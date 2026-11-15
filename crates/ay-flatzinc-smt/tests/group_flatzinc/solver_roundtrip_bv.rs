@@ -11,7 +11,7 @@
 //! Part of #326 (set constraint soundness), #273 (MiniZinc entry).
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use ay_core::kani_compat::{det_hash_map_new, DetHashMap as HashMap};
 use ay_flatzinc_smt::translate;
@@ -21,33 +21,13 @@ fn translate_fzn(input: &str) -> ay_flatzinc_smt::TranslationResult {
     translate(&model).expect("translate failed")
 }
 
-/// Find z3 binary for set encoding verification.
-fn z3_path() -> Option<String> {
-    if let Ok(p) = std::env::var("Z3_PATH") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(output) = Command::new("which").arg("z3").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
-                return Some(path);
-            }
-        }
-    }
-    let default = "/opt/homebrew/bin/z3";
-    if std::path::Path::new(default).exists() {
-        return Some(default.to_string());
-    }
-    eprintln!("SKIP: z3 binary not found. Set Z3_PATH or install z3.");
-    None
-}
-
-/// Run z3 on an SMT-LIB2 script. Returns (exit_code, stdout, stderr).
+/// Run z3 on an SMT-LIB2 script. Returns (exit_code, stdout, stderr), or
+/// `None` (after a visible skip line) when no z3 is usable. The z3 is reached
+/// by path and proved to be z3 (`ay_test_support::z3`), never spawned by name.
 fn run_z3(smtlib: &str) -> Option<(i32, String, String)> {
-    let z3 = z3_path()?;
-    let mut child = Command::new(&z3)
+    let z3 = ay_test_support::z3::optional_z3("ay-flatzinc-smt solver_roundtrip_bv")?;
+    let mut child = z3
+        .command()
         .args(["-smt2", "-in"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

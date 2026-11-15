@@ -42,6 +42,9 @@ const HASH_ENTRY_BYTES: usize = 64;
 /// Long conversion loops poll external controls at least this often.
 const CONTROL_POLL_INTERVAL: usize = 1024;
 
+mod work_attribution;
+use work_attribution::{ConversionPhase, WorkAttribution};
+
 #[derive(Clone, Copy, Debug)]
 struct TraceIdState {
     trace_index: usize,
@@ -57,6 +60,19 @@ struct TraceShape {
     hints: usize,
     max_row_hints: usize,
     synthesis_scratch_bytes: usize,
+    /// Conversion-local compaction assignment and undo trail, retained even
+    /// while the existing rooted/full-synthesis scratch is live.
+    compaction_scratch_bytes: usize,
+    /// Original-clause occurrence index, including its temporary build cursor.
+    /// Reserved throughout conversion, independently of propagation scratch.
+    root_index_scratch_bytes: usize,
+    /// Separately admitted row-local candidate index and ordered ready queues.
+    /// Zero during the initial namespace preflight; refined after hint checks.
+    candidate_scheduler_bytes: usize,
+    /// Preserve both hint-plan alternatives for the post-namespace admission.
+    recorded_hints: usize,
+    recorded_max_row_hints: usize,
+    widened_hints: Option<usize>,
     /// Per-derived-row hint width admitted for independent RUP chain
     /// reconstruction. A row may retain at most
     /// `max(recorded_hints, row_hint_budget)` hints. `0` admits only the
@@ -385,6 +401,32 @@ struct ConversionMeter<'a> {
     limits: &'a ResolutionValidationLimits,
     should_stop: &'a mut dyn FnMut() -> bool,
     work: u64,
+    attribution: WorkAttribution,
+}
+
+/// A cold attribution point, not a new resource limit or proof authority.
+#[cold]
+#[inline(never)]
+fn conversion_work_limit_error(
+    limit: u64,
+    actual: u64,
+    debit: u64,
+    attribution: &WorkAttribution,
+) -> ResolutionValidationError {
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        // One stderr write: the refusal line stays byte-identical and the
+        // diagnostic phase partition follows it on the next line.
+        ay_core::safe_eprintln!(
+            "--probe-cert-reject: work-limit owner=sat-conversion limit={limit} actual={actual} debit={debit}\n\
+             --probe-cert-reject: conversion-work {}",
+            attribution.snapshot(actual)
+        );
+    }
+    ResolutionValidationError::LimitExceeded {
+        resource: ResolutionValidationResource::Work,
+        limit: u128::from(limit),
+        actual: u128::from(actual),
+    }
 }
 
 impl<'a> ConversionMeter<'a> {
@@ -396,6 +438,7 @@ impl<'a> ConversionMeter<'a> {
             limits,
             should_stop,
             work: 0,
+            attribution: WorkAttribution::default(),
         };
         meter.check_controls()?;
         Ok(meter)
@@ -428,11 +471,12 @@ impl<'a> ConversionMeter<'a> {
                     resource: ResolutionValidationResource::Work,
                 })?;
         if self.work > self.limits.max_work {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: u128::from(self.limits.max_work),
-                actual: u128::from(self.work),
-            });
+            return Err(conversion_work_limit_error(
+                self.limits.max_work,
+                self.work,
+                amount,
+                &self.attribution,
+            ));
         }
         if previous / CONTROL_POLL_INTERVAL as u64 != self.work / CONTROL_POLL_INTERVAL as u64 {
             self.check_controls()?;
@@ -443,7 +487,23 @@ impl<'a> ConversionMeter<'a> {
     fn consumed_work(&self) -> u64 {
         self.work
     }
+
+    /// Attribute existing debits exclusively, without changing their controls.
+    /// This is not a Drop guard: replay must reborrow the cancellation callback
+    /// after the last ordinary use of this meter.
+    fn in_phase<R>(&mut self, phase: ConversionPhase, operation: impl FnOnce(&mut Self) -> R) -> R {
+        let work = self.consumed_work();
+        let previous = self.attribution.switch(phase, work);
+        let result = operation(self);
+        let work = self.consumed_work();
+        self.attribution.switch(previous, work);
+        result
+    }
 }
+
+#[cfg(test)]
+#[path = "clause_trace_resolution/work_limit_tests.rs"]
+mod work_limit_tests;
 
 fn add_count(
     current: usize,
@@ -624,6 +684,17 @@ fn synthesis_scratch_bytes_from_capacities(
 include!("clause_trace_resolution/preflight.rs");
 
 include!("clause_trace_resolution/bounded_copy.rs");
+
+mod compaction_scratch;
+use compaction_scratch::CompactionScratch;
+
+mod root_occurrence_index;
+
+mod rooted_retirement;
+
+mod ordinary_compaction;
+mod rooted_scheduler;
+use ordinary_compaction::compact_seeded_candidates;
 
 enum TerminalHintScan {
     Satisfied,
@@ -1195,24 +1266,37 @@ mod tests {
         let limits = ResolutionValidationLimits::unbounded();
         let mut meter = ConversionMeter::new(&limits, &mut should_stop).expect("meter");
         let admitted_scratch = planned_synthesis_scratch_bytes(3, 3).expect("scratch plan");
+        let scratch = CompactionScratch::new(
+            3,
+            CompactionScratch::planned_bytes(3).expect("assignment plan"),
+            &mut meter,
+        )
+        .expect("assignment scratch");
 
-        let compacted = compact_rup_hint_candidates(
+        let (compacted, _) = compact_rup_hint_candidates(
             &originals,
             &[],
             &[],
             &[neg(2)],
             &[1, 2, 3],
             3,
-            3,
+            scratch,
             admitted_scratch,
+            usize::MAX,
             &mut meter,
         )
-        .expect("bounded compaction")
-        .expect("later units make the skipped prefix conflicting");
+        .expect("bounded compaction");
+        let compacted = compacted.expect("later units make the skipped prefix conflicting");
         assert_eq!(compacted, vec![2, 3, 1]);
 
         let mut should_stop = || false;
         let mut meter = ConversionMeter::new(&limits, &mut should_stop).expect("meter");
+        let scratch = CompactionScratch::new(
+            3,
+            CompactionScratch::planned_bytes(3).expect("assignment plan"),
+            &mut meter,
+        )
+        .expect("assignment scratch");
         assert_eq!(
             compact_rup_hint_candidates(
                 &originals,
@@ -1221,11 +1305,13 @@ mod tests {
                 &[neg(2)],
                 &[2, 3],
                 2,
-                3,
+                scratch,
                 admitted_scratch,
+                usize::MAX,
                 &mut meter,
             )
-            .expect("bounded negative compaction"),
+            .expect("bounded negative compaction")
+            .0,
             None,
             "removing the required conflicting candidate must fail closed"
         );
@@ -1636,23 +1722,32 @@ mod tests {
     fn conversion_and_replay_share_one_work_allowance() {
         let trace = valid_trace();
         let mut limits = ResolutionValidationLimits::unbounded();
-        // This exact trace consumes 37 conversion visits, including namespace
-        // initialization, both filtered-entry scans, and the retained-capacity
-        // census, followed by 12 replay preflight/allocation/initialization
-        // visits. If replay received a fresh allowance it would succeed;
-        // carrying conversion forward makes the replay's first original-clause
-        // visit exceed the envelope.
-        limits.max_work = 49;
+        let validated = validate_clause_trace_resolution(&trace, 1, &limits)
+            .expect("complete conversion and replay");
+        let mut never_stop = || false;
+        let replay_work = validated
+            .dag()
+            .validate_with_limits_interruptible(&limits, &[], 0, 0, &mut never_stop)
+            .expect("independent replay from a zero prefix");
+        let full_work = validated.validation_work();
+        // Independently measure replay, rather than trusting the returned
+        // total alone: resetting its conversion prefix would fail this check.
+        assert!(full_work > replay_work);
+        let conversion_work = full_work - replay_work;
+        limits.max_work = full_work - 1;
+        assert!(conversion_work <= limits.max_work);
+        assert!(replay_work <= limits.max_work);
+        // Each phase fits separately; their shared allowance must not.
 
         assert!(matches!(
             validate_clause_trace_resolution(&trace, 1, &limits),
             Err(ClauseTraceResolutionError::InvalidResolutionDag(
                 ResolutionValidationError::LimitExceeded {
                     resource: ResolutionValidationResource::Work,
-                    limit: 49,
-                    actual: 50,
+                    limit,
+                    actual,
                 }
-            ))
+            )) if limit == u128::from(full_work - 1) && actual == u128::from(full_work)
         ));
     }
 

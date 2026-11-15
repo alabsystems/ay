@@ -36,8 +36,12 @@
 use super::*;
 use ay_core::time::Instant;
 use std::collections::HashSet;
-use std::hash::Hash;
+#[cfg(test)]
 use std::mem::size_of;
+
+mod cancellation;
+mod meter;
+use meter::BackwardProofMeter;
 
 /// A single LRAT proof step produced by backward reconstruction.
 ///
@@ -106,6 +110,7 @@ pub(crate) struct BackwardProofLimits {
 /// Typed exhaustion from bounded backward reconstruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackwardProofFailure {
+    Cancelled,
     Limit {
         resource: BackwardProofResource,
         limit: usize,
@@ -118,15 +123,6 @@ pub(crate) enum BackwardProofFailure {
     Allocation {
         resource: BackwardProofResource,
     },
-}
-
-struct BackwardProofMeter<'a> {
-    limits: &'a BackwardProofLimits,
-    bytes: usize,
-    steps: usize,
-    literals: usize,
-    hints: usize,
-    work: u64,
 }
 
 const MAX_DENSE_VISITED_BYTES: usize = 8 * 1024 * 1024;
@@ -166,7 +162,10 @@ impl ClauseIdVisited {
         if dense_bytes <= MAX_DENSE_VISITED_BYTES && dense_fits_meter {
             let mut words = Vec::new();
             meter.reserve_to(&mut words, word_len, BackwardProofResource::Visited)?;
-            words.resize(word_len, 0);
+            for _ in 0..word_len {
+                meter.poll()?;
+                words.push(0);
+            }
             meter.check_deadline()?;
             Ok(Self::Dense { len, words })
         } else {
@@ -199,6 +198,7 @@ impl ClauseIdVisited {
         index: usize,
         meter: &mut BackwardProofMeter<'_>,
     ) -> Result<Option<bool>, BackwardProofFailure> {
+        meter.poll()?;
         match self {
             Self::Dense { len, words } => {
                 if index >= *len {
@@ -218,294 +218,6 @@ impl ClauseIdVisited {
                     .insert_hash_set(ids, index, BackwardProofResource::Visited)
                     .map(Some)
             }
-        }
-    }
-}
-
-impl<'a> BackwardProofMeter<'a> {
-    fn new(limits: &'a BackwardProofLimits) -> Result<Self, BackwardProofFailure> {
-        let meter = Self {
-            limits,
-            bytes: 0,
-            steps: 0,
-            literals: 0,
-            hints: 0,
-            work: 0,
-        };
-        meter.check_deadline()?;
-        Ok(meter)
-    }
-
-    fn check_deadline(&self) -> Result<(), BackwardProofFailure> {
-        if self
-            .limits
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(BackwardProofFailure::Deadline);
-        }
-        Ok(())
-    }
-
-    fn tick(&mut self) -> Result<(), BackwardProofFailure> {
-        self.work = self
-            .work
-            .checked_add(1)
-            .ok_or(BackwardProofFailure::AccountingOverflow {
-                resource: BackwardProofResource::Bytes,
-            })?;
-        if self.work.is_multiple_of(1024) {
-            self.check_deadline()?;
-        }
-        Ok(())
-    }
-
-    fn add_count(
-        current: &mut usize,
-        additional: usize,
-        limit: usize,
-        resource: BackwardProofResource,
-    ) -> Result<(), BackwardProofFailure> {
-        let actual = current
-            .checked_add(additional)
-            .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-        if actual > limit {
-            return Err(BackwardProofFailure::Limit {
-                resource,
-                limit,
-                actual,
-            });
-        }
-        *current = actual;
-        Ok(())
-    }
-
-    fn add_step(&mut self) -> Result<(), BackwardProofFailure> {
-        Self::add_count(
-            &mut self.steps,
-            1,
-            self.limits.max_steps,
-            BackwardProofResource::Steps,
-        )
-    }
-
-    fn add_literals(&mut self, count: usize) -> Result<(), BackwardProofFailure> {
-        Self::add_count(
-            &mut self.literals,
-            count,
-            self.limits.max_literals,
-            BackwardProofResource::Literals,
-        )
-    }
-
-    fn add_hint(&mut self) -> Result<(), BackwardProofFailure> {
-        Self::add_count(
-            &mut self.hints,
-            1,
-            self.limits.max_hints,
-            BackwardProofResource::Hints,
-        )
-    }
-
-    fn reserve_to<T>(
-        &mut self,
-        vec: &mut Vec<T>,
-        target: usize,
-        resource: BackwardProofResource,
-    ) -> Result<(), BackwardProofFailure> {
-        let old_capacity = vec.capacity();
-        if target <= old_capacity {
-            return Ok(());
-        }
-        let requested_delta = target
-            .checked_sub(old_capacity)
-            .and_then(|delta| delta.checked_mul(size_of::<T>()))
-            .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-        let requested = self.bytes.checked_add(requested_delta).ok_or(
-            BackwardProofFailure::AccountingOverflow {
-                resource: BackwardProofResource::Bytes,
-            },
-        )?;
-        if requested > self.limits.max_bytes {
-            return Err(BackwardProofFailure::Limit {
-                resource: BackwardProofResource::Bytes,
-                limit: self.limits.max_bytes,
-                actual: requested,
-            });
-        }
-        vec.try_reserve_exact(target - vec.len())
-            .map_err(|_| BackwardProofFailure::Allocation { resource })?;
-        self.check_deadline()?;
-        let actual_delta = vec
-            .capacity()
-            .checked_sub(old_capacity)
-            .and_then(|delta| delta.checked_mul(size_of::<T>()))
-            .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-        let actual = self.bytes.checked_add(actual_delta).ok_or(
-            BackwardProofFailure::AccountingOverflow {
-                resource: BackwardProofResource::Bytes,
-            },
-        )?;
-        if actual > self.limits.max_bytes {
-            *vec = Vec::new();
-            return Err(BackwardProofFailure::Limit {
-                resource: BackwardProofResource::Bytes,
-                limit: self.limits.max_bytes,
-                actual,
-            });
-        }
-        self.bytes = actual;
-        Ok(())
-    }
-
-    fn push<T>(
-        &mut self,
-        vec: &mut Vec<T>,
-        value: T,
-        resource: BackwardProofResource,
-    ) -> Result<(), BackwardProofFailure> {
-        let required = vec
-            .len()
-            .checked_add(1)
-            .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-        if required > vec.capacity() {
-            let target = if vec.capacity() == 0 {
-                4
-            } else {
-                vec.capacity().saturating_mul(2)
-            }
-            .max(required);
-            self.reserve_to(vec, target, resource)?;
-        }
-        vec.push(value);
-        Ok(())
-    }
-
-    fn insert_hash_set<T: Eq + Hash>(
-        &mut self,
-        seen: &mut HashSet<T>,
-        value: T,
-        resource: BackwardProofResource,
-    ) -> Result<bool, BackwardProofFailure> {
-        if seen.contains(&value) {
-            return Ok(false);
-        }
-        if seen.len() == seen.capacity() {
-            let required = seen
-                .len()
-                .checked_add(1)
-                .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-            let target = if seen.capacity() == 0 {
-                4
-            } else {
-                seen.capacity().saturating_mul(2)
-            }
-            .max(required);
-            let requested_delta = target
-                .checked_sub(seen.capacity())
-                .and_then(|delta| delta.checked_mul(32))
-                .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-            let requested = self.bytes.checked_add(requested_delta).ok_or(
-                BackwardProofFailure::AccountingOverflow {
-                    resource: BackwardProofResource::Bytes,
-                },
-            )?;
-            if requested > self.limits.max_bytes {
-                return Err(BackwardProofFailure::Limit {
-                    resource: BackwardProofResource::Bytes,
-                    limit: self.limits.max_bytes,
-                    actual: requested,
-                });
-            }
-            let old_capacity = seen.capacity();
-            seen.try_reserve(target - seen.len())
-                .map_err(|_| BackwardProofFailure::Allocation { resource })?;
-            self.check_deadline()?;
-            let actual_delta = seen
-                .capacity()
-                .checked_sub(old_capacity)
-                .and_then(|delta| delta.checked_mul(32))
-                .ok_or(BackwardProofFailure::AccountingOverflow { resource })?;
-            let actual = self.bytes.checked_add(actual_delta).ok_or(
-                BackwardProofFailure::AccountingOverflow {
-                    resource: BackwardProofResource::Bytes,
-                },
-            )?;
-            if actual > self.limits.max_bytes {
-                *seen = HashSet::new();
-                return Err(BackwardProofFailure::Limit {
-                    resource: BackwardProofResource::Bytes,
-                    limit: self.limits.max_bytes,
-                    actual,
-                });
-            }
-            self.bytes = actual;
-        }
-        Ok(seen.insert(value))
-    }
-
-    fn insert_seen(
-        &mut self,
-        seen: &mut HashSet<i64>,
-        value: i64,
-    ) -> Result<bool, BackwardProofFailure> {
-        self.insert_hash_set(seen, value, BackwardProofResource::Hints)
-    }
-
-    fn clone_slice<T: Clone>(
-        &mut self,
-        slice: &[T],
-        resource: BackwardProofResource,
-    ) -> Result<Vec<T>, BackwardProofFailure> {
-        let mut result = Vec::new();
-        self.reserve_to(&mut result, slice.len(), resource)?;
-        result.extend_from_slice(slice);
-        Ok(result)
-    }
-
-    fn sort_steps_by_clause_id(
-        &mut self,
-        steps: &mut [LratStep],
-    ) -> Result<(), BackwardProofFailure> {
-        let len = steps.len();
-        if len < 2 {
-            return self.check_deadline();
-        }
-        for start in (0..(len / 2)).rev() {
-            self.sift_steps_down(steps, start, len)?;
-        }
-        for end in (1..len).rev() {
-            self.tick()?;
-            steps.swap(0, end);
-            self.sift_steps_down(steps, 0, end)?;
-        }
-        self.check_deadline()
-    }
-
-    fn sift_steps_down(
-        &mut self,
-        steps: &mut [LratStep],
-        mut root: usize,
-        end: usize,
-    ) -> Result<(), BackwardProofFailure> {
-        loop {
-            self.tick()?;
-            let Some(mut child) = root.checked_mul(2).and_then(|value| value.checked_add(1)) else {
-                return Err(BackwardProofFailure::AccountingOverflow {
-                    resource: BackwardProofResource::Steps,
-                });
-            };
-            if child >= end {
-                return Ok(());
-            }
-            if child + 1 < end && steps[child].clause_id < steps[child + 1].clause_id {
-                child += 1;
-            }
-            if steps[root].clause_id >= steps[child].clause_id {
-                return Ok(());
-            }
-            steps.swap(root, child);
-            root = child;
         }
     }
 }
@@ -641,6 +353,14 @@ impl Solver {
                     continue;
                 }
 
+                // Lazy theory reasons (#8467): `reason_raw` is a lazy-table
+                // index, not an arena offset. Reading it as a clause would
+                // name an unrelated clause as the antecedent.
+                if self.var_data[var_idx].is_lazy_theory_reason() {
+                    result.complete = false;
+                    continue;
+                }
+
                 // Binary literal reasons (#8034) — no arena clause to reference.
                 if is_binary_literal_reason(reason_raw) {
                     // Binary reasons don't have a clause_id in the arena.
@@ -728,7 +448,29 @@ impl Solver {
         &self,
         limits: &BackwardProofLimits,
     ) -> Result<BoundedBackwardProofResult, BackwardProofFailure> {
-        let mut meter = BackwardProofMeter::new(limits)?;
+        self.reconstruct_lrat_backward_bounded_with_cancellation(limits, &|| true)
+    }
+
+    /// Cancel the actual reconstruction walk without weakening its proof checks.
+    /// The borrowed callback runs on this thread; false is irreversible for this
+    /// call. Hash operations, allocation and destruction remain opaque intervals.
+    pub(crate) fn reconstruct_lrat_backward_bounded_with_cancellation(
+        &self,
+        limits: &BackwardProofLimits,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<BoundedBackwardProofResult, BackwardProofFailure> {
+        let mut meter = BackwardProofMeter::with_cancellation(limits, keep_going)?;
+        let result = self.reconstruct_lrat_backward_bounded_inner(&mut meter)?;
+        // All visited/queue/temporary hint storage has been destroyed by the
+        // inner frame before final admission, including the no-seed outcome.
+        meter.check_deadline()?;
+        Ok(result)
+    }
+
+    fn reconstruct_lrat_backward_bounded_inner(
+        &self,
+        meter: &mut BackwardProofMeter<'_>,
+    ) -> Result<BoundedBackwardProofResult, BackwardProofFailure> {
         let original_boundary = self.cold.original_clause_boundary;
         let visited_len = usize::try_from(self.cold.next_clause_id)
             .ok()
@@ -736,7 +478,7 @@ impl Solver {
             .ok_or(BackwardProofFailure::AccountingOverflow {
                 resource: BackwardProofResource::ClauseIds,
             })?;
-        let mut visited = ClauseIdVisited::new_bounded(visited_len, &mut meter)?;
+        let mut visited = ClauseIdVisited::new_bounded(visited_len, meter)?;
         let mut queue: Vec<usize> = Vec::new();
         let mut seed_clause_ids: Vec<u64> = Vec::new();
         let mut complete = true;
@@ -767,7 +509,7 @@ impl Solver {
                 usize::try_from(cid).map_err(|_| BackwardProofFailure::AccountingOverflow {
                     resource: BackwardProofResource::ClauseIds,
                 })?;
-            let _ = visited.mark(cid_index, &mut meter)?;
+            let _ = visited.mark(cid_index, meter)?;
             if offset >= original_boundary {
                 meter.push(&mut queue, offset, BackwardProofResource::Queue)?;
             }
@@ -810,7 +552,7 @@ impl Solver {
                         resource: BackwardProofResource::ClauseIds,
                     }
                 })?;
-                let Some(is_new) = visited.mark(reason_index, &mut meter)? else {
+                let Some(is_new) = visited.mark(reason_index, meter)? else {
                     complete = false;
                     continue;
                 };
@@ -859,7 +601,11 @@ impl Solver {
                 if reason_raw == NO_REASON {
                     continue;
                 }
-                if is_binary_literal_reason(reason_raw) {
+                // A lazy theory reason (#8467) is a table index, not an arena
+                // offset: it names no clause here.
+                if is_binary_literal_reason(reason_raw)
+                    || self.var_data[var_idx].is_lazy_theory_reason()
+                {
                     complete = false;
                     continue;
                 }
@@ -892,7 +638,7 @@ impl Solver {
                     }
                 })?;
                 if reason_offset >= original_boundary {
-                    let Some(is_new) = visited.mark(reason_index, &mut meter)? else {
+                    let Some(is_new) = visited.mark(reason_index, meter)? else {
                         complete = false;
                         continue;
                     };
@@ -928,7 +674,7 @@ impl Solver {
             // therefore a complete one-hint RUP proof.
             if self_referential_reason || antecedent_ids.is_empty() {
                 if let Some(subsumer_id) =
-                    self.find_bounded_visible_subsumer_id(clause_id, clause_lits, &mut meter)?
+                    self.find_bounded_visible_subsumer_id(clause_id, clause_lits, meter)?
                 {
                     antecedent_ids.clear();
                     hint_seen.clear();
@@ -981,7 +727,7 @@ impl Solver {
         let empty_clause_hints = self.build_backward_empty_clause_hints_bounded(
             &seed_clause_ids,
             &mut hint_seen,
-            &mut meter,
+            meter,
             &mut complete,
             &visited,
         )?;
@@ -1182,6 +928,8 @@ mod tests {
     use crate::proof::ProofOutput;
     use crate::resolution_dag::{ResolutionDag, RupStep};
     use std::time::Duration;
+
+    mod cancellation;
 
     fn generous_limits() -> BackwardProofLimits {
         BackwardProofLimits {

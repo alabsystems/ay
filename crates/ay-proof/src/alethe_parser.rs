@@ -49,10 +49,27 @@
 //! them would mean reimplementing the checker. The one check-level failure
 //! cheap enough to keep is structural and is included: a document that never
 //! concludes `(cl)`, and a rule name outside the checkable set.
+//!
+//! The checkable set depends on the checker the document is spelled for
+//! ([`AletheDialect`], `alethe_printer/dialect.rs`), and it is the one
+//! decision here that is not a probe of pinned Carcara alone. A document
+//! spelled for pinned Carcara may name only [`CHECKABLE_ALETHE_RULES`]; one
+//! spelled for Clean's vendored Carcara ([`AletheDialect::Clean`], the
+//! default, and what the printer emits by default) may also name
+//! [`ay_core::CLEAN_DIALECT_ALETHE_RULES`] (`dt_project`), which Clean
+//! implements and pinned Carcara answers `unknown rule` for. Reading a Clean
+//! document against the pinned vocabulary refused AY's own export as
+//! `unknown-rule`; reading a pinned document against Clean's would admit a
+//! rule its checker voids the document over. So the dialect is passed down
+//! with the export ([`AletheDocumentChecker::with_dialect`]).
 
-use ay_core::{is_checkable_alethe_rule, CHECKABLE_ALETHE_RULES};
+use crate::AletheDialect;
+use ay_core::CHECKABLE_ALETHE_RULES;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+mod rup_arguments;
+mod term_walk;
 
 // ---------------------------------------------------------------------------
 // Source positions
@@ -221,7 +238,10 @@ pub enum AletheDefect {
         /// The offending token, rendered.
         token: String,
     },
-    /// A rule name outside [`CHECKABLE_ALETHE_RULES`].
+    /// A rule name the checker the document is spelled for does not
+    /// implement ([`AletheDialect::implements_rule`]): one outside
+    /// [`CHECKABLE_ALETHE_RULES`], or, for a pinned-Carcara document, a
+    /// Clean-only rule such as `dt_project`.
     UnknownRule {
         /// Source position (0-indexed, matching carcara).
         pos: Pos,
@@ -679,7 +699,7 @@ fn push_atom(stack: &mut [Vec<Sexp>], out: &mut Vec<Sexp>, text: &str) {
 /// distinct < <= > >= + - * / select store` plus `(_ is C)`, so the extra
 /// names are inert. They are present so that a future AY that emits, say,
 /// bit-vector terms is not falsely rejected.
-const BUILTIN_OPERATORS: &[&str] = &[
+pub(crate) const BUILTIN_OPERATORS: &[&str] = &[
     "true",
     "false",
     "not",
@@ -773,10 +793,13 @@ const BUILTIN_OPERATORS: &[&str] = &[
     "int.pow2",
     "int.ispow2",
     "int.log2",
+    // carcara's reserved `BvPBbTerm`/`BvBbTerm`, which printer lowerings write.
+    "@pbbterm",
+    "@bbterm",
 ];
 
 /// Indexed identifier heads carcara resolves: `(_ NAME idx+)`.
-const BUILTIN_INDEXED: &[&str] = &[
+pub(crate) const BUILTIN_INDEXED: &[&str] = &[
     "extract",
     "zero_extend",
     "sign_extend",
@@ -789,6 +812,9 @@ const BUILTIN_INDEXED: &[&str] = &[
     "re.loop",
     "is",
     "const",
+    // carcara's reserved `BvBitOf`/`BvIntOf`, likewise.
+    "@bit_of",
+    "@int_of",
 ];
 
 /// Sort names available without a `declare-sort`.
@@ -816,8 +842,8 @@ const DECLARATION_COMMANDS: &[&str] = &[
 ];
 
 /// The maximum term nesting this parser will follow. AY's deepest observed
-/// document nests to 109. Anything past the cap is REJECTED rather than
-/// risking a stack overflow — a crash is not a verdict.
+/// document nests to 109. An explicit continuation stack enforces the cap
+/// without recursing on the machine stack — a crash is not a verdict.
 const MAX_TERM_DEPTH: usize = 4096;
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1161,8 @@ struct Frame {
 /// not undo that.
 pub struct AletheDocumentChecker {
     scope: ProblemScope,
+    /// The checker the document is spelled for; it fixes the rule vocabulary.
+    dialect: AletheDialect,
     /// Symbols bound by proof-level `define-fun`, with arity.
     defines: HashMap<String, usize>,
     /// Ids currently visible for premise resolution.
@@ -1161,11 +1189,13 @@ pub struct AletheDocumentChecker {
 }
 
 impl AletheDocumentChecker {
-    /// Start a check against `scope`.
+    /// Start a check against `scope`, of a document spelled for the default
+    /// dialect, [`AletheDialect::Clean`] (see [`Self::with_dialect`]).
     #[must_use]
     pub fn new(scope: ProblemScope) -> Self {
         Self {
             scope,
+            dialect: AletheDialect::default(),
             defines: HashMap::new(),
             visible_ids: HashSet::new(),
             retired_ids: HashSet::new(),
@@ -1180,6 +1210,16 @@ impl AletheDocumentChecker {
             started: false,
             failed: None,
         }
+    }
+
+    /// Read the document as spelled for `dialect`: a rule name its checker
+    /// does not implement ([`AletheDialect::implements_rule`]) is
+    /// [`AletheDefect::UnknownRule`]. Pass the dialect the document was
+    /// rendered in (`with_alethe_dialect`, `Executor::alethe_dialect`).
+    #[must_use]
+    pub fn with_dialect(mut self, dialect: AletheDialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Feed the next chunk of emitted proof text.
@@ -1571,7 +1611,10 @@ impl AletheDocumentChecker {
                         if stage != 1 && stage != 2 {
                             return Err(AletheDefect::MisplacedAttribute { pos, keyword: kw });
                         }
-                        self.parse_term_sequence(lexer, &kw, pos)?;
+                        match rule.as_ref().map(|(name, _)| name.as_str()) {
+                            Some("drup" | "drat") => self.parse_rup_arguments(lexer, pos)?,
+                            _ => self.parse_term_sequence(lexer, &kw, pos)?,
+                        }
                         stage = 3;
                     }
                     ":discharge" => {
@@ -1601,7 +1644,7 @@ impl AletheDocumentChecker {
                 found: ")".to_string(),
             });
         };
-        if !is_checkable_alethe_rule(&rule_name) {
+        if !self.dialect.implements_rule(&rule_name) {
             return Err(AletheDefect::UnknownRule {
                 pos: rule_pos,
                 rule: rule_name,
@@ -1760,7 +1803,11 @@ impl AletheDocumentChecker {
                                 });
                             };
                             self.parse_sort(lexer)?;
-                            self.expect(lexer, &Tok::Close, "')' closing the sorted variable")?;
+                            self.expect_token(
+                                lexer,
+                                &Tok::Close,
+                                "')' closing the sorted variable",
+                            )?;
                             bound.push(name);
                         }
                         other => {
@@ -1776,12 +1823,12 @@ impl AletheDocumentChecker {
                     let mut binders = self.frame_bound_vars();
                     let (tok, pos) = lexer.next_token()?;
                     self.parse_term_from(lexer, tok, pos, &mut binders, 0)?;
-                    self.expect(lexer, &Tok::Close, "')' closing the anchor argument")?;
+                    self.expect_token(lexer, &Tok::Close, "')' closing the anchor argument")?;
                 }
                 // `(x U)` sorted variable
                 Tok::Symbol(name) => {
                     self.parse_sort(lexer)?;
-                    self.expect(lexer, &Tok::Close, "')' closing the sorted variable")?;
+                    self.expect_token(lexer, &Tok::Close, "')' closing the sorted variable")?;
                     bound.push(name);
                 }
                 other => {
@@ -1815,7 +1862,7 @@ impl AletheDocumentChecker {
                 found: name_tok.describe(),
             });
         };
-        self.expect(lexer, &Tok::Open, "'(' opening the parameter list")?;
+        self.expect_token(lexer, &Tok::Open, "'(' opening the parameter list")?;
         let mut params = Vec::new();
         loop {
             let (tok, pos) = lexer.next_token()?;
@@ -1838,7 +1885,7 @@ impl AletheDocumentChecker {
                 });
             };
             self.parse_sort(lexer)?;
-            self.expect(lexer, &Tok::Close, "')' closing the sorted variable")?;
+            self.expect_token(lexer, &Tok::Close, "')' closing the sorted variable")?;
             params.push(var);
         }
         self.parse_sort(lexer)?;
@@ -1846,7 +1893,7 @@ impl AletheDocumentChecker {
         let mut binders = params;
         let (tok, pos) = lexer.next_token()?;
         self.parse_term_from(lexer, tok, pos, &mut binders, 0)?;
-        self.expect(lexer, &Tok::Close, "')' closing the define-fun")?;
+        self.expect_token(lexer, &Tok::Close, "')' closing the define-fun")?;
         // Definitions must precede use (probe `df_forward`), so register only
         // after the body parses.
         self.defines.insert(name, arity);
@@ -1856,7 +1903,7 @@ impl AletheDocumentChecker {
 
     // -- shared pieces ------------------------------------------------------
 
-    fn expect(
+    fn expect_token(
         &self,
         lexer: &mut Lexer<'_>,
         want: &Tok,
@@ -1929,7 +1976,7 @@ impl AletheDocumentChecker {
         keyword: &str,
         kw_pos: Pos,
     ) -> Result<Vec<(String, Pos)>, AletheDefect> {
-        self.expect(lexer, &Tok::Open, "'(' opening an id sequence")?;
+        self.expect_token(lexer, &Tok::Open, "'(' opening an id sequence")?;
         let mut ids = Vec::new();
         loop {
             let (tok, pos) = lexer.next_token()?;
@@ -1960,7 +2007,7 @@ impl AletheDocumentChecker {
         keyword: &str,
         kw_pos: Pos,
     ) -> Result<(), AletheDefect> {
-        self.expect(lexer, &Tok::Open, "'(' opening a term sequence")?;
+        self.expect_token(lexer, &Tok::Open, "'(' opening a term sequence")?;
         let mut count = 0usize;
         loop {
             let (tok, pos) = lexer.next_token()?;
@@ -2018,7 +2065,6 @@ impl AletheDocumentChecker {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn parse_term_from(
         &mut self,
         lexer: &mut Lexer<'_>,
@@ -2027,143 +2073,7 @@ impl AletheDocumentChecker {
         binders: &mut Vec<String>,
         depth: usize,
     ) -> Result<(), AletheDefect> {
-        if depth > MAX_TERM_DEPTH {
-            return Err(AletheDefect::TermTooDeep { pos });
-        }
-        match tok {
-            Tok::Numeral(_) | Tok::Decimal(_) | Tok::StringLit(_) | Tok::BitVec(_) => Ok(()),
-            Tok::Symbol(name) => self.resolve_symbol(&name, pos, binders),
-            Tok::Open => self.parse_application(lexer, pos, binders, depth),
-            Tok::Close => Err(AletheDefect::UnexpectedToken {
-                pos,
-                expected: "a term",
-                found: ")".to_string(),
-            }),
-            Tok::Keyword(kw) => Err(AletheDefect::UnexpectedToken {
-                pos,
-                expected: "a term",
-                found: kw,
-            }),
-            Tok::Eof => Err(AletheDefect::UnexpectedEof {
-                pos,
-                expected: "a term",
-            }),
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn parse_application(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        _open_pos: Pos,
-        binders: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<(), AletheDefect> {
-        let (head, head_pos) = lexer.next_token()?;
-        match head {
-            Tok::Symbol(ref name) => match name.as_str() {
-                "let" => return self.parse_let(lexer, binders, depth),
-                "forall" | "exists" | "lambda" | "choice" => {
-                    return self.parse_binder(lexer, binders, depth)
-                }
-                // `match` panics carcara (exit 101). Never accept it.
-                "match" => {
-                    return Err(AletheDefect::ForbiddenConstruct {
-                        pos: head_pos,
-                        what: "match",
-                    })
-                }
-                "par" => {
-                    return Err(AletheDefect::ForbiddenConstruct {
-                        pos: head_pos,
-                        what: "par",
-                    })
-                }
-                "!" => return self.parse_annotation(lexer, binders, depth),
-                "_" => {
-                    // `(_ NAME idx+)` — an indexed constant used as a term.
-                    self.parse_indexed_tail(lexer, head_pos)?;
-                    return Ok(());
-                }
-                "as" => {
-                    // `(as NAME SORT)` used bare as a term.
-                    let (tok, pos) = lexer.next_token()?;
-                    self.parse_term_from(lexer, tok, pos, binders, depth + 1)?;
-                    self.parse_sort(lexer)?;
-                    self.expect(lexer, &Tok::Close, "')' closing the qualified identifier")?;
-                    return Ok(());
-                }
-                "cl" => {
-                    return Err(AletheDefect::UnexpectedToken {
-                        pos: head_pos,
-                        expected: "a term (a nested 'cl' is not a term)",
-                        found: "cl".to_string(),
-                    })
-                }
-                _ => {
-                    self.resolve_symbol(name, head_pos, binders)?;
-                    if let Some(arity) = self.defines.get(name).copied() {
-                        return self.parse_args_checked(
-                            lexer,
-                            binders,
-                            depth,
-                            Some((arity, name.clone(), head_pos)),
-                        );
-                    }
-                }
-            },
-            Tok::Open => {
-                // A qualified/indexed head: `((_ is C) t)`, `((as const S) v)`,
-                // or a lambda applied directly.
-                self.parse_qualified_head(lexer, binders, depth)?;
-            }
-            other => {
-                return Err(AletheDefect::UnexpectedToken {
-                    pos: head_pos,
-                    expected: "an application head",
-                    found: other.describe(),
-                })
-            }
-        }
-        self.parse_args_checked(lexer, binders, depth, None)?;
-        Ok(())
-    }
-
-    fn parse_args_checked(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        binders: &mut Vec<String>,
-        depth: usize,
-        arity_check: Option<(usize, String, Pos)>,
-    ) -> Result<(), AletheDefect> {
-        let mut count = 0usize;
-        loop {
-            let (tok, pos) = lexer.next_token()?;
-            if tok == Tok::Close {
-                break;
-            }
-            if tok == Tok::Eof {
-                return Err(AletheDefect::UnexpectedEof {
-                    pos,
-                    expected: "')' closing the application",
-                });
-            }
-            self.parse_term_from(lexer, tok, pos, binders, depth + 1)?;
-            count += 1;
-        }
-        if let Some((arity, name, pos)) = arity_check {
-            if arity != count {
-                // carcara: `expected 0 arguments, got 1` (probe
-                // `df_collide_arity`). A proof define-fun SHADOWS the problem
-                // declaration, so a mismatch is a hard parse error.
-                return Err(AletheDefect::UnexpectedToken {
-                    pos,
-                    expected: "the declared arity of a proof define-fun",
-                    found: format!("{name} applied to {count} arguments (expects {arity})"),
-                });
-            }
-        }
-        Ok(())
+        term_walk::check(self, lexer, tok, pos, binders, depth)
     }
 
     /// Parse `(_ NAME idx+)` after the `_`, or `(as t SORT)` after the `as`.
@@ -2222,194 +2132,6 @@ impl AletheDocumentChecker {
         Ok(())
     }
 
-    fn parse_qualified_head(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        binders: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<(), AletheDefect> {
-        let (tok, pos) = lexer.next_token()?;
-        match tok {
-            Tok::Symbol(ref name) if name == "_" => self.parse_indexed_tail(lexer, pos),
-            Tok::Symbol(ref name) if name == "as" => {
-                let (inner, inner_pos) = lexer.next_token()?;
-                match inner {
-                    Tok::Symbol(ref sym) if sym == "const" => {}
-                    Tok::Symbol(ref sym) => self.resolve_symbol(sym, inner_pos, binders)?,
-                    Tok::Open => {
-                        // `(as (_ ...) SORT)`
-                        self.parse_qualified_head(lexer, binders, depth)?;
-                    }
-                    other => {
-                        return Err(AletheDefect::UnexpectedToken {
-                            pos: inner_pos,
-                            expected: "an identifier after 'as'",
-                            found: other.describe(),
-                        })
-                    }
-                }
-                self.parse_sort(lexer)?;
-                self.expect(lexer, &Tok::Close, "')' closing the qualified identifier")
-            }
-            Tok::Symbol(ref name) if name == "lambda" => self.parse_binder(lexer, binders, depth),
-            other => Err(AletheDefect::UnexpectedToken {
-                pos,
-                expected: "'_', 'as' or 'lambda' in an application head",
-                found: other.describe(),
-            }),
-        }
-    }
-
-    fn parse_let(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        binders: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<(), AletheDefect> {
-        self.expect(lexer, &Tok::Open, "'(' opening the let bindings")?;
-        let mut introduced = Vec::new();
-        let mut list_pos;
-        loop {
-            let (tok, pos) = lexer.next_token()?;
-            list_pos = pos;
-            if tok == Tok::Close {
-                break;
-            }
-            if tok != Tok::Open {
-                return Err(AletheDefect::UnexpectedToken {
-                    pos,
-                    expected: "'(' opening a let binding",
-                    found: tok.describe(),
-                });
-            }
-            let (name_tok, name_pos) = lexer.next_token()?;
-            let Tok::Symbol(name) = name_tok else {
-                return Err(AletheDefect::UnexpectedToken {
-                    pos: name_pos,
-                    expected: "a let-bound name",
-                    found: name_tok.describe(),
-                });
-            };
-            // SMT-LIB `let` is parallel: the bound value sees only the OUTER
-            // scope.
-            let (tok, pos) = lexer.next_token()?;
-            self.parse_term_from(lexer, tok, pos, binders, depth + 1)?;
-            self.expect(lexer, &Tok::Close, "')' closing the let binding")?;
-            introduced.push(name);
-        }
-        if introduced.is_empty() {
-            return Err(AletheDefect::EmptySequence {
-                pos: list_pos,
-                keyword: "let".to_string(),
-            });
-        }
-        let mark = binders.len();
-        binders.extend(introduced);
-        let (tok, pos) = lexer.next_token()?;
-        let result = self.parse_term_from(lexer, tok, pos, binders, depth + 1);
-        binders.truncate(mark);
-        result?;
-        self.expect(lexer, &Tok::Close, "')' closing the let")
-    }
-
-    fn parse_binder(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        binders: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<(), AletheDefect> {
-        self.expect(lexer, &Tok::Open, "'(' opening the binder list")?;
-        let mark = binders.len();
-        let mut count = 0usize;
-        let mut list_pos;
-        loop {
-            let (tok, pos) = lexer.next_token()?;
-            list_pos = pos;
-            if tok == Tok::Close {
-                break;
-            }
-            if tok != Tok::Open {
-                binders.truncate(mark);
-                return Err(AletheDefect::UnexpectedToken {
-                    pos,
-                    expected: "'(' opening a sorted variable",
-                    found: tok.describe(),
-                });
-            }
-            let (name_tok, name_pos) = lexer.next_token()?;
-            let Tok::Symbol(name) = name_tok else {
-                binders.truncate(mark);
-                return Err(AletheDefect::UnexpectedToken {
-                    pos: name_pos,
-                    expected: "a bound variable name",
-                    found: name_tok.describe(),
-                });
-            };
-            if let Err(defect) = self.parse_sort(lexer) {
-                binders.truncate(mark);
-                return Err(defect);
-            }
-            if let Err(defect) = self.expect(lexer, &Tok::Close, "')' closing the sorted variable")
-            {
-                binders.truncate(mark);
-                return Err(defect);
-            }
-            binders.push(name);
-            count += 1;
-        }
-        if count == 0 {
-            binders.truncate(mark);
-            return Err(AletheDefect::EmptySequence {
-                pos: list_pos,
-                keyword: "binder".to_string(),
-            });
-        }
-        let (tok, pos) = lexer.next_token()?;
-        let result = self.parse_term_from(lexer, tok, pos, binders, depth + 1);
-        binders.truncate(mark);
-        result?;
-        self.expect(lexer, &Tok::Close, "')' closing the binder")
-    }
-
-    fn parse_annotation(
-        &mut self,
-        lexer: &mut Lexer<'_>,
-        binders: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<(), AletheDefect> {
-        let (tok, pos) = lexer.next_token()?;
-        self.parse_term_from(lexer, tok, pos, binders, depth + 1)?;
-        loop {
-            let (tok, pos) = lexer.next_token()?;
-            match tok {
-                Tok::Close => return Ok(()),
-                Tok::Keyword(_) => {
-                    // Annotation values are unconstrained; skip one balanced
-                    // token or s-expression.
-                    let (value, value_pos) = lexer.next_token()?;
-                    match value {
-                        Tok::Close => {
-                            return Err(AletheDefect::UnexpectedToken {
-                                pos: value_pos,
-                                expected: "an annotation value",
-                                found: ")".to_string(),
-                            })
-                        }
-                        Tok::Open => self.skip_balanced(lexer)?,
-                        _ => {}
-                    }
-                }
-                other => {
-                    return Err(AletheDefect::UnexpectedToken {
-                        pos,
-                        expected: "an annotation keyword",
-                        found: other.describe(),
-                    })
-                }
-            }
-        }
-    }
-
     fn skip_balanced(&self, lexer: &mut Lexer<'_>) -> Result<(), AletheDefect> {
         let mut depth = 1usize;
         loop {
@@ -2434,163 +2156,7 @@ impl AletheDocumentChecker {
     }
 
     fn parse_sort(&mut self, lexer: &mut Lexer<'_>) -> Result<(), AletheDefect> {
-        let (tok, pos) = lexer.next_token()?;
-        match tok {
-            Tok::Symbol(name) => {
-                if BUILTIN_SORTS.contains(&name.as_str()) || self.scope.contains_sort(&name) {
-                    Ok(())
-                } else {
-                    Err(AletheDefect::UndefinedSort { pos, name })
-                }
-            }
-            Tok::Open => {
-                let (head, head_pos) = lexer.next_token()?;
-                let Tok::Symbol(name) = head else {
-                    return Err(AletheDefect::UnexpectedToken {
-                        pos: head_pos,
-                        expected: "a sort constructor",
-                        found: head.describe(),
-                    });
-                };
-                if name == "_" {
-                    let (idx_name, idx_pos) = lexer.next_token()?;
-                    let Tok::Symbol(idx_name) = idx_name else {
-                        return Err(AletheDefect::UnexpectedToken {
-                            pos: idx_pos,
-                            expected: "an indexed sort name",
-                            found: idx_name.describe(),
-                        });
-                    };
-                    if !BUILTIN_INDEXED_SORTS.contains(&idx_name.as_str()) {
-                        return Err(AletheDefect::UndefinedSort {
-                            pos: idx_pos,
-                            name: idx_name,
-                        });
-                    }
-                    loop {
-                        let (tok, pos) = lexer.next_token()?;
-                        match tok {
-                            Tok::Close => return Ok(()),
-                            Tok::Numeral(_) => {}
-                            other => {
-                                return Err(AletheDefect::UnexpectedToken {
-                                    pos,
-                                    expected: "a sort index",
-                                    found: other.describe(),
-                                })
-                            }
-                        }
-                    }
-                }
-                if !BUILTIN_SORT_CONSTRUCTORS.contains(&name.as_str())
-                    && !self.scope.contains_sort(&name)
-                {
-                    return Err(AletheDefect::UndefinedSort {
-                        pos: head_pos,
-                        name,
-                    });
-                }
-                loop {
-                    let (tok, pos) = lexer.next_token()?;
-                    match tok {
-                        Tok::Close => return Ok(()),
-                        Tok::Symbol(inner) => {
-                            if !BUILTIN_SORTS.contains(&inner.as_str())
-                                && !self.scope.contains_sort(&inner)
-                            {
-                                return Err(AletheDefect::UndefinedSort { pos, name: inner });
-                            }
-                        }
-                        Tok::Open => {
-                            // Re-enter via a synthetic open: rewind is not
-                            // available, so parse the nested sort inline.
-                            self.parse_sort_after_open(lexer)?;
-                        }
-                        other => {
-                            return Err(AletheDefect::UnexpectedToken {
-                                pos,
-                                expected: "a sort",
-                                found: other.describe(),
-                            })
-                        }
-                    }
-                }
-            }
-            other => Err(AletheDefect::UnexpectedToken {
-                pos,
-                expected: "a sort",
-                found: other.describe(),
-            }),
-        }
-    }
-
-    /// The `Tok::Open` branch of [`Self::parse_sort`], entered with the open
-    /// paren already consumed.
-    fn parse_sort_after_open(&mut self, lexer: &mut Lexer<'_>) -> Result<(), AletheDefect> {
-        let (head, head_pos) = lexer.next_token()?;
-        let Tok::Symbol(name) = head else {
-            return Err(AletheDefect::UnexpectedToken {
-                pos: head_pos,
-                expected: "a sort constructor",
-                found: head.describe(),
-            });
-        };
-        if name == "_" {
-            let (idx_name, idx_pos) = lexer.next_token()?;
-            let Tok::Symbol(idx_name) = idx_name else {
-                return Err(AletheDefect::UnexpectedToken {
-                    pos: idx_pos,
-                    expected: "an indexed sort name",
-                    found: idx_name.describe(),
-                });
-            };
-            if !BUILTIN_INDEXED_SORTS.contains(&idx_name.as_str()) {
-                return Err(AletheDefect::UndefinedSort {
-                    pos: idx_pos,
-                    name: idx_name,
-                });
-            }
-            loop {
-                let (tok, pos) = lexer.next_token()?;
-                match tok {
-                    Tok::Close => return Ok(()),
-                    Tok::Numeral(_) => {}
-                    other => {
-                        return Err(AletheDefect::UnexpectedToken {
-                            pos,
-                            expected: "a sort index",
-                            found: other.describe(),
-                        })
-                    }
-                }
-            }
-        }
-        if !BUILTIN_SORT_CONSTRUCTORS.contains(&name.as_str()) && !self.scope.contains_sort(&name) {
-            return Err(AletheDefect::UndefinedSort {
-                pos: head_pos,
-                name,
-            });
-        }
-        loop {
-            let (tok, pos) = lexer.next_token()?;
-            match tok {
-                Tok::Close => return Ok(()),
-                Tok::Symbol(inner) => {
-                    if !BUILTIN_SORTS.contains(&inner.as_str()) && !self.scope.contains_sort(&inner)
-                    {
-                        return Err(AletheDefect::UndefinedSort { pos, name: inner });
-                    }
-                }
-                Tok::Open => self.parse_sort_after_open(lexer)?,
-                other => {
-                    return Err(AletheDefect::UnexpectedToken {
-                        pos,
-                        expected: "a sort",
-                        found: other.describe(),
-                    })
-                }
-            }
-        }
+        term_walk::sorts::check(self, lexer)
     }
 }
 
@@ -2602,7 +2168,9 @@ impl AletheDocumentChecker {
 ///
 /// This is the round-trip self-check: hand it the text the exporter just
 /// produced plus the problem's declared symbols, and it returns `Ok` only if
-/// the document is one carcara can parse.
+/// the document is one carcara can parse. The document is read as spelled
+/// for the default dialect, [`AletheDialect::Clean`]; see
+/// [`check_alethe_document_in_dialect`].
 ///
 /// # Errors
 ///
@@ -2611,7 +2179,21 @@ pub fn check_alethe_document(
     text: &str,
     scope: &ProblemScope,
 ) -> Result<AletheDocumentReport, AletheDefect> {
-    let mut checker = AletheDocumentChecker::new(scope.clone());
+    check_alethe_document_in_dialect(text, scope, AletheDialect::default())
+}
+
+/// [`check_alethe_document`] for a document spelled for `dialect`, whose
+/// checker fixes the rule vocabulary ([`AletheDialect::implements_rule`]).
+///
+/// # Errors
+///
+/// Returns the first [`AletheDefect`] found.
+pub fn check_alethe_document_in_dialect(
+    text: &str,
+    scope: &ProblemScope,
+    dialect: AletheDialect,
+) -> Result<AletheDocumentReport, AletheDefect> {
+    let mut checker = AletheDocumentChecker::new(scope.clone()).with_dialect(dialect);
     checker.push_str(text)?;
     checker.finish()
 }
@@ -2628,13 +2210,22 @@ pub struct AletheSelfCheckWriter<W> {
 }
 
 impl<W> AletheSelfCheckWriter<W> {
-    /// Wrap `inner`, checking every byte written against `scope`.
+    /// Wrap `inner`, checking every byte written against `scope`, as a
+    /// document spelled for the default dialect ([`AletheDialect::Clean`]).
     pub fn new(inner: W, scope: ProblemScope) -> Self {
         Self {
             inner,
             checker: Some(AletheDocumentChecker::new(scope)),
             defect: None,
         }
+    }
+
+    /// Read the stream as spelled for `dialect`
+    /// ([`AletheDocumentChecker::with_dialect`]).
+    #[must_use]
+    pub fn with_dialect(mut self, dialect: AletheDialect) -> Self {
+        self.checker = self.checker.map(|checker| checker.with_dialect(dialect));
+        self
     }
 
     /// Borrow the wrapped writer.
@@ -2676,8 +2267,9 @@ impl<W: std::io::Write> std::io::Write for AletheSelfCheckWriter<W> {
     }
 }
 
-/// The rule vocabulary the document checker accepts, exposed for tests and the
-/// offline differential harness.
+/// The rule vocabulary the document checker accepts for a pinned-Carcara
+/// document, exposed for tests and the offline differential harness. A
+/// Clean-dialect document may also name [`ay_core::CLEAN_DIALECT_ALETHE_RULES`].
 #[must_use]
 pub fn checkable_rule_names() -> &'static [&'static str] {
     &CHECKABLE_ALETHE_RULES

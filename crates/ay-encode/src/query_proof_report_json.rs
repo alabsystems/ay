@@ -69,7 +69,7 @@ impl QueryObligationBatchProofReport {
             "schema": CHC_QUERY_BATCH_PROOF_REPORT_SCHEMA,
             "schema_version": 1,
             "source": {
-                "normalized_input_schema": NORMALIZED_CHC_INPUT_SCHEMA,
+                "normalized_input_schema": self.source_normalized_input_schema,
                 "normalized_input_sha256": self.source_normalized_input_sha256,
                 "normalized_input_bytes": self.source_normalized_input_bytes,
                 "query_count": self.source_query_count,

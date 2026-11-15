@@ -7,6 +7,9 @@
 #[path = "common/spawn.rs"]
 pub mod spawn;
 
+#[path = "common/corpus.rs"]
+pub mod corpus;
+
 #[path = "group_soundness/arrays_as_array_extensionality.rs"]
 mod arrays_as_array_extensionality;
 
@@ -34,8 +37,20 @@ mod chc_array_bmc_8734;
 #[path = "group_soundness/chc_false_safe_barthe.rs"]
 mod chc_false_safe_barthe;
 
+#[path = "group_soundness/chc_false_safe_faulty_barthe.rs"]
+mod chc_false_safe_faulty_barthe;
+
+#[path = "group_soundness/chc_false_unsafe_pc_sfifo.rs"]
+mod chc_false_unsafe_pc_sfifo;
+
+#[path = "group_soundness/chc_empty_acyclic_safe_rigor.rs"]
+mod chc_empty_acyclic_safe_rigor;
+
 #[path = "group_soundness/dimacs_unsat_corpus_soundness.rs"]
 mod dimacs_unsat_corpus_soundness;
+
+#[path = "group_soundness/decompose_live_binaries_5314fd6c.rs"]
+mod decompose_live_binaries_5314fd6c;
 
 #[path = "group_soundness/frame_condition_regression.rs"]
 mod frame_condition_regression;
@@ -94,6 +109,12 @@ mod qf_uf_hwbench_soundness;
 #[path = "group_soundness/qf_auflia_storecomm_8785.rs"]
 mod qf_auflia_storecomm_8785;
 
+#[path = "group_soundness/qf_nra_horner_refining.rs"]
+mod qf_nra_horner_refining;
+
+#[path = "group_soundness/vendored_fixture_integrity.rs"]
+mod vendored_fixture_integrity;
+
 #[path = "group_soundness/qf_uflia_8783.rs"]
 mod qf_uflia_8783;
 
@@ -120,3 +141,84 @@ mod uart_23_8758;
 
 #[path = "group_soundness/z3_open_bugs.rs"]
 mod z3_open_bugs;
+
+#[path = "group_soundness/resident_session_history.rs"]
+mod resident_session_history;
+
+#[path = "group_soundness/resident_session_reset.rs"]
+mod resident_session_reset;
+
+#[path = "group_soundness/external_codegen_consumer_certificates.rs"]
+mod external_codegen_consumer_certificates;
+
+#[path = "group_soundness/external_codegen_resident_word_level.rs"]
+mod external_codegen_resident_word_level;
+
+#[path = "group_soundness/alethe_dialect_disclosure.rs"]
+mod alethe_dialect_disclosure;
+
+#[path = "group_soundness/alethe_undeclared_application_head.rs"]
+mod alethe_undeclared_application_head;
+
+#[path = "group_soundness/zero_extend_reliance.rs"]
+mod zero_extend_reliance;
+
+#[path = "group_soundness/carcara_surface_problem_reading.rs"]
+mod carcara_surface_problem_reading;
+
+#[path = "group_soundness/strict_certificate_publication.rs"]
+mod strict_certificate_publication;
+
+#[path = "group_soundness/strict_admission_routes.rs"]
+mod strict_admission_routes;
+
+#[path = "group_soundness/strict_authored_spelling_bridges.rs"]
+mod strict_authored_spelling_bridges;
+#[path = "group_soundness/strict_definition_premise.rs"]
+mod strict_definition_premise;
+#[path = "group_soundness/strict_folded_premise.rs"]
+mod strict_folded_premise;
+
+#[path = "group_soundness/real_only_numeral_premise.rs"]
+mod real_only_numeral_premise;
+#[path = "group_soundness/strict_admission_spellings.rs"]
+mod strict_admission_spellings;
+#[path = "group_soundness/strict_default_publication.rs"]
+mod strict_default_publication;
+#[path = "group_soundness/strict_publication_after_error.rs"]
+mod strict_publication_after_error;
+#[path = "group_soundness/unsat_evidence_labels.rs"]
+mod unsat_evidence_labels;
+
+#[path = "group_soundness/strict_chc_spellings.rs"]
+mod strict_chc_spellings;
+
+#[path = "group_soundness/strict_chc_race_trace.rs"]
+mod strict_chc_race_trace;
+
+#[path = "group_soundness/nested_array_model_witness.rs"]
+mod nested_array_model_witness;
+
+#[path = "group_soundness/array_valued_uf_printed_model.rs"]
+mod array_valued_uf_printed_model;
+
+#[path = "group_soundness/array_refuted_model_resolve_cli.rs"]
+mod array_refuted_model_resolve_cli;
+
+#[path = "group_soundness/vacuous_binder_strict_proofs.rs"]
+mod vacuous_binder_strict_proofs;
+
+#[path = "group_soundness/refused_surface_step_hole.rs"]
+mod refused_surface_step_hole;
+
+#[path = "group_soundness/reordered_row_store_hole.rs"]
+mod reordered_row_store_hole;
+
+#[path = "group_soundness/signed_symbol_verdicts.rs"]
+mod signed_symbol_verdicts;
+
+#[path = "group_soundness/lnh_on_off_agreement.rs"]
+mod lnh_on_off_agreement;
+
+#[path = "group_soundness/model_checker_consumer_bmc_walker_original.rs"]
+mod model_checker_consumer_bmc_walker_original;

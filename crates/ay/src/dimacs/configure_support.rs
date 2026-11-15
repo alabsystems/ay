@@ -15,16 +15,21 @@ fn finish_configure_dimacs_solver(solver: &mut SatSolver) {
     // let it convert 0.15 s solves into 300 s timeouts.
     let timeout_ms = super::GLOBAL_TIMEOUT_MS.load(Ordering::SeqCst);
     if timeout_ms > 0 {
+        solver.set_solve_budget_ms(Some(timeout_ms));
         if let Some(start) = super::START_TIME.get() {
             // An adversarially large CLI timeout can exceed the monotonic
             // clock's representable range; the watchdog still owns the hard
             // timeout, so omit only this cooperative deadline.
-            if let Some(deadline) =
-                start.checked_add(std::time::Duration::from_millis(timeout_ms))
+            if let Some(deadline) = start.checked_add(std::time::Duration::from_millis(timeout_ms))
             {
                 solver.set_solve_deadline(Some(deadline));
             }
         }
+    }
+    // `--sat-conflict-cap`: a counted stop for screens. The search answers
+    // UNKNOWN at its N-th conflict, a point host load cannot move.
+    if let Some(cap) = ay_core::sat_ab_switches().conflict_cap {
+        solver.set_conflict_budget(Some(cap));
     }
     // Size the learned clause database against the process memory budget.
     //

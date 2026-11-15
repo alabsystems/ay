@@ -172,3 +172,83 @@ fn test_assert_after_check_sat_invalidates_model_access() {
         "expected NoResult after post-solve assertion, got {model_map_err:?}"
     );
 }
+
+/// A SAT model holding a NEGATIVE Int and a NEGATIVE non-integer Real must
+/// read back through the strict typed decoder. The native get-value printer
+/// used to spell a negative Int as the bare token `-7`, which is not an
+/// SMT-LIB numeral, so the whole batch failed with ModelGenerationFailed.
+#[test]
+fn negative_int_and_real_values_survive_typed_read_back() {
+    let mut solver = Solver::new(Logic::All);
+    let x = solver.declare_const("x", Sort::Int);
+    let r = solver.declare_const("r", Sort::Real);
+    let seven = solver.int_const(7);
+    let minus_seven = solver.neg(seven);
+    let x_eq = solver.eq(x, minus_seven);
+    solver.assert_term(x_eq);
+    let half = solver.rational_const(-1, 2);
+    let r_eq = solver.eq(r, half);
+    solver.assert_term(r_eq);
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+
+    let text = solver.values_smtlib(&[x, r]).expect("raw get-value text");
+    assert!(!text.contains(" -7"), "bare negative Int numeral: {text}");
+
+    let values = solver
+        .try_get_values(&[x, r])
+        .expect("negative model values must decode");
+    assert_eq!(values[0], ModelValue::Int(BigInt::from(-7)));
+    assert_eq!(
+        values[1],
+        ModelValue::Real(num_rational::BigRational::new(
+            BigInt::from(-1),
+            BigInt::from(2)
+        ))
+    );
+
+    let map = solver
+        .try_get_model_map()
+        .expect("negative model values must decode in the model map");
+    assert_eq!(map.get("x"), Some(&ModelValue::Int(BigInt::from(-7))));
+}
+
+/// A negative Int stored in an Int->Int array, and a negative Int index,
+/// must survive the typed array read-back as well.
+#[test]
+fn negative_int_inside_array_store_chain_survives_typed_read_back() {
+    let mut solver = Solver::new(Logic::All);
+    let a = solver.declare_const("a", Sort::array(Sort::Int, Sort::Int));
+    let x = solver.declare_const("x", Sort::Int);
+    let three = solver.int_const(3);
+    let minus_three = solver.neg(three);
+    let five = solver.int_const(5);
+    let minus_five = solver.neg(five);
+    let read = solver.select(a, minus_three);
+    let read_eq = solver.eq(read, minus_five);
+    solver.assert_term(read_eq);
+    let x_eq = solver.eq(x, read);
+    solver.assert_term(x_eq);
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+
+    let values = solver
+        .try_get_values(&[a, x, read])
+        .expect("array model with negative Int cells must decode");
+    assert_eq!(values[1], ModelValue::Int(BigInt::from(-5)));
+    assert_eq!(values[2], ModelValue::Int(BigInt::from(-5)));
+    match &values[0] {
+        ModelValue::Array { stores, .. } => assert!(
+            stores
+                .iter()
+                .any(|(i, v)| *i == ModelValue::Int(BigInt::from(-3))
+                    && *v == ModelValue::Int(BigInt::from(-5))),
+            "store chain lost the negative cell: {:?}",
+            values[0]
+        ),
+        other => panic!("expected a structured array value, got {other:?}"),
+    }
+
+    let map = solver
+        .try_get_model_map()
+        .expect("model map with a negative array cell must decode");
+    assert_eq!(map.get("x"), Some(&ModelValue::Int(BigInt::from(-5))));
+}

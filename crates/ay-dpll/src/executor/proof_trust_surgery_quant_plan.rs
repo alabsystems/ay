@@ -17,6 +17,11 @@ use crate::executor::proof_surface_syntax::strip_frontend_annotations;
 use crate::executor::proof_trust_surgery_provenance::{complement_of, MAX_PROVENANCE_REPAIR_TERMS};
 use crate::executor::Executor;
 
+enum QuantConsequenceSearch {
+    Exact,
+    Entailment,
+}
+
 fn quant_plan_capacity_remaining(plan_count: usize, requested_chains: usize) -> bool {
     requested_chains > 0
         && plan_count
@@ -276,6 +281,29 @@ impl Executor {
         None
     }
 
+    /// The consequence lemma `(cl (not inst) (not s).. conclusion)`, or NO
+    /// lemma for an IDENTITY consequence: when the trust unit is the instance
+    /// itself the chain already derives `(cl conclusion)`, and the lemma would
+    /// be the tautology `(cl (not L) L)` the surface audit refuses to emit.
+    /// See `QuantConsequencePlan::lemma`.
+    fn quant_consequence_lemma(
+        &mut self,
+        inst: TermId,
+        used: &[TermId],
+        conclusion: TermId,
+    ) -> Vec<TermId> {
+        if inst == conclusion && used.is_empty() {
+            return Vec::new();
+        }
+        let mut lemma = Vec::with_capacity(2 + used.len());
+        lemma.push(complement_of(&mut self.ctx.terms, inst));
+        for &support in used {
+            lemma.push(complement_of(&mut self.ctx.terms, support));
+        }
+        lemma.push(conclusion);
+        lemma
+    }
+
     /// Recognize a folded consequence of one quantifier-expansion instance
     /// and at most one exact authored arithmetic support.
     pub(super) fn plan_quant_consequence(
@@ -293,91 +321,121 @@ impl Executor {
             return None;
         }
         let conclusion = clause[0];
-        let supports = authority.nonquant_supports(&self.ctx.terms, originals)?;
         let mut budget = 20_000usize;
         let record_count = self.quant_expansion_records.len().min(4096);
-        for record_index in 0..record_count {
-            let assertion_index = self.quant_expansion_records[record_index].assertion_index;
-            let Some((forall_term, parsed)) = originals.get(assertion_index) else {
-                continue;
+        // Prefer an exact recorded instance before probing arithmetic entailment.
+        for search in [
+            QuantConsequenceSearch::Exact,
+            QuantConsequenceSearch::Entailment,
+        ] {
+            let supports = match search {
+                QuantConsequenceSearch::Exact => Vec::new(),
+                QuantConsequenceSearch::Entailment => {
+                    authority.nonquant_supports(&self.ctx.terms, originals)?
+                }
             };
-            let forall_term = *forall_term;
-            if !matches!(self.ctx.terms.get(forall_term), TermData::Forall(..))
-                || authority.original(originals, forall_term).is_none()
-            {
-                continue;
-            }
-            if !authority.spend_chain_source(forall_term, parsed) {
-                return None;
-            }
-            if !matches!(strip_frontend_annotations(parsed), FrontendTerm::Forall(..)) {
-                continue;
-            }
-            let instance_count = self.quant_expansion_records[record_index].instances.len();
-            for instance_index in 0..instance_count {
-                budget = budget.checked_sub(1)?;
-                let (values, inst) = {
-                    let (values, inst) =
-                        &self.quant_expansion_records[record_index].instances[instance_index];
-                    if values.len() > MAX_PROVENANCE_REPAIR_TERMS {
-                        continue;
-                    }
-                    if !authority.spend_solver_attempt(&self.ctx.terms, values) {
-                        return None;
-                    }
-                    (values.clone(), *inst)
+            for record_index in 0..record_count {
+                let assertion_index = self.quant_expansion_records[record_index].assertion_index;
+                let Some((forall_term, parsed)) = originals.get(assertion_index) else {
+                    continue;
                 };
-                if matches!(self.ctx.terms.get(inst), TermData::Const(_)) {
+                let forall_term = *forall_term;
+                if !matches!(self.ctx.terms.get(forall_term), TermData::Forall(..))
+                    || authority.original(originals, forall_term).is_none()
+                {
                     continue;
                 }
-                if !authority.spend_solver_attempt(&self.ctx.terms, &[inst, conclusion]) {
-                    return None;
-                }
-                let used = if self.quant_lemma_valid(&[inst], conclusion) {
-                    Vec::new()
-                } else {
-                    let mut found = None;
-                    for &support in &supports {
-                        budget = budget.checked_sub(1)?;
-                        if !authority
-                            .spend_solver_attempt(&self.ctx.terms, &[inst, support, conclusion])
-                        {
-                            return None;
-                        }
-                        if self.quant_lemma_valid(&[inst, support], conclusion) {
-                            found = Some(support);
-                            break;
-                        }
-                    }
-                    let Some(support) = found else {
-                        continue;
-                    };
-                    vec![support]
-                };
                 if !authority.spend_chain_source(forall_term, parsed) {
                     return None;
                 }
-                if !authority.spend_solver_attempt(&self.ctx.terms, &values) {
-                    return None;
-                }
-                let Some(chain) = self.build_quant_instance_chain(parsed, &values, inst) else {
+                if !matches!(strip_frontend_annotations(parsed), FrontendTerm::Forall(..)) {
                     continue;
-                };
-                let mut lemma = Vec::with_capacity(2 + used.len());
-                lemma.push(complement_of(&mut self.ctx.terms, inst));
-                for &support in &used {
-                    lemma.push(complement_of(&mut self.ctx.terms, support));
                 }
-                lemma.push(conclusion);
-                if !record_quant_plan(plan_count, 1) {
-                    return None;
+                let instance_count = self.quant_expansion_records[record_index].instances.len();
+                for instance_index in 0..instance_count {
+                    budget = budget.checked_sub(1)?;
+                    if !authority.spend_classification_work(1) {
+                        return None;
+                    }
+                    let (values, inst) = {
+                        let (values, inst) =
+                            &self.quant_expansion_records[record_index].instances[instance_index];
+                        if values.len() > MAX_PROVENANCE_REPAIR_TERMS
+                            || (matches!(search, QuantConsequenceSearch::Exact)
+                                != (*inst == conclusion))
+                        {
+                            continue;
+                        }
+                        if !authority.spend_solver_attempt(&self.ctx.terms, values) {
+                            return None;
+                        }
+                        (values.clone(), *inst)
+                    };
+                    if matches!(self.ctx.terms.get(inst), TermData::Const(_)) {
+                        continue;
+                    }
+                    if inst != conclusion
+                        && !authority.spend_solver_attempt(&self.ctx.terms, &[inst, conclusion])
+                    {
+                        return None;
+                    }
+                    let used = if inst == conclusion || self.quant_lemma_valid(&[inst], conclusion)
+                    {
+                        Vec::new()
+                    } else {
+                        let mut found = None;
+                        for &support in &supports {
+                            budget = budget.checked_sub(1)?;
+                            if !authority
+                                .spend_solver_attempt(&self.ctx.terms, &[inst, support, conclusion])
+                            {
+                                return None;
+                            }
+                            if self.quant_lemma_valid(&[inst, support], conclusion) {
+                                found = Some(support);
+                                break;
+                            }
+                        }
+                        let Some(support) = found else {
+                            continue;
+                        };
+                        vec![support]
+                    };
+                    if !authority.spend_chain_source(forall_term, parsed) {
+                        return None;
+                    }
+                    if !authority.spend_solver_attempt(&self.ctx.terms, &values) {
+                        return None;
+                    }
+                    let Some(chain) = self.build_quant_instance_chain(parsed, &values, inst) else {
+                        continue;
+                    };
+                    if !authority.spend_chain_source(forall_term, parsed)
+                        || !authority.spend_solver_attempt(&self.ctx.terms, &values)
+                    {
+                        return None;
+                    }
+                    let Some(raw_forall) = self.build_raw_ematching_forall_source(
+                        forall_term,
+                        parsed,
+                        &values,
+                        chain.phi,
+                    ) else {
+                        continue;
+                    };
+                    let lemma = self.quant_consequence_lemma(inst, &used, conclusion);
+                    if !record_quant_plan(plan_count, 1) {
+                        return None;
+                    }
+                    return Some(QuantConsequencePlan {
+                        source_quantifier: forall_term,
+                        assertion_index,
+                        forall_term: raw_forall,
+                        chain,
+                        supports: used,
+                        lemma,
+                    });
                 }
-                return Some(QuantConsequencePlan {
-                    forall_term,
-                    chain,
-                    supports: used,
-                    lemma,
-                });
             }
         }
         None

@@ -257,7 +257,32 @@ impl BoundProvenance {
         raw.retain(|pair| seen.insert(*pair));
         raw
     }
+
+    /// `true` when `pred` holds for every reason leaf of the DAG
+    /// (#nia-sign-cut-soundness). Allocation-free counterpart of
+    /// [`Self::collect_reasons`] for liveness audits on hot paths; sentinel
+    /// leaves are skipped exactly as `collect_reasons` skips them.
+    pub fn reasons_all(&self, pred: &dyn Fn(TermId, bool) -> bool) -> bool {
+        match self {
+            Self::Atom { term, value } => term.is_sentinel() || pred(*term, *value),
+            Self::SharedEquality { reasons } => reasons
+                .iter()
+                .all(|&(term, value)| term.is_sentinel() || pred(term, value)),
+            Self::Join { parts } => parts.iter().all(|part| part.reasons_all(pred)),
+            Self::Axiom => true,
+        }
+    }
 }
+
+/// Inline reason storage for [`Bound`] (#bound-churn).
+///
+/// The overwhelming majority of bounds carry exactly ONE reason (every direct
+/// atom bound, every NIA factor-split pin/cut with its sentinel reason), so a
+/// one-element inline buffer makes `Bound::new`, the trail clone in
+/// `assert_var_bound`, and the `Bound` drop glue allocation-free. Multi-reason
+/// bounds (Diophantine, shared-equality) spill to the heap exactly as a `Vec`
+/// would. `SmallVec` derefs to a slice, so every read site is unchanged.
+pub type BoundReasons<T> = SmallVec<[T; 1]>;
 
 /// A bound with its value and the atoms that established it
 #[derive(Debug, Clone)]
@@ -267,13 +292,13 @@ pub struct Bound {
     /// The atom terms that established this bound.
     /// Multiple reasons can exist when bounds are derived from the LIA solver's
     /// Diophantine analysis, which combines information from multiple constraints.
-    pub reasons: Vec<TermId>,
+    pub reasons: BoundReasons<TermId>,
     /// The Boolean values of each reason in the current assignment.
     ///
     /// When the SAT layer assigns an atom `t` to `false`, the theory asserts the
     /// negation of `t` (e.g. `!(x <= 5)` becomes `x > 5`). For conflict clauses
     /// to be sound, we must preserve that polarity.
-    pub reason_values: Vec<bool>,
+    pub reason_values: BoundReasons<bool>,
     /// Farkas scaling factors for each reason atom.
     ///
     /// When an atom like `5x <= c` is normalized to a per-variable bound `x <= c/5`,
@@ -285,7 +310,7 @@ pub struct Bound {
     /// #8406: Changed from `Vec<BigRational>` to `Vec<Rational>` to eliminate heap
     /// allocation on every bound assertion. Most scales are 1 (Rational::Small(1,1)),
     /// which is zero-allocation inline storage.
-    pub reason_scales: Vec<Rational>,
+    pub reason_scales: BoundReasons<Rational>,
     /// Whether the bound is strict (< or >) vs non-strict (<= or >=)
     pub strict: bool,
     /// Complete justification chain for this bound (#8151).
@@ -302,13 +327,20 @@ pub struct Bound {
 
 impl Bound {
     /// Create a bound with reason tracking and debug invariant checks.
+    ///
+    /// The reason containers are generic over `Into<BoundReasons<_>>` so
+    /// callers may pass a `Vec` (spilled), a `[T; 1]` array (inline, no
+    /// allocation) or a `SmallVec` directly.
     pub fn new(
         value: Rational,
-        reasons: Vec<TermId>,
-        reason_values: Vec<bool>,
-        reason_scales: Vec<Rational>,
+        reasons: impl Into<BoundReasons<TermId>>,
+        reason_values: impl Into<BoundReasons<bool>>,
+        reason_scales: impl Into<BoundReasons<Rational>>,
         strict: bool,
     ) -> Self {
+        let reasons = reasons.into();
+        let reason_values = reason_values.into();
+        let reason_scales = reason_scales.into();
         debug_assert_eq!(
             reasons.len(),
             reason_values.len(),
@@ -364,9 +396,9 @@ impl Bound {
     pub fn without_reasons(value: Rational, strict: bool) -> Self {
         Self {
             value,
-            reasons: Vec::new(),
-            reason_values: Vec::new(),
-            reason_scales: Vec::new(),
+            reasons: BoundReasons::new(),
+            reason_values: BoundReasons::new(),
+            reason_scales: BoundReasons::new(),
             strict,
             provenance: None,
         }

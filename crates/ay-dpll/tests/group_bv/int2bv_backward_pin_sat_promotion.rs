@@ -29,6 +29,60 @@
 
 use ntest::timeout;
 
+#[test]
+#[timeout(60_000)]
+fn test_int2bv_low_mask_alignment_model() {
+    let outputs = crate::common::solve_vec(
+        r#"
+        (set-logic ALL)
+        (declare-const x Int)
+        (assert (> x 0))
+        (assert (<= x 4))
+        (assert (= 0 (bv2nat (bvand ((_ int2bv 64) x) #x0000000000000003))))
+        (check-sat)
+        (get-value (x))
+        "#,
+    );
+    assert!(outputs.iter().any(|line| line == "sat"), "{outputs:?}");
+    assert!(outputs.join("\n").contains("(x 4)"), "{outputs:?}");
+}
+
+#[test]
+#[timeout(60_000)]
+fn test_int2bv_low_mask_alignment_excluded() {
+    assert_eq!(
+        verdict(
+            r#"
+            (set-logic ALL)
+            (declare-const x Int)
+            (assert (> x 0))
+            (assert (< x 4))
+            (assert (= 0 (bv2nat (bvand ((_ int2bv 64) x) #x0000000000000003))))
+            (check-sat)
+            "#,
+        ),
+        "unsat"
+    );
+}
+
+#[test]
+#[timeout(60_000)]
+fn test_int2bv_low_mask_alignment_negative_wrap() {
+    assert_eq!(
+        verdict(
+            r#"
+            (set-logic ALL)
+            (declare-const x Int)
+            (assert (< x (- 16)))
+            (assert (> x (- 20)))
+            (assert (= 3 (bv2nat (bvand #x3 ((_ int2bv 4) x)))))
+            (check-sat)
+            "#,
+        ),
+        "sat"
+    );
+}
+
 fn verdict(smt: &str) -> String {
     let outputs = crate::common::solve_vec(smt);
     outputs

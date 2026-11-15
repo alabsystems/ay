@@ -86,8 +86,11 @@ impl LiaSolver<'_> {
                 let scaled = (coeff * &lcm_den).to_integer();
                 let abs_scaled = scaled.abs();
 
-                // Check if this variable is fixed
-                if let Some((lb, ub)) = self.lra.get_var_bounds(*var) {
+                // Check if this variable is fixed — by JUSTIFIED bounds only
+                // (#nia-sign-cut-soundness): an NIA rounding / patch pin also
+                // reads `lb == ub`, and folding it into the constant makes the
+                // divisibility test decide against a guess.
+                if let Some((lb, ub)) = self.justified_var_bounds(*var) {
                     let is_fixed = lb.is_some() && ub.is_some() && lb == ub;
                     let is_bounded = lb.is_some() && ub.is_some();
                     let is_int = self.lra.is_int_var(*var, &self.integer_vars);
@@ -132,8 +135,9 @@ impl LiaSolver<'_> {
             if !remainder.is_zero() {
                 if debug {
                     safe_eprintln!(
-                        "[GCD_TAB] UNSAT: Row basic_var={} GCD={} does not divide const={} (remainder={})",
-                        row.basic_var, gcds, scaled_const, remainder
+                        "[GCD_TAB] UNSAT: Row basic_var={} GCD={} does not divide const={} (remainder={}); row={:?}; bounds={:?}",
+                        row.basic_var, gcds, scaled_const, remainder, row,
+                        row.coeffs.iter().map(|(var, _)| (*var, self.justified_var_bounds(*var))).collect::<Vec<_>>()
                     );
                 }
                 info!(
@@ -158,8 +162,9 @@ impl LiaSolver<'_> {
                 if let Some(conflict) = self.ext_gcd_test(&row, &least_coeff, &lcm_den, &consts) {
                     if debug {
                         safe_eprintln!(
-                            "[GCD_TAB] Extended GCD test detected UNSAT for row basic_var={}",
-                            row.basic_var
+                            "[GCD_TAB] Extended GCD test detected UNSAT for row basic_var={}; lcm={}; least={}; fixed={}; row={:?}; bounds={:?}",
+                            row.basic_var, lcm_den, least_coeff, consts, row,
+                            row.coeffs.iter().map(|(var, _)| (*var, self.justified_var_bounds(*var))).collect::<Vec<_>>()
                         );
                     }
                     info!(
@@ -262,7 +267,9 @@ impl LiaSolver<'_> {
         }
 
         for (var, coeff) in &row.coeffs {
-            if let Some((lb, ub)) = self.lra.get_var_bounds(*var) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness), matching the
+            // fixed-variable fold above.
+            if let Some((lb, ub)) = self.justified_var_bounds(*var) {
                 let is_fixed = lb.is_some() && ub.is_some() && lb == ub;
                 if is_fixed {
                     continue; // Already handled in fixed_consts

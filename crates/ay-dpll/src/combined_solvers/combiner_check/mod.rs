@@ -27,7 +27,8 @@ use super::check_loops::{
 use super::combiner::TheoryCombiner;
 use super::interface_bridge::{
     evaluate_arith_term_with_reasons, evaluate_real_arith_term_with_reasons,
-    has_unjustified_int_leaf, lia_get_int_value_with_reasons, lra_get_real_value_with_reasons,
+    has_unjustified_int_leaf, has_unjustified_real_leaf, lia_get_int_value_with_reasons,
+    lra_get_real_value_with_reasons,
 };
 use super::theory_stats;
 
@@ -1645,14 +1646,11 @@ impl TheoryCombiner<'_> {
                 arrays,
                 &mut self.euf,
                 |t| {
+                    let get = |var| lia_get_int_value_with_reasons(lia, var);
                     let mut reasons = Vec::new();
-                    let value = evaluate_arith_term_with_reasons(
-                        terms,
-                        &|var| lia_get_int_value_with_reasons(lia, var),
-                        t,
-                        &mut reasons,
-                    )?;
-                    Some((value, reasons))
+                    let value = evaluate_arith_term_with_reasons(terms, &get, t, &mut reasons)?;
+                    let justified = !has_unjustified_int_leaf(terms, &get, t);
+                    Some((value, justified.then_some(reasons)))
                 },
                 act_on_read_congruence_pairs,
             )
@@ -1662,14 +1660,12 @@ impl TheoryCombiner<'_> {
                 arrays,
                 &mut self.euf,
                 |t| {
+                    let get = |var| lra_get_real_value_with_reasons(lra, var);
                     let mut reasons = Vec::new();
-                    let value = evaluate_real_arith_term_with_reasons(
-                        terms,
-                        &|var| lra_get_real_value_with_reasons(lra, var),
-                        t,
-                        &mut reasons,
-                    )?;
-                    Some((value, reasons))
+                    let value =
+                        evaluate_real_arith_term_with_reasons(terms, &get, t, &mut reasons)?;
+                    let justified = !has_unjustified_real_leaf(terms, &get, t);
+                    Some((value, justified.then_some(reasons)))
                 },
                 act_on_read_congruence_pairs,
             )

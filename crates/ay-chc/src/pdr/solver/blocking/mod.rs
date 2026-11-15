@@ -32,6 +32,8 @@ pub(super) use array_skolem::ArraySkolemState;
 pub(super) use property_indices::PropertyArrayIndices;
 
 use bool_normalization::{denormalize_int_to_bool, extract_farkas_from_result};
+pub(in crate::pdr::solver) use reachability::ClauseCore;
+pub(in crate::pdr::solver) use reachability::NlRound;
 use reachability::{ClauseInterpolationData, ReachabilityData};
 
 use super::{
@@ -40,6 +42,7 @@ use super::{
     LemmaGeneralizer, LiteralWeakeningGeneralizer, PdrGeneralizerAdapter, PdrSolver, PobKind,
     PredecessorState, PredicateId, ProofObligation, SmtResult, SmtValue,
 };
+use crate::pdr::solver::spacer_core::stats::UnknownClass;
 use crate::pdr::solver::ArraySessionKey;
 use crate::proof_interpolation::InterpolantKind;
 use crate::smt::IncrementalCheckResult;
@@ -69,7 +72,27 @@ impl PdrSolver {
     /// Try to block a proof obligation using SMT queries (with local blocked states)
     ///
     /// NOTE: `pob` is mutable to allow storing `smt_model` from already-blocked checks (#801).
+    ///
+    /// Workstream B: this wrapper only keeps the board's wall-time counter and
+    /// resets the telemetry-only `pending_unknown_class`; the algorithm is in
+    /// `block_obligation_inner`.
     pub(in crate::pdr::solver) fn block_obligation_with_local_blocked(
+        &mut self,
+        pob: &mut ProofObligation,
+        blocked_at_level_0: &[(PredicateId, ChcExpr)],
+        unknown_predecessors: &[(usize, PredicateId, ChcExpr)],
+    ) -> BlockResult {
+        let started = ay_core::time::Instant::now();
+        self.pending_unknown_class = None;
+        let result = self.block_obligation_inner(pob, blocked_at_level_0, unknown_predecessors);
+        self.spacer_stats.block_ms_total = self
+            .spacer_stats
+            .block_ms_total
+            .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        result
+    }
+
+    fn block_obligation_inner(
         &mut self,
         pob: &mut ProofObligation,
         _blocked_at_level_0: &[(PredicateId, ChcExpr)],
@@ -86,6 +109,7 @@ impl PdrSolver {
                     pob.level
                 );
             }
+            self.spacer_stats.already_blocked_syntactic += 1;
             return BlockResult::AlreadyBlocked;
         }
 
@@ -100,12 +124,26 @@ impl PdrSolver {
                     pob.level
                 );
             }
+            self.spacer_stats.already_blocked_syntactic += 1;
             return BlockResult::AlreadyBlocked;
         }
 
         // Early cancellation check before expensive SMT work
         if self.is_cancelled() {
+            self.pending_unknown_class = Some(UnknownClass::Cancelled);
             return BlockResult::Unknown;
+        }
+
+        // Workstream B dispatch (contract C4, `DESIGN` §2 / §4.4): after the
+        // syntactic checks, a linear predicate under the lane goes to the
+        // Spacer-faithful path (no already-blocked pre-check unless
+        // `already_blocked_fastpath`; Q1 verdicts identical; lemma from the
+        // cores). Hyperedge predicates, arrays, BV and datatypes stay here.
+        if self.spacer_core {
+            if self.lane_nonlinear || self.linear_pred(pob.predicate) {
+                return self.block_linear(pob, unknown_predecessors);
+            }
+            self.spacer_stats.lane_bypassed_hyperedge += 1;
         }
 
         // Step 1: Check if pob.state is already blocked by lemmas AT THIS LEVEL ONLY
@@ -154,6 +192,7 @@ impl PdrSolver {
                     if self.config.verbose {
                         safe_eprintln!("PDR: State already blocked at level {}", pob.level);
                     }
+                    self.spacer_stats.already_blocked_smt += 1;
                     return BlockResult::AlreadyBlocked;
                 }
                 IncrementalCheckResult::Sat(m) => {
@@ -188,230 +227,314 @@ impl PdrSolver {
         // N1 approach (#917): Track per-clause data for interpolation in clause-local names.
         // We keep both the combined constraints (for combined interpolation) and per-clause
         // info (for per-clause interpolation with proper variable naming).
-        let mut transition_constraints: Vec<ChcExpr> = Vec::new();
-
-        let mut clause_interpolation_data: Vec<ClauseInterpolationData> = Vec::new();
-
-        if pob.level == 0 {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "PDR: Level 0 checking init reachability for state={}",
-                    pob.state
-                );
-            }
-            let mut found_clause = false;
-            let mut had_sat_no_cube = false;
-            for (clause_index, clause) in self
-                .problem
-                .clauses_defining_with_index(pob.predicate)
-                .filter(|(_, clause)| clause.is_fact())
-            {
-                // #2887: Check cancellation between SMT queries in clause loop.
-                if self.is_cancelled() {
-                    return BlockResult::Unknown;
-                }
-                found_clause = true;
-
-                let fact_constraint = clause
-                    .body
-                    .constraint
-                    .clone()
-                    .unwrap_or(ChcExpr::Bool(true));
-                let head_args = match &clause.head {
-                    crate::ClauseHead::Predicate(_, a) => a.as_slice(),
-                    crate::ClauseHead::False => continue,
-                };
-                if self.config.verbose {
-                    safe_eprintln!(
-                        "PDR: Level 0 clause {}: fact_constraint={}, head_args={:?}",
-                        clause_index,
-                        fact_constraint,
-                        head_args
-                    );
-                }
-                let state_on_fact = match self.apply_to_args(pob.predicate, &pob.state, head_args) {
-                    Some(e) => e,
-                    None => {
-                        if self.config.verbose {
-                            safe_eprintln!("PDR: Level 0: apply_to_args failed");
-                        }
-                        return BlockResult::Unknown;
-                    }
-                };
-                // Clone fact_constraint for MBP - it's used in query but also needed for projection
-                let query = self
-                    .bound_int_vars(ChcExpr::and(fact_constraint.clone(), state_on_fact.clone()));
-                if self.config.verbose {
-                    safe_eprintln!("PDR: Level 0 query: {}", query);
-                }
-
-                let projection_vars = self.projection_vars_for_args(pob.predicate, head_args);
-                // #6366: Skip O(expr_size) tree walk for pure-LIA problems.
-                // When uses_arrays is false, no query can contain array ops.
-                let result = if self.uses_arrays && query.contains_array_ops() {
-                    Self::check_array_clause_query(
-                        &mut self.smt,
-                        &mut self.array_clause_sessions,
-                        ArraySessionKey::HeadFact { clause_index },
-                        &fact_constraint,
-                        &state_on_fact,
-                        &query,
-                        self.max_array_params,
-                    )
-                } else {
-                    // #6358: Per-predicate prop_solver for clause predecessor.
-                    // Pure-LIA: one solve via prop_solver. Non-pure-LIA: one solve
-                    // via non-incremental. No double-solve.
-                    if self.incremental_pdr_enabled() {
-                        let check_timeout = self.smt.current_timeout();
-                        let seg_key =
-                            super::prop_solver::SegmentKey::ClauseBlocking { clause_index };
-                        let prop = super::core::ensure_prop_solver_split(
-                            &mut self.prop_solvers,
-                            &self.frames,
-                            pob.predicate,
-                        );
-                        prop.register_segment(seg_key, &fact_constraint);
-                        let incr_result = prop.check_clause_blocking(
-                            0,
-                            clause_index,
-                            &[state_on_fact.clone()],
-                            check_timeout,
-                            pob.smt_model.as_ref(),
-                        );
-                        match incr_result {
-                            IncrementalCheckResult::Unsat => SmtResult::Unsat,
-                            IncrementalCheckResult::Sat(model) => SmtResult::Sat(model),
-                            IncrementalCheckResult::Unknown => SmtResult::Unknown,
-                        }
-                    } else {
-                        self.smt.reset();
-                        self.smt
-                            .with_phase_seed_model(pob.smt_model.as_ref(), |smt| {
-                                smt.check_sat(&query)
-                            })
-                    }
-                };
-                // #6484: Extract Farkas conflicts before the match consumes the result
-                let farkas_conflicts = if result.is_unsat() {
-                    extract_farkas_from_result(result.clone())
-                } else {
-                    Vec::new()
-                };
-                match result {
-                    SmtResult::Sat(model) => {
-                        let model = Self::minimize_projection_model_with_context(
-                            &mut self.smt,
-                            &projection_vars,
-                            &query,
-                            model,
-                        );
-                        if self.config.verbose {
-                            safe_eprintln!("PDR: Level 0: SAT with model {:?}", model);
-                        }
-                        // #8660: Prefer scalar-only cubes for array problems,
-                        // but keep property-relevant array selects when the
-                        // property reads arrays (Mem-track fix).
-                        let cube = if self.uses_arrays {
-                            self.cube_from_model_array_aware(
-                                pob.predicate,
-                                head_args,
-                                &fact_constraint,
-                                &model,
-                            )
-                        } else {
-                            self.cube_with_mbp(pob.predicate, head_args, &fact_constraint, &model)
-                        };
-                        let cube = match cube {
-                            Some(c) => c,
-                            None => {
-                                if self.config.verbose {
-                                    safe_eprintln!(
-                                        "PDR: Level 0: cube_from_model failed, trying next clause"
-                                    );
-                                }
-                                had_sat_no_cube = true;
-                                self.telemetry.sat_no_cube_events += 1;
-                                continue;
-                            }
-                        };
-                        return BlockResult::Reachable(Box::new(PredecessorState {
-                            predicate: pob.predicate,
-                            state: cube,
-                            clause_index,
-                            smt_model: model,
-                            derivation_id: None,
-                        }));
-                    }
-                    SmtResult::Unsat
-                    | SmtResult::UnsatWithCore(_)
-                    | SmtResult::UnsatWithFarkas(_) => {
-                        if self.config.verbose {
-                            safe_eprintln!("PDR: Level 0: UNSAT");
-                        }
-                        // Collect transition constraint for interpolation
-                        if self.config.use_interpolation {
-                            // Translate clause constraint to canonical names for consistent
-                            // A/B naming in interpolation (#966)
-                            let constraint_canonical =
-                                if let Some(canon_vars) = self.canonical_vars(pob.predicate) {
-                                    Self::translate_to_canonical_names(
-                                        &fact_constraint,
-                                        head_args,
-                                        canon_vars,
-                                    )
-                                } else {
-                                    fact_constraint.clone()
-                                };
-                            transition_constraints.push(constraint_canonical);
-                            // N1: Also track per-clause data for clause-local interpolation
-                            clause_interpolation_data.push(ClauseInterpolationData {
-                                head_args: head_args.to_vec(),
-                                constraint: fact_constraint.clone(),
-                                farkas_conflicts,
-                            });
-                        }
-                        continue;
-                    }
-                    SmtResult::Unknown => {
-                        if self.config.verbose {
-                            safe_eprintln!("PDR: Level 0: SMT Unknown");
-                        }
-                        // #6047: Previously stripped array conjuncts and retried
-                        // with integer-only constraints. This created "Swiss cheese"
-                        // where arrays never participated in invariant discovery.
-                        // The executor adapter (check_sat.rs) now dispatches array
-                        // queries to ay-dpll's full Executor with array theory
-                        // support. If it still returns Unknown, accept it.
-                        return BlockResult::Unknown;
-                    }
-                }
-            }
-            if had_sat_no_cube {
-                return BlockResult::Unknown;
-            }
-            if self.config.verbose && !found_clause {
-                safe_eprintln!("PDR: Level 0: no matching fact clause found");
-            }
+        let reach = if pob.level == 0 {
+            self.level0_fact_reachability(pob)
         } else {
-            match self.check_predecessor_reachability(pob, unknown_predecessors) {
-                Ok(ReachabilityData {
-                    transition_constraints: new_transition_constraints,
-                    clause_interpolation_data: new_clause_interpolation_data,
-                }) => {
-                    transition_constraints = new_transition_constraints;
-                    clause_interpolation_data = new_clause_interpolation_data;
-                }
-                Err(result) => return result,
-            }
-        }
+            self.check_predecessor_reachability(pob, unknown_predecessors)
+        };
+        let (transition_constraints, clause_interpolation_data) = match reach {
+            Ok(ReachabilityData {
+                transition_constraints,
+                clause_interpolation_data,
+                cores: _,
+            }) => (transition_constraints, clause_interpolation_data),
+            Err(result) => return result,
+        };
 
         // Cancellation check before lemma generalization (can involve multiple SMT queries)
         if self.is_cancelled() {
+            self.pending_unknown_class = Some(UnknownClass::Cancelled);
             return BlockResult::Unknown;
         }
 
-        self.block_unreachable_obligation(pob, transition_constraints, clause_interpolation_data)
+        let result = self.block_unreachable_obligation(
+            pob,
+            transition_constraints,
+            clause_interpolation_data,
+        );
+        if matches!(result, BlockResult::Unknown) && self.pending_unknown_class.is_none() {
+            self.pending_unknown_class = Some(if self.is_cancelled() {
+                UnknownClass::Cancelled
+            } else {
+                UnknownClass::LegacyLemma
+            });
+        }
+        result
+    }
+
+    /// Level-0 (fact) reachability of `pob` — the per-fact loop shared by the
+    /// legacy path and the Spacer lane's `block_linear` (contract C4;
+    /// `DESIGN` §4.2.1 step 2). Behaviour is byte-identical to the loop that
+    /// lived inline in `block_obligation_with_local_blocked`; under the lane
+    /// it additionally fills `ReachabilityData.cores` with one `ClauseCore`
+    /// per UNSAT fact pair through C3 (`q1_core_for_clause`).
+    #[allow(clippy::result_large_err)]
+    pub(in crate::pdr::solver) fn level0_fact_reachability(
+        &mut self,
+        pob: &mut ProofObligation,
+    ) -> Result<ReachabilityData, BlockResult> {
+        let mut transition_constraints: Vec<ChcExpr> = Vec::new();
+        let mut clause_interpolation_data: Vec<ClauseInterpolationData> = Vec::new();
+        // Under the lane: UNSAT fact pairs whose cores are computed after the
+        // loop (the loop holds an immutable borrow of `self.problem`).
+        let mut unsat_facts: Vec<(usize, ChcExpr, Vec<ChcExpr>)> = Vec::new();
+        if self.config.verbose {
+            safe_eprintln!(
+                "PDR: Level 0 checking init reachability for state={}",
+                pob.state
+            );
+        }
+        let mut found_clause = false;
+        let mut had_sat_no_cube = false;
+        for (clause_index, clause) in self
+            .problem
+            .clauses_defining_with_index(pob.predicate)
+            .filter(|(_, clause)| clause.is_fact())
+        {
+            // #2887: Check cancellation between SMT queries in clause loop.
+            if self.is_cancelled() {
+                self.pending_unknown_class = Some(UnknownClass::Cancelled);
+                return Err(BlockResult::Unknown);
+            }
+            found_clause = true;
+
+            let fact_constraint = clause
+                .body
+                .constraint
+                .clone()
+                .unwrap_or(ChcExpr::Bool(true));
+            let head_args = match &clause.head {
+                crate::ClauseHead::Predicate(_, a) => a.as_slice(),
+                crate::ClauseHead::False => continue,
+            };
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: Level 0 clause {}: fact_constraint={}, head_args={:?}",
+                    clause_index,
+                    fact_constraint,
+                    head_args
+                );
+            }
+            let state_on_fact = match self.apply_to_args(pob.predicate, &pob.state, head_args) {
+                Some(e) => e,
+                None => {
+                    if self.config.verbose {
+                        safe_eprintln!("PDR: Level 0: apply_to_args failed");
+                    }
+                    self.pending_unknown_class = Some(UnknownClass::Other);
+                    return Err(BlockResult::Unknown);
+                }
+            };
+            // Clone fact_constraint for MBP - it's used in query but also needed for projection
+            let query =
+                self.bound_int_vars(ChcExpr::and(fact_constraint.clone(), state_on_fact.clone()));
+            if self.config.verbose {
+                safe_eprintln!("PDR: Level 0 query: {}", query);
+            }
+
+            let projection_vars = self.projection_vars_for_args(pob.predicate, head_args);
+            // #6366: Skip O(expr_size) tree walk for pure-LIA problems.
+            // When uses_arrays is false, no query can contain array ops.
+            let result = if self.uses_arrays && query.contains_array_ops() {
+                Self::check_array_clause_query(
+                    &mut self.smt,
+                    &mut self.array_clause_sessions,
+                    ArraySessionKey::HeadFact { clause_index },
+                    &fact_constraint,
+                    &state_on_fact,
+                    &query,
+                    self.max_array_params,
+                )
+            } else {
+                // #6358: Per-predicate prop_solver for clause predecessor.
+                // Pure-LIA: one solve via prop_solver. Non-pure-LIA: one solve
+                // via non-incremental. No double-solve.
+                if self.incremental_pdr_enabled() {
+                    let check_timeout = self.smt.current_timeout();
+                    let seg_key = super::prop_solver::SegmentKey::ClauseBlocking { clause_index };
+                    let prop = super::core::ensure_prop_solver_split(
+                        &mut self.prop_solvers,
+                        &self.frames,
+                        pob.predicate,
+                    );
+                    prop.register_segment(seg_key, &fact_constraint);
+                    let incr_result = prop.check_clause_blocking(
+                        0,
+                        clause_index,
+                        &[state_on_fact.clone()],
+                        check_timeout,
+                        pob.smt_model.as_ref(),
+                    );
+                    match incr_result {
+                        IncrementalCheckResult::Unsat => SmtResult::Unsat,
+                        IncrementalCheckResult::Sat(model) => SmtResult::Sat(model),
+                        IncrementalCheckResult::Unknown => SmtResult::Unknown,
+                    }
+                } else {
+                    self.smt.reset();
+                    self.smt
+                        .with_phase_seed_model(pob.smt_model.as_ref(), |smt| smt.check_sat(&query))
+                }
+            };
+            // #6484: Extract Farkas conflicts before the match consumes the result
+            let farkas_conflicts = if result.is_unsat() {
+                extract_farkas_from_result(result.clone())
+            } else {
+                Vec::new()
+            };
+            match result {
+                SmtResult::Sat(model) => {
+                    let model = Self::minimize_projection_model_with_context(
+                        &mut self.smt,
+                        &projection_vars,
+                        &query,
+                        model,
+                    );
+                    if self.config.verbose {
+                        safe_eprintln!("PDR: Level 0: SAT with model {:?}", model);
+                    }
+                    // #8660: Prefer scalar-only cubes for array problems,
+                    // but keep property-relevant array selects when the
+                    // property reads arrays (Mem-track fix).
+                    let cube = if self.uses_arrays {
+                        self.cube_from_model_array_aware(
+                            pob.predicate,
+                            head_args,
+                            &fact_constraint,
+                            &model,
+                        )
+                    } else {
+                        self.cube_with_mbp(pob.predicate, head_args, &fact_constraint, &model)
+                    };
+                    let cube = match cube {
+                        Some(c) => c,
+                        None => {
+                            if self.config.verbose {
+                                safe_eprintln!(
+                                    "PDR: Level 0: cube_from_model failed, trying next clause"
+                                );
+                            }
+                            had_sat_no_cube = true;
+                            self.telemetry.sat_no_cube_events += 1;
+                            continue;
+                        }
+                    };
+                    return Err(BlockResult::Reachable(Box::new(PredecessorState {
+                        predicate: pob.predicate,
+                        state: cube,
+                        clause_index,
+                        smt_model: model,
+                        derivation_id: None,
+                        lits: None,
+                    })));
+                }
+                SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
+                    if self.config.verbose {
+                        safe_eprintln!("PDR: Level 0: UNSAT");
+                    }
+                    // Workstream B (C2/C3/C4): one `ClauseCore` per UNSAT
+                    // (fact) pair through L's exclusion-free core query.
+                    if self.spacer_core {
+                        unsat_facts.push((
+                            clause_index,
+                            fact_constraint.clone(),
+                            head_args.to_vec(),
+                        ));
+                    }
+                    // Collect transition constraint for interpolation
+                    if self.config.use_interpolation {
+                        // Translate clause constraint to canonical names for consistent
+                        // A/B naming in interpolation (#966)
+                        let constraint_canonical =
+                            if let Some(canon_vars) = self.canonical_vars(pob.predicate) {
+                                Self::translate_to_canonical_names(
+                                    &fact_constraint,
+                                    head_args,
+                                    canon_vars,
+                                )
+                            } else {
+                                fact_constraint.clone()
+                            };
+                        transition_constraints.push(constraint_canonical);
+                        // N1: Also track per-clause data for clause-local interpolation
+                        clause_interpolation_data.push(ClauseInterpolationData {
+                            head_args: head_args.to_vec(),
+                            constraint: fact_constraint.clone(),
+                            farkas_conflicts,
+                        });
+                    }
+                    continue;
+                }
+                SmtResult::Unknown => {
+                    if self.config.verbose {
+                        safe_eprintln!("PDR: Level 0: SMT Unknown");
+                    }
+                    // #6047: Previously stripped array conjuncts and retried
+                    // with integer-only constraints. This created "Swiss cheese"
+                    // where arrays never participated in invariant discovery.
+                    // The executor adapter (check_sat.rs) now dispatches array
+                    // queries to ay-dpll's full Executor with array theory
+                    // support. If it still returns Unknown, accept it.
+                    self.pending_unknown_class = Some(UnknownClass::SmtUnknown);
+                    return Err(BlockResult::Unknown);
+                }
+            }
+        }
+        if had_sat_no_cube {
+            self.spacer_stats.sat_no_cube += 1;
+            self.pending_unknown_class = Some(UnknownClass::SatNoCube);
+            return Err(BlockResult::Unknown);
+        }
+        if self.config.verbose && !found_clause {
+            safe_eprintln!("PDR: Level 0: no matching fact clause found");
+        }
+        let mut cores: Vec<ClauseCore> = Vec::with_capacity(unsat_facts.len());
+        for (clause_index, fact_constraint, head_args) in unsat_facts {
+            cores.push(self.level0_fact_core(pob, clause_index, &fact_constraint, &head_args));
+        }
+        Ok(ReachabilityData {
+            transition_constraints,
+            clause_interpolation_data,
+            cores,
+        })
+    }
+
+    /// C3 at level 0: the core of `fact ∧ lits_on_head` over the POB's literals
+    /// (all-true inexact when a literal cannot be instantiated on the head).
+    fn level0_fact_core(
+        &mut self,
+        pob: &ProofObligation,
+        clause_index: usize,
+        fact_constraint: &ChcExpr,
+        head_args: &[ChcExpr],
+    ) -> ClauseCore {
+        let cube = pob.cube();
+        let n = cube.len();
+        let mut lits_on_head = Vec::with_capacity(n);
+        for lit in cube.lits() {
+            match self.apply_to_args(pob.predicate, lit, head_args) {
+                Some(l) => lits_on_head.push(l),
+                None => return ClauseCore::all_true(clause_index, Some(clause_index), n, false),
+            }
+        }
+        let per_call = self
+            .smt
+            .current_timeout()
+            .unwrap_or(std::time::Duration::from_secs(5));
+        let mut budget = super::spacer_core::Budget::per_call_only(per_call);
+        let (core, exact) = self.q1_core_for_clause(
+            std::slice::from_ref(fact_constraint),
+            &lits_on_head,
+            &mut budget,
+        );
+        ClauseCore {
+            clause_index,
+            fact_index: Some(clause_index),
+            core,
+            exact,
+            had_exclusion: false,
+            uses_level: None,
+        }
     }
 
     /// Extract a variable and constant from an equality or negated distinct.

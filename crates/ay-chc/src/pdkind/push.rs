@@ -58,7 +58,7 @@ impl PdkindSolver {
         // When incremental_mode is FreshOnly or Degraded, route through the
         // existing FreshOnly plan so each obligation solves from
         // background_exprs + assumptions (#8161, #6692).
-        let mut inc_smt = SmtContext::new();
+        let mut inc_smt = SmtContext::new_search();
         let mut inc_ctx = {
             let mut ctx = IncrementalQueryContext::new();
             ctx.assert_background(&k_transition, &mut inc_smt);
@@ -350,7 +350,9 @@ impl PdkindSolver {
             "BUG: trivial invariant {invariant:?} at k={k}",
         );
         let verbose = self.config.base.verbose;
-        let mut ctx = SmtContext::new();
+        // INV-S2: the non-incremental re-verification of a candidate Safe.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+        let mut ctx = SmtContext::new_search();
 
         // Check 0 (#6787): k-step non-vacuity — verify that the k-inductiveness
         // premise (inv@0 ∧ ... ∧ inv@(k-1) ∧ T^k) is satisfiable.
@@ -502,7 +504,16 @@ impl PdkindSolver {
     ///
     /// Returns the first bounded counterexample depth if one is found.
     pub(super) fn bmc_sanity_counterexample_depth(&self, max_depth: usize) -> Option<usize> {
-        let config = BmcConfig::with_engine_config(max_depth, false, None);
+        // The sanity BMC runs under PDKIND's own cancellation: once the
+        // portfolio cancels PDKIND (a winner was accepted), up to 50 unrolled
+        // depths of BMC are no longer needed. A cancelled BMC answers Unknown,
+        // i.e. `None` here, and the portfolio never accepts a result from a
+        // cancelled lane (S-reap: 35.7 s post-cancel on tte_synchro).
+        let config = BmcConfig::with_engine_config(
+            max_depth,
+            false,
+            self.config.base.cancellation_token.clone(),
+        );
         match BmcSolver::new(self.problem.clone(), config).solve() {
             crate::engine_result::ChcEngineResult::Unsafe(cex) => {
                 Some(cex.steps.len().saturating_sub(1))

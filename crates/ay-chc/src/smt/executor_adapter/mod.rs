@@ -13,9 +13,18 @@
 //! Design: the development design notes
 //! Approach C — thin adapter, array logics only.
 
+mod interrupt_observer;
+pub(crate) use interrupt_observer::InterruptObserver;
 mod logic_detection;
 mod model_parsing;
+mod replay_cancellation;
+mod replay_limit;
+mod replay_memory;
 mod strict_unsat;
+mod verdict_only;
+pub(crate) use verdict_only::ScopedVerdictOnlySearch;
+#[cfg(test)]
+pub(crate) use verdict_only::{shed_search_executors_built, verdict_only_search_active};
 
 // Re-export for sibling modules (persistent.rs) and crate-level re-export (smt/mod.rs #7983).
 #[cfg(test)]
@@ -34,7 +43,14 @@ pub(super) use logic_detection::{
     collect_uninterpreted_function_applications, emit_declare_datatype,
 };
 pub(crate) use model_parsing::parse_model_into;
-pub(crate) use strict_unsat::{smtlib_strict_unsat_cert_via_executor, StrictUnsatCert};
+pub(crate) use replay_cancellation::ReplayCancellation;
+pub(crate) use replay_limit::ReplayLimit;
+pub(crate) use strict_unsat::{
+    check_plain_unsat_retained_native_with_progress,
+    smtlib_strict_unsat_cert_native_only_with_limit, smtlib_strict_unsat_cert_via_executor,
+    smtlib_strict_unsat_cert_via_executor_until, smtlib_strict_unsat_cert_via_executor_with_limit,
+    BoundRetainedProof, BoundRetainedProofBytes, RetainedReplayProgress, StrictUnsatCert,
+};
 
 // Re-export test-visible helpers (tests.rs uses super::*).
 #[cfg(test)]
@@ -42,14 +58,15 @@ pub(super) use model_parsing::{
     parse_decimal_to_rational, parse_model_simple, parse_simple_value, term_body_to_smt_value,
 };
 
-use super::context::SmtContext;
+use super::context::{SmtContext, SmtLane};
 use super::executor_sort_guard::unsupported_executor_expr_reason;
 use super::model_verify::verify_sat_model_conjunction_strict_with_mod_retry;
 use super::types::{ModelVerifyResult, SmtResult, SmtValue};
 use crate::pdr::model::InvariantModel;
-use crate::{ChcExpr, ChcSort};
+use crate::{ChcExpr, ChcSort, ChcVar};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use ay_core::time::Instant;
+use replay_memory::ReplayMemory;
 use std::panic::AssertUnwindSafe;
 
 /// One fresh scalar constant constrained to equal an ordinary-UF application.
@@ -72,6 +89,8 @@ pub(crate) enum UfApplicationAliasEmissionError {
     ResourceLimit(&'static str),
     #[error("executor UF alias emission deadline expired")]
     DeadlineExpired,
+    #[error("executor array lambda has mismatched capture sorts")]
+    InvalidArrayLambda,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +128,12 @@ fn collect_expr_symbol_names<'a>(
     }
     let mut nodes = 0usize;
     let mut name_bytes = 0usize;
+    // Charge each distinct node once, including closed lambda code.
+    let mut visited: FxHashSet<usize> = FxHashSet::default();
     while let Some(expr) = stack.pop() {
+        if !visited.insert(logic_detection::expr_key(expr)) {
+            continue;
+        }
         nodes = nodes
             .checked_add(1)
             .filter(|count| *count <= logic_detection::MAX_DT_EXPR_NODES)
@@ -117,72 +141,45 @@ fn collect_expr_symbol_names<'a>(
                 "executor expression node cap exceeded while collecting symbols".to_string()
             })?;
         match expr {
-            ChcExpr::Var(var) => {
-                name_bytes = name_bytes
-                    .checked_add(var.name.len())
-                    .filter(|bytes| *bytes <= logic_detection::MAX_EXECUTOR_SURFACE_NAME_BYTES)
-                    .ok_or_else(|| {
-                        "executor symbol name-byte cap exceeded while collecting symbols"
-                            .to_string()
-                    })?;
-                names.insert(var.name.clone());
+            ChcExpr::Var(var) => collect_symbol_name(&var.name, &mut names, &mut name_bytes)?,
+            ChcExpr::PredicateApp(name, _, _) | ChcExpr::FuncApp(name, _, _) => {
+                collect_symbol_name(name, &mut names, &mut name_bytes)?;
             }
-            ChcExpr::PredicateApp(name, _, args) | ChcExpr::FuncApp(name, _, args) => {
-                name_bytes = name_bytes
-                    .checked_add(name.len())
-                    .filter(|bytes| *bytes <= logic_detection::MAX_EXECUTOR_SURFACE_NAME_BYTES)
-                    .ok_or_else(|| {
-                        "executor symbol name-byte cap exceeded while collecting symbols"
-                            .to_string()
-                    })?;
-                names.insert(name.clone());
-                if nodes
-                    .checked_add(stack.len())
-                    .and_then(|pending| pending.checked_add(args.len()))
-                    .is_none_or(|pending| pending > logic_detection::MAX_DT_EXPR_NODES)
-                {
-                    return Err(
-                        "executor expression node cap exceeded while collecting symbols"
-                            .to_string(),
-                    );
+            ChcExpr::ArrayLambda(lambda) => {
+                for variable in std::iter::once(lambda.binder()).chain(lambda.formals()) {
+                    collect_symbol_name(&variable.name, &mut names, &mut name_bytes)?;
                 }
-                stack.extend(args.iter().map(AsRef::as_ref));
             }
-            ChcExpr::Op(_, args) => {
-                if nodes
-                    .checked_add(stack.len())
-                    .and_then(|pending| pending.checked_add(args.len()))
-                    .is_none_or(|pending| pending > logic_detection::MAX_DT_EXPR_NODES)
-                {
-                    return Err(
-                        "executor expression node cap exceeded while collecting symbols"
-                            .to_string(),
-                    );
-                }
-                stack.extend(args.iter().map(AsRef::as_ref));
-            }
-            ChcExpr::ConstArray(_, value) => {
-                if nodes
-                    .checked_add(stack.len())
-                    .and_then(|pending| pending.checked_add(1))
-                    .is_none_or(|pending| pending > logic_detection::MAX_DT_EXPR_NODES)
-                {
-                    return Err(
-                        "executor expression node cap exceeded while collecting symbols"
-                            .to_string(),
-                    );
-                }
-                stack.push(value);
-            }
-            ChcExpr::Bool(_)
-            | ChcExpr::Int(_)
-            | ChcExpr::Real(_, _)
-            | ChcExpr::BitVec(_, _)
-            | ChcExpr::ConstArrayMarker(_)
-            | ChcExpr::IsTesterMarker(_) => {}
+            _ => {}
         }
+        let children = logic_detection::expr_children(expr);
+        if nodes
+            .checked_add(stack.len())
+            .and_then(|pending| pending.checked_add(children.len()))
+            .is_none_or(|pending| pending > logic_detection::MAX_DT_EXPR_NODES)
+        {
+            return Err(
+                "executor expression node cap exceeded while collecting symbols".to_string(),
+            );
+        }
+        stack.extend(children.iter().map(AsRef::as_ref));
     }
     Ok(names)
+}
+
+fn collect_symbol_name(
+    name: &str,
+    names: &mut FxHashSet<String>,
+    bytes: &mut usize,
+) -> Result<(), String> {
+    *bytes = bytes
+        .checked_add(name.len())
+        .filter(|bytes| *bytes <= logic_detection::MAX_EXECUTOR_SURFACE_NAME_BYTES)
+        .ok_or_else(|| {
+            "executor symbol name-byte cap exceeded while collecting symbols".to_string()
+        })?;
+    names.insert(name.to_string());
+    Ok(())
 }
 
 /// Allocate fresh, query-local aliases for every syntactic scalar-UF
@@ -290,6 +287,9 @@ fn alias_emission_deadline_expired(deadline: Option<ay_core::time::Instant>) -> 
 enum UfAliasSmtPart<'a> {
     Expr(&'a ChcExpr),
     Argument(&'a ChcExpr),
+    Lambda(&'a crate::expr::ChcArrayLambda),
+    Capture(&'a ChcVar, &'a ChcExpr),
+    Text(&'static str),
     Close,
 }
 
@@ -526,6 +526,15 @@ impl BoundedUfAliasScript {
                 ChcExpr::Op(operator, arguments) => {
                     Self::schedule_expr_sort_operator_dependencies(operator, arguments, &mut stack);
                 }
+                ChcExpr::ArrayLambda(lambda) => {
+                    Self::charge_sort_work(
+                        &lambda.binder().sort,
+                        serializer_work,
+                        serializer_work_limit,
+                        deadline,
+                    )?;
+                    stack.push(lambda.body());
+                }
                 ChcExpr::ConstArray(key_sort, value) => {
                     Self::charge_sort_work(
                         key_sort,
@@ -593,6 +602,69 @@ impl BoundedUfAliasScript {
         Ok(())
     }
 
+    fn write_array_lambda<'a>(
+        &mut self,
+        lambda: &'a crate::expr::ChcArrayLambda,
+        stack: &mut Vec<UfAliasSmtPart<'a>>,
+        serializer_work: &mut usize,
+        serializer_work_limit: usize,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Result<(), UfApplicationAliasEmissionError> {
+        for value in lambda.captures() {
+            Self::charge_expr_sort_work(value, serializer_work, serializer_work_limit, deadline)?;
+        }
+        if !lambda.captures_are_well_typed() {
+            return Err(UfApplicationAliasEmissionError::InvalidArrayLambda);
+        }
+        if lambda.captures().is_empty() {
+            stack.push(UfAliasSmtPart::Lambda(lambda));
+        } else {
+            self.push_str("(let (")?;
+            stack.push(UfAliasSmtPart::Close);
+            stack.push(UfAliasSmtPart::Lambda(lambda));
+            stack.push(UfAliasSmtPart::Text(") "));
+            for (formal, value) in lambda.formals().iter().zip(lambda.captures()).rev() {
+                stack.push(UfAliasSmtPart::Capture(formal, value));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_const_array<'a>(
+        &mut self,
+        key_sort: &ChcSort,
+        value: &'a std::sync::Arc<ChcExpr>,
+        stack: &mut Vec<UfAliasSmtPart<'a>>,
+        serializer_work: &mut usize,
+        serializer_work_limit: usize,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Result<(), UfApplicationAliasEmissionError> {
+        // The established spelling asks `ChcExpr::sort()` for the
+        // value sort. Account for the key-sort rendering, that hidden
+        // recursive walk, and the value-sort rendering before doing
+        // any of those operations.
+        Self::charge_sort_work(key_sort, serializer_work, serializer_work_limit, deadline)?;
+        Self::charge_expr_sort_work(value, serializer_work, serializer_work_limit, deadline)?;
+        let value_sort = value.sort();
+        if alias_emission_deadline_expired(deadline) {
+            return Err(UfApplicationAliasEmissionError::DeadlineExpired);
+        }
+        Self::charge_sort_work(
+            &value_sort,
+            serializer_work,
+            serializer_work_limit,
+            deadline,
+        )?;
+        self.push_str("((as const (Array ")?;
+        self.push_str(&key_sort.to_string())?;
+        self.push_char(' ')?;
+        self.push_str(&value_sort.to_string())?;
+        self.push_str("))")?;
+        stack.push(UfAliasSmtPart::Close);
+        stack.push(UfAliasSmtPart::Argument(value.as_ref()));
+        Ok(())
+    }
+
     fn write_expr_node<'a>(
         &mut self,
         expr: &'a ChcExpr,
@@ -655,37 +727,21 @@ impl BoundedUfAliasScript {
                 self.push_str(&quote_symbol(name))?;
                 self.push_char(')')
             }
-            ChcExpr::ConstArray(key_sort, value) => {
-                // The established spelling asks `ChcExpr::sort()` for the
-                // value sort. Account for the key-sort rendering, that hidden
-                // recursive walk, and the value-sort rendering before doing
-                // any of those operations.
-                Self::charge_sort_work(key_sort, serializer_work, serializer_work_limit, deadline)?;
-                Self::charge_expr_sort_work(
-                    value,
-                    serializer_work,
-                    serializer_work_limit,
-                    deadline,
-                )?;
-                let value_sort = value.sort();
-                if alias_emission_deadline_expired(deadline) {
-                    return Err(UfApplicationAliasEmissionError::DeadlineExpired);
-                }
-                Self::charge_sort_work(
-                    &value_sort,
-                    serializer_work,
-                    serializer_work_limit,
-                    deadline,
-                )?;
-                self.push_str("((as const (Array ")?;
-                self.push_str(&key_sort.to_string())?;
-                self.push_char(' ')?;
-                self.push_str(&value_sort.to_string())?;
-                self.push_str("))")?;
-                stack.push(UfAliasSmtPart::Close);
-                stack.push(UfAliasSmtPart::Argument(value.as_ref()));
-                Ok(())
-            }
+            ChcExpr::ArrayLambda(lambda) => self.write_array_lambda(
+                lambda,
+                stack,
+                serializer_work,
+                serializer_work_limit,
+                deadline,
+            ),
+            ChcExpr::ConstArray(key_sort, value) => self.write_const_array(
+                key_sort,
+                value,
+                stack,
+                serializer_work,
+                serializer_work_limit,
+                deadline,
+            ),
         }
     }
 
@@ -704,6 +760,37 @@ impl BoundedUfAliasScript {
                     expr
                 }
                 UfAliasSmtPart::Expr(expr) => expr,
+                UfAliasSmtPart::Lambda(lambda) => {
+                    Self::charge_work(serializer_work, serializer_work_limit, deadline)?;
+                    Self::charge_sort_work(
+                        &lambda.binder().sort,
+                        serializer_work,
+                        serializer_work_limit,
+                        deadline,
+                    )?;
+                    self.push_str("(lambda ((")?;
+                    self.push_str(&quote_symbol(&lambda.binder().name))?;
+                    self.push_char(' ')?;
+                    self.push_str(&sort_to_smtlib(&lambda.binder().sort))?;
+                    self.push_str(")) ")?;
+                    stack.push(UfAliasSmtPart::Close);
+                    stack.push(UfAliasSmtPart::Expr(lambda.body()));
+                    continue;
+                }
+                UfAliasSmtPart::Capture(formal, value) => {
+                    Self::charge_work(serializer_work, serializer_work_limit, deadline)?;
+                    self.push_char('(')?;
+                    self.push_str(&quote_symbol(&formal.name))?;
+                    self.push_char(' ')?;
+                    stack.push(UfAliasSmtPart::Close);
+                    stack.push(UfAliasSmtPart::Expr(value));
+                    continue;
+                }
+                UfAliasSmtPart::Text(text) => {
+                    Self::charge_work(serializer_work, serializer_work_limit, deadline)?;
+                    self.push_str(text)?;
+                    continue;
+                }
                 UfAliasSmtPart::Close => {
                     self.push_char(')')?;
                     continue;
@@ -902,8 +989,8 @@ pub(crate) enum ExecutorQueryRole {
     InternalLemma,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ExecutorResourceLimits {
+#[derive(Clone, Copy, Default)]
+struct ExecutorResourceLimits<'a> {
     /// One already-elapsing deadline covering caller construction, parsing,
     /// execution, and publication.  Unlike `Executor::set_timeout`, this is
     /// never renewed when `check-sat` is reached.
@@ -911,43 +998,143 @@ struct ExecutorResourceLimits {
     /// Per-executor term-store ceiling. This is deliberately distinct from the
     /// process-RSS `:max-memory` control.
     term_memory_limit: Option<usize>,
+    cancellation: Option<&'a ReplayCancellation>,
 }
 
+impl ExecutorResourceLimits<'_> {
+    fn stopped(self) -> bool {
+        self.cancellation
+            .is_some_and(ReplayCancellation::is_cancelled)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+/// Build the executor for a CHC SEARCH query: one whose verdict only guides
+/// the engines (PDR consecution / blocking, BMC depth checks, k-induction,
+/// Houdini candidates, replay probes) and is never itself the published
+/// claim — the CHC verdict is re-verified independently (`portfolio::accept`,
+/// `adaptive_validation`) before it is printed.
+///
+/// Every `ay_dpll::Executor` ay-chc constructs for such a query comes from
+/// here, so the per-query posture inherits the process-level one the CLI
+/// applies to its own executor (`run::new_executor`, T8): under
+/// `--competition` / `--no-proof` / `--z3-mode` with no proof or certificate
+/// demand in scope (`MiscCliFlags::search_executor_sheds_proof_cycle`) the
+/// executor sheds the internal proof cycle exactly as the CLI executor does
+/// (`Executor::set_competition_mode`: no search-time proof recording, no
+/// post-UNSAT certificate mint, UNSAT through the scope-authenticated raw
+/// lane). A plain solve, `--strict-proofs`, `--self-check`, `--proof`,
+/// `--chc-checked-replay`, and every library consumer that never installs
+/// CLI flags keep the default proof-carrying posture — including the
+/// `--strict-proofs`-only checked replay (`proof_metadata::replay_check`),
+/// which reaches the same posture through
+/// `smtlib_first_verdict_via_executor_with_limit` ([`new_script_executor`]).
+///
+/// One scope sheds in every posture: a search marked verdict-only by a live
+/// [`ScopedVerdictOnlySearch`] guard on this thread, whose verdicts back no
+/// claim at all (the counterexample replay; see `verdict_only`). The raw
+/// SMT-LIB script channels never consult it.
+///
+/// NOT for the certificate lanes: `strict_unsat` (the checked native bundle)
+/// and `interpolation::proof_backed` (proof-derived interpolants) build their
+/// own `api::Solver` with `set_produce_proofs(true)` and never pass through
+/// here.
+pub(crate) fn new_search_executor() -> ay_dpll::Executor {
+    executor_in_posture(verdict_only::search_sheds_proof_cycle())
+}
+
+/// The executor of the raw SMT-LIB script channels
+/// ([`check_unsat_smtlib_via_executor`],
+/// [`smtlib_first_verdict_via_executor_with_limit`]). Their `unsat` can be
+/// the published claim (the ghost-pair quantified certification, the
+/// `--strict-proofs` checked replay), so it takes the process posture alone:
+/// a [`ScopedVerdictOnlySearch`] on this thread does not reach it.
+fn new_script_executor() -> ay_dpll::Executor {
+    executor_in_posture(false)
+}
+
+/// A search executor in the process posture, shedding the proof cycle in
+/// every posture when `verdict_only`.
+fn executor_in_posture(verdict_only: bool) -> ay_dpll::Executor {
+    let mut exec = ay_dpll::Executor::new();
+    exec.set_term_memory_limit(SmtContext::current_thread_term_memory_budget());
+    if verdict_only || ay_core::misc_cli_flags().search_executor_sheds_proof_cycle {
+        exec.set_competition_mode(true);
+    }
+    // On a portfolio lane thread, the lane's interrupt stops an in-flight
+    // check as soon as the portfolio cancels its workers (a caller that owns
+    // a finer cancellation replaces it with `set_interrupt`).
+    if let Some(flag) = crate::smt::deadline::lane_interrupt_flag() {
+        exec.set_interrupt(flag);
+    }
+    exec
+}
+
+/// [`execute_commands_via_executor_with_limits`] for a raw SMT-LIB script
+/// channel ([`new_script_executor`]), unlimited.
 fn execute_commands_via_executor(
     commands: &[ay_frontend::Command],
     role: ExecutorQueryRole,
 ) -> Result<Vec<String>, ()> {
-    execute_commands_via_executor_with_limits(commands, role, ExecutorResourceLimits::default())
+    execute_commands_via_executor_with_limits(
+        commands,
+        role,
+        ExecutorResourceLimits::default(),
+        new_script_executor,
+    )
 }
 
+/// Execute `commands` on a fresh executor from `new_executor`: the search
+/// constructor ([`new_search_executor`]) for the `ChcExpr` query channels,
+/// the script constructor ([`new_script_executor`]) for the raw SMT-LIB ones.
 fn execute_commands_via_executor_with_limits(
     commands: &[ay_frontend::Command],
     role: ExecutorQueryRole,
-    limits: ExecutorResourceLimits,
+    limits: ExecutorResourceLimits<'_>,
+    new_executor: fn() -> ay_dpll::Executor,
 ) -> Result<Vec<String>, ()> {
-    if ay_core::TermStore::global_memory_exceeded()
-        || limits
+    let memory = ReplayMemory::capture(limits.term_memory_limit);
+    let inherited = crate::smt::deadline::current_lane_token();
+    let inherited_observed = inherited.as_ref().map(ReplayCancellation::new);
+    let limits = ExecutorResourceLimits {
+        deadline: limits
             .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    {
+            .into_iter()
+            .chain(crate::smt::deadline::effective_thread_deadline())
+            .min(),
+        term_memory_limit: memory.term_limit(),
+        cancellation: limits.cancellation.or(inherited_observed.as_ref()),
+    };
+    if memory.check().is_none() || limits.stopped() {
         return Err(());
     }
+    // Declare the observer first so unwinding destroys the executor before
+    // stopping and joining its owned interrupt observer. No borrowed caller
+    // callback is moved onto that worker.
+    let mut observer = limits
+        .cancellation
+        .map(interrupt_observer::InterruptObserver::new)
+        .transpose()
+        .map_err(|error| {
+            tracing::debug!("executor_adapter: {error}");
+        })?;
     let trace = exec_trace_enabled();
     let t_new = ay_core::time::Instant::now();
-    let mut exec = ay_dpll::Executor::new();
+    let mut exec = new_executor();
     // Charge executor construction to the same absolute wall and reject it if
     // it consumed the final share.  Installing the absolute deadline (rather
     // than a relative timeout computed before parsing) prevents `check-sat`
     // from launching with a freshly renewed stale budget.
-    if ay_core::TermStore::global_memory_exceeded()
-        || limits
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    {
+    if memory.check_terms(exec.terms()).is_none() || limits.stopped() {
         return Err(());
     }
     exec.set_deadline(limits.deadline);
     exec.set_term_memory_limit(limits.term_memory_limit);
+    if let Some(observer) = &observer {
+        exec.set_interrupt(observer.interrupt());
+    }
     let new_dt = t_new.elapsed();
     let t_exec = ay_core::time::Instant::now();
     let result = ay_core::catch_ay_panics(
@@ -973,33 +1160,45 @@ fn execute_commands_via_executor_with_limits(
         },
     );
     if trace {
-        let stats = exec.statistics();
-        let phase = |name: &str| stats.get_float(name).unwrap_or(0.0);
-        safe_eprintln!(
-            "[EXEC-TRACE {:?}] new={:.1}ms exec={:.1}ms (quant={:.1}ms logic={:.1}ms dispatch={:.1}ms map={:.1}ms) conflicts={} decisions={}",
-            std::thread::current().id(),
-            new_dt.as_secs_f64() * 1e3,
-            t_exec.elapsed().as_secs_f64() * 1e3,
-            phase("phase.quantifier_preprocess.seconds") * 1e3,
-            phase("phase.logic_detection.seconds") * 1e3,
-            phase("phase.solver_dispatch.seconds") * 1e3,
-            phase("phase.quantifier_result_mapping.seconds") * 1e3,
-            stats.conflicts,
-            stats.decisions
-        );
+        trace_executor_phases(&exec, new_dt, t_exec.elapsed());
     }
-    if ay_core::TermStore::global_memory_exceeded()
-        || limits
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        || exec.term_memory_exceeded()
-        || limits
-            .term_memory_limit
-            .is_some_and(|limit| exec.terms().true_memory_bytes() > limit)
+    if memory.check_executor(&exec).is_none() || limits.stopped() {
+        return Err(());
+    }
+    // Keep observing during destruction, then join before a successful result
+    // leaves this frame. The enclosing ReplayLimit phase additionally charges
+    // parsed-command/output cleanup and repeats cancellation/deadline checks.
+    drop(exec);
+    if observer.as_mut().is_some_and(|observer| !observer.finish())
+        || limits.stopped()
+        || memory.check().is_none()
     {
         return Err(());
     }
     result
+}
+
+/// `--chc-checksat-trace>=2` line for one executor run: construction and execution
+/// wall, the phase split and the search counters.
+fn trace_executor_phases(
+    exec: &ay_dpll::Executor,
+    new_dt: std::time::Duration,
+    exec_dt: std::time::Duration,
+) {
+    let stats = exec.statistics();
+    let phase = |name: &str| stats.get_float(name).unwrap_or(0.0);
+    safe_eprintln!(
+        "[EXEC-TRACE {:?}] new={:.1}ms exec={:.1}ms (quant={:.1}ms logic={:.1}ms dispatch={:.1}ms map={:.1}ms) conflicts={} decisions={}",
+        std::thread::current().id(),
+        new_dt.as_secs_f64() * 1e3,
+        exec_dt.as_secs_f64() * 1e3,
+        phase("phase.quantifier_preprocess.seconds") * 1e3,
+        phase("phase.logic_detection.seconds") * 1e3,
+        phase("phase.solver_dispatch.seconds") * 1e3,
+        phase("phase.quantifier_result_mapping.seconds") * 1e3,
+        stats.conflicts,
+        stats.decisions
+    );
 }
 
 /// Run a raw SMT-LIB script through the ay-dpll executor and return `true`
@@ -1013,6 +1212,10 @@ fn execute_commands_via_executor_with_limits(
 /// parse error, execution error, panic, `sat`, or `unknown` returns `false`
 /// (fail-closed).
 pub(crate) fn check_unsat_smtlib_via_executor(smt: &str) -> bool {
+    let memory = ReplayMemory::capture(None);
+    if memory.check().is_none() {
+        return false;
+    }
     let commands = match ay_frontend::parse(smt) {
         Ok(commands) => commands,
         Err(error) => {
@@ -1020,10 +1223,12 @@ pub(crate) fn check_unsat_smtlib_via_executor(smt: &str) -> bool {
             return false;
         }
     };
-    match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
+    let result = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
         Ok(outputs) => outputs.first().map(String::as_str) == Some("unsat"),
         Err(()) => false,
-    }
+    };
+    drop(commands);
+    memory.check().is_some() && result
 }
 
 /// Run a raw SMT-LIB script through the ay-dpll executor with an optional
@@ -1042,6 +1247,8 @@ pub(crate) fn smtlib_first_verdict_via_executor(
     smt: &str,
     timeout: Option<std::time::Duration>,
 ) -> Option<String> {
+    let memory = ReplayMemory::capture(None);
+    memory.check()?;
     let script_with_timeout;
     let effective_script = match timeout {
         Some(timeout) if !timeout.is_zero() => {
@@ -1060,10 +1267,13 @@ pub(crate) fn smtlib_first_verdict_via_executor(
             return None;
         }
     };
-    match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
+    let result = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
         Ok(outputs) => outputs.first().cloned(),
         Err(()) => None,
-    }
+    };
+    drop(commands);
+    memory.check()?;
+    result
 }
 
 /// Execute a generated SMT-LIB obligation under one absolute wall-clock
@@ -1082,45 +1292,71 @@ pub(crate) fn smtlib_first_verdict_via_executor(
 /// the single authoritative wall. `:max-memory` is a separate process-RSS
 /// control and does not alter the term-store ceiling. Any expired/exceeded
 /// resource limit, parse or execution error, panic, or empty output fails closed
-/// to `None`.
+/// to `None`. An inherited CHC thread-local term cap is intersected with the
+/// explicit cap; supplying `None` or a larger limit cannot remove that owner.
 pub(crate) fn smtlib_first_verdict_via_executor_until(
     smt: &str,
     deadline: Instant,
     term_memory_limit: Option<usize>,
 ) -> Option<String> {
-    let limits = ExecutorResourceLimits {
-        deadline: Some(deadline),
+    smtlib_first_verdict_via_executor_with_limit(
+        smt,
+        ReplayLimit::Until(deadline),
         term_memory_limit,
-    };
-    if Instant::now() >= deadline {
-        return None;
-    }
-    let commands = match ay_frontend::parse(smt) {
-        Ok(commands) => commands,
-        Err(error) => {
-            tracing::debug!("executor_adapter: bounded obligation parse error: {error}");
-            return None;
-        }
-    };
-    if Instant::now() >= deadline {
-        return None;
-    }
-    if commands.iter().any(|command| {
-        let keyword = match command {
-            ay_frontend::Command::SetOption(keyword, _)
-            | ay_frontend::Command::SetOptionAttribute(keyword) => keyword,
-            _ => return false,
-        };
-        keyword.trim_start_matches(':') == "timeout"
-    }) {
-        tracing::debug!("executor_adapter: bounded obligation contains a timeout override");
-        return None;
-    }
-    match execute_commands_via_executor_with_limits(&commands, ExecutorQueryRole::Published, limits)
-    {
-        Ok(outputs) => outputs.first().cloned(),
-        Err(()) => None,
-    }
+    )
+}
+
+/// Preserve published-query authority while carrying a caller-owned deadline
+/// and optional cancellation attempt through active ordinary SMT execution.
+/// The owned observer is cooperative, not a hard response-time guarantee.
+pub(crate) fn smtlib_first_verdict_via_executor_with_limit(
+    smt: &str,
+    limit: ReplayLimit<'_>,
+    term_memory_limit: Option<usize>,
+) -> Option<String> {
+    let memory = ReplayMemory::capture(term_memory_limit);
+    // The phase boundary is outside the parsed commands, executor and output
+    // collection: their destruction is charged before a verdict may escape.
+    memory.phase(|| {
+        limit.phase(|| {
+            let limits = ExecutorResourceLimits {
+                deadline: limit.deadline(),
+                term_memory_limit: memory.term_limit(),
+                cancellation: limit.cancellation(),
+            };
+            limit.check()?;
+            let commands = match ay_frontend::parse(smt) {
+                Ok(commands) => commands,
+                Err(error) => {
+                    tracing::debug!("executor_adapter: bounded obligation parse error: {error}");
+                    return None;
+                }
+            };
+            limit.check()?;
+            if limit.deadline().is_some()
+                && commands.iter().any(|command| {
+                    let keyword = match command {
+                        ay_frontend::Command::SetOption(keyword, _)
+                        | ay_frontend::Command::SetOptionAttribute(keyword) => keyword,
+                        _ => return false,
+                    };
+                    keyword.trim_start_matches(':') == "timeout"
+                })
+            {
+                tracing::debug!("executor_adapter: bounded obligation contains a timeout override");
+                return None;
+            }
+            match execute_commands_via_executor_with_limits(
+                &commands,
+                ExecutorQueryRole::Published,
+                limits,
+                new_script_executor,
+            ) {
+                Ok(outputs) => outputs.first().cloned(),
+                Err(()) => None,
+            }
+        })
+    })
 }
 
 /// Re-export of the shared splitter that lives with the `Solver` API it
@@ -1279,6 +1515,100 @@ pub(super) fn accept_reparsed_sat_model(
     }
 }
 
+/// Datatype declarations admitted for one executor query, with its tree size.
+type AdmittedQuery<'a> = (Vec<(&'a str, &'a [crate::ChcDtConstructor])>, usize);
+
+/// Executor admission of one query expression (bridge item D-1, CHC-COMP 2026
+/// Workstream D): the pointer-memoised walk of `logic_detection` (unique-node,
+/// depth and tree caps), with the decision counted on the ITP-BOARD by lane
+/// and stage. Same verdict semantics as `collect_dt_declarations_for_expr`;
+/// also returns the admitted tree size (it selects the script printer).
+fn admit_for_executor<'a>(
+    lane: SmtLane,
+    stage: &'static str,
+    expr: &'a ChcExpr,
+) -> Result<AdmittedQuery<'a>, logic_detection::DatatypeDeclarationError> {
+    use crate::interpolation::stats::{record_admission, AdmissionOutcome};
+    match logic_detection::collect_dt_declarations_for_expr_sized(&[], expr) {
+        Ok((declarations, sizes)) => {
+            record_admission(
+                lane,
+                stage,
+                AdmissionOutcome::Admitted {
+                    unique_nodes: sizes.unique_nodes,
+                    tree_nodes: sizes.tree_nodes,
+                },
+            );
+            Ok((declarations, sizes.tree_nodes))
+        }
+        Err(error) => {
+            let outcome = match &error {
+                logic_detection::DatatypeDeclarationError::ResourceLimit(
+                    "datatype expression nodes",
+                ) => AdmissionOutcome::RefusedUniqueNodes,
+                logic_detection::DatatypeDeclarationError::ResourceLimit(
+                    "datatype expression nesting depth",
+                ) => AdmissionOutcome::RefusedDepth,
+                logic_detection::DatatypeDeclarationError::ResourceLimit(
+                    "executor expression tree nodes",
+                ) => AdmissionOutcome::RefusedTreeSize,
+                _ => AdmissionOutcome::RefusedOther,
+            };
+            record_admission(lane, stage, outcome);
+            Err(error)
+        }
+    }
+}
+
+/// Append one `(assert …)` per conjunct.
+///
+/// Search lane, and only for a query whose tree expansion exceeds the old
+/// admission cap (`MAX_DT_EXPR_NODES` tree nodes — exactly the queries the
+/// tree-counting admission used to refuse): DAG-linear (`smt::dag_smtlib`,
+/// `let`-shared; bridge item D-1). Everything else keeps the tree printer, so
+/// every query the executor accepted before is printed byte for byte as
+/// before. Measured reason for the size gate (2026-09-22): the executor is
+/// slower on `let` scripts of small queries — the tte_synchro IMC k=3 query
+/// (SAT) takes `ay --competition` 5.0–5.4 s with its `let`s and 0.7–0.8 s
+/// let-expanded, and in-portfolio the DAG-printed Search-lane checks turned
+/// that `sat` into `unknown` at IMC's 5 s cap — while a wide query printed as
+/// a tree costs megabytes (om1_general_4_6 k=1: 1.09 MB, 0.73 s vs 0.04 s
+/// as a DAG). Verification lane: the tree printer, unchanged until the INV-12
+/// differential gate covers it. A DAG-printer refusal falls back to the tree
+/// printer.
+fn write_executor_asserts(
+    smt: &mut String,
+    conjuncts: &[&ChcExpr],
+    lane: SmtLane,
+    tree_nodes: usize,
+) {
+    use crate::interpolation::stats::{record_script_print, ScriptPrint};
+    let before = smt.len();
+    if lane == SmtLane::Search && tree_nodes > logic_detection::MAX_DT_EXPR_NODES {
+        let caps = crate::smt::dag_smtlib::DagCaps {
+            max_unique_nodes: logic_detection::MAX_DT_EXPR_NODES,
+            max_depth: logic_detection::MAX_DT_NESTING_DEPTH,
+        };
+        match crate::smt::dag_smtlib::write_asserts_dag(smt, conjuncts, caps) {
+            Ok(stats) => {
+                record_script_print(ScriptPrint::Dag {
+                    bytes: smt.len() - before,
+                    shared_nodes: stats.shared_nodes,
+                });
+                return;
+            }
+            Err(_) => record_script_print(ScriptPrint::DagFallback),
+        }
+    }
+    for c in conjuncts {
+        let c_str = InvariantModel::expr_to_smtlib(c);
+        smt.push_str(&format!("(assert {c_str})\n"));
+    }
+    record_script_print(ScriptPrint::Tree {
+        bytes: smt.len() - before,
+    });
+}
+
 impl SmtContext {
     /// Dispatch an array-containing formula to ay-dpll's Executor for full
     /// array theory support. Falls back to SmtResult::Unknown on any error.
@@ -1293,7 +1623,14 @@ impl SmtContext {
         propagated_model: &FxHashMap<String, SmtValue>,
         timeout: std::time::Duration,
     ) -> SmtResult {
-        self.check_sat_via_executor_with_opts(expr, propagated_model, timeout, false)
+        // Rung 0: Search-lane scripts run EqDiffVar-off (see
+        // `SmtContext::executor_disables_eq_diffvar`); Verification unchanged.
+        self.check_sat_via_executor_with_opts(
+            expr,
+            propagated_model,
+            timeout,
+            self.executor_disables_eq_diffvar(),
+        )
     }
 
     /// `check_sat_via_executor` with per-run executor options (inc-18).
@@ -1313,6 +1650,21 @@ impl SmtContext {
         timeout: std::time::Duration,
         disable_eq_diffvar: bool,
     ) -> SmtResult {
+        // Under an effort the executor route is closed (P4a slice 8): an
+        // executor session's work is outside the run's count before GuardTree
+        // S6, so its answer would be the clock's, not the count's.
+        if crate::run_meter::close_route() {
+            return SmtResult::Unknown;
+        }
+        #[cfg(test)]
+        super::check_sat::record_executor_session_for_tests(timeout);
+        // Under a counted allowance (`smt::executor_work`) the run is bounded
+        // by its work; a spent allowance answers as an expired deadline does.
+        let _work = match super::executor_work::draw_executor_work() {
+            super::executor_work::ExecutorDraw::Spent => return SmtResult::Unknown,
+            super::executor_work::ExecutorDraw::Open(draw) => Some(draw),
+            super::executor_work::ExecutorDraw::Unmetered => None,
+        };
         // Start one absolute envelope before admission, rewriting, SMT-LIB
         // construction, and parsing. The script's relative `:timeout` is kept
         // for compatibility, but Executor combines it with this earlier wall
@@ -1329,17 +1681,68 @@ impl SmtContext {
         .flatten()
         .fold(timeout_deadline, |deadline, outer| deadline.min(outer));
         if Instant::now() >= executor_deadline || self.exact_term_memory_exceeded() {
+            if exec_trace_enabled() {
+                safe_eprintln!(
+                    "[EXEC-TRACE {:?}] adapter early-return: deadline/term-memory before admission",
+                    std::thread::current().id()
+                );
+            }
             return SmtResult::Unknown;
         }
+
+        let lane = self.lane();
+        // Search lane: solve top-level equalities first (`smt::solve_eqs`).
+        // The residual is equisatisfiable; a SAT model of it is completed
+        // (eliminated variables from their definitions) and validated against
+        // the ORIGINAL `expr` below, like every executor model. The pass is
+        // DAG-memoised and budgeted, so it runs ahead of admission: a wide
+        // unrolling whose tree expansion the admission would refuse is often
+        // small once its init constants and frame equalities are substituted.
+        let solved = if lane == SmtLane::Search {
+            super::solve_eqs::for_search_executor(expr)
+        } else {
+            None
+        };
+        if let Some((solved, original_vars)) = &solved {
+            if exec_trace_enabled() {
+                safe_eprintln!(
+                    "[EXEC-TRACE {:?}] solve-eqs eliminated={} rounds={} decided={}",
+                    std::thread::current().id(),
+                    solved.eliminated(),
+                    solved.rounds,
+                    matches!(solved.residual, ChcExpr::Bool(_))
+                );
+            }
+            match solved.residual {
+                ChcExpr::Bool(false) => return SmtResult::Unsat,
+                ChcExpr::Bool(true) => {
+                    let mut model = propagated_model.clone();
+                    if !solved.complete_model(original_vars, &mut model) {
+                        return SmtResult::Unknown;
+                    }
+                    return accept_reparsed_sat_model(&[expr], model, "executor_adapter")
+                        .map_or(SmtResult::Unknown, SmtResult::Sat);
+                }
+                _ => {}
+            }
+        }
+        let original_expr = expr;
+        let expr = solved.as_ref().map_or(expr, |(solved, _)| &solved.residual);
 
         // Step 0: Admit the original expression before any recursive
         // preprocessing (`contains_mod_or_div`, `eliminate_mod`, or `vars`).
         // The collector is iterative and owns aggregate node/depth/name/sort
         // caps, so a hostile typed term fails closed before those helpers run.
-        if let Err(reason) = collect_dt_declarations_for_expr(&[], expr) {
+        if let Err(reason) = admit_for_executor(lane, "pre", expr) {
             tracing::debug!(
                 "executor_adapter: {reason}; returning Unknown before recursive preprocessing"
             );
+            if exec_trace_enabled() {
+                safe_eprintln!(
+                    "[EXEC-TRACE {:?}] adapter early-return: dt admission (pre): {reason}",
+                    std::thread::current().id()
+                );
+            }
             return SmtResult::Unknown;
         }
 
@@ -1356,12 +1759,18 @@ impl SmtContext {
         // auxiliary variables and constraints. Datatype declarations are
         // collected here before the now-bounded `vars` traversal and reused
         // below rather than rewalking variable sorts a second time.
-        let dt_decls = match collect_dt_declarations_for_expr(&[], solve_expr) {
-            Ok(declarations) => declarations,
+        let (dt_decls, admitted_tree_nodes) = match admit_for_executor(lane, "post", solve_expr) {
+            Ok(admitted) => admitted,
             Err(reason) => {
                 tracing::debug!(
                     "executor_adapter: {reason}; returning Unknown after bounded preprocessing"
                 );
+                if exec_trace_enabled() {
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] adapter early-return: dt admission (post): {reason}",
+                        std::thread::current().id()
+                    );
+                }
                 return SmtResult::Unknown;
             }
         };
@@ -1370,8 +1779,30 @@ impl SmtContext {
         let vars = solve_expr.vars();
         if vars.is_empty() {
             // No variables -- constant expression. Let the normal path handle it.
+            if exec_trace_enabled() {
+                safe_eprintln!(
+                    "[EXEC-TRACE {:?}] adapter early-return: no variables (constant expression)",
+                    std::thread::current().id()
+                );
+            }
             return SmtResult::Unknown;
         }
+
+        // Step 2b (Rung 0): sort-unique names. One query can carry `J:Int` and
+        // `J:Bool`; emitting both as `(declare-const J ..)` made the frontend
+        // reject the script (78–89 % of DRAGON_10's executor Unknowns). The
+        // rank-losing sort is renamed `J!Int` in declarations AND body; the
+        // model maps back through `lookup_model_value`, and SAT validation
+        // below still runs against the ORIGINAL `expr`.
+        let sort_renaming = super::sort_unique::SortUniqueRenaming::plan(&vars);
+        let sort_renamed_expr;
+        let (solve_expr, vars) = match &sort_renaming {
+            Some(renaming) => {
+                sort_renamed_expr = renaming.apply(solve_expr);
+                (&sort_renamed_expr, renaming.renamed_vars(&vars))
+            }
+            None => (solve_expr, vars),
+        };
 
         // Step 3: Detect the appropriate logic based on sorts present.
         let logic = detect_logic(&vars, solve_expr);
@@ -1401,6 +1832,12 @@ impl SmtContext {
                 tracing::debug!(
                     "executor_adapter: {reason}; returning Unknown instead of emitting invalid datatype declarations"
                 );
+                if exec_trace_enabled() {
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] adapter early-return: datatype declarations: {reason}",
+                        std::thread::current().id()
+                    );
+                }
                 return SmtResult::Unknown;
             }
         }
@@ -1411,6 +1848,12 @@ impl SmtContext {
                 tracing::debug!(
                     "executor_adapter: {reason}; returning Unknown instead of emitting ambiguous declarations"
                 );
+                if exec_trace_enabled() {
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] adapter early-return: uf declarations: {reason}",
+                        std::thread::current().id()
+                    );
+                }
                 return SmtResult::Unknown;
             }
         };
@@ -1435,6 +1878,12 @@ impl SmtContext {
                 Ok(aliases) => aliases,
                 Err(reason) => {
                     tracing::debug!("executor_adapter: {reason}; returning Unknown");
+                    if exec_trace_enabled() {
+                        safe_eprintln!(
+                            "[EXEC-TRACE {:?}] adapter early-return: uf alias: {reason}",
+                            std::thread::current().id()
+                        );
+                    }
                     return SmtResult::Unknown;
                 }
             };
@@ -1443,6 +1892,12 @@ impl SmtContext {
                 Ok(script) => script,
                 Err(reason) => {
                     tracing::debug!("executor_adapter: {reason}; returning Unknown");
+                    if exec_trace_enabled() {
+                        safe_eprintln!(
+                            "[EXEC-TRACE {:?}] adapter early-return: uf alias: {reason}",
+                            std::thread::current().id()
+                        );
+                    }
                     return SmtResult::Unknown;
                 }
             };
@@ -1453,19 +1908,32 @@ impl SmtContext {
         // conjunct individually. Without this, (assert (and A B C)) hides
         // DT constructor equalities from the reachability filter (#7016).
         let conjuncts = solve_expr.conjuncts();
-        if let Some(reason) = conjuncts
+        if let Some((offending, reason)) = conjuncts
             .iter()
-            .find_map(|expr| unsupported_executor_expr_reason(expr))
+            .find_map(|expr| unsupported_executor_expr_reason(expr).map(|reason| (expr, reason)))
         {
             tracing::debug!(
                 "executor_adapter: unsupported SMT-LIB executor term: {reason}; returning Unknown"
             );
+            if exec_trace_enabled() {
+                safe_eprintln!(
+                    "[EXEC-TRACE {:?}] adapter early-return: sort guard: {reason}",
+                    std::thread::current().id()
+                );
+                static SAMPLES: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                    let text = InvariantModel::expr_to_smtlib(offending);
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] sort-guard sample: {}",
+                        std::thread::current().id(),
+                        &text[..text.len().min(400)]
+                    );
+                }
+            }
             return SmtResult::Unknown;
         }
-        for c in &conjuncts {
-            let c_str = InvariantModel::expr_to_smtlib(c);
-            smt.push_str(&format!("(assert {c_str})\n"));
-        }
+        write_executor_asserts(&mut smt, &conjuncts, lane, admitted_tree_nodes);
         smt.push_str("(check-sat)\n");
         smt.push_str("(get-model)\n");
         let build_dt = t_build.elapsed();
@@ -1501,6 +1969,12 @@ impl SmtContext {
             Ok(cmds) => cmds,
             Err(e) => {
                 tracing::debug!("executor_adapter: parse error: {e}");
+                if exec_trace_enabled() {
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] adapter early-return: parse error: {e}",
+                        std::thread::current().id()
+                    );
+                }
                 return SmtResult::Unknown;
             }
         };
@@ -1523,7 +1997,9 @@ impl SmtContext {
             ExecutorResourceLimits {
                 deadline: Some(executor_deadline),
                 term_memory_limit: self.term_memory_budget,
+                cancellation: None,
             },
+            new_search_executor,
         ) {
             Ok(out) => out,
             Err(()) => return SmtResult::Unknown,
@@ -1549,7 +2025,12 @@ impl SmtContext {
                     );
                     return SmtResult::Unknown;
                 }
-                let validation_exprs = [expr];
+                if let Some((solved, original_vars)) = &solved {
+                    if !solved.complete_model(original_vars, &mut model) {
+                        return SmtResult::Unknown;
+                    }
+                }
+                let validation_exprs = [original_expr];
                 if let Some(model) =
                     accept_reparsed_sat_model(&validation_exprs, model, "executor_adapter")
                 {
@@ -1654,6 +2135,10 @@ pub(super) fn check_sat_conjunction_via_executor_with_resource_limits(
 ) -> super::incremental::IncrementalCheckResult {
     use super::incremental::IncrementalCheckResult;
 
+    // Closed under an effort, as `SmtContext::check_sat_via_executor_with_opts`.
+    if crate::run_meter::close_route() {
+        return IncrementalCheckResult::Unknown;
+    }
     let Some(timeout_deadline) = Instant::now().checked_add(timeout) else {
         return IncrementalCheckResult::Unknown;
     };
@@ -1698,6 +2183,23 @@ pub(super) fn check_sat_conjunction_via_executor_with_resource_limits(
     if vars.is_empty() {
         return IncrementalCheckResult::Unknown;
     }
+
+    // Rung 0: sort-unique names (see `check_sat_via_executor_with_opts`).
+    let sort_renaming = super::sort_unique::SortUniqueRenaming::plan(&vars);
+    let sort_renamed_exprs: Vec<ChcExpr>;
+    let (exprs, combined, vars): (&[ChcExpr], ChcExpr, Vec<ChcVar>) = match &sort_renaming {
+        Some(renaming) => {
+            sort_renamed_exprs = exprs.iter().map(|e| renaming.apply(e)).collect();
+            (
+                &sort_renamed_exprs,
+                renaming.apply(&combined),
+                renaming.renamed_vars(&vars),
+            )
+        }
+        // `dt_decls` borrows the original `combined`; a shallow (Arc) clone
+        // keeps it alive on the common no-clash path.
+        None => (exprs, combined.clone(), vars),
+    };
 
     let logic = detect_logic(&vars, &combined);
 
@@ -1819,7 +2321,9 @@ pub(super) fn check_sat_conjunction_via_executor_with_resource_limits(
         ExecutorResourceLimits {
             deadline: Some(executor_deadline),
             term_memory_limit,
+            cancellation: None,
         },
+        new_search_executor,
     ) {
         Ok(out) => out,
         Err(()) => return IncrementalCheckResult::Unknown,
@@ -1884,3 +2388,106 @@ pub(super) fn check_sat_conjunction_via_executor_with_resource_limits(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancellation_tests;
+
+#[cfg(test)]
+mod array_lambda_executor_tests {
+    use super::*;
+    use crate::{ChcOp, ChcParser};
+    use std::sync::Arc;
+
+    fn captured_lambda() -> ChcExpr {
+        let index = ChcVar::new("i", ChcSort::Int);
+        ChcExpr::array_lambda(
+            index.clone(),
+            ChcExpr::Op(
+                ChcOp::Add,
+                vec![
+                    Arc::new(ChcExpr::Var(index)),
+                    Arc::new(ChcExpr::Var(ChcVar::new("outer value", ChcSort::Int))),
+                ],
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lambda_bound_uf_is_declared_without_a_global_observation_alias() {
+        let index = ChcVar::new("i", ChcSort::Int);
+        let lambda = ChcExpr::array_lambda(
+            index.clone(),
+            ChcExpr::FuncApp(
+                "f".into(),
+                ChcSort::Int,
+                vec![Arc::new(ChcExpr::Var(index))],
+            ),
+        )
+        .unwrap();
+        let declarations =
+            collect_uninterpreted_function_declarations_for_exprs([&lambda]).unwrap();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "f");
+        assert!(
+            collect_uninterpreted_function_applications_for_exprs([&lambda])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lambda_and_outer_shared_uf_keep_distinct_observation_scopes() {
+        let lambda = ChcExpr::array_lambda(
+            ChcVar::new("i", ChcSort::Int),
+            ChcExpr::FuncApp("f".into(), ChcSort::Int, vec![Arc::new(ChcExpr::Int(7))]),
+        )
+        .unwrap();
+        let ChcExpr::ArrayLambda(info) = &lambda else {
+            unreachable!()
+        };
+        // Stack order visits the shared node first under the lambda. Its
+        // later outer occurrence must still receive a global observation.
+        let applications =
+            collect_uninterpreted_function_applications_for_exprs([info.body().as_ref(), &lambda])
+                .unwrap();
+        assert_eq!(applications.len(), 1);
+        assert_eq!(&applications[0], info.body().as_ref());
+    }
+
+    #[test]
+    fn bounded_lambda_writer_roundtrips_quoted_capture_and_parallel_let() {
+        let lambda = captured_lambda();
+        let mut script = BoundedUfAliasScript::new(32_768);
+        let mut work = 0;
+        script.write_expr(&lambda, &mut work, 32_768, None).unwrap();
+        assert!(script.text.contains("|outer value|"), "{}", script.text);
+        let query = format!(
+            "(set-logic HORN) (declare-var |outer value| Int) \
+             (declare-rel error ()) \
+             (rule (=> (not (= (select {} 4) 11)) error)) (query error)",
+            script.text,
+        );
+        ChcParser::parse(&query).expect("same lexical scopes after bounded serialization");
+        assert!(work > 0);
+    }
+
+    #[test]
+    fn bounded_lambda_writer_respects_output_and_work_limits() {
+        let lambda = captured_lambda();
+        let mut small = BoundedUfAliasScript::new(8);
+        assert_eq!(
+            small.write_expr(&lambda, &mut 0, 32_768, None),
+            Err(UfApplicationAliasEmissionError::ResourceLimit(
+                "emitted bytes"
+            ))
+        );
+        let mut small = BoundedUfAliasScript::new(32_768);
+        assert_eq!(
+            small.write_expr(&lambda, &mut 0, 1, None),
+            Err(UfApplicationAliasEmissionError::ResourceLimit(
+                "serializer work"
+            ))
+        );
+    }
+}

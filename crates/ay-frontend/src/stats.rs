@@ -94,7 +94,8 @@ impl FormulaStats {
             | Command::Eval(term)
             | Command::Display(term, _)
             | Command::DebugSet(_, term, _)
-            | Command::Simplify(term) => self.collect_term(term),
+            | Command::Simplify(term)
+            | Command::SimplifyWithParams(term, _) => self.collect_term(term),
             Command::CheckSatAssuming(terms) => {
                 for t in terms {
                     self.collect_term(t);

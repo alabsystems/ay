@@ -5,7 +5,7 @@
 //! Extension-mode entry points and initialization for DPLL(T) solving.
 
 use super::super::*;
-use super::theory_callback::ExtensionCallback;
+use super::theory_callback::{ExtensionCallback, TheoryCallback};
 
 impl Solver {
     /// Solve with an extension extracted from the SAT clause database during the
@@ -23,9 +23,8 @@ impl Solver {
         E: Extension,
         B: FnMut(&[Vec<Literal>]) -> Option<PreparedExtension<E>>,
     {
-        SolverSatResult::from_solver_result(
-            self.solve_with_preprocessing_extension_raw(build_extension),
-        )
+        let result = self.solve_with_preprocessing_extension_raw(build_extension);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Interruptible variant of `solve_with_preprocessing_extension`.
@@ -39,9 +38,9 @@ impl Solver {
         B: FnMut(&[Vec<Literal>]) -> Option<PreparedExtension<E>>,
         F: Fn() -> bool,
     {
-        SolverSatResult::from_solver_result(
-            self.solve_interruptible_with_preprocessing_extension_raw(build_extension, should_stop),
-        )
+        let result =
+            self.solve_interruptible_with_preprocessing_extension_raw(build_extension, should_stop);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Solve with a theory extension for eager DPLL(T) integration
@@ -54,7 +53,8 @@ impl Solver {
     /// This is the recommended way to integrate theory solvers for eager
     /// DPLL(T) where theory propagation happens during SAT search.
     pub fn solve_with_extension(&mut self, ext: &mut dyn Extension) -> SolverSatResult {
-        SolverSatResult::from_solver_result(self.solve_with_extension_raw(ext))
+        let result = self.solve_with_extension_raw(ext);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Solve with a theory extension under a set of assumption literals (#LNS).
@@ -71,9 +71,8 @@ impl Solver {
         ext: &mut dyn Extension,
         assumptions: &[Literal],
     ) -> SolverSatResult {
-        SolverSatResult::from_solver_result(
-            self.solve_with_extension_and_assumptions_raw(ext, assumptions),
-        )
+        let result = self.solve_with_extension_and_assumptions_raw(ext, assumptions);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     fn solve_with_extension_and_assumptions_raw(
@@ -126,6 +125,96 @@ impl Solver {
         result
     }
 
+    /// Solve with a theory extension under assumptions and KEEP the
+    /// failed-assumption core (#horn-smt-session WP-1, contract C8).
+    ///
+    /// `solve_with_extension_and_assumptions` collapses
+    /// `AssumeResult::Unsat(core, ..)` to `SatResult::Unsat(ProofCertificate::empty())`
+    /// and so discards the core the assumption loop computed. A persistent
+    /// CDCL(T) session that activates its assertions through assumption
+    /// literals needs that core back (it IS the query's UNSAT core) and needs a
+    /// cooperative stop predicate (deadline / interrupt / memory). This entry
+    /// adds exactly those two things and changes nothing else: same loop
+    /// (`solve_with_assumptions_impl` with `eager_ext`), same incremental-reset
+    /// behaviour, same result finalisation as the plain assumption API.
+    ///
+    /// Head mirrors `solve_with_extension_and_assumptions_raw` (oversized-clause
+    /// guard, cooperative stop, empty clause / empty constraint); tail mirrors
+    /// `solve_with_assumptions_interruptible_raw` (`finalize_assumption_api_result`:
+    /// debug model check, truncation to `user_num_vars`, scope-selector
+    /// filtering of the core; diagnostics, trace, `reset_constraint`).
+    ///
+    /// `should_stop` is polled at entry and then by the loop every 100
+    /// conflicts / 1000 decisions / 1024 iterations. A stop answers `Unknown`
+    /// with `last_unknown_reason() == Some(SatUnknownReason::Interrupted)`
+    /// (`DeadlineExceeded` when the solve deadline is the cause). There is no
+    /// empty-assumption fast path on purpose: `solve_no_assumptions` would run
+    /// without the extension, and the eager loop handles an empty prefix.
+    pub fn solve_with_extension_and_assumptions_core<F>(
+        &mut self,
+        ext: &mut dyn Extension,
+        assumptions: &[Literal],
+        should_stop: Option<&F>,
+    ) -> SolverAssumeResult
+    where
+        F: Fn() -> bool,
+    {
+        let result =
+            self.solve_with_extension_and_assumptions_core_raw(ext, assumptions, should_stop);
+        SolverAssumeResult::from_solver_result(self.finish_counted_assume(result))
+    }
+
+    fn solve_with_extension_and_assumptions_core_raw<F>(
+        &mut self,
+        ext: &mut dyn Extension,
+        assumptions: &[Literal],
+        should_stop: Option<&F>,
+    ) -> AssumeResult
+    where
+        F: Fn() -> bool,
+    {
+        self.cold.last_unknown_reason = None;
+        self.cold.last_unknown_detail = None;
+        if self.arena.has_oversized_clause() {
+            let result = self.declare_assume_unknown_with_reason(SatUnknownReason::ClauseTooLarge);
+            self.emit_diagnostic_assumption_result(&result);
+            self.trace_result(SolveOutcome::Unknown);
+            self.finish_tla_trace();
+            self.reset_constraint();
+            return result;
+        }
+        if let Some(result) = self.finish_stopped_assumption_entry(should_stop) {
+            return result;
+        }
+        let combined = self.compose_scope_assumptions(assumptions);
+        self.emit_diagnostic_assumption_batch(&combined, !self.cold.scope_selectors.is_empty());
+
+        // CaDiCaL constrain.cpp:53 - empty constraint -> immediate UNSAT (#8207);
+        // an empty clause is UNSAT under every assumption set.
+        if self.cold.unsat_constraint || self.has_empty_clause {
+            let result = self.declare_unsat_assume(vec![]);
+            self.emit_diagnostic_assumption_result(&result);
+            self.trace_result(SolveOutcome::Unsat);
+            self.finish_tla_trace();
+            self.reset_constraint();
+            return result;
+        }
+
+        let result =
+            self.solve_with_assumptions_impl(&combined, should_stop, None, None, Some(ext));
+
+        let final_result = self.finalize_assumption_api_result(result);
+        self.emit_diagnostic_assumption_result(&final_result);
+        match final_result {
+            AssumeResult::Sat(_) => self.trace_result(SolveOutcome::Sat),
+            AssumeResult::Unsat(..) => self.trace_result(SolveOutcome::Unsat),
+            AssumeResult::Unknown => self.trace_result(SolveOutcome::Unknown),
+        }
+        self.finish_tla_trace();
+        self.reset_constraint();
+        final_result
+    }
+
     /// Solve with a theory extension AND an interrupt callback (#6296).
     ///
     /// Combines `solve_with_extension` (theory phase hints, propagation) with
@@ -139,9 +228,8 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
-        SolverSatResult::from_solver_result(
-            self.solve_interruptible_with_extension_raw(ext, should_stop),
-        )
+        let result = self.solve_interruptible_with_extension_raw(ext, should_stop);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Continue solving with an extension after adding new clauses (#8256).
@@ -161,18 +249,19 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
-        SolverSatResult::from_solver_result(
-            self.continue_solving_with_extension_raw(ext, should_stop),
-        )
+        let result = self.continue_solving_with_extension_raw(ext, should_stop);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Resume solving after a budget-exhausted interruption (#8256).
     ///
-    /// Unlike `continue_solving_with_extension`, this does NOT reset the trail,
-    /// flush learned clauses, or rebuild VSIDS state. It simply re-enters the
-    /// CDCL loop from the current state with a new should_stop closure.
-    /// This is safe when:
-    /// 1. The prior solve returned Unknown(Interrupted) due to should_stop
+    /// Unlike `continue_solving_with_extension`, this does NOT flush learned
+    /// clauses or rebuild VSIDS state, and keeps the trail up to the assumption
+    /// prefix. It restarts above that prefix (P4a: a stop can leave a found
+    /// conflict unanalysed on the trail) and re-enters the CDCL loop with a new
+    /// should_stop closure. This is safe when:
+    /// 1. The prior solve returned Unknown on a stop (should_stop, or a
+    ///    conflict or decision budget)
     /// 2. No new clauses have been added via add_clause()
     /// 3. The theory extension is in the same state (same trail position)
     ///
@@ -190,7 +279,7 @@ impl Solver {
         F: Fn() -> bool,
     {
         let result = self.resume_solving_with_extension_raw(ext, should_stop);
-        SolverSatResult::from_solver_result(result)
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Internal resume implementation — re-enters CDCL loop without trail reset.
@@ -234,10 +323,32 @@ impl Solver {
             self.cold.last_progress_time = None;
         }
 
-        // No trail reset, no learned clause flush, no VSIDS rebuild.
-        // Simply re-enter the CDCL loop from the current state.
-
+        // No learned clause flush, no VSIDS rebuild, no trail reset below the
+        // assumption prefix: re-enter the CDCL loop from the current search.
         let mut callback = ExtensionCallback { ext };
+
+        // But restart above that prefix first, as a cold restart does (P4a).
+        // The loop's stops do not wait for the step they interrupt: the
+        // conflict-site budget and stop checks return BEFORE the conflict is
+        // analysed, and the theory-propagation polls return before the theory's
+        // result is handled. A conflict so left sits behind `qhead`, falsified,
+        // and a loop re-entered on the same trail never visits it again: it can
+        // reach a complete assignment that falsifies the clause (#8078's "BCP
+        // missed conflict"), which a split-loop round stopped by its decision
+        // slice and resumed here did. The prior solve's exit also dropped the
+        // trail's lazy theory reasons (`clear_lazy_reason_tables`), so literals
+        // above the prefix are left without reasons for a later analysis.
+        // Backtracking unassigns every literal of such a conflict above the
+        // prefix (one at least, or it was a conflict at the prefix, which ends
+        // the solve before any stop), so its watches see it again; the learned
+        // clauses, scores and saved phases stay, which is what resuming keeps.
+        let keep_level = self.cold.active_assumption_count;
+        if self.decision_level > keep_level {
+            self.backtrack(keep_level);
+            callback.backtrack_after_materializing_lazy_reasons(self, keep_level);
+            self.cold.lazy_materialization_failed = false;
+        }
+
         let result = self.cdcl_loop(&mut callback, should_stop);
         self.clear_lazy_reason_tables();
         result
@@ -378,6 +489,7 @@ impl Solver {
                 }
 
                 self.stats.clear_bcp_learned_1963_blocker_cert(*idx);
+                self.record_clause_retirement(*idx);
                 self.arena.delete(*idx);
                 self.cold.clause_db_changes += 1;
                 flushed += 1;
@@ -389,6 +501,8 @@ impl Solver {
                     core_kept = self.arena.active_clause_count(),
                     "#8399 continue_solving: flushed non-core learned clauses"
                 );
+                // The cap and byte triggers' floors (`lower_reduction_retrigger_points`).
+                self.lower_reduction_retrigger_points();
             }
         }
 
@@ -466,7 +580,11 @@ impl Solver {
             return result;
         }
         ext.init();
-        if let Some(conflict_ref) = self.search_propagate() {
+        let propagation = match self.search_propagate_counted() {
+            Ok(conflict) => conflict,
+            Err(reason) => return self.declare_unknown_with_reason(reason),
+        };
+        if let Some(conflict_ref) = propagation {
             self.record_level0_conflict_chain(conflict_ref);
             let result = self.declare_unsat();
             self.trace_sat_result(&result);
@@ -826,6 +944,9 @@ impl Solver {
             }
         }
 
+        if self.decision_level == 0 {
+            self.reclassify_jump_reasons_kissat(true);
+        }
         self.cdcl_loop_pure(should_stop)
     }
 
@@ -860,11 +981,27 @@ impl Solver {
         if use_incremental {
             self.stats.ext_incremental_reset_hits += 1;
             self.reset_search_state_incremental();
+            if self.original_ledger_replay_failed() {
+                return Some(
+                    self.declare_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure),
+                );
+            }
+            // Attaching the clauses added since the last solve can refute the
+            // clause database. Neither BCP nor the extension may run on a
+            // refuted database.
+            if self.has_empty_clause {
+                return Some(self.declare_unsat());
+            }
         } else {
             if self.cold.inc_engine_reset_mode {
                 self.stats.ext_full_reset_hits += 1;
             }
             self.reset_search_state();
+            if self.original_ledger_replay_failed() {
+                return Some(
+                    self.declare_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure),
+                );
+            }
         }
 
         // TLA trace: emit initial state (step 0, no action).
@@ -921,7 +1058,11 @@ impl Solver {
 
         // Propagate level-0 units before entering the unified loop.
         let trail_before = self.trail.len();
-        if let Some(conflict_ref) = self.search_propagate() {
+        let propagation = match self.search_propagate_counted() {
+            Ok(conflict) => conflict,
+            Err(reason) => return Some(self.declare_unknown_with_reason(reason)),
+        };
+        if let Some(conflict_ref) = propagation {
             // Record the BCP resolution chain for proof reconstruction (#6368).
             // Without this, the clause trace has no empty-clause entry with
             // resolution hints, causing SAT proof reconstruction (Phase 1)
@@ -951,6 +1092,8 @@ impl Solver {
         if !result.proof_script.is_empty() {
             self.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
         }
+        // G3 then G1 (see `extension_effects.rs`).
+        self.apply_extension_growth_and_definitions(&mut result);
 
         // Process additional theory lemma clauses BEFORE handling conflicts (#4533).
         // When the XOR extension detects a 0=1 contradiction, it may include
@@ -958,7 +1101,7 @@ impl Solver {
         // XOR-encoding clauses. These must be emitted to the proof stream before
         // the empty clause so external DRAT checkers can verify the derivation.
         for clause in result.clauses {
-            self.add_theory_lemma(clause);
+            self.add_extension_clause(clause, result.clause_origin);
         }
 
         if let Some(conflict) = result.conflict {
@@ -999,6 +1142,17 @@ impl Solver {
             ExtCheckResult::AddClauses(clauses) => {
                 // #6546: add theory lemmas and continue solving.
                 for clause in clauses {
+                    self.add_theory_lemma(clause);
+                }
+                None
+            }
+            ExtCheckResult::Continue(cont) => {
+                // G2 at level 0 (the search has not started): plain adds.
+                self.grow_for_extension_vars(cont.num_vars);
+                for clause in cont.definitions {
+                    self.add_theory_definition(clause);
+                }
+                for clause in cont.lemmas {
                     self.add_theory_lemma(clause);
                 }
                 None

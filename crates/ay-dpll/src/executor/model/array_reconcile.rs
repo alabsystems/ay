@@ -354,6 +354,14 @@ impl Executor {
             let key = (base, idx_int);
             if let Some(existing) = fresh.get(&key) {
                 if !value_strings_agree(existing, &sel_val) {
+                    if ay_core::misc_cli_flags().debug_cert {
+                        eprintln!(
+                            "CERT/array-reconcile reject=read-pair select={sel:?} base={:?} base_term={:?} index={} previous={existing:?} committed={sel_val:?}",
+                            key.0,
+                            self.ctx.terms.get(key.0),
+                            key.1,
+                        );
+                    }
                     return None;
                 }
             } else {
@@ -368,10 +376,26 @@ impl Executor {
                             .find(|(k, _)| parse_int_entry(k).is_some_and(|n| n == key.1));
                         if let Some((_, v)) = existing {
                             if !value_strings_agree(v, &sel_val) {
+                                if ay_core::misc_cli_flags().debug_cert {
+                                    eprintln!(
+                                        "CERT/array-reconcile reject=stored-cell select={sel:?} base={:?} base_term={:?} index={} previous={v:?} committed={sel_val:?}",
+                                        key.0,
+                                        self.ctx.terms.get(key.0),
+                                        key.1,
+                                    );
+                                }
                                 return None;
                             }
                         } else if let Some(default) = &interp.default {
                             if !value_strings_agree(default, &sel_val) {
+                                if ay_core::misc_cli_flags().debug_cert {
+                                    eprintln!(
+                                        "CERT/array-reconcile reject=default select={sel:?} base={:?} base_term={:?} index={} previous={default:?} committed={sel_val:?}",
+                                        key.0,
+                                        self.ctx.terms.get(key.0),
+                                        key.1,
+                                    );
+                                }
                                 return None;
                             }
                         }

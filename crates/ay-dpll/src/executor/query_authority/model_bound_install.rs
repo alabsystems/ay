@@ -12,6 +12,7 @@ use crate::executor::mbqi::CheckedMbqiSatAuthority;
 use crate::executor::model::{Model, QuantifiedGrantModelEpoch};
 use crate::executor::quantifier_loop::result_mapping::{
     CheckedExactArrayNegationSatAuthority, CheckedFiniteExpansionSatAuthority,
+    CheckedModelRewriteSatAuthority,
 };
 use crate::executor::Executor;
 
@@ -51,6 +52,7 @@ impl QuantifiedSatAuthorityGrant {
                 .collect(),
             projection_bindings: QuantifiedProjectionBindings::None,
             model_epoch: Some(model_epoch),
+            admission: crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
         })
     }
 }
@@ -73,11 +75,23 @@ impl Executor {
     /// the prior public model and evidence exactly untouched. Any later strict
     /// repair uses the ordinary model mutation primitives, revokes the affine
     /// model seal, and makes this grant fail closed at the quantified gate.
+    ///
+    /// `admission` is the class of the weakest refutation the producer's
+    /// certificate consumed. Only `Checked` installs: a pass resting on a
+    /// `discharged-trust` refutation (a fresh executor running the same code
+    /// re-decided it) decided a truth value nobody checked, and the gate
+    /// defers to this grant without re-deciding it, so such a pass declines
+    /// here exactly like a stale one, predecessor untouched. The producers'
+    /// probe mode already refuses that class; this is the second line.
     pub(in crate::executor) fn install_finite_model_full_domain_sat_authority(
         &mut self,
         evidence: CheckedBvFullDomainSatAuthority,
         mut staged_model: Model,
+        admission: crate::executor::unsat_cert::ProbeUnsatAuthority,
     ) -> bool {
+        if admission != crate::executor::unsat_cert::ProbeUnsatAuthority::Checked {
+            return false;
+        }
         let Some(roots) = evidence.into_current_roots(self) else {
             return false;
         };
@@ -88,7 +102,7 @@ impl Executor {
             return false;
         }
         let model_epoch = staged_model.seal_quantified_grant_model();
-        let Some(grant) = QuantifiedSatAuthorityGrant::for_checked_staged_model_roots(
+        let Some(mut grant) = QuantifiedSatAuthorityGrant::for_checked_staged_model_roots(
             self,
             &roots,
             &staged_model,
@@ -99,6 +113,7 @@ impl Executor {
         if !grant.scope_is_current_for(self, &roots) {
             return false;
         }
+        grant.admission = admission;
 
         // The commit boundary. No fallible work may be added below it.
         self.last_model_validated = false;
@@ -170,6 +185,18 @@ impl Executor {
     pub(in crate::executor) fn install_exact_array_negation_sat_authority(
         &mut self,
         evidence: CheckedExactArrayNegationSatAuthority,
+    ) -> bool {
+        self.revoke_mbqi_sat_authority();
+        let Some((roots, model_epoch)) = evidence.into_current_roots(self) else {
+            return false;
+        };
+        self.install_model_bound_mbqi_grant(&roots, model_epoch, QuantifiedProjectionBindings::None)
+    }
+
+    /// Install exact current evidence for a fully evaluated quantified model.
+    pub(in crate::executor) fn install_independently_evaluated_quantified_sat_authority(
+        &mut self,
+        evidence: CheckedModelRewriteSatAuthority,
     ) -> bool {
         self.revoke_mbqi_sat_authority();
         let Some((roots, model_epoch)) = evidence.into_current_roots(self) else {
@@ -264,7 +291,11 @@ mod tests {
         let stale = CheckedBvFullDomainSatAuthority::for_test(&executor, &roots);
         executor.advance_query_authority_epoch();
 
-        assert!(!executor.install_finite_model_full_domain_sat_authority(stale, Model::empty(),));
+        assert!(!executor.install_finite_model_full_domain_sat_authority(
+            stale,
+            Model::empty(),
+            crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
+        ));
         assert_eq!(
             sentinel_value(&mut executor, sentinel),
             EvalValue::Bool(false),
@@ -324,7 +355,11 @@ mod tests {
         let _memo = crate::executor::model::EvalMemoSession::new();
         crate::executor::model::seed_eval_memo_for_test(sentinel, EvalValue::Bool(false));
         let evidence = CheckedBvFullDomainSatAuthority::for_test(&executor, &roots);
-        assert!(executor.install_finite_model_full_domain_sat_authority(evidence, staged));
+        assert!(executor.install_finite_model_full_domain_sat_authority(
+            evidence,
+            staged,
+            crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
+        ));
 
         assert_eq!(
             sentinel_value(&mut executor, sentinel),
@@ -355,7 +390,11 @@ mod tests {
         let roots = executor.ctx.assertions.clone();
         executor.last_model = Some(Model::empty());
         let evidence = CheckedBvFullDomainSatAuthority::for_test(&executor, &roots);
-        assert!(executor.install_finite_model_full_domain_sat_authority(evidence, Model::empty(),));
+        assert!(executor.install_finite_model_full_domain_sat_authority(
+            evidence,
+            Model::empty(),
+            crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
+        ));
         assert!(executor.has_current_model_bound_quantified_sat_authority(&roots));
 
         let sentinel = executor
@@ -380,5 +419,68 @@ mod tests {
             SolveResult::Unknown,
             "a stale finite-model grant must not discharge a quantified root"
         );
+    }
+
+    /// The installer is the second line behind the probe mode: a pass whose
+    /// certificate rests on a `discharged-trust` refutation never mints the
+    /// grant the gate defers to, and the decline is as atomic as a stale one.
+    /// The staged model FALSIFIES the root (`c = false` against
+    /// `forall x. (or x c)`), which is what a wrong same-engine refutation
+    /// would hand the gate. The Checked twin installs the same pass.
+    #[test]
+    fn trust_resting_finite_model_pass_never_installs() {
+        use crate::executor::unsat_cert::ProbeUnsatAuthority;
+
+        let mut executor = load_assertions(
+            "(set-logic ALL) (declare-const c Bool) (assert (forall ((x Bool)) (or x c)))",
+        );
+        let roots = executor.ctx.assertions.clone();
+        let c = executor.ctx.terms.mk_var("c", Sort::Bool);
+        let sentinel = executor
+            .ctx
+            .terms
+            .mk_var("finite-install-trust-predecessor", Sort::Bool);
+        let mut predecessor = Model::empty();
+        assert!(Executor::insert_completed_value(
+            &executor.ctx.terms,
+            &mut predecessor,
+            sentinel,
+            &EvalValue::Bool(false),
+        ));
+        executor.last_model = Some(predecessor);
+        let falsifying = |executor: &Executor| {
+            let mut staged = Model::empty();
+            assert!(Executor::insert_completed_value(
+                &executor.ctx.terms,
+                &mut staged,
+                c,
+                &EvalValue::Bool(false),
+            ));
+            staged
+        };
+
+        let evidence = CheckedBvFullDomainSatAuthority::for_test(&executor, &roots);
+        let staged = falsifying(&executor);
+        assert!(!executor.install_finite_model_full_domain_sat_authority(
+            evidence,
+            staged,
+            ProbeUnsatAuthority::DischargedTrust,
+        ));
+        assert_eq!(
+            sentinel_value(&mut executor, sentinel),
+            EvalValue::Bool(false),
+            "a refused install must retain the exact predecessor model"
+        );
+        assert!(!executor.bv_quantifier_full_domain_proof);
+        assert!(!executor.has_current_model_bound_quantified_sat_authority(&roots));
+
+        let evidence = CheckedBvFullDomainSatAuthority::for_test(&executor, &roots);
+        let staged = falsifying(&executor);
+        assert!(executor.install_finite_model_full_domain_sat_authority(
+            evidence,
+            staged,
+            ProbeUnsatAuthority::Checked,
+        ));
+        assert!(executor.has_current_model_bound_quantified_sat_authority(&roots));
     }
 }

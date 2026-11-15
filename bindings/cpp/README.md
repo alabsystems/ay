@@ -95,7 +95,7 @@ satisfiability, and asserts the expected verdicts. It is wired into the cargo
 test harness:
 
 ```sh
-cargo test -p ay-ffi --test group_ffi cpp_consumer
+targo --unverified test -p ay-ffi --test group_ffi cpp_consumer
 ```
 
 The test compiles `cpp_consumer.cpp` with the system C++ compiler, links it

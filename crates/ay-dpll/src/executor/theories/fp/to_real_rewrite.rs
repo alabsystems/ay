@@ -128,6 +128,14 @@ pub(super) fn rewrite_fp_to_real_with_vars(
 /// For finite FP model values, replaces with the exact rational.
 /// For NaN/infinity, replaces with a stable UF application on the FP operand,
 /// ensuring congruence: equal FP inputs produce equal Real outputs.
+///
+/// A rounding-mode constant the FP circuit decided (it has bits, so the FP
+/// model carries its decoded mode in `rm_values`) is replaced by that mode's
+/// literal. The FP values substituted above were computed UNDER that mode, so
+/// the mixed subproblem must not choose the mode again: left symbolic, the
+/// child solve re-decided it from the domain axioms alone (`r = RNE`) while
+/// `x` held the value `to_fp` gives under the circuit's mode (`RTZ`), and the
+/// merged model printed a mode that falsifies the formula.
 pub(super) fn rewrite_fp_to_real_for_model(
     terms: &mut TermStore,
     term: TermId,
@@ -166,6 +174,10 @@ pub(super) fn rewrite_fp_to_real_for_model(
                 term
             }
         }
+        TermData::Var(..) => match fp_model.rm_values.get(&term) {
+            Some(&mode) => crate::executor::rm_domain::rm_literal_term(terms, mode),
+            None => term,
+        },
         TermData::App(sym, args) => {
             let new_args: Vec<TermId> = args
                 .iter()
@@ -222,4 +234,85 @@ pub(super) fn rewrite_fp_to_real_for_model(
 
     cache.insert(term, result);
     result
+}
+
+/// The decided rounding modes the mixed subproblem's verdict can depend on,
+/// appended (once each, in first-visit order) from one assertion that
+/// [`rewrite_fp_to_real_for_model`] is about to rewrite.
+///
+/// The rewrite replaces every decided mode with its literal, so an UNSAT child
+/// may be UNSAT under those modes rather than under the site values. A
+/// blocking clause over the site bits alone would then exclude assignments
+/// that differ only in a mode, and an exact block could refute a satisfiable
+/// formula; the refinement loop adds these modes' bits to its block unless
+/// the child stays UNSAT with them free (`modes_the_refutation_needs`).
+///
+/// An assertion built only from Boolean connectives and mode (in)equalities,
+/// with no Boolean variable — the domain axioms of `rm_domain`, or
+/// `(distinct r1 RTN)` — contributes nothing: it has no `fp.to_real`, so the FP
+/// circuit bit-blasted it and its modes satisfy it, and with its modes replaced
+/// it is a closed true formula. Blocking therefore stays exactly as strong as
+/// before on every formula whose modes the Real side never reads. Modes inside
+/// an `fp.to_real` operand are covered by the site's own bits.
+pub(super) fn collect_child_mode_dependencies(
+    terms: &TermStore,
+    assertion: TermId,
+    fp_model: &FpModel,
+    out: &mut Vec<TermId>,
+) {
+    if fp_model.rm_values.is_empty() || is_closed_mode_formula(terms, assertion) {
+        return;
+    }
+    let mut visited = ay_core::kani_compat::DetHashSet::default();
+    let mut stack = vec![assertion];
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::Var(..) => {
+                if fp_model.rm_values.contains_key(&term) && !out.contains(&term) {
+                    out.push(term);
+                }
+            }
+            TermData::App(sym, _) if sym.name() == "fp.to_real" => {}
+            TermData::App(_, args) => stack.extend(args.iter().rev()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => stack.extend([*e, *t, *c]),
+            TermData::Let(bindings, body) => {
+                stack.push(*body);
+                stack.extend(bindings.iter().rev().map(|(_, value)| *value));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `root` is built only from Boolean constants and connectives, `ite`,
+/// and `=`/`distinct` over rounding-mode terms: once its mode constants are
+/// literals it has no free symbol left.
+fn is_closed_mode_formula(terms: &TermStore, root: TermId) -> bool {
+    use crate::executor::rm_domain::{is_rm_literal, is_rm_sort};
+    let mut visited = ay_core::kani_compat::DetHashSet::default();
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::Const(ay_core::term::Constant::Bool(_)) => {}
+            TermData::Var(..) if is_rm_sort(terms.sort(term)) => {}
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
+            TermData::App(..) if is_rm_literal(terms, term) => {}
+            TermData::App(sym, args) => match sym.name() {
+                "and" | "or" | "=>" | "xor" | "not" | "ite" | "=" | "distinct" => {
+                    stack.extend_from_slice(args);
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }

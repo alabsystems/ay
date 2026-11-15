@@ -12,51 +12,22 @@
 use super::*;
 
 impl PdrSolver {
-    fn simplify_transition_query(query: ChcExpr) -> ChcExpr {
-        let mut current = query.simplify_array_ops().simplify_constants();
-
-        for _ in 0..8 {
-            let Some((var, value)) = current
-                .collect_conjuncts()
-                .into_iter()
-                .find_map(|conjunct| Self::top_level_var_equality(&conjunct))
-            else {
-                break;
-            };
-
-            let next = current
-                .substitute(&[(var, value)])
-                .simplify_array_ops()
-                .simplify_constants();
-            if next == current {
-                break;
-            }
-            current = next;
-        }
-
-        current
-    }
-
-    fn top_level_var_equality(conjunct: &ChcExpr) -> Option<(ChcVar, ChcExpr)> {
-        let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
-            return None;
-        };
-        if args.len() != 2 {
-            return None;
-        }
-
-        Self::oriented_var_equality(args[0].as_ref(), args[1].as_ref())
-            .or_else(|| Self::oriented_var_equality(args[1].as_ref(), args[0].as_ref()))
-    }
-
-    fn oriented_var_equality(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(ChcVar, ChcExpr)> {
-        let ChcExpr::Var(var) = lhs else {
-            return None;
-        };
-        if rhs.vars().iter().any(|rhs_var| rhs_var == var) {
-            return None;
-        }
-        Some((var.clone(), rhs.clone()))
+    /// `body ∧ ¬head` with every variable a top-level equality defines
+    /// substituted away ([`ChcExpr::eliminate_top_level_definitions`]).
+    ///
+    /// All of them, not a fixed few: a clause-local array pinned by
+    /// `a = store(...)` that survives keeps the query in the array theory,
+    /// where each check goes to the executor and, in the default
+    /// proof-carrying posture, costs about a second and can come back
+    /// `unknown` (the BV/LIA tautology check refuses a query with an array
+    /// term), so a valid back-translated model of a straight-line program
+    /// failed validation. Stopping after eight substitutions left such
+    /// definitions in place whenever more than eight preceded them. The
+    /// substituted definitions are returned too, so a SAT model of the
+    /// simplified query names the eliminated variables again
+    /// ([`ChcExpr::extend_model_by_definitions`]).
+    fn simplify_transition_query(query: ChcExpr) -> (ChcExpr, Vec<(ChcVar, ChcExpr)>) {
+        query.eliminate_top_level_definitions_with_trail()
     }
 
     /// Verify a single transition clause (`ClauseHead::Predicate`).
@@ -77,9 +48,9 @@ impl PdrSolver {
         budget_start: Option<ay_core::time::Instant>,
         budget: Option<std::time::Duration>,
         used_filtered_invariant: &mut bool,
-        concrete_budget: std::time::Duration,
-        concrete_elapsed: &mut std::time::Duration,
+        concrete: &mut concrete::ConcreteBudget,
         concrete_unsat_count: &mut u64,
+        exact_owner: &mut crate::ground_derivation::compact::Owner<'static>,
     ) -> Option<(PredicateId, ChcExpr, PredicateId, ChcExpr)> {
         let head = match self.clause_head_under_model(&clause.head, model) {
             Some(h) => h,
@@ -99,13 +70,43 @@ impl PdrSolver {
             }
         };
         let head = self.bound_int_vars(head);
+        if self.config.verbose {
+            let kind = match &head {
+                ChcExpr::Bool(false) => "false",
+                ChcExpr::Bool(true) => "true",
+                ChcExpr::Op(ChcOp::And, _) => "conjunction",
+                _ => "other",
+            };
+            safe_eprintln!("PDR: verify_model: clause {clause_idx} head shape={kind}");
+        }
 
-        // Check if this is an incoming transition (different predicates)
-        let is_incoming_transition = clause
-            .body
-            .predicates
-            .first()
-            .is_some_and(|(body_pred, _)| *body_pred != *head_pred);
+        // Preserve the original conjunction before variable substitution or
+        // blocking-lemma filtering can erase its direct proof. Ordinary
+        // single-literal/trivial queries retain the existing fast SMT path.
+        if matches!(&head, ChcExpr::Op(ChcOp::And, _)) {
+            let local_deadline = match (budget_start, budget) {
+                (Some(start), Some(limit)) => match start.checked_add(limit) {
+                    Some(deadline) => Some(deadline),
+                    None => return Some(Self::unconfirmed_model()),
+                },
+                _ => None,
+            };
+            let mut allowed =
+                || local_deadline.is_none_or(|deadline| ay_core::time::Instant::now() < deadline);
+            let mut continuation = exact_owner.with_progress(&mut allowed);
+            match exact_conjunct::entails(body, &head, &mut continuation) {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(error) => {
+                    if self.config.verbose {
+                        safe_eprintln!(
+                            "PDR: verify_model: clause {clause_idx} structural proof refused: {error:?}"
+                        );
+                    }
+                    return Some(Self::unconfirmed_model());
+                }
+            }
+        }
 
         // Validate: body => head  (i.e., body /\ !head is UNSAT)
         // Keep the pre-simplification query: `simplify_transition_query`
@@ -114,7 +115,7 @@ impl PdrSolver {
         // extraction (and #4751 L4 candidate repair) re-derives them by
         // propagating the ORIGINAL query's equalities through the model.
         let raw_query = self.bound_int_vars(ChcExpr::and(body.clone(), ChcExpr::not(head.clone())));
-        let query = Self::simplify_transition_query(raw_query.clone());
+        let (query, eliminated) = Self::simplify_transition_query(raw_query.clone());
 
         // Fast-path: a syntactic contradiction implies UNSAT (safe to skip SMT).
         if cube::is_trivial_contradiction(&query) {
@@ -331,6 +332,19 @@ impl PdrSolver {
                 }
             }
         }
+        if let SmtResult::Sat(candidate) = result {
+            result = self.confirm_original_validation_sat(
+                &raw_query,
+                &eliminated,
+                candidate,
+                verify_timeout,
+                budget_start,
+                budget,
+            );
+            if matches!(result, SmtResult::Unknown) {
+                return Some(Self::unconfirmed_model());
+            }
+        }
         match result {
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
                 // #6787: Cross-check via Executor — budgeted (#5970 regression).
@@ -343,25 +357,41 @@ impl PdrSolver {
                             .min(std::time::Duration::from_millis(500));
                         let propagated = FxHashMap::default();
                         let cross_start = ay_core::time::Instant::now();
+                        // A rejection-only guard: a rule's spent executor
+                        // allowance must not turn it into a vacuous Unknown.
+                        let _unmetered = crate::smt::executor_work::ScopedExecutorWork::lift();
                         let cross_result =
                             self.smt
                                 .check_sat_via_executor(&query, &propagated, cross_timeout);
                         self.cross_check_budget = self
                             .cross_check_budget
                             .saturating_sub(cross_start.elapsed());
-                        if matches!(cross_result, SmtResult::Sat(_)) {
-                            if self.config.verbose {
-                                safe_eprintln!(
-                                    "PDR: verify_model: clause {} CROSS-CHECK FAILED — \
-                                     SmtContext=UNSAT but Executor=SAT (#6787)",
-                                    clause_idx
-                                );
-                            }
-                            tracing::warn!(
-                                clause_idx,
-                                "verify_model: Executor cross-check detected false-UNSAT (#6787)"
+                        if let SmtResult::Sat(candidate) = cross_result {
+                            let original = self.confirm_original_validation_sat(
+                                &raw_query,
+                                &eliminated,
+                                candidate,
+                                verify_timeout,
+                                budget_start,
+                                budget,
                             );
-                            return Some((*head_pred, body.clone(), *head_pred, head));
+                            if matches!(original, SmtResult::Unknown) {
+                                return Some(Self::unconfirmed_model());
+                            }
+                            if matches!(original, SmtResult::Sat(_)) {
+                                if self.config.verbose {
+                                    safe_eprintln!(
+                                        "PDR: verify_model: clause {} CROSS-CHECK FAILED — \
+                                         original query confirmed SAT (#6787)",
+                                        clause_idx
+                                    );
+                                }
+                                tracing::warn!(
+                                    clause_idx,
+                                    "verify_model: original query confirms cross-check SAT (#6787)"
+                                );
+                                return Some((*head_pred, body.clone(), *head_pred, head));
+                            }
                         }
                     }
                 }
@@ -369,23 +399,29 @@ impl PdrSolver {
                 // #5653: Budget-limited to avoid cumulative overhead.
                 // #7410: Rate-limit: first 10, then 1-in-100.
                 *concrete_unsat_count += 1;
-                if *concrete_elapsed < concrete_budget
+                if concrete.has_room()
                     && (*concrete_unsat_count <= 10 || (*concrete_unsat_count).is_multiple_of(100))
                 {
-                    let check_start = ay_core::time::Instant::now();
-                    if let Some(cex_model) = concrete::transition_check(body, &head, &query) {
-                        tracing::warn!(
-                            clause_idx,
-                            ?cex_model,
-                            "verify_model: SMT said UNSAT but concrete check found SAT"
-                        );
-                        return Some((*head_pred, body.clone(), *head_pred, head.clone()));
+                    match concrete.check(body, &query) {
+                        concrete::ConcreteAnswer::Witness(cex_model) => {
+                            tracing::warn!(
+                                clause_idx,
+                                ?cex_model,
+                                "verify_model: SMT said UNSAT but concrete check found SAT"
+                            );
+                            return Some((*head_pred, body.clone(), *head_pred, head.clone()));
+                        }
+                        // The solve is over: no acceptance on an unfinished check.
+                        concrete::ConcreteAnswer::Interrupted => {
+                            return Some(Self::unconfirmed_model())
+                        }
+                        concrete::ConcreteAnswer::NoWitness => {}
                     }
-                    *concrete_elapsed += check_start.elapsed();
                 }
             }
             SmtResult::Sat(m) => {
                 let mut m = m;
+                ChcExpr::extend_model_by_definitions(&eliminated, &mut m);
                 if m.is_empty() {
                     Self::extract_equalities_from_formula(&raw_query, &mut m);
                 }
@@ -404,125 +440,11 @@ impl PdrSolver {
                     safe_eprintln!("  model={:?}", m);
                 }
 
-                // Blocking lemmas and exit guards may not be inductive.
-                // Try aggressive filtering for all transitions.
-                let body_filtered = Self::filter_blocking_lemmas_aggressive(body);
-                let head_filtered = Self::filter_blocking_lemmas(&head);
-                let query_filtered =
-                    ChcExpr::and(body_filtered.clone(), ChcExpr::not(head_filtered.clone()));
-                self.smt.reset();
-                match self
-                    .smt
-                    .check_sat_with_timeout(&query_filtered, verify_timeout)
-                {
-                    SmtResult::Unsat
-                    | SmtResult::UnsatWithCore(_)
-                    | SmtResult::UnsatWithFarkas(_) => {
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: verify_model: clause {} passed via aggressive filter (incoming={})",
-                                clause_idx, is_incoming_transition
-                            );
-                        }
-                        // Mark that we used filtered invariant (#73 soundness fix)
-                        *used_filtered_invariant = true;
-                        return None; // Core invariants are inductive
-                    }
-                    _ => {
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: verify_model: clause {} aggressive filtered query also failed",
-                                clause_idx
-                            );
-                        }
-                        // Case-split fallback: if body contains OR constraints, split and verify each case
-                        let or_cases = Self::extract_or_cases_from_constraint(&body_filtered);
-                        if or_cases.len() > 1 {
-                            let mut all_cases_pass = true;
-                            for (case_idx, case_body) in or_cases.iter().enumerate() {
-                                let case_query = ChcExpr::and(
-                                    case_body.clone(),
-                                    ChcExpr::not(head_filtered.clone()),
-                                );
-                                self.smt.reset();
-                                match self.smt.check_sat_with_timeout(&case_query, verify_timeout) {
-                                    SmtResult::Unsat
-                                    | SmtResult::UnsatWithCore(_)
-                                    | SmtResult::UnsatWithFarkas(_) => {
-                                        if self.config.verbose {
-                                            safe_eprintln!(
-                                                "PDR: verify_model: clause {} case {} passed via case-split (SAT path)",
-                                                clause_idx, case_idx
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        if mod_div::verify_case_via_ite_case_split(
-                                            &mut self.smt,
-                                            self.config.verbose,
-                                            clause_idx,
-                                            Some(case_idx),
-                                            case_body,
-                                            &head_filtered,
-                                            verify_timeout,
-                                        ) {
-                                            continue;
-                                        }
-                                        all_cases_pass = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if all_cases_pass {
-                                if self.config.verbose {
-                                    safe_eprintln!(
-                                        "PDR: verify_model: clause {} passed via case-split (all {} cases, SAT path)",
-                                        clause_idx, or_cases.len()
-                                    );
-                                }
-                                // Mark that we used filtered invariant (#73 soundness fix)
-                                *used_filtered_invariant = true;
-                                return None;
-                            }
-                        }
-
-                        // ITE fallback even without OR case-splits
-                        if mod_div::verify_case_via_ite_case_split(
-                            &mut self.smt,
-                            self.config.verbose,
-                            clause_idx,
-                            None,
-                            &body_filtered,
-                            &head_filtered,
-                            verify_timeout,
-                        ) {
-                            *used_filtered_invariant = true;
-                            return None;
-                        }
-
-                        // Unreachable body check: if the body (with invariants) is UNSAT,
-                        // the implication is vacuously true.
-                        self.smt.reset();
-                        match self
-                            .smt
-                            .check_sat_with_timeout(&body_filtered, verify_timeout)
-                        {
-                            SmtResult::Unsat
-                            | SmtResult::UnsatWithCore(_)
-                            | SmtResult::UnsatWithFarkas(_) => {
-                                if self.config.verbose {
-                                    safe_eprintln!(
-                                        "PDR: verify_model: clause {} passed (body is UNSAT/unreachable)",
-                                        clause_idx
-                                    );
-                                }
-                                return None; // Body unreachable, clause vacuously satisfied
-                            }
-                            _ => {} // Body is reachable, continue to failure
-                        }
-                    }
-                }
-
+                // SAT refutes this exact submitted interpretation. Proving a
+                // weaker head, even followed by query-only rechecks, cannot
+                // validate the original model. Preserve the concrete teacher
+                // below: candidate repair may weaken a separate model, then
+                // must recheck that changed model against every clause.
                 // Extract pre-state (body predicate) and post-state (head predicate)
                 if let Some((body_pred, body_args)) = clause.body.predicates.first() {
                     let pre_state = self.extract_state_from_args(*body_pred, body_args, &m);
@@ -544,6 +466,13 @@ impl PdrSolver {
                 ));
             }
             SmtResult::Unknown => {
+                // A disjunctive body interpretation (IMC's reached set) is
+                // re-checked one disjunct at a time before the fallback chain.
+                if Self::body_interpretation_is_disjunctive(clause, model)
+                    && self.prove_by_disjunctive_body_split(clause_idx, &query)
+                {
+                    return None;
+                }
                 // Full fallback chain in model_inductive_unknown.rs.
                 return self.handle_unknown_transition_clause(
                     clause,
@@ -562,3 +491,7 @@ impl PdrSolver {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "model_inductive/definition_tests.rs"]
+mod definition_tests;

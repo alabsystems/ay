@@ -18,12 +18,26 @@ fn publish_owned_dimacs_proof_state(
             "DIMACS proof descriptor identity changed before publication",
         ));
     }
+    // A fast-publication proof is published under its writer's digest, so
+    // nothing may have grown or shrunk it since: fail before the name exists.
+    if let Some(streamed) = state.custody.streamed_digest() {
+        let len = state.descriptor.metadata()?.len();
+        if len != streamed.len {
+            return Err(io::Error::other(format!(
+                "DIMACS proof output '{}' holds {len} bytes but its writer wrote {}; it is not published",
+                resolved.display(),
+                streamed.len
+            )));
+        }
+    }
     match state.location {
         OwnedDimacsProofLocation::Anonymous => {
             #[cfg(target_os = "linux")]
             {
-                if let Err(error) = publish_dimacs_descriptor_noreplace(&state.descriptor, resolved)
-                {
+                state.custody.begin_publication()?;
+                let linked = publish_dimacs_descriptor_noreplace(&state.descriptor, resolved);
+                state.custody.end_publication(linked.is_ok());
+                if let Err(error) = linked {
                     return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                         preexisting_dimacs_proof_error(resolved, Some(&error))
                     } else {
@@ -44,12 +58,17 @@ fn publish_owned_dimacs_proof_state(
                 .clone()
                 .ok_or_else(|| io::Error::other("named DIMACS proof staging path is missing"))?;
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            if let Err(error) = rename_dimacs_noreplace(&staging_path, resolved) {
-                return Err(if error.kind() == io::ErrorKind::AlreadyExists {
-                    preexisting_dimacs_proof_error(resolved, Some(&error))
-                } else {
-                    error
-                });
+            {
+                state.custody.begin_publication()?;
+                let renamed = rename_dimacs_noreplace(&staging_path, resolved);
+                state.custody.end_publication(renamed.is_ok());
+                if let Err(error) = renamed {
+                    return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                        preexisting_dimacs_proof_error(resolved, Some(&error))
+                    } else {
+                        error
+                    });
+                }
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             return Err(io::Error::new(
@@ -79,6 +98,21 @@ fn authenticate_published_dimacs_proof(
             "DIMACS proof path '{}' was replaced before publication",
             resolved.display()
         )));
+    }
+    // The fast path: the writer hashed every byte as it wrote it, so the name
+    // is bound to that digest without reading 2.73 GB back (166e1e5a).
+    if let Some(streamed) = state.custody.streamed_digest() {
+        if visible.metadata()?.len() != streamed.len {
+            return Err(io::Error::other(format!(
+                "DIMACS proof output '{}' changed while it was sealed",
+                resolved.display()
+            )));
+        }
+        return Ok(PublishedDimacsProof {
+            identity: state.identity,
+            len: streamed.len,
+            sha256: streamed.sha256,
+        });
     }
     let before_len = visible.metadata()?.len();
     let (len, sha256) = hash_file(&mut visible)?;
@@ -124,6 +158,14 @@ fn seal_owned_dimacs_proof_body(path: &str) -> io::Result<PublishedDimacsProof> 
     }
     if let Some(published) = state.published {
         return Ok(published);
+    }
+    // Fail fast, before the fsync: the authoritative check is the custody
+    // compare-and-swap immediately before the rename or link.
+    if state.custody.is_abandoned() {
+        return Err(io::Error::other(format!(
+            "DIMACS proof output '{}' was abandoned by an unanswered exit and is not published",
+            resolved.display()
+        )));
     }
     publish_owned_dimacs_proof_state(state, &resolved)?;
     let published = authenticate_published_dimacs_proof(state, &resolved)?;

@@ -506,19 +506,11 @@ mod tests {
     /// sat; ay must agree.
     const SEED_SAT: &str = "(declare-const x Int)\n(assert (> x 0))\n(check-sat)\n";
 
-    /// (c) ay-known-Unknown: a triggerless quantified UFNIA assertion,
+    /// (c) A formerly incomplete triggerless quantified UFNIA assertion,
     /// `forall x. f(x*x) > x`. The oracle decides SAT (witness: `f(n) = |n|+1`,
-    /// so `f(x^2) = x^2 + 1 > x` for every integer `x`), but ay's quantifier
-    /// engine gives up (CEGQI incompleteness over the nonlinear body) and
-    /// returns Unknown with a stable reason code.
-    ///
-    /// History: the original seed here was "factor the prime 1000003 into two
-    /// factors > 1" (UNSAT), inherited from the deductive-checks extraction
-    /// (7f477903). ay's nonlinear-integer fragment has since grown strong
-    /// enough to decide it (interval branch-and-prune, 43034c4b lineage): it
-    /// now answers `unsat` in milliseconds, landing in `Agree` — so that
-    /// script no longer exercises the `AyIncomplete` bucket.
-    const SEED_AY_UNKNOWN: &str = concat!(
+    /// so `f(x^2) = x^2 + 1 > x` for every integer `x`). AY now decides it;
+    /// retain that improvement rather than requiring a solver gap to persist.
+    const SEED_QUANTIFIED_SAT: &str = concat!(
         "(set-logic UFNIA)\n",
         "(declare-fun f (Int) Int)\n",
         "(assert (forall ((x Int)) (> (f (* x x)) x)))\n",
@@ -542,14 +534,34 @@ mod tests {
     }
 
     #[test]
-    fn seed_ay_unknown_is_incomplete() {
-        // The authoritative verdict for the quantified-UF script is SAT.
-        let c = classify_script(SEED_AY_UNKNOWN, SolverVerdict::Sat);
+    fn formerly_incomplete_quantified_seed_agrees() {
+        let c = classify_script(SEED_QUANTIFIED_SAT, SolverVerdict::Sat);
+        assert_eq!(c.bucket, DiffBucket::Agree, "{c:?}");
+        assert_eq!(c.ay_verdict, Some(SolverVerdict::Sat), "{c:?}");
+        assert!(!c.is_soundness_finding());
+    }
+
+    fn incomplete_outcome() -> Classification {
+        classify_outcome(
+            AyOutcome::Verdict {
+                verdict: SolverVerdict::Unknown,
+                reason: Some(UnknownReason::Incomplete.code()),
+            },
+            SolverVerdict::Sat,
+        )
+    }
+
+    #[test]
+    fn reason_coded_unknown_is_incomplete() {
+        // Classify an explicit solver fact, without requiring a particular
+        // supported formula to remain incomplete as AY improves.
+        let c = incomplete_outcome();
         assert_eq!(c.bucket, DiffBucket::AyIncomplete, "{c:?}");
         assert_eq!(c.ay_verdict, Some(SolverVerdict::Unknown), "{c:?}");
         // The reason must be carried through as a stable UnknownReason code.
-        assert!(
-            c.ay_reason.is_some(),
+        assert_eq!(
+            c.ay_reason.as_deref(),
+            Some(UnknownReason::Incomplete.code()),
             "AyIncomplete must record an UnknownReason code: {c:?}"
         );
         assert!(!c.is_soundness_finding());
@@ -602,7 +614,7 @@ mod tests {
     #[test]
     fn deadline_breach_is_timeout() {
         let c = classify_script_with_deadline(
-            SEED_AY_UNKNOWN,
+            SEED_QUANTIFIED_SAT,
             SolverVerdict::Sat,
             Duration::from_secs(0),
         );
@@ -617,10 +629,10 @@ mod tests {
         let classifications = vec![
             classify_script(SEED_UNSAT, SolverVerdict::Unsat), // Agree
             classify_script(SEED_SAT, SolverVerdict::Sat),     // Agree
-            classify_script(SEED_AY_UNKNOWN, SolverVerdict::Sat), // AyIncomplete
+            incomplete_outcome(),                              // AyIncomplete
             classify_script(SEED_UNSAT, SolverVerdict::Sat),   // UnsoundDisagree
             classify_script_with_deadline(
-                SEED_AY_UNKNOWN,
+                SEED_QUANTIFIED_SAT,
                 SolverVerdict::Sat,
                 Duration::from_secs(0),
             ), // Timeout

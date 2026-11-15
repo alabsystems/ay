@@ -1,0 +1,29 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `PropagationEngine::reset_watch()` iterated only the *enabled* propagation
+% sets, so a core-only phase -- which disables the derived sets in step 1. of `init_trail` and
+% truncates the trail in `unpoison()` right after -- left the derived general PB watchers with
+% the `next_pos` / `next_pos_prop` / `is_reset_not_contributing` state of the longer trail.
+% This proof drives exactly that:
+%   * `pol` derives three general PB constraints into the derived set;
+%   * `red` with a two-mapping witness skips the top-level RUP shortcut, so the negated
+%     constraint goes into AUTOPROVING and the level-zero trail conflicts inside `init_trail`,
+%     which returns without the `load_level()` that would have reset the watchers -- constraint
+%     11's watcher is left resumed at the end of its term list, with `~x2` recorded as
+%     not contributing;
+%   * `del id 10` starts a core-only phase that disables the derived sets and wipes the trail,
+%     and the (skipping) `reset_watch` leaves that state in place;
+%   * back in core+derived mode the derived unit `~x1` falsifies the last contributing watch,
+%     the resume scan finds nothing left to watch and `~x2` is never moved back, so the
+%     watcher reports a slack of -1 where the true slack is 2 -- an invented level-zero
+%     conflict that makes the `rup` below succeed.
+% The formula is satisfiable, e.g. ~x1 x2 ~x3 ~x4 ~x5 x6 ~x9 ~x10 ~x11 ~x12 ~x13 x14.
+f 10;
+pol 4 5 + 2 d ;
+pol 6 7 + 2 d ;
+pol 8 9 + 2 d ;
+red 1 ~x1 >= 1 : x11 -> 1 x12 -> 1 ;
+del id 10 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT;
+end pseudo-Boolean proof;

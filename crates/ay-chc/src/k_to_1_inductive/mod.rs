@@ -29,6 +29,9 @@
 //! - PDKind paper: "Property-Directed K-Induction" (FMCAD 2017)
 //! - "Horn Clause Solvers for Program Verification", Section 4.2
 
+/// Workstream D (CHC-COMP 2026) one-proof k→1 conversion; owner WP-D1-P.
+pub(crate) mod path;
+
 use crate::interpolation::{interpolating_sat_constraints_until, InterpolatingSatResult};
 use crate::smt::{SmtContext, SmtResult};
 use crate::transition_system::TransitionSystem;

@@ -439,6 +439,7 @@ fn official_sat_main_regular_route_decision_from_env() -> (bool, Option<Decision
 }
 
 fn fail_closed_satcomp_proof_setup(reason: &str) -> ! {
+    settle_unanswered_dimacs_exit();
     safe_eprintln!("c reason: {reason}");
     if !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
         safe_println!("s UNKNOWN");
@@ -454,6 +455,7 @@ fn fail_dimacs_certification_or_exit(reason: &str) -> ! {
             "{gate} rejected UNSAT because certification failed: {reason}"
         ));
     }
+    settle_unanswered_dimacs_exit();
     safe_eprintln!("Error: {reason}");
     std::process::exit(1);
 }

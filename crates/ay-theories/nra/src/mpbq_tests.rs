@@ -94,7 +94,7 @@ fn structural_equality_is_numeric_equality() {
                         x.to_rational() == y.to_rational(),
                         "{a1}/2^{k1} vs {a2}/2^{k2}"
                     );
-                    checked += 1;
+                    checked = checked.saturating_add(1);
                 }
             }
         }
@@ -142,7 +142,7 @@ fn k_zero_is_ordinary_integer_arithmetic() {
 }
 
 #[test]
-fn shifts_by_powers_of_two_are_exact_and_move_only_k() {
+fn shifts_by_powers_of_two_are_exact_and_move_only_k() -> Result<(), Box<dyn std::error::Error>> {
     let x = bq(3, 1); // 3/2
     assert_eq!(x.mul_two_pow(1), bq(3, 0));
     assert_eq!(x.mul_two_pow(4), bq(24, 0));
@@ -156,13 +156,15 @@ fn shifts_by_powers_of_two_are_exact_and_move_only_k() {
                 let up = v.mul_two_pow(e);
                 let down = v.div_two_pow(e).unwrap();
                 assert!(up.k() <= v.k());
-                assert!(down.k() <= v.k() + e);
+                let ceiling = v.k().checked_add(e).ok_or("k + e overflows u32")?;
+                assert!(down.k() <= ceiling);
                 let two_e = BigRational::from(BigInt::one() << e);
                 assert_eq!(up.to_rational(), v.to_rational() * &two_e);
                 assert_eq!(down.to_rational(), v.to_rational() / &two_e);
             }
         }
     }
+    Ok(())
 }
 
 #[test]
@@ -241,7 +243,8 @@ fn interval_refuses_equal_and_inverted_endpoints() {
 }
 
 #[test]
-fn bisection_halves_the_width_exactly_and_costs_one_bit() {
+fn bisection_halves_the_width_exactly_and_costs_one_bit() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut iv = BqInterval::new(bq(0, 0), bq(1, 0)).unwrap();
     let mut expect_k = 0u32;
     for step in 1..=64u32 {
@@ -250,13 +253,14 @@ fn bisection_halves_the_width_exactly_and_costs_one_bit() {
         assert_eq!(left.hi(), &mid);
         assert_eq!(right.lo(), &mid);
         // Exactly one bit of precision per step, never two.
-        expect_k += 1;
+        expect_k = expect_k.checked_add(1).ok_or("expected k overflows u32")?;
         assert_eq!(mid.k(), expect_k, "step {step}");
         assert_eq!(left.width(), right.width());
         assert_eq!(left.width().mul_two_pow(1), iv.width());
         iv = left;
     }
     assert_eq!(iv.width(), Bq::inv_two_pow(64));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -405,12 +409,14 @@ fn separation_orders_two_distinct_roots_and_declines_on_equal_ones() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn select_small_is_minimal_with_the_negative_half_of_the_certificate() {
+fn select_small_is_minimal_with_the_negative_half_of_the_certificate(
+) -> Result<(), Box<dyn std::error::Error>> {
     // Sweep every interval on a fine grid and check BOTH halves: the answer is
     // inside at exponent k, and NO dyadic of exponent k-1 is inside.
     let mut cases = 0u32;
     for lo_a in -24i64..24 {
-        for hi_a in (lo_a + 1)..=24 {
+        let first_hi = lo_a.checked_add(1).ok_or("lo_a + 1 overflows i64")?;
+        for hi_a in first_hi..=24 {
             for k in 0u32..5 {
                 let Some(iv) = BqInterval::new(bq(lo_a, k), bq(hi_a, k)) else {
                     continue;
@@ -418,19 +424,25 @@ fn select_small_is_minimal_with_the_negative_half_of_the_certificate() {
                 let sel = select_small(&iv).unwrap();
                 assert!(iv.contains_open(&sel.value));
                 assert!(sel.value.k() <= sel.k_ceiling);
-                assert_eq!(sel.k_ceiling, iv.width().k() + 1);
-                if sel.value.k() > 0 {
+                let ceiling = iv
+                    .width()
+                    .k()
+                    .checked_add(1)
+                    .ok_or("k ceiling overflows u32")?;
+                assert_eq!(sel.k_ceiling, ceiling);
+                if let Some(below) = sel.value.k().checked_sub(1) {
                     assert!(
-                        candidate_at(&iv, sel.value.k() - 1).is_none(),
+                        candidate_at(&iv, below).is_none(),
                         "not minimal: ({lo_a}, {hi_a})/2^{k} answered k={}",
                         sel.value.k()
                     );
                 }
-                cases += 1;
+                cases = cases.saturating_add(1);
             }
         }
     }
     assert!(cases > 4000, "grid too small to be evidence: {cases}");
+    Ok(())
 }
 
 #[test]
@@ -449,11 +461,13 @@ fn select_small_prefers_an_integer_and_prefers_zero() {
 }
 
 #[test]
-fn select_int_agrees_with_the_scaled_candidate_at_exponent_zero() {
+fn select_int_agrees_with_the_scaled_candidate_at_exponent_zero(
+) -> Result<(), Box<dyn std::error::Error>> {
     // Two independent code paths inside the module — `floor()`/`ceil()` versus
     // `floor_at(0)`/`ceil_at(0)` — must give the same answer everywhere.
     for lo_a in -30i64..30 {
-        for hi_a in (lo_a + 1)..=30 {
+        let first_hi = lo_a.checked_add(1).ok_or("lo_a + 1 overflows i64")?;
+        for hi_a in first_hi..=30 {
             for k in 0u32..4 {
                 let Some(iv) = BqInterval::new(bq(lo_a, k), bq(hi_a, k)) else {
                     continue;
@@ -467,6 +481,7 @@ fn select_int_agrees_with_the_scaled_candidate_at_exponent_zero() {
     // Degenerate: empty and inverted.
     assert_eq!(select_int(&bq(1, 0), &bq(1, 0)), None);
     assert_eq!(select_int(&bq(5, 0), &bq(1, 0)), None);
+    Ok(())
 }
 
 /// MEASURED, and it corrects a claim that is easy to make and is wrong.
@@ -484,7 +499,8 @@ fn select_int_agrees_with_the_scaled_candidate_at_exponent_zero() {
 /// which still straddles something simple. There the midpoint inherits the
 /// endpoints' precision (`k = 201` below) and `select_small` returns `1`.
 #[test]
-fn select_small_never_loses_to_the_midpoint_and_wins_where_it_can() {
+fn select_small_never_loses_to_the_midpoint_and_wins_where_it_can(
+) -> Result<(), Box<dyn std::error::Error>> {
     let p = zs(&[-2, 0, 1]);
     let mut iv = BqInterval::new(bq(1, 0), bq(2, 0)).unwrap();
     for _ in 0..120 {
@@ -503,7 +519,13 @@ fn select_small_never_loses_to_the_midpoint_and_wins_where_it_can() {
     assert!(sel.value.k() <= mid.k());
     assert_eq!(sel.value, mid);
     assert_eq!(sel.value.k(), 121);
-    assert_eq!(sel.value.k(), iv.width().k() + 1);
+    assert_eq!(
+        sel.value.k(),
+        iv.width()
+            .k()
+            .checked_add(1)
+            .ok_or("k ceiling overflows u32")?
+    );
 
     // The case the rule is FOR: high-precision endpoints, a simple point inside.
     // (1 - 2^-200, 1 + 2^-100) straddles the integer 1.
@@ -515,6 +537,7 @@ fn select_small_never_loses_to_the_midpoint_and_wins_where_it_can() {
     let sel = select_small(&wide).unwrap();
     assert_eq!(sel.value, Bq::one());
     assert_eq!(sel.value.k(), 0);
+    Ok(())
 }
 
 #[test]

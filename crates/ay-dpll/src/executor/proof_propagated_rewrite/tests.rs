@@ -810,3 +810,5 @@ fn non_constant_mint_leg_requires_a_literal_defining_equality() {
 }
 
 include!("tests/folding_regressions.rs");
+
+mod closed_fold_regressions;

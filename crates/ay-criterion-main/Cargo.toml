@@ -1,0 +1,24 @@
+[package]
+name = "ay-criterion-main"
+description = "criterion_main! for AY bench targets that accepts the libtest arguments cargo test forwards"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# No dependencies: the macro names the invoking crate's own `criterion`.
+[dependencies]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[test]]
+name = "forwarded_libtest_args"
+harness = false

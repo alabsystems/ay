@@ -11,7 +11,7 @@
 # caught. The two intentional, documented divergences (see DIVERGENCES below)
 # are asserted to AY's honest behavior with z3py's differing answer recorded.
 #
-# Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_datatypes.py -v
+# Run:  targo --unverified build -p ay-ffi  &&  pytest bindings/python/tests/test_datatypes.py -v
 #
 # DIVERGENCES (honest, documented; never a wrong/fabricated value):
 #   * Datatype model VALUES are read back through const-interp (`m[c]`) and AST

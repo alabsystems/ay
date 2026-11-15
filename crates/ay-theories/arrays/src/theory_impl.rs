@@ -61,7 +61,8 @@ impl TheorySolver for ArraySolver<'_> {
         // Debug-only; release compiles it out with the rest of `weq5_shadow`.
         #[cfg(debug_assertions)]
         weak_equiv::weq5_shadow::maybe_dump();
-        vec![
+        let mut stats = propagation::prop_eq_stats::snapshot();
+        stats.extend([
             ("arrays_checks", self.check_count),
             ("arrays_conflicts", self.conflict_count),
             ("arrays_propagations", self.propagation_count),
@@ -101,10 +102,26 @@ impl TheorySolver for ArraySolver<'_> {
                 "arrays_sent_propagations",
                 self.sent_propagations.len() as u64,
             ),
-        ]
+            ("arrays_populate_calls", self.cache_rebuild.populate_calls),
+            (
+                "arrays_populate_full_rebuilds",
+                self.cache_rebuild.full_rebuilds,
+            ),
+            (
+                "arrays_populate_term_registrations",
+                self.cache_rebuild.term_registrations,
+            ),
+            ("arrays_scope_grew", self.cache_rebuild.scope_grew),
+            (
+                "arrays_scope_grew_below_watermark",
+                self.cache_rebuild.scope_grew_below_watermark,
+            ),
+        ]);
+        stats
     }
 
     fn note_applied_theory_lemma(&mut self, clause: &[TheoryLit]) {
+        self.acknowledge_row2_clause(clause);
         // #8605: Cap applied_theory_lemmas to prevent unbounded heap growth.
         // Each entry is a heap-allocated Vec<TheoryLit>. When the set exceeds
         // the soft cap, clear it. Re-emitting already-applied lemmas is safe:
@@ -116,6 +133,17 @@ impl TheorySolver for ArraySolver<'_> {
             self.applied_theory_lemmas.shrink_to_fit();
         }
         self.applied_theory_lemmas.insert(clause.to_vec());
+    }
+
+    fn reacknowledge_applied_theory_lemma(
+        &mut self,
+        clause: &[TheoryLit],
+    ) -> ay_core::TheoryLemmaReplay {
+        if self.acknowledge_row2_clause(clause) {
+            ay_core::TheoryLemmaReplay::CurrentWorkAcknowledged
+        } else {
+            ay_core::TheoryLemmaReplay::Unchanged
+        }
     }
 
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
@@ -186,6 +214,13 @@ impl TheorySolver for ArraySolver<'_> {
         self.applied_theory_lemmas.shrink_to_fit();
         // #6546: Clear event-driven ROW1 queue on backtrack since equalities
         // may no longer hold.
+        self.pending_axioms.clear();
+        self.blocked_axioms.clear();
+        self.row2_down_work.clear();
+        self.row2_last_clause.clear();
+        self.row2_clause_acknowledged.clear();
+        self.axiom_fingerprints.clear();
+        self.row2_fingerprint_indices.clear();
         self.pending_row1.clear();
         self.pending_row2_upward.clear();
         self.pending_self_store.clear();
@@ -259,8 +294,6 @@ impl TheorySolver for ArraySolver<'_> {
         self.trail.clear();
         self.scopes.clear();
         self.clear_term_caches();
-        self.axiom_fingerprints.clear();
-        self.row2_fingerprint_indices.clear();
         self.external_diseqs.clear();
         self.external_diseq_reasons.clear();
         self.external_eqs.clear();

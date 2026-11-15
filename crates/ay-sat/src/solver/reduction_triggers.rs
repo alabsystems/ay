@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// The least byte growth past what the last reduction left that re-arms the
+/// byte trigger (`clause_db_byte_limit_exceeded`) before the learned count
+/// reaches its floor, so a tiny limit does not reduce at every conflict.
+pub(super) const CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH: usize = 1 << 20;
+
+/// Minimum learned-clause growth before the size cap may trigger another
+/// reduction (`learned_cap_retrigger_floor`).
+const LEARNED_CAP_RETRIGGER_MIN_GROWTH: usize = 256;
+
 impl Solver {
     /// Recompute the glue (LBD) of a clause from the current assignment.
     ///
@@ -13,12 +22,40 @@ impl Solver {
     /// assigned literals. Uses a stamp table for O(clause_size) performance
     /// with no clearing overhead (CaDiCaL analyze.cpp:206-219).
     pub(super) fn recompute_glue(&mut self, clause_idx: usize) -> u32 {
+        self.recompute_glue_upto(clause_idx, u32::MAX)
+    }
+
+    /// `recompute_glue`, stopping once the count reaches `limit` (and then
+    /// returning `limit`). `bump_clause` only asks whether the glue dropped
+    /// below the stored one, so it passes that as the limit and skips the
+    /// rest of a clause whose glue has not improved.
+    pub(super) fn recompute_glue_upto(&mut self, clause_idx: usize, limit: u32) -> u32 {
+        match self.recompute_glue_upto_admitted(
+            clause_idx,
+            limit,
+            &conflict_analysis_minimize::admitted::Ordinary,
+        ) {
+            Ok(glue) => glue,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(in crate::solver) fn recompute_glue_upto_admitted<
+        P: conflict_analysis_minimize::admitted::Policy,
+    >(
+        &mut self,
+        clause_idx: usize,
+        limit: u32,
+        p: &P,
+    ) -> Result<u32, P::Error> {
+        p.work(3)?;
         debug_assert!(
             self.arena.is_active(clause_idx),
             "BUG: recompute_glue called on inactive clause {clause_idx}"
         );
 
         if self.glue_stamp_counter == u32::MAX {
+            p.work(self.glue_stamp.len())?;
             self.glue_stamp.fill(0);
             self.glue_stamp_counter = 0;
         }
@@ -27,6 +64,7 @@ impl Solver {
         let mut count = 0u32;
         let clause_len = self.arena.len_of(clause_idx);
         for i in 0..clause_len {
+            p.work(1)?;
             let lit = self.arena.literal(clause_idx, i);
             let var_idx = lit.variable().index();
             // CaDiCaL analyze.cpp:210: every literal must be assigned
@@ -40,11 +78,15 @@ impl Solver {
             let lvl = self.var_data[var_idx].level as usize;
             // Grow stamp table if needed (can happen with added variables)
             if lvl >= self.glue_stamp.len() {
+                p.glue_growth(self, lvl + 1)?;
                 self.glue_stamp.resize(lvl + 1, 0);
             }
             if self.glue_stamp[lvl] != stamp {
                 self.glue_stamp[lvl] = stamp;
                 count += 1;
+                if count >= limit {
+                    return Ok(limit);
+                }
             }
         }
 
@@ -55,7 +97,7 @@ impl Solver {
             "BUG: recompute_glue returned {count} for clause {clause_idx} with {clause_len} literals"
         );
 
-        count
+        Ok(count)
     }
 
     /// Estimated live heap usage attributable to the clause database.
@@ -116,9 +158,98 @@ impl Solver {
     #[inline]
     pub(super) fn learned_clause_limit_exceeded(&self) -> bool {
         if let Some(limit) = self.cold.max_learned_clauses {
-            self.arena.redundant_count() > limit
+            let redundant = self.arena.redundant_count();
+            // Not again until the count has grown past what the last
+            // reduction left (see `learned_cap_retrigger_floor`).
+            redundant > limit && redundant >= self.cold.learned_cap_retrigger_floor
         } else {
             false
+        }
+    }
+
+    /// Whether the clause DB is over its byte limit
+    /// (`set_max_clause_db_bytes`) with learned clauses a reduction can
+    /// delete.
+    ///
+    /// The limit counts irredundant clauses too, which no reduction deletes,
+    /// and the arena's accounted capacity, which only compaction gives back.
+    /// So, like the learned-clause cap, the trigger waits until the learned
+    /// count has grown past what the last reduction left
+    /// (`learned_cap_retrigger_floor`). Without that floor a formula whose
+    /// irredundant part alone is over the limit reduced at every conflict.
+    /// The floor counts clauses, not bytes, so the trigger also fires once
+    /// the bytes have grown a tenth of the limit (at least 1 MiB) past what
+    /// the last reduction left (`clause_db_bytes_after_reduction`): long
+    /// learned clauses cannot carry the DB far past its limit. Measured
+    /// 2026-10-08 on Circuit_multiplier22 with a limit 1 MB over its initial
+    /// size: the count floor alone peaked 23-40% over the old 6.78 MB.
+    /// Measured 2026-10-08 in the test profile on the 1.64M-clause complete
+    /// blast of a twenty-product 64-bit commuted sum: 378 MB against the
+    /// resolution-DAG producer's 256 MB, 199 reductions in 199 conflicts at
+    /// 20-60 ms each. The solve polls its stop every 100 conflicts, so those
+    /// polls came 2.3-2.6 s apart, and a stop that had already fired was
+    /// seen 1.6-2.2 s late.
+    #[inline]
+    pub(super) fn clause_db_byte_limit_exceeded(&self) -> bool {
+        self.cold.max_clause_db_bytes.is_some_and(|limit| {
+            let bytes = self.clause_db_memory_bytes();
+            bytes > limit
+                && (self.arena.redundant_count() >= self.cold.learned_cap_retrigger_floor
+                    || bytes.saturating_sub(self.cold.clause_db_bytes_after_reduction)
+                        > (limit / 10).max(CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH))
+        })
+    }
+
+    /// The learned count the cap and byte triggers wait for after a
+    /// reduction that left the current learned clauses: those plus a tenth,
+    /// at least `LEARNED_CAP_RETRIGGER_MIN_GROWTH` more.
+    fn learned_retrigger_floor_for_remaining(&self) -> usize {
+        let remaining = self.arena.redundant_count();
+        remaining.saturating_add((remaining / 10).max(LEARNED_CAP_RETRIGGER_MIN_GROWTH))
+    }
+
+    /// Record what a reduction left for the cap and byte triggers: the
+    /// learned-count floor (`learned_cap_retrigger_floor`) and, with a byte
+    /// limit set, the clause DB's bytes (`clause_db_bytes_after_reduction`).
+    pub(super) fn record_reduction_retrigger_points(&mut self) {
+        self.cold.learned_cap_retrigger_floor = self.learned_retrigger_floor_for_remaining();
+        if self.cold.max_clause_db_bytes.is_some() {
+            self.cold.clause_db_bytes_after_reduction = self.clause_db_memory_bytes();
+        }
+    }
+
+    /// Lower the cap and byte triggers' retrigger points to what is left,
+    /// after learned clauses were deleted outside `reduce_db`
+    /// (`clear_learned_clauses`, a popped scope's clauses, a between-solve
+    /// reduction, the #8399 flush of `continue_solving_with_extension`, the
+    /// incremental arena rebuild). Both points are what the last reduction
+    /// left; deleting learned clauses afterwards leaves them above the DB, so
+    /// the cap trigger waited for the learned count to regrow past a floor
+    /// that can be any multiple of the cap. For example, a reduction that
+    /// cannot get under a 10,000 cap and leaves 50,000 protected clauses sets
+    /// the floor to 55,000; after `clear_learned_clauses` the cap was then
+    /// not enforced again until the count was back at 55,000. Only ever
+    /// lowers, so a trigger never fires later than it did.
+    pub(super) fn lower_reduction_retrigger_points(&mut self) {
+        let floor = self.learned_retrigger_floor_for_remaining();
+        self.cold.learned_cap_retrigger_floor = self.cold.learned_cap_retrigger_floor.min(floor);
+        self.lower_clause_db_bytes_after_reduction();
+    }
+
+    /// Lower the byte trigger's reference (`clause_db_bytes_after_reduction`)
+    /// to the clause DB's bytes, which an arena compaction just shrank.
+    /// `reduce_db` defers its compaction to the search's next quiescent
+    /// point (`run_deferred_arena_compaction`), after it recorded the
+    /// reference, so the reference kept the pre-compaction bytes, dead
+    /// clauses included, and the DB could fill all the space the compaction
+    /// gave back, plus the tenth of the limit, before the byte growth arm
+    /// fired again. Only ever lowers: growth since the reduction stays
+    /// counted.
+    pub(super) fn lower_clause_db_bytes_after_reduction(&mut self) {
+        if self.cold.max_clause_db_bytes.is_some() {
+            let bytes = self.clause_db_memory_bytes();
+            self.cold.clause_db_bytes_after_reduction =
+                self.cold.clause_db_bytes_after_reduction.min(bytes);
         }
     }
 
@@ -151,12 +282,7 @@ impl Solver {
         // original-ledger, not just the arena word buffer. The prior arena-only
         // check underreported actual clause-DB memory by 2x-5x and caused this
         // branch to fire late under real memory pressure.
-        if let Some(limit) = self.cold.max_clause_db_bytes {
-            if self.clause_db_memory_bytes() > limit {
-                return true;
-            }
-        }
-        false
+        self.clause_db_byte_limit_exceeded()
     }
 
     /// Poll the process-wide memory limit on the shared conflict cadence.

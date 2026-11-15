@@ -116,6 +116,64 @@ fn euf_congruence_missing_left_arg_equality_stays_rejected() {
     );
 }
 
+/// Flood a mul-congruence conflict's difference polynomial with ~3000
+/// cancelling `g(a_i) - g(a_i)` application pairs so thousands of apps
+/// reach the congruence closure while the certificate stays `[1,1,1,1]`.
+fn build_flooded_mul_conflict(relate_l: bool) -> MulCongruenceConflict {
+    let mut c = build_mul_congruence_conflict(
+        "__verification_consumer_nonlinear_mul",
+        "__verification_consumer_nonlinear_mul",
+        relate_l,
+        true,
+        true,
+    );
+    let lit1 = c.conflict[1].term;
+    let (diff, eqdv) = match c.terms.get(lit1).clone() {
+        crate::TermData::App(_, args) => (args[0], args[1]),
+        other => panic!("unexpected lit1 shape: {other:?}"),
+    };
+    let mut wide = vec![diff];
+    for i in 0..3000 {
+        let a = c.terms.mk_var(format!("flood_a{i}"), Sort::Int);
+        let g = c.terms.mk_app(Symbol::named("flood_g"), vec![a], Sort::Int);
+        let neg_g = c.terms.mk_neg(g);
+        wide.push(g);
+        wide.push(neg_g);
+    }
+    let wide_diff = c.terms.mk_add(wide);
+    let wide_lit1 = c.terms.mk_le(wide_diff, eqdv);
+    c.conflict[1] = TheoryLit::new(wide_lit1, true);
+    c
+}
+
+#[test]
+fn euf_congruence_wide_conflict_closure_still_validates() {
+    // Width regression: the congruence closure must stay correct (and
+    // near-linear) when the conflict's subterms carry thousands of
+    // applications. (The former pairwise closure paid ~4.5M pair checks
+    // per round here and dominated whole solves on miniflight-shaped
+    // input.)
+    let c = build_flooded_mul_conflict(true);
+    let farkas = FarkasAnnotation::from_ints(&[1, 1, 1, 1]);
+    verify_farkas_conflict_lits_full(&c.terms, &c.conflict, &farkas)
+        .expect("congruence-justified mul conflict must validate at width");
+}
+
+#[test]
+fn euf_congruence_wide_conflict_broken_arg_equality_stays_rejected() {
+    // SOUNDNESS at width: with the left argument equality broken, the
+    // flooded conflict is SAT and must stay rejected — the signature
+    // closure must not merge the products amid thousands of flood apps.
+    let c = build_flooded_mul_conflict(false);
+    let farkas = FarkasAnnotation::from_ints(&[1, 1, 1, 1]);
+    let err = verify_farkas_conflict_lits_full(&c.terms, &c.conflict, &farkas)
+        .expect_err("broken left-arg congruence must NOT be certified at width");
+    assert!(
+        matches!(err, FarkasValidationError::VariablesNotEliminated { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
 #[test]
 fn euf_congruence_missing_right_arg_equality_stays_rejected() {
     let c = build_mul_congruence_conflict(

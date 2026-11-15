@@ -26,6 +26,9 @@ num-traits.workspace = true
 hashbrown.workspace = true
 tracing.workspace = true
 stacker.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+ay-proof.workspace = true
+ay-test-support.workspace = true
 num-bigint.workspace = true

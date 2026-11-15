@@ -53,6 +53,24 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+mod cancellation;
+mod clause_literals;
+mod literal_walk;
+mod ordinary;
+
+pub use ordinary::{prove_unsat_resolution_dag_with_cancellation, ResolutionDagCancellationError};
+mod within;
+
+pub use within::{prove_unsat_resolution_dag_within, ResolutionDagWork};
+
+pub(crate) use cancellation::ProofControl;
+
+#[cfg(test)]
+mod cancellation_tests;
+
+#[cfg(test)]
+mod work_reporting_tests;
+
 /// One derived clause of the refutation together with the positive RUP
 /// antecedent clause-ids the solver used to derive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +124,12 @@ pub enum ResolutionDagError {
     /// The emitted proof did not end in the empty clause.
     #[error("emitted LRAT proof does not derive the empty clause")]
     NoEmptyClause,
+    /// The input has more clauses than `u64` LRAT clause ids can number.
+    #[error("input has too many clauses to number with LRAT clause ids")]
+    TooManyClauses,
+    /// The counted work envelope ([`ResolutionDagWork`]) ran out first.
+    #[error("the counted work envelope ran out; no refutation produced")]
+    OverEnvelope,
 }
 
 /// Resource guarded by [`ResolutionProofLimits`].
@@ -230,6 +254,9 @@ impl Default for ResolutionProofLimits {
 /// Fail-closed errors from [`prove_unsat_resolution_dag_with_limits`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ResolutionProofError {
+    /// The caller refused cooperative progress; no model or refutation is returned.
+    #[error("resolution proof cancelled")]
+    Cancelled,
     /// A caller-supplied literal names a variable outside the declared range.
     #[error(
         "input clause {clause_index}, literal {literal_index}: variable {var} out of range for {num_vars} variables"
@@ -351,43 +378,29 @@ pub fn prove_unsat_resolution_dag(
     num_vars: usize,
     clauses: &[Vec<Literal>],
 ) -> Result<ResolutionDag, ResolutionDagError> {
-    let mut solver = Solver::with_proof_output(
-        num_vars,
-        ProofOutput::lrat_text(Vec::<u8>::new(), clauses.len() as u64),
-    );
-    // This API promises a directly consumable pure-RUP refutation.  Keep its
-    // producer on the ordinary CDCL lane: preprocessing can perform
-    // equisatisfiable transforms whose trust classification cannot be encoded
-    // in LRAT, causing an otherwise valid UNSAT result to fail closed to
-    // Unknown (or leaving a hint chain that is not a forward RUP derivation).
-    // The formulas served here are already bit-blasted CNF, so preprocessing
-    // is neither part of the contract nor required for completeness.
-    solver.set_preprocess_enabled(false);
-    for clause in clauses {
-        solver.add_clause(clause.clone());
-    }
+    prove_unsat_resolution_dag_until(num_vars, clauses, &|| false)
+}
 
-    match solver.solve().into_inner() {
-        SatResult::Unsat(_) => {}
-        SatResult::Sat(_) => return Err(ResolutionDagError::Satisfiable),
-        SatResult::Unknown => return Err(ResolutionDagError::Unknown),
-    }
-
-    let writer = solver
-        .take_proof_writer()
-        .ok_or(ResolutionDagError::ProofWriterUnavailable)?;
-    let bytes = writer
-        .into_vec()
-        .map_err(|_| ResolutionDagError::ProofWriterUnavailable)?;
-    let text = String::from_utf8(bytes).map_err(|_| ResolutionDagError::ProofNotUtf8)?;
-
-    let original_clauses: Vec<(u64, Vec<Literal>)> = clauses
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i as u64 + 1, c.clone()))
-        .collect();
-
-    parse_lrat_text_into_dag(num_vars, original_clauses, &text)
+/// Ordinary pure-RUP production, stopped by the caller's original observer.
+///
+/// Both inprocessing attempts, input copies, extraction and final admission use
+/// the same sticky control. A stop yields `Unknown`, never a decision or a
+/// refutation. The adapter introduces no deadline or resource allowance.
+///
+/// # Errors
+/// Preserves ordinary producer errors; an observed stop becomes
+/// [`ResolutionDagError::Unknown`].
+pub fn prove_unsat_resolution_dag_until(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<ResolutionDag, ResolutionDagError> {
+    prove_unsat_resolution_dag_with_cancellation(num_vars, clauses, &mut || !should_stop()).map_err(
+        |error| match error {
+            ResolutionDagCancellationError::Resolution(error) => error,
+            ResolutionDagCancellationError::Cancelled => ResolutionDagError::Unknown,
+        },
+    )
 }
 
 /// Produce and independently replay a pure-RUP refutation under explicit
@@ -397,9 +410,46 @@ pub fn prove_unsat_resolution_dag_with_limits(
     clauses: &[Vec<Literal>],
     limits: &ResolutionProofLimits,
 ) -> Result<ResolutionDag, ResolutionProofError> {
-    match solve_resolution_dag_with_limits(num_vars, clauses, limits)? {
-        ResolutionSolveOutcome::Sat(_) => Err(ResolutionProofError::Satisfiable),
-        ResolutionSolveOutcome::Unsat(dag) => Ok(dag),
+    prove_unsat_resolution_dag_with_limits_and_cancellation(num_vars, clauses, limits, &mut || true)
+}
+
+/// Produce an independently replayed refutation with caller-thread cancellation.
+///
+/// `keep_going` returns true to continue. Refusal is sticky and returns
+/// [`ResolutionProofError::Cancelled`], never a refutation or SAT result.
+/// The resource/deadline limits are identical to the compatibility entry point.
+/// See [`solve_resolution_dag_with_limits_and_cancellation`] for the remaining
+/// opaque intervals; this is not a hard latency or complete allocation budget.
+pub fn prove_unsat_resolution_dag_with_limits_and_cancellation(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<ResolutionDag, ResolutionProofError> {
+    prove_unsat_resolution_dag_with_limits_and_cancellation_work(
+        num_vars, clauses, limits, keep_going,
+    )
+    .map(|(dag, _)| dag)
+}
+
+/// Produce a refutation and report the producer's independent DAG-validation work.
+///
+/// The limits, single SAT pass, independent replay, sticky cancellation and final
+/// admission are identical to [`prove_unsat_resolution_dag_with_limits_and_cancellation`].
+/// The returned work is only the existing deterministic counter for that one
+/// independent DAG validation: it excludes SAT/search, input walks, proof output,
+/// binary parsing and caller-side transport or additional replay. It is exposed
+/// only after temporary owners are destroyed and final controls admit success.
+/// Errors (including SAT and Unknown) return neither a proof nor refundable usage.
+pub fn prove_unsat_resolution_dag_with_limits_and_cancellation_work(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(ResolutionDag, u64), ResolutionProofError> {
+    match solve_resolution_dag_with_work(num_vars, clauses, limits, keep_going)? {
+        (ResolutionSolveOutcome::Sat(_), _) => Err(ResolutionProofError::Satisfiable),
+        (ResolutionSolveOutcome::Unsat(dag), work) => Ok((dag, work)),
     }
 }
 
@@ -421,10 +471,83 @@ pub fn solve_resolution_dag_with_limits(
     clauses: &[Vec<Literal>],
     limits: &ResolutionProofLimits,
 ) -> Result<ResolutionSolveOutcome, ResolutionProofError> {
-    preflight_input(num_vars, clauses, limits)?;
-    check_deadline(limits.deadline, ResolutionProofPhase::Preflight)?;
+    solve_resolution_dag_with_limits_and_cancellation(num_vars, clauses, limits, &mut || true)
+}
 
-    let codec_reserved = original_codec_reservation(clauses, limits.deadline)?;
+/// Solve and independently replay under the original limits and a borrowed
+/// caller-thread callback (`true` continues, `false` cancels this attempt).
+///
+/// One sticky control spans input walks, the solver's existing interrupt
+/// checkpoints, deferred backward reconstruction, bounded LRAT emission and
+/// extraction, binary decoding, exact source comparison and independent RUP
+/// replay. No callback is moved to a worker or stored beyond this call.
+/// A final success poll follows destruction of temporary solver/writer/replay owners.
+///
+/// Clause ingestion (including its ordinary forward proof writes) and some SAT
+/// propagation/startup/finalization routines still have opaque intervals. Their
+/// existing absolute deadlines and resource limits remain enabled. Individual
+/// sink writes, allocations, hash operations and destruction are also opaque: cancellation
+/// is cooperative, not a hard latency or complete work/byte guarantee. Panics
+/// are not caught here; refusal remains latched if an inner guard catches one.
+pub fn solve_resolution_dag_with_limits_and_cancellation(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<ResolutionSolveOutcome, ResolutionProofError> {
+    solve_resolution_dag_with_work(num_vars, clauses, limits, keep_going)
+        .map(|(outcome, _)| outcome)
+}
+
+// The private SAT carrier uses zero because no DAG replay takes place. Only an
+// admitted UNSAT exposes work through the public reporting API.
+fn solve_resolution_dag_with_work(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(ResolutionSolveOutcome, u64), ResolutionProofError> {
+    let control = ProofControl::new(keep_going);
+    let result = control
+        .run(|control| solve_resolution_dag_controlled(num_vars, clauses, limits, control, true));
+    // A reached error still receives no new callback or deadline check. Work
+    // accompanies success only through the unchanged post-cleanup admission.
+    let (outcome, work) = result?;
+    admit_controlled_outcome(Ok(outcome), limits).map(|outcome| (outcome, work))
+}
+
+pub(crate) fn admit_controlled_outcome(
+    result: Result<ResolutionSolveOutcome, ResolutionProofError>,
+    limits: &ResolutionProofLimits,
+) -> Result<ResolutionSolveOutcome, ResolutionProofError> {
+    // Preserve an error already reached. Successful outcomes must remain
+    // within the original deadline after cleanup AND the final callback.
+    match &result {
+        Ok(ResolutionSolveOutcome::Sat(_)) => {
+            check_deadline(limits.deadline, ResolutionProofPhase::Solve)?
+        }
+        Ok(ResolutionSolveOutcome::Unsat(_)) => check_deadline(
+            earliest_deadline(limits.deadline, limits.validation.deadline),
+            ResolutionProofPhase::Validate,
+        )?,
+        Err(_) => {}
+    }
+    result
+}
+
+/// `support_enumeration`: whether the solver may build the parked support
+/// enumeration at startup (`Solver::set_support_enumeration`).
+pub(crate) fn solve_resolution_dag_controlled(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    control: &ProofControl<'_>,
+    support_enumeration: bool,
+) -> Result<(ResolutionSolveOutcome, u64), ResolutionProofError> {
+    preflight_input_controlled(num_vars, clauses, limits, control)?;
+    control.check(limits.deadline, ResolutionProofPhase::Preflight)?;
+
+    let codec_reserved = original_codec_reservation(clauses, limits.deadline, control)?;
     enforce_proof_limit(
         ResolutionProofResource::CodecBytes,
         codec_reserved,
@@ -452,15 +575,16 @@ pub fn solve_resolution_dag_with_limits(
     });
     solver.set_preprocess_enabled(false);
     solver.disable_all_inprocessing();
+    solver.set_support_enumeration(support_enumeration);
     solver.set_solve_deadline(limits.deadline);
     solver.set_conflict_budget(limits.max_conflicts);
     solver.set_decision_budget(limits.max_decisions);
     solver.set_max_clause_db_bytes(Some(limits.solver_clause_db_reduction_threshold_bytes));
     solver.set_interrupt(proof_handle.failed_flag());
-    let logical_input_bytes = logical_input_bytes(clauses, limits.deadline)?;
+    let logical_input_bytes = logical_input_bytes(clauses, limits.deadline, control)?;
     let mut add_buffer: Vec<Literal> = Vec::new();
     for clause in clauses {
-        check_deadline(limits.deadline, ResolutionProofPhase::Solve)?;
+        control.check(limits.deadline, ResolutionProofPhase::Solve)?;
         if add_buffer.capacity() < clause.len() {
             let requested_bytes = clause.len().checked_mul(size_of::<Literal>()).ok_or(
                 ResolutionProofError::AccountingOverflow {
@@ -499,20 +623,34 @@ pub fn solve_resolution_dag_with_limits(
                 limits.max_input_bytes,
             )?;
         }
-        add_buffer.extend_from_slice(clause);
+        literal_walk::append(
+            &mut add_buffer,
+            clause,
+            limits.deadline,
+            ResolutionProofPhase::Solve,
+            control,
+        )?;
         solver.add_clause_reusing_buffer(&mut add_buffer);
-        check_deadline(limits.deadline, ResolutionProofPhase::Solve)?;
+        control.check(limits.deadline, ResolutionProofPhase::Solve)?;
     }
 
     let failed = proof_handle.failed_flag();
     let deadline = limits.deadline;
+    // The search polls its stop at every conflict and propagation round: the
+    // deadline's clock is read once per 64 polls (`ClockStride`, DR-34).
+    let clock = ay_core::time::ClockStride::new(64);
     let result = solver
-        .solve_interruptible_without_artifact(move || {
-            failed.load(Ordering::Relaxed) || deadline.is_some_and(|end| Instant::now() >= end)
-        })
+        .solve_interruptible_without_artifact_with_proof_progress(
+            move || {
+                control.poll().is_err()
+                    || failed.load(Ordering::Relaxed)
+                    || (clock.due() && deadline.is_some_and(|end| Instant::now() >= end))
+            },
+            &|| control.poll().is_ok(),
+        )
         .into_inner();
     let unknown_reason = solver.last_unknown_reason();
-    let conflicts = solver.num_conflicts();
+    let conflicts = control.record_conflicts(solver.num_conflicts());
     let decisions = solver.num_decisions();
     let backward_failure = solver.take_backward_proof_failure();
 
@@ -520,8 +658,20 @@ pub fn solve_resolution_dag_with_limits(
         .take_proof_writer_without_artifact()
         .ok_or(ResolutionProofError::ProofWriterUnavailable)?;
     let pending_deletion_failure = output.lrat_bounded_resource_failure();
-    let inner_result = output.into_inner();
+    // Do not invoke a new callback while draining a writer after a producer
+    // failure has already been reached. Its original typed cause must survive.
+    let inner_result = if backward_failure.is_none()
+        && proof_handle.failure().is_none()
+        && pending_deletion_failure.is_none()
+    {
+        Some(output.into_inner_with_cancellation(&|| control.poll().is_ok()))
+    } else {
+        drop(output);
+        None
+    };
     drop(solver);
+
+    control.check_latched()?;
 
     if let Some(failure) = backward_failure {
         return Err(map_backward_proof_failure(failure));
@@ -571,7 +721,13 @@ pub fn solve_resolution_dag_with_limits(
             }
         });
     }
-    check_deadline(limits.deadline, ResolutionProofPhase::Solve)?;
+    if inner_result.as_ref().is_some_and(Result::is_err) {
+        // Preserve the legacy deadline/counter/SAT precedence below without
+        // invoking new caller code after an ordinary writer error was reached.
+        check_deadline(limits.deadline, ResolutionProofPhase::Solve)?;
+    } else {
+        control.check(limits.deadline, ResolutionProofPhase::Solve)?;
+    }
 
     // Public solver budgets are polled at documented amortized checkpoints.
     // A result found between decision polls is accepted only if its final
@@ -592,7 +748,7 @@ pub fn solve_resolution_dag_with_limits(
     }
 
     match result {
-        SatResult::Sat(model) => return Ok(ResolutionSolveOutcome::Sat(model)),
+        SatResult::Sat(model) => return Ok((ResolutionSolveOutcome::Sat(model), 0)),
         SatResult::Unknown => {
             if limits.deadline.is_some_and(|end| Instant::now() >= end) {
                 return Err(ResolutionProofError::DeadlineExceeded {
@@ -619,14 +775,21 @@ pub fn solve_resolution_dag_with_limits(
         }
         SatResult::Unsat(_) => {}
     }
-    let boxed_writer = inner_result.map_err(|_| ResolutionProofError::ProofWriterUnavailable)?;
+    let boxed_writer = inner_result
+        .ok_or(ResolutionProofError::ProofWriterUnavailable)?
+        .map_err(map_proof_writer_error)?;
     let bytes = boxed_writer
         .into_typed::<BoundedProofBuffer>()
         .ok_or(ResolutionProofError::ProofWriterUnavailable)?
         .into_bytes();
-    check_deadline(limits.deadline, ResolutionProofPhase::Parse)?;
+    control.check(limits.deadline, ResolutionProofPhase::Parse)?;
 
-    let mut codec = CodecMeter::new(bytes.capacity(), limits.max_codec_bytes, limits.deadline)?;
+    let mut codec = CodecMeter::new(
+        bytes.capacity(),
+        limits.max_codec_bytes,
+        limits.deadline,
+        control,
+    )?;
     codec.charge(
         size_of::<ResolutionDag>(),
         ResolutionProofResource::CodecBytes,
@@ -637,14 +800,27 @@ pub fn solve_resolution_dag_with_limits(
     // byte budget accounts only the certificate plus its own scratch.
     drop(bytes);
 
+    check_originals_controlled(&dag, clauses, limits.deadline, control)?;
+    let work = validate_dag_controlled(&dag, limits, control)?;
+    Ok((ResolutionSolveOutcome::Unsat(dag), work))
+}
+
+fn check_originals_controlled(
+    dag: &ResolutionDag,
+    clauses: &[Vec<Literal>],
+    deadline: Option<Instant>,
+    control: &ProofControl<'_>,
+) -> Result<(), ResolutionProofError> {
+    control.poll()?;
     if dag.original_clauses.len() != clauses.len() {
         return Err(ResolutionProofError::OriginalClauseMismatch {
             index: dag.original_clauses.len().min(clauses.len()),
         });
     }
     for (index, ((id, actual), expected)) in dag.original_clauses.iter().zip(clauses).enumerate() {
+        control.poll()?;
         if index % 1024 == 0 {
-            check_deadline(limits.deadline, ResolutionProofPhase::Parse)?;
+            control.check(deadline, ResolutionProofPhase::Parse)?;
         }
         let expected_id = u64::try_from(index)
             .ok()
@@ -652,24 +828,39 @@ pub fn solve_resolution_dag_with_limits(
             .ok_or(ResolutionProofError::AccountingOverflow {
                 resource: ResolutionProofResource::InputClauses,
             })?;
-        if *id != expected_id || actual != expected {
+        if *id != expected_id || actual.len() != expected.len() {
             return Err(ResolutionProofError::OriginalClauseMismatch { index });
         }
+        literal_walk::compare(actual, expected, index, deadline, control)?;
     }
-    check_deadline(limits.deadline, ResolutionProofPhase::Parse)?;
+    control.check(deadline, ResolutionProofPhase::Parse)
+}
 
+fn validate_dag_controlled(
+    dag: &ResolutionDag,
+    limits: &ResolutionProofLimits,
+    control: &ProofControl<'_>,
+) -> Result<u64, ResolutionProofError> {
     let mut validation_limits = limits.validation.clone();
     validation_limits.deadline = earliest_deadline(limits.deadline, validation_limits.deadline);
-    match dag.validate_with_limits(&validation_limits) {
-        Ok(()) => {}
-        Err(ResolutionValidationError::DeadlineExceeded) => {
-            return Err(ResolutionProofError::DeadlineExceeded {
-                phase: ResolutionProofPhase::Validate,
-            });
+    let validation =
+        dag.validate_with_limits_interruptible(&validation_limits, &[], 0, 0, &mut || {
+            control.poll().is_err()
+        });
+    control.check_latched()?;
+    match validation {
+        Ok(work) => {
+            control.check(validation_limits.deadline, ResolutionProofPhase::Validate)?;
+            Ok(work)
         }
-        Err(error) => return Err(ResolutionProofError::Validation(error)),
+        Err(ResolutionValidationError::Cancelled) => Err(ResolutionProofError::Cancelled),
+        Err(ResolutionValidationError::DeadlineExceeded) => {
+            Err(ResolutionProofError::DeadlineExceeded {
+                phase: ResolutionProofPhase::Validate,
+            })
+        }
+        Err(error) => Err(ResolutionProofError::Validation(error)),
     }
-    Ok(ResolutionSolveOutcome::Unsat(dag))
 }
 
 fn map_backward_proof_resource(resource: BackwardProofResource) -> ResolutionProofResource {
@@ -687,6 +878,7 @@ fn map_backward_proof_resource(resource: BackwardProofResource) -> ResolutionPro
 
 fn map_backward_proof_failure(failure: BackwardProofFailure) -> ResolutionProofError {
     match failure {
+        BackwardProofFailure::Cancelled => ResolutionProofError::Cancelled,
         BackwardProofFailure::Deadline => ResolutionProofError::DeadlineExceeded {
             phase: ResolutionProofPhase::Solve,
         },
@@ -710,6 +902,14 @@ fn map_backward_proof_failure(failure: BackwardProofFailure) -> ResolutionProofE
     }
 }
 
+fn map_proof_writer_error(error: std::io::Error) -> ResolutionProofError {
+    if crate::proof::is_bounded_emission_cancelled(&error) {
+        ResolutionProofError::Cancelled
+    } else {
+        ResolutionProofError::ProofWriterUnavailable
+    }
+}
+
 fn earliest_deadline(lhs: Option<Instant>, rhs: Option<Instant>) -> Option<Instant> {
     match (lhs, rhs) {
         (Some(lhs), Some(rhs)) => Some(lhs.min(rhs)),
@@ -728,6 +928,15 @@ fn check_deadline(
     Ok(())
 }
 
+/// Hard ceiling on one input clause's literal count; preflight clamps the
+/// configured `max_input_clause_literals` to it.
+const MAX_INPUT_CLAUSE_LITERALS: usize = 60_000;
+
+/// Exclusive bound on the original-clause records one parse materializes:
+/// the record vector stays below 2^28 bytes. Every configured
+/// `max_input_clauses` in the workspace (at most 2,000,000) is far below it.
+const MAX_ORIGINAL_CLAUSE_RECORDS: usize = (1 << 28) / size_of::<(u64, Vec<Literal>)>();
+
 fn enforce_proof_limit(
     resource: ResolutionProofResource,
     actual: usize,
@@ -743,10 +952,20 @@ fn enforce_proof_limit(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_input(
     num_vars: usize,
     clauses: &[Vec<Literal>],
     limits: &ResolutionProofLimits,
+) -> Result<(), ResolutionProofError> {
+    preflight_input_controlled(num_vars, clauses, limits, &ProofControl::new(&mut || true))
+}
+
+fn preflight_input_controlled(
+    num_vars: usize,
+    clauses: &[Vec<Literal>],
+    limits: &ResolutionProofLimits,
+    control: &ProofControl<'_>,
 ) -> Result<(), ResolutionProofError> {
     if limits.deadline.is_none() {
         return Err(ResolutionProofError::UnboundedSearch);
@@ -771,13 +990,16 @@ fn preflight_input(
 
     let mut total_literals = 0usize;
     for (clause_index, clause) in clauses.iter().enumerate() {
+        control.poll()?;
         if clause_index % 1024 == 0 {
             check_deadline(limits.deadline, ResolutionProofPhase::Preflight)?;
         }
         enforce_proof_limit(
             ResolutionProofResource::InputClauseLiterals,
             clause.len(),
-            limits.max_input_clause_literals.min(60_000),
+            limits
+                .max_input_clause_literals
+                .min(MAX_INPUT_CLAUSE_LITERALS),
         )?;
         total_literals = total_literals.checked_add(clause.len()).ok_or(
             ResolutionProofError::AccountingOverflow {
@@ -812,72 +1034,11 @@ fn preflight_input(
         limits.max_input_bytes,
     )?;
 
+    // Every literal in range and unrepeated in its clause, with the repeat
+    // check's scratch charged first (`resolution_dag/clause_literals.rs`).
+    let mut pass = clause_literals::ClauseLiterals::new(num_vars, input_bytes, limits, control);
     for (clause_index, clause) in clauses.iter().enumerate() {
-        if clause_index % 1024 == 0 {
-            check_deadline(limits.deadline, ResolutionProofPhase::Preflight)?;
-        }
-        let requested_scratch =
-            clause
-                .len()
-                .checked_mul(32)
-                .ok_or(ResolutionProofError::AccountingOverflow {
-                    resource: ResolutionProofResource::InputBytes,
-                })?;
-        let requested_peak = input_bytes.checked_add(requested_scratch).ok_or(
-            ResolutionProofError::AccountingOverflow {
-                resource: ResolutionProofResource::InputBytes,
-            },
-        )?;
-        enforce_proof_limit(
-            ResolutionProofResource::InputBytes,
-            requested_peak,
-            limits.max_input_bytes,
-        )?;
-        let mut seen = std::collections::HashMap::<u32, usize>::new();
-        seen.try_reserve(clause.len())
-            .map_err(|_| ResolutionProofError::AllocationFailed {
-                resource: ResolutionProofResource::InputLiterals,
-            })?;
-        // `HashMap::capacity` reflects implementation load-factor slack. A
-        // conservative 32-byte slot estimate covers `(u32, usize)`, control
-        // bytes and alignment. Only one clause map is live at a time.
-        let scratch_bytes =
-            seen.capacity()
-                .checked_mul(32)
-                .ok_or(ResolutionProofError::AccountingOverflow {
-                    resource: ResolutionProofResource::InputBytes,
-                })?;
-        let peak_input_bytes = input_bytes.checked_add(scratch_bytes).ok_or(
-            ResolutionProofError::AccountingOverflow {
-                resource: ResolutionProofResource::InputBytes,
-            },
-        )?;
-        enforce_proof_limit(
-            ResolutionProofResource::InputBytes,
-            peak_input_bytes,
-            limits.max_input_bytes,
-        )?;
-        for (literal_index, literal) in clause.iter().enumerate() {
-            if literal_index % 1024 == 0 {
-                check_deadline(limits.deadline, ResolutionProofPhase::Preflight)?;
-            }
-            let var = literal.variable().index();
-            if var >= num_vars {
-                return Err(ResolutionProofError::InputLiteralOutOfRange {
-                    clause_index,
-                    literal_index,
-                    var,
-                    num_vars,
-                });
-            }
-            if let Some(first_index) = seen.insert(literal.raw(), literal_index) {
-                return Err(ResolutionProofError::DuplicateInputLiteral {
-                    clause_index,
-                    literal_index,
-                    first_index,
-                });
-            }
-        }
+        pass.check(clause_index, clause)?;
     }
     Ok(())
 }
@@ -885,9 +1046,11 @@ fn preflight_input(
 fn logical_input_bytes(
     clauses: &[Vec<Literal>],
     deadline: Option<Instant>,
+    control: &ProofControl<'_>,
 ) -> Result<usize, ResolutionProofError> {
     let mut literals = 0usize;
     for (index, clause) in clauses.iter().enumerate() {
+        control.poll()?;
         if index % 1024 == 0 {
             check_deadline(deadline, ResolutionProofPhase::Solve)?;
         }
@@ -915,9 +1078,11 @@ fn logical_input_bytes(
 fn original_codec_reservation(
     clauses: &[Vec<Literal>],
     deadline: Option<Instant>,
+    control: &ProofControl<'_>,
 ) -> Result<usize, ResolutionProofError> {
     let mut literals = 0usize;
     for (index, clause) in clauses.iter().enumerate() {
+        control.poll()?;
         if index % 1024 == 0 {
             check_deadline(deadline, ResolutionProofPhase::Preflight)?;
         }
@@ -1032,9 +1197,11 @@ impl BoundedProofBuffer {
             current.saturating_mul(2).min(self.limit)
         }
         .max(required);
+        // `target >= required > capacity >= len`; saturating keeps the
+        // "additional bytes to reach `target`" exact without an underflow edge.
         if self
             .bytes
-            .try_reserve_exact(target - self.bytes.len())
+            .try_reserve_exact(target.saturating_sub(self.bytes.len()))
             .is_err()
         {
             self.fail(ProofBufferFailure::Allocation);
@@ -1130,24 +1297,28 @@ impl BoundedProofBufferHandle {
     }
 }
 
-struct CodecMeter {
+struct CodecMeter<'a, 'p> {
     used: usize,
     limit: usize,
     deadline: Option<Instant>,
+    control: &'a ProofControl<'p>,
 }
 
-impl CodecMeter {
+impl<'a, 'p> CodecMeter<'a, 'p> {
     fn new(
         initial: usize,
         limit: usize,
         deadline: Option<Instant>,
+        control: &'a ProofControl<'p>,
     ) -> Result<Self, ResolutionProofError> {
+        control.poll()?;
         enforce_proof_limit(ResolutionProofResource::CodecBytes, initial, limit)?;
         check_deadline(deadline, ResolutionProofPhase::Parse)?;
         Ok(Self {
             used: initial,
             limit,
             deadline,
+            control,
         })
     }
 
@@ -1156,6 +1327,7 @@ impl CodecMeter {
         bytes: usize,
         resource: ResolutionProofResource,
     ) -> Result<(), ResolutionProofError> {
+        self.control.poll()?;
         let attempted = self
             .used
             .checked_add(bytes)
@@ -1192,6 +1364,7 @@ impl CodecMeter {
         target: usize,
         allocation_resource: ResolutionProofResource,
     ) -> Result<(), ResolutionProofError> {
+        self.control.poll()?;
         let old_capacity = vec.capacity();
         if target <= old_capacity {
             return Ok(());
@@ -1216,12 +1389,18 @@ impl CodecMeter {
             },
         )?;
         enforce_proof_limit(ResolutionProofResource::CodecBytes, transient, self.limit)?;
-        if vec.try_reserve_exact(target - vec.len()).is_err() {
+        // `target > capacity >= len`; saturating keeps the "additional
+        // elements to reach `target`" exact without an underflow edge.
+        if vec
+            .try_reserve_exact(target.saturating_sub(vec.len()))
+            .is_err()
+        {
             return Err(ResolutionProofError::AllocationFailed {
                 resource: allocation_resource,
             });
         }
-        check_deadline(self.deadline, ResolutionProofPhase::Parse)?;
+        self.control
+            .check(self.deadline, ResolutionProofPhase::Parse)?;
         let actual_bytes = vec.capacity().checked_mul(size_of::<T>()).ok_or(
             ResolutionProofError::AccountingOverflow {
                 resource: ResolutionProofResource::CodecBytes,
@@ -1256,6 +1435,7 @@ impl CodecMeter {
         value: T,
         allocation_resource: ResolutionProofResource,
     ) -> Result<(), ResolutionProofError> {
+        self.control.poll()?;
         if vec.len() == vec.capacity() {
             let target = if vec.capacity() == 0 {
                 4
@@ -1272,9 +1452,18 @@ impl CodecMeter {
 
 fn clone_originals_bounded(
     clauses: &[Vec<Literal>],
-    codec: &mut CodecMeter,
+    codec: &mut CodecMeter<'_, '_>,
     deadline: Option<Instant>,
 ) -> Result<Vec<(u64, Vec<Literal>)>, ResolutionProofError> {
+    // Preflight already capped both sizes far below these bounds; restating
+    // them here keeps every allocation below provably bounded.
+    if clauses.len() >= MAX_ORIGINAL_CLAUSE_RECORDS {
+        return Err(ResolutionProofError::LimitExceeded {
+            resource: ResolutionProofResource::InputClauses,
+            limit: (MAX_ORIGINAL_CLAUSE_RECORDS - 1) as u128,
+            actual: clauses.len() as u128,
+        });
+    }
     let mut originals = Vec::new();
     codec.reserve_exact(
         &mut originals,
@@ -1283,8 +1472,16 @@ fn clone_originals_bounded(
     )?;
     check_deadline(deadline, ResolutionProofPhase::Parse)?;
     for (index, clause) in clauses.iter().enumerate() {
+        codec.control.poll()?;
         if index % 1024 == 0 {
             check_deadline(deadline, ResolutionProofPhase::Parse)?;
+        }
+        if clause.len() > MAX_INPUT_CLAUSE_LITERALS {
+            return Err(ResolutionProofError::LimitExceeded {
+                resource: ResolutionProofResource::InputClauseLiterals,
+                limit: MAX_INPUT_CLAUSE_LITERALS as u128,
+                actual: clause.len() as u128,
+            });
         }
         let mut copy = Vec::new();
         codec.reserve_exact(
@@ -1292,7 +1489,13 @@ fn clone_originals_bounded(
             clause.len(),
             ResolutionProofResource::InputLiterals,
         )?;
-        copy.extend_from_slice(clause);
+        literal_walk::append(
+            &mut copy,
+            clause,
+            deadline,
+            ResolutionProofPhase::Parse,
+            codec.control,
+        )?;
         let id = u64::try_from(index)
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -1310,7 +1513,7 @@ fn parse_binary_lrat_into_dag(
     original_clauses: Vec<(u64, Vec<Literal>)>,
     bytes: &[u8],
     limits: &ResolutionProofLimits,
-    codec: &mut CodecMeter,
+    codec: &mut CodecMeter<'_, '_>,
 ) -> Result<ResolutionDag, ResolutionProofError> {
     let mut position = 0usize;
     let mut derived = Vec::new();
@@ -1318,11 +1521,19 @@ fn parse_binary_lrat_into_dag(
     let mut hints = 0usize;
 
     while position < bytes.len() {
+        codec.control.poll()?;
         if position.is_multiple_of(1024) {
             check_deadline(limits.deadline, ResolutionProofPhase::Parse)?;
         }
-        let marker = bytes[position];
-        position += 1;
+        let Some(&marker) = bytes.get(position) else {
+            break;
+        };
+        let marker_offset = position;
+        position = position
+            .checked_add(1)
+            .ok_or(ResolutionProofError::AccountingOverflow {
+                resource: ResolutionProofResource::ProofOutputBytes,
+            })?;
         match marker {
             b'a' => {
                 enforce_proof_limit(
@@ -1330,7 +1541,8 @@ fn parse_binary_lrat_into_dag(
                     derived.len().saturating_add(1),
                     limits.max_derived_steps,
                 )?;
-                let encoded_id = read_binary_value(bytes, &mut position, limits.deadline)?;
+                let encoded_id =
+                    read_binary_value(bytes, &mut position, limits.deadline, codec.control)?;
                 if encoded_id == 0 || encoded_id & 1 != 0 {
                     return Err(ResolutionProofError::MalformedBinaryProof {
                         offset: position,
@@ -1341,7 +1553,8 @@ fn parse_binary_lrat_into_dag(
 
                 let mut clause = Vec::new();
                 loop {
-                    let encoded = read_binary_value(bytes, &mut position, limits.deadline)?;
+                    let encoded =
+                        read_binary_value(bytes, &mut position, limits.deadline, codec.control)?;
                     if encoded == 0 {
                         break;
                     }
@@ -1389,7 +1602,8 @@ fn parse_binary_lrat_into_dag(
 
                 let mut rup_hints = Vec::new();
                 loop {
-                    let encoded = read_binary_value(bytes, &mut position, limits.deadline)?;
+                    let encoded =
+                        read_binary_value(bytes, &mut position, limits.deadline, codec.control)?;
                     if encoded == 0 {
                         break;
                     }
@@ -1423,7 +1637,8 @@ fn parse_binary_lrat_into_dag(
                 )?;
             }
             b'd' => loop {
-                let encoded = read_binary_value(bytes, &mut position, limits.deadline)?;
+                let encoded =
+                    read_binary_value(bytes, &mut position, limits.deadline, codec.control)?;
                 if encoded == 0 {
                     break;
                 }
@@ -1436,13 +1651,14 @@ fn parse_binary_lrat_into_dag(
             },
             _ => {
                 return Err(ResolutionProofError::MalformedBinaryProof {
-                    offset: position - 1,
+                    offset: marker_offset,
                     detail: "unknown LRAT record marker",
                 });
             }
         }
     }
 
+    codec.control.poll()?;
     let empty_clause_id = derived
         .last()
         .filter(|step| step.clause.is_empty())
@@ -1460,7 +1676,9 @@ fn read_binary_value(
     bytes: &[u8],
     position: &mut usize,
     deadline: Option<Instant>,
+    control: &ProofControl<'_>,
 ) -> Result<u64, ResolutionProofError> {
+    control.poll()?;
     let start = *position;
     let start_poll_bucket = start / 1024;
     let mut value = 0u64;
@@ -1672,6 +1890,27 @@ mod tests {
     }
 
     #[test]
+    fn bounded_complementary_units_fast_path_needs_no_backward_memory() {
+        let clauses = vec![vec![p(0)], vec![n(0)]];
+        let mut limits = bounded_limits();
+        limits.max_backward_reconstruction_bytes = 0;
+        let dag = prove_unsat_resolution_dag_with_limits(1, &clauses, &limits)
+            .expect("complementary units are emitted at startup, not reconstructed");
+        assert_eq!(dag.original_clauses, vec![(1, vec![p(0)]), (2, vec![n(0)])]);
+        assert_eq!(
+            dag.derived,
+            vec![RupStep {
+                id: 3,
+                clause: Vec::new(),
+                rup_hints: vec![1, 2],
+            }]
+        );
+        assert_eq!(dag.empty_clause_id, 3);
+        dag.validate_with_limits(&limits.validation)
+            .expect("independent replay with zero backward memory");
+    }
+
+    #[test]
     fn bounded_api_preserves_authenticated_complementary_units_refutation() {
         let clauses = vec![vec![p(0)], vec![n(0)]];
         let limits = bounded_limits();
@@ -1684,49 +1923,6 @@ mod tests {
             .is_some_and(|step| step.clause.is_empty()));
         dag.validate_with_limits(&limits.validation)
             .expect("independent replay of complementary-units proof");
-    }
-
-    #[test]
-    fn bounded_finalization_source_guard_uses_only_direct_emission_funnels() {
-        let source = include_str!("solver/solve/finalize_unsat.rs");
-        let bounded = source
-            .split_once("if let Some(limits) = self.cold.backward_proof_limits.clone() {")
-            .expect("bounded finalization branch")
-            .1
-            .split_once("let backward = self.reconstruct_lrat_backward();")
-            .expect("legacy finalization branch")
-            .0;
-        assert!(bounded.contains("manager.emit_bounded_backward_rup_step("));
-        assert!(bounded.contains("mark_empty_clause_with_bounded_prevalidated_hints("));
-        assert!(!bounded.contains("manager.emit_backward_step("));
-        assert!(!bounded.contains("self.mark_empty_clause_with_hints("));
-    }
-
-    #[test]
-    fn bounded_level0_conflict_source_guard_defers_before_legacy_allocations() {
-        let source = [
-            include_str!("solver/conflict_analysis_lrat_specialized/level0_conflict.rs"),
-            include_str!("solver/conflict_analysis_lrat_specialized.rs"),
-        ]
-        .join("\n");
-        let deferred = source
-            .find("if self.cold.backward_proof_limits.is_some() {")
-            .expect("bounded deferred-conflict branch");
-        let conflict_clone = source
-            .find("let conflict_lits = self.arena.literals(ci).to_vec();")
-            .expect("legacy conflict clone");
-        let materialize = source
-            .find("self.materialize_level0_unit_proofs();")
-            .expect("legacy unit materialization");
-        let trace_hash = source
-            .find("&det_hash_set_new()")
-            .expect("legacy trace HashSet");
-        assert!(deferred < materialize);
-        assert!(deferred < conflict_clone);
-        assert!(deferred < trace_hash);
-        let branch = &source[deferred..materialize];
-        assert!(branch.contains("self.mark_empty_clause_deferred_for_bounded_proof();"));
-        assert!(branch.contains("return;"));
     }
 
     #[test]
@@ -2002,8 +2198,15 @@ mod tests {
             bytes.extend(std::iter::repeat_n(0xff, 10));
             bytes
         }] {
-            let mut codec =
-                CodecMeter::new(bytes.capacity(), limits.max_codec_bytes, limits.deadline).unwrap();
+            let mut keep_going = || true;
+            let control = ProofControl::new(&mut keep_going);
+            let mut codec = CodecMeter::new(
+                bytes.capacity(),
+                limits.max_codec_bytes,
+                limits.deadline,
+                &control,
+            )
+            .unwrap();
             let err = parse_binary_lrat_into_dag(0, Vec::new(), &bytes, &limits, &mut codec)
                 .expect_err("malformed proof");
             assert!(matches!(

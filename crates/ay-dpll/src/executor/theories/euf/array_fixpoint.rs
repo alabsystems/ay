@@ -5,6 +5,7 @@
 //! Array+EUF solve entry points and axiom fixpoint loops.
 
 use super::super::super::Executor;
+use super::array_store_eq_indices::ARRAY_REFUTATION_INSTANCE_CAP;
 use super::{reachable_term_set, ArrayAxiomMode};
 use crate::combined_solvers::combiner::{
     CrossTheoryEqualityReplay, EufArrayNotifyReplayState, TheoryCombiner,
@@ -876,27 +877,18 @@ impl Executor {
         // construction, a name the current query cannot mention, so no axiom
         // indexed at it can be relevant to the current query.
         self.compute_array_axiom_dead_skolems(assumption_roots);
+        if self.array_refutation_instances_armed {
+            self.add_array_refutation_instances(ARRAY_REFUTATION_INSTANCE_CAP, assumption_roots);
+        }
 
         // In incremental mode, scope axiom generation to terms reachable from
         // current assertions (and assumption roots, if any). This prevents
         // phantom axioms from dead terms in popped scopes (#6726). Terms
         // created during the fixpoint (idx >= start_len) always pass the
         // scope check.
-        if self.incremental_mode || self.shared_store_derived_query {
-            let start_len = self.ctx.terms.len();
-            let reachable = if assumption_roots.is_empty() {
-                reachable_term_set(&self.ctx.terms, &self.ctx.assertions)
-            } else {
-                // Include assumption terms in the reachable set so
-                // assumption-only array operations get axioms (#6736).
-                let mut roots =
-                    Vec::with_capacity(self.ctx.assertions.len() + assumption_roots.len());
-                roots.extend_from_slice(&self.ctx.assertions);
-                roots.extend_from_slice(assumption_roots);
-                reachable_term_set(&self.ctx.terms, &roots)
-            };
-            self.array_axiom_scope = Some((reachable, start_len));
-        }
+        let previous_scope = self
+            .live_array_axiom_scope_wanted()
+            .then(|| self.begin_live_array_axiom_scope(assumption_roots));
 
         // #6820: Reset store-eq cache for this fixpoint invocation.
         // Store equalities are stable across inner rounds (they come from
@@ -1359,7 +1351,10 @@ impl Executor {
         }
 
         self.row_seeded_terms.clear();
-        self.array_axiom_scope = None;
+        if let Some(scope) = previous_scope {
+            self.array_axiom_scope = scope;
+            self.include_current_array_assertions_in_scope();
+        }
     }
 
     /// Run the full eager array axiom fixpoint at a given dedup_protect offset.
@@ -1416,20 +1411,13 @@ impl Executor {
         include_congruence: bool,
         assumption_roots: &[TermId],
     ) {
-        // Scope filtering for incremental mode (#6726).
-        if self.incremental_mode || self.shared_store_derived_query {
-            let start_len = self.ctx.terms.len();
-            let reachable = if assumption_roots.is_empty() {
-                reachable_term_set(&self.ctx.terms, &self.ctx.assertions)
-            } else {
-                let mut roots =
-                    Vec::with_capacity(self.ctx.assertions.len() + assumption_roots.len());
-                roots.extend_from_slice(&self.ctx.assertions);
-                roots.extend_from_slice(assumption_roots);
-                reachable_term_set(&self.ctx.terms, &roots)
-            };
-            self.array_axiom_scope = Some((reachable, start_len));
+        if self.array_refutation_instances_armed {
+            self.add_array_refutation_instances(ARRAY_REFUTATION_INSTANCE_CAP, assumption_roots);
         }
+        // Scope filtering for incremental mode (#6726).
+        let previous_scope = self
+            .live_array_axiom_scope_wanted()
+            .then(|| self.begin_live_array_axiom_scope(assumption_roots));
 
         self.reset_array_congruence_caches();
 
@@ -1492,14 +1480,14 @@ impl Executor {
             }
         }
         // Deduplicate assertions.
-        #[cfg(not(kani))]
         let mut seen: HashSet<TermId> =
             ay_core::kani_compat::det_hash_set_with_capacity(self.ctx.assertions.len());
-        #[cfg(kani)]
-        let mut seen: HashSet<TermId> = HashSet::default();
         self.ctx.assertions.retain(|a| seen.insert(*a));
 
-        self.array_axiom_scope = None;
+        if let Some(scope) = previous_scope {
+            self.array_axiom_scope = scope;
+            self.include_current_array_assertions_in_scope();
+        }
     }
 }
 

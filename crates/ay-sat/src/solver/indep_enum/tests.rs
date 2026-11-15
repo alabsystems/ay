@@ -15,6 +15,9 @@
 use super::*;
 use crate::solver::Solver;
 
+mod local_solves;
+mod tick_stop;
+
 fn lit(v: i32) -> Literal {
     if v > 0 {
         Literal::positive(Variable((v - 1) as u32))
@@ -309,6 +312,42 @@ fn a_spent_enumeration_slice_falls_through_to_search() {
     );
 }
 
+/// A solver's own counted switch (`set_deterministic_inproc`, which ay-dpll
+/// turns on for every bit-blast solve under `:rlimit`) parks the enumeration
+/// with a schedule of work, the same whatever time is left before the
+/// deadline. The wall schedule is a share of the time left, so a slower host,
+/// or a nearer backstop, moved where the probe ran and what search found.
+#[test]
+fn a_counted_solver_parks_the_same_schedule_whatever_time_is_left() {
+    let (nv, clauses) = resolvent_forced_and_chains(34);
+    let park = |time_left: Duration, counted: bool| {
+        let mut s = solver_from(nv, &clauses);
+        s.set_deterministic_inproc(counted);
+        assert_eq!(s.deterministic_inproc(), counted);
+        assert_eq!(s.preprocess_wall_budgets_enabled(), !counted);
+        s.set_solve_deadline(Some(ay_core::time::Instant::now() + time_left));
+        s.prepare_indep_enum_at_startup();
+        let pending = s
+            .cold
+            .indep_enum_pending
+            .as_ref()
+            .expect("the gate admits this instance");
+        (
+            pending.head_start_ticks,
+            pending.slice_visits,
+            pending.budget,
+        )
+    };
+    let near = Duration::from_secs(2);
+    let far = Duration::from_secs(600);
+    let counted_near = park(near, true);
+    assert_eq!(counted_near, park(far, true));
+    assert!(counted_near.0 > 0 && counted_near.1 > 0, "{counted_near:?}");
+    assert_eq!(counted_near.2, Duration::ZERO, "no wall slice");
+    // Negative control: uncounted, the slice is a share of the time left.
+    assert_ne!(park(near, false).2, park(far, false).2);
+}
+
 /// Gate 1(b): no gate structure means no support means no admission, and the
 /// cost is the pre-gate plus a bailed support computation — no enumeration.
 #[test]
@@ -401,4 +440,60 @@ fn xor_collapse_leaves_incomplete_classes_alone() {
     let (kinds, _, _) = collapse_xors(&raw);
     assert_eq!(kinds.len(), 3);
     assert!(kinds.iter().all(|&k| k == KIND_CLAUSE));
+}
+
+/// `--sat-indep-enum-and`: the AND-gate shape collapses to one AND constraint
+/// `[o, a, b]` with its literals in gate order.
+#[test]
+fn and_collapse_recognises_two_input_gates() {
+    let p = |v: u32| v * 2;
+    let n = |v: u32| v * 2 + 1;
+    let raw = vec![vec![n(2), p(0)], vec![n(2), p(1)], vec![p(2), n(0), n(1)]];
+    let (kinds, starts, lits) = collapse_constraints(&raw, true);
+    assert_eq!(kinds, vec![KIND_AND]);
+    assert_eq!(starts, vec![0, 3]);
+    assert_eq!(lits, vec![p(2), p(0), p(1)]);
+    // Off, the same clauses stay clauses.
+    let (kinds, _, _) = collapse_constraints(&raw, false);
+    assert!(kinds.iter().all(|&k| k == KIND_CLAUSE));
+}
+
+/// The AND kind must reach the verdict the clause encoding reaches: on small
+/// AND/XOR circuits with pinned outputs (half of them made unsatisfiable by
+/// flipping one pinned output), the probe finds a model with the switch on
+/// exactly when it finds one with it off, and every model is a real model.
+#[test]
+fn and_kind_agrees_with_the_clause_encoding() {
+    let run = |clauses: &[Vec<i32>], nv: usize, on: bool| {
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            indep_enum_and: Some(on),
+            ..Default::default()
+        });
+        let mut s = solver_from(nv, clauses);
+        let model = s.indep_enum_probe();
+        (model, s.stats.indep_enum_admitted)
+    };
+    let mut compared = 0;
+    for seed in 0..48u64 {
+        let n_in = 5 + (seed % 6) as usize;
+        let (nv, mut clauses, _) = mini_prng(n_in, 2 + (seed % 2) as usize, seed * 2654435761);
+        if seed % 2 == 1 {
+            let last = clauses.len() - 1;
+            clauses[last][0] = -clauses[last][0];
+        }
+        let (off, admitted_off) = run(&clauses, nv, false);
+        let (on, admitted_on) = run(&clauses, nv, true);
+        if admitted_off == 0 || admitted_on == 0 {
+            continue;
+        }
+        compared += 1;
+        assert_eq!(off.is_some(), on.is_some(), "seed {seed}: verdicts differ");
+        if let Some(m) = &on {
+            assert_model(&clauses, m);
+        }
+    }
+    assert!(
+        compared >= 24,
+        "only {compared} of 48 circuits were admitted by both"
+    );
 }

@@ -132,7 +132,9 @@ fn try_run_xor_proof_route(
         .and_then(|file| solver_proof_output_writer(file, proof))
     {
         Ok(writer) => match (proof.format, proof.binary) {
-            (ProofFormat::Veripb, _) => ProofOutput::veripb(writer),
+            (ProofFormat::Veripb, _) => {
+                ProofOutput::veripb_with_original_clauses(writer, num_original_clauses)
+            }
             (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
             (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
             (ProofFormat::Lrat, false) => ProofOutput::lrat_text(writer, num_original_clauses),

@@ -49,11 +49,12 @@ impl PdrSolver {
             // If 0 or >1 fact clauses, skip this clause but continue with others.
             let frame_on_body = if level == 1 {
                 // Collect fact clauses for body predicate
-                let fact_clauses: Vec<_> = self
+                let fact_clauses: Vec<(usize, &crate::HornClause)> = self
                     .problem
                     .clauses()
                     .iter()
-                    .filter(|c| {
+                    .enumerate()
+                    .filter(|(_, c)| {
                         c.body.predicates.is_empty() && c.head.predicate_id() == Some(*body_pred)
                     })
                     .collect();
@@ -63,35 +64,40 @@ impl PdrSolver {
                     continue;
                 }
 
-                let fact = &fact_clauses[0];
+                let (fact_index, fact) = fact_clauses[0];
                 let fact_constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
                 let fact_head_args = match &fact.head {
                     crate::ClauseHead::Predicate(_, a) => a.as_slice(),
                     crate::ClauseHead::False => continue,
                 };
-
-                // Apply fact constraint to body args via fact head args
-                // Substitutes fact_head_args variables with body_args expressions
-                // #2492: Also extract constituent vars from expression fact head args
-                let mut subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
-                for (fact_arg, body_arg) in fact_head_args.iter().zip(body_args.iter()) {
-                    match fact_arg {
-                        ChcExpr::Var(v) => subst.push((v.clone(), body_arg.clone())),
-                        expr => {
-                            // For expression fact head args, substitute constituent vars
-                            for v in expr.vars() {
-                                if !subst.iter().any(|(sv, _)| sv.name == v.name) {
-                                    subst.push((v.clone(), body_arg.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-                if subst.len() < fact_head_args.len() {
-                    // Conservative bail: some positions have no variables at all
+                if fact_head_args.len() != body_args.len() {
                     continue;
                 }
-                fact_constraint.substitute(&subst)
+
+                // The fact renamed apart from this step clause (a shared
+                // letter would equate an init local with a step variable —
+                // `rename_clause_apart`), joined to the body positionally:
+                // `fact ∧ body_args = fact_head_args`. This also replaces the
+                // old head-variable substitution, which mapped every variable
+                // of a compound fact head argument (e.g. `x + 1`) to the body
+                // argument itself.
+                // A failed rename abandons the shrink (never a weaker frame).
+                let names = self.source_names()?;
+                let (renamed_fact, renamed_head_args) = self.rename_clause_apart(
+                    &names,
+                    &format!("__fact{fact_index}_"),
+                    &fact_constraint,
+                    fact_head_args,
+                    [&clause_constraint].into_iter().chain(body_args.iter()),
+                )?;
+                let init_match = ChcExpr::and_all(
+                    body_args
+                        .iter()
+                        .cloned()
+                        .zip(renamed_head_args)
+                        .map(|(body_arg, fact_arg)| ChcExpr::eq(body_arg, fact_arg)),
+                );
+                ChcExpr::and(renamed_fact, init_match)
             } else {
                 let frame_constraint = self
                     .cumulative_frame_constraint(level - 1, *body_pred)
@@ -110,7 +116,9 @@ impl PdrSolver {
             }
 
             self.smt.reset();
-            match self.smt.check_sat_with_assumption_conjuncts(
+            // Rung 4: the session answers when it can (conjunct-level core
+            // over the assumptions; `check_sat_with_assumption_conjuncts_search`).
+            match self.smt.check_sat_with_assumption_conjuncts_search(
                 &[clause_constraint, frame_on_body],
                 &assumptions_on_head,
             ) {

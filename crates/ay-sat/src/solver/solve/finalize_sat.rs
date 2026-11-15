@@ -8,7 +8,11 @@
 //! and the `declare_sat_*` / `declare_unknown_*` API methods.
 
 use super::super::*;
+use crate::reconstruct::admitted::{ordinary, Ordinary};
+use crate::solver::preprocess_verify::admitted::OriginalDomain;
 use crate::solver_log::solver_log;
+
+mod counted;
 
 impl Solver {
     // debug_assert_sat_result_model REMOVED (#9200): This function read from
@@ -159,37 +163,25 @@ impl Solver {
         // This check runs in O(unit_clauses) and provides a precise
         // diagnostic that distinguishes core-solver bugs from reconstruction
         // bugs.
+        if let Some((ci, lit, int_var, model_val)) =
+            ordinary(self.first_unit_model_violation_admitted(&model, &Ordinary))
         {
-            for (ci, clause) in self.cold.original_ledger.iter_clauses().enumerate() {
-                if clause.len() != 1 {
-                    continue;
-                }
-                let lit = clause[0];
-                let vi = lit.variable().index();
-                // Map external variable to internal for pre-reconstruction check.
-                if vi < self.cold.e2i.len() {
-                    let int_var = self.cold.e2i[vi];
-                    if int_var != compact::UNMAPPED {
-                        let int_var = int_var as usize;
-                        if int_var < model.len() {
-                            let model_val = model[int_var];
-                            let expected = lit.is_positive();
-                            if model_val != expected {
-                                let detail =
-                                    format!(
-                                    "BUG: original unit clause {} (ext_var{}, pos={}) violated \
-                                     by internal model BEFORE reconstruction — core solver or \
-                                     preprocessing bug, not reconstruction. int_var={}, \
-                                     model_val={}, clause_index={}",
-                                    lit.to_dimacs(), vi, expected, int_var, model_val, ci,
-                                );
-                                tracing::error!(detail = detail.as_str(), "unit clause violation");
-                                return Err(detail);
-                            }
-                        }
-                    }
-                }
-            }
+            let vi = lit.variable().index();
+            let expected = lit.is_positive();
+            let detail = format!(
+                "BUG: original unit clause {} (ext_var{}, pos={}) violated \
+                 by internal model BEFORE reconstruction — core solver or \
+                 preprocessing bug, not reconstruction. int_var={}, \
+                 model_val={}, clause_index={}",
+                lit.to_dimacs(),
+                vi,
+                expected,
+                int_var,
+                model_val,
+                ci,
+            );
+            tracing::error!(detail = detail.as_str(), "unit clause violation");
+            return Err(detail);
         }
 
         // Under active scopes, skip reconstruction. Reconstruction entries from
@@ -209,30 +201,7 @@ impl Solver {
             // produces incorrect values, causing original-formula verification
             // to fail and the solver to return Unknown instead of SAT.
             let ext_num_vars = self.cold.e2i.len();
-            let mut ext_model = vec![false; ext_num_vars];
-            for (ext_var, val) in ext_model.iter_mut().enumerate() {
-                let int_var = self.cold.e2i[ext_var];
-                if int_var == compact::UNMAPPED {
-                    // Variable was eliminated and compacted away. Use the
-                    // level-0 value saved during compaction. CaDiCaL preserves
-                    // eliminated variables' vals across compaction (extend.cpp:140
-                    // reads `internal->val(ilit)` even for eliminated variables).
-                    // AY's compaction truncates vals, so we read from the saved
-                    // external-space copy instead. (#8179)
-                    if ext_var < self.cold.eliminated_ext_vals.len() {
-                        *val = self.cold.eliminated_ext_vals[ext_var];
-                    }
-                    continue;
-                }
-                let int_var = int_var as usize;
-                if int_var < model.len() {
-                    // Read from the model parameter — the authoritative internal
-                    // assignment passed by the caller. This works for both
-                    // get_model() (vals-based) and get_model_from_phases()
-                    // (walk-based) call paths.
-                    *val = model[int_var];
-                }
-            }
+            let mut ext_model = ordinary(self.external_model_admitted(&model, &Ordinary));
 
             // (#8356) Pre-reconstruction diagnostic: verify that the external
             // model satisfies all active clause-DB clauses mapped to external
@@ -424,54 +393,11 @@ impl Solver {
             // When push/pop was used (#5077, #5522): skip scoped clauses,
             // because they may contain scope-selector literals that are
             // no longer asserted after pop().
-            let fail_idx = self.cold.original_ledger.iter_clauses().position(|clause| {
-                // Skip clauses containing scope selector variables.
-                if self.cold.has_ever_scoped {
-                    let has_scope = clause.iter().any(|lit| {
-                        let vi = lit.variable().index();
-                        vi < self.cold.was_scope_selector.len() && self.cold.was_scope_selector[vi]
-                    });
-                    if has_scope {
-                        return false;
-                    }
-                }
-                // #8577: Domain-restricted verification. When active_domain is set
-                // (IC3/PDR domain-restricted BCP), non-domain variables are don't-cares
-                // and may have incorrect values in the model. Domain-restricted BCP
-                // at level >0 only propagates domain variables, so:
-                // - Clauses with ANY non-domain literal may be unsatisfied because the
-                //   non-domain literal wasn't propagated even though a domain literal
-                //   unit-propagated it in full BCP.
-                // - Only clauses where ALL variables are in the domain can be reliably
-                //   checked: the solver decided/propagated all of them.
-                //
-                // This matches the IC3-specific bypass in solve/ic3.rs:297 which
-                // returns the model directly without finalize_sat_model verification,
-                // and the scoped-path domain-aware verification at line 621.
-                if let Some(ref domain) = self.active_domain {
-                    let has_non_domain_var = clause.iter().any(|lit| {
-                        let vi = lit.variable().index();
-                        if vi < self.cold.e2i.len() {
-                            let int_var = self.cold.e2i[vi];
-                            if int_var != compact::UNMAPPED {
-                                let iv = int_var as usize;
-                                iv >= domain.len() || !domain[iv]
-                            } else {
-                                true // Unmapped = non-domain
-                            }
-                        } else {
-                            true // Out-of-range = non-domain
-                        }
-                    });
-                    if has_non_domain_var {
-                        return false; // Has non-domain var; cannot verify reliably.
-                    }
-                }
-                !clause.iter().any(|&lit| {
-                    let vi = lit.variable().index();
-                    vi < ext_model.len() && (ext_model[vi] == lit.is_positive())
-                })
-            });
+            let fail_idx = ordinary(self.first_original_violation_admitted(
+                &ext_model,
+                OriginalDomain::Configured,
+                &Ordinary,
+            ));
             if let Some(fi) = fail_idx {
                 let clause = self.cold.original_ledger.clause(fi);
                 let clause_dimacs: Vec<i32> = clause
@@ -665,16 +591,8 @@ impl Solver {
             // ledger after reconstruction. On failure we return Err so the
             // caller downgrades to Unknown rather than reporting unsound SAT.
             if self.active_domain.is_none() {
-                let mut internal_model = vec![false; self.num_vars];
-                let mut missing_var: Option<(usize, usize)> = None;
-                for (int_var, val) in internal_model.iter_mut().enumerate() {
-                    let ext_var = self.cold.i2e[int_var] as usize;
-                    if ext_var >= ext_model.len() {
-                        missing_var = Some((int_var, ext_var));
-                        break;
-                    }
-                    *val = ext_model[ext_var];
-                }
+                let (internal_model, missing_var) =
+                    ordinary(self.internal_model_admitted(&ext_model, &Ordinary));
                 if let Some((int_var, ext_var)) = missing_var {
                     let detail = format!(
                         "BUG [#8819]: reconstructed SAT model missing external var {ext_var} \
@@ -755,6 +673,10 @@ impl Solver {
 
     #[inline]
     pub(in crate::solver) fn declare_sat_from_model(&mut self, model: Vec<bool>) -> SatResult {
+        if let Some(reason) = self.counted_step_stop_reason() {
+            drop(model);
+            return self.declare_unknown_with_reason(reason);
+        }
         let model = match self.finalize_sat_model(model) {
             Ok(model) => model,
             Err(detail) => {
@@ -807,7 +729,7 @@ impl Solver {
             "solve: sat"
         );
         self.emit_diagnostic_sat_summary(model.len());
-        SatResult::Sat(model)
+        self.finish_counted_sat(SatResult::Sat(model))
     }
 
     #[inline]
@@ -820,6 +742,7 @@ impl Solver {
         &mut self,
         reason: SatUnknownReason,
     ) -> SatResult {
+        self.note_proof_write_failure(reason);
         if ay_core::debug_channel_active(ay_core::DebugChannel::Unknown) {
             let detail_str = self.cold.last_unknown_detail.as_deref().unwrap_or("(none)");
             eprintln!(
@@ -841,6 +764,10 @@ impl Solver {
         &mut self,
         model: Vec<bool>,
     ) -> AssumeResult {
+        if let Some(reason) = self.counted_step_stop_reason() {
+            drop(model);
+            return self.declare_assume_unknown_with_reason(reason);
+        }
         let model = match self.finalize_sat_model(model) {
             Ok(model) => model,
             Err(detail) => {
@@ -878,7 +805,7 @@ impl Solver {
             return self.declare_assume_unknown_with_reason(SatUnknownReason::InvalidSatModel);
         }
         self.emit_diagnostic_sat_summary(model.len());
-        AssumeResult::Sat(model)
+        self.finish_counted_assume(AssumeResult::Sat(model))
     }
 
     #[inline]
@@ -886,9 +813,24 @@ impl Solver {
         &mut self,
         reason: SatUnknownReason,
     ) -> AssumeResult {
+        self.note_proof_write_failure(reason);
         self.cold.last_unknown_reason = Some(reason);
         self.emit_diagnostic_unknown_summary(reason.diagnostic_label());
         AssumeResult::Unknown
+    }
+
+    /// For [`SatUnknownReason::ProofWriteFailure`], record which OS error the
+    /// proof sink reported as the unknown detail, so a caller can name the
+    /// cause (a full disk) instead of a generic "incomplete".
+    fn note_proof_write_failure(&mut self, reason: SatUnknownReason) {
+        if reason == SatUnknownReason::ProofWriteFailure {
+            let detail = self.proof_write_failure_detail();
+            tracing::error!(
+                detail = detail.as_str(),
+                "proof write failed; answering unknown"
+            );
+            self.cold.last_unknown_detail = Some(detail);
+        }
     }
 
     #[inline]

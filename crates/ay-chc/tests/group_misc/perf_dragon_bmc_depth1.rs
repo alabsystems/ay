@@ -90,8 +90,10 @@ fn bounded_depth1_incremental_lane() {
 
     let mut exec = ay_dpll::Executor::new();
     exec.set_timeout(Some(Duration::from_secs(10)));
-    // Mirror the production TS lane (Fix 1): LRA propagation off.
-    exec.set_no_lra_theory_propagation(true);
+    // Mirror the production TS lane (`configure_cex_search_executor`):
+    // BCP-time implied bounds off, every-decision theory branching off.
+    exec.set_no_lra_bcp_implied_bounds(true);
+    exec.set_no_theory_every_decision(true);
     exec_segment(&mut exec, &segments[0]);
 
     // Depth 0 (unsat): THE B1 gate. Lazy arm: 30s timeout; eager: ~30ms.
@@ -149,9 +151,10 @@ fn bounded_depth1_standalone_lane() {
 
     let mut exec = ay_dpll::Executor::new();
     exec.set_timeout(Some(Duration::from_secs(10)));
-    // Mirror the production TS-lane confirmation re-solve (Fix 1):
-    // LRA propagation off on the flat depth-1 query.
-    exec.set_no_lra_theory_propagation(true);
+    // Mirror the production TS-lane confirmation re-solve
+    // (`configure_cex_search_executor`) on the flat depth-1 query.
+    exec.set_no_lra_bcp_implied_bounds(true);
+    exec.set_no_theory_every_decision(true);
     let start = Instant::now();
     let d1 = verdict(&exec_segment(&mut exec, &flat));
     let secs = start.elapsed().as_secs_f64();

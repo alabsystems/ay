@@ -17,6 +17,8 @@ pub(in crate::solver) enum TheoryModelCheck {
     Unknown(SatUnknownReason),
     /// Add clauses and continue solving (#6546).
     AddClauses(Vec<Vec<Literal>>),
+    /// G2: lemmas at the current level, no restart (`extension_effects.rs`).
+    Continue(ExtContinue),
 }
 
 /// Shared interface used by the unified theory/extension CDCL loop.
@@ -79,6 +81,19 @@ pub(in crate::solver) trait TheoryCallback {
     fn check_model(&mut self, _solver: &mut Solver) -> TheoryModelCheck {
         TheoryModelCheck::Sat
     }
+
+    /// G4: the decision to make once the heuristic picked `lit`.
+    fn on_decide(&mut self, _solver: &mut Solver, lit: Literal) -> Literal {
+        lit
+    }
+
+    /// G4: whether `on_learned` wants each learned clause.
+    fn wants_learned(&self) -> bool {
+        false
+    }
+
+    /// G4: a clause conflict analysis learned.
+    fn on_learned(&mut self, _clause: &[Literal]) {}
 
     /// Ask the extension for a decision literal suggestion.
     fn suggest_decision(&self, _solver: &Solver) -> Option<Literal> {
@@ -192,6 +207,10 @@ impl TheoryCallback for ExtensionCallback<'_> {
         if !result.proof_script.is_empty() {
             solver.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
         }
+        // G3 then G1: create every named variable (frozen) before any literal
+        // is tested below; definitions are added even beside a conflict.
+        let has_definitions = !result.definitions.is_empty();
+        solver.apply_extension_growth_and_definitions(&mut result);
 
         if let Some(conflict) = result.conflict {
             // Process any accompanying proof clauses BEFORE returning the
@@ -201,13 +220,11 @@ impl TheoryCallback for ExtensionCallback<'_> {
             // empty clause). Without this, external DRAT checkers cannot verify
             // the derivation because the intermediate clauses are dropped.
             for clause in result.clauses {
-                solver.add_theory_lemma(clause);
+                solver.add_extension_clause(clause, result.clause_origin);
             }
             return TheoryPropResult::Conflict(conflict);
         }
-        let has_work = !result.clauses.is_empty()
-            || !result.propagations.is_empty()
-            || !result.lazy_propagations.is_empty();
+        let has_work = has_definitions || result.has_work();
 
         if solver.cold.trace_ext_conflict && has_work {
             eprintln!(
@@ -253,7 +270,7 @@ impl TheoryCallback for ExtensionCallback<'_> {
                 // handle_ext_conflict to process (backtrack + re-add).
                 return TheoryPropResult::Conflict(clause);
             }
-            solver.add_theory_lemma(clause);
+            solver.add_extension_clause(clause, result.clause_origin);
         }
         // Lightweight theory propagations (#4919): directly enqueue on trail
         // without watch-list overhead. Matches Z3's ctx().assign() pattern.
@@ -301,23 +318,23 @@ impl TheoryCallback for ExtensionCallback<'_> {
         if !result.proof_script.is_empty() {
             solver.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
         }
+        let has_definitions = !result.definitions.is_empty();
+        solver.apply_extension_growth_and_definitions(&mut result);
 
         if let Some(conflict) = result.conflict {
             for clause in result.clauses {
-                solver.add_theory_lemma(clause);
+                solver.add_extension_clause(clause, result.clause_origin);
             }
             return TheoryPropResult::Conflict(conflict);
         }
-        let has_work = !result.clauses.is_empty()
-            || !result.propagations.is_empty()
-            || !result.lazy_propagations.is_empty();
+        let has_work = has_definitions || result.has_work();
 
         for clause in result.clauses {
             let all_false = clause.iter().all(|lit| solver.lit_val(*lit) < 0);
             if all_false && solver.current_decision_level() > 0 {
                 return TheoryPropResult::Conflict(clause);
             }
-            solver.add_theory_lemma(clause);
+            solver.add_extension_clause(clause, result.clause_origin);
         }
         for (clause, propagated) in result.propagations {
             solver.add_theory_propagation_scoped(clause, propagated);
@@ -371,7 +388,21 @@ impl TheoryCallback for ExtensionCallback<'_> {
                 TheoryModelCheck::Unknown(SatUnknownReason::ExtensionUnknown)
             }
             ExtCheckResult::AddClauses(clauses) => TheoryModelCheck::AddClauses(clauses),
+            ExtCheckResult::Continue(cont) => TheoryModelCheck::Continue(cont),
         }
+    }
+
+    fn on_decide(&mut self, solver: &mut Solver, lit: Literal) -> Literal {
+        let alternative = self.ext.on_decide(solver, lit);
+        solver.extension_decision(lit, alternative)
+    }
+
+    fn wants_learned(&self) -> bool {
+        self.ext.wants_learned_clauses()
+    }
+
+    fn on_learned(&mut self, clause: &[Literal]) {
+        self.ext.on_learned(clause);
     }
 
     fn suggest_decision(&self, solver: &Solver) -> Option<Literal> {

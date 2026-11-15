@@ -80,7 +80,7 @@ impl LiaSolver<'_> {
                 continue;
             }
 
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 
@@ -181,7 +181,7 @@ impl LiaSolver<'_> {
             return Some(BigInt::one());
         }
 
-        match self.terms.get(expr) {
+        match self.terms().get(expr) {
             TermData::App(Symbol::Named(name), args) => {
                 if name == "*" && args.len() == 2 {
                     // (* c target) or (* target c)
@@ -204,7 +204,7 @@ impl LiaSolver<'_> {
 
     /// Extract an integer constant from a term, if it is one.
     pub(crate) fn extract_constant(&self, term: TermId) -> Option<BigInt> {
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => Some(n.clone()),
             TermData::Const(Constant::Rational(r)) => {
                 if r.0.denom().is_one() {
@@ -234,7 +234,7 @@ impl LiaSolver<'_> {
                 continue;
             }
 
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 

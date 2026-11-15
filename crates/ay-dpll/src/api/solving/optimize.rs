@@ -34,21 +34,25 @@
 //!
 //! ## Relationship to MaxSMT (soft constraints)
 //!
-//! Objectives and soft constraints (`assert_soft`) are SEPARATE optimization
-//! mechanisms. [`optimize_check`](Solver::optimize_check) optimizes registered
-//! ARITHMETIC objectives; [`check_sat_max`](Solver::check_sat_max) optimizes a
-//! pure API-owned soft set. AY does not yet jointly optimize both classes, so
-//! `optimize_check` fails closed with `Unknown(Unsupported)` whenever API softs
-//! are registered instead of silently discarding them.
+//! Objectives and soft constraints (`assert_soft`) optimize JOINTLY here:
+//! [`optimize_check`](Solver::optimize_check) transplants the API-owned soft
+//! set and the tracked interleaved declaration sequence into the executor
+//! context for one query, so mixed soft + arithmetic problems take the same
+//! joint engine as parsed scripts. [`check_sat_max`](Solver::check_sat_max)
+//! remains the pure-soft entrypoint with flat `MaxSmtResult` accounting.
+//! Mixed OWNERSHIP (API softs alongside parsed `(assert-soft ...)`) still
+//! fails closed with `Unknown(Unsupported)`.
 
 use ay_core::Sort;
 use ay_frontend::{Objective, ObjectiveDirection};
+use num_rational::BigRational;
 
 use crate::api::types::{
     NativeReplayEventKind, ObjectiveValue, SolveResult, SolverError, Term, VerifiedSolveResult,
 };
 use crate::api::Solver;
 use crate::executor::optimization::ObjectiveOutcome;
+use ay_core::time::Instant;
 
 impl Solver {
     /// Register a `maximize` objective on the term `term`.
@@ -101,12 +105,17 @@ impl Solver {
             });
         }
         self.executor.note_api_optimization_mutation();
-        let ctx = self.executor.context_mut_internal();
-        let idx = ctx.objectives().len();
-        ctx.add_objective(Objective {
-            direction,
-            term: term_id,
-        });
+        let idx = {
+            let ctx = self.executor.context_mut_internal();
+            let idx = ctx.objectives().len();
+            ctx.add_objective(Objective {
+                direction,
+                term: term_id,
+            });
+            idx
+        };
+        self.optimization_sequence
+            .push(ay_frontend::ObjectiveStep::Arithmetic(idx));
         Ok(idx)
     }
 
@@ -139,26 +148,44 @@ impl Solver {
         self.clear_last_solve_state(true, true);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
 
-        if !self.soft_constraints.is_empty() {
-            // The executor context does not contain API-owned softs, so entering
-            // its objective optimizer here would silently ignore them and make
-            // the returned model value look like a joint optimum.
-            self.executor
-                .replace_last_result_with_unknown(crate::UnknownReason::Unsupported);
-            self.last_unknown_reason = Some(crate::UnknownReason::Unsupported);
-            return self.finish_verified_result(SolveResult::Unknown);
+        // Mixed ownership (API softs + parsed softs) has no single joint
+        // representation yet; reject it exactly like the feasibility path.
+        if let Some(rejected) = self.reject_mixed_soft_ownership() {
+            return rejected;
         }
 
-        let controls = self.native_publication_controls();
-        if let Some(early) = self.preflight_check(controls) {
+        let controls = self.native_optimization_publication_controls_at(Instant::now());
+        if let Some(early) = self.preflight_check(&controls) {
             return early;
         }
+
+        // Transplant the API-owned soft set and the tracked interleaved
+        // declaration sequence for this one query (the same transaction
+        // shape as `check_sat_max`), so mixed soft + arithmetic problems
+        // take the executor's joint engine with the caller's true order.
+        let transplant = (!self.soft_constraints.is_empty()).then(|| {
+            let native_softs: Vec<ay_frontend::SoftAssertion> = self
+                .soft_constraints
+                .iter()
+                .map(|soft| ay_frontend::SoftAssertion {
+                    term: soft.term.id(),
+                    weight: soft.weight,
+                    id: soft.group.clone(),
+                })
+                .collect();
+            (native_softs, self.optimization_sequence.clone())
+        });
+        let displaced = transplant.as_ref().map(|(native_softs, sequence)| {
+            self.executor
+                .context_mut_internal()
+                .replace_soft_constraints_with_sequence(native_softs.clone(), sequence.clone())
+        });
 
         // Optimization performs many nested feasibility checks, so the native
         // API must install the same interrupt/deadline/memory and clause-budget
         // envelope as `check_sat` around the ENTIRE executor command. The
         // executor's own timeout alone does not carry Solver-level controls.
-        self.install_solve_controls(controls);
+        let deadline_scope = self.install_solve_controls(&controls);
 
         // Drive the executor's SAME `(check-sat)` routing used by SMT-LIB, but
         // do not publish a text result. The unpublished native entrypoint leaves
@@ -166,18 +193,36 @@ impl Solver {
         // of consuming it once for text and then incorrectly requiring it a
         // second time here.
         let exec_result = self.executor.execute_native_optimization_check_sat();
-        let result = match exec_result {
+        let mut result = match exec_result {
             Ok(result) => result,
             Err(e) => {
                 self.record_executor_failure_unknown(&e);
                 SolveResult::Unknown
             }
         };
+
+        // Restore the parsed soft set + sequence on every exit and
+        // authenticate the transplant (as in `check_sat_max`): outcome
+        // indices are interpreted against the caller-owned native set.
+        if let (Some((expected_softs, expected_sequence)), Some((parsed_softs, parsed_sequence))) =
+            (transplant, displaced)
+        {
+            let (installed_softs, installed_sequence) = self
+                .executor
+                .context_mut_internal()
+                .replace_soft_constraints_with_sequence(parsed_softs, parsed_sequence);
+            if installed_softs != expected_softs || installed_sequence != expected_sequence {
+                self.executor
+                    .replace_last_result_with_unknown(crate::UnknownReason::Unsupported);
+                self.last_unknown_reason = Some(crate::UnknownReason::Unsupported);
+                result = SolveResult::Unknown;
+            }
+        }
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(controls);
+            self.classify_unknown_reason(&controls);
         }
         let verified = self.finish_verified_result(result);
-        self.restore_solve_controls(controls);
+        self.restore_solve_controls(&controls, deadline_scope);
         verified
     }
 
@@ -211,6 +256,18 @@ impl Solver {
             ObjectiveOutcome::PosInfinity => Some(ObjectiveValue::PosInfinity),
             ObjectiveOutcome::NegInfinity => Some(ObjectiveValue::NegInfinity),
             ObjectiveOutcome::Unavailable => None,
+        }
+    }
+
+    /// An UNATTAINED optimum of objective `idx` as `(value, eps_coeff)`: the
+    /// optimum is `value + eps_coeff·ε` (z3 reports `3 + -1*epsilon` for
+    /// `maximize x` under `x < 3`). `None` for any other outcome.
+    #[must_use]
+    pub fn get_objective_epsilon(&self, idx: usize) -> Option<(BigRational, BigRational)> {
+        self.executor.context().objectives().get(idx)?;
+        match self.executor.objective_optimum(idx) {
+            ObjectiveOutcome::Epsilon { value, eps_coeff } => Some((value, eps_coeff)),
+            _ => None,
         }
     }
 
@@ -303,11 +360,11 @@ mod tests {
         assert!(!s.executor.last_check_saw_authored_query_authority());
     }
 
-    /// Parsed softs and arithmetic objectives are a composite problem for which
-    /// AY has no joint optimizer. The native unpublished route must preserve
-    /// the text dispatch's fail-closed rejection.
+    /// Parsed softs and arithmetic objectives optimize JOINTLY in
+    /// declaration order through the native route, exactly as the text
+    /// dispatch does (the always-true soft never binds the maximize).
     #[test]
-    fn optimize_rejects_parsed_soft_and_objective_mix() {
+    fn optimize_joint_parsed_soft_and_objective() {
         let mut s = Solver::try_new(Logic::QfLia).unwrap();
         let x = s.declare_const("x", Sort::Int);
         let zero = s.int_const(0);
@@ -325,11 +382,91 @@ mod tests {
         s.parse_smtlib2("(assert-soft true :weight 1)").unwrap();
 
         let result = s.optimize_check();
-        assert!(result.is_unknown());
-        assert_eq!(s.unknown_reason(), Some(crate::UnknownReason::Unsupported));
-        assert!(s.model_for_consumer().is_none());
-        assert_eq!(s.get_objective_value(objective), None);
+        assert!(result.is_sat());
+        assert!(s.model_for_consumer().is_some());
+        assert_eq!(
+            s.get_objective_value(objective),
+            Some(ObjectiveValue::Finite(rat(10)))
+        );
         assert!(s.executor.take_sat_certificate().is_none());
+    }
+
+    /// API-registered softs and arithmetic objectives optimize JOINTLY in
+    /// registration order: whichever is declared first wins outright, and
+    /// the soft accounting describes the joint witness.
+    #[test]
+    fn optimize_joint_api_soft_and_objective_in_registration_order() {
+        let mut s = Solver::try_new(Logic::QfLia).unwrap();
+        let x = s.declare_const("x", Sort::Int);
+        let zero = s.int_const(0);
+        let ten = s.int_const(10);
+        for bound in [s.try_ge(x, zero).unwrap(), s.try_le(x, ten).unwrap()] {
+            s.try_assert_term(bound).unwrap();
+        }
+        // Maximize registered first: x=10; the soft pays its weight 3.
+        let obj = s.maximize(x);
+        let x_is_zero = s.try_eq(x, zero).unwrap();
+        s.assert_soft(x_is_zero, 3, None).unwrap();
+        assert!(s.optimize_check().is_sat());
+        assert_eq!(
+            s.get_objective_value(obj),
+            Some(ObjectiveValue::Finite(rat(10)))
+        );
+        assert_eq!(s.executor.last_maxsmt_outcome(), Some((3, true, &[0][..])));
+
+        // Soft registered first: it is satisfied exactly; maximize is pinned.
+        let mut s = Solver::try_new(Logic::QfLia).unwrap();
+        let x = s.declare_const("x", Sort::Int);
+        let zero = s.int_const(0);
+        let ten = s.int_const(10);
+        for bound in [s.try_ge(x, zero).unwrap(), s.try_le(x, ten).unwrap()] {
+            s.try_assert_term(bound).unwrap();
+        }
+        let x_is_zero = s.try_eq(x, zero).unwrap();
+        s.assert_soft(x_is_zero, 3, Some("g")).unwrap();
+        let obj = s.maximize(x);
+        assert!(s.optimize_check().is_sat());
+        assert_eq!(
+            s.get_objective_value(obj),
+            Some(ObjectiveValue::Finite(rat(0)))
+        );
+        assert_eq!(s.executor.last_maxsmt_outcome(), Some((0, true, &[][..])));
+    }
+
+    /// Joint Pareto through the native API: repeated `optimize_check`
+    /// calls enumerate the front {(x=3, cost 1), (x=0, cost 0)} as a set,
+    /// then exhaustion answers unsat and the cycle restarts.
+    #[test]
+    fn optimize_joint_api_pareto_enumerates_front() {
+        let mut s = Solver::try_new(Logic::QfLia).unwrap();
+        s.set_option(":opt.priority", "pareto");
+        let x = s.declare_const("x", Sort::Int);
+        let zero = s.int_const(0);
+        let three = s.int_const(3);
+        for bound in [s.try_ge(x, zero).unwrap(), s.try_le(x, three).unwrap()] {
+            s.try_assert_term(bound).unwrap();
+        }
+        let obj = s.maximize(x);
+        let x_is_zero = s.try_eq(x, zero).unwrap();
+        s.assert_soft(x_is_zero, 1, Some("A")).unwrap();
+
+        let mut points: Vec<(i64, u64)> = Vec::new();
+        for _ in 0..2 {
+            assert!(s.optimize_check().is_sat());
+            let Some(ObjectiveValue::Finite(value)) = s.get_objective_value(obj) else {
+                panic!("finite objective value expected");
+            };
+            let (cost, optimal, _) = s.executor.last_maxsmt_outcome().unwrap();
+            assert!(optimal);
+            points.push((value.to_integer().try_into().unwrap(), cost));
+        }
+        points.sort_unstable();
+        assert_eq!(points, [(0, 0), (3, 1)]);
+        assert!(s.optimize_check().is_unsat());
+        assert!(
+            s.optimize_check().is_sat(),
+            "cycle restarts after exhaustion"
+        );
     }
 
     /// With parsed softs but no arithmetic objectives, native optimize follows
@@ -688,7 +825,10 @@ mod tests {
         ] {
             s.try_assert_term(term).unwrap();
         }
+        // Two objectives engage the enumerator (a single objective
+        // degenerates to lex in z3 and never holds enumeration state).
         s.maximize(x);
+        s.minimize(x);
         assert!(s.optimize_check().is_sat());
         assert!(s.executor.pareto_state.is_some());
         let incremental_before = s.executor.incremental_mode;

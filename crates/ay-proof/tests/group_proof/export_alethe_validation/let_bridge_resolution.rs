@@ -44,31 +44,12 @@ fn let_bridged_derived_complement_is_accepted_by_carcara() {
     let unbridged = alethe.replacen(canonical, &authored, 1);
     assert_ne!(unbridged, alethe);
 
-    let Some(carcara) = find_carcara() else {
-        eprintln!("carcara not found, skipping external rejection differential");
-        return;
-    };
-    let (problem_path, proof_path) = write_problem_and_proof(
+    // Through the shared runner, so this rejection differential cannot pass
+    // on a document whose verdict is not evidence at all.
+    assert_carcara_verdict(
         "let_bridged_derived_complement_unpatched",
         QF_LIA_LET_BRIDGE_RESOLUTION,
         &unbridged,
-    );
-    let output = Command::new(carcara)
-        .arg("check")
-        .arg("--")
-        .arg(&proof_path)
-        .arg(&problem_path)
-        .output()
-        .expect("run carcara check on the unpatched document");
-    let _ = std::fs::remove_file(&problem_path);
-    let _ = std::fs::remove_file(&proof_path);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stdout.trim(),
         "invalid",
-        "the pre-fix document unexpectedly survived Carcara\nstdout: {stdout}\n\
-         stderr: {stderr}\nproof:\n{unbridged}"
     );
 }

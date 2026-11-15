@@ -15,18 +15,6 @@ fn insert_dimacs_structured_solver_core(
     stats.insert("restarts", solver.num_restarts());
     stats.insert("sat.cold_restarts", solver.num_cold_restarts());
     stats.insert("sat.chrono_bt", solver.num_chrono_backtracks());
-    stats.insert(
-        "sat.approx_bcp_noop_matched",
-        solver.approx_bcp_noop_matched(),
-    );
-    stats.insert(
-        "sat.approx_bcp_conflict_matched",
-        solver.approx_bcp_conflict_matched(),
-    );
-    stats.insert(
-        "sat.approx_bcp_mismatch_detected",
-        solver.approx_bcp_mismatch_detected(),
-    );
     stats.insert("sat.forced_bt", solver.num_forced_backtracks());
     stats.insert("sat.mli_detected", mli_detected);
     stats.insert("sat.mli_reimplied", mli_reimplied);
@@ -35,6 +23,11 @@ fn insert_dimacs_structured_solver_core(
     stats.insert("sat.fixed_vars", solver.num_fixed() as u64);
     stats.insert("sat.original_clauses", solver.num_original_clauses() as u64);
     stats.insert("sat.learned_clauses", solver.num_learned_clauses());
+    let composition = solver.learned_composition();
+    stats.insert("sat.learned_live_hyper", composition.0);
+    stats.insert("sat.learned_live_binary", composition.1);
+    stats.insert("sat.learned_live_short", composition.2);
+    stats.insert("sat.learned_live_long", composition.3);
     insert_dimacs_proof_telemetry(stats, solver, proof, proof_writer_telemetry);
     insert_preprocessing_transaction_telemetry(stats, solver.preprocessing_transaction_stats());
 }
@@ -173,6 +166,7 @@ fn insert_dimacs_structured_lbd(solver: &SatSolver, stats: &mut stats_output::Ru
     if let Some(value) = (lbd_sum * 100).checked_div(lbd_count) {
         stats.insert("sat.avg_lbd_x100", value);
     }
+    stats.insert("sat.learned_literals", solver.learned_literals());
     let buckets = solver.lbd_buckets();
     stats.insert("sat.lbd_1", buckets[0]);
     stats.insert("sat.lbd_2", buckets[1]);
@@ -187,6 +181,75 @@ fn insert_dimacs_structured_lbd(solver: &SatSolver, stats: &mut stats_output::Ru
         "sat.avg_decision_level_x100",
         (solver.avg_decision_level() * 100.0) as u64,
     );
+    let (focused, stable) = solver.sampled_decision_relevance();
+    stats.insert("sat.sampled_conflicts_focused", focused.0);
+    stats.insert("sat.sampled_decisions_focused", focused.1);
+    stats.insert("sat.sampled_relevant_focused", focused.2);
+    stats.insert("sat.sampled_conflicts_stable", stable.0);
+    stats.insert("sat.sampled_decisions_stable", stable.1);
+    stats.insert("sat.sampled_relevant_stable", stable.2);
+    let (focused_src, stable_src) = solver.sampled_decision_sources();
+    stats.insert("sat.sampled_decisions_recent_focused", focused_src.0);
+    stats.insert("sat.sampled_relevant_recent_focused", focused_src.1);
+    stats.insert("sat.sampled_decisions_stale_focused", focused_src.2);
+    stats.insert("sat.sampled_relevant_stale_focused", focused_src.3);
+    stats.insert("sat.sampled_decisions_recent_stable", stable_src.0);
+    stats.insert("sat.sampled_relevant_recent_stable", stable_src.1);
+    stats.insert("sat.sampled_decisions_stale_stable", stable_src.2);
+    stats.insert("sat.sampled_relevant_stale_stable", stable_src.3);
+    let analyzed = solver.sampled_analyzed();
+    stats.insert("sat.sampled_analyzed_focused", analyzed.0);
+    stats.insert("sat.sampled_analyzed_stable", analyzed.1);
+    let trail_comp = solver.sampled_trail_composition();
+    stats.insert("sat.sampled_trail_len_focused", trail_comp.0 .0);
+    stats.insert("sat.sampled_target_set_focused", trail_comp.0 .1);
+    stats.insert("sat.sampled_target_agree_focused", trail_comp.0 .2);
+    stats.insert("sat.sampled_trail_len_stable", trail_comp.1 .0);
+    stats.insert("sat.sampled_target_set_stable", trail_comp.1 .1);
+    stats.insert("sat.sampled_target_agree_stable", trail_comp.1 .2);
+    let descent = solver.descent_histograms();
+    stats.insert("sat.descent_hist_focused_le64", descent.0[0]);
+    stats.insert("sat.descent_hist_focused_65_256", descent.0[1]);
+    stats.insert("sat.descent_hist_focused_257_1024", descent.0[2]);
+    stats.insert("sat.descent_hist_focused_gt1024", descent.0[3]);
+    stats.insert("sat.descent_hist_stable_le64", descent.1[0]);
+    stats.insert("sat.descent_hist_stable_65_256", descent.1[1]);
+    stats.insert("sat.descent_hist_stable_257_1024", descent.1[2]);
+    stats.insert("sat.descent_hist_stable_gt1024", descent.1[3]);
+    let prop_dec = solver.prop_decision_histograms();
+    stats.insert("sat.prop_decision_hist_early_0", prop_dec.0[0]);
+    stats.insert("sat.prop_decision_hist_early_1_16", prop_dec.0[1]);
+    stats.insert("sat.prop_decision_hist_early_17_64", prop_dec.0[2]);
+    stats.insert("sat.prop_decision_hist_early_65_256", prop_dec.0[3]);
+    stats.insert("sat.prop_decision_hist_early_257_1024", prop_dec.0[4]);
+    stats.insert("sat.prop_decision_hist_early_gt1024", prop_dec.0[5]);
+    stats.insert("sat.prop_decision_hist_late_0", prop_dec.1[0]);
+    stats.insert("sat.prop_decision_hist_late_1_16", prop_dec.1[1]);
+    stats.insert("sat.prop_decision_hist_late_17_64", prop_dec.1[2]);
+    stats.insert("sat.prop_decision_hist_late_65_256", prop_dec.1[3]);
+    stats.insert("sat.prop_decision_hist_late_257_1024", prop_dec.1[4]);
+    stats.insert("sat.prop_decision_hist_late_gt1024", prop_dec.1[5]);
+    let zero_split = solver.prop_zero_split();
+    stats.insert("sat.prop_zero_level_0_8", zero_split.0[0]);
+    stats.insert("sat.prop_zero_level_9_64", zero_split.0[1]);
+    stats.insert("sat.prop_zero_level_65_512", zero_split.0[2]);
+    stats.insert("sat.prop_zero_level_gt512", zero_split.0[3]);
+    stats.insert("sat.prop_zero_focused", zero_split.1[0]);
+    stats.insert("sat.prop_zero_stable", zero_split.1[1]);
+    stats.insert("sat.decisions_level_0_8", zero_split.2[0]);
+    stats.insert("sat.decisions_level_9_64", zero_split.2[1]);
+    stats.insert("sat.decisions_level_65_512", zero_split.2[2]);
+    stats.insert("sat.decisions_level_gt512", zero_split.2[3]);
+    stats.insert(
+        "sat.decisions_with_pending_props",
+        solver.decisions_with_pending_props(),
+    );
+    let (first_dec, first_dec_len) = solver.first_search_decisions();
+    stats.insert("sat.first_search_dec_len", first_dec_len);
+    for pair in 0..64 {
+        let packed = u64::from(first_dec[2 * pair]) | (u64::from(first_dec[2 * pair + 1]) << 32);
+        stats.insert(&format!("sat.first_search_dec_pair_{pair}"), packed);
+    }
 }
 
 fn insert_dimacs_structured_restart_routes(

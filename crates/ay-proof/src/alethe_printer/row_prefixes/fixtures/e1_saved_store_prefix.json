@@ -1,0 +1,12 @@
+{
+  "scope": "exact retained store subtree and prelude, new identity assertion solely to retain typed terms; not original E1 theorem",
+  "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+  "source_bytes": 1073945,
+  "prefix_source_byte_start": 2139,
+  "prefix_source_byte_end_exclusive": 15081,
+  "prefix_bytes": 12942,
+  "prefix_sha256": "892109e5750f8fe76b547b41d6fbc4d8f7785bd0ad92e6862b5a53300c124698",
+  "stores": 80,
+  "fixture_bytes": 26741,
+  "fixture_sha256": "b09c90fec1066817cea7b69e251e6959a218e365a504730c9850a0d3c1271bce"
+}

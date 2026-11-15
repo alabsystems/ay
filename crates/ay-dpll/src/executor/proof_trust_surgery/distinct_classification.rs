@@ -223,7 +223,21 @@ impl Executor {
                         // for the assume and bridged per-literal.
                         let Some(lits) = taut_surface::or_perm_lits(&self.ctx.terms, raw, conj)
                         else {
-                            return Ok(None);
+                            // Elaboration folded the raw conjunct onto the
+                            // canonical one (closed subterms, `(= p false)`,
+                            // `false` disjuncts): transport it with checked
+                            // steps, or keep the assume as-is.
+                            let Some(plan) = self.plan_conjunct_transport(raw, conj) else {
+                                return Ok(None);
+                            };
+                            units.push(AndDistinctUnit {
+                                pos,
+                                raw,
+                                kind: AndDistinctKind::Transport(Box::new(plan)),
+                            });
+                            raws.push(raw);
+                            k += 1;
+                            continue;
                         };
                         units.push(AndDistinctUnit {
                             pos,
@@ -234,12 +248,24 @@ impl Executor {
                         k += 1;
                         continue;
                     }
-                    units.push(AndDistinctUnit {
-                        pos,
-                        raw: conj,
-                        kind: AndDistinctKind::Plain,
-                    });
-                    raws.push(conj);
+                    // The assumed conjunction must be the exact raw source
+                    // term (it is admitted as authored problem provenance),
+                    // so a flipped conjunct keeps its FILE orientation and
+                    // is bridged to the canonical literal. Only a top-level
+                    // flip has a certified bridge; a nested one declines.
+                    let kind = if raw == conj {
+                        AndDistinctKind::Plain
+                    } else if conjunct_transport::is_top_level_equality_flip(
+                        &self.ctx.terms,
+                        raw,
+                        conj,
+                    ) {
+                        AndDistinctKind::EqFlip
+                    } else {
+                        return Ok(None);
+                    };
+                    units.push(AndDistinctUnit { pos, raw, kind });
+                    raws.push(raw);
                 }
                 k += 1;
                 continue;

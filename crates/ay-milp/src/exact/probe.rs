@@ -268,10 +268,15 @@ fn rim() {
     };
     let form = lp.form_label();
     let switch_at = SWITCH_AT.with(std::cell::Cell::get);
+    // Whether the RIM_SECS wall backstop had passed when the solve returned:
+    // milp_rim_gate calls a solve short of an optimum that ended past it COULD
+    // NOT RUN, since the clock, not the pivot counts, may have ended it.
+    let deadline_passed = budget.deadline.is_some_and(|at| Instant::now() >= at);
     match out {
         LpOptimum::Optimal { value, multipliers } => {
             eprintln!(
-                "RIMRESULT inst={name} status=OPTIMAL form={form} switch_at={switch_at} phase1={feas_label} \
+                "RIMRESULT inst={name} status=OPTIMAL form={form} switch_at={switch_at} \
+                 deadline_passed={deadline_passed} phase1={feas_label} \
                  p1_pivots={p1_pivots} pivots={piv} entries_written={w} inline_i64={share:.2}% \
                  build={:.3}s p1={:.3}s solve={:.3}s mult={} value={value}",
                 build.as_secs_f64(),
@@ -281,7 +286,8 @@ fn rim() {
             );
         }
         other => eprintln!(
-            "RIMRESULT inst={name} status=NONOPTIMAL form={form} switch_at={switch_at} phase1={feas_label} \
+            "RIMRESULT inst={name} status=NONOPTIMAL form={form} switch_at={switch_at} \
+             deadline_passed={deadline_passed} phase1={feas_label} \
              p1_pivots={p1_pivots} pivots={piv} entries_written={w} inline_i64={share:.2}% \
              build={:.3}s p1={:.3}s solve={:.3}s detail={other:?}",
             build.as_secs_f64(),

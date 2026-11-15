@@ -13,19 +13,24 @@
 //! while model-checking a byte-loop parser proof: the cost was entirely in
 //! `Expr`'s Display, not in building the (polynomially small) DAG.
 //!
-//! [`Expr::to_smtlib_shared`] prints the same expression with each non-trivial
-//! subterm that is referenced more than once hoisted into a `let` binding, so
-//! the output is linear in the number of DISTINCT nodes. SMT-LIB `let` is pure
-//! (transparent) sharing, so the result is logically identical to `Display`.
+//! [`Expr::to_smtlib_shared`] shares repeated subterms within a lexical region.
+//! Quantifiers are opaque to their enclosing region; their matrices start new
+//! regions during Display. No binder-dependent subterm is moved across a
+//! quantifier. A repeated whole quantifier can still be shared as one term.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
 use super::fold::rebuild_with_children;
-use super::{Expr, ExprValue};
-use crate::constraint::Constraint;
-use crate::program::AYProgram;
+use super::Expr;
+
+mod estimate;
+use crate::sort::Sort;
+
+mod scope;
+#[cfg(test)]
+mod scope_tests;
 
 /// A subterm is only worth a `let` binding when its unfolded (tree) size is at
 /// least this large. Tiny shared terms are cheaper to re-print than to name,
@@ -62,21 +67,29 @@ fn is_compound(e: &Expr) -> bool {
 impl Expr {
     /// Render this expression as SMT-LIB, hoisting subterms that are shared (by
     /// `Arc` identity) more than once — and large enough to be worth it — into
-    /// `let` bindings. Semantically identical to `Display`, but its size and
-    /// running time are linear in the number of distinct nodes rather than the
-    /// unfolded tree size.
+    /// `let` bindings in the same lexical region. Quantified matrices are
+    /// rendered in separate regions, never hoisted through their binders.
+    /// Repeated whole quantifiers are shared even below the ordinary threshold.
+    /// Namespace scans include nested regions; this is not a global time or
+    /// output-byte bound. Trigger terms retain ordinary Display rendering.
     ///
     /// When nothing is worth sharing the output is byte-for-byte identical to
     /// `format!("{self}")`.
     #[must_use]
     pub fn to_smtlib_shared(&self) -> String {
-        // Pass 1: reference counts + saturating tree sizes + free-var names.
-        // Memoised by node identity, so it is O(distinct nodes), never the
-        // exponential tree.
+        self.to_smtlib_shared_scoped(&[])
+    }
+
+    /// Matrix-only entry: preserve enclosing binder names even when unused in
+    /// this matrix. No public API or global serializer state is introduced.
+    pub(super) fn to_smtlib_shared_scoped(&self, binders: &[(String, Sort)]) -> String {
+        // Names hidden below quantifier barriers still forbid enclosing lets.
+        // Each census is iterative and visits each distinct node/sort once.
+        let free_vars = scope::reserved_names(self, binders);
+        // Pass 1: region-local reference counts and saturating tree sizes.
         let mut refs: HashMap<usize, u32> = HashMap::new();
         let mut size: HashMap<usize, u64> = HashMap::new();
-        let mut free_vars: HashSet<String> = HashSet::new();
-        count_refs(self, &mut refs, &mut size, &mut free_vars);
+        count_refs(self, &mut refs, &mut size);
 
         let shareable = |e: &Self| -> bool {
             let id = node_id(e);
@@ -126,27 +139,24 @@ impl Expr {
     }
 }
 
-/// Count references to each distinct node, its saturating tree size, and the
-/// free variable names (so generated let-names can avoid colliding with them).
-fn count_refs(
-    e: &Expr,
-    refs: &mut HashMap<usize, u32>,
-    size: &mut HashMap<usize, u64>,
-    free_vars: &mut HashSet<String>,
-) {
+/// Count references and tree sizes in one region. A quantified node contributes
+/// the threshold, so sharing repeated whole quantifiers prevents nested DAGs
+/// from doubling, but its body/triggers never contribute outer references.
+fn count_refs(e: &Expr, refs: &mut HashMap<usize, u32>, size: &mut HashMap<usize, u64>) {
     stacker::maybe_grow(SHARE_STACK_RED_ZONE, SHARE_STACK_SIZE, || {
-        if let ExprValue::Var { name } = e.value.as_ref() {
-            free_vars.insert(name.clone());
-        }
         let id = node_id(e);
         let c = refs.entry(id).or_insert(0);
         *c += 1;
         if *c > 1 {
             return; // already descended on the first visit; size already recorded
         }
+        if scope::is_barrier(e) {
+            size.insert(id, SHARE_MIN_TREE_SIZE);
+            return;
+        }
         let mut sz: u64 = 1;
         for ch in e.children() {
-            count_refs(ch, refs, size, free_vars);
+            count_refs(ch, refs, size);
             sz = sz.saturating_add(size.get(&node_id(ch)).copied().unwrap_or(1));
         }
         size.insert(id, sz.min(TREE_SIZE_CAP));
@@ -170,8 +180,10 @@ fn assign_names(
         if !visited.insert(id) {
             return;
         }
-        for ch in e.children() {
-            assign_names(ch, shareable, names, order, visited, counter, free_vars);
+        if !scope::is_barrier(e) {
+            for ch in e.children() {
+                assign_names(ch, shareable, names, order, visited, counter, free_vars);
+            }
         }
         if shareable(e) {
             let name = fresh_name(counter, free_vars);
@@ -203,6 +215,9 @@ fn shallow(e: &Expr, names: &HashMap<usize, String>, memo: &mut HashMap<usize, E
         if let Some(name) = names.get(&id) {
             return Expr::var(name.clone(), e.sort().clone());
         }
+        if scope::is_barrier(e) {
+            return e.clone();
+        }
         if let Some(m) = memo.get(&id) {
             return m.clone();
         }
@@ -221,6 +236,9 @@ fn shallow(e: &Expr, names: &HashMap<usize, String>, memo: &mut HashMap<usize, E
 /// its children rendered shallowly. The node itself keeps its operator (it is
 /// what we are defining / the body), only its sub-subterms are shared away.
 fn define(s: &Expr, names: &HashMap<usize, String>, memo: &mut HashMap<usize, Expr>) -> Expr {
+    if scope::is_barrier(s) {
+        return s.clone();
+    }
     let new_children: Vec<Expr> = s.children().map(|c| shallow(c, names, memo)).collect();
     if new_children.is_empty() {
         s.clone()
@@ -229,77 +247,11 @@ fn define(s: &Expr, names: &HashMap<usize, String>, memo: &mut HashMap<usize, Ex
     }
 }
 
-/// Count the distinct nodes (by `Arc` identity) reachable from `e`, adding them
-/// to `seen`, stopping early once `seen` reaches `cap`. This is the size of the
-/// SHARED serialization (what `to_smtlib_shared` emits), NOT the exponential
-/// unfolded tree — so it is safe to call on the very DAGs that would blow up if
-/// printed. O(distinct nodes), guarded against deep recursion.
-fn count_distinct_into(e: &Expr, seen: &mut HashSet<usize>, cap: usize) {
-    if seen.len() >= cap {
-        return;
-    }
-    stacker::maybe_grow(SHARE_STACK_RED_ZONE, SHARE_STACK_SIZE, || {
-        if !seen.insert(node_id(e)) {
-            return;
-        }
-        for ch in e.children() {
-            if seen.len() >= cap {
-                break;
-            }
-            count_distinct_into(ch, seen, cap);
-        }
-    });
-}
-
-/// The expressions a command embeds at top level (the ones whose serialization
-/// can be large). Non-term commands (declarations, push/pop, check-sat, …) embed
-/// none. Kept in sync with `Constraint`'s `Display`.
-fn constraint_exprs(c: &Constraint) -> Vec<&Expr> {
-    match c {
-        Constraint::Assert { expr, .. } | Constraint::SoftAssert { expr, .. } => vec![expr],
-        Constraint::DefineFun { body, .. } => vec![body],
-        Constraint::Rule {
-            head: Some(head),
-            body,
-        } => vec![body, head],
-        Constraint::Rule { head: None, body } => vec![body],
-        Constraint::Query(rel) => vec![rel],
-        Constraint::Maximize(e) | Constraint::Minimize(e) => vec![e],
-        Constraint::CheckSatAssuming(es) | Constraint::GetValue(es) => es.iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-impl AYProgram {
-    /// A saturating estimate of this program's serialized size, measured in
-    /// distinct SMT-LIB term nodes across all commands (subterms shared by `Arc`
-    /// identity within a command are counted once, mirroring how `Display` now
-    /// serializes them via `let`). Returns as soon as the count reaches `cap`, so
-    /// it is cheap even on a program whose unfolded form would be astronomically
-    /// large.
-    ///
-    /// Consumers (e.g. a model checker writing `.smt2` files) use this to fail
-    /// closed — report the harness as resource-exhausted/inconclusive — BEFORE
-    /// materializing a pathologically large serialization and risking OOM, rather
-    /// than after.
-    #[must_use]
-    pub fn serialized_node_estimate(&self, cap: usize) -> usize {
-        let mut seen: HashSet<usize> = HashSet::new();
-        for c in self.commands() {
-            for e in constraint_exprs(c) {
-                count_distinct_into(e, &mut seen, cap);
-                if seen.len() >= cap {
-                    return cap;
-                }
-            }
-        }
-        seen.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::Constraint;
+    use crate::program::AYProgram;
     use crate::sort::Sort;
 
     /// The whole point: an expression whose DAG is small but whose unfolded tree

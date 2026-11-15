@@ -13,6 +13,9 @@ use crate::api::types::SolverError;
 use crate::api::*;
 use num_bigint::BigInt;
 
+mod binary128;
+mod wide_foreign;
+
 // --- Positive: term construction produces correct sort ---
 
 #[test]
@@ -499,31 +502,43 @@ fn test_fp_to_ieee_bv_wrong_sort() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn float128_high_fraction_bit_fails_closed_before_model_extraction() {
-    // Float128 has 112 explicitly stored fraction bits, while the current
-    // concrete model stores that field in u64. Exercise a bit above 63 so a
-    // missing preflight would shift/truncate in `extract_fp_model_from_bits`.
+fn custom_fp_high_fraction_bit_survives_validated_model_extraction() {
+    // This format fits the checked carrier. Preserve the high fraction bit
+    // through actual solving and public model evaluation, without narrowing.
     let mut solver = Solver::new(Logic::QfBvfp);
-    let x = solver.declare_const("wide_x", Sort::FloatingPoint(15, 113));
+    let x = solver.declare_const("wide_x", Sort::FloatingPoint(15, 114));
     let high_fraction = BigInt::from(1u8) << 100usize;
     let value = solver
-        .try_fp_const_from_bits_bigint(&high_fraction, 15, 113)
-        .expect("Float128 term construction remains supported");
+        .try_fp_const_from_bits_bigint(&high_fraction, 15, 114)
+        .expect("all individual fields fit the checked carrier");
     let equality = solver.eq(x, value);
     solver.assert_term(equality);
 
-    assert_eq!(solver.check_sat(), SolveResult::Unknown);
-    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+    assert_eq!(
+        solver.try_get_value(x).unwrap().as_fp_wide(),
+        Some((false, 0, 1u128 << 100, 15, 114))
+    );
 }
 
 #[test]
 fn wide_fp_model_boundary_scans_unused_nested_declaration_sort() {
     // Model completion enumerates unused declarations too. Keep the FP sort
     // below no asserted term and nest it so a root-only scan cannot pass.
-    let mut solver = Solver::new(Logic::All);
-    let nested = Sort::array(Sort::Int, Sort::seq(Sort::FloatingPoint(15, 113)));
-    let _array = solver.declare_const("wide_fp_array", nested);
-
-    assert_eq!(solver.check_sat(), SolveResult::Unknown);
-    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
+    for (sb, supported) in [
+        (129, true),
+        (200, true),
+        (ay_fp::MAX_ENCODING_SIGNIFICAND_BITS + 1, false),
+    ] {
+        let mut solver = Solver::new(Logic::All);
+        let nested = Sort::array(Sort::Int, Sort::seq(Sort::FloatingPoint(15, sb)));
+        let _array = solver.declare_const("wide_fp_array", nested);
+        if supported {
+            assert_eq!(solver.check_sat(), SolveResult::Sat);
+            assert!(solver.try_get_model_for_consumer().is_ok());
+        } else {
+            assert_eq!(solver.check_sat(), SolveResult::Unknown);
+            assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
+        }
+    }
 }

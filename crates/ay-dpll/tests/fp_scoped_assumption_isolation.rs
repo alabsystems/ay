@@ -9,8 +9,8 @@
 //! An assumption must constrain ONLY the query it was given to. This file exists
 //! because the FP route reaches that guarantee differently from every other lane,
 //! and because grep shows the existing `check-sat-assuming` tests
-//! (`sat_chokepoint_repros`, `sat_chokepoint_conformance`,
-//! `unsat_chokepoint_conformance`) contain no FP at all — so the FP assumption
+//! (`sat_chokepoint_repros`, `unsat_chokepoint_conformance`) contain no FP
+//! at all — so the FP assumption
 //! path had zero coverage.
 //!
 //! `solve_fp_with_scoped_assumptions` (`executor/check_sat_assuming.rs`) does not

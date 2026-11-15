@@ -74,6 +74,28 @@ fn is_skolem_antisymmetry_split(exec: &ay_dpll::Executor, term: TermId) -> bool 
         })
 }
 
+/// Owner decision D7 (2026-09-22): the export renders what the strict checker
+/// accepted for EVERY sort, and DISCLOSES that pinned Carcara cannot parse
+/// `unsupported_sort` instead of refusing the document. Between 2026-08-30
+/// (`c93a232b2`) and D7 the export in [`assert_proof_authority`] was refused,
+/// so every Seq-carrying obligation reached Trust as `Unknown`.
+fn assert_unsupported_surface_disclosed(
+    exec: &ay_dpll::Executor,
+    label: &str,
+    unsupported_sort: &str,
+) {
+    let surface = exec
+        .last_unsat_proof_carcara_surface()
+        .expect("boundary UNSAT must retain its proof for the surface verdict");
+    assert!(
+        surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains(unsupported_sort)),
+        "{label}: the artifact must disclose sort {unsupported_sort} as outside pinned \
+         Carcara's grammar, got {surface}"
+    );
+}
+
 fn assert_proof_authority(exec: &ay_dpll::Executor, label: &str) {
     let proof = exec
         .last_proof()
@@ -174,7 +196,9 @@ fn assert_proof_authority(exec: &ay_dpll::Executor, label: &str) {
     );
 }
 
-fn assert_unsat_with_certified_proof(smt: &str, label: &str) {
+/// `unsupported_sort` is the sort the proof-mode export must disclose as
+/// outside pinned Carcara's grammar (D7): `(Seq Int)` for every fixture here.
+fn assert_unsat_with_certified_proof(smt: &str, label: &str, unsupported_sort: &str) {
     // Exercise proof mode directly as well as the default no-proof API. The
     // latter internally corroborates non-string-Seq UNSAT under proof mode, but
     // this direct lane also pins proof construction and checking itself.
@@ -188,6 +212,7 @@ fn assert_unsat_with_certified_proof(smt: &str, label: &str) {
         "{label} (proof mode): must NOT return sat, got {proof_results:?}"
     );
     assert_proof_authority(&exec, label);
+    assert_unsupported_surface_disclosed(&exec, label, unsupported_sort);
 
     assert_unsat(smt, label);
 }
@@ -245,7 +270,7 @@ fn seq_boundary_index_pin_discharges_unsat() {
             (=> (and (<= len i) (< i (+ len 1))) (entailed (seq.nth db2 i))))))
         (check-sat)
     "#;
-    assert_unsat_with_certified_proof(smt, "seq_boundary_index_pin");
+    assert_unsat_with_certified_proof(smt, "seq_boundary_index_pin", "(Seq Int)");
 }
 
 /// Same boundary pin over an SMT array carrier (`select` / opaque element fact).
@@ -340,7 +365,7 @@ fn seq_boundary_index_pin_separate_len_var_discharges_unsat() {
             (=> (and (<= len i) (< i new_len)) (entailed (seq.nth db2 i))))))
         (check-sat)
     "#;
-    assert_unsat_with_certified_proof(smt, "seq_boundary_index_pin_separate_len_var");
+    assert_unsat_with_certified_proof(smt, "seq_boundary_index_pin_separate_len_var", "(Seq Int)");
 }
 
 // ===========================================================================

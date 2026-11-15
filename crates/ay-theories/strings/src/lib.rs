@@ -36,8 +36,6 @@ mod state;
 mod state_query;
 pub mod term_regex;
 mod theory_impl;
-#[cfg(kani)]
-mod verification;
 /// Bounded Nielsen-transform word-equation solver (Track A3 M1).
 ///
 /// A standalone decision procedure for conjunctions of word equations over

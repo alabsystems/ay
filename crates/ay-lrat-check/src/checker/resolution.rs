@@ -29,15 +29,15 @@ impl LratChecker {
     ///
     /// Only takes positive (RUP) hints. RAT witnesses are verified separately.
     pub(super) fn check_resolution(&mut self, clause: &[Literal], hints: &[i64]) -> bool {
-        if hints.is_empty() {
+        // The resolution chain is applied from the last hint backward: the
+        // last hint seeds the resolvent and `chain` (every earlier hint, in
+        // order) is walked in reverse.
+        let Some((&last_hint, chain)) = hints.split_last() else {
             // Tautological clause — no chain needed.
             return true;
-        }
+        };
 
         // Last hint must be positive (a clause ID, not an ER marker).
-        let last_hint = *hints
-            .last()
-            .expect("invariant: non-empty hints checked above");
         if last_hint < 0 {
             return false;
         }
@@ -74,7 +74,7 @@ impl LratChecker {
 
         // Phase 2: Walk hints from second-to-last backward to first.
         // For each literal: if ~lit is in resolvent, cancel both; else add lit.
-        for &hint_id in hints[..hints.len() - 1].iter().rev() {
+        for &hint_id in chain.iter().rev() {
             if hint_id < 0 {
                 self.clear_checked_stack();
                 return false;

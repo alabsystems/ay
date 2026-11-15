@@ -64,7 +64,7 @@ That generated result is not shipped as benchmark evidence. Every line has
 Regenerate with:
 
 ```bash
-cargo run --example baseline_dataset -p ay-proof-complexity --release
+targo --unverified run --example baseline_dataset -p ay-proof-complexity --release
 ```
 
 The generator is deterministic (seeded), so a given source revision produces

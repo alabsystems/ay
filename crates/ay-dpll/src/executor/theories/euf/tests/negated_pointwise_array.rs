@@ -28,7 +28,7 @@ fn forall_equality_publishes_only_with_exact_rewrite_and_model_authority() {
         "different constant arrays witness the negated pointwise equality"
     );
     assert!(exec.was_model_validated());
-    let roots = exec.independent_gate_query_roots();
+    let roots = exec.independent_gate_query_roots().unwrap();
     assert_eq!(
         roots.len(),
         1,

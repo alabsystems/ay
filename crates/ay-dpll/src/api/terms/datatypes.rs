@@ -423,6 +423,22 @@ impl Solver {
             })
     }
 
+    /// The datatype and the selector names (in field order) of the datatype
+    /// constructor whose term symbol is `name` (an application's operator, or
+    /// a nullary constructor's variable, as [`Self::term_kind`] reports it);
+    /// `None` when `name` is not a constructor. A nullary constructor has no
+    /// selectors.
+    #[must_use]
+    pub fn constructor_selector_names(&self, name: &str) -> Option<(String, Vec<String>)> {
+        let ctx = self.executor.context();
+        let (datatype, _) = ctx.is_constructor(name)?;
+        let selectors = ctx
+            .constructor_selectors(name)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        Some((datatype, selectors))
+    }
+
     /// Try to build a datatype selector (field access) term.
     ///
     /// Fallible version of [`datatype_selector`]. Returns an error instead
@@ -522,10 +538,14 @@ impl Solver {
             });
         }
 
-        let term = self.terms_mut().mk_app(
-            Symbol::Named(selector_identity.into()),
-            vec![expr],
-            expected_sort,
+        // The elaborator's own selector builder: `(sel (C a..))` folds to the
+        // stored field (distributed through `ite`), exactly as the surface
+        // spelling elaborates, so a natively built selector application is
+        // the term `try_assert_term_with_source` reconstructs from its text.
+        let term = self.executor.context_mut_internal().mk_datatype_selector(
+            &selector_identity,
+            &expected_sort,
+            expr,
         );
         Ok(self.wrap_term(term))
     }
@@ -607,11 +627,34 @@ impl Solver {
             });
         }
 
-        let term = self.terms_mut().mk_app(
-            Symbol::Named(tester_identity.into()),
-            vec![expr],
-            Sort::Bool,
-        );
+        // Build exactly what a surface tester application elaborates to: over
+        // a LITERAL constructor the tester folds to a Boolean constant by
+        // distinctness; anything else is the `is-<ctor>` application under the
+        // tester's registered identity.
+        //
+        // The SOLE-CONSTRUCTOR fold is deliberately NOT applied. It is sound,
+        // and `elaborate_indexed_app` applies it to the standard
+        // `((_ is C) e)` spelling, but it discards the scrutinee — and a
+        // discarded scrutinee is one the datatype model collector never
+        // observes, which costs a class its
+        // `ConstructorForceOrigin::PositiveTester` and its authored W6
+        // array-field authorization. Folding here would additionally refuse
+        // the non-standard named `(is-C e)` spelling, which `elaborate_app`
+        // keeps as an application, for a query that authored it. So over an
+        // OPAQUE scrutinee the native tester is the application both it and
+        // `(is-C e)` name; `((_ is C) e)` over a single-constructor datatype
+        // elaborates to `true` and does not reconstruct it, exactly as on
+        // origin/main. `test_datatype_tester_spellings` pins every case.
+        let ctx = self.executor.context_mut_internal();
+        let term = if let Some(ctor_identity) = tester_identity.strip_prefix("is-") {
+            ctx.mk_datatype_tester(ctor_identity, expr)
+        } else {
+            ctx.terms.mk_app(
+                Symbol::Named(tester_identity.into()),
+                vec![expr],
+                Sort::Bool,
+            )
+        };
         Ok(self.wrap_term(term))
     }
 }

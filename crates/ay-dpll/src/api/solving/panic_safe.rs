@@ -12,10 +12,51 @@ use crate::api::types::{
     AssumptionSolveDetails, SolveDetails, SolverError, Term, VerifiedSolveResult,
 };
 use crate::api::Solver;
+use crate::UnknownReason;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Inject an unwind after a solve has recorded its provisional result but
+    /// before the fallible API returns it. Scoped to one solver so a nested
+    /// probe cannot accidentally consume the test hook.
+    static PANIC_AFTER_SOLVE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
 impl Solver {
-    /// Convert an infallible solve's recorded artifact-export failure back into
-    /// a typed error for the `try_check_sat*` contract.
+    /// A caught panic is not a decision result. Retire even a result recorded
+    /// just before the unwind, together with every model/proof/core capability.
+    fn catch_solve_panic<T>(
+        &mut self,
+        solve: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, SolverError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = solve(self);
+            #[cfg(test)]
+            PANIC_AFTER_SOLVE.with(|armed| {
+                if armed.get() == Some(self as *const Self as usize) {
+                    armed.set(None);
+                    panic!("injected panic after solve result");
+                }
+            });
+            result
+        })) {
+            Ok(result) => Ok(result),
+            Err(payload) => {
+                let message = panic_payload_to_string(&*payload);
+                self.executor
+                    .replace_last_result_with_unknown(UnknownReason::InternalError);
+                self.last_assumptions = None;
+                self.last_unknown_reason = Some(UnknownReason::InternalError);
+                self.last_artifact_export_failure = None;
+                self.last_model_extraction_failure = None;
+                self.last_executor_error = Some(format!("solver panic: {message}"));
+                Err(SolverError::SolverPanic(message))
+            }
+        }
+    }
+
+    /// Convert an infallible solve's recorded terminal extraction/artifact
+    /// refusal back into a typed error for the `try_check_sat*` contract.
     fn fail_on_artifact_export<T>(&self, value: T) -> Result<T, SolverError> {
         if let Some(error) = self.last_artifact_export_error() {
             Err(error)
@@ -51,8 +92,7 @@ impl Solver {
     ///
     /// [`check_sat`]: Solver::check_sat
     pub fn try_check_sat(&mut self) -> Result<VerifiedSolveResult, SolverError> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.check_sat()))
-            .map_err(|e| SolverError::SolverPanic(panic_payload_to_string(&*e)))?;
+        let result = self.catch_solve_panic(Self::check_sat)?;
         self.fail_on_artifact_export(result)
     }
 
@@ -85,10 +125,7 @@ impl Solver {
         assumptions: &[Term],
     ) -> Result<VerifiedSolveResult, SolverError> {
         self.resolve_terms("check_sat_assuming", assumptions)?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.check_sat_assuming(assumptions)
-        }))
-        .map_err(|e| SolverError::SolverPanic(panic_payload_to_string(&*e)))?;
+        let result = self.catch_solve_panic(|solver| solver.check_sat_assuming(assumptions))?;
         self.fail_on_artifact_export(result)
     }
 
@@ -107,9 +144,9 @@ impl Solver {
         // leave its temporary override installed on the poisoned solver.
         let saved = self.timeout;
         self.timeout = Some(timeout);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.check_sat()));
+        let outcome = self.catch_solve_panic(Self::check_sat);
         self.timeout = saved;
-        let result = outcome.map_err(|e| SolverError::SolverPanic(panic_payload_to_string(&*e)))?;
+        let result = outcome?;
         self.fail_on_artifact_export(result)
     }
 
@@ -120,10 +157,7 @@ impl Solver {
     ///
     /// [`check_sat_with_details`]: Solver::check_sat_with_details
     pub fn try_check_sat_with_details(&mut self) -> Result<SolveDetails, SolverError> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.check_sat_with_details()
-        }))
-        .map_err(|e| SolverError::SolverPanic(panic_payload_to_string(&*e)))?;
+        let result = self.catch_solve_panic(Self::check_sat_with_details)?;
         self.fail_on_artifact_export(result)
     }
 
@@ -139,10 +173,14 @@ impl Solver {
         assumptions: &[Term],
     ) -> Result<AssumptionSolveDetails, SolverError> {
         self.resolve_terms("check_sat_assuming_with_details", assumptions)?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.check_sat_assuming_with_details(assumptions)
-        }))
-        .map_err(|e| SolverError::SolverPanic(panic_payload_to_string(&*e)))?;
+        let result =
+            self.catch_solve_panic(|solver| solver.check_sat_assuming_with_details(assumptions))?;
         self.fail_on_artifact_export(result)
     }
 }
+
+#[cfg(test)]
+mod model_extraction_tests;
+#[cfg(test)]
+#[path = "panic_safe/tests.rs"]
+mod tests;

@@ -16,8 +16,8 @@ use ay_core::{quote_symbol, string_literal, Sort, TermId};
 use num_bigint::BigInt;
 
 use crate::executor_format::{
-    format_bigint, format_bitvec, format_default_value_surface, format_model_atom_surface,
-    format_rational, format_real, format_sort_surface,
+    format_bigint, format_bitvec, format_model_atom_surface, format_rational, format_real,
+    format_sort_surface,
 };
 
 use super::datatype_array_fields::AuthenticatedDatatypeArrayMembers;
@@ -25,6 +25,7 @@ use super::Executor;
 use super::{EvalValue, Model};
 
 mod datatype_array_selectors;
+mod rendered_array_value;
 
 /// Typed failure from the exact row pipeline shared by model output and the
 /// independent gate.  Coverage failures remain distinct from a semantic
@@ -89,6 +90,29 @@ fn eval_value_real_string(value: &EvalValue) -> Option<String> {
         EvalValue::Rational(r) => Some(format_real(r)),
         EvalValue::Algebraic(v) => match v.to_number_for_output() {
             Some(ay_nra::RealScalar::Rational(r)) => Some(format_real(&r)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The SMT-LIB USER-FACING spelling of a rational-valued non-Real
+/// `EvalValue`: an integer as `n` / `(- n)`, a non-integer as `(/ n d)` /
+/// `(- (/ n d))`. `None` when the value is not an exact rational. The
+/// internal comparison-key spelling (`-n`) stays in
+/// [`Executor::try_format_eval_value`].
+fn eval_value_rational_string(value: &EvalValue) -> Option<String> {
+    let format = |r: &num_rational::BigRational| {
+        if r.is_integer() {
+            format_bigint(r.numer())
+        } else {
+            format_rational(r)
+        }
+    };
+    match value {
+        EvalValue::Rational(r) => Some(format(r)),
+        EvalValue::Algebraic(v) => match v.to_number_for_output() {
+            Some(ay_nra::RealScalar::Rational(r)) => Some(format(&r)),
             _ => None,
         },
         _ => None,
@@ -327,7 +351,7 @@ impl Executor {
             // it with the canonical constant body (legitimate model
             // completion of an unconstrained function, not a fabricated value
             // for a missing one).
-            format_default_value_surface(&self.ctx, result_sort)
+            self.default_value_surface(result_sort)
         } else {
             self.format_function_body(arg_sorts, result_sort, &resolved_table)
         };
@@ -339,6 +363,229 @@ impl Executor {
             result_sort_str,
             body
         ))
+    }
+
+    /// Constant-body instance of the native function-definition renderer.
+    /// The actual immutable DATA owner pays every parameter/body copy.
+    pub(super) fn format_retained_constant_function(
+        &self,
+        name: &str,
+        arguments: &[Sort],
+        result_sort: &Sort,
+        value: &ay_model_check::ModelValue,
+        admission: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<String, String> {
+        use ay_core::render_admission as output;
+        if !super::evaluation_copies::active() || !super::evaluation_copies::validate(self) {
+            return Err("retained function has no live read owner".to_owned());
+        }
+        let owner = Some(admission);
+        let mut text = output::Buffer::new(owner);
+        let name = output::quote(owner, name);
+        if !text.push("  (define-fun ") || !text.push(&name) || !text.push(" (") {
+            return Err("retained function output refused".to_owned());
+        }
+        for (index, sort) in arguments.iter().enumerate() {
+            if index != 0 && !text.character(' ') {
+                return Err("retained function output refused".to_owned());
+            }
+            let sort = crate::executor_format::format_sort_surface_owned(&self.ctx, sort, owner);
+            if !text.format(format_args!("(x{index} ")) || !text.push(&sort) || !text.character(')')
+            {
+                return Err("retained function output refused".to_owned());
+            }
+        }
+        let result =
+            crate::executor_format::format_sort_surface_owned(&self.ctx, result_sort, owner);
+        let body = self
+            .retained_array_render_value(value, result_sort, admission)
+            .map_err(|error| error.to_string())?;
+        if !text.push(") ")
+            || !text.push(&result)
+            || !text.push("\n    ")
+            || !text.push(&body)
+            || !text.character(')')
+        {
+            return Err("retained function output refused".to_owned());
+        }
+        admission.check().map_err(|e| e.to_string())?;
+        Ok(text.finish())
+    }
+
+    /// Authored ground UF applications by (symbol, arity), memoized
+    /// against the exact (assertions, finitely-expanded roots) snapshot:
+    /// the census traversal is O(assertions x term size) and both the
+    /// printer and the gate ask per symbol per round (#dt-uf-table-
+    /// authored-points; the uncached walk cost ~8 s on vlsat3's 23k
+    /// assertions). Any snapshot difference rebuilds, so a stale census
+    /// is never served.
+    fn uf_authored_applications(
+        &self,
+    ) -> std::sync::Arc<ay_core::kani_compat::DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>>>
+    {
+        let roots = self.finitely_expanded_ground_roots();
+        if let Some((assertions, cached_roots, map, _quantifier_memo)) =
+            self.uf_authored_apps_cache.borrow().as_ref()
+        {
+            if assertions.as_slice() == self.ctx.assertions.as_slice() && *cached_roots == roots {
+                return map.clone();
+            }
+        }
+        let mut applications: ay_core::kani_compat::DetHashMap<
+            (String, usize),
+            Vec<(TermId, Vec<TermId>)>,
+        > = ay_core::kani_compat::DetHashMap::default();
+        let mut visited = HashSet::default();
+        for &assertion in &self.ctx.assertions {
+            self.collect_uf_applications(assertion, &mut applications, &mut visited);
+        }
+        for &root in &roots {
+            self.collect_uf_applications(root, &mut applications, &mut visited);
+        }
+        let map = std::sync::Arc::new(applications);
+        *self.uf_authored_apps_cache.borrow_mut() = Some((
+            self.ctx.assertions.clone(),
+            roots,
+            map.clone(),
+            std::collections::HashMap::default(),
+        ));
+        map
+    }
+
+    /// `symbol_occurs_under_quantifier` memoized against the same
+    /// snapshot as the authored-application census: the walk is
+    /// O(assertions x term size) per call and the completion trigger
+    /// asks once per printed-table call.
+    fn uf_symbol_occurs_under_quantifier(&self, name: &str) -> bool {
+        // Populate / validate the snapshot first (also builds the memo).
+        let _ = self.uf_authored_applications();
+        if let Some(hit) = self
+            .uf_authored_apps_cache
+            .borrow()
+            .as_ref()
+            .and_then(|(_, _, _, memo)| memo.get(name).copied())
+        {
+            return hit;
+        }
+        // The walk does not touch this cache, so no borrow is held across
+        // it; insert under a fresh borrow afterwards. (This shape also
+        // keeps `Executor: Send` — the memo used to be an
+        // `Rc<RefCell<..>>` cloned out of the cache borrow, which broke
+        // ay-milp's `assert_send::<BabSession>()` contract.)
+        let occurs = self.symbol_occurs_under_quantifier(name);
+        if let Some((_, _, _, memo)) = self.uf_authored_apps_cache.borrow_mut().as_mut() {
+            memo.insert(name.to_string(), occurs);
+        }
+        occurs
+    }
+
+    /// Structural rendering of a datatype-sorted term for UF-table keys:
+    /// `ite` follows the model's branch, a constructor application renders
+    /// over its parts (datatype parts recursively, scalar parts by model
+    /// evaluation), and anything else reads the dt-egraph assignment (which
+    /// itself resolves selector projections structurally) or the model's
+    /// term value. This mirrors how the independent gate evaluates the
+    /// same term when it looks an application up in the printed body, so a
+    /// completed row is keyed at the point the gate actually queries.
+    fn structural_dt_table_key(&self, model: &Model, term: TermId, depth: u32) -> Option<String> {
+        if depth == 0 {
+            return None;
+        }
+        match self.ctx.terms.get(term) {
+            TermData::Ite(cond, then_t, else_t) => {
+                match self.term_value_string(model, *cond).ok()?.as_str() {
+                    "true" => self.structural_dt_table_key(model, *then_t, depth - 1),
+                    "false" => self.structural_dt_table_key(model, *else_t, depth - 1),
+                    _ => None,
+                }
+            }
+            TermData::App(sym, args) => {
+                if self.ctx.is_constructor(sym.name()).is_none() {
+                    // Selector application: project from the operand's
+                    // STRUCTURAL rendering, exactly as the gate evaluates
+                    // it. The class value of a selector application can be
+                    // an abstract completion unrelated to the operand's
+                    // constructor fields, which is the divergence this
+                    // keying exists to avoid.
+                    if args.len() == 1 {
+                        if let Some(projected) = self.structural_dt_selector_projection(
+                            model,
+                            sym.name(),
+                            args[0],
+                            depth,
+                        ) {
+                            return Some(projected);
+                        }
+                    }
+                    return self
+                        .dt_egraph_value(model, term)
+                        .or_else(|| self.term_value_string(model, term).ok());
+                }
+                let (_dt, ctor) = self.ctx.is_constructor(sym.name())?;
+                let mut parts = Vec::with_capacity(args.len());
+                for &arg in args {
+                    let sort = self.ctx.terms.sort(arg).clone();
+                    let part = if self.datatype_sort_name(&sort).is_some() {
+                        self.structural_dt_table_key(model, arg, depth - 1)?
+                    } else {
+                        self.term_value_string(model, arg).ok()?
+                    };
+                    parts.push(part);
+                }
+                let surface = self.dt_surface(&ctor);
+                Some(if parts.is_empty() {
+                    surface.to_string()
+                } else {
+                    format!("({} {})", surface, parts.join(" "))
+                })
+            }
+            _ => self
+                .dt_egraph_value(model, term)
+                .or_else(|| self.term_value_string(model, term).ok()),
+        }
+    }
+
+    /// Project selector `sel` from the structural rendering of `operand`:
+    /// when that rendering is a constructor application of the ctor owning
+    /// `sel`, return its corresponding top-level field rendering verbatim.
+    fn structural_dt_selector_projection(
+        &self,
+        model: &Model,
+        sel: &str,
+        operand: TermId,
+        depth: u32,
+    ) -> Option<String> {
+        let (owner, idx) = self
+            .ctx
+            .ctor_selectors_iter()
+            .find_map(|(ctor, selectors)| {
+                selectors
+                    .iter()
+                    .position(|candidate| candidate == sel)
+                    .map(|idx| (ctor.clone(), idx))
+            })?;
+        let rendered = self.structural_dt_table_key(model, operand, depth.checked_sub(1)?)?;
+        let inner = rendered.strip_prefix('(')?.strip_suffix(')')?;
+        let mut fields: Vec<&str> = Vec::new();
+        let mut level = 0i32;
+        let mut start = 0usize;
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '(' => level += 1,
+                ')' => level -= 1,
+                ' ' if level == 0 => {
+                    fields.push(&inner[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        fields.push(&inner[start..]);
+        let (head, args) = fields.split_first()?;
+        if *head != self.dt_surface(&owner) && *head != owner.as_str() {
+            return None;
+        }
+        args.get(idx).map(|field| (*field).to_string())
     }
 
     /// The EXACT row list `format_function_table` turns into the printed
@@ -403,6 +650,113 @@ impl Executor {
             resolved_table.push((resolved_args, resolved_result));
         }
 
+        // Authored-point completion (#dt-uf-table-authored-points): an EUF
+        // extraction table keys only the applications its own round saw, so
+        // a datatype-sorted application the authored assertions apply the
+        // function at — typically under a composite argument (`(f (ite
+        // ...))`, `(f (sel x))`) whose point the round's residual never
+        // registered — can be missing from the table entirely. The printed
+        // body then answers its `else` there while the model's pin for
+        // that application says otherwise: an incoherent published
+        // witness (Certora `65782_..._6_QF_UFDTBV`, assertion on
+        // `(x76 (ite ...))`, validated against the printed body in z3).
+        // Complete the table from the same authored-application census
+        // the no-table fallback uses, keyed and valued by the model's own
+        // term evaluation, so printer and gate read one coherent body.
+        // Scoped and fail-soft: only datatype-argument tables (the
+        // measured class), only when an `else` row already exists, only
+        // points not already present (the `else` row's ignored key
+        // included — that point already reads as the `else` value), and
+        // any point that does not resolve is skipped, leaving today's
+        // adjudication untouched. The backstop below still rejects a
+        // completed table that is not a function.
+        if !resolved_table.is_empty()
+            && arg_sorts
+                .iter()
+                .any(|sort| self.datatype_sort_name(sort).is_some())
+            && !self.uf_symbol_occurs_under_quantifier(name)
+        {
+            let applications = self.uf_authored_applications();
+            if let Some(apps) = applications.get(&(name.to_string(), arg_sorts.len())) {
+                // Coverage short-circuits: when the table already carries
+                // at least as many points as there are authored
+                // applications, every authored point is already present
+                // up to rendering; and when no authored argument is
+                // composite (an `ite`/constructor/selector-headed term —
+                // the only shape whose point an extraction round can
+                // miss, since plain variable/constant arguments are
+                // keyed by extraction itself), there is nothing to
+                // complete. Either way the per-application key
+                // evaluations below (the hot path on assertion-heavy
+                // files) cannot add anything.
+                let any_composite_arg = apps.iter().any(|(_, args)| {
+                    args.iter().any(|&arg| {
+                        self.datatype_sort_name(self.ctx.terms.sort(arg)).is_some()
+                            && matches!(
+                                self.ctx.terms.get(arg),
+                                TermData::App(..) | TermData::Ite(..)
+                            )
+                    })
+                });
+                let additions: Vec<(Vec<String>, String)> = if !any_composite_arg
+                    || resolved_table.len().saturating_sub(1) >= apps.len()
+                {
+                    Vec::new()
+                } else {
+                    let present: HashSet<&Vec<String>> =
+                        resolved_table.iter().map(|(args, _)| args).collect();
+                    let mut additions: Vec<(Vec<String>, String)> = Vec::new();
+                    // Applications share argument terms heavily; memoize
+                    // each term's key rendering within this call.
+                    let mut key_memo: HashMap<TermId, Option<String>> = HashMap::default();
+                    for (app, args) in apps {
+                        let mut key = Vec::with_capacity(args.len());
+                        let mut resolvable = true;
+                        for &arg in args {
+                            // Datatype arguments key by their STRUCTURAL
+                            // value (the value the gate's evaluator
+                            // computes for the same term), not by the
+                            // producer's class rendering: for a composite
+                            // argument (`(ite ...)`, a constructor over
+                            // selector applications) the class rendering
+                            // is an abstract tree the gate never looks
+                            // up, which is exactly how the `65782` points
+                            // went missing.
+                            let rendered = key_memo
+                                .entry(arg)
+                                .or_insert_with(|| {
+                                    if self.datatype_sort_name(self.ctx.terms.sort(arg)).is_some() {
+                                        self.structural_dt_table_key(model, arg, 64)
+                                    } else {
+                                        None
+                                    }
+                                    .or_else(|| self.term_value_string(model, arg).ok())
+                                })
+                                .clone();
+                            match rendered {
+                                Some(rendered) => key.push(rendered),
+                                None => {
+                                    resolvable = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if resolvable && !present.contains(&key) {
+                            if let Ok(value) = self.term_value_string(model, *app) {
+                                additions.push((key, value));
+                            }
+                        }
+                    }
+                    additions
+                };
+                if !additions.is_empty() {
+                    let else_row = resolved_table.pop().expect("non-empty table checked above");
+                    resolved_table.extend(additions);
+                    resolved_table.push(else_row);
+                }
+            }
+        }
+
         // Print backstop (#uf-one-int-lane): the emitted body is a FIRST-MATCH
         // ite chain, so a later row whose argument point was already seen is
         // dead code. Two rows can land on one point when distinct source
@@ -431,6 +785,24 @@ impl Executor {
                     seen_points.insert(args.clone(), result.clone());
                     deduped.push((args, result));
                 }
+            }
+        }
+        // CONSTANT ABSORPTION. The rows above have pairwise-distinct argument
+        // points and the printed body is a first-match `ite` chain whose LAST
+        // row supplies the `else` branch, so when every row resolves to the
+        // same value the chain IS that constant: keeping one row prints the
+        // bare value (`format_function_body`'s single-entry case) and denotes
+        // exactly the same total function. This is not a simplification for
+        // looks. A guarded binder expands to one row per point — 65 of them for
+        // `(forall ((i (_ BitVec 64))) (=> (bvult i (_ bv65 64)) (= (f i) #b1)))`
+        // — and the resulting 64-deep `ite` puts its innermost condition
+        // arguments at depth 65, past the `MAX_DEPTH` of 64 that the typed
+        // scalar-function decoder enforces, so the honest total interpretation
+        // would be published and then refused on read-back.
+        if deduped.len() > 1 {
+            let (_, first) = &deduped[0];
+            if deduped.iter().all(|(_, result)| result == first) {
+                deduped.truncate(1);
             }
         }
         Ok(deduped)
@@ -550,7 +922,18 @@ impl Executor {
                             )
                         });
                 }
-                let eval = self.evaluate_term(model, term_id);
+                // An application the solved formula no longer contains (a
+                // preprocessing substitution eliminated it) keeps the value a
+                // top-level asserted equality gives it: `(= (h x) (- x 3))`
+                // with `h` Real-ranged had no theory value, and the whole
+                // `(get-model)` failed ("no model value for function-table
+                // entry of sort Real") although the gates validated the model.
+                let eval = match self.evaluate_term(model, term_id) {
+                    EvalValue::Unknown => self
+                        .extract_value_from_asserted_equalities(model, term_id)
+                        .unwrap_or(EvalValue::Unknown),
+                    value => value,
+                };
                 if !matches!(eval, EvalValue::Unknown) {
                     // USER-FACING table position (#real-fmt): the DECLARED
                     // param/result sort is authoritative — an Int-sorted
@@ -575,13 +958,18 @@ impl Executor {
                     "opaque internal equality-class value {raw} is not a concrete sequence"
                 ));
             }
+            // RoundingMode has five values; `rm_concrete.rs` replaces every
+            // minted element before completion, so one here is a gap.
+            if crate::executor::rm_domain::is_rm_sort(sort) {
+                return Err(format!("internal element {raw} is not a rounding mode"));
+            }
             // Abstract element token (`@Sort!n`) of an uninterpreted sort:
             // sort-ascribe it exactly like every other printed occurrence
             // (#mv-abstract-value-ascription). Scalar sorts pass through
             // unchanged.
             return Ok(format_model_atom_surface(&self.ctx, sort, raw));
         }
-        Ok(raw.to_string())
+        Ok(smtlib_arith_table_literal(raw, sort).unwrap_or_else(|| raw.to_string()))
     }
 
     /// True when a raw function-table entry (RESULT or ARGUMENT) marks a
@@ -612,10 +1000,56 @@ impl Executor {
             return true;
         }
         let binders = self.quantifier_binder_names();
-        if binders.is_empty() {
-            return false;
+        if !binders.is_empty() && self.term_mentions_named_var(term_id, &binders) {
+            return true;
         }
-        self.term_mentions_named_var(term_id, &binders)
+        // A term that occurs in no current assertion and no assumption of the
+        // last check constrains nothing: the e-graph can hold it because the
+        // term store does (a Z3 C API context builds terms it never asserts,
+        // e.g. `h(a)` for a Real-ranged `h`, and a `(= (h a) (h a))` folds to
+        // `true` while `(h a)` stays registered). Its row is not a model point
+        // either; without this the whole model failed to print ("no model
+        // value for function-table entry of sort Real") and the API published
+        // `sat` with an EMPTY model.
+        !self.term_occurs_in_current_query(term_id)
+    }
+
+    /// True when `t` is a subterm of a current assertion or of an assumption
+    /// of the last check. Cold path: only consulted for table entries that
+    /// already resolve to no model value.
+    fn term_occurs_in_current_query(&self, t: TermId) -> bool {
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = self.ctx.assertions.clone();
+        stack.extend(self.last_assumptions.iter().flatten().copied());
+        while let Some(u) = stack.pop() {
+            if u == t {
+                return true;
+            }
+            if !visited.insert(u) {
+                continue;
+            }
+            match self.ctx.terms.get(u) {
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(i) => stack.push(*i),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::Let(bindings, b) => {
+                    for (_, v) in bindings {
+                        stack.push(*v);
+                    }
+                    stack.push(*b);
+                }
+                TermData::Forall(_, b, triggers) | TermData::Exists(_, b, triggers) => {
+                    stack.push(*b);
+                    stack.extend(triggers.iter().flatten().copied());
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// True when `t` mentions a `Var` whose name is not a declared symbol —
@@ -722,7 +1156,7 @@ impl Executor {
         if table.is_empty() {
             // Unreachable in practice (the caller special-cases the empty
             // table); kept total with the same unconstrained-function body.
-            return format_default_value_surface(&self.ctx, result_sort);
+            return self.default_value_surface(result_sort);
         }
 
         // Use last entry as the default (else branch).
@@ -981,7 +1415,7 @@ impl Executor {
             if model
                 .array_model
                 .as_ref()
-                .is_some_and(|arrays| arrays.read_conflicted.contains(&array_term))
+                .is_some_and(|arrays| arrays.is_withheld(&array_term))
             {
                 return None;
             }
@@ -1204,7 +1638,7 @@ impl Executor {
         let read_conflicted = model
             .array_model
             .as_ref()
-            .is_some_and(|am| am.read_conflicted.contains(&array_term));
+            .is_some_and(|am| am.is_withheld(&array_term));
         if read_conflicted {
             return None;
         }
@@ -1230,6 +1664,7 @@ impl Executor {
             // concrete canonical repair below (#model-witness-no-skolem).
             Some(default) => Some(
                 self.printable_uninterpreted_atom(&default, elem_sort)
+                    .or_else(|| self.printable_rendered_array_value(&default, elem_sort))
                     .unwrap_or_else(|| self.canonical_default_value(elem_sort)),
             ),
             None if mode.completes_missing_default() => None,
@@ -1378,13 +1813,10 @@ impl Executor {
                 } else {
                     idx_str.clone()
                 };
-                let val_str = if val_str.contains('@') {
-                    match self.printable_uninterpreted_atom(val_str, elem_sort) {
-                        Some(spelled) => spelled,
-                        None => continue,
-                    }
-                } else {
-                    val_str.clone()
+                let val_str = match self.printable_reconstructed_cell(val_str, elem_sort) {
+                    Ok(Some(spelled)) => spelled,
+                    Ok(None) => continue,
+                    Err(()) => return None,
                 };
                 Self::upsert_store(&mut reconstructed, idx_str, val_str);
             }
@@ -1511,6 +1943,11 @@ impl Executor {
         array_term: TermId,
         sort: &Sort,
     ) -> Option<String> {
+        match self.functional_array_render(model, array_term) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         let mut def_visited = HashSet::default();
         self.format_array_witness_value_inner(
             model,
@@ -1531,6 +1968,11 @@ impl Executor {
         def_visited: &mut HashSet<TermId>,
         mode: ArrayInterpMode,
     ) -> Option<String> {
+        match self.functional_array_render(model, array_term) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         let Sort::Array(arr_sort) = sort else {
             return None;
         };
@@ -1633,6 +2075,11 @@ impl Executor {
     /// falls back to rebuilding a value for common array constructors (`store`, `const-array`).
     /// Uses `stacker::maybe_grow` for stack safety on deeply nested store chains (#4602).
     pub(super) fn format_array_term_value(&self, model: &Model, term_id: TermId) -> Option<String> {
+        match self.functional_array_render(model, term_id) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         // A fresh definition-cycle guard per top-level format request. Resolving
         // an array variable through its definitional equality below recurses,
         // and `array_variable_definition` reads `(= a b)` in BOTH directions, so
@@ -1653,6 +2100,11 @@ impl Executor {
         def_visited: &mut HashSet<TermId>,
     ) -> Option<String> {
         stacker::maybe_grow(ARRAY_FMT_STACK_RED_ZONE, ARRAY_FMT_STACK_SIZE, || {
+            match self.functional_array_render(model, term_id) {
+                Ok(Some(value)) => return Some(value),
+                Ok(None) => {}
+                Err(_) => return None,
+            }
             let sort = self.ctx.terms.sort(term_id);
             if !matches!(sort, Sort::Array(_)) {
                 return None;
@@ -1660,7 +2112,7 @@ impl Executor {
             if model
                 .array_model
                 .as_ref()
-                .is_some_and(|arrays| arrays.read_conflicted.contains(&term_id))
+                .is_some_and(|arrays| arrays.is_withheld(&term_id))
             {
                 return None;
             }
@@ -1669,7 +2121,7 @@ impl Executor {
                 TermData::Var(_, _) => {
                     if let Some(array_model) = model.array_model.as_ref() {
                         if let Some(interp) = array_model.array_values.get(&term_id) {
-                            if array_model.read_conflicted.contains(&term_id) {
+                            if array_model.is_withheld(&term_id) {
                                 return None;
                             }
                             return self.format_array_value(sort, interp);
@@ -1749,6 +2201,11 @@ impl Executor {
         match value {
             EvalValue::Bool(true) => Ok("true".to_string()),
             EvalValue::Bool(false) => Ok("false".to_string()),
+            EvalValue::Complex { real, imaginary } => Ok(format!(
+                "(complex.make {} {})",
+                Self::format_complex_component(real)?,
+                Self::format_complex_component(imaginary)?
+            )),
             EvalValue::Element(elem) => {
                 let sort = self.ctx.terms.sort(term_id);
                 if matches!(sort, Sort::Seq(_)) {
@@ -1786,6 +2243,9 @@ impl Executor {
                 // Use format_bitvec for SMT-LIB compliant output (#1793).
                 Ok(format_bitvec(value, *width))
             }
+            EvalValue::FiniteField { value, field } => self
+                .format_field_literal_checked(*value, *field)
+                .ok_or_else(|| "finite-field numeral rendering refused".into()),
             EvalValue::Fp(fp_val) => Ok(fp_val.to_smtlib()),
             EvalValue::String(s) => Ok(string_literal(s)),
             EvalValue::Seq(elems) => {
@@ -1809,10 +2269,14 @@ impl Executor {
     }
 
     /// USER-FACING variant of [`Self::try_format_eval_value`]: byte-identical
-    /// on every input EXCEPT a Real-SORTED exact-rational value, which prints
-    /// in the z3-exact spelling (`5.0`, `(- 5.0)`, `(/ 7.0 2.0)`,
-    /// `(- (/ 7.0 2.0))`) instead of the legacy internal one (`5`, `-5`,
-    /// `(/ 7 2)`).
+    /// on every input EXCEPT an exact-rational value, which prints in SMT-LIB
+    /// syntax instead of the legacy internal spelling (`-5`, `(/ -7 2)`):
+    ///
+    /// * Real-sorted: the z3-exact spelling (`5.0`, `(- 5.0)`, `(/ 7.0 2.0)`,
+    ///   `(- (/ 7.0 2.0))`).
+    /// * any other sort (Int): an integer as a numeral or `(- n)`, which is the
+    ///   only negative spelling the strict typed decoder accepts (a bare `-5`
+    ///   lexes as a symbol); a non-integer as `(/ n d)` or `(- (/ n d))`.
     ///
     /// CONTRACT (#real-fmt): stdout boundary ONLY — get-value/eval, get-model
     /// scalars, get-objectives, and resolved function tables route through
@@ -1830,6 +2294,9 @@ impl Executor {
             if let Some(s) = eval_value_real_string(value) {
                 return Ok(s);
             }
+        }
+        if let Some(s) = eval_value_rational_string(value) {
+            return Ok(s);
         }
         self.try_format_eval_value(value, term_id)
     }
@@ -1891,6 +2358,46 @@ impl Executor {
             MV::Int(i) => Some(format_bigint(i)),
             MV::Real(r) => Some(format_rational(r)),
             MV::BitVec { width, value } => Some(format_bitvec(value, *width)),
+            MV::FloatingPointExact {
+                sign,
+                exponent,
+                significand,
+                exponent_bits,
+                significand_bits,
+            } => {
+                let Sort::FloatingPoint(eb, sb) = sort else {
+                    return None;
+                };
+                if exponent_bits != eb || significand_bits != sb {
+                    return None;
+                }
+                if !(2..=ay_fp::MAX_ENCODING_EXPONENT_BITS).contains(eb)
+                    || !(2..=ay_fp::MAX_ENCODING_SIGNIFICAND_BITS).contains(sb)
+                {
+                    return None;
+                }
+                self.poll_evaluation_stop().ok()?;
+                let fields = ay_fp::FpFields::from_shared(
+                    *sign,
+                    std::sync::Arc::clone(exponent),
+                    std::sync::Arc::clone(significand),
+                    *eb,
+                    *sb,
+                )?;
+                let value = ay_fp::FpModelValue::Exact(fields);
+                let output_bytes = if value.is_nan() || value.is_zero() || value.is_infinite() {
+                    128
+                } else {
+                    usize::try_from(eb.checked_add(*sb)?)
+                        .ok()?
+                        .checked_mul(2)?
+                        .checked_add(128)?
+                };
+                let _arena = self.admit_evaluation_scratch(output_bytes).ok()?;
+                let output = value.to_smtlib();
+                self.poll_evaluation_stop().ok()?;
+                Some(output)
+            }
             MV::FloatingPoint {
                 sign,
                 exponent,
@@ -1901,19 +2408,17 @@ impl Executor {
                 let Sort::FloatingPoint(sort_eb, sort_sb) = sort else {
                     return None;
                 };
-                if exponent_bits != sort_eb
-                    || significand_bits != sort_sb
-                    || !(2..64).contains(exponent_bits)
-                    || !(2..=64).contains(significand_bits)
-                {
+                if exponent_bits != sort_eb || significand_bits != sort_sb {
                     return None;
                 }
+                ay_fp::FpModelValue::from_fields(
+                    *sign,
+                    *exponent,
+                    *significand,
+                    *exponent_bits,
+                    *significand_bits,
+                )?;
                 let stored_bits = *significand_bits - 1;
-                let max_exponent = (1u64 << *exponent_bits) - 1;
-                let significand_limit = 1u64 << stored_bits;
-                if *exponent > max_exponent || *significand >= significand_limit {
-                    return None;
-                }
                 Some(format!(
                     "(fp {} {} {})",
                     format_bitvec(&BigInt::from(u8::from(*sign)), 1),
@@ -1972,6 +2477,19 @@ impl Executor {
                     out = format!("(store {out} {idx_str} {val_str})");
                 }
                 Some(out)
+            }
+            MV::Datatype { ctor, args } if sort == &Sort::Complex => {
+                let [real, imaginary] = args.as_slice() else {
+                    return None;
+                };
+                if ctor != "complex.make" {
+                    return None;
+                }
+                Some(format!(
+                    "(complex.make {} {})",
+                    self.format_gate_model_value(real, &Sort::Real)?,
+                    self.format_gate_model_value(imaginary, &Sort::Real)?
+                ))
             }
             MV::Datatype { ctor, args } => {
                 // Field sorts come from THIS constructor's own declaration (a
@@ -2032,6 +2550,17 @@ impl Executor {
     /// element recursively (#model-seq-witness).
     fn format_seq_element(&self, value: &EvalValue, elem_sort: &Sort) -> String {
         match value {
+            EvalValue::Complex { real, imaginary } => {
+                match (
+                    Self::format_complex_component(real),
+                    Self::format_complex_component(imaginary),
+                ) {
+                    (Ok(real), Ok(imaginary)) if elem_sort == &Sort::Complex => {
+                        format!("(complex.make {real} {imaginary})")
+                    }
+                    _ => value_unavailable_marker("Complex sequence element"),
+                }
+            }
             EvalValue::Bool(true) => "true".to_string(),
             EvalValue::Bool(false) => "false".to_string(),
             EvalValue::Rational(r) => match elem_sort {
@@ -2040,6 +2569,7 @@ impl Executor {
                 _ => format_bigint(r.numer()),
             },
             EvalValue::BitVec { value, width } => format_bitvec(value, *width),
+            EvalValue::FiniteField { value, field } => self.format_field_literal(*value, *field),
             EvalValue::Fp(fp_val) => fp_val.to_smtlib(),
             EvalValue::String(s) => string_literal(s),
             EvalValue::Element(elem) => format_model_atom_surface(&self.ctx, elem_sort, elem),
@@ -2153,3 +2683,36 @@ mod gate_fp_format_tests;
 
 #[cfg(test)]
 mod sequence_table_provenance_tests;
+
+/// The SMT-LIB spelling of a raw arithmetic function-table entry at `sort`.
+///
+/// Function-table rows can carry an already-concrete value text from model
+/// extraction, and an extracted negative integer arrives as the bare token
+/// `-1`. That token is a SYMBOL in SMT-LIB, not a numeral, so the printed row
+/// `(ite (= x0 -1) true ...)` is ill-formed: a reader either rejects it or (the
+/// Z3 C API's table reader) loses the row, publishing a function that violates
+/// the assertions it was validated against. A negative numeral or decimal is
+/// re-spelled at the declared sort (`(- 1)`, `(- 1.0)`); any other text is `None`.
+fn smtlib_arith_table_literal(raw: &str, sort: &Sort) -> Option<String> {
+    if !matches!(sort, Sort::Int | Sort::Real) {
+        return None;
+    }
+    // Only a leading `-` makes the bare text a non-numeral; every other
+    // numeral or decimal is already valid SMT-LIB and is printed unchanged.
+    let magnitude = raw.strip_prefix('-')?;
+    let (int_part, frac_part) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    let digits_ok = !int_part.is_empty()
+        && int_part.bytes().all(|b| b.is_ascii_digit())
+        && frac_part.bytes().all(|b| b.is_ascii_digit());
+    if !digits_ok {
+        return None;
+    }
+    let numer: BigInt = format!("{int_part}{frac_part}").parse().ok()?;
+    let denom = BigInt::from(10u32).pow(u32::try_from(frac_part.len()).ok()?);
+    let value = num_rational::BigRational::new(-numer, denom);
+    match sort {
+        Sort::Int if value.is_integer() => Some(format_bigint(value.numer())),
+        Sort::Real => Some(format_real(&value)),
+        _ => None,
+    }
+}

@@ -55,13 +55,17 @@
 //! surface (never a normalized re-elaboration, which is how the folded
 //! constant got in). Any failure leaves the erasure exactly as it was.
 //!
-//! On the wire `dt_tester`/`dt_project` are not checkable Alethe rules, so
-//! those steps print as `hole` and carcara reports `holey`, not `valid`. That
-//! is the honest state of the art: Alethe has no datatype rules. The
-//! difference from today is the whole point — the artifact now NAMES the one
-//! obligation it cannot discharge and derives everything around it from the
-//! author's assertion, instead of asserting an empty clause from nothing.
-//! Reflexivity closes with `eq_reflexive`, which IS checkable.
+//! On the wire `dt_tester` is not a checkable Alethe rule, so a tester step
+//! prints as `hole` and carcara reports `holey`, not `valid`: standard
+//! Alethe has no datatype rules. A `dt_project` step prints as Clean's
+//! `dt_project` rule in the Clean dialect (the default; Clean's vendored
+//! Carcara checks it, and pinned Carcara 9a352ee answers `unknown rule`) and
+//! as `hole` in the pinned dialect (`ay_proof::AletheDialect`,
+//! `alethe_printer/dt_project.rs`). The difference from today is the whole
+//! point — the artifact now NAMES the one obligation it cannot discharge and
+//! derives everything around it from the author's assertion, instead of
+//! asserting an empty clause from nothing. Reflexivity closes with
+//! `eq_reflexive`, which IS checkable.
 
 use super::*;
 
@@ -145,6 +149,9 @@ impl Executor {
             return false;
         };
         if !self.rebuilt_root_prints_as_authored(root, assertion) {
+            super::authored_consequence_replay::replay_note(|| {
+                "[fold-to-false] conjunct-eval: the raw root does not print as authored".into()
+            });
             return false;
         }
         let Some(nodes) = self.raw_and_tree_leaves(root) else {
@@ -175,6 +182,12 @@ impl Executor {
             };
             let Some(closer) = self.conjunct_eval_closer(inner, datatype_decls, selector_decls)
             else {
+                super::authored_consequence_replay::replay_note(|| {
+                    format!(
+                        "[fold-to-false] conjunct-eval: no closer for leaf {}",
+                        ay_proof::format_term_alethe(&self.ctx.terms, *leaf)
+                    )
+                });
                 // A negated implication is one NNF step away from two more
                 // conjuncts; the closers themselves stay leaf-only.
                 if self.try_authored_not_implies_conjunct_refutation(

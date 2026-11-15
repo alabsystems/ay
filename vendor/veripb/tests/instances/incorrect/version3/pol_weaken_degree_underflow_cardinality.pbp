@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% Regression test: same degree underflow as pol_weaken_degree_underflow, but on the
+% `Cardinality` representation, which stores its degree in an i64 as well.
+f 2 ;
+rup 1 x1 1 x2 >= -9223372036854775808 ;
+pol 3 x1 w x2 w ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

@@ -47,6 +47,45 @@ impl EufSolver<'_> {
         self.term_cache_watermark = n;
     }
 
+    /// Every asserted disequality whose two sides the closure equates, each
+    /// with the reasons of that equality: the conflicts `check` would report
+    /// one at a time, at most `limit` of them, in the order of the atoms.
+    pub fn collect_disequality_conflicts(&mut self, limit: usize) -> Vec<Vec<TheoryLit>> {
+        if self.poisoned || limit == 0 {
+            return Vec::new();
+        }
+        self.rebuild_closure();
+        let mut violated: Vec<(TermId, TermId, TermId)> = Vec::new();
+        for (&lit_term, &value) in &self.assigns {
+            if value {
+                continue;
+            }
+            let Some((lhs, rhs)) = self.decode_eq(lit_term) else {
+                continue;
+            };
+            if self.terms.sort(lhs) != self.terms.sort(rhs)
+                || (lhs.0 as usize) >= self.enodes.len()
+                || (rhs.0 as usize) >= self.enodes.len()
+            {
+                continue;
+            }
+            if self.enode_find_const(lhs.0) == self.enode_find_const(rhs.0) {
+                violated.push((lit_term, lhs, rhs));
+            }
+        }
+        violated.sort_by_key(|(lit_term, _, _)| lit_term.0);
+        violated.truncate(limit);
+        let mut conflicts = Vec::with_capacity(violated.len());
+        for (lit_term, lhs, rhs) in violated {
+            let mut reasons = self.explain(lhs, rhs);
+            reasons.push(TheoryLit::new(lit_term, false));
+            reasons.sort_unstable_by_key(|l| (l.term, l.value));
+            reasons.dedup_by_key(|l| (l.term, l.value));
+            conflicts.push(reasons);
+        }
+        conflicts
+    }
+
     /// Check for conflicts from explicit disequalities `(= a b) = false`
     /// where `find(a) = find(b)`.
     ///
@@ -99,7 +138,7 @@ impl EufSolver<'_> {
                     );
                 }
                 let reasons = self.explain(lhs, rhs);
-                self.conflict_count += 1;
+                self.conflict_count = self.conflict_count.saturating_add(1);
                 return Some(self.conflict_with_reasons(reasons, TheoryLit::new(lit_term, false)));
             }
             return None;
@@ -148,7 +187,7 @@ impl EufSolver<'_> {
                 // In Nelson-Oppen, explain() returns shared equality reasons that
                 // reference terms from another theory (LRA, LIA, arrays). These
                 // cross-theory reasons are REQUIRED in the conflict clause.
-                self.conflict_count += 1;
+                self.conflict_count = self.conflict_count.saturating_add(1);
                 return Some(self.conflict_with_reasons(reasons, TheoryLit::new(lit_term, false)));
             }
         }
@@ -205,7 +244,7 @@ impl EufSolver<'_> {
                     return Some(TheoryResult::Unknown);
                 }
 
-                self.conflict_count += 1;
+                self.conflict_count = self.conflict_count.saturating_add(1);
                 return Some(TheoryResult::Unsat(conflict));
             }
         }
@@ -250,7 +289,8 @@ impl EufSolver<'_> {
                 );
             }
             for i in 0..n_args {
-                for j in (i + 1)..n_args {
+                // `i < n_args`, so the successor never saturates.
+                for j in i.saturating_add(1)..n_args {
                     // Index directly into scratch buffer to avoid long-lived borrows (#5575).
                     let arg_i = self.scratch_distincts[idx].1[i];
                     let arg_j = self.scratch_distincts[idx].1[j];
@@ -270,6 +310,16 @@ impl EufSolver<'_> {
                         );
                     }
                     if rep_i == rep_j {
+                        // Identical raw arguments are equal by reflexivity, so
+                        // only the live distinct assertion is a conflict premise.
+                        // Different terms still require the explanation below.
+                        if arg_i == arg_j {
+                            self.conflict_count = self.conflict_count.saturating_add(1);
+                            return Some(self.conflict_with_reasons(
+                                Vec::new(),
+                                TheoryLit::new(lit_term, true),
+                            ));
+                        }
                         let reasons = self.explain(arg_i, arg_j);
                         debug_assert!(
                             !reasons.is_empty(),
@@ -279,7 +329,7 @@ impl EufSolver<'_> {
                         if reasons.is_empty() {
                             return Some(TheoryResult::Unknown);
                         }
-                        self.conflict_count += 1;
+                        self.conflict_count = self.conflict_count.saturating_add(1);
                         return Some(
                             self.conflict_with_reasons(reasons, TheoryLit::new(lit_term, true)),
                         );
@@ -338,7 +388,7 @@ impl EufSolver<'_> {
                                 return Some(TheoryResult::Unknown);
                             }
                         }
-                        self.conflict_count += 1;
+                        self.conflict_count = self.conflict_count.saturating_add(1);
                         return Some(TheoryResult::Unsat(reasons));
                     }
                 } else {

@@ -103,8 +103,7 @@ fn detect_relativized_php_shape(clauses: &[Vec<Literal>]) -> Option<RelativizedP
         }
     }
     let y: Vec<Variable> = yset.iter().copied().collect();
-    let res_idx: BTreeMap<Variable, usize> =
-        y.iter().enumerate().map(|(t, &g)| (g, t)).collect();
+    let res_idx: BTreeMap<Variable, usize> = y.iter().enumerate().map(|(t, &g)| (g, t)).collect();
     // Hole variables: resource = the row's guard; fresh everywhere else.
     let mut v2res: BTreeMap<Variable, usize> = BTreeMap::new();
     for r in &mixw {

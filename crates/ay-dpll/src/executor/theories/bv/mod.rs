@@ -17,11 +17,10 @@
 //! Configuration in `bv_config.rs`.
 
 use ay_core::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::Ordering;
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_bv::{BvSolver, BvValidationError};
+use ay_bv::{BlastCut, BvSolver, BvValidationError};
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, TermData};
 use ay_core::{Sort, TermId, TermStore, Tseitin, TseitinResult};
@@ -30,103 +29,24 @@ use ay_sat::{
     Solver as SatSolver, Variable as SatVariable,
 };
 
-use crate::executor_types::{Result, SolveResult, UnknownReason};
+use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::preprocess::{Preprocessor, VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT};
 
 use super::super::Executor;
 use super::bv_cnf_dump;
 use super::bv_encoding;
 use super::euf::ArrayAxiomMode;
-use super::{debug_ite_conditions_enabled, debug_preprocessed_enabled};
+use super::sat_stop::install_sat_stop;
+use super::{debug_ite_conditions_enabled, debug_preprocessed_enabled, ChainSpend, CongruenceBail};
 
+#[cfg(test)]
+mod constant_proof_mapping_tests;
+mod encoding_owner;
 mod pure_preprocess;
+mod structural_preprocess;
 
 // Re-export so existing `use super::bv::BvSolveConfig` paths continue to work.
 pub(in crate::executor) use super::bv_config::BvSolveConfig;
-
-pub(super) struct BvSatDeadlineGuard(
-    Option<(Arc<(Mutex<bool>, Condvar)>, std::thread::JoinHandle<()>)>,
-);
-
-impl Drop for BvSatDeadlineGuard {
-    fn drop(&mut self) {
-        if let Some((stop, handle)) = self.0.take() {
-            let (lock, cvar) = &*stop;
-            if let Ok(mut stopped) = lock.lock() {
-                *stopped = true;
-                cvar.notify_one();
-            }
-            let _ = handle.join();
-        }
-    }
-}
-
-pub(super) fn install_bv_sat_interrupt(
-    solver: &mut SatSolver,
-    external_interrupt: Option<Arc<AtomicBool>>,
-    solve_deadline: Option<Instant>,
-) -> BvSatDeadlineGuard {
-    // Preserve timeout provenance at the SAT result boundary. The timer flag
-    // remains installed below for legacy deep loops that only poll interrupts.
-    solver.set_solve_deadline(solve_deadline);
-    let sat_deadline_interrupt_flag = solve_deadline.map(|_| {
-        Arc::new(AtomicBool::new(
-            external_interrupt
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed)),
-        ))
-    });
-    let sat_interrupt_flag = sat_deadline_interrupt_flag
-        .clone()
-        .or_else(|| external_interrupt.clone());
-    // Persistent BV solvers outlive one public query. Rebind even when this
-    // query has no controls so a prior timeout's local flag cannot poison a
-    // retry.
-    solver.set_interrupt_handle(sat_interrupt_flag);
-
-    // Spawn a cancellable deadline timer thread if needed (#8554). The timer
-    // writes only to the SAT-local deadline flag, never to the caller's API
-    // interrupt flag (#8961).
-    let deadline_guard = if let (Some(deadline), Some(flag)) =
-        (solve_deadline, sat_deadline_interrupt_flag.as_ref())
-    {
-        let now = Instant::now();
-        if now < deadline {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let flag = flag.clone();
-                let stop = Arc::new((Mutex::new(false), Condvar::new()));
-                let stop_clone = Arc::clone(&stop);
-                let remaining = deadline - now;
-                let handle = std::thread::spawn(move || {
-                    let (lock, cvar) = &*stop_clone;
-                    let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let (guard, _) = cvar
-                        .wait_timeout_while(guard, remaining, |stopped| !*stopped)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if !*guard {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                });
-                Some((stop, handle))
-            }
-            // wasm32 has no threads: the deadline is still honored by the inline
-            // `Instant::now() >= deadline` checks on the solve path (which use the
-            // ay-core clock shim), so no timer thread is needed here.
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = flag;
-                None
-            }
-        } else {
-            flag.store(true, Ordering::Relaxed);
-            None
-        }
-    } else {
-        None
-    };
-    BvSatDeadlineGuard(deadline_guard)
-}
 
 const ABV_LARGE_STABLE_RESTART_MIN_VARS: usize = 500_000;
 const ABV_LARGE_STABLE_RESTART_MIN_CLAUSES: usize = 1_000_000;
@@ -212,6 +132,28 @@ fn configure_ephemeral_bv_sat_solver(
         // stable-biased phase long enough to exercise restart search on tails,
         // and keep legacy-coupled branching so stable mode uses EVSIDS.
         solver.set_stable_phase_init(ABV_LARGE_STABLE_RESTART_PHASE_CONFLICTS);
+    }
+}
+
+/// A forced bit-blast cut, for tests: the next eager bit-blast on this
+/// thread reads as cut by it, whatever `bitblast_all` saw.
+#[cfg(test)]
+pub(in crate::executor) mod forced_blast_cut {
+    use std::cell::Cell;
+
+    use ay_bv::BlastCut;
+
+    thread_local! {
+        static FORCED: Cell<Option<BlastCut>> = const { Cell::new(None) };
+    }
+
+    /// Force (or clear) the next bit-blast's cut on this thread.
+    pub(in crate::executor) fn force(cut: Option<BlastCut>) {
+        FORCED.with(|forced| forced.set(cut));
+    }
+
+    pub(super) fn take() -> Option<BlastCut> {
+        FORCED.with(Cell::take)
     }
 }
 
@@ -610,525 +552,570 @@ impl Executor {
         assumptions: &[TermId],
         assumption_roots: &[TermId],
     ) -> Result<SolveResult> {
-        // Certificate export is deliberately a fresh, eager per-check mode.
-        // The persistent incremental solver does not expose a lossless snapshot
-        // of active scoped/global clauses, and delayed BV operations add clauses
-        // after the first SAT call.  Re-encoding the currently active assertion
-        // vector here avoids both omissions while preserving normal fast paths
-        // when no dump was requested.
-        let export_bv_cnf = bv_cnf_dump::enabled();
-        if export_bv_cnf {
-            if config.theory_tag != "BV" {
-                return Err(crate::executor_types::ExecutorError::ArtifactExport(
-                    format!(
-                        "--dump-bv-cnf supports pure QF_BV only; {} has post-encoding theory refinements",
-                        config.theory_tag
-                    ),
-                ));
+        let owner = self.bv_encoding_owner();
+        if !owner.open() {
+            return self.abort_bv_encoding();
+        }
+        let encoding = &owner;
+        let mut recorded_blast_stop = None;
+        let mut trace_caller = None;
+        let result = (|| {
+            // Certificate export is deliberately a fresh, eager per-check mode.
+            // The persistent incremental solver does not expose a lossless snapshot
+            // of active scoped/global clauses, and delayed BV operations add clauses
+            // after the first SAT call.  Re-encoding the currently active assertion
+            // vector here avoids both omissions while preserving normal fast paths
+            // when no dump was requested.
+            let export_bv_cnf = bv_cnf_dump::enabled();
+            if export_bv_cnf {
+                if config.theory_tag != "BV" {
+                    return Err(crate::executor_types::ExecutorError::ArtifactExport(
+                        format!(
+                            "--dump-bv-cnf supports pure QF_BV only; {} has post-encoding theory refinements",
+                            config.theory_tag
+                        ),
+                    ));
+                }
+                config.incremental = false;
             }
-            config.incremental = false;
-        }
 
-        // Early exit if already timed out or interrupted (#3070).
-        // Without this, the entire encoding pipeline (Tseitin, bitblasting,
-        // axiom generation) runs to completion even when the deadline has
-        // already passed, causing deductive-checks to hang on wide BV queries.
-        if self.should_abort_theory_loop() {
-            return Ok(SolveResult::Unknown);
-        }
+            // Early exit if already timed out or interrupted (#3070).
+            // Without this, the entire encoding pipeline (Tseitin, bitblasting,
+            // axiom generation) runs to completion even when the deadline has
+            // already passed, causing deductive-checks to hang on wide BV queries.
+            if self.should_abort_theory_loop() {
+                return Ok(SolveResult::Unknown);
+            }
 
-        // #abv-subst-model-retry: the single reactive re-solve after a
-        // substitution-recovery model rejection runs with preprocessing
-        // disabled, so the model is built directly from the bit-blasted
-        // original assertions (no VariableSubstitution, no recovery).
-        if self.bv_subst_retry_disable_preprocess {
-            config.preprocess = false;
-        }
+            // #abv-subst-model-retry: the single reactive re-solve after a
+            // substitution-recovery model rejection runs with preprocessing
+            // disabled, so the model is built directly from the bit-blasted
+            // original assertions (no VariableSubstitution, no recovery).
+            if self.bv_subst_retry_disable_preprocess {
+                config.preprocess = false;
+            }
 
-        // Env-gated phase timing (`--phase-trace`): one stderr line per phase
-        // boundary with elapsed seconds since this solve entered. Zero cost when
-        // the env var is absent. Diagnostic-only (`c ...` comment lines), so it
-        // cannot perturb transcript parsing or the verdict.
-        let phase_trace_start = ay_core::misc_cli_flags().phase_trace.then(Instant::now);
-        macro_rules! phase_trace {
-            ($name:expr) => {
-                if let Some(t0) = phase_trace_start {
-                    eprintln!(
-                        "c phase-trace {} t={:.1}s",
-                        $name,
-                        t0.elapsed().as_secs_f64()
+            // Env-gated phase timing (`--phase-trace`): one stderr line per phase
+            // boundary with elapsed seconds since this solve entered. Zero cost when
+            // the env var is absent. Diagnostic-only (`c ...` comment lines), so it
+            // cannot perturb transcript parsing or the verdict.
+            let phase_trace_start = ay_core::misc_cli_flags().phase_trace.then(Instant::now);
+            macro_rules! phase_trace {
+                ($name:expr) => {
+                    if let Some(t0) = phase_trace_start {
+                        eprintln!(
+                            "c phase-trace {} t={:.1}s",
+                            $name,
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                };
+            }
+
+            // --- Phase 0: Optional preprocessing (#8140) ---
+            phase_trace!("phase0-preprocess");
+            // When both preprocessing and array axioms are enabled (QF_ABV), run
+            // preprocessing BEFORE array axiom generation. This ensures the array
+            // axiom fixpoint operates on post-substitution terms, avoiding stale
+            // term ID references that previously caused regressions.
+            //
+            // For pure BV (no array axioms), preprocessing runs in Phase 2 as before.
+            //
+            // Preprocessing MUST be disabled when assumptions are present (#5581):
+            // VariableSubstitution and PropagateValues can eliminate the relationship
+            // between assumption terms and the formula. For example, `(= p (= x #x00))`
+            // with `(= x #xFF)` can be simplified away, disconnecting the assumption
+            // literal `p` from the BV encoding. The Tseitin variable for `p` then has
+            // no clauses connecting it to the rest of the formula, allowing the SAT
+            // solver to assign it freely and produce a wrong-SAT result.
+            let early_preprocess =
+                config.preprocess && config.array_axioms && assumptions.is_empty();
+            let mut structural_progress = None;
+            let mut current_assertion_source_sets: Option<Vec<Vec<TermId>>> = None;
+            let original_assertions_before_early_preprocess = if early_preprocess {
+                let original_assertions = self.ctx.assertions.clone();
+                let mut source_sets: Vec<Vec<TermId>> = original_assertions
+                    .iter()
+                    .map(|&assertion| vec![assertion])
+                    .collect();
+                if assumption_roots.is_empty() {
+                    structural_progress = self.prepare_guarded_store_preprocessing(
+                        &original_assertions,
+                        &mut source_sets,
                     );
                 }
-            };
-        }
-
-        // --- Phase 0: Optional preprocessing (#8140) ---
-        phase_trace!("phase0-preprocess");
-        // When both preprocessing and array axioms are enabled (QF_ABV), run
-        // preprocessing BEFORE array axiom generation. This ensures the array
-        // axiom fixpoint operates on post-substitution terms, avoiding stale
-        // term ID references that previously caused regressions.
-        //
-        // For pure BV (no array axioms), preprocessing runs in Phase 2 as before.
-        //
-        // Preprocessing MUST be disabled when assumptions are present (#5581):
-        // VariableSubstitution and PropagateValues can eliminate the relationship
-        // between assumption terms and the formula. For example, `(= p (= x #x00))`
-        // with `(= x #xFF)` can be simplified away, disconnecting the assumption
-        // literal `p` from the BV encoding. The Tseitin variable for `p` then has
-        // no clauses connecting it to the rest of the formula, allowing the SAT
-        // solver to assign it freely and produce a wrong-SAT result.
-        let early_preprocess = config.preprocess && config.array_axioms && assumptions.is_empty();
-        let mut current_assertion_source_sets: Option<Vec<Vec<TermId>>> = None;
-        let original_assertions_before_early_preprocess = if early_preprocess {
-            let original_assertions = self.ctx.assertions.clone();
-            let mut source_sets: Vec<Vec<TermId>> = original_assertions
-                .iter()
-                .map(|&assertion| vec![assertion])
-                .collect();
-            phase_trace!("phase0.pre-bvand-flatten");
-            self.flatten_bv1_bvand_assertions_with_sources(&mut source_sets);
-            phase_trace!("phase0.pre-packed-mux");
-            if !self.is_producing_proofs() {
-                let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
-                if derived > 0 {
-                    source_sets.resize(self.ctx.assertions.len(), Vec::new());
-                    self.last_statistics.set_int(
-                        "smt.abv.packed_mux.derived_select_equalities",
-                        derived as u64,
-                    );
+                phase_trace!("phase0.pre-bvand-flatten");
+                self.flatten_bv1_bvand_assertions_with_sources(&mut source_sets);
+                phase_trace!("phase0.pre-packed-mux");
+                if !self.is_producing_proofs() {
+                    let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
+                    if derived > 0 {
+                        source_sets.resize(self.ctx.assertions.len(), Vec::new());
+                        self.last_statistics.set_int(
+                            "smt.abv.packed_mux.derived_select_equalities",
+                            derived as u64,
+                        );
+                    }
                 }
-            }
-            current_assertion_source_sets = Some(source_sets);
-            Some(original_assertions)
-        } else {
-            None
-        };
-        let var_subst = if early_preprocess {
-            phase_trace!("phase0.count-array-ops");
-            let mut preprocessed = self.ctx.assertions.clone();
-            let mut preprocessed_source_sets = current_assertion_source_sets
-                .clone()
-                .expect("early preprocess source sets initialized");
-            let (mut preprocessor, var_subst, propagate_values) =
-                Preprocessor::new_with_subst_and_propagation();
-            let (initial_num_selects, initial_num_stores) =
-                self.count_array_op_occurrences_in_assertions();
-            self.last_statistics.set_int(
-                "smt.abv.variable_subst.scalar_budget_input_selects",
-                initial_num_selects as u64,
-            );
-            self.last_statistics.set_int(
-                "smt.abv.variable_subst.scalar_budget_input_stores",
-                initial_num_stores as u64,
-            );
-            if Self::should_budget_scalar_variable_substitution(
-                initial_num_stores,
-                initial_num_selects,
-            ) {
-                var_subst
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .set_scalar_replacement_node_limit(VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT);
-                self.last_statistics
-                    .set_int("smt.abv.variable_subst.scalar_budgeted", 1);
+                current_assertion_source_sets = Some(source_sets);
+                Some(original_assertions)
             } else {
-                self.last_statistics
-                    .set_int("smt.abv.variable_subst.scalar_budgeted", 0);
-            }
-            phase_trace!("phase0.preprocessor-loop");
-            preprocessor.preprocess_with_sources(
-                &mut self.ctx.terms,
-                &mut preprocessed,
-                &mut preprocessed_source_sets,
-            );
-            phase_trace!("phase0.preprocessor-loop-done");
-            // Some ABV generators SSA-lower packed muxes through many one-bit
-            // variables. The first preprocessing pass exposes those ITE/concat
-            // structures; run the packed-mux alias detector once more before
-            // bit-blasting, then re-run preprocessing so variable substitution
-            // can collapse downstream BV users of the derived equality.
-            std::mem::swap(&mut self.ctx.assertions, &mut preprocessed);
-            current_assertion_source_sets = Some(preprocessed_source_sets);
-            if !self.is_producing_proofs() {
-                let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
-                if derived > 0 {
-                    let source_sets = current_assertion_source_sets
-                        .as_mut()
-                        .expect("early preprocess source sets preserved");
-                    source_sets.resize(self.ctx.assertions.len(), Vec::new());
-                    let total = self
-                        .last_statistics
-                        .get_int("smt.abv.packed_mux.derived_select_equalities")
-                        .unwrap_or(0)
-                        + derived as u64;
-                    self.last_statistics
-                        .set_int("smt.abv.packed_mux.derived_select_equalities", total);
-                    preprocessor.preprocess_with_sources(
-                        &mut self.ctx.terms,
-                        &mut self.ctx.assertions,
-                        source_sets,
-                    );
-                }
-            }
-            // #ppp-provenance: drain the pass's rewrite records once, after
-            // the final preprocess run of this site, under the campaign kill
-            // switch (off = no records anywhere = pristine baseline).
-            self.extend_propagated_value_provenance(&propagate_values);
-            if debug_preprocessed_enabled() {
-                safe_eprintln!(
-                    "[preprocess] assertions after preprocessing (early/ABV): {}",
-                    self.ctx.assertions.len()
+                None
+            };
+            let var_subst = if early_preprocess {
+                phase_trace!("phase0.count-array-ops");
+                let mut preprocessed = self.ctx.assertions.clone();
+                let mut preprocessed_source_sets = current_assertion_source_sets
+                    .clone()
+                    .expect("early preprocess source sets initialized");
+                let (mut preprocessor, var_subst, propagate_values) = match structural_progress {
+                    Some(progress) => {
+                        Preprocessor::new_with_recorded_subst_and_propagation(progress)
+                    }
+                    None => Preprocessor::new_with_subst_and_propagation(),
+                };
+                let (initial_num_selects, initial_num_stores) =
+                    self.count_array_op_occurrences_in_assertions();
+                self.last_statistics.set_int(
+                    "smt.abv.variable_subst.scalar_budget_input_selects",
+                    initial_num_selects as u64,
                 );
-                for (idx, &assertion) in self.ctx.assertions.iter().enumerate() {
-                    safe_eprintln!("[preprocess] {}: {}", idx, self.format_term(assertion));
-                }
-            }
-            // Swap assertions with preprocessed version so array axiom fixpoint
-            // sees post-substitution terms. Original assertions are preserved for
-            // restore/model validation; the flattened form is only an encoding aid.
-            Some((
-                var_subst,
-                original_assertions_before_early_preprocess
-                    .expect("early preprocess original assertions saved"),
-            ))
-        } else {
-            None
-        };
-
-        // --- Phase 0a: BV1 bvand flattening ---
-        phase_trace!("phase0a-bvand-flatten");
-        // Flatten `(= #b1 (bvand t1 t2 ...))` into separate assertions.
-        // The try3/try5 QF_ABV benchmarks encode their entire formula as a
-        // single assertion with a giant bvand tree at BV1 width. Flattening
-        // exposes individual constraints (including store equalities) for
-        // the array axiom fixpoint and store-flat substitution to operate on.
-        if config.array_axioms && !early_preprocess {
-            self.flatten_bv1_bvand_assertions();
-        }
-
-        // Track the source-mapped primary roots separately from generated array
-        // axioms. Array preprocessing appends ROW/FC roots and rewrites selects;
-        // source sets must follow only the original prefix through those
-        // same-length rewrites.
-        let primary_formula_len = if config.array_axioms && var_subst.is_some() {
-            Some(self.ctx.assertions.len())
-        } else {
-            None
-        };
-        let mut primary_formula_assertions = if config.array_axioms && var_subst.is_some() {
-            Some(self.ctx.assertions.clone())
-        } else {
-            None
-        };
-        let primary_formula_assertion_source_sets = if config.array_axioms && var_subst.is_some() {
-            current_assertion_source_sets.clone()
-        } else {
-            None
-        };
-
-        // --- Phase 0b: Array axiom fixpoint (if enabled) ---
-        phase_trace!("phase0b-array-axioms");
-        // Must run before Tseitin because it adds new assertion-level terms.
-        // When preprocessing is enabled (QF_ABV), assertions are already
-        // preprocessed at this point (#8140).
-        if config.array_axioms {
-            let cegar_rounds = self
-                .last_statistics
-                .get_int("smt.abv.array_fc_cegar.refinement_rounds")
-                .unwrap_or(0);
-            self.last_statistics
-                .set_int("smt.abv.array_fc_cegar.refinement_rounds", cegar_rounds);
-            for key in [
-                "smt.abv.array_fixpoint.runs",
-                "smt.abv.array_fixpoint.skips",
-            ] {
-                let current = self.last_statistics.get_int(key).unwrap_or(0);
-                self.last_statistics.set_int(key, current);
-            }
-            // Reify array-sorted equality atoms for UF arguments (#12).
-            // When a UF takes whole-array arguments (e.g. `h(a)`, `h(b)`),
-            // congruence `(= a b) → (= h(a) h(b))` requires the atom `(= a b)`
-            // (and its negation) to exist BEFORE extensionality runs, so that:
-            //   1. extensionality generates `(= a b) ∨ select(a,k) ≠ select(b,k)`,
-            //      letting the array theory drive `(= a b)` true from a store
-            //      no-op (`a = store(b, i, select a i)`, `select a i = select b i`);
-            //   2. Tseitin internalizes `(= a b)`, giving the non-BV congruence
-            //      generator a variable to build the `(args differ) ∨ (h(a)=h(b))`
-            //      clause from.
-            // Without the atom, `a = b` is only derivable inside the array layer,
-            // never reaches the UF layer, and `(distinct (h a) (h b))` is wrongly
-            // satisfiable (Nelson-Oppen sharing gap). The tautology
-            // `(or (= a b) (not (= a b)))` adds no semantic constraint.
-            // Must run before extensionality / finite-array axioms below.
-            if config.uf_congruence || config.non_bv_congruence {
-                let uf_eq_roots: Vec<TermId> = assumption_roots.to_vec();
-                let reified = self.reify_array_uf_arg_equalities(&uf_eq_roots);
-                if reified > 0 {
+                self.last_statistics.set_int(
+                    "smt.abv.variable_subst.scalar_budget_input_stores",
+                    initial_num_stores as u64,
+                );
+                if Self::should_budget_scalar_variable_substitution(
+                    initial_num_stores,
+                    initial_num_selects,
+                ) {
+                    var_subst
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .set_scalar_replacement_node_limit(VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT);
                     self.last_statistics
-                        .set_int("smt.aufbv.array_uf_eq.reified", reified as u64);
+                        .set_int("smt.abv.variable_subst.scalar_budgeted", 1);
+                } else {
+                    self.last_statistics
+                        .set_int("smt.abv.variable_subst.scalar_budgeted", 0);
                 }
+                phase_trace!("phase0.preprocessor-loop");
+                preprocessor.preprocess_with_sources(
+                    &mut self.ctx.terms,
+                    &mut preprocessed,
+                    &mut preprocessed_source_sets,
+                );
+                phase_trace!("phase0.preprocessor-loop-done");
+                // Some ABV generators SSA-lower packed muxes through many one-bit
+                // variables. The first preprocessing pass exposes those ITE/concat
+                // structures; run the packed-mux alias detector once more before
+                // bit-blasting, then re-run preprocessing so variable substitution
+                // can collapse downstream BV users of the derived equality.
+                std::mem::swap(&mut self.ctx.assertions, &mut preprocessed);
+                current_assertion_source_sets = Some(preprocessed_source_sets);
+                if !self.is_producing_proofs() {
+                    let derived = self.add_packed_mux_output_select_equalities_for_preprocess();
+                    if derived > 0 {
+                        let source_sets = current_assertion_source_sets
+                            .as_mut()
+                            .expect("early preprocess source sets preserved");
+                        source_sets.resize(self.ctx.assertions.len(), Vec::new());
+                        let total = self
+                            .last_statistics
+                            .get_int("smt.abv.packed_mux.derived_select_equalities")
+                            .unwrap_or(0)
+                            + derived as u64;
+                        self.last_statistics
+                            .set_int("smt.abv.packed_mux.derived_select_equalities", total);
+                        preprocessor.preprocess_with_sources(
+                            &mut self.ctx.terms,
+                            &mut self.ctx.assertions,
+                            source_sets,
+                        );
+                    }
+                }
+                // #ppp-provenance: drain the pass's rewrite records once, after
+                // the final preprocess run of this site, under the campaign kill
+                // switch (off = no records anywhere = pristine baseline).
+                self.extend_propagated_value_provenance(&propagate_values);
+                if debug_preprocessed_enabled() {
+                    safe_eprintln!(
+                        "[preprocess] assertions after preprocessing (early/ABV): {}",
+                        self.ctx.assertions.len()
+                    );
+                    for (idx, &assertion) in self.ctx.assertions.iter().enumerate() {
+                        safe_eprintln!("[preprocess] {}: {}", idx, self.format_term(assertion));
+                    }
+                }
+                // Swap assertions with preprocessed version so array axiom fixpoint
+                // sees post-substitution terms. Original assertions are preserved for
+                // restore/model validation; the flattened form is only an encoding aid.
+                Some((
+                    var_subst,
+                    original_assertions_before_early_preprocess
+                        .expect("early preprocess original assertions saved"),
+                ))
+            } else {
+                None
+            };
+
+            // --- Phase 0a: BV1 bvand flattening ---
+            phase_trace!("phase0a-bvand-flatten");
+            // Flatten `(= #b1 (bvand t1 t2 ...))` into separate assertions.
+            // The try3/try5 QF_ABV benchmarks encode their entire formula as a
+            // single assertion with a giant bvand tree at BV1 width. Flattening
+            // exposes individual constraints (including store equalities) for
+            // the array axiom fixpoint and store-flat substitution to operate on.
+            if config.array_axioms && !early_preprocess {
+                self.flatten_bv1_bvand_assertions();
             }
 
-            // Ensure negation terms exist for array equalities inside ITE
-            // conditions. Without this, `add_array_extensionality_axioms` skips
-            // array equalities used only as ITE conditions (no standalone
-            // negation), leaving them unconstrained and causing unknown/wrong-SAT
-            // on QF_ABV benchmarks with `(ite (= array1 array2) ...)` patterns.
-            self.ensure_array_eq_ite_negations();
+            // Track the source-mapped primary roots separately from generated array
+            // axioms. Array preprocessing appends ROW/FC roots and rewrites selects;
+            // source sets must follow only the original prefix through those
+            // same-length rewrites.
+            let primary_formula_len = if config.array_axioms && var_subst.is_some() {
+                Some(self.ctx.assertions.len())
+            } else {
+                None
+            };
+            let mut primary_formula_assertions = if config.array_axioms && var_subst.is_some() {
+                Some(self.ctx.assertions.clone())
+            } else {
+                None
+            };
+            let primary_formula_assertion_source_sets =
+                if config.array_axioms && var_subst.is_some() {
+                    current_assertion_source_sets.clone()
+                } else {
+                    None
+                };
 
-            // Exact finite-domain closure must see the route's post-preprocess
-            // assertion surface before generic extensionality. Besides avoiding
-            // a redundant difference Skolem, this ordering matters recursively:
-            // the generic witness select over a nested finite array would expose
-            // an artificial fourth equality candidate in addition to the outer
-            // equality and its two concrete BV1 cells. Active exact coverage lets
-            // the generic pass suppress that witness. The final closure below is
-            // still required for equalities and reads synthesized by the legacy
-            // fixpoint, select/store rewriting, and ROW2 materialization.
-            phase_trace!("phase0b-initial-finite-array-closure");
-            let _ = self.add_finite_index_array_closure_with_roots(assumption_roots);
-            self.add_array_extensionality_axioms();
-
-            // Adaptive fixpoint gate: skip the array axiom fixpoint on formulas
-            // where it would cause term explosion. The fixpoint loop creates
-            // new selects via congruence axioms, compounding O(N^2) term growth.
-            //
-            // Gate: skip the general fixpoint when the formula has too many
-            // selects (> 80), since the O(selects^2) congruence generation is
-            // too expensive, EXCEPT when a symbolic array `default` is active:
-            // its carrier-sensitive store axioms are semantic requirements and
-            // cannot be dropped by a performance throttle. For smaller formulas
-            // (or a required default), the fixpoint runs with a term budget (10K
-            // terms, #8140) enforced inside run_array_axiom_fixpoint_inner.
-            //
-            // When the fixpoint is skipped or bails on budget, the
-            // expand_select_store pass and ROW axioms in
-            // generate_array_bv_axioms provide sufficient array reasoning.
-            // #8510: Count only selects that interact with stores (selects
-            // on store-chain arrays or selects with symbolic indices). The
-            // original gate threshold of 80 is hit by benchmarks with many
-            // trivial constant-indexed selects on constant arrays (e.g.,
-            // csplit-query QF_ABV benchmarks have 2000+ trivial selects but
-            // only 8 complex ones). Skipping the fixpoint causes false SAT.
-            let complex_selects = self.count_complex_array_selects_in_assertions();
-            self.last_statistics.set_int(
-                "smt.abv.array_fixpoint.complex_selects",
-                complex_selects as u64,
-            );
-            let default_fixpoint_required =
-                self.has_symbolic_array_default_in_roots(assumption_roots);
-            if complex_selects <= 80 || default_fixpoint_required {
-                let runs = self
+            // --- Phase 0b: Array axiom fixpoint (if enabled) ---
+            phase_trace!("phase0b-array-axioms");
+            // The append-only arena still contains eliminated array definitions.
+            // Generate from this route's live post-substitution surface, including
+            // logical assumptions, and retain the caller's scope for restoration.
+            let previous_array_scope = config
+                .array_axioms
+                .then(|| self.begin_live_array_axiom_scope(assumption_roots));
+            // Must run before Tseitin because it adds new assertion-level terms.
+            // When preprocessing is enabled (QF_ABV), assertions are already
+            // preprocessed at this point (#8140).
+            if config.array_axioms {
+                let cegar_rounds = self
                     .last_statistics
-                    .get_int("smt.abv.array_fixpoint.runs")
+                    .get_int("smt.abv.array_fc_cegar.refinement_rounds")
                     .unwrap_or(0);
                 self.last_statistics
-                    .set_int("smt.abv.array_fixpoint.runs", runs.saturating_add(1));
-                if assumption_roots.is_empty() {
-                    if let Some(primary_formula_len) = primary_formula_len {
-                        self.run_array_axiom_fixpoint_at(
-                            primary_formula_len,
-                            ArrayAxiomMode::EagerAll,
-                        );
+                    .set_int("smt.abv.array_fc_cegar.refinement_rounds", cegar_rounds);
+                for key in [
+                    "smt.abv.array_fixpoint.runs",
+                    "smt.abv.array_fixpoint.skips",
+                ] {
+                    let current = self.last_statistics.get_int(key).unwrap_or(0);
+                    self.last_statistics.set_int(key, current);
+                }
+                // Reify array-sorted equality atoms for UF arguments (#12).
+                // When a UF takes whole-array arguments (e.g. `h(a)`, `h(b)`),
+                // congruence `(= a b) → (= h(a) h(b))` requires the atom `(= a b)`
+                // (and its negation) to exist BEFORE extensionality runs, so that:
+                //   1. extensionality generates `(= a b) ∨ select(a,k) ≠ select(b,k)`,
+                //      letting the array theory drive `(= a b)` true from a store
+                //      no-op (`a = store(b, i, select a i)`, `select a i = select b i`);
+                //   2. Tseitin internalizes `(= a b)`, giving the non-BV congruence
+                //      generator a variable to build the `(args differ) ∨ (h(a)=h(b))`
+                //      clause from.
+                // Without the atom, `a = b` is only derivable inside the array layer,
+                // never reaches the UF layer, and `(distinct (h a) (h b))` is wrongly
+                // satisfiable (Nelson-Oppen sharing gap). The tautology
+                // `(or (= a b) (not (= a b)))` adds no semantic constraint.
+                // Must run before extensionality / finite-array axioms below.
+                if config.uf_congruence || config.non_bv_congruence {
+                    let uf_eq_roots: Vec<TermId> = assumption_roots.to_vec();
+                    let reified = self.reify_array_uf_arg_equalities(&uf_eq_roots);
+                    if reified > 0 {
+                        self.last_statistics
+                            .set_int("smt.aufbv.array_uf_eq.reified", reified as u64);
+                    }
+                }
+
+                // Ensure negation terms exist for array equalities inside ITE
+                // conditions. Without this, `add_array_extensionality_axioms` skips
+                // array equalities used only as ITE conditions (no standalone
+                // negation), leaving them unconstrained and causing unknown/wrong-SAT
+                // on QF_ABV benchmarks with `(ite (= array1 array2) ...)` patterns.
+                self.ensure_array_eq_ite_negations();
+
+                // Exact finite-domain closure must see the route's post-preprocess
+                // assertion surface before generic extensionality. Besides avoiding
+                // a redundant difference Skolem, this ordering matters recursively:
+                // the generic witness select over a nested finite array would expose
+                // an artificial fourth equality candidate in addition to the outer
+                // equality and its two concrete BV1 cells. Active exact coverage lets
+                // the generic pass suppress that witness. The final closure below is
+                // still required for equalities and reads synthesized by the legacy
+                // fixpoint, select/store rewriting, and ROW2 materialization.
+                phase_trace!("phase0b-initial-finite-array-closure");
+                let _ = self.add_finite_index_array_closure_with_roots(assumption_roots);
+                self.add_array_extensionality_axioms();
+
+                // Adaptive fixpoint gate: skip the array axiom fixpoint on formulas
+                // where it would cause term explosion. The fixpoint loop creates
+                // new selects via congruence axioms, compounding O(N^2) term growth.
+                //
+                // Gate: skip the general fixpoint when the formula has too many
+                // selects (> 80), since the O(selects^2) congruence generation is
+                // too expensive, EXCEPT when a symbolic array `default` is active:
+                // its carrier-sensitive store axioms are semantic requirements and
+                // cannot be dropped by a performance throttle. For smaller formulas
+                // (or a required default), the fixpoint runs with a term budget (10K
+                // terms, #8140) enforced inside run_array_axiom_fixpoint_inner.
+                //
+                // When the fixpoint is skipped or bails on budget, the
+                // expand_select_store pass and ROW axioms in
+                // generate_array_bv_axioms provide sufficient array reasoning.
+                // #8510: Count only selects that interact with stores (selects
+                // on store-chain arrays or selects with symbolic indices). The
+                // original gate threshold of 80 is hit by benchmarks with many
+                // trivial constant-indexed selects on constant arrays (e.g.,
+                // csplit-query QF_ABV benchmarks have 2000+ trivial selects but
+                // only 8 complex ones). Skipping the fixpoint causes false SAT.
+                let complex_selects = self.count_complex_array_selects_in_assertions();
+                self.last_statistics.set_int(
+                    "smt.abv.array_fixpoint.complex_selects",
+                    complex_selects as u64,
+                );
+                let default_fixpoint_required =
+                    self.has_symbolic_array_default_in_roots(assumption_roots);
+                if complex_selects <= 80 || default_fixpoint_required {
+                    let runs = self
+                        .last_statistics
+                        .get_int("smt.abv.array_fixpoint.runs")
+                        .unwrap_or(0);
+                    self.last_statistics
+                        .set_int("smt.abv.array_fixpoint.runs", runs.saturating_add(1));
+                    if assumption_roots.is_empty() {
+                        if let Some(primary_formula_len) = primary_formula_len {
+                            self.run_array_axiom_fixpoint_at(
+                                primary_formula_len,
+                                ArrayAxiomMode::EagerAll,
+                            );
+                        } else {
+                            self.run_array_axiom_fixpoint_5();
+                        }
                     } else {
-                        self.run_array_axiom_fixpoint_5();
+                        self.run_array_axiom_fixpoint_5_with_roots(assumption_roots);
                     }
                 } else {
-                    self.run_array_axiom_fixpoint_5_with_roots(assumption_roots);
+                    let skips = self
+                        .last_statistics
+                        .get_int("smt.abv.array_fixpoint.skips")
+                        .unwrap_or(0);
+                    self.last_statistics
+                        .set_int("smt.abv.array_fixpoint.skips", skips.saturating_add(1));
                 }
-            } else {
-                let skips = self
-                    .last_statistics
-                    .get_int("smt.abv.array_fixpoint.skips")
-                    .unwrap_or(0);
+
+                // Expand select(store(a, I, v), J) into ITE chains. This converts
+                // remaining select-over-store patterns into boolean structure that
+                // Tseitin + BV bitblasting encode directly, avoiding expensive
+                // bit-level ROW axiom generation in generate_array_bv_axioms.
+                // Concrete-distinct indices skip through without generating ITEs.
+                // Z3 ref: array_rewriter.cpp:354-381.
+                //
+                // Adaptive ITE budget (#8140): use a higher symbolic ITE budget for
+                // formulas with moderate store chain depth. For bubble_sort22-like
+                // benchmarks, this resolves more store levels as ITEs at the term
+                // level, dramatically reducing the clause count sent to the SAT
+                // solver and avoiding the pathological L0 GC overhead on 4M+ clause
+                // databases.
+                let num_stores = self.count_array_stores_in_assertions();
+                let num_selects = self.count_array_selects_in_assertions();
                 self.last_statistics
-                    .set_int("smt.abv.array_fixpoint.skips", skips.saturating_add(1));
-            }
-
-            // Expand select(store(a, I, v), J) into ITE chains. This converts
-            // remaining select-over-store patterns into boolean structure that
-            // Tseitin + BV bitblasting encode directly, avoiding expensive
-            // bit-level ROW axiom generation in generate_array_bv_axioms.
-            // Concrete-distinct indices skip through without generating ITEs.
-            // Z3 ref: array_rewriter.cpp:354-381.
-            //
-            // Adaptive ITE budget (#8140): use a higher symbolic ITE budget for
-            // formulas with moderate store chain depth. For bubble_sort22-like
-            // benchmarks, this resolves more store levels as ITEs at the term
-            // level, dramatically reducing the clause count sent to the SAT
-            // solver and avoiding the pathological L0 GC overhead on 4M+ clause
-            // databases.
-            let num_stores = self.count_array_stores_in_assertions();
-            let num_selects = self.count_array_selects_in_assertions();
-            self.last_statistics
-                .set_int("smt.abv.select_store_expansion.stores", num_stores as u64);
-            self.last_statistics
-                .set_int("smt.abv.select_store_expansion.selects", num_selects as u64);
-            self.ctx.assertions = self
-                .ctx
-                .terms
-                .expand_select_store_all_adaptive(&self.ctx.assertions, num_stores);
-            if let Some(primary_formula_len) = primary_formula_len {
-                primary_formula_assertions =
-                    Some(self.ctx.assertions[..primary_formula_len].to_vec());
-            }
-        }
-        debug_assert_eq!(
-            primary_formula_assertions.as_ref().map(Vec::len),
-            primary_formula_assertion_source_sets.as_ref().map(Vec::len)
-        );
-
-        let mut array_axiom_extra_roots = assumption_roots.to_vec();
-        if let Some((ref var_subst, _)) = var_subst {
-            let substitutions = var_subst
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for &replacement in substitutions.substitutions().values() {
-                array_axiom_extra_roots.push(replacement);
-            }
-            for &source in substitutions.substitution_sources().values() {
-                array_axiom_extra_roots.push(source);
-            }
-        }
-        if config.array_axioms {
-            // Substitution sources/replacements are discovery seeds for ROW2
-            // read materialization, not live Boolean constraints. Keep a
-            // watermark so the final exact-closure scan sees only the actual
-            // assumption roots and the new read terms materialized below.
-            // Re-scanning every eliminated source equality here resurrects the
-            // store-flat aliases that route-local preprocessing just removed
-            // (50 BV8 aliases previously expanded into 12,800 dead cells).
-            let row2_root_start = array_axiom_extra_roots.len();
-            let row2_roots = self.materialize_array_row2_read_terms(&mut array_axiom_extra_roots);
-            if row2_roots > 0 {
+                    .set_int("smt.abv.select_store_expansion.stores", num_stores as u64);
                 self.last_statistics
-                    .set_int("smt.abv.row2.materialized_read_terms", row2_roots as u64);
+                    .set_int("smt.abv.select_store_expansion.selects", num_selects as u64);
+                self.ctx.assertions = self
+                    .ctx
+                    .terms
+                    .expand_select_store_all_adaptive(&self.ctx.assertions, num_stores);
+                if let Some(primary_formula_len) = primary_formula_len {
+                    primary_formula_assertions =
+                        Some(self.ctx.assertions[..primary_formula_len].to_vec());
+                }
             }
-
-            // This is the owning route's final exact-closure boundary. The
-            // legacy array fixpoint above can synthesize array-valued select
-            // equalities, select/store expansion rewrites the assertion DAG,
-            // and ROW2 materialization adds extra read roots. None of those
-            // post-initial-closure surfaces may reach Tseitin/bit-blasting
-            // without another exact scan. Context assertions are scanned
-            // implicitly; temporary logical assumptions and newly materialized
-            // branch/base reads are the only additional live surfaces.
-            phase_trace!("phase0b-final-finite-array-closure");
-            let mut finite_closure_extra_roots = Vec::with_capacity(
-                assumption_roots
-                    .len()
-                    .saturating_add(array_axiom_extra_roots.len() - row2_root_start),
+            debug_assert_eq!(
+                primary_formula_assertions.as_ref().map(Vec::len),
+                primary_formula_assertion_source_sets.as_ref().map(Vec::len)
             );
-            finite_closure_extra_roots.extend_from_slice(assumption_roots);
-            finite_closure_extra_roots
-                .extend_from_slice(&array_axiom_extra_roots[row2_root_start..]);
-            let _ = self.add_finite_index_array_closure_with_roots(&finite_closure_extra_roots);
-        }
 
-        // --- Phase 1: Proof setup ---
-        phase_trace!("phase1-proof-setup");
-        let proof_enabled = self.produce_proofs_enabled();
-        if proof_enabled {
-            self.proof_tracker.set_theory(config.theory_tag);
-            for (idx, &assertion) in self.ctx.assertions.iter().enumerate() {
-                let _ = self
-                    .proof_tracker
-                    .add_assumption(assertion, Some(format!("h{idx}")));
-            }
-        }
-
-        // --- Incremental path: persistent SAT solver with push/pop scoping ---
-        // When config.incremental is true, uses IncrementalBvState for cached
-        // Tseitin/BvSolver/SatSolver state management. This path only encodes NEW
-        // assertions incrementally and adds definitional clauses globally.
-        if config.incremental {
-            let result = self.solve_bv_incremental_inner(&config, proof_enabled);
-            return self.fail_close_incomplete_finite_array_sat(result);
-        }
-
-        // Interrupt check after array axiom fixpoint and proof setup (#3070).
-        if self.should_abort_theory_loop() {
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            return Ok(SolveResult::Unknown);
-        }
-
-        // --- Phase 2: Optional preprocessing (pure BV without array axioms) ---
-        phase_trace!("phase2-preprocess");
-        // For combined theories (QF_ABV), preprocessing already ran in Phase 0.
-        // This phase handles the pure BV case (no array axioms).
-        let var_subst = if !early_preprocess && config.preprocess && assumptions.is_empty() {
-            let (var_subst, mut preprocessed, preprocessed_source_sets) =
-                self.preprocess_pure_bv_assertions();
-            if debug_preprocessed_enabled() {
-                safe_eprintln!(
-                    "[preprocess] assertions after preprocessing: {}",
-                    preprocessed.len()
-                );
-                for (idx, &assertion) in preprocessed.iter().enumerate() {
-                    safe_eprintln!("[preprocess] {}: {}", idx, self.format_term(assertion));
+            let mut array_axiom_extra_roots = assumption_roots.to_vec();
+            if let Some((ref var_subst, _)) = var_subst {
+                let substitutions = var_subst
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for &replacement in substitutions.substitutions().values() {
+                    array_axiom_extra_roots.push(replacement);
+                }
+                for &source in substitutions.substitution_sources().values() {
+                    array_axiom_extra_roots.push(source);
                 }
             }
-            if debug_ite_conditions_enabled() {
-                use ay_core::kani_compat::DetHashMap as HashMap;
-                let mut cond_terms: HashMap<String, Vec<(usize, TermId)>> = HashMap::default();
-                for (idx, &assertion) in preprocessed.iter().enumerate() {
-                    if let TermData::Ite(cond, _, _) = self.ctx.terms.get(assertion) {
-                        let cond = *cond;
-                        let cond_str = self.format_term(cond);
-                        cond_terms.entry(cond_str).or_default().push((idx, cond));
+            let late_array_reads = if config.array_axioms {
+                // Substitution sources/replacements are discovery seeds for ROW2
+                // read materialization, not live Boolean constraints. Keep a
+                // watermark so the final exact-closure scan sees only the actual
+                // assumption roots and the new read terms materialized below.
+                // Re-scanning every eliminated source equality here resurrects the
+                // store-flat aliases that route-local preprocessing just removed
+                // (50 BV8 aliases previously expanded into 12,800 dead cells).
+                let row2_root_start = array_axiom_extra_roots.len();
+                let reads = self.materialize_array_row2_read_terms(&mut array_axiom_extra_roots);
+                let row2_roots = reads.added_roots();
+                if row2_roots > 0 {
+                    self.last_statistics
+                        .set_int("smt.abv.row2.materialized_read_terms", row2_roots as u64);
+                }
+
+                // This is the owning route's final exact-closure boundary. The
+                // legacy array fixpoint above can synthesize array-valued select
+                // equalities, select/store expansion rewrites the assertion DAG,
+                // and ROW2 materialization adds extra read roots. None of those
+                // post-initial-closure surfaces may reach Tseitin/bit-blasting
+                // without another exact scan. Context assertions are scanned
+                // implicitly; temporary logical assumptions and newly materialized
+                // branch/base reads are the only additional live surfaces.
+                phase_trace!("phase0b-final-finite-array-closure");
+                let mut finite_closure_extra_roots = Vec::with_capacity(
+                    assumption_roots
+                        .len()
+                        .saturating_add(array_axiom_extra_roots.len() - row2_root_start),
+                );
+                finite_closure_extra_roots.extend_from_slice(assumption_roots);
+                finite_closure_extra_roots
+                    .extend_from_slice(&array_axiom_extra_roots[row2_root_start..]);
+                let _ = self.add_finite_index_array_closure_with_roots(&finite_closure_extra_roots);
+                Some(reads)
+            } else {
+                None
+            };
+            if let Some(scope) = previous_array_scope {
+                self.array_axiom_scope = scope;
+            }
+
+            // --- Phase 1: Proof setup ---
+            phase_trace!("phase1-proof-setup");
+            let proof_enabled = self.produce_proofs_enabled();
+            if proof_enabled {
+                self.proof_tracker.set_theory(config.theory_tag);
+                for (idx, &assertion) in self.ctx.assertions.iter().enumerate() {
+                    let _ = self
+                        .proof_tracker
+                        .add_assumption(assertion, Some(format!("h{idx}")));
+                }
+                // The same temporary assumptions are encoded and passed to SAT
+                // below. Record their actual input leaves too: a nonempty base
+                // tracker bypasses the assertion-only assembly seed, so omitting
+                // these leaves would reconstruct a different, weaker problem.
+                for (idx, &assumption) in assumptions.iter().enumerate() {
+                    let _ = self
+                        .proof_tracker
+                        .add_assumption(assumption, Some(format!("ha{idx}")));
+                }
+            }
+
+            // --- Incremental path: persistent SAT solver with push/pop scoping ---
+            // When config.incremental is true, uses IncrementalBvState for cached
+            // Tseitin/BvSolver/SatSolver state management. This path only encodes NEW
+            // assertions incrementally and adds definitional clauses globally.
+            if config.incremental {
+                let result = self.solve_bv_incremental_inner(&config, proof_enabled, encoding);
+                return self.fail_close_incomplete_finite_array_sat(result);
+            }
+
+            // Interrupt check after array axiom fixpoint and proof setup (#3070).
+            if self.should_abort_theory_loop() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return Ok(SolveResult::Unknown);
+            }
+
+            // --- Phase 2: Optional preprocessing (pure BV without array axioms) ---
+            phase_trace!("phase2-preprocess");
+            // For combined theories (QF_ABV), preprocessing already ran in Phase 0.
+            // This phase handles the pure BV case (no array axioms).
+            let var_subst = if !early_preprocess && config.preprocess && assumptions.is_empty() {
+                let (var_subst, mut preprocessed, preprocessed_source_sets) =
+                    self.preprocess_pure_bv_assertions();
+                if debug_preprocessed_enabled() {
+                    safe_eprintln!(
+                        "[preprocess] assertions after preprocessing: {}",
+                        preprocessed.len()
+                    );
+                    for (idx, &assertion) in preprocessed.iter().enumerate() {
+                        safe_eprintln!("[preprocess] {}: {}", idx, self.format_term(assertion));
                     }
                 }
-                for (cond_str, occurrences) in &cond_terms {
-                    let ids: Vec<_> = occurrences.iter().map(|(_, id)| id.index()).collect();
-                    let same = occurrences.iter().all(|(_, id)| *id == occurrences[0].1);
-                    safe_eprintln!(
-                        "[ite-cond] '{}': TermIds {:?}, unified={}",
-                        cond_str,
-                        ids,
-                        same
-                    );
+                if debug_ite_conditions_enabled() {
+                    use ay_core::kani_compat::DetHashMap as HashMap;
+                    let mut cond_terms: HashMap<String, Vec<(usize, TermId)>> = HashMap::default();
+                    for (idx, &assertion) in preprocessed.iter().enumerate() {
+                        if let TermData::Ite(cond, _, _) = self.ctx.terms.get(assertion) {
+                            let cond = *cond;
+                            let cond_str = self.format_term(cond);
+                            cond_terms.entry(cond_str).or_default().push((idx, cond));
+                        }
+                    }
+                    for (cond_str, occurrences) in &cond_terms {
+                        let ids: Vec<_> = occurrences.iter().map(|(_, id)| id.index()).collect();
+                        let same = occurrences.iter().all(|(_, id)| *id == occurrences[0].1);
+                        safe_eprintln!(
+                            "[ite-cond] '{}': TermIds {:?}, unified={}",
+                            cond_str,
+                            ids,
+                            same
+                        );
+                    }
                 }
+                // Swap assertions with preprocessed version for Tseitin/bitblast.
+                // Original assertions are preserved in `saved_assertions` and restored
+                // at the end of the function for incremental mode, model verification,
+                // and proof production.
+                std::mem::swap(&mut self.ctx.assertions, &mut preprocessed);
+                current_assertion_source_sets = Some(preprocessed_source_sets);
+                Some((var_subst, preprocessed))
+            } else {
+                var_subst
+            };
+            // #abv-subst-model-retry: mark this check-sat as a substitution-
+            // carrying BV-lane solve (Phase 0 ABV path or Phase 2 pure-BV path).
+            // Any gate rejection of this solve's model (refutation, incomplete
+            // validation, cannot-confirm downgrade) then arms the single
+            // preprocessing-free re-solve in `check_sat_guarded`.
+            if var_subst.is_some() {
+                self.bv_subst_lane = true;
             }
-            // Swap assertions with preprocessed version for Tseitin/bitblast.
-            // Original assertions are preserved in `saved_assertions` and restored
-            // at the end of the function for incremental mode, model verification,
-            // and proof production.
-            std::mem::swap(&mut self.ctx.assertions, &mut preprocessed);
-            current_assertion_source_sets = Some(preprocessed_source_sets);
-            Some((var_subst, preprocessed))
-        } else {
-            var_subst
-        };
-        // #abv-subst-model-retry: mark this check-sat as a substitution-
-        // carrying BV-lane solve (Phase 0 ABV path or Phase 2 pure-BV path).
-        // A model refutation from this solve (in-loop BV validation or the
-        // independent gate) then arms the single preprocessing-free re-solve
-        // in `check_sat_guarded`.
-        if var_subst.is_some() {
-            self.bv_subst_lane = true;
-        }
 
-        // --- Phase 3: Tseitin transformation (incremental API) ---
-        phase_trace!("phase3-tseitin");
-        // Use incremental Tseitin so we can encode assumptions without asserting
-        // them as unit clauses. This ensures assumption terms (e.g., UF applications
-        // in `distinct(f(x), f(y))`) get Tseitin variables assigned and are visible
-        // to downstream axiom generation (EUF congruence, array axioms).
-        let mut tseitin = Tseitin::new(&self.ctx.terms);
-        for &assertion in &self.ctx.assertions {
-            tseitin.assert_term(assertion);
-        }
+            // --- Phase 3: Tseitin transformation (incremental API) ---
+            phase_trace!("phase3-tseitin");
+            // Use incremental Tseitin so we can encode assumptions without asserting
+            // them as unit clauses. This ensures assumption terms (e.g., UF applications
+            // in `distinct(f(x), f(y))`) get Tseitin variables assigned and are visible
+            // to downstream axiom generation (EUF congruence, array axioms).
+            let mut tseitin = Tseitin::new(&self.ctx.terms);
+            for &assertion in &self.ctx.assertions {
+                tseitin.assert_term(assertion);
+            }
 
-        // --- Phase 3b: Assumption handling ---
-        // Encode assumption terms via Tseitin (without adding unit clauses) so they
-        // get CNF variables. This fixes #5535: assumption terms not in assertions
-        // were silently dropped because they had no Tseitin encoding.
-        let has_assumptions = !assumptions.is_empty();
-        let (sat_assumptions, assumption_to_term): (Vec<SatLiteral>, Vec<(SatLiteral, TermId)>) =
-            if has_assumptions {
+            // --- Phase 3b: Assumption handling ---
+            // Encode assumption terms via Tseitin (without adding unit clauses) so they
+            // get CNF variables. This fixes #5535: assumption terms not in assertions
+            // were silently dropped because they had no Tseitin encoding.
+            let has_assumptions = !assumptions.is_empty();
+            let (sat_assumptions, assumption_to_term): (
+                Vec<SatLiteral>,
+                Vec<(SatLiteral, TermId)>,
+            ) = if has_assumptions {
                 let mut sat_assumps = Vec::new();
                 let mut map = Vec::new();
                 for &assumption in assumptions {
@@ -1152,1269 +1139,1514 @@ impl Executor {
                 (Vec::new(), Vec::new())
             };
 
-        // Build TseitinResult from incremental state
-        let tseitin_result = TseitinResult::new(
-            tseitin.all_clauses().to_vec(),
-            tseitin.term_to_var().clone(),
-            tseitin.var_to_term().clone(),
-            0, // Not used when clauses are added individually
-            tseitin.num_vars(),
-        );
+            // Transfer the complete assertion database and release the encoder's
+            // unused cache before bitblasting; do not retain a cloned CNF/maps.
+            let tseitin_result = tseitin.into_assertion_result();
 
-        debug_assert!(
-            self.ctx.assertions.is_empty() || !tseitin_result.clauses.is_empty(),
-            "BUG: Tseitin produced 0 clauses from {} assertions in {}",
-            self.ctx.assertions.len(),
-            config.theory_tag
-        );
+            debug_assert!(
+                self.ctx.assertions.is_empty() || !tseitin_result.clauses.is_empty(),
+                "BUG: Tseitin produced 0 clauses from {} assertions in {}",
+                self.ctx.assertions.len(),
+                config.theory_tag
+            );
 
-        // Interrupt check before bitblasting (#3070). Wide BV multipliers
-        // (64-bit) generate ~128K gates; bail out before that work if timed out.
-        if self.should_abort_theory_loop() {
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            return Ok(SolveResult::Unknown);
-        }
-
-        // --- Phase 4: Bitblasting ---
-        phase_trace!("phase4-bitblast");
-        // Enable delayed internalization for non-incremental, non-assumption paths (#7015).
-        // For expensive operations (mul/div/rem on wide BV with 2+ variable args),
-        // the BvSolver allocates fresh unconstrained bits instead of building circuits.
-        // After SAT solving, we check these against the model and add conflict clauses.
-        //
-        // For combined theories (#8142): delayed internalization IS enabled, but BV
-        // terms that appear as array select/store indices, store values, or UF arguments
-        // are marked as "eager" — they and their BV sub-expressions are always fully
-        // bit-blasted. This ensures array/EUF axioms reason over constrained bits while
-        // allowing bulk BV operations (e.g., data-path multiplications that don't feed
-        // into indices) to remain delayed.
-        let use_delayed =
-            !config.incremental && assumptions.is_empty() && !proof_enabled && !export_bv_cnf;
-
-        // Capture interrupt state before taking &self.ctx.terms borrow (#8609).
-        // bv_solver holds an immutable borrow on self.ctx.terms, so we cannot
-        // call self.should_abort_theory_loop() while bv_solver is alive.
-        // Instead, capture the flag and deadline for local interrupt checking.
-        let bv_interrupt_flag = self.solve_interrupt.clone();
-        let bv_deadline = self.solve_deadline.clone();
-        let bv_is_interrupted = || -> bool {
-            if let Some(ref flag) = bv_interrupt_flag {
-                if flag.load(Ordering::Relaxed) {
-                    return true;
+            // Interrupt check before bitblasting (#3070). Wide BV multipliers
+            // (64-bit) generate ~128K gates; bail out before that work if timed out.
+            if self.should_abort_theory_loop() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
                 }
+                return Ok(SolveResult::Unknown);
             }
-            bv_deadline.expired()
-        };
 
-        let mut bv_solver = BvSolver::new(&self.ctx.terms);
-        // Wire the executor's interrupt flag into the BV solver so that
-        // set_timeout() and interrupt() are respected during bitblasting (#8609).
-        if let Some(ref flag) = bv_interrupt_flag {
-            bv_solver.set_interrupt(flag.clone());
-        }
-        if use_delayed {
-            bv_solver.set_delay_enabled(true);
-
-            // For combined theories, collect terms that must be eagerly internalized.
-            if config.array_axioms || config.uf_congruence {
-                let eager_terms = self.collect_eager_bv_terms(&config, &array_axiom_extra_roots);
-                if !eager_terms.is_empty() {
-                    bv_solver.set_eager_terms(eager_terms);
-                }
-            }
-        }
-        let bv_clauses = bv_solver.bitblast_all(&self.ctx.assertions);
-
-        // Interrupt / memory check after bitblasting (#8609). bitblast_all() now
-        // checks the interrupt flag *and* the process memory ceiling periodically
-        // and may return a partial result on either. A partial CNF can only ever
-        // yield Unknown (never SAT/UNSAT), so bailing here is sound — it converts
-        // an eager-blast memory blowup that would otherwise OOM-kill the process
-        // into a graceful Unknown that respects the -memory budget.
-        // Use local check (not should_abort_theory_loop) to avoid borrow conflict.
-        if bv_is_interrupted() || ay_sys::process_memory_exceeded() {
-            drop(bv_solver);
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            self.propagate_bv_unknown_reason(true);
-            return Ok(SolveResult::Unknown);
-        }
-
-        if self.debug_ufbv && config.uf_congruence {
-            safe_eprintln!("DEBUG: Tseitin num_vars = {}", tseitin_result.num_vars);
-            safe_eprintln!(
-                "DEBUG: BV num_vars (before linking) = {}",
-                bv_solver.num_vars()
-            );
-            safe_eprintln!("DEBUG: Tseitin clauses = {}", tseitin_result.clauses.len());
-            safe_eprintln!(
-                "DEBUG: BV clauses (before offset) = {}",
-                bv_solver.clauses().len()
-            );
-            for (term_id, bits) in bv_solver.iter_term_bits() {
-                safe_eprintln!("DEBUG: Term {:?} has bits {:?}", term_id, bits);
-            }
-        }
-
-        // --- Phase 5: Combine Tseitin + BV clauses ---
-        phase_trace!("phase5-combine");
-        let mut all_clauses = tseitin_result.clauses.clone();
-        if phase_trace_start.is_some() {
-            eprintln!("c phase-trace clauses.tseitin={}", all_clauses.len());
-        }
-        let var_offset = tseitin_result.num_vars as i32;
-        bv_encoding::offset_and_push_clauses(bv_clauses, var_offset, &mut all_clauses);
-        if phase_trace_start.is_some() {
-            eprintln!("c phase-trace clauses.after-bitblast={}", all_clauses.len());
-        }
-
-        // Materialize BV bits for array terms (ABV/AUFBV only)
-        if config.array_axioms {
-            self.materialize_array_bv_terms(&mut bv_solver, &array_axiom_extra_roots);
-            let extra = bv_solver.take_clauses();
-            bv_encoding::offset_and_push_clauses(extra, var_offset, &mut all_clauses);
-        }
-
-        // Materialize single-literal encodings for Bool-sorted UF application
-        // arguments BEFORE Tseitin↔BV linking (#boolarg-congruence): Bool args
-        // have no BV bits, so both congruence generators dropped every
-        // application pair containing one — congruence over Bool argument
-        // positions was silently lost (wrong-SAT: 256 finite-domain instances
-        // of `(= (BoolUnbox (BoolBox c)) c)` answered `sat`). Allocating the
-        // literal here lets `build_linking_batch` bridge it to any Tseitin
-        // variable for the same term, and the generators encode the argument
-        // difference as a 1-bit XOR. The clauses `bitblast_bool` emits are
-        // drained into the linking batch's extra BV clauses below.
-        if config.uf_congruence || config.non_bv_congruence {
-            for arg in self.collect_uf_bool_args(assumptions) {
-                let _ = bv_solver.ensure_bool_literal(arg);
-            }
-        }
-
-        // --- Phases 6-7: Predicate + Bool linking (#858, #5457) ---
-        let mut linking_batch = bv_encoding::build_linking_batch(
-            &tseitin_result.var_to_term,
-            &mut bv_solver,
-            var_offset,
-            &self.ctx.terms,
-            None,
-        );
-        linking_batch.push_equivalence_clauses(&mut all_clauses);
-        let extra_bv_clauses = linking_batch.take_extra_bv_clauses();
-        bv_encoding::offset_and_push_clauses(extra_bv_clauses, var_offset, &mut all_clauses);
-
-        // --- Phase 8: BV equality congruence axioms (#1708, QF_BV only) ---
-        if config.bv_eq_congruence {
-            all_clauses.extend(bv_encoding::generate_bv_eq_congruence_clauses(
-                &self.ctx.terms,
-                &self.ctx.assertions,
-                &bv_solver,
-                var_offset,
-            ));
-        }
-
-        // --- Phase 9: Theory-specific axiom generation ---
-        phase_trace!("phase9-theory-axioms");
-        if phase_trace_start.is_some() {
-            eprintln!(
-                "c phase-trace clauses.after-linking-congruence={}",
-                all_clauses.len()
-            );
-        }
-
-        // Materialize BV bits for UF application arguments (#5475).
-        // Complex BV sub-expressions (e.g., bvadd(x, #x01)) inside UF calls
-        // are opaque to the BV bitblaster and need explicit materialization
-        // before congruence axiom generation.
-        if config.uf_congruence {
-            self.materialize_uf_arg_bv_terms(&mut bv_solver, assumptions);
-            let extra = bv_solver.take_clauses();
-            bv_encoding::offset_and_push_clauses(extra, var_offset, &mut all_clauses);
-        }
-
-        let bv_num_vars = bv_solver.num_vars();
-        let mut running_offset = tseitin_result.num_vars + bv_num_vars;
-
-        // Array axiom clauses (ABV/AUFBV)
-        let _array_axiom_vars = if config.array_axioms {
-            let array_axiom_result = self.generate_array_bv_axioms(
-                &bv_solver,
-                tseitin_result.num_vars,
-                running_offset,
-                &array_axiom_extra_roots,
-                &tseitin_result.term_to_var,
-            );
-            for clause in array_axiom_result.clauses {
-                all_clauses.push(clause);
-            }
-            if phase_trace_start.is_some() {
-                eprintln!(
-                    "c phase-trace clauses.after-array-axioms={}",
-                    all_clauses.len()
-                );
-            }
-            running_offset += array_axiom_result.num_vars;
-            array_axiom_result.num_vars
-        } else {
-            0
-        };
-
-        // EUF congruence axiom clauses (UFBV/AUFBV)
-        let _euf_axiom_vars = if config.uf_congruence {
-            let euf_axiom_result = self.generate_euf_bv_axioms_debug(
-                &bv_solver,
-                tseitin_result.num_vars,
-                running_offset,
-                self.debug_ufbv,
-                assumptions,
-            );
-            if self.debug_ufbv {
-                safe_eprintln!("DEBUG: EUF axiom num_vars = {}", euf_axiom_result.num_vars);
-                safe_eprintln!(
-                    "DEBUG: EUF axiom clauses = {}",
-                    euf_axiom_result.clauses.len()
-                );
-            }
-            for clause in euf_axiom_result.clauses {
-                all_clauses.push(clause);
-            }
-            if phase_trace_start.is_some() {
-                eprintln!(
-                    "c phase-trace clauses.after-euf-axioms={}",
-                    all_clauses.len()
-                );
-            }
-            running_offset += euf_axiom_result.num_vars;
-            euf_axiom_result.num_vars
-        } else {
-            0
-        };
-
-        // Interrupt check after encoding phases (#8609).
-        // Phases 5-9 (clause combination, linking, congruence, axiom generation)
-        // can be expensive for combined theories (QF_ABV, QF_UFBV). Check before
-        // committing to SAT solving. Use local check to avoid borrow conflict
-        // with bv_solver's &self.ctx.terms borrow.
-        if bv_is_interrupted() {
-            drop(bv_solver);
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            self.propagate_bv_unknown_reason(true);
-            return Ok(SolveResult::Unknown);
-        }
-
-        // Clone term_bits for model extraction (needed after bv_solver is consumed).
-        let term_bits = bv_solver.term_to_bits().clone();
-        let bv_predicate_to_var = bv_solver.predicate_to_var().clone();
-        let bv_bool_to_var = bv_solver.bool_to_var().clone();
-        // Alias for assumption path which references term_bits_snapshot
-        let term_bits_snapshot = &term_bits;
-        // Extract delayed state before dropping bv_solver (#7015).
-        let mut delayed_state = bv_solver.take_delayed_state();
-        // Save division caches for Phase 2 circuit building.
-        // The actual next_var for tmp_bv is computed later using total_vars
-        // to avoid variable collisions with array/EUF axiom variables.
-        let mut delay_div_caches = if delayed_state.is_some() {
-            Some((
-                bv_solver.div_caches().0.clone(),
-                bv_solver.div_caches().1.clone(),
-                // Placeholder; will be updated after total_vars is computed.
-                bv_solver.num_vars() + 1,
-            ))
-        } else {
-            None
-        };
-        let has_delayed_ops = delayed_state.is_some();
-        drop(bv_solver);
-
-        // Non-BV-return UF congruence (#5433)
-        // Item 4 Stage 2: the pass polls interrupt/deadline/memory inside its
-        // all-pairs loop and may bail with a PARTIAL axiomatization. Partial
-        // congruence is sound for UNSAT only — any CDCL SAT below must be
-        // degraded to Unknown while `non_bv_congruence_bailed` is set.
-        let mut non_bv_congruence_bailed = false;
-        if config.non_bv_congruence {
-            let congruence_outcome = self.generate_non_bv_euf_congruence(
-                &term_bits,
-                &bv_bool_to_var,
-                &tseitin_result,
-                running_offset,
-                &mut all_clauses,
-                assumptions,
-            );
-            non_bv_congruence_bailed = congruence_outcome.bailed;
-            if non_bv_congruence_bailed && ay_core::misc_cli_flags().phase_trace {
-                eprintln!("c phase-trace non-bv-congruence-bailed");
-            }
-            if phase_trace_start.is_some() {
-                eprintln!(
-                    "c phase-trace clauses.after-non-bv-congruence={}",
-                    all_clauses.len()
-                );
-            }
-            running_offset += congruence_outcome.num_vars;
-        }
-
-        let mut total_vars = running_offset;
-
-        // Fix next_var for delayed circuit building (#8480):
-        // New BV variables must not collide with array/EUF axiom variables.
-        // The BV offset is var_offset (= tseitin_num_vars), so BV var N maps
-        // to SAT var (var_offset + N - 1). To avoid collisions with variables
-        // in the [tseitin+bv .. total_vars) range, new BV variables must start
-        // at (total_vars - var_offset + 1) = (running_offset - tseitin_num_vars + 1).
-        if let Some((_, _, ref mut next_var)) = delay_div_caches {
-            let safe_next = total_vars - tseitin_result.num_vars + 1;
-            if safe_next > *next_var {
-                *next_var = safe_next;
-            }
-        }
-
-        if self.debug_ufbv && config.uf_congruence {
-            safe_eprintln!("DEBUG: Total vars = {}", total_vars);
-            safe_eprintln!("DEBUG: Total clauses = {}", all_clauses.len());
-            safe_eprintln!(
-                "DEBUG: tseitin_num_vars={} bv_num_vars={} var_offset={}",
-                tseitin_result.num_vars,
-                bv_num_vars,
-                var_offset
-            );
-        }
-
-        // Interrupt check after all encoding phases, before SAT solve (#3070).
-        if self.should_abort_theory_loop() {
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            return Ok(SolveResult::Unknown);
-        }
-
-        // --- Phase 10: SAT solving ---
-        phase_trace!("phase10-sat");
-        if phase_trace_start.is_some() {
-            let total_lits: usize = all_clauses.iter().map(|c| c.literals().len()).sum();
-            eprintln!(
-                "c phase-trace phase10-load vars={} clauses={} lits={}",
-                total_vars,
-                all_clauses.len(),
-                total_lits
-            );
-        }
-        // B-cert pipeline (#56): dump the complete eager bit-blast plus any
-        // check-sat-assuming literals (as unit clauses).  I/O failure aborts
-        // this check before a verdict can escape; certificate production is
-        // never a best-effort trace side effect.
-        bv_cnf_dump::write_formula(&all_clauses, total_vars, &sat_assumptions)?;
-
-        // B-cert single-invocation DRAT (#56): when `--proof X.drat` is paired
-        // with `--dump-bv-cnf`, the SAME eager bit-blast that produced the dumped
-        // CNF also emits a drat-trim-checkable DRAT beside it. The DRAT stream is
-        // written live by the SAT solver's proof manager (identical to DIMACS
-        // mode) against the exact variable numbering of the dumped CNF, so the
-        // CNF and its UNSAT certificate are guaranteed to come from one solve.
-        //
-        // Only the plain (no check-sat-assuming) path is certified this way: an
-        // assumption-augmented formula is dumped as CNF-plus-unit-clauses, but
-        // the live DRAT of an assumption solve terminates in an
-        // assumption-negation clause rather than the empty clause, so it would
-        // not be a stand-alone refutation of the dumped CNF. That case fails
-        // closed rather than emit an uncheckable proof (§0).
-        let bv_drat = if export_bv_cnf {
-            bv_cnf_dump::bv_drat_target()
-        } else {
-            None
-        };
-        if bv_drat.is_some() && has_assumptions {
-            return Err(crate::executor_types::ExecutorError::ArtifactExport(
-                "--proof DRAT with --dump-bv-cnf does not support check-sat-assuming: the \
-                 assumption-augmented bit-blast has no single-invocation DRAT certificate"
-                    .to_string(),
-            ));
-        }
-
-        let (mut solver, bv_drat_artifact) = if let Some((drat_path, binary)) = bv_drat.as_ref() {
-            let (file, artifact) = bv_cnf_dump::create_bv_drat(drat_path)?;
-            let writer = std::io::BufWriter::new(file);
-            let output = if *binary {
-                ProofOutput::drat_binary(writer)
-            } else {
-                ProofOutput::drat_text(writer)
-            };
-            (
-                SatSolver::with_proof_output(total_vars as usize, output),
-                Some(artifact),
-            )
-        } else {
-            (SatSolver::new(total_vars as usize), None)
-        };
-        self.apply_random_seed_to_sat(&mut solver);
-        self.apply_progress_to_sat(&mut solver);
-        configure_ephemeral_bv_sat_solver(
-            &mut solver,
-            total_vars as usize,
-            all_clauses.len(),
-            config.array_axioms,
-        );
-
-        // Wire a deadline-aware interrupt flag to the SAT solver so
-        // preprocessing passes (congruence, BVE, probing) honor the DPLL
-        // executor timeout (#8782). The deadline timer must not write into the
-        // executor/API interrupt flag: API callers reuse a solver across many
-        // checks, and a timed-out BV subsolve must not poison later queries as
-        // externally interrupted (#8961).
-        let mut _deadline_guard = install_bv_sat_interrupt(
-            &mut solver,
-            self.solve_interrupt.clone(),
-            self.solve_deadline.get(),
-        );
-
-        // The internal Alethe clause trace and the live DRAT proof manager are
-        // mutually exclusive proof surfaces; the DRAT route owns the proof
-        // manager, so never also arm clause tracing on it.
-        if proof_enabled && bv_drat.is_none() {
-            solver.enable_clause_trace();
-            solver.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
-        }
-
-        // --- JIT batch compilation for BV clauses (#8275) ---
-        // Feed clauses to SAT solver and collect arena offsets for JIT compilation.
-        // BV clauses use arena offsets as clause IDs so that conflict analysis
-        // can construct ClauseRef(arena_offset) to access the clause via standard
-        // 2WL infrastructure. The compiled formula is installed as a separate
-        // bv_compiled_formula alongside the main compiled_formula.
-        //
-        // On non-JIT builds, clauses are added via add_clause_prenormalized
-        // (the original path).
-        {
-            let mut lit_buf: Vec<SatLiteral> = Vec::with_capacity(8);
-            for clause in &all_clauses {
-                lit_buf.clear();
-                lit_buf.extend(
-                    clause
-                        .literals()
-                        .iter()
-                        .map(|&lit| crate::cnf_lit_to_sat(lit)),
-                );
-                // Sort for add_clause_prenormalized contract: Tseitin/BV
-                // gate clauses have unique variables but may not be sorted.
-                lit_buf.sort_unstable_by_key(|l| l.raw());
-                solver.add_clause_prenormalized(&lit_buf);
-            }
-        }
-
-        // When assumptions are present, use solve_with_assumptions for unsat core
-        // extraction. Otherwise use the standard solve() path.
-        if has_assumptions {
-            solver.set_max_learned_clauses(self.learned_clause_limit);
-            solver.set_max_clause_db_bytes(resolve_clause_db_bytes_limit(
-                self.clause_db_bytes_limit,
-                total_vars,
-            ));
-
-            self.arm_sat_conflict_budget(&mut solver, 0);
-
-            // Use interruptible variant to respect timeout/interrupt (#3381)
-            let should_stop = self.make_should_stop();
-            let assume_result =
-                solver.solve_with_assumptions_interruptible(&sat_assumptions, should_stop);
-
-            collect_sat_stats!(self, &solver);
-
-            match assume_result.into_inner() {
-                AssumeResult::Sat(model) => {
-                    // Exact finite-array closure is allowed to emit a sound
-                    // prefix when its deterministic aggregate budget is
-                    // exhausted, but that relaxed formula cannot authorize a
-                    // SAT model. Assumption-bearing BV solves return directly
-                    // from this arm, so enforce the same fail-closed boundary
-                    // here before extraction/publication.
-                    if !self.finite_array_expansion.is_complete() {
-                        if let Some((_, original)) = var_subst {
-                            self.ctx.assertions = original;
-                        }
-                        let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
-                        return Ok(SolveResult::Unknown);
-                    }
-                    // Item 4 Stage 2 soundness gate (see the Phase 11 twin):
-                    // SAT under a bailed partial congruence axiomatization
-                    // degrades to Unknown.
-                    if non_bv_congruence_bailed {
-                        if let Some((_, original)) = var_subst {
-                            self.ctx.assertions = original;
-                        }
-                        return self.finalize_bv_congruence_bail();
-                    }
-                    self.last_assumption_core = None;
-                    let mut bv_model = Self::extract_bv_model_from_bits(
-                        &model,
-                        term_bits_snapshot,
-                        var_offset,
-                        &self.ctx.terms,
-                    );
-                    // Carry Bool-in-BV variable assignments (ite conditions)
-                    // into the model (#bv-ite-bool-model).
-                    Self::seed_bv_bool_assignments_from_bitblast(
-                        &model,
-                        &bv_bool_to_var,
-                        var_offset,
-                        &self.ctx.terms,
-                        &mut bv_model,
-                    );
-                    let bv_validation = ay_bv::validate_bv_assertions(
-                        &self.ctx.terms,
-                        &self.ctx.assertions,
-                        &bv_model,
-                    );
-                    match bv_validation {
-                        Ok(checked) => {
-                            self.last_statistics
-                                .set_int("model_validation.bv.checked", checked as u64);
-                        }
-                        Err(error) => {
-                            return self.finalize_bv_model_validation_failure(error);
-                        }
-                    }
-                    return self.solve_and_store_model_full(
-                        SatResult::Sat(model),
-                        &tseitin_result,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(bv_model),
-                        None,
-                        None,
-                        None,
-                    );
-                }
-                AssumeResult::Unsat(core_lits, _) => {
-                    // Map SAT literals back to original assumption TermIds
-                    let core_terms: Vec<TermId> = core_lits
-                        .iter()
-                        .filter_map(|&lit| {
-                            assumption_to_term
-                                .iter()
-                                .find(|(sat_lit, _)| {
-                                    sat_lit.variable() == lit.variable()
-                                        && sat_lit.is_positive() == lit.is_positive()
-                                })
-                                .map(|(_, term)| *term)
-                        })
-                        .collect();
-                    debug_assert!(
-                        core_terms.iter().all(|ct| assumptions.contains(ct)),
-                        "BUG: BV assumption core contains term not in original assumptions"
-                    );
-                    self.last_assumption_core = Some(core_terms);
-
-                    // UNSAT proof handling (#340, #4176)
-                    if proof_enabled {
-                        self.save_bv_unsat_proof_state(
-                            solver.take_clause_trace(),
-                            &tseitin_result.var_to_term,
-                        );
-                    }
-
-                    return self.solve_and_store_model(
-                        SatResult::Unsat(ay_sat::ProofCertificate::empty()),
-                        &tseitin_result,
-                        None,
-                        None,
-                    );
-                }
-                AssumeResult::Unknown => {
-                    self.last_assumption_core = None;
-                    return self.solve_and_store_model(
-                        SatResult::Unknown,
-                        &tseitin_result,
-                        None,
-                        None,
-                    );
-                }
-                #[allow(unreachable_patterns)]
-                _ => unreachable!("BUG: AssumeResult variant not handled in BV assumption path"),
-            }
-        }
-
-        // Standard solve path (no assumptions)
-        //
-        // Delayed internalization (#7015) uses a post-solve re-check loop:
-        // 1. Solve the formula without circuit clauses (delayed ops have
-        //    unconstrained result bits)
-        // 2. If SAT, check delayed ops against the model
-        // 3. If violations: add cheap axiom clauses or full circuit clauses
-        //    as regular clauses and re-solve
-        // 4. Repeat until consistent or max iterations
-        //
-        // This replaces the previous Extension::check() + AddClauses approach
-        // (#8284) which caused spurious UNSAT (#8480). The AddClauses path
-        // injected thousands of new-variable clauses into a complete model
-        // via add_theory_lemma, which interacted badly with the CDCL loop
-        // (the former pending-theory-conflict single-slot overwrite, level-0
-        // unit conflicts from partial propagation during batch addition). The re-solve loop is
-        // simpler, correct, and matches Z3's actual implementation: Z3's
-        // bv_solver::check() returns a status that causes the outer DPLL(T)
-        // loop to restart from scratch with the new clauses.
-        let mut solve_result;
-
-        let mut spent = 0;
-
-        if has_delayed_ops {
-            let mut ds = delayed_state
-                .take()
-                .expect("delayed_state must exist when has_delayed_ops");
-
-            let mut current_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
-
-            // Re-check loop: verify delayed ops and add clauses as needed.
-            const MAX_DELAYED_ITERATIONS: u32 = 32;
-            let mut iteration = 0u32;
-
-            // Accumulator: ALL cheap-axiom and circuit clauses added across
-            // re-check iterations. Required because each iteration creates a
-            // fresh SAT solver (to avoid stale BCP state after add_clause on a
-            // solved solver — see #8480), so circuit clauses added in a prior
-            // iteration would be lost without this accumulator. Without the
-            // accumulator, the SAT solver can return a model in iter N that
-            // violates circuit constraints added in iter N-1, leaving a
-            // delayed op with `circuit_built=true` but an inconsistent value
-            // (bug #8698: z3_7526 at width=16+ returned Unknown because the
-            // 32-bit bvmul's circuit clauses were dropped on the next
-            // re-solve).
-            let mut accumulated_delayed_clauses: Vec<Vec<SatLiteral>> = Vec::new();
-
-            // If the first solve returns UNSAT but there are unresolved delayed
-            // ops, the UNSAT may be spurious: unconstrained result bits are
-            // connected to constrained formula terms via Tseitin equality
-            // clauses, and the SAT solver can derive false contradictions.
+            // --- Phase 4: Bitblasting ---
+            phase_trace!("phase4-bitblast");
+            // Enable delayed internalization for non-incremental, non-assumption paths (#7015).
+            // For expensive operations (mul/div/rem on wide BV with 2+ variable args),
+            // the BvSolver allocates fresh unconstrained bits instead of building circuits.
+            // After SAT solving, we check these against the model and add conflict clauses.
             //
-            // Fix: build all delayed circuits and re-solve from scratch with
-            // a fresh SAT solver. We cannot reuse the existing solver because
-            // once has_empty_clause is set, it always returns UNSAT.
-            if matches!(current_result, SatResult::Unsat(_)) && ds.has_unresolved() {
-                let unresolved_indices: Vec<usize> = ds
-                    .delayed_ops()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, op)| !op.circuit_built)
-                    .map(|(i, _)| i)
-                    .collect();
+            // For combined theories (#8142): delayed internalization IS enabled, but BV
+            // terms that appear as array select/store indices, store values, or UF arguments
+            // are marked as "eager" — they and their BV sub-expressions are always fully
+            // bit-blasted. This ensures array/EUF axioms reason over constrained bits while
+            // allowing bulk BV operations (e.g., data-path multiplications that don't feed
+            // into indices) to remain delayed.
+            let use_delayed =
+                !config.incremental && assumptions.is_empty() && !proof_enabled && !export_bv_cnf;
 
-                if !unresolved_indices.is_empty() {
-                    let mut tmp_bv = BvSolver::new(&self.ctx.terms);
-                    tmp_bv.set_term_to_bits(ds.term_to_bits().clone());
-                    if let Some((ref ucache, ref scache, ref mut next_var)) = delay_div_caches {
-                        tmp_bv.set_div_caches(ucache.clone(), scache.clone());
-                        tmp_bv.set_next_var(*next_var);
-                    }
-                    tmp_bv.set_delayed_ops(ds.delayed_ops().to_vec());
-
-                    let mut circuit_clauses_sat: Vec<Vec<SatLiteral>> = Vec::new();
-                    for &idx in &unresolved_indices {
-                        let circuit_clauses = tmp_bv.build_delayed_circuit(idx);
-                        for clause in &circuit_clauses {
-                            let sat_lits: Vec<SatLiteral> = clause
-                                .literals()
-                                .iter()
-                                .map(|&lit| {
-                                    crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
-                                        lit, var_offset,
-                                    ))
-                                })
-                                .collect();
-                            circuit_clauses_sat.push(sat_lits);
-                        }
-                        let bv_extra = tmp_bv.take_clauses();
-                        for clause in &bv_extra {
-                            let sat_lits: Vec<SatLiteral> = clause
-                                .literals()
-                                .iter()
-                                .map(|&lit| {
-                                    crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
-                                        lit, var_offset,
-                                    ))
-                                })
-                                .collect();
-                            circuit_clauses_sat.push(sat_lits);
-                        }
-                    }
-
-                    if let Some((_, _, ref mut next_var)) = delay_div_caches {
-                        *next_var = tmp_bv.num_vars() + 1;
-                    }
-
-                    if !circuit_clauses_sat.is_empty() && !self.should_abort_theory_loop() {
-                        // Persist circuit clauses into the accumulator so that
-                        // every subsequent fresh-solver rebuild (#8698) keeps
-                        // them in scope. Without this, a later cheap-axiom
-                        // re-solve would drop the circuit clauses on the
-                        // floor, allowing the SAT solver to return a model
-                        // where the circuit-built op is still inconsistent.
-                        accumulated_delayed_clauses.extend(circuit_clauses_sat.iter().cloned());
-
-                        // Determine the new total variable count.
-                        let circuit_max_var = circuit_clauses_sat
-                            .iter()
-                            .flat_map(|c| c.iter())
-                            .map(|l| l.variable().index() + 1)
-                            .max()
-                            .unwrap_or(0);
-                        let new_total_vars = circuit_max_var.max(total_vars as usize);
-
-                        // Create a fresh SAT solver with original + circuit clauses.
-                        let mut fresh_solver = SatSolver::new(new_total_vars);
-                        self.apply_random_seed_to_sat(&mut fresh_solver);
-                        self.apply_progress_to_sat(&mut fresh_solver);
-                        configure_ephemeral_bv_sat_solver(
-                            &mut fresh_solver,
-                            new_total_vars,
-                            all_clauses.len() + accumulated_delayed_clauses.len(),
-                            config.array_axioms,
-                        );
-                        _deadline_guard = install_bv_sat_interrupt(
-                            &mut fresh_solver,
-                            self.solve_interrupt.clone(),
-                            self.solve_deadline.get(),
-                        );
-
-                        // Re-add all original clauses.
-                        for clause in &all_clauses {
-                            let sat_lits: Vec<SatLiteral> = clause
-                                .literals()
-                                .iter()
-                                .map(|&lit| crate::cnf_lit_to_sat(lit))
-                                .collect();
-                            fresh_solver.add_clause(sat_lits);
-                        }
-                        // Add circuit clauses.
-                        for clause in circuit_clauses_sat {
-                            fresh_solver.add_clause(clause);
-                        }
-
-                        current_result =
-                            self.solve_sat_in_budget_chain(&mut fresh_solver, &mut spent);
-                        solver = fresh_solver;
-                        // Update total_vars so CEGAR loop doesn't collide.
-                        total_vars = total_vars.max(new_total_vars as u32);
+            // Capture interrupt state before taking &self.ctx.terms borrow (#8609).
+            // bv_solver holds an immutable borrow on self.ctx.terms, so we cannot
+            // call self.should_abort_theory_loop() while bv_solver is alive.
+            // Instead, capture the flag and deadline for local interrupt checking.
+            let bv_interrupt_flag = self.solve_interrupt.clone();
+            let bv_deadline = self.solve_deadline.clone();
+            let bv_is_interrupted = || -> bool {
+                if let Some(ref flag) = bv_interrupt_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        return true;
                     }
                 }
-            }
-
-            // Residual iteration-cap hole (#4666/#8595): when the CEGAR refinement
-            // budget is exhausted, the candidate model has NOT been verified against
-            // the remaining delayed ops (the `ds.check` below is skipped), so a
-            // delayed result variable may still violate its defining op (e.g.
-            // `full_chunks = usize::MAX` while the udiv relation requires
-            // `full_chunks*3 <= len <= isize::MAX`). Record that case and downgrade to
-            // Unknown after the loop instead of publishing a possibly-spurious Sat.
-            let mut cap_hit_unresolved = false;
-            while let SatResult::Sat(ref model) = current_result {
-                if iteration >= MAX_DELAYED_ITERATIONS {
-                    // Downgrade ONLY if the candidate model is actually INCONSISTENT
-                    // with a remaining delayed op — i.e. a final `check` against THIS
-                    // model still yields refinement clauses. A model that happens to
-                    // satisfy every delayed op (empty check) is a genuine Sat and must
-                    // be preserved (using `has_unresolved()` alone over-rejects such
-                    // consistent-but-not-circuit-built models).
-                    if ds.has_unresolved() {
-                        let (cheap, circ) = ds.check(model, var_offset);
-                        cap_hit_unresolved = !cheap.is_empty() || !circ.is_empty();
-                    }
-                    break;
-                }
-                iteration += 1;
-
-                if !ds.has_unresolved() {
-                    break;
-                }
-
-                // Check delayed ops against the current model.
-                let (cheap_clauses, needs_circuit) = ds.check(model, var_offset);
-
-                if cheap_clauses.is_empty() && needs_circuit.is_empty() {
-                    // All delayed ops are consistent under the current model.
-                    // This is only correct when previously-built circuits are
-                    // preserved across re-solves via accumulated_delayed_clauses
-                    // (#8698) — otherwise a "built" op may still be inconsistent.
-                    break;
-                }
-
-                // Collect all new clauses (cheap axioms + full circuits).
-                let mut new_clauses: Vec<Vec<SatLiteral>> = Vec::new();
-
-                // Phase 1: cheap axiom clauses.
-                for clause in &cheap_clauses {
-                    let sat_lits: Vec<SatLiteral> = clause
-                        .literals()
-                        .iter()
-                        .map(|&lit| {
-                            crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(lit, var_offset))
-                        })
-                        .collect();
-                    new_clauses.push(sat_lits);
-                }
-
-                // Phase 2: build full circuits for ops that exhausted cheap axioms.
-                if !needs_circuit.is_empty() {
-                    let mut tmp_bv = BvSolver::new(&self.ctx.terms);
-                    tmp_bv.set_term_to_bits(ds.term_to_bits().clone());
-                    if let Some((ref ucache, ref scache, ref mut next_var)) = delay_div_caches {
-                        tmp_bv.set_div_caches(ucache.clone(), scache.clone());
-                        tmp_bv.set_next_var(*next_var);
-                    }
-                    tmp_bv.set_delayed_ops(ds.delayed_ops().to_vec());
-
-                    for &idx in &needs_circuit {
-                        let circuit_clauses = tmp_bv.build_delayed_circuit(idx);
-                        for clause in &circuit_clauses {
-                            let sat_lits: Vec<SatLiteral> = clause
-                                .literals()
-                                .iter()
-                                .map(|&lit| {
-                                    crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
-                                        lit, var_offset,
-                                    ))
-                                })
-                                .collect();
-                            new_clauses.push(sat_lits);
-                        }
-                        let bv_extra = tmp_bv.take_clauses();
-                        for clause in &bv_extra {
-                            let sat_lits: Vec<SatLiteral> = clause
-                                .literals()
-                                .iter()
-                                .map(|&lit| {
-                                    crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
-                                        lit, var_offset,
-                                    ))
-                                })
-                                .collect();
-                            new_clauses.push(sat_lits);
-                        }
-                    }
-
-                    if let Some((_, _, ref mut next_var)) = delay_div_caches {
-                        *next_var = tmp_bv.num_vars() + 1;
-                    }
-                }
-
-                if new_clauses.is_empty() {
-                    break;
-                }
-
-                // Accumulate this iteration's cheap-axiom and circuit clauses
-                // so future re-solves keep them in scope (#8698). Each fresh
-                // SAT solver below adds `all_clauses` plus the entire
-                // accumulator — this guarantees that once a delayed op's
-                // circuit is built, the SAT solver can never again return a
-                // model where that circuit is violated.
-                accumulated_delayed_clauses.extend(new_clauses.iter().cloned());
-
-                // Re-solve with a fresh SAT solver containing original + ALL
-                // accumulated delayed clauses. We cannot reuse the existing
-                // solver because adding clauses to a solver that has a
-                // complete SAT model can trigger BCP during add_clause that
-                // derives false contradictions from the stale model state
-                // (#8480).
-                if self.should_abort_theory_loop() {
-                    current_result = SatResult::Unknown;
-                    break;
-                }
-
-                let circuit_max_var = accumulated_delayed_clauses
-                    .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|l| l.variable().index() + 1)
-                    .max()
-                    .unwrap_or(0);
-                let new_total = circuit_max_var.max(total_vars as usize);
-
-                let mut fresh = SatSolver::new(new_total);
-                self.apply_random_seed_to_sat(&mut fresh);
-                self.apply_progress_to_sat(&mut fresh);
-                configure_ephemeral_bv_sat_solver(
-                    &mut fresh,
-                    new_total,
-                    all_clauses.len() + accumulated_delayed_clauses.len(),
-                    config.array_axioms,
-                );
-                _deadline_guard = install_bv_sat_interrupt(
-                    &mut fresh,
-                    self.solve_interrupt.clone(),
-                    self.solve_deadline.get(),
-                );
-
-                // Re-add all original clauses.
-                for clause in &all_clauses {
-                    let sat_lits: Vec<SatLiteral> = clause
-                        .literals()
-                        .iter()
-                        .map(|&lit| crate::cnf_lit_to_sat(lit))
-                        .collect();
-                    fresh.add_clause(sat_lits);
-                }
-                // Add ALL accumulated delayed clauses (circuits + cheap axioms)
-                // across every iteration so far.
-                for clause in &accumulated_delayed_clauses {
-                    fresh.add_clause(clause.clone());
-                }
-
-                current_result = self.solve_sat_in_budget_chain(&mut fresh, &mut spent);
-                solver = fresh;
-                // Update total_vars so CEGAR loop doesn't collide.
-                total_vars = total_vars.max(new_total as u32);
-            }
-
-            // SOUND downgrade (#4666/#8595): a Sat that exhausted the delayed-op
-            // refinement budget with ops still unresolved is possibly spurious (a
-            // delayed result variable may violate its defining op) — publish Unknown,
-            // never a false counterexample. This only ever turns a candidate-Sat into
-            // Unknown: a genuine model resolves every delayed op and exits the loop
-            // via the `!ds.has_unresolved()` / consistent-`check` breaks (leaving
-            // `cap_hit_unresolved == false`), so real Sat and all Unsat results are
-            // unaffected — the feasible set is never enlarged or under-cut.
-            if cap_hit_unresolved && matches!(current_result, SatResult::Sat(_)) {
-                current_result = SatResult::Unknown;
-            }
-            solve_result = current_result;
-            self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
-        } else {
-            // Bound the learned-clause DB on the long naked solve (#dt-array-fc-lazy),
-            // mirroring the has-assumptions branch. A huge instance (21M+ vars) can
-            // otherwise grow an unbounded learned DB over a multi-hour solve,
-            // drowning BCP. Caps bound only LEARNED clauses (never original), so
-            // completeness/soundness are unaffected — just memory.
-            solver.set_max_learned_clauses(self.learned_clause_limit);
-            solver.set_max_clause_db_bytes(resolve_clause_db_bytes_limit(
-                self.clause_db_bytes_limit,
-                total_vars,
-            ));
-            solve_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
-            self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
-        }
-
-        // --- Phase 10.7: CEGAR array FC refinement (#8510) ---
-        phase_trace!("phase10.7-cegar");
-        //
-        // After SAT returns a satisfying assignment, check array functional
-        // consistency: for any two select terms on the same array with equal
-        // concrete index values, their result values must also be equal.
-        //
-        // The upfront FC axiom budget (FC_CROSS_BASE_BUDGET_PER_ARRAY = 200)
-        // can be insufficient for arrays with many constant-indexed selects
-        // and few symbolic-indexed selects (e.g., csplit-query QF_ABV:
-        // 2050 constant selects + 8 symbolic selects = 16K+ needed cross-base
-        // pairs, but only 200 generated). The CEGAR loop lazily adds only
-        // the FC axioms that are actually violated by the current model.
-        if config.array_axioms {
-            let max_cegar_iterations = ay_core::misc_cli_flags().fc_cegar_iters.unwrap_or(16);
-            // Bool-element selects (and Bool indices) have no term bits; the
-            // audit reads their single atom literal through the same maps the
-            // upfront array axioms use (`scalar_elem_lits`).
-            let fc_audit_lits = super::bv_cegar_array::FcAuditLits::new(
-                &term_bits,
-                &bv_bool_to_var,
-                &tseitin_result.term_to_var,
-                var_offset,
-            );
-            solve_result = self.refine_array_fc_model(
-                solve_result,
-                &fc_audit_lits,
-                total_vars,
-                &mut solver,
-                max_cegar_iterations,
-            );
-        }
-
-        if !self.finite_array_expansion.is_complete() && matches!(solve_result, SatResult::Sat(_)) {
-            // A bounded prefix consists only of valid array tautologies, hence
-            // UNSAT remains sound. SAT may depend on a deferred equality and is
-            // withheld until exact finite-domain coverage is complete.
-            let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
-            solve_result = SatResult::Unknown;
-        }
-
-        // Item 4 Stage 2 soundness gate: a SAT found under a BAILED (partial)
-        // non-BV congruence axiomatization may violate an unemitted
-        // congruence constraint — degrade to Unknown before model
-        // extraction. UNSAT remains reportable (partial axioms are a subset
-        // of the full axiomatization).
-        if non_bv_congruence_bailed && matches!(solve_result, SatResult::Sat(_)) {
-            if let Some((_, original)) = var_subst {
-                self.ctx.assertions = original;
-            }
-            return self.finalize_bv_congruence_bail();
-        }
-
-        // Finalize the single-invocation BV DRAT (#56) now that the verdict is
-        // settled: on UNSAT flush and keep the (empty-clause-terminated) proof,
-        // on SAT/Unknown remove the scratch file so no verdict carries a
-        // non-refuting proof. `solve_result` is final here for the export path
-        // (pure QF_BV has no delayed-op re-solve, array CEGAR, or congruence
-        // bail; the assumption path returned earlier and never installs a DRAT).
-        if let Some((drat_path, _)) = bv_drat.as_ref() {
-            let proof = solver.take_proof_writer();
-            // origin's refactor: finish through the retained artifact descriptor
-            // created alongside the DRAT writer (`create_bv_drat`), not the raw
-            // path.
-            let artifact = bv_drat_artifact.ok_or_else(|| {
-                crate::executor_types::ExecutorError::ArtifactExport(format!(
-                    "BV DRAT target '{drat_path}' has no retained artifact descriptor"
-                ))
-            })?;
-            let is_unsat = matches!(solve_result, SatResult::Unsat(_));
-            bv_cnf_dump::finish_bv_drat(proof, artifact, is_unsat)?;
-            // `--self-check` BV DRAT self-cert: record that this pure-QF_BV UNSAT
-            // emitted a native-checkable, empty-clause-terminated DRAT beside its
-            // CNF for THIS solve. `self_cert_armed()` is true only inside the
-            // self-cert arm (not for a user `--proof`+`--dump-bv-cnf` run), so
-            // the flag never fires outside `--self-check`. The CLI verifies the
-            // DRAT with AY's native checker before keeping the `unsat`.
-            if is_unsat && bv_cnf_dump::self_cert_armed() {
-                self.last_bv_drat_self_cert = true;
-            }
-        }
-
-        // --- Phase 11: Model extraction ---
-        phase_trace!("phase11-model");
-        if let SatResult::Sat(ref model) = solve_result {
-            let sat_model: Vec<bool> = model.clone();
-            // Use term_bits clone if bv_solver was dropped (non-BV congruence path),
-            // otherwise get from bv_solver directly.
-            let mut bv_model = Self::extract_bv_model_from_bits(
-                &sat_model,
-                &term_bits,
-                var_offset,
-                &self.ctx.terms,
-            );
-
-            // Seed bool_overrides with Tseitin SAT assignments for Bool-sorted terms (#5115).
-            for (&dimacs_var, &term) in &tseitin_result.var_to_term {
-                if *self.ctx.terms.sort(term) == Sort::Bool {
-                    let sat_idx = (dimacs_var - 1) as usize;
-                    if let Some(&val) = sat_model.get(sat_idx) {
-                        bv_model.bool_overrides.entry(term).or_insert(val);
-                    }
-                }
-            }
-
-            // Seed bool_overrides with the BV bit-blaster's SAT assignments for
-            // Bool variables reached only inside BV terms (ite conditions),
-            // which the Tseitin encoding never sees (#bv-ite-bool-model).
-            Self::seed_bv_bool_assignments_from_bitblast(
-                &sat_model,
-                &bv_bool_to_var,
-                var_offset,
-                &self.ctx.terms,
-                &mut bv_model,
-            );
-
-            // Preprocessor variable substitution recovery (#1708/#1789, #8140)
-            let mut array_substitutions = Vec::new();
-            let mut substituted_vars: HashSet<TermId> = HashSet::default();
-            let mut restored_assertions_covered_by_bv = HashSet::default();
-            let current_assertions: Vec<TermId> = self.ctx.assertions.clone();
-            let coverage_assertions = if var_subst.is_some() {
-                primary_formula_assertions
-                    .as_deref()
-                    .unwrap_or(current_assertions.as_slice())
-            } else {
-                current_assertions.as_slice()
+                bv_deadline.expired()
             };
-            let coverage_covered: Vec<bool> = coverage_assertions
-                .iter()
-                .map(|&assertion| {
-                    Self::bv_assertion_covered(
-                        &self.ctx.terms,
-                        assertion,
-                        &tseitin_result,
-                        &bv_predicate_to_var,
-                        &bv_bool_to_var,
+
+            let mut bv_solver = BvSolver::new(&self.ctx.terms);
+            bv_solver.inherit_encoding_guard(encoding);
+            if let Some(local) = ay_core::misc_cli_flags()
+                .probe_sat_variable
+                .and_then(|v| v.checked_add(1))
+                .and_then(|v| v.checked_sub(tseitin_result.num_vars))
+                .and_then(|v| i32::try_from(v).ok())
+            {
+                bv_solver.watch_variable_registration(local);
+            }
+            // Wire the executor's interrupt flag into the BV solver so that
+            // set_timeout() and interrupt() are respected during bitblasting (#8609).
+            if let Some(ref flag) = bv_interrupt_flag {
+                bv_solver.set_interrupt(flag.clone());
+            }
+            if use_delayed {
+                bv_solver.set_delay_enabled(true);
+
+                // For combined theories, collect terms that must be eagerly internalized.
+                if config.array_axioms || config.uf_congruence {
+                    let mut eager_terms =
+                        self.collect_eager_bv_terms(&config, &array_axiom_extra_roots);
+                    if let Some(reads) = &late_array_reads {
+                        reads.extend_eager_terms(&self.ctx.terms, &mut eager_terms);
+                    }
+                    if !eager_terms.is_empty() {
+                        bv_solver.set_eager_terms(eager_terms);
+                    }
+                }
+            }
+            let bv_clauses = bv_solver.bitblast_all(&self.ctx.assertions);
+
+            // Interrupt / memory check after bitblasting (#8609). bitblast_all()
+            // checks the interrupt flag *and* the process memory ceiling
+            // periodically and may return a partial CNF on either, which it records
+            // (`blast_cut`): the memory reading is not sticky, so only that record
+            // tells a partial CNF from a reading that has since dropped back. A
+            // partial CNF can only ever yield Unknown (never SAT/UNSAT), so bailing
+            // here is sound — it converts an eager-blast memory blowup that would
+            // otherwise OOM-kill the process into a graceful Unknown that respects
+            // the -memory budget. A complete CNF still stops on any stop seen now.
+            // Each stop is published as itself (interrupted, timeout, memout),
+            // never as a verdict or an untagged unknown (P4a). `encoding_phase_stop`
+            // takes `&self`, which the BvSolver's borrow of the term store allows.
+            let blast_cut = bv_solver.blast_cut();
+            #[cfg(test)]
+            let blast_cut = forced_blast_cut::take().or(blast_cut);
+            let blast_stop = match blast_cut {
+                Some(BlastCut::Interrupt) => Some(UnknownOrigin::InterruptFlag),
+                Some(BlastCut::MemoryCeiling) => Some(UnknownOrigin::MemoryBudget),
+                None => self.encoding_phase_stop(),
+            };
+            if let Some(origin) = blast_stop {
+                recorded_blast_stop = Some(origin);
+                drop(bv_solver);
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                self.record_unknown_from_origin(origin);
+                return Ok(SolveResult::Unknown);
+            }
+            if !encoding.open() {
+                drop(bv_solver);
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+
+            if self.debug_ufbv && config.uf_congruence {
+                safe_eprintln!("DEBUG: Tseitin num_vars = {}", tseitin_result.num_vars);
+                safe_eprintln!(
+                    "DEBUG: BV num_vars (before linking) = {}",
+                    bv_solver.num_vars()
+                );
+                safe_eprintln!("DEBUG: Tseitin clauses = {}", tseitin_result.clauses.len());
+                safe_eprintln!(
+                    "DEBUG: BV clauses (before offset) = {}",
+                    bv_solver.clauses().len()
+                );
+                for (term_id, bits) in bv_solver.iter_term_bits() {
+                    safe_eprintln!("DEBUG: Term {:?} has bits {:?}", term_id, bits);
+                }
+            }
+
+            if !encoding.open() {
+                drop(bv_solver);
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+
+            // --- Phase 5: Combine Tseitin + BV clauses ---
+            phase_trace!("phase5-combine");
+            let mut all_clauses = tseitin_result.clauses.clone();
+            if phase_trace_start.is_some() {
+                eprintln!("c phase-trace clauses.tseitin={}", all_clauses.len());
+            }
+            let var_offset = tseitin_result.num_vars as i32;
+            bv_encoding::offset_and_push_clauses(bv_clauses, var_offset, &mut all_clauses);
+            if phase_trace_start.is_some() {
+                eprintln!("c phase-trace clauses.after-bitblast={}", all_clauses.len());
+            }
+
+            // Materialize BV bits for array terms (ABV/AUFBV only)
+            if config.array_axioms {
+                self.materialize_array_bv_terms(
+                    &mut bv_solver,
+                    &array_axiom_extra_roots,
+                    late_array_reads.as_ref(),
+                );
+                let extra = bv_solver.take_clauses();
+                bv_encoding::offset_and_push_clauses(extra, var_offset, &mut all_clauses);
+            }
+
+            // Materialize single-literal encodings for Bool-sorted UF application
+            // arguments BEFORE Tseitin↔BV linking (#boolarg-congruence): Bool args
+            // have no BV bits, so both congruence generators dropped every
+            // application pair containing one — congruence over Bool argument
+            // positions was silently lost (wrong-SAT: 256 finite-domain instances
+            // of `(= (BoolUnbox (BoolBox c)) c)` answered `sat`). Allocating the
+            // literal here lets `build_linking_batch` bridge it to any Tseitin
+            // variable for the same term, and the generators encode the argument
+            // difference as a 1-bit XOR. The clauses `bitblast_bool` emits are
+            // drained into the linking batch's extra BV clauses below.
+            if config.uf_congruence || config.non_bv_congruence {
+                for arg in self.collect_uf_bool_args(assumptions) {
+                    let _ = bv_solver.ensure_bool_literal(arg);
+                }
+            }
+
+            // --- Phases 6-7: Predicate + Bool linking (#858, #5457) ---
+            let mut linking_batch = bv_encoding::build_linking_batch(
+                &tseitin_result.var_to_term,
+                &mut bv_solver,
+                var_offset,
+                &self.ctx.terms,
+                None,
+            );
+            if !encoding.open() {
+                drop(bv_solver);
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+
+            linking_batch.push_equivalence_clauses(&mut all_clauses);
+            let extra_bv_clauses = linking_batch.take_extra_bv_clauses();
+            bv_encoding::offset_and_push_clauses(extra_bv_clauses, var_offset, &mut all_clauses);
+
+            // --- Phase 8: BV equality congruence axioms (#1708, QF_BV only) ---
+            if config.bv_eq_congruence {
+                all_clauses.extend(bv_encoding::generate_bv_eq_congruence_clauses(
+                    &self.ctx.terms,
+                    &self.ctx.assertions,
+                    &bv_solver,
+                    var_offset,
+                ));
+            }
+
+            // --- Phase 9: Theory-specific axiom generation ---
+            phase_trace!("phase9-theory-axioms");
+            if phase_trace_start.is_some() {
+                eprintln!(
+                    "c phase-trace clauses.after-linking-congruence={}",
+                    all_clauses.len()
+                );
+            }
+
+            // Materialize BV bits for UF application arguments (#5475).
+            // Complex BV sub-expressions (e.g., bvadd(x, #x01)) inside UF calls
+            // are opaque to the BV bitblaster and need explicit materialization
+            // before congruence axiom generation.
+            if config.uf_congruence {
+                self.materialize_uf_arg_bv_terms(&mut bv_solver, assumptions);
+                let extra = bv_solver.take_clauses();
+                bv_encoding::offset_and_push_clauses(extra, var_offset, &mut all_clauses);
+            }
+
+            let bv_num_vars = bv_solver.num_vars();
+            let mut running_offset = tseitin_result.num_vars + bv_num_vars;
+
+            // Array axiom clauses (ABV/AUFBV)
+            let _array_axiom_vars = if config.array_axioms {
+                let array_axiom_result = self.generate_array_bv_axioms(
+                    &bv_solver,
+                    tseitin_result.num_vars,
+                    running_offset,
+                    &array_axiom_extra_roots,
+                    &tseitin_result.term_to_var,
+                    late_array_reads.as_ref(),
+                );
+                for clause in array_axiom_result.clauses {
+                    all_clauses.push(clause);
+                }
+                if phase_trace_start.is_some() {
+                    eprintln!(
+                        "c phase-trace clauses.after-array-axioms={}",
+                        all_clauses.len()
+                    );
+                }
+                running_offset += array_axiom_result.num_vars;
+                array_axiom_result.num_vars
+            } else {
+                0
+            };
+
+            // EUF congruence axiom clauses (UFBV/AUFBV). A bailed pass is folded
+            // into `congruence_bail` below: partial congruence is sound
+            // for UNSAT only.
+            let mut euf_bv_congruence_bail = None;
+            let _euf_axiom_vars = if config.uf_congruence {
+                let euf_axiom_result = self.generate_euf_bv_axioms_debug(
+                    &bv_solver,
+                    tseitin_result.num_vars,
+                    running_offset,
+                    self.debug_ufbv,
+                    assumptions,
+                );
+                if self.debug_ufbv {
+                    safe_eprintln!("DEBUG: EUF axiom num_vars = {}", euf_axiom_result.num_vars);
+                    safe_eprintln!(
+                        "DEBUG: EUF axiom clauses = {}",
+                        euf_axiom_result.clauses.len()
+                    );
+                }
+                euf_bv_congruence_bail = euf_axiom_result.bail;
+                for clause in euf_axiom_result.clauses {
+                    all_clauses.push(clause);
+                }
+                if phase_trace_start.is_some() {
+                    eprintln!(
+                        "c phase-trace clauses.after-euf-axioms={}",
+                        all_clauses.len()
+                    );
+                }
+                running_offset += euf_axiom_result.num_vars;
+                euf_axiom_result.num_vars
+            } else {
+                0
+            };
+
+            // Interrupt check after encoding phases (#8609).
+            // Phases 5-9 (clause combination, linking, congruence, axiom generation)
+            // can be expensive for combined theories (QF_ABV, QF_UFBV). Check before
+            // committing to SAT solving. Use local check to avoid borrow conflict
+            // with bv_solver's &self.ctx.terms borrow.
+            if !encoding.open() || bv_is_interrupted() {
+                drop(bv_solver);
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                self.propagate_bv_unknown_reason(true);
+                return Ok(SolveResult::Unknown);
+            }
+
+            // Clone term_bits for model extraction (needed after bv_solver is consumed).
+            // A requested diagnostic uses the actual active namespace offset
+            // and borrowed owner caches. It never populates the proof map.
+            if let Some(variable) = ay_core::misc_cli_flags().probe_sat_variable {
+                crate::executor::probe_cert_reject_raw(|| {
+                    format!(
+                        "c sat-variable-namespace owner=solve_bv_core_inner query_epoch={:#x} bv_instance={:p} requested_sat_variable={} from=bv-local-dimacs1 to=sat-global-zero-based offset={} tseitin_term={:?} bv_vars={} conversion=local-plus-offset-minus-one",
+                        self.query_authority_epoch.diagnostic_address(),
+                        &bv_solver,
+                        variable,
                         var_offset,
-                        &sat_model,
+                        variable
+                            .checked_add(1)
+                            .and_then(|v| tseitin_result.var_to_term.get(&v)),
+                        bv_solver.num_vars(),
                     )
-                })
-                .collect();
-            self.last_statistics.set_int(
-                "model_validation.bv.coverage_assertions",
-                coverage_assertions.len() as u64,
-            );
-            self.last_statistics.set_int(
-                "model_validation.bv.covered_assertions",
-                coverage_covered.iter().filter(|&&covered| covered).count() as u64,
-            );
-            let covered_formula_roots: HashSet<TermId> = coverage_assertions
-                .iter()
-                .zip(coverage_covered.iter())
-                .filter_map(|(&assertion, &covered)| covered.then_some(assertion))
-                .collect();
-            let coverage_source_sets = if var_subst.is_some() {
-                primary_formula_assertion_source_sets
-                    .as_deref()
-                    .or(current_assertion_source_sets.as_deref())
+                });
+                if let Some(local) = variable
+                    .checked_add(1)
+                    .and_then(|v| v.checked_sub(tseitin_result.num_vars))
+                    .and_then(|v| i32::try_from(v).ok())
+                {
+                    bv_solver.probe_variable_provenance(local);
+                }
+            }
+            let term_bits = bv_solver.term_to_bits().clone();
+            let bv_predicate_to_var = bv_solver.predicate_to_var().clone();
+            let bv_bool_to_var = bv_solver.bool_to_var().clone();
+            // Alias for assumption path which references term_bits_snapshot
+            let term_bits_snapshot = &term_bits;
+            // Extract delayed state before dropping bv_solver (#7015).
+            let mut delayed_state = bv_solver.take_delayed_state();
+            // Save division caches for Phase 2 circuit building.
+            // The actual next_var for tmp_bv is computed later using total_vars
+            // to avoid variable collisions with array/EUF axiom variables.
+            let mut delay_div_caches = if delayed_state.is_some() {
+                Some((
+                    bv_solver.div_caches().0.clone(),
+                    bv_solver.div_caches().1.clone(),
+                    // Placeholder; will be updated after total_vars is computed.
+                    bv_solver.num_vars() + 1,
+                ))
             } else {
                 None
             };
-            if var_subst.is_none() {
-                restored_assertions_covered_by_bv.extend(covered_formula_roots.iter().copied());
-            }
-            if let Some((ref var_subst, _)) = var_subst {
-                let source_sets_present = coverage_source_sets.is_some();
-                let (source_mapped_assertions, split_source_assertions, source_sets_valid) =
-                    Self::add_restored_bv_coverage_from_sources(
-                        &self.ctx.terms,
-                        &mut restored_assertions_covered_by_bv,
-                        &coverage_covered,
-                        coverage_source_sets,
+            let has_delayed_ops = delayed_state.is_some();
+            let false_proof_variable = bv_solver
+                .canonical_false_literal()
+                .and_then(|v| u32::try_from(v).ok())
+                .and_then(|v| tseitin_result.num_vars.checked_add(v));
+            drop(bv_solver);
+
+            // Non-BV-return UF congruence (#5433)
+            // Item 4 Stage 2: the pass polls interrupt/deadline/memory inside its
+            // all-pairs loop and may bail with a PARTIAL axiomatization. Partial
+            // congruence is sound for UNSAT only — any CDCL SAT below must be
+            // degraded to Unknown while `congruence_bail` is set.
+            let mut congruence_bail = euf_bv_congruence_bail;
+            if config.non_bv_congruence {
+                let congruence_outcome = self.generate_non_bv_euf_congruence(
+                    &term_bits,
+                    &bv_bool_to_var,
+                    &tseitin_result,
+                    running_offset,
+                    &mut all_clauses,
+                    assumptions,
+                );
+                congruence_bail = CongruenceBail::merge(congruence_bail, congruence_outcome.bail);
+                if congruence_bail.is_some() && ay_core::misc_cli_flags().phase_trace {
+                    eprintln!("c phase-trace non-bv-congruence-bailed");
+                }
+                if phase_trace_start.is_some() {
+                    eprintln!(
+                        "c phase-trace clauses.after-non-bv-congruence={}",
+                        all_clauses.len()
                     );
-                self.last_statistics.set_int(
-                    "model_validation.bv.source_sets_present",
-                    u64::from(source_sets_present),
+                }
+                running_offset += congruence_outcome.num_vars;
+            }
+
+            let mut total_vars = running_offset;
+
+            // Fix next_var for delayed circuit building (#8480):
+            // New BV variables must not collide with array/EUF axiom variables.
+            // The BV offset is var_offset (= tseitin_num_vars), so BV var N maps
+            // to SAT var (var_offset + N - 1). To avoid collisions with variables
+            // in the [tseitin+bv .. total_vars) range, new BV variables must start
+            // at (total_vars - var_offset + 1) = (running_offset - tseitin_num_vars + 1).
+            if let Some((_, _, ref mut next_var)) = delay_div_caches {
+                let safe_next = total_vars - tseitin_result.num_vars + 1;
+                if safe_next > *next_var {
+                    *next_var = safe_next;
+                }
+            }
+
+            if self.debug_ufbv && config.uf_congruence {
+                safe_eprintln!("DEBUG: Total vars = {}", total_vars);
+                safe_eprintln!("DEBUG: Total clauses = {}", all_clauses.len());
+                safe_eprintln!(
+                    "DEBUG: tseitin_num_vars={} bv_num_vars={} var_offset={}",
+                    tseitin_result.num_vars,
+                    bv_num_vars,
+                    var_offset
                 );
-                self.last_statistics.set_int(
-                    "model_validation.bv.source_sets_valid",
-                    u64::from(source_sets_valid),
+            }
+
+            // Interrupt check after all encoding phases, before SAT solve (#3070).
+            if self.should_abort_theory_loop() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return Ok(SolveResult::Unknown);
+            }
+
+            // --- Phase 10: SAT solving ---
+            phase_trace!("phase10-sat");
+            if phase_trace_start.is_some() {
+                let total_lits: usize = all_clauses.iter().map(|c| c.literals().len()).sum();
+                eprintln!(
+                    "c phase-trace phase10-load vars={} clauses={} lits={}",
+                    total_vars,
+                    all_clauses.len(),
+                    total_lits
                 );
-                self.last_statistics.set_int(
-                    "model_validation.bv.source_mapped_assertions",
-                    source_mapped_assertions.len() as u64,
+            }
+            // B-cert pipeline (#56): dump the complete eager bit-blast plus any
+            // check-sat-assuming literals (as unit clauses).  I/O failure aborts
+            // this check before a verdict can escape; certificate production is
+            // never a best-effort trace side effect.
+            if !encoding.open() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+            bv_cnf_dump::write_formula(&all_clauses, total_vars, &sat_assumptions)?;
+
+            // B-cert single-invocation DRAT (#56): when `--proof X.drat` is paired
+            // with `--dump-bv-cnf`, the SAME eager bit-blast that produced the dumped
+            // CNF also emits a drat-trim-checkable DRAT beside it. The DRAT stream is
+            // written live by the SAT solver's proof manager (identical to DIMACS
+            // mode) against the exact variable numbering of the dumped CNF, so the
+            // CNF and its UNSAT certificate are guaranteed to come from one solve.
+            //
+            // Only the plain (no check-sat-assuming) path is certified this way: an
+            // assumption-augmented formula is dumped as CNF-plus-unit-clauses, but
+            // the live DRAT of an assumption solve terminates in an
+            // assumption-negation clause rather than the empty clause, so it would
+            // not be a stand-alone refutation of the dumped CNF. That case fails
+            // closed rather than emit an uncheckable proof (§0).
+            let bv_drat = if export_bv_cnf {
+                bv_cnf_dump::bv_drat_target()
+            } else {
+                None
+            };
+            if bv_drat.is_some() && has_assumptions {
+                return Err(crate::executor_types::ExecutorError::ArtifactExport(
+                    "--proof DRAT with --dump-bv-cnf does not support check-sat-assuming: the \
+                 assumption-augmented bit-blast has no single-invocation DRAT certificate"
+                        .to_string(),
+                ));
+            }
+
+            let (mut solver, bv_drat_artifact) = if let Some((drat_path, binary)) = bv_drat.as_ref()
+            {
+                let (file, artifact) = bv_cnf_dump::create_bv_drat(drat_path)?;
+                let writer = std::io::BufWriter::new(file);
+                let output = if *binary {
+                    ProofOutput::drat_binary(writer)
+                } else {
+                    ProofOutput::drat_text(writer)
+                };
+                (
+                    SatSolver::with_proof_output(total_vars as usize, output),
+                    Some(artifact),
+                )
+            } else {
+                (SatSolver::new(total_vars as usize), None)
+            };
+            self.apply_random_seed_to_sat(&mut solver);
+            self.apply_progress_to_sat(&mut solver);
+            configure_ephemeral_bv_sat_solver(
+                &mut solver,
+                total_vars as usize,
+                all_clauses.len(),
+                config.array_axioms,
+            );
+
+            // Wire a deadline-aware interrupt flag to the SAT solver so
+            // preprocessing passes (congruence, BVE, probing) honor the DPLL
+            // executor timeout (#8782). The deadline timer must not write into the
+            // executor/API interrupt flag: API callers reuse a solver across many
+            // checks, and a timed-out BV subsolve must not poison later queries as
+            // externally interrupted (#8961).
+            let mut _deadline_guard = install_sat_stop(
+                &mut solver,
+                self.solve_interrupt.clone(),
+                self.solve_deadline.get(),
+            );
+
+            // The internal Alethe clause trace and the live DRAT proof manager are
+            // mutually exclusive proof surfaces; the DRAT route owns the proof
+            // manager, so never also arm clause tracing on it.
+            // A fresh eager pure-BV solver owns one fixed original CNF. Move its
+            // ledger on final handoff instead of copying every input into trace.
+            // Extensions, assumptions, empty-input and persistent paths keep
+            // the ordinary capture API; no theorem becomes a new assumption.
+            let consuming_candidate = proof_enabled
+                && bv_drat.is_none()
+                && !config.incremental
+                && !has_assumptions
+                && !has_delayed_ops
+                && !config.array_axioms
+                && !config.uf_congruence
+                && !config.non_bv_congruence
+                && all_clauses
+                    .iter()
+                    .all(|clause| encoding.open() && !clause.literals().is_empty());
+            // A stop observed while classifying the input is terminal, not an
+            // unsupported shape that may fall through to legacy trace copying.
+            if !encoding.open() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+            if consuming_candidate {
+                trace_caller = Some(consuming_trace::TraceCaller::capture(self));
+            }
+            let _trace_scope = trace_caller
+                .as_ref()
+                .map(consuming_trace::TraceCaller::enter);
+            let mut consuming_trace = false;
+            if proof_enabled && bv_drat.is_none() {
+                if let Some(caller) = &mut trace_caller {
+                    if caller.stopped() {
+                        if let Some((_, original)) = var_subst {
+                            self.ctx.assertions = original;
+                        }
+                        return self.abort_bv_encoding();
+                    }
+                    match solver.enable_consuming_clause_trace() {
+                        Ok(capture) => {
+                            caller.retain_capture(capture);
+                            consuming_trace = true;
+                        }
+                        Err(ay_sat::ConsumingTraceError::Unavailable) => {
+                            solver.enable_clause_trace()
+                        }
+                        Err(ay_sat::ConsumingTraceError::Stopped(reason)) => {
+                            caller.record(reason);
+                            if let Some((_, original)) = var_subst {
+                                self.ctx.assertions = original;
+                            }
+                            return self.abort_bv_encoding();
+                        }
+                    }
+                } else {
+                    solver.enable_clause_trace();
+                }
+                solver.set_clause_event_capture(self.clause_event_capture);
+                solver.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
+            }
+
+            // --- JIT batch compilation for BV clauses (#8275) ---
+            // Feed clauses to SAT solver and collect arena offsets for JIT compilation.
+            // BV clauses use arena offsets as clause IDs so that conflict analysis
+            // can construct ClauseRef(arena_offset) to access the clause via standard
+            // 2WL infrastructure. The compiled formula is installed as a separate
+            // bv_compiled_formula alongside the main compiled_formula.
+            //
+            // On non-JIT builds, clauses are added via add_clause_prenormalized
+            // (the original path).
+            {
+                let mut lit_buf: Vec<SatLiteral> = Vec::with_capacity(8);
+                for clause in &all_clauses {
+                    lit_buf.clear();
+                    lit_buf.extend(
+                        clause
+                            .literals()
+                            .iter()
+                            .map(|&lit| crate::cnf_lit_to_sat(lit)),
+                    );
+                    // Sort for add_clause_prenormalized contract: Tseitin/BV
+                    // gate clauses have unique variables but may not be sorted.
+                    lit_buf.sort_unstable_by_key(|l| l.raw());
+                    solver.add_clause_prenormalized(&lit_buf);
+                }
+            }
+
+            // When assumptions are present, use solve_with_assumptions for unsat core
+            // extraction. Otherwise use the standard solve() path.
+            if has_assumptions {
+                solver.set_max_learned_clauses(self.learned_clause_limit);
+                solver.set_max_clause_db_bytes(resolve_clause_db_bytes_limit(
+                    self.clause_db_bytes_limit,
+                    total_vars,
+                ));
+
+                self.arm_sat_count_budget(&mut solver, ChainSpend::NONE);
+
+                // Use interruptible variant to respect timeout/interrupt (#3381)
+                let should_stop = self.make_should_stop();
+                #[cfg(test)]
+                let should_stop = super::slow_host::slow_poll(should_stop);
+                let assume_result =
+                    solver.solve_with_assumptions_interruptible(&sat_assumptions, should_stop);
+
+                collect_sat_stats!(self, &solver);
+
+                match assume_result.into_inner() {
+                    AssumeResult::Sat(model) => {
+                        // Exact finite-array closure is allowed to emit a sound
+                        // prefix when its deterministic aggregate budget is
+                        // exhausted, but that relaxed formula cannot authorize a
+                        // SAT model. Assumption-bearing BV solves return directly
+                        // from this arm, so enforce the same fail-closed boundary
+                        // here before extraction/publication.
+                        if !self.finite_array_expansion.is_complete() {
+                            if let Some((_, original)) = var_subst {
+                                self.ctx.assertions = original;
+                            }
+                            let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
+                            return Ok(SolveResult::Unknown);
+                        }
+                        // Item 4 Stage 2 soundness gate (see the Phase 11 twin):
+                        // SAT under a bailed partial congruence axiomatization
+                        // degrades to Unknown.
+                        if let Some(bail) = congruence_bail {
+                            if let Some((_, original)) = var_subst {
+                                self.ctx.assertions = original;
+                            }
+                            return self.finalize_bv_congruence_bail(bail);
+                        }
+                        self.last_assumption_core = None;
+                        let mut bv_model = Self::extract_bv_model_from_bits(
+                            &model,
+                            term_bits_snapshot,
+                            var_offset,
+                            &self.ctx.terms,
+                        );
+                        // Carry Bool-in-BV variable assignments (ite conditions)
+                        // into the model (#bv-ite-bool-model).
+                        Self::seed_bv_bool_assignments_from_bitblast(
+                            &model,
+                            &bv_bool_to_var,
+                            var_offset,
+                            &self.ctx.terms,
+                            &mut bv_model,
+                        );
+                        let bv_validation = ay_bv::validate_bv_assertions(
+                            &self.ctx.terms,
+                            &self.ctx.assertions,
+                            &bv_model,
+                        );
+                        match bv_validation {
+                            Ok(checked) => {
+                                self.last_statistics
+                                    .set_int("model_validation.bv.checked", checked as u64);
+                            }
+                            Err(error) => {
+                                return self.finalize_bv_model_validation_failure(error);
+                            }
+                        }
+                        return self.solve_and_store_model_full(
+                            SatResult::Sat(model),
+                            &tseitin_result,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(bv_model),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                    AssumeResult::Unsat(core_lits, _) => {
+                        // Map SAT literals back to original assumption TermIds
+                        let core_terms: Vec<TermId> = core_lits
+                            .iter()
+                            .filter_map(|&lit| {
+                                assumption_to_term
+                                    .iter()
+                                    .find(|(sat_lit, _)| {
+                                        sat_lit.variable() == lit.variable()
+                                            && sat_lit.is_positive() == lit.is_positive()
+                                    })
+                                    .map(|(_, term)| *term)
+                            })
+                            .collect();
+                        debug_assert!(
+                            core_terms.iter().all(|ct| assumptions.contains(ct)),
+                            "BUG: BV assumption core contains term not in original assumptions"
+                        );
+                        self.last_assumption_core = Some(core_terms);
+
+                        // UNSAT proof handling (#340, #4176)
+                        if proof_enabled {
+                            self.save_bv_unsat_proof_state(
+                                solver.take_clause_trace(),
+                                &tseitin_result.var_to_term,
+                                false_proof_variable,
+                            );
+                        }
+
+                        return self.solve_and_store_model(
+                            SatResult::Unsat(ay_sat::ProofCertificate::empty()),
+                            &tseitin_result,
+                            None,
+                            None,
+                        );
+                    }
+                    AssumeResult::Unknown => {
+                        self.last_assumption_core = None;
+                        return self.solve_and_store_model(
+                            SatResult::Unknown,
+                            &tseitin_result,
+                            None,
+                            None,
+                        );
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        unreachable!("BUG: AssumeResult variant not handled in BV assumption path")
+                    }
+                }
+            }
+
+            // Standard solve path (no assumptions)
+            //
+            // Delayed internalization (#7015) uses a post-solve re-check loop:
+            // 1. Solve the formula without circuit clauses (delayed ops have
+            //    unconstrained result bits)
+            // 2. If SAT, check delayed ops against the model
+            // 3. If violations: add cheap axiom clauses or full circuit clauses
+            //    as regular clauses and re-solve
+            // 4. Repeat until consistent or max iterations
+            //
+            // This replaces the previous Extension::check() + AddClauses approach
+            // (#8284) which caused spurious UNSAT (#8480). The AddClauses path
+            // injected thousands of new-variable clauses into a complete model
+            // via add_theory_lemma, which interacted badly with the CDCL loop
+            // (the former pending-theory-conflict single-slot overwrite, level-0
+            // unit conflicts from partial propagation during batch addition). The re-solve loop is
+            // simpler, correct, and matches Z3's actual implementation: Z3's
+            // bv_solver::check() returns a status that causes the outer DPLL(T)
+            // loop to restart from scratch with the new clauses.
+            let mut solve_result;
+
+            let mut spent = ChainSpend::NONE;
+
+            if has_delayed_ops {
+                let mut ds = delayed_state
+                    .take()
+                    .expect("delayed_state must exist when has_delayed_ops");
+
+                let mut current_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
+
+                // Re-check loop: verify delayed ops and add clauses as needed.
+                const MAX_DELAYED_ITERATIONS: u32 = 32;
+                let mut iteration = 0u32;
+
+                // Accumulator: ALL cheap-axiom and circuit clauses added across
+                // re-check iterations. Required because each iteration creates a
+                // fresh SAT solver (to avoid stale BCP state after add_clause on a
+                // solved solver — see #8480), so circuit clauses added in a prior
+                // iteration would be lost without this accumulator. Without the
+                // accumulator, the SAT solver can return a model in iter N that
+                // violates circuit constraints added in iter N-1, leaving a
+                // delayed op with `circuit_built=true` but an inconsistent value
+                // (bug #8698: z3_7526 at width=16+ returned Unknown because the
+                // 32-bit bvmul's circuit clauses were dropped on the next
+                // re-solve).
+                let mut accumulated_delayed_clauses: Vec<Vec<SatLiteral>> = Vec::new();
+
+                // If the first solve returns UNSAT but there are unresolved delayed
+                // ops, the UNSAT may be spurious: unconstrained result bits are
+                // connected to constrained formula terms via Tseitin equality
+                // clauses, and the SAT solver can derive false contradictions.
+                //
+                // Fix: build all delayed circuits and re-solve from scratch with
+                // a fresh SAT solver. We cannot reuse the existing solver because
+                // once has_empty_clause is set, it always returns UNSAT.
+                if matches!(current_result, SatResult::Unsat(_)) && ds.has_unresolved() {
+                    let unresolved_indices: Vec<usize> = ds
+                        .delayed_ops()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, op)| !op.circuit_built)
+                        .map(|(i, _)| i)
+                        .collect();
+
+                    if !unresolved_indices.is_empty() {
+                        let mut tmp_bv = BvSolver::new(&self.ctx.terms);
+                        tmp_bv.inherit_encoding_guard(encoding);
+                        tmp_bv.set_term_to_bits(ds.term_to_bits().clone());
+                        if let Some((ref ucache, ref scache, ref mut next_var)) = delay_div_caches {
+                            tmp_bv.set_div_caches(ucache.clone(), scache.clone());
+                            tmp_bv.set_next_var(*next_var);
+                        }
+                        tmp_bv.set_delayed_ops(ds.delayed_ops().to_vec());
+
+                        let mut circuit_clauses_sat: Vec<Vec<SatLiteral>> = Vec::new();
+                        for &idx in &unresolved_indices {
+                            let circuit_clauses = tmp_bv.build_delayed_circuit(idx);
+                            if !encoding.open() {
+                                drop(tmp_bv);
+                                if let Some((_, original)) = var_subst {
+                                    self.ctx.assertions = original;
+                                }
+                                return self.abort_bv_encoding();
+                            }
+                            for clause in &circuit_clauses {
+                                let sat_lits: Vec<SatLiteral> = clause
+                                    .literals()
+                                    .iter()
+                                    .map(|&lit| {
+                                        crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
+                                            lit, var_offset,
+                                        ))
+                                    })
+                                    .collect();
+                                circuit_clauses_sat.push(sat_lits);
+                            }
+                            let bv_extra = tmp_bv.take_clauses();
+                            for clause in &bv_extra {
+                                let sat_lits: Vec<SatLiteral> = clause
+                                    .literals()
+                                    .iter()
+                                    .map(|&lit| {
+                                        crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
+                                            lit, var_offset,
+                                        ))
+                                    })
+                                    .collect();
+                                circuit_clauses_sat.push(sat_lits);
+                            }
+                        }
+
+                        if let Some((_, _, ref mut next_var)) = delay_div_caches {
+                            *next_var = tmp_bv.num_vars() + 1;
+                        }
+
+                        if !circuit_clauses_sat.is_empty() && self.should_abort_theory_loop() {
+                            current_result = SatResult::Unknown;
+                        } else if !circuit_clauses_sat.is_empty() {
+                            // Persist circuit clauses into the accumulator so that
+                            // every subsequent fresh-solver rebuild (#8698) keeps
+                            // them in scope. Without this, a later cheap-axiom
+                            // re-solve would drop the circuit clauses on the
+                            // floor, allowing the SAT solver to return a model
+                            // where the circuit-built op is still inconsistent.
+                            accumulated_delayed_clauses.extend(circuit_clauses_sat.iter().cloned());
+
+                            // Determine the new total variable count.
+                            let circuit_max_var = circuit_clauses_sat
+                                .iter()
+                                .flat_map(|c| c.iter())
+                                .map(|l| l.variable().index() + 1)
+                                .max()
+                                .unwrap_or(0);
+                            let new_total_vars = circuit_max_var.max(total_vars as usize);
+
+                            // Create a fresh SAT solver with original + circuit clauses.
+                            let mut fresh_solver = SatSolver::new(new_total_vars);
+                            self.apply_random_seed_to_sat(&mut fresh_solver);
+                            self.apply_progress_to_sat(&mut fresh_solver);
+                            configure_ephemeral_bv_sat_solver(
+                                &mut fresh_solver,
+                                new_total_vars,
+                                all_clauses.len() + accumulated_delayed_clauses.len(),
+                                config.array_axioms,
+                            );
+                            _deadline_guard = install_sat_stop(
+                                &mut fresh_solver,
+                                self.solve_interrupt.clone(),
+                                self.solve_deadline.get(),
+                            );
+
+                            // Re-add all original clauses.
+                            for clause in &all_clauses {
+                                let sat_lits: Vec<SatLiteral> = clause
+                                    .literals()
+                                    .iter()
+                                    .map(|&lit| crate::cnf_lit_to_sat(lit))
+                                    .collect();
+                                fresh_solver.add_clause(sat_lits);
+                            }
+                            // Add circuit clauses.
+                            for clause in circuit_clauses_sat {
+                                fresh_solver.add_clause(clause);
+                            }
+
+                            current_result =
+                                self.solve_sat_in_budget_chain(&mut fresh_solver, &mut spent);
+                            solver = fresh_solver;
+                            // Update total_vars so CEGAR loop doesn't collide.
+                            total_vars = total_vars.max(new_total_vars as u32);
+                        }
+                    }
+                }
+
+                // Residual iteration-cap hole (#4666/#8595): when the CEGAR refinement
+                // budget is exhausted, the candidate model has NOT been verified against
+                // the remaining delayed ops (the `ds.check` below is skipped), so a
+                // delayed result variable may still violate its defining op (e.g.
+                // `full_chunks = usize::MAX` while the udiv relation requires
+                // `full_chunks*3 <= len <= isize::MAX`). Record that case and downgrade to
+                // Unknown after the loop instead of publishing a possibly-spurious Sat.
+                let mut cap_hit_unresolved = false;
+                while let SatResult::Sat(ref model) = current_result {
+                    if iteration >= MAX_DELAYED_ITERATIONS {
+                        // Downgrade ONLY if the candidate model is actually INCONSISTENT
+                        // with a remaining delayed op — i.e. a final `check` against THIS
+                        // model still yields refinement clauses. A model that happens to
+                        // satisfy every delayed op (empty check) is a genuine Sat and must
+                        // be preserved (using `has_unresolved()` alone over-rejects such
+                        // consistent-but-not-circuit-built models).
+                        if ds.has_unresolved() {
+                            let (cheap, circ) = ds.check(model, var_offset);
+                            cap_hit_unresolved = !cheap.is_empty() || !circ.is_empty();
+                        }
+                        break;
+                    }
+                    iteration += 1;
+
+                    if !ds.has_unresolved() {
+                        break;
+                    }
+
+                    // Check delayed ops against the current model.
+                    let (cheap_clauses, needs_circuit) = ds.check(model, var_offset);
+
+                    if cheap_clauses.is_empty() && needs_circuit.is_empty() {
+                        // All delayed ops are consistent under the current model.
+                        // This is only correct when previously-built circuits are
+                        // preserved across re-solves via accumulated_delayed_clauses
+                        // (#8698) — otherwise a "built" op may still be inconsistent.
+                        break;
+                    }
+
+                    // Collect all new clauses (cheap axioms + full circuits).
+                    let mut new_clauses: Vec<Vec<SatLiteral>> = Vec::new();
+
+                    // Phase 1: cheap axiom clauses.
+                    for clause in &cheap_clauses {
+                        let sat_lits: Vec<SatLiteral> = clause
+                            .literals()
+                            .iter()
+                            .map(|&lit| {
+                                crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(lit, var_offset))
+                            })
+                            .collect();
+                        new_clauses.push(sat_lits);
+                    }
+
+                    // Phase 2: build full circuits for ops that exhausted cheap axioms.
+                    if !needs_circuit.is_empty() {
+                        let mut tmp_bv = BvSolver::new(&self.ctx.terms);
+                        tmp_bv.inherit_encoding_guard(encoding);
+                        tmp_bv.set_term_to_bits(ds.term_to_bits().clone());
+                        if let Some((ref ucache, ref scache, ref mut next_var)) = delay_div_caches {
+                            tmp_bv.set_div_caches(ucache.clone(), scache.clone());
+                            tmp_bv.set_next_var(*next_var);
+                        }
+                        tmp_bv.set_delayed_ops(ds.delayed_ops().to_vec());
+
+                        for &idx in &needs_circuit {
+                            let circuit_clauses = tmp_bv.build_delayed_circuit(idx);
+                            if !encoding.open() {
+                                drop(tmp_bv);
+                                if let Some((_, original)) = var_subst {
+                                    self.ctx.assertions = original;
+                                }
+                                return self.abort_bv_encoding();
+                            }
+                            for clause in &circuit_clauses {
+                                let sat_lits: Vec<SatLiteral> = clause
+                                    .literals()
+                                    .iter()
+                                    .map(|&lit| {
+                                        crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
+                                            lit, var_offset,
+                                        ))
+                                    })
+                                    .collect();
+                                new_clauses.push(sat_lits);
+                            }
+                            let bv_extra = tmp_bv.take_clauses();
+                            for clause in &bv_extra {
+                                let sat_lits: Vec<SatLiteral> = clause
+                                    .literals()
+                                    .iter()
+                                    .map(|&lit| {
+                                        crate::cnf_lit_to_sat(bv_encoding::offset_cnf_lit(
+                                            lit, var_offset,
+                                        ))
+                                    })
+                                    .collect();
+                                new_clauses.push(sat_lits);
+                            }
+                        }
+
+                        if let Some((_, _, ref mut next_var)) = delay_div_caches {
+                            *next_var = tmp_bv.num_vars() + 1;
+                        }
+                    }
+
+                    if new_clauses.is_empty() {
+                        break;
+                    }
+
+                    // Accumulate this iteration's cheap-axiom and circuit clauses
+                    // so future re-solves keep them in scope (#8698). Each fresh
+                    // SAT solver below adds `all_clauses` plus the entire
+                    // accumulator — this guarantees that once a delayed op's
+                    // circuit is built, the SAT solver can never again return a
+                    // model where that circuit is violated.
+                    accumulated_delayed_clauses.extend(new_clauses.iter().cloned());
+
+                    // Re-solve with a fresh SAT solver containing original + ALL
+                    // accumulated delayed clauses. We cannot reuse the existing
+                    // solver because adding clauses to a solver that has a
+                    // complete SAT model can trigger BCP during add_clause that
+                    // derives false contradictions from the stale model state
+                    // (#8480).
+                    if self.should_abort_theory_loop() {
+                        current_result = SatResult::Unknown;
+                        break;
+                    }
+
+                    let circuit_max_var = accumulated_delayed_clauses
+                        .iter()
+                        .flat_map(|c| c.iter())
+                        .map(|l| l.variable().index() + 1)
+                        .max()
+                        .unwrap_or(0);
+                    let new_total = circuit_max_var.max(total_vars as usize);
+
+                    let mut fresh = SatSolver::new(new_total);
+                    self.apply_random_seed_to_sat(&mut fresh);
+                    self.apply_progress_to_sat(&mut fresh);
+                    configure_ephemeral_bv_sat_solver(
+                        &mut fresh,
+                        new_total,
+                        all_clauses.len() + accumulated_delayed_clauses.len(),
+                        config.array_axioms,
+                    );
+                    _deadline_guard = install_sat_stop(
+                        &mut fresh,
+                        self.solve_interrupt.clone(),
+                        self.solve_deadline.get(),
+                    );
+
+                    // Re-add all original clauses.
+                    for clause in &all_clauses {
+                        let sat_lits: Vec<SatLiteral> = clause
+                            .literals()
+                            .iter()
+                            .map(|&lit| crate::cnf_lit_to_sat(lit))
+                            .collect();
+                        fresh.add_clause(sat_lits);
+                    }
+                    // Add ALL accumulated delayed clauses (circuits + cheap axioms)
+                    // across every iteration so far.
+                    for clause in &accumulated_delayed_clauses {
+                        fresh.add_clause(clause.clone());
+                    }
+
+                    current_result = self.solve_sat_in_budget_chain(&mut fresh, &mut spent);
+                    solver = fresh;
+                    // Update total_vars so CEGAR loop doesn't collide.
+                    total_vars = total_vars.max(new_total as u32);
+                }
+
+                // SOUND downgrade (#4666/#8595): a Sat that exhausted the delayed-op
+                // refinement budget with ops still unresolved is possibly spurious (a
+                // delayed result variable may violate its defining op) — publish Unknown,
+                // never a false counterexample. This only ever turns a candidate-Sat into
+                // Unknown: a genuine model resolves every delayed op and exits the loop
+                // via the `!ds.has_unresolved()` / consistent-`check` breaks (leaving
+                // `cap_hit_unresolved == false`), so real Sat and all Unsat results are
+                // unaffected — the feasible set is never enlarged or under-cut.
+                if cap_hit_unresolved && matches!(current_result, SatResult::Sat(_)) {
+                    current_result = SatResult::Unknown;
+                }
+                solve_result = current_result;
+                self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
+            } else {
+                // Bound the learned-clause DB on the long naked solve (#dt-array-fc-lazy),
+                // mirroring the has-assumptions branch. A huge instance (21M+ vars) can
+                // otherwise grow an unbounded learned DB over a multi-hour solve,
+                // drowning BCP. Caps bound only LEARNED clauses (never original), so
+                // completeness/soundness are unaffected — just memory.
+                solver.set_max_learned_clauses(self.learned_clause_limit);
+                solver.set_max_clause_db_bytes(resolve_clause_db_bytes_limit(
+                    self.clause_db_bytes_limit,
+                    total_vars,
+                ));
+                solve_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
+                self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
+            }
+
+            // --- Phase 10.7: CEGAR array FC refinement (#8510) ---
+            phase_trace!("phase10.7-cegar");
+            //
+            // After SAT returns a satisfying assignment, check array functional
+            // consistency: for any two select terms on the same array with equal
+            // concrete index values, their result values must also be equal.
+            //
+            // The upfront FC axiom budget (FC_CROSS_BASE_BUDGET_PER_ARRAY = 200)
+            // can be insufficient for arrays with many constant-indexed selects
+            // and few symbolic-indexed selects (e.g., csplit-query QF_ABV:
+            // 2050 constant selects + 8 symbolic selects = 16K+ needed cross-base
+            // pairs, but only 200 generated). The CEGAR loop lazily adds only
+            // the FC axioms that are actually violated by the current model.
+            if config.array_axioms {
+                let max_cegar_iterations = ay_core::misc_cli_flags().fc_cegar_iters.unwrap_or(16);
+                // Bool-element selects (and Bool indices) have no term bits; the
+                // audit reads their single atom literal through the same maps the
+                // upfront array axioms use (`scalar_elem_lits`).
+                let fc_audit_lits = super::bv_cegar_array::FcAuditLits::new(
+                    &term_bits,
+                    &bv_bool_to_var,
+                    &tseitin_result.term_to_var,
+                    var_offset,
                 );
-                self.last_statistics.set_int(
-                    "model_validation.bv.split_source_assertions",
-                    split_source_assertions.len() as u64,
+                // Var<->var array equalities for the FC audit's
+                // cross-equality pass, captured from the original
+                // (pre-substitution) assertions where that form still
+                // exists, each mapped to its substituted term for the
+                // guard atom.
+                let cross_pairs = match &var_subst {
+                    Some((var_subst, original)) => {
+                        let mut subst = var_subst
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        Self::collect_cross_equality_pairs(
+                            &mut self.ctx.terms,
+                            original,
+                            Some(&mut subst),
+                        )
+                    }
+                    None => Self::collect_cross_equality_pairs(
+                        &mut self.ctx.terms,
+                        &self.ctx.assertions.clone(),
+                        None,
+                    ),
+                };
+                solve_result = self.refine_array_fc_model(
+                    solve_result,
+                    &fc_audit_lits,
+                    &cross_pairs,
+                    total_vars,
+                    &mut solver,
+                    max_cegar_iterations,
+                    &mut spent,
+                );
+            }
+
+            if !self.finite_array_expansion.is_complete()
+                && matches!(solve_result, SatResult::Sat(_))
+            {
+                // A bounded prefix consists only of valid array tautologies, hence
+                // UNSAT remains sound. SAT may depend on a deferred equality and is
+                // withheld until exact finite-domain coverage is complete.
+                let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
+                solve_result = SatResult::Unknown;
+            }
+
+            // Item 4 Stage 2 soundness gate: a SAT found under a BAILED (partial)
+            // non-BV congruence axiomatization may violate an unemitted
+            // congruence constraint — degrade to Unknown before model
+            // extraction. UNSAT remains reportable (partial axioms are a subset
+            // of the full axiomatization).
+            if let (Some(bail), SatResult::Sat(_)) = (congruence_bail, &solve_result) {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.finalize_bv_congruence_bail(bail);
+            }
+
+            if !encoding.open() {
+                solve_result = SatResult::Unknown;
+            }
+
+            // Finalize the single-invocation BV DRAT (#56) now that the verdict is
+            // settled: on UNSAT flush and keep the (empty-clause-terminated) proof,
+            // on SAT/Unknown remove the scratch file so no verdict carries a
+            // non-refuting proof. `solve_result` is final here for the export path
+            // (pure QF_BV has no delayed-op re-solve, array CEGAR, or congruence
+            // bail; the assumption path returned earlier and never installs a DRAT).
+            if let Some((drat_path, _)) = bv_drat.as_ref() {
+                let proof = solver.take_proof_writer();
+                // origin's refactor: finish through the retained artifact descriptor
+                // created alongside the DRAT writer (`create_bv_drat`), not the raw
+                // path.
+                let artifact = bv_drat_artifact.ok_or_else(|| {
+                    crate::executor_types::ExecutorError::ArtifactExport(format!(
+                        "BV DRAT target '{drat_path}' has no retained artifact descriptor"
+                    ))
+                })?;
+                let is_unsat = matches!(solve_result, SatResult::Unsat(_));
+                bv_cnf_dump::finish_bv_drat(proof, artifact, is_unsat)?;
+                // `--self-check` BV DRAT self-cert: record that this pure-QF_BV UNSAT
+                // emitted a native-checkable, empty-clause-terminated DRAT beside its
+                // CNF for THIS solve. `self_cert_armed()` is true only inside the
+                // self-cert arm (not for a user `--proof`+`--dump-bv-cnf` run), so
+                // the flag never fires outside `--self-check`. The CLI verifies the
+                // DRAT with AY's native checker before keeping the `unsat`.
+                if is_unsat && bv_cnf_dump::self_cert_armed() {
+                    self.last_bv_drat_self_cert = true;
+                }
+            }
+
+            // --- Phase 11: Model extraction ---
+            phase_trace!("phase11-model");
+            if let SatResult::Sat(ref model) = solve_result {
+                let sat_model: Vec<bool> = model.clone();
+                // Use term_bits clone if bv_solver was dropped (non-BV congruence path),
+                // otherwise get from bv_solver directly.
+                let mut bv_model = Self::extract_bv_model_from_bits(
+                    &sat_model,
+                    &term_bits,
+                    var_offset,
+                    &self.ctx.terms,
                 );
 
-                let substitutions = var_subst
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let subs: Vec<(TermId, TermId)> = substitutions
-                    .substitutions()
-                    .iter()
-                    .map(|(&k, &v)| (k, v))
-                    .collect();
-                // Record eliminated-variable definitions for model completion
-                // at finalize time (model/completion.rs). Complements the
-                // BV-local recovery below for RHS forms it cannot evaluate.
-                for &(from, to) in &subs {
-                    self.recorded_var_substitutions.insert(from, to);
+                // Seed bool_overrides with Tseitin SAT assignments for Bool-sorted terms (#5115).
+                for (&dimacs_var, &term) in &tseitin_result.var_to_term {
+                    if *self.ctx.terms.sort(term) == Sort::Bool {
+                        let sat_idx = (dimacs_var - 1) as usize;
+                        if let Some(&val) = sat_model.get(sat_idx) {
+                            bv_model.bool_overrides.entry(term).or_insert(val);
+                        }
+                    }
                 }
-                array_substitutions = subs
+
+                // Seed bool_overrides with the BV bit-blaster's SAT assignments for
+                // Bool variables reached only inside BV terms (ite conditions),
+                // which the Tseitin encoding never sees (#bv-ite-bool-model).
+                Self::seed_bv_bool_assignments_from_bitblast(
+                    &sat_model,
+                    &bv_bool_to_var,
+                    var_offset,
+                    &self.ctx.terms,
+                    &mut bv_model,
+                );
+
+                // Preprocessor variable substitution recovery (#1708/#1789, #8140)
+                let mut array_substitutions = Vec::new();
+                let mut substituted_vars: HashSet<TermId> = HashSet::default();
+                let mut restored_assertions_covered_by_bv = HashSet::default();
+                let current_assertions: Vec<TermId> = self.ctx.assertions.clone();
+                let coverage_assertions = if var_subst.is_some() {
+                    primary_formula_assertions
+                        .as_deref()
+                        .unwrap_or(current_assertions.as_slice())
+                } else {
+                    current_assertions.as_slice()
+                };
+                let coverage_covered: Vec<bool> = coverage_assertions
                     .iter()
-                    .copied()
-                    .filter(|(from_var, _)| {
-                        matches!(self.ctx.terms.sort(*from_var), Sort::Array(_))
+                    .map(|&assertion| {
+                        Self::bv_assertion_covered(
+                            &self.ctx.terms,
+                            assertion,
+                            &tseitin_result,
+                            &bv_predicate_to_var,
+                            &bv_bool_to_var,
+                            var_offset,
+                            &sat_model,
+                        )
                     })
                     .collect();
-                // #abv-select-congruence: array-model extraction excludes
-                // select pairs whose index mentions an eliminated variable
-                // (their bit-blast values are decoupled junk).
-                substituted_vars = subs.iter().map(|&(from_var, _)| from_var).collect();
-                Self::recover_substituted_bv_bool_values(&self.ctx.terms, &subs, &mut bv_model);
-
-                if !source_sets_present {
-                    self.last_statistics
-                        .set_int("model_validation.bv.source_sets_missing_fail_closed", 1);
-                }
-            }
-
-            // Restore original assertions if preprocessed
-            if let Some((_, original)) = &var_subst {
-                self.ctx.assertions = original.clone();
-            }
-            Self::add_delegated_validation_conjuncts(
-                &self.ctx.terms,
-                &mut restored_assertions_covered_by_bv,
-            );
-            self.model_validation_delegated_assertions = restored_assertions_covered_by_bv;
-            self.last_statistics.set_int(
-                "model_validation.bv.restored_delegated_assertions",
-                self.model_validation_delegated_assertions.len() as u64,
-            );
-
-            match ay_bv::validate_bv_assertions(&self.ctx.terms, &self.ctx.assertions, &bv_model) {
-                Ok(checked) => {
-                    self.last_statistics
-                        .set_int("model_validation.bv.checked", checked as u64);
-                }
-                Err(error) => {
-                    return self.finalize_bv_model_validation_failure(error);
-                }
-            }
-
-            // Extract array model from BV select terms (#5449)
-            let array_model = if config.array_axioms {
-                let mut am = Self::extract_array_model_from_bv_model(
-                    &self.ctx.terms,
-                    &bv_model,
-                    &self.ctx.assertions,
-                    &substituted_vars,
+                self.last_statistics.set_int(
+                    "model_validation.bv.coverage_assertions",
+                    coverage_assertions.len() as u64,
                 );
-                Self::populate_array_models_from_substitutions(
-                    &self.ctx.terms,
-                    &bv_model,
-                    &array_substitutions,
-                    &mut am.array_values,
+                self.last_statistics.set_int(
+                    "model_validation.bv.covered_assertions",
+                    coverage_covered.iter().filter(|&&covered| covered).count() as u64,
                 );
-                if am.array_values.is_empty() {
-                    None
+                let covered_formula_roots: HashSet<TermId> = coverage_assertions
+                    .iter()
+                    .zip(coverage_covered.iter())
+                    .filter_map(|(&assertion, &covered)| covered.then_some(assertion))
+                    .collect();
+                let coverage_source_sets = if var_subst.is_some() {
+                    primary_formula_assertion_source_sets
+                        .as_deref()
+                        .or(current_assertion_source_sets.as_deref())
                 } else {
-                    Some(am)
+                    None
+                };
+                if var_subst.is_none() {
+                    restored_assertions_covered_by_bv.extend(covered_formula_roots.iter().copied());
+                }
+                if let Some((ref var_subst, _)) = var_subst {
+                    let source_sets_present = coverage_source_sets.is_some();
+                    let (source_mapped_assertions, split_source_assertions, source_sets_valid) =
+                        Self::add_restored_bv_coverage_from_sources(
+                            &self.ctx.terms,
+                            &mut restored_assertions_covered_by_bv,
+                            &coverage_covered,
+                            coverage_source_sets,
+                        );
+                    self.last_statistics.set_int(
+                        "model_validation.bv.source_sets_present",
+                        u64::from(source_sets_present),
+                    );
+                    self.last_statistics.set_int(
+                        "model_validation.bv.source_sets_valid",
+                        u64::from(source_sets_valid),
+                    );
+                    self.last_statistics.set_int(
+                        "model_validation.bv.source_mapped_assertions",
+                        source_mapped_assertions.len() as u64,
+                    );
+                    self.last_statistics.set_int(
+                        "model_validation.bv.split_source_assertions",
+                        split_source_assertions.len() as u64,
+                    );
+
+                    let substitutions = var_subst
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let subs: Vec<(TermId, TermId)> = substitutions
+                        .substitutions()
+                        .iter()
+                        .map(|(&k, &v)| (k, v))
+                        .collect();
+                    // Record eliminated-variable definitions for model completion
+                    // at finalize time (model/completion.rs). Complements the
+                    // BV-local recovery below for RHS forms it cannot evaluate.
+                    for &(from, to) in &subs {
+                        self.recorded_var_substitutions.insert(from, to);
+                    }
+                    array_substitutions = subs
+                        .iter()
+                        .copied()
+                        .filter(|(from_var, _)| {
+                            matches!(self.ctx.terms.sort(*from_var), Sort::Array(_))
+                        })
+                        .collect();
+                    // #abv-select-congruence: array-model extraction excludes
+                    // select pairs whose index mentions an eliminated variable
+                    // (their bit-blast values are decoupled junk).
+                    substituted_vars = subs.iter().map(|&(from_var, _)| from_var).collect();
+                    Self::recover_substituted_bv_bool_values(&self.ctx.terms, &subs, &mut bv_model);
+
+                    if !source_sets_present {
+                        self.last_statistics
+                            .set_int("model_validation.bv.source_sets_missing_fail_closed", 1);
+                    }
+                }
+
+                // Restore original assertions if preprocessed
+                if let Some((_, original)) = &var_subst {
+                    self.ctx.assertions = original.clone();
+                }
+                Self::add_delegated_validation_conjuncts(
+                    &self.ctx.terms,
+                    &mut restored_assertions_covered_by_bv,
+                );
+                self.model_validation_delegated_assertions = restored_assertions_covered_by_bv;
+                self.last_statistics.set_int(
+                    "model_validation.bv.restored_delegated_assertions",
+                    self.model_validation_delegated_assertions.len() as u64,
+                );
+
+                match ay_bv::validate_bv_assertions(
+                    &self.ctx.terms,
+                    &self.ctx.assertions,
+                    &bv_model,
+                ) {
+                    Ok(checked) => {
+                        self.last_statistics
+                            .set_int("model_validation.bv.checked", checked as u64);
+                    }
+                    Err(error) => {
+                        return self.finalize_bv_model_validation_failure(error);
+                    }
+                }
+
+                // Extract array model from BV select terms (#5449)
+                let array_model = if config.array_axioms {
+                    let mut am = Self::extract_array_model_from_bv_model(
+                        &self.ctx.terms,
+                        &bv_model,
+                        &self.ctx.assertions,
+                        &substituted_vars,
+                    );
+                    self.populate_array_models_with_field_targets(
+                        &bv_model,
+                        &array_substitutions,
+                        &substituted_vars,
+                        &mut am,
+                    );
+                    if am.array_values.is_empty() && !am.has_withheld_arrays() {
+                        None
+                    } else {
+                        Some(am)
+                    }
+                } else {
+                    None
+                };
+                if !encoding.open() {
+                    return self.abort_bv_encoding();
+                }
+                return self.solve_and_store_model_full(
+                    SatResult::Sat(sat_model),
+                    &tseitin_result,
+                    None,
+                    array_model,
+                    None,
+                    None,
+                    Some(bv_model),
+                    None,
+                    None,
+                    None,
+                );
+            }
+
+            // --- Phase 12: Non-SAT result finalization ---
+            debug_assert!(
+                !matches!(solve_result, SatResult::Sat(_)),
+                "BUG: BV SAT case must go through solve_and_store_model_full, not From conversion"
+            );
+
+            let clause_trace = if proof_enabled && matches!(solve_result, SatResult::Unsat(_)) {
+                if consuming_trace {
+                    let trace = solver.into_consuming_clause_trace(&mut || !encoding.open());
+                    let Some(caller) = &trace_caller else {
+                        self.record_evaluation_stop(crate::UnknownOrigin::IncompleteSolverLane);
+                        if let Some((_, original)) = var_subst {
+                            self.ctx.assertions = original;
+                        }
+                        return self.abort_bv_encoding();
+                    };
+                    match caller.handoff(trace) {
+                        Ok(trace) => trace,
+                        Err(_) => {
+                            if let Some((_, original)) = var_subst {
+                                self.ctx.assertions = original;
+                            }
+                            return self.abort_bv_encoding();
+                        }
+                    }
+                } else {
+                    solver.take_clause_trace()
                 }
             } else {
                 None
             };
-            return self.solve_and_store_model_full(
-                SatResult::Sat(sat_model),
-                &tseitin_result,
-                None,
-                array_model,
-                None,
-                None,
-                Some(bv_model),
-                None,
-                None,
-                None,
-            );
-        }
 
-        // --- Phase 12: Non-SAT result finalization ---
-        debug_assert!(
-            !matches!(solve_result, SatResult::Sat(_)),
-            "BUG: BV SAT case must go through solve_and_store_model_full, not From conversion"
-        );
+            if matches!(solve_result, SatResult::Unsat(_)) {
+                self.last_assumption_core = Some(vec![]);
+            }
 
-        let clause_trace = if proof_enabled && matches!(solve_result, SatResult::Unsat(_)) {
-            solver.take_clause_trace()
+            let result = match solve_result {
+                SatResult::Unsat(_) => self.finalize_bv_unsat_with_constant_hint(
+                    clause_trace,
+                    &tseitin_result.var_to_term,
+                    false_proof_variable,
+                    proof_enabled,
+                ),
+                SatResult::Unknown => self.finalize_bv_unknown(),
+                SatResult::Sat(_) => {
+                    unreachable!("BUG: BV SAT case handled above")
+                }
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("BUG: SatResult variant not handled in BV non-incremental path"),
+            };
+
+            // Restore original assertions if preprocessed
+            if let Some((_, original)) = var_subst {
+                self.ctx.assertions = original;
+            }
+
+            result
+        })();
+        // Artifact/internal errors retain their genuine error classification.
+        let trace_stopped = trace_caller
+            .as_ref()
+            .is_some_and(consuming_trace::TraceCaller::stopped);
+        drop(trace_caller);
+        if result.is_ok() && (trace_stopped || !owner.open()) {
+            let aborted = self.abort_bv_encoding();
+            // The original blast's sticky cause outlives temporary memory
+            // readings and raw flag resets during cleanup.
+            if let Some(origin) = recorded_blast_stop {
+                self.record_unknown_from_origin(origin);
+            }
+            aborted
         } else {
-            None
-        };
-
-        if matches!(solve_result, SatResult::Unsat(_)) {
-            self.last_assumption_core = Some(vec![]);
+            result
         }
-
-        let result = match solve_result {
-            SatResult::Unsat(_) => {
-                self.finalize_bv_unsat(clause_trace, &tseitin_result.var_to_term, proof_enabled)
-            }
-            SatResult::Unknown => self.finalize_bv_unknown(),
-            SatResult::Sat(_) => {
-                unreachable!("BUG: BV SAT case handled above")
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("BUG: SatResult variant not handled in BV non-incremental path"),
-        };
-
-        // Restore original assertions if preprocessed
-        if let Some((_, original)) = var_subst {
-            self.ctx.assertions = original;
-        }
-
-        result
     }
 
     /// Finalize a BV UNSAT result: save proof state, set result, build proof.
@@ -2428,8 +2660,18 @@ impl Executor {
         var_to_term: &std::collections::BTreeMap<u32, TermId>,
         proof_enabled: bool,
     ) -> Result<SolveResult> {
+        self.finalize_bv_unsat_with_constant_hint(clause_trace, var_to_term, None, proof_enabled)
+    }
+
+    fn finalize_bv_unsat_with_constant_hint(
+        &mut self,
+        clause_trace: Option<ClauseTrace>,
+        var_to_term: &std::collections::BTreeMap<u32, TermId>,
+        false_dimacs_hint: Option<u32>,
+        proof_enabled: bool,
+    ) -> Result<SolveResult> {
         if proof_enabled {
-            self.save_bv_unsat_proof_state(clause_trace, var_to_term);
+            self.save_bv_unsat_proof_state(clause_trace, var_to_term, false_dimacs_hint);
         }
         self.last_model = None;
         self.last_result = Some(SolveResult::unsat());
@@ -2437,31 +2679,6 @@ impl Executor {
             self.build_unsat_proof();
         }
         Ok(SolveResult::unsat())
-    }
-
-    /// Degrade a CDCL SAT found under a BAILED (partial) non-BV congruence
-    /// axiomatization to Unknown (item 4 Stage 2).
-    ///
-    /// The congruence pair loop stopped early on interrupt/deadline/memory,
-    /// so the emitted axioms are a SUBSET of the full axiomatization: UNSAT
-    /// verdicts remain valid, but a model may violate an unemitted
-    /// congruence constraint (the 2026-06-20 wrong-SAT hunt class). Fail
-    /// closed to Unknown with an Incomplete marker.
-    pub(super) fn finalize_bv_congruence_bail(&mut self) -> Result<SolveResult> {
-        tracing::warn!(
-            "BV non-BV congruence axiomatization bailed mid-loop; degrading CDCL SAT to \
-             Unknown (partial congruence is sound for UNSAT only)"
-        );
-        self.last_statistics
-            .set_string("unknown.reason", UnknownReason::Incomplete.to_string());
-        self.last_statistics
-            .set_string("unknown.phase", "non-bv-congruence-bail");
-        self.last_statistics
-            .set_string("unknown.cost_center", "bv-non-bv-congruence");
-        self.last_model = None;
-        self.last_unknown_reason = Some(UnknownReason::Incomplete);
-        self.last_result = Some(SolveResult::Unknown);
-        Ok(SolveResult::Unknown)
     }
 
     /// Finalize a BV Unknown result: map SAT-level reason, set result.
@@ -2622,15 +2839,64 @@ impl Executor {
         &mut self,
         clause_trace: Option<ClauseTrace>,
         var_to_term: &std::collections::BTreeMap<u32, TermId>,
+        false_dimacs_hint: Option<u32>,
     ) {
+        // A real fresh BV owner supplies this hint. Retain it only inside the
+        // same sealed, selector-free namespace and never overwrite a source
+        // atom. It is a value encoding, not an assumed clause: exact original
+        // authentication and the strict source-context checker remain mandatory.
+        let false_variable = false_dimacs_hint
+            .filter(|v| *v != 0 && !var_to_term.contains_key(v))
+            .filter(|v| {
+                clause_trace.as_ref().is_some_and(|trace| {
+                    trace
+                        .solver_num_vars()
+                        .is_some_and(|count| *v as usize <= count)
+                        && trace
+                            .scope_assumptions()
+                            .is_some_and(<[SatLiteral]>::is_empty)
+                })
+            })
+            .and_then(|v| v.checked_sub(1));
         self.last_clause_trace = clause_trace;
         self.last_var_to_term = Some(var_to_term.iter().map(|(&v, &t)| (v - 1, t)).collect());
         self.last_negations = Some(bv_encoding::build_negation_map(
             &mut self.ctx.terms,
             var_to_term,
         ));
+        if let Some(variable) = false_variable {
+            let false_term = self.ctx.terms.false_term();
+            let true_term = self.ctx.terms.true_term();
+            if let (Some(variables), Some(negations)) =
+                (&mut self.last_var_to_term, &mut self.last_negations)
+            {
+                if variables.try_reserve(1).is_ok() && negations.try_reserve(1).is_ok() {
+                    variables.insert(variable, false_term);
+                    negations.insert(false_term, true_term);
+                }
+            }
+        }
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
+        crate::executor::probe_cert_reject_raw(|| {
+            format!(
+                "c sat-variable-map-capture owner=save_bv_unsat_proof_state query_epoch={:#x} trace_address={:p} map_address={:p} namespace=sat-global-zero-based solver_num_vars={:?} trace_entries={:?} source_map_entries={} retained_map_entries={:?} false_hint_variable={:?} conversion=key-minus-one bv_gate_authority=none",
+                self.query_authority_epoch.diagnostic_address(),
+                self.last_clause_trace
+                    .as_ref()
+                    .map_or(std::ptr::null(), |trace| trace as *const ClauseTrace),
+                self.last_var_to_term
+                    .as_ref()
+                    .map_or(std::ptr::null(), |map| map as *const HashMap<u32, TermId>),
+                self.last_clause_trace
+                    .as_ref()
+                    .and_then(ClauseTrace::solver_num_vars),
+                self.last_clause_trace.as_ref().map(ClauseTrace::len),
+                var_to_term.len(),
+                self.last_var_to_term.as_ref().map(HashMap::len),
+                false_variable,
+            )
+        });
     }
 
     // Array axiom generation (generate_array_bv_axioms, collect_array_terms) is in bv_axioms_array.rs.
@@ -2723,5 +2989,8 @@ impl Executor {
     }
 }
 
+mod consuming_trace;
+#[cfg(test)]
+mod consuming_trace_tests;
 #[cfg(test)]
 mod tests;

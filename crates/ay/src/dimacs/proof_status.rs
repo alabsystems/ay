@@ -106,8 +106,32 @@ fn rewrite_reserved_dimacs_proof_status(
     Ok(())
 }
 
+/// The status a synthesized-default proof's marker carries while it names
+/// that proof as this run's certificate.
+const DIMACS_PROOF_STATUS_CURRENT: &str = "current-same-run";
+
+/// Publish `status` through the reservation, after claiming its custody so an
+/// unanswered exit cannot settle the same lock concurrently
+/// (status_custody.rs). A published current marker stays in custody: an
+/// unanswered exit that discards its proof revokes it.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn publish_reserved_dimacs_proof_status(
+    reservation: DimacsProofStatusReservation,
+    status: &str,
+    sha256: Option<Sha256Digest>,
+) -> io::Result<RetainedDimacsPublication> {
+    let custody = Arc::clone(&reservation.custody);
+    let claim = custody.claim_settling()?;
+    let published = publish_claimed_dimacs_proof_status(reservation, status, sha256);
+    match &published {
+        Ok(_) if status == DIMACS_PROOF_STATUS_CURRENT => claim.finish_current(),
+        outcome => claim.finish(outcome.is_ok()),
+    }
+    published
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn publish_claimed_dimacs_proof_status(
     reservation: DimacsProofStatusReservation,
     status: &str,
     sha256: Option<Sha256Digest>,
@@ -128,6 +152,8 @@ fn publish_reserved_dimacs_proof_status(
             "DIMACS proof status transaction lock",
         ));
     }
+    #[cfg(test)]
+    run_injected_dimacs_status_publication_pause();
     if let Err(error) = rename_dimacs_noreplace(&reservation.lock_path, &reservation.status_path) {
         return Err(dimacs_invalidation_error(
             error,
@@ -144,6 +170,7 @@ fn publish_reserved_dimacs_proof_status(
         "DIMACS proof status marker",
         None,
         DimacsPublicationInvalidation::Empty,
+        DimacsPublicationRecheck::Bytes,
     )?;
     // Directory fsync is the POSIX idiom for making a rename durable, and is
     // gated to unix exactly as the other two sites are: on Windows `File::open`
@@ -231,7 +258,7 @@ fn mark_synthesized_default_dimacs_proof_current(
         })?;
     let status_publication = publish_reserved_dimacs_proof_status(
         reservation,
-        "current-same-run",
+        DIMACS_PROOF_STATUS_CURRENT,
         Some(published.sha256),
     )?;
     let status_path = status_publication.path.clone();
@@ -274,6 +301,14 @@ fn handle_dimacs_proof_io_failure(proof: &ProofConfig, operation: &str, error: &
         }
         return;
     }
+    if proof_io_error_is_storage_full(error) {
+        // No space for the proof: it cannot back an UNSAT, so the run answers
+        // unknown and names the cause, on the normal unknown exit path, never
+        // exit 1 or a panic. The partial proof is discarded best-effort; the
+        // exit sweep removes any staging leftover.
+        let _ = remove_owned_dimacs_proof(&proof.path);
+        answer_unknown_after_proof_write_failure(&reason);
+    }
     if proof.synthesized_default {
         if let Err(cleanup_error) = invalidate_synthesized_default_dimacs_proof(proof) {
             reason.push_str(&format!(
@@ -288,8 +323,31 @@ fn handle_dimacs_proof_io_failure(proof: &ProofConfig, operation: &str, error: &
             ));
         }
     }
+    settle_unanswered_dimacs_exit();
     safe_eprintln!("Error: {reason}");
     std::process::exit(1);
+}
+
+/// True when a proof I/O error means the disk (or the quota) is full.
+fn proof_io_error_is_storage_full(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    )
+}
+
+/// Answer `s UNKNOWN` after a proof write failed for lack of space, naming the
+/// cause on stderr, and exit on the normal unknown path (exit 0, as the other
+/// fail-closed proof paths do).
+fn answer_unknown_after_proof_write_failure(cause: &str) -> ! {
+    settle_unanswered_dimacs_exit();
+    safe_eprintln!("c proof write failed: {cause}; answering unknown");
+    if !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
+        safe_println!("s UNKNOWN");
+    }
+    let _ = Write::flush(&mut io::stdout());
+    let _ = Write::flush(&mut io::stderr());
+    std::process::exit(0);
 }
 
 fn handle_failed_proof_create(proof: &ProofConfig, error: &io::Error) {
@@ -330,5 +388,31 @@ fn sink_proof_output_after_optional_create_failure(
         (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
             unreachable!("Alethe/Lean4 do not create a pre-solve DIMACS proof file")
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_full_tests {
+    use super::proof_io_error_is_storage_full;
+    use std::io;
+
+    #[test]
+    fn only_a_full_disk_or_quota_counts_as_storage_full() {
+        assert!(proof_io_error_is_storage_full(&io::Error::from(
+            io::ErrorKind::StorageFull
+        )));
+        assert!(proof_io_error_is_storage_full(&io::Error::from(
+            io::ErrorKind::QuotaExceeded
+        )));
+        #[cfg(unix)]
+        assert!(proof_io_error_is_storage_full(
+            &io::Error::from_raw_os_error(28)
+        ));
+        assert!(!proof_io_error_is_storage_full(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!proof_io_error_is_storage_full(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
     }
 }

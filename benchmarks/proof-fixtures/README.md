@@ -57,6 +57,7 @@ instance" — and to do so in about a second, deterministically.
 ; AY-ANSWER: unsat            what to print on stdout (omit ⇒ print nothing)
 ; AY-STDERR: (:reason-unknown "…")   an extra stderr line
 ; AY-RC: 124                  process exit code (default 0)
+; AY-GUARD: refused           what `ay check carcara-guard` answers (default clean)
 ; AY-PROOF-BEGIN              start of the canned Alethe proof
 ;| (assume h1 p)              proof body, one line per `;|`
 ; AY-PROOF-END
@@ -94,6 +95,7 @@ catch.
 | `c07_unsat_no_proof` | `no-proof` | unsat with no certificate is a gap, not a lie — fatal only under `--require-proof` |
 | `c08_wrong_answer_sat` | `WRONG-ANSWER` | AY contradicting a declared `:status` is a hard failure, never bucketed with "unknown/timeout" |
 | `c09_not_unsat_unknown` | `unknown` | a legitimate non-answer, and **not** the same thing as `no-answer` |
+| `c10_misjudged_valid` | `misjudged`, reason ⊃ `misjudged-evaluate` | pinned carcara answers `valid`, but the proof rests on an `evaluate` step over a signed operator it computes wrongly (`ay_core::pinned_carcara`), so its verdict is not evidence. `ay check carcara-guard` refuses it: a hard failure, never a pass. The stub replays the fixture's `AY-GUARD: refused`; `crates/ay/src/cmd_check/carcara_guard.rs` runs the real scan on this file |
 
 The set deliberately contains bad proofs, so a *healthy* harness exits **1** on
 this directory (real defects found) — never 0, and never 3 (measurement broken).

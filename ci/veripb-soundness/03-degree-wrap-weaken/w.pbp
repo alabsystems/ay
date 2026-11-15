@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 2 ;
+rup 2 x1 >= -9223372036854775808 ;
+pol 3 x1 w ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

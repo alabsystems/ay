@@ -16,6 +16,7 @@ mod uf_seq_lia;
 mod uf_set_lia;
 
 pub(crate) use auf_lira::AufLiraSolver;
+pub(crate) use auf_lira_state::SplitLoopReads;
 pub(crate) use lira::LiraSolver;
 pub(crate) use strings_lia::StringsLiaSolver;
 pub(crate) use uf_map_lia::UfMapLiaSolver;

@@ -263,27 +263,15 @@ pub fn build_report(
             "no baseline rows for corpus '{corpus}'"
         )));
     }
-    // The harvest publication validator is intentionally not used here:
-    // migrated or incomplete rows must remain visible as non-comparable
-    // evidence instead of aborting the entire report.
-    // Index: benchmark_path -> solver_name -> row.
-    let mut by_bench: BTreeMap<String, BTreeMap<String, &BaselineRow>> = BTreeMap::new();
-    for row in &rows {
-        if !solvers.iter().any(|s| s == &row.solver) {
-            continue;
-        }
-        by_bench
-            .entry(row.benchmark_path.clone())
-            .or_default()
-            .insert(row.solver.clone(), row);
-    }
-    if by_bench.is_empty() {
-        return Err(BenchError::msg(format!(
-            "corpus '{corpus}' has no rows matching any of the requested solvers {solvers:?}"
-        )));
-    }
+    let by_bench = index_by_benchmark(&rows, corpus, solvers)?;
 
-    let mut entries = Vec::with_capacity(by_bench.len());
+    let mut entries = Vec::new();
+    entries.try_reserve(by_bench.len()).map_err(|_| {
+        BenchError::msg(format!(
+            "cannot allocate {} cross-verify entries for corpus '{corpus}'",
+            by_bench.len()
+        ))
+    })?;
     let mut counts = CrossCounts::default();
 
     for (bench_path, solver_rows) in by_bench {
@@ -310,7 +298,7 @@ pub fn build_report(
         };
         counts.add(class);
         if comparison.reason.is_some() {
-            counts.non_comparable += 1;
+            counts.non_comparable = counts.non_comparable.saturating_add(1);
         }
 
         let mut answers = BTreeMap::new();
@@ -337,6 +325,34 @@ pub fn build_report(
         non_comparable: counts.non_comparable,
         entries,
     })
+}
+
+/// Index the requested solvers' rows: benchmark_path -> solver_name -> row.
+///
+/// The harvest publication validator is intentionally not used here:
+/// migrated or incomplete rows must remain visible as non-comparable
+/// evidence instead of aborting the entire report.
+fn index_by_benchmark<'a>(
+    rows: &'a [BaselineRow],
+    corpus: &str,
+    solvers: &[String],
+) -> Result<BTreeMap<String, BTreeMap<String, &'a BaselineRow>>> {
+    let mut by_bench: BTreeMap<String, BTreeMap<String, &BaselineRow>> = BTreeMap::new();
+    for row in rows {
+        if !solvers.iter().any(|s| s == &row.solver) {
+            continue;
+        }
+        by_bench
+            .entry(row.benchmark_path.clone())
+            .or_default()
+            .insert(row.solver.clone(), row);
+    }
+    if by_bench.is_empty() {
+        return Err(BenchError::msg(format!(
+            "corpus '{corpus}' has no rows matching any of the requested solvers {solvers:?}"
+        )));
+    }
+    Ok(by_bench)
 }
 
 struct ComparisonStatus {
@@ -507,10 +523,10 @@ struct CrossCounts {
 impl CrossCounts {
     fn add(&mut self, class: CrossClass) {
         match class {
-            CrossClass::Agree => self.agree += 1,
-            CrossClass::Dispute => self.dispute += 1,
-            CrossClass::Partial => self.partial += 1,
-            CrossClass::Missing => self.missing += 1,
+            CrossClass::Agree => self.agree = self.agree.saturating_add(1),
+            CrossClass::Dispute => self.dispute = self.dispute.saturating_add(1),
+            CrossClass::Partial => self.partial = self.partial.saturating_add(1),
+            CrossClass::Missing => self.missing = self.missing.saturating_add(1),
             CrossClass::NonComparable => {}
         }
     }

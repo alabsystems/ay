@@ -23,7 +23,7 @@
 #     unless the minimal core is UNIQUE, because when several minimal cores
 #     exist z3 and ayz3 may each pick a different (equally valid) one.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import pytest
 

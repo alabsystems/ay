@@ -21,15 +21,28 @@ use crate::sign;
 mod factor_definition;
 mod global_recheck;
 
+#[cfg(test)]
+mod sos_tests;
+
+/// Per-pass memo of tableau values plus the shared materialisation δ
+/// (see `memo_var_value`). One memo serves one read-only evaluation
+/// pass against one unchanged LRA model; it must be dropped before
+/// anything mutates that model.
+#[derive(Default)]
+pub(crate) struct ValueMemo {
+    values: crate::HashMap<TermId, Option<BigRational>>,
+    delta: Option<BigRational>,
+}
+
 impl NraSolver<'_> {
     /// Undo all tentative scopes (sign-cut + patch) if any are active.
     /// Both the sign-cut scope (pushed at lib.rs:322) and the patch scope
     /// (pushed at patch.rs:245) must be popped to prevent model-dependent
     /// bounds from leaking into future queries.
     pub(crate) fn undo_tentative_patch(&mut self) {
-        while self.tentative_depth > 0 {
+        while let Some(depth) = self.tentative_depth.checked_sub(1) {
             self.lra.pop();
-            self.tentative_depth -= 1;
+            self.tentative_depth = depth;
         }
         self.compound_defs_emitted.clear();
         self.linearization_rows.clear();
@@ -120,7 +133,21 @@ impl NraSolver<'_> {
     /// Get the value of a term: tries LRA model first, then constant extraction.
     /// Handles rational and integer constants that may not have LRA variables (#6811).
     pub(crate) fn term_value(&self, term: TermId) -> Option<BigRational> {
-        if let Some(val) = self.lra.get_value(term) {
+        self.term_value_sharing_delta(term, &mut None)
+    }
+
+    /// [`Self::term_value`] with the LRA materialisation delta shared
+    /// across a read-only evaluation pass (see
+    /// `LraSolver::get_value_sharing_delta`): identical values, one
+    /// O(#vars) delta scan per pass instead of one per epsilon leaf.
+    /// The caller must not reuse `delta` across any mutation of
+    /// assignments, bounds or disequality trails.
+    pub(crate) fn term_value_sharing_delta(
+        &self,
+        term: TermId,
+        delta: &mut Option<BigRational>,
+    ) -> Option<BigRational> {
+        if let Some(val) = self.lra.get_value_sharing_delta(term, delta) {
             return Some(val);
         }
         match self.terms.get(term) {
@@ -276,6 +303,20 @@ impl NraSolver<'_> {
             if product == num_val {
                 continue; // consistent
             }
+            // A tangent plane at a point whose coordinates have grown past
+            // `MAX_DIVISION_REFINEMENT_POINT_BITS` is skipped: each round's
+            // point is the previous round's LRA vertex, so the cuts' rationals
+            // compound, and one cut's slack row took seconds to build
+            // (measured through the Z3 C API: `y / x > x, y = 1` spent its whole
+            // 3 s timeout, and 3 s more, inside one refinement). Skipping a
+            // lemma only weakens the relaxation; the loop then declines with
+            // `Unknown` rather than claim a model it did not check.
+            if [&d, &k, &num_val]
+                .iter()
+                .any(|value| rational_bits(value) > MAX_DIVISION_REFINEMENT_POINT_BITS)
+            {
+                continue;
+            }
 
             // Tangent plane: k*denom + d*div_term - d*k [cmp] num_val
             // Rearranged: k*denom + d*div_term [cmp] num_val + d*k
@@ -345,7 +386,42 @@ impl NraSolver<'_> {
     /// Call through [`Self::monomial_factor_value`] rather than passing a depth
     /// by hand.
     fn factor_value(&self, term: TermId, depth: u32) -> Option<BigRational> {
-        if let Some(v) = self.lra.get_value(term) {
+        self.factor_value_memo(term, depth, None)
+    }
+
+    /// Tableau value of `term` through a per-pass memo: repeated queries
+    /// answer from the memo (including a recorded `None`), and the first
+    /// ε-carrying query fills the shared materialisation δ that every
+    /// later query reuses. Sound only while the LRA model does not
+    /// change — every pass that uses a memo is `&self` read-only, and a
+    /// memo must never outlive the pass that created it.
+    pub(crate) fn memo_var_value(
+        &self,
+        term: TermId,
+        memo: &std::cell::RefCell<ValueMemo>,
+    ) -> Option<BigRational> {
+        if let Some(value) = memo.borrow().values.get(&term) {
+            return value.clone();
+        }
+        let mut guard = memo.borrow_mut();
+        let value = self.lra.get_value_sharing_delta(term, &mut guard.delta);
+        guard.values.insert(term, value.clone());
+        value
+    }
+
+    /// [`Self::factor_value`] resolving tableau leaves through `memo`
+    /// when one is supplied; identical results either way.
+    fn factor_value_memo(
+        &self,
+        term: TermId,
+        depth: u32,
+        memo: Option<&std::cell::RefCell<ValueMemo>>,
+    ) -> Option<BigRational> {
+        let direct = match memo {
+            Some(memo) => self.memo_var_value(term, memo),
+            None => self.lra.get_value(term),
+        };
+        if let Some(v) = direct {
             return Some(v);
         }
         // Depth guard: term graphs are DAGs and can nest arbitrarily. Horner
@@ -361,28 +437,30 @@ impl NraSolver<'_> {
                 "+" if !args.is_empty() => {
                     let mut acc = BigRational::zero();
                     for &a in args {
-                        acc += self.factor_value(a, depth - 1)?;
+                        acc += self.factor_value_memo(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
                 "*" if !args.is_empty() => {
                     let mut acc = BigRational::one();
                     for &a in args {
-                        acc *= self.factor_value(a, depth - 1)?;
+                        acc *= self.factor_value_memo(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
-                "-" if args.len() == 1 => Some(-self.factor_value(args[0], depth - 1)?),
+                "-" if args.len() == 1 => {
+                    Some(-self.factor_value_memo(args[0], depth - 1, memo)?)
+                }
                 "-" if args.len() >= 2 => {
-                    let mut acc = self.factor_value(args[0], depth - 1)?;
+                    let mut acc = self.factor_value_memo(args[0], depth - 1, memo)?;
                     for &a in &args[1..] {
-                        acc -= self.factor_value(a, depth - 1)?;
+                        acc -= self.factor_value_memo(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
                 "/" if args.len() == 2 => {
-                    let num = self.factor_value(args[0], depth - 1)?;
-                    let den = self.factor_value(args[1], depth - 1)?;
+                    let num = self.factor_value_memo(args[0], depth - 1, memo)?;
+                    let den = self.factor_value_memo(args[1], depth - 1, memo)?;
                     // Division by zero is left to the dedicated zero-divisor
                     // machinery (`zero_divisor_model_is_unsound`); do not
                     // invent a quotient here.
@@ -410,6 +488,34 @@ impl NraSolver<'_> {
         self.factor_value(term, FACTOR_EVAL_MAX_DEPTH)
     }
 
+    /// Depth bound shared by the memoised and live factor resolvers.
+    pub(crate) const FACTOR_EVAL_MAX_DEPTH: u32 = 64;
+
+    /// [`Self::monomial_factor_value`] resolving leaves through `memo`.
+    pub(crate) fn monomial_factor_value_memo(
+        &self,
+        term: TermId,
+        memo: &std::cell::RefCell<ValueMemo>,
+    ) -> Option<BigRational> {
+        self.factor_value_memo(term, Self::FACTOR_EVAL_MAX_DEPTH, Some(memo))
+    }
+
+    /// [`Self::term_value`] resolving the tableau query through `memo`.
+    pub(crate) fn term_value_memo(
+        &self,
+        term: TermId,
+        memo: &std::cell::RefCell<ValueMemo>,
+    ) -> Option<BigRational> {
+        if let Some(val) = self.memo_var_value(term, memo) {
+            return Some(val);
+        }
+        match self.terms.get(term) {
+            TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
+            TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
+            _ => None,
+        }
+    }
+
     // `check_monomial_consistency` lives in `check_loop/factor_definition.rs`,
     // and resolves its factors through `monomial_factor_value` above. See that
     // function for why the two halves — this resolver and that residual policy —
@@ -425,9 +531,11 @@ impl NraSolver<'_> {
         let definitions = self.emit_factor_definitions();
         // McCormick envelopes + tangent hyperplanes
         let (tangent_added, _) = self.add_tangent_constraints_for_incorrect_monomials();
-        self.tangent_lemma_count += tangent_added as u64;
+        self.tangent_lemma_count = self
+            .tangent_lemma_count
+            .saturating_add(tangent_added as u64);
 
-        definitions + tangent_added
+        definitions.saturating_add(tangent_added)
     }
 
     /// Check sign consistency: propagate factor signs, then detect conflicts.
@@ -443,8 +551,8 @@ impl NraSolver<'_> {
             &self.asserted,
             self.debug,
         ) {
-            self.conflict_count += 1;
-            return Some(TheoryResult::Unsat(conflict));
+            self.conflict_count = self.conflict_count.saturating_add(1);
+            return Some(TheoryResult::Unsat(self.widen_full_set_conflict(conflict)));
         }
         None
     }
@@ -479,12 +587,12 @@ impl NraSolver<'_> {
     }
 
     /// Run the NRA check loop and, on an UNSAT verdict, attempt to attach a
-    /// replayable rational Positivstellensatz / SOS certificate of infeasibility
-    /// (see [`crate::sos`]). The certificate — when the degree-2 search finds one
-    /// — replaces the audited `:rule trust` hole for that theory conflict with an
-    /// independently checkable algebraic proof. When the search declines (its
-    /// search is sound but incomplete), the interval-exhaustion UNSAT stands with
-    /// its existing `:rule trust`; no verdict is regressed.
+    /// checked rational Positivstellensatz / SOS witness (see [`crate::sos`]).
+    /// The bounded search only enriches evidence after another route decided
+    /// UNSAT; it does not promote Unknown. The witness is retained internally,
+    /// while its Alethe rendering preserves the rational data in comments and
+    /// still emits `:rule hole`. Portable source-bound replay is separate work.
+    /// A declined search leaves the existing verdict unchanged.
     pub(crate) fn nra_check_loop(&mut self) -> TheoryResult {
         self.last_unsat_certificate = None;
         let result = self.nra_check_loop_impl();
@@ -513,35 +621,27 @@ impl NraSolver<'_> {
     }
 
     /// Build a Positivstellensatz certificate for the current (refuted) asserted
-    /// set, or `None` if the degree-2 rational search does not find one. Reads
+    /// set, or `None` if the bounded rational search does not find one. Reads
     /// only `self.asserted`, so it works uniformly for every UNSAT surface
     /// (interval exhaustion, ICP branch-and-prune, linear substitution, the
     /// univariate decider). The returned certificate is guaranteed to pass the
     /// independent checker ([`crate::sos::SosCertificate::verify`]).
     fn try_build_unsat_sos_certificate(&self) -> Option<crate::sos::SosCertificate> {
-        let mut constraints = Vec::new();
-        for &(atom, value) in &self.asserted {
-            match self.atom_to_multi(atom, value) {
-                // A pure-constant false atom is a degenerate UNSAT with no
-                // polynomial refutation to certify; leave the trust fallback.
-                Some(crate::univariate::MultiAtom::ConstFalse) => return None,
-                Some(crate::univariate::MultiAtom::ConstTrue) => {}
-                Some(crate::univariate::MultiAtom::Constraint(c)) => constraints.push(c),
-                // An unsupported atom means the polynomial view is incomplete, so
-                // any certificate over the parsed subset would not refute the
-                // full conjunction — decline.
-                None => return None,
-            }
-        }
+        let constraints = self.sos_source_constraints()?;
         if constraints.is_empty() {
             return None;
         }
-        let mut vars: Vec<TermId> = Vec::new();
-        for c in &constraints {
-            for v in c.poly.variables() {
-                if !vars.contains(&v) {
-                    vars.push(v);
+        let mut vars = Vec::with_capacity(crate::sos::MAX_VARS);
+        for &var in constraints
+            .iter()
+            .flat_map(|c| &c.poly.terms)
+            .flat_map(|(monomial, _)| monomial)
+        {
+            if !vars.contains(&var) {
+                if vars.len() >= crate::sos::MAX_VARS {
+                    return None;
                 }
+                vars.push(var);
             }
         }
         vars.sort_unstable_by_key(|t| t.0);
@@ -559,6 +659,49 @@ impl NraSolver<'_> {
         self.fixed_lin_emitted.clear();
         self.compound_defs_emitted.clear();
 
+        // LINEAR RELAXATION FIRST (#nra-relaxation-first). Every monomial is
+        // an opaque LRA variable here, so an infeasible relaxation is a
+        // genuine UNSAT — exactly the `iteration == 0` arm of the refinement
+        // loop below, with the same Farkas-annotated explanation. It used to
+        // be reached only after every exact pre-phase had run, and those
+        // phases refute with the FULL asserted-literal set: measured on a
+        // KeYmaera instance set whose units contradict linearly
+        // (`state = 2`, `state = 1`; 2M decisions, no refutation in 20 s) and
+        // on distributed braking dynamics whose two sides cancel over the
+        // monomials (the branch-and-prune phase spent 3.8 s per check), where
+        // the simplex answers in milliseconds with a two-literal core. A
+        // feasible relaxation falls through unchanged: the exact pre-phases
+        // read the asserted atoms, never the simplex state, and the loop's own
+        // first check re-reads the same base state.
+        let relaxation = self.lra.check();
+        if matches!(
+            relaxation,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ) {
+            self.conflict_count += 1;
+            return relaxation;
+        }
+        // A split request from the relaxation must surface NOW, not fall
+        // through to the exact pre-phases. Those phases verify their Sat
+        // witnesses against the asserted atoms only, so a witness can
+        // violate a *shared* (Nelson-Oppen) disequality the inner LRA is
+        // holding — the relaxation's split request is exactly that
+        // violation report. Dropping it let a pre-phase publish Sat with
+        // a model falsifying an EUF-forwarded disequality (caught only
+        // by the executor's soundness gate, as `unknown`) on trivial
+        // QF_UFNRA goals like `(f a) != b ∧ a != c`. The refinement
+        // loop below returns the same split via its catch-all arm; the
+        // pre-phases between here and there are the only bypass.
+        if matches!(
+            relaxation,
+            TheoryResult::NeedSplit(_)
+                | TheoryResult::NeedDisequalitySplit(_)
+                | TheoryResult::NeedExpressionSplit(_)
+                | TheoryResult::NeedExpressionSplits(_)
+        ) {
+            return relaxation;
+        }
+
         // Exact INTERVAL-PROPAGATION UNSAT pre-phase (sound, BigRational-only).
         // A forward exact-interval pass decides bounded multivariate infeasibilities such as
         // `x>2 ∧ x^2+y^2<1`, left `unknown` by tangent/McCormick and
@@ -570,12 +713,7 @@ impl NraSolver<'_> {
         // See univariate.rs (`try_interval_unsat`).
         match self.try_interval_unsat() {
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // Sat/SatAlgebraic are never produced here; Unknown falls through
             // unchanged.
@@ -594,12 +732,7 @@ impl NraSolver<'_> {
         // It NEVER emits SAT; Unknown falls through. See `try_sos_unsat`.
         match self.try_sos_unsat() {
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // Sat is never produced here; Unknown/SatAlgebraic fall through unchanged.
             crate::univariate::UniResult::Sat(_)
@@ -620,12 +753,7 @@ impl NraSolver<'_> {
                 return TheoryResult::Sat;
             }
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // The `is_int` fragment only ever produces rational SAT models (it
             // searches concrete integer-valued witnesses); it never emits an
@@ -659,12 +787,7 @@ impl NraSolver<'_> {
                 return TheoryResult::Sat;
             }
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // Out of fragment / uncertain — fall through to the univariate
             // path (which may itself certify, or to tangent).
@@ -699,18 +822,21 @@ impl NraSolver<'_> {
                 return TheoryResult::Sat;
             }
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // Out of fragment / uncertain — fall through to the existing
             // tangent path unchanged (sound: never a wrong verdict).
             crate::univariate::UniResult::Unknown => {
                 // Out of fragment or uncertain — fall through unchanged.
             }
+        }
+
+        // The multivariate phases below (witness search, interval
+        // branch-and-prune, the refinement loop) are the ones whose work can
+        // outlast the check; the caller polls its deadline only between
+        // checks. A stopped check ends here as `unknown`.
+        if ay_core::resource::check_stop_requested() {
+            return TheoryResult::Unknown;
         }
 
         // Bounded MULTIVARIATE rational-witness SEARCH (sound, SAT only).
@@ -755,6 +881,10 @@ impl NraSolver<'_> {
         // is exhausted with every leaf refuted. Anything else — budget
         // exhaustion, unbounded variables, unsupported atoms — falls through
         // unchanged as Unknown. See icp.rs.
+        // The witness search above may have ended because the check stopped.
+        if ay_core::resource::check_stop_requested() {
+            return TheoryResult::Unknown;
+        }
         match self.try_icp_branch_and_prune() {
             crate::univariate::UniResult::Sat(model) => {
                 self.inject_univariate_model(&model);
@@ -770,12 +900,7 @@ impl NraSolver<'_> {
                 return TheoryResult::Sat;
             }
             crate::univariate::UniResult::Unsat => {
-                let conflict: Vec<TheoryLit> = self
-                    .asserted
-                    .iter()
-                    .map(|&(t, v)| TheoryLit { term: t, value: v })
-                    .collect();
-                return TheoryResult::Unsat(conflict);
+                return TheoryResult::Unsat(self.full_conflict_lits());
             }
             // Out of fragment / uncertain — fall through to the tangent path
             // unchanged (sound: never a wrong verdict).
@@ -799,6 +924,12 @@ impl NraSolver<'_> {
         // by original-atom verification; see `grounding` for its full contract.
         let mut grounding = self.build_grounding_plan();
         for iteration in 0..=MAX_ITERATIONS {
+            // The caller polls its deadline only between checks; up to 500
+            // refinement rounds run inside one. The solve deadline or the
+            // check's own stop ends the check as `unknown`.
+            if self.deadline_passed() || ay_core::resource::check_stop_requested() {
+                return TheoryResult::Unknown;
+            }
             let lra_result = self.lra.check();
             let lra_result = self.normalize_lra_result(lra_result);
 
@@ -942,6 +1073,9 @@ impl NraSolver<'_> {
                     if div_added > 0 {
                         added += div_added;
                     }
+                    if self.deadline_passed() {
+                        return TheoryResult::Unknown;
+                    }
                     // Progress is "a row entered LRA this iteration", from ANY
                     // source. The look-ahead pin and the sign cuts move the state
                     // the next `check()` reads just as a tangent plane does, so
@@ -968,9 +1102,10 @@ impl NraSolver<'_> {
                             }
                         }
                         if self.debug {
+                            let memo = std::cell::RefCell::new(ValueMemo::default());
                             let bad = self
                                 .products()
-                                .filter(|m| !self.check_monomial_consistency(m))
+                                .filter(|m| !self.check_monomial_consistency(m, &memo))
                                 .count();
                             tracing::debug!(
                                 "[NRA] give up at iter={} (added={}, {} monomials still inconsistent)",
@@ -1069,4 +1204,13 @@ impl NraSolver<'_> {
         self.inject_univariate_model(&rational);
         self.algebraic_model = algebraic;
     }
+}
+
+/// Largest numerator-plus-denominator bit length of a division refinement
+/// point (see `NraSolver::generate_division_refinement`).
+const MAX_DIVISION_REFINEMENT_POINT_BITS: u64 = 1024;
+
+/// Bit length of `value`'s numerator plus that of its denominator.
+fn rational_bits(value: &BigRational) -> u64 {
+    value.numer().bits() + value.denom().bits()
 }

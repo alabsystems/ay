@@ -21,7 +21,8 @@
 /// - `$self`: the Executor instance
 /// - `tag`: string label for debug messages (e.g., "EUF", "LRA")
 /// - `create_theory`: expression producing a fresh theory solver each DPLL(T) iteration
-/// - `extract_models`: closure `|theory: &mut T| -> TheoryModels`
+/// - `extract_models`: closure returning `TheoryModels` or
+///   `Result<TheoryModels, ay_core::original_query::QueryError>`; refusal is terminal.
 /// - `track_theory_stats`: bool — track round_trips/theory_conflicts and call
 ///   `collect_theory_stats!(incremental: ...)`
 /// - `set_unknown_on_error`: bool — set `UnknownReason::Incomplete` on verification failures
@@ -35,10 +36,7 @@ macro_rules! solve_incremental_theory_pipeline {
         $(, pre_sat_solve: |$sat_solver:ident, $ttv_ref:ident| $pre_sat_solve:expr)?
         $(, extra_active_atoms: $extra_atoms:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion, TseitinResult};
         use ay_sat::{Literal as SatLiteral, SatResult, Variable as SatVariable};
@@ -252,6 +250,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         };
 
         // Lazy DPLL(T) loop
+        // This call owns these post-add clauses until its SAT scope returns.
+        // Persistent/cache rows may have other lifetimes and are not authority.
+        let mut _itp_installed_theory_lemmas: Vec<ay_core::TheoryLemma> = Vec::new();
+        let mut _itp_installed_theory_keys: HashSet<Vec<ay_core::TheoryLit>> = HashSet::default();
         let _itp_result: $crate::executor_types::Result<SolveResult> = loop {
             _itp_refinement_count += 1;
             if _itp_refinement_count > _ITP_MAX_REFINEMENTS {
@@ -272,6 +274,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             if $track_stats {
                 state.round_trips += 1;
             }
+            ay_core::resource::work().note_round_trip();
 
             // #8067: Apply saved theory phase hints before SAT solve.
             for &(var_idx, phase) in &_itp_saved_phase_hints {
@@ -340,6 +343,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     }
 
                     let _itp_theory_result = ay_core::TheorySolver::check(&mut theory);
+                    let _itp_theory_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                        &mut theory, _itp_theory_result, &_itp_installed_theory_lemmas, &_itp_should_stop,
+                    );
 
                     // #8067: Collect theory phase hints for the next SAT solve iteration.
                     _itp_saved_phase_hints.clear();
@@ -375,7 +381,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     match _itp_theory_result {
                         ay_core::TheoryResult::Sat => {
                             let $theory_var = &mut theory;
-                            let _itp_models = $extract;
+                            let _itp_models = match $crate::executor::theories::solve_harness::model_extraction_result($extract) {
+                                Ok(models) => models,
+                                Err(error) => break Err($self.terminal_model_extraction_error(error)),
+                            };
 
                             let fake_result = TseitinResult::new(
                                 vec![],
@@ -587,7 +596,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             let mut any_new = false;
                             let mut new_lemmas = Vec::new();
                             for lemma in &lemmas {
-                                if !state.theory_lemma_keys.insert(lemma.clause.clone()) {
+                                if _itp_installed_theory_keys.contains(&lemma.clause) {
                                     continue;
                                 }
                                 any_new = true;
@@ -677,6 +686,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     $self.lemma_cache.record_lemma(lemma.clone(), lemma_depth);
                                 }
                             }
+                            for (lemma, _, _) in &new_lemmas {
+                                _itp_installed_theory_keys.insert(lemma.clause.clone());
+                                state.theory_lemma_keys.insert(lemma.clause.clone());
+                                _itp_installed_theory_lemmas.push(lemma.clone());
+                            }
                             state.theory_lemmas.extend(
                                 new_lemmas
                                     .into_iter()
@@ -725,15 +739,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         | ay_core::TheoryResult::NeedSplit(_)
                         | ay_core::TheoryResult::NeedDisequalitySplit(_)
                         | ay_core::TheoryResult::NeedExpressionSplit(_)
-                        // Plural variant (Real disequality `a != b` -> a<b | a>b)
-                        // emitted on the LRA disequality-saturated lane; the
-                        // singular sibling pipelines handle it explicitly, but
-                        // this incremental path must at least fail closed to
-                        // Unknown instead of hitting the unreachable!() below
-                        // (deterministic SIGABRT on sally/oral_messages — see
-                        // the development design notes F0).
+                        // These responses need a refinement this pipeline cannot
+                        // perform. Preserve an existing stop reason; otherwise
+                        // report incomplete theory solving at this exit.
                         | ay_core::TheoryResult::NeedExpressionSplits(_)
                         | ay_core::TheoryResult::NeedStringLemma(_) => {
+                            $self.last_unknown_reason.get_or_insert(UnknownReason::Incomplete);
                             $self.last_result = Some(SolveResult::Unknown);
                             break Ok(SolveResult::Unknown);
                         }
@@ -827,10 +838,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         $(, pre_sat_solve: |$sat_solver:ident, $ttv_ref:ident| $pre_sat_solve:expr)?
         $(, extra_active_atoms: $extra_atoms:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion, TseitinResult};
         use ay_sat::{Literal as SatLiteral, SatResult, Variable as SatVariable};
@@ -1016,6 +1024,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         }
         let mut _itp_replayed_lemma_count: usize = 0;
 
+        // This call owns these post-add clauses until its SAT scope returns.
+        // Persistent/cache rows may have other lifetimes and are not authority.
+        let mut _itp_installed_theory_lemmas: Vec<ay_core::TheoryLemma> = Vec::new();
+        let mut _itp_installed_theory_keys: HashSet<Vec<ay_core::TheoryLit>> = HashSet::default();
         let _itp_result: $crate::executor_types::Result<SolveResult> = loop {
             _itp_refinement_count += 1;
             if _itp_refinement_count > _ITP_MAX_REFINEMENTS {
@@ -1031,6 +1043,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 break Ok(SolveResult::Unknown);
             }
             if $track_stats { state.round_trips += 1; }
+            ay_core::resource::work().note_round_trip();
 
             for &(var_idx, phase) in &_itp_saved_phase_hints {
                 solver.set_var_phase(SatVariable::new(var_idx), phase);
@@ -1089,6 +1102,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     }
 
                     let _itp_theory_result = ay_core::TheorySolver::check(&mut theory);
+                    let _itp_theory_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                        &mut theory, _itp_theory_result, &_itp_installed_theory_lemmas, &_itp_should_stop,
+                    );
 
                     _itp_saved_phase_hints.clear();
                     for (&term, &var_idx) in term_to_var.iter() {
@@ -1140,7 +1156,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     match _itp_theory_result {
                         ay_core::TheoryResult::Sat => {
                             let $theory_var = &mut theory;
-                            let _itp_models = $extract;
+                            let _itp_models = match $crate::executor::theories::solve_harness::model_extraction_result($extract) {
+                                Ok(models) => models,
+                                Err(error) => {
+                                    theory.unset_terms();
+                                    break Err($self.terminal_model_extraction_error(error));
+                                }
+                            };
                             theory.unset_terms();
 
                             let fake_result = TseitinResult::new(
@@ -1292,7 +1314,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             let mut any_new = false;
                             let mut new_lemmas = Vec::new();
                             for lemma in &lemmas {
-                                if !state.theory_lemma_keys.insert(lemma.clause.clone()) { continue; }
+                                if _itp_installed_theory_keys.contains(&lemma.clause) { continue; }
                                 any_new = true;
                                 let (recorded_in_trace, original_id) = $crate::executor::theories::split_incremental::apply_theory_lemma_incremental_persistent(
                                     solver, &mut term_to_var, &mut var_to_term,
@@ -1348,6 +1370,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     $self.lemma_cache.record_lemma(lemma.clone(), lemma_depth);
                                 }
                             }
+                            for (lemma, _, _) in &new_lemmas {
+                                _itp_installed_theory_keys.insert(lemma.clause.clone());
+                                state.theory_lemma_keys.insert(lemma.clause.clone());
+                                _itp_installed_theory_lemmas.push(lemma.clone());
+                            }
                             state.theory_lemmas.extend(
                                 new_lemmas.into_iter().map(|(lemma, _, _)| (lemma, lemma_depth)),
                             );
@@ -1385,17 +1412,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         | ay_core::TheoryResult::NeedSplit(_)
                         | ay_core::TheoryResult::NeedDisequalitySplit(_)
                         | ay_core::TheoryResult::NeedExpressionSplit(_)
-                        // Plural variant (Real disequality `a != b` -> a<b | a>b)
-                        // emitted on the LRA disequality-saturated lane. The first
-                        // match block above already fails closed to Unknown here;
-                        // this `persistent_theory: true` block (used by
-                        // solve_lra_incremental) was missed by the original F0 fix
-                        // and still hit the unreachable!() below — a deterministic
-                        // SIGABRT on sally/oral_messages disequalities, which the
-                        // F1 Bool-in-IMC unlock now exercises via IMC's check_sat
-                        // (see the development design notes F0/F1).
+                        // Match the nonpersistent pipeline's unsupported-refinement
+                        // exit, retaining a specific stop reason when one exists.
                         | ay_core::TheoryResult::NeedExpressionSplits(_)
                         | ay_core::TheoryResult::NeedStringLemma(_) => {
+                            $self.last_unknown_reason.get_or_insert(UnknownReason::Incomplete);
                             theory.unset_terms();
                             $self.last_result = Some(SolveResult::Unknown);
                             break Ok(SolveResult::Unknown);

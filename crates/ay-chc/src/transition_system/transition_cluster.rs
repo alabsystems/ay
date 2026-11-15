@@ -591,6 +591,9 @@ fn validate_supported_expr_inner(
     expr: &ChcExpr,
 ) -> Result<(), Tla2TransitionClusterExpressionRejection> {
     match expr {
+        ChcExpr::ArrayLambda(_) => {
+            Err(Tla2TransitionClusterExpressionRejection::UnsupportedOperator)
+        }
         ChcExpr::Bool(_) | ChcExpr::Int(_) => Ok(()),
         ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
             Err(Tla2TransitionClusterExpressionRejection::NonScalarLiteral)
@@ -739,6 +742,19 @@ fn stable_expr_hash(expr: &ChcExpr) -> u64 {
 
 fn stable_hash_expr(state: &mut u64, expr: &ChcExpr) {
     match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            stable_hash_u64(state, 12);
+            stable_hash_sort(state, &lambda.binder().sort);
+            stable_hash_bytes(state, lambda.binder().name.as_bytes());
+            for formal in lambda.formals() {
+                stable_hash_sort(state, &formal.sort);
+                stable_hash_bytes(state, formal.name.as_bytes());
+            }
+            stable_hash_expr(state, lambda.body());
+            for value in lambda.captures() {
+                stable_hash_expr(state, value);
+            }
+        }
         ChcExpr::Bool(value) => {
             stable_hash_u64(state, 1);
             stable_hash_bool(state, *value);

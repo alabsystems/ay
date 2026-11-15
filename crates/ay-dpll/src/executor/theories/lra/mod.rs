@@ -4,7 +4,7 @@
 
 //! Linear Real Arithmetic (LRA) solving.
 
-use ay_core::TermId;
+use ay_core::{TermId, TermStore};
 use ay_lra::LraSolver;
 use ay_sat::Solver as SatSolver;
 
@@ -90,21 +90,88 @@ fn inc_engine_unguarded_lemmas_on() -> bool {
     })
 }
 
+/// The standalone QF_LRA lane's preprocessing, on any store: also what the
+/// kernel shadow (`executor/engine_shadow.rs`) runs, so both see one input.
+pub(in crate::executor) fn preprocess_lra(
+    terms: &mut TermStore,
+    assertions: Vec<TermId>,
+) -> Vec<TermId> {
+    preprocess_lra_with(terms, assertions, true)
+}
+
+/// [`preprocess_lra`], optionally without sum-of-monomials normalization
+/// (`Executor::proof_probe_skips_som`).
+fn preprocess_lra_with(
+    terms: &mut TermStore,
+    mut assertions: Vec<TermId>,
+    som: bool,
+) -> Vec<TermId> {
+    // Keep the dedicated QF_LRA entrypoint aligned with the generic
+    // arithmetic preprocessing used by the shared theory harness.
+    let mut flatten_pass = FlattenAnd::new();
+    flatten_pass.apply(terms, &mut assertions);
+
+    if som {
+        let mut som_pass = NormalizeArithSom::new();
+        som_pass.apply(terms, &mut assertions);
+    }
+
+    let assertions = terms.decompose_arithmetic_eq_all(&assertions);
+    let assertions = terms.decompose_disequality_all(&assertions);
+    let assertions = terms.rewrite_cardinality_constraints(&assertions);
+    terms.lift_arithmetic_ite_all(&assertions)
+}
+
 impl Executor {
     pub(in crate::executor) fn preprocess_lra_assertions(&mut self) -> Vec<TermId> {
-        // Keep the dedicated QF_LRA entrypoint aligned with the generic
-        // arithmetic preprocessing used by the shared theory harness.
+        if self.interpolation_proof() {
+            return self.preprocess_lra_assertions_recording_sources();
+        }
+        let som = !(self.proof_probe_skips_som && self.produce_proofs_enabled());
+        preprocess_lra_with(&mut self.ctx.terms, self.ctx.assertions.clone(), som)
+    }
+
+    /// [`Self::preprocess_lra_assertions`] for an interpolation proof session:
+    /// the same passes, recording in `interpolation.leaf_sources` the original
+    /// assertions each preprocessed assertion derives from.
+    ///
+    /// Those preprocessed assertions are the refutation's `assume` leaves (the
+    /// SAT/theory core only ever sees them), so this record is the only way the
+    /// interpolation extractor can attribute a leaf the QF_LRA lane rewrote —
+    /// Shannon-lifted arithmetic `ite`s, split equalities and disequalities, SOM
+    /// normal forms — to the assertion group that implies it. Every pass here
+    /// maps one assertion to assertions it implies; `FlattenAnd` (split and
+    /// cross-assertion dedup) and the cardinality rewrite (one to many) carry
+    /// their sources explicitly, the rest are positional. A leaf whose sources
+    /// span groups is attributable to none of them.
+    fn preprocess_lra_assertions_recording_sources(&mut self) -> Vec<TermId> {
         let mut assertions = self.ctx.assertions.clone();
+        let mut sources: Vec<Vec<TermId>> = assertions.iter().map(|&a| vec![a]).collect();
         let mut flatten_pass = FlattenAnd::new();
-        flatten_pass.apply(&mut self.ctx.terms, &mut assertions);
+        flatten_pass.apply_with_sources(&mut self.ctx.terms, &mut assertions, &mut sources);
 
         let mut som_pass = NormalizeArithSom::new();
-        som_pass.apply(&mut self.ctx.terms, &mut assertions);
+        som_pass.apply_with_sources(&mut self.ctx.terms, &mut assertions, &mut sources);
 
         let assertions = self.ctx.terms.decompose_arithmetic_eq_all(&assertions);
         let assertions = self.ctx.terms.decompose_disequality_all(&assertions);
-        let assertions = self.ctx.terms.rewrite_cardinality_constraints(&assertions);
-        self.ctx.terms.lift_arithmetic_ite_all(&assertions)
+        let mut rewritten = Vec::with_capacity(assertions.len());
+        let mut rewritten_sources = Vec::with_capacity(assertions.len());
+        for (assertion, source) in assertions.into_iter().zip(sources) {
+            for replacement in self.ctx.terms.rewrite_cardinality_constraints(&[assertion]) {
+                rewritten.push(replacement);
+                rewritten_sources.push(source.clone());
+            }
+        }
+        let lifted = self.ctx.terms.lift_arithmetic_ite_all(&rewritten);
+        debug_assert_eq!(lifted.len(), rewritten_sources.len());
+        let mut leaf_sources: ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>> =
+            ay_core::kani_compat::DetHashMap::default();
+        for (&leaf, source) in lifted.iter().zip(rewritten_sources) {
+            leaf_sources.entry(leaf).or_insert(source);
+        }
+        self.interpolation.leaf_sources = Some(leaf_sources);
+        lifted
     }
 
     pub(in crate::executor) fn solve_lra(&mut self) -> Result<SolveResult> {
@@ -407,6 +474,23 @@ impl Executor {
         // full-reset hits stay ~constant ⇒ the accumulated formula was NOT
         // re-solved from scratch).
         if inc_engine_stats_enabled() {
+            // The warm (persisted) theory's own counters, nonzero only: where
+            // the per-check-sat LRA work goes (implied-bound sweeps, simplex
+            // pivots, lazy reasons emitted and explained). Empty when no
+            // theory is persisted.
+            let theory_stats: Vec<String> = self
+                .incr_theory_state
+                .as_ref()
+                .and_then(|st| st.persist_theory.as_ref())
+                .and_then(|b| b.downcast_ref::<LraSolver>())
+                .map(|t| {
+                    <LraSolver as ay_core::TheorySolver>::collect_statistics(t)
+                        .into_iter()
+                        .filter(|(_, v)| *v != 0)
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(sat) = self
                 .incr_theory_state
                 .as_ref()
@@ -424,15 +508,20 @@ impl Executor {
                 // selector-guarded on .ind; grows with permanent retention).
                 // assumption_level_conflicts counts conflicts inside the
                 // scope-selector assumption prefix (the resolvent-poisoning
-                // site).
+                // site). analysis_bailouts counts conflict analyses that
+                // learned nothing (a lazy reason that could not be
+                // materialised, or trail exhaustion): growing with the
+                // conflicts is the #8467 learn-nothing loop.
                 eprintln!(
-                    "#lra-inc-engine-stats inc_reset_hits={} full_reset_hits={} assumption_cache_hits={} assumption_cache_misses={} conflicts_prior_solve={} assumption_level_conflicts={}",
+                    "#lra-inc-engine-stats inc_reset_hits={} full_reset_hits={} assumption_cache_hits={} assumption_cache_misses={} conflicts_prior_solve={} assumption_level_conflicts={} analysis_bailouts={} theory: {}",
                     sat.ext_incremental_reset_hits(),
                     sat.ext_full_reset_hits(),
                     sat.assumption_cache_hits(),
                     sat.assumption_cache_misses(),
                     sat.conflicts_from_prior_solve_clauses(),
                     sat.assumption_level_conflicts(),
+                    sat.trail_exhaustion_bailouts(),
+                    theory_stats.join(" "),
                 );
             }
         }
@@ -467,6 +556,9 @@ impl Executor {
                 }
             }
             _ => {
+                if let Some(st) = self.incr_theory_state.as_mut() {
+                    st.dead_atom_stats.engine_fallbacks += 1;
+                }
                 if let Err(e) = &result {
                     tracing::warn!(
                         error = ?e,
@@ -628,6 +720,7 @@ impl Executor {
             ay_sat::TlaTraceable::maybe_enable_tla_trace_from_env(&mut sat);
             if self.produce_proofs_enabled() {
                 sat.enable_clause_trace();
+                sat.set_clause_event_capture(self.clause_event_capture);
                 sat.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
             }
             temp_state.persistent_sat = Some(sat);
@@ -639,11 +732,18 @@ impl Executor {
 
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
+        let no_implied_bounds = self.qlra_lane.probe_lra_no_implied_bounds;
 
         let result = solve_incremental_split_loop_pipeline!(self,
             tag: "LRA",
             persistent_sat_field: persistent_sat,
-            create_theory: LraSolver::new(&self.ctx.terms),
+            create_theory: {
+                let mut theory = LraSolver::new(&self.ctx.terms);
+                if no_implied_bounds {
+                    theory.set_no_implied_bounds(true);
+                }
+                theory
+            },
             extract_models: |theory| {
                 use super::solve_harness::TheoryModels;
                 TheoryModels {
@@ -942,15 +1042,24 @@ impl Executor {
     /// additionally save/restore `ctx.assertions`. A re-entrancy flag
     /// (`lra_in_assignment_recheck`) makes the nested arm fail closed at its own
     /// guard, guaranteeing termination.
+    ///
+    /// `bool_pins` are the assignment's Bool-sorted uninterpreted constants
+    /// (`is_bool_constant`). They carry no arithmetic, but the recovered model
+    /// is published as THE model of the original query, so it must keep the
+    /// Boolean skeleton's leaves at the assignment's values: re-solving the
+    /// theory atoms alone left them at a completion default, and the model then
+    /// failed validation on every original assertion that mentions one
+    /// (`om1_with_relays_agreement_two_faults` BMC depth 3; DPLL_LRA_perf_2026-09-23 §1).
     pub(in crate::executor) fn lra_recover_assignment_verdict(
         &mut self,
         assignment_lits: &[ay_core::TheoryLit],
+        bool_pins: &[ay_core::TheoryLit],
     ) -> Result<SolveResult> {
         if assignment_lits.is_empty() {
             return Ok(SolveResult::Unknown);
         }
-        let mut conj: Vec<TermId> = Vec::with_capacity(assignment_lits.len());
-        for tl in assignment_lits {
+        let mut conj: Vec<TermId> = Vec::with_capacity(assignment_lits.len() + bool_pins.len());
+        for tl in assignment_lits.iter().chain(bool_pins) {
             let lit_term = if tl.value {
                 tl.term
             } else {
@@ -975,4 +1084,35 @@ impl Executor {
 
         result
     }
+}
+
+/// A Bool-sorted uninterpreted constant (`(declare-const b Bool)`): a leaf of
+/// the Boolean skeleton that no theory interprets.
+pub(crate) fn is_bool_constant(terms: &ay_core::TermStore, term: TermId) -> bool {
+    terms.sort(term) == &ay_core::Sort::Bool
+        && matches!(terms.get(term), ay_core::TermData::Var(..))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test hook: reject the next N model publications of the eager-persistent
+    /// LRA split loop as if validation had failed, driving the #9604
+    /// recovery path deterministically.
+    static FORCE_LOOP_MODEL_REJECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_loop_model_reject(count: u32) {
+    FORCE_LOOP_MODEL_REJECT.with(|c| c.set(count));
+}
+
+#[cfg(test)]
+pub(crate) fn take_forced_loop_model_reject() -> bool {
+    FORCE_LOOP_MODEL_REJECT.with(|c| {
+        let n = c.get();
+        if n > 0 {
+            c.set(n - 1);
+        }
+        n > 0
+    })
 }

@@ -99,10 +99,14 @@ fn meter_authentication_payload_inner(
     }
 
     let mut pending = Vec::new();
-    if datatype_member_signatures.is_some() {
+    if datatype_member_signatures.is_some_and(|signatures| !signatures.is_empty()) {
         // Typed-context validation scans every term, including terms not
         // reachable from this proof fragment, so meter that exact authority
-        // surface before entering the global preflight.
+        // surface before entering the global preflight. With NO member
+        // signatures that scan is vacuous and skipped (see
+        // `validate_occurrences`), so there is no global surface to meter: a
+        // datatype-free certificate costs its own payload, not the size of
+        // the session's term store.
         for index in 0..terms.len() {
             let raw = u32::try_from(index).map_err(|_| ProofCheckError::ResourceLimit)?;
             push_term(&mut pending, TermId::new(raw), progress)?;
@@ -112,7 +116,7 @@ fn meter_authentication_payload_inner(
         push_term_slice(&mut pending, assertions, progress)?;
     }
 
-    meter_proof_steps(proof, &mut pending, progress)?;
+    meter_proof_steps(proof, terms, &mut pending, progress)?;
 
     meter_reachable_terms(terms, pending, progress)?;
     Ok(RegistryContextStats {
@@ -123,13 +127,25 @@ fn meter_authentication_payload_inner(
 
 fn meter_proof_steps(
     proof: &Proof,
+    terms: &TermStore,
     pending: &mut Vec<TermId>,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
-    for step in &proof.steps {
+    for (index, step) in proof.steps.iter().enumerate() {
         charge_progress(progress, 1, 0)?;
         match step {
             ProofStep::Assume(term) => push_term(pending, *term, progress)?,
+            ProofStep::FiniteFieldLinear {
+                clause,
+                multipliers,
+            } => {
+                let bytes = checked_add_usize(
+                    checked_mul_usize(clause.capacity(), size_of::<TermId>())?,
+                    checked_mul_usize(multipliers.capacity(), size_of::<u32>())?,
+                )?;
+                charge_progress(progress, multipliers.len(), bytes)?;
+                push_term_slice(pending, clause, progress)?;
+            }
             ProofStep::Resolution { clause, pivot, .. } => {
                 charge_progress(
                     progress,
@@ -173,6 +189,13 @@ fn meter_proof_steps(
                         )?,
                     )?;
                 }
+            }
+            ProofStep::NraSos {
+                clause,
+                certificate,
+            } => {
+                let id = ProofId(u32::try_from(index).map_err(|_| ProofCheckError::ResourceLimit)?);
+                super::nra_sos_payload::meter(terms, id, clause, certificate, pending, progress)?;
             }
             ProofStep::Step {
                 rule,

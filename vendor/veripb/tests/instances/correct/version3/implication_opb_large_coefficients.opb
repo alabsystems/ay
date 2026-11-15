@@ -1,0 +1,8 @@
+* #variable= 7 #constraint= 5
+* The antecedent is added with the degree as its coefficient, so a constraint that fits into a
+* narrow integer type on its own can still need a wider one once it is reified.
+z1 z2 ==> 4611686018427387904 x1 >= 4611686018427387904 ;
+z3 ==> 170141183460469231731687303715884105727 x1 3 x2 >= 4 ;
+z4 ==> 17014118346046923173168730371588410572800000000000 x1 3 x2 >= 4 ;
+z5 <== 1 x1 <= 9223372036854775807 ;
+1 x1 <= -9223372036854775808 ;

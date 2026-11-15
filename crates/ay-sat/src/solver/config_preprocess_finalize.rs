@@ -33,6 +33,14 @@ impl Solver {
                  [cong={t1_cong} bb={t2_bb} decomp={t3_decomp} factor={t4_factor} bve={t5_bve} probe={t6_probe}]"
             );
         }
+        if ay_core::misc_cli_flags().sat_mem_probe {
+            eprintln!(
+                "c mem-report after-preprocess rss={}MiB live={}MiB {}",
+                ay_sys::current_rss_bytes() >> 20,
+                ay_sys::current_live_bytes() >> 20,
+                self.memory_report()
+            );
+        }
     }
 
     /// Remove all active clauses that reference eliminated or substituted
@@ -91,6 +99,7 @@ impl Solver {
                     // The clause is already logically dead; we just need to
                     // ensure BCP cannot traverse it via stale watch entries.
                     self.stats.clear_bcp_learned_1963_blocker_cert(idx);
+                    self.record_clause_retirement(idx);
                     self.arena.delete(idx);
                     deleted_any = true;
                 } else {

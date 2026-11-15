@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_ABV)
+(declare-const reg_val (_ BitVec 8))
+(declare-const offset (_ BitVec 8))
+(assert (not (= reg_val (select (store ((as const (Array (_ BitVec 8) (_ BitVec 8))) (_ bv0 8)) offset reg_val) offset))))
+(check-sat)
+(exit)

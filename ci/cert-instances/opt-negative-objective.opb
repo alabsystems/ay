@@ -1,0 +1,9 @@
+* #variable= 4 #constraint= 2
+* OPT-LIN with a MIXED-SIGN objective and a negative optimum (-2).
+* Regression cover for the `optimum <= 0` early-return in the objective
+* lower-bound logger: an instance whose optimum is negative must still reach a
+* checker-confirmed `conclusion BOUNDS -2 <= obj <= -2`, not an unproved bound
+* and not a silent fail-closed.
+min: -3 x1 +2 x2 -1 x3 +1 x4 ;
++1 x1 +1 x2 +1 x3 +1 x4 >= 2 ;
+-1 x1 -1 x3 >= -1 ;

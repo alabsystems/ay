@@ -62,11 +62,14 @@
 //! strict checker over the authored scope. A wrong witness or a non-refuting
 //! consequence set can only cost a declined candidate.
 //!
-//! UNSAT-ONLY. The lane is consulted at exactly one place — the artifact
-//! firewall's downgrade — so its only reachable transition is
-//! `unknown -> unsat`, and it installs `last_proof` only through the shared
-//! consequence-replay installation boundary. Kill switch:
-//! `--no-negated-exists-ground-inst` (and the parent `--no-consequence-replay`).
+//! UNSAT-ONLY. The lane is consulted at exactly two places — the artifact
+//! firewall's downgrade, and the CEGQI-UNSAT certification
+//! (`cegqi_unsat_authority::certify`, the only route a `check-sat-assuming`
+//! query reaches a CEGQI refutation through) after the plain replay declined —
+//! so its only reachable transition is `unknown -> unsat`, and it installs
+//! `last_proof` only through the shared consequence-replay installation
+//! boundary. Kill switch: `--no-negated-exists-ground-inst` (and the parent
+//! `--no-consequence-replay`).
 
 //! CARCARA CANNOT ADJUDICATE THIS LANE'S ARTIFACTS, and the reason is not this
 //! lane. Two pre-existing limits, both reproduced on the BASE binary:
@@ -90,9 +93,29 @@
 //! from carcara-`invalid` to carcara-`holey`. It needs authored binder names
 //! carried into the printer, which the printer's own docs say it cannot do
 //! against an immutable `TermStore`.
+//!
+//! CLAUSE-SHAPED ROOTS (#primes-negated-and-exists). The same derivation
+//! serves an existential denied beside ground conjuncts —
+//! `(not (and E ψ…))`, elaborated to `(or (not ψ)… (not E))` — when the
+//! stitcher first clausifies the root and resolves each ψ literal away
+//! against a ψ unit it derives itself (`NegatedExistsDual::co_units`),
+//! leaving the bare shape's `(not E)` unit. Multi-binder positive
+//! existentials reach the probe through one-binder-at-a-time
+//! `qnt_join` + `sko` chains, whose witnesses head the candidate columns
+//! in binder order (the staircase tuple). Planner support lives in the
+//! `psi` submodule.
+//!
+//! WITNESS SOURCES (#negated-exists-cegqi-witness-hints). The authored ground
+//! scan below is one of three candidate sources; the planner asks
+//! `negated_exists_witness_candidates` (`authored_negated_exists_witness_hints`)
+//! which prepends the positive-existential Skolem constants and the closed
+//! CEGQI binder values of this check-sat, each re-filtered for
+//! problem-closedness. Same certificate shape, same validators.
 
-use super::authored_consequence_replay::NegatedExistsDual;
+use super::authored_consequence_replay::{ExpansionStep, NegatedExistsDual};
 use super::*;
+
+mod psi;
 
 /// Authored-scope size beyond which this lane declines.
 const MAX_AUTHORED_ROOTS: usize = 64;
@@ -104,7 +127,8 @@ const MAX_WITNESSES_PER_SORT: usize = 8;
 /// Every instance is one more assertion the bounded probe must bit-blast.
 const MAX_GROUND_INSTANCES: usize = 12;
 /// Binder count beyond which the tuple enumeration declines outright.
-const MAX_BINDERS: usize = 2;
+/// Tuple count stays bounded by `MAX_GROUND_INSTANCES` regardless.
+const MAX_BINDERS: usize = 3;
 /// Probe attempts this lane may consume per public check-sat.
 const MAX_LANE_ATTEMPTS: u8 = 1;
 /// Node budget for the binder-name and groundness scans.
@@ -150,12 +174,19 @@ impl Executor {
         if authored.is_empty() || authored.len() > MAX_AUTHORED_ROOTS {
             return false;
         }
-        let Some((duals, records)) = self.plan_negated_exists_ground_instances(&authored) else {
+        let Some((duals, records, skolem, chain)) =
+            self.plan_negated_exists_ground_instances(&authored)
+        else {
             return false;
         };
         self.negated_exists_ground_inst_attempts.set(attempts + 1);
-        let installed =
-            self.try_translate_authored_consequence_replay_unsat_with_duals(&records, &duals);
+        let installed = self.try_translate_authored_consequence_replay_unsat_with_clauses(
+            &records,
+            &duals,
+            &skolem,
+            &[],
+            &chain,
+        );
         note(|| {
             format!(
                 "translate: duals={} instances={} installed={installed}",
@@ -177,9 +208,12 @@ impl Executor {
     ) -> Option<(
         Vec<NegatedExistsDual>,
         Vec<crate::ematching::ForallInstantiationProvenance>,
+        Vec<crate::executor::SkolemInstanceRecord>,
+        Vec<ExpansionStep>,
     )> {
         let roots = self.exact_authored_negated_exists_roots(authored);
-        if roots.is_empty() {
+        let psi_roots = self.exact_authored_negated_and_exists_roots(authored);
+        if roots.is_empty() && psi_roots.is_empty() {
             note(|| "decline: no authored (not (exists ...)) root".into());
             return None;
         }
@@ -188,6 +222,14 @@ impl Executor {
         // the precise per-source rule; this is the cheap conservative filter
         // that keeps the probe from ever seeing an open term.
         let bound_names = self.authored_binder_names(authored);
+        // Registry-rebuilt positive Skolem provenance: witness source here,
+        // consequence source for the stitcher.
+        let mut skolem = self.authored_positive_exists_skolem_records(authored);
+        // Multi-binder positive existentials have no single-binder record
+        // to rebuild; their `qnt_join` + `sko` chains make the fully
+        // instantiated body a chained consequence for the probe.
+        let (chain, chain_records) = self.authored_positive_exists_chains(authored);
+        skolem.extend(chain_records);
 
         let mut duals: Vec<NegatedExistsDual> = Vec::new();
         let mut records: Vec<crate::ematching::ForallInstantiationProvenance> = Vec::new();
@@ -206,23 +248,18 @@ impl Executor {
             let negated_body = self.ctx.terms.mk_not_raw(body);
             let forall = self.ctx.terms.mk_forall(bindings.clone(), negated_body);
 
-            let mut per_binder: Vec<Vec<TermId>> = Vec::with_capacity(bindings.len());
-            for (_, sort) in &bindings {
-                let candidates = self.ground_witnesses_for_sort(authored, sort, &bound_names);
-                if candidates.is_empty() {
-                    break;
-                }
-                per_binder.push(candidates);
-            }
-            if per_binder.len() != bindings.len() {
-                note(|| {
-                    "decline: a binder sort has no ground witness in the authored scope".into()
-                });
+            let Some(tuples) = self.negated_exists_tuples(
+                authored,
+                &bindings,
+                &bound_names,
+                &skolem,
+                MAX_GROUND_INSTANCES - records.len(),
+            ) else {
                 continue;
-            }
+            };
 
             let mut minted = 0usize;
-            for tuple in bounded_tuples(&per_binder, MAX_GROUND_INSTANCES - records.len()) {
+            for tuple in tuples {
                 let mut substitution: ay_core::kani_compat::DetHashMap<String, TermId> =
                     ay_core::kani_compat::DetHashMap::default();
                 for ((name, _), &value) in bindings.iter().zip(&tuple) {
@@ -253,23 +290,42 @@ impl Executor {
                     not_exists_root,
                     exists,
                     forall,
+                    co_units: Vec::new(),
                 });
             }
             if records.len() >= MAX_GROUND_INSTANCES {
                 break;
             }
         }
+        self.plan_psi_negated_exists_instances(
+            authored,
+            psi_roots,
+            &bound_names,
+            &skolem,
+            &mut duals,
+            &mut records,
+        );
         if records.is_empty() {
             note(|| "decline: no ground instance proposable".into());
             return None;
         }
-        Some((duals, records))
+        Some((duals, records, skolem, chain))
     }
 
     /// Ground terms of `sort` occurring anywhere in the authored scope,
-    /// EXCLUDING under binders — review measured that `ground_instantiation_candidates` has no `Forall`/`Exists` arm (`_ => {}`), so it never descends and can never return a term containing a `Var`. The `term_avoids_names` filter below is therefore a NO-OP on every input it can receive, kept as a guard against a future arm being added, not as an active filter. Consequence: `+zero` and `16.0`, which occur only inside the existential body, are NEVER proposed as instantiation terms — on this shape every interesting constant
-    /// (`+zero`, the bound `16.0`) occurs only inside the existential body —
-    /// minus anything mentioning a bound name.
+    /// EXCLUDING under binders — review measured that
+    /// `ground_instantiation_candidates` has no `Forall`/`Exists` arm
+    /// (`_ => {}`), so it never descends and can never return a term
+    /// containing a `Var`. The `term_avoids_names` filter below is therefore
+    /// a NO-OP on every input it can receive, kept as a guard against a future
+    /// arm being added, not as an active filter. Consequence: `+zero` and
+    /// `16.0`, which occur only inside the existential body, are NEVER
+    /// proposed as instantiation terms by THIS scan. That is exactly why the
+    /// planner consults the CEGQI and Skolem witness sources of
+    /// `authored_negated_exists_witness_hints` BEFORE it: a query whose only
+    /// terms of the binder sort live inside the body (the deductive-checks
+    /// `(not (exists i. 0 <= i < 2^32 ∧ 300 < i))` obligation) has no authored
+    /// witness here at all.
     pub(super) fn ground_witnesses_for_sort(
         &self,
         authored: &[TermId],

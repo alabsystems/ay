@@ -6,6 +6,8 @@
 
 use super::dt_opaque_completion_scope::loaded_fixture;
 use super::*;
+use crate::executor::model::rendered_dt_guard::RenderedDatatypeGuard;
+use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_model_check::{GateVerdict, ModelValue};
 
 fn hard_cell_fixture(assertion: &str) -> (Executor, TermId, Sort) {
@@ -129,8 +131,15 @@ fn conflicting_active_cell_equalities_poison_shared_carrier() {
     }
 }
 
+/// A datatype whose NAME needs pipe-quoting on the surface (deductive-checks's
+/// `(u32, u32)` tuple) is an ordinary registered datatype for the exact cell
+/// authority: its bare extractor carrier `@Quoted Cell!0` binds to the
+/// class's constructor tree exactly like `@GuardCell!11` does (C-4,
+/// 2026-09-16). Only the bare internal spelling is a carrier — the printed
+/// pipe-quoted and sort-ascribed dialects, a non-canonical counter, and a
+/// foreign sort still decline.
 #[test]
-fn quoted_datatype_names_never_authorize_bare_abstract_cells() {
+fn quoted_datatype_names_authorize_their_exact_bare_carrier_only() {
     let mut executor = loaded_fixture();
     let sort = Sort::Uninterpreted("Quoted Cell".to_string());
     let term = executor.ctx.terms.mk_var("quoted_carrier", sort.clone());
@@ -147,12 +156,52 @@ fn quoted_datatype_names_never_authorize_bare_abstract_cells() {
     );
 
     let completions = executor.exact_datatype_cell_completions(&model, &[]);
-    assert!(!executor.exact_datatype_cell_completion(
-        &completions,
-        "@Quoted Cell!0",
-        "QuotedCell_mk",
-        &sort,
-    ));
+    assert!(
+        executor.exact_datatype_cell_completion(
+            &completions,
+            "@Quoted Cell!0",
+            "QuotedCell_mk",
+            &sort,
+        ),
+        "the bare carrier of a quoted-name datatype must bind to its class value"
+    );
+
+    let guard = RenderedDatatypeGuard::new(&executor);
+    let constructor_tokens: HashSet<String> = HashSet::default();
+    let accepts = |token: &str| {
+        super::datatype_cell_authority::exact_datatype_carrier_token(
+            &guard,
+            &constructor_tokens,
+            &sort,
+            token,
+        )
+    };
+    assert!(accepts("@Quoted Cell!0"));
+    assert!(accepts("@Quoted Cell!17"));
+    for declined in [
+        "|@Quoted Cell!0|",
+        "(as @Quoted Cell!0 |Quoted Cell|)",
+        "(as |@Quoted Cell!0| |Quoted Cell|)",
+        "@Quoted Cell!00",
+        "@Quoted Cell!",
+        "@Quoted Cell!-1",
+        "@Quoted Cell",
+        "@QuotedCell!0",
+        "@GuardCell!0",
+        " @Quoted Cell!0",
+        "@Quoted Cell!0 ",
+    ] {
+        assert!(!accepts(declined), "{declined:?} must not be a carrier");
+    }
+    let foreign = Sort::Uninterpreted("GuardCell".to_string());
+    assert!(
+        !super::datatype_cell_authority::exact_datatype_carrier_token(
+            &guard,
+            &constructor_tokens,
+            &foreign,
+            "@Quoted Cell!0",
+        )
+    );
 }
 
 #[test]

@@ -25,9 +25,12 @@ impl QbfSolver {
             }
         }
 
-        // Build decision order from quantifier prefix
-        let mut decision_order = Vec::with_capacity(matrix_variables.len());
-        let mut quantified = HashSet::with_capacity(matrix_variables.len());
+        // Build decision order from quantifier prefix. The reservations are
+        // capacity hints only; pushes and inserts still grow on demand.
+        let mut decision_order = Vec::new();
+        let _ = decision_order.try_reserve_exact(matrix_variables.len());
+        let mut quantified = HashSet::new();
+        let _ = quantified.try_reserve(matrix_variables.len());
         for block in formula.prefix() {
             for &var in &block.variables {
                 if matrix_variables.contains(&var) && quantified.insert(var) {
@@ -54,14 +57,24 @@ impl QbfSolver {
         // Oversized native formulas are invalid and receive no dense state.
         // `solve_with_limit` returns Unknown before any of these vectors are
         // indexed. Parsed inputs never reach this path above the limit.
-        let dense_num_vars = if input_valid { num_vars } else { 0 };
+        // (`input_valid` already implies the bound; restating it bounds the
+        // dense allocations below in this function.)
+        let dense_num_vars = if input_valid && num_vars <= MAX_QBF_VARS {
+            num_vars
+        } else {
+            0
+        };
+        // Capacity hint for the trail, which holds at most one literal per
+        // variable; it still grows on demand if the reservation fails.
+        let mut trail = Vec::new();
+        let _ = trail.try_reserve_exact(dense_num_vars);
         let solver = Self {
             formula,
             input_valid,
             assignments: vec![Assignment::Unassigned; dense_num_vars],
             levels: vec![0; dense_num_vars],
             reasons: vec![Reason::Decision; dense_num_vars],
-            trail: Vec::with_capacity(dense_num_vars),
+            trail,
             trail_lim: Vec::new(),
             decision_level: 0,
             learned: Vec::new(),
@@ -137,9 +150,8 @@ impl QbfSolver {
         if !self.input_valid {
             return QbfResult::Unknown;
         }
-        if self.watches.is_empty() {
-            self.watches = vec![Vec::new(); self.formula.num_vars().saturating_mul(2) + 2];
-            self.init_watches();
+        if !self.ensure_watches() {
+            return QbfResult::Unknown;
         }
         // Apply initial universal reduction
         self.apply_universal_reduction();
@@ -151,7 +163,7 @@ impl QbfSolver {
 
         let mut iterations: u64 = 0;
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > max_iterations {
                 return QbfResult::Unknown;
             }
@@ -160,15 +172,19 @@ impl QbfSolver {
             match self.propagate() {
                 PropResult::Ok => {}
                 PropResult::Conflict(clause_idx) => {
-                    self.conflicts += 1;
+                    self.conflicts = self.conflicts.saturating_add(1);
 
                     if self.decision_level == 0 {
                         // Conflict at level 0 - UNSAT
                         return QbfResult::Unsat(self.build_herbrand_certificate());
                     }
 
-                    // Analyze conflict and learn
-                    let (learned_clause, backtrack_level) = self.analyze_conflict(clause_idx);
+                    // Analyze conflict and learn. Analysis refuses state that
+                    // breaks its invariants; fail closed rather than guess.
+                    let Some((learned_clause, backtrack_level)) = self.analyze_conflict(clause_idx)
+                    else {
+                        return QbfResult::Unknown;
+                    };
                     self.bump_clause_activity(&learned_clause);
                     self.var_decay_activity();
 
@@ -217,7 +233,7 @@ impl QbfSolver {
             // Make a decision
             match self.decide() {
                 Some(_) => {
-                    self.decisions += 1;
+                    self.decisions = self.decisions.saturating_add(1);
                 }
                 None => {
                     // No more decisions possible but not all assigned?
@@ -240,7 +256,9 @@ impl QbfSolver {
         true_path: &mut Option<Vec<Assignment>>,
         false_path: &mut Option<Vec<Assignment>>,
     ) -> ExactVerdict {
-        let mut frames: Vec<ExactFrame> = Vec::with_capacity(self.decision_order.len().min(1024));
+        // Capacity hint only (the DFS stack grows on demand past it).
+        let mut frames: Vec<ExactFrame> = Vec::new();
+        let _ = frames.try_reserve_exact(self.decision_order.len().min(1024));
         let mut order_index = 0usize;
         let mut completed = None;
 
@@ -249,7 +267,11 @@ impl QbfSolver {
                 let Some(frame) = frames.pop() else {
                     return child_verdict;
                 };
-                let slot = frame.variable as usize - 1;
+                // `open_exact_frame` pushes only variables >= 1, so
+                // a zero id is broken state and the search fails closed.
+                let Some(slot) = (frame.variable as usize).checked_sub(1) else {
+                    return ExactVerdict::Unknown;
+                };
 
                 match frame.state {
                     ExactFrameState::AwaitingFalse => {
@@ -289,7 +311,7 @@ impl QbfSolver {
                     continue;
                 }
                 PartialMatrixValue::False => {
-                    self.conflicts += 1;
+                    self.conflicts = self.conflicts.saturating_add(1);
                     if false_path.is_none() {
                         *false_path = Some(self.assignments.clone());
                     }
@@ -308,28 +330,33 @@ impl QbfSolver {
                 continue;
             }
 
-            let Some(variable) = self.decision_order.get(order_index).copied() else {
-                // Every decision variable is assigned, so an unresolved matrix
-                // indicates malformed native input. Stay fail-closed.
+            let Some(frame) = self.open_exact_frame(order_index) else {
                 completed = Some(ExactVerdict::Unknown);
                 continue;
             };
-            let slot = variable as usize - 1;
-            if slot >= self.assignments.len() {
-                completed = Some(ExactVerdict::Unknown);
-                continue;
-            }
-            self.decisions += 1;
-
-            self.assignments[slot] = Assignment::False;
-            frames.push(ExactFrame {
-                variable,
-                next_order_index: order_index + 1,
-                existential: self.formula.is_existential(variable),
-                state: ExactFrameState::AwaitingFalse,
-            });
-            order_index += 1;
+            order_index = frame.next_order_index;
+            frames.push(frame);
         }
+    }
+
+    /// Branch on the decision variable at `order_index`: assign it false and
+    /// return its frame. `None` (the caller fails closed with `Unknown`) when
+    /// every decision variable is assigned yet the matrix is unresolved, which
+    /// only malformed native input reaches, or when the variable has no slot.
+    fn open_exact_frame(&mut self, order_index: usize) -> Option<ExactFrame> {
+        let variable = self.decision_order.get(order_index).copied()?;
+        // `order_index` named an element, so the next index is at most the
+        // order's length.
+        let next_order_index = order_index.checked_add(1)?;
+        let slot = (variable as usize).checked_sub(1)?;
+        *self.assignments.get_mut(slot)? = Assignment::False;
+        self.decisions = self.decisions.saturating_add(1);
+        Some(ExactFrame {
+            variable,
+            next_order_index,
+            existential: self.formula.is_existential(variable),
+            state: ExactFrameState::AwaitingFalse,
+        })
     }
 
     /// Restore one terminal search path so the read-only solver context keeps
@@ -343,7 +370,13 @@ impl QbfSolver {
         self.assignments = path;
         self.trail.clear();
         for &variable in &self.decision_order {
-            let assignment = self.assignments[variable as usize - 1];
+            // A variable with no assignment slot has no value to restore.
+            let Some(&assignment) = (variable as usize)
+                .checked_sub(1)
+                .and_then(|slot| self.assignments.get(slot))
+            else {
+                continue;
+            };
             let literal = match assignment {
                 Assignment::True => Literal::positive(Variable::new(variable)),
                 Assignment::False => Literal::negative(Variable::new(variable)),

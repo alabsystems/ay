@@ -116,7 +116,9 @@ impl Executor {
                     self.evaluate_term(model, args[0]),
                     self.evaluate_term(model, args[1]),
                 ) {
-                    (EvalValue::String(a), EvalValue::String(b)) => EvalValue::Bool(a < b),
+                    (EvalValue::String(a), EvalValue::String(b)) => {
+                        EvalValue::Bool(ay_core::smtlib_str_cmp(&a, &b).is_lt())
+                    }
                     _ => EvalValue::Unknown,
                 }
             }
@@ -125,7 +127,9 @@ impl Executor {
                     self.evaluate_term(model, args[0]),
                     self.evaluate_term(model, args[1]),
                 ) {
-                    (EvalValue::String(a), EvalValue::String(b)) => EvalValue::Bool(a <= b),
+                    (EvalValue::String(a), EvalValue::String(b)) => {
+                        EvalValue::Bool(ay_core::smtlib_str_cmp(&a, &b).is_le())
+                    }
                     _ => EvalValue::Unknown,
                 }
             }

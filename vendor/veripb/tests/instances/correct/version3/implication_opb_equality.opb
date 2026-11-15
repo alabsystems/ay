@@ -1,0 +1,4 @@
+* #variable= 5 #constraint= 4
+* A reified equality is split into two constraints, just like a plain equality.
+z1 ==> 1 x1 1 x2 = 1 ;
+z2 ~z3 ==> 2 x1 -1 x2 = 1 ;

@@ -354,6 +354,3 @@ impl DtSolver<'_> {
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

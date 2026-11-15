@@ -1,0 +1,68 @@
+# AY <-> z3 reference-oracle PIN: the one statement of WHICH z3 bytes the differential gate is measured against.
+#
+# WHAT IT PINS. The upstream GitHub release asset of z3, per platform row: the archive's name, size and sha256 (equal
+# to GitHub's own asset digest when the pin was cut), and the sha256 of the archive's bin/z3. scripts/_z3_reference.py
+# downloads the row for this host, checks both hashes, and unpacks it read-only into the content-addressed user cache
+# ${XDG_CACHE_HOME:-~/.cache}/ay-z3/<archive sha256>/. No machine-wide install is involved, and nothing is built.
+#
+#     python3 scripts/_z3_reference.py --provision   # once per host; prints the bin/z3 path
+#     python3 scripts/_z3_reference.py --path        # offline; exit 2 when not provisioned
+#
+# WHY BYTES AND NOT A VERSION. The differential gate (scripts/differential_gate.sh) used to admit any program whose
+# --version banner named the right version, and its bypass flag still ended in a passing verdict. A banner is not an
+# identity: a source build, a patched build and a drop-in all print it. The gate now admits its oracle by the sha256
+# of bin/z3 against this file; any other oracle can still run, but the run ends `GATE: PASS-UNPINNED` with exit 4,
+# never `GATE: PASS`.
+#
+# WHAT THE BYTES ARE. No row's bin/z3 loads libz3 (Mach-O load commands and ELF NEEDED entries name only the C/C++
+# runtime and libc), so hashing bin/z3 pins z3's own code; the C++ runtime and libc are the host's. Z3_REFERENCE_ROW
+# is the row the dated gate measurements of 2026-09-24/25 ran: they name the oracle by its unpacked path, and
+# the development design notes:72 is that path, whose bin/z3 is this file's darwin_arm64 bin sha256.
+# The 2026-09-30 chc-family measurement names only a version and recorded no bytes. From this pin on, every gate run
+# records its oracle (path, sha256, banner, row) in the run directory's plan.json, and `--observed` output starts
+# with the same identity, so a ledger edit cites the bytes that produced it. Other rows are the same release built
+# for other platforms; the gate admits them with a NOTE.
+#
+# FORMAT: strict KEY=VALUE, no spaces, no quoting, no expansion, like ci/veripb.pin and ci/cakepb.pin; `.`-able from
+# POSIX sh and read by the hand-written parser in scripts/_z3_reference.py, which refuses an unknown or duplicated
+# key, a malformed sha or size, an asset name that does not carry the version, a URL that does not end in the
+# version's tag, and a row with a missing or orphan key. Z3_ROWS lists the rows; each row has the four keys
+# Z3_ASSET_<row>, Z3_ASSET_SIZE_<row>, Z3_ASSET_SHA256_<row> and Z3_BIN_SHA256_<row>. The release tag is
+# "z3-" + Z3_VERSION and is not restated.
+#
+# TO MOVE THE PIN:
+#   1. `agh api repos/Z3Prover/z3/releases/tags/<tag>` gives the asset names, sizes and digests.
+#   2. `python3 scripts/_z3_reference.py --measure <asset url>` per row gives the bin/z3 sha256 and its dynamic
+#      dependencies. A row whose bin/z3 loads libz3 must also pin that library, or be dropped.
+#   3. Re-measure the floors and the ledger with the new oracle (full budget, `--observed`; re-solve every timeout
+#      at -T:15, per scripts/differential/README.md). The `--observed` header carries the oracle line.
+#   4. Commit this file and scripts/differential/KNOWN_WRONG.tsv together, and rewrite this prose to match. A run
+#      made under the old pin rejudges as PASS-UNPINNED under the new one.
+
+# Upgraded 2026-11-06. All four archives match upstream release sizes/digests;
+# executable hashes were measured from the exact release archive members.
+# Previous 5.1.0 measurements remain historical; this pin makes no fresh sweep claim.
+Z3_VERSION=5.3.3
+Z3_RELEASE_URL=https://github.com/Z3Prover/z3/releases/download/z3-5.3.3
+Z3_REFERENCE_ROW=darwin_arm64
+Z3_ROWS=darwin_arm64,darwin_x86_64,linux_x86_64,linux_aarch64
+
+Z3_ASSET_darwin_arm64=z3-5.3.3-arm64-osx-13.3.zip
+Z3_ASSET_SIZE_darwin_arm64=53744860
+Z3_ASSET_SHA256_darwin_arm64=6957e6c75266d7ca8fa77030e86e83d78624567dcdf34cc11f4192fdc6f93c6b
+Z3_BIN_SHA256_darwin_arm64=9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4
+
+Z3_ASSET_darwin_x86_64=z3-5.3.3-x64-osx-13.3.zip
+Z3_ASSET_SIZE_darwin_x86_64=54428314
+Z3_ASSET_SHA256_darwin_x86_64=ace69787d5a21762154b103abe68178188f38e02362fb0f82d346621af90f8e7
+Z3_BIN_SHA256_darwin_x86_64=fe7796c8d255a2c44d3710447dea202641548b1c4aa3dade0f33dfe11e8d1ba0
+
+Z3_ASSET_linux_x86_64=z3-5.3.3-x64-glibc-2.39.zip
+Z3_ASSET_SIZE_linux_x86_64=69671358
+Z3_ASSET_SHA256_linux_x86_64=d56f60b06f432f33de5810f7f1a384a339131f361e2d54d08ea83eea14326880
+Z3_BIN_SHA256_linux_x86_64=fcd0ca765d1c0b4eac776f442ec0f10294b9a6416be91fad4e52fa19012c8d01
+
+Z3_ASSET_linux_aarch64=z3-5.3.3-arm64-glibc-2.38.zip
+Z3_ASSET_SIZE_linux_aarch64=64975322
+Z3_ASSET_SHA256_linux_aarch64=d4586e12af2609499e07d615ac578256125b19f396f0d6ca358fe7b22988bcec
+Z3_BIN_SHA256_linux_aarch64=72e459328004dde6f36c2d24095f79603c048646f800f39f8d48ac789dc33ed6

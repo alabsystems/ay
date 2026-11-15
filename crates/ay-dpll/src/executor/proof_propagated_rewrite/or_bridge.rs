@@ -6,6 +6,8 @@
 
 use super::*;
 
+mod changed_survivor;
+
 impl PropagationChainPlanner<'_> {
     /// `(cl (not eq)) (not a) b` tautology + two resolutions:
     /// from `(cl eq)` and `(cl a)` derive `(cl b)`. `eq_term` must be an
@@ -105,9 +107,9 @@ impl PropagationChainPlanner<'_> {
         Some((equivalence, id))
     }
 
-    /// Shape A: `before = (or d1 .. dk)` with all-distinct disjuncts; every
-    /// changed disjunct must replay to literal `false`. `after` is then one
-    /// of three shapes, and anything else declines:
+    /// First preserve the deletion-only bridge: `before = (or d1 .. dk)`
+    /// with all-distinct disjuncts, each changed disjunct replaying to literal
+    /// `false`. `after` is then one of three shapes:
     ///
     ///  * literal `false` — every disjunct is eliminated, the last one
     ///    through the equivalence bridge so the conclusion is exactly
@@ -118,7 +120,33 @@ impl PropagationChainPlanner<'_> {
     ///    deduplicates, so the survivor SET (not its order) must match, and
     ///    the surviving clause is folded back into the disjunction by one
     ///    `or_neg` tautology per survivor plus a resolution.
+    ///
+    /// A failed legacy attempt may then try one changed nonfalse survivor.
+    /// That bounded fallback derives its original spelling before applying
+    /// the checked equality; neither attempt can retain a failed suffix.
     pub(super) fn plan_or_elimination_bridge(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        before: TermId,
+        before_id: ProofId,
+        after: TermId,
+        stamp: u32,
+    ) -> Option<ProofId> {
+        let mark = cx.mark();
+        if let Some(id) =
+            self.plan_unchanged_or_elimination_bridge(cx, before, before_id, after, stamp)
+        {
+            return Some(id);
+        }
+        cx.rollback(mark);
+        let result = self.plan_changed_or_survivor(cx, before, before_id, after, stamp);
+        if result.is_none() {
+            cx.rollback(mark);
+        }
+        result
+    }
+
+    fn plan_unchanged_or_elimination_bridge(
         &mut self,
         cx: &mut PlanCx<'_>,
         before: TermId,

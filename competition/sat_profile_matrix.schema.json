@@ -397,6 +397,16 @@
           "description": "B76: profile-owned solver lever decisions delivered as typed --sat-* CLI flags by the generated run.sh (formerly runtime_env exports).",
           "additionalProperties": { "type": "string", "enum": ["0", "1"] }
         },
+        "$comment": { "type": "string" },
+        "search_flags": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Search configuration the claimed count was measured with: ay solve argv tokens in order, appended by the generated run.sh to the default solve, never the probe or R500 slice (each runs as it was measured). Value-follows-option, no repeated option and no generator-owned option are enforced by competition/prepare_sat26_submission.sh, which refuses the profile otherwise.",
+          "items": {
+            "type": "string",
+            "pattern": "^(--(sat-[a-z0-9-]+|no-cold-restart)|[A-Za-z0-9_.][A-Za-z0-9_.-]*)$"
+          }
+        },
         "runtime_comments": {
           "type": "object",
           "required": [

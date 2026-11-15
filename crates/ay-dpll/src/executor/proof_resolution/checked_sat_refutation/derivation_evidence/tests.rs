@@ -235,6 +235,103 @@ fn tampered_propagation_entry_value_is_refused() {
     assert!(token.into_current(&executor).is_some());
 }
 
+/// A CHAINED licensing environment, the `VariableSubstitution` shape
+/// (#chained-entry-seal): `n |-> len` and `p |-> (ppd_h n)`, so the second
+/// entry's replacement itself mentions the first entry's key.
+/// `VariableSubstitution::substitute_term` applies its map to FIXPOINT, so
+/// the pass wrote `(ppd_g (ppd_h len))` — not the one-shot
+/// `(ppd_g (ppd_h n))` a verbatim map hit reconstructs.
+fn chained_propagation_record_fixture() -> (
+    Executor,
+    PropagatedRewriteRecord,
+    Vec<PropagatedEntrySource>,
+) {
+    let mut executor = Executor::new();
+    let terms = &mut executor.ctx.terms;
+    let n = terms.mk_var("ppd_n", Sort::Int);
+    let len = terms.mk_var("ppd_len", Sort::Int);
+    let p = terms.mk_var("ppd_p", Sort::Int);
+    let h_n = terms.mk_app(Symbol::named("ppd_h"), [n], Sort::Int);
+    let h_len = terms.mk_app(Symbol::named("ppd_h"), [len], Sort::Int);
+    let n_src = terms.mk_app(Symbol::named("="), [n, len], Sort::Bool);
+    let p_src = terms.mk_app(Symbol::named("="), [p, h_n], Sort::Bool);
+    let before = terms.mk_app(Symbol::named("ppd_g"), [p], Sort::Bool);
+    let after = terms.mk_app(Symbol::named("ppd_g"), [h_len], Sort::Bool);
+    let record = PropagatedRewriteRecord {
+        before,
+        after,
+        stamp: 1,
+    };
+    let entries = vec![
+        PropagatedEntrySource {
+            expr: n,
+            value: len,
+            source_assertion: n_src,
+            stamp: 1,
+        },
+        PropagatedEntrySource {
+            expr: p,
+            value: h_n,
+            source_assertion: p_src,
+            stamp: 1,
+        },
+    ];
+    (executor, record, entries)
+}
+
+/// THE REGRESSION. The verbatim replay reconstructs `(ppd_g (ppd_h ppd_n))`
+/// and refuses; the seal must re-run under the map closed under itself and
+/// accept the rewrite the producer actually performed. Before the fix this
+/// record was dropped, the original clause lost its exact proof authority,
+/// and the whole refutation published `unknown (self-check-rejected)`.
+#[test]
+fn chained_propagation_record_seals_under_the_closed_map() {
+    let (mut executor, record, entries) = chained_propagation_record_fixture();
+    let token = CheckedPropagationDerivation::seal(&mut executor, &record, &entries)
+        .expect("a chained but faithfully recorded rewrite must seal");
+    let (after, (before, stamp)) = token
+        .into_current(&executor)
+        .expect("a live-epoch token must consume");
+    assert_eq!(after, record.after);
+    assert_eq!(before, record.before);
+    assert_eq!(stamp, record.stamp);
+}
+
+/// ORDER: the VERBATIM replay stays the first attempt, so every record that
+/// sealed before the closure existed still seals by exactly the same route —
+/// `PropagateValues::apply` really does return a map hit unchased, and its
+/// records name that image. `(ppd_g (ppd_h ppd_n))` is what that one-shot
+/// replay produces on the chained fixture, and it is accepted here; the
+/// closure is consulted only when the verbatim replay MISSES.
+#[test]
+fn the_unchased_replay_image_still_seals_first() {
+    let (mut executor, mut record, entries) = chained_propagation_record_fixture();
+    let n = executor.ctx.terms.mk_var("ppd_n", Sort::Int);
+    let h_n = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("ppd_h"), [n], Sort::Int);
+    record.after = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("ppd_g"), [h_n], Sort::Bool);
+    assert!(CheckedPropagationDerivation::seal(&mut executor, &record, &entries).is_some());
+}
+
+/// A tampered `after` on the chained shape is refused just as it is on the
+/// unchained one — the closure widens WHICH map the replay runs under, never
+/// what counts as a match.
+#[test]
+fn tampered_chained_propagation_record_after_is_refused() {
+    let (mut executor, mut record, entries) = chained_propagation_record_fixture();
+    let len = executor.ctx.terms.mk_var("ppd_len", Sort::Int);
+    record.after = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("ppd_g"), [len], Sort::Bool);
+    assert!(CheckedPropagationDerivation::seal(&mut executor, &record, &entries).is_none());
+}
+
 /// L2 (#ppp-c7) qpf instance-root fixture:
 /// `F = forall x:BV8. (or (and (= (h x) 1) (= (h2 x) 2)) (not (= x 1)))`
 /// instantiated at `x := 1`.

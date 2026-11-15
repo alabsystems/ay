@@ -317,14 +317,9 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
             reason: "--max-par2-regression-pct must be finite and non-negative".to_string(),
         });
     }
-    let resources = crate::resource::PlannedResources::plan(&repo_root(), 1, "ay bench chc-gate")?;
-    eprintln!(
-        "chc-gate: resource plan jobs=1 memory={}MiB NBCORE={} headroom={}MiB enforcement=ay --memory + rss_watchdog",
-        resources.plan.memlimit_mb_per_child,
-        resources.plan.nbcore_per_child,
-        resources.plan.headroom_mb,
-    );
-
+    // Reject inadmissible source DATA before acquiring benchmark resources.
+    // This bounded provenance capture grants no execution or evidence authority;
+    // every request allowed to proceed still crosses the same machine fence.
     let git = git_provenance();
     if git.source_dirty && !args.allow_dirty {
         return Err(BenchError::InvalidArgs {
@@ -333,6 +328,14 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
                     .to_string(),
         });
     }
+
+    let resources = crate::resource::PlannedResources::plan(&repo_root(), 1, "ay bench chc-gate")?;
+    eprintln!(
+        "chc-gate: resource plan jobs=1 memory={}MiB NBCORE={} headroom={}MiB enforcement=ay --memory + rss_watchdog",
+        resources.plan.memlimit_mb_per_child,
+        resources.plan.nbcore_per_child,
+        resources.plan.headroom_mb,
+    );
 
     let mut cases = Vec::new();
     if args.sample {
@@ -497,16 +500,11 @@ fn extend_cases_bounded(
     Ok(())
 }
 
+/// The shared bench resolver: from the working directory, then from the `ay`
+/// binary's own location, so a run started outside the tree (a temp dir, as
+/// the CLI tests do) still finds `scripts/_oom_guard.py`.
 fn repo_root() -> PathBuf {
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    loop {
-        if dir.join("Cargo.toml").exists() && dir.join("crates").exists() {
-            return dir;
-        }
-        if !dir.pop() {
-            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        }
-    }
+    crate::runner::repo_root_public()
 }
 
 fn display_path(path: &Path) -> String {
@@ -608,15 +606,15 @@ fn read_sidecar_input_file(path: &Path) -> Option<PathBuf> {
                     .join(raw_value),
             );
         }
-        for following in lines.iter().skip(index + 1) {
+        for following in lines.iter().skip(index.saturating_add(1)) {
             let item = following.trim();
             if item.is_empty() {
                 continue;
             }
-            if !item.starts_with("- ") {
+            let Some(list_value) = item.strip_prefix("- ") else {
                 break;
-            }
-            let raw_value = clean_yaml_scalar(&item[2..]);
+            };
+            let raw_value = clean_yaml_scalar(list_value);
             if !raw_value.is_empty() {
                 return Some(
                     path.parent()
@@ -819,7 +817,8 @@ fn infer_family(path: &Path, category: &str) -> String {
         )
     });
     if let Some(index) = marker_index {
-        parts = parts.split_off(index + 1);
+        // `index` comes from `rposition`, so `index + 1 <= parts.len()`.
+        parts = parts.split_off(index.saturating_add(1));
     }
     if parts
         .first()
@@ -857,13 +856,20 @@ fn load_sample_cases(explicit_category: Option<&str>) -> Result<Vec<ManifestCase
             .map(normalize_category_name)
             .unwrap_or_else(|| normalize_category_name(category));
         let sidecar = read_sidecar_expected(&path);
-        let (expected_status, expected_source) = match (sidecar.origin, sidecar.status) {
-            (ExpectedOrigin::Sidecar, Some(status)) => (status, sidecar.source),
-            (ExpectedOrigin::SidecarInvalid, _) => {
-                (expected_status.to_string(), "repo-sample-list".to_string())
-            }
-            _ => (expected_status.to_string(), "repo-sample-list".to_string()),
+        // A valid sidecar verdict wins; otherwise the sample list's label.
+        // Each `Option` is consumed whole: moving a payload out of a pattern
+        // leaves a drop that switches on the niche-encoded discriminant, whose
+        // `unreachable` default per-function verification cannot rule out.
+        let origin = sidecar.origin;
+        let sidecar_status = sidecar
+            .status
+            .filter(|_| matches!(origin, ExpectedOrigin::Sidecar));
+        let expected_source = if sidecar_status.is_some() {
+            sidecar.source
+        } else {
+            "repo-sample-list".to_string()
         };
+        let expected_status = sidecar_status.unwrap_or_else(|| expected_status.to_string());
         cases.push(ManifestCase {
             case_id: case_id_for(&path, &category),
             family: infer_family(&path, &category),
@@ -1005,13 +1011,28 @@ fn make_case_from_json_entry(
     )
     .and_then(normalize_expected_status);
     let sidecar = read_sidecar_expected(&path);
-    let (expected_status, expected_source) =
-        match (sidecar.origin, sidecar.status, manifest_expected) {
-            (ExpectedOrigin::Sidecar, Some(status), _) => (status, sidecar.source),
-            (ExpectedOrigin::SidecarInvalid, _, _) => ("unknown".to_string(), sidecar.source),
-            (_, _, Some(status)) => (status, "manifest".to_string()),
-            _ => ("unknown".to_string(), "none".to_string()),
-        };
+    // Precedence: a valid sidecar verdict, then an invalid sidecar (unknown),
+    // then the manifest's label, then unknown. Each `Option` is consumed
+    // whole: moving a payload out of a pattern leaves a drop that switches on
+    // the niche-encoded discriminant, whose `unreachable` default
+    // per-function verification cannot rule out.
+    let origin = sidecar.origin;
+    let sidecar_status = sidecar
+        .status
+        .filter(|_| matches!(origin, ExpectedOrigin::Sidecar));
+    let sidecar_decides =
+        sidecar_status.is_some() || matches!(origin, ExpectedOrigin::SidecarInvalid);
+    let manifest_status = manifest_expected.filter(|_| !sidecar_decides);
+    let expected_source = if sidecar_decides {
+        sidecar.source
+    } else if manifest_status.is_some() {
+        "manifest".to_string()
+    } else {
+        "none".to_string()
+    };
+    let expected_status = sidecar_status
+        .or(manifest_status)
+        .unwrap_or_else(|| "unknown".to_string());
     let case_id = entry
         .get("id")
         .and_then(value_as_nonempty_str)
@@ -1084,7 +1105,14 @@ fn load_json_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Ve
             ),
         });
     }
-    let mut cases = Vec::with_capacity(entries.len().min(MAX_CHC_CASES));
+    let mut cases = Vec::new();
+    cases.try_reserve(entries.len()).map_err(|_| {
+        BenchError::msg(format!(
+            "cannot allocate {} CHC manifest cases for {}",
+            entries.len(),
+            path.display()
+        ))
+    })?;
     for entry in entries.iter().filter_map(Value::as_object) {
         if let Some(case) =
             make_case_from_json_entry(entry, path, explicit_category, manifest_category)
@@ -1195,13 +1223,28 @@ fn load_csv_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec
             .and_then(|idx| fields.get(idx))
             .and_then(|value| normalize_expected_text(value));
         let sidecar = read_sidecar_expected(&source_path);
-        let (expected_status, expected_source) =
-            match (sidecar.origin, sidecar.status, manifest_expected) {
-                (ExpectedOrigin::Sidecar, Some(status), _) => (status, sidecar.source),
-                (ExpectedOrigin::SidecarInvalid, _, _) => ("unknown".to_string(), sidecar.source),
-                (_, _, Some(status)) => (status, "manifest".to_string()),
-                _ => ("unknown".to_string(), "none".to_string()),
-            };
+        // Precedence: a valid sidecar verdict, then an invalid sidecar (unknown),
+        // then the manifest's label, then unknown. Each `Option` is consumed
+        // whole: moving a payload out of a pattern leaves a drop that switches on
+        // the niche-encoded discriminant, whose `unreachable` default
+        // per-function verification cannot rule out.
+        let origin = sidecar.origin;
+        let sidecar_status = sidecar
+            .status
+            .filter(|_| matches!(origin, ExpectedOrigin::Sidecar));
+        let sidecar_decides =
+            sidecar_status.is_some() || matches!(origin, ExpectedOrigin::SidecarInvalid);
+        let manifest_status = manifest_expected.filter(|_| !sidecar_decides);
+        let expected_source = if sidecar_decides {
+            sidecar.source
+        } else if manifest_status.is_some() {
+            "manifest".to_string()
+        } else {
+            "none".to_string()
+        };
+        let expected_status = sidecar_status
+            .or(manifest_status)
+            .unwrap_or_else(|| "unknown".to_string());
         let route_counters = route_col
             .and_then(|idx| fields.get(idx))
             .map(|raw| split_route_counter_list(raw))
@@ -1589,8 +1632,15 @@ fn snapshot_case_input(source_path: &Path, case_dir: &Path) -> Result<CaseInputS
                 source_path.display()
             )));
         }
-        hasher.update(&buffer[..read]);
-        snapshot.write_all(&buffer[..read])?;
+        let chunk = buffer.get(..read).ok_or_else(|| {
+            BenchError::msg(format!(
+                "reading CHC input snapshot source {} reported {read} bytes for a {}-byte buffer",
+                source_path.display(),
+                buffer.len()
+            ))
+        })?;
+        hasher.update(chunk);
+        snapshot.write_all(chunk)?;
     }
     snapshot.as_file().sync_all()?;
 
@@ -1751,34 +1801,21 @@ fn run_case(
     let mut stdout = String::new();
     let stderr: String;
     let mut output_incomplete = false;
-    let status = match resources.spawn_external_child(&mut command, "ay bench chc-gate") {
-        Ok((mut child, watchdog)) => {
-            let Some(stdout_pipe) = child.stdout.take() else {
-                crate::resource::terminate_guarded_child(
-                    &mut child,
-                    watchdog,
-                    "ay bench chc-gate",
-                )?;
+    let status = match resources.spawn_owned_child(&mut command, "ay bench chc-gate") {
+        Ok(mut child) => {
+            let Some(stdout_pipe) = child.take_stdout() else {
+                child.cancel()?;
                 return Err(BenchError::msg("CHC gate solver stdout pipe missing"));
             };
-            let Some(stderr_pipe) = child.stderr.take() else {
-                crate::resource::terminate_guarded_child(
-                    &mut child,
-                    watchdog,
-                    "ay bench chc-gate",
-                )?;
+            let Some(stderr_pipe) = child.take_stderr() else {
+                child.cancel()?;
                 return Err(BenchError::msg("CHC gate solver stderr pipe missing"));
             };
             let stdout_capture =
                 crate::resource::BoundedFileCapture::start(stdout_pipe, stdout_file);
             let stderr_capture =
                 crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
-            let outcome = crate::resource::wait_for_guarded_child(
-                &mut child,
-                watchdog,
-                std::time::Duration::from_secs_f64(args.timeout_sec),
-                "ay bench chc-gate",
-            )?;
+            let outcome = child.wait(std::time::Duration::from_secs_f64(args.timeout_sec))?;
             timed_out = outcome.timed_out;
             memout = outcome.memout;
             let stdout_output = stdout_capture.finish()?;
@@ -1992,10 +2029,13 @@ fn extract_solver_result(stdout: &str) -> String {
             verdicts.push(verdict);
         }
     }
-    match verdicts.as_slice() {
-        [verdict] => (*verdict).to_string(),
-        _ => "error".to_string(),
-    }
+    // Exactly one verdict line is a result; none or several is an error.
+    let only = if verdicts.len() == 1 {
+        verdicts.first()
+    } else {
+        None
+    };
+    only.map_or_else(|| "error".to_string(), |verdict| (*verdict).to_string())
 }
 
 fn classify_case(status: &str, timed_out: bool, wrong: bool, invalid: bool) -> String {
@@ -2168,7 +2208,7 @@ fn summarize_overall(records: &[CaseRecord], dirty: bool) -> OverallSummary {
     let par2_total = round6(records.iter().map(|record| record.par2_s).sum());
     OverallSummary {
         total,
-        solved: solved_sat + solved_unsat,
+        solved: solved_sat.saturating_add(solved_unsat),
         solved_sat,
         solved_unsat,
         wrong: records.iter().filter(|record| record.wrong).count(),
@@ -2229,7 +2269,7 @@ fn summarize_category(category: &str, rows: &[&CaseRecord]) -> CategorySummary {
     CategorySummary {
         category: category.to_string(),
         total,
-        solved: solved_sat + solved_unsat,
+        solved: solved_sat.saturating_add(solved_unsat),
         solved_sat,
         solved_unsat,
         wrong: rows.iter().filter(|record| record.wrong).count(),
@@ -2272,10 +2312,10 @@ fn summarize_route_counters(records: &[CaseRecord], required: &[String]) -> Rout
     for record in records {
         for (name, value) in &record.route_counters {
             let entry = counters.entry(name.clone()).or_default();
-            entry.rows_present += 1;
+            entry.rows_present = entry.rows_present.saturating_add(1);
             entry.total += *value;
             if *value > 0.0 {
-                entry.rows_exercised += 1;
+                entry.rows_exercised = entry.rows_exercised.saturating_add(1);
                 entry.cases.push(record.case_id.clone());
             }
         }
@@ -2386,7 +2426,9 @@ fn baseline_checks(
         return checks;
     }
     if let Some(baseline_solved) = baseline.solved {
-        let delta = current_solved as isize - baseline_solved as isize;
+        // Saturating keeps the sign of the true difference, so the pass/fail
+        // comparison below is exact for every input.
+        let delta = (current_solved as isize).saturating_sub(baseline_solved as isize);
         checks.push(GateCheck {
             name: "baseline-solved-delta".to_string(),
             status: if delta >= args.min_solved_delta {
@@ -2438,6 +2480,12 @@ fn non_promotable_reasons(
     checks: &[GateCheck],
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    // Git answers nothing outside a repository (a gate run from a temp dir),
+    // which reads as a CLEAN tree at no commit: evidence that names no source
+    // is not promotable.
+    if git.source_commit.is_empty() {
+        reasons.push("source commit unknown (no git provenance)".to_string());
+    }
     if git.source_dirty {
         reasons.push("dirty source tree".to_string());
     }
@@ -2756,505 +2804,4 @@ fn round6(value: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn write_case(dir: &Path, rel: &str, sidecar: &str) -> PathBuf {
-        let path = dir.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "(set-logic HORN)\n(check-sat)\n").unwrap();
-        fs::write(path.with_extension("yml"), sidecar).unwrap();
-        path
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
-    fn chc_gate_executes_one_pinned_snapshot_with_exact_recorded_environment() {
-        use sha2::Digest as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        assert!(std::env::var_os("HOME").is_some());
-        let tmp = TempDir::new().expect("tempdir");
-        let input = tmp.path().join("case.smt2");
-        let original_input = "(set-logic HORN)\n; ORIGINAL_TOKEN\n(check-sat)\n";
-        fs::write(&input, original_input).expect("write input");
-        let solver = tmp.path().join("fake-ay.sh");
-        fs::write(
-            &solver,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fake-ay 1\\n'; exit 0; fi\nif [ \"${{HOME+x}}\" = x ]; then printf 'inherited HOME\\n' >&2; exit 71; fi\nprintf '(set-logic HORN)\\n; MUTATED_SOURCE\\n(check-sat)\\n' > '{}'\nfor argument in \"$@\"; do solver_input=$argument; done\nif grep -q ORIGINAL_TOKEN \"$solver_input\"; then printf 'sat\\n'; else printf 'unsat\\n'; fi\n",
-                input.display()
-            ),
-        )
-        .expect("write solver");
-        let mut permissions = fs::metadata(&solver)
-            .expect("solver metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&solver, permissions).expect("chmod solver");
-        let resources =
-            crate::resource::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
-        let pinned = crate::environment::PinnedSolver::capture(
-            &solver,
-            &resources,
-            "CHC pinned snapshot regression",
-        )
-        .expect("pin solver");
-        fs::write(&solver, "#!/bin/sh\nprintf 'unsat\\n'\n").expect("mutate source");
-        let args = ChcGateArgs {
-            manifest: None,
-            roots: Vec::new(),
-            sample: false,
-            out_dir: tmp.path().join("out"),
-            ay: solver,
-            timeout_sec: 5.0,
-            baseline: None,
-            category: None,
-            require_all_categories: false,
-            require_route_counters: Vec::new(),
-            allow_dirty: true,
-            fail_on_wrong: true,
-            fail_on_invalid: false,
-            min_solved_delta: 0,
-            max_par2_regression_pct: 0.0,
-        };
-        let run_root = tmp.path().join("runs");
-        fs::create_dir(&run_root).expect("run root");
-        let record = run_case(
-            &ManifestCase {
-                case_id: "case".to_string(),
-                path: input.clone(),
-                category: "LIA".to_string(),
-                family: "test".to_string(),
-                expected_status: "sat".to_string(),
-                expected_source: "sidecar".to_string(),
-                source: "test".to_string(),
-                required_route_counters: Vec::new(),
-            },
-            &args,
-            &run_root,
-            &resources,
-            pinned.execution_path(),
-        )
-        .expect("run pinned CHC solver");
-
-        assert_eq!(record.status, "sat");
-        assert!(record.command_argv[0].contains("ay-solver-pin-"));
-        assert_eq!(record.path, display_path(&input));
-        assert_ne!(record.solver_input_path, record.path);
-        assert_eq!(
-            record.command_argv.last().map(String::as_str),
-            Some(record.solver_input_path.as_str())
-        );
-        assert_eq!(record.input_size_bytes, original_input.len() as u64);
-        assert_eq!(
-            record.input_sha256,
-            format!(
-                "sha256:{:x}",
-                sha2::Sha256::digest(original_input.as_bytes())
-            )
-        );
-        assert_eq!(
-            fs::read_to_string(&record.solver_input_path).expect("read solver input snapshot"),
-            original_input
-        );
-        assert!(
-            fs::read_to_string(&input)
-                .expect("read replaced source")
-                .contains("MUTATED_SOURCE"),
-            "the solver must mutate the original pathname before reading its argument"
-        );
-        assert!(!record.command_env.contains_key("HOME"));
-        assert_eq!(
-            record.command_env.get("LC_ALL").map(String::as_str),
-            Some("C")
-        );
-        assert_eq!(
-            record.command_env.get("MEMLIMIT").map(String::as_str),
-            Some("4096")
-        );
-        assert!(pinned.verify_source().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chc_gate_rejects_symlink_input_before_snapshotting() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let target = tmp.path().join("target.smt2");
-        fs::write(&target, "(check-sat)\n").expect("write target");
-        let link = tmp.path().join("link.smt2");
-        symlink(&target, &link).expect("create input symlink");
-        let case = ManifestCase {
-            case_id: "linked".to_string(),
-            path: link.clone(),
-            category: "LIA".to_string(),
-            family: "test".to_string(),
-            expected_status: "sat".to_string(),
-            expected_source: "manifest".to_string(),
-            source: "test".to_string(),
-            required_route_counters: Vec::new(),
-        };
-        let validation_error = validate_manifest_cases(&[case])
-            .expect_err("manifest validation must reject a symlink input")
-            .to_string();
-        assert!(
-            validation_error.contains("not a non-symlink regular file"),
-            "{validation_error}"
-        );
-
-        let case_dir = tmp.path().join("run");
-        fs::create_dir(&case_dir).expect("case dir");
-        assert!(
-            snapshot_case_input(&link, &case_dir).is_err(),
-            "the authoritative snapshot open must independently reject symlinks"
-        );
-    }
-
-    #[test]
-    fn chc_gate_normalizes_core_categories() {
-        assert_eq!(normalize_category_name("lia-lin-arrays"), "LIA-Lin-Arrays");
-        assert_eq!(normalize_category_name("mixed-lia-lra"), "mixed_LIA_LRA");
-        assert_eq!(normalize_category_name("BOOL"), "BOOL");
-    }
-
-    #[test]
-    fn chc_gate_json_manifest_uses_sidecar_expected_and_route_counters() {
-        let tmp = TempDir::new().unwrap();
-        let bench = write_case(
-            tmp.path(),
-            "family/case.smt2",
-            "properties:\n- expected_verdict: false\n  majority_vote_verdict: false\n",
-        );
-        let manifest = tmp.path().join("manifest.json");
-        fs::write(
-            &manifest,
-            serde_json::json!({
-                "benchmarks": [{
-                    "id": "case-a",
-                    "path": bench,
-                    "category": "lia-lin",
-                    "expected_status": "sat",
-                    "route_counters_expected": ["chc.route.demo"]
-                }]
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let cases = load_manifest_spec(manifest.to_str().unwrap(), None).unwrap();
-        assert_eq!(cases.len(), 1);
-        assert_eq!(cases[0].case_id, "case-a");
-        assert_eq!(cases[0].category, "LIA-Lin");
-        assert_eq!(cases[0].expected_status, "unsat");
-        assert!(cases[0].expected_source.starts_with("sidecar:"));
-        assert_eq!(cases[0].required_route_counters, vec!["chc.route.demo"]);
-    }
-
-    #[test]
-    fn chc_gate_sidecar_expected_keys_are_exact_unique_and_consistent() {
-        let tmp = TempDir::new().unwrap();
-        let unrelated = write_case(
-            tmp.path(),
-            "unrelated.smt2",
-            "not_expected_verdict: true\nmajority_vote_verdict_note: false\n",
-        );
-        assert_eq!(
-            read_sidecar_expected(&unrelated).origin,
-            ExpectedOrigin::None
-        );
-
-        let duplicate = write_case(
-            tmp.path(),
-            "duplicate.smt2",
-            "expected_verdict: true\n- expected_verdict: true\n",
-        );
-        assert_eq!(
-            read_sidecar_expected(&duplicate).origin,
-            ExpectedOrigin::SidecarInvalid
-        );
-
-        let conflicting = write_case(
-            tmp.path(),
-            "conflicting.smt2",
-            "expected_verdict: true\nmajority_vote_verdict: false\n",
-        );
-        assert_eq!(
-            read_sidecar_expected(&conflicting).origin,
-            ExpectedOrigin::SidecarInvalid
-        );
-    }
-
-    #[test]
-    fn chc_gate_result_parser_requires_one_authoritative_stdout_line() {
-        assert_eq!(extract_solver_result("sat\n"), "sat");
-        assert_eq!(
-            extract_solver_result("diagnostic: expected unsat\n"),
-            "error"
-        );
-        assert_eq!(extract_solver_result("sat\nsat\n"), "error");
-        assert_eq!(extract_solver_result("sat\nunsat\n"), "error");
-        assert_eq!(
-            solver_status_from_process(false, false, false, false, "sat\n"),
-            "error",
-            "a process abort after emitting a verdict is not solved"
-        );
-    }
-
-    #[test]
-    fn chc_gate_rejects_duplicate_and_colliding_case_ids() {
-        let tmp = TempDir::new().unwrap();
-        let first_path = write_case(tmp.path(), "first.smt2", "expected_verdict: true\n");
-        let second_path = write_case(tmp.path(), "second.smt2", "expected_verdict: true\n");
-        let make = |case_id: &str, path: &Path, source: &str| ManifestCase {
-            case_id: case_id.to_string(),
-            path: path.to_path_buf(),
-            category: "LIA".to_string(),
-            family: "test".to_string(),
-            expected_status: "sat".to_string(),
-            expected_source: "manifest".to_string(),
-            source: source.to_string(),
-            required_route_counters: Vec::new(),
-        };
-        let cases = vec![
-            make("a/b", &first_path, "first-source"),
-            make("a_b", &second_path, "second-source"),
-            make("a/b", &second_path, "duplicate-source"),
-        ];
-        let error = validate_manifest_cases(&cases)
-            .expect_err("duplicate and colliding IDs must be rejected")
-            .to_string();
-        assert!(error.contains("duplicate CHC case ID"), "{error}");
-        assert!(error.contains("collide at output directory"), "{error}");
-        assert!(error.contains("first-source"), "{error}");
-        assert!(error.contains("second-source"), "{error}");
-    }
-
-    #[test]
-    fn chc_gate_root_discovery_enforces_case_cap() {
-        let tmp = TempDir::new().unwrap();
-        for name in ["a.smt2", "b.smt2", "c.smt2"] {
-            fs::write(tmp.path().join(name), "(set-logic HORN)\n").unwrap();
-        }
-        let mut cases = Vec::new();
-        let error = collect_smt2_cases_with_limits(tmp.path(), None, &mut cases, 100, 100, 2)
-            .expect_err("root discovery must enforce its case cap");
-        assert!(error.to_string().contains("2-case cap"));
-        assert!(cases.len() <= 2);
-    }
-
-    #[test]
-    fn chc_gate_set_manifest_resolves_sidecar_input_file() {
-        let tmp = TempDir::new().unwrap();
-        let bench_dir = tmp.path().join("bench");
-        let family = bench_dir.join("family");
-        fs::create_dir_all(&family).unwrap();
-        fs::write(family.join("actual.smt2"), "(check-sat)\n").unwrap();
-        fs::write(
-            family.join("case.yml"),
-            "input_files: actual.smt2\nproperties:\n- expected_verdict: true\n",
-        )
-        .unwrap();
-        let set = bench_dir.join("LIA.set");
-        fs::write(&set, "family/case.yml\n").unwrap();
-
-        let cases = load_manifest_spec(&format!("LIA-Lin={}", set.display()), None).unwrap();
-        assert_eq!(cases.len(), 1);
-        assert_eq!(cases[0].path, family.join("actual.smt2"));
-        assert_eq!(cases[0].category, "LIA-Lin");
-        assert_eq!(cases[0].expected_status, "sat");
-    }
-
-    #[test]
-    fn chc_gate_par2_scores_unsolved_as_double_timeout() {
-        let solved = CaseRecord {
-            schema: CASES_SCHEMA,
-            case_id: "a".to_string(),
-            path: "a.smt2".to_string(),
-            solver_input_path: "snapshot-a.smt2".to_string(),
-            input_sha256: "sha256:test".to_string(),
-            input_size_bytes: 1,
-            category: "LIA".to_string(),
-            family: "f".to_string(),
-            expected_status: "sat".to_string(),
-            expected_source: "manifest".to_string(),
-            source: "manifest:m".to_string(),
-            status: "sat".to_string(),
-            classification: "solved".to_string(),
-            solved: true,
-            wrong: false,
-            invalid: false,
-            invalid_reasons: Vec::new(),
-            elapsed_s: Some(0.25),
-            par2_s: 0.25,
-            timed_out: false,
-            exit_code: Some(0),
-            process_status: "exit status: 0".to_string(),
-            stats_json_present: true,
-            stats_json_path: String::new(),
-            validation: ValidationTelemetry::default(),
-            transform_memory: TransformMemoryTelemetry::default(),
-            route: RouteTelemetry::default(),
-            route_counters: BTreeMap::new(),
-            required_route_counters: Vec::new(),
-            missing_required_route_counters: Vec::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            command_argv: Vec::new(),
-            command_env: BTreeMap::new(),
-        };
-        let mut timeout = solved.clone();
-        timeout.case_id = "b".to_string();
-        timeout.solved = false;
-        timeout.status = "timeout".to_string();
-        timeout.classification = "timeout".to_string();
-        timeout.par2_s = 4.0;
-        let summary = summarize_overall(&[solved, timeout], false);
-        assert_eq!(summary.solved, 1);
-        assert_eq!(summary.par2_total, 4.25);
-        assert_eq!(summary.memout, 0);
-    }
-
-    #[test]
-    fn chc_gate_baseline_regression_check_fails_on_solved_loss() {
-        let baseline = BaselineStats {
-            source: "baseline.json".to_string(),
-            solved: Some(2),
-            par2_total: Some(1.0),
-            resource_plan: Some(crate::resource::ResourcePlan {
-                requested_jobs: 1,
-                jobs: 1,
-                memlimit_mb_per_child: 1024,
-                nbcore_per_child: 1,
-                headroom_mb: 16000,
-                planner: "test".to_string(),
-            }),
-            timeout_sec: Some(2.0),
-            resource_enforcement: Some(crate::resource::ENFORCEMENT_AY_MEMORY_RSS_V1.to_string()),
-        };
-        let args = ChcGateArgs {
-            manifest: Some(PathBuf::from("m.json")),
-            roots: Vec::new(),
-            sample: false,
-            out_dir: PathBuf::from("out"),
-            ay: PathBuf::from("ay"),
-            timeout_sec: 2.0,
-            baseline: None,
-            category: None,
-            require_all_categories: false,
-            require_route_counters: Vec::new(),
-            allow_dirty: true,
-            fail_on_wrong: false,
-            fail_on_invalid: false,
-            min_solved_delta: 0,
-            max_par2_regression_pct: 0.0,
-        };
-        let current_plan = baseline.resource_plan.clone().unwrap();
-        let checks = baseline_checks(&[], &baseline, &current_plan, &args);
-        assert!(
-            checks
-                .iter()
-                .any(|check| check.name == "baseline-solved-delta" && check.status == "fail"),
-            "{checks:?}"
-        );
-    }
-
-    #[test]
-    fn chc_gate_memout_has_distinct_classification_and_summary_bucket() {
-        assert_eq!(classify_case("memout", false, false, false), "memout");
-        let mut row = CaseRecord {
-            schema: CASES_SCHEMA,
-            case_id: "mem".to_string(),
-            path: "mem.smt2".to_string(),
-            solver_input_path: "snapshot-mem.smt2".to_string(),
-            input_sha256: "sha256:test".to_string(),
-            input_size_bytes: 1,
-            category: "LIA".to_string(),
-            family: "f".to_string(),
-            expected_status: "sat".to_string(),
-            expected_source: "manifest".to_string(),
-            source: "manifest:m".to_string(),
-            status: "memout".to_string(),
-            classification: "memout".to_string(),
-            solved: false,
-            wrong: false,
-            invalid: false,
-            invalid_reasons: Vec::new(),
-            elapsed_s: Some(1.0),
-            par2_s: 4.0,
-            timed_out: false,
-            exit_code: None,
-            process_status: "signal: 9".to_string(),
-            stats_json_present: false,
-            stats_json_path: String::new(),
-            validation: ValidationTelemetry::default(),
-            transform_memory: TransformMemoryTelemetry::default(),
-            route: RouteTelemetry::default(),
-            route_counters: BTreeMap::new(),
-            required_route_counters: Vec::new(),
-            missing_required_route_counters: Vec::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            command_argv: Vec::new(),
-            command_env: BTreeMap::new(),
-        };
-        let overall = summarize_overall(std::slice::from_ref(&row), false);
-        assert_eq!(overall.memout, 1);
-        assert_eq!(overall.error, 0);
-        let categories = summarize_categories(std::slice::from_ref(&row));
-        assert_eq!(categories[0].memout, 1);
-        assert_eq!(categories[0].error, 0);
-        row.classification = "error".to_string();
-        assert_eq!(summarize_overall(&[row], false).error, 1);
-    }
-
-    #[test]
-    fn chc_gate_baseline_envelope_mismatch_skips_performance_comparison() {
-        let baseline = BaselineStats {
-            source: "baseline.json".to_string(),
-            solved: Some(1),
-            par2_total: Some(1.0),
-            resource_plan: None,
-            timeout_sec: None,
-            resource_enforcement: None,
-        };
-        let args = ChcGateArgs {
-            manifest: None,
-            roots: Vec::new(),
-            sample: false,
-            out_dir: PathBuf::from("out"),
-            ay: PathBuf::from("ay"),
-            timeout_sec: 1.0,
-            baseline: None,
-            category: None,
-            require_all_categories: false,
-            require_route_counters: Vec::new(),
-            allow_dirty: true,
-            fail_on_wrong: false,
-            fail_on_invalid: false,
-            min_solved_delta: 0,
-            max_par2_regression_pct: 0.0,
-        };
-        let plan = crate::resource::ResourcePlan {
-            requested_jobs: 1,
-            jobs: 1,
-            memlimit_mb_per_child: 1024,
-            nbcore_per_child: 1,
-            headroom_mb: 16000,
-            planner: "test".to_string(),
-        };
-        let checks = baseline_checks(&[], &baseline, &plan, &args);
-        assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].name, "baseline-resource-envelope");
-        assert_eq!(checks[0].status, "fail");
-        assert!(checks[0].reason.contains("non-comparable"));
-    }
-}
+mod tests;

@@ -228,15 +228,17 @@ fn reduction_drops_the_degree_when_p_divides_the_leading_coefficient() {
 }
 
 #[test]
-fn the_modular_inverse_fails_closed_on_a_multiple_of_p() {
+fn the_modular_inverse_fails_closed_on_a_multiple_of_p() -> Result<(), Box<dyn std::error::Error>> {
     let m = Zp::new(7).expect("prime");
     assert_eq!(m.inv_s(0), None);
     assert_eq!(m.inv_s(7), None);
     assert_eq!(m.inv_s(14), None);
     for a in 1..7u64 {
         let i = m.inv_s(a).expect("invertible");
-        assert_eq!((a * i) % 7, 1);
+        let product = a.checked_mul(i).ok_or("inverse product overflows u64")?;
+        assert_eq!(product % 7, 1);
     }
+    Ok(())
 }
 
 #[test]
@@ -359,13 +361,15 @@ fn distinct_degree_separates_a_planted_mix_of_degrees() {
 }
 
 #[test]
-fn factorization_of_a_split_product_recovers_every_linear_factor() {
+fn factorization_of_a_split_product_recovers_every_linear_factor(
+) -> Result<(), Box<dyn std::error::Error>> {
     let m = Zp::new(101).expect("prime");
     // prod_{i=0}^{9} (x - i): ten distinct linear factors, the worst case for
     // equal-degree splitting.
     let mut f = m.one();
     for i in 0..10u64 {
-        f = m.mul(&f, &m.from_u64(vec![(101 - i) % 101, 1]));
+        let root = 101u64.checked_sub(i).ok_or("root exceeds the modulus")?;
+        f = m.mul(&f, &m.from_u64(vec![root % 101, 1]));
     }
     let fac = m.factor(&f).expect("non-zero");
     assert_eq!(fac.lc, 1);
@@ -380,6 +384,7 @@ fn factorization_of_a_split_product_recovers_every_linear_factor() {
         }
     }
     assert_eq!(prod, f, "the product identity is the oracle");
+    Ok(())
 }
 
 #[test]
@@ -452,7 +457,7 @@ fn factoring_a_non_monic_input_puts_the_unit_in_lc() {
 fn irreducibility_agrees_with_the_factorizer_on_every_monic_cubic_mod_five() {
     // An exhaustive cross-check of the two independent paths on 125 inputs.
     let m = Zp::new(5).expect("prime");
-    let mut irreducible_count = 0;
+    let mut irreducible_count = 0usize;
     for a in 0..5u64 {
         for b in 0..5u64 {
             for c in 0..5u64 {
@@ -464,7 +469,7 @@ fn irreducibility_agrees_with_the_factorizer_on_every_monic_cubic_mod_five() {
                     && fac.factors[0].0.degree() == Some(3);
                 assert_eq!(rabin, via_factor, "disagreement on {:?}", f.coeffs());
                 if rabin {
-                    irreducible_count += 1;
+                    irreducible_count = irreducible_count.saturating_add(1);
                 }
             }
         }
@@ -474,7 +479,8 @@ fn irreducibility_agrees_with_the_factorizer_on_every_monic_cubic_mod_five() {
 }
 
 #[test]
-fn every_monic_quartic_mod_three_factors_back_to_itself() {
+fn every_monic_quartic_mod_three_factors_back_to_itself() -> Result<(), Box<dyn std::error::Error>>
+{
     // Exhaustive: 81 inputs, each checked against the exact product identity
     // and against the independent irreducibility test.
     let m = Zp::new(3).expect("prime");
@@ -493,7 +499,9 @@ fn every_monic_quartic_mod_three_factors_back_to_itself() {
                             "non-irreducible factor for {:?}",
                             f.coeffs()
                         );
-                        total += g.degree().expect("non-zero") * e;
+                        let degree = g.degree().expect("non-zero");
+                        let part = degree.checked_mul(*e).ok_or("factor degree overflows")?;
+                        total = total.checked_add(part).ok_or("degree sum overflows")?;
                         for _ in 0..*e {
                             prod = m.mul(&prod, g);
                         }
@@ -504,6 +512,7 @@ fn every_monic_quartic_mod_three_factors_back_to_itself() {
             }
         }
     }
+    Ok(())
 }
 
 /// `factor` must not DECLINE on ordinary fully-split input at the degrees where
@@ -520,14 +529,16 @@ fn every_monic_quartic_mod_three_factors_back_to_itself() {
 /// The degrees below straddle that window deliberately. They are cheap: a
 /// degree-256 split-linear factorization measured 17.6 ms.
 #[test]
-fn factor_does_not_decline_on_fully_split_input_across_the_old_budget_cliff() {
+fn factor_does_not_decline_on_fully_split_input_across_the_old_budget_cliff(
+) -> Result<(), Box<dyn std::error::Error>> {
     let m = Zp::new(65537).expect("prime");
     for n in [320u64, 340, 355, 370, 384] {
         // prod_{i<n} (x - i): n distinct linear factors, the worst case for
         // equal-degree splitting and the shape that exposed the cliff.
         let mut f = m.one();
         for i in 0..n {
-            f = m.mul(&f, &m.from_u64(vec![(65537 - i) % 65537, 1]));
+            let root = 65537u64.checked_sub(i).ok_or("root exceeds the modulus")?;
+            f = m.mul(&f, &m.from_u64(vec![root % 65537, 1]));
         }
         let fac = m
             .factor(&f)
@@ -542,6 +553,7 @@ fn factor_does_not_decline_on_fully_split_input_across_the_old_budget_cliff() {
             assert_eq!(*e, 1, "degree {n}: multiplicity must be 1");
         }
     }
+    Ok(())
 }
 
 include!("upoly_tests/yun_regression.rs");

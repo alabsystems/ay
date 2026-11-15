@@ -11,17 +11,23 @@
 //!
 //! Design: the development design notes
 
+use crate::expr::dag::Step;
 use crate::farkas::compute_interpolant_until as farkas_interpolant_until;
 use crate::interpolation::heuristics::{
     compute_bound_interpolant, compute_transitivity_interpolant,
 };
 use crate::{ChcExpr, ChcOp};
+use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 use ay_core::time::Instant;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Maximum case-split budget: 2^n ≤ this value.
 const ITE_CASE_BUDGET: usize = 64;
+/// The most distinct ITE conditions whose 2^n case split fits
+/// [`ITE_CASE_BUDGET`].
+const MAX_ITE_CONDITIONS: usize = ITE_CASE_BUDGET.ilog2() as usize;
 
 /// Compute interpolant by case-splitting on ITE conditions.
 ///
@@ -45,27 +51,26 @@ pub(crate) fn compute_ite_farkas_interpolant_until(
     shared_vars: &FxHashSet<String>,
     deadline: Option<Instant>,
 ) -> Option<ChcExpr> {
-    // 1. Collect ITE conditions from all constraints
-    let mut conditions = Vec::new();
-    for expr in a_constraints.iter().chain(b_constraints.iter()) {
-        collect_ite_conditions(expr, &mut conditions);
-    }
-    // Deduplicate (ChcExpr implements Eq+Hash)
-    let mut seen = FxHashSet::default();
-    conditions.retain(|c| seen.insert(c.clone()));
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
+    // 1. Collect the distinct ITE conditions of all constraints (first
+    // occurrences, in tree preorder), stopping once the case budget is
+    // exceeded: no further condition can bring the count back under it.
+    let Some(conditions) = collect_ite_conditions(
+        a_constraints.iter().chain(b_constraints.iter()),
+        MAX_ITE_CONDITIONS,
+    ) else {
+        info!(
+            event = "chc_ite_farkas_skip",
+            reason = "budget_exceeded",
+            conditions = MAX_ITE_CONDITIONS + 1,
+        );
+        return None;
+    };
 
     if conditions.is_empty() {
         return None;
     }
     let n = conditions.len();
-    if n > 20 || (1usize << n) > ITE_CASE_BUDGET {
-        info!(
-            event = "chc_ite_farkas_skip",
-            reason = "budget_exceeded",
-            conditions = n,
-        );
-        return None;
-    }
 
     // 2. Classify each condition's variable ownership
     let a_vars: FxHashSet<String> = a_constraints
@@ -135,22 +140,40 @@ pub(crate) fn compute_ite_farkas_interpolant_until(
     result
 }
 
-/// Walk an expression tree and collect ITE conditions (args[0] of Ite nodes).
-fn collect_ite_conditions(expr: &ChcExpr, conditions: &mut Vec<ChcExpr>) {
-    match expr {
-        ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
-            conditions.push(args[0].as_ref().clone());
-            for arg in args {
-                collect_ite_conditions(arg, conditions);
+/// The distinct ITE conditions (`args[0]` of `ite` nodes reached through
+/// `Op` nodes) of `exprs`, in the order of their first occurrence in a
+/// recursive preorder tree walk, or `None` once more than `cap` are found.
+///
+/// DAG time: a shared node (same `Arc`) is walked once, which collects
+/// exactly what the tree walk collects after deduplication (its first
+/// visit already reached every condition below it). The LRA-Lin `let`
+/// DAGs (cav12 transmitter.2: 1.8e12 tree nodes) kept IMC's interpolation
+/// in this walk for the whole run.
+fn collect_ite_conditions<'a>(
+    exprs: impl Iterator<Item = &'a ChcExpr>,
+    cap: usize,
+) -> Option<Vec<ChcExpr>> {
+    let mut seen = FxHashSet::default();
+    let mut conditions = Vec::new();
+    for expr in exprs {
+        let complete = crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                if seen.insert(args[0].as_ref().clone()) {
+                    conditions.push(args[0].as_ref().clone());
+                    if conditions.len() > cap {
+                        return Step::Stop;
+                    }
+                }
+                Step::Descend
             }
+            ChcExpr::Op(..) => Step::Descend,
+            _ => Step::Skip,
+        });
+        if !complete {
+            return None;
         }
-        ChcExpr::Op(_, args) => {
-            for arg in args {
-                collect_ite_conditions(arg, conditions);
-            }
-        }
-        _ => {}
     }
+    Some(conditions)
 }
 
 /// Substitute ITE conditions with truth values, add condition guards, and simplify.
@@ -186,23 +209,51 @@ fn substitute_ite_case(
 
 /// Replace `ite(c, t, e)` with `t` (if val=true) or `e` (if val=false)
 /// for all occurrences where the condition matches `cond`.
+///
+/// Each distinct node (same `Arc`) is rewritten once and its result shared,
+/// so a `let` DAG is rewritten in DAG time; the result is structurally the
+/// tree rewrite's.
 fn substitute_ite_condition(expr: &ChcExpr, cond: &ChcExpr, val: bool) -> ChcExpr {
+    let mut memo: FxHashMap<*const ChcExpr, Arc<ChcExpr>> = FxHashMap::default();
+    substitute_ite_condition_memo(expr, cond, val, &mut memo)
+}
+
+fn substitute_ite_condition_arc(
+    arg: &Arc<ChcExpr>,
+    cond: &ChcExpr,
+    val: bool,
+    memo: &mut FxHashMap<*const ChcExpr, Arc<ChcExpr>>,
+) -> Arc<ChcExpr> {
+    let key = Arc::as_ptr(arg);
+    if let Some(done) = memo.get(&key) {
+        return Arc::clone(done);
+    }
+    let rewritten: Arc<ChcExpr> =
+        crate::expr::maybe_grow_expr_stack(|| substitute_ite_condition_memo(arg, cond, val, memo))
+            .into();
+    memo.insert(key, Arc::clone(&rewritten));
+    rewritten
+}
+
+fn substitute_ite_condition_memo(
+    expr: &ChcExpr,
+    cond: &ChcExpr,
+    val: bool,
+    memo: &mut FxHashMap<*const ChcExpr, Arc<ChcExpr>>,
+) -> ChcExpr {
     match expr {
         ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
             if args[0].as_ref() == cond {
-                // Match: replace with the appropriate branch
-                let branch = if val {
-                    args[1].as_ref()
-                } else {
-                    args[2].as_ref()
-                };
-                // Recurse into the chosen branch (may contain nested ITEs)
-                substitute_ite_condition(branch, cond, val)
+                // Match: the chosen branch (may contain nested ITEs)
+                let branch = if val { &args[1] } else { &args[2] };
+                substitute_ite_condition_arc(branch, cond, val, memo)
+                    .as_ref()
+                    .clone()
             } else {
                 // Non-matching ITE: recurse into all children
                 let new_args: Vec<_> = args
                     .iter()
-                    .map(|a| substitute_ite_condition(a, cond, val).into())
+                    .map(|a| substitute_ite_condition_arc(a, cond, val, memo))
                     .collect();
                 ChcExpr::Op(ChcOp::Ite, new_args)
             }
@@ -210,7 +261,7 @@ fn substitute_ite_condition(expr: &ChcExpr, cond: &ChcExpr, val: bool) -> ChcExp
         ChcExpr::Op(op, args) => {
             let new_args: Vec<_> = args
                 .iter()
-                .map(|a| substitute_ite_condition(a, cond, val).into())
+                .map(|a| substitute_ite_condition_arc(a, cond, val, memo))
                 .collect();
             ChcExpr::Op(*op, new_args)
         }

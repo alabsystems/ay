@@ -88,7 +88,9 @@ impl Executor {
             }
         }
 
-        let mut stack = self.authenticated_datatype_array_extensionality_roots(model)?;
+        let mut stack = self
+            .collect_demanded_datatype_array_extensionality(model)?
+            .roots;
         while let Some(term) = stack.pop() {
             if !candidates.insert(term) {
                 continue;

@@ -9,7 +9,7 @@
 //! SAME instance three ways and require they agree:
 //!   1. the **diff-logic-ON** path (`(set-option :ay-diff-logic true)`),
 //!   2. the **default** path (option absent / OFF — the always-correct solver),
-//!   3. **z3** (ground truth; skipped gracefully when z3 is not on PATH).
+//!   3. **z3** (ground truth, reached by path; skipped visibly when absent).
 //!
 //! ANY sat/unsat mismatch fails the test (the gate's whole purpose). For each ON
 //! instance we additionally assert the diff-logic engine actually *fired* (so we
@@ -19,10 +19,11 @@
 
 use super::Executor;
 use ay_frontend::parse;
+use ay_test_support::z3::Z3Oracle;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Run an SMT-LIB script through a fresh executor; return per-command outputs.
 fn run(script: &str) -> Vec<String> {
@@ -40,31 +41,10 @@ fn run_on(script: &str) -> (Vec<String>, bool) {
     (outputs, exec.last_diff_logic_decided_for_test())
 }
 
-/// Locate a z3 binary, or `None` to skip the z3 leg.
-fn z3_path() -> Option<String> {
-    for cand in [
-        "z3",
-        "/opt/homebrew/bin/z3",
-        "/usr/local/bin/z3",
-        "/usr/bin/z3",
-    ] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.to_string());
-        }
-    }
-    None
-}
-
 /// Run a z3 script, returning the trimmed first verdict line.
-fn run_z3(z3: &str, script: &str) -> String {
-    let mut child = Command::new(z3)
+fn run_z3(z3: &Z3Oracle, script: &str) -> String {
+    let mut child = z3
+        .command()
         .arg("-in")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -192,10 +172,9 @@ fn differential_corpus(
     gen_atom: fn(&mut ChaCha8Rng) -> String,
     label: &str,
 ) {
-    let z3 = z3_path();
-    if z3.is_none() {
-        eprintln!("NOTE {label}: z3 not on PATH — running executor-vs-executor only");
-    }
+    // The z3 leg is optional and reached by path (`ay_test_support::z3`); a
+    // missing z3 is announced there and this corpus runs executor-vs-executor.
+    let z3 = ay_test_support::z3::optional_z3("ay-dpll executor::diff_logic_tests");
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     let mut sat = 0usize;
@@ -237,7 +216,7 @@ fn differential_corpus(
         }
 
         // z3 leg.
-        if let Some(ref z3) = z3 {
+        if let Some(z3) = z3 {
             let z3_v = run_z3(z3, &format!("{base}(check-sat)\n"));
             if z3_v == "sat" || z3_v == "unsat" {
                 z3_checked += 1;

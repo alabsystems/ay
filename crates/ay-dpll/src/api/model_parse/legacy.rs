@@ -90,6 +90,7 @@ pub(super) fn parse_model_str_legacy(model_str: &str) -> Model {
         bv_values: HashMap::default(),
         string_values: HashMap::default(),
         fp_values: HashMap::default(),
+        field_values: HashMap::default(),
         seq_values: HashMap::default(),
         array_values: HashMap::default(),
         datatype_values: HashMap::default(),

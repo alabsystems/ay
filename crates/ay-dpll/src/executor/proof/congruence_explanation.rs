@@ -119,6 +119,10 @@ impl Executor {
             .take(proof.steps.len())
             .collect();
         let mut rejustified = vec![false; proof.steps.len()];
+        // Each fragment prints inside THIS proof's export, where a confined
+        // `let` assume spelling prints only at its own `assume`.
+        let let_confined =
+            self.let_confined_overrides_for_export(proof, self.last_proof_term_overrides.as_ref());
         let candidates: Vec<usize> = proof
             .steps
             .iter()
@@ -126,7 +130,13 @@ impl Executor {
             .filter(|(_, step)| is_explanation_lemma(step))
             .map(|(index, _)| index)
             .collect();
+        // One stop for the pass (its Certify node, built here outside an
+        // assembly), polled per candidate.
+        let stop = self.make_proof_assembly_should_stop();
         for index in candidates {
+            if stop() {
+                return 0;
+            }
             let Some(candidate) = self.explanation_candidate(proof, &citations, index) else {
                 continue;
             };
@@ -139,13 +149,13 @@ impl Executor {
             let Some(derivation) = derivation else {
                 continue;
             };
-            if self.derivation_is_unrenderable(&derivation) {
+            if self.derivation_is_unrenderable(&derivation, let_confined.as_ref()) {
                 continue;
             }
             // Guard 5: the untouched strict checker replays every emitted step
             // before any of them may enter the proof.
             let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &derivation);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+            if self.check_proof_strict_until_stopped(&closed).is_err() {
                 continue;
             }
             if let Some(consumer) = candidate.consumer {
@@ -222,8 +232,21 @@ impl Executor {
     ///   `(= (= a b) false)`, which the printer renders happily and an
     ///   external checker then rejects. Decided by the SAME predicate the
     ///   `eq_transitive` demotion uses, for the same reason.
-    fn derivation_is_unrenderable(&self, derivation: &CongruenceDerivation) -> bool {
-        let overrides = self.last_proof_term_overrides.as_ref();
+    ///
+    /// `let_confined`, when present, is the export's table outside confined
+    /// `let` assumes ([`Executor::let_confined_overrides_for_export`]). The
+    /// raw table spells an authored `let` root inside every fragment step
+    /// over it, which the export never prints. MEASURED on
+    /// `benchmarks/smt/QF_AUFLIA/storeinv_nf_size2.smt2`: read through the
+    /// raw table, three explanations over its `let`-authored array equality
+    /// stayed `hole`; read as the export prints, the document is carcara
+    /// `valid`.
+    fn derivation_is_unrenderable(
+        &self,
+        derivation: &CongruenceDerivation,
+        let_confined: Option<&DetHashMap<TermId, String>>,
+    ) -> bool {
+        let overrides = let_confined.or(self.last_proof_term_overrides.as_ref());
         if !ay_proof::congruence_derivation_renders(&self.ctx.terms, overrides, derivation) {
             return true;
         }

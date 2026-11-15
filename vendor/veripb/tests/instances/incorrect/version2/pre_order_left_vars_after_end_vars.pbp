@@ -1,0 +1,52 @@
+pseudo-Boolean proof version 2.0
+* Regression test: the same asymmetric order as
+* incorrect/version2/pre_order_asymmetric_left_right_vars, with the offending
+* `left` moved one line past `end`.
+*
+* That earlier fix put the symmetry re-check where the `vars` block closes.
+* But the rules that declare the lists were guarded only on the enclosing
+* subcontext, and `end vars` does not close that subcontext -- it clears an
+* `inside_vars` flag which `left`, `right`, `aux` and the `fresh_*` rules
+* never read, even though `RuleOnlyAllowedInOrderVars`, the error they raise,
+* says in so many words that they belong to "the variable definition of an
+* order". Each rule overwrites its list outright, so a declaration written
+* after `end vars` replaced the validated list with an unvalidated one and
+* neither check saw it. `load_order bad x1 x2` was then sized against the
+* poisoned `left` of length 2 while `right` still had length 1.
+*
+* Not a wrong verdict, and no attempt to build one from it succeeded: the
+* truncated relation is still a genuine preorder, and `get_reflexivity_-
+* substitution` truncates the same way, so a `def` that reaches the unpaired
+* positions makes reflexivity unprovable. What is measured here is the bypass
+* itself -- `load_order bad x1 x2` is accepted against a `right` of length 1,
+* which is exactly the state both existing checks exist to prevent -- and the
+* hazard it leaves live downstream, where `ActiveOrder::new` and both
+* substitution getters zip the two sides with `izip!` and each stops at a
+* different length. It is refused because a guard that can be stepped around
+* by moving one line is not a guard.
+f 1
+pre_order bad
+    vars
+        left u1
+        right v1
+        aux
+    end
+    left u2 u3
+    def
+        1 ~u2 1 v1 >= 1 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                u >= 1 ;
+            end -1
+        end
+    end
+end
+load_order bad x1 x2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

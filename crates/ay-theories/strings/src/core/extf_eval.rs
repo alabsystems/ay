@@ -149,7 +149,7 @@ impl CoreSolver {
                 }
                 let a = Self::resolve_string_term(terms, state, args[0], 0)?;
                 let b = Self::resolve_string_term(terms, state, args[1], 0)?;
-                Some(a <= b)
+                Some(ay_core::smtlib_str_cmp(&a, &b).is_le())
             }
             "str.<" if args.len() == 2 => {
                 if state.find(args[0]) == state.find(args[1]) {
@@ -157,7 +157,7 @@ impl CoreSolver {
                 }
                 let a = Self::resolve_string_term(terms, state, args[0], 0)?;
                 let b = Self::resolve_string_term(terms, state, args[1], 0)?;
-                Some(a < b)
+                Some(ay_core::smtlib_str_cmp(&a, &b).is_lt())
             }
             "str.is_digit" if args.len() == 1 => {
                 let s = Self::resolve_string_term(terms, state, args[0], 0)?;

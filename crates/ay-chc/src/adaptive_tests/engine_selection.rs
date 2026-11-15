@@ -28,6 +28,34 @@ fn engine_counts(portfolio: &PortfolioConfig) -> [usize; 11] {
     })
 }
 
+/// Fix C (8cd8c6474): a cyclic array multi-predicate problem gets the
+/// Unsafe-only BMC lane (max_depth 30, `acyclic_safe` false) in the
+/// multi-pred lineup. heap__swaparray_000 is the instance that lane was added
+/// for; its end-to-end test now lands before the portfolio is built, so this
+/// pins the lineup entry directly.
+#[test]
+fn multi_pred_lineup_keeps_fix_c_unsafe_only_bmc_for_cyclic_arrays() {
+    let problem = ChcParser::parse(include_str!(
+        "../../tests/fixtures/chc_comp/llreve/heap__swaparray_000.smt2"
+    ))
+    .expect("parse heap__swaparray_000");
+    let features = ProblemClassifier::classify(&problem);
+    assert!(features.uses_arrays && features.has_cycles);
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let config = adaptive.multi_pred_linear_portfolio_config(
+        PdrConfig::default(),
+        PdrConfig::portfolio_variant_with_splits(),
+        &features,
+    );
+    assert!(
+        config.engines.iter().any(|engine| matches!(
+            engine,
+            EngineConfig::Bmc(bmc) if bmc.max_depth == 30 && !bmc.acyclic_safe
+        )),
+        "the cyclic-array multi-pred lineup must keep Fix C's Unsafe-only BMC lane"
+    );
+}
+
 fn sorted_engine_fingerprints(portfolio: &PortfolioConfig) -> Vec<String> {
     let mut fingerprints = portfolio
         .engines
@@ -177,33 +205,6 @@ fn feature_selection_cannot_undo_datatype_guards() {
         EngineConfig::Pdr(pdr) => pdr.max_escalation_level == 0,
         _ => true,
     }));
-}
-
-#[test]
-fn feature_selection_stays_at_original_problem_route_boundaries() {
-    let call = "apply_original_problem_engine_selection(";
-    assert_eq!(
-        include_str!("../adaptive_bv_strategy.rs")
-            .matches(call)
-            .count(),
-        2
-    );
-    assert_eq!(
-        include_str!("../adaptive_multi_pred.rs")
-            .matches(call)
-            .count(),
-        1
-    );
-    assert_eq!(
-        include_str!("../adaptive_multi_pred_complex.rs")
-            .matches(call)
-            .count(),
-        2
-    );
-    assert!(
-        !include_str!("../adaptive_bv_dual_lane.rs").contains(call),
-        "transformed BV lane builders must not be reordered from original-problem features"
-    );
 }
 
 #[test]

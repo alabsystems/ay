@@ -30,8 +30,15 @@
 /// So this is a PRE-EMPT weaker than what it displaces — the same error the QE
 /// alternation route made. When the orientation assertion fails, delete this
 /// test and default the knob on.
+///
+/// Both exports run under `--no-qsat`: the QSAT route runs ahead of both the
+/// precheck and CEGQI and would publish either export itself.
 #[test]
 fn closed_universal_precheck_in_proof_mode_is_still_weaker_than_cegqi() {
+    let _no_qsat = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        no_qsat: true,
+        ..ay_core::misc_cli_flags().clone()
+    });
     #[derive(Clone, Copy)]
     enum PrecheckMode {
         Default,

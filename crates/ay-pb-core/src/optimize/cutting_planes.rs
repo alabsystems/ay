@@ -2016,8 +2016,9 @@ mod tests {
     /// lifted coefficient `alpha_j = (|C|-1) - max_coeff_within_budget(...)`; a
     /// wrong (too-small) DP value would inflate `alpha_j` and could yield a
     /// NON-ENTAILED cut that cuts off the true optimum (=> false OPTIMUM => DQ).
-    /// Verified equal to exhaustive subset enumeration. Kani twin:
-    /// `kani_lifted_cover_dp::*` (proofs/2026-06-16-pb-trust-soundness-harnesses.md).
+    /// Verified equal to exhaustive subset enumeration: hand-picked cases, then
+    /// every 3-item set with weights `1..=4`, coefficients `0..=4` and budget
+    /// `0..=8`.
     #[test]
     fn test_max_coeff_within_budget_equals_bruteforce() {
         fn li(weight: i128, coeff: i128) -> LiftedItem {
@@ -2061,72 +2062,19 @@ mod tests {
         check(&[], 5); // empty => 0
                        // budget < 0 short-circuits to Some(0).
         assert_eq!(max_coeff_within_budget(&[li(1, 1)], -1), Some(0));
-    }
-}
 
-/// VerifierConsumer / Kani proof harness for the lifted-cover 0/1-knapsack DP
-/// (model-checked by model-checker-consumer; proofs/2026-06-16-pb-trust-soundness-harnesses.md).
-/// Proves `max_coeff_within_budget` equals exhaustive subset-max for ALL small
-/// bounded instances — the Kani-tractable core of lifted-cover soundness (the full
-/// cut path uses `BigRational` and is intractable; entailment itself is brute-force
-/// tested by `property_every_lifted_cover_cut_is_entailed`). `#[cfg(kani)]` gates
-/// it out of normal builds.
-#[cfg(kani)]
-mod kani_lifted_cover_dp {
-    use super::*;
-
-    fn li(weight: i128, coeff: i128) -> LiftedItem {
-        LiftedItem {
-            lit: PbLit {
-                var: 1,
-                negated: false,
-            },
-            weight,
-            coeff,
+        let items: Vec<(i128, i128)> = (1..=4)
+            .flat_map(|weight| (0..=4).map(move |coeff| (weight, coeff)))
+            .collect();
+        for &(w0, c0) in &items {
+            for &(w1, c1) in &items {
+                for &(w2, c2) in &items {
+                    let set = [li(w0, c0), li(w1, c1), li(w2, c2)];
+                    for budget in 0..=8 {
+                        check(&set, budget);
+                    }
+                }
+            }
         }
-    }
-
-    /// For all small bounded item sets, the DP value equals exhaustive subset-max.
-    /// 3 items, weights 1..=4, coeffs 0..=4, budget 0..=8 (DP table width <= 9):
-    /// tractable. Brute-force subset enumeration is the trusted oracle.
-    #[kani::proof]
-    fn max_coeff_within_budget_equals_bruteforce() {
-        let w0: i128 = kani::any();
-        let c0: i128 = kani::any();
-        let w1: i128 = kani::any();
-        let c1: i128 = kani::any();
-        let w2: i128 = kani::any();
-        let c2: i128 = kani::any();
-        kani::assume((1..=4).contains(&w0) && (0..=4).contains(&c0));
-        kani::assume((1..=4).contains(&w1) && (0..=4).contains(&c1));
-        kani::assume((1..=4).contains(&w2) && (0..=4).contains(&c2));
-        let budget: i128 = kani::any();
-        kani::assume((0..=8).contains(&budget));
-
-        let items = [li(w0, c0), li(w1, c1), li(w2, c2)];
-
-        let mut best = 0i128;
-        let mut mask = 0u32;
-        while mask < 8 {
-            let (mut w, mut c) = (0i128, 0i128);
-            if mask & 1 != 0 {
-                w += items[0].weight;
-                c += items[0].coeff;
-            }
-            if mask & 2 != 0 {
-                w += items[1].weight;
-                c += items[1].coeff;
-            }
-            if mask & 4 != 0 {
-                w += items[2].weight;
-                c += items[2].coeff;
-            }
-            if w <= budget && c > best {
-                best = c;
-            }
-            mask += 1;
-        }
-
-        assert_eq!(max_coeff_within_budget(&items, budget), Some(best));
     }
 }

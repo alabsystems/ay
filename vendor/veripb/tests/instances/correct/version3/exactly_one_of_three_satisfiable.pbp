@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to the def_order_transitivity_fresh_right_* instances under
+% incorrect/version3: those refute this very formula, so record here that it is
+% satisfiable. `x1 = 1, x2 = 0, x3 = 0` satisfies exactly-one-of-three.
+f 4;
+output NONE;
+conclusion SAT : x1 ~x2 ~x3;
+end pseudo-Boolean proof;

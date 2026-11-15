@@ -6,12 +6,10 @@
 
 use ay_core::TermId;
 
-use super::super::{
-    bv_expr_nodes, proof_producing_expr_nodes, BvExpr, ProofProducingExpr, ProofProducingLowerer,
-};
+use super::super::{BvExpr, ProofProducingExpr, ProofProducingLowerer};
 use super::{FiniteArrayExpr, FiniteIndexSort, FiniteScalarSort, FiniteSortShape};
 
-impl ProofProducingLowerer<'_> {
+impl ProofProducingLowerer<'_, '_> {
     pub(super) fn lower_array_variable(
         &mut self,
         term: TermId,
@@ -22,6 +20,7 @@ impl ProofProducingLowerer<'_> {
         let mut cells = Vec::new();
         self.reserve_cells(&mut cells, shape.scalar_cells, "finite-array variable")?;
         for cell in 0..shape.scalar_cells {
+            self.poll_lowering()?;
             cells.push(BvExpr::leaf(
                 &format!("proof_array_{}_cell_{cell}", term.index()),
                 shape.leaf_width(),
@@ -41,7 +40,7 @@ impl ProofProducingLowerer<'_> {
         let element_shape = self.element_shape_or_resource(&shape)?;
         self.require_term_shape(*fill_term, &element_shape, "const-array fill")?;
         let fill = self.lower(*fill_term)?;
-        let fill_nodes = proof_producing_expr_nodes(&fill).inspect_err(|_| {
+        let fill_nodes = self.count_proof_nodes(&fill).inspect_err(|_| {
             self.resource_exhausted = true;
         })?;
         let domain = shape.outer_index()?.domain_size();
@@ -55,7 +54,10 @@ impl ProofProducingLowerer<'_> {
         let mut cells = Vec::new();
         self.reserve_cells(&mut cells, shape.scalar_cells, "const-array")?;
         for _ in 0..domain {
-            cells.extend(fill_cells.iter().cloned());
+            for cell in &fill_cells {
+                self.poll_lowering()?;
+                cells.push(cell.clone());
+            }
         }
         Ok(FiniteArrayExpr { shape, cells })
     }
@@ -89,6 +91,7 @@ impl ProofProducingLowerer<'_> {
         for (point, condition) in conditions.into_iter().enumerate() {
             let offset = point * element_cells;
             for (cell, value_cell) in value.iter().enumerate() {
+                self.poll_lowering()?;
                 cells.push(Self::mux_leaf(
                     condition.clone(),
                     value_cell.clone(),
@@ -117,7 +120,7 @@ impl ProofProducingLowerer<'_> {
         let condition = self.lower_bool(condition_term)?;
         let then_array = self.lower_array_value(then_term, &shape, "array ite then branch")?;
         let else_array = self.lower_array_value(else_term, &shape, "array ite else branch")?;
-        let condition_nodes = bv_expr_nodes(&condition).inspect_err(|_| {
+        let condition_nodes = self.count_bv_nodes(&condition).inspect_err(|_| {
             self.resource_exhausted = true;
         })?;
         let mask_nodes = condition_nodes + usize::from(shape.leaf_width() > 1);
@@ -140,6 +143,7 @@ impl ProofProducingLowerer<'_> {
         let mut cells = Vec::new();
         self.reserve_cells(&mut cells, shape.scalar_cells, "finite-array ite")?;
         for (then_cell, else_cell) in then_array.cells.into_iter().zip(else_array.cells) {
+            self.poll_lowering()?;
             cells.push(Self::mux_leaf(
                 condition.clone(),
                 then_cell,
@@ -183,6 +187,7 @@ impl ProofProducingLowerer<'_> {
                 "finite-array select candidates",
             )?;
             for (point, condition) in conditions.iter().enumerate() {
+                self.poll_lowering()?;
                 let source = point * element_shape.scalar_cells + cell;
                 candidates.push(BvExpr::and(
                     Self::condition_mask(condition.clone(), element_shape.leaf_width()),
@@ -200,7 +205,7 @@ impl ProofProducingLowerer<'_> {
         index_sort: FiniteIndexSort,
     ) -> Result<Vec<BvExpr>, String> {
         let domain = index_sort.domain_size();
-        let index_nodes = bv_expr_nodes(&index).inspect_err(|_| {
+        let index_nodes = self.count_bv_nodes(&index).inspect_err(|_| {
             self.resource_exhausted = true;
         })?;
         let condition_nodes = match index_sort {
@@ -226,6 +231,7 @@ impl ProofProducingLowerer<'_> {
             }
             FiniteIndexSort::BitVec(width) => {
                 for point in 0..domain {
+                    self.poll_lowering()?;
                     conditions.push(BvExpr::eq(
                         index.clone(),
                         BvExpr::const_val(point as u128, width),

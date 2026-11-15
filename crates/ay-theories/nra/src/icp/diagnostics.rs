@@ -126,7 +126,7 @@ pub(super) fn report_witness(
             if bx.get(var).is_some_and(|iv| interval_contains(iv, value)) {
                 continue;
             }
-            outside += 1;
+            outside = outside.saturating_add(1);
             detail.push_str(&format!(
                 "[{value} OUT OF {}] ",
                 render_box(solver, &[*var], bx)

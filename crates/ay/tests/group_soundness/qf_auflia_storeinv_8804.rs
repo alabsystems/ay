@@ -18,13 +18,14 @@
 use ntest::timeout;
 use std::process::Command;
 
+use crate::corpus::tracked_fixture;
+
+/// `benchmarks/smt/QF_AUFLIA` is committed, so a missing reproducer is a
+/// broken tree and fails here rather than handing `ay` a path that does not
+/// exist and reading whatever it prints as the verdict.
 fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smt/QF_AUFLIA/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        smt_file
-    );
+    let benchmark_path = tracked_fixture(&format!("benchmarks/smt/QF_AUFLIA/{smt_file}"));
 
     let output = Command::new(ay_path)
         .arg(format!("-t:{timeout_ms}"))

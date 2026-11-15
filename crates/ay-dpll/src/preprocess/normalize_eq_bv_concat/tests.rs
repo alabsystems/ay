@@ -253,6 +253,102 @@ fn test_idempotency() {
 }
 
 #[test]
+fn test_join_extract_equalities_into_word_equality() {
+    // Byte-slice definitions of one variable must join into the
+    // entailed word equality so variable substitution can replace
+    // the variable whole (the shape substitution itself produces on
+    // instruction-selection dumps: c-in bytes each equal to slices
+    // of one argument, while the goal mentions the whole word).
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(16));
+    let hi = terms.mk_var("hi", Sort::bitvec(8));
+    let lo = terms.mk_var("lo", Sort::bitvec(8));
+    let x_hi = terms.mk_bvextract(15, 8, x);
+    let x_lo = terms.mk_bvextract(7, 0, x);
+    let eq_hi = terms.mk_eq(x_hi, hi);
+    let eq_lo = terms.mk_eq(x_lo, lo);
+
+    let mut assertions = vec![eq_hi, eq_lo];
+    let mut pass = NormalizeEqBvConcat::new();
+    let modified = pass.apply(&mut terms, &mut assertions);
+    assert!(modified, "joining a full partition should modify");
+    // Originals kept, word equality added.
+    let word = terms.mk_bvconcat(vec![hi, lo]);
+    let word_eq = terms.mk_eq(x, word);
+    assert!(
+        assertions.contains(&eq_hi) && assertions.contains(&eq_lo),
+        "slice equalities must be preserved"
+    );
+    assert!(
+        assertions.contains(&word_eq),
+        "joined word equality (= x (concat hi lo)) must be added"
+    );
+    // Idempotent: a second application neither re-joins nor splits
+    // the joined equality back apart.
+    let after_first = assertions.clone();
+    let modified2 = pass.apply(&mut terms, &mut assertions);
+    assert!(!modified2, "second application must be a no-op");
+    assert_eq!(assertions, after_first);
+}
+
+#[test]
+fn test_join_when_both_sides_are_extracts() {
+    // Real-input shape: `(= (extract hi lo R) (extract hi' lo' x))`
+    // with `R` a compound (non-variable) term on the LEFT. The
+    // matcher must still take the variable side as the definition
+    // being joined (Mulh_u32.0005 byte definitions).
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(16));
+    let r = terms.mk_var("r", Sort::bitvec(16));
+    let c = terms.mk_bitvec(BigInt::from(5), 16);
+    let r_plus = terms.mk_bvadd(vec![r, c]);
+    let x_hi = terms.mk_bvextract(15, 8, x);
+    let x_lo = terms.mk_bvextract(7, 0, x);
+    let rp_hi = terms.mk_bvextract(15, 8, r_plus);
+    let rp_lo = terms.mk_bvextract(7, 0, r_plus);
+    // Compound extract on the LEFT, variable extract on the RIGHT.
+    let eq_hi = terms.mk_eq(rp_hi, x_hi);
+    let eq_lo = terms.mk_eq(rp_lo, x_lo);
+
+    let mut assertions = vec![eq_hi, eq_lo];
+    let mut pass = NormalizeEqBvConcat::new();
+    assert!(pass.apply(&mut terms, &mut assertions));
+    let word = terms.mk_bvconcat(vec![rp_hi, rp_lo]);
+    let word_eq = terms.mk_eq(x, word);
+    assert!(
+        assertions.contains(&word_eq),
+        "joined word equality must be added for both-extracts shapes"
+    );
+}
+
+#[test]
+fn test_no_join_for_partial_or_cyclic_slices() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(16));
+    let lo = terms.mk_var("lo", Sort::bitvec(8));
+    let x_lo = terms.mk_bvextract(7, 0, x);
+    // Only the low byte defined: not a partition, no join.
+    let eq_lo = terms.mk_eq(x_lo, lo);
+    let mut assertions = vec![eq_lo];
+    let mut pass = NormalizeEqBvConcat::new();
+    assert!(!pass.apply(&mut terms, &mut assertions));
+    assert_eq!(assertions, vec![eq_lo]);
+
+    // Cyclic: high byte defined from x itself — no join (the word
+    // equality would not be a usable definition for substitution).
+    let x_hi = terms.mk_bvextract(15, 8, x);
+    let x_mid = terms.mk_bvextract(11, 4, x);
+    let eq_hi_cyclic = terms.mk_eq(x_hi, x_mid);
+    let mut assertions = vec![eq_hi_cyclic, eq_lo];
+    let mut pass = NormalizeEqBvConcat::new();
+    let modified = pass.apply(&mut terms, &mut assertions);
+    assert!(
+        !modified,
+        "cyclic slice definitions must not join, got {assertions:?}"
+    );
+}
+
+#[test]
 fn test_no_normalize_negated_equality() {
     let mut terms = TermStore::new();
 

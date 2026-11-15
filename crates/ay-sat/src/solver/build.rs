@@ -4,6 +4,7 @@
 
 //! Solver constructors: `new`, `with_proof`, `with_proof_output`, `build`.
 
+use super::construction::{Construction, Ordinary};
 use super::*;
 
 impl Solver {
@@ -39,7 +40,7 @@ impl Solver {
     ///
     /// The hint is advisory: the arena grows normally if it turns out low.
     pub fn with_clause_hint(num_vars: usize, num_clauses: usize) -> Self {
-        Self::build_with_hint(num_vars, None, Some(num_clauses))
+        Self::build_uncounted(num_vars, None, Some(num_clauses))
     }
 
     /// Reserve clause-arena room for a CNF of known shape.
@@ -59,18 +60,44 @@ impl Solver {
     /// capacity stores nothing and changes no search state.
     pub fn reserve_clause_capacity(&mut self, num_clauses: usize, num_literals: usize) {
         self.arena.reserve_clauses(num_clauses, num_literals);
+        self.cold.original_ledger.reserve(num_clauses, num_literals);
     }
 
     /// Shared constructor: all Solver initialization in one place.
     fn build(num_vars: usize, proof_output: Option<ProofOutput>) -> Self {
-        Self::build_with_hint(num_vars, proof_output, None)
+        Self::build_uncounted(num_vars, proof_output, None)
     }
 
-    fn build_with_hint(
+    fn build_uncounted(
         num_vars: usize,
         proof_output: Option<ProofOutput>,
         clause_hint: Option<usize>,
     ) -> Self {
+        match Self::build_with_hint(num_vars, proof_output, clause_hint, &Ordinary) {
+            Ok(solver) => solver,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn build_with_hint<A: Construction>(
+        num_vars: usize,
+        proof_output: Option<ProofOutput>,
+        clause_hint: Option<usize>,
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        a.unsupported(
+            num_vars > (1usize << 30),
+            "SAT namespace exceeds packed watch bound",
+        )?;
+        a.unsupported(
+            proof_output.is_some(),
+            "counted proof writer construction not admitted",
+        )?;
+        a.unsupported(
+            ay_core::misc_cli_flags().sat_mem_probe,
+            "counted memory diagnostic construction not admitted",
+        )?;
         let has_proof = proof_output.is_some();
         let lrat_enabled = proof_output.as_ref().is_some_and(ProofOutput::is_lrat);
         // Removed 100k cap for BV performance (#757) - BV CNF has ~3-5 clauses/var
@@ -134,33 +161,52 @@ impl Solver {
         let mut solver = Self {
             num_vars,
             user_num_vars: num_vars,
-            arena: ClauseArena::with_capacity(clauses_capacity, literals_capacity),
+            arena: a.choose(
+                || ClauseArena::with_capacity(clauses_capacity, literals_capacity),
+                |owner| {
+                    ClauseArena::try_with_capacity_counted(
+                        clauses_capacity,
+                        literals_capacity,
+                        owner,
+                    )
+                },
+            )?,
 
-            watches: WatchedLists::new(num_vars),
+            watches: a.choose(
+                || WatchedLists::new(num_vars),
+                |owner| WatchedLists::try_new_counted(num_vars, owner),
+            )?,
             watches_disconnected: false,
             defer_stale_reason_cleanup: false,
+            defer_binary_unlink: false,
             defer_proof_deletions: false,
             deferred_proof_deletions: Vec::new(),
             earliest_affected_trail_pos: None,
             stale_reasons: Vec::new(),
-            vsids: VSIDS::new(num_vars),
-            conflict: ConflictAnalyzer::new(num_vars),
-            vals: vec![0i8; num_vars * 2],
-            var_data: vec![VarData::UNASSIGNED; num_vars],
+            vsids: a.choose(
+                || VSIDS::new(num_vars),
+                |owner| VSIDS::try_new_counted(num_vars, owner),
+            )?,
+            conflict: a.choose(
+                || ConflictAnalyzer::new(num_vars),
+                |owner| ConflictAnalyzer::try_new_counted(num_vars, owner),
+            )?,
+            vals: a.filled(num_vars * 2, 0i8)?,
+            var_data: a.filled(num_vars, VarData::UNASSIGNED)?,
             // Always allocate unit_proof_id unconditionally (#8069: Phase 2a).
             // Clause IDs are always tracked for deferred backward proof
             // reconstruction, so unit proof IDs must also always be available.
-            unit_proof_id: vec![0; num_vars],
-            unit_proof_sign: vec![0; num_vars],
+            unit_proof_id: a.filled(num_vars, 0)?,
+            unit_proof_sign: a.filled(num_vars, 0)?,
             pending_theory_unit_proof_ids: Vec::new(),
             // Grown on demand, never pre-sized. This used to be
-            // `vec![0; clauses_capacity * HEADER_WORDS + literals_capacity]`,
+            // `a.filled(clauses_capacity * HEADER_WORDS + literals_capacity, 0)?`,
             // and since both capacities are derived from `num_vars` alone
             // (`num_vars * 4` clauses, `* 3` literals each) rather than from the
             // formula's actual size, it committed `num_vars * 24` ZEROED bytes
             // before a single clause was read: 647 MB on a 6.7 M-variable
             // SAT-COMP 2026 instance whose real arena is 380 MB, and it is
-            // resident immediately because `vec![0; n]` writes.
+            // resident immediately because `a.filled(n, 0)?` writes.
             //
             // Nothing needed it eagerly. Every access site already handles a
             // short vector: `mark_reason_clause` falls into
@@ -175,9 +221,9 @@ impl Solver {
             trail_lim: Vec::new(),
             decision_level: 0,
             qhead: 0,
-            phase: vec![0i8; num_vars],
-            target_phase: vec![0i8; num_vars],
-            best_phase: vec![0i8; num_vars],
+            phase: a.filled(num_vars, 0i8)?,
+            target_phase: a.filled(num_vars, 0i8)?,
+            best_phase: a.filled(num_vars, 0i8)?,
             target_trail_len: 0,
             best_trail_len: 0,
             no_conflict_until: 0,
@@ -195,19 +241,20 @@ impl Solver {
             num_original_clauses: 0,
             chrono_enabled: true,
             two_stage_clause_management: false,
+            two_stage_warm: ay_core::sat_ab_switches().two_stage_warm_scores_kissat == Some(true),
             // Ghost literal guard is only needed when chrono-BT can actually fire.
             // Chrono-BT fires when decision_level - jump_level > CHRONO_LEVEL_LIMIT.
             // This requires decision_level > CHRONO_LEVEL_LIMIT, which requires
             // num_vars > CHRONO_LEVEL_LIMIT (#8466).
             ghost_guard_needed: num_vars > CHRONO_LEVEL_LIMIT as usize,
-            lambda: vec![None; num_vars],
+            lambda: a.filled(num_vars, None)?,
             chrono_reuse_trail: true, // CaDiCaL-style trail reuse (re-enabled #112)
             stats: solver_stats::SolverStats::new(),
             num_decisions: 0,
             bump_order_sort_buf: Vec::new(),
-            backbone_seen: vec![false; num_vars],
-            vivify_analyzed: vec![false; num_vars],
-            vivify_analyzed_to_clear: Vec::with_capacity(64),
+            backbone_seen: a.filled(num_vars, false)?,
+            vivify_analyzed: a.filled(num_vars, false)?,
+            vivify_analyzed_to_clear: a.reserved(64)?,
             num_propagations: 0,
             num_search_propagations: 0,
             pending_garbage_count: 0,
@@ -222,11 +269,14 @@ impl Solver {
                 None
             },
             preprocessing_quick_mode: true,
-            inproc: inproc_engines::InprocessingEngines::new(num_vars),
-            subsume_dirty: vec![true; num_vars], // all dirty initially so first round processes everything
-            l0_gc_dirty: vec![false; num_vars],  // no fixed variables yet
-            dirty_watches: vec![false; num_vars * 2], // no stale entries initially
-            dirty_watch_list: Vec::new(),        // no dirty entries initially
+            inproc: a.choose(
+                || inproc_engines::InprocessingEngines::new(num_vars),
+                |owner| inproc_engines::InprocessingEngines::try_new_counted(num_vars, owner),
+            )?,
+            subsume_dirty: a.filled(num_vars, true)?, // all dirty initially so first round processes everything
+            l0_gc_dirty: a.filled(num_vars, false)?,  // no fixed variables yet
+            dirty_watches: a.filled(num_vars * 2, false)?, // no stale entries initially
+            dirty_watch_list: Vec::new(),             // no dirty entries initially
             gc_occ: None,
             gc_occ_scratch: None,
             probing_mode: false,
@@ -236,21 +286,24 @@ impl Solver {
             inprocessing_yield_productivity_rescue_enabled: false,
             inprocessing_yield_rescue_backbone_cooldown_enabled: false,
             bounded_backbone_zero_decompose_backoff_enabled: false,
-            hbr_lits: Vec::with_capacity(32),
-            probe_parent: vec![None; num_vars],
+            hbr_lits: a.reserved(32)?,
+            probe_parent: a.filled(num_vars, None)?,
             deferred_watch_list: WatchList::new(),
             deferred_replacement_watches: Vec::new(),
             fixed_count: 0,
-            var_lifecycle: lifecycle::VarLifecycle::new(num_vars),
-            lit_marks: LitMarks::new(num_vars),
+            var_lifecycle: lifecycle::VarLifecycle::build_admitted(num_vars, a)?,
+            lit_marks: a.choose(
+                || LitMarks::new(num_vars),
+                |owner| LitMarks::try_new_counted(num_vars, owner),
+            )?,
             last_conflict_clause_ref: None,
             last_conflict_clause_id: 0,
             has_empty_clause: false,
             // Glue recomputation stamp table
-            glue_stamp: vec![0u32; num_vars + 1], // indexed by decision level (0..=max_level)
+            glue_stamp: a.filled(num_vars + 1, 0u32)?, // indexed by decision level (0..=max_level)
             glue_stamp_counter: 0u32,
             // Block-level shrinking stamp table
-            shrink_stamp: vec![0u32; num_vars],
+            shrink_stamp: a.filled(num_vars, 0u32)?,
             shrink_stamp_counter: 0,
             shrink_enabled: true,
             reap: reap::Reap::new(),
@@ -258,14 +311,23 @@ impl Solver {
             ws_shrink_result: Vec::new(),
             ws_shrink_block_lits: Vec::new(),
             ws_shrink_chain: Vec::new(),
-            tiers: tier_state::TierState::new(),
-            min: minimization_state::MinimizationState::new(num_vars),
-            phase_init: phase_init_state::PhaseInitState::new(num_vars),
-            cold: Box::new(cold::ColdState::new(
+            tiers: tier_state::TierState {
+                kissat_rule: ay_core::sat_ab_switches().reduce_kissat_tiers == Some(true),
+                ..a.choose(
+                    || tier_state::TierState::new(),
+                    |owner| {
+                        tier_state::TierState::build_admitted(&super::construction::Counted(owner))
+                    },
+                )?
+            },
+            min: minimization_state::MinimizationState::build_admitted(num_vars, a)?,
+            phase_init: phase_init_state::PhaseInitState::build_admitted(num_vars, a)?,
+            cold: a.boxed(cold::ColdState::new(
                 num_vars,
                 clauses_capacity,
                 lrat_enabled,
-            )),
+                a,
+            )?)?,
             provenance: crate::clause_provenance::ProvenanceTracker::new(),
             dip: dip::DipManager::new(),
             active_domain: None,
@@ -286,7 +348,12 @@ impl Solver {
             #[cfg(feature = "jit")]
             jit_conflict_processor: None,
             #[cfg(feature = "jit")]
-            jit_conflict_output: ay_jit::conflict_jit::ConflictProcessorOutput::new(num_vars),
+            jit_conflict_output: a.choose(
+                || ay_jit::conflict_jit::ConflictProcessorOutput::new(num_vars),
+                |owner| {
+                    ay_jit::conflict_jit::ConflictProcessorOutput::try_new_counted(num_vars, owner)
+                },
+            )?,
         };
 
         // Debug builds: full checking (every derived clause RUP-verified, #4564).
@@ -299,6 +366,6 @@ impl Solver {
             }
         }
 
-        solver
+        Ok(solver)
     }
 }

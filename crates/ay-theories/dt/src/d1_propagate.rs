@@ -563,7 +563,7 @@ impl DtLazyPropagator {
             // A non-syntactic merge the proof forest cannot justify: never
             // emit an unconditional clause from this pass.
             tracing::warn!("dt-d1: empty explanation for e-graph merge; propagation dropped");
-            self.rederive_failures += 1;
+            self.rederive_failures = self.rederive_failures.saturating_add(1);
             return None;
         }
         // Independent re-derivation: exactly the reason literals on a fresh
@@ -585,10 +585,12 @@ impl DtLazyPropagator {
                 lit_count = reason.len(),
                 "dt-d1: explanation failed independent fresh-EUF re-derivation; dropped"
             );
-            self.rederive_failures += 1;
+            self.rederive_failures = self.rederive_failures.saturating_add(1);
             return None;
         }
-        let mut clause: Vec<TheoryLit> = Vec::with_capacity(reason.len() + 2);
+        let mut clause: Vec<TheoryLit> = Vec::new();
+        // Capacity is only a hint: if the reservation fails, `push` grows it.
+        let _ = clause.try_reserve_exact(reason.len().saturating_add(2));
         if let Some(extra) = extra_neg {
             clause.push(extra);
         }

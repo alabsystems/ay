@@ -172,6 +172,154 @@ impl Executor {
         changed
     }
 
+    /// (#proof-capability) The proof-carrying subset of
+    /// [`Self::rewrite_dense_bv_array_initializer_selects`], computed as a
+    /// WINDOW rather than written to the root assertion vector: ONLY the
+    /// exact cell fold `(select A k) -> v` licensed by a top-level defining
+    /// fact `(= (select A k) v)` (either spelling; `k` and `v` bit-vector
+    /// constants), and only for a cell every such fact agrees on.
+    ///
+    /// The full pass is gated off under proof production for two reasons
+    /// this method respects. Its interval, predicate and masked-concat
+    /// rewrites have no derivation the proof replay could re-check, so only
+    /// the exact fold is taken — the shape the `PropagateValues` provenance
+    /// channel already carries (an entry `expr ↦ value` licensed by an
+    /// asserted defining equality, plus one `before -> after` record per
+    /// rewritten assertion), returned here for the caller to merge through
+    /// [`Executor::merge_propagation_records`] like the harness's own
+    /// substitution rewrites. And a rewrite of the ROOT vector would make the
+    /// checked SAT refutation's frozen roots differ from the exact public
+    /// query roots (measured: `unknown (incomplete self-check-rejected)` on a
+    /// quantifier-free reduction), so the fold is handed back as a window
+    /// for one theory lane to install and restore, exactly as that lane
+    /// already scopes its bridge assertions. The defining facts themselves
+    /// are left untouched (they stay the replay's premises); only OTHER
+    /// assertions mentioning the cell are rewritten.
+    ///
+    /// Why it exists: under proof production the deductive-checks set-fold ground
+    /// core (`C_sets/87167-00066`, its 6-assertion reduction) reached the
+    /// BV/LIA bridge lane with `(bvadd (select state 0) (select ordering 0))`
+    /// still in place; the bridge's `bv2nat` decomposition of that sum ties
+    /// both arrays into the arithmetic lane, whose candidate model the strict
+    /// gate refuses (`arrays-read-conflict-uneval`), and the query was left
+    /// `unknown (incomplete)` where the no-proof run — whose full dense pass
+    /// folds `(select state 0)` to `#x0` and the sum to a single read — answers
+    /// `unsat` (z3: `unsat`). Same fold, now with the provenance the proof
+    /// lane demands and without touching the authored roots.
+    ///
+    /// Sound: each rewrite replaces a term by one an asserted top-level
+    /// equality makes equal to it, in a conjunction that keeps that equality.
+    /// `None` when nothing folds.
+    pub(in crate::executor) fn pinned_bv_array_read_fold_window(
+        &mut self,
+    ) -> Option<(Vec<TermId>, crate::preprocess::PropagationRecords)> {
+        if !crate::quant_unit_authority::quant_unit_authority_enabled() {
+            return None;
+        }
+        let mut subst: HashMap<TermId, TermId> = HashMap::default();
+        let mut sources: HashMap<TermId, TermId> = HashMap::default();
+        let mut conflicted: HashSet<TermId> = HashSet::default();
+        let mut facts: HashSet<TermId> = HashSet::default();
+        for &assertion in &self.ctx.assertions {
+            let Some((array, index, value)) = self.select_const_bv_equality(assertion) else {
+                continue;
+            };
+            if !matches!(
+                self.ctx.terms.get(value),
+                TermData::Const(Constant::BitVec { .. })
+            ) {
+                continue;
+            }
+            let Some(select) = self.pinned_select_term(assertion, array, index) else {
+                continue;
+            };
+            match subst.insert(select, value) {
+                Some(existing) if existing != value => {
+                    conflicted.insert(select);
+                }
+                _ => {}
+            }
+            sources.entry(select).or_insert(assertion);
+            facts.insert(assertion);
+        }
+        for select in &conflicted {
+            subst.remove(select);
+            sources.remove(select);
+        }
+        if subst.is_empty() {
+            return None;
+        }
+
+        let mut pv = crate::preprocess::PropagateValues::new();
+        pv.seed_substitution(&subst);
+        let mut rewrites: Vec<crate::preprocess::PropagatedRewriteRecord> = Vec::new();
+        let mut window = Vec::with_capacity(self.ctx.assertions.len());
+        for i in 0..self.ctx.assertions.len() {
+            let before = self.ctx.assertions[i];
+            if facts.contains(&before) {
+                window.push(before);
+                continue;
+            }
+            let after = pv.rewrite_seeded(&mut self.ctx.terms, before);
+            if after != before {
+                rewrites.push(crate::preprocess::PropagatedRewriteRecord {
+                    before,
+                    after,
+                    stamp: 1,
+                });
+            }
+            window.push(after);
+        }
+        if rewrites.is_empty() {
+            return None;
+        }
+        let entries: Vec<crate::preprocess::PropagatedEntrySource> = subst
+            .iter()
+            .filter_map(|(&expr, &value)| {
+                let source_assertion = *sources.get(&expr)?;
+                Some(crate::preprocess::PropagatedEntrySource {
+                    expr,
+                    value,
+                    source_assertion,
+                    stamp: 1,
+                })
+            })
+            .collect();
+        self.last_statistics.set_int(
+            "smt.abv.finite_array.pinned_read_proof_rewrites",
+            rewrites.len() as u64,
+        );
+        Some((
+            window,
+            crate::preprocess::PropagationRecords {
+                rewrites,
+                entries,
+                ..crate::preprocess::PropagationRecords::default()
+            },
+        ))
+    }
+
+    /// The `(select array index)` side of a defining fact, as the term the
+    /// fact actually mentions (never a rebuilt one, so the recorded entry's
+    /// `expr` is the exact subterm the rewrite replaces).
+    fn pinned_select_term(
+        &self,
+        assertion: TermId,
+        array: TermId,
+        index: TermId,
+    ) -> Option<TermId> {
+        let TermData::App(_, args) = self.ctx.terms.get(assertion) else {
+            return None;
+        };
+        args.iter().copied().find(|&side| {
+            matches!(
+                self.ctx.terms.get(side),
+                TermData::App(sym, sargs)
+                    if sym.name() == "select" && sargs.len() == 2 && sargs[0] == array && sargs[1] == index
+            )
+        })
+    }
+
     fn collect_dense_bv_array_intervals(
         &self,
     ) -> (
@@ -1096,7 +1244,14 @@ fn bv_range(
         | TermData::Let(_, _)
         | TermData::Forall(_, _, _)
         | TermData::Exists(_, _, _) => None,
-        other => unreachable!("unhandled TermData variant in dense array range: {other:?}"),
+        // Any other shape has no bit-vector range, and every caller reads
+        // `None` as "decline the dense rewrite". The index of a select reached
+        // here need not be a bit-vector: fresh nestfin_2909_0018 --z3-mode
+        // (`(select (store m0 true b0) false)` on an `(Array Bool (Array (_
+        // BitVec 2) (_ BitVec 2)))`) handed the Bool constant `false` to this
+        // match, whose last arm was `unreachable!` -- a panic, then `unknown`
+        // where z3 5.1.0 and the default posture answer `unsat`.
+        _ => None,
     });
 
     cache.insert(term, range);
@@ -1239,8 +1394,10 @@ fn bv_range_concat(
         if width > 128 {
             return None;
         }
-        lower = (lower << range.width) | range.lower;
-        upper = (upper << range.width) | range.upper;
+        // A 128-bit first operand shifts the empty prefix by 128, which
+        // `<<` rejects (overflow checks are on in release); the prefix is 0.
+        lower = lower.checked_shl(range.width).unwrap_or(0) | range.lower;
+        upper = upper.checked_shl(range.width).unwrap_or(0) | range.upper;
     }
 
     Some(BvRange {
@@ -1257,24 +1414,47 @@ fn bv_range_extract(
     low: u32,
     cache: &mut HashMap<TermId, Option<BvRange>>,
 ) -> Option<BvRange> {
+    let inner = bv_range(terms, arg, cache)?;
+    extract_range(inner, high, low)
+}
+
+/// The range of `extract[high:low](v)` for every `v` in `inner`.
+fn extract_range(inner: BvRange, high: u32, low: u32) -> Option<BvRange> {
     if high < low {
         return None;
     }
     let width = high - low + 1;
     let mask = bv_mask_u128(width)?;
-    let inner = bv_range(terms, arg, cache)?;
-    let inner_mask = bv_mask_u128(inner.width)?;
-    let low_mask = if low == 0 { 0 } else { (1u128 << low) - 1 };
-    let lower = if inner.upper <= inner_mask && inner.lower & low_mask == 0 {
-        (inner.lower >> low).min(mask)
-    } else {
-        0
-    };
-    let upper = (inner.upper >> low).min(mask);
+    if high >= inner.width || inner.lower > inner.upper {
+        return full_bv_range_of_width(width);
+    }
+    // `extract[high:low](v) = (v >> low) mod 2^width`. The shift is monotone,
+    // so `v >> low` ranges over `[lower >> low, upper >> low]`, and the
+    // reduction mod 2^width keeps that order only while both ends lie in one
+    // period of 2^width (`lower >> (high+1) == upper >> (high+1)`); across a
+    // period boundary the image wraps and is taken as the whole width. The
+    // reduction is `& mask`, not a clamp: `extract[7:0]` of `[256, 300]` is
+    // `[0, 44]`, where `min(v >> low, mask)` claimed `[255, 255]` and the
+    // dense-table rewrite then read one cell for a read that can touch 45.
+    let shifted_lower = inner.lower.checked_shr(low).unwrap_or(0);
+    let shifted_upper = inner.upper.checked_shr(low).unwrap_or(0);
+    if shifted_lower.checked_shr(width).unwrap_or(0)
+        != shifted_upper.checked_shr(width).unwrap_or(0)
+    {
+        return full_bv_range_of_width(width);
+    }
     Some(BvRange {
         width,
-        lower,
-        upper,
+        lower: shifted_lower & mask,
+        upper: shifted_upper & mask,
+    })
+}
+
+fn full_bv_range_of_width(width: u32) -> Option<BvRange> {
+    Some(BvRange {
+        width,
+        lower: 0,
+        upper: bv_mask_u128(width)?,
     })
 }
 
@@ -1394,6 +1574,80 @@ fn bv_mask_u128(width: u32) -> Option<u128> {
 mod tests {
     use super::*;
 
+    /// #proof-capability: the windowed pinned-read fold replaces
+    /// `(select a 0)` inside the sum by its pinned `#x00` and folds the sum,
+    /// hands back one rewrite record licensed by the pin, keeps the pin
+    /// itself verbatim, and never touches the root assertion vector.
+    #[test]
+    fn pinned_read_fold_window_folds_the_sum_and_keeps_the_roots() {
+        let mut exec = Executor::new();
+        let index_sort = Sort::bitvec(8);
+        let value_sort = Sort::bitvec(8);
+        let array_sort = Sort::array(index_sort.clone(), value_sort.clone());
+        let a = exec.ctx.terms.mk_var("a", array_sort);
+        let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0u8), 8);
+        let one = exec.ctx.terms.mk_bitvec(BigInt::from(1u8), 8);
+        let nine = exec.ctx.terms.mk_bitvec(BigInt::from(9u8), 8);
+        let a0 = exec.ctx.terms.mk_select(a, zero);
+        let a1 = exec.ctx.terms.mk_select(a, one);
+        // The pin, spelled value-first as deductive-checks spells it.
+        let pin = exec.ctx.terms.mk_eq(zero, a0);
+        let sum = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("bvadd"), vec![a0, nine], value_sort);
+        let step = exec.ctx.terms.mk_eq(sum, a1);
+        exec.ctx.assertions.push(pin);
+        exec.ctx.assertions.push(step);
+        let roots = exec.ctx.assertions.clone();
+
+        let (window, records) = exec
+            .pinned_bv_array_read_fold_window()
+            .expect("the pinned read folds");
+        assert_eq!(exec.ctx.assertions, roots, "the roots must not move");
+        assert_eq!(window.len(), 2);
+        assert_eq!(window[0], pin, "the defining fact stays verbatim");
+        let expected = exec.ctx.terms.mk_eq(nine, a1);
+        assert_eq!(
+            window[1], expected,
+            "`#x00 + #x09` folds to the pinned value"
+        );
+        assert_eq!(records.rewrites.len(), 1);
+        assert_eq!(records.rewrites[0].before, step);
+        assert_eq!(records.rewrites[0].after, expected);
+        assert_eq!(records.entries.len(), 1);
+        assert_eq!(records.entries[0].expr, a0);
+        assert_eq!(records.entries[0].value, zero);
+        assert_eq!(records.entries[0].source_assertion, pin);
+    }
+
+    /// Two facts disagreeing on one cell license nothing: the window is
+    /// declined rather than built from either value.
+    #[test]
+    fn pinned_read_fold_window_declines_a_conflicted_cell() {
+        let mut exec = Executor::new();
+        let index_sort = Sort::bitvec(8);
+        let value_sort = Sort::bitvec(8);
+        let array_sort = Sort::array(index_sort.clone(), value_sort.clone());
+        let a = exec.ctx.terms.mk_var("a", array_sort);
+        let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0u8), 8);
+        let one = exec.ctx.terms.mk_bitvec(BigInt::from(1u8), 8);
+        let nine = exec.ctx.terms.mk_bitvec(BigInt::from(9u8), 8);
+        let a0 = exec.ctx.terms.mk_select(a, zero);
+        let a1 = exec.ctx.terms.mk_select(a, one);
+        let pin_zero = exec.ctx.terms.mk_eq(a0, zero);
+        let pin_one = exec.ctx.terms.mk_eq(a0, one);
+        let sum = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("bvadd"), vec![a0, nine], value_sort);
+        let step = exec.ctx.terms.mk_eq(sum, a1);
+        exec.ctx.assertions.push(pin_zero);
+        exec.ctx.assertions.push(pin_one);
+        exec.ctx.assertions.push(step);
+        assert!(exec.pinned_bv_array_read_fold_window().is_none());
+    }
+
     #[test]
     fn sparse_predicate_same_index_symbolic_store_value_fails_closed_11924() {
         let mut exec = Executor::new();
@@ -1469,5 +1723,544 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+    }
+
+    // ---- D9 (2026-09-23 hunt): `bv_range_extract` ignored the wrap ----
+    //
+    // The syntactic index range feeds three rewrites that each replace a
+    // read by what the table holds on EVERY index of the range: the value
+    // rewrite, the predicate enumeration, and store peeling through
+    // `bv_ranges_provably_disjoint`. A range that misses a reachable index
+    // therefore proves a false equality. `extract[7:0]` of an index in
+    // `[256, 511]` was given the range `[255, 255]` (a clamp, not the
+    // reduction mod 2^8), so a read of every low byte was folded against the
+    // single cell `T[255]`. The generators below check the range lattice
+    // against the operators' definitions, not against the implementation.
+
+    /// xorshift64: deterministic, so a failure replays from its case number.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn range_u32(&mut self, lo: u32, hi: u32) -> u32 {
+            lo + self.below(u64::from(hi - lo) + 1) as u32
+        }
+
+        fn range_u128(&mut self, lo: u128, hi: u128) -> u128 {
+            let raw = (u128::from(self.next()) << 64) | u128::from(self.next());
+            match (hi - lo).checked_add(1) {
+                Some(span) => lo + raw % span,
+                None => raw,
+            }
+        }
+    }
+
+    fn mask_of(width: u32) -> u128 {
+        bv_mask_u128(width).expect("test widths are 1..=128")
+    }
+
+    /// Exhaustive over every interval of every inner width up to 6 bits and
+    /// every `extract[high:low]`: the range contains each extracted value, and
+    /// is exactly their hull when the interval does not cross a period of
+    /// `2^(high+1)`.
+    #[test]
+    fn extract_range_contains_every_extracted_value_exhaustive_d9() {
+        for inner_width in 1..=6u32 {
+            let top = mask_of(inner_width);
+            for lower in 0..=top {
+                for upper in lower..=top {
+                    let inner = BvRange {
+                        width: inner_width,
+                        lower,
+                        upper,
+                    };
+                    for high in 0..inner_width {
+                        for low in 0..=high {
+                            let got = extract_range(inner, high, low)
+                                .expect("a well-formed extract has a range");
+                            assert_eq!(got.width, high - low + 1);
+                            let mask = mask_of(got.width);
+                            let (mut min, mut max) = (u128::MAX, 0u128);
+                            for v in lower..=upper {
+                                let e = (v >> low) & mask;
+                                assert!(
+                                    got.lower <= e && e <= got.upper,
+                                    "extract[{high}:{low}] of {v} in [{lower}, {upper}] \
+                                     (width {inner_width}) is {e}, outside the claimed \
+                                     [{}, {}]",
+                                    got.lower,
+                                    got.upper
+                                );
+                                min = min.min(e);
+                                max = max.max(e);
+                            }
+                            if lower >> (high + 1) == upper >> (high + 1) {
+                                assert_eq!(
+                                    (got.lower, got.upper),
+                                    (min, max),
+                                    "extract[{high}:{low}] of [{lower}, {upper}] stays in one \
+                                     period, so its range is exact"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The witness shapes themselves: `extract[7:0]` of `[256, 511]` is every
+    /// byte, of `[300, 363]` (`(bvadd (bvand y #x3f) #x12c)`) it is
+    /// `[44, 107]`, and of `[250, 260]` (a real wrap) it is every byte —
+    /// never `[255, 255]`.
+    #[test]
+    fn extract_range_of_the_hunt_witness_intervals_d9() {
+        let range = |lower, upper| {
+            let got = extract_range(
+                BvRange {
+                    width: 16,
+                    lower,
+                    upper,
+                },
+                7,
+                0,
+            )
+            .expect("a well-formed extract");
+            (got.width, got.lower, got.upper)
+        };
+        assert_eq!(range(256, 511), (8, 0, 255));
+        assert_eq!(range(300, 363), (8, 44, 107));
+        assert_eq!(range(250, 260), (8, 0, 255));
+    }
+
+    /// Random intervals over every inner width up to 128 bits, half of them
+    /// straddling a multiple of `2^(high+1)` (the wrap). Each interval is
+    /// probed at its ends, next to every period boundary it crosses (up to
+    /// eight), and at random interior points.
+    #[test]
+    fn extract_range_contains_wrapping_intervals_up_to_128_bits_d9() {
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        for case in 0..20_000u32 {
+            let inner_width = rng.range_u32(1, 128);
+            let high = rng.range_u32(0, inner_width - 1);
+            let low = rng.range_u32(0, high);
+            let top = mask_of(inner_width);
+            let period_bits = high + 1;
+            let (lower, upper) = if period_bits < inner_width && rng.below(2) == 0 {
+                // Straddle a period boundary of the extract.
+                let boundary = rng.range_u128(1, top >> period_bits) << period_bits;
+                let below = rng.range_u128(1, 1u128 << period_bits.min(20));
+                let above = rng.range_u128(0, 1u128 << period_bits.min(20));
+                (
+                    boundary.saturating_sub(below),
+                    boundary.saturating_add(above).min(top),
+                )
+            } else {
+                let a = rng.range_u128(0, top);
+                let b = rng.range_u128(0, top);
+                (a.min(b), a.max(b))
+            };
+            let inner = BvRange {
+                width: inner_width,
+                lower,
+                upper,
+            };
+            let got = extract_range(inner, high, low).expect("a well-formed extract");
+            let mask = mask_of(got.width);
+            let mut probes = vec![lower, upper, lower.saturating_add(1).min(upper)];
+            probes.push(upper.saturating_sub(1).max(lower));
+            if period_bits < 128 {
+                let step = 1u128 << period_bits;
+                let mut boundary = ((lower >> period_bits) + 1).checked_mul(step);
+                for _ in 0..8 {
+                    let Some(at) = boundary.filter(|&at| at <= upper) else {
+                        break;
+                    };
+                    probes.push(at - 1);
+                    probes.push(at);
+                    boundary = at.checked_add(step);
+                }
+            }
+            for _ in 0..8 {
+                probes.push(rng.range_u128(lower, upper));
+            }
+            for v in probes {
+                let e = (v >> low) & mask;
+                assert!(
+                    got.lower <= e && e <= got.upper,
+                    "case {case}: extract[{high}:{low}] of {v} in [{lower}, {upper}] (width \
+                     {inner_width}) is {e}, outside the claimed [{}, {}]",
+                    got.lower,
+                    got.upper
+                );
+            }
+        }
+    }
+
+    fn eval_index_term(terms: &TermStore, term: TermId, y: TermId, y_value: u128) -> Option<u128> {
+        let width = bv_width(terms, term)?;
+        let mask = mask_of(width);
+        let value = match terms.get(term).clone() {
+            TermData::Const(Constant::BitVec { value, .. }) => value.to_u128()?,
+            TermData::Var(_, _) if term == y => y_value,
+            TermData::Ite(cond, then_term, else_term) => {
+                if eval_index_condition(terms, cond, y, y_value)? {
+                    eval_index_term(terms, then_term, y, y_value)?
+                } else {
+                    eval_index_term(terms, else_term, y, y_value)?
+                }
+            }
+            TermData::App(sym, args) => {
+                let indices = match &sym {
+                    Symbol::Indexed(_, indices) => indices.clone(),
+                    _ => Vec::new(),
+                };
+                let name = sym.name();
+                if name == "ite" && args.len() == 3 {
+                    return if eval_index_condition(terms, args[0], y, y_value)? {
+                        eval_index_term(terms, args[1], y, y_value)
+                    } else {
+                        eval_index_term(terms, args[2], y, y_value)
+                    };
+                }
+                let values: Option<Vec<u128>> = args
+                    .iter()
+                    .map(|&arg| eval_index_term(terms, arg, y, y_value))
+                    .collect();
+                let values = values?;
+                match (name, values.as_slice()) {
+                    ("bvadd", vs) => vs.iter().fold(0u128, |a, &v| a.wrapping_add(v)),
+                    ("bvsub", [a, b]) => a.wrapping_sub(*b),
+                    ("bvmul", vs) => vs.iter().fold(1u128, |a, &v| a.wrapping_mul(v)),
+                    ("bvand", vs) => vs.iter().fold(mask, |a, &v| a & v),
+                    ("bvor", vs) => vs.iter().fold(0, |a, &v| a | v),
+                    ("bvxor", vs) => vs.iter().fold(0, |a, &v| a ^ v),
+                    ("bvnot", [a]) => !a,
+                    ("bvneg", [a]) => a.wrapping_neg(),
+                    ("bvshl", [a, b]) if *b < u128::from(width) => a << b,
+                    ("bvshl", [_, _]) => 0,
+                    ("bvlshr", [a, b]) if *b < u128::from(width) => a >> b,
+                    ("bvlshr", [_, _]) => 0,
+                    ("concat", vs) => {
+                        let mut acc = 0u128;
+                        for (&arg, &v) in args.iter().zip(vs) {
+                            acc = (acc << bv_width(terms, arg)?) | v;
+                        }
+                        acc
+                    }
+                    ("extract", [a]) if indices.len() == 2 => a >> indices[1],
+                    ("zero_extend", [a]) => *a,
+                    ("sign_extend", [a]) => {
+                        let inner = bv_width(terms, args[0])?;
+                        if (a >> (inner - 1)) & 1 == 1 {
+                            a | !mask_of(inner)
+                        } else {
+                            *a
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        Some(value & mask)
+    }
+
+    fn eval_index_condition(
+        terms: &TermStore,
+        cond: TermId,
+        y: TermId,
+        y_value: u128,
+    ) -> Option<bool> {
+        match terms.get(cond).clone() {
+            TermData::Const(Constant::Bool(value)) => Some(value),
+            TermData::Not(inner) => Some(!eval_index_condition(terms, inner, y, y_value)?),
+            TermData::App(sym, args) if args.len() == 2 => {
+                let a = eval_index_term(terms, args[0], y, y_value)?;
+                let b = eval_index_term(terms, args[1], y, y_value)?;
+                match sym.name() {
+                    "bvult" => Some(a < b),
+                    "bvule" => Some(a <= b),
+                    "bvugt" => Some(a > b),
+                    "bvuge" => Some(a >= b),
+                    "=" => Some(a == b),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A random index expression of `width` bits over `y`, drawn from every
+    /// operator the range lattice reads (the family generator's `base`).
+    fn gen_index_term(
+        terms: &mut TermStore,
+        rng: &mut XorShift,
+        y: TermId,
+        y_width: u32,
+        width: u32,
+        depth: u32,
+    ) -> TermId {
+        let pick = if depth == 0 {
+            rng.below(2)
+        } else {
+            rng.below(11)
+        };
+        let mask = mask_of(width);
+        match pick {
+            0 => {
+                if y_width == width {
+                    y
+                } else if y_width < width {
+                    terms.mk_bvzero_extend(width - y_width, y)
+                } else {
+                    terms.mk_bvextract(width - 1, 0, y)
+                }
+            }
+            1 => terms.mk_bitvec(BigInt::from(rng.range_u128(0, mask)), width),
+            2 | 3 => {
+                let a = gen_index_term(terms, rng, y, y_width, width, depth - 1);
+                let b = if rng.below(10) < 7 {
+                    let c = match rng.below(4) {
+                        0 => 1u128 << (width - 1),
+                        1 => 1,
+                        2 => mask,
+                        _ => rng.range_u128(1, mask),
+                    };
+                    terms.mk_bitvec(BigInt::from(c), width)
+                } else {
+                    gen_index_term(terms, rng, y, y_width, width, depth - 1)
+                };
+                terms.mk_bvadd(vec![a, b])
+            }
+            4 => {
+                let a = gen_index_term(terms, rng, y, y_width, width, depth - 1);
+                let c = terms.mk_bitvec(BigInt::from(rng.range_u128(0, mask)), width);
+                terms.mk_bvand(vec![a, c])
+            }
+            5 => {
+                let a = gen_index_term(terms, rng, y, y_width, width, depth - 1);
+                let c = [2u128, 3, 4, 5, rng.range_u128(0, mask)][rng.below(5) as usize] & mask;
+                let c = terms.mk_bitvec(BigInt::from(c), width);
+                terms.mk_bvmul(vec![a, c])
+            }
+            6 if width >= 2 => {
+                let high_width = rng.range_u32(1, width - 1);
+                let hi = terms.mk_bitvec(
+                    BigInt::from(rng.range_u128(0, mask_of(high_width))),
+                    high_width,
+                );
+                let lo = gen_index_term(terms, rng, y, y_width, width - high_width, depth - 1);
+                terms.mk_bvconcat(vec![hi, lo])
+            }
+            7 => {
+                let a = gen_index_term(terms, rng, y, y_width, width, depth - 1);
+                let b = gen_index_term(terms, rng, y, y_width, width, depth - 1);
+                let t = terms.mk_bitvec(BigInt::from(rng.range_u128(0, mask_of(y_width))), y_width);
+                let cond = terms.mk_bvult(y, t);
+                terms.mk_ite(cond, a, b)
+            }
+            8 => {
+                let wide = (width + rng.range_u32(1, 8)).min(16);
+                let a = gen_index_term(terms, rng, y, y_width, wide, depth - 1);
+                let low = if rng.below(3) == 0 {
+                    rng.range_u32(0, wide - width)
+                } else {
+                    0
+                };
+                terms.mk_bvextract(low + width - 1, low, a)
+            }
+            9 if width >= 2 => {
+                let narrow = rng.range_u32(1, width - 1);
+                let a = gen_index_term(terms, rng, y, y_width, narrow, depth - 1);
+                terms.mk_bvzero_extend(width - narrow, a)
+            }
+            10 if width >= 2 => {
+                let narrow = rng.range_u32(1, width - 1);
+                let a = gen_index_term(terms, rng, y, y_width, narrow, depth - 1);
+                terms.mk_bvsign_extend(width - narrow, a)
+            }
+            _ => gen_index_term(terms, rng, y, y_width, width, 0),
+        }
+    }
+
+    /// The generator's AIMED shape: an extract of an offset, masked-offset or
+    /// concatenated source whose range crosses `2^(high+1)`.
+    fn gen_aimed_extract(
+        terms: &mut TermStore,
+        rng: &mut XorShift,
+        y: TermId,
+        y_width: u32,
+        width: u32,
+    ) -> TermId {
+        let wide = (width + rng.range_u32(1, 8)).min(16);
+        let inner_width = rng.range_u32(1, wide - 1);
+        let depth = rng.range_u32(0, 1);
+        let a = gen_index_term(terms, rng, y, y_width, inner_width, depth);
+        let source = match rng.below(4) {
+            0 | 1 => {
+                let span = mask_of(wide) - mask_of(inner_width);
+                let c = terms.mk_bitvec(BigInt::from(rng.range_u128(1, span.max(1))), wide);
+                let widened = terms.mk_bvzero_extend(wide - inner_width, a);
+                terms.mk_bvadd(vec![widened, c])
+            }
+            2 => {
+                let m = rng.range_u128(0, mask_of(inner_width));
+                let c = rng.range_u128(1, (mask_of(wide) - m).max(1));
+                let widened = terms.mk_bvzero_extend(wide - inner_width, a);
+                let m = terms.mk_bitvec(BigInt::from(m), wide);
+                let masked = terms.mk_bvand(vec![widened, m]);
+                let c = terms.mk_bitvec(BigInt::from(c), wide);
+                terms.mk_bvadd(vec![masked, c])
+            }
+            _ => {
+                let hi_width = wide - inner_width;
+                let hi =
+                    terms.mk_bitvec(BigInt::from(rng.range_u128(1, mask_of(hi_width))), hi_width);
+                terms.mk_bvconcat(vec![hi, a])
+            }
+        };
+        let low = if rng.below(4) == 0 {
+            rng.range_u32(0, wide - width)
+        } else {
+            0
+        };
+        terms.mk_bvextract(low + width - 1, low, source)
+    }
+
+    /// Generated index terms (6,000 cases, 60% of them the aimed wrap-around
+    /// extract) over a variable of 1..=8 bits: the range `bv_range` computes
+    /// must contain the term's value under EVERY assignment of the variable.
+    #[test]
+    fn bv_range_contains_every_value_of_generated_index_terms_d9() {
+        let mut rng = XorShift(0xd9d9_5eed_0bad_c0de);
+        let mut checked = 0u32;
+        let mut aimed_wraps = 0u32;
+        for case in 0..6_000u32 {
+            let mut terms = TermStore::new();
+            let y_width = [1u32, 2, 3, 4, 5, 6, 8][rng.below(7) as usize];
+            let y = terms.mk_var("y", Sort::bitvec(y_width));
+            let width = rng.range_u32(1, 8);
+            let aimed = rng.below(10) < 6;
+            let term = if aimed {
+                gen_aimed_extract(&mut terms, &mut rng, y, y_width, width)
+            } else {
+                let depth = rng.range_u32(1, 3);
+                gen_index_term(&mut terms, &mut rng, y, y_width, width, depth)
+            };
+            let mut cache = HashMap::default();
+            let Some(range) = bv_range(&terms, term, &mut cache) else {
+                continue;
+            };
+            assert_eq!(Some(range.width), bv_width(&terms, term), "case {case}");
+            let values: Option<Vec<(u128, u128)>> = (0..=mask_of(y_width))
+                .map(|y_value| Some((y_value, eval_index_term(&terms, term, y, y_value)?)))
+                .collect();
+            let Some(values) = values else {
+                continue;
+            };
+            checked += 1;
+            let lo = values.iter().map(|&(_, v)| v).min().unwrap_or(0);
+            let hi = values.iter().map(|&(_, v)| v).max().unwrap_or(0);
+            if aimed
+                && hi - lo < mask_of(width)
+                && range.lower == 0
+                && range.upper == mask_of(width)
+            {
+                aimed_wraps += 1;
+            }
+            for (y_value, value) in values {
+                assert!(
+                    range.lower <= value && value <= range.upper,
+                    "case {case}: the index term {:?} is {value} at y = {y_value} (y has \
+                     {y_width} bits), outside the claimed range [{}, {}]",
+                    terms.get(term),
+                    range.lower,
+                    range.upper
+                );
+            }
+        }
+        assert!(
+            checked >= 5_000,
+            "only {checked} of 6000 generated terms were checked"
+        );
+        assert!(
+            aimed_wraps > 0,
+            "the aimed generator must reach a wrapping extract"
+        );
+    }
+
+    /// End to end on the rewrite: `T[#xff] = #x00` and a read of `T` at
+    /// `extract[7:0](#x0100 + zero_extend(y))` — every byte — must not be
+    /// rewritten against the one known cell (it was folded to `false`).
+    #[test]
+    fn dense_predicate_rewrite_does_not_fold_a_wrapping_extract_index_d9() {
+        let mut exec = Executor::new();
+        let table_sort = Sort::array(Sort::bitvec(8), Sort::bitvec(8));
+        let table = exec.ctx.terms.mk_var("t", table_sort);
+        let y = exec.ctx.terms.mk_var("y", Sort::bitvec(8));
+        let ff = exec.ctx.terms.mk_bitvec(BigInt::from(255u32), 8);
+        let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0u32), 8);
+        let pinned = exec.ctx.terms.mk_select(table, ff);
+        let fact = exec.ctx.terms.mk_eq(pinned, zero);
+        let offset = exec.ctx.terms.mk_bitvec(BigInt::from(256u32), 16);
+        let widened = exec.ctx.terms.mk_bvzero_extend(8, y);
+        let sum = exec.ctx.terms.mk_bvadd(vec![offset, widened]);
+        let index = exec.ctx.terms.mk_bvextract(7, 0, sum);
+        let read = exec.ctx.terms.mk_select(table, index);
+        let read_is_zero = exec.ctx.terms.mk_eq(read, zero);
+        let goal = exec.ctx.terms.mk_not(read_is_zero);
+        exec.ctx.assertions = vec![fact, goal];
+
+        exec.rewrite_dense_bv_array_initializer_selects();
+
+        assert_eq!(exec.ctx.assertions[0], fact);
+        assert_ne!(
+            exec.ctx.assertions[1],
+            exec.ctx.terms.false_term(),
+            "a read that can touch every cell was rewritten against T[#xff] alone"
+        );
+        assert_eq!(
+            exec.last_statistics
+                .get_int("smt.abv.finite_array.predicate_rewrites")
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// A 128-bit first operand of a `concat` shifted the empty prefix by 128
+    /// bits, which overflow-checked `<<` rejects with a panic.
+    #[test]
+    fn bv_range_of_a_concat_with_a_128_bit_head_does_not_overflow() {
+        let mut terms = TermStore::new();
+        let head = terms.mk_var("head", Sort::bitvec(128));
+        let tail = terms.mk_var("tail", Sort::bitvec(8));
+        let mut cache = HashMap::default();
+        let head_only = bv_range_concat(&terms, &[head], &mut cache)
+            .expect("a 128-bit operand alone has a range");
+        assert_eq!((head_only.lower, head_only.upper), (0, u128::MAX));
+        let mut cache = HashMap::default();
+        assert!(bv_range_concat(&terms, &[head, tail], &mut cache).is_none());
+    }
+
+    /// A select index that is not a bit-vector -- the Bool index of an outer
+    /// `(Array Bool ..)` -- has no range: `None`, never a panic (fresh
+    /// nestfin_2909_0018 --z3-mode aborted on `false` here).
+    #[test]
+    fn bv_range_of_a_non_bitvector_index_is_none() {
+        let mut terms = TermStore::new();
+        let index = terms.mk_bool(false);
+        let mut cache = HashMap::default();
+        assert!(bv_range(&terms, index, &mut cache).is_none());
     }
 }

@@ -108,7 +108,7 @@ impl HTR {
     }
 
     /// Test helper wrapper using a temporary mark array.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(super) fn try_resolve(
         &mut self,
         clause_c: &[Literal],

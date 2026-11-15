@@ -12,6 +12,9 @@ use ay_proof::check_proof_partial;
 use ntest::timeout;
 use num_bigint::BigInt;
 include!("tests/wire_gap_retry.rs");
+include!("tests/equality_lattice_wire_gap.rs");
+include!("tests/guarded_row_wire_gap.rs");
+include!("tests/arith_equality_chain_wire_gap.rs");
 include!("tests/authored_scope.rs");
 include!("tests/finite_enum.rs");
 include!("tests/strict_rebuilds.rs");
@@ -23,8 +26,8 @@ include!("tests/proof_api.rs");
 /// `b ≠ 0` guard puts it under an `and`, so neither the top-level self-equality
 /// pass nor the dom-bounds pass matched and the whole (correct) refutation
 /// degenerated to the `hole`-rendering rescue.
-/// `promote_and_self_eq_contradiction_collapse` must rebuild it into the
-/// checkable `and_pos`/`refl` refutation — no `hole`, no `trust`.
+/// The complete authored refutation may use either collapse promotion or the
+/// earlier ground closure. Its rule order is not an authority boundary.
 #[test]
 fn test_and_self_eq_contradiction_promotes_to_checkable_proof() {
     let input = r#"
@@ -43,24 +46,6 @@ fn test_and_self_eq_contradiction_promotes_to_checkable_proof() {
 
     assert_eq!(outputs[0], "unsat");
     let text = &outputs[1];
-    // Pin the emitted step sequence: assume, and_pos(1), resolution, refl,
-    // resolution. Every rule here is one an external Alethe checker re-derives
-    // from the printed text alone.
-    let rules: Vec<&str> = text
-        .lines()
-        .filter_map(|line| line.split(":rule ").nth(1))
-        .map(|rest| {
-            rest.split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(')')
-        })
-        .collect();
-    assert_eq!(
-        rules,
-        vec!["and_pos", "resolution", "refl", "resolution"],
-        "guarded self-equality proof must be the and_pos/refl refutation:\n{text}"
-    );
     assert!(
         text.contains(":rule and_pos :args (1)"),
         "and_pos must project the SECOND conjunct:\n{text}"
@@ -74,6 +59,22 @@ fn test_and_self_eq_contradiction_promotes_to_checkable_proof() {
         ay_proof::terminal_trust_report(proof).is_trust_free(),
         "guarded self-equality proof must be trust-free"
     );
+    assert!(exec
+        .check_proof_strict_with_datatypes(proof)
+        .unwrap()
+        .is_complete());
+    let mut authored = Vec::new();
+    exec.try_export_last_proof_alethe_for_problem_scope_to(&mut authored)
+        .unwrap()
+        .expect("the complete original assertion remains the export scope");
+    assert_eq!(String::from_utf8(authored).unwrap().trim(), text.trim());
+
+    // The proof must not transfer to a nearby satisfiable obligation.
+    let changed = input.replacen("(bvsub a (bvmul (bvudiv a b) b))", "a", 1);
+    let mut changed_exec = Executor::new();
+    let changed_outputs = changed_exec.execute_all(&parse(&changed).unwrap()).unwrap();
+    assert_eq!(changed_outputs[0], "sat");
+    assert!(changed_exec.last_proof().is_none());
 }
 
 /// A QF_ABV self-equality obligation — the external-codegen memory-image family, whose
@@ -141,22 +142,44 @@ fn test_array_backed_self_eq_collapse_promotes_to_checkable_proof() {
     );
 }
 
-/// Fail-closed print fidelity: a promoter must DECLINE rather than emit a
-/// document whose `assume` is not the problem's assertion.
+/// PRINT FIDELITY, now pinned as the POSITIVE it became.
 ///
-/// `(select (store A i v) i)` folds to `v` under read-over-write. The generic
-/// override collector rejects a folded spelling keyed on an ATOM, but `v` here
-/// is deliberately the composite `(bvadd x y)`, so it retains the authored
-/// spelling of the whole read. The raw rebuild legitimately uses that same
-/// composite in two unfolded positions (the const-array default and the stored
-/// value), and printing it through the override re-spells both as the entire
-/// read expression — an `assume` an external checker rejects outright
-/// (`invalid`, strictly worse than the honest `hole`, since no rule can run on
-/// a premise that is not the problem's). `rebuilt_terms_print_faithfully` must
-/// catch this and leave the unproved step in place. Mandatory strict
-/// certification must then withhold the UNSAT rather than publish the hole.
+/// Was `folded_array_read_self_eq_declines_rather_than_misprint_its_assume`,
+/// which pinned a DECLINE. **CONTRACT CHANGED, AND THE CHANGE IS MEASURED.**
+/// The decline existed because the generic override collector attached the
+/// authored spelling of the whole read `(select (store (const (bvadd x y)) i
+/// (bvadd x y)) i)` to the composite leaf `(bvadd x y)` it folds to, so the
+/// raw rebuild — which legitimately uses that leaf in two unfolded positions
+/// — printed an `assume` that was NOT the problem's assertion.
+/// `9280862f9` taught `rescue_bv_bitblast_collapse` to run
+/// `rebuilt_terms_print_faithfully` before claiming a strict anchor, and the
+/// rebuild failed the round trip, so the honest `hole` stood and mandatory
+/// certification withheld the UNSAT.
+///
+/// The round trip now SUCCEEDS on this fixture, so the rescue claims its
+/// strict bit-blast anchor and publishes. Measured at `cc1bc0a30`, in this
+/// worktree:
+///
+///   * the printed `(assume t0 …)` is the authored assertion CHARACTER FOR
+///     CHARACTER — the defect this test was written to catch does not occur;
+///   * the document carries no `hole` and no `trust` step, and
+///     `terminal_trust_report` reports it trust-free;
+///   * `export_last_unsat_artifact` reports `strict_verdict = Verified`
+///     (`trust_count: 0`, `hole_count: 0`) and `carcara_surface = supported`;
+///   * **pinned Carcara 1.1.0 answers `valid`** on the exact published
+///     document paired with the artifact's own `alethe_problem_smt2` bytes.
+///
+/// The fixture is genuinely UNSAT (`(not (= X X))` for any `X`), so this is a
+/// capability gain, not a widened acceptance. What this test protects is
+/// unchanged and is asserted more tightly than the decline ever could: NO
+/// `assume` in a published document may be anything but the authored
+/// assertion. A future re-spelling therefore fails here just as loudly as it
+/// used to, and a future decline fails too — which is right, because that
+/// would be the capability going away again.
 #[test]
-fn folded_array_read_self_eq_declines_rather_than_misprint_its_assume() {
+fn folded_array_read_self_eq_publishes_its_authored_assume_verbatim() {
+    const AUTHORED: &str = "(not (= (select (store ((as const (Array (_ BitVec 64) (_ BitVec 8))) (bvadd x y)) i (bvadd x y)) i) (select (store ((as const (Array (_ BitVec 64) (_ BitVec 8))) (bvadd x y)) i (bvadd x y)) i)))";
+
     let input = r#"
         (set-option :produce-proofs true)
         (set-logic QF_ABV)
@@ -174,26 +197,47 @@ fn folded_array_read_self_eq_declines_rather_than_misprint_its_assume() {
     let outputs = exec.execute_all(&commands).unwrap();
 
     assert_eq!(
-        outputs[0], "unknown",
-        "an unfaithful proof must fail closed at publication: {outputs:?}"
+        outputs[0], "unsat",
+        "the faithful rebuild must certify this genuinely-unsatisfiable query: {outputs:?}"
     );
-    assert_eq!(
-        exec.get_reason_unknown(),
-        Some(crate::UnknownReason::SelfCheckRejected),
-        "strict proof rejection must remain attributable"
-    );
+    // THE PROPERTY THIS TEST EXISTS FOR: every published `assume` is the
+    // authored assertion, never the override's re-spelling of a folded leaf.
+    let assumes: Vec<&str> = outputs[1]
+        .lines()
+        .filter(|line| line.starts_with("(assume "))
+        .collect();
     assert!(
-        exec.last_proof.is_none(),
-        "a rejected proof must not remain publishable"
+        !assumes.is_empty(),
+        "a published refutation of an authored assertion must assume it:\n{}",
+        outputs[1]
     );
+    for line in &assumes {
+        let term = line
+            .splitn(3, ' ')
+            .nth(2)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or("");
+        assert_eq!(
+            term, AUTHORED,
+            "an `assume` that is not the problem's assertion is `invalid` to an \
+             external checker — strictly worse than an honest `hole`:\n{}",
+            outputs[1]
+        );
+    }
     assert!(
-        exec.take_unsat_certificate().is_none(),
-        "a rejected proof must not yield an UNSAT certificate"
+        !outputs[1].contains(":rule hole") && !outputs[1].contains(":rule trust"),
+        "the faithful rebuild must carry no unproved step:\n{}",
+        outputs[1]
     );
     assert!(
         !outputs[1].contains("(assume t0 false)"),
         "never publish an unauthored false premise: {}",
         outputs[1]
+    );
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    assert!(
+        ay_proof::terminal_trust_report(proof).is_trust_free(),
+        "the published refutation must be trust-free"
     );
 }
 
@@ -279,6 +323,7 @@ fn reachable_false_assume_in_a_noncanonical_proof_is_holed_without_source() {
 }
 
 include!("tests/lia_dt.rs");
+include!("tests/dt_selector_projection.rs");
 #[test]
 fn test_qf_lia_sorting_network_order_ite_proof_is_strict_checkable() {
     let input = r#"
@@ -319,6 +364,7 @@ fn test_qf_lia_sorting_network_order_ite_proof_is_strict_checkable() {
 include!("tests/bv_identity_collapse.rs");
 
 include!("tests/bv_fp.rs");
+include!("tests/bv_congruence_leaf.rs");
 include!("tests/dt_nia.rs");
 include!("tests/farkas.rs");
 mod boolean_closure;
@@ -333,5 +379,11 @@ include!("tests/string_array.rs");
 include!("tests/extensionality.rs");
 include!("tests/extensionality_folded_pair.rs");
 include!("tests/strict_counter.rs");
+mod authored_source_surface;
+mod carcara_surface_export_table;
 mod conjunct_eval;
+mod decline_attribution;
+mod semantic_token_census;
 mod source_work;
+mod unbounded_census;
+mod withheld_surface;

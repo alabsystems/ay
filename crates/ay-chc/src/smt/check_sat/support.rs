@@ -11,6 +11,134 @@ use ay_core::TermStore;
 use ay_euf::EufSolver;
 use ay_lia::{DiophState, HnfCutKey, LiaSolver, StoredCut};
 
+/// The DPLL(T) loop's SAT solver together with the log of every clause the
+/// loop itself added after the initial CNF: theory blocking clauses (Farkas
+/// and violated-atom), integer/disequality/expression split encodings and
+/// model-equality encodings.
+///
+/// The log exists for the #5384 UNSAT defense in `run_check_sat_theory_loop`,
+/// which re-checks a SAT-level UNSAT by replaying the INPUT clauses — and none
+/// of the solver's learned clauses — in a fresh solver. A replay of the
+/// initial CNF alone silently dropped the loop's theory lemmas: a query that
+/// is UNSAT only modulo those lemmas came back SAT from the fresh solver, the
+/// defense installed that solver as the main one, and the loop re-derived the
+/// same lemmas from the same models forever (2026-09-23, 3 h 40 min observed;
+/// the development design notes).
+///
+/// Two logs, because not every clause the loop adds is a lemma:
+///
+/// - `added` — theory conflicts (Farkas and plain), split encodings and
+///   model-equality encodings: consequences of the formula and the theory.
+///   The replay re-adds them.
+/// - `model_blocks` — the `violated_constraint` block of the
+///   `TheoryResult::Sat` arm: the negation of the whole current Boolean
+///   assignment, added because the loop's model re-evaluation
+///   (`get_term_value`) recomputes `*`/`div`/`mod` from argument values while
+///   ay-lia carries those terms as OPAQUE columns, so the two disagree on a
+///   perfectly feasible assignment (`x*y >= 7 ∧ x >= 0 ∧ y >= 0`: LIA says
+///   x = y = 0 with the product column at 7; recomputed, `0 >= 7` is false).
+///   That block is a model-repair heuristic, not a lemma, and it can exclude
+///   the only satisfying assignment. It goes into the solver (the loop needs
+///   to move on) but NOT into the replay: a SAT-level UNSAT that needs a model
+///   block is unjustified, and the replay's job is to detect exactly that
+///   (2026-09-23 adversarial review of f8a77d505). The durable fix is for
+///   `get_term_value` to read the opaque columns from `lia_model.values`
+///   instead of recomputing them; until then the loop fails closed.
+///
+/// The clause trace cannot tell the two apart, nor either from the input: it
+/// marks EVERY clause given to `Solver::add_clause` original, so its
+/// originals end with the lemmas AND the model blocks. The replay therefore
+/// takes only the first `initial_originals` of them (the formula as the loop
+/// received it) and the lemmas from `added` (`replay_clauses`). Replaying all
+/// trace originals re-added the blocks and confirmed an UNSAT that rested on
+/// one (faulty__barthe!_000: a satisfiable transition check came back UNSAT
+/// and a non-inductive invariant was published as SAFE).
+///
+/// Everything except the two `add_*` entry points goes straight to the solver
+/// through `Deref`/`DerefMut`; `add_clause` is shadowed so no call site can
+/// bypass the log.
+pub(super) struct LoopSat {
+    solver: ay_sat::Solver,
+    /// Trace originals present when this handle took the solver: no model
+    /// block is among them, and every clause added later is logged here.
+    initial_originals: usize,
+    added: Vec<Vec<ay_sat::Literal>>,
+    model_blocks: Vec<Vec<ay_sat::Literal>>,
+}
+
+impl LoopSat {
+    pub(super) fn new(solver: ay_sat::Solver) -> Self {
+        Self {
+            initial_originals: trace_original_count(&solver),
+            solver,
+            added: Vec::new(),
+            model_blocks: Vec::new(),
+        }
+    }
+
+    /// Add a lemma to the solver and log it for the UNSAT replay.
+    pub(super) fn add_clause(&mut self, clause: Vec<ay_sat::Literal>) -> bool {
+        self.added.push(clause.clone());
+        self.solver.add_clause(clause)
+    }
+
+    /// Add a model-based assignment block to the solver. It is logged apart
+    /// from the lemmas and never replayed (see the type-level comment).
+    pub(super) fn add_model_block(&mut self, clause: Vec<ay_sat::Literal>) -> bool {
+        self.model_blocks.push(clause.clone());
+        self.solver.add_clause(clause)
+    }
+
+    /// Every lemma added through this handle since the formula, in order.
+    pub(super) fn added_clauses(&self) -> &[Vec<ay_sat::Literal>] {
+        &self.added
+    }
+
+    /// The model-based blocks currently in the solver.
+    pub(super) fn model_blocks(&self) -> &[Vec<ay_sat::Literal>] {
+        &self.model_blocks
+    }
+
+    /// The #5384 UNSAT replay's clauses: the formula the loop received plus
+    /// every lemma, never a model block. `None` without a clause trace.
+    pub(super) fn replay_clauses(&self) -> Option<Vec<Vec<ay_sat::Literal>>> {
+        let trace = self.solver.clause_trace()?;
+        let initial = trace.original_clauses().take(self.initial_originals);
+        let initial = initial.map(|entry| entry.clause.to_vec());
+        Some(initial.chain(self.added.iter().cloned()).collect())
+    }
+
+    /// Install a replacement solver (the #5384 recovery). The replacement was
+    /// built from `replay_clauses()`, so all of its trace originals are the
+    /// formula and lemmas, and no model block is in it: both logs restart.
+    pub(super) fn replace_solver(&mut self, solver: ay_sat::Solver) {
+        self.initial_originals = trace_original_count(&solver);
+        self.solver = solver;
+        self.added.clear();
+        self.model_blocks.clear();
+    }
+}
+
+fn trace_original_count(solver: &ay_sat::Solver) -> usize {
+    solver
+        .clause_trace()
+        .map_or(0, |trace| trace.original_clauses().count())
+}
+
+impl std::ops::Deref for LoopSat {
+    type Target = ay_sat::Solver;
+
+    fn deref(&self) -> &ay_sat::Solver {
+        &self.solver
+    }
+}
+
+impl std::ops::DerefMut for LoopSat {
+    fn deref_mut(&mut self) -> &mut ay_sat::Solver {
+        &mut self.solver
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LiaReusableState {
     dioph: DiophState,
@@ -118,3 +246,6 @@ pub(super) fn add_offset_bv_clause(
         .collect();
     sat.add_clause(lits);
 }
+
+#[cfg(test)]
+mod tests;

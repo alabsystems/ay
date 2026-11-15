@@ -255,6 +255,9 @@ impl Executor {
     /// model, or the model is left untouched. Runs at most once per SAT
     /// verdict.
     pub(crate) fn refine_nra_algebraic_model_for_print(&mut self) {
+        if self.poll_evaluation_stop().is_err() {
+            return;
+        }
         if self.nra_algebraic_model.print_refinement_attempted() {
             return;
         }
@@ -366,6 +369,9 @@ impl Executor {
         let saved_nra = self.nra_algebraic_model.values().clone();
         let mut last_candidates: Option<Vec<(TermId, BigRational)>> = None;
         for round in 0..MAX_REFINE_ROUNDS {
+            if self.poll_evaluation_stop().is_err() {
+                break;
+            }
             if round > 0 && !narrow(&mut state) {
                 if debug {
                     ay_core::safe_eprintln!("[NRA] refine: round {round} could not narrow — stop");
@@ -611,15 +617,19 @@ impl Executor {
     /// ambient session some future caller might hold open across the
     /// `GetModel` dispatch.
     fn refined_model_satisfies_all_assertions(&self) -> bool {
+        if self.poll_evaluation_stop().is_err() {
+            return false;
+        }
         let Some(model) = self.last_model.as_ref() else {
             return false;
         };
-        with_isolated_eval_memo(|| {
+        let satisfies = with_isolated_eval_memo(|| {
             self.ctx
                 .assertions
                 .iter()
                 .all(|&a| matches!(self.evaluate_term(model, a), EvalValue::Bool(true)))
-        })
+        });
+        self.poll_evaluation_stop().is_ok() && satisfies
     }
 }
 

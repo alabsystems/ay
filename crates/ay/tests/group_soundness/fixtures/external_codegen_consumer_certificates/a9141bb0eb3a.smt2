@@ -1,0 +1,7 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const a (_ BitVec 8))
+(assert (and (not (= a (_ bv0 8))) (not (= (bvsub (_ bv7 8) (ite (= ((_ extract 7 7) a) (_ bv1 1)) (_ bv0 8) (ite (= ((_ extract 6 6) a) (_ bv1 1)) (_ bv1 8) (ite (= ((_ extract 5 5) a) (_ bv1 1)) (_ bv2 8) (ite (= ((_ extract 4 4) a) (_ bv1 1)) (_ bv3 8) (ite (= ((_ extract 3 3) a) (_ bv1 1)) (_ bv4 8) (ite (= ((_ extract 2 2) a) (_ bv1 1)) (_ bv5 8) (ite (= ((_ extract 1 1) a) (_ bv1 1)) (_ bv6 8) (ite (= ((_ extract 0 0) a) (_ bv1 1)) (_ bv7 8) (_ bv8 8)))))))))) (ite (= ((_ extract 7 7) a) (_ bv1 1)) (_ bv7 8) (ite (= ((_ extract 6 6) a) (_ bv1 1)) (_ bv6 8) (ite (= ((_ extract 5 5) a) (_ bv1 1)) (_ bv5 8) (ite (= ((_ extract 4 4) a) (_ bv1 1)) (_ bv4 8) (ite (= ((_ extract 3 3) a) (_ bv1 1)) (_ bv3 8) (ite (= ((_ extract 2 2) a) (_ bv1 1)) (_ bv2 8) (ite (= ((_ extract 1 1) a) (_ bv1 1)) (_ bv1 8) (ite (= ((_ extract 0 0) a) (_ bv1 1)) (_ bv0 8) (_ bv8 8)))))))))))))
+(check-sat)
+(exit)

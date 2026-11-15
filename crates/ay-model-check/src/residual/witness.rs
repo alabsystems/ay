@@ -16,12 +16,17 @@ use crate::{
     ProjectionLookupError, ProvenUnconstrainedKind,
 };
 
-use super::element_dt;
+use super::path::metadata;
+mod accounting;
+mod completion;
+mod requirements;
+pub(super) use accounting::{account_entry_values, account_path_index};
+pub use completion::{ArrayCompletion, CompletedArrayAssignment, ModelConfirmation};
 
 /// Maximum formula/pin requirements admitted by one residual witness.
 pub(crate) const MAX_WITNESS_ENTRIES: usize = 512;
 
-/// Maximum semantic index comparisons while forming `(class, index)` groups.
+/// Maximum semantic index comparisons across outer groups and inner arrays.
 const MAX_INDEX_COMPARISONS: usize = 131_072;
 
 /// Maximum value nodes inspected or synthesized for one completed witness.
@@ -31,13 +36,25 @@ pub(crate) const MAX_WITNESS_VALUE_WORK: usize = 8192;
 const MAX_WITNESS_VALUE_DEPTH: usize = 128;
 
 /// Which slot of an array element an entry constrains.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) enum Slot {
     /// The whole element: `(= <ground> (select a i))` or a pinned select.
     Whole,
     /// One selector field: `(= <ground> (fld (select a i)))` or a pinned
     /// selector-chain read.
     Field(String),
+    /// Root-to-leaf selectors, authenticated at every original source step.
+    Path(Vec<String>),
+    /// Exact selector/index steps inside the selected outer datatype element.
+    Access(Vec<AccessStep>),
+}
+
+/// One typed, source-authenticated step; index values come from the candidate
+/// evaluator, never from an invented interpretation of an unpinned key.
+#[derive(Clone)]
+pub(super) enum AccessStep {
+    Field(String),
+    Index(ModelValue),
 }
 
 /// One entry of the joint constraint map: `(array, index-value, slot) ->
@@ -166,26 +183,6 @@ impl WitnessBudget {
     }
 }
 
-/// Charge model-provided entry values before the classifier retains them.
-///
-/// The update is transactional: a rejected `or` branch or over-budget entry
-/// cannot consume capacity that belongs to a later admissible branch.
-pub(super) fn account_entry_values(
-    value_work: &mut usize,
-    index: &ModelValue,
-    value: &ModelValue,
-) -> bool {
-    let mut candidate = WitnessBudget {
-        index_comparisons: 0,
-        value_work: *value_work,
-    };
-    if !candidate.account_value(index) || !candidate.account_value(value) {
-        return false;
-    }
-    *value_work = candidate.value_work;
-    true
-}
-
 fn scalar_payload_work(value: &ModelValue) -> Option<usize> {
     fn bigint_bytes(value: &BigInt) -> Option<usize> {
         usize::try_from(value.bits().checked_add(7)? / 8).ok()
@@ -233,6 +230,7 @@ fn scalar_payload_work(value: &ModelValue) -> Option<usize> {
                 .checked_add(1)?;
             usize::try_from(total_bits.checked_add(7)? / 8).ok()
         }
+        value @ ModelValue::FloatingPointExact { .. } => crate::fp_exact::bytes(value).ok(),
         ModelValue::Str(value) | ModelValue::Uninterpreted(value) => Some(value.len()),
         ModelValue::Algebraic(value) => algebraic_bytes(value),
         ModelValue::Datatype { ctor, .. } => Some(ctor.len()),
@@ -244,14 +242,76 @@ fn scalar_payload_work(value: &ModelValue) -> Option<usize> {
 /// surface is delegated unchanged to the solver-provided view.
 struct CompletedModel<'a> {
     base: &'a dyn ModelView,
+    admission_refused: std::cell::Cell<bool>,
     member_roots: HashMap<TermId, TermId>,
     arrays: HashMap<TermId, ModelValue>,
 }
 
 impl ModelView for CompletedModel<'_> {
+    fn has_evaluation_admission(&self) -> bool {
+        self.base.has_evaluation_admission()
+    }
+
+    fn refuse_evaluation_work(&self, reason: &str) {
+        self.admission_refused.set(true);
+        self.base.refuse_evaluation_work(reason);
+    }
+
+    fn admit_evaluation_work(&self, work: usize, bytes: usize) -> Result<(), String> {
+        if self.admission_refused.get() {
+            return Err("completed-model payload admission previously refused".to_owned());
+        }
+        if !self.has_evaluation_admission() {
+            return Ok(());
+        }
+        self.base
+            .admit_evaluation_work(work, bytes)
+            .map_err(|reason| {
+                self.refuse_evaluation_work(&reason);
+                reason
+            })
+    }
+
+    fn exact_fp_interrupted(&self) -> bool {
+        self.admission_refused.get() || self.base.exact_fp_interrupted()
+    }
+
+    fn charge_exact_fp_work(&self, amount: usize) -> Result<(), String> {
+        if self.admission_refused.get() {
+            return Err("completed-model exact FP admission previously refused".to_owned());
+        }
+        self.base.charge_exact_fp_work(amount).map_err(|reason| {
+            self.refuse_evaluation_work(&reason);
+            reason
+        })
+    }
+
+    fn admit_exact_fp_work(&self, work: usize, bytes: usize) -> Result<(), String> {
+        if self.admission_refused.get() {
+            return Err("completed-model exact FP admission previously refused".to_owned());
+        }
+        self.base
+            .admit_exact_fp_work(work, bytes)
+            .map_err(|reason| {
+                self.refuse_evaluation_work(&reason);
+                reason
+            })
+    }
+
     fn leaf_value(&self, term: TermId) -> Option<ModelValue> {
         match self.member_roots.get(&term) {
-            Some(root) => self.arrays.get(root).cloned(),
+            Some(root) => {
+                let value = self.arrays.get(root)?;
+                if self.has_evaluation_admission() {
+                    if let Err(reason) = crate::admit_model_value_work(value, &mut |work, bytes| {
+                        self.admit_evaluation_work(work, bytes)
+                    }) {
+                        self.refuse_evaluation_work(&reason);
+                        return None;
+                    }
+                }
+                Some(value.clone())
+            }
             None => self.base.leaf_value(term),
         }
     }
@@ -291,18 +351,18 @@ impl ModelView for CompletedModel<'_> {
 
 /// Materialize one concrete `(default, finite-store)` value per alias class and
 /// grant it authority only after a fresh residual-disabled replay succeeds.
-pub(super) fn materialize_and_replay(
-    terms: &TermStore,
-    model: &dyn ModelView,
+pub(super) fn materialize_and_replay<'a>(
+    terms: &'a TermStore,
+    model: &'a dyn ModelView,
     evaluator: &Evaluator<'_>,
-    assertions: &[TermId],
+    assertions: &'a [TermId],
     resolve: &DtResolve<'_>,
     member_roots: HashMap<TermId, TermId>,
     entries: Vec<Entry>,
     entry_value_work: usize,
-) -> bool {
+) -> Option<ArrayCompletion<'a>> {
     if entry_value_work > MAX_WITNESS_VALUE_WORK {
-        return false;
+        return None;
     }
     let mut budget = WitnessBudget {
         index_comparisons: 0,
@@ -311,7 +371,7 @@ pub(super) fn materialize_and_replay(
 
     let Some(mut class_arrays) = build_class_arrays(terms, resolve, &member_roots, &mut budget)
     else {
-        return false;
+        return None;
     };
     if !populate_class_arrays(
         terms,
@@ -321,7 +381,7 @@ pub(super) fn materialize_and_replay(
         &mut class_arrays,
         &mut budget,
     ) {
-        return false;
+        return None;
     }
 
     let arrays = class_arrays
@@ -333,18 +393,22 @@ pub(super) fn materialize_and_replay(
             .ensure_value_inhabits_sort(array, terms.sort(root))
             .is_err()
         {
-            return false;
+            return None;
         }
     }
     let completed = CompletedModel {
         base: model,
+        admission_refused: std::cell::Cell::new(false),
         member_roots,
         arrays,
     };
-    matches!(
+    if !matches!(
         confirm_completed_model(terms, &completed, assertions),
         GateVerdict::ConfirmedSat
-    )
+    ) {
+        return None;
+    }
+    Some(ArrayCompletion::new(terms, assertions, completed, budget))
 }
 
 fn build_class_arrays(
@@ -366,7 +430,9 @@ fn build_class_arrays(
         let Sort::Array(array_sort) = terms.sort(member) else {
             return None;
         };
-        element_dt(&array_sort.element_sort, resolve)?;
+        metadata::datatype(&array_sort.element_sort, resolve, &mut |n| {
+            budget.spend_value_nodes(n)
+        })?;
         let default = canonical_inhabitant(
             &array_sort.element_sort,
             resolve,
@@ -412,16 +478,18 @@ fn populate_class_arrays(
         let Some(group) = gather_index_group(root, first, &keyed, &mut done, budget) else {
             return false;
         };
-        let Some((whole, fields)) = reconcile_group(&group) else {
-            return false;
-        };
         let Sort::Array(array_sort) = terms.sort(root) else {
             return false;
         };
-        let Some(datatype) = element_dt(&array_sort.element_sort, resolve) else {
-            return false;
+        let element = if group
+            .iter()
+            .any(|entry| matches!(entry.slot, Slot::Path(_) | Slot::Access(_)))
+        {
+            requirements::materialize(&array_sort.element_sort, &group, resolve, budget)
+        } else {
+            legacy_element(&array_sort.element_sort, &group, resolve, budget)
         };
-        let Some(element) = materialize_element(&datatype, whole, &fields, resolve, budget) else {
+        let Some(element) = element else {
             return false;
         };
         let Some(array) = arrays.get_mut(&root) else {
@@ -430,6 +498,17 @@ fn populate_class_arrays(
         array.store.push((first.index.clone(), element));
     }
     true
+}
+
+fn legacy_element(
+    sort: &Sort,
+    group: &[&Entry],
+    resolve: &DtResolve<'_>,
+    budget: &mut WitnessBudget,
+) -> Option<ModelValue> {
+    let (whole, fields) = reconcile_group(group)?;
+    let datatype = metadata::datatype(sort, resolve, &mut |n| budget.spend_value_nodes(n))?;
+    materialize_element(&datatype, whole, &fields, resolve, budget)
 }
 
 fn gather_index_group<'a>(
@@ -486,6 +565,7 @@ fn reconcile_group<'a>(
                     fields.push((field.as_str(), &entry.value));
                 }
             }
+            Slot::Path(_) | Slot::Access(_) => return None,
         }
     }
     Some((whole, fields))
@@ -579,7 +659,9 @@ fn canonical_inhabitant(
         return None;
     }
 
-    if let Some(datatype) = element_dt(sort, resolve) {
+    if let Some(datatype) =
+        metadata::datatype_shape(sort, resolve, &mut |n| budget.spend_value_nodes(n))?
+    {
         if active_datatypes.iter().any(|name| name == &datatype.name) {
             return None;
         }
@@ -642,8 +724,20 @@ fn canonical_inhabitant(
         Sort::String => Some(ModelValue::Str(String::new())),
         Sort::RegLan => None,
         Sort::FloatingPoint(exponent_bits, significand_bits)
-            if (2..=64).contains(exponent_bits) && (2..=65).contains(significand_bits) =>
+            if *exponent_bits >= 2 && *significand_bits >= 2 =>
         {
+            if !crate::fp::data_format_supported(*exponent_bits, *significand_bits) {
+                let value = ModelValue::floating_point_exact(
+                    false,
+                    0u8.into(),
+                    0u8.into(),
+                    *exponent_bits,
+                    *significand_bits,
+                )?;
+                return budget
+                    .spend_value_nodes(crate::fp_exact::bytes(&value).ok()?)
+                    .then_some(value);
+            }
             let total_bits = u64::from(*exponent_bits)
                 .checked_add(u64::from(*significand_bits))?
                 .checked_add(1)?;
@@ -765,6 +859,7 @@ mod bound_tests {
                 &mut retained_work,
                 &ModelValue::Bool(false),
                 &value,
+                &Slot::Whole,
             ));
             assert_eq!(
                 retained_work, 0,
@@ -820,5 +915,166 @@ mod bound_tests {
             0,
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod evaluation_admission_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn completed_model_forwards_admission_and_debits_its_own_payload() {
+        struct Owner {
+            refused: Cell<bool>,
+            calls: Cell<usize>,
+        }
+        impl ModelView for Owner {
+            fn has_evaluation_admission(&self) -> bool {
+                true
+            }
+            fn refuse_evaluation_work(&self, _: &str) {
+                self.refused.set(true);
+            }
+            fn leaf_value(&self, _: TermId) -> Option<ModelValue> {
+                None
+            }
+            fn admit_evaluation_work(&self, _: usize, bytes: usize) -> Result<(), String> {
+                self.calls.set(self.calls.get() + 1);
+                if self.refused.get() || bytes > 512 {
+                    self.refused.set(true);
+                    Err("owner payload limit".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut terms = TermStore::new();
+        let term = terms.mk_var("array", Sort::array(Sort::Int, Sort::String));
+        let owner = Owner {
+            refused: Cell::new(false),
+            calls: Cell::new(0),
+        };
+        let view = CompletedModel {
+            base: &owner,
+            admission_refused: Cell::new(false),
+            member_roots: HashMap::from([(term, term)]),
+            arrays: HashMap::from([(
+                term,
+                ModelValue::Array(Box::new(ArrayValue {
+                    default: ModelValue::Str("x".repeat(4096)),
+                    store: Vec::new(),
+                })),
+            )]),
+        };
+        assert!(matches!(
+            Evaluator::new(&terms, &view).evaluate(term),
+            crate::EvalOutcome::Unevaluable(_)
+        ));
+        assert!(owner.refused.get());
+        assert!(owner.calls.get() > 1);
+        assert!(view.admit_evaluation_work(0, 0).is_err());
+    }
+    #[test]
+    fn completed_overlay_preserves_dedicated_fp_counter_without_generic_admission() {
+        use std::cell::Cell;
+        struct Owner {
+            left: Cell<usize>,
+            refused: Cell<bool>,
+        }
+        impl ModelView for Owner {
+            fn leaf_value(&self, _: TermId) -> Option<ModelValue> {
+                None
+            }
+            fn exact_fp_interrupted(&self) -> bool {
+                self.refused.get()
+            }
+            fn charge_exact_fp_work(&self, amount: usize) -> Result<(), String> {
+                if self.refused.get() {
+                    return Err("original FP counter refused".into());
+                }
+                let Some(left) = self.left.get().checked_sub(amount) else {
+                    self.refused.set(true);
+                    return Err("original FP counter exhausted".into());
+                };
+                self.left.set(left);
+                Ok(())
+            }
+        }
+        let owner = Owner {
+            left: Cell::new(4096),
+            refused: Cell::new(false),
+        };
+        let mut terms = ay_core::TermStore::new();
+        let root = terms.mk_var(
+            "overlay_exact",
+            ay_core::Sort::array(ay_core::Sort::Int, ay_core::Sort::FloatingPoint(8, 200)),
+        );
+        let zero = terms.mk_int(num_bigint::BigInt::from(0));
+        let selected = terms.mk_app(
+            ay_core::Symbol::named("select"),
+            &[root, zero],
+            ay_core::Sort::FloatingPoint(8, 200),
+        );
+        let value = ModelValue::floating_point_exact(
+            false,
+            127u32.into(),
+            (num_bigint::BigUint::from(1u8) << 198usize) + 1u8,
+            8,
+            200,
+        )
+        .unwrap();
+        let view = CompletedModel {
+            base: &owner,
+            admission_refused: Cell::new(false),
+            member_roots: [(root, root)].into_iter().collect(),
+            arrays: [(
+                root,
+                ModelValue::Array(Box::new(crate::ArrayValue {
+                    default: value,
+                    store: Vec::new(),
+                })),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(
+            !view.has_evaluation_admission(),
+            "generic admission deliberately absent"
+        );
+        assert!(matches!(
+            crate::evaluate_term(&terms, &view, root),
+            crate::EvalOutcome::Value(_)
+        ));
+        assert_eq!(
+            owner.left.get(),
+            4096,
+            "retained aggregate DATA consumes no FP field work"
+        );
+        let evaluator = crate::Evaluator::new(&terms, &view);
+        assert!(matches!(
+            evaluator.evaluate(root),
+            crate::EvalOutcome::Value(_)
+        ));
+        assert!(matches!(
+            evaluator.evaluate(selected),
+            crate::EvalOutcome::Value(_)
+        ));
+        assert!(
+            owner.left.get() < 4096,
+            "actual select spent the base FP counter"
+        );
+        assert!(view.charge_exact_fp_work(4097).is_err());
+        assert!(owner.exact_fp_interrupted());
+        assert!(matches!(
+            evaluator.evaluate(selected),
+            crate::EvalOutcome::Unevaluable(_)
+        ));
+        let fresh = crate::Evaluator::new(&terms, &view);
+        assert!(matches!(fresh.evaluate(root), crate::EvalOutcome::Value(_)));
+        assert!(matches!(
+            fresh.evaluate(selected),
+            crate::EvalOutcome::Unevaluable(_)
+        ));
     }
 }

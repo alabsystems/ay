@@ -2,7 +2,7 @@
 
 These `.smt2` files are verbatim copies of individual benchmarks from the
 CHC-COMP benchmark repositories. They are vendored so that every regression
-that depends on them is **hermetic**: `cargo test -p ay-chc` runs them on a
+that depends on them is **hermetic**: `targo --unverified test -p ay-chc` runs them on a
 fresh checkout with no network, no download, and no environment setup.
 
 ## Why vendored and not downloaded
@@ -28,6 +28,7 @@ and are fetched with `ay corpus download`.
 | `hcai/svcomp/O0/` | `hcai-bench/svcomp/O0/` |
 | `solidity/` | `solidity/no_adts/unit_tests/abi/` |
 | `kind2/`, `llreve/`, `reve/` | the correspondingly named upstream trees |
+| `sally/oral_messages/` | CHC-COMP-26 `sally-chc-benchmarks/oral_messages/` (see below) |
 
 Local paths flatten the upstream directory names (`hcai-bench` → `hcai`); the
 table above is the mapping.
@@ -42,6 +43,18 @@ All CHC-COMP-25 files come from
 were preprocessed with the CHC-COMP formatter and carry benchexec metadata whose
 expected verdict is `true` (all solvers reporting agreed on `sat`) or `false`
 (all agreed on `unsat`).
+
+The `sally/` files come from <https://github.com/chc-comp/chc-comp26-benchmarks>
+pinned at commit `b4fa7a708e5863bbcdb5de50d692ead3a67cbedc` (the checkout the
+2026 campaign harness reads), copied byte-for-byte. They are the shared-DAG
+front-end fixtures of WP-F: `let`-nested ITE-heavy transition relations whose
+tree expansion is 10^5–10^9 times their DAG.
+
+`kind2/durationThm_3_e7_334_000.smt2` is from the CHC-COMP-26 repository
+<https://github.com/chc-comp/chc-comp26-benchmarks> (`kind2-chc-benchmarks/data/`) at commit
+`b4fa7a708e5863bbcdb5de50d692ead3a67cbedc`, the revision `benchmarks/chc/chc-comp26-benchmarks` is
+checked out at for the 2026 campaign (expected verdict `false`, i.e. unsat). Vendored 2026-09-23 for the
+clause-inliner ground back-translation regression (premise synthesis through a poisoned composition trace).
 
 Upstream publishes no top-level licence file. These are competition benchmarks
 redistributed for regression testing; confirm terms before redistributing them
@@ -82,6 +95,8 @@ re-copy every fixture listed above, so the pin and the fixtures cannot drift.
 - `crates/ay-chc/tests/group_misc/cyclic_array_bmc_unsafe_swaparray.rs` — `llreve/*`
 - `crates/ay-chc/tests/group_soundness/query_safety_free_vars_022c.rs` — `reve/*`
 - `crates/ay-chc/src/transform/interval_propagation_tests.rs` — `hcai/svcomp/O0/O0_lu.cmp_*`
+- `crates/ay-chc/src/expr/dag_tests.rs` — `sally/oral_messages/om1_with_relays_general_{3_10_agreement,4_6_agreement}_000.smt2`
+- `crates/ay-chc/src/transform/clause_inlining/tests.rs` — `kind2/durationThm_3_e7_334_000.smt2`
 
 ### Benchmark-only capability targets
 

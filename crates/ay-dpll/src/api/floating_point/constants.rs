@@ -10,10 +10,17 @@ use ay_core::{Sort, Symbol};
 use num_bigint::BigInt;
 
 /// Dense native FP construction bounds shared by all fallible API builders.
-const MAX_API_FP_EXPONENT_BITS: u32 = 31;
-const MAX_API_FP_SIGNIFICAND_BITS: u32 = 1 << 20;
+const MAX_API_FP_EXPONENT_BITS: u32 = ay_fp::MAX_ENCODING_EXPONENT_BITS;
+const MAX_API_FP_SIGNIFICAND_BITS: u32 = ay_fp::MAX_ENCODING_SIGNIFICAND_BITS;
 
 impl Solver {
+    /// Construct a floating-point sort supported by the native encoding,
+    /// without allocating a term or any width-sized data.
+    pub fn try_fp_sort(&self, eb: u32, sb: u32) -> Result<Sort, SolverError> {
+        self.checked_fp_total_width("fp_sort", eb, sb)?;
+        Ok(Sort::FloatingPoint(eb, sb))
+    }
+
     pub(in crate::api) fn checked_fp_total_width(
         &self,
         operation: &'static str,

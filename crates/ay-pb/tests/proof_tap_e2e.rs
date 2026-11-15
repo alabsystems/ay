@@ -14,36 +14,22 @@ use std::process::Command;
 
 use ay_pb::cdcl::{PbCdclResult, PbCdclSolver};
 
-fn veripb_bin() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("VERIPB_BIN") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(path) = which_veripb() {
-        return Some(path);
-    }
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    let default = cache.join("ay-veripb/VeriPB/target/release/veripb");
-    default.exists().then_some(default)
-}
+const SUITE: &str = "proof_tap_e2e";
 
-fn which_veripb() -> Result<PathBuf, ()> {
-    let out = Command::new("which")
-        .arg("veripb")
-        .output()
-        .map_err(|_| ())?;
-    if !out.status.success() {
-        return Err(());
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err(());
-    }
-    Ok(PathBuf::from(path))
+/// The checker for this suite, or `None` when the machine has none.
+///
+/// This used to be a hand-rolled probe: `$VERIPB_BIN`, then `which veripb`,
+/// then a cache path — and not ONE probe run against whatever it found. Both
+/// halves were holes. The cache half was closed by requiring the pinned
+/// identity in the directory name; the `$VERIPB_BIN` and `$PATH` halves cannot
+/// be closed that way, because neither can carry an identity at all. So this
+/// now goes through the ONE resolver, which puts every candidate — from every
+/// source — through the self-test AND the twenty-two committed wrong-verdict
+/// fixtures. A probe that finds an unsound checker is worse than one that finds
+/// nothing: the suite then reads green having asked a binary with twenty-one
+/// known wrong-verdict defects.
+fn veripb_bin() -> Option<PathBuf> {
+    ay_test_support::veripb::optional_checker(SUITE)
 }
 
 struct TapRun {

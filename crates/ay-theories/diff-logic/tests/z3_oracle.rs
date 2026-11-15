@@ -8,49 +8,31 @@
 //!   4. on SAT, append our model as equality assertions and confirm **z3 still
 //!      returns sat** — real model validation, not just label agreement.
 //!
-//! The test SKIPS gracefully (passes, printing a note) when `z3` is not on
-//! `PATH`, and runs for real when it is present. The engine's own always-on
+//! The test SKIPS visibly (an `AY-TEST-SKIP` line; a failure under
+//! `Z3_DIFFERENTIAL_REQUIRED`) when no z3 is usable, and runs for real when one
+//! resolves: `Z3_PATH`, else the first z3 on `PATH` that proves it is z3,
+//! reached by path (`ay_test_support::z3`), never `z3` by name. The engine's own always-on
 //! `debug_assert!` self-certification covers soundness even in the skip case;
 //! this oracle is the external confirmation.
 
 use ay_diff_logic::atom::Op;
 use ay_diff_logic::{solve_int_atoms, solve_rational_atoms, BuildResult, DiffAtom};
+use ay_test_support::z3::{optional_z3, Z3Oracle};
 use num_rational::BigRational;
 use num_traits::Signed;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const N_VARS: usize = 6;
 const NUM_INSTANCES: usize = 400; // per logic (IDL, RDL)
 
-/// Locate a z3 binary, or `None` to skip.
-fn z3_path() -> Option<String> {
-    for cand in [
-        "z3",
-        "/opt/homebrew/bin/z3",
-        "/usr/local/bin/z3",
-        "/usr/bin/z3",
-    ] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.to_string());
-        }
-    }
-    None
-}
-
 /// Run a z3 SMT-LIB script and return its trimmed `(check-sat)` answer
 /// ("sat" / "unsat" / "unknown").
-fn run_z3(z3: &str, script: &str) -> String {
-    let mut child = Command::new(z3)
+fn run_z3(z3: &Z3Oracle, script: &str) -> String {
+    let mut child = z3
+        .command()
         .arg("-in")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -104,7 +86,8 @@ fn atom_smt_rat(a: &DiffAtom<BigRational>) -> String {
 /// SMT-LIB integer literal (negatives wrapped in `(- n)`).
 fn smt_int(n: i64) -> String {
     if n < 0 {
-        format!("(- {})", -n)
+        // `unsigned_abs`, not `-n`: `i64::MIN` has no positive i64.
+        format!("(- {})", n.unsigned_abs())
     } else {
         n.to_string()
     }
@@ -141,8 +124,7 @@ fn header(vars: usize, logic: &str, sort: &str) -> String {
 
 #[test]
 fn z3_oracle_idl() {
-    let Some(z3) = z3_path() else {
-        eprintln!("SKIP z3_oracle_idl: z3 not found on PATH");
+    let Some(z3) = optional_z3("ay-diff-logic z3_oracle_idl") else {
         return;
     };
     let mut rng = ChaCha8Rng::seed_from_u64(0xD1FF_10C0_1D10_0001);
@@ -178,7 +160,7 @@ fn z3_oracle_idl() {
             base.push_str(&atom_smt_int(a));
             base.push('\n');
         }
-        let z3_verdict = run_z3(&z3, &format!("{base}(check-sat)\n"));
+        let z3_verdict = run_z3(z3, &format!("{base}(check-sat)\n"));
 
         let our_label = match &ours {
             BuildResult::Sat { .. } => "sat",
@@ -198,7 +180,7 @@ fn z3_oracle_idl() {
                     val.push_str(&format!("(assert (= v{v} {}))\n", smt_int(*m)));
                 }
                 val.push_str("(check-sat)\n");
-                let mv = run_z3(&z3, &val);
+                let mv = run_z3(z3, &val);
                 assert_eq!(
                     mv, "sat",
                     "IDL MODEL REJECTED by z3 #{inst}: model={model:?} atoms={atoms:?}"
@@ -216,10 +198,9 @@ fn z3_oracle_idl() {
 }
 
 #[test]
-fn z3_oracle_rdl() {
-    let Some(z3) = z3_path() else {
-        eprintln!("SKIP z3_oracle_rdl: z3 not found on PATH");
-        return;
+fn z3_oracle_rdl() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(z3) = optional_z3("ay-diff-logic z3_oracle_rdl") else {
+        return Ok(());
     };
     let mut rng = ChaCha8Rng::seed_from_u64(0x5D10_AC1E_9900_0002);
     let ops = [Op::Le, Op::Lt, Op::Eq, Op::Ge, Op::Gt];
@@ -228,11 +209,14 @@ fn z3_oracle_rdl() {
     let mut unsat_count = 0usize;
     for inst in 0..NUM_INSTANCES {
         let n_atoms = rng.gen_range(1..=12);
-        let mut atoms: Vec<DiffAtom<BigRational>> = Vec::with_capacity(n_atoms);
+        let mut atoms: Vec<DiffAtom<BigRational>> = Vec::new();
+        atoms.try_reserve(n_atoms)?;
         for _ in 0..n_atoms {
             let x = rng.gen_range(0..N_VARS);
             let y = rng.gen_range(0..N_VARS);
-            let op = ops[rng.gen_range(0..ops.len())];
+            let op = *ops
+                .get(rng.gen_range(0..ops.len()))
+                .ok_or("operator index out of range")?;
             let num = rng.gen_range(-15i64..=15);
             let den = rng.gen_range(1i64..=6);
             let c = BigRational::new(num.into(), den.into());
@@ -254,12 +238,14 @@ fn z3_oracle_rdl() {
             base.push_str(&atom_smt_rat(a));
             base.push('\n');
         }
-        let z3_verdict = run_z3(&z3, &format!("{base}(check-sat)\n"));
+        let z3_verdict = run_z3(z3, &format!("{base}(check-sat)\n"));
 
         let our_label = match &ours {
             BuildResult::Sat { .. } => "sat",
             BuildResult::Unsat { .. } => "unsat",
-            BuildResult::Rejected => unreachable!(),
+            BuildResult::Rejected => {
+                return Err(format!("engine rejected RDL instance #{inst}").into())
+            }
         };
         assert_eq!(
             our_label, z3_verdict,
@@ -273,19 +259,22 @@ fn z3_oracle_rdl() {
                     val.push_str(&format!("(assert (= v{v} {}))\n", smt_rat(m)));
                 }
                 val.push_str("(check-sat)\n");
-                let mv = run_z3(&z3, &val);
+                let mv = run_z3(z3, &val);
                 assert_eq!(
                     mv, "sat",
                     "RDL MODEL REJECTED by z3 #{inst}: model={model:?} atoms={atoms:?}"
                 );
-                sat_validated += 1;
+                sat_validated = sat_validated.saturating_add(1);
             }
-            BuildResult::Unsat { .. } => unsat_count += 1,
-            BuildResult::Rejected => unreachable!(),
+            BuildResult::Unsat { .. } => unsat_count = unsat_count.saturating_add(1),
+            BuildResult::Rejected => {
+                return Err(format!("engine rejected RDL instance #{inst}").into())
+            }
         }
     }
     eprintln!(
         "z3_oracle_rdl: {NUM_INSTANCES} instances cross-checked, {sat_validated} SAT models \
          validated, {unsat_count} UNSAT agreed; 0 disagreements"
     );
+    Ok(())
 }

@@ -122,6 +122,29 @@ fn emit_special_optimality(emission: &mut Emission<'_, '_>) -> EmittedClaim {
     // branched MILP, so its job is to catch what those miss -- which makes this
     // lane purely ADDITIVE: no verdict that already shipped succinct dual
     // evidence has its evidence changed by the tree existing.
+    // THE STREAMED FORM FIRST. It is the same block — same records, same
+    // pre-order, byte for byte — produced without ever holding the tree, and
+    // it is what a `solve` now hands over. The in-memory form below stays for
+    // in-process callers that hold a typed `MilpOptimalityCertificate`.
+    if let Some(body) = emission.ctx.milp_optimality_tree_block {
+        let admitted = emission.admit_opt_tree_body(body);
+        return EmittedClaim {
+            name: "dual",
+            kind: if admitted {
+                EvidenceKind::Succinct
+            } else {
+                EvidenceKind::None
+            },
+            source: Some(
+                if admitted {
+                    "optimality-tree"
+                } else {
+                    "truncated"
+                }
+                .into(),
+            ),
+        };
+    }
     if let Some(certificate) = emission.ctx.milp_optimality_tree_certificate {
         return emission.block_claim(
             "dual",

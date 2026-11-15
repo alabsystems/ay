@@ -150,6 +150,15 @@ pub unsafe extern "C" fn Z3_mk_uninterpreted_sort(c: Z3_context, s: Z3_symbol) -
                 ));
                 return ptr::null_mut();
             }
+            // A datatype of this name would share the engine sort (both lower
+            // to `Uninterpreted(name)`): refused, never merged (libz3 5.1.0
+            // keeps `EnumSort('C')` and `DeclareSort('C')` apart, `sat`).
+            if let Some(reason) = super::uninterpreted_sort_name_collision(ctx, &semantic_name) {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(format!("Z3_mk_uninterpreted_sort: {reason}"));
+                return ptr::null_mut();
+            }
+            ctx.uninterpreted_sort_names.insert(semantic_name.clone());
             let sort = Sort::Uninterpreted(semantic_name.clone());
             ctx.ffi_sort_symbols.insert(sort.clone(), symbol.clone());
             alloc_sort(ctx, sort)
@@ -237,6 +246,9 @@ pub unsafe extern "C" fn Z3_get_sort_kind(_c: Z3_context, t: Z3_sort) -> c_uint 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(_c, Z3_UNKNOWN_AST, |ctx| {
+            if (*t).sort == super::proof_dag::proof_sort() {
+                return super::Z3_UNKNOWN_SORT;
+            } // Z3_UNKNOWN_SORT
             if super::finite_set_basis(ctx, &(*t).sort).is_some() {
                 return super::FINITE_SET_SORT_KIND;
             }
@@ -244,8 +256,15 @@ pub unsafe extern "C" fn Z3_get_sort_kind(_c: Z3_context, t: Z3_sort) -> c_uint 
                 Sort::Bool => Z3_BOOL_SORT,
                 Sort::Int => Z3_INT_SORT,
                 Sort::Real => Z3_REAL_SORT,
+                Sort::Complex => super::Z3_COMPLEX_SORT,
+                Sort::FiniteField(_) => super::Z3_FINITE_FIELD_SORT,
                 Sort::BitVec(_) => Z3_BV_SORT,
                 Sort::Array(_) => Z3_ARRAY_SORT,
+                // z3py builds FPRef / FPRMRef values only for these kinds
+                // (measured: an `If` over Float16 values was a plain ExprRef,
+                // and every fp.* constructor over it raised).
+                Sort::FloatingPoint(_, _) => super::Z3_FLOATING_POINT_SORT,
+                Sort::Uninterpreted(name) if name == "RoundingMode" => super::Z3_ROUNDING_MODE_SORT,
                 Sort::Uninterpreted(_) => Z3_UNINTERPRETED_SORT,
                 // An algebraic datatype (declared via Z3_mk_datatype /
                 // declare-datatypes) reports Z3_DATATYPE_SORT, matching z3py's
@@ -360,6 +379,9 @@ pub unsafe extern "C" fn Z3_sort_to_string(c: Z3_context, s: Z3_sort) -> *const 
     // so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            if (*s).sort == super::proof_dag::proof_sort() {
+                return cache_string(ctx, "Proof".to_owned());
+            }
             let sort_str = if super::sort_mentions_finite_set(ctx, &(*s).sort) {
                 super::render_public_sort(ctx, &(*s).sort)
             } else {

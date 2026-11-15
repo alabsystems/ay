@@ -11,7 +11,16 @@
 //!
 //! Reference: CaDiCaL `internal.hpp:481-495` (shared mark/unmark API).
 
+mod counted;
+
+use crate::kani_compat::DetHashMap;
 use crate::literal::{Literal, Variable};
+
+/// Variables with an index below this bound keep their mark in the dense
+/// array; the array therefore never grows to 2^28 entries. Marks for the
+/// (rare) variables at or above it live in a sparse side table, so every
+/// variable index a `Literal` can carry is still marked exactly.
+const MAX_DENSE_MARK_VARS: usize = (1 << 28) - 1;
 
 /// Shared signed mark array for tautology checking.
 ///
@@ -24,46 +33,85 @@ use crate::literal::{Literal, Variable};
 /// and need tautology / duplicate detection.
 #[derive(Clone)]
 pub(crate) struct LitMarks {
+    /// Dense marks for variables below `MAX_DENSE_MARK_VARS`.
     marks: Vec<i8>,
+    /// Non-zero marks for variables at or above `MAX_DENSE_MARK_VARS`.
+    overflow: DetHashMap<usize, i8>,
 }
 
 impl LitMarks {
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
-            marks: vec![0; num_vars],
+            marks: vec![0; num_vars.min(MAX_DENSE_MARK_VARS)],
+            overflow: DetHashMap::default(),
         }
     }
 
     pub(crate) fn ensure_num_vars(&mut self, num_vars: usize) {
-        if self.marks.len() < num_vars {
-            self.marks.resize(num_vars, 0);
+        let dense = num_vars.min(MAX_DENSE_MARK_VARS);
+        if self.marks.len() < dense && dense <= MAX_DENSE_MARK_VARS {
+            self.marks.resize(dense, 0);
+        }
+    }
+
+    /// Current mark of the variable at `idx` (`0` if never marked).
+    #[inline]
+    fn mark_at(&self, idx: usize) -> i8 {
+        if idx < MAX_DENSE_MARK_VARS {
+            self.marks.get(idx).copied().unwrap_or(0)
+        } else {
+            self.overflow.get(&idx).copied().unwrap_or(0)
+        }
+    }
+
+    /// Set the mark of the variable at `idx`, growing the dense array on
+    /// demand, and return the previous mark.
+    #[inline]
+    fn set_mark_at(&mut self, idx: usize, value: i8) -> i8 {
+        if idx < MAX_DENSE_MARK_VARS {
+            if idx >= self.marks.len() {
+                // `idx < MAX_DENSE_MARK_VARS`, so the new length stays below
+                // 2^28 and cannot overflow.
+                let Some(len) = idx.checked_add(1) else {
+                    return 0;
+                };
+                if len <= MAX_DENSE_MARK_VARS {
+                    self.marks.resize(len, 0);
+                }
+            }
+            match self.marks.get_mut(idx) {
+                Some(slot) => std::mem::replace(slot, value),
+                None => 0,
+            }
+        } else if value == 0 {
+            self.overflow.remove(&idx).unwrap_or(0)
+        } else {
+            self.overflow.insert(idx, value).unwrap_or(0)
         }
     }
 
     /// Mark a literal's variable with its polarity and return the previous mark.
     #[inline]
     pub(crate) fn mark(&mut self, lit: Literal) -> i8 {
-        let idx = lit.variable().index();
-        if idx >= self.marks.len() {
-            self.marks.resize(idx + 1, 0);
-        }
-        let prev = self.marks[idx];
-        self.marks[idx] = lit.sign_i8();
-        prev
+        self.set_mark_at(lit.variable().index(), lit.sign_i8())
     }
 
     /// Get the mark for a variable (`0` if out of bounds).
     #[inline]
     pub(crate) fn get(&self, var: Variable) -> i8 {
-        self.marks.get(var.index()).copied().unwrap_or(0)
+        self.mark_at(var.index())
     }
 
     /// Clear a literal variable mark.
     #[inline]
     pub(crate) fn clear(&mut self, lit: Literal) {
         let idx = lit.variable().index();
-        if idx < self.marks.len() {
-            self.marks[idx] = 0;
+        if idx < MAX_DENSE_MARK_VARS {
+            if let Some(slot) = self.marks.get_mut(idx) {
+                *slot = 0;
+            }
+        } else {
+            self.overflow.remove(&idx);
         }
     }
 
@@ -82,9 +130,15 @@ impl LitMarks {
     /// for unpromoted ones.
     #[inline]
     pub(crate) fn promote(&mut self, var: Variable) {
+        // Marks are 0, ±1 or ±2, so doubling is exact; saturation only
+        // bounds the arithmetic for values no caller produces.
         let idx = var.index();
-        if idx < self.marks.len() {
-            self.marks[idx] *= 2;
+        if idx < MAX_DENSE_MARK_VARS {
+            if let Some(slot) = self.marks.get_mut(idx) {
+                *slot = slot.saturating_mul(2);
+            }
+        } else if let Some(slot) = self.overflow.get_mut(&idx) {
+            *slot = slot.saturating_mul(2);
         }
     }
 
@@ -139,20 +193,17 @@ impl LitMarks {
             }
 
             let var_idx = mapped.variable().index();
-            if var_idx >= self.marks.len() {
-                self.marks.resize(var_idx + 1, 0);
-            }
-
             let sign = mapped.sign_i8();
-            let mark = self.marks[var_idx];
-            if mark == -sign {
+            let complement: i8 = if mapped.is_positive() { -1 } else { 1 };
+            let mark = self.mark_at(var_idx);
+            if mark == complement {
                 // Complementary literal — tautology.
                 self.clear_clause(out);
                 out.clear();
                 return ClauseRewriteOutcome::Tautology;
             }
             if mark == 0 {
-                self.marks[var_idx] = sign;
+                self.set_mark_at(var_idx, sign);
                 out.push(mapped);
             }
             // mark == sign → duplicate, skip

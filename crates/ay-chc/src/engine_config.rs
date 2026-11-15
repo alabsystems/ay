@@ -73,6 +73,14 @@ impl ChcEngineConfig {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
             || TermStore::global_memory_exceeded()
+            // Rung 0 (CHC-COMP 2026, T3): an expired thread SMT deadline makes
+            // every further `check_sat` an instant Unknown, so the engine loop
+            // cannot progress — stop it instead of spinning to the watchdog.
+            // Only ever degrades the verdict to Unknown.
+            || crate::smt::smt_deadline_expired()
+            // Inside a CHC proof run under an effort, its count's latched stop
+            // (P4a slice 8): an engine the run starts ends with it.
+            || crate::run_meter::run_stopped()
     }
 
     /// Builder: set verbose logging.

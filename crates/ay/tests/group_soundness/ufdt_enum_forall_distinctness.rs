@@ -140,3 +140,104 @@ fn ufdt_enum_exists_witness_is_sat() {
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+/// Mechanism pin for [`ufdt_enum_exists_witness_is_sat`].
+///
+/// Since the quantified fail-closed model gate landed (ce801b029), a `sat`
+/// with a quantified assertion publishes only on the gate's own `confirmed`.
+/// An existential confirms only on a CLEAN check, and the nullary
+/// constructor `S` (a `Var` in the term store) was collected as a free leaf
+/// whose datatype value has no pin term, so the check was never clean
+/// (`existential witness under partial pins`) and the genuine `sat` failed
+/// closed to `unknown`. A nullary constructor is interpreted, like a literal,
+/// and needs no pin: the gate must now confirm this existential itself.
+#[test]
+#[timeout(30_000)]
+fn ufdt_enum_exists_witness_is_confirmed_by_the_quantified_gate() {
+    let src = "(set-logic UFDT)\n\
+               (declare-datatype E ((R) (S)))\n\
+               (assert (exists ((c E)) (= c S)))\n\
+               (check-sat)\n\
+               (get-info :all-statistics)\n";
+    let (stdout, stderr) = run_ay(src);
+    assert_eq!(
+        verdict(&stdout),
+        "sat",
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(":model-check-gate.quantified ")
+                && line.contains("\"confirmed\"")),
+        "the quantified model gate itself must confirm the witness.\nstdout:\n{stdout}"
+    );
+}
+
+/// Negative controls for the constructor-leaf rule: treating a nullary
+/// constructor as interpreted must never let the gate confirm an existential
+/// that is false. Each of these is UNSAT (z3 agrees); `sat` is a soundness bug.
+#[test]
+#[timeout(60_000)]
+fn ufdt_enum_false_existentials_must_not_be_sat() {
+    for body in [
+        "(assert (exists ((c E)) (and (= c R) (= c S))))",
+        "(declare-const d E)\n(assert (not (= d S)))\n\
+         (assert (exists ((c E)) (and (= c d) (= c S))))",
+        "(declare-fun g (E) Bool)\n(assert (not (g S)))\n\
+         (assert (exists ((c E)) (and (g c) (= c S))))",
+    ] {
+        let src =
+            format!("(set-logic UFDT)\n(declare-datatype E ((R) (S)))\n{body}\n(check-sat)\n");
+        let (stdout, stderr) = run_ay(&src);
+        assert_ne!(
+            verdict(&stdout),
+            "sat",
+            "Soundness regression: a false enum existential reported `sat`.\n\
+             input:\n{src}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Wrong-UNSAT guard: satisfiable enum existentials under a logic with
+/// arithmetic. `UFDTLIA` routes through the N-O UFLIA combiner. There the
+/// finite-enum Skolem coverage (`add_enum_skolem_coverage`, 70959bd33) spells
+/// each nullary constructor as a 0-ary application `(S)`, while the frontend
+/// binds the same constructor to a `Var`; the D0 datatype pass's ground
+/// structural-disequality rule (`ay-dt` `egraph_pass`, c95b28139) judged the
+/// two spellings different ground values and emitted a fabricated
+/// `ground-diseq` lemma, so AY answered `unsat` (z3: `sat`) in the default
+/// posture. Every case below answered `unsat` before the fix. `unsat` is a
+/// soundness bug; `sat` or `unknown` are acceptable.
+#[test]
+#[timeout(60_000)]
+fn ufdtlia_enum_satisfiable_existentials_must_not_be_unsat() {
+    for (decls, body) in [
+        (
+            "(declare-datatype E ((R) (S)))",
+            "(assert (exists ((c E)) (= c S)))",
+        ),
+        (
+            "(declare-datatype E ((R) (S) (T)))",
+            "(assert (exists ((c E)) (= c T)))",
+        ),
+        (
+            "(declare-datatype E ((R) (S)))\n(declare-const k Int)",
+            "(assert (exists ((c E)) (= c R)))",
+        ),
+        (
+            "(declare-datatype E ((R) (S) (T)))\n\
+             (declare-datatype L ((nil) (cons (hd Int) (tl L))))",
+            "(assert (exists ((c E) (e E)) (and (distinct c e) (distinct c R) (distinct e R))))",
+        ),
+    ] {
+        let src = format!("(set-logic UFDTLIA)\n{decls}\n{body}\n(check-sat)\n");
+        let (stdout, stderr) = run_ay(&src);
+        assert_ne!(
+            verdict(&stdout),
+            "unsat",
+            "Soundness regression: a satisfiable enum existential reported `unsat`.\n\
+             input:\n{src}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}

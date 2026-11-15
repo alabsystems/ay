@@ -1,0 +1,4 @@
+* #variable= 2 #constraint= 1
+preserved: x1 ;
+min: 1 x1 ;
+1 x1 1 x2 >= 1 ;

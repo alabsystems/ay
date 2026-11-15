@@ -44,6 +44,9 @@ impl Ic3Solver {
     /// Returns true if a fixpoint is detected (some frame i becomes empty
     /// after propagation, meaning every clause at level i propagated up).
     pub(super) fn propagate(&mut self) -> bool {
+        if self.resource_exhausted() {
+            return false;
+        }
         let k = self.frames.len() - 1;
 
         for i in 1..k {
@@ -54,7 +57,16 @@ impl Ic3Solver {
             let clauses = std::mem::take(&mut self.frames[i].blocked_clauses);
             let mut retained: Vec<Vec<Literal>> = Vec::with_capacity(clauses.len());
 
-            for clause in clauses {
+            let mut pending = clauses.into_iter();
+            while let Some(clause) = pending.next() {
+                if self.resource_exhausted() {
+                    // Previously propagated clauses remain at their proved
+                    // levels. Restore every other clause in original order.
+                    retained.push(clause);
+                    retained.extend(pending);
+                    self.frames[i].blocked_clauses = retained;
+                    return false;
+                }
                 // Check if this clause is inductive relative to F_i.
                 // The clause blocks a cube; we check if the cube (negated clause)
                 // is inductive relative to frame i + 1 (using F_i as the
@@ -80,6 +92,12 @@ impl Ic3Solver {
             }
 
             self.frames[i].blocked_clauses = retained;
+
+            // Unknown retains its clause above and terminates the attempt; it
+            // must not be interpreted as an empty-frame fixpoint.
+            if self.resource_exhausted() {
+                return false;
+            }
 
             // Fixpoint: under delta encoding, F_i is exactly its own delta
             // clauses plus F_{i+1}. If no clauses remain stored at level i,

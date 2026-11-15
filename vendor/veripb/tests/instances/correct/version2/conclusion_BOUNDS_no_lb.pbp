@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 2.0
+f 3
+* derive naive lower bound
+p ~x1 ~x2 ~x3 + +
+* conclude bounds
+output NONE
+conclusion BOUNDS 0 : 4 2 : x1 ~x2 ~x3
+end pseudo-Boolean proof

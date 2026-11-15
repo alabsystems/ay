@@ -29,6 +29,7 @@ use std::io;
 mod bounded;
 mod learned_lrat_json;
 mod live_id_set;
+mod veripb_rup;
 use live_id_set::LiveIdSet;
 
 #[cfg(test)]
@@ -315,6 +316,12 @@ pub(crate) struct ProofManager {
     /// representation delivers ~64× memory reduction on long proofs
     /// without any change to LRAT file output bytes (#8599).
     known_lrat_ids: LiveIdSet,
+    /// Live inputs eligible for an explicitly optional arena-collection delete.
+    /// A required deletion always revokes this identity's proof authority.
+    ledger_original_ids: LiveIdSet,
+    /// Restoring a deleted/unbound input cannot revive its serialized proof ID.
+    /// This refusal is sticky and distinct from the Fmla replay exception.
+    ledger_replay_failure: bool,
     /// Count of proof-visible LRAT IDs removed from `known_lrat_ids` since
     /// the previous shrink. This gates expensive bitmap rebuilds after
     /// reductions that did not actually delete proof-visible IDs.
@@ -399,6 +406,8 @@ impl ProofManager {
             learned_lrat_authority_records: Vec::new(),
             lrat_blocked_by_theory_lemmas: false,
             known_lrat_ids: LiveIdSet::new(),
+            ledger_original_ids: LiveIdSet::new(),
+            ledger_replay_failure: false,
             known_lrat_ids_deleted_since_shrink: 0,
             trusted_lrat_ids: det_hash_set_new(),
             backward_reserved_ids: LiveIdSet::new(),
@@ -450,6 +459,43 @@ impl ProofManager {
             || (self.known_lrat_ids.contains(clause_id)
                 && !self.trusted_lrat_ids.contains(&clause_id)
                 && !self.backward_reserved_ids.contains(clause_id))
+    }
+
+    /// Retention is not registration and never revives an invisible/deleted ID.
+    pub(crate) fn retain_ledger_original_id(&mut self, clause_id: u64) {
+        if self.lrat_mode && self.lrat_id_usable_as_hint(clause_id) {
+            self.ledger_original_ids.insert(clause_id);
+        }
+    }
+
+    pub(crate) fn retainable_ledger_original_id(&self, clause_id: u64) -> bool {
+        self.ledger_original_ids.contains(clause_id) && self.lrat_id_usable_as_hint(clause_id)
+    }
+
+    pub(crate) fn preflight_ledger_replay(&mut self, clause_ids: Option<&[u64]>) -> bool {
+        if !self.lrat_mode {
+            return true;
+        }
+        if self.ledger_replay_failure {
+            return false;
+        }
+        if !clause_ids.is_some_and(|ids| ids.iter().all(|&id| self.lrat_id_usable_as_hint(id))) {
+            self.ledger_replay_failure = true;
+            self.lrat_structural_failure = true;
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn ledger_replay_failed(&self) -> bool {
+        self.ledger_replay_failure
+    }
+
+    pub(crate) fn refresh_ledger_original_ids(&mut self, clause_ids: &[u64]) {
+        self.ledger_original_ids.clear();
+        for &clause_id in clause_ids {
+            self.retain_ledger_original_id(clause_id);
+        }
     }
 
     #[inline]
@@ -2126,6 +2172,7 @@ impl ProofManager {
 
     #[inline]
     fn remove_known_lrat_id(&mut self, clause_id: u64) {
+        self.ledger_original_ids.remove(clause_id);
         if self.known_lrat_ids.remove(clause_id) {
             self.known_lrat_ids_deleted_since_shrink =
                 self.known_lrat_ids_deleted_since_shrink.saturating_add(1);
@@ -2528,6 +2575,11 @@ impl ProofManager {
     }
 
     #[inline]
+    pub(crate) fn output_mut(&mut self) -> &mut ProofOutput {
+        &mut self.output
+    }
+
+    #[inline]
     pub(crate) fn into_output(self) -> ProofOutput {
         self.output
     }
@@ -2650,9 +2702,6 @@ impl ProofManager {
     pub(crate) fn cleanup_debug_tracking(&mut self, threshold: usize) {
         if self.deleted_lrat_ids.len() > threshold {
             self.deleted_lrat_ids.clear();
-            // `BTreeSet` (the `#[cfg(kani)]` backend) has no `shrink_to`; `clear`
-            // already releases its nodes there.
-            #[cfg(not(kani))]
             self.deleted_lrat_ids.shrink_to(0);
         }
     }

@@ -4,7 +4,7 @@
 
 use crate::expr::Expr;
 use crate::program::AYProgram;
-use crate::sort::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
+use crate::sort::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort, SortInner};
 
 #[test]
 fn test_clear_commands_preserves_consts() {
@@ -51,9 +51,12 @@ fn test_clear_commands_preserves_datatypes() {
             ],
         }],
     };
-    program.declare_datatype(dt);
+    program.declare_datatype(dt.clone());
+    // A `Pair` with constructor `Pair_mk` is a different definition under the
+    // name; the constant carries the declared descriptor.
     let pair_sort = Sort::struct_type("Pair", [("fst", Sort::int()), ("snd", Sort::int())]);
-    let _p = program.declare_const("p", pair_sort);
+    assert!(program.try_declare_const("q", pair_sort).is_err());
+    let _p = program.declare_const("p", Sort::from_inner(SortInner::Datatype(dt)));
     program.check_sat();
 
     program.clear_commands();

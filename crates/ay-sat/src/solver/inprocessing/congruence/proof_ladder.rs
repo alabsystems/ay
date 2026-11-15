@@ -21,14 +21,18 @@
 //! level above. The final k=0 clauses are the equivalence binaries
 //! themselves, emitted by the caller. Every rung is individually RUP-probed
 //! before emission — a failed probe rolls the ladder back and skips the edge
-//! (fail-closed: coverage loss, never unsoundness). Rungs are deleted from
-//! the proof and DB once the edge binaries are in.
+//! (fail-closed: coverage loss, never unsoundness). Rungs stay in the proof;
+//! in the solver they are unwatched arena clauses the edge's probes
+//! (`frozen_probe.rs`) propagate through, rolled back out of the arena once
+//! those probes are done, so the clause DB, its offsets and the watch lists
+//! are the ones a run without a proof has.
 //!
 //! Emission is PROGRESSIVE (edge order = closure merge order): probes run
 //! against the DB including previously inserted edge binaries, so chained
 //! merges whose representatives depend on earlier merges verify.
 
 use super::super::super::*;
+use crate::clause_arena::ArenaAppendMark;
 use crate::congruence::{CongruenceResult, EdgeProvenance};
 use crate::kani_compat::DetHashSet as HashSet;
 
@@ -47,9 +51,12 @@ impl Solver {
         // The rung probes must see EXACTLY the state the DRAT checker will
         // reconstruct at this proof offset. Two live/checker divergence
         // sources are neutralized here:
-        //  1. Stale watches let probes propagate through clauses whose proof
-        //     deletion was already emitted (reduce_db / forward subsumption
-        //     delete lazily) — flush first.
+        //  1. Stale watches could let probes propagate through clauses whose
+        //     proof deletion was already emitted (reduce_db / forward
+        //     subsumption delete lazily). The probes (`frozen_rup_probe`)
+        //     skip every dead clause, binary or long, instead of flushing the
+        //     watch lists: a flush here, which a run without a proof never
+        //     does, changed later tick charges (posture screen, 29a27e97).
         //  2. The probes start from the solver's level-0 trail, which
         //     accumulates units from earlier probe side effects and BCP that
         //     are not necessarily proof adds at this offset. Mirror every
@@ -57,7 +64,6 @@ impl Solver {
         //     RUP from proof-visible clauses (it was BCP-derived from them),
         //     and re-adding an already-present unit is a trivially-RUP no-op
         //     for the checker.
-        self.flush_watches();
         self.mirror_all_fixed_units();
         let mut mirrored_upto = self.trail().len();
         let saved_propagations = self.num_propagations;
@@ -96,9 +102,12 @@ impl Solver {
                 continue;
             }
 
-            let mut fwd = self.is_rup_binary_under_negation(lhs.negated(), rhs);
-            let mut bwd = self.is_rup_binary_under_negation(lhs, rhs.negated());
+            // `--sat-veripb-hints`: the probes also read each binary's hint ids.
+            let (mut fwd, mut fwd_ids) = self.rup_binary_with_veripb_hints(lhs.negated(), rhs, &[]);
+            let (mut bwd, mut bwd_ids) = self.rup_binary_with_veripb_hints(lhs, rhs.negated(), &[]);
             let mut rungs: Vec<usize> = Vec::new();
+            // Rungs are appended from here; the arena returns to this mark.
+            let rung_mark = self.arena.append_mark();
             // Ladder pattern variables by provenance: XOR-match edges use the
             // shared canonical inputs; ITE-match edges use the shared
             // condition (the two-rung-per-direction Kissat ITE chain,
@@ -113,34 +122,37 @@ impl Solver {
             let is_chain_candidate = ladder_vars.is_some();
             if (!fwd || !bwd) && is_chain_candidate {
                 if let Some(vars) = ladder_vars {
-                    if let Some(r) =
-                        self.try_emit_xor_matching_ladder(lhs, rhs, &vars, &mut mirrored_upto)
-                    {
-                        rungs = r;
+                    if self.try_emit_xor_matching_ladder(
+                        lhs,
+                        rhs,
+                        &vars,
+                        &mut mirrored_upto,
+                        &mut rungs,
+                    ) {
                         if !fwd {
-                            fwd = self.is_rup_binary_under_negation(lhs.negated(), rhs);
+                            (fwd, fwd_ids) =
+                                self.rup_binary_with_veripb_hints(lhs.negated(), rhs, &rungs);
                         }
                         if !bwd {
-                            bwd = self.is_rup_binary_under_negation(lhs, rhs.negated());
+                            (bwd, bwd_ids) =
+                                self.rup_binary_with_veripb_hints(lhs, rhs.negated(), &rungs);
                         }
                     }
                 }
             }
+            // The rungs served this edge's probes alone: once its binaries are
+            // probed (subsumed by them, or refuted) they leave the solver.
+            let retired = self.retire_ladder_rungs(&rungs, rung_mark);
 
             if !fwd || !bwd {
                 self.inproc.congruence.stats_mut().non_rup_equivalences += 1;
                 if is_chain_candidate {
                     self.inproc.congruence.stats_mut().xor_ladder_failures += 1;
                 }
-                // Rungs emitted before the failure STAY: each passed its RUP
-                // probe (checker-valid implied clause), and deleting them
-                // mid-pass makes the live probe state diverge from the
-                // checker's view — later probes can propagate through
-                // garbage-kept clauses via stale watches while the checker
-                // honors the deletion, producing verdict-correct but
-                // NOT-VERIFIED proofs (observed on eq.atree.braun.8/.10).
-                // Normal clause management (reduce_db) reclaims them later
-                // with properly ordered proof deletions.
+                // Nothing will cite the rungs: delete them from the proof too,
+                // or they stay live in the checker's database for the rest of
+                // the proof (every later `red` scans them).
+                self.delete_retired_rungs(retired);
                 continue;
             }
 
@@ -148,9 +160,12 @@ impl Solver {
                 self.inproc.congruence.stats_mut().xor_ladders_emitted += 1;
             }
             self.mirror_new_trail_units(&mut mirrored_upto);
-            self.insert_congruence_equivalence_binary_pair(lhs, rhs, &[], &[]);
+            let (fwd_ids, bwd_ids) = (fwd_ids.unwrap_or_default(), bwd_ids.unwrap_or_default());
+            self.insert_congruence_equivalence_binary_pair(lhs, rhs, &fwd_ids, &bwd_ids);
+            // The binaries' hints may cite rungs, so the rungs go after them;
+            // the binaries subsume every rung.
+            self.delete_retired_rungs(retired);
             emitted_edges.push((lhs, rhs));
-            // Rungs stay in the DB and proof — see the failure-path comment.
         }
 
         // Restore counters to keep scheduling deterministic (probe pattern).
@@ -187,15 +202,25 @@ impl Solver {
     /// a rung probed pre-falsified against it, but its first proof add sat
     /// 26k steps later — the rung was checker-rejected (step 143161). Scans
     /// `vals` via lit_value; the bitmap dedups across passes.
+    ///
+    /// Every XOR ladder rung repeats the scan, so a unit already mirrored is
+    /// passed over on its value and the bitmap alone: on 30e8b477 the scan
+    /// that read each fixed variable's level and called `mirror_unit_once`
+    /// for it took 13 of 35 s of preprocessing.
     fn mirror_all_fixed_units(&mut self) {
+        if self.cold.proof_mirrored_units.len() < self.num_vars * 2 {
+            self.cold
+                .proof_mirrored_units
+                .resize(self.num_vars * 2, false);
+        }
         for v in 0..self.num_vars {
             let lit = Literal::positive(Variable(v as u32));
-            let lit = match self.lit_value(lit) {
-                Some(true) => lit,
-                Some(false) => lit.negated(),
-                None => continue,
+            let lit = match self.vals[lit.index()] {
+                0 => continue,
+                val if val > 0 => lit,
+                _ => lit.negated(),
             };
-            if self.var_data[v].level != 0 {
+            if self.cold.proof_mirrored_units[lit.index()] || self.var_data[v].level != 0 {
                 continue;
             }
             self.mirror_unit_once(lit);
@@ -215,34 +240,38 @@ impl Solver {
             return;
         }
         self.cold.proof_mirrored_units[li] = true;
-        self.proof_emit_unit(unit, &[], ProofAddKind::Derived);
+        // `--sat-veripb-hints`: stated from its level-0 reason (veripb_units.rs).
+        if !self.veripb_state_root_unit(unit, None) {
+            self.proof_emit_unit(unit, &[], ProofAddKind::Derived);
+        }
     }
 
-    /// Emit the intermediate ladder rungs for one XOR-match edge. Returns
-    /// the arena indices of the inserted rungs, or `None` (with full
-    /// rollback) if any rung fails its RUP probe.
+    /// Emit the intermediate ladder rungs for one XOR-match edge, pushing
+    /// their arena indices onto `rungs`. Returns `false` if any rung fails
+    /// its RUP probe; the rungs emitted before it stay in `rungs` for the
+    /// caller to retire with the rest.
     fn try_emit_xor_matching_ladder(
         &mut self,
         l1: Literal,
         l2: Literal,
         xrhs: &[usize],
         mirrored_upto: &mut usize,
-    ) -> Option<Vec<usize>> {
+        rungs: &mut Vec<usize>,
+    ) -> bool {
         let n = xrhs.len();
         // n==1 is the ITE matching chain (two rungs per direction over
         // ±cond); cap the exponential at the extraction arity limit.
         if !(1..=5).contains(&n) {
-            return None;
+            return false;
         }
         let num_lits = self.num_vars * 2;
         for &v in xrhs {
             let var = v / 2;
             if v >= num_lits || var == l1.variable().index() || var == l2.variable().index() {
-                return None;
+                return false;
             }
         }
 
-        let mut rungs: Vec<usize> = Vec::new();
         for (a, b) in [(l1.negated(), l2), (l1, l2.negated())] {
             for k in (1..n).rev() {
                 let vars = &xrhs[n - k..];
@@ -263,88 +292,81 @@ impl Solver {
                     // after the first pass.
                     self.mirror_all_fixed_units();
                     self.mirror_new_trail_units(mirrored_upto);
-                    if !self.is_rup_clause_under_negation(&lits) {
-                        // Keep already-emitted rungs (checker-valid; see the
-                        // failure-path comment in the caller).
-                        return None;
+                    let (rup, veripb_ids) =
+                        self.rup_clause_with_veripb_hints(&lits, rungs.as_slice());
+                    if !rup {
+                        // Already-emitted rungs stay in the proof
+                        // (checker-valid; see the failure-path comment in the
+                        // caller); the caller takes them out of the solver.
+                        return false;
+                    }
+                    if let Some(ids) = &veripb_ids {
+                        self.veripb_ready_hints(&lits, ids);
                     }
                     let idx = self.insert_ladder_rung(&lits);
                     rungs.push(idx);
                 }
             }
         }
-        Some(rungs)
+        true
     }
 
-    /// Add one rung to the proof and the clause DB (learned, watched) so
-    /// later rungs and the edge binaries can RUP-propagate through it.
+    /// Add one rung to the proof and the arena (irredundant, never watched):
+    /// the edge's later rung and binary probes propagate through it as one of
+    /// their `rungs` (`frozen_rup_probe`), and `retire_ladder_rungs` removes
+    /// it once they are done. Unwatched, a rung cannot be the 3-literal
+    /// clause watched as a binary that once propagated a phantom unit
+    /// (f0bafebd, wf_0c7d84e9), nor move any watch a run without a proof has.
+    /// Irredundant because a learned add grows the arena's learned index (a
+    /// `Vec` and a hash table whose capacities `memory_bytes` reads, the table
+    /// keeping a tombstone after the removal), which `rollback_appends`
+    /// cannot return to its old capacity; nothing reads the flag of a clause
+    /// that lives only for one edge's probes.
     fn insert_ladder_rung(&mut self, lits: &[Literal]) -> usize {
         let pid = self
             .proof_emit_add(lits, &[], ProofAddKind::Derived)
             .unwrap_or(0);
-        let idx = self.arena.add(lits, true);
-        self.cold.clause_ids_grow_for(idx);
-        self.cold.clause_ids[idx] = if pid != 0 {
+        let idx = self.arena.add(lits, false);
+        let cid = if pid != 0 {
             pid
         } else {
             let id = self.cold.next_clause_id;
             self.cold.next_clause_id += 1;
             id
         };
-        let cref = ClauseRef(idx as u32);
-        let mut watched_lits: Vec<Literal> = lits.to_vec();
-        // A rung containing root-assigned literals may not expose two
-        // watchable literals; leave it unwatched then (still in the proof and
-        // arena — subsequent probes simply cannot propagate through it, which
-        // at worst fails a later rung's probe and rolls the ladder back).
-        //
-        // is_binary MUST be computed from the clause length (f0bafebd root
-        // cause, wf_0c7d84e9): rungs have k+2 >= 3 literals, and a >=3-lit
-        // clause watched with BINARY_FLAG propagates its second watched
-        // literal whenever the first falsifies — ignoring the remaining
-        // literals (unsound propagation), skipping the BCP liveness check
-        // (the binary path never reads the arena header), and surviving
-        // deletion (delete_binary_clause_watches only unlinks true binaries).
-        // On f0bafebd this produced a phantom level-0 unit (-1318 through the
-        // deleted rung husk [1369 -1318 2820]) that collect_level0_garbage
-        // later baked into strengthened clauses the DRAT checker rejects
-        // (dpr-trim "RAT check on proof pivot failed [1163 -2820]").
-        if let Some(watched) =
-            self.prepare_watched_literals(&mut watched_lits, WatchOrderPolicy::Preserve)
-        {
-            self.attach_clause_watches(cref, watched, lits.len() == 2);
-        }
+        self.cold.record_clause_id(idx, cid);
         idx
     }
 
-    /// Delete ladder rungs from the proof and mark them garbage in the DB
-    /// (forward-subsumption deletion pattern + #8101 targeted watch flush).
-    /// Currently UNUSED on the emission paths (rungs are kept — deleting
-    /// mid-pass desyncs live probes from the checker); retained for a future
-    /// end-of-pass batch cleanup.
-    #[allow(dead_code)]
-    pub(super) fn cleanup_ladder_rungs(&mut self, rungs: &[usize]) {
+    /// Take one edge's rungs back out of the solver, keeping them in the
+    /// proof. A checker holding more clauses than the solver accepts every
+    /// RUP step, and every RAT/`red` step whose pivot or witness touches
+    /// only fresh extension variables; the substitution-witness (symmetry)
+    /// steps are written in preprocessing before congruence first runs, so
+    /// no such step meets a rung. They were never watched and are no reason
+    /// (every probe backtracked), and the arena returns to `mark`, taken
+    /// before the first of them: the clause DB is word for word the one a run
+    /// without a proof has, with the same offsets for the clauses added next.
+    fn retire_ladder_rungs(
+        &mut self,
+        rungs: &[usize],
+        mark: ArenaAppendMark,
+    ) -> Vec<(Vec<Literal>, u64)> {
+        let mut retired = Vec::with_capacity(rungs.len());
         for &idx in rungs {
-            if self.arena.is_empty_clause(idx) {
-                continue;
-            }
-            let cid = self.cold.clause_ids.get(idx).copied().unwrap_or(0);
-            let _ = self.proof_emit_delete_arena(idx, cid);
-            let clen = self.arena.len_of(idx);
-            if clen > 2 {
-                let (w0, w1) = self.arena.watched_literals(idx);
-                if w0.index() < self.dirty_watches.len() {
-                    self.dirty_watches[w0.index()] = true;
-                }
-                if w1.index() < self.dirty_watches.len() {
-                    self.dirty_watches[w1.index()] = true;
-                }
-            }
-            self.stats.clear_bcp_learned_1963_blocker_cert(idx);
-            self.arena.mark_garbage_keep_data(idx);
-            if idx < self.cold.clause_ids.len() {
-                self.cold.clause_ids[idx] = 0;
-            }
+            let lits = self.arena.literals(idx).to_vec();
+            let id = self.cold.clause_ids.get_mut(idx).map_or(0, std::mem::take);
+            retired.push((lits, id));
+        }
+        self.arena.rollback_appends(mark);
+        retired
+    }
+
+    /// Delete rungs `retire_ladder_rungs` took out of the solver from the
+    /// proof as well (by id, or by content where the writer numbers them).
+    fn delete_retired_rungs(&mut self, retired: Vec<(Vec<Literal>, u64)>) {
+        for (lits, id) in retired {
+            let _ = self.proof_emit_delete(&lits, id);
         }
     }
 }

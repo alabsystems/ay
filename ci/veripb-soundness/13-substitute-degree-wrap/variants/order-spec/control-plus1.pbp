@@ -1,0 +1,41 @@
+pseudo-Boolean proof version 3.0
+% Byte-identical to `spec.pbp` except the spec degree is `i64::MIN + 1`. Substituting `u1 := 1`
+% then gives the TRUE value `i64::MIN`, which still fits, so no wrap and no poisoned scope
+% premise -- and the unfixed checker refuses this too.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 u1 >= -9223372036854775807 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+      fresh_aux_1 $b1 ;
+      fresh_aux_2 $c1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+red >= 1 : x1 -> 1 : subproof
+  scope leq
+    proofgoal #1
+    qed;
+    proofgoal #2
+    qed;
+  end scope;
+qed red;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

@@ -366,7 +366,11 @@ pub(super) fn run_tpa_with_singleloop_fallback(
     verbose: bool,
 ) -> EngineResult {
     // Single-predicate: run directly, returning TpaResult for native conversion.
+    // The portfolio's verbose flag reaches TPA here too (the SingleLoop arm
+    // below already passes it), so its power-level lines are observable.
     if problem.predicates().len() <= 1 {
+        let mut config = config;
+        config.verbose_level = config.verbose_level.max(u8::from(verbose));
         return EngineResult::Tpa(TpaSolver::new(problem.clone(), config).solve());
     }
 
@@ -446,6 +450,22 @@ pub(super) fn run_tpa_with_singleloop_fallback(
     }
 }
 
+/// The ITP-BOARD tag of a portfolio engine.
+fn engine_itp_tag(config: &EngineConfig) -> crate::interpolation::stats::EngineTag {
+    use crate::interpolation::stats::EngineTag;
+    match config {
+        EngineConfig::Pdr(_) | EngineConfig::Decomposition(_) => EngineTag::Pdr,
+        EngineConfig::Pdkind(_) => EngineTag::Pdkind,
+        EngineConfig::Imc(_) => EngineTag::Imc,
+        EngineConfig::Lawi(_) => EngineTag::Lawi,
+        EngineConfig::Dar(_) => EngineTag::Dar,
+        EngineConfig::Tpa(_) => EngineTag::Tpa,
+        EngineConfig::Kind(_) => EngineTag::Kind,
+        EngineConfig::Cegar(_) => EngineTag::Cegar,
+        EngineConfig::Bmc(_) | EngineConfig::Trl(_) => EngineTag::Other,
+    }
+}
+
 /// Run a single CHC engine on a problem and return its result.
 ///
 /// Centralizes the engine dispatch logic previously duplicated across
@@ -462,11 +482,19 @@ pub(super) fn run_engine(
     if verbose {
         safe_eprintln!("Portfolio: Engine {} ({}) starting", idx, name);
     }
+    // ITP-BOARD attribution: interpolation calls made on this engine thread
+    // are counted for this engine (Workstream D telemetry, C-M1).
+    let _engine_tag =
+        crate::interpolation::stats::ScopedEngineTag::install(engine_itp_tag(&engine_config));
 
     let result = match engine_config {
         EngineConfig::Pdr(config) => {
             // Propagate AY_TRACE_FILE for TLA trace support (#2585).
-            let config = config.with_tla_trace_from_env();
+            let mut config = config.with_tla_trace_from_env();
+            // Rung 0: a portfolio engine is search guidance — its verdict is
+            // re-derived by the portfolio's own strict validators (default
+            // `Verification` lane) before acceptance.
+            config.smt_lane = crate::smt::SmtLane::Search;
             let give_up_on_stuck = config.give_up_on_stuck;
             let outcome = PdrSolver::solve_problem_with_stats(&problem, config);
             // Item 5a: when the scheduler opted into give_up_on_stuck and PDR
@@ -489,6 +517,8 @@ pub(super) fn run_engine(
             if verbose {
                 config.base.verbose = true;
             }
+            // Rung 0: portfolio engine -> Search lane (see the PDR arm).
+            config.smt_lane = crate::smt::SmtLane::Search;
             let solver = BmcSolver::new(problem, config.clone());
             let result = solver.solve();
             let stats = solver.stats();

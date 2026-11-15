@@ -123,20 +123,6 @@ impl LraSolver {
         safe_eprintln!("[LRA]   {}", self.debug_format_bound("lower", lower));
     }
 
-    /// Mix a u32 variable ID into a 64-bit hash value (#6221 Finding 1).
-    /// Uses splitmix64-style avalanche to ensure XOR-based set hashing
-    /// has good collision resistance.
-    #[inline]
-    pub(super) fn mix_u32(v: u32) -> u64 {
-        let mut x = u64::from(v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x ^= x >> 27;
-        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-        x ^= x >> 31;
-        x
-    }
-
     #[cfg(debug_assertions)]
     pub(super) fn debug_assert_tableau_consistency(&self, context: &str) {
         for (row_idx, row) in self.rows.iter().enumerate() {

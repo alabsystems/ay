@@ -162,9 +162,9 @@ impl Solver {
     pub fn try_seq_len(&mut self, s: Term) -> Result<Term, SolverError> {
         let s_id = self.resolve_term("seq.len", s)?;
         self.expect_seq("seq.len", s)?;
-        let result = self
-            .terms_mut()
-            .mk_app(Symbol::named("seq.len"), vec![s_id], Sort::Int);
+        let result =
+            self.terms_mut()
+                .mk_app_structural(Symbol::named("seq.len"), vec![s_id], Sort::Int);
         Ok(self.wrap_term(result))
     }
 

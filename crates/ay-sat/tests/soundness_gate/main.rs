@@ -16,7 +16,6 @@
 
 mod common;
 mod isolation;
-mod ledger;
 mod pairwise;
 mod regression;
 #[path = "../common/mod.rs"]

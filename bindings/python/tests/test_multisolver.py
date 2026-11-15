@@ -26,7 +26,7 @@
 # Int/Real -> unknown), that is asserted as the honest sat-or-unknown, never
 # loosened to hide a wrong verdict.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import pytest
 

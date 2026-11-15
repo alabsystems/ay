@@ -49,8 +49,14 @@ include!("dimacs/bodies/run_proof_streaming_reader.rs");
 include!("dimacs/bodies/run_streaming.rs");
 include!("dimacs/bodies/seal_owned_dimacs_proof.rs");
 include!("dimacs/bodies/verify_lean_proof.rs");
+include!("dimacs/proof_space_guard.rs");
 include!("dimacs/proof_writer.rs");
+include!("dimacs/proof_hash.rs");
 include!("dimacs/proof_registry.rs");
+include!("dimacs/proof_custody.rs");
+include!("dimacs/status_custody.rs");
+include!("dimacs/status_custody_in_flight.rs");
+include!("dimacs/custody_names.rs");
 include!("dimacs/proof_file_creation.rs");
 include!("dimacs/proof_publication.rs");
 include!("dimacs/proof_sealing.rs");
@@ -96,5 +102,19 @@ include!("dimacs/finalize_rescue.rs");
 include!("dimacs/streaming_proof.rs");
 include!("dimacs/streaming_solver.rs");
 
+/// An authenticated removal leaves no private quarantine behind (2026-10-08).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod authenticated_removal_tests;
+/// The custody state machine and its lock-free discard (2026-09-13).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod custody_tests;
+/// The competition fast publication (2026-09-13).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod fast_publication_tests;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod proof_hash_tests;
+/// The status reservation's custody and its exit settlement (2026-10-08).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod status_custody_tests;
 #[cfg(test)]
 mod tests;

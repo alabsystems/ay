@@ -33,7 +33,6 @@ pub use self::cert::{
     OptLinCertRoute,
 };
 pub use self::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
-pub use self::opt_budget::proof_slice_cut_note;
 pub use self::opt_budget::{
     certify_reserve, compute_cert_opt_budget_split, extend_native_deadline, native_cap_expired,
     CertOptBudgetPolicy, CertOptBudgetSplit, OPT_CERT_CERTIFY_RESERVE_DIV,
@@ -41,6 +40,9 @@ pub use self::opt_budget::{
     OPT_CERT_HUGE_MIN_CONSTRAINTS, OPT_CERT_HUGE_MIN_VARS, OPT_CERT_IMPROVE_GRACE_DIV,
     OPT_CERT_IMPROVE_GRACE_MAX_MS, OPT_CERT_NATIVE_CEIL_DIV, OPT_CERT_NATIVE_CEIL_DIV_HUGE,
     OPT_CERT_NATIVE_SLICE_DIV, OPT_CERT_NATIVE_SLICE_DIV_HUGE,
+};
+pub use self::opt_budget::{
+    instance_is_huge, proof_slice_cut_note, ProofSliceOrigin, ProofSliceProvenance,
 };
 #[cfg(test)]
 pub(crate) use self::optimum_check::FLOOR_CERT_CALLS;
@@ -52,7 +54,7 @@ pub use self::optimum_check::{
 pub use self::refutation_check::{
     pb_eq_halves, pb_ge, LinConstraint, RefError, RefStep, Refutation,
 };
-pub use self::route_budget::CertRouteBudget;
+pub use self::route_budget::{cert_debug_line, CertRouteBudget};
 
 pub use self::context::{
     FailClosedReason, InputRowIds, ObjectiveProofState, ProofConclusionState, ProofContext,

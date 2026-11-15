@@ -35,8 +35,6 @@ const BVE_BINARY_DEGREE_PRODUCT_LIMIT: usize = 100;
 
 mod apply;
 mod body;
-#[cfg(feature = "gpu")]
-mod gpu_dispatch;
 // elim_propagate removed (#8356): CaDiCaL elim.cpp:251-263 explicitly
 // does NOT propagate after adding resolvents. AY's elim_propagate was
 // deleting root-level-satisfied resolvents from occ lists, causing
@@ -151,6 +149,24 @@ impl Solver {
     ///
     /// This is intentionally conservative: false negatives are acceptable,
     /// false positives on tiny structured formulas are not.
+    /// `true` when `--sat-bve-ext-cooccur true` lets BVE eliminate an original
+    /// variable that shares a clause with a live extension variable (see the
+    /// #8397 guard in `body.rs`). Read per call: tests scope the switch. Never
+    /// after an incremental call, whose scoped clauses the guard's reasoning
+    /// was not written for.
+    pub(in crate::solver) fn bve_ext_cooccur_allowed(&self) -> bool {
+        ay_core::sat_ab_switches().bve_ext_cooccur == Some(true) && !self.cold.has_been_incremental
+    }
+
+    /// `true` when `--sat-bve-bound-progress true` lets a complete but
+    /// unproductive BVE phase raise the growth bound (Kissat's rule), so the
+    /// next phase retries every variable at the next bound instead of waiting
+    /// for the fixpoint guard to see new units or marks.
+    pub(in crate::solver) fn bve_bound_progress_allowed(&self) -> bool {
+        let switches = ay_core::sat_ab_switches();
+        switches.bve_bound_progress == Some(true) || switches.bve_kissat_schedule == Some(true)
+    }
+
     pub(in crate::solver) fn is_uniform_nonbinary_irredundant_formula(&mut self) -> bool {
         if let Some(cached) = self.cold.uniform_formula_cache {
             return cached;
@@ -214,6 +230,12 @@ impl Solver {
     ///          no active learned clause contains a removed variable,
     ///          reconstruction entries pushed for all deleted clauses
     pub(in crate::solver) fn bve(&mut self) -> bool {
+        // `--sat-eliminate-cadence-kissat`: Kissat counts its in-search
+        // elimination calls (eliminate.c:597), not preprocessing's.
+        let cadence_kissat = self.eliminate_cadence_kissat_applies();
+        if !self.inproc.bve.is_fastelim_mode() && self.num_conflicts > 0 {
+            self.cold.kissat_eliminations += 1;
+        }
         // Defer the O(num_vars) stale reason scan during bulk deletions.
         // BVE deletes many clauses per variable; batching the scan reduces
         // cost from O(deleted × num_vars) to O(deleted + num_vars).
@@ -274,7 +296,23 @@ impl Solver {
         } else {
             1.0
         };
-        let interval = (base as f64 * factor * unproductive_scale) as u64;
+        let interval = if cadence_kissat {
+            kissat_eliminate_interval_nlog2n(
+                self.arena.irredundant_count() as u64,
+                self.cold.kissat_eliminations,
+            )
+        } else if bve_kissat_schedule_enabled() {
+            // Kissat `UPDATE_CONFLICT_LIMIT (eliminate, eliminations, NLOGN,
+            // true)`: the preprocessing phases count as its first elimination.
+            let phases = if self.inproc.bve.is_fastelim_mode() {
+                1
+            } else {
+                u64::from(self.cold.bve_phases).max(1)
+            };
+            kissat_eliminate_interval(self.arena.irredundant_count() as u64, phases)
+        } else {
+            (base as f64 * factor * unproductive_scale) as u64
+        };
         self.inproc_ctrl
             .bve
             .reschedule(self.num_conflicts, interval);
@@ -282,4 +320,52 @@ impl Solver {
         self.cold.last_bve_ticks = self.search_ticks[0] + self.search_ticks[1];
         result
     }
+}
+
+impl Solver {
+    /// `--sat-eliminate-cadence-kissat` governs this `bve` call: an in-search
+    /// elimination, not preprocessing's fast elimination.
+    pub(in crate::solver) fn eliminate_cadence_kissat_applies(&self) -> bool {
+        self.cold.eliminate_cadence_kissat
+            && !self.inproc.bve.is_fastelim_mode()
+            && self.num_conflicts > 0
+    }
+}
+
+/// `--sat-bve-kissat-schedule`.
+#[inline]
+pub(super) fn bve_kissat_schedule_enabled() -> bool {
+    ay_core::sat_ab_switches().bve_kissat_schedule == Some(true)
+}
+
+/// Kissat's `eliminate` interval (kimits.h `UPDATE_CONFLICT_LIMIT` with
+/// `eliminateint` 500 and `NLOGN`): `500 x n log10(n + 9) x (4.5 (log10(C + 1)
+/// - 5)^2 + 25)` conflicts, `n` the eliminations so far, `C` the irredundant
+/// clauses.
+pub(in crate::solver) fn kissat_eliminate_interval(irredundant_clauses: u64, phases: u64) -> u64 {
+    const ELIMINATE_INTERVAL: f64 = 500.0;
+    let n = phases.max(1) as f64;
+    let n_log_n = n * (n + 9.0).log10();
+    let f = ((irredundant_clauses + 1) as f64).log10() - 5.0;
+    let size_scale = 4.5 * f * f + 25.0;
+    (ELIMINATE_INTERVAL * n_log_n * size_scale) as u64
+}
+
+/// Kissat 4.0.4's `eliminate` interval (eliminate.c:599,
+/// `UPDATE_CONFLICT_LIMIT (eliminate, eliminations, NLOG2N, true)`):
+/// `500 x n log10(n + 9)^2 x (4.5 (log10(C + 10) - 5)^2 + 25)` conflicts, `n`
+/// the in-search eliminations so far; Kissat's size scale is
+/// `kissat_logn (C + 1)` = `log10(C + 10)` (kimits.c:13-18, 42).
+/// `kissat_eliminate_interval` is the NLOGN shape `--sat-bve-kissat-schedule`
+/// took (with `log10(C + 1)`, kept for that switch).
+pub(in crate::solver) fn kissat_eliminate_interval_nlog2n(
+    irredundant_clauses: u64,
+    eliminations: u64,
+) -> u64 {
+    const ELIMINATE_INTERVAL: f64 = 500.0;
+    let n = eliminations.max(1) as f64;
+    let log = (n + 9.0).log10();
+    let f = ((irredundant_clauses + 10) as f64).log10() - 5.0;
+    let size_scale = 4.5 * f * f + 25.0;
+    (ELIMINATE_INTERVAL * n * log * log * size_scale) as u64
 }

@@ -141,6 +141,14 @@ pub(super) struct RelevancyFrontier {
     buf: Vec<bool>,
     /// Popcount of `buf`. `size == 0` is the empty-frontier SAT signal.
     size: usize,
+    /// The `buf`-true variables as a dense list (order unspecified), so the
+    /// VMTF decision scan is O(frontier) instead of O(num_vars) per decision
+    /// (measured ~57% of Certora QF_UFDTLIA samples in the bitmap scan).
+    /// Maintained by `member_insert`/`member_remove` at exactly the sites
+    /// that toggle `buf`/`size`; `member_pos` is the inverse map
+    /// (`u32::MAX` = absent) enabling O(1) swap-removal.
+    members: Vec<u32>,
+    member_pos: Vec<u32>,
     /// Per-variable count of unsatisfied-clause literal occurrences.
     var_unsat: Vec<u32>,
     /// Per-clause count of TRUE literals, indexed by arena WORD OFFSET. Sparse
@@ -175,6 +183,9 @@ pub(super) struct RelevancyFrontier {
     debug_fold_checks_done: u32,
 }
 
+mod counted_backtrack;
+mod counted_selection;
+pub(super) use counted_selection::SelectionStorage;
 mod folds;
 
 impl RelevancyFrontier {
@@ -186,6 +197,8 @@ impl RelevancyFrontier {
         self.valid = false;
         self.synced_len = 0;
         self.size = 0;
+        self.members.clear();
+        self.member_pos.clear();
         // Release the per-offset / per-literal tables: an invalidation usually
         // means the arena just shrank or was rebuilt, and a stale `true_count`
         // sized to the OLD arena is pure footprint.
@@ -260,17 +273,83 @@ impl RelevancyFrontier {
         &self.buf
     }
 
+    /// The frontier variables as a dense list (the `buf`-true set).
+    #[inline]
+    pub(super) fn members(&self) -> &[u32] {
+        &self.members
+    }
+
+    /// Add `v` to the frontier. Callers guarantee `!buf[v]` (their existing
+    /// toggle guards); the debug assert keeps that honest.
+    #[inline]
+    pub(super) fn member_insert(&mut self, v: usize) {
+        debug_assert!(v < self.buf.len() && !self.buf[v], "double frontier insert");
+        self.buf[v] = true;
+        self.size += 1;
+        if v >= self.member_pos.len() {
+            self.member_pos.resize(v + 1, u32::MAX);
+        }
+        self.member_pos[v] = self.members.len() as u32;
+        self.members.push(v as u32);
+    }
+
+    /// Remove `v` from the frontier. Callers guarantee `buf[v]`.
+    #[inline]
+    pub(super) fn member_remove(&mut self, v: usize) {
+        debug_assert!(
+            v < self.buf.len() && self.buf[v],
+            "frontier remove of non-member"
+        );
+        self.buf[v] = false;
+        self.size -= 1;
+        let pos = self.member_pos[v] as usize;
+        self.member_pos[v] = u32::MAX;
+        let last = self.members.len() - 1;
+        if pos != last {
+            let moved = self.members[last];
+            self.members[pos] = moved;
+            self.member_pos[moved as usize] = pos as u32;
+        }
+        self.members.truncate(last);
+    }
+
+    /// Pin: `members` is exactly the `buf`-true set with a consistent
+    /// inverse map. Runs beside the from-scratch exactness pin.
+    #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+    pub(super) fn debug_assert_members_exact(&self) {
+        assert_eq!(
+            self.members.len(),
+            self.size,
+            "BUG: frontier members len {} != size {}",
+            self.members.len(),
+            self.size,
+        );
+        for (pos, &m) in self.members.iter().enumerate() {
+            let v = m as usize;
+            assert!(
+                v < self.buf.len() && self.buf[v],
+                "BUG: frontier member {v} not in buf",
+            );
+            assert_eq!(
+                self.member_pos[v] as usize, pos,
+                "BUG: frontier member_pos[{v}] != its members index",
+            );
+        }
+    }
+
     /// Bring the cached frontier up to date with `s`; returns whether any
     /// variable is relevant.
     pub(super) fn sync(&mut self, s: &Solver) -> bool {
-        if !self.valid
-            || self.num_vars != s.num_vars
-            || self.epoch != s.arena.formula_epoch()
-            || self.arena_words > s.arena.len()
-            || self.arena_clauses > s.arena.num_clauses()
-            || self.synced_len > s.trail.len()
-        {
-            self.rebuild(s);
+        self.sync_prepared(s, None)
+    }
+
+    pub(super) fn sync_prepared(
+        &mut self,
+        s: &Solver,
+        mut storage: Option<&mut SelectionStorage>,
+    ) -> bool {
+        if self.needs_rebuild(s) {
+            self.rebuild(s, storage.as_deref_mut());
             return self.size > 0;
         }
 
@@ -284,7 +363,7 @@ impl RelevancyFrontier {
             self.fold_assign(s, lit);
         }
         if self.arena_words < s.arena.len() && !self.fold_appended_clauses(s) {
-            self.rebuild(s);
+            self.rebuild(s, storage);
         }
         self.size > 0
     }
@@ -362,7 +441,7 @@ impl RelevancyFrontier {
     /// Rebuild every table from `arena.live_indices()` — the original
     /// from-scratch algorithm, now run once per invalidating event instead of
     /// once per decision.
-    fn rebuild(&mut self, s: &Solver) {
+    fn rebuild(&mut self, s: &Solver, storage: Option<&mut SelectionStorage>) {
         let num_vars = s.num_vars;
         self.buf.clear();
         self.buf.resize(num_vars, false);
@@ -370,11 +449,18 @@ impl RelevancyFrontier {
         self.var_unsat.resize(num_vars, 0);
         self.true_count.clear();
         self.true_count.resize(s.arena.len(), 0);
-        self.occ.resize_with(num_vars * 2, Vec::new);
+        if let Some(storage) = storage {
+            storage.install_headers(&mut self.occ, num_vars * 2);
+        } else {
+            self.occ.resize_with(num_vars * 2, Vec::new);
+        }
         for occ in &mut self.occ {
             occ.clear();
         }
         self.size = 0;
+        self.members.clear();
+        self.member_pos.clear();
+        self.member_pos.resize(num_vars, u32::MAX);
 
         for off in s.arena.live_indices() {
             let lits = s.arena.literals(off);
@@ -405,8 +491,7 @@ impl RelevancyFrontier {
                 && ay_prefetch::val_at(&s.vals, v * 2) == 0
                 && !s.var_lifecycle.is_removed(v)
             {
-                self.buf[v] = true;
-                self.size += 1;
+                self.member_insert(v);
             }
         }
 

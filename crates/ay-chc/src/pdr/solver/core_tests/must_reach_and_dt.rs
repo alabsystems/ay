@@ -12,7 +12,7 @@ use super::*;
 fn test_dt_sort_int_pair() -> ChcSort {
     ChcSort::Datatype {
         name: "IntPair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkpair".to_string(),
             selectors: vec![
                 ChcDtSelector {

@@ -128,13 +128,17 @@ impl ArraySolver<'_> {
                     .copied()
                     .filter(|t| self.store_cache.contains_key(t))
                     .collect();
-                for i in 0..stores_in_class.len() {
-                    for j in (i + 1)..stores_in_class.len() {
-                        let pair = (stores_in_class[i], stores_in_class[j]);
+                // Every unordered pair, earlier member first: each member is
+                // paired with the members after it.
+                let mut rest = stores_in_class.as_slice();
+                while let Some((&first, later)) = rest.split_first() {
+                    for &second in later {
+                        let pair = (first, second);
                         if existing.insert(pair) {
                             self.pending_conflicting_stores.push(pair);
                         }
                     }
+                    rest = later;
                 }
             }
         }
@@ -260,6 +264,24 @@ impl ArraySolver<'_> {
             return TheoryResult::Unknown;
         }
 
+        // Every read of an array whose class holds a const-array, not only
+        // the ones an event queued (`enqueue_const_reads_by_class`).
+        self.enqueue_const_reads_by_class();
+        match self.check_const_array_read() {
+            Some(TheoryResult::NeedLemmas(lemmas)) => {
+                let lemmas = self.filter_unapplied_final_check_lemmas(lemmas);
+                if !lemmas.is_empty() {
+                    self.conflict_count += 1;
+                    return TheoryResult::NeedLemmas(lemmas);
+                }
+            }
+            Some(result) => {
+                self.conflict_count += 1;
+                return result;
+            }
+            None => {}
+        }
+
         // #8141: Generate ALL remaining lazy ROW2 axioms (no budget) in
         // final_check to ensure completeness. If check() skipped some axioms
         // due to the budget, final_check catches them here.
@@ -283,6 +305,18 @@ impl ArraySolver<'_> {
         // in one pass. Conflicts and lemmas still return immediately.
         let mut model_eq_requests: Vec<ModelEqualityRequest> = Vec::new();
 
+        // Lemma batching across the ROW2 sub-checks below: each used to
+        // return immediately on its first non-empty batch, so one
+        // refinement round learned a single sub-check's lemmas per full
+        // SAT re-solve (measured 2,849 rounds / 4,478 lemmas in 20 s on
+        // qlock.induction.5). The sub-checks read the same theory state
+        // (emitted lemmas are not asserted back within final_check), so
+        // accumulating every sub-check's lemmas into one batch is the
+        // same valid lemma set delivered in fewer rounds. Conflicts
+        // still return immediately; accumulated model-equality requests
+        // are rolled back when lemmas win, exactly as before.
+        let mut lemma_batch: Vec<TheoryLemma> = Vec::new();
+
         self.populate_final_check_row2_upward_queue();
 
         // #8615: Check interrupt after rebuilding ROW2-upward candidates.
@@ -304,12 +338,11 @@ impl ArraySolver<'_> {
                 TheoryResult::NeedLemmas(lemmas) => {
                     let lemmas = self.filter_unapplied_final_check_lemmas(lemmas);
                     if !lemmas.is_empty() {
-                        self.rollback_unreturned_model_equality_requests(&model_eq_requests);
                         tracing::debug!(
                             count = lemmas.len(),
-                            "arrays final_check: ROW2-upward lemma batch"
+                            "arrays final_check: ROW2-upward lemma batch (accumulated)"
                         );
-                        return TheoryResult::NeedLemmas(lemmas);
+                        lemma_batch.extend(lemmas);
                     }
                 }
                 TheoryResult::NeedModelEquality(req) => {
@@ -348,12 +381,11 @@ impl ArraySolver<'_> {
                 TheoryResult::NeedLemmas(lemmas) => {
                     let lemmas = self.filter_unapplied_final_check_lemmas(lemmas);
                     if !lemmas.is_empty() {
-                        self.rollback_unreturned_model_equality_requests(&model_eq_requests);
                         tracing::debug!(
                             count = lemmas.len(),
-                            "arrays final_check: ROW2-down lemma batch"
+                            "arrays final_check: ROW2-down lemma batch (accumulated)"
                         );
-                        return TheoryResult::NeedLemmas(lemmas);
+                        lemma_batch.extend(lemmas);
                     }
                 }
                 TheoryResult::NeedModelEquality(req) => {
@@ -394,18 +426,33 @@ impl ArraySolver<'_> {
                 TheoryResult::NeedLemmas(lemmas) => {
                     let lemmas = self.filter_unapplied_final_check_lemmas(lemmas);
                     if !lemmas.is_empty() {
-                        self.rollback_unreturned_model_equality_requests(&model_eq_requests);
                         tracing::debug!(
                             count = lemmas.len(),
                             clauses = ?lemmas.iter().map(|l| &l.clause).collect::<Vec<_>>(),
-                            "arrays final_check: ROW2-extended lemma batch"
+                            "arrays final_check: ROW2-extended lemma batch (accumulated)"
                         );
-                        return TheoryResult::NeedLemmas(lemmas);
+                        lemma_batch.extend(lemmas);
                     }
                 }
                 _ => {
                     tracing::debug!("arrays final_check: ROW2-extended non-sat result");
                 }
+            }
+        }
+
+        // Flush the accumulated ROW2 lemma batch. Lemmas take
+        // precedence over the model-equality requests gathered in the
+        // same pass (rolled back so a later round re-requests them),
+        // matching the previous per-sub-check early-return precedence.
+        if !lemma_batch.is_empty() {
+            let lemmas = self.filter_unapplied_final_check_lemmas(lemma_batch);
+            if !lemmas.is_empty() {
+                self.rollback_unreturned_model_equality_requests(&model_eq_requests);
+                tracing::debug!(
+                    count = lemmas.len(),
+                    "arrays final_check: combined ROW2 lemma batch"
+                );
+                return TheoryResult::NeedLemmas(lemmas);
             }
         }
 
@@ -879,7 +926,10 @@ impl ArraySolver<'_> {
         let mut requests = Vec::new();
 
         // O(n^2) pairwise comparison, budgeted.
-        for (i, &a) in active_arrays.iter().enumerate() {
+        // Each array is compared with the arrays after it.
+        let mut rest = active_arrays.as_slice();
+        while let Some((&a, later)) = rest.split_first() {
+            rest = later;
             if requests.len() >= MAX_INTERFACE_EQS_PER_CALL {
                 break;
             }
@@ -888,7 +938,7 @@ impl ArraySolver<'_> {
                 continue;
             }
 
-            for &b in active_arrays.iter().skip(i + 1) {
+            for &b in later {
                 if requests.len() >= MAX_INTERFACE_EQS_PER_CALL {
                     break;
                 }
@@ -1213,9 +1263,11 @@ impl ArraySolver<'_> {
             if self.store_chain_indices_are_decided(&universe, &[]) {
                 continue;
             }
-            for a in 0..universe.len() {
-                for b in (a + 1)..universe.len() {
-                    let (idx1, idx2) = (universe[a], universe[b]);
+            // Every unordered pair, earlier index first.
+            let mut rest = universe.as_slice();
+            while let Some((&idx1, later)) = rest.split_first() {
+                rest = later;
+                for &idx2 in later {
                     if self.terms.sort(idx1) != self.terms.sort(idx2) {
                         continue;
                     }

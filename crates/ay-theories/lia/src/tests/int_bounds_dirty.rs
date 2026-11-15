@@ -15,9 +15,11 @@ use num_bigint::BigInt;
 fn mk_bound(value: Rational, strict: bool) -> Bound {
     Bound {
         value,
-        reasons: Vec::new(),
-        reason_values: Vec::new(),
-        reason_scales: Vec::new(),
+        // These three moved from `Vec` to `SmallVec`; `Default` is the one
+        // spelling that stays correct whichever container the field carries.
+        reasons: Default::default(),
+        reason_values: Default::default(),
+        reason_scales: Default::default(),
         strict,
         provenance: None,
     }

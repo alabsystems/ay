@@ -8,64 +8,50 @@ wraps, what fronts it, and what ships (`ay scripts --help`). When an
 entry names a fronting subcommand (CLI column), prefer the subcommand
 over direct invocation.
 
-Adding functionality? Apply in order:
-
-1. Rust in the binary when the logic is product semantics,
-soundness-relevant, scoring, provenance, or anything shipped code
-depends on for correctness.
-2. An `ay tool` recipe (reference/tools.toml) when the need is a
-pinned external binary at a known path.
-3. An indexed script when wrapping an external tool's workflow,
-gluing an evolving campaign, or preserving archival evidence. A
-script does not exist until its index entry does
-(`ay scripts check` enforces the bijection).
+Required tooling belongs in maintained AY Rust code built with Trust.
+Use an `ay tool` recipe (reference/tools.toml) for a pinned external
+binary. This index inventories the remaining legacy scripts; it is
+not a template for adding campaign helpers or duplicate workflows.
+Remove obsolete tools and tests. Git history preserves old evidence.
 
 ## audit
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
 | chc-cert-check | audit.chc | `scripts/chc_cert_check.py` | python | active | - | Independent CHC SAFE-certificate checker (external SMT arbiter). |
-| flag-audit | audit.flags | `scripts/flag_audit.py` | python | active | - | Compatibility/listing audit for the historical regex count (338 after B1); the Rust ay-quality-gate exact-set scanner is the build ratchet. |
-| flag-baseline-reconcile | audit.flags | `scripts/flag_baseline_reconcile.py` | python | active | - | Reconcile the env-flag exact-set baseline after deleting flags: prune entries, rebuild the key-site section sorted from the failing gate's own report. |
-| quality-baseline-reconcile | audit.flags | `scripts/quality_baseline_reconcile.py` | python | active | - | Reconcile the file/function/construct size ratchets and file_size waiver ceilings from the quality gate's own report; seeds new construct sites so a second pass can pick up the true fingerprint. |
+| check-proofs | audit.proof | `scripts/check_proofs.sh` | bash | active | - | Run AY over a corpus or selection and put every emitted Alethe proof through carcara, failing on any invalid proof, counting holey ones, and refusing a run that checked nothing. |
 | proof-checkability-sweep | audit.proof | `scripts/proof_checkability_sweep.py` | python | active | - | Sweep a corpus for AY UNSAT verdicts that are independently kernel-checkable via the complete-conflict Lean firewall, cross-checking each verdict against z3 and :status. |
+| unsat-cert-census | audit.proof | `scripts/unsat_cert_census.sh` | bash | active | - | Run `ay solve --no-proof -T:10` once per file over a .smt2 list with bounded parallelism and a hard per-file wall, writing the verdict/exit-code/wall ledger that makes UNSAT-certification census runs comparable. |
 | firewall-selfcert-check | audit.smt | `scripts/firewall-selfcert-check.sh` | bash | active | - | End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones. |
 | lra-bmc-validate | audit.smt | `scripts/lra_bmc_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .bmc files. |
 | lra-ind-validate | audit.smt | `scripts/lra_ind_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .ind files. |
-| ufbv-fixpoint-audit | audit.smt | `scripts/ufbv_fixpoint_audit.py` | python | active | - | Guarded two-lane production and self-check audit of the exact 121-file quantified UFBV fixpoint family. |
+| quantifier-census | audit.smt | `scripts/quantifier_census.py` | python | active | - | Z3-parity quantifier-bucket census: select quantifier-reason rows from division-scan records, run AY under --stats-full --debug-cert to attribute the declining gate and :quantifier.* counters, record how z3 routes the same files, and histogram the result. |
+| smt-soundness-sweep | audit.smt | `scripts/soundness_sweep.py` | python | active | - | Sweep an SMT-LIB corpus through `ay --z3-mode` on stdin for wrong answers and definite-but-undecided output, confirming a hit only when z3 and cvc5 --finite-model-find agree against AY. |
 | z3py-cascade-check | audit.z3 | `scripts/verify_z3py_cascade.py` | python | active | - | Stock-z3py cascade verification against AY's libz3-compatible dylib. |
 
 ## bench
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chc-disagreement-audit | bench.chc | `scripts/chc_disagreement_audit.py` | python | active | - | Arbitrate every AY-vs-ground-truth disagreement in a harness run. |
-| chc-flag-ab | bench.chc | `scripts/chc_flag_ab.py` | python | active | - | A/B a set of ay --chc env configs on the ref_only instances from a baseline JSON. |
-| chc-parity-diff | bench.chc | `scripts/chc_parity_diff.py` | python | active | - | CHC parity differential: ay --chc vs z3 fp.engine=spacer on a benchexec .set. |
-| chc-refonly-time | bench.chc | `scripts/chc_refonly_time.py` | python | active | - | Measure how many ref_only instances AY closes at a longer, competition-realistic timeout. |
-| chccomp-build-baseline | bench.chc | `scripts/chccomp_build_baseline.py` | python | deprecated | - | Assemble a CHC regression baseline from prior AY harness runs. |
-| chccomp-track-sweep | bench.chc | `scripts/chccomp_track_sweep.py` | python | active | - | Stratified-sample standings sweep across CHC-COMP tracks. |
+| chc-session-replay | bench.chc | `scripts/chc_session_replay.py` | python | active | - | Pack, unpack, replay and summarize HornSmt session query dumps: the crates/ay-chc/tests/fixtures/session_replay corpus format, a Rust-harness replay (warm session vs fresh context vs z3 vs the recorded verdict), and a z3 verdict census. |
 | wind-tunnel | bench.core | `scripts/wind_tunnel.py` | python | active | - | The Wind Tunnel: full-corpus PAR-2 evaluation with an independent output checker. |
 | lp-bench | bench.milp | `scripts/lp_bench.py` | python | active | - | Time LP/MILP solvers on a corpus and compare verdicts. |
+| lp-gap-highs | bench.milp | `scripts/lp_gap_highs.py` | python | active | - | Solve one LP relaxation through highspy in a fresh process and print one timed `highs_lp:` line, the reference arm of milp-lp-gap. |
 | milp-compare | bench.milp | `scripts/compare.py` | python | active | - | ay-milp vs HiGHS verdict agreement on the real .milp corpus. |
 | milp-corpus | bench.milp | `scripts/milp_corpus.py` | python | active | - | Fetch and index the MIPLIB 2017 corpus (+ .solu reference optima) the W0 harness measures on. |
+| milp-decision-census | bench.milp | `scripts/milp_decision_census.py` | python | active | - | Node-rate steering census: drive an mps_solve built with --features dcensus at ambient and spinner-induced load and report per-site evals and fires, the wall coupling limit-invariance cannot see. |
+| milp-limit-invariance | bench.milp | `scripts/milp_limit_invariance.py` | python | active | - | Load-free wall-coupling instrument: solve each gate-corpus model at two --limit values and flag any model whose proved objective or node count differs, with --check against the recorded partition. |
+| milp-lp-gap | bench.milp | `scripts/milp_lp_gap.py` | python | active | - | Three-arm LP-gap harness: run the diag lp-only scaffold, the diag shipped-lp lane and HiGHS on the same LPs, interleaved, to separate the solver's LP gap from the measurement scaffold's. |
+| milp-portfolio | bench.milp | `scripts/milp_portfolio.py` | python | active | - | Measure ay-milp configuration arms per instance, a single-thread Gurobi baseline, and the oracle-minus-default coverage gap: the evidence a tune::select rule must carry. |
 | milp-refsolve | bench.milp | `scripts/refsolve.py` | python | active | - | HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge. |
 | milp-w0 | bench.milp | `scripts/milp_w0.py` | python | active | - | W0 attribution harness: root closure, solver baselines, per-knob ablation, regression gate, Gurobi audit, LP-throughput gap. |
 | milp2mps | bench.milp | `scripts/milp2mps.py` | python | active | - | Convert the .milp serialization to standard MPS (bit-exact f64 fields). |
 | miplib-bench | bench.milp | `scripts/miplib_bench.py` | python | active | - | Run ay-milp and HiGHS on the same MPS files and compare verdicts. |
 | solver-portfolio | bench.milp | `scripts/solver_portfolio.py` | python | active | - | Run AY against a portfolio of reference MILP solvers at matched single-thread budgets. |
-| mzn-local-bench | bench.mzn | `benchmarks/minizinc/run_benchmarks.sh` | bash | deprecated | - | Run local FlatZinc benchmarks through the competition CLI surface. |
-| pb-ab-compare | bench.pb | `scripts/pb_ab_compare.py` | python | deprecated | - | A/B compare two ay-pb binaries over a PB corpus. |
-| pb-audit | bench.pb | `scripts/pb_audit.sh` | sh | broken | - | PB soundness audit: verify SAT/OPTIMUM models with an external OPB model checker named by $MODEL_CHECKER (still broken: no validator is tracked in-repo). |
-| pb-bench | bench.pb | `scripts/pb_bench.sh` | sh | active | - | Parallel PB benchmark runner for AY. |
 | pb-cert-coverage | bench.pb | `scripts/pb_cert_coverage.sh` | bash | active | - | PB certificate coverage probe: solve with --proof and check emitted proofs with VeriPB. |
-| pb-sweep | bench.pb | `scripts/pb_sweep.py` | python | active | - | Pseudo-Boolean sweep: AY-PB vs a reference (RoundingSat) on OPB/WBO with verdict cross-checks. |
-| lever-ab-verdict | bench.sat | `scripts/lever_ab_verdict.py` | python | active | - | Score one paired lever A/B sweep per arm (certificates joined on the arm, never collapsed) and print a FLIP / NO-FLIP verdict. |
-| lever-eligibility | bench.sat | `scripts/lever_eligibility.py` | python | active | - | Compute each default-OFF SAT lever's eligible population from CNF headers, applying that lever's own gate arithmetic. |
-| run-lever-ab | bench.sat | `scripts/run_lever_ab.sh` | bash | active | - | One command: build the lever binary off the main target dir, sweep each default-OFF lever's eligible population with both arms paired in one run, drain certificates, print a flip verdict per lever. |
+| proof-manifest-verifier | bench.sat | `scripts/verify_proof_manifest.py` | python | active | - | Verify retained SAT certificates with dsr-trim outside the solve budget, then score a sweep with competition-mode SOLVED and certificate-accepted SCORED counts kept apart. |
 | sat-attribute | bench.sat | `scripts/sat_bench/attribute.py` | python | active | - | Classify a sat_compare results JSON: bucket instances and attribute the gap by family. |
 | sat-bve-audit | bench.sat | `scripts/sat_bench/audit.py` | python | active | - | Soundness audit for the BVE-enabled build: flag wrong answers on known-verdict instances. |
-| sat-combine-threeway | bench.sat | `scripts/sat_bench/combine_threeway.py` | python | active | - | Combine the split three-way @300s result JSONs into the full-set verdict. |
 | sat-sweep | bench.sat | `scripts/sweep.py` | python | active | - | Lightweight SAT sweep harness: one or more solvers over a DIMACS corpus at a fixed timeout. |
 | smt-diff-sweep | bench.smt | `scripts/diff_sweep.py` | python | active | - | Differential SMT sweep: AY vs a field of competitor solvers over an .smt2 corpus. |
 
@@ -80,61 +66,44 @@ script does not exist until its index entry does
 | zig-cxx | build.toolchain | `scripts/zig-cxx-x86_64-linux-musl.sh` | bash | active | - | Zig cross-compile c++ shim (x86_64-linux-musl) for the static Linux build. |
 | zig-ranlib | build.toolchain | `scripts/zig-ranlib.sh` | bash | active | - | Zig ranlib shim for the static Linux build. |
 
-## campaign
-
-| Name | Group | Path | Lang | Status | CLI | Summary |
-|---|---|---|---|---|---|---|
-| continuous-benchmark | campaign.core | `scripts/continuous_benchmark.py` | python | active | - | Four-hour branch integration, correctness gates, rotating competition benchmarks, repair, and progress publication. |
-
 ## compare
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chccomp-harness | compare.chc | `scripts/chccomp_harness.py` | python | active | `ay bench compare run chccomp-2025` | CHC-COMP multi-solver harness: AY vs Golem/Eldarica/Spacer with ground-truth cross-validation. |
-| mzn-run | compare.mzn | `scripts/mzn_challenge/run.py` | python | active | `ay bench compare run mznc-2025` | Run AY over the MiniZinc Challenge 2025 corpus; emit a results vector for the retroactive scorer. |
+| mzn-run | compare.mzn | `scripts/mzn_challenge/run.py` | python | active | - | Run AY over the MiniZinc Challenge 2025 corpus; emit a results vector for the retroactive scorer. |
 | mzn-score | compare.mzn | `scripts/mzn_challenge/score.py` | python | active | - | Retroactive MiniZinc Challenge scorer, validated against the official pairwise score tensor. |
 | mzn-score-ay | compare.mzn | `scripts/mzn_challenge/score_ay.py` | python | active | - | Score an AY results vector against the real MiniZinc Challenge 2025 field. |
 | mzn-setup | compare.mzn | `scripts/mzn_challenge/setup.sh` | bash | active | - | Reconstitute the MiniZinc Challenge 2025 harness on a fresh machine (minizinc, corpus, fzn-exec). |
-| pbcomp-harness | compare.pb | `scripts/pbcomp_harness.py` | python | active | `ay bench compare run pbcomp-2026` | PB-COMP harness: ay pb solve over OPB/WBO instances under competition budgets. |
-| sat-compare | compare.sat | `scripts/sat_bench/sat_compare.py` | python | active | `ay bench compare run satcomp-2025` | Head-to-head SAT comparison harness: AY vs a reference (e.g. Kissat) with verdict cross-validation. |
+| pbcomp-harness | compare.pb | `scripts/pbcomp_harness.py` | python | active | - | PB-COMP harness: ay pb solve over OPB/WBO instances under competition budgets. |
+| sat-compare | compare.sat | `scripts/sat_bench/sat_compare.py` | python | active | - | Head-to-head SAT comparison harness: AY vs a reference (e.g. Kissat) with verdict cross-validation. |
 | smt-ab-interleaved | compare.smt | `scripts/ab_interleaved.py` | python | active | - | Order-balanced same-binary A/B harness for incremental SMT levers, with order-effect and verdict-agreement checks. |
-| smtcomp-restage | compare.smt | `scripts/smtcomp_harness.py` | python | active | `ay bench compare run smtcomp-2025` | SMT-COMP 2025 restage harness: AY and the real 2025 entrants on the exact 2025 selection. |
-
-## compat
-
-| Name | Group | Path | Lang | Status | CLI | Summary |
-|---|---|---|---|---|---|---|
-| chccomp-late-artifact-check | compat.chc | `scripts/chccomp_late_entry_artifact_build_check.py` | python | deprecated | - | Compatibility metadata for CHC-COMP late-entry artifact checks. |
-| chccomp-late-preflight | compat.chc | `scripts/chccomp_late_entry_preflight.py` | python | deprecated | - | Compatibility wrapper for the Rust CHC-COMP late-entry preflight. |
-| satcomp-matrix-shim | compat.sat | `scripts/run_satcomp_matrix.sh` | bash | deprecated | - | Legacy SAT-COMP matrix wrapper; superseded by native ay verbs. |
+| smtcomp-restage | compare.smt | `scripts/smtcomp_harness.py` | python | active | - | SMT-COMP 2025 restage harness: AY and the real 2025 entrants on the exact 2025 selection. |
+| z3-division-scan | compare.smt | `scripts/z3_division_scan.py` | python | active | - | Stratified AY-vs-z3 division scan: N seeded files per division of an SMT-LIB corpus root, both solvers at the same -T, one provenance-stamped JSON line per file, and a per-division decided/only/disagreement summary. |
 
 ## competition
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chccomp-slurm-worker | competition.chc | `deploy/cluster/chccomp_slurm_worker.sh` | bash | active | - | SLURM array worker driving CHC-COMP harness shards on the cluster. |
-| maxsat-driver | competition.maxsat | `competition/maxsat_run.sh` | sh | deprecated | - | Competition driver for the weighted/unweighted MaxSAT track. |
 | mc2026-build | competition.mc | `competition/mc2026/build.sh` | bash | active | - | Model Counting Competition build script: AY exact counter plus the FlowCutter TD helper. |
 | mc2026-run | competition.mc | `competition/mc2026/run.sh` | bash | active | - | Model Counting Competition run script: one instance path in, MC-2026 output format on stdout. |
 | fzn-exec | competition.mzn | `competition/minizinc/fzn-exec` | sh | active | - | MiniZinc FlatZinc solver wrapper for AY; invoked by minizinc with the flags declared in ay.msc. |
-| pb-package | competition.pb | `scripts/pb_package.sh` | sh | active | `ay submission` | Build a PB-COMP submission tarball from the current git HEAD. |
 | pb26-build | competition.pb | `competition/pb/build.sh` | sh | active | - | PB-COMP build script: build the ay-pb competition binary from the bundled source. |
 | pb26-package | competition.pb | `competition/pb/package.sh` | sh | active | - | Trident matrix packager: build, harden, and validate every entry in competition/pb/entries.toml. |
 | pb26-run | competition.pb | `competition/pb/run.sh` | sh | active | - | PB-COMP run script for the AY PB solver (generated by package.sh from entries.toml). |
 | pb26-run-template | competition.pb | `competition/pb/run.sh.in` | sh | active | - | Template for the PB-COMP run script; package.sh substitutes per-entry values. |
 | sat-portfolio-driver | competition.sat | `competition/ay_portfolio.sh` | sh | active | - | Competition portfolio driver (SAT parallel/cloud track): race full ay solve --competition configs. |
-| sat26-package | competition.sat | `competition/prepare_sat26_submission.sh` | bash | active | - | Prepare the SAT-COMP 2026 submission package. |
+| sat26-memory-limit | competition.sat | `competition/sat26_memory_limit.sh` | bash | active | - | SAT-COMP 2026 memory limit (32,000,000,000 bytes) every SAT-COMP launcher passes as ay's --memory-ceiling-bytes ceiling and GOVERN_AY_MB budget. |
 
 ## corpus
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| mzn-fetch | corpus.fetch | `scripts/download_minizinc_benchmarks.sh` | bash | deprecated | - | Fetch and compile the MiniZinc Challenge 2024 FlatZinc instances the ay-flatzinc tests resolve. |
+| milp-gate-corpus | corpus.fetch | `scripts/milp_gate_corpus.py` | python | active | - | Verify or rebuild the sha256-pinned MILP gate corpus (.milp_gate_corpus.tsv) under ~/ay-bench/milp-gate/instances, so the MILP gates are reproducible from the repository alone. |
+| rebuild-milp-bench | corpus.fetch | `scripts/rebuild_milp_bench.py` | python | active | - | Rebuild ~/ay-bench/milp (MIPLIB 2017 instances, .solu and a tiered manifest.json) from the name list embedded in the script, for the MILP harnesses that read that corpus. |
 | sat-download-2025 | corpus.fetch | `scripts/sat_bench/download_2025.py` | python | active | - | Download a stratified sample of SAT-COMP main_2025 from GBD by content hash. |
-| satcomp24-sample-fetch | corpus.fetch | `scripts/fetch_satcomp_sample.sh` | bash | active | `ay corpus download satcomp2024-sample` | Fetch the SAT-COMP 2024 sample corpus from the public GBD mirror. |
-| satcomp25-sample-fetch | corpus.fetch | `scripts/_fetch_sat2025_sample.sh` | bash | active | - | Fetch a size-bounded SAT-COMP 2025 main-track sample for local iteration benchmarking. |
-| satlib-fetch | corpus.fetch | `scripts/download_satlib_benchmarks.sh` | bash | deprecated | - | Fetch the SATLIB uniform-random 3-SAT sets the ay-sat soundness/DRAT tests resolve. |
+| satcomp26-official-fetch | corpus.fetch | `scripts/sat_bench/fetch_satcomp2026_official.py` | python | active | - | Provision the 400 instances SAT-COMP 2026 actually scored (the instanceid column of the official scores.csv) from the GBD mirror, binding each file to its instanceid by recomputing the GBD hash, and write SC2026.official.csv. |
 | smtcomp-fetch | corpus.fetch | `scripts/download_smtcomp_benchmarks.sh` | bash | active | - | Fetch SMT-LIB non-incremental benchmarks for a logic into benchmarks/smtcomp/<LOGIC>/. |
+| smtlib2025-fetch | corpus.fetch | `scripts/fetch_smtlib2025_corpus.py` | python | active | - | Fetch the SMT-LIB 2025 archives SMT-COMP 2025 used (Zenodo 15493090 non-incremental, 15493096 incremental) into benchmarks/smtlib-2025/<kind>/<LOGIC>/, prefix-safe, resumable and reporting logics the record lacks. |
 | mzn-gen-community | corpus.gen | `benchmarks/minizinc/gen_community.py` | python | active | - | Generate a FlatZinc community-detection benchmark (mexican.s26.k4-like). |
 | smtcomp-fixtures | corpus.prepare | `scripts/link_smtcomp_fixtures.sh` | bash | active | - | Populate flat SMT-COMP fixture paths by linking already-downloaded SMT-LIB 2025 files into benchmarks/smtcomp/. |
 
@@ -142,15 +111,14 @@ script does not exist until its index entry does
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chccomp-docker-env | dev | `scripts/docker_test_env.sh` | bash | deprecated | - | Docker test environment for CHC-COMP runs. |
 | prof-hotspots | dev | `scripts/prof_hotspots.sh` | zsh | active | - | Profile AY on a benchmark with macOS sample; print top-of-stack self-time. |
-| setup-audit-tools | dev | `scripts/setup-audit-tools.sh` | bash | deprecated | - | Install the external checkers/solvers the z3-audit full-replacement replay needs. |
 
 ## fuzz
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
 | ayz3-fuzz | fuzz | `bindings/python/ayz3_fuzz` | python | active | - | Differential fuzzer for the ayz3 Python bindings. |
+| lia-mod-diff-fuzz | fuzz | `scripts/fuzz/lia_mod_diff_fuzz.py` | python | active | - | Differential fuzzer for QF_LIA with mod/div by small constants (parity/lattice obligations), AY vs Z3. |
 | planted-sat-fuzz | fuzz | `scripts/fuzz/decompose_planted_sat_fuzz.py` | python | active | - | Differential soundness fuzz for SCC equivalent-literal substitution on planted-SAT CNFs. |
 | smt-diff-fuzz | fuzz | `scripts/diff_fuzz.py` | python | active | - | Differential SMT fuzzer: random well-typed formulas in a declared logic, AY vs Z3. |
 | smt-diff-fuzz-dt | fuzz | `scripts/diff_fuzz_dt.py` | python | active | - | Differential SMT fuzzer for datatypes (QF_DT, QF_UFDT, QF_UFDTLIA, AUFDTLIA). |
@@ -161,35 +129,33 @@ script does not exist until its index entry does
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chc-baseline-compare | gate.chc | `scripts/chc_baseline_compare.py` | python | active | `ay submission` | Compare current AY CHC results against a checked-in baseline snapshot. |
-| chccomp-regression | gate.chc | `scripts/chccomp_regression.py` | python | active | - | Regression safety net: re-run every baselined CHC solve; fail on wrong answers or regressions. |
+| milp-corpus-guard | gate.milp | `scripts/corpus_guard.py` | python | active | - | Broad MILP drift guard decided by counts: re-measure shipped ay-milp defaults on the gate corpus against reports/corpus-baseline.json, catching work-only (simplex iterations at unchanged nodes) and limit-invariance regressions the exact node ratchet cannot see; a wall time decides nothing, and a solve its wall limit ended is COULD NOT RUN unless the counts it reached are already past the baseline's. |
+| milp-nightly-guard | gate.milp | `scripts/nightly_corpus_guard.sh` | zsh | active | - | Nightly MILP wrapper: build ay-milp at HEAD, verify the gate corpus, then run the node ratchet, the banded corpus guard and the exact-rim ratchet, leaving a dated log under the development design notes |
+| milp-nightly-guard-install | gate.milp | `scripts/install_nightly_guard.sh` | zsh | active | - | Install, remove or report the macOS LaunchAgent that runs the MILP nightly guard at 03:17 local time, so the guard runs when no session is open. |
+| milp-node-gate | gate.milp | `scripts/milp_node_gate.py` | python | active | - | Exact node-count ratchet: re-solve the twenty deterministic MIPLIB pins in .milp_node_baseline.toml and fail on any node, objective or status drift, so a node-economy regression is caught at push time. |
 | cert-ci-gate | gate.pb | `scripts/cert_ci.sh` | sh | active | - | CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1). |
-| pb-certified-gate | gate.pb | `scripts/ci/pb_certified_gate.sh` | sh | active | - | PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the six known wrong-verdict fixtures. |
-| proof-overhead-gate | gate.pb | `scripts/proof_overhead.py` | python | active | - | Proof Tap overhead gate: dense-tap proof-on vs plain, median <= 2x. |
+| pb-certified-gate | gate.pb | `scripts/ci/pb_certified_gate.sh` | sh | active | - | PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the twenty-two known wrong-verdict fixtures. |
+| pb-cli-manifest-gate | gate.pb | `scripts/pb_cli_manifest_gate.sh` | bash | active | - | Run the certified-track manifest (ci/cert-instances/manifest.tsv) through the shipped `ay pb solve --proof` and require the manifest status plus the exact pinned-VeriPB `s VERIFIED` conclusion on every row, counting documented refusals separately. |
+| veripb-build-id-lib | gate.pb | `scripts/lib/veripb_build_id.sh` | sh | active | - | The one shell-side authority for the pinned VeriPB cache key: resolves the compiler cargo will run and keys the checker cache by VeriPB commit, patch hash and that compiler, byte-for-byte with the Rust resolvers. |
 | veripb-fake-checker-gate | gate.pb | `scripts/ci/veripb_fake_checker_gate.sh` | sh | active | - | Runs every VeriPB-backed gate against the four fake checkers in ci/fake-checkers/ and fails if any gate passes. |
 | veripb-verdict-lib | gate.pb | `scripts/lib/veripb_verdict.sh` | sh | active | - | The one shell-side VeriPB verdict gate: exit code + exact conclusion + a six-probe checker self-test. |
-| critical-solver-policy-gate | gate.release | `scripts/check_critical_solver_policy.sh` | bash | active | `ay gate` | Enforce that changes to critical solver files land with native solver gate evidence. |
-| doc-reality-gate | gate.release | `scripts/check_doc_reality.sh` | bash | active | `ay gate` | Check that local Markdown links in AY's public documentation resolve inside the checkout. |
+| govern-armed-gate | gate.release | `scripts/check_govern_armed.sh` | bash | active | - | Fail unless every workspace bin target's main (found through include!) opens with ay_sys::govern::arm(), so no binary can allocate without the in-image kernel memory bound. |
+| govern-image-check | gate.release | `scripts/verify_govern_image.sh` | bash | active | - | Prove on macOS that a release ay's in-image memory bound holds: normal solves are unaffected, an unarmed control runs unbounded, and a 192 MB GOVERN_AY_MB budget stops a pigeonhole hog for the binary, a renamed copy, a copy at a new path and an orphan. |
 | public-clone-check | gate.release | `scripts/public-clone-check.sh` | bash | active | - | Unauthenticated public-clone build evidence: simulate what a fresh clone of the public repo sees. |
 | workspace-feature-unification-gate | gate.release | `scripts/ci/workspace_feature_unification_gate.sh` | bash | active | - | Fresh-target build gate for the ay CLI plus the system-allocator ay-pb binary under unified workspace features. |
-| sat-soundness-gate | gate.soundness | `scripts/ci/sat_soundness_gate.sh` | bash | active | `ay gate` | SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts. |
-| smt-soundness-gate | gate.soundness | `scripts/ci/smt_soundness_gate.sh` | bash | active | `ay gate` | SMT soundness-differential gate; the in-tree pre-push net. |
-| trust-ratchet-accounting | gate.soundness | `scripts/trust_ratchet_accounting.py` | python | active | - | Difference two ratchet baselines by obligation IDENTITY, so an obligation that was PROVED is distinguishable from one that merely STOPPED BEING ASKED: only `proved_solver_discharged`/`kernel_certified` are floors (deleting an obligation cannot raise them), gap counters are disclosed and never credited, and every run states proved-versus-not-asked in one line with removals attributed to the callee summary that caused them. |
-| trust-survey-parse | gate.soundness | `scripts/trust_survey_parse.py` | python | active | - | Parse a direct-compiler_consumer verification log into the ratchet baseline JSON: the authoritative per-function verdict lane plus in-band TRUST_JSON records, with the native-bundle `native_*` counters demoted to a labelled secondary engine-coverage metric. |
-
-## hook
-
-| Name | Group | Path | Lang | Status | CLI | Summary |
-|---|---|---|---|---|---|---|
-| pre-push-hook | hook | `scripts/git-hooks/pre-push` | bash | active | - | In-tree pre-push hook: enforces zero active Python test skips, then runs the SMT soundness gate. |
+| sat-soundness-gate | gate.soundness | `scripts/ci/sat_soundness_gate.sh` | bash | active | - | SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts. |
+| smt-soundness-gate | gate.soundness | `scripts/ci/smt_soundness_gate.sh` | bash | active | - | SMT soundness-differential gate: hermetic declared-status regressions, and a 2-solver diff against libz3 where it is present. |
 
 ## lib
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
+| cargo-frontend-lib | lib | `scripts/lib/cargo_frontend.sh` | sh | active | - | The Cargo-family frontend for scripts that ship publicly: `targo` (unverified lane for compiling subcommands) where the Trust toolchain is installed, plain `cargo` on a host without it. |
 | nra-oracle-campaign | lib | `scripts/nra_oracle_campaign.py` | python | active | - | Bounded scheduling, child supervision, and harness-abort coordination for NRA oracle shards. |
 | nra-oracle-shards-lib | lib | `scripts/nra_oracle_shards_lib.py` | python | active | - | Persistence, terminal-summary validation, and shard-range primitives for NRA oracle campaigns. |
 | oom-guard | lib | `scripts/_oom_guard.py` | python | active | - | Aggregate admission control for harness children: cap concurrency, hand each child MEMLIMIT/NBCORE env. |
+| z3-oracle | lib | `scripts/_z3_oracle.py` | python | active | - | The one z3 oracle resolver for scripts (mirrors ay-sys z3_oracle): Z3_PATH, else the first z3 on PATH that proves it is z3 (banner plus a negative control), reached by path past aterm reroute stubs. |
+| z3-reference | lib | `scripts/_z3_reference.py` | python | active | - | Reads ci/z3.pin (the one statement of which z3 bytes the differential gate is measured against) and provisions this host's row of the pinned upstream release asset into a read-only, content-addressed user cache (ay-z3 under XDG_CACHE_HOME, else ~/.cache): archive size and sha256, members and bin/z3 sha256 checked; --path is offline. Provisions z3, so it requires none. |
 
 ## oracle
 
@@ -203,24 +169,25 @@ script does not exist until its index entry does
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| maxsat-retro-report | report.maxsat | `scripts/maxsat_retro_report.py` | python | deprecated | - | Summarize ay maxsat bench JSON reports into the retroactive MSE leaderboard markdown. |
-| maxsat-tournament-report | report.maxsat | `scripts/maxsat_tournament_report.py` | python | deprecated | - | Merge ay maxsat bench --solver JSON reports into a same-hardware tournament leaderboard. |
 | pb-results-analyze | report.pb | `scripts/pb_results_analyze.py` | python | active | - | Consolidate a PB competition results mirror into clean structured data. |
 
 ## test
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| chccomp-campaign-oom-guard-tests | test | `scripts/tests/test_chccomp_campaign_oom_guard.py` | python | active | - | Resource-envelope recording checks for the CHC campaign scripts. |
-| continuous-benchmark-tests | test | `scripts/tests/test_continuous_benchmark.py` | python | active | - | Unit and disposable-Git-worktree tests for the continuous benchmark campaign driver. |
+| cargo-frontend-tests | test | `scripts/tests/test_cargo_frontend.py` | python | active | - | Drive cargo_frontend.sh with recording stubs (Trust host, public host, stock Cargo under the targo name), and scan the exported shell scripts for a direct targo command. |
 | frontend-resource-harness-tests | test | `scripts/tests/test_frontend_resource_harnesses.py` | python | active | - | Resource-envelope tests for the frontend benchmark harnesses. |
+| gate-load-precondition-tests | test | `scripts/tests/test_gate_load_precondition.py` | python | active | - | Pins the MILP node ratchet's quiet-box precondition, and holds corpus_guard's verdicts to counts on synthetic records: a wall-only slowdown decides nothing, moved nodes or work fail, a solve its wall limit ended could not run unless its counts already decided, the clock-steered instance decides only its answer and status, and a baseline the clock decided is not written. |
 | java-binding-smoke | test | `bindings/java/run.sh` | bash | active | - | Build and run the AY Java (FFM) binding test against libay_ffi. |
-| no-python-test-skips | test | `scripts/check_no_python_test_skips.py` | python | active | - | Fail-closed AST gate forbidding active skips and expected failures in first-party Python. |
-| no-python-test-skips-tests | test | `scripts/tests/test_no_python_test_skips.py` | python | active | - | Adversarial self-tests and repository-cleanliness pin for the Python zero-skip gate. |
+| milp-corpus-guard-provenance-tests | test | `scripts/tests/test_corpus_guard_provenance.py` | python | active | - | Validates corpus_guard's provenance overrides against the committed reports/corpus-baseline.json and refuses an override that names no result or records a measurement time that is neither a string nor null. |
 | nra-oracle-shards-terminal-tests | test | `scripts/tests/test_nra_oracle_shards_terminal.py` | python | active | - | Rejection-matrix and harness-abort regression tests for NRA oracle sharding. |
 | nra-oracle-shards-tests | test | `scripts/tests/test_nra_oracle_shards.py` | python | active | - | Resource-envelope, bounded-scheduler, and persistence tests for NRA oracle sharding. |
 | ocaml-binding-smoke | test | `bindings/ocaml/run.sh` | bash | active | - | Build and run the AY OCaml binding test against libay_ffi. |
 | oom-guard-tests | test | `scripts/tests/test_oom_guard.py` | python | active | - | Tests for _oom_guard.py resource planning and the harness wiring. |
+| proof-manifest-verifier-tests | test | `scripts/tests/test_verify_proof_manifest.py` | python | active | - | Locks the deferred-certificate contract: only a checker-accepted certificate scores as a win, rejected, timed-out or missing proofs never count, PAR-2 is priced at the solver clock, and the out-of-repo proof-mode wrapper (checked only when present) never runs the checker inside the timed region. |
 | resource-harness-tests | test | `scripts/tests/test_resource_harnesses.py` | python | active | - | Tests for benchmark drivers that consume the shared OOM guard. |
 | sat-soundness-gate-resource-tests | test | `scripts/tests/test_sat_soundness_gate_resources.py` | python | active | - | Resource-envelope tests for the SAT soundness gate harness. |
+| selftest-proof-harness | test | `scripts/selftest_proof_harness.py` | python | active | - | Regression test for the proof instruments: runs check_proofs.sh and soundness_sweep.py unmodified over benchmarks/proof-fixtures with a stub solver, and under --seed-fault re-introduces each historical harness defect to prove the suite goes red. |
 | smtcomp-harness-tests | test | `scripts/tests/test_smtcomp_harness.py` | python | active | - | Focused regression tests for SMT-COMP preparation, cache, and resource handling. |
+| z3-oracle-tests | test | `scripts/tests/test_z3_oracle.py` | python | active | - | Tests the script-side z3 oracle resolver against fake z3 programs: reroute stubs and impostors are passed over, a wrong Z3_PATH never falls back. |
+| z3-reference-tests | test | `scripts/tests/test_z3_reference.py` | python | active | - | Tests the ci/z3.pin reader and provisioner with fabricated pins and fake archives, offline: malformed pins, archives or binaries that differ from the pin, oversized downloads and members outside the one top directory are refused; the installed tree is read-only, idempotent and never overwritten. |

@@ -131,7 +131,7 @@ impl ConflictAnalyzer {
     /// Not used in production (CaDiCaL keeps seen flags until end of analysis),
     /// but retained for test coverage of the mark/unmark lifecycle.
     #[inline]
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn unmark_seen(&mut self, var: usize, var_data: &mut [VarData]) {
         debug_assert!(
             var < var_data.len(),

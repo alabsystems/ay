@@ -33,7 +33,7 @@ impl Solver {
         // for clause tier classification, regardless of current mode.
         if lbd <= self.tiers.tier1_lbd[0] {
             ClauseTier::Core
-        } else if lbd <= self.tiers.tier2_lbd[0] {
+        } else if lbd <= self.tiers.reduce_tier2() {
             ClauseTier::Tier1
         } else {
             ClauseTier::Tier2
@@ -55,7 +55,7 @@ impl Solver {
             return true;
         }
         let lbd = self.arena.lbd(clause_idx);
-        if lbd <= self.tiers.tier2_lbd[0] {
+        if lbd <= self.tiers.reduce_tier2() {
             return true;
         }
         lbd <= self.tiers.kept_glue
@@ -80,6 +80,10 @@ impl Solver {
     pub(super) fn reduce_permanent_protect_lbd(&self) -> u32 {
         if self.cold.ic3_mode {
             CORE_LBD
+        } else if self.cold.reduce_protect_kissat {
+            // `--sat-reduce-protect-kissat`: Kissat protects glue-1 clauses
+            // only while used (reduce.c:76-79).
+            0
         } else {
             // Main-track search keeps only LBD-1 clauses permanently. Stale
             // LBD-2 clauses fall through to the used-gated Core tier so recent
@@ -141,6 +145,21 @@ impl Solver {
     /// Clause activity plays no role in deletion decisions (#5132) -- only LBD
     /// and clause size determine usefulness per CaDiCaL's `reduce_less_useful`.
     pub(super) fn bump_clause(&mut self, clause_ref: ClauseRef) {
+        match self.bump_clause_admitted(clause_ref, &conflict_analysis_minimize::admitted::Ordinary)
+        {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+
+    pub(in crate::solver) fn bump_clause_admitted<
+        P: conflict_analysis_minimize::admitted::Policy,
+    >(
+        &mut self,
+        clause_ref: ClauseRef,
+        p: &P,
+    ) -> Result<(), P::Error> {
+        p.work(8)?;
         let clause_idx = clause_ref.0 as usize;
 
         debug_assert!(
@@ -155,19 +174,28 @@ impl Solver {
         // a cumulative usage FREQUENCY, and saturating to MAX_USED here would
         // flatten "used once" and "used ten thousand times" into the same
         // value, which is the whole distinction stage 1 sorts on.
-        if self.two_stage_clause_management {
+        if self.two_stage_scoring() {
+            if self.arena.is_learned(clause_idx) {
+                p.counter(self.stats.two_stage_analysis_bumps, 1)?;
+                if self.arena.two_stage_score(clause_idx)
+                    == crate::clause_arena::MAX_TWO_STAGE_SCORE
+                {
+                    p.counter(self.stats.two_stage_score_saturations, 1)?;
+                }
+            }
             self.two_stage_note_analysis_use(clause_idx);
-        } else {
+        }
+        if !self.two_stage_clause_management {
             self.arena
                 .set_used(clause_idx, crate::clause_arena::MAX_USED);
         }
 
         // (2) Recompute glue and promote for learned clauses
         if !self.arena.is_learned(clause_idx) || self.arena.is_empty_clause(clause_idx) {
-            return;
+            return Ok(());
         }
         let old_lbd = self.arena.lbd(clause_idx);
-        let new_lbd = self.recompute_glue(clause_idx);
+        let new_lbd = self.recompute_glue_upto_admitted(clause_idx, old_lbd, p)?;
         if new_lbd < old_lbd {
             self.arena.set_lbd(clause_idx, new_lbd);
         }
@@ -183,12 +211,29 @@ impl Solver {
         // (#8229) When a clause is promoted into tier-1 (LBD drops to <= tier2_lbd),
         // mark its variables as JIT-dirty so the next delta recompile picks it up.
 
-        // (3) Track per-glue usage (CaDiCaL analyze.cpp:237-239)
+        // (3) Track per-glue usage (CaDiCaL analyze.cpp:237-239) — for large
+        // clauses only, as Kissat does (deduce.c `mark_clause_as_used` runs
+        // for large reasons; binary reasons are literals there). AY's search
+        // BCP stores a binary propagation's clause as its reason, so every
+        // learned binary clause used in analysis was landing here at glue 1
+        // or 2 and the tiers collapsed to 1 / 2 on schooltt-5-3, snw_16_9
+        // and SDP_134 (Kissat: 7 / 12 there), leaving every learned clause
+        // of LBD 3 and up a tier-3 deletion candidate and the learned-tier
+        // vivification budgets on near-empty populations (2026-09-21). The
+        // tiers are for the clauses reduction ranks, and it never ranks
+        // binaries. `--sat-tier-histogram-binaries true` restores the old
+        // accounting.
+        if self.arena.len_of(clause_idx) <= 2 && !self.tier_histogram_counts_binaries() {
+            return Ok(());
+        }
         let glue = self.arena.lbd(clause_idx);
         let mode = usize::from(self.stable_mode);
-        let bucket = (glue as usize).min(self.tiers.tier_usage[mode].len() - 1);
+        let bucket = (glue as usize).min(self.tiers.max_glue_used());
+        p.counter(self.tiers.tier_usage[mode][bucket], 1)?;
+        p.counter(self.tiers.tier_bump_total[mode], 1)?;
         self.tiers.tier_usage[mode][bucket] += 1;
         self.tiers.tier_bump_total[mode] += 1;
+        Ok(())
     }
 
     /// Force a full rebuild of reason clause marks on the next `ensure` call (#8100).
@@ -344,6 +389,40 @@ impl Solver {
         }
     }
 
+    /// Whether binary learned clauses feed the used-glue histogram: the test
+    /// override, else `--sat-tier-histogram-binaries` (default off).
+    fn tier_histogram_counts_binaries(&self) -> bool {
+        self.cold
+            .tier_histogram_binaries
+            .unwrap_or_else(|| ay_core::sat_ab_switches().tier_histogram_binaries == Some(true))
+    }
+
+    #[cfg(test)]
+    pub(in crate::solver) fn set_tier_histogram_binaries(&mut self, on: bool) {
+        self.cold.tier_histogram_binaries = Some(on);
+    }
+
+    /// Whether `clause_idx` is the reason of an assigned variable, read from
+    /// the clause's own literals: `reason[vi] == Some(cref)` implies `vi`
+    /// appears in the clause (test_reason_clause_contains_propagated_variable),
+    /// and only assigned variables' reasons count, as in the marks. The same
+    /// answer `is_reason_clause_marked` gives after a refresh, in O(clause
+    /// length) where the refresh walks the whole trail: on b54b26f3 (3.01M
+    /// root-level literals) vivification refreshed for every clause it deleted.
+    pub(super) fn is_reason_clause_direct(&self, clause_idx: usize) -> bool {
+        let reason = clause_idx as u32;
+        if !is_clause_reason(reason) {
+            return false;
+        }
+        self.arena.literals(clause_idx).iter().any(|&lit| {
+            let vi = lit.variable().index();
+            vi < self.num_vars && {
+                let vd = self.var_data[vi];
+                vd.reason == reason && !vd.is_lazy_theory_reason() && self.vals[lit.index()] != 0
+            }
+        })
+    }
+
     /// Check whether a clause is marked as a current reason in the active epoch.
     #[inline]
     #[allow(unsafe_code)]
@@ -410,7 +489,11 @@ impl Solver {
         // Find tier2 boundary (continue from where tier1 left off).
         // CaDiCaL tier.cpp:48 also starts tier2 from the same glue value
         // as tier1 break — the double-count is intentional (overlapping
-        // cumulative thresholds, not exclusive partitions).
+        // cumulative thresholds, not exclusive partitions). Kissat's rule
+        // (tiers.c:27-28) starts past it.
+        if self.tiers.kissat_rule {
+            glue += 1;
+        }
         while glue < usage.len() {
             accumulated += usage[glue];
             if accumulated >= tier2_target {

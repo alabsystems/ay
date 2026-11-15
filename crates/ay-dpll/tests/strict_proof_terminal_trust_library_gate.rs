@@ -284,3 +284,97 @@ fn restored_reason_round_trips_through_its_origin() {
         "the inventories must stay the same length"
     );
 }
+
+/// A floating-point refutation AY's strict checker accepts (an exhaustive
+/// exact-IEEE classification lemma) whose sort pinned Carcara cannot parse.
+const FP_UNCHECKABLE_UNSAT: &str = "\
+(set-logic QF_FP)
+(declare-const x (_ FloatingPoint 3 5))
+(assert (and (fp.isNaN x) (fp.isNormal x)))
+(check-sat)
+";
+
+/// D7 (2026-09-22) negative control: a consumer that CLAIMS an external check
+/// refuses an `unsupported`-surface certificate WITH THE REASON. Strict proofs
+/// is that consumer at the library boundary: the verdict is withheld as
+/// `ProofTrusted`, and `unknown_detail()` names the sort pinned Carcara cannot
+/// parse — uniformly for `Seq` and `FloatingPoint`.
+#[test]
+#[timeout(120_000)]
+fn strict_proofs_refusal_names_the_unsupported_carcara_surface() {
+    for (script, sort) in [
+        (SEQ_LEN_UNCHECKABLE_UNSAT, "(Seq Int)"),
+        (FP_UNCHECKABLE_UNSAT, "(_ FloatingPoint 3 5)"),
+    ] {
+        let (verdict, executor) = solve(STRICT, script);
+        assert_eq!(
+            verdict, "unknown",
+            "{sort}: strict proofs must withhold the verdict"
+        );
+        assert_eq!(
+            executor.unknown_reason(),
+            Some(UnknownReason::ProofTrusted),
+            "{sort}: the typed reason must name the gate"
+        );
+        let detail = executor
+            .unknown_detail()
+            .unwrap_or_else(|| panic!("{sort}: the strict-proof refusal must record its cause"));
+        assert!(
+            detail.contains("external-recheck surface is unsupported") && detail.contains(sort),
+            "{sort}: the refusal must name the unsupported surface, got: {detail}"
+        );
+    }
+}
+
+/// The same refusal through `--self-check`, the other consumer that claims an
+/// external-style check: `SelfCheckRejected`, with the surface named.
+#[test]
+#[timeout(120_000)]
+fn self_check_refusal_names_the_unsupported_carcara_surface() {
+    let commands =
+        parse(&format!("{PLAIN}{SEQ_LEN_UNCHECKABLE_UNSAT}")).expect("parse probe script");
+    let mut executor = Executor::new();
+    executor.set_self_check(true);
+    let outputs = executor
+        .execute_all(&commands)
+        .expect("execute probe script");
+    assert_eq!(outputs.last().map(String::as_str), Some("unknown"));
+    assert_eq!(
+        executor.unknown_reason(),
+        Some(UnknownReason::SelfCheckRejected)
+    );
+    let detail = executor
+        .unknown_detail()
+        .expect("the self-check refusal must record its cause");
+    assert!(
+        detail.contains("external-recheck surface is unsupported") && detail.contains("(Seq Int)"),
+        "the refusal must name the unsupported surface, got: {detail}"
+    );
+}
+
+/// The control's own control for D7: a consumer that claims NO external check
+/// gets the verdict AND the document, with the surface disclosed rather than
+/// refused — the artifact no longer vanishes on a `Seq` sort.
+#[test]
+#[timeout(120_000)]
+fn plain_mode_discloses_the_unsupported_surface_instead_of_withholding_the_document() {
+    let (verdict, executor) = solve(PLAIN, SEQ_LEN_UNCHECKABLE_UNSAT);
+    assert_eq!(verdict, "unsat");
+    let surface = executor
+        .last_unsat_proof_carcara_surface()
+        .expect("proof mode retains the proof");
+    assert!(
+        surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains("(Seq Int)")),
+        "{surface}"
+    );
+    let alethe = executor
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("proof mode retains a problem-scoped proof")
+        .expect("D7: the Seq document renders what the strict checker accepted");
+    assert!(
+        alethe.contains("(step ") && !alethe.contains("UNVERIFIABLE PROOF"),
+        "{alethe}"
+    );
+}

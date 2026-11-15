@@ -27,6 +27,6 @@ fn equality_style_shared_tag_cycle() {
             assert!(!tags.is_empty());
             assert!(tags.contains(&0) && tags.contains(&1), "tags: {tags:?}");
         }
-        AssertOutcome::Consistent => panic!("missed the negative cycle"),
+        AssertOutcome::Consistent | AssertOutcome::Refused => panic!("missed the negative cycle"),
     }
 }

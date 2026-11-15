@@ -139,7 +139,14 @@ impl PdrSolver {
                     // have inconsistent frames due to blocking lemmas from
                     // different incoming transitions — this is expected and not
                     // a convergence-blocking issue.
-                    if let Some(constraint) = self.frames[i].get_predicate_constraint(pred_id) {
+                    // Under the lane the frame at level i is the delta frame
+                    // (S6: one hypothesis for every reader).
+                    let constraint = if self.spacer_core {
+                        self.frame_hyp(i, pred_id)
+                    } else {
+                        self.frames[i].get_predicate_constraint(pred_id)
+                    };
+                    if let Some(constraint) = constraint {
                         self.smt.reset();
                         matches!(
                             self.smt.check_sat_with_timeout(
@@ -183,7 +190,28 @@ impl PdrSolver {
                 // problems, which filters out entry-invalid lemmas. Fall back to
                 // build_model_from_frame if the entry-inductive model is trivial
                 // (all predicates map to true).
-                let model = if self.problem.predicates().len() > 1 {
+                // Workstream B (D2 / §7.5, WP-S 2026-09-23): under the lane the
+                // converged hypothesis IS `frame_hyp(i)` = ∧_{j ≥ i} frames[j]:
+                // every lane lemma at level L was established relative to
+                // F_{L-1} over ALL defining clauses of its predicate (entry
+                // clauses included), and F_i ≡ F_{i+1} makes F_i inductive.
+                // The legacy entry-inductive rebuild below reads the LOCAL
+                // `frames[i]` only and Houdini-prunes what it cannot re-prove
+                // from that weaker set — on HOLA-44 it pruned the proven
+                // `false` of both query predicates, so every fixed-point model
+                // failed its query clause (47 demotions). The candidate is
+                // the full delta frame (`false` kept by
+                // `false_lemma_in_model`); `verify_model` still decides (S1).
+                let model = if self.spacer_core {
+                    if self.config.verbose {
+                        safe_eprintln!(
+                            "PDR-SPACER: check_fixed_point: full delta-frame model at level {} (false_lemma_in_model={})",
+                            i,
+                            self.config.spacer.false_lemma_in_model
+                        );
+                    }
+                    self.build_model_from_frame_for_convergence(i)
+                } else if self.problem.predicates().len() > 1 {
                     let entry_model = self.build_model_from_entry_inductive_lemmas(i);
                     let is_trivial = self.problem.predicates().iter().all(|pred| {
                         entry_model
@@ -277,28 +305,40 @@ impl PdrSolver {
     /// Two frames are equivalent if their cumulative constraints are logically equivalent,
     /// which means F_i => F_j and F_j => F_i.
     pub(in crate::pdr::solver) fn frames_equivalent(&mut self, i: usize, j: usize) -> bool {
-        // Quick syntactic check first
-        if self.frames[i].lemmas.len() != self.frames[j].lemmas.len() {
-            if self.config.verbose {
-                safe_eprintln!("PDR: frames_equivalent: frames {} and {} have different lemma counts ({} vs {})",
-                    i, j, self.frames[i].lemmas.len(), self.frames[j].lemmas.len());
+        // Workstream B (D2, `DESIGN` §4.3 item 3): under the lane the frames are
+        // delta frames, `F_i = frames[i] ∧ F_{i+1}`. The lemma-count quick-reject
+        // does not apply; instead a quick-ACCEPT: when every lemma of `frames[i]`
+        // has a structural duplicate in some `frames[j']`, `j' > i`, then
+        // `F_i ≡ F_{i+1}` syntactically. Otherwise the SMT equivalence below runs
+        // over `cumulative_frame_constraint` (= `frame_hyp` under the lane).
+        if self.spacer_core {
+            if let Some(quick) = self.frames_equivalent_delta_quick(i, j) {
+                return quick;
             }
-            return false;
-        }
+        } else {
+            // Quick syntactic check first
+            if self.frames[i].lemmas.len() != self.frames[j].lemmas.len() {
+                if self.config.verbose {
+                    safe_eprintln!("PDR: frames_equivalent: frames {} and {} have different lemma counts ({} vs {})",
+                        i, j, self.frames[i].lemmas.len(), self.frames[j].lemmas.len());
+                }
+                return false;
+            }
 
-        // Two empty frames cannot form a valid fixpoint — an empty frame set
-        // means PDR hasn't discovered any lemmas, not that safety is proven.
-        // This can happen when SMT queries return Unknown for array-heavy
-        // problems. (#6047)
-        if self.frames[i].lemmas.is_empty() && self.frames[j].lemmas.is_empty() {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "PDR: frames_equivalent: both frames {} and {} are empty, not a valid fixpoint",
-                    i,
-                    j
-                );
+            // Two empty frames cannot form a valid fixpoint — an empty frame set
+            // means PDR hasn't discovered any lemmas, not that safety is proven.
+            // This can happen when SMT queries return Unknown for array-heavy
+            // problems. (#6047)
+            if self.frames[i].lemmas.is_empty() && self.frames[j].lemmas.is_empty() {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "PDR: frames_equivalent: both frames {} and {} are empty, not a valid fixpoint",
+                        i,
+                        j
+                    );
+                }
+                return false;
             }
-            return false;
         }
 
         // Check logical equivalence for each predicate
@@ -387,6 +427,53 @@ impl PdrSolver {
         }
 
         true
+    }
+
+    /// Delta-frame quick decision for `frames_equivalent(i, j)` (`j == i + 1`):
+    /// `Some(false)` when no frame `≥ i` carries any lemma (the #6047 guard:
+    /// an empty frame set proves nothing); `Some(true)` when every lemma of
+    /// `frames[i]` has a structural duplicate in some `frames[j']`, `j' > i`
+    /// (then `frames[i] ⊆ F_{i+1}` as conjunct sets and `F_i ≡ F_{i+1}`);
+    /// `None` = undecided, run the SMT equivalence.
+    pub(in crate::pdr::solver) fn frames_equivalent_delta_quick(
+        &self,
+        i: usize,
+        j: usize,
+    ) -> Option<bool> {
+        let top = self.frames.len().saturating_sub(1);
+        if i == 0 || i > top {
+            return Some(false);
+        }
+        let any_lemma_at_or_above = (i..=top).any(|k| !self.frames[k].lemmas.is_empty());
+        if !any_lemma_at_or_above {
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: frames_equivalent: no lemma at any frame >= {}, not a valid fixpoint",
+                    i
+                );
+            }
+            return Some(false);
+        }
+        let start = j.max(i + 1).min(top + 1);
+        let all_duplicated = self.frames[i].lemmas.iter().all(|lemma| {
+            (start..=top).any(|k| {
+                self.frames[k].lemmas.iter().any(|l| {
+                    l.predicate == lemma.predicate
+                        && l.formula_hash == lemma.formula_hash
+                        && l.formula == lemma.formula
+                })
+            })
+        });
+        if all_duplicated {
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: frames_equivalent: every lemma of frame {} is duplicated above it (delta quick-accept)",
+                    i
+                );
+            }
+            return Some(true);
+        }
+        None
     }
 
     /// Bounded per-conjunct implication check for frame equivalence

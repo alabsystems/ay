@@ -11,9 +11,8 @@ use crate::types::{PbConstraint, WboInstance};
 // GRAMMAR — cfg-stripping runs after parsing — so it cannot be hidden from a
 // compiler that lacks the extension, and it would make this whole file unreadable
 // to one. It therefore lives alone in a fragment: the verifier reads
-// `eval/vig_core.rs`, everyone else reads `eval/vig_core_stock.rs`, and the two are
-// pinned together by `tests/native_contract_twins.rs`. Both are `include!`d rather
-// than made a submodule so the function keeps this module, its `crate::`
+// `eval/vig_core.rs`, everyone else reads `eval/vig_core_stock.rs`. Both are
+// `include!`d rather than made a submodule so the function keeps this module, its `crate::`
 // re-export and its doc links.
 #[cfg(deductive_verify)]
 include!("eval/vig_core.rs");

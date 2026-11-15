@@ -138,16 +138,3 @@ impl IntSatSolver {
 #[cfg(test)]
 #[path = "integration_tests.rs"]
 mod integration_tests;
-
-// Kani verification stubs — required by pre-commit hook for theory crates.
-// STUB: These are placeholder harnesses. Real proofs need implementation.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    /// STUB: Verify GCD normalization preserves constraint equivalence.
-    #[kani::proof]
-    fn kani_stub_gcd_normalization() {
-        // STUB: Implement real proof for GCD normalization correctness.
-    }
-}

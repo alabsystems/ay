@@ -31,6 +31,45 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Whether a Bool constant that is a UF argument joins its value's class
+    /// ([`scoped_bool_constant_arg_seeding`]); `None` outside every scope.
+    static BOOL_CONSTANT_ARG_SEEDING: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the predecessor seeding switch on drop (and unwind).
+pub struct BoolConstantArgSeedingScope(Option<bool>);
+
+impl Drop for BoolConstantArgSeedingScope {
+    fn drop(&mut self) {
+        BOOL_CONSTANT_ARG_SEEDING.with(|c| c.set(self.0));
+    }
+}
+
+/// Seed Bool constant UF arguments into their value's class while the
+/// returned guard lives on this thread. Only a solve whose UNSAT is published
+/// without a proof may ask for it: the merge is sound, but a refutation
+/// resting on it yields an EUF lemma the proof checker rejects
+/// (`EufCongruentPred` over a Boolean argument), which the proof-carrying
+/// postures turn into `unknown` on ground queries they refuted without it.
+///
+/// The outermost scope decides: a solve nested inside another (a probe or a
+/// fresh executor re-checking a verdict) keeps the enclosing solve's choice.
+pub fn scoped_bool_constant_arg_seeding(enabled: bool) -> BoolConstantArgSeedingScope {
+    BOOL_CONSTANT_ARG_SEEDING.with(|c| {
+        let outer = c.get();
+        if outer.is_none() {
+            c.set(Some(enabled));
+        }
+        BoolConstantArgSeedingScope(outer)
+    })
+}
+
+fn bool_constant_arg_seeding() -> bool {
+    BOOL_CONSTANT_ARG_SEEDING.with(|c| c.get() == Some(true))
+}
+
 /// Take (and clear) the Bool-arg app pairs recorded by the last congruence-guard
 /// downgrade on this thread. Empty when the guard did not fire.
 pub fn take_bool_arg_repair_candidates() -> Vec<(TermId, TermId)> {
@@ -117,7 +156,7 @@ impl EufSolver<'_> {
                             && (lhs.0 as usize) < self.enodes.len()
                             && (rhs.0 as usize) < self.enodes.len()
                         {
-                            self.gap_stats.eq_asserts += 1;
+                            self.gap_stats.eq_asserts = self.gap_stats.eq_asserts.saturating_add(1);
                             if self.gap_stats.eq_asserts.is_multiple_of(1024) {
                                 self.gap_stats.print(self.propagation_count);
                             }
@@ -125,18 +164,22 @@ impl EufSolver<'_> {
                             let rr = self.enode_find_const(rhs.0);
                             if lr == rr {
                                 if value {
-                                    self.gap_stats.pos_redundant += 1;
+                                    self.gap_stats.pos_redundant =
+                                        self.gap_stats.pos_redundant.saturating_add(1);
                                 } else {
-                                    self.gap_stats.neg_conflict += 1;
+                                    self.gap_stats.neg_conflict =
+                                        self.gap_stats.neg_conflict.saturating_add(1);
                                 }
                             } else {
                                 let key = (lr.min(rr), lr.max(rr));
                                 if let Some(&(_, _, dterm)) = self.diseq_pair_index.get(&key) {
                                     if self.assigns.get(&dterm) == Some(&false) {
                                         if value {
-                                            self.gap_stats.pos_conflict += 1;
+                                            self.gap_stats.pos_conflict =
+                                                self.gap_stats.pos_conflict.saturating_add(1);
                                         } else {
-                                            self.gap_stats.neg_redundant += 1;
+                                            self.gap_stats.neg_redundant =
+                                                self.gap_stats.neg_redundant.saturating_add(1);
                                         }
                                     }
                                 }
@@ -292,6 +335,22 @@ impl EufSolver<'_> {
                 }
             }
         }
+        // A Bool constant that is a UF argument, as in `(B false)`, has its
+        // value in every model: it joins that value's class whether or not the
+        // SAT layer assigned it, so `(B false)` and `(B p)` merge once `p` is
+        // false. Structural, so a fresh solver re-checking a conflict (which
+        // gets no literal for a constant endpoint) seeds it the same way. Only
+        // under a proof-shedding solve (`scoped_bool_constant_arg_seeding`).
+        if bool_constant_arg_seeding() {
+            for (constant, val) in [
+                (self.terms.true_term(), true),
+                (self.terms.false_term(), false),
+            ] {
+                if self.bool_uf_arg_terms.contains(&constant.0) {
+                    bool_assigns.push((constant.0, val));
+                }
+            }
+        }
         bool_assigns.sort_unstable();
         bool_assigns.dedup();
 
@@ -353,29 +412,26 @@ impl EufSolver<'_> {
             } else {
                 self.bool_false_anchor
             };
-            match anchor {
-                None => {
-                    if val {
-                        self.bool_true_anchor = Some(term_id);
-                    } else {
-                        self.bool_false_anchor = Some(term_id);
-                    }
+            // An `if let` (not a two-arm `match`): the Option's discriminant
+            // switch then carries no unreachable fallthrough arm.
+            if let Some(existing_rep) = anchor {
+                self.ensure_enodes_size(term_id);
+                self.ensure_enodes_size(existing_rep);
+                if self.enode_find_const(term_id) != self.enode_find_const(existing_rep) {
+                    self.to_merge.push_back(MergeReason {
+                        a: term_id,
+                        b: existing_rep,
+                        reason: EqualityReason::BoolValue {
+                            term: TermId(term_id),
+                            value: val,
+                        },
+                    });
+                    queued = queued.saturating_add(1);
                 }
-                Some(existing_rep) => {
-                    self.ensure_enodes_size(term_id);
-                    self.ensure_enodes_size(existing_rep);
-                    if self.enode_find_const(term_id) != self.enode_find_const(existing_rep) {
-                        self.to_merge.push_back(MergeReason {
-                            a: term_id,
-                            b: existing_rep,
-                            reason: EqualityReason::BoolValue {
-                                term: TermId(term_id),
-                                value: val,
-                            },
-                        });
-                        queued += 1;
-                    }
-                }
+            } else if val {
+                self.bool_true_anchor = Some(term_id);
+            } else {
+                self.bool_false_anchor = Some(term_id);
             }
         }
         pending.clear();
@@ -486,7 +542,9 @@ impl EufSolver<'_> {
                 if args.is_empty() {
                     return None;
                 }
-                let (consequent, antecedents) = args.split_last().unwrap();
+                let Some((consequent, antecedents)) = args.split_last() else {
+                    return None;
+                };
                 let mut all_ante_true = true;
                 for &a in antecedents {
                     match self.derive_bool_term_value(a) {
@@ -503,21 +561,37 @@ impl EufSolver<'_> {
             }
             // Bool-sorted `=`/`distinct` over determinable Bool operands.
             "=" if args.len() >= 2 && self.terms.sort(args[0]) == &Sort::Bool => {
-                let mut vals: Vec<bool> = Vec::with_capacity(args.len());
+                // Every operand must be determined; the chain holds iff each
+                // value equals the first (no scratch vector needed).
+                let mut first: Option<bool> = None;
+                let mut all_equal = true;
                 for &a in args {
-                    vals.push(self.derive_bool_term_value(a)?);
+                    let v = self.derive_bool_term_value(a)?;
+                    if let Some(f) = first {
+                        all_equal &= f == v;
+                    } else {
+                        first = Some(v);
+                    }
                 }
-                Some(vals.windows(2).all(|w| w[0] == w[1]))
+                Some(all_equal)
             }
             "distinct" if args.len() >= 2 && self.terms.sort(args[0]) == &Sort::Bool => {
-                let mut vals: Vec<bool> = Vec::with_capacity(args.len());
+                // Every operand must be determined (as before); only the first
+                // two values matter for the verdict below.
+                let mut first: Option<bool> = None;
+                let mut second: Option<bool> = None;
                 for &a in args {
-                    vals.push(self.derive_bool_term_value(a)?);
+                    let v = self.derive_bool_term_value(a)?;
+                    if first.is_none() {
+                        first = Some(v);
+                    } else if second.is_none() {
+                        second = Some(v);
+                    }
                 }
                 // Over Bool there are only two values, so >2 args can never be
                 // pairwise distinct; for 2 args it is the inequality.
-                if vals.len() == 2 {
-                    Some(vals[0] != vals[1])
+                if args.len() == 2 {
+                    Some(first != second)
                 } else {
                     Some(false)
                 }
@@ -577,22 +651,24 @@ impl EufSolver<'_> {
         // so the closure below only adds the Bool-arg congruence merges on top of
         // what EUF already derived.
         let mut parent: Vec<u32> = (0..nverts).collect();
-        fn sfind(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                parent[x as usize] = parent[parent[x as usize] as usize];
-                x = parent[x as usize];
-            }
-            x
-        }
+        // Path-halving union-find root lookup. Lives in `crate::union_find`
+        // so every index read from the forest is an explicit, stated
+        // bounds check rather than an unstated assumption. A malformed forest
+        // (`Err`) means the guard cannot confirm congruence, so it refuses to
+        // certify the model (`false`: Sat -> Unknown, never a wrong answer).
+        use crate::union_find::{is_forest, sfind};
         // Seed with current EUF classes.
         for v in 0..nverts {
             let r = self.enode_find_const(v);
-            let rr = sfind(&mut parent, r);
-            let vr = sfind(&mut parent, v);
+            let (Ok(rr), Ok(vr)) = (sfind(&mut parent, r), sfind(&mut parent, v)) else {
+                return false;
+            };
             if vr != rr {
                 parent[vr as usize] = rr;
             }
         }
+        // Whole-forest check once per batch (here and after the merges), never per lookup.
+        debug_assert!(is_forest(&parent));
 
         // Collect the forced-equal Bool-arg app pairs: two UF apps with the same
         // (func_hash, non-Bool-arg current-reps, Bool-arg model truth values)
@@ -636,7 +712,10 @@ impl EufSolver<'_> {
                         }
                     }
                 } else {
-                    non_bool_reps.push(sfind(&mut parent, arg));
+                    let Ok(r) = sfind(&mut parent, arg) else {
+                        return false;
+                    };
+                    non_bool_reps.push(r);
                 }
             }
             if undetermined {
@@ -679,13 +758,20 @@ impl EufSolver<'_> {
         let baseline: Vec<u32> = {
             let mut b = parent.clone();
             for v in 0..nverts {
-                sfind(&mut b, v);
+                if sfind(&mut b, v).is_err() {
+                    return false;
+                }
             }
             b
         };
+        // Every id reaching this lookup is `< nverts == baseline.len()`; an id
+        // outside the forest has no parent and is its own root.
         let base_rep = |b: &[u32], mut x: u32| -> u32 {
-            while b[x as usize] != x {
-                x = b[x as usize];
+            while let Some(&next) = b.get(x as usize) {
+                if next == x {
+                    break;
+                }
+                x = next;
             }
             x
         };
@@ -693,8 +779,9 @@ impl EufSolver<'_> {
         // ordinary congruence over ALL func_apps so nested wrappers like
         // `f(fb(A))` / `f(fb(B))` also collapse. A bounded fixpoint.
         for (a, b) in &forced_edges {
-            let ra = sfind(&mut parent, *a);
-            let rb = sfind(&mut parent, *b);
+            let (Ok(ra), Ok(rb)) = (sfind(&mut parent, *a), sfind(&mut parent, *b)) else {
+                return false;
+            };
             if ra != rb {
                 parent[ra as usize] = rb;
             }
@@ -721,7 +808,10 @@ impl EufSolver<'_> {
             let mut cong = std::mem::take(&mut self.scratch_bool_arg_cong);
             let mut pool = std::mem::take(&mut self.scratch_bool_arg_pool);
             cong.reserve(self.func_apps.len().saturating_sub(cong.capacity()));
-            while changed && rounds < max_rounds {
+            // Set on a malformed forest; the scratch is restored before the
+            // guard refuses the model.
+            let mut malformed = false;
+            'rounds: while changed && rounds < max_rounds {
                 changed = false;
                 rounds += 1;
                 for ((_, k), _) in cong.drain() {
@@ -732,19 +822,25 @@ impl EufSolver<'_> {
                     let func_hash = self.func_apps[i].func_hash;
                     let mut arg_reps = pool.pop().unwrap_or_default();
                     arg_reps.clear();
-                    arg_reps.extend(
-                        self.func_apps[i]
-                            .args
-                            .iter()
-                            .map(|&a| sfind(&mut parent, a)),
-                    );
+                    for &a in &self.func_apps[i].args {
+                        let Ok(r) = sfind(&mut parent, a) else {
+                            malformed = true;
+                            pool.push(arg_reps);
+                            break 'rounds;
+                        };
+                        arg_reps.push(r);
+                    }
                     match cong.entry((func_hash, arg_reps)) {
                         Entry::Vacant(e) => {
                             e.insert(app_term);
                         }
                         Entry::Occupied(e) => {
-                            let ra = sfind(&mut parent, *e.get());
-                            let rb = sfind(&mut parent, app_term);
+                            let (Ok(ra), Ok(rb)) =
+                                (sfind(&mut parent, *e.get()), sfind(&mut parent, app_term))
+                            else {
+                                malformed = true;
+                                break 'rounds;
+                            };
                             if ra != rb {
                                 parent[ra as usize] = rb;
                                 changed = true;
@@ -758,7 +854,11 @@ impl EufSolver<'_> {
             }
             self.scratch_bool_arg_cong = cong;
             self.scratch_bool_arg_pool = pool;
+            if malformed {
+                return false;
+            }
         }
+        debug_assert!(is_forest(&parent));
 
         // Bool-VALUE collision: if the congruence closure merged two Bool-sorted
         // terms whose committed model truth values DISAGREE, the model is
@@ -786,7 +886,9 @@ impl EufSolver<'_> {
                 if t.0 >= nverts || self.terms.sort(t) != &Sort::Bool {
                     continue;
                 }
-                let closed = sfind(&mut parent, t.0);
+                let Ok(closed) = sfind(&mut parent, t.0) else {
+                    return false;
+                };
                 let base = base_rep(&baseline, t.0);
                 let seen = class_witnesses.entry(closed).or_default();
                 if seen.iter().any(|&(ob, ov)| ob != base && ov != v) {
@@ -809,12 +911,14 @@ impl EufSolver<'_> {
             .filter_map(|(&t, _)| self.decode_eq(t))
             .collect();
         for (lhs, rhs) in neg_eqs {
-            if self.terms.sort(lhs) == self.terms.sort(rhs)
-                && lhs.0 < nverts
-                && rhs.0 < nverts
-                && sfind(&mut parent, lhs.0) == sfind(&mut parent, rhs.0)
-            {
-                return false;
+            if self.terms.sort(lhs) == self.terms.sort(rhs) && lhs.0 < nverts && rhs.0 < nverts {
+                let (Ok(rl), Ok(rr)) = (sfind(&mut parent, lhs.0), sfind(&mut parent, rhs.0))
+                else {
+                    return false;
+                };
+                if rl == rr {
+                    return false;
+                }
             }
         }
         let distinct_terms: Vec<Vec<TermId>> = self
@@ -828,12 +932,17 @@ impl EufSolver<'_> {
                 if args[i].0 >= nverts {
                     continue;
                 }
-                let ri = sfind(&mut parent, args[i].0);
+                let Ok(ri) = sfind(&mut parent, args[i].0) else {
+                    return false;
+                };
                 for arg in &args[i + 1..] {
                     if arg.0 >= nverts {
                         continue;
                     }
-                    if ri == sfind(&mut parent, arg.0) {
+                    let Ok(ra) = sfind(&mut parent, arg.0) else {
+                        return false;
+                    };
+                    if ri == ra {
                         return false;
                     }
                 }

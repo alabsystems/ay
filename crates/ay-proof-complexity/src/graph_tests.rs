@@ -25,7 +25,7 @@ fn test_cycle_graph() {
     assert_eq!(c5.num_edges(), 5);
 
     for i in 0..5 {
-        assert!(c5.has_edge(i, (i + 1) % 5));
+        assert!(c5.has_edge(i, i.saturating_add(1) % 5));
         assert_eq!(c5.degree(i), 2);
     }
 }

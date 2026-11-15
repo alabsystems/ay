@@ -6,6 +6,9 @@
 
 use crate::{Literal, Variable};
 
+mod trace_replay;
+pub(crate) use trace_replay::strict_lrat_trace_replay;
+
 /// Create a literal from a variable index and polarity.
 ///
 /// Used extensively in unit tests across the crate.

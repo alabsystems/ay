@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated nonlinear integration tests for ay-dpll.
-//! Groups 7 test modules into a single binary to reduce link time.
+//! Groups 10 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -11,6 +11,14 @@ mod common;
 
 #[path = "group_nonlinear/auf_select_nonlinear_8920.rs"]
 mod auf_select_nonlinear_8920;
+#[path = "group_nonlinear/compound_side_routing.rs"]
+mod compound_side_routing;
+#[path = "group_nonlinear/nia_contracted_mccormick.rs"]
+mod nia_contracted_mccormick;
+#[path = "group_nonlinear/nia_pushpop_split_model_size.rs"]
+mod nia_pushpop_split_model_size;
+#[path = "group_nonlinear/nia_split_loop_empty_clause_scope.rs"]
+mod nia_split_loop_empty_clause_scope;
 #[path = "group_nonlinear/nia_theory_verification.rs"]
 mod nia_theory_verification;
 #[path = "group_nonlinear/nra_irrational_soundness.rs"]
@@ -25,3 +33,5 @@ mod nra_stack_safety_6765;
 mod sign_theory_regression;
 #[path = "group_nonlinear/snia_dispatch_3389.rs"]
 mod snia_dispatch_3389;
+#[path = "group_nonlinear/symbolic_division_lemmas.rs"]
+mod symbolic_division_lemmas;

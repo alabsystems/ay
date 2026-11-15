@@ -17,8 +17,56 @@ impl TermStore {
         if let Some((v, _w)) = self.get_bitvec(arg) {
             return self.mk_int(v.clone());
         }
+        if let Some((source, modulus)) = self.masked_int2bv_residue(arg) {
+            let modulus = self.mk_int(modulus);
+            return self.mk_mod(source, modulus);
+        }
 
         self.intern(TermData::App(Symbol::named("bv2nat"), vec![arg]), Sort::Int)
+    }
+
+    /// The low `k` bits of `int2bv_w(x)` have unsigned value `x mod 2^k`.
+    /// This holds for negative and overflowing integers because `2^k` divides
+    /// `2^w`. Expose that exact residue to arithmetic for alignment masks.
+    fn masked_int2bv_residue(&self, arg: TermId) -> Option<(TermId, BigInt)> {
+        let TermData::App(Symbol::Named(name), args) = self.get(arg) else {
+            return None;
+        };
+        if name != "bvand" || args.len() != 2 {
+            return None;
+        }
+        let width = self.get_bv_width(arg)?;
+        for (value, mask_id) in [(args[0], args[1]), (args[1], args[0])] {
+            let Some((mask, mask_width)) = self.get_bitvec(mask_id) else {
+                continue;
+            };
+            // Raw applications need not have passed the typed BV builders.
+            // Authenticate both recorded sorts and the constant payload before
+            // replacing their surface with well-sorted integer arithmetic.
+            if mask_width != width
+                || self.get_bv_width(mask_id) != Some(width)
+                || mask.is_negative()
+                || mask.bits() > u64::from(width)
+            {
+                continue;
+            }
+            let TermData::App(Symbol::Indexed(name, indices), source) = self.get(value) else {
+                continue;
+            };
+            if name != "int2bv"
+                || indices.as_slice() != [width]
+                || source.len() != 1
+                || self.get_bv_width(value) != Some(width)
+                || self.sort(source[0]) != &Sort::Int
+            {
+                continue;
+            }
+            let modulus = mask + BigInt::one();
+            if (mask & &modulus).is_zero() {
+                return Some((source[0], modulus));
+            }
+        }
+        None
     }
 
     /// Convert a bitvector to an integer with optional signed interpretation (Z3: bv2int).

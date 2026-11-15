@@ -26,7 +26,7 @@
 
 use super::PreprocessingPass;
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
 use ay_core::{TermId, TermStore};
 
@@ -239,8 +239,7 @@ impl Default for NormalizeArithSom {
 impl PreprocessingPass for NormalizeArithSom {
     fn apply(&mut self, terms: &mut TermStore, assertions: &mut Vec<TermId>) -> bool {
         // Only apply to Int/Real sorts — skip if no arithmetic assertions
-        let has_arith = assertions.iter().any(|&a| self.has_arithmetic(terms, a));
-        if !has_arith {
+        if !Self::any_has_arithmetic(terms, assertions) {
             return false;
         }
 
@@ -261,30 +260,36 @@ impl PreprocessingPass for NormalizeArithSom {
 }
 
 impl NormalizeArithSom {
-    /// Quick check if an assertion contains arithmetic operations.
-    fn has_arithmetic(&self, terms: &TermStore, id: TermId) -> bool {
-        Self::term_has_arithmetic(terms, id)
-    }
-
-    fn term_has_arithmetic(terms: &TermStore, id: TermId) -> bool {
-        match terms.get(id) {
-            TermData::App(Symbol::Named(name), args) => {
-                if matches!(
-                    name.as_str(),
-                    "+" | "*" | "-" | "/" | "<" | "<=" | ">=" | ">"
-                ) {
-                    return true;
+    /// Whether any assertion contains an arithmetic operation.
+    ///
+    /// One walk over the assertions' shared DAG, each subterm visited once.
+    /// The recursive tree walk this replaces visited a subterm once per PATH:
+    /// on a `let`-shaped Boolean transition relation with no arithmetic near
+    /// the top (the LRA-Lin `cav12/array_max` IMC queries) it ran for minutes,
+    /// past every deadline, inside QF_LRA preprocessing.
+    fn any_has_arithmetic(terms: &TermStore, assertions: &[TermId]) -> bool {
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = assertions.to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match terms.get(id) {
+                TermData::App(Symbol::Named(name), args) => {
+                    if matches!(
+                        name.as_str(),
+                        "+" | "*" | "-" | "/" | "<" | "<=" | ">=" | ">"
+                    ) {
+                        return true;
+                    }
+                    stack.extend(args.iter().copied());
                 }
-                args.iter().any(|&a| Self::term_has_arithmetic(terms, a))
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
+                _ => {}
             }
-            TermData::Not(inner) => Self::term_has_arithmetic(terms, *inner),
-            TermData::Ite(c, t, e) => {
-                Self::term_has_arithmetic(terms, *c)
-                    || Self::term_has_arithmetic(terms, *t)
-                    || Self::term_has_arithmetic(terms, *e)
-            }
-            _ => false,
         }
+        false
     }
 }
 

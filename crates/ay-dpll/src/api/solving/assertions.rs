@@ -5,6 +5,7 @@
 //! Assertion stack management: assert, push, pop, scopes, reset.
 
 mod adoption_support;
+mod native_power;
 
 use ay_core::term::Symbol;
 use ay_core::{Sort, TermData, TermId};
@@ -36,6 +37,17 @@ impl Solver {
     /// [`assert_term`]: Solver::assert_term
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_assert_term(&mut self, term: Term) -> Result<(), SolverError> {
+        self.assert_native_term(
+            term,
+            ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
+        )
+    }
+
+    pub(super) fn assert_native_term(
+        &mut self,
+        term: Term,
+        source: ParsedTerm,
+    ) -> Result<(), SolverError> {
         let term_id = self.resolve_term("assert_term", term)?;
         if let Some(message) = self
             .executor
@@ -62,17 +74,18 @@ impl Solver {
         // an exact definition: later native applications can be expanded by
         // construction, while model output emits the lambda body.  Every
         // refusal below keeps the original quantified assertion unchanged.
+        // A native `^` reaches the engine with the elaborator's semantics:
+        // literal positive integer exponents unfold to products, anything else
+        // stays for the executor's capability gate (`native_power`).
+        let lowered = self.lower_native_integer_powers(term_id);
         let asserted_term = self
-            .try_adopt_native_definitional_forall(term_id)
-            .unwrap_or(term_id);
+            .try_adopt_native_definitional_forall(lowered)
+            .map_or(lowered, |adoption| adoption.replacement);
 
         // Keep assertions_parsed aligned with assertions for proof-rewrite
         // invariants when assertions are added via the native API path.
         let ctx = self.executor.context_mut_internal();
-        ctx.add_assertion_with_parsed(
-            asserted_term,
-            ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
-        );
+        ctx.add_assertion_with_parsed(asserted_term, source);
         self.record_native_replay_event(NativeReplayEventKind::Assert {
             term: term_id,
             name: None,
@@ -126,21 +139,52 @@ impl Solver {
 
         self.executor.note_api_assertion_mutation();
 
+        // #defmacro-named-preuse: a core label is metadata, not meaning, so a
+        // named definitional forall is exactly as adoptable as an anonymous
+        // one (`try_assert_term`). The label follows the assertion that
+        // actually lands on the stack — the discharged replacement — so the
+        // named-core redirect assumes the replacement, never the raw
+        // quantifier it discharged; and the label is recorded against the
+        // adopted head so a harvested core over the expanded assertions
+        // still reports the definition it depends on.
+        let lowered = self.lower_native_integer_powers(term_id);
+        let adoption = self.try_adopt_native_definitional_forall(lowered);
+        let asserted_term = adoption
+            .as_ref()
+            .map_or(lowered, |adoption| adoption.replacement);
+
         let ctx = self.executor.context_mut_internal();
         // A native assertion's optional core name is metadata, not surface
         // syntax.  Reuse the anonymous native sentinel so strict proof
         // reconstruction derives from the exact asserted term instead of
         // trying to elaborate a fabricated `__ay_named_*` variable.
         ctx.add_assertion_with_parsed(
-            term_id,
+            asserted_term,
             ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
         );
-        ctx.register_named_term(name.to_string(), term_id);
+        ctx.register_named_term(name.to_string(), asserted_term);
+        if let Some(adoption) = &adoption {
+            ctx.note_adopted_definition_label(&adoption.head, name.to_string());
+        }
         self.record_native_replay_event(NativeReplayEventKind::Assert {
             term: term_id,
             name: Some(name.to_string()),
         });
         Ok(())
+    }
+
+    /// `term` with every native `^` whose exponent is a literal positive
+    /// integer unfolded into a product, exactly as the assertion boundary
+    /// lowers it. A ground power then folds under [`Self::simplify`] (the Z3
+    /// C API's `Z3_model_eval` relies on this: `2^3` evaluates to `8`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `term` is not a live term of this solver.
+    pub fn lower_native_powers(&mut self, term: Term) -> Term {
+        let id = self.require_term("lower_native_powers", term);
+        let lowered = self.lower_native_integer_powers(id);
+        self.wrap_term(lowered)
     }
 
     /// Push a new scope for incremental solving
@@ -261,13 +305,16 @@ impl Solver {
         self.cache_token = SolverCacheToken::new();
         self.scope_level = 0;
         self.var_names.clear();
+        self.adopted_tactic_declarations.clear();
         self.var_terms_by_name.clear();
         self.var_sorts.clear();
         self.last_assumptions = None;
         self.last_unknown_reason = None;
         self.last_executor_error = None;
         self.last_artifact_export_failure = None;
+        self.last_model_extraction_failure = None;
         self.soft_constraints.clear();
+        self.optimization_sequence.clear();
         self.defined_funs.clear();
         self.native_fun_signatures.clear();
         self.core_tracker = crate::api::types::CoreEvolutionTracker::new();
@@ -302,10 +349,26 @@ impl Solver {
         self.last_unknown_reason = None;
         self.last_executor_error = None;
         self.last_artifact_export_failure = None;
+        self.last_model_extraction_failure = None;
         self.soft_constraints.clear();
+        self.optimization_sequence.clear();
         self.core_tracker = crate::api::types::CoreEvolutionTracker::new();
         self.record_native_replay_event(NativeReplayEventKind::ResetAssertions);
         Ok(())
+    }
+
+    /// Whether a definition adopted from an asserted definitional `forall` is
+    /// installed. While one is, [`Self::try_apply`] expands every new
+    /// application of its head at construction; an embedder that shares one
+    /// solver between several assertion sets (the Z3 C API's solver handles)
+    /// must not leave such a definition installed past the solve it served,
+    /// or terms built for another assertion set arrive pre-expanded.
+    /// [`Self::try_reset_assertions`] removes them.
+    #[must_use]
+    pub fn has_assertion_derived_definitions(&self) -> bool {
+        self.defined_funs
+            .values()
+            .any(|definition| definition.assertion_derived)
     }
 
     /// Adopt a native, already-elaborated definitional forall as an exact
@@ -322,7 +385,10 @@ impl Solver {
     /// mismatched arity/sort, a quantified definition body) REFUSES the whole
     /// adoption.  With no earlier application the replacement is the reflexive
     /// tautology, exactly as before.
-    fn try_adopt_native_definitional_forall(&mut self, assertion: TermId) -> Option<TermId> {
+    fn try_adopt_native_definitional_forall(
+        &mut self,
+        assertion: TermId,
+    ) -> Option<NativeDefinitionalAdoption> {
         if self.scope_level != 0 {
             return None;
         }
@@ -416,6 +482,17 @@ impl Solver {
         //     genuinely provable UNSAT would be rejected and demoted to
         //     Unknown.  Refusing keeps the pre-pinning verdict exactly.
         let range_is_bool = range.as_term_sort() == Sort::Bool;
+        // A declared constant and a quantifier binder are both `Var` nodes in
+        // the arena, so "mentions a bound variable" is decided by NAME against
+        // every binder any quantifier in the arena introduces (collected
+        // below): a `Var` whose name no binder ever bound is a free constant,
+        // and `f(i)` over a declared `i` is a ground application the pin
+        // covers exactly. A constant that shares its spelling with some
+        // binder is treated as bound — fail-closed, refusing the adoption —
+        // because the two cannot be told apart term-by-term
+        // (#defmacro-named-preuse: deductive-checks's `out = f(i)` before the
+        // definition of `f`, with `i` a declared constant).
+        let binder_names = arena_binder_names(self);
         let mut stale_applications: Vec<(TermId, Vec<TermId>)> = Vec::new();
         for id in self.terms().term_ids() {
             if id == head {
@@ -435,7 +512,7 @@ impl Solver {
                 if self.terms().sort(*arg) != bound {
                     return None;
                 }
-                if term_mentions_var(self, *arg) {
+                if term_mentions_binder_var(self, *arg, &binder_names) {
                     return None;
                 }
             }
@@ -471,8 +548,9 @@ impl Solver {
         {
             return None;
         }
+        let head = name.clone();
         self.defined_funs.insert(
-            name.clone(),
+            head.clone(),
             super::super::DefinedFun {
                 params: params
                     .iter()
@@ -503,8 +581,18 @@ impl Solver {
             let pin = self.eq(self.wrap_term(raw), self.wrap_term(expanded));
             replacement = self.and(replacement, pin);
         }
-        Some(replacement.id())
+        Some(NativeDefinitionalAdoption {
+            head,
+            replacement: replacement.id(),
+        })
     }
+}
+
+/// A native definitional forall adopted as a macro: the caller-visible head
+/// name and the assertion that replaces the discharged `forall` on the stack.
+struct NativeDefinitionalAdoption {
+    head: String,
+    replacement: TermId,
 }
 
 /// The most raw pre-definition applications of one symbol that adoption will
@@ -537,10 +625,29 @@ fn term_contains_quantifier(solver: &Solver, term: TermId) -> bool {
     false
 }
 
-/// Does `term`'s DAG mention a bound/free variable anywhere?  A raw application
-/// with a variable argument cannot be pinned: instantiating its enclosing
-/// quantifier yields applications at points no pin covers.
-fn term_mentions_var(solver: &Solver, term: TermId) -> bool {
+/// Every binder name any `forall`/`exists` in the arena introduces. One walk
+/// over the arena's top-level nodes: a quantifier node carries its own binder
+/// list, so no descent is needed.
+fn arena_binder_names(solver: &Solver) -> ay_core::kani_compat::DetHashSet<String> {
+    let mut names = ay_core::kani_compat::DetHashSet::default();
+    for id in solver.terms().term_ids() {
+        if let TermData::Forall(vars, _, _) | TermData::Exists(vars, _, _) = solver.terms().get(id)
+        {
+            names.extend(vars.iter().map(|(name, _)| name.clone()));
+        }
+    }
+    names
+}
+
+/// Does `term`'s DAG mention a variable some quantifier binds (by name)?  A raw
+/// application with such an argument cannot be pinned: instantiating its
+/// enclosing quantifier yields applications at points no pin covers.  A `Var`
+/// no binder ever bound is a declared constant and pins exactly.
+fn term_mentions_binder_var(
+    solver: &Solver,
+    term: TermId,
+    binder_names: &ay_core::kani_compat::DetHashSet<String>,
+) -> bool {
     let mut seen = ay_core::kani_compat::DetHashSet::default();
     let mut stack = vec![term];
     while let Some(current) = stack.pop() {
@@ -548,7 +655,11 @@ fn term_mentions_var(solver: &Solver, term: TermId) -> bool {
             continue;
         }
         match solver.terms().get(current) {
-            TermData::Var(_, _) => return true,
+            TermData::Var(name, _) => {
+                if binder_names.contains(name) {
+                    return true;
+                }
+            }
             TermData::App(_, args) => stack.extend(args.iter().copied()),
             TermData::Not(inner) => stack.push(*inner),
             TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
@@ -566,3 +677,7 @@ fn term_mentions_var(solver: &Solver, term: TermId) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "assertions/native_bv_source_surface_tests.rs"]
+mod native_bv_source_surface_tests;

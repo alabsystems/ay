@@ -155,6 +155,8 @@ macro_rules! solve_incremental_split_loop_pipeline {
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
         $(, per_round_shadow: |$sh_result:ident, $sh_lits:ident, $sh_atoms:ident, $sh_lemmas:ident| $sh_expr:expr)?
+        $(, retain_primary_conflicts: $retain_primary:expr)?
+        $(, retain_primary_after: $retain_after:expr)?
         $(, max_string_lemma_requests: $max_slr:expr,
            handle_string_lemma: |$sl_lemma:ident, $sl_negations:ident| $sl_handler:expr)?
     ) => {{
@@ -171,6 +173,8 @@ macro_rules! solve_incremental_split_loop_pipeline {
             post_theory_export: |$export_theory| $export_expr
             $(, pre_iter_check: |$pic_self| $pic_expr)?
             $(, per_round_shadow: |$sh_result, $sh_lits, $sh_atoms, $sh_lemmas| $sh_expr)?
+            $(, retain_primary_conflicts: $retain_primary)?
+            $(, retain_primary_after: $retain_after)?
             $(, max_string_lemma_requests: $max_slr,
                handle_string_lemma: |$sl_lemma, $sl_negations| $sl_handler)?
         )
@@ -191,6 +195,8 @@ macro_rules! solve_incremental_split_loop_pipeline {
         pre_theory_import: |$import_theory:ident, $import_lc:ident, $import_hc:ident, $import_ds:ident| $import_expr:expr,
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
+        $(, retain_primary_conflicts: $retain_primary:expr)?
+        $(, retain_primary_after: $retain_after:expr)?
         $(, max_string_lemma_requests: $max_slr:expr,
            handle_string_lemma: |$sl_lemma:ident, $sl_negations:ident| $sl_handler:expr)?
     ) => {{
@@ -206,6 +212,8 @@ macro_rules! solve_incremental_split_loop_pipeline {
             pre_theory_import: |$import_theory, $import_lc, $import_hc, $import_ds| $import_expr,
             post_theory_export: |$export_theory| $export_expr
             $(, pre_iter_check: |$pic_self| $pic_expr)?
+            $(, retain_primary_conflicts: $retain_primary)?
+            $(, retain_primary_after: $retain_after)?
             $(, max_string_lemma_requests: $max_slr,
                handle_string_lemma: |$sl_lemma, $sl_negations| $sl_handler)?
         )
@@ -229,6 +237,8 @@ macro_rules! solve_incremental_assume_split_loop_pipeline {
         pre_theory_import: |$import_theory:ident, $import_lc:ident, $import_hc:ident, $import_ds:ident| $import_expr:expr,
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
+        $(, retain_primary_conflicts: $retain_primary:expr)?
+        $(, retain_primary_after: $retain_after:expr)?
     ) => {{
         pipeline_incremental_split_assume_arm!($self,
             tag: $tag,
@@ -240,6 +250,8 @@ macro_rules! solve_incremental_assume_split_loop_pipeline {
             pre_theory_import: |$import_theory, $import_lc, $import_hc, $import_ds| $import_expr,
             post_theory_export: |$export_theory| $export_expr
             $(, pre_iter_check: |$pic_self| $pic_expr)?
+            $(, retain_primary_conflicts: $retain_primary)?
+            $(, retain_primary_after: $retain_after)?
         )
     }};
 }

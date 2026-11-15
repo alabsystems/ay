@@ -1,0 +1,11 @@
+* #variable= 5 #constraint= 8
+* An equivalence stands for the two directions of the same constraint, in the order in which they
+* would be written out.
+z1 <==> +1 x1 +2 x2 >= 2 ;
+z2 <==> 1 x1 1 x2 <= 1 ;
+* The literal may be negated, and the constraint is normalized before it is reified.
+~z3 <==> 3 x1 2 ~x1 >= 3 ;
+* A trivially satisfied constraint is implied by anything, and implies the literal; a contradicting
+* constraint implies anything, and is implied by nothing.
+z4 <==> 1 x1 >= 0 ;
+z5 <==> 1 x1 >= 5 ;

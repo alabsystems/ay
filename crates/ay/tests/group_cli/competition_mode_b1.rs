@@ -47,48 +47,18 @@ const TRIVIAL_UNSAT_SMT: &str = "(set-logic QF_UF)\n\
 (assert (not p))\n\
 (check-sat)\n";
 
-/// `--rigor standard` (the certified, batteries-on rung) emits the sibling
-/// `.alethe` certificate for an UNSAT verdict — the opt-in the plain default
-/// no longer takes, and the baseline the env signal must suppress.
+/// The PLAIN default (`ay FILE.smt2`, no flag at all) is batteries-on: the
+/// proof tracker is armed, the certificate is minted and strict-checked, and
+/// the sibling `.alethe` sidecar is written and announced. This is the
+/// baseline `--z3-mode` (and the env signal, and `--no-proof`) must suppress.
+///
+/// Owner decision, 2026-09-06: "I want batteries on by default and a flag for
+/// z3 exact behavior" — the certificate is the product, so a flagless run
+/// produces one. A one-day experiment with the opposite default is what these
+/// pins now guard against.
 #[test]
 #[timeout(120_000)]
-fn rigor_standard_run_emits_sibling_alethe_artifact() {
-    let ay_path = env!("CARGO_BIN_EXE_ay");
-    let (input, _c) = write_temp(TRIVIAL_UNSAT_SMT, "smt2");
-    let alethe = PathBuf::from(format!("{}.alethe", input.display()));
-    let _alethe_cleanup = CleanupGuard(alethe.clone());
-
-    let output = Command::new(ay_path)
-        .args(["--rigor", "standard"])
-        .arg(&input)
-        .output()
-        .expect("spawn ay");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stdout.lines().any(|line| line.trim() == "unsat"),
-        "--rigor standard run must publish unsat, got stdout={stdout} stderr={stderr}"
-    );
-    assert!(
-        alethe.exists(),
-        "--rigor standard run must emit the sibling .alethe certificate"
-    );
-    assert!(
-        stderr
-            .lines()
-            .any(|line| line.starts_with("c writing Alethe proof to ")),
-        "--rigor standard run must announce the sidecar: {stderr}"
-    );
-}
-
-/// The PLAIN default (`ay FILE.smt2`, no flag) has z3's posture: no proof is
-/// recorded, no certificate is minted (every `cert.*` / `proof.*` counter is
-/// zero), nothing is announced, and no `.alethe` sidecar appears next to the
-/// input. The verdict is still published through the raw admission lane,
-/// which `--stats-full` labels.
-#[test]
-#[timeout(120_000)]
-fn plain_default_run_records_no_proof_and_writes_no_sidecar() {
+fn default_run_emits_sibling_alethe_artifact() {
     let ay_path = env!("CARGO_BIN_EXE_ay");
     let (input, _c) = write_temp(TRIVIAL_UNSAT_SMT, "smt2");
     let alethe = PathBuf::from(format!("{}.alethe", input.display()));
@@ -99,18 +69,37 @@ fn plain_default_run_records_no_proof_and_writes_no_sidecar() {
         .arg(&input)
         .output()
         .expect("spawn ay");
-    assert_shed_proof_posture(&output, &alethe, "plain default");
+    assert_certified_proof_posture(&output, &alethe, "plain default");
 }
 
-/// `--no-proof` and `--z3-mode` shed exactly what `--rigor fast` sheds: the
-/// tracker, the certificate mint, the nested corroboration re-solves, and
-/// the sidecar. They used to leave the tracker armed with an unbudgeted
+/// `--rigor standard` names the same rung the plain default already sits on,
+/// so it must be indistinguishable from it.
+#[test]
+#[timeout(120_000)]
+fn rigor_standard_matches_the_plain_default() {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    let (input, _c) = write_temp(TRIVIAL_UNSAT_SMT, "smt2");
+    let alethe = PathBuf::from(format!("{}.alethe", input.display()));
+    let _alethe_cleanup = CleanupGuard(alethe.clone());
+
+    let output = Command::new(ay_path)
+        .args(["--rigor", "standard", "--stats-full"])
+        .arg(&input)
+        .output()
+        .expect("spawn ay");
+    assert_certified_proof_posture(&output, &alethe, "--rigor standard");
+}
+
+/// `--z3-mode` is the documented flag for z3-exact behaviour, and
+/// `--no-proof` / `--rigor fast` reach the same proof posture: the tracker,
+/// the certificate mint, the nested corroboration re-solves and the sidecar
+/// are all shed. They used to leave the tracker armed with an unbudgeted
 /// meter (slower than the certified default they claimed to opt out of).
 #[test]
 #[timeout(120_000)]
 fn no_proof_and_z3_mode_shed_the_proof_cycle_like_rigor_fast() {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    for flag in ["--no-proof", "--z3-mode", "--rigor=fast"] {
+    for flag in ["--z3-mode", "--no-proof", "--rigor=fast"] {
         let (input, _c) = write_temp(TRIVIAL_UNSAT_SMT, "smt2");
         let alethe = PathBuf::from(format!("{}.alethe", input.display()));
         let _alethe_cleanup = CleanupGuard(alethe.clone());
@@ -123,6 +112,71 @@ fn no_proof_and_z3_mode_shed_the_proof_cycle_like_rigor_fast() {
             .expect("spawn ay");
         assert_shed_proof_posture(&output, &alethe, flag);
     }
+}
+
+/// The batteries-on proof posture, as `--stats-full` reports it: `unsat`
+/// published with a certificate behind it — the tracker recorded steps, the
+/// mint ran and was strict-checked — and the sidecar announced and written.
+/// The exact inverse of [`assert_shed_proof_posture`].
+fn assert_certified_proof_posture(output: &std::process::Output, alethe: &PathBuf, label: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.lines().any(|line| line.trim() == "unsat"),
+        "{label} run must publish unsat, got stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        alethe.exists(),
+        "{label} run must emit the sibling .alethe certificate: stderr={stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("c writing Alethe proof to ")),
+        "{label} run must announce the sidecar: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("c ay.proof.certificate ")
+                && line.contains("ay_self_checkable=yes")),
+        "{label} run must mint a certificate its own acceptance gate takes: {stderr}"
+    );
+    let combined = format!("{stdout}\n{stderr}");
+    // NOT `:cert.proof_steps_recorded`: a query decided by propagation alone
+    // records zero steps and still mints a real certificate.
+    for key in [":cert.mints", ":proof.strict_check_invocations"] {
+        let value = stat_value(&combined, key);
+        let parsed: u64 = value
+            .as_deref()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{label}: no numeric {key} in stats: {combined}"));
+        assert!(
+            parsed > 0,
+            "{label} run must do real certificate work ({key} = {parsed}): {combined}"
+        );
+    }
+    assert_eq!(
+        stat_value(&combined, ":cert.raw_admissions").as_deref(),
+        Some("0"),
+        "{label} run must not publish UNSAT through the raw admission lane: {combined}"
+    );
+    assert_ne!(
+        stat_value(&combined, ":unsat_admission").as_deref(),
+        Some("\"competition-raw\""),
+        "{label} run must not be labelled competition-raw: {combined}"
+    );
+}
+
+/// One `--stats-full` counter, by its `:key value` line.
+fn stat_value(combined: &str, key: &str) -> Option<String> {
+    combined.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix(key)
+            .filter(|rest| rest.starts_with(' '))
+            .map(|rest| rest.trim().to_string())
+    })
 }
 
 /// The shed proof posture, as `--stats-full` reports it: `unsat` published
@@ -145,15 +199,7 @@ fn assert_shed_proof_posture(output: &std::process::Output, alethe: &PathBuf, la
         "{label} run must not announce a sidecar: {stderr}"
     );
     let combined = format!("{stdout}\n{stderr}");
-    let stat = |key: &str| -> Option<String> {
-        combined.lines().find_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix(key)
-                .filter(|rest| rest.starts_with(' '))
-                .map(|rest| rest.trim().to_string())
-        })
-    };
+    let stat = |key: &str| stat_value(&combined, key);
     for key in [
         ":cert.proof_steps_recorded",
         ":cert.decisions_proof_tracked",
@@ -246,34 +292,9 @@ fn lra_optimization_answers_in_every_posture() {
     }
 }
 
-/// A QF_UF instance whose two `distinct` blocks over 2500 constants expand to
-/// ~6M disequalities: it breaches a 64 MiB `--memory` budget in well under a
-/// second on every posture (measured 0.08 s), so it is a deterministic memout.
-fn memory_hungry_smt() -> String {
-    let n = 2500;
-    let mut script = String::from("(set-logic QF_UF)\n(declare-sort U 0)\n");
-    for i in 0..n {
-        script.push_str(&format!("(declare-const a{i} U)\n"));
-    }
-    script.push_str("(declare-fun g (U) U)\n(assert (distinct");
-    for i in 0..n {
-        script.push_str(&format!(" a{i}"));
-    }
-    script.push_str("))\n(assert (distinct");
-    for i in 0..n {
-        script.push_str(&format!(" (g a{i})"));
-    }
-    script.push_str("))\n");
-    for i in 0..n - 1 {
-        script.push_str(&format!(
-            "(assert (or (= (g a{i}) a{}) (= (g a{}) a{i})))\n",
-            i + 1,
-            i + 1
-        ));
-    }
-    script.push_str("(check-sat)\n");
-    script
-}
+#[path = "competition_mode_b1/memout_fixtures.rs"]
+mod memout_fixtures;
+use memout_fixtures::{memory_hungry_cnf, memory_hungry_smt, MEMORY_HUNGRY_CNF_MIN_BYTES};
 
 /// The memory-budget verdict follows the INPUT FORMAT, not the posture: an
 /// SMT-LIB memout is `unknown` + `(:reason-unknown "memout")` (exit 124) at
@@ -336,16 +357,31 @@ fn smt_memout_prints_smtlib_grammar_at_every_posture() {
 /// DIMACS input keeps its own grammar: `c memout` / `s UNKNOWN` at every
 /// posture (as its timeout path already prints), exit 0 under `--rigor fast`
 /// and 124 for a plain run.
+///
+/// The memout must be forced, not raced. This test used to run the 2-clause
+/// contradiction `1`, `-1`, whose counted heap stays under 1 MiB, so the
+/// allocator ceiling never fired and only the memory watchdog's first poll
+/// (RSS over the budget) could end the run. When the scheduler held that
+/// thread back, the solve answered first, correctly, `s UNSATISFIABLE`: 12 of
+/// 40 `--rigor fast` runs under CPU contention on 2026-10-07, 9 of 40 on a
+/// build of the commit that added this test. [`memory_hungry_cnf`]'s input
+/// buffer alone is over the budget, so no verdict can precede the memout.
 #[test]
 #[timeout(120_000)]
 fn dimacs_memout_prints_sat_competition_grammar_at_every_posture() {
     let ay_path = env!("CARGO_BIN_EXE_ay");
+    let cnf = memory_hungry_cnf();
+    assert!(
+        cnf.len() > MEMORY_HUNGRY_CNF_MIN_BYTES,
+        "the memout fixture must dwarf the 1 MiB budget, or the run races the watchdog: {} bytes",
+        cnf.len()
+    );
     for (flags, expected_exit) in [(&[][..], 124), (&["--rigor", "fast"][..], 0)] {
-        let (input, _c) = write_temp("p cnf 1 2\n1 0\n-1 0\n", "cnf");
+        let (input, _c) = write_temp(&cnf, "cnf");
         let drat = PathBuf::from(format!("{}.drat", input.display()));
         let _drat_cleanup = CleanupGuard(drat);
-        // 1 MiB is below the process baseline, so the budget is breached on
-        // the first allocation after it is armed — deterministically.
+        // The allocator's hard ceiling refuses the buffer the input is read
+        // into, on the reading thread, before any clause is parsed.
         let output = Command::new(ay_path)
             .args(["--quiet", "--memory", "1", "-T:20"])
             .args(flags)
@@ -360,8 +396,13 @@ fn dimacs_memout_prints_sat_competition_grammar_at_every_posture() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let label = format!("{flags:?}");
         assert!(
-            stdout.lines().any(|line| line.trim() == "s UNKNOWN"),
-            "{label}: DIMACS memout must print `s UNKNOWN`: stdout={stdout} stderr={stderr}"
+            !stdout.lines().any(|line| line.trim().starts_with("s ") && line.trim() != "s UNKNOWN"),
+            "{label}: a decisive verdict preceded the memout, so the budget did not end the run: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.lines().any(|line| line.trim() == "s UNKNOWN")
+                && stdout.lines().any(|line| line.trim() == "c memout"),
+            "{label}: DIMACS memout must print `c memout` / `s UNKNOWN`: stdout={stdout} stderr={stderr}"
         );
         assert!(
             !stdout.lines().any(|line| line.trim() == "unknown")

@@ -16,6 +16,11 @@ impl Solver {
     pub fn try_add(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("add", a)?;
         let b_id = self.resolve_term("add", b)?;
+        if let Some(result) =
+            self.try_complex_fold("add", &[a_id, b_id], TermStore::mk_complex_add)?
+        {
+            return Ok(result);
+        }
         self.expect_same_arith_sort("add", a, b)?;
         let result = self.terms_mut().mk_add(vec![a_id, b_id]);
         Ok(self.wrap_term(result))
@@ -34,6 +39,9 @@ impl Solver {
             .copied()
             .map(|term| self.resolve_term("add_many", term))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(result) = self.try_complex_fold("add_many", &ids, TermStore::mk_complex_add)? {
+            return Ok(result);
+        }
         if let Some(&first) = terms.first() {
             self.expect_arith("add_many", first)?;
             for &t in &terms[1..] {
@@ -54,6 +62,11 @@ impl Solver {
     pub fn try_sub(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("sub", a)?;
         let b_id = self.resolve_term("sub", b)?;
+        if let Some(result) =
+            self.try_complex_fold("sub", &[a_id, b_id], TermStore::mk_complex_subtract)?
+        {
+            return Ok(result);
+        }
         self.expect_same_arith_sort("sub", a, b)?;
         let result = self.terms_mut().mk_sub(vec![a_id, b_id]);
         Ok(self.wrap_term(result))
@@ -69,6 +82,11 @@ impl Solver {
     pub fn try_mul(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("mul", a)?;
         let b_id = self.resolve_term("mul", b)?;
+        if let Some(result) =
+            self.try_complex_fold("mul", &[a_id, b_id], TermStore::mk_complex_multiply)?
+        {
+            return Ok(result);
+        }
         self.expect_same_arith_sort("mul", a, b)?;
         let result = self.terms_mut().mk_mul(vec![a_id, b_id]);
         Ok(self.wrap_term(result))
@@ -87,6 +105,11 @@ impl Solver {
             .copied()
             .map(|term| self.resolve_term("mul_many", term))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(result) =
+            self.try_complex_fold("mul_many", &ids, TermStore::mk_complex_multiply)?
+        {
+            return Ok(result);
+        }
         if let Some(&first) = terms.first() {
             self.expect_arith("mul_many", first)?;
             for &t in &terms[1..] {
@@ -106,6 +129,10 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_neg(&mut self, a: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("neg", a)?;
+        if self.terms().sort(a_id) == &Sort::Complex {
+            let result = self.terms_mut().mk_complex_negate(a_id);
+            return self.finish_complex_construction("neg", &[a_id], result);
+        }
         self.expect_arith("neg", a)?;
         let result = self.terms_mut().mk_neg(a_id);
         Ok(self.wrap_term(result))
@@ -121,6 +148,11 @@ impl Solver {
     pub fn try_div(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("div", a)?;
         let b_id = self.resolve_term("div", b)?;
+        if let Some(result) =
+            self.try_complex_fold("div", &[a_id, b_id], TermStore::mk_complex_divide)?
+        {
+            return Ok(result);
+        }
         self.expect_both_real("div", a, b)?;
         let result = self.terms_mut().mk_div(a_id, b_id);
         Ok(self.wrap_term(result))
@@ -256,12 +288,19 @@ impl Solver {
     }
 
     /// Try to create an exponentiation (a ^ b). Both args must be same arithmetic sort.
+    ///
+    /// The result is `Real` for every arithmetic sort, as in Z3 (whose
+    /// `Z3_mk_power` is this method's consumer): an integer power with a
+    /// negative exponent is not an integer, so Z3 types `Int ^ Int` as `Real`
+    /// (measured, z3 5.1: `(a**2).sort()` is `Real`, and `(a**2)/2` is real
+    /// division). An `Int`-sorted power would turn the caller's `/` into
+    /// integer `div` and flip verdicts (`a = 3, a^2 / 2 = 4` is unsat in Z3).
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_power(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
         let a_id = self.resolve_term("power", a)?;
         let b_id = self.resolve_term("power", b)?;
         self.expect_same_arith_sort("power", a, b)?;
-        let sort = self.terms().sort(a_id).clone();
+        let sort = Sort::Real;
         let result = self
             .terms_mut()
             .mk_app(Symbol::named("^"), vec![a_id, b_id], sort);

@@ -387,14 +387,15 @@ fn test_simplify_abs() {
     // (abs (- 5)) should simplify to 5
     let input = r#"
         (simplify (abs (- 5)))
+        (simplify (abs 5))
+        (simplify (abs 0))
     "#;
 
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
 
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0], "5");
+    assert_eq!(outputs, ["5", "5", "0"]);
 }
 
 // =======================================================================

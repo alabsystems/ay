@@ -4,19 +4,31 @@
 
 //! Shared resource admission for benchmark subprocesses.
 //!
-//! `scripts/_oom_guard.py` is the repository's single source of truth for RAM
-//! headroom, job caps, and RSS-backstop behavior.  Native Rust harnesses use
-//! its machine-readable `plan` output and attach its `rss_watchdog` to external
-//! solver process groups through one campaign-wide `watch-server` sidecar.
+//! Native measurements restrict RAM headroom and job/CPU requests. The existing
+//! `_oom_guard.py` lease and campaign watch-server still own aggregate exclusion
+//! and the RSS backstop; measurement does not confer a shared-machine grant.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt as _;
 
+// Every pipe to a sidecar or target this module writes goes through
+// `ChildPipeWriter`: a `unix_hardened` build runs with SIGPIPE at its default
+// (terminate) disposition, so a write to a child that has died would kill the
+// benchmark parent instead of returning the `EPIPE` the callers handle.
+use ay_sys::child_pipe::ChildPipeWriter;
+
 use crate::error::{BenchError, Result, WithContext as _};
+
+mod deadline;
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+mod native;
+#[cfg(all(test, unix))]
+mod native_metadata_tests;
+mod owned_child;
+use deadline::terminate_after_deadline;
 
 pub(crate) const MAX_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(crate) const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
@@ -83,6 +95,28 @@ pub(crate) fn checked_benchmark_timeout(value: f64, label: &str) -> Result<Durat
     Ok(duration)
 }
 
+/// The textual verdict grammar shared by process assessment and strict
+/// single-observation routes. This helper does not infer status from an exit.
+pub(crate) fn solver_verdict_line(line: &str) -> Option<&'static str> {
+    let line = line.trim();
+    for (spelling, verdict) in [
+        ("sat", "sat"),
+        ("s satisfiable", "sat"),
+        ("satisfiable", "sat"),
+        ("unsat", "unsat"),
+        ("s unsatisfiable", "unsat"),
+        ("unsatisfiable", "unsat"),
+        ("unknown", "unknown"),
+        ("s unknown", "unknown"),
+        ("timeout", "unknown"),
+    ] {
+        if line.eq_ignore_ascii_case(spelling) {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
 /// Parse solver output only when every textual verdict agrees and the process
 /// exit status is compatible with it. Signals, crashes, and contradictory
 /// status lines are errors even if an earlier line looked definitive.
@@ -110,13 +144,7 @@ pub(crate) fn strict_solver_verdict(
     }
     let mut observed: Option<&'static str> = None;
     for line in stdout.lines().chain(stderr.lines()) {
-        let lower = line.trim().to_ascii_lowercase();
-        let verdict = match lower.as_str() {
-            "sat" | "s satisfiable" | "satisfiable" => Some("sat"),
-            "unsat" | "s unsatisfiable" | "unsatisfiable" => Some("unsat"),
-            "unknown" | "s unknown" | "timeout" => Some("unknown"),
-            _ => None,
-        };
+        let verdict = solver_verdict_line(line);
         let Some(verdict) = verdict else {
             continue;
         };
@@ -167,7 +195,16 @@ pub(crate) fn read_bounded_text(path: &Path, limit: u64, label: &str) -> Result<
             path.display()
         )));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve(usize::try_from(metadata.len()).unwrap_or(0))
+        .map_err(|_| {
+            BenchError::msg(format!(
+                "cannot allocate {} bytes for {label} {}",
+                metadata.len(),
+                path.display()
+            ))
+        })?;
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .with_bench_context(|| format!("reading {label} {}", path.display()))?;
@@ -545,7 +582,7 @@ pub(crate) fn normalized_relative_id(path: &Path, corpus_root: &Path) -> Result<
     Ok(segments.join("/"))
 }
 
-/// Persistable resource envelope returned by `_oom_guard.py plan`.
+/// Persistable resource envelope restricted by native host/controller readings.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourcePlan {
     /// Parallelism requested by the caller before host admission.
@@ -558,7 +595,7 @@ pub struct ResourcePlan {
     pub nbcore_per_child: usize,
     /// Host-memory headroom reserved outside child budgets.
     pub headroom_mb: usize,
-    /// Repository-relative or absolute planner path used for admission.
+    /// Measurement implementation and actual enforcement component identity.
     pub planner: String,
 }
 
@@ -609,7 +646,7 @@ pub fn effective_execution_envelope(
 /// the benchmark parent process group.
 #[derive(Debug)]
 struct GlobalHarnessLease {
-    process: std::sync::Mutex<Option<(Child, std::process::ChildStdin)>>,
+    process: std::sync::Mutex<Option<(Child, ChildPipeWriter<ChildStdin>)>>,
 }
 
 static PROCESS_HARNESS_LEASE: std::sync::OnceLock<
@@ -625,13 +662,18 @@ static PROCESS_HARNESS_LEASE: std::sync::OnceLock<
 static TEST_CAMPAIGN_STATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
+// Test-compiled campaigns take the aggregate lease only on `_oom_guard.py`'s
+// explicit `--test-lock-path` seam, private to this test process, never on the
+// shared host/user lease. That lease is global host state: while any real
+// campaign or guarded build holds it, including a runner this test binary runs
+// under, the sidecar refuses and campaign tests fail reading its readiness
+// ("failed to fill whole buffer", 2026-09-22: all three sat_delta campaign
+// tests; 352/352 pass on this seam with that lease still held). While a test
+// holds it, a real campaign starting on the host is refused instead. The build
+// sandbox, whose host lock is read-only, needed this seam first.
 #[cfg(test)]
-fn build_sandbox_test_lease_path() -> Option<PathBuf> {
-    if std::env::var_os("AY_CONTINUOUS_BUILD_SANDBOX").as_deref() != Some(std::ffi::OsStr::new("1"))
-    {
-        return None;
-    }
-    Some(std::env::temp_dir().join(format!("ay-bench-test-lease-{}.lock", std::process::id())))
+fn test_campaign_lease_path() -> PathBuf {
+    std::env::temp_dir().join(format!("ay-bench-test-lease-{}.lock", std::process::id()))
 }
 
 #[cfg(test)]
@@ -690,12 +732,12 @@ impl GlobalHarnessLease {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         #[cfg(test)]
-        if let Some(path) = build_sandbox_test_lease_path() {
-            // The complete cargo-test process is already inside the
-            // controller's host-leased, RSS-capped build namespace. Exercise
-            // nested harness logic against _oom_guard's explicit test seam
-            // instead of asking test code to mutate the read-only host lock.
-            command.arg("--test-lock-path").arg(path);
+        {
+            // The lock identity is the only difference from production; see
+            // `test_campaign_lease_path` for why it is never the host lock.
+            command
+                .arg("--test-lock-path")
+                .arg(test_campaign_lease_path());
         }
         #[cfg(unix)]
         {
@@ -705,15 +747,13 @@ impl GlobalHarnessLease {
         let mut child = command
             .spawn()
             .with_bench_context(|| format!("acquiring aggregate resource lease for {label}"))?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                terminate_process_group(&mut child);
-                return Err(BenchError::msg(format!(
-                    "{label}: aggregate resource lease stdin is missing"
-                )));
-            }
-        };
+        let stdin = ChildPipeWriter::take_from(&mut child).map_err(|error| {
+            sidecar_stdin_unusable(
+                &mut child,
+                &format!("{label}: aggregate resource lease"),
+                &error,
+            )
+        })?;
         let Some(mut ready_pipe) = child.stdout.take() else {
             terminate_process_group(&mut child);
             return Err(BenchError::msg(format!(
@@ -901,7 +941,9 @@ type WatchdogServerMessage = std::result::Result<WatchdogServerEvent, String>;
 #[derive(Debug)]
 struct WatchdogServerProcess {
     child: Child,
-    stdin: std::process::ChildStdin,
+    /// A server that dies between the health check and a registration must
+    /// fail that registration, not kill the campaign parent.
+    stdin: ChildPipeWriter<ChildStdin>,
 }
 
 /// One Python watchdog process per benchmark campaign. Individual solver
@@ -984,10 +1026,8 @@ impl SharedWatchdogServer {
                 self.guard_script.display()
             )
         })?;
-        let Some(stdin) = child.stdin.take() else {
-            terminate_process_group(&mut child);
-            return Err(BenchError::msg("RSS watchdog server stdin is missing"));
-        };
+        let stdin = ChildPipeWriter::take_from(&mut child)
+            .map_err(|error| sidecar_stdin_unusable(&mut child, "RSS watchdog server", &error))?;
         let Some(stdout) = child.stdout.take() else {
             terminate_process_group(&mut child);
             return Err(BenchError::msg("RSS watchdog server stdout is missing"));
@@ -1073,6 +1113,8 @@ impl SharedWatchdogServer {
             write!(&mut label_hex, "{byte:02x}")
                 .map_err(|_| BenchError::msg("encoding RSS watchdog label failed"))?;
         }
+        let identity = ay_sys::supervisor::process_group::process_identity(pid)?
+            .ok_or_else(|| BenchError::msg("watch target vanished before registration"))?;
         let command = format!("WATCH {watch_id} {pid} {limit_mb} {label_hex}\n");
         if command.len() > WATCHDOG_SERVER_MAX_LINE as usize {
             return Err(BenchError::msg(
@@ -1110,8 +1152,11 @@ impl SharedWatchdogServer {
                 server: std::sync::Arc::clone(self),
                 aggregate_lease: None,
                 watch_id,
-                target_pgid: i32::try_from(pid).ok(),
+                #[cfg(unix)]
+                identity,
                 terminal_breach: None,
+                #[cfg(test)]
+                pending_identity_observations: std::cell::Cell::new(0),
                 receiver,
             }),
             Ok(Ok(_)) => Err(BenchError::msg(format!(
@@ -1264,10 +1309,13 @@ fn watchdog_server_reader(
             if read == 0 {
                 return Err("RSS watchdog server closed its response pipe".to_string());
             }
-            if line.len() > WATCHDOG_SERVER_MAX_LINE as usize || !line.ends_with(b"\n") {
+            if line.len() > WATCHDOG_SERVER_MAX_LINE as usize {
                 return Err("RSS watchdog server response exceeds protocol limit".to_string());
             }
-            let line = std::str::from_utf8(&line[..line.len() - 1])
+            let Some(line) = line.strip_suffix(b"\n") else {
+                return Err("RSS watchdog server response exceeds protocol limit".to_string());
+            };
+            let line = std::str::from_utf8(line)
                 .map_err(|error| format!("RSS watchdog server emitted non-UTF-8: {error}"))?;
             if let Some(timestamp) = line.strip_prefix("HEARTBEAT ") {
                 let timestamp = timestamp
@@ -1345,7 +1393,10 @@ fn parse_watchdog_server_event(
             if encoded.len() > 1024 || encoded.len() % 2 != 0 {
                 return Err("watchdog server error has invalid encoding".to_string());
             }
-            let mut bytes = Vec::with_capacity(encoded.len() / 2);
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve(encoded.len() / 2)
+                .map_err(|_| "watchdog server error cannot be decoded".to_string())?;
             for pair in encoded.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(pair)
                     .map_err(|_| "watchdog server error has invalid encoding".to_string())?;
@@ -1372,6 +1423,20 @@ pub struct PlannedResources {
     watchdog_server: std::sync::Arc<SharedWatchdogServer>,
     #[cfg(test)]
     _test_campaign_lease: Option<std::sync::Arc<TestCampaignLease>>,
+}
+
+fn measured_native_plan(requested: usize, enforcement: &Path) -> Result<ResourcePlan> {
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+    {
+        native::plan(requested, enforcement)
+    }
+    #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
+    {
+        let _ = (requested, enforcement);
+        Err(BenchError::msg(
+            "native benchmark measurement unsupported on this target",
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -1501,12 +1566,17 @@ impl LimitedFileCapture {
                         let remaining = limit.saturating_sub(written);
                         let retain = read.min(usize::try_from(remaining).unwrap_or(usize::MAX));
                         if retain > 0 {
-                            if output.write_all(&chunk[..retain]).is_err() {
+                            let Some(retained) = chunk.get(..retain) else {
+                                write_failed = true;
+                                worker_breach.store(true, std::sync::atomic::Ordering::Release);
+                                break;
+                            };
+                            if output.write_all(retained).is_err() {
                                 write_failed = true;
                                 worker_breach.store(true, std::sync::atomic::Ordering::Release);
                                 break;
                             }
-                            hasher.update(&chunk[..retain]);
+                            hasher.update(retained);
                             written = written.saturating_add(retain as u64);
                         }
                         if retain < read {
@@ -1578,8 +1648,12 @@ impl BoundedFileCapture {
                         let remaining = EXTERNAL_CAPTURE_LIMIT.saturating_sub(kept.len());
                         let retain = read.min(remaining);
                         if retain > 0 {
-                            kept.extend_from_slice(&chunk[..retain]);
-                            if evidence_file.write_all(&chunk[..retain]).is_err() {
+                            let Some(retained) = chunk.get(..retain) else {
+                                failed = true;
+                                break;
+                            };
+                            kept.extend_from_slice(retained);
+                            if evidence_file.write_all(retained).is_err() {
                                 failed = true;
                             }
                         }
@@ -1608,53 +1682,8 @@ impl BoundedFileCapture {
     }
 }
 
-pub(crate) struct BoundedPipeCapture {
-    receiver: std::sync::mpsc::Receiver<(Vec<u8>, bool, bool)>,
-}
-
-impl BoundedPipeCapture {
-    pub(crate) fn start<R>(mut reader: R) -> Self
-    where
-        R: std::io::Read + Send + 'static,
-    {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut kept = Vec::with_capacity(METADATA_CAPTURE_LIMIT);
-            let mut truncated = false;
-            let mut read_failed = false;
-            let mut chunk = [0_u8; 8192];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        let remaining = METADATA_CAPTURE_LIMIT.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..read.min(remaining)]);
-                        truncated |= read > remaining;
-                    }
-                    Err(_) => {
-                        read_failed = true;
-                        break;
-                    }
-                }
-            }
-            let _ = sender.send((kept, truncated, read_failed));
-        });
-        Self { receiver }
-    }
-
-    pub(crate) fn finish(self, label: &str, stream: &str) -> Result<String> {
-        let (bytes, truncated, read_failed) = self
-            .receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| BenchError::msg(format!("{label}: {stream} capture did not finish")))?;
-        if truncated || read_failed {
-            return Err(BenchError::msg(format!(
-                "{label}: {stream} exceeded the 64 KiB metadata capture limit or was unreadable"
-            )));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-}
+/// Bounded terminal evidence, including a prefix when capture was incomplete.
+pub(crate) use ay_sys::metadata_capture::{BoundedPipeCapture, PipeCaptureEvidence};
 
 struct BoundedBytesCapture {
     receiver: std::sync::mpsc::Receiver<(Vec<u8>, bool, bool)>,
@@ -1676,7 +1705,11 @@ impl BoundedBytesCapture {
                     Ok(0) => break,
                     Ok(read) => {
                         let remaining = EXTERNAL_CAPTURE_LIMIT.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..read.min(remaining)]);
+                        let Some(retained) = chunk.get(..read.min(remaining)) else {
+                            read_failed = true;
+                            break;
+                        };
+                        kept.extend_from_slice(retained);
                         truncated |= read > remaining;
                     }
                     Err(_) => {
@@ -1711,10 +1744,11 @@ struct BoundedStdinWriter {
 }
 
 impl BoundedStdinWriter {
-    fn start<W>(mut writer: W, bytes: Vec<u8>) -> Self
+    fn start<W>(mut writer: ChildPipeWriter<W>, bytes: Vec<u8>) -> Self
     where
         W: std::io::Write + Send + 'static,
     {
+        use std::io::Write as _;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = writer.write_all(&bytes).and_then(|()| writer.flush());
@@ -1729,7 +1763,9 @@ impl BoundedStdinWriter {
             // Closing stdin before consuming the complete transcript is child
             // behavior, not a harness failure. Its exit status and captured
             // diagnostics remain available, while `stdin_complete` prevents a
-            // caller from mistaking the partial exchange for a full one.
+            // caller from mistaking the partial exchange for a full one. The
+            // writer is a `ChildPipeWriter`, so that close arrives here as
+            // `EPIPE`, never as a SIGPIPE that kills the harness.
             Ok(Err(error))
                 if matches!(
                     error.kind(),
@@ -1778,127 +1814,49 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    if timeout.is_zero() {
-        return Err(BenchError::msg(format!(
-            "{label}: timeout must be positive"
-        )));
-    }
-    let guard_script = crate::runner::repo_root_public()
-        .join("scripts")
-        .join("_oom_guard.py");
-    if !guard_script.is_file() {
-        return Err(BenchError::msg(format!(
-            "{label}: required stopped-child wrapper is missing: {}",
-            guard_script.display()
-        )));
-    }
-    let mut command = Command::new("python3");
-    command
-        .arg(&guard_script)
-        .arg("exec-stopped")
-        .arg("--")
-        .arg(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = Command::new(program);
+    command.args(args);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .with_bench_context(|| format!("spawning stopped metadata child for {label}"))?;
-    #[cfg(unix)]
-    resume_stopped_metadata_child(&mut child, label)?;
-    #[cfg(not(unix))]
-    {
-        terminate_process_group(&mut child);
-        return Err(BenchError::msg(format!(
-            "{label}: bounded metadata execution requires POSIX process groups"
-        )));
-    }
-    let stdout_capture = child.stdout.take().map(BoundedPipeCapture::start);
-    let stderr_capture = child.stderr.take().map(BoundedPipeCapture::start);
-    let status = match wait_for_child_exit_unreaped(&child, timeout, label) {
-        Ok(true) => kill_process_group_and_reap(&mut child, label)?,
-        Ok(false) => {
-            terminate_process_group(&mut child);
-            return Err(BenchError::msg(format!(
-                "{label}: exceeded {:.3}s",
-                timeout.as_secs_f64()
-            )));
-        }
-        Err(error) => {
-            terminate_process_group(&mut child);
-            return Err(error);
-        }
-    };
-    let stdout_result = stdout_capture
-        .ok_or_else(|| BenchError::msg(format!("{label}: stdout pipe missing")))?
-        .finish(label, "stdout");
-    let stderr_result = stderr_capture
-        .ok_or_else(|| BenchError::msg(format!("{label}: stderr pipe missing")))?
-        .finish(label, "stderr");
-    let stdout = stdout_result?;
-    let stderr = stderr_result?;
+    let output = ay_sys::metadata_capture::capture(
+        command,
+        ay_sys::metadata_capture::CaptureLimits {
+            timeout,
+            output_bytes: METADATA_CAPTURE_LIMIT,
+            resident_bytes: None,
+        },
+        label,
+    )?;
     Ok(CapturedOutput {
-        status,
-        stdout,
-        stderr,
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
-#[cfg(unix)]
-fn resume_stopped_metadata_child(child: &mut Child, label: &str) -> Result<()> {
-    let pid_raw = i32::try_from(child.id())
-        .map_err(|_| BenchError::msg(format!("{label}: metadata child PID does not fit pid_t")))?;
-    let pid = nix::unistd::Pid::from_raw(pid_raw);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match observe_child_unreaped(child, true, label) {
-            Ok(UnreapedChildState::Stopped(nix::sys::signal::Signal::SIGSTOP)) => break,
-            Ok(UnreapedChildState::Running) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(UnreapedChildState::Running) => {
-                terminate_process_group(child);
-                return Err(BenchError::msg(format!(
-                    "{label}: metadata child did not stop within 10 seconds"
-                )));
-            }
-            Ok(status) => {
-                terminate_process_group(child);
-                return Err(BenchError::msg(format!(
-                    "{label}: metadata child exited before its safety stop ({status:?})"
-                )));
-            }
-            Err(error) => {
-                terminate_process_group(child);
-                return Err(BenchError::msg(format!(
-                    "{label}: waiting for metadata child safety stop failed: {error}"
-                )));
-            }
-        }
-    }
-    if nix::unistd::getpgid(Some(pid)) != Ok(pid) {
-        terminate_process_group(child);
-        return Err(BenchError::msg(format!(
-            "{label}: stopped metadata child is not its process-group leader"
-        )));
-    }
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).map_err(|error| {
-        terminate_process_group(child);
-        BenchError::msg(format!("{label}: resuming metadata child failed: {error}"))
-    })
-}
+const LOADER_ENVIRONMENT: &[&str] = &[
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_ROOT_PATH",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LIBPATH",
+    "SHLIB_PATH",
+];
 
 impl PlannedResources {
-    /// Ask the repository OOM guard to cap `requested_jobs` and split RAM/CPU.
+    /// Hold the existing campaign lease and restrict jobs/RAM/CPU using native
+    /// observations. The lease and watchdog remain the enforcement owners.
     pub fn plan(repo_root: &Path, requested_jobs: usize, label: &str) -> Result<Self> {
         if requested_jobs == 0 {
             return Err(BenchError::InvalidArgs {
@@ -1908,7 +1866,7 @@ impl PlannedResources {
         let guard_script = repo_root.join("scripts").join("_oom_guard.py");
         if !guard_script.is_file() {
             return Err(BenchError::msg(format!(
-                "required resource planner is missing: {}",
+                "required resource enforcement component is missing: {}",
                 guard_script.display()
             )));
         }
@@ -1916,96 +1874,11 @@ impl PlannedResources {
         let test_campaign_lease = TestCampaignLease::acquire();
         let aggregate_lease = GlobalHarnessLease::exclusive(&guard_script, label)?;
 
-        let mut command = Command::new("python3");
-        command
-            .arg(&guard_script)
-            .arg("plan")
-            .arg("--jobs")
-            .arg(requested_jobs.to_string())
-            .arg("--label")
-            .arg(label);
-        // Unit tests invoke focused fake-solver harnesses from a live
-        // `cargo test` parent. Production binaries retain the strict build
-        // exclusion; tests exercise that policy directly in _oom_guard.py.
-        #[cfg(not(test))]
-        command.arg("--warn-concurrent-build");
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().with_bench_context(|| {
-            format!(
-                "running resource planner {} for {label}",
-                guard_script.display()
-            )
-        })?;
-        let stdout_capture = child.stdout.take().map(BoundedPipeCapture::start);
-        let stderr_capture = child.stderr.take().map(BoundedPipeCapture::start);
-        let status =
-            match wait_for_child_exit_unreaped(&child, Duration::from_secs(30), "resource planner")
-            {
-                Ok(true) => kill_process_group_and_reap(&mut child, "resource planner")?,
-                Ok(false) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "resource planner {} did not finish within 30 seconds",
-                        guard_script.display()
-                    )));
-                }
-                Err(error) => {
-                    terminate_process_group(&mut child);
-                    return Err(error);
-                }
-            };
-        let stdout = stdout_capture
-            .ok_or_else(|| BenchError::msg("resource planner stdout pipe missing"))?
-            .finish("resource planner", "stdout")?;
-        let stderr = stderr_capture
-            .ok_or_else(|| BenchError::msg("resource planner stderr pipe missing"))?
-            .finish("resource planner", "stderr")?;
-
-        if !stderr.is_empty() {
-            eprint!("{stderr}");
-        }
-        if !status.success() {
-            return Err(BenchError::msg(format!(
-                "resource planner {} exited with {}",
-                guard_script.display(),
-                status
-            )));
-        }
-
-        let values = parse_plan_output(&stdout)?;
-        let jobs = plan_value(&values, "PLAN_JOBS")?;
-        let memlimit_mb_per_child = plan_value(&values, "PLAN_MEMLIMIT_MB")?;
-        let nbcore_per_child = plan_value(&values, "PLAN_NBCORE")?;
-        let headroom_mb = plan_value(&values, "PLAN_HEADROOM_MB")?;
-        if jobs == 0 || jobs > requested_jobs {
-            return Err(BenchError::msg(format!(
-                "resource planner returned invalid job count {jobs} for request {requested_jobs}"
-            )));
-        }
-        if memlimit_mb_per_child == 0 {
-            return Err(BenchError::msg(
-                "resource planner returned PLAN_MEMLIMIT_MB=0; refusing to spawn an unenveloped child",
-            ));
-        }
-        if nbcore_per_child == 0 {
-            return Err(BenchError::msg("resource planner returned PLAN_NBCORE=0"));
-        }
+        let plan = measured_native_plan(requested_jobs, &guard_script)?;
         aggregate_lease.ensure_alive(label)?;
 
         Ok(Self {
-            plan: ResourcePlan {
-                requested_jobs,
-                jobs,
-                memlimit_mb_per_child,
-                nbcore_per_child,
-                headroom_mb,
-                planner: guard_script.display().to_string(),
-            },
+            plan,
             watchdog_server: SharedWatchdogServer::new(guard_script.clone()),
             guard_script,
             _aggregate_lease: Some(aggregate_lease),
@@ -2016,8 +1889,8 @@ impl PlannedResources {
 
     /// Reduce the planner-admitted per-child envelope for a campaign profile.
     ///
-    /// The OOM guard remains the source of admission and aggregate exclusion;
-    /// profile caps may only make its plan stricter. The reduced values are
+    /// The existing campaign lease retains aggregate exclusion; profile caps
+    /// may only tighten the native measured plan. The reduced values are
     /// the ones exported to children, enforced by the watchdog, and persisted
     /// in result packets.
     pub(crate) fn apply_per_child_caps(
@@ -2091,10 +1964,16 @@ impl PlannedResources {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.stdin(Stdio::null());
-        let (mut child, watchdog) = self.spawn_external_child(&mut command, label)?;
-        let stdout_capture = child.stdout.take().map(BoundedPipeCapture::start);
-        let stderr_capture = child.stderr.take().map(BoundedPipeCapture::start);
-        let outcome = wait_for_guarded_child(&mut child, watchdog, timeout, label)?;
+        let mut child = self.spawn_owned_child(&mut command, label)?;
+        let stdout_capture = child
+            .take_stdout()
+            .map(BoundedPipeCapture::start)
+            .transpose()?;
+        let stderr_capture = child
+            .take_stderr()
+            .map(BoundedPipeCapture::start)
+            .transpose()?;
+        let outcome = child.wait(timeout)?;
         if outcome.memout {
             return Err(BenchError::msg(format!(
                 "{label}: metadata command exceeded its memory envelope"
@@ -2147,15 +2026,15 @@ impl PlannedResources {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let (mut child, watchdog) = self.spawn_external_child(&mut command, label)?;
-        let Some(stdout) = child.stdout.take() else {
-            terminate_guarded_child(&mut child, watchdog, label)?;
+        let mut child = self.spawn_owned_child(&mut command, label)?;
+        let Some(stdout) = child.take_stdout() else {
+            child.cancel()?;
             return Err(BenchError::msg(format!(
                 "{label}: guarded stdout pipe is missing"
             )));
         };
         let capture = BoundedBytesCapture::start(stdout);
-        let outcome = wait_for_guarded_child(&mut child, watchdog, timeout, label);
+        let outcome = child.wait(timeout);
         let captured = capture.finish(label, "stdout");
         let (outcome, (stdout, output_truncated)) = match (outcome, captured) {
             (Ok(outcome), Ok(captured)) => (outcome, captured),
@@ -2196,7 +2075,39 @@ impl PlannedResources {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        self.run_external_transcript_impl(program, args, stdin, timeout, label, &[])
+        self.run_external_transcript_impl(program, args, stdin, timeout, label, &[], None)
+    }
+
+    /// Run a bounded transcript whose child also has a kernel-enforced
+    /// per-file output ceiling. Proof producers can otherwise fill the disk
+    /// while their stdout, RSS, and elapsed time remain within limits.
+    pub fn run_external_transcript_with_file_limit<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        stdin: &[u8],
+        timeout: Duration,
+        label: &str,
+        max_file_bytes: u64,
+    ) -> Result<GuardedTranscriptOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if max_file_bytes == 0 {
+            return Err(BenchError::InvalidArgs {
+                reason: "guarded transcript file limit must be positive".to_string(),
+            });
+        }
+        self.run_external_transcript_impl(
+            program,
+            args,
+            stdin,
+            timeout,
+            label,
+            &[],
+            Some(max_file_bytes),
+        )
     }
 
     /// Run one byte transcript while removing dynamic-loader injection and
@@ -2219,25 +2130,45 @@ impl PlannedResources {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        const LOADER_ENVIRONMENT: &[&str] = &[
-            "DYLD_FRAMEWORK_PATH",
-            "DYLD_FALLBACK_FRAMEWORK_PATH",
-            "DYLD_FALLBACK_LIBRARY_PATH",
-            "DYLD_IMAGE_SUFFIX",
-            "DYLD_INSERT_LIBRARIES",
-            "DYLD_LIBRARY_PATH",
-            "DYLD_ROOT_PATH",
-            "DYLD_VERSIONED_FRAMEWORK_PATH",
-            "DYLD_VERSIONED_LIBRARY_PATH",
-            "LD_AUDIT",
-            "LD_DEBUG",
-            "LD_LIBRARY_PATH",
-            "LD_PRELOAD",
-            "LD_PROFILE",
-            "LIBPATH",
-            "SHLIB_PATH",
-        ];
-        self.run_external_transcript_impl(program, args, stdin, timeout, label, LOADER_ENVIRONMENT)
+        self.run_external_transcript_impl(
+            program,
+            args,
+            stdin,
+            timeout,
+            label,
+            LOADER_ENVIRONMENT,
+            None,
+        )
+    }
+
+    /// Combine authenticated loader isolation with a hard file-output bound.
+    pub fn run_external_transcript_scrubbed_with_file_limit<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        stdin: &[u8],
+        timeout: Duration,
+        label: &str,
+        max_file_bytes: u64,
+    ) -> Result<GuardedTranscriptOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if max_file_bytes == 0 {
+            return Err(BenchError::InvalidArgs {
+                reason: "guarded transcript file limit must be positive".to_string(),
+            });
+        }
+        self.run_external_transcript_impl(
+            program,
+            args,
+            stdin,
+            timeout,
+            label,
+            LOADER_ENVIRONMENT,
+            Some(max_file_bytes),
+        )
     }
 
     fn run_external_transcript_impl<I, S>(
@@ -2248,6 +2179,7 @@ impl PlannedResources {
         timeout: Duration,
         label: &str,
         removed_environment: &[&str],
+        max_file_bytes: Option<u64>,
     ) -> Result<GuardedTranscriptOutput>
     where
         I: IntoIterator<Item = S>,
@@ -2264,7 +2196,10 @@ impl PlannedResources {
         }
 
         let started = Instant::now();
-        let mut command = self.external_command(program);
+        let mut command = match max_file_bytes {
+            Some(bytes) => self.external_command_with_file_limit(program, bytes),
+            None => self.external_command(program),
+        };
         for variable in removed_environment {
             command.env_remove(variable);
         }
@@ -2275,20 +2210,32 @@ impl PlannedResources {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, watchdog) = self.spawn_external_child(&mut command, label)?;
-        let (Some(child_stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        let mut child = self.spawn_owned_child(&mut command, label)?;
+        let (child_stdin, Some(stdout), Some(stderr)) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr())
         else {
-            terminate_guarded_child(&mut child, watchdog, label)?;
+            child.cancel()?;
             return Err(BenchError::msg(format!(
-                "{label}: guarded transcript pipe is missing"
+                "{label}: guarded transcript output pipe is missing"
             )));
         };
-
+        // Named explicitly so the SIGPIPE-safe writer is visible at the
+        // spawn site: `OwnedChild::take_stdin` wraps
+        // `ChildPipeWriter::take_from`, which the child-pipe gate cannot
+        // see through from this function.
+        let child_stdin: ChildPipeWriter<ChildStdin> = match child_stdin {
+            Ok(writer) => writer,
+            Err(error) => {
+                child.cancel()?;
+                return Err(BenchError::msg(format!(
+                    "{label}: guarded transcript stdin is missing or cannot be protected from SIGPIPE: {error}"
+                )));
+            }
+        };
         let stdin_writer = BoundedStdinWriter::start(child_stdin, stdin.to_vec());
         let stdout_capture = BoundedBytesCapture::start(stdout);
         let stderr_capture = BoundedBytesCapture::start(stderr);
-        let outcome = wait_for_guarded_child(&mut child, watchdog, timeout, label);
+        let outcome = child.wait(timeout);
         let stdin_result = stdin_writer.finish(label);
         let stdout_result = stdout_capture.finish(label, "stdout");
         let stderr_result = stderr_capture.finish(label, "stderr");
@@ -2347,8 +2294,18 @@ impl PlannedResources {
         })
     }
 
+    pub(crate) fn spawn_owned_child(
+        &self,
+        command: &mut Command,
+        label: &str,
+    ) -> Result<owned_child::LocalOwnedChild> {
+        let label = label.to_owned();
+        let (child, watchdog) = self.spawn_external_child(command, &label)?;
+        Ok(owned_child::LocalOwnedChild::new(child, watchdog, label))
+    }
+
     #[cfg(unix)]
-    pub(crate) fn spawn_external_child(
+    fn spawn_external_child(
         &self,
         command: &mut Command,
         label: &str,
@@ -2507,7 +2464,8 @@ impl PlannedResources {
 /// RSS watchdog remains alive. Every return path reaps the isolated process
 /// group and its campaign-server registration, so callers cannot accidentally
 /// leak either handle.
-pub(crate) fn wait_for_guarded_child(
+#[cfg(test)]
+fn wait_for_guarded_child(
     child: &mut Child,
     watchdog: RssWatchdog,
     timeout: Duration,
@@ -2516,147 +2474,25 @@ pub(crate) fn wait_for_guarded_child(
     wait_for_guarded_child_with_limits(child, watchdog, timeout, label, None, None)
 }
 
-pub(crate) fn wait_for_guarded_child_with_file_limit(
-    child: &mut Child,
-    watchdog: RssWatchdog,
-    timeout: Duration,
-    label: &str,
-    file_limit: Option<(&Path, u64)>,
-) -> Result<GuardedChildOutcome> {
-    wait_for_guarded_child_with_limits(child, watchdog, timeout, label, file_limit, None)
-}
+use ay_sys::owned_child::UnreapedChildState;
 
-include!("resource/unreaped_child_state.rs");
-
-#[cfg(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "haiku",
-    all(target_os = "linux", not(target_env = "uclibc")),
-))]
 fn observe_child_unreaped(
     child: &Child,
     include_stopped: bool,
     label: &str,
 ) -> Result<UnreapedChildState> {
-    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
-
-    let raw_pid = i32::try_from(child.id())
-        .map_err(|_| BenchError::msg(format!("{label}: child PID does not fit pid_t")))?;
-    let mut flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-    if include_stopped {
-        flags |= WaitPidFlag::WSTOPPED;
-    }
-    match waitid(Id::Pid(Pid::from_raw(raw_pid)), flags) {
-        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => Ok(UnreapedChildState::Exited),
-        Ok(WaitStatus::Stopped(_, signal)) if include_stopped => {
-            Ok(UnreapedChildState::Stopped(signal))
-        }
-        Ok(WaitStatus::StillAlive | WaitStatus::Continued(..)) => Ok(UnreapedChildState::Running),
-        Ok(status) => Err(BenchError::msg(format!(
-            "{label}: unexpected unreaped child status: {status:?}"
-        ))),
-        Err(error) => Err(BenchError::msg(format!(
-            "{label}: observing child without reaping failed: {error}"
-        ))),
-    }
+    let events = if include_stopped {
+        ay_sys::owned_child::ChildEvents::ExitOrStop
+    } else {
+        ay_sys::owned_child::ChildEvents::Exit
+    };
+    ay_sys::owned_child::observe_child_unreaped(child, events, label).map_err(Into::into)
 }
-
-#[cfg(target_os = "macos")]
-fn observe_child_unreaped(
-    child: &Child,
-    include_stopped: bool,
-    label: &str,
-) -> Result<UnreapedChildState> {
-    use ay_sys::supervisor::UnreapedChildState as SystemChildState;
-
-    match ay_sys::supervisor::observe_child_unreaped(child, include_stopped) {
-        Ok(SystemChildState::Running) => Ok(UnreapedChildState::Running),
-        Ok(SystemChildState::Exited) => Ok(UnreapedChildState::Exited),
-        Ok(SystemChildState::Stopped(signal)) if include_stopped => {
-            let signal = nix::sys::signal::Signal::try_from(signal).map_err(|error| {
-                BenchError::msg(format!(
-                    "{label}: child stopped with invalid signal {signal}: {error}"
-                ))
-            })?;
-            Ok(UnreapedChildState::Stopped(signal))
-        }
-        Ok(SystemChildState::Stopped(signal)) => Err(BenchError::msg(format!(
-            "{label}: unexpectedly observed stopped child with signal {signal}"
-        ))),
-        Err(error) => Err(BenchError::msg(format!(
-            "{label}: observing child without reaping failed: {error}"
-        ))),
-    }
-}
-
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "macos",
-    all(target_os = "linux", not(target_env = "uclibc")),
-)))]
-fn observe_child_unreaped(
-    _child: &Child,
-    _include_stopped: bool,
-    label: &str,
-) -> Result<UnreapedChildState> {
-    // Unix-only: off Unix the witness does not exist (see its definition).
-    #[cfg(unix)]
-    let _ = UNREAPED_CHILD_STATE_TYPE_WITNESS;
-    Err(BenchError::msg(format!(
-        "{label}: safe unreaped child observation is unavailable on this platform"
-    )))
-}
-
-#[cfg(all(
-    test,
-    unix,
-    not(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc")),
-    )),
-))]
-#[test]
-fn unsupported_target_rejects_unreaped_child_observation() {
-    let mut child = std::process::Command::new("/usr/bin/true")
-        .spawn()
-        .expect("spawn policy probe");
-    let error = observe_child_unreaped(&child, false, "target-policy regression")
-        .expect_err("unsupported targets must fail closed");
-    assert!(error
-        .to_string()
-        .contains("safe unreaped child observation is unavailable"));
-    child.wait().expect("reap policy probe");
-}
-
 fn wait_for_child_exit_unreaped(child: &Child, timeout: Duration, label: &str) -> Result<bool> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| BenchError::msg(format!("{label}: child wait deadline overflow")))?;
-    loop {
-        match observe_child_unreaped(child, false, label)? {
-            UnreapedChildState::Exited => return Ok(true),
-            UnreapedChildState::Running => {}
-            UnreapedChildState::Stopped(_) => {
-                return Err(BenchError::msg(format!(
-                    "{label}: child stopped unexpectedly while awaiting exit"
-                )))
-            }
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    ay_sys::owned_child::wait_for_child_exit_unreaped(child, timeout, label).map_err(Into::into)
 }
 
-pub(crate) fn wait_for_guarded_child_with_limits(
+fn wait_for_guarded_child_with_limits(
     child: &mut Child,
     mut watchdog: RssWatchdog,
     timeout: Duration,
@@ -2678,8 +2514,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
         }
     };
     if let Some(reason) = invalid_reason {
-        terminate_process_group(child);
-        let cleanup = watchdog.finish_after_target_cleanup().err();
+        let cleanup = terminate_guarded_child(child, watchdog, label).err();
         return Err(BenchError::msg(match cleanup {
             Some(error) => format!("{label}: {reason}; watchdog cleanup failed: {error}"),
             None => format!("{label}: {reason}"),
@@ -2688,8 +2523,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
     let deadline = match deadline {
         Some(deadline) => deadline,
         None => {
-            terminate_process_group(child);
-            let cleanup = watchdog.finish_after_target_cleanup().err();
+            let cleanup = terminate_guarded_child(child, watchdog, label).err();
             return Err(BenchError::msg(match cleanup {
                 Some(error) => format!(
                     "{label}: internal deadline validation failed; watchdog cleanup failed: {error}"
@@ -2700,8 +2534,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
     };
     loop {
         if abort_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
-            terminate_process_group(child);
-            let cleanup = watchdog.finish_after_target_cleanup().err();
+            let cleanup = terminate_guarded_child(child, watchdog, label).err();
             return Err(BenchError::msg(match cleanup {
                 Some(error) => format!(
                     "{label}: bounded output capture failed or exceeded its fixed size limit; watchdog cleanup failed: {error}"
@@ -2714,8 +2547,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
         if let Some((path, limit)) = file_limit {
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if !metadata.file_type().is_file() => {
-                    terminate_process_group(child);
-                    let cleanup = watchdog.finish_after_target_cleanup().err();
+                    let cleanup = terminate_guarded_child(child, watchdog, label).err();
                     return Err(BenchError::msg(match cleanup {
                         Some(error) => format!(
                             "{label}: guarded artifact is not a regular file: {}; watchdog cleanup failed: {error}",
@@ -2728,8 +2560,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                     }));
                 }
                 Ok(metadata) if metadata.len() > limit => {
-                    terminate_process_group(child);
-                    let cleanup = watchdog.finish_after_target_cleanup().err();
+                    let cleanup = terminate_guarded_child(child, watchdog, label).err();
                     return Err(BenchError::msg(match cleanup {
                         Some(error) => format!(
                             "{label}: guarded artifact {} exceeded the fixed {limit}-byte limit; watchdog cleanup failed: {error}",
@@ -2744,8 +2575,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    terminate_process_group(child);
-                    let cleanup = watchdog.finish_after_target_cleanup().err();
+                    let cleanup = terminate_guarded_child(child, watchdog, label).err();
                     return Err(BenchError::msg(match cleanup {
                         Some(cleanup_error) => format!(
                             "{label}: cannot inspect guarded artifact {}: {error}; watchdog cleanup failed: {cleanup_error}",
@@ -2759,13 +2589,12 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                 }
             }
         }
-        match observe_child_unreaped(child, false, label) {
+        match watchdog.observe_owned_child(child, label) {
             Ok(UnreapedChildState::Exited) => {
                 let trigger_ns = match monotonic_time_ns() {
                     Ok(trigger_ns) => trigger_ns,
                     Err(error) => {
-                        terminate_process_group(child);
-                        let cleanup = watchdog.finish_after_target_cleanup().err();
+                        let cleanup = terminate_guarded_child(child, watchdog, label).err();
                         return Err(BenchError::msg(match cleanup {
                             Some(cleanup) => format!(
                                 "{label}: cannot timestamp child completion: {error}; watchdog cleanup failed: {cleanup}"
@@ -2780,8 +2609,9 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                 // descendant in its process group has been killed. Reaping
                 // first would permit an inherited stdout descriptor to keep
                 // the bounded reader alive indefinitely.
-                let status_result = kill_process_group_and_reap(child, label);
+                let cleanup = GroupCleanup::begin(child)?;
                 let watchdog_result = watchdog.finish_after_target_cleanup();
+                let status_result = cleanup.reap(label).map_err(BenchError::from);
                 let (status, watchdog_outcome) = match (status_result, watchdog_result) {
                     (Ok(status), Ok(watchdog_outcome)) => (status, watchdog_outcome),
                     (Err(status_error), Ok(_)) => return Err(status_error),
@@ -2801,8 +2631,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
             }
             Ok(UnreapedChildState::Running) => {}
             Ok(UnreapedChildState::Stopped(_)) => {
-                terminate_process_group(child);
-                let watchdog_error = watchdog.finish_after_target_cleanup().err();
+                let watchdog_error = terminate_guarded_child(child, watchdog, label).err();
                 return Err(BenchError::msg(match watchdog_error {
                     Some(error) => format!(
                         "{label}: guarded child stopped unexpectedly; watchdog cleanup failed: {error}"
@@ -2810,30 +2639,40 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                     None => format!("{label}: guarded child stopped unexpectedly"),
                 }));
             }
+            Err(BenchError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // The original child can be between live identity and an
+                // observable exit. Pending grants no signal/group authority.
+                // Retain both owners, then recheck all existing stop/artifact
+                // controls under the SAME absolute deadline and poll cadence.
+                if Instant::now() >= deadline {
+                    return terminate_after_deadline(child, watchdog, label);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             Err(error) => {
-                terminate_process_group(child);
-                let watchdog_error = watchdog.finish_after_target_cleanup().err();
-                return Err(BenchError::msg(match watchdog_error {
-                    Some(watchdog_error) => {
-                        format!("{label}: waiting for child failed: {error}; watchdog cleanup failed: {watchdog_error}")
-                    }
-                    None => format!("{label}: waiting for child failed: {error}"),
-                }));
+                // An ownership observation failure (especially ECHILD) must
+                // never turn into numeric PID/group signal authority.
+                return Err(BenchError::msg(format!(
+                    "{label}: child ownership unavailable; cleanup refused: {error}"
+                )));
             }
         }
 
         match watchdog.poll() {
             Ok(None) => {}
             Ok(Some(observed)) if observed.breached => {
-                terminate_process_group(child);
-                let final_outcome = watchdog.finish_after_target_cleanup()?;
+                let cleanup = GroupCleanup::begin(child)?;
+                let final_outcome = watchdog.finish_after_target_cleanup();
+                let status = cleanup.reap(label)?;
+                let final_outcome = final_outcome?;
                 if !final_outcome.breached {
                     return Err(BenchError::msg(
                         "RSS watchdog lost a previously observed breach",
                     ));
                 }
                 return Ok(GuardedChildOutcome {
-                    status: child.try_wait().ok().flatten(),
+                    status: Some(status),
                     timed_out: false,
                     memout: true,
                 });
@@ -2853,27 +2692,7 @@ pub(crate) fn wait_for_guarded_child_with_limits(
         }
 
         if Instant::now() >= deadline {
-            let trigger_ns = match monotonic_time_ns() {
-                Ok(trigger_ns) => trigger_ns,
-                Err(error) => {
-                    terminate_process_group(child);
-                    let cleanup = watchdog.finish_after_target_cleanup().err();
-                    return Err(BenchError::msg(match cleanup {
-                        Some(cleanup) => format!(
-                            "{label}: cannot timestamp timeout trigger: {error}; watchdog cleanup failed: {cleanup}"
-                        ),
-                        None => format!("{label}: cannot timestamp timeout trigger: {error}"),
-                    }));
-                }
-            };
-            terminate_process_group(child);
-            let watchdog_outcome = watchdog.finish_after_target_cleanup()?;
-            let memout = watchdog_breached_before(watchdog_outcome, trigger_ns)?;
-            return Ok(GuardedChildOutcome {
-                status: child.try_wait().ok().flatten(),
-                timed_out: !memout,
-                memout,
-            });
+            return terminate_after_deadline(child, watchdog, label);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2891,36 +2710,39 @@ pub(crate) struct RssWatchdog {
     server: std::sync::Arc<SharedWatchdogServer>,
     aggregate_lease: Option<std::sync::Arc<GlobalHarnessLease>>,
     watch_id: u64,
-    target_pgid: Option<i32>,
+    #[cfg(unix)]
+    identity: ay_sys::supervisor::process_group::ProcessIdentity,
     terminal_breach: Option<WatchdogOutcome>,
+    #[cfg(test)]
+    pending_identity_observations: std::cell::Cell<usize>,
     receiver: std::sync::mpsc::Receiver<WatchdogServerMessage>,
 }
 
 impl RssWatchdog {
+    fn observe_owned_child(&self, child: &Child, label: &str) -> Result<UnreapedChildState> {
+        #[cfg(test)]
+        if let Some(left) = self.pending_identity_observations.get().checked_sub(1) {
+            self.pending_identity_observations.set(left);
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        #[cfg(unix)]
+        {
+            owned_child::observe_original_unreaped(child, &self.identity, label).map_err(Into::into)
+        }
+        #[cfg(not(unix))]
+        {
+            observe_child_unreaped(child, true, label)
+        }
+    }
     fn ensure_aggregate_lease_alive(&mut self) -> Result<()> {
         let result = match self.aggregate_lease.as_deref() {
             Some(lease) => lease.ensure_alive("guarded solver"),
             None => Ok(()),
         };
         if let Err(error) = result {
-            self.kill_target();
             return Err(error);
         }
         Ok(())
-    }
-
-    fn kill_target(&mut self) {
-        #[cfg(unix)]
-        if let Some(raw) = self.target_pgid.take() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(raw),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            self.target_pgid = None;
-        }
     }
 
     /// Poll watchdog health while the guarded child is still running.
@@ -2930,32 +2752,23 @@ impl RssWatchdog {
             return Ok(Some(breached));
         }
         if !self.server.is_healthy() {
-            self.kill_target();
             return Err(BenchError::msg(
                 "campaign RSS watchdog server stopped while a solver was active",
             ));
         }
         match self.receiver.try_recv() {
             Ok(message) => {
-                // Receiving any post-readiness response ends this server-side
-                // registration. Disarm the authenticated PGID before decoding
-                // the response: decoding is fallible, and the caller kills and
-                // reaps a still-live target on that error path. Retaining the
-                // numeric PGID until `Drop` would let it signal an unrelated
-                // group if the kernel reused the number after that reap.
-                self.target_pgid = None;
+                // Observations never grant signal authority. Only the owner
+                // retaining the actual unreaped Child may cancel its group.
                 let outcome = self.decode_terminal_event(message)?;
                 self.terminal_breach = Some(outcome);
                 Ok(Some(outcome))
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.kill_target();
-                Err(BenchError::msg(format!(
-                    "RSS watchdog {} response channel disconnected",
-                    self.watch_id
-                )))
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(BenchError::msg(format!(
+                "RSS watchdog {} response channel disconnected",
+                self.watch_id
+            ))),
         }
     }
 
@@ -2963,11 +2776,9 @@ impl RssWatchdog {
     pub(crate) fn finish(mut self) -> Result<WatchdogOutcome> {
         self.ensure_aggregate_lease_alive()?;
         if let Some(breached) = self.terminal_breach {
-            self.target_pgid = None;
             return Ok(breached);
         }
         if !self.server.is_healthy() {
-            self.kill_target();
             return Err(BenchError::msg(
                 "campaign RSS watchdog server stopped before reporting completion",
             ));
@@ -2975,14 +2786,12 @@ impl RssWatchdog {
         let message = match self.receiver.recv_timeout(Duration::from_secs(12)) {
             Ok(message) => message,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.kill_target();
                 return Err(BenchError::msg(format!(
                     "RSS watchdog {} did not report completion within 12 seconds",
                     self.watch_id
                 )));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                self.kill_target();
                 return Err(BenchError::msg(format!(
                     "RSS watchdog {} response channel disconnected",
                     self.watch_id
@@ -2991,17 +2800,14 @@ impl RssWatchdog {
         };
         let outcome = self.decode_terminal_event(message);
         if outcome.is_ok() {
-            self.target_pgid = None;
             self.ensure_aggregate_lease_alive()?;
         }
         outcome
     }
 
-    /// Finish after the caller has already killed and reaped the authenticated
-    /// target group. Disarming first prevents an error-path `Drop` from ever
-    /// signalling a PGID that could have been reused after the leader reap.
-    fn finish_after_target_cleanup(mut self) -> Result<WatchdogOutcome> {
-        self.target_pgid = None;
+    /// Receive completion after the actual Child owner requested cleanup.
+    /// The observer never signals a numeric PID/group, including on failure.
+    fn finish_after_target_cleanup(self) -> Result<WatchdogOutcome> {
         self.finish()
     }
 
@@ -3025,46 +2831,17 @@ impl RssWatchdog {
     }
 }
 
-impl Drop for RssWatchdog {
-    fn drop(&mut self) {
-        self.kill_target();
-    }
-}
-
-fn kill_process_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            let pgid = nix::unistd::Pid::from_raw(pid);
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-}
+use ay_sys::owned_child::GroupCleanup;
 
 fn kill_process_group_and_reap(child: &mut Child, label: &str) -> Result<ExitStatus> {
-    kill_process_group(child);
-    match child.wait_timeout(Duration::from_secs(5)) {
-        Ok(Some(status)) => Ok(status),
-        Ok(None) => Err(BenchError::msg(format!(
-            "{label}: process-group leader could not be reaped within 5 seconds after SIGKILL"
-        ))),
-        Err(error) => Err(BenchError::msg(format!(
-            "{label}: reaping process-group leader after SIGKILL failed: {error}"
-        ))),
-    }
+    ay_sys::owned_child::kill_process_group_and_reap(child, label).map_err(Into::into)
 }
 
-pub(crate) fn terminate_guarded_child(
-    child: &mut Child,
-    watchdog: RssWatchdog,
-    label: &str,
-) -> Result<()> {
-    let child_result = kill_process_group_and_reap(child, label).map(|_| ());
+fn terminate_guarded_child(child: &mut Child, watchdog: RssWatchdog, label: &str) -> Result<()> {
+    watchdog.observe_owned_child(child, label)?;
+    let cleanup = GroupCleanup::begin(child)?;
     let watchdog_result = watchdog.finish_after_target_cleanup().map(|_| ());
+    let child_result = cleanup.reap(label).map(|_| ()).map_err(BenchError::from);
     match (child_result, watchdog_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -3074,61 +2851,21 @@ pub(crate) fn terminate_guarded_child(
     }
 }
 
+/// Kill and reap a sidecar whose stdin cannot be taken as a `ChildPipeWriter`,
+/// and say so: a pipe that cannot be marked would let a dead sidecar kill the
+/// campaign on the next write.
+fn sidecar_stdin_unusable(child: &mut Child, sidecar: &str, error: &std::io::Error) -> BenchError {
+    terminate_process_group(child);
+    BenchError::msg(format!("{sidecar} stdin is unusable: {error}"))
+}
+
 /// Kill and reap an isolated solver process group. Callers must not reap the
 /// leader before invoking this helper: the unreaped PID prevents PGID reuse
 /// between group signalling and cleanup.
-pub(crate) fn terminate_process_group(child: &mut Child) {
-    kill_process_group(child);
-    // SIGKILL does not wake an uninterruptible (D-state) task. Never let
-    // cleanup turn a bounded harness deadline into an unbounded parent wait.
-    let _ = child.wait_timeout(Duration::from_secs(5));
-}
+pub(crate) use ay_sys::owned_child::terminate_process_group;
 
-fn parse_plan_output(output: &str) -> Result<BTreeMap<&str, usize>> {
-    let mut values = BTreeMap::new();
-    for line in output.lines() {
-        let Some((key, value)) = line.trim().split_once('=') else {
-            continue;
-        };
-        if !key.starts_with("PLAN_") {
-            continue;
-        }
-        if !matches!(
-            key,
-            "PLAN_JOBS" | "PLAN_MEMLIMIT_MB" | "PLAN_NBCORE" | "PLAN_HEADROOM_MB"
-        ) {
-            return Err(BenchError::msg(format!(
-                "resource planner returned unknown field {key}"
-            )));
-        }
-        let value = value.parse::<usize>().map_err(|_| {
-            BenchError::msg(format!("resource planner returned invalid {key}={value:?}"))
-        })?;
-        if values.insert(key, value).is_some() {
-            return Err(BenchError::msg(format!(
-                "resource planner returned duplicate field {key}"
-            )));
-        }
-    }
-    for key in [
-        "PLAN_JOBS",
-        "PLAN_MEMLIMIT_MB",
-        "PLAN_NBCORE",
-        "PLAN_HEADROOM_MB",
-    ] {
-        if !values.contains_key(key) {
-            return Err(BenchError::msg(format!("resource planner omitted {key}")));
-        }
-    }
-    Ok(values)
-}
-
-fn plan_value(values: &BTreeMap<&str, usize>, key: &'static str) -> Result<usize> {
-    values
-        .get(key)
-        .copied()
-        .ok_or_else(|| BenchError::msg(format!("resource planner omitted {key}")))
-}
+#[cfg(test)]
+mod child_pipe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3139,29 +2876,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .expect("secure test directory");
-    }
-
-    #[test]
-    fn parses_complete_plan_without_shell_evaluation() {
-        let parsed = parse_plan_output(
-            "PLAN_JOBS=3\nPLAN_MEMLIMIT_MB=2048\nPLAN_NBCORE=2\nPLAN_HEADROOM_MB=16000\n",
-        )
-        .expect("parse plan");
-        assert_eq!(plan_value(&parsed, "PLAN_JOBS").unwrap(), 3);
-        assert_eq!(plan_value(&parsed, "PLAN_MEMLIMIT_MB").unwrap(), 2048);
-    }
-
-    #[test]
-    fn rejects_non_numeric_plan_values() {
-        let err = parse_plan_output("PLAN_JOBS=$(bad)\n").expect_err("must reject");
-        assert!(err.to_string().contains("invalid PLAN_JOBS"));
-    }
-
-    #[test]
-    fn rejects_duplicate_or_unknown_plan_fields() {
-        let complete = "PLAN_JOBS=1\nPLAN_MEMLIMIT_MB=1024\nPLAN_NBCORE=1\nPLAN_HEADROOM_MB=0\n";
-        assert!(parse_plan_output(&format!("{complete}PLAN_JOBS=2\n")).is_err());
-        assert!(parse_plan_output(&format!("{complete}PLAN_SURPRISE=1\n")).is_err());
     }
 
     #[test]
@@ -3264,22 +2978,54 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn build_sandbox_uses_only_the_explicit_test_lease_seam() {
-        let marked = std::env::var_os("AY_CONTINUOUS_BUILD_SANDBOX").as_deref()
-            == Some(std::ffi::OsStr::new("1"));
-        let path = build_sandbox_test_lease_path();
-        assert_eq!(path.is_some(), marked);
-        if let Some(path) = path {
-            assert!(path.is_absolute());
-            assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
-            let name = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .expect("test lease filename");
-            assert!(name.starts_with("ay-bench-test-lease-"));
-            assert!(!name.starts_with("ay-oom-guard-"));
-        }
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn test_campaigns_take_the_aggregate_lease_only_on_the_private_seam() {
+        let path = test_campaign_lease_path();
+        assert!(path.is_absolute());
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("test lease filename");
+        assert_eq!(
+            name,
+            format!("ay-bench-test-lease-{}.lock", std::process::id())
+        );
+        assert!(!name.starts_with("ay-oom-guard-"));
+
+        // Pin the call site with the real sidecar, serialized with the campaign
+        // tests that share this lock: its flock record must land in the
+        // private file. Routed to the host lock instead, the sidecar is refused
+        // while any AY harness holds that lock, and otherwise writes no record
+        // here naming this sidecar.
+        let _serialized = TestCampaignLease::acquire();
+        let guard_script = crate::runner::repo_root_public()
+            .join("scripts")
+            .join("_oom_guard.py");
+        let label = "private seam test lease";
+        let lease = GlobalHarnessLease::acquire(&guard_script, label).expect("private lease");
+        let sidecar = {
+            let process = lease.process.lock().expect("lease process lock");
+            process.as_ref().expect("lease process").0.id()
+        };
+        let record = std::fs::read_to_string(&path).expect("private lease record");
+        assert!(
+            record.starts_with(&format!("pid={sidecar} ")),
+            "private lease record does not name this sidecar: {record:?}"
+        );
+        assert!(
+            record.ends_with(&format!(" label={label}\n")),
+            "private lease record does not carry this label: {record:?}"
+        );
+        drop(lease);
     }
 
     #[test]
@@ -3567,6 +3313,63 @@ os._exit(0)
 
     #[cfg(unix)]
     #[test]
+    fn guarded_transcript_file_limit_bounds_proof_artifacts() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let temporary = tempfile::tempdir().expect("artifact directory");
+        let path = temporary.path().join("proof");
+        let output = resources
+            .run_external_transcript_with_file_limit(
+                "python3",
+                [
+                    "-c",
+                    "import sys; open(sys.argv[1], 'wb').write(b'x' * 16384)",
+                    path.to_str().expect("UTF-8 path"),
+                ],
+                b"",
+                Duration::from_secs(5),
+                "proof size refusal",
+                4096,
+            )
+            .expect("guarded producer");
+        assert!(!output.status.is_some_and(|status| status.success()));
+        assert!(std::fs::metadata(&path).expect("partial proof").len() <= 4096);
+        let accepted = temporary.path().join("small-proof");
+        let output = resources
+            .run_external_transcript_with_file_limit(
+                "python3",
+                [
+                    "-c",
+                    "import sys; open(sys.argv[1], 'wb').write(b'x' * 32)",
+                    accepted.to_str().expect("UTF-8 path"),
+                ],
+                b"",
+                Duration::from_secs(5),
+                "bounded proof",
+                4096,
+            )
+            .expect("guarded producer");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(std::fs::metadata(accepted).expect("proof").len(), 32);
+    }
+
+    #[test]
+    fn guarded_transcript_refuses_zero_file_limit_before_spawn() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let error = resources
+            .run_external_transcript_with_file_limit(
+                "/no/such/producer",
+                std::iter::empty::<&str>(),
+                b"",
+                Duration::from_secs(5),
+                "invalid file limit",
+                0,
+            )
+            .expect_err("zero file limit must fail before spawn");
+        assert!(error.to_string().contains("file limit must be positive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[cfg(any(
         target_os = "android",
         target_os = "freebsd",
@@ -3789,7 +3592,7 @@ os._exit(0)
 
     #[cfg(unix)]
     #[test]
-    fn terminal_watchdog_error_disarms_pgid_before_drop() {
+    fn terminal_watchdog_error_cannot_signal_an_observed_process() {
         use std::os::unix::process::CommandExt as _;
         use std::sync::atomic::Ordering;
         use wait_timeout::ChildExt as _;
@@ -3806,7 +3609,9 @@ os._exit(0)
         let mut replacement = replacement_command
             .spawn()
             .expect("spawn replacement group");
-        let replacement_pgid = i32::try_from(replacement.id()).expect("replacement PID fits pid_t");
+        let identity = ay_sys::supervisor::process_group::process_identity(replacement.id())
+            .expect("observe replacement")
+            .expect("replacement is alive");
 
         // Construct the post-READY state directly and inject the terminal
         // ERROR delivered by the server reader. Future timestamps keep this
@@ -3825,13 +3630,13 @@ os._exit(0)
             server,
             aggregate_lease: None,
             watch_id: 41,
-            target_pgid: Some(replacement_pgid),
+            identity,
             terminal_breach: None,
+            pending_identity_observations: std::cell::Cell::new(0),
             receiver,
         };
 
         let poll_result = watchdog.poll();
-        let disarmed_before_drop = watchdog.target_pgid.is_none();
         drop(watchdog);
         let replacement_status = replacement
             .wait_timeout(Duration::from_millis(250))
@@ -3844,7 +3649,6 @@ os._exit(0)
         assert!(error
             .to_string()
             .contains("injected terminal watchdog failure"));
-        assert!(disarmed_before_drop, "terminal error retained a stale PGID");
         assert!(
             replacement_status.is_none(),
             "watchdog cleanup signalled the replacement process group"
@@ -3861,28 +3665,34 @@ os._exit(0)
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn campaign_watchdog_preserves_zero_grace_memout_enforcement() {
-        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 16);
-        let mut command = resources.external_command("python3");
-        command
-            .args([
-                "-c",
-                "import time; allocation=bytearray(64*1024*1024); time.sleep(60)",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let (mut child, watchdog) = resources
-            .spawn_external_child(&mut command, "campaign memout child")
-            .expect("spawn guarded memory hog");
-        let outcome = wait_for_guarded_child(
-            &mut child,
-            watchdog,
-            Duration::from_secs(10),
-            "campaign memout child",
-        )
-        .expect("wait memory hog");
-        assert!(outcome.memout);
-        assert!(!outcome.timed_out);
+        for pending in [0, 3] {
+            let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 16);
+            let mut command = resources.external_command("python3");
+            command
+                .args([
+                    "-c",
+                    "import time; allocation=bytearray(64*1024*1024); time.sleep(60)",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let (mut child, watchdog) = resources
+                .spawn_external_child(&mut command, "campaign memout child")
+                .expect("spawn guarded memory hog");
+            // Pending observations provide no identity/signal authority. The
+            // original wait owner must retain the real Child/watchdog and still
+            // return the actual zero-grace memory cause after native reaping.
+            watchdog.pending_identity_observations.set(pending);
+            let outcome = wait_for_guarded_child(
+                &mut child,
+                watchdog,
+                Duration::from_secs(10),
+                "campaign memout child",
+            )
+            .expect("wait memory hog");
+            assert!(outcome.memout);
+            assert!(!outcome.timed_out);
+        }
     }
 
     #[cfg(unix)]

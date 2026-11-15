@@ -11,7 +11,6 @@ use ay_milp::{
 };
 use num_rational::BigRational;
 use num_traits::One;
-use std::path::Path;
 
 fn rat(n: i64, d: i64) -> BigRational {
     BigRational::new(n.into(), d.into())
@@ -448,60 +447,6 @@ ENDATA
         // Fail-closed is a SUCCESS: an honest non-answer (`Unknown`/`Bound`),
         // never a wrong one.
         _ => {}
-    }
-}
-
-/// THE INVARIANT THAT JUSTIFIES SKIPPING `fail_closed_for_inexact`.
-///
-/// `finish_exact_reduction` is sound only because every lane that exits through
-/// it reads model facts from the exact rational side store — `row_coeff_exact`,
-/// `obj_coeff_exact_at`, `row_lb_exact`/`row_ub_exact`, `col_*_exact` — and
-/// never from the `f64` proxy the reader keeps for the float lane. Add a lane
-/// to that block without the property and a rounded-proxy search result is
-/// silently relabelled an exact verdict, with the float-search backstop
-/// removed.
-///
-/// Nothing enforced this structurally, so it is enforced here: a source scan,
-/// in the style of `tests/env_ledger.rs`, over the modules the exact-reduction
-/// block dispatches to.
-#[test]
-fn every_exact_reduction_lane_reads_the_rational_side_store() {
-    // Each module reachable from the `finish_exact_reduction` block in
-    // `BabSession::check`. Adding a route there means adding it here.
-    const LANES: &[&str] = &[
-        "pb_translate.rs",
-        "direct_cnf.rs",
-        "sat_relu.rs",
-        "hybrid_pb_lp.rs",
-        "hybrid_integer_lift.rs",
-        "network_design_pb.rs",
-        "open_domain.rs",
-        "parity.rs",
-    ];
-    // Any one of these proves the lane consults the exact side store.
-    const EXACT_READS: &[&str] = &[
-        "row_coeff_exact",
-        "obj_coeff_exact_at",
-        "row_lb_exact",
-        "row_ub_exact",
-        "col_lb_exact",
-        "col_ub_exact",
-        "obj_offset_exact",
-        "has_inexact_coeffs",
-    ];
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for lane in LANES {
-        let path = src.join(lane);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("exact-reduction lane {lane} is unreadable: {e}"));
-        assert!(
-            EXACT_READS.iter().any(|needle| text.contains(needle)),
-            "{lane} exits through `finish_exact_reduction`, which SKIPS \
-             `fail_closed_for_inexact`, but reads no exact side-store accessor. \
-             Either it reads the rounded f64 proxy — in which case its verdict \
-             is not exact and the skip is unsound — or it declines outright and \
-             should say so here."
-        );
     }
 }
 

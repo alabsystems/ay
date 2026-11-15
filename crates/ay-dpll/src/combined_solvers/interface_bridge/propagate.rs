@@ -9,8 +9,6 @@
 //!
 //! Split from `mod.rs` for code health (#5970).
 
-// #8529: Use deterministic hash sets in all builds.
-use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{DiscoveredEquality, TermId, TermStore, TheoryLit};
 use num_bigint::BigInt;
@@ -24,10 +22,10 @@ use super::{
 };
 
 /// Red zone size for `stacker::maybe_grow` in constant collection recursion (#8414).
-const CONST_COLLECT_STACK_RED_ZONE: usize = 32 * 1024;
+pub(super) const CONST_COLLECT_STACK_RED_ZONE: usize = 32 * 1024;
 
 /// Stack segment size allocated by stacker for constant collection recursion.
-const CONST_COLLECT_STACK_SIZE: usize = 1024 * 1024;
+pub(super) const CONST_COLLECT_STACK_SIZE: usize = 1024 * 1024;
 
 /// Detect self-evidencing reason sets for a discovered bridge equality (#8742).
 ///
@@ -169,7 +167,7 @@ fn ite_cond_has_unjustified_int_leaf(
 
 /// Check if a Real-sorted term has any variable leaf with unjustified (non-tight)
 /// bounds (#8147). Parallel to `has_unjustified_int_leaf`.
-fn has_unjustified_real_leaf(
+pub(in crate::combined_solvers) fn has_unjustified_real_leaf(
     terms: &TermStore,
     get_real_value_with_reasons: &impl Fn(TermId) -> Option<(BigRational, Vec<TheoryLit>)>,
     term: TermId,
@@ -245,47 +243,9 @@ impl InterfaceBridge {
     /// Collect integer constants from a term and register them.
     /// Uses a visited set to avoid exponential re-traversal of shared DAG subterms (#3712).
     pub(crate) fn collect_int_constants(&mut self, terms: &TermStore, term: TermId) {
-        let mut visited = HashSet::default();
-        self.collect_int_constants_inner(terms, term, &mut visited);
-    }
-
-    /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#8414).
-    fn collect_int_constants_inner(
-        &mut self,
-        terms: &TermStore,
-        term: TermId,
-        visited: &mut HashSet<TermId>,
-    ) {
-        stacker::maybe_grow(
-            CONST_COLLECT_STACK_RED_ZONE,
-            CONST_COLLECT_STACK_SIZE,
-            || {
-                if !visited.insert(term) {
-                    return;
-                }
-                match terms.get(term) {
-                    TermData::Const(Constant::Int(n)) if !self.int_const_terms.contains_key(n) => {
-                        self.int_const_terms.insert(n.clone(), term);
-                        self.interface_trail
-                            .push(InterfaceTrailEntry::ConstTerm(n.clone()));
-                    }
-                    TermData::App(_, args) => {
-                        for &arg in args {
-                            self.collect_int_constants_inner(terms, arg, visited);
-                        }
-                    }
-                    TermData::Not(inner) => {
-                        self.collect_int_constants_inner(terms, *inner, visited)
-                    }
-                    TermData::Ite(c, t, e) => {
-                        self.collect_int_constants_inner(terms, *c, visited);
-                        self.collect_int_constants_inner(terms, *t, visited);
-                        self.collect_int_constants_inner(terms, *e, visited);
-                    }
-                    _ => {}
-                }
-            },
-        ) // stacker::maybe_grow
+        let mut ops = Vec::new();
+        super::track_plan::plan_int_constants(terms, term, &mut ops);
+        self.apply_track_ops(&ops);
     }
 
     /// Evaluate interface terms and return new equalities with reasons (#4068).
@@ -464,59 +424,9 @@ impl InterfaceBridge {
     /// Collect rational (Real) constants from a term and register them (#4915).
     /// Parallel to `collect_int_constants` but for Real-sorted constants.
     pub(crate) fn collect_real_constants(&mut self, terms: &TermStore, term: TermId) {
-        let mut visited = HashSet::default();
-        self.collect_real_constants_inner(terms, term, &mut visited);
-    }
-
-    /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#8414).
-    fn collect_real_constants_inner(
-        &mut self,
-        terms: &TermStore,
-        term: TermId,
-        visited: &mut HashSet<TermId>,
-    ) {
-        stacker::maybe_grow(
-            CONST_COLLECT_STACK_RED_ZONE,
-            CONST_COLLECT_STACK_SIZE,
-            || {
-                if !visited.insert(term) {
-                    return;
-                }
-                match terms.get(term) {
-                    TermData::Const(Constant::Rational(r))
-                        if !self.real_const_terms.contains_key(&r.0) =>
-                    {
-                        self.real_const_terms.insert(r.0.clone(), term);
-                        self.interface_trail
-                            .push(InterfaceTrailEntry::RealConstTerm(r.0.clone()));
-                    }
-                    TermData::Const(Constant::Int(n)) => {
-                        // Integer constants can appear in Real-sorted expressions
-                        // (e.g., `(= x 2)` where x is Real is parsed as `(= x 2.0)`).
-                        let rational = BigRational::from(n.clone());
-                        if !self.real_const_terms.contains_key(&rational) {
-                            self.real_const_terms.insert(rational.clone(), term);
-                            self.interface_trail
-                                .push(InterfaceTrailEntry::RealConstTerm(rational));
-                        }
-                    }
-                    TermData::App(_, args) => {
-                        for &arg in args {
-                            self.collect_real_constants_inner(terms, arg, visited);
-                        }
-                    }
-                    TermData::Not(inner) => {
-                        self.collect_real_constants_inner(terms, *inner, visited)
-                    }
-                    TermData::Ite(c, t, e) => {
-                        self.collect_real_constants_inner(terms, *c, visited);
-                        self.collect_real_constants_inner(terms, *t, visited);
-                        self.collect_real_constants_inner(terms, *e, visited);
-                    }
-                    _ => {}
-                }
-            },
-        ) // stacker::maybe_grow
+        let mut ops = Vec::new();
+        super::track_plan::plan_real_constants(terms, term, &mut ops);
+        self.apply_track_ops(&ops);
     }
 
     /// Evaluate Real-valued interface terms and return new equalities (#4915).

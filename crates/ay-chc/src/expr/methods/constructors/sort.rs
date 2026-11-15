@@ -23,6 +23,7 @@ impl ChcExpr {
             Self::FuncApp(_, sort, _) => sort.clone(),
             Self::Op(op, args) => Self::op_sort(op, args),
             Self::ConstArrayMarker(_) | Self::IsTesterMarker(_) => ChcSort::Bool,
+            Self::ArrayLambda(lambda) => lambda.sort(),
             Self::ConstArray(key_sort, val) => {
                 ChcSort::Array(Box::new(key_sort.clone()), Box::new(val.sort()))
             }

@@ -310,6 +310,9 @@ impl Executor {
 }
 
 fn charge_work(work: &mut usize, amount: usize) -> bool {
+    if !super::recovery_admission::pay_current(amount, 0) {
+        return false;
+    }
     let Some(next) = work.checked_add(amount) else {
         return false;
     };

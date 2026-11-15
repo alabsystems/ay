@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% `Cardinality::substitute`, which lowers the degree with an unchecked `-= 1` per literal mapped
+% to TRUE. `1 x1 1 x2 >= i64::MIN` has all coefficients one and a degree that fits `i64`, so
+% `into_smallest_type()` stores it as a cardinality constraint and the general-PB fix alone
+% would not cover it.
+f 2;
+rup 1 x1 1 x2 >= -9223372036854775808 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

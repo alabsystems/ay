@@ -4,6 +4,7 @@
 
 //! Last-resort QF_BV whole-proof collapse reconstruction.
 
+use ay_core::kani_compat::DetHashSet;
 use ay_core::{AletheRule, Proof, ProofId, Sort, TermData, TermId, TheoryLemmaKind};
 use ay_frontend::command::Term as FrontendTerm;
 
@@ -35,7 +36,7 @@ impl Executor {
         assertion_ids: &[TermId],
         negated: &[TermId],
     ) -> Option<Proof> {
-        if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, negated) {
+        if !self.recognize_bv_bitblast_until_stopped(negated) {
             return None;
         }
 
@@ -118,6 +119,15 @@ impl Executor {
         if !Self::proof_is_single_empty_trust(proof) {
             return;
         }
+        // The word-level ground closure first: on a pure bit-vector query it
+        // decides by congruence and slice identities what the joint-negation
+        // lemma below re-decides by bit-blasting every circuit at once, which
+        // spends the query's whole budget on a multiplier (external-codegen's x86-64
+        // `imul` overflow bodies, measured on 84dbf0bdb: 30 s, `unknown`).
+        // A decline leaves `proof` untouched for the rescue below.
+        if self.try_pure_bit_vector_ground_closure_first(proof) {
+            return;
+        }
         let parsed: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
         if parsed.is_empty() {
             return;
@@ -131,6 +141,42 @@ impl Executor {
                 return;
             }
             assertion_ids.push(t);
+        }
+
+        // #trust-lemma-dup-assume, this lane's instance. The parsed assertion
+        // list can hold the SAME term more than once (the identical assertion
+        // asserted twice). Every occurrence contributes ONE literal to
+        // `negated`, but a clause is a SET: the checker decodes the head and
+        // every resolvent through `clause_as_set`, which sorts and dedups.
+        //
+        // Both emissions below break on a repeated literal, in mirror-image
+        // ways. The fallback chain removes ONE occurrence per step
+        // (`remaining.remove(0)`), so the FIRST resolution against a repeated
+        // literal records a resolvent that still carries the duplicate the
+        // checker's resolution already eliminated — the step is rejected as
+        // `invalid resolution derivation`. The strict `th_resolution` anchor
+        // uses `retain`, which drops ALL copies at once, so the LATER
+        // duplicate resolves against a premise with no complement left, which
+        // is not a resolution either. Only the strict path is gated by its own
+        // re-check and so merely loses its anchor; the fallback PUBLISHES its
+        // invalid chain, and the mandatory certification gate then correctly
+        // refuses the whole refutation.
+        //
+        // Measured on `repros/unsat-cert/chc_array_pred_invalid_resolution.smt2`,
+        // whose parsed assertions hold `(= i #b0..0)` twice: step t16 resolved
+        // premise t15 (two copies of `(not (= i 0))`) against that assumption
+        // and kept one copy, so the recorded resolvent had four literals where
+        // the checker derives three.
+        //
+        // Deduplicating by term fixes both: every head literal is unique, so
+        // exactly one occurrence is removed per step under BOTH positional and
+        // set semantics. Nothing is weakened and no claim is widened — a
+        // repeated literal is redundant in a clause, so the head states the
+        // same proposition over the same assumptions, and every step is still
+        // replayed by the untouched checker.
+        {
+            let mut seen = DetHashSet::default();
+            assertion_ids.retain(|&t| seen.insert(t));
         }
 
         // Scope guard: this rescue is the BV lane's. Require at least one
@@ -154,9 +200,33 @@ impl Executor {
             }
         }
 
-        if let Some(candidate) =
+        // A strict-checkable anchor is what makes this rescue's document
+        // PUBLISHABLE, so every term it prints must survive the printer's
+        // surface-override table -- the same gate every collapse promoter
+        // applies to its raw rebuilds (see `rebuilt_terms_print_faithfully`).
+        // A folded array read attaches the whole read's authored spelling to
+        // the composite leaf it collapsed to, and the raw rebuild legitimately
+        // uses that leaf in unfolded positions, so the `assume` would no longer
+        // be the problem's assertion. Keep the honest `hole` below in that
+        // case: mandatory strict certification then withholds the UNSAT rather
+        // than publish a document AY cannot stand behind.
+        let printed: Vec<TermId> = assertion_ids
+            .iter()
+            .chain(negated.iter())
+            .copied()
+            .collect();
+        let strict_anchor = if self.rebuilt_terms_print_faithfully(&printed) {
+            // Where the anchor would pay for an exact divider, an authored
+            // `bvurem` obligation the BvUremBound theorem closes is certified
+            // first (`bv_identity_promotion/guarded/urem_bound/before_division.rs`).
+            if self.promote_urem_bound_before_rescue_anchor(proof, &negated) {
+                return;
+            }
             self.strict_bv_bitblast_collapse_candidate(&assertion_ids, &negated)
-        {
+        } else {
+            None
+        };
+        if let Some(candidate) = strict_anchor {
             *proof = candidate;
             return;
         }
@@ -250,5 +320,163 @@ mod tests {
         );
         exec.check_proof_strict_with_datatypes(proof)
             .expect("the reconstructed BvBitBlast proof must replay strictly");
+    }
+
+    /// REGRESSION (#trust-lemma-dup-assume, this lane). A parsed assertion list
+    /// holding the SAME assertion twice must still emit a resolution chain the
+    /// untouched checker accepts.
+    ///
+    /// Before the dedup, `negated` carried the repeated literal twice, the
+    /// fallback chain removed ONE occurrence per step, and the FIRST resolution
+    /// against the repeat recorded a resolvent still carrying a literal the
+    /// checker's set-semantics resolution had already eliminated — published as
+    /// `step tN has invalid resolution derivation`. Measured end to end on
+    /// `repros/unsat-cert/chc_array_pred_invalid_resolution.smt2` (step t16).
+    #[test]
+    fn a_duplicated_parsed_assertion_still_emits_a_checkable_resolution_chain() {
+        use ay_core::term::Symbol;
+        use ay_core::{Proof, Sort};
+        use ay_frontend::command::Term as FrontendTerm;
+
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("dupbv_x", Sort::bitvec(32));
+        let y = exec.ctx.terms.mk_var("dupbv_y", Sort::bitvec(32));
+        let lt = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("bvult"), vec![x, y], Sort::Bool);
+        let parsed = FrontendTerm::App(
+            "bvult".to_string(),
+            vec![
+                FrontendTerm::Symbol("dupbv_x".to_string()),
+                FrontendTerm::Symbol("dupbv_y".to_string()),
+            ],
+        );
+        // The identical assertion, asserted twice: the defect's precondition.
+        exec.ctx.add_assertion_with_parsed(lt, parsed.clone());
+        exec.ctx.add_assertion_with_parsed(lt, parsed);
+
+        // The degenerate single-empty-trust collapse is what arms the rescue.
+        let mut proof = Proof::new();
+        proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+        exec.rescue_bv_bitblast_collapse(&mut proof);
+
+        let head_literals: Vec<usize> = proof
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ProofStep::Step {
+                    rule: AletheRule::Hole,
+                    clause,
+                    ..
+                } => Some(clause.len()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            head_literals.iter().all(|&n| n == 1),
+            "the head must carry one literal per DISTINCT assertion, got {head_literals:?} in {:#?}",
+            proof.steps
+        );
+
+        let (_summary, error) = ay_proof::check_proof_partial(&proof, &exec.ctx.terms);
+        assert!(
+            error.is_none(),
+            "the emitted chain must replay: {error:?}\n{:#?}",
+            proof.steps
+        );
+    }
+
+    /// NEGATIVE CONTROL. The fix must not have taught the checker to tolerate
+    /// the bad shape: the exact pre-fix emission — a head carrying the repeated
+    /// literal twice and a chain removing one occurrence per step — must still
+    /// be REFUSED as an invalid resolution derivation.
+    #[test]
+    fn the_pre_fix_duplicated_head_chain_is_still_refused() {
+        use ay_core::{Proof, Sort, TermStore};
+
+        let mut terms = TermStore::new();
+        let a = terms.mk_var("negctl_a", Sort::Bool);
+        let not_a = terms.mk_not_raw(a);
+
+        let mut proof = Proof::new();
+        let first = proof.add_assume(a, None);
+        let second = proof.add_assume(a, None);
+        let head =
+            proof.add_rule_step(AletheRule::Hole, vec![not_a, not_a], Vec::new(), Vec::new());
+        // Removes ONE copy; the checker resolves over SETS and removes both.
+        let partial_step = proof.add_resolution(vec![not_a], a, head, first);
+        proof.add_resolution(Vec::new(), a, partial_step, second);
+
+        let (_summary, error) = ay_proof::check_proof_partial(&proof, &terms);
+        assert!(
+            matches!(
+                error,
+                Some(ay_proof::ProofCheckError::InvalidResolution { .. })
+            ),
+            "a genuinely invalid resolution must still be refused, got {error:?}"
+        );
+    }
+
+    /// REGRESSION (AY-03), on the query that surfaced it in the field.
+    ///
+    /// compiler_consumer 321aaeda7 (ay 075a482ae) logged `internal proof checker rejected
+    /// UNSAT proof, error=step t48 has invalid resolution derivation` (a 95-step
+    /// proof) while verifying unicode-ident-1.0.24 `is_xid_start`. Re-running
+    /// that obligation through ay 075a482ae's `engines::solve_pdr_proof`
+    /// rejected a 95-step proof the same way at t50, and the fixture holds
+    /// that proof's 47 `assume` steps: 45 distinct assertions, with
+    /// `(bvule 0 ch)` and `(bvule ch 4294967295)` each asserted twice.
+    ///
+    /// Hand-check of that t50 from the dump. Premise t49 carries
+    /// `(not (bvule 0 ch))` twice and t2 is `assume (bvule 0 ch)`. The recorded
+    /// conclusion keeps one copy, so as a set it has 43 literals. The set
+    /// resolvent on that pivot has 42: the same literals minus
+    /// `(not (bvule 0 ch))`. The step is a multiset resolution, a sound
+    /// weakening but not the resolution the checker validates. So the producer
+    /// was at fault, not the checker. ca0dd42ad fixed the producer by
+    /// deduplicating these assertions, and backporting that dedup onto
+    /// 075a482ae removed the rejection for this obligation.
+    ///
+    /// This drives the rescue on the real assertion list (two separate repeats,
+    /// interleaved with 128-bit BV terms) and requires the untouched checker to
+    /// accept what it emits.
+    #[test]
+    fn unicode_ident_pdr_query_with_repeated_assertions_rescues_to_a_checkable_chain() {
+        use ay_core::Proof;
+        use ay_frontend::command::Command;
+
+        let input =
+            include_str!("../../../tests/fixtures/unicode_ident_pdr_duplicate_assertions.smt2");
+        // Elaborate the declarations and assertions without solving: the
+        // rescue is driven directly, on the degenerate collapse that arms it.
+        let commands: Vec<Command> = parse(input)
+            .expect("fixture must parse")
+            .into_iter()
+            .filter(|command| !matches!(command, Command::CheckSat))
+            .collect();
+        let mut exec = Executor::new();
+        exec.execute_all(&commands)
+            .expect("fixture declarations and assertions must elaborate");
+        assert_eq!(
+            exec.ctx.assertions_parsed().len(),
+            47,
+            "the fixture's repeated assertions must reach the rescue as authored"
+        );
+
+        let mut proof = Proof::new();
+        proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+        exec.rescue_bv_bitblast_collapse(&mut proof);
+        assert!(
+            !Executor::proof_is_single_empty_trust(&proof),
+            "the rescue must fire on this QF_BV assertion list; got {:#?}",
+            proof.steps
+        );
+
+        let (_summary, error) = ay_proof::check_proof_partial(&proof, &exec.ctx.terms);
+        assert!(
+            error.is_none(),
+            "the rescued refutation must replay through the untouched checker, got {error:?}"
+        );
     }
 }

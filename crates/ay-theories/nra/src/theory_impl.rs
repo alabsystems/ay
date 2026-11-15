@@ -10,6 +10,7 @@ use super::*;
 
 impl TheorySolver for NraSolver<'_> {
     fn assert_literal(&mut self, literal: TermId, value: bool) {
+        self.last_unsat_certificate = None;
         // Undo any tentative patch before asserting new literals —
         // assertions must go into the real scope, not the patch scope.
         self.undo_tentative_patch();
@@ -47,7 +48,7 @@ impl TheorySolver for NraSolver<'_> {
     }
 
     fn check(&mut self) -> TheoryResult {
-        self.check_count += 1;
+        self.check_count = self.check_count.saturating_add(1);
         // Clear the per-check algebraic model witnesses. They are only set
         // again if THIS check proves SAT via the exact Sturm/IVT irrational-root
         // certificate (univariate.rs). Resetting here keeps the model honest:
@@ -68,7 +69,9 @@ impl TheorySolver for NraSolver<'_> {
 
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
         let props = self.lra.propagate();
-        self.propagation_count += props.len() as u64;
+        self.propagation_count = self
+            .propagation_count
+            .saturating_add(u64::try_from(props.len()).unwrap_or(u64::MAX));
         props
     }
 
@@ -83,12 +86,17 @@ impl TheorySolver for NraSolver<'_> {
             ("nra_feasible_set_computations", self.feasible_set_count),
             ("nra_blocked_vars", self.blocked_vars.len() as u64),
             ("nra_fixed_vars", self.fixed_vars.len() as u64),
+            ("nra_icp_calls", self.icp_call_count.get()),
+            ("nra_icp_main_boxes", self.icp_main_box_count.get()),
+            ("nra_icp_pin_boxes", self.icp_pin_box_count.get()),
+            ("nra_icp_wide_tree_caps", self.icp_wide_tree_cap_count.get()),
         ];
         stats.extend(self.lra.collect_statistics());
         stats
     }
 
     fn push(&mut self) {
+        self.last_unsat_certificate = None;
         // Undo tentative patch scope before creating a new real scope
         self.undo_tentative_patch();
         self.scopes.push((
@@ -105,6 +113,7 @@ impl TheorySolver for NraSolver<'_> {
     }
 
     fn pop(&mut self) {
+        self.last_unsat_certificate = None;
         // Undo tentative patch scope before popping the real scope
         self.undo_tentative_patch();
         if let Some((assert_mark, div_mark, div_terms_mark)) = self.scopes.pop() {
@@ -172,6 +181,7 @@ impl TheorySolver for NraSolver<'_> {
         self.fixed_lin_emitted.clear();
         self.registered_atoms.clear();
         self.asserted_atom_set.clear();
+        self.sat_atoms.clear();
         self.algebraic_model.clear();
         self.last_unsat_certificate = None;
         self.lra.reset();
@@ -186,10 +196,12 @@ impl TheorySolver for NraSolver<'_> {
     }
 
     fn assert_shared_equality(&mut self, lhs: TermId, rhs: TermId, reason: &[TheoryLit]) {
+        self.last_unsat_certificate = None;
         self.lra.assert_shared_equality(lhs, rhs, reason);
     }
 
     fn assert_shared_disequality(&mut self, lhs: TermId, rhs: TermId, reason: &[TheoryLit]) {
+        self.last_unsat_certificate = None;
         self.lra.assert_shared_disequality(lhs, rhs, reason);
     }
 
@@ -208,28 +220,57 @@ impl TheorySolver for NraSolver<'_> {
         // suggest phases that are consistent with arithmetic feasibility.
         // If we can compute a feasible set for this atom, suggest the phase
         // that keeps the feasible set non-empty.
-        if let Some((_free_var, fs_true)) = self.compute_literal_feasible_set(atom, true) {
-            if let Some((_free_var, fs_false)) = self.compute_literal_feasible_set(atom, false) {
-                // Prefer the phase that produces a non-empty feasible set
-                let true_empty = fs_true.is_empty();
-                let false_empty = fs_false.is_empty();
-                if true_empty && !false_empty {
-                    return Some(false);
-                }
-                if false_empty && !true_empty {
-                    return Some(true);
-                }
-                // If both are non-empty, prefer the one with a wider feasible set
-                // (more intervals = more flexibility). Fall through to LRA otherwise.
-                if fs_true.num_intervals() > fs_false.num_intervals() {
-                    return Some(true);
-                }
-                if fs_false.num_intervals() > fs_true.num_intervals() {
-                    return Some(false);
-                }
-            }
+        //
+        // #nonlinear-phase-hints: `feasible_set_phase` is the allocation-free,
+        // value-exact form of that decision (its doc carries the derivation);
+        // the previous two-feasible-set body is `feasible_set_phase_reference`
+        // and every debug build checks the two agree on every call.
+        let phase = self.feasible_set_phase(atom);
+        debug_assert_eq!(
+            phase,
+            self.feasible_set_phase_reference(atom),
+            "feasible_set_phase diverged from its reference on atom {atom:?}"
+        );
+        if phase.is_some() {
+            return phase;
         }
         self.lra.suggest_phase(atom)
+    }
+
+    fn register_atom(&mut self, atom: TermId) {
+        // Count the SAT-visible vocabulary for the phase-epoch gate
+        // (#nonlinear-phase-hints). Nothing else changes: the atom is still
+        // parsed by the wrapped solver only when it is first asserted.
+        self.sat_atoms.insert(atom);
+    }
+
+    fn phase_hint_epoch(&self) -> Option<u64> {
+        // `suggest_phase` above is a function of the immutable term store and
+        // of what the wrapped LRA's LRA exposes — `has_value` / `value_sign`
+        // (columns, the assignment, the bounds through the materialisation
+        // delta) for the feasible-set look-ahead, then `suggest_phase` (phase
+        // cache, snapshot, registered atoms, `last_simplex_feasible`) for the
+        // fallback — and `LraSolver::phase_state_epoch` advances on every
+        // mutation of each of those (its doc enumerates the sites). So an
+        // unchanged epoch means every suggestion is unchanged: value-exact.
+        // The DPLL extension's debug canary re-derives every hint on a
+        // skipped seed and asserts exactly that.
+        //
+        // SIZE-GATED at the same floor, for the same reason, as
+        // `LiaSolver::phase_hint_epoch` (#certora-phase-epoch): the skip is
+        // value-exact but not trajectory-exact — a skipped re-seed no longer
+        // overwrites phases that phase-saving flipped between quiescences —
+        // and small crafted greens were measured to depend on that trajectory.
+        // The gate counts the atoms the DPLL layer registered (`sat_atoms`),
+        // not the wrapped solver's `registered_atom_count`, because this lane
+        // registers atoms with the linear solver only on first assertion.
+        const PHASE_EPOCH_MIN_ATOMS: usize = 8192;
+        let atoms = self.sat_atoms.len();
+        if atoms < PHASE_EPOCH_MIN_ATOMS {
+            ay_core::forgone::charge(ay_core::forgone::PHASE_EPOCH_NRA, atoms as u64);
+            return None;
+        }
+        Some(self.lra.phase_state_epoch())
     }
 
     fn supports_theory_aware_branching(&self) -> bool {
@@ -256,13 +297,19 @@ impl TheorySolver for NraSolver<'_> {
         // before using the suggestion, but filtering here avoids wasted
         // feasible-set computation.
 
+        // One materialisation delta for every feasible-set evaluation
+        // below: this suggestion pass is read-only over one LRA model.
+        let mut delta = None;
+
         // Highest priority: unassigned atoms involving blocked variables
         for &blocked_var in &self.blocked_vars {
             for &atom in &self.registered_atoms {
                 if self.asserted_atom_set.contains(&atom) {
                     continue; // Already decided
                 }
-                if let Some((free_var, fs_true)) = self.compute_literal_feasible_set(atom, true) {
+                if let Some((free_var, fs_true)) =
+                    self.compute_literal_feasible_set_with_delta(atom, true, &mut delta)
+                {
                     if free_var == blocked_var {
                         // Suggest the phase that has a non-empty feasible set
                         // (or false if both are empty, to force conflict quickly)
@@ -278,7 +325,9 @@ impl TheorySolver for NraSolver<'_> {
                 if self.asserted_atom_set.contains(&atom) {
                     continue; // Already decided
                 }
-                if let Some((free_var, fs_true)) = self.compute_literal_feasible_set(atom, true) {
+                if let Some((free_var, fs_true)) =
+                    self.compute_literal_feasible_set_with_delta(atom, true, &mut delta)
+                {
                     if free_var == *fixed_var {
                         return Some((atom, !fs_true.is_empty()));
                     }
@@ -293,7 +342,9 @@ impl TheorySolver for NraSolver<'_> {
             if self.asserted_atom_set.contains(&atom) {
                 continue;
             }
-            if let Some((free_var, fs_true)) = self.compute_literal_feasible_set(atom, true) {
+            if let Some((free_var, fs_true)) =
+                self.compute_literal_feasible_set_with_delta(atom, true, &mut delta)
+            {
                 if let Some(fs) = self.feasible_sets.get(&free_var) {
                     if !fs.is_empty() && fs.num_intervals() < 3 {
                         // Variable has a tight feasible set — suggest phase
@@ -304,7 +355,7 @@ impl TheorySolver for NraSolver<'_> {
                             return Some((atom, true));
                         }
                         if let Some((_fv, fs_false)) =
-                            self.compute_literal_feasible_set(atom, false)
+                            self.compute_literal_feasible_set_with_delta(atom, false, &mut delta)
                         {
                             let false_consistent =
                                 !fs_false.is_empty() && !fs.intersection(&fs_false).is_empty();

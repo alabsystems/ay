@@ -22,9 +22,34 @@
 //! (formula, seed) yields byte-identical verdicts and counters on every host.
 //!
 //! Enabled via `--sat-deterministic-inproc` (see
-//! [`deterministic_inproc_enabled`]); default [`DEFAULT_ON`]. The outer
+//! [`deterministic_inproc_enabled`]); default [`DEFAULT_ON`]. That switch is
+//! each solver's starting value: a solver carries its own
+//! (`Solver::set_deterministic_inproc`), so an embedder can make one solve
+//! clock-free, as ay-dpll does for every bit-blast solve under an SMT
+//! `:rlimit`, without changing the process. The outer
 //! `-t <ms>` total-solve timeout is deliberately *not* converted — it is the
 //! user's stated wall-clock budget, not an internal scheduling decision.
+//!
+//! Clock-free since 2026-09-14 (owner decision): under the flag no decision of
+//! the SAT solve reads elapsed time, so runs of one build write byte-identical
+//! proofs under any CPU load. Besides the round, backbone, sweep and
+//! preprocessing walls above, these are counted too:
+//! - the per-round inprocessing overhead behind `adaptive_tick_scale` and the
+//!   arena-compaction bias ([`overhead_ms_equiv`], `solver/det_work.rs`);
+//! - lookahead ([`LOOKAHEAD_TICK_BUDGET`]), gate extraction and
+//!   independent-support gate recovery ([`GATE_EXTRACT_DET_WORK_BUDGET`]), the
+//!   binary backbone's watch scans, and the bounded-backbone backoff;
+//! - the early lucky probes (occurrence visits), the GF(p) probe (elementary
+//!   operations), the indep_enum head start and slice (sized from the
+//!   configured budget, not the time remaining), and ay-xor's XOR finder
+//!   (clauses scanned);
+//! - the BVE cascade, the fastelim intra-round check, the BVE/transred
+//!   proportional guard and the vivify-converge net are off, their counted
+//!   partners in force.
+//!
+//! An UNSAT reached after the deadline or an interrupt is not published
+//! under the flag, and the CLI refuses `--parallel`, `--cube-and-conquer` and
+//! `--fallback-solver` with it. Only the `-t` stop still reads the clock.
 //!
 //! Soundness surface is zero: these budgets schedule *work*, never *truth*.
 //! Verdicts stay guarded regardless of which passes ran or how far each got —
@@ -67,6 +92,41 @@ pub(crate) const BACKBONE_TICK_BUDGET: u64 = 1_500_000;
 /// reproduces the wall cap's "many cheap bounded calls" coverage pattern.
 pub(crate) const BACKBONE_BINARY_TICK_BUDGET: u64 = 3_750_000;
 
+/// Search ticks per millisecond of solver work: the calibration anchor of
+/// [`ROUND_TICK_BUDGET`] (15M ticks for the 2000 ms round guard). Every wall
+/// budget or wall measurement converted under [`deterministic_inproc_enabled`]
+/// is written in milliseconds at this rate, so the constants below read as
+/// the walls they replace. It is also the unit of a check's tick budget
+/// (the development design notes DR-37), so an embedder that turns one of its own wall
+/// windows into ticks (ay-chc's frame stall under an effort, P4a slice 8)
+/// converts at this rate.
+pub const TICKS_PER_MS: u64 = 7_500;
+const _: () = assert!(ROUND_TICK_BUDGET == 2_000 * TICKS_PER_MS);
+
+/// The per-round inprocessing overhead of #8099 (a round's work minus the
+/// work of its timed passes) in counted work: `work_te` tick equivalents,
+/// expressed as the milliseconds `adaptive_tick_scale` and the arena
+/// compaction bias bucket at 1, 3, 8, 10 and 100 ms. A finished round is at
+/// least one unit: zero means "no data" to the readers, which would give the
+/// cheapest rounds the most conservative scale.
+#[inline]
+pub(crate) fn overhead_ms_equiv(work_te: u64) -> f64 {
+    work_te.max(1) as f64 / TICKS_PER_MS as f64
+}
+
+/// Lookahead's 500 ms wall (`LOOKAHEAD_WALL_LIMIT_MS`) in search ticks. The
+/// probes are decisions plus search propagation, so their work lands in
+/// `search_ticks`, the unit [`TICKS_PER_MS`] was measured in.
+pub(crate) const LOOKAHEAD_TICK_BUDGET: u64 = 500 * TICKS_PER_MS;
+
+/// Gate extraction's 2 s wall (`GATE_EXTRACT_TIME_BUDGET_MS`, congruence) as
+/// clause visits: 2,000 ms at [`TICKS_PER_MS`], one visit per tick. The
+/// per-pivot loop charges each pivot's occurrences plus the clause visits of
+/// its ITE base-pair scan. On most formulas the existing 20 x num_clauses
+/// effort budget binds first, as it does against the wall. Independent-support
+/// gate recovery uses the same budget for its own 2 s wall.
+pub(crate) const GATE_EXTRACT_DET_WORK_BUDGET: u64 = 2_000 * TICKS_PER_MS;
+
 /// Whether the deterministic (work-count) inprocessing budgets are active,
 /// resolved once from `--sat-deterministic-inproc`:
 /// - unset  => [`DEFAULT_ON`] (compile-time default)
@@ -76,7 +136,7 @@ pub(crate) const BACKBONE_BINARY_TICK_BUDGET: u64 = 3_750_000;
 /// Cached in a `OnceLock` (mirrors the `AY_AB_*` flag convention) so the hot
 /// per-pass gates never pay an env syscall.
 #[inline]
-pub(crate) fn deterministic_inproc_enabled() -> bool {
+pub fn deterministic_inproc_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match ay_core::sat_ab_switches().deterministic_inproc {
         None => DEFAULT_ON,
@@ -92,3 +152,7 @@ pub(crate) fn round_tick_budget() -> u64 {
     // B25: the recalibration env is retired; the named budget stands.
     ROUND_TICK_BUDGET
 }
+
+#[cfg(test)]
+#[path = "determinism_tests.rs"]
+mod tests;

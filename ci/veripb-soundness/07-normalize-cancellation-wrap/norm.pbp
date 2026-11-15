@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. x1 + ~x1 == 1 >= -9223372036854775808 for either value of x1.
+% Unfixed: normalizing the row cancels the opposite literals and lowers the degree
+% by 1; the unchecked `-=` wraps i64::MIN to i64::MAX, so the trivially true input
+% row is stored as the empty contradiction and `conclusion UNSAT : 1` is accepted.
+f 1 ;
+output NONE;
+conclusion UNSAT : 1 ;
+end pseudo-Boolean proof;

@@ -14,6 +14,7 @@ use super::{
     surface_source_is_bounded, surface_source_work, surface_sources_have_bounded_work,
     ProofSourcePass, ProofSourceWorkEnvelope, MAX_AGGREGATE_SOURCE_WORK, MAX_SURFACE_DEPTH,
 };
+use super::{surface_pass_work_as, SurfaceWorkModel};
 use crate::executor::proof_surface_syntax::{
     surface_override_map_is_bounded, surface_override_roots_have_bounded_work,
 };
@@ -77,12 +78,21 @@ fn one_pass_over_genuinely_oversized_sources_still_fails_closed() {
     let stack: Vec<&FrontendTerm> = std::iter::repeat_n(&row, rows).collect();
 
     assert!(!surface_sources_have_bounded_work(stack.iter().copied()));
-    assert!(!envelope.spend(ProofSourcePass::UnsatProofBuild, stack.iter().copied()));
+    assert!(!envelope.spend(ProofSourcePass::InputSyntaxRewrite, stack.iter().copied()));
     assert_eq!(
         envelope.remaining_for_test(),
         full,
         "a refused pass must not debit the envelope",
     );
+
+    // The build pass is a traversal; a stack one traversal cannot afford is
+    // refused the same way.
+    let per_row = surface_pass_work_as(std::iter::once(&row), SurfaceWorkModel::Traversal)
+        .expect("one row is traversable");
+    let rows = MAX_AGGREGATE_SOURCE_WORK / per_row + 1;
+    let stack: Vec<&FrontendTerm> = std::iter::repeat_n(&row, rows).collect();
+    assert!(!envelope.spend(ProofSourcePass::UnsatProofBuild, stack.iter().copied()));
+    assert_eq!(envelope.remaining_for_test(), full);
 }
 
 /// PARITY: an unbounded root fails closed and debits nothing, at every pass.
@@ -115,8 +125,10 @@ fn passes_drain_one_shared_envelope_until_it_refuses() {
     let row = sized_source(1_024);
     let stack = [&row];
     let per_pass = surface_pass_work(stack.iter().copied()).expect("bounded");
+    let build = surface_pass_work_as(stack.iter().copied(), SurfaceWorkModel::Traversal)
+        .expect("traversable");
     let envelope = ProofSourceWorkEnvelope::default();
-    envelope.set_remaining_for_test(per_pass * 2);
+    envelope.set_remaining_for_test(build + per_pass);
 
     assert!(envelope.spend(ProofSourcePass::UnsatProofBuild, stack.iter().copied()));
     assert_eq!(envelope.remaining_for_test(), per_pass);
@@ -140,20 +152,22 @@ fn every_pass_charges_exactly_the_traversals_it_performs() {
     let row = sized_source(512);
     let stack = [&row];
     let single = surface_pass_work(stack.iter().copied()).expect("bounded");
+    let traversal = surface_pass_work_as(stack.iter().copied(), SurfaceWorkModel::Traversal)
+        .expect("traversable");
 
-    for (pass, expected_passes) in [
-        (ProofSourcePass::UnsatProofBuild, 1usize),
-        (ProofSourcePass::OriginalAssertionRebuild, 3),
-        (ProofSourcePass::InputSyntaxRewrite, 1),
-        (ProofSourcePass::InputSyntaxOverridePairs, 1),
-        (ProofSourcePass::InternalCertificateScope, 1),
+    for (pass, unit, expected_passes) in [
+        (ProofSourcePass::UnsatProofBuild, traversal, 1usize),
+        (ProofSourcePass::OriginalAssertionRebuild, single, 3),
+        (ProofSourcePass::InputSyntaxRewrite, single, 1),
+        (ProofSourcePass::InputSyntaxOverridePairs, single, 1),
+        (ProofSourcePass::InternalCertificateScope, single, 1),
     ] {
         let envelope = ProofSourceWorkEnvelope::default();
         let full = envelope.remaining_for_test();
         assert!(envelope.spend(pass, stack.iter().copied()));
         assert_eq!(
             full - envelope.remaining_for_test(),
-            single * expected_passes,
+            unit * expected_passes,
             "{pass:?} must charge exactly {expected_passes} pass(es)",
         );
     }
@@ -307,4 +321,97 @@ fn dynamic_printer_sources_fail_closed_only_when_live_or_selected() {
         &terms,
         &selected_let,
     ));
+}
+
+/// A traversal pays for each node once; a per-subtree renderer pays for it
+/// once per ancestor. The two models share the depth bound and nothing else.
+#[test]
+fn traversal_model_prices_one_visit_per_node_under_its_own_ceilings() {
+    use super::{
+        surface_source_work_probe_as, SurfaceSourceRefusal, SurfaceWorkModel,
+        MAX_AGGREGATE_SOURCE_WORK, MAX_TRAVERSAL_NODES,
+    };
+
+    // Past the per-subtree node ceiling, well inside the traversal's: the
+    // traversal charge is exactly four times the rendered bytes at depth 0
+    // and 1 — `(and` + 20_000 argument separators + parentheses, plus one byte
+    // per leaf.
+    let wide = FrontendTerm::App(
+        "and".to_string(),
+        vec![FrontendTerm::Symbol("p".to_string()); 20_000],
+    );
+    assert_eq!(
+        surface_source_work_probe_as(&wide, SurfaceWorkModel::PerSubtree),
+        Err(SurfaceSourceRefusal::Nodes)
+    );
+    assert_eq!(
+        surface_source_work_probe_as(&wide, SurfaceWorkModel::Traversal),
+        Ok(4 * ((3 + 20_000 + 2) + 20_000))
+    );
+
+    // The node ceiling of a traversal is its own.
+    let too_many = FrontendTerm::App(
+        "and".to_string(),
+        vec![FrontendTerm::Symbol("p".to_string()); MAX_TRAVERSAL_NODES],
+    );
+    assert_eq!(
+        surface_source_work_probe_as(&too_many, SurfaceWorkModel::Traversal),
+        Err(SurfaceSourceRefusal::Nodes)
+    );
+
+    // The depth bound is shared: the recursive passes a traversal admits
+    // still recurse.
+    let mut deep = FrontendTerm::Symbol("p".to_string());
+    for _ in 0..=MAX_SURFACE_DEPTH {
+        deep = FrontendTerm::App("not".to_string(), vec![deep]);
+    }
+    for model in [SurfaceWorkModel::PerSubtree, SurfaceWorkModel::Traversal] {
+        assert_eq!(
+            surface_source_work_probe_as(&deep, model),
+            Err(SurfaceSourceRefusal::Depth)
+        );
+    }
+
+    // One root may not cost more than the query's whole source envelope.
+    let heavy = FrontendTerm::Symbol("h".repeat(MAX_AGGREGATE_SOURCE_WORK / 4 + 1));
+    assert_eq!(
+        surface_source_work_probe_as(&heavy, SurfaceWorkModel::Traversal),
+        Err(SurfaceSourceRefusal::Bytes)
+    );
+    let fits = FrontendTerm::Symbol("h".repeat(MAX_AGGREGATE_SOURCE_WORK / 4));
+    assert_eq!(
+        surface_source_work_probe_as(&fits, SurfaceWorkModel::Traversal),
+        Ok(MAX_AGGREGATE_SOURCE_WORK)
+    );
+}
+
+/// Only the proof build is a traversal; every other metered pass renders per
+/// subtree and still refuses a root past the per-subtree bound.
+#[test]
+fn only_the_build_pass_is_priced_as_a_traversal() {
+    let wide = FrontendTerm::App(
+        "and".to_string(),
+        vec![FrontendTerm::Symbol("p".to_string()); 20_000],
+    );
+    let envelope = ProofSourceWorkEnvelope::default();
+    for pass in [
+        ProofSourcePass::OriginalAssertionRebuild,
+        ProofSourcePass::AuthoredConjunctEvalRebuild,
+        ProofSourcePass::AuthoredFoldIdentityScan,
+        ProofSourcePass::AuthoredFoldIdentityRebuild,
+        ProofSourcePass::InputSyntaxRewrite,
+        ProofSourcePass::InputSyntaxOverridePairs,
+        ProofSourcePass::InternalCertificateScope,
+    ] {
+        assert!(
+            !envelope.spend(pass, std::iter::once(&wide)),
+            "{pass:?} renders per subtree and must refuse the root"
+        );
+    }
+    assert_eq!(envelope.remaining_for_test(), MAX_AGGREGATE_SOURCE_WORK);
+    assert!(envelope.spend(ProofSourcePass::UnsatProofBuild, std::iter::once(&wide)));
+    assert_eq!(
+        envelope.remaining_for_test(),
+        MAX_AGGREGATE_SOURCE_WORK - 4 * ((3 + 20_000 + 2) + 20_000)
+    );
 }

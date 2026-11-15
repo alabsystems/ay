@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the same unguarded bookkeeping in the i128 fallback of `Clause::add`.
+% The degree sum is i128::MIN + 1 and merging the three unit literals against the
+% coefficient-3 negated literals cancels 3, so the true degree is i128::MIN - 2. The
+% formula is satisfiable (x1 true).
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

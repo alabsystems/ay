@@ -22,17 +22,17 @@
 //! datatype-element array variables of exactly two shapes —
 //!
 //! * alias equalities `(= a b)` between two free array variables, and
-//! * ground element reads `(= <ground> (select a i))` /
-//!   `(= <ground> (fld (select a i)))` whose index and ground side evaluate
+//! * ground element reads `(= <ground> (select a i))` or bounded named
+//!   selector paths over that read, whose index and ground side evaluate
 //!   under the fixed partial model —
 //!
 //! then union-find the alias classes and collect, per class, the
 //! `(index-value, slot) -> value` REQUIREMENTS from the residue plus the
 //! PINNED reads over class members the evaluator did resolve (see below). The
-//! residue is jointly satisfiable iff no two collected entries force
-//! different values at one `(class, index, field)` slot — whole-element
-//! values are reconciled with field values by exact constructor projection,
-//! and the constrained fields of one element must fit a single constructor.
+//! requirements must agree at every `(class, index, field-path)` slot.
+//! Whole-element and ancestor values are reconciled with descendant values
+//! by exact constructor projection, and each node must fit one real declared
+//! constructor. Bounded synthesis can still refuse a satisfiable requirement.
 //! The decision then MATERIALIZES that proof as one bounded
 //! `(default, finite-store)` value per alias class, overlays those values on
 //! every class member, and runs the ordinary independent model checker again
@@ -97,8 +97,8 @@
 //!    grow and computed values are stable, so a probe seen `Unevaluable` at
 //!    the end proves no pin over that term was ever consulted). A probe that
 //!    yields a value is localized into the entry map when the term is a
-//!    direct `(select m i)` / `(fld (select m i))` read with an evaluable
-//!    index, and refuses otherwise.
+//!    `(select m i)` or authenticated selector path with an evaluable index,
+//!    including every committed ancestor prefix, and refuses otherwise.
 //! 4. The witness is local to this PROVED residual fragment. It never adopts
 //!    the solver's canonical const-array or committed store chain (the former
 //!    was proven unsound on `qf_abv_incremental_false_unsat`). Defaults and
@@ -112,16 +112,18 @@
 use std::collections::{HashMap, HashSet};
 
 use ay_core::term::{Symbol, TermData};
-use ay_core::{DatatypeSort, Sort, TermId, TermStore};
+use ay_core::{Sort, TermId, TermStore};
 
 use crate::dt_axiom::DtResolve;
 use crate::{is_datatype_tautology_with, EvalOutcome, Evaluator, ModelValue, ModelView};
 
+mod path;
 mod witness;
 pub(super) use witness::MAX_WITNESS_ENTRIES;
 #[cfg(test)]
 pub(super) use witness::MAX_WITNESS_VALUE_WORK;
-use witness::{account_entry_values, materialize_and_replay, Entry, Slot};
+use witness::{account_entry_values, materialize_and_replay, AccessStep, Entry, Slot};
+pub use witness::{ArrayCompletion, CompletedArrayAssignment, ModelConfirmation};
 
 /// Recursion bound for the residual-constraint classifier (top-level Boolean
 /// structure only; residual assertions are shallow in practice).
@@ -143,17 +145,16 @@ pub(super) const MAX_WITNESS_MEMBERS: usize = 256;
 pub(super) const MAX_OCCURRENCE_NODES: usize = 16_384;
 
 /// Decide whether the unevaluable `residue` is exactly the free-datatype-array
-/// fragment AND jointly satisfiable, so the confirmed partial model provably
-/// extends to a full model. `true` ⇒ the caller may return `ConfirmedSat`;
-/// `false` ⇒ keep the fail-closed `CannotConfirm`.
-pub(crate) fn free_dt_array_residue_extends(
-    terms: &TermStore,
-    model: &dyn ModelView,
+/// fragment AND jointly satisfiable. Retain the exact replayed extension;
+/// `None` keeps the fail-closed `CannotConfirm` outcome.
+pub(crate) fn free_dt_array_residue_extends<'a>(
+    terms: &'a TermStore,
+    model: &'a dyn ModelView,
     ev: &Evaluator<'_>,
-    assertions: &[TermId],
+    assertions: &'a [TermId],
     residue: &[TermId],
     resolve: &DtResolve<'_>,
-) -> bool {
+) -> Option<ArrayCompletion<'a>> {
     let mut cx = Classifier {
         terms,
         model,
@@ -167,14 +168,14 @@ pub(crate) fn free_dt_array_residue_extends(
     };
     for &a in residue {
         if !cx.classify(a, 0) {
-            return false;
+            return None;
         }
     }
     if cx.aliases.is_empty() && cx.entries.is_empty() {
         // Nothing was classified (e.g. every residual assertion meanwhile
         // re-evaluated `true`): not the free-dt-array fragment — keep today's
         // fail-closed behaviour rather than widen the gate's contract.
-        return false;
+        return None;
     }
     let alias_eqs: HashSet<TermId> = cx.alias_eq_terms.iter().copied().collect();
 
@@ -184,28 +185,29 @@ pub(crate) fn free_dt_array_residue_extends(
     let mut members: HashSet<TermId> = HashSet::new();
     for &(l, r) in &cx.aliases {
         if members.insert(l) && members.len() > MAX_WITNESS_MEMBERS {
-            return false;
+            return None;
         }
         if members.insert(r) && members.len() > MAX_WITNESS_MEMBERS {
-            return false;
+            return None;
         }
         union(&mut uf, l, r);
     }
     for e in &cx.entries {
         if members.insert(e.array) && members.len() > MAX_WITNESS_MEMBERS {
-            return false;
+            return None;
         }
     }
 
-    // Occurrence guard over the whole (non-quantifier) assertion DAG, and
+    // Occurrence guard over the whole assertion DAG, including quantified bodies, and
     // collection of every pin SITE over the classes.
     let mut select_sites: Vec<TermId> = Vec::new();
-    // (site, inner array member, inner index term, field name)
-    let mut chain_sites: Vec<(TermId, TermId, TermId, String)> = Vec::new();
-    let mut other_selector_sites: Vec<TermId> = Vec::new();
+    // Every prefix is retained separately, including pinned ancestor values.
+    let mut chain_sites: Vec<(TermId, TermId, TermId, Slot)> = Vec::new();
+    let mut other_read_sites: Vec<TermId> = Vec::new();
+    let mut store_edges = path::StoreEdges::default();
     let mut contains_memo: HashMap<TermId, bool> = HashMap::new();
     if assertions.len() > MAX_OCCURRENCE_NODES {
-        return false;
+        return None;
     }
     let mut stack: Vec<TermId> = assertions.to_vec();
     let mut seen: HashSet<TermId> = HashSet::new();
@@ -214,88 +216,121 @@ pub(crate) fn free_dt_array_residue_extends(
             continue;
         }
         if seen.len() > MAX_OCCURRENCE_NODES {
-            return false;
+            return None;
         }
         match terms.get(t) {
             TermData::App(sym, args) => {
                 if !pending_nodes_fit(seen.len(), stack.len(), args.len(), MAX_OCCURRENCE_NODES) {
-                    return false;
+                    return None;
                 }
-                let is_select = sym.name() == "select" && args.len() == 2;
+                let is_select = matches!(sym, Symbol::Named(name) if name == "select")
+                    && !terms.is_declared_function("select")
+                    && args.len() == 2;
                 let blessed_eq = alias_eqs.contains(&t);
-                for (pos, &c) in args.iter().enumerate() {
-                    if members.contains(&c) && !((is_select && pos == 0) || blessed_eq) {
-                        return false; // member escapes the blessed contexts
-                    }
-                }
                 if is_select && members.contains(&args[0]) {
                     select_sites.push(t);
+                } else if is_select && contains_member(terms, t, &members, &mut contains_memo)? {
+                    // Nested selects have the same committed per-read fallback
+                    // as direct reads. Preserve every such pin, including reads
+                    // in already-true assertions and unselected Boolean arms.
+                    match cx.parse_read_with_stores(t) {
+                        Some(read) if members.contains(&read.array) => {
+                            store_edges.admit(read.store_edges, &mut cx)?;
+                            chain_sites.push((t, read.array, read.index, read.slot));
+                        }
+                        _ => other_read_sites.push(t),
+                    }
                 }
                 // Selector-shaped unary application whose argument depends on
                 // a member: the ONE pin site that can commit a value without
                 // evaluating its argument (`eval_selector_via_model`).
                 if let (Symbol::Named(name), [arg]) = (sym, args.as_slice()) {
-                    let contains = if cx.selector_shaped(name, *arg) {
-                        let Some(contains) =
-                            contains_member(terms, *arg, &members, &mut contains_memo)
-                        else {
-                            return false;
-                        };
-                        contains
-                    } else {
-                        false
+                    let Some(contains) = contains_member(terms, *arg, &members, &mut contains_memo)
+                    else {
+                        return None;
                     };
                     if contains {
-                        match cx.direct_chain(t, *arg, name) {
-                            Some((m, i)) => chain_sites.push((t, m, i, name.to_string())),
-                            None => other_selector_sites.push(t),
+                        let Some(selector_shaped) = cx.selector_shaped(name, *arg) else {
+                            return None;
+                        };
+                        if selector_shaped {
+                            match cx.parse_read_with_stores(t) {
+                                Some(read) if members.contains(&read.array) => {
+                                    store_edges.admit(read.store_edges, &mut cx)?;
+                                    chain_sites.push((t, read.array, read.index, read.slot));
+                                }
+                                _ => other_read_sites.push(t),
+                            }
                         }
+                    }
+                }
+                // Authenticate a consuming read before descending into its
+                // missed stores. Check EVERY incoming use even for seen DAG
+                // children, so one valid miss never blesses a store equation.
+                for (pos, &child) in args.iter().enumerate() {
+                    let allowed_store_edge = store_edges.permits(t, child, pos);
+                    if members.contains(&child)
+                        && !((is_select && pos == 0) || blessed_eq || allowed_store_edge)
+                    {
+                        return None;
+                    }
+                    if path::is_store(terms, child)
+                        && contains_member(terms, child, &members, &mut contains_memo)?
+                        && !allowed_store_edge
+                    {
+                        return None;
                     }
                 }
                 stack.extend(args.iter().copied());
             }
-            // Quantifier bodies are never evaluated by the gate (the evaluator
-            // fails at the quantifier node itself, adopting no pins), so they
-            // cannot constrain the extension; do not descend.
-            TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {}
+            // Finite quantifier bodies now evaluate in the gate and may
+            // constrain this extension. The generic walk includes their bodies
+            // (but not solver-search triggers), conservatively retaining pins.
             data => {
                 let Some(child_count) = term_child_count(data) else {
-                    return false;
+                    return None;
                 };
                 if !pending_nodes_fit(seen.len(), stack.len(), child_count, MAX_OCCURRENCE_NODES) {
-                    return false;
+                    return None;
                 }
                 let mut escaped = false;
                 if for_each_term_child(data, |c| {
-                    if members.contains(&c) {
+                    if members.contains(&c)
+                        || (path::is_store(terms, c)
+                            && contains_member(terms, c, &members, &mut contains_memo)
+                                != Some(false))
+                    {
                         escaped = true;
                     }
                     stack.push(c);
                 })
                 .is_none()
                 {
-                    return false;
+                    return None;
                 }
                 if escaped {
-                    return false; // member under a non-App context (ite/not/let)
+                    return None; // member under a non-App context (ite/not/let)
                 }
             }
         }
     }
 
+    if cx.classify_work > MAX_CLASSIFY_WORK {
+        return None; // an exhausted selector census must never hide a pin
+    }
     // Probe every pin site LAST (final pin-graph state). A resolvable direct
     // read is LOCALIZED as an entry; anything else resolvable refuses.
     for t in select_sites {
         let TermData::App(_, args) = terms.get(t) else {
-            return false; // unreachable by construction
+            return None; // unreachable by construction
         };
         let (arr, idx_term) = (args[0], args[1]);
         if let EvalOutcome::Value(v) = ev.evaluate(t) {
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
-                return false; // pinned read at an unkeyable index
+                return None; // pinned read at an unkeyable index
             };
             let Sort::Array(array_sort) = terms.sort(arr) else {
-                return false;
+                return None;
             };
             if terms.sort(idx_term) != &array_sort.index_sort
                 || terms.sort(t) != &array_sort.element_sort
@@ -306,7 +341,7 @@ pub(crate) fn free_dt_array_residue_extends(
                     .ensure_value_inhabits_sort(&v, &array_sort.element_sort)
                     .is_err()
             {
-                return false;
+                return None;
             }
             if !cx.push_entry(Entry {
                 array: arr,
@@ -314,17 +349,17 @@ pub(crate) fn free_dt_array_residue_extends(
                 slot: Slot::Whole,
                 value: v,
             }) {
-                return false;
+                return None;
             }
         }
     }
-    for (t, m, idx_term, fld) in chain_sites {
+    for (t, m, idx_term, slot) in chain_sites {
         if let EvalOutcome::Value(v) = ev.evaluate(t) {
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
-                return false; // pinned field read at an unkeyable index
+                return None; // pinned field read at an unkeyable index
             };
             let Sort::Array(array_sort) = terms.sort(m) else {
-                return false;
+                return None;
             };
             if terms.sort(idx_term) != &array_sort.index_sort
                 || ev
@@ -332,21 +367,21 @@ pub(crate) fn free_dt_array_residue_extends(
                     .is_err()
                 || ev.ensure_value_inhabits_sort(&v, terms.sort(t)).is_err()
             {
-                return false;
+                return None;
             }
             if !cx.push_entry(Entry {
                 array: m,
                 index,
-                slot: Slot::Field(fld),
+                slot,
                 value: v,
             }) {
-                return false;
+                return None;
             }
         }
     }
-    for t in other_selector_sites {
+    for t in other_read_sites {
         if matches!(ev.evaluate(t), EvalOutcome::Value(_)) {
-            return false; // committed pin that cannot be localized
+            return None; // committed pin that cannot be localized
         }
     }
 
@@ -368,7 +403,7 @@ pub(crate) fn free_dt_array_residue_extends(
 }
 
 /// Classification state: the alias edges, the classified alias-equality terms
-/// (the ONLY blessed non-`select` occurrence context), and the entry map
+/// (with separately authenticated store-miss receiver edges), and the entry map
 /// (requirements now; pinned reads are appended by the probe phase).
 struct Classifier<'a> {
     terms: &'a TermStore,
@@ -382,12 +417,14 @@ struct Classifier<'a> {
     witness_value_work: usize,
 }
 
-impl Classifier<'_> {
+impl<'a> Classifier<'a> {
     fn spend_classify_work(&mut self, amount: usize) -> bool {
         let Some(next) = self.classify_work.checked_add(amount) else {
+            self.classify_work = MAX_CLASSIFY_WORK + 1;
             return false;
         };
         if next > MAX_CLASSIFY_WORK {
+            self.classify_work = MAX_CLASSIFY_WORK + 1;
             return false;
         }
         self.classify_work = next;
@@ -407,7 +444,12 @@ impl Classifier<'_> {
         if self.entries.len() >= MAX_WITNESS_ENTRIES {
             return false;
         }
-        if !account_entry_values(&mut self.witness_value_work, &entry.index, &entry.value) {
+        if !account_entry_values(
+            &mut self.witness_value_work,
+            &entry.index,
+            &entry.value,
+            &entry.slot,
+        ) {
             return false;
         }
         self.entries.push(entry);
@@ -534,6 +576,11 @@ impl Classifier<'_> {
                 return false;
             };
             let read_sort = self.terms.sort(read_side);
+            if !path::metadata::sort_work(self.terms.sort(ground_side), 0, &mut |n| {
+                self.spend_classify_work(n)
+            }) {
+                return false;
+            }
             if read_sort != self.terms.sort(ground_side)
                 || self
                     .ev
@@ -558,95 +605,44 @@ impl Classifier<'_> {
 
     /// `t` as a FREE datatype-element array variable: a `Var` leaf of sort
     /// `(Array _ DT)` the model does not pin. Returns its sort.
-    fn free_dt_array_var(&self, t: TermId) -> Option<Sort> {
+    fn free_dt_array_var(&mut self, t: TermId) -> Option<&'a Sort> {
         if !matches!(self.terms.get(t), TermData::Var(_, _)) {
             return None;
         }
-        let sort = self.terms.sort(t).clone();
-        let Sort::Array(arr) = &sort else {
+        let sort = self.terms.sort(t);
+        if !path::metadata::sort_work(sort, 0, &mut |n| self.spend_classify_work(n)) {
+            return None;
+        }
+        let Sort::Array(arr) = sort else {
             return None;
         };
-        element_dt(&arr.element_sort, self.resolve)?;
+        if !matches!(&arr.element_sort, Sort::Datatype(_)) {
+            path::metadata::datatype(&arr.element_sort, self.resolve, &mut |n| {
+                self.spend_classify_work(n)
+            })?;
+        }
         if self.model.leaf_value(t).is_some() {
             return None; // pinned ⇒ not free ⇒ out of this fragment
         }
         Some(sort)
     }
 
-    /// Parse `(select a i)` / `(fld (select a i))` over a free array variable.
-    fn parse_free_read(&self, t: TermId) -> Option<(TermId, TermId, Slot)> {
-        match self.terms.get(t) {
-            TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
-                let (a, i) = (args[0], args[1]);
-                let sort = self.free_dt_array_var(a)?;
-                let Sort::Array(array_sort) = sort else {
-                    return None;
-                };
-                if self.terms.sort(i) != &array_sort.index_sort
-                    || self.terms.sort(t) != &array_sort.element_sort
-                {
-                    return None;
-                }
-                Some((a, i, Slot::Whole))
-            }
-            TermData::App(Symbol::Named(name), args) if args.len() == 1 => {
-                let (a, i) = self.direct_chain(t, args[0], name)?;
-                Some((a, i, Slot::Field(name.to_string())))
-            }
-            _ => None,
-        }
-    }
-
-    /// `arg` as the inner read of a DIRECT selector chain `(name (select m i))`
-    /// over a free member array whose element datatype declares exactly one
-    /// field `name` with the selector term's result sort.
-    fn direct_chain(&self, selector: TermId, arg: TermId, name: &str) -> Option<(TermId, TermId)> {
-        let TermData::App(isym, iargs) = self.terms.get(arg) else {
-            return None;
-        };
-        if isym.name() != "select" || iargs.len() != 2 {
-            return None;
-        }
-        let (a, i) = (iargs[0], iargs[1]);
-        let sort = self.free_dt_array_var(a)?;
-        let Sort::Array(arr) = &sort else {
-            return None;
-        };
-        if self.terms.sort(i) != &arr.index_sort || self.terms.sort(arg) != &arr.element_sort {
-            return None;
-        }
-        let dt = element_dt(&arr.element_sort, self.resolve)?;
-        let mut fields = dt
-            .constructors
-            .iter()
-            .flat_map(|constructor| &constructor.fields)
-            .filter(|field| field.name == name);
-        let field = fields.next()?;
-        if fields.next().is_some() || self.terms.sort(selector) != &field.sort {
-            return None;
-        }
-        Some((a, i))
-    }
-
     /// Whether `(name arg)` is selector-shaped: `arg` is datatype-sorted and
     /// `name` is a field of that datatype — the exact precondition of the
     /// evaluator's `eval_selector_via_model` pin site.
-    fn selector_shaped(&self, name: &str, arg: TermId) -> bool {
-        let Some(dt) = element_dt(self.terms.sort(arg), self.resolve) else {
-            return false;
+    fn selector_shaped(&mut self, name: &str, arg: TermId) -> Option<bool> {
+        let Some(dt) =
+            path::metadata::datatype_shape(self.terms.sort(arg), self.resolve, &mut |n| {
+                self.spend_classify_work(n)
+            })?
+        else {
+            return Some(false);
         };
-        dt.constructors
-            .iter()
-            .any(|c| c.fields.iter().any(|f| f.name == name))
-    }
-}
-
-/// Resolve a sort to its datatype definition (native or registry-abstracted).
-fn element_dt(sort: &Sort, resolve: &DtResolve<'_>) -> Option<DatatypeSort> {
-    match sort {
-        Sort::Datatype(dt) => Some(dt.clone()),
-        Sort::Uninterpreted(name) => resolve(name),
-        _ => None,
+        Some(
+            dt.constructors
+                .iter()
+                .any(|c| c.fields.iter().any(|f| f.name == name)),
+        )
     }
 }
 
@@ -655,7 +651,7 @@ fn element_dt(sort: &Sort, resolve: &DtResolve<'_>) -> Option<DatatypeSort> {
 /// `TermData` is non-exhaustive across the crate boundary. An unknown future
 /// variant returns `None`, so this proof-oriented path fails closed until its
 /// child semantics are reviewed explicitly.
-fn for_each_term_child(data: &TermData, mut visit: impl FnMut(TermId)) -> Option<()> {
+pub(crate) fn for_each_term_child(data: &TermData, mut visit: impl FnMut(TermId)) -> Option<()> {
     match data {
         TermData::Const(_) | TermData::Var(_, _) => {}
         TermData::App(_, arguments) => {
@@ -681,7 +677,7 @@ fn for_each_term_child(data: &TermData, mut visit: impl FnMut(TermId)) -> Option
     Some(())
 }
 
-fn term_child_count(data: &TermData) -> Option<usize> {
+pub(crate) fn term_child_count(data: &TermData) -> Option<usize> {
     match data {
         TermData::Const(_) | TermData::Var(_, _) => Some(0),
         TermData::App(_, arguments) => Some(arguments.len()),

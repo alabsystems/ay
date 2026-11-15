@@ -481,3 +481,6 @@ fn shadowed_to_real_block_stays_unknown() {
     assert!(!progressed);
     assert_eq!(goal[0], original);
 }
+
+#[path = "qe_prepass_parity_tests.rs"]
+mod parity_shape;

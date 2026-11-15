@@ -92,6 +92,13 @@ impl UnknownOrigin {
             }
             Self::MemoryBudget => "executor/check_sat.rs::should_abort_theory_loop",
             Self::InterruptFlag => "executor/check_sat.rs::should_abort_theory_loop",
+            // The audited family. This origin has other publication sites; the
+            // one outside the executor's check-sat is a decision query's
+            // `ExecutorError::UnsupportedLogic` refusal (no combined decision
+            // procedure for the theory mix), which the native API's
+            // `api/solving/check.rs::record_executor_failure_unknown` and the
+            // CLI publish through
+            // `executor/lifecycle/unknown_publication.rs::replace_last_result_with_executor_error`.
             Self::IncompleteSolverLane => "executor/check_sat.rs::check_sat_guarded",
             Self::VerdictCertification => {
                 "executor/unsat_cert.rs::reject_uncertified_verdict_for_publication"
@@ -117,6 +124,9 @@ impl UnknownOrigin {
                 "executor/check_sat.rs::contains_symbolic_integer_power"
             }
             Self::UnsupportedMixedCollection => "executor/theories/seq.rs::solve_seq_auflia",
+            // Every executor error a decision query ends in except
+            // `UnsupportedLogic`, which this recorder publishes as
+            // `IncompleteSolverLane` (`ExecutorError::unknown_reason`).
             Self::ExecutorFailure => "api/solving/check.rs::record_executor_failure_unknown",
             Self::UntaggedSolverUnknown => {
                 "executor/lifecycle/unknown_publication.rs::finalize_unknown_publication"

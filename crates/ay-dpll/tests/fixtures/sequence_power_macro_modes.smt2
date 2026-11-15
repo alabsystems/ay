@@ -1,0 +1,7 @@
+(set-logic ALL)
+(define-fun triple ((x String)) String (str.power x 3))
+(declare-const s String)
+(simplify (triple s))
+(assert (= s "ab"))
+(assert (distinct (triple s) "ababab"))
+(check-sat)

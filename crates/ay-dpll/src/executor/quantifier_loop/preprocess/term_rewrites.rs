@@ -369,7 +369,9 @@ fn reduce_selectors_rec(
                     }
                     if folded.is_none() {
                         if let Some(tested) = name.strip_prefix("is-") {
-                            if ctor_sels.contains_key(tested) && ctor_sels.contains_key(ctor.as_str()) {
+                            if ctor_sels.contains_key(tested)
+                                && ctor_sels.contains_key(ctor.as_str())
+                            {
                                 folded = Some(if tested == ctor {
                                     terms.true_term()
                                 } else {

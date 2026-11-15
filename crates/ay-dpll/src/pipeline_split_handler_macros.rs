@@ -259,6 +259,8 @@ macro_rules! pipeline_encode_model_equality {
 /// Shared across all 4 split-loop arms (#5814 Packet B). The `pre_store` block
 /// runs between TseitinResult construction and the store call — use it for
 /// arm-specific cleanup (`solver.pop()`, `theory.unset_terms()`, or `{}`).
+/// Checked extraction refusal runs the same cleanup before breaking with its
+/// typed error, without building placeholder maps or entering model storage.
 macro_rules! pipeline_store_sat_model {
     ($loop_label:lifetime, $self:expr, $solver:expr, $model:expr,
      $local_term_to_var:expr, $local_var_to_term:expr, $local_next_var:expr,
@@ -266,7 +268,14 @@ macro_rules! pipeline_store_sat_model {
      pre_store: { $($pre_store:tt)* }) => {{
         let _psm_extract_start = ay_core::time::Instant::now();
         let $theory_var = &mut $theory;
-        let _psm_models = $extract;
+        let _psm_models = match $crate::executor::theories::solve_harness::model_extraction_result($extract) {
+            Ok(models) => models,
+            Err(error) => {
+                $timing.model_extract += _psm_extract_start.elapsed();
+                $($pre_store)*
+                break $loop_label Err($self.terminal_model_extraction_error(error));
+            }
+        };
         $timing.model_extract += _psm_extract_start.elapsed();
 
         let _psm_fake_result = ay_core::TseitinResult::new(
@@ -305,6 +314,7 @@ macro_rules! pipeline_build_eager_extension {
      $added_refinement_clauses:expr, $added_axioms:expr,
      $eager_stats:expr, $timing:expr, $state:expr,
      should_stop: $should_stop:expr,
+     installed_theory_lemmas: $installed_theory_lemmas:expr,
      bound_axioms_pre_injected: $axioms_pre_injected:expr,
      bound_axiom_cache_key: $axiom_cache_key:expr) => {{
         // #8103: Skip bound axiom generation+validation on iterations > 0.
@@ -334,10 +344,12 @@ macro_rules! pipeline_build_eager_extension {
                 None,
             )
         }
+        .with_installed_theory_lemmas(&$installed_theory_lemmas, &$should_stop)
         .with_inline_bound_refinement_replay(&$added_refinement_clauses)
         // T3: forward the executor's wall-clock deadline so propagate_impl()
         // can terminate a diverging theory churn (see extension/propagate.rs).
         .with_solve_deadline($self.solve_deadline.get())
+        .with_theory_every_decision(!$self.no_theory_every_decision)
         // #AUFLIA-support: forward the Executor's accumulated unconditional-
         // Forall ground instances so the eager check()/propagate() conflict
         // verifiers can reprove conflicts that depend on them.
@@ -421,6 +433,7 @@ macro_rules! pipeline_build_eager_extension {
      $added_refinement_clauses:expr, $added_axioms:expr,
      $eager_stats:expr, $timing:expr, $state:expr,
      should_stop: $should_stop:expr,
+     installed_theory_lemmas: $installed_theory_lemmas:expr,
      cached_ext_data: $cached:expr,
      use_continue_solving: $use_continue:expr,
      use_resume_solving: $use_resume:expr,
@@ -474,10 +487,12 @@ macro_rules! pipeline_build_eager_extension {
                 None,
             )
         }
+        .with_installed_theory_lemmas(&$installed_theory_lemmas, &$should_stop)
         .with_inline_bound_refinement_replay(&$added_refinement_clauses)
         // T3: forward the executor's wall-clock deadline so propagate_impl()
         // can terminate a diverging theory churn (see extension/propagate.rs).
         .with_solve_deadline($self.solve_deadline.get())
+        .with_theory_every_decision(!$self.no_theory_every_decision)
         // #AUFLIA-support: forward the Executor's accumulated unconditional-
         // Forall ground instances so the eager check()/propagate() conflict
         // verifiers can reprove conflicts that depend on them.
@@ -519,10 +534,12 @@ macro_rules! pipeline_build_eager_extension {
         // #8256: Budget-exhausted continuation strategies.
         //
         // Three modes, in order of preference:
-        //   1. resume_solving — O(1), re-enters CDCL loop without any state reset.
-        //      Used for the first budget-exhausted continuation. Preserves the
-        //      entire trail, all learned clauses, VSIDS/CHB state. The theory
-        //      extension has warm_trail_position set to skip assertion replay.
+        //   1. resume_solving — re-enters the CDCL loop after a restart: the
+        //      trail above level 0 is backtracked (a stop can leave a found
+        //      conflict unanalysed on it; P4a), while all learned clauses,
+        //      VSIDS/CHB state and saved phases stay. Used for the first
+        //      budget-exhausted continuation. The theory extension has
+        //      warm_trail_position set to skip assertion replay.
         //   2. continue_solving — O(trail + learned), resets trail and flushes
         //      non-core learned clauses. Used as fallback when resume_solving
         //      stalls (3 consecutive budget-exhausted iterations with < 50

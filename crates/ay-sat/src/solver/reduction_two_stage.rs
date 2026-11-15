@@ -198,6 +198,13 @@ fn two_stage_score_bucket(score: u16) -> usize {
 }
 
 impl Solver {
+    /// Whether the two-stage scores are maintained: while the policy is on,
+    /// and from conflict 1 under `--sat-two-stage-warm-scores-kissat`.
+    #[inline(always)]
+    pub(super) fn two_stage_scoring(&self) -> bool {
+        self.two_stage_clause_management || self.two_stage_warm
+    }
+
     /// `OnLearnedClause(c)`: `score(c) <- 1`.
     ///
     /// Called from the single clause-creation choke point
@@ -208,7 +215,7 @@ impl Solver {
     /// which is the exact failure mode stage 2 exists to prevent.
     #[inline]
     pub(super) fn two_stage_note_learned(&mut self, clause_idx: usize) {
-        debug_assert!(self.two_stage_clause_management);
+        debug_assert!(self.two_stage_scoring());
         self.arena.set_two_stage_score(clause_idx, 1);
         self.stats.two_stage_learned_inits += 1;
     }
@@ -219,7 +226,7 @@ impl Solver {
     /// check is first and is a load from the HOT section of `Solver`.
     #[inline(always)]
     pub(super) fn two_stage_note_bcp_use(&mut self, reason: ClauseRef) {
-        if !self.two_stage_clause_management {
+        if !self.two_stage_scoring() {
             return;
         }
         if self.two_stage_bump_score(reason.0 as usize) {
@@ -230,7 +237,7 @@ impl Solver {
     /// `OnClauseUse(c)` for the conflict-analysis half: `c` was a reason.
     #[inline]
     pub(super) fn two_stage_note_analysis_use(&mut self, clause_idx: usize) {
-        debug_assert!(self.two_stage_clause_management);
+        debug_assert!(self.two_stage_scoring());
         if self.two_stage_bump_score(clause_idx) {
             self.stats.two_stage_analysis_bumps += 1;
         }
@@ -263,7 +270,7 @@ impl Solver {
     /// is set. Cost is one arena flags read-modify-write per learned clause
     /// every 4096 conflicts.
     pub(super) fn two_stage_periodic_decay_if_due(&mut self) {
-        if !self.two_stage_clause_management {
+        if !self.two_stage_scoring() {
             return;
         }
         if self.num_conflicts < self.cold.two_stage_next_decay {

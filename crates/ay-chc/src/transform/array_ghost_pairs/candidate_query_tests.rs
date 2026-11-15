@@ -85,15 +85,15 @@ fn does_not_treat_nonlinear_constrained_or_nonnullary_input_as_transparent() {
     let right = problem.declare_predicate("right", Vec::new());
     let state = problem.declare_predicate("state", vec![ChcSort::Int]);
     let error = problem.declare_predicate("error", Vec::new());
+    // A constant-false guard is removed by add_clause before query slicing.
+    // Keep a live constrained rule so this test actually covers that boundary.
+    let guard = var("guard", ChcSort::Bool);
     problem.add_clause(HornClause::new(
         ClauseBody::predicates_only(vec![(left, Vec::new()), (right, Vec::new())]),
         ClauseHead::Predicate(error, Vec::new()),
     ));
     problem.add_clause(HornClause::new(
-        ClauseBody::new(
-            vec![(left, Vec::new())],
-            Some(ChcExpr::eq(ChcExpr::Int(0), ChcExpr::Int(1))),
-        ),
+        ClauseBody::new(vec![(left, Vec::new())], Some(guard.clone())),
         ClauseHead::Predicate(error, Vec::new()),
     ));
     problem.add_clause(HornClause::new(
@@ -102,6 +102,13 @@ fn does_not_treat_nonlinear_constrained_or_nonnullary_input_as_transparent() {
     ));
     problem.add_clause(HornClause::query(nullary_body(error)));
 
+    assert_eq!(
+        problem.clauses().len(),
+        4,
+        "all fixture rules must survive admission"
+    );
+    assert_eq!(problem.clauses()[1].body.constraint.as_ref(), Some(&guard));
+
     let slice = super::bounded_query_slice(&problem, None).expect("bounded root slice");
     assert_eq!(slice.sink_predicates, vec![error]);
     assert_eq!(
@@ -109,6 +116,7 @@ fn does_not_treat_nonlinear_constrained_or_nonnullary_input_as_transparent() {
         1,
         "only the guarded clause is a source"
     );
+    assert!(std::ptr::eq(slice.anchors[0], &problem.clauses()[1]));
 }
 
 #[test]

@@ -41,6 +41,15 @@ const ALLSAT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Timeout for the final I ∧ B validation check.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Whole-call budget of one dual-MBP interpolation, inside the caller's
+/// deadline. The cascade hands this fallback leg its whole window (the
+/// thread's solve deadline under a portfolio engine), and 100 AllSAT queries
+/// at 500 ms each plus two validations let one call hold an engine thread
+/// for most of the wall: on LRA sally systems it wedged the LAWI and CEGAR
+/// threads (PERF_vs_winners_2026-09-25, row 6). The strategy gets the same
+/// order of time as a Craig validation check, then yields to the later legs.
+const CALL_BUDGET: Duration = Duration::from_secs(2);
+
 /// Compute a dual MBP interpolant for A ∧ B UNSAT.
 ///
 /// Returns `Some(I)` where I mentions only `shared_vars`, or `None` if the
@@ -60,6 +69,11 @@ pub(crate) fn compute_dual_mbp_interpolant_until(
     shared_vars: &FxHashSet<String>,
     deadline: Option<Instant>,
 ) -> Option<ChcExpr> {
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
+    // Every call is bounded by `CALL_BUDGET` for the whole enumeration and
+    // validation, and by the caller's deadline when that comes first.
+    let cap = Instant::now() + CALL_BUDGET;
+    let deadline = Some(deadline.map_or(cap, |d| d.min(cap)));
     if deadline_expired(deadline) {
         return None;
     }
@@ -94,12 +108,8 @@ pub(crate) fn compute_dual_mbp_interpolant_until(
             return None;
         }
 
-        let query_result = if deadline.is_some() {
-            let timeout = timeout_for_deadline(deadline, ALLSAT_QUERY_TIMEOUT)?;
-            smt.check_sat_with_timeout(&blocking, timeout)
-        } else {
-            smt.check_sat(&blocking)
-        };
+        let timeout = timeout_for_deadline(deadline, ALLSAT_QUERY_TIMEOUT)?;
+        let query_result = smt.check_sat_with_timeout(&blocking, timeout);
 
         match query_result {
             SmtResult::Sat(model) => {
@@ -166,22 +176,14 @@ pub(crate) fn compute_dual_mbp_interpolant_until(
     // Validate: I ∧ B must be UNSAT
     let check_formula = ChcExpr::and(interpolant.clone(), b_formula);
     let mut smt_check = SmtContext::new();
-    let validation_timeout = if deadline.is_some() {
-        timeout_for_deadline(deadline, VALIDATION_TIMEOUT)?
-    } else {
-        VALIDATION_TIMEOUT
-    };
+    let validation_timeout = timeout_for_deadline(deadline, VALIDATION_TIMEOUT)?;
     match smt_check.check_sat_with_timeout(&check_formula, validation_timeout) {
         SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
             // Also validate A → I: ¬(A → I) = A ∧ ¬I must be UNSAT
             let a_formula = ChcExpr::and_all(a_constraints.iter().cloned());
             let a_not_i = ChcExpr::and(a_formula, ChcExpr::not(interpolant.clone()));
             let mut smt_a = SmtContext::new();
-            let validation_timeout = if deadline.is_some() {
-                timeout_for_deadline(deadline, VALIDATION_TIMEOUT)?
-            } else {
-                VALIDATION_TIMEOUT
-            };
+            let validation_timeout = timeout_for_deadline(deadline, VALIDATION_TIMEOUT)?;
             match smt_a.check_sat_with_timeout(&a_not_i, validation_timeout) {
                 SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
                     info!(

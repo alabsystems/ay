@@ -588,13 +588,34 @@ pub fn try_clique_witness(
     term_flag: &AtomicBool,
     base_seed: u64,
 ) -> Option<Vec<bool>> {
+    let _compute = ay_sys::compute_budget::ComputeScope::enter_until(|| {
+        term_flag.load(Ordering::Relaxed)
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    })
+    .ok()??;
     let s = detect_and_build(instance)?;
 
-    let threads = worker_count();
+    let mut extras = Vec::new();
+    for _ in 1..worker_count() {
+        match ay_sys::compute_budget::try_extra().ok()? {
+            Some(permit) => extras.push(permit),
+            None => break,
+        }
+    }
+    let threads = 1 + extras.len();
     let stop = AtomicBool::new(false);
     let winner: Mutex<Option<Vec<usize>>> = Mutex::new(None);
 
     std::thread::scope(|scope| {
+        struct StopOnExit<'a>(&'a AtomicBool);
+        impl Drop for StopOnExit<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        // Also stop siblings before scope joins if inline search unwinds.
+        let _stop_on_exit = StopOnExit(&stop);
+        let mut inline = None;
         for t in 0..threads {
             let s_ref = &s;
             let stop_ref = &stop;
@@ -606,7 +627,9 @@ pub fn try_clique_witness(
             // the heavy-tailed early solve; deeper-restart workers explore each plateau
             // longer. A portfolio is more robust than one fixed threshold.
             let restart_thresh = [8_000u64, 20_000, 40_000, 80_000][t % 4];
-            scope.spawn(move || {
+            let task = move || {
+                #[cfg(test)]
+                resource_tests::observe_worker();
                 // Mix in the shared interrupt: stop if a worker won OR the caller asked.
                 if let Some(clique) = clique_search(s_ref, seed, deadline, stop_ref, restart_thresh)
                 {
@@ -616,7 +639,14 @@ pub fn try_clique_witness(
                     }
                     stop_ref.store(true, Ordering::Relaxed);
                 }
-            });
+            };
+            if t == 0 {
+                inline = Some(task);
+            } else if let Some(permit) = extras.pop() {
+                scope.spawn(move || {
+                    let _ = permit.run(task);
+                });
+            }
         }
         // A lightweight watcher that propagates the external interrupt into `stop`.
         let stop_ref = &stop;
@@ -636,9 +666,16 @@ pub fn try_clique_witness(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         });
+        if let Some(task) = inline {
+            task();
+        }
     });
 
     let clique = winner.into_inner().unwrap()?;
     // Extend + verify on the main thread (fast). Soundness gate.
     extend_and_verify(instance, &s, &clique)
 }
+
+#[cfg(test)]
+#[path = "clique_witness/resource_tests.rs"]
+mod resource_tests;

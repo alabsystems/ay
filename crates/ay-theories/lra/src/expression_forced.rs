@@ -11,12 +11,16 @@
 //! Split from `optimization.rs` for code health (#5970).
 
 // #8529: Use deterministic hash maps in all builds.
+use crate::linear_expr::{
+    coeffs_are_normalized, proportional_coeff_slice_ratio, same_coeff_slices,
+};
 use crate::{BoundType, LinearExpr, LraSolver, Rational};
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermId;
 use ay_core::DebugChannel;
 use ay_core::TheoryLit;
 use num_rational::BigRational;
+use num_traits::{Signed, Zero};
 
 mod difference_reasons;
 
@@ -37,6 +41,19 @@ impl LraSolver {
         target_value: &BigRational,
     ) -> Option<(Vec<TheoryLit>, bool)> {
         let debug = debug_lra_forced();
+
+        // A zero coefficient means the expression does not depend on that
+        // variable: drop such entries before the case split, so `0*x + c`
+        // is the constant `c` (Case 1) and Case 2 never divides by zero.
+        // `LinearExpr::coeffs` is a public field, so the sparse invariant is
+        // re-established here rather than assumed.
+        let sparse;
+        let expr = if expr.coeffs.iter().any(|(_, c)| c.is_zero()) {
+            sparse = expr.normalize();
+            &sparse
+        } else {
+            expr
+        };
 
         // Case 1: Expression is constant - it's forced to that constant value
         if expr.coeffs.is_empty() {
@@ -103,41 +120,75 @@ impl LraSolver {
     }
 
     /// Collect tableau slack variables whose rows are proportional to `expr`.
+    ///
+    /// Each match is `(basic_var, required_basic_value, ratio_positive)` where
+    /// `expr = k * (basic_var - row_constant) + expr_constant` and
+    /// `ratio_positive` is `k > 0`. The SIGN of `k` decides which side of
+    /// `expr` a bound on `basic_var` constrains: for `k < 0` a LOWER bound on
+    /// the slack is an UPPER bound on `expr` (and vice versa).
     fn matching_slack_vars(
         &self,
         expr: &LinearExpr,
         target_value: &BigRational,
-    ) -> Vec<(u32, BigRational)> {
+    ) -> Vec<(u32, BigRational, bool)> {
         let mut matching = Vec::new();
         let normalized_expr = expr.normalize();
 
         for row in &self.rows {
             let row_constant_big = row.constant.to_big();
-            let normalized_row = LinearExpr {
-                coeffs: row.coeffs.clone(),
-                constant: row.constant.clone(),
-            }
-            .normalize();
+            // Tableau rows are constructed and pivot-maintained
+            // normalized, so the common case compares slices in place;
+            // the clone+normalize fallback covers any row that is not.
+            // (This scan runs per disequality per check: normalizing
+            // every row every time was the top profile frame on
+            // Certora QF_UFDTNIA 39657...48.)
+            let normalized_row;
+            let row_coeffs: &[(u32, Rational)] = if coeffs_are_normalized(&row.coeffs) {
+                &row.coeffs
+            } else {
+                normalized_row = LinearExpr {
+                    coeffs: row.coeffs.clone(),
+                    constant: row.constant.clone(),
+                }
+                .normalize();
+                &normalized_row.coeffs
+            };
 
             // Use semantic coefficient comparison: exact match first,
-            // then proportional match (e.g., 4294967296*(A-B) vs (A-B)).
-            let required_basic_value = if normalized_expr.same_coefficients(&normalized_row) {
-                // expr = row_expr + (expr_constant - row_constant).
-                target_value - expr.constant.to_big() + &row_constant_big
-            } else if let Some(k) = normalized_expr.proportional_coefficient_ratio(&normalized_row)
-            {
-                // expr = k * basic_var + (expr_constant - k * row_constant).
-                (target_value - expr.constant.to_big() + &k * &row_constant_big) / &k
-            } else {
-                continue;
-            };
-            matching.push((row.basic_var, required_basic_value));
+            // then proportional match (e.g., 4294967296*(A-B) vs (A-B), or
+            // -(A-B) vs (A-B) — a NEGATIVE ratio flips bound sides).
+            let (required_basic_value, ratio_positive) =
+                if same_coeff_slices(&normalized_expr.coeffs, row_coeffs) {
+                    // expr = row_expr + (expr_constant - row_constant).
+                    (
+                        target_value - expr.constant.to_big() + &row_constant_big,
+                        true,
+                    )
+                } else if let Some(k) =
+                    proportional_coeff_slice_ratio(&normalized_expr.coeffs, row_coeffs)
+                {
+                    // expr = k * basic_var + (expr_constant - k * row_constant).
+                    let positive = k.is_positive();
+                    (
+                        (target_value - expr.constant.to_big() + &k * &row_constant_big) / &k,
+                        positive,
+                    )
+                } else {
+                    continue;
+                };
+            matching.push((row.basic_var, required_basic_value, ratio_positive));
         }
 
         matching
     }
 
     /// Check whether matching tableau rows jointly pin a multi-var expression.
+    ///
+    /// SOUNDNESS: `expr` is pinned only by a bound at the target on EACH side
+    /// of `expr`. A slack whose row is a NEGATIVE multiple of `expr` contributes
+    /// its lower bound to `expr`'s upper side and its upper bound to `expr`'s
+    /// lower side; counting them unflipped "pinned" `y - z` from the one-sided
+    /// pair `y - z <= 0`, `z - y >= 0` and refuted a satisfiable `y != z`.
     fn multi_var_expression_forced_to_value(
         &self,
         expr: &LinearExpr,
@@ -151,8 +202,15 @@ impl LraSolver {
         let mut all_reasons: Vec<TheoryLit> = Vec::new();
         let mut has_lower_bound_at_target = false;
         let mut has_upper_bound_at_target = false;
+        let push_reasons = |bound: &crate::Bound, all_reasons: &mut Vec<TheoryLit>| {
+            for (r, v) in bound.reasons.iter().zip(&bound.reason_values) {
+                if !r.is_sentinel() && !all_reasons.iter().any(|x| x.term == *r) {
+                    all_reasons.push(TheoryLit::new(*r, *v));
+                }
+            }
+        };
 
-        for (slack_var, required_value) in &matching_slack_vars {
+        for (slack_var, required_value, ratio_positive) in &matching_slack_vars {
             if let Some(info) = self.vars.get(*slack_var as usize) {
                 if info.value.rational() != *required_value {
                     continue;
@@ -160,22 +218,22 @@ impl LraSolver {
 
                 if let Some(ref lb) = info.lower {
                     if lb.value == *required_value && !lb.strict {
-                        has_lower_bound_at_target = true;
-                        for (r, v) in lb.reasons.iter().zip(&lb.reason_values) {
-                            if !r.is_sentinel() && !all_reasons.iter().any(|x| x.term == *r) {
-                                all_reasons.push(TheoryLit::new(*r, *v));
-                            }
+                        if *ratio_positive {
+                            has_lower_bound_at_target = true;
+                        } else {
+                            has_upper_bound_at_target = true;
                         }
+                        push_reasons(lb, &mut all_reasons);
                     }
                 }
                 if let Some(ref ub) = info.upper {
                     if ub.value == *required_value && !ub.strict {
-                        has_upper_bound_at_target = true;
-                        for (r, v) in ub.reasons.iter().zip(&ub.reason_values) {
-                            if !r.is_sentinel() && !all_reasons.iter().any(|x| x.term == *r) {
-                                all_reasons.push(TheoryLit::new(*r, *v));
-                            }
+                        if *ratio_positive {
+                            has_upper_bound_at_target = true;
+                        } else {
+                            has_lower_bound_at_target = true;
                         }
+                        push_reasons(ub, &mut all_reasons);
                     }
                 }
             }
@@ -202,12 +260,19 @@ impl LraSolver {
     /// (false-UNSAT). A non-empty reason set means asserted constraints (the
     /// entailing literals) truly pin `a - b` to 0 — exactly invariant (ENT).
     ///
-    /// TRACTABILITY: we only consider pairs of candidate interface terms that are
-    /// already COUPLED by asserted bounds, i.e. that co-occur in some tableau
-    /// row. `is_expression_forced_to_value` for a difference returns `None`
-    /// unless a matching tableau row exists, so uncoupled pairs are cheap to
-    /// reject; we additionally pre-filter via row co-occurrence so we never run
-    /// the full O(n^2) difference query over unrelated variables.
+    /// TRACTABILITY: candidate pairs come from
+    /// `difference_pair_reasons` — one bucketing pass over the asserted
+    /// atoms — never an O(n^2) pair query over unrelated variables.
+    /// The former row-co-occurrence coupling pre-filter rebuilt every
+    /// co-occurring pair of every tableau row on every call
+    /// (Θ(rows × touched²) hash inserts per Nelson-Oppen round; the
+    /// top on-CPU frames on QF_LIRA smtopt, whose rows touch thousands
+    /// of candidates). It was purely a work filter from the older
+    /// per-pair design: the emitted reasons are entailing asserted
+    /// literals by construction, independent of row coupling, so
+    /// intersecting with the reason buckets directly is sound and
+    /// can only surface entailed pairs the coupling missed.
+    /// (#lra-diff-no-couple)
     ///
     /// Returns `(term_a, term_b, reasons)` with `term_a.0 < term_b.0`.
     pub fn find_entailed_difference_equalities(
@@ -233,35 +298,6 @@ impl LraSolver {
         let cand_var_set: std::collections::HashSet<u32> =
             cand_vars.iter().map(|(_, v)| *v).collect();
 
-        // Determine which candidate-var pairs are COUPLED by asserted bounds: two
-        // candidate vars are coupled when, after expressing them in the simplex's
-        // nonbasic basis (substituting basic vars via their defining rows), they
-        // share a nonbasic variable or are both pinned by a common row. We
-        // approximate this cheaply: a pair is a candidate if both vars appear
-        // (as basic var or coefficient) in some tableau row, OR if one is the
-        // basic var of a row mentioning the other. This restricts work to pairs
-        // genuinely connected by the asserted `<=/>=` rows — never the full
-        // O(n^2) over unrelated program variables.
-        let mut coupled: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-        for row in &self.rows {
-            let mut touched: Vec<u32> = Vec::new();
-            if cand_var_set.contains(&row.basic_var) {
-                touched.push(row.basic_var);
-            }
-            for &(v, _) in &row.coeffs {
-                if cand_var_set.contains(&v) && !touched.contains(&v) {
-                    touched.push(v);
-                }
-            }
-            for i in 0..touched.len() {
-                for j in (i + 1)..touched.len() {
-                    let (va, vb) = (touched[i], touched[j]);
-                    let pair = if va < vb { (va, vb) } else { (vb, va) };
-                    coupled.insert(pair);
-                }
-            }
-        }
-
         // #certora-diff-one-pass: the former code ran
         // `entailed_difference_zero_reasons(va, vb)` per coupled pair, and that
         // helper scanned ALL asserted atoms per call — Θ(pairs × asserted) per
@@ -275,24 +311,25 @@ impl LraSolver {
         // to the byte-identical reason set.
         let diff_resolved = self.difference_pair_reasons();
 
-        for (va, vb) in coupled {
+        for (&(va, vb), reasons) in diff_resolved.iter() {
+            if !cand_var_set.contains(&va) || !cand_var_set.contains(&vb) {
+                continue;
+            }
             // SOUNDNESS (ENT): only emit `a = b` when asserted literals pin
             // `a - b` to exactly 0 with a NON-EMPTY reason set (see
             // `difference_pair_reasons`) — never a model/default artifact.
-            if let Some(reasons) = diff_resolved.get(&(va, vb)) {
-                if reasons.is_empty() {
-                    continue;
-                }
-                let (ta, tb) = match (self.var_to_term.get(&va), self.var_to_term.get(&vb)) {
-                    (Some(&ta), Some(&tb)) => (ta, tb),
-                    _ => continue,
-                };
-                if ta == tb {
-                    continue;
-                }
-                let (lo, hi) = if ta.0 < tb.0 { (ta, tb) } else { (tb, ta) };
-                result.push((lo, hi, reasons.clone()));
+            if reasons.is_empty() {
+                continue;
             }
+            let (ta, tb) = match (self.var_to_term.get(&va), self.var_to_term.get(&vb)) {
+                (Some(&ta), Some(&tb)) => (ta, tb),
+                _ => continue,
+            };
+            if ta == tb {
+                continue;
+            }
+            let (lo, hi) = if ta.0 < tb.0 { (ta, tb) } else { (tb, ta) };
+            result.push((lo, hi, reasons.clone()));
         }
 
         result

@@ -28,6 +28,27 @@ pub enum CertIoError {
         /// The source token that was named.
         source_token: String,
     },
+    /// The input is larger than this build's parser will read.
+    ///
+    /// SEPARATE FROM `Malformed` DELIBERATELY, and the distinction is a
+    /// verdict-level one, not a tidiness one. Nothing about the certificate has
+    /// been read, so nothing about it has been refuted: this is a statement
+    /// about the CHECKER, not about the evidence. Routed through
+    /// [`Malformed`](CertIoError::Malformed) it reached
+    /// `CheckStatus::Refuted` — `ay-milp verify` printed the word REFUTED over
+    /// a `CLAIMS verified=- refuted=- unbacked=-` census that named nothing
+    /// refuted, which is exactly the confusion the census line exists to
+    /// prevent. It now reaches `CheckStatus::Unverified` (exit 10), still
+    /// non-zero, still never VERIFIED.
+    #[error("{what} ({actual} > {limit})")]
+    InputTooLarge {
+        /// Which cap, in words.
+        what: String,
+        /// The cap.
+        limit: usize,
+        /// What arrived.
+        actual: usize,
+    },
     /// A rational field exceeded the exact-arithmetic ceiling of the proof
     /// format that owns it.  This is separate from malformed syntax so callers
     /// can distinguish a bounded fail-closed rejection from a grammar error.
@@ -127,10 +148,29 @@ pub struct Certificate {
     pub optcert_trivial: bool,
     /// The whole-tree infeasibility certificate, when present.
     pub tree: Option<MilpInfeasibilityCertificate>,
-    /// The whole-tree OPTIMALITY split tree, when present. A SEPARATE field
-    /// from `tree` on purpose: the two carry opposite claims, and a bound tree
-    /// read as a proof of emptiness would be fatal rather than merely vacuous.
-    pub opt_tree: Option<OptTreeNode>,
+    /// The whole-tree OPTIMALITY split tree, when present, AS ITS WIRE BODY —
+    /// the block's records without its `opttree` opener or `end` terminator.
+    /// A SEPARATE field from `tree` on purpose: the two carry opposite claims,
+    /// and a bound tree read as a proof of emptiness would be fatal rather than
+    /// merely vacuous.
+    ///
+    /// # Why the body and not the parsed tree
+    ///
+    /// This field used to hold an `OptTreeNode`, and materialising it was a
+    /// hard ceiling on what could be CHECKED. One `Multiplier` is a `FactRef`
+    /// plus a heap-allocated `BigRational`; a bound leaf writes one per column
+    /// with a nonzero residual, so the object graph costs ~110 bytes per
+    /// multiplier against ~28 bytes for the wire record that prints it.
+    /// Measured on `khb05250`'s completed 17,124-leaf tree — 655,330,144 bytes
+    /// and 23,024,720 records — the object form is ~2.5 GB and does not fit
+    /// under this box's 3,072 MiB governor, so the certificate would have been
+    /// unverifiable on the machine that produced it.
+    ///
+    /// [`check`] streams it instead ([`verify_opt_tree_body`]): one leaf live
+    /// at a time, a bound-restore stack whose depth is the tree's, and every
+    /// box reconstructed from the model rather than read. Nothing about the
+    /// obligations changed — only what has to be resident to discharge them.
+    pub opt_tree_body: Option<String>,
     /// Exact source-to-reduced affine replay, including reduced-frame proof.
     pub affine_aggregation: Option<AffineAggregationCertificate>,
     /// Exact GF(2) source-row contradiction, when present.

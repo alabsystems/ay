@@ -16,10 +16,11 @@ fn test_evaluate_to_fp_from_rational() {
     // (_ to_fp 5 11) RNE 3.0 → Float16 representing 3.0
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let three = executor
         .ctx
         .terms
@@ -46,10 +47,11 @@ fn test_evaluate_to_fp_from_fp_cast() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let fp32 = Sort::FloatingPoint(8, 24);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
 
     // Float32 2.5: sign=0, exp=128 (bias=127, real exp=1), sig=0x200000
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
@@ -84,10 +86,11 @@ fn test_evaluate_fp_to_ubv() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
 
     // Float16 42.0: 1.0101 * 2^5, bias=15, biased_exp=20, sig=0b0101000000=320
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
@@ -120,10 +123,11 @@ fn test_evaluate_fp_to_ubv_negative_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
 
     // Float16 -3.0: sign=1, exp=16, sig=512
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(1), 1);
@@ -149,10 +153,11 @@ fn test_evaluate_fp_to_sbv() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
 
     // Float16 -3.0: sign=1, exp=16, sig=512
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(1), 1);
@@ -415,10 +420,11 @@ fn test_evaluate_fp_to_ubv_nan_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     // Float16 NaN: exp=31 (all 1s), sig=1 (nonzero)
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
     let exp = executor.ctx.terms.mk_bitvec(BigInt::from(31u32), 5);
@@ -441,10 +447,11 @@ fn test_evaluate_fp_to_sbv_nan_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     // Float16 NaN: exp=31 (all 1s), sig=1 (nonzero)
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
     let exp = executor.ctx.terms.mk_bitvec(BigInt::from(31u32), 5);
@@ -467,10 +474,11 @@ fn test_evaluate_fp_to_ubv_overflow_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     // Float16 300.0: not representable exactly in Float16 (max normal ≈ 65504).
     // Use a rational conversion instead.
     let three_hundred = executor
@@ -495,10 +503,11 @@ fn test_evaluate_fp_to_sbv_overflow_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let two_hundred = executor
         .ctx
         .terms
@@ -521,10 +530,11 @@ fn test_evaluate_fp_to_ubv_inf_returns_unknown() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let bv8 = Sort::bitvec(8);
-    let rne = executor
-        .ctx
-        .terms
-        .mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    let rne = executor.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     // Float16 +Inf: sign=0, exp=31 (all 1s), sig=0
     let sign = executor.ctx.terms.mk_bitvec(BigInt::from(0), 1);
     let exp = executor.ctx.terms.mk_bitvec(BigInt::from(31u32), 5);

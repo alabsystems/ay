@@ -336,7 +336,7 @@ fn maybe_run_dense_clique_php_proof_route_body(
         admission.asset.name
     );
     validate_dimacs_unsat_publication_before_verdict(&mut authority);
-    crate::mark_verdict_printed();
+    crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(20));
     safe_println!("s UNSATISFIABLE");
     authority.commit_after_verdict();
     let _ = io::stdout().flush();

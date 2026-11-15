@@ -1,0 +1,64 @@
+pseudo-Boolean proof version 2.0
+* INTEGRATION-TEST: ignore(elaborate)
+* Filed under `correct/` because it IS correct: it verifies at exit 0. What it
+* cannot do is elaborate, and the marker above says so. It sat under
+* `incorrect/` behind `ignore(check)` for one round, which made it the one
+* instance in the corpus that contradicted its own directory -- a proof
+* labelled incorrect that the checker accepts.
+*
+* The other half of `correct/version2/pre_order_aux_vars`: a version-2 order
+* whose auxiliary variable is a name the run has already used -- here `x1`,
+* a variable of the formula.
+*
+* Elaboration renames a version-2 order's auxiliary variables to the `$`-form
+* the version-3 grammar demands, and it does so in the variable-name table, so
+* the rename reaches every occurrence at once. What it cannot reach is what has
+* already been written: the formula file, which elaboration does not rewrite,
+* and the lines of the elaborated proof emitted before this one. Renaming `x1`
+* here would therefore be a *partial* rename -- the `aux` list and the `def`
+* would say `$x1` while the formula still says `x1` -- and a partial rename is
+* worse than no elaboration at all, because the result parses and means
+* something else.
+*
+* So this one is refused, naming the reason, instead of being elaborated. The
+* proof itself is fine and still *checks* at exit 0, which is why the check
+* trial is ignored above and only the elaborate trial runs: what is pinned
+* here is that `-e` refuses rather than writing an artifact that says
+* something the input did not.
+f 1
+pre_order simple
+    vars
+        left u1
+        right v1
+        * `x1` is a formula variable, so it has a name in the elaborated
+        * proof's world already
+        aux x1
+    end
+
+    * the same specification the correct companion has, so that the order is
+    * provable and the only thing wrong with the proof is the name
+    spec
+        red 1 ~x1 >= 1 ; x1 -> 0 ; begin
+        end
+    end
+
+    def
+        1 ~u1 1 v1 1 x1 >= 1 ;
+    end
+
+    transitivity
+        vars
+            fresh_right w1
+            fresh_aux_1 b1
+            fresh_aux_2 c1
+        end
+        proof
+            proofgoal #1
+                p 4 1 + 5 + 2 + 6 +
+            end -1
+        end
+    end
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

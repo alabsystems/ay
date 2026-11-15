@@ -97,7 +97,7 @@ pub fn oexplain_relevant_pairs(lits: &[OExplainLit]) -> Option<Vec<(usize, usize
 }
 
 /// Which projection factor a polynomial came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq)]
 pub enum OProjKind {
     /// Leading coefficient of input `i` in the projected variable.
     LeadingCoeff(usize),
@@ -105,6 +105,21 @@ pub enum OProjKind {
     Discriminant(usize),
     /// Resultant of inputs `i` and `j`.
     Resultant(usize, usize),
+}
+
+// Written out rather than derived: the derived `eq` compares discriminants and
+// then matches the pair with an `unreachable` arm for mismatched variants, an
+// arm Level-0 verification cannot rule out. Matching the pair directly is the
+// same relation with no unreachable arm.
+impl PartialEq for OProjKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::LeadingCoeff(a), Self::LeadingCoeff(b))
+            | (Self::Discriminant(a), Self::Discriminant(b)) => a == b,
+            (Self::Resultant(a, b), Self::Resultant(c, d)) => a == c && b == d,
+            _ => false,
+        }
+    }
 }
 
 /// The CAD projection, with the degree report.

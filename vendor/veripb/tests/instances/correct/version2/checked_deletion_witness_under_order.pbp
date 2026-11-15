@@ -1,0 +1,38 @@
+pseudo-Boolean proof version 2.0
+* The version-2 spelling of
+* `correct/version3/checked_deletion_witness_under_order.pbp`: a checked
+* deletion may carry a witness while an order is loaded. Only the
+* strengthening-to-core half of the format's "the substitution has to be empty"
+* condition is real; under a loaded order `DeletionChecker` generates the
+* order's proofgoals, so the witness has to not worsen the order rather than be
+* absent. Both dialects reach the same code, and both are pinned because
+* several past defects were reachable in only one of them.
+f 2
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order simple x1
+* A derived constraint, so the acceptance below cannot be a silent fall back to
+* unchecked deletion.
+p 1 2 +
+delc 1 ; x1 -> 0 x2 -> 1 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

@@ -193,6 +193,7 @@ pub(super) fn is_inductive_blocking_uncached(
         .clauses_defining_with_index(predicate)
         .map(|(index, clause)| (index, clause.clone()))
         .collect();
+    let mut source_names = None;
     for (clause_index, clause) in defining_clauses {
         // #2901: Check cancellation between SMT queries in clause loop.
         if solver.is_cancelled() {
@@ -293,22 +294,43 @@ pub(super) fn is_inductive_blocking_uncached(
         if level - 1 == 0 {
             let matching_facts: Vec<_> = solver
                 .problem
-                .facts()
-                .filter(|f| f.head.predicate_id() == Some(*body_pred))
-                .cloned()
+                .clauses_defining_with_index(*body_pred)
+                .filter(|(_, fact)| fact.is_fact())
+                .map(|(index, fact)| (index, fact.clone()))
                 .collect();
-            for fact in matching_facts {
+            for (fact_index, fact) in matching_facts {
                 let fact_constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
                 let fact_head_args = match &fact.head {
                     crate::ClauseHead::Predicate(_, a) => a.as_slice(),
-                    crate::ClauseHead::False => continue,
+                    crate::ClauseHead::False => return false,
                 };
                 if fact_head_args.len() != body_args.len() {
-                    continue;
+                    return false;
                 }
 
-                let (renamed_fact_constraint, renamed_fact_args) =
-                    PdrSolver::rename_fact_variables(&fact_constraint, fact_head_args, "__fact_");
+                let mut open = || !solver.is_cancelled();
+                if source_names.is_none() {
+                    // #lvl1-repeat: cached per-solver census (`source_names()`)
+                    // instead of a fresh `SourceNames::collect` walk — this
+                    // function is the hottest per-candidate blocking check in
+                    // PDR generalization, called once per dropped-literal
+                    // candidate, so an uncached walk here re-paid the
+                    // full-problem census on almost every call.
+                    source_names = solver.source_names();
+                }
+                let Some((renamed_fact_constraint, renamed_fact_args)) =
+                    source_names.as_ref().and_then(|names| {
+                        names.rename(
+                            &fact_constraint,
+                            fact_head_args,
+                            &format!("__fact_{fact_index}_"),
+                            [&base].into_iter().chain(head_args).chain(body_args),
+                            &mut open,
+                        )
+                    })
+                else {
+                    return false;
+                };
 
                 let eqs: Vec<ChcExpr> = body_args
                     .iter()
@@ -490,6 +512,7 @@ fn level_zero_inductive_blocking(
         .clauses_defining_with_index(predicate)
         .map(|(index, clause)| (index, clause.clone()))
         .collect();
+    let mut source_names = None;
     for (clause_index, clause) in defining_clauses {
         if solver.is_cancelled() {
             return false;
@@ -531,14 +554,37 @@ fn level_zero_inductive_blocking(
                 let fact_constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
                 let fact_head_args = match &fact.head {
                     crate::ClauseHead::Predicate(_, a) => a.as_slice(),
-                    crate::ClauseHead::False => continue,
+                    crate::ClauseHead::False => return false,
                 };
                 if fact_head_args.len() != body_args.len() {
-                    continue;
+                    return false;
                 }
 
-                let (renamed_fact_constraint, renamed_fact_args) =
-                    PdrSolver::rename_fact_variables(&fact_constraint, fact_head_args, "__fact_");
+                // Source-only names keep this clause/fact segment stable across
+                // candidates; query-only collisions refuse before registration.
+                let mut open = || !solver.is_cancelled();
+                if source_names.is_none() {
+                    // #lvl1-repeat: cached per-solver census (`source_names()`)
+                    // instead of a fresh `SourceNames::collect` walk — this
+                    // function is the hottest per-candidate blocking check in
+                    // PDR generalization, called once per dropped-literal
+                    // candidate, so an uncached walk here re-paid the
+                    // full-problem census on almost every call.
+                    source_names = solver.source_names();
+                }
+                let Some((renamed_fact_constraint, renamed_fact_args)) =
+                    source_names.as_ref().and_then(|names| {
+                        names.rename(
+                            &fact_constraint,
+                            fact_head_args,
+                            &format!("__fact_{fact_index}_"),
+                            [&base].into_iter().chain(head_args).chain(body_args),
+                            &mut open,
+                        )
+                    })
+                else {
+                    return false;
+                };
 
                 let eqs: Vec<ChcExpr> = body_args
                     .iter()

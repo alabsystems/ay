@@ -148,3 +148,40 @@ fn malformed_bitvector_payload_declines_before_clone() {
     };
     assert!(eval_to_mv(&negative, &Sort::bitvec(8)).is_none());
 }
+
+/// The pair envelope counts pair visits, not identifier bytes. A model-checker-consumer BMC
+/// query with 35 selector and 20 constructor terms (785 pairs) fit while its
+/// longest application spelling weighed 19 and was refused at 20, when the
+/// datatype's name grew by one byte (`Option_u8` to `OptionX_u8`): datatype
+/// construction did not run, the model gate could not confirm the candidate,
+/// and the satisfiable query came back `unknown`.
+#[test]
+fn congruence_pair_envelope_counts_pairs_not_name_bytes() {
+    for weight in [19, 20, 64] {
+        let mut budget = OpaqueDtCollectionBudget::new();
+        assert!(
+            budget.finish(4, 35, 20, weight).is_some(),
+            "785 pairs fit the pair envelope at weight {weight}"
+        );
+    }
+}
+
+/// The byte-weighted congruence cost still has a bound: the work envelope.
+#[test]
+fn congruence_name_bytes_are_charged_to_the_work_envelope() {
+    // 785 pairs * 64 rounds = 50,240 visits; at weight 1,000 that is 50.24M of
+    // work, over the 32 MiB collection work envelope.
+    let mut heavy = OpaqueDtCollectionBudget::new();
+    assert!(heavy.finish(4, 35, 20, 1_000).is_none());
+}
+
+/// Too many pairs are refused at any weight.
+#[test]
+fn congruence_pair_envelope_refuses_too_many_pairs() {
+    // 200 constructor terms: 19,900 pairs * 64 rounds = 1,273,600 visits.
+    let mut wide = OpaqueDtCollectionBudget::new();
+    assert!(wide.finish(4, 0, 200, 1).is_none());
+    // 176 constructor terms: 15,400 pairs * 64 = 985,600 visits fit.
+    let mut fits = OpaqueDtCollectionBudget::new();
+    assert!(fits.finish(4, 0, 176, 1).is_some());
+}

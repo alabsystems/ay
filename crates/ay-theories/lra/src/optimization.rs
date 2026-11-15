@@ -131,18 +131,15 @@ impl LraSolver {
             TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
                 return (OptimizationResult::Infeasible, None);
             }
-            TheoryResult::Unknown
-            | TheoryResult::NeedSplit(_)
-            | TheoryResult::NeedDisequalitySplit(_)
-            | TheoryResult::NeedExpressionSplit(_)
-            | TheoryResult::NeedStringLemma(_) => {
-                // #6166: These indicate incomplete feasibility checking, NOT infeasibility.
-                // Unknown means the theory solver cannot determine satisfiability (e.g.,
-                // unsupported atoms with ITE, non-linear terms, or variable-divisor div/mod).
-                // NeedSplit variants mean the DPLL(T) loop needs case splits to determine SAT.
-                return (OptimizationResult::Unknown, None);
-            }
-            _ => unreachable!("unexpected TheoryResult variant"),
+            // #6166: every other outcome (`Unknown`, and every `Need*` request:
+            // splits, lemmas, string lemmas) is incomplete feasibility checking,
+            // NOT infeasibility: the DPLL(T) loop must act before the arithmetic
+            // state is a feasible point to optimize from. `NeedLemmas` and
+            // `NeedExpressionSplits` used to reach an `unreachable!` — a panic on
+            // `(minimize (ite (= x c0) 1 0))` over a `distinct` + totality of
+            // uninterpreted constants (2026-10-02 audit,
+            // `crash_lra_opt_minimize_ite_k3`); `TheoryResult` is non-exhaustive.
+            _ => return (OptimizationResult::Unknown, None),
         }
 
         // Disequalities are non-convex: a feasibility model can satisfy one
@@ -188,6 +185,7 @@ impl LraSolver {
         // This allows us to apply bounds and pivoting to minimize obj_var
         let obj_var = self.next_var;
         self.next_var += 1;
+        self.note_phase_state_change(); // a new column (#nonlinear-phase-hints)
         while self.vars.len() <= obj_var as usize {
             self.vars.push(VarInfo::default());
         }
@@ -204,6 +202,7 @@ impl LraSolver {
         // #inc-guard-memo: direct value write — invalidate the guard memo and
         // break the tracked-only chain (#inc-guard-chain).
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         // #warm-simplex: untracked value write (and a new row below).
         self.warm_invalidate();
@@ -446,6 +445,7 @@ impl LraSolver {
             // #inc-guard-memo: direct value writes below — invalidate the memo and
             // break the tracked-only chain (#inc-guard-chain).
             self.guard_clean_valid = false;
+            self.note_phase_state_change();
             self.guard_tracked_only = false;
             // #warm-simplex: untracked value writes.
             self.warm_invalidate();

@@ -9,7 +9,8 @@
 //!
 //! Extracted from `validation.rs` as part of the code-health module split.
 
-use ay_core::term::{Constant, TermData};
+use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId};
 
 use super::{
@@ -59,39 +60,39 @@ impl Executor {
     /// trigger for the general select-congruence model gate
     /// (`array_select_congruence_violated`). Solver-generated axioms may
     /// constrain search but cannot arm a public model-observation gate.
-    pub(crate) fn problem_has_array(&self) -> bool {
-        self.independent_gate_query_roots()
+    pub(crate) fn problem_has_array(&self) -> Result<bool, crate::executor_types::UnknownOrigin> {
+        // One visited set across all roots: the walk is linear in the shared
+        // DAG. A per-root tree walk was exponential on `let` chains that share
+        // each level twice (a 48-level chain never returned).
+        let mut visited = HashSet::default();
+        Ok(self
+            .independent_gate_query_roots()?
             .iter()
-            .any(|&assertion| self.term_mentions_array_sort(assertion))
+            .any(|&assertion| self.term_mentions_array_sort(assertion, &mut visited)))
     }
 
-    fn term_mentions_array_sort(&self, term: TermId) -> bool {
-        stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
+    fn term_mentions_array_sort(&self, root: TermId, visited: &mut HashSet<TermId>) -> bool {
+        let mut pending = vec![root];
+        while let Some(term) = pending.pop() {
+            if !visited.insert(term) {
+                continue;
+            }
             if self.ctx.terms.sort(term).is_array() {
                 return true;
             }
             match self.ctx.terms.get(term) {
-                TermData::App(_, args) => {
-                    args.iter().any(|&arg| self.term_mentions_array_sort(arg))
-                }
-                TermData::Not(inner) => self.term_mentions_array_sort(*inner),
-                TermData::Ite(c, t, e) => {
-                    self.term_mentions_array_sort(*c)
-                        || self.term_mentions_array_sort(*t)
-                        || self.term_mentions_array_sort(*e)
-                }
+                TermData::App(_, args) => pending.extend(args.iter().copied()),
+                TermData::Not(inner) => pending.push(*inner),
+                TermData::Ite(c, t, e) => pending.extend([*c, *t, *e]),
                 TermData::Let(bindings, body) => {
-                    bindings
-                        .iter()
-                        .any(|(_, bound)| self.term_mentions_array_sort(*bound))
-                        || self.term_mentions_array_sort(*body)
+                    pending.extend(bindings.iter().map(|(_, bound)| *bound));
+                    pending.push(*body);
                 }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    self.term_mentions_array_sort(*body)
-                }
-                _ => false,
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => pending.push(*body),
+                _ => {}
             }
-        })
+        }
+        false
     }
 
     /// A sort that (recursively) carries a datatype, recognizing BOTH
@@ -1361,64 +1362,75 @@ impl Executor {
         constructive_per_root.values().all(|&c| c <= 1)
     }
 
+    /// Whether a subterm reachable from `term` (arguments, `not`, `ite`,
+    /// `let` values and body, quantifier bodies) has a datatype-carrying array
+    /// sort. Visits each distinct subterm once: the recursive form re-walked
+    /// shared subterms once per path, exponential on a DAG. On QF_UFDTLIA
+    /// Certora `940_590f27b1c3c800d3243e_33` the `--z3-mode` run was inside
+    /// this walk 9-12 s into a `-T:10` run (sampled), polling no stop, and
+    /// ended in the watchdog's hard exit.
     fn term_has_datatype_carrying_array_sort(&self, term: TermId) -> bool {
-        stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
-            if self.sort_is_datatype_carrying_array(self.ctx.terms.sort(term)) {
+        let mut stack = vec![term];
+        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if self.sort_is_datatype_carrying_array(self.ctx.terms.sort(t)) {
                 return true;
             }
-            match self.ctx.terms.get(term) {
-                TermData::App(_, args) => args
-                    .iter()
-                    .any(|&arg| self.term_has_datatype_carrying_array_sort(arg)),
-                TermData::Not(inner) => self.term_has_datatype_carrying_array_sort(*inner),
-                TermData::Ite(c, t, e) => {
-                    self.term_has_datatype_carrying_array_sort(*c)
-                        || self.term_has_datatype_carrying_array_sort(*t)
-                        || self.term_has_datatype_carrying_array_sort(*e)
+            match self.ctx.terms.get(t) {
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, then_term, else_term) => {
+                    stack.push(*c);
+                    stack.push(*then_term);
+                    stack.push(*else_term);
                 }
                 TermData::Let(bindings, body) => {
-                    bindings
-                        .iter()
-                        .any(|(_, bound)| self.term_has_datatype_carrying_array_sort(*bound))
-                        || self.term_has_datatype_carrying_array_sort(*body)
+                    stack.extend(bindings.iter().map(|(_, bound)| *bound));
+                    stack.push(*body);
                 }
                 TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    self.term_has_datatype_carrying_array_sort(*body)
+                    stack.push(*body);
                 }
-                _ => false,
+                _ => {}
             }
-        })
+        }
+        false
     }
 
     pub(in crate::executor::model) fn contains_internal_symbol(&self, term_id: TermId) -> bool {
-        stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
-            match self.ctx.terms.get(term_id) {
+        // Visited set: linear in the shared DAG. The tree walk was exponential
+        // on `let` chains that share each level twice.
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut pending = vec![term_id];
+        while let Some(term) = pending.pop() {
+            if !visited.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
                 TermData::App(sym, args) => {
                     if sym.name().starts_with("__ay_")
                         && !self.is_live_private_binding_identity(sym.name())
                     {
                         return true;
                     }
-                    args.iter().any(|&arg| self.contains_internal_symbol(arg))
+                    pending.extend(args.iter().copied());
                 }
-                TermData::Not(inner) => self.contains_internal_symbol(*inner),
-                TermData::Ite(c, t, e) => {
-                    self.contains_internal_symbol(*c)
-                        || self.contains_internal_symbol(*t)
-                        || self.contains_internal_symbol(*e)
-                }
-                TermData::Let(_, body) => self.contains_internal_symbol(*body),
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    self.contains_internal_symbol(*body)
-                }
-                TermData::Const(_) | TermData::Var(_, _) => false,
+                TermData::Not(inner) => pending.push(*inner),
+                TermData::Ite(c, t, e) => pending.extend([*c, *t, *e]),
+                TermData::Let(_, body) => pending.push(*body),
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => pending.push(*body),
+                TermData::Const(_) | TermData::Var(_, _) => {}
                 // All current TermData variants are handled above.
                 // This arm is required by #[non_exhaustive] and catches future variants.
                 other => unreachable!(
                     "unhandled TermData variant in contains_internal_symbol(): {other:?}"
                 ),
             }
-        })
+        }
+        false
     }
 
     /// Check whether a term tree contains a datatype-sorted subterm.
@@ -1646,10 +1658,97 @@ impl Executor {
             && !self.validation_term_is_ground(term_id)
     }
 
-    pub(in crate::executor::model) fn contains_uninterpreted_function_app(
-        &self,
-        term_id: TermId,
-    ) -> bool {
+    /// Whether `sym` is an INTERPRETED theory operator — one the model
+    /// evaluator computes from its operands' values by the theory's own
+    /// semantics — as opposed to a user-declared function whose value comes
+    /// from the EUF model table.
+    ///
+    /// The FixedSizeBitVectors operators, their indexed forms (`extract`,
+    /// `zero_extend`, `sign_extend`, `repeat`, `rotate_*`) and the Int/BitVec
+    /// conversions (`int2bv`, `bv2nat`, `bv2int`) are built-ins. Before
+    /// #int2bv-invalid-model they were classified as uninterpreted, so a
+    /// definition like `(= v3 (bv2nat (bvshl #x1 ((_ int2bv 64) v0))))` that
+    /// the evaluator had CONCRETELY refuted — every leaf valued, every
+    /// operator interpreted — was waved through as a "UF model-extraction gap"
+    /// and a falsified model was published as `sat` (the independent gate
+    /// caught it downstream at the cost of the verdict). A refutation computed
+    /// from interpreted operators is final: there is no table to disagree with
+    /// it. Deliberately scoped to that family: every other symbol (FP, string,
+    /// datatype, user-declared) keeps its previous classification.
+    pub(in crate::executor::model) fn is_interpreted_theory_symbol(sym: &Symbol) -> bool {
+        match sym {
+            Symbol::Indexed(name, _) => matches!(
+                name.as_str(),
+                "extract"
+                    | "zero_extend"
+                    | "sign_extend"
+                    | "repeat"
+                    | "rotate_left"
+                    | "rotate_right"
+                    | "int2bv"
+            ),
+            Symbol::Named(name) => matches!(
+                name.as_str(),
+                "+" | "-"
+                    | "*"
+                    | "/"
+                    | "div"
+                    | "mod"
+                    | "abs"
+                    | "to_real"
+                    | "to_int"
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+                    | "="
+                    | "distinct"
+                    | "and"
+                    | "or"
+                    | "not"
+                    | "=>"
+                    | "ite"
+                    | "select"
+                    | "store"
+                    | "bv2nat"
+                    | "bv2int"
+                    | "bvand"
+                    | "bvor"
+                    | "bvxor"
+                    | "bvnot"
+                    | "bvnand"
+                    | "bvnor"
+                    | "bvxnor"
+                    | "bvadd"
+                    | "bvsub"
+                    | "bvneg"
+                    | "bvmul"
+                    | "bvudiv"
+                    | "bvurem"
+                    | "bvsdiv"
+                    | "bvsrem"
+                    | "bvsmod"
+                    | "bvshl"
+                    | "bvlshr"
+                    | "bvashr"
+                    | "concat"
+                    | "bvcomp"
+                    | "bvult"
+                    | "bvule"
+                    | "bvugt"
+                    | "bvuge"
+                    | "bvslt"
+                    | "bvsle"
+                    | "bvsgt"
+                    | "bvsge"
+            ),
+            // `Symbol` is `#[non_exhaustive]`: an unknown future symbol kind
+            // is treated as uninterpreted (the conservative reading).
+            _ => false,
+        }
+    }
+
+    pub(in crate::executor) fn contains_uninterpreted_function_app(&self, term_id: TermId) -> bool {
         // Visited set: hash-consed DAG, else once-per-path (exponential). Sound:
         // `any` short-circuits on the first `true`, so a continued-past node
         // evaluated `false`, fixed for this term table.
@@ -1669,31 +1768,7 @@ impl Executor {
             match self.ctx.terms.get(term_id) {
                 TermData::Const(_) | TermData::Var(_, _) => false,
                 TermData::App(sym, args) => {
-                    let name = sym.name();
-                    if matches!(
-                        name,
-                        "+" | "-"
-                            | "*"
-                            | "/"
-                            | "div"
-                            | "mod"
-                            | "abs"
-                            | "to_real"
-                            | "to_int"
-                            | "<"
-                            | "<="
-                            | ">"
-                            | ">="
-                            | "="
-                            | "distinct"
-                            | "and"
-                            | "or"
-                            | "not"
-                            | "=>"
-                            | "ite"
-                            | "select"
-                            | "store"
-                    ) {
+                    if Self::is_interpreted_theory_symbol(sym) {
                         args.iter().any(|&arg| {
                             self.contains_uninterpreted_function_app_inner(arg, visited)
                         })

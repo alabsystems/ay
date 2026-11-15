@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 3;
+sol ~p1 ~p2 q1 ~z1 ~z2;
+output NONE;
+conclusion BOUNDS 0 0;
+end pseudo-Boolean proof;

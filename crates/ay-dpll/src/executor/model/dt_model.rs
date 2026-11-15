@@ -14,7 +14,7 @@ use ay_core::term::TermData;
 use ay_core::{quote_symbol, Sort, Symbol, TermId, TermStore};
 use num_rational::BigRational;
 
-use crate::executor_format::{format_default_value_surface, format_sort_surface};
+use crate::executor_format::format_sort_surface;
 
 use super::rendered_dt_limits::SchemaSourceBudget;
 use super::{EvalValue, Executor, Model};
@@ -52,7 +52,7 @@ thread_local! {
     /// existing complete term evaluator — every string/BV/int/seq predicate is
     /// handled correctly with no op-by-op reimplementation. The map is empty (and
     /// the override is a no-op) outside `dt_mat_eval`.
-    static DT_FIELD_OVERRIDE: RefCell<Option<HashMap<TermId, EvalValue>>> =
+    static DT_FIELD_OVERRIDE: RefCell<Option<HashMap<TermId, std::rc::Rc<EvalValue>>>> =
         const { RefCell::new(None) };
 
     /// Bound terms installed specifically for contextual evaluation (currently
@@ -65,7 +65,7 @@ thread_local! {
     /// their values in a layer separate from `DT_FIELD_OVERRIDE`: datatype
     /// materializer pins are ambient model facts, while these values belong to
     /// one lexical beta environment.
-    static SCOPED_TERM_BINDINGS: RefCell<Vec<(TermId, EvalValue)>> =
+    static SCOPED_TERM_BINDINGS: RefCell<Vec<(TermId, std::rc::Rc<EvalValue>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -75,11 +75,12 @@ thread_local! {
 /// concrete field value instead of `Unknown` for a selector/recognizer it cannot
 /// otherwise resolve.
 pub(super) fn dt_field_override_lookup(term_id: TermId) -> Option<EvalValue> {
-    DT_FIELD_OVERRIDE.with(|cell| {
+    let value = DT_FIELD_OVERRIDE.with(|cell| {
         cell.borrow()
             .as_ref()
             .and_then(|m| m.get(&term_id).cloned())
-    })
+    });
+    value.map(|value| super::evaluation_copies::copy(&value))
 }
 
 /// Look up the active value of `term_id` under layered evaluator overrides.
@@ -93,10 +94,10 @@ pub(super) fn active_term_override_lookup(terms: &TermStore, term_id: TermId) ->
         cell.borrow()
             .iter()
             .rev()
-            .find_map(|(bound, value)| (*bound == term_id).then(|| value.clone()))
+            .find_map(|(bound, value)| (*bound == term_id).then(|| std::rc::Rc::clone(value)))
     });
-    if scoped.is_some() {
-        return scoped;
+    if let Some(value) = scoped {
+        return Some(super::evaluation_copies::copy(&value));
     }
     if term_depends_on_scoped_binding(terms, term_id) {
         return None;
@@ -119,11 +120,23 @@ pub(super) fn dt_field_override_active() -> bool {
 /// call (or the dt-egraph assignment self-check) and restores the previous one
 /// (supporting re-entrancy) on drop.
 pub(super) struct OverrideGuard {
-    prev: Option<HashMap<TermId, EvalValue>>,
+    prev: Option<HashMap<TermId, std::rc::Rc<EvalValue>>>,
 }
 
 impl OverrideGuard {
     pub(super) fn install(map: HashMap<TermId, EvalValue>) -> Self {
+        let admitted = super::evaluation_copies::pay(
+            map.len(),
+            map.len()
+                .saturating_mul(4 * std::mem::size_of::<(TermId, EvalValue)>()),
+        );
+        let map = if admitted {
+            map.into_iter()
+                .map(|(term, value)| (term, std::rc::Rc::new(value)))
+                .collect()
+        } else {
+            HashMap::default()
+        };
         let prev = DT_FIELD_OVERRIDE.with(|cell| cell.borrow_mut().replace(map));
         OverrideGuard { prev }
     }
@@ -144,6 +157,14 @@ struct ScopedBindingGuard {
 
 impl ScopedBindingGuard {
     fn install(term: TermId, value: EvalValue) -> Self {
+        let admitted =
+            super::evaluation_copies::pay(1, 4 * std::mem::size_of::<(TermId, EvalValue)>());
+        if !admitted {
+            return Self {
+                restore_len: SCOPED_TERM_BINDINGS.with(|slot| slot.borrow().len()),
+            };
+        }
+        let value = std::rc::Rc::new(value);
         let restore_len = SCOPED_TERM_BINDINGS.with(|cell| {
             let mut bindings = cell.borrow_mut();
             let len = bindings.len();
@@ -878,6 +899,9 @@ impl Executor {
         term_id: TermId,
         use_dt_pins: bool,
     ) -> EvalValue {
+        if !super::evaluation_copies::validate(self) {
+            return EvalValue::Unknown;
+        }
         // Every direct source below is keyed only by the ambient TermId. Under
         // beta reduction, fail closed for a dependent term: this helper is
         // commonly reached only after recursive evaluation returned Unknown,
@@ -904,7 +928,7 @@ impl Executor {
         // genuinely-consistent model.
         if use_dt_pins && !model.dt_pins.is_empty() {
             if let Some(pin) = model.dt_pins.get(&term_id) {
-                return pin.clone();
+                return super::evaluation_copies::copy(pin);
             }
         }
         let sort = self.ctx.terms.sort(term_id);
@@ -913,6 +937,9 @@ impl Executor {
         if let Sort::BitVec(bv) = sort {
             if let Some(ref bv_model) = model.bv_model {
                 if let Some(val) = bv_model.values.get(&term_id) {
+                    if !super::evaluation_copies::integer(val) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::BitVec {
                         value: val.clone(),
                         width: bv.width,
@@ -925,6 +952,9 @@ impl Executor {
         if matches!(sort, Sort::Int) {
             if let Some(ref lia_model) = model.lia_model {
                 if let Some(val) = lia_model.values.get(&term_id) {
+                    if !super::evaluation_copies::integer(val) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::Rational(BigRational::from(val.clone()));
                 }
             }
@@ -934,6 +964,9 @@ impl Executor {
         if matches!(sort, Sort::Int | Sort::Real) {
             if let Some(ref lra_model) = model.lra_model {
                 if let Some(val) = lra_model.values.get(&term_id) {
+                    if !super::evaluation_copies::rational(val) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::Rational(val.clone());
                 }
             }
@@ -942,6 +975,9 @@ impl Executor {
         // Check EUF model for uninterpreted sorts.
         if let Some(ref euf_model) = model.euf_model {
             if let Some(elem) = euf_model.term_values.get(&term_id) {
+                if !super::evaluation_copies::string(elem) {
+                    return EvalValue::Unknown;
+                }
                 return EvalValue::Element(elem.clone());
             }
         }
@@ -1156,11 +1192,11 @@ impl Executor {
             ),
             Sort::Datatype(dt) => self
                 .datatype_canonical_value(&dt.name, visited)
-                .unwrap_or_else(|| format_default_value_surface(&self.ctx, sort)),
+                .unwrap_or_else(|| self.default_value_surface(sort)),
             Sort::Uninterpreted(name) => self
                 .datatype_canonical_value(name, visited)
-                .unwrap_or_else(|| format_default_value_surface(&self.ctx, sort)),
-            _ => format_default_value_surface(&self.ctx, sort),
+                .unwrap_or_else(|| self.default_value_surface(sort)),
+            _ => self.default_value_surface(sort),
         }
     }
 
@@ -1315,7 +1351,12 @@ impl Executor {
         // array equalities + derived nested-select identity, and the observed
         // cell function per identity class. Shared verbatim with the general
         // select-congruence gate so the two never diverge.
-        let query_roots = self.independent_gate_query_roots();
+        let query_roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return false;
+            }
+        };
         let CensusIdentity {
             reachable,
             uf,
@@ -1746,9 +1787,12 @@ impl Executor {
     /// `declare-sort E` array false-SAT class) is caught. Undecidable comparisons
     /// do NOT trip it — completeness is preserved for everything except the
     /// specific inconsistency.
-    pub(in crate::executor) fn array_select_congruence_violated(&self, model: &Model) -> bool {
+    pub(in crate::executor) fn array_select_congruence_violated(
+        &self,
+        model: &Model,
+    ) -> Result<bool, crate::executor_types::UnknownOrigin> {
         let memo = CensusMemo::new();
-        let query_roots = self.independent_gate_query_roots();
+        let query_roots = self.independent_gate_query_roots()?;
         let violation = self.census_first_congruence_violation(model, &memo, &query_roots);
         if let Some((r1, r2)) = violation {
             if ay_core::misc_cli_flags().census_trace {
@@ -1762,7 +1806,7 @@ impl Executor {
                 );
             }
         }
-        violation.is_some()
+        Ok(violation.is_some())
     }
 
     /// The FIRST pair of reads that share an (identity class, evaluated index)
@@ -1827,7 +1871,12 @@ impl Executor {
         // Phase A (immutable analysis): locate the first violating read pair.
         let pair = {
             let memo = CensusMemo::new();
-            let query_roots = self.independent_gate_query_roots();
+            let query_roots = match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => {
+                    return None;
+                }
+            };
             self.census_first_congruence_violation(model, &memo, &query_roots)
         };
         let (r1, r2) = pair?;
@@ -2797,14 +2846,104 @@ impl Executor {
     /// (voiding, M4 F1/F2). Same principle when the e-graph assignment's
     /// structural self-check fails: ALL totalizations are withheld.
     pub(super) fn total_selector_definitions(&self, model: &Model) -> Vec<String> {
-        struct SelInfo {
-            dt_name: String,
-            ret_sort: Sort,
-            ctors: Vec<String>,
-            skip: bool,
+        let Some(SelectorTables {
+            infos: sel_infos,
+            cases: wrong_cases,
+            dropped,
+        }) = self.selector_tables(model)
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<&String> = sel_infos
+            .iter()
+            .filter(|(n, i)| !i.skip && !dropped.contains(n.as_str()))
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        let mut defs: Vec<String> = Vec::with_capacity(names.len());
+        for name in names {
+            let (_, info) = sel_infos
+                .iter()
+                .find(|(n, _)| n == name)
+                .expect("name collected from sel_infos above");
+            // A selector shared by EVERY constructor of its datatype is already
+            // TOTAL: the tester disjunction is exhaustive, so a wrong-ctor arm
+            // is unreachable and any default it carried would be pure
+            // fabrication (a single-constructor `(mkbox (arr ...) ...)` field
+            // accessor must not print a `((as const ...) 0)` arm the model
+            // never uses, #model-array-witness). Emit the builtin-deferral
+            // body directly. Guarded on no committed wrong-ctor cases, which
+            // cannot exist when the owning set is exhaustive.
+            if self.selector_exhaustive(info)
+                && wrong_cases.get(name).map_or(true, |c| c.is_empty())
+            {
+                defs.push(format!(
+                    "  (define-fun {sel} ((@p0 {dt})) {ret} ({sel} @p0))",
+                    sel = quote_symbol(name),
+                    dt = quote_symbol(&info.dt_name),
+                    ret = format_sort_surface(&self.ctx, &info.ret_sort),
+                ));
+                continue;
+            }
+            // else-chain: committed wrong-constructor cases first, canonical
+            // default innermost.
+            let mut els = self.canonical_default_value(&info.ret_sort);
+            if let Some(cases) = wrong_cases.get(name) {
+                for (arg, val) in cases.iter().rev() {
+                    els = format!("(ite (= @p0 {arg}) {val} {els})");
+                }
+            }
+            let tester = |c: &String| format!("((_ is {}) @p0)", quote_symbol(self.dt_surface(c)));
+            let cond = if info.ctors.len() == 1 {
+                tester(&info.ctors[0])
+            } else {
+                format!(
+                    "(or {})",
+                    info.ctors.iter().map(tester).collect::<Vec<_>>().join(" ")
+                )
+            };
+            defs.push(format!(
+                "  (define-fun {sel} ((@p0 {dt})) {ret} (ite {cond} ({sel} @p0) {els}))",
+                sel = quote_symbol(name),
+                dt = quote_symbol(&info.dt_name),
+                ret = format_sort_surface(&self.ctx, &info.ret_sort),
+            ));
         }
-        // Insertion-ordered (name, info) list; datatype_iter order is
-        // deterministic and small, so linear find is fine.
+        defs
+    }
+
+    /// Whether every constructor of `info`'s datatype owns the selector.
+    fn selector_exhaustive(&self, info: &SelInfo) -> bool {
+        self.ctx
+            .datatype_iter()
+            .find(|(n, _)| *n == info.dt_name)
+            .is_some_and(|(_, ctors)| ctors.iter().all(|c| info.ctors.iter().any(|ic| ic == c)))
+    }
+
+    /// What the printed selector totalizations are built from
+    /// ([`Self::total_selector_definitions`]): every selector of the
+    /// query-relevant datatypes and its committed wrong-constructor cases.
+    /// `(get-value)` of a selector application the query never mentions reads
+    /// the same tables (`wrong_ctor_get_value.rs`), so the two never disagree.
+    /// `None` when no table is printed at all.
+    pub(super) fn selector_tables(&self, model: &Model) -> Option<SelectorTables> {
+        // The committed cases are the applications' own values; a
+        // `(get-value)` read of a non-query application reads these tables,
+        // so inside them it must take the ordinary path.
+        struct Building(bool);
+        impl Drop for Building {
+            fn drop(&mut self) {
+                BUILDING_SELECTOR_TABLES.with(|b| b.set(self.0));
+            }
+        }
+        let _restore = Building(BUILDING_SELECTOR_TABLES.with(|b| b.replace(true)));
+        self.selector_tables_inner(model)
+    }
+
+    /// Every selector of the query-relevant, non-parametric datatypes, in
+    /// insertion order (`datatype_iter` order is deterministic and small, so
+    /// a linear find is fine).
+    fn selector_infos(&self) -> Vec<(String, SelInfo)> {
         let mut sel_infos: Vec<(String, SelInfo)> = Vec::new();
         let relevant_carriers = self.query_relevant_datatype_carriers();
         for (dt_name, ctors) in self.ctx.datatype_iter() {
@@ -2848,8 +2987,13 @@ impl Executor {
                 }
             }
         }
+        sel_infos
+    }
+
+    fn selector_tables_inner(&self, model: &Model) -> Option<SelectorTables> {
+        let sel_infos = self.selector_infos();
         if sel_infos.is_empty() {
-            return Vec::new();
+            return None;
         }
 
         // Committed wrong-constructor cases, one pass over the term store:
@@ -2877,183 +3021,206 @@ impl Executor {
             // every total selector definition (fail-closed partial model)
             // rather than emit totalizations whose committed cases the
             // validator could refute (#mv-dt-single-source).
-            return Vec::new();
+            return None;
         }
         let mut wrong_cases: HashMap<String, Vec<(String, String)>> = HashMap::default();
         let mut dropped: HashSet<String> = HashSet::default();
-        for raw in 0..self.ctx.terms.len() {
-            let tid = TermId(raw as u32);
-            let TermData::App(sym, args) = self.ctx.terms.get(tid) else {
-                continue;
-            };
-            if args.len() != 1 {
-                continue;
+        // A published finite-domain lane model commits the value of every
+        // selector on nil, applied or not (#dt-fd-ground-model).
+        for (sel, arg, value) in self.dt_fd_ground_wrong_ctor_cases() {
+            if sel_infos.iter().any(|(n, i)| *n == sel && !i.skip) {
+                wrong_cases.entry(sel).or_default().push((arg, value));
             }
-            let name = sym.name();
-            if dropped.contains(name) {
-                continue;
-            }
-            let Some((_, info)) = sel_infos.iter().find(|(n, _)| n == name) else {
-                continue;
-            };
-            if info.skip
-                || self
-                    .datatype_sort_name(self.ctx.terms.sort(args[0]))
-                    .as_deref()
-                    != Some(info.dt_name.as_str())
-            {
-                continue;
-            }
-            // An argument committed to an OWNING constructor is covered by the
-            // tester arm (which is evaluated first). With the e-graph
-            // assignment the constructor is read directly off the class.
-            if let Some(cls_ctor) = self.dt_egraph_class_ctor(model, args[0]) {
-                if info.ctors.iter().any(|c| *c == cls_ctor) {
-                    continue;
-                }
-            }
-            let arg_val = if egraph {
-                self.dt_egraph_value(model, args[0])
-            } else {
-                self.term_value_string(model, args[0]).ok()
-            };
-            let Some(arg_str) = arg_val else {
-                // A committed case with no representable key cannot be part of
-                // a faithful total definition — drop the definition.
-                if ay_core::misc_cli_flags().phase_trace {
-                    eprintln!(
-                        "c phase-trace mv-total-sel-drop sel={name} reason=arg-unrenderable tid={} arg={}",
-                        tid.0, args[0].0
-                    );
-                }
-                dropped.insert(name.to_string());
-                continue;
-            };
-            if arg_str.contains('@') {
-                // Abstract/skolem leak in the branch KEY: not expressible as a
-                // reliable `(= @p0 …)` guard — fail closed (M4 F2; the former
-                // silent case-skip let the default arm override a committed
-                // gate-checked value: a voiding channel).
-                if ay_core::misc_cli_flags().phase_trace {
-                    eprintln!(
-                        "c phase-trace mv-total-sel-drop sel={name} reason=abstract-key tid={} arg_str={arg_str}",
-                        tid.0
-                    );
-                }
-                dropped.insert(name.to_string());
-                continue;
-            }
-            // Legacy owning-constructor detection by rendered head (kept as a
-            // backstop for the non-e-graph path).
-            let head = sexpr_head(&arg_str);
-            if info.ctors.iter().any(|c| self.dt_surface(c) == head) {
-                continue;
-            }
-            let app_val = if egraph && self.datatype_sort_name(&info.ret_sort).is_some() {
-                self.dt_egraph_value(model, tid)
-            } else {
-                self.term_value_string(model, tid).ok()
-            };
-            let Some(val_str) = app_val else {
-                if ay_core::misc_cli_flags().phase_trace {
-                    eprintln!(
-                        "c phase-trace mv-total-sel-drop sel={name} reason=value-unrenderable tid={} arg_str={arg_str}",
-                        tid.0
-                    );
-                }
-                dropped.insert(name.to_string());
-                continue;
-            };
-            let cases = wrong_cases.entry(name.to_string()).or_default();
-            match cases.iter().find(|(a, _)| *a == arg_str) {
-                Some((_, prev)) if *prev != val_str => {
-                    // Two committed values for ONE argument value is a
-                    // model-coherence violation; printing either would
-                    // contradict the internal model on the other application.
-                    // Surface it loudly and drop the definition (fail-closed;
-                    // the former keep-the-first silently printed a value
-                    // contradicting the internal model).
-                    tracing::warn!(
-                        selector = name,
-                        arg = %arg_str,
-                        "conflicting committed selector values for one argument \
-                         value; dropping the selector's total definition"
-                    );
-                    if ay_core::misc_cli_flags().phase_trace {
-                        eprintln!(
-                            "c phase-trace mv-total-sel-drop sel={name} reason=conflict tid={} arg_str={arg_str} val={val_str} prev={prev}",
-                            tid.0
-                        );
-                    }
-                    dropped.insert(name.to_string());
-                }
-                Some(_) => {}
-                None => cases.push((arg_str, val_str)),
-            }
+        }
+        // Only applications the last decision command's model valued commit
+        // a case: one interned afterwards (a `(get-value)` term such as
+        // `(tl nil)`) has no value of its own, and counting its fallback
+        // value dropped the table or printed it beside a committed case for
+        // the same argument (E13 round 6, `cong_uf`).
+        let committed_len = self.ctx.terms.len().min(self.model_term_len);
+        for raw in 0..committed_len {
+            self.record_committed_case(
+                model,
+                egraph,
+                TermId(raw as u32),
+                &sel_infos,
+                &mut wrong_cases,
+                &mut dropped,
+            );
         }
 
-        let mut names: Vec<&String> = sel_infos
-            .iter()
-            .filter(|(n, i)| !i.skip && !dropped.contains(n.as_str()))
-            .map(|(n, _)| n)
-            .collect();
-        names.sort();
-        let mut defs: Vec<String> = Vec::with_capacity(names.len());
-        for name in names {
-            let (_, info) = sel_infos
-                .iter()
-                .find(|(n, _)| n == name)
-                .expect("name collected from sel_infos above");
-            // A selector shared by EVERY constructor of its datatype is already
-            // TOTAL: the tester disjunction is exhaustive, so a wrong-ctor arm
-            // is unreachable and any default it carried would be pure
-            // fabrication (a single-constructor `(mkbox (arr ...) ...)` field
-            // accessor must not print a `((as const ...) 0)` arm the model
-            // never uses, #model-array-witness). Emit the builtin-deferral
-            // body directly. Guarded on no committed wrong-ctor cases, which
-            // cannot exist when the owning set is exhaustive.
-            let exhaustive = self
-                .ctx
-                .datatype_iter()
-                .find(|(n, _)| *n == info.dt_name)
-                .is_some_and(|(_, ctors)| {
-                    ctors.iter().all(|c| info.ctors.iter().any(|ic| ic == c))
-                });
-            if exhaustive && wrong_cases.get(name).map_or(true, |c| c.is_empty()) {
-                defs.push(format!(
-                    "  (define-fun {sel} ((@p0 {dt})) {ret} ({sel} @p0))",
-                    sel = quote_symbol(name),
-                    dt = quote_symbol(&info.dt_name),
-                    ret = format_sort_surface(&self.ctx, &info.ret_sort),
-                ));
-                continue;
-            }
-            // else-chain: committed wrong-constructor cases first, canonical
-            // default innermost.
-            let mut els = self.canonical_default_value(&info.ret_sort);
-            if let Some(cases) = wrong_cases.get(name) {
-                for (arg, val) in cases.iter().rev() {
-                    els = format!("(ite (= @p0 {arg}) {val} {els})");
-                }
-            }
-            let tester = |c: &String| format!("((_ is {}) @p0)", quote_symbol(self.dt_surface(c)));
-            let cond = if info.ctors.len() == 1 {
-                tester(&info.ctors[0])
-            } else {
-                format!(
-                    "(or {})",
-                    info.ctors.iter().map(tester).collect::<Vec<_>>().join(" ")
-                )
-            };
-            defs.push(format!(
-                "  (define-fun {sel} ((@p0 {dt})) {ret} (ite {cond} ({sel} @p0) {els}))",
-                sel = quote_symbol(name),
-                dt = quote_symbol(&info.dt_name),
-                ret = format_sort_surface(&self.ctx, &info.ret_sort),
-            ));
-        }
-        defs
+        Some(SelectorTables {
+            infos: sel_infos,
+            cases: wrong_cases,
+            dropped,
+        })
     }
+
+    /// One store term's contribution to [`Self::selector_tables`]: a
+    /// committed wrong-constructor case, or the reason its selector's table
+    /// is withheld.
+    fn record_committed_case(
+        &self,
+        model: &Model,
+        egraph: bool,
+        tid: TermId,
+        sel_infos: &[(String, SelInfo)],
+        wrong_cases: &mut HashMap<String, Vec<(String, String)>>,
+        dropped: &mut HashSet<String>,
+    ) {
+        let TermData::App(sym, args) = self.ctx.terms.get(tid) else {
+            return;
+        };
+        if args.len() != 1 {
+            return;
+        }
+        let name = sym.name();
+        if dropped.contains(name) {
+            return;
+        }
+        let Some((_, info)) = sel_infos.iter().find(|(n, _)| n == name) else {
+            return;
+        };
+        if info.skip
+            || self
+                .datatype_sort_name(self.ctx.terms.sort(args[0]))
+                .as_deref()
+                != Some(info.dt_name.as_str())
+        {
+            return;
+        }
+        // An argument committed to an OWNING constructor is covered by the
+        // tester arm (which is evaluated first). With the e-graph
+        // assignment the constructor is read directly off the class.
+        if let Some(cls_ctor) = self.dt_egraph_class_ctor(model, args[0]) {
+            if info.ctors.iter().any(|c| *c == cls_ctor) {
+                return;
+            }
+        }
+        let arg_val = if let Some(lane) = self.dt_fd_ground_value(model, args[0]) {
+            Some(lane)
+        } else if egraph {
+            self.dt_egraph_value(model, args[0])
+        } else {
+            self.term_value_string(model, args[0]).ok()
+        };
+        let Some(arg_str) = arg_val else {
+            // A committed case with no representable key cannot be part of
+            // a faithful total definition — drop the definition.
+            if ay_core::misc_cli_flags().phase_trace {
+                eprintln!(
+                    "c phase-trace mv-total-sel-drop sel={name} reason=arg-unrenderable tid={} arg={}",
+                    tid.0, args[0].0
+                );
+            }
+            dropped.insert(name.to_string());
+            return;
+        };
+        if arg_str.contains('@') {
+            // Abstract/skolem leak in the branch KEY: not expressible as a
+            // reliable `(= @p0 …)` guard — fail closed (M4 F2; the former
+            // silent case-skip let the default arm override a committed
+            // gate-checked value: a voiding channel).
+            if ay_core::misc_cli_flags().phase_trace {
+                eprintln!(
+                    "c phase-trace mv-total-sel-drop sel={name} reason=abstract-key tid={} arg_str={arg_str}",
+                    tid.0
+                );
+            }
+            dropped.insert(name.to_string());
+            return;
+        }
+        // Legacy owning-constructor detection by rendered head (kept as a
+        // backstop for the non-e-graph path).
+        let head = sexpr_head(&arg_str);
+        if info.ctors.iter().any(|c| self.dt_surface(c) == head) {
+            return;
+        }
+        let app_val = if let Some(lane) = self.dt_fd_ground_value(model, tid) {
+            Some(lane)
+        } else if egraph && self.datatype_sort_name(&info.ret_sort).is_some() {
+            self.dt_egraph_value(model, tid)
+        } else {
+            self.term_value_string(model, tid).ok()
+        };
+        let Some(val_str) = app_val else {
+            if ay_core::misc_cli_flags().phase_trace {
+                eprintln!(
+                    "c phase-trace mv-total-sel-drop sel={name} reason=value-unrenderable tid={} arg_str={arg_str}",
+                    tid.0
+                );
+            }
+            dropped.insert(name.to_string());
+            return;
+        };
+        insert_committed_case(name, arg_str, val_str, tid, wrong_cases, dropped);
+    }
+}
+
+thread_local! {
+    /// Set while [`Executor::selector_tables`] collects committed cases.
+    pub(super) static BUILDING_SELECTOR_TABLES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Add one committed case `(arg_str -> val_str)` of selector `name`, or
+/// withhold its table when it conflicts with an earlier one
+/// (#mv-total-selector-fail-closed).
+fn insert_committed_case(
+    name: &str,
+    arg_str: String,
+    val_str: String,
+    tid: TermId,
+    wrong_cases: &mut HashMap<String, Vec<(String, String)>>,
+    dropped: &mut HashSet<String>,
+) {
+    let cases = wrong_cases.entry(name.to_string()).or_default();
+    match cases.iter().find(|(a, _)| *a == arg_str) {
+        Some((_, prev)) if *prev != val_str => {
+            // Two committed values for ONE argument value is a
+            // model-coherence violation; printing either would
+            // contradict the internal model on the other application.
+            // Surface it loudly and drop the definition (fail-closed;
+            // the former keep-the-first silently printed a value
+            // contradicting the internal model).
+            tracing::warn!(
+                selector = name,
+                arg = %arg_str,
+                "conflicting committed selector values for one argument \
+                 value; dropping the selector's total definition"
+            );
+            if ay_core::misc_cli_flags().phase_trace {
+                eprintln!(
+                    "c phase-trace mv-total-sel-drop sel={name} reason=conflict tid={} arg_str={arg_str} val={val_str} prev={prev}",
+                    tid.0
+                );
+            }
+            dropped.insert(name.to_string());
+        }
+        Some(_) => {}
+        None => cases.push((arg_str, val_str)),
+    }
+}
+
+/// One selector of [`SelectorTables`].
+pub(super) struct SelInfo {
+    pub(super) dt_name: String,
+    pub(super) ret_sort: Sort,
+    /// The constructors owning it.
+    pub(super) ctors: Vec<String>,
+    /// Its name is shared across datatypes or field sorts: no table.
+    pub(super) skip: bool,
+}
+
+/// The inputs of the printed selector totalizations
+/// ([`Executor::selector_tables`]).
+pub(super) struct SelectorTables {
+    /// Insertion-ordered `(selector, info)`.
+    pub(super) infos: Vec<(String, SelInfo)>,
+    /// selector -> `[(rendered argument value, rendered value)]`.
+    pub(super) cases: HashMap<String, Vec<(String, String)>>,
+    /// Selectors whose table is withheld (fail-closed).
+    pub(super) dropped: HashSet<String>,
 }
 
 /// Head symbol of a rendered s-expression value: `(cons a b)` -> `cons`,

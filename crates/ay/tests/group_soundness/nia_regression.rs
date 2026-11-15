@@ -93,3 +93,81 @@ fn test_nia_tswift_pattern_soundness() {
         "tswift_pattern.smt2 should not be unsat (it's satisfiable), got: {result}"
     );
 }
+
+/// Run `ay` on a QF_NIA benchmark and return `(first stdout line, stderr)`.
+///
+/// The panic regressions below assert on stderr as well as the verdict: a
+/// solver thread that panics is caught by the portfolio's `catch_unwind`, so
+/// the process still exits 0 and prints a verdict. Only stderr distinguishes
+/// "declined" from "crashed".
+fn run_ay_with_stderr(smt_file: &str) -> (String, String) {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    let benchmark_path = format!(
+        "{}/../../benchmarks/smt/QF_NIA/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        smt_file
+    );
+
+    let output = Command::new(ay_path)
+        .arg("solve")
+        .arg("--no-proof")
+        .arg(&benchmark_path)
+        .output()
+        .expect("Failed to spawn ay");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let verdict = stdout
+        .lines()
+        .find(|line| !line.starts_with("c ") && !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (verdict, stderr)
+}
+
+/// A full-width `i64` box must not make bounded enumeration overflow.
+///
+/// `x, y in [i64::MIN, i64::MAX]` is exactly what model-checker-consumer emits for a 64-bit
+/// signed-overflow obligation. Phase 3 of `try_bounded_enumeration` computed
+/// `hi - lo + 1` in `i64` and PANICKED at `bounded_enum.rs:264:25` with
+/// "attempt to subtract with overflow" (10 occurrences while compiler_consumer verified
+/// `library/core`). The box is astronomically past `MAX_ENUM_DOMAIN`, so
+/// declining is the provably right answer. Satisfiable (x = 6, y = 1), so
+/// `unsat` would be a wrong answer.
+#[test]
+#[timeout(60000)]
+fn test_nia_i64_full_width_box_does_not_panic() {
+    let (verdict, stderr) = run_ay_with_stderr("i64_full_width_box_8616.smt2");
+    assert!(
+        !stderr.contains("panicked at"),
+        "the solver must not panic on a full-width i64 box; stderr: {stderr}"
+    );
+    assert_ne!(
+        verdict, "unsat",
+        "i64_full_width_box_8616.smt2 is satisfiable (x=6, y=1), got: {verdict}"
+    );
+}
+
+/// An `i128::MIN` constant must not make the clausal local-search lane
+/// overflow.
+///
+/// The constant fits `Mono::coeff` but its negation does not, and `atom_lit`
+/// builds `lhs - rhs` through `neg_poly`, which PANICKED at
+/// `local_search.rs:586:19` with "attempt to negate with overflow" (3
+/// occurrences while compiler_consumer verified `library/core`). The lane is SAT-only and
+/// must simply decline. Satisfiable — 33334 * (3, 4, 5) — so `unsat` would be a
+/// wrong answer.
+#[test]
+#[timeout(60000)]
+fn test_nia_i128_min_constant_does_not_panic() {
+    let (verdict, stderr) = run_ay_with_stderr("i128_min_constant_sls_8616.smt2");
+    assert!(
+        !stderr.contains("panicked at"),
+        "the solver must not panic on an i128::MIN constant; stderr: {stderr}"
+    );
+    assert_ne!(
+        verdict, "unsat",
+        "i128_min_constant_sls_8616.smt2 is satisfiable, got: {verdict}"
+    );
+}

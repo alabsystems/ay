@@ -8,7 +8,7 @@ use crate::bv_util::bv_mask;
 use crate::clause::ActionId;
 use crate::{
     ChcExpr, ChcOp, ChcResult, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause, Predicate,
-    PredicateId, NORMALIZED_CHC_INPUT_SCHEMA,
+    PredicateId,
 };
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use sha2::{Digest, Sha256};
@@ -17,10 +17,19 @@ use std::sync::Arc;
 mod analysis;
 mod api;
 mod case_split;
+mod identity;
+mod nullary_expansion;
+mod or_split_share;
+mod playback_projection;
 mod preprocess;
+mod projection;
 mod scalarization;
+mod simplified_conjunction;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use nullary_expansion::{ExpandedClauseOrigin, NullaryExpansion};
+pub use playback_projection::{ChcQueryPlayback, ChcQueryPlaybackControl, ChcQueryPlaybackError};
 
 const PRUNED_FALSE_QUERY_CONTENT_SCHEMA: &str = "ay.chc-pruned-false-query-clause-content/v1";
 
@@ -106,7 +115,7 @@ impl ChcPrunedQueryObligationId {
                 let (action, payload) = remainder.split_once('\n')?;
                 (action == "none" || action.parse::<usize>().is_ok()).then_some(payload)
             })
-            .is_some_and(|payload| payload.starts_with(NORMALIZED_CHC_INPUT_SCHEMA))
+            .is_some_and(|payload| crate::normalized_chc_input_schema_of(payload).is_some())
             && sha256_hex(self.content.as_bytes()) == self.content_sha256
     }
 }
@@ -124,6 +133,7 @@ pub struct ChcQueryObligationId {
     query_clause_index: usize,
     defining_clause_index: Option<usize>,
     label: String,
+    normalized_input_schema: &'static str,
     content_sha256: String,
 }
 
@@ -149,11 +159,20 @@ impl ChcQueryObligationId {
         &self.label
     }
 
+    /// Schema named by the same normalized input that `content_sha256` hashes.
+    ///
+    /// Retain this label with the digest when binding replay evidence: datatype
+    /// references use a different schema from datatype-free canonical input.
+    pub fn normalized_input_schema(&self) -> &'static str {
+        self.normalized_input_schema
+    }
+
     /// SHA-256 of the obligation's deterministic normalized CHC input.
     ///
     /// Unlike the source-clause indices, this binds the identity to the exact
     /// independently solvable problem content and remains stable across
-    /// repeated construction of the same slice.
+    /// repeated construction of the same slice. Its normalized-input schema is
+    /// available through [`Self::normalized_input_schema`].
     pub fn content_sha256(&self) -> &str {
         &self.content_sha256
     }

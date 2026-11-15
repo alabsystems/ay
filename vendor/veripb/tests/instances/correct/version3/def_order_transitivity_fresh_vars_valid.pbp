@@ -1,0 +1,39 @@
+pseudo-Boolean proof version 3.0
+% The positive control for the fresh-variable validation: a real order with an auxiliary
+% variable, one fresh copy per `right` variable and one fresh copy of the auxiliary variable per
+% instance of the relation. All three lists have the declared arity and no entry aliases a
+% `left`, `right` or `aux` variable, so the order still installs and this proof still checks.
+%
+% `ignore(elaborate)` is not about this defect: the elaborated form of a `def_order`
+% transitivity subproof does not re-check on the UNFIXED build either (its `qed` hint points at
+% a non-contradicting constraint), so requiring it here would assert a pre-existing elaborator
+% limitation rather than anything about the fresh-variable lists.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 ~$z +1 u1 +1 ~v1 >= 1 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+      fresh_aux_1 $b1 ;
+      fresh_aux_2 $c1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

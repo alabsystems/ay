@@ -111,7 +111,12 @@ fn remove_owned_dimacs_proof(path: &str) -> io::Result<bool> {
     let Some(state) = owned.get_mut(&resolved) else {
         return Ok(false);
     };
+    // A removed generation is one no verdict will answer with: silence its
+    // writer, if one is still alive, and let an exit in progress know.
+    state.custody.abandon();
     let status_cleanup = match state.status_reservation.take() {
+        // An unanswered exit already settled it stale-not-current.
+        Some(reservation) if reservation.custody.settled_by_exit() => Ok(()),
         Some(reservation) => {
             publish_reserved_dimacs_proof_status(reservation, "stale-not-current", None).map(drop)
         }
@@ -123,7 +128,9 @@ fn remove_owned_dimacs_proof(path: &str) -> io::Result<bool> {
         // proof and status cleanup have each either removed the owned
         // generation or restored an unrelated replacement. Retryable failures
         // keep the remaining authority in place.
-        owned.remove(&resolved);
+        if let Some(removed) = owned.remove(&resolved) {
+            release_dimacs_proof_custody(&removed.custody);
+        }
     }
     match (proof_cleanup, status_cleanup) {
         (Ok(removed), Ok(())) => Ok(removed),
@@ -135,15 +142,14 @@ fn remove_owned_dimacs_proof(path: &str) -> io::Result<bool> {
     }
 }
 
-fn flush_dimacs_timeout_outputs(solver: Option<&mut SatSolver>) {
-    if let Some(solver) = solver {
+/// Discard, never complete, the proof of a solve that timed out: its writer
+/// drops its buffered bytes unwritten and the generation is removed. Only the
+/// Fmla dry-run artifact, which authorizes nothing, is kept.
+fn discard_dimacs_timeout_outputs(mut solver: Option<&mut SatSolver>, proof: Option<&ProofConfig>) {
+    if let Some(solver) = solver.as_deref_mut() {
         retain_fmla_learned_lrat_dry_run_artifact_from_env(solver);
-        if let Some(mut proof_output) = solver.take_proof_writer() {
-            if let Err(error) = proof_output.flush() {
-                safe_eprintln!("c Warning: failed to flush proof output on timeout: {error}");
-            }
-        }
     }
+    discard_owned_dimacs_proof(solver, proof);
 }
 
 fn retain_fmla_learned_lrat_dry_run_artifact_from_env(solver: &SatSolver) {
@@ -277,17 +283,19 @@ fn write_decimal_usize<W: Write>(out: &mut W, mut value: usize) -> io::Result<()
 
 /// DIMACS-specific timeout handling: prints "s UNKNOWN" in SAT competition
 /// format instead of the SMT-LIB "unknown" that `exit_if_timed_out` produces
-/// (#8674), and drains proof output before the caller exits (#2971).
+/// (#8674). The proof of the timed-out solve is discarded first, never
+/// flushed (2026-09-13): a run that does not answer leaves no proof behind.
 fn dimacs_timeout_exit_code_for_policy(
     solver: Option<&mut SatSolver>,
+    proof: Option<&ProofConfig>,
     sat_competition_wrapper: bool,
 ) -> Option<i32> {
     if TIMED_OUT.load(Ordering::SeqCst) {
+        discard_dimacs_timeout_outputs(solver, proof);
         if !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
             safe_println!("s UNKNOWN");
         }
         safe_eprintln!("c timeout");
-        flush_dimacs_timeout_outputs(solver);
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
         return Some(timeout_exit_code_for_sat_competition_wrapper(
@@ -297,15 +305,35 @@ fn dimacs_timeout_exit_code_for_policy(
     None
 }
 
-fn dimacs_timeout_exit_code(solver: Option<&mut SatSolver>) -> Option<i32> {
-    dimacs_timeout_exit_code_for_policy(solver, sat_competition_wrapper_timeout_policy())
+fn dimacs_timeout_exit_code(
+    solver: Option<&mut SatSolver>,
+    proof: Option<&ProofConfig>,
+) -> Option<i32> {
+    dimacs_timeout_exit_code_for_policy(solver, proof, sat_competition_wrapper_timeout_policy())
 }
 
 /// DIMACS-specific timeout exit: prints "s UNKNOWN" in SAT competition format
 /// instead of the SMT-LIB "unknown" that `exit_if_timed_out` produces (#8674).
-fn dimacs_exit_if_timed_out(solver: Option<&mut SatSolver>) {
-    if let Some(code) = dimacs_timeout_exit_code(solver) {
+fn dimacs_exit_if_timed_out(solver: Option<&mut SatSolver>, proof: Option<&ProofConfig>) {
+    if !TIMED_OUT.load(Ordering::SeqCst) {
+        return;
+    }
+    settle_unanswered_dimacs_exit();
+    if let Some(code) = dimacs_timeout_exit_code(solver, proof) {
         std::process::exit(code);
+    }
+}
+
+/// Settle the run as unanswered before a main-thread exit that prints no
+/// decisive verdict: if a hard exit already owns the run, leave the exit to
+/// it; otherwise discard every proof generation the run still holds.
+fn settle_unanswered_dimacs_exit() {
+    match crate::claim_unanswered_outcome() {
+        crate::UnansweredClaim::AlreadyUnanswered => crate::yield_to_exiting_thread(),
+        crate::UnansweredClaim::Won => discard_unanswered_dimacs_proofs(),
+        // Unreachable from a main-thread unanswered exit: the thread that
+        // claimed the verdict is the one publishing it. Never discard its proof.
+        crate::UnansweredClaim::Decisive(_) => {}
     }
 }
 use ay_sat::auto::DecisionSource;

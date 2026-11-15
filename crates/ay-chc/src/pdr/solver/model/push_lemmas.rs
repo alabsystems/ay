@@ -190,6 +190,28 @@ impl PdrSolver {
     /// A positive invariant L can be pushed if:
     /// - For all transitions T: Frame[k] /\ T => L' (in the post-state)
     /// - Equivalently: Frame[k] /\ T /\ NOT(L') is UNSAT
+    /// The `clause_guarded_constraint` check level of a push from `level` to
+    /// `level + 1`.
+    ///
+    /// A clause guard is a body lemma at level L translated through the clause
+    /// and stored with `max_level = L + 1` (Z3's `next_level`,
+    /// `propagate_lemma_to_users`); `clause_guarded_constraint(.., c)` keeps it
+    /// iff `c <= L + 1`, i.e. iff the query's body frame `F_{c-1}` lies inside
+    /// `F_L` — the convention of the blocking and admission queries, whose check
+    /// level is the HEAD level (body frame one below). A push from `level`
+    /// assumes the body frame `F_level`, so its check level is `level + 1`:
+    /// Spacer's `propagate_to_next_level` calls `is_invariant(next_level(lvl))`.
+    /// Passing `level` admitted guards from body lemmas at `level - 1` that
+    /// `F_level` does not imply: the pushed lemma was then not inductive
+    /// relative to `F_level`, `F_level ≡ F_{level+1}` could be declared on
+    /// non-inductive frames, and the fixed-point model failed verification (a
+    /// demotion; every demoted Safe is a lost solve). Found by Workstream B on
+    /// HOLA-44 (`cross-predicate push: advanced (>= __p3_a8 0) for pred 3 to
+    /// level 3 via pred 18`, then `verify_model: clause 14 implication failed`).
+    pub(in crate::pdr::solver) const fn push_guard_check_level(level: usize) -> usize {
+        level + 1
+    }
+
     pub(in crate::pdr::solver) fn can_push_lemma(&mut self, lemma: &Lemma, level: usize) -> bool {
         // #5653 Phase 1A: ALL lemmas get full SMT inductiveness check during push.
         // Previously, 75% of discovered invariants at level 1 skipped this check
@@ -277,9 +299,15 @@ impl PdrSolver {
                 };
             // #2515: Match Spacer's is_invariant rule-tag semantics by including
             // clause-guarded propagated lemmas only for this active clause.
-            // #2536: Level-aware — only include lemmas valid at this push level.
-            let guarded =
-                self.clause_guarded_constraint(lemma.predicate, clause_index, head_args, level);
+            // #2536: Level-aware — only include lemmas valid at this push level:
+            // the check level of a push from `level` is `level + 1`
+            // (`push_guard_check_level`).
+            let guarded = self.clause_guarded_constraint(
+                lemma.predicate,
+                clause_index,
+                head_args,
+                Self::push_guard_check_level(level),
+            );
 
             // Negated equality splitting: ¬(a = b) → (a < b) ∨ (a > b)
             // Controlled by config. Helps dillig-style benchmarks but doubles queries (#470).
@@ -365,9 +393,13 @@ impl PdrSolver {
             if clause.body.predicates.len() > 1 {
                 let mut body_constraints = Vec::with_capacity(clause.body.predicates.len());
                 for (body_pred, body_args) in &clause.body.predicates {
-                    let frame_constraint = self.frames[level]
-                        .get_predicate_constraint(*body_pred)
-                        .unwrap_or(ChcExpr::Bool(true));
+                    // Under the lane every body frame is the delta frame (S6).
+                    let frame_constraint = if self.spacer_core {
+                        self.frame_hyp(level, *body_pred)
+                    } else {
+                        self.frames[level].get_predicate_constraint(*body_pred)
+                    }
+                    .unwrap_or(ChcExpr::Bool(true));
                     match self.apply_to_args(*body_pred, &frame_constraint, body_args) {
                         Some(e) => body_constraints.push(e),
                         None => return false,
@@ -432,10 +464,15 @@ impl PdrSolver {
             // Linear clause (one predicate in body)
             let (body_pred, body_args) = &clause.body.predicates[0];
 
-            // Get frame constraint at level k for the body predicate
-            let frame_constraint = self.frames[level]
-                .get_predicate_constraint(*body_pred)
-                .unwrap_or(ChcExpr::Bool(true));
+            // Get frame constraint at level k for the body predicate.
+            // Workstream B (D2, `DESIGN` §4.3 item 2): under the lane the ONE
+            // frame hypothesis is the delta frame `frame_hyp(k)`.
+            let frame_constraint = if self.spacer_core {
+                self.frame_hyp(level, *body_pred)
+            } else {
+                self.frames[level].get_predicate_constraint(*body_pred)
+            }
+            .unwrap_or(ChcExpr::Bool(true));
 
             let frame_on_body = match self.apply_to_args(*body_pred, &frame_constraint, body_args) {
                 Some(e) => e,

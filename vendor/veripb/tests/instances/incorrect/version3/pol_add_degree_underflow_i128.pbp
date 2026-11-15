@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the same unguarded degree bookkeeping in `GeneralPBConstraint::add` at
+% the i128 instantiation. The degree sum is i128::MIN + 3, the merge of `5 x1` with `5 ~x1`
+% cancels 5, so the true degree is i128::MIN - 2 and used to wrap positive. The formula is
+% satisfiable: the only constraint is trivially true.
+f 1 ;
+pol 1 ~x1 5 * + ;
+pol 2 x2 w ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

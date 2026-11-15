@@ -112,6 +112,7 @@ impl ChcParser {
 
         match first.as_str() {
             "let" => self.parse_let_expr(),
+            "lambda" => self.parse_lambda_expr(),
             "forall" | "exists" => self.parse_quantifier_expr(&first),
             "as" => self.parse_as_expr(),
             _ => self.parse_application(&first),
@@ -252,6 +253,7 @@ impl ChcParser {
         // Add let-bound variables to the variable map before parsing body
         // This ensures that references to these variables get the correct sort
         let mut old_values = Vec::new();
+        let scope = self.enter_let_scope(&bindings);
         for (name, value) in &bindings {
             let sort = value.sort();
             let old = self.variables.insert(name.clone(), sort);
@@ -260,6 +262,7 @@ impl ChcParser {
 
         self.skip_whitespace_and_comments();
         let body = self.parse_expr()?;
+        self.leave_let_scope(scope);
         self.skip_whitespace_and_comments();
         self.expect_char(')')?;
 
@@ -295,6 +298,11 @@ impl ChcParser {
 
     /// Parse quantifier expression (forall/exists)
     fn parse_quantifier_expr(&mut self, quantifier: &str) -> ChcResult<ChcExpr> {
+        if self.lambda_depth != 0 {
+            return Err(ChcError::Parse(
+                "quantifiers inside array lambdas are unsupported".into(),
+            ));
+        }
         self.skip_whitespace_and_comments();
         self.expect_char('(')?;
 
@@ -343,11 +351,7 @@ impl ChcParser {
             self.expect_char(')')?;
 
             // Register variable in scope (CHC treats quantifiers as implicit)
-            let registered_name = if self.clause_binder_names.contains(&var_name)
-                || self.declared_var_names.contains(&var_name)
-                || self.functions.contains_key(&var_name)
-                || self.predicates.contains_key(&var_name)
-            {
+            let registered_name = if self.binder_must_be_renamed(&var_name) {
                 let fresh = self.fresh_binder_name(&var_name);
                 self.variables.insert(fresh.clone(), sort);
                 self.clause_binder_names.insert(fresh.clone());
@@ -373,7 +377,10 @@ impl ChcParser {
         self.expect_char(')')?;
 
         self.skip_whitespace_and_comments();
+        self.quantifier_seen = false;
         let body = self.parse_expr()?;
+        let nested_quantifier = self.quantifier_seen;
+        self.quantifier_seen = true;
         // This binder group's renames end with its body. Renaming during the
         // parse rather than substituting afterwards means no extra walk over
         // the body and no fail-closed post-check.
@@ -392,7 +399,10 @@ impl ChcParser {
         // exact key/value sorts, and neither `a` nor `v` may mention the
         // binder. Any near miss takes the existing fail-closed over-
         // approximation path and retains the Unsafe-to-Unknown downgrade.
-        if quantifier == "forall" && self.polarity < 0 && binder_count == 1 {
+        // An inner binder may already have been hoisted. Sharing it between
+        // finite instances (or a const-array value) would change forall/exists
+        // dependency, so neither exact rule may cross any nested quantifier.
+        if quantifier == "forall" && self.polarity < 0 && binder_count == 1 && !nested_quantifier {
             if let Some(binder_name) = singleton_binder_name {
                 if let Some(binder_sort) = self.variables.get(&binder_name) {
                     if let Some(rewritten) = Self::eliminate_singleton_forall_const_array(
@@ -400,6 +410,11 @@ impl ChcParser {
                         &binder_name,
                         binder_sort,
                     ) {
+                        return Ok(rewritten);
+                    }
+                    if let Some(rewritten) =
+                        super::finite_forall::eliminate(&body, &binder_name, binder_sort)
+                    {
                         return Ok(rewritten);
                     }
                 }
@@ -569,6 +584,7 @@ impl ChcParser {
                     && Self::sorts_compatible(expected, sort)
             }
             ChcExpr::PredicateApp(_, _, _) => matches!(expected, ChcSort::Bool),
+            ChcExpr::ArrayLambda(_) => false,
             // Computing the sort of an arbitrary Op/ConstArray recursively
             // would require another owned traversal. These are outside the
             // narrow MODEL_CHECKER_CONSUMER equivalence and retain the conservative guard.
@@ -622,6 +638,13 @@ impl ChcParser {
         let mut scheduled = 1usize;
         while let Some(expr) = stack.pop() {
             match expr {
+                ChcExpr::ArrayLambda(lambda) => {
+                    scheduled = match scheduled.checked_add(lambda.captures().len()) {
+                        Some(count) if count <= MAX_SINGLETON_FORALL_INSPECTION_NODES => count,
+                        _ => return false,
+                    };
+                    stack.extend(lambda.captures().iter().map(AsRef::as_ref));
+                }
                 // SMT-LIB binder identity is lexical.  Comparing the complete
                 // `ChcVar` would incorrectly treat a malformed same-name,
                 // different-sort occurrence as free and could make the exact

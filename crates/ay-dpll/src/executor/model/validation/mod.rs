@@ -10,6 +10,7 @@
 //! - `term_analysis`: Term classification helpers (contains_internal_symbol, etc.)
 
 mod definitive_eval;
+mod dt_eta;
 mod observation;
 mod pipeline;
 mod term_analysis;

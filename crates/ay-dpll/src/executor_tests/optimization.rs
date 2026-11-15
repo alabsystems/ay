@@ -1811,16 +1811,14 @@ fn test_pareto_fresh_query_after_reset() {
     assert_eq!(ay_set, brute_force_pareto_max_max(2, 2));
 }
 
-/// A Real objective under `pareto` is NOT supported (AY's LRA multi-objective
-/// optimizer is itself incomplete); it falls back to lex SOUNDLY rather than
-/// risk emitting a non-Pareto point. The result must be a sound verdict, never a
-/// panic or a wrong point. (We assert only the sound `sat` verdict and that the
-/// pareto enumeration was NOT engaged — the exact Real optimum is governed by
-/// AY's pre-existing LRA epsilon arithmetic, not by this increment.)
+/// Strict old-point blockers describe an open region on this continuous front.
+/// Optimize inside the certified seed's closed cone to obtain an attained,
+/// distinct point rather than repeating a lex fallback or publishing a supremum.
 #[test]
-fn test_pareto_real_objective_falls_back_to_lex_soundly() {
+fn test_pareto_real_closed_seed_cone_emits_distinct_continuous_points() {
     let input = r#"
         (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
         (set-logic QF_LRA)
         (declare-const x Real)
         (declare-const y Real)
@@ -1828,28 +1826,242 @@ fn test_pareto_real_objective_falls_back_to_lex_soundly() {
         (assert (>= y 0.0))
         (assert (<= x 5.0))
         (assert (<= y 5.0))
-        (assert (<= (+ x y) 4.0))
+        (assert (= (+ x y) 4.0))
         (maximize x)
         (maximize y)
-        (check-sat)(get-objectives)
+        (check-sat)(get-value (x y))
+        (check-sat)(get-value (x y))
     "#;
     let commands = parse(input).expect("input should parse");
     let mut exec = Executor::new();
     let outputs = exec
         .execute_all(&commands)
-        .expect("Real pareto must fall back to lex soundly, never erroring");
-    // Sound verdict; the front fell back to lex so pareto_state must stay empty.
+        .expect("continuous Pareto checks should execute");
+    assert_eq!(outputs.len(), 4);
     assert_eq!(outputs[0], "sat");
-    assert!(
-        exec.pareto_state.is_none(),
-        "Real pareto must not engage the pareto enumerator"
+    assert_eq!(outputs[2], "sat");
+    let first = pareto_exact_pair(&outputs[1]);
+    let second = pareto_exact_pair(&outputs[3]);
+    assert_ne!(first, second);
+    for [x, y] in [first, second] {
+        assert_eq!(&x + &y, num_rational::BigRational::from_integer(4.into()));
+        assert!(x >= num_rational::BigRational::from_integer(0.into()));
+        assert!(y >= num_rational::BigRational::from_integer(0.into()));
+    }
+}
+
+#[test]
+fn test_pareto_seed_cone_bounds_an_infinite_integer_front() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LIA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Int)(declare-const y Int)
+        (assert (= (+ x y) 0))
+        (maximize x)(maximize y)
+        (check-sat)(get-value (x y))(check-sat)(get-value (x y))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[2], "sat");
+    let first = pareto_exact_pair(&outputs[1]);
+    let second = pareto_exact_pair(&outputs[3]);
+    assert_ne!(first, second);
+    for [x, y] in [first, second] {
+        assert!(x.is_integer() && y.is_integer());
+        assert_eq!(x + y, num_rational::BigRational::from_integer(0.into()));
+    }
+}
+
+#[test]
+fn test_pareto_seed_cone_preserves_mixed_real_directions() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LRA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Real)(declare-const y Real)
+        (assert (= x y))(assert (>= x 0.0))(assert (<= x 1.0))
+        (maximize x)(minimize y)
+        (check-sat)(get-value (x y))(check-sat)(get-value (x y))
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.len(), 4);
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[2], "sat");
+    let first = pareto_exact_pair(&outputs[1]);
+    let second = pareto_exact_pair(&outputs[3]);
+    assert_ne!(first, second);
+    for [x, y] in [first, second] {
+        assert_eq!(x, y);
+        assert!(x >= num_rational::BigRational::from_integer(0.into()));
+        assert!(x <= num_rational::BigRational::from_integer(1.into()));
+    }
+}
+
+/// Decode the actual public exact scalars, without fixing discovery order or
+/// accepting two different renderings of the same rational as distinct points.
+fn pareto_exact_pair(output: &str) -> [num_rational::BigRational; 2] {
+    use ay_frontend::sexp::SExpr;
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    fn scalar(expr: &SExpr) -> BigRational {
+        match expr {
+            SExpr::Numeral(text) => BigRational::from_integer(text.parse().unwrap()),
+            SExpr::Decimal(text) => {
+                let (whole, fraction) = text.split_once('.').unwrap();
+                let numerator: BigInt = format!("{whole}{fraction}").parse().unwrap();
+                BigRational::new(
+                    numerator,
+                    BigInt::from(10).pow(fraction.len().try_into().unwrap()),
+                )
+            }
+            SExpr::List(items) if items.len() == 2 && items[0].as_symbol() == Some("-") => {
+                -scalar(&items[1])
+            }
+            SExpr::List(items) if items.len() == 3 && items[0].as_symbol() == Some("/") => {
+                scalar(&items[1]) / scalar(&items[2])
+            }
+            other => panic!("expected an exact numeric value, got {other:?}"),
+        }
+    }
+    let expr = parse_sexp(output).unwrap();
+    let pairs = expr.as_list().unwrap();
+    assert_eq!(pairs.len(), 2);
+    [
+        scalar(&pairs[0].as_list().unwrap()[1]),
+        scalar(&pairs[1].as_list().unwrap()[1]),
+    ]
+}
+
+#[test]
+fn test_pareto_seed_cone_keeps_unattained_real_optima_unavailable() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LRA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Real)(declare-const y Real)
+        (assert (< x 1.0))(assert (= y 0.0))
+        (maximize x)(maximize y)
+        (check-sat)(get-objectives)
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs[0], "unknown");
+    assert!(outputs[1].contains("error"));
+}
+
+#[test]
+fn test_pareto_seed_cone_preserves_joint_soft_group_costs() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LRA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Real)(declare-const p Bool)
+        (assert (>= x 0.0))(assert (<= x 1.0))
+        (assert (=> p (<= x 0.0)))
+        (assert-soft p :weight 1 :id group)
+        (maximize x)
+        (check-sat)(check-sat)(check-sat)
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).unwrap(),
+        ["sat", "sat", "unsat"]
     );
-    // get-objectives produces a well-formed objectives list (no error/panic).
-    assert!(
-        outputs[1].contains("objectives"),
-        "get-objectives must be well-formed after the lex fallback, got: {}",
-        outputs[1]
-    );
+}
+
+#[test]
+fn test_pareto_weighted_group_endpoints_preserve_exact_tradeoffs() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LRA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Real)(declare-const p Bool)(declare-const q Bool)
+        (assert (>= x 0.0))(assert (<= x 1.0))
+        (assert (= p q))(assert (=> p (<= x 0.0)))
+        (assert-soft p :weight 3 :id group)
+        (assert-soft q :weight 5 :id group)
+        (assert-soft true :weight 0 :id group)
+        (maximize x)
+        (check-sat)(get-value (x (+ (ite p 0 3) (ite q 0 5))))
+        (check-sat)(get-value (x (+ (ite p 0 3) (ite q 0 5))))
+        (check-sat)
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.len(), 5);
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[2], "sat");
+    assert_eq!(outputs[4], "unsat");
+    let points = [
+        pareto_exact_pair(&outputs[1]),
+        pareto_exact_pair(&outputs[3]),
+    ];
+    assert_ne!(points[0], points[1]);
+    for (x, cost) in [(0, 0), (1, 8)] {
+        assert!(points.contains(&[
+            num_rational::BigRational::from_integer(x.into()),
+            num_rational::BigRational::from_integer(cost.into()),
+        ]));
+    }
+}
+
+#[test]
+fn test_pareto_weighted_group_interior_keeps_the_integer_front() {
+    let commands = parse(
+        r#"
+        (set-logic QF_LIA)
+        (set-option :opt.priority pareto)
+        (set-option :timeout 5000)
+        (declare-const x Int)(declare-const p Bool)(declare-const q Bool)
+        (assert (>= x 0))(assert (<= x 2))
+        (assert (=> p (<= x 0)))(assert (=> q (<= x 1)))
+        (assert-soft p :weight 3 :id group)
+        (assert-soft q :weight 5 :id group)
+        (maximize x)
+        (check-sat)(get-value (x (+ (ite p 0 3) (ite q 0 5))))
+        (check-sat)(get-value (x (+ (ite p 0 3) (ite q 0 5))))
+        (check-sat)(get-value (x (+ (ite p 0 3) (ite q 0 5))))
+        (check-sat)
+    "#,
+    )
+    .unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs.len(), 7);
+    for index in [0, 2, 4] {
+        assert_eq!(outputs[index], "sat");
+    }
+    assert_eq!(outputs[6], "unsat");
+    let points = [
+        pareto_exact_pair(&outputs[1]),
+        pareto_exact_pair(&outputs[3]),
+        pareto_exact_pair(&outputs[5]),
+    ];
+    for (x, cost) in [(0, 0), (1, 3), (2, 8)] {
+        assert!(points.contains(&[
+            num_rational::BigRational::from_integer(x.into()),
+            num_rational::BigRational::from_integer(cost.into()),
+        ]));
+    }
 }
 
 /// #8708 (acceptance criterion): Fuzz test for `(minimize ...)` with random

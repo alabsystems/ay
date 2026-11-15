@@ -161,7 +161,29 @@ pub(crate) fn deep_qe(
     assertions: &mut [TermId],
     interrupt: Option<&AtomicBool>,
 ) -> bool {
+    #[cfg(test)]
+    if FORCE_WRONG_ELIMINATION.with(std::cell::Cell::get) {
+        let wrong = terms.mk_bool(false);
+        let mut progress = false;
+        for a in assertions
+            .iter_mut()
+            .filter(|a| contains_quantifier(terms, **a))
+        {
+            *a = wrong;
+            progress = true;
+        }
+        return progress;
+    }
     deep_qe_with_budget(terms, assertions, interrupt, MAX_ELIMINATIONS_PER_APPLY)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: [`deep_qe`] reports the maximally-WRONG elimination (every
+    /// quantified assertion becomes `false`) so publication fences are tested
+    /// against a residue that is refutable when the authored problem is not.
+    pub(crate) static FORCE_WRONG_ELIMINATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// [`deep_qe`] with an explicit per-apply elimination budget.

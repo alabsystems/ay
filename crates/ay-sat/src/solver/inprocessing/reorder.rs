@@ -22,8 +22,36 @@ use super::super::*;
 /// are skipped to avoid O(1/2^n) underflow and to focus on structurally
 /// important short clauses. AY uses 20 (2^-20 ≈ 1e-6 is effectively zero).
 const REORDER_MAX_SIZE: usize = 20;
+/// Kissat's `reordermaxsize` (100), a cap on the counted size, under
+/// `--sat-reorder-weights-kissat`.
+const KISSAT_REORDER_MAX_SIZE: usize = 100;
+
+/// `--sat-reorder-kissat`: reorder from the search loop (Kissat
+/// `kissat_reordering`, reorder.c), in both modes, every `REORDER_INTERVAL x n`
+/// conflicts, in place of the reorders inside inprocessing rounds.
+pub(in crate::solver) fn kissat_reorder_enabled() -> bool {
+    ay_core::sat_ab_switches().reorder_kissat == Some(true)
+}
 
 impl Solver {
+    /// Whether a `--sat-reorder-kissat` reorder is due.
+    #[inline]
+    pub(in crate::solver) fn kissat_reorder_due(&self) -> bool {
+        self.num_conflicts >= self.cold.kissat_reorder_next
+            && kissat_reorder_enabled()
+            && self.inproc_ctrl.reorder.enabled
+    }
+
+    /// One `--sat-reorder-kissat` reorder at level 0, then Kissat's linear
+    /// limit: the n-th reorder waits `REORDER_INTERVAL x n` conflicts.
+    pub(in crate::solver) fn kissat_reorder(&mut self) {
+        self.reorder_variables();
+        self.cold.kissat_reorders += 1;
+        self.cold.kissat_reorder_next = self
+            .num_conflicts
+            .saturating_add(REORDER_INTERVAL.saturating_mul(self.cold.kissat_reorders));
+    }
+
     /// Reorder decision queue by clause-weighted variable importance.
     ///
     /// Port of Kissat `reorder.c`. Runs at decision level 0 after restarts.
@@ -47,10 +75,19 @@ impl Solver {
         // Kissat reorder.c:24-101 `compute_weights`.
         // Weight table: weight[size] = 1.0 / 2^(size-2) for size in 2..=max_size.
         // size=2 → weight=1.0, size=3 → 0.5, size=4 → 0.25, etc.
-        let mut weight_table = [0.0f64; REORDER_MAX_SIZE + 1];
+        // `--sat-reorder-weights-kissat` (Kissat reorder.c:24-84): sizes capped
+        // at 100, every binary between active variables weighs 1, learned ones
+        // included, and ties keep queue order.
+        let kissat_weights = self.cold.reorder_weights_kissat;
+        let max_size = if kissat_weights {
+            KISSAT_REORDER_MAX_SIZE
+        } else {
+            REORDER_MAX_SIZE
+        };
+        let mut weight_table = [0.0f64; KISSAT_REORDER_MAX_SIZE + 1];
         {
             let mut w = 1.0f64;
-            for entry in weight_table.iter_mut().take(REORDER_MAX_SIZE + 1).skip(2) {
+            for entry in weight_table.iter_mut().take(max_size + 1).skip(2) {
                 *entry = w;
                 w /= 2.0;
             }
@@ -77,7 +114,8 @@ impl Solver {
             .extend(self.arena.active_indices());
         for i in 0..self.cold.reduce_indices_buf.len() {
             let offset = self.cold.reduce_indices_buf[i];
-            if self.arena.is_learned(offset) {
+            if self.arena.is_learned(offset) && !(kissat_weights && self.arena.len_of(offset) == 2)
+            {
                 continue;
             }
             let lits = self.arena.literals(offset);
@@ -93,7 +131,7 @@ impl Solver {
                 }
                 if val == 0 {
                     effective_size += 1;
-                    if effective_size >= REORDER_MAX_SIZE {
+                    if effective_size >= max_size {
                         break;
                     }
                 }
@@ -101,7 +139,7 @@ impl Solver {
             if satisfied || effective_size < 2 {
                 continue;
             }
-            let size = effective_size.min(REORDER_MAX_SIZE);
+            let size = effective_size.min(max_size);
             let weight = weight_table[size];
             for &lit in lits {
                 let li = lit.index();
@@ -139,7 +177,22 @@ impl Solver {
             // Sort ascending by score (ties broken by existing stamp via stable sort).
             // Kissat reorder.c:103-112 `less_focused_order`: lower weight = earlier
             // in sorted order. After move_to_front loop, highest weight at front.
-            var_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            if kissat_weights {
+                // Kissat `less_focused_order`: ties by queue stamp.
+                let vsids = &self.vsids;
+                var_scores.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            vsids
+                                .bump_order(Variable(a.0))
+                                .cmp(&vsids.bump_order(Variable(b.0)))
+                        })
+                });
+            } else {
+                var_scores
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
 
             let sorted_vars: Vec<u32> = var_scores.iter().map(|&(v, _)| v).collect();
             self.vsids.reorder_vmtf_queue(&sorted_vars, &self.vals);

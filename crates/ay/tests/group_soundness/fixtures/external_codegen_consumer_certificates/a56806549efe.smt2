@@ -1,0 +1,7 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_ABV)
+(declare-const gpu_map_in_0 (_ BitVec 32))
+(assert (not (= (store ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)) (_ bv0 64) (bvadd (select (store ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)) (_ bv0 64) gpu_map_in_0) (_ bv0 64)) (_ bv1 32))) (store ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)) (_ bv0 64) (bvadd (select (store ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)) (_ bv0 64) gpu_map_in_0) (_ bv0 64)) (_ bv1 32))))))
+(check-sat)
+(exit)

@@ -1,0 +1,220 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+# EXACT-RIM pins: switch point, pivot counts and the EXACT rational optimum for
+# models that drive `crates/ay-milp/src/exact/` directly. Written by
+# `target/release/examples/milp_rim_gate --ratchet`, checked by `--check`, and
+# validated for shape/class coverage by `crates/ay-milp/tests/rim_ratchet.rs`
+# in the default test run.
+#
+# WHY THIS FILE EXISTS AT ALL: the 19-instance node gate and corpus_guard both
+# pass a change that costs 4.9x on dcmulti and 3.45x on qnet1, because both
+# measure the float-first MILP lane and that lane reaches the rim about once
+# per 1.36M nodes. These are the rim's own pins.
+#
+# `switch_at` is the primary tripwire -- the pivot at which the reduced ->
+# fraction-free conversion fired, 0 meaning never. `pivots` and `p1_pivots`
+# say the pivot SEQUENCE did not move (it must not: the two representations
+# denote the same numbers, so a representation change that moves a pivot count
+# is a bug). `value` is byte-compared as an exact rational; it is never an f64
+# and never has a tolerance. `wall_s` is RECORDED, not gated.
+#
+# THE TWO CLASSES ARE BOTH PRESENT ON PURPOSE, and a change is only safe when
+# it leaves both alone:
+#   class = "fraction-free"  converts, and its switch point is the number a
+#                            "convert earlier" change is trying to move.
+#   class = "reduced"        does NOT convert and MUST NOT START. Measured,
+#                            every one of these writes 100.000% of its tableau
+#                            entries on the inline i64 path -- exactly, not
+#                            approximately -- so any policy that fires on one
+#                            of them has stopped reading the census.
+#
+# A CHANGE THAT MOVES ANY NUMBER BELOW MUST UPDATE IT DELIBERATELY, in the same
+# commit, with the measurement in the message. That includes IMPROVEMENTS: an
+# earlier switch point on the fraction-free class is the whole point of the
+# "convert earlier" lead, and it still has to be ratcheted in by hand or the
+# pin rots into folklore.
+#
+# tier = "fast"  -- the pre-push lane (`--tier fast`, 10 instances, 17.3s)
+# tier = "slow"  -- nightly only (`--tier all`, adds qiu at 88.1s)
+#
+# WHAT THE PINS BELOW ALREADY REFUTE, measured 2026-08-21 through the probe's
+# RIM_PARAMS seam on the shipped binary, every arm interleaved and every arm at
+# an IDENTICAL pivot count and a byte-identical optimum:
+#
+#   pk1 does NOT convert late for a reason the census can see. Its sampled
+#   census is 100.000% inline until pivot ~552 -- the reduced class's own
+#   signature -- so no (window, percent, sustain) triple converts it before
+#   549. Converting at pivot 32 is 0.33s against 2.65s shipped (8.0x), and the
+#   earliest CENSUS-DRIVEN conversion, at 549, is 1.86s (1.42x). The 8x is not
+#   reachable from this signal; a trigger that fired on pk1 at 32 would fire on
+#   dcmulti at 32 too, and that is the 4.9x.
+#
+#   blend2 has nothing to gain at all: sw@32 is 7.98s against 7.94s shipped, a
+#   wash. Its cost is entirely after pivot 566.
+#
+#   The one census-visible lever is SWITCH_SUSTAIN 2 -> 1: pk1 688 -> 560
+#   (2.65s -> 1.94s, 1.37x), blend2 592 -> 576 (1.01x), mas74/mas76 160 -> 144
+#   (1.04x/1.03x), reduced class BIT-IDENTICAL. It is not taken here because
+#   the window it fires on is only 95-99% inline -- measured: a 95% threshold
+#   at sustain 1 leaves pk1 at 688 -- i.e. exactly the marginal single-window
+#   evidence SWITCH_SUSTAIN = 2 was set up to refuse.
+#
+# QUIET BOX ONLY -- but for a narrower reason than the node gate's. Nothing
+# here is wall-coupled while the instance FINISHES inside `--limit`; the pins
+# only become box-dependent if a deadline is hit, which turns OPTIMAL into
+# NONOPTIMAL. qiu at ~90s against a 600s default has 6.7x of headroom and the
+# rest have 30x or better.
+
+[[instance]]
+name = "blend2"
+class = "fraction-free"
+status = "OPTIMAL"
+form = "fraction-free"
+switch_at = 592
+p1_pivots = 2119
+pivots = 2511
+value = "978580260928702717451/4636729959328972800"
+tier = "fast"
+wall_s = 7.889
+
+[[instance]]
+name = "dcmulti"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 341
+pivots = 1632
+value = "636187416259/11065600"
+tier = "fast"
+wall_s = 0.579
+
+[[instance]]
+name = "gt2"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 63
+pivots = 155
+value = "21479658227/12766292"
+tier = "fast"
+wall_s = 0.007
+
+[[instance]]
+name = "lseu"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 33
+pivots = 134
+value = "70948/85"
+tier = "fast"
+wall_s = 0.006
+
+[[instance]]
+name = "mas74"
+class = "fraction-free"
+status = "OPTIMAL"
+form = "fraction-free"
+switch_at = 160
+p1_pivots = 129
+pivots = 534
+value = "51210548031574035931757661298458831457793529009633542257587214879798414537534654467594681312952404659/6253055576064224506746491423554643204802097246426847897493063747437910847977966769239629472000"
+tier = "fast"
+wall_s = 1.528
+
+[[instance]]
+name = "mas76"
+class = "fraction-free"
+status = "OPTIMAL"
+form = "fraction-free"
+switch_at = 160
+p1_pivots = 134
+pivots = 583
+value = "1257993686678108007573463284427382354545128106623228759724665133528105009/41400624988187485325794111749015621021026756887964691329066496000"
+tier = "fast"
+wall_s = 1.167
+
+[[instance]]
+name = "p0201"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 227
+pivots = 616
+value = "6875/16"
+tier = "fast"
+wall_s = 0.058
+
+[[instance]]
+name = "p0282"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 2346
+pivots = 2694
+value = "2385914321379/3453399040"
+tier = "fast"
+wall_s = 0.300
+
+[[instance]]
+name = "p0548"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 12250
+pivots = 13165
+value = "8039/408"
+tier = "fast"
+wall_s = 3.083
+
+[[instance]]
+name = "pk1"
+class = "fraction-free"
+status = "OPTIMAL"
+form = "fraction-free"
+switch_at = 688
+p1_pivots = 1396
+pivots = 1396
+value = "0"
+tier = "fast"
+wall_s = 2.579
+
+[[instance]]
+name = "qiu"
+class = "reduced"
+status = "OPTIMAL"
+form = "reduced"
+switch_at = 0
+p1_pivots = 2799
+pivots = 9189
+value = "-1804584443099539/247936000000"
+tier = "slow"
+wall_s = 88.088
+
+# NOT PINNED: DOES NOT FINISH. The rim does not reach an optimum on these
+# inside any budget worth spending, so their pivot counts are a function of the
+# DEADLINE rather than of the tableau, and pinning them would pin the box.
+[not_finished]
+qnet1 = "reduced class; 300s of rim budget buys 171,858 phase-1 pivots and Unknown(Timeout)"
+
+# NOT PINNED: NO SUCH MODEL ON THIS MACHINE. Named in the campaign's class
+# lists but present in no corpus here. Listed rather than omitted so the
+# question is answered by the file.
+[absent]
+harp2 = "fraction-free class per the 67-probe sweep; in no corpus on this box"
+
+# NOT PINNED: CORPUS NOT REBUILDABLE FROM THIS REPOSITORY. Measured, real, and
+# deliberately left out: a pin that only one machine can check goes SETUP-red
+# everywhere else and is then deleted. Everything pinned above resolves out of
+# the sha256-manifested corpus that `scripts/milp_gate_corpus.py --build`
+# recreates.
+[not_pinned]
+domset_mw19_13..23 = "ten fraction-free LP relaxations in read-only ~/ay-bench/oracle_v2/lp; _13 is also a non-finisher (2,316 pivots in 300s, sw@208)"

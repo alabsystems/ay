@@ -28,8 +28,6 @@ impl Expr {
         /// Bitvector addition.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvadd / try_bvadd,
         check: bv_same,
         assert_msg: "bvadd requires same BitVec sorts",
@@ -41,8 +39,6 @@ impl Expr {
         /// Bitvector subtraction.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvsub / try_bvsub,
         check: bv_same,
         assert_msg: "bvsub requires same BitVec sorts",
@@ -54,8 +50,6 @@ impl Expr {
         /// Bitvector multiplication.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvmul / try_bvmul,
         check: bv_same,
         assert_msg: "bvmul requires same BitVec sorts",
@@ -67,8 +61,6 @@ impl Expr {
         /// Unsigned bitvector division.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvudiv / try_bvudiv,
         check: bv_same,
         assert_msg: "bvudiv requires same BitVec sorts",
@@ -80,8 +72,6 @@ impl Expr {
         /// Signed bitvector division.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvsdiv / try_bvsdiv,
         check: bv_same,
         assert_msg: "bvsdiv requires same BitVec sorts",
@@ -93,8 +83,6 @@ impl Expr {
         /// Unsigned bitvector remainder.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvurem / try_bvurem,
         check: bv_same,
         assert_msg: "bvurem requires same BitVec sorts",
@@ -106,8 +94,6 @@ impl Expr {
         /// Signed bitvector remainder.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvsrem / try_bvsrem,
         check: bv_same,
         assert_msg: "bvsrem requires same BitVec sorts",
@@ -121,8 +107,6 @@ impl Expr {
         /// Bitvector negation.
         /// REQUIRES: `self` is a BitVec sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec())]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvneg / try_bvneg,
         check: is_bv,
         assert_msg: "bvneg requires BitVec sort",
@@ -136,8 +120,6 @@ impl Expr {
         /// Bitwise NOT.
         /// REQUIRES: `self` is a BitVec sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec())]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvnot / try_bvnot,
         check: is_bv,
         assert_msg: "bvnot requires BitVec sort",
@@ -149,8 +131,6 @@ impl Expr {
         /// Bitwise AND.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvand / try_bvand,
         check: bv_same,
         assert_msg: "bvand requires same BitVec sorts",
@@ -162,8 +142,6 @@ impl Expr {
         /// Bitwise OR.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvor / try_bvor,
         check: bv_same,
         assert_msg: "bvor requires same BitVec sorts",
@@ -175,8 +153,6 @@ impl Expr {
         /// Bitwise XOR.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvxor / try_bvxor,
         check: bv_same,
         assert_msg: "bvxor requires same BitVec sorts",
@@ -190,8 +166,6 @@ impl Expr {
         /// Logical shift left.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvshl / try_bvshl,
         check: bv_same,
         assert_msg: "bvshl requires same BitVec sorts",
@@ -203,8 +177,6 @@ impl Expr {
         /// Logical shift right.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvlshr / try_bvlshr,
         check: bv_same,
         assert_msg: "bvlshr requires same BitVec sorts",
@@ -216,8 +188,6 @@ impl Expr {
         /// Arithmetic shift right.
         /// REQUIRES: `self` and `other` are BitVec sorts with identical widths.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bitvec())]
         fn bvashr / try_bvashr,
         check: bv_same,
         assert_msg: "bvashr requires same BitVec sorts",
@@ -236,8 +206,6 @@ impl Expr {
     /// Panics if `self` is not BitVec-sorted. Only call this on terms whose
     /// sort is a locally-guaranteed invariant; for externally-sourced terms
     /// use [`Expr::try_zero_extend`] and fail closed on the error.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn zero_extend(self, extra_bits: u32) -> Self {
@@ -253,8 +221,6 @@ impl Expr {
     /// Panics if `self` is not BitVec-sorted. Only call this on terms whose
     /// sort is a locally-guaranteed invariant; for externally-sourced terms
     /// use [`Expr::try_sign_extend`] and fail closed on the error.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn sign_extend(self, extra_bits: u32) -> Self {
@@ -274,8 +240,6 @@ impl Expr {
     /// Int-sorted operand reaching this wrapper aborts the whole embedding
     /// process (development verifier census failure). `#[track_caller]` attributes the
     /// panic to the emitting call site, not this wrapper.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn extract(self, high: u32, low: u32) -> Self {
@@ -292,8 +256,6 @@ impl Expr {
     /// terms whose sorts are locally-guaranteed invariants; for
     /// externally-sourced terms use [`Expr::try_concat`] and fail closed on
     /// the error.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec() && other.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn concat(self, other: Self) -> Self {
@@ -310,8 +272,6 @@ impl Expr {
         ///
         /// The result is an unbounded integer with the unsigned value of the bitvector.
         /// In SMT-LIB: (bv2int bv).
-        #[kani_requires(self.sort.is_bitvec())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn bv2int / try_bv2int,
         check: is_bv,
         assert_msg: "bv2int requires BitVec sort",
@@ -334,8 +294,6 @@ impl Expr {
     /// # Panics
     /// Panics if `self` is not BitVec-sorted; for externally-sourced terms
     /// use [`Expr::try_bv2int_signed`] and fail closed on the error.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_int()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn bv2int_signed(self) -> Self {

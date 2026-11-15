@@ -1,0 +1,28 @@
+; Copyright 2026 Andrew Yates
+; SPDX-License-Identifier: Apache-2.0
+; Source-derived acyclic fact + bad-read query composition, not AY replay output.
+; Expected: sat. Only the suffix-fill conjunct differs from complete_fill.smt2.
+(set-logic ALL)
+(declare-datatypes ((MCVecIntoIter 0) (MCVec 0))
+  (((mkIter (fld_vec MCVec) (fld_pos (_ BitVec 64))))
+   ((mkVec (fld_ptr (_ BitVec 64)) (fld_len (_ BitVec 64))
+     (fld_cap (_ BitVec 64)) (fld_data (Array (_ BitVec 64) (_ BitVec 8)))))))
+(declare-const v MCVec)
+(declare-const w MCVecIntoIter)
+(declare-const b (Array (_ BitVec 64) (_ BitVec 8)))
+(declare-const old (_ BitVec 64))
+(declare-const new (_ BitVec 64))
+(declare-const pos (_ BitVec 64))
+(declare-const fill (_ BitVec 8))
+(assert (= old (fld_len v)))
+(assert (bvult old new))
+(assert (= w ((as mkIter MCVecIntoIter)
+  ((as mkVec MCVec) (fld_ptr v) new (fld_cap v) b) pos)))
+(assert (forall ((i (_ BitVec 64)))
+  (=> (bvult i old)
+    (= (select (fld_data ((as fld_vec MCVec) w)) i) (select (fld_data v) i)))))
+(assert (bvuge (fld_pos w) old))
+(assert (bvult (fld_pos w) (fld_len ((as fld_vec MCVec) w))))
+(assert (bvuge (fld_pos w) (_ bv32 64)))
+(assert (not (= (select (fld_data ((as fld_vec MCVec) w)) (fld_pos w)) fill)))
+(check-sat)

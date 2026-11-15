@@ -198,7 +198,20 @@ impl NiaSolver<'_> {
 
     /// Apply a model patch by injecting Gomory cuts that force the variable
     /// to equal the target value.
+    ///
+    /// The pin is a MODEL GUESS that stays in force as a heuristic
+    /// (#nia-sign-cut-soundness): its reason is the variable term, never an
+    /// asserted atom, so the LRA's Farkas guard rejects any simplex conflict
+    /// citing it and the LIA treats it as an unjustified bound (`ay_lia`
+    /// `justified_bounds`) — it steers the LP and can never reach a
+    /// verdict. The check loop counts it in `tentative_guess_count`.
+    /// Callers must have pushed a tentative scope.
     fn apply_patch(&mut self, var: TermId, value: &BigRational) {
+        debug_assert!(
+            self.tentative_depth > 0,
+            "model pins are asserted only inside a tentative scope"
+        );
+        self.tentative_guess_count += 1;
         let lra_var = self.lia.lra_solver_mut().ensure_var_registered(var);
         let coeffs = vec![(lra_var, BigRational::one())];
 
@@ -349,6 +362,16 @@ impl NiaSolver<'_> {
     /// feasibility. If the patched model is LIA-feasible and monomials
     /// and divisions are consistent, return true (scope is kept). Otherwise
     /// pop the scope to undo the patches and return false. (#4125 soundness fix)
+    ///
+    /// #nia-sign-cut-soundness: the pins are model guesses (variable-term
+    /// reasons), so the LIA's verdict-producing side checks no longer refute
+    /// them — a pin that contradicts a Diophantine congruence used to make
+    /// the verification say UNSAT (through the same laundering that produced
+    /// the wrong verdicts) and the patch was rejected. To keep that rejection
+    /// without the laundering, the patched point is also judged directly: a
+    /// point that is fractional on an Int variable of the asserted atoms, or
+    /// that provably violates one of them, is not a model and the patch is
+    /// rejected (`patched_point_is_admissible`).
     pub(crate) fn try_tentative_patch(&mut self) -> bool {
         let mon_patches = self.collect_inconsistent_monomials();
         let div_patches = self.collect_inconsistent_division_patches();
@@ -366,8 +389,12 @@ impl NiaSolver<'_> {
             return false;
         }
 
-        // Push a scope so patch cuts can be undone
-        self.lia.push();
+        // Push a scope so patch cuts can be undone. The pins are model
+        // guesses; if the patch is rejected below the scope is popped and the
+        // guess count restored (#nia-sign-cut-soundness).
+        let guesses_before = self.tentative_guess_count;
+        self.lia.push_tentative();
+        self.tentative_depth += 1;
 
         self.apply_planned_patches(&all_plans);
 
@@ -375,8 +402,12 @@ impl NiaSolver<'_> {
         use ay_core::TheoryResult;
         match self.lia.check() {
             TheoryResult::Sat | TheoryResult::Unknown
-                // LIA is feasible -- verify monomials and divisions are consistent
-                if !self.has_inconsistent_monomials() && !self.has_inconsistent_divisions() => {
+                // LIA is feasible -- verify monomials and divisions are
+                // consistent, and the point does not provably violate an
+                // asserted atom (#nia-sign-cut-soundness, see above).
+                if !self.has_inconsistent_monomials()
+                    && !self.has_inconsistent_divisions()
+                    && self.patched_point_is_admissible() => {
                     if self.debug {
                         safe_eprintln!(
                             "[NIA] Tentative patch succeeded: {} monomials, {} divisions",
@@ -384,18 +415,52 @@ impl NiaSolver<'_> {
                             all_plans.len() - mon_patches.len()
                         );
                     }
-                    // Keep the scope (patched values active).
-                    // Increment depth so undo_tentative_patch() pops
+                    // Keep the scope (patched values active); depth was
+                    // incremented at the push so undo_tentative_patch() pops
                     // both this scope and the sign-cut scope.
-                    self.tentative_depth += 1;
                     return true;
                 }
             _ => {}
         }
 
-        // Patch failed -- undo the cuts
-        self.lia.pop();
+        // Patch failed -- undo the cuts and forget their guesses.
+        self.lia.pop_tentative();
+        self.tentative_depth -= 1;
+        self.tentative_guess_count = guesses_before;
         false
+    }
+
+    /// Whether the current (patched) tableau point may be accepted as a
+    /// model candidate (#nia-sign-cut-soundness, see `try_tentative_patch`):
+    /// every Int variable of the asserted atoms holds an integral value in
+    /// range, and the exact evaluator does not PROVE an asserted atom false.
+    /// An atom the evaluator cannot judge (a UF application) keeps the
+    /// historical acceptance.
+    fn patched_point_is_admissible(&self) -> bool {
+        let asserted_terms: Vec<TermId> = self.asserted.iter().map(|&(t, _)| t).collect();
+        let mut leaves: Vec<TermId> = Vec::new();
+        for &t in &asserted_terms {
+            self.collect_int_var_leaves(t, &mut leaves);
+        }
+        // A fractional Int variable is not a model, whatever the LIA said. A
+        // variable with no LRA value at all (it appears only inside opaque
+        // terms) is inconclusive, not wrong.
+        if leaves
+            .iter()
+            .any(|&v| self.var_value(v).is_some_and(|val| !val.denom().is_one()))
+        {
+            return false;
+        }
+        let Some(var_map) = self.integer_model_point_for(&asserted_terms) else {
+            return true;
+        };
+        if var_map.is_empty() {
+            return true;
+        }
+        let mut vars: Vec<TermId> = var_map.keys().copied().collect();
+        vars.sort_by_key(|t| t.0);
+        let values: Vec<i64> = vars.iter().map(|v| var_map[v]).collect();
+        self.check_assignment(&vars, &values) != Some(false)
     }
 
     /// Check if any tracked monomial has an inconsistent value

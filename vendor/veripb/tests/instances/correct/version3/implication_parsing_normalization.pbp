@@ -1,0 +1,23 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+% The constraint of a reification shorthand is normalized before the antecedent is added at the
+% degree as coefficient, so this stands for `1 ~z1 1 x1 >= 1` and not for `3 ~z1 1 x1 >= 1`.
+rup z1 ==> 3 x1 2 ~x1 >= 3 ;
+e 1 ~z1 1 x1 >= 1 : 2 ;
+% A trivially satisfied constraint is implied by anything, in particular by a conjunction of more
+% than one literal.
+rup z1 z2 ==> 1 x1 >= -1 ;
+e 1 x1 >= -1 : 3 ;
+rup z1 z2 ==> 1 x1 <= 5 ;
+e 1 ~x1 >= -4 : 4 ;
+% A contradicting constraint implies anything, so a left implication of one is its trivially
+% satisfied negation and does not mention the literal.
+rup z1 <== 1 x1 >= 5 ;
+e 1 ~x1 >= -3 : 5 ;
+rup z1 <== 3 x1 2 ~x1 >= 5 ;
+e 1 ~x1 >= -1 : 6 ;
+rup z1 <== 1 x1 <= -2 ;
+e 1 x1 >= -1 : 7 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -12,7 +12,10 @@
 //! Rust's `rust_oom` fail-fast (`abort()`; exception 0xC0000409 on Windows,
 //! SIGABRT on unix) before the in-process `process_memory_exceeded()`
 //! checkpoints can trip. The `AY_INTERNAL_TEST_ABORT_SOLVE_CHILD` hook makes
-//! the child take exactly that abort path deterministically.
+//! the child die of that same SIGABRT deterministically. On macOS the hook
+//! aborts through `abort_with_reason(.., OS_REASON_FLAG_NO_CRASH_REPORT)`, so a
+//! test run no longer files an `ay-*.ips` crash report; the wait-status the
+//! parent classifies is unchanged, which `assert_child_died_of_sigabrt` pins.
 
 use ntest::timeout;
 use std::fs;
@@ -45,6 +48,22 @@ fn write_temp_horn(tag: &str) -> (PathBuf, Cleanup) {
     fs::write(&path, formula).expect("write temp horn file");
     let cleanup = Cleanup(path.clone());
     (path, cleanup)
+}
+
+/// The injected fault must stay a genuine SIGABRT death — the `rust_oom`
+/// producer this gate stands in for — not merely "some crash signal": the
+/// supervisor names the signal it reaped in its fail-closed diagnostic.
+fn assert_child_died_of_sigabrt(stderr: &str) {
+    #[cfg(unix)]
+    {
+        let expected = format!("aborted abnormally (fatal signal {})", nix::libc::SIGABRT);
+        assert!(
+            stderr.contains(&expected),
+            "the injected child fault must die of SIGABRT ({expected:?}), got: {stderr:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = stderr;
 }
 
 /// A crashed solve child (simulated `rust_oom` abort) is converted by the
@@ -88,6 +107,7 @@ fn test_wrapper_converts_child_abort_to_unknown() {
         stderr.contains("reason-unknown"),
         "wrapper must emit the reason-unknown line, got: {stderr:?}"
     );
+    assert_child_died_of_sigabrt(&stderr);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -127,6 +147,7 @@ fn test_wrapper_crash_hook_cannot_forge_sat_before_abort() {
             .any(|line| matches!(line.trim(), "sat" | "unsat")),
         "crash hook must never synthesize a definitive verdict: {stdout:?}"
     );
+    assert_child_died_of_sigabrt(&stderr);
     assert_eq!(output.status.code(), Some(0));
 }
 

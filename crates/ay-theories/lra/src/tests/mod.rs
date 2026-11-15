@@ -10,21 +10,32 @@ use ay_core::term::{Symbol, TermData, TermStore};
 use ay_core::{Sort, TheorySolver};
 
 mod basics;
+mod batch_values;
 mod bound_interest;
+mod cube_decline;
 mod decision_index;
 mod deferred_reason_materialization;
 mod delta_objective;
 mod dirty_row_sweep;
 mod divmod_unsupported;
+mod entailed_difference_emission;
 mod faithfulness_audit;
 mod farkas_optimization;
+mod forced_expression_sign;
+mod forced_expression_zero_coeff;
+mod implied_not_tighter;
 mod implied_propagation_entailment;
 mod incremental_bounds;
 mod jit_propagation;
 mod jit_snapshot_persistence;
 mod model_snapshot;
+mod normalized_coeff_slices;
+mod offset_relevance;
 mod optimality_certificate;
 mod propagation_reason_audit;
+mod retract_unjustified;
+mod unit_pivot_pref;
+mod unjustified_exports;
 mod warm_simplex_state;
 
 /// Helper: check() may return NeedModelEquality or NeedModelEqualities when

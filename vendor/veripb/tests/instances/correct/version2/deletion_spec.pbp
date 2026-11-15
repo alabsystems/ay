@@ -1,0 +1,40 @@
+pseudo-Boolean proof version 2.0
+f 2
+p 1 2 +
+e 2 x1 2 x2 2 ~x3 >= 3 ; 3
+del id 3
+is_deleted 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+e 2 x1 2 x2 2 ~x3 >= 3 ; -1
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+is_deleted 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+p 1 2 +
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+e 2 x1 2 x2 2 ~x3 >= 3 ; -1
+e 2 x1 2 x2 2 ~x3 >= 3 ; -2
+del id 5 6
+is_deleted 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+p 1 2 +
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+e 2 x1 2 x2 2 ~x3 >= 3 ; -1
+e 2 x1 2 x2 2 ~x3 >= 3 ; -2
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+is_deleted 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+p 1 2 +
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+p 1 2 +
+e 2 x1 2 x2 2 ~x3 >= 3 ; -1
+e 2 x1 2 x2 2 ~x3 >= 3 ; -2
+e 2 x1 2 x2 2 ~x3 >= 3 ; -3
+e 2 x1 2 x2 2 ~x3 >= 3 ; -4
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+del spec 2 x1 2 x2 2 ~x3 >= 3 ;
+is_deleted 2 x1 2 x2 2 ~x3 >= 3 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

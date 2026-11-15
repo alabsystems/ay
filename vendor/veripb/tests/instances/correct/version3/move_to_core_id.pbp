@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+f 5;
+pol 3 1 * 4 1 * + s;
+e 1 x1 +1 x3 >= 1 : 6;
+pol 1 2 + 6 +;
+e +2 x1 +2 x2 +2 x3 >= 3 : 7;
+pol 1 2 + 6 + 2 d;
+e 1 x1 1 x2 1 x3 >= 2 : 8;
+pol 5 2 * 8 2 * +;
+e >= 2 : 9;
+core id -1 8;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

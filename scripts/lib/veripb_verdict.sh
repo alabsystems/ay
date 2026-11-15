@@ -422,6 +422,15 @@ veripb_soundness_probe() {
 # Soundness fixtures or die. A gate that skips this can certify AY's answers
 # against a checker that calls satisfiable formulas unsatisfiable.
 veripb_require_soundness() {
+    # A tree without the fixtures says nothing about the checker. Report it as
+    # SETUP (exit 2), not as a verdict against the checker (exit 3): blaming the
+    # checker for a missing manifest sends the reader after the wrong defect.
+    if [ ! -r "$2/expected.tsv" ]; then
+        echo "SETUP: soundness fixture manifest missing: $2/expected.tsv" >&2
+        echo "       The checker was not judged. Restore VERIPB_SOUNDNESS_DIR from" >&2
+        echo "       ci/veripb.pin before running this gate." >&2
+        exit 2
+    fi
     veripb_soundness_probe "$1" "$2" && return 0
     echo "ERROR: the resolved checker gave a verdict contradicting known truth." >&2
     echo "       Refusing to certify against it. Build the pinned checker per" >&2

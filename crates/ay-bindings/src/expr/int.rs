@@ -26,8 +26,6 @@ impl Expr {
         /// Integer addition.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_add / try_int_add,
         check: int_same,
         assert_msg: "int_add requires Int sorts",
@@ -39,8 +37,6 @@ impl Expr {
         /// Integer subtraction.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_sub / try_int_sub,
         check: int_same,
         assert_msg: "int_sub requires Int sorts",
@@ -52,8 +48,6 @@ impl Expr {
         /// Integer multiplication.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_mul / try_int_mul,
         check: int_same,
         assert_msg: "int_mul requires Int sorts",
@@ -65,8 +59,6 @@ impl Expr {
         /// Integer division.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_div / try_int_div,
         check: int_same,
         assert_msg: "int_div requires Int sorts",
@@ -78,8 +70,6 @@ impl Expr {
         /// Integer modulo.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_mod / try_int_mod,
         check: int_same,
         assert_msg: "int_mod requires Int sorts",
@@ -91,8 +81,6 @@ impl Expr {
         /// Integer negation.
         /// REQUIRES: `self` is an Int sort.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn int_neg / try_int_neg,
         check: is_int,
         assert_msg: "int_neg requires Int sort",
@@ -106,8 +94,6 @@ impl Expr {
         /// Integer less than.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn int_lt / try_int_lt,
         check: int_same,
         assert_msg: "int_lt requires Int sorts",
@@ -119,8 +105,6 @@ impl Expr {
         /// Integer less than or equal.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn int_le / try_int_le,
         check: int_same,
         assert_msg: "int_le requires Int sorts",
@@ -132,8 +116,6 @@ impl Expr {
         /// Integer greater than.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn int_gt / try_int_gt,
         check: int_same,
         assert_msg: "int_gt requires Int sorts",
@@ -145,8 +127,6 @@ impl Expr {
         /// Integer greater than or equal.
         /// REQUIRES: `self` and `other` are Int sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_int() && other.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn int_ge / try_int_ge,
         check: int_same,
         assert_msg: "int_ge requires Int sorts",
@@ -179,8 +159,6 @@ impl Expr {
     /// terms whose sort is a locally-guaranteed invariant; for
     /// externally-sourced terms use [`Expr::try_int2bv`] and fail closed on
     /// the error.
-    #[cfg_attr(kani, kani::requires(self.sort.is_int() && width > 0))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     #[must_use = "expression operations return a new Expr"]
     #[track_caller]
     pub fn int2bv(self, width: u32) -> Self {

@@ -11,16 +11,28 @@ impl BvSolver<'_> {
     ///
     /// Zero bits use `fresh_false` for multiplication optimization (#1720).
     pub(super) fn shift_left_const(&mut self, a: &BvBits, amt: usize) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let n = a.len();
-        let mut result = Vec::with_capacity(n);
+        let Some(mut result) = self.counted_bits(n) else {
+            return Vec::new();
+        };
 
         // Low bits become zero
         for _ in 0..amt.min(n) {
+            if !self.encoding_step() {
+                return Vec::new();
+            }
             result.push(self.fresh_false());
         }
 
-        // Shift in the original bits
-        for &bit in a.iter().take(n - amt.min(n)) {
+        // Shift in the original bits (`n - min(amt, n)` of them)
+        for &bit in a.iter().take(n.saturating_sub(amt)) {
+            if !self.encoding_step() {
+                return Vec::new();
+            }
             result.push(bit);
         }
 
@@ -31,16 +43,28 @@ impl BvSolver<'_> {
     ///
     /// Zero bits use `fresh_false` for multiplication optimization (#1720).
     pub(super) fn shift_right_const(&mut self, a: &BvBits, amt: usize) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let n = a.len();
-        let mut result = Vec::with_capacity(n);
+        let Some(mut result) = self.counted_bits(n) else {
+            return Vec::new();
+        };
 
         // Shift in the original bits
         for &bit in a.iter().skip(amt.min(n)) {
+            if !self.encoding_step() {
+                return Vec::new();
+            }
             result.push(bit);
         }
 
         // High bits become zero
         for _ in 0..amt.min(n) {
+            if !self.encoding_step() {
+                return Vec::new();
+            }
             result.push(self.fresh_false());
         }
 
@@ -53,6 +77,10 @@ impl BvSolver<'_> {
     /// level, bypass the barrel-shifter MUX tree and just wire bits directly.
     /// This eliminates ~log2(n) layers of n MUX gates per constant shift.
     pub(super) fn bitblast_shl(&mut self, a: &BvBits, b: &BvBits) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let n = a.len();
         if n == 0 {
             return Vec::new();
@@ -68,7 +96,9 @@ impl BvSolver<'_> {
         }
 
         // Use barrel shifter approach for bits 0..log2(n)
-        let mut current = a.clone();
+        let Some(mut current) = self.counted_copy_bits(a) else {
+            return Vec::new();
+        };
 
         // How many bits of shift amount can we handle before overflow?
         // For n-bit value, shifts 0..n-1 are valid. That requires ceil(log2(n)) bits.
@@ -79,7 +109,14 @@ impl BvSolver<'_> {
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {
-            let shift_amt = 1 << i;
+            if !self.encoding_step() {
+                return Vec::new();
+            }
+            // `i < log2_n <= usize::BITS`, so `1 << i` fits; a stage past the
+            // word is past `n` too.
+            let Some(shift_amt) = u32::try_from(i).ok().and_then(|s| 1usize.checked_shl(s)) else {
+                break;
+            };
             if shift_amt >= n {
                 break;
             }
@@ -90,9 +127,9 @@ impl BvSolver<'_> {
         }
 
         // Handle overflow: if any high bit (>= log2_n) is set, shift >= n => result = 0
-        let high_bits: Vec<CnfLit> = b.iter().skip(log2_n).copied().collect();
+        let high_bits = &b[log2_n.min(b.len())..];
         if !high_bits.is_empty() {
-            let overflow = self.mk_or_many(&high_bits);
+            let overflow = self.mk_or_many(high_bits);
             let zero = self.const_bits(0, n);
             current = self.bitwise_mux(&zero, &current, overflow);
         }
@@ -105,6 +142,10 @@ impl BvSolver<'_> {
     /// Shortcut (#8111): When the shift amount is a known constant at the bit
     /// level, bypass the barrel-shifter MUX tree and just wire bits directly.
     pub(super) fn bitblast_lshr(&mut self, a: &BvBits, b: &BvBits) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let n = a.len();
         if n == 0 {
             return Vec::new();
@@ -119,7 +160,9 @@ impl BvSolver<'_> {
             return self.shift_right_const(a, shift_amt);
         }
 
-        let mut current = a.clone();
+        let Some(mut current) = self.counted_copy_bits(a) else {
+            return Vec::new();
+        };
 
         // How many bits of shift amount can we handle before overflow?
         let log2_n = if n.is_power_of_two() {
@@ -129,7 +172,14 @@ impl BvSolver<'_> {
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {
-            let shift_amt = 1 << i;
+            if !self.encoding_step() {
+                return Vec::new();
+            }
+            // `i < log2_n <= usize::BITS`, so `1 << i` fits; a stage past the
+            // word is past `n` too.
+            let Some(shift_amt) = u32::try_from(i).ok().and_then(|s| 1usize.checked_shl(s)) else {
+                break;
+            };
             if shift_amt >= n {
                 break;
             }
@@ -139,9 +189,9 @@ impl BvSolver<'_> {
         }
 
         // Handle overflow: if any high bit (>= log2_n) is set, shift >= n => result = 0
-        let high_bits: Vec<CnfLit> = b.iter().skip(log2_n).copied().collect();
+        let high_bits = &b[log2_n.min(b.len())..];
         if !high_bits.is_empty() {
-            let overflow = self.mk_or_many(&high_bits);
+            let overflow = self.mk_or_many(high_bits);
             let zero = self.const_bits(0, n);
             current = self.bitwise_mux(&zero, &current, overflow);
         }
@@ -154,6 +204,10 @@ impl BvSolver<'_> {
     /// Shortcut (#8111): When the shift amount is a known constant at the bit
     /// level, bypass the barrel-shifter MUX tree and just wire bits directly.
     pub(super) fn bitblast_ashr(&mut self, a: &BvBits, b: &BvBits) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let n = a.len();
         if n == 0 {
             return Vec::new();
@@ -166,20 +220,30 @@ impl BvSolver<'_> {
         if let Some(shift_amt) = self.try_bits_to_usize(b) {
             if shift_amt >= n {
                 // All bits become the sign bit
-                return vec![sign_bit; n];
+                return self.repeat_bit(sign_bit, n);
             }
             // Arithmetic shift right: shift in the original bits, fill with sign bit
-            let mut result = Vec::with_capacity(n);
+            let Some(mut result) = self.counted_bits(n) else {
+                return Vec::new();
+            };
             for &bit in a.iter().skip(shift_amt) {
+                if !self.encoding_step() {
+                    return Vec::new();
+                }
                 result.push(bit);
             }
             for _ in 0..shift_amt {
+                if !self.encoding_step() {
+                    return Vec::new();
+                }
                 result.push(sign_bit);
             }
             return result;
         }
 
-        let mut current = a.clone();
+        let Some(mut current) = self.counted_copy_bits(a) else {
+            return Vec::new();
+        };
 
         // How many bits of shift amount can we handle before overflow?
         let log2_n = if n.is_power_of_two() {
@@ -189,17 +253,32 @@ impl BvSolver<'_> {
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {
-            let shift_amt = 1 << i;
+            if !self.encoding_step() {
+                return Vec::new();
+            }
+            // `i < log2_n <= usize::BITS`, so `1 << i` fits; a stage past the
+            // word is past `n` too.
+            let Some(shift_amt) = u32::try_from(i).ok().and_then(|s| 1usize.checked_shl(s)) else {
+                break;
+            };
             if shift_amt >= n {
                 break;
             }
 
             // Arithmetic shift fills with sign bit
-            let mut shifted = Vec::with_capacity(n);
+            let Some(mut shifted) = self.counted_bits(n) else {
+                return Vec::new();
+            };
             for &bit in current.iter().skip(shift_amt) {
+                if !self.encoding_step() {
+                    return Vec::new();
+                }
                 shifted.push(bit);
             }
             for _ in 0..shift_amt.min(n) {
+                if !self.encoding_step() {
+                    return Vec::new();
+                }
                 shifted.push(sign_bit);
             }
 
@@ -207,10 +286,10 @@ impl BvSolver<'_> {
         }
 
         // Handle overflow: if any high bit (>= log2_n) is set, shift >= n => result = all sign bits
-        let high_bits: Vec<CnfLit> = b.iter().skip(log2_n).copied().collect();
+        let high_bits = &b[log2_n.min(b.len())..];
         if !high_bits.is_empty() {
-            let overflow = self.mk_or_many(&high_bits);
-            let all_sign = vec![sign_bit; n];
+            let overflow = self.mk_or_many(high_bits);
+            let all_sign = self.repeat_bit(sign_bit, n);
             current = self.bitwise_mux(&all_sign, &current, overflow);
         }
 

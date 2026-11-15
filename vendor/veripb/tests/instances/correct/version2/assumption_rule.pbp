@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+* INTEGRATION-TEST: ignore(elaborate)
+f 1
+a 1 ~x1 >= 1 ;
+e 1 ~x1 >= 1 ; 2
+u 1 ~x3 >= 1 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

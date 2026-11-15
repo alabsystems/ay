@@ -101,6 +101,16 @@ impl ArraySolver<'_> {
         self.find_store_through_eq_with_mode(term, SentinelEdgeMode::RequireReasons)
     }
 
+    /// The outermost write `(index, value)` of `term`'s store chain, with the
+    /// reasons that make `term` that store (none when it is one syntactically).
+    pub(crate) fn outermost_store_write(
+        &self,
+        term: TermId,
+    ) -> Option<(TermId, TermId, Vec<TheoryLit>)> {
+        self.find_store_through_eq_with_reasons(term)
+            .map(|found| (found.index, found.value, found.reasons))
+    }
+
     fn find_store_through_asserted_eq(&self, term: TermId) -> Option<StoreThroughEq> {
         self.find_store_through_eq_with_mode(term, SentinelEdgeMode::Skip)
     }
@@ -404,11 +414,11 @@ impl ArraySolver<'_> {
         diseq_reasons: &mut Vec<TheoryLit>,
     ) -> TermId {
         let mut current = array;
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 20;
 
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 break;
             }
@@ -447,11 +457,11 @@ impl ArraySolver<'_> {
     ) -> Option<(TermId, Vec<TheoryLit>)> {
         let mut current = array;
         let mut reasons = Vec::new();
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 200;
 
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 return None;
             }
@@ -519,6 +529,7 @@ impl ArraySolver<'_> {
         if let Some(hit) = eq_paths_cache::get_resolve_base(array, index) {
             return (hit.0, hit.1.clone());
         }
+        propagation::prop_eq_stats::add(&propagation::prop_eq_stats::resolve_base_uncached, 1);
         let result = self.resolve_select_base_for_propagation_with_reasons_uncached(array, index);
         eq_paths_cache::put_resolve_base(array, index, &Rc::new((result.0, result.1.clone())));
         result
@@ -531,11 +542,11 @@ impl ArraySolver<'_> {
     ) -> (SelectResolution, Vec<TheoryLit>) {
         let mut current = array;
         let mut reasons = Vec::new();
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 200;
 
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 return (SelectResolution::Unresolved, reasons);
             }
@@ -594,16 +605,33 @@ impl ArraySolver<'_> {
     /// alias reasons plus the distinctness reasons that make that store
     /// effective. Returns `None` if the chain is too long or not a pure store
     /// chain.
-    pub(crate) fn collect_effective_stores(&self, array: TermId) -> Option<StoreChainCollection> {
+    /// The window-scoped memo (see `eq_paths_cache::Tables::effective_stores`)
+    /// in front of the walk, shared rather than cloned: the
+    /// equality-propagation sections that walk every asserted array
+    /// equality's sides read the map many times per call and never mutate
+    /// it. Outside a window every call recomputes, exactly as before.
+    pub(crate) fn collect_effective_stores_shared(
+        &self,
+        array: TermId,
+    ) -> Option<Rc<StoreChainCollection>> {
+        if let Some(hit) = eq_paths_cache::get_effective_stores(array) {
+            return hit;
+        }
+        let chain = self.collect_effective_stores_uncached(array).map(Rc::new);
+        eq_paths_cache::put_effective_stores(array, &chain);
+        chain
+    }
+
+    fn collect_effective_stores_uncached(&self, array: TermId) -> Option<StoreChainCollection> {
         let mut current = array;
         let mut path_reasons = Vec::new();
         let mut effective: StoreChainEntries = Vec::new();
         let mut seen_indices: Vec<TermId> = Vec::new();
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 200;
 
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 return None;
             }
@@ -621,12 +649,25 @@ impl ArraySolver<'_> {
                 //
                 // Fix: skip the inner store unless ALL outer indices are
                 // provably distinct from it.
+                //
+                // "All outer indices" means every outer STORE, not only the
+                // outer stores that made it into the map. A store skipped here
+                // (its own shadowing undecided) still writes its index when
+                // it is not shadowed, so it can hide a deeper store at the
+                // same index. Remembering only the admitted indices let
+                // `store(store(store(b, j, 1), i, v), 2, j)` publish `(j, 1)`
+                // with reasons `{j != 2}` alone while `i = j` makes the chain
+                // read `v` at `j`; the effective-store decomposition then
+                // propagated `1 = 2` against `store(store(c, j, 2), 2, 5)` and
+                // learned `S = S' -> j != 5`, a wrong UNSAT (2026-09-23 hunt
+                // D4, storeeq_41_0293). Every visited index is therefore
+                // recorded, admitted or not.
                 if let Some(reasons) =
                     self.effective_store_reasons(&seen_indices, store_idx, &path_reasons)
                 {
                     effective.push((store_idx, store_val, reasons));
-                    seen_indices.push(store_idx);
                 }
+                seen_indices.push(store_idx);
                 current = base;
                 continue;
             }
@@ -637,13 +678,14 @@ impl ArraySolver<'_> {
                 store_reasons.extend(found.reasons);
                 Self::canonicalize_theory_lits(&mut store_reasons);
 
-                // #7654: Same fix as above — require provable distinctness.
+                // #7654: Same fix as above — require provable distinctness
+                // from every outer store index, admitted or not.
                 if let Some(reasons) =
                     self.effective_store_reasons(&seen_indices, found.index, &store_reasons)
                 {
                     effective.push((found.index, found.value, reasons));
-                    seen_indices.push(found.index);
                 }
+                seen_indices.push(found.index);
                 path_reasons = store_reasons;
                 current = found.base;
                 continue;
@@ -677,11 +719,11 @@ impl ArraySolver<'_> {
 
     pub(crate) fn store_chain_reaches_asserted(&self, from: TermId, target: TermId) -> bool {
         let mut current = from;
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 200;
 
         while current != target {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 return false;
             }
@@ -704,13 +746,28 @@ impl ArraySolver<'_> {
         let mut path_reasons = Vec::new();
         let mut effective: StoreChainEntries = Vec::new();
         let mut seen_indices: Vec<TermId> = Vec::new();
-        let mut iterations = 0;
+        let mut iterations = 0usize;
         const MAX_ITERATIONS: usize = 200;
 
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             if iterations > MAX_ITERATIONS {
                 return None;
+            }
+
+            // A const-array reached as a BASE ends the chain. Its class can
+            // also hold a store (an asserted `K = store(a, i, v)`), and
+            // walking into that store from here re-enters the very chain
+            // being collected: fresh storeeq_2609_0448's
+            // `{K0 = store(a1, 5, 0), a1 = store(K0, 2, 1)}` cycled
+            // `store(a1, 5, 0) -> a1 -> store(K0, 2, 1) -> K0 -> store(a1, 5,
+            // 0)` to the iteration cap and returned no map, so the obligation
+            // at the written index 2 (1 against the default 0) was never
+            // drawn -- in the search's solver or in the fail-closed conflict
+            // verifier, which then rejected a valid conflict.
+            if iterations > 1 && self.const_array_cache.contains_key(&current) {
+                Self::canonicalize_theory_lits(&mut path_reasons);
+                return Some((current, path_reasons, effective));
             }
 
             let Some(found) = self.find_store_through_eq_with_mode(current, sentinel_edges) else {
@@ -785,7 +842,13 @@ impl ArraySolver<'_> {
         }
 
         // #6546: Greedy O(N^2) matcher replaces O(N!) backtracking matcher.
-        let mut used = vec![false; map2.len()];
+        // One match flag per candidate, reserved fallibly: without room for
+        // them no match is claimed.
+        let mut used = Vec::new();
+        used.try_reserve_exact(map2.len()).ok()?;
+        for _ in 0..map2.len() {
+            used.push(false);
+        }
         let mut all_reasons = Vec::new();
 
         for (idx1, val1, store_reasons1) in map1 {
@@ -818,6 +881,38 @@ impl ArraySolver<'_> {
         all_reasons.sort_by_key(|lit| (lit.term.0, lit.value));
         all_reasons.dedup_by_key(|lit| (lit.term, lit.value));
         Some(all_reasons)
+    }
+
+    /// Reasons for `lhs = rhs` as two store chains that are permutations of
+    /// each other over provably equal bases, or `None`.
+    ///
+    /// Read from the COMPLETE effective maps only
+    /// (`collect_complete_effective_stores`): every store of each chain is
+    /// accounted for, either effective (with the distinctness reasons that make
+    /// it visible) or shadowed (with the equality reasons that hide it), so
+    /// matching maps over equal bases really are equal arrays. The partial
+    /// walker (`collect_effective_stores`) omits a store whose shadowing is
+    /// undecided, so two partial maps can match while the chains differ at the
+    /// omitted store's index. The store-permutation scan emitted from partial
+    /// maps and derived
+    /// `store(store(b, 2, R), i, V) = store(store(K1, 2, 2), i, V)` from
+    /// `b = K1` alone — both `(2, _)` stores were omitted as undecided against
+    /// `i` — which is false whenever `R != 2` and `i != 2` (2026-09-23 hunt D4,
+    /// storeeq_41_0883). The partial maps may still NOMINATE candidate pairs.
+    pub(crate) fn complete_store_permutation_reasons(
+        &self,
+        lhs: TermId,
+        rhs: TermId,
+    ) -> Option<Vec<TheoryLit>> {
+        let (base_l, mut reasons, map_l) = self.collect_complete_effective_stores(lhs)?;
+        let (base_r, reasons_r, map_r) = self.collect_complete_effective_stores(rhs)?;
+        let base_reasons = self.explain_equal_if_provable(base_l, base_r)?;
+        let map_reasons = self.effective_stores_match_with_reasons(&map_l, &map_r)?;
+        reasons.extend(reasons_r);
+        reasons.extend(base_reasons);
+        reasons.extend(map_reasons);
+        Self::canonicalize_theory_lits(&mut reasons);
+        Some(reasons)
     }
 
     /// #lemma-must-prune / #refine-theory-memory: is emitting `clause` a NO-OP

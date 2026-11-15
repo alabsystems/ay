@@ -9,16 +9,19 @@ use std::path::PathBuf;
 // ─── Hash table rehash coverage ────────────────────────────────────
 
 #[test]
-fn test_maybe_rehash_triggers_on_large_formula() {
+fn test_maybe_rehash_triggers_on_large_formula() -> Result<(), Box<dyn std::error::Error>> {
     // Initial hash capacity is 1024. Adding >1024 clauses triggers rehash.
-    let num_clauses = 1100;
-    let mut checker = DratChecker::new(num_clauses * 2, false);
+    let num_clauses: u32 = 1100;
+    let num_vars = num_clauses
+        .checked_mul(2)
+        .ok_or("variable count overflows")?;
+    let mut checker = DratChecker::new(usize::try_from(num_vars)?, false);
     assert_eq!(checker.hash_buckets.len(), INITIAL_HASH_CAPACITY);
 
     // Add enough 2-literal clauses to exceed the initial capacity.
     for i in 0..num_clauses {
-        let a = i as u32 * 2;
-        let b = a + 1;
+        let a = i.checked_mul(2).ok_or("variable index overflows")?;
+        let b = a.checked_add(1).ok_or("variable index overflows")?;
         checker.add_original(&[lit(a, true), lit(b, true)]);
     }
 
@@ -33,6 +36,7 @@ fn test_maybe_rehash_triggers_on_large_formula() {
     // Deletion should still find clauses after rehash.
     checker.delete_clause(&[lit(0, true), lit(1, true)]);
     assert_eq!(checker.stats.missed_deletes, 0);
+    Ok(())
 }
 
 // ─── Coverage gap tests ─────────────────────────────────────────────

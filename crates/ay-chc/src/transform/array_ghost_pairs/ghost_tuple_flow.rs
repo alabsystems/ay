@@ -154,15 +154,14 @@ pub(super) fn preferred_body_ghost_indices(
     body_args: &[ChcExpr],
     fresh_head_indices: &[ChcExpr],
     trigger_indices: &[ChcExpr],
+    query_constraint: Option<&ChcExpr>,
 ) -> Option<Vec<ChcExpr>> {
-    let observed =
-        if matches!(&clause.head, ClauseHead::False) {
-            clause.body.constraint.as_ref().and_then(|constraint| {
-                observed_access_tuple(body_spec, spec.n, body_args, constraint)
-            })
-        } else {
-            None
-        };
+    let observed = if matches!(&clause.head, ClauseHead::False) {
+        query_constraint
+            .and_then(|constraint| observed_access_tuple(body_spec, spec.n, body_args, constraint))
+    } else {
+        None
+    };
     let aligned = match &clause.head {
         ClauseHead::Predicate(head_predicate, head_args) => {
             spec.preds.get(head_predicate).and_then(|head_spec| {

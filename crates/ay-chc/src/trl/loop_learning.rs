@@ -269,6 +269,19 @@ impl TrlSolver {
             substitutions.push((next_var, ChcExpr::var(TransitionSystem::version_var(v, to))));
         }
 
+        // Every other variable is a clause-local existential, and each step
+        // gets its own copy. Under one shared name the steps of an unrolling
+        // are forced to agree on it, which loses every counterexample that
+        // needs them to differ (#6789's shape, in TRL's own unrolling).
+        let fixed: FxHashSet<String> = substitutions.iter().map(|(v, _)| v.name.clone()).collect();
+        for v in trans.vars() {
+            if !fixed.contains(&v.name) {
+                let local =
+                    ChcVar::new(crate::trace::step_local_name(&v.name, from), v.sort.clone());
+                substitutions.push((v, ChcExpr::var(local)));
+            }
+        }
+
         trans.substitute(&substitutions)
     }
 }

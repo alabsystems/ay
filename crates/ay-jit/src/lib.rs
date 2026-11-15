@@ -26,8 +26,6 @@
 //!   native SAT dispatch is disabled.
 //! - [`batch_recompile`] -- Scheduler for selecting hot learned clauses for
 //!   profile extraction.
-//! - [`deletion_hook`] -- Inert deletion/mutation scaffold for any future
-//!   gated learned-clause runtime experiment.
 //!
 //! ### Theory JIT (production, used by ay-theories and ay-dpll)
 //!
@@ -67,7 +65,6 @@ pub mod code_cache;
 pub(crate) mod compiler_service;
 pub mod conflict_jit;
 pub mod context;
-pub mod deletion_hook;
 pub mod expr_eval;
 pub mod guards;
 pub mod learned_clause_emit;
@@ -171,4 +168,11 @@ pub enum JitError {
     /// observe the failure.
     #[error("JIT backend compilation panicked: {0}")]
     BackendPanic(String),
+
+    /// external-codegen-ir refused to build the module: a construction door (a function
+    /// signature, the function itself) found its id space exhausted. Since
+    /// external-codegen-ir D1b (`3d315a17`) such a door refuses instead of panicking.
+    /// Nothing was compiled; baseline code keeps running.
+    #[error("external-codegen-ir refused the module construction: {0}")]
+    ExternalCodegenIrRefused(String),
 }

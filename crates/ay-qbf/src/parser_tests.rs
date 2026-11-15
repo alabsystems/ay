@@ -4,7 +4,7 @@
 use super::*;
 
 #[test]
-fn test_parse_simple_qdimacs() {
+fn test_parse_simple_qdimacs() -> Result<(), Box<dyn std::error::Error>> {
     let input = r#"
 c Simple QBF example
 p cnf 3 2
@@ -14,21 +14,24 @@ a 2 0
 -1 -2 3 0
 "#;
 
-    let formula = parse_qdimacs(input).unwrap();
+    let formula = parse_qdimacs(input)?;
     assert_eq!(formula.num_vars(), 3);
     assert_eq!(formula.prefix().len(), 2);
     assert_eq!(formula.clauses().len(), 2);
 
     // Check prefix
-    assert_eq!(formula.prefix()[0].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix()[0].variables, vec![1, 3]);
-    assert_eq!(formula.prefix()[1].quantifier, Quantifier::Forall);
-    assert_eq!(formula.prefix()[1].variables, vec![2]);
+    let first = formula.prefix().first().ok_or("missing first block")?;
+    let second = formula.prefix().get(1).ok_or("missing second block")?;
+    assert_eq!(first.quantifier, Quantifier::Exists);
+    assert_eq!(first.variables, vec![1, 3]);
+    assert_eq!(second.quantifier, Quantifier::Forall);
+    assert_eq!(second.variables, vec![2]);
 
     // Check quantifier info
     assert!(formula.is_existential(1));
     assert!(formula.is_universal(2));
     assert!(formula.is_existential(3));
+    Ok(())
 }
 
 #[test]
@@ -41,7 +44,7 @@ fn test_parse_minimal_qdimacs() {
 }
 
 #[test]
-fn test_parse_alternating_quantifiers() {
+fn test_parse_alternating_quantifiers() -> Result<(), Box<dyn std::error::Error>> {
     let input = r#"
 p cnf 4 1
 e 1 0
@@ -51,20 +54,31 @@ a 4 0
 1 -2 3 -4 0
 "#;
 
-    let formula = parse_qdimacs(input).unwrap();
+    let formula = parse_qdimacs(input)?;
     assert_eq!(formula.prefix().len(), 4);
 
     // Check alternation
-    assert_eq!(formula.prefix()[0].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix()[1].quantifier, Quantifier::Forall);
-    assert_eq!(formula.prefix()[2].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix()[3].quantifier, Quantifier::Forall);
+    let quantifiers: Vec<Quantifier> = formula
+        .prefix()
+        .iter()
+        .map(|block| block.quantifier)
+        .collect();
+    assert_eq!(
+        quantifiers,
+        [
+            Quantifier::Exists,
+            Quantifier::Forall,
+            Quantifier::Exists,
+            Quantifier::Forall
+        ]
+    );
 
     // Check levels
     assert_eq!(formula.var_level(1), 0);
     assert_eq!(formula.var_level(2), 1);
     assert_eq!(formula.var_level(3), 2);
     assert_eq!(formula.var_level(4), 3);
+    Ok(())
 }
 
 #[test]

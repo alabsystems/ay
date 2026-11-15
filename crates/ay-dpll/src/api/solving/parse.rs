@@ -11,6 +11,7 @@ use ay_frontend::{
 
 use crate::api::types::{SolverError, Term};
 use crate::api::Solver;
+use crate::api::Sort;
 
 /// Public-sort metadata for one parsed term occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +177,46 @@ impl Solver {
     /// state commands, or an internal metadata-alignment violation.
     pub fn parse_smtlib2_z3_5(&mut self, input: &str) -> Result<ParsedSmtlib2Batch, SolverError> {
         self.parse_smtlib2_with_public_metadata(input, FiniteSetTypingMode::Z3_5Strict)
+    }
+
+    /// Bind the sort name `name` to `sort` in the current scope, so a
+    /// following parse that names it denotes the caller's sort (see
+    /// [`ay_frontend::Context::bind_native_sort_name`]). The sort is lowered
+    /// exactly as a native declaration over it is.
+    ///
+    /// # Errors
+    ///
+    /// The name is reserved or already names a sort in this scope.
+    pub fn try_bind_sort_name(&mut self, name: &str, sort: &Sort) -> Result<(), SolverError> {
+        let lowered = self.lower_live_sort(sort);
+        self.executor
+            .context_mut_internal()
+            .bind_native_sort_name(name, lowered)
+            .map_err(|e| SolverError::InvalidArgument {
+                operation: "bind_sort_name",
+                message: e.to_string(),
+            })
+    }
+
+    /// The sort the sort name `name` denotes in the current scope, if any.
+    pub fn resolve_sort_name(&mut self, name: &str) -> Option<Sort> {
+        self.executor
+            .context_mut_internal()
+            .resolve_native_sort_name(name)
+    }
+
+    /// The sort a native declaration over `sort` receives (a caller-made
+    /// sort a parsed text declares again is the same sort when they agree).
+    #[must_use]
+    pub fn live_sort(&self, sort: &Sort) -> Sort {
+        self.lower_live_sort(sort)
+    }
+
+    /// Every declared signature: surface name, core identity, argument
+    /// sorts, result sort, and whether it is a `define-fun` macro.
+    #[must_use]
+    pub fn symbol_signatures_core(&self) -> Vec<(String, String, Vec<Sort>, Sort, bool)> {
+        self.executor.context().native_symbol_signatures()
     }
 
     fn parse_smtlib2_with_public_metadata(

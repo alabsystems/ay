@@ -118,6 +118,40 @@ impl Executor {
                 .is_some_and(|proof| self.check_proof_strict_with_datatypes(proof).is_ok())
     }
 
+    /// Whether this query's UNSAT was already minted on a still-current exact
+    /// finite-expansion theorem that the requested presentation admits.
+    ///
+    /// That theorem re-expands the immutable public roots over their finite
+    /// binder carriers and accepts only an elementary ground contradiction in
+    /// the expansion: a literal `false` conjunct, or one subject equated to two
+    /// distinct scalar literals. No theory solver runs, so the refutation
+    /// cannot rest on the nested-array combination the quarantine distrusts.
+    /// It is semantic evidence, so it is refused under exactly the predicate
+    /// the semantic-certificate mint refuses it under (an explicit proof,
+    /// strict-check or self-check request), as the exact finite Bool/BV rung
+    /// is. The currency check re-binds the evidence to the live query epoch,
+    /// so a certificate left over from an earlier query never counts.
+    ///
+    /// b79271632 made MODEL_CHECKER_CONSUMER's `nested_premise_false_unsat` publish on exactly
+    /// this certificate; that row keeps arrays in datatype fields and lost it to
+    /// the quarantine once declared carriers counted as nested
+    /// (#nested-array-quarantine-datatype-fields). A directly nested UNSAT that
+    /// carries the certificate is admitted the same way.
+    pub(in crate::executor) fn nested_array_unsat_finite_expansion_theorem_is_current(
+        &self,
+    ) -> bool {
+        !self.strict_unsat_presentation_required()
+            && self
+                .last_unsat_certificate
+                .as_ref()
+                .is_some_and(|certificate| {
+                    matches!(
+                        certificate.0,
+                        UnsatCertificateKind::CheckedExactFiniteExpansion(_)
+                    ) && certificate.checked_exact_semantic_is_current(self)
+                })
+    }
+
     /// Produce the move-only exact finite-array theorem consumed later by the
     /// common UNSAT mint.
     ///

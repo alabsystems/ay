@@ -187,7 +187,7 @@ impl Kitten {
         core_ids
     }
 
-    fn reset_core_marks(&mut self) {
+    pub(super) fn reset_core_marks(&mut self) {
         let mut offset = 0;
         while offset + 2 < self.clause_data.len() {
             let size = self.clause_data[offset + 1] as usize;

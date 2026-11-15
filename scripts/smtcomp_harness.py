@@ -167,7 +167,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -178,7 +177,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _z3_oracle  # noqa: E402
 from _oom_guard import (  # noqa: E402
+    GuardEnforcementError,
     guarded_popen,
     plan_solver_resources,
     warn_concurrent_build,
@@ -829,6 +830,26 @@ def _find(env: str, *candidates: object) -> Path | None:
     return None
 
 
+def _find_z3() -> Path | None:
+    """The reference oracle: $Z3_BIN, else a vendored .competitors/z3, else the
+    z3 oracle (scripts/_z3_oracle.py: Z3_PATH, else the first z3 on PATH that
+    proves it is z3). Each is identity-checked; `shutil.which("z3")` is not
+    used, because it can name a refusing reroute stub or an AY drop-in, whose
+    answers would stand in for z3's. None when no z3 proves itself."""
+    explicit = os.environ.get("Z3_BIN")
+    vendored = COMPETITORS / "z3"
+    try:
+        if explicit:
+            return Path(_z3_oracle.resolve_z3_spelling(explicit).path)
+        if vendored.is_file():
+            return Path(_z3_oracle.identify_z3(str(vendored)).path)
+        oracle = _z3_oracle.find_z3()
+    except (_z3_oracle.Z3Unavailable, ValueError) as error:
+        print(f"z3: not a usable reference oracle: {error}", file=sys.stderr)
+        return None
+    return Path(oracle.path) if oracle else None
+
+
 def build_registry() -> dict[str, Solver]:
     # Prefer the vendored temurin JRE over PATH lookup: on macOS
     # /usr/bin/java is a stub that "runs" and exits answerless when no JRE
@@ -840,9 +861,8 @@ def build_registry() -> dict[str, Solver]:
                  "java")
     registry = {
         "ay": Solver("ay", _find("AY_BIN", REPO / "target/release/ay"), "ay"),
-        "z3": Solver("z3", _find("Z3_BIN", COMPETITORS / "z3", "z3",
-                                 Path("/opt/homebrew/bin/z3")),
-                     "z3", note="reference oracle, plain `z3 FILE`"),
+        "z3": Solver("z3", _find_z3(), "z3",
+                     note="reference oracle, plain `z3 FILE`"),
         "cvc5": Solver("cvc5", _find("CVC5_BIN", COMPETITORS / "cvc5", "cvc5"),
                        "native", submission="cvc5",
                        note="2025 command is a starexec wrapper script inside the "
@@ -1218,13 +1238,6 @@ class _NonReapingProcessView:
             return None
 
 
-def _kill_process_group(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def _drain_head(stream, buf: bytearray, cap: int, sink, total: list[int]) -> None:
     try:
         while True:
@@ -1290,7 +1303,7 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
     proc = None
     guard = None
     drain_threads: list[threading.Thread] = []
-    leader_reaped = False
+    completion_attempted = False
     try:
         if inv.stdin_path:
             stdin_fh = open(inv.stdin_path, "rb")
@@ -1325,38 +1338,44 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
         killed = False
         rusage = None
         status = 0
+        kill_deadline = None
         while True:
+            guard.check_enforcement()
             try:
                 pid, status, rusage = os.wait4(proc.pid, os.WNOHANG)
-            except ChildProcessError:  # someone else reaped (shouldn't happen)
-                pid, rusage = proc.pid, None
+            except ChildProcessError as error:
+                # Neither an exit status nor CPU usage can be reconstructed if
+                # another observer stole wait4's child. Never fabricate success.
+                raise GuardEnforcementError("SMT wait4 lost its owned child") from error
             if pid == proc.pid:
+                try:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                except ValueError:
+                    exit_code = None
+                # finish must not reap again or overwrite the actual wait4
+                # status; this is the sole owner of direct-child CPU accounting.
+                proc.returncode = exit_code if exit_code is not None else -1
+                guard.check_enforcement()
                 break
             now = time.monotonic()
             if now >= deadline and not killed:
                 killed = True
-                _kill_process_group(proc.pid)  # setsid => pgid == pid
+                kill_deadline = now + 5
+                # Preserve wait4 accounting at timeout: request one kill through
+                # the authenticated monitor, then let this loop reap the leader.
+                guard.terminate_if_authenticated()
+                guard.check_enforcement()
+            if kill_deadline is not None and now >= kill_deadline:
+                raise GuardEnforcementError("SMT child did not reap after authenticated timeout kill")
             time.sleep(min(0.05, max(deadline - now, 0.005)))
-        leader_reaped = True
         wall = time.monotonic() - t0
-        # The wrapper may exit while leaving solver descendants alive. Kill the
-        # entire isolated group on every outcome before disarming the only RSS
-        # enforcement and before waiting for pipe EOF.
-        _kill_process_group(proc.pid)
-        guard.stop()
+        completion_attempted = True
+        guard.finish(proc, "smtcomp_harness.py")
         memout = guard.breached
-        try:
-            exit_code = os.waitstatus_to_exitcode(status)
-        except ValueError:
-            exit_code = None
-        proc.returncode = exit_code if exit_code is not None else -1  # stop Popen re-reaping
         t_out.join(timeout=10)
         t_err.join(timeout=10)
-        for s in (proc.stdout, proc.stderr):
-            try:
-                s.close()
-            except OSError:
-                pass
+        if t_out.is_alive() or t_err.is_alive():
+            raise GuardEnforcementError("SMT child pipes did not close after process-group reap")
         cpu = (rusage.ru_utime + rusage.ru_stime) if rusage else None
         return ExecResult(
             stdout=bytes(out_buf),
@@ -1373,30 +1392,31 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
             peak_rss_mb=getattr(guard, "peak_rss_mb", None),
         )
     finally:
-        if proc is not None:
-            _kill_process_group(proc.pid)
-            if guard is not None:
-                guard.stop()
-            if not leader_reaped:
-                try:
-                    _, cleanup_status = os.waitpid(proc.pid, 0)
-                    proc.returncode = os.waitstatus_to_exitcode(cleanup_status)
-                except (ChildProcessError, ProcessLookupError, ValueError):
-                    pass
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+        try:
+            if guard is not None and not completion_attempted:
+                completion_attempted = True
+                guard.finish(proc, "smtcomp_harness.py[cleanup]")
+        finally:
             for thread in drain_threads:
                 thread.join(timeout=10)
-        for fh in (stdin_fh, sink):
-            if fh is not None:
-                try:
-                    fh.close()
-                except OSError:
-                    pass
+            if proc is not None:
+                for index, stream in enumerate((proc.stdout, proc.stderr)):
+                    # A failed identity boundary may leave a pipe open. Do not
+                    # block on a buffered reader's lock while reporting refusal.
+                    if (stream is not None and
+                            (index >= len(drain_threads) or not drain_threads[index].is_alive())):
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+            for fh in (stdin_fh, sink):
+                # The stdout drainer owns the sink until it terminates.
+                if (fh is not None and
+                        not (fh is sink and drain_threads and drain_threads[0].is_alive())):
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
 
 
 # ---------------------------------------------------------------------------

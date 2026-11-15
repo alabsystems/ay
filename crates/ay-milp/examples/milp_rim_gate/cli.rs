@@ -31,19 +31,12 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BusyPolicy {
-    RequireQuiet,
-    AllowBusy,
-}
-
 pub(crate) struct Args {
     pub(crate) corpora: Vec<PathBuf>,
     pub(crate) probe: Option<PathBuf>,
     pub(crate) limit_secs: f64,
     pub(crate) tier: Tier,
     pub(crate) action: Action,
-    pub(crate) busy_policy: BusyPolicy,
 }
 
 struct Parser {
@@ -53,7 +46,6 @@ struct Parser {
     probe: Option<PathBuf>,
     limit_secs: f64,
     tier: Tier,
-    busy_policy: BusyPolicy,
 }
 
 impl Parser {
@@ -65,7 +57,6 @@ impl Parser {
             probe: None,
             limit_secs: 600.0,
             tier: Tier::Fast,
-            busy_policy: BusyPolicy::RequireQuiet,
         }
     }
 
@@ -116,10 +107,6 @@ impl Parser {
             Some("--ratchet") => self.set_action(Action::Ratchet, "--ratchet"),
             Some("--list") => self.set_action(Action::List, "--list"),
             Some("--help" | "-h") => self.set_action(Action::Help, "--help"),
-            Some("--allow-busy") => {
-                self.busy_policy = BusyPolicy::AllowBusy;
-                Ok(())
-            }
             Some("--corpus") => {
                 let value = self.value("--corpus")?;
                 self.corpora.push(PathBuf::from(value));
@@ -159,7 +146,6 @@ impl Parser {
             limit_secs: self.limit_secs,
             tier: self.tier,
             action: self.action.unwrap_or(Action::List),
-            busy_policy: self.busy_policy,
         })
     }
 }
@@ -175,9 +161,8 @@ pub(crate) fn print_help() {
          Options:\n\
            --corpus DIR    Directory of .mps/.mps.gz models; repeatable\n\
            --probe PATH    ay-milp lib test binary; otherwise ask Cargo\n\
-           --limit SECS    Per-instance rim deadline (default: 600)\n\
+           --limit SECS    Per-instance wall backstop (default: 600); a solve it ends could not run\n\
            --tier TIER     fast or all (default: fast)\n\
-           --allow-busy    Override the quiet-host precondition\n\
            -h, --help      Print this help\n\n\
          No action lists the committed pins without measuring."
     );

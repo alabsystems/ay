@@ -4,432 +4,103 @@
 
 //! Exact, capture-safe validation for premiseless `forall_inst`.
 
+use super::progress::QuantifierMeter;
+use super::scans::{argument_has_free_name_in, argument_is_ground_for, nested_binder_names};
+use super::substitution::matches_substitution;
 use super::*;
 
-type MatchFrame = (TermId, TermId, HashSet<String>);
 type ForallInstShape<'a> = (&'a [(String, Sort)], TermId, TermId);
-
-fn invalid_forall_inst(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
-    invalid_rule(step, "forall_inst", reason)
-}
-
-struct SubstitutionMatcher<'a, 's, 'w> {
-    terms: &'a TermStore,
-    substitutions: &'s HashMap<&'a str, TermId>,
-    matched_var_ids: HashMap<String, u32>,
-    work: &'w mut usize,
-    stack: Vec<MatchFrame>,
-}
-
-impl SubstitutionMatcher<'_, '_, '_> {
-    fn run(&mut self, pattern: TermId, instance: TermId) -> Option<bool> {
-        self.stack
-            .push((pattern, instance, HashSet::<String>::default()));
-        while let Some((expected, actual, blocked)) = self.stack.pop() {
-            if !self.match_node(expected, actual, blocked)? {
-                return Some(false);
-            }
-        }
-        Some(true)
-    }
-
-    fn match_node(
-        &mut self,
-        expected: TermId,
-        actual: TermId,
-        blocked: HashSet<String>,
-    ) -> Option<bool> {
-        if *self.work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
-        }
-        *self.work += 1;
-        if self.terms.sort(expected) != self.terms.sort(actual) {
-            return Some(false);
-        }
-        match self.terms.get(expected) {
-            TermData::Var(name, id) => {
-                Some(self.match_variable(name, *id, expected, actual, &blocked))
-            }
-            TermData::Const(..) => Some(expected == actual),
-            TermData::Not(inner) => {
-                let TermData::Not(actual_inner) = self.terms.get(actual) else {
-                    return Some(false);
-                };
-                self.stack.push((*inner, *actual_inner, blocked));
-                Some(true)
-            }
-            TermData::Ite(condition, then_branch, else_branch) => {
-                let TermData::Ite(actual_condition, actual_then, actual_else) =
-                    self.terms.get(actual)
-                else {
-                    return Some(false);
-                };
-                self.stack.extend([
-                    (*condition, *actual_condition, blocked.clone()),
-                    (*then_branch, *actual_then, blocked.clone()),
-                    (*else_branch, *actual_else, blocked),
-                ]);
-                Some(true)
-            }
-            TermData::App(symbol, args) => self.match_app(symbol, args, actual, blocked),
-            TermData::Forall(bindings, body, triggers)
-            | TermData::Exists(bindings, body, triggers) => {
-                self.match_quantifier(expected, actual, bindings, *body, triggers, blocked)
-            }
-            TermData::Let(..) => Some(false),
-            _ => Some(false),
-        }
-    }
-
-    fn match_variable(
-        &mut self,
-        name: &str,
-        id: u32,
-        expected: TermId,
-        actual: TermId,
-        blocked: &HashSet<String>,
-    ) -> bool {
-        if blocked.contains(name) {
-            return expected == actual;
-        }
-        let Some(&replacement) = self.substitutions.get(name) else {
-            return expected == actual;
-        };
-        match self.matched_var_ids.get(name) {
-            Some(&seen) if seen != id => return false,
-            Some(_) => {}
-            None => {
-                self.matched_var_ids.insert(name.to_owned(), id);
-            }
-        }
-        actual == replacement
-    }
-
-    fn match_app(
-        &mut self,
-        symbol: &Symbol,
-        args: &[TermId],
-        actual: TermId,
-        blocked: HashSet<String>,
-    ) -> Option<bool> {
-        let TermData::App(actual_symbol, actual_args) = self.terms.get(actual) else {
-            return Some(false);
-        };
-        if symbol != actual_symbol || args.len() != actual_args.len() {
-            return Some(false);
-        }
-        self.stack.extend(
-            args.iter()
-                .copied()
-                .zip(actual_args.iter().copied())
-                .map(|(left, right)| (left, right, blocked.clone())),
-        );
-        Some(true)
-    }
-
-    fn match_quantifier(
-        &mut self,
-        expected: TermId,
-        actual: TermId,
-        bindings: &[(String, Sort)],
-        body: TermId,
-        triggers: &[Vec<TermId>],
-        mut blocked: HashSet<String>,
-    ) -> Option<bool> {
-        let same_polarity = matches!(
-            (self.terms.get(expected), self.terms.get(actual)),
-            (TermData::Forall(..), TermData::Forall(..))
-                | (TermData::Exists(..), TermData::Exists(..))
-        );
-        let (actual_bindings, actual_body, actual_triggers) = match self.terms.get(actual) {
-            TermData::Forall(bindings, body, triggers)
-            | TermData::Exists(bindings, body, triggers) => (bindings, body, triggers),
-            _ => return Some(false),
-        };
-        if !same_polarity
-            || bindings != actual_bindings
-            || triggers.len() != actual_triggers.len()
-            || triggers
-                .iter()
-                .zip(actual_triggers)
-                .any(|(left, right)| left.len() != right.len())
-        {
-            return Some(false);
-        }
-        blocked.extend(bindings.iter().map(|(name, _)| name.clone()));
-        self.stack.push((body, *actual_body, blocked.clone()));
-        for (left, right) in triggers.iter().zip(actual_triggers) {
-            self.stack.extend(
-                left.iter()
-                    .copied()
-                    .zip(right.iter().copied())
-                    .map(|(left, right)| (left, right, blocked.clone())),
-            );
-        }
-        Some(true)
-    }
-}
-
-fn matches_substitution<'a>(
-    terms: &'a TermStore,
-    pattern: TermId,
-    instance: TermId,
-    substitutions: &HashMap<&'a str, TermId>,
-    work: &mut usize,
-) -> Option<bool> {
-    SubstitutionMatcher {
-        terms,
-        substitutions,
-        matched_var_ids: HashMap::default(),
-        work,
-        stack: Vec::new(),
-    }
-    .run(pattern, instance)
-}
-
-fn nested_binder_names(
-    terms: &TermStore,
-    root: TermId,
-    work: &mut usize,
-) -> Option<HashSet<String>> {
-    let mut names = HashSet::default();
-    let mut seen = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if !seen.insert(term) {
-            continue;
-        }
-        if *work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
-        }
-        *work += 1;
-        match terms.get(term) {
-            TermData::Forall(bindings, body, triggers)
-            | TermData::Exists(bindings, body, triggers) => {
-                names.extend(bindings.iter().map(|(name, _)| name.clone()));
-                stack.push(*body);
-                stack.extend(triggers.iter().flatten().copied());
-            }
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(condition, then_branch, else_branch) => {
-                stack.extend([*condition, *then_branch, *else_branch]);
-            }
-            TermData::Let(..) => return None,
-            TermData::Var(..) | TermData::Const(..) => {}
-            // An unknown future `TermData` variant could carry a binder this
-            // scan would then miss. An empty result now AUTHORIZES arguments
-            // spelled like a source binder, so silently skipping an
-            // unrecognized node is no longer safe: fail closed.
-            _ => return None,
-        }
-    }
-    Some(names)
-}
-
-fn argument_has_free_name_in(
-    terms: &TermStore,
-    root: TermId,
-    forbidden: &HashSet<String>,
-    work: &mut usize,
-) -> Option<bool> {
-    let mut seen = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if !seen.insert(term) {
-            continue;
-        }
-        if *work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
-        }
-        *work += 1;
-        match terms.get(term) {
-            TermData::Var(name, _) if forbidden.contains(name) => return Some(true),
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(condition, then_branch, else_branch) => {
-                stack.extend([*condition, *then_branch, *else_branch]);
-            }
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return Some(true),
-            _ => {}
-        }
-    }
-    Some(false)
-}
-
-pub(super) fn matches_single_substitution(
-    terms: &TermStore,
-    pattern: TermId,
-    instance: TermId,
-    binder: &str,
-    witness: TermId,
-    work: &mut usize,
-) -> Option<bool> {
-    let mut substitutions = HashMap::default();
-    substitutions.insert(binder, witness);
-    matches_substitution(terms, pattern, instance, &substitutions, work)
-}
-
-/// An argument is usable when it carries no binder of its own and names no
-/// binder that is still in scope at the substitution sites.
-///
-/// `capturing_binders` is that in-scope subset of the source binders — see
-/// [`checked_substitutions`]. It is EMPTY for a binder-free body, where the
-/// instance cannot contain a binder at all; it is the full source binder set
-/// for every body that does bind something.
-fn argument_is_ground_for(
-    terms: &TermStore,
-    root: TermId,
-    capturing_binders: &HashSet<&str>,
-    work: &mut usize,
-) -> Option<bool> {
-    let mut visited = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if !visited.insert(term) {
-            continue;
-        }
-        if *work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
-        }
-        *work += 1;
-        match terms.get(term) {
-            TermData::Var(name, _) if capturing_binders.contains(name.as_str()) => {
-                return Some(false);
-            }
-            TermData::Var(..) | TermData::Const(..) => {}
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(condition, then_branch, else_branch) => {
-                stack.extend([*condition, *then_branch, *else_branch]);
-            }
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return Some(false),
-            _ => return Some(false),
-        }
-    }
-    Some(true)
-}
 
 fn decode_forall_inst_shape<'a>(
     terms: &'a TermStore,
-    step: ProofId,
+    _step: ProofId,
     clause: &[TermId],
     premise_count: usize,
     args: &[TermId],
+    meter: &mut QuantifierMeter<'_, '_>,
 ) -> Result<ForallInstShape<'a>, ProofCheckError> {
     if premise_count != 0 {
-        return Err(invalid_forall_inst(step, "must not have premises"));
+        return Err(meter.invalid("must not have premises")?);
     }
     let [implication] = clause else {
-        return Err(invalid_forall_inst(
-            step,
-            "conclusion must be one or-wrapped implication",
-        ));
+        return Err(meter.invalid("conclusion must be one or-wrapped implication")?);
     };
-    let TermData::App(Symbol::Named(or_name), disjuncts) = terms.get(*implication) else {
-        return Err(invalid_forall_inst(step, "conclusion must be an or term"));
+    let TermData::App(Symbol::Named(or_name), disjuncts) = meter.term(terms, *implication)? else {
+        return Err(meter.invalid("conclusion must be an or term")?);
     };
-    if terms.sort(*implication) != &Sort::Bool || or_name != "or" || disjuncts.len() != 2 {
-        return Err(invalid_forall_inst(
-            step,
-            "conclusion must be exactly a Boolean (or (not forall) instance)",
-        ));
+    meter.name(or_name)?;
+    let implication_sort = meter.sort(terms, *implication)?;
+    if !meter.sort_equal(implication_sort, &Sort::Bool)? || or_name != "or" || disjuncts.len() != 2
+    {
+        return Err(
+            meter.invalid("conclusion must be exactly a Boolean (or (not forall) instance)")?
+        );
     }
-    let TermData::Not(quantified) = terms.get(disjuncts[0]) else {
-        return Err(invalid_forall_inst(
-            step,
-            "first disjunct must be the negated source forall",
-        ));
+    let TermData::Not(quantified) = meter.term(terms, disjuncts[0])? else {
+        return Err(meter.invalid("first disjunct must be the negated source forall")?);
     };
-    let TermData::Forall(bindings, body, _) = terms.get(*quantified) else {
-        return Err(invalid_forall_inst(step, "negated source must be a forall"));
+    let TermData::Forall(bindings, body, _) = meter.term(terms, *quantified)? else {
+        return Err(meter.invalid("negated source must be a forall")?);
     };
     if bindings.is_empty() || args.len() != bindings.len() {
-        return Err(invalid_forall_inst(
-            step,
-            "positional argument count must equal the non-empty binder count",
-        ));
+        return Err(
+            meter.invalid("positional argument count must equal the non-empty binder count")?
+        );
     }
     Ok((bindings, *body, disjuncts[1]))
 }
 
 fn checked_substitutions<'a>(
     terms: &'a TermStore,
-    step: ProofId,
+    _step: ProofId,
     bindings: &'a [(String, Sort)],
     body: TermId,
     args: &[TermId],
-    work: &mut usize,
+    meter: &mut QuantifierMeter<'_, '_>,
 ) -> Result<HashMap<&'a str, TermId>, ProofCheckError> {
-    let binder_names = bindings
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<HashSet<_>>();
-    if binder_names.len() != bindings.len() {
-        return Err(invalid_forall_inst(
-            step,
-            "source forall contains duplicate binder names",
-        ));
+    let mut binder_names = HashSet::default();
+    for (name, _) in bindings {
+        meter.name_set_entry(&binder_names, name)?;
+        if !binder_names.insert(name.as_str()) {
+            return Err(meter.invalid("source forall contains duplicate binder names")?);
+        }
     }
-    let nested_names = nested_binder_names(terms, body, work).ok_or_else(|| {
-        invalid_forall_inst(
-            step,
-            format!(
-                "nested-binder scan exceeds {SKOLEM_TERM_WORK_LIMIT} distinct terms or encounters let"
-            ),
-        )
-    })?;
-    // Which binder spellings can an argument's free names actually collide
-    // with? Only the ones still BINDING inside `body`. The source binders are
-    // not: this rule instantiates them away, so in the conclusion they bind
-    // nothing and an argument mentioning one denotes the ambient free symbol
-    // the binder happened to shadow — `(or (not (forall ((x S)) (p x))) (p x))`
-    // is a valid instantiation of `∀x. p x` at the free `x`, and the
-    // substitution lemma needs capture-freedom only with respect to the binders
-    // of `body` itself.
-    //
-    // When `body` carries no binder at all, that is decidable outright.
-    // `nested_binder_names` fails closed on any `let` and collects every
-    // `forall`/`exists` binder reachable through bodies AND trigger groups, so
-    // an empty set means `body` is binder-free; every argument is checked
-    // binder-free just below; and the structural matcher introduces no binder.
-    // The instance is therefore binder-free too, and nothing in it can capture.
-    //
-    // The moment `body` DOES bind something we are in the nested lane, and the
-    // source-binder spelling test stays in force exactly as written: a body
-    // that re-binds a source spelling (`forall x. … forall x. …`) puts that
-    // spelling back in scope over a substitution site.
-    let capturing_binders = if nested_names.is_empty() {
-        HashSet::default()
-    } else {
-        binder_names.clone()
+    let Some(nested_names) = nested_binder_names(terms, body, meter)? else {
+        return Err(meter.invalid("nested-binder scan encounters let or unsupported term")?);
     };
+    // Source binders disappear under simultaneous instantiation. In a
+    // binder-free body their names may therefore denote ambient free symbols.
+    // Preserve the existing conservative source-name restriction whenever
+    // the body carries a nested binder (including one inside a trigger).
+    let mut capturing_binders = HashSet::default();
+    if !nested_names.is_empty() {
+        meter.table_iteration(binder_names.len())?;
+        for &name in &binder_names {
+            meter.name_set_entry(&capturing_binders, name)?;
+            capturing_binders.insert(name);
+        }
+    }
     let mut substitutions = HashMap::default();
     for ((name, sort), &argument) in bindings.iter().zip(args) {
-        if terms.sort(argument) != sort {
-            return Err(invalid_forall_inst(
-                step,
-                "argument sort does not match its positional binder",
-            ));
+        let argument_sort = meter.sort(terms, argument)?;
+        if !meter.sort_equal(argument_sort, sort)? {
+            return Err(meter.invalid("argument sort does not match its positional binder")?);
         }
-        if argument_is_ground_for(terms, argument, &capturing_binders, work) != Some(true) {
-            return Err(invalid_forall_inst(
-                step,
-                "argument carries a binder or let, or names a source binder the body keeps in scope",
-            ));
+        if !argument_is_ground_for(terms, argument, &capturing_binders, meter)? {
+            return Err(meter.invalid("argument carries a binder or let, or names a source binder the body keeps in scope")?);
         }
-        if argument_has_free_name_in(terms, argument, &nested_names, work) != Some(false) {
-            return Err(invalid_forall_inst(
-                step,
-                "argument is unbounded or may be captured by a nested binder",
-            ));
+        if argument_has_free_name_in(terms, argument, &nested_names, meter)? {
+            return Err(
+                meter.invalid("argument is unbounded or may be captured by a nested binder")?
+            );
         }
+        meter.name_map_entry(&substitutions, name)?;
         substitutions.insert(name.as_str(), argument);
     }
     Ok(substitutions)
 }
 
-/// Validate AY's premiseless, exact structural `forall_inst` representation.
+/// Compatibility wrapper for callers without a resource callback.
 pub(crate) fn validate_forall_inst(
     terms: &TermStore,
     step: ProofId,
@@ -437,25 +108,30 @@ pub(crate) fn validate_forall_inst(
     premise_count: usize,
     args: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let (bindings, body, instance) =
-        decode_forall_inst_shape(terms, step, clause, premise_count, args)?;
+    validate_forall_inst_with_progress(terms, step, clause, premise_count, args, &mut |_, _| true)
+}
+
+/// Validate exact simultaneous instantiation within the caller's envelope.
+pub(crate) fn validate_forall_inst_with_progress(
+    terms: &TermStore,
+    step: ProofId,
+    clause: &[TermId],
+    premise_count: usize,
+    args: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
     let mut work = 0usize;
-    let substitutions = checked_substitutions(terms, step, bindings, body, args, &mut work)?;
-    if terms.sort(instance) != &Sort::Bool {
-        return Err(invalid_forall_inst(
-            step,
-            "instantiated body must be Boolean",
-        ));
+    let mut meter = QuantifierMeter::new(step, "forall_inst", &mut work, progress);
+    meter.charge(1, 0)?;
+    let (bindings, body, instance) =
+        decode_forall_inst_shape(terms, step, clause, premise_count, args, &mut meter)?;
+    let substitutions = checked_substitutions(terms, step, bindings, body, args, &mut meter)?;
+    let instance_sort = meter.sort(terms, instance)?;
+    if !meter.sort_equal(instance_sort, &Sort::Bool)? {
+        return Err(meter.invalid("instantiated body must be Boolean")?);
     }
-    match matches_substitution(terms, body, instance, &substitutions, &mut work) {
-        Some(true) => Ok(()),
-        Some(false) => Err(invalid_forall_inst(
-            step,
-            "instance is not the exact simultaneous binder substitution",
-        )),
-        None => Err(invalid_forall_inst(
-            step,
-            format!("substitution check exceeds {SKOLEM_TERM_WORK_LIMIT} distinct term pairs"),
-        )),
+    if !matches_substitution(terms, body, instance, &substitutions, &mut meter)? {
+        return Err(meter.invalid("instance is not the exact simultaneous binder substitution")?);
     }
+    meter.charge(0, 0)
 }

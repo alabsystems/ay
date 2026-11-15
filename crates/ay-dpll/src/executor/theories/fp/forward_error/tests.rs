@@ -70,7 +70,11 @@ fn representability_f64() {
 /// assertions; returns (assertions-without-goal, to_real(rf), mirror-expr).
 fn build_guard_dag(terms: &mut TermStore) -> (Vec<TermId>, TermId, TermId) {
     let f64_sort = Sort::FloatingPoint(11, 53);
-    let rne = terms.mk_app(Symbol::named("RNE"), [], Sort::Bool);
+    let rne = terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let mk_bounded_var = |terms: &mut TermStore, name: &str, mag: BigRational| {
         let v = terms.mk_var(name, f64_sort.clone());
         let is_normal = terms.mk_app(Symbol::named("fp.isNormal"), [v], Sort::Bool);
@@ -139,6 +143,36 @@ fn guard_dag_certified_bound_is_13_64ths() {
         .expect("0.3 claim must be refuted (bound 13/64 < 3/10)");
     assert_eq!(refutation.goal, goal);
     assert_eq!(refutation.bound, rat(13, 64));
+}
+
+#[test]
+fn fp_namespace_opaque_heads_and_symbolic_rne_cannot_refute() {
+    for name in [
+        "fp.add",
+        "fp.mul",
+        "fp.to_real",
+        "fp.isNormal",
+        "and",
+        "RNE",
+    ] {
+        let mut terms = TermStore::new();
+        let (mut assertions, rf_real, mirror) = build_guard_dag(&mut terms);
+        let claim = terms.mk_rational(rat(3, 10));
+        let diff = terms.mk_app(Symbol::named("-"), [rf_real, mirror], Sort::Real);
+        let goal = terms.mk_app(Symbol::named(">="), [diff, claim], Sort::Bool);
+        assertions.push(goal);
+        assert!(try_refute_forward_error_goal(&terms, &assertions).is_some());
+        terms.register_declared_function(name);
+        assert!(
+            try_refute_forward_error_goal(&terms, &assertions).is_none(),
+            "{name}"
+        );
+    }
+    let mut terms = TermStore::new();
+    let free = terms.mk_var("RNE", Sort::Uninterpreted("RoundingMode".into()));
+    assert!(!is_rne(&terms, free));
+    let malformed = terms.mk_app(Symbol::named("RNE"), [], Sort::Bool);
+    assert!(!is_rne(&terms, malformed));
 }
 
 #[test]
@@ -235,7 +269,11 @@ fn mirror_mismatch_aborts() {
 fn non_rne_rounding_mode_aborts() {
     let mut terms = TermStore::new();
     let f64_sort = Sort::FloatingPoint(11, 53);
-    let rtz = terms.mk_app(Symbol::named("RTZ"), [], Sort::Bool);
+    let rtz = terms.mk_app(
+        Symbol::named("RTZ"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let v = terms.mk_var("x", f64_sort.clone());
     let is_normal = terms.mk_app(Symbol::named("fp.isNormal"), [v], Sort::Bool);
     let abs = terms.mk_app(Symbol::named("fp.abs"), [v], f64_sort.clone());
@@ -262,7 +300,11 @@ fn non_rne_rounding_mode_aborts() {
 fn overflow_risk_aborts() {
     let mut terms = TermStore::new();
     let f64_sort = Sort::FloatingPoint(11, 53);
-    let rne = terms.mk_app(Symbol::named("RNE"), [], Sort::Bool);
+    let rne = terms.mk_app(
+        Symbol::named("RNE"),
+        [],
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let v = terms.mk_var("x", f64_sort.clone());
     let is_normal = terms.mk_app(Symbol::named("fp.isNormal"), [v], Sort::Bool);
     let abs = terms.mk_app(Symbol::named("fp.abs"), [v], f64_sort.clone());

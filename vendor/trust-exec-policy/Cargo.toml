@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "trust-exec-policy"
+version = "0.13.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Native final-exec policy attributes; no admission or installed-policy authority"
+
+[dependencies]
+libc = "0.2"

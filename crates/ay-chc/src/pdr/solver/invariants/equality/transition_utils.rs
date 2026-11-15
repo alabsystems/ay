@@ -83,6 +83,15 @@ impl PdrSolver {
         var_map: &FxHashMap<String, ChcVar>,
     ) -> Option<ChcExpr> {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => Some(ChcExpr::ArrayLambda(
+                lambda.with_captures(
+                    lambda
+                        .captures()
+                        .iter()
+                        .map(|value| Self::to_canonical(value, var_map).map(std::sync::Arc::new))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+            )),
             ChcExpr::Bool(b) => Some(ChcExpr::Bool(*b)),
             ChcExpr::Int(n) => Some(ChcExpr::Int(*n)),
             ChcExpr::BitVec(val, width) => Some(ChcExpr::BitVec(*val, *width)),

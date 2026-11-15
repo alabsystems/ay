@@ -1,0 +1,22 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. Both rows have a left-hand side in [0,3] and a hugely
+% NEGATIVE right-hand side, so both are trivially true. `sat.pbp` here makes
+% the same checker say `s VERIFIED SATISFIABLE`, with the model x1 = x2 = 0.
+%
+% Same defect as fixture 11 in the OTHER file: not all coefficients are 1, so
+% these rows are stored as `GeneralPBConstraint<i64>` and the addition runs
+% `GeneralPBConstraint::add` (general_pb_constraint.rs) instead of
+% `Cardinality::add`. That function has the same shape: it validates that the
+% summed degree fits into `N` and then does `set_degree(degree_sum -
+% &cancellation)` in `N`. A fix applied only to cardinality.rs still fails here.
+%
+% `pol 1 2 +`: the degrees sum to exactly i64::MIN; 2 x1 and 2 ~x1 cancel by 2.
+% Correct result:  `2 x2 >= -9223372036854775810`   (trivially true)
+% Unfixed result:  `2 x2 >= 9223372036854775806`    (degree above the
+%                   coefficient sum 2, i.e. a contradiction)
+% so `conclusion UNSAT : 3` is accepted.
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

@@ -38,7 +38,7 @@ impl Solver {
         for &old_lit in old_lits {
             let vi = old_lit.variable().index();
             if vi >= self.num_vars
-                || self.var_data[vi].reason != clause_ref.0
+                || !self.var_data[vi].has_clause_reason(clause_ref)
                 || self.var_data[vi].level != 0
             {
                 continue;
@@ -87,7 +87,7 @@ impl Solver {
         for &old_lit in old_lits {
             let vi = old_lit.variable().index();
             if vi >= self.num_vars
-                || self.var_data[vi].reason != clause_ref.0
+                || !self.var_data[vi].has_clause_reason(clause_ref)
                 || self.var_data[vi].level != 0
             {
                 continue;
@@ -142,7 +142,7 @@ impl Solver {
             if self.cold.lrat_enabled {
                 self.pin_lrat_level0_unit_materialize_for_var(vi);
             }
-            self.var_data[vi].reason = NO_REASON;
+            self.var_data[vi].clear_reason();
         }
     }
 
@@ -156,6 +156,7 @@ impl Solver {
     ///
     /// * `clause_idx` - Index into the clause database.
     /// * `new_lits` - New literal set (must be shorter or equal to original).
+    #[track_caller]
     pub(super) fn replace_clause_checked(
         &mut self,
         clause_idx: usize,
@@ -174,6 +175,7 @@ impl Solver {
     /// is skipped. Used by subsumption where the derivation is purely
     /// structural (subsumer + original clause) and level-0 reasons are
     /// irrelevant (#4398).
+    #[track_caller]
     pub(super) fn replace_clause_checked_with_lrat_hints(
         &mut self,
         clause_idx: usize,
@@ -190,6 +192,7 @@ impl Solver {
     }
 
     /// Replace a clause with explicit LRAT hints only (no auto level-0 reasons).
+    #[track_caller]
     pub(super) fn replace_clause_with_explicit_lrat_hints(
         &mut self,
         clause_idx: usize,
@@ -211,6 +214,7 @@ impl Solver {
     /// and reverses), this takes hints already in final LRAT checker processing
     /// order. Used by BVE OTFS strengthening where the hint chain order depends
     /// on whether root-level-false literals were pruned (#5026).
+    #[track_caller]
     pub(super) fn replace_clause_with_final_hints(
         &mut self,
         clause_idx: usize,
@@ -225,6 +229,7 @@ impl Solver {
     /// Takes `final_hints` already in LRAT checker processing order (no reversal,
     /// no old_clause_id insertion). Performs all validation, arena mutation, watch
     /// updates, and proof emission. Used by `replace_clause_with_final_hints`.
+    #[track_caller]
     fn replace_clause_core(
         &mut self,
         clause_idx: usize,
@@ -302,6 +307,9 @@ impl Solver {
         }
 
         let mut replacement_clause_id = None;
+        // `--sat-veripb-hints`: the replaced clause is an antecedent of its
+        // replacement (with root units, all a level-0 strengthening needs).
+        self.veripb_note_antecedent(&old_lits);
         if let Ok(new_id) = self.proof_emit_add(&reordered, final_hints, proof_kind) {
             if self.cold.lrat_enabled && new_id != 0 {
                 replacement_clause_id = Some(new_id);
@@ -339,6 +347,7 @@ impl Solver {
                     false,
                     final_hints.to_vec(),
                 );
+                trace.record_deletion(old_clause_id, &old_lits);
             }
         }
 

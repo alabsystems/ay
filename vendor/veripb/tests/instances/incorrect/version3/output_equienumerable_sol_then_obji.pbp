@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+sol x1 ~x2 ;
+obji 1 ;
+output EQUIENUMERABLE FILE ;
+conclusion NONE ;
+end pseudo-Boolean proof;

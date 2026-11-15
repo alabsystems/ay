@@ -425,7 +425,7 @@ fn test_simplify_constants_large_nonnegative_mod_expression() {
 fn option_bool_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Option_bool".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None_Option_bool".to_string(),
                 selectors: vec![],
@@ -651,6 +651,51 @@ fn simplify_constants_ite_with_large_product_divisor_condition_9604() {
     let expr = ChcExpr::ite(condition, ChcExpr::Bool(true), ChcExpr::Bool(false));
 
     assert_eq!(expr.simplify_constants(), ChcExpr::Bool(false));
+}
+
+/// A zero divisor nested inside a `div`/`mod` must make the u128 widening
+/// lane ABSTAIN, never panic.
+///
+/// `bool::then_some` takes its argument BY VALUE, so `(rhs != 0).then_some(lhs
+/// % rhs)` evaluated `lhs % rhs` *before* consulting the guard: a constant
+/// subterm such as `(mod 5 0)` divided by zero inside
+/// `eval_nonnegative_const_u128`. The AY solver runs in-process as compiler_consumer's
+/// verification backend, so that panic surfaced as a compiler ICE on every
+/// verified build. `checked_rem`/`checked_div` push the guard *inside* the
+/// operation, which is both panic-free and what the neighbouring `Add`/`Mul`/
+/// `Sub` arms already do; a lazy `then(|| lhs % rhs)` is panic-free too, but
+/// leaves the guard outside the closure where Trust's own `remzero`/`divzero`
+/// obligations cannot see it and refute the site.
+#[test]
+fn simplify_constants_nested_zero_divisor_abstains_without_panicking() {
+    for inner_op in [ChcOp::Mod, ChcOp::Div] {
+        // A constant subterm with a zero divisor: `(op 5 0)`. It cannot fold
+        // (Euclidean div/mod by zero is undefined), so it stays symbolic.
+        let inner = ChcExpr::Op(
+            inner_op,
+            vec![Arc::new(ChcExpr::int(5)), Arc::new(ChcExpr::int(0))],
+        );
+        assert_eq!(
+            inner.simplify_constants(),
+            inner,
+            "{inner_op:?} by zero must stay symbolic"
+        );
+
+        for outer_op in [ChcOp::Mod, ChcOp::Div] {
+            // `(outer (op 5 0) 3)`: the outer arm drives the u128 widening
+            // fallback over the non-`Int` operand, which is where the
+            // eager `then_some` argument divided by zero.
+            let expr = ChcExpr::Op(
+                outer_op,
+                vec![Arc::new(inner.clone()), Arc::new(ChcExpr::int(3))],
+            );
+            assert_eq!(
+                expr.simplify_constants(),
+                expr,
+                "{outer_op:?} over a nested zero divisor must stay symbolic"
+            );
+        }
+    }
 }
 
 #[test]

@@ -18,6 +18,12 @@ fn scoped_z3_audit_runs_without_private_docs() {
     fs::create_dir_all(&cache_dir).expect("reference cache directory");
     fs::create_dir_all(&benchmark_dir).expect("CHC benchmark directory");
     fs::create_dir_all(&ay_crate_dir).expect("ay crate directory");
+    fs::create_dir_all(snapshot.path().join("ci")).expect("reference pin directory");
+    fs::copy(
+        source_root.join("ci/z3.pin"),
+        snapshot.path().join("ci/z3.pin"),
+    )
+    .expect("copy actual reference pin");
     fs::write(snapshot.path().join("Cargo.toml"), "[workspace]\n").expect("workspace manifest");
     fs::write(
         ay_crate_dir.join("Cargo.toml"),
@@ -40,31 +46,11 @@ fn scoped_z3_audit_runs_without_private_docs() {
         "fixture must model the docs-free public snapshot"
     );
 
-    let help = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args(["z3-audit", "--help"])
-        .output()
-        .expect("read z3-audit help");
-    let help_stdout = String::from_utf8_lossy(&help.stdout);
-    assert!(
-        help.status.success(),
-        "help stderr: {}",
-        String::from_utf8_lossy(&help.stderr)
-    );
-    assert!(
-        help_stdout.contains("AY workspace root containing Cargo.toml and crates/ay/Cargo.toml"),
-        "help:\n{help_stdout}"
-    );
-    assert!(
-        help_stdout.contains("explicitly inventoried"),
-        "help:\n{help_stdout}"
-    );
-    assert!(
-        !help_stdout.contains("Repository root containing docs/"),
-        "help must not require private docs:\n{help_stdout}"
-    );
-
+    let summary = snapshot.path().join("audit.json");
     let output = Command::new(env!("CARGO_BIN_EXE_ay"))
         .args(["z3-audit", "--scope", "cli-subset", "--inventory-only"])
+        .arg("--summary-json")
+        .arg(&summary)
         .current_dir(snapshot.path())
         .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
         .output()
@@ -73,17 +59,32 @@ fn scoped_z3_audit_runs_without_private_docs() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        output.status.success(),
-        "z3-audit failed without docs\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        output.status.code() == Some(1),
+        "inventory-only must remain incomplete\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(stdout.contains("scope=cli-subset"), "stdout:\n{stdout}");
-    assert!(stdout.contains("verdict=pass"), "stdout:\n{stdout}");
-    assert!(
-        stdout.contains("compatibility_inventory"),
-        "stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("private compatibility prose is not shipped"),
-        "stdout:\n{stdout}"
-    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(summary).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "incomplete");
+    assert_eq!(report["reference_cache_loaded"], true);
+    assert_eq!(report["full_replacement_ready"], false);
+    for id in [
+        "reference_cache",
+        "z3_version",
+        "basic_smt_transcript",
+        "compatibility_inventory",
+    ] {
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == id)
+            .expect("required semantic check");
+        assert_eq!(check["status"], "pass", "{check}");
+    }
+    let alethe = report["proof_inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "smt_alethe_external_replay")
+        .unwrap();
+    assert_eq!(alethe["status"], "not_run");
 }

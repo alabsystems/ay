@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::formula::MAX_QBF_VARS;
 
 impl QbfSolver {
     pub(super) fn bump_clause_activity(&mut self, clause: &[Literal]) {
@@ -12,9 +13,17 @@ impl QbfSolver {
     }
 
     fn bump_var_activity(&mut self, var: u32) {
-        let idx = var as usize - 1;
-        self.activity[idx] += self.var_inc;
-        if self.activity[idx] > 1e100 {
+        // Variable ids are 1-based; an id with no activity slot (0, or past a
+        // formula whose dense state was never allocated) has nothing to bump.
+        let Some(idx) = (var as usize).checked_sub(1) else {
+            return;
+        };
+        let var_inc = self.var_inc;
+        let Some(activity) = self.activity.get_mut(idx) else {
+            return;
+        };
+        *activity += var_inc;
+        if *activity > 1e100 {
             self.rescale_var_activity();
         }
     }
@@ -52,7 +61,13 @@ impl QbfSolver {
                 continue;
             }
 
-            let act = self.activity[var as usize - 1];
+            // A variable with no activity slot scores 0.0, the initial
+            // activity and what `QbfSolverContext::activity` reports for it.
+            let act = (var as usize)
+                .checked_sub(1)
+                .and_then(|idx| self.activity.get(idx))
+                .copied()
+                .unwrap_or(0.0);
             if best_var.is_none()
                 || act > best_activity
                 || (act == best_activity && best_var.is_some_and(|bv| var < bv))
@@ -69,8 +84,9 @@ impl QbfSolver {
     pub(super) fn decide(&mut self) -> Option<Literal> {
         let var = self.pick_branch_var()?;
 
-        // New decision level
-        self.decision_level += 1;
+        // New decision level. A level past u32::MAX cannot be represented, so
+        // no decision is made (the search loop then reports Unknown).
+        self.decision_level = self.decision_level.checked_add(1)?;
         self.trail_lim.push(self.trail.len());
 
         // Decide: try true first for existential, false for universal
@@ -115,29 +131,32 @@ impl QbfSolver {
     ///
     /// This learns more specific clauses than simple decision-negation,
     /// leading to better pruning and faster solving.
-    pub(super) fn analyze_conflict(&mut self, conflict_clause_idx: usize) -> (Vec<Literal>, u32) {
+    ///
+    /// Returns `None` when the solver state breaks an analysis invariant (a
+    /// clause index or variable with no slot, or a trail exhausted before the
+    /// 1-UIP); the search loop then fails closed with `Unknown`.
+    pub(super) fn analyze_conflict(
+        &mut self,
+        conflict_clause_idx: usize,
+    ) -> Option<(Vec<Literal>, u32)> {
         // Get the conflict clause and mark it as used
-        let conflict_clause = if conflict_clause_idx < self.formula.clauses().len() {
-            self.formula.clauses()[conflict_clause_idx].clone()
-        } else {
-            let learned_idx = conflict_clause_idx - self.formula.clauses().len();
-            self.mark_clause_used(learned_idx);
-            self.learned[learned_idx].clone()
-        };
+        let conflict_clause = self.clause_for_analysis(conflict_clause_idx)?;
 
-        let mut seen = vec![false; self.formula.num_vars()];
+        let mut seen = self.conflict_seen_table()?;
         let mut learned: Vec<Literal> = Vec::new();
-        let mut counter = 0;
+        let mut counter: usize = 0;
 
         // Start with the conflict clause
         for &lit in &conflict_clause {
             let var = lit.variable().id();
-            let level = self.levels[var as usize - 1];
+            let slot = (var as usize).checked_sub(1)?;
+            let level = *self.levels.get(slot)?;
+            let seen_var = seen.get_mut(slot)?;
 
-            if !seen[var as usize - 1] {
-                seen[var as usize - 1] = true;
+            if !*seen_var {
+                *seen_var = true;
                 if level == self.decision_level {
-                    counter += 1;
+                    counter = counter.checked_add(1)?;
                 } else if level > 0 {
                     // Literal from earlier level goes directly to learned clause
                     learned.push(lit.negated());
@@ -151,16 +170,18 @@ impl QbfSolver {
 
         while counter > 0 {
             // Find the next literal on the trail that we've seen
-            trail_idx -= 1;
-            let lit = self.trail[trail_idx];
+            trail_idx = trail_idx.checked_sub(1)?;
+            let lit = *self.trail.get(trail_idx)?;
             let var = lit.variable().id();
+            let slot = (var as usize).checked_sub(1)?;
+            let seen_var = seen.get_mut(slot)?;
 
-            if !seen[var as usize - 1] {
+            if !*seen_var {
                 continue;
             }
 
             // This variable was involved in the conflict
-            seen[var as usize - 1] = false;
+            *seen_var = false;
             counter -= 1;
 
             if counter == 0 {
@@ -170,25 +191,21 @@ impl QbfSolver {
             }
 
             // Get the reason clause and resolve
-            let reason = self.reasons[var as usize - 1];
+            let reason = *self.reasons.get(slot)?;
             if let Reason::Propagated(reason_idx) = reason {
-                let reason_clause = if reason_idx < self.formula.clauses().len() {
-                    self.formula.clauses()[reason_idx].clone()
-                } else {
-                    let learned_idx = reason_idx - self.formula.clauses().len();
-                    self.mark_clause_used(learned_idx);
-                    self.learned[learned_idx].clone()
-                };
+                let reason_clause = self.clause_for_analysis(reason_idx)?;
                 for &reason_lit in &reason_clause {
                     let reason_var = reason_lit.variable().id();
                     if reason_var == var {
                         continue;
                     }
-                    let level = self.levels[reason_var as usize - 1];
-                    if !seen[reason_var as usize - 1] {
-                        seen[reason_var as usize - 1] = true;
+                    let reason_slot = (reason_var as usize).checked_sub(1)?;
+                    let level = *self.levels.get(reason_slot)?;
+                    let seen_reason = seen.get_mut(reason_slot)?;
+                    if !*seen_reason {
+                        *seen_reason = true;
                         if level == self.decision_level {
-                            counter += 1;
+                            counter = counter.checked_add(1)?;
                         } else if level > 0 {
                             learned.push(reason_lit.negated());
                         }
@@ -196,7 +213,7 @@ impl QbfSolver {
                 }
             } else if matches!(reason, Reason::CubePropagated(_)) {
                 // Cube-propagated: treat like decision, include without resolving
-                let level = self.levels[var as usize - 1];
+                let level = *self.levels.get(slot)?;
                 if level > 0 {
                     learned.push(lit.negated());
                 }
@@ -213,23 +230,55 @@ impl QbfSolver {
         let reduced = self.formula.universal_reduce(&learned);
 
         // Compute backtrack level (second highest level in learned clause)
-        let backtrack_level = self.compute_backtrack_level(&reduced);
+        let backtrack_level = self.compute_backtrack_level(&reduced)?;
 
-        (reduced, backtrack_level)
+        Some((reduced, backtrack_level))
+    }
+
+    /// One unset "seen" flag per variable for conflict analysis. Only
+    /// `input_valid` formulas (at most `MAX_QBF_VARS` variables) reach QCDCL;
+    /// `None` for a larger one, which breaks that invariant, rather than
+    /// sizing the table by it.
+    fn conflict_seen_table(&self) -> Option<Vec<bool>> {
+        let num_vars = self.formula.num_vars();
+        if num_vars > MAX_QBF_VARS {
+            return None;
+        }
+        Some(vec![false; num_vars])
+    }
+
+    /// Clone the clause a conflict or reason index names: an original clause
+    /// below `clauses().len()`, otherwise the learned clause at the offset
+    /// past it, which is also marked used. `None` if no clause has the index.
+    fn clause_for_analysis(&mut self, clause_idx: usize) -> Option<Vec<Literal>> {
+        let originals = self.formula.clauses();
+        if let Some(clause) = originals.get(clause_idx) {
+            return Some(clause.clone());
+        }
+        let learned_idx = clause_idx.checked_sub(originals.len())?;
+        self.mark_clause_used(learned_idx);
+        self.learned.get(learned_idx).cloned()
+    }
+
+    /// Decision level of 1-based variable `var`, or `None` if it has no slot.
+    fn level_of_var(&self, var: u32) -> Option<u32> {
+        let slot = (var as usize).checked_sub(1)?;
+        self.levels.get(slot).copied()
     }
 
     /// Compute the backtrack level for a learned clause
-    /// Returns the second-highest decision level (or 0 for unit clauses)
-    fn compute_backtrack_level(&self, clause: &[Literal]) -> u32 {
+    /// Returns the second-highest decision level (or 0 for unit clauses),
+    /// or `None` if a literal's variable has no level slot.
+    fn compute_backtrack_level(&self, clause: &[Literal]) -> Option<u32> {
         if clause.is_empty() || clause.len() == 1 {
-            return 0;
+            return Some(0);
         }
 
         let mut max_level = 0;
         let mut second_level = 0;
 
         for lit in clause {
-            let level = self.levels[lit.variable().id() as usize - 1];
+            let level = self.level_of_var(lit.variable().id())?;
             if level > max_level {
                 second_level = max_level;
                 max_level = level;
@@ -238,7 +287,7 @@ impl QbfSolver {
             }
         }
 
-        second_level
+        Some(second_level)
     }
 
     /// Learn a cube from a partial solution state
@@ -286,8 +335,9 @@ impl QbfSolver {
         }
 
         // Compute backtrack level for the cube
-        // We backtrack to the second-highest level and flip the universal decision
-        let backtrack_level = self.compute_cube_backtrack_level(&reduced_cube);
+        // We backtrack to the second-highest level and flip the universal decision.
+        // A cube variable with no level slot leaves no cube to learn.
+        let backtrack_level = self.compute_cube_backtrack_level(&reduced_cube)?;
 
         // Add the cube (stored as negated literals for propagation)
         // A cube C = (l1 ∧ l2 ∧ ... ∧ ln) is blocked when any li is false
@@ -339,27 +389,30 @@ impl QbfSolver {
     }
 
     /// Compute backtrack level for a cube
-    /// Similar to clause backtrack, but we want to flip a universal decision
-    fn compute_cube_backtrack_level(&self, cube: &[Literal]) -> u32 {
+    /// Similar to clause backtrack, but we want to flip a universal decision.
+    /// `None` if a universal cube variable has no level slot.
+    fn compute_cube_backtrack_level(&self, cube: &[Literal]) -> Option<u32> {
         if cube.is_empty() || cube.len() == 1 {
-            return 0;
+            return Some(0);
         }
 
         // Find the second-highest decision level among universal variables in cube
         let mut levels: Vec<u32> = cube
             .iter()
             .filter(|lit| self.formula.lit_is_universal(**lit))
-            .map(|lit| self.levels[lit.variable().id() as usize - 1])
-            .collect();
+            .map(|lit| self.level_of_var(lit.variable().id()))
+            .collect::<Option<_>>()?;
 
         levels.sort_unstable();
         levels.dedup();
 
-        if levels.len() < 2 {
-            return levels.first().copied().unwrap_or(0).saturating_sub(1);
-        }
-
-        // Return second-highest level
-        levels[levels.len() - 2]
+        // Return the second-highest level; with fewer than two distinct
+        // levels, one below the only level (or 0 when there is none).
+        let mut descending = levels.iter().rev();
+        let highest = descending.next().copied();
+        Some(match descending.next() {
+            Some(&second) => second,
+            None => highest.unwrap_or(0).saturating_sub(1),
+        })
     }
 }

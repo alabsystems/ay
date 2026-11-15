@@ -11,11 +11,34 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
+}
+
+/// Every `ay bench chc-gate` run takes the host-wide benchmark resource lease,
+/// so a second one in flight fails on the lease, not on what its test checks.
+/// A poisoned lock is recovered so one failure does not cascade.
+static CHC_GATE_SERIAL: Mutex<()> = Mutex::new(());
+
+fn chc_gate_guard() -> MutexGuard<'static, ()> {
+    CHC_GATE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A rejection is this test's evidence only if it names this test's reason: a
+/// missing resource planner or a held lease exits non-zero too.
+fn assert_rejected_for(output: &Output, reason: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(reason),
+        "chc-gate should fail with `{reason}`:\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 fn write_case(dir: &Path, name: &str) -> PathBuf {
@@ -69,6 +92,7 @@ esac
 #[test]
 #[timeout(30_000)]
 fn chc_gate_accepts_valid_safe_and_unsafe_stub_rows() {
+    let _serial = chc_gate_guard();
     let dir = TempDir::new().expect("tempdir");
     let safe = write_case(dir.path(), "safe.smt2");
     let unsafe_case = write_case(dir.path(), "unsafe.smt2");
@@ -125,6 +149,16 @@ fn chc_gate_accepts_valid_safe_and_unsafe_stub_rows() {
     assert_eq!(summary["summary"]["solved"], 2, "{summary:#}");
     assert_eq!(summary["summary"]["wrong"], 0, "{summary:#}");
     assert_eq!(summary["summary"]["invalid"], 0, "{summary:#}");
+    // Run from a temp dir, git names no source commit: not promotable.
+    assert_eq!(summary["summary"]["promotable"], false, "{summary:#}");
+    assert!(
+        summary["non_promotable_reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|r| r
+                .as_str()
+                .is_some_and(|r| r.starts_with("source commit unknown")))),
+        "{summary:#}"
+    );
     assert!(out_dir.join("cases.jsonl").is_file());
     assert!(out_dir.join("category-summary.csv").is_file());
     assert!(out_dir.join("route-counters.json").is_file());
@@ -134,6 +168,7 @@ fn chc_gate_accepts_valid_safe_and_unsafe_stub_rows() {
 #[test]
 #[timeout(30_000)]
 fn chc_gate_fail_on_wrong_rejects_definitive_disagreement() {
+    let _serial = chc_gate_guard();
     let dir = TempDir::new().expect("tempdir");
     let safe = write_case(dir.path(), "safe.smt2");
     let manifest = write_manifest(
@@ -159,17 +194,13 @@ fn chc_gate_fail_on_wrong_rejects_definitive_disagreement() {
         .output()
         .expect("spawn ay bench chc-gate wrong");
 
-    assert!(
-        !output.status.success(),
-        "wrong row should fail:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_rejected_for(&output, "wrong rows present: 1");
 }
 
 #[test]
 #[timeout(30_000)]
 fn chc_gate_fail_on_invalid_rejects_missing_validation_success() {
+    let _serial = chc_gate_guard();
     let dir = TempDir::new().expect("tempdir");
     let safe = write_case(dir.path(), "safe.smt2");
     let manifest = write_manifest(
@@ -202,17 +233,13 @@ echo '{"mode":"portfolio","result":"sat","wall_time_ms":1,"chc.validation.safe_a
         .output()
         .expect("spawn ay bench chc-gate invalid");
 
-    assert!(
-        !output.status.success(),
-        "invalid row should fail:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_rejected_for(&output, "invalid rows present: 1");
 }
 
 #[test]
 #[timeout(30_000)]
 fn chc_gate_requires_route_counter_exercise() {
+    let _serial = chc_gate_guard();
     let dir = TempDir::new().expect("tempdir");
     let safe = write_case(dir.path(), "safe.smt2");
     let manifest = write_manifest(
@@ -243,17 +270,13 @@ fn chc_gate_requires_route_counter_exercise() {
         .output()
         .expect("spawn ay bench chc-gate missing route");
 
-    assert!(
-        !output.status.success(),
-        "missing route counter should fail:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_rejected_for(&output, "chc.never_exercised was not exercised by any row");
 }
 
 #[test]
 #[timeout(30_000)]
 fn chc_gate_rejects_dirty_provenance_without_allow_dirty() {
+    let _serial = chc_gate_guard();
     let dir = TempDir::new().expect("tempdir");
     let safe = write_case(dir.path(), "safe.smt2");
     let manifest = write_manifest(
@@ -280,10 +303,5 @@ fn chc_gate_rejects_dirty_provenance_without_allow_dirty() {
         .output()
         .expect("spawn ay bench chc-gate dirty");
 
-    assert!(
-        !output.status.success(),
-        "dirty evidence should fail without --allow-dirty:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_rejected_for(&output, "source tree is dirty");
 }

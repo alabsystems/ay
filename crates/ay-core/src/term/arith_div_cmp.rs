@@ -12,8 +12,33 @@ use num_traits::One;
 
 impl TermStore {
     /// Create real division with constant folding
+    ///
+    /// # Invariant
+    ///
+    /// Both operands are `Real`. This is not a style rule: `/` is the SMT-LIB
+    /// *Reals* operator, the term minted at the bottom of this function is
+    /// interned at `Sort::Real` UNCONDITIONALLY, and the folding above reads
+    /// its operands through `get_rational`. Passing `Int` operands therefore
+    /// mints a term whose declared sort contradicts its own operands, and
+    /// every later consumer — sort-directed dispatch, substitution, model
+    /// evaluation — reads the declared sort. The Int operator is
+    /// [`Self::mk_intdiv`] (SMT-LIB `div`), which interns at `Sort::Int`.
+    ///
+    /// `debug_assert!` and not `assert!`: the elaborator already rejects
+    /// non-Real operands at the `(/ ...)` boundary
+    /// (`elaborate::app::arithmetic`), so a violation is an internal
+    /// constructor mistake, which is exactly what a debug assertion is for.
+    /// One is on record — `atom_boundary_binder_bases` built its integer
+    /// divisibility boundary with this function instead of `mk_intdiv`, and
+    /// this assertion is what caught it.
     pub fn mk_div(&mut self, lhs: TermId, rhs: TermId) -> TermId {
-        debug_assert!(self.sort(lhs) == &Sort::Real && self.sort(rhs) == &Sort::Real);
+        debug_assert!(
+            self.sort(lhs) == &Sort::Real && self.sort(rhs) == &Sort::Real,
+            "BUG: mk_div is SMT-LIB Real `/` and interns at Sort::Real; \
+             got lhs={} rhs={} (use mk_intdiv for SMT-LIB `div`)",
+            self.sort(lhs),
+            self.sort(rhs)
+        );
         // Constant folding for rationals
         if let (Some(r1), Some(r2)) = (self.get_rational(lhs), self.get_rational(rhs)) {
             if !r2.is_zero() {

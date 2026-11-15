@@ -157,3 +157,138 @@ impl PathInterpolantResult {
         self.strength
     }
 }
+
+/// How strictly proof-based interpolant extraction treats the proof.
+///
+/// Workstream D, Rung 1 (CHC-COMP 2026; the development design notes
+/// DESIGN_lra_interp_tpa.md` §4.1). Owner: WP-D1-P (proof substrate).
+///
+/// - `Legacy` is the historical traversal, byte-identical to
+///   [`crate::api::Solver::get_interpolant_with_strength`]: a missing premise
+///   defaults to `true`, theory-lemma fallbacks are on, and locality is a
+///   `debug_assert`.
+/// - `Explicit` fails closed: a Trust step, a missing premise, an
+///   unclassified literal or pivot, an uncertified or undecodable theory leaf,
+///   or a non-local variable is an [`InterpolantFailure`], never a degraded
+///   `true`/`false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum InterpolantMode {
+    /// Historical traversal (default); unchanged behaviour.
+    #[default]
+    Legacy,
+    /// Fail-closed traversal (INV-4 of the Workstream D design).
+    Explicit,
+}
+
+/// Why fail-closed (`InterpolantMode::Explicit`) extraction refused a proof.
+///
+/// `step` is the index of the offending proof step in the proof's step list.
+/// Owner: WP-D1-P. `NoProof` and `InvalidGroups` cover the method's own
+/// preconditions (no UNSAT proof available; an empty/oversized group list or
+/// a mask outside it) so that the entry point never needs `Option`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InterpolantFailure {
+    /// A `Trust`-rule step (an unjustified hole) was reached.
+    TrustStep {
+        /// Proof step index.
+        step: usize,
+    },
+    /// A theory leaf whose Farkas certificate was rejected on re-verification.
+    UncertifiedLeaf {
+        /// Proof step index.
+        step: usize,
+    },
+    /// A theory leaf whose rows could not be decoded into linear constraints.
+    UndecodableLeaf {
+        /// Proof step index.
+        step: usize,
+    },
+    /// A literal or pivot that no A/B occurrence classifies.
+    UnclassifiedLiteral {
+        /// Proof step index.
+        step: usize,
+    },
+    /// A resolution step whose premise is absent.
+    MissingPremise {
+        /// Proof step index.
+        step: usize,
+    },
+    /// A reachable step the fail-closed extractor has no interpolation rule
+    /// for (a subproof anchor, a DRUP step, a resolution chain whose pivots
+    /// cannot be recovered, or an inference rule outside the supported
+    /// Boolean/arithmetic set).
+    UnsupportedStep {
+        /// Proof step index.
+        step: usize,
+    },
+    /// The produced interpolant mentions a variable outside the shared set.
+    NonLocal {
+        /// Name of the offending variable.
+        var: String,
+    },
+    /// The last check did not produce an UNSAT proof (proofs off, not UNSAT,
+    /// or an empty proof).
+    NoProof,
+    /// The group/mask arguments are malformed (no groups, more than 128
+    /// groups, a mask selecting a group that does not exist, or a mask that
+    /// selects all or none of the groups).
+    InvalidGroups,
+}
+
+impl InterpolantFailure {
+    /// Stable snake-case name of the failure kind (for counters and logs).
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::TrustStep { .. } => "trust_step",
+            Self::UncertifiedLeaf { .. } => "uncertified_leaf",
+            Self::UndecodableLeaf { .. } => "undecodable_leaf",
+            Self::UnclassifiedLiteral { .. } => "unclassified_literal",
+            Self::MissingPremise { .. } => "missing_premise",
+            Self::UnsupportedStep { .. } => "unsupported_step",
+            Self::NonLocal { .. } => "non_local",
+            Self::NoProof => "no_proof",
+            Self::InvalidGroups => "invalid_groups",
+        }
+    }
+
+    /// Proof step index the failure is attributed to, when it has one.
+    #[must_use]
+    pub fn step(&self) -> Option<usize> {
+        match self {
+            Self::TrustStep { step }
+            | Self::UncertifiedLeaf { step }
+            | Self::UndecodableLeaf { step }
+            | Self::UnclassifiedLiteral { step }
+            | Self::MissingPremise { step }
+            | Self::UnsupportedStep { step } => Some(*step),
+            Self::NonLocal { .. } | Self::NoProof | Self::InvalidGroups => None,
+        }
+    }
+}
+
+impl std::fmt::Display for InterpolantFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrustStep { step } => write!(f, "trust step at proof step {step}"),
+            Self::UncertifiedLeaf { step } => {
+                write!(f, "uncertified theory leaf at proof step {step}")
+            }
+            Self::UndecodableLeaf { step } => {
+                write!(f, "undecodable theory leaf at proof step {step}")
+            }
+            Self::UnclassifiedLiteral { step } => {
+                write!(f, "unclassified literal at proof step {step}")
+            }
+            Self::MissingPremise { step } => write!(f, "missing premise at proof step {step}"),
+            Self::UnsupportedStep { step } => write!(f, "unsupported proof step {step}"),
+            Self::NonLocal { var } => write!(f, "non-local variable {var}"),
+            Self::NoProof => write!(f, "no UNSAT proof available"),
+            Self::InvalidGroups => write!(f, "invalid interpolation groups or masks"),
+        }
+    }
+}
+
+impl std::error::Error for InterpolantFailure {}

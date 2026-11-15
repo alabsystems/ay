@@ -10,6 +10,40 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[test]
+fn nested_sat_pools_finish_without_waiting_for_unavailable_extra_units() {
+    let caller = ay_sys::compute_budget::ComputeScope::enter().expect("caller unit");
+    let mut held = Vec::new();
+    while let Some(permit) = caller.try_extra().expect("extra probe") {
+        held.push(permit);
+    }
+    // The caller's inline search task has the same fault isolation as a
+    // spawned worker. A failed task must not unwind the shared caller unit.
+    run_isolated_inline(|| panic!("injected inline portfolio worker failure"));
+    let formula = parse_str("p cnf 3 3\n1 2 0\n-1 3 0\n2 -3 0\n").expect("DIMACS");
+    let portfolio = PortfolioSolver::new(8);
+    let result = portfolio.solve(&formula);
+    assert!(matches!(result, SatResult::Sat(_)), "{result:?}");
+    let cubes = crate::cube_and_conquer::CubeAndConquerSolver::new(8, 2);
+    let result = cubes.solve(&formula);
+    assert!(matches!(result, SatResult::Sat(_)), "{result:?}");
+    drop(held);
+}
+
+#[test]
+fn original_cancellation_refuses_before_contended_portfolio_work() {
+    let caller = ay_sys::compute_budget::ComputeScope::enter().expect("caller unit");
+    let mut held = Vec::new();
+    while let Some(permit) = caller.try_extra().expect("extra probe") {
+        held.push(permit);
+    }
+    let formula = parse_str("p cnf 1 1\n1 0\n").expect("DIMACS");
+    let mut portfolio = PortfolioSolver::new(8);
+    portfolio.set_external_cancel(Arc::new(AtomicBool::new(true)));
+    assert!(matches!(portfolio.solve(&formula), SatResult::Unknown));
+    drop(held);
+}
+
+#[test]
 fn test_portfolio_sat_simple() {
     let cnf = "p cnf 3 2\n1 2 0\n-1 3 0\n";
     let formula = parse_str(cnf).expect("valid DIMACS");

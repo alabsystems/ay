@@ -17,6 +17,8 @@ pub fn validate_reachable_assumes_in_problem_scope(
         let derives_empty = match step {
             ProofStep::Step { clause, .. }
             | ProofStep::Resolution { clause, .. }
+            | ProofStep::FiniteFieldLinear { clause, .. }
+            | ProofStep::NraSos { clause, .. }
             | ProofStep::TheoryLemma { clause, .. } => clause.is_empty(),
             ProofStep::Assume(_) | ProofStep::Anchor { .. } => false,
             _ => false,

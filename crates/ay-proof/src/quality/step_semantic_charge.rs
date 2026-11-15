@@ -37,10 +37,24 @@ pub(super) fn is_euf_identity_route(step: &ProofStep) -> bool {
 /// the right SHAPE. Add a rule only when its strict validator provably touches
 /// no subterm — check the validator, not the rule's name.
 pub(super) fn is_clause_identity_route(step: &ProofStep) -> bool {
+    // `array_ext_diff_intro` belongs here too: it is a DEFINITION whose
+    // per-step validator (`array_axiom::validate_ext_diff_intro`) is arity
+    // guards, one `terms.get` on the witness, four sort reads, two `TermId`
+    // comparisons and a name clone — O(1) over its three arguments. Its
+    // whole-proof conditions (fresh, bound once, acyclic) live in
+    // `ExtDiffRegistry::collect`, charged separately by
+    // `ext_diff_registry_charge`. Under `General` one such step precharged
+    // `33068^2 = 1_093_492_624` — 3.1x the whole envelope — on
+    // `QF_AX/swap/swap_t2_np_nf_ai_00008_008` (measured with
+    // `--probe-strict-check`), refusing a walk on a definition that reads
+    // three arguments.
     matches!(
         step,
         ProofStep::Step {
-            rule: AletheRule::Reordering | AletheRule::Weakening | AletheRule::EqReflexive,
+            rule: AletheRule::Reordering
+                | AletheRule::Weakening
+                | AletheRule::EqReflexive
+                | AletheRule::ArrayExtDiffIntro,
             ..
         }
     )
@@ -51,6 +65,15 @@ pub(super) fn strict_semantic_charge(
     semantic_payload: PayloadStats,
     semantic_class: SemanticChargeClass,
 ) -> Result<(usize, usize), ProofCheckError> {
+    if matches!(
+        step,
+        ProofStep::NraSos { .. } | ProofStep::FiniteFieldLinear { .. }
+    ) {
+        // Native SOS replay debits its actual polynomial and rational work
+        // through this validation's callback. Authentication already charged
+        // every payload vector, integer limb, and embedded term root.
+        return Ok((0, 0));
+    }
     // `ArrayRowChain` AND `ArrayStorePermutation` meter their ACTUAL validation
     // work through the strict-check progress callback inside their validators
     // ([`crate::checker::validate_array_row_chain`] /

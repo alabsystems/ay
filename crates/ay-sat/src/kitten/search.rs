@@ -86,9 +86,13 @@ impl Kitten {
             i += 1;
             ticks += 1;
 
-            let lit0 = self.clause_lit(ref_, 0);
-            let lit1 = self.clause_lit(ref_, 1);
-            let other = lit0 ^ lit1 ^ not_lit;
+            // The clause's literals as one slice (one bounds check per visit,
+            // not one per literal read); `values` and `watches` are other
+            // fields, so they stay usable while it is borrowed.
+            let base = ref_ as usize;
+            let size = self.clause_data[base + 1] as usize;
+            let lits = &mut self.clause_data[base + 3..base + 3 + size];
+            let other = lits[0] ^ lits[1] ^ not_lit;
             let other_value = self.values[other as usize];
 
             if other_value > 0 {
@@ -97,26 +101,20 @@ impl Kitten {
                 continue;
             }
 
-            let size = self.clause_size(ref_) as usize;
             let mut replacement = INVALID;
-            let mut replacement_value: i8 = -1;
             let mut replacement_pos = 0;
-            for k in 2..size {
-                let r = self.clause_lit(ref_, k);
-                let rv = self.values[r as usize];
-                if rv >= 0 {
+            for (k, &r) in lits.iter().enumerate().skip(2) {
+                if self.values[r as usize] >= 0 {
                     replacement = r;
-                    replacement_value = rv;
                     replacement_pos = k;
                     break;
                 }
             }
 
-            if replacement_value >= 0 {
-                debug_assert!(replacement != INVALID);
-                self.set_clause_lit(ref_, 0, other);
-                self.set_clause_lit(ref_, 1, replacement);
-                self.set_clause_lit(ref_, replacement_pos, not_lit);
+            if replacement != INVALID {
+                lits[0] = other;
+                lits[1] = replacement;
+                lits[replacement_pos] = not_lit;
                 self.watches[replacement as usize].push(ref_);
             } else if other_value < 0 {
                 self.conflicts += 1;
@@ -148,12 +146,18 @@ impl Kitten {
         let mut propagated_count: u64 = 0;
         let mut conflict = INVALID;
         while conflict == INVALID && self.propagated < self.trail.len() {
+            // A stop leaves the trail part-propagated; `solve` then answers
+            // unknown before it decides (kitten.c:1090-1093, 1873-1877).
+            if self.terminator_due() {
+                break;
+            }
             let lit = self.trail[self.propagated];
             conflict = self.propagate_literal(lit);
             self.propagated += 1;
             propagated_count += 1;
         }
         self.propagations += propagated_count;
+        self.lifetime_propagations += propagated_count;
         conflict
     }
 
@@ -608,6 +612,7 @@ impl Kitten {
     /// Solve under current assumptions.
     /// Returns 10 (SAT), 20 (UNSAT), 0 (unknown/limit hit).
     pub(crate) fn solve(&mut self) -> i32 {
+        self.lifetime_solves += 1;
         if self.status != 0 {
             self.reset_incremental();
         } else {
@@ -617,42 +622,56 @@ impl Kitten {
             self.completely_backtrack_to_root_level();
         }
 
+        // Even empty/already-inconsistent inputs have no propagation poll.
+        // Observe the SAME sticky terminator after safe incremental cleanup.
+        if self.terminated() {
+            return self.admit_solve_result(0);
+        }
+
         let res = self.propagate_units();
-        if res != 0 {
-            self.status = res;
-            return res;
+        if res != 0 || self.terminated() {
+            return self.admit_solve_result(res);
         }
 
         loop {
             let conflict = self.propagate();
-            if conflict != INVALID {
+            let decision_result = if self.terminated() {
+                -1
+            } else if conflict != INVALID {
                 if self.level == 0 {
                     self.mark_inconsistent(conflict);
-                    self.status = 20;
-                    return 20;
+                    return self.admit_solve_result(20);
                 }
                 self.analyze(conflict);
+                0
             } else {
-                let decision_result = self.decide();
-                if decision_result != 0 {
-                    self.status = if decision_result < 0 {
-                        0
-                    } else {
-                        decision_result
-                    };
-                    // CaDiCaL kitten.c:1893-1894: when solve returns unknown
-                    // (0, e.g. ticks limit hit), reset assumptions so they
-                    // don't accumulate across incremental solves. Without this,
-                    // the next assume() call sees status==0 and skips
-                    // reset_incremental(), appending new assumptions on top of
-                    // stale ones. The corrupted assumption stack causes false
-                    // UNSAT in subsequent probes (#8530).
-                    if self.status == 0 && !self.assumptions.is_empty() {
-                        self.reset_assumptions();
-                    }
-                    return self.status;
-                }
+                self.decide()
+            };
+            if decision_result != 0 {
+                let result = if decision_result < 0 {
+                    0
+                } else {
+                    decision_result
+                };
+                return self.admit_solve_result(result);
             }
         }
+    }
+
+    /// Admission, not a new stop or allowance. Keep logical clauses/learned
+    /// state, but never publish a completed answer after an observed stop.
+    fn admit_solve_result(&mut self, result: i32) -> i32 {
+        self.status = if self.terminated() { 0 } else { result };
+        // CaDiCaL kitten.c:1893-1894: unknown must reset assumptions, including
+        // early stop and terminal veto. Otherwise the next assume() skips
+        // reset_incremental at status==0 and stale assumptions can cause a
+        // false UNSAT in a later, independently rebound query (#8530).
+        if self.status == 0 {
+            self.reset_assumptions();
+            // Discard assumption-query credit, not persistent original UNSAT.
+            self.failing = INVALID;
+            self.core.clear();
+        }
+        self.status
     }
 }

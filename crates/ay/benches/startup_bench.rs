@@ -8,9 +8,10 @@
 //! includes parsing so benchmark runs can separate parser cost from
 //! executor startup and solving cost.
 
+use ay_criterion_main::criterion_main;
 use ay_dpll::Executor;
 use ay_frontend::{parse, Command};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 
 fn run_commands(commands: &[Command]) {
     let mut executor = Executor::new();

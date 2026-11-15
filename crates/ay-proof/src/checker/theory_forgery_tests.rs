@@ -229,9 +229,9 @@ fn test_bv_bitblast_accepts_bounded_semantic_tautology() {
 /// re-decide one unchanged lemma over and over (MEASURED at b0a836719b on the
 /// 28 `shl_is_mul_by_pow2` queries: 226 entries into the decision procedure for
 /// 28 distinct decisions, 41.3 s of 53.2 s redundant). That is only sound
-/// because a rejection is never recorded — the proof-producing checker is
-/// deadline-bounded, so a failure is a fact about one attempt, not about the
-/// clause — and because the key is the clause itself.
+/// because a rejection never enters the ACCEPTED table — a counted refusal is
+/// kept apart, and can only ever repeat a rejection — and because the key is
+/// the clause itself.
 #[test]
 fn test_bv_bitblast_memoizes_accepted_clauses_and_never_rejected_ones() {
     let mut terms = TermStore::new();
@@ -427,22 +427,62 @@ fn test_strict_proof_rejects_cumulative_wide_bv_lemma_budget_before_replay() {
 }
 
 #[test]
-fn test_bv_bitblast_proof_producer_rejects_unsupported_wide_operator() {
+fn test_bv_bitblast_proof_producer_interprets_or_abstracts_division_but_never_forges() {
+    // A power-of-two divisor is EXACT: `(bvudiv x 2^k)` lowers to
+    // `(bvlshr x k)`, so a true identity over it is accepted ...
     let mut terms = TermStore::new();
     let bv = terms.mk_var("bv", Sort::bitvec(32));
-    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let four = terms.mk_bitvec(BigInt::from(4), 32);
+    let two = terms.mk_bitvec(BigInt::from(2), 32);
     let quotient = terms.mk_app(
         ay_core::Symbol::named("bvudiv"),
-        vec![bv, one],
+        vec![bv, four],
+        Sort::bitvec(32),
+    );
+    let shifted = terms.mk_app(
+        ay_core::Symbol::named("bvlshr"),
+        vec![bv, two],
         Sort::bitvec(32),
     );
     let eq = terms.mk_app(
         ay_core::Symbol::named("="),
-        vec![quotient, quotient],
+        vec![quotient, shifted],
         Sort::Bool,
     );
     validate_theory_lemma_strict(&terms, vec![eq], TheoryLemmaKind::BvBitBlast)
-        .expect_err("unsupported wide operator must fail closed even for a tautological shape");
+        .expect("division by a power of two is exactly a shift");
+    // ... and a false one is refused.
+    let wrong = terms.mk_app(ay_core::Symbol::named("="), vec![quotient, bv], Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![wrong], TheoryLemmaKind::BvBitBlast)
+        .expect_err("x / 4 is not x");
+
+    // A general divisor is ABSTRACTED in lemma validation: a clause that holds
+    // for every interpretation of the opaque quotient (the same term on both
+    // sides) is accepted ...
+    let divisor = terms.mk_var("divisor", Sort::bitvec(32));
+    let signed = terms.mk_app(
+        ay_core::Symbol::named("bvsdiv"),
+        vec![bv, divisor],
+        Sort::bitvec(32),
+    );
+    let same = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![signed, signed],
+        Sort::Bool,
+    );
+    validate_theory_lemma_strict(&terms, vec![same], TheoryLemmaKind::BvBitBlast)
+        .expect("an identity of one opaque term holds for every interpretation");
+    // ... while a clause that needs the operator's MEANING fails closed: the
+    // abstraction has a model, and a model of the abstraction is not a proof.
+    let one = terms.mk_bitvec(BigInt::from(1), 32);
+    let by_one = terms.mk_app(
+        ay_core::Symbol::named("bvsdiv"),
+        vec![bv, one],
+        Sort::bitvec(32),
+    );
+    let meaning = terms.mk_app(ay_core::Symbol::named("="), vec![by_one, bv], Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![meaning], TheoryLemmaKind::BvBitBlast)
+        .expect_err("x sdiv 1 = x needs bvsdiv's semantics, which the abstraction forgets");
 }
 
 #[test]
@@ -460,7 +500,8 @@ fn test_bv_bitblast_proof_producer_rejects_oversized_mul_tree_before_search() {
     let mut terms = TermStore::new();
     let bv = terms.mk_var("bv", Sort::bitvec(64));
     let mut product = bv;
-    for _ in 0..8 {
+    // Ten 64-bit multipliers exceed the unchanged 100,000-gate bound.
+    for _ in 0..10 {
         product = terms.mk_app(
             ay_core::Symbol::named("bvmul"),
             vec![product, bv],
@@ -484,12 +525,14 @@ fn test_bv_bitblast_proof_producer_rejects_oversized_mul_tree_before_search() {
 fn test_bv_bitblast_proof_producer_rejects_oversized_shift_tree_before_search() {
     let mut terms = TermStore::new();
     let bv = terms.mk_var("bv", Sort::bitvec(64));
-    let one = terms.mk_bitvec(BigInt::from(1), 64);
+    let amount = terms.mk_var("amount", Sort::bitvec(64));
     let mut shifted = bv;
-    for _ in 0..8 {
+    // Variable amounts construct barrel shifters; literal shifts are rewiring.
+    // 55 * 1,856 gates exceed the unchanged 100,000-gate bound.
+    for _ in 0..55 {
         shifted = terms.mk_app(
             ay_core::Symbol::named("bvshl"),
-            vec![shifted, one],
+            vec![shifted, amount],
             Sort::bitvec(64),
         );
     }

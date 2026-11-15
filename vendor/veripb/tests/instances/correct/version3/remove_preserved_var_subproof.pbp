@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+f 6;
+preserved_rm x5 : 1 x1 >= 1 : subproof
+    proofgoal #1
+        pol -1 5 +;
+    qed : -1;
+    proofgoal #2
+        pol -1 6 +;
+    qed : -1;
+qed;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

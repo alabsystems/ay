@@ -214,9 +214,17 @@ proptest! {
         let mut bwd = BackwardChecker::new(num_vars as usize, false);
         let result = bwd.verify(&clauses, &steps);
         if result.is_ok() {
-            let total_clauses = (bwd.stats().original + bwd.stats().additions) as usize;
+            let total_clauses = bwd
+                .stats()
+                .original
+                .checked_add(bwd.stats().additions)
+                .ok_or_else(|| TestCaseError::fail("clause count overflows u64"))?
+                as usize;
             // Check a reasonable range of indices — active array is at most total_clauses long.
-            for cidx in 0..total_clauses + 10 {
+            let scan_end = total_clauses
+                .checked_add(10)
+                .ok_or_else(|| TestCaseError::fail("index scan bound overflows usize"))?;
+            for cidx in 0..scan_end {
                 if bwd.is_active(cidx) {
                     prop_assert!(
                         cidx < total_clauses,

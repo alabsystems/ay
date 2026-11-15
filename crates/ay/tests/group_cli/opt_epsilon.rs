@@ -54,7 +54,6 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use ntest::timeout;
 
@@ -105,24 +104,13 @@ fn assert_lines(name: &str, expected: &[&str]) {
     );
 }
 
-/// True when a `z3` binary is on PATH (differential/model checks skip
-/// gracefully without it — the AY-side pins above always run).
-fn z3_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        Command::new("z3")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
+/// z3's answer to `script`, or `None` when no z3 is usable (the model checks
+/// then skip visibly — the AY-side pins above always run). The z3 is reached
+/// by path and must prove it is z3 (`ay_test_support::z3`).
 fn z3_check_script(script: &str) -> Option<String> {
-    if !z3_available() {
-        return None;
-    }
-    let mut child = Command::new("z3")
+    let z3 = ay_test_support::z3::optional_z3("ay opt_epsilon model feasibility")?;
+    let mut child = z3
+        .command()
         .arg("-in")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

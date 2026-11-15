@@ -115,6 +115,14 @@ pub(crate) enum CertifiedHybridPbLpDecision {
     },
 }
 
+/// An infeasibility probe is finished by one exactly checked feasible point;
+/// an ordinary solve must still optimize its objective.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HybridGoal {
+    Solve,
+    Refute,
+}
+
 /// Independently replayable proof that the binary-master/continuous-recourse
 /// decomposition is infeasible.
 ///
@@ -229,16 +237,24 @@ pub(crate) enum HybridPbLpCertificateCodecError {
     Malformed(#[source] serde_json::Error),
 }
 
+/// Why independent model-bound hybrid PB/LP certificate replay declined.
+/// A failure never authorizes an infeasibility verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum HybridPbLpCertificateVerificationError {
+#[non_exhaustive]
+pub enum HybridPbLpCertificateVerificationError {
+    /// The supplied original deadline or cancellation callback fired.
     #[error("hybrid certificate verification was interrupted")]
     Interrupted,
+    /// The supplied model is outside the exact decomposition supported here.
     #[error("model is not an admissible binary-master/continuous-recourse decomposition")]
     UnsupportedModel,
+    /// A cut license, model binding, or retained resource bound was rejected.
     #[error("hybrid cut ledger is malformed or exceeds its resource envelope")]
     InvalidCutLedger,
+    /// The final proof does not refute the independently rebuilt PB master.
     #[error("final PB master refutation failed independent replay")]
     MasterRefutationRejected,
+    /// The typed artifact exceeds its bounded serialization envelope.
     #[error("hybrid certificate cannot be represented by the bounded codec")]
     SerializationLimit,
 }
@@ -259,7 +275,8 @@ pub(crate) fn try_solve_interruptible<F>(
 where
     F: FnMut() -> bool,
 {
-    try_solve_certified_interruptible(model, deadline, should_stop).map(drop_hybrid_certificate)
+    try_solve_certified_interruptible(model, deadline, HybridGoal::Solve, should_stop)
+        .map(drop_hybrid_certificate)
 }
 
 /// Run the hybrid route while retaining independently replayable
@@ -270,12 +287,23 @@ pub(crate) fn try_solve_certified(
     model: &Model,
     deadline: Option<Instant>,
 ) -> Option<CertifiedHybridPbLpDecision> {
-    try_solve_certified_interruptible(model, deadline, || false)
+    try_solve_certified_interruptible(model, deadline, HybridGoal::Solve, || false)
+}
+
+/// Search for an infeasibility certificate without optimizing a feasible model.
+/// A feasible result retains its checked witness so callers can distinguish a
+/// disproved probe from a structural or resource decline.
+pub(crate) fn try_refute_certified(
+    model: &Model,
+    deadline: Option<Instant>,
+) -> Option<CertifiedHybridPbLpDecision> {
+    try_solve_certified_interruptible(model, deadline, HybridGoal::Refute, || false)
 }
 
 pub(crate) fn try_solve_certified_interruptible<F>(
     model: &Model,
     deadline: Option<Instant>,
+    goal: HybridGoal,
     mut should_stop: F,
 ) -> Option<CertifiedHybridPbLpDecision>
 where
@@ -299,7 +327,7 @@ where
     }
     let instance = core_instance(&plan, deadline, &mut should_stop)?;
     let mut master = MasterState { plan, instance };
-    let mut subproblem = ContinuousSubproblem::new(model, deadline, &mut should_stop)?;
+    let mut subproblem = ContinuousSubproblem::new(model, goal, deadline, &mut should_stop)?;
     let mut cuts = RetainedCuts::new(
         CutResourceLimits::production(),
         master.plan.constraints.len(),
@@ -359,13 +387,15 @@ where
             )? {
                 SubproblemDecision::Feasible(model_values) => {
                     let value = model.objective_value_at(&model_values);
-                    if let Some(claimed) = claimed_objective {
-                        let mapped = master.plan.objective.as_ref()?.map.model_value(claimed);
-                        if value != mapped {
-                            return None;
+                    if goal == HybridGoal::Solve {
+                        if let Some(claimed) = claimed_objective {
+                            let mapped = master.plan.objective.as_ref()?.map.model_value(claimed);
+                            if value != mapped {
+                                return None;
+                            }
                         }
                     }
-                    if model.has_objective() && proven_optimal {
+                    if goal == HybridGoal::Solve && model.has_objective() && proven_optimal {
                         trace_result(&decomposition, iteration, "OPTIMAL", started.elapsed());
                         return Some(CertifiedHybridPbLpDecision::Optimal {
                             value,
@@ -388,6 +418,13 @@ where
                         || model.objective_value_at(&model_values) != value
                     {
                         return None;
+                    }
+                    if goal == HybridGoal::Refute {
+                        trace_result(&decomposition, iteration, "FEASIBLE", started.elapsed());
+                        return Some(CertifiedHybridPbLpDecision::Feasible {
+                            model_values,
+                            incumbent_only: true,
+                        });
                     }
                     let improves = incumbent
                         .as_ref()
@@ -511,8 +548,17 @@ where
     Some(certificate)
 }
 
-/// Independently rebuild and replay a hybrid infeasibility artifact.
-pub(crate) fn verify_hybrid_pb_lp_infeasibility_certificate(
+/// Independently rebuild and replay a hybrid infeasibility artifact against
+/// the caller's original model. No solver or session verdict is consulted.
+///
+/// Rebuilds the binary master, verifies every exact Farkas/no-good cut license,
+/// and independently replays the final PB refutation. No model or learned row
+/// embedded in the artifact is trusted.
+///
+/// # Errors
+/// Returns a verification error on a malformed artifact, unsupported model,
+/// rejected license/refutation, or exhausted bounded evidence envelope.
+pub fn verify_hybrid_pb_lp_infeasibility_certificate(
     original: &Model,
     certificate: &HybridPbLpInfeasibilityCertificate,
 ) -> Result<(), HybridPbLpCertificateVerificationError> {
@@ -524,7 +570,38 @@ pub(crate) fn verify_hybrid_pb_lp_infeasibility_certificate(
     )
 }
 
-pub(crate) fn verify_hybrid_pb_lp_infeasibility_certificate_interruptible<F>(
+/// Replay a hybrid proof under the caller's existing absolute deadline.
+/// Reconstruction and proof checking share the deadline; polling is cooperative.
+///
+/// # Errors
+/// Returns [`HybridPbLpCertificateVerificationError::Interrupted`] on expiry,
+/// or the same errors as the deadline-free verifier.
+pub fn verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+    original: &Model,
+    certificate: &HybridPbLpInfeasibilityCertificate,
+    deadline: Option<Instant>,
+) -> Result<(), HybridPbLpCertificateVerificationError> {
+    verify_hybrid_pb_lp_infeasibility_certificate_interruptible(
+        original,
+        certificate,
+        deadline,
+        &mut || false,
+    )
+}
+
+/// Independently replay against the caller's original model under its
+/// existing absolute deadline and cancellation callback.
+///
+/// This is the same exact verifier as the non-interruptible entry point. It
+/// performs no solver rerun and grants no new time allowance. Its polling is
+/// cooperative; callers that require a hard wall deadline must retain their
+/// existing outer enforcement around this call.
+///
+/// # Errors
+/// Returns [`HybridPbLpCertificateVerificationError::Interrupted`] when the
+/// deadline/callback fires, or the same model/license/proof errors as
+/// [`verify_hybrid_pb_lp_infeasibility_certificate`]. No failure is a proof.
+pub fn verify_hybrid_pb_lp_infeasibility_certificate_interruptible<F>(
     original: &Model,
     certificate: &HybridPbLpInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -2157,14 +2234,25 @@ enum SubproblemDecision {
 }
 
 impl ContinuousSubproblem {
-    fn new<F>(model: &Model, deadline: Option<Instant>, should_stop: &mut F) -> Option<Self>
+    fn new<F>(
+        model: &Model,
+        goal: HybridGoal,
+        deadline: Option<Instant>,
+        should_stop: &mut F,
+    ) -> Option<Self>
     where
         F: FnMut() -> bool,
     {
-        let objective: Vec<(u32, f64)> = continuous_objective_terms(model, deadline, should_stop)?
-            .into_iter()
-            .map(|(column, _)| (column, model.obj_coeff(Col(column))))
-            .collect();
+        let mut objective: Vec<(u32, f64)> =
+            continuous_objective_terms(model, deadline, should_stop)?
+                .into_iter()
+                .map(|(column, _)| (column, model.obj_coeff(Col(column))))
+                .collect();
+        // A refutation needs a checked feasible point, not an optimal recourse
+        // value or its dual row. Keep the same exact feasibility checks below.
+        if goal == HybridGoal::Refute {
+            objective.clear();
+        }
         let has_objective = !objective.is_empty();
         let lp = FloatLp::from_model(
             model,
@@ -2699,6 +2787,10 @@ pub(crate) fn prime_env() {
 }
 
 #[cfg(test)]
+#[path = "hybrid_pb_lp/refute_tests.rs"]
+mod refute_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2736,7 +2828,8 @@ mod tests {
     fn projected_farkas_cut_is_global_and_excludes_assignment() {
         let model = fixed_charge_model(1.0);
         let decomposition = admit(&model);
-        let mut checker = ContinuousSubproblem::new(&model, None, &mut || false).expect("LP");
+        let mut checker =
+            ContinuousSubproblem::new(&model, HybridGoal::Solve, None, &mut || false).expect("LP");
         let SubproblemDecision::Infeasible(farkas) = checker
             .check(&model, &decomposition, &[false], None, &mut || false)
             .expect("subproblem result")
@@ -2994,7 +3087,9 @@ mod tests {
     #[test]
     fn certified_hybrid_interruption_never_becomes_infeasibility() {
         let model = fixed_charge_model(2.0);
-        assert!(try_solve_certified_interruptible(&model, None, || true).is_none());
+        assert!(
+            try_solve_certified_interruptible(&model, None, HybridGoal::Solve, || true).is_none()
+        );
 
         let CertifiedHybridPbLpDecision::Infeasible(certificate) =
             try_solve_certified(&model, None).expect("certified hybrid result")
@@ -3209,7 +3304,8 @@ mod tests {
     fn no_good_license_rejects_a_farkas_from_another_assignment() {
         let model = fixed_charge_model(1.0);
         let decomposition = admit(&model);
-        let mut checker = ContinuousSubproblem::new(&model, None, &mut || false).expect("LP");
+        let mut checker =
+            ContinuousSubproblem::new(&model, HybridGoal::Solve, None, &mut || false).expect("LP");
         let SubproblemDecision::Infeasible(farkas) = checker
             .check(&model, &decomposition, &[false], None, &mut || false)
             .expect("subproblem result")
@@ -3419,7 +3515,8 @@ mod tests {
     fn retained_evidence_limit_declines_without_mutating_master() {
         let model = fixed_charge_model(1.0);
         let decomposition = admit(&model);
-        let mut checker = ContinuousSubproblem::new(&model, None, &mut || false).expect("LP");
+        let mut checker =
+            ContinuousSubproblem::new(&model, HybridGoal::Solve, None, &mut || false).expect("LP");
         let SubproblemDecision::Infeasible(farkas) = checker
             .check(&model, &decomposition, &[false], None, &mut || false)
             .expect("subproblem result")

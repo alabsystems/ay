@@ -65,7 +65,7 @@ impl TheorySolver for EufSolver<'_> {
     }
 
     fn check(&mut self) -> TheoryResult {
-        self.check_count += 1;
+        self.check_count = self.check_count.saturating_add(1);
         // Soundness gate (#8454): if an earlier pop() detected trail underflow
         // (corrupted E-graph state), refuse to produce a SAT/UNSAT result.
         if self.poisoned {
@@ -103,7 +103,7 @@ impl TheorySolver for EufSolver<'_> {
                 self.terms.len()
             );
             // Return conflict clause: {term=true, term=false} -> both are in conflict
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(vec![
                 TheoryLit::new(conflict_term, true),
                 TheoryLit::new(conflict_term, false),
@@ -119,7 +119,7 @@ impl TheorySolver for EufSolver<'_> {
                     conflict.len()
                 );
             }
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
@@ -196,11 +196,15 @@ impl TheorySolver for EufSolver<'_> {
         // Disequality propagation (#5575, see theory_propagate.rs)
         self.propagate_disequalities(&mut propagations);
 
-        self.propagation_count += propagations.len() as u64;
+        self.propagation_count = self
+            .propagation_count
+            .saturating_add(propagations.len() as u64);
         // Store the allocation back for reuse, then move its elements into the
         // independently owned result without discarding the reusable capacity.
         self.propagation_output_buf = propagations;
-        let mut output = Vec::with_capacity(self.propagation_output_buf.len());
+        // The reservation is a capacity hint: on failure `append` still grows.
+        let mut output = Vec::new();
+        let _ = output.try_reserve_exact(self.propagation_output_buf.len());
         output.append(&mut self.propagation_output_buf);
         output
     }
@@ -686,7 +690,9 @@ impl TheorySolver for EufSolver<'_> {
         // sync still fixes everything, so we leave the flag untouched.)
         // shared_equality_reasons is now scope-aware via RemoveSharedEqualityReason
         // undo records (#4840). No blanket clear needed.
-        self.func_app_values.clear(); // #385: derived from assignments
+        // #385: func-app values are derived from assignments. The
+        // incremental branch prunes/resyncs them below; the
+        // not-yet-initialized branch clears them.
 
         // In incremental mode with active undo records, equality_edges are maintained
         // incrementally via RemoveEqualityEdge undo records (#5575). The blanket clear
@@ -696,6 +702,8 @@ impl TheorySolver for EufSolver<'_> {
         if !self.enodes_init {
             // Enodes not yet initialized — blanket clear is safe.
             self.equality_edges.clear();
+            self.func_app_values.clear(); // #385: derived from assignments
+            self.func_app_value_providers.clear();
             self.dirty = true;
         } else {
             // Incremental mode: E-graph state is maintained by undo records above.
@@ -703,7 +711,7 @@ impl TheorySolver for EufSolver<'_> {
             // Refresh the UF mirror before returning so direct uf.find() readers
             // and extract_model() see the restored outer-scope partition.
             self.sync_egraph_to_uf();
-            self.resync_func_app_values_from_assigns();
+            self.prune_func_app_values_after_pop();
         }
         self.pending_conflict = None;
         // #euf-idle-rebuild: queued merges were discarded and applied merges
@@ -797,6 +805,7 @@ impl TheorySolver for EufSolver<'_> {
         self.pending_shared_diseq_conflict = None;
         // Clear function application values (#385)
         self.func_app_values.clear();
+        self.func_app_value_providers.clear();
         // #8599: Clear persistent propagation buffer
         self.propagation_output_buf.clear();
         // #euf-lazy-explain: assignment-derived witnesses are gone with the
@@ -895,6 +904,7 @@ impl TheorySolver for EufSolver<'_> {
         self.pending_shared_diseq_conflict = None;
         // Clear function application values (#385) - derived from assignments
         self.func_app_values.clear();
+        self.func_app_value_providers.clear();
         // #8599: Clear persistent propagation buffer
         self.propagation_output_buf.clear();
         // #euf-lazy-explain: see reset() — witnesses are assignment-derived.
@@ -1283,7 +1293,7 @@ impl TheorySolver for EufSolver<'_> {
             == crate::theory_propagate::EUF_LAZY_MAGIC
         {
             let _ = lit;
-            self.lazy_explain_rejected_count += 1;
+            self.lazy_explain_rejected_count = self.lazy_explain_rejected_count.saturating_add(1);
         }
     }
 

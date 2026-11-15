@@ -23,6 +23,7 @@ mod exact_fragment;
 mod folded_unit_authority;
 mod hint_error;
 mod inspection;
+mod refutation_tail;
 #[cfg(test)]
 mod tests;
 
@@ -42,6 +43,19 @@ pub(crate) use exact_fragment::{
     FragmentInstanceDerivation, FragmentInstanceRootDerivation, FragmentPropagationEnvironment,
     FragmentSkolemDerivation,
 };
+
+/// Per-trace-entry rate of the reconstruction step meter: the floor of the
+/// best-effort (#A2b) replay budget
+/// (`proof_resolution/sat_resolution/trace_replay.rs`), and the allowance the
+/// certified re-derivation attempts in `SatProofManager::process_trace` share
+/// on one trace.
+pub(crate) const RECONSTRUCTION_STEPS_PER_TRACE_ENTRY: u64 = 512;
+
+/// The re-derivation allowance one attempt may spend, as a fraction of the
+/// trace's allowance: equal to the failure cap, so the allowance funds every
+/// failure the cap admits and an early expensive one cannot starve the later
+/// targets.
+const REDERIVATION_ATTEMPT_SHARES: u64 = 64;
 
 /// SAT-level proof manager for translating clause traces to Alethe steps
 pub(crate) struct SatProofManager<'a> {
@@ -89,6 +103,11 @@ pub(crate) struct SatProofManager<'a> {
     /// Number of learned clauses that fell back to Trust due to failed
     /// resolution hint reconstruction (#4585).
     trust_fallback_count: u32,
+    /// Lemma clause keys already materialized as clause versions by
+    /// `derive_clause_via_bounded_dpll`, so repeated derivation attempts
+    /// do not push duplicate versions (which would balloon the version
+    /// list and the RUP step charges against it).
+    materialized_lemma_versions: std::collections::HashSet<Vec<TermId>>,
     /// Trace entries dropped because `clause_to_terms` failed (introspection).
     untranslatable_entries: u32,
     unmapped_var_min: Option<u32>,
@@ -98,6 +117,9 @@ pub(crate) struct SatProofManager<'a> {
     /// out and returns `None` (best-effort synthesized-default certificates
     /// only; see `Executor::set_proof_reconstruction_step_budget`, #A2b).
     step_budget: Option<u64>,
+    /// The caller's stop signals (interrupt, deadline), polled once per
+    /// `STOP_POLL_STRIDE` trace entries; a stop abandons the replay (`None`).
+    should_stop: Option<&'a dyn Fn() -> bool>,
     /// Datatype registries for the pedigree-free DT authentication lane
     /// (#dt-ground-conflict): mid-solve conflicts added through the SAT-core
     /// extension have no annotation channel to the indexed ledgers, so the
@@ -329,6 +351,22 @@ impl SatProofManager<'_> {
         let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
         let mut final_empty: Option<ProofId> = None;
         let mut weak_empty: Option<ProofId> = None;
+        // Re-derivation attempts spent on originals with no justified
+        // theory annotation: each attempt rebuilds a watch index over the
+        // processed versions, so cap attempts (and failures more tightly)
+        // and fail closed to the annotation path beyond them.
+        let mut generic_derivation_attempts = 0usize;
+        let mut generic_derivation_failures = 0usize;
+        // The caps bound counts, not work: one failing bounded-DPLL attempt
+        // over ~70k processed versions costs seconds, and a certification
+        // reconstructs many traces. So the attempts also spend one
+        // deterministic step allowance per trace (charged like the replay's
+        // own steps), never the replay's budget, and one attempt gets at most
+        // its share of it.
+        let mut rederivation_allowance = u64::try_from(trace.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(RECONSTRUCTION_STEPS_PER_TRACE_ENTRY);
+        let rederivation_share = (rederivation_allowance / REDERIVATION_ATTEMPT_SHARES).max(1);
         for (idx, step) in proof.steps.iter().enumerate() {
             let Some(clause) = Self::clause_from_step(step) else {
                 continue;
@@ -338,6 +376,8 @@ impl SatProofManager<'_> {
                 .entry(key)
                 .or_insert(ProofId(idx as u32));
         }
+        // The replay's own steps start here (`refutation_tail`).
+        let replay_start = proof.steps.len();
 
         // #A2b: the SAT solver's search-time proof bookkeeping budget was
         // exhausted, so the trace's level-0 LRAT unit chains are incomplete
@@ -352,7 +392,10 @@ impl SatProofManager<'_> {
             return None;
         }
 
-        for entry in trace.entries() {
+        for (entry_index, entry) in trace.entries().into_iter().enumerate() {
+            if self.stop_requested_at(entry_index) {
+                return None;
+            }
             // Best-effort budget (#A2b): once the RUP-replay step budget is
             // exhausted, abandon reconstruction entirely — the caller treats
             // `None` as "no reconstructable proof" (synthesized-default runs
@@ -397,6 +440,39 @@ impl SatProofManager<'_> {
                             .and_then(|candidate| {
                                 Self::rebind_theory_annotation(candidate, &entry_clause_terms)
                             })
+                    });
+                // A `Generic` annotation carries no checker-replayable
+                // authority (the funnel could not classify the lemma): the
+                // strict checker rejects it like a trust leaf. Such an
+                // original is a candidate for certified re-derivation from
+                // the already-processed clause database below, exactly like
+                // an unannotated derived fact.
+                let unjustified_theory_annotation = matches!(
+                    theory_annotation.as_ref().map(|annot| annot.kind),
+                    Some(ay_core::TheoryLemmaKind::Generic)
+                );
+                // The proof being assembled may already carry this clause
+                // as a premiseless `trust` step (the funnel records
+                // unclassified EUF lemmas that way during search, and the
+                // seeding above copied it into `existing_clause_map`).
+                // Such an entry is no authority either: a certified
+                // re-derivation may replace it for downstream lookups.
+                let existing_is_unjustified =
+                    existing_clause_map.get(&normalized_key).is_some_and(|pid| {
+                        matches!(
+                            proof.steps.get(pid.0 as usize),
+                            Some(ay_core::ProofStep::Step {
+                                rule: ay_core::AletheRule::Trust,
+                                premises,
+                                ..
+                            }) if premises.is_empty()
+                        ) || matches!(
+                            proof.steps.get(pid.0 as usize),
+                            Some(ay_core::ProofStep::TheoryLemma {
+                                kind: ay_core::TheoryLemmaKind::Generic,
+                                ..
+                            })
+                        )
                     });
                 // Level-0-minimized theory lemma bridge (#rank-4 increment 2).
                 // The SAT layer strips literals that are false at level 0
@@ -455,6 +531,125 @@ impl SatProofManager<'_> {
                                 .entry(Self::normalize_clause(derived_terms))
                                 .or_insert(*derived_proof);
                         })
+                    } else {
+                        None
+                    }
+                });
+                // Certified re-derivation for an original whose only
+                // annotation is unjustified (`Generic`, or already seeded in
+                // the proof as a premiseless `trust`/`Generic` leaf): EUF
+                // congruence lemmas the funnel could not classify, whose
+                // derivation is resolution over authored originals and
+                // certified lemmas already processed (the QF_UF finite-model
+                // family: predicate congruence resolvents); the scope of
+                // DR-AY-EUF-BRIDGE-20261103. An unannotated original is not a
+                // target: the proof answers it with an `assume`, its own
+                // authority when authored, and a replay over the processed
+                // versions can only trade that step for whatever they prove,
+                // a strict subclause down to the empty clause included, even
+                // through an anonymous version that later demotes to `trust`.
+                // That holds for an unlabeled seeded `assume` too, a
+                // temporary assertion the export demotes to `trust`: outside
+                // the DR's scope, though f1a718aed's code reached it.
+                // Measured on deductive-checks's set-fold frame, re-deriving those
+                // leaves its refutation as it was, and on the frame's largest
+                // trace they took 56 of the 64 failures the cap admits.
+                // Try the cheap RUP replay over the shared engine first, then
+                // the bounded DPLL search (its lemma materialization is
+                // deduped across attempts). Bounded by clause length and
+                // attempt/failure caps; fail-closed to the annotation path.
+                // Note the finite-model *narrowed domain* clauses are LNH
+                // symmetry-breaking assertions (`executor/lnh_symmetry.rs`
+                // C5), not entailed consequences: they are expected to
+                // decline here and certify only through the deferred-trust
+                // discharge's fresh whole-query re-solve (`unsat_cert.rs`
+                // step 4).
+                let bridged = bridged.or_else(|| {
+                    // Only spend an attempt where the funnel's own
+                    // intrinsic battery also declines the clause: an
+                    // intrinsically classifiable original (a congruence
+                    // axiom, say) is authenticated at finalize time and
+                    // needs no re-derivation. Classified last, so only a
+                    // target pays for it.
+                    let funnel_declines = || {
+                        let view = self
+                            .dt_registry_data
+                            .map(crate::theory_inference::DatatypeRegistries::from_data);
+                        let (kind, _) =
+                            crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+                                self.terms,
+                                &entry_clause_terms,
+                                None,
+                                view.as_ref(),
+                            );
+                        kind.is_trust()
+                    };
+                    // The step `add_original_clause_step` would answer with
+                    // must itself be unjustified. A clause the proof already
+                    // carries with a justified step (an authored `assume`, a
+                    // certified lemma) is answered by that step, whatever
+                    // annotation the trace entry has, and a replay could only
+                    // trade it for a derivation through an unjustified leaf.
+                    let unjustified_step = existing_is_unjustified
+                        || (unjustified_theory_annotation
+                            && !existing_clause_map.contains_key(&normalized_key));
+                    if annotation.is_none()
+                        && unjustified_step
+                        && !entry_clause_terms.is_empty()
+                        && entry_clause_terms.len() <= 8
+                        && generic_derivation_failures < 64
+                        && generic_derivation_attempts < 512
+                        && rederivation_allowance > 0
+                        && funnel_declines()
+                    {
+                        generic_derivation_attempts += 1;
+                        // Attempts carry their own bounds (DPLL node cap,
+                        // attempt/failure caps and the allowance above); do
+                        // not let their propagation scans drain the
+                        // reconstruction step budget that bounds the main
+                        // trace replay. A budgeted replay's remaining budget
+                        // still caps one attempt, as it did before the
+                        // allowance existed.
+                        let saved_step_budget = self.step_budget;
+                        let share = rederivation_allowance.min(rederivation_share);
+                        let granted = saved_step_budget.map_or(share, |left| share.min(left));
+                        self.step_budget = Some(granted);
+                        let rup = self
+                            .derive_clause_via_rup_replay(
+                                &entry_clause_terms,
+                                &entry_sat_clause,
+                                &[],
+                                &clause_versions,
+                                &mut rup_engine,
+                                proof,
+                            )
+                            .ok();
+                        let derived = rup.or_else(|| {
+                            self.derive_clause_via_bounded_dpll(
+                                &entry_sat_clause,
+                                &mut clause_versions,
+                                &mut existing_clause_map,
+                                proof,
+                            )
+                        });
+                        let unspent = self.step_budget.unwrap_or(0).min(granted);
+                        rederivation_allowance -= granted - unspent;
+                        self.step_budget = saved_step_budget;
+                        match derived {
+                            Some((derived_proof, derived_terms, derived_sat)) => {
+                                // Overwrite: prefer the certified derivation
+                                // over any seeded trust entry for this clause.
+                                existing_clause_map.insert(
+                                    Self::normalize_clause(&derived_terms),
+                                    derived_proof,
+                                );
+                                Some((derived_proof, derived_terms, derived_sat))
+                            }
+                            None => {
+                                generic_derivation_failures += 1;
+                                None
+                            }
+                        }
                     } else {
                         None
                     }
@@ -560,6 +755,17 @@ impl SatProofManager<'_> {
                                         proof,
                                     )
                                 })
+                                // Failed-literal probing: the per-literal
+                                // case splits a learning-free DPLL repeats
+                                // exponentially, when the hint chain ran
+                                // through untranslatable bit-level clauses
+                                // (#aig-bridged-empty). Fail-closed.
+                                .or_else(|| {
+                                    self.derive_empty_via_failed_literal_probing(
+                                        &clause_versions,
+                                        proof,
+                                    )
+                                })
                         } else {
                             None
                         };
@@ -646,6 +852,8 @@ impl SatProofManager<'_> {
             }
         }
 
+        // The replay ends at its refutation (`refutation_tail`).
+        refutation_tail::end_at(proof, final_empty, replay_start);
         final_empty
             // Level-0 propagation-conflict exits record no empty-clause trace
             // entry (only the UNSAT flag); replay unit propagation over the
@@ -662,6 +870,9 @@ impl SatProofManager<'_> {
             // stalled assignment and close by genuine resolution.
             // Fail-closed on any uncertifiable shape.
             .or_else(|| self.derive_empty_via_bounded_dpll_theory(&clause_versions, proof))
+            // Failed-literal probing (#aig-bridged-empty): the honest closer
+            // for a refutation whose traced chain crossed bit-level variables.
+            .or_else(|| self.derive_empty_via_failed_literal_probing(&clause_versions, proof))
             // Keep a premise-less empty trust step as a last resort so
             // process_trace can still return a contradiction when no better
             // derivation exists (e.g., original empty clause inputs).

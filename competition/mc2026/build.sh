@@ -7,8 +7,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# 1. AY solver (release, CLI feature set).
-cargo build --release -p ay --features cli --bin ay
+# 1. AY solver (release, CLI feature set). With the Trust toolchain installed
+#    this is `targo --unverified build` (Rust on ALab hosts is spelled targo;
+#    the competition binary is a measurement subject, not a proof claim); a
+#    competition host without it builds with plain `cargo`.
+if targo --unverified --version >/dev/null 2>&1; then
+  targo --unverified build --release -p ay --features cli --bin ay
+else
+  cargo build --release -p ay --features cli --bin ay
+fi
 
 # 2. FlowCutter (PACE-17) — tree-decomposition helper used for TD-guided
 #    branching. Anytime heuristic; prints its best decomposition on SIGTERM.

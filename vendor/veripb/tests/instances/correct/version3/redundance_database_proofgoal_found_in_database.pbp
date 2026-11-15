@@ -1,0 +1,28 @@
+pseudo-Boolean proof version 3.0
+% Regression test (availability): this proof checks fine, but `--elaborate`
+% used to abort the process at
+% `elaboration::write_helpers::write_proofgoal_id`
+% ("database proofgoal should have same ID as a database constraint",
+% SIGABRT, 0-byte output).
+%
+% `Proofgoal::autoprove` discharges a database goal by finding an equal
+% constraint in the database and then writes the subproof with
+% `write_existing_constraint_subproof`. It passed the FOUND constraint where the
+% header needs the GOAL: a `ProofgoalID::Database(id)` is written as the output
+% ID registered for input ID `id`, which only the goal carries (proofgoal
+% generation copies the ids of the constraint it substituted), while the found
+% constraint is a different object with its own ids. `impl ConstraintLookup for
+% Rc<DBConstraint>` ignores the index and hands the found constraint straight
+% back, so the lookup silently succeeded and `get_out_id(id)` returned `None`.
+%
+% Reaching the path needs the db-lookup discharge to be *deferred* out of
+% proofgoal generation, which happens while elaborating as long as the touched
+% constraints stay under `IGNORE_DATABASE_PROOFGOAL_THRESHOLD` (5%) of the
+% database -- hence the 39 padding constraints. Substituting `xv -> 1` into
+% constraint 1 yields constraint 2 exactly, which is the goal that gets
+% discharged by database lookup.
+f 41;
+red 1 xv >= 1 : xv -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

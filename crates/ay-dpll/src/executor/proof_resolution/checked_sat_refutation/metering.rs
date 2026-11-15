@@ -6,6 +6,26 @@
 
 use super::*;
 
+/// This identifies the rejecting owner, not the dominant work consumer.
+#[cold]
+#[inline(never)]
+fn checked_refutation_work_limit_error(
+    limit: u64,
+    actual: u64,
+    debit: u64,
+) -> ResolutionValidationError {
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        ay_core::safe_eprintln!(
+            "--probe-cert-reject: work-limit owner=dpll-checked-refutation limit={limit} actual={actual} debit={debit}"
+        );
+    }
+    ResolutionValidationError::LimitExceeded {
+        resource: ResolutionValidationResource::Work,
+        limit: u128::from(limit),
+        actual: u128::from(actual),
+    }
+}
+
 /// Hard resource envelope for the independent positive-RUP replay.
 ///
 /// These are deliberately written at the production call site rather than
@@ -173,11 +193,11 @@ impl CheckedRefutationMeter {
                     resource: ResolutionValidationResource::Work,
                 })?;
         if self.work > self.limits.max_work {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: u128::from(self.limits.max_work),
-                actual: u128::from(self.work),
-            });
+            return Err(checked_refutation_work_limit_error(
+                self.limits.max_work,
+                self.work,
+                work,
+            ));
         }
         self.bytes =
             self.bytes
@@ -215,3 +235,7 @@ impl CheckedRefutationMeter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "metering/work_limit_tests.rs"]
+mod work_limit_tests;

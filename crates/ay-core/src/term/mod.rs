@@ -26,16 +26,35 @@ mod bitvector;
 mod boolean;
 mod boolean_eq;
 mod builders;
+mod bv_sharing;
 mod cardinality;
 mod compact;
+mod complex;
+mod controlled_intern;
+mod datatype_fields;
+mod declared_functions;
+mod divmod_purification;
 mod expand_select_store;
+mod finite_field;
 mod ite_lifting;
 mod memory;
 mod preprocess;
+mod sequence_power;
+mod snapshot;
+mod strict_bv_memo;
 mod subst;
 mod value;
 
+pub use bitvector::{BvOffsetEquality, BvOffsetShares};
 pub use compact::{RemapTable, Remappable};
+pub use controlled_intern::counted::{
+    reserve_counted, reserve_map_counted, reserve_string_counted, CountedBuiltin,
+    CountedFieldBuiltin, CountedRingBuiltin, CountedTermBuilder, CountedTermError,
+    TermConstructionAdmission, COUNTED_TERM_WORK_VERSION,
+};
+pub use controlled_intern::ControlledTermInternError;
+pub use divmod_purification::DivModPurification;
+pub use snapshot::TermSnapshotError;
 pub use value::{Constant, RationalWrapper, SkolemChoice, Symbol, TermData, TermId};
 #[allow(clippy::panic)]
 #[cfg(test)]
@@ -75,13 +94,9 @@ static NEXT_TERM_ENTRY_STAMP: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TermEntryStamp(u64);
 
+// `fetch_update`: model-checker-consumer's kept Kani baseline (nightly-2025-12-03) lacks stable `try_update`.
 #[allow(clippy::panic, deprecated)]
 fn fresh_term_entry_stamp() -> TermEntryStamp {
-    // `fetch_update`, not `try_update`: identical semantics (the closure-CAS
-    // loop returning the previous value), but stable since 1.45 — `try_update`
-    // is its unstable rename (#135894) and holds every downstream consumer
-    // (model-checker-consumer pins nightly-2025-12-03, which lacks it) to a newer toolchain
-    // for no behavioral gain.
     let stamp = NEXT_TERM_ENTRY_STAMP
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
@@ -90,12 +105,10 @@ fn fresh_term_entry_stamp() -> TermEntryStamp {
     TermEntryStamp(stamp)
 }
 
-/// Global counter for the number of active portfolio engines.
+/// Legacy global divisor for per-engine term budgets.
 ///
-/// Set by the portfolio coordinator before spawning engines. Used to compute
-/// per-engine memory budgets: `global_term_memory_limit / max(1, engine_count)`.
-/// This prevents a single engine from consuming the entire budget, leaving
-/// nothing for fallback engines (#8600 item 5).
+/// This does not count live engines or reserve memory. Independent portfolios
+/// derive their own shares without mutating this compatibility setting.
 static GLOBAL_ENGINE_COUNT: AtomicUsize = AtomicUsize::new(1);
 
 /// Default memory limit for aggregate TermStore allocation: unlimited.
@@ -124,17 +137,13 @@ static GLOBAL_TERM_MEMORY_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_TERM_MEM
 /// every DPLL(T) iteration (#8600).
 const TRUE_MEMORY_RECOMPUTE_DELTA: usize = 64 * 1024;
 
-/// Cap on `TermStore::strict_bv_semantics_ok`. Past it the store stops
-/// memoizing completed strict BV validations and the checker re-runs them, so
-/// the bound costs time, never correctness.
-const MAX_STRICT_BV_SEMANTICS_MEMO: usize = 4096;
-
 /// Internal term representation with pre-computed hash
 #[derive(Debug, Clone)]
 struct TermEntry {
     term: TermData,
     sort: Sort,
     stamp: TermEntryStamp,
+    field_presence: Option<bool>,
 }
 
 /// Hash-consing term store
@@ -149,6 +158,9 @@ struct TermEntry {
 // checkpoint can never be transplanted between the two otherwise-identical
 // stores.
 pub struct TermStore {
+    // Only the additive controlled constructor reads this role; legacy builders
+    // retain their existing behavior. A checker snapshot is not a producer.
+    store_role: controlled_intern::StoreRole,
     /// All terms, indexed by TermId
     terms: Vec<TermEntry>,
     /// Hash-cons map: hash -> list of term IDs with that hash
@@ -193,7 +205,8 @@ pub struct TermStore {
     /// families of this store — the TermStore state the strict proof checker
     /// (`ay-proof`) reads BESIDES the immutable term entries/sorts: the
     /// `to_real_shadowed` and `is_int_shadowed` latches and the
-    /// `skolem_symbols` / `skolem_choice` registries. Those families mutate
+    /// `skolem_symbols` / `skolem_choice` and `declared_functions` registries.
+    /// Those families mutate
     /// through their registration mutators WITHOUT appending a term or
     /// advancing the structural generation, so [`Self::snapshot_stamp`]
     /// equality alone does NOT prove them unchanged; any consumer replaying
@@ -202,10 +215,12 @@ pub struct TermStore {
     /// [`Self::checker_visible_metadata_generation`].
     ///
     /// CONTRACT (kept by construction, pinned by the memo's adversarial
-    /// tests): every mutation of these four families either bumps this
+    /// tests): every mutation of these families either bumps this
     /// counter ([`Self::mark_to_real_shadowed`],
     /// [`Self::mark_is_int_shadowed`], [`Self::mark_skolem_symbol`],
-    /// [`Self::register_skolem_choice`] — including a `skolem_choice`
+    /// [`Self::with_skolem_symbols_with_progress`],
+    /// [`Self::register_declared_function`], [`Self::register_skolem_choice`]
+    /// — including a `skolem_choice`
     /// OVERWRITE, which changes the table at unchanged size) or retires the
     /// snapshot stamp ([`Self::rollback_to`] pruning, `mark_and_compact`
     /// remapping — both advance the structural generation — and `Clone`,
@@ -267,6 +282,9 @@ pub struct TermStore {
     /// exporter DECLINE. Never read by the solver, so a missing or stale entry
     /// can only cost a printable proof, never change a verdict.
     skolem_choice: KaniHashMap<TermId, SkolemChoice>,
+    /// Mint-site provenance of each div/mod purification pair, keyed by its
+    /// quotient AND its remainder. Producer-only: see `divmod_purification.rs`.
+    divmod_purification: KaniHashMap<TermId, DivModPurification>,
     /// TermStore length at the start of the FIRST quantifier-instantiation pass
     /// (`process_quantifiers`), i.e. the count of ORIGINAL problem terms before
     /// any MBQI/CEGQI model-value witness is synthesized. Set ONCE (outside the
@@ -310,28 +328,46 @@ pub struct TermStore {
     /// rollback or compaction can make a previously used length alias a new
     /// term universe.
     rollback_generation: u64,
-    /// Clauses whose strict `bv_bitblast` SEMANTIC decision procedure has
-    /// already run to completion — and PASSED — against this store.
-    ///
-    /// A memo of work already done, never a substitute for it. An entry is
-    /// written only by the strict checker, only after the full decision
-    /// procedure (exhaustive bounded evaluation, or the bounded bit-blast +
-    /// LRAT proof producer and its replay) ACCEPTED that exact clause, and it
-    /// is read only to skip repeating that identical decision. Failures are
-    /// deliberately never recorded: the proof-producing checker is
-    /// deadline-bounded, so a failure is a fact about one attempt, not about
-    /// the clause.
+    /// The strict `bv_bitblast` checker's memo of COMPLETED decisions against
+    /// this store: clauses it accepted, and clauses its counted proof-producing
+    /// envelope refused. A memo of work already done, never a substitute for
+    /// it; see `strict_bv_memo.rs` for what may and may not be recorded.
     ///
     /// Keyed by `TermId`, hence cleared by every operation that can change what
     /// a `TermId` means — `rollback_to` and `mark_and_compact` are the only two
     /// (every other mutation of `self.terms` appends), and both clear it.
     /// `Clone` and `from_entries` start empty.
-    strict_bv_semantics_ok: std::cell::RefCell<KaniHashSet<Vec<TermId>>>,
+    strict_bv_semantics: strict_bv_memo::StrictBvSemanticsMemo,
+    /// Ordered field (selector) names of a datatype CONSTRUCTOR, by name.
+    ///
+    /// The only source of the constructor-to-field mapping for a datatype whose
+    /// carrier is a `Sort::Uninterpreted` identity, which is how every
+    /// `declare-datatype` arrives: `Sort::Datatype` carries its own
+    /// `constructors`, but a declared carrier does not, so
+    /// [`Self::try_fold_datatype_selector`] could not resolve a field index and
+    /// silently folded nothing on parsed SMT-LIB input. Populated by the
+    /// declaring layer; an absent constructor simply means no fold, never a
+    /// wrong one.
+    ///
+    /// Append-only for the store's lifetime and keyed by NAME, not `TermId`, so
+    /// it survives `rollback_to` and `mark_and_compact` the way `skolem_symbols`
+    /// does.
+    constructor_fields: KaniHashMap<String, Vec<String>>,
+    /// Every field sort of a declared datatype CARRIER, by carrier name: the
+    /// sort-level twin of `constructor_fields`, see `datatype_fields.rs`.
+    datatype_field_sorts: KaniHashMap<String, Vec<Sort>>,
+    /// Private core identities of user declarations, see
+    /// `declared_functions.rs`.
+    declared_functions: KaniHashSet<String>,
 }
 
 impl Clone for TermStore {
     fn clone(&self) -> Self {
         let cloned = Self {
+            store_role: self.store_role,
+            constructor_fields: self.constructor_fields.clone(),
+            datatype_field_sorts: self.datatype_field_sorts.clone(),
+            declared_functions: self.declared_functions.clone(),
             terms: self.terms.clone(),
             hash_cons: self.hash_cons.clone(),
             not_cache: self.not_cache.clone(),
@@ -357,6 +393,7 @@ impl Clone for TermStore {
             no_mbqi: self.no_mbqi.clone(),
             skolem_symbols: self.skolem_symbols.clone(),
             skolem_choice: self.skolem_choice.clone(),
+            divmod_purification: self.divmod_purification.clone(),
             synthesis_watermark: self.synthesis_watermark,
             quantifier_id: self.quantifier_id.clone(),
             skolem_id: self.skolem_id.clone(),
@@ -364,9 +401,9 @@ impl Clone for TermStore {
             quantifier_no_patterns: self.quantifier_no_patterns.clone(),
             rollback_identity: self.rollback_identity.clone(),
             rollback_generation: self.rollback_generation,
-            // A memo of completed checker work, not store content. Starting a
-            // clone empty is always correct: it only costs a re-validation.
-            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
+            // A memo of completed checker work, not store content: the copy
+            // keeps only the refusals (see `StrictBvSemanticsMemo::for_clone`).
+            strict_bv_semantics: self.strict_bv_semantics.for_clone(),
         };
 
         // A cloned store owns a second physical allocation and its Drop
@@ -521,6 +558,10 @@ impl TermStore {
     /// Create a new empty term store
     pub fn new() -> Self {
         let mut store = Self {
+            store_role: controlled_intern::StoreRole::Producer,
+            constructor_fields: KaniHashMap::default(),
+            datatype_field_sorts: KaniHashMap::default(),
+            declared_functions: KaniHashSet::default(),
             terms: Vec::new(),
             hash_cons: KaniHashMap::default(),
             not_cache: KaniHashMap::default(),
@@ -539,6 +580,7 @@ impl TermStore {
             no_mbqi: KaniHashSet::default(),
             skolem_symbols: KaniHashSet::default(),
             skolem_choice: KaniHashMap::default(),
+            divmod_purification: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
             skolem_id: KaniHashMap::default(),
@@ -546,7 +588,7 @@ impl TermStore {
             quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
-            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
+            strict_bv_semantics: strict_bv_memo::StrictBvSemanticsMemo::default(),
         };
         // Pre-create true and false
         store.true_term = Some(store.mk_bool(true));
@@ -562,44 +604,6 @@ impl TermStore {
         );
         store.false_term = Some(false_term);
         store
-    }
-
-    /// Kani-only constructor: creates an empty TermStore without pre-creating
-    /// true/false terms. Avoids the `mk_bool()` → `hash_cons.insert()` path
-    /// that triggers deep BTree symbolic exploration in CBMC (#6612).
-    ///
-    /// Only suitable for Kani proofs that test pointer/structural properties
-    /// without dereferencing term data.
-    #[cfg(kani)]
-    pub fn new_kani_minimal() -> Self {
-        Self {
-            terms: Vec::new(),
-            hash_cons: KaniHashMap::default(),
-            not_cache: KaniHashMap::default(),
-            var_counter: 0,
-            names: KaniHashMap::default(),
-            true_term: None,
-            false_term: None,
-            to_real_shadowed: false,
-            is_int_shadowed: false,
-            checker_visible_metadata_generation: 0,
-            instance_term_bytes: 0,
-            heap_data_bytes: 0,
-            bucket_capacity_bytes: 0,
-            true_memory_cache: std::cell::Cell::new(0),
-            true_memory_cache_at: std::cell::Cell::new(0),
-            no_mbqi: KaniHashSet::default(),
-            skolem_symbols: KaniHashSet::default(),
-            skolem_choice: KaniHashMap::default(),
-            synthesis_watermark: None,
-            quantifier_id: KaniHashMap::default(),
-            skolem_id: KaniHashMap::default(),
-            quantifier_weight: KaniHashMap::default(),
-            quantifier_no_patterns: KaniHashMap::default(),
-            rollback_identity: RollbackIdentity::new(),
-            rollback_generation: 0,
-            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
-        }
     }
 
     /// Mark a `Forall` term as "E-matching only" — excluded from MBQI/CEGQI
@@ -846,6 +850,13 @@ impl TermStore {
         self.terms.is_empty()
     }
 
+    /// Whether this arena permits producer mutation. This is a role check,
+    /// not source authentication or theorem/model authority.
+    #[must_use]
+    pub fn is_mutable_producer(&self) -> bool {
+        self.store_role == controlled_intern::StoreRole::Producer
+    }
+
     /// Capture the identity of the current immutable structural snapshot.
     ///
     /// Read-only caches may reuse data only while this stamp remains equal.
@@ -951,10 +962,10 @@ impl TermStore {
         let len = checkpoint.len;
         let keep = |id: &TermId| (id.0 as usize) < len;
         self.terms.truncate(len);
-        // Every memoized checker verdict is keyed by `TermId`; the suffix this
-        // truncation reclaims can be re-minted as entirely different terms, so
-        // the memo must not survive it.
-        self.strict_bv_semantics_ok.get_mut().clear();
+        // Checker verdicts are keyed by `TermId`; the reclaimed suffix can be
+        // re-minted as different terms. Acceptances go; refusals over ids
+        // below `len` (unchanged terms) stay, since they only ever reject.
+        self.strict_bv_semantics.truncate(len);
         for bucket in self.hash_cons.values_mut() {
             bucket.retain(|id| keep(id));
         }
@@ -971,6 +982,7 @@ impl TermStore {
         // rendering it would spell a term this store no longer holds.
         self.skolem_choice
             .retain(|k, choice| keep(k) && keep(&choice.body));
+        self.retain_divmod_purifications_below(len);
         if self.synthesis_watermark.is_some_and(|w| w > len) {
             self.synthesis_watermark = Some(len);
         }
@@ -1001,20 +1013,21 @@ impl TermStore {
         GLOBAL_TERM_BYTES.load(Ordering::Relaxed)
     }
 
-    /// Reset the global term memory counter.
+    /// Reset the process-wide live term memory counter.
     ///
-    /// Call this at the start of a new portfolio solve to avoid accumulating
-    /// counts from previous solves. Safe to call from any thread — the counter
-    /// is atomic.
+    /// Only use at a quiescent boundary with no live stores or concurrent term
+    /// allocation. Ordinary solves must not reset it: stores account their own
+    /// allocation, cloning and release, including across nested portfolios.
+    /// Atomic access does not make resetting another store's live bytes valid.
     pub fn reset_global_term_bytes() {
         GLOBAL_TERM_BYTES.store(0, Ordering::Relaxed);
     }
 
-    /// Set the number of active portfolio engines for per-engine budgeting.
+    /// Set the legacy process-wide divisor for [`Self::per_engine_budget`].
     ///
-    /// Call this from the portfolio coordinator before spawning engines.
-    /// The per-engine budget is `global_term_memory_limit / max(1, count)`.
-    /// Defaults to 1 if never called (single-engine mode).
+    /// Independent schedules must use [`Self::per_engine_budget_for`] instead
+    /// of overwriting another caller's divisor. This defaults to one and does
+    /// not reserve memory or count the actual number of live engines.
     pub fn set_engine_count(count: usize) {
         GLOBAL_ENGINE_COUNT.store(count.max(1), Ordering::Relaxed);
     }
@@ -1029,6 +1042,18 @@ impl TermStore {
         // Explicit zero guard (not `.max(1)`) so the divisor is locally
         // provably nonzero on the dividing path.
         match GLOBAL_ENGINE_COUNT.load(Ordering::Relaxed) {
+            0 => limit,
+            count => limit / count,
+        }
+    }
+
+    /// Divide one snapshot of the configured global term limit by a local
+    /// schedule's concurrency, without changing the legacy global divisor.
+    /// A zero worker count is treated as one. This is a term allocation share,
+    /// not a reservation or a process-wide RSS budget.
+    pub fn per_engine_budget_for(concurrent_engines: usize) -> usize {
+        let limit = GLOBAL_TERM_MEMORY_LIMIT.load(Ordering::Relaxed);
+        match concurrent_engines {
             0 => limit,
             count => limit / count,
         }
@@ -1087,33 +1112,6 @@ impl TermStore {
     pub fn false_term(&self) -> TermId {
         self.false_term
             .expect("TermStore: false_term accessed before initialization")
-    }
-
-    /// Whether `clause` is recorded as having PASSED the strict `bv_bitblast`
-    /// semantic decision procedure against this store.
-    ///
-    /// `true` means that procedure has already run TO COMPLETION on this exact
-    /// clause in this exact store and accepted it; see
-    /// `strict_bv_semantics_ok`. There is deliberately no way to record — or to
-    /// observe — a failure, so this can never be used to skip a check that has
-    /// not actually passed.
-    #[must_use]
-    pub fn strict_bv_semantics_validated(&self, clause: &[TermId]) -> bool {
-        self.strict_bv_semantics_ok.borrow().contains(clause)
-    }
-
-    /// Record that the strict `bv_bitblast` semantic decision procedure ran to
-    /// completion on `clause` and ACCEPTED it.
-    ///
-    /// Callers must only call this immediately after such a success.
-    pub fn record_strict_bv_semantics_validated(&self, clause: &[TermId]) {
-        let mut memo = self.strict_bv_semantics_ok.borrow_mut();
-        // Bounded so an untrusted proof cannot grow the memo without limit.
-        // Once full we simply stop memoizing and re-validate, as before.
-        if memo.len() >= MAX_STRICT_BV_SEMANTICS_MEMO {
-            return;
-        }
-        memo.insert(clause.to_vec());
     }
 
     /// Interning position of the preallocated `false` constant.
@@ -1226,15 +1224,32 @@ impl TermStore {
         false_term: Option<TermId>,
         var_counter: u32,
     ) -> Self {
-        let terms = entries
-            .into_iter()
-            .map(|(term, sort)| TermEntry {
+        let mut terms = Vec::with_capacity(entries.len());
+        for (term, sort) in entries {
+            let field_presence = finite_field::entry(&terms, &term, &sort);
+            terms.push(TermEntry {
                 term,
                 sort,
                 stamp: fresh_term_entry_stamp(),
-            })
-            .collect();
+                field_presence,
+            });
+        }
+        Self::from_snapshot_entries(terms, true_term, false_term, var_counter)
+    }
+
+    /// Shared initialization for positional, checker-only snapshots. This does
+    /// not authenticate the entries or restore producer-side metadata.
+    fn from_snapshot_entries(
+        terms: Vec<TermEntry>,
+        true_term: Option<TermId>,
+        false_term: Option<TermId>,
+        var_counter: u32,
+    ) -> Self {
         Self {
+            store_role: controlled_intern::StoreRole::ReadOnlySnapshot,
+            constructor_fields: KaniHashMap::default(),
+            datatype_field_sorts: KaniHashMap::default(),
+            declared_functions: KaniHashSet::default(),
             terms,
             hash_cons: KaniHashMap::default(),
             var_counter,
@@ -1255,6 +1270,7 @@ impl TermStore {
             no_mbqi: KaniHashSet::default(),
             skolem_symbols: KaniHashSet::default(),
             skolem_choice: KaniHashMap::default(),
+            divmod_purification: KaniHashMap::default(),
             synthesis_watermark: None,
             quantifier_id: KaniHashMap::default(),
             skolem_id: KaniHashMap::default(),
@@ -1262,7 +1278,7 @@ impl TermStore {
             quantifier_no_patterns: KaniHashMap::default(),
             rollback_identity: RollbackIdentity::new(),
             rollback_generation: 0,
-            strict_bv_semantics_ok: std::cell::RefCell::new(KaniHashSet::default()),
+            strict_bv_semantics: strict_bv_memo::StrictBvSemanticsMemo::default(),
         }
     }
 

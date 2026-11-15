@@ -11,13 +11,25 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{Sort, TermId, TermStore, TseitinState};
+use ay_core::{TermId, TseitinState};
 use ay_fp::FpEncodingCache;
 use ay_sat::Solver as SatSolver;
 
 use super::IncrementalSubsystem;
+use crate::executor_types::UnknownOrigin;
+
+#[path = "fp_state/admission.rs"]
+mod admission;
+#[path = "fp_state/namespace.rs"]
+mod namespace;
+#[path = "fp_state/ownership.rs"]
+mod ownership;
+#[cfg(test)]
+#[path = "fp_state/tests.rs"]
+mod tests;
 
 /// Result of observing the current authored assertion set for persistence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FpIncrementalAdmission {
     /// Every current FP-relevant root has an exact reusable identity.
     Admit,
@@ -108,6 +120,9 @@ pub(crate) struct IncrementalFpState {
     /// unsupported predicate). Always paired with a full teardown, so
     /// "disabled" means "behaves exactly as before this subsystem existed".
     pub(crate) disabled: bool,
+    /// A push could not reserve its selector namespace. Report once at the
+    /// next attempt even if pop or teardown makes the live frontier smaller.
+    pending_namespace_refusal: Option<UnknownOrigin>,
 }
 
 impl IncrementalFpState {
@@ -128,60 +143,8 @@ impl IncrementalFpState {
             fp_relevance_cache: Vec::new(),
             solves: 0,
             disabled: false,
+            pending_namespace_refusal: None,
         }
-    }
-
-    /// Keep Tseitin allocation clear of BOTH the scope selectors and the frozen
-    /// FP range. Run FIRST, before [`Self::sync_next_fp_var`] (#7031).
-    ///
-    /// Clause (a) must use `total_num_vars`, not `user_num_vars`: `Solver::push`
-    /// allocates a scope SELECTOR variable, and a Tseitin variable that collides
-    /// with a live selector is assumed `¬selector` and silently forced — a wrong
-    /// answer with no symptom.
-    ///
-    /// Clause (b) is the non-obvious one. Freezing `fp_var_offset` means the
-    /// Tseitin space stops being a contiguous prefix: variables allocated on a
-    /// later check-sat would land INSIDE the FP range. Afterwards the Tseitin
-    /// space is `[1 .. offset] ∪ [offset + next_fp_var .. )` (#7015 for BV).
-    pub(crate) fn sync_tseitin_next_var(&mut self) {
-        if let Some(ref sat) = self.persistent_sat {
-            let sat_total = sat.total_num_vars() as u32;
-            self.tseitin_state.next_var = self.tseitin_state.next_var.max(sat_total + 1);
-        }
-        if let Some(offset) = self.fp_var_offset {
-            let max_fp_sat_pos = (self.next_fp_var as i64 - 1) + offset as i64;
-            if max_fp_sat_pos >= 0 {
-                self.tseitin_state.next_var =
-                    self.tseitin_state.next_var.max(max_fp_sat_pos as u32 + 1);
-            }
-        }
-    }
-
-    /// Keep FP allocation clear of Tseitin variables and scope selectors. Run
-    /// SECOND — it reads the frontier the call above just advanced.
-    ///
-    /// BOTH bounds are the TIGHT form, not BV's looser `max(tseitin_next)` /
-    /// `max(sat_total + 1)`. Under `offset_cnf_lit(v, off) = v + off` an FP
-    /// variable `v` occupies SAT position `v + off`, so avoiding a collision
-    /// needs `v + off >= bound`, i.e. `v >= bound - off` — not `v >= bound`.
-    ///
-    /// The loose form is safe but not merely wasteful: it feeds back. It pushes
-    /// `next_fp_var` up to the Tseitin frontier, which the sync above then
-    /// pushes up to `offset + next_fp_var`, which pushes `next_fp_var` up
-    /// again — the SAT variable space grows by `offset` on EVERY check-sat, for
-    /// the whole session. With the tight form the pair reaches its fixed point
-    /// after one round (`tseitin_next == offset + next_fp_var`) and the space
-    /// grows only when the encoding actually grows.
-    pub(crate) fn sync_next_fp_var(&mut self) {
-        let offset = self.fp_var_offset.unwrap_or(0) as i64;
-        let above_tseitin = (self.tseitin_state.next_var as i64 - offset).max(1);
-        self.next_fp_var = self.next_fp_var.max(above_tseitin as u32);
-        if let Some(ref sat) = self.persistent_sat {
-            let sat_total = sat.total_num_vars() as i64;
-            let above_selectors = (sat_total - offset + 1).max(1);
-            self.next_fp_var = self.next_fp_var.max(above_selectors as u32);
-        }
-        self.fp_cache.next_var = self.fp_cache.next_var.max(self.next_fp_var);
     }
 
     /// Capture the assertions outside the first incremental scope.
@@ -195,106 +158,6 @@ impl IncrementalFpState {
         }
     }
 
-    /// Whether `root` transitively mentions an FP-sorted term.
-    ///
-    /// Iterative post-order keeps this safe for deep authored DAGs. The cache
-    /// makes a disjoint batch linear in newly seen terms across the session,
-    /// rather than re-walking shared prefixes at every check-sat.
-    fn term_mentions_fp(&mut self, terms: &TermStore, root: TermId) -> bool {
-        if let Some(relevant) = self.cached_fp_relevance(root) {
-            return relevant;
-        }
-
-        let mut stack = vec![(root, false)];
-        while let Some((term, expanded)) = stack.pop() {
-            if self.cached_fp_relevance(term).is_some() {
-                continue;
-            }
-            if matches!(terms.sort(term), Sort::FloatingPoint(..)) {
-                self.cache_fp_relevance(term, true);
-                continue;
-            }
-            let children = terms.children(term);
-            if expanded {
-                let relevant = children
-                    .iter()
-                    .any(|&child| self.cached_fp_relevance(child) == Some(true));
-                self.cache_fp_relevance(term, relevant);
-            } else {
-                stack.push((term, true));
-                stack.extend(children.into_iter().map(|child| (child, false)));
-            }
-        }
-        self.cached_fp_relevance(root) == Some(true)
-    }
-
-    fn cached_fp_relevance(&self, term: TermId) -> Option<bool> {
-        self.fp_relevance_cache
-            .get(term.0 as usize)
-            .copied()
-            .flatten()
-    }
-
-    fn cache_fp_relevance(&mut self, term: TermId, relevant: bool) {
-        let index = term.0 as usize;
-        if self.fp_relevance_cache.len() <= index {
-            self.fp_relevance_cache.resize(index + 1, None);
-        }
-        self.fp_relevance_cache[index] = Some(relevant);
-    }
-
-    fn fp_relevant_assertions(
-        &mut self,
-        terms: &TermStore,
-        assertions: &[TermId],
-    ) -> HashSet<TermId> {
-        assertions
-            .iter()
-            .copied()
-            .filter(|&term| self.term_mentions_fp(terms, term))
-            .collect()
-    }
-
-    /// Admit only when every current FP-relevant root was already observed.
-    ///
-    /// Roots may survive continuously or be popped and reasserted: immutable
-    /// `TermId` identity makes either reusable. Subsets/removals are therefore
-    /// admitted immediately. Any novel root tears an active SAT state down but
-    /// does not disable the lane: this query is the new full-set observation,
-    /// and an identical repeat may rebuild persistence on the next check.
-    pub(crate) fn observe_live_assertion_reuse(
-        &mut self,
-        terms: &TermStore,
-        assertions: &[TermId],
-    ) -> FpIncrementalAdmission {
-        let relevant = self.fp_relevant_assertions(terms, assertions);
-        if self.solves > 0 {
-            if !relevant.is_empty()
-                && relevant
-                    .iter()
-                    .all(|term| self.encoded_assertions.contains_key(term))
-            {
-                return FpIncrementalAdmission::Admit;
-            }
-            self.reset_sat_encoding_for_rebuild();
-            self.reuse_probe = Some(relevant);
-            return FpIncrementalAdmission::Defer;
-        }
-
-        let fully_observed = !relevant.is_empty()
-            && self
-                .reuse_probe
-                .as_ref()
-                .is_some_and(|previous| relevant.iter().all(|term| previous.contains(term)));
-        self.reuse_probe = Some(relevant);
-        if fully_observed {
-            self.reuse_probe = None;
-            FpIncrementalAdmission::Admit
-        } else {
-            FpIncrementalAdmission::Defer
-        }
-    }
-
     /// FULL teardown: drop the solver and every cache, keeping only the
     /// frontend scope depth so the next check-sat can rebuild the scope stack.
     ///
@@ -303,11 +166,9 @@ impl IncrementalFpState {
     /// Deliberately NOT the ordinary `pop()` path — see
     /// `IncrementalBvState::pop` for why scope retraction needs no teardown.
     ///
-    /// `FpSolver::reset` (`ay-fp`'s `TheorySolver` impl) is NOT usable here: it
-    /// restarts `next_var` at 1 while leaving `bool_input_lits`,
-    /// `to_bv_unspec_sites`, `ieee_nan_encodings` and `term_to_cnf` populated
-    /// with literals from the OLD numbering, aliasing every survivor onto a
-    /// fresh variable.
+    /// Resetting only the library FP solver is insufficient: the Tseitin,
+    /// activation and SAT owners must restart with the same namespace too.
+    /// A pending push refusal survives this internal teardown until consumed.
     pub(crate) fn reset_sat_encoding_for_rebuild(&mut self) {
         // Exhaustive destructure (no `..`): a newly added field that needs
         // clearing on reset is a COMPILE ERROR here rather than a stale literal
@@ -328,6 +189,7 @@ impl IncrementalFpState {
             fp_relevance_cache,
             solves,
             disabled: _,
+            pending_namespace_refusal: _,
         } = self;
         *pending_pushes = *scope_depth;
         *persistent_sat = None;
@@ -355,12 +217,7 @@ impl IncrementalFpState {
 
 impl IncrementalSubsystem for IncrementalFpState {
     fn push(&mut self) {
-        self.scope_depth += 1;
-        if let Some(ref mut sat) = self.persistent_sat {
-            sat.push();
-        } else {
-            self.pending_pushes += 1;
-        }
+        self.push_checked();
     }
 
     /// Retract one assertion scope without destroying any encoding.
@@ -400,5 +257,6 @@ impl IncrementalSubsystem for IncrementalFpState {
         // `drop` arm of `for_each_incremental_subsystem!` handles
         // `(reset-assertions)` by discarding the state entirely.)
         self.disabled = false;
+        self.pending_namespace_refusal = None;
     }
 }

@@ -160,6 +160,8 @@ impl TheorySolver for LraSolver {
         let mut stats = vec![
             ("lra_checks", self.stats.check_count),
             ("lra_conflicts", self.stats.conflict_count),
+            ("lra_conflict_lits_total", self.stats.conflict_lits_total),
+            ("lra_conflict_lits_max", self.stats.conflict_lits_max),
             ("lra_propagations", self.stats.propagation_count),
             ("lra_bcp_simplex_skips", self.stats.bcp_simplex_skips),
             (
@@ -167,6 +169,7 @@ impl TheorySolver for LraSolver {
                 self.stats.bcp_post_simplex_fast_skips,
             ),
             ("lra_assert_dirty_skips", self.stats.assert_dirty_skips),
+            ("lra_scope_push_flushes", self.stats.scope_push_flushes),
             (
                 "lra_propagate_implied_fresh_skips",
                 self.stats.propagate_implied_bounds_fresh_skips,
@@ -240,9 +243,19 @@ impl TheorySolver for LraSolver {
                 "lra_stale_conflict_rejected",
                 self.stats.stale_conflict_rejected_count,
             ),
+            (
+                "lra_unjustified_exports_refused",
+                self.stats.unjustified_exports_refused,
+            ),
             ("lra_simplex_sat", self.stats.simplex_sat_count),
             ("lra_snapshot_pivot_skips", self.stats.snapshot_pivot_skips),
             ("lra_total_pivots", self.stats.total_pivots),
+            // Tableau size and per-row precision lane counters (#8185), so a
+            // slow gate can be diagnosed from `-st` output instead of `sample`.
+            ("lra_rows", self.rows.len() as u64),
+            ("lra_precision_i64_rows", self.stats.precision_i64_rows),
+            ("lra_precision_i128_rows", self.stats.precision_i128_rows),
+            ("lra_precision_big_rows", self.stats.precision_big_rows),
             ("lra_full_check_pivots", self.stats.full_check_pivots),
             (
                 "lra_simplex_budget_exhaustions",
@@ -526,6 +539,10 @@ impl TheorySolver for LraSolver {
             ("lra_f64_rows_skipped", self.stats.f64_rows_skipped),
             ("lra_f64_vars_skipped", self.stats.f64_vars_skipped),
             (
+                "lra_implied_not_tighter_skips",
+                self.stats.implied_not_tighter_skips,
+            ),
+            (
                 "lra_max_outer_fixpoint_iters",
                 u64::from(self.stats.max_outer_fixpoint_iters),
             ),
@@ -690,11 +707,15 @@ impl TheorySolver for LraSolver {
         // `suggest_phase` is a pure function of `phase_hint_cache` (fast path)
         // and the feasible-value snapshot (fall back). Both are refreshed
         // together in `save_feasible_snapshot`, which bumps `phase_hint_epoch`
-        // exactly when it rebuilds the cache (and the snapshot), and skips the
-        // bump when no variable value changed. Cache clears on pop/reset also
-        // bump it. So a stable epoch guarantees identical suggestions, letting
-        // the SAT seeder skip an O(atoms) re-seed per BCP quiescence — the
-        // dominant in-solver cost on QF_LRA induction benchmarks.
+        // exactly when a cached suggestion changes (flip, first entry, or
+        // removal), when the registered-atom set grows, or when the cache is
+        // cleared on reset. A snapshot refresh that moves values without
+        // flipping any atom's phase leaves the epoch stable: every fallback
+        // atom over a changed variable is revisited by the rebuild, so its
+        // suggestion is covered by the same comparison. A stable epoch
+        // therefore guarantees identical suggestions, letting the SAT seeder
+        // skip an O(atoms) re-seed per BCP quiescence — the dominant
+        // in-solver cost on QF_LRA induction benchmarks.
         Some(self.phase_hint_epoch)
     }
 

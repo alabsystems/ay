@@ -10,6 +10,8 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 mod ite_regressions;
+mod materialization_diseq;
+mod recovery_bool_pins;
 
 fn run_script(input: &str) -> Vec<String> {
     let commands = parse(input).expect("SMT-LIB script should parse");

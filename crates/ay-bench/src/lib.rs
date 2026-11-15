@@ -9,6 +9,7 @@
 //! This crate provides the benchmarking runner and scoring engines.
 //! The binary entry point has moved to the unified ay CLI (`ay bench`).
 
+pub mod acceptance_inventory;
 pub mod campaign;
 pub mod chc_gate;
 pub mod cross_verify;

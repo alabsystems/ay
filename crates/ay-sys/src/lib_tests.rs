@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "lib_tests/memory_signals.rs"]
+mod memory_signals;
+
 // The three probes below assert a real figure only where a reader exists. Off
 // macOS/Linux the fallback legitimately returns 0, so the value is bound and
 // discarded rather than asserted — but the CALL still runs everywhere, which is
@@ -61,6 +64,24 @@ fn test_process_memory_limit_huge() {
     set_process_memory_limit(1024 * 1024 * 1024 * 1024); // 1 TB
     assert!(!process_memory_exceeded());
     set_process_memory_limit(old);
+}
+
+#[test]
+fn test_forced_predictive_memory_pressure_is_thread_local() {
+    // Only assertions that hold whatever the process-global limit is: sibling
+    // tests in this binary flip that limit concurrently.
+    force_process_memory_predictive_exceeded_for_testing(true);
+    assert!(process_memory_exceeded_at_percent(53));
+    let other_thread_forced =
+        std::thread::spawn(|| FORCE_PROCESS_MEMORY_PREDICTIVE_EXCEEDED.with(std::cell::Cell::get))
+            .join()
+            .expect("probe thread should not panic");
+    assert!(
+        !other_thread_forced,
+        "the forced state must not leak to other threads"
+    );
+    force_process_memory_predictive_exceeded_for_testing(false);
+    assert!(!FORCE_PROCESS_MEMORY_PREDICTIVE_EXCEEDED.with(std::cell::Cell::get));
 }
 
 #[test]
@@ -414,27 +435,46 @@ fn test_linux_cgroup_and_physical_memory_paths_no_panic() {
 // they avoid asserting an exact absolute value mid-flight to avoid coupling to
 // any background allocator activity.
 
-#[test]
-fn test_live_bytes_add_then_sub_round_trips() {
-    let base = current_live_bytes();
-    add_live_bytes(4096);
-    assert_eq!(current_live_bytes(), base + 4096);
-    sub_live_bytes(4096);
-    assert_eq!(current_live_bytes(), base);
+/// Serialises the tests that move or observe the process-global live-byte
+/// counter. They compare readings taken before and after their own changes,
+/// and a concurrent test's published change (a 1 MB over-subtraction, a batch
+/// published from another thread) would otherwise land between those reads.
+fn live_bytes_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[test]
-fn test_sub_live_bytes_saturates_at_zero() {
-    // Underflow must clamp at 0, never wrap to a huge value that would
-    // spuriously trip `process_memory_exceeded`.
-    let base = current_live_bytes();
-    // Drain whatever is there, then over-subtract.
+fn test_live_bytes_add_then_sub_round_trips() {
+    let _serial = live_bytes_test_lock();
+    // `exact_live_bytes` sums every stripe: a 4 KiB change stays pending on
+    // the stripe of whatever stack window this thread runs in.
+    let base = exact_live_bytes();
+    add_live_bytes(4096);
+    assert_eq!(exact_live_bytes(), base + 4096);
+    sub_live_bytes(4096);
+    assert_eq!(exact_live_bytes(), base);
+}
+
+#[test]
+fn test_over_release_reads_as_zero_and_keeps_its_debt() {
+    // A release larger than the count must read as 0, never wrap to a huge
+    // value that would spuriously trip `process_memory_exceeded`. The total
+    // keeps the debt, so the growth that pays it back is not counted twice.
+    let _serial = live_bytes_test_lock();
+    let base = exact_live_bytes();
+    // Drain whatever is there, then over-release.
     sub_live_bytes(base);
-    assert_eq!(current_live_bytes(), 0);
+    assert_eq!(exact_live_bytes(), 0);
     sub_live_bytes(1_000_000);
-    assert_eq!(current_live_bytes(), 0, "underflow must clamp to zero");
+    assert_eq!(current_live_bytes(), 0, "a debt must read as zero");
+    assert_eq!(exact_live_bytes(), 0, "a debt must read as zero");
+    add_live_bytes(1_000_000);
+    assert_eq!(exact_live_bytes(), 0, "growth pays the debt back first");
     // Restore the prior baseline for any concurrently-running tests.
     add_live_bytes(base);
+    assert_eq!(exact_live_bytes(), base);
 }
 
 #[test]
@@ -444,7 +484,7 @@ fn test_advisory_prefers_physical_footprint_over_live_bytes() {
     // capacity, measured ~20-25% above physical on the .xz giants
     // (live-bytes peak in (5700,6175] MB against a 4.79 GB physical settle),
     // which aborted runs the physical budget allowed. Burst detection is the
-    // hard ceiling's job (`add_live_bytes`), which keeps exact live bytes.
+    // hard ceiling's job (`add_live_bytes`), which counts a burst as it lands.
     let threshold = 950;
     assert!(
         memory_signals_exceed(threshold, 1000, 0, 0),

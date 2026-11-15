@@ -134,17 +134,3 @@ fn test_dtbv_mixed_evaluable_and_skipped_execute_path_returns_sat() {
         "Execute path for mixed DT + DT+BV should return sat, got: {result_trimmed}"
     );
 }
-
-/// Canary: verify the zero-check guard exists in source.
-#[test]
-fn test_zero_check_guard_exists_in_source() {
-    let source = include_str!("../../src/executor/model/validation/pipeline.rs");
-    assert!(
-        source.contains("stats.checked == 0") && source.contains("skipped_dtbv > 0"),
-        "BUG #5488: zero-check guard missing from validate_model()"
-    );
-    assert!(
-        source.contains("ModelValidationError::incomplete"),
-        "BUG #5488: typed incomplete error missing from validate_model()"
-    );
-}

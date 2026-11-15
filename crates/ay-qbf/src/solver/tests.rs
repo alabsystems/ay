@@ -151,37 +151,52 @@ fn test_matrix_literal_work_is_bounded_independently_of_nodes() {
     );
 }
 
+/// CNF value under a total assignment of 1-based variables; `None` if a
+/// literal names a variable outside the assignment.
+fn matrix_value(clauses: &[Vec<Literal>], assignment: &[bool]) -> Option<bool> {
+    for clause in clauses {
+        let mut satisfied = false;
+        for literal in clause {
+            let slot = (literal.variable().id() as usize).checked_sub(1)?;
+            if *assignment.get(slot)? == literal.is_positive() {
+                satisfied = true;
+                break;
+            }
+        }
+        if !satisfied {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Brute-force QBF value; `None` if a variable leaves the assignment or
+/// the mask's width.
+fn truth_value(
+    clauses: &[Vec<Literal>],
+    existential_mask: usize,
+    variable: usize,
+    assignment: &mut [bool],
+) -> Option<bool> {
+    if variable == assignment.len() {
+        return matrix_value(clauses, assignment);
+    }
+
+    let next = variable.checked_add(1)?;
+    let bit = 1usize.checked_shl(u32::try_from(variable).ok()?)?;
+    *assignment.get_mut(variable)? = false;
+    let when_false = truth_value(clauses, existential_mask, next, assignment)?;
+    *assignment.get_mut(variable)? = true;
+    let when_true = truth_value(clauses, existential_mask, next, assignment)?;
+    Some(if existential_mask & bit != 0 {
+        when_false || when_true
+    } else {
+        when_false && when_true
+    })
+}
+
 #[test]
-fn test_small_qbf_formulas_match_truth_table() {
-    fn matrix_value(clauses: &[Vec<Literal>], assignment: &[bool]) -> bool {
-        clauses.iter().all(|clause| {
-            clause.iter().any(|literal| {
-                assignment[literal.variable().id() as usize - 1] == literal.is_positive()
-            })
-        })
-    }
-
-    fn truth_value(
-        clauses: &[Vec<Literal>],
-        existential_mask: usize,
-        variable: usize,
-        assignment: &mut [bool],
-    ) -> bool {
-        if variable == assignment.len() {
-            return matrix_value(clauses, assignment);
-        }
-
-        assignment[variable] = false;
-        let when_false = truth_value(clauses, existential_mask, variable + 1, assignment);
-        assignment[variable] = true;
-        let when_true = truth_value(clauses, existential_mask, variable + 1, assignment);
-        if existential_mask & (1 << variable) != 0 {
-            when_false || when_true
-        } else {
-            when_false && when_true
-        }
-    }
-
+fn test_small_qbf_formulas_match_truth_table() -> Result<(), Box<dyn std::error::Error>> {
     for num_vars in 1usize..=3 {
         let mut clause_universe = Vec::new();
         for encoding in 1usize..3usize.pow(num_vars as u32) {
@@ -217,20 +232,24 @@ fn test_small_qbf_formulas_match_truth_table() {
         }
 
         for existential_mask in 0usize..1 << num_vars {
-            let prefix: Vec<_> = (0..num_vars)
-                .map(|index| {
-                    let variable = index as u32 + 1;
-                    if existential_mask & (1 << index) != 0 {
-                        QuantifierBlock::exists(vec![variable])
-                    } else {
-                        QuantifierBlock::forall(vec![variable])
-                    }
-                })
-                .collect();
+            let mut prefix = Vec::new();
+            for index in 0..num_vars {
+                let index = u32::try_from(index)?;
+                let variable = index.checked_add(1).ok_or("variable id overflows u32")?;
+                let bit = 1usize
+                    .checked_shl(index)
+                    .ok_or("variable index exceeds the mask width")?;
+                if existential_mask & bit != 0 {
+                    prefix.push(QuantifierBlock::exists(vec![variable]));
+                } else {
+                    prefix.push(QuantifierBlock::forall(vec![variable]));
+                }
+            }
 
             for clauses in &matrices {
                 let expected =
-                    truth_value(clauses, existential_mask, 0, &mut vec![false; num_vars]);
+                    truth_value(clauses, existential_mask, 0, &mut vec![false; num_vars])
+                        .ok_or("truth table named a variable outside the assignment")?;
                 let formula = QbfFormula::new(num_vars, prefix.clone(), clauses.clone());
                 let result = QbfSolver::new(formula).solve();
                 assert!(
@@ -244,6 +263,7 @@ fn test_small_qbf_formulas_match_truth_table() {
             }
         }
     }
+    Ok(())
 }
 
 #[test]

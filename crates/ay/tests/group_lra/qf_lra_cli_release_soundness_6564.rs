@@ -18,8 +18,10 @@ use std::process::Command;
 #[cfg(not(debug_assertions))]
 fn run_ay_file(path: &str) -> (std::process::ExitStatus, String, String) {
     let ay_path = env!("CARGO_BIN_EXE_ay");
+    // The mechanism counters are engine counters, which `--stats` has left to
+    // `--stats-full` since 58f2aaa13 curated it.
     let output = Command::new(ay_path)
-        .arg("--stats")
+        .arg("--stats-full")
         .arg(path)
         .output()
         .expect("failed to spawn ay");

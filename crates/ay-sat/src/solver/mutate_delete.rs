@@ -17,6 +17,12 @@ enum DeleteStopPolicy {
     RequiredCleanup,
 }
 
+#[derive(Clone, Copy)]
+enum ProofDeletePolicy {
+    Required,
+    OptionalCollection,
+}
+
 impl Solver {
     #[inline]
     fn materialize_delete_unit_proofs(&mut self, stop_policy: DeleteStopPolicy) -> bool {
@@ -247,7 +253,21 @@ impl Solver {
             clause_idx,
             reason_policy,
             DeleteStopPolicy::Interruptible,
+            ProofDeletePolicy::Required,
         )
+    }
+
+    /// Record a real retirement independently of optional proof-writer output.
+    pub(in crate::solver) fn record_clause_retirement(&mut self, clause_idx: usize) {
+        let id = self.clause_id(ClauseRef(clause_idx as u32));
+        if let Some(trace) = self
+            .cold
+            .clause_trace
+            .as_mut()
+            .filter(|trace| !trace.proof_work_exhausted())
+        {
+            trace.record_deletion(id, self.arena.literals(clause_idx));
+        }
     }
 
     fn delete_clause_observed_with_policy(
@@ -255,6 +275,7 @@ impl Solver {
         clause_idx: usize,
         reason_policy: ReasonPolicy,
         stop_policy: DeleteStopPolicy,
+        proof_policy: ProofDeletePolicy,
     ) -> bool {
         let clause_id = self.clause_id(ClauseRef(clause_idx as u32));
         // Fix #6270: re-derive unit proofs that reference this clause's ID
@@ -271,7 +292,7 @@ impl Solver {
         // Forward DRUP check + proof deletion via unified wrapper (#4564).
         // Uses arena-direct variant to avoid .to_vec() allocation (#5075).
         if self.cold.forward_checker.is_some() || self.proof_manager.is_some() {
-            let _ = self.proof_emit_delete_arena(clause_idx, clause_id);
+            let _ = self.emit_arena_proof_deletion(clause_idx, clause_id, proof_policy);
         }
         // SAT diagnostic trace: clause_delete event (Wave 2, #4211)
         // Derive DeleteReason from diagnostic_pass for specific attribution,
@@ -340,9 +361,24 @@ impl Solver {
             let lits = self.arena.literals(clause_idx);
             gc_occ.remove_clause(clause_idx, lits);
         }
+        self.record_clause_retirement(clause_idx);
         self.arena.delete(clause_idx);
         self.cold.clause_db_changes += 1; // BVE dual-signal fixpoint guard (#3416)
         true
+    }
+
+    fn emit_arena_proof_deletion(
+        &mut self,
+        clause_idx: usize,
+        clause_id: u64,
+        policy: ProofDeletePolicy,
+    ) -> std::io::Result<()> {
+        match policy {
+            ProofDeletePolicy::Required => self.proof_emit_delete_arena(clause_idx, clause_id),
+            ProofDeletePolicy::OptionalCollection => {
+                self.proof_emit_delete_arena_optional_gc(clause_idx, clause_id)
+            }
+        }
     }
 
     /// Delete a clause with uniform watch removal, reason protection, and proof logging.
@@ -362,6 +398,21 @@ impl Solver {
         )
     }
 
+    /// Only satisfied L0 garbage collection may retain a live ledger proof row.
+    pub(super) fn delete_clause_checked_optional_gc(
+        &mut self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+    ) -> DeleteResult {
+        self.delete_clause_checked_impl(
+            clause_idx,
+            reason_policy,
+            DeleteStopPolicy::Interruptible,
+            ProofDeletePolicy::OptionalCollection,
+            false,
+        )
+    }
+
     pub(super) fn delete_clause_checked_required_cleanup(
         &mut self,
         clause_idx: usize,
@@ -377,11 +428,43 @@ impl Solver {
         )
     }
 
+    /// `delete_clause_checked(clause_idx, ReasonPolicy::Skip)` for callers that
+    /// never read the reason marks themselves (vivification): the clause's
+    /// reason status is read from its own literals and the marks are left
+    /// alone, so a deletion costs O(clause length) instead of a walk of the
+    /// whole trail after every propagation.
+    pub(super) fn delete_clause_checked_skip_direct(&mut self, clause_idx: usize) -> DeleteResult {
+        self.delete_clause_checked_impl(
+            clause_idx,
+            ReasonPolicy::Skip,
+            DeleteStopPolicy::Interruptible,
+            ProofDeletePolicy::Required,
+            true,
+        )
+    }
+
     fn delete_clause_checked_with_policy(
         &mut self,
         clause_idx: usize,
         reason_policy: ReasonPolicy,
         stop_policy: DeleteStopPolicy,
+    ) -> DeleteResult {
+        self.delete_clause_checked_impl(
+            clause_idx,
+            reason_policy,
+            stop_policy,
+            ProofDeletePolicy::Required,
+            false,
+        )
+    }
+
+    fn delete_clause_checked_impl(
+        &mut self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+        stop_policy: DeleteStopPolicy,
+        proof_policy: ProofDeletePolicy,
+        direct_reason_check: bool,
     ) -> DeleteResult {
         // CaDiCaL clause.cpp: deletion only during inprocessing at level 0.
         // Soundness-critical: deleting at higher levels corrupts solver state (#4560).
@@ -390,8 +473,14 @@ impl Solver {
             "BUG: delete_clause_checked at decision level {}",
             self.decision_level,
         );
-        self.ensure_reason_clause_marks_current();
-        if !self.can_delete_clause(clause_idx, reason_policy) {
+        let is_reason = if direct_reason_check {
+            debug_assert!(matches!(reason_policy, ReasonPolicy::Skip));
+            self.is_reason_clause_direct(clause_idx)
+        } else {
+            self.ensure_reason_clause_marks_current();
+            self.is_reason_clause_marked(clause_idx)
+        };
+        if !self.can_delete_clause_given(clause_idx, reason_policy, is_reason) {
             return DeleteResult::Skipped;
         }
         if !self
@@ -402,7 +491,7 @@ impl Solver {
 
         match reason_policy {
             ReasonPolicy::Skip => {
-                if self.is_reason_clause_marked(clause_idx) {
+                if is_reason {
                     unreachable!(
                         "can_delete_clause rejected reason-protected clause with ReasonPolicy::Skip"
                     )
@@ -437,7 +526,7 @@ impl Solver {
                             let lit = self.arena.literal(clause_idx, i);
                             let vi = lit.variable().index();
                             if vi < self.num_vars
-                                && self.var_data[vi].reason == cref.0
+                                && self.var_data[vi].has_clause_reason(cref)
                                 && self.var_data[vi].level == 0
                                 && !self.lrat_delete_unit_derivation_hints_ready_for_clause(
                                     clause_idx, i, cid,
@@ -451,7 +540,7 @@ impl Solver {
                         let lit = self.arena.literal(clause_idx, i);
                         let vi = lit.variable().index();
                         if vi < self.num_vars
-                            && self.var_data[vi].reason == cref.0
+                            && self.var_data[vi].has_clause_reason(cref)
                             && self.var_data[vi].level == 0
                         {
                             // Minimal trail rewind (#8095): record the trail position
@@ -486,7 +575,7 @@ impl Solver {
                             if self.cold.lrat_enabled {
                                 self.pin_lrat_level0_unit_materialize_for_var(vi);
                             }
-                            self.var_data[vi].reason = NO_REASON;
+                            self.var_data[vi].clear_reason();
                             cleared_any_reason = true;
                         }
                     }
@@ -512,7 +601,7 @@ impl Solver {
                         let lit = self.arena.literal(clause_idx, i);
                         let vi = lit.variable().index();
                         if vi < self.num_vars
-                            && self.var_data[vi].reason == cref.0
+                            && self.var_data[vi].has_clause_reason(cref)
                             && self.var_data[vi].level != 0
                         {
                             self.stale_reasons.push(vi as u32);
@@ -520,8 +609,8 @@ impl Solver {
                     }
                 } else {
                     for vi in 0..self.num_vars {
-                        if self.var_data[vi].reason == cref.0 {
-                            self.var_data[vi].reason = NO_REASON;
+                        if self.var_data[vi].has_clause_reason(cref) {
+                            self.var_data[vi].clear_reason();
                             cleared_any_reason = true;
                         }
                     }
@@ -533,7 +622,7 @@ impl Solver {
                 if !self.watches_disconnected && !self.defer_stale_reason_cleanup {
                     for vi in 0..self.num_vars {
                         debug_assert!(
-                            self.var_data[vi].reason != cref.0,
+                            !self.var_data[vi].has_clause_reason(cref),
                             "BUG: var {vi} still references deleted clause {clause_idx} as reason \
                              after ClearLevel0 (level={}, assigned={})",
                             self.var_data[vi].level,
@@ -548,7 +637,12 @@ impl Solver {
             }
         }
 
-        if self.delete_clause_observed_with_policy(clause_idx, reason_policy, stop_policy) {
+        if self.delete_clause_observed_with_policy(
+            clause_idx,
+            reason_policy,
+            stop_policy,
+            proof_policy,
+        ) {
             DeleteResult::Deleted
         } else {
             DeleteResult::Skipped
@@ -638,7 +732,7 @@ impl Solver {
                                 let lit = self.arena.literal(*clause_idx, i);
                                 let vi = lit.variable().index();
                                 if vi < self.num_vars
-                                    && self.var_data[vi].reason == cref.0
+                                    && self.var_data[vi].has_clause_reason(cref)
                                     && self.var_data[vi].level == 0
                                     && !self.lrat_delete_unit_derivation_hints_ready_for_clause(
                                         *clause_idx,
@@ -654,7 +748,7 @@ impl Solver {
                             let lit = self.arena.literal(*clause_idx, i);
                             let vi = lit.variable().index();
                             if vi < self.num_vars
-                                && self.var_data[vi].reason == cref.0
+                                && self.var_data[vi].has_clause_reason(cref)
                                 && self.var_data[vi].level == 0
                             {
                                 // ClearLevel0 victims: preserve a checker-visible
@@ -682,7 +776,7 @@ impl Solver {
                                 // still live. This arm bypasses delete_clause_checked
                                 // entirely, so it needs its own call.
                                 self.proof_emit_level0_unit_for_lost_reason(lit);
-                                self.var_data[vi].reason = NO_REASON;
+                                self.var_data[vi].clear_reason();
                             }
                         }
                         // Incrementally unmark this clause as a reason (#8100).
@@ -715,6 +809,7 @@ impl Solver {
                     }
                     self.drain_pending_garbage_mark(*clause_idx);
                     self.stats.clear_bcp_learned_1963_blocker_cert(*clause_idx);
+                    self.record_clause_retirement(*clause_idx);
                     self.arena.delete(*clause_idx);
                 }
             }
@@ -797,6 +892,7 @@ impl Solver {
                     }
                     self.drain_pending_garbage_mark(*clause_idx);
                     self.stats.clear_bcp_learned_1963_blocker_cert(*clause_idx);
+                    self.record_clause_retirement(*clause_idx);
                     self.arena.replace(*clause_idx, new);
                     if let Some(ref mut gc_occ) = self.gc_occ {
                         gc_occ.add_clause(*clause_idx, new);

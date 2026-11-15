@@ -40,6 +40,7 @@
 //! with the optimum already in hand (exit 137, no `s` line at all), which is
 //! precisely the failure the governor bucket of the residual census is made of.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,7 +48,9 @@ use std::time::{Duration, Instant};
 use ay_pb_core::{PbExactSolution, PbInstance, PbObjective, PbSolution, PbStatus};
 
 use crate::portfolio::{self, PbPortfolioPhaseTimings};
-use crate::proof::{certify_opt_lin_any_interruptible, certify_reserve, OptLinCertRoute};
+use crate::proof::{
+    cert_debug_line, certify_opt_lin_any_interruptible, certify_reserve, OptLinCertRoute,
+};
 
 /// What [`run_opt_lin_cert_fallback`] concluded.
 ///
@@ -187,6 +190,31 @@ pub fn run_opt_lin_cert_fallback(
         );
         (result.solution, Some(result.timings))
     };
+    // PHASE ACCOUNTING for the certified fallback, `--cert-debug` only.
+    //
+    // The chain's per-rung trace starts when the chain starts, so everything
+    // BEFORE it — how much of the declared budget the fallback portfolio was
+    // handed, how much it used, and therefore how much is left for the rungs —
+    // was invisible. A miss whose rungs each report `slice=3333ms` says nothing
+    // about WHY the slice is 3.3 s; this line does.
+    if ay_core::misc_cli_flags().cert_debug {
+        cert_debug_line(format_args!(
+            "c [cert/phase] portfolio grant={} elapsed={}ms status={:?} obj={:?}; \
+             declared={} left-for-chain={}ms",
+            portfolio_timeout.map_or_else(
+                || "unbounded".to_string(),
+                |t| format!("{}ms", t.as_millis())
+            ),
+            start.elapsed().as_millis(),
+            portfolio_solution.status,
+            portfolio_solution.objective,
+            timeout_dur.map_or_else(
+                || "unbounded".to_string(),
+                |t| format!("{}ms", t.as_millis())
+            ),
+            timeout_dur.map_or(0, |t| t.saturating_sub(start.elapsed()).as_millis()),
+        ));
+    }
 
     // Unified stop predicate: deadline, outer termination, AND memory pressure.
     // See the module header for why the memory arm is in the shared spelling.
@@ -209,8 +237,38 @@ pub fn run_opt_lin_cert_fallback(
     // not rediscover it (`dim_054` at 5 s: `o 1512 s UNKNOWN` with `--proof`
     // against `s OPTIMUM FOUND` without). The widening helper re-verifies both
     // arms from raw bits and only ever CHOOSES a candidate; the verdict still
-    // has to clear `finalize_optimum_verdict`'s certified-floor gate and the
-    // certificate chain below.
+    // has to clear the certificate chain below.
+    //
+    // THE UPGRADE GATE NO LONGER DECIDES WHETHER THE CHAIN RUNS, and that is
+    // this block's whole point. `finalize_optimum_verdict` proves optimality
+    // from exactly TWO routes (`recovered_structural_search_floor` and
+    // `certified_objective_floor_interruptible`). The chain behind it has
+    // THIRTEEN. Returning `Declined` on the gate's verdict therefore skipped
+    // eleven routes because two of them failed — and it did so AFTER
+    // `certify_reserve` had already been taken out of the search, so the
+    // reserve was subtracted and then destroyed.
+    //
+    // MEASURED, delivery bucket, `ay pb solve --timeout 60000 --cert-debug`,
+    // one solve at a time, 18 instances: on 7 of them the chain emitted NOT ONE
+    // `c [cert/floor]` line — it was never entered — each with
+    // `left-for-chain` ~= 10,000 ms of the declared 60,000 ms unspent. Three of
+    // those 7 were holding an incumbent EQUAL to the instance's known optimum
+    // (`50-750-...-2000opt` -70, `comppebphp_...06` 28, `rande89f80` 2979398).
+    //
+    // WHY LETTING A MERELY-FEASIBLE CANDIDATE THROUGH IS SOUND. It is a
+    // CANDIDATE, exactly as the widening above is. Every rung independently
+    // re-verifies that the incumbent is complete and feasible and that it
+    // evaluates to the claimed value, and then DERIVES the matching lower bound
+    // itself — `lp_dual_floor` from an exact rational dual, `certified_bb` by
+    // closing a tree, the three `bounds_*` rungs by refuting
+    // {instance AND obj <= v-1}. A non-optimal `v` makes that augmented
+    // instance SATISFIABLE and every rung returns `None`. So no rung can emit
+    // `BOUNDS v <= obj <= v` for a `v` that is not the optimum, the status is
+    // upgraded only on the strength of a proof, and the pinned external checker
+    // re-checks that proof before any CERTIFIED claim is made. This is the same
+    // "certificate-backed SATISFIABLE becomes OPTIMUM, sound by construction"
+    // rule `finalize_optimum_verdict` already documents, applied to the whole
+    // route inventory instead of two of it.
     let candidate = if portfolio_solution.status == PbStatus::OptimumFound {
         portfolio_solution
     } else {
@@ -226,7 +284,13 @@ pub fn run_opt_lin_cert_fallback(
         );
         let upgraded =
             portfolio::finalize_optimum_verdict(widened, instance_ref, objective, &should_stop);
-        if upgraded.status != PbStatus::OptimumFound {
+        // A feasible candidate is still a candidate. Only a result with no
+        // incumbent at all has nothing for the chain to work from; the
+        // `objective`/width guards immediately below reject that case.
+        if !matches!(
+            upgraded.status,
+            PbStatus::OptimumFound | PbStatus::Satisfiable
+        ) {
             return OptLinCertFallback::Declined { timings };
         }
         upgraded
@@ -266,6 +330,39 @@ pub fn run_opt_lin_cert_fallback(
     }
 }
 
+/// NATIVE-PHASE ACCOUNTING, `--cert-debug` only: the `c [cert/phase]
+/// native-cdcl` line both frontends print after their proof-logging CDCL phase.
+///
+/// That phase is the one that writes to the proof file DIRECTLY, and unless it
+/// closes the optimality bound every one of those bytes is thrown away: the
+/// fallback above and the known-optimum commit both overwrite the temp path
+/// wholesale. How much wall and how many bytes that costs was unmeasurable from
+/// outside; this reports both. The frontends keep their own native phase (only
+/// the fallback is shared), so this line used to be spelled twice; it is
+/// spelled here once and both call it.
+///
+/// Diagnostics only: the proof file is measured only when the line is written.
+pub fn trace_native_cdcl_phase(
+    start: Instant,
+    solution: &PbSolution,
+    temp_proof_path: &Path,
+    deferred_lb: bool,
+) {
+    if !ay_core::misc_cli_flags().cert_debug {
+        return;
+    }
+    let discarded = std::fs::metadata(temp_proof_path).map_or(0, |m| m.len());
+    cert_debug_line(format_args!(
+        "c [cert/phase] native-cdcl elapsed={}ms status={:?} obj={:?} \
+         proof-bytes-so-far={} deferred-lb={}",
+        start.elapsed().as_millis(),
+        solution.status,
+        solution.objective,
+        discarded,
+        deferred_lb,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +391,45 @@ mod tests {
             "the certified fallback must not route to the first-proven-wins \
              coordinator: which optimal model comes back is decided by a race, \
              and the certificate embeds the model"
+        );
+    }
+
+    /// THE PROPERTY THAT LICENSES ADMITTING A MERELY-FEASIBLE CANDIDATE.
+    ///
+    /// The fallback used to return `Declined` whenever
+    /// `finalize_optimum_verdict` could not prove optimality from its two
+    /// routes, which skipped the eleven other rungs and destroyed the
+    /// `certify_reserve` it had already taken out of the search. It now hands
+    /// the chain a candidate the gate could not upgrade.
+    ///
+    /// That is only safe because NO RUNG WILL CERTIFY A VALUE THAT IS NOT THE
+    /// OPTIMUM. This test states that directly, on the smallest instance where
+    /// a feasible point is not optimal: `min: x1 + x2` subject to
+    /// `x1 + x2 >= 1` has optimum 1, and `x1 = x2 = true` is feasible at 2. If
+    /// this ever starts returning a proof, the widened admission above is
+    /// unsound and must be reverted with it — a `BOUNDS 2 <= obj <= 2` here
+    /// would be a wrong answer carrying a certificate.
+    #[test]
+    fn no_rung_certifies_a_feasible_incumbent_that_is_not_optimal() {
+        let opb = "* #variable= 2 #constraint= 1\n\
+                   min: 1 x1 1 x2 ;\n\
+                   1 x1 1 x2 >= 1 ;\n";
+        let instance = parse_opb(opb).expect("fixture parses");
+        let feasible_but_not_optimal = vec![true, true];
+        let got = certify_opt_lin_any_interruptible(
+            &instance,
+            &feasible_but_not_optimal,
+            2,
+            None,
+            &|| false,
+        );
+        assert!(
+            got.is_none(),
+            "a rung certified BOUNDS 2 <= obj <= 2 for an instance whose optimum \
+             is 1 (route {:?}); the whole chain must be fail-closed against a \
+             non-optimal claimed value, because that is what makes it safe to \
+             run it on a candidate the upgrade gate could not prove optimal",
+            got.map(|(_, route)| route.as_str())
         );
     }
 }

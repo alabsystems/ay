@@ -16,24 +16,61 @@
 //! [`TermId`] resolves), the boolean-constant ids, the variable counter, and the
 //! proof-authorized obligation term ids (so a consumer can bind the proof's
 //! `assume` axioms to the obligation it claims to discharge), and the datatype
-//! declaration context needed by the corresponding strict proof rules. The
+//! declaration context needed by the corresponding strict proof rules, and
+//! the complete registered user-function identity set. Namespace identities
+//! survive every owning copy and offline restore; their omission is an error,
+//! never a request to reinterpret a user head as a builtin. The
 //! obligation ids may be an authenticated UNSAT-core subset of the producer's
 //! full assertion list.
 //! Re-checking establishes that the bundle is internally sound; it does NOT
 //! authenticate the producer's claimed problem context. A consumer binding a
-//! schema-v3 bundle to an independently obtained problem must verify that every
+//! schema-v5 bundle to an independently obtained problem must verify that every
 //! obligation assertion is a member of the intended problem and compare
 //! `datatype_declarations`, `constructor_selectors`,
 //! `datatype_member_signatures`, and the complete free-symbol declaration
 //! context (exact named/indexed identity plus argument and result sorts).
 //! Canonical assertion text alone is
 //! insufficient: the same printed term can acquire different meaning from a
-//! different declaration environment. Schema v3 does not serialize a complete
+//! different declaration environment. Registered identities preserve builtin
+//! versus user meaning, but schema v5 does not serialize a complete
 //! arbitrary-function declaration table, so that final comparison remains a
 //! consumer responsibility.
 
+mod cancellation;
+mod construction;
+mod retained;
+mod retained_api;
+pub(crate) mod retained_reader;
+pub use cancellation::{
+    re_check_bundle_strict_with_cancellation, re_check_bundle_strict_with_resource_control,
+};
+pub use retained_api::{
+    capture_strict_retained_bundle_with_resource_control,
+    re_check_retained_bundle_strict_with_resource_control,
+    read_retained_proof_bundle_with_resource_control,
+    read_retained_proof_bundle_with_resource_control_and_diagnostics, RetainedProofBundle,
+    RetainedProofCapture, RetainedProofTransportLimits, RetainedReadDiagnostics,
+    RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal, RetainedReadStage,
+    RetainedReadTerminal, RETAINED_PROOF_BUNDLE_SCHEMA,
+};
+#[cfg(test)]
+mod nra_sos;
+mod preflight;
+mod preflight_app;
+mod preflight_canonical;
+mod preflight_declarations;
+mod preflight_proof;
+mod preflight_sort;
+mod preflight_term;
+#[cfg(test)]
+use preflight_proof::{validate_proof_snapshot, validate_proof_snapshot_with_progress};
+use preflight_sort::validate_sort_with_progress;
+#[cfg(test)]
+mod nra_sos_tests;
 #[cfg(test)]
 mod quantifier_tests;
+#[cfg(test)]
+mod snapshot_preflight_tests;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
@@ -43,16 +80,16 @@ use num_bigint::Sign;
 use serde::{Deserialize, Serialize};
 
 use crate::alethe_printer::AlethePrinter;
-use crate::{
-    check_proof_strict_with_typed_context, DatatypeMemberSignature, ProofCheckError, ProofQuality,
-};
+use crate::{DatatypeMemberSignature, ProofCheckError, ProofQuality};
+#[cfg(test)]
+use preflight_declarations::{validate_declaration_context, validate_declared_constructor_terms};
 
 /// Schema tag for [`SerializableProofBundle`]. The bundle is a compiled-Rust
 /// serde encoding tied to the exact `ay-core` proof/term representation that
 /// BOTH producer and consumer link — NOT a stable cross-version wire format.
 /// [`re_check_bundle_strict`] fail-closes on any other tag so a version skew is
 /// rejected rather than silently mis-decoded.
-pub const PROOF_BUNDLE_SCHEMA: &str = "ay.proofbundle/v3";
+pub const PROOF_BUNDLE_SCHEMA: &str = "ay.proofbundle/v5";
 
 /// A self-contained, serializable UNSAT proof: the proof DAG plus the minimal
 /// term table needed to re-check it offline (see module docs). "Self-contained"
@@ -88,16 +125,21 @@ pub struct SerializableProofBundle {
     /// Exact sticky core signatures for every constructor, selector, and
     /// derived tester named by the datatype declaration context.
     pub datatype_member_signatures: Vec<DatatypeMemberSignature>,
+    /// User-function core identities, including names that resemble builtins.
+    /// These are namespace data, not authentication of an external problem.
+    /// Missing metadata must never silently restore builtin interpretation.
+    pub declared_function_identities: Vec<String>,
 }
 /// Result of [`re_check_bundle_strict`]: the strict-check quality metrics plus
-/// the set of `assume` term ids the proof used as axioms.
+/// the `assume` term ids in proof-step order, including duplicate occurrences.
 #[derive(Debug, Clone)]
 pub struct BundleReCheck {
     /// Strict-mode quality metrics (the proof passed
-    /// [`check_proof_strict_with_typed_context`]).
+    /// [`check_proof_strict_with_typed_context`](crate::check_proof_strict_with_typed_context)).
     pub quality: ProofQuality,
-    /// The `TermId`s appearing in the proof's `Assume` steps — the axioms the
-    /// terminal empty clause was derived from.
+    /// Every `TermId` appearing in an `Assume` step, in proof-step order with
+    /// duplicates preserved. This is not restricted to the terminal clause's
+    /// dependency cone; unused assumptions are included too.
     pub assume_terms: Vec<TermId>,
 }
 
@@ -118,7 +160,7 @@ impl SerializableProofBundle {
 
     /// Assemble a compatibility bundle from name-only datatype context.
     ///
-    /// Under schema v3, name-only context carries no datatype-rule authority:
+    /// Under schema v5, name-only context carries no datatype-rule authority:
     /// offline re-checking rejects any non-empty datatype context that lacks its
     /// exact member-signature table. Use
     /// [`Self::from_proof_with_typed_context`] for datatype proofs.
@@ -140,7 +182,7 @@ impl SerializableProofBundle {
         )
     }
 
-    /// Assemble a schema-v3 bundle with an exact datatype-member signature
+    /// Assemble a schema-v5 bundle with an exact datatype-member signature
     /// table. The offline checker cross-checks this table against both name
     /// registries and every member occurrence in the serialized term store.
     #[must_use]
@@ -163,6 +205,10 @@ impl SerializableProofBundle {
             datatype_declarations,
             constructor_selectors,
             datatype_member_signatures,
+            declared_function_identities: terms
+                .declared_function_identities()
+                .map(str::to_owned)
+                .collect(),
         }
     }
 }
@@ -173,6 +219,7 @@ fn malformed_bundle(reason: impl Into<String>) -> ProofCheckError {
     }
 }
 
+#[cfg(test)]
 fn bundle_term<'a>(
     entries: &'a [(TermData, Sort)],
     id: TermId,
@@ -186,6 +233,7 @@ fn bundle_term<'a>(
     })
 }
 
+#[cfg(test)]
 fn bundle_bool_term(
     entries: &[(TermData, Sort)],
     id: TermId,
@@ -200,6 +248,7 @@ fn bundle_bool_term(
     Ok(())
 }
 
+#[cfg(test)]
 fn prior_child_sort<'a>(
     entries: &'a [(TermData, Sort)],
     node_index: usize,
@@ -216,89 +265,27 @@ fn prior_child_sort<'a>(
 
 const MAX_BUNDLE_SORT_DEPTH: usize = 256;
 const MAX_BUNDLE_BITVECTOR_WIDTH: u32 = 1 << 20;
-const MAX_BUNDLE_FP_EXPONENT_WIDTH: u32 = 31;
+// Metadata bound only: each semantic validator enforces its own arithmetic
+// limits (ground 20, forward-error 24, or metered word programs). Classification
+// now compares u64 fields directly, including a 64-bit all-ones exponent.
+const MAX_BUNDLE_FP_EXPONENT_WIDTH: u32 = 64;
 const MAX_BUNDLE_FP_SIGNIFICAND_WIDTH: u32 = MAX_BUNDLE_BITVECTOR_WIDTH;
 const MAX_BOUNDED_CHECKER_BV_WIDTH: u32 = 64;
 const MAX_FP_CHECKER_ASSIGNMENT_BITS: u32 = 16;
-const MAX_FP_CHECKER_EXPONENT_WIDTH: u32 = 16;
+// Classification compares decoded u64 fields, without exponent-sized rationals.
+const MAX_FP_CHECKER_EXPONENT_WIDTH: u32 = 64;
 
+#[cfg(test)]
 fn validate_sort(
     sort: &Sort,
     node_index: usize,
     role: &str,
     depth: usize,
 ) -> Result<(), ProofCheckError> {
-    if depth > MAX_BUNDLE_SORT_DEPTH {
-        return Err(malformed_bundle(format!(
-            "term t{node_index} {role} exceeds the maximum sort nesting depth"
-        )));
-    }
-    match sort {
-        Sort::Bool | Sort::Int | Sort::Real | Sort::String | Sort::RegLan | Sort::Char => Ok(()),
-        Sort::BitVec(bitvec)
-            if (1..=MAX_BUNDLE_BITVECTOR_WIDTH).contains(&bitvec.width) =>
-        {
-            Ok(())
-        }
-        Sort::BitVec(bitvec) => Err(malformed_bundle(format!(
-            "term t{node_index} {role} has invalid bit-vector width {}",
-            bitvec.width
-        ))),
-        Sort::Array(array) => {
-            validate_sort(&array.index_sort, node_index, "array index sort", depth + 1)?;
-            validate_sort(
-                &array.element_sort,
-                node_index,
-                "array element sort",
-                depth + 1,
-            )
-        }
-        Sort::FloatingPoint(exponent, significand)
-            if (2..=MAX_BUNDLE_FP_EXPONENT_WIDTH).contains(exponent)
-                && (2..=MAX_BUNDLE_FP_SIGNIFICAND_WIDTH).contains(significand) =>
-        {
-            Ok(())
-        }
-        Sort::FloatingPoint(exponent, significand) => Err(malformed_bundle(format!(
-            "term t{node_index} {role} has invalid floating-point format ({exponent}, {significand})"
-        ))),
-        Sort::Uninterpreted(_) | Sort::TypeVar(_) => Ok(()),
-        Sort::Datatype(datatype) => {
-            if datatype.name.is_empty() || datatype.constructors.is_empty() {
-                return Err(malformed_bundle(format!(
-                    "term t{node_index} {role} has an empty datatype name or constructor set"
-                )));
-            }
-            let mut constructors = HashSet::default();
-            for constructor in &datatype.constructors {
-                if constructor.name.is_empty() || !constructors.insert(constructor.name.as_str()) {
-                    return Err(malformed_bundle(format!(
-                        "term t{node_index} {role} has an empty or duplicate datatype constructor"
-                    )));
-                }
-                let mut fields = HashSet::default();
-                for field in &constructor.fields {
-                    if field.name.is_empty() || !fields.insert(field.name.as_str()) {
-                        return Err(malformed_bundle(format!(
-                            "term t{node_index} {role} has an empty or duplicate datatype field"
-                        )));
-                    }
-                    validate_sort(&field.sort, node_index, "datatype field sort", depth + 1)?;
-                }
-            }
-            Ok(())
-        }
-        Sort::Seq(element) => validate_sort(element, node_index, "sequence element sort", depth + 1),
-        Sort::FiniteDomain(_, size) if *size != 0 => Ok(()),
-        Sort::FiniteDomain(_, _) => Err(malformed_bundle(format!(
-            "term t{node_index} {role} has a zero-cardinality finite-domain sort"
-        ))),
-        _ => Err(malformed_bundle(format!(
-            "term t{node_index} {role} uses an unsupported sort variant"
-        ))),
-    }
+    validate_sort_with_progress(sort, node_index, role, depth, &mut |_, _| true)
 }
 
+#[cfg(test)]
 fn validate_constant_sort(
     node_index: usize,
     constant: &Constant,
@@ -307,11 +294,14 @@ fn validate_constant_sort(
     let sort_matches = match constant {
         Constant::Bool(_) => sort == &Sort::Bool,
         Constant::Int(_) => sort == &Sort::Int,
-        Constant::Rational(_) => sort == &Sort::Real,
+        Constant::Rational(value) => sort == &Sort::Real && value.0.denom().sign() != Sign::NoSign,
         Constant::BitVec { value, width } => {
             matches!(sort, Sort::BitVec(bitvec) if bitvec.width == *width)
                 && value.sign() != Sign::Minus
                 && value.bits() <= u64::from(*width)
+        }
+        Constant::FiniteField { value, field } => {
+            sort == &Sort::FiniteField(*field) && *value < field.modulus()
         }
         Constant::String(_) => sort == &Sort::String,
         _ => false,
@@ -324,6 +314,7 @@ fn validate_constant_sort(
     Ok(())
 }
 
+#[cfg(test)]
 fn app_signature_error(node_index: usize, reason: impl Into<String>) -> ProofCheckError {
     malformed_bundle(format!(
         "application term t{node_index} has invalid builtin signature: {}",
@@ -331,6 +322,7 @@ fn app_signature_error(node_index: usize, reason: impl Into<String>) -> ProofChe
     ))
 }
 
+#[cfg(test)]
 fn validate_named_app_signature(
     entries: &[(TermData, Sort)],
     node_index: usize,
@@ -581,6 +573,7 @@ fn validate_named_app_signature(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_indexed_bv_signature(
     entries: &[(TermData, Sort)],
     node_index: usize,
@@ -657,12 +650,14 @@ fn validate_indexed_bv_signature(
     Ok(true)
 }
 
+#[cfg(test)]
 fn requires_named_symbol(name: &str) -> bool {
     requires_named_core_or_bv_symbol(name)
         || requires_named_fp_symbol(name)
         || requires_named_string_or_regex_symbol(name)
 }
 
+#[cfg(test)]
 fn requires_named_core_or_bv_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -718,6 +713,7 @@ fn requires_named_core_or_bv_symbol(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn requires_named_fp_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -755,6 +751,7 @@ fn requires_named_fp_symbol(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn requires_named_string_or_regex_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -795,6 +792,7 @@ fn requires_named_string_or_regex_symbol(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn validate_app_signature(
     entries: &[(TermData, Sort)],
     node_index: usize,
@@ -807,7 +805,7 @@ fn validate_app_signature(
     // here. Validate the structural builtins and bounded-checker operations
     // whose malformed signatures could violate checker invariants;
     // declaration-backed datatype constructors are checked separately against
-    // the v3 context in `validate_declared_constructor_terms`.
+    // the v5 context in `validate_declared_constructor_terms`.
     match symbol {
         Symbol::Named(name) => {
             validate_named_app_signature(entries, node_index, name, args, result_sort)
@@ -844,7 +842,8 @@ fn validate_app_signature(
     }
 }
 
-fn validate_term_snapshot(entries: &[(TermData, Sort)]) -> Result<(), ProofCheckError> {
+#[cfg(test)]
+fn validate_term_snapshot_legacy(entries: &[(TermData, Sort)]) -> Result<(), ProofCheckError> {
     if entries.len() > u32::MAX as usize {
         return Err(malformed_bundle(format!(
             "term snapshot contains {} entries, exceeding TermId capacity",
@@ -854,11 +853,6 @@ fn validate_term_snapshot(entries: &[(TermData, Sort)]) -> Result<(), ProofCheck
 
     let mut canonical_entries = HashSet::default();
     for (node_index, (data, result_sort)) in entries.iter().enumerate() {
-        if !canonical_entries.insert((data, result_sort)) {
-            return Err(malformed_bundle(format!(
-                "term t{node_index} duplicates an earlier canonical term entry"
-            )));
-        }
         validate_sort(result_sort, node_index, "recorded sort", 0)?;
         match data {
             TermData::Const(constant) => {
@@ -943,10 +937,19 @@ fn validate_term_snapshot(entries: &[(TermData, Sort)]) -> Result<(), ProofCheck
                 )));
             }
         }
+        // Hash/Eq recurse through both the recorded sort and any quantifier
+        // binder sorts. Validate the COMPLETE entry first so those operations
+        // cannot traverse an unbounded or structurally malformed sort tree.
+        if !canonical_entries.insert((data, result_sort)) {
+            return Err(malformed_bundle(format!(
+                "term t{node_index} duplicates an earlier canonical term entry"
+            )));
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_bool_constant_id(
     entries: &[(TermData, Sort)],
     id: Option<TermId>,
@@ -963,247 +966,11 @@ fn validate_bool_constant_id(
     Ok(())
 }
 
-fn validate_premise(
-    premise: ProofId,
-    step_index: usize,
-    step_count: usize,
-    role: &str,
-) -> Result<(), ProofCheckError> {
-    let premise_index = premise.0 as usize;
-    if premise_index >= step_count {
-        return Err(malformed_bundle(format!(
-            "proof step t{step_index} {role} references missing proof step {premise}"
-        )));
-    }
-    if premise_index >= step_index {
-        return Err(malformed_bundle(format!(
-            "proof step t{step_index} {role} references non-prior proof step {premise}"
-        )));
-    }
-    Ok(())
-}
-
-fn push_term_children(data: &TermData, stack: &mut Vec<TermId>) {
-    match data {
-        TermData::App(_, args) => stack.extend(args.iter().copied()),
-        TermData::Let(bindings, body) => {
-            stack.extend(bindings.iter().map(|(_, value)| *value));
-            stack.push(*body);
-        }
-        TermData::Not(inner) => stack.push(*inner),
-        TermData::Ite(condition, then_branch, else_branch) => {
-            stack.extend([*condition, *then_branch, *else_branch]);
-        }
-        TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-            stack.push(*body);
-            stack.extend(triggers.iter().flatten().copied());
-        }
-        _ => {}
-    }
-}
-
-fn validate_bounded_bv_checker_safety(
-    entries: &[(TermData, Sort)],
-    step_index: usize,
-    clause: &[TermId],
-) -> Result<(), ProofCheckError> {
-    let mut seen = HashSet::default();
-    let mut stack = clause.to_vec();
-    while let Some(term) = stack.pop() {
-        if !seen.insert(term) {
-            continue;
-        }
-        let (data, sort) = &entries[term.index()];
-        if matches!(sort, Sort::BitVec(bitvec) if bitvec.width > MAX_BOUNDED_CHECKER_BV_WIDTH) {
-            return Err(malformed_bundle(format!(
-                "proof step t{step_index} reaches bit-vector term {term} wider than the bounded checker's {MAX_BOUNDED_CHECKER_BV_WIDTH}-bit evaluator"
-            )));
-        }
-        match data {
-            TermData::App(Symbol::Named(name), args)
-                if matches!(
-                    name.as_str(),
-                    "bvslt" | "bvsle" | "bvsgt" | "bvsge" | "bvsdiv" | "bvsrem" | "bvsmod"
-                ) =>
-            {
-                if matches!(
-                    &entries[args[0].index()].1,
-                    Sort::BitVec(bitvec) if bitvec.width >= u64::BITS
-                ) {
-                    return Err(malformed_bundle(format!(
-                        "proof step t{step_index} reaches a signed bit-vector operation at the bounded checker's unsafe 64-bit width"
-                    )));
-                }
-            }
-            TermData::App(Symbol::Indexed(name, _), args) if name == "repeat" => {
-                if matches!(
-                    &entries[args[0].index()].1,
-                    Sort::BitVec(bitvec) if bitvec.width >= u64::BITS
-                ) {
-                    return Err(malformed_bundle(format!(
-                        "proof step t{step_index} reaches `repeat` with an operand too wide for the bounded checker"
-                    )));
-                }
-            }
-            _ => {}
-        }
-        push_term_children(data, &mut stack);
-    }
-    Ok(())
-}
-
-fn validate_fp_checker_safety(
-    entries: &[(TermData, Sort)],
-    step_index: usize,
-    clause: &[TermId],
-) -> Result<(), ProofCheckError> {
-    let mut seen = HashSet::default();
-    let mut stack = clause.to_vec();
-    let mut assignment_bits = 0u32;
-    while let Some(term) = stack.pop() {
-        if !seen.insert(term) {
-            continue;
-        }
-        let (data, sort) = &entries[term.index()];
-        if let Sort::FloatingPoint(exponent, significand) = sort {
-            if *exponent > MAX_FP_CHECKER_EXPONENT_WIDTH {
-                return Err(malformed_bundle(format!(
-                    "proof step t{step_index} reaches floating-point term {term} with exponent width above the checker-safe limit {MAX_FP_CHECKER_EXPONENT_WIDTH}"
-                )));
-            }
-            if matches!(data, TermData::Var(_, _)) {
-                let width = exponent.checked_add(*significand).ok_or_else(|| {
-                    malformed_bundle(format!(
-                        "proof step t{step_index} overflows its floating-point assignment width"
-                    ))
-                })?;
-                assignment_bits = assignment_bits.checked_add(width).ok_or_else(|| {
-                    malformed_bundle(format!(
-                        "proof step t{step_index} overflows its floating-point assignment budget"
-                    ))
-                })?;
-                if assignment_bits > MAX_FP_CHECKER_ASSIGNMENT_BITS {
-                    return Err(malformed_bundle(format!(
-                        "proof step t{step_index} exceeds the bounded floating-point checker's {MAX_FP_CHECKER_ASSIGNMENT_BITS}-bit assignment budget"
-                    )));
-                }
-            }
-            if matches!(
-                data,
-                TermData::App(Symbol::Indexed(name, _), _) if name == "NaN" && *significand > 65
-            ) {
-                return Err(malformed_bundle(format!(
-                    "proof step t{step_index} reaches a NaN literal wider than the bounded checker's representation"
-                )));
-            }
-        }
-        push_term_children(data, &mut stack);
-    }
-    Ok(())
-}
-
-fn validate_proof_snapshot(
-    steps: &[ProofStep],
-    entries: &[(TermData, Sort)],
-) -> Result<(), ProofCheckError> {
-    if steps.len() > u32::MAX as usize {
-        return Err(malformed_bundle(format!(
-            "proof contains {} steps, exceeding ProofId capacity",
-            steps.len()
-        )));
-    }
-
-    for (step_index, step) in steps.iter().enumerate() {
-        match step {
-            ProofStep::Assume(term) => {
-                bundle_bool_term(
-                    entries,
-                    *term,
-                    &format!("proof step t{step_index} assumption"),
-                )?;
-            }
-            ProofStep::Resolution {
-                clause,
-                pivot,
-                clause1,
-                clause2,
-            } => {
-                for &literal in clause {
-                    bundle_bool_term(
-                        entries,
-                        literal,
-                        &format!("proof step t{step_index} resolution clause"),
-                    )?;
-                }
-                bundle_bool_term(
-                    entries,
-                    *pivot,
-                    &format!("proof step t{step_index} resolution pivot"),
-                )?;
-                validate_premise(*clause1, step_index, steps.len(), "first premise")?;
-                validate_premise(*clause2, step_index, steps.len(), "second premise")?;
-            }
-            ProofStep::TheoryLemma { clause, kind, .. } => {
-                for &literal in clause {
-                    bundle_bool_term(
-                        entries,
-                        literal,
-                        &format!("proof step t{step_index} theory clause"),
-                    )?;
-                }
-                if matches!(
-                    *kind,
-                    TheoryLemmaKind::BvBitBlast
-                        | TheoryLemmaKind::BvBitBlastGate { .. }
-                        | TheoryLemmaKind::BoolTautology
-                ) {
-                    validate_bounded_bv_checker_safety(entries, step_index, clause)?;
-                }
-                if matches!(*kind, TheoryLemmaKind::FpClassification { .. }) {
-                    validate_fp_checker_safety(entries, step_index, clause)?;
-                }
-            }
-            ProofStep::Step {
-                clause,
-                premises,
-                args,
-                ..
-            } => {
-                for &literal in clause {
-                    bundle_bool_term(
-                        entries,
-                        literal,
-                        &format!("proof step t{step_index} conclusion clause"),
-                    )?;
-                }
-                for &premise in premises {
-                    validate_premise(premise, step_index, steps.len(), "premise")?;
-                }
-                for &arg in args {
-                    bundle_term(entries, arg, &format!("proof step t{step_index} argument"))?;
-                }
-            }
-            ProofStep::Anchor { end_step, .. } => {
-                if end_step.0 as usize >= steps.len() {
-                    return Err(malformed_bundle(format!(
-                        "proof anchor t{step_index} references missing end step {end_step}"
-                    )));
-                }
-            }
-            _ => {
-                return Err(malformed_bundle(format!(
-                    "proof step t{step_index} uses an unsupported proof-step variant"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn preflight_bundle(
+#[cfg(test)]
+fn preflight_bundle_legacy(
     bundle: &SerializableProofBundle,
 ) -> Result<HashMap<String, &'static str>, ProofCheckError> {
-    validate_term_snapshot(&bundle.term_entries)?;
+    validate_term_snapshot_legacy(&bundle.term_entries)?;
     for (signature_index, signature) in bundle.datatype_member_signatures.iter().enumerate() {
         for (argument_index, sort) in signature.argument_sorts.iter().enumerate() {
             validate_sort(
@@ -1237,124 +1004,23 @@ fn preflight_bundle(
     Ok(declaration_term_symbols)
 }
 
-fn insert_declaration_term_symbol(
-    symbols: &mut HashMap<String, &'static str>,
-    name: &str,
-    role: &'static str,
-) -> Result<(), ProofCheckError> {
-    if let Some(prior_role) = symbols.insert(name.to_string(), role) {
-        return Err(malformed_bundle(format!(
-            "datatype declaration term symbol {name:?} is ambiguous: declared as both {prior_role} and {role}"
-        )));
-    }
-    Ok(())
+#[cfg(test)]
+fn validate_term_snapshot(entries: &[(TermData, Sort)]) -> Result<(), ProofCheckError> {
+    preflight_term::validate_term_snapshot_with_progress(entries, &mut |_, _| true)
 }
 
-/// Validate the serialized datatype context and return its complete term-level
-/// symbol namespace. Constructors (including nullary constructors), selectors,
-/// and the exact `is-<constructor>` tester names all occupy the namespace whose
-/// semantics the strict checker may recover from this context. Keeping the set
-/// here makes duplicate/cross-role declarations fail before any offline
-/// Skolem authority is restored.
-fn validate_declaration_context(
+#[cfg(test)]
+fn preflight_bundle(
     bundle: &SerializableProofBundle,
 ) -> Result<HashMap<String, &'static str>, ProofCheckError> {
-    let mut datatype_names = HashSet::default();
-    let mut constructor_names = HashSet::default();
-    let mut term_symbols: HashMap<String, &'static str> = HashMap::default();
-    for (datatype, constructors) in &bundle.datatype_declarations {
-        if datatype.is_empty() || !datatype_names.insert(datatype.clone()) {
-            return Err(malformed_bundle(format!(
-                "datatype declaration name {datatype:?} is empty or duplicated"
-            )));
-        }
-        if constructors.is_empty() {
-            return Err(malformed_bundle(format!(
-                "datatype {datatype:?} has no constructors"
-            )));
-        }
-        for constructor in constructors {
-            if constructor.is_empty() || !constructor_names.insert(constructor.clone()) {
-                return Err(malformed_bundle(format!(
-                    "constructor declaration name {constructor:?} is empty or duplicated"
-                )));
-            }
-            insert_declaration_term_symbol(&mut term_symbols, constructor, "a constructor")?;
-            let tester = format!("is-{constructor}");
-            insert_declaration_term_symbol(&mut term_symbols, &tester, "a derived tester")?;
-        }
-    }
-
-    let mut selector_entries = HashSet::default();
-    for (constructor, selectors) in &bundle.constructor_selectors {
-        if !constructor_names.contains(constructor) {
-            return Err(malformed_bundle(format!(
-                "selector declaration references unknown constructor {constructor:?}"
-            )));
-        }
-        if !selector_entries.insert(constructor.clone()) {
-            return Err(malformed_bundle(format!(
-                "selector declaration for constructor {constructor:?} is duplicated"
-            )));
-        }
-        for selector in selectors {
-            if selector.is_empty() {
-                return Err(malformed_bundle(format!(
-                    "selector name {selector:?} for constructor {constructor:?} is empty"
-                )));
-            }
-            insert_declaration_term_symbol(&mut term_symbols, selector, "a selector")?;
-        }
-    }
-    Ok(term_symbols)
-}
-
-fn validate_declared_constructor_terms(
-    bundle: &SerializableProofBundle,
-) -> Result<(), ProofCheckError> {
-    for (node_index, (data, sort)) in bundle.term_entries.iter().enumerate() {
-        let (name, arity) = match data {
-            TermData::Var(name, _) => (name.as_str(), 0),
-            TermData::App(Symbol::Named(name), args) => (name.as_str(), args.len()),
-            _ => continue,
-        };
-        let Some((datatype, _)) = bundle
-            .datatype_declarations
-            .iter()
-            .find(|(_, constructors)| constructors.iter().any(|constructor| constructor == name))
-        else {
-            continue;
-        };
-        let sort_matches = match sort {
-            Sort::Uninterpreted(carrier) => carrier == datatype,
-            Sort::Datatype(definition) => definition.name == datatype.as_str(),
-            _ => false,
-        };
-        if !sort_matches {
-            return Err(malformed_bundle(format!(
-                "declared constructor term t{node_index} `{name}` has a result sort outside datatype `{datatype}`"
-            )));
-        }
-        if let Some((_, selectors)) = bundle
-            .constructor_selectors
-            .iter()
-            .find(|(constructor, _)| constructor == name)
-        {
-            if arity != selectors.len() {
-                return Err(malformed_bundle(format!(
-                    "declared constructor term t{node_index} `{name}` has arity {arity}, expected {}",
-                    selectors.len()
-                )));
-            }
-        }
-    }
-    Ok(())
+    preflight::preflight_bundle_with_progress(bundle, &mut |_, _| true)
 }
 
 /// Re-check a serialized proof bundle OFFLINE — no solver, no access to the
 /// producer's term store. Rebuilds a checker-only [`TermStore`] from the
 /// snapshot and a [`Proof`] from the steps, then runs
-/// [`check_proof_strict_with_typed_context`] (which rejects trust/hole steps,
+/// [`check_proof_strict_with_typed_context`](crate::check_proof_strict_with_typed_context)
+/// (which rejects trust/hole steps,
 /// checks extensionality witnesses against `obligation_assertions`, validates
 /// the exact datatype member signatures, and requires the terminal empty
 /// clause). On success returns the strict quality and the proof's `assume` axiom
@@ -1362,73 +1028,13 @@ fn validate_declared_constructor_terms(
 ///
 /// Success authenticates only the bundle's internal proof/context pairing. It
 /// does not establish that its claimed assertions or declarations match an
-/// external source problem; see the module-level schema-v3 binding contract.
+/// external source problem; see the module-level schema-v5 binding contract.
 ///
 /// Fail-closed on a schema-tag mismatch (a version skew that could mis-decode).
 pub fn re_check_bundle_strict(
     bundle: &SerializableProofBundle,
 ) -> Result<BundleReCheck, ProofCheckError> {
-    if bundle.schema != PROOF_BUNDLE_SCHEMA {
-        return Err(ProofCheckError::BundleSchemaMismatch {
-            expected: PROOF_BUNDLE_SCHEMA.to_string(),
-            found: bundle.schema.clone(),
-        });
-    }
-    let declaration_term_symbols = preflight_bundle(bundle)?;
-    let mut terms = TermStore::from_entries(
-        bundle.term_entries.clone(),
-        bundle.true_term,
-        bundle.false_term,
-        bundle.var_counter,
-    );
-    let datatype_declarations = (!bundle.datatype_declarations.is_empty())
-        .then_some(bundle.datatype_declarations.as_slice());
-    let constructor_selectors = (!bundle.constructor_selectors.is_empty())
-        .then_some(bundle.constructor_selectors.as_slice());
-    // Typed declaration authority is established before restoring any
-    // certificate-derived Skolem metadata.  This keeps schema-v3 preflight
-    // fail-closed even when a malformed proof never reaches a datatype step.
-    crate::checker::validate_datatype_signature_context(
-        &terms,
-        datatype_declarations,
-        constructor_selectors,
-        &bundle.datatype_member_signatures,
-    )?;
-    let proof = Proof::from_steps(bundle.steps.clone());
-    // A checker-only TermStore intentionally starts with no producer-side
-    // Skolem registry. Reconstruct that authority from the certificate itself:
-    // exact substitution shape plus problem freshness, one-to-one bindings,
-    // separation from the authenticated datatype term namespace, unambiguous
-    // names, and an acyclic dependency graph. No serialized Skolem-name list
-    // is trusted.
-    for name in crate::checker::quantifier::authenticate_bundle_skolems(
-        &proof,
-        &terms,
-        &bundle.obligation_assertions,
-        &declaration_term_symbols,
-    )? {
-        terms.mark_skolem_symbol(name);
-    }
-    let quality = check_proof_strict_with_typed_context(
-        &proof,
-        &terms,
-        datatype_declarations,
-        constructor_selectors,
-        &bundle.datatype_member_signatures,
-        Some(&bundle.obligation_assertions),
-    )?;
-    let assume_terms = proof
-        .steps
-        .iter()
-        .filter_map(|s| match s {
-            ProofStep::Assume(t) => Some(*t),
-            _ => None,
-        })
-        .collect();
-    Ok(BundleReCheck {
-        quality,
-        assume_terms,
-    })
+    re_check_bundle_strict_with_cancellation(bundle, &mut || true)
 }
 
 /// Render a term to a canonical, STORE-INDEPENDENT S-expression string.
@@ -1439,7 +1045,7 @@ pub fn re_check_bundle_strict(
 /// against an independently-built one at the term level without sharing ids.
 /// The rendering omits datatype, selector, and arbitrary free-symbol
 /// declarations, so it is not by itself a secure external problem-binding key;
-/// compare the full schema-v3 context described in the module documentation.
+/// compare the full schema-v5 context described in the module documentation.
 #[must_use]
 pub fn render_term_canonical(terms: &TermStore, id: TermId) -> String {
     AlethePrinter::new(terms).format_term(id)
@@ -1868,6 +1474,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn namespace_identity_cannot_claim_an_authenticated_datatype_member() {
+        let mut bundle = typed_datatype_bundle();
+        assert!(re_check_bundle_strict(&bundle)
+            .unwrap()
+            .quality
+            .is_complete());
+        let identity = bundle.datatype_member_signatures[0].identity.clone();
+        bundle.declared_function_identities.push(identity);
+        assert!(matches!(
+            re_check_bundle_strict(&bundle),
+            Err(ProofCheckError::MalformedProofBundle { .. })
+        ));
+    }
+
     fn typed_datatype_bundle() -> SerializableProofBundle {
         let mut terms = TermStore::new();
         let carrier = Sort::Uninterpreted("BundleColor".to_string());
@@ -1927,7 +1548,7 @@ mod tests {
     #[test]
     fn schema_v3_bundle_rechecks_exact_datatype_signatures_and_rejects_forgery() {
         let bundle = typed_datatype_bundle();
-        re_check_bundle_strict(&bundle).expect("the exact schema-v3 datatype bundle rechecks");
+        re_check_bundle_strict(&bundle).expect("the exact schema-v5 datatype bundle rechecks");
 
         let mut forged = bundle.clone();
         forged.datatype_member_signatures[0].result_sort = Sort::Int;
@@ -2286,7 +1907,7 @@ mod tests {
             theory: "BV".to_string(),
             clause: vec![signed_comparison],
             farkas: None,
-            kind: TheoryLemmaKind::BvBitBlast,
+            kind: TheoryLemmaKind::BoolTautology,
             lia: None,
         });
         assert_malformed_bundle(&unsafe_signed, "unsafe 64-bit width");
@@ -2344,18 +1965,17 @@ mod tests {
         ));
         assert_malformed_bundle(&named, "must be an indexed symbol");
 
-        let mut wide = ArrayExtBundleFixture::new().bundle();
-        let nan = TermId::new(wide.term_entries.len() as u32);
-        wide.term_entries.push((
-            TermData::App(Symbol::indexed("NaN", vec![15, 113]), Vec::new()),
+        let mut terms = TermStore::new();
+        let nan = terms.mk_app(
+            Symbol::indexed("NaN", vec![15, 113]),
+            [],
             Sort::FloatingPoint(15, 113),
-        ));
-        let is_nan = TermId::new(wide.term_entries.len() as u32);
-        wide.term_entries.push((
-            TermData::App(Symbol::named("fp.isNaN"), vec![nan]),
-            Sort::Bool,
-        ));
-        wide.steps.push(ProofStep::TheoryLemma {
+        );
+        let is_nan = terms.mk_app(Symbol::named("fp.isNaN"), [nan], Sort::Bool);
+        let assumption = terms.mk_not_raw(is_nan);
+        let mut proof = Proof::new();
+        let assumed = proof.add_assume(assumption, None);
+        let lemma = proof.add_step(ProofStep::TheoryLemma {
             theory: "FP".to_string(),
             clause: vec![is_nan],
             farkas: None,
@@ -2364,7 +1984,9 @@ mod tests {
             },
             lia: None,
         });
-        assert_malformed_bundle(&wide, "NaN literal wider");
+        proof.add_resolution(Vec::new(), is_nan, assumed, lemma);
+        let wide = SerializableProofBundle::from_proof(&proof, &terms, vec![assumption]);
+        assert!(re_check_bundle_strict(&wide).unwrap().quality.is_complete());
     }
 
     /// Build a tiny UNSAT problem `x = 0 /\ x < 0` over the integers, prove it,
@@ -2424,6 +2046,7 @@ mod tests {
             datatype_declarations: Vec::new(),
             constructor_selectors: Vec::new(),
             datatype_member_signatures: Vec::new(),
+            declared_function_identities: Vec::new(),
         };
         assert!(
             matches!(
@@ -2434,3 +2057,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wide_bv_replay_tests;

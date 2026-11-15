@@ -41,10 +41,7 @@ macro_rules! pipeline_incremental_split_eager_arm {
         $(, max_string_lemma_requests: $max_slr:expr,
            handle_string_lemma: |$sl_lemma:ident, $sl_negations:ident| $sl_handler:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
         use ay_sat::{Literal as SatLiteral, SatResult, Solver as SatSolver, Variable as SatVariable};
@@ -140,8 +137,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
         // Local variable maps grow as splits are added
         let mut local_term_to_var: HashMap<TermId, u32> = base_term_to_var;
-        let mut local_next_var: u32 = u32::try_from(solver.user_num_vars() + solver.scope_depth())
-            .expect("SAT solver variable count does not fit in u32");
+        // Seed from the solver's TOTAL variable count, never
+        // `user_num_vars() + scope_depth()`: that sum omits the DEAD scope
+        // selectors a persistent solver accumulates across pop(), and handing
+        // one of those (forced TRUE at level 0) to a split atom produced a
+        // false UNSAT — see `split_incremental::fresh_sat_var_floor`.
+        let mut local_next_var: u32 =
+            $crate::executor::theories::split_incremental::fresh_sat_var_floor(&solver);
         let base_active_atom_set: HashSet<TermId> = base_active_atoms.iter().copied().collect();
         let mut _islp_added_split_clauses: HashSet<
             $crate::executor::theories::split_incremental::SplitClauseKey,
@@ -320,6 +322,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             }
         }
 
+        // Exact positive installation evidence for this current SAT scope.
+        // No historical state/cache entry is treated as an installed clause.
+        let mut _islp_installed_theory_lemmas: Vec<ay_core::TheoryLemma> = Vec::new();
         let _islp_result: $crate::executor_types::Result<SolveResult> = 'split_loop: {
             if _islp_scope_depth_unsupported {
                 tracing::warn!(
@@ -375,6 +380,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 state.round_trips += 1;
                 _islp_timing.dpll.round_trips += 1;
+                ay_core::resource::work().note_round_trip();
 
                 // #6846: non-convergence guard for non-persistent eager arm.
                 // #ssl-residue D1: reset the counter when the previous
@@ -504,11 +510,35 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         _islp_added_refinement_clauses, _islp_added_axioms,
                         _islp_eager_stats, _islp_timing, state,
                         should_stop: _islp_should_stop,
+                        installed_theory_lemmas: _islp_installed_theory_lemmas,
                         bound_axioms_pre_injected: _islp_ba_pre_injected,
                         bound_axiom_cache_key:
                             (_iteration == 0).then_some(_islp_ba_key)
                     );
                 ay_core::TheorySolver::set_search_phase(&mut theory, false);
+                // #split-walk-sat-fallback (eager parity with the lazy arm):
+                // a pending split the oscillation guard is about to answer
+                // `unknown` for gets the theory's SAT-only lane first. Only a
+                // Sat candidate can become a Sat-accept round; on success the
+                // pending split is dropped and the final check below re-asks
+                // the theory, whose fresh NeedSplit the same flag converts to
+                // Sat (the lane's verified witness is what extract_model
+                // reports, and the model gates still decide). Every other
+                // outcome reaches the guard unchanged.
+                let mut _islp_dive_witness_ready = false;
+                let pending_split = match pending_split {
+                    Some(ay_core::TheoryResult::NeedSplit(_islp_sp))
+                        if matches!(sat_result, SatResult::Sat(_))
+                            && $crate::executor::theories::solve_harness::split_oscillation_would_trigger(
+                                &_islp_last_split_values, _islp_sp.variable, &_islp_sp.value,
+                            )
+                            && ay_core::TheorySolver::try_sat_before_split_giveup(&mut theory) =>
+                    {
+                        _islp_dive_witness_ready = true;
+                        None
+                    }
+                    other => other,
+                };
                 // #8727: Reset the model-equality round counter whenever the
                 // SAT solver learned at least one theory-conflict clause in
                 // this iteration. The budget exists to prevent infinite
@@ -611,93 +641,74 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         }
                     }
                     Some(ay_core::TheoryResult::NeedLemmas(lemmas)) => {
-                        // #8594: Check if all lemma atoms are already encoded.
-                        // In the non-persistent eager arm, a fresh theory each
-                        // iteration may regenerate the same NeedLemmas that
-                        // were already added in prior iterations. When all
-                        // atoms are already mapped to SAT variables, the
-                        // clauses are redundant and re-solving will produce
-                        // the same model — continuing would loop until the
-                        // no-progress cap. Instead, fall through to accept
-                        $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager fallthrough-accept L508"));
-                        // the SAT model.
-                        let _nlm_all_known = lemmas.iter().all(|lemma| {
-                            lemma.clause.iter().all(|lit| {
-                                local_term_to_var.contains_key(&lit.term)
-                            })
-                        });
-                        if _nlm_all_known {
-                            // All atoms already encoded — skip redundant
-                            // re-add and fall through. Theory stays alive
-                            // for the SAT model handler's final check.
-                            None
-                        } else {
-                            pipeline_export_theory_state!(
-                                theory, $export_theory, $export_expr,
-                                _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
-                            );
-                            drop(theory);
-                            let mut _islp_lemma_original_ids = Vec::with_capacity(lemmas.len());
-                            for lemma in &lemmas {
-                                _islp_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
-                                    &$self.ctx.terms,
-                                    solver,
-                                    &mut local_term_to_var,
-                                    &mut local_var_to_term,
-                                    &mut local_next_var,
-                                    &mut _islp_negations,
-                                    &lemma.clause,
-                                ));
-                            }
-                            if proof_enabled {
-                                _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                // #trust->0 C3: DT registries, once per batch.
-                                let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
-                                for (lemma, _islp_original_id) in
-                                    lemmas.iter().zip(_islp_lemma_original_ids)
-                                {
-                                    let terms: Vec<ay_core::TermId> = lemma
-                                        .clause
-                                        .iter()
-                                        .map(|lit| {
-                                            if lit.value {
-                                                lit.term
-                                            } else {
-                                                *_islp_negations
-                                                    .as_map()
-                                                    .get(&lit.term)
-                                                    .expect("eager theory-lemma negation cache should be synced")
-                                            }
-                                        })
-                                        .collect();
-                                    // #trust->0 C3: funnel classifies + records;
-                                    // adopt its validator-ordered clause.
-                                    let (kind, terms) =
-                                        $crate::theory_inference::record_funnel_classified_lemma(
-                                            &mut $self.proof_tracker,
-                                            &$self.ctx.terms,
-                                            terms,
-                                            _c3_dt.as_ref(),
-                                        );
-                                    if let Some(_islp_original_id) = _islp_original_id {
-                                        $crate::pipeline_fns::place_original_clause_authority_at_id(
-                                            &solver,
-                                            _islp_original_id,
-                                            None,
-                                            Some(ay_core::TheoryLemmaProof {
-                                                clause: terms,
-                                                kind,
-                                                farkas: None,
-                                                lia: None,
-                                            }),
-                                            &mut _islp_local_clausification_proofs,
-                                            &mut _islp_local_original_clause_theory_proofs,
-                                        );
-                                    }
+                        // Encoded atoms do not establish installation of this
+                        // exact signed clause. Preserve ordinary add/proof handling.
+                        pipeline_export_theory_state!(
+                            theory, $export_theory, $export_expr,
+                            _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
+                        );
+                        drop(theory);
+                        let mut _islp_lemma_original_ids = Vec::with_capacity(lemmas.len());
+                        for lemma in &lemmas {
+                            _islp_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                &$self.ctx.terms,
+                                solver,
+                                &mut local_term_to_var,
+                                &mut local_var_to_term,
+                                &mut local_next_var,
+                                &mut _islp_negations,
+                                &lemma.clause,
+                            ));
+                        }
+                        if proof_enabled {
+                            _islp_negations.sync_pending(&mut $self.ctx.terms);
+                            // #trust->0 C3: DT registries, once per batch.
+                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                            for (lemma, _islp_original_id) in
+                                lemmas.iter().zip(_islp_lemma_original_ids)
+                            {
+                                let terms: Vec<ay_core::TermId> = lemma
+                                    .clause
+                                    .iter()
+                                    .map(|lit| {
+                                        if lit.value {
+                                            lit.term
+                                        } else {
+                                            *_islp_negations
+                                                .as_map()
+                                                .get(&lit.term)
+                                                .expect("eager theory-lemma negation cache should be synced")
+                                        }
+                                    })
+                                    .collect();
+                                // #trust->0 C3: funnel classifies + records;
+                                // adopt its validator-ordered clause.
+                                let (kind, terms) =
+                                    $crate::theory_inference::record_funnel_classified_lemma(
+                                        &mut $self.proof_tracker,
+                                        &$self.ctx.terms,
+                                        terms,
+                                        _c3_dt.as_ref(),
+                                    );
+                                if let Some(_islp_original_id) = _islp_original_id {
+                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                        &solver,
+                                        _islp_original_id,
+                                        None,
+                                        Some(ay_core::TheoryLemmaProof {
+                                            clause: terms,
+                                            kind,
+                                            farkas: None,
+                                            lia: None,
+                                        }),
+                                        &mut _islp_local_clausification_proofs,
+                                        &mut _islp_local_original_clause_theory_proofs,
+                                    );
                                 }
                             }
-                            continue;
                         }
+                        _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
+                        continue;
                     }
                     Some(ay_core::TheoryResult::NeedModelEquality(ref eq)) => {
                         // #8594: Pipeline-level dedup for model equality requests.
@@ -721,16 +732,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             );
                             drop(theory);
 
-                            // #8594: Only count a round if this equality atom is new.
+                            // #8594/#1145: a fresh atom replenishes the round budget;
+                            // only a dispatch with nothing new counts against it.
                             let _meq_atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                             let _meq_is_new = !local_term_to_var.contains_key(&_meq_atom);
                             if _meq_is_new {
-                                if _islp_model_eq_tracker.increment_round() {
+                                // Fresh equality atom: finite progress — replenish the
+                                // round budget instead of counting the dispatch (#1145).
+                                _islp_model_eq_tracker.note_new_equality();
+                            } else if _islp_model_eq_tracker.increment_round() {
                                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                     $self.last_result = Some(SolveResult::Unknown);
                                     $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L604"));
                                     break 'split_loop Ok(SolveResult::Unknown);
-                                }
                             }
 
                             // #8596: Skip triangle axioms for pure ArrayEUF.
@@ -777,18 +791,21 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             );
                             drop(theory);
 
-                            // #8594: Only count a round if at least one atom is new.
+                            // #8594/#1145: a fresh atom replenishes the round budget;
+                            // only a dispatch with nothing new counts against it.
                             let _meq_has_new = eqs.iter().any(|eq| {
                                 let atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                                 !local_term_to_var.contains_key(&atom)
                             });
                             if _meq_has_new {
-                                if _islp_model_eq_tracker.increment_round() {
+                                // Fresh equality atom: finite progress — replenish the
+                                // round budget instead of counting the dispatch (#1145).
+                                _islp_model_eq_tracker.note_new_equality();
+                            } else if _islp_model_eq_tracker.increment_round() {
                                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                     $self.last_result = Some(SolveResult::Unknown);
                                     $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L660"));
                                     break 'split_loop Ok(SolveResult::Unknown);
-                                }
                             }
 
                             for eq in eqs {
@@ -881,6 +898,27 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             && pending_split.is_none()
                         {
                             let _fc_result = ay_core::TheorySolver::check(&mut theory);
+                            let _fc_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                                &mut theory, _fc_result, &_islp_installed_theory_lemmas, &_islp_should_stop,
+                            );
+                            // #split-walk-sat-fallback: same giveup lane as the
+                            // pending-split transform above, for a NeedSplit
+                            // first produced by this final check. The flag
+                            // covers the witness already verified this round;
+                            // otherwise the lane runs now. Sat here only
+                            // reaches the unchanged model gates.
+                            let _fc_result = match _fc_result {
+                                ay_core::TheoryResult::NeedSplit(_islp_sp)
+                                    if _islp_dive_witness_ready
+                                        || ($crate::executor::theories::solve_harness::split_oscillation_would_trigger(
+                                                &_islp_last_split_values, _islp_sp.variable, &_islp_sp.value,
+                                            )
+                                            && ay_core::TheorySolver::try_sat_before_split_giveup(&mut theory)) =>
+                                {
+                                    ay_core::TheoryResult::Sat
+                                }
+                                other => other,
+                            };
                             match _fc_result {
                                 ay_core::TheoryResult::Sat => {
                                     // Full check passed — fall through to existing
@@ -930,16 +968,18 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         drop(theory);
-                                        // #8594: Only count round if atom is new.
+                                        // #8594/#1145: fresh atom replenishes; stale dispatch counts.
                                         let _meq_atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                                         let _meq_is_new = !local_term_to_var.contains_key(&_meq_atom);
                                         if _meq_is_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L765"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         // #8596: Skip triangle axioms for pure ArrayEUF.
                                         if _islp_skip_arith_triangle {
@@ -983,18 +1023,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         drop(theory);
-                                        // #8594: Only count round if at least one atom is new.
+                                        // #8594/#1145: fresh atom replenishes; stale dispatch counts.
                                         let _meq_has_new = eqs.iter().any(|eq| {
                                             let atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                                             !local_term_to_var.contains_key(&atom)
                                         });
                                         if _meq_has_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L818"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         for eq in eqs {
                                             // #8596: Skip triangle axioms for pure ArrayEUF.
@@ -1016,85 +1058,76 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager fallthrough-accept L849"));
                                 }
                                 ay_core::TheoryResult::NeedLemmas(lemmas) => {
-                                    // #8594: Check if all lemma atoms are already
-                                    // encoded. If so, the clauses are redundant
-                                    // duplicates from a fresh theory.
-                                    let _fc_nlm_all_known = lemmas.iter().all(|lemma| {
-                                        lemma.clause.iter().all(|lit| {
-                                            local_term_to_var.contains_key(&lit.term)
-                                        })
-                                    });
-                                    if !_fc_nlm_all_known {
-                                        // New atoms — replay into SAT solver and continue.
-                                        pipeline_export_theory_state!(
-                                            theory, $export_theory, $export_expr,
-                                            _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
-                                        );
-                                        drop(theory);
-                                        let mut _fc_lemma_original_ids = Vec::with_capacity(lemmas.len());
-                                        for lemma in &lemmas {
-                                            _fc_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
-                                                &$self.ctx.terms,
-                                                solver,
-                                                &mut local_term_to_var,
-                                                &mut local_var_to_term,
-                                                &mut local_next_var,
-                                                &mut _islp_negations,
-                                                &lemma.clause,
-                                            ));
-                                        }
-                                        if proof_enabled {
-                                            _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                            // #trust->0 C3: DT registries, once per batch.
-                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
-                                            for (lemma, _fc_original_id) in
-                                                lemmas.iter().zip(_fc_lemma_original_ids)
-                                            {
-                                                let terms: Vec<ay_core::TermId> = lemma
-                                                    .clause
-                                                    .iter()
-                                                    .map(|lit| {
-                                                        if lit.value {
-                                                            lit.term
-                                                        } else {
-                                                            *_islp_negations
-                                                                .as_map()
-                                                                .get(&lit.term)
-                                                                .expect("final-check theory-lemma negation cache should be synced")
-                                                        }
-                                                    })
-                                                    .collect();
-                                                // #trust->0 C3: funnel classifies +
-                                                // records; adopt its validator-ordered
-                                                // clause.
-                                                let (kind, terms) =
-                                                    $crate::theory_inference::record_funnel_classified_lemma(
-                                                        &mut $self.proof_tracker,
-                                                        &$self.ctx.terms,
-                                                        terms,
-                                                        _c3_dt.as_ref(),
-                                                    );
-                                                if let Some(_fc_original_id) = _fc_original_id {
-                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
-                                                        &solver,
-                                                        _fc_original_id,
-                                                        None,
-                                                        Some(ay_core::TheoryLemmaProof {
-                                                            clause: terms,
-                                                            kind,
-                                                            farkas: None,
-                                                            lia: None,
-                                                        }),
-                                                        &mut _islp_local_clausification_proofs,
-                                                        &mut _islp_local_original_clause_theory_proofs,
-                                                    );
-                                                }
+                                    // An encoded atom is not an installed clause.
+                                    // Unresolved exact clauses follow the actual add path.
+                                    pipeline_export_theory_state!(
+                                        theory, $export_theory, $export_expr,
+                                        _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
+                                    );
+                                    drop(theory);
+                                    let mut _fc_lemma_original_ids = Vec::with_capacity(lemmas.len());
+                                    for lemma in &lemmas {
+                                        _fc_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            &$self.ctx.terms,
+                                            solver,
+                                            &mut local_term_to_var,
+                                            &mut local_var_to_term,
+                                            &mut local_next_var,
+                                            &mut _islp_negations,
+                                            &lemma.clause,
+                                        ));
+                                    }
+                                    if proof_enabled {
+                                        _islp_negations.sync_pending(&mut $self.ctx.terms);
+                                        // #trust->0 C3: DT registries, once per batch.
+                                        let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                        for (lemma, _fc_original_id) in
+                                            lemmas.iter().zip(_fc_lemma_original_ids)
+                                        {
+                                            let terms: Vec<ay_core::TermId> = lemma
+                                                .clause
+                                                .iter()
+                                                .map(|lit| {
+                                                    if lit.value {
+                                                        lit.term
+                                                    } else {
+                                                        *_islp_negations
+                                                            .as_map()
+                                                            .get(&lit.term)
+                                                            .expect("final-check theory-lemma negation cache should be synced")
+                                                    }
+                                                })
+                                                .collect();
+                                            // #trust->0 C3: funnel classifies +
+                                            // records; adopt its validator-ordered
+                                            // clause.
+                                            let (kind, terms) =
+                                                $crate::theory_inference::record_funnel_classified_lemma(
+                                                    &mut $self.proof_tracker,
+                                                    &$self.ctx.terms,
+                                                    terms,
+                                                    _c3_dt.as_ref(),
+                                                );
+                                            if let Some(_fc_original_id) = _fc_original_id {
+                                                $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                    &solver,
+                                                    _fc_original_id,
+                                                    None,
+                                                    Some(ay_core::TheoryLemmaProof {
+                                                        clause: terms,
+                                                        kind,
+                                                        farkas: None,
+                                                        lia: None,
+                                                    }),
+                                                    &mut _islp_local_clausification_proofs,
+                                                    &mut _islp_local_original_clause_theory_proofs,
+                                                );
                                             }
                                         }
-                                        continue;
                                     }
-                                    // All atoms already known — fall through to
-                                    // accept model.
+                                    _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
+                                    continue;
+
                                 }
                                 _ => {
                                     // Unsat/UnsatWithFarkas/Unknown/NeedStringLemma:
@@ -1130,12 +1163,14 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         let _meq_atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                                         let _meq_is_new = !local_term_to_var.contains_key(&_meq_atom);
                                         if _meq_is_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L947"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         if _islp_skip_arith_triangle {
                                             pipeline_encode_model_equality!(
@@ -1181,12 +1216,14 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             !local_term_to_var.contains_key(&atom)
                                         });
                                         if _meq_has_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L996"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         for eq in eqs {
                                             if _islp_skip_arith_triangle {
@@ -1207,79 +1244,75 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager fallthrough-accept L1029"));
                                 }
                                 ay_core::TheoryResult::NeedLemmas(lemmas) => {
-                                    let _ps_nlm_all_known = lemmas.iter().all(|lemma| {
-                                        lemma.clause.iter().all(|lit| {
-                                            local_term_to_var.contains_key(&lit.term)
-                                        })
-                                    });
-                                    if !_ps_nlm_all_known {
-                                        pipeline_export_theory_state!(
-                                            theory, $export_theory, $export_expr,
-                                            _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
-                                        );
-                                        drop(theory);
-                                        let mut _ps_lemma_original_ids = Vec::with_capacity(lemmas.len());
-                                        for lemma in &lemmas {
-                                            _ps_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
-                                                &$self.ctx.terms,
-                                                solver,
-                                                &mut local_term_to_var,
-                                                &mut local_var_to_term,
-                                                &mut local_next_var,
-                                                &mut _islp_negations,
-                                                &lemma.clause,
-                                            ));
-                                        }
-                                        if proof_enabled {
-                                            _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                            // #trust->0 C3: DT registries, once per batch.
-                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
-                                            for (lemma, _ps_original_id) in
-                                                lemmas.iter().zip(_ps_lemma_original_ids)
-                                            {
-                                                let terms: Vec<ay_core::TermId> = lemma
-                                                    .clause
-                                                    .iter()
-                                                    .map(|lit| {
-                                                        if lit.value {
-                                                            lit.term
-                                                        } else {
-                                                            *_islp_negations
-                                                                .as_map()
-                                                                .get(&lit.term)
-                                                                .expect("pending-split theory-lemma negation cache should be synced")
-                                                        }
-                                                    })
-                                                    .collect();
-                                                // #trust->0 C3: funnel classifies +
-                                                // records; adopt its validator-ordered
-                                                // clause.
-                                                let (kind, terms) =
-                                                    $crate::theory_inference::record_funnel_classified_lemma(
-                                                        &mut $self.proof_tracker,
-                                                        &$self.ctx.terms,
-                                                        terms,
-                                                        _c3_dt.as_ref(),
-                                                    );
-                                                if let Some(_ps_original_id) = _ps_original_id {
-                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
-                                                        &solver,
-                                                        _ps_original_id,
-                                                        None,
-                                                        Some(ay_core::TheoryLemmaProof {
-                                                            clause: terms,
-                                                            kind,
-                                                            farkas: None,
-                                                            lia: None,
-                                                        }),
-                                                        &mut _islp_local_clausification_proofs,
-                                                        &mut _islp_local_original_clause_theory_proofs,
-                                                    );
-                                                }
+                                    // An encoded atom is not an installed clause.
+                                    pipeline_export_theory_state!(
+                                        theory, $export_theory, $export_expr,
+                                        _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
+                                    );
+                                    drop(theory);
+                                    let mut _ps_lemma_original_ids = Vec::with_capacity(lemmas.len());
+                                    for lemma in &lemmas {
+                                        _ps_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            &$self.ctx.terms,
+                                            solver,
+                                            &mut local_term_to_var,
+                                            &mut local_var_to_term,
+                                            &mut local_next_var,
+                                            &mut _islp_negations,
+                                            &lemma.clause,
+                                        ));
+                                    }
+                                    if proof_enabled {
+                                        _islp_negations.sync_pending(&mut $self.ctx.terms);
+                                        // #trust->0 C3: DT registries, once per batch.
+                                        let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                        for (lemma, _ps_original_id) in
+                                            lemmas.iter().zip(_ps_lemma_original_ids)
+                                        {
+                                            let terms: Vec<ay_core::TermId> = lemma
+                                                .clause
+                                                .iter()
+                                                .map(|lit| {
+                                                    if lit.value {
+                                                        lit.term
+                                                    } else {
+                                                        *_islp_negations
+                                                            .as_map()
+                                                            .get(&lit.term)
+                                                            .expect("pending-split theory-lemma negation cache should be synced")
+                                                    }
+                                                })
+                                                .collect();
+                                            // #trust->0 C3: funnel classifies +
+                                            // records; adopt its validator-ordered
+                                            // clause.
+                                            let (kind, terms) =
+                                                $crate::theory_inference::record_funnel_classified_lemma(
+                                                    &mut $self.proof_tracker,
+                                                    &$self.ctx.terms,
+                                                    terms,
+                                                    _c3_dt.as_ref(),
+                                                );
+                                            if let Some(_ps_original_id) = _ps_original_id {
+                                                $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                    &solver,
+                                                    _ps_original_id,
+                                                    None,
+                                                    Some(ay_core::TheoryLemmaProof {
+                                                        clause: terms,
+                                                        kind,
+                                                        farkas: None,
+                                                        lia: None,
+                                                    }),
+                                                    &mut _islp_local_clausification_proofs,
+                                                    &mut _islp_local_original_clause_theory_proofs,
+                                                );
                                             }
                                         }
-                                        continue;
                                     }
+                                    _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
+                                    continue;
+
                                     // All atoms already known — fall through to accept model.
                                     $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager fallthrough-accept L1096"));
                                 }
@@ -1560,12 +1593,14 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         let _meq_atom = $self.ctx.terms.mk_eq_coerce(eq.lhs, eq.rhs);
                                         let _meq_is_new = !local_term_to_var.contains_key(&_meq_atom);
                                         if _meq_is_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L1277"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         if _islp_skip_arith_triangle {
                                             pipeline_encode_model_equality!(
@@ -1610,12 +1645,14 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             !local_term_to_var.contains_key(&atom)
                                         });
                                         if _meq_has_new {
-                                            if _islp_model_eq_tracker.increment_round() {
+                                            // Fresh equality atom: finite progress — replenish the
+                                            // round budget instead of counting the dispatch (#1145).
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                                 $self.last_result = Some(SolveResult::Unknown);
                                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L1326"));
                                                 break 'split_loop Ok(SolveResult::Unknown);
-                                            }
                                         }
                                         for eq in eqs {
                                             if _islp_skip_arith_triangle {
@@ -1635,77 +1672,73 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     // All already requested — fall through to Unknown.
                                 }
                                 ay_core::TheoryResult::NeedLemmas(lemmas) => {
-                                    let _unk_nlm_all_known = lemmas.iter().all(|lemma| {
-                                        lemma.clause.iter().all(|lit| {
-                                            local_term_to_var.contains_key(&lit.term)
-                                        })
-                                    });
-                                    if !_unk_nlm_all_known {
-                                        pipeline_export_theory_state!(
-                                            theory, $export_theory, $export_expr,
-                                            _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
-                                        );
-                                        drop(theory);
-                                        let mut _unk_lemma_original_ids = Vec::with_capacity(lemmas.len());
-                                        for lemma in &lemmas {
-                                            _unk_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
-                                                &$self.ctx.terms,
-                                                solver,
-                                                &mut local_term_to_var,
-                                                &mut local_var_to_term,
-                                                &mut local_next_var,
-                                                &mut _islp_negations,
-                                                &lemma.clause,
-                                            ));
-                                        }
-                                        if proof_enabled {
-                                            _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
-                                            for (lemma, _unk_original_id) in
-                                                lemmas.iter().zip(_unk_lemma_original_ids)
-                                            {
-                                                let terms: Vec<ay_core::TermId> = lemma
-                                                    .clause
-                                                    .iter()
-                                                    .map(|lit| {
-                                                        if lit.value {
-                                                            lit.term
-                                                        } else {
-                                                            *_islp_negations
-                                                                .as_map()
-                                                                .get(&lit.term)
-                                                                .expect("unknown-recovery theory-lemma negation cache should be synced")
-                                                        }
-                                                    })
-                                                    .collect();
-                                                let (kind, terms) =
-                                                    $crate::theory_inference::record_funnel_classified_lemma(
-                                                        &mut $self.proof_tracker,
-                                                        &$self.ctx.terms,
-                                                        terms,
-                                                        _c3_dt.as_ref(),
-                                                    );
-                                                if let Some(_unk_original_id) = _unk_original_id {
-                                                    if !matches!(kind, ay_core::TheoryLemmaKind::Generic) {
-                                                        $crate::pipeline_fns::place_original_clause_authority_at_id(
-                                                            &solver,
-                                                            _unk_original_id,
-                                                            None,
-                                                            Some(ay_core::TheoryLemmaProof {
-                                                                clause: terms,
-                                                                kind,
-                                                                farkas: None,
-                                                                lia: None,
-                                                            }),
-                                                            &mut _islp_local_clausification_proofs,
-                                                            &mut _islp_local_original_clause_theory_proofs,
-                                                        );
+                                    // An encoded atom is not an installed clause.
+                                    pipeline_export_theory_state!(
+                                        theory, $export_theory, $export_expr,
+                                        _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
+                                    );
+                                    drop(theory);
+                                    let mut _unk_lemma_original_ids = Vec::with_capacity(lemmas.len());
+                                    for lemma in &lemmas {
+                                        _unk_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            &$self.ctx.terms,
+                                            solver,
+                                            &mut local_term_to_var,
+                                            &mut local_var_to_term,
+                                            &mut local_next_var,
+                                            &mut _islp_negations,
+                                            &lemma.clause,
+                                        ));
+                                    }
+                                    if proof_enabled {
+                                        _islp_negations.sync_pending(&mut $self.ctx.terms);
+                                        let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                        for (lemma, _unk_original_id) in
+                                            lemmas.iter().zip(_unk_lemma_original_ids)
+                                        {
+                                            let terms: Vec<ay_core::TermId> = lemma
+                                                .clause
+                                                .iter()
+                                                .map(|lit| {
+                                                    if lit.value {
+                                                        lit.term
+                                                    } else {
+                                                        *_islp_negations
+                                                            .as_map()
+                                                            .get(&lit.term)
+                                                            .expect("unknown-recovery theory-lemma negation cache should be synced")
                                                     }
+                                                })
+                                                .collect();
+                                            let (kind, terms) =
+                                                $crate::theory_inference::record_funnel_classified_lemma(
+                                                    &mut $self.proof_tracker,
+                                                    &$self.ctx.terms,
+                                                    terms,
+                                                    _c3_dt.as_ref(),
+                                                );
+                                            if let Some(_unk_original_id) = _unk_original_id {
+                                                if !matches!(kind, ay_core::TheoryLemmaKind::Generic) {
+                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                        &solver,
+                                                        _unk_original_id,
+                                                        None,
+                                                        Some(ay_core::TheoryLemmaProof {
+                                                            clause: terms,
+                                                            kind,
+                                                            farkas: None,
+                                                            lia: None,
+                                                        }),
+                                                        &mut _islp_local_clausification_proofs,
+                                                        &mut _islp_local_original_clause_theory_proofs,
+                                                    );
                                                 }
                                             }
                                         }
-                                        continue;
                                     }
+                                    _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
+                                    continue;
+
                                     // All atoms already known — fall through to Unknown.
                                 }
                                 _ => {

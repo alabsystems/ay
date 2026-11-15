@@ -1,0 +1,18 @@
+; Same source, but the saved first occurrence no longer matches its query pin.
+; Recomputing an artifact digest cannot make this pinned assignment valid.
+(set-logic BV)
+(set-info :status unsat)
+(declare-const fact0 (_ BitVec 2))
+(declare-const fact1 (_ BitVec 2))
+(declare-const query0 (_ BitVec 2))
+(declare-const query1 (_ BitVec 2))
+(assert (forall ((i (_ BitVec 2))) (= fact0 fact0)))
+(assert (forall ((i (_ BitVec 2))) (= fact1 fact1)))
+(assert (= query0 fact0))
+(assert (= query1 fact1))
+(assert (distinct query0 query1))
+(assert (= fact0 (_ bv1 2)))
+(assert (= fact1 (_ bv1 2)))
+(assert (= query0 (_ bv0 2)))
+(assert (= query1 (_ bv1 2)))
+(check-sat)

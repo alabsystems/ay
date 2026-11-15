@@ -22,6 +22,16 @@ impl PdrSolver {
     }
 
     /// Build counterexample from proof obligation chain
+    ///
+    /// `pob` is the chain's leaf (it reached an initial state at level 0) and
+    /// its parents lead to the root (the bad state). The derivation witness is
+    /// laid out ROOT FIRST (`root: 0`, entry `i + 1` is entry `i`'s chain
+    /// premise), while `steps` run leaf first, i.e. initial state -> ... -> bad
+    /// state as [`Counterexample::steps`] documents. Each step carries the
+    /// query model of the clause that derived it (`incoming_clause`). Listing
+    /// the steps root first made the exported trace-validity obligation pin the
+    /// root's values at time 0 (refuted by `init`) and the certificate trace
+    /// read bad -> init.
     pub(in crate::pdr::solver) fn build_cex(&self, pob: &ProofObligation) -> Counterexample {
         let mut chain: Vec<&ProofObligation> = Vec::new();
 
@@ -32,11 +42,12 @@ impl PdrSolver {
             current = p.parent.as_deref();
         }
 
-        // Convert to init -> bad order
+        // Root first, the witness layout; `steps` read it back leaf first.
         chain.reverse();
 
         let steps: Vec<CounterexampleStep> = chain
             .iter()
+            .rev()
             .map(|p| {
                 // Extract integer assignments from SMT model
                 let assignments = if let Some(ref model) = p.smt_model {
@@ -210,58 +221,11 @@ impl PdrSolver {
             }
         }
 
-        // Third pass: wire up premises
-        // Using explicit index because we need mutable access to entries[i] and also
-        // reference i + 1 for fallback linking.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..entries.len() {
-            let entry = &entries[i];
-            let is_init = entry.level == 0
-                && entry
-                    .incoming_clause
-                    .and_then(|idx| self.problem.clauses().get(idx))
-                    .is_some_and(|c| c.body.predicates.is_empty());
-
-            if is_init {
-                // Fact clause: no premises
-                continue;
-            }
-
-            if let Some(clause_idx) = entry.incoming_clause {
-                if let Some(clause) = self.problem.clauses().get(clause_idx) {
-                    let prev_level = if entry.level > 0 { entry.level - 1 } else { 0 };
-                    let mut premises = Vec::new();
-                    for (body_pred, _) in &clause.body.predicates {
-                        if let Some(&premise_idx) =
-                            pred_level_to_entry.get(&(*body_pred, prev_level))
-                        {
-                            premises.push(premise_idx);
-                        }
-                    }
-                    // Only set premises if we found all of them
-                    if premises.len() == clause.body.predicates.len() {
-                        // SAFETY: we're modifying entries[i] which we already read from
-                        let entry_mut = &mut entries[i];
-                        entry_mut.premises = premises;
-                    } else if !clause.body.predicates.is_empty() {
-                        // Fallback: point to next entry in chain (original linear behavior)
-                        let entry_mut = &mut entries[i];
-                        if i + 1 < chain_len {
-                            entry_mut.premises = vec![i + 1];
-                        }
-                    }
-                }
-            } else {
-                // No incoming clause: point to next entry in chain if available
-                if i + 1 < chain_len {
-                    entries[i].premises = vec![i + 1];
-                }
-            }
-        }
+        // Third pass: wire up premises.
+        self.wire_witness_premises(&mut entries, chain_len, &pred_level_to_entry);
 
         let witness = DerivationWitness {
-            // query_clause is set on the ROOT of the obligation chain (highest level).
-            // The chain was built leaf→root, then reversed. After reverse, root is first.
+            // query_clause is set on the chain ROOT (highest level), which is first.
             query_clause: chain.first().and_then(|p| p.query_clause),
             root: 0,
             entries,
@@ -270,7 +234,76 @@ impl PdrSolver {
         Counterexample {
             steps,
             witness: Some(witness),
+            compact_derivation: None,
             ground_derivation: None,
+        }
+    }
+
+    /// Third pass of [`Self::build_cex`]: each entry's `premises`.
+    ///
+    /// `entries[..chain_len]` is the POB chain, root first: the chain child
+    /// `entries[i + 1]` was found as the predecessor of entry `i` through its
+    /// `incoming_clause`, so it IS the premise at that clause's body position
+    /// with the child's predicate, and it is wired by POSITION. The
+    /// `(predicate, level - 1)` lookup is kept for the other body positions of
+    /// a hyperedge (the synthesized entries). Reading the traced premise through
+    /// the lookup as well assumed every chain node sits exactly one level below
+    /// its parent with a unique `(predicate, level)`: a POB push (`use_pob_push`
+    /// re-queues a blocked POB at `level + 1`, parent unchanged) breaks both, the
+    /// last-writer-wins lookup wired a node to a deeper node with the same key,
+    /// the premise/head alignment check (`cex_entries.rs`) rejected the genuine
+    /// derivation as spurious, and the search rebuilt the same witness until the
+    /// spurious-cex limit returned Unknown. On a push-free chain (levels strictly
+    /// decrease) both readings wire the same entries.
+    fn wire_witness_premises(
+        &self,
+        entries: &mut [DerivationWitnessEntry],
+        chain_len: usize,
+        pred_level_to_entry: &FxHashMap<(PredicateId, usize), usize>,
+    ) {
+        for i in 0..entries.len() {
+            let entry = &entries[i];
+            let clause = entry
+                .incoming_clause
+                .and_then(|idx| self.problem.clauses().get(idx));
+            if entry.level == 0 && clause.is_some_and(|c| c.body.predicates.is_empty()) {
+                // Fact clause: no premises.
+                continue;
+            }
+            let chain_child = (i + 1 < chain_len).then_some(i + 1);
+            let Some(clause) = clause else {
+                // No (resolvable) incoming clause: the next chain entry, if any
+                // (an unresolvable index keeps no premises, as before).
+                if entry.incoming_clause.is_none() {
+                    if let Some(c) = chain_child {
+                        entries[i].premises = vec![c];
+                    }
+                }
+                continue;
+            };
+            let prev_level = entry.level.saturating_sub(1);
+            let mut child_used = false;
+            let mut premises = Vec::with_capacity(clause.body.predicates.len());
+            for (body_pred, _) in &clause.body.predicates {
+                if !child_used {
+                    if let Some(c) = chain_child.filter(|&c| entries[c].predicate == *body_pred) {
+                        premises.push(c);
+                        child_used = true;
+                        continue;
+                    }
+                }
+                if let Some(&premise_idx) = pred_level_to_entry.get(&(*body_pred, prev_level)) {
+                    premises.push(premise_idx);
+                }
+            }
+            if premises.len() == clause.body.predicates.len() {
+                entries[i].premises = premises;
+            } else if !clause.body.predicates.is_empty() {
+                // Fallback: the next chain entry (original linear behaviour).
+                if let Some(c) = chain_child {
+                    entries[i].premises = vec![c];
+                }
+            }
         }
     }
 
@@ -402,6 +435,7 @@ impl PdrSolver {
                 root: witness_root,
                 entries: witness_builder.entries,
             }),
+            compact_derivation: None,
             ground_derivation: None,
         })
     }

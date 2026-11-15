@@ -465,3 +465,4 @@ fn z3_500_public_identity_flows_through_aliases_and_declared_functions() {
 }
 
 include!("finite_sets_z3_500/public_identity_and_metadata.rs");
+include!("finite_sets_z3_500/strict_shape_scan.rs");

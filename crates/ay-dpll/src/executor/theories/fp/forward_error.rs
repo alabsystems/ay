@@ -104,6 +104,37 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
+fn builtin_name<'a>(terms: &TermStore, symbol: &'a ay_core::Symbol) -> Option<&'a str> {
+    let ay_core::Symbol::Named(name) = symbol else {
+        return None;
+    };
+    let name = name.as_str();
+    if !matches!(
+        name,
+        "and"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "<="
+            | "<"
+            | ">="
+            | ">"
+            | "fp.to_real"
+            | "fp.abs"
+            | "fp.isNormal"
+            | "fp.neg"
+            | "fp.add"
+            | "fp.sub"
+            | "fp.mul"
+            | "RNE"
+            | "roundNearestTiesToEven"
+    ) {
+        return None;
+    }
+    (!terms.is_declared_function(name)).then_some(name)
+}
+
 /// Cap on distinct dag nodes analyzed (guards against pathological inputs).
 const MAX_DAG_NODES: usize = 1024;
 /// Cap on monomials in any normalized polynomial.
@@ -206,7 +237,7 @@ fn collect_conjuncts(terms: &TermStore, t: TermId, out: &mut Vec<TermId>) {
         return;
     }
     match terms.get(t) {
-        TermData::App(sym, args) if sym.name() == "and" => {
+        TermData::App(sym, args) if builtin_name(terms, sym) == Some("and") => {
             for &a in args {
                 collect_conjuncts(terms, a, out);
             }
@@ -229,12 +260,13 @@ fn eval_ground_rational(terms: &TermStore, t: TermId) -> Option<BigRational> {
         TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
         TermData::Const(Constant::Int(i)) => Some(BigRational::from_integer(i.clone())),
         TermData::App(sym, args) if !args.is_empty() => {
+            let name = builtin_name(terms, sym)?;
             let vals: Option<Vec<BigRational>> = args
                 .iter()
                 .map(|&a| eval_ground_rational(terms, a))
                 .collect();
             let vals = vals?;
-            match sym.name() {
+            match name {
                 "+" => Some(vals.into_iter().sum()),
                 "*" => Some(vals.into_iter().product()),
                 "-" if vals.len() == 1 => Some(-vals[0].clone()),
@@ -273,7 +305,10 @@ fn mine_input_facts(terms: &TermStore, conjuncts: &[TermId]) -> InputFacts {
         let TermData::App(sym, args) = terms.get(c) else {
             continue;
         };
-        match (sym.name(), args.len()) {
+        let Some(name) = builtin_name(terms, sym) else {
+            continue;
+        };
+        match (name, args.len()) {
             ("fp.isNormal", 1) => {
                 if let Some(v) = as_fp_var(terms, args[0]) {
                     facts.normal.insert(v);
@@ -282,7 +317,7 @@ fn mine_input_facts(terms: &TermStore, conjuncts: &[TermId]) -> InputFacts {
             ("<=" | "<" | ">=" | ">", 2) => {
                 // Normalize to `small <= big` (using `<` as the weaker `<=`
                 // is sound: the premise is only ever weakened).
-                let (small, big) = match sym.name() {
+                let (small, big) = match name {
                     "<=" | "<" => (args[0], args[1]),
                     _ => (args[1], args[0]),
                 };
@@ -299,11 +334,12 @@ fn mine_bound(terms: &TermStore, small: TermId, big: TermId, facts: &mut InputFa
     // Upper bounds: to_real(x) <= c   or   to_real(fp.abs(x)) <= c.
     if let Some(c) = eval_ground_rational(terms, big) {
         if let TermData::App(sym, args) = terms.get(small) {
-            if sym.name() == "fp.to_real" && args.len() == 1 {
+            if builtin_name(terms, sym) == Some("fp.to_real") && args.len() == 1 {
                 match terms.get(args[0]) {
                     // |x| <= c: two-sided magnitude bound.
                     TermData::App(abs_sym, abs_args)
-                        if abs_sym.name() == "fp.abs" && abs_args.len() == 1 =>
+                        if builtin_name(terms, abs_sym) == Some("fp.abs")
+                            && abs_args.len() == 1 =>
                     {
                         if let Some(v) = as_fp_var(terms, abs_args[0]) {
                             if !c.is_negative() {
@@ -326,7 +362,7 @@ fn mine_bound(terms: &TermStore, small: TermId, big: TermId, facts: &mut InputFa
     // enclosure information for this analysis and are ignored.)
     if let Some(c) = eval_ground_rational(terms, small) {
         if let TermData::App(sym, args) = terms.get(big) {
-            if sym.name() == "fp.to_real" && args.len() == 1 {
+            if builtin_name(terms, sym) == Some("fp.to_real") && args.len() == 1 {
                 if let Some(v) = as_fp_var(terms, args[0]) {
                     tighten_lo(&mut facts.lo, v, c);
                 }
@@ -483,7 +519,7 @@ fn poly_real_uncached(
         TermData::Const(Constant::Int(i)) => {
             Some(Poly::constant(BigRational::from_integer(i.clone())))
         }
-        TermData::App(sym, args) => match (sym.name(), args.len()) {
+        TermData::App(sym, args) => match (builtin_name(terms, sym)?, args.len()) {
             ("fp.to_real", 1) => match (terms.get(args[0]), terms.sort(args[0])) {
                 (TermData::Var(..), Sort::FloatingPoint(..)) => {
                     Some(Poly::atom(Atom::Leaf(args[0])))
@@ -552,7 +588,7 @@ fn mirror_poly(
         TermData::Var(..) if matches!(terms.sort(t), Sort::FloatingPoint(..)) => {
             Some(Poly::atom(Atom::Leaf(t)))
         }
-        TermData::App(sym, args) => match (sym.name(), args.len()) {
+        TermData::App(sym, args) => match (builtin_name(terms, sym)?, args.len()) {
             ("fp.neg", 1) => mirror_poly(terms, args[0], memo).map(|p| p.neg()),
             ("fp.add", 3) => {
                 let mut a = mirror_poly(terms, args[1], memo)?;
@@ -731,7 +767,7 @@ fn analyze_uncached(
                 err: BigRational::zero(),
             })
         }
-        TermData::App(sym, args) => match (sym.name(), args.len()) {
+        TermData::App(sym, args) => match (builtin_name(terms, sym)?, args.len()) {
             // fp.neg is exact: negate the interval, keep the error.
             ("fp.neg", 1) => {
                 let a = analyze(terms, args[0], facts, memo)?;
@@ -825,13 +861,20 @@ fn analyze_uncached(
 }
 
 /// `t` is the RNE rounding-mode constant. Matched structurally against the
-/// canonical short name the frontend produces (nullary app) plus the `Var`
-/// spelling some frontends use. Anything else — including other modes and
-/// non-constant modes — is NOT RNE.
+/// canonical nullary builtin. A free variable has no fixed mode, regardless
+/// of its spelling. Other modes and opaque applications are not RNE.
 fn is_rne(terms: &TermStore, t: TermId) -> bool {
+    if !matches!(terms.sort(t), Sort::Uninterpreted(name) if name == "RoundingMode") {
+        return false;
+    }
     match terms.get(t) {
-        TermData::App(sym, args) => args.is_empty() && sym.name() == "RNE",
-        TermData::Var(name, _) => name == "RNE",
+        TermData::App(sym, args) => {
+            args.is_empty()
+                && matches!(
+                    builtin_name(terms, sym),
+                    Some("RNE" | "roundNearestTiesToEven")
+                )
+        }
         _ => false,
     }
 }
@@ -868,7 +911,7 @@ fn decompose_cmp(terms: &TermStore, t: TermId) -> Option<(CmpOp, TermId, TermId)
             Some((op.negate(), l, r))
         }
         TermData::App(sym, args) if args.len() == 2 => {
-            let op = match sym.name() {
+            let op = match builtin_name(terms, sym)? {
                 ">=" => CmpOp::Ge,
                 ">" => CmpOp::Gt,
                 "<=" => CmpOp::Le,

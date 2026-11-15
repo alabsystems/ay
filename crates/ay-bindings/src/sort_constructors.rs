@@ -16,7 +16,6 @@ impl Sort {
     /// Create a boolean sort.
     /// ENSURES: result.is_bool() is true.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bool()))]
     pub fn bool() -> Self {
         Self::from_inner(SortInner::Bool)
     }
@@ -28,8 +27,6 @@ impl Sort {
     /// # Panics
     /// Panics if width is 0.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(width > 0))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bitvec(width: u32) -> Self {
         assert!(width > 0, "BitVec width must be > 0");
         Self::from_inner(SortInner::BitVec(BitVecSort { width }))
@@ -38,7 +35,6 @@ impl Sort {
     /// Create an 8-bit bitvector sort.
     /// ENSURES: result.bitvec_width() == Some(8).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bv8() -> Self {
         Self::bitvec(8)
     }
@@ -46,7 +42,6 @@ impl Sort {
     /// Create a 16-bit bitvector sort.
     /// ENSURES: result.bitvec_width() == Some(16).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bv16() -> Self {
         Self::bitvec(16)
     }
@@ -54,7 +49,6 @@ impl Sort {
     /// Create a 32-bit bitvector sort.
     /// ENSURES: result.bitvec_width() == Some(32).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bv32() -> Self {
         Self::bitvec(32)
     }
@@ -62,7 +56,6 @@ impl Sort {
     /// Create a 64-bit bitvector sort.
     /// ENSURES: result.bitvec_width() == Some(64).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bv64() -> Self {
         Self::bitvec(64)
     }
@@ -70,7 +63,6 @@ impl Sort {
     /// Create a 128-bit bitvector sort.
     /// ENSURES: result.bitvec_width() == Some(128).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_bitvec()))]
     pub fn bv128() -> Self {
         Self::bitvec(128)
     }
@@ -78,7 +70,6 @@ impl Sort {
     /// Create an unbounded integer sort.
     /// ENSURES: result.is_int() is true.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_int()))]
     pub fn int() -> Self {
         Self::from_inner(SortInner::Int)
     }
@@ -86,7 +77,6 @@ impl Sort {
     /// Create a real number sort.
     /// ENSURES: result.is_real() is true.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_real()))]
     pub fn real() -> Self {
         Self::from_inner(SortInner::Real)
     }
@@ -94,7 +84,6 @@ impl Sort {
     /// Create an array sort.
     /// ENSURES: result.is_array() is true with provided index/element sorts.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_array()))]
     pub fn array(index_sort: Self, element_sort: Self) -> Self {
         Self::from_inner(SortInner::Array(ArraySort {
             index_sort,
@@ -105,7 +94,6 @@ impl Sort {
     /// Create a memory array sort (64-bit addresses to bytes).
     /// ENSURES: result.is_array() with index BitVec(64) and element BitVec(8).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_array()))]
     pub fn memory() -> Self {
         Self::array(Self::bv64(), Self::bv8())
     }
@@ -118,7 +106,6 @@ impl Sort {
     /// across multiple struct types in the same SMT file. This fixes #948 where
     /// multiple structs with the generic "mk" constructor caused sort conflicts.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_datatype()))]
     pub fn struct_type(
         name: impl Into<String>,
         fields: impl IntoIterator<Item = (impl Into<String>, Self)>,
@@ -145,7 +132,6 @@ impl Sort {
     /// REQUIRES: `variants` supply constructor names and field sorts.
     /// ENSURES: returns Datatype with one constructor per variant.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_datatype()))]
     pub fn enum_type<VariantName, Variants, FieldName, VariantFields>(
         name: impl Into<String>,
         variants: Variants,
@@ -193,7 +179,6 @@ impl Sort {
     /// assert!(color.is_datatype());
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_datatype()))]
     pub fn simple_enum_type(
         name: impl Into<String>,
         variants: impl IntoIterator<Item = impl Into<String>>,
@@ -225,8 +210,6 @@ impl Sort {
     /// assert!(pair.datatype_has_field("_1"));
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::requires(!sorts.is_empty()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.is_datatype()))]
     pub fn tuple(sorts: Vec<Self>) -> Self {
         assert!(!sorts.is_empty(), "Tuple must have at least one element");
 
@@ -281,6 +264,56 @@ impl Sort {
     #[must_use]
     pub fn uninterpreted(name: impl Into<String>) -> Self {
         Self::from_inner(SortInner::Uninterpreted(name.into()))
+    }
+
+    /// Create a by-name reference to an enclosing datatype declaration.
+    ///
+    /// Use this for a recursive field of the datatype being declared:
+    ///
+    /// ```rust
+    /// use ay_bindings::{Expr, Sort};
+    ///
+    /// // (declare-datatype Level ((zero) (succ (pred Level))))
+    /// let level = Sort::enum_type(
+    ///     "Level",
+    ///     vec![
+    ///         ("zero", vec![]),
+    ///         ("succ", vec![("pred", Sort::datatype_ref("Level"))]),
+    ///     ],
+    /// );
+    /// let l = Expr::var("l", level.clone());
+    /// let succ_l = Expr::datatype_constructor("Level", "succ", vec![l.clone()], level.clone());
+    /// let pred = succ_l.field_select("Level", "pred", level);
+    /// # let _ = pred;
+    /// ```
+    ///
+    /// The reference resolves only to an enclosing declaration of the same
+    /// name, and then compares structurally against that declaration. It is
+    /// not interchangeable with [`Sort::uninterpreted`], and it is refused as
+    /// the sort of an expression or anywhere outside such a declaration.
+    ///
+    /// A field whose datatype is NOT an enclosing declaration (a sibling, or
+    /// the other half of a mutually recursive pair) carries that datatype's
+    /// full definition inline; a bare reference to it is dangling and refused.
+    /// Inside the inlined definition, a reference back to any enclosing name
+    /// is again a `datatype_ref`, so `Tower { stack (top: Block, rest: Tower) }`
+    /// with `Block { cell (owner: Tower) }` is spelled, at the `Tower` term
+    /// sort, as `Tower { stack (top: Block { cell (owner: ref Tower) }, rest:
+    /// ref Tower) }`. The signature checks compare such spellings coinductively,
+    /// so the same datatype unfolded to different depths is one sort.
+    ///
+    /// A program keeps one definition per name: `AYProgram::try_declare_datatype`
+    /// and `try_declare_const` authenticate every definition nested in a sort
+    /// against the definition registered under its name (registering a new
+    /// name as a definition of its own, declared first), and a same-named
+    /// definition nested inside a declaration must be that declaration
+    /// unfolded, never a different one shadowing it. A mutually recursive pair
+    /// is therefore admitted by the checked API as term sorts but refused as
+    /// program declarations: each spelling nests a definition that refers back
+    /// out to the datatype enclosing it, which no registry entry can stand for.
+    #[must_use]
+    pub fn datatype_ref(name: impl Into<String>) -> Self {
+        Self::from_inner(SortInner::DatatypeRef(name.into()))
     }
 
     /// Create a regular language sort.

@@ -191,14 +191,18 @@ impl PipeCapture {
                     Ok(0) | Err(_) => break,
                     Ok(read) => read,
                 };
+                // A reader reporting more bytes than the buffer holds breaks
+                // the `Read` contract; stop capturing exactly as on an error.
+                let Some(filled) = chunk.get(..read) else {
+                    break;
+                };
                 total = total.saturating_add(read);
-                let mut offset = 0;
-                if head.len() < CAPTURE_HEAD_BYTES {
-                    let keep = read.min(CAPTURE_HEAD_BYTES - head.len());
-                    head.extend_from_slice(&chunk[..keep]);
-                    offset = keep;
-                }
-                for byte in &chunk[offset..read] {
+                let head_room = CAPTURE_HEAD_BYTES.saturating_sub(head.len());
+                let Some((to_head, to_tail)) = filled.split_at_checked(read.min(head_room)) else {
+                    break;
+                };
+                head.extend_from_slice(to_head);
+                for byte in to_tail {
                     if tail.len() == tail_cap {
                         tail.pop_front();
                     }

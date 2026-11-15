@@ -34,27 +34,22 @@
 // justification), #8255 (BCP theory-check frequency).
 
 use ntest::timeout;
+use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
+
+use crate::corpus::{optional_corpus_file, tracked_fixture};
+
+const QF_LRA: &str = "benchmarks/smtcomp/QF_LRA";
 
 /// Run ay on a QF_LRA benchmark with an internal timeout (milliseconds) and
 /// return the first line of stdout, trimmed. The test harness additionally
 /// applies its own `#[timeout]` wall-clock ceiling for hard-hang protection.
-fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
+fn run_ay(benchmark_path: &Path, timeout_ms: u64) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smtcomp/QF_LRA/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        smt_file
-    );
-    if !std::path::Path::new(&benchmark_path).is_file() {
-        eprintln!("SKIP: optional QF_LRA benchmark not found: {benchmark_path}");
-        return "unknown".to_string();
-    }
-
     let output = Command::new(ay_path)
         .arg(format!("-t:{timeout_ms}"))
-        .arg(&benchmark_path)
+        .arg(benchmark_path)
         .output()
         .expect("Failed to spawn ay");
 
@@ -62,10 +57,32 @@ fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
     stdout.trim().lines().next().unwrap_or("").to_string()
 }
 
-/// As `run_ay` but also returns elapsed wall-clock seconds.
+/// `run_ay` on one of the two committed reproducers (`benchmarks/.gitignore`
+/// un-ignores `simple_startup_{10,14}nodes.bug.induct.smt2`). Their absence is
+/// a broken tree and fails the test. It used to become the verdict `unknown`,
+/// which every oracle in this file accepts — including the 30 s performance
+/// gates, which then measured a run that never happened.
+fn run_ay_tracked(smt_file: &str, timeout_ms: u64) -> String {
+    run_ay(
+        &tracked_fixture(&format!("{QF_LRA}/{smt_file}")),
+        timeout_ms,
+    )
+}
+
+/// `run_ay` on a gitignored corpus file, or `None` when it is absent and
+/// skipping is allowed (`AY_REQUIRE_CORPUS=1` fails instead). `None` is never
+/// a verdict; the caller returns without asserting (see `common/corpus.rs`).
+fn run_ay_corpus(test: &str, smt_file: &str, timeout_ms: u64) -> Option<String> {
+    let benchmark_path = optional_corpus_file(test, &format!("{QF_LRA}/{smt_file}"))?;
+    Some(run_ay(&benchmark_path, timeout_ms))
+}
+
+/// As `run_ay_tracked` but also returns elapsed wall-clock seconds of the
+/// solver run alone.
 fn run_ay_timed(smt_file: &str, timeout_ms: u64) -> (String, f64) {
+    let benchmark_path = tracked_fixture(&format!("{QF_LRA}/{smt_file}"));
     let start = Instant::now();
-    let result = run_ay(smt_file, timeout_ms);
+    let result = run_ay(&benchmark_path, timeout_ms);
     let elapsed = start.elapsed().as_secs_f64();
     (result, elapsed)
 }
@@ -80,7 +97,7 @@ fn run_ay_timed(smt_file: &str, timeout_ms: u64) -> (String, f64) {
 #[test]
 #[timeout(180_000)]
 fn rebuild_8256_never_false_unsat_on_simple_startup_10nodes() {
-    let result = run_ay("simple_startup_10nodes.bug.induct.smt2", 60_000);
+    let result = run_ay_tracked("simple_startup_10nodes.bug.induct.smt2", 60_000);
     assert_ne!(
         result, "unsat",
         "Soundness regression (#8256): AY reported 'unsat' on a SAT QF_LRA \
@@ -98,7 +115,7 @@ fn rebuild_8256_never_false_unsat_on_simple_startup_10nodes() {
 #[test]
 #[timeout(180_000)]
 fn rebuild_8256_never_false_unsat_on_simple_startup_14nodes() {
-    let result = run_ay("simple_startup_14nodes.bug.induct.smt2", 60_000);
+    let result = run_ay_tracked("simple_startup_14nodes.bug.induct.smt2", 60_000);
     assert_ne!(
         result, "unsat",
         "Soundness regression (#8256): AY reported 'unsat' on a SAT QF_LRA \
@@ -118,7 +135,13 @@ fn rebuild_8256_never_false_unsat_on_simple_startup_14nodes() {
 #[test]
 #[timeout(300_000)]
 fn rebuild_8256_never_false_unsat_on_labyrinth_18() {
-    let result = run_ay("0067-labyrinth-18-0.smt2", 120_000);
+    let Some(result) = run_ay_corpus(
+        "rebuild_8256_never_false_unsat_on_labyrinth_18",
+        "0067-labyrinth-18-0.smt2",
+        120_000,
+    ) else {
+        return;
+    };
     assert_ne!(
         result, "unsat",
         "Soundness regression (#8256): AY reported 'unsat' on a SAT QF_LRA \
@@ -136,7 +159,13 @@ fn rebuild_8256_never_false_unsat_on_labyrinth_18() {
 #[test]
 #[timeout(300_000)]
 fn rebuild_8256_never_false_unsat_on_labyrinth_13() {
-    let result = run_ay("0165-labyrinth-13-0.smt2", 120_000);
+    let Some(result) = run_ay_corpus(
+        "rebuild_8256_never_false_unsat_on_labyrinth_13",
+        "0165-labyrinth-13-0.smt2",
+        120_000,
+    ) else {
+        return;
+    };
     assert_ne!(
         result, "unsat",
         "Soundness regression (#8256): AY reported 'unsat' on a SAT QF_LRA \
@@ -154,7 +183,13 @@ fn rebuild_8256_never_false_unsat_on_labyrinth_13() {
 #[test]
 #[timeout(180_000)]
 fn rebuild_8256_never_false_sat_on_simple_startup_7nodes_abstract_induct() {
-    let result = run_ay("simple_startup_7nodes.abstract.induct.smt2", 60_000);
+    let Some(result) = run_ay_corpus(
+        "rebuild_8256_never_false_sat_on_simple_startup_7nodes_abstract_induct",
+        "simple_startup_7nodes.abstract.induct.smt2",
+        60_000,
+    ) else {
+        return;
+    };
     assert_ne!(
         result, "sat",
         "Soundness regression (#8256): AY reported 'sat' on an UNSAT QF_LRA \

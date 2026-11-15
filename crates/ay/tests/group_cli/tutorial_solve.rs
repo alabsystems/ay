@@ -113,9 +113,7 @@ fn test_public_help_shows_tutorial_without_internal_commands() {
         "competition-jit",
         "gate",
         "consumer-smoke",
-        "launch-gate",
         "release",
-        "launch-packet",
         "submission",
         "verifier-audit",
         "bisect",
@@ -302,6 +300,7 @@ fn test_tutorial_engineers_full_course_is_practical_and_noninteractive() {
         &stdout,
         &[
             "AY for Engineers",
+            "targo --unverified build",
             "cargo build",
             "--timeout",
             "--memory",

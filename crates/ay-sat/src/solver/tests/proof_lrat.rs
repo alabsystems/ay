@@ -17,7 +17,7 @@ fn dimacs_text(num_vars: usize, clauses: &[Vec<Literal>]) -> String {
     out
 }
 
-fn verify_lrat_with_external_checker(
+pub(super) fn verify_lrat_with_external_checker(
     num_vars: usize,
     clauses: &[Vec<Literal>],
     proof: &str,
@@ -118,6 +118,11 @@ fn test_factorize_drat_proof_emission() {
     //           1 blocked delete + 6 original deletes = 7 deletes.
     assert!(writer.added_count() > 0, "DRAT must have add entries");
     assert!(writer.deleted_count() > 0, "DRAT must have delete entries");
+    assert_eq!(
+        writer.deleted_count(),
+        writer.added_count() + 1,
+        "the proof-only blocked clause is deleted with the six originals (2026-09-17)"
+    );
 }
 
 /// LRAT factorization fails closed before mutation while its fresh-literal
@@ -408,8 +413,8 @@ fn test_proof_mode_inprocessing_setters_cannot_reopen_unsafe() {
     drat_solver.set_sbva_enabled(true);
 
     assert!(
-        !drat_solver.is_sweep_enabled(),
-        "sweep is disabled in all proof modes"
+        drat_solver.is_sweep_enabled(),
+        "sweep is proof-logged on DRAT since site S (e367fd456), closed on LRAT"
     );
     assert!(
         drat_solver.is_factor_enabled(),
@@ -1269,15 +1274,19 @@ fn test_forward_checker_validates_cdcl_proof_classification() {
 fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
     use crate::ProofOutput;
 
-    let proof_writer = ProofOutput::lrat_text(Vec::new(), 2);
+    let proof_writer = ProofOutput::lrat_text(Vec::new(), 3);
     let mut solver = Solver::with_proof_output(2, proof_writer);
 
     let a = Literal::positive(Variable(0));
     let na = Literal::negative(Variable(0));
     let b = Literal::positive(Variable(1));
 
-    solver.add_clause(vec![a]);
-    solver.add_clause(vec![na, b]);
+    // Root units alone are not a refutation. Include a genuine falsified
+    // original seed, rather than minting an empty clause from the SAT prefix.
+    let clauses = vec![vec![a], vec![na, b], vec![b.negated()]];
+    for clause in &clauses {
+        solver.add_clause(clause.clone());
+    }
 
     assert!(
         solver.process_initial_clauses().is_none(),
@@ -1287,6 +1296,13 @@ fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
         !solver.has_empty_clause,
         "helper test must start before the empty clause is recorded"
     );
+    solver.initialize_watches();
+    let seed = solver.propagate().expect("real root conflict");
+    assert!(solver
+        .arena
+        .literals(seed.0 as usize)
+        .iter()
+        .all(|&lit| solver.lit_val(lit) < 0));
 
     solver.mark_empty_clause_with_level0_hints();
 
@@ -1311,6 +1327,38 @@ fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
         hint_count > 0,
         "level-0 helper must attach LRAT hints to the empty clause: {last_line}"
     );
+    verify_lrat_with_external_checker(2, &clauses, &proof, "authenticated helper seed");
+}
+
+#[test]
+fn level0_hints_without_falsified_seed_refuse_base_certificate() {
+    let clauses = vec![
+        vec![Literal::positive(Variable(0))],
+        vec![
+            Literal::negative(Variable(0)),
+            Literal::positive(Variable(1)),
+        ],
+    ];
+    let mut solver = Solver::with_proof_output(2, ProofOutput::lrat_text(Vec::new(), 2));
+    for clause in clauses {
+        solver.add_clause(clause);
+    }
+    assert!(solver.process_initial_clauses().is_none());
+    solver.mark_empty_clause_with_level0_hints();
+    assert!(!solver.cold.empty_clause_in_proof);
+    assert_eq!(solver.cold.empty_clause_lrat_id, None);
+    assert!(solver.declare_unsat().is_unknown());
+    assert_eq!(
+        solver.last_unknown_reason(),
+        Some(crate::SatUnknownReason::ProofFinalizationFailure),
+    );
+    let output = solver.take_proof_writer().expect("proof writer");
+    let proof = String::from_utf8(output.into_vec().expect("flush")).expect("UTF-8");
+    let steps = ay_lrat_check::lrat_parser::parse_text_lrat(&proof).expect("valid prefix");
+    assert!(steps.iter().all(|step| !matches!(
+        step,
+        ay_lrat_check::lrat_parser::LratStep::Add { clause, .. } if clause.is_empty()
+    )));
 }
 
 /// Create a conditioning-only solver with the given proof output.
@@ -2367,8 +2415,8 @@ fn test_finalize_empty_clause_hints_with_contradictory_units() {
 
 /// Coverage Gap 5b: finalize_unsat_proof with scope selector axiom in hints.
 ///
-/// Verifies that the empty clause derivation includes the scope selector
-/// axiom ID (¬selector) in its hint chain. This is the fix from #7108.
+/// Historical identity retained: a temporary selector axiom must NOT license
+/// a terminal empty clause in the persistent base stream.
 #[test]
 #[cfg(debug_assertions)]
 fn test_finalize_empty_clause_includes_scope_selector_axiom_hint() {
@@ -2398,26 +2446,26 @@ fn test_finalize_empty_clause_includes_scope_selector_axiom_hint() {
     let axiom_id = solver.cold.scope_selector_axiom_ids[0];
     assert!(axiom_id > 0, "axiom ID must be non-zero in LRAT mode");
 
-    // Verify the LRAT proof contains the axiom ID in the empty clause hints.
+    assert!(!solver.has_empty_clause);
+    assert!(!solver.cold.empty_clause_in_proof);
+    assert_eq!(solver.cold.empty_clause_lrat_id, None);
+    assert!(solver.pop());
+    assert!(
+        solver.solve().is_sat(),
+        "the base formula remains satisfiable"
+    );
+
+    // The internal selector axiom is not a permanent external proof input.
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof_text = String::from_utf8(writer.into_vec().expect("flush")).expect("UTF-8");
 
-    let axiom_str = axiom_id.to_string();
-    let has_axiom_hint = proof_text.lines().any(|line| {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        // Empty clause line: <id> 0 <hints...> 0
-        if tokens.len() < 3 || tokens[1] != "0" || line.contains(" d ") {
-            return false;
-        }
-        // Check if axiom_id appears in the hint section
-        let first_zero = tokens.iter().position(|t| *t == "0").unwrap();
-        tokens[first_zero + 1..tokens.len() - 1]
-            .iter()
-            .any(|t| *t == axiom_str)
-    });
+    let steps = ay_lrat_check::lrat_parser::parse_text_lrat(&proof_text).expect("LRAT prefix");
     assert!(
-        has_axiom_hint,
-        "empty clause hints must include scope selector axiom ID {axiom_id}\nproof:\n{proof_text}",
+        steps.iter().all(|step| !matches!(
+            step,
+            ay_lrat_check::lrat_parser::LratStep::Add { clause, .. } if clause.is_empty()
+        )),
+        "conditional query must not close the base stream: {proof_text}"
     );
 }
 

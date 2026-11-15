@@ -17,10 +17,13 @@ use crate::{
     HornClause, VerifiedChcResult,
 };
 
+#[path = "adaptive_cata_tests/witness.rs"]
+mod witness;
+
 fn list_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Lst".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "nil".to_string(),
                 selectors: vec![],
@@ -417,7 +420,7 @@ fn cata_route_skips_non_recursive_datatype_problems() {
     // Pair(Int, Int) — non-recursive: dt_flatten territory, not cata.
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk".to_string(),
             selectors: vec![
                 ChcDtSelector {

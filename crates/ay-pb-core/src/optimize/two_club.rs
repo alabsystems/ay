@@ -1123,9 +1123,15 @@ fn build_solve_rows(
 /// protocol failure, arithmetic overflow, or timeout costs the caller the
 /// bound (fail-closed: no prune) — see `SdpReply` for which of those retire
 /// the bridge and which are ordinary in-protocol answers.
+///
+/// A child that has DIED is one of those failures, so every write to it must
+/// come back as an `EPIPE` error rather than a SIGPIPE that kills the solver:
+/// `stdin` is a [`ay_sys::child_pipe::ChildPipeWriter`], because a
+/// `unix_hardened` build runs with SIGPIPE at its default (terminate)
+/// disposition.
 struct SdpWorker {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: ay_sys::child_pipe::ChildPipeWriter<std::process::ChildStdin>,
     rx: std::sync::mpsc::Receiver<String>,
 }
 
@@ -1139,9 +1145,11 @@ impl SdpWorker {
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .ok()?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
+        // A pipe that cannot be marked would let a dead worker kill the
+        // solver on the next write: decline the bridge instead.
+        let stdin = match ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child) {
+            Ok(stdin) => stdin,
+            Err(_) => {
                 terminate_child(&mut child);
                 return None;
             }
@@ -4081,6 +4089,12 @@ mod tests {
     /// Scripted stand-in for the development design notes, driven through
     /// the real protocol over real pipes (`/bin/sh`, so the fixture cannot
     /// accidentally depend on the certified toolchain being installed).
+    ///
+    /// A fixture that has to hang does `exec sleep 60`, never a `while :` spin:
+    /// if the test process dies before `SdpWorker::drop` kills the child, the
+    /// child is re-parented to launchd and outlives the run. Five spinning
+    /// orphans of this test were found on 2026-09-25, 34 to 47 hours old, one
+    /// core each; a sleeping one costs nothing and is gone within a minute.
     #[cfg(unix)]
     struct FakeWorker {
         config: SdpWorkerConfig,
@@ -4092,10 +4106,20 @@ mod tests {
         fn new(label: &str, body: &str) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let directory = std::env::temp_dir()
-                .join(format!("ay-sdp-worker-{}-{label}-{id}", std::process::id()));
-            std::fs::create_dir(&directory).expect("create fake-worker directory");
+            // A name can already exist: a test process that was killed never
+            // dropped its fixtures, and a later one can reuse its PID (a
+            // collision failed 1 of 800 runs, 2026-09-26). Take the next id
+            // instead of touching a directory this process did not make.
+            let directory = loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let candidate = std::env::temp_dir()
+                    .join(format!("ay-sdp-worker-{}-{label}-{id}", std::process::id()));
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create fake-worker directory: {error}"),
+                }
+            };
             let script = directory.join("worker.sh");
             let instance = directory.join("instance.opb");
             std::fs::write(&script, body).expect("write fake worker");
@@ -4143,7 +4167,7 @@ mod tests {
 
         let mismatch = FakeWorker::new(
             "mismatch",
-            "printf '%s\\n' 'READY graph_sha256=deadbeef n=4 pairs=2'\nwhile :; do :; done\n",
+            "printf '%s\\n' 'READY graph_sha256=deadbeef n=4 pairs=2'\nexec sleep 60\n",
         );
         assert!(
             SdpWorker::spawn(&mismatch.config, &digest).is_none(),
@@ -4155,7 +4179,7 @@ mod tests {
             &format!(
                 "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
                  IFS= read -r request || exit 3\n\
-                 while :; do :; done\n"
+                 exec sleep 60\n"
             ),
         );
         let mut worker =
@@ -4255,6 +4279,98 @@ mod tests {
 
         // The retirement rule itself: only a RUN of breaks is systemic.
         const _: () = assert!(SDP_MAX_BROKEN_STREAK >= 2, "one break must be survivable");
+    }
+
+    /// A worker that is already DEAD when the bridge writes to it must cost the
+    /// bridge one child, never the process. `query` and `Drop` both write to
+    /// the worker's stdin, and after the child exits that pipe has no reader:
+    /// the write must come back as a handled `EPIPE`, which `query` classifies
+    /// as `Broken` and `Drop` ignores.
+    ///
+    /// Under the `unix_hardened` verification profile this workspace builds
+    /// with, the compiler DEFAULTS to `-Zon-broken-pipe=kill` (`main` installs
+    /// `SIG_DFL`), and on a plain `ChildStdin` the same write killed the whole
+    /// test binary with exit 141 before either error path ran (measured
+    /// 2026-09-26). The bridge's `ChildPipeWriter` suppresses the signal for
+    /// its own pipe, whatever the process disposition.
+    ///
+    /// The scenario runs ALONE, in a re-exec of this test binary where SIGPIPE
+    /// terminates the process (`ay_test_support::sigpipe::run_alone`, which
+    /// grew out of this test); a SIGPIPE kill there fails this test by name.
+    /// Alone, because "the worker is reaped, so its stdin has no reader" is
+    /// false in a process whose other tests spawn children at the
+    /// same time: on macOS std makes a pipe with `pipe()` and sets
+    /// `FD_CLOEXEC` in a second call (there is no `pipe2`), and a child
+    /// another test spawns in between inherits the worker's stdin read end and
+    /// holds that pipe open after the worker is gone. The explicit write below
+    /// then succeeded (1 run in 480 of the `certified_sdp` filter, 8 loops in
+    /// parallel, 2026-09-26). Terminating on SIGPIPE is forced, because the
+    /// check must not depend on the toolchain's broken-pipe default: a stock
+    /// build ignores SIGPIPE and could never see the kill this guards against.
+    #[cfg(unix)]
+    #[test]
+    fn certified_sdp_dead_worker_is_a_broken_reply_not_a_process_kill() {
+        use std::io::Write;
+        if !ay_test_support::sigpipe::run_alone(
+            module_path!(),
+            "certified_sdp_dead_worker_is_a_broken_reply_not_a_process_kill",
+        )
+        .expect("re-exec this test alone")
+        {
+            return;
+        }
+        let digest = graph_sha256(4, &[(0, 2, vec![1]), (1, 3, vec![0, 2])]);
+        // Handshake, then exit without reading a request: every later write by
+        // the bridge lands on a pipe whose only reader is gone.
+        let dying = FakeWorker::new(
+            "dying",
+            &format!("printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\nexit 0\n"),
+        );
+        let spawn_dead = || {
+            let mut worker =
+                SdpWorker::spawn(&dying.config, &digest).expect("matching worker handshake");
+            // Reap it first, so the writes below deterministically find the
+            // read end closed instead of racing the child's exit (and, run
+            // alone, no other test's child can have inherited that end).
+            worker.child.wait().expect("reap the exited worker");
+            worker
+        };
+
+        // `query` on a dead worker: the write fails, the child is `Broken`.
+        let mut worker = spawn_dead();
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::Broken
+        );
+        // The failure is the ordinary io error the bridge was written against.
+        let error = writeln!(worker.stdin, "0 2")
+            .and_then(|()| worker.stdin.flush())
+            .expect_err("a write to a worker with no reader must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        // `Drop` writes `QUIT` to the same dead pipe.
+        drop(worker);
+
+        // `Drop` alone, with no query first to discover the break.
+        drop(spawn_dead());
+
+        // The bridge recovers: a replacement child (identity re-checked)
+        // answers, which is what the search does after a `Broken` reply.
+        let healthy = FakeWorker::new(
+            "after-dead",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r request || exit 3\n\
+                 printf '%s\\n' 'BOUND 141 2'\n\
+                 IFS= read -r quit || true\n"
+            ),
+        );
+        let mut replacement =
+            SdpWorker::spawn(&healthy.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            replacement.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::Bound(141, 2)
+        );
+        drop(replacement);
     }
 
     /// The INCREMENTAL DUAL-SNAPSHOT machinery under maximum stress: refresh at

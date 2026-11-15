@@ -7,10 +7,43 @@
 //! Extracted from `solve.rs` for file size management. The `strengthen()` method
 //! is the core obligation-processing loop called from the main PDR solve loop.
 
+use super::blocking::NlRound;
+use super::spacer_core::stats::{LemmaSource, UnknownClass};
 use super::{
     cube, BlockResult, ChcExpr, ChcOp, ChcSort, FxHashMap, FxHashSet, HornClause, Lemma, PdrSolver,
-    PredicateId, ProofObligation, ReachFact, ReachFactId, StrengthenResult,
+    PredecessorState, PredicateId, ProofObligation, ReachFact, ReachFactId, StrengthenResult,
 };
+use crate::pdr::config::SpacerLane;
+
+/// Point-block enumeration exit (`DESIGN` §4.4, R1 `lift_caps`): the cap that
+/// still returns `Unknown`, or `None` when the exit is lifted to a counter.
+/// Legacy (`spacer_core == false`, or the lane without `lift_caps`) keeps
+/// `legacy_cap` (25); the lane with `lift_caps` keeps only `enum_valve`.
+pub(in crate::pdr::solver) fn point_block_cap_policy(
+    spacer_core: bool,
+    lane: &SpacerLane,
+    legacy_cap: usize,
+) -> Option<usize> {
+    if spacer_core && lane.lift_caps {
+        lane.enum_valve
+    } else {
+        Some(legacy_cap)
+    }
+}
+
+/// Level-0 blocked-state exit (`DESIGN` §4.4): `legacy_cap` (50) unless the lane
+/// lifted it.
+pub(in crate::pdr::solver) fn level0_cap_policy(
+    spacer_core: bool,
+    lane: &SpacerLane,
+    legacy_cap: usize,
+) -> Option<usize> {
+    if spacer_core && lane.lift_caps {
+        None
+    } else {
+        Some(legacy_cap)
+    }
+}
 
 impl PdrSolver {
     /// Strengthen the current frame by blocking bad states
@@ -75,6 +108,14 @@ impl PdrSolver {
         // See #759: MBP soundness fix causes PDR to produce more point cubes
         let mut point_blocks_per_level: FxHashMap<usize, usize> = FxHashMap::default();
         const MAX_POINT_BLOCKS_PER_LEVEL: usize = 25;
+        // Workstream B (`DESIGN` §4.4, R1 `lift_caps`): under the lane the two
+        // enumeration exits become counters; `enum_valve` keeps a cap for
+        // sequential lanes. `None` = no exit.
+        let point_block_cap = point_block_cap_policy(
+            self.spacer_core,
+            &self.config.spacer,
+            MAX_POINT_BLOCKS_PER_LEVEL,
+        );
 
         // Clone queries (with clause indices) to avoid borrow issues with self
         let queries: Vec<(usize, HornClause)> = self
@@ -91,8 +132,12 @@ impl PdrSolver {
             // This handles both:
             // 1. Direct hyperedge queries (multiple body predicates)
             // 2. Indirect hyperedge queries (single body predicate defined by hyperedge clause)
-            if let Some(cex) = self.check_hyperedge_unsafe(query, *query_clause_index) {
-                return StrengthenResult::Unsafe(cex);
+            // (The nonlinear lane covers hyperedges with its own reach facts and
+            // multi-atom query steps, whose counterexamples are ground-checkable.)
+            if !self.lane_nonlinear {
+                if let Some(cex) = self.check_hyperedge_unsafe(query, *query_clause_index) {
+                    return StrengthenResult::Unsafe(cex);
+                }
             }
 
             // Skip direct hyperedge queries - can only be handled via must-summary intersection above
@@ -102,7 +147,23 @@ impl PdrSolver {
 
             let (pred_id, args) = &query.body.predicates[0];
             let constraint = query.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
-            let bad_state = match self.constraint_to_canonical_state(*pred_id, args, &constraint) {
+            // The root POB is later conjoined with fact clauses (level 0) and
+            // step clauses: the query clause is renamed apart first so its
+            // locals keep fresh names in the canonical state
+            // (`rename_clause_apart`); a failed rename takes the conservative
+            // canonical-state failure path below.
+            let renamed = self.source_names().and_then(|names| {
+                self.rename_clause_apart(
+                    &names,
+                    &format!("__query{query_clause_index}_"),
+                    &constraint,
+                    args,
+                    std::iter::empty(),
+                )
+            });
+            let bad_state = match renamed.and_then(|(constraint, args)| {
+                self.constraint_to_canonical_state(*pred_id, &args, &constraint)
+            }) {
                 Some(s) => s,
                 None => {
                     if self.config.verbose {
@@ -121,6 +182,16 @@ impl PdrSolver {
                     return StrengthenResult::Unknown;
                 }
             };
+            // The nonlinear lane: no query-local existentials in the root (a
+            // lemma would carry them free into the frames).
+            let bad_state = if self.lane_nonlinear {
+                self.nl_root_state(*pred_id, bad_state)
+            } else {
+                bad_state
+            };
+            if matches!(bad_state, ChcExpr::Bool(false)) {
+                continue;
+            }
             if self.config.verbose {
                 safe_eprintln!(
                     "PDR: Create obligation for bad state {} at level {}",
@@ -135,11 +206,41 @@ impl PdrSolver {
             }
         }
 
+        // The nonlinear lane: a multi-atom query clause has no root POB; a
+        // query step examines it whenever the queue drains, until every such
+        // query is blocked at this level (`blocking/reachability/nonlinear/queries.rs`).
+        let hyper_queries: Vec<(usize, HornClause)> = if self.lane_nonlinear {
+            queries
+                .iter()
+                .filter(|(_, q)| q.body.predicates.len() > 1)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Process proof obligations
         let mut processed = 0usize;
-        while let Some(pob) = self.pop_obligation() {
+        while let Some(pob) = match self.pop_obligation() {
+            Some(pob) => Some(pob),
+            None if hyper_queries.is_empty() => None,
+            None => match self.nl_query_round(&hyper_queries, current_level) {
+                NlRound::Children(children) => {
+                    for child in children {
+                        if enqueued.insert(key(&child)) {
+                            self.push_obligation(child);
+                        }
+                    }
+                    self.pop_obligation()
+                }
+                NlRound::Done(result) => return result,
+            },
+        } {
             enqueued.remove(&key(&pob));
             processed += 1;
+            // Under an effort a charge that stops the run latches the stop
+            // `is_cancelled` reads next (P4a slice 8).
+            let _ = crate::run_meter::charge(crate::run_meter::Step::Obligation);
 
             // Check cancellation or memory budget (#2769)
             if self.is_cancelled() {
@@ -197,6 +298,12 @@ impl PdrSolver {
             }
             self.tracing.active_pob = Some((pob.predicate.index(), pob.level, pob.depth));
             self.pdr_trace_step("Running", Some("BlockObligation"), Some(&pob));
+            // Workstream B board (R0): POB shape counters (telemetry only).
+            {
+                let cube = pob.cube();
+                let canon = self.canonical_vars(pob.predicate).map(<[_]>::to_vec);
+                self.spacer_stats.record_pob(&pob, &cube, canon.as_deref());
+            }
             tracing::info!(
                 action = "BlockObligation",
                 predicate = pob.predicate.index(),
@@ -209,7 +316,11 @@ impl PdrSolver {
             // SOUNDNESS: Only use this for early counterexample detection at the query level.
             // For intermediate levels, finding one reachable point doesn't mean the entire
             // POB should be skipped - we still need to try to block it.
-            if pob.level == current_level {
+            // (Not under the nonlinear lane: its own queries cover atoms by its
+            // reach facts, and a match against a legacy summary here would
+            // close a multi-atom query's child that the next query step, which
+            // cannot see that summary, recreates forever.)
+            if pob.level == current_level && !self.lane_nonlinear {
                 if let Some(rf_id) = self.check_must_reachability(&pob) {
                     // SOUNDNESS (agenda #6 MAY-POB): may-pobs must NEVER enter
                     // counterexample reconstruction. A may-pob that intersects
@@ -255,6 +366,18 @@ impl PdrSolver {
                             pob.level
                         );
                     }
+                    // Workstream B board (R0): one blocked POB, one lemma record.
+                    // Legacy attribution is coarse (original / point / other);
+                    // the board script refines it from the verbose source lines.
+                    self.spacer_stats.blocked_pobs += 1;
+                    {
+                        let source = if self.lane_lemma_pending.take().unwrap_or(false) {
+                            LemmaSource::LaneIndGen
+                        } else {
+                            self.classify_legacy_lemma_source(&pob, &lemma)
+                        };
+                        self.spacer_stats.record_legacy_lemma(&lemma, source);
+                    }
 
                     // Record blocked state for convex closure analysis
                     self.record_blocked_state_for_convex(pob.predicate, &pob.state);
@@ -285,6 +408,7 @@ impl PdrSolver {
                             continue;
                         }
                         blocked_at_level_0.push((pob.predicate, pob.state.clone()));
+                        self.spacer_stats.level0_blocked += 1;
 
                         // Detect degeneration into point enumeration: when we've blocked
                         // too many level-0 states without making progress, the algorithm
@@ -293,7 +417,16 @@ impl PdrSolver {
                         // Use a smaller limit (50) because each blocked state adds to the
                         // exclusion clause, causing exponential slowdown in SMT queries.
                         const MAX_LEVEL0_BLOCKED: usize = 50;
-                        if blocked_at_level_0.len() > MAX_LEVEL0_BLOCKED {
+                        let level0_cap = level0_cap_policy(
+                            self.spacer_core,
+                            &self.config.spacer,
+                            MAX_LEVEL0_BLOCKED,
+                        );
+                        if level0_cap.is_none() && blocked_at_level_0.len() > MAX_LEVEL0_BLOCKED {
+                            // Lifted exit (R1): counted, not fatal.
+                            self.spacer_stats.level0_cap_lifted += 1;
+                        }
+                        if level0_cap.is_some_and(|cap| blocked_at_level_0.len() > cap) {
                             if self.config.verbose {
                                 safe_eprintln!(
                                     "PDR: Exceeded {} blocked level-0 states, returning Unknown to avoid infinite enumeration",
@@ -320,6 +453,13 @@ impl PdrSolver {
                             self.add_lemma_to_frame(l.clone(), 0);
                             // Also add to frame[1] so the lemma participates in the inductive
                             // invariant construction (frame[0] is not used in the final model).
+                            //
+                            // Workstream B (D5, lock L-0): under the lane a level-0 lemma
+                            // enters frames[1] ONLY when the lane raised it to level ≥ 1
+                            // through a real Q2 at level 1 (`lemma.level >= 1`).
+                            if self.spacer_core && lemma.level == 0 {
+                                continue;
+                            }
                             let mut l1 = lemma.clone();
                             l1.level = 1;
                             // #2459: Hint/invariant context — use add_lemma_to_frame
@@ -346,8 +486,17 @@ impl PdrSolver {
                         }
                         continue;
                     }
-                    // At level 1+, add lemma to the frame and propagate to related predicates
-                    let lvl = pob.level.min(self.frames.len() - 1);
+                    // At level 1+, add lemma to the frame and propagate to related predicates.
+                    // Workstream B (D6): under the lane the lemma's own level (Phase D /
+                    // `uses_level`) is honoured, clamped to `[pob.level, top]`; legacy
+                    // lemmas always carry `lemma.level == pob.level`, so the legacy value
+                    // is unchanged.
+                    let top = self.frames.len() - 1;
+                    let lvl = if self.spacer_core {
+                        lemma.level.max(pob.level).min(top)
+                    } else {
+                        pob.level.min(top)
+                    };
 
                     // For cyclic SCCs, try simultaneous strengthening first
                     // This breaks cyclic dependencies by strengthening all SCC predicates together
@@ -364,6 +513,8 @@ impl PdrSolver {
                         }
                         for (pred, translated_formula) in scc_lemmas {
                             let scc_lemma = Lemma::new(pred, translated_formula, lvl);
+                            self.spacer_stats
+                                .record_legacy_lemma(&scc_lemma, LemmaSource::Scc);
                             // #2459: Blocking context — SCC lemmas from POB resolution.
                             self.add_blocking_lemma(scc_lemma, lvl);
                         }
@@ -376,6 +527,11 @@ impl PdrSolver {
                     let mut l = lemma.clone();
                     l.level = lvl;
                     self.add_blocking_lemma(l.clone(), lvl);
+                    // Workstream B progress witness (§4.4, S5): a child's lemma must
+                    // exclude the parent's Q1 body state.
+                    if self.spacer_core && pob.parent.is_some() {
+                        self.check_child_progress_witness(&pob, &l);
+                    }
 
                     // Track point-blocking lemmas to detect degeneration.
                     // Fix #963: Check the LEMMA's blocking formula, not the POB state.
@@ -399,14 +555,19 @@ impl PdrSolver {
                             // Feed concretize tracker (#4782): detect convergence stalls early
                             // so Reachable POBs at this (pred, level) can be concretized.
                             self.record_point_block_for_concretize(pob.predicate, lvl);
+                            self.spacer_stats.note_point_block(lvl);
 
                             let count = point_blocks_per_level.entry(lvl).or_insert(0);
                             *count += 1;
-                            if *count > MAX_POINT_BLOCKS_PER_LEVEL {
+                            if point_block_cap.is_none() && *count > MAX_POINT_BLOCKS_PER_LEVEL {
+                                // Lifted exit (R1): counted, not fatal.
+                                self.spacer_stats.point_block_cap_lifted += 1;
+                            }
+                            if let Some(cap) = point_block_cap.filter(|cap| *count > *cap) {
                                 if self.config.verbose {
                                     safe_eprintln!(
                                         "PDR: Exceeded {} point-blocking lemmas at level {}, returning Unknown to avoid infinite enumeration",
-                                        MAX_POINT_BLOCKS_PER_LEVEL,
+                                        cap,
                                         lvl
                                     );
                                 }
@@ -415,7 +576,7 @@ impl PdrSolver {
                                     serde_json::json!({
                                         "level": lvl,
                                         "point_block_count": *count,
-                                        "limit": MAX_POINT_BLOCKS_PER_LEVEL,
+                                        "limit": cap,
                                         "predicate": pob.predicate.index(),
                                     }),
                                     Some(&pob),
@@ -437,6 +598,8 @@ impl PdrSolver {
                             );
                         }
                         // #2459: Blocking context — convex closure from POB resolution.
+                        self.spacer_stats
+                            .record_legacy_lemma(&cc_lemma, LemmaSource::ConvexClosure);
                         self.add_blocking_lemma(cc_lemma, lvl);
                     }
 
@@ -504,6 +667,49 @@ impl PdrSolver {
                             predecessor.predicate.index(),
                             predecessor.state
                         );
+                    }
+                    self.spacer_stats.reachable_pobs += 1;
+                    if pob.level == 0 && self.lane_nonlinear {
+                        // The nonlinear lane tracks reachability by reach
+                        // facts: the fact hit becomes a point reach fact and
+                        // the POB closes as reachable.
+                        let fact = self
+                            .problem
+                            .clauses()
+                            .get(predecessor.clause_index)
+                            .and_then(|c| match &c.head {
+                                crate::ClauseHead::Predicate(_, a) => Some(a.clone()),
+                                crate::ClauseHead::False => None,
+                            });
+                        let rf = fact.and_then(|head_args| {
+                            self.nl_fact_reach_fact(
+                                pob.predicate,
+                                &head_args,
+                                &predecessor.smt_model,
+                                predecessor.clause_index,
+                            )
+                        });
+                        let Some((rf_id, _)) = rf else {
+                            // No reach fact: undecided, like a child Unknown
+                            // (the parent excludes this state next time).
+                            self.spacer_stats.nl_rf_fail += 1;
+                            match &pob.parent {
+                                Some(parent) => unknown_predecessors.push((
+                                    parent.level,
+                                    pob.predicate,
+                                    pob.state.clone(),
+                                )),
+                                None if !pob.is_may() => return StrengthenResult::Unknown,
+                                None => {}
+                            }
+                            continue;
+                        };
+                        if let Some(done) =
+                            self.nl_reachable_pob(&pob, rf_id, is_query_derived(&pob))
+                        {
+                            return done;
+                        }
+                        continue;
                     }
                     if pob.level == 0 {
                         // Reached initial state - counterexample found
@@ -708,6 +914,36 @@ impl PdrSolver {
                             .clone()
                             .with_incoming_clause(predecessor.clause_index)
                             .with_smt_model(predecessor.smt_model);
+                        // Re-concretise the chain forward before `build_cex` (D3):
+                        // consecutive witness entries must agree on the states
+                        // they share, which non-point child cubes (legacy MBP, the
+                        // lane's free POBs) do not guarantee; a failed walk keeps
+                        // the recorded models and the verifier decides either way.
+                        let pob_with_clause = match self.concretize_cex_chain(pob_with_clause) {
+                            Ok(p) => {
+                                self.spacer_stats.cex_concretize_ok += 1;
+                                p
+                            }
+                            Err((p, fail)) => {
+                                match fail {
+                                    super::model::ConcretizeFail::Unsat { .. } => {
+                                        self.spacer_stats.cex_concretize_fail_unsat += 1;
+                                    }
+                                    super::model::ConcretizeFail::Unknown { .. } => {
+                                        self.spacer_stats.cex_concretize_fail_unknown += 1;
+                                    }
+                                    super::model::ConcretizeFail::Hyperedge { .. } => {
+                                        self.spacer_stats.cex_concretize_hyperedge += 1;
+                                    }
+                                }
+                                if self.config.verbose {
+                                    safe_eprintln!(
+                                        "PDR-SPACER: cex concretisation failed ({fail:?}); keeping the recorded models"
+                                    );
+                                }
+                                p
+                            }
+                        };
                         return StrengthenResult::Unsafe(self.build_cex(&pob_with_clause));
                     }
                     // MAY-POB gas discipline (agenda #6): descending to a
@@ -744,13 +980,38 @@ impl PdrSolver {
                         .clone()
                         .with_incoming_clause(predecessor.clause_index)
                         .with_smt_model(predecessor.smt_model.clone());
-                    let mut child_pob = ProofObligation::new(
-                        predecessor.predicate,
-                        predecessor.state,
-                        pob.level - 1,
-                    )
-                    .with_parent(parent_for_chain)
-                    .with_smt_model(predecessor.smt_model);
+                    // Workstream B (contract C8): under `free_pob` a SAT fact clause of
+                    // the POB's own predicate spawns the child AT LEVEL 0 (its level-0
+                    // check is SAT by model containment and starts the concretisation
+                    // walk); otherwise `level - 1` as today. `PredecessorState.lits`
+                    // (P's literal view) rides along as `ProofObligation.lits`.
+                    let child_level = if self.spacer_core
+                        && self.config.spacer.free_pob
+                        && self
+                            .problem
+                            .clauses()
+                            .get(predecessor.clause_index)
+                            .is_some_and(HornClause::is_fact)
+                    {
+                        0
+                    } else {
+                        pob.level - 1
+                    };
+                    let PredecessorState {
+                        predicate: pred_predicate,
+                        state: pred_state,
+                        clause_index: _,
+                        smt_model: pred_smt_model,
+                        derivation_id: pred_derivation_id,
+                        lits: pred_lits,
+                    } = *predecessor;
+                    let mut child_pob =
+                        ProofObligation::new(pred_predicate, pred_state, child_level)
+                            .with_parent(parent_for_chain)
+                            .with_smt_model(pred_smt_model);
+                    if let Some(lits) = pred_lits {
+                        child_pob.lits = Some(std::sync::Arc::new(lits));
+                    }
 
                     // MAY-POB lineage (agenda #6): children inherit the may kind
                     // (and pay one unit of gas) so the entire lineage stays out of
@@ -761,7 +1022,7 @@ impl PdrSolver {
                         pob.gas = pob.gas.saturating_sub(1);
                         child_pob.kind = pob.kind;
                         child_pob.gas = pob.gas;
-                    } else if let Some(deriv_id) = predecessor.derivation_id {
+                    } else if let Some(deriv_id) = pred_derivation_id {
                         // #1275: Propagate derivation_id to child POBs for hyperedge tracking.
                         child_pob = child_pob.with_derivation_id(deriv_id);
                     }
@@ -819,9 +1080,27 @@ impl PdrSolver {
                         self.push_obligation_front(child_pob);
                     }
                 }
+                BlockResult::MustReachable(rf_id) => {
+                    self.spacer_stats.reachable_pobs += 1;
+                    if let Some(done) = self.nl_reachable_pob(&pob, rf_id, is_query_derived(&pob)) {
+                        return done;
+                    }
+                }
                 BlockResult::Unknown => {
                     if self.config.verbose {
                         safe_eprintln!("PDR: block_obligation returned Unknown");
+                    }
+                    {
+                        let class =
+                            self.pending_unknown_class
+                                .take()
+                                .unwrap_or(if self.is_cancelled() {
+                                    UnknownClass::Cancelled
+                                } else {
+                                    UnknownClass::Other
+                                });
+                        let root = pob.parent.is_none() && !pob.is_may();
+                        self.spacer_stats.record_unknown(class, root);
                     }
                     // If this POB has a parent, mark this state as an unknown predecessor
                     // at the parent's level so we try to find a different predecessor
@@ -904,5 +1183,80 @@ impl PdrSolver {
         }
 
         StrengthenResult::Safe
+    }
+}
+
+impl PdrSolver {
+    /// Coarse R0 attribution of a legacy-path lemma (the verbose source lines
+    /// carry the fine-grained strategy; the board script reads those):
+    /// `Original` when the lemma is exactly `¬pob.state`, `PointBlock` when its
+    /// cube is a point cube over the canonical variables, else `Unknown`
+    /// (cascade / template / IUC are not distinguishable from here).
+    fn classify_legacy_lemma_source(&self, pob: &ProofObligation, lemma: &Lemma) -> LemmaSource {
+        let inner = match &lemma.formula {
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => &*args[0],
+            _ => return LemmaSource::Unknown,
+        };
+        if *inner == pob.state {
+            return LemmaSource::Original;
+        }
+        if let Some(canon) = self.canonical_vars(pob.predicate) {
+            if cube::is_point_cube_for_vars(inner, canon) {
+                return LemmaSource::PointBlock;
+            }
+        }
+        LemmaSource::Unknown
+    }
+
+    /// Progress witness (`DESIGN` §4.4 / S5): the new lemma `¬C` of a CHILD
+    /// POB must exclude the body state of the parent's Q1 model (`pob.smt_model`,
+    /// the model of the incoming clause recorded on the child). `C` on the body
+    /// args evaluating to `false` means the model's body state is NOT in `C`,
+    /// so `¬C` leaves it reachable — INV-P was violated upstream (counted,
+    /// debug-asserted; release continues). `None` (opaque atoms) is not a violation.
+    fn check_child_progress_witness(&mut self, pob: &ProofObligation, lemma: &Lemma) {
+        let Some(model) = pob.smt_model.as_ref() else {
+            return;
+        };
+        let Some(parent) = pob.parent.as_deref() else {
+            return;
+        };
+        let Some(clause_index) = parent.incoming_clause else {
+            return;
+        };
+        let Some(clause) = self.problem.clauses().get(clause_index) else {
+            return;
+        };
+        if clause.body.predicates.len() != 1 {
+            return;
+        }
+        let (body_pred, body_args) = &clause.body.predicates[0];
+        if *body_pred != pob.predicate {
+            return;
+        }
+        let cube_expr = match &lemma.formula {
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => &*args[0],
+            _ => return,
+        };
+        let Some(cube_on_body) = self.apply_to_args(pob.predicate, cube_expr, body_args) else {
+            return;
+        };
+        if let Some(crate::smt::SmtValue::Bool(false)) =
+            crate::expr::evaluate_expr(&cube_on_body, model)
+        {
+            self.spacer_stats.pob_no_progress += 1;
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR-SPACER: BUG (INV-P): lemma {} does not exclude the parent's body state (pred={} level={})",
+                    lemma.formula,
+                    pob.predicate.index(),
+                    pob.level
+                );
+            }
+            debug_assert!(
+                false,
+                "BUG (INV-P): child lemma does not exclude the parent's Q1 body state"
+            );
+        }
     }
 }

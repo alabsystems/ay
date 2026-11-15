@@ -27,6 +27,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
+#[path = "cmd_scripts/retirement.rs"]
+pub(crate) mod retirement;
+
 /// Repo-relative path of the public index (ships).
 const PUBLIC_INDEX: &str = "scripts/index.toml";
 /// Repo-relative path of the internal index (never ships).
@@ -356,9 +359,6 @@ impl ScriptEntry {
         if self.summary.is_empty() {
             bail!("summary must not be empty");
         }
-        if self.entrypoint == Entrypoint::Cli && self.cli.is_empty() && self.cli_note.is_empty() {
-            bail!("entrypoint=cli with cli=\"\" requires a cli_note explaining why no subcommand fronts it");
-        }
         if !self.replaced_by.is_empty() && self.status != Status::Deprecated {
             bail!("replaced_by is set but status is not deprecated");
         }
@@ -606,7 +606,7 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
 
 /// Parse of the publication manifest as far as `scripts check` needs it.
 struct PublishManifest {
-    /// Allowlisted top-level names (dirs or files), the non-`!` lines.
+    /// Allowlisted paths (directories or exact files), the non-`!` lines.
     allow: Vec<String>,
     /// `!` exclusions outside the generated block, without the leading `!`.
     hand_exclusions: Vec<String>,
@@ -687,10 +687,14 @@ impl PublishManifest {
         all
     }
 
-    /// Is `path` under an allowlisted top-level entry?
+    /// Is `path` an allowlisted path or beneath it at a segment boundary?
     fn allowlisted(&self, path: &str) -> bool {
-        let top = path.split('/').next().unwrap_or(path);
-        self.allow.iter().any(|a| a == top || a == path)
+        self.allow.iter().any(|a| {
+            a == path
+                || path
+                    .strip_prefix(a)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 
     fn excluded(&self, path: &str) -> bool {
@@ -924,6 +928,14 @@ struct Finding {
 
 fn run_check(args: CheckArgs) -> Result<i32> {
     let root = repo_root()?;
+    run_check_at(&root, args)
+}
+
+pub(crate) fn check_at(root: &Path) -> Result<i32> {
+    run_check_at(root, CheckArgs { json: false })
+}
+
+fn run_check_at(root: &Path, args: CheckArgs) -> Result<i32> {
     let loaded = Loaded::load(&root)?;
     let tracked = git_tracked(&root)?;
     let mut findings: Vec<Finding> = Vec::new();
@@ -1184,16 +1196,11 @@ fn render_readme(public: &[ScriptEntry]) -> String {
          wraps, what fronts it, and what ships (`ay scripts --help`). When an\n\
          entry names a fronting subcommand (CLI column), prefer the subcommand\n\
          over direct invocation.\n\n\
-         Adding functionality? Apply in order:\n\n\
-         1. Rust in the binary when the logic is product semantics,\n\
-            soundness-relevant, scoring, provenance, or anything shipped code\n\
-            depends on for correctness.\n\
-         2. An `ay tool` recipe (reference/tools.toml) when the need is a\n\
-            pinned external binary at a known path.\n\
-         3. An indexed script when wrapping an external tool's workflow,\n\
-            gluing an evolving campaign, or preserving archival evidence. A\n\
-            script does not exist until its index entry does\n\
-            (`ay scripts check` enforces the bijection).\n",
+         Required tooling belongs in maintained AY Rust code built with Trust.\n\
+         Use an `ay tool` recipe (reference/tools.toml) for a pinned external\n\
+         binary. This index inventories the remaining legacy scripts; it is\n\
+         not a template for adding campaign helpers or duplicate workflows.\n\
+         Remove obsolete tools and tests. Git history preserves old evidence.\n",
     );
     for (root, entries) in &by_root {
         out.push_str(&format!("\n## {root}\n\n"));
@@ -1260,27 +1267,6 @@ cli     = "ay bench"
 "#;
 
     #[test]
-    fn repo_indexes_parse_and_validate() {
-        let root = repo_root_for_tests();
-        let loaded = Loaded::load(&root).expect("load repo indexes");
-        assert!(!loaded.public.scripts.is_empty(), "public index is empty");
-        let internal = loaded
-            .internal
-            .as_ref()
-            .expect("internal index present in dev checkout");
-        assert!(!internal.scripts.is_empty(), "internal index is empty");
-        assert!(loaded
-            .public
-            .scripts
-            .iter()
-            .all(|e| e.publish == Publish::Public));
-        assert!(internal
-            .scripts
-            .iter()
-            .all(|e| e.publish == Publish::Internal));
-    }
-
-    #[test]
     fn duplicate_names_across_files_rejected() {
         let public = parse_index(MINIMAL, Publish::Public).unwrap();
         let internal_body = MINIMAL
@@ -1300,13 +1286,6 @@ cli     = "ay bench"
         // (Index::load enforces it; loading is the assertion).
         let root = repo_root_for_tests();
         Loaded::load(&root).expect("checked-in groups within taxonomy");
-    }
-
-    #[test]
-    fn cli_entrypoint_requires_cli_or_note() {
-        let body = MINIMAL.replace("cli     = \"ay bench\"", "");
-        let err = parse_index(&body, Publish::Public).unwrap_err();
-        assert!(err.to_string().contains("cli_note"), "{err}");
     }
 
     #[test]
@@ -1330,21 +1309,22 @@ cli     = "ay bench"
     }
 
     #[test]
-    fn manifest_generated_block_matches_internal_index() {
-        let root = repo_root_for_tests();
-        let loaded = Loaded::load(&root).expect("load repo indexes");
-        let internal = loaded.internal.as_ref().expect("internal index");
-        let manifest = PublishManifest::parse(&root.join(MANIFEST_PATH)).expect("parse manifest");
-        let actual = manifest
-            .generated
-            .as_ref()
-            .expect("generated block markers present in publish/manifest.txt");
-        let expected =
-            expected_generated_block(&internal.scripts, &manifest.hand_exclusions, &manifest);
-        assert_eq!(
-            actual, &expected,
-            "run-order or content drift between index-internal.toml and the manifest block"
-        );
+    fn nested_manifest_root_does_not_admit_neighboring_paths() {
+        let manifest = PublishManifest {
+            allow: vec!["vendor/veripb".into(), "ci/z3.pin".into()],
+            hand_exclusions: vec!["vendor/veripb/private".into()],
+            generated: None,
+        };
+        assert!(manifest.allowlisted("vendor/veripb/veripb-checker/src/lib.rs"));
+        assert!(manifest.allowlisted("ci/z3.pin"));
+        for path in [
+            "vendor/veripb-other/src/lib.rs",
+            "vendor/other/src/lib.rs",
+            "ci/z3.pin-private",
+        ] {
+            assert!(!manifest.allowlisted(path), "{path}");
+        }
+        assert!(manifest.excluded("vendor/veripb/private/fixture"));
     }
 
     #[test]

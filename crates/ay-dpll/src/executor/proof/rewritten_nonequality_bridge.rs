@@ -182,8 +182,22 @@ impl Executor {
             .take(proof.steps.len())
             .collect();
         let mut planned = 0usize;
+        // One stop for the pass (`make_proof_assembly_should_stop`), polled
+        // per leaf and per root.
+        let stop = self.make_proof_assembly_should_stop();
         for (index, atom) in leaves {
-            let Some(fragment) = self.plan_nonequality_fragment(atom, &pool, &leaf_of, &roots)
+            // Up to 512 leaves x 64 roots, each a congruence closure over the
+            // whole pool: the sibling lane's loop polls the assembly stop and
+            // this one did not. On QF_BV Sage2 `bench_17445` a deadline that
+            // landed inside a nested certification re-solve's assembly was
+            // observed only by the watchdog's hard exit (sampled 0.5 s past
+            // the deadline, 5/5 inside `plan_definitional_bridge` here).
+            // Planning nothing is the lane's fail-closed answer.
+            if stop() {
+                return 0;
+            }
+            let Some(fragment) =
+                self.plan_nonequality_fragment(atom, &pool, &leaf_of, &roots, &stop)
             else {
                 continue;
             };
@@ -226,17 +240,22 @@ impl Executor {
         roots
     }
 
-    /// Plan the replacement fragment for one leaf, or `None`.
+    /// Plan the replacement fragment for one leaf, or `None`; `None` too once
+    /// the pass's `stop` fires.
     pub(super) fn plan_nonequality_fragment(
         &mut self,
         atom: TermId,
         pool: &[TermId],
         leaf_of: &DetHashMap<TermId, HypothesisLeaf>,
         roots: &DetHashMap<(String, usize), Vec<TermId>>,
+        stop: &dyn Fn() -> bool,
     ) -> Option<Vec<ProofStep>> {
         let key = head_key(&self.ctx.terms, atom)?;
         let candidates = roots.get(&key)?;
         for &root in candidates.iter().take(MAX_ROOTS_PER_LEAF) {
+            if stop() {
+                return None;
+            }
             if root == atom {
                 continue;
             }
@@ -262,7 +281,7 @@ impl Executor {
             // Guard 6.
             let closed =
                 ay_proof::close_congruence_derivation(&mut self.ctx.terms, &bridge.derivation);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+            if self.check_proof_strict_until_stopped(&closed).is_err() {
                 continue;
             }
             let Some(mut fragment) = self.assemble_bridge_fragment(&bridge, leaf_of, goal) else {
@@ -344,7 +363,7 @@ impl Executor {
                 clause: clause.clone(),
             };
             let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &derivation);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_ok() {
+            if self.check_proof_strict_until_stopped(&closed).is_ok() {
                 return Some(rule);
             }
         }

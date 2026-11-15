@@ -12,14 +12,37 @@
 //! Extracted from `model.rs` as part of the structural split (#5970).
 
 use super::*;
-use crate::expr::evaluate_expr;
 
+mod budget;
 mod helpers;
+mod window;
+pub(super) use budget::{ConcreteAnswer, ConcreteBudget};
+// Only tests build a stop by hand; a verifier's comes from
+// `PdrSolver::concrete_budget`.
+#[cfg(test)]
+pub(super) use budget::ConcreteStop;
 use helpers::*;
+use window::*;
 
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod empty_domain_tests;
+
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod window_tests;
+
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod budget_tests;
+
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod stop_tests;
 
 /// Range descriptor for concrete enumeration: Int or BV variable.
 pub(super) enum ConcreteCheckRange {
@@ -33,6 +56,17 @@ pub(super) enum ConcreteCheckRange {
         width: u32,
         count: u128,
     },
+}
+
+impl ConcreteCheckRange {
+    /// True when the range holds no value: an `Int` range whose bounds cross,
+    /// or a `BitVec` range of no values.
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            ConcreteCheckRange::Int { lo, hi, .. } => lo > hi,
+            ConcreteCheckRange::BitVec { count, .. } => *count == 0,
+        }
+    }
 }
 
 /// Simple deterministic xorshift64 PRNG for Monte Carlo sampling.
@@ -77,7 +111,8 @@ impl Xorshift64 {
 /// Concrete transition check: exhaustive or Monte Carlo sampling (#5381, #5539).
 ///
 /// Collects Int and small BV (≤8-bit) variables from the query, extracts bounds
-/// from the body, and evaluates the formula on concrete assignments:
+/// from the body, gives each Int variable at most 201 values inside its bounds
+/// ([`int_check_window`]), and evaluates the formula on concrete assignments:
 ///
 /// 1. **Exhaustive** (≤10000 combos): tests all assignments in bounded range.
 /// 2. **Monte Carlo** (>10000 combos): boundary-seeded random sampling, 10000 samples
@@ -86,73 +121,103 @@ impl Xorshift64 {
 ///
 /// FIX #5539: Previously bailed out on >4 variables, leaving most CHC-COMP
 /// LIA benchmarks (6-20+ variables) completely unchecked.
+///
+/// This form runs to completion, and only tests call it. The verifiers call
+/// [`ConcreteBudget::check`], which searches the same domain under their time
+/// accounting and stops when their solve does.
+#[cfg(test)]
 pub(super) fn transition_check(
     body: &ChcExpr,
     _head: &ChcExpr,
     query: &ChcExpr,
 ) -> Option<FxHashMap<String, SmtValue>> {
-    // Collect Int and small BV variables from the query
-    let vars: Vec<ChcVar> = query
-        .vars()
-        .into_iter()
-        .filter(|v| match &v.sort {
-            ChcSort::Int => true,
-            ChcSort::BitVec(w) => *w <= 8,
-            _ => false,
-        })
-        .collect();
+    let stop = ConcreteStop::none();
+    CheckDomain::new(body, query)?.search(&mut Probe::new(query, None, stop.resolve()))
+}
 
-    if vars.is_empty() {
-        return None;
+/// What one concrete check enumerates.
+pub(super) struct CheckDomain {
+    ranges: Vec<ConcreteCheckRange>,
+    bounds: FxHashMap<String, (i64, i64)>,
+    /// An Int range lies wholly beyond ±100 and is searched on its anchored
+    /// window. Before 2026-11-01 the centred window emptied it, so the check
+    /// evaluated nothing on this domain and answered `None` at once.
+    pub(super) anchored: bool,
+}
+
+impl CheckDomain {
+    /// The domain `query` is searched on, or `None` when there is nothing to
+    /// evaluate: no Int or small BV variable, or a range that holds no value.
+    pub(super) fn new(body: &ChcExpr, query: &ChcExpr) -> Option<Self> {
+        // Collect Int and small BV variables from the query
+        let all_vars = query.vars();
+        let vars: Vec<ChcVar> = all_vars
+            .iter()
+            .filter(|v| match &v.sort {
+                ChcSort::Int => true,
+                ChcSort::BitVec(w) => *w <= 8,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        if vars.is_empty() {
+            return None;
+        }
+
+        // Extract bounds from body conjuncts (for Int vars)
+        let bounds = extract_int_bounds_from_conjuncts(body);
+        let (ranges, anchored) = check_ranges(&vars, &all_vars, &bounds);
+
+        // A domain with an empty range holds no assignment, so the exhaustive
+        // enumeration's answer is `None` without evaluating anything; answer
+        // it here. An Int range is empty when its extracted bounds cross
+        // (`x >= 150 /\ x <= 100` gives `150..=100`), which no value
+        // satisfies, or, for a name another variable's lookup can read, when
+        // the centred clamp misses its bounds (`x >= 150`). Such a domain's
+        // product below is 0, which chose the exhaustive branch, and the
+        // enumeration finds the empty range only at its own depth: with `k`
+        // ranges before it, it walks every assignment of those (up to 201^k)
+        // and evaluates nothing, and so polls nothing (the probe is polled
+        // before each evaluation), and a PDR worker sat in it for hours
+        // (Trust's verification of ay-sat, 2026-10-31). With every range
+        // non-empty, the exhaustive branch evaluates exactly `total` (at most
+        // 10000) assignments, polling the probe before each.
+        if ranges.iter().any(ConcreteCheckRange::is_empty) {
+            return None;
+        }
+        Some(Self {
+            ranges,
+            bounds,
+            anchored,
+        })
     }
 
-    // Extract bounds from body conjuncts (for Int vars)
-    let bounds = extract_int_bounds_from_conjuncts(body);
-
-    // Build ranges for each variable, using wider defaults (#5539)
-    let ranges: Vec<ConcreteCheckRange> = vars
-        .iter()
-        .map(|v| match &v.sort {
-            ChcSort::BitVec(w) => ConcreteCheckRange::BitVec {
-                name: v.name.clone(),
-                width: *w,
-                count: 1u128.checked_shl(*w).unwrap_or(u128::MAX),
-            },
-            _ => {
-                let (lo, hi) = bounds
-                    .get(&v.name)
-                    .map(|(l, u)| (*l, *u))
-                    .unwrap_or((-50, 50));
-                // Wider clamp: [-100, 100], max per-var range 200
-                let lo = lo.max(-100);
-                let hi = hi.min(100).min(lo.saturating_add(200));
-                ConcreteCheckRange::Int {
-                    name: v.name.clone(),
-                    lo,
-                    hi,
+    /// Evaluate the probe's query on this domain's assignments until one makes
+    /// it true, the assignments run out, or the probe stops.
+    fn search(&self, probe: &mut Probe<'_>) -> Option<FxHashMap<String, SmtValue>> {
+        // Estimate total combinations (overflow-safe via saturating arithmetic)
+        let total: u64 = self
+            .ranges
+            .iter()
+            .map(|r| match r {
+                ConcreteCheckRange::Int { lo, hi, .. } => {
+                    (i128::from(*hi) - i128::from(*lo) + 1).max(0) as u64
                 }
-            }
-        })
-        .collect();
+                ConcreteCheckRange::BitVec { count, .. } => {
+                    u64::try_from(*count).unwrap_or(u64::MAX)
+                }
+            })
+            .fold(1u64, u64::saturating_mul);
 
-    // Estimate total combinations (overflow-safe via saturating arithmetic)
-    let total: u64 = ranges
-        .iter()
-        .map(|r| match r {
-            ConcreteCheckRange::Int { lo, hi, .. } => {
-                (i128::from(*hi) - i128::from(*lo) + 1).max(0) as u64
-            }
-            ConcreteCheckRange::BitVec { count, .. } => u64::try_from(*count).unwrap_or(u64::MAX),
-        })
-        .fold(1u64, u64::saturating_mul);
-
-    if total <= 10000 {
-        // Small enough for exhaustive enumeration
-        let mut assignment: FxHashMap<String, SmtValue> = FxHashMap::default();
-        enumerate_and_check_generic(&ranges, 0, &mut assignment, query)
-    } else {
-        // Monte Carlo random sampling for large variable sets (#5539)
-        monte_carlo_transition_check(&ranges, &bounds, query)
+        if total <= 10000 {
+            // Small enough for exhaustive enumeration
+            let mut assignment: FxHashMap<String, SmtValue> = FxHashMap::default();
+            enumerate_and_check_generic(&self.ranges, 0, &mut assignment, probe)
+        } else {
+            // Monte Carlo random sampling for large variable sets (#5539)
+            monte_carlo_transition_check(&self.ranges, &self.bounds, probe)
+        }
     }
 }
 
@@ -192,8 +257,9 @@ pub(super) fn transition_check(
 fn monte_carlo_transition_check(
     ranges: &[ConcreteCheckRange],
     bounds: &FxHashMap<String, (i64, i64)>,
-    query: &ChcExpr,
+    probe: &mut Probe<'_>,
 ) -> Option<FxHashMap<String, SmtValue>> {
+    let query = probe.query();
     // #5653: Adaptive sample count based on variable count.
     // High-variable-count formulas have huge search spaces where random
     // sampling is unlikely to find point counterexamples anyway. Reducing
@@ -294,7 +360,7 @@ fn monte_carlo_transition_check(
         ranges,
         &boundary_values,
         &mut assignment,
-        query,
+        probe,
         boundary_limit,
         &mut samples_checked,
     );
@@ -303,7 +369,7 @@ fn monte_carlo_transition_check(
     }
 
     // Phase 2: Random sampling for remaining budget
-    while samples_checked < max_samples {
+    while samples_checked < max_samples && !probe.stopped() {
         assignment.clear();
         for r in ranges {
             let (name, val) = match r {
@@ -325,7 +391,7 @@ fn monte_carlo_transition_check(
         }
         samples_checked += 1;
 
-        if evaluate_expr(query, &assignment) == Some(SmtValue::Bool(true)) {
+        if probe.holds(&assignment) {
             return Some(assignment);
         }
     }

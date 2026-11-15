@@ -50,8 +50,41 @@ fn temp_output_path(ext: &str) -> (std::path::PathBuf, CleanupGuard) {
     (path.clone(), CleanupGuard(path))
 }
 
-/// Assert the canonical RunStatistics envelope headers are present.
+/// Assert no statistics output restates the build stamp.
+///
+/// Meridian PR1 (58f2aaa13) made the `c ay.session.*` markers the only lines
+/// that name the build: the `c ay.build.stamp:` row a stats block used to carry
+/// was one more copy of `build.stamp=` (two more on SMT runs). HOW MANY markers
+/// carry it is the session-log level's business — `AY_SESSION_LOG=full`, which
+/// any competition signal forces, puts it on the end marker too — and
+/// `build_version_stamp_8870` pins that per level; so this checks only what the
+/// statistics surfaces changed, and holds at every level. The stamp's value is
+/// taken from the start marker when there is one, so a restatement under a new
+/// key spelling is caught too.
+fn assert_build_stamp_not_restated(stderr: &str) {
+    let stamp = stderr.lines().find_map(|line| {
+        line.strip_prefix("c ay.session.start ")?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("build.stamp="))
+    });
+    for line in stderr
+        .lines()
+        .filter(|line| !line.starts_with("c ay.session."))
+    {
+        assert!(
+            !line.contains("build.stamp") && stamp.is_none_or(|stamp| !line.contains(stamp)),
+            "only the session markers may state the build stamp; {line:?} restates it in: {stderr}"
+        );
+    }
+}
+
+/// Assert the canonical `c --- AY statistics ---` block (DIMACS, CHC and
+/// portfolio runs) carries its envelope rows.
 fn assert_common_stats_envelope(stderr: &str) {
+    assert!(
+        stderr.contains("c --- AY statistics ---"),
+        "Expected the canonical AY statistics block in stderr: {stderr}"
+    );
     assert!(
         stderr.contains("ay.mode:"),
         "Expected ay.mode in stderr: {stderr}"
@@ -64,10 +97,80 @@ fn assert_common_stats_envelope(stderr: &str) {
         stderr.contains("ay.wall_time_ms:"),
         "Expected ay.wall_time_ms in stderr: {stderr}"
     );
+    assert_build_stamp_not_restated(stderr);
+}
+
+/// Assert an SMT `--stats`/`-st` run printed the curated `(:statistics …)`
+/// block and nothing else.
+///
+/// Meridian PR1 (58f2aaa13) removed the `c --- AY statistics ---` block from
+/// SMT runs: it restated a subset of the s-expression block under a second
+/// set of names. The s-expression block is the SMT idiom, so it must be
+/// present, state the verdict, and carry the search counters the comment
+/// block used to repeat.
+fn assert_smt_statistics_block(stderr: &str, verdict: &str) {
     assert!(
-        stderr.contains("ay.build.stamp:"),
-        "Expected ay.build.stamp in stderr: {stderr}"
+        stderr.contains("(:statistics"),
+        "Expected the SMT-LIB statistics block in stderr: {stderr}"
     );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>() == [":result", verdict]),
+        "Expected `:result {verdict}` in the statistics block: {stderr}"
+    );
+    for key in [
+        ":total-time",
+        ":conflicts",
+        ":decisions",
+        ":propagations",
+        ":restarts",
+        ":theory-conflicts",
+        ":theory-propagations",
+    ] {
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(key)),
+            "Expected {key} in the SMT statistics block: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("--- AY statistics ---") && !stderr.contains("ay.mode:"),
+        "an SMT run must emit the s-expression block alone, not the comment block: {stderr}"
+    );
+    assert_build_stamp_not_restated(stderr);
+}
+
+/// Assert the machine-readable envelope of an SMT run: after 58f2aaa13 the
+/// SMT `RunStatistics` envelope is reachable only through `--stats-json`.
+fn assert_smt_stats_json_envelope(stderr: &str, verdict: &str) {
+    let parsed = parse_stats_json_line(stderr);
+    assert_eq!(
+        parsed["mode"], "smt",
+        "SMT run must be tagged smt: {parsed}"
+    );
+    assert_eq!(parsed["result"], verdict, "{parsed}");
+    assert!(
+        parsed["wall_time_ms"].is_u64(),
+        "expected numeric wall_time_ms: {parsed}"
+    );
+    assert!(
+        parsed["ay_build"]["stamp"]
+            .as_str()
+            .is_some_and(|stamp| !stamp.is_empty()),
+        "the JSON envelope must carry build provenance: {parsed}"
+    );
+    for key in [
+        "conflicts",
+        "decisions",
+        "propagations",
+        "restarts",
+        "smt.theory_conflicts",
+        "smt.theory_propagations",
+    ] {
+        stats_json_u64(&parsed, key);
+    }
 }
 
 /// Assert SAT-level counters are present in the envelope (SMT + DIMACS modes).
@@ -390,20 +493,25 @@ fn test_cli_stats_flag_prints_statistics_after_check_sat() {
         "Expected assertion count in stderr stats: {stderr}"
     );
 
-    assert_common_stats_envelope(&stderr);
-    assert_sat_counters_in_envelope(&stderr);
+    assert_smt_statistics_block(&stderr, "sat");
     assert!(
         !stderr.contains("dimacs-sat"),
         "SMT run should not be tagged dimacs-sat: {stderr}"
     );
+
+    // The canonical envelope — mode tag, SAT counters and the SMT theory keys —
+    // is the `--stats-json` line for SMT runs.
+    let json_output = Command::new(ay_path)
+        .arg("--stats-json")
+        .arg(&temp_path)
+        .output()
+        .expect("failed to spawn ay --stats-json");
     assert!(
-        stderr.contains("smt.theory_conflicts:"),
-        "Expected SMT theory conflicts key in stderr: {stderr}"
+        json_output.status.success(),
+        "Expected zero exit status from --stats-json, got {:?}",
+        json_output.status
     );
-    assert!(
-        stderr.contains("smt.theory_propagations:"),
-        "Expected SMT theory propagations key in stderr: {stderr}"
-    );
+    assert_smt_stats_json_envelope(&String::from_utf8_lossy(&json_output.stderr), "sat");
 }
 
 #[test]
@@ -434,10 +542,27 @@ fn test_cli_stats_authenticates_checked_projection_sat() {
         warmup.status,
         String::from_utf8_lossy(&warmup.stderr)
     );
+    // Every statistics envelope must attest the same build stamp as --version.
+    let version_stdout = String::from_utf8_lossy(&warmup.stdout);
+    let attested_stamp = version_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("build.stamp="))
+        .unwrap_or_else(|| panic!("--version must attest build.stamp=: {version_stdout}"));
 
+    // Check the canonical statistics contract in both solve paths. A SAT
+    // projection closure must carry its checked-certificate counter.
+    const CERTIFICATE_KEY: &str = "model_validation.checked_projection_certificate";
     for self_check in [false, true] {
         let mut command = Command::new(ay_path);
-        command.arg("-st");
+        command.args([
+            "solve",
+            "--quiet",
+            "--no-proof",
+            "--no-verify-proof",
+            "--stats-json",
+            "--memory",
+            "512",
+        ]);
         if self_check {
             command.arg("--self-check");
         }
@@ -458,27 +583,104 @@ fn test_cli_stats_authenticates_checked_projection_sat() {
             "self_check={self_check}: {stdout}"
         );
 
+        // Under `--quiet`, stderr is the envelope and nothing else: one line
+        // that is one whole JSON object.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let certificate_lines: Vec<_> = stderr
-            .lines()
-            .filter(|line| {
-                line.trim_start()
-                    .starts_with("c model_validation.checked_projection_certificate:")
-            })
-            .collect();
+        let lines: Vec<_> = stderr.lines().filter(|line| !line.is_empty()).collect();
+        assert!(
+            lines.len() == 1 && lines[0].starts_with('{') && lines[0].ends_with('}'),
+            "self_check={self_check}: expected exactly one statistics envelope: {stderr}"
+        );
+        // Counted in the raw bytes: a JSON reader keeps the LAST of two equal
+        // keys, so a doubled counter would otherwise read as one clean value.
         assert_eq!(
-            certificate_lines.len(),
+            lines[0].matches(&format!("\"{CERTIFICATE_KEY}\"")).count(),
             1,
             "self_check={self_check}: the canonical statistics envelope must expose exactly one checked-projection certificate counter: {stderr}"
         );
+        let parsed: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("the statistics envelope must be valid JSON");
+        assert_eq!(parsed["mode"], "smt", "self_check={self_check}: {parsed}");
+        assert_eq!(parsed["result"], "sat", "self_check={self_check}: {parsed}");
+        assert!(
+            parsed["wall_time_ms"].is_u64(),
+            "self_check={self_check}: expected numeric wall_time_ms: {parsed}"
+        );
         assert_eq!(
-            certificate_lines[0]
-                .strip_prefix("c model_validation.checked_projection_certificate:")
-                .map(str::trim),
-            Some("1"),
+            parsed["ay_build"]["stamp"].as_str(),
+            Some(attested_stamp),
+            "self_check={self_check}: the envelope must name the binary --version attests: {parsed}"
+        );
+        assert_eq!(
+            stats_json_u64(&parsed, CERTIFICATE_KEY),
+            1,
             "self_check={self_check}: the SAT verdict must carry exactly one checked-projection certificate: {stderr}"
         );
     }
+}
+
+/// `--stats-full` must expose the SAT-evidence signal for the constructive
+/// quantified lane.
+///
+/// `model_check_gate.result` is the key an operator or an evidence census reads
+/// to learn whether a published `sat` was independently confirmed and by which
+/// authority. This lane decides the authored query before the ordinary funnel
+/// runs, and used to publish `sat` with the key absent entirely — so the two
+/// UFBV `wintersteiger/fmsd13/fixpoint` corpus files, whose shape this fixture
+/// reproduces, were indistinguishable from a `sat` nothing had confirmed.
+///
+/// The value must name THIS authority rather than the compositional gate's:
+/// that gate never ran, and `ay_model_check`'s evaluator reports
+/// `CannotConfirm` on a quantifier, so claiming its verdict here would be a
+/// green signal with no check behind it.
+#[test]
+#[timeout(300_000)]
+fn test_stats_full_publishes_checked_projection_sat_evidence() {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    let input = r#"(set-logic UFBV)
+(declare-fun plain_projection ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+(assert
+  (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+    (=> (= x y) (= (plain_projection y x) y))))
+(check-sat)
+"#;
+    let (temp_path, _cleanup) = write_temp_smt2(input);
+
+    let warmup = Command::new(ay_path)
+        .arg("--version")
+        .output_timeout(Duration::from_secs(180))
+        .expect("failed to warm the freshly linked ay binary");
+    assert!(warmup.status.success(), "ay --version warmup failed");
+
+    let output = Command::new(ay_path)
+        .arg("--stats-full")
+        .arg(&temp_path)
+        .output_timeout(Duration::from_secs(30))
+        .expect("failed to spawn ay");
+    assert!(
+        output.status.success(),
+        "Expected zero exit status, got {:?}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().next(), Some("sat"), "{stdout}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let signal: Vec<_> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(":model_check_gate.result "))
+        .collect();
+    assert_eq!(
+        signal.len(),
+        1,
+        "a published sat must carry exactly one SAT-evidence signal: {stderr}"
+    );
+    assert_eq!(
+        signal[0], ":model_check_gate.result \"confirmed-sat-checked-projection\"",
+        "the signal must name the checked-projection authority: {stderr}"
+    );
 }
 
 #[test]
@@ -560,8 +762,7 @@ fn test_cli_stats_flag_prints_statistics_on_piped_stdin() {
         stderr.contains(":conflicts"),
         "Expected SMT-LIB statistics in stderr: {stderr}"
     );
-    assert_common_stats_envelope(&stderr);
-    assert_sat_counters_in_envelope(&stderr);
+    assert_smt_statistics_block(&stderr, "sat");
 }
 
 #[test]
@@ -1860,8 +2061,7 @@ fn test_cli_chc_stats_json_binds_unsafe_trace_validity_obligation_hash() {
     let trace_path = trace_obligation["path"]
         .as_str()
         .expect("trace obligation path should be recorded");
-    let trace_query =
-        std::fs::read_to_string(trace_path).expect("trace-validity query should exist");
+    let trace_payload = std::fs::read(trace_path).expect("trace-validity artifact should exist");
 
     assert_eq!(manifest["result"]["result"], "unsafe");
     assert_eq!(
@@ -1873,6 +2073,48 @@ fn test_cli_chc_stats_json_binds_unsafe_trace_validity_obligation_hash() {
         Some(64),
         "trace-validity query should be hash-bound: {manifest}"
     );
+    assert_eq!(trace_obligation["payload_format"], "ground-derivation-v1");
+    assert_eq!(trace_obligation["role"], "unsafe-ground-derivation");
+    let problem = ay::chc::ChcParser::parse(input).expect("original trace source");
+    ay::chc::validate_chc_ground_derivation_artifact(&problem, &trace_payload)
+        .expect("published ground evidence must freshly replay the original clauses");
+    assert_eq!(
+        trace_obligation["sha256"],
+        ay::chc::ChcProofArtifactDigest::from_bytes("unsafe-ground-derivation", &trace_payload)
+            .sha256,
+    );
+    let mut corrupted: serde_json::Value =
+        serde_json::from_slice(&trace_payload).expect("ground envelope");
+    corrupted["query_step"] = serde_json::json!(0);
+    assert!(ay::chc::validate_chc_ground_derivation_artifact(
+        &problem,
+        &serde_json::to_vec(&corrupted).expect("corrupted ground envelope"),
+    )
+    .is_err());
+    let changed = ay::chc::ChcParser::parse(&input.replace("(= x 1)", "(= x 2)"))
+        .expect("changed query source");
+    assert!(ay::chc::validate_chc_ground_derivation_artifact(&changed, &trace_payload).is_err());
+
+    // Legacy traces carry no ground derivation. Keep their independent SMT
+    // replay and both corruption controls even though the solver's preferred
+    // durable evidence above is now the complete original ground proof.
+    let predicate = problem.predicates()[0].id;
+    let legacy = ay::chc::Counterexample::new(vec![
+        ay::chc::CounterexampleStep::new(predicate, [("x".to_string(), 0)].into_iter().collect()),
+        ay::chc::CounterexampleStep::new(
+            predicate,
+            [("v0_1".to_string(), 1)].into_iter().collect(),
+        ),
+    ]);
+    assert!(!legacy.has_ground_derivation());
+    let obligations = legacy
+        .trace_validity_replay_obligations(&problem)
+        .expect("legacy trace remains exportable");
+    assert_eq!(obligations.len(), 1);
+    let trace_query = obligations[0].smtlib.clone();
+    let (legacy_trace_path, _legacy_trace_cleanup) = temp_output_path("smt2");
+    std::fs::write(&legacy_trace_path, &trace_query).expect("write legacy replay query");
+    let trace_path = legacy_trace_path.to_str().expect("owned UTF-8 path");
     assert!(
         trace_query.contains("; expected-result: sat")
             && trace_query.contains("; kind: trace-validity"),

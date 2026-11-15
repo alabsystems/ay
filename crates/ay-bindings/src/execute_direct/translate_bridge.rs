@@ -16,8 +16,8 @@ use ay_translate::ops::{
 use ay_translate::TranslationSession;
 
 use super::context::ExecutionContext;
-use super::translate::{translate_expr, translate_sort};
 use super::ExecuteError;
+use super::{datatypes::translate_sort, translate::translate_expr};
 use crate::expr::{Expr, ExprValue};
 use crate::sort::Sort;
 
@@ -64,7 +64,7 @@ pub(super) fn declare_const(
     sort: &Sort,
 ) -> Result<(), ExecuteError> {
     reject_reserved_symbol(name, "declare_const")?;
-    let api_sort = translate_sort(sort)?;
+    let api_sort = translate_sort(ctx, sort)?;
     {
         let mut session = ctx.session();
         let _ = session
@@ -101,9 +101,9 @@ pub(super) fn declare_fun(
     reject_internal_namespace(name, "declare_fun")?;
     let domain = arg_sorts
         .iter()
-        .map(translate_sort)
+        .map(|sort| translate_sort(ctx, sort))
         .collect::<Result<Vec<_>, _>>()?;
-    let range = translate_sort(return_sort)?;
+    let range = translate_sort(ctx, return_sort)?;
     let mut session = ctx.session();
     let _ = session
         .try_declare_or_get_fun(name, &domain, range)
@@ -124,7 +124,7 @@ pub(super) fn define_fun(
 
     reject_reserved_symbol(name, "define_fun")?;
     for (param_name, param_sort) in params {
-        let api_sort = translate_sort(param_sort)?;
+        let api_sort = translate_sort(ctx, param_sort)?;
         // `fresh_var` panics when the prefix would enter a reserved namespace;
         // its fallible twin reports the same condition as a recoverable error.
         let term = ctx
@@ -143,7 +143,7 @@ pub(super) fn define_fun(
     ctx.bound_var_scopes.pop();
     let body_term = body_result?;
 
-    let range = translate_sort(return_sort)?;
+    let range = translate_sort(ctx, return_sort)?;
     let param_refs: Vec<(&str, Term)> = param_names
         .iter()
         .zip(param_terms.iter())
@@ -161,7 +161,7 @@ pub(super) fn declare_var(
     sort: &Sort,
 ) -> Result<(), ExecuteError> {
     reject_reserved_symbol(name, "declare_var")?;
-    let api_sort = translate_sort(sort)?;
+    let api_sort = translate_sort(ctx, sort)?;
     let mut session = ctx.session();
     let _ = session
         .try_get_or_declare(name.to_string(), name, api_sort)
@@ -262,7 +262,7 @@ pub(super) fn maybe_translate_expr(
             array::store(session, arr, idx, value)
         }),
         ExprValue::ConstArray { index_sort, value } => {
-            let idx_sort = match translate_sort(index_sort) {
+            let idx_sort = match translate_sort(ctx, index_sort) {
                 Ok(sort) => sort,
                 Err(error) => return Some(Err(error)),
             };
@@ -449,7 +449,7 @@ pub(super) fn maybe_translate_expr(
             string::re_concat(session, left, right)
         }),
         ExprValue::SeqEmpty(element_sort) => {
-            let element_sort = match translate_sort(element_sort) {
+            let element_sort = match translate_sort(ctx, element_sort) {
                 Ok(sort) => sort,
                 Err(error) => return Some(Err(error)),
             };

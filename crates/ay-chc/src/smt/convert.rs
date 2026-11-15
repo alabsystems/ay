@@ -5,6 +5,7 @@
 //! Expression conversion: CHC expressions to ay-core terms.
 
 use super::context::{SmtContext, MAX_CONVERSION_NODES};
+use super::convert_dag::ConvertCx;
 use crate::term_bridge::sort::chc_sort_to_core;
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
 use ay_core::term::Symbol;
@@ -12,7 +13,6 @@ use ay_core::{Sort, TermId};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use std::fmt::Write;
-
 impl SmtContext {
     pub fn preprocess(expr: &ChcExpr) -> ChcExpr {
         // #6360: Single-pass feature scan replaces 6 individual `contains_*` walks.
@@ -71,14 +71,6 @@ impl SmtContext {
     }
 
     /// Convert a CHC expression to a ay-core term
-    pub fn convert_expr(&mut self, expr: &ChcExpr) -> TermId {
-        // Guard against stack overflow on deep expression trees (e.g., from PDKind
-        // iterations building deep conjunctions). Uses stacker to grow onto heap
-        // when the thread stack runs low — matching the protection in expr.rs
-        // traversals (#2759).
-        crate::expr::maybe_grow_expr_stack(|| self.convert_expr_inner(expr))
-    }
-
     /// Reset the conversion budget for a new conversion session.
     pub(crate) fn reset_conversion_budget(&mut self) {
         self.conversion_node_count = 0;
@@ -281,7 +273,7 @@ impl SmtContext {
         }
     }
 
-    fn convert_expr_inner(&mut self, expr: &ChcExpr) -> TermId {
+    pub(super) fn convert_expr_inner(&mut self, expr: &ChcExpr, cx: &mut ConvertCx) -> TermId {
         // Budget check: prevent unbounded expression tree growth (#2771).
         self.conversion_node_count += 1;
         if self.conversion_node_count > MAX_CONVERSION_NODES {
@@ -312,7 +304,12 @@ impl SmtContext {
                 self.terms.mk_rational(r)
             }
 
-            ChcExpr::Var(v) => self.get_or_create_var(v),
+            ChcExpr::Var(v) => cx
+                .bindings
+                .get(v)
+                .copied()
+                .unwrap_or_else(|| self.get_or_create_var(v)),
+            ChcExpr::ArrayLambda(lambda) => self.convert_array_lambda(lambda, cx),
 
             ChcExpr::PredicateApp(name, id, args) => {
                 // Serialize arguments for uniqueness key
@@ -333,7 +330,7 @@ impl SmtContext {
 
             ChcExpr::FuncApp(name, sort, args) => {
                 if name == "to_real" && args.len() == 1 {
-                    let arg = self.convert_expr(&args[0]);
+                    let arg = self.convert_child(&args[0], cx);
                     if self.conversion_budget_exceeded {
                         return self.terms.mk_bool(true);
                     }
@@ -349,7 +346,7 @@ impl SmtContext {
                         .mk_rational(BigRational::from_integer(BigInt::from(0)));
                 }
                 if name == "to_int" && args.len() == 1 {
-                    let arg = self.convert_expr(&args[0]);
+                    let arg = self.convert_child(&args[0], cx);
                     if self.conversion_budget_exceeded {
                         return self.terms.mk_bool(true);
                     }
@@ -363,7 +360,7 @@ impl SmtContext {
                     return self.terms.mk_int(BigInt::from(0));
                 }
                 if name == "is_int" && args.len() == 1 {
-                    let arg = self.convert_expr(&args[0]);
+                    let arg = self.convert_child(&args[0], cx);
                     if self.conversion_budget_exceeded {
                         return self.terms.mk_bool(true);
                     }
@@ -377,7 +374,7 @@ impl SmtContext {
                     return self.terms.mk_bool(true);
                 }
 
-                let term_args: Vec<TermId> = args.iter().map(|a| self.convert_expr(a)).collect();
+                let term_args = self.convert_children(args, cx);
                 // Budget may have been exceeded during child conversion (#2771).
                 if self.conversion_budget_exceeded {
                     return self.terms.mk_bool(true);
@@ -388,7 +385,7 @@ impl SmtContext {
             }
 
             ChcExpr::Op(op, args) => {
-                let term_args: Vec<TermId> = args.iter().map(|a| self.convert_expr(a)).collect();
+                let term_args = self.convert_children(args, cx);
                 // Budget may have been exceeded during child conversion (#2771).
                 // Return sentinel before passing mixed-sort children to term constructors
                 // that would panic (e.g., mk_gt(int, bool)).
@@ -863,7 +860,7 @@ impl SmtContext {
 
             ChcExpr::ConstArray(key_sort, val) => {
                 // Create a constant array with the parsed key sort (#6084).
-                let val_term = self.convert_expr(val);
+                let val_term = self.convert_child(val, cx);
                 let core_key_sort = chc_sort_to_core(key_sort);
                 self.terms.mk_const_array(core_key_sort, val_term)
             }

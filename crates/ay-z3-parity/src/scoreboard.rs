@@ -1551,11 +1551,7 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
         available_total,
         sample_census.as_ref(),
     );
-    let cert_text = serde_json::to_string_pretty(&cert).unwrap_or_default();
-    if let Some(dir) = cfg.json_out.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Err(e) = std::fs::write(&cfg.json_out, &cert_text) {
+    if let Err(e) = write_certificate(&cfg.json_out, &cert) {
         eprintln!("error: writing {}: {e}", cfg.json_out.display());
         return 2;
     }
@@ -1863,10 +1859,163 @@ fn render_table(
 // JSON certificate
 // ---------------------------------------------------------------------------
 
+struct Certificate<'a> {
+    metadata: serde_json::Value,
+    records: &'a [FileRecord],
+}
+
+#[derive(Clone, Copy)]
+enum CertificateRows {
+    All,
+    Disagreements,
+    DeclaredConflicts,
+    SelfConflicts,
+}
+
+impl CertificateRows {
+    fn includes(self, record: &FileRecord) -> bool {
+        match self {
+            Self::All => true,
+            Self::Disagreements => record.disagree(),
+            Self::DeclaredConflicts => record.declared_conflict(),
+            Self::SelfConflicts => record.self_conflict(),
+        }
+    }
+
+    fn row(self, r: &FileRecord) -> serde_json::Value {
+        match self {
+            Self::All => serde_json::json!({
+                "file": r.file.display().to_string(),
+                "division": r.division,
+                "ay": { "outcome": r.ay.label(), "wall_ms": r.ay.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": r.ay.peak_rss, "detail": r.ay.detail(), "decided": r.ay_decided() },
+                "z3": r.z3.as_ref().map(|z| serde_json::json!({ "outcome": z.label(), "wall_ms": z.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": z.peak_rss, "detail": z.detail(), "decided": z.decided() })),
+                "self_check": r.selfcheck.label(),
+                "self_check_detail": r.selfcheck.detail(),
+                "self_certified": r.self_certified(),
+                "category": r.category.map(Category::label),
+                // The file's own (set-info :status ...): "sat" | "unsat" |
+                // "unknown" | "absent". `absent` (no annotation) is deliberately
+                // distinct from a declared `unknown`.
+                "declared": r.declared.as_str(),
+                "declared_conflict": r.declared_conflict(),
+                "declared_confirmed": r.declared_confirmed(),
+                "beyond_z3": r.beyond_z3(),
+                "loss": r.loss(),
+                "verdict_shape_mismatch": r.verdict_shape_mismatch(),
+                "wall_slower_than_z3": r.wall_slower_than_z3(),
+                "wall_ratio_ay_over_z3": r.ratio,
+                "rss_ratio_ay_over_z3": rss_ratio(&r.ay, r.z3.as_ref()),
+            }),
+            Self::Disagreements => serde_json::json!({
+                "file": r.file.display().to_string(),
+                // Kept `null` for an unannotated file, as in format 2; the
+                // four-state token lives in the per-file `declared` field.
+                "declared_status": match r.declared {
+                    DeclaredStatus::Absent => None,
+                    status => Some(status.as_str()),
+                },
+                "declared": r.declared.as_str(),
+                "z3": r.z3.as_ref().map(BenchOutcome::label),
+                "ay": r.ay.label(),
+            }),
+            Self::DeclaredConflicts => serde_json::json!({
+                "file": r.file.display().to_string(),
+                "division": r.division,
+                "declared": r.declared.as_str(),
+                "ay": r.ay.label(),
+                "z3": r.z3.as_ref().map(BenchOutcome::label),
+                "z3_decided": r.z3_decided(),
+                "self_check": r.selfcheck.label(),
+                "self_certified": r.self_certified(),
+            }),
+            Self::SelfConflicts => serde_json::json!({
+                "file": r.file.display().to_string(),
+                "ay_eval": r.ay.label(),
+                "ay_self_check": r.selfcheck.label(),
+            }),
+        }
+    }
+}
+
+struct CertificateRowView<'a> {
+    records: &'a [FileRecord],
+    kind: CertificateRows,
+}
+
+impl serde::Serialize for CertificateRowView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let count = self
+            .records
+            .iter()
+            .filter(|record| self.kind.includes(record))
+            .count();
+        let mut sequence = serializer.serialize_seq(Some(count))?;
+        for record in self
+            .records
+            .iter()
+            .filter(|record| self.kind.includes(record))
+        {
+            // Only this row is materialized; the complete population remains
+            // borrowed from the measured records instead of cloned as Values.
+            sequence.serialize_element(&self.kind.row(record))?;
+        }
+        sequence.end()
+    }
+}
+
+impl serde::Serialize for Certificate<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let fields = self.metadata.as_object().ok_or_else(|| {
+            <S::Error as serde::ser::Error>::custom("certificate metadata is not an object")
+        })?;
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields {
+            let kind = match key.as_str() {
+                "files" => Some(CertificateRows::All),
+                "disagree_files" => Some(CertificateRows::Disagreements),
+                "declared_conflict_files" => Some(CertificateRows::DeclaredConflicts),
+                "self_conflict_files" => Some(CertificateRows::SelfConflicts),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                map.serialize_entry(
+                    key,
+                    &CertificateRowView {
+                        records: self.records,
+                        kind,
+                    },
+                )?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+fn write_certificate(path: &Path, certificate: &Certificate<'_>) -> Result<(), String> {
+    if let Some(directory) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut output = std::io::BufWriter::new(file);
+    write_certificate_to(&mut output, certificate)
+}
+
+fn write_certificate_to(
+    output: &mut impl Write,
+    certificate: &Certificate<'_>,
+) -> Result<(), String> {
+    serde_json::to_writer_pretty(&mut *output, certificate).map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn build_certificate(
+fn build_certificate<'a>(
     cfg: &ScoreboardConfig,
-    records: &[FileRecord],
+    records: &'a [FileRecord],
     divisions: &BTreeMap<String, DivStats>,
     totals: &DivStats,
     ay_version: Option<&str>,
@@ -1879,7 +2028,7 @@ fn build_certificate(
     resource_evidence: &serde_json::Value,
     available_total: usize,
     sample_census: Option<&BTreeMap<String, (usize, usize)>>,
-) -> serde_json::Value {
+) -> Certificate<'a> {
     let div_json = |name: &str, s: &DivStats| {
         serde_json::json!({
             "name": name,
@@ -1939,77 +2088,6 @@ fn build_certificate(
             },
         })
     };
-    let files_json: Vec<_> = records
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "file": r.file.display().to_string(),
-                "division": r.division,
-                "ay": { "outcome": r.ay.label(), "wall_ms": r.ay.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": r.ay.peak_rss, "detail": r.ay.detail(), "decided": r.ay_decided() },
-                "z3": r.z3.as_ref().map(|z| serde_json::json!({ "outcome": z.label(), "wall_ms": z.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": z.peak_rss, "detail": z.detail(), "decided": z.decided() })),
-                "self_check": r.selfcheck.label(),
-                "self_check_detail": r.selfcheck.detail(),
-                "self_certified": r.self_certified(),
-                "category": r.category.map(Category::label),
-                // The file's own (set-info :status ...): "sat" | "unsat" |
-                // "unknown" | "absent". `absent` (no annotation) is deliberately
-                // distinct from a declared `unknown`.
-                "declared": r.declared.as_str(),
-                "declared_conflict": r.declared_conflict(),
-                "declared_confirmed": r.declared_confirmed(),
-                "beyond_z3": r.beyond_z3(),
-                "loss": r.loss(),
-                "verdict_shape_mismatch": r.verdict_shape_mismatch(),
-                "wall_slower_than_z3": r.wall_slower_than_z3(),
-                "wall_ratio_ay_over_z3": r.ratio,
-                "rss_ratio_ay_over_z3": rss_ratio(&r.ay, r.z3.as_ref()),
-            })
-        })
-        .collect();
-    let disagree_files: Vec<_> = records
-        .iter()
-        .filter(|r| r.disagree())
-        .map(|r| {
-            serde_json::json!({
-                "file": r.file.display().to_string(),
-                // Kept `null` for an unannotated file, as in format 2; the
-                // four-state token lives in the per-file `declared` field.
-                "declared_status": bench::declared_status(&r.file),
-                "declared": r.declared.as_str(),
-                "z3": r.z3.as_ref().map(BenchOutcome::label),
-                "ay": r.ay.label(),
-            })
-        })
-        .collect();
-    // The wrong answers the z3 comparison structurally cannot see: `z3_decided`
-    // is false for most of these, which is exactly why they need their own list.
-    let declared_conflict_files: Vec<_> = records
-        .iter()
-        .filter(|r| r.declared_conflict())
-        .map(|r| {
-            serde_json::json!({
-                "file": r.file.display().to_string(),
-                "division": r.division,
-                "declared": r.declared.as_str(),
-                "ay": r.ay.label(),
-                "z3": r.z3.as_ref().map(BenchOutcome::label),
-                "z3_decided": r.z3_decided(),
-                "self_check": r.selfcheck.label(),
-                "self_certified": r.self_certified(),
-            })
-        })
-        .collect();
-    let self_conflict_files: Vec<_> = records
-        .iter()
-        .filter(|r| r.self_conflict())
-        .map(|r| {
-            serde_json::json!({
-                "file": r.file.display().to_string(),
-                "ay_eval": r.ay.label(),
-                "ay_self_check": r.selfcheck.label(),
-            })
-        })
-        .collect();
     // Which verdict oracles sat this run out. Each conflict counter is
     // vacuously 0 when its oracle did not run, so this list is what keeps
     // `pass` from being computed off silence. See the `pass` key below.
@@ -2023,7 +2101,7 @@ fn build_certificate(
     if totals.declared_decided == 0 {
         gates_not_run.push("declared_status");
     }
-    serde_json::json!({
+    let metadata = serde_json::json!({
         "kind": "ay-z3-scoreboard",
         "format_version": FORMAT_VERSION,
         "generated_utc": utc_now_iso(),
@@ -2088,10 +2166,10 @@ fn build_certificate(
         },
         "divisions": divisions.iter().map(|(n, s)| div_json(n, s)).collect::<Vec<_>>(),
         "totals": div_json("TOTAL", totals),
-        "files": files_json,
-        "disagree_files": disagree_files,
-        "declared_conflict_files": declared_conflict_files,
-        "self_conflict_files": self_conflict_files,
+        "files": null,
+        "disagree_files": null,
+        "declared_conflict_files": null,
+        "self_conflict_files": null,
         // WHICH ORACLES ACTUALLY RAN. Each conflict counter is vacuously 0 when
         // its oracle did not run, so `pass` computed from the counters alone
         // reports success for a run that checked nothing. Measured on
@@ -2119,7 +2197,8 @@ fn build_certificate(
             && z3_available
             && totals.self_cert > 0
             && totals.declared_decided > 0,
-    })
+    });
+    Certificate { metadata, records }
 }
 
 // ---------------------------------------------------------------------------
@@ -2228,7 +2307,7 @@ mod tests {
         let plan = test_plan();
         let evidence =
             resource_evidence(&plan, Duration::from_secs(20), true).expect("resource evidence");
-        build_certificate(
+        serde_json::to_value(build_certificate(
             &cfg,
             records,
             divisions,
@@ -2243,7 +2322,173 @@ mod tests {
             &evidence,
             records.len(),
             None,
+        ))
+        .expect("certificate serialization")
+    }
+
+    #[test]
+    fn streamed_certificate_preserves_rows_filters_nulls_and_escaped_bytes() {
+        use Verdict::*;
+        let mut records = vec![
+            declared(
+                rec(
+                    v(&[Sat]),
+                    10,
+                    Some(v(&[Sat])),
+                    20,
+                    SelfCheck::Verdicts(vec![Sat]),
+                ),
+                DeclaredStatus::Sat,
+            ),
+            declared(
+                rec(
+                    v(&[Sat]),
+                    10,
+                    Some(v(&[Unsat])),
+                    20,
+                    SelfCheck::Verdicts(vec![Unsat]),
+                ),
+                DeclaredStatus::Unsat,
+            ),
+            rec(v(&[Unknown]), 10, Some(v(&[Sat])), 20, SelfCheck::Timeout),
+            rec(
+                OutcomeKind::Timeout,
+                20,
+                None,
+                0,
+                SelfCheck::Error("cannot start \"child\"\n雪".to_string()),
+            ),
+            rec(
+                OutcomeKind::MemoryLimit,
+                20,
+                Some(OutcomeKind::MemoryLimit),
+                20,
+                SelfCheck::MemoryLimit,
+            ),
+            rec(
+                OutcomeKind::Crash("signal\\detail\n".to_string()),
+                20,
+                Some(OutcomeKind::Crash("other".to_string())),
+                20,
+                SelfCheck::Crash("failed".to_string()),
+            ),
+            rec(
+                OutcomeKind::InputError("missing input".to_string()),
+                0,
+                Some(OutcomeKind::Timeout),
+                20,
+                SelfCheck::Verdicts(vec![]),
+            ),
+        ];
+        let mut totals = DivStats::default();
+        for (index, record) in records.iter_mut().enumerate() {
+            record.file = PathBuf::from(format!("path-雪-\"{index}\n.smt2"));
+            totals.add(record);
+        }
+        let divisions = BTreeMap::from([("D".to_string(), totals.clone())]);
+        let cfg = test_cfg();
+        let plan = test_plan();
+        let evidence = resource_evidence(&plan, Duration::from_secs(20), true).unwrap();
+        let certificate = build_certificate(
+            &cfg,
+            &records,
+            &divisions,
+            &totals,
+            None,
+            None,
+            None,
+            true,
+            None,
+            Duration::from_secs(1),
+            &plan,
+            &evidence,
+            42,
+            None,
+        );
+        let mut expected = certificate.metadata.clone();
+        for (key, kind) in [
+            ("files", CertificateRows::All),
+            ("disagree_files", CertificateRows::Disagreements),
+            (
+                "declared_conflict_files",
+                CertificateRows::DeclaredConflicts,
+            ),
+            ("self_conflict_files", CertificateRows::SelfConflicts),
+        ] {
+            expected[key] = serde_json::Value::Array(
+                records
+                    .iter()
+                    .filter(|record| kind.includes(record))
+                    .map(|record| kind.row(record))
+                    .collect(),
+            );
+        }
+        let mut actual = Vec::new();
+        write_certificate_to(&mut actual, &certificate).unwrap();
+        assert_eq!(actual, serde_json::to_vec_pretty(&expected).unwrap());
+        assert_eq!(expected["files"].as_array().unwrap().len(), records.len());
+        assert_eq!(expected["disagree_files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            expected["declared_conflict_files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(expected["self_conflict_files"].as_array().unwrap().len(), 1);
+        assert!(expected["files"][3]["z3"].is_null());
+        assert_eq!(expected["sampling"]["selected_files"], records.len());
+        assert_eq!(expected["sampling"]["available_files"], 42);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.json");
+        write_certificate(&path, &certificate).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), actual);
+    }
+
+    #[test]
+    fn streamed_certificate_propagates_write_and_flush_failures() {
+        struct FailingWriter {
+            remaining: usize,
+            fail_flush: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let records = Vec::new();
+        let certificate = Certificate {
+            metadata: serde_json::json!({"files":null}),
+            records: &records,
+        };
+        assert!(write_certificate_to(
+            &mut FailingWriter {
+                remaining: 4,
+                fail_flush: false
+            },
+            &certificate
         )
+        .is_err());
+        assert!(write_certificate_to(
+            &mut FailingWriter {
+                remaining: usize::MAX,
+                fail_flush: true
+            },
+            &certificate
+        )
+        .is_err());
     }
 
     #[test]

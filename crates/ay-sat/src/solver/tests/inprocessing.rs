@@ -543,6 +543,74 @@ fn test_collect_level0_garbage_repeats_after_internal_unit_creation() {
     );
 }
 
+/// #triage-lra-const-eq (CHC-COMP 2026 batch 3, `heap__findmax.array_000`):
+/// a queued theory conflict that a later ROOT unit satisfies must not make
+/// level-0 GC spin. The queue entry survives the DPLL(T) round (the solve
+/// returned to its caller with the queue non-empty), the next
+/// `solve_with_assumptions` runs incremental inprocessing at level 0 before
+/// the CDCL loop drains the queue, and `can_delete_clause` refuses the queued
+/// clause. The old sweep counted the refused delete as a mutation and never
+/// polled the deadline on a small affected set: an unbounded loop (45 s in
+/// the observed run, past a 624 ms query timeout). The GC must return, leave the
+/// queued clause alone, and do the sweep once the queue has drained.
+#[test]
+fn test_collect_level0_garbage_terminates_with_queued_conflict_satisfied_at_root() {
+    let mut solver: Solver = Solver::new(2);
+    let x = Variable(0);
+    let u = Variable(1);
+    solver.initialize_watches();
+
+    // Level 1: ¬u; level 2: x. The theory lemma (¬x ∨ u) is all-false at
+    // level 2, so it is queued for the solve loop.
+    solver.decide(Literal::negative(u));
+    solver.qhead = solver.trail.len();
+    solver.decide(Literal::positive(x));
+    solver.qhead = solver.trail.len();
+    let queued = solver
+        .add_theory_lemma(vec![Literal::negative(x), Literal::positive(u)])
+        .expect("all-false theory lemma is added");
+    assert_eq!(solver.pending_theory_conflicts.len(), 1);
+
+    // The round returns with the queue non-empty; the next solve starts at
+    // level 0, where a root unit u satisfies the queued clause.
+    solver.backtrack(0);
+    solver.enqueue(Literal::positive(u), None);
+    solver.qhead = solver.trail.len();
+    solver.fixed_count = 1;
+    solver.cold.last_collect_fixed = 0;
+    solver.l0_gc_dirty[u.index()] = true;
+    assert_eq!(
+        solver.pending_theory_conflicts.len(),
+        1,
+        "fixture: the queued conflict crosses the solve boundary",
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let unsat = solver.collect_level0_garbage();
+        let _ = tx.send((unsat, solver));
+    });
+    let (unsat, mut solver) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("collect_level0_garbage must terminate with a queued conflict satisfied at root");
+    assert!(!unsat, "fixture is satisfiable");
+    let idx = queued.0 as usize;
+    assert!(
+        !solver.arena.is_empty_clause(idx) && !solver.arena.is_dead(idx),
+        "a queued theory conflict owns its clause: level-0 GC must not delete it",
+    );
+    assert_eq!(solver.pending_theory_conflicts.len(), 1);
+
+    // Once the solve loop consumes the queue, the next call does the sweep:
+    // the skip did not arm the fixpoint guard.
+    assert_eq!(solver.take_pending_theory_conflict(), Some(queued));
+    assert!(!solver.collect_level0_garbage());
+    assert!(
+        solver.arena.is_empty_clause(idx) || solver.arena.is_dead(idx),
+        "the resumed sweep deletes the root-satisfied clause",
+    );
+}
+
 #[test]
 fn test_replace_clause_checked_skips_pending_garbage_husk() {
     // Husk adjudication #3/#4 (revival sink): a pending-garbage clause is
@@ -1013,6 +1081,91 @@ fn test_probe_failed_literal_unit_emits_lrat_hints() {
     );
 }
 
+/// `count` binary clauses `(r_i v a_i)` over fresh variables: each literal
+/// occurs only positively, so `!r_i` and `!a_i` are probe candidates (two
+/// per clause) whose propagation neither conflicts nor reaches another clause.
+fn solver_with_probe_roots(count: u32) -> Solver {
+    let mut solver: Solver = Solver::new(2 * count as usize);
+    for root in 0..count {
+        solver.add_clause(vec![
+            Literal::positive(Variable(2 * root)),
+            Literal::positive(Variable(2 * root + 1)),
+        ]);
+    }
+    assert!(solver.process_initial_clauses().is_none());
+    solver.initialize_watches();
+    assert!(solver.propagate().is_none());
+    solver
+}
+
+/// Probing polls the search's stop before every candidate, which no
+/// interrupt flag carries: a stop that fires on its third poll ends the
+/// pass after two candidates and is latched for the search loop. Before,
+/// probing polled only the flags, so a stop closure was never seen inside a
+/// round (in debug builds two full reverse watch validations per candidate
+/// made one round of a 1.6M-clause CNF run past 240 s), and all twenty
+/// candidates were probed.
+#[test]
+fn test_probe_ends_at_the_candidate_where_the_search_stop_fires() {
+    let mut idle = solver_with_probe_roots(10);
+    let idle_polls = std::cell::Cell::new(0_u32);
+    assert!(!idle.probe_until(&|| {
+        idle_polls.set(idle_polls.get() + 1);
+        false
+    }));
+    assert_eq!(
+        idle.inproc.prober.stats().probed,
+        20,
+        "an idle stop changes nothing"
+    );
+    assert_eq!(idle_polls.get(), 20, "one poll per candidate");
+    assert!(!idle.cold.inprocessing_caller_stop);
+
+    let mut stopped = solver_with_probe_roots(10);
+    let polls = std::cell::Cell::new(0_u32);
+    assert!(!stopped.probe_until(&|| {
+        polls.set(polls.get() + 1);
+        polls.get() >= 3
+    }));
+    assert_eq!(stopped.inproc.prober.stats().probed, 2);
+    assert_eq!(polls.get(), 3, "a latched stop is not polled again");
+    assert!(stopped.cold.inprocessing_caller_stop);
+    assert!(stopped.inprocessing_stop_requested(&|| unreachable!("latched")));
+}
+
+/// A round that saw the search's stop ends the solve Unknown, and takes the
+/// latch; an idle stop leaves the round's own result and no latch.
+#[test]
+fn test_inprocessing_round_ends_the_solve_when_the_search_stop_fired() {
+    let mut idle = solver_with_probe_roots(10);
+    idle.cold.next_inprobe_conflict = 0;
+    idle.num_conflicts = 1;
+    assert!(idle.run_inprocessing_round_until(&|| false, None).is_none());
+    assert!(!idle.cold.inprocessing_caller_stop);
+
+    let mut stopped = solver_with_probe_roots(10);
+    stopped.cold.next_inprobe_conflict = 0;
+    stopped.num_conflicts = 1;
+    let polls = std::cell::Cell::new(0_u32);
+    let ended = stopped.run_inprocessing_round_until(
+        &|| {
+            polls.set(polls.get() + 1);
+            true
+        },
+        None,
+    );
+    assert!(matches!(ended, Some(SatResult::Unknown)), "{ended:?}");
+    assert_eq!(polls.get(), 1, "a fired stop starts no round");
+    assert_eq!(
+        stopped.last_unknown_reason(),
+        Some(SatUnknownReason::Interrupted)
+    );
+    assert!(
+        !stopped.cold.inprocessing_caller_stop,
+        "the round's end took the latch"
+    );
+}
+
 /// Regression test for #4841: probe must not report false UNSAT on SAT formulas.
 ///
 /// The formula `(x0 v x1) AND (NOT x0 v x1)` is satisfiable (x1=true).
@@ -1409,6 +1562,97 @@ fn test_backbone_no_forced_literals() {
     assert!(!found, "no backbone literals in (x0 ∨ x1)");
 }
 
+/// Under the pass marks a call that reaches the last variable completes a
+/// pass: every active variable carries the pass number, the counter advances
+/// and the next call starts a new pass. With the marks off nothing is kept.
+#[test]
+fn test_backbone_pass_marks_complete_and_advance() {
+    use crate::watched::Watcher;
+
+    let x0p = Literal::positive(Variable(0));
+    let x1p = Literal::positive(Variable(1));
+    let x2p = Literal::positive(Variable(2));
+    let mut solver = Solver::new(3);
+    for (a, b) in [(x0p, x1p), (x1p, x2p)] {
+        let c = solver.add_clause_db(&[a, b], false);
+        let c_ref = ClauseRef(c as u32);
+        solver.watches.add_watch(a, Watcher::binary(c_ref, b));
+        solver.watches.add_watch(b, Watcher::binary(c_ref, a));
+    }
+    solver.set_backbone_passes(true);
+    assert!(
+        !solver.backbone(),
+        "no backbone literals in a satisfiable 2-chain"
+    );
+    assert_eq!(solver.stats.backbone_completed_passes, 1);
+    assert_eq!(solver.cold.backbone_probed_in_pass, vec![1, 1, 1]);
+    assert_eq!(solver.cold.backbone_pass, 2);
+    assert!(!solver.backbone());
+    assert_eq!(solver.stats.backbone_completed_passes, 2);
+    assert_eq!(solver.cold.backbone_probed_in_pass, vec![2, 2, 2]);
+
+    let mut plain = Solver::new(2);
+    let c = plain.add_clause_db(&[x0p, x1p], false);
+    let c_ref = ClauseRef(c as u32);
+    plain.watches.add_watch(x0p, Watcher::binary(c_ref, x1p));
+    plain.watches.add_watch(x1p, Watcher::binary(c_ref, x0p));
+    plain.set_backbone_passes(false);
+    assert!(!plain.backbone());
+    assert_eq!(plain.stats.backbone_completed_passes, 0);
+    assert!(plain.cold.backbone_probed_in_pass.is_empty());
+}
+
+/// The stacked binary backbone finds the failed literal of
+/// `test_backbone_binary_finds_forced_unit` while probing on top of a
+/// consistent stack: round 1 probes `x0`, `x1`, `x2`, `x3` positively (all
+/// consistent, so they drop out of the candidate set), round 2 probes `¬x0`,
+/// which forces `x1` and `¬x1` and yields the unit `x0`. Nothing but binary
+/// propagation is involved, the trail is left propagated at level 0, and the
+/// unrelated `(x2 ∨ x3)` never produces a unit.
+#[test]
+fn test_backbone_binary_stacked_finds_forced_unit_across_rounds() {
+    use crate::watched::Watcher;
+
+    let mut solver = Solver::new(4);
+    let lit = |v: u32, pos: bool| {
+        if pos {
+            Literal::positive(Variable(v))
+        } else {
+            Literal::negative(Variable(v))
+        }
+    };
+    for (a, b) in [
+        (lit(0, true), lit(1, true)),
+        (lit(0, true), lit(1, false)),
+        (lit(2, true), lit(3, true)),
+    ] {
+        let c = solver.add_clause_db(&[a, b], false);
+        let c_ref = ClauseRef(c as u32);
+        solver.watches.add_watch(a, Watcher::binary(c_ref, b));
+        solver.watches.add_watch(b, Watcher::binary(c_ref, a));
+    }
+    solver.set_backbone_binary_stacked(true);
+
+    let found = solver.backbone_binary();
+
+    assert!(found, "the stacked backbone must detect x0 as forced");
+    assert_eq!(solver.get_var_assignment(0), Some(true));
+    assert_eq!(solver.get_var_assignment(2), None, "x2 is free");
+    assert_eq!(solver.get_var_assignment(3), None, "x3 is free");
+    assert_eq!(solver.stats.backbone_binary_units, 1);
+    assert!(
+        solver.stats.backbone_stacked_rounds >= 2,
+        "the failed literal ¬x0 is only probed after the consistent positives"
+    );
+    assert_eq!(solver.stats.backbone_stacked_guard_skips, 0);
+    assert!(
+        !solver.cold.backbone_binary_candidate[lit(2, true).index()],
+        "a consistently probed literal leaves the candidate set"
+    );
+    assert_eq!(solver.qhead, solver.trail.len());
+    assert_eq!(solver.decision_level, 0);
+}
+
 /// Backbone model verification: solve SAT with only backbone enabled (#4943).
 /// x0 is backbone (forced true by (x0|x1)&(x0|-x1)), x2-x4 are free.
 #[test]
@@ -1617,6 +1861,72 @@ fn test_sweep_skip_reason_passes_above_tick_threshold() {
         None,
         "sweep should fire when tick budget meets CaDiCaL's threshold",
     );
+}
+
+/// With generations on, a vivify call marks every learned candidate it
+/// tries; the next call finds no untried candidate, re-flags the tier (one
+/// generation) and tries them again. With generations off nothing is marked.
+#[test]
+fn test_vivify_generations_try_each_clause_once_then_reflag() {
+    use crate::watched::Watcher;
+
+    let lit = |v: u32, pos: bool| {
+        if pos {
+            Literal::positive(Variable(v))
+        } else {
+            Literal::negative(Variable(v))
+        }
+    };
+    let clauses = [
+        vec![lit(0, true), lit(1, true), lit(2, true)],
+        vec![lit(0, false), lit(3, true), lit(4, true)],
+        vec![lit(1, false), lit(2, false), lit(5, true)],
+        vec![lit(3, false), lit(4, false), lit(5, false)],
+    ];
+    let build = |generations: bool| {
+        let mut solver = Solver::new(6);
+        for c in &clauses {
+            let idx = solver.add_clause_db(c, true);
+            let cref = ClauseRef(idx as u32);
+            solver.watches.add_watch(c[0], Watcher::new(cref, c[1]));
+            solver.watches.add_watch(c[1], Watcher::new(cref, c[0]));
+        }
+        solver.set_vivify_generations(generations);
+        solver
+    };
+
+    let mut solver = build(true);
+    solver.num_conflicts = solver.inproc_ctrl.vivify.next_conflict;
+    let _ = solver.vivify();
+    let live: Vec<usize> = solver.arena.active_indices().collect();
+    assert!(!live.is_empty(), "the fixture's clauses stay live");
+    assert!(
+        solver.inproc.vivifier.stats.clauses_examined > 0,
+        "the learned tiers examine the fixture on the first call"
+    );
+    assert!(
+        live.iter().all(|&idx| solver.arena.is_vivify_tried(idx)),
+        "every candidate is marked tried after the first call"
+    );
+    assert_eq!(solver.inproc.vivifier.stats.generations, 0);
+    solver.num_conflicts = solver.inproc_ctrl.vivify.next_conflict;
+    let _ = solver.vivify();
+    assert_eq!(
+        solver.inproc.vivifier.stats.generations, 1,
+        "the second call found nothing untried and re-flagged the tier"
+    );
+
+    let mut plain = build(false);
+    plain.num_conflicts = plain.inproc_ctrl.vivify.next_conflict;
+    let _ = plain.vivify();
+    assert!(
+        plain
+            .arena
+            .active_indices()
+            .all(|idx| !plain.arena.is_vivify_tried(idx)),
+        "with generations off nothing is marked"
+    );
+    assert_eq!(plain.inproc.vivifier.stats.generations, 0);
 }
 
 #[test]
@@ -2915,4 +3225,90 @@ p cnf 6 7
 
     // x0 is a backbone literal -- must be true in every satisfying assignment.
     assert!(model[0], "x0 should be true (backbone literal)");
+}
+
+/// The no-proof streaming route disables clause ids; the factoring pass must
+/// still apply there (its ER definitions are proof-only bookkeeping). Before
+/// the fix the ER preflight rejected every pass on that route with
+/// `MissingOrHiddenSourceId`.
+#[test]
+fn test_factor_applies_with_clause_ids_disabled_and_no_proof() {
+    fn grid_solver(ids_disabled: bool) -> Solver {
+        let mut solver: Solver = Solver::new(200);
+        solver.set_clause_ids_disabled(ids_disabled);
+        for i in 0..6 {
+            for j in 0..6 {
+                solver.add_clause_db(
+                    &[
+                        Literal::positive(Variable(i)),
+                        Literal::positive(Variable(100 + j)),
+                    ],
+                    false,
+                );
+            }
+        }
+        solver.initialize_watches();
+        solver.disable_all_inprocessing();
+        solver.set_factor_enabled(true);
+        solver.cold.next_inprobe_conflict = 0;
+        solver.inproc_ctrl.factor.next_conflict = 0;
+        solver.num_conflicts = FACTOR_INTERVAL;
+        solver
+    }
+    let mut with_ids = grid_solver(false);
+    with_ids.factorize();
+    assert!(
+        with_ids.cold.factor_factored_total > 0,
+        "the grid factors with clause ids"
+    );
+    let mut without_ids = grid_solver(true);
+    assert!(without_ids.cold.clause_ids.iter().all(|&id| id == 0));
+    without_ids.factorize();
+    assert_eq!(
+        without_ids.cold.factor_factored_total, with_ids.cold.factor_factored_total,
+        "the grid factors identically with clause ids disabled and no proof"
+    );
+}
+
+/// `--sat-bve-kissat-schedule`: the in-search BVE interval is Kissat's
+/// `eliminate` cadence — `eliminateint` 500 times n log n of the phases times
+/// the formula-size scale — so the first in-search round on a 540K-clause
+/// formula is due after ~14K conflicts, not the 192K the phase-and-backoff
+/// product gave qwh.60.1728.
+#[test]
+fn test_kissat_eliminate_interval_matches_kissat_cadence() {
+    use crate::solver::inprocessing::kissat_eliminate_interval;
+    let first = kissat_eliminate_interval(542_447, 1);
+    assert!((12_000..=16_000).contains(&first), "first interval {first}");
+    let second = kissat_eliminate_interval(542_447, 2);
+    let third = kissat_eliminate_interval(542_447, 3);
+    assert!(first < second && second < third, "{first} {second} {third}");
+    // Kissat's size scale `4.5 (log10(C + 1) - 5)^2 + 25` is least at 100K
+    // clauses and grows both above and below it.
+    let hundred_k = kissat_eliminate_interval(100_000, 1);
+    assert!(hundred_k < first && hundred_k < kissat_eliminate_interval(10_000, 1));
+    // Phases below one count as one.
+    assert_eq!(kissat_eliminate_interval(542_447, 0), first);
+}
+
+/// `--sat-eliminate-cadence-kissat`: Kissat's NLOG2N elimination interval,
+/// n log10(n + 9)^2 times the first, over Kissat's size scale log10(C + 10).
+#[test]
+fn test_kissat_eliminate_interval_nlog2n() {
+    use crate::solver::inprocessing::kissat_eliminate_interval_nlog2n;
+    let c = 542_447;
+    let first = kissat_eliminate_interval_nlog2n(c, 1) as f64;
+    let f = ((c + 10) as f64).log10() - 5.0;
+    assert!(
+        (first - 500.0 * (4.5 * f * f + 25.0)).abs() <= 1.0,
+        "{first}"
+    );
+    for n in 2..6u64 {
+        let log = ((n + 9) as f64).log10();
+        let ratio = kissat_eliminate_interval_nlog2n(c, n) as f64 / first;
+        assert!(
+            (ratio - n as f64 * log * log).abs() < 1e-3,
+            "n={n}: {ratio}"
+        );
+    }
 }

@@ -125,9 +125,30 @@ impl Sweeper {
         vals: &[i8],
         frozen: &[u32],
     ) -> Vec<Vec<u32>> {
+        self.find_candidates_by_simulation_budgeted(clauses, vals, frozen, None)
+            .0
+    }
+
+    /// The simulation with its work charged to a tick budget: one tick per
+    /// literal of the copied formula, per variable visited in a round and per
+    /// clause scanned by the propagation. The round loop stops after the
+    /// round in which the budget runs out, so at least one round runs; the
+    /// signatures then have `rounds` bits, and the complement fold and the
+    /// polarity majority read only those bits. Returns the classes, the
+    /// rounds run and the ticks spent. Without a budget it is the 64-round
+    /// simulation, whose 64 passes over the formula cost about a second per
+    /// in-search sweep on a 263K-clause formula (schooltt-5-3, 2026-09-21)
+    /// while the kitten budget it fed was a few million ticks.
+    pub(super) fn find_candidates_by_simulation_budgeted(
+        &self,
+        clauses: &ClauseArena,
+        vals: &[i8],
+        frozen: &[u32],
+        tick_budget: Option<u64>,
+    ) -> (Vec<Vec<u32>>, u64, u64) {
         let num_vars = self.num_vars;
         if num_vars == 0 {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         }
 
         // Collect clause data once.
@@ -135,18 +156,17 @@ impl Sweeper {
         let clause_data: Vec<Vec<Literal>> = clauses
             .indices()
             .filter(|&idx| {
-                !clauses.is_garbage(idx)
-                    && !clauses.is_empty_clause(idx)
-                    && (!clauses.is_learned(idx) || clauses.len_of(idx) <= 2)
+                !clauses.is_dead(idx) && (!clauses.is_learned(idx) || clauses.len_of(idx) <= 2)
             })
             .map(|idx| clauses.literals(idx).to_vec())
             .collect();
 
         if clause_data.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         }
 
         let num_lits = num_vars * 2;
+        let mut ticks: u64 = 0;
 
         // ── Build per-literal occurrence lists ──────────────────────────
         // occ_lists[lit_idx] = vec of clause indices in clause_data containing
@@ -155,6 +175,7 @@ impl Sweeper {
         // Reference: CaDiCaL sweep_dense_propagate uses occs(-lit).
         let mut occ_lists: Vec<Vec<usize>> = vec![Vec::new(); num_lits];
         for (ci, lits) in clause_data.iter().enumerate() {
+            ticks += lits.len() as u64;
             for &lit in lits {
                 let li = lit.index();
                 if li < num_lits {
@@ -210,7 +231,9 @@ impl Sweeper {
         let mut prop_queue: Vec<usize> = Vec::new();
         let mut rng = XorShift64::new(0xDEAD_BEEF_CAFE_1234);
 
+        let mut rounds_run: u64 = 0;
         for round in 0..MAX_SIMULATION_ROUNDS {
+            ticks += num_vars as u64;
             // 1. Reset simulation values. Copy level-0 fixed assignments.
             for v in sim_vals.iter_mut() {
                 *v = 0;
@@ -257,6 +280,7 @@ impl Sweeper {
                     &mut sim_vals,
                     &mut prop_queue,
                     num_lits,
+                    &mut ticks,
                 );
             }
 
@@ -268,7 +292,22 @@ impl Sweeper {
                     *signature |= bit;
                 }
             }
+            rounds_run += 1;
+            // A stop ends the rounds too; the caller then verifies nothing.
+            if tick_budget.is_some_and(|budget| ticks >= budget)
+                || self.kitten.terminator().raised()
+            {
+                break;
+            }
         }
+        // The bits the rounds wrote; the complement fold and the majority
+        // must not read the unwritten ones when the budget cut the rounds.
+        let signature_mask = if rounds_run >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << rounds_run) - 1
+        };
+        let majority_rounds = (rounds_run / 2) as u32;
 
         // 5. Group variables by canonical signature.
         // Complement folding: if sig(A) = !sig(B), then A is equivalent to not-B.
@@ -293,9 +332,10 @@ impl Sweeper {
             }
 
             let sig = signatures[var];
-            let majority_positive = sig.count_ones() > 32;
+            let complement = !sig & signature_mask;
+            let majority_positive = sig.count_ones() > majority_rounds;
 
-            let (canon_sig, signed_lit) = if sig <= !sig {
+            let (canon_sig, signed_lit) = if sig <= complement {
                 // Use sig directly. Literal polarity follows signature majority.
                 let lit = if majority_positive {
                     pos_idx as u32
@@ -312,17 +352,18 @@ impl Sweeper {
                 } else {
                     pos_idx as u32
                 };
-                (!sig, lit)
+                (complement, lit)
             };
 
             classes.entry(canon_sig).or_default().push(signed_lit);
         }
 
         // 6. Filter: keep only classes with 2+ members.
-        classes
+        let classes = classes
             .into_values()
             .filter(|class| class.len() >= 2)
-            .collect()
+            .collect();
+        (classes, rounds_run, ticks)
     }
 
     /// Queue-driven forward propagation using per-literal occurrence lists.
@@ -339,23 +380,35 @@ impl Sweeper {
         sim_vals: &mut [i8],
         queue: &mut Vec<usize>,
         num_lits: usize,
+        ticks: &mut u64,
     ) {
-        let mut qi = 0;
+        let mut qi: usize = 0;
         let mut steps: u32 = 0;
 
         while qi < queue.len() && steps < MAX_PROPAGATION_STEPS {
             // The queue contains literal indices that were just falsified.
             // Scan all clauses containing this literal for unit implications.
-            let falsified_lit_idx = queue[qi];
-            qi += 1;
+            let Some(&falsified_lit_idx) = queue.get(qi) else {
+                break;
+            };
+            let Some(next_qi) = qi.checked_add(1) else {
+                break;
+            };
+            qi = next_qi;
 
             if falsified_lit_idx >= num_lits {
                 continue;
             }
+            let Some(occ) = occ_lists.get(falsified_lit_idx) else {
+                continue;
+            };
 
-            for &ci in &occ_lists[falsified_lit_idx] {
-                steps += 1;
-                let lits = &clause_data[ci];
+            for &ci in occ {
+                steps = steps.saturating_add(1);
+                *ticks = ticks.saturating_add(1);
+                let Some(lits) = clause_data.get(ci) else {
+                    continue;
+                };
 
                 let mut satisfied = false;
                 let mut unassigned_lit = Literal(0);
@@ -366,12 +419,14 @@ impl Sweeper {
                     if li >= num_lits {
                         continue;
                     }
-                    let v = sim_vals[li];
+                    let Some(&v) = sim_vals.get(li) else {
+                        continue;
+                    };
                     if v > 0 {
                         satisfied = true;
                         break;
                     } else if v == 0 {
-                        unassigned_count += 1;
+                        unassigned_count = unassigned_count.saturating_add(1);
                         if unassigned_count > 1 {
                             break; // Not unit, skip early
                         }
@@ -385,12 +440,59 @@ impl Sweeper {
 
                 // Unit clause: force the remaining literal.
                 let li = unassigned_lit.index();
-                if li < num_lits && sim_vals[li] == 0 {
+                if li < num_lits && sim_vals.get(li) == Some(&0) {
                     let neg_idx = sim_assign(sim_vals, unassigned_lit);
                     // Enqueue the negation of the forced literal for further propagation.
                     queue.push(neg_idx);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::super::Sweeper;
+    use crate::clause_arena::ClauseArena;
+    use crate::test_util::lit;
+
+    /// A tick budget cuts the simulation after the round that exhausts it: one
+    /// tick is enough for one round (the loop checks after each round), the
+    /// signatures then carry one bit, and the propagation-forced pair x0/x1 still
+    /// lands in one class. Without a budget all 64 rounds run.
+    #[test]
+    fn simulation_stops_after_the_round_that_exhausts_the_budget() {
+        let mut clauses = ClauseArena::new();
+        clauses.add(&[lit(0, true), lit(1, false)], false);
+        clauses.add(&[lit(0, false), lit(1, true)], false);
+        clauses.add(&[lit(2, true), lit(3, true)], false);
+        clauses.add(&[lit(2, false), lit(3, false)], false);
+        let vals = vec![0i8; 8];
+        let frozen: Vec<u32> = vec![0; 4];
+        let sweeper = Sweeper::new(4);
+
+        let (classes, rounds, ticks) =
+            sweeper.find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, Some(1));
+        assert_eq!(rounds, 1);
+        assert!(
+            ticks >= 8,
+            "the copied literals alone are 8 ticks, got {ticks}"
+        );
+        let x0_class = classes.iter().find(|c| c.iter().any(|&l| l >> 1 == 0));
+        assert!(
+            x0_class.is_some_and(|c| c.iter().any(|&l| l >> 1 == 1)),
+            "x0 and x1 are forced equal and must share a class after one round: {classes:?}"
+        );
+
+        let (_, rounds, _) =
+            sweeper.find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, None);
+        assert_eq!(rounds, 64);
+        let (_, rounds, _) = sweeper.find_candidates_by_simulation_budgeted(
+            &clauses,
+            &vals,
+            &frozen,
+            Some(u64::MAX),
+        );
+        assert_eq!(rounds, 64);
     }
 }

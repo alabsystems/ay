@@ -9,7 +9,10 @@ use super::*;
 use std::collections::BTreeSet;
 
 mod aux_free_sr_route;
+mod fix_and_cut;
 pub(in crate::solver) mod ladder_collapse;
+mod size_caps;
+use size_caps::{orbitope_limits, orbitope_max_clauses, symmetry_detector_max_clauses};
 
 const SYMMETRY_MAX_VARS: usize = 4_096;
 /// Variable ceiling for the CHEAP aux-free-SR / php-matrix route.
@@ -47,7 +50,8 @@ const SYMMETRY_IR_MAX_CLAUSES: usize = 20_000;
 /// six official `chnl` instances sit just past it (`chnl-020x101` at 202_202
 /// clauses, `chnl-030x091` at 245_882) and were dropped to plain CDCL, where
 /// they time out, while the four below the cap solve in 67-1337 ms. The cap is a
-/// resource guard, not a soundness gate. (B2: edit the constant.)
+/// resource guard, not a soundness gate. (B2: edit the constant.) Read through
+/// `size_caps`, where `--sat-symmetry-large-caps` raises it.
 const SYMMETRY_DETECTOR_MAX_CLAUSES: usize = 1_000_000;
 /// Size guard for the SIGNED IR search. The search itself is node-budgeted, but
 /// building the colored graph and the clause multiset is linear in the formula,
@@ -60,6 +64,7 @@ const SYMMETRY_MAX_GROUP_SIZE: usize = 64;
 /// needs its own. Set far above every instance the route targets (largest:
 /// `exam_75_65` at 336_450 clauses, `chnl-030x091` at 245_882) while keeping the
 /// corpus's 18 M-clause instances out. See the measurement at the call site.
+/// Read through `size_caps`, where `--sat-symmetry-large-caps` raises it.
 const ORBITOPE_MAX_CLAUSES: usize = 2_000_000;
 const ORBITOPE_MAX_VARS: usize = 1_000_000;
 
@@ -102,7 +107,10 @@ impl Solver {
         // composite-permutation symmetry path even when the profile leaves
         // symmetry off — for the clique/coloring/PHP family that the single-swap
         // detector cannot break.
-        let composite_symmetry = ay_core::sat_ab_switches().composite_symmetry;
+        // Fix-and-cut (symmetry fixing, step 3) rides on the composite route
+        // with the detector's size caps and its own constraints.
+        let fix_and_cut = ay_core::sat_ab_switches().symmetry_fix_and_cut;
+        let composite_symmetry = ay_core::sat_ab_switches().composite_symmetry || fix_and_cut;
         if self.cold.has_been_incremental {
             self.cold
                 .symmetry_stats
@@ -137,6 +145,9 @@ impl Solver {
         let declared_checker_sr_ok =
             crate::proof_capability::declared_checker_accepts_sr_witnesses(veripb_surface);
         let witnessed_drat_ok = plain_drat_surface_ok && declared_checker_sr_ok;
+        // Fix-and-cut certifies every step by SR with the automorphism as the
+        // witness (or RUP), so it runs wherever the aux-free SR route may.
+        let fix_and_cut_route = fix_and_cut && (!proof_surface_active || witnessed_drat_ok);
 
         // Orbitope route (SAT-COMP 2026): structure-first row-interchangeable
         // at-most-one matrix detection plus orbitopal unit fixing — the
@@ -178,7 +189,8 @@ impl Solver {
         // the corpus's 1.7 GB / 18 M-clause instances. The cap is set well above
         // every target: the largest in the family is `exam_75_65` at 336 450
         // clauses and `chnl-030x091` at 245 882.
-        let orbitope_fits = self.arena.active_clause_count() <= ORBITOPE_MAX_CLAUSES
+        let orbitope_clause_cap = orbitope_max_clauses();
+        let orbitope_fits = self.arena.active_clause_count() <= orbitope_clause_cap
             && self.num_vars <= ORBITOPE_MAX_VARS;
         if orbitope_route
             && !self.cold.symmetry_orbitope_disabled
@@ -196,12 +208,26 @@ impl Solver {
             // symmetry the detector needs. Sound standalone — it runs whether
             // or not the orbitope detection subsequently fires. See
             // `ladder_collapse` for the recognizer's strictness contract.
-            let (ladder_unsat, ladder_changed) = self.preprocess_symmetry_ladder_collapse();
+            let mut stopped = None;
+            let (ladder_unsat, ladder_changed) =
+                self.preprocess_symmetry_ladder_collapse(should_stop, &mut stopped);
             if ladder_unsat {
                 return (true, true);
             }
             let before = self.cold.symmetry_stats.sb_clauses_added;
-            let (unsat, changed) = self.preprocess_symmetry_orbitope();
+            let (unsat, changed) = match stopped {
+                None => self.preprocess_symmetry_orbitope(should_stop, &mut stopped),
+                Some(_) => (false, false),
+            };
+            if let Some(reason) = stopped {
+                // The solve's own stop fired inside the route. Detection only
+                // reads a snapshot and ladder collapse stops between ladders,
+                // so nothing partial is installed; never stop silently (G7).
+                safe_eprintln!("c symmetry: orbitope route stopped: {reason:?}");
+                let outcome = format!("stopped: {reason:?}");
+                self.cold.symmetry_stats.record_route("orbitope", outcome);
+                return (false, ladder_changed);
+            }
             let added = self.cold.symmetry_stats.sb_clauses_added - before;
             self.cold.symmetry_stats.record_route(
                 "orbitope",
@@ -219,7 +245,7 @@ impl Solver {
         } else if orbitope_route && self.cold.symmetry_oneshot && !orbitope_fits {
             // Never drop a route silently (master-plan G7).
             safe_eprintln!(
-                "c symmetry: skipped (orbitope size): vars {} cap {ORBITOPE_MAX_VARS}, clauses {} cap {ORBITOPE_MAX_CLAUSES}",
+                "c symmetry: skipped (orbitope size): vars {} cap {ORBITOPE_MAX_VARS}, clauses {} cap {orbitope_clause_cap}",
                 self.num_vars,
                 self.arena.active_clause_count(),
             );
@@ -375,7 +401,7 @@ impl Solver {
         // DRAT surface, not the dsr-trim declared-checker capability.
         let hhw_route = hhw_route_enabled && composite_symmetry && plain_drat_surface_ok;
         let sr_auxfree_route = sr_auxfree_route && sr_auxfree_supported;
-        if proof_surface_active && !hhw_route && !sr_auxfree_route {
+        if proof_surface_active && !hhw_route && !sr_auxfree_route && !fix_and_cut_route {
             // Same G7 rule as the size guard below: never drop to plain CDCL
             // without a trace. This skip used to be SILENT, which made a
             // proof-mode run look like a plain search timeout — the instance
@@ -406,12 +432,13 @@ impl Solver {
         // silently (master-plan G7: php_50 used to vanish into CDCL with no trace).
         // B2: the AY_SAT_SYMMETRY_DETECTOR_MAX_* env overrides are deleted;
         // the named constants are the single source of truth.
-        let clause_cap = if sr_auxfree_route && !hhw_route {
-            SYMMETRY_DETECTOR_MAX_CLAUSES
+        let large_caps = (sr_auxfree_route && !hhw_route) || fix_and_cut;
+        let clause_cap = if large_caps {
+            symmetry_detector_max_clauses()
         } else {
             SYMMETRY_IR_MAX_CLAUSES
         };
-        let var_cap = if sr_auxfree_route && !hhw_route {
+        let var_cap = if large_caps {
             SYMMETRY_DETECTOR_MAX_VARS
         } else {
             SYMMETRY_MAX_VARS
@@ -439,7 +466,10 @@ impl Solver {
             return (false, false);
         }
 
-        let clauses = self.snapshot_root_irredundant_clauses_for_symmetry();
+        let stop = || self.solve_stop_reason(should_stop).is_some();
+        let Some(clauses) = self.snapshot_symmetry_clauses_until(&stop) else {
+            return (false, false);
+        };
         if self.preprocessing_should_stop(should_stop) {
             return (false, false);
         }
@@ -533,7 +563,9 @@ impl Solver {
             // misses, reapply the tight IR cap before falling through; otherwise
             // default-on aux-free recognition would accidentally authorize the
             // backtracking finder up to the one-million-variable/clause ceilings.
-            if num_vars > SYMMETRY_MAX_VARS || active_clauses > SYMMETRY_IR_MAX_CLAUSES {
+            if !fix_and_cut
+                && (num_vars > SYMMETRY_MAX_VARS || active_clauses > SYMMETRY_IR_MAX_CLAUSES)
+            {
                 if num_vars > SYMMETRY_MAX_VARS {
                     safe_eprintln!(
                         "c symmetry: skipped (IR fallback after aux-free miss): vars {num_vars} > cap {SYMMETRY_MAX_VARS}"
@@ -552,12 +584,26 @@ impl Solver {
             // Falling through is only safe because the routes below re-check the
             // proof surface; a proof-mode run that reaches here must not enter a
             // route without a checker-consumable construction.
-            if proof_surface_active && !hhw_route {
+            if proof_surface_active && !hhw_route && !fix_and_cut_route {
                 self.cold
                     .symmetry_stats
                     .skip(crate::symmetry::SymmetrySkipReason::ProofMode);
                 return (false, false);
             }
+        }
+
+        if fix_and_cut_route {
+            let result = self.symmetry_fix_and_cut_install(&detector, &clauses);
+            self.user_num_vars = user_num_vars_before;
+            return result;
+        }
+        if fix_and_cut {
+            // Asked for, but the proof surface cannot carry SR witnesses.
+            self.cold
+                .symmetry_stats
+                .skip(crate::symmetry::SymmetrySkipReason::ProofMode);
+            self.user_num_vars = user_num_vars_before;
+            return (false, false);
         }
 
         let sbp_clauses = if composite_symmetry {
@@ -568,7 +614,11 @@ impl Solver {
             // witnesses yet, #8011). Aux variables are allocated from the current
             // var count and must exist before the clauses are added.
             let fresh_base = self.num_vars as u32;
-            let (cls, aux) = detector.detect_and_encode_composite(&clauses, fresh_base);
+            let (cls, aux, chain) =
+                detector.detect_and_encode_composite_with_chain(&clauses, fresh_base);
+            self.cold.symmetry_stats.chain_generators = chain.generators;
+            self.cold.symmetry_stats.chain_base_len = chain.base_len;
+            self.cold.symmetry_stats.chain_orbits = chain.orbits;
             if aux > 0 {
                 self.ensure_num_vars(fresh_base as usize + aux as usize);
             }
@@ -784,14 +834,32 @@ impl Solver {
     /// Returns `(unsat, changed)`. Every row transposition used is checked
     /// against the whole clause multiset by the detector's sound gate, so a
     /// detection bug can only cost units, never admit a wrong answer.
-    fn preprocess_symmetry_orbitope(&mut self) -> (bool, bool) {
-        use crate::symmetry::orbitope::{detect_row_amo_matrices, OrbitopeLimits};
+    ///
+    /// The solve's stop (deadline, interrupt, memory, proof failure) is sampled
+    /// throughout; when it fires, `stopped` gets its reason and nothing is added.
+    fn preprocess_symmetry_orbitope<F>(
+        &mut self,
+        should_stop: &F,
+        stopped: &mut Option<crate::SatUnknownReason>,
+    ) -> (bool, bool)
+    where
+        F: Fn() -> bool + ?Sized,
+    {
+        use crate::symmetry::orbitope::detect_row_amo_matrices_until;
 
-        let clauses = self.snapshot_root_irredundant_clauses_for_symmetry();
+        let stop = || self.solve_stop_reason(should_stop).is_some();
+        let Some(clauses) = self.snapshot_symmetry_clauses_until(&stop) else {
+            *stopped = Some(self.stop_reason_or_interrupted(should_stop));
+            return (false, false);
+        };
         if clauses.len() < 2 {
             return (false, false);
         }
-        let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, stats) = detect_row_amo_matrices_until(&clauses, orbitope_limits(), &stop);
+        if stats.interrupted {
+            *stopped = Some(self.stop_reason_or_interrupted(should_stop));
+            return (false, false);
+        }
         self.cold.symmetry_stats.groups_nontrivial = self
             .cold
             .symmetry_stats
@@ -937,7 +1005,17 @@ impl Solver {
     /// Every entry's clause is implied by the ORIGINAL formula, and the
     /// always-on model verification gate (`finalize_sat_model`) remains the
     /// backstop behind this argument.
-    pub(in crate::solver) fn preprocess_symmetry_ladder_collapse(&mut self) -> (bool, bool) {
+    ///
+    /// The solve's stop is sampled during the scan and before each ladder, so a
+    /// ladder is collapsed whole or not at all; `stopped` gets the reason.
+    pub(in crate::solver) fn preprocess_symmetry_ladder_collapse<F>(
+        &mut self,
+        should_stop: &F,
+        stopped: &mut Option<crate::SatUnknownReason>,
+    ) -> (bool, bool)
+    where
+        F: Fn() -> bool + ?Sized,
+    {
         use crate::proof_manager::ProofAddKind;
         use ladder_collapse::{
             detect_ladders, LadderScanInput, LADDER_COLLAPSE_MAX_TOTAL_BINARIES,
@@ -953,7 +1031,13 @@ impl Solver {
         // Streaming scan: only clean binary clauses are retained; every other
         // clause merely disqualifies its variables from serving as registers.
         let mut input = LadderScanInput::new(self.num_vars);
-        for idx in self.arena.active_indices() {
+        for (scanned, idx) in self.arena.active_indices().enumerate() {
+            if scanned % 65_536 == 65_535 {
+                if let Some(reason) = self.solve_stop_reason(should_stop) {
+                    *stopped = Some(reason);
+                    return (false, false);
+                }
+            }
             if self.arena.is_dead(idx) || self.arena.is_learned(idx) {
                 continue;
             }
@@ -965,6 +1049,10 @@ impl Solver {
         if scan.ladders.is_empty() {
             return (false, false);
         }
+        if let Some(reason) = self.solve_stop_reason(should_stop) {
+            *stopped = Some(reason);
+            return (false, false);
+        }
 
         let mut existing_amo = scan.existing_amo;
         let mut collapsed = 0usize;
@@ -973,6 +1061,10 @@ impl Solver {
         let mut aux_eliminated = 0usize;
         let mut budget_skipped = 0usize;
         for ladder in &scan.ladders {
+            if let Some(reason) = self.solve_stop_reason(should_stop) {
+                *stopped = Some(reason);
+                break;
+            }
             let k = ladder.base.len();
             // Pairs still missing from the formula, under the global budget.
             let mut pairs: Vec<(Variable, Variable)> = Vec::with_capacity(k * (k - 1) / 2);
@@ -1196,9 +1288,21 @@ impl Solver {
     }
 
     fn snapshot_root_irredundant_clauses_for_symmetry(&self) -> Vec<Vec<Literal>> {
+        self.snapshot_symmetry_clauses_until(&|| false)
+            .unwrap_or_default()
+    }
+
+    /// The snapshot, sampling `stop` every 65,536 clauses; `None` once it fires.
+    fn snapshot_symmetry_clauses_until(
+        &self,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Vec<Vec<Literal>>> {
         let mut clauses = Vec::new();
 
-        for clause_idx in self.arena.active_indices() {
+        for (scanned, clause_idx) in self.arena.active_indices().enumerate() {
+            if scanned % 65_536 == 65_535 && stop() {
+                return None;
+            }
             if self.arena.is_dead(clause_idx) || self.arena.is_learned(clause_idx) {
                 continue;
             }
@@ -1225,7 +1329,18 @@ impl Solver {
             clauses.push(reduced);
         }
 
-        clauses
+        Some(clauses)
+    }
+
+    /// The reason a stop sampled inside the symmetry pass fired. A callback
+    /// need not repeat its answer, so a fired stop with no reason left to read
+    /// is reported as an interrupt.
+    fn stop_reason_or_interrupted<F>(&self, should_stop: &F) -> crate::SatUnknownReason
+    where
+        F: Fn() -> bool + ?Sized,
+    {
+        self.solve_stop_reason(should_stop)
+            .unwrap_or(crate::SatUnknownReason::Interrupted)
     }
 
     #[inline]

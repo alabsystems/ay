@@ -133,7 +133,8 @@ impl<'a> SExprParser<'a> {
             Some(Ok(token)) => {
                 let result =
                     match token {
-                        Token::Symbol(s) => SExpr::Symbol((*s).to_string()),
+                        Token::Symbol(s) => negative_numeric_literal(s)
+                            .unwrap_or_else(|| SExpr::Symbol((*s).to_string())),
                         Token::Keyword(k) => SExpr::Keyword((*k).to_string()),
                         Token::Numeral(n) => SExpr::Numeral((*n).to_string()),
                         Token::Decimal(d) => SExpr::Decimal((*d).to_string()),
@@ -150,14 +151,24 @@ impl<'a> SExprParser<'a> {
                                     u32::from(character)
                                 )));
                             }
-                            // Fail closed on a literal we cannot represent exactly.
-                            // Substituting a replacement character (or dropping the
-                            // escape) would change the string's length and silently
-                            // flip every str.len/membership verdict mentioning it.
-                            match unescape_string_contents(contents) {
-                                Ok(decoded) => SExpr::String(decoded),
-                                Err(err) => return Err(self.error_at_current(err.to_string())),
+                            // A RAW character in the surrogate carrier block
+                            // would read back as the surrogate it carries (raw
+                            // U+10D800 as `\u{d800}`), though the input meant
+                            // the code point 0x10D800, which equals no SMT-LIB
+                            // character. Refused, never stored: the literal's
+                            // command is discarded and a later `check-sat`
+                            // answers `unknown`, not a verdict about U+D800.
+                            if let Some(character) = ay_core::first_surrogate_carrier(contents) {
+                                return Err(self.error_at_current(format!(
+                                    "string literal contains raw character U+{:04X}, which AY \
+                                     reserves to carry the surrogate code point U+{:04X}",
+                                    u32::from(character),
+                                    ay_core::smtlib_code_point(character)
+                                )));
                             }
+                            // Every in-alphabet escape, a surrogate included, is
+                            // exactly one character (`ay_core::smtlib_char`).
+                            SExpr::String(unescape_string_contents(contents))
                         }
                         Token::QuotedSymbol(s) => {
                             let inner = &s[1..s.len() - 1];
@@ -222,6 +233,44 @@ impl<'a> SExprParser<'a> {
             result.push(self.parse_sexp()?);
         }
         Ok(result)
+    }
+}
+
+/// The number an UNQUOTED `-N` / `-N.M` spells, or `None` for any other
+/// symbol.
+///
+/// SMT-LIB 2.6 makes `-1` a simple symbol, but z3 (4.16, 5.1.0), cvc5 1.4.1
+/// and pinned Carcara 1.1.0 all scan an unquoted `-` followed by digits as a
+/// negative numeral (`-` digits `.` digits as a negative decimal), even where
+/// `|-1|` is declared, defined or bound: only the QUOTED `|-1|` names that
+/// symbol. The lexer keeps the two apart (`Token::Symbol` vs
+/// `Token::QuotedSymbol`), and so does this parser: the unquoted spelling
+/// becomes the signed `Numeral` / `Decimal`, so no later scope can turn it into
+/// a symbol, and a declaration or binder spelled with it is refused as z3
+/// refuses it ("symbol expected"). Leading zeros (`-007`) read as z3 reads
+/// them; `-.5`, `-5.`, `-1e3` and `-1a` stay symbols.
+fn negative_numeric_literal(text: &str) -> Option<SExpr> {
+    is_negative_numeric_literal(text).then(|| {
+        if text.contains('.') {
+            SExpr::Decimal(text.to_string())
+        } else {
+            SExpr::Numeral(text.to_string())
+        }
+    })
+}
+
+/// Whether the unquoted spelling `text` is the negative numeral or decimal
+/// `-N` / `-N.M` the parser reads as a number (`negative_numeric_literal`), so
+/// a symbol of that name must be written `|text|` to stay a symbol.
+#[must_use]
+pub fn is_negative_numeric_literal(text: &str) -> bool {
+    let Some(magnitude) = text.strip_prefix('-') else {
+        return false;
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    match magnitude.split_once('.') {
+        None => digits(magnitude),
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
     }
 }
 

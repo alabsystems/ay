@@ -235,14 +235,16 @@ impl Subsumer {
                 if sign_idx < self.bins.len() {
                     for bi in 0..self.bins[sign_idx].len() {
                         let bin = self.bins[sign_idx][bi];
+                        // The mark first: it is in cache, the clause header
+                        // is not, and most binaries fail it.
+                        let tmp = self.marked(bin.other);
+                        if tmp == 0 {
+                            continue;
+                        }
                         if bin.clause_idx >= clauses.len()
                             || !clauses.is_active(bin.clause_idx)
                             || clauses.is_dead(bin.clause_idx)
                         {
-                            continue;
-                        }
-                        let tmp = self.marked(bin.other);
-                        if tmp == 0 {
                             continue;
                         }
                         // Binary clause {sign, other} — check subsumption/strengthening
@@ -280,6 +282,14 @@ impl Subsumer {
                         if d_idx == c_idx {
                             continue;
                         }
+                        // 64-bit signature pre-filter, before the clause is
+                        // read: skip D if its variables are not a subset of
+                        // C's. `d_sig` is the pass-local signature carried in
+                        // the connection entry; literals do not change during
+                        // the round, so it matches D's current literals.
+                        if !clause_signature_vars_subset(d_sig, c_sig) {
+                            continue;
+                        }
                         if d_idx >= clauses.len()
                             || !clauses.is_active(d_idx)
                             || clauses.is_dead(d_idx)
@@ -296,16 +306,6 @@ impl Subsumer {
                         );
                         if d_lits.len() > c_lits.len() {
                             continue; // D must be <= C in size to subsume C
-                        }
-                        // 64-bit signature pre-filter: skip D if its variables
-                        // are not a subset of C's variables. This avoids the
-                        // O(|D|) literal-by-literal subsume_check when the
-                        // bloom filter proves non-containment. `d_sig` is the
-                        // pass-local signature carried in the connection
-                        // entry; literals do not change during the round, so
-                        // it matches D's current literals.
-                        if !clause_signature_vars_subset(d_sig, c_sig) {
-                            continue;
                         }
                         let check = self.subsume_check(d_lits);
                         if check != 0 {

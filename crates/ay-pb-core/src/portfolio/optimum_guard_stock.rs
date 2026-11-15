@@ -9,9 +9,7 @@
 // fragment with one line removed, because a native contract clause is raw grammar
 // that a stock rustc rejects at parse time. `portfolio.rs` selects between them on
 // `cfg(deductive_verify)`, so the verifier NEVER reads this file and the OPTIMUM upgrade
-// gate is never verified in a weakened form. `tests/native_contract_twins.rs` pins
-// the two bodies together, so a divergence fails the suite instead of shipping an
-// unproven gate.
+// gate is never verified in a weakened form.
 
 /// See `optimum_guard.rs` for the OPTIMUM-upgrade contract and the postcondition
 /// this spelling cannot carry.

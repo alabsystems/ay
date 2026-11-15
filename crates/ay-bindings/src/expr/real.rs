@@ -34,8 +34,6 @@ impl Expr {
         /// Convert Int to Real.
         /// REQUIRES: `self` is an Int sort.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_int())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn int_to_real / try_int_to_real,
         check: is_int,
         assert_msg: "int_to_real requires Int sort",
@@ -49,8 +47,6 @@ impl Expr {
         /// SMT-LIB: (to_int r) returns floor(r).
         /// REQUIRES: `self` is a Real sort.
         /// ENSURES: result sort is Int.
-        #[kani_requires(self.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_int())]
         fn real_to_int / try_real_to_int,
         check: is_real,
         assert_msg: "real_to_int requires Real sort",
@@ -64,8 +60,6 @@ impl Expr {
         /// SMT-LIB: (is_int r) returns true iff r is an integer value.
         /// REQUIRES: `self` is a Real sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn is_int / try_is_int,
         check: is_real,
         assert_msg: "is_int requires Real sort",
@@ -79,8 +73,6 @@ impl Expr {
         /// Real addition.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn real_add / try_real_add,
         check: real_same,
         assert_msg: "real_add requires Real sorts",
@@ -92,8 +84,6 @@ impl Expr {
         /// Real subtraction.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn real_sub / try_real_sub,
         check: real_same,
         assert_msg: "real_sub requires Real sorts",
@@ -105,8 +95,6 @@ impl Expr {
         /// Real multiplication.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn real_mul / try_real_mul,
         check: real_same,
         assert_msg: "real_mul requires Real sorts",
@@ -118,8 +106,6 @@ impl Expr {
         /// Real division.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn real_div / try_real_div,
         check: real_same,
         assert_msg: "real_div requires Real sorts",
@@ -131,8 +117,6 @@ impl Expr {
         /// Real negation.
         /// REQUIRES: `self` is a Real sort.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn real_neg / try_real_neg,
         check: is_real,
         assert_msg: "real_neg requires Real sort",
@@ -146,8 +130,6 @@ impl Expr {
         /// Real less than.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn real_lt / try_real_lt,
         check: real_same,
         assert_msg: "real_lt requires Real sorts",
@@ -159,8 +141,6 @@ impl Expr {
         /// Real less than or equal.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn real_le / try_real_le,
         check: real_same,
         assert_msg: "real_le requires Real sorts",
@@ -172,8 +152,6 @@ impl Expr {
         /// Real greater than.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn real_gt / try_real_gt,
         check: real_same,
         assert_msg: "real_gt requires Real sorts",
@@ -185,8 +163,6 @@ impl Expr {
         /// Real greater than or equal.
         /// REQUIRES: `self` and `other` are Real sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_real() && other.sort.is_real())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn real_ge / try_real_ge,
         check: real_same,
         assert_msg: "real_ge requires Real sorts",

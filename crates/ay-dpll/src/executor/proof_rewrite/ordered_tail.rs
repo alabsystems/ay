@@ -88,11 +88,17 @@ impl Executor {
         // path has run the lane unbounded since #4751 and keeps its exact
         // behaviour; the retention-OFF subset's commit gate does not apply.
         let _spliced = self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
+        if self.proof_assembly_stop_requested() {
+            return;
+        }
         // #rewritten-assertion-bridge — the same repair for the assertions
         // `VariableSubstitution` rewrote, which carry no `EqDiffVar` record and
         // no fresh definiendum: DERIVE the rewrite from the authored
         // assertions, by congruence. See `proof/rewritten_assertion_bridge`.
         self.derive_rewritten_assertions_by_congruence(proof, &extended_assertions);
+        if self.proof_assembly_stop_requested() {
+            return;
+        }
         // #rewritten-nonequality-bridge — the same repair for a rewritten
         // assertion whose goal is not a binary `=`.
         self.derive_rewritten_nonequality_assertions(proof, &extended_assertions);

@@ -8,8 +8,8 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{FarkasAnnotation, TheoryPropagation, TheoryResult, TheorySolver};
 use ay_sat::{ExtPropagateResult, Literal};
 
+use super::propagation_lazy::bound_axiom_kind;
 use super::*;
-use crate::extension::infer_bound_axiom_arith_kind;
 use crate::extension::types::format_term_recursive;
 use crate::verification::{log_propagation_debug, verify_theory_propagation};
 
@@ -73,6 +73,29 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 return PropagationDisposition::Lazy(sat_literal, reason_data);
             }
             LazyResolution::Materialized(propagation) => propagation,
+            LazyResolution::Level0Explained {
+                explained,
+                sat_literal,
+                reason_data,
+            } => {
+                let theory_literal = explained.literal;
+                let certified = explained.clone();
+                return match self.process_materialized_propagation(explained, round) {
+                    eager @ PropagationDisposition::Eager(..) => {
+                        self.certify_level0_explanation(&certified);
+                        eager
+                    }
+                    _ => {
+                        self.eager_stats.level0_lazy_unexplained += 1;
+                        self.record_lazy_context_propagation(
+                            round.ctx,
+                            &theory_literal,
+                            reason_data,
+                        );
+                        PropagationDisposition::Lazy(sat_literal, reason_data)
+                    }
+                };
+            }
         };
         self.process_materialized_propagation(propagation, round)
     }
@@ -82,7 +105,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         propagation: TheoryPropagation,
         round: &PropagationRound<'_>,
     ) -> PropagationDisposition {
-        if self.propagation_is_unmapped(&propagation) {
+        if self.propagation_is_unmapped(&propagation, round.ctx) {
             return PropagationDisposition::Skip;
         }
         log_propagation_debug(&propagation, "eager");
@@ -100,9 +123,12 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         if !self.propagation_is_semantically_valid(&propagation) {
             return PropagationDisposition::Skip;
         }
-        let Some(literal) =
-            self.term_to_literal(propagation.literal.term, propagation.literal.value)
-        else {
+        let Some(literal) = self.term_to_literal_minting(
+            propagation.literal.term,
+            propagation.literal.value,
+            round.ctx,
+            super::super::check::mint_theory_vars_enabled(),
+        ) else {
             return PropagationDisposition::Skip;
         };
         if let Some(value) = round.ctx.value(literal.variable()) {
@@ -126,8 +152,21 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         }
     }
 
-    fn propagation_is_unmapped(&mut self, propagation: &TheoryPropagation) -> bool {
-        if self.term_to_var.contains_key(&propagation.literal.term) {
+    fn propagation_is_unmapped(
+        &mut self,
+        propagation: &TheoryPropagation,
+        ctx: &dyn ay_sat::SolverContext,
+    ) -> bool {
+        if self.var_for_term(propagation.literal.term).is_some() {
+            return false;
+        }
+        // #6846 BCP parity: with minting enabled, name the propagated
+        // term instead of skipping the propagation outright.
+        if super::super::check::mint_theory_vars_enabled()
+            && self
+                .mint_var_for_term(propagation.literal.term, ctx)
+                .is_some()
+        {
             return false;
         }
         self.eager_stats.props_unmapped += 1;
@@ -149,17 +188,32 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         literal: Literal,
         round: &PropagationRound<'_>,
     ) -> PropagationDisposition {
-        let mut conflict: Vec<Literal> = propagation
-            .reason
-            .iter()
-            .filter_map(|reason| self.term_to_literal(reason.term, !reason.value))
-            .collect();
+        let mint_enabled = super::super::check::mint_theory_vars_enabled();
+        let mut minted_any = false;
+        let mut conflict: Vec<Literal> = Vec::with_capacity(propagation.reason.len());
+        for reason in &propagation.reason {
+            let was_mapped = self.var_for_term(reason.term).is_some();
+            match self.term_to_literal_minting(reason.term, !reason.value, round.ctx, mint_enabled)
+            {
+                Some(lit) => {
+                    minted_any |= !was_mapped;
+                    conflict.push(lit);
+                }
+                None => break,
+            }
+        }
         if conflict.len() < propagation.reason.len() {
             self.bump_partial_clause_count();
             self.emit_conflict_unknown(round);
             return PropagationDisposition::Skip;
         }
         if !reasons_are_falsified(&conflict, round) {
+            if minted_any {
+                // Completed only by minting: the clause is a valid
+                // propagation lemma, not a falsified conflict.
+                conflict.push(literal);
+                return PropagationDisposition::Lemma(conflict);
+            }
             tracing::warn!(
                 propagated = ?literal,
                 reason_count = conflict.len(),
@@ -196,12 +250,10 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     ) -> ClauseDisposition {
         let mut clause = Vec::with_capacity(propagation.reason.len() + 1);
         clause.push(literal);
-        clause.extend(
-            propagation
-                .reason
-                .iter()
-                .filter_map(|reason| self.term_to_literal(reason.term, !reason.value)),
-        );
+        let mint_enabled = super::super::check::mint_theory_vars_enabled();
+        clause.extend(propagation.reason.iter().filter_map(|reason| {
+            self.term_to_literal_minting(reason.term, !reason.value, round.ctx, mint_enabled)
+        }));
         if clause.len() - 1 < propagation.reason.len() {
             self.bump_partial_clause_count();
             return ClauseDisposition::Skip;
@@ -250,37 +302,17 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     /// Record only level-0, single-reason, Farkas-classified implications.
     /// Widening either gate perturbs the proof firewall and has regressed the
     /// strict suites; uncertified `Generic` lemmas remain deliberately absent.
+    /// (The level-0 lazy explanations are certified separately, and only with
+    /// a re-verified certificate: `certify_level0_explanation`.)
     fn record_level0_propagation(&mut self, propagation: &TheoryPropagation, clause_len: usize) {
         self.record_context_propagation(&propagation.literal, &propagation.reason);
-        let terms = self.terms;
+        let Some(clause) = self.level0_proof_clause(propagation, clause_len) else {
+            return;
+        };
         let Some(proof) = self.proof.as_mut() else {
             return;
         };
-        let mut clause = Vec::with_capacity(clause_len);
-        if !push_term_at_polarity(
-            &mut clause,
-            propagation.literal.term,
-            propagation.literal.value,
-            proof.negations,
-        ) {
-            return;
-        }
-        for reason in &propagation.reason {
-            if !push_term_at_polarity(&mut clause, reason.term, !reason.value, proof.negations) {
-                return;
-            }
-        }
-        let kind = match (terms, propagation.reason.as_slice()) {
-            (Some(terms), [reason]) => infer_bound_axiom_arith_kind(
-                terms,
-                propagation.literal.term,
-                reason.term,
-                propagation.literal.value,
-                reason.value,
-            ),
-            _ => None,
-        };
-        if let Some(kind) = kind {
+        if let Some(kind) = bound_axiom_kind(self.terms, propagation) {
             let _ = proof.tracker.add_theory_lemma_with_farkas_and_kind(
                 clause,
                 FarkasAnnotation::from_ints(&[1i64, 1]),
@@ -416,7 +448,7 @@ pub(super) fn reasons_are_falsified(reasons: &[Literal], round: &PropagationRoun
     })
 }
 
-fn push_term_at_polarity(
+pub(super) fn push_term_at_polarity(
     clause: &mut Vec<ay_core::TermId>,
     term: ay_core::TermId,
     positive: bool,

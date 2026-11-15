@@ -564,10 +564,13 @@ fn test_maxsmt_rejects_parsed_softs_even_without_native_softs() {
     assert!(solver.model_for_consumer().is_none());
 }
 
-/// Neither native optimization entrypoint may silently drop the other
-/// objective class while presenting a non-joint model value as optimal.
+/// `optimize_check` now optimizes mixed API softs + arithmetic objectives
+/// JOINTLY in registration order (the soft was registered first here, so it
+/// wins and the maximize is pinned to 0); `check_sat_max` remains the
+/// pure-soft entrypoint and keeps refusing a problem that also carries
+/// arithmetic objectives.
 #[test]
-fn test_native_objective_and_soft_mix_is_honest_unknown_everywhere() {
+fn test_native_objective_and_soft_mix_joint_optimize_flat_refused() {
     let mut solver = Solver::try_new(Logic::QfLia).unwrap();
     let x = solver.declare_const("x", Sort::Int);
     let zero = solver.int_const(0);
@@ -581,14 +584,14 @@ fn test_native_objective_and_soft_mix_is_honest_unknown_everywhere() {
     let objective = solver.maximize(x);
 
     let optimized = solver.optimize_check();
-    assert!(optimized.is_unknown());
+    assert!(optimized.is_sat());
     assert_eq!(
-        solver.unknown_reason(),
-        Some(crate::UnknownReason::Unsupported)
+        solver.get_objective_value(objective),
+        Some(crate::api::ObjectiveValue::Finite(
+            num_rational::BigRational::from_integer(num_bigint::BigInt::from(0))
+        ))
     );
-    assert_eq!(solver.get_objective_value(objective), None);
-    assert!(solver.model().is_none());
-    assert!(solver.model_for_consumer().is_none());
+    assert!(solver.model_for_consumer().is_some());
     assert!(solver.executor.take_sat_certificate().is_none());
 
     let maxsmt = solver.check_sat_max().unwrap();

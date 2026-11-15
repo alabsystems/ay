@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 impl AlethePrinter<'_> {
     /// Format a term as an SMT-LIB expression
     pub(crate) fn format_term(&self, term_id: TermId) -> String {
@@ -65,12 +68,96 @@ impl AlethePrinter<'_> {
             return;
         }
         let term = self.terms.get(term_id);
+        let formatted = if let Some(formatted) = self.format_const_array(term_id, term) {
+            formatted
+        } else if let TermData::App(symbol, args) = term {
+            // Stream applications into the final buffer. Materializing and
+            // caching every store prefix copies a depth-n array n times, even
+            // when its final spelling fits the unchanged emission budget.
+            // Overrides and existing cache entries still take precedence.
+            self.write_application_into(out, symbol, args);
+            return;
+        } else {
+            self.format_term_data(term)
+        };
+        self.charge(formatted.len() as u64);
+        out.push_str(&formatted);
+        self.format_cache.borrow_mut().insert(term_id, formatted);
+    }
+
+    /// The single structural application spelling, shared by direct append
+    /// and structural-only rendering. Charge the bytes this application adds;
+    /// each child charges its own writes, without copying ancestor buffers.
+    pub(super) fn write_application_into(
+        &self,
+        out: &mut String,
+        symbol: &Symbol,
+        args: &[TermId],
+    ) {
+        if self.work_budget_exhausted() {
+            return;
+        }
+        let name = Self::application_spelling_head(symbol, args.len());
+        let own_bytes = if args.is_empty() {
+            name.len()
+        } else {
+            name.len().saturating_add(args.len()).saturating_add(2)
+        };
+        if !self.admit_emission_work(own_bytes as u64) {
+            return;
+        }
+        if args.is_empty() {
+            out.push_str(&name);
+            return;
+        }
+        out.push('(');
+        out.push_str(&name);
+        for arg in args {
+            out.push(' ');
+            self.write_term_into(out, *arg);
+            if self.work_budget_exhausted() {
+                return;
+            }
+        }
+        out.push(')');
+    }
+
+    /// The one application-head spelling shared by ordinary rendering and
+    /// the bounded canonical projection used by authored definition bridges.
+    pub(super) fn application_spelling_head(symbol: &Symbol, arity: usize) -> String {
+        match symbol {
+            Symbol::Named(name) if arity == 1 && name.starts_with("is-") => {
+                format!("(_ is {})", quote_symbol(&name[3..]))
+            }
+            Symbol::Named(name) if arity == 0 && name == "cl" => {
+                ALETHE_CLAUSE_CONSTRUCTOR_TERM.to_string()
+            }
+            _ => Self::format_symbol(symbol),
+        }
+    }
+
+    /// The document's rendering of `term_id` with only its OWN producer
+    /// override set aside: every descendant keeps its channel. `None` when a
+    /// printer channel (a Skolem `choice`, a confined bridge rendering) already
+    /// owns the term, because then there is no second spelling to derive.
+    pub(super) fn format_term_without_own_override(&self, term_id: TermId) -> Option<String> {
+        if self.skolem_overrides.borrow().contains_key(&term_id)
+            || self.let_bridge_renderings.borrow().contains_key(&term_id)
+        {
+            return None;
+        }
+        Some(self.format_term_structurally(term_id))
+    }
+
+    /// The structural rendering of `term_id` with EVERY channel for the term
+    /// itself set aside and every descendant keeping its channel. Uncached.
+    pub(super) fn format_term_structurally(&self, term_id: TermId) -> String {
+        let term = self.terms.get(term_id);
         let formatted = self
             .format_const_array(term_id, term)
             .unwrap_or_else(|| self.format_term_data(term));
         self.charge(formatted.len() as u64);
-        out.push_str(&formatted);
-        self.format_cache.borrow_mut().insert(term_id, formatted);
+        formatted
     }
 
     /// Render AY's internal constant-array spelling as SMT-LIB's.

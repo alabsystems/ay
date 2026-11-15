@@ -172,6 +172,9 @@ struct ArithIteSeeding {
     /// At least one formula-level ITE contributed a path clause — this pass's
     /// whole purpose; the entry gate declines without one.
     seeded_ite: bool,
+    /// Elaborated conjuncts derived from raw authored conjuncts by a checked
+    /// transport; an accepted candidate must print them canonically.
+    transported: Vec<TermId>,
     work: usize,
 }
 
@@ -322,7 +325,7 @@ impl Executor {
         // (2) Seed a clause database from the arithmetic-ITE roots. Declines
         // (fail-closed) unless at least one formula-level ITE and one genuine
         // arithmetic atom participate.
-        let Some((var_to_term, clause_versions, mut candidate)) =
+        let Some((var_to_term, clause_versions, mut candidate, transported)) =
             self.seed_arith_ite_clause_database(&roots)
         else {
             return;
@@ -359,6 +362,7 @@ impl Executor {
             .is_ok_and(|quality| quality.is_complete())
         {
             *proof = candidate;
+            self.drop_surface_overrides_below(&transported);
         }
     }
 
@@ -374,7 +378,12 @@ impl Executor {
     fn seed_arith_ite_clause_database(
         &mut self,
         roots: &[TermId],
-    ) -> Option<(HashMap<u32, TermId>, Vec<(Vec<Literal>, ProofId)>, Proof)> {
+    ) -> Option<(
+        HashMap<u32, TermId>,
+        Vec<(Vec<Literal>, ProofId)>,
+        Proof,
+        Vec<TermId>,
+    )> {
         let parsed_assertions = self.ctx.assertions_parsed().to_vec();
         // NATIVE mode: every retained parsed slot is the API sentinel (or none
         // was retained at all) — no authored surface exists anywhere, so the
@@ -459,6 +468,11 @@ impl Executor {
             return None;
         }
 
-        Some((seeding.var_to_term, seeding.clause_versions, candidate))
+        Some((
+            seeding.var_to_term,
+            seeding.clause_versions,
+            candidate,
+            seeding.transported,
+        ))
     }
 }

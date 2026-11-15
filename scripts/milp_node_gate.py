@@ -91,11 +91,13 @@ and were watching nothing.
                  (SETUP, not clean, not fail) above 0.35 x cpu_count. Override
                  with `--allow-busy` only to reproduce a failure you already have.
 
-                 SHARED, since 2026-08-26: `busy_box()` and `LOAD_FRACTION` below
-                 are imported by `scripts/corpus_guard.py`, which had NO load
-                 guard at all while being the more load-coupled of the two (it
-                 gates WALL ratios; this file records `wall_s` and gates only
-                 nodes). One definition, one threshold, one idiom.
+                 SHARED from 2026-08-26 to 2026-10-15: `busy_box()` and
+                 `LOAD_FRACTION` below were imported by `scripts/corpus_guard.py`,
+                 which had NO load guard at all while being the more
+                 load-coupled of the two (it gated WALL ratios; this file
+                 records `wall_s` and gates only nodes). Since 2026-10-15 the
+                 corpus guard's verdicts are counts and it refuses no busy box,
+                 so this file is the threshold's one user.
 
   THE PIN IS A RATCHET, NOT A SNAPSHOT.  `--check` NEVER writes. A legitimate
                  improvement updates `.milp_node_baseline.toml` with `--ratchet`,
@@ -471,7 +473,8 @@ def main():
             return 2
     if not os.path.exists(a.solver):
         print('SETUP: solver not built at %s\n'
-              '       cargo build --release -p ay-milp --example mps_solve'
+              '       targo --unverified build --release -p ay-milp --example mps_solve\n'
+              '       (without the Trust toolchain: cargo build with the same arguments)'
               % a.solver, file=sys.stderr)
         return 2
 

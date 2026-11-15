@@ -187,7 +187,7 @@ impl MustSummaries {
     /// Prefer `add_backed()` or `add_filter_only()` for explicit provenance.
     ///
     /// Note: Only used in tests - production code uses `add_backed()` or `add_filter_only()`.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn add(&mut self, level: usize, pred: PredicateId, formula: ChcExpr) -> bool {
         self.add_filter_only(level, pred, formula)
     }

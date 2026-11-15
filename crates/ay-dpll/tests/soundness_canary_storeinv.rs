@@ -51,22 +51,37 @@ mod common;
 
 use common::SolverOutcome;
 use ntest::timeout;
+use std::path::{Path, PathBuf};
 
 const CANARY: &str =
     "benchmarks/smt/regression/soundness_qf_ax_storechain/storeinv_t3_np_nf_10_wrong_sat.smt2";
 
 /// The canary must NEVER be reported `sat`. A `sat` here is a wrong answer.
+/// The committed canary, resolved in the tree that compiled this test ONLY.
+///
+/// Never through `common::workspace_path`, whose fallback to the main checkout
+/// exists for gitignored corpora: that copy belongs to a different commit and
+/// would hide exactly the broken tree this reports.
+fn tracked_canary() -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(CANARY);
+    assert!(
+        path.is_file(),
+        "tracked wrong-SAT canary missing: {} — it is committed, so this tree is \
+         broken; the canary must not be skipped",
+        path.display()
+    );
+    path
+}
+
 #[test]
 #[timeout(120_000)]
 fn storeinv_t3_np_nf_10_canary_is_never_sat() {
-    let path = common::workspace_path(CANARY);
-    if !path.is_file() {
-        eprintln!(
-            "skipping wrong-SAT canary, benchmark not present in this checkout: {}",
-            path.display()
-        );
-        return;
-    }
+    // The canary is committed (and shipped by `publish/manifest.txt`), so its
+    // absence is a broken tree. It used to be a silent skip, which read as the
+    // canary passing.
+    let path = tracked_canary();
 
     let outcome = common::run_executor_file_with_timeout(&path, 60)
         .unwrap_or_else(|err| panic!("solver error on the wrong-SAT canary: {err}"));
@@ -94,11 +109,7 @@ fn storeinv_t3_np_nf_10_canary_is_never_sat() {
 #[test]
 #[timeout(120_000)]
 fn storeinv_t3_np_nf_10_canary_answer_is_reported() {
-    let path = common::workspace_path(CANARY);
-    if !path.is_file() {
-        eprintln!("skipping canary observation, benchmark absent");
-        return;
-    }
+    let path = tracked_canary();
     match common::run_executor_file_with_timeout(&path, 60) {
         Ok(outcome) => eprintln!(
             "[canary] storeinv_t3_np_nf_10_wrong_sat => {outcome:?} \

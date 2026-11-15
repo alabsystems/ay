@@ -187,9 +187,50 @@ fn test_extract_disequalities_collects_from_and_or() {
         ],
     );
 
-    let diseqs = extract_disequalities(&expr);
+    let diseqs = extract_disequalities(&expr, usize::MAX);
     assert_eq!(diseqs.len(), 2);
+    assert_eq!(
+        extract_disequalities(&expr, 1).len(),
+        1,
+        "the cap stops the walk"
+    );
 
     assert!(diseqs.contains(&(ChcExpr::Var(x), ChcExpr::Int(1))));
     assert!(diseqs.contains(&(ChcExpr::Var(y), ChcExpr::Int(2))));
+}
+
+/// A disequality under a shared `and` spine counts once per tree occurrence
+/// (the tree walk's result) up to the cap, and a diseq-free shared spine is
+/// walked once: a 2^60-occurrence DAG answers at once.
+#[test]
+fn test_extract_disequalities_is_bounded_on_dags() {
+    use crate::ChcSort;
+
+    let x = ChcVar::new("x", ChcSort::Int);
+    let eq = Arc::new(ChcExpr::Op(
+        ChcOp::Eq,
+        vec![Arc::new(ChcExpr::Var(x.clone())), Arc::new(ChcExpr::Int(1))],
+    ));
+    let mut barren = Arc::clone(&eq);
+    for _ in 0..60 {
+        barren = Arc::new(ChcExpr::Op(
+            ChcOp::And,
+            vec![Arc::clone(&barren), Arc::clone(&barren)],
+        ));
+    }
+    assert!(extract_disequalities(&barren, usize::MAX).is_empty());
+
+    let diseq = Arc::new(ChcExpr::not(eq.as_ref().clone()));
+    let mut shared = Arc::clone(&diseq);
+    for _ in 0..60 {
+        shared = Arc::new(ChcExpr::Op(
+            ChcOp::And,
+            vec![Arc::clone(&shared), Arc::clone(&shared)],
+        ));
+    }
+    let found = extract_disequalities(&shared, 5);
+    assert_eq!(found.len(), 5);
+    assert!(found
+        .iter()
+        .all(|pair| *pair == (ChcExpr::Var(x.clone()), ChcExpr::Int(1))));
 }

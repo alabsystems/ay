@@ -29,7 +29,7 @@ impl LiaSolver<'_> {
 
         for &literal in &self.assertion_view().positive_equalities {
             // Check if this is an equality
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {

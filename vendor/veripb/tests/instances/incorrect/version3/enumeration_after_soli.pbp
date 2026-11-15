@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% DEFECT: `conclusion ENUMERATION_COMPLETE` accepted a contradiction manufactured
+% by the objective-improving constraint of `soli`. That constraint (`obj <= v-1`)
+% removes every assignment with objective value at least `v` and, unlike `solx`,
+% never increments the excluded-solution counter, so the contradiction it creates
+% does not establish "there are no further solutions". This formula has three
+% solutions and two projections onto the preserved variable x1, so a complete
+% enumeration of 0 solutions is wrong under every reading.
+f 1;
+soli ~x1 x2;
+output NONE;
+conclusion ENUMERATION_COMPLETE 0;
+end pseudo-Boolean proof;

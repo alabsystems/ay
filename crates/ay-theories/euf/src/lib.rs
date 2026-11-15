@@ -29,10 +29,14 @@ extern crate ay_core;
 
 mod bool_atoms;
 mod closure;
+mod congruence_scope;
+mod controlled_bv_model;
+mod controlled_model_inventory;
 mod egraph;
 mod explain;
 mod merge;
 mod model_extraction;
+mod model_recovery_facts;
 mod sat_atom_filter;
 mod shared_equality;
 mod solver;
@@ -41,17 +45,19 @@ mod theory_check;
 mod theory_impl;
 mod theory_propagate;
 mod types;
-mod verification;
+mod union_find;
 
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
 
 // Re-export public API
-pub use bool_atoms::{clear_bool_arg_repair_candidates, take_bool_arg_repair_candidates};
+pub use bool_atoms::{
+    clear_bool_arg_repair_candidates, scoped_bool_constant_arg_seeding,
+    take_bool_arg_repair_candidates, BoolConstantArgSeedingScope,
+};
+pub use model_recovery_facts::ModelRecoveryFact;
 pub use solver::EufSolver;
 pub use solver_query::DiscoveredDisequality;
 pub use theory_propagate::{EUF_LAZY_MAGIC, EUF_LAZY_MAGIC_MASK};
 pub use types::{EufModel, FunctionTable, SortModel};
-
-pub mod theories_ledger;

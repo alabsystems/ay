@@ -24,7 +24,7 @@
 #
 # Where a value is claimed, it is cross-checked against real z3py 4.15.4.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import pytest
 

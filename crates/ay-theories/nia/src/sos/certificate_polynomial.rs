@@ -31,7 +31,7 @@ pub(crate) fn orient(c: &MultiConstraint) -> Option<(MultiPoly, OrientedKind)> {
 fn derive_oriented(
     origin: CertOrigin,
     constraints: &[MultiConstraint],
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Result<(MultiPoly, OrientedKind), SosError> {
     match origin {
         CertOrigin::Constraint(i) => {
@@ -74,13 +74,16 @@ fn mono_product(a: &[TermId], b: &[TermId]) -> Vec<TermId> {
 fn scale(
     p: &MultiPoly,
     k: &BigRational,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Result<MultiPoly, SosError> {
     if k.is_zero() {
         return Ok(MultiPoly::zero());
     }
     let mut out = MultiPoly::zero();
     for (m, c) in &p.terms {
+        if !budget.poll() {
+            return Err(SosError::ResourceLimit);
+        }
         let term = MultiPoly {
             terms: vec![(m.clone(), c * k)],
         };
@@ -93,11 +96,14 @@ fn scale(
 fn sigma0_poly(
     basis: &[Vec<TermId>],
     gram: &[Vec<BigRational>],
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Result<MultiPoly, SosError> {
     let mut out = MultiPoly::zero();
     for (a, ba) in basis.iter().enumerate() {
         for (b, bb) in basis.iter().enumerate() {
+            if !budget.poll() {
+                return Err(SosError::ResourceLimit);
+            }
             let q = &gram[a][b];
             if q.is_zero() {
                 continue;

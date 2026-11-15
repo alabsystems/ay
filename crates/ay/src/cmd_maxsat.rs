@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ay_maxsat::{MaxSatResult, MaxSatSolver};
+// The sidecar pipes this module writes go through `ChildPipeWriter`: the `ay`
+// binary runs with SIGPIPE at its default (terminate) disposition, so a write
+// to a sidecar that has died would kill the campaign instead of failing it.
+use ay_sys::child_pipe::ChildPipeWriter;
 use clap::Subcommand;
 use serde::Serialize;
 
@@ -57,7 +61,11 @@ impl OomGuardSource {
                 command.arg(path);
             }
             Self::Embedded => {
-                command.arg("-c").arg(EMBEDDED_OOM_GUARD);
+                ay_sys::embedded_python::embed_program(
+                    &mut command,
+                    "embedded:scripts/_oom_guard.py",
+                    EMBEDDED_OOM_GUARD,
+                );
             }
         }
         command
@@ -98,7 +106,7 @@ struct MaxSatResources {
 #[derive(Debug)]
 struct MaxSatCampaignLease {
     label: String,
-    process: Mutex<Option<(Child, ChildStdin)>>,
+    process: Mutex<Option<(Child, ChildPipeWriter<ChildStdin>)>>,
 }
 
 impl MaxSatCampaignLease {
@@ -131,13 +139,13 @@ impl MaxSatCampaignLease {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to acquire host-wide MaxSAT lease for {label}"))?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                terminate_maxsat_process_group(&mut child);
-                bail!("{label}: MaxSAT campaign lease stdin is missing");
-            }
-        };
+        let stdin = ChildPipeWriter::take_from(&mut child).map_err(|error| {
+            sidecar_stdin_unusable(
+                &mut child,
+                &format!("{label}: MaxSAT campaign lease"),
+                &error,
+            )
+        })?;
         let mut ready_pipe = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -526,7 +534,9 @@ fn maxsat_watchdog_server_process_is_responsive(_pid: u32) -> bool {
 #[derive(Debug)]
 struct MaxSatWatchdogServerProcess {
     child: Child,
-    stdin: ChildStdin,
+    /// A server that dies between the health check and a registration must
+    /// fail that registration, not kill the campaign.
+    stdin: ChildPipeWriter<ChildStdin>,
 }
 
 /// One `_oom_guard.py watch-server` per MaxSAT campaign. Each registration
@@ -610,10 +620,9 @@ impl MaxSatWatchdogServer {
                 self.guard.provenance()
             )
         })?;
-        let Some(stdin) = child.stdin.take() else {
-            terminate_maxsat_process_group(&mut child);
-            bail!("MaxSAT RSS watchdog server stdin is missing");
-        };
+        let stdin = ChildPipeWriter::take_from(&mut child).map_err(|error| {
+            sidecar_stdin_unusable(&mut child, "MaxSAT RSS watchdog server", &error)
+        })?;
         let Some(stdout) = child.stdout.take() else {
             drop(stdin);
             terminate_maxsat_process_group(&mut child);
@@ -1150,6 +1159,7 @@ impl Drop for MaxSatWatchdog {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc")),
     )),
     allow(dead_code)
@@ -1159,6 +1169,11 @@ enum MaxSatUnreapedChildState {
     Stopped,
     Exited,
 }
+
+#[cfg(target_os = "macos")]
+mod darwin_child;
+#[cfg(target_os = "macos")]
+use darwin_child::{observe_maxsat_child_unreaped, wait_for_maxsat_guard_stop};
 
 #[cfg(any(
     target_os = "android",
@@ -1196,6 +1211,7 @@ fn observe_maxsat_child_unreaped(
     target_os = "android",
     target_os = "freebsd",
     target_os = "haiku",
+    target_os = "macos",
     all(target_os = "linux", not(target_env = "uclibc")),
 )))]
 fn observe_maxsat_child_unreaped(
@@ -1245,6 +1261,7 @@ fn wait_for_maxsat_guard_stop(child: &Child, label: &str) -> Result<()> {
     target_os = "android",
     target_os = "freebsd",
     target_os = "haiku",
+    target_os = "macos",
     all(target_os = "linux", not(target_env = "uclibc")),
 )))]
 fn wait_for_maxsat_guard_stop(_child: &Child, label: &str) -> Result<()> {
@@ -1259,6 +1276,18 @@ fn isolate_maxsat_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn isolate_maxsat_process_group(_command: &mut Command) {}
+
+/// Kill a sidecar whose stdin cannot be taken as a `ChildPipeWriter`, and say
+/// so: a pipe that cannot be marked would let a dead sidecar kill the campaign
+/// on the next write.
+fn sidecar_stdin_unusable(
+    child: &mut Child,
+    sidecar: &str,
+    error: &std::io::Error,
+) -> anyhow::Error {
+    terminate_maxsat_process_group(child);
+    anyhow::anyhow!("{sidecar} stdin is unusable: {error}")
+}
 
 fn terminate_maxsat_process_group(child: &mut Child) {
     let _ = terminate_maxsat_process_group_with_status(child);
@@ -2559,11 +2588,10 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
         )
         .map_err(|why| anyhow::anyhow!("--proof-check: {why}"))?;
         safe_println!(
-            "certificate lane: checker {} (reports {}, pin {} patch {}), artifacts under {}, cap {}MiB",
+            "certificate lane: {} check veripb ({}, imported source {}), artifacts under {}, cap {}MiB",
             plan.checker.display(),
             plan.checker_version,
-            maxsat_cert::pin::commit(),
-            maxsat_cert::pin::patch_sha256(),
+            maxsat_cert::IMPORTED_CHECKER_SOURCE,
             plan.dir.display(),
             args.proof_max_instance_mib,
         );
@@ -2915,9 +2943,9 @@ fn write_json_report(
             "par2": summary.par2,
             "exit_code": bench_exit_code(summary),
         },
-        // The checker's IDENTITY travels with its counts on purpose: a verdict
-        // from an unpinned checker is not evidence, and this report is the only
-        // place that fact can be recovered after the sweep. The per-row verdict
+        // The integrated checker's imported cohort travels with its counts.
+        // AY release provenance also binds the local integration changes.
+        // The per-row verdict
         // itself needs no schema change — it is fully carried by `detail` and
         // `authority` above.
         "certificate": match cert {
@@ -2925,8 +2953,8 @@ fn write_json_report(
                 "requested": true,
                 "checker": cert.checker.display().to_string(),
                 "checker_version": cert.checker_version,
-                "pin_commit": maxsat_cert::pin::commit(),
-                "pin_patch_sha256": maxsat_cert::pin::patch_sha256(),
+                "checker_mode": "ay-integrated",
+                "imported_checker_source": maxsat_cert::IMPORTED_CHECKER_SOURCE,
                 "verified": cert.verified(),
                 "closed": cert.closed(),
                 "skipped": cert.skipped(),
@@ -3593,7 +3621,7 @@ fn run_one(
     }
 }
 
-/// Check one emitted certificate with the pinned VeriPB checker.
+/// Check one emitted certificate with this AY image's integrated VeriPB checker.
 ///
 /// Runs AFTER the solver child has been killed and reaped, so it BORROWS that
 /// worker's already-planned slot: the same `wrap_stopped` + `watch` envelope,
@@ -3616,7 +3644,7 @@ fn run_certificate_checker(
 ) -> maxsat_cert::CertOutcome {
     use maxsat_cert::CertOutcome;
 
-    let mut target = Command::new(&plan.checker);
+    let mut target = plan.checker.command();
     // `--opb` explicitly. Letting the checker guess the formula format by
     // extension has bitten this workspace before, and our formula is always the
     // OPB restatement, never the `.wcnf`.
@@ -4296,6 +4324,8 @@ mod tests {
     use super::*;
     use std::io::Read as _;
 
+    mod child_pipe;
+
     #[test]
     fn timeout_duration_conversion_handles_endpoints_without_panicking() {
         assert_eq!(
@@ -4605,6 +4635,7 @@ mod tests {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         )
     ))]
@@ -4629,6 +4660,7 @@ mod tests {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         )
     ))]
@@ -4647,6 +4679,7 @@ mod tests {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         )
     ))]
@@ -4766,6 +4799,7 @@ mod tests {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         )
     ))]
@@ -4982,101 +5016,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn maxsat_runner_reaps_descendants_and_applies_core_envelope() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = std::env::temp_dir().join(format!(
-            "ay-maxsat-runner-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let solver = dir.join("solver.sh");
-        let pid_file = dir.join("descendant.pid");
-        let env_file = dir.join("nbcore.txt");
-        fs::write(
-            &solver,
-            format!(
-                "#!/bin/sh\nsleep 60 &\necho $! > '{}'\necho \"${{NBCORE:-}}\" > '{}'\nprintf 's UNKNOWN\\n'\n",
-                pid_file.display(),
-                env_file.display()
-            ),
-        )
-        .expect("write solver");
-        let mut permissions = fs::metadata(&solver).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&solver, permissions).expect("chmod");
-        let input = dir.join("case.wcnf");
-        fs::write(&input, "h 1 0\n").expect("write input");
-        let lease_command = OomGuardSource::Embedded.command();
-        let lease_lock_path = dir.join("host-lease.lock");
-        let campaign_lease = MaxSatCampaignLease::acquire_command(
-            lease_command,
-            "MaxSAT runner test",
-            Stdio::null(),
-            Some(&lease_lock_path),
-        )
-        .expect("campaign lease");
-        let resources = MaxSatResources {
-            plan: MaxSatResourcePlan {
-                schema: MAXSAT_RESOURCE_ENVELOPE_SCHEMA_V2,
-                requested_jobs: 1,
-                jobs: 1,
-                memlimit_mb_per_child: 10_000,
-                nbcore_per_child: 3,
-                headroom_mb: 16_000,
-                planner: "test".to_string(),
-                planner_protocol: MAXSAT_RESOURCE_PLANNER_PROTOCOL_V1,
-                enforcement: MAXSAT_CHILD_ENFORCEMENT_V1,
-                solver_environment: MAXSAT_SOLVER_ENVIRONMENT_V1,
-                aggregate_enforcement: MAXSAT_AGGREGATE_ENFORCEMENT_V1,
-                lease_protocol: MAXSAT_LEASE_PROTOCOL_V1,
-                lease_readiness: MAXSAT_LEASE_READINESS_V1,
-                lease_location: MAXSAT_LEASE_LOCATION_V1,
-            },
-            guard: OomGuardSource::Checkout(locate_oom_guard().expect("oom guard")),
-            campaign_lease: Arc::new(campaign_lease),
-            watchdog_server: MaxSatWatchdogServer::new(OomGuardSource::Checkout(
-                locate_oom_guard().expect("oom guard"),
-            )),
-        };
-        let external = ("fake".to_string(), vec![solver.display().to_string()]);
-        let result = run_one(
-            Path::new("unused-ay"),
-            Some(&external),
-            &input,
-            5.0,
-            false,
-            None,
-            &resources,
-            None,
-            &MaxSatEngineFlags::default(),
-        );
-        assert_eq!(result.status, RunStatus::Timeout, "{}", result.detail);
-        assert_eq!(fs::read_to_string(env_file).unwrap().trim(), "3");
-        let descendant = fs::read_to_string(pid_file).unwrap();
-        let proc_stat = PathBuf::from(format!("/proc/{}/stat", descendant.trim()));
-        for _ in 0..100 {
-            let dead_or_zombie = fs::read_to_string(&proc_stat)
-                .map(|stat| {
-                    stat.rsplit(')')
-                        .nth(1)
-                        .is_some_and(|rest| rest.trim().starts_with('Z'))
-                })
-                .unwrap_or(true);
-            if dead_or_zombie {
-                fs::remove_dir_all(&dir).ok();
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!(
-            "descendant {} survived process-group cleanup",
-            descendant.trim()
-        );
-    }
+    mod runner_reaping;
 
     /// A script at `path`, executable.
     #[cfg(unix)]
@@ -5282,137 +5222,6 @@ mod tests {
             "an instance the size guard ADMITS ({admitted} bytes) expands to \
              {worst_case_artifacts} bytes of artifacts, past the {GIANT_INSTANCE_BYTES}-byte \
              giant threshold the default is supposed to stay under"
-        );
-    }
-
-    /// #D8: the answer reaches stdout BEFORE certificate emission starts.
-    ///
-    /// Emission happens inside the child's RSS envelope and inside the bench
-    /// harness's kill grace, and a 74MiB `.opb` is not instant. With emission
-    /// first, a SIGKILL landing mid-write destroyed the ANSWER: stdout never
-    /// reached `s OPTIMUM FOUND`, so the harness fell through to its `_` arm
-    /// and recorded a TIMEOUT for an instance that had been solved. Printing
-    /// first makes such a kill cost the certificate instead — and a missing
-    /// certificate is exactly what the bench lane's `Unvalidated` branch is
-    /// for.
-    ///
-    /// This is a STRUCTURAL test, and deliberately so: the property is "no
-    /// answer line is printed after the emission call in the same block", which
-    /// is a statement about the source. Making it behavioural needs a kill
-    /// landing inside a multi-MB write in a subprocess running the built
-    /// binary, which a unit test in this crate can neither locate nor time
-    /// deterministically. The four call sites in `solve`/`milp_solve` — the OLL
-    /// OPTIMUM site, both MILP-race sites and the anytime `s UNKNOWN` site —
-    /// are all covered here; the `--milp` site in `milp_solve` is the fifth.
-    ///
-    /// Kill mutation: at any one call site, move the
-    /// `emit_proof_if_requested(...)` line back above its `println!("s ...")` —
-    /// the forward scan then finds an answer line inside the same block and
-    /// this test names the offending line.
-    #[test]
-    fn maxsat_certificate_emission_never_precedes_the_answer_lines() {
-        let source = include_str!("cmd_maxsat.rs");
-        let lines: Vec<&str> = source.lines().collect();
-        let indent = |line: &str| line.len() - line.trim_start().len();
-        let is_answer = |line: &str| {
-            let line = line.trim_start();
-            line.starts_with("println!(\"s ") || line.starts_with("print_assignment(")
-        };
-
-        let mut sites = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("emit_proof_if_requested(") {
-                continue;
-            }
-            sites += 1;
-            let depth = indent(line);
-            // Walk forward to the end of the block this call sits in: the first
-            // non-blank line indented LESS than the call closes it.
-            for (offset, follower) in lines[index + 1..].iter().enumerate() {
-                if follower.trim().is_empty() {
-                    continue;
-                }
-                if indent(follower) < depth {
-                    break;
-                }
-                assert!(
-                    !is_answer(follower),
-                    "cmd_maxsat.rs:{}: `{}` is printed AFTER the certificate emission at line {} \
-                     — a kill during emission would destroy the answer instead of the certificate",
-                    index + offset + 2,
-                    follower.trim(),
-                    index + 1
-                );
-            }
-        }
-        assert!(
-            sites >= 5,
-            "expected every `emit_proof_if_requested` call site to be checked, found {sites}"
-        );
-    }
-
-    /// #N3, as a rule rather than as three call sites: no `run_one` detector
-    /// may construct a `RunStatus::Wrong` row without first retaining that
-    /// row's certificate.
-    ///
-    /// The unit behaviour is pinned by
-    /// `a_wrong_verdict_keeps_its_artifacts_whichever_detector_produced_it`;
-    /// what this adds is that the NEXT detector cannot be added without the
-    /// call, which is precisely how the reference-field and model-verifier
-    /// paths came to delete their own evidence while the fold kept its.
-    ///
-    /// Kill mutation: delete any one
-    /// `artifacts.retain_if_evidence(cert, RunStatus::Wrong);` line — the
-    /// `RunResult` below it then has no retain call in front of it and this
-    /// test names the line.
-    #[test]
-    fn maxsat_every_wrong_row_retains_its_certificate() {
-        let source = include_str!("cmd_maxsat.rs");
-        let lines: Vec<&str> = source.lines().collect();
-        let mut checked = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            // Only the row CONSTRUCTIONS, not the enum's own arms or matches.
-            if line.trim() != "status: RunStatus::Wrong," {
-                continue;
-            }
-            checked += 1;
-            let window = index.saturating_sub(12)..index;
-            assert!(
-                lines[window].iter().any(|earlier| earlier
-                    .trim_start()
-                    .starts_with("artifacts.retain_if_evidence(")),
-                "cmd_maxsat.rs:{}: a `Wrong` row is built without retaining its certificate — \
-                 the artifacts go out with `CertArtifacts`'s Drop, deleting the evidence in \
-                 exactly the row an independent authority contradicted",
-                index + 1
-            );
-        }
-        assert!(
-            checked >= 3,
-            "expected the early-returning wrong-answer detectors to be checked, found {checked}"
-        );
-        // The scan above only sees rows built with a LITERAL
-        // `status: RunStatus::Wrong,`. Two retain sites pass a `status`
-        // variable instead — the classify fold and the UNSAT/reference-field
-        // detector — so deleting either left this test green, which a mutation
-        // audit caught. Count the calls directly so every site is pinned.
-        // Count STATEMENT lines only. A plain `matches()` over the whole file
-        // also counts this test's own doc comment and its two string literals,
-        // so `>= 5` would have been satisfied by just two real call sites —
-        // a guard that counts itself is no guard.
-        let calls = lines
-            .iter()
-            .filter(|line| {
-                line.trim_start()
-                    .starts_with("artifacts.retain_if_evidence(")
-            })
-            .count();
-        assert!(
-            calls >= 5,
-            "found {calls} `retain_if_evidence` call sites, expected at least 5: the reference \
-             optimum check, `verify_model`, the wall-clock demotion, the certificate fold, and \
-             the UNSAT-vs-feasible-reference detector. A wrong-answer row whose site was dropped \
-             deletes the very evidence an independent authority produced"
         );
     }
 }

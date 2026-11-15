@@ -11,7 +11,6 @@
 use crate::literal::Literal;
 use crate::watched::{ClauseRef, WatchedLists};
 
-#[cfg(not(kani))]
 use super::debug_transred_clause;
 use super::{Mark, TransRed, WitnessContext};
 
@@ -86,9 +85,6 @@ impl TransRed {
             dst.variable(),
             "BUG: check_transitive src and dst have same variable",
         );
-        #[cfg(kani)]
-        let trace = false;
-        #[cfg(not(kani))]
         let trace = debug_transred_clause() == Some(skip_clause.0);
 
         self.work.clear();

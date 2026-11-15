@@ -15,6 +15,10 @@ use std::mem::size_of;
 
 use super::surface_source_work;
 
+#[path = "proof_trust_surgery_planning_refusal.rs"]
+mod refusal;
+pub use refusal::CanonicalWorkRefusal;
+
 const MAX_PLANNING_WORK: usize = 32 * 1024 * 1024;
 const MAX_CACHED_TERMS: usize = 8_192;
 pub(in crate::executor) const MAX_FARKAS_ATTEMPTS: usize = 128;
@@ -192,7 +196,7 @@ impl SurgeryPlanningBudget {
             return OperandCharge::Exhausted;
         }
         let (work, probe) = canonical_term_work_probe(terms, operand);
-        let Some(work) = work else {
+        let Ok(work) = work else {
             // Charge the refused walk on the SAME scale the success path uses.
             let probe_work = probe.saturating_mul(size_of::<TermData>());
             return if self.spend_work(probe_work) {
@@ -234,6 +238,14 @@ impl SurgeryPlanningBudget {
 /// Bound canonical traversal before substitution, formatting, or solver work.
 /// Shared DAGs are charged per occurrence to match recursive consumers.
 pub(in crate::executor) fn canonical_term_work(terms: &TermStore, root: TermId) -> Option<usize> {
+    canonical_term_work_probe(terms, root).0.ok()
+}
+
+/// [`canonical_term_work`], naming the refusal when it declines.
+pub(in crate::executor) fn canonical_term_work_refusal(
+    terms: &TermStore,
+    root: TermId,
+) -> Result<usize, CanonicalWorkRefusal> {
     canonical_term_work_probe(terms, root).0
 }
 
@@ -245,57 +257,112 @@ pub(in crate::executor) fn canonical_term_work(terms: &TermStore, root: TermId) 
 /// `forall`s buys unbounded planning work one free probe at a time. The visit
 /// count is the same quantity the success path already folds into its cost
 /// (`visits * size_of::<TermData>()`), so both outcomes bill on one scale.
-fn canonical_term_work_probe(terms: &TermStore, root: TermId) -> (Option<usize>, usize) {
-    const MAX_VISITS: usize = 100_000;
-    const MAX_DEPTH: usize = 256;
-    const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_VISITS: usize = 100_000;
+const MAX_DEPTH: usize = 256;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
 
-    fn bigint_bytes(value: &num_bigint::BigInt) -> Option<usize> {
-        let bits = usize::try_from(value.bits()).ok()?;
-        let binary = bits.checked_add(7)? / 8;
-        // `value_to_surface` and Alethe formatting allocate decimal text.
-        // ceil(bits * log10(2)) plus sign/small-value headroom.
-        let decimal = bits
-            .checked_mul(30_103)?
-            .checked_add(99_999)?
-            .checked_div(100_000)?
-            .checked_add(2)?;
-        Some(binary.max(decimal))
-    }
+/// Rendered width of one big integer: binary digits or decimal text, whichever
+/// the Alethe formatter would allocate more of.
+fn bigint_bytes(value: &num_bigint::BigInt) -> Option<usize> {
+    let bits = usize::try_from(value.bits()).ok()?;
+    let binary = bits.checked_add(7)? / 8;
+    // `value_to_surface` and Alethe formatting allocate decimal text.
+    // ceil(bits * log10(2)) plus sign/small-value headroom.
+    let decimal = bits
+        .checked_mul(30_103)?
+        .checked_add(99_999)?
+        .checked_div(100_000)?
+        .checked_add(2)?;
+    Some(binary.max(decimal))
+}
 
-    fn symbol_work(symbol: &Symbol, max_indices: usize) -> Option<usize> {
-        match symbol {
-            Symbol::Named(name) => Some(name.len()),
-            Symbol::Indexed(name, indices) => {
-                if indices.len() > max_indices {
-                    return None;
-                }
-                name.len()
-                    .checked_add(indices.len().checked_mul(size_of::<u32>())?)
+/// Rendered width of one application head, refusing an over-wide index list.
+fn symbol_work(symbol: &Symbol, max_indices: usize) -> Option<usize> {
+    match symbol {
+        Symbol::Named(name) => Some(name.len()),
+        Symbol::Indexed(name, indices) => {
+            if indices.len() > max_indices {
+                return None;
             }
-            _ => None,
+            name.len()
+                .checked_add(indices.len().checked_mul(size_of::<u32>())?)
         }
+        _ => None,
     }
+}
 
+fn canonical_term_work_probe(
+    terms: &TermStore,
+    root: TermId,
+) -> (Result<usize, CanonicalWorkRefusal>, usize) {
+    let (work, visits) = canonical_term_work_probe_metered(terms, root, |_| true);
+    // The legacy caller's meter always accepts; preserve its exact result and
+    // visit count, including visits that reach a fixed structural bound.
+    (work.unwrap_or(Err(CanonicalWorkRefusal::Visits)), visits)
+}
+
+enum CanonicalProbeStop {
+    Shape(CanonicalWorkRefusal),
+    Allowance,
+}
+
+impl From<CanonicalWorkRefusal> for CanonicalProbeStop {
+    fn from(reason: CanonicalWorkRefusal) -> Self {
+        Self::Shape(reason)
+    }
+}
+
+fn charge_probe_children(
+    charge: &mut impl FnMut(usize) -> bool,
+    count: usize,
+) -> Result<(), CanonicalProbeStop> {
+    let work = count
+        .checked_mul(size_of::<(TermId, usize)>())
+        .ok_or(CanonicalWorkRefusal::Visits)?;
+    if charge(work) {
+        Ok(())
+    } else {
+        Err(CanonicalProbeStop::Allowance)
+    }
+}
+
+/// The same canonical probe, with a debit before each node visit and before
+/// each child-stack expansion. `None` means the debit was refused; no unpaid
+/// node is included in `visits`. Structural refusals retain their old reason.
+/// The returned canonical estimate is unchanged; queue charges are separate.
+pub(in crate::executor) fn canonical_term_work_probe_metered(
+    terms: &TermStore,
+    root: TermId,
+    mut charge: impl FnMut(usize) -> bool,
+) -> (Option<Result<usize, CanonicalWorkRefusal>>, usize) {
     let mut pending = vec![(root, 0usize)];
     let mut visits = 0usize;
     // The walk is wrapped so its `?` exits land HERE and `visits` survives them:
     // a refusal has to report the work it already did, not zero.
-    let work = (|| {
+    let work = (|| -> Result<usize, CanonicalProbeStop> {
         let mut bytes = 0usize;
         while let Some((term, depth)) = pending.pop() {
-            visits = visits.checked_add(1)?;
-            if visits > MAX_VISITS || depth > MAX_DEPTH {
-                return None;
+            if !charge(size_of::<TermData>()) {
+                return Err(CanonicalProbeStop::Allowance);
+            }
+            visits = visits.checked_add(1).ok_or(CanonicalWorkRefusal::Visits)?;
+            if visits > MAX_VISITS {
+                return Err(CanonicalWorkRefusal::Visits.into());
+            }
+            if depth > MAX_DEPTH {
+                return Err(CanonicalWorkRefusal::Depth.into());
             }
             let local = match terms.get(term) {
                 TermData::Const(Constant::Bool(_)) => 1,
-                TermData::Const(Constant::Int(value)) => bigint_bytes(value)?,
-                TermData::Const(Constant::Rational(value)) => {
-                    bigint_bytes(value.0.numer())?.checked_add(bigint_bytes(value.0.denom())?)?
+                TermData::Const(Constant::Int(value)) => {
+                    bigint_bytes(value).ok_or(CanonicalWorkRefusal::Symbol)?
                 }
-                TermData::Const(Constant::BitVec { value, width }) => bigint_bytes(value)?
-                    .max(usize::try_from(*width).ok()?)
+                TermData::Const(Constant::Rational(value)) => bigint_bytes(value.0.numer())
+                    .and_then(|n| n.checked_add(bigint_bytes(value.0.denom())?))
+                    .ok_or(CanonicalWorkRefusal::Symbol)?,
+                TermData::Const(Constant::BitVec { value, width }) => bigint_bytes(value)
+                    .and_then(|b| Some(b.max(usize::try_from(*width).ok()?)))
+                    .ok_or(CanonicalWorkRefusal::Symbol)?
                     .saturating_add(2),
                 TermData::Const(Constant::String(value)) => value.len(),
                 TermData::Var(name, _) => name.len(),
@@ -306,17 +373,21 @@ fn canonical_term_work_probe(terms: &TermStore, root: TermId) -> (Option<usize>,
                         .saturating_add(args.len())
                         > MAX_VISITS
                     {
-                        return None;
+                        return Err(CanonicalWorkRefusal::Visits.into());
                     }
+                    charge_probe_children(&mut charge, args.len())?;
                     pending.extend(args.iter().map(|&arg| (arg, depth + 1)));
-                    symbol_work(symbol, MAX_VISITS.saturating_sub(visits))?
+                    symbol_work(symbol, MAX_VISITS.saturating_sub(visits))
+                        .ok_or(CanonicalWorkRefusal::Symbol)?
                         .saturating_add(args.len().saturating_mul(4))
                 }
                 TermData::Not(inner) => {
+                    charge_probe_children(&mut charge, 1)?;
                     pending.push((*inner, depth + 1));
                     1
                 }
                 TermData::Ite(cond, then_term, else_term) => {
+                    charge_probe_children(&mut charge, 3)?;
                     pending.extend([
                         (*cond, depth + 1),
                         (*then_term, depth + 1),
@@ -324,125 +395,31 @@ fn canonical_term_work_probe(terms: &TermStore, root: TermId) -> (Option<usize>,
                     ]);
                     3
                 }
-                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return None,
-                _ => return None,
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                    return Err(CanonicalWorkRefusal::Binder.into())
+                }
+                _ => return Err(CanonicalWorkRefusal::Symbol.into()),
             };
-            bytes = bytes.checked_add(local)?;
+            bytes = bytes
+                .checked_add(local)
+                .ok_or(CanonicalWorkRefusal::Bytes)?;
             if bytes > MAX_BYTES {
-                return None;
+                return Err(CanonicalWorkRefusal::Bytes.into());
             }
         }
         bytes
             .checked_add(visits.saturating_mul(size_of::<TermData>()))
             .filter(|&work| work <= MAX_BYTES)
+            .ok_or_else(|| CanonicalWorkRefusal::Bytes.into())
     })();
+    let work = match work {
+        Ok(work) => Some(Ok(work)),
+        Err(CanonicalProbeStop::Shape(reason)) => Some(Err(reason)),
+        Err(CanonicalProbeStop::Allowance) => None,
+    };
     (work, visits)
 }
 
 #[cfg(test)]
-mod tests {
-    use ay_core::{Sort, TermStore};
-    use ay_frontend::command::Term as FrontendTerm;
-
-    use super::{surface_source_work, SurgeryPlanningBudget};
-
-    #[test]
-    fn farkas_attempts_share_one_global_boundary() {
-        let mut terms = TermStore::new();
-        let atom = terms.mk_var("planning_budget_atom", Sort::Bool);
-        let mut budget = SurgeryPlanningBudget::new();
-        for _ in 0..super::MAX_FARKAS_ATTEMPTS {
-            assert!(budget.spend_farkas_attempt(&terms, &[atom]));
-        }
-        assert!(!budget.spend_farkas_attempt(&terms, &[atom]));
-    }
-
-    /// The tri-state charge must separate "cannot price this" from "budget
-    /// gone" — the conflation that made one authored `forall` abort the whole
-    /// ground ITE-lift scan (#shannon-lift-checkable).
-    #[test]
-    fn charging_a_binder_operand_is_unpriceable_not_exhaustion() {
-        let mut terms = TermStore::new();
-        let body = terms.mk_var("charge_binder_body", Sort::Bool);
-        let binder = terms.mk_forall(vec![("charge_z".to_string(), Sort::Int)], body);
-        assert!(
-            super::canonical_term_work(&terms, binder).is_none(),
-            "the cost model refuses to price a binder",
-        );
-        let mut budget = SurgeryPlanningBudget::new();
-        assert!(matches!(
-            budget.charge_operand(&terms, binder),
-            super::OperandCharge::Unpriceable
-        ));
-        // The scan may go on to price and use an ordinary ground operand.
-        assert!(matches!(
-            budget.charge_operand(&terms, body),
-            super::OperandCharge::Charged
-        ));
-    }
-
-    /// A refusal is still billed, so a file of binders cannot buy unbounded
-    /// planning work one free probe at a time.
-    #[test]
-    fn an_unpriceable_operand_still_spends_the_aggregate_budget() {
-        let mut terms = TermStore::new();
-        let body = terms.mk_var("charge_drain_body", Sort::Bool);
-        let binder = terms.mk_forall(vec![("charge_drain_z".to_string(), Sort::Int)], body);
-        let mut budget = SurgeryPlanningBudget::new();
-        budget.set_remaining_work_for_test(1);
-        assert!(matches!(
-            budget.charge_operand(&terms, binder),
-            super::OperandCharge::Exhausted
-        ));
-    }
-
-    #[test]
-    fn one_canonical_source_cannot_reuse_another_surface_address() {
-        let mut budget = SurgeryPlanningBudget::new();
-        let first = FrontendTerm::Symbol("first_source".to_string());
-        let second = FrontendTerm::Symbol("second_source".to_string());
-        assert!(budget.spend_surface(ay_core::TermId(7), &first));
-        assert!(!budget.spend_surface(ay_core::TermId(7), &second));
-    }
-
-    #[test]
-    fn repeated_whole_surface_operations_spend_the_aggregate_budget() {
-        let fragment = FrontendTerm::App(
-            "+".to_string(),
-            (0..4_096)
-                .map(|index| FrontendTerm::Symbol(format!("fragment_{index}")))
-                .collect(),
-        );
-        let work = surface_source_work(&fragment).expect("bounded fragment has a cost");
-        let mut budget = SurgeryPlanningBudget::new();
-        budget.set_remaining_work_for_test(work * 2 - 1);
-        assert!(budget.spend_surface(ay_core::TermId(8), &fragment));
-        assert!(!budget.spend_surface(ay_core::TermId(8), &fragment));
-    }
-
-    #[test]
-    fn whole_source_estimate_dominates_all_immediate_fragment_estimates() {
-        let rows: Vec<FrontendTerm> = (0..64)
-            .map(|index| {
-                FrontendTerm::App(
-                    "=".to_string(),
-                    vec![
-                        FrontendTerm::Symbol(format!("surface_row_{index}")),
-                        FrontendTerm::Const(ay_frontend::command::Constant::Numeral(
-                            index.to_string(),
-                        )),
-                    ],
-                )
-            })
-            .collect();
-        let fragment_work = rows.iter().try_fold(0usize, |used, row| {
-            used.checked_add(surface_source_work(row)?)
-        });
-        let whole = FrontendTerm::App("and".to_string(), rows);
-        assert!(
-            surface_source_work(&whole).expect("whole source is bounded")
-                >= fragment_work.expect("all fragments are bounded"),
-            "one complete-source charge must dominate a pass over every child",
-        );
-    }
-}
+#[path = "proof_trust_surgery_planning_budget_tests.rs"]
+mod tests;

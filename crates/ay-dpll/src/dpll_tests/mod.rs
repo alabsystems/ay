@@ -22,6 +22,7 @@ mod propagation;
 mod sat_warm_state;
 mod string_lemma;
 mod unsat_core;
+mod work_grant;
 
 /// Convert a ay-sat Literal to DIMACS-style CNF literal
 pub(crate) fn sat_lit_to_cnf_lit(lit: Literal) -> CnfLit {

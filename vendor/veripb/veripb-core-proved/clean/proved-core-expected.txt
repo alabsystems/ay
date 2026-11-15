@@ -1,0 +1,110 @@
+# Pinned magnitudes of the proved core.  Regenerate with
+#     scripts/verify-proofs.sh --refresh
+# and REVIEW THE DIFF: every number below is a claim about how much
+# was verified, and the point of committing them is that a drop
+# cannot happen without showing up in a merge request.
+# Blessed 2026-09-01T13:32:42Z on arm64-Darwin.
+
+# clean check: declarations in clean/veripb_kernel.lean, all passing.
+kernel_decls=912
+# sha256 of the canonical (comment-stripped, ASCII) kernel text =
+# byte-for-byte the Clean island compiler_consumer compiles.  Also written into
+# the manifest header, where it ties the bundle to this source.
+kernel_island_sha256=e39a7af15fbc7e05ff79ad4acb529ab7f2237a614b16fce219ccb97c7d23dc63
+
+# downstream proof consumer cert verify: proof terms replayed from the bundle.
+bundle_theorems=414
+
+# compiler_consumer on src/trust_surface.rs: island declarations registered,
+# 'by <theorem>' citations kernel-discharged (exact -- losing one is
+# silent), and Level-0 obligations, which must ALL be proved.
+#
+# The obligation total is NOT evidence that the citations are there
+# -- not for the 'min' citations.  Measured 2026-08-24: deleting a
+# 'by <theorem>' clause from one of those -- the trivial u64_le_refl
+# one or the soundness-carrying capcoeff_i64_min_full -- leaves
+# compiler_consumer at rc 0 with the total unchanged, because the solver
+# re-proves the postcondition unaided.  Only the name and site lists
+# below can see such a citation disappear.
+#
+# The two rule-guard citations behave differently and are worth
+# more for it: their clauses come back Unknown from the native
+# verifier, so deleting either 'by' drops the total AND fails the
+# run on its own.  Do not generalise either behaviour to the other
+# group; the lists below are what gates both.
+island_decls=912
+island_citations=20
+island_cited_names=capcoeff_i64_le_capcoeff,capcoeff_i64_le_coeff,capcoeff_i64_le_degree,capcoeff_i64_min_full,capcoeff_le_other,capcoeff_le_self,capcoeff_le_self,capcoeff_min_bounds,checkedAdd128_comm,checkedAdd128_isSome_of_inI64,checkedMul128_comm,checkedMul128_isSome_of_inI64,checkedSub128_isSome_of_inI64,checkedSub128_self_isSome,guard_fits_exact,guard_fits_lower_exact,guard_fits_upper_exact,narrowWide_isSome_of_fits,u64_le_refl,weaken_factor_sign_exact
+# '<function>:<theorem>' per citation, as compiler_consumer resolved it ("with
+# `result` bound to the imported definition of `<function>`").  The
+# name list alone cannot see a citation MIGRATE: 'by
+# capcoeff_i64_le_coeff' on a fresh two-line function keeps the name
+# list identical while claiming nothing about cap_coeff_i64_le_coeff,
+# the function whose body is pinned to the real cap_coeff.
+island_citation_sites=cadd_wide:checkedAdd128_comm,cadd_wide:checkedAdd128_isSome_of_inI64,cap_coeff_bounds_u64:capcoeff_min_bounds,cap_coeff_call_site:capcoeff_le_self,cap_coeff_i64:capcoeff_i64_min_full,cap_coeff_i64_le_capcoeff:capcoeff_i64_le_capcoeff,cap_coeff_i64_le_coeff:capcoeff_i64_le_coeff,cap_coeff_i64_le_degree:capcoeff_i64_le_degree,cap_coeff_le_other_u64:capcoeff_le_other,cap_coeff_le_self_u64:capcoeff_le_self,cmul_wide:checkedMul128_comm,cmul_wide:checkedMul128_isSome_of_inI64,csub_wide:checkedSub128_isSome_of_inI64,csub_wide:checkedSub128_self_isSome,fits_i64_lower_wide:guard_fits_lower_exact,fits_i64_upper_wide:guard_fits_upper_exact,fits_i64_wide:guard_fits_exact,narrow_wide_in_range:narrowWide_isSome_of_fits,saturated_degree:u64_le_refl,weaken_factor_nonneg:weaken_factor_sign_exact
+island_proved_obligations=45
+
+# compiler_consumer on the whole crate under the advisory policy.  A RATCHET,
+# not a proof: most obligations are open.  Raise the floor and lower
+# the ceiling as coverage grows; never the other way round silently.
+# 'enabled' runs the ratchet.  Any other value pins the stage
+# UNAVAILABLE and inverts the gate (it then REQUIRES the crate-root
+# diagnostic, so the crate compiling again is the failure).
+#
+# It was pinned unavailable while `malachite-bigint` had no build
+# step here, and the reason recorded then -- "a dependency compiler_consumer
+# cannot build" -- was WRONG.  Measured 2026-08-24: compiler_consumer builds
+# malachite-bigint and its whole dependency tree (22 rlibs) in ~9s.
+# What was missing was the build step, not the capability: one
+# standalone `compiler_consumer src/lib.rs` is E0433 with no --extern, and
+# cargo's own rlib is stock-rustc-built, which compiler_consumer refuses with
+# E0514.  The script now pre-builds the tree with
+# the historical explicit unverified dependency build and
+# passes that rlib as --extern, which is what re-enabled this stage.
+#
+# Verifying the DEPENDENCIES too is a DIFFERENT lane, is not what
+# this stage measures, and is still blocked: with verification enabled
+# for every crate, `num-traits` ICEs in model-checker-consumer's CHC translator
+# ("EQ requires same sort: (_ BitVec 128) and (_ BitVec 64)") and
+# `ryu` exceeds the per-function verify budget.  A third blocker
+# there -- a SignatureMismatch ICE in the compiler's `dyn` case
+# split, tripped by `proc-macro2`'s build script -- was fixed in
+# compiler_consumer on 2026-08-24 (see trustc_toolchain below).
+wholecrate_ratchet=enabled
+wholecrate_proved_floor=128
+wholecrate_incomplete_ceiling=447
+
+# The kernel-discharged citations of the WHOLE-CRATE stage, as
+# '<function>:<theorem>'.  The two magnitudes above cannot see one
+# of these disappear: an audit deleted the `by` from the contracts
+# on the REAL cap_coeff and cap_coeff_wide and proved/incomplete
+# stayed byte-identical, because the native solver re-proves those
+# 'min' postconditions unaided.  This list is what notices -- and
+# these are the contracts that sit on the bodies the checker runs,
+# so it is the list that most needed to exist.
+wholecrate_citation_sites=add_degree_wide:checkedAdd128_isSome_of_inI64,cadd_wide:checkedAdd128_comm,cadd_wide:checkedAdd128_isSome_of_inI64,cap_coeff:capcoeff_i64_min_full,cap_coeff_bounds_u64:capcoeff_min_bounds,cap_coeff_call_site:capcoeff_le_self,cap_coeff_i64:capcoeff_i64_min_full,cap_coeff_i64_le_capcoeff:capcoeff_i64_le_capcoeff,cap_coeff_i64_le_coeff:capcoeff_i64_le_coeff,cap_coeff_i64_le_degree:capcoeff_i64_le_degree,cap_coeff_le_other_u64:capcoeff_le_other,cap_coeff_le_self_u64:capcoeff_le_self,cap_coeff_wide:capcoeff_i128_min_full,cmul_wide:checkedMul128_comm,cmul_wide:checkedMul128_isSome_of_inI64,csub_wide:checkedSub128_isSome_of_inI64,csub_wide:checkedSub128_self_isSome,factor_nonneg:weaken_factor_sign_exact,fits_i64:guard_fits_exact,fits_i64_lower_wide:guard_fits_lower_exact,fits_i64_upper_wide:guard_fits_upper_exact,fits_i64_wide:guard_fits_exact,mul_coeff_wide:checkedMul128_isSome_of_inI64,narrow:narrowWide_isSome_of_fits,narrow_wide_in_range:narrowWide_isSome_of_fits,neg:litctor_var_preserved,negate:litnegate_var_preserved,pos:litctor_var_preserved,sat_term:satterm_coeff_le_degree,saturated_degree:u64_le_refl,sub_degree_wide:checkedSub128_isSome_of_inI64,weaken_factor_nonneg:weaken_factor_sign_exact,wide_at_least:wide_le_exact,wide_nonneg:wide_sign_exact
+
+# Functions compiler_consumer can admit into its proof fragment, ALL of which
+# must carry a contract (gate_admissible_coverage). Required by
+# require_pins and read at the whole-crate stage, but never written
+# here -- so a plain (non---refresh) run aborted with "missing
+# pin(s): admissible_functions" and --refresh never healed it.
+# Recounted from the SAME E6 sweep the gate reads, so the pin and
+# the gate can never disagree about what was measured.
+admissible_functions=19
+
+# The verifying toolchains.  Both are per-machine builds with useless
+# --version strings, so the revision is the identifier.  A mismatch is
+# reported as TOOLCHAIN DRIFT (a failure under --strict): it means the
+# numbers above were measured by a different binary.
+clean_toolchain=clean 0.2.0|not-a-git-checkout
+trustc_toolchain=rustc 1.99.0-dev (compiler_consumer 0.1.0)|v0.8.0-522-g66e9d4fd406
+# Machine-specific absolute paths from the historical measurement are omitted.
+# The identities above are preserved; AY selects managed tools on PATH and
+# does not claim those historical measurements for a current toolchain.
+
+# NOT pinned, deliberately: the .cleancert bytes and the bundle's
+# env_hash.  clean export-cert bincodes HashMaps in randomized
+# iteration order before zstd, so two exports of byte-identical input
+# differ.  Per-theorem type_hash/proof_hash ARE stable, which is why
+# the manifest pins those instead.

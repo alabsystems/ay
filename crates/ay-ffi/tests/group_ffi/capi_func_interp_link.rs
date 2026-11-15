@@ -11,27 +11,10 @@
 //! header); here it must build and pass against ay.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-/// Find the ay-ffi static library in the cargo target directory.
-fn find_static_lib() -> Option<PathBuf> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
-    let workspace_root = Path::new(&manifest_dir).parent()?.parent()?;
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"));
-    let lib_path = target_dir.join(profile).join("libay_ffi.a");
-    if lib_path.exists() {
-        return Some(lib_path);
-    }
-    None
-}
+use super::native_link::find_static_lib;
 
 /// Compile-only header check (used when the static lib is not present).
 fn compile_only(header_dir: &Path, c_source: &Path, obj_file: &Path) {
@@ -60,17 +43,7 @@ fn compile_and_link(header_dir: &Path, c_source: &Path, static_lib: &Path, binar
         .arg(static_lib.as_os_str())
         .arg("-o")
         .arg(binary.as_os_str());
-    if cfg!(target_os = "macos") {
-        cmd.args([
-            "-framework",
-            "Security",
-            "-framework",
-            "CoreFoundation",
-            "-lresolv",
-            "-Wl,-no_warn_duplicate_libraries",
-        ]);
-    }
-    cmd.args(["-lpthread", "-lm"]);
+    super::native_link::add_native_libraries(&mut cmd);
     let output = cmd.output().expect("failed to invoke cc for linking");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -110,15 +83,14 @@ fn test_capi_func_interp_consumer_compiles_links_runs() {
         c_source.display()
     );
 
-    let tmpdir = env::temp_dir().join("ay_capi_func_interp_test");
-    let _ = std::fs::create_dir_all(&tmpdir);
+    let temporary = tempfile::tempdir().expect("create isolated consumer directory");
+    let tmpdir = temporary.path();
 
     let static_lib = match find_static_lib() {
         Some(p) => p,
         None => {
             eprintln!("SKIP link: libay_ffi.a not found, compile-only check");
             compile_only(&header_dir, &c_source, &tmpdir.join("capi_func_interp.o"));
-            let _ = std::fs::remove_dir_all(&tmpdir);
             return;
         }
     };
@@ -126,5 +98,4 @@ fn test_capi_func_interp_consumer_compiles_links_runs() {
     let binary = tmpdir.join("capi_func_interp_consumer");
     compile_and_link(&header_dir, &c_source, &static_lib, &binary);
     run_and_verify(&binary);
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }

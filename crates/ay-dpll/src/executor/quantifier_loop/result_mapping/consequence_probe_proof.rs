@@ -18,6 +18,13 @@ impl Executor {
         }
         let mut proof = self.last_proof.take()?;
         self.promote_consequence_probe_conjunct_trust_leaves(&mut proof, assertions);
+        // (#probe-ite-lift-promoter) A probe assertion whose arithmetic
+        // `ite`s preprocessing Shannon-expanded is assumed by the tracker in
+        // its LIFTED form, which is no probe assertion and no conjunct of
+        // one, so the pass above cannot recognize it and the leaf stays a
+        // premiseless `trust` unit. Derive it from the unlifted assertion
+        // instead; the strict check below still gates the result.
+        self.promote_consequence_probe_ite_lift_trust_leaves(&mut proof, assertions);
         // The ordinary cascade ran while the probe-local conjuncts were still
         // trust leaves. Its EUF promotion is atomic, so those leaves correctly
         // made it revert. Once exact probe assertions derive the conjuncts,

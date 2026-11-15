@@ -127,10 +127,19 @@ fn different_arguments_are_not_shared() {
 }
 
 /// A body whose expansion mints a fresh variable per occurrence — here a
-/// quantifier binder — must NOT be shared: the memo records only expansions
-/// that left the variable counter untouched.
+/// quantifier binder — must NOT be memoized: `MacroExpansionScope::close`
+/// records only expansions that left the variable counter untouched.
+///
+/// This used to be pinned by asserting the two call sites elaborate to
+/// DIFFERENT terms, which is no longer a faithful probe of the memo:
+/// #alpha-quantifier-sharing makes two alpha-equivalent authored quantifiers
+/// converge on one term AFTER each was elaborated independently, so term
+/// identity can no longer distinguish "the memo replayed an expansion" from
+/// "two independent expansions produced the same formula". The memo table
+/// itself is the direct observable, so the test reads that instead of the
+/// consequence it used to infer from.
 #[test]
-fn bodies_that_mint_fresh_variables_are_not_shared() {
+fn bodies_that_mint_fresh_variables_are_not_memoized() {
     let (ctx, outcomes) = elaborate_all(
         "(declare-const a Int)
          (define-fun some_larger ((v Int)) Bool (exists ((w Int)) (> w v)))
@@ -141,9 +150,28 @@ fn bodies_that_mint_fresh_variables_are_not_shared() {
         outcome.as_ref().expect("elaborates");
     }
     assert_eq!(ctx.assertions.len(), 2);
-    assert_ne!(
-        ctx.assertions[0], ctx.assertions[1],
-        "each occurrence must keep its own freshly minted binder"
+    assert!(
+        ctx.macro_expansion_memo.is_empty(),
+        "an expansion that minted a binder must not be recorded for replay"
+    );
+}
+
+/// The memo DOES record a body that mints nothing, so the test above is a
+/// discriminating probe rather than one that passes on an always-empty table.
+#[test]
+fn bodies_that_mint_nothing_are_memoized() {
+    let (ctx, outcomes) = elaborate_all(
+        "(declare-const a Int)
+         (define-fun twice ((v Int)) Int (+ v v))
+         (assert (= (twice a) 0))
+         (assert (= (twice a) 0))",
+    );
+    for outcome in &outcomes {
+        outcome.as_ref().expect("elaborates");
+    }
+    assert!(
+        !ctx.macro_expansion_memo.is_empty(),
+        "a variable-counter-neutral expansion must be recorded for replay"
     );
 }
 

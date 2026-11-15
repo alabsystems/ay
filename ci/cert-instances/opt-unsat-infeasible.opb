@@ -1,0 +1,8 @@
+* #variable= 2 #constraint= 2
+* OPT-LIN whose CONSTRAINTS are infeasible: the certified answer is
+* UNSATISFIABLE, and the proof must conclude BOUNDS INF <= obj <= INF
+* (an empty feasible set has no optimum). Distinct proof class from
+* decision-UNSAT: the objective is present, so the conclusion line differs.
+min: +1 x1 +1 x2 ;
++1 x1 >= 1 ;
+-1 x1 >= 0 ;

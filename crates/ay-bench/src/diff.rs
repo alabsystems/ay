@@ -121,13 +121,14 @@ impl DiffReport {
 
     #[must_use]
     pub fn total_base(&self) -> usize {
-        self.regressions.len()
-            + self.improvements.len()
-            + self.slowdowns.len()
-            + self.speedups.len()
-            + self.removed.len()
-            + self.non_comparable.len()
-            + self.unchanged_count
+        self.regressions
+            .len()
+            .saturating_add(self.improvements.len())
+            .saturating_add(self.slowdowns.len())
+            .saturating_add(self.speedups.len())
+            .saturating_add(self.removed.len())
+            .saturating_add(self.non_comparable.len())
+            .saturating_add(self.unchanged_count)
     }
 }
 

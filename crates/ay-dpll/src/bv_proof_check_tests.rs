@@ -666,3 +666,22 @@ fn mixed_int_bv_alloc_oom_is_never_valid() {
         "mixed Int+BV must fail-closed to Unchecked, got {verdict:?}"
     );
 }
+
+#[test]
+fn mkbv_proof_replay_preserves_low_bit_first_order() {
+    let mut terms = TermStore::new();
+    let low = terms.mk_var("low", Sort::Bool);
+    let clear = terms.mk_bool(false);
+    let set = terms.mk_bool(true);
+    let word = terms.mk_app_structural(Symbol::named("mkbv"), [low, clear, set], bv(3));
+    let five = terms.mk_bitvec(num_bigint::BigInt::from(5), 3);
+    let four = terms.mk_bitvec(num_bigint::BigInt::from(4), 3);
+    let expected = terms.mk_ite(low, five, four);
+    let equality = terms.mk_eq(word, expected);
+    assert!(check_bv_lemma(&terms, vec![equality]).is_valid());
+
+    let one = terms.mk_bitvec(num_bigint::BigInt::from(1), 3);
+    let reversed = terms.mk_ite(low, five, one);
+    let false_equality = terms.mk_eq(word, reversed);
+    assert!(check_bv_lemma(&terms, vec![false_equality]).is_invalid());
+}

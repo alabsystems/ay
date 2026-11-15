@@ -57,6 +57,7 @@ configure_zig_musl_cc_env() {
     export RANLIB_x86_64_unknown_linux_musl="${RANLIB_x86_64_unknown_linux_musl:-$RANLIB}"
 }
 
+# STOCK EXCEPTION: Trust seal 9192 has no x86_64-unknown-linux-musl std (2026-09-28: E0463).
 case "$TOOL" in
     zigbuild)
         configure_zig_musl_cc_env

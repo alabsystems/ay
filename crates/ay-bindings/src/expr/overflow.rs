@@ -28,8 +28,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a + b does NOT overflow (i.e., the result fits in the bit-width).
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvadd_no_overflow_unsigned / try_bvadd_no_overflow_unsigned,
         check: bv_same,
         assert_msg: "bvadd_no_overflow_unsigned requires same BitVec sorts",
@@ -43,8 +41,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a + b does NOT overflow (result is representable in signed bit-width).
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvadd_no_overflow_signed / try_bvadd_no_overflow_signed,
         check: bv_same,
         assert_msg: "bvadd_no_overflow_signed requires same BitVec sorts",
@@ -58,8 +54,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a - b does NOT underflow (i.e., a >= b).
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvsub_no_underflow_unsigned / try_bvsub_no_underflow_unsigned,
         check: bv_same,
         assert_msg: "bvsub_no_underflow_unsigned requires same BitVec sorts",
@@ -73,8 +67,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a - b does NOT overflow.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvsub_no_overflow_signed / try_bvsub_no_overflow_signed,
         check: bv_same,
         assert_msg: "bvsub_no_overflow_signed requires same BitVec sorts",
@@ -88,8 +80,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a * b does NOT overflow.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvmul_no_overflow_unsigned / try_bvmul_no_overflow_unsigned,
         check: bv_same,
         assert_msg: "bvmul_no_overflow_unsigned requires same BitVec sorts",
@@ -103,8 +93,6 @@ impl Expr {
         /// ENSURES: result sort is Bool.
         ///
         /// Returns true if a * b does NOT overflow.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvmul_no_overflow_signed / try_bvmul_no_overflow_signed,
         check: bv_same,
         assert_msg: "bvmul_no_overflow_signed requires same BitVec sorts",
@@ -119,8 +107,6 @@ impl Expr {
         ///
         /// Returns true if -a does NOT overflow.
         /// Negation overflow only occurs for INT_MIN (e.g., -128 for i8).
-        #[kani_requires(self.sort.is_bitvec())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvneg_no_overflow / try_bvneg_no_overflow,
         check: is_bv,
         assert_msg: "bvneg_no_overflow requires BitVec sort",
@@ -135,8 +121,6 @@ impl Expr {
         ///
         /// Returns true if a / b does NOT overflow.
         /// Signed division overflow only occurs when dividing INT_MIN by -1.
-        #[kani_requires(self.sort.is_bitvec() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn bvsdiv_no_overflow / try_bvsdiv_no_overflow,
         check: bv_same,
         assert_msg: "bvsdiv_no_overflow requires same BitVec sorts",

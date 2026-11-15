@@ -182,6 +182,73 @@ fn test_substitute_var_matches_naive() {
     );
 }
 
+/// `substitute_var` equals the naive `remove_coeff` + `add_coeff` loop, keeps the
+/// coefficients strictly sorted with no zeros, and leaves the constant alone
+/// (#6194), exhaustively: every row of one to three terms over x1..x4, every
+/// entering variable in it, every substitution of one or two terms over x1..x5
+/// (the entering variable included), coefficients -1, 1, 2 and `i64::MAX`
+/// (cancellation and i64 overflow), and scales covering the ±1, small-i64 and
+/// overflowing arms.
+#[test]
+fn test_substitute_var_matches_naive_exhaustive() {
+    use crate::rational::Rational;
+    use crate::types::TableauRow;
+
+    let values = [-1, 1, 2, i64::MAX].map(|n| Rational::new(n, 1));
+    let scales =
+        [(1, 1), (-1, 1), (2, 1), (-1, 2), (i64::MAX, 1)].map(|(n, d)| Rational::new(n, d));
+    // Every sparse vector over x1..=x`vars` with one to `max_len` terms.
+    let sparse = |vars: u32, max_len: u32| {
+        let mut vectors: Vec<Vec<(u32, Rational)>> = Vec::new();
+        for mask in 1u32..1 << vars {
+            if mask.count_ones() > max_len {
+                continue;
+            }
+            let support: Vec<u32> = (1..=vars).filter(|v| mask >> (v - 1) & 1 == 1).collect();
+            for pick in 0..values.len().pow(mask.count_ones()) {
+                let digit = |i: usize| pick / values.len().pow(i as u32) % values.len();
+                let terms = support
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (v, values[digit(i)].clone()));
+                vectors.push(terms.collect());
+            }
+        }
+        vectors
+    };
+    let constant = Rational::new(42, 1);
+    let substitutions = sparse(5, 2);
+    for row_coeffs in sparse(4, 3) {
+        for &(entering, _) in &row_coeffs {
+            let cases = substitutions
+                .iter()
+                .flat_map(|s| scales.iter().map(move |k| (s, k)));
+            for (subst, scale) in cases {
+                let mut row = TableauRow::new_rat(0, row_coeffs.clone(), constant.clone());
+                let mut naive = row.clone();
+                row.substitute_var(entering, subst, scale);
+                naive.remove_coeff(entering);
+                for (var, coeff) in subst.iter().filter(|(var, _)| *var != entering) {
+                    naive.add_coeff(*var, coeff * scale);
+                }
+                let case = || format!("{row_coeffs:?}, x{entering} := {subst:?} * {scale:?}");
+                assert_eq!(row.coeffs, naive.coeffs, "{}", case());
+                assert!(
+                    row.coeffs.windows(2).all(|w| w[0].0 < w[1].0),
+                    "unsorted: {}",
+                    case()
+                );
+                assert!(
+                    row.coeffs.iter().all(|(_, c)| !c.is_zero()),
+                    "zero kept: {}",
+                    case()
+                );
+                assert_eq!(row.constant, constant, "{}", case());
+            }
+        }
+    }
+}
+
 /// Verify substitute_var handles cancellation correctly.
 /// Row: 3*x1 + 2*x2, substitute x2 with {x1: -1} at scale=2
 ///   → remove x2, add 2*(-1)*x1 = -2*x1
@@ -767,4 +834,108 @@ fn test_bound_new_multi_reason_shared_equality_provenance() {
         }
         other => panic!("expected SharedEquality, got {other:?}"),
     }
+}
+
+/// #bound-churn: single-reason bounds (every direct atom bound, every NIA
+/// factor-split pin) keep their reason storage INLINE — no heap allocation
+/// for the three parallel vectors — while multi-reason bounds spill exactly
+/// as a `Vec` would, with identical contents and order.
+#[test]
+fn single_reason_bound_storage_is_inline_and_multi_reason_spills_in_order() {
+    let one = Bound::new(
+        Rational::from(5i64),
+        [TermId::new(7)],
+        [true],
+        [Rational::one()],
+        false,
+    );
+    assert!(!one.reasons.spilled(), "one reason must be inline");
+    assert!(!one.reason_values.spilled());
+    assert!(!one.reason_scales.spilled());
+    assert_eq!(&one.reasons[..], &[TermId::new(7)]);
+    assert_eq!(&one.reason_values[..], &[true]);
+    assert_eq!(one.reason_scales.len(), 1);
+    assert!(matches!(one.provenance, Some(BoundProvenance::Atom { .. })));
+
+    // A `Vec` still converts (spilled), preserving order.
+    let ids = vec![TermId::new(3), TermId::new(1), TermId::new(2)];
+    let vals = vec![true, false, true];
+    let scales = vec![Rational::one(), Rational::new(1, 2), Rational::from(3i64)];
+    let many = Bound::new(
+        Rational::zero(),
+        ids.clone(),
+        vals.clone(),
+        scales.clone(),
+        true,
+    );
+    assert!(many.reasons.spilled());
+    assert_eq!(many.reasons.to_vec(), ids);
+    assert_eq!(many.reason_values.to_vec(), vals);
+    assert_eq!(many.reason_scales.to_vec(), scales);
+    // Clone keeps contents and the inline/spilled shape.
+    let c = one.clone();
+    assert_eq!(c.reasons.to_vec(), one.reasons.to_vec());
+    assert!(!c.reasons.spilled());
+}
+
+/// An index at or past the stamp table's limit is a member like any other:
+/// `usize::MAX` used to overflow `idx + 1` and panic in `insert`.
+#[test]
+fn test_dense_idx_set_keeps_indices_beyond_the_stamp_table() -> Result<(), String> {
+    use crate::types::{DenseIdxSet, DENSE_SET_STAMP_LIMIT};
+
+    let mut set = DenseIdxSet::default();
+    let indices = [3, DENSE_SET_STAMP_LIMIT, usize::MAX];
+    for idx in indices {
+        if !set.insert(idx) {
+            return Err(format!("first insert of {idx} reported a duplicate"));
+        }
+        if set.insert(idx) {
+            return Err(format!("second insert of {idx} was not deduplicated"));
+        }
+    }
+    let members: Vec<usize> = set.iter().copied().collect();
+    if members != indices {
+        return Err(format!("members {members:?}, expected {indices:?}"));
+    }
+    set.clear();
+    if !set.is_empty() {
+        return Err("clear left members behind".to_string());
+    }
+    for idx in indices {
+        if !set.insert(idx) {
+            return Err(format!("{idx} still counted as a member after clear"));
+        }
+    }
+    Ok(())
+}
+
+/// The `u32` twin: `u32::MAX` is kept in the entry list instead of growing
+/// the stamp table to 2^32 slots.
+#[test]
+fn test_dense_u32_set_keeps_ids_beyond_the_stamp_table() -> Result<(), String> {
+    use crate::types::{DenseU32Set, DENSE_SET_STAMP_LIMIT};
+
+    let limit = u32::try_from(DENSE_SET_STAMP_LIMIT).map_err(|e| e.to_string())?;
+    let mut set = DenseU32Set::default();
+    let ids = [7, limit, u32::MAX];
+    for id in ids {
+        if set.contains(&id) {
+            return Err(format!("{id} is a member before its insert"));
+        }
+        if !set.insert(id) {
+            return Err(format!("first insert of {id} reported a duplicate"));
+        }
+        if set.insert(id) || !set.contains(&id) {
+            return Err(format!("{id} is not a single member after two inserts"));
+        }
+    }
+    if set.len() != ids.len() {
+        return Err(format!("len {}, expected {}", set.len(), ids.len()));
+    }
+    set.clear();
+    if ids.iter().any(|id| set.contains(id)) {
+        return Err("clear left members behind".to_string());
+    }
+    Ok(())
 }

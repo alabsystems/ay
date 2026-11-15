@@ -79,14 +79,17 @@ impl Executor {
         if scope.is_err() || !empty || !strict.is_ok_and(|quality| quality.is_complete()) || wire {
             return None;
         }
-        let rendered = ay_proof::try_export_alethe_with_problem_scope_overrides_and_budget(
-            &candidate,
-            &self.ctx.terms,
-            &authority_scope,
-            overrides.as_ref(),
-            Some(MAX_DIRECT_RENDER_WORK),
-        )
-        .ok()?;
+        let rendered = self
+            .in_alethe_dialect(|| {
+                ay_proof::try_export_alethe_with_problem_scope_overrides_and_budget(
+                    &candidate,
+                    &self.ctx.terms,
+                    &authority_scope,
+                    overrides.as_ref(),
+                    Some(MAX_DIRECT_RENDER_WORK),
+                )
+            })
+            .ok()?;
         if rendered.contains(":rule hole") || rendered.contains(":rule trust") {
             return None;
         }

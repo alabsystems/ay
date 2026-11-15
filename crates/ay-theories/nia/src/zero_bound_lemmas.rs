@@ -75,7 +75,7 @@ use ay_core::nonlinear::{self, SignConstraint};
 use ay_core::term::{Symbol, TermData, TermId};
 use ay_lra::GomoryCut;
 use num_rational::BigRational;
-use num_traits::{One, Zero};
+use num_traits::{One, Signed, Zero};
 use std::collections::BTreeMap;
 
 use super::NiaSolver;
@@ -89,6 +89,60 @@ use super::NiaSolver;
 struct WeakSigns {
     nonneg: BTreeMap<TermId, (TermId, bool)>,
     nonpos: BTreeMap<TermId, (TermId, bool)>,
+}
+
+/// One LRA side bound with non-empty justification (families 5-7).
+struct JustifiedSide {
+    value: BigRational,
+    strict: bool,
+    reasons: Vec<(TermId, bool)>,
+}
+
+fn justified_side(bound: &Option<ay_lra::Bound>) -> Option<JustifiedSide> {
+    let b = bound.as_ref()?;
+    // Length parity is only debug-asserted at Bound construction; a
+    // desynced pair would silently truncate the justification zip below
+    // and under-justify any cut derived from this bound. Refuse instead.
+    if b.reasons.is_empty() || b.reasons.len() != b.reason_values.len() {
+        return None;
+    }
+    Some(JustifiedSide {
+        value: b.value_big(),
+        strict: b.strict,
+        reasons: b
+            .reasons
+            .iter()
+            .copied()
+            .zip(b.reason_values.iter().copied())
+            .collect(),
+    })
+}
+
+fn justified_bounds(
+    bounds: Option<(Option<ay_lra::Bound>, Option<ay_lra::Bound>)>,
+) -> (Option<JustifiedSide>, Option<JustifiedSide>) {
+    match bounds {
+        Some((lo, hi)) => (justified_side(&lo), justified_side(&hi)),
+        None => (None, None),
+    }
+}
+
+/// The justifying reasons when the bounds exclude zero (`> 0` or `< 0`
+/// by value or strictness), else `None`.
+fn excludes_zero(
+    sides: &(Option<JustifiedSide>, Option<JustifiedSide>),
+) -> Option<&Vec<(TermId, bool)>> {
+    if let Some(lo) = &sides.0 {
+        if lo.value.is_positive() || (lo.value.is_zero() && lo.strict) {
+            return Some(&lo.reasons);
+        }
+    }
+    if let Some(hi) = &sides.1 {
+        if hi.value.is_negative() || (hi.value.is_zero() && hi.strict) {
+            return Some(&hi.reasons);
+        }
+    }
+    None
 }
 
 impl NiaSolver<'_> {
@@ -151,6 +205,7 @@ impl NiaSolver<'_> {
         added += self.add_mul_monotonicity_lemmas(&signs, &orders);
         added += self.add_product_pair_order_lemmas(&signs, &orders);
         added += self.add_box_product_upper_lemmas();
+        added += self.add_zero_product_lemmas(true);
         added
     }
 
@@ -179,6 +234,18 @@ impl NiaSolver<'_> {
     /// (#nia-mccormick-reasons): every used bound must carry non-empty reason
     /// atoms, which become the cut's reasons, so conflicts explain themselves
     /// with exactly the justifying literals.
+    ///
+    /// At iteration >= 1 of the check loop this runs INSIDE the tentative
+    /// scope, where a factor's bound may be a model-guessed sign cut whose
+    /// one reason is the variable term (#nia-sign-cut-soundness). The cut is
+    /// then a theorem only under the guess — and it is emitted anyway, on
+    /// purpose: it steers the LP like the McCormick rows built on the same
+    /// bounds (measured: withholding it lost `sat` on QF_UFNIA fuzz files
+    /// the base decides), and it is protected by the same machinery — its
+    /// reasons carry the variable term, so the simplex conflict guard
+    /// discards any refutation citing it and the LIA's verdict-producing
+    /// reads see it as unjustified; it leaves with the tentative scope. At
+    /// iteration 0 no guess exists and the lemma is exact.
     pub(crate) fn add_box_product_upper_lemmas(&mut self) -> usize {
         const MAX_DEGREE: usize = 8;
         let mons: Vec<(TermId, Vec<TermId>)> = self
@@ -252,6 +319,260 @@ impl NiaSolver<'_> {
             added += 1;
         }
         added
+    }
+
+    /// Families 5-7: zero-product, fixed-factor quotient, and
+    /// interval-product bounds (#nia-zero-product).
+    ///
+    /// For a monomial `m = x1*...*xn` (aux `a`) with JUSTIFIED LRA bounds
+    /// (every used bound carries non-empty reason atoms, the family-4
+    /// discipline):
+    ///
+    /// 5. **Zero product** — `a = 0` (both sides justified at 0) with
+    ///    every factor except `xi` bounded away from zero (`> 0` or `< 0`
+    ///    by bound value or strictness) forces `xi = 0`.
+    /// 6. **Quotient** — every factor except `xi` fixed (both sides
+    ///    justified) with product `C != 0` turns an aux bound into a bound
+    ///    on `xi` (`a <= u -> xi <= u/C` for `C > 0`; division flips the
+    ///    side for `C < 0`). The cut keeps the rational bound; integer
+    ///    tightening is the LIA's business.
+    /// 7. **Interval product** — with all factor sides justified, the aux
+    ///    lies in the interval product of the factor boxes; emit each side
+    ///    that tightens the aux's current justified bound. Consumers that
+    ///    read STORED bounds (pairwise McCormick sub-auxes, secant cuts,
+    ///    feasible sets) never see LP-implied bounds, so the stored form
+    ///    is new information even where the LP could derive it.
+    ///
+    /// All three are ordered-ring theorems conditional exactly on the
+    /// bound reasons they cite, emitted as single-variable Gomory cuts.
+    pub(crate) fn add_zero_product_lemmas(&mut self, allow_zero_product: bool) -> usize {
+        // Never read bounds inside a tentative scope: sign cuts and patch
+        // pins there are MODEL GUESSES, so a bound like `aux = 0` may be a
+        // guessed pin rather than an asserted fact. Deriving permanent
+        // factor cuts from guessed bounds poisons the model search
+        // (measured: QF_UFNIA int_check_bvslt_bvadd_rtl sat -> unknown via
+        // model-validation rejection). Real-scope bounds only.
+        if self.tentative_depth > 0 {
+            return 0;
+        }
+        let mons: Vec<(TermId, Vec<TermId>)> = self
+            .monomials_sorted()
+            .iter()
+            // Families 6/7 assume `aux == product(vars)`; a scaled
+            // monomial (`aux == coeff * product`) would need coeff-scaled
+            // bounds. ay-nia only ever registers coeff-1 monomials today
+            // (McCormick makes the same assumption), but skip scaled ones
+            // defensively rather than emit wrong bounds if that changes.
+            .filter(|m| m.vars.len() >= 2 && m.coeff.is_one())
+            .map(|m| (m.aux_var, m.vars.clone()))
+            .collect();
+        let mut added = 0;
+        for (aux, vars) in &mons {
+            added += self.zero_product_lemmas_for(*aux, vars, allow_zero_product);
+        }
+        added
+    }
+
+    fn zero_product_lemmas_for(
+        &mut self,
+        aux: TermId,
+        vars: &[TermId],
+        allow_zero_product: bool,
+    ) -> usize {
+        let a = justified_bounds(self.lia.lra_solver().get_bounds(aux));
+        let fb: Vec<(Option<JustifiedSide>, Option<JustifiedSide>)> = vars
+            .iter()
+            .map(|v| justified_bounds(self.lia.lra_solver().get_bounds(*v)))
+            .collect();
+        let mut added = 0;
+
+        // Family 5: zero product.
+        if allow_zero_product {
+            if let (Some(alo), Some(ahi)) = (&a.0, &a.1) {
+                // Only (nearly) DIRECTLY asserted zero products: each side
+                // justified by at most two atoms (an asserted `(= (* x y) 0)`
+                // reaches the bound store with the equality atom, plus at
+                // most a definition atom from SOM purification). Forcing a
+                // factor to zero from a DERIVED zero bound (multi-atom Farkas
+                // justification, 5 reasons measured) steers the model-point
+                // search into points the exact validator rejects, and the
+                // loop gives up instead of finding another point (QF_UFNIA
+                // int_check_bvslt_bvadd_rtl sat -> unknown).
+                if alo.value.is_zero()
+                    && ahi.value.is_zero()
+                    && !alo.strict
+                    && !ahi.strict
+                    && alo.reasons.len() <= 2
+                    && ahi.reasons.len() <= 2
+                {
+                    let mut base = alo.reasons.clone();
+                    base.extend(ahi.reasons.iter().copied());
+                    for (i, &target) in vars.iter().enumerate() {
+                        let mut reasons = base.clone();
+                        // Every factor DISTINCT from the target must exclude
+                        // zero; occurrences of the target itself (pure
+                        // powers like `x*x = 0`) need no premise.
+                        let mut all_exclude = true;
+                        for (j, sides) in fb.iter().enumerate() {
+                            if j == i || vars[j] == target {
+                                continue;
+                            }
+                            match excludes_zero(sides) {
+                                Some(excl) => reasons.extend(excl.iter().copied()),
+                                None => all_exclude = false,
+                            }
+                        }
+                        if all_exclude {
+                            added += self.emit_zero_product_cut(
+                                target,
+                                BigRational::zero(),
+                                true,
+                                &reasons,
+                            );
+                            added += self.emit_zero_product_cut(
+                                target,
+                                BigRational::zero(),
+                                false,
+                                &reasons,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Family 6: quotient through the fixed cofactor product.
+        for (i, &target) in vars.iter().enumerate() {
+            added += self.quotient_bounds_for(&a, &fb, i, target);
+        }
+
+        // Family 7: interval product on the aux.
+        let mut range: Option<(BigRational, BigRational)> = None;
+        let mut reasons: Vec<(TermId, bool)> = Vec::new();
+        for sides in &fb {
+            let (Some(lo), Some(hi)) = (&sides.0, &sides.1) else {
+                range = None;
+                reasons.clear();
+                break;
+            };
+            reasons.extend(lo.reasons.iter().copied());
+            reasons.extend(hi.reasons.iter().copied());
+            range = Some(match range {
+                None => (lo.value.clone(), hi.value.clone()),
+                Some((plo, phi)) => {
+                    let corners = [
+                        &plo * &lo.value,
+                        &plo * &hi.value,
+                        &phi * &lo.value,
+                        &phi * &hi.value,
+                    ];
+                    (
+                        corners.iter().min().expect("four corners").clone(),
+                        corners.iter().max().expect("four corners").clone(),
+                    )
+                }
+            });
+        }
+        if let Some((pmin, pmax)) = range {
+            if a.0.as_ref().is_none_or(|lo| pmin > lo.value) {
+                added += self.emit_zero_product_cut(aux, pmin, true, &reasons);
+            }
+            if a.1.as_ref().is_none_or(|hi| pmax < hi.value) {
+                added += self.emit_zero_product_cut(aux, pmax, false, &reasons);
+            }
+        }
+        added
+    }
+
+    /// Family 6 for factor `i`: when every OTHER factor is fixed with
+    /// product `C != 0`, aux bounds become bounds on factor `i`.
+    fn quotient_bounds_for(
+        &mut self,
+        a: &(Option<JustifiedSide>, Option<JustifiedSide>),
+        fb: &[(Option<JustifiedSide>, Option<JustifiedSide>)],
+        i: usize,
+        target: TermId,
+    ) -> usize {
+        let mut c = BigRational::one();
+        let mut base: Vec<(TermId, bool)> = Vec::new();
+        for (j, sides) in fb.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let (Some(lo), Some(hi)) = (&sides.0, &sides.1) else {
+                return 0;
+            };
+            if lo.strict || hi.strict || lo.value != hi.value {
+                return 0;
+            }
+            c *= &lo.value;
+            base.extend(lo.reasons.iter().copied());
+            base.extend(hi.reasons.iter().copied());
+        }
+        if c.is_zero() {
+            return 0;
+        }
+        let mut added = 0;
+        // a = C * target. C > 0 keeps sides; C < 0 swaps them.
+        if let Some(alo) = &a.0 {
+            let mut r = base.clone();
+            r.extend(alo.reasons.iter().copied());
+            let bound = &alo.value / &c;
+            added += self.emit_zero_product_cut(target, bound, c.is_positive(), &r);
+        }
+        if let Some(ahi) = &a.1 {
+            let mut r = base.clone();
+            r.extend(ahi.reasons.iter().copied());
+            let bound = &ahi.value / &c;
+            added += self.emit_zero_product_cut(target, bound, !c.is_positive(), &r);
+        }
+        added
+    }
+
+    /// Emit one single-variable cut `target >= bound` (`is_lower`) or
+    /// `target <= bound`, deduped per scope. The reasons must be non-empty
+    /// after dedup — a reason-less cut could not explain itself in a
+    /// Farkas conflict (family-4 discipline).
+    fn emit_zero_product_cut(
+        &mut self,
+        target: TermId,
+        bound: BigRational,
+        is_lower: bool,
+        reasons: &[(TermId, bool)],
+    ) -> usize {
+        let mut reasons: Vec<(TermId, bool)> = reasons.to_vec();
+        reasons.sort_unstable_by_key(|&(t, v)| (t, v));
+        reasons.dedup();
+        if reasons.is_empty() {
+            return 0;
+        }
+        if !self
+            .zero_product_emitted
+            .insert((target, bound.clone(), is_lower))
+        {
+            return 0;
+        }
+        if self.debug {
+            safe_eprintln!(
+                "[NIA] zero-product lemma: {:?} {} {} (reasons={:?})",
+                target,
+                if is_lower { ">=" } else { "<=" },
+                bound,
+                reasons
+            );
+        }
+        let var = self.lia.lra_solver_mut().ensure_var_registered(target);
+        self.lia.lra_solver_mut().add_gomory_cut(
+            &GomoryCut {
+                coeffs: vec![(var, BigRational::one())],
+                bound,
+                is_lower,
+                reasons,
+                source_term: None,
+            },
+            target,
+        );
+        1
     }
 
     /// Family 1: product sign at the zero bound.

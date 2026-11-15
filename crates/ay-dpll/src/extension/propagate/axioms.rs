@@ -41,7 +41,9 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         let terms = std::mem::take(&mut self.pending_axiom_terms);
         let annotations = std::mem::take(&mut self.pending_axiom_farkas);
         self.record_pending_axioms(terms.into_iter().zip(annotations));
-        Some(ExtPropagateResult::clauses(axioms))
+        let mut result = ExtPropagateResult::clauses(axioms);
+        result.clause_origin = ay_sat::TheoryClauseOrigin::Axiom;
+        Some(result)
     }
 
     /// Record each bound axiom with the strongest sound proof classification.

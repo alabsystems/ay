@@ -46,10 +46,10 @@ struct CliqueColouringShape {
     k: usize,
     c: usize,
     n: usize,
-    q: Vec<Vec<Variable>>,      // k x n: [position][vertex]
-    x: Vec<Vec<Variable>>,      // n x c: [x-row][colour]
-    xrow_of_vert: Vec<usize>,   // vertex -> x-row (a bijection)
-    edge: Vec<Vec<Variable>>,   // n x n: [vertex][vertex]
+    q: Vec<Vec<Variable>>,    // k x n: [position][vertex]
+    x: Vec<Vec<Variable>>,    // n x c: [x-row][colour]
+    xrow_of_vert: Vec<usize>, // vertex -> x-row (a bijection)
+    edge: Vec<Vec<Variable>>, // n x n: [vertex][vertex]
 }
 
 /// Recognise the clique-colouring shape or return `None`.
@@ -116,7 +116,7 @@ fn detect_clique_colouring_shape(clauses: &[Vec<Literal>]) -> Option<CliqueColou
         return None;
     }
     let (vert_of, q) = cc_vertex_classes(&negb, &qrow_of, &xrow_of, n, k, c)?;
-    let (evc, edge) = cc_edge_map(&mixed3, &vert_of, &evars, n, k)?;
+    let (evc, edge) = cc_edge_map(&mixed3, &vert_of, &qrow_of, &evars, n, k)?;
     let (exr, x) = cc_colour_map(&neg3, &xrow_of, &evars, n, c)?;
     let xrow_of_vert = cc_vertex_xrows(&evc, &exr, n)?;
     Some(CliqueColouringShape {
@@ -228,42 +228,55 @@ fn cc_vertex_classes(
 /// Recover the edge ↔ vertex-pair bijection from the mixed ternaries
 /// `¬q_{i,u} ∨ ¬q_{j,v} ∨ e_{u,v}` (exact count, no duplicates, one
 /// consistent vertex pair per edge variable).
+///
+/// The family has exactly one such clause per unordered position pair
+/// `{i, j}` (i ≠ j) and ordered vertex pair `(u, v)` (u ≠ v), so each clause
+/// is keyed on its (row pair, vertex pair) and the keys must be pairwise
+/// distinct: with the exact count that means every combination is present
+/// once. Checking only the vertex pair let a clause whose two q-literals sit
+/// in the SAME position row stand in for a missing cross-row clause, and the
+/// route then refuted a satisfiable near-miss (a wrong UNSAT, found by the
+/// 2026-09-17 audit; the control checker rejected the certificate).
 fn cc_edge_map(
     mixed3: &[&Vec<Literal>],
     vert_of: &BTreeMap<Variable, usize>,
+    qrow_of: &BTreeMap<Variable, usize>,
     evars: &std::collections::BTreeSet<Variable>,
     n: usize,
     k: usize,
-) -> Option<(
-    BTreeMap<Variable, (usize, usize)>,
-    Vec<Vec<Variable>>,
-)> {
+) -> Option<(BTreeMap<Variable, (usize, usize)>, Vec<Vec<Variable>>)> {
     use std::collections::{BTreeMap, BTreeSet};
 
     if mixed3.len() != (k * (k - 1) / 2) * n * (n - 1) {
         return None;
     }
-    let mut seen: BTreeSet<[Variable; 3]> = BTreeSet::new();
+    let mut seen: BTreeSet<(usize, usize, usize, usize)> = BTreeSet::new();
     let mut evc: BTreeMap<Variable, (usize, usize)> = BTreeMap::new();
     for cl in mixed3 {
         let e = cl.iter().find(|l| l.is_positive())?.variable();
         if !evars.contains(&e) {
             return None;
         }
-        let verts: Vec<usize> = cl
+        // (position row, vertex) of each q-literal, in a canonical row order.
+        let mut cells: Vec<(usize, usize)> = cl
             .iter()
             .filter(|l| !l.is_positive())
-            .map(|l| vert_of.get(&l.variable()).copied())
+            .map(|l| {
+                let var = l.variable();
+                Some((*qrow_of.get(&var)?, *vert_of.get(&var)?))
+            })
             .collect::<Option<Vec<_>>>()?;
-        let pair = (verts[0].min(verts[1]), verts[0].max(verts[1]));
-        if pair.0 == pair.1 {
+        cells.sort_unstable();
+        let [(row_a, vert_a), (row_b, vert_b)] = cells[..] else {
+            return None;
+        };
+        if row_a == row_b || vert_a == vert_b {
             return None;
         }
-        let mut key = [cl[0].variable(), cl[1].variable(), cl[2].variable()];
-        key.sort_unstable();
-        if !seen.insert(key) {
+        if !seen.insert((row_a, row_b, vert_a, vert_b)) {
             return None;
         }
+        let pair = (vert_a.min(vert_b), vert_a.max(vert_b));
         if *evc.entry(e).or_insert(pair) != pair {
             return None;
         }
@@ -300,10 +313,7 @@ fn cc_colour_map(
     evars: &std::collections::BTreeSet<Variable>,
     n: usize,
     c: usize,
-) -> Option<(
-    BTreeMap<Variable, (usize, usize)>,
-    Vec<Vec<Variable>>,
-)> {
+) -> Option<(BTreeMap<Variable, (usize, usize)>, Vec<Vec<Variable>>)> {
     use std::collections::{BTreeMap, BTreeSet};
 
     if neg3.len() != (n * (n - 1) / 2) * c {

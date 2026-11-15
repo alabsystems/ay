@@ -19,9 +19,10 @@ pub enum SExpr {
     Symbol(String),
     /// A keyword (:name)
     Keyword(String),
-    /// A numeral
+    /// A numeral. Non-negative, except an unquoted `-N`, which the parser
+    /// reads as the negative numeral `-N` (`negative_numeric_literal`).
     Numeral(String),
-    /// A decimal number
+    /// A decimal number. Non-negative, except an unquoted `-N.M`.
     Decimal(String),
     /// A hexadecimal bitvector
     Hexadecimal(String),
@@ -103,6 +104,9 @@ fn raw_symbol_needs_quoting(name: &str) -> bool {
     name.is_empty()
         || name.starts_with(|c: char| c.is_ascii_digit())
         || name.contains(|c: char| !c.is_ascii_alphanumeric() && !EXTRA.contains(&c))
+        // A bare `-1` re-reads as the NUMBER (`negative_numeric_literal`), so
+        // the symbol named `-1` must keep its `|...|` to come back a symbol.
+        || is_negative_numeric_literal(name)
 }
 
 impl SExpr {

@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_ABV)
+(declare-const src_val (_ BitVec 8))
+(declare-const preg (_ BitVec 8))
+(assert (not (= src_val (select (store ((as const (Array (_ BitVec 8) (_ BitVec 8))) (_ bv0 8)) preg src_val) preg))))
+(check-sat)
+(exit)

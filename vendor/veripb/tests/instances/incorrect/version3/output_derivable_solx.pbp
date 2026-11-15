@@ -1,0 +1,31 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): `output DERIVABLE` trusted the core set to be
+% input-entailed, which `solx` breaks.
+%
+% DERIVABLE claims every model of the input is a model of the output, and
+% `check_file` establishes it by matching the output against the core set
+% constraint for constraint -- sound only while every core constraint is
+% entailed by the input. `solx` stores a satisfiability-preserving but NOT
+% entailed constraint into core (its kernel taint is
+% `solution-exclusion-unmodelled`), so after it the invariant is broken.
+%
+% Ground truth, one variable: the input `1 x1 >= 1` is satisfied by x1=1; the
+% output `{1 x1 >= 1, 1 ~x1 >= 1}` is unsatisfiable. A satisfiable formula
+% cannot entail an unsatisfiable one, so OUTPUT DERIVABLE is false -- yet this
+% used to print `s VERIFIED OUTPUT DERIVABLE` at exit 0 under default flags, on
+% this fork and on clean upstream 4bb10c2c, with `--kernel-verify` reporting no
+% divergence.
+%
+% This is defect 15's failure mode at the one guarantee its fix did not reach:
+% `EQUISATISFIABLE` and `EQUIENUMERABLE` already carry the `solution_logged`
+% guard; the reasoning that DERIVABLE was "implication-based, so unaffected by
+% weakened solution guarantees" silently assumed an input-entailed core.
+% Invisible because no corpus proof ever wrote DERIVABLE.
+%
+% Found by the ninth red team, whose report arrived after a usage-limit
+% interruption and was adjudicated on recovery.
+f 1;
+solx x1;
+output DERIVABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

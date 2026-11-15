@@ -165,7 +165,7 @@ impl PdrSolver {
     pub(in crate::pdr) fn verify_model_fast(
         &mut self,
         model: &InvariantModel,
-        deadline: ay_core::time::Instant,
+        mut deadline: ay_core::time::Instant,
     ) -> bool {
         self.telemetry.verification_queries = self.telemetry.verification_queries.saturating_add(1);
 
@@ -209,20 +209,16 @@ impl PdrSolver {
             }
         }
 
-        // #3215 soundness fix: track whether any transition clause used filtered invariant.
-        // If so, we must re-verify query clauses with the same filtered invariant,
-        // matching the #73 soundness fix in verify_model_with_cex.
-        let mut used_filtered_invariant = false;
-        let mut query_clause_info: Vec<QueryClauseInfo> = Vec::new();
-
         // #5653: Budget for concrete_transition_check to avoid cumulative overhead.
         // When budget is exhausted, trust the SMT result for remaining clauses.
-        let concrete_budget = std::time::Duration::from_millis(200);
-        let mut concrete_elapsed = std::time::Duration::ZERO;
+        let mut concrete = self.concrete_budget(std::time::Duration::from_millis(200));
         // #7410: Rate-limit concrete cross-checks to 1-in-100 UNSAT results.
         let mut concrete_unsat_count: u64 = 0;
 
         for (clause_idx, clause) in self.problem.clauses().iter().enumerate() {
+            // Anchored search time is not the clauses' to lose: move the deadline past it.
+            let anchored = concrete.take_anchored_spent(&mut self.telemetry);
+            deadline = deadline.checked_add(anchored).unwrap_or(deadline);
             // #3225: Check cooperative cancellation between clauses.
             if self.is_cancelled() {
                 return false;
@@ -246,22 +242,6 @@ impl PdrSolver {
 
             match &clause.head {
                 crate::ClauseHead::False => {
-                    // #3215: Store query clause info for re-verification if filtered invariant used.
-                    let invariant_body = self
-                        .extract_invariant_only_from_body(&clause.body, model)
-                        .unwrap_or(ChcExpr::Bool(true));
-                    let bad_state = clause
-                        .body
-                        .constraint
-                        .clone()
-                        .unwrap_or(ChcExpr::Bool(true));
-                    let pred_info = clause
-                        .body
-                        .predicates
-                        .first()
-                        .map(|(pred, args)| (*pred, args.clone()));
-                    query_clause_info.push((pred_info, invariant_body, bad_state));
-
                     // Query clause: check body is UNSAT
                     if cube::is_trivial_contradiction(&body) {
                         continue;
@@ -310,26 +290,28 @@ impl PdrSolver {
                             // dangerous soundness failure.
                             // #7410: Rate-limit: first 10, then 1-in-100.
                             concrete_unsat_count += 1;
-                            if concrete_elapsed < concrete_budget
+                            if concrete.has_room()
                                 && (concrete_unsat_count <= 10
                                     || concrete_unsat_count.is_multiple_of(100))
                             {
-                                let check_start = ay_core::time::Instant::now();
-                                if let Some(cex_model) =
-                                    concrete::transition_check(&body, &ChcExpr::Bool(true), &body)
-                                {
-                                    tracing::warn!(
-                                        clause_idx,
-                                        ?cex_model,
-                                        "verify_model_fast: query clause SMT said UNSAT but concrete check found SAT (#5803)"
-                                    );
-                                    return false;
+                                match concrete.check(&body, &body) {
+                                    concrete::ConcreteAnswer::Witness(cex_model) => {
+                                        tracing::warn!(
+                                            clause_idx,
+                                            ?cex_model,
+                                            "verify_model_fast: query clause SMT said UNSAT but concrete check found SAT (#5803)"
+                                        );
+                                        return false;
+                                    }
+                                    // The solve is over: no acceptance on an
+                                    // unfinished check.
+                                    concrete::ConcreteAnswer::Interrupted => return false,
+                                    concrete::ConcreteAnswer::NoWitness => {}
                                 }
-                                concrete_elapsed += check_start.elapsed();
-                            } else if concrete_elapsed >= concrete_budget {
+                            } else if !concrete.has_room() {
                                 tracing::warn!(
                                     clause_idx,
-                                    ?concrete_elapsed,
+                                    concrete_elapsed = ?concrete.elapsed(),
                                     "trust-proof fallback: query clause concrete cross-check \
                                      skipped due to budget exhaustion — trusting SMT UNSAT"
                                 );
@@ -492,26 +474,28 @@ impl PdrSolver {
                             // PDR repeatedly attempts model verification.
                             // #7410: Rate-limit: first 10, then 1-in-100.
                             concrete_unsat_count += 1;
-                            if concrete_elapsed < concrete_budget
+                            if concrete.has_room()
                                 && (concrete_unsat_count <= 10
                                     || concrete_unsat_count.is_multiple_of(100))
                             {
-                                let check_start = ay_core::time::Instant::now();
-                                if let Some(cex_model) =
-                                    concrete::transition_check(&body, &head, &query)
-                                {
-                                    tracing::warn!(
-                                        clause_idx,
-                                        ?cex_model,
-                                        "verify_model_fast: SMT said UNSAT but concrete check found SAT"
-                                    );
-                                    return false;
+                                match concrete.check(&body, &query) {
+                                    concrete::ConcreteAnswer::Witness(cex_model) => {
+                                        tracing::warn!(
+                                            clause_idx,
+                                            ?cex_model,
+                                            "verify_model_fast: SMT said UNSAT but concrete check found SAT"
+                                        );
+                                        return false;
+                                    }
+                                    // The solve is over: no acceptance on an
+                                    // unfinished check.
+                                    concrete::ConcreteAnswer::Interrupted => return false,
+                                    concrete::ConcreteAnswer::NoWitness => {}
                                 }
-                                concrete_elapsed += check_start.elapsed();
-                            } else if concrete_elapsed >= concrete_budget {
+                            } else if !concrete.has_room() {
                                 tracing::warn!(
                                     clause_idx,
-                                    ?concrete_elapsed,
+                                    concrete_elapsed = ?concrete.elapsed(),
                                     "trust-proof fallback: transition clause concrete cross-check \
                                      skipped due to budget exhaustion — trusting SMT UNSAT"
                                 );
@@ -527,25 +511,10 @@ impl PdrSolver {
                             continue;
                         }
                         SmtResult::Sat(_) => {
-                            // Try aggressive filtering fallback
-                            let body_filtered = Self::filter_blocking_lemmas_aggressive(&body);
-                            let head_filtered = Self::filter_blocking_lemmas(&head);
-                            let query_filtered =
-                                ChcExpr::and(body_filtered, ChcExpr::not(head_filtered));
-                            self.smt.reset();
-                            let remaining =
-                                deadline.saturating_duration_since(ay_core::time::Instant::now());
-                            let timeout = fast_initial.min(remaining);
-                            match self.smt.check_sat_with_timeout(&query_filtered, timeout) {
-                                SmtResult::Unsat
-                                | SmtResult::UnsatWithCore(_)
-                                | SmtResult::UnsatWithFarkas(_) => {
-                                    // #3215: Mark that filtered invariant was used
-                                    used_filtered_invariant = true;
-                                    continue;
-                                }
-                                _ => return false,
-                            }
+                            // This verifier returns the original model. A
+                            // weaker head cannot repair its failed implication;
+                            // candidate repair owns mutation and a full recheck.
+                            return false;
                         }
                         SmtResult::Unknown => {
                             // Try fixed-int substitution first (eliminates mod/div cheaply)
@@ -629,82 +598,6 @@ impl PdrSolver {
                             }
                             return false;
                         }
-                    }
-                }
-            }
-        }
-
-        // #3215 soundness fix: re-verify query clauses with filtered invariant.
-        // Mirrors the #73 soundness fix in verify_model_with_cex (lines 1402+).
-        // If any transition clause was verified only via aggressive filtering,
-        // the filtered invariant might admit bad states that the original blocking
-        // lemmas excluded. We must check that filtered_invariant ∧ bad_state is UNSAT.
-        if used_filtered_invariant && !query_clause_info.is_empty() {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "PDR: verify_model_fast: re-verifying {} query clauses with filtered invariant",
-                    query_clause_info.len()
-                );
-            }
-            for (i, (_pred_info, invariant_body, bad_state)) in query_clause_info.iter().enumerate()
-            {
-                // #3225: Check cooperative cancellation between re-verification queries.
-                if self.is_cancelled() {
-                    return false;
-                }
-                if ay_core::time::Instant::now() >= deadline {
-                    return false;
-                }
-                let filtered_invariant = Self::filter_blocking_lemmas_aggressive(invariant_body);
-                let query_body_filtered = ChcExpr::and(filtered_invariant, bad_state.clone());
-
-                self.smt.reset();
-                let remaining = deadline.saturating_duration_since(ay_core::time::Instant::now());
-                let timeout = fast_initial.min(remaining);
-                match self
-                    .smt
-                    .check_sat_with_timeout(&query_body_filtered, timeout)
-                {
-                    SmtResult::Unsat
-                    | SmtResult::UnsatWithCore(_)
-                    | SmtResult::UnsatWithFarkas(_) => {
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: verify_model_fast: query {} passed filtered re-verification",
-                                i
-                            );
-                        }
-                    }
-                    SmtResult::Unknown
-                        if !Self::contains_mod_or_div(&query_body_filtered)
-                            && !query_body_filtered.contains_array_ops() =>
-                    {
-                        // QF_LIA retry with extended timeout
-                        let remaining =
-                            deadline.saturating_duration_since(ay_core::time::Instant::now());
-                        let timeout = fast_retry.min(remaining);
-                        if timeout.is_zero() {
-                            return false;
-                        }
-                        self.smt.reset();
-                        match self
-                            .smt
-                            .check_sat_with_timeout(&query_body_filtered, timeout)
-                        {
-                            SmtResult::Unsat
-                            | SmtResult::UnsatWithCore(_)
-                            | SmtResult::UnsatWithFarkas(_) => {}
-                            _ => return false,
-                        }
-                    }
-                    _ => {
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: verify_model_fast: query {} FAILED filtered re-verification (soundness catch)",
-                                i
-                            );
-                        }
-                        return false;
                     }
                 }
             }

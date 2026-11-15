@@ -88,14 +88,25 @@ impl Solver {
         self.cold.lrat_enabled = false;
         if let Some(trace) = self.cold.clause_trace.as_mut() {
             trace.mark_proof_work_exhausted();
+            // #destroyed-trace. Take the census BEFORE the clear, because the
+            // clear is what makes the question unanswerable downstream: every
+            // consumer then sees `entries=0` and cannot tell a destroyed
+            // refutation from a destroyed partial search record. Write-only.
+            trace.snapshot_before_exhaustion_clear();
             trace.clear_entries();
         }
         // With no certificate left, restore controls that proof mode disabled
-        // so search continues at full (--no-proof) power.
-        if let Some(pristine) = self.inproc_ctrl_pre_proof.take() {
-            self.inproc_ctrl = pristine;
+        // so search continues at full (--no-proof) power, unless this solver
+        // re-decides a verdict as evidence and keeps the proof-mode controls
+        // (`proof_exhaustion_scope`): the snapshot is then discarded.
+        let pristine = self.inproc_ctrl_pre_proof.take();
+        if !self.cold.proof_exhaustion_keeps_proof_inprocessing {
+            if let Some(pristine) = pristine {
+                self.inproc_ctrl = pristine;
+            }
         }
         tracing::warn!(
+            kept_proof_inprocessing = self.cold.proof_exhaustion_keeps_proof_inprocessing,
             "search-time proof bookkeeping budget exhausted: degraded to              no-proof search (verdict unaffected; synthesized-default              certificate will not be emitted)"
         );
     }
@@ -332,6 +343,9 @@ impl Solver {
             rounds: self.cold.factor_rounds,
             factored_count: self.cold.factor_factored_total,
             extension_vars: self.cold.factor_extension_vars_total,
+            init_calls: self.cold.factor_init_calls,
+            init_ticks: self.cold.factor_init_ticks,
+            init_undrained: self.cold.factor_init_undrained,
         }
     }
 
@@ -620,6 +634,10 @@ impl Solver {
     /// bounded, proof-safe, and lets the existing Kissat focused reorder path
     /// rebuild VMTF from structural clause weights during the hard tail.
     pub(in crate::solver) fn should_reorder(&self) -> bool {
+        // `--sat-reorder-kissat` reorders from the search loop instead.
+        if super::reorder::kissat_reorder_enabled() {
+            return false;
+        }
         if !self.stable_mode && !self.small_dense_learned_reduce_policy() {
             return false;
         }
@@ -658,7 +676,8 @@ impl Solver {
 
     /// Check if we should run probing (interval + tick-threshold delay).
     pub(in crate::solver) fn should_probe(&self) -> bool {
-        self.probe_skip_reason().is_none()
+        ay_core::sat_ab_switches().inproc_passes_kissat != Some(true)
+            && self.probe_skip_reason().is_none()
     }
 
     /// Evaluate the subsumption pass skip reason with tick-threshold gating (#8148).
@@ -794,13 +813,13 @@ impl Solver {
         if !control.enabled {
             return Some(TransredSkipReason::DisabledFlag);
         }
-        if self.num_conflicts < control.next_conflict {
+        if !self.cold.probe_round_kissat && self.num_conflicts < control.next_conflict {
             return Some(TransredSkipReason::IntervalNotDue);
         }
 
         // Tick-threshold gate (#8148): skip if not enough search ticks have
         // accumulated since the last transred call.
-        if self.cold.last_transred_ticks > 0 {
+        if !self.cold.probe_round_kissat && self.cold.last_transred_ticks > 0 {
             let ticks_now = self.search_ticks[0] + self.search_ticks[1];
             let ticks_delta = ticks_now.saturating_sub(self.cold.last_transred_ticks);
             let base_threshold = TRANSRED_TICK_THRESHOLD.saturating_mul(self.num_clauses() as u64);
@@ -868,7 +887,7 @@ impl Solver {
     }
 
     #[inline]
-    fn floor_log10(mut value: usize) -> u64 {
+    pub(in crate::solver) fn floor_log10(mut value: usize) -> u64 {
         let mut log = 0_u64;
         while value >= 10 {
             value /= 10;
@@ -884,17 +903,13 @@ impl Solver {
         if !control.enabled {
             return Some(FactorSkipReason::DisabledFlag);
         }
-        if self.num_conflicts < control.next_conflict {
+        if !self.cold.probe_round_kissat && self.num_conflicts < control.next_conflict {
             return Some(FactorSkipReason::IntervalNotDue);
         }
 
-        // CaDiCaL factor.cpp: delay gate based on active vars and elimination rounds.
-        let active_vars = self
-            .num_vars
-            .saturating_sub(self.var_lifecycle.count_removed());
-        let active_log10 = Self::floor_log10(active_vars);
-        let delay_limit = u64::from(self.cold.bve_phases) + FACTOR_DELAY;
-        if active_log10 > delay_limit {
+        // CaDiCaL factor.cpp: delay gate based on active vars and elimination
+        // rounds; `--sat-factor-large` opens it in its band (factor_large.rs).
+        if self.factor_delay_gate_holds() {
             return Some(FactorSkipReason::DelayGuard);
         }
 
@@ -904,7 +919,7 @@ impl Solver {
         // and uses FACTOR_INIT_TICKS instead.
         // Adaptive scaling (#8099): when inprocessing overhead is low, lower
         // the threshold so factorization fires more frequently.
-        if self.cold.factor_rounds > 0 {
+        if !self.cold.probe_round_kissat && self.cold.factor_rounds > 0 {
             let ticks_now = self.search_ticks[0] + self.search_ticks[1];
             let ticks_delta = ticks_now.saturating_sub(self.cold.last_factor_ticks);
             let base_threshold = FACTOR_TICK_THRESHOLD.saturating_mul(self.num_clauses() as u64);
@@ -951,7 +966,8 @@ impl Solver {
 
     /// Check if we should run HTR (interval + tick-threshold delay).
     pub(in crate::solver) fn should_htr(&self) -> bool {
-        self.htr_skip_reason().is_none()
+        ay_core::sat_ab_switches().inproc_passes_kissat != Some(true)
+            && self.htr_skip_reason().is_none()
     }
 
     /// Check if we should run factorization (interval + delay + mark-watermark).
@@ -970,12 +986,8 @@ impl Solver {
             return false;
         }
 
-        let active_vars = self
-            .num_vars
-            .saturating_sub(self.var_lifecycle.count_removed());
-        let active_log10 = Self::floor_log10(active_vars);
-        let delay_limit = u64::from(self.cold.bve_phases) + FACTOR_DELAY;
-        if active_log10 > delay_limit {
+        // The switch never opens under LRAT, so this shadow stays as it was.
+        if self.factor_delay_gate_holds() {
             return false;
         }
 
@@ -1011,12 +1023,7 @@ impl Solver {
             return false;
         }
 
-        let active_vars = self
-            .num_vars
-            .saturating_sub(self.var_lifecycle.count_removed());
-        let active_log10 = Self::floor_log10(active_vars);
-        let delay_limit = u64::from(self.cold.bve_phases) + FACTOR_DELAY;
-        if active_log10 > delay_limit {
+        if self.factor_delay_gate_holds() {
             return false;
         }
 
@@ -1036,7 +1043,7 @@ impl Solver {
             return Some(BackboneSkipReason::DisabledFlag);
         }
 
-        if self.num_conflicts < control.next_conflict {
+        if !self.probe_round_kissat_backbone() && self.num_conflicts < control.next_conflict {
             return Some(BackboneSkipReason::IntervalNotDue);
         }
 
@@ -1046,7 +1053,7 @@ impl Solver {
         // The first call (last_backbone_ticks == 0 and num_conflicts > 0)
         // always passes since ticks_delta equals the full search tick count.
         // Adaptive scaling (#8099): lower threshold when overhead is low.
-        if self.cold.last_backbone_ticks > 0 {
+        if !self.probe_round_kissat_backbone() && self.cold.last_backbone_ticks > 0 {
             let ticks_now = self.search_ticks[0] + self.search_ticks[1];
             let ticks_delta = ticks_now.saturating_sub(self.cold.last_backbone_ticks);
             let base_threshold = BACKBONE_TICK_THRESHOLD.saturating_mul(self.num_clauses() as u64);
@@ -1077,7 +1084,7 @@ impl Solver {
         if !control.enabled {
             return Some(SweepSkipReason::DisabledFlag);
         }
-        if self.num_conflicts < control.next_conflict {
+        if !self.cold.probe_round_kissat && self.num_conflicts < control.next_conflict {
             return Some(SweepSkipReason::IntervalNotDue);
         }
 
@@ -1085,7 +1092,7 @@ impl Solver {
         // skip if not enough search ticks have accumulated since the last
         // sweep call relative to the current clause database size.
         // Adaptive scaling (#8099): lower threshold when overhead is low.
-        if self.cold.last_sweep_ticks > 0 {
+        if !self.cold.probe_round_kissat && self.cold.last_sweep_ticks > 0 {
             let ticks_now = self.search_ticks[0] + self.search_ticks[1];
             let ticks_delta = ticks_now.saturating_sub(self.cold.last_sweep_ticks);
             let base_threshold = SWEEP_TICK_THRESHOLD.saturating_mul(self.num_clauses() as u64);
@@ -1168,6 +1175,11 @@ impl Solver {
     pub(in crate::solver) fn vivify_skip_reason(&self) -> Option<VivifySkipReason> {
         if !self.inproc_ctrl.vivify.enabled {
             return Some(VivifySkipReason::DisabledFlag);
+        }
+        // `--sat-vivify-kissat`: every simplification round, under Kissat's
+        // own budget and delay (`inprocessing/vivify/kissat.rs`).
+        if self.cold.vivify_kissat && !self.cold.has_been_incremental {
+            return None;
         }
         if !self.should_vivify_learned() && !self.should_vivify_irred() {
             return Some(VivifySkipReason::IntervalNotDue);

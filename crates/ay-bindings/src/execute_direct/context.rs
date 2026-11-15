@@ -6,14 +6,18 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 
 use ay_core::catch_ay_panics;
-use ay_dpll::api::{FuncDecl, Logic, Solver, SolverError, Term};
+use ay_dpll::api::{FuncDecl, Solver, SolverError, Term};
 use ay_translate::{TranslationSession, TranslationState};
 
 use super::ExecuteError;
+use crate::AYProgram;
 
 /// Execution context for translating AYProgram to solver calls.
 pub(super) struct ExecutionContext {
     pub(super) solver: Solver,
+    /// Any proof request in the complete program requires retained source,
+    /// including for assertions preceding the request.
+    pub(super) retain_assertion_sources: bool,
     /// Shared translation state for declared variables and functions.
     pub(super) translation_state: TranslationState<String>,
     /// Bound-variable overlays for quantifier translation.
@@ -24,15 +28,34 @@ pub(super) struct ExecutionContext {
     /// Declared datatypes, keyed by name. Needed for constructor translation
     /// which requires the full DatatypeSort to pass to the solver API.
     pub(super) declared_datatypes: BTreeMap<String, ay_core::DatatypeSort>,
+    /// The bindings-side definition behind each declared datatype: every
+    /// descriptor lowered here (on a variable, binder, function signature,
+    /// or datatype term) must be structurally equal to the one registered
+    /// under its name, so a term is never lowered under a definition other
+    /// than the one the checked expression API authenticated it against.
+    pub(super) datatype_definitions: crate::expr::dt::Definitions,
     /// Assumptions from check-sat-assuming commands (#5456).
     /// When non-empty, execute() calls check_sat_assuming instead of check_sat.
     pub(super) check_sat_assumptions: Vec<Term>,
+    /// Expr-to-Term memo keyed by node identity, scoped like the assertion
+    /// stack (see [`super::memo::TranslationMemo`]).
+    pub(super) translation_memo: super::memo::TranslationMemo,
 }
 
 impl ExecutionContext {
-    /// Create a new execution context with the specified logic.
-    pub(super) fn new(logic: Logic) -> Result<Self, ExecuteError> {
-        let solver = Solver::try_new(logic).map_err(|e| ExecuteError::SolverInit(e.to_string()))?;
+    /// Create a new execution context with the specified logic declaration.
+    pub(super) fn new(
+        logic: super::logic::Declaration,
+        program: &AYProgram,
+    ) -> Result<Self, ExecuteError> {
+        // An attested SMT-LIB name with no `Logic` variant is installed BY NAME
+        // so `ctx.logic()` is the DECLARED logic and category routing matches
+        // the SMT-LIB text lane; see `logic::Declaration`.
+        let solver = match logic {
+            super::logic::Declaration::Capability(logic) => Solver::try_new(logic),
+            super::logic::Declaration::SmtLibName(name) => Solver::try_new_with_smtlib_logic(&name),
+        }
+        .map_err(|e| ExecuteError::SolverInit(e.to_string()))?;
 
         // Timeout policy is explicit program input (`set-option :timeout`),
         // processed by the normal constraint path. Ambient environment cannot
@@ -40,11 +63,14 @@ impl ExecutionContext {
 
         Ok(Self {
             solver,
+            retain_assertion_sources: super::assertion_source::program_requests_proofs(program),
             translation_state: TranslationState::new(),
             bound_var_scopes: Vec::new(),
             get_value_terms: Vec::new(),
             declared_datatypes: BTreeMap::new(),
+            datatype_definitions: crate::expr::dt::Definitions::new(),
             check_sat_assumptions: Vec::new(),
+            translation_memo: super::memo::TranslationMemo::new(),
         })
     }
 

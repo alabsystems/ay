@@ -25,7 +25,9 @@
 //! - Z3: `reference/z3/src/sat/smt/q_solver.cpp:143-148`
 //! - Design: the development design notes
 
+mod boolean_equality;
 mod finite_domain;
+pub(crate) use boolean_equality::scoped_definition_split;
 pub(crate) use finite_domain::{
     bounded_expansion_grounds_all_quantifiers, derived_bound_unlocks_expansion,
     expand_finite_domain_subterms, finite_domain_expand_with_instances,
@@ -352,6 +354,13 @@ fn rewrite_nnf_with_skolem(
             // Positive forall keeps universal scope. Recurse so nested existentials
             // can build Skolem functions from the visible universal environment.
             TermData::Forall(vars, body, triggers) if positive => {
+                // A predicate definition keeps its Boolean `=` whole unless
+                // the solve publishes without a proof (#iff-split-definition).
+                if boolean_equality::keeps_definitions_whole()
+                    && boolean_equality::is_quantified_definition(terms, &vars, body)
+                {
+                    return term;
+                }
                 let extended_env = extend_universal_env(universal_env, &vars);
                 let new_body =
                     rewrite_nnf_with_skolem(terms, body, true, &extended_env, provenance);
@@ -411,6 +420,15 @@ fn rewrite_nnf_with_skolem(
                 } else {
                     terms.mk_and(vec![lhs, rhs])
                 }
+            }
+
+            // A Boolean `=` with a quantifier on either side (#iff-split), and
+            // no quantifier alternation inside it (#iff-split-alternation).
+            TermData::App(ref sym, ref args)
+                if boolean_equality::splits_without_alternation(terms, sym, args) =>
+            {
+                let (a, b) = (args[0], args[1]);
+                boolean_equality::rewrite(terms, a, b, positive, universal_env, provenance)
             }
 
             // ITE is conservative: keep the condition opaque, but rewrite branches.

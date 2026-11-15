@@ -72,6 +72,8 @@
 use super::*;
 use std::sync::OnceLock;
 
+mod decision;
+
 /// Cached hybrid trip-wire configuration for the relevancy brancher.
 #[derive(Clone, Copy)]
 struct RelevancyConfig {
@@ -294,44 +296,11 @@ impl Solver {
             .collect()
     }
 
-    /// Pick the next decision restricted to the relevancy frontier (Scheme A).
-    ///
-    /// Syncs the INCREMENTAL frontier (`relevancy_frontier.rs`) and defers to
-    /// the existing `pick_domain_restricted_decision`. Returns `None` when the
-    /// frontier is empty — the partial assignment satisfies every live clause,
-    /// i.e. it is a model (re-verified by the always-on model gate before SAT is
-    /// reported).
-    ///
-    /// Returning `None` here is the SAT signal, exactly as the IC3 domain path
-    /// (`pick_domain_restricted_decision` returning `None`) is.
-    ///
-    /// The frontier handed to the picker is EXACTLY the set the from-scratch
-    /// walk produced (`fill_relevancy_frontier`, kept below as the reference and
-    /// cross-checked by `debug_assert_relevancy_frontier_exact`), so which
-    /// variable is decided is unchanged.
-    pub(super) fn pick_relevancy_frontier_decision(&mut self) -> Option<Variable> {
-        // Take the frontier out so the sync (which needs `&self` for the arena,
-        // trail and vals) and the domain picker (which needs `&mut self`) can
-        // both run without aliasing a `self` field.
-        let mut frontier = std::mem::take(&mut self.relevancy_frontier);
-        let any_relevant = frontier.sync(self);
-        #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
-        if frontier.take_debug_check() {
-            self.debug_assert_relevancy_frontier_exact(frontier.buf(), any_relevant);
-        }
-        let result = if any_relevant {
-            self.pick_domain_restricted_decision(frontier.buf())
-        } else {
-            // Empty frontier => every live clause has a true literal => SAT.
-            None
-        };
-        self.relevancy_frontier = frontier;
-
+    fn note_relevancy_selection(&mut self, result: Option<Variable>) {
         if result.is_some() {
             let first = self.relevancy_decisions == 0;
             self.relevancy_decisions += 1;
             if first && relevancy_config().verbose {
-                // One-line engage marker (--sat-relevancy) for observability.
                 ay_core::safe_eprintln!(
                     "[relevancy] engaged: conflicts={} decisions={} num_vars={}",
                     self.num_conflicts,
@@ -340,7 +309,6 @@ impl Solver {
                 );
             }
         }
-        result
     }
 
     /// EXACTNESS PIN at the UNASSIGNMENT FOLD (#relevancy-frontier-incremental).
@@ -359,10 +327,24 @@ impl Solver {
     /// of a rebuild.
     #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
     pub(super) fn debug_assert_relevancy_frontier_exact_after_fold(&mut self) {
+        self.debug_assert_relevancy_frontier_exact_after_fold_with(&mut Vec::new());
+    }
+
+    /// The counted backtrack policy supplies its preadmitted reference storage.
+    #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+    pub(super) fn debug_assert_relevancy_frontier_exact_after_fold_with(
+        &mut self,
+        reference: &mut Vec<bool>,
+    ) {
         let mut frontier = std::mem::take(&mut self.relevancy_frontier);
         if frontier.take_debug_fold_check() {
             let any_relevant = frontier.debug_fold_to_current_strict(self);
-            self.debug_assert_relevancy_frontier_exact(frontier.buf(), any_relevant);
+            frontier.debug_assert_members_exact();
+            self.debug_assert_relevancy_frontier_exact_with(
+                frontier.buf(),
+                any_relevant,
+                reference,
+            );
         }
         self.relevancy_frontier = frontier;
     }
@@ -380,9 +362,13 @@ impl Solver {
     /// relevancy-frontier-invariants` and on a bounded prefix otherwise (see
     /// `RelevancyFrontier::take_debug_check`).
     #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
-    fn debug_assert_relevancy_frontier_exact(&self, buf: &[bool], any_relevant: bool) {
-        let mut reference = Vec::new();
-        let reference_any = self.fill_relevancy_frontier(&mut reference);
+    fn debug_assert_relevancy_frontier_exact_with(
+        &self,
+        buf: &[bool],
+        any_relevant: bool,
+        reference: &mut Vec<bool>,
+    ) {
+        let reference_any = self.fill_relevancy_frontier(reference);
         assert_eq!(
             any_relevant, reference_any,
             "BUG: incremental relevancy frontier disagrees on emptiness \
@@ -433,7 +419,7 @@ impl Solver {
     /// `buf` is passed by `&mut` (a caller-owned local, never a `self` field) so
     /// the clause walk can hold `&self` without a borrow conflict.
     #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
-    fn fill_relevancy_frontier(&self, buf: &mut Vec<bool>) -> bool {
+    pub(super) fn fill_relevancy_frontier(&self, buf: &mut Vec<bool>) -> bool {
         buf.clear();
         buf.resize(self.num_vars, false);
         let lifecycle_len = self.var_lifecycle.len();

@@ -49,16 +49,23 @@ const LETLEAK_WALL3_DRIVER_QUERY: &str = r#"
 (check-sat)
 "#;
 
-/// #letleak wall 3, the self-check half: `--self-check` demands independently
-/// verified truth, not the exported Alethe document, so a current checked
-/// SAT-refutation sidecar for the exact query publishes `unsat` even while
-/// the raw export still carries a residual trust step. This is the CLI's
-/// exact wiring: `set_self_check` + `set_mandatory_proof_collection`.
+/// The driver query with `bv2nat` spelled `ubv_to_int`, the SMT-LIB 2.7 name
+/// AY elaborates to the same term. `--self-check` claims an external-style
+/// check, and pinned Carcara defines only `ubv_to_int`, so the verbatim
+/// spelling is withheld (`self_check_withholds_letleak_unsat_carcara_cannot_parse`).
+#[cfg(feature = "proof-checker")]
+fn letleak_wall3_query_in_carcara_spelling() -> String {
+    LETLEAK_WALL3_DRIVER_QUERY.replace("(bv2nat ", "(ubv_to_int ")
+}
+
+/// Self-check accepts the checked refutation for the exact original query.
+/// This is the CLI's collection-only wiring: `set_self_check` followed by
+/// `set_mandatory_proof_collection`.
 #[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn self_check_publishes_letleak_unsat_on_checked_sat_refutation_authority() {
-    let commands = parse(LETLEAK_WALL3_DRIVER_QUERY).unwrap();
+    let commands = parse(&letleak_wall3_query_in_carcara_spelling()).unwrap();
     let mut exec = Executor::new();
     exec.set_self_check(true);
     exec.set_mandatory_proof_collection();
@@ -68,22 +75,72 @@ fn self_check_publishes_letleak_unsat_on_checked_sat_refutation_authority() {
     assert_eq!(outputs, vec!["unsat"]);
 }
 
-/// The dual ruling: an EXPLICIT artifact demand (`--proof`/`:produce-proofs`)
-/// promises the translated document itself, so the residual trust step keeps
-/// withholding `unsat` — the independent certification lanes must not launder
-/// a hole-bearing artifact past a caller who asked for that artifact.
+/// An explicit artifact demand must publish the complete translated proof.
+/// Authored quantified roots and ground literal spellings now have explicit
+/// Alethe derivations, independently replayed against the original query.
+///
+/// Without `--self-check`: the verbatim query spells `bv2nat`, which pinned
+/// Carcara does not define, so a lane claiming an external-style check
+/// withholds it (`self_check_withholds_letleak_unsat_carcara_cannot_parse`),
+/// and the document discloses that surface instead. The `ubv_to_int` spelling
+/// is no substitute here: the printer spells the elaborated conversion
+/// `bv2nat`, so the `and_pos` conjunct no longer matches its authored source
+/// and the export is refused (measured; the proof-side vocabulary follow-up).
 #[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
-fn explicit_proof_demand_still_withholds_letleak_unsat() {
+fn explicit_proof_demand_exports_complete_letleak_unsat() {
     let commands = parse(LETLEAK_WALL3_DRIVER_QUERY).unwrap();
     let mut exec = Executor::new();
-    exec.set_self_check(true);
     exec.set_produce_proofs(true);
 
     let outputs = exec.execute_all(&commands).unwrap();
 
-    assert_eq!(outputs, vec!["unknown"]);
+    assert_eq!(outputs, vec!["unsat"]);
+    assert!(exec
+        .last_unsat_proof_carcara_surface()
+        .and_then(|surface| surface.unsupported_reason().map(str::to_string))
+        .is_some_and(|reason| reason.contains("`bv2nat`")));
+    assert!(!exec.unsat_proof_has_known_wire_gap());
+    let wire = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("the exact query retains its proof")
+        .expect("the authored proof must be exportable");
+    assert!(!wire.contains(":rule hole"), "{wire}");
+    assert!(!wire.contains(":rule trust"), "{wire}");
+    assert_eq!(exec.get_proof(), wire);
+}
+
+/// The verbatim targo spelling: its problem uses `bv2nat`, which pinned
+/// Carcara does not define, so `--self-check` withholds the UNSAT and names
+/// that surface, both in the CLI's collection-only wiring and beside an
+/// explicit artifact demand (the combination the explicit-demand test used
+/// before). Before the certificate surface read the authored problem it was
+/// disclosed `supported` and published.
+#[cfg(feature = "proof-checker")]
+#[test]
+#[timeout(120000)]
+fn self_check_withholds_letleak_unsat_carcara_cannot_parse() {
+    let commands = parse(LETLEAK_WALL3_DRIVER_QUERY).unwrap();
+    for explicit_demand in [false, true] {
+        let mut exec = Executor::new();
+        exec.set_self_check(true);
+        if explicit_demand {
+            exec.set_produce_proofs(true);
+        } else {
+            exec.set_mandatory_proof_collection();
+        }
+
+        let outputs = exec.execute_all(&commands).unwrap();
+
+        assert_eq!(
+            outputs,
+            vec!["unknown"],
+            "explicit demand: {explicit_demand}"
+        );
+        let detail = exec.unknown_detail().unwrap_or_default();
+        assert!(detail.contains("`bv2nat`"), "{detail}");
+    }
 }
 
 /// The default text lane (best-effort synthesized certificate) publishes the

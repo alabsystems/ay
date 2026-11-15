@@ -4,24 +4,33 @@
 
 //! UNSAT proof orchestration and API; checking, synthesis, resolution, and rewriting live in focused siblings.
 
+pub(in crate::executor) mod assembly_observations;
+mod authored_activated_equality_refutation;
 mod authored_array_row1;
 mod authored_array_row_value;
+mod authored_bv_bitblast_refutation;
 mod authored_bv_high_zero_refutation;
 mod authored_bv_lia_refutation;
 mod authored_cascade;
 mod authored_collection_subset;
+mod authored_complementary_roots;
 mod authored_congruence;
 mod authored_conjunct_eval;
 mod authored_conjunct_leaf;
+mod authored_conjunction_rehome;
 mod authored_consequence_replay;
 mod authored_datatype;
 mod authored_divisibility;
 mod authored_equality_closure;
+mod authored_exists_bridge_chain;
+mod authored_expansion_certificate;
+mod authored_fold_identity;
 mod authored_forall;
 mod authored_forall_inst_conflict;
 mod authored_forall_inst_equality;
 mod authored_forall_substitution;
 mod authored_forall_witness;
+mod authored_ground_closure;
 mod authored_guarded_linear;
 mod authored_helpers;
 mod authored_linear;
@@ -29,16 +38,20 @@ mod authored_linear_subset;
 mod authored_negated_conjunct_bridge;
 mod authored_negated_exists;
 mod authored_negated_exists_ground_inst;
+mod authored_negated_exists_witness_hints;
 mod authored_nested_forall;
 mod authored_nested_forall_search;
+mod authored_shared_tautology;
 mod authored_store_permutation;
 mod authored_string_length;
 mod authored_string_word_identity;
+mod bool_bv_typing;
 mod build_unsat_assembly;
 mod build_unsat_finalize;
 mod bv_bitblast_collapse;
 mod bv_identity_promotion;
 mod bvand_commutative_congruence;
+mod canonical_surface_export;
 mod check;
 mod collection_axiom_promotion;
 mod congruence_explanation;
@@ -47,6 +60,7 @@ mod conjunct_decomposition_leaf;
 mod conjunct_decomposition_leaf_fragment;
 mod consequence_replay_budget;
 mod contextual_array_row2;
+mod corroboration;
 mod decline;
 mod double_negation;
 mod emission_budget;
@@ -78,14 +92,29 @@ mod minted_definition_leaf_fragment;
 mod minted_definition_leaf_mint;
 mod packed_boolean_tautology;
 mod packed_euf_reordering;
+mod problem_scope_export;
+pub(super) mod problem_surface;
+mod proxy_renaming;
 mod reconstruction_fallbacks;
 mod rewritten_assertion_bridge;
 mod rewritten_assertion_bridge_fragment;
 mod rewritten_nonequality_bridge;
 mod surface_bv_rebuild;
 mod terminal_trust;
+mod unbounded_census;
+mod unrewritten_authored_replay;
 
+pub use crate::executor::proof_repair::proof_trust_surgery_surface_audit::SurfaceSourceRefusal;
+pub use crate::executor::proof_trust_surgery_provenance::CanonicalWorkRefusal;
 use authored_cascade::RepairEntry;
+pub(in crate::executor) use authored_consequence_replay::{
+    ClausalInstanceRecord, ClausalLiteral, ExpansionStep, NegatedExistsDual, QuantifierJoinRecord,
+};
+#[cfg(test)]
+pub(crate) use authored_expansion_certificate::{
+    set_expansion_cert_mutation, ExpansionCertMutation,
+};
+pub(in crate::executor) use authored_expansion_certificate::{CertDecline, ExpansionCertReport};
 use authored_helpers::{
     collect_select_terms_local, pair_other_side_local, DerivedUnit, GroundBinding,
     StringLengthFactProvenance, StringRelevantSubterms,
@@ -99,9 +128,15 @@ use ay_frontend::command::{
     Constant as FrontendConstant, Index as FrontendIndex, Term as FrontendTerm,
 };
 use ay_frontend::{Command, CommandResult, OptionValue};
-use ay_proof::{export_alethe_with_problem_scope_and_overrides, AlethePrintError};
+use ay_proof::AlethePrintError;
 use bvand_commutative_congruence::add_bvand_commutative_congruence_proof;
-pub use decline::ProofDeclineMechanism;
+pub use corroboration::{
+    CorroborationMethod, CorroborationSource, UnsatCorroboration, UnsatEvidence, UnsatEvidenceLevel,
+};
+pub use decline::{
+    ProofDeclineMechanism, SatReconstructionOutcome, SatReconstructionRecord, SemanticTokenCensus,
+    SemanticTokenSource, TrustClosureCensus,
+};
 use emission_budget::DEFAULT_ALETHE_EMISSION_WORK_BUDGET;
 use euf_congruence_finalize::finalize_euf_congruence_split;
 use num_bigint::BigInt;
@@ -110,16 +145,20 @@ use surface_bv_rebuild::{
     build_qfbv_select_pterm, match_and_self_eq_contradiction, match_and_true_eq_contradiction,
     match_eq_negation, parse_rendered_assertion,
 };
-
-use crate::executor_types::SolveResult;
+pub(in crate::executor) use unbounded_census::{census_canonical_roots, override_collection_root};
+pub use unbounded_census::{
+    CanonicalRootShape, OverridePlanCensus, OverridePlanExit, ParsedRootShape, SourceRootCensus,
+    UnboundedCensus,
+};
 
 use super::Executor;
+use crate::executor_types::SolveResult;
 pub(in crate::executor) use consequence_replay_budget::ConsequenceReplayProbeBudget;
 pub(in crate::executor) use finite_enum::CheckedFiniteEnumPigeonholeProof;
 use finite_enum::MAX_RENDER_WORK as MAX_FINITE_ENUM_RENDER_WORK;
 
 impl Executor {
-    fn promote_semantically_checked_bv_lemmas(terms: &TermStore, proof: &mut Proof) {
+    fn promote_semantically_checked_bv_lemmas(&self, proof: &mut Proof) {
         let mut proof_producer_attempts = 0_usize;
         for step in &mut proof.steps {
             let ProofStep::TheoryLemma {
@@ -134,7 +173,7 @@ impl Executor {
             if *kind != TheoryLemmaKind::Generic {
                 continue;
             }
-            if ay_proof::bv_bitblast_requires_proof_producer(terms, clause) {
+            if ay_proof::bv_bitblast_requires_proof_producer(&self.ctx.terms, clause) {
                 proof_producer_attempts += 1;
                 if proof_producer_attempts > ay_proof::MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF {
                     // Leave the lemma Generic: strict checking will reject it.
@@ -144,7 +183,7 @@ impl Executor {
                     continue;
                 }
             }
-            if !ay_proof::recognize_bv_bitblast(terms, clause) {
+            if !self.recognize_bv_bitblast_until_stopped(clause) {
                 continue;
             }
             *theory = "bv".to_string();
@@ -2439,6 +2478,12 @@ impl Executor {
     ///   assume      (not (= (sel_i (C a_0 .. a_n)) a_i))   the input hypothesis
     ///   lemma       (= (sel_i (C a_0 .. a_n)) a_i)          strict-validated
     ///   resolution  □
+    /// in the equality's AUTHORED orientation: `(not (= a_i (sel_i (C ..))))`
+    /// is rebuilt value first, so the `assume` is the problem's own assertion
+    /// and the lemma is the reversed projection (the Alethe printer spells it
+    /// `dt_project` then `symm` in the Clean dialect). Rebuilding it selector
+    /// first, as this did until 2026-10-02, printed an `assume` the problem
+    /// does not state (`foreign_assumes=yes`).
     /// The constructor application and raw selector term the fold erased are
     /// rebuilt via `mk_app` (no fold) at the constructor's / selector's declared
     /// return sorts. SOUND + fail-closed: the candidate lemma is gated through
@@ -2462,7 +2507,8 @@ impl Executor {
             return;
         }
         for asrt in &parsed {
-            let Some((ctor, arg_syms, sel, val)) = match_dt_selector_negation(asrt) else {
+            let Some((ctor, arg_syms, sel, val, selector_side)) = match_dt_selector_negation(asrt)
+            else {
                 continue;
             };
             let Some(arg_ids) = arg_syms
@@ -2539,10 +2585,11 @@ impl Executor {
                 self.ctx
                     .terms
                     .mk_app(Symbol::named(&selector_identity), [ctor_term], sel_sort);
-            let eq_t = self
-                .ctx
-                .terms
-                .mk_app(Symbol::named("="), [sel_term, val_id], Sort::Bool);
+            let sides = match selector_side {
+                EqualitySide::Left => [sel_term, val_id],
+                EqualitySide::Right => [val_id, sel_term],
+            };
+            let eq_t = self.ctx.terms.mk_app(Symbol::named("="), sides, Sort::Bool);
             // Gate on the checker's own recognizer: commit only if strict mode
             // will re-validate this exact lemma (no classifier/checker drift).
             if !ay_proof::recognize_datatype_selector_project(&self.ctx.terms, &[eq_t], &selectors)
@@ -3039,7 +3086,10 @@ impl Executor {
         // The division rewrite can leave a multi-step terminal derivation whose
         // first leaf is still Trust (auxiliary range fact + authored equality +
         // Farkas closure), so this is deliberately not keyed only on the legacy
-        // single-empty-trust shape. Do not replace an already certified proof.
+        // single-empty-trust shape. A whole-query `BvLiaTautology` is native
+        // checked evidence, but it still renders as a wire hole; when this
+        // exact range shape is present, prefer the renderable checker-owned
+        // certificate below. Every other already-certified proof is left alone.
         let has_untrusted_step = proof.steps.iter().any(|step| {
             matches!(
                 step,
@@ -3047,7 +3097,8 @@ impl Executor {
                     rule: AletheRule::Trust | AletheRule::Hole,
                     ..
                 }
-            ) || matches!(step, ProofStep::TheoryLemma { kind, .. } if kind.is_trust())
+            ) || matches!(step, ProofStep::TheoryLemma { kind, .. }
+                if kind.is_trust() || matches!(kind, TheoryLemmaKind::BvLiaTautology))
         });
         if !has_untrusted_step {
             return;
@@ -3505,7 +3556,7 @@ impl Executor {
         });
 
         // ── (5) WHOLE-PROOF revert gate. ──
-        match ay_proof::check_proof_strict(proof, &self.ctx.terms) {
+        match self.check_proof_strict_until_stopped(proof) {
             Ok(q) if q.trust_count == 0 => { /* keep the reconstruction */ }
             _ => {
                 proof.steps = original_steps;
@@ -3892,9 +3943,18 @@ impl Executor {
                 continue;
             }
 
+            // The command is an elaboration vehicle here, not a check: this
+            // runs on the LIVE context in the middle of a public decision,
+            // so the check-sat-time definitional-forall pass that command
+            // carries (#defmacro-named-preuse) is held off. Left to fire, it
+            // re-elaborates the stack and advances the source revision under
+            // the pending verdict, and the certification funnel then
+            // withdraws a computed UNSAT as decided over a stale context.
             let Some(Some(CommandResult::CheckSatAssuming(term_ids))) = self
                 .ctx
-                .process_command(&Command::CheckSatAssuming(vec![parsed.clone()]))
+                .with_definitional_check_sat_pass_held(|ctx| {
+                    ctx.process_command(&Command::CheckSatAssuming(vec![parsed.clone()]))
+                })
                 .ok()
             else {
                 continue;
@@ -3949,7 +4009,7 @@ impl Executor {
     /// keep a byte-identical rendering, so no currently-checking proof can
     /// move. (In practice the two agree: a field term only acquires a source
     /// override when the input literally wrote `(left s_)`.)
-    fn proof_export_term_overrides(
+    pub(in crate::executor) fn proof_export_term_overrides(
         &self,
     ) -> Option<ay_core::kani_compat::DetHashMap<TermId, String>> {
         let fields = self.ctx.dt_field_surface_overrides();
@@ -3969,6 +4029,10 @@ impl Executor {
     ///
     /// Returns a proof that the assertions are unsatisfiable in Alethe format.
     pub(super) fn get_proof(&self) -> String {
+        self.in_alethe_dialect(|| self.get_proof_in_dialect())
+    }
+
+    fn get_proof_in_dialect(&self) -> String {
         // Live SMT enablement cannot relabel an old solve-time proof request.
         if !self.is_producing_proofs() {
             return "(error \"proof generation is not enabled, set :produce-proofs to true\")"
@@ -4008,13 +4072,9 @@ impl Executor {
                                     .to_string()
                             })
                         } else {
-                            let overrides = self.proof_export_term_overrides();
-                            export_alethe_with_problem_scope_and_overrides(
-                                proof,
-                                &self.ctx.terms,
-                                &scope,
-                                overrides.as_ref(),
-                            )
+                            // The same authored surfaces as the file-backed
+                            // export (#assume-boundary).
+                            self.get_proof_alethe_with_authored_surfaces(proof, &scope)
                         }
                     }
                     None => "(error \"proof was not generated\")".to_string(),
@@ -4032,64 +4092,32 @@ impl Executor {
         }
     }
 
-    /// Export the last proof through the same problem-scoped Alethe path used by
-    /// `(get-proof)`.
+    /// The external-recheck surface verdict of the document
+    /// [`Self::try_export_last_proof_alethe_for_problem_scope`] renders — or,
+    /// with `canonical`, its canonical-spelling twin — computed on the SAME
+    /// proof and override table that render uses, so the disclosure describes
+    /// the artifact's own bytes.
     ///
-    /// File-backed SMT proof output must not emit declarations for symbols that
-    /// are already declared by the SMT-LIB problem. External checkers such as
-    /// Carcara read the problem file separately and expect the proof file to
-    /// contain only proof commands.
+    /// `None` exactly when the corresponding export declines before rendering
+    /// (no retained proof, a suppressed reconstruction, a stale finite-enum
+    /// surface).
     #[must_use]
-    pub fn try_export_last_proof_alethe_for_problem_scope(
+    pub(crate) fn carcara_surface_for_last_export(
         &self,
-    ) -> Option<Result<String, AlethePrintError>> {
+        canonical: bool,
+    ) -> Option<ay_proof::CarcaraSurface> {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
         let proof = self.last_proof_with_authenticated_alethe_surface()?;
-        // #A2b: `proof_reconstruction_step_budget` is set ONLY for the
-        // synthesized-default certificate (never for explicit `--proof`,
-        // `--strict-proofs`, `--self-check`, or `:produce-proofs`). Extend
-        // that contract over Alethe EMISSION as well: rendering work is
-        // capped so a seconds-fast UNSAT verdict is never followed by
-        // minutes of certificate materialization (QF_ALIA pp-family). On
-        // exhaustion the caller prints the honest "no proof certificate
-        // emitted" warning; the verdict is already out and unchanged.
-        if self.last_proof_has_finite_enum_sidecar() {
-            let Some(overrides) = self.finite_enum_surface_overrides_for_proof(proof) else {
-                return Some(Err(AlethePrintError::UnavailableAuthenticatedSurface {
-                    reason: "the finite-enum proof surface is absent or stale",
-                }));
-            };
-            let Some(scope) = self.proof_export_scope_assertions_for(proof) else {
-                return Some(Err(AlethePrintError::UnavailableAuthenticatedSurface {
-                    reason: "the finite-enum proof scope is absent or stale",
-                }));
-            };
-            return Some(
-                ay_proof::try_export_alethe_with_problem_scope_overrides_and_budget(
-                    proof,
-                    &self.ctx.terms,
-                    &scope,
-                    Some(overrides),
-                    Some(MAX_FINITE_ENUM_RENDER_WORK),
-                ),
-            );
-        }
-        let emission_budget = self
-            .proof_reconstruction_step_budget
-            .map(|_| DEFAULT_ALETHE_EMISSION_WORK_BUDGET);
-        let scope = self.proof_export_scope_assertions_for(proof)?;
-        let overrides = self.proof_export_term_overrides();
-        Some(
-            ay_proof::try_export_alethe_with_problem_scope_overrides_and_budget(
-                proof,
-                &self.ctx.terms,
-                &scope,
-                overrides.as_ref(),
-                emission_budget,
-            ),
-        )
+        let overrides = if self.last_proof_has_finite_enum_sidecar() {
+            Some(self.finite_enum_surface_overrides_for_proof(proof)?.clone())
+        } else if canonical {
+            self.canonical_export_term_overrides()
+        } else {
+            self.proof_export_term_overrides()
+        };
+        Some(self.problem_and_proof_surface(proof, overrides.as_ref()))
     }
 
     /// Exact SMT-LIB problem bytes paired with the last exported Alethe proof.
@@ -4130,10 +4158,65 @@ impl Executor {
         &self,
         out: &mut W,
     ) -> Option<Result<(), ay_proof::AletheStreamError>> {
+        self.in_alethe_dialect(|| self.export_problem_scope_to_in_dialect(out))
+    }
+
+    fn export_problem_scope_to_in_dialect<W: std::io::Write>(
+        &self,
+        out: &mut W,
+    ) -> Option<Result<(), ay_proof::AletheStreamError>> {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
         let proof = self.last_proof_with_authenticated_alethe_surface()?;
+        self.export_proof_problem_scope_to_in_dialect(proof, out)
+    }
+
+    /// The problem-scoped document of the proof INSTALLED for an `unsat`
+    /// this solve has not published yet, rendered exactly as
+    /// [`Self::try_export_last_proof_alethe_for_problem_scope_to`] will render
+    /// it once the verdict is out: a route that may publish only with its
+    /// document (the QSAT route's evidence gate) reads it here first.
+    #[must_use]
+    pub(in crate::executor) fn try_export_installed_proof_alethe_to<W: std::io::Write>(
+        &self,
+        out: &mut W,
+    ) -> Option<Result<(), ay_proof::AletheStreamError>> {
+        if self.last_unsat_proof_reconstruction_suppressed {
+            return None;
+        }
+        let proof = self.last_proof.as_ref()?;
+        if !self.proof_has_authenticated_alethe_surface(proof) {
+            return None;
+        }
+        self.in_alethe_dialect(|| self.export_proof_problem_scope_to_in_dialect(proof, out))
+    }
+
+    /// Whether pinned carcara can parse the problem beside the installed
+    /// proof's document (the surface verdict of
+    /// [`Self::carcara_surface_for_last_export`], read before publication).
+    #[must_use]
+    pub(in crate::executor) fn installed_proof_carcara_surface_supported(&self) -> bool {
+        let Some(proof) = self.last_proof.as_ref() else {
+            return false;
+        };
+        let overrides = if self.last_proof_has_finite_enum_sidecar() {
+            match self.finite_enum_surface_overrides_for_proof(proof) {
+                Some(overrides) => Some(overrides.clone()),
+                None => return false,
+            }
+        } else {
+            self.proof_export_term_overrides()
+        };
+        self.problem_and_proof_surface(proof, overrides.as_ref())
+            .is_supported()
+    }
+
+    fn export_proof_problem_scope_to_in_dialect<W: std::io::Write>(
+        &self,
+        proof: &Proof,
+        out: &mut W,
+    ) -> Option<Result<(), ay_proof::AletheStreamError>> {
         // #A2b: same emission-budget contract as the String variant above.
         if self.last_proof_has_finite_enum_sidecar() {
             let Some(overrides) = self.finite_enum_surface_overrides_for_proof(proof) else {
@@ -4166,16 +4249,37 @@ impl Executor {
             .map(|_| DEFAULT_ALETHE_EMISSION_WORK_BUDGET);
         let scope = self.proof_export_scope_assertions_for(proof)?;
         let overrides = self.proof_export_term_overrides();
-        Some(
-            ay_proof::try_export_alethe_with_problem_scope_overrides_and_budget_to(
-                out,
-                proof,
-                &self.ctx.terms,
-                &scope,
-                overrides.as_ref(),
-                emission_budget,
-            ),
-        )
+        let surfaces = self.authored_export_surfaces();
+        let channels = surfaces.channels();
+        crate::executor::unsat_cert::probe_cert_reject(|| {
+            // Observe the actual handoff, without rerunning the surface planner
+            // or installing any diagnostic rendering into its authority tables.
+            let overridden_roots = scope
+                .iter()
+                .filter(|root| {
+                    overrides
+                        .as_ref()
+                        .is_some_and(|map| map.contains_key(*root))
+                })
+                .count();
+            format!(
+                "Alethe export handoff: scope_roots={} raw_overrides={} overridden_scope_roots={} negation_shells={} nullary_definitions={}",
+                scope.len(),
+                overrides.as_ref().map_or(0, |map| map.len()),
+                overridden_roots,
+                channels.negation_shell_assumes.map_or(0, |map| map.len()),
+                channels.nullary_definitions.map_or(0, |map| map.len()),
+            )
+        });
+        Some(ay_proof::try_export_alethe_with_authored_surfaces_to(
+            out,
+            proof,
+            &self.ctx.terms,
+            &scope,
+            overrides.as_ref(),
+            channels,
+            emission_budget,
+        ))
     }
 
     /// Problem-declared symbol names for the Alethe round-trip self-check.
@@ -4209,6 +4313,30 @@ impl Executor {
     /// exact parsed source form; check-sat-assuming adds another authored
     /// source. Derived temporary constraints are intentionally absent.
     pub(crate) fn proof_export_scope_assertions(&self) -> Vec<TermId> {
+        self.proof_export_scope_assertions_tracking_drop().0
+    }
+
+    /// [`Self::proof_export_scope_assertions`], plus whether an UNAUTHORED
+    /// canonical `false` premise was RETAINED OUT of the returned scope.
+    ///
+    /// The retain is a premise-AUTHORITY rule (an `assume false` the author
+    /// never wrote proves nothing about the input), but it also makes the
+    /// scope a PROPER SUBSET of the authored problem: preprocessing folds a
+    /// refuted authored assertion to the canonical `false` term, and that
+    /// premise — which is what makes the query unsatisfiable — is then
+    /// absent. Every ACCEPTING consumer wants exactly that subset. The
+    /// REJECTING forged-UNSAT guard does not: its inference "a fresh solve of
+    /// this set returns a DEFINITIVE SAT, therefore the UNSAT is forged" is
+    /// valid only over the whole query, and a proper subset of an
+    /// unsatisfiable set is routinely satisfiable. Measured on
+    /// `sfz/min/m494.smt2` (`(assert (select ((as const (Array (_ BitVec 32)
+    /// Bool)) false) #x00000003))` plus two satisfiable assertions): the
+    /// guard re-decided the two survivors, correctly found them satisfiable,
+    /// and destroyed a correct refutation that z3, the same binary at
+    /// `--rigor fast`, and the previous commit all publish as `unsat`.
+    pub(in crate::executor) fn proof_export_scope_assertions_tracking_drop(
+        &self,
+    ) -> (Vec<TermId>, bool) {
         let mut scope = self.proof_problem_assertions();
         for assertion in self.proof_original_problem_assertions() {
             if !scope.contains(&assertion) {
@@ -4234,10 +4362,13 @@ impl Executor {
                 }
             }
         }
+        let mut dropped_unauthored_false = false;
         if !self.boolean_constant_premises_authored().1 {
+            let before = scope.len();
             scope.retain(|&term| term != self.ctx.terms.false_term());
+            dropped_unauthored_false = scope.len() != before;
         }
-        scope
+        (scope, dropped_unauthored_false)
     }
 
     /// Admit one raw term reconstructed from a parsed source assertion as an
@@ -4278,14 +4409,14 @@ impl Executor {
     ///
     /// Callers must have matched the term against a PARSED assertion of the
     /// problem and finished their exact recognizer gate before recording it.
-    /// `promote_dt_selector_collapse`, the one caller today, holds exactly that
+    /// `promote_dt_selector_collapse`, the datatype caller, holds exactly that
     /// fact for the raw negation it records: the shape came from
     /// `match_dt_selector_negation(asrt)` over a PARSED assertion, every member
     /// was resolved through the exact constructor->selector registry with full
     /// signatures (ambiguity rejected), and
     /// `ay_proof::recognize_datatype_selector_project` -- the strict checker's
     /// OWN recognizer -- accepted the lemma before the negation was interned.
-    /// Scoped to `crate::executor::proof` because the only callers are
+    /// Scoped to `crate::executor::proof`; its callers include
     /// `promote_dt_selector_collapse` and this tree's own regression tests --
     /// NOT because the module owns the ledgers. Both ledgers it appends to are
     /// shared executor state: `last_proof_raw_original_assertions` is taken,
@@ -4365,16 +4496,26 @@ impl Executor {
         )
     }
 
+    /// Whether preprocessing variable substitution is skipped for THIS solve:
+    /// proofs are being produced AND either the user's `:ay-proof-no-varsubst`
+    /// option is on or this executor is a consequence-replay proof probe
+    /// (`proof_probe_skips_varsubst`). The single consult point for both
+    /// preprocessing harness sites.
+    pub(in crate::executor) fn skip_varsubst_for_proofs(&self) -> bool {
+        self.produce_proofs_enabled()
+            && (self.proof_no_varsubst_enabled() || self.proof_probe_skips_varsubst)
+    }
+
     /// Check if strict proof checking is enabled (#4420).
     ///
     /// When `(set-option :check-proofs-strict true)` is set, the internal
     /// proof checker rejects `trust` and `hole` steps, requiring fully
     /// reconstructed proofs.
+    /// The option is read through
+    /// [`ay_frontend::Context::check_proofs_strict_requested`], the same read
+    /// the routes that never hand the script to an executor (CHC) use.
     pub(in crate::executor) fn strict_proofs_enabled(&self) -> bool {
-        matches!(
-            self.ctx.get_option("check-proofs-strict"),
-            Some(OptionValue::Bool(true))
-        )
+        self.ctx.check_proofs_strict_requested()
     }
 }
 
@@ -5491,8 +5632,10 @@ fn plan_euf_lia_value_conflict(terms: &mut TermStore, clause: &[TermId]) -> Opti
 /// A plan for the general EUF-chain + arithmetic-bridge conflict split
 /// (#ground-conflict-decomp, arm 1).
 ///
-/// The fused Generic clause carries 1–3 arithmetic comparison literals (either
+/// The fused Generic clause carries arithmetic comparison literals (either
 /// polarity) and otherwise only NEGATED equalities (undirected chain edges).
+/// Each bridge uses at most three comparisons; unused comparisons are restored
+/// by weakening, just like unused equality edges.
 /// The equalities entail `p = q` — for one arithmetic-atom side `p` and some
 /// clause term `q` — through at most ONE congruence lift plus a transitive
 /// chain (or a single direct edge), and that equality refutes the arithmetic
@@ -5525,7 +5668,7 @@ struct EufChainFarkasBridgePlan {
 
 /// Literal budget for the two #ground-conflict-decomp planners.
 const MAX_GROUND_CONFLICT_DECOMP_LITERALS: usize = 16;
-/// Candidate (start, sibling, value) probes for arm 1, per clause.
+/// Shared relation-subset and (start, sibling, value) probes for arm 1, per clause.
 const MAX_GROUND_CONFLICT_BRIDGE_PROBES: usize = 64;
 /// Maximum arithmetic literals joined into one Farkas bridge.
 const MAX_GROUND_CONFLICT_BRIDGE_RELS: usize = 3;
@@ -5549,7 +5692,6 @@ fn plan_euf_chain_farkas_bridge(
     // Partition: negated equalities are chain edges; arithmetic comparisons
     // (either polarity) join the Farkas bridge; anything else declines.
     let mut rel_lits: Vec<TermId> = Vec::new();
-    let mut rel_sides: Vec<TermId> = Vec::new();
     let mut edges: Vec<(TermId, TermId, TermId)> = Vec::new();
     for &lit in clause {
         let (inner, neg) = strip_not_local(terms, lit);
@@ -5560,17 +5702,7 @@ fn plan_euf_chain_farkas_bridge(
             }
         }
         if is_arith_cmp(terms, inner) {
-            if rel_lits.len() >= MAX_GROUND_CONFLICT_BRIDGE_RELS {
-                return None;
-            }
             rel_lits.push(lit);
-            if let Some((_, args)) = as_app_local(terms, inner) {
-                for &side in &args {
-                    if !rel_sides.contains(&side) {
-                        rel_sides.push(side);
-                    }
-                }
-            }
             continue;
         }
         return None;
@@ -5581,8 +5713,64 @@ fn plan_euf_chain_farkas_bridge(
         return None;
     }
 
+    let mut probes = MAX_GROUND_CONFLICT_BRIDGE_PROBES;
+    if rel_lits.len() <= MAX_GROUND_CONFLICT_BRIDGE_RELS {
+        // Preserve the existing search order and cost for the original shape.
+        return plan_euf_chain_farkas_bridge_relations(
+            terms,
+            clause,
+            &rel_lits,
+            &edges,
+            &mut probes,
+        );
+    }
+    // Larger clauses can contain redundant arithmetic guards. Search triples
+    // lazily: a smaller support may give the other relations zero coefficients.
+    // Charge preparation and every head/Farkas probe to ONE allowance, so a
+    // new subset never renews the work budget. Exhaustion still declines.
+    for first in 0..rel_lits.len() - 2 {
+        for second in first + 1..rel_lits.len() - 1 {
+            for third in second + 1..rel_lits.len() {
+                probes = probes.checked_sub(1)?;
+                let selected = [rel_lits[first], rel_lits[second], rel_lits[third]];
+                if let Some(plan) = plan_euf_chain_farkas_bridge_relations(
+                    terms,
+                    clause,
+                    &selected,
+                    &edges,
+                    &mut probes,
+                ) {
+                    return Some(plan);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Search one bounded relation set using the caller's remaining allowance.
+/// The full original clause stays available for exact weakening of unused
+/// premises. Only the outer planner owns the per-clause allowance.
+fn plan_euf_chain_farkas_bridge_relations(
+    terms: &mut TermStore,
+    clause: &[TermId],
+    rel_lits: &[TermId],
+    edges: &[(TermId, TermId, TermId)],
+    probes: &mut usize,
+) -> Option<EufChainFarkasBridgePlan> {
+    let mut rel_sides: Vec<TermId> = Vec::new();
+    for &lit in rel_lits {
+        let (inner, _) = strip_not_local(terms, lit);
+        if let Some((_, args)) = as_app_local(terms, inner) {
+            for &side in &args {
+                if !rel_sides.contains(&side) {
+                    rel_sides.push(side);
+                }
+            }
+        }
+    }
     let mut endpoints: Vec<TermId> = Vec::new();
-    for &(a, b, _) in &edges {
+    for &(a, b, _) in edges {
         if !endpoints.contains(&a) {
             endpoints.push(a);
         }
@@ -5598,7 +5786,6 @@ fn plan_euf_chain_farkas_bridge(
         }
     }
 
-    let mut probes = MAX_GROUND_CONFLICT_BRIDGE_PROBES;
     for &p in &rel_sides {
         // Case A: `p` participates in the equality graph directly.
         if endpoints.contains(&p) {
@@ -5606,20 +5793,17 @@ fn plan_euf_chain_farkas_bridge(
                 if q == p {
                     continue;
                 }
-                probes = probes.checked_sub(1)?;
-                let Some(path) = euf_chain_path(&edges, p, q) else {
+                *probes = probes.checked_sub(1)?;
+                let Some(path) = euf_chain_path(edges, p, q) else {
                     continue;
                 };
                 if path.len() == 1 {
                     // The single edge literal itself joins the bridge; no
                     // `eq_transitive` step is needed (a 1-edge chain is a
                     // degenerate clause the checker rejects).
-                    if let Some(plan) = finish_chain_bridge_plan(
-                        terms,
-                        clause,
-                        &rel_lits,
-                        BridgeHead::Edge(path[0]),
-                    ) {
+                    if let Some(plan) =
+                        finish_chain_bridge_plan(terms, clause, rel_lits, BridgeHead::Edge(path[0]))
+                    {
                         return Some(plan);
                     }
                     continue;
@@ -5627,7 +5811,7 @@ fn plan_euf_chain_farkas_bridge(
                 if let Some(plan) = finish_chain_bridge_plan(
                     terms,
                     clause,
-                    &rel_lits,
+                    rel_lits,
                     BridgeHead::Derived {
                         p,
                         q,
@@ -5666,7 +5850,7 @@ fn plan_euf_chain_farkas_bridge(
                     cong_plans.push((ai, bi, Vec::new()));
                     continue;
                 }
-                match euf_chain_path(&edges, ai, bi) {
+                match euf_chain_path(edges, ai, bi) {
                     Some(path) => cong_plans.push((ai, bi, path)),
                     None => {
                         positions_ok = false;
@@ -5682,11 +5866,11 @@ fn plan_euf_chain_farkas_bridge(
                 if q == p {
                     continue;
                 }
-                probes = probes.checked_sub(1)?;
+                *probes = probes.checked_sub(1)?;
                 let path = if q == u {
                     Vec::new()
                 } else {
-                    match euf_chain_path(&edges, u, q) {
+                    match euf_chain_path(edges, u, q) {
                         Some(path) => path,
                         None => continue,
                     }
@@ -5694,7 +5878,7 @@ fn plan_euf_chain_farkas_bridge(
                 if let Some(plan) = finish_chain_bridge_plan(
                     terms,
                     clause,
-                    &rel_lits,
+                    rel_lits,
                     BridgeHead::Derived {
                         p,
                         q,
@@ -5932,11 +6116,11 @@ fn emit_euf_chain_farkas_bridge(
 /// (#ground-conflict-decomp, arm 2).
 ///
 /// The Generic lemma is `¬(= L R) ∨ (= (select X x) (select Y x))` — flat or
-/// packed as one `or` unit — where one/both of `L`, `R` carry store chains,
-/// `x` is an integer numeral, and every store index is a DISTINCT integer
-/// numeral. The strict-checkable `ArrayRowChain` schema requires the
-/// positive `(= x i)` guard per skipped store; each guard is refuted by a
-/// solver-certified Farkas unit and resolved away, re-deriving the original.
+/// or-packed, each literal under AT MOST ONE `not` as the schema reads it —
+/// where one/both of `L`, `R` carry store chains, `x` is an integer numeral,
+/// and every store index is a DISTINCT integer numeral. The strict-checkable
+/// `ArrayRowChain` schema requires the positive `(= x i)` guard per skipped
+/// store, each refuted by a solver-certified Farkas unit and resolved away.
 struct RowChainUnderEqPlan {
     /// The packed `or` unit term (`None` for a flat two-literal clause).
     packed_or: Option<TermId>,
@@ -5974,7 +6158,7 @@ fn plan_array_row_chain_under_eq(
     let mut not_eq: Option<(TermId, TermId, TermId)> = None;
     let mut pos_eq: Option<(TermId, TermId, TermId)> = None;
     for &lit in &flat {
-        let (inner, neg) = strip_not_local(terms, lit);
+        let (inner, neg) = double_negation::strip_one_not(terms, lit);
         let (lhs, rhs) = decode_eq_local(terms, inner)?;
         if neg {
             if !matches!(terms.sort(lhs), Sort::Array(_)) || not_eq.is_some() {
@@ -6307,15 +6491,25 @@ fn match_row1_value_mismatch(
     None
 }
 
+/// Which side of an authored equality a term was written on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EqualitySide {
+    Left,
+    Right,
+}
+
 /// Match a datatype selector-projection negation `(not (= (sel (C a_0 .. a_n)) v))`
 /// — the selector applied to a constructor application, equated to a symbol —
-/// returning `(ctor_name, [arg_symbol], selector_name, value_symbol)`. The
-/// selector may sit on either side of the equality. Returns `None` for any other
+/// returning `(ctor_name, [arg_symbol], selector_name, value_symbol, side)`,
+/// `side` being where the selector application was written. The selector may
+/// sit on either side of the equality. Returns `None` for any other
 /// shape (fail-closed); only `Symbol` leaves are accepted so the names resolve to
 /// declared-constant `TermId`s. Whether `sel` genuinely projects the field holding
 /// `v` is NOT decided here — that is gated by the strict checker's recognizer in
 /// the caller, keyed on the constructor→selector registry.
-fn match_dt_selector_negation(asrt: &FrontendTerm) -> Option<(&str, Vec<&str>, &str, &str)> {
+fn match_dt_selector_negation(
+    asrt: &FrontendTerm,
+) -> Option<(&str, Vec<&str>, &str, &str, EqualitySide)> {
     let FrontendTerm::App(not_op, not_args) = asrt else {
         return None;
     };
@@ -6328,7 +6522,10 @@ fn match_dt_selector_negation(asrt: &FrontendTerm) -> Option<(&str, Vec<&str>, &
     if eq_op != "=" || eq_args.len() != 2 {
         return None;
     }
-    for (sel_i, val_i) in [(0usize, 1usize), (1, 0)] {
+    for (sel_i, val_i, side) in [
+        (0usize, 1usize, EqualitySide::Left),
+        (1, 0, EqualitySide::Right),
+    ] {
         let FrontendTerm::App(sel, sel_args) = &eq_args[sel_i] else {
             continue;
         };
@@ -6355,7 +6552,7 @@ fn match_dt_selector_negation(asrt: &FrontendTerm) -> Option<(&str, Vec<&str>, &
         let FrontendTerm::Symbol(val) = &eq_args[val_i] else {
             continue;
         };
-        return Some((ctor.as_str(), arg_syms, sel.as_str(), val.as_str()));
+        return Some((ctor.as_str(), arg_syms, sel.as_str(), val.as_str(), side));
     }
     None
 }
@@ -6747,6 +6944,11 @@ fn build_bool_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
 pub(in crate::executor) use check::StrictWalkMemo;
 #[cfg(all(test, feature = "proof-checker"))]
 use check::*;
+pub(in crate::executor) use terminal_trust::WireGapScreenDeclines;
+#[cfg(all(test, feature = "proof-checker"))]
+mod ground_conflict_bridge_tests;
+#[cfg(test)]
+mod scoped_premise_tests;
 #[cfg(test)]
 mod shadowed_store_ext_tests;
 #[cfg(test)]

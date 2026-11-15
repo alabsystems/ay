@@ -235,14 +235,35 @@ fn test_native_api_enum_initiation_bundle_recheck_strict() {
 /// proof is `assume, assume, TheoryLemma{kind: NraIntervalUnsat}, th_resolution`
 /// with `trust_count == 0` and `hole_count == 0`.
 ///
-/// WHAT DID NOT CHANGE — THE WIRE DOCUMENT. The Alethe printer has no spec rule
-/// name for an interval refutation, so `(get-proof)` still discloses
-/// `(step t2 ... :rule hole)`. Internal certification and the exported document
-/// therefore now DISAGREE, and that asymmetry is what this test pins from here
-/// on: the strict checker must succeed (or the NRA kernel silently regressed),
-/// AND the wire text must stay honestly unproved (or the printer started
-/// dressing an unnamed kind up as a checkable rule). Both halves are still
-/// soundness guards; only the side that carries the gap moved.
+/// PROMOTED AGAIN (2026-09-22) — THE WIRE DOCUMENT CLOSED, exactly as the twin
+/// `multi_equality_farkas_rebuild::test_nonlinear_conjunct_publishes_uncheckable_certificate`
+/// was promoted on 2026-08-25. The previous revision of this doc ended by
+/// pinning a residual unproved step and attributing it to the printer having no
+/// spec rule name for `NraIntervalUnsat`. Both halves of that attribution are
+/// now false, and the twin — the SAME programme with `(< x 0)` in place of
+/// `(not (= x 9))` — already records why and already asserts the contract
+/// below; only this one was left behind.
+///
+/// Measured at cc1bc0a305023de643db159abf8143ae0e785287, `ay-dpll` 0.27:
+///
+/// * The printer never names the interval kind. It LOWERS the refutation over
+///   the ground consequences of `y = 3` — `cong`, `evaluate`, `trans`,
+///   `equiv_pos1`/`equiv_neg2`, `th_resolution` — and the one step that used to
+///   stay a `hole`, `(= (* 3 3) 9)`, is discharged by AY's own ground evaluator
+///   as carcara's `evaluate`.
+/// * The internal proof is no longer routed through the interval kernel for
+///   this shape at all: its single theory lemma is a `LiaGeneric` lemma
+///   carrying the ground product evaluation, with `trust_count == 0`,
+///   `hole_count == 0` and empty `trust_theory_kinds`. Guard 1's counts are
+///   unchanged and still pin exactly that.
+///
+/// So guard 2 is promoted to what the twin already demands: no rule name may be
+/// invented for the interval kernel, the ground consequence must be discharged
+/// by `evaluate`, and the document must carry NO unproved step. That is
+/// strictly more than the old disjunction `hole || trust` asked for — a
+/// document with no unproved step cannot overclaim one — so this is a
+/// promotion, not a relaxation. Should the printer ever lose the lowering, the
+/// `evaluate` pin and the no-`hole` pin are what fire.
 #[test]
 #[timeout(10_000)]
 fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
@@ -277,10 +298,10 @@ fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
     );
 
     // SOUNDNESS GUARD 1 — the acceptance must be EARNED, not fabricated. The
-    // NRA interval kernel reconstructs the refutation from the clause, so the
-    // strict check succeeds with no trust and no hole steps. A regression that
-    // lost the kernel would show as `Err` here; a regression that started
-    // waving trust/hole steps through would show in the counts.
+    // refutation is reconstructed from the clause, so the strict check succeeds
+    // with no trust and no hole steps and no theory lemma admitted on trust. A
+    // regression that lost the reconstruction would show as `Err` here; one
+    // that started waving trust/hole steps through would show in the counts.
     let strict = check_proof_strict(proof, exec.terms())
         .expect("the NRA interval kernel must strictly certify this refutation");
     assert_eq!(
@@ -297,16 +318,27 @@ fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
     );
     assert_eq!(
         strict.theory_lemma_count, 1,
-        "exactly one theory lemma — the interval refutation — carries this proof: {strict:?}"
+        "exactly one theory lemma carries this proof: {strict:?}"
     );
 
-    // SOUNDNESS GUARD 2 — the WIRE document must not overclaim. The printer has
-    // no Alethe rule name for `NraIntervalUnsat`, so it must keep disclosing the
-    // step as unproved rather than borrowing some other rule's name.
+    // SOUNDNESS GUARD 2 — the WIRE document must not overclaim a rule name it
+    // does not have. The interval kernel has no Alethe spelling, so the one
+    // thing that must never appear is a rule name invented for it; the printer
+    // instead lowers the refutation to rules the pinned calculus implements,
+    // and the ground arithmetic it turns on is DISCHARGED rather than asserted.
     let alethe = outputs.get(1).expect("get-proof output");
+    for invented in ["nra_interval", "interval", "nra_"] {
+        assert!(
+            !alethe.contains(invented),
+            "no rule name may be invented for the interval kernel ({invented}):\n{alethe}"
+        );
+    }
     assert!(
-        alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the exported document has no rule name for the interval refutation and \
-         must stay honestly unproved:\n{alethe}"
+        alethe.contains("(step t8 (cl (= (* 3 3) 9)) :rule evaluate)"),
+        "the ground consequence of `y = 3` must be discharged by evaluate:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule hole") && !alethe.contains(":rule trust"),
+        "the lowered document must carry no unproved step:\n{alethe}"
     );
 }

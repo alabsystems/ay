@@ -10,6 +10,7 @@
 //! Bitvector evaluation is in the sibling `eval_bv` module.
 
 use crate::bv_util::bv_to_signed;
+use crate::expr::dag::eval_memo;
 use crate::{ChcExpr, ChcOp, ChcSort, SmtValue};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
@@ -19,8 +20,23 @@ use super::Mbp;
 // Per-function #[allow(clippy::only_used_in_recursion)] is used where needed.
 
 impl Mbp {
-    /// Evaluate a boolean expression under a model
+    /// Evaluate a boolean expression under a model.
+    ///
+    /// Memoised per distinct node over shared DAGs (WP-F, `expr::dag::eval_memo`):
+    /// the plain walk below recurses once per incoming edge, i.e. costs the
+    /// tree size of a shared transition relation.
     pub fn eval_bool(&self, expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) -> Option<bool> {
+        eval_memo::memoised(
+            expr,
+            model,
+            eval_memo::EvalKind::MbpBool,
+            eval_memo::wrap_bool,
+            eval_memo::unwrap_bool,
+            || self.eval_bool_plain(expr, model),
+        )
+    }
+
+    fn eval_bool_plain(&self, expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) -> Option<bool> {
         crate::expr::maybe_grow_expr_stack(|| {
             let _g = crate::expr::ExprDepthGuard::check()?;
             match expr {
@@ -241,8 +257,24 @@ impl Mbp {
         })
     }
 
-    /// Evaluate an arithmetic expression under a model
+    /// Evaluate an arithmetic expression under a model (memoised over shared
+    /// DAGs like [`Self::eval_bool`]).
     pub(crate) fn eval_arith(
+        &self,
+        expr: &ChcExpr,
+        model: &FxHashMap<String, SmtValue>,
+    ) -> Option<i128> {
+        eval_memo::memoised(
+            expr,
+            model,
+            eval_memo::EvalKind::MbpArith,
+            eval_memo::wrap_int,
+            eval_memo::unwrap_int,
+            || self.eval_arith_plain(expr, model),
+        )
+    }
+
+    fn eval_arith_plain(
         &self,
         expr: &ChcExpr,
         model: &FxHashMap<String, SmtValue>,
@@ -311,7 +343,23 @@ impl Mbp {
 
     /// Generic expression evaluation returning SmtValue for any sort.
     /// Used for index comparison in Array MBP and select-store reduction.
+    /// Memoised over shared DAGs like [`Self::eval_bool`].
     pub(super) fn eval_generic(
+        &self,
+        expr: &ChcExpr,
+        model: &FxHashMap<String, SmtValue>,
+    ) -> Option<SmtValue> {
+        eval_memo::memoised(
+            expr,
+            model,
+            eval_memo::EvalKind::MbpGeneric,
+            eval_memo::wrap_value,
+            eval_memo::unwrap_value,
+            || self.eval_generic_plain(expr, model),
+        )
+    }
+
+    fn eval_generic_plain(
         &self,
         expr: &ChcExpr,
         model: &FxHashMap<String, SmtValue>,

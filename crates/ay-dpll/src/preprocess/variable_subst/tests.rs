@@ -8,6 +8,9 @@ use ay_core::Sort;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
+#[path = "tests/canonical_bool.rs"]
+mod canonical_bool;
+
 #[test]
 fn test_datatype_variable_elimination_folds_nested_selector() {
     use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort};

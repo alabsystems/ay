@@ -23,6 +23,17 @@ mod unix_tests {
         Stdin,
     }
 
+    #[test]
+    fn child_exiting_before_large_stdin_does_not_kill_the_harness() {
+        // Larger than a pipe buffer: a child that never reads cannot consume
+        // this before exit. Under unix_hardened an unprotected writer would
+        // deliver SIGPIPE to this entire test process instead of an EPIPE.
+        let output = Command::new("true")
+            .output_timeout_with_stdin(&vec![b'x'; 1024 * 1024], Duration::from_secs(5))
+            .expect("the parent survives the child's closed stdin");
+        assert!(output.status.success());
+    }
+
     struct Cleanup(PathBuf);
 
     impl Drop for Cleanup {

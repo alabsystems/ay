@@ -12,6 +12,11 @@
 use super::*;
 use num_rational::Rational64;
 
+mod basis;
+
+#[cfg(test)]
+mod arithmetic_tests;
+
 const MAX_AFFINE_EQS: usize = 64;
 const MAX_AFFINE_DISEQS: usize = 64;
 const MAX_AFFINE_VARS: usize = 64;
@@ -121,7 +126,7 @@ impl LiaSolver<'_> {
                 // IS the equality of this pair (either orientation), so the
                 // row is the literal's row up to global negation.
                 let reason_row_exact = match reasons.as_slice() {
-                    [reason] if reason.value => match self.terms.get(reason.term) {
+                    [reason] if reason.value => match self.terms().get(reason.term) {
                         TermData::App(Symbol::Named(name), args)
                             if name == "=" && args.len() == 2 =>
                         {
@@ -175,9 +180,14 @@ impl LiaSolver<'_> {
             }
         }
 
+        // #affine-rref-hoist: one basis, reduced against as a span filter.
+        let basis = self.affine_equation_basis(&equations);
         for disequality in disequalities {
             if self.should_timeout() {
                 return None;
+            }
+            if self.affine_basis_excludes(basis.as_ref(), &disequality) {
+                continue;
             }
             let target_coeffs = disequality.coeffs;
             let target_constant = disequality.constant;
@@ -383,11 +393,11 @@ impl LiaSolver<'_> {
     ) -> bool {
         let mut term = reason.term;
         let mut value = reason.value;
-        while let TermData::Not(inner) = self.terms.get(term) {
+        while let TermData::Not(inner) = self.terms().get(term) {
             term = *inner;
             value = !value;
         }
-        let TermData::App(Symbol::Named(name), args) = self.terms.get(term) else {
+        let TermData::App(Symbol::Named(name), args) = self.terms().get(term) else {
             return false;
         };
         if args.len() != 2 {
@@ -443,7 +453,7 @@ impl LiaSolver<'_> {
         &self,
         literal: TermId,
     ) -> Option<(HashMap<TermId, BigInt>, BigInt)> {
-        let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+        let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
             return None;
         };
         if name != "=" || args.len() != 2 {
@@ -457,8 +467,8 @@ impl LiaSolver<'_> {
         lhs: TermId,
         rhs: TermId,
     ) -> Option<(HashMap<TermId, BigInt>, BigInt)> {
-        let lhs_sort = self.terms.sort(lhs);
-        let rhs_sort = self.terms.sort(rhs);
+        let lhs_sort = self.terms().sort(lhs);
+        let rhs_sort = self.terms().sort(rhs);
         if !matches!(lhs_sort, Sort::Int | Sort::Real)
             || !matches!(rhs_sort, Sort::Int | Sort::Real)
         {
@@ -880,6 +890,14 @@ impl LiaSolver<'_> {
         {
             return None;
         }
+        // RREF normalizes every pivot by itself and regularly divides zero
+        // cells by it. Keep all admission checks above these exact identities.
+        if divisor.is_one() || dividend.is_zero() {
+            return Some(dividend.clone());
+        }
+        if dividend == divisor {
+            return Some(BigRational::one());
+        }
         let result = dividend / divisor;
         Self::rational_is_bounded(&result).then_some(result)
     }
@@ -895,7 +913,19 @@ impl LiaSolver<'_> {
         {
             return None;
         }
-        let product = factor * pivot;
+        // Zero cells and normalized pivots are common during elimination.
+        // Avoid BigRational multiplication/normalization for these identities,
+        // without bypassing any input or intermediate coefficient bound.
+        if factor.is_zero() || pivot.is_zero() {
+            return Some(value.clone());
+        }
+        let product = if factor.is_one() {
+            pivot.clone()
+        } else if pivot.is_one() {
+            factor.clone()
+        } else {
+            factor * pivot
+        };
         if !Self::rational_is_bounded(&product) {
             return None;
         }
@@ -914,7 +944,16 @@ impl LiaSolver<'_> {
         {
             return None;
         }
-        let product = factor * pivot;
+        if factor.is_zero() || pivot.is_zero() {
+            return Some(value.clone());
+        }
+        let product = if factor.is_one() {
+            pivot.clone()
+        } else if pivot.is_one() {
+            factor.clone()
+        } else {
+            factor * pivot
+        };
         if !Self::rational_is_bounded(&product) {
             return None;
         }
@@ -925,72 +964,11 @@ impl LiaSolver<'_> {
     /// Exact Gauss-Jordan rank with cooperative cancellation, cell-operation
     /// fuel, and a coefficient-size invariant. `None` means "rank not proved"
     /// and must never be mapped to a numeric rank or used to emit a conflict.
-    fn rational_rank<F: FnMut() -> bool>(
-        mut rows: Vec<Vec<BigRational>>,
+    pub(crate) fn rational_rank<F: FnMut() -> bool>(
+        rows: Vec<Vec<BigRational>>,
         fuel: &mut usize,
         should_abort: &mut F,
     ) -> Option<usize> {
-        if should_abort() {
-            return None;
-        }
-        if rows.is_empty() {
-            return Some(0);
-        }
-
-        let row_count = rows.len();
-        let col_count = rows[0].len();
-        if rows.iter().any(|row| row.len() != col_count)
-            || !rows.iter().flatten().all(Self::rational_is_bounded)
-        {
-            return None;
-        }
-        let mut rank = 0;
-
-        for col in 0..col_count {
-            if should_abort() {
-                return None;
-            }
-            let Some(pivot) = (rank..row_count).find(|&row| !rows[row][col].is_zero()) else {
-                continue;
-            };
-            rows.swap(rank, pivot);
-
-            let pivot_value = rows[rank][col].clone();
-            for cell in rows[rank].iter_mut().take(col_count).skip(col) {
-                if !Self::affine_step_allowed(fuel, should_abort) {
-                    return None;
-                }
-                *cell = Self::bounded_rational_div(cell, &pivot_value)?;
-            }
-            let pivot_tail: Vec<_> = rows[rank][col..col_count].to_vec();
-
-            for (row, row_values) in rows.iter_mut().enumerate().take(row_count) {
-                if should_abort() {
-                    return None;
-                }
-                if row == rank || row_values[col].is_zero() {
-                    continue;
-                }
-                let factor = row_values[col].clone();
-                for (cell, pivot_cell) in row_values
-                    .iter_mut()
-                    .take(col_count)
-                    .skip(col)
-                    .zip(&pivot_tail)
-                {
-                    if !Self::affine_step_allowed(fuel, should_abort) {
-                        return None;
-                    }
-                    *cell = Self::bounded_rational_scaled_sub(cell, &factor, pivot_cell)?;
-                }
-            }
-
-            rank += 1;
-            if rank == row_count {
-                break;
-            }
-        }
-
-        Some(rank)
+        Self::rational_rref(rows, fuel, should_abort).map(|basis| basis.len())
     }
 }

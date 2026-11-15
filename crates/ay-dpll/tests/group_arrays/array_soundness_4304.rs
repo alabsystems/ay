@@ -176,6 +176,59 @@ fn qf_auflia_storeinv_nf_2idx_6282() {
     }
 }
 
+/// Depth-1 cross-base storeinv SAT shape minimized from
+/// `storeinv_invalid_t3_pp_nf_ai_00009_001.cvc.smt2` (QF_AUFLIA).
+///
+/// The cross-base chain-equality completion builds an explicit witness
+/// (one value per union-find cell class), but at Int element sort it
+/// installed abstract `@ay!wit!xval!` tokens the independent gate
+/// cannot parse as integer leaves, so both bases stayed unpinned and a
+/// genuine model was refused as `cannot-confirm`. Int elements are
+/// now concretized (one fresh numeral per class), mirroring the Int
+/// index atoms. z3 answers `sat` for both shapes below.
+#[test]
+#[timeout(10_000)]
+fn qf_auflia_storeinv_depth1_int_elem_sat() {
+    let (_, outputs) = solve(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun a1 () (Array Int Int))
+        (declare-fun a2 () (Array Int Int))
+        (declare-fun i1 () Int)
+        (declare-fun i2 () Int)
+        (declare-fun sk ((Array Int Int) (Array Int Int)) Int)
+        (assert (let ((?x1 (store a1 i1 (select a2 i1)))) (let ((?y1 (store a2 i1 (select a1 i1)))) (= (store ?y1 i1 (select ?x1 i2)) (store ?x1 i2 (select ?y1 i2))))))
+        (assert (let ((?v_0 (sk a1 a2))) (not (= (select a1 ?v_0) (select a2 ?v_0)))))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        outputs[0], "sat",
+        "depth-1 storeinv with base-separating sk read is sat (z3 agrees)"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn qf_auflia_storeinv_depth1_int_elem_sat_no_sk() {
+    let (_, outputs) = solve(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun a1 () (Array Int Int))
+        (declare-fun a2 () (Array Int Int))
+        (declare-fun i1 () Int)
+        (declare-fun i2 () Int)
+        (declare-fun sk ((Array Int Int) (Array Int Int)) Int)
+        (assert (let ((?x1 (store a1 i1 (select a2 i1)))) (let ((?y1 (store a2 i1 (select a1 i1)))) (= (store ?y1 i1 (select ?x1 i2)) (store ?x1 i2 (select ?y1 i2))))))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        outputs[0], "sat",
+        "depth-1 storeinv chain equality alone is sat (z3 agrees)"
+    );
+}
+
 /// AUFLIA storeinv single: store(a, i, select(a, i)) = a.
 ///
 /// Simplest store invariant in QF_AUFLIA with Int sorts.

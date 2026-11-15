@@ -30,19 +30,30 @@ fn closed_interval(lo: i64, hi: i64) -> AInterval {
     .expect("fixture interval must be non-empty")
 }
 
-fn generated_fixture(count: usize) -> Vec<AInterval> {
-    (0..count)
-        .map(|index| {
-            let base = i64::try_from(index).expect("small fixture index") * 4;
-            closed_interval(base, base + 2)
-        })
-        .collect()
+/// Largest fixture the helper builds; the tests use seven intervals.
+const MAX_FIXTURE: usize = 64;
+
+fn generated_fixture(count: usize) -> Result<Vec<AInterval>, Box<dyn std::error::Error>> {
+    if count > MAX_FIXTURE {
+        return Err("fixture larger than MAX_FIXTURE".into());
+    }
+    let mut fixture = Vec::new();
+    fixture.try_reserve_exact(count)?;
+    for index in 0..count {
+        let base = i64::try_from(index)?
+            .checked_mul(4)
+            .ok_or("fixture base fits i64")?;
+        let hi = base.checked_add(2).ok_or("fixture bound fits i64")?;
+        fixture.push(closed_interval(base, hi));
+    }
+    Ok(fixture)
 }
 
 #[test]
-fn generated_fixture_preserves_cardinality_and_disjointness() {
+fn generated_fixture_preserves_cardinality_and_disjointness(
+) -> Result<(), Box<dyn std::error::Error>> {
     const COUNT: usize = 7;
-    let set = IntervalSet::normalize(generated_fixture(COUNT)).expect("fixture normalizes");
+    let set = IntervalSet::normalize(generated_fixture(COUNT)?).expect("fixture normalizes");
 
     assert_eq!(set.len(), COUNT);
     for adjacent in set.intervals().windows(2) {
@@ -53,14 +64,19 @@ fn generated_fixture_preserves_cardinality_and_disjointness() {
         );
     }
     for index in 0..COUNT {
-        let midpoint = i64::try_from(index).expect("small fixture index") * 4 + 1;
+        let midpoint = i64::try_from(index)?
+            .checked_mul(4)
+            .and_then(|base| base.checked_add(1))
+            .ok_or("fixture midpoint fits i64")?;
         assert_eq!(set.contains(&rational(midpoint)), Some(true));
     }
+    Ok(())
 }
 
 #[test]
-fn normalization_is_permutation_invariant_by_exact_set_equality() {
-    let fixture = generated_fixture(7);
+fn normalization_is_permutation_invariant_by_exact_set_equality(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = generated_fixture(7)?;
     let ordered = IntervalSet::normalize(fixture.clone()).expect("ordered fixture normalizes");
     let permutation = [4usize, 1, 6, 0, 5, 2, 3];
     let permuted = permutation
@@ -70,6 +86,7 @@ fn normalization_is_permutation_invariant_by_exact_set_equality() {
     let normalized = IntervalSet::normalize(permuted).expect("permuted fixture normalizes");
 
     assert_eq!(ordered.same_set_as(&normalized), Some(true));
+    Ok(())
 }
 
 #[test]

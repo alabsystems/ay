@@ -17,6 +17,8 @@
 //! Reference: Een & Biere, "Effective Preprocessing in SAT through Variable
 //! and Clause Elimination", SAT 2005.
 
+mod counted;
+
 use crate::clause::ClauseSignature;
 use crate::elim_heap::ElimHeap;
 use crate::kani_compat::DetHashMap;
@@ -165,6 +167,12 @@ pub struct BVEStats {
     /// pre-check (#7922). These candidates were skipped in O(1) without the
     /// expensive O(|D|) literal-by-literal scan.
     pub backward_sig_filtered: u64,
+    /// Gates proved sound for restriction on a variable with non-gate clauses
+    /// (`--sat-bve-gate-complete`).
+    pub gates_proved_mixed: u64,
+    /// Gates whose restriction was checked and not proved sound, by reason:
+    /// (shape, unresolved non-tautological pair, incomplete, out of budget).
+    pub gates_unproved: [u64; 4],
     /// Variables eliminated during the quick elimination pre-pass (Pass 0).
     /// CaDiCaL `elimfast.cpp` pattern: tight limits (5 occs, 20 clause size).
     pub fast_elim_vars: u64,
@@ -533,6 +541,12 @@ pub(crate) struct BVE {
     /// similar filter, AY rebuilds the heap over all live variables on every
     /// BVE call, wasting the resolution budget on unchanged candidates.
     candidate_dirty: Vec<bool>,
+    /// The growth bound at which each variable was last tried and refused
+    /// (`u8::MAX`: never). Under Kissat's schedule a refused candidate is not
+    /// retried until the bound moves or a clause of its touches it.
+    rejected_at_bound: Vec<u8>,
+    /// Whether `build_schedule` skips candidates refused at the current bound.
+    skip_rejected_at_bound: bool,
     /// True after `build_schedule()` has been called since the last `rebuild()`.
     /// Prevents infinite re-builds when the heap drains without any successful
     /// elimination (failed variables are not re-inserted). Reset by `rebuild()`.
@@ -649,6 +663,8 @@ impl BVE {
             schedule_gate_pair_credit: vec![0; num_vars],
             schedule: ElimHeap::new(num_vars),
             candidate_dirty: vec![false; num_vars],
+            rejected_at_bound: vec![u8::MAX; num_vars],
+            skip_rejected_at_bound: false,
             schedule_built: false,
             growth_bound: 0,
             fastelim_mode: false,
@@ -683,6 +699,9 @@ impl BVE {
         if self.candidate_dirty.len() < num_vars {
             self.candidate_dirty.resize(num_vars, false);
         }
+        if self.rejected_at_bound.len() < num_vars {
+            self.rejected_at_bound.resize(num_vars, u8::MAX);
+        }
         self.occ_delta.ensure_num_vars(num_vars);
 
         debug_assert!(
@@ -705,6 +724,21 @@ impl BVE {
 
     /// Whether we're in fastelim (preprocessing) mode.
     /// CaDiCaL parity: fastelim does NOT use gate detection.
+    /// Record that `var` was tried at the current growth bound and refused.
+    pub(crate) fn note_rejected_at_bound(&mut self, var: Variable) {
+        let idx = var.index();
+        if idx < self.rejected_at_bound.len() {
+            self.rejected_at_bound[idx] = self.growth_bound.min(u8::MAX as usize) as u8;
+        }
+    }
+
+    /// Under Kissat's schedule the in-search rounds are capped and must
+    /// progress through the candidates, so a candidate refused at the
+    /// current bound waits for the bound to move.
+    pub(crate) fn set_skip_rejected_at_bound(&mut self, on: bool) {
+        self.skip_rejected_at_bound = on;
+    }
+
     pub(crate) fn is_fastelim_mode(&self) -> bool {
         self.fastelim_mode
     }
@@ -861,25 +895,10 @@ impl BVE {
 pub(crate) mod backward;
 mod eliminate;
 pub(crate) mod fast_eliminate;
+mod gate_complete;
 mod occs;
 mod resolve;
 mod schedule;
-
-// Phase 1 of incremental BVE during search (#8795).
-//
-// These modules live alongside the preprocessing-only `bve` machinery so
-// that Phase 2 can share clause-database accessors without the parallel-
-// island pattern that was rolled back in #8808. They are NOT yet wired
-// into the CDCL loop — the public API is exercised only by the unit tests
-// in this module. Phase 2 will register the tracker in the solver state
-// and call the trigger from `solver/solve/inprocessing_schedule.rs`.
-// `dead_code` is allowed because no production caller imports these yet;
-// the Phase 2 wiring session removes the allow when the trigger is
-// invoked from the inprocessing schedule.
-#[allow(dead_code)]
-pub(crate) mod incremental_cost;
-#[allow(dead_code)]
-pub(crate) mod trigger;
 
 #[cfg(test)]
 mod tests;

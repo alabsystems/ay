@@ -15,13 +15,17 @@ use super::{
 
 mod arithmetic;
 mod bitvectors;
+mod complex;
+mod connective_chain;
 mod core;
 mod floating_point;
 mod map;
+mod map_identity;
 mod multiset;
 mod sequences;
 mod set;
 mod strings;
+mod z3_unknown;
 
 impl Context {
     /// Elaborate a function application
@@ -216,7 +220,8 @@ impl Context {
         // already folds a constant condition, but only AFTER both branches are
         // built — too late to stop the runaway recursion.) A non-constant guard
         // falls through to the normal eager elaboration below, so symbolic ITEs
-        // are unaffected.
+        // are unaffected. z3 still reads the untaken branch of an authored
+        // `ite`, in its place, so it is checked there (`skipped_subterms`).
         let builtin_ite_spelling =
             name == "ite" || name == "if" || (self.logic.is_none() && name == "if_then_else");
         if builtin_ite_spelling
@@ -227,10 +232,14 @@ impl Context {
             let cond = self.elaborate_term(&args[0], env)?;
             match self.terms.get(cond) {
                 TermData::Const(Constant::Bool(true)) => {
-                    return self.elaborate_term(&args[1], env);
+                    let taken = self.elaborate_term(&args[1], env)?;
+                    let skipped = self.check_skipped_subterm(&args[2], env, &HashMap::default())?;
+                    return self.join_skipped_branch(taken, skipped);
                 }
                 TermData::Const(Constant::Bool(false)) => {
-                    return self.elaborate_term(&args[2], env);
+                    let skipped = self.check_skipped_subterm(&args[1], env, &HashMap::default())?;
+                    let taken = self.elaborate_term(&args[2], env)?;
+                    return self.join_skipped_branch(taken, skipped);
                 }
                 _ => {}
             }
@@ -253,8 +262,16 @@ impl Context {
                 | "seq.map"
                 | "seq.mapi"
         );
-        let mut arg_ids: Vec<TermId> = Vec::with_capacity(args.len());
-        for (i, a) in args.iter().enumerate() {
+        // A deep `and`/`or` chain goes to one constructor call over its leaves
+        // instead of one per level (`connective_chain`).
+        let gathered = self.deep_connective_chain_leaves(name, args);
+        let arg_count = gathered.as_ref().map_or(args.len(), Vec::len);
+        let mut arg_ids: Vec<TermId> = Vec::with_capacity(arg_count);
+        for i in 0..arg_count {
+            let a = match &gathered {
+                Some(leaves) => leaves[i],
+                None => &args[i],
+            };
             let saved = self.multivar_lambda_curry_allowed;
             self.multivar_lambda_curry_allowed = ho_seq_fn_arg && i == 0;
             let r = self.elaborate_term(a, env);
@@ -356,6 +373,22 @@ impl Context {
                             }
                         }
                     }
+                    // NOT folded here: the SOLE-CONSTRUCTOR rule, which
+                    // `elaborate_indexed_app` applies to the standard
+                    // `((_ is C) e)` spelling. That fold is sound (a datatype
+                    // with one constructor is satisfied by every value of its
+                    // sort) and load-bearing there — it collapses an `ite`
+                    // guard so the DT occurs-check can see through it — but it
+                    // also DISCARDS the scrutinee, and a discarded scrutinee
+                    // is one the datatype model collector never observes.
+                    // MEASURED: folding `(is-mk (f 0))` for a single-
+                    // constructor `U` empties `DtBuilder::tester_apps`, so the
+                    // class loses `ConstructorForceOrigin::PositiveTester` and
+                    // the authored W6 array-field authorization cell for
+                    // `(f 0)` is never minted
+                    // (`executor::model::dt_construct::positive_tester_tests`).
+                    // The named spelling is the only surface route left to
+                    // that observation, so it keeps the application.
                 }
             }
             let inner = self.terms.get(arg_ids[0]).clone();
@@ -435,6 +468,9 @@ impl Context {
                     return Ok(term);
                 }
             }
+            if Self::is_native_map_op_name(&app_name) {
+                self.mark_uses_map();
+            }
             return Ok(self
                 .terms
                 .mk_app(Symbol::named(&app_name), arg_ids, info.sort));
@@ -472,12 +508,25 @@ impl Context {
             if name == "is_int" {
                 self.terms.mark_is_int_shadowed();
             }
+            // A USER-declared `map.dom` / `map.subset` (deductive-checks's activation
+            // route) builds an application the map theory decides as its own
+            // operator, so the SAT funnel's native-map gate must see it too
+            // (#map-value-semantics).
+            if Self::is_native_map_op_name(&declared_app_name) {
+                self.mark_uses_map();
+            }
             return Ok(self
                 .terms
                 .mk_app(Symbol::named(&declared_app_name), arg_ids, sort));
         }
 
+        self.check_builtin_z3_knows(name, &arg_ids)?;
         if let Some(term) = self.try_elaborate_builtin_app(name, &mut arg_ids)? {
+            // Shell-only z3 signature gate (DR-59): a builtin applied
+            // outside the declared logic's signature is an error in
+            // z3's shell (`unknown constant …`), never gated on the
+            // library / canonical-application paths.
+            self.require_logic_builtin_signature(name, &arg_ids, term)?;
             return Ok(term);
         }
 
@@ -521,6 +570,19 @@ impl Context {
         name: &str,
         args: &mut [TermId],
     ) -> Result<Option<TermId>> {
+        if matches!(name, "ff.add" | "ff.mul" | "ff.neg" | "ff.bitsum") {
+            if !matches!(self.logic(), None | Some("ALL" | "QF_FF")) {
+                return Err(ElaborateError::InvalidConstant(
+                    "field operator outside field logic".into(),
+                ));
+            }
+            return self.terms.mk_ff_app(name, args).map(Some).ok_or_else(|| {
+                ElaborateError::InvalidConstant(format!("ill-sorted or wrong-arity {name}"))
+            });
+        }
+        if let Some(term) = self.try_elaborate_complex_app(name, args)? {
+            return Ok(Some(term));
+        }
         if let Some(term) = self.try_elaborate_core_app(name, args)? {
             return Ok(Some(term));
         }
@@ -558,13 +620,6 @@ impl Context {
         matches!(self.terms.sort(term), Sort::Uninterpreted(s) if self.datatypes.contains_key(s))
     }
 
-    /// Build a datatype tester application `((_ is C) e)` over an already
-    /// elaborated scrutinee, given the constructor's INTERNAL name. Mirrors the
-    /// `is-<ctor_internal>` named app that [`Self::elaborate_app`] produces for a
-    /// surface `(_ is C)`. When the scrutinee is a literal constructor
-    /// application the result folds to a Boolean constant (constructor
-    /// distinctness), which lets the surrounding `ite` collapse. Used by `match`
-    /// desugaring (`elaborate/term.rs`).
     /// The datatype constructor (INTERNAL name) that literally built `t`, if
     /// any: a constructor application `C(a..)`, or a NULLARY constructor —
     /// which elaborates to a named Var, not a 0-ary App (`mk_fresh_named_var`
@@ -582,7 +637,19 @@ impl Context {
         }
     }
 
-    pub(super) fn mk_datatype_tester(&mut self, ctor_internal: &str, scrut: TermId) -> TermId {
+    /// Build a datatype tester application `((_ is C) e)` over an already
+    /// elaborated scrutinee, given the constructor's INTERNAL name. Mirrors the
+    /// `is-<ctor_internal>` named app that [`Self::elaborate_app`] produces for a
+    /// surface `(_ is C)`. When the scrutinee is a literal constructor
+    /// application the result folds to a Boolean constant (constructor
+    /// distinctness), which lets the surrounding `ite` collapse. Used by `match`
+    /// desugaring (`elaborate/term.rs`).
+    ///
+    /// This is the canonical datatype tester builder: the native term API
+    /// (`ay-dpll`'s `try_datatype_tester`) builds through it too, so a tester
+    /// asserted natively is the exact term its SMT-LIB spelling elaborates to
+    /// and the retained-source reconstruction check can hold it to that.
+    pub fn mk_datatype_tester(&mut self, ctor_internal: &str, scrut: TermId) -> TermId {
         if let Some(applied) = self.ctor_of_term(scrut) {
             return if applied == ctor_internal {
                 self.terms.true_term()
@@ -601,8 +668,10 @@ impl Context {
     /// scrutinee, given the selector's INTERNAL name and field sort. Reuses the
     /// selector-over-constructor / selector-over-ite folding so a `match` on a
     /// literal constructor reduces directly to the stored field. Used by `match`
-    /// desugaring (`elaborate/term.rs`).
-    pub(super) fn mk_datatype_selector(
+    /// desugaring (`elaborate/term.rs`) and, like [`Self::mk_datatype_tester`],
+    /// by the native term API, so a natively built `(sel (C ..))` is the term
+    /// its surface spelling elaborates to.
+    pub fn mk_datatype_selector(
         &mut self,
         sel_internal: &str,
         sel_sort: &Sort,
@@ -638,6 +707,44 @@ impl Context {
             }
             _ => None,
         }
+    }
+
+    /// Build the equality `(= lhs rhs)` of two same-sorted, already elaborated
+    /// terms exactly as a surface `=` elaborates: a datatype-sorted equality is
+    /// folded through constructor injectivity/distinctness and `ite`
+    /// (see [`Self::fold_datatype_eq`]), any other equality is interned
+    /// structurally. The native term API builds its equalities through this so
+    /// a native `(= (succ (succ l)) (succ l))` is the term its spelling
+    /// elaborates to. The caller has already checked that the sorts agree.
+    pub fn mk_elaborated_eq(&mut self, lhs: TermId, rhs: TermId) -> TermId {
+        if self.is_datatype_sorted(lhs) {
+            self.fold_datatype_eq(lhs, rhs)
+        } else {
+            self.terms.mk_eq(lhs, rhs)
+        }
+    }
+
+    /// Whether `((_ is ctor_surface) scrut)` is definitionally `true`: the
+    /// datatype of `scrut` has `ctor_surface` as its one and only constructor,
+    /// so every value of the datatype satisfies its only recognizer.
+    /// Constructor names are compared through their surface spelling, so a
+    /// parametric instance's mangled constructor is recognized as well.
+    ///
+    /// This is the STANDARD indexed spelling's rule and only that spelling's:
+    /// `elaborate_indexed_app` applies it, `elaborate_app` (the non-standard
+    /// named `(is-C e)`) and the native term API deliberately do not, because
+    /// the fold discards the scrutinee and with it the datatype model
+    /// collector's record that the query ever tested that term. See the
+    /// tester-fold comment in [`Self::elaborate_app`].
+    pub(super) fn is_sole_constructor_tester(&self, ctor_surface: &str, scrut: TermId) -> bool {
+        let dt_name = match self.terms.sort(scrut) {
+            Sort::Uninterpreted(name) => name.as_str(),
+            Sort::Datatype(dt) => dt.name.as_str(),
+            _ => return false,
+        };
+        self.datatypes.get(dt_name).is_some_and(|ctors| {
+            ctors.len() == 1 && self.dt_surface_name(&ctors[0]).unwrap_or(&ctors[0]) == ctor_surface
+        })
     }
 
     /// Fold a datatype equality `lhs = rhs` into a datatype-free formula via

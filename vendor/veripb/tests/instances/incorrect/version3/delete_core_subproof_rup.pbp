@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+pol 1 ;
+del id 1 : : subproof
+    rup >= 1 ;
+qed : -1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

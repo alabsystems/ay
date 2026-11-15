@@ -140,7 +140,9 @@ pub struct NormalizedConstraint<W> {
 /// the atom is not a difference-logic atom.
 ///
 /// Returns one constraint for `<=,<,>=,>`, two for `=`. The implicit zero
-/// variable is supplied as `zero_var`.
+/// variable is supplied as `zero_var`. A constant whose negation the weight type
+/// cannot represent (`i64::MIN` for `>=`, `>`, `=`) is not lowered either: the
+/// atom returns `None` and the caller rejects the system rather than panicking.
 pub fn lower_int_atom<W: IntWeight + Negate>(
     atom: &DiffAtom<W>,
     zero_var: usize,
@@ -170,13 +172,13 @@ pub fn lower_int_atom<W: IntWeight + Negate>(
         Op::Ge => vec![NormalizedConstraint {
             to: y,
             from: x,
-            weight: neg_int(&c),
+            weight: neg_int(&c)?,
         }],
         // x - y > c    ⇒  y - x < -c  ⇒  y - x <= -c-1
         Op::Gt => vec![NormalizedConstraint {
             to: y,
             from: x,
-            weight: neg_int(&c).strict_pred(),
+            weight: neg_int(&c)?.strict_pred(),
         }],
         // x - y = c    ⇒  x - y <= c  AND  y - x <= -c
         Op::Eq => vec![
@@ -188,7 +190,7 @@ pub fn lower_int_atom<W: IntWeight + Negate>(
             NormalizedConstraint {
                 to: y,
                 from: x,
-                weight: neg_int(&c),
+                weight: neg_int(&c)?,
             },
         ],
     })
@@ -202,35 +204,59 @@ pub fn lower_int_atom<W: IntWeight + Negate>(
 /// To stay generic we route through `strict_pred`/`add` only, which is not
 /// enough for negation; instead require negation explicitly. We add it as a
 /// free function specialised by a tiny trait to keep `Weight` minimal.
-fn neg_int<W: IntWeight + Negate>(c: &W) -> W {
+fn neg_int<W: IntWeight + Negate>(c: &W) -> Option<W> {
     c.negate()
 }
 
 /// Negation, factored out so [`Weight`](crate::weight::Weight) itself stays
 /// limited to the ordered-monoid operations the SSSP core needs.
-pub trait Negate {
-    fn negate(&self) -> Self;
+///
+/// Fallible because the fixed-width weights have a value with no negation
+/// (`i64::MIN`, or an ε-count of `i64::MIN`): wrapping it would flip a sign and
+/// saturating it would be off by one, so the caller gets `None` and refuses.
+pub trait Negate: Sized {
+    fn negate(&self) -> Option<Self>;
+
+    /// Whether [`Negate::negate`] succeeds, without building the negation.
+    #[inline]
+    fn can_negate(&self) -> bool {
+        self.negate().is_some()
+    }
 }
 
 impl Negate for i64 {
     #[inline]
-    fn negate(&self) -> Self {
+    fn negate(&self) -> Option<Self> {
         self.checked_neg()
-            .expect("i64 difference-logic weight negation overflow; use BigInt")
+    }
+
+    #[inline]
+    fn can_negate(&self) -> bool {
+        *self != i64::MIN
     }
 }
 
 impl Negate for num_bigint::BigInt {
     #[inline]
-    fn negate(&self) -> Self {
-        -self
+    fn negate(&self) -> Option<Self> {
+        Some(-self)
+    }
+
+    #[inline]
+    fn can_negate(&self) -> bool {
+        true
     }
 }
 
 impl Negate for num_rational::BigRational {
     #[inline]
-    fn negate(&self) -> Self {
-        -self
+    fn negate(&self) -> Option<Self> {
+        Some(-self)
+    }
+
+    #[inline]
+    fn can_negate(&self) -> bool {
+        true
     }
 }
 

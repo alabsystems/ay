@@ -2,12 +2,19 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-/// The endpoint lane pins one opaque term to two different bit-vector
-/// CONSTANTS and closes it with a `bv_bitblast` unit lemma. Carcara cannot
-/// re-derive AY's bit-blasting, but `(= #x05 #x06)` is a GROUND term its own
-/// `evaluate` reduces to `false`, so this lemma exports checked instead of as
-/// a hole. Both arms of the lane are covered: the QF_ABV array read and the
-/// QF_BV term (`bvudiv`) that is deliberately held opaque.
+/// The endpoint lane pins one term to two different bit-vector CONSTANTS. Every
+/// arm must export a document pinned Carcara re-derives with no allowed trust,
+/// and never AY's private coarse `bv_bitblast` rule name. Three arms are
+/// covered: a bare variable, the QF_ABV array read, and the QF_BV term
+/// (`bvudiv`) that is deliberately held opaque.
+///
+/// d22d4f03f landed c5db644c1's compact shared-endpoint lowering. The joint
+/// guarded BV repair still derives the conjunction of the authored equalities,
+/// but its canonical constant conflict now lowers through `and_pos`,
+/// `eq_transitive`, and `evaluate` before the general bit-blast fallback.
+/// Thus the variable and array arms again require `evaluate`, as does the
+/// opaque `bvudiv` endpoint. Rule names alone are not proof acceptance: every
+/// document below must still pass the unchanged trust-free Carcara check.
 #[test]
 #[timeout(120_000)]
 fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
@@ -16,6 +23,15 @@ fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
     };
     let cases = [
         (
+            "trust_free_qf_bv_variable_endpoint_constant_mismatch",
+            "(set-logic QF_BV)\n\
+             (declare-const x (_ BitVec 8))\n\
+             (assert (= x #x05))\n\
+             (assert (= x #x0A))\n\
+             (check-sat)\n",
+            ":rule evaluate",
+        ),
+        (
             "trust_free_qf_abv_shared_endpoint_constant_mismatch",
             "(set-logic QF_ABV)\n\
              (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\n\
@@ -23,6 +39,7 @@ fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
              (assert (= (select a i) #x05))\n\
              (assert (= (select a i) #x06))\n\
              (check-sat)\n",
+            ":rule evaluate",
         ),
         (
             "trust_free_qf_bv_opaque_udiv_endpoint_mismatch",
@@ -31,9 +48,10 @@ fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
              (assert (= (bvudiv x #x03) #x02))\n\
              (assert (= (bvudiv x #x03) #x03))\n\
              (check-sat)\n",
+            ":rule evaluate",
         ),
     ];
-    for (label, problem) in cases {
+    for (label, problem, closure) in cases {
         let proof = solve_unsat_and_get_proof(problem, label);
         assert!(
             !proof.contains(":rule trust") && !proof.contains(":rule hole"),
@@ -44,8 +62,8 @@ fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
             "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
         );
         assert!(
-            proof.contains(":rule evaluate"),
-            "{label}: the constant mismatch must be certified by evaluate:\n{proof}"
+            proof.contains(closure),
+            "{label}: the constant mismatch must be certified by `{closure}`:\n{proof}"
         );
         assert!(
             run_carcara_trust_free(&carcara, label, problem, &proof),
@@ -170,10 +188,14 @@ fn test_carcara_qf_uf_boolean_equality_surface_is_valid_or_fails_closed() {
     );
 }
 
-/// QF_LIA arithmetic proofs may still contain `trust`-backed theory steps when
-/// coefficient annotations are unavailable. This test checks the current export
-/// contract: the proof must remain structurally valid via carcara with AY's
-/// supported allowlist.
+/// QF_LIA arithmetic proof, checked by pinned Carcara with NO allowance.
+///
+/// CONTRACT CORRECTED 2026-09-23 (the name is kept so name-keyed ledgers keep
+/// the oracle). It read: the proof "may still contain `trust`-backed theory
+/// steps" and must be structurally valid "with AY's supported allowlist" —
+/// `--allowed-rules trust` plus an exit-code read, which also passes `holey`.
+/// Measured on ay `8d9e105fa` and `69efb137d`, carcara 1.1.0 [git 9a352ee], the document is
+/// `valid` with no allowance, so the test now requires exactly that.
 #[test]
 #[timeout(60_000)]
 fn test_carcara_qf_lia_holey_valid() {
@@ -208,9 +230,32 @@ fn test_carcara_finite_enum_pigeonhole_is_honestly_holey() {
     );
     assert_eq!(proof.matches(":rule resolution").count(), 1, "{proof}");
     assert!(!proof.contains(":rule dt_enum_pigeonhole"), "{proof}");
-    let (problem_path, proof_path) =
-        write_problem_and_proof(label, QF_DT_FINITE_ENUM_PIGEONHOLE_CARCARA_SCOPE, &proof);
-    let output = std::process::Command::new(&carcara)
+    let (success, stdout, stderr) = guarded_expand_let_output(
+        &carcara,
+        label,
+        QF_DT_FINITE_ENUM_PIGEONHOLE_CARCARA_SCOPE,
+        &proof,
+    );
+    assert!(
+        success,
+        "Carcara rejected finite-enum skeleton: stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, "holey");
+}
+
+/// Pinned carcara under the corpus flags with no allowance, after the shared
+/// refusal of a pair whose verdict is not evidence (so a `holey` resting on a
+/// step it misjudges cannot pass): `(exit ok, stdout, stderr)`, trimmed.
+#[cfg(test)]
+fn guarded_expand_let_output(
+    carcara: &Path,
+    label: &str,
+    problem: &str,
+    proof: &str,
+) -> (bool, String, String) {
+    refuse_pinned_carcara_misjudgments(label, problem, proof);
+    let (problem_path, proof_path) = write_problem_and_proof(label, problem, proof);
+    let output = std::process::Command::new(carcara)
         .arg("check")
         .arg("--expand-let-bindings")
         .arg("--")
@@ -218,20 +263,29 @@ fn test_carcara_finite_enum_pigeonhole_is_honestly_holey() {
         .arg(&problem_path)
         .output()
         .expect("run carcara finite-enum holey check");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let keep_artifacts = keep_alethe_artifacts() || !output.status.success();
     if !keep_artifacts {
         let _ = std::fs::remove_file(&problem_path);
         let _ = std::fs::remove_file(&proof_path);
     }
-    assert!(
+    (
         output.status.success(),
-        "Carcara rejected finite-enum skeleton: stdout={} stderr={}",
-        stdout.trim(),
-        stderr.trim()
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    )
+}
+
+/// NEGATIVE CONTROL: the runner above refuses, before the checker runs, the
+/// pair pinned carcara prints `valid` for only through its `evaluate` defect.
+#[test]
+#[should_panic(expected = "is not evidence")]
+fn the_finite_enum_runner_refuses_a_document_pinned_carcara_misjudges() {
+    guarded_expand_let_output(
+        Path::new("carcara"),
+        "finite_enum_false_valid_control",
+        ay_core::pinned_carcara::FALSE_VALID_CONTROL_PROBLEM,
+        ay_core::pinned_carcara::FALSE_VALID_CONTROL_PROOF,
     );
-    assert_eq!(stdout.trim(), "holey");
 }
 
 /// The trust-FREE normalized-assume class: every step is checkable, but the

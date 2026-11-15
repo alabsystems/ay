@@ -58,22 +58,18 @@ published snapshot.
 
 ## Releases
 
-### 0.23.0 — 2026-08-29 (current workspace version)
+Entries for 0.24.0 through 0.27.0 have not been written yet; `version` under
+`[workspace.package]` in `Cargo.toml` is the current version.
+
+### 0.23.0 — 2026-08-29
 
 Tag `v0.23.0` → `bf79cde4e`; release commit `6f66beb8c8` ("release: bump for
-the docs-refresh cut"), with the snapshot cut two `publish` commits later. This
-is the version `[workspace.package]` carries today, and the publication ledger's
-newest `ay` row maps this revision to the current `alabsystems/ay` release.
+the docs-refresh cut"), with the snapshot cut two `publish` commits later. When
+this entry was written, the publication ledger's newest `ay` row mapped this
+revision to the then-current `alabsystems/ay` release.
 
 46 non-merge commits since the 0.22.0 release point (`fix` 11, `feat` 7,
 `census` 6, `docs` 5, then a long singleton tail).
-
-34 non-merge commits have landed on `main` since this snapshot point and are
-not part of any cut snapshot. Among them, and worth knowing when reading the
-rest of this repository: `1e48ffbf36` made the Trust verifying compiler the
-development tree's default with verification on, and `fe36913a09` converted the
-last attribute-spelled contracts to Trust's native clause grammar. Neither
-touches the public snapshot, which publication repins to stock stable Rust.
 
 ### 0.22.0 — 2026-08-29
 

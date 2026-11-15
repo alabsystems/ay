@@ -192,31 +192,48 @@ pub(super) fn root_dual_block(oc: &OptimalityCertificate, gap: &BigRational) -> 
 /// forgery the design review named.
 pub(super) fn opt_tree_block(root: &OptTreeNode) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "opttree");
+    let _ = writeln!(s, "{OPT_TREE_OPEN}");
     // Explicit pre-order, iterative: a certificate is input data and its depth
     // must not be the writer's stack limit.
     let mut stack: Vec<&OptTreeNode> = vec![root];
     while let Some(node) = stack.pop() {
         match node {
             OptTreeNode::Split { col, cut, lo, hi } => {
-                let _ = writeln!(s, "split {} {}", col.index(), fmt_rat(cut));
+                write_opt_tree_split(&mut s, *col, cut);
                 stack.push(hi);
                 stack.push(lo);
             }
             OptTreeNode::Empty { farkas } => {
-                let _ = writeln!(s, "leaf");
-                write_multipliers(&mut s, &farkas.multipliers);
-                let _ = writeln!(s, "endleaf");
+                write_opt_tree_leaf(&mut s, &farkas.multipliers, false);
             }
             OptTreeNode::Dominated { multipliers } => {
-                let _ = writeln!(s, "boundleaf");
-                write_multipliers(&mut s, multipliers);
-                let _ = writeln!(s, "endleaf");
+                write_opt_tree_leaf(&mut s, multipliers, true);
             }
         }
     }
-    let _ = writeln!(s, "end");
+    let _ = writeln!(s, "{OPT_TREE_CLOSE}");
     s
+}
+
+/// The `opttree` block's opener and terminator, named once so the STREAMING
+/// producer and this one cannot drift apart.
+pub(crate) const OPT_TREE_OPEN: &str = "opttree";
+/// See [`OPT_TREE_OPEN`].
+pub(crate) const OPT_TREE_CLOSE: &str = "end";
+
+/// ONE split record. THE serialiser for it — the streaming sink calls this, not
+/// a copy of it, so a change to the wire form cannot reach one producer and
+/// miss the other.
+pub(crate) fn write_opt_tree_split(s: &mut String, col: Col, cut: &BigRational) {
+    let _ = writeln!(s, "split {} {}", col.index(), fmt_rat(cut));
+}
+
+/// ONE leaf record: `boundleaf` when it closes by DOMINATION, `leaf` when it
+/// closes by EMPTINESS. See [`write_opt_tree_split`] for why this is shared.
+pub(crate) fn write_opt_tree_leaf(s: &mut String, mults: &[Multiplier], dominated: bool) {
+    let _ = writeln!(s, "{}", if dominated { "boundleaf" } else { "leaf" });
+    write_multipliers(s, mults);
+    let _ = writeln!(s, "endleaf");
 }
 
 pub(super) fn tree_block(tc: &MilpInfeasibilityCertificate) -> String {

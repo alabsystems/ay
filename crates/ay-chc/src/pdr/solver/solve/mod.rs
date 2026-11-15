@@ -12,10 +12,15 @@ use super::{
     ReachFactId, SmtResult, StrengthenResult, VerificationProgressSignature, MAX_GLOBAL_LEMMAS,
 };
 
+mod acyclic_model;
+mod encoding_owner;
 mod fact_summary;
+mod input_restatement;
 mod main_loop;
 mod safety_checks;
 mod solve_init;
+#[cfg(test)]
+mod solve_init_tests;
 mod spurious_cex;
 #[cfg(test)]
 mod tests;

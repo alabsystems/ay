@@ -1,0 +1,54 @@
+pseudo-Boolean proof version 3.0
+% An order with a non-empty `spec` block and *no* `reflexivity` block, so that
+% reflexivity is auto-proven and the elaborator has to synthesize the whole
+% `reflexivity` block itself. The definition `1 ~u1 1 v1 >= 1` under the
+% reflexivity substitution `v1 -> u1` is `1 ~u1 1 u1 >= 1`, a tautology, which
+% is exactly the condition `OrderContext::autoprove_reflexivity` checks.
+%
+% The synthesized block discharges each goal with `qed : <id>`, naming the
+% negated goal -- contradicting on its own, because the goal is trivial. That
+% id has to be predicted, and re-running `proof` pushes one substituted
+% *specification* premise per `spec` constraint into the order's sub-database
+% before the first `proofgoal` pushes its negated goal. Those premises were not
+% counted, so every hint named a premise instead of the negated goal and the
+% elaborated proof failed to re-check with "The constraint with ID 8 is not
+% contradicting, as specified by the hint".
+%
+% The three corpus orders that already had a `spec` block
+% (`dominance_with_aux_vars`, `redundance_non_touching_order`,
+% `redundance_non_touching_order_explicit_subproof`) all write an explicit
+% `reflexivity` block, so none of them reaches the synthesized one; an order
+% with no `spec` reaches it with nothing to miscount. This instance is the
+% missing combination.
+f 2;
+def_order simple
+  vars
+    left u1;
+    right v1;
+    aux $a1;
+  end vars;
+  spec
+    red 1 ~$a1 >= 1 : $a1 -> 0;
+  end spec;
+  def
+    -1 u1 1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1;
+      fresh_aux_1 $b1;
+      fresh_aux_2 $c1;
+    end vars;
+    proof
+      proofgoal #1
+        pol -2 -3 + -1 +;
+      qed : -1;
+    qed;
+  end transitivity;
+end def_order;
+load_order simple x1;
+pol 1 2 +;
+load_order;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

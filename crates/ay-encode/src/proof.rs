@@ -24,7 +24,7 @@
 
 use ay_chc::{
     ChcPdrProofRun, ChcProofRunArtifacts, ChcProofTranscriptConsumerEvidence,
-    ChcProofTranscriptMetadata, VerifiedChcResult,
+    ChcProofTranscriptMetadata, ChcRunWork, VerifiedChcResult,
 };
 
 /// A completed PDR proof run bound to the exact problem that was solved.
@@ -54,6 +54,28 @@ impl ProofRun {
     /// The sealed semantic result returned by AY.
     pub fn result(&self) -> &VerifiedChcResult {
         self.run.result()
+    }
+
+    /// The work AY metered the run at ([`ay_chc::ChcPdrProofRun::work`]): its
+    /// GuardTree node's ticks and what they are made of. Observation only (it
+    /// decided nothing) and part of no certificate: a clock can still steer
+    /// the search that produced it.
+    #[must_use]
+    pub fn work(&self) -> Option<&ChcRunWork> {
+        self.run.work()
+    }
+
+    /// The run's frontend-neutral verdict, exactly as [`crate::invoke::solve`]
+    /// returns it under [`crate::invoke::ProofMode::Strict`]: on an accepted
+    /// `Safe`, [`crate::verdict::AyVerdict::Proved`] carries
+    /// [`Self::certificate`]; otherwise there is no certificate. A caller that
+    /// wants the run's [`Self::work`] beside the verdict calls
+    /// [`crate::invoke::solve_with_proof`] and this, in place of `solve`.
+    pub fn verdict(&self) -> crate::verdict::AyVerdict {
+        let raw = self.run.result().clone();
+        let certificate =
+            (self.accepted_as_proof() && raw.is_safe()).then(|| Box::new(self.certificate()));
+        crate::verdict::from_verified(raw, certificate)
     }
 
     /// Build a re-checkable [`Certificate`] for this run's solved problem.

@@ -45,6 +45,40 @@ impl LraSolver {
             || self.bound_is_interesting(var, is_upper, value)
     }
 
+    /// True when a freshly derived bound `(value, strict)` on the `is_upper`
+    /// side of `vi` is NOT tighter than the bound `implied_bounds[vi]`
+    /// already holds — exactly the negation of the strict-aware `tighter`
+    /// test of the deferred-update apply loop in `compute_implied_bounds`.
+    ///
+    /// Within one cascade round the slots only ever tighten (the apply loop
+    /// and the cross-negation pass replace a bound only with a tighter one,
+    /// and nothing else writes them between derivation and apply), and the
+    /// strict-aware order is total, so a candidate that is not tighter than
+    /// the slot at derivation time is not tighter at apply time either: the
+    /// apply loop would discard it with no side effect. Dropping it at
+    /// derivation time therefore changes nothing but the work done — it
+    /// skips the atom-interest scan, the explanation clone and the update.
+    #[inline]
+    pub(crate) fn derived_bound_not_tighter(
+        &self,
+        vi: usize,
+        is_upper: bool,
+        value: &Rational,
+        strict: bool,
+    ) -> bool {
+        let slot = &self.implied_bounds[vi];
+        let cur = if is_upper { &slot.1 } else { &slot.0 };
+        let Some(cur) = cur else {
+            return false;
+        };
+        let tighter = match value.cmp(&cur.value) {
+            std::cmp::Ordering::Less => is_upper,
+            std::cmp::Ordering::Greater => !is_upper,
+            std::cmp::Ordering::Equal => strict && !cur.strict,
+        };
+        !tighter
+    }
+
     /// Compute implied bounds for all variables from tableau rows.
     ///
     /// Two-pass approach following Z3's `bound_analyzer_on_row`:
@@ -776,6 +810,16 @@ impl LraSolver {
                             } else {
                                 false // no strict bounds at all
                             };
+                            // Not tighter than the slot: the apply loop would drop it.
+                            if self.derived_bound_not_tighter(
+                                vi,
+                                is_upper,
+                                &bound_val,
+                                derived_strict,
+                            ) {
+                                self.stats.implied_not_tighter_skips += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // Z3's bound_analyzer_on_row stores ALL derived bounds and
                             // only checks interest at the propagation level (arith_solver.cpp:363).
@@ -829,7 +873,15 @@ impl LraSolver {
                             // Z3 applies bound_is_interesting at the propagation layer,
                             // not at LP-level derivation. Filtering here blocks
                             // transitive cascades through intermediate variables.
-                            {
+                            if self.derived_bound_not_tighter(
+                                target_vi,
+                                is_upper,
+                                &bound_val,
+                                lb_any_strict,
+                            ) {
+                                // Not tighter than the slot: the apply loop would drop it.
+                                self.stats.implied_not_tighter_skips += 1;
+                            } else {
                                 let derived_strict = lb_any_strict;
                                 // #6617: Build eager explanation -- all other variables.
                                 let ib = ImpliedBound {
@@ -1146,6 +1198,16 @@ impl LraSolver {
                             } else {
                                 false
                             };
+                            // Not tighter than the slot: the apply loop would drop it.
+                            if self.derived_bound_not_tighter(
+                                vi,
+                                is_upper,
+                                &bound_val,
+                                derived_strict,
+                            ) {
+                                self.stats.implied_not_tighter_skips += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // (See LB direction comment above for full rationale.)
                             let interesting =
@@ -1180,7 +1242,15 @@ impl LraSolver {
                             let bound_val = &rhs / eq_c;
                             // #8782: Always store single-unbounded implied bounds
                             // (see LB single-unbounded path comment above).
-                            {
+                            if self.derived_bound_not_tighter(
+                                target_vi,
+                                !eq_c.is_positive(),
+                                &bound_val,
+                                ub_any_strict,
+                            ) {
+                                // Not tighter than the slot: the apply loop would drop it.
+                                self.stats.implied_not_tighter_skips += 1;
+                            } else {
                                 let derived_strict = ub_any_strict;
                                 // #6617: Build eager explanation for UB single-unbounded.
                                 let ib = ImpliedBound {
@@ -1545,7 +1615,7 @@ impl LraSolver {
             return true;
         }
         if self.implied_tighten_streak[vi] < IMPLIED_TIGHTEN_STREAK_CAP {
-            self.implied_tighten_streak[vi] += 1;
+            self.implied_tighten_streak[vi] = self.implied_tighten_streak[vi].saturating_add(1);
             return true;
         }
         self.bound_crosses_unassigned_atom(vi as u32, is_upper, &new_ib.value)
@@ -1624,10 +1694,14 @@ impl LraSolver {
                 .is_some_and(|b| matches!(b.value, Rational::Big(_)))
     }
 
+    /// Returns true when either slot's value or strictness changed.
+    /// Replacement happens only for a strictly tighter bound, so this is
+    /// exactly "row analysis could see a different input for this var".
     pub(crate) fn overlay_direct_bound_for_var(
         info: &VarInfo,
         slot: &mut (Option<ImpliedBound>, Option<ImpliedBound>),
-    ) {
+    ) -> bool {
+        let mut changed = false;
         if let Some(b) = &info.lower {
             let direct_lb = ImpliedBound {
                 value: b.value.clone(),
@@ -1646,6 +1720,7 @@ impl LraSolver {
             };
             if replace {
                 slot.0 = Some(direct_lb);
+                changed = true;
             }
         }
         if let Some(b) = &info.upper {
@@ -1666,7 +1741,9 @@ impl LraSolver {
             };
             if replace {
                 slot.1 = Some(direct_ub);
+                changed = true;
             }
         }
+        changed
     }
 }

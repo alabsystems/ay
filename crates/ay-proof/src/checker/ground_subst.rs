@@ -51,6 +51,8 @@ use super::ProofCheckError;
 
 mod normalize;
 mod structural;
+#[cfg(test)]
+mod symbol_tests;
 
 use normalize::normalize_with_substitution;
 use structural::{is_literal_constant, key_occurs_or_binder, substituted_exactly};
@@ -97,7 +99,7 @@ pub(crate) fn validate_ground_equality_substitution(
         let TermData::App(symbol, args) = terms.get(*equality) else {
             return Err(invalid(step_id, "leading literal is not an equality"));
         };
-        if symbol.name() != "=" || args.len() != 2 {
+        if !matches!(symbol, ay_core::Symbol::Named(name) if name == "=") || args.len() != 2 {
             return Err(invalid(step_id, "leading literal is not a binary equality"));
         }
         let (key, value) = (args[0], args[1]);

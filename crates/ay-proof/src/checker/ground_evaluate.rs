@@ -18,6 +18,7 @@ use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
 use super::ProofCheckError;
+mod unsigned_order;
 
 /// Maximum number of term visits/argument edges checked for one literal.
 ///
@@ -42,23 +43,32 @@ enum Value {
     Bool(bool),
     Int(BigInt),
     Real(BigRational),
+    /// A bit-vector of `width` bits holding `value`, `0 <= value < 2^width`.
+    BitVec {
+        width: u32,
+        value: BigInt,
+    },
 }
 
 impl Value {
     fn matches_sort(&self, sort: &Sort) -> bool {
-        matches!(
-            (self, sort),
-            (Self::Bool(_), Sort::Bool) | (Self::Int(_), Sort::Int) | (Self::Real(_), Sort::Real)
-        )
+        match (self, sort) {
+            (Self::Bool(_), Sort::Bool)
+            | (Self::Int(_), Sort::Int)
+            | (Self::Real(_), Sort::Real) => true,
+            (Self::BitVec { width, .. }, Sort::BitVec(sort)) => *width == sort.width,
+            _ => false,
+        }
     }
 
     fn same_kind(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
+        match (self, other) {
             (Self::Bool(_), Self::Bool(_))
-                | (Self::Int(_), Self::Int(_))
-                | (Self::Real(_), Self::Real(_))
-        )
+            | (Self::Int(_), Self::Int(_))
+            | (Self::Real(_), Self::Real(_)) => true,
+            (Self::BitVec { width: left, .. }, Self::BitVec { width: right, .. }) => left == right,
+            _ => false,
+        }
     }
 
     fn bit_size(&self) -> u64 {
@@ -70,6 +80,7 @@ impl Value {
                 .bits()
                 .max(1)
                 .saturating_add(value.denom().bits().max(1)),
+            Self::BitVec { width, .. } => u64::from(*width).max(1),
         }
     }
 }
@@ -163,8 +174,14 @@ impl<'a> Evaluator<'a> {
                 ),
                 0,
             ),
+            TermData::Const(Constant::BitVec { width, .. }) => (Some(u64::from(*width).max(1)), 0),
             TermData::Not(_) | TermData::Ite(_, _, _) => (None, 0),
             TermData::App(Symbol::Named(name), args) if supported_builtin_name(name) => {
+                (None, args.len())
+            }
+            TermData::App(Symbol::Indexed(name, indices), args)
+                if supported_indexed_name(name, indices.len()) =>
+            {
                 (None, args.len())
             }
             _ => return None,
@@ -179,6 +196,12 @@ impl<'a> Evaluator<'a> {
             TermData::Const(Constant::Bool(value)) => Value::Bool(value),
             TermData::Const(Constant::Int(value)) => Value::Int(value),
             TermData::Const(Constant::Rational(value)) => Value::Real(value.0),
+            TermData::Const(Constant::BitVec { value, width }) => {
+                if width == 0 {
+                    return None;
+                }
+                bit_vector(width, value)
+            }
             TermData::Not(inner) => {
                 let Value::Bool(value) = self.eval(inner, depth + 1)? else {
                     return None;
@@ -203,6 +226,9 @@ impl<'a> Evaluator<'a> {
                 }
             }
             TermData::App(Symbol::Named(name), args) => self.eval_app(&name, &args, depth + 1)?,
+            TermData::App(Symbol::Indexed(name, indices), args) => {
+                self.eval_indexed_app(&name, &indices, &args, depth + 1)?
+            }
             // Variables, UFs (handled by the unknown-head arm in `eval_app`),
             // binders, lets, indexed symbols, non-arithmetic constants, and
             // all future term variants are outside this strict fragment.
@@ -337,8 +363,127 @@ impl<'a> Evaluator<'a> {
                 };
                 Some(Value::Int(value))
             }
+            "bvnot" | "bvneg" if args.len() == 1 => {
+                let Value::BitVec { width, value } = self.eval(args[0], depth)? else {
+                    return None;
+                };
+                let modulus = BigInt::one() << width;
+                Some(bit_vector(
+                    width,
+                    if name == "bvnot" {
+                        &modulus - BigInt::one() - value
+                    } else {
+                        modulus - value
+                    },
+                ))
+            }
+            "bvand" | "bvor" | "bvxor" | "bvadd" | "bvmul" if args.len() >= 2 => {
+                let (width, values) = self.eval_bit_vectors(args, depth)?;
+                let mut values = values.into_iter();
+                let first = values.next()?;
+                let result = values.try_fold(first, |acc, value| {
+                    Some(match name {
+                        "bvand" => acc & value,
+                        "bvor" => acc | value,
+                        "bvxor" => acc ^ value,
+                        "bvadd" => acc + value,
+                        _ => {
+                            self.check_estimated_bits(acc.bits().saturating_add(value.bits()))?;
+                            acc * value
+                        }
+                    })
+                })?;
+                Some(bit_vector(width, result))
+            }
+            "bvsub" if args.len() == 2 => {
+                let (width, values) = self.eval_bit_vectors(args, depth)?;
+                let modulus = BigInt::one() << width;
+                Some(bit_vector(width, &values[0] + modulus - &values[1]))
+            }
+            "concat" if args.len() >= 2 => {
+                let mut width = 0u32;
+                let mut result = BigInt::zero();
+                for &arg in args {
+                    let Value::BitVec {
+                        width: part_width,
+                        value,
+                    } = self.eval(arg, depth)?
+                    else {
+                        return None;
+                    };
+                    width = width.checked_add(part_width)?;
+                    self.check_estimated_bits(u64::from(width))?;
+                    result = (result << part_width) | value;
+                }
+                Some(bit_vector(width, result))
+            }
+            // Unsigned value; `bv2int` is Z3's name for SMT-LIB `bv2nat`.
+            "bv2nat" | "bv2int" | "ubv_to_int" if args.len() == 1 => {
+                let Value::BitVec { value, .. } = self.eval(args[0], depth)? else {
+                    return None;
+                };
+                Some(Value::Int(value))
+            }
+            _ => self.eval_unsigned_order(name, args, depth),
+        }
+    }
+
+    fn eval_indexed_app(
+        &mut self,
+        name: &str,
+        indices: &[u32],
+        args: &[TermId],
+        depth: usize,
+    ) -> Option<Value> {
+        match (name, indices, args) {
+            // `((_ int2bv w) n)` is `n mod 2^w`.
+            ("int2bv", [width], [arg]) if *width > 0 => {
+                self.check_estimated_bits(u64::from(*width))?;
+                let Value::Int(value) = self.eval(*arg, depth)? else {
+                    return None;
+                };
+                let modulus = BigInt::one() << *width;
+                Some(bit_vector(*width, euclidean_mod(&value, &modulus)))
+            }
+            ("extract", [high, low], [arg]) if high >= low => {
+                let Value::BitVec { width, value } = self.eval(*arg, depth)? else {
+                    return None;
+                };
+                if *high >= width {
+                    return None;
+                }
+                Some(bit_vector(high - low + 1, value >> *low))
+            }
+            ("zero_extend", [extra], [arg]) => {
+                let Value::BitVec { width, value } = self.eval(*arg, depth)? else {
+                    return None;
+                };
+                let width = width.checked_add(*extra)?;
+                self.check_estimated_bits(u64::from(width))?;
+                Some(bit_vector(width, value))
+            }
             _ => None,
         }
+    }
+
+    /// Evaluate same-width bit-vector operands.
+    fn eval_bit_vectors(&mut self, args: &[TermId], depth: usize) -> Option<(u32, Vec<BigInt>)> {
+        let mut width = None;
+        let mut values = Vec::with_capacity(args.len());
+        for &arg in args {
+            let Value::BitVec {
+                width: arg_width,
+                value,
+            } = self.eval(arg, depth)?
+            else {
+                return None;
+            };
+            if *width.get_or_insert(arg_width) != arg_width {
+                return None;
+            }
+            values.push(value);
+        }
+        Some((width?, values))
     }
 
     fn eval_values(&mut self, args: &[TermId], depth: usize) -> Option<Vec<Value>> {
@@ -383,7 +528,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Some(Value::Real(sum))
             }
-            Value::Bool(_) => None,
+            Value::Bool(_) | Value::BitVec { .. } => None,
         }
     }
 
@@ -393,7 +538,7 @@ impl<'a> Evaluator<'a> {
             return match first {
                 Value::Int(value) => Some(Value::Int(-value)),
                 Value::Real(value) => Some(Value::Real(-value)),
-                Value::Bool(_) => None,
+                Value::Bool(_) | Value::BitVec { .. } => None,
             };
         }
         match first {
@@ -419,7 +564,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Some(Value::Real(difference))
             }
-            Value::Bool(_) => None,
+            Value::Bool(_) | Value::BitVec { .. } => None,
         }
     }
 
@@ -447,7 +592,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Some(Value::Real(product))
             }
-            Value::Bool(_) => None,
+            Value::Bool(_) | Value::BitVec { .. } => None,
         }
     }
 
@@ -483,7 +628,7 @@ impl<'a> Evaluator<'a> {
                 };
                 Some(acc && compare(name, left, right)?)
             }),
-            Value::Bool(_) => None,
+            Value::Bool(_) | Value::BitVec { .. } => None,
         }
     }
 
@@ -534,7 +679,36 @@ fn supported_builtin_name(name: &str) -> bool {
             | "div"
             | "mod"
             | "rem"
+            | "bvnot"
+            | "bvneg"
+            | "bvand"
+            | "bvor"
+            | "bvxor"
+            | "bvadd"
+            | "bvsub"
+            | "bvmul"
+            | "concat"
+            | "bv2nat"
+            | "bv2int"
+            | "ubv_to_int"
+    ) || unsigned_order::UNSIGNED_ORDERS.contains(&name)
+}
+
+/// Indexed heads interpreted by [`Evaluator::eval_indexed_app`].
+fn supported_indexed_name(name: &str, index_count: usize) -> bool {
+    matches!(
+        (name, index_count),
+        ("int2bv" | "zero_extend", 1) | ("extract", 2)
     )
+}
+
+/// A `width`-bit vector holding `value mod 2^width`.
+fn bit_vector(width: u32, value: BigInt) -> Value {
+    let modulus = BigInt::one() << width;
+    Value::BitVec {
+        width,
+        value: euclidean_mod(&value, &modulus),
+    }
 }
 
 fn compare<T: Ord>(name: &str, left: &T, right: &T) -> Option<bool> {
@@ -673,6 +847,99 @@ mod tests {
 
     fn raw_eq(terms: &mut TermStore, left: TermId, right: TermId) -> TermId {
         app(terms, "=", &[left, right], Sort::Bool)
+    }
+
+    fn indexed(
+        terms: &mut TermStore,
+        name: &str,
+        indices: Vec<u32>,
+        args: &[TermId],
+        sort: Sort,
+    ) -> TermId {
+        terms.mk_app(Symbol::indexed(name, indices), args, sort)
+    }
+
+    fn bv(width: u32) -> Sort {
+        Sort::BitVec(ay_core::BitVecSort::new(width))
+    }
+
+    /// `(bv2int ((_ extract 3 0) (bvand (bvnot ((_ int2bv 8) 8))
+    /// (bvsub ((_ int2bv 8) 8) ((_ int2bv 8) 1)))))`: the low bits below the
+    /// lowest set bit of 8, i.e. `7`.
+    fn trailing_mask(terms: &mut TermStore) -> TermId {
+        let eight = terms.mk_int(BigInt::from(8));
+        let one = terms.mk_int(BigInt::from(1));
+        let eight_bv = indexed(terms, "int2bv", vec![8], &[eight], bv(8));
+        let one_bv = indexed(terms, "int2bv", vec![8], &[one], bv(8));
+        let not_eight = app(terms, "bvnot", &[eight_bv], bv(8));
+        let seven_bv = app(terms, "bvsub", &[eight_bv, one_bv], bv(8));
+        let mask = app(terms, "bvand", &[not_eight, seven_bv], bv(8));
+        let low = indexed(terms, "extract", vec![3, 0], &[mask], bv(4));
+        app(terms, "bv2int", &[low], Sort::Int)
+    }
+
+    #[test]
+    fn evaluates_closed_bit_vector_arithmetic_through_integer_conversions() {
+        let mut terms = TermStore::new();
+        let mask = trailing_mask(&mut terms);
+        let seven = terms.mk_int(BigInt::from(7));
+        let equality = raw_eq(&mut terms, mask, seven);
+        assert!(recognize_ground_evaluate(&terms, equality));
+        assert!(validate_ground_evaluate(&terms, ProofId(0), &[equality], 0, &[]).is_ok());
+
+        // Mutant: any other value is refused.
+        let eight = terms.mk_int(BigInt::from(8));
+        let wrong = raw_eq(&mut terms, mask, eight);
+        assert!(!recognize_ground_evaluate(&terms, wrong));
+        assert!(validate_ground_evaluate(&terms, ProofId(0), &[wrong], 0, &[]).is_err());
+    }
+
+    #[test]
+    fn bit_vector_evaluation_wraps_and_concatenates_exactly() {
+        let mut terms = TermStore::new();
+        // `((_ int2bv 4) -1)` is `#xF`; `bv2nat` of its concatenation with
+        // `#x1` is 0xF1.
+        let minus_one = terms.mk_int(BigInt::from(-1));
+        let wrapped = indexed(&mut terms, "int2bv", vec![4], &[minus_one], bv(4));
+        let low = terms.mk_bitvec(BigInt::from(1), 4);
+        let joined = app(&mut terms, "concat", &[wrapped, low], bv(8));
+        let value = app(&mut terms, "bv2nat", &[joined], Sort::Int);
+        let expected = terms.mk_int(BigInt::from(0xF1));
+        let equality = raw_eq(&mut terms, value, expected);
+        assert!(recognize_ground_evaluate(&terms, equality));
+
+        // `bvneg`/`bvadd` wrap modulo 2^w; `zero_extend` keeps the value.
+        let three = terms.mk_bitvec(BigInt::from(3), 4);
+        let negated = app(&mut terms, "bvneg", &[three], bv(4));
+        let sum = app(&mut terms, "bvadd", &[negated, three], bv(4));
+        let widened = indexed(&mut terms, "zero_extend", vec![4], &[sum], bv(8));
+        let zero = app(&mut terms, "bv2nat", &[widened], Sort::Int);
+        let zero_value = terms.mk_int(BigInt::zero());
+        let zero_equality = raw_eq(&mut terms, zero, zero_value);
+        assert!(recognize_ground_evaluate(&terms, zero_equality));
+    }
+
+    #[test]
+    fn bit_vector_evaluation_refuses_ill_formed_operands() {
+        let mut terms = TermStore::new();
+        let four_bits = terms.mk_bitvec(BigInt::from(1), 4);
+        let eight_bits = terms.mk_bitvec(BigInt::from(1), 8);
+        // Width mismatch.
+        let mixed = app(&mut terms, "bvand", &[four_bits, eight_bits], bv(4));
+        let mixed_value = app(&mut terms, "bv2nat", &[mixed], Sort::Int);
+        let one = terms.mk_int(BigInt::from(1));
+        let mixed_equality = raw_eq(&mut terms, mixed_value, one);
+        assert!(!recognize_ground_evaluate(&terms, mixed_equality));
+        // Extract beyond the operand width.
+        let beyond = indexed(&mut terms, "extract", vec![4, 0], &[four_bits], bv(5));
+        let beyond_value = app(&mut terms, "bv2nat", &[beyond], Sort::Int);
+        let beyond_equality = raw_eq(&mut terms, beyond_value, one);
+        assert!(!recognize_ground_evaluate(&terms, beyond_equality));
+        // A free bit-vector variable is not closed.
+        let free = terms.mk_var("b", bv(4));
+        let free_value = app(&mut terms, "bv2nat", &[free], Sort::Int);
+        let free_equality = raw_eq(&mut terms, free_value, one);
+        assert!(!recognize_ground_evaluate(&terms, free_equality));
     }
 
     #[test]

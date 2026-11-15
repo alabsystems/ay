@@ -1,0 +1,97 @@
+{
+  "scope": "Independent wide square-root and rounded-conversion source qualification; original public query now SAT; publication pending",
+  "base_source": "c436b78ca",
+  "compiler_lane": "targo --unverified; unchanged checked-in configuration; native c983 Targo and managed Trust16387",
+  "command": "build-slot -- targo --unverified test --offline --locked -p ay-model-check --lib -- sqrt fp_arithmetic_exact wide_fp_arithmetic",
+  "result": {
+    "exit_code": 0,
+    "selected_passed": 29,
+    "failed": 0,
+    "build_seconds": 39.29,
+    "test_seconds": 0.01,
+    "note": "Selection also includes existing algebraic tests matched by sqrt; not a whole-crate or compiler-verification claim"
+  },
+  "source_sha256": {
+    "src/fp.rs": "5ddac7d0ed3ecbc95ffe0a572e8ef13e205949900e03c715fd07a2ac0251ab98",
+    "src/fp_exact/arithmetic.rs": "f28d3252cd00193eddc0e9f3ee3139d1ddd6524bfdd8535e1f0133b3406aaf9c",
+    "src/eval.rs": "9fb309f09af08c18360e02bc52af402ad1f4062b685a4225d2f56ccf6c53402b",
+    "src/eval/fp_arithmetic_admission_tests.rs": "088d9c9fb703460a070c4951f95a862386c77f48f36c2abc97fd9b2d1d4b9c1c",
+    "src/tests/fp_arithmetic_exact.rs": "137b8fefde7a1305a9507fb0060f0e15f558adda14210f091cba81e0da937631"
+  },
+  "log_sha256": "4ed19c634caad70851884303daa8474f7ad693573d85d107a21bff76d590d56f",
+  "test_image_sha256": "388a6953c664d99380c3569051bb937d6b2a5794c566de07cd050b4ca7e6214b",
+  "reference": {
+    "version": "Z3 5.3.3",
+    "binary_sha256": "9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4",
+    "command": "z3 -T:10 memory_max_size=256 fp-wide-sqrt-reference.smt2",
+    "input_sha256": "724381f9e699f4610d7788fbf2bfcf4d4b4c51b941d4f198d2ee3b22ff38d822",
+    "expected_claims": 55,
+    "result": "unsat",
+    "exit_code": 0,
+    "log_sha256": "5c17dfcc2a8f1f30d9e96df6a9825a5030ade046d560332c19de74d93d591a18",
+    "discarded_attempt": "Original QF_FP declaration excluded the explicit BV operations; exit1 parser errors plus a trailing SAT are not a solver verdict. Corrected only the logic to QF_FPBV before the recorded successful run. Original error log retained."
+  },
+  "public_baseline": {
+    "input_sha256": "f61868c7cfbaa0f9af7249af9b46c87a3b6da7ae7a6d3e7d52118e1bb309e510",
+    "ay_source": "76cab0dd4cdd11b5d37e8e713b7a0b0c77b3ffc7",
+    "ay_build": 14956,
+    "ay_binary_sha256": "768f39188c3c6ff8954f6bc965ed5d1417270b86b948abed99defb57527c46ad",
+    "ay_command": "ay solve --timeout 5000 --memory 256 fp-wide-sqrt.smt2",
+    "ay_result": "unknown; incomplete",
+    "ay_log_sha256": "157fa86fb249131397be3ad02f3aa7f1c777dfdad1e85cf6ee9971bfc259d5bb",
+    "reference_command": "z3 -T:5 memory_max_size=256 fp-wide-sqrt.smt2",
+    "reference_result": "sat",
+    "reference_log_sha256": "863ce454a0d23597fdc0d2a6c43abc1bdcb34c27e94ae55f28e00102658c3f96",
+    "exit_codes": [0, 0],
+    "after": {
+      "build": 14970,
+      "source": "aa6c4c160b0129eb3d66074816af106ccb66adfd",
+      "binary_sha256": "08907502c90947b2b483e6ecd523ef4addcde6e8b6e3066b32d6a3aea121ffd9",
+      "build_command": "build-slot -- targo --unverified build --offline --locked -p ay --features cli --bin ay",
+      "build_seconds": 632,
+      "command": "ay solve --stats-json --timeout 5000 --memory 256 fp-wide-sqrt.smt2",
+      "result": "unknown; incomplete",
+      "exit_code": 0,
+      "log_sha256": "6d0ef0e5b435d8e77ca625917b45d537aff6c9668a4118162a2726a1a9e9228d",
+      "diagnostic": "All-statistics names model-check-gate.cannot-confirm-reason: unsupported floating-point format. Rounded to_fp Real conversion still calls the bounded native carrier; retain original input and fix that operation.",
+      "diagnostic_log_sha256": "a6503083e6144cba12da68c3ec666a21e8e0a88e8e2308ad8493b3bd7a025071"
+    }
+  },
+  "public_field_twin": {
+    "input": "fp-wide-sqrt-fields.smt2",
+    "input_sha256": "eb86643d7cf04ead0d93947b19f557eb15815f42d0baf290895a2d3cb2ec402b",
+    "purpose": "Discriminate independent square root from the separate rounded to_fp gap. Both inputs remain requirements; this twin does not replace the original query.",
+    "before": "AY14956 unknown",
+    "after": "AY14970 sat under default assurance",
+    "reference": "Pinned Z3 5.3.3 sat",
+    "exit_codes": [0, 0, 0],
+    "logs_sha256": {
+      "before": "08c047a7aaf57384fc1bf5a3e1ea2852d3fd7c6cf3f9fcec97fa6add665421d6",
+      "after": "dd45079e906efe7098ae06905d5c6287d1418d796d68bad3fdf03a368395ec8f",
+      "reference": "863ce454a0d23597fdc0d2a6c43abc1bdcb34c27e94ae55f28e00102658c3f96"
+    }
+  },
+  "rounded_conversion_followup": {
+    "source_commit": "6f5d108035512676cff7ab303fdf385b6dcf7de7",
+    "merged_source": "17c51142368e97f76d61d82a34ff32a5442a14da",
+    "source_controls": "814 existing/final-production controls passed in full-library invocation; 2 new fixture expectations failed. Only those test fixtures changed; both corrected controls passed separately. No single all-816-green invocation claim.",
+    "build": 14973,
+    "binary_sha256": "917ce88b3fb28b0b425a76a4c6a0eae6ff1420e07431e2d60463b354d8fa0858",
+    "build_seconds": 325,
+    "build_log_sha256": "1e8f01df28e8f4a8b87e2e494cea6cbe6e5b0435d17bc5104b0d34bd567fec99",
+    "original_query_result": "sat; input unchanged; default assurance; 5000ms/256MiB; exit0",
+    "original_query_log_sha256": "e87d0d521d68033b0ce25e2869d8e9c9f682ce42a704611cea805bcabd8738c5",
+    "wrong_conversion_claims": {
+      "input": "fp-wide-rounded-conversions.smt2",
+      "input_sha256": "c5d19c192edcbe6db0bbc78305a7bd9dcb06c740a949eb080b91d269e1f5d6dd",
+      "claims": 9,
+      "reference_result": "pinned Z3 5.3.3 unsat; 10s/256MiB; exit0",
+      "reference_log_sha256": "8d4e8e52eb6f3ec2a8615824e2974246575037b430aac8154c7b0015c64c7d23",
+      "ay_result": "unsat; default assurance; strict native E2, corroboration none; exit0",
+      "ay_log_sha256": "a957f92f091f89f2ac935f9fc2b25acfb27c5cb5cc41aa1a9d32d4872128eaa0",
+      "external_proof": "Unsupported FP surface, one rendered hole; neither external Alethe acceptance nor formal compiler verification is claimed"
+    }
+  },
+  "retained_logs": "Public outputs and unsupported artifact: the development design notes Source qualification/build logs: /tmp/.ubd/ay-session-config/.",
+  "limits": "Original evaluator cumulative work/storage/callbacks, existing exact dyadic/rounding envelope; no new allowance, cache, flag, solver arithmetic dependency or proof-transport claim"
+}

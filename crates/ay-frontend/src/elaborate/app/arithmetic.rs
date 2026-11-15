@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use ay_core::{Sort, Symbol, TermId};
+use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -23,6 +23,9 @@ impl Context {
                     ));
                 }
                 self.maybe_promote_arithmetic_args(arg_ids)?;
+                if self.preserve_sequence_power {
+                    return self.preserve_ring_application("+", arg_ids).map(Some);
+                }
                 Ok(Some(self.terms.mk_add(arg_ids.to_vec())))
             }
             "-" => {
@@ -32,6 +35,9 @@ impl Context {
                     ));
                 }
                 self.maybe_promote_arithmetic_args(arg_ids)?;
+                if self.preserve_sequence_power {
+                    return self.preserve_ring_application("-", arg_ids).map(Some);
+                }
                 Ok(Some(self.terms.mk_sub(arg_ids.to_vec())))
             }
             // Z3 5.0.0 registers `~` as the unary-minus spelling. Unlike
@@ -59,7 +65,30 @@ impl Context {
                     ));
                 }
                 self.maybe_promote_arithmetic_args(arg_ids)?;
+                if self.preserve_sequence_power {
+                    return self.preserve_ring_application("*", arg_ids).map(Some);
+                }
                 Ok(Some(self.terms.mk_mul(arg_ids.to_vec())))
+            }
+            "^" if self.preserve_sequence_power => {
+                if arg_ids.len() != 2 {
+                    return Err(ElaborateError::InvalidConstant(
+                        "^ requires two arguments".into(),
+                    ));
+                }
+                self.maybe_promote_arithmetic_args(arg_ids)?;
+                let sort = self.terms.sort(arg_ids[0]).clone();
+                if !matches!(sort, Sort::Int | Sort::Real) {
+                    return Err(ElaborateError::InvalidConstant(
+                        "^ requires arithmetic arguments".into(),
+                    ));
+                }
+                self.expect_all_args_sort(arg_ids, &sort)?;
+                Ok(Some(self.terms.mk_app(
+                    Symbol::Named("^".into()),
+                    arg_ids.to_vec(),
+                    Sort::Real,
+                )))
             }
             "^" => Ok(Some(self.elaborate_power(arg_ids)?)),
             "**" => Ok(Some(self.elaborate_integer_power(arg_ids)?)),
@@ -212,8 +241,13 @@ impl Context {
     /// SMT-LIB (Reals_Ints §3.8) defines `^` as partial. This elaborator
     /// unfolds `(^ base n)` when `n` is a concrete integer literal:
     ///
-    /// * `n == 0` → `1` (SMT-LIB: `x^0 = 1` for all `x`, including `0^0`
-    ///   per Z3's convention of treating `0^0 = 1` via `^0`).
+    /// * `n == 0` → `1` for a nonzero numeral base. Otherwise
+    ///   `(ite (= base 0) <0^0> 1)`, where `<0^0>` is one private constant per
+    ///   base sort: z3 keeps `0^0` as its uninterpreted `^0` (libz3 5.1.0
+    ///   answers `(assert (= r (^ 0.0 0.0))) (assert (not (= r 1.0)))` `sat`
+    ///   with `^0 = [else -> 2]`, and `(^ 0 0)` over Int and `(^ 0.0 0.0)` take
+    ///   independent values), so `0^0` is one unconstrained value per sort and
+    ///   `x^0` is `1` wherever `x` is nonzero.
     /// * `n == 1` → `base`.
     /// * `n > 1` → `base * base * ... * base` (n factors).
     /// * `n < 0` → `(ite (= base 0) <fresh> (/ 1 base^|n|))`. The fresh
@@ -225,6 +259,21 @@ impl Context {
     /// uninterpreted function is unsound: constraints on the exponent can make
     /// Z3 prove facts that EUF alone cannot see.
     #[allow(clippy::too_many_lines)]
+    // Explicit simplification must see the authored ring structure: eager
+    // arithmetic normalization here would erase flat/max_degree semantics.
+    fn preserve_ring_application(&mut self, head: &str, args: &[TermId]) -> Result<TermId> {
+        let sort = self.terms.sort(args[0]).clone();
+        if !matches!(sort, Sort::Int | Sort::Real) {
+            return Err(ElaborateError::InvalidConstant(
+                "arithmetic arguments required".into(),
+            ));
+        }
+        self.expect_all_args_sort(args, &sort)?;
+        Ok(self
+            .terms
+            .mk_app_structural(Symbol::Named(head.into()), args, sort))
+    }
+
     fn elaborate_power(&mut self, arg_ids: &[TermId]) -> Result<TermId> {
         if arg_ids.len() != 2 {
             return Err(ElaborateError::InvalidConstant(format!(
@@ -246,6 +295,9 @@ impl Context {
         let exp_int = self.terms.extract_integer_constant(exp);
 
         if let Some(n) = exp_int {
+            if n.is_zero() {
+                return Ok(self.power_zero_exponent(base, &base_sort));
+            }
             return self.unfold_integer_power(base, &base_sort, &n);
         }
 
@@ -310,6 +362,48 @@ impl Context {
         Ok(self.terms.mk_intdiv(one, positive_power))
     }
 
+    /// `(^ base exp)` for an exponent equal to zero: `1` for a nonzero
+    /// numeral base, else `(ite (= base 0) <0^0> 1)` (see `elaborate_power`).
+    ///
+    /// `<0^0>` is the elaborator-private constant [`zero_power_of_zero`] of
+    /// the base sort, shared by every `0^0` of that sort, so `0^0` is
+    /// functionally consistent (`(^ a 0)` and `(^ 0.0 0.0)` agree when
+    /// `a = 0`, as z3's `^0` makes them) while a forced-nonzero base still
+    /// folds to `1` in the solver (`(not (= a 0.0))` with `(^ a 0.0) != 1` is
+    /// unsat).
+    fn power_zero_exponent(&mut self, base: TermId, base_sort: &Sort) -> TermId {
+        let (one, zero) = match base_sort {
+            Sort::Real => (
+                self.terms.mk_rational(BigRational::one()),
+                self.terms.mk_rational(BigRational::zero()),
+            ),
+            _ => (
+                self.terms.mk_int(BigInt::one()),
+                self.terms.mk_int(BigInt::zero()),
+            ),
+        };
+        if self.is_nonzero_numeral(base) {
+            return one;
+        }
+        let is_base_zero = self.terms.mk_eq(base, zero);
+        let zero_power = self
+            .terms
+            .mk_var(zero_power_of_zero(base_sort), base_sort.clone());
+        self.terms.mk_ite(is_base_zero, zero_power, one)
+    }
+
+    /// Whether `term` is a numeral other than zero (`2`, `0.5`, `(- 3)`).
+    fn is_nonzero_numeral(&self, term: TermId) -> bool {
+        match self.terms.get(term) {
+            TermData::Const(Constant::Int(n)) => !n.is_zero(),
+            TermData::Const(Constant::Rational(r)) => !r.0.is_zero(),
+            TermData::App(symbol, args) if symbol.name() == "-" && args.len() == 1 => {
+                self.is_nonzero_numeral(args[0])
+            }
+            _ => false,
+        }
+    }
+
     /// Unfold `(^ base n)` where `n` is a concrete integer.
     fn unfold_integer_power(
         &mut self,
@@ -317,14 +411,7 @@ impl Context {
         base_sort: &Sort,
         n: &BigInt,
     ) -> Result<TermId> {
-        // n == 0: return 1 in the base's sort.
-        if n.is_zero() {
-            return Ok(match base_sort {
-                Sort::Real => self.terms.mk_rational(BigRational::one()),
-                _ => self.terms.mk_int(BigInt::one()),
-            });
-        }
-
+        // n == 0 is `power_zero_exponent`'s; `repeated_product` refuses it.
         let abs_n = n.abs();
         let positive_power = self.repeated_product(base, &abs_n)?;
 
@@ -411,3 +498,18 @@ impl Context {
         })
     }
 }
+
+/// The name of the private constant standing for `0^0` over `sort` (`Int`
+/// or `Real`). It is in the internal `!ay.` namespace, which source text
+/// cannot declare (`is_source_reserved_symbol`), so it never collides with a
+/// user symbol. It is not in the `__ay_` namespace: the engine reads those
+/// names as solver-minted witnesses, and its model validation skips the
+/// assertions holding one (measured: `(assert (= (^ 0.0 0.0) 1.0))` answered
+/// unknown, "all 2 assertions were skipped").
+fn zero_power_of_zero(sort: &Sort) -> String {
+    format!("!ay.zero-power-of-zero.{sort}")
+}
+
+#[cfg(test)]
+#[path = "arithmetic_power_zero_tests.rs"]
+mod power_zero_tests;

@@ -1,0 +1,34 @@
+pseudo-Boolean proof version 2.0
+f 1
+pre_order triv
+    vars
+        left u1
+        right v1
+        aux a1
+    end
+    spec
+        red 1 ~a1 >= 1 ; a1 → 0 ; begin
+        end
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+            fresh_aux_1 b1
+            fresh_aux_2 c1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order triv x1
+red 1 a1 >= 1 ; a1 → 1 ; begin
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

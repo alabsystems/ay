@@ -1,0 +1,36 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. The formula is the single clause `x1 OR x2`. There is
+% nothing unusual about it at all -- no large coefficients, no negative degree,
+% it is what a DIMACS `1 2 0` becomes. Three of its four assignments are models.
+% `sat.pbp` here makes the same checker say `s VERIFIED SATISFIABLE`.
+%
+% This is the UNIVERSAL form of defect 9: the forgery needs no cooperation from
+% the formula, because the proof introduces its own poisoned rows.
+%
+% Lines 1 and 2 of the derivation `rup` two constraints with a hugely NEGATIVE
+% degree. Both are TRIVIALLY TRUE, so VeriPB accepts them immediately and
+% legitimately (a trivial conclusion is a valid RUP conclusion). Nothing is
+% forged yet -- the database is still equivalent to the formula.
+%
+% But `GeneralPBWatcher::{get_assignment_independent_propagations,
+% no_watches_required, is_propagating_independent_of_assignment}` compute the
+% propagation slack as `coeff_sum - degree` in the row's OWN integer width. For
+% `2 x1 >= -9223372036854775806` that is 2 + 9223372036854775806 = 2^63, one
+% past i64::MAX, so it wraps to i64::MIN. Every coefficient is then "greater
+% than the slack", and the propagator reports that these two trivially true
+% rows propagate ALL their literals unconditionally: row 2 asserts x1, row 3
+% asserts ~x1. The trail is now in conflict, so line 3 RUPs the empty
+% contradiction and `conclusion UNSAT` is verified.
+%
+% Consequence: at this pin, NO `s VERIFIED UNSATISFIABLE` from this checker is
+% evidence of anything, for any formula. Three proof lines forge it.
+%
+% Control: change both -9223372036854775806 to -9223372036854775805. The slack
+% is then exactly i64::MAX, no wrap occurs, and line 3 is REJECTED.
+f 1 ;
+rup 2 x1 >= -9223372036854775806 ;
+rup 2 ~x1 >= -9223372036854775806 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

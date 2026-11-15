@@ -32,7 +32,8 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{TermId, TermStore};
 
-use super::pattern::{BoundVarScopeMemo, EqualityClasses, TermIndex};
+use super::occurrences::GroundOccurrences;
+use super::pattern::{EqualityClasses, TermIndex};
 
 /// Persistent, incrementally-maintained E-matching index/eqclass/seen state.
 ///
@@ -43,16 +44,9 @@ pub(crate) struct PersistentMatchState {
     // ---- Term index (LI-1/LI-2) ----
     /// The ground-term index, persisted and incrementally extended.
     index: TermIndex,
-    /// Reachability short-circuit set carried across refresh calls
-    /// (collect_reachable_term_ids `seen`).
-    reachable_seen: HashSet<u32>,
-    /// Bound-variable classification, monotone within a solve (a Var never
-    /// transitions bound -> free because the term DAG is immutable).
-    bound_var_ids: HashSet<u32>,
-    /// `index_term` seen set: ids already classified/indexed.
-    index_seen: HashSet<u32>,
-    /// `is_ground_cached` memo, persisted (pure function of the DAG + bound_var_ids).
-    ground_cache: HashMap<u32, bool>,
+    /// Scope-keyed groundness and candidate occurrence memo. It is monotone
+    /// within a round group and reset whenever assertions can be retracted.
+    occurrences: GroundOccurrences,
     /// Watermark used ONLY as a fast no-op guard, never as a scan bound.
     indexed_term_revision: usize,
 
@@ -64,6 +58,10 @@ pub(crate) struct PersistentMatchState {
     /// TermId (NOT a positional pointer) so it is correct regardless of which
     /// caller's re-cloned/reordered assertion vector is passed (LI-7).
     folded_eq_atoms: HashSet<u32>,
+
+    /// Instances of derived-entailed universals over instance-minted terms
+    /// admitted in this epoch (#derived-entailment-depth).
+    derived_deep_admitted: usize,
 
     // ---- Instantiation memo (LI-3/LI-4/LI-10) ----
     /// Cross-round dedup memo of (quantifier, binding). Pure performance memo;
@@ -141,10 +139,7 @@ impl PersistentMatchState {
             index: TermIndex {
                 by_symbol: HashMap::default(),
             },
-            reachable_seen: HashSet::default(),
-            bound_var_ids: HashSet::default(),
-            index_seen: HashSet::default(),
-            ground_cache: HashMap::default(),
+            occurrences: GroundOccurrences::default(),
             indexed_term_revision: 0,
             assertion_eqclasses: EqualityClasses::new_empty(),
             folded_eq_atoms: HashSet::default(),
@@ -156,6 +151,7 @@ impl PersistentMatchState {
             epoch_matched_bindings: HashMap::default(),
             instantiated_order: Vec::new(),
             compaction_epoch: 0,
+            derived_deep_admitted: 0,
         }
     }
 
@@ -165,71 +161,32 @@ impl PersistentMatchState {
         *self = Self::new();
     }
 
+    /// Take one unit of the epoch's budget for instances of derived-entailed
+    /// universals over instance-minted terms; `false` once it is spent
+    /// (#derived-entailment-depth).
+    pub(crate) fn admit_derived_deep_instance(&mut self) -> bool {
+        if self.derived_deep_admitted < super::DERIVED_ENTAILMENT_DEEP_BUDGET {
+            self.derived_deep_admitted += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     // ===================== Index (LI-1 / LI-2) =====================
 
     /// Refresh the term index INCREMENTALLY by walking the NEW assertion roots.
     ///
     /// `assertions` is the cumulative slice the caller has folded up to this
-    /// round. Roots already walked (tracked via `reachable_seen`) short-circuit;
-    /// genuinely new roots are descended via `terms.get`, classified, and their
-    /// new ground Apps are sorted-inserted into `by_symbol`.
+    /// round. A memo keyed by `(TermId, binder scope)` short-circuits previously
+    /// visited occurrences, while a newly free occurrence of an old TermId can
+    /// still add that App to the index.
     pub(crate) fn refresh_index(&mut self, terms: &TermStore, assertions: &[TermId]) {
         self.assert_compaction_unchanged(terms);
 
-        for &root in assertions {
-            // Walk new reachable subterms from this root. `reachable_seen` is
-            // persistent, so a root (or subterm) already visited contributes
-            // nothing. This handles constant-folded LOW-id roots whose ids are
-            // below `indexed_term_revision` but were never reachable before
-            // (LI-1) — an id-range scan would miss them.
-            let mut reachable_new: Vec<TermId> = Vec::new();
-            TermIndex::collect_reachable_term_ids(
-                terms,
-                root,
-                &mut reachable_new,
-                &mut self.reachable_seen,
-            );
-            if reachable_new.is_empty() {
-                continue;
-            }
-            // Mirror the full rebuild: process newly-reachable ids in ascending
-            // TermId order (pattern.rs:59).
-            reachable_new.sort_unstable_by_key(|t| t.0);
-
-            // Pass: classify bound vars over the new ids. `bound_names` MUST be a
-            // FRESH local scope stack per refresh call (push/pop balanced within a
-            // root walk); only `bound_var_ids` persists.
-            let mut bound_names: HashSet<String> = HashSet::default();
-            // Memo for this root walk only; it is paired with the accumulator
-            // `self.bound_var_ids` and with the immutable `terms` borrow, and is
-            // dropped before either can change (see `BoundVarScopeMemo`).
-            let mut bound_var_memo = BoundVarScopeMemo::default();
-            for &id in &reachable_new {
-                TermIndex::collect_bound_var_ids(
-                    terms,
-                    id,
-                    &mut self.bound_var_ids,
-                    &mut bound_names,
-                    &mut bound_var_memo,
-                );
-            }
-            debug_assert!(
-                bound_names.is_empty(),
-                "bound_names must be push/pop balanced after a root walk"
-            );
-
-            // Pass: index the new ids. `index_term` short-circuits ids already in
-            // `index_seen` and sorted-inserts new ground Apps (LI-2).
-            for &id in &reachable_new {
-                TermIndex::index_term(
-                    terms,
-                    id,
-                    &mut self.index.by_symbol,
-                    &mut self.index_seen,
-                    &self.bound_var_ids,
-                    &mut self.ground_cache,
-                );
-            }
+        self.occurrences.visit_assertions(terms, assertions);
+        for id in self.occurrences.take_new_ground_apps() {
+            TermIndex::insert_ground_app(terms, id, &mut self.index.by_symbol);
         }
         self.indexed_term_revision = terms.len();
 
@@ -272,6 +229,7 @@ impl PersistentMatchState {
     /// un-merge.
     pub(crate) fn working_eqclasses(
         &self,
+        terms: &TermStore,
         euf_model: Option<&ay_euf::EufModel>,
     ) -> EqualityClasses {
         #[cfg(debug_assertions)]
@@ -279,7 +237,12 @@ impl PersistentMatchState {
 
         let mut working = self.assertion_eqclasses.clone();
         if let Some(model) = euf_model {
-            working.augment_with_euf_model(model);
+            working.augment_with_euf_model(
+                model,
+                terms,
+                &self.occurrences.bound_var_ids,
+                &self.occurrences.ground_ids,
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -384,6 +347,7 @@ impl PersistentMatchState {
     ///    assertion set only grows monotonically and the incremental update is
     ///    exact.
     pub(crate) fn begin_epoch(&mut self, baseline: usize) {
+        self.derived_deep_admitted = 0;
         self.truncate_seen_to(baseline);
         self.seen_epoch_base = self.seen_order.len();
         self.reset_index_eqclasses();
@@ -409,10 +373,7 @@ impl PersistentMatchState {
         self.index = TermIndex {
             by_symbol: HashMap::default(),
         };
-        self.reachable_seen.clear();
-        self.bound_var_ids.clear();
-        self.index_seen.clear();
-        self.ground_cache.clear();
+        self.occurrences = GroundOccurrences::default();
         self.indexed_term_revision = 0;
 
         self.assertion_eqclasses = EqualityClasses::new_empty();
@@ -571,9 +532,9 @@ impl PersistentMatchState {
     // ===================== Scope snapshot/restore (push/pop) =====================
 
     /// Snapshot the assertion-only eqclasses + folded-atom set for push().
-    /// The index is intentionally NOT snapshotted: it is monotone-safe (extra
-    /// ground candidates only widen matches -> extra valid instances -> never a
-    /// false UNSAT, G4/LI-2), so it may persist across scopes without restore.
+    /// The index is intentionally NOT snapshotted on push/pop. No matching runs
+    /// during scope restoration; `begin_epoch` resets it before the next solve,
+    /// so no retracted free occurrence can survive as a candidate.
     pub(crate) fn snapshot_eqclasses(&self) -> (EqualityClasses, HashSet<u32>) {
         (
             self.assertion_eqclasses.clone(),
@@ -700,7 +661,7 @@ mod tests {
         let mut m1 = EufModel::default();
         m1.term_values.insert(a, "e0".to_string());
         m1.term_values.insert(b, "e0".to_string());
-        let working1 = state.working_eqclasses(Some(&m1));
+        let working1 = state.working_eqclasses(&terms, Some(&m1));
         assert!(
             working1.in_same_class(a, b),
             "round-1 working copy reflects M1's a~b"
@@ -710,7 +671,7 @@ mod tests {
         let mut m2 = EufModel::default();
         m2.term_values.insert(a, "e1".to_string());
         m2.term_values.insert(z, "e1".to_string());
-        let working2 = state.working_eqclasses(Some(&m2));
+        let working2 = state.working_eqclasses(&terms, Some(&m2));
         assert!(
             working2.in_same_class(a, z),
             "round-2 working copy reflects M2's a~z"
@@ -724,6 +685,68 @@ mod tests {
         assert!(
             state.assertion_eqclasses.is_empty(),
             "LI-6: the persisted eqclasses must carry no EUF congruence"
+        );
+    }
+
+    /// #ematching-model-class-ground: a model value on a term that mentions a
+    /// quantifier-bound variable must not merge that term into a ground class.
+    /// Otherwise a nested pattern matches a ground candidate THROUGH the
+    /// binder-mentioning member and binds the pattern variable to the
+    /// quantifier's own binder (measured on deductive-checks `C_sets/87167-00066`).
+    #[test]
+    fn test_euf_model_augmentation_skips_binder_mentioning_terms() {
+        let mut terms = TermStore::new();
+        let s = Sort::Int;
+        let a = terms.mk_app(Symbol::named("a"), vec![], s.clone());
+        let zero = terms.mk_int(BigInt::from(0));
+        let x = terms.mk_var("x", s.clone());
+        let g_x = terms.mk_app(Symbol::named("g"), vec![x], s.clone());
+        let g_a = terms.mk_app(Symbol::named("g"), vec![a], s.clone());
+        let p_gx = terms.mk_app(Symbol::named("p"), vec![g_x], Sort::Bool);
+        let forall = terms.mk_forall(vec![("x".to_string(), s.clone())], p_gx);
+        let p_ga = terms.mk_app(Symbol::named("p"), vec![g_a], Sort::Bool);
+
+        let mut state = PersistentMatchState::new();
+        // The index walk is what records `x` as bound; the eqclass fold reads
+        // that record.
+        state.refresh_index(&terms, &[forall, p_ga]);
+        state.refresh_eqclasses(&terms, &[forall, p_ga]);
+        assert!(
+            state.occurrences.bound_var_ids.contains(&x.0),
+            "fixture: the binder must be recorded as bound by the index walk"
+        );
+
+        // The model values the binder-mentioning `(g x)` like the ground `0`
+        // and `(g a)`.
+        let mut model = EufModel::default();
+        model.term_values.insert(g_x, "e0".to_string());
+        model.term_values.insert(zero, "e0".to_string());
+        model.term_values.insert(g_a, "e0".to_string());
+        let working = state.working_eqclasses(&terms, Some(&model));
+        assert!(
+            working.in_same_class(zero, g_a),
+            "ground terms sharing a model value still merge"
+        );
+        assert!(
+            !working.in_same_class(zero, g_x),
+            "a term mentioning a bound variable must never join a ground class"
+        );
+        assert!(
+            !working.class_members(zero).contains(&g_x.0),
+            "and it must not be enumerable as a class member either"
+        );
+
+        // The *same* DAG term can also occur free. That asserted occurrence
+        // then legitimizes its model entry; binder-only filtering must not
+        // suppress it globally by TermId.
+        let free_gx = terms.mk_app(Symbol::named("Q"), vec![g_x], Sort::Bool);
+        state.begin_round_group();
+        state.refresh_index(&terms, &[forall, p_ga, free_gx]);
+        state.refresh_eqclasses(&terms, &[forall, p_ga, free_gx]);
+        let working_with_free = state.working_eqclasses(&terms, Some(&model));
+        assert!(
+            working_with_free.in_same_class(zero, g_x),
+            "a free occurrence admits the shared model term"
         );
     }
 

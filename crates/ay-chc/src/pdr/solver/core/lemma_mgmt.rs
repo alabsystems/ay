@@ -328,8 +328,25 @@ impl PdrSolver {
             }
         }
 
+        // Workstream B board: per-lemma trace line (only computed when tracing).
+        let lemma_lits_for_trace = if self.tracing.tla_trace.is_some() {
+            Some(match &lemma.formula {
+                ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
+                    args[0].collect_conjuncts_nontrivial().len()
+                }
+                _ => 1,
+            })
+        } else {
+            None
+        };
+        let lemma_pred = lemma.predicate;
         self.add_lemma_to_frame(lemma, level);
-        self.pdr_trace_step("Running", Some("LearnLemma"), None);
+        // Lock L3 (debug builds, lane only): F_k ⇒ F_{k+1} syntactically.
+        self.debug_check_frame_hyp_monotone(level, lemma_pred);
+        match lemma_lits_for_trace {
+            Some(n) => self.pdr_trace_learn_lemma(n, level),
+            None => self.pdr_trace_step("Running", Some("LearnLemma"), None),
+        }
         tracing::info!(
             action = "LearnLemma",
             level,

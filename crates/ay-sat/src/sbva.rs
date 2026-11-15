@@ -33,6 +33,8 @@
 #[path = "sbva_tests.rs"]
 mod tests;
 
+mod counted;
+
 use crate::clause_arena::ClauseArena;
 use crate::literal::{Literal, Variable};
 use crate::occ_list::OccList;

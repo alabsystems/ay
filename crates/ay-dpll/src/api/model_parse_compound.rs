@@ -48,6 +48,7 @@ pub(crate) fn parse_value_sexp(sexp: &ay_frontend::SExpr, sort: &Sort) -> ModelV
         },
         Sort::Array(arr) => parse_array_value(sexp, &arr.element_sort),
         Sort::FloatingPoint(eb, sb) => parse_fp_value(sexp, *eb, *sb),
+        Sort::FiniteField(field) => super::model_parse::parse_field_literal(sexp, *field),
         Sort::Datatype(_) => parse_dt_value(sexp, sort),
         Sort::RegLan => ModelValue::Unknown,
         Sort::Seq(elem_sort) => parse_seq_value(sexp, elem_sort),
@@ -123,8 +124,14 @@ pub(crate) fn parse_array_value(sexp: &ay_frontend::SExpr, element_sort: &Sort) 
         match current.as_list() {
             Some(items) if items.len() == 4 && items[0].is_symbol("store") => {
                 // (store <base> <index> <value>)
+                // The stored value has the array's element sort: reading it by
+                // syntax alone made `(- (/ 3 2))` an uninterpreted token, and
+                // the Z3 API then had no value for an `(Array Int Real)`.
                 let index = parse_value_for_array_elem(&items[2]);
-                let value = parse_value_for_array_elem(&items[3]);
+                let value = match parse_value_sexp(&items[3], element_sort) {
+                    ModelValue::Unknown => parse_value_for_array_elem(&items[3]),
+                    value => value,
+                };
                 stores.push((index, value));
                 current = &items[1]; // descend into base
             }
@@ -176,10 +183,13 @@ fn parse_value_for_array_elem(sexp: &ay_frontend::SExpr) -> ModelValue {
         }
         ay_frontend::SExpr::Symbol(s) => ModelValue::Uninterpreted(s.clone()),
         ay_frontend::SExpr::List(items) => {
-            // Try: negative integer (- N)
+            // Try: negative integer (- N), then negative rational (- (/ N D))
             if items.len() == 2 && items[0].is_symbol("-") {
                 if let Some(v) = parse_int_value_bigint(sexp) {
                     return ModelValue::Int(v);
+                }
+                if let Some(v) = parse_real_value_bigrat(sexp) {
+                    return ModelValue::Real(v);
                 }
             }
             // Try: rational (/ N D)
@@ -196,61 +206,7 @@ fn parse_value_for_array_elem(sexp: &ay_frontend::SExpr) -> ModelValue {
 
 /// Parse an FP value: `(fp #b<sign> #b<exp> #b<sig>)` or `(_ +zero/NaN/+oo/-oo/-zero eb sb)`.
 pub(crate) fn parse_fp_value(sexp: &ay_frontend::SExpr, eb: u32, sb: u32) -> ModelValue {
-    use super::types::FpSpecialKind;
-
-    let items = match sexp.as_list() {
-        Some(items) => items,
-        None => return ModelValue::Unknown,
-    };
-
-    if items.len() == 4 && items[0].is_symbol("_") {
-        let kind = match items[1].as_symbol() {
-            Some("+zero") => Some(FpSpecialKind::PosZero),
-            Some("-zero") => Some(FpSpecialKind::NegZero),
-            Some("+oo") => Some(FpSpecialKind::PosInf),
-            Some("-oo") => Some(FpSpecialKind::NegInf),
-            Some("NaN") => Some(FpSpecialKind::NaN),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            return ModelValue::FloatingPointSpecial { kind, eb, sb };
-        }
-    }
-
-    if items.len() == 4 && items[0].is_symbol("fp") {
-        let sign = match &items[1] {
-            ay_frontend::SExpr::Binary(b) => {
-                let bits = b.strip_prefix("#b").unwrap_or(b);
-                bits == "1"
-            }
-            _ => return ModelValue::Unknown,
-        };
-        let exponent = match &items[2] {
-            ay_frontend::SExpr::Binary(b) => {
-                let bits = b.strip_prefix("#b").unwrap_or(b);
-                u64::from_str_radix(bits, 2).ok()
-            }
-            _ => None,
-        };
-        let significand = match &items[3] {
-            ay_frontend::SExpr::Binary(b) => {
-                let bits = b.strip_prefix("#b").unwrap_or(b);
-                u64::from_str_radix(bits, 2).ok()
-            }
-            _ => None,
-        };
-        if let (Some(exponent), Some(significand)) = (exponent, significand) {
-            return ModelValue::FloatingPoint {
-                sign,
-                exponent,
-                significand,
-                eb,
-                sb,
-            };
-        }
-    }
-
-    ModelValue::Unknown
+    super::model_parse::parse_fp_literal(sexp, eb, sb).unwrap_or(ModelValue::Unknown)
 }
 
 /// Parse a datatype value: `ConstructorName` or `(Constructor arg1 arg2 ...)`.

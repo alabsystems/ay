@@ -49,12 +49,10 @@ macro_rules! safe_print {
 use ay_core::escape_string_contents;
 
 mod build_info;
+mod chc_owed_responses;
 mod chc_runner;
 mod cmd_allsat;
 mod cmd_bench;
-#[cfg(feature = "bench")]
-mod cmd_bench_campaign;
-mod cmd_bench_compare;
 mod cmd_bisect;
 mod cmd_check;
 mod cmd_competition_jit;
@@ -62,8 +60,6 @@ mod cmd_corpus;
 mod cmd_diagnose;
 mod cmd_flatzinc;
 mod cmd_gate;
-mod cmd_launch;
-mod cmd_launch_packet;
 mod cmd_lp;
 mod cmd_maxsat;
 mod cmd_model_count;
@@ -90,6 +86,7 @@ mod explain;
 mod explain_reason;
 mod features;
 mod firewall_verify;
+mod hard_exit_statistics;
 mod help_style;
 mod help_topics;
 mod lean_verify;
@@ -101,8 +98,10 @@ mod parent_death;
 mod proof_artifact;
 mod proof_verify;
 mod run;
+mod rust_frontend;
 mod solve_ab_switches;
 mod stats_output;
+mod strict_request;
 mod tracing_setup;
 mod z3_catalog;
 mod z3_catalog_markdown;
@@ -150,6 +149,10 @@ const SAT_COMPETITION_WRAPPER_PROOF_FORMATS: &[&str] = &["veripb", "drat", "lrat
 /// Global timeout in milliseconds (0 = no timeout)
 pub(crate) static GLOBAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// Initial value from the standard Z3 key=value command-line surface.
+pub(crate) static SEQUENCE_POWER_EXPANSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+pub(crate) static POLYNOMIAL_OPTIONS: std::sync::OnceLock<ay_dpll::api::PolynomialParameters> =
+    std::sync::OnceLock::new();
 /// Global timeout flag — set by watchdog thread instead of process::exit (#2971).
 /// All solve paths check this cooperatively and return Unknown/timeout.
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
@@ -212,15 +215,18 @@ pub(crate) static PROGRESS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `--strict-proofs`, `--self-check`, in-script `:produce-proofs` /
 /// `:check-proofs-strict`) overrides the shedding, never conflicts with it.
 pub(crate) use competition_mode::{
-    certification_requested, competition_mode, proof_cycle_shed, COMPETITION_MODE_ENABLED,
-    PROOF_CYCLE_SHED_ENABLED,
+    competition_mode, proof_cycle_shed, COMPETITION_MODE_ENABLED, PROOF_CYCLE_SHED_ENABLED,
 };
 /// Whether aggressive model minimization is enabled (#8297).
 /// Set by `--minimize-model` CLI flag. Read by executor creation paths.
 pub(crate) static MINIMIZE_MODEL_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether strict proof mode is enabled (#8555).
-/// Set by `--strict-proofs` CLI flag. Read by CHC auto-detect path.
+/// Set by `--strict-proofs`; strict admission reads it via `strict_request`.
 pub(crate) static STRICT_PROOFS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// `--alethe-dialect pinned-carcara`: spell SMT Alethe certificates for pinned
+/// Carcara 9a352ee instead of Clean's vendored Carcara (the default).
+pub(crate) static ALETHE_DIALECT_PINNED: AtomicBool = AtomicBool::new(false);
 /// Whether fail-closed self-check mode is enabled.
 /// Set by `--self-check` CLI flag. Read by executor creation paths
 /// (`new_executor`). In this mode AY emits `sat` only when its own
@@ -257,8 +263,7 @@ pub(crate) static EXPLICIT_VERIFY_PROOF_ENABLED: AtomicBool = AtomicBool::new(fa
 /// Whether `--lean-verify` is active (#8773, Phase 1 thin wrapper).
 ///
 /// Set by the CLI flag. Read by `dimacs.rs` after UNSAT + proof emission to
-/// invoke the Lean verifier on the `.lean4` proof file via the ay-lean-bridge
-/// canonical path.
+/// invoke the Lean verifier on the `.lean4` proof file via `lean_verify`.
 pub(crate) static LEAN_VERIFY_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Optional explicit path to the `lean` binary for `--lean-verify`.
 /// Set by `--lean-path`. When None, PATH is searched.
@@ -385,8 +390,10 @@ pub(crate) struct ProofConfig {
     /// A synthesized default differs from an explicit `--proof` in its failure
     /// posture: outside a mandatory proof gate, failure to render the default
     /// certificate warns and leaves the verdict standing; under
-    /// `--strict-proofs` or `--self-check`, the uncertified result instead
-    /// downgrades to `unknown`. An explicit user output failure remains fatal.
+    /// `--strict-proofs` the uncertified result instead downgrades to
+    /// `unknown`. `--self-check` alone does not demand the rendered artifact:
+    /// it admits `unsat` on AY's in-memory same-problem refutation (see
+    /// `configure_proof_policy`). An explicit user output failure remains fatal.
     /// This marker also lets logic-specific runners (e.g. CHC) retarget the
     /// path/format to their native certificate kind, since the default path is
     /// chosen from the input extension before the logic is known.
@@ -696,7 +703,7 @@ struct Cli {
 enum Command {
     /// Solve an SMT-LIB2, DIMACS CNF, or CHC formula (the default)
     Solve(SolveArgs),
-    /// Verify DRAT/LRAT proofs
+    /// Verify DRAT/LRAT/DPR/SR/VeriPB proofs and SAT models
     #[command(subcommand)]
     Check(cmd_check::CheckCommand),
     /// Run and score reproducible benchmark evaluations
@@ -747,15 +754,9 @@ enum Command {
     ModelCount(cmd_model_count::ModelCountArgs),
     /// Triage a suspected wrong answer against a reference solver
     Diagnose(cmd_diagnose::DiagnoseCommand),
-    /// Run the release-readiness gate
-    #[command(name = "launch-gate", hide = true)]
-    LaunchGate(cmd_launch::HnGateArgs),
     /// Release evidence generation and verification
     #[command(subcommand, hide = true)]
     Release(cmd_release::ReleaseCommand),
-    /// Generate launch benchmark packet metadata sidecars
-    #[command(name = "launch-packet", hide = true)]
-    LaunchPacket(cmd_launch_packet::LaunchPacketCommand),
     /// Audit the development tree's measured Z3-compatibility surface
     #[command(name = "z3-audit", hide = true)]
     Z3Audit(cmd_z3_audit::Z3AuditArgs),
@@ -796,18 +797,23 @@ include!("main/sat_exit_codes.rs");
 // `after_long_help` only on `--help`, so naming the long one is the whole fix.
 #[command(after_long_help = "\
 Rigor (--rigor <LEVEL>): how much AY proves and re-checks its OWN answer.
-The verdict is always sound at every level -- AY never publishes a wrong sat/unsat;
-this only controls proof/self-check work, not confidence in the answer.
+Every level runs AY's always-on self-checks where they apply: a sat model is evaluated
+against the input when AY can evaluate it, and a CHC SAFE model must exclude the error
+states before it prints. These are AY checking AY: they catch only the errors they are
+independent of. Replay the certificate with an external checker (e.g. carcara for
+.alethe) for assurance beyond AY's own code.
   fast       just the answer, like z3 -- no proof, no re-check (was --competition)
-  standard   validate the answer, emit a proof next to the input, re-check that proof
+  standard   default: validate the answer, emit a proof next to the input, re-check it
   strict     strict proof checker; a terminal-trust unsat it cannot prove -> unknown (was --strict-proofs)
-  certified  fail-closed: emit only answers AY can self-verify, else unknown (was --self-check)
-A plain `ay FILE.smt2` (no --rigor, no proof flag) has z3's posture: the fast rung's
-proof work -- nothing recorded, minted, re-checked, or written next to the input --
-with the validation batteries left on. Certification is one flag away: --rigor
-standard, --proof FILE, --self-check, --strict-proofs, or (set-option :produce-proofs
-true) in the script. DIMACS (<input>.drat) and CHC (<input>.chccert) keep their
-proof-carrying defaults.
+  certified  fail-closed: emit only answers AY can self-verify, else unknown (was --self-check);
+             on CHC it also runs strict's SAFE/UNSAFE re-checks
+Batteries are ON by default: a plain `ay FILE.smt2` records a proof during search,
+mints and re-checks its certificate, and writes it next to the input --
+<input>.alethe for SMT-LIB, <input>.drat for DIMACS, <input>.chccert for CHC. The
+certificate is the point of using AY; it is also how you tell that a change made
+progress. For z3-exact behaviour -- nothing recorded, minted, re-checked, or
+written -- pass --z3-mode (--no-proof and --rigor fast reach the same proof
+posture by their own routes).
 
 Proof artifact:
   --proof FILE [--proof-format alethe|drat|lrat|lean4|veripb] [--proof-binary]
@@ -815,9 +821,10 @@ Proof artifact:
   --proof-checker dsr-trim|dpr-trim|drat-trim|gratgen|veripb declares the
   external checker; routes whose steps that checker rejects are disabled
   (default dsr-trim keeps the SR-witnessed symmetry routes enabled).
-  --proof-format veripb --proof-checker veripb keeps them enabled under a
-  checker on the official SAT-COMP 2026 menu: veripb --cnf FILE.cnf proof.pbp.
-  That pair is what the SAT-COMP 2026 submission declares and run.sh passes.
+  --proof-format veripb --proof-checker veripb keeps them enabled. SAT-COMP
+  2026 certifies such a proof by `veripb -u --cnf --elaborate KERNEL FILE.cnf
+  proof.pbp` then the verified `cake_pb_cnf FILE.cnf KERNEL` (ci/veripb.pin
+  and ci/cakepb.pin name the builds). That pair is what the submission declares.
 
 SAT primary path:
   ay solve --sat-variant default FILE.cnf
@@ -880,6 +887,13 @@ struct SolveArgs {
     #[arg(long = "ignored-z3-param", hide = true)]
     ignored_z3_param: Vec<String>,
 
+    /// Internal typed transport for the implemented Z3 module parameter.
+    #[arg(long = "z3-sequence-power-expansion", hide = true)]
+    z3_sequence_power_expansion: Vec<u32>,
+    /// Internal transport for implemented standard rewriter key=value arguments.
+    #[arg(long = "z3-polynomial-option", hide = true)]
+    z3_polynomial_option: Vec<String>,
+
     /// Internal compatibility carrier for terminal Z3 parameter/help requests.
     #[arg(long = "z3-parameter-request", hide = true, allow_hyphen_values = true)]
     z3_parameter_request: Option<String>,
@@ -900,6 +914,16 @@ struct SolveArgs {
     )]
     unsupported_z3_option: Vec<String>,
 
+    /// Internal compatibility carrier for options Z3 itself rejects as
+    /// invalid (unknown single-dash spellings in a z3 invocation).
+    #[arg(long = "invalid-z3-option", hide = true, allow_hyphen_values = true)]
+    invalid_z3_option: Vec<String>,
+
+    /// Internal compatibility carrier for input files after the first in a
+    /// z3 invocation (z3 warns and solves the first).
+    #[arg(long = "z3-duplicate-input", hide = true, allow_hyphen_values = true)]
+    z3_duplicate_input: Vec<String>,
+
     /// Force CHC solving mode
     #[arg(long, help_heading = "Input", hide_short_help = true)]
     chc: bool,
@@ -914,9 +938,13 @@ struct SolveArgs {
 
     /// Proof effort: fast, standard, strict, certified
     ///
-    /// One mutually-exclusive ladder, default `standard`. The verdict is ALWAYS
-    /// SOUND at every level — AY never publishes a wrong `sat`/`unsat`; this dial
-    /// controls proof and self-check work, not confidence in the answer.
+    /// One mutually-exclusive ladder, default `standard`. Every level runs AY's
+    /// always-on self-checks where they apply (a sat model is evaluated against
+    /// the input when AY can evaluate it; a CHC SAFE model must exclude the error
+    /// states); the dial controls how much further proof and self-check evidence
+    /// AY demands. These are AY's own checks, not a guarantee that no answer is
+    /// wrong; replay the certificate with an external checker for independent
+    /// assurance.
     ///
     ///   fast       just the answer, like z3 (was --competition): no default
     ///              validation / proof emission / proof re-check. Soundness
@@ -928,7 +956,8 @@ struct SolveArgs {
     ///              Trust-backed `unsat` it cannot prove is downgraded to
     ///              `unknown`.
     ///   certified  fail-closed (was --self-check): emit only answers AY can
-    ///              self-verify, else `unknown`.
+    ///              self-verify, else `unknown`. On CHC it also runs strict's
+    ///              SAFE/UNSAFE re-checks.
     ///
     /// Being a single enum, the levels are mutually exclusive by construction.
     /// Resolution is MONOTONE: the STRONGEST level any given flag requests wins
@@ -988,12 +1017,12 @@ struct SolveArgs {
     #[arg(long = "self-check", hide = true)]
     self_check: bool,
 
-    /// Strict proof diagnostic and terminal-trust screen
+    /// Strict proofs: `unsat` only together with a certificate
     ///
-    /// Uses AY's strict semantic checker while constructing SMT proofs and
-    /// downgrades a terminal Trust-backed `unsat` to `unknown`. Other checker
-    /// failures remain diagnostics. This is neither the fail-closed
-    /// `--self-check` gate nor independent external replay.
+    /// Answers `unknown` for an `unsat` with a terminal Trust step, or whose
+    /// certificate (written or not) has an unproved step or assumes anything
+    /// but the input's assertions. Other checker failures remain diagnostics;
+    /// neither the fail-closed `--self-check` gate nor external replay.
     ///
     /// Hidden legacy alias for `--assurance strict`; kept working unchanged.
     #[arg(long, hide = true)]
@@ -1050,9 +1079,39 @@ struct SolveArgs {
 
     /// Memory ceiling in megabytes (0 = unlimited)
     ///
-    /// Default: auto-detected from physical RAM.
+    /// Default: auto-detected. On macOS it is 90% of the kernel-held budget
+    /// the binary arms for itself, which defaults to physical RAM / 16 as a
+    /// machine guard, so the ceiling is 2764 MiB on a 48 GiB box. Raising
+    /// `GOVERN_AY_MB` moves that budget and this ceiling together; this flag
+    /// alone raises only the ceiling, which the kernel budget still caps
+    /// wherever the solve runs unsupervised. On Linux it is 85% of physical
+    /// RAM or of the cgroup limit visible at the cgroup mount root, less when
+    /// `AY_CONCURRENCY` or a test harness splits the available memory across
+    /// peers; elsewhere there is no default ceiling. The SAT-COMP runner uses
+    /// `--memory-ceiling-bytes` instead. A SAT-competition memout names which
+    /// limit was in force.
     #[arg(long, help_heading = "Resources")]
     memory: Option<u64>,
+
+    /// Hard memory ceiling for this run, in bytes (for example a
+    /// competition's limit)
+    ///
+    /// Not an override: ay's own limit becomes 90% of the SMALLEST of this,
+    /// the cgroup memory limit (its own cgroup and each ancestor visible in
+    /// its cgroup namespace), its RLIMIT_AS and RLIMIT_DATA soft limits, and
+    /// the macOS govern kernel budget when armed, so it is never looser than
+    /// a limit the kernel already shows. Bounds a job shares (this ceiling
+    /// and the cgroup) are split across `AY_CONCURRENCY` peers, or across the
+    /// CPU count under a test harness. The SAT-COMP runner passes 32000000000
+    /// from `competition/sat26_memory_limit.sh`.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help_heading = "Resources",
+        conflicts_with = "memory",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    memory_ceiling_bytes: Option<u64>,
 
     /// Parallel portfolio solver threads (DIMACS SAT only)
     #[arg(
@@ -1199,6 +1258,37 @@ struct SolveArgs {
     )]
     proof_checker: Option<CliProofChecker>,
 
+    /// Which Carcara an SMT Alethe certificate is spelled for [default: clean]
+    ///
+    /// Pinned Carcara 1.1.0 (9a352ee) and Clean's vendored Carcara disagree
+    /// on three spellings and one rule. `clean` prints the one external-codegen's
+    /// checker accepts; the certificate line then says
+    /// `carcara_surface=clean-dialect`. `pinned-carcara` prints the
+    /// zero-filled `bitblast_ashr` layer the pinned checker accepts, and its
+    /// `bitblast_udiv`/`bitblast_urem` divider only where that divider is
+    /// true (a zero divisor, or closed operands it divides correctly), and
+    /// `zero_extend` as closed cases where the packed lane proves one
+    /// bit-vector identity over a word with at most eight symbolic bits. Any
+    /// other `zero_extend` (more symbolic bits, or one the packed-circuit or
+    /// complete bit-blast lane checks, such as two such identities under one
+    /// conjunction) has no pinned spelling, and neither has a divider step
+    /// outside that domain: their certificates say `clean-dialect` either
+    /// way. The rule is `dt_project`, a datatype selector over a constructor
+    /// (`(= (fst (mk a b)) a)`): `clean` prints it, and pinned Carcara, which
+    /// has no datatype rule, answers `unknown rule` for it and rejects the
+    /// whole document; `pinned-carcara` prints the step as an unproved
+    /// `hole` instead (`unproved_steps=1`, so `--strict-proofs` answers
+    /// `unknown`). `--proof-self-check` reads the document in the dialect
+    /// chosen here.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "CHECKER",
+        help_heading = "Proof verification",
+        hide_short_help = true
+    )]
+    alethe_dialect: Option<CliAletheDialect>,
+
     /// Write binary DRAT/LRAT proof (with --proof).
     /// SMT Alethe and CHC certificate routes reject binary output.
     #[arg(
@@ -1229,18 +1319,24 @@ struct SolveArgs {
 
     /// Opt out of default proof-artifact emission on supported UNSAT paths.
     ///
-    /// For DIMACS and CHC file inputs, proof emission is ON BY DEFAULT: after
-    /// an UNSAT result, ay attempts to write a proof artifact next to the input
-    /// — DRAT for DIMACS (`<input>.drat`) or an ay-chc-cert for CHC
-    /// (`<input>.chccert`). An SMT-LIB input gets its Alethe certificate
-    /// (`<input>.alethe`) only at `--rigor standard` or above; a plain solve
-    /// has z3's posture and records no proof. Support depends on the solver
-    /// path, theory, and format. Outside `--strict-proofs`/`--self-check`, a
-    /// default-emission failure warns without changing the solver verdict;
-    /// those gates instead fail closed. Treat an artifact as independently
-    /// certified only after its intended checker accepts it. Pass `--no-proof`
-    /// to suppress the default (e.g. when proof I/O adds benchmark overhead),
-    /// or select an explicit `--proof FILE`; clap rejects combining the two.
+    /// For supported file inputs, proof emission is ON BY DEFAULT: after an
+    /// UNSAT result, ay attempts to write a proof artifact next to the input —
+    /// DRAT for DIMACS (`<input>.drat`), Alethe for SMT (`<input>.alethe`), or
+    /// an ay-chc-cert for CHC (`<input>.chccert`). Support depends on the solver
+    /// path, theory, and format. A default-emission failure warns and leaves
+    /// the solver verdict unchanged, except under strict proofs
+    /// (`--strict-proofs`, `--rigor strict`, or the script's
+    /// `(set-option :check-proofs-strict true)`), where the answer becomes
+    /// `unknown`. `--self-check` (`--rigor certified`) does the same for DIMACS
+    /// and CHC; on SMT-LIB it checks the answer, not the file, so its `unsat`
+    /// stands when `<input>.alethe` cannot be written. An existing
+    /// `<input>.alethe` or `<input>.drat` is never replaced, so it is such a
+    /// failure; `<input>.chccert` is overwritten, so on CHC only an unwritable
+    /// path is. Treat an artifact as
+    /// independently certified only after its intended checker accepts it.
+    /// Pass `--no-proof` to suppress the default (e.g. when proof I/O adds
+    /// benchmark overhead), or select an explicit `--proof FILE`; clap rejects
+    /// combining the two.
     ///
     /// On SMT-LIB input `--no-proof` sheds the whole internal proof cycle
     /// exactly like `--rigor fast`: no search-time proof recording, no
@@ -1894,6 +1990,27 @@ fn timeout_exit_policy(
     )
 }
 
+/// Set by the SIGTERM poller: the run was told to terminate. Its exit is the
+/// timeout's (cooperative `unknown`, 124), but the note must not say
+/// `timeout`: no deadline fired.
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+/// `note` as [`timeout_exit_policy`] wrote it, reworded for a run ended by
+/// SIGTERM. The reason is z3's word for an external stop, `canceled`.
+fn termination_note(note: &'static [u8], terminated: bool) -> &'static [u8] {
+    if !terminated {
+        return note;
+    }
+    match note {
+        b"(:reason-unknown \"timeout\")\n" => b"(:reason-unknown \"canceled\")\n",
+        b"c timeout\n" => b"c terminated\n",
+        b"c timeout after the verdict was published; verdict stands\n" => {
+            b"c terminated after the verdict was published; verdict stands\n"
+        }
+        other => other,
+    }
+}
+
 fn abandon_unfinished_bv_cnf_export(reason: &str) -> bool {
     if VERDICT_PRINTED.load(Ordering::SeqCst) {
         return false;
@@ -1916,20 +2033,24 @@ fn hard_timeout_fallback_exit() -> ! {
     // destructors that will be skipped, so reap it here or orphan it. No-op
     // when no stage child is running, which is every non-composed run.
     compose::kill_live_stage_child();
+    settle_proofs_before_unanswered_exit();
+    chc_runner::emit_horn_session_totals();
     let sat_competition_wrapper = sat_competition_wrapper_timeout_policy();
     let export_abandoned = abandon_unfinished_bv_cnf_export("hard timeout or termination");
-    if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
+    if !export_abandoned && claim_owed_unknown_response() {
         let _ = Write::write_all(
             &mut io::stdout(),
             timeout_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper),
         );
         let _ = Write::flush(&mut io::stdout());
+        write_cut_query_reason(sat_competition_wrapper);
     }
     let (note, code) = timeout_exit_policy(
         decisive_verdict_already_published(),
         sat_competition_wrapper,
         export_abandoned,
     );
+    let note = note.map(|line| termination_note(line, TERMINATED.load(Ordering::SeqCst)));
     if let Some(line) = note {
         let _ = Write::write_all(&mut io::stderr(), line);
     }
@@ -1937,9 +2058,21 @@ fn hard_timeout_fallback_exit() -> ! {
     std::process::exit(code);
 }
 
-/// Poll interval for the memory watchdog: one footprint read per tick, taken
-/// off the solver threads.
-const MEMORY_WATCHDOG_POLL: Duration = Duration::from_millis(100);
+/// Grace given to the cooperative stop after the deadline before the timeout
+/// watchdog hard-exits.
+const TIMEOUT_WATCHDOG_GRACE: Duration = Duration::from_secs(2);
+
+/// Poll interval for the memory watchdog and its governor: one pressure read
+/// per tick (a single Mach call, ~0.5 us), taken off the solver threads. Short
+/// because a runaway lane measured 5-7 GB/s (expression-DAG expansion on
+/// LRA-Lin): at 100 ms the budget's last 5 % went unobserved.
+const MEMORY_WATCHDOG_POLL: Duration = Duration::from_millis(10);
+
+/// Pressure, in percent of the budget, at which the watchdog stops waiting out
+/// its grace and exits with the memout verdict at once: the process is about
+/// to be killed from outside (an RSS-polling harness, the kernel), which
+/// would lose the verdict line.
+const MEMORY_WATCHDOG_CRITICAL_PERCENT: usize = 98;
 
 /// Grace given to the cooperative stop before the memory watchdog hard-exits.
 /// Matches the global-timeout watchdog's 2 s, for the same reason: a thread in
@@ -1967,22 +2100,26 @@ static HARD_CEILING_SMTLIB: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeilin
     stdout_line: MEMOUT_STDOUT_SMTLIB,
     stderr_line: MEMOUT_STDERR_SMTLIB,
     exit_code: DEFAULT_TIMEOUT_EXIT_CODE,
+    statistics: Some(hard_exit_statistics::write_ceiling_block),
 };
 static HARD_CEILING_SMTLIB_WRAPPER_EXIT: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
     stdout_line: MEMOUT_STDOUT_SMTLIB,
     stderr_line: MEMOUT_STDERR_SMTLIB,
     exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
+    statistics: Some(hard_exit_statistics::write_ceiling_block),
 };
 static HARD_CEILING_SAT_COMPETITION: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
     stdout_line: MEMOUT_STDOUT_SAT_COMPETITION,
     stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
     exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
+    statistics: Some(hard_exit_statistics::write_ceiling_block),
 };
 static HARD_CEILING_SAT_COMPETITION_PLAIN_EXIT: ay_sys::HardMemoryCeiling =
     ay_sys::HardMemoryCeiling {
         stdout_line: MEMOUT_STDOUT_SAT_COMPETITION,
         stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
         exit_code: DEFAULT_TIMEOUT_EXIT_CODE,
+        statistics: Some(hard_exit_statistics::write_ceiling_block),
     };
 
 /// The input format this run is serving, as far as it is known, for the
@@ -2038,7 +2175,7 @@ pub(crate) fn note_verdict_grammar_route(route: VerdictGrammarRoute) {
     VERDICT_GRAMMAR_ROUTE.store(route as u8, Ordering::SeqCst);
     let limit = HARD_MEMORY_LIMIT_BYTES.load(Ordering::SeqCst);
     if limit > 0 {
-        ay_sys::arm_hard_memory_ceiling(limit, memout_verdict().hard_ceiling_action());
+        ay_sys::arm_hard_memory_ceiling(limit, memout_hard_ceiling_action());
     }
 }
 
@@ -2141,7 +2278,97 @@ fn memout_verdict() -> MemoutVerdict {
 /// observer-based signal can bound because they can only request a stop.
 fn arm_hard_memory_ceiling(limit_bytes: usize) {
     HARD_MEMORY_LIMIT_BYTES.store(limit_bytes, Ordering::SeqCst);
-    ay_sys::arm_hard_memory_ceiling(limit_bytes, memout_verdict().hard_ceiling_action());
+    ay_sys::set_hard_memory_ceiling_settlement(settle_run_at_memory_ceiling);
+    ay_sys::arm_hard_memory_ceiling(limit_bytes, memout_hard_ceiling_action());
+}
+
+/// The allocator ceiling's breach action for the live verdict, carrying the
+/// memout note when it applies (see [`hard_ceiling_action_with_note`]).
+fn memout_hard_ceiling_action() -> &'static ay_sys::HardMemoryCeiling {
+    hard_ceiling_action_with_note(
+        memout_verdict().hard_ceiling_action(),
+        MEMORY_LIMIT_NOTE.get().map(String::as_str),
+        Z3_MODE_ENABLED.load(Ordering::SeqCst),
+    )
+}
+
+/// `base` with `note` appended to its stderr bytes when the note applies
+/// ([`memory_limit_note_applies`]), else `base` itself.
+///
+/// The allocator's burst ceiling leaves through `_exit` writing only the
+/// `'static` bytes of the action it was armed with — it cannot format or
+/// allocate — so the note is baked into a leaked copy of the action at ARM
+/// time. This is the path a big formula takes: measured 2026-09-12 on
+/// SAT-COMP `07df5e6f` (1.64 M vars, 8.98 M clauses), the 2764 MiB ceiling
+/// breaches 2.4 s into parsing, before any checkpoint or watchdog poll could
+/// report it gracefully. Called a handful of times per process (each arm and
+/// route re-arm), so the leak is bounded.
+fn hard_ceiling_action_with_note(
+    base: &'static ay_sys::HardMemoryCeiling,
+    note: Option<&str>,
+    z3_mode: bool,
+) -> &'static ay_sys::HardMemoryCeiling {
+    let Some(note) = note.filter(|_| memory_limit_note_applies(base.stderr_line, z3_mode)) else {
+        return base;
+    };
+    let mut stderr_line = base.stderr_line.to_vec();
+    stderr_line.extend_from_slice(note.as_bytes());
+    Box::leak(Box::new(ay_sys::HardMemoryCeiling {
+        stdout_line: base.stdout_line,
+        stderr_line: Box::leak(stderr_line.into_boxed_slice()),
+        exit_code: base.exit_code,
+        statistics: base.statistics,
+    }))
+}
+
+/// One `c` line naming the memory ceiling that tripped and where it came from,
+/// written after the SAT-competition `c memout` line (see
+/// [`memory_limit_note_applies`]) on both memout paths: by
+/// [`hard_memory_fallback_exit`] for the watchdog and the checkpoints, and
+/// baked into the allocator ceiling's breach action at arm time
+/// ([`hard_ceiling_action_with_note`]) for a burst. Set once in `run_solve`,
+/// before the watchdog and the ceiling are armed.
+static MEMORY_LIMIT_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where the process memory ceiling came from.
+///
+/// 2026-09-12: two of 24 sampled SAT-COMP 2026 instances answered `c memout`
+/// 8 s into a solve on a 48 GiB Mac. The ceiling was 2764 MiB — 90% of the
+/// macOS govern budget, whose default is physical RAM / 16 — while the two
+/// peak at 3.9-4.0 GiB resident in 300 s with the ceiling raised. Nothing in
+/// the output said so, and `--memory`'s help claimed "auto-detected from
+/// physical RAM", so the forfeit read as an instance that outgrew the machine
+/// rather than as the dev-box guard it was. This names the posture.
+fn memory_limit_origin(explicit_mb: Option<u64>, kernel_budget_bytes: Option<usize>) -> String {
+    match (explicit_mb, kernel_budget_bytes) {
+        (Some(mb), _) if mb > 0 => "--memory flag".to_string(),
+        (_, Some(kernel)) => format!(
+            "{}% of the kernel-held govern budget of {} MiB, which defaults to physical \
+             RAM / 16 as a machine guard, not an estimate of this instance; raise both \
+             with GOVERN_AY_MB=<MiB>",
+            ay_sys::KERNEL_BUDGET_HEADROOM_PERCENT,
+            kernel / (1024 * 1024)
+        ),
+        (_, None) => "85% of physical RAM or of the visible cgroup limit, less when peers \
+                      split the available memory; override with --memory <MiB>"
+            .to_string(),
+    }
+}
+
+/// The memout note for a ceiling of `limit_bytes`. The watchdog and the
+/// checkpoints trip at 95% of it, the allocator's burst ceiling at 100%.
+fn memory_limit_note(limit_bytes: usize, origin: &str) -> String {
+    format!(
+        "c memout: process memory limit {} MiB ({origin})\n",
+        limit_bytes / (1024 * 1024)
+    )
+}
+
+/// Whether the memout note is written: only after the SAT-competition
+/// `c memout` line, where `c` comments are native, and never in Z3 mode,
+/// whose stderr contract is the Z3 transcript byte for byte.
+fn memory_limit_note_applies(verdict_stderr: &[u8], z3_mode: bool) -> bool {
+    !z3_mode && verdict_stderr == MEMOUT_STDERR_SAT_COMPETITION
 }
 
 /// Emit the `unknown` verdict for a breached `--memory` budget, then exit.
@@ -2151,17 +2378,116 @@ fn arm_hard_memory_ceiling(limit_bytes: usize) {
 /// run) and the exit code is the same resource-exhaustion code, so only the
 /// `:reason-unknown` payload distinguishes a memout from a timeout.
 fn hard_memory_fallback_exit() -> ! {
+    settle_proofs_before_unanswered_exit();
     let verdict = memout_verdict();
     let export_abandoned = abandon_unfinished_bv_cnf_export("memory limit exceeded");
-    if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
+    let owed = !export_abandoned && claim_owed_unknown_response();
+    if owed {
         let _ = Write::write_all(&mut io::stdout(), verdict.stdout_line());
         let _ = Write::flush(&mut io::stdout());
     }
-    if !export_abandoned {
+    let decisive = decisive_verdict_already_published();
+    if !export_abandoned && !owed && decisive {
+        // Teardown after a decisive answer, with no query in flight: the
+        // memout describes no `unknown`, exactly as for a deadline.
+        write_verdict_stands_note(|bytes| {
+            let _ = Write::write_all(&mut io::stderr(), bytes);
+        });
+    } else if !export_abandoned {
         let _ = Write::write_all(&mut io::stderr(), verdict.stderr_line());
+        if memory_limit_note_applies(
+            verdict.stderr_line(),
+            Z3_MODE_ENABLED.load(Ordering::SeqCst),
+        ) {
+            if let Some(note) = MEMORY_LIMIT_NOTE.get() {
+                let _ = Write::write_all(&mut io::stderr(), note.as_bytes());
+            }
+        }
     }
     let _ = Write::flush(&mut io::stderr());
-    std::process::exit(verdict.exit_code);
+    std::process::exit(memout_exit_code(
+        decisive,
+        export_abandoned,
+        verdict.exit_code,
+    ));
+}
+
+/// The exit code of a run a memory breach ends: the memout code, unless a
+/// decisive verdict is already on stdout, which a breach never turns into a
+/// failed run (the same rule [`timeout_exit_policy`] applies to a deadline).
+fn memout_exit_code(decisive_verdict_published: bool, export_abandoned: bool, memout: i32) -> i32 {
+    if decisive_verdict_published && !export_abandoned {
+        0
+    } else {
+        memout
+    }
+}
+
+/// End the run cooperatively once the memory watchdog has latched a breach.
+///
+/// The watchdog raises the interrupt and the process cancel, and a solve that
+/// observes them answers `unknown` -- with reason `interrupted` and, at the
+/// end of the script, exit 0, because nothing routed that `unknown` to the
+/// memout report (measured: `--memory 1` on a trivial file printed `unknown`,
+/// `(:reason-unknown interrupted)`, exit 0; an incremental script answered
+/// `unknown` to every later query, all at exit 0). The SMT drivers call this
+/// after each command: the breach ends the run as a memout, the same report
+/// the watchdog gives when the solve does not stop in time.
+pub(crate) fn exit_if_memout_requested() {
+    if MEMOUT_REQUESTED.load(Ordering::SeqCst) {
+        hard_memory_fallback_exit();
+    }
+}
+
+/// The reason line for a query a budget or SIGTERM cut short after an
+/// earlier query's decisive answer, when the run's exit will write only its
+/// "verdict stands" note (`None` otherwise: the exit writes the reason).
+/// Measured: `--memory 40` on an incremental UFLIA script printed `sat`,
+/// `unknown` and only `c memout after the verdict was published`.
+pub(crate) fn budget_reason_after_decisive_verdict() -> Option<&'static str> {
+    if !decisive_verdict_already_published() {
+        return None;
+    }
+    Some(if MEMOUT_REQUESTED.load(Ordering::SeqCst) {
+        "(:reason-unknown \"memout\")"
+    } else if TERMINATED.load(Ordering::SeqCst) {
+        "(:reason-unknown \"canceled\")"
+    } else {
+        "(:reason-unknown \"timeout\")"
+    })
+}
+
+/// Latch a memory breach for the `unknown` about to be published when
+/// [`memout_abort_requested`] holds, so the run ends as the memout it is right
+/// after the command ([`exit_if_memout_requested`]). The in-solver checkpoints
+/// stop a check at the advisory threshold before the watchdog's poll sees the
+/// breach: measured, `--z3-mode --memory 40` on an incremental UFLIA script
+/// answered `sat` then four `unknown`s at 68 MB, exit 0, with no memout report.
+pub(crate) fn latch_memout_if_over_budget() -> bool {
+    if memout_abort_requested() {
+        MEMOUT_REQUESTED.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// The reason line for the `unknown` an exit just wrote for a query it cut
+/// short, when an earlier decisive answer means the exit's own note is only
+/// "verdict stands" (the SMT-LIB transcript, not z3's or the SAT wrapper's).
+fn write_cut_query_reason(sat_competition_wrapper: bool) {
+    if sat_competition_wrapper || Z3_MODE_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(line) = budget_reason_after_decisive_verdict() {
+        let _ = Write::write_all(&mut io::stderr(), line.as_bytes());
+        let _ = Write::write_all(&mut io::stderr(), b"\n");
+    }
+}
+
+/// Whether the memory watchdog has latched a breach (its `unknown` is a
+/// memout, whatever reason the interrupted solve recorded).
+pub(crate) fn memout_requested_by_watchdog() -> bool {
+    MEMOUT_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Whether the `Unknown` about to be published is actually a memory abort:
@@ -2177,9 +2503,11 @@ pub(crate) fn memout_abort_requested() -> bool {
 /// Escalation policy of the memory watchdog, split out of the thread so it is
 /// testable without allocating: poll `over_budget` every `poll`, and on the
 /// first breach run `on_breach` (the cooperative stop) and then wait out
-/// `grace`. Returns only when the caller should hard-exit.
+/// `grace`, polling `critical` every `poll` to cut the wait short. Returns
+/// only when the caller should hard-exit.
 fn run_memory_watchdog(
     mut over_budget: impl FnMut() -> bool,
+    mut critical: impl FnMut() -> bool,
     poll: Duration,
     grace: Duration,
     on_breach: impl FnOnce(),
@@ -2189,7 +2517,12 @@ fn run_memory_watchdog(
         sleep(poll);
     }
     on_breach();
-    sleep(grace);
+    let mut waited = Duration::ZERO;
+    while waited < grace && !critical() {
+        let step = poll.min(grace - waited);
+        sleep(step);
+        waited += step;
+    }
 }
 
 /// Arm the memory watchdog for a run that carries a positive `--memory` budget.
@@ -2207,11 +2540,28 @@ fn run_memory_watchdog(
 /// available in-process is to observe the footprint and act on it. Time
 /// already has this safety net in [`set_global_timeout`]; this is its memory
 /// twin, and it is what makes `--memory` a limit rather than a hint.
+///
+/// Each poll also runs the memory governor (`ay_sys::memory_governor`): above
+/// 70 % of the budget it returns freed heap pages to the OS and sheds the
+/// solver lane holding the most live heap, so the other lanes keep running
+/// instead of every lane ending with the process at 95 %. The pressure it and
+/// the watchdog read is the larger of footprint and resident set — what an
+/// RSS-polling harness holds against the process.
 fn arm_memory_watchdog() {
     let handle = Arc::clone(INTERRUPT_HANDLE.get_or_init(|| Arc::new(AtomicBool::new(false))));
+    let limit = ay_sys::get_process_memory_limit();
     std::thread::spawn(move || {
+        let mut governor = ay_sys::memory_governor::MemoryGovernor::new(limit);
+        let breach_at = limit / 100 * 95;
+        let critical_at = limit / 100 * MEMORY_WATCHDOG_CRITICAL_PERCENT;
         run_memory_watchdog(
-            ay_sys::process_memory_exceeded,
+            || {
+                for event in governor.poll() {
+                    log_memory_governor_event(event);
+                }
+                ay_sys::current_memory_pressure_bytes() > breach_at
+            },
+            || ay_sys::current_memory_pressure_bytes() > critical_at,
             MEMORY_WATCHDOG_POLL,
             MEMORY_WATCHDOG_GRACE,
             move || {
@@ -2220,15 +2570,58 @@ fn arm_memory_watchdog() {
                 // be able to see that the stop was a memory abort.
                 MEMOUT_REQUESTED.store(true, Ordering::SeqCst);
                 handle.store(true, Ordering::SeqCst);
+                ay_core::resource::cancel_process();
             },
             std::thread::sleep,
         );
+        if response_owed() || !decisive_verdict_already_published() {
+            hard_exit_statistics::emit(
+                hard_exit_statistics::HardExitCause::Memout,
+                MEMORY_WATCHDOG_GRACE,
+                START_TIME.get().map(Instant::elapsed),
+            );
+        }
         hard_memory_fallback_exit();
     });
 }
 
+/// One governor action, for `--verbose` runs.
+fn log_memory_governor_event(event: ay_sys::memory_governor::GovernorEvent) {
+    const MIB: usize = 1024 * 1024;
+    match event {
+        ay_sys::memory_governor::GovernorEvent::Purged { before, after } => tracing::info!(
+            before_mib = before / MIB,
+            after_mib = after / MIB,
+            "memory governor: returned freed heap pages"
+        ),
+        ay_sys::memory_governor::GovernorEvent::Shed { lane, pressure } => {
+            let running: Vec<String> = ay_sys::memory_group_census()
+                .iter()
+                .take(6)
+                .map(|usage| format!("{}={}MiB", usage.label, usage.live_bytes / 1024 / 1024))
+                .collect();
+            tracing::info!(
+                lane = lane.label,
+                lane_live_mib = lane.live_bytes / 1024 / 1024,
+                pressure_mib = pressure / MIB,
+                running = running.join(" "),
+                "memory governor: shed the fattest lane"
+            );
+        }
+    }
+}
+
 /// Set global timeout in milliseconds
 fn set_global_timeout(ms: u64) {
+    set_global_timeout_with_watchdog(ms, ms);
+}
+
+/// `set_global_timeout` whose watchdog fires after `watchdog_ms` instead of
+/// `ms`. Only `--engine=shadow` (a measurement option) asks for a later
+/// watchdog: every solve deadline still derives from `ms`
+/// (`GLOBAL_TIMEOUT_MS`), and the kernel run after each check-sat has its
+/// own budget of the same length, which the watchdog must not cut short.
+fn set_global_timeout_with_watchdog(ms: u64, watchdog_ms: u64) {
     // Z3 treats -t:0 as "no timeout" - honor that convention.
     if ms == 0 {
         // The `GLOBAL_TIMEOUT_MS` atomic is the canonical store; the env var
@@ -2238,6 +2631,7 @@ fn set_global_timeout(ms: u64) {
         return;
     }
     GLOBAL_TIMEOUT_MS.store(ms, Ordering::SeqCst);
+    RUN_DEADLINE_MS.store(watchdog_ms.max(ms), Ordering::SeqCst);
     START_TIME.get_or_init(Instant::now);
 
     // Initialize the shared interrupt handle for ay-dpll integration.
@@ -2254,13 +2648,21 @@ fn set_global_timeout(ms: u64) {
     // 10000-node BV transitions) can prevent process exit indefinitely.
     // Add a hard exit after a 2-second grace period as a safety net.
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(ms));
+        std::thread::sleep(Duration::from_millis(watchdog_ms.max(ms)));
         TIMED_OUT.store(true, Ordering::SeqCst);
         watchdog_handle.store(true, Ordering::SeqCst);
+        ay_core::resource::cancel_process();
         // Grace period for cooperative shutdown, then hard exit. SAT-COMP
         // wrapper runs use competition UNKNOWN grammar/exit code; normal CLI
         // runs keep SMT-LIB timeout behavior.
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(TIMEOUT_WATCHDOG_GRACE);
+        if response_owed() || !decisive_verdict_already_published() {
+            hard_exit_statistics::emit(
+                hard_exit_statistics::HardExitCause::Timeout,
+                TIMEOUT_WATCHDOG_GRACE,
+                START_TIME.get().map(Instant::elapsed),
+            );
+        }
         hard_timeout_fallback_exit();
     });
 }
@@ -2278,24 +2680,27 @@ fn set_global_timeout(ms: u64) {
 /// cooperative timeout flag (TIMED_OUT / INTERRUPT_HANDLE) to flush and close
 /// before the solver returns.
 pub(crate) fn exit_if_timed_out() {
-    if TIMED_OUT.load(Ordering::SeqCst) {
+    if run_deadline_passed() {
+        chc_runner::emit_horn_session_totals();
         let sat_competition_wrapper = sat_competition_wrapper_timeout_policy();
         let export_abandoned = abandon_unfinished_bv_cnf_export("timeout");
         // Only print "unknown" if no solve path has already printed a result.
         // The SMT executor path prints "unknown" via execute_and_print before
         // reaching this check; the CHC path may not have printed anything yet.
-        if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
+        if !export_abandoned && claim_owed_unknown_response() {
             if sat_competition_wrapper {
                 safe_println!("s UNKNOWN");
             } else {
                 safe_println!("unknown");
             }
+            write_cut_query_reason(sat_competition_wrapper);
         }
         let (note, code) = timeout_exit_policy(
             decisive_verdict_already_published(),
             sat_competition_wrapper,
             export_abandoned,
         );
+        let note = note.map(|line| termination_note(line, TERMINATED.load(Ordering::SeqCst)));
         if let Some(line) = note {
             let _ = Write::write_all(&mut io::stderr(), line);
         }
@@ -2310,6 +2715,43 @@ pub(crate) fn mark_verdict_printed() -> bool {
     VERDICT_PRINTED.swap(true, Ordering::SeqCst)
 }
 
+/// A new decision query is starting, and it owes its own response.
+///
+/// [`VERDICT_PRINTED`] answers "is the CURRENT query's response on stdout",
+/// not "did any query answer": a timeout, memout or SIGTERM that ends the run
+/// during the second `check-sat` of a script prints `unknown` for it (and the
+/// exit policy still lets an earlier `sat`/`unsat` stand). As a once-per-process
+/// latch it silently truncated the transcript instead: on an incremental
+/// script whose second query the watchdog had to end, stdout carried only the
+/// first query's `sat`, with exit 0.
+///
+/// Called on the main thread before the query runs, after the previous
+/// query's response (a deferred `unsat` included) has been published.
+pub(crate) fn owe_response_for_new_query() {
+    VERDICT_PRINTED.store(false, Ordering::SeqCst);
+}
+
+/// Claim the owed response for an exit that ends the run without an answer:
+/// true exactly once per query. An idle `-in` stream is owed one too: the
+/// `-T` watchdog answers it `unknown` (z3 prints `timeout` there), which
+/// `capital_t_timeout_alias_uses_watchdog` pins.
+fn claim_owed_unknown_response() -> bool {
+    claim_owed_unknown_in(&VERDICT_PRINTED)
+}
+
+/// [`claim_owed_unknown_response`] over an explicit cell (tested on its own).
+fn claim_owed_unknown_in(printed: &AtomicBool) -> bool {
+    !printed.swap(true, Ordering::SeqCst)
+}
+
+/// Whether a query is still owed its response (the watchdog's statistics
+/// describe the query it ends).
+fn response_owed() -> bool {
+    !VERDICT_PRINTED.load(Ordering::SeqCst)
+}
+
+include!("main/run_outcome.rs");
+
 /// Record that the verdict published to stdout was DECISIVE (`sat`/`unsat`).
 /// Call alongside [`mark_verdict_printed`] on paths that know their verdict.
 /// See [`DECISIVE_VERDICT_PRINTED`].
@@ -2323,6 +2765,33 @@ fn decisive_verdict_already_published() -> bool {
     DECISIVE_VERDICT_PRINTED.load(Ordering::SeqCst)
 }
 
+/// The run's whole-process deadline in milliseconds after [`START_TIME`]:
+/// what the watchdog sleeps toward (0: none).
+static RUN_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the run's deadline has passed: the watchdog's flag, or the clock.
+///
+/// The solve's own deadline derives from the same start and can expire a
+/// few milliseconds before the watchdog thread wakes, so an `unknown` the
+/// deadline caused could reach the end of the script before [`TIMED_OUT`]
+/// was set and exit 0 -- "the solver gave up on its own" -- with `(:reason-unknown
+/// timeout)` beside it (QF_NIA VeryMax `p15100_safety_0` at `-T:2`, 6/6). The
+/// clock settles it the way the watchdog would a moment later.
+pub(crate) fn run_deadline_passed() -> bool {
+    if TIMED_OUT.load(Ordering::SeqCst) {
+        return true;
+    }
+    let deadline_ms = RUN_DEADLINE_MS.load(Ordering::SeqCst);
+    let passed = deadline_ms > 0
+        && START_TIME
+            .get()
+            .is_some_and(|start| start.elapsed() >= Duration::from_millis(deadline_ms));
+    if passed {
+        TIMED_OUT.store(true, Ordering::SeqCst);
+    }
+    passed
+}
+
 /// Returns true when the global watchdog timeout has fired.
 pub(crate) fn is_timed_out() -> bool {
     TIMED_OUT.load(Ordering::Relaxed)
@@ -2331,6 +2800,18 @@ pub(crate) fn is_timed_out() -> bool {
 pub(crate) fn eprintln_smt_error(message: impl std::fmt::Display) {
     let message = message.to_string();
     safe_eprintln!("(error \"{}\")", escape_string_contents(&message));
+}
+
+/// Report an input file that cannot be opened/read and exit. In z3 mode this
+/// is z3's exact diagnostic and exit status (108); natively AY keeps the
+/// OS error detail and exits 1.
+pub(crate) fn exit_unreadable_input_file(path: &str, detail: &std::io::Error) -> ! {
+    if Z3_MODE_ENABLED.load(Ordering::Relaxed) {
+        eprintln_smt_error(format_args!("failed to open file '{path}'"));
+        std::process::exit(108);
+    }
+    eprintln_smt_error(format_args!("Error reading file '{path}': {detail}"));
+    std::process::exit(1);
 }
 
 /// Get elapsed time since process start.
@@ -2972,12 +3453,17 @@ fn maybe_print_solve_full_help(processed: &[String]) -> bool {
     true
 }
 
+/// Z3's exact rejection of an option its own parser does not know
+/// (stderr, exit 109 — handled by the caller).
+fn print_invalid_z3_option(option: &str) {
+    safe_eprintln!("Error: invalid command line option: {option}\nFor usage information: z3 -h");
+}
+
 fn print_unsupported_z3_option(option: &str) {
     if option == "-opb" {
         // The authenticated Z3 5.0.0 Homebrew binary advertises -opb in
         // `-h`, but this build rejects it in the command-line parser.
-        safe_eprintln!("Error: invalid command line option: -opb");
-        safe_eprintln!("For usage information: z3 -h");
+        print_invalid_z3_option(option);
         return;
     }
     safe_eprintln!("Error: unsupported Z3 option '{option}'");
@@ -2999,6 +3485,74 @@ fn print_unsupported_z3_option(option: &str) {
 
 fn is_unsupported_z3_option(arg: &str) -> bool {
     matches!(arg, "-dl" | "-opb" | "-log")
+}
+
+/// A single-dash spelling that is neither a z3 option AY translates (those
+/// are matched by earlier `preprocess_args` branches and never reach the
+/// fallthrough) nor one of AY's own short flags (`-q`, `-t`, clap's `-h`/`-V`).
+/// In a z3 invocation, z3's parser rejects these as invalid options.
+fn is_unknown_single_dash_option(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 1 {
+        return false;
+    }
+    if matches!(arg, "-q" | "-h" | "-V" | "-t") {
+        return false;
+    }
+    // AY's `-t` with an attached or `=`-joined timeout value.
+    if let Some(value) = arg.strip_prefix("-t") {
+        let digits = value.strip_prefix('=').unwrap_or(value);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// AY's solve long-flag spellings (without the leading `--`), derived from
+/// the clap definition itself so the known set cannot drift from what the
+/// parser accepts.
+fn known_solve_long_options() -> &'static std::collections::HashSet<String> {
+    static KNOWN: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut cmd = Cli::command();
+        cmd.build();
+        let mut names = std::collections::HashSet::new();
+        if let Some(solve) = cmd.find_subcommand("solve") {
+            for arg in solve.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    names.insert(long.to_string());
+                }
+                for alias in arg.get_aliases().into_iter().flatten() {
+                    names.insert(alias.to_string());
+                }
+                for alias in arg.get_visible_aliases().into_iter().flatten() {
+                    names.insert(alias.to_string());
+                }
+            }
+        }
+        names
+    })
+}
+
+/// A `--long` spelling (optionally `=value`-joined) that AY's solve parser
+/// does not accept. In a z3 invocation z3 rejects these itself; native
+/// invocations keep clap's diagnostic and never reach this check.
+fn is_unknown_long_option(arg: &str) -> bool {
+    let Some(name) = arg.strip_prefix("--") else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let name = name.split('=').next().unwrap_or(name);
+    // Help/version spellings are served by the pre-parse meta handlers
+    // (`maybe_print_explicit_z3_meta`, `maybe_print_solve_full_help`), not
+    // by clap, so they never appear in the solve argument list.
+    if matches!(name, "help" | "version" | "full-help") {
+        return false;
+    }
+    !known_solve_long_options().contains(name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -3079,13 +3633,34 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
         processed.push(prog.clone());
     }
 
+    // Z3 invocation context: the binary was invoked as `z3` or `--z3-mode`
+    // was given. Only there do unknown options and extra input files take
+    // z3's error/warning shapes; native invocations keep clap's diagnostics.
+    let z3_context = argv0_is_z3(&raw) || raw.iter().any(|arg| arg == "--z3-mode");
+    let mut seen_input_file = false;
+
     let mut i = 1;
     while i < raw.len() {
         let arg = &raw[i];
 
         if arg == "--" {
+            // In z3 context, input files after the first are duplicates z3
+            // warns about and ignores. Their carriers must land BEFORE the
+            // `--` separator or clap would read them as positionals.
+            let mut tail = Vec::new();
+            for item in raw.iter().skip(i + 1) {
+                if z3_context && looks_like_input_path_arg(item) {
+                    if seen_input_file {
+                        processed.push("--z3-duplicate-input".to_string());
+                        processed.push(item.clone());
+                        continue;
+                    }
+                    seen_input_file = true;
+                }
+                tail.push(item.clone());
+            }
             processed.push(arg.clone());
-            processed.extend(raw.iter().skip(i + 1).cloned());
+            processed.extend(tail);
             break;
         } else if arg == "-" {
             // A bare `-` FILE means "read the formula from stdin" — the
@@ -3108,8 +3683,15 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
             processed.push("--memory".to_string());
             processed.push(mem_str.to_string());
         } else if let Some(file) = arg.strip_prefix("-file:") {
-            // Z3: -file:PATH -> PATH
-            processed.push(file.to_string());
+            // Z3: -file:PATH -> PATH. A second input in z3 context is a
+            // warned-about duplicate, not the input.
+            if z3_context && seen_input_file {
+                processed.push("--z3-duplicate-input".to_string());
+                processed.push(file.to_string());
+            } else {
+                seen_input_file = true;
+                processed.push(file.to_string());
+            }
         } else if arg == "-smt2" {
             // Z3: -smt2 is a no-op (auto-detected)
         } else if arg == "-dimacs" {
@@ -3188,7 +3770,27 @@ fn preprocess_args(raw: Vec<String>) -> Vec<String> {
                 processed.push("--unsupported-z3-param".to_string());
                 processed.push(arg.clone());
             }
+        } else if z3_context && is_unknown_single_dash_option(arg) {
+            // Not a z3 spelling AY translates (those matched earlier) and not
+            // an AY short flag: z3's parser rejects it as invalid.
+            processed.push("--invalid-z3-option".to_string());
+            processed.push(arg.clone());
+        } else if z3_context && is_unknown_long_option(arg) {
+            // Not an AY long flag: z3's parser rejects it as invalid.
+            processed.push("--invalid-z3-option".to_string());
+            processed.push(arg.clone());
+        } else if z3_context
+            && seen_input_file
+            && !arg.starts_with('-')
+            && looks_like_input_path_arg(arg)
+        {
+            // Second input file: z3 warns and solves the first.
+            processed.push("--z3-duplicate-input".to_string());
+            processed.push(arg.clone());
         } else {
+            if z3_context && !arg.starts_with('-') && looks_like_input_path_arg(arg) {
+                seen_input_file = true;
+            }
             if !explicit_input_format
                 && !processed
                     .iter()
@@ -3349,6 +3951,17 @@ fn handle_z3_key_value_param(arg: &str, processed: &mut Vec<String>) -> bool {
     let Some((key, value)) = split_z3_param(arg) else {
         return false;
     };
+    let (module, parameter) = z3_parameter_help::normalize_parameter(key);
+    if module == "rewriter" && ay_dpll::api::PolynomialParameters::recognizes(&parameter) {
+        processed.push("--z3-polynomial-option".to_owned());
+        processed.push(format!("{parameter}={value}"));
+        return true;
+    }
+    if module == "rewriter" && parameter == "max_power_expansion" {
+        processed.push("--z3-sequence-power-expansion".to_owned());
+        processed.push(value.to_owned());
+        return true;
+    }
 
     match key {
         "timeout" if is_z3_unsigned_value(value) => {
@@ -3713,12 +4326,32 @@ fn solve_session_needs_wrapper(processed: &[String]) -> bool {
                 | "--z3-parameter-request"
                 | "--z3-catalog-request"
                 | "--unsupported-z3-option"
+                | "--invalid-z3-option"
         ) {
             return false;
         }
     }
 
     true
+}
+
+/// The reaper's pid slot while the child is being spawned: it may already
+/// exist, but its pid is not published yet.
+const CHILD_SPAWNING: i32 = 0;
+/// The reaper's pid slot once the child has been reaped.
+const CHILD_REAPED: i32 = -1;
+/// Base of the slot values that record a signal received while
+/// [`CHILD_SPAWNING`]: `-(CHILD_SIGNAL_PENDING_BASE + signal)`.
+const CHILD_SIGNAL_PENDING_BASE: i32 = 1000;
+
+/// The slot value recording `signal` as pending during the spawn.
+fn child_signal_pending(signal: i32) -> i32 {
+    -(CHILD_SIGNAL_PENDING_BASE + signal)
+}
+
+/// The signal a slot value records as pending during the spawn, if any.
+fn pending_child_signal(slot: i32) -> Option<i32> {
+    (slot < -CHILD_SIGNAL_PENDING_BASE).then(|| -slot - CHILD_SIGNAL_PENDING_BASE)
 }
 
 /// Install a signal reaper that guarantees the re-exec'd solve-session child
@@ -3733,14 +4366,21 @@ fn solve_session_needs_wrapper(processed: &[String]) -> bool {
 /// while the wrapper blocked in `child.wait()`. SIGHUP was not handled at all, so
 /// the wrapper died on its default disposition and orphaned the child.
 ///
-/// `child_pid` is a shared slot the reaper reads: `0` means "no live child to
-/// reap" (not spawned yet, or already `wait()`ed). The handlers are registered on
-/// the *calling* thread before the child is spawned, so there is no startup
-/// window in which a fatal signal hits the default disposition.
+/// `child_pid` is a shared slot the reaper reads: a positive pid is the live
+/// child, [`CHILD_REAPED`] "already `wait()`ed", and [`CHILD_SPAWNING`] "the
+/// spawn is in progress". A signal that arrives while spawning is recorded in
+/// the slot ([`child_signal_pending`]) instead of being acted on: the child may
+/// already exist without its pid being known, and it answers a SIGTERM itself
+/// once the signal reaches it. The spawner publishes the pid with a `swap` and
+/// delivers a recorded signal itself ([`deliver_signal_to_child`]), or, if the
+/// spawn failed, answers it ([`answer_signal_without_child`]). Answering here
+/// instead printed `unknown` twice: once from the wrapper, once from the child,
+/// which saw its parent die (re-exec supervisor, SIGTERM 7-23 ms after start).
+/// The handlers are registered on the *calling* thread before the child is
+/// spawned, so there is no startup window in which a fatal signal hits the
+/// default disposition.
 #[cfg(unix)]
 fn install_child_reaper_on_signal(child_pid: Arc<std::sync::atomic::AtomicI32>) {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
     // Registers the sigaction handlers immediately (in this parent thread) so a
@@ -3748,46 +4388,100 @@ fn install_child_reaper_on_signal(child_pid: Arc<std::sync::atomic::AtomicI32>) 
     let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) else {
         return;
     };
+    ay_sys::early_sigterm::hand_over_sigterm();
 
     let _ = std::thread::Builder::new()
         .name("ay-wrapper-signals".to_string())
         .spawn(move || {
             for raw_signal in &mut signals {
-                let pid = child_pid.load(Ordering::SeqCst);
-                if pid <= 0 {
-                    // No live child to reap: the signal is aimed at the wrapper
-                    // itself. Exit promptly with the conventional 128+signal code
-                    // (signal-hook has already suppressed the default terminate
-                    // disposition, so without this the wrapper would hang).
-                    std::process::exit(128 + raw_signal);
-                }
-                let target = Pid::from_raw(pid);
-                if raw_signal == SIGTERM {
-                    // Give the child its cooperative "unknown" shutdown (#8674),
-                    // then guarantee death with a SIGKILL safety net if it hangs
-                    // (e.g. a churning theory loop that never observes the timeout
-                    // flag). The wrapper's main thread is blocked in `child.wait()`
-                    // and returns the moment the child exits.
-                    let _ = kill(target, Signal::SIGTERM);
-                    let killer = Arc::clone(&child_pid);
-                    let _ = std::thread::Builder::new()
-                        .name("ay-wrapper-killnet".to_string())
-                        .spawn(move || {
-                            std::thread::sleep(Duration::from_secs(4));
-                            let pid = killer.load(Ordering::SeqCst);
-                            if pid > 0 {
-                                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-                            }
-                        });
-                } else {
-                    // SIGINT / SIGHUP: the solver child ignores SIGINT (inherited
-                    // background disposition) and has no cooperative path here, so
-                    // hard-kill it immediately. ay then dies cleanly like z3,
-                    // leaking nothing.
-                    let _ = kill(target, Signal::SIGKILL);
+                let mut slot = child_pid.load(Ordering::SeqCst);
+                loop {
+                    if slot > 0 {
+                        deliver_signal_to_child(raw_signal, slot, &child_pid);
+                        break;
+                    }
+                    if slot == CHILD_REAPED {
+                        if raw_signal == SIGTERM {
+                            // The child already answered and exited; the main
+                            // thread is leaving with its status. A verdict line
+                            // here would follow the child's own answer.
+                            break;
+                        }
+                        // signal-hook has suppressed the default terminate
+                        // disposition, so without this the wrapper would hang.
+                        std::process::exit(128 + raw_signal);
+                    }
+                    // Spawning: record the signal for the spawner. A SIGINT or
+                    // SIGHUP (hard kill) is never downgraded to a SIGTERM.
+                    let recorded = match pending_child_signal(slot) {
+                        Some(earlier) if earlier != SIGTERM => slot,
+                        _ => child_signal_pending(raw_signal),
+                    };
+                    match child_pid.compare_exchange(
+                        slot,
+                        recorded,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        // The spawner published the pid (or the reap) first.
+                        Err(current) => slot = current,
+                    }
                 }
             }
         });
+}
+
+/// Act on `raw_signal` for the live child `pid`: the reaper thread's path,
+/// and the spawner's for a signal that arrived during the spawn.
+#[cfg(unix)]
+fn deliver_signal_to_child(
+    raw_signal: i32,
+    pid: i32,
+    child_pid: &Arc<std::sync::atomic::AtomicI32>,
+) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let target = Pid::from_raw(pid);
+    if raw_signal == signal_hook::consts::SIGTERM {
+        // Give the child its cooperative "unknown" shutdown (#8674), then
+        // guarantee death with a SIGKILL safety net if it hangs (e.g. a
+        // churning theory loop that never observes the timeout flag). The
+        // wrapper's main thread is blocked in `child.wait()` and returns the
+        // moment the child exits. A child still starting up holds SIGTERM
+        // until its start-up answer is armed (`early_sigterm`).
+        let _ = kill(target, Signal::SIGTERM);
+        let killer = Arc::clone(child_pid);
+        let _ = std::thread::Builder::new()
+            .name("ay-wrapper-killnet".to_string())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_secs(4));
+                let pid = killer.load(Ordering::SeqCst);
+                if pid > 0 {
+                    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+                }
+            });
+    } else {
+        // SIGINT / SIGHUP: the solver child ignores SIGINT (inherited
+        // background disposition) and has no cooperative path here, so
+        // hard-kill it immediately. ay then dies cleanly like z3, leaking
+        // nothing.
+        let _ = kill(target, Signal::SIGKILL);
+    }
+}
+
+/// A signal recorded during a spawn that failed: no child will answer it.
+/// SIGTERM keeps the solve's contract (`unknown`, exit 124); the others exit
+/// with the conventional 128+signal code.
+fn answer_signal_without_child(raw_signal: i32) -> ! {
+    #[cfg(unix)]
+    if raw_signal == signal_hook::consts::SIGTERM {
+        let _ = Write::write_all(&mut io::stdout(), b"unknown\n");
+        let _ = Write::flush(&mut io::stdout());
+        std::process::exit(DEFAULT_TIMEOUT_EXIT_CODE);
+    }
+    std::process::exit(128 + raw_signal);
 }
 
 #[cfg(not(unix))]
@@ -4063,9 +4757,10 @@ fn maybe_inject_test_child_fault() {
         return;
     };
     match kind.to_string_lossy().trim() {
-        // SIGABRT — the `rust_oom`/`abort()` OOM producer (default & back-compat "1").
-        "" | "1" | "abort" | "abrt" | "oom" => std::process::abort(),
-        // SIGSEGV — genuine null dereference.
+        // SIGABRT (`rust_oom`/`abort()` producer; default & "1"), no macOS crash report.
+        "" | "1" | "abort" | "abrt" | "oom" => ay_sys::supervisor::abort_without_crash_report(),
+        // SIGSEGV — genuine null deref. segv, bus, ill, fpe, trap and stackoverflow
+        // DO file macOS crash reports; no test uses them.
         "segv" => ay_sys::supervisor::crash_null_deref(),
         // SIGBUS / SIGILL / SIGFPE / SIGTRAP — reliable SIG_DFL-reset + raise.
         "bus" => ay_sys::supervisor::die_with_signal(nix::libc::SIGBUS),
@@ -4090,7 +4785,7 @@ fn maybe_inject_test_child_fault() {
             }
         }
         // Any other value defaults to the abort path (back-compat).
-        _ => std::process::abort(),
+        _ => ay_sys::supervisor::abort_without_crash_report(),
     }
 }
 
@@ -4154,8 +4849,10 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
 
         ay_sys::supervisor::ForkOutcome::Child => {
             // ---- CHILD: single-threaded, shares the parent image (no second dyld) --
-            // Restore the inherited signal mask so the solve sees normal dispositions
+            // Answer a SIGTERM until the solve installs its own handler, then
+            // restore the inherited signal mask so the solve sees normal dispositions
             // (cooperative SIGTERM shutdown etc.) exactly as the re-exec'd child does.
+            ay_sys::early_sigterm::answer_until_handed_over();
             ay_sys::supervisor::restore_sigmask(&saved_mask);
 
             // Keep only the read end of the death pipe (closing this copy of the
@@ -4204,7 +4901,7 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
             let Some(raw_status) = ay_sys::supervisor::wait_for_child(pid) else {
                 // Unrecoverable waitpid failure: never leak the child.
                 ay_sys::supervisor::kill_and_reap(pid);
-                child_pid.store(0, Ordering::SeqCst);
+                child_pid.store(CHILD_REAPED, Ordering::SeqCst);
                 kill_guard.disarm();
                 safe_eprintln!("Error: failed to wait for solve session");
                 eprint_session_marker(build_info::session_end_marker(
@@ -4217,7 +4914,7 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
 
             // Child reaped cleanly: retire the slot and guard so a late signal can
             // never target a PID the OS may have recycled.
-            child_pid.store(0, Ordering::SeqCst);
+            child_pid.store(CHILD_REAPED, Ordering::SeqCst);
             kill_guard.disarm();
             // The child is reaped, so releasing the write end is a no-op for it.
             drop(death_pipe_writer);
@@ -4282,10 +4979,26 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
     // Shared PID of the child, read by the signal reaper. Installed BEFORE the
     // spawn so the SIGINT/SIGTERM/SIGHUP handlers exist for the child's whole
     // lifetime and no fatal signal can slip through on the default disposition.
-    let child_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    // Until the pid is published the reaper only records a signal (see
+    // `install_child_reaper_on_signal`).
+    let child_pid = Arc::new(std::sync::atomic::AtomicI32::new(CHILD_SPAWNING));
     install_child_reaper_on_signal(Arc::clone(&child_pid));
 
     let mut command = std::process::Command::new(current_exe);
+    // Keep argv[0]. The child re-derives every argv[0]-dependent mode from its
+    // OWN argv[0] — an `ay` installed as `z3` injects `--z3-mode` in
+    // `inject_z3_mode_from_argv0` — and `current_exe()` has already resolved
+    // that symlink to the real binary, so without this the parent latched
+    // z3-mode (and hid the session markers) while the child that actually
+    // solves ran as plain ay: AY provenance in `(get-info :version)`, ay's
+    // `(model …)` shape, ay's exit codes. The fork path never lost it because
+    // it continues with the parent's preprocessed args; this is the path every
+    // non-macOS host takes. `compose.rs` keeps argv[0] for the same reason.
+    #[cfg(unix)]
+    if let Some(argv0) = raw_args.first() {
+        use std::os::unix::process::CommandExt as _;
+        command.arg0(argv0);
+    }
     command
         .args(raw_args.iter().skip(1))
         .env(SESSION_PROVENANCE_CHILD_ENV, "1")
@@ -4298,6 +5011,11 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
     let death_pipe = parent_death::create();
     #[cfg(unix)]
     parent_death::configure_reexec_child(&mut command, death_pipe.as_ref());
+    // The child starts with SIGTERM blocked, so one the reaper forwards while it
+    // is still starting up waits for the child's start-up answer instead of
+    // killing it with no verdict (see `early_sigterm`).
+    #[cfg(unix)]
+    ay_sys::early_sigterm::start_child_with_sigterm_held(&mut command);
 
     // Peak-RSS trim: the solve child is where all the real allocation (and thus
     // peak RSS) lives. mimalloc's eager arena reservation can make the committed
@@ -4314,20 +5032,33 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            // No child exists, so a signal recorded during the spawn is ours to
+            // answer.
+            let pending = pending_child_signal(child_pid.swap(CHILD_REAPED, Ordering::SeqCst));
             safe_eprintln!("Error: failed to launch solve session: {error}");
             eprint_session_marker(build_info::session_end_marker(
                 build_info::SessionOutcome::LaunchError,
                 start.elapsed(),
             ));
             let _ = io::stderr().flush();
+            if let Some(raw_signal) = pending {
+                answer_signal_without_child(raw_signal);
+            }
             std::process::exit(1);
         }
     };
 
-    // Publish the live PID so the reaper can kill it, and arm a Drop guard that
-    // SIGKILLs it if this function unwinds (panic) before a clean `wait()`.
-    let raw_pid = i32::try_from(child.id()).unwrap_or(0);
-    child_pid.store(raw_pid, Ordering::SeqCst);
+    // Publish the live PID so the reaper can kill it, deliver a signal that
+    // arrived during the spawn, and arm a Drop guard that SIGKILLs the child if
+    // this function unwinds (panic) before a clean `wait()`.
+    let raw_pid = i32::try_from(child.id()).unwrap_or(CHILD_SPAWNING);
+    let pending = pending_child_signal(child_pid.swap(raw_pid, Ordering::SeqCst));
+    #[cfg(unix)]
+    if let (Some(raw_signal), true) = (pending, raw_pid > 0) {
+        deliver_signal_to_child(raw_signal, raw_pid, &child_pid);
+    }
+    #[cfg(not(unix))]
+    let _ = pending;
     #[cfg(unix)]
     let mut kill_guard = ChildKillGuard::new(raw_pid);
     // Hold the write end of the death pipe until the child has been reaped.
@@ -4352,7 +5083,7 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
 
     // Child reaped cleanly: retire the slot and guard so a late signal can never
     // target a PID the OS may have recycled.
-    child_pid.store(0, Ordering::SeqCst);
+    child_pid.store(CHILD_REAPED, Ordering::SeqCst);
     #[cfg(unix)]
     kill_guard.disarm();
     #[cfg(unix)]
@@ -5217,6 +5948,20 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
+    // Options z3's own parser rejects: exact z3 message, z3's exit status.
+    if !args.invalid_z3_option.is_empty() {
+        for option in &args.invalid_z3_option {
+            print_invalid_z3_option(option);
+        }
+        std::process::exit(109);
+    }
+
+    // Extra input files in a z3 invocation: z3 warns (once per extra file)
+    // and solves the first.
+    for _ in &args.z3_duplicate_input {
+        safe_eprintln!("WARNING: input file was already specified.");
+    }
+
     if !args.unsupported_z3_option.is_empty() {
         for option in &args.unsupported_z3_option {
             print_unsupported_z3_option(option);
@@ -5243,6 +5988,32 @@ fn run_solve(args: &SolveArgs) {
             safe_eprintln!("Error: unsupported Z3 parameter '{param}'");
         }
         std::process::exit(1);
+    }
+
+    if let Some(maximum) = args.z3_sequence_power_expansion.last() {
+        let _ = SEQUENCE_POWER_EXPANSION.set(*maximum);
+    }
+    if !args.z3_polynomial_option.is_empty() {
+        let mut polynomial = ay_dpll::api::PolynomialParameters::default();
+        for option in &args.z3_polynomial_option {
+            let Some((name, value)) = option.split_once('=') else {
+                safe_eprintln!("Error: invalid rewriter option");
+                std::process::exit(1);
+            };
+            let value = match value {
+                "true" => ay_dpll::api::TacticParameterValue::Bool(true),
+                "false" => ay_dpll::api::TacticParameterValue::Bool(false),
+                other => match other.parse::<u32>() {
+                    Ok(n) => ay_dpll::api::TacticParameterValue::UInt(n),
+                    Err(_) => ay_dpll::api::TacticParameterValue::Unsupported,
+                },
+            };
+            if polynomial.set(name, value).is_err() {
+                safe_eprintln!("Error: invalid rewriter parameter {name}");
+                std::process::exit(1);
+            }
+        }
+        let _ = POLYNOMIAL_OPTIONS.set(polynomial);
     }
 
     // Real Z3 tuning knobs AY does not implement: accepted so the run proceeds
@@ -5309,6 +6080,20 @@ fn run_solve(args: &SolveArgs) {
     }
 
     args.install_solver_switches();
+    // `--sat-deterministic-inproc` promises byte-identical proofs from one
+    // build under any load. A parallel portfolio (first finisher wins),
+    // cube-and-conquer workers and a fallback stage cut by the clock cannot
+    // keep that promise, so they are refused rather than silently timed.
+    if ay_sat::deterministic_inproc_enabled()
+        && (args.parallel.is_some()
+            || args.cube_and_conquer.is_some()
+            || args.fallback_solver.is_some())
+    {
+        safe_eprintln!(
+            "Error: --sat-deterministic-inproc is incompatible with --parallel, --cube-and-conquer and --fallback-solver; those routes decide by timing"
+        );
+        std::process::exit(1);
+    }
 
     // -- CLI → global config population (#8835) ---------------------------
     //
@@ -5357,6 +6142,7 @@ fn run_solve(args: &SolveArgs) {
         full: args.stats_full,
         json: args.stats_json,
     };
+    hard_exit_statistics::note_requested(stats_cfg.human, stats_cfg.json);
 
     // Progress
     if args.progress {
@@ -5379,6 +6165,9 @@ fn run_solve(args: &SolveArgs) {
     // Strict proof mode (#8555, #8759).
     if args.strict_proofs {
         STRICT_PROOFS_ENABLED.store(true, Ordering::SeqCst);
+    }
+    if matches!(args.alethe_dialect, Some(CliAletheDialect::PinnedCarcara)) {
+        ALETHE_DIALECT_PINNED.store(true, Ordering::SeqCst);
     }
 
     // Fail-closed self-check: AY verifies its own sat/unsat answers.
@@ -5470,7 +6259,22 @@ fn run_solve(args: &SolveArgs) {
     // Timeout
     let timeout_ms = args.timeout;
     if let Some(ms) = timeout_ms {
-        set_global_timeout(ms);
+        // `--engine=shadow`: the lane keeps its `ms` deadline, the kernel then
+        // gets `ms` of its own, and the hard-exit watchdog waits for both.
+        // `--engine-shadow-proofs` adds a third `ms` for the kernel's proof
+        // assembly and check.
+        let flags = ay_core::misc_cli_flags();
+        let watchdog_ms = if flags.engine_shadow {
+            let windows = if flags.engine_shadow_proofs.is_some() {
+                3
+            } else {
+                2
+            };
+            ms.saturating_mul(windows).saturating_add(3_000)
+        } else {
+            ms
+        };
+        set_global_timeout_with_watchdog(ms, watchdog_ms);
     }
 
     // Sequential-fallback composed solve. Dispatched here — after the global
@@ -5527,7 +6331,14 @@ fn run_solve(args: &SolveArgs) {
     //
     // Pass `--memory 0` to explicitly disable, or raise `GOVERN_AY_MB` to move
     // both bounds together for a sole-tenant run.
-    let memory_limit_bytes = if let Some(mb) = args.memory {
+    // `--memory-ceiling-bytes`: the ceiling is a cap, not an override; see
+    // `ay_sys::memory_ceiling`.
+    let memory_ceiling = args.memory_ceiling_bytes.map(|bytes| {
+        ay_sys::memory_ceiling::limit_under_ceiling(usize::try_from(bytes).unwrap_or(usize::MAX))
+    });
+    let memory_limit_bytes = if let Some(ceiling) = &memory_ceiling {
+        ceiling.limit_bytes
+    } else if let Some(mb) = args.memory {
         if mb == 0 {
             0
         } else {
@@ -5557,7 +6368,15 @@ fn run_solve(args: &SolveArgs) {
     // ceiling, so a breach during the file read already prints the grammar of
     // the input; the route dispatch in `run.rs` confirms it from the content.
     note_verdict_grammar_route(VerdictGrammarRoute::from_input_path(args.file.as_deref()));
+    let kernel_budget = ay_sys::govern::active_budget_bytes();
+    let memory_origin = memory_ceiling.as_ref().map_or_else(
+        || memory_limit_origin(args.memory, kernel_budget),
+        ay_sys::memory_ceiling::MemoryCeiling::origin,
+    );
     if memory_limit_bytes > 0 {
+        // Preformatted BEFORE the watchdog and the hard ceiling are armed, so
+        // the memout path reads it without deciding anything at breach time.
+        let _ = MEMORY_LIMIT_NOTE.set(memory_limit_note(memory_limit_bytes, &memory_origin));
         ay_sys::set_process_memory_limit(memory_limit_bytes);
         arm_memory_watchdog();
         arm_hard_memory_ceiling(memory_limit_bytes);
@@ -5569,6 +6388,8 @@ fn run_solve(args: &SolveArgs) {
     if memory_limit_bytes > 0 {
         tracing::info!(
             limit_mb = memory_limit_bytes / (1024 * 1024),
+            kernel_budget_mb = kernel_budget.map(|bytes| bytes / (1024 * 1024)),
+            origin = memory_origin.as_str(),
             "process memory limit active"
         );
     }
@@ -5760,7 +6581,6 @@ fn run_solve(args: &SolveArgs) {
                     f,
                     args.verbose,
                     validate,
-                    args.strict_proofs,
                     timeout_ms,
                     stats_cfg,
                     proof_config.as_ref(),
@@ -5910,18 +6730,13 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
     // `--stats-json`, whose contract is one machine-readable JSON line.
     //
     // The SMT-LIB (Alethe) default is synthesized for every `.smt2`/`.smt`
-    // input because the CHC runner retargets it to `<input>.chccert` and CHC
-    // is only recognised after the file is read — but the SMT DECISION route
-    // honours it only when certification was requested: a plain solve runs
-    // at the `fast` rung's proof posture (`proof_cycle_shed`), and
-    // `adapt_proof_config_for_smt` drops the synthesized config there. So the
-    // announcement, which names an `.alethe` a plain solve will never write,
-    // is printed only for a certifying invocation. DIMACS keeps its DRAT
-    // default and announcement unchanged.
+    // input; the CHC runner retargets it to `<input>.chccert` when the problem
+    // turns out to be Horn, which is only known after the file is read. A
+    // plain solve honours it — batteries on — so the announcement always names
+    // a file the run will actually write on `unsat`.
     if !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args)) {
         if let Some((path, format)) = default_proof_path(args.file.as_deref()) {
-            let announce = format != ProofFormat::Alethe || certification_requested(args);
-            if announce && !args.stats_json && !quiet_enabled() {
+            if !args.stats_json && !quiet_enabled() {
                 // "on unsat": this is announced before solving, and the
                 // certificate is only actually written for an UNSAT verdict —
                 // a SAT/unknown run creates no file. `-q`/`--quiet` suppresses
@@ -6122,8 +6937,9 @@ fn install_sigterm_handler() {
     let Ok(_sig_id) =
         signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm_flag))
     else {
-        return; // Non-fatal: fall back to default SIGTERM behavior.
+        return; // Non-fatal: the start-up answer keeps SIGTERM answered.
     };
+    ay_sys::early_sigterm::hand_over_sigterm();
 
     // Spawn a poller thread that watches for the SIGTERM flag and initiates
     // graceful shutdown. The poller checks every 50ms — well within the
@@ -6139,10 +6955,12 @@ fn install_sigterm_handler() {
             }
 
             // Set cooperative timeout flags so in-flight solvers can exit.
+            TERMINATED.store(true, Ordering::SeqCst);
             TIMED_OUT.store(true, Ordering::SeqCst);
             if let Some(handle) = INTERRUPT_HANDLE.get() {
                 handle.store(true, Ordering::SeqCst);
             }
+            ay_core::resource::cancel_process();
 
             // Grace period: let cooperative shutdown paths print their own output.
             std::thread::sleep(Duration::from_secs(2));
@@ -6166,13 +6984,13 @@ fn install_sigterm_handler() {
 // the CLI binary only (lib consumers choose their own allocator).
 //
 // The mimalloc allocator is wrapped in `ay_sys::MimallocCountingAllocator`,
-// which owns the mimalloc-only first-allocation arena trim and keeps an exact,
-// instantaneous count of live heap bytes (~2 relaxed atomics per allocation,
-// no syscalls). That counter feeds `ay_sys::process_memory_exceeded` — already
-// consulted at every solver cancellation checkpoint — so a runaway bulk
-// allocation trips the existing `Unknown(MemoryLimit)` path the moment it lands,
-// instead of letting the process grow until the OS OOM-killer panics the
-// machine. Soundness-neutral: it only observes bytes and drives Unknown, never
+// which owns the mimalloc-only first-allocation arena trim and counts live heap
+// bytes with no syscall, to within one 64 KiB batch per active stack window
+// (an allocation of two batches or more is counted at once). The count feeds
+// the hard allocation ceiling, which refuses a bulk allocation as it lands,
+// and `ay_sys::process_memory_exceeded` at every solver cancellation
+// checkpoint, so runaway growth ends in memout or `Unknown(MemoryLimit)`, not
+// the OS OOM-killer. Soundness-neutral: it only observes bytes and never makes
 // a wrong SAT/UNSAT. Binary-only; library consumers keep their own allocator.
 #[cfg(feature = "cli")]
 #[global_allocator]
@@ -6187,13 +7005,30 @@ fn main() {
     // Copies of this binary under other names are exactly what panicked the
     // machine on 2026-08-02 (`ay-base` 137.9 GB + `ay-fixed` 134.4 GB), so the
     // bound is armed by the image rather than by a shim on some path.
-    ay_sys::govern::arm();
-
-    let provenance_args = env::args_os().collect::<Vec<_>>();
-    if matches!(provenance_args.as_slice(), [_, flag] if flag == "--provenance") {
+    // Except this one: block SIGTERM first (allocation-free, thread-free; the
+    // mask survives the re-exec), so a SIGTERM in the start-up window waits
+    // for `arm_early_sigterm_answer` below instead of killing the run with
+    // no verdict (see `early_sigterm`).
+    #[cfg(unix)]
+    ay_sys::early_sigterm::hold_sigterm();
+    // This exact readonly operation formats compile-time identifiers only:
+    // no input, solver, child process, thread or resource claim is involved.
+    // Inspect at most argc 0..2 rather than collecting arbitrary argument data.
+    // An inherited private watchdog request must reach its normal dispatch or
+    // refusal; metadata output cannot stand in for its bootstrap handshake.
+    let exact_provenance = {
+        let mut arguments = env::args_os();
+        matches!((arguments.next(), arguments.next(), arguments.next()),
+            (Some(_), Some(flag), None) if flag == "--provenance")
+    };
+    if exact_provenance && env::var_os("AY_NATIVE_RESOURCE_WORKER_V1").is_none() {
         safe_println!("{}", build_info::exact_provenance_json());
         return;
     }
+
+    ay_sys::govern::arm();
+    #[cfg(unix)]
+    ay_sys::early_sigterm::arm_early_sigterm_answer();
 
     // The mimalloc `arena_reserve` peak-RSS trim runs from the global
     // allocator's first allocation, before any arena is reserved. A forked
@@ -6267,6 +7102,13 @@ fn main() {
     // run_solve(), not here: it synthesizes a solver verdict line on stdout,
     // which must never appear on the stdout of non-solve subcommands.
     let cli = Cli::parse_from(processed);
+    // Only a solve answers SIGTERM with a verdict line (see above).
+    #[cfg(unix)]
+    {
+        if !matches!(cli.command, None | Some(Command::Solve(_))) {
+            ay_sys::early_sigterm::terminate_by_default_on_sigterm();
+        }
+    }
 
     match cli.command {
         Some(Command::Solve(mut args)) => {
@@ -6492,31 +7334,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Some(Command::LaunchGate(args)) => match cmd_launch::run(&args) {
-            Ok(0) => {}
-            Ok(code) => {
-                let _ = io::stdout().flush();
-                let _ = io::stderr().flush();
-                std::process::exit(code);
-            }
-            Err(e) => {
-                safe_eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        },
         Some(Command::Release(cmd)) => match cmd_release::run(cmd) {
-            Ok(0) => {}
-            Ok(code) => {
-                let _ = io::stdout().flush();
-                let _ = io::stderr().flush();
-                std::process::exit(code);
-            }
-            Err(e) => {
-                safe_eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        },
-        Some(Command::LaunchPacket(args)) => match cmd_launch_packet::run(&args) {
             Ok(0) => {}
             Ok(code) => {
                 let _ = io::stdout().flush();
@@ -6607,6 +7425,12 @@ fn maybe_reexec_pb_with_large_stack() {
 #[cfg(not(unix))]
 fn maybe_reexec_pb_with_large_stack() {}
 
+#[cfg(test)]
+#[path = "query_response_tests.rs"]
+mod query_response_tests;
+#[cfg(test)]
+#[path = "sat_profile_search_flags_tests.rs"]
+mod sat_profile_search_flags_tests;
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;

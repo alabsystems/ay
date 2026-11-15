@@ -6,13 +6,13 @@
 //
 // This file holds the single soundness-critical CLASSIFICATION the PR/SR kernel
 // runs: `classify_reduct`. It is compiled by `cargo` — the real
-// `reduce_clause_under_subst` in `sr.rs` calls it, so the SHIPPED checker runs
+// `reduce_clause_under_subst` in `sr_subst.rs` calls it, so the SHIPPED checker runs
 // THIS decision — AND it is verified by `offline deductive checker check` against the exact
 // same source bytes: the development proof harness pulls this file in
 // with `include!`, so the proof is over the real code, NO TWIN. Plain `//`
 // comments only, so it stays valid when `include!`d into the proof harness.
 //
-// A reduct CLASS is a `u8` CODE mirroring `enum Reduce` in `sr.rs`:
+// A reduct CLASS is a `u8` CODE mirroring `enum Reduce` in `sr_subst.rs`:
 //   0 = Satisfied, 1 = NotReduced, 2 = Reduced, 3 = Contradiction.
 
 // THE soundness-critical CLASSIFICATION of a clause under the substitution sigma.

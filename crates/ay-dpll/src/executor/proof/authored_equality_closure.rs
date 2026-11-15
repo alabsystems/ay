@@ -4,6 +4,36 @@
 
 use super::*;
 
+mod ground_instances;
+mod run;
+
+use ground_instances::AuthoredGroundInstance;
+use run::{authored_closure_leaves, authored_closure_seeds, AuthoredClosureSeeds};
+
+// Work bounds shared by every closure run. The closure runs on every
+// refutation the strict checker rejects, and declining an oversized problem
+// leaves today's behaviour exactly as it is, so the bounds can only cost
+// completeness.
+// The live verification-consumer snapshot-alias obligation has 33 distinct authored
+// roots after deduplication (72 source rows, most repeated equality
+// bridges). Keep a bounded margin above that exact observed shape.
+// Resource parity remains explicit: root collection is linear and is
+// followed by the independent 64-leaf / 96-universe / 192-derived /
+// 3-round caps below, so widening this admission count does not unbound
+// either pairwise saturation loop. Every emitted premise is still
+// checked against `authored`, and the completed candidate is committed
+// only after strict replay.
+const MAX_AUTHORED_ROOTS: usize = 64;
+const MAX_LEAVES: usize = 64;
+// `fmap_deref`-class WP obligations carry several independent
+// equality components. Pairwise saturation can produce well over 48
+// checked recipes before the two four-edge goal chains are complete.
+// 192 remains a hard completeness-only work bound; the emitted
+// dependency cone and the final strict gate retain soundness.
+const MAX_DERIVED: usize = 192;
+const MAX_ROUNDS: usize = 3;
+const MAX_UNIVERSE: usize = 96;
+
 impl Executor {
     /// Rebuild a refutation whose whole content is EQUALITY REASONING over the
     /// exact authored roots (#trust-count→0, the `dt_and_term` / `check-sat-assuming`
@@ -69,155 +99,19 @@ impl Executor {
         &mut self,
         proof: &mut Proof,
     ) {
-        // Work bounds. This pass runs on every refutation the strict checker
-        // rejects, and declining an oversized problem leaves today's behaviour
-        // exactly as it is, so the bounds can only cost completeness.
-        // The live verification-consumer snapshot-alias obligation has 33 distinct authored
-        // roots after deduplication (72 source rows, most repeated equality
-        // bridges). Keep a bounded margin above that exact observed shape.
-        // Resource parity remains explicit: root collection is linear and is
-        // followed by the independent 64-leaf / 96-universe / 192-derived /
-        // 3-round caps below, so widening this admission count does not unbound
-        // either pairwise saturation loop. Every emitted premise is still
-        // checked against `authored`, and the completed candidate is committed
-        // only after strict replay.
-        const MAX_AUTHORED_ROOTS: usize = 64;
-        const MAX_LEAVES: usize = 64;
-        // `fmap_deref`-class WP obligations carry several independent
-        // equality components. Pairwise saturation can produce well over 48
-        // checked recipes before the two four-edge goal chains are complete.
-        // 192 remains a hard completeness-only work bound; the emitted
-        // dependency cone and the final strict gate retain soundness.
-        const MAX_DERIVED: usize = 192;
-        const MAX_ROUNDS: usize = 3;
-        const MAX_UNIVERSE: usize = 96;
-
         if self.check_proof_strict_with_datatypes(proof).is_ok() {
             return;
         }
         let authored = self.exact_concrete_authored_scope();
-        if authored.is_empty() || authored.len() > MAX_AUTHORED_ROOTS {
+        let Some(leaves) = authored_closure_leaves(&self.ctx.terms, &authored) else {
             return;
-        }
-
-        // 1. Conjunction leaves of the authored roots, each with the `and`-path
-        //    that reaches it. A leaf is derivable from its root by `and_pos`
-        //    projections alone, so nothing outside the authored scope enters.
-        let mut leaves: Vec<AuthoredLeaf> = Vec::new();
-        for &root in &authored {
-            collect_authored_conjunction_leaves(
-                &self.ctx.terms,
-                root,
-                root,
-                &mut Vec::new(),
-                &mut leaves,
-                MAX_LEAVES,
-            );
-        }
-        if leaves.len() > MAX_LEAVES {
-            return;
-        }
-
-        // 2. Seed the derived-equality set with the leaves that ARE equalities,
-        //    and collect the leaves that are DISEQUALITIES as closing targets.
-        let mut derived: Vec<AuthoredDerivedEq> = Vec::new();
-        let mut goals: Vec<AuthoredEqGoal> = Vec::new();
-        for (index, leaf) in leaves.iter().enumerate() {
-            if let Some((a, b)) = decode_eq_local(&self.ctx.terms, leaf.term) {
-                if a != b {
-                    push_authored_derived_eq(
-                        &mut derived,
-                        AuthoredDerivedEq {
-                            eq: leaf.term,
-                            a,
-                            b,
-                            derivation: AuthoredEqDerivation::Leaf(index),
-                        },
-                    );
-                }
-                continue;
-            }
-            if let TermData::Not(inner) = self.ctx.terms.get(leaf.term) {
-                let inner = *inner;
-                if decode_eq_local(&self.ctx.terms, inner).is_some() {
-                    goals.push(AuthoredEqGoal::Disequality {
-                        equality: inner,
-                        leaf: index,
-                    });
-                    continue;
-                }
-            }
-            // A common WP postcondition shape is
-            // `(or (not (= a x)) (not (= b y)))`: refuting it requires BOTH
-            // equalities. Keep this narrowly structural and bounded. The
-            // eventual `or` and resolution steps are checked independently;
-            // a malformed or incomplete candidate cannot pass the final
-            // strict commit gate.
-            if let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(leaf.term) {
-                const MAX_DISEQUALITY_DISJUNCTS: usize = 8;
-                if name == "or" && (2..=MAX_DISEQUALITY_DISJUNCTS).contains(&args.len()) {
-                    let mut equalities = Vec::with_capacity(args.len());
-                    for &disjunct in args {
-                        let TermData::Not(inner) = self.ctx.terms.get(disjunct) else {
-                            equalities.clear();
-                            break;
-                        };
-                        let inner = *inner;
-                        if decode_eq_local(&self.ctx.terms, inner).is_none()
-                            || equalities.contains(&inner)
-                        {
-                            equalities.clear();
-                            break;
-                        }
-                        equalities.push(inner);
-                    }
-                    if !equalities.is_empty() {
-                        goals.push(AuthoredEqGoal::DisequalityDisjunction {
-                            equalities,
-                            leaf: index,
-                        });
-                    }
-                }
-            }
-        }
+        };
+        let (derived, goals) = authored_closure_seeds(&self.ctx.terms, &leaves);
         if derived.is_empty() {
             return;
         }
-
-        // 3. The congruence universe: every subterm of the authored roots. A
-        //    congruence step may only conclude about applications the PROBLEM
-        //    already mentions, which keeps the search finite and the rebuilt
-        //    proof free of invented terms.
-        let mut universe: Vec<TermId> = Vec::new();
-        for &root in &authored {
-            collect_authored_subterms(&self.ctx.terms, root, &mut universe, MAX_UNIVERSE);
-        }
-        if universe.len() > MAX_UNIVERSE {
-            return;
-        }
-
-        // 4. Bounded saturation, then close. Closers are tried on the seeds and
-        //    after every round, so the smallest refutation wins.
-        for _ in 0..=MAX_ROUNDS {
-            if let Some(candidate) =
-                self.build_authored_equality_closure_candidate(&leaves, &derived, &goals)
-            {
-                if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
-                    .is_ok()
-                    && Self::proof_derives_empty_clause(&candidate)
-                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-                {
-                    *proof = candidate;
-                    return;
-                }
-            }
-            if derived.len() >= MAX_DERIVED {
-                return;
-            }
-            if !self.saturate_authored_equalities(&mut derived, &universe, MAX_DERIVED) {
-                return;
-            }
-        }
+        let seeds = AuthoredClosureSeeds::plain(&leaves, &goals);
+        self.close_authored_equalities(proof, &authored, seeds, derived);
     }
 
     /// One saturation round: extend `derived` with the transitivity and
@@ -493,6 +387,10 @@ enum AuthoredEqDerivation {
         right: TermId,
         positions: Vec<Option<usize>>,
     },
+    /// The equality disjunct of a checked ground instance of an authored
+    /// universal, every other disjunct refuted (`forall_inst`, `or`,
+    /// resolution); see `ground_instances`.
+    Instance(Box<AuthoredGroundInstance>),
 }
 
 /// A derived equality: the canonical equality term, its two sides, and its
@@ -699,6 +597,7 @@ impl<'a> AuthoredEqProofBuilder<'a> {
         let entry = self.derived.get(index)?.clone();
         let id = match entry.derivation {
             AuthoredEqDerivation::Leaf(leaf) => self.emit_leaf(terms, leaf)?,
+            AuthoredEqDerivation::Instance(ref inst) => self.emit_ground_instance(terms, inst)?,
             AuthoredEqDerivation::Transitive { left, right } => {
                 let left_id = self.emit_derived(terms, left)?;
                 let right_id = self.emit_derived(terms, right)?;

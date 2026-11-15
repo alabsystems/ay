@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::checker::test_helpers::lit;
+use crate::drat_parser::ProofStep;
 
 // ─── trail_len ──────────────────────────────────────────────────────
 
@@ -135,15 +136,19 @@ fn test_lit_value_out_of_bounds_returns_none() {
 // ─── add_trusted ────────────────────────────────────────────────────
 
 #[test]
-fn test_add_trusted_adds_clause_without_rup_check() {
+fn test_add_trusted_adds_clause_without_rup_check() -> Result<(), Box<dyn std::error::Error>> {
     let mut checker = DratChecker::new(5, false);
     let before = checker.live_clause_count();
     checker.add_trusted(&[lit(0, true), lit(1, true)]); // (a v b) — no RUP check
-    assert_eq!(
-        checker.live_clause_count(),
-        before + 1,
-        "add_trusted should insert clause"
-    );
+    let expected = before.checked_add(1).ok_or("live clause count overflows")?;
+    let after = checker.live_clause_count();
+    if after != expected {
+        return Err(format!(
+            "add_trusted should insert clause: {after} live clauses, expected {expected}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[test]

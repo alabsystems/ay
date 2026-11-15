@@ -1,0 +1,18 @@
+pseudo-Boolean proof version 3.0
+% The same fabrication reached through CHECKED DELETION rather than `pbc`: with
+% `strengthening_to_core on` a `delc` subproof is a proof by contradiction and registers no
+% proofgoals either, so `proofgoal 1` fabricated one and closing it discharged the deletion
+% obligation. The consequence is a different wrong verdict: a CORE constraint is deleted for
+% free, and the formula `x1 AND ~x1` -- unsatisfiable -- was reported
+% `s VERIFIED SATISFIABLE`.
+f 2 ;
+strengthening_to_core on;
+delc 2 : : subproof
+    proofgoal 1
+        rup >= 1 ;
+    qed;
+qed;
+sol x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

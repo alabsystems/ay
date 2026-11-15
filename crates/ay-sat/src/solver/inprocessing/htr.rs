@@ -59,6 +59,10 @@ impl Solver {
         // For LRAT, track assigned clause IDs of ternary resolvents so that
         // multi-round HTR can reference earlier-round resolvents as antecedents (#4398).
         let mut derived_lrat_ids: Vec<u64> = Vec::new();
+        // `--sat-veripb-hints`: this call's ternary resolvents in derived
+        // order, so a later round's resolvent can name one by content.
+        let veripb_hints = self.veripb_hints_active();
+        let mut derived_ternaries: Vec<Vec<Literal>> = Vec::new();
         for (resolvent, ante1, ante2) in &result.resolvents {
             // Build LRAT hints from antecedent clause IDs.
             let hints = if self.cold.lrat_enabled {
@@ -85,6 +89,21 @@ impl Solver {
             } else {
                 Vec::new()
             };
+
+            // `--sat-veripb-hints`: name the two clauses resolved (the funnel
+            // checks them by refutation before writing their ids).
+            if veripb_hints {
+                for ante in [*ante1, *ante2] {
+                    if ante < derived_base {
+                        self.veripb_note_antecedent_ref(ClauseRef(ante as u32));
+                    } else if let Some(lits) = derived_ternaries.get(ante - derived_base) {
+                        self.veripb_note_antecedent(lits);
+                    }
+                }
+                if resolvent.len() == 3 {
+                    derived_ternaries.push(resolvent.clone());
+                }
+            }
 
             // Log resolvent to proof and sync ID counter (#4398).
             // The manager may consume extra IDs for deletion flushes, so we

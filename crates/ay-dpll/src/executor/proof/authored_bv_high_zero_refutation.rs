@@ -306,7 +306,7 @@ impl Executor {
         // checked 64-bit pseudo-Boolean template.
         let zero_equality = raw_equality(&mut self.ctx.terms, ult.subject, target.zero)?;
         let zero_equivalence = raw_equality(&mut self.ctx.terms, ult.literal, zero_equality)?;
-        if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[zero_equivalence]) {
+        if !self.recognize_bv_bitblast_until_stopped(&[zero_equivalence]) {
             return None;
         }
         let zero_equivalence_unit = candidate.add_theory_lemma_with_kind(

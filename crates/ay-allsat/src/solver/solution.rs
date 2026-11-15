@@ -34,7 +34,7 @@ impl std::fmt::Display for SolutionIndexing {
 }
 
 /// A solution variable or literal cannot be accessed unambiguously.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 #[non_exhaustive]
 pub enum SolutionLiteralError {
     /// Signed clause encoding reserves zero and supports variables only through
@@ -44,6 +44,20 @@ pub enum SolutionLiteralError {
     VariableMissing(u32),
     /// Signed literals are a 1-based API but this solution is 0-based.
     IndexingMismatch(SolutionIndexing),
+}
+
+// Written out instead of derived: the derived enum comparison ends in an
+// `unreachable` arm that per-function verification cannot rule out, while
+// this match is total and compares exactly the same fields.
+impl PartialEq for SolutionLiteralError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::VariableOutOfRange(left), Self::VariableOutOfRange(right)) => left == right,
+            (Self::VariableMissing(left), Self::VariableMissing(right)) => left == right,
+            (Self::IndexingMismatch(left), Self::IndexingMismatch(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for SolutionLiteralError {
@@ -134,7 +148,15 @@ impl Solution {
                 let value = self
                     .get(var)
                     .ok_or(SolutionLiteralError::VariableMissing(var))?;
-                Ok(if value { literal } else { -literal })
+                // `literal` is in 1..=i32::MAX, so negation cannot overflow;
+                // `checked_neg` states that without a panicking path.
+                if value {
+                    Ok(literal)
+                } else {
+                    literal
+                        .checked_neg()
+                        .ok_or(SolutionLiteralError::VariableOutOfRange(var))
+                }
             })
             .collect()
     }

@@ -176,10 +176,9 @@ impl CoreSolver {
                                             TermData::Const(Constant::Int(_))
                                         )
                                     {
-                                        let explanation = vec![lit];
                                         infer.add_conflict(
                                             InferenceKind::PredicateConflict,
-                                            explanation,
+                                            Self::range_conflict(terms, state, lit, func_side),
                                         );
                                         return true;
                                     }
@@ -270,8 +269,8 @@ impl CoreSolver {
                             // conclusion model-local -> spurious universal UNSAT
                             // (#str-lia-WU). Fail closed otherwise.
                             if matches!(terms.get(const_side), TermData::Const(Constant::Int(_))) {
-                                let explanation = vec![lit];
-                                infer.add_conflict(InferenceKind::PredicateConflict, explanation);
+                                let expl = Self::range_conflict(terms, state, lit, func_side);
+                                infer.add_conflict(InferenceKind::PredicateConflict, expl);
                                 return true;
                             }
                             // CAP-2: reduction lemma first, incomplete as fallback.

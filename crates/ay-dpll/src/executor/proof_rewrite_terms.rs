@@ -24,14 +24,54 @@ const PROOF_REWRITE_STACK_SIZE: usize = 1024 * 1024;
 
 use super::Executor;
 
+#[cfg(test)]
+mod tests;
+
+/// This transform cannot preserve the meaning of source-position-bound data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(in crate::executor) enum ProofTermRewriteError {
+    #[error("source-bound SOS certificate at proof step {step} cannot be rewritten")]
+    SourceBoundSos { step: usize },
+    #[error("unsupported proof step {step} cannot be rewritten")]
+    UnsupportedStep { step: usize },
+    #[error("proof step {step} carries source-bound finite-field multipliers")]
+    SourceBoundFiniteField { step: usize },
+}
+
 impl Executor {
+    /// Refuse the whole document before any term allocation or proof mutation.
+    /// SOS origins name exact clause positions; neither rewriting nor clause
+    /// deduplication is sound without a separately authenticated remapping.
+    pub(in crate::executor) fn preflight_proof_term_rewrite(
+        proof: &Proof,
+    ) -> Result<(), ProofTermRewriteError> {
+        for (step, entry) in proof.steps.iter().enumerate() {
+            match entry {
+                ProofStep::Assume(_)
+                | ProofStep::TheoryLemma { .. }
+                | ProofStep::Step { .. }
+                | ProofStep::Resolution { .. }
+                | ProofStep::Anchor { .. } => {}
+                ProofStep::NraSos { .. } => {
+                    return Err(ProofTermRewriteError::SourceBoundSos { step });
+                }
+                ProofStep::FiniteFieldLinear { .. } => {
+                    return Err(ProofTermRewriteError::SourceBoundFiniteField { step });
+                }
+                _ => return Err(ProofTermRewriteError::UnsupportedStep { step }),
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::executor) fn rewrite_proof_terms(
         terms: &mut TermStore,
         proof: &mut Proof,
         rewrites: &HashMap<TermId, TermId>,
-    ) {
+    ) -> Result<(), ProofTermRewriteError> {
+        Self::preflight_proof_term_rewrite(proof)?;
         let mut cache: HashMap<TermId, TermId> = HashMap::default();
-        for step in &mut proof.steps {
+        for (index, step) in proof.steps.iter_mut().enumerate() {
             match step {
                 ProofStep::Assume(term) => {
                     *term = Self::rewrite_term(terms, *term, rewrites, &mut cache);
@@ -89,16 +129,22 @@ impl Executor {
                     Self::dedup_clause(clause);
                 }
                 ProofStep::Anchor { .. } => {}
-                other => unreachable!("unhandled ProofStep in rewrite_proof_terms(): {other:?}"),
+                // The whole-document preflight has already refused these
+                // variants; keep the mutation match fail-closed as well.
+                ProofStep::NraSos { .. } => {
+                    return Err(ProofTermRewriteError::SourceBoundSos { step: index });
+                }
+                ProofStep::FiniteFieldLinear { .. } => {
+                    return Err(ProofTermRewriteError::SourceBoundFiniteField { step: index });
+                }
+                _ => return Err(ProofTermRewriteError::UnsupportedStep { step: index }),
             }
         }
+        Ok(())
     }
 
     fn dedup_clause(clause: &mut Vec<TermId>) {
-        #[cfg(not(kani))]
         let mut seen = ay_core::kani_compat::det_hash_set_with_capacity(clause.len());
-        #[cfg(kani)]
-        let mut seen = HashSet::default();
         clause.retain(|lit| seen.insert(*lit));
     }
 
@@ -108,6 +154,8 @@ impl Executor {
             derived.push(match step {
                 ProofStep::Assume(term) => vec![*term],
                 ProofStep::TheoryLemma { clause, .. }
+                | ProofStep::FiniteFieldLinear { clause, .. }
+                | ProofStep::NraSos { clause, .. }
                 | ProofStep::Step { clause, .. }
                 | ProofStep::Resolution { clause, .. } => clause.clone(),
                 _ => Vec::new(),

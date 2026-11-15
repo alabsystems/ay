@@ -8,6 +8,7 @@
 //! by any code that needs to manipulate formula conjuncts.
 
 use crate::{ChcExpr, ChcOp};
+use ay_core::kani_compat::DetHashSet as FxHashSet;
 use std::sync::Arc;
 
 /// Build a conjunction from a list of formulas.
@@ -48,20 +49,38 @@ pub(in crate::pdr) fn collect_or_branches(args: &[Arc<ChcExpr>], result: &mut Ve
     });
 }
 
-/// Extract all disequalities `(not (= a b))` from an expression.
+/// Extract the disequalities `(not (= a b))` under the `and`/`or` spine of
+/// an expression, in tree (depth-first) order and with tree multiplicity,
+/// stopping once `cap` are collected.
 ///
-/// Returns Vec<(lhs, rhs)> for each disequality found.
-pub(in crate::pdr) fn extract_disequalities(expr: &ChcExpr) -> Vec<(ChcExpr, ChcExpr)> {
+/// Returns Vec<(lhs, rhs)> for each disequality found (at most `cap`).
+///
+/// The cap and the memo of diseq-free subtrees bound the walk on DAGs: the
+/// expression is a DAG (substituted frames and `let`-expanded transitions
+/// share subterms), and the uncapped tree walk expanded a shared `and`/`or`
+/// spine into one pushed pair per tree occurrence — measured on toy-bug-1
+/// (LRA-Lin) as two PDR lanes growing a `Vec` past 4 GiB each. Callers only
+/// look at the first few pairs or refuse beyond a count, so up to `cap` the
+/// result is exactly the tree walk's.
+pub(in crate::pdr) fn extract_disequalities(expr: &ChcExpr, cap: usize) -> Vec<(ChcExpr, ChcExpr)> {
     let mut diseqs = Vec::new();
-    extract_disequalities_rec(expr, &mut diseqs);
+    let mut barren: FxHashSet<*const ChcExpr> = FxHashSet::default();
+    extract_disequalities_rec(expr, cap, &mut diseqs, &mut barren);
     diseqs
 }
 
-/// Recursively extract disequalities from an expression.
-pub(in crate::pdr) fn extract_disequalities_rec(
+/// Recursive step of [`extract_disequalities`]. `barren` holds the spine
+/// nodes (by address; the root is borrowed for the whole walk) already known
+/// to contain no disequality, so a shared subtree without one is walked once.
+fn extract_disequalities_rec(
     expr: &ChcExpr,
+    cap: usize,
     result: &mut Vec<(ChcExpr, ChcExpr)>,
+    barren: &mut FxHashSet<*const ChcExpr>,
 ) {
+    if result.len() >= cap {
+        return;
+    }
     crate::expr::maybe_grow_expr_stack(|| match expr {
         ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
             if let ChcExpr::Op(ChcOp::Eq, eq_args) = args[0].as_ref() {
@@ -71,8 +90,19 @@ pub(in crate::pdr) fn extract_disequalities_rec(
             }
         }
         ChcExpr::Op(ChcOp::And | ChcOp::Or, args) => {
+            let key: *const ChcExpr = expr;
+            if barren.contains(&key) {
+                return;
+            }
+            let before = result.len();
             for arg in args {
-                extract_disequalities_rec(arg, result);
+                if result.len() >= cap {
+                    return;
+                }
+                extract_disequalities_rec(arg, cap, result, barren);
+            }
+            if result.len() == before {
+                barren.insert(key);
             }
         }
         _ => {}

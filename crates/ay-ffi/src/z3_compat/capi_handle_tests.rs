@@ -91,7 +91,7 @@ fn func_decl_to_ast_is_canonical_and_round_trips() {
         let mut dom = [int, arr];
         let f1 = Z3_mk_func_decl(c, sym, 2, dom.as_mut_ptr(), bv8);
         let f2 = Z3_mk_func_decl(c, sym, 2, dom.as_mut_ptr(), bv8);
-        assert_ne!(f1, f2, "AY does not hash-cons decl handles (precondition)");
+        assert_eq!(f1, f2, "decl handles are hash-consed, as z3's are");
         let a1 = Z3_func_decl_to_ast(c, f1);
         let a2 = Z3_func_decl_to_ast(c, f2);
         assert_ne!(a1, 0);
@@ -741,7 +741,7 @@ fn reserved_map_and_internal_names_are_refused() {
         // …and the same shape with a clean name still answers (sat, as z3).
         let good = c"(declare-fun mapf ((Array Int Int)) (Array Int Int)) (declare-const a (Array Int Int)) (assert (= (select (mapf a) 3) 7)) (check-sat)";
         let out2 = cstr(Z3_eval_smtlib2_string(c, good.as_ptr()));
-        assert_eq!(out2, "sat", "clean-name control must still decide");
+        assert_eq!(out2, "sat\n", "clean-name control must still decide");
         Z3_del_context(c);
     }
 }
@@ -909,11 +909,16 @@ fn datatype_symbols_round_trip_kind_without_private_name_leaks() {
                 Z3_get_symbol_kind(c, Z3_get_sort_name(c, sort)),
                 expected_kind
             );
+            // z3 names every recognizer `is` (a string symbol), whatever
+            // symbol the constructor was given; its constructor is the
+            // decl's parameter.
+            assert_eq!(
+                cstr(Z3_get_symbol_string(c, Z3_get_decl_name(c, recognizer))),
+                "is"
+            );
             for decl in [ctor, recognizer, accessor] {
-                assert_eq!(
-                    Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)),
-                    expected_kind
-                );
+                let want = if decl == recognizer { 1 } else { expected_kind };
+                assert_eq!(Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)), want);
                 let rendered = cstr(Z3_func_decl_to_string(c, decl));
                 assert!(
                     !rendered.contains("!ay.z3-"),
@@ -923,15 +928,15 @@ fn datatype_symbols_round_trip_kind_without_private_name_leaks() {
 
             // Sort-based introspection must preserve the same exact symbols,
             // not reconstruct string-kind names from private semantic text.
-            for decl in [
-                Z3_get_datatype_sort_constructor(c, sort, 0),
-                Z3_get_datatype_sort_recognizer(c, sort, 0),
-                Z3_get_datatype_sort_constructor_accessor(c, sort, 0, 0),
+            for (decl, want) in [
+                (Z3_get_datatype_sort_constructor(c, sort, 0), expected_kind),
+                (Z3_get_datatype_sort_recognizer(c, sort, 0), 1),
+                (
+                    Z3_get_datatype_sort_constructor_accessor(c, sort, 0, 0),
+                    expected_kind,
+                ),
             ] {
-                assert_eq!(
-                    Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)),
-                    expected_kind
-                );
+                assert_eq!(Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)), want);
             }
         }
 

@@ -33,7 +33,7 @@ def find_dylib(argv):
 def main():
     dylib = find_dylib(sys.argv)
     if not dylib or not os.path.exists(dylib):
-        print("SKIP: libay_ffi dylib not found (build with `cargo build --release -p ay-ffi`)")
+        print("SKIP: libay_ffi dylib not found (build with `targo --unverified build --release -p ay-ffi`, or `cargo build --release -p ay-ffi` without the Trust toolchain)")
         return 0
 
     workdir = tempfile.mkdtemp(prefix="ay_z3py_")

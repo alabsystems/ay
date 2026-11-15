@@ -7,12 +7,15 @@
 //! Contains the interactive (stdin), piped, and file-based execution
 //! paths. Extracted from `main.rs` to keep each file under 500 lines.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufWriter, Read, Write};
 
 use ay_core::{escape_string_contents, quote_symbol};
-use ay_dpll::{Executor, UnknownReason};
+use ay_dpll::{
+    CandidateModelPolicy, CanonicalWorkRefusal, Executor, OverridePlanExit, ProofDeclineMechanism,
+    SatReconstructionOutcome, UnboundedCensus, UnknownReason,
+};
 use ay_frontend::{
     parse, sexp::parse_sexp, Command, CommandStream, CommandStreamItem, Constant,
     FiniteSetTypingMode, FormulaStats, Index, IntroKind, QualifiedIdentifier, SExpr, Sort, Term,
@@ -26,17 +29,18 @@ use super::{
     proof_artifact::{
         write_sealed_proof_artifact, DigestBytes, ProofArtifactProblem, ProofArtifactTheoryMetadata,
     },
-    stats_output, ProofConfig, ProofFormat, EXPLAIN_ENABLED, EXPLAIN_FORMAT_JSON,
-    EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE, MINIMIZE_MODEL_ENABLED,
-    PROGRESS_ENABLED, PROGRESS_JSON_PATH, PROOF_CYCLE_SHED_ENABLED, SELF_CHECK_ENABLED, START_TIME,
-    STRICT_PROOFS_ENABLED, VERIFY_FIREWALL_ENABLED, VERIFY_PROOF_ENABLED, Z3_MODEL_ENABLED,
-    Z3_MODE_ENABLED,
+    stats_output, ProofConfig, ProofFormat, ALETHE_DIALECT_PINNED, EXPLAIN_ENABLED,
+    EXPLAIN_FORMAT_JSON, EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE,
+    MINIMIZE_MODEL_ENABLED, PROGRESS_ENABLED, PROGRESS_JSON_PATH, PROOF_CYCLE_SHED_ENABLED,
+    SELF_CHECK_ENABLED, START_TIME, STRICT_PROOFS_ENABLED, VERIFY_FIREWALL_ENABLED,
+    VERIFY_PROOF_ENABLED, Z3_MODEL_ENABLED, Z3_MODE_ENABLED,
 };
 use ay::solution_visualization::{render_solution_visualization, VisualizationFormat};
 
 const SMT_FILE_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 include!("run/smt_proof_config.rs");
+include!("run/strict_admission.rs");
 
 /// Create an executor with global timeout interrupt wired in (#2971).
 fn new_executor() -> Executor {
@@ -65,10 +69,62 @@ fn new_executor() -> Executor {
     // API (`set_strict_logic_compliance(true)`), which is how the elaborator's
     // own conformance tests drive it.
     executor.context_mut().set_strict_logic_compliance(false);
+    if let Some(maximum) = super::SEQUENCE_POWER_EXPANSION.get() {
+        let command = Command::SetOption(
+            "rewriter.max_power_expansion".to_owned(),
+            SExpr::Numeral(maximum.to_string()),
+        );
+        if let Err(error) = executor.execute(&command) {
+            safe_eprintln!("Error: cannot configure sequence power rewriting: {error}");
+            std::process::exit(1);
+        }
+    }
+    if let Some(polynomial) = super::POLYNOMIAL_OPTIONS.get() {
+        let configured = polynomial.visit(|name, value| {
+            let value = match value {
+                ay_dpll::api::TacticParameterValue::Bool(true) => SExpr::True,
+                ay_dpll::api::TacticParameterValue::Bool(false) => SExpr::False,
+                ay_dpll::api::TacticParameterValue::UInt(n) => SExpr::Numeral(n.to_string()),
+                _ => return Err("invalid polynomial configuration".to_owned()),
+            };
+            executor
+                .execute(&Command::SetOption(format!("rewriter.{name}"), value))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        if let Err(error) = configured {
+            safe_eprintln!("Error: cannot configure polynomial rewriting: {error}");
+            std::process::exit(1);
+        }
+    }
+    // `--rigor strict|certified`: authority GRANTS (the closed-sentence
+    // certificates) must rest on strictly checked evidence, mirroring the
+    // UNSAT screen below that withholds a trust-bearing refutation
+    // (#closed-sentence-cert): a closed sentence must not publish `sat` on
+    // the refutation its negation is refused.
+    executor.set_strict_grant_evidence_required(strict_proofs_enabled() || self_check_enabled());
     if z3_mode_enabled() {
         executor
             .context_mut()
             .set_finite_set_typing_mode(FiniteSetTypingMode::Z3_5Strict);
+        // Read the script as z3 reads it where the frontend is otherwise more
+        // permissive, and hold `:named` labels to z3's reading.
+        executor.context_mut().set_z3_mode(true);
+        // The narrow slice of z3's logic enforcement that its shell
+        // does apply: a builtin sort or operator outside the declared
+        // logic's signature is `unknown sort '...'` / `unknown
+        // constant ...` (DR-59). Plain mode keeps AY's own reading
+        // (e.g. the `min`/`max` builtins), as the label-guard pairs
+        // pin; z3's C-API parser stays permissive, so the library
+        // default does too.
+        executor
+            .context_mut()
+            .set_enforce_logic_sort_signatures(true);
+        // z3 answers `(get-model)` after `unknown` with the candidate its search
+        // stopped at, and z3 clients (Verus/AIR) read it to locate a failing
+        // assertion. The printed candidate is marked as unvalidated; outside
+        // --z3-mode `(get-model)` after `unknown` stays an error.
+        executor.set_candidate_model_policy(CandidateModelPolicy::PublishAfterUnknown);
     }
     if let Some(handle) = INTERRUPT_HANDLE.get() {
         executor.set_interrupt(handle.clone());
@@ -103,13 +159,17 @@ fn new_executor() -> Executor {
     if MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         executor.set_aggressive_model_minimize(true);
     }
+    // `--alethe-dialect`: every Alethe document this executor renders.
+    if ALETHE_DIALECT_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        executor.set_alethe_dialect(ay_proof::AletheDialect::PinnedCarcara);
+    }
     // Proof-cycle shedding (#proof-capability B1, generalised): the executor
     // sheds the internal proof cycle on public solves with no proof demand.
     // Keyed on `PROOF_CYCLE_SHED_ENABLED` — competition mode, `--no-proof`,
-    // `--z3-mode`, and every plain solve that requested no certification (the
-    // z3 default posture) — not on the competition latch alone, so the shed
-    // posture never drags the SAT-competition verdict grammar, the CHC
-    // validation battery, or the DIMACS proof re-check along with it. Setting the mode
+    // `--z3-mode` — not on the competition latch alone, so the shed posture
+    // never drags the SAT-competition verdict grammar, the CHC validation
+    // battery, or the DIMACS proof re-check along with it. A plain solve is
+    // never shed: batteries are on by default. Setting the mode
     // here is safe alongside the proof wiring below — precedence is evaluated
     // executor-side at every `begin_public_solve`, so a `set_produce_proofs`
     // from `--proof`/`--strict-proofs`/`--self-check` (in any order) or a
@@ -196,13 +256,63 @@ fn may_use_ungated_solver_route(gates: ResultGateRequests) -> bool {
     !gates.any()
 }
 
-fn required_smt_unsat_publication(proof: Option<&ProofConfig>) -> bool {
-    proof.is_some_and(|proof| {
-        !proof.synthesized_default
-            || proof.artifact_path.is_some()
-            || strict_proofs_enabled()
-            || crate::FIREWALL_LEAN_DIR.get().is_some()
-    })
+/// What a run's proof configuration asks of an executor-produced UNSAT before
+/// it reaches the regular output channel. Fixed once, before the first
+/// command. Whether ONE query's UNSAT is held back until its certificate is
+/// published also depends on the strict request in force when that query is
+/// answered, because the in-script spelling is only learned mid-script; see
+/// [`Self::holds_unsat`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SmtUnsatProofPosture {
+    /// No proof configuration: no certificate, so nothing to wait for.
+    #[default]
+    NoCertificate,
+    /// Only the synthesized default certificate (`<input>.alethe`). It is
+    /// best-effort unless strict proofs are requested, in either spelling.
+    DefaultCertificate,
+    /// An explicit proof file, an artifact envelope or a firewall Lean
+    /// directory: every UNSAT waits for its publication transaction.
+    RequiredCertificate,
+}
+
+impl SmtUnsatProofPosture {
+    fn of(proof: Option<&ProofConfig>) -> Self {
+        match proof {
+            None => Self::NoCertificate,
+            Some(proof)
+                if !proof.synthesized_default
+                    || proof.artifact_path.is_some()
+                    || crate::FIREWALL_LEAN_DIR.get().is_some() =>
+            {
+                Self::RequiredCertificate
+            }
+            Some(_) => Self::DefaultCertificate,
+        }
+    }
+
+    /// Whether an UNSAT answered under this posture is held back until its
+    /// publication transaction commits. `script_strict` is the in-script
+    /// option in force for that query; it is combined with the flag by THE
+    /// strict predicate (`strict_request`), never read apart from it.
+    fn holds_unsat(self, script_strict: bool) -> bool {
+        match self {
+            Self::NoCertificate => false,
+            Self::DefaultCertificate => {
+                crate::strict_request::strict_proofs_requested(script_strict)
+            }
+            Self::RequiredCertificate => true,
+        }
+    }
+}
+
+/// Whether an UNSAT must wait for its certificate: `proof` is the run's proof
+/// configuration and `script_strict` the in-script strict option in force for
+/// the query. This read the flag alone and was latched before the script ran,
+/// while the publication posture (`write_alethe_proof`) read both spellings:
+/// with only the option, a failed default publication printed `unsat` and
+/// then, at EOF, `unknown` for the same `check-sat`.
+fn required_smt_unsat_publication(proof: Option<&ProofConfig>, script_strict: bool) -> bool {
+    SmtUnsatProofPosture::of(proof).holds_unsat(script_strict)
 }
 
 fn unsupported_explicit_proof_verification_error(
@@ -503,6 +613,14 @@ struct SmtTranscriptState {
     rlimit_option: String,
     z3_compat_bool_options: HashMap<String, bool>,
     status: Option<String>,
+    /// AY's recorded solver-work counter: what `(get-info :rlimit)` and every
+    /// `:rlimit-count` of this session report. As in z3 it only grows until
+    /// `(reset)` starts it again at [`INITIAL_RLIMIT_COUNT`]. Commands add
+    /// only work the executor actually recorded. It lives here and not in the
+    /// executor because the executor is rebuilt after a failed command and its
+    /// statistics describe one check-sat; Verus's AIR subtracts successive
+    /// readings within a query as `u64`, so a reading below an earlier one
+    /// aborts the verifier.
     rlimit: u64,
     assertion_stack_depth: u32,
     executor_assertion_stack_depth: u32,
@@ -545,10 +663,25 @@ struct SmtTranscriptState {
     /// must never authorize a later verdict.
     decision_trace_publication: DecisionTracePublication,
     result_certification_rejected: bool,
-    /// A required persistent proof/firewall transaction must commit before an
-    /// executor-produced UNSAT becomes observable on the regular channel.
-    defer_unsat_publication: bool,
+    /// What the run's proof configuration requires before an executor-produced
+    /// UNSAT becomes observable on the regular channel. Set once, before the
+    /// first command; whether one query's UNSAT is held back is decided when
+    /// that query is answered
+    /// ([`SmtTranscriptState::holds_unsat_publication`]).
+    unsat_proof_posture: SmtUnsatProofPosture,
+    /// Whether `(set-option :check-proofs-strict true)` was in force when the
+    /// current decision query was answered. Strict proofs are judged per
+    /// query: an option set after a `check-sat` applies to later queries only.
+    query_script_strict: bool,
+    /// The held-back UNSAT of the current query, printed only once a required
+    /// persistent proof/firewall transaction commits.
     pending_unsat_output: Option<String>,
+    /// Whether this run created its default certificate (`<input>.alethe`).
+    /// A run publishes one and never replaces a file, so a later query that
+    /// finds the path taken met this run's own certificate for an earlier
+    /// query (or the empty stub it was invalidated to), not a stale file from
+    /// an earlier run. A fact about the run, so `(reset)` keeps it.
+    default_certificate_created: Cell<bool>,
     /// Retained proof/artifact authority for a deferred UNSAT. The prepared
     /// transaction remains armed until the decision trace settles and every
     /// participant is revalidated immediately before the verdict is emitted.
@@ -561,6 +694,24 @@ struct SmtTranscriptState {
     /// Model-Validation a `sat` carrying no model scores exactly ZERO, so that
     /// gap silently discarded solves AY had already finished paying for.
     owes_model_emission: bool,
+    /// Whether a command that fails inside the executor leaves the session
+    /// running, as in z3; see [`continue_after_failed_command`].
+    continue_after_failure: bool,
+    /// Executor mutations kept so the session can survive a failed command.
+    /// `None` when not kept, or once a command could not be recorded exactly;
+    /// see [`SessionReplayLog`].
+    replay_log: Option<SessionReplayLog>,
+    /// See [`report_failure_in_surviving_session`].
+    failure_reported: bool,
+    /// See [`keep_discarded_command_error`].
+    discarded_command_error: Option<String>,
+    z3_scope: Z3ScopeState,
+    /// `:named` label names whose binding here may differ from z3's: z3
+    /// binds them and this session did not, or this session binds them and
+    /// z3 may not reach them; see [`withhold_after_labels_z3_binds`].
+    labels_bound_unlike_z3: std::collections::HashSet<String>,
+    /// See [`withhold_answers_out_of_step`].
+    answers_out_of_step: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -608,7 +759,7 @@ impl SmtTranscriptState {
             rlimit_option: "0".to_string(),
             z3_compat_bool_options: z3_compat_bool_option_defaults(),
             status: Some("unknown".to_string()),
-            rlimit: 1,
+            rlimit: INITIAL_RLIMIT_COUNT,
             assertion_stack_depth: 0,
             executor_assertion_stack_depth: 0,
             symbol_sorts: HashMap::new(),
@@ -626,10 +777,19 @@ impl SmtTranscriptState {
             public_verdict_from_executor: false,
             decision_trace_publication: DecisionTracePublication::Pending,
             result_certification_rejected: false,
-            defer_unsat_publication: false,
+            unsat_proof_posture: SmtUnsatProofPosture::NoCertificate,
+            query_script_strict: false,
             pending_unsat_output: None,
+            default_certificate_created: Cell::new(false),
             smt_unsat_publication: SmtUnsatPublicationState::Unprepared,
             owes_model_emission: false,
+            continue_after_failure: false,
+            replay_log: None,
+            failure_reported: false,
+            discarded_command_error: None,
+            z3_scope: Z3ScopeState::default(),
+            labels_bound_unlike_z3: std::collections::HashSet::new(),
+            answers_out_of_step: false,
         }
     }
 
@@ -681,6 +841,7 @@ impl SmtTranscriptState {
         self.public_verdict_from_executor = false;
         self.result_certification_rejected = false;
         self.pending_unsat_output = None;
+        self.query_script_strict = false;
         self.smt_unsat_publication = SmtUnsatPublicationState::Unprepared;
         self.owes_model_emission = false;
     }
@@ -726,6 +887,20 @@ impl SmtTranscriptState {
             && !self.result_certification_rejected
             && !self.had_recoverable_error
             && !self.is_incomplete()
+    }
+
+    /// Whether the current query's executor UNSAT is held back until its
+    /// publication transaction commits: the run's proof posture under the
+    /// strict request in force when the query was answered.
+    fn holds_unsat_publication(&self) -> bool {
+        self.unsat_proof_posture
+            .holds_unsat(self.query_script_strict)
+    }
+
+    /// Whether strict proofs, in either spelling, were requested for the
+    /// current query.
+    fn query_strict_proofs_requested(&self) -> bool {
+        crate::strict_request::strict_proofs_requested(self.query_script_strict)
     }
 
     fn protect_path(&mut self, path: &std::path::Path) -> io::Result<()> {
@@ -889,8 +1064,18 @@ fn seed_smt_transcript_protections_or_exit(
 /// command's text, so its leading keyword is a reliable signal. A malformed
 /// S-expression (e.g. a stray `)`) does not start with `(<keyword>` and is left
 /// untainted, preserving z3-style continued-execution for such structural slips.
+///
+/// Text that may hold a `:named` label taints too, whatever its command: z3
+/// may accept the command and bind the label (`(check-sat-assuming ((! p
+/// :named a)) extra)`), and a later label or definition of that name then
+/// means something else here.
+///
+/// Text that holds more than one top-level form taints as well: recovery
+/// skipped a command z3 may have run.
 fn parse_drop_contributes_to_problem(consumed: &str) -> bool {
     source_has_command_keyword(consumed, command_keyword_contributes_to_problem)
+        || consumed.contains(":named")
+        || collect_command_sources(consumed).len() > 1
 }
 
 fn invalidate_export_after_malformed_decision(source: &str) {
@@ -924,11 +1109,35 @@ fn skip_smt_trivia(mut source: &str) -> &str {
 fn command_source_keyword(text: &str) -> Option<&str> {
     let body = skip_smt_trivia(text).strip_prefix('(')?;
     let body = skip_smt_trivia(body);
-    let end = body
-        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
-        .unwrap_or(body.len());
-    let keyword = &body[..end];
+    // `|pop|` is the symbol `pop`, and z3 runs `(|pop| 1)` as a pop. No
+    // command name holds a `\`, so the escapes in a quoted keyword need no
+    // decoding to compare it.
+    let keyword = match body.strip_prefix('|') {
+        Some(quoted) => &quoted[..quoted_symbol_body_end(quoted)?],
+        None => {
+            let end = body
+                .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                .unwrap_or(body.len());
+            &body[..end]
+        }
+    };
     (!keyword.is_empty()).then_some(keyword)
+}
+
+/// The byte offset of the `|` that ends a quoted symbol whose body starts
+/// `text`, with `\` escaping the character after it, or `None` when the
+/// symbol does not end.
+fn quoted_symbol_body_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'|' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 /// Inspect every list head in a possibly malformed command buffer. Looking at
@@ -967,10 +1176,16 @@ fn source_has_command_keyword(text: &str, predicate: impl Fn(&str) -> bool) -> b
             continue;
         }
         if in_quoted_symbol {
-            if byte == b'|' {
-                in_quoted_symbol = false;
+            // `\` escapes the next character, so `\|` does not end the
+            // symbol.
+            match byte {
+                b'\\' => index += 2,
+                b'|' => {
+                    in_quoted_symbol = false;
+                    index += 1;
+                }
+                _ => index += 1,
             }
-            index += 1;
             continue;
         }
 
@@ -992,10 +1207,11 @@ fn source_has_command_keyword(text: &str, predicate: impl Fn(&str) -> bool) -> b
 
 /// Command keywords whose failure to parse changes the satisfiability of the
 /// problem: anything that asserts a constraint, declares/defines a symbol or
-/// sort, or manipulates the assertion stack. Pure queries and options
-/// (`get-*`, `set-*`, `echo`, ...) are deliberately excluded — discarding one
-/// cannot flip a sat/unsat verdict, so the solver stays answerable (matching
-/// z3's continued-execution).
+/// sort, or manipulates the assertion stack. `set-option` counts too: an
+/// option such as `:global-declarations` decides which definition a later
+/// name means. Pure queries (`get-*`, `echo`, ...) are deliberately excluded
+/// — discarding one cannot flip a sat/unsat verdict, so the solver stays
+/// answerable (matching z3's continued-execution).
 fn command_keyword_contributes_to_problem(keyword: &str) -> bool {
     matches!(
         keyword,
@@ -1012,6 +1228,7 @@ fn command_keyword_contributes_to_problem(keyword: &str) -> bool {
             | "declare-datatype"
             | "declare-datatypes"
             | "define-fun"
+            | "define-const"
             | "define-fun-rec"
             | "define-funs-rec"
             | "declare-rel"
@@ -1023,6 +1240,7 @@ fn command_keyword_contributes_to_problem(keyword: &str) -> bool {
             | "reset"
             | "reset-assertions"
             | "set-logic"
+            | "set-option"
             | "synth-fun"
             | "synth-inv"
             | "constraint"
@@ -1084,12 +1302,19 @@ fn collect_command_sources(input: &str) -> Vec<CommandSource> {
 }
 
 include!("run/model_demand.rs");
+include!("run/session_rebuild.rs");
+include!("run/z3_quiet_failures.rs");
+include!("run/z3_session_scope.rs");
+include!("run/z3_session_start.rs");
+#[cfg(test)]
+mod label_mention_tests;
+include!("run/session_rlimit.rs");
+include!("run/stream_sources.rs");
+include!("run/stdin_buffer.rs");
+include!("run/query_alignment.rs");
 
 /// Like [`collect_command_sources`] but numbers the first line `line_base`
-/// instead of 1. The streaming `-in` path parses one command chunk at a time and
-/// clears the buffer between chunks, so it threads a running line count here to
-/// keep error positions cumulative across the whole session — z3 reports the
-/// true whole-input line number in `-in` mode, not a per-command reset.
+/// instead of 1.
 fn collect_command_sources_from_line(input: &str, line_base: usize) -> Vec<CommandSource> {
     let mut sources = Vec::new();
     let mut line = line_base;
@@ -1101,6 +1326,7 @@ fn collect_command_sources_from_line(input: &str, line_base: usize) -> Vec<Comma
     let mut in_comment = false;
     let mut in_string = false;
     let mut in_quoted_symbol = false;
+    let mut quoted_symbol_escape = false;
     let mut chars = input.char_indices().peekable();
 
     while let Some((idx, ch)) = chars.next() {
@@ -1134,7 +1360,13 @@ fn collect_command_sources_from_line(input: &str, line_base: usize) -> Vec<Comma
         }
 
         if in_quoted_symbol {
-            if ch == '|' {
+            // `\` escapes the next character, so `\|` does not end the
+            // symbol.
+            if quoted_symbol_escape {
+                quoted_symbol_escape = false;
+            } else if ch == '\\' {
+                quoted_symbol_escape = true;
+            } else if ch == '|' {
                 in_quoted_symbol = false;
             }
             if ch == '\n' {
@@ -1181,16 +1413,6 @@ fn collect_command_sources_from_line(input: &str, line_base: usize) -> Vec<Comma
     }
 
     sources
-}
-
-fn set_current_command_source(
-    state: &mut SmtTranscriptState,
-    sources: &[CommandSource],
-    index: usize,
-) {
-    state.current_source = sources.get(index).cloned();
-    state.current_command_ordinal = state.processed_commands;
-    state.processed_commands = state.processed_commands.saturating_add(1);
 }
 
 fn source_position_at(source: &CommandSource, byte_offset: usize) -> SourcePosition {
@@ -1274,12 +1496,15 @@ fn prepare_transcript_channel(channel: &str) -> io::Result<Option<std::fs::File>
     }
 
     let target = std::path::Path::new(channel);
-    let (resolved_target, temp_path, file) = create_artifact_temp_file(target)?;
-    match publish_artifact_temp(&temp_path, &resolved_target) {
-        Ok(()) => Ok(Some(file)),
+    let (resolved_target, mut reservation, file) = create_artifact_temp_file(target)?;
+    match publish_artifact_temp(reservation.path(), &resolved_target) {
+        Ok(()) => {
+            reservation.commit();
+            Ok(Some(file))
+        }
         Err(error) => {
+            // The still-armed reservation unlinks the unpublished temp file.
             drop(file);
-            let _ = std::fs::remove_file(&temp_path);
             Err(error)
         }
     }
@@ -1565,6 +1790,7 @@ fn maybe_handle_cli_transcript_command(
         }
 
         if *depth > state.executor_assertion_stack_depth {
+            pop_beyond_executor_levels(executor, state);
             update_transcript_state_after_command(state, cmd);
             maybe_print_success(state);
             return true;
@@ -1709,6 +1935,7 @@ fn maybe_handle_cli_transcript_command(
             // unlimited + default-ground-budget opt-out — are the executor's
             // own `apply_rlimit_option`, shared, not re-derived here.
             executor.apply_rlimit_option(numeral);
+            record_rlimit_option(state, numeral);
             update_transcript_state_after_command(state, cmd);
             maybe_print_success(state);
             return true;
@@ -1722,12 +1949,9 @@ fn maybe_handle_cli_transcript_command(
     false
 }
 
-fn emit_z3_unknown_attribute_warnings(state: &SmtTranscriptState, cmd: &Command) {
-    if !state.print_warning {
-        return;
-    }
-
-    let mut terms: Vec<&Term> = match cmd {
+/// The terms written in `cmd`.
+fn command_terms(cmd: &Command) -> Vec<&Term> {
+    match cmd {
         Command::Rule(term)
         | Command::Query(term)
         | Command::SygusConstraint(term)
@@ -1738,6 +1962,7 @@ fn emit_z3_unknown_attribute_warnings(state: &SmtTranscriptState, cmd: &Command)
         | Command::Display(term, _)
         | Command::DebugSet(_, term, _)
         | Command::Simplify(term)
+        | Command::SimplifyWithParams(term, _)
         | Command::GetAbduct(_, term) => vec![term],
         Command::DefineFun(_, _, _, body) | Command::DefineFunRec(_, _, _, body) => vec![body],
         Command::DefineFunsRec(_, bodies) | Command::CheckSatAssuming(bodies) => {
@@ -1752,8 +1977,25 @@ fn emit_z3_unknown_attribute_warnings(state: &SmtTranscriptState, cmd: &Command)
             vec![left, right]
         }
         _ => Vec::new(),
-    };
+    }
+}
 
+/// Whether a command other than `assert` carries a `:named` label. z3 binds
+/// such a label as a definition; the frontend binds labels only for
+/// assertions.
+fn command_has_named_label_outside_assert(cmd: &Command) -> bool {
+    !matches!(cmd, Command::Assert(_))
+        && command_terms(cmd)
+            .into_iter()
+            .any(ay_frontend::term_has_named_label)
+}
+
+fn emit_z3_unknown_attribute_warnings(state: &SmtTranscriptState, cmd: &Command) {
+    if !state.print_warning {
+        return;
+    }
+
+    let mut terms = command_terms(cmd);
     while let Some(term) = terms.pop() {
         match term {
             Term::App(_, arguments)
@@ -1829,8 +2071,10 @@ fn constant_sort_text(value: &Constant) -> String {
         Constant::True | Constant::False => "Bool".to_string(),
         Constant::Numeral(_) => "Int".to_string(),
         Constant::Decimal(_) => "Real".to_string(),
-        Constant::Hexadecimal(bits) => format!("(_ BitVec {})", bits.len() * 4),
-        Constant::Binary(bits) => format!("(_ BitVec {})", bits.len()),
+        Constant::Hexadecimal(bits) => {
+            format!("(_ BitVec {})", bits.trim_start_matches("#x").len() * 4)
+        }
+        Constant::Binary(bits) => format!("(_ BitVec {})", bits.trim_start_matches("#b").len()),
         Constant::String(_) => "String".to_string(),
         _ => "Unknown".to_string(),
     }
@@ -2064,6 +2308,7 @@ fn command_application_arg_sorts(
         Command::Assert(term)
         | Command::Display(term, _)
         | Command::Simplify(term)
+        | Command::SimplifyWithParams(term, _)
         | Command::Eval(term) => find_application_arg_sorts(state, term, symbol),
         Command::CheckSatAssuming(terms) => terms
             .iter()
@@ -2241,6 +2486,22 @@ fn z3_compat_sort_mismatch_error(state: &SmtTranscriptState, message: &str) -> O
     ))
 }
 
+/// z3's error for a `check-sat-assuming` argument that is not a formula.
+fn z3_compat_non_boolean_assumption_error(
+    state: &SmtTranscriptState,
+    cmd: &Command,
+    message: &str,
+) -> Option<String> {
+    (matches!(cmd, Command::CheckSatAssuming(_))
+        && message.starts_with("elaboration error: sort mismatch: expected Bool"))
+    .then(|| {
+        source_error(
+            current_source_last_token_position(state),
+            "invalid check-sat command, argument must be a Boolean literal",
+        )
+    })
+}
+
 include!("run/z3_options.rs");
 
 /// z3's `set-option` error for a parameter it does not recognize, or `None`
@@ -2336,6 +2597,11 @@ fn maybe_handle_recoverable_execution_error(
     message: &str,
 ) -> bool {
     if let Some(output) = z3_compat_undefined_symbol_error(state, cmd, message) {
+        print_regular_line(state, &output);
+        state.note_recoverable_error();
+        return true;
+    }
+    if let Some(output) = z3_compat_non_boolean_assumption_error(state, cmd, message) {
         print_regular_line(state, &output);
         state.note_recoverable_error();
         return true;
@@ -2456,6 +2722,7 @@ fn exit_if_timed_out_with_transcript_context(state: &SmtTranscriptState) {
     if timeout_exit_would_strand_owed_model(state) {
         return;
     }
+    super::exit_if_memout_requested();
     if is_timed_out() && state.had_recoverable_error && !z3_mode_enabled() {
         let count = state.recoverable_error_count.max(1);
         let plural = if count == 1 { "" } else { "s" };
@@ -2488,23 +2755,10 @@ fn exit_if_timed_out_with_stats(
     if timeout_exit_would_strand_owed_model(state) {
         return;
     }
-    if is_timed_out() && stats_cfg.any() {
+    if (super::run_deadline_passed() || super::memout_requested_by_watchdog()) && stats_cfg.any() {
         print_smt_stats(executor, state, formula_stats, stats_cfg);
     }
     exit_if_timed_out_with_transcript_context(state);
-}
-
-fn update_rlimit_after_command(state: &mut SmtTranscriptState, cmd: &Command) {
-    match cmd {
-        Command::Assert(_) => state.rlimit = state.rlimit.saturating_add(3),
-        Command::CheckSat | Command::CheckSatAssuming(_) => {
-            state.rlimit = state.rlimit.saturating_add(30);
-        }
-        Command::Push(_) | Command::Pop(_) | Command::Reset | Command::ResetAssertions => {
-            state.rlimit = state.rlimit.saturating_add(1);
-        }
-        _ => {}
-    }
 }
 
 fn command_invalidates_public_result(cmd: &Command) -> bool {
@@ -2539,6 +2793,17 @@ fn expire_scoped_symbol_sorts(state: &mut SmtTranscriptState) {
         let inferred = (bindings.len() == 1).then(|| bindings[0].sort.clone());
         state.symbol_sorts.insert(name.clone(), inferred);
     }
+}
+
+/// `(reset)` returns options to their initial values too. These three are
+/// echoes of what the SCRIPT set (no host flag writes them); the executor
+/// returns its script-set resource options to the host's values on the same
+/// command, so `(get-option :rlimit)` must not keep reporting a budget that no
+/// longer applies.
+fn reset_script_option_echoes(state: &mut SmtTranscriptState) {
+    state.verbosity = "0".to_string();
+    state.rlimit_option = "0".to_string();
+    state.z3_compat_bool_options = z3_compat_bool_option_defaults();
 }
 
 fn update_transcript_state_after_command(state: &mut SmtTranscriptState, cmd: &Command) {
@@ -2723,9 +2988,16 @@ fn update_transcript_state_after_command(state: &mut SmtTranscriptState, cmd: &C
             // applies. NB: only `(reset)` is a full fresh start;
             // `(reset-assertions)` keeps declarations, so its poison is left
             // intact (a dropped declaration can still matter).
-            state.completeness = ProblemCompleteness::Complete;
+            // Answers out of step with z3's stay withheld: a reset does not
+            // bring their positions back in line.
+            if !state.answers_out_of_step {
+                state.completeness = ProblemCompleteness::Complete;
+            }
+            state.discarded_command_error = None;
             state.had_recoverable_error = false;
             state.recoverable_error_count = 0;
+            state.labels_bound_unlike_z3.clear();
+            reset_script_option_echoes(state);
         }
         Command::ResetAssertions => {
             if !z3_mode_enabled() {
@@ -2738,12 +3010,13 @@ fn update_transcript_state_after_command(state: &mut SmtTranscriptState, cmd: &C
                 expire_scoped_symbol_sorts(state);
             }
             // Z3 5.0.0 instead retains its public assertion-stack level while
-            // dropping the asserted formulas.  The executor stack is empty in
-            // both modes; --z3-mode simulates subsequent pops at the CLI layer.
+            // dropping the asserted formulas. The executor stack is empty here;
+            // --z3-mode reopens the retained levels (restore_z3_session_after_reset).
             state.executor_assertion_stack_depth = 0;
         }
         _ => {}
     }
+    note_z3_scope_command(state, cmd);
 }
 
 fn maybe_print_success(state: &SmtTranscriptState) {
@@ -2813,6 +3086,7 @@ fn z3_compat_get_info_output(
         "all-statistics" if state.public_verdict.is_none() => {
             Some(z3_initial_statistics(state))
         }
+        "all-statistics" => Some(with_session_rlimit_count(output, state.rlimit)),
         "rlimit" => Some(format!("(:rlimit {})", state.rlimit)),
         "assertion-stack-levels" => Some(format!(
             "(:assertion-stack-levels {})",
@@ -2918,11 +3192,17 @@ fn reason_unknown_inner(output: &str) -> Option<&str> {
 ///   * every other reason (bare `incomplete`, `unsupported*`, `internal-error`,
 ///     ...) is wrapped as `(incomplete <reason>)` so a consumer treats the goal
 ///     as NOT proved — the sound default — while preserving AY's detail.
-fn z3_reason_unknown_output(inner: &str) -> String {
-    let inner = inner
+fn z3_reason_unknown_output(reason: &str) -> String {
+    // A reason stored as an SMT-LIB string literal is already escaped; any
+    // other reason may carry raw quotes (an error detail) that the string
+    // literal below must double.
+    let (inner, escaped) = match reason
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(inner);
+    {
+        Some(inner) => (inner, true),
+        None => (reason, false),
+    };
     let z3 = match inner {
         "timeout" | "resourceout" | "memout" | "interrupted" => "canceled".to_string(),
         "unknown" => "unknown".to_string(),
@@ -2930,6 +3210,7 @@ fn z3_reason_unknown_output(inner: &str) -> String {
         "incomplete" => "(incomplete)".to_string(),
         other => format!("(incomplete {other})"),
     };
+    let z3 = if escaped { z3 } else { z3.replace('"', "\"\"") };
     format!("(:reason-unknown \"{z3}\")")
 }
 
@@ -3103,6 +3384,15 @@ fn z3_compat_get_option_output(
         | "trace"
         | "dump-models"
         | "stats"
+        | "rewriter.max_power_expansion"
+        | "rewriter.som"
+        | "rewriter.som_blowup"
+        | "rewriter.flat"
+        | "rewriter.expand_power"
+        | "rewriter.mul_to_power"
+        | "rewriter.max_degree"
+        | "rewriter.sort_sums"
+        | "rewriter.push_to_real"
         | "timeout" => simple_get_option_value(key, output)
             .map(str::to_string)
             .unwrap_or_else(|| output.to_string()),
@@ -3123,11 +3413,46 @@ fn maybe_enable_z3_default_assignment_query(executor: &mut Executor, cmd: &Comma
         .is_ok()
 }
 
+/// The regular-channel text of an executor response, recording every
+/// `(error ...)` it prints as an error of the run.
+///
+/// z3 exits 1 for every error it prints, and no certificate may embed a
+/// problem in which a command failed (`public_unsat_artifacts_allowed`). The
+/// arms that reword a response into z3's form record their error themselves;
+/// every other executor error passed through unrecorded. Measured on main
+/// db768acbd: `(get-assignment)` or `(eval a)` with no model, and
+/// `(get-proof)` or `(get-unsat-core)` after `sat`, each printed an error,
+/// exited 0, and left a later strict `unsat` published with its certificate.
+/// `echo` prints the script's own text, which is never an error.
 fn z3_compat_output_for_command(
     state: &mut SmtTranscriptState,
     cmd: &Command,
     output: &str,
 ) -> Option<String> {
+    let recorded = state.recoverable_error_count;
+    let rendered = z3_compat_render_command_output(state, cmd, output);
+    let prints_error = !matches!(cmd, Command::Echo(_))
+        && rendered
+            .as_deref()
+            .is_some_and(|text| text.starts_with("(error "));
+    if prints_error && state.recoverable_error_count == recorded {
+        state.note_recoverable_error();
+    }
+    rendered
+}
+
+fn z3_compat_render_command_output(
+    state: &mut SmtTranscriptState,
+    cmd: &Command,
+    output: &str,
+) -> Option<String> {
+    if let Some(message) = z3_result_query_refusal(cmd, output) {
+        state.note_recoverable_error();
+        return Some(source_error(
+            current_source_last_token_position(state),
+            message,
+        ));
+    }
     match cmd {
         Command::GetInfo(keyword) => z3_compat_get_info_output(state, keyword, output),
         Command::GetOption(keyword) => z3_compat_get_option_output(state, keyword, output),
@@ -3137,23 +3462,6 @@ fn z3_compat_output_for_command(
         Command::GetConsequences(assumptions, _) if z3_mode_enabled() => Some(
             z3_compat_get_consequences_output(output, !assumptions.is_empty()),
         ),
-        // Two distinct executor spellings reach this point and BOTH are the same
-        // z3 response. The second was unhandled, so it fell through unflagged and
-        // unpositioned: ay printed a bare `(error "model is not available")` and
-        // exited 0, where z3 emits the positioned form and exits 1.
-        //
-        //   (set-logic ALL) (get-model)
-        //     z3: (error "line 2 column 10: model is not available")   exit 1
-        Command::GetModel
-            if output == "(error \"model generation is not enabled\")"
-                || output == "(error \"model is not available\")" =>
-        {
-            state.note_recoverable_error();
-            Some(source_error(
-                current_source_last_token_position(state),
-                "model is not available",
-            ))
-        }
         Command::GetModel if z3_mode_enabled() && output.starts_with("(model\n") => {
             // z3 4.15.4 and SMT-LIB 2.6 emit get-model as a bare
             // `( <define-fun>* )` sequence; AY's native form prepends a `model`
@@ -3166,38 +3474,69 @@ fn z3_compat_output_for_command(
             // so they are unaffected.)
             Some(format!("(\n{}", &output["(model\n".len()..]))
         }
-        Command::GetValue(_) if output == "(error \"model is not available\")" => {
-            state.note_recoverable_error();
-            Some(source_error(
-                current_source_last_token_position(state),
-                "model is not available",
-            ))
-        }
-        Command::GetUnsatCore
-            if output
-                == "(error \"unsat core generation is not enabled, set :produce-unsat-cores to true\")" =>
-        {
-            state.note_recoverable_error();
-            Some(source_error(
-                current_source_last_token_position(state),
-                "unsat core construction is not enabled, use command (set-option :produce-unsat-cores true)",
-            ))
-        }
         Command::GetUnsatAssumptions
             if output == "(error \"no check-sat-assuming has been performed\")" =>
         {
             Some("()".to_string())
         }
+        _ => Some(output.to_string()),
+    }
+}
+
+/// z3's wording for the executor's refusal of a result query (no model, no
+/// proof, no core, no assumptions to report), which z3 prints positioned and
+/// exits 1 for.
+fn z3_result_query_refusal(cmd: &Command, output: &str) -> Option<&'static str> {
+    match cmd {
+        // Two distinct executor spellings reach this point and BOTH are the same
+        // z3 response. The second was unhandled, so it fell through unflagged and
+        // unpositioned: ay printed a bare `(error "model is not available")` and
+        // exited 0, where z3 emits the positioned form and exits 1.
+        //
+        //   (set-logic ALL) (get-model)
+        //     z3: (error "line 2 column 10: model is not available")   exit 1
+        Command::GetModel
+            if output == "(error \"model generation is not enabled\")"
+                || output == "(error \"model is not available\")" =>
+        {
+            Some("model is not available")
+        }
+        // `eval` had the same gap as `get-model` above, and `get-assignment`
+        // with no `sat` (or `unknown`) to read printed a bare
+        // `(error "assignment is not available")`. Each exited 0 and, because
+        // the error went unrecorded, still published a certificate for a later
+        // `unsat` in the same problem.
+        //
+        //   (set-logic QF_UF) (get-assignment) ... (check-sat)
+        //     z3: (error "line 2 column 15: model is not available")   exit 1
+        Command::GetValue(_) | Command::Eval(_)
+            if output == "(error \"model is not available\")" =>
+        {
+            Some("model is not available")
+        }
+        Command::GetAssignment if output == "(error \"assignment is not available\")" => {
+            Some("model is not available")
+        }
+        // z3 names no cause for either (no query yet, or the last was not
+        // `unsat`): `(error "line 4 column 10: proof is not available")`.
+        Command::GetProof if output.starts_with("(error \"proof is not available") => {
+            Some("proof is not available")
+        }
+        Command::GetUnsatCore if output.starts_with("(error \"unsat core is not available") => {
+            Some("unsat core is not available")
+        }
+        Command::GetUnsatCore
+            if output
+                == "(error \"unsat core generation is not enabled, set :produce-unsat-cores to true\")" =>
+        {
+            Some("unsat core construction is not enabled, use command (set-option :produce-unsat-cores true)")
+        }
         Command::GetUnsatAssumptions
             if output == "(error \"unsat assumptions not available, last result was sat\")" =>
         {
-            state.note_recoverable_error();
-            Some(source_error(
-                current_source_last_token_position(state),
-                "unsat assumptions is not available",
-            ))
+            Some("unsat assumptions is not available")
         }
-        _ => Some(output.to_string()),
+        _ => None,
     }
 }
 
@@ -3331,7 +3670,7 @@ fn publish_rendered_executor_output(
     decision_trace_path: Option<&str>,
     emit: impl FnOnce(&SmtTranscriptState, &str),
 ) -> Result<bool, String> {
-    if is_decision_query && raw_output == "unsat" && transcript.defer_unsat_publication {
+    if is_decision_query && raw_output == "unsat" && transcript.holds_unsat_publication() {
         transcript.pending_unsat_output = Some(rendered_output);
         return Ok(false);
     }
@@ -3496,6 +3835,7 @@ fn print_synthesized_public_unknown(transcript: &mut SmtTranscriptState) -> bool
 fn publish_strict_proof_trust_rejection(
     transcript: &mut SmtTranscriptState,
     cmd: &Command,
+    executor: &Executor,
 ) -> bool {
     update_transcript_state_after_command(transcript, cmd);
     transcript.reject_result_certification("(incomplete proof-trusted)");
@@ -3504,7 +3844,17 @@ fn publish_strict_proof_trust_rejection(
         eprintln_smt_error(error);
         return false;
     }
-    print_synthesized_public_unknown(transcript)
+    let published = print_synthesized_public_unknown(transcript);
+    // The refusal names its cause (D7): which arm of the gate fired and, for
+    // an unsupported external-recheck surface, the sort or symbol pinned
+    // Carcara cannot parse. `--strict-proofs` claims an external check; this
+    // is where that claim is refused, so this is where the reason belongs.
+    if published {
+        if let Some(detail) = executor.unknown_detail() {
+            print_diagnostic_line(transcript, &format!("c strict-proofs: {detail}"));
+        }
+    }
+    published
 }
 
 /// Inspect the executor's last Alethe proof and return `true` when the
@@ -3522,107 +3872,750 @@ fn terminal_trust_detected(executor: &Executor) -> bool {
     executor.unsat_proof_terminal_trust_detected()
 }
 
-/// Disclose, on a published Alethe certificate, exactly which of AY's own
-/// checks the certificate passed.
+/// The one attribution line an unevidenced `unsat` must carry.
 ///
-/// Three facts, all read off the proof AY actually emitted:
+/// `path` names the certificate — the file that exists, or the file that would
+/// have been written. Both are useful to a census; a decline with no path is
+/// not, because it cannot be joined to anything.
+///
+/// `mechanism` is what is TRUE OF THIS VERDICT NOW. `recorded=` is what a
+/// producer wrote down during assembly, and the two differ exactly when a later
+/// repair pass superseded the gap the producer named — a real and measurable
+/// event (the finite-enum pigeonhole rebuild replaces the whole proof; the
+/// promoters retype heads), and one a census must be able to see rather than
+/// infer. Printing only the first would hide supersession; printing only the
+/// second would attach "no derivation" to documents that have one.
+fn disclose_proof_decline(
+    path: &str,
+    mechanism: ProofDeclineMechanism,
+    recorded: Option<ProofDeclineMechanism>,
+) {
+    safe_eprintln!(
+        "c ay.proof.decline path={path} mechanism={} recorded={} — {}",
+        mechanism.tag(),
+        recorded.map_or("none", ProofDeclineMechanism::tag),
+        mechanism.explanation(),
+    );
+}
+
+/// How an assembly-time record competes with a fallback the caller computes.
+///
+/// #evidence-stage-3, and this distinction was MEASURED, not designed. The
+/// first version screened the record against the retained proof everywhere, on
+/// the reasoning that a proof which stopped carrying a trust step had
+/// superseded its own decline. On QF_FP `lt-has-no-other-solution-8331` that
+/// reasoning is false: the closer recorded `assume-family-trust-closure`, an FP
+/// promoter then RETYPED the same head into a kind AY's own checker validates —
+/// `:proof_steps 7`, `:proof_trust 0`, `unsat_admission=strict-proof`, and
+/// `:cert.proof_steps_recorded 0` for a bit-blasted refutation — and the screen
+/// read "trust-free" and dropped the record. The head was relabelled, not
+/// replaced, and the file then blamed the printer for a lane that recorded no
+/// derivation at all. That is exactly the misattribution this stage exists to
+/// remove.
+#[derive(Clone, Copy)]
+enum DeclinePrecedence {
+    /// A document was written, so the subject is the DOCUMENT. A record the
+    /// retained derivation no longer exhibits has been superseded by a repair
+    /// pass and must not be printed over a proof that does not have that gap.
+    ScreenAgainstRetainedProof,
+    /// No document exists. The render is the last stage in the pipeline and
+    /// structurally the first gate to speak — the pinned-checker sort screen
+    /// runs before a single step is emitted — so anything recorded during
+    /// ASSEMBLY is upstream of it and outranks it.
+    AssemblyOutranksRender,
+}
+
+/// The attribution line, with the record/fallback contest resolved in one place.
+///
+/// Every caller wants the same answer — the assembly record where it applies,
+/// else a fallback only the caller can compute — and the acceptance criterion is
+/// that exactly one line comes out of it.
+fn disclose_proof_decline_with_fallback(
+    executor: &Executor,
+    path: &str,
+    precedence: DeclinePrecedence,
+    fallback: impl FnOnce() -> ProofDeclineMechanism,
+) {
+    let recorded = executor.last_proof_decline();
+    let live = match precedence {
+        DeclinePrecedence::ScreenAgainstRetainedProof => executor.live_proof_decline(),
+        DeclinePrecedence::AssemblyOutranksRender => recorded,
+    };
+    let mechanism = live.unwrap_or_else(fallback);
+    disclose_proof_decline(path, mechanism, recorded);
+    disclose_trust_closure_census(executor, mechanism);
+    disclose_semantic_token_census(executor, mechanism);
+    disclose_unbounded_census(executor, mechanism);
+}
+
+/// What the exact semantic-certificate mint held, for the one mechanism it
+/// names.
+///
+/// #semantic-token census. `checked-semantic-certificate-unrendered` is the
+/// campaign's structural thesis in its purest form — a checked derivation
+/// that only lacks a writer — and this line is how a corpus scan tests that
+/// name against the object: how many leaf obligations the token holds, and
+/// whether the sealed root can be the authored assertion at all
+/// (`construction_residue=yes` means the authored text names declared symbols
+/// the symbol-free sealed root cannot; term construction erased them).
+///
+/// Diagnostic only. Nothing reads these fields to decide anything.
+fn disclose_semantic_token_census(executor: &Executor, mechanism: ProofDeclineMechanism) {
+    if !matches!(
+        mechanism,
+        ProofDeclineMechanism::CheckedSemanticCertificateUnrendered
+            | ProofDeclineMechanism::ExactExpansionOverDischargedTrust
+            | ProofDeclineMechanism::AuthoredSubsetUnrendered
+    ) {
+        return;
+    }
+    let Some(census) = executor.last_semantic_token_census() else {
+        return;
+    };
+    safe_eprintln!(
+        "c ay.proof.semantic-token kind={} obligations={} ground_true={} ground_false={} \
+         nested_refuted={} nested_negation_refuted={} nested_trust_refuted={} leaf_only={} \
+         sealed_root_head={} \
+         sealed_root_nodes={} authored_source={} authored_head={} authored_nodes={} \
+         authored_symbols={} authored_walk_complete={} construction_residue={} \
+         sealed_root=\"{}\"",
+        census.kind,
+        census.obligations,
+        census.ground_true,
+        census.ground_false,
+        census.nested_refuted,
+        census.nested_negation_refuted,
+        census.nested_trust_refuted,
+        yes_no(census.is_leaf_only()),
+        census.sealed_root_head,
+        census.sealed_root_nodes,
+        census.authored_source.tag(),
+        census.authored_head,
+        census.authored_nodes,
+        census.authored_symbols,
+        yes_no(census.authored_walk_complete),
+        match census.sealed_root_is_construction_residue() {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "undetermined",
+        },
+        census.sealed_root_surface,
+    );
+}
+
+/// What was on the other side of the bound, for the two "unbounded" declines.
+///
+/// #unbounded-population. Both mechanisms say a bound was exceeded and neither
+/// says which one, on what, or what lifting it would cost. The sibling class
+/// was diagnosed by counting at the site and the count refuted the obvious
+/// fix; this is the same count for these two. Diagnostic only.
+fn disclose_unbounded_census(executor: &Executor, mechanism: ProofDeclineMechanism) {
+    if !matches!(
+        mechanism,
+        ProofDeclineMechanism::AuthoredSourceRootUnbounded
+            | ProofDeclineMechanism::AuthoredSurfaceOverridePlanUnbounded
+    ) {
+        return;
+    }
+    let Some(census) = executor.last_unbounded_census() else {
+        return;
+    };
+    match census {
+        UnboundedCensus::SourceRoot(c) => {
+            let f = c.first_refused;
+            let l = c.largest_refused;
+            safe_eprintln!(
+                "c ay.proof.unbounded mechanism={} site=source-root roots={} refused_roots={} \
+                 refusal={} first_nodes={} first_depth={} first_bytes={} first_lets={} \
+                 first_let_depth={} first_binders={} first_unpriced={} largest_nodes={} \
+                 largest_depth={} largest_bytes={} largest_lets={} largest_let_depth={} \
+                 bounded_roots_work={} solve_window_roots={} authored_roots={} \
+                 first_canonical_source={} first_canonical_unique={} \
+                 first_canonical_expanded={} first_canonical_depth={} \
+                 first_canonical_binders={} first_canonical_kind={}",
+                mechanism.tag(),
+                c.roots,
+                c.refused_roots,
+                c.refusal.map_or("none", |r| r.tag()),
+                f.nodes,
+                f.depth,
+                f.bytes,
+                f.let_bindings,
+                f.let_depth,
+                f.binders,
+                f.unpriced,
+                l.nodes,
+                l.depth,
+                l.bytes,
+                l.let_bindings,
+                l.let_depth,
+                c.bounded_roots_work,
+                c.solve_window_roots,
+                c.authored_roots,
+                c.first_canonical_source,
+                c.first_canonical.unique_nodes,
+                c.first_canonical.expanded_nodes,
+                c.first_canonical.depth,
+                c.first_canonical.binders,
+                c.first_canonical_kind,
+            );
+        }
+        UnboundedCensus::OverridePlan(c) => {
+            let g = c.largest_canonical;
+            safe_eprintln!(
+                "c ay.proof.unbounded mechanism={} site=override-plan exit={} \
+                 problem_assertions={} original_problem_assertions={} parsed_assertions={} \
+                 provenance={} source_scan_work={} pair_specs={} canonical_refused_shape={} \
+                 canonical_refused_size={} canonical_refused_symbol={} \
+                 canonical_first_refusal={} canonical_work={} \
+                 largest_unique_nodes={} largest_expanded_nodes={} largest_depth={} \
+                 largest_binders={} envelope_remaining={} envelope_charge={} \
+                 collector_refused_pair={} overrides={} override_bytes={}",
+                mechanism.tag(),
+                c.exit.map_or("none", OverridePlanExit::tag),
+                c.problem_assertions,
+                c.original_problem_assertions,
+                c.parsed_assertions,
+                yes_no(c.has_provenance),
+                c.source_scan_work,
+                c.pair_specs,
+                c.canonical_roots_refused_shape,
+                c.canonical_roots_refused_size,
+                c.canonical_roots_refused_symbol,
+                c.canonical_first_refusal
+                    .map_or("none", CanonicalWorkRefusal::tag),
+                c.canonical_work,
+                g.unique_nodes,
+                g.expanded_nodes,
+                g.depth,
+                g.binders,
+                c.envelope_remaining,
+                c.envelope_charge
+                    .map_or_else(|| "unbounded".to_string(), |charge| charge.to_string()),
+                c.collector_refused_pair
+                    .map_or_else(|| "none".to_string(), |pair| pair.to_string()),
+                c.overrides,
+                c.override_bytes,
+            );
+        }
+    }
+}
+
+/// What the last-resort closer was looking at, for the two mechanisms it names.
+///
+/// #closer-population. `assume-family-trust-closure` is the largest class in
+/// the decline census and the census could not say whether it means "AY derived
+/// something and the closer could not chain it" or "the lane that decided this
+/// query recorded nothing". The artifact cannot answer that — after the closer
+/// runs, its own head-and-resolution chain is the whole document — so the
+/// counts are taken at the closure site and disclosed here.
+///
+/// Scoped to the two closure mechanisms on purpose: the closer can have run and
+/// then been superseded by a later repair pass, and attaching its census to a
+/// decline some other lane recorded would invite exactly the misreading the
+/// attribution work exists to remove.
+///
+/// Diagnostic only. Nothing reads these numbers to decide anything.
+const fn yes_no(flag: bool) -> &'static str {
+    if flag {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn disclose_trust_closure_census(executor: &Executor, mechanism: ProofDeclineMechanism) {
+    if !matches!(
+        mechanism,
+        ProofDeclineMechanism::AssumeFamilyTrustClosure
+            | ProofDeclineMechanism::DerivedLeafTrustClosure { .. }
+    ) {
+        return;
+    }
+    let Some(census) = executor.last_trust_closure_census() else {
+        return;
+    };
+    safe_eprintln!(
+        "c ay.proof.closure mechanism={} steps={} assumes={} unit_trust_leaves={} \
+         theory_lemmas={} typed_theory_lemmas={} derived_steps={} assumptions_only={} \
+         sat_reconstruction={} clause_trace_entries={} clause_trace_has_empty={} \
+         mapped_vars={} untranslatable_entries={} proof_work_exhausted={} \
+         trace_truncated={} propositional_refutation={} destroyed_entries={} \
+         destroyed_originals={} destroyed_learned={} destroyed_learned_with_hints={} \
+         destroyed_has_empty={} trace_armings={}",
+        mechanism.tag(),
+        census.steps,
+        census.assumes,
+        census.unit_trust_leaves,
+        census.theory_lemmas,
+        census.typed_theory_lemmas,
+        census.derived_steps,
+        yes_no(census.is_assumptions_only()),
+        census
+            .reconstruction
+            .outcome
+            .map_or("never-ran", SatReconstructionOutcome::tag),
+        census.reconstruction.trace_entries,
+        yes_no(census.reconstruction.trace_has_empty),
+        census.reconstruction.mapped_vars,
+        census.reconstruction.untranslatable_entries,
+        yes_no(census.reconstruction.proof_work_exhausted),
+        yes_no(census.reconstruction.trace_truncated),
+        yes_no(census.has_propositional_refutation()),
+        census.reconstruction.destroyed_entries,
+        census.reconstruction.destroyed_originals,
+        census.reconstruction.destroyed_learned,
+        census.reconstruction.destroyed_learned_with_hints,
+        yes_no(census.reconstruction.destroyed_has_empty),
+        ay_sat::clause_trace_armings(),
+    );
+}
+
+/// What independently re-decided this refutation, when something did.
+///
+/// #evidence-stage-3. Measured on a 24-file sample of the class AY's own strict
+/// checker rejects: 17 of 24 published on a fresh-`Executor` whole-problem
+/// re-solve and the rest on a clause-by-clause standalone-tautology discharge.
+/// Neither appeared anywhere in the output — only in two statistics counters —
+/// so a reader could not tell a verdict that survived an independent
+/// re-decision from one that rests on nothing.
+///
+/// `scope=authored` is not decoration: the re-decision is run over the AUTHORED
+/// obligation (`authored_corroboration_scope`), not over the solver's rewritten
+/// internal assertion set, and that is the only version of the claim worth
+/// anything to a reader of the input file.
+///
+/// This is REPRODUCIBILITY evidence and never checkability evidence. It does
+/// not make a verdict tier A, and the campaign's evidence predicate does not
+/// read it.
+///
+/// P4 of the 2026-10-02 evidence policy: the line names the arm (`method=`),
+/// where it ran (`source=`, `nested:…` when a probe an exact theorem sealed
+/// ran it) and which strengthenings the re-solve ran without (`disabled=`,
+/// `none` printed literally: the re-solve walked the same code). It is read
+/// off the certificate the command consumed, so a nested probe's
+/// corroboration is disclosed too.
+fn disclose_unsat_corroboration(executor: &Executor) {
+    if let Some(corroboration) = executor.last_unsat_corroboration() {
+        safe_eprintln!(
+            "c ay.proof.corroboration method={} source={} disabled={} scope=authored — {}",
+            corroboration.method().tag(),
+            corroboration.source().tag(),
+            corroboration.disabled().tags(),
+            corroboration.explanation(),
+        );
+    }
+}
+
+/// `evidence=… corroboration=… disabled=…` for the certificate line and the
+/// no-certificate warnings (evidence policy P4, 2026-10-02).
+///
+/// `evidence=` is the level of the certificate the command consumed: E2 a
+/// checker verified the refutation, E1 AY's own code re-derived or re-ran what
+/// the refutation could not show (`discharged-trust`, or a
+/// `checked-sat-refutation` with a `Generic` premise AY's verifier re-derived),
+/// E0 no checked refutation. Only `--rigor strict` publishes on E2 alone.
+fn unsat_evidence_fields(executor: &Executor) -> String {
+    let evidence = executor.last_command_unsat_evidence();
+    let level = evidence.map_or("none-recorded", |evidence| evidence.level().tag());
+    let corroboration = evidence.and_then(|evidence| evidence.corroboration());
+    format!(
+        "evidence={level} corroboration={} disabled={}",
+        corroboration.map_or("none", |corroboration| corroboration.method().tag()),
+        corroboration.map_or_else(
+            || "none".to_string(),
+            |corroboration| corroboration.disabled().tags()
+        ),
+    )
+}
+
+/// Classify a render refusal, for use ONLY when no earlier lane declined.
+///
+/// #evidence-stage-3, and the ordering is the point. The render is the last
+/// gate in the pipeline and frequently the FIRST one to speak: before owner
+/// decision D7 (2026-09-22) the pinned-Carcara sort screen ran in
+/// `prepare_proof` before a single step was emitted, so on a floating-point
+/// query — where the lane bit-blasts with proof output off and the refutation
+/// is one bare trust lemma — it fired on a document that never had a
+/// derivation to print. Reporting it as the cause blamed the printer for 90
+/// files whose defect is upstream of the printer entirely. So the caller
+/// consults `Executor::live_proof_decline` first and only falls through to
+/// this when nothing earlier declined. Since D7 the printer no longer refuses
+/// on that screen (the surface is disclosed on the written certificate
+/// instead), so the `pinned Carcara` arm below is reached only by an older
+/// producer's refusal string; the structural refusals that remain in
+/// `prepare_proof` (a term handle outside the store, a malformed `nra_sos`
+/// payload) fall to the stale-scope arm, which is the closest class.
+fn mechanism_from_print_error(error: &ay_proof::AlethePrintError) -> ProofDeclineMechanism {
+    use ay_proof::AlethePrintError as Print;
+    match error {
+        Print::EmissionBudgetExhausted { .. } => ProofDeclineMechanism::AletheEmissionWorkBudget,
+        Print::UndeclarableProofSymbols { .. } => ProofDeclineMechanism::UndeclarableProofSymbols,
+        // Same class, found on the bytes: a witness the printer resugared
+        // still printed raw somewhere, so the document would be free in a
+        // symbol it cannot introduce.
+        Print::ResugaredWitnessPrintedRaw { .. } => ProofDeclineMechanism::UndeclarableProofSymbols,
+        // Matched on the reason because this one variant carries three
+        // unrelated refusals: the pinned checker's grammar, and two staleness
+        // checks on AY's own export surface.
+        Print::UnavailableAuthenticatedSurface { reason } => {
+            if reason.contains("pinned Carcara") {
+                ProofDeclineMechanism::PinnedCheckerSurfaceUnsupported
+            } else {
+                ProofDeclineMechanism::StaleAuthenticatedExportScope
+            }
+        }
+        _ => ProofDeclineMechanism::ProofSurfaceBridgeMissing,
+    }
+}
+
+/// Disclose, on a published Alethe certificate, exactly which of AY's own
+/// checks the certificate passed — and, separately, what backs the verdict.
+///
+/// Four facts read off the proof AY actually emitted, plus one read off the
+/// publication funnel:
 ///
 /// * `unproved_steps` — steps on the path to the empty clause that carry no
 ///   derivation: `trust` rules, trust-kind theory lemmas, and explicit
 ///   `hole`s. ALL of them print as `hole` in the emitted document (the wire
 ///   name for "unproved"), so a certificate with any is *holey* to an
 ///   external checker, never *valid*.
-/// * `foreign_assumes` — reachable `assume` leaves the problem never
-///   asserted.
+/// * `foreign_assumes` — `yes` when a premise `assume` of the document is not
+///   an assertion of the input as written (compared token for token, up to
+///   literal and quoting spelling; see `ay_dpll::normalize_premise_surface`),
+///   or when AY's provenance does not back one; `unjudged` when that
+///   comparison could not be made.
 /// * `trust_free` — no `trust`/`hole` step and no provenance-unbacked
 ///   `assume` reaches the empty clause.
-/// * `ay_self_checkable` — the exact predicate `--self-check` /
-///   `--strict-proofs` use to decide whether AY will stand behind the UNSAT.
-///   When this is `no`, AY itself would report `unknown`: an externally
-///   *valid* certificate must never be published under that condition
-///   silently, and a *holey* one must not read as a clean bill of health.
+/// * `ay_self_checkable` — a property OF THE DOCUMENT AT `path`, and of
+///   nothing else: `yes` means the file on disk carries NO unproved step
+///   (`unproved_steps=0`), assumes only the input's own assertions
+///   (`foreign_assumes=no`), AND no terminal trust / foreign-`assume` /
+///   uncheckable-`Seq` gap reaches its empty clause (`terminal_trust_detected`,
+///   the CLI's own `--rigor strict` screen).
+///
+///   It is deliberately NOT also conjoined with
+///   `Executor::unsat_proof_has_known_wire_gap()`, the second arm of the
+///   executor's strict decline gate — that was tried and MEASURED WRONG; see
+///   the comment on `strict_screen_refuses` in `disclose_alethe_certificate`.
+///
+///   `ay_self_checkable=yes` therefore IMPLIES `unproved_steps=0`, which is
+///   what makes the flag alone a safe evidence predicate. Before
+///   #evidence-stage-0 it was `!terminal_trust_detected(executor)` alone: both
+///   internal predicates read the IN-MEMORY proof, and neither can see the
+///   printer's own `ay_core::wire_rule_name` downgrade of a rule AY's checker
+///   verified but the pinned external checker cannot spell. So
+///   `(assert (not (or (= #b10 #b10) (= x #b01))))` published a three-line
+///   artifact whose only inference is `:rule hole` under
+///   `unproved_steps=1 … ay_self_checkable=yes`, at every rigor level, and at
+///   corpus scale that was 78 certificates carrying up to 148 unproved steps
+///   scored as evidence.
+///
+///   The converse is narrower than it looks: `ay_self_checkable=no` predicts
+///   that `--rigor strict` withholds the verdict (its admission decision
+///   refuses any document with an unproved step or a foreign `assume`,
+///   including holes the printer alone introduced, on every input route), and
+///   says nothing about the other rigor levels. Before that gate `--rigor strict` decided on the IN-MEMORY
+///   derivation alone and published printer-holed documents; measured on four
+///   external-codegen bridge/stride queries, each published as `unsat` with
+///   `unproved_steps=1 … unsat_admission=strict-proof`.
+///   Nor is `yes` a promise that an external checker will answer *valid*: it
+///   says the document carries no `hole`, not that every symbol and rule in it
+///   is one the pinned checker accepts (the undeclarable-symbol and
+///   congruence-premise printer classes are documented in LIMITATIONS.md).
+///   Nor is it the `--rigor certified` (`--self-check`) gate: that one is a
+///   DISJUNCTION over authorities the Alethe presentation is only one of — see
+///   `Executor::check_sat`'s `unsat_proof_self_certified() ||
+///   bv_drat_self_cert || checked_refutation_satisfies_self_check()` — so a
+///   `hole`-bearing document routinely accompanies a verdict certified by a
+///   replayed SAT-resolution refutation or a native BV DRAT re-check.
+/// * `unsat_admission` — which certification authority actually admitted this
+///   published `unsat`. This is the honest answer to "what is behind the
+///   verdict", and it is deliberately reported next to, not merged with, the
+///   document's own checkability. In particular `unsat_admission=strict-proof`
+///   means `Executor::check_strict_unsat_presentation` ran
+///   `ay_proof::check_proof_strict_with_datatypes` over the IN-MEMORY proof and
+///   it re-derived every step — that call rejects `trust`/`hole` rules and any
+///   theory-lemma family without a semantic validator, so the claim is about
+///   the derivation, not about the file. It is therefore consistent, and not a
+///   contradiction, for `unsat_admission=strict-proof` to sit beside
+///   `unproved_steps=1 ay_self_checkable=no`: AY's checker verified the step,
+///   and the printer had no external spelling for it.
+///
+/// `carcara_surface` is `supported` (pinned Carcara parses the document and
+/// the problem, and no step is spelled for one of its invocations only, so
+/// the spelling reads the same with or without `--expand-let-bindings`; that
+/// every step checks is what `unproved_steps` and `foreign_assumes` add — an
+/// `assume` matching a `let` premise only after expansion is
+/// `foreign_assumes=yes`), `unsupported` (pinned Carcara cannot
+/// parse the proof or the authored problem it is paired with; this wins over
+/// `clean-dialect`, whose spellings are moot when the parse stops),
+/// `clean-dialect` (it parses, but the render kept a spelling only Clean's
+/// vendored Carcara checks, which pinned Carcara 9a352ee refuses; see
+/// `ay_proof::AletheDialect`), `without-let-expansion` (the render printed a
+/// `:rule let` step over the problem's own `let`, which pinned Carcara checks
+/// only in its canonical invocation `carcara check -- PROOF PROBLEM`, never
+/// under `--expand-let-bindings`) or `none-recorded`. It is the verdict the
+/// streamed export returned beside exactly the bytes at `path`
+/// (`Executor::try_export_last_proof_alethe_for_problem_scope_to_with_carcara_surface`).
 ///
 /// Written as SMT-LIB comments on stderr so it never perturbs the solver's
 /// stdout answer.
-/// Count the steps an EXTERNAL checker will refuse in the document actually
-/// written to `path`.
-///
-/// The internal [`ay_proof::terminal_trust_report`] counts only `AletheRule::
-/// Trust`, `AletheRule::Hole` and trust-kind theory lemmas on the in-memory
-/// proof. The PRINTER independently downgrades any rule with no checkable
-/// Alethe counterpart to the wire name `hole` at print time, and the report
-/// never sees those. Disclosing the internal number therefore published an
-/// affirmatively FALSE clean bill of health on documents that carry printed
-/// holes. The document is what the external checker reads, so the document is
-/// what gets counted.
-fn printed_unproved_steps(path: &str) -> Option<u32> {
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(
-        u32::try_from(
-            text.lines()
-                .filter(|line| line.contains(":rule hole") || line.contains(":rule trust"))
-                .count(),
-        )
-        .unwrap_or(u32::MAX),
-    )
-}
-
-fn disclose_alethe_certificate(executor: &Executor, path: &str) {
-    let report = executor
-        .last_proof()
-        .map(ay_proof::terminal_trust_report)
-        .unwrap_or_default();
-    let self_checkable = !terminal_trust_detected(executor);
-    let internal_unproved = report
-        .trust_rule_on_path
-        .saturating_add(report.trust_theory_lemma_on_path)
-        .saturating_add(report.hole_rule_on_path);
-    // Take the larger of the two: the printed count catches print-time
-    // downgrades the internal report cannot see, and the internal count catches
-    // anything the textual scan would miss.
-    let unproved = printed_unproved_steps(path)
-        .map_or(internal_unproved, |printed| printed.max(internal_unproved));
-    // `report.foreign_assume_on_path` above is computed with an ALWAYS-TRUE
-    // provenance predicate, so it is structurally 0 and says nothing. The real
-    // question — does every `assume` correspond to an assertion of the input
-    // file? — is exactly what the acceptance gate already answers. Without this,
-    // a proof that assumes a REWRITTEN form of an assertion was disclosed as
-    // clean while an external checker rejects it at the first `assume` with
-    // "could not match term to any of the original problem premises".
-    let foreign_assume = executor.unsat_proof_terminal_foreign_assume();
-    let trust_free = report.is_trust_free() && unproved == 0 && !foreign_assume;
+fn disclose_alethe_certificate(
+    executor: &Executor,
+    path: &str,
+    carcara_surface: Option<&ay_proof::CarcaraSurface>,
+) {
+    let evidence = certificate_evidence(executor, path);
+    let unproved = evidence.unproved;
+    let premises_verbatim = evidence.premises == AssumedPremises::Verbatim;
+    // The derivation's own trust-freeness: no `trust`/`hole` step and no
+    // trust-kind lemma on the path to the empty clause, and every premise
+    // `assume` the input's own. `trust_free` below additionally demands a
+    // hole-free DOCUMENT.
+    let derivation_trust_free = evidence.derivation_trust_free && premises_verbatim;
+    let trust_free = derivation_trust_free && unproved == 0;
+    // The CLI's own `--rigor strict` screen, verbatim
+    // (`run_command`'s `strict_derivation_screen_refuses`).
+    // When this is true, strict really does answer `unknown`, so the warning
+    // below may say so.
+    //
+    // REFUTED, and deliberately NOT a disjunction with
+    // `Executor::unsat_proof_has_known_wire_gap()`. #evidence-stage-0 set out
+    // to add that second arm so the disclosure would agree with the executor's
+    // funnel (`decline_trust_bearing_unsat_under_strict_proofs`). Measured on
+    // `benchmarks/smtlib-all/QF_AX/non-incremental__QF_AX__storeinv__storeinv_t2_np_nf_ai_00001_001.cvc.smt2`:
+    // the wire-gap predicate answers TRUE at disclosure time while the very
+    // same run publishes `unsat` under `--rigor strict`, on a certificate with
+    // `unproved_steps=0 foreign_assumes=no trust_free=yes`. The two predicates
+    // are sampled at different points of the pipeline — the funnel screens the
+    // proof it is about to certify, this runs after the printer — so forcing
+    // them together does not make the flag agree with the gate; it makes the
+    // flag lie about a hole-free document, and it did (1 of the 2 hole-free
+    // certificates in a seeded 50-file QF_AX/QF_IDL sweep flipped to `no`).
+    // The gate is not weakened by leaving it out: a proof the funnel refuses
+    // never publishes a certificate for this function to disclose.
+    let strict_screen_refuses = terminal_trust_detected(executor);
+    // THE FLAG IS A STATEMENT ABOUT THE FILE AT `path`. A document carrying a
+    // printed unproved step can never be a clean bill of health, whatever the
+    // in-memory predicates say about the derivation behind it, so
+    // `ay_self_checkable=yes` now IMPLIES `unproved_steps=0`. See the item
+    // doc above for the reproducer this was measured on.
+    // It also implies every premise `assume` is the input's own, as the strict
+    // gate requires; a premise-only refusal has its own warning, not a `hole`.
+    let holed_or_screened = strict_screen_refuses || unproved > 0;
+    let self_checkable = !holed_or_screened && premises_verbatim;
+    // The external-recheck surface, DISCLOSED (owner decision D7, 2026-09-22).
+    // `unsupported` means pinned Carcara cannot parse this file — a `Seq`,
+    // `FloatingPoint` or `Char` sort, or a Z3-escaped symbol — so the verdict
+    // stands on AY's strict checker alone. The file is still written: only a
+    // consumer that CLAIMS an external check (`--strict-proofs`,
+    // `--self-check`, a Carcara cross-check) refuses it, and it refuses with
+    // the reason printed below. Read on the same proof the strict screen read.
+    // A parseable document that keeps a Clean-only spelling is NOT one pinned
+    // Carcara accepts (475ba9547's sign-filled `bitblast_ashr` layer was
+    // disclosed `supported` and refused by it), nor is one whose `:rule let`
+    // step only one pinned invocation accepts: the render reported both, and
+    // the streamed export folded that report into `carcara_surface`.
+    // Only a spelling pinned Carcara cannot PARSE is a gap of the strict screen.
+    let surface_gap = match carcara_surface {
+        Some(ay_proof::CarcaraSurface::Unsupported { reason }) => Some(reason.as_str()),
+        _ => None,
+    };
+    let clean_only = match carcara_surface {
+        Some(ay_proof::CarcaraSurface::CleanDialect { spelling }) => Some(*spelling),
+        _ => None,
+    };
+    let surface_label = match carcara_surface {
+        Some(ay_proof::CarcaraSurface::CleanDialect { .. }) => "clean-dialect",
+        Some(ay_proof::CarcaraSurface::WithoutLetExpansion) => "without-let-expansion",
+        Some(surface) if surface.is_supported() => "supported",
+        Some(_) => "unsupported",
+        None => "none-recorded",
+    };
+    // What actually backs the verdict, as opposed to what the document proves.
+    // Every published UNSAT consumed exactly one certification capability; name
+    // it, so a reader never has to infer the verdict's authority from the
+    // artifact's checkability (which is what made the disclaimer below wrong).
+    let admission = executor
+        .last_command_unsat_admission_tag()
+        .unwrap_or("none-recorded");
     safe_eprintln!(
-        "c ay.proof.certificate path={path} unproved_steps={unproved} foreign_assumes={} trust_free={} ay_self_checkable={}",
-        if foreign_assume { "yes" } else { "no" },
+        "c ay.proof.certificate path={path} unproved_steps={unproved} foreign_assumes={} trust_free={} ay_self_checkable={} carcara_surface={} unsat_admission={admission} {}",
+        match &evidence.premises {
+            AssumedPremises::Verbatim => "no",
+            AssumedPremises::Foreign(_) => "yes",
+            AssumedPremises::Unjudged(_) => "unjudged",
+        },
         if trust_free { "yes" } else { "no" },
         if self_checkable { "yes" } else { "no" },
+        surface_label,
+        unsat_evidence_fields(executor),
     );
-    if foreign_assume {
-        safe_eprintln!(
-            "c warning: {path} contains an `assume` that is not verbatim an assertion of the input; an external checker rejects it at that step"
-        );
+    let premise_warning = match &evidence.premises {
+        AssumedPremises::Verbatim => None,
+        // An external checker rejects that `assume` only once it parses the
+        // document; when pinned Carcara cannot (`carcara_surface=unsupported`)
+        // it stops at the parse instead (measured on D7: BVFPLRA, 2026-10-02).
+        AssumedPremises::Foreign(assume) if surface_gap.is_some() => Some(format!("contains an `assume` that is not verbatim an assertion of the input ({assume}); a checker that parses this document rejects it at that step, though pinned Carcara stops earlier, at the parse")),
+        AssumedPremises::Foreign(assume) => Some(format!("contains an `assume` that is not verbatim an assertion of the input ({assume}); an external checker rejects it at that step")),
+        AssumedPremises::Unjudged(why) => Some(format!("has premise `assume`s that were not compared with the input ({why})")),
+    };
+    if let Some(warning) = premise_warning {
+        safe_eprintln!("c warning: {path} {warning}; `--rigor strict` (`--strict-proofs`) answers `unknown` for this verdict");
+    }
+    let surface_warning = match (surface_gap, clean_only) {
+        (Some(reason), _) => Some(format!("carcara_surface=unsupported — {reason}; pinned Carcara cannot parse this document, so the verdict stands on AY's strict checker alone, and `--strict-proofs` / `--self-check` refuse it with this reason")),
+        (None, Some(spelling)) if surface_label == "clean-dialect" => Some(format!(
+            "carcara_surface=clean-dialect — {}; Clean's vendored Carcara checks this spelling and pinned Carcara 1.1.0 (9a352ee) refuses it, {}",
+            spelling.describe(),
+            spelling.pinned_dialect_note()
+        )),
+        (None, None) if surface_label == "without-let-expansion" => Some(format!(
+            "carcara_surface=without-let-expansion — {}; check it as `carcara check -- PROOF PROBLEM`: `--expand-let-bindings` expands that `let` at parse time, before the rule sees it, and pinned Carcara then refuses the step",
+            ay_proof::CarcaraSurface::WithoutLetExpansion
+                .unsupported_reason()
+                .unwrap_or_default()
+        )),
+        _ => None,
+    };
+    if let Some(warning) = surface_warning {
+        safe_eprintln!("c warning: {path} {warning}");
     }
     // A refutation with NO derivation at all is a different failure from one
     // whose last mile is unproved, and until this line the two were
     // indistinguishable in the emitted artifact and in every corpus census
     // built from it. Name the mechanism so the census says which machinery is
     // missing instead of bucketing every cause under one label.
-    if let Some(mechanism) = executor.last_proof_decline() {
-        safe_eprintln!(
-            "c ay.proof.decline path={path} mechanism={} — {}",
-            mechanism.tag(),
-            mechanism.explanation(),
+    //
+    // #evidence-stage-3 — EXACTLY ONE line, and only where it is true.
+    //
+    // Only where it is true: an evidenced document needs no excuse, and a
+    // decline recorded during assembly can be superseded by a later repair
+    // pass, so printing it beside `ay_self_checkable=yes` would be a false
+    // statement of the same species this stage exists to remove. `unproved`
+    // and `strict_screen_refuses` are already computed above and settle it.
+    //
+    // Exactly one: on the measured census 32 unevidenced refutations emitted a
+    // holey document and recorded nothing, because the two document-side
+    // mechanisms are not producer decisions and no producer records them. They
+    // are read off the artifact and the derivation behind it, here, at the only
+    // point where both are in hand — and the two arms are the same discriminator
+    // the two warning branches below already use, so the label and the advice
+    // can never disagree.
+    if holed_or_screened {
+        disclose_proof_decline_with_fallback(
+            executor,
+            path,
+            DeclinePrecedence::ScreenAgainstRetainedProof,
+            || {
+                // A trust-free derivation the strict screen refuses ONLY for
+                // its surface is the D7 disclosure class, not a trust step.
+                //
+                // "Trust-free" is the DERIVATION's property, read off the
+                // proof AY's strict checker walked — not the document's
+                // `unproved` count, which also counts a validated kind the
+                // printer downgraded to `hole`. Keyed on the document, every
+                // FP refutation whose `FpGroundEval` lemma (validated by the
+                // exact IEEE-754 evaluator) prints as `hole` was told "a step
+                // AY's own strict checker refuses" while `unsat_admission` read
+                // `strict-proof` — the 2026-09-23 fp-strings verifier's E1
+                // witnesses, one branch at a time.
+                if strict_screen_refuses && derivation_trust_free && surface_gap.is_some() {
+                    ProofDeclineMechanism::PinnedCheckerSurfaceUnsupported
+                } else if strict_screen_refuses {
+                    ProofDeclineMechanism::TerminalTrustStepOnPath
+                } else {
+                    ProofDeclineMechanism::PrinterRuleWithoutExternalSpelling
+                }
+            },
         );
     }
-    if !self_checkable {
+    disclose_unsat_corroboration(executor);
+    // MEASURED 2026-09-06, and the reason this sentence is no longer the one it
+    // was: on a seeded 60-file corpus sweep, two files published `unsat` under
+    // `--self-check` while this very line printed `ay_self_checkable=no` and the
+    // old text claimed `--self-check` would answer `unknown`. Both were admitted
+    // by `checked-sat-refutation` — a replayed, premise-authenticated SAT
+    // resolution refutation of the exact authored query — which is precisely
+    // what the certified rigor level accepts and the strict level does not. The
+    // document really is uncheckable; the claim about the verdict was false.
+    //
+    // The explanation is SPLIT, because after #evidence-stage-0
+    // `ay_self_checkable=no` covers two different situations: an unproved step
+    // in AY's own derivation, and a document holed by the printer alone (the
+    // `unproved_steps=1 … unsat_admission=strict-proof` reproducer). The
+    // consequence for `--rigor strict` is the same for both: its publication
+    // gate withholds any certificate that carries an unproved step.
+    if holed_or_screened {
+        // What pinned Carcara 1.1.0 (9a352ee) answers for this document, in
+        // its own order of precedence: a parse failure stops it before any
+        // step is checked, a step it refuses makes the document *invalid*
+        // however many holes it also carries, and only a document whose every
+        // other step checks is *holey*. MEASURED on the 445-file D7 unsat list
+        // (main a68e18a38f, `carcara check --allow-int-real-subtyping PROOF
+        // PROBLEM`): the old two-way split told 81 documents "reports it as
+        // *holey*" — 75 with `carcara_surface=unsupported` that pinned Carcara
+        // refused with a parser error, 5 with a foreign `assume` and 1 with a
+        // Clean-only spelling that it reported *invalid*.
+        let holes = if unproved > 0 {
+            format!("; it also prints {unproved} unproved step(s) as `hole`")
+        } else {
+            String::new()
+        };
+        let prediction = if surface_gap.is_some() {
+            format!("is NOT an externally checkable certificate — pinned Carcara cannot parse it (its surface is outside pinned Carcara's grammar, see carcara_surface above) and stops with a parser error before checking any step{holes}")
+        } else if matches!(evidence.premises, AssumedPremises::Foreign(_)) {
+            format!("is NOT an externally checkable certificate — pinned Carcara reports it *invalid* at the premise `assume` that is not verbatim an assertion of the input (named above){holes}")
+        } else if surface_label == "clean-dialect" {
+            format!("is NOT an externally checkable certificate — pinned Carcara reports it *invalid* at the Clean-only spelling named above{holes}")
+        } else if unproved > 0 {
+            format!("is NOT an externally checkable certificate ({unproved} unproved step(s) print as `hole`) — an external checker reports it as *holey*, never *valid*")
+        } else {
+            "is NOT an externally checkable certificate of this verdict: AY's strict screen finds a trust-kind step on the derivation's path to the empty clause, though the document prints no `hole`".to_string()
+        };
         safe_eprintln!(
-            "c warning: {path} is NOT an externally checkable certificate ({unproved} unproved step(s) print as `hole`) — AY's own acceptance gate rejects it, so `--self-check` answers `unknown` for this verdict; the exit status reports the verdict, not the certificate"
+            "c warning: {path} {prediction}; the exit status reports the verdict, not the certificate"
         );
-    } else if unproved > 0 {
-        safe_eprintln!(
-            "c warning: {path} carries {unproved} unproved step(s); an external checker reports it as *holey*, never *valid*"
-        );
+        if strict_screen_refuses {
+            safe_eprintln!(
+                "c warning: {path} — `--rigor strict` (`--strict-proofs`) answers `unknown` for this verdict, and so does `--rigor certified` (`--self-check`) when a translated artifact is also demanded (`--proof`, `:produce-proofs`). Bare `--rigor certified` publishes only on an independent certification lane, named by `unsat_admission=` above"
+            );
+        } else {
+            safe_eprintln!(
+                "c warning: {path} — these holes are a PRINTER limitation, not an unproved step in AY's derivation: nothing on the path to the empty clause is a `trust` step, and the verdict was admitted by unsat_admission={admission}. `--rigor strict` (`--strict-proofs`) answers `unknown` for this verdict all the same, because it publishes `unsat` only with a certificate that carries no unproved step. This line is about the document; `unsat_admission=` above is the verdict's authority"
+            );
+        }
     }
+}
+
+/// Standing marker for a certificate artifact the publication path REFUSED
+/// after the mint had already produced it.
+///
+/// Two very different things print no `c ay.proof.certificate` line: a verdict
+/// whose proof was never reconstructable (nothing was ever offered), and a
+/// verdict whose proof WAS built and was then rejected by the renderer, the
+/// writer, or the publication authority check. Until this line the only trace
+/// of the second case was prose on stderr, and the campaign's evidence census
+/// filed both under "no evidence artifact at all" -- which reads as "AY never
+/// tried" when in fact AY tried, produced an artifact, and refused it.
+///
+/// Printed on every posture. What changes under `--rigor strict` is the
+/// VERDICT (the caller routes to `RejectToUnknown`); the refusal itself is the
+/// same event and earns the same record either way.
+///
+/// `rejections`/`nested_rejections` mirror the `cert.publication_rejections`
+/// and `cert.publication_rejections_nested` counters, so a census reading this
+/// line has the refusal accounting in front of it. The nested cell is the
+/// share contributed by internal certification probes, which say nothing about
+/// the published verdict.
+fn disclose_refused_artifact(stage: &str, path: &str, reason: &dyn std::fmt::Display) {
+    let accounting = ay_dpll::CertificationAccounting::snapshot();
+    safe_eprintln!(
+        "c ay.proof.artifact-refused path={path} stage={stage} rejections={} nested_rejections={} reason={reason}",
+        accounting.publication_rejections,
+        accounting.publication_rejections_nested,
+    );
 }
 
 fn invalidate_artifacts_for_rejected_result() {
@@ -3794,7 +4787,7 @@ fn run_incomplete_problem_gate(
 
     executor.replace_last_result_with_unknown(UnknownReason::Incomplete);
     update_transcript_state_after_command(transcript, cmd);
-    transcript.record_synthesized_unknown("\"a problem-contributing command was discarded\"");
+    transcript.record_synthesized_unknown(discarded_command_reason(transcript));
     if let Err(error) = invalidate_decision_trace_for_public_mismatch(transcript) {
         eprintln_smt_error(error);
         return Some(false);
@@ -3819,6 +4812,26 @@ fn execute_and_print(
     // z3 `-model` inline emission: only the streaming path sets this. The
     // non-incremental file path appends a literal `(get-model)` instead, so it
     // passes false to avoid emitting the model twice.
+    emit_z3_model_inline: bool,
+) -> bool {
+    if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {
+        // This query owes its own response, whatever earlier ones printed: a
+        // run the deadline or a memory breach ends during it answers it
+        // `unknown` (see `owe_response_for_new_query`).
+        super::owe_response_for_new_query();
+    }
+    note_z3_session_command(transcript, cmd);
+    note_z3_session_start_in_context(executor, transcript);
+    withhold_before_label_mention(executor, transcript);
+    let continued = execute_and_print_command(executor, cmd, transcript, emit_z3_model_inline);
+    withhold_after_labels_z3_binds(executor, transcript, cmd);
+    continued
+}
+
+fn execute_and_print_command(
+    executor: &mut Executor,
+    cmd: &Command,
+    transcript: &mut SmtTranscriptState,
     emit_z3_model_inline: bool,
 ) -> bool {
     if (ay_core::trace_config().dump_bv_cnf_path.is_some()
@@ -3985,10 +4998,17 @@ fn execute_and_print(
             return true;
         }
     }
+    withhold_after_late_global_declarations(executor, transcript, cmd);
+    if reject_z3_fixed_option(executor, transcript, cmd) {
+        return true;
+    }
 
     if !maybe_enable_z3_default_assignment_query(executor, cmd) {
         eprintln_smt_error("failed to enable assignment collection for get-assignment".to_string());
         return false;
+    }
+    if matches!(cmd, Command::GetAssignment) {
+        record_session_option(transcript, "(set-option :produce-assignments true)");
     }
 
     let is_decision_query = matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_));
@@ -3996,6 +5016,12 @@ fn execute_and_print(
         // A failed or panicking new decision must not leave the preceding
         // public result authoritative.
         transcript.clear_public_result();
+        // The in-script half of the strict request this query is answered
+        // under (the flag is the other half). With the flag, it decides
+        // whether the query's UNSAT waits for its certificate
+        // (`publish_rendered_executor_output`) and how that certificate is
+        // published (`write_alethe_proof`).
+        transcript.query_script_strict = executor.script_strict_proofs_requested();
     }
 
     // Competition robustness: an internal solver bug must NEVER crash the process
@@ -4006,9 +5032,7 @@ fn execute_and_print(
     // commands. The release profile is intentionally `panic = "unwind"` so this
     // containment works. Found by the diff_fuzz seq sort-interning crash (a valid
     // QF_SLIA input panicked `mk_eq expects same sort`, exiting the process 101).
-    let exec_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor.execute_authored(cmd)
-    })) {
+    let exec_result = match execute_charging_rlimit(executor, cmd, transcript) {
         Ok(r) => r,
         Err(_panic) => return handle_executor_panic(executor, cmd, transcript),
     };
@@ -4026,13 +5050,25 @@ fn execute_and_print(
     if matches!(cmd, Command::GetModel) {
         transcript.owes_model_emission = false;
     }
+    if exec_result.is_ok() {
+        record_accepted_command(transcript, cmd, global_declarations_in_force(executor));
+    }
     match exec_result {
         Ok(Some(output)) => {
+            // The strict request this response is judged under, read ONCE. A
+            // decision query's is the request recorded when it started, the
+            // value every later gate of its publication reads too
+            // (`write_alethe_proof`); any other response's is the live one.
+            let strict = if is_decision_query {
+                transcript.query_strict_proofs_requested()
+            } else {
+                strict_admission_requested(executor)
+            };
             // Strict-proof mode: downgrade UNSAT to Unknown when the terminal
             // derivation chain contains a `:rule trust` fallback (#8759).
             // The proof is generated internally regardless of `--proof` because
             // `new_executor()` forces `set_produce_proofs(true)` under strict.
-            if output == "unsat" && strict_proofs_enabled() && terminal_trust_detected(executor) {
+            if output == "unsat" && strict_derivation_screen_refuses(strict, executor) {
                 let downgraded = executor.reject_last_unsat_as_unknown();
                 debug_assert!(downgraded, "strict-proof gate started from UNSAT");
                 debug_assert_eq!(
@@ -4040,17 +5076,22 @@ fn execute_and_print(
                     Some(UnknownReason::ProofTrusted),
                     "the strict-proof gate must publish its own typed reason"
                 );
-                return publish_strict_proof_trust_rejection(transcript, cmd);
+                return publish_strict_proof_trust_rejection(transcript, cmd, executor);
             }
-            // The executor's own UNSAT funnel applies the same gate, so a
-            // script that turned strict proofs on with
-            // `(set-option :check-proofs-strict true)` — or any ay-dpll
-            // consumer — arrives here already downgraded. Publish the identical
-            // transcript certification rejection rather than letting the two
-            // spellings of "strict proofs" produce two different outputs.
+            // The DOCUMENT half, at the one point every route's `unsat` passes
+            // (see `strict_admission.rs`).
+            if let Some(refusal) = strict_document_refusal(strict, executor, &output) {
+                return publish_strict_document_rejection(transcript, cmd, executor, refusal);
+            }
+            // The executor's own UNSAT funnel may already have downgraded a
+            // verdict under `(set-option :check-proofs-strict true)`. Publish
+            // the identical transcript certification rejection rather than
+            // letting the two spellings of "strict proofs" produce two
+            // different outputs; an `unsat` it admitted passed both gates
+            // above (`strict` reads the option too).
             if output == "unknown" && executor.unknown_reason() == Some(UnknownReason::ProofTrusted)
             {
-                return publish_strict_proof_trust_rejection(transcript, cmd);
+                return publish_strict_proof_trust_rejection(transcript, cmd, executor);
             }
             // Firewall result gate (`--verify-firewall`). Today's emitters prove
             // diagnostic LOCAL theory obligations only; even when every such
@@ -4133,6 +5174,19 @@ fn execute_and_print(
                     // "timeout")` over the top of it nor exit non-zero.
                     if raw_output == "sat" || raw_output == "unsat" {
                         super::mark_decisive_verdict_printed();
+                        // P4: what admitted an `unsat`, for a memout note
+                        // that ends the run before the certificate line.
+                        super::record_decisive_verdict_evidence((raw_output == "unsat").then(
+                            || {
+                                format!(
+                                    "unsat_admission={} {}",
+                                    executor
+                                        .last_command_unsat_admission_tag()
+                                        .unwrap_or("none-recorded"),
+                                    unsat_evidence_fields(executor),
+                                )
+                            },
+                        ));
                     }
                 }
                 // #model-owed: arm the debt the instant the `sat` becomes
@@ -4158,12 +5212,30 @@ fn execute_and_print(
                 // Mark that "unknown" has been printed to prevent duplicate
                 // output from exit_if_timed_out (#8674).
                 super::VERDICT_PRINTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                if !z3_mode_enabled() {
-                    if let Some(reason) = executor.get_reason_unknown() {
-                        print_diagnostic_line(transcript, &format!("(:reason-unknown {reason})"));
-                    } else {
-                        print_diagnostic_line(transcript, "(:reason-unknown unknown)");
+                // In z3 mode too: an `unknown` the memory budget caused ends
+                // the run as a memout after this command.
+                if z3_mode_enabled() {
+                    super::latch_memout_if_over_budget();
+                }
+                // A breach the memory watchdog latched is reported as the
+                // memout it is, right after this command
+                // (`exit_if_memout_requested`), not as the `interrupted` the
+                // stopped solve recorded.
+                // Likewise a deadline: the run's exit gives the one canonical
+                // timeout report (`exit_if_timed_out`), with its exit code.
+                if z3_mode_enabled() {
+                    // z3's transcript carries no reason line here.
+                } else if super::latch_memout_if_over_budget() || super::run_deadline_passed() {
+                    // When an earlier query's decisive answer stands, the
+                    // run's exit writes only its "verdict stands" note, so
+                    // the reason for THIS query's `unknown` is written here.
+                    if let Some(line) = super::budget_reason_after_decisive_verdict() {
+                        print_diagnostic_line(transcript, line);
                     }
+                } else if let Some(reason) = executor.get_reason_unknown() {
+                    print_diagnostic_line(transcript, &format!("(:reason-unknown {reason})"));
+                } else {
+                    print_diagnostic_line(transcript, "(:reason-unknown unknown)");
                 }
             }
             // z3 `-model`: emit the model after a satisfiable `check-sat`, as if
@@ -4190,6 +5262,7 @@ fn execute_and_print(
         }
         Ok(None) => {
             update_transcript_state_after_command(transcript, cmd);
+            restore_z3_session_after_reset(executor, transcript, cmd);
             if !z3_mode_enabled()
                 || z3_command_implicitly_acknowledges_success(transcript.current_source.as_ref())
             {
@@ -4199,8 +5272,15 @@ fn execute_and_print(
         }
         Err(e) => {
             let message = e.to_string();
+            let label_failure = z3_assertion_label_failure(executor, cmd);
+            let rejection = is_decision_query
+                .then(|| query_rejection(transcript, &message))
+                .flatten();
             if is_decision_query {
-                executor.replace_last_result_with_unknown(UnknownReason::InternalError);
+                // The error's own reason, as the native API publishes it: a
+                // theory mix with no combined decision procedure is a refusal
+                // (`incomplete`), any other executor error `internal_error`.
+                executor.replace_last_result_with_executor_error(&e);
                 update_transcript_state_after_command(transcript, cmd);
                 // Carry the underlying error text as the reason DETAIL. A bare
                 // `(incomplete decision-execution-error)` cannot be told apart
@@ -4229,7 +5309,7 @@ fn execute_and_print(
             // unaffected (it unfolds fully and returns a real verdict). (matches
             // the burndown "every check-sat emits a verdict" principle.)
             if message.contains("recursion depth limit") && command_contributes_to_problem(cmd) {
-                eprintln_smt_error(message);
+                report_dropped_command_error(transcript, cmd, message);
                 mark_problem_incomplete(executor, transcript);
                 if is_decision_query && !print_synthesized_public_unknown(transcript) {
                     return false;
@@ -4249,7 +5329,18 @@ fn execute_and_print(
                 // must not taint the session to `unknown`. Tainting here made
                 // the following `check-sat` answer `unknown` on a fully intact
                 // problem, contradicting the handler's own contract.
-                if command_contributes_to_problem(cmd) && !matches!(cmd, Command::SetLogic(_)) {
+                if label_failure == Some(ay_frontend::LabelFailure::Exact) {
+                    // z3 rejects this assertion at the same label, keeping
+                    // the labels before it, which are bound here too.
+                    let global = global_declarations_in_force(executor);
+                    record_rejected_assertion(transcript, cmd, global);
+                    note_z3_scope_command(transcript, cmd);
+                } else if label_failure.is_some() {
+                    // z3 keeps labels this session did not bind.
+                    mark_problem_incomplete(executor, transcript);
+                } else if command_contributes_to_problem(cmd)
+                    && !matches!(cmd, Command::SetLogic(_))
+                {
                     // A dropped `assert` is a monotone WEAKENING of the problem,
                     // so a later `unsat` on the remainder still refutes the
                     // whole. Anything else dropped here (a definition, a
@@ -4261,12 +5352,21 @@ fn execute_and_print(
                         mark_problem_incomplete(executor, transcript);
                     }
                 }
-                if is_decision_query && !print_synthesized_public_unknown(transcript) {
+                if let Some(rejection) = rejection {
+                    if !rejection.answered {
+                        super::mark_verdict_printed();
+                    } else if !print_synthesized_public_unknown(transcript) {
+                        return false;
+                    }
+                    if rejection.withhold {
+                        withhold_answers_out_of_step(executor, transcript);
+                    }
+                } else if is_decision_query && !print_synthesized_public_unknown(transcript) {
                     return false;
                 }
                 return !transcript.exit_on_error;
             }
-            eprintln_smt_error(message);
+            report_executor_failure(transcript, cmd, message);
             if is_decision_query {
                 let _ = print_synthesized_public_unknown(transcript);
             }
@@ -4546,9 +5646,10 @@ fn print_smt_stats(
     formula_stats: Option<&FormulaStats>,
     stats_cfg: stats_output::StatsConfig,
 ) {
+    crate::hard_exit_statistics::note_printed();
     if stats_cfg.human {
         use std::io::IsTerminal;
-        let dpll_stats = executor.statistics();
+        let dpll_stats = statistics_with_session_rlimit(executor, transcript);
         if stats_cfg.full {
             safe_eprintln!("{dpll_stats}");
         } else {
@@ -4849,6 +5950,149 @@ mod tests {
         );
     }
 
+    /// The in-script strict option holds a default-certificate UNSAT back
+    /// exactly as the flag does: both spellings are one predicate. It read the
+    /// flag alone, so with only the option a failed default publication
+    /// printed `unsat` and then `unknown` for the same `check-sat`.
+    #[test]
+    fn the_in_script_strict_option_requires_default_certificate_publication() {
+        let default =
+            ProofConfig::new_default("/tmp/default.alethe".to_string(), ProofFormat::Alethe);
+        assert_eq!(
+            SmtUnsatProofPosture::of(Some(&default)),
+            SmtUnsatProofPosture::DefaultCertificate
+        );
+        assert!(required_smt_unsat_publication(Some(&default), true));
+        assert!(SmtUnsatProofPosture::DefaultCertificate.holds_unsat(true));
+
+        let explicit = ProofConfig::from_path("/tmp/explicit.alethe".to_string());
+        let enveloped = default
+            .clone()
+            .with_artifact_path(Some("/tmp/default.json".to_string()));
+        for required in [&explicit, &enveloped] {
+            assert_eq!(
+                SmtUnsatProofPosture::of(Some(required)),
+                SmtUnsatProofPosture::RequiredCertificate
+            );
+            assert!(required_smt_unsat_publication(Some(required), false));
+        }
+
+        assert_eq!(
+            SmtUnsatProofPosture::of(None),
+            SmtUnsatProofPosture::NoCertificate
+        );
+        assert!(!required_smt_unsat_publication(None, true));
+    }
+
+    /// The hold-back is decided per query, from the strict request in force
+    /// when that query was answered, not latched before the script ran.
+    #[test]
+    fn a_query_answered_under_the_in_script_option_holds_its_unsat_back() {
+        let mut transcript = SmtTranscriptState::new();
+        transcript.unsat_proof_posture = SmtUnsatProofPosture::DefaultCertificate;
+        transcript.query_script_strict = true;
+        transcript.record_public_verdict(PublicVerdict::Unsat);
+        assert!(transcript.query_strict_proofs_requested());
+        let mut emitted = Vec::new();
+        let result = publish_rendered_executor_output(
+            &mut transcript,
+            true,
+            "unsat",
+            "unsat".to_string(),
+            None,
+            |_, output| emitted.push(output.to_string()),
+        );
+        assert_eq!(result, Ok(false));
+        assert!(emitted.is_empty(), "a held UNSAT leaked: {emitted:?}");
+        assert_eq!(transcript.pending_unsat_output.as_deref(), Some("unsat"));
+
+        // A later query starts from no strict request until it is answered.
+        transcript.clear_public_result();
+        assert!(!transcript.query_script_strict);
+        assert!(transcript.pending_unsat_output.is_none());
+    }
+
+    /// Every `(error ...)` an executor response prints is recorded once,
+    /// whether or not an arm rewords it; `echo` text never is.
+    #[test]
+    fn every_printed_executor_error_is_recorded_once() {
+        let mut state = SmtTranscriptState::new();
+        let unreworded = "(error \"objectives are not available\")";
+        let rendered =
+            z3_compat_output_for_command(&mut state, &Command::GetObjectives, unreworded);
+        assert_eq!(rendered.as_deref(), Some(unreworded));
+        assert!(state.had_recoverable_error && state.emitted_any_error);
+        assert_eq!(state.recoverable_error_count, 1);
+
+        // An arm that rewords and records its error is not counted twice.
+        let rendered = z3_compat_output_for_command(
+            &mut state,
+            &Command::GetModel,
+            "(error \"model is not available\")",
+        );
+        assert!(rendered.is_some_and(|text| text.contains("model is not available")));
+        assert_eq!(state.recoverable_error_count, 2);
+
+        let mut state = SmtTranscriptState::new();
+        let echoed = "(error \"x\")";
+        let rendered =
+            z3_compat_output_for_command(&mut state, &Command::Echo(echoed.to_string()), echoed);
+        assert_eq!(rendered.as_deref(), Some(echoed));
+        assert!(!state.had_recoverable_error && !state.emitted_any_error);
+    }
+
+    /// A held UNSAT whose problem may carry no artifact (an earlier recoverable
+    /// error) is settled by its posture, never left unprepared: that failed its
+    /// publication with no response to the query.
+    #[test]
+    fn a_held_unsat_after_a_recoverable_error_gets_its_postures_answer() {
+        let mut transcript = SmtTranscriptState::new();
+        transcript.record_public_verdict(PublicVerdict::Unsat);
+        transcript.note_recoverable_error();
+        assert!(!transcript.public_unsat_artifacts_allowed());
+        let default =
+            ProofConfig::new_default("/tmp/default.alethe".to_string(), ProofFormat::Alethe);
+        let explicit = ProofConfig::from_path("/tmp/explicit.alethe".to_string());
+
+        // Not held: already on the regular channel, and no certificate is due.
+        for proof in [&default, &explicit] {
+            assert!(matches!(
+                unsat_publication_without_artifact_authority(&transcript, proof),
+                AletheProofPublication::Ready(None)
+            ));
+        }
+
+        transcript.pending_unsat_output = Some("unsat".to_string());
+        match unsat_publication_without_artifact_authority(&transcript, &default) {
+            AletheProofPublication::RejectToUnknown { reason, diagnostic } => {
+                assert_eq!(reason, "(incomplete proof-publication-failed)");
+                assert!(diagnostic.contains("/tmp/default.alethe"), "{diagnostic}");
+                assert!(diagnostic.contains("earlier in this problem failed"));
+            }
+            _ => panic!("a strict default certificate after an error must reject to unknown"),
+        }
+        match unsat_publication_without_artifact_authority(&transcript, &explicit) {
+            AletheProofPublication::Fatal(error) => {
+                assert!(error.starts_with("--proof requires /tmp/explicit.alethe"));
+                assert!(error.contains("earlier in this problem failed"), "{error}");
+            }
+            _ => panic!("a required certificate after an error must fail the run"),
+        }
+        // The request is named with its own target, then the certificate.
+        let enveloped = default
+            .clone()
+            .with_artifact_path(Some("/tmp/default.json".to_string()));
+        match unsat_publication_without_artifact_authority(&transcript, &enveloped) {
+            AletheProofPublication::Fatal(error) => assert!(
+                error.starts_with(
+                    "--proof-artifact /tmp/default.json requires the certificate /tmp/default.alethe"
+                ),
+                "{error}"
+            ),
+            _ => panic!("a required envelope after an error must fail the run"),
+        }
+    }
+
     #[test]
     fn z3_5_info_help_and_initial_statistics_have_the_pinned_shape() {
         let state = SmtTranscriptState::new();
@@ -4858,12 +6102,12 @@ mod tests {
         );
         assert_eq!(
             z3_compat_get_info_output(&state, ":rlimit", "unused"),
-            Some("(:rlimit 1)".to_string())
+            Some("(:rlimit 0)".to_string())
         );
         assert_eq!(
             z3_compat_get_info_output(&state, ":all-statistics", "unused"),
             Some(
-                "(:max-memory   0.00\n :memory       0.00\n :num-allocs   0\n :rlimit-count 1)"
+                "(:max-memory   0.00\n :memory       0.00\n :num-allocs   0\n :rlimit-count 0)"
                     .to_string()
             )
         );
@@ -5190,6 +6434,58 @@ mod tests {
         assert!(!parse_drop_contributes_to_problem(
             "; (assert false)\n(get-info :version)"
         ));
+        assert!(parse_drop_contributes_to_problem(
+            "(define-const c Int (x))"
+        ));
+        assert!(parse_drop_contributes_to_problem(
+            "(set-option :global-declarations (x))"
+        ));
+        // Two forms: recovery skipped a command z3 may have run.
+        assert!(parse_drop_contributes_to_problem(
+            "(get-value ((x))) (check-sat)"
+        ));
+        assert!(!parse_drop_contributes_to_problem(
+            "(get-value ((x))) ; (check-sat)"
+        ));
+    }
+
+    #[test]
+    fn a_dropped_query_withholds_later_answers() {
+        assert!(dropped_text_holds_a_query("(check-sat-assuming (p) extra)"));
+        assert!(dropped_text_holds_a_query("(check-sat-assuming p)"));
+        assert!(dropped_text_holds_a_query("(check-sat extra)"));
+        assert!(dropped_text_holds_a_query("(|check-sat-using| 1)"));
+        assert!(dropped_text_holds_a_query("(get-value ((x))) (check-sat"));
+        assert!(!dropped_text_holds_a_query("(echo \"(check-sat)\" x)"));
+        assert!(!dropped_text_holds_a_query("(assert (p)) ; (check-sat)"));
+    }
+
+    #[test]
+    fn a_quoted_keyword_is_the_command_it_names() {
+        assert_eq!(command_source_keyword("(|pop| 1 extra)"), Some("pop"));
+        assert_eq!(
+            command_source_keyword("( |set-option|:x)"),
+            Some("set-option")
+        );
+        assert_eq!(command_source_keyword("(|a\\|b| 1)"), Some("a\\|b"));
+        assert_eq!(command_source_keyword("(|pop"), None);
+        assert_eq!(command_source_keyword("(||)"), None);
+        assert!(parse_drop_contributes_to_problem("(|pop| 1 extra)"));
+        assert!(parse_drop_contributes_to_problem("(|assert| false extra)"));
+        assert!(!parse_drop_contributes_to_problem("(|get-info| :x :y)"));
+    }
+
+    #[test]
+    fn an_escaped_bar_does_not_end_a_quoted_symbol_in_dropped_text() {
+        // Read with `\|` as the end of the symbol, the `(pop` would be inside
+        // the next quoted symbol and missed.
+        assert!(parse_drop_contributes_to_problem(
+            "(get-info |a\\|) b|) (pop 1)"
+        ));
+        assert_eq!(
+            collect_command_sources("(get-info |a\\|) (b|) (pop 1)").len(),
+            2
+        );
     }
 
     #[test]
@@ -5254,6 +6550,18 @@ mod tests {
         assert_eq!(
             classify_dimacs_prefix(b"; leading SMT-LIB comment\n(set-logic HORN)\n", false),
             DimacsPrefixKind::NotDimacs
+        );
+    }
+
+    #[test]
+    fn z3_reason_unknown_doubles_quotes_of_an_error_detail() {
+        assert_eq!(
+            z3_reason_unknown_output("(incomplete decision-execution-error \"no lane\")"),
+            "(:reason-unknown \"(incomplete decision-execution-error \"\"no lane\"\")\")"
+        );
+        assert_eq!(
+            z3_reason_unknown_output("\"internal solver error\""),
+            "(:reason-unknown \"(incomplete internal solver error)\")"
         );
     }
 
@@ -5411,13 +6719,205 @@ mod tests {
         let (reserved, file) = create_artifact_temp_file_from_nonce(&target, pid, nonce)
             .expect("a later exclusive candidate should be available");
         drop(file);
-        assert_ne!(reserved, planted);
+        let reserved_path = reserved.path().to_path_buf();
+        assert_ne!(reserved_path, planted);
         assert!(planted.is_symlink());
         assert_eq!(
             std::fs::read_to_string(&victim).expect("read victim"),
             "do not truncate"
         );
-        std::fs::remove_file(reserved).expect("remove reserved temporary file");
+        drop(reserved);
+        assert!(
+            !reserved_path.exists(),
+            "an uncommitted reservation unlinks its temporary file"
+        );
+    }
+
+    /// Names of the unpublished artifact reservations sitting in `dir`.
+    fn artifact_temp_debris(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read artifact directory")
+            .map(|entry| entry.expect("read artifact directory entry").file_name())
+            .filter_map(|name| name.to_str().map(str::to_owned))
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
+    }
+
+    /// The defect this guard exists for: an emission that stops mid-document
+    /// must leave NOTHING beside the user's input.
+    ///
+    /// Measured before the fix, on QF_UF `iso_brn492` with the synthesized
+    /// default certificate: each `--rigor standard` run left a
+    /// `.iso_brn492.smt2.alethe.tmp-<pid>-0` of 29,182,083 bytes, and three
+    /// runs left three. That is what this pins, at the exact seam that leaked:
+    /// the temp file is unlinked, AND the descriptor is left empty rather than
+    /// re-inflated by `BufWriter::drop` flushing its tail past the truncation
+    /// point (which is what made the "invalidated" partial 29 MB, not 0).
+    #[test]
+    fn abandoned_alethe_emission_leaves_no_partial_and_empties_the_inode() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("input.smt2.alethe");
+        let (_resolved_target, reservation, file) =
+            create_artifact_temp_file(&target).expect("reserve a temporary proof file");
+        let reserved_path = reservation.path().to_path_buf();
+
+        // Render more than the writer's buffer, exactly as a budget-exhausting
+        // emission does: most of the partial has reached the file, the tail is
+        // still buffered.
+        let mut writer = ProofDigestWriter::with_self_check(
+            BufWriter::with_capacity(1 << 20, file),
+            None,
+            ay_proof::AletheDialect::default(),
+        );
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..4 {
+            writer.write_all(&chunk).expect("render partial proof text");
+        }
+        writer
+            .write_all(b"(step t1 (cl) :rule hole)")
+            .expect("leave a tail in the writer buffer");
+        assert!(
+            std::fs::metadata(&reserved_path)
+                .expect("stat the partial")
+                .len()
+                > 0,
+            "the fixture must actually produce a partial on disk"
+        );
+
+        let _error = alethe_error_after_abandoning_buffer(
+            ay_proof::AletheStreamError::Print(
+                ay_proof::AlethePrintError::UnavailableAuthenticatedSurface {
+                    reason: "emission work budget exhausted",
+                },
+            ),
+            writer,
+        );
+        assert_eq!(
+            std::fs::metadata(&reserved_path)
+                .expect("stat the abandoned partial")
+                .len(),
+            0,
+            "the abandoned descriptor still holds proof text: the discarded buffer must not be flushed back past the invalidation"
+        );
+
+        drop(reservation);
+        assert!(
+            !reserved_path.exists(),
+            "an abandoned emission left a partial at {}",
+            reserved_path.display()
+        );
+        assert!(!target.exists(), "an abandoned emission published a proof");
+        assert!(
+            artifact_temp_debris(temp.path()).is_empty(),
+            "abandoned emission debris: {:?}",
+            artifact_temp_debris(temp.path())
+        );
+    }
+
+    /// `--proof-self-check` reads the document in the dialect the executor
+    /// renders it in (`--alethe-dialect`): a Clean document may name Clean's
+    /// `dt_project`, and a pinned-Carcara document naming it is refused as
+    /// `unknown-rule`, as pinned Carcara refuses it (it voids the document).
+    ///
+    /// The pinned printer never writes `dt_project`, so no CLI run can show
+    /// the pinned half; this pins it at the writer `write_alethe_proof`
+    /// streams through, built from the executor exactly as there.
+    #[test]
+    fn proof_self_check_reads_the_document_in_the_executor_dialect() {
+        use std::io::Write as _;
+        let scope = ay_proof::ProblemScope::from_smtlib_source(
+            "(declare-datatypes ((Pair 0)) (((mk (fst Int) (snd Int)))))\n\
+             (declare-const a Int)\n(declare-const b Int)\n",
+        );
+        let document = "(assume t0 (not (= (fst (mk a b)) a)))\n\
+                        (step t1 (cl (= (fst (mk a b)) a)) :rule dt_project)\n\
+                        (step t2 (cl) :rule resolution :premises (t0 t1))\n";
+        let verdict = |mut writer: ProofDigestWriter<Vec<u8>>| {
+            writer
+                .write_all(document.as_bytes())
+                .expect("stream the document");
+            let verdict = writer
+                .take_self_check_verdict()
+                .expect("the self-check is enabled");
+            assert_eq!(
+                writer.into_inner(),
+                document.as_bytes(),
+                "the bytes pass through"
+            );
+            verdict
+        };
+        for dialect in [
+            ay_proof::AletheDialect::Clean,
+            ay_proof::AletheDialect::PinnedCarcara,
+        ] {
+            let mut executor = Executor::new();
+            executor.set_alethe_dialect(dialect);
+            for (how, writer) in [
+                (
+                    "with_self_check",
+                    ProofDigestWriter::with_self_check(Vec::new(), Some(scope.clone()), dialect),
+                ),
+                (
+                    "for_executor",
+                    ProofDigestWriter::for_executor(Vec::new(), Some(scope.clone()), &executor),
+                ),
+            ] {
+                match (dialect, verdict(writer)) {
+                    (ay_proof::AletheDialect::Clean, Ok(report)) => assert_eq!(report.steps, 2),
+                    (
+                        ay_proof::AletheDialect::PinnedCarcara,
+                        Err(ay_proof::AletheDefect::UnknownRule { rule, .. }),
+                    ) => assert_eq!(rule, "dt_project", "{how}"),
+                    (dialect, other) => panic!("{how} in {dialect:?}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A no-replace publication that loses to a pre-existing artifact is the
+    /// path a corpus scan takes on its SECOND pass over the same directory. It
+    /// must leave the existing file untouched AND leave no reservation behind,
+    /// or the scan strands one partial per instance per pass.
+    #[test]
+    fn noreplace_publication_failure_leaves_no_artifact_debris() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("input.smt2.alethe");
+        std::fs::write(&target, "pre-existing certificate").expect("plant the earlier artifact");
+
+        let error = write_artifact_noreplace_retained(&target, |file| {
+            file.write_all(b"a second run's certificate")
+        })
+        .expect_err("publication must not replace an existing artifact");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the preserved artifact"),
+            "pre-existing certificate"
+        );
+        assert!(
+            artifact_temp_debris(temp.path()).is_empty(),
+            "a lost publication left debris: {:?}",
+            artifact_temp_debris(temp.path())
+        );
+    }
+
+    /// A writer that fails part-way is the same abandonment, one layer up.
+    #[test]
+    fn failed_artifact_write_leaves_no_artifact_debris() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("firewall_0.lean");
+
+        let error = write_artifact_atomically(&target, |file| {
+            file.write_all(b"a partial lemma")?;
+            Err(io::Error::other("rendering gave up"))
+        })
+        .expect_err("the write failure must propagate");
+        assert_eq!(error.to_string(), "rendering gave up");
+        assert!(!target.exists(), "a failed write published an artifact");
+        assert!(
+            artifact_temp_debris(temp.path()).is_empty(),
+            "a failed write left debris: {:?}",
+            artifact_temp_debris(temp.path())
+        );
     }
 
     #[cfg(unix)]
@@ -5954,7 +7454,7 @@ mod tests {
         symlink(&first, &alias).unwrap();
 
         let target = alias.join("proof.alethe");
-        let (resolved_target, temp_path, mut file) =
+        let (resolved_target, mut reservation, mut file) =
             create_artifact_temp_file(&target).expect("reserve in resolved parent");
         file.write_all(b"proof").unwrap();
         file.sync_all().unwrap();
@@ -5962,7 +7462,9 @@ mod tests {
 
         std::fs::remove_file(&alias).unwrap();
         symlink(&second, &alias).unwrap();
-        publish_artifact_temp(&temp_path, &resolved_target).expect("publish to original parent");
+        publish_artifact_temp(reservation.path(), &resolved_target)
+            .expect("publish to original parent");
+        reservation.commit();
 
         assert_eq!(std::fs::read(first.join("proof.alethe")).unwrap(), b"proof");
         assert!(!second.join("proof.alethe").exists());
@@ -6037,73 +7539,6 @@ mod tests {
         ));
         transcript.protect_path(&proof).expect("protect proof path");
         assert!(transcript.output_channel_conflicts(proof.to_str().expect("UTF-8 path"), "stderr",));
-    }
-
-    /// Feed `input` to `IncrementalDepth` one physical line at a time (mirroring
-    /// the `read_line` accumulation) and return the final depth.
-    fn scan_depth_by_line(input: &str) -> IncrementalDepth {
-        let mut d = IncrementalDepth::default();
-        for line in input.split_inclusive('\n') {
-            d.feed(line);
-        }
-        d
-    }
-
-    #[test]
-    fn incremental_depth_balances_single_line_command() {
-        assert_eq!(scan_depth_by_line("(check-sat)\n").depth, 0);
-        assert_eq!(scan_depth_by_line("(assert (= x 1))\n").depth, 0);
-    }
-
-    #[test]
-    fn incremental_depth_open_until_closed_across_lines() {
-        // A multi-line command is only "complete" (depth 0) on the closing line.
-        let mut d = IncrementalDepth::default();
-        d.feed("(assert (or\n");
-        assert!(d.depth > 0, "mid-command depth must stay positive");
-        d.feed("  (= x 1)\n");
-        assert!(d.depth > 0);
-        d.feed("  (= y 2)))\n");
-        assert_eq!(d.depth, 0, "closing line returns to depth 0");
-    }
-
-    #[test]
-    fn incremental_depth_ignores_parens_in_line_comment() {
-        // A ')' inside a `;` comment must not close a real group.
-        assert_eq!(scan_depth_by_line("(echo x) ; )))(((\n").depth, 0);
-        let mut d = IncrementalDepth::default();
-        d.feed("(assert true ; ) ) )\n");
-        assert_eq!(d.depth, 1, "comment parens are inert");
-    }
-
-    #[test]
-    fn incremental_depth_ignores_parens_in_string_and_pipe() {
-        // Parens inside a "..." string literal or |...| quoted symbol are inert,
-        // including when the literal spans multiple physical lines.
-        assert_eq!(scan_depth_by_line("(echo \"(((\")\n").depth, 0);
-        assert_eq!(scan_depth_by_line("(echo \"a\"\"b)\")\n").depth, 0);
-        // Multi-line quoted symbol (as in `(set-info :source | ... |)`).
-        let mut d = IncrementalDepth::default();
-        d.feed("(set-info :source |\n");
-        assert_eq!(d.depth, 1);
-        d.feed("  text with ) ( parens and no effect\n");
-        assert_eq!(d.depth, 1, "still inside quoted symbol");
-        d.feed("|)\n");
-        assert_eq!(d.depth, 0, "closing | then ) balances");
-    }
-
-    #[test]
-    fn incremental_depth_matches_naive_paren_count_outside_literals() {
-        // On the benchmark shape (no strings/pipes mid-command), the tracker's
-        // depth equals the naive open-minus-close count the old gate used.
-        for s in [
-            "(a (b) (c (d)))\n",
-            "(assert (<= (+ x y) 3))\n",
-            "(push 1)\n(assert x)\n",
-        ] {
-            let naive = s.matches('(').count() as i64 - s.matches(')').count() as i64;
-            assert_eq!(scan_depth_by_line(s).depth, naive, "input: {s:?}");
-        }
     }
 
     #[test]
@@ -6474,7 +7909,7 @@ fn maybe_emit_firewall_lean(executor: &Executor) -> Result<Option<FirewallPublic
         return Ok(None);
     };
     let proof = executor.last_proof().ok_or_else(|| {
-        "--emit-firewall-lean requested artifacts, but UNSAT produced no reconstructable proof"
+        "--emit-firewall-lean requested artifacts, but no derivation was retained for this UNSAT"
             .to_string()
     })?;
     let Some(leans) = executor.emit_datatype_firewall_lean_bounded(
@@ -6784,11 +8219,138 @@ fn publish_artifact_temp_noreplace(
     Ok(())
 }
 
+/// Owns a reserved artifact temporary path until it is published.
+///
+/// The reservation lives NEXT TO the caller's own file — `--proof FILE` writes
+/// `.FILE.tmp-<pid>-<nonce>` in FILE's directory, and the synthesized default
+/// certificate writes `.<input>.alethe.tmp-<pid>-<nonce>` beside the SMT-LIB
+/// input. So every path out of an artifact write that does NOT end in the
+/// temp -> target rename must unlink the reservation: an error return, an early
+/// exit, and above all the *successful-verdict* abandonment where rendering
+/// stops mid-document (the synthesized-default Alethe emission work budget of
+/// `DEFAULT_ALETHE_EMISSION_WORK_BUDGET`), which is not an error anywhere in
+/// this program and therefore had no cleanup at all.
+///
+/// A partial left behind is not merely untidy. It is a dotfile a plain `ls`
+/// does not show, it is written into a directory the user only asked AY to
+/// READ, and — because publication is deliberately no-replace — an artifact
+/// sitting next to an input makes the NEXT run over that directory fail to
+/// publish ("File exists"), so a leak silently under-reports evidence on every
+/// later measurement of the same corpus. Measured before this guard existed:
+/// three `--rigor standard` runs of one budget-exhausting QF_UF instance left
+/// three 29,182,083-byte partials, and a scan of this repository on 2026-09-06
+/// found 145 stranded ones (129 of them inside `benchmarks/`, 353 MB apparent).
+///
+/// Drop-order note for buffered writers: declare the reservation BEFORE the
+/// writer that borrows its file, so the writer is dropped (and its buffered
+/// tail flushed, or discarded) before the unlink runs.
+struct ArtifactTempReservation {
+    path: std::path::PathBuf,
+    /// Cleared by [`Self::commit`] once the temp file has been published under
+    /// its target name and the temp path is therefore gone.
+    armed: bool,
+}
+
+impl ArtifactTempReservation {
+    fn new(path: std::path::PathBuf) -> Self {
+        register_live_artifact_temp_path(&path);
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Disarm: the reservation was published (renamed onto the target), so the
+    /// temp name no longer exists and must not be unlinked by anyone else.
+    fn commit(&mut self) {
+        self.armed = false;
+        unregister_live_artifact_temp_path(&self.path);
+    }
+}
+
+impl Drop for ArtifactTempReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+            unregister_live_artifact_temp_path(&self.path);
+        }
+    }
+}
+
+/// Reserved-but-unpublished artifact temporary paths, for the exit that runs
+/// no destructor.
+///
+/// [`ArtifactTempReservation`] covers every Rust control-flow exit from a proof
+/// write, but not `process::exit`, which is how AY ends a timeout, a SIGTERM
+/// wind-down, a memory abort and a fatal CLI error — and a timeout landing
+/// DURING emission is not hypothetical here: the emission work budget exists
+/// precisely because some certificates rendered for 300s+ after the verdict.
+/// This mirrors what the DIMACS proof registry already does for its
+/// `.ay-dimacs-proof-<pid>-<nonce>.stage` siblings (`arm_abandoned_dimacs_proof_sweep`)
+/// and what `ay-pb` does for `PROOFFILE.tmp-*` under its SIGTERM watchdog.
+/// A SIGKILL still strands the file; nothing in the process can prevent that.
+static LIVE_ARTIFACT_TEMP_PATHS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Infix every temporary name reserved by THIS process carries. `ay` supervises
+/// each solve behind a `fork()`, so a child inherits a copy of the list above;
+/// only the process whose PID names the file may unlink it.
+fn artifact_temp_owner_infix() -> String {
+    format!(".tmp-{}-", std::process::id())
+}
+
+fn register_live_artifact_temp_path(path: &std::path::Path) {
+    arm_artifact_temp_sweep();
+    LIVE_ARTIFACT_TEMP_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+}
+
+fn unregister_live_artifact_temp_path(path: &std::path::Path) {
+    LIVE_ARTIFACT_TEMP_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|registered| registered != path);
+}
+
+/// Arm the process-exit sweep, lazily: a run that never reserves an artifact
+/// pays nothing.
+fn arm_artifact_temp_sweep() {
+    static ARMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ARMED.get_or_init(|| {
+        if !ay_sys::at_process_exit(sweep_live_artifact_temp_paths) {
+            safe_eprintln!(
+                "c Warning: could not arm the artifact staging sweep; an abnormal exit will strand its temporary file"
+            );
+        }
+    });
+}
+
+extern "C" fn sweep_live_artifact_temp_paths() {
+    // `try_lock`, never `lock`: the exiting thread may already hold this lock,
+    // and hanging the process at exit is far worse than stranding one file.
+    let Ok(paths) = LIVE_ARTIFACT_TEMP_PATHS.try_lock() else {
+        return;
+    };
+    let owner = artifact_temp_owner_infix();
+    for path in paths.iter() {
+        let owned_by_this_process = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.contains(&owner));
+        if owned_by_this_process {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn create_artifact_temp_file_from_nonce(
     target: &std::path::Path,
     process_id: u32,
     first_nonce: u64,
-) -> io::Result<(std::path::PathBuf, std::fs::File)> {
+) -> io::Result<(ArtifactTempReservation, std::fs::File)> {
     for offset in 0..ARTIFACT_TEMP_CREATE_ATTEMPTS {
         let candidate =
             artifact_temp_candidate(target, process_id, first_nonce.wrapping_add(offset))?;
@@ -6798,7 +8360,7 @@ fn create_artifact_temp_file_from_nonce(
             .create_new(true)
             .open(&candidate)
         {
-            Ok(file) => return Ok((candidate, file)),
+            Ok(file) => return Ok((ArtifactTempReservation::new(candidate), file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -6813,15 +8375,15 @@ fn create_artifact_temp_file_from_nonce(
 
 fn create_artifact_temp_file(
     target: &std::path::Path,
-) -> io::Result<(std::path::PathBuf, std::path::PathBuf, std::fs::File)> {
+) -> io::Result<(std::path::PathBuf, ArtifactTempReservation, std::fs::File)> {
     use std::sync::atomic::Ordering;
 
     let resolved_target = resolve_artifact_target(target)?;
     let first_nonce =
         ARTIFACT_TEMP_NONCE.fetch_add(ARTIFACT_TEMP_CREATE_ATTEMPTS, Ordering::Relaxed);
-    let (temp_path, file) =
+    let (reservation, file) =
         create_artifact_temp_file_from_nonce(&resolved_target, std::process::id(), first_nonce)?;
-    Ok((resolved_target, temp_path, file))
+    Ok((resolved_target, reservation, file))
 }
 
 pub(crate) fn write_artifact_atomically(
@@ -6854,10 +8416,12 @@ fn write_artifact_with_publication(
     write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
     publish: fn(&std::path::Path, &std::path::Path) -> io::Result<()>,
 ) -> io::Result<std::fs::File> {
-    let (resolved_target, temp_path, mut file) = create_artifact_temp_file(target)?;
+    let (resolved_target, mut reservation, mut file) = create_artifact_temp_file(target)?;
     let write_result = write(&mut file).and_then(|()| file.sync_all());
-    let result = write_result.and_then(|()| publish(&temp_path, &resolved_target));
+    let result = write_result.and_then(|()| publish(reservation.path(), &resolved_target));
     if let Err(error) = result {
+        // `reservation` is still armed on this early return, so its `Drop`
+        // unlinks the unpublished temp file on the way out.
         let invalidation = invalidate_retained_artifact(&file);
         return Err(match invalidation {
             Ok(()) => error,
@@ -6866,6 +8430,7 @@ fn write_artifact_with_publication(
             )),
         });
     }
+    reservation.commit();
     Ok(file)
 }
 
@@ -6893,11 +8458,26 @@ struct ProofDigestWriter<W> {
 }
 
 impl<W> ProofDigestWriter<W> {
-    fn with_self_check(inner: W, scope: Option<ay_proof::ProblemScope>) -> Self {
+    /// The writer `write_alethe_proof` streams `executor`'s document through:
+    /// the round-trip check reads it in the dialect the executor renders it
+    /// in (`--alethe-dialect`).
+    fn for_executor(inner: W, scope: Option<ay_proof::ProblemScope>, executor: &Executor) -> Self {
+        Self::with_self_check(inner, scope, executor.alethe_dialect())
+    }
+
+    /// `dialect` is the one the document is rendered in: its checker fixes
+    /// the rule vocabulary the round-trip check accepts (`dt_project` only in
+    /// [`ay_proof::AletheDialect::Clean`]).
+    fn with_self_check(
+        inner: W,
+        scope: Option<ay_proof::ProblemScope>,
+        dialect: ay_proof::AletheDialect,
+    ) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
-            self_check: scope.map(ay_proof::AletheDocumentChecker::new),
+            self_check: scope
+                .map(|scope| ay_proof::AletheDocumentChecker::new(scope).with_dialect(dialect)),
             self_check_defect: None,
         }
     }
@@ -7117,6 +8697,82 @@ enum AletheProofPublication {
     Fatal(String),
 }
 
+/// The publication of an UNSAT that stands while its problem may carry no
+/// artifact: an `(error ...)` earlier in this problem (until `(reset)`), or a
+/// dropped assertion, and no certificate may embed source that failed
+/// continued execution (`public_unsat_artifacts_allowed`).
+///
+/// An UNSAT that was not held back needs no certificate: it is already on the
+/// regular channel and the run writes none. One held back for its certificate
+/// (`holds_unsat_publication`) gets the answer its posture gives any
+/// certificate that cannot be published, as an I/O failure does
+/// (`write_alethe_proof`): under strict proofs, in either spelling, this
+/// query's one response is `unknown` and the run goes on; a required
+/// certificate (`--proof`, `--proof-artifact`, `--emit-firewall-lean`) fails
+/// the run loudly, naming the cause. Measured before this: the held UNSAT
+/// reached publication with no transaction prepared, and every such run exited
+/// 1 with no response to this `check-sat` and none to the rest of the script
+/// ("SMT UNSAT artifacts were not prepared before publication"), under the
+/// flag on main aba6406be and under the in-script option once it held its
+/// UNSAT back too.
+fn unsat_publication_without_artifact_authority(
+    transcript: &SmtTranscriptState,
+    proof_config: &ProofConfig,
+) -> AletheProofPublication {
+    if transcript.pending_unsat_output.is_none() {
+        return AletheProofPublication::Ready(None);
+    }
+    let cause = "a command earlier in this problem failed, and no certificate may embed source that failed continued execution";
+    match SmtUnsatProofPosture::of(Some(proof_config)) {
+        SmtUnsatProofPosture::DefaultCertificate => AletheProofPublication::RejectToUnknown {
+            reason: "(incomplete proof-publication-failed)".to_string(),
+            diagnostic: format!(
+                "strict proof mode rejected UNSAT because {} cannot be published: {cause}",
+                proof_config.path
+            ),
+        },
+        SmtUnsatProofPosture::RequiredCertificate | SmtUnsatProofPosture::NoCertificate => {
+            AletheProofPublication::Fatal(format!(
+                "{}, but it cannot be published: {cause}",
+                required_certificate_request(proof_config)
+            ))
+        }
+    }
+}
+
+/// Whether the default certificate could not be published because this run
+/// already wrote `<input>.alethe` for an earlier query. A run publishes one
+/// default certificate and never replaces a file, so the second query finds
+/// its own run's file there; calling it a stale file from an earlier run, as
+/// the generic message does, sent a reader looking for the wrong file.
+fn default_certificate_taken_by_this_run(
+    transcript: &SmtTranscriptState,
+    proof_config: &ProofConfig,
+    error: &io::Error,
+) -> bool {
+    proof_config.synthesized_default
+        && error.kind() == io::ErrorKind::AlreadyExists
+        && transcript.default_certificate_created.get()
+}
+
+/// The command-line request that makes `proof_config`'s certificate required,
+/// with that request's own target and the certificate it requires. Naming the
+/// certificate alone read as if `--proof-artifact` or `--emit-firewall-lean`
+/// had asked for the default `<input>.alethe` by name.
+fn required_certificate_request(proof_config: &ProofConfig) -> String {
+    let certificate = &proof_config.path;
+    if let Some(dir) = crate::FIREWALL_LEAN_DIR.get() {
+        format!(
+            "--emit-firewall-lean {} requires the certificate {certificate}",
+            dir.display()
+        )
+    } else if let Some(artifact) = proof_config.artifact_path.as_deref() {
+        format!("--proof-artifact {artifact} requires the certificate {certificate}")
+    } else {
+        format!("--proof requires {certificate}")
+    }
+}
+
 fn write_alethe_proof(
     executor: &Executor,
     transcript: &SmtTranscriptState,
@@ -7125,7 +8781,7 @@ fn write_alethe_proof(
     theory: ProofArtifactTheoryMetadata,
 ) -> AletheProofPublication {
     if !transcript.public_unsat_artifacts_allowed() {
-        return AletheProofPublication::Ready(None);
+        return unsat_publication_without_artifact_authority(transcript, proof_config);
     }
     if proof_config.format != ProofFormat::Alethe {
         return AletheProofPublication::Fatal(format!(
@@ -7136,11 +8792,17 @@ fn write_alethe_proof(
     if !executor.last_result_is_unsat() {
         return AletheProofPublication::Ready(None);
     }
+    // Strict in either spelling, as requested when this query was answered
+    // (`holds_unsat_publication`): the ONE value every strict gate of this
+    // publication reads. The executor's live option may have changed since
+    // (an option set after the `check-sat` applies to later queries only), so
+    // none of them re-reads it here.
+    let query_strict = transcript.query_strict_proofs_requested();
     // #8759: In strict-proof mode, suppress proof file writing when the
     // terminal derivation rides on a trust fallback. The CLI has already
     // printed `unknown` + `(:reason-unknown (incomplete proof-trusted))`;
     // emitting a trust-tainted "UNSAT proof" would contradict that verdict.
-    if strict_proofs_enabled() && terminal_trust_detected(executor) {
+    if strict_derivation_screen_refuses(query_strict, executor) {
         return AletheProofPublication::Ready(None);
     }
     // #8821: Use the fallible API so printer errors (e.g., missing Farkas
@@ -7161,8 +8823,8 @@ fn write_alethe_proof(
     let default_only = proof_config.synthesized_default
         && proof_config.artifact_path.is_none()
         && !proof_required_by_firewall;
-    let optional_default = default_only && !strict_proofs_enabled();
-    let strict_default = default_only && strict_proofs_enabled();
+    let strict_default = default_only && query_strict;
+    let optional_default = default_only && !strict_default;
     // #rss-vs-z3: STREAM the certificate to disk instead of materializing it
     // as one in-memory String. Large default-mode certificates (pgm_protocol.4
     // renders 785MB of Alethe) transiently held ~1.5x their size in RAM during
@@ -7173,9 +8835,64 @@ fn write_alethe_proof(
     // certificate ever appears at the target path, and a pre-existing file
     // there is left untouched on failure.
     if executor.last_proof().is_none() {
+        // #evidence-stage-3. Attribute BEFORE the posture split, so the record
+        // is the same event whether the verdict publishes or downgrades — the
+        // refusal is identical either way, exactly as `disclose_refused_artifact`
+        // already argues for its own line.
+        disclose_proof_decline_with_fallback(
+            executor,
+            &proof_config.path,
+            DeclinePrecedence::AssemblyOutranksRender,
+            || ProofDeclineMechanism::NoDerivationRecorded,
+        );
+        disclose_unsat_corroboration(executor);
         if optional_default {
+            // Name the authority even here — ESPECIALLY here. A published UNSAT
+            // with no artifact at all used to disclose nothing about what backs
+            // it, which is the worst place for the record to go quiet: measured
+            // 2026-09-06, 2 of the 10 `--self-check` UNSATs in a seeded 60-file
+            // sweep landed on this branch, each certified by an independent lane
+            // that no line of output named.
+            // CORRECTED at #evidence-stage-3. This used to read "UNSAT produced
+            // no reconstructable proof", and that sentence is FALSE for both of
+            // the lanes that dominate this branch. On the closed-sentence
+            // semantic-certificate lane a checked derivation is computed and
+            // then discarded, because the certificate family has no
+            // authored-scope Alethe presentation. On the quantifier firewall a
+            // complete `CheckedSatRefutation` is minted and then DELETED,
+            // because one leaf names a solver-invented constant. In both, a
+            // refutation was produced; what is missing is a renderable
+            // authored-scope form of it. Saying "no reconstructable proof" told
+            // a reader the search came up empty, which is the opposite of the
+            // truth and the wrong repair to go looking for.
+            //
+            // CORRECTED AGAIN 2026-09-11 (#semantic-token census): for the
+            // closed-sentence lane "a checked derivation is computed and then
+            // discarded" is itself too generous. Measured at the mint on 23 of
+            // 23 files at two fresh seeds, the token holds leaf obligations
+            // over a term-construction residue of the authored assertion, and
+            // no derivation from the authored text ever existed in AY. The
+            // `ay.proof.semantic-token` line beside the decline says exactly
+            // what was held.
+            //
+            // The honest claim is narrow: no derivation was RETAINED for this
+            // artifact. Which machinery let go of it is on the
+            // `ay.proof.decline` line printed immediately above.
+            // #certify-before-presentation: here a derivation WAS retained and
+            // went to certification; only its authored-surface document was
+            // withheld by the bound the decline line names. Saying "no
+            // derivation was retained" would understate what was checked.
+            let why = if executor.last_unsat_document_withheld_by().is_some() {
+                "a derivation was retained and handed to certification, but its authored-surface document was withheld by the presentation bound the ay.proof.decline line above names, so no file is written for an external checker"
+            } else {
+                "no derivation was retained for this UNSAT; the ay.proof.decline line above names which machinery let go of it — for several lanes a checked refutation existed and had no renderable authored-scope form"
+            };
             safe_eprintln!(
-                "c warning: no proof certificate emitted (UNSAT produced no reconstructable proof); pass --strict-proofs to require one"
+                "c warning: no proof certificate emitted ({why}); the verdict was admitted by unsat_admission={} {}; pass --strict-proofs to require a certificate instead",
+                executor
+                    .last_command_unsat_admission_tag()
+                    .unwrap_or("none-recorded"),
+                unsat_evidence_fields(executor),
             );
             return AletheProofPublication::Ready(None);
         }
@@ -7183,21 +8900,14 @@ fn write_alethe_proof(
             return AletheProofPublication::RejectToUnknown {
                 reason: "(incomplete proof-unavailable)".to_string(),
                 diagnostic: format!(
-                    "strict proof mode rejected UNSAT because {} has no reconstructable proof",
+                    "strict proof mode rejected UNSAT because no derivation was retained for {}",
                     proof_config.path
                 ),
             };
         }
-        let request = if proof_required_by_firewall {
-            "--emit-firewall-lean"
-        } else if proof_config.artifact_path.is_some() {
-            "--proof-artifact"
-        } else {
-            "--proof"
-        };
         return AletheProofPublication::Fatal(format!(
-            "{request} requires {}, but UNSAT produced no reconstructable proof",
-            proof_config.path
+            "{}, but no derivation was retained for this UNSAT",
+            required_certificate_request(proof_config)
         ));
     }
     let target_path = std::path::Path::new(&proof_config.path);
@@ -7209,13 +8919,32 @@ fn write_alethe_proof(
         }
     };
     let mut self_check_verdict = None;
+    let mut carcara_surface = None;
     let stream_result = match create_artifact_temp_file(target_path) {
-        Ok((resolved_target, created_temp_path, file)) => {
-            let mut writer = ProofDigestWriter::with_self_check(
+        Ok((resolved_target, mut reservation, file)) => {
+            let mut writer = ProofDigestWriter::for_executor(
                 BufWriter::with_capacity(1 << 20, file),
                 self_check_scope,
+                executor,
             );
-            let render = executor.try_export_last_proof_alethe_for_problem_scope_to(&mut writer);
+            // The surface verdict describes exactly these bytes: the export
+            // captures their dialect report around this render. A step whose
+            // authored spelling no certified bridge relates to the checked
+            // internal step prints as the honest `hole` over its clause
+            // (counted in `unproved_steps`; strict rigor withholds the
+            // verdict) instead of refusing the document, which cost an
+            // explicit `--proof FILE` its `unsat` (#8821;
+            // `ay_proof::with_refused_surface_steps_declined_to_hole`).
+            let render = ay_proof::with_refused_surface_steps_declined_to_hole(|| {
+                executor.try_export_last_proof_alethe_for_problem_scope_to_with_carcara_surface(
+                    &mut writer,
+                )
+            })
+            .map(|streamed| {
+                streamed.map(|surface| {
+                    carcara_surface = Some(surface);
+                })
+            });
             match render {
                 Some(Ok(())) => {
                     use std::io::Write as _;
@@ -7247,10 +8976,18 @@ fn write_alethe_proof(
                         Ok(()) => match writer.into_inner().into_inner() {
                             Ok(file) => {
                                 match publish_artifact_temp_noreplace(
-                                    &created_temp_path,
+                                    reservation.path(),
                                     &resolved_target,
                                 ) {
-                                    Ok(()) => Ok((proof_digest, file, resolved_target)),
+                                    Ok(()) => {
+                                        // Published: the temp name is gone, so
+                                        // the reservation must not unlink it.
+                                        reservation.commit();
+                                        if proof_config.synthesized_default {
+                                            transcript.default_certificate_created.set(true);
+                                        }
+                                        Ok((proof_digest, file, resolved_target))
+                                    }
                                     Err(error) => Err(alethe_error_after_invalidation(
                                         ay_proof::AletheStreamError::Io(error),
                                         &file,
@@ -7260,30 +8997,24 @@ fn write_alethe_proof(
                             Err(error) => {
                                 let primary =
                                     io::Error::new(error.error().kind(), error.error().to_string());
-                                let buffered = error.into_inner();
+                                let (file, _discarded) = error.into_inner().into_parts();
                                 Err(alethe_error_after_invalidation(
                                     ay_proof::AletheStreamError::Io(primary),
-                                    buffered.get_ref(),
+                                    &file,
                                 ))
                             }
                         },
-                        Err(error) => Err(alethe_error_after_invalidation(
-                            error,
-                            writer.inner().get_ref(),
-                        )),
+                        Err(error) => Err(alethe_error_after_abandoning_buffer(error, writer)),
                     }
                 }
-                Some(Err(error)) => Err(alethe_error_after_invalidation(
-                    error,
-                    writer.inner().get_ref(),
-                )),
-                None => Err(alethe_error_after_invalidation(
+                Some(Err(error)) => Err(alethe_error_after_abandoning_buffer(error, writer)),
+                None => Err(alethe_error_after_abandoning_buffer(
                     ay_proof::AletheStreamError::Print(
                         ay_proof::AlethePrintError::UnavailableAuthenticatedSurface {
                             reason: "proof export returned no artifact despite a retained proof",
                         },
                     ),
-                    writer.inner().get_ref(),
+                    writer,
                 )),
             }
         }
@@ -7313,9 +9044,48 @@ fn write_alethe_proof(
     let (proof_digest, proof_file, proof_path) = match stream_result {
         Ok(publication) => publication,
         Err(ay_proof::AletheStreamError::Print(error)) => {
+            disclose_refused_artifact("render", &proof_config.path, &error);
+            // #evidence-stage-3 — AHEAD OF THE RENDER MESSAGE, and that order is
+            // the whole fix for the floating-point family.
+            //
+            // The pinned-Carcara sort screen runs inside `prepare_proof`, before
+            // a single step is emitted. On an FP query the lane bit-blasts with
+            // proof output OFF, records no clause trace, and closes the
+            // refutation with one bare trust lemma — so there is no derivation
+            // to print and the sort screen is merely the first gate to speak.
+            // Measured over 64 FP-family UNSATs: ZERO print as
+            // `proof-unrenderable` under `--rigor strict`; 41 are rejected by
+            // AY's own self-check and 23 by trust detection. The surface is
+            // never the binding constraint, and reporting it as the cause sent
+            // the census after a printer bridge that would have recovered
+            // nothing.
+            //
+            // So consult what declined EARLIER first, and fall through to the
+            // render only when nothing did.
+            disclose_proof_decline_with_fallback(
+                executor,
+                &proof_config.path,
+                DeclinePrecedence::AssemblyOutranksRender,
+                || mechanism_from_print_error(&error),
+            );
+            disclose_unsat_corroboration(executor);
             if optional_default {
+                // Same reason as the no-derivation branch above: when no
+                // document is written, the admission tag is the ONLY record of
+                // what the verdict rests on.
+                //
+                // CORRECTED at #evidence-stage-3. "proof not fully checkable"
+                // asserts that a proof exists and merely fell short of full
+                // checkability. For the FP family that is false — there is no
+                // derivation at all — and the sentence sent every reader to the
+                // printer. The refusal is now stated as what it is, a refusal AT
+                // the render, with the cause named on the line above.
                 safe_eprintln!(
-                    "c warning: no proof certificate emitted (proof not fully checkable: {error}); pass --strict-proofs to require one"
+                    "c warning: no proof certificate emitted (the render refused the artifact: {error}); a render refusal is the first gate to fire, not necessarily the cause — the ay.proof.decline line above names the cause; the verdict was admitted by unsat_admission={} {}; pass --strict-proofs to require a certificate instead",
+                    executor
+                        .last_command_unsat_admission_tag()
+                        .unwrap_or("none-recorded"),
+                    unsat_evidence_fields(executor),
                 );
                 return AletheProofPublication::Ready(None);
             }
@@ -7340,6 +9110,21 @@ fn write_alethe_proof(
             });
         }
         Err(ay_proof::AletheStreamError::Io(error)) => {
+            disclose_refused_artifact("write", &proof_config.path, &error);
+            // #evidence-stage-3. A write failure says nothing about the
+            // derivation, and this is the one branch where that matters: the
+            // verdict is still unevidenced from the corpus's point of view, so
+            // it must carry a mechanism, and the mechanism must not be mistaken
+            // for a producer defect. An earlier decline still outranks it.
+            disclose_proof_decline_with_fallback(
+                executor,
+                &proof_config.path,
+                DeclinePrecedence::AssemblyOutranksRender,
+                || ProofDeclineMechanism::CertificateWriteFailed,
+            );
+            disclose_unsat_corroboration(executor);
+            let taken_by_this_run =
+                default_certificate_taken_by_this_run(transcript, proof_config, &error);
             if optional_default {
                 // A synthesized-default certificate is optional and AY-specific (z3
                 // writes no proof by default). A write failure — most commonly a
@@ -7349,19 +9134,35 @@ fn write_alethe_proof(
                 // as the render-failure branches above do for the default case.
                 // (Previously this exited 1 with a correct `unsat` on stdout, which
                 // broke every read-only deployment.)
-                safe_eprintln!(
-                    "c warning: could not publish a same-run default proof file {} ({error}); any pre-existing file was preserved and is stale for this run; UNSAT verdict is unaffected",
-                    proof_config.path,
-                );
+                let unpublished = if taken_by_this_run {
+                    format!(
+                        "no default proof file for this UNSAT: {} was already written by this run for an earlier query, and AY never replaces a file",
+                        proof_config.path,
+                    )
+                } else {
+                    format!(
+                        "could not publish a same-run default proof file {} ({error}); any pre-existing file was preserved and is stale for this run",
+                        proof_config.path,
+                    )
+                };
+                safe_eprintln!("c warning: {unpublished}; UNSAT verdict is unaffected");
                 return AletheProofPublication::Ready(None);
             }
             if strict_default {
-                return AletheProofPublication::RejectToUnknown {
-                    reason: "(incomplete proof-publication-failed)".to_string(),
-                    diagnostic: format!(
+                let diagnostic = if taken_by_this_run {
+                    format!(
+                        "strict proof mode rejected UNSAT because {} was already written by this run for an earlier query, and AY never replaces a file",
+                        proof_config.path
+                    )
+                } else {
+                    format!(
                         "strict proof mode rejected UNSAT because {} could not be published: {error}",
                         proof_config.path
-                    ),
+                    )
+                };
+                return AletheProofPublication::RejectToUnknown {
+                    reason: "(incomplete proof-publication-failed)".to_string(),
+                    diagnostic,
                 };
             }
             return AletheProofPublication::Fatal(format!(
@@ -7370,6 +9171,11 @@ fn write_alethe_proof(
             ));
         }
     };
+    if let Some(withheld) =
+        strict_certificate_withheld(query_strict, executor, proof_config, &proof_file)
+    {
+        return withheld;
+    }
     // PUBLICATION DISCLOSURE. Exit 0 reports the VERDICT; it has never been a
     // statement about the certificate. Without `--strict-proofs` a certificate
     // that still carries `hole` steps is published anyway (it is the honest
@@ -7378,7 +9184,7 @@ fn write_alethe_proof(
     // never *valid*. Say so on the record, naming exactly which checks AY ran
     // and how they came out, so a zero exit status cannot be misread as
     // "externally checkable".
-    disclose_alethe_certificate(executor, &proof_config.path);
+    disclose_alethe_certificate(executor, &proof_config.path, carcara_surface.as_ref());
     let proof_publication = match RetainedPublication::new(
         proof_file,
         proof_path,
@@ -7386,6 +9192,7 @@ fn write_alethe_proof(
     ) {
         Ok(publication) => publication,
         Err(error) => {
+            disclose_refused_artifact("seal", &proof_config.path, &error);
             if optional_default {
                 safe_eprintln!(
                         "c warning: same-run optional default proof could not be sealed ({error}); UNSAT verdict is unaffected"
@@ -7446,6 +9253,7 @@ fn write_alethe_proof(
     );
     if let Err(error) = publication.validate() {
         let invalidation = publication.invalidate_exact();
+        disclose_refused_artifact("authority", &proof_config.path, &error);
         if optional_default {
             safe_eprintln!(
                 "c warning: same-run optional default proof lost publication authority ({error}{invalidation}); UNSAT verdict is unaffected"
@@ -7457,6 +9265,26 @@ fn write_alethe_proof(
         ));
     }
     AletheProofPublication::Ready(Some(Box::new(publication)))
+}
+
+/// Abandon a partially rendered certificate: take the file back out of its
+/// buffered writer WITHOUT flushing, then invalidate that exact descriptor.
+///
+/// Discarding the buffer is load-bearing, not tidiness. `BufWriter::drop`
+/// flushes at the file's CURRENT offset, so plainly dropping the writer after
+/// [`invalidate_retained_artifact`] truncated the inode wrote the buffered
+/// tail back at the pre-truncation offset: measured on the QF_UF
+/// `iso_brn492` emission-budget abandonment, the "invalidated" temp file was
+/// a 29,182,083-byte sparse file still holding the last megabyte of the
+/// discarded proof text (996 KB of real blocks). The caller's
+/// [`ArtifactTempReservation`] then unlinks the path; this makes the inode
+/// itself empty even for anyone still holding it open.
+fn alethe_error_after_abandoning_buffer(
+    primary: ay_proof::AletheStreamError,
+    writer: ProofDigestWriter<BufWriter<std::fs::File>>,
+) -> ay_proof::AletheStreamError {
+    let (file, _discarded) = writer.into_inner().into_parts();
+    alethe_error_after_invalidation(primary, &file)
 }
 
 fn alethe_error_after_invalidation(
@@ -7611,10 +9439,17 @@ fn finalize_smt_unsat_artifacts(
     problem: ProofArtifactProblem<'_>,
     theory: ProofArtifactTheoryMetadata,
 ) {
+    // Whether this query's UNSAT is still held back (`publish_pending_smt_unsat`)
+    // or already on the regular channel. Decided when the query was answered,
+    // under the strict request in force then (`holds_unsat_publication`).
+    let unsat_held = transcript.pending_unsat_output.is_some();
+    // A held UNSAT is settled here even when its problem may carry no
+    // artifact: leaving it unprepared would fail its publication, with no
+    // response to the query (`unsat_publication_without_artifact_authority`).
     if !matches!(
         &transcript.smt_unsat_publication,
         SmtUnsatPublicationState::Unprepared
-    ) || !transcript.public_unsat_artifacts_allowed()
+    ) || (!unsat_held && !transcript.public_unsat_artifacts_allowed())
     {
         return;
     }
@@ -7624,13 +9459,16 @@ fn finalize_smt_unsat_artifacts(
     };
     match write_alethe_proof(executor, transcript, proof_config, problem, theory) {
         AletheProofPublication::Ready(publication) => {
-            if transcript.defer_unsat_publication {
+            if unsat_held {
                 transcript.smt_unsat_publication = match publication {
                     Some(publication) => SmtUnsatPublicationState::Prepared(publication),
                     None => SmtUnsatPublicationState::ReadyWithoutArtifacts,
                 };
             } else {
-                if required_smt_unsat_publication(Some(proof_config)) {
+                if required_smt_unsat_publication(
+                    Some(proof_config),
+                    transcript.query_script_strict,
+                ) {
                     fail_required_unsat_publication(
                         transcript,
                         "required SMT UNSAT publication was not deferred before output",
@@ -7651,6 +9489,17 @@ fn finalize_smt_unsat_artifacts(
             }
         }
         AletheProofPublication::RejectToUnknown { reason, diagnostic } => {
+            if !unsat_held {
+                // This query's `unsat` is already on the regular channel. A
+                // second response to the same command would retract it, so
+                // fail loudly instead (the Ready arm's guard, for this arm).
+                fail_required_unsat_publication(
+                    transcript,
+                    format!(
+                        "{diagnostic}, but this query's unsat is already published and a second response cannot retract it"
+                    ),
+                );
+            }
             safe_eprintln!("c warning: {diagnostic}; publishing unknown");
             let downgraded = executor.reject_last_unsat_as_unknown();
             debug_assert!(downgraded, "strict proof rejection started from UNSAT");
@@ -7704,6 +9553,10 @@ fn publish_pending_smt_unsat(
     match result {
         Ok(true) => {
             super::mark_verdict_printed();
+            // The deferred line is an `unsat`: decisive, so a deadline after
+            // it is teardown overrun, not a failure to decide (the immediate
+            // publication path records the same).
+            super::mark_decisive_verdict_printed();
         }
         Ok(false) => {}
         Err(error) => fail_required_unsat_publication(transcript, error),
@@ -7830,77 +9683,6 @@ fn reject_bv_cnf_export_for_non_smt_route(route: &str) {
         ));
     }
     std::process::exit(1);
-}
-
-/// Incremental, lexing-aware paren-depth tracker for the line-by-line stdin
-/// reader (#inc-lra-parse).
-///
-/// The line-by-line loop accumulates physical lines into a buffer and must
-/// decide when the buffer holds one or more *complete* top-level commands
-/// before it hands the buffer to the (O(buffer)) `parse`. The historical gate
-/// re-scanned the entire buffer every line (via `parse` + a naive
-/// `matches('(')` count), which is O(command_lines × command_bytes) — quadratic
-/// on the giant multi-line asserts emitted by BMC k-unrolling (a single assert
-/// can span thousands of lines), and the dominant cost on incremental QF_LRA.
-///
-/// This tracker maintains the running SMT-LIB paren depth by scanning only each
-/// *newly appended* line, correctly skipping `;` line comments, `"…"` string
-/// literals (with `""` escape), and `|…|` quoted symbols — all of which may
-/// carry an unbalanced paren and the latter two of which may span lines. When
-/// the depth is `> 0` the command is provably incomplete, so the loop keeps
-/// reading without touching `parse`, turning the accumulation into O(bytes).
-///
-/// Soundness: this only decides *when* to attempt a parse — never the parse
-/// result. When the depth reaches `<= 0` the existing `parse` + naive-paren
-/// recovery runs exactly as before, so a mis-tracked depth can at worst trigger
-/// a parse that then self-heals through the unchanged error path.
-/// `--no-inc-linear-parse` restores parse-every-line behavior.
-#[derive(Default)]
-struct IncrementalDepth {
-    depth: i64,
-    in_string: bool,
-    in_pipe: bool,
-}
-
-impl IncrementalDepth {
-    /// Fold one freshly read physical line (including any trailing newline)
-    /// into the running paren depth.
-    fn feed(&mut self, line: &str) {
-        let b = line.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            let c = b[i];
-            if self.in_string {
-                if c == b'"' {
-                    // `""` inside a string literal is an escaped quote: stay in.
-                    if i + 1 < b.len() && b[i + 1] == b'"' {
-                        i += 2;
-                        continue;
-                    }
-                    self.in_string = false;
-                }
-                i += 1;
-                continue;
-            }
-            if self.in_pipe {
-                if c == b'|' {
-                    self.in_pipe = false;
-                }
-                i += 1;
-                continue;
-            }
-            match c {
-                // Line comment: the rest of this physical line is inert.
-                b';' => break,
-                b'"' => self.in_string = true,
-                b'|' => self.in_pipe = true,
-                b'(' => self.depth += 1,
-                b')' => self.depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-    }
 }
 
 /// What an interactive session shows a HUMAN, as distinct from what it streams.
@@ -8074,6 +9856,7 @@ pub(super) fn run_interactive(
                 validate,
                 stats_cfg,
                 proof_config,
+                false,
             );
             return;
         }
@@ -8092,6 +9875,7 @@ pub(super) fn run_interactive(
                 validate,
                 stats_cfg,
                 proof_config,
+                false,
             );
             return;
         }
@@ -8126,6 +9910,36 @@ pub(super) fn run_interactive(
     );
 }
 
+/// Configure an SMT-LIB session executor that emits no proof and serves no
+/// mandatory result gate.
+fn configure_unproved_smt_executor(executor: &mut Executor) {
+    // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
+    // competition mode, or stdin with nothing to name a sidecar after),
+    // and no mandatory result/artifact gate needs the internal proof
+    // surface: skip retaining a deep parsed-AST clone of every assertion
+    // (~190 MB of a 318 MB peak on a 6 MB QF_UF input, #rss-vs-z3). An
+    // in-script `(set-option :produce-proofs true)` re-enables retention.
+    // The check-sat-time definitional-forall pass (#defmacro-named-preuse)
+    // gets its own parsed copy, bounded to the node budget its
+    // re-elaboration honours anyway, so a small problem still decides
+    // exactly as it does for a library embedder while the retention
+    // switch — which is also load-bearing for the certification funnel's
+    // lane choice — stays off.
+    executor.set_retain_parsed_assertions(false);
+    executor
+        .set_definitional_pass_parsed_budget(ay_frontend::CHECK_SAT_ADOPTION_MAX_RETAINED_NODES);
+    // Whatever proof work a NON-shedding executor still does here (the
+    // mandatory certificate of a `--rigor standard` stdin session) is
+    // best-effort with no artifact behind it, so its bookkeeping meter
+    // must be the same budgeted one the synthesized-default file route
+    // uses — never `None`. An unbudgeted meter was the `--no-proof` trap:
+    // gensys_icl161 materialised a 122k-step proof and strict-checked
+    // 3.9M steps for an artifact nobody asked for. A shedding executor
+    // never consults it, and an explicit demand (`set_produce_proofs`,
+    // in-script `:produce-proofs`) keeps its unbudgeted slot by contract.
+    executor.set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
+}
+
 /// Drive SMT-LIB input command-by-command from `reader`, flushing stdout after
 /// every response so a pipe or coprocess peer sees each verdict immediately.
 ///
@@ -8149,13 +9963,15 @@ fn run_interactive_smt_stream(
 
     let mut stdout = io::stdout();
     let mut input_buffer = String::new();
-    // Running 1-based line number of the first line still in `input_buffer`, so
-    // errors report their true position in the whole session (z3's `-in` does not
-    // reset the line counter per command). Advanced by the lines consumed each
-    // time the buffer is parsed and cleared.
+    // Running 1-based line and column of the first character still in
+    // `input_buffer`, so errors report their true position in the whole
+    // session (z3's `-in` does not reset the line counter per command).
+    // Advanced past the text consumed each time the buffer is read.
     let mut line_base = 1usize;
-    // Linear-time completeness gate for the accumulation buffer (#inc-lra-parse).
-    // Default on; `--no-inc-linear-parse` restores parse-every-line.
+    let mut column_base = 1usize;
+    // The lexer state of `input_buffer`, fed line by line, finds the item
+    // still open at its end in time linear in the input (#inc-lra-parse).
+    // `--no-inc-linear-parse` rescans the whole buffer on every line instead.
     let linear_parse = !ay_core::misc_cli_flags().no_inc_linear_parse;
     let mut depth_scan = IncrementalDepth::default();
     let mut artifact_input = String::new();
@@ -8170,10 +9986,13 @@ fn run_interactive_smt_stream(
     let mut chc_stream_mode = false;
     let mut chc_problem_input = String::new();
     let mut chc_last_model: Option<String> = None;
+    // A problem-contributing command was dropped since the last reset, so a
+    // streamed CHC check-sat answers `unknown`.
+    let mut chc_problem_dropped = false;
     // Rewrite synthesized non-Alethe configs to Alethe for SMT
     // (Finding A in the development design notes).
     let adapted = adapt_proof_config_for_smt(proof_config);
-    transcript.defer_unsat_publication = required_smt_unsat_publication(adapted.as_ref());
+    transcript.unsat_proof_posture = SmtUnsatProofPosture::of(adapted.as_ref());
     seed_smt_transcript_protections_or_exit(&mut transcript, None, adapted.as_ref());
     let retain_artifact_input = visualization.is_some()
         || adapted
@@ -8195,25 +10014,17 @@ fn run_interactive_smt_stream(
         }
         configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
-        // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
-        // competition mode, or stdin with nothing to name a sidecar after),
-        // and no mandatory result/artifact gate needs the internal proof
-        // surface: skip retaining a deep parsed-AST clone of every assertion
-        // (~190 MB of a 318 MB peak on a 6 MB QF_UF input, #rss-vs-z3). An
-        // in-script `(set-option :produce-proofs true)` re-enables retention.
-        executor.set_retain_parsed_assertions(false);
-        // Whatever proof work a NON-shedding executor still does here (the
-        // mandatory certificate of a `--rigor standard` stdin session) is
-        // best-effort with no artifact behind it, so its bookkeeping meter
-        // must be the same budgeted one the synthesized-default file route
-        // uses — never `None`. An unbudgeted meter was the `--no-proof` trap:
-        // gensys_icl161 materialised a 122k-step proof and strict-checked
-        // 3.9M steps for an artifact nobody asked for. A shedding executor
-        // never consults it, and an explicit demand (`set_produce_proofs`,
-        // in-script `:produce-proofs`) keeps its unbudgeted slot by contract.
-        executor
-            .set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
+        configure_unproved_smt_executor(&mut executor);
     }
+
+    enable_session_replay_if_supported(&mut transcript, adapted.as_ref());
+    let rebuild_executor = || {
+        let mut executor = new_executor();
+        if !ResultGateRequests::current().any() {
+            configure_unproved_smt_executor(&mut executor);
+        }
+        executor
+    };
 
     loop {
         exit_if_timed_out_with_transcript_context(&transcript);
@@ -8222,7 +10033,11 @@ fn run_interactive_smt_stream(
             // stays column-aligned instead of stair-stepping. Dim, because the
             // brightest thing on the screen should be what the user typed.
             ReplSurface::Full => {
-                let prompt = if depth_scan.depth > 0 { "..>" } else { "ay>" };
+                let prompt = if depth_scan.open_item().is_some() {
+                    "..>"
+                } else {
+                    "ay>"
+                };
                 safe_print!("{} ", super::help_style::dim(prompt));
             }
             ReplSurface::Plain => safe_print!("> "),
@@ -8249,209 +10064,201 @@ fn run_interactive_smt_stream(
             input_buffer.push_str(&line);
         }
 
-        // Linear completeness gate: while the buffer's top-level parens are
-        // still open the command cannot be complete, so keep reading without
-        // re-lexing the whole (potentially multi-megabyte) buffer. This is the
-        // dominant cost on multi-line BMC asserts. See `IncrementalDepth`.
-        // The depth is fed for the PARSE gate when `linear_parse` is on, and for
-        // the CONTINUATION PROMPT whenever a human is watching — a session with
-        // `--no-inc-linear-parse` still deserves a `..>` that means something.
-        // Only the gate short-circuits, so the parse behaviour is unchanged.
-        if (linear_parse || surface == ReplSurface::Full) && !eof {
+        // z3 reads a command on across lines until it closes. Run the
+        // complete items before the one still open at the end of the
+        // buffer, and keep that one to read on; at end of input, read the
+        // rest as it is. See `IncrementalDepth`.
+        let ready = if eof {
+            input_buffer.len()
+        } else {
             depth_scan.feed(&line);
-            if linear_parse && depth_scan.depth > 0 {
-                continue;
+            let open = if linear_parse {
+                depth_scan.open_item()
+            } else {
+                IncrementalDepth::scan(&input_buffer).open_item()
+            };
+            match open {
+                Some(0) => continue,
+                Some(start) => start,
+                None => input_buffer.len(),
             }
-        }
-
-        match parse(&input_buffer) {
-            Ok(commands) => {
-                let command_sources = collect_command_sources_from_line(&input_buffer, line_base);
-                line_base += input_buffer.matches('\n').count();
-                input_buffer.clear();
-                depth_scan = IncrementalDepth::default();
-                for (cmd_index, cmd) in commands.iter().enumerate() {
-                    set_current_command_source(&mut transcript, &command_sources, cmd_index);
-                    if smt_logic.is_none() {
-                        smt_logic =
-                            logic_from_commands(std::slice::from_ref(cmd)).map(str::to_owned);
-                    }
-                    formula_stats.observe_command(cmd);
-                    let enters_horn = matches!(
-                        cmd,
-                        Command::SetLogic(logic) if logic.eq_ignore_ascii_case("HORN")
-                    );
-                    if chc_stream_mode || enters_horn {
-                        if !chc_stream_mode {
-                            reject_decision_trace_for_route("incremental CHC stdin");
-                            reject_bv_cnf_export_for_non_smt_route("incremental CHC stdin");
-                            reject_firewall_emission_for_route("incremental CHC stdin");
-                            reject_firewall_verification_for_route("incremental CHC stdin");
-                            reject_explicit_proof_verification_for_route(
-                                "incremental CHC",
-                                "CHC replay",
-                            );
-                            chc_stream_mode = true;
-                        }
-
-                        match cmd {
-                            Command::Exit => {
-                                cleanup_temp_proof(adapted.as_ref());
-                                return;
-                            }
-                            Command::Reset => {
-                                chc_stream_mode = false;
-                                chc_problem_input.clear();
-                                chc_last_model = None;
-                                formula_stats = FormulaStats::default();
-                                smt_logic = None;
-                            }
-                            Command::GetModel => match &chc_last_model {
-                                Some(model) => safe_print!("{model}"),
-                                None => safe_println!("(error \"model is not available\")"),
-                            },
-                            Command::CheckSat => {
-                                let mut solve_input = chc_problem_input.clone();
-                                solve_input.push_str("(check-sat)\n");
-                                chc_last_model = chc_runner::run_chc_from_content(
-                                    &solve_input,
-                                    verbose,
-                                    validate,
-                                    stats_cfg,
-                                    proof_config,
-                                );
-                            }
-                            _ => {
-                                if let Some(source) = command_sources.get(cmd_index) {
-                                    // Any accepted problem command starts a new
-                                    // model epoch. Serving the previously
-                                    // certified invariant after an assertion,
-                                    // rule, declaration, push, or pop would
-                                    // attach stale evidence to a changed CHC
-                                    // problem. A fresh check-sat is the only
-                                    // operation allowed to repopulate it.
-                                    chc_last_model = None;
-                                    chc_problem_input.push_str(&source.text);
-                                    if !source.text.ends_with('\n') {
-                                        chc_problem_input.push('\n');
-                                    }
-                                }
-                            }
-                        }
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    if matches!(cmd, Command::Exit) {
-                        publish_pending_smt_unsat(
-                            &mut executor,
-                            &mut transcript,
-                            adapted.as_ref(),
-                            ProofArtifactProblem::Text(&artifact_input),
-                            ProofArtifactTheoryMetadata::smt_lib(
-                                smt_logic.as_deref(),
-                                Some(&formula_stats),
-                            ),
-                        );
-                        finalize_smt_unsat_artifacts(
-                            &mut executor,
-                            &mut transcript,
-                            adapted.as_ref(),
-                            ProofArtifactProblem::Text(&artifact_input),
-                            ProofArtifactTheoryMetadata::smt_lib(
-                                smt_logic.as_deref(),
-                                Some(&formula_stats),
-                            ),
-                        );
-                        maybe_print_success(&transcript);
-                        maybe_explain(&mut executor, &transcript);
-                        maybe_visualize(&artifact_input, &mut executor, &transcript, visualization);
-                        if stats_cfg.any() {
-                            print_smt_stats(
-                                &executor,
-                                &transcript,
-                                Some(&formula_stats),
-                                stats_cfg,
-                            );
-                        }
-                        maybe_write_minimal_decision_trace(&mut transcript);
-                        cleanup_temp_proof(adapted.as_ref());
-                        exit_if_transcript_had_recoverable_error(&transcript);
-                        return;
-                    }
-                    if !execute_and_print(&mut executor, cmd, &mut transcript, true) {
-                        let _ = stdout.flush();
-                        exit_if_timed_out_with_transcript_context(&transcript);
-                        cleanup_temp_proof(adapted.as_ref());
-                        std::process::exit(1);
-                    }
-                    if matches!(cmd, Command::Reset) {
-                        // A successful reset begins a fresh artifact epoch. It
-                        // discards every prior accepted/rejected command and
-                        // keeps payload metadata scoped to the same problem.
-                        artifact_input.clear();
-                        formula_stats = FormulaStats::default();
-                        smt_logic = None;
-                    } else if retain_artifact_input {
-                        if let Some(source) = command_sources.get(cmd_index) {
-                            artifact_input.push_str(&source.text);
-                            if !source.text.ends_with('\n') {
-                                artifact_input.push('\n');
-                            }
-                        }
-                    }
-                    publish_pending_smt_unsat(
-                        &mut executor,
-                        &mut transcript,
-                        adapted.as_ref(),
-                        ProofArtifactProblem::Text(&artifact_input),
-                        ProofArtifactTheoryMetadata::smt_lib(
-                            smt_logic.as_deref(),
-                            Some(&formula_stats),
-                        ),
-                    );
-                    // Flush after each command so pipe consumers see responses
-                    // immediately (stdout is block-buffered when piped).
-                    let _ = stdout.flush();
-                    exit_if_timed_out_with_transcript_context(&transcript);
-                }
-            }
-            Err(e) => {
-                let opens = input_buffer.matches('(').count();
-                let closes = input_buffer.matches(')').count();
-                if eof || opens <= closes {
-                    // Balanced (or over-closed) buffer that still fails to
-                    // parse. `parse` is a pure function of the buffer, so
-                    // re-parsing the unchanged text can never succeed — report
-                    // the error we already have, mirroring file mode
-                    // (`run_smt_file_content`): a recoverable `(error "...")`
-                    // on the regular output channel, marked so the process
-                    // still exits non-zero. Clear the per-command source first
-                    // — it still points at the last successfully parsed
-                    // command from a previous batch and would misattribute
-                    // this error's position.
-                    transcript.current_source = Some(CommandSource {
-                        line: line_base,
-                        column: 1,
-                        text: input_buffer.clone(),
-                    });
-                    print_recoverable_parse_error(&mut transcript, &e);
-                    invalidate_export_after_malformed_decision(&input_buffer);
+        };
+        let consumed = &input_buffer[..ready];
+        let commands = read_stdin_commands(consumed, line_base, column_base);
+        (line_base, column_base) = position_after(consumed, line_base, column_base);
+        input_buffer.drain(..ready);
+        depth_scan.rebase(ready);
+        for item in commands {
+            let (cmd, source) = match item {
+                StdinCommand::Parsed(cmd, source) => (cmd, source),
+                StdinCommand::Dropped(err, source) => {
+                    let text = source.text.clone();
+                    set_current_source(&mut transcript, source);
+                    executor.observe_authored_dropped_source(&text);
+                    note_z3_session_failed_source(&mut transcript, &text);
+                    print_recoverable_parse_error(&mut transcript, &err);
+                    invalidate_export_after_malformed_decision(&text);
                     if transcript.exit_on_error {
                         cleanup_temp_proof(adapted.as_ref());
                         std::process::exit(1);
                     }
-                    // SOUNDNESS: mirror file mode — a problem-contributing
-                    // command (e.g. a malformed `assert`) was dropped, so a
-                    // later check-sat must fail closed to `unknown` instead of
-                    // answering on the incomplete remainder.
-                    if parse_drop_contributes_to_problem(&input_buffer) {
+                    // SOUNDNESS: a dropped problem-contributing command makes
+                    // a later check-sat fail closed to `unknown`, in CHC
+                    // streaming too.
+                    if parse_drop_contributes_to_problem(&text) {
                         mark_problem_incomplete(&mut executor, &mut transcript);
+                        chc_problem_dropped = true;
                     }
-                    line_base += input_buffer.matches('\n').count();
-                    input_buffer.clear();
-                    depth_scan = IncrementalDepth::default();
+                    if dropped_text_holds_a_query(&text) {
+                        withhold_answers_out_of_step(&mut executor, &mut transcript);
+                        chc_problem_dropped = true;
+                    }
+                    let _ = stdout.flush();
+                    exit_if_timed_out_with_transcript_context(&transcript);
+                    continue;
                 }
+            };
+            set_current_source(&mut transcript, source.clone());
+            let cmd: &Command = &cmd;
+            let source_text = source.text.as_str();
+            if smt_logic.is_none() {
+                smt_logic = logic_from_commands(std::slice::from_ref(cmd)).map(str::to_owned);
             }
+            formula_stats.observe_command(cmd);
+            executor.observe_authored_command_source(source_text);
+            let enters_horn = matches!(
+                cmd,
+                Command::SetLogic(logic) if logic.eq_ignore_ascii_case("HORN")
+            );
+            if chc_stream_mode || enters_horn {
+                if !chc_stream_mode {
+                    reject_decision_trace_for_route("incremental CHC stdin");
+                    reject_bv_cnf_export_for_non_smt_route("incremental CHC stdin");
+                    reject_firewall_emission_for_route("incremental CHC stdin");
+                    reject_firewall_verification_for_route("incremental CHC stdin");
+                    reject_explicit_proof_verification_for_route("incremental CHC", "CHC replay");
+                    chc_stream_mode = true;
+                }
+
+                match cmd {
+                    Command::Exit => {
+                        cleanup_temp_proof(adapted.as_ref());
+                        return;
+                    }
+                    Command::Reset => {
+                        chc_stream_mode = false;
+                        chc_problem_dropped = transcript.answers_out_of_step;
+                        chc_problem_input.clear();
+                        chc_last_model = None;
+                        formula_stats = FormulaStats::default();
+                        smt_logic = None;
+                    }
+                    Command::GetModel => match &chc_last_model {
+                        Some(model) => safe_print!("{model}"),
+                        None => safe_println!("(error \"model is not available\")"),
+                    },
+                    Command::CheckSat if chc_problem_dropped => {
+                        super::owe_response_for_new_query();
+                        chc_last_model = None;
+                        chc_runner::emit_chc_unknown_after_dropped_command(stats_cfg);
+                    }
+                    Command::CheckSat => {
+                        super::owe_response_for_new_query();
+                        let mut solve_input = chc_problem_input.clone();
+                        solve_input.push_str("(check-sat)\n");
+                        chc_last_model = chc_runner::run_chc_from_content(
+                            &solve_input,
+                            verbose,
+                            validate,
+                            stats_cfg,
+                            proof_config,
+                            executor.script_strict_proofs_requested(),
+                        );
+                    }
+                    _ => {
+                        // Any accepted problem command starts a new model
+                        // epoch. Serving the previously certified invariant
+                        // after an assertion, rule, declaration, push, or pop
+                        // would attach stale evidence to a changed CHC
+                        // problem. A fresh check-sat is the only operation
+                        // allowed to repopulate it.
+                        chc_last_model = None;
+                        chc_problem_input.push_str(source_text);
+                        chc_problem_input.push('\n');
+                    }
+                }
+                let _ = stdout.flush();
+                continue;
+            }
+            if matches!(cmd, Command::Exit) {
+                publish_pending_smt_unsat(
+                    &mut executor,
+                    &mut transcript,
+                    adapted.as_ref(),
+                    ProofArtifactProblem::Text(&artifact_input),
+                    ProofArtifactTheoryMetadata::smt_lib(
+                        smt_logic.as_deref(),
+                        Some(&formula_stats),
+                    ),
+                );
+                finalize_smt_unsat_artifacts(
+                    &mut executor,
+                    &mut transcript,
+                    adapted.as_ref(),
+                    ProofArtifactProblem::Text(&artifact_input),
+                    ProofArtifactTheoryMetadata::smt_lib(
+                        smt_logic.as_deref(),
+                        Some(&formula_stats),
+                    ),
+                );
+                maybe_print_success(&transcript);
+                maybe_explain(&mut executor, &transcript);
+                maybe_visualize(&artifact_input, &mut executor, &transcript, visualization);
+                if stats_cfg.any() {
+                    print_smt_stats(&executor, &transcript, Some(&formula_stats), stats_cfg);
+                }
+                maybe_write_minimal_decision_trace(&mut transcript);
+                cleanup_temp_proof(adapted.as_ref());
+                exit_if_transcript_had_recoverable_error(&transcript);
+                return;
+            }
+            if !execute_and_print(&mut executor, cmd, &mut transcript, true) {
+                let _ = stdout.flush();
+                exit_if_timed_out_with_transcript_context(&transcript);
+                if continue_after_failed_command(
+                    &mut executor,
+                    cmd,
+                    &mut transcript,
+                    &rebuild_executor,
+                ) {
+                    continue;
+                }
+                cleanup_temp_proof(adapted.as_ref());
+                std::process::exit(1);
+            }
+            if matches!(cmd, Command::Reset) {
+                // A successful reset begins a fresh artifact epoch. It
+                // discards every prior accepted/rejected command and
+                // keeps payload metadata scoped to the same problem.
+                artifact_input.clear();
+                formula_stats = FormulaStats::default();
+                smt_logic = None;
+                chc_problem_dropped = false;
+            } else if retain_artifact_input {
+                artifact_input.push_str(source_text);
+                artifact_input.push('\n');
+            }
+            publish_pending_smt_unsat(
+                &mut executor,
+                &mut transcript,
+                adapted.as_ref(),
+                ProofArtifactProblem::Text(&artifact_input),
+                ProofArtifactTheoryMetadata::smt_lib(smt_logic.as_deref(), Some(&formula_stats)),
+            );
+            // Flush after each command so pipe consumers see responses
+            // immediately (stdout is block-buffered when piped).
+            let _ = stdout.flush();
+            exit_if_timed_out_with_transcript_context(&transcript);
         }
     }
     if chc_stream_mode {
@@ -8565,10 +10372,7 @@ pub(super) fn run_file(
         Some((_, None)) => None,
         None => match std::fs::File::open(path) {
             Ok(file) => Some(file),
-            Err(e) => {
-                eprintln_smt_error(format_args!("Error reading file '{path}': {e}"));
-                std::process::exit(1);
-            }
+            Err(e) => crate::exit_unreadable_input_file(path, &e),
         },
     };
     let smt_source = match input_file.as_ref() {
@@ -8659,6 +10463,7 @@ pub(super) fn run_file(
                     validate,
                     stats_cfg,
                     proof_config,
+                    false,
                 );
                 return;
             }
@@ -8677,6 +10482,7 @@ pub(super) fn run_file(
                     validate,
                     stats_cfg,
                     proof_config,
+                    false,
                 );
                 return;
             }
@@ -8689,10 +10495,7 @@ pub(super) fn run_file(
                 visualization,
             );
         }
-        Err(e) => {
-            eprintln_smt_error(format_args!("Error reading file '{path}': {e}"));
-            std::process::exit(1);
-        }
+        Err(e) => crate::exit_unreadable_input_file(path, &e),
     }
 }
 
@@ -8807,16 +10610,15 @@ fn run_smt_file_content(
     // SMALL witness (honour the intent even with no reader in the script), and
     // a visualization renders solver state. The interactive `-in` lane never
     // reaches here, so it always keeps the demand-assumed default.
-    executor.set_model_output_shedding(
-        !commands_may_consume_a_model(&command_sources)
-            && !z3_model_enabled()
-            && !MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-            && visualization.is_none(),
-    );
+    let model_output_shedding = !commands_may_consume_a_model(&command_sources)
+        && !z3_model_enabled()
+        && !MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && visualization.is_none();
+    executor.set_model_output_shedding(model_output_shedding);
     // Rewrite synthesized non-Alethe configs to Alethe for SMT
     // (Finding A in the development design notes).
     let adapted = adapt_proof_config_for_smt(proof_config);
-    transcript.defer_unsat_publication = required_smt_unsat_publication(adapted.as_ref());
+    transcript.unsat_proof_posture = SmtUnsatProofPosture::of(adapted.as_ref());
     seed_smt_transcript_protections_or_exit(&mut transcript, source, adapted.as_ref());
     if let Some(proof) = adapted.as_ref() {
         if proof.format != ProofFormat::Alethe {
@@ -8834,27 +10636,20 @@ fn run_smt_file_content(
         }
         configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
-        // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
-        // competition mode, or stdin with nothing to name a sidecar after),
-        // and no mandatory result/artifact gate needs the internal proof
-        // surface: skip retaining a deep parsed-AST clone of every assertion
-        // (~190 MB of a 318 MB peak on a 6 MB QF_UF input, #rss-vs-z3). An
-        // in-script `(set-option :produce-proofs true)` re-enables retention.
-        executor.set_retain_parsed_assertions(false);
-        // Whatever proof work a NON-shedding executor still does here (the
-        // mandatory certificate of a `--rigor standard` stdin session) is
-        // best-effort with no artifact behind it, so its bookkeeping meter
-        // must be the same budgeted one the synthesized-default file route
-        // uses — never `None`. An unbudgeted meter was the `--no-proof` trap:
-        // gensys_icl161 materialised a 122k-step proof and strict-checked
-        // 3.9M steps for an artifact nobody asked for. A shedding executor
-        // never consults it, and an explicit demand (`set_produce_proofs`,
-        // in-script `:produce-proofs`) keeps its unbudgeted slot by contract.
-        executor
-            .set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
+        configure_unproved_smt_executor(&mut executor);
     }
 
-    let mut cmd_index = 0usize;
+    enable_session_replay_if_supported(&mut transcript, adapted.as_ref());
+    let rebuild_executor = || {
+        let mut executor = new_executor();
+        executor.set_model_output_shedding(model_output_shedding);
+        if !ResultGateRequests::current().any() {
+            configure_unproved_smt_executor(&mut executor);
+        }
+        executor
+    };
+
+    let mut sources = StreamSources::new(1, 1);
     // Start byte of the current full-reset epoch. Proof payloads and
     // visualization must describe exactly the problem that produced the
     // authoritative decision, never rejected text from an earlier epoch.
@@ -8862,8 +10657,7 @@ fn run_smt_file_content(
     let mut stream = CommandStream::new(content);
     loop {
         // Delimit the exact source slice this command consumes (used below to
-        // classify a dropped command on a parse error, independent of the
-        // possibly-misaligned `command_sources` re-chunking).
+        // classify a dropped command on a parse error).
         let consumed_start = stream.position();
         let Some(item) = stream.next_command() else {
             break;
@@ -8871,15 +10665,18 @@ fn run_smt_file_content(
         let consumed = content
             .get(consumed_start..stream.position())
             .unwrap_or_default();
-        // Source tracking advances per top-level command (both successful and
-        // failed ones occupy a slot), keeping positions aligned with the
-        // balanced-paren chunks `collect_command_sources` recorded.
-        set_current_command_source(&mut transcript, &command_sources, cmd_index);
-        cmd_index += 1;
+        // Each item's source is the text it consumed, so a command never
+        // reads another one's text after a stray token.
+        set_current_source(
+            &mut transcript,
+            sources.source(content, consumed_start, stream.position()),
+        );
         match item {
             CommandStreamItem::Error(err) => {
                 // z3-style continued-execution: report the bad command and keep
                 // going. Marked recoverable so the process still exits non-zero.
+                executor.observe_authored_dropped_source(consumed);
+                note_z3_session_failed_source(&mut transcript, consumed);
                 print_recoverable_parse_error(&mut transcript, &err);
                 invalidate_export_after_malformed_decision(consumed);
                 if transcript.exit_on_error {
@@ -8893,11 +10690,20 @@ fn run_smt_file_content(
                 if parse_drop_contributes_to_problem(consumed) {
                     mark_problem_incomplete(&mut executor, &mut transcript);
                 }
+                if dropped_text_holds_a_query(consumed) {
+                    withhold_answers_out_of_step(&mut executor, &mut transcript);
+                }
                 exit_if_timed_out_with_transcript_context(&transcript);
             }
             CommandStreamItem::Command(cmd) => {
                 let cmd = *cmd;
                 formula_stats.observe_command(&cmd);
+                if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {
+                    // Carcara parses the whole file: read the rest before the
+                    // query can publish a certificate for it.
+                    executor.observe_authored_commands_ahead(&content[consumed_start..]);
+                }
+                executor.observe_authored_command_source(consumed);
                 if smt_logic.is_none() {
                     smt_logic = logic_from_commands(std::slice::from_ref(&cmd)).map(str::to_owned);
                 }
@@ -8943,6 +10749,14 @@ fn run_smt_file_content(
                     _ => {
                         if !execute_and_print(&mut executor, &cmd, &mut transcript, false) {
                             exit_if_timed_out_with_transcript_context(&transcript);
+                            if continue_after_failed_command(
+                                &mut executor,
+                                &cmd,
+                                &mut transcript,
+                                &rebuild_executor,
+                            ) {
+                                continue;
+                            }
                             std::process::exit(1);
                         }
                         if matches!(cmd, Command::Reset) {
@@ -9039,7 +10853,7 @@ fn print_recoverable_parse_error(state: &mut SmtTranscriptState, err: &ay_fronte
         return;
     }
     state.note_recoverable_error();
-    // Use the offending command's *absolute* position from `command_sources`
+    // Use the offending command's *absolute* position from its current source
     // (the parser's own line/column are relative to the per-command slice and
     // would be wrong for whole-file reporting). Emit only the bare error
     // `message` so the position is not duplicated by `ParseError`'s Display.

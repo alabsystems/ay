@@ -51,6 +51,7 @@ pub(crate) enum IncrementalCheckResult {
 
 fn resources_exhausted(smt: &SmtContext, deadline: ay_core::time::Instant) -> bool {
     ay_core::time::Instant::now() >= deadline
+        || super::deadline::lane_cancelled()
         || TermStore::global_memory_exceeded()
         || smt
             .term_memory_budget
@@ -106,6 +107,18 @@ impl IncrementalQueryContext {
         smt: &mut SmtContext,
         timeout: Option<std::time::Duration>,
     ) -> IncrementalCheckResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return IncrementalCheckResult::Unknown;
+        }
+        // Census (`--chc-session-coverage`): nothing is built when it is off.
+        let _census = super::lane::census::coverage_enabled().then(|| {
+            let exprs: Vec<&ChcExpr> = self.background_exprs.iter().chain(assumptions).collect();
+            super::lane::CensusFrame::enter(
+                super::lane::SmtEntry::IncrementalQuery,
+                Some(smt.census_lane()),
+                &exprs,
+            )
+        });
         // One absolute wall covers admission, both solver attempts, and final
         // publication. The historical ten-second executor default is now the
         // default for the whole query rather than being renewed before an
@@ -159,23 +172,90 @@ impl IncrementalQueryContext {
         // Expression node count budget guard (#8198): if the combined expression
         // exceeds the conversion budget, solving would produce incorrect partial
         // results. Return Unknown and reset the smt conversion budget state so
-        // subsequent small queries are not blocked.
+        // subsequent small queries are not blocked. Counted on the DAG (F0d).
         let budget_limit = super::context::MAX_CONVERSION_NODES;
-        if combined.node_count(budget_limit + 1) > budget_limit {
+        if crate::expr::dag::dag_size_at_least(&combined, budget_limit + 1) {
             smt.reset_conversion_budget();
             return IncrementalCheckResult::Unknown;
         }
+
+        // #horn-smt-session Rung 4: a `Search`-lane caller (kind / pdkind /
+        // trl search contexts; BMC's contexts stay `Verification`, INV-S1)
+        // hands an eligible Bool/LRA query to its context's persistent
+        // session first, under the same already-elapsing wall. `None` = the
+        // session did not answer: the executor-then-fresh schedule below runs
+        // unchanged.
+        if smt.session_gate_open() {
+            let remaining = query_deadline.saturating_duration_since(ay_core::time::Instant::now());
+            if let Some(routed) = smt.try_session_route(&combined, Some(remaining)) {
+                if resources_exhausted(smt, query_deadline) {
+                    return IncrementalCheckResult::Unknown;
+                }
+                return match routed {
+                    super::types::SmtResult::Sat(model) => IncrementalCheckResult::Sat(model),
+                    result if result.is_unsat() => IncrementalCheckResult::Unsat,
+                    _ => IncrementalCheckResult::Unknown,
+                };
+            }
+        }
+
+        // Search lane: solve the top-level equalities first
+        // (`smt::solve_eqs`), as the `SmtContext` executor path does. The
+        // residual is equisatisfiable; a SAT model of it is completed and
+        // validated against `combined`.
+        let solved = if smt.lane() == super::SmtLane::Search {
+            super::solve_eqs::for_search_executor(&combined)
+        } else {
+            None
+        };
+        if let Some((solved, original_vars)) = &solved {
+            match solved.residual {
+                ChcExpr::Bool(false) => return IncrementalCheckResult::Unsat,
+                ChcExpr::Bool(true) => {
+                    let mut model = FxHashMap::default();
+                    return if solved.complete_model(original_vars, &mut model) {
+                        super::executor_adapter::accept_reparsed_sat_model(
+                            &[&combined],
+                            model,
+                            "incremental_solve_eqs",
+                        )
+                        .map_or(IncrementalCheckResult::Unknown, IncrementalCheckResult::Sat)
+                    } else {
+                        IncrementalCheckResult::Unknown
+                    };
+                }
+                _ => {}
+            }
+        }
+        let query = solved
+            .as_ref()
+            .map_or(&combined, |(solved, _)| &solved.residual);
 
         // Try executor adapter (full DPLL(T) with theory support).
         let empty_equalities = FxHashMap::default();
         let result =
             super::executor_adapter::check_sat_conjunction_via_executor_with_resource_limits(
-                &[combined.clone()],
+                &[query.clone()],
                 &empty_equalities,
                 requested,
                 Some(query_deadline),
                 smt.term_memory_budget,
             );
+        let result = match (result, &solved) {
+            (IncrementalCheckResult::Sat(mut model), Some((solved, original_vars))) => {
+                if solved.complete_model(original_vars, &mut model) {
+                    super::executor_adapter::accept_reparsed_sat_model(
+                        &[&combined],
+                        model,
+                        "incremental_solve_eqs",
+                    )
+                    .map_or(IncrementalCheckResult::Unknown, IncrementalCheckResult::Sat)
+                } else {
+                    IncrementalCheckResult::Unknown
+                }
+            }
+            (result, _) => result,
+        };
         if resources_exhausted(smt, query_deadline) {
             return IncrementalCheckResult::Unknown;
         }
@@ -186,6 +266,7 @@ impl IncrementalQueryContext {
         // Fallback: one fresh SmtContext under the SAME already-elapsing wall
         // and per-instance term-store ceiling as the executor attempt.
         let mut fresh_smt = SmtContext::new();
+        fresh_smt.set_lane(smt.lane());
         fresh_smt.set_term_memory_budget(smt.term_memory_budget);
         fresh_smt.set_global_solve_deadline(Some(query_deadline));
         if resources_exhausted(&fresh_smt, query_deadline) {
@@ -215,6 +296,22 @@ impl IncrementalQueryContext {
         parent_smt: &SmtContext,
         timeout: Option<std::time::Duration>,
     ) -> IncrementalCheckResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return IncrementalCheckResult::Unknown;
+        }
+        // Census (`--chc-session-coverage`): nothing is built when it is off.
+        let _census = super::lane::census::coverage_enabled().then(|| {
+            let exprs: Vec<&ChcExpr> = self.background_exprs.iter().chain(assumptions).collect();
+            super::lane::CensusFrame::enter(
+                super::lane::SmtEntry::IncrementalQuery,
+                Some(parent_smt.census_lane()),
+                &exprs,
+            )
+        });
+        // A deliberately FRESH re-check (kind's Unknown retries): never the
+        // session (#horn-smt-session Rung 4; INV-S2 keeps the fresh context
+        // off it whatever the parent's lane).
+        let _fresh_pin = super::lane::ScopedVerificationMode::install();
         let started = ay_core::time::Instant::now();
         let requested = timeout.unwrap_or(std::time::Duration::from_secs(10));
         let Some(requested_deadline) = started.checked_add(requested) else {
@@ -241,6 +338,7 @@ impl IncrementalQueryContext {
             return IncrementalCheckResult::Unknown;
         }
         let mut fresh_smt = SmtContext::new();
+        fresh_smt.set_lane(parent_smt.lane());
         fresh_smt.set_term_memory_budget(parent_smt.term_memory_budget);
         fresh_smt.set_global_solve_deadline(Some(deadline));
         if resources_exhausted(&fresh_smt, deadline) {

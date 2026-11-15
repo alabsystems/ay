@@ -501,9 +501,15 @@ impl ArraySolver<'_> {
                 break;
             }
 
-            let entry_idx = scan_indices.map_or(pos, |s| s[pos] as usize);
+            // `pos < total`, and `total` is the scan list's length when one is
+            // given, so the lookup always finds an entry.
+            let Some(entry_idx) =
+                scan_indices.map_or(Some(pos), |s| s.get(pos).map(|&i| i as usize))
+            else {
+                continue;
+            };
             let (eq_term, lhs, rhs) = self.eq_select_entries_sorted[entry_idx];
-            outcome.entry_visits += 1;
+            outcome.entry_visits = outcome.entry_visits.saturating_add(1);
             deps.clear();
 
             if self.assigns.get(&eq_term) == Some(&true) {
@@ -549,8 +555,14 @@ impl ArraySolver<'_> {
             let emit = |propagations: &mut Vec<TheoryPropagation>,
                         view_reasons: [&[TheoryLit]; 3],
                         probe_lits: [Option<TheoryLit>; 3]| {
-                let mut reasons: Vec<TheoryLit> =
-                    Vec::with_capacity(view_reasons.iter().map(|r| r.len()).sum::<usize>() + 3);
+                // Reserved fallibly for the three chunks plus three probe
+                // literals: a failed reservation only means the extends below
+                // grow the vector as they go.
+                let capacity = view_reasons
+                    .iter()
+                    .fold(3usize, |total, chunk| total.saturating_add(chunk.len()));
+                let mut reasons: Vec<TheoryLit> = Vec::new();
+                let _ = reasons.try_reserve_exact(capacity);
                 for chunk in view_reasons {
                     reasons.extend_from_slice(chunk);
                 }

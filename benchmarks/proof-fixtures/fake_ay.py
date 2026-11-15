@@ -25,6 +25,7 @@ directives telling this stub how to behave:
     ; AY-ANSWER: unsat            what to print on stdout   (omit => print nothing)
     ; AY-STDERR: (:reason-unknown "incomplete")   extra line on stderr
     ; AY-RC: 124                  process exit code         (default 0)
+    ; AY-GUARD: refused           `ay check carcara-guard` verdict (default clean)
     ; AY-PROOF-BEGIN              start of the canned Alethe proof
     ;| (assume h1 p)              proof body, one line per `;|`
     ; AY-PROOF-END
@@ -40,11 +41,18 @@ is precisely what we want the guard to notice.
 The `; EXPECT-...` directives in the same file are read by
 scripts/selftest_proof_harness.py, never by this stub.
 
-INVOCATION MODES (both real harness paths)
+INVOCATION MODES (the real harness paths)
     ay -T:20 /path/to/case.smt2        (check_proofs.sh)   -> reads the file,
                                         writes /path/to/case.smt2.alethe
     ay --z3-mode -T:10 < case.smt2     (soundness_sweep.py) -> reads stdin,
                                         writes no proof (nothing to write it next to)
+    ay check carcara-guard PROOF PROBLEM   (check_proofs.sh) -> replays the
+                                        fixture's `AY-GUARD` verdict. The real
+                                        command scans the pair
+                                        (ay_core::pinned_carcara); a Rust test
+                                        (crates/ay/src/cmd_check/carcara_guard.rs)
+                                        runs the REAL scan on every fixture that
+                                        says `refused`, so the two cannot drift.
 """
 import os
 import sys
@@ -79,10 +87,32 @@ def parse(text):
     return answer, stderr_lines, rc, proof
 
 
+def guard(argv):
+    """`ay check carcara-guard PROOF PROBLEM`: the fixture's AY-GUARD verdict."""
+    if "--help" in argv:
+        print("Usage: ay check carcara-guard <PROOF> <PROBLEM>")
+        return 0
+    text = ""
+    if len(argv) > 4 and os.path.isfile(argv[4]):
+        with open(argv[4], errors="ignore") as fh:
+            text = fh.read()
+    refused = any(line.strip().lstrip(";").strip() == "AY-GUARD: refused"
+                  for line in text.splitlines() if line.strip().startswith(";"))
+    if refused:
+        print("pinned-carcara-guard: refused (pinned Carcara's verdict on this pair "
+              "is not evidence)")
+        print("misjudged-evaluate: (the fixture's AY-GUARD directive)")
+        return 1
+    print("pinned-carcara-guard: clean")
+    return 0
+
+
 def main(argv):
     if "--version" in argv:
         print(VERSION)
         return 0
+    if argv[1:3] == ["check", "carcara-guard"]:
+        return guard(argv)
 
     # The real `ay` takes the problem as a positional path, or on stdin under
     # --z3-mode. Mirror that: last existing-file argument wins, else stdin.

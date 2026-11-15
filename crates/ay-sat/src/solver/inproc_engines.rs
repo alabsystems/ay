@@ -9,6 +9,8 @@
 //! All fields are accessed only during inprocessing rounds, not during
 //! BCP or conflict analysis.
 
+mod counted;
+
 use crate::bce::BCE;
 use crate::bve::BVE;
 use crate::cce::Cce;
@@ -17,10 +19,6 @@ use crate::congruence::CongruenceClosure;
 use crate::decompose::Decompose;
 use crate::factor::Factor;
 use crate::gates::GateExtractor;
-#[cfg(feature = "gpu")]
-use crate::gpu::bve::GpuBvePipeline;
-#[cfg(feature = "gpu")]
-use crate::gpu::GpuContext;
 use crate::htr::HTR;
 use crate::kitten::Kitten;
 use crate::preprocess_transaction::PreprocessTransactionLedger;
@@ -76,26 +74,6 @@ pub(crate) struct InprocessingEngines {
     pub reconstruction: ReconstructionStack,
     /// Execution-path preprocessing transaction ledger.
     pub preprocess_transactions: PreprocessTransactionLedger,
-    // ══════════════════════════════════════════════════════════════════════
-    // GPU: lazily-initialized compute accelerators (behind feature gate)
-    // ══════════════════════════════════════════════════════════════════════
-    /// Lazily-initialized GPU context shared across all GPU-accelerated passes.
-    /// `None` until first GPU dispatch attempt; stays `None` if no adapter.
-    #[cfg(feature = "gpu")]
-    pub gpu_context: Option<GpuContext>,
-    /// Cached GPU BVE pipeline (shader + bind group layout compiled once,
-    /// against `gpu_context`'s device).
-    /// `None` until first BVE GPU dispatch; stays `None` if GPU unavailable.
-    #[cfg(feature = "gpu")]
-    pub gpu_bve_pipeline: Option<GpuBvePipeline>,
-    /// Whether GPU initialization was already attempted (prevents retrying
-    /// on every inprocessing round after a failed adapter probe).
-    #[cfg(feature = "gpu")]
-    pub gpu_init_attempted: bool,
-    /// Whether BVE pipeline compilation was already attempted (prevents
-    /// re-compiling the shader on every BVE candidate after a failure).
-    #[cfg(feature = "gpu")]
-    pub gpu_bve_pipeline_attempted: bool,
 }
 
 impl InprocessingEngines {
@@ -166,67 +144,6 @@ impl InprocessingEngines {
             definition_kitten,
             reconstruction: ReconstructionStack::new(),
             preprocess_transactions: PreprocessTransactionLedger::new(),
-            #[cfg(feature = "gpu")]
-            gpu_context: None,
-            #[cfg(feature = "gpu")]
-            gpu_bve_pipeline: None,
-            #[cfg(feature = "gpu")]
-            gpu_init_attempted: false,
-            #[cfg(feature = "gpu")]
-            gpu_bve_pipeline_attempted: false,
-        }
-    }
-
-    /// Lazily initialize the GPU context on first use.
-    ///
-    /// Returns `Some(&GpuContext)` if a GPU adapter is available, `None` otherwise.
-    /// After the first attempt (success or failure), subsequent calls return the
-    /// cached result without retrying. This amortizes the wgpu adapter probe cost
-    /// and avoids repeated error logging on headless systems.
-    #[cfg(feature = "gpu")]
-    pub(crate) fn gpu_context(&mut self) -> Option<&GpuContext> {
-        if !self.gpu_init_attempted {
-            self.gpu_init_attempted = true;
-            match GpuContext::initialize() {
-                Ok(ctx) => {
-                    tracing::info!(
-                        backend = ?ctx.backend(),
-                        adapter = ?ctx.adapter_info().name,
-                        "GPU context initialized for inprocessing acceleration"
-                    );
-                    self.gpu_context = Some(ctx);
-                }
-                Err(err) => {
-                    tracing::debug!("GPU initialization failed (falling back to CPU): {err}");
-                }
-            }
-        }
-        self.gpu_context.as_ref()
-    }
-
-    /// Lazily initialize the GPU context and BVE pipeline on first use.
-    ///
-    /// Returns the shared context together with the pipeline compiled
-    /// against it (`dispatch_resolve` requires both). Returns `None` when
-    /// no GPU adapter is available or pipeline compilation failed; each of
-    /// those is attempted at most once per solver.
-    #[cfg(feature = "gpu")]
-    pub(crate) fn gpu_bve(&mut self) -> Option<(&GpuContext, &GpuBvePipeline)> {
-        if !self.gpu_init_attempted {
-            let _ = self.gpu_context();
-        }
-        if !self.gpu_bve_pipeline_attempted {
-            self.gpu_bve_pipeline_attempted = true;
-            if let Some(context) = self.gpu_context.as_ref() {
-                self.gpu_bve_pipeline = GpuBvePipeline::try_new(context);
-                if self.gpu_bve_pipeline.is_some() {
-                    tracing::info!("GPU BVE pipeline initialized");
-                }
-            }
-        }
-        match (self.gpu_context.as_ref(), self.gpu_bve_pipeline.as_ref()) {
-            (Some(context), Some(pipeline)) => Some((context, pipeline)),
-            _ => None,
         }
     }
 

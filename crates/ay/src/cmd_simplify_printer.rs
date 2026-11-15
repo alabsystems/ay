@@ -17,15 +17,28 @@ use ay_frontend::command::{
 use ay_frontend::{Command, SExpr};
 
 fn identifier_to_sexp(identifier: &str) -> SExpr {
-    // `to_raw_string` deliberately does not quote symbols, so carry the bars
-    // in the stored spelling for user identifiers while keeping syntax tokens
-    // such as `_` and `as` raw at their construction sites.
+    // Every symbol this printer builds carries its final surface spelling:
+    // user identifiers are quoted here with the full SMT-LIB rule (reserved
+    // words included), and syntax tokens such as `_` and `as` stay raw at their
+    // construction sites. `render_smtlib` therefore emits symbols verbatim.
     SExpr::Symbol(quote_symbol(identifier))
 }
 
 fn opaque_value_to_sexp(value: &SExpr) -> SExpr {
     match value {
         SExpr::Symbol(symbol) => identifier_to_sexp(symbol),
+        SExpr::List(items) => SExpr::List(items.iter().map(raw_opaque_to_sexp).collect()),
+        _ => value.clone(),
+    }
+}
+
+/// Nested opaque data (a list-valued option or attribute) is raw parser output
+/// whose `|...|` delimiters the lexer stripped. Store the structural quoting
+/// `SExpr::to_raw_string` gives each symbol as its final spelling.
+fn raw_opaque_to_sexp(value: &SExpr) -> SExpr {
+    match value {
+        SExpr::Symbol(_) => SExpr::Symbol(value.to_raw_string()),
+        SExpr::List(items) => SExpr::List(items.iter().map(raw_opaque_to_sexp).collect()),
         _ => value.clone(),
     }
 }
@@ -410,6 +423,14 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
             SExpr::Symbol("simplify".to_string()),
             term_to_sexp(term),
         ]),
+        Command::SimplifyWithParams(term, parameters) => {
+            let mut parts = vec![SExpr::Symbol("simplify".into()), term_to_sexp(term)];
+            for (name, value) in parameters {
+                parts.push(SExpr::Keyword(name.clone()));
+                parts.push(value.clone());
+            }
+            SExpr::List(parts)
+        }
         Command::GetInterpolant(a, b) => SExpr::List(vec![
             SExpr::Symbol("get-interpolant".to_string()),
             term_to_sexp(a),
@@ -429,8 +450,38 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
 /// Convert a frontend command AST into SMT-LIB2 text.
 pub(crate) fn command_to_smtlib(command: &Command) -> String {
     command_to_sexp(command)
-        .map(|sexpr| sexpr.to_raw_string())
+        .map(|sexpr| render_smtlib(&sexpr))
         .unwrap_or_else(|| "; unsupported command".to_string())
+}
+
+/// Render this printer's S-expressions as SMT-LIB2 text.
+///
+/// Symbols are emitted verbatim because they already carry their final
+/// spelling (see `identifier_to_sexp`). `SExpr::to_raw_string` must not render
+/// them: since 6064a0363 it re-quotes every symbol outside the simple-symbol
+/// alphabet, which turns the printer's `|a b|` into the different symbol
+/// `|\|a b\||`. Every other atom keeps its `to_raw_string` spelling.
+fn render_smtlib(sexpr: &SExpr) -> String {
+    let mut out = String::new();
+    render_smtlib_into(sexpr, &mut out);
+    out
+}
+
+fn render_smtlib_into(sexpr: &SExpr, out: &mut String) {
+    match sexpr {
+        SExpr::Symbol(spelling) => out.push_str(spelling),
+        SExpr::List(items) => {
+            out.push('(');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                render_smtlib_into(item, out);
+            }
+            out.push(')');
+        }
+        atom => out.push_str(&atom.to_raw_string()),
+    }
 }
 
 #[cfg(test)]
@@ -444,12 +495,12 @@ mod tests {
             Term::from_sexp(&parse_sexp("((as const (Array Int Int)) 0)").expect("valid sexp"))
                 .expect("valid term");
         assert_eq!(
-            term_to_sexp(&term).to_raw_string(),
+            render_smtlib(&term_to_sexp(&term)),
             "((as const (Array Int Int)) 0)"
         );
 
         let sort = Sort::Indexed("BitVec".to_string(), vec![Index::Numeral("32".to_string())]);
-        assert_eq!(sort_to_sexp(&sort).to_raw_string(), "(_ BitVec 32)");
+        assert_eq!(render_smtlib(&sort_to_sexp(&sort)), "(_ BitVec 32)");
     }
 
     #[test]
@@ -458,7 +509,7 @@ mod tests {
             Term::from_sexp(&parse_sexp("(distinct |(_ bv0 8)| (_ bv0 8))").expect("valid sexp"))
                 .expect("valid term");
         assert_eq!(
-            term_to_sexp(&term).to_raw_string(),
+            render_smtlib(&term_to_sexp(&term)),
             "(distinct |(_ bv0 8)| (_ bv0 8))"
         );
 
@@ -468,7 +519,7 @@ mod tests {
         )
         .expect("valid let term");
         assert_eq!(
-            term_to_sexp(&let_term).to_raw_string(),
+            render_smtlib(&term_to_sexp(&let_term)),
             "(let ((|(_ bv0 8)| #x01)) (distinct |(_ bv0 8)| (_ bv0 8)))"
         );
 
@@ -476,7 +527,7 @@ mod tests {
             Term::from_sexp(&parse_sexp("(! p :named |(_ bv0 8)|)").expect("valid annotation"))
                 .expect("valid annotated term");
         assert_eq!(
-            term_to_sexp(&annotated).to_raw_string(),
+            render_smtlib(&term_to_sexp(&annotated)),
             "(! p :named |(_ bv0 8)|)"
         );
 
@@ -487,7 +538,7 @@ mod tests {
         ] {
             let patterned = Term::from_sexp(&parse_sexp(input).expect("valid pattern annotation"))
                 .expect("valid annotated term");
-            let rendered = term_to_sexp(&patterned).to_raw_string();
+            let rendered = render_smtlib(&term_to_sexp(&patterned));
             assert_eq!(rendered, input);
             let reparsed = Term::from_sexp(&parse_sexp(&rendered).expect("rendered S-expression"))
                 .expect("rendered annotated term");
@@ -496,21 +547,21 @@ mod tests {
 
         let character = Term::from_sexp(&parse_sexp("(_ char #x41)").expect("valid char literal"))
             .expect("valid term");
-        assert_eq!(term_to_sexp(&character).to_raw_string(), "(_ char #x41)");
+        assert_eq!(render_smtlib(&term_to_sexp(&character)), "(_ char #x41)");
 
         let pseudo_boolean = Term::from_sexp(
             &parse_sexp("((_ pble 0.5 0.25) true)").expect("valid pseudo-Boolean term"),
         )
         .expect("valid term");
         assert_eq!(
-            term_to_sexp(&pseudo_boolean).to_raw_string(),
+            render_smtlib(&term_to_sexp(&pseudo_boolean)),
             "((_ pble 0.5 0.25) true)"
         );
 
         for input in ["(as f Int)", "(as (_ f 1) Int)"] {
             let qualified = Term::from_sexp(&parse_sexp(input).expect("valid qualified term"))
                 .expect("valid term");
-            assert_eq!(term_to_sexp(&qualified).to_raw_string(), input);
+            assert_eq!(render_smtlib(&term_to_sexp(&qualified)), input);
         }
     }
 
@@ -525,5 +576,30 @@ mod tests {
         // fall through, but the fallback string must still be stable text).
         let rendered = command_to_smtlib(&Command::Exit);
         assert_eq!(rendered, "(exit)");
+    }
+
+    /// Regression: 6064a0363 made `SExpr::to_raw_string` re-quote symbols while
+    /// this printer's identifiers arrive already quoted, so `ay simplify`
+    /// renamed `|a b|` to `|\|a b\||`. A quoted identifier must be emitted
+    /// quoted exactly once, a reserved-word identifier must keep its bars, and
+    /// nested opaque option data must keep its structural quoting, all
+    /// reparsing to the same command.
+    #[test]
+    fn quoted_identifiers_render_once_and_reparse_to_the_same_command() {
+        for input in [
+            "(declare-const |a b| (_ BitVec 8))",
+            "(declare-const |let| Int)",
+            "(assert (distinct |a b| |let| (_ bv0 8)))",
+            "(set-info :source |two words|)",
+            "(set-option :opaque (|a b| c))",
+        ] {
+            let parsed = ay_frontend::parse(input).expect("valid command");
+            let rendered = command_to_smtlib(&parsed[0]);
+            assert_eq!(rendered, input);
+            assert_eq!(
+                ay_frontend::parse(&rendered).expect("rendered command reparses"),
+                parsed
+            );
+        }
     }
 }

@@ -943,7 +943,14 @@ fn test_finalize_sat_model_validation_resolves_covered_direct_bv_backed_array_se
 }
 
 #[test]
-fn test_finalize_sat_model_validation_delegates_bv_backed_array_wrapper_unknown_11936() {
+fn test_finalize_sat_model_validation_degrades_covered_bv_backed_array_wrapper_unknown_11936() {
+    // (#bv-array-delegation) This test originally asserted that bit-blast
+    // coverage lets the wrapper pass as Sat with one delegated array check,
+    // although the model has no value for `arr` or `idx`, so the evaluator
+    // returns Unknown and the printer would publish values nothing checked.
+    // Coverage certifies the SAT solver's internal assignment, not the emitted
+    // model: the covered case must degrade exactly like the uncovered sibling
+    // below. On the old code this test fails with Sat and array_delegated = 1.
     let mut executor = Executor::new();
     let arr = executor
         .ctx
@@ -977,19 +984,16 @@ fn test_finalize_sat_model_validation_delegates_bv_backed_array_wrapper_unknown_
 
     let result = executor
         .finalize_sat_model_validation()
-        .expect("explicitly covered BV-backed array wrapper should delegate");
+        .expect("covered BV-backed array wrapper the model cannot evaluate degrades to Unknown");
 
-    assert_eq!(result, SolveResult::Sat);
-    assert_eq!(executor.last_result, Some(SolveResult::Sat));
-    assert_eq!(
-        executor.statistics().get_int("model_validation_failures"),
-        Some(0)
-    );
+    assert_eq!(result, SolveResult::Unknown);
+    assert_eq!(executor.last_result, Some(SolveResult::Unknown));
     assert_eq!(
         executor
             .statistics()
-            .get_int("model_validation.array_delegated"),
-        Some(1)
+            .get_int("model_validation.array_delegated")
+            .unwrap_or(0),
+        0
     );
 }
 
@@ -1095,7 +1099,14 @@ fn test_finalize_sat_model_validation_degrades_uncovered_bv_backed_array_wrapper
 }
 
 #[test]
-fn test_finalize_sat_model_validation_delegates_covered_bv_backed_array_wrapper_false_11936() {
+fn test_finalize_sat_model_validation_degrades_covered_bv_backed_array_wrapper_false_11936() {
+    // (#bv-array-delegation) This test originally asserted Sat with one
+    // delegated array check although the model CONCRETELY falsifies the
+    // assertion (`cond` is true and `arr` is the constant #x00, so
+    // `(= (select arr idx) #x42)` is false): the array twin of the override
+    // #bv-ite-bool-model removed. A concrete false is final whatever covers
+    // it, so the covered case degrades exactly like the uncovered sibling
+    // above. On the old code this test fails with Sat and array_delegated = 1.
     use ay_arrays::ArrayInterpretation;
 
     let mut executor = Executor::new();
@@ -1142,14 +1153,15 @@ fn test_finalize_sat_model_validation_delegates_covered_bv_backed_array_wrapper_
 
     let result = executor
         .finalize_sat_model_validation()
-        .expect("explicitly covered BV-backed array wrapper false should delegate");
+        .expect("covered BV-backed array wrapper false should degrade to Unknown");
 
-    assert_eq!(result, SolveResult::Sat);
+    assert_eq!(result, SolveResult::Unknown);
     assert_eq!(
         executor
             .statistics()
-            .get_int("model_validation.array_delegated"),
-        Some(1)
+            .get_int("model_validation.array_delegated")
+            .unwrap_or(0),
+        0
     );
 }
 
@@ -1674,6 +1686,79 @@ fn test_bv_exact_select_conflicting_default_is_unknown_11936() {
             width: 8,
         },
         "explicit array-model store entries remain authoritative"
+    );
+}
+
+/// A definition-built interpretation (from a model-true store-chain
+/// definition with every operand resolved at extraction) outranks a
+/// direct select's bit-blasted bits: for definition-defined arrays the
+/// BV encoding links selects to the chain only at finitely many
+/// extensionality indices, so an exact-select disagreement at an
+/// unlinked index is unconstrained junk, not a model conflict. This
+/// is the remaining QF_ABV `arrays-read-conflict-uneval` shape: every
+/// required read failed closed on exactly this veto even though the
+/// built interpretation was total.
+#[test]
+fn test_definition_authoritative_interp_outranks_exact_select_bits() {
+    use ay_arrays::ArrayInterpretation;
+
+    let mut executor = Executor::new();
+    let arr_sort = Sort::array(Sort::bitvec(8), Sort::bitvec(8));
+    let arr = executor.ctx.terms.mk_var("arr", arr_sort);
+    let idx = executor.ctx.terms.mk_var("idx", Sort::bitvec(8));
+    let sel = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("select"), vec![arr, idx], Sort::bitvec(8));
+
+    let mut bv_values = HashMap::default();
+    bv_values.insert(idx, BigInt::from(0x05u8));
+    // Junk exact bits: disagree with the definition-built default.
+    bv_values.insert(sel, BigInt::from(0x42u8));
+
+    let mut array_values = HashMap::default();
+    array_values.insert(
+        arr,
+        ArrayInterpretation {
+            index_sort: Some(Sort::bitvec(8)),
+            element_sort: Some(Sort::bitvec(8)),
+            default: Some("#x00".to_string()),
+            stores: vec![],
+        },
+    );
+
+    let mut model = empty_model();
+    model.bv_model = Some(BvModel {
+        values: bv_values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    });
+    model.array_model = Some(ArrayModel {
+        array_values,
+        ..Default::default()
+    });
+
+    // Without provenance the disagreement fails closed (11936 above).
+    assert_eq!(executor.evaluate_term(&model, sel), EvalValue::Unknown);
+    assert!(executor.bv_exact_select_array_model_conflict(&model, arr, idx));
+
+    model
+        .array_model
+        .as_mut()
+        .unwrap()
+        .definition_authoritative
+        .insert(arr);
+    assert_eq!(
+        executor.evaluate_term(&model, sel),
+        EvalValue::BitVec {
+            value: BigInt::from(0u8),
+            width: 8,
+        },
+        "the definition-built interpretation decides the read"
+    );
+    assert!(
+        !executor.bv_exact_select_array_model_conflict(&model, arr, idx),
+        "no conflict may be reported against definition-built evidence"
     );
 }
 
@@ -2280,5 +2365,58 @@ fn test_bv2nat_lia_fallback_gated_on_absent_bv_model() {
         ex.evaluate_term(&model, b2n),
         EvalValue::Unknown,
         "with a bv_model present, bv2nat must neither invent zero nor use the LIA opaque value"
+    );
+}
+
+// ==========================================================================
+// evaluate_var, BitVec branch: only the BV lane's own value is authority
+// (#subst-key-no-default BitVec side, and #bv-euf-class-literal-read)
+// ==========================================================================
+
+/// A BitVec variable with no BV-model value stays Unknown — the EUF class
+/// spelling is NOT read (#bv-euf-class-literal-read, reverted 2026-09-17:
+/// EUF models no BitVec semantics, so that read answered ten queries with a
+/// literal contradicting their own `bvult` atoms) — and an ELIMINATED
+/// variable stays Unknown for the separate, stronger reason that its
+/// recorded substitution is an exact definition which completion, not the
+/// evaluator, installs (#subst-key-no-default, BitVec side;
+/// `missing_bv_entries_are_defaulted_only_after_substitution_recovery` pins
+/// that replay).
+#[test]
+fn bitvec_var_with_no_bv_value_stays_unknown_and_ignores_euf_literal() {
+    let mut executor = Executor::new();
+    let x = executor.ctx.terms.mk_var("x", Sort::bitvec(8));
+    let two = executor.ctx.terms.mk_bitvec(BigInt::from(2u8), 8);
+    let mut model = empty_model();
+    let mut euf = EufModel::default();
+    euf.term_values.insert(x, "#x04".to_string());
+    model.euf_model = Some(euf);
+
+    // A live variable does not take the EUF class spelling as a BV value.
+    assert_eq!(executor.evaluate_term(&model, x), EvalValue::Unknown);
+
+    // Nor does an eliminated one: the definition is the authority and
+    // completion, not the evaluator, installs it.
+    executor.recorded_var_substitutions.insert(x, two);
+    super::eval_memo_clear();
+    assert_eq!(executor.evaluate_term(&model, x), EvalValue::Unknown);
+
+    // And when the BV model DOES carry a value, that value wins — the lane
+    // that models BitVec semantics is the only authority here.
+    executor.recorded_var_substitutions.remove(&x);
+    let mut values: HashMap<TermId, BigInt> = HashMap::default();
+    values.insert(x, BigInt::from(7u8));
+    model.bv_model = Some(BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    });
+    super::eval_memo_clear();
+    assert_eq!(
+        executor.evaluate_term(&model, x),
+        EvalValue::BitVec {
+            value: BigInt::from(7u8),
+            width: 8
+        }
     );
 }

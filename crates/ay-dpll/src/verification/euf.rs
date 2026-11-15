@@ -45,8 +45,18 @@ pub(crate) fn verify_euf_conflict(
     terms: &TermStore,
     support_axioms: &[TheoryLit],
 ) -> Result<(), VerificationError> {
-    use ay_core::{TheoryResult, TheorySolver};
-    use ay_euf::EufSolver;
+    verify_euf_conflict_classified(conflict, terms, support_axioms).map(|_| ())
+}
+
+/// [`verify_euf_conflict`] reporting whether the fresh congruence closure
+/// actually ran (`Reproved`) or the sampled re-check was skipped
+/// (`AcceptedUnchecked`; see `ConflictSemanticVerdict`).
+pub(crate) fn verify_euf_conflict_classified(
+    conflict: &[TheoryLit],
+    terms: &TermStore,
+    support_axioms: &[TheoryLit],
+) -> Result<super::dispatch::ConflictSemanticVerdict, VerificationError> {
+    use super::dispatch::ConflictSemanticVerdict;
 
     // Structural checks ALWAYS run (cheap; catch duplicate/circular/malformed
     // conflict literals). Only the EXPENSIVE semantic re-check below is sampled.
@@ -87,9 +97,27 @@ pub(crate) fn verify_euf_conflict(
             v
         });
         if n > WARMUP && !n.is_multiple_of(SAMPLE_EVERY) {
-            return Ok(());
+            return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
         }
     }
+
+    reprove_euf_conflict(conflict, terms, support_axioms)
+}
+
+/// The fresh congruence closure of [`verify_euf_conflict_classified`], run
+/// every time it is called: no sampling, and no structural pre-check of the
+/// literal list.
+///
+/// `Ok(Reproved)` means a new EUF solver that was given the conflict literals
+/// and `support_axioms`, and nothing else, derived a contradiction.
+pub(crate) fn reprove_euf_conflict(
+    conflict: &[TheoryLit],
+    terms: &TermStore,
+    support_axioms: &[TheoryLit],
+) -> Result<super::dispatch::ConflictSemanticVerdict, VerificationError> {
+    use super::dispatch::ConflictSemanticVerdict;
+    use ay_core::{TheoryResult, TheorySolver};
+    use ay_euf::EufSolver;
 
     // Create a fresh EUF solver and assert the conflict literals.
     // verify_only_scoped(): this solver recomputes only the Sat/Unsat verdict;
@@ -117,7 +145,9 @@ pub(crate) fn verify_euf_conflict(
 
     // Run congruence closure
     match verify_euf.check() {
-        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => Ok(()),
+        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
+            Ok(ConflictSemanticVerdict::Reproved)
+        }
         TheoryResult::Sat => Err(VerificationError::ConflictIsSat),
         TheoryResult::Unknown => {
             // EUF should never return Unknown, but handle it gracefully

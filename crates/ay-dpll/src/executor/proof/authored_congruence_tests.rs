@@ -330,10 +330,20 @@ fn an_assumption_ledger_admits_only_the_roots_it_actually_holds() {
 /// A surface override re-spells ONE `TermId` for the WHOLE document. The
 /// printer confines an authored assume spelling to its own step only when it
 /// can DERIVE `source = canonical` — a comparison reversal, a numeric
-/// multiplication reorder, or `cong` under the canonical root's own operator.
-/// `(distinct i j)` over the canonical `(not (= i j))` reaches none of those:
-/// the entry would leak into every printed occurrence, printing one side of a
-/// resolution as an opaque `distinct` atom and the other as `(= i j)`.
+/// multiplication reorder, `cong` under the canonical root's own operator, or
+/// `distinct_elim` from a binary `distinct`, or a checked Boolean fold. An
+/// authored `(=> (= i j) (< 1 0))` over the canonical `(not (= i j))` reaches
+/// none of those (`implies_simplify` rewrites a literal `false` consequent,
+/// not an arithmetic one): the entry would leak into every printed
+/// occurrence, printing one side of a resolution as an opaque implication and
+/// the other as `(= i j)`.
+///
+/// (This fixture used `(distinct i j)` until the printer gained its checked
+/// `distinct_elim` assume bridge, and `(=> (= i j) false)` until the Boolean
+/// fold derived it with `implies_simplify`;
+/// `a_binary_distinct_root_restores_its_authored_spelling` and
+/// `confined_spelling::tests::a_folded_implication_root_restores_its_authored_spelling`
+/// now pin those spellings as restored.)
 ///
 /// Withholding is the correct answer, not suppression: the root keeps the
 /// canonical spelling the strict checker validated, and a sibling root in the
@@ -354,9 +364,10 @@ fn an_unconfinable_authored_spelling_is_withheld_not_suppressed() {
     executor
         .ctx
         .add_assertion_with_parsed(equality, parsed_assertion("(assert (= i j))"));
-    executor
-        .ctx
-        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (distinct i j))"));
+    executor.ctx.add_assertion_with_parsed(
+        disequality,
+        parsed_assertion("(assert (=> (= i j) (< 1 0)))"),
+    );
 
     let mut proof = Proof::new();
     let positive = proof.add_assume(equality, None);
@@ -390,8 +401,69 @@ fn an_unconfinable_authored_spelling_is_withheld_not_suppressed() {
     assert_eq!(
         ay_proof::format_term_alethe(&executor.ctx.terms, disequality),
         "(not (= i j))",
-        "`distinct` over a negated-equality root cannot be confined to its \
-         assume, so the withheld root keeps canonical text"
+        "an implication over a negated-equality root cannot be confined to \
+         its assume, so the withheld root keeps canonical text"
+    );
+}
+
+/// The `distinct` arm of the confinement predicate. A binary authored
+/// `(distinct j i)` over the canonical `(not (= i j))` — AY interns the
+/// equality's operands in term order, so the pair comes back swapped — is now
+/// RESTORED: the printer bridges it with `distinct_elim` + `not_symm` at its
+/// own `assume` and prints the canonical literal everywhere else.
+///
+/// Withholding it published `(assume t0 (not (= i j)))`, which is no assertion
+/// of the problem file `(get-proof)` is checked against. MEASURED on
+/// `model_checker_consumer_quantified_models/signed_range64_fill_unsat.smt2`: pinned carcara
+/// 1.1.0 refused that document at `t0` ("could not match term to any of the
+/// original problem premises") although the strict checker accepted it.
+#[test]
+fn a_binary_distinct_root_restores_its_authored_spelling() {
+    let mut executor = Executor::new();
+    let i = executor.ctx.terms.mk_var("i", Sort::Int);
+    let j = executor.ctx.terms.mk_var("j", Sort::Int);
+    let equality = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), [i, j], Sort::Bool);
+    let disequality = executor.ctx.terms.mk_not_raw(equality);
+    executor
+        .ctx
+        .add_assertion_with_parsed(equality, parsed_assertion("(assert (= i j))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (distinct j i))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(disequality, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(!executor.last_unsat_proof_reconstruction_suppressed);
+    let overrides = executor
+        .last_proof_term_overrides
+        .clone()
+        .expect("the binary distinct root records its authored text");
+    assert_eq!(
+        overrides.get(&disequality).map(String::as_str),
+        Some("(distinct j i)")
+    );
+    let document = ay_proof::try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &executor.ctx.terms,
+        &[equality, disequality],
+        Some(&overrides),
+    )
+    .expect("the restored distinct spelling has a checked assume bridge");
+    assert!(
+        document.contains("(assume t1.a (distinct j i))") && document.contains(":rule not_symm"),
+        "{document}"
+    );
+    assert!(
+        !document.contains("(assume t1 (not (= i j)))"),
+        "the canonical negated equality must not be published as a premise:\n{document}"
     );
 }
 
@@ -415,9 +487,10 @@ fn a_withheld_root_does_not_cost_a_noncanonical_sibling_its_override() {
     executor
         .ctx
         .add_assertion_with_parsed(equality, parsed_assertion("(assert (= i (+ j 0)))"));
-    executor
-        .ctx
-        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (distinct i j))"));
+    executor.ctx.add_assertion_with_parsed(
+        disequality,
+        parsed_assertion("(assert (=> (= i j) (< 1 0)))"),
+    );
 
     let mut proof = Proof::new();
     let positive = proof.add_assume(equality, None);
@@ -442,7 +515,7 @@ fn a_withheld_root_does_not_cost_a_noncanonical_sibling_its_override() {
     assert_eq!(
         overrides.get(&disequality),
         None,
-        "`distinct` over a negated-equality root cannot be confined to its assume"
+        "an implication over a negated-equality root cannot be confined to its assume"
     );
 }
 
@@ -540,18 +613,21 @@ fn a_composite_fold_root_keeps_the_spelling_an_earlier_pass_installed() {
 }
 
 /// The other half of the same fact: with no earlier entry to preserve, a
-/// composite fold root gets NOTHING from this pass. It is withheld, never
-/// installed and never a suppression, and a sibling root in the same document
-/// still publishes its authored text — here by falling back to canonical text
-/// its own row spells exactly.
+/// composite fold root is restored from its own row when the printer derives
+/// the folded term from that exact spelling (here the conjunction projection:
+/// `and_pos` onto the printed conjunct `(= a b)`), and it is never a
+/// suppression.
 ///
-/// Measured end to end on `(assert (and (= a b) (= x x)))` +
-/// `(assert (not (= a b)))`: the published document is
-/// `(assume t0 (= a b))` ... `(cl)`, strictly Verified with trust=0 and
-/// hole=0, and the exported problem transport carries `(assert (= a b))` as an
-/// assertion of its own.
+/// Until the restoration asked the printer, this root got NOTHING from the
+/// pass. Measured end to end at `2c356fd15` on `(assert (and (= a b) (= x
+/// x)))` + `(assert (not (= a b)))` whenever an earlier pass had not left the
+/// conjunction on the root (the native SOS lane purges it; a later row's
+/// `(not (= a b))` overwrites it): the published document was `(assume t0 (=
+/// a b))` ... `(cl)`, which is no assertion of the problem file, stamped
+/// `foreign_assumes=yes`, and pinned carcara 1.1.0 refused it ("could not
+/// match term to any of the original problem premises").
 #[test]
-fn a_composite_fold_root_installs_nothing_when_no_earlier_pass_did() {
+fn a_composite_fold_root_restores_its_authored_conjunction() {
     let mut executor = Executor::new();
     let a = executor.ctx.terms.mk_var("a", Sort::Int);
     let b = executor.ctx.terms.mk_var("b", Sort::Int);
@@ -576,22 +652,41 @@ fn a_composite_fold_root_installs_nothing_when_no_earlier_pass_did() {
 
     assert!(
         !executor.last_unsat_proof_reconstruction_suppressed,
-        "a spelling this pass declines to install is not a publication failure"
+        "a restored fold spelling is not a publication failure"
     );
-    // As above, two facts where this pinned one: nothing is installed for
-    // EITHER root — the folded `and` is withheld, and `(assert (not (= a b)))`
-    // already spells its root exactly as the printer renders it, so it
-    // authenticates canonical text instead of re-deriving it as an entry that
-    // an earlier pass's spelling could then collide with.
-    assert!(
-        executor.last_proof_term_overrides.is_none(),
-        "an authored `and` over a folded `=` root is not installed by this \
-         pass, and its sibling is already canonical"
-    );
+    let overrides = executor
+        .last_proof_term_overrides
+        .clone()
+        .expect("the folded conjunction root records its authored text");
     assert_eq!(
-        ay_proof::format_term_alethe(&executor.ctx.terms, disequality),
-        "(not (= a b))",
-        "and the canonical text the sibling falls back to IS its authored spelling"
+        overrides.get(&equality).map(String::as_str),
+        Some("(and (= a b) (= x x))"),
+        "the folded root is spelled as its own row"
+    );
+    // The sibling spells its root canonically; the seal pins that text
+    // against the descendant spelling the folded root now carries.
+    assert_eq!(
+        overrides.get(&disequality).map(String::as_str),
+        Some("(not (= a b))")
+    );
+    let document = ay_proof::try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &executor.ctx.terms,
+        &[equality, disequality],
+        Some(&overrides),
+    )
+    .expect("the restored conjunction has a checked projection");
+    assert!(
+        document.contains("(assume t0.a (and (= a b) (= x x)))")
+            && document.contains(
+                "(step t0.p (cl (not (and (= a b) (= x x))) (= a b)) :rule and_pos :args (0))"
+            )
+            && document.contains("(assume t1 (not (= a b)))"),
+        "{document}"
+    );
+    assert!(
+        !document.contains("(assume t0 (= a b))"),
+        "the folded canonical term must not be published as a premise:\n{document}"
     );
 }
 
@@ -1138,32 +1233,49 @@ fn a_folded_authored_root_exports_with_the_problem_file_spelling() {
         "the cell just written with #x10 cannot read back #x20, got {outputs:?}"
     );
     let proof = outputs.last().expect("`(get-proof)` produces a document");
-
-    // Carcara matches an `assume` against the original problem premises
-    // SYNTACTICALLY, and it does not fold `(bvadd p #x00)`. Measured on
-    // carcara 1.1.0, the canonical spelling was rejected outright with
-    // "could not match term to any of the original problem premises".
     assert!(
-        proof.contains("(assume t0 (= mem2 (store mem (bvadd p #b00000000) #b00010000)))"),
+        !proof.lines().any(|line| line.starts_with("(error")),
+        "{proof}"
+    );
+    let path = std::env::temp_dir().join(format!(
+        "ay-folded-index-public-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "type":"alethe_certificate", "version":"1.0",
+            "problem":BVADD_FOLD_FIXTURE, "proof":proof
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    println!("independent replay certificate: {}", path.display());
+
+    // Assumptions must retain the authored index. SMT-LIB hexadecimal and
+    // binary literals denote the same parsed BV constant; proof IDs are local.
+    assert!(
+        proof.lines().any(|line| line.starts_with("(assume ")
+            && (line.ends_with(" (= mem2 (store mem (bvadd p #x00) #x10)))")
+                || line.ends_with(" (= mem2 (store mem (bvadd p #b00000000) #b00010000)))"))),
         "the assume must carry the problem file's own index spelling:\n{proof}"
     );
     assert!(
-        proof.contains("(assume t7 (= (select mem2 (bvadd p #b00000000)) #b00100000))"),
+        proof.lines().any(|line| line.starts_with("(assume ")
+            && (line.ends_with(" (= (select mem2 (bvadd p #x00)) #x20))")
+                || line.ends_with(" (= (select mem2 (bvadd p #b00000000)) #b00100000))"))),
         "every authored root must carry it, not just the first:\n{proof}"
     );
-    // ...and ONE spelling per term: the ROW1 index must agree with the store's
-    // index and with the reflexive congruence hypothesis, or Carcara's
-    // `arrays_idx` / `eq_congruent` reject the very steps the assume unlocked.
+    // Canonical indices may occur in derived steps only through the explicit
+    // checked addition bridge. The independent replay checks the entire chain
+    // from these exact assumptions through read-over-write to the empty clause.
     assert!(
-        proof.contains(
-            "(step t5 (cl (= (select (store mem (bvadd p #b00000000) #b00010000) \
-             (bvadd p #b00000000)) #b00010000)) :rule arrays_idx)"
-        ),
-        "the ROW1 step must read the same index it wrote:\n{proof}"
+        proof.contains(":rule bitblast_add") && proof.contains(":rule arrays_idx"),
+        "the array derivation needs its checked index equality:\n{proof}"
     );
     assert!(
-        !proof.contains("(select mem2 p)"),
-        "no step may fall back to the folded spelling:\n{proof}"
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "the exported derivation must be complete:\n{proof}"
     );
 }
 

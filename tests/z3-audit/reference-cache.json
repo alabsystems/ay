@@ -37,18 +37,24 @@
     "problem": "benchmarks/chc/counter_safe_chccomp.smt2",
     "problem_sha256": "4c3d57c3b9fe565d373115186f0ff64cc3a74e32023d8422062cabbd8e71263c"
   },
-  "generated_at_unix_seconds": 1785035367,
+  "generated_at_unix_seconds": 1794441314,
   "generator": {
     "ay": "target/debug/ay",
-    "ay_version": "ay 0.3.0+build.5637.98a72fb841535ccd96684118fd232e07de107693@2026-07-26T00:02:15Z",
-    "z3_command": "/opt/homebrew/bin/z3",
-    "z3_version": "Z3 version 5.0.0 - 64 bit"
+    "ay_version": "unpublished-development-fixture",
+    "z3_command": "z3",
+    "z3_identity": {
+      "executable_sha256": "9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4",
+      "pin_sha256": "974662f65b84a386c11a8b28791f2e06eb782fd510c8f906386fea56238c6483",
+      "row": "darwin_arm64",
+      "version": "5.3.3"
+    },
+    "z3_version": "Z3 version 5.3.3 - 64 bit - build hashcode 430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e"
   },
   "replacement_surface_evidence": {
     "schema": "ay-z3-audit-replacement-surface-evidence/v1",
     "surfaces": [
       {
-        "command": "cargo build --release --locked && ./target/release/ay --version",
+        "command": "CARGO_SKIP_CACHE=1 build-slot -- targo --unverified build --release --locked -p ay --features cli,bench --bin ay && ./target/release/ay --version",
         "current": "4/4 local release-build provenance files present; 0/1 current-code unauthenticated public-clone build packets pass; stale_passing_public_logs=1",
         "goal": "1/1 fresh unauthenticated release build packet with command, environment, ay --version, and artifact provenance",
         "id": "public_source_build",
@@ -57,21 +63,21 @@
         "status": "fail"
       },
       {
-        "command": "cargo build --release --locked -p ay --features bench --bin ay && ./target/release/ay bench run smt-local-suite smt-smtcomp-qf-lia smt-smtcomp-qf-lra smt-smtcomp-qf-bv smt-smtcomp-qf-abv smt-smtcomp-qf-uf smt-smtcomp-qf-alia smt-smtcomp-qf-auflia --ay ./target/release/ay --timeout 30 --reference-solver z3",
-        "current": "0/8 current-code eval packets; 8/8 packets found; eval_statuses=pass:0,fail:8,fail_timeout:0,fail_unknown:0,fail_error:0; benchmarks=0; agree=0; disagree=0; ay_only=0; reference_solved_missing=0; reference_solved_missing_ay_results=none; both_solved=0; ay_errors=0; ref_errors=0; ay_results=none; ref_results=none; per_eval=[smt-local-suite{status=fail; packet=stale@985868f585f9d7d263b65ffba98ff998135b345c; dirty=false; benchmarks=188; agree=183; disagree=0; ay_only=0; reference_solved_missing=4; reference_solved_missing_ay_results=unknown:2,timeout:2; ay_results=sat:83,unsat:100,unknown:2,timeout:3; ref_results=sat:85,unsat:102,timeout:1; top_reference_solved_missing=pointer-safe-5.smt2:ay=timeout,ref=unsat,ay_time=20.000s,qlock-bug-10.smt2:ay=timeout,ref=sat,ay_time=20.000s,seq_dense_ghost_vec.smt2:ay=unknown,ref=sat,ay_time=0.982s; source=evals/results/smt-local-suite/2026-07-16T10-55-22Z/results.json}; smt-smtcomp-qf-lia{status=fail; packet=stale@799c3745e374fa862739edfcfdacdbeccb175f2d; dirty=false; benchmarks=141; agree=124; disagree=0; ay_only=8; reference_solved_missing=9; reference_solved_missing_ay_results=timeout:9; ay_results=sat:79,unsat:53,timeout:9; ref_results=sat:88,unsat:45,timeout:8; top_reference_solved_missing=problem__006.smt2:ay=timeout,ref=sat,ay_time=20.000s,problem__006.smt2:ay=timeout,ref=sat,ay_time=20.000s,problem__005.smt2:ay=timeout,ref=sat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-lia/2026-07-16T13-00-48Z/results.json}; smt-smtcomp-qf-lra{status=fail; packet=stale@799c3745e374fa862739edfcfdacdbeccb175f2d; dirty=false; benchmarks=125; agree=122; disagree=0; ay_only=0; reference_solved_missing=3; reference_solved_missing_ay_results=timeout:3; ay_results=sat:72,unsat:50,timeout:3; ref_results=sat:74,unsat:51; top_reference_solved_missing=polyrank4.t2.c_Iteration8_Loop_4-pieceTemplate.smt2:ay=timeout,ref=unsat,ay_time=20.000s,simple_startup_10nodes.bug.induct.smt2:ay=timeout,ref=sat,ay_time=20.000s,simple_startup_14nodes.bug.induct.smt2:ay=timeout,ref=sat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-lra/2026-07-16T13-09-51Z/results.json}; smt-smtcomp-qf-bv{status=fail; packet=stale@799c3745e374fa862739edfcfdacdbeccb175f2d; dirty=false; benchmarks=136; agree=114; disagree=0; ay_only=0; reference_solved_missing=10; reference_solved_missing_ay_results=unknown:2,timeout:8; ay_results=sat:56,unsat:58,unknown:2,timeout:20; ref_results=sat:65,unsat:59,timeout:12; top_reference_solved_missing=compose.s2._bit8_na6_nr3_paired.smt2:ay=timeout,ref=sat,ay_time=20.000s,mobiledevice_bit8_na6_nr3_paired.smt2:ay=timeout,ref=sat,ay_time=20.000s,string1x8.6._bit8_na6_nr3_paired.smt2:ay=timeout,ref=sat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-bv/2026-07-16T12-48-35Z/results.json}; smt-smtcomp-qf-abv{status=fail; packet=stale@985868f585f9d7d263b65ffba98ff998135b345c; dirty=false; benchmarks=150; agree=149; disagree=0; ay_only=0; reference_solved_missing=0; reference_solved_missing_ay_results=none; ay_results=sat:87,unsat:62,unknown:1; ref_results=sat:87,unsat:62,timeout:1; top_reference_solved_missing=none; source=evals/results/smt-smtcomp-qf-abv/2026-07-16T10-57-07Z/results.json}; smt-smtcomp-qf-uf{status=fail; packet=stale@799c3745e374fa862739edfcfdacdbeccb175f2d; dirty=false; benchmarks=157; agree=152; disagree=0; ay_only=0; reference_solved_missing=4; reference_solved_missing_ay_results=unknown:1,timeout:3; ay_results=sat:54,unsat:98,unknown:1,timeout:4; ref_results=sat:54,unsat:102,timeout:1; top_reference_solved_missing=NEQ016_size8.smt2:ay=timeout,ref=unsat,ay_time=20.000s,NEQ032_size4.smt2:ay=timeout,ref=unsat,ay_time=20.000s,PEQ018_size6.smt2:ay=timeout,ref=unsat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-uf/2026-07-16T13-11-12Z/results.json}; smt-smtcomp-qf-alia{status=fail; packet=stale@985868f585f9d7d263b65ffba98ff998135b345c; dirty=false; benchmarks=176; agree=41; disagree=0; ay_only=0; reference_solved_missing=89; reference_solved_missing_ay_results=timeout:89; ay_results=unsat:41,timeout:135; ref_results=sat:59,unsat:71,timeout:46; top_reference_solved_missing=AllInterval-011.c_AllErrorsAtOnce_Iteration2_0.smt2:ay=timeout,ref=sat,ay_time=20.000s,cs_lazy.i_3.smt2:ay=timeout,ref=sat,ay_time=20.000s,cs_lazy.i_6.smt2:ay=timeout,ref=sat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-alia/2026-07-16T10-57-53Z/results.json}; smt-smtcomp-qf-auflia{status=fail; packet=stale@799c3745e374fa862739edfcfdacdbeccb175f2d; dirty=false; benchmarks=1303; agree=1177; disagree=0; ay_only=0; reference_solved_missing=126; reference_solved_missing_ay_results=unknown:11,timeout:115; ay_results=sat:532,unsat:645,unknown:11,timeout:115; ref_results=sat:543,unsat:760; top_reference_solved_missing=pipeline-invalid.smt2:ay=timeout,ref=sat,ay_time=20.000s,dlx-dmem.smt2:ay=timeout,ref=unsat,ay_time=20.000s,dlx-pc.smt2:ay=timeout,ref=unsat,ay_time=20.000s; source=evals/results/smt-smtcomp-qf-auflia/2026-07-16T12-03-04Z/results.json}]",
+        "command": "CARGO_SKIP_CACHE=1 build-slot -- targo --unverified build --release --locked -p ay --features cli,bench --bin ay && ./target/release/ay bench run smt-local-suite smt-smtcomp-qf-lia smt-smtcomp-qf-lra smt-smtcomp-qf-bv smt-smtcomp-qf-abv smt-smtcomp-qf-uf smt-smtcomp-qf-alia smt-smtcomp-qf-auflia --ay ./target/release/ay --timeout 30 --reference-solver z3",
+        "current": "0/8 current-code eval packets; 1/8 packets found; eval_statuses=pass:0,fail:8,fail_timeout:0,fail_unknown:0,fail_error:0,not_run:0,missing:0,stale:0; benchmarks=0; agree=0; disagree=0; ay_only=0; reference_solved_missing=0; reference_solved_missing_ay_results=none; both_solved=0; ay_errors=0; ref_errors=0; ay_results=none; ref_results=none; per_eval=[smt-local-suite{status=fail; packet=stale@8b64632c28ca60b6ded755579bac0509bdd0a953; dirty=false; benchmarks=188; agree=183; disagree=0; ay_only=0; reference_solved_missing=4; reference_solved_missing_ay_results=unknown:1,timeout:3; ay_results=sat:83,unsat:100,unknown:1,timeout:4; ref_results=sat:85,unsat:102,timeout:1; top_reference_solved_missing=ios_t1_ios_bia_np_sf_ai_00005_001.cvc.smt2:ay=timeout,ref=unsat,ay_time=30.000s,ios_t1_ios_np_sf_ai_00004_001.cvc.smt2:ay=timeout,ref=unsat,ay_time=30.000s,qlock-bug-10.smt2:ay=timeout,ref=sat,ay_time=30.000s; source=evals/results/smt-local-suite/2026-06-05T09-10-43Z/results.json}; smt-smtcomp-qf-lia{status=fail; packet=missing}; smt-smtcomp-qf-lra{status=fail; packet=missing}; smt-smtcomp-qf-bv{status=fail; packet=missing}; smt-smtcomp-qf-abv{status=fail; packet=missing}; smt-smtcomp-qf-uf{status=fail; packet=missing}; smt-smtcomp-qf-alia{status=fail; packet=missing}; smt-smtcomp-qf-auflia{status=fail; packet=missing}]",
         "goal": "1/1 current-code differential packet with per-logic solved/unknown/timeout/error/disagreement counts, 0 wrong answers, and reference_solved_missing=0",
         "id": "smtlib_input",
-        "missing": "stale eval packets not from current code tree: smt-local-suite@985868f585f9d7d263b65ffba98ff998135b345c, smt-smtcomp-qf-lia@799c3745e374fa862739edfcfdacdbeccb175f2d, smt-smtcomp-qf-lra@799c3745e374fa862739edfcfdacdbeccb175f2d, smt-smtcomp-qf-bv@799c3745e374fa862739edfcfdacdbeccb175f2d, smt-smtcomp-qf-abv@985868f585f9d7d263b65ffba98ff998135b345c, smt-smtcomp-qf-uf@799c3745e374fa862739edfcfdacdbeccb175f2d, smt-smtcomp-qf-alia@985868f585f9d7d263b65ffba98ff998135b345c, smt-smtcomp-qf-auflia@799c3745e374fa862739edfcfdacdbeccb175f2d",
-        "source": "evals/results/smt-local-suite/2026-07-16T10-55-22Z/results.json, evals/results/smt-smtcomp-qf-lia/2026-07-16T13-00-48Z/results.json, evals/results/smt-smtcomp-qf-lra/2026-07-16T13-09-51Z/results.json, evals/results/smt-smtcomp-qf-bv/2026-07-16T12-48-35Z/results.json, evals/results/smt-smtcomp-qf-abv/2026-07-16T10-57-07Z/results.json, evals/results/smt-smtcomp-qf-uf/2026-07-16T13-11-12Z/results.json, evals/results/smt-smtcomp-qf-alia/2026-07-16T10-57-53Z/results.json, evals/results/smt-smtcomp-qf-auflia/2026-07-16T12-03-04Z/results.json",
+        "missing": "missing eval packets: smt-smtcomp-qf-lia, smt-smtcomp-qf-lra, smt-smtcomp-qf-bv, smt-smtcomp-qf-abv, smt-smtcomp-qf-uf, smt-smtcomp-qf-alia, smt-smtcomp-qf-auflia; stale eval packets not from current code tree: smt-local-suite@8b64632c28ca60b6ded755579bac0509bdd0a953",
+        "source": "evals/results/smt-local-suite/2026-06-05T09-10-43Z/results.json",
         "status": "fail"
       },
       {
-        "command": "competition/prepare_sat26_submission.sh --variant default --track main --ai-class regular --proof-format lrat --stage-binary ./target/release/ay --allow-local-runsh-preflight-binary --output \"$PWD/target/sat26-submission\" && scripts/run_satcomp_matrix.sh --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf --expected sat --family canary --category sanity --submission-root \"$PWD/target/sat26-submission\" --variants default --timeout-sec 30 --proof-checker auto --reference-solver cadical=reference/cadical/build/cadical --output the development design notes --soundness --fail-on-wrong",
-        "current": "0/1 current-code SAT-COMP-shaped scoreboard packets pass; 1 SAT-COMP-shaped scoreboard packets found; stale_scoreboards=1",
+        "command": "competition/prepare_sat26_submission.sh --variant default --track main --ai-class regular --proof-format veripb --stage-binary ./target/release/ay --allow-local-runsh-preflight-binary --output \"$PWD/target/sat26-submission\" && ay submission preflight sat-matrix run --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf --expected sat --family canary --category sanity --submission-root \"$PWD/target/sat26-submission\" --variants default --timeout-sec 30 --proof-checker auto --output the development design notes --soundness --fail-on-wrong",
+        "current": "0/1 current-code SAT-COMP-shaped scoreboard packets pass; 0 SAT-COMP-shaped scoreboard packets found; stale_scoreboards=0",
         "goal": "1/1 current SAT-COMP-shaped packet with solved count, PAR-2, model/proof validity, 0 wrong answers, and 0 reference-only solves",
         "id": "dimacs_cnf_input",
-        "missing": "current-code SAT-COMP-shaped scoreboard packet is missing; stale scoreboards not from current code tree: the development design notes@530687dfdf4d726750f4ec67f2383b8f175be00d",
-        "source": "the development design notes@530687dfdf4d726750f4ec67f2383b8f175be00d",
+        "missing": "current-code SAT-COMP-shaped scoreboard packet is missing",
+        "source": "",
         "status": "fail"
       },
       {
@@ -84,7 +90,7 @@
         "status": "fail"
       },
       {
-        "command": "ay gate solver && bash scripts/soundness_gate.sh",
+        "command": "ay gate land --no-push",
         "current": "basic SMT model transcript=1/1 cached; SAT scoreboard invalid=0; SAT scoreboard wrong=0; SAT model checks passed=0/0; broad SMT theory model-validation packets=0/0",
         "goal": "1/1 model-validation packet with invalid_model_count=0 for every claimed SAT/model surface",
         "id": "models",
@@ -102,7 +108,7 @@
         "status": "fail"
       },
       {
-        "command": "cargo test -p ay-ffi --release && cargo build -p ay-ffi --release --locked",
+        "command": "CARGO_SKIP_CACHE=1 build-slot -- targo --unverified test -p ay-ffi --release && CARGO_SKIP_CACHE=1 build-slot -- targo --unverified build -p ay-ffi --release --locked",
         "current": "header sources present=2/2; consumer test sources present=2/2; checked-in FFI result packets=0/1",
         "goal": "1/1 ABI/API smoke packet with examples, build instructions, consumer tests, and explicit libz3-compatibility decision",
         "id": "c_api_ffi",
@@ -112,5 +118,5 @@
       }
     ]
   },
-  "schema": "ay-z3-audit-reference-cache/v1"
+  "schema": "ay-z3-audit-reference-cache/v2"
 }

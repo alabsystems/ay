@@ -9,7 +9,9 @@
 //! such as CEGAR, PDR, and abstraction-refinement engines.
 
 use super::context::SmtContext;
-use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
+use crate::interpolation::{
+    interpolating_sat_constraints, interpolating_sat_constraints_until, InterpolatingSatResult,
+};
 use crate::ChcExpr;
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 
@@ -106,10 +108,7 @@ impl SmtContext {
             .collect();
         let shared_vars: FxHashSet<String> = a_vars.intersection(&b_vars).cloned().collect();
 
-        match interpolating_sat_constraints(a_assertions, b_assertions, &shared_vars) {
-            InterpolatingSatResult::Unsat(interpolant) => InterpolationResult::Unsat(interpolant),
-            InterpolatingSatResult::Unknown => InterpolationResult::Unknown,
-        }
+        self.interpolate_within_budget(a_assertions, b_assertions, &shared_vars)
     }
 
     /// Compute a Craig interpolant with explicit shared variables.
@@ -130,7 +129,32 @@ impl SmtContext {
         b_assertions: &[ChcExpr],
         shared_vars: &FxHashSet<String>,
     ) -> InterpolationResult {
-        match interpolating_sat_constraints(a_assertions, b_assertions, shared_vars) {
+        self.interpolate_within_budget(a_assertions, b_assertions, shared_vars)
+    }
+
+    /// Run the cascade within `check_sat`'s budget for this context
+    /// ([`SmtContext::check_budget_deadline`]): the per-check timeout and the
+    /// global solve deadline bound it as they bound every other check here,
+    /// and a spent budget refuses. The cascade's own checks see only the
+    /// thread's deadlines, so without this a context scoped to a short check
+    /// timeout ran the whole cascade.
+    fn interpolate_within_budget(
+        &self,
+        a_assertions: &[ChcExpr],
+        b_assertions: &[ChcExpr],
+        shared_vars: &FxHashSet<String>,
+    ) -> InterpolationResult {
+        let result = match self.check_budget_deadline(ay_core::time::Instant::now()) {
+            Err(()) => return InterpolationResult::Unknown,
+            Ok(None) => interpolating_sat_constraints(a_assertions, b_assertions, shared_vars),
+            Ok(Some(deadline)) => interpolating_sat_constraints_until(
+                a_assertions,
+                b_assertions,
+                shared_vars,
+                deadline,
+            ),
+        };
+        match result {
             InterpolatingSatResult::Unsat(interpolant) => InterpolationResult::Unsat(interpolant),
             InterpolatingSatResult::Unknown => InterpolationResult::Unknown,
         }

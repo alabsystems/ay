@@ -77,7 +77,7 @@ fn mode_index(terms: &TermStore, term: TermId) -> Option<usize> {
     let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
         return None;
     };
-    if !args.is_empty() {
+    if !args.is_empty() || terms.is_declared_function(name) {
         return None;
     }
     MODE_NAMES.iter().position(|candidate| name == candidate)
@@ -85,7 +85,9 @@ fn mode_index(terms: &TermStore, term: TermId) -> Option<usize> {
 
 fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
+        TermData::App(Symbol::Named(name), args)
+            if name == "=" && args.len() == 2 && !terms.is_declared_function(name) =>
+        {
             Some((args[0], args[1]))
         }
         _ => None,
@@ -102,7 +104,7 @@ fn negated_equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, Te
 fn disjunction_literals<'a>(terms: &'a TermStore, clause: &'a [TermId]) -> &'a [TermId] {
     if let [only] = clause {
         if let TermData::App(Symbol::Named(name), args) = terms.get(*only) {
-            if name == "or" {
+            if name == "or" && !terms.is_declared_function(name) {
                 return args;
             }
         }
@@ -203,7 +205,9 @@ fn recognize_distinct_conjunction(terms: &TermStore, clause: &[TermId]) -> bool 
     let TermData::App(Symbol::Named(name), conjuncts) = terms.get(*only) else {
         return false;
     };
-    name == "and" && exact_pair_mask(terms, conjuncts, disequality_pair_bit)
+    name == "and"
+        && !terms.is_declared_function(name)
+        && exact_pair_mask(terms, conjuncts, disequality_pair_bit)
 }
 
 fn recognize_distinct_demorgan(terms: &TermStore, clause: &[TermId]) -> bool {
@@ -216,7 +220,9 @@ fn recognize_distinct_demorgan(terms: &TermStore, clause: &[TermId]) -> bool {
     let TermData::App(Symbol::Named(name), equalities) = terms.get(*disjunction) else {
         return false;
     };
-    name == "or" && exact_pair_mask(terms, equalities, equality_pair_bit)
+    name == "or"
+        && !terms.is_declared_function(name)
+        && exact_pair_mask(terms, equalities, equality_pair_bit)
 }
 
 /// Recognize `not(distinct t_0 ... t_n)` for more than five values of the
@@ -230,7 +236,7 @@ fn recognize_domain_pigeonhole(terms: &TermStore, literal: TermId) -> bool {
     let TermData::App(Symbol::Named(name), conjuncts) = terms.get(*distinct) else {
         return false;
     };
-    if name != "and" {
+    if name != "and" || terms.is_declared_function(name) {
         return false;
     }
 
@@ -291,6 +297,98 @@ mod tests {
             .map(|name| terms.mk_app(Symbol::named(*name), Vec::new(), sort.clone()))
             .collect();
         (terms, modes)
+    }
+
+    #[test]
+    fn registered_mode_or_equality_names_cannot_supply_distinctness_axioms() {
+        for head in ["RNE", "="] {
+            let (mut terms, modes) = fixture();
+            let equality = terms.mk_eq(modes[0], modes[1]);
+            let disequality = terms.mk_not_raw(equality);
+            assert!(recognize_rounding_mode_domain(&terms, &[disequality]));
+            terms.register_declared_function(head);
+            assert!(
+                !recognize_rounding_mode_domain(&terms, &[disequality]),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_boolean_heads_cannot_supply_complete_domain_axioms() {
+        for head in ["and", "or"] {
+            let (mut terms, modes) = fixture();
+            let distinct = terms.mk_distinct(modes);
+            let theorem = if head == "and" {
+                distinct
+            } else {
+                let TermData::App(_, pairs) = terms.get(distinct).clone() else {
+                    panic!("pairwise conjunction")
+                };
+                let equalities = pairs
+                    .iter()
+                    .map(|&pair| {
+                        let TermData::Not(equality) = terms.get(pair) else {
+                            panic!("disequality")
+                        };
+                        *equality
+                    })
+                    .collect();
+                let disjunction = terms.mk_or(equalities);
+                terms.mk_not_raw(disjunction)
+            };
+            assert!(recognize_rounding_mode_domain(&terms, &[theorem]));
+            terms.register_declared_function(head);
+            assert!(
+                !recognize_rounding_mode_domain(&terms, &[theorem]),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_mode_cannot_authorize_a_complete_false_refutation() {
+        let (mut terms, modes) = fixture();
+        let equality = terms.mk_eq(modes[0], modes[1]);
+        let disequality = terms.mk_not_raw(equality);
+        let mut proof = ay_core::Proof::new();
+        let assumed = proof.add_assume(equality, None);
+        let theorem = proof.add_theory_lemma_with_kind(
+            "RoundingMode",
+            vec![disequality],
+            ay_core::TheoryLemmaKind::RoundingModeDomain,
+        );
+        proof.add_resolution(vec![], equality, assumed, theorem);
+        assert!(crate::check_proof_strict(&proof, &terms)
+            .unwrap()
+            .is_complete());
+        terms.register_declared_function("RNE");
+        assert!(crate::check_proof_strict(&proof, &terms).is_err());
+        let bundle = crate::SerializableProofBundle::from_proof(&proof, &terms, vec![equality]);
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        let restored = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            crate::re_check_bundle_strict(&restored).is_err(),
+            "offline replay must preserve the user-head identity that the live checker rejected"
+        );
+    }
+
+    #[test]
+    fn registered_subject_functions_keep_genuine_five_mode_coverage() {
+        let (mut terms, modes) = fixture();
+        let argument = terms.mk_var("argument", Sort::Int);
+        let subject = terms.mk_app(
+            Symbol::named("user_mode"),
+            [argument],
+            Sort::Uninterpreted("RoundingMode".into()),
+        );
+        terms.register_declared_function("user_mode");
+        let equalities = modes
+            .iter()
+            .map(|&mode| terms.mk_eq(subject, mode))
+            .collect();
+        let coverage = terms.mk_or(equalities);
+        assert!(recognize_rounding_mode_domain(&terms, &[coverage]));
     }
 
     #[test]

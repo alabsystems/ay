@@ -29,7 +29,7 @@ const COMPACT_LIMIT_PER_MILLE: usize = 10;
 
 /// Base conflict interval between compaction attempts.
 /// CaDiCaL: `compactint = 2000` (options.hpp:55).
-const COMPACT_INTERVAL_BASE: u64 = 2_000;
+pub(super) const COMPACT_INTERVAL_BASE: u64 = 2_000;
 
 /// Sentinel value meaning "variable is not mapped" (inactive).
 pub(crate) const UNMAPPED: u32 = u32::MAX;
@@ -38,7 +38,9 @@ pub(crate) const UNMAPPED: u32 = u32::MAX;
 ///
 /// Maps old variable indices to new contiguous indices. Eliminated and
 /// substituted variables are unmapped; all active variables (including
-/// level-0 fixed) get contiguous new indices.
+/// level-0 fixed) get contiguous new indices, except under
+/// `--sat-compact-fixed`, which also unmaps the root-fixed variables no
+/// clause mentions (compact_fixed.rs).
 pub(crate) struct VariableMap {
     /// `old_to_new[old_var_idx]` = new variable index, or `UNMAPPED` if
     /// the variable is inactive (eliminated/substituted).
@@ -51,13 +53,18 @@ impl VariableMap {
     /// Build the mapping table from the current solver state.
     ///
     /// Active and non-eliminated variables get contiguous new indices.
-    /// Eliminated/substituted variables are unmapped.
-    fn build(num_vars: usize, lifecycle: &lifecycle::VarLifecycle) -> Self {
+    /// Eliminated/substituted variables are unmapped, and so is every
+    /// variable `dropped` marks (`--sat-compact-fixed`).
+    fn build(
+        num_vars: usize,
+        lifecycle: &lifecycle::VarLifecycle,
+        dropped: Option<&[bool]>,
+    ) -> Self {
         let mut old_to_new = vec![UNMAPPED; num_vars];
         let mut next_idx: u32 = 0;
 
         for (var_idx, slot) in old_to_new.iter_mut().enumerate() {
-            if lifecycle.is_removed(var_idx) {
+            if lifecycle.is_removed(var_idx) || dropped.is_some_and(|d| d[var_idx]) {
                 continue;
             }
             *slot = next_idx;
@@ -150,7 +157,19 @@ impl Solver {
         if self.cold.has_been_incremental {
             return false;
         }
-        if self.proof_manager.is_some() {
+        // proof-posture-parity (site C): compaction stays OFF only where a
+        // proof consumer holds internal literals across the solve — LRAT (its
+        // level-0 unit materialisation is keyed by variable and was never
+        // exercised across a remap), a live clause trace, and the bounded
+        // backward-proof mode. On the plain DRAT/VeriPB surface — the shipped
+        // SAT-COMP posture — every emitted literal is externalized at the
+        // proof funnel once `proof_vars_compacted` is set below, so the
+        // proof survives the renumbering and both postures compact alike.
+        if self.proof_manager.is_some()
+            && (self.cold.lrat_enabled
+                || self.has_live_clause_trace()
+                || self.cold.backward_proof_limits.is_some())
+        {
             return false;
         }
         if self.cold.freeze_counts.iter().any(|&c| c > 0) {
@@ -160,14 +179,28 @@ impl Solver {
         // aggressive compaction keeps the clause arena tight for cache
         // performance on large formulas (bvsub 598K vars, stable-300).
         let inactive = self.var_lifecycle.count_removed();
-        if inactive < COMPACT_MIN_INACTIVE {
-            return false;
+        if self.compact_inactive_suffices(inactive) {
+            return true;
         }
+        // `--sat-compact-fixed` (compact_fixed.rs): root-fixed variables are
+        // inactive too, as in CaDiCaL's `active ()` (internal.hpp:363-379).
+        // When it takes them to cross the thresholds, CaDiCaL's conflict
+        // limit applies (`lim.compact`, compact.cpp:13-27), so fixed
+        // variables that clauses still hold are not retried every round. A
+        // solver that removes no variables never compacts by default, and
+        // the switch leaves it so (`compact_fixed_active`).
+        self.compact_fixed_active()
+            && self.num_conflicts >= self.cold.compact_next_conflict
+            && self.compact_inactive_suffices(inactive + self.count_root_fixed_unremoved())
+    }
+
+    /// CaDiCaL's size thresholds (`compactmin`, `compactlim`; compact.cpp:13-27):
+    /// at least `COMPACT_MIN_INACTIVE` inactive variables, and at least
+    /// `COMPACT_LIMIT_PER_MILLE` per mille of all variables.
+    fn compact_inactive_suffices(&self, inactive: usize) -> bool {
         // inactive >= 0.001 * COMPACT_LIMIT_PER_MILLE * num_vars
-        if inactive * 1000 < COMPACT_LIMIT_PER_MILLE * self.num_vars {
-            return false;
-        }
-        true
+        inactive >= COMPACT_MIN_INACTIVE
+            && inactive * 1000 >= COMPACT_LIMIT_PER_MILLE * self.num_vars
     }
 
     /// Compact variable indices: remap all active variables to a contiguous
@@ -180,13 +213,25 @@ impl Solver {
         debug_assert_eq!(self.decision_level, 0);
         debug_assert_eq!(self.qhead, self.trail.len());
 
-        let map = VariableMap::build(self.num_vars, &self.var_lifecycle);
+        // `--sat-compact-fixed` also drops the root-fixed variables that no
+        // clause mentions any more (compact_fixed.rs).
+        let fixed = self.compact_fixed_active();
+        let map = {
+            let dropped = fixed.then(|| self.droppable_fixed_vars());
+            VariableMap::build(self.num_vars, &self.var_lifecycle, dropped.as_deref())
+        };
 
         if map.new_num_vars == self.num_vars {
             return;
         }
+        // Counted work under `--sat-deterministic-inproc`: every clause and
+        // every watch list is renumbered (det_work.rs).
+        self.charge_inproc_scan(self.arena_scan_te() + self.watch_scan_te());
 
         let old_num_vars = self.num_vars;
+        if fixed {
+            self.drop_fixed_unit_clauses(&map);
+        }
 
         // ── Phase 0: Pre-compaction stale clause cleanup (#8464, #8397) ─────
         //
@@ -327,6 +372,9 @@ impl Solver {
             }
             self.indep_support = remapped;
         }
+        if fixed {
+            self.remap_trail_marks_for_compaction(&map);
+        }
         self.trail = new_trail;
         self.qhead = self.trail.len();
 
@@ -351,6 +399,12 @@ impl Solver {
         map.remap_var_vec(&mut self.target_phase);
         map.remap_var_vec(&mut self.best_phase);
         map.remap_var_vec(&mut self.cold.freeze_counts);
+        if !self.cold.backbone_probed_in_pass.is_empty() {
+            map.remap_var_vec(&mut self.cold.backbone_probed_in_pass);
+        }
+        if !self.cold.backbone_binary_candidate.is_empty() {
+            map.remap_lit_vec(&mut self.cold.backbone_binary_candidate);
+        }
         if !self.cold.level0_proof_id.is_empty() {
             map.remap_var_vec(&mut self.cold.level0_proof_id);
         }
@@ -423,15 +477,18 @@ impl Solver {
             });
         }
 
-        // ── Phase 4b: Save eliminated variables' level-0 values (#8179) ──
+        // ── Phase 4b: Save unmapped variables' level-0 values (#8179) ──
         //
         // CaDiCaL preserves eliminated variables' vals across compaction
         // (extend.cpp:140 reads `internal->val(ilit)` for all variables).
         // AY's Phase 5 below truncates `self.vals`, losing eliminated
         // variables' level-0 assignments. Save them in external-index
-        // space so `finalize_sat` can seed ext_model correctly.
+        // space so `finalize_sat` can seed ext_model correctly. Every
+        // unmapped variable is saved: the eliminated and substituted ones
+        // and, under `--sat-compact-fixed`, the dropped root-fixed ones,
+        // whose saved value is their root value.
         for old_var in 0..old_num_vars {
-            if !self.var_lifecycle.is_removed(old_var) {
+            if map.map_var(old_var).is_some() {
                 continue;
             }
             let ext_var = self.cold.i2e[old_var] as usize;
@@ -495,6 +552,36 @@ impl Solver {
             self.cold.i2e = new_i2e;
         }
 
+        // proof-posture-parity (site C): the proof-side state keyed by
+        // internal variable. `veripb_stated_root_units` is a bitset over
+        // internal variables — rebuild it through the map. Deferred proof
+        // deletions hold internal literals and are only ever pending inside
+        // a BVE round, never here between passes. From now on every literal
+        // reaching a proof writer is externalized through `i2e`.
+        if self.proof_manager.is_some() {
+            debug_assert!(
+                !self.defer_proof_deletions && self.deferred_proof_deletions.is_empty(),
+                "BUG: compaction with pending deferred proof deletions"
+            );
+            if !self.cold.veripb_stated_root_units.is_empty() {
+                let old_bits = std::mem::take(&mut self.cold.veripb_stated_root_units);
+                let mut new_bits = vec![0u64; map.new_num_vars.div_ceil(64)];
+                for old_var in 0..old_num_vars {
+                    let word = old_var / 64;
+                    if old_bits
+                        .get(word)
+                        .is_some_and(|w| w & (1u64 << (old_var % 64)) != 0)
+                    {
+                        if let Some(new_var) = map.map_var(old_var) {
+                            new_bits[new_var / 64] |= 1u64 << (new_var % 64);
+                        }
+                    }
+                }
+                self.cold.veripb_stated_root_units = new_bits;
+            }
+            self.cold.proof_vars_compacted = true;
+        }
+
         // ── Phase 10: Reconstruction stack uses external indices (#5250) ──
         // No remapping needed — entries store stable external indices that
         // are never affected by internal variable compaction.
@@ -515,8 +602,16 @@ impl Solver {
         let probe_stats = self.inproc.prober.stats().clone();
         let congruence_stats = self.inproc.congruence.stats().clone();
 
+        // The Kissat growth bound (0, 1, 2, 4, 8, 16 across complete phases)
+        // lives on the engine and was lost with it here after every productive
+        // phase, so in-search BVE never passed bound 2 (hitag2-7: 697 of 2,262
+        // variables eliminated against Kissat's 1,698; 2026-09-19). Carry it.
+        let (bve_bound, bve_fastelim, bve_quick) = self.inproc.bve.budget_mode();
         self.inproc.bve = BVE::new(map.new_num_vars);
         self.inproc.bve.restore_stats(bve_stats);
+        self.inproc
+            .bve
+            .restore_budget_mode(bve_bound, bve_fastelim, bve_quick);
         self.inproc.bce = BCE::new(map.new_num_vars);
         self.inproc.bce.restore_stats(bce_stats);
         self.inproc.subsumer = Subsumer::new(map.new_num_vars);
@@ -525,8 +620,16 @@ impl Solver {
         self.dirty_watches = vec![false; map.new_num_vars * 2]; // reset after compaction
         self.dirty_watch_list.clear(); // reset after compaction
         self.l0_gc_dirty = vec![false; map.new_num_vars]; // reset after compaction
+                                                          // The sweep's per-variable pass marks went the way of the BVE bound
+                                                          // above (lost with the engine on every compaction): carry them,
+                                                          // remapped to the compacted indices.
+        let (mut sweep_marks, sweep_pass) = self.inproc.sweeper.take_pass_state();
+        map.remap_var_vec(&mut sweep_marks);
         self.inproc.sweeper = Sweeper::new(map.new_num_vars);
         self.inproc.sweeper.restore_stats(sweep_stats);
+        self.inproc
+            .sweeper
+            .restore_pass_state(sweep_marks, sweep_pass);
         self.inproc.prober = Prober::new(map.new_num_vars);
         self.inproc.prober.restore_stats(probe_stats);
         self.inproc.decompose_engine = Decompose::new(map.new_num_vars);
@@ -649,8 +752,10 @@ impl Solver {
             !self.cold.has_been_incremental,
             "BUG: compact must not run in incremental mode"
         );
-        self.target_trail_len = self.trail.len();
-        self.best_trail_len = self.trail.len();
+        if fixed {
+            self.finish_fixed_compaction(&map);
+        }
+        (self.target_trail_len, self.best_trail_len) = self.phase_marks_after_compaction();
 
         // Schedule next compaction (CaDiCaL compact.cpp:540-541).
         self.cold.compact_count += 1;

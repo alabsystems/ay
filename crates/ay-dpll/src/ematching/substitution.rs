@@ -247,67 +247,102 @@ pub(crate) fn subst_vars(
     term: TermId,
     subst: &HashMap<String, TermId>,
 ) -> TermId {
+    subst_vars_shared(terms, term, subst, &mut HashMap::default()).0
+}
+
+/// [`subst_vars`] with a memo of the binder-free subterms already substituted
+/// in this call, so a subterm shared along several paths is rebuilt once. The
+/// walk without it re-walked every shared subterm once per path, exponential
+/// on a DAG: on UFBV PEak `hard4` the `--z3-mode` run was inside it 6 s into
+/// `-T:10` (sampled, under `try_mbqi_refinement`), polling no stop, and ended
+/// in the watchdog's hard exit.
+///
+/// Only binder-free results are remembered. Substituting under a binder may
+/// alpha-rename it to a fresh name, and a fresh name is new on every call, so
+/// those subterms are rebuilt exactly as before; every other result is a
+/// function of the term alone, and hash-consing makes the memoized result and
+/// the order terms are created in identical to the walk without it. The flag
+/// returned is whether `term` is binder-free.
+fn subst_vars_shared(
+    terms: &mut TermStore,
+    term: TermId,
+    subst: &HashMap<String, TermId>,
+    memo: &mut HashMap<TermId, TermId>,
+) -> (TermId, bool) {
+    if let Some(&done) = memo.get(&term) {
+        return (done, true);
+    }
     stacker::maybe_grow(SUBST_STACK_RED_ZONE, SUBST_STACK_SIZE, || {
-        match terms.get(term).clone() {
-            TermData::Var(name, _) => *subst.get(&name).unwrap_or(&term),
-            TermData::Const(_) => term,
+        let (result, binder_free) = match terms.get(term).clone() {
+            TermData::Var(name, _) => (*subst.get(&name).unwrap_or(&term), true),
+            TermData::Const(_) => (term, true),
             TermData::App(sym, args) => {
-                let new_args: Vec<TermId> = args
-                    .iter()
-                    .map(|&arg| subst_vars(terms, arg, subst))
-                    .collect();
+                let mut binder_free = true;
+                let mut new_args: Vec<TermId> = Vec::with_capacity(args.len());
+                for &arg in &args {
+                    let (new_arg, free) = subst_vars_shared(terms, arg, subst, memo);
+                    binder_free &= free;
+                    new_args.push(new_arg);
+                }
                 if new_args == args {
-                    term
+                    (term, binder_free)
                 } else {
-                    mk_app_simplified(terms, &sym, new_args, term)
+                    (mk_app_simplified(terms, &sym, new_args, term), binder_free)
                 }
             }
             TermData::Not(inner) => {
-                let new_inner = subst_vars(terms, inner, subst);
+                let (new_inner, binder_free) = subst_vars_shared(terms, inner, subst, memo);
                 if new_inner == inner {
-                    term
+                    (term, binder_free)
                 } else {
-                    terms.mk_not(new_inner)
+                    (terms.mk_not(new_inner), binder_free)
                 }
             }
             TermData::Ite(c, t, e) => {
-                let nc = subst_vars(terms, c, subst);
-                let nt = subst_vars(terms, t, subst);
-                let ne = subst_vars(terms, e, subst);
+                let (nc, fc) = subst_vars_shared(terms, c, subst, memo);
+                let (nt, ft) = subst_vars_shared(terms, t, subst, memo);
+                let (ne, fe) = subst_vars_shared(terms, e, subst, memo);
+                let binder_free = fc && ft && fe;
                 if nc == c && nt == t && ne == e {
-                    term
+                    (term, binder_free)
                 } else {
-                    terms.mk_ite(nc, nt, ne)
+                    (terms.mk_ite(nc, nt, ne), binder_free)
                 }
             }
-            TermData::Let(bindings, body) => subst_let(terms, term, &bindings, body, subst),
+            TermData::Let(bindings, body) => {
+                (subst_let(terms, term, &bindings, body, subst), false)
+            }
             TermData::Forall(vars, body, triggers) => {
                 let mut vars = vars;
                 let Some(inner) = capture_avoiding_subst(terms, &mut vars, subst) else {
-                    return term;
+                    return (term, false);
                 };
                 let (nb, nt) = subst_quantifier_parts(terms, body, &triggers, &inner);
                 if nb == body && nt == triggers {
-                    term
+                    (term, false)
                 } else {
-                    terms.mk_forall_with_triggers(vars, nb, nt)
+                    (terms.mk_forall_with_triggers(vars, nb, nt), false)
                 }
             }
             TermData::Exists(vars, body, triggers) => {
                 let mut vars = vars;
                 let Some(inner) = capture_avoiding_subst(terms, &mut vars, subst) else {
-                    return term;
+                    return (term, false);
                 };
                 let (nb, nt) = subst_quantifier_parts(terms, body, &triggers, &inner);
                 if nb == body && nt == triggers {
-                    term
+                    (term, false)
                 } else {
-                    terms.mk_exists_with_triggers(vars, nb, nt)
+                    (terms.mk_exists_with_triggers(vars, nb, nt), false)
                 }
             }
             // Future TermData variants: return term unchanged (identity substitution).
-            _ => term,
+            _ => (term, false),
+        };
+        if binder_free {
+            memo.insert(term, result);
         }
+        (result, binder_free)
     }) // stacker::maybe_grow
 }
 
@@ -584,6 +619,44 @@ pub(crate) fn subst_vars_exact_qf(
 }
 
 /// Construct an App term using simplifying constructors where available.
+/// (#selector-over-ctor-subst) `sel_k(C(t_1 .. t_n))` folded to `t_k`, the
+/// datatype selector's DEFINING equation -- a tautology-preserving rewrite,
+/// not an approximation. `None` leaves the application to be built as written.
+///
+/// This belongs on the substitution path specifically, because substitution is
+/// what CREATES the shape: the stored term is `sel_k(v)` for a variable `v`,
+/// and only once `v` is replaced by a constructor application does a
+/// selector-over-constructor exist to fold. Leaving it unfolded strands every
+/// downstream reader that needs the FIELD -- measured on a nested-`Vec` replay
+/// obligation, where instantiating the outer binder reduced the row read to
+/// `(mkInner .. (_ bv0 64) ..)` but `(fld_len (mkInner ..))` stayed opaque, so
+/// the inner binder's bound was never a literal, the finite-domain expansion
+/// declined, and a decidable query answered `unknown`.
+///
+/// [`TermStore::try_fold_datatype_selector`] is self-guarding: it declines
+/// unless the argument IS an application of a constructor it knows and `name`
+/// IS one of that constructor's fields, so a same-named uninterpreted function
+/// over an unrelated term is untouched.
+///
+/// The SORT CHECK is load-bearing, not belt-and-braces. The registry is keyed
+/// by constructor NAME, so two datatypes that declare a same-named constructor
+/// share one entry and the last registration wins; folding on that entry could
+/// return a field of the wrong sort. Requiring the folded field to carry
+/// exactly the sort this application already has makes such a mismatch a
+/// decline instead of a silently ill-sorted term.
+fn fold_datatype_selector_app(
+    terms: &mut TermStore,
+    name: &str,
+    args: &[TermId],
+    sort: &Sort,
+) -> Option<TermId> {
+    if args.len() != 1 {
+        return None;
+    }
+    let folded = terms.try_fold_datatype_selector(name, args[0])?;
+    (terms.sort(folded) == sort).then_some(folded)
+}
+
 pub(crate) fn mk_app_simplified(
     terms: &mut TermStore,
     sym: &Symbol,
@@ -649,6 +722,9 @@ pub(crate) fn mk_app_simplified(
         // Fallback
         _ => {
             let sort = terms.sort(original).clone();
+            if let Some(folded) = fold_datatype_selector_app(terms, name, &args, &sort) {
+                return folded;
+            }
             terms.mk_app(sym.clone(), args, sort)
         }
     }

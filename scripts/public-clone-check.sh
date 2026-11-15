@@ -23,7 +23,7 @@
 #                                 [--repo <path-or-url>] [--output <log>]
 #
 #   --ref <commit>     Commit/ref to check out in the fresh clone (default: HEAD).
-#   --metadata-only    Only run `cargo metadata --no-deps --locked` (skip the
+#   --metadata-only    Only run `metadata --no-deps --locked` (skip the
 #                      release build).
 #   --repo <path|url>  Source to clone (default: this repository's root).
 #   --output <log>     Log path (default:
@@ -47,6 +47,23 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# The Cargo-family frontend. With the Trust toolchain installed this is
+# `targo` (owner ruling 2026-09-23: Rust on ALab hosts is spelled targo), and
+# the release build runs in its unverified lane — this check measures that a
+# clean clone resolves and builds; it makes no proof claim. A host without the
+# Trust toolchain, which is what a real public user has, runs plain `cargo`;
+# the step labels (`cargo_metadata_locked`, `release_build`) and provenance
+# file names keep their historical names because `ay z3-audit` parses them.
+# The discriminator is the only one that holds: stock Cargo refuses
+# `--unverified`.
+if targo --unverified --version >/dev/null 2>&1; then
+  RUST_META=(targo)
+  RUST_BUILD=(targo --unverified)
+else
+  RUST_META=(cargo)
+  RUST_BUILD=(cargo)
+fi
 
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse "${REF}")"
 mkdir -p "${PROVENANCE_DIR}"
@@ -76,7 +93,7 @@ fi
 # --no-deps keeps this a workspace-resolution check that does not fetch every
 # dependency source.
 if [[ "${OVERALL_OK}" -eq 1 ]]; then
-  if cargo metadata --manifest-path "${CLONE}/Cargo.toml" --format-version 1 --no-deps --locked \
+  if "${RUST_META[@]}" metadata --manifest-path "${CLONE}/Cargo.toml" --format-version 1 --no-deps --locked \
       >"${WORK}/metadata.json" 2>"${WORK}/metadata.stderr"; then
     emit "public-clone-check: PASS cargo_metadata_locked"
   else
@@ -89,7 +106,7 @@ fi
 if [[ "${METADATA_ONLY}" -eq 1 ]]; then
   emit "public-clone-check: SKIP release_build (metadata-only)"
 elif [[ "${OVERALL_OK}" -eq 1 ]]; then
-  BUILD_CMD="cargo build --release --locked -p ay --features cli --bin ay"
+  BUILD_CMD="${RUST_BUILD[*]} build --release --locked -p ay --features cli --bin ay"
   printf '%s\n' "${BUILD_CMD}" >"${PROVENANCE_DIR}/cargo-build-release.command.txt"
   if (cd "${CLONE}" && eval "${BUILD_CMD}") \
       >"${PROVENANCE_DIR}/cargo-build-release.stdout.txt" \

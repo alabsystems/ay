@@ -6,6 +6,8 @@
 
 #[path = "fp_ground_adversarial_audit_tests/generator.rs"]
 mod generator;
+#[path = "fp_ground_adversarial_audit_tests/integer_casts.rs"]
+mod integer_casts;
 #[path = "fp_ground_adversarial_audit_tests/oracle.rs"]
 mod oracle;
 
@@ -15,16 +17,9 @@ use oracle::{ClauseVerdict, Oracle};
 const ROUNDS_PER_LANE: u32 = 300;
 
 fn audit(seed: u64, with_vars: bool, label: &str) {
-    let Some(oracle) = Oracle::resolve() else {
-        assert!(
-            !oracle::differential_required(),
-            "[{label}] Z3 is unavailable, but Z3_DIFFERENTIAL_REQUIRED is truthy; \
-             set Z3_PATH to an existing Z3 executable or add z3 to PATH"
-        );
-        eprintln!(
-            "[{label}] Z3 unavailable; skipping FP differential audit \
-             (set Z3_DIFFERENTIAL_REQUIRED=1 to require it)"
-        );
+    // No usable z3: `Oracle::resolve` announced the skip (or failed the test
+    // under Z3_DIFFERENTIAL_REQUIRED or a wrong Z3_PATH).
+    let Some(oracle) = Oracle::resolve(label) else {
         return;
     };
 
@@ -35,10 +30,7 @@ fn audit(seed: u64, with_vars: bool, label: &str) {
     );
 
     let verdicts = oracle.check_clauses(&clauses).unwrap_or_else(|error| {
-        panic!(
-            "[{label}] Z3 oracle {} failed: {error}",
-            oracle.path().display()
-        )
+        panic!("[{label}] Z3 oracle {} failed: {error}", oracle.identity())
     });
     let accepted = clauses.len();
     let oracle_checked = verdicts.len();
@@ -86,4 +78,30 @@ fn ground_fp_clauses_accepted_by_the_checker_are_valid_per_z3() {
 #[test]
 fn near_ground_fp_clauses_accepted_by_the_checker_are_valid_per_z3() {
     audit(0x0FED_CBA9_8765_4321, true, "bindings+residual");
+}
+
+#[test]
+fn integer_cast_clauses_accepted_by_the_checker_are_valid_per_z3() {
+    let label = "integer-casts";
+    let Some(oracle) = Oracle::resolve(label) else {
+        return;
+    };
+    let clauses = integer_casts::accepted_clauses();
+    assert!(clauses.len() > 1000, "nonvacuous conversion coverage");
+    let verdicts = oracle
+        .check_clauses(&clauses)
+        .expect("integer cast oracle batch");
+    assert_eq!(verdicts.len(), clauses.len());
+    let false_accepts = collect_false_accepts(label, &clauses, &verdicts);
+    eprintln!(
+        "[{label}] accepted={} oracle-checked={} false_accepts={}",
+        clauses.len(),
+        verdicts.len(),
+        false_accepts.len()
+    );
+    assert!(
+        false_accepts.is_empty(),
+        "{}",
+        false_accepts.join("\n----\n")
+    );
 }

@@ -125,8 +125,6 @@ impl Expr {
         /// Floating-point absolute value.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_abs / try_fp_abs,
         check: is_fp,
         assert_msg: "fp_abs requires FP sort",
@@ -138,8 +136,6 @@ impl Expr {
         /// Floating-point negation.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_neg / try_fp_neg,
         check: is_fp,
         assert_msg: "fp_neg requires FP sort",
@@ -153,8 +149,6 @@ impl Expr {
         /// Floating-point addition.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_add / try_fp_add,
         check: fp_same,
         assert_msg: "fp_add requires same FP sorts",
@@ -166,8 +160,6 @@ impl Expr {
         /// Floating-point subtraction.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_sub / try_fp_sub,
         check: fp_same,
         assert_msg: "fp_sub requires same FP sorts",
@@ -179,8 +171,6 @@ impl Expr {
         /// Floating-point multiplication.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_mul / try_fp_mul,
         check: fp_same,
         assert_msg: "fp_mul requires same FP sorts",
@@ -192,8 +182,6 @@ impl Expr {
         /// Floating-point division.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_div / try_fp_div,
         check: fp_same,
         assert_msg: "fp_div requires same FP sorts",
@@ -201,12 +189,20 @@ impl Expr {
         variant: FpDiv
     }
 
+    binop_same_sort! {
+        /// Remainder with an integer quotient truncated toward zero (Rust `%`).
+        /// This is not SMT-LIB's nearest/ties-even `fp.rem`; no NaN payload promise.
+        fn fp_truncating_rem / try_fp_truncating_rem,
+        check: fp_same,
+        assert_msg: "fp_truncating_rem requires same FP sorts",
+        error_expected: "matching FloatingPoint sorts",
+        variant: FpTruncatingRem
+    }
+
     /// Floating-point fused multiply-add: (fp.fma rm x y z) = x*y + z.
     ///
     /// This is a ternary operation so it stays hand-written; delegates to try_fp_fma.
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_floating_point() && self.sort == y.sort && self.sort == z.sort))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_floating_point()))]
     pub fn fp_fma(self, rm: RoundingMode, y: Self, z: Self) -> Self {
         self.try_fp_fma(rm, y, z)
             .expect("fp_fma requires same FP sorts")
@@ -233,8 +229,6 @@ impl Expr {
         /// Floating-point square root.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_sqrt / try_fp_sqrt,
         check: is_fp,
         assert_msg: "fp_sqrt requires FP sort",
@@ -248,8 +242,6 @@ impl Expr {
         /// Floating-point remainder.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_rem / try_fp_rem,
         check: fp_same,
         assert_msg: "fp_rem requires same FP sorts",
@@ -261,8 +253,6 @@ impl Expr {
         /// Floating-point round to integral.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_round_to_integral / try_fp_round_to_integral,
         check: is_fp,
         assert_msg: "fp_round_to_integral requires FP sort",
@@ -274,8 +264,6 @@ impl Expr {
         /// Floating-point minimum.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_min / try_fp_min,
         check: fp_same,
         assert_msg: "fp_min requires same FP sorts",
@@ -287,8 +275,6 @@ impl Expr {
         /// Floating-point maximum.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort matches operand sort.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_floating_point())]
         fn fp_max / try_fp_max,
         check: fp_same,
         assert_msg: "fp_max requires same FP sorts",
@@ -302,8 +288,6 @@ impl Expr {
         /// Floating-point equality (IEEE 754 semantics: NaN != NaN).
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_eq / try_fp_eq,
         check: fp_same,
         assert_msg: "fp_eq requires same FP sorts",
@@ -315,8 +299,6 @@ impl Expr {
         /// Floating-point less than.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_lt / try_fp_lt,
         check: fp_same,
         assert_msg: "fp_lt requires same FP sorts",
@@ -328,8 +310,6 @@ impl Expr {
         /// Floating-point less than or equal.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_le / try_fp_le,
         check: fp_same,
         assert_msg: "fp_le requires same FP sorts",
@@ -341,8 +321,6 @@ impl Expr {
         /// Floating-point greater than.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_gt / try_fp_gt,
         check: fp_same,
         assert_msg: "fp_gt requires same FP sorts",
@@ -354,8 +332,6 @@ impl Expr {
         /// Floating-point greater than or equal.
         /// REQUIRES: `self` and `other` are FP sorts with identical parameters.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point() && self.sort == other.sort)]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_ge / try_fp_ge,
         check: fp_same,
         assert_msg: "fp_ge requires same FP sorts",

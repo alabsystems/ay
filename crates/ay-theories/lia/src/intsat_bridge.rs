@@ -147,7 +147,7 @@ impl LiaSolver<'_> {
             }
 
             let constraints_before = constraints.len();
-            match self.terms.get(atom) {
+            match self.terms().get(atom) {
                 TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
                     let lhs = args[0];
                     let rhs = args[1];
@@ -240,7 +240,12 @@ impl LiaSolver<'_> {
         // `--timeout`. Without this the probe can take multiple seconds to
         // exhaust its conflict budget on large instances, overshooting the
         // user-configured timeout.
-        let dl = self.deadline_for_intsat();
+        let now = ay_core::time::Instant::now();
+        let allowance = std::time::Duration::from_millis(100);
+        let slice = self.deadline_for_intsat().map_or(allowance, |deadline| {
+            allowance.min(deadline.saturating_duration_since(now) / 8)
+        });
+        let dl = Some(now + slice);
         let config = ay_intsat::IntSatConfig {
             max_conflicts: INTSAT_PROBE_CONFLICTS,
             max_learned: 2_000,
@@ -331,7 +336,7 @@ impl LiaSolver<'_> {
         coeffs: &mut HashMap<TermId, BigInt>,
         constant: &mut BigInt,
     ) {
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => {
                 *constant += scale * n;
             }
@@ -362,12 +367,12 @@ impl LiaSolver<'_> {
                 "*" => {
                     // Try to extract a constant factor.
                     if args.len() == 2 {
-                        if let Some(k) = self.terms.extract_integer_constant(args[0]) {
+                        if let Some(k) = self.terms().extract_integer_constant(args[0]) {
                             let new_scale = scale * &k;
                             self.collect_intsat_linear(args[1], &new_scale, coeffs, constant);
                             return;
                         }
-                        if let Some(k) = self.terms.extract_integer_constant(args[1]) {
+                        if let Some(k) = self.terms().extract_integer_constant(args[1]) {
                             let new_scale = scale * &k;
                             self.collect_intsat_linear(args[0], &new_scale, coeffs, constant);
                             return;

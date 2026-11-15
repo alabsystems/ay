@@ -23,14 +23,15 @@ use num_traits::{Signed, Zero};
 use super::{
     cache_ast_vector, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
     ffi_guard_const_ptr_keep_error, ffi_guard_ptr, ffi_guard_uint, ffi_guard_uint_keep_error,
-    ffi_guard_void, render_finite_set_ast, require_ast_handle, require_term_ast_or_return, Z3_ast,
-    Z3_ast_vector, Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS, MAX_FFI_DECIMAL_PRECISION,
-    Z3_INVALID_ARG, Z3_OP_ABS, Z3_OP_ADD, Z3_OP_AND, Z3_OP_BADD, Z3_OP_BAND, Z3_OP_BASHR,
-    Z3_OP_BLSHR, Z3_OP_BMUL, Z3_OP_BNEG, Z3_OP_BNOT, Z3_OP_BOR, Z3_OP_BSDIV, Z3_OP_BSHL,
-    Z3_OP_BSMOD, Z3_OP_BSREM, Z3_OP_BSUB, Z3_OP_BUDIV, Z3_OP_BUREM, Z3_OP_BXOR, Z3_OP_CONCAT,
-    Z3_OP_CONST_ARRAY, Z3_OP_DISTINCT, Z3_OP_DIV, Z3_OP_EQ, Z3_OP_EXTRACT, Z3_OP_FALSE, Z3_OP_GE,
-    Z3_OP_GT, Z3_OP_IDIV, Z3_OP_IFF, Z3_OP_IMPLIES, Z3_OP_IS_INT, Z3_OP_ITE, Z3_OP_LE, Z3_OP_LT,
-    Z3_OP_MOD, Z3_OP_MUL, Z3_OP_NOT, Z3_OP_OR, Z3_OP_POWER, Z3_OP_REPEAT, Z3_OP_ROTATE_LEFT,
+    ffi_guard_void, render_finite_set_ast, require_ast_handle, require_ast_or_return, DatatypeOp,
+    Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS,
+    MAX_FFI_DECIMAL_PRECISION, Z3_INVALID_ARG, Z3_OP_ABS, Z3_OP_ADD, Z3_OP_AND, Z3_OP_BADD,
+    Z3_OP_BAND, Z3_OP_BASHR, Z3_OP_BLSHR, Z3_OP_BMUL, Z3_OP_BNEG, Z3_OP_BNOT, Z3_OP_BOR,
+    Z3_OP_BSDIV, Z3_OP_BSHL, Z3_OP_BSMOD, Z3_OP_BSREM, Z3_OP_BSUB, Z3_OP_BUDIV, Z3_OP_BUREM,
+    Z3_OP_BXOR, Z3_OP_CONCAT, Z3_OP_CONST_ARRAY, Z3_OP_DISTINCT, Z3_OP_DIV, Z3_OP_DT_ACCESSOR,
+    Z3_OP_DT_CONSTRUCTOR, Z3_OP_DT_IS, Z3_OP_EQ, Z3_OP_EXTRACT, Z3_OP_FALSE, Z3_OP_GE, Z3_OP_GT,
+    Z3_OP_IDIV, Z3_OP_IFF, Z3_OP_IMPLIES, Z3_OP_IS_INT, Z3_OP_ITE, Z3_OP_LE, Z3_OP_LT, Z3_OP_MOD,
+    Z3_OP_MUL, Z3_OP_NOT, Z3_OP_OR, Z3_OP_POWER, Z3_OP_REPEAT, Z3_OP_ROTATE_LEFT,
     Z3_OP_ROTATE_RIGHT, Z3_OP_SELECT, Z3_OP_SGEQ, Z3_OP_SGT, Z3_OP_SIGN_EXT, Z3_OP_SLEQ, Z3_OP_SLT,
     Z3_OP_STORE, Z3_OP_SUB, Z3_OP_TO_INT, Z3_OP_TO_REAL, Z3_OP_TRUE, Z3_OP_UGEQ, Z3_OP_UGT,
     Z3_OP_ULEQ, Z3_OP_ULT, Z3_OP_UMINUS, Z3_OP_UNINTERPRETED, Z3_OP_XOR, Z3_OP_ZERO_EXT,
@@ -60,15 +61,16 @@ pub unsafe extern "C" fn Z3_get_numeral_string(c: Z3_context, a: Z3_ast) -> *con
     // so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
-                ctx,
-                a,
-                "Z3_get_numeral_string",
-                "numeral",
-                ptr::null()
-            );
+            let term =
+                require_ast_or_return!(ctx, a, "Z3_get_numeral_string", "numeral", ptr::null())
+                    .term;
             match ctx.solver.numeral_string(term) {
-                Some(s) => cache_string(ctx, s),
+                // z3 prints an integral Real numeral without a denominator
+                // (`RealVal(100).as_string()` is `100`, not `100/1`).
+                Some(s) => {
+                    let s = s.strip_suffix("/1").map(str::to_owned).unwrap_or(s);
+                    cache_string(ctx, s)
+                }
                 None => ptr::null(),
             }
         })
@@ -98,13 +100,14 @@ pub unsafe extern "C" fn Z3_get_numeral_decimal_string(
     // so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 a,
                 "Z3_get_numeral_decimal_string",
                 "numeral",
                 ptr::null()
-            );
+            )
+            .term;
             match ctx.solver.numeral_string(term) {
                 Some(s) => {
                     // If it's a rational (contains '/'), convert to decimal via scaled BigInt division
@@ -182,6 +185,20 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             // `(root-obj (+ (^ x 2) (- 2)) 2)` for √2) computed from the
             // stored value's defining polynomial — never `(null)` and never a
             // lossy decimal guess.
+            // Objective-infinity handles (from an unbounded
+            // `Z3_optimize_get_lower`/`_upper`): z3 renders `oo` and
+            // `(* (- 1) oo)` (measured libz3 5.1.0).
+            if a & super::HANDLE_TAG_MASK == super::OO_AST_TAG {
+                return match super::decode_oo_ast(ctx, a) {
+                    Some(negative) => cache_string(ctx, super::oo_ast_string(negative).to_string()),
+                    None => {
+                        ctx.last_error = Z3_INVALID_ARG;
+                        ctx.error_msg =
+                            Some("Z3_ast_to_string: invalid or foreign oo AST handle".to_string());
+                        ptr::null()
+                    }
+                };
+            }
             if a & super::HANDLE_TAG_MASK == super::ALGEBRAIC_AST_TAG {
                 if let Some(text) = super::algebraic::ast_as_scalar(ctx, a)
                     .as_ref()
@@ -255,8 +272,23 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             // formatter (e.g. `(+ x (* 2 y))`), matching z3's `sexpr()` output.
             // A foreign/stale handle yields `None` -> null (the Python layer
             // falls back); it never panics across the FFI boundary.
-            let term = require_term_ast_or_return!(ctx, a, "Z3_ast_to_string", "AST", ptr::null());
-            match ctx.solver.format_term_checked(term) {
+            let term = require_ast_or_return!(ctx, a, "Z3_ast_to_string", "AST", ptr::null()).term;
+            // A character literal is its code point to the engine; z3 prints
+            // it as `(_ Char 101)` (libz3 5.1.0, `CharVal('e').sexpr()`).
+            if super::lookup_ast_sort(ctx, a).is_some_and(ay_dpll::api::Sort::is_char) {
+                if let Some(code) = ctx
+                    .solver
+                    .numeral_string(term)
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .filter(|code| {
+                        super::bounded_sort_hi(&ay_dpll::api::Sort::Char)
+                            .is_some_and(|max| (0..=max).contains(code))
+                    })
+                {
+                    return cache_string(ctx, format!("(_ Char {code})"));
+                }
+            }
+            match super::finite_field::format_public_term(ctx, term) {
                 Some(s) => cache_string(ctx, super::ffi_surface_text(ctx, &s)),
                 None => ptr::null(),
             }
@@ -270,8 +302,62 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
 
 // ---- Decl kind ----
 
+/// z3's `Z3_OP_FPA_*` kind of a floating-point operator or value name (z3py
+/// prints FP terms and values by these kinds).
+fn fp_operator_decl_kind(name: &str) -> Option<c_uint> {
+    let kind = match name {
+        "RNE" | "roundNearestTiesToEven" => 0xb000,
+        "RNA" | "roundNearestTiesToAway" => 0xb001,
+        "RTP" | "roundTowardPositive" => 0xb002,
+        "RTN" | "roundTowardNegative" => 0xb003,
+        "RTZ" | "roundTowardZero" => 0xb004,
+        "fp.numeral" => 0xb005,
+        "+oo" | "plusInfinity" => 0xb006,
+        "-oo" | "minusInfinity" => 0xb007,
+        "NaN" => 0xb008,
+        "+zero" => 0xb009,
+        "-zero" => 0xb00a,
+        "fp.add" => 0xb00b,
+        "fp.sub" => 0xb00c,
+        "fp.neg" => 0xb00d,
+        "fp.mul" => 0xb00e,
+        "fp.div" => 0xb00f,
+        "fp.rem" => 0xb010,
+        "fp.abs" => 0xb011,
+        "fp.min" => 0xb012,
+        "fp.max" => 0xb013,
+        "fp.fma" => 0xb014,
+        "fp.sqrt" => 0xb015,
+        "fp.roundToIntegral" => 0xb016,
+        "fp.eq" => 0xb017,
+        "fp.lt" => 0xb018,
+        "fp.gt" => 0xb019,
+        "fp.leq" => 0xb01a,
+        "fp.geq" => 0xb01b,
+        "fp.isNaN" => 0xb01c,
+        "fp.isInfinite" => 0xb01d,
+        "fp.isZero" => 0xb01e,
+        "fp.isNormal" => 0xb01f,
+        "fp.isSubnormal" => 0xb020,
+        "fp.isNegative" => 0xb021,
+        "fp.isPositive" => 0xb022,
+        "fp" => 0xb023,
+        "to_fp" => 0xb024,
+        "to_fp_unsigned" => 0xb025,
+        "fp.to_ubv" => 0xb026,
+        "fp.to_sbv" => 0xb027,
+        "fp.to_real" => 0xb028,
+        "fp.to_ieee_bv" => 0xb029,
+        _ => return None,
+    };
+    Some(kind)
+}
+
 /// Map an operator name (from AY TermKind) to the Z3 decl_kind constant.
 fn operator_name_to_decl_kind(name: &str) -> c_uint {
+    if let Some(kind) = fp_operator_decl_kind(name) {
+        return kind;
+    }
     match name {
         // Boolean
         "true" => Z3_OP_TRUE,
@@ -309,6 +395,15 @@ fn operator_name_to_decl_kind(name: &str) -> c_uint {
         "is_int" => Z3_OP_IS_INT,
         "^" | "power" => Z3_OP_POWER,
         "abs" => Z3_OP_ABS,
+        "ff.add" => super::Z3_OP_FF_ADD,
+        "ff.mul" => super::Z3_OP_FF_MUL,
+        "ff.neg" => super::Z3_OP_FF_NEG,
+        "ff.bitsum" => super::Z3_OP_FF_BITSUM,
+        "complex.make" => super::Z3_OP_COMPLEX,
+        "complex.real" => super::Z3_OP_REAL_PART,
+        "complex.imag" => super::Z3_OP_IMAG_PART,
+        "seq.power" => super::Z3_OP_SEQ_POWER,
+        "seq.len" | "str.len" => super::Z3_OP_SEQ_LENGTH,
         // Arrays
         "store" => Z3_OP_STORE,
         "select" => Z3_OP_SELECT,
@@ -328,6 +423,7 @@ fn operator_name_to_decl_kind(name: &str) -> c_uint {
         "bvnot" => Z3_OP_BNOT,
         "bvxor" => Z3_OP_BXOR,
         "concat" => Z3_OP_CONCAT,
+        "mkbv" => super::Z3_OP_MKBV,
         "sign_extend" => Z3_OP_SIGN_EXT,
         "zero_extend" => Z3_OP_ZERO_EXT,
         "extract" => Z3_OP_EXTRACT,
@@ -364,18 +460,37 @@ fn operator_name_to_decl_kind(name: &str) -> c_uint {
 /// # Safety
 /// All pointers must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_get_decl_kind(_c: Z3_context, d: Z3_func_decl) -> c_uint {
-    if d.is_null() {
-        return Z3_OP_UNINTERPRETED;
-    }
+pub unsafe extern "C" fn Z3_get_decl_kind(c: Z3_context, d: Z3_func_decl) -> c_uint {
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_uint` handles the null case internally and catches any unwinding panic so it
-    // cannot cross the FFI boundary.
+    // cannot cross the FFI boundary. `d` is dereferenced only after its null check.
     unsafe {
-        ffi_guard_uint(_c, Z3_OP_UNINTERPRETED, |_ctx| {
-            if let Some(op) = (*d).finite_set_op {
+        ffi_guard_uint(c, Z3_OP_UNINTERPRETED, |ctx| {
+            if let Some(kind) = ctx.proof_declarations.get(&d) {
+                return *kind;
+            }
+            if d.is_null() {
+                // A null decl (e.g. an unchecked failed `Z3_get_app_decl`) must
+                // not read as an uninterpreted symbol.
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some("Z3_get_decl_kind: null function declaration".to_string());
+                return Z3_OP_UNINTERPRETED;
+            }
+            if let Some(value) = (*d).value {
+                value.kind
+            } else if let Some(op) = &(*d).dt_op {
+                match op {
+                    DatatypeOp::Constructor { .. } => Z3_OP_DT_CONSTRUCTOR,
+                    DatatypeOp::Recognizer { .. } => Z3_OP_DT_IS,
+                    DatatypeOp::Accessor { .. } => Z3_OP_DT_ACCESSOR,
+                }
+            } else if let Some(op) = (*d).finite_set_op {
                 op.decl_kind()
+            } else if (*d).decl.name() == "-" && (*d).decl.arity() == 1 {
+                // AY spells negation `-` with one argument; z3 reports it as
+                // Z3_OP_UMINUS (z3py printed `-(5 + x)` as `x + 5`).
+                Z3_OP_UMINUS
             } else {
                 operator_name_to_decl_kind((*d).decl.name())
             }
@@ -451,15 +566,23 @@ pub unsafe extern "C" fn Z3_get_error_msg(c: Z3_context, err: c_uint) -> *const 
     }
 }
 
-/// Set an error handler (currently a no-op).
+/// Set (or clear, with null) the context's error handler. The FFI guards
+/// invoke it once per API call that leaves a non-OK error state, as in
+/// libz3; see `ffi_guards::invoke_error_handler`.
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_set_error_handler(
-    _c: Z3_context,
-    _h: Option<unsafe extern "C" fn(Z3_context, c_uint)>,
+    c: Z3_context,
+    h: Option<unsafe extern "C" fn(Z3_context, c_uint)>,
 ) {
+    // SAFETY: `c` null-checked by `as_mut`; a single field store on the
+    // caller-owned context (single-threaded per context). No guard wrapper:
+    // libz3's registration does not itself raise or clear error state.
+    if let Some(ctx) = unsafe { c.as_mut() } {
+        ctx.error_handler = h;
+    }
 }
 
 // ---- AST vectors ----

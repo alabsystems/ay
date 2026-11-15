@@ -55,6 +55,10 @@ fn insert_dimacs_proof_telemetry(
     let (proof_file_present, proof_file_bytes) = dimacs_proof_file_telemetry(proof_config);
     run_stats.insert("sat.proof_file_present", proof_file_present);
     run_stats.insert("sat.proof_file_bytes", proof_file_bytes);
+    run_stats.insert(
+        "sat.proof_digest_streamed",
+        u64::from(proof_config.is_some_and(|proof| dimacs_proof_sealed_from_stream(&proof.path))),
+    );
     run_stats.insert("sat.proof_writer_additions", writer_telemetry.additions);
     run_stats.insert("sat.proof_writer_deletions", writer_telemetry.deletions);
 }

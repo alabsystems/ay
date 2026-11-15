@@ -484,3 +484,131 @@ fn test_preprocess_symmetry_skips_clause_trace_reconstruction_mode() {
 }
 
 include!("symmetry_orbitope_proof_surface_tests.rs");
+
+/// Pigeonhole `pigeons` into `holes`: one at-least-one clause per pigeon and
+/// pairwise at-most-one per hole.
+fn add_pigeonhole(solver: &mut Solver, pigeons: u32, holes: u32) {
+    let var = |i: u32, h: u32| Variable(i * holes + h);
+    for i in 0..pigeons {
+        let alo: Vec<Literal> = (0..holes).map(|h| Literal::positive(var(i, h))).collect();
+        assert!(solver.add_clause(alo));
+    }
+    for h in 0..holes {
+        for i in 0..pigeons {
+            for k in i + 1..pigeons {
+                assert!(solver.add_clause(vec![
+                    Literal::negative(var(i, h)),
+                    Literal::negative(var(k, h)),
+                ]));
+            }
+        }
+    }
+}
+
+#[test]
+fn fix_and_cut_fixes_the_pigeonhole_and_keeps_it_unsatisfiable() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        symmetry_fix_and_cut: true,
+        ..Default::default()
+    });
+    let mut solver = Solver::new(20);
+    solver.set_symmetry_oneshot(true);
+    add_pigeonhole(&mut solver, 5, 4);
+
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(changed, "fix-and-cut must install its constraints");
+    let stats = &solver.cold.symmetry_stats;
+    assert!(stats.chain_generators >= 2, "{stats:?}");
+    assert!(stats.fixcut_fixings >= 1, "{stats:?}");
+    assert!(stats.fixcut_levels >= 1, "{stats:?}");
+    assert_eq!(stats.fixcut_budget_hit, 0);
+    assert!(stats.sb_clauses_added >= 1, "{stats:?}");
+    assert!(
+        matches!(solver.solve().into_inner(), SatResult::Unsat(_)),
+        "php(5,4) stays UNSAT"
+    );
+}
+
+#[test]
+fn fix_and_cut_keeps_a_satisfiable_pigeonhole_satisfiable() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        symmetry_fix_and_cut: true,
+        ..Default::default()
+    });
+    let mut solver = Solver::new(20);
+    solver.set_symmetry_oneshot(true);
+    add_pigeonhole(&mut solver, 4, 5);
+
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(changed);
+    assert!(solver.cold.symmetry_stats.fixcut_fixings >= 1);
+    assert!(
+        matches!(solver.solve().into_inner(), SatResult::Sat(_)),
+        "php(4,5) stays SAT"
+    );
+}
+
+#[test]
+fn fix_and_cut_stays_off_an_unwitnessed_proof_surface() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        symmetry_fix_and_cut: true,
+        ..Default::default()
+    });
+    // LRAT text output cannot carry SR witnesses: the route must stay off.
+    let mut solver = Solver::with_proof_output(20, ProofOutput::lrat_text(Vec::<u8>::new(), 4));
+    solver.set_symmetry_oneshot(true);
+    add_pigeonhole(&mut solver, 5, 4);
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(
+        !changed,
+        "no witnessed surface: the route must stay clamped off"
+    );
+    assert_eq!(solver.arena.active_clause_count(), before);
+    assert_eq!(
+        solver.cold.symmetry_stats.last_skipped_reason,
+        Some(crate::symmetry::SymmetrySkipReason::ProofMode),
+    );
+}
+
+#[test]
+fn fix_and_cut_derives_a_negation_fixing_through_the_route() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        symmetry_fix_and_cut: true,
+        ..Default::default()
+    });
+    // Two xor constraints sharing no variable with the rest: flipping a
+    // whole xor's variables is an automorphism, so each xor fixes a literal.
+    let mut solver = Solver::new(6);
+    solver.set_symmetry_oneshot(true);
+    let v = |i: u32| Variable(i);
+    for (a, b) in [(0, 1), (2, 3)] {
+        assert!(solver.add_clause(vec![Literal::positive(v(a)), Literal::positive(v(b))]));
+        assert!(solver.add_clause(vec![Literal::negative(v(a)), Literal::negative(v(b))]));
+    }
+    assert!(solver.add_clause(vec![Literal::positive(v(4)), Literal::positive(v(5))]));
+    assert!(solver.add_clause(vec![Literal::negative(v(4)), Literal::positive(v(5))]));
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(changed, "{:?}", solver.cold.symmetry_stats);
+    assert!(
+        solver.cold.symmetry_stats.fixcut_fixings >= 1,
+        "{:?}",
+        solver.cold.symmetry_stats
+    );
+    assert!(
+        matches!(solver.solve().into_inner(), SatResult::Sat(_)),
+        "the xor formula stays SAT"
+    );
+}

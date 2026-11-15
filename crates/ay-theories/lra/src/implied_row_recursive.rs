@@ -88,7 +88,7 @@ impl LraSolver {
         // #8013: Total-calls budget. Even with depth limiting, the branching
         // factor across many rows can produce exponential work. This caps the
         // total number of recursive invocations across the entire call tree.
-        *call_count += 1;
+        *call_count = call_count.saturating_add(1);
         if *call_count > Self::MAX_RECURSIVE_CALLS {
             return false;
         }
@@ -419,8 +419,12 @@ impl LraSolver {
         visited_added: &mut Vec<(u32, bool)>,
         mark: usize,
     ) {
-        for &entry in &visited_added[mark..] {
-            visited_vars.remove(&entry);
+        // `mark` is a length the stack had earlier, so it is within bounds;
+        // a mark past the end names no entries and `truncate` is a no-op.
+        if let Some(added) = visited_added.get(mark..) {
+            for &entry in added {
+                visited_vars.remove(&entry);
+            }
         }
         visited_added.truncate(mark);
     }
@@ -511,7 +515,7 @@ impl LraSolver {
                     visited_vars,
                     visited_added,
                     on_stack,
-                    depth + 1,
+                    depth.saturating_add(1),
                     call_count,
                 ) {
                     // Rollback partial additions from earlier nonbasic vars
@@ -541,7 +545,7 @@ impl LraSolver {
                     visited_vars,
                     visited_added,
                     on_stack,
-                    depth + 1,
+                    depth.saturating_add(1),
                     call_count,
                 ) {
                     // Rollback partial additions from earlier nonbasic vars

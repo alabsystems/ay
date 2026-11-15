@@ -159,9 +159,8 @@ fn v06_two_stores_never_unsat() {
 /// Real elements.
 #[test]
 #[timeout(10000)]
-fn v07_real_elements_never_unsat() {
-    assert_never_unsat(
-        "v07_real_elems",
+fn v07_real_elements_publish_a_checked_model() {
+    let results = crate::common::solve_vec(
         r#"
         (set-logic AUFLIRA)
         (declare-fun a () (Array Int Real))
@@ -171,6 +170,7 @@ fn v07_real_elements_never_unsat() {
         (check-sat)
     "#,
     );
+    assert_eq!(results, vec!["sat"]);
 }
 
 /// `(+ (select a i) 0)` offset body — arithmetic that does NOT count as

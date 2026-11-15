@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: ignore(elaborate)
+f 1;
+a 1 ~x1 >= 1 ::    named_assertion;
+e 1 ~x1 >= 1 : 2;
+rup 1 ~x3 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

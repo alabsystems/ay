@@ -1,0 +1,21 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% INTEGRATION-TEST: lenient-header-counts
+% Regression test for the bound that makes sizing the variable space from the
+% file's contents safe. The checker is densely indexed by variable -- the
+% variable-name table, the propagation `Assignment` and every watchlist are
+% `Vec`s indexed by variable -- so a run costs about 180 bytes and 68 ns per
+% index up to the largest one used, whatever the file's size. This 24-byte file
+% names variable 4294967300, which is ~682 GiB of tables before the first proof
+% line: the process would die in the allocator or to the OOM killer, and neither
+% is a verdict.
+%
+% `Lit::MAX_VAR_IDX` does not catch it (4294967300 is perfectly representable),
+% so `MAX_DENSE_VAR_IDX` refuses it as a parse error naming the index. Like the
+% representability check, this one is unconditional: the instance carries
+% `lenient-header-counts` exactly so that a flag which only relaxes a truncation
+% heuristic cannot be mistaken for one that relaxes this.
+f 1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

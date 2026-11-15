@@ -205,7 +205,8 @@ fn nested_row_auxiliary_refutation_self_certifies_without_the_independent_crutch
         "a certified UNSAT keeps its attributed native proof"
     );
     assert!(
-        !exec.last_command_unsat_was_independently_verified(),
+        !exec.last_command_unsat_was_independently_verified()
+            && !exec.last_command_unsat_was_corroborated(),
         "the independent-discharge crutch must no longer be consumed for \
          this refutation"
     );

@@ -11,7 +11,8 @@ type TightBoundGroups = HashMap<Rational, TightBoundGroup>;
 impl LraSolver {
     pub(super) fn propagate_equalities_impl(&mut self) -> EqualityPropagationResult {
         let debug = self.debug_lra_nelson_oppen;
-        let tight_bound_vars = self.collect_tight_bound_vars(debug);
+        let (tight_bound_vars, refused) = self.collect_tight_bound_vars(debug);
+        self.stats.unjustified_exports_refused += refused;
         let vars_by_value = group_tight_bound_vars(tight_bound_vars);
 
         self.propagate_tight_bound_equalities(&vars_by_value, debug);
@@ -28,12 +29,15 @@ impl LraSolver {
 
     // Collect variables whose equal, non-strict bounds uniquely determine
     // their value. Rational keeps the common i64-sized path allocation-free.
-    fn collect_tight_bound_vars(&self, debug: bool) -> Vec<TightBoundVar> {
+    /// Also returns how many tight pins were NOT exported because they are
+    /// not justified (#nonlinear-shared-reasons).
+    fn collect_tight_bound_vars(&self, debug: bool) -> (Vec<TightBoundVar>, u64) {
         // Sort term_to_var entries by TermId for deterministic iteration (#2681).
         let mut sorted_term_vars: Vec<_> = self.term_to_var.iter().collect();
         sorted_term_vars.sort_by_key(|(&term, _)| term.0);
 
         let mut tight_bound_vars = Vec::new();
+        let mut refused = 0u64;
         for (&var_term, &var_id) in sorted_term_vars {
             let Some(info) = self.vars.get(var_id as usize) else {
                 continue;
@@ -42,6 +46,13 @@ impl LraSolver {
                 continue;
             };
             if lower.value != upper.value || lower.strict || upper.strict {
+                continue;
+            }
+            // Only a JUSTIFIED pin is exported (#nonlinear-shared-reasons): an
+            // NIA/NRA model guess (reason = the variable term) must not reach
+            // EUF as the reason of `x = y`.
+            if !self.bound_reasons_all_asserted(lower) || !self.bound_reasons_all_asserted(upper) {
+                refused += 1;
                 continue;
             }
 
@@ -77,7 +88,7 @@ impl LraSolver {
             }
             tight_bound_vars.push((var_term, lower.value.clone(), reasons));
         }
-        tight_bound_vars
+        (tight_bound_vars, refused)
     }
 
     fn propagate_tight_bound_equalities(&mut self, vars_by_value: &TightBoundGroups, debug: bool) {
@@ -86,18 +97,26 @@ impl LraSolver {
         sorted_groups.sort_by_key(|(value, _)| *value);
 
         for (_value, vars) in sorted_groups {
-            for i in 0..vars.len() {
-                for j in (i + 1)..vars.len() {
-                    let (lhs, lhs_reasons) = &vars[i];
-                    let (rhs, rhs_reasons) = &vars[j];
-                    self.propagate_tight_bound_equality(
-                        *lhs,
-                        lhs_reasons,
-                        *rhs,
-                        rhs_reasons,
-                        debug,
-                    );
+            // Anchor star per sort, mirroring
+            // `ay_core::propagate_tight_bound_equalities`: the first term
+            // of each sort anchors the group and later same-sort terms
+            // equate to it. Equality is transitive, so EUF merges the
+            // same classes as all-pairs emission while staying linear in
+            // group size (all-pairs re-scanned Θ(n²) pairs per round
+            // against the retained propagated-pairs set).
+            let mut anchors: Vec<(Sort, TermId, &Vec<TheoryLit>)> = Vec::new();
+            for (term, reasons) in vars {
+                let sort = self.terms().sort(*term).clone();
+                let Some(&(_, anchor, anchor_reasons)) =
+                    anchors.iter().find(|(s, _, _)| *s == sort)
+                else {
+                    anchors.push((sort, *term, reasons));
+                    continue;
+                };
+                if anchor == *term {
+                    continue;
                 }
+                self.propagate_tight_bound_equality(anchor, anchor_reasons, *term, reasons, debug);
             }
         }
     }
@@ -143,11 +162,11 @@ impl LraSolver {
         sorted_groups.sort_by_key(|(value, _)| *value);
 
         let mut new_disequalities = Vec::new();
-        for i in 0..sorted_groups.len() {
-            for j in (i + 1)..sorted_groups.len() {
-                let (_, group_a) = &sorted_groups[i];
-                let (_, group_b) = &sorted_groups[j];
-
+        // Every unordered pair of groups (i < j), in sorted order.
+        let mut rest = sorted_groups.as_slice();
+        while let Some(((_, group_a), tail)) = rest.split_first() {
+            rest = tail;
+            for (_, group_b) in tail {
                 // One anchor per value group avoids O(n*m) pairs. Equality
                 // transitivity makes the anchor disequality sufficient.
                 for (term_a, reasons_a) in group_a.iter().take(1) {

@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `Cardinality::lower_rhs` had the same dropped-temporary
+% escalation, reachable by an i64 underflow of `degree - amount` as well as by
+% an amount that does not fit i64. The guard correctly refused the wrap, but
+% the escalation it handed off to did nothing. Both routes are exercised here.
+f 1 ;
+pol 1 9223372036854775807 - ;
+pol 2 9223372036854775807 - ;
+e 1 x1 1 x2 >= -18446744073709551613 : 3 ;
+pol 2 18446744073709551616 - ;
+e 1 x1 1 x2 >= -27670116110564327422 : 4 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -12,7 +12,7 @@ use crate::executor::Executor;
 
 #[must_use = "a checked exact-rewrite SAT authority must be consumed or discarded"]
 #[derive(Debug)]
-pub(super) struct CheckedModelRewriteSatAuthority {
+pub(in crate::executor) struct CheckedModelRewriteSatAuthority {
     scope: CheckedGroundScope,
     model_epoch: QuantifiedGrantModelEpoch,
 }
@@ -24,8 +24,36 @@ impl CheckedModelRewriteSatAuthority {
         rewritten_model_roots: &[TermId],
         diagnostic_name: &'static str,
     ) -> Option<Self> {
+        if rewritten_model_roots.is_empty() {
+            return None;
+        }
+        Self::for_current_after(executor, roots, diagnostic_name, |executor| {
+            installed_model_satisfies_roots(executor, rewritten_model_roots)
+        })
+    }
+
+    pub(super) fn for_independently_evaluated_model(
+        executor: &mut Executor,
+        roots: &[TermId],
+    ) -> Option<Self> {
+        if executor.independent_gate_query_roots().ok()?.as_slice() != roots {
+            return None;
+        }
+        Self::for_current_after(executor, roots, "exact-array-frame", |executor| {
+            matches!(
+                executor.confirm_sat_with_fully_evaluated_independent_gate(),
+                ay_model_check::GateVerdict::ConfirmedSat
+            )
+        })
+    }
+
+    fn for_current_after(
+        executor: &mut Executor,
+        roots: &[TermId],
+        diagnostic_name: &'static str,
+        check: impl FnOnce(&Executor) -> bool,
+    ) -> Option<Self> {
         if roots.is_empty()
-            || rewritten_model_roots.is_empty()
             || executor.should_abort_theory_loop()
             || model::scoped_term_evaluation_override_active()
         {
@@ -52,7 +80,7 @@ impl CheckedModelRewriteSatAuthority {
         let accepted = model::with_isolated_eval_memo(|| {
             !executor.should_abort_theory_loop()
                 && !model::scoped_term_evaluation_override_active()
-                && installed_model_satisfies_roots(executor, rewritten_model_roots)
+                && check(executor)
         });
         if !accepted {
             trace_decline(diagnostic_name, "retained model failed rewritten roots");
@@ -74,7 +102,7 @@ impl CheckedModelRewriteSatAuthority {
         Some(Self { scope, model_epoch })
     }
 
-    pub(super) fn into_current_roots(
+    pub(in crate::executor) fn into_current_roots(
         self,
         executor: &mut Executor,
     ) -> Option<(Box<[TermId]>, QuantifiedGrantModelEpoch)> {

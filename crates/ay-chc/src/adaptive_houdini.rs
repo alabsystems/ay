@@ -516,7 +516,7 @@ impl AdaptivePortfolio {
         // proven `init ⇒ cand`. The (equality-propagated) init formula is
         // asserted ONCE as solver background; all checks are small deltas.
         let init_bg = propagate_background(&init_inlined);
-        let mut init_ctx = PersistentExecutorSmtContext::new();
+        let mut init_ctx = PersistentExecutorSmtContext::new_search();
         // Inc-21: this route's queries are SAT-direction-heavy over a large
         // guarded-eq background — the inc-14 EqDiffVar pass taxes every
         // check and defeats the model search (the inc-18 cliff). Seed the
@@ -671,7 +671,7 @@ impl AdaptivePortfolio {
         // implication (init ⇒ each survivor individually). On a combined-
         // query Unknown, a definitive per-candidate sweep takes over.
         let trans_bg = propagate_background(&trans_inlined);
-        let mut trans_ctx = PersistentExecutorSmtContext::new();
+        let mut trans_ctx = PersistentExecutorSmtContext::new_search();
         // Inc-21: dv-off-first, same rationale as `init_ctx` above.
         trans_ctx.prefer_dv_off_first();
         if !trans_ctx.ensure_background(&trans_bg, budget.call_cap()?) {
@@ -1006,7 +1006,7 @@ impl AdaptivePortfolio {
 
             // Nested consecution fixpoint — all queries conjunctive.
             let trans_bg = propagate_background(&trans_inlined);
-            let mut tctx = PersistentExecutorSmtContext::new();
+            let mut tctx = PersistentExecutorSmtContext::new_search();
             let cap = match budget.call_cap() {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -1498,6 +1498,12 @@ impl HoudiniBudget {
     }
 
     fn remaining(&self) -> Result<Duration, String> {
+        // The persistent executor sessions below do not consult the thread's
+        // SMT deadline; a cancelled lane (decided ladder race) or an expired
+        // enclosing deadline ends the route here instead of per query.
+        if crate::smt::smt_deadline_expired() {
+            return Err("route cancelled".to_string());
+        }
         self.route_budget
             .checked_sub(self.route_start.elapsed())
             .ok_or_else(|| "route budget exhausted".to_string())
@@ -1780,7 +1786,7 @@ fn houdini_phase_init_filter(
     init_bg: &ChcExpr,
     budget: &HoudiniBudget,
 ) -> Result<Vec<HoudiniCandidate>, String> {
-    let mut ctx = PersistentExecutorSmtContext::new();
+    let mut ctx = PersistentExecutorSmtContext::new_search();
     if !ctx.ensure_background(init_bg, budget.call_cap()?) {
         return Ok(cands.to_vec());
     }
@@ -1813,7 +1819,7 @@ fn minimize_phase_conj(
         Ok(c) => c,
         Err(_) => return cands,
     };
-    let mut ctx = PersistentExecutorSmtContext::new();
+    let mut ctx = PersistentExecutorSmtContext::new_search();
     if !ctx.ensure_background(phase, cap0) {
         return cands;
     }

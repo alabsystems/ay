@@ -284,6 +284,11 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         $lc, $shc, $ds
                     );
                     drop($theory);
+                    // Pop the caller's private frame like every other exit: a
+                    // leaked frame put the session's scopes one SAT selector
+                    // off, and a scoped `(assert false)` outlived its `(pop)`
+                    // (wrong `unsat`, 2026-09-29 scope-leak fix-up).
+                    let _ = $solver.pop();
                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     $self.last_result = Some(SolveResult::Unknown);
                     break $loop_label Ok(SolveResult::Unknown);
@@ -388,6 +393,9 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         $theory, $export_theory, $export_expr,
                         $lc, $shc, $ds
                     );
+                    // #stale-accept-sat-lane: the theory's SAT-only lane
+                    // before the gate decides this round's `Sat`.
+                    let _ = ay_core::TheorySolver::try_sat_before_stale_accept(&mut $theory);
                     $($sat_handler)*
                 } else {
                 pipeline_export_theory_state!(
@@ -469,6 +477,9 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         $theory, $export_theory, $export_expr,
                         $lc, $shc, $ds
                     );
+                    // #stale-accept-sat-lane: the theory's SAT-only lane
+                    // before the gate decides this round's `Sat`.
+                    let _ = ay_core::TheorySolver::try_sat_before_stale_accept(&mut $theory);
                     $($sat_handler)*
                 } else {
                 pipeline_export_theory_state!(
@@ -644,6 +655,9 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         $theory, $export_theory, $export_expr,
                         $lc, $shc, $ds
                     );
+                    // #stale-accept-sat-lane: the theory's SAT-only lane
+                    // before the gate decides this round's `Sat`.
+                    let _ = ay_core::TheorySolver::try_sat_before_stale_accept(&mut $theory);
                     $($sat_handler)*
                 } else {
                     pipeline_export_theory_state!(
@@ -652,8 +666,19 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     );
                     drop($theory);
 
-                    // #6851: Centralized round budget via ModelEqualityTracker.
-                    if $met.increment_round() {
+                    // #6851/#1145: a not-yet-encoded atom is finite progress
+                    // and replenishes the round budget; only a triangle-only
+                    // dispatch (atom already encoded) counts against it. The
+                    // test reads the atom the encoder maps, not `find_eq`'s
+                    // raw term (#model-eq-encoded-atom).
+                    if $crate::pipeline_fns::model_equality_request_is_new(
+                        &mut $self.ctx.terms,
+                        eq.lhs,
+                        eq.rhs,
+                        |atom| $ltv.contains_key(&atom),
+                    ) {
+                        $met.note_new_equality();
+                    } else if $met.increment_round() {
                         let _ = $solver.pop();
                         $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                         $self.last_result = Some(SolveResult::Unknown);
@@ -691,6 +716,9 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         $theory, $export_theory, $export_expr,
                         $lc, $shc, $ds
                     );
+                    // #stale-accept-sat-lane: the theory's SAT-only lane
+                    // before the gate decides this round's `Sat`.
+                    let _ = ay_core::TheorySolver::try_sat_before_stale_accept(&mut $theory);
                     $($sat_handler)*
                 } else {
                     pipeline_export_theory_state!(
@@ -699,8 +727,20 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     );
                     drop($theory);
 
-                    // #6851: Centralized round budget via ModelEqualityTracker.
-                    if $met.increment_round() {
+                    // #6851/#1145: a batch with at least one not-yet-encoded
+                    // atom replenishes the round budget; only a triangle-only
+                    // batch counts against it (#model-eq-encoded-atom).
+                    let _sld_me_has_new = eqs.iter().any(|eq| {
+                        $crate::pipeline_fns::model_equality_request_is_new(
+                            &mut $self.ctx.terms,
+                            eq.lhs,
+                            eq.rhs,
+                            |atom| $ltv.contains_key(&atom),
+                        )
+                    });
+                    if _sld_me_has_new {
+                        $met.note_new_equality();
+                    } else if $met.increment_round() {
                         let _ = $solver.pop();
                         $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                         $self.last_result = Some(SolveResult::Unknown);

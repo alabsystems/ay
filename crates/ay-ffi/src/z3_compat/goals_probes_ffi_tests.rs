@@ -20,6 +20,161 @@
 use super::super::*;
 use std::ffi::CStr;
 
+#[test]
+fn field_sat_public_boolean_field_models_and_native_refutation_transport() {
+    // SAFETY: this test exclusively owns its context and all its handles;
+    // every AST/array remains live throughout each matching-context call.
+    unsafe {
+        let ctx = mk_ctx();
+        let field = Z3_mk_finite_field_sort(ctx, c"7".as_ptr());
+        let x = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"x".as_ptr()), field);
+        let p = Z3_mk_const(
+            ctx,
+            Z3_mk_string_symbol(ctx, c"p".as_ptr()),
+            Z3_mk_bool_sort(ctx),
+        );
+        let eq =
+            |value: *const std::ffi::c_char| Z3_mk_eq(ctx, x, Z3_mk_numeral(ctx, value, field));
+        let x1 = eq(c"1".as_ptr());
+        let x2 = eq(c"2".as_ptr());
+        let x3 = eq(c"3".as_ptr());
+        let a = Z3_mk_or(ctx, 2, [p, x1].as_ptr());
+        let b = Z3_mk_or(ctx, 2, [Z3_mk_not(ctx, p), x2].as_ptr());
+        let tactic = Z3_mk_tactic(ctx, c"ff-sat".as_ptr());
+        assert!(!tactic.is_null());
+        let empty = Z3_mk_model(ctx);
+        for models in [false, true] {
+            let goal = Z3_mk_goal(ctx, models, false, false);
+            for root in [a, b, x2] {
+                Z3_goal_assert(ctx, goal, root);
+            }
+            let result = Z3_tactic_apply(ctx, tactic, goal);
+            assert!(!result.is_null());
+            let subgoal = Z3_apply_result_get_subgoal(ctx, result, 0);
+            assert!(Z3_goal_is_decided_sat(ctx, subgoal));
+            let copied = Z3_goal_translate(ctx, subgoal, ctx);
+            assert!(!copied.is_null());
+            let reapplied = Z3_tactic_apply(ctx, tactic, copied);
+            assert!(!reapplied.is_null());
+            let repeated = Z3_apply_result_get_subgoal(ctx, reapplied, 0);
+            assert!(Z3_goal_is_decided_sat(ctx, repeated));
+            for goal in [subgoal, copied, repeated] {
+                let model = Z3_goal_convert_model(ctx, goal, empty);
+                assert!(!model.is_null());
+                if models {
+                    for root in [a, b, x2, p] {
+                        let mut value = 0;
+                        assert!(Z3_model_eval(ctx, model, root, false, &mut value));
+                        assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+                    }
+                } else {
+                    assert_eq!(Z3_model_get_num_consts(ctx, model), 0);
+                }
+            }
+        }
+        let goal = Z3_mk_goal(ctx, true, false, false);
+        for root in [a, b, x3] {
+            Z3_goal_assert(ctx, goal, root);
+        }
+        let result = Z3_tactic_apply(ctx, tactic, goal);
+        assert!(!result.is_null());
+        assert!(Z3_goal_is_decided_unsat(
+            ctx,
+            Z3_apply_result_get_subgoal(ctx, result, 0)
+        ));
+        for (proofs, cores) in [(true, false), (false, true)] {
+            let goal = Z3_mk_goal(ctx, true, cores, proofs);
+            for root in [a, b, x3] {
+                Z3_goal_assert(ctx, goal, root);
+            }
+            assert!(Z3_tactic_apply(ctx, tactic, goal).is_null());
+        }
+        Z3_del_context(ctx);
+    }
+}
+
+#[test]
+fn field_solve_public_goal_witness_copy_flags_and_proof_refusal() {
+    // SAFETY: this test exclusively owns both live contexts; text/arrays are
+    // live throughout each call and every handle is from its stated context.
+    unsafe {
+        let ctx = mk_ctx();
+        let field = Z3_mk_finite_field_sort(ctx, c"65537".as_ptr());
+        let x = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"x".as_ptr()), field);
+        let y = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"y".as_ptr()), field);
+        let one = Z3_mk_numeral(ctx, c"1".as_ptr(), field);
+        let a = Z3_mk_eq(ctx, Z3_mk_ff_mul(ctx, 2, [x, x].as_ptr()), one);
+        let b = Z3_mk_eq(ctx, Z3_mk_ff_mul(ctx, 2, [x, y].as_ptr()), one);
+        let tactic = Z3_mk_tactic(ctx, c"ff-solve".as_ptr());
+        assert!(!tactic.is_null());
+        let empty = Z3_mk_model(ctx);
+        for models in [true, false] {
+            let goal = Z3_mk_goal(ctx, models, false, false);
+            Z3_goal_assert(ctx, goal, a);
+            Z3_goal_assert(ctx, goal, b);
+            let result = Z3_tactic_apply(ctx, tactic, goal);
+            assert!(!result.is_null());
+            let subgoal = Z3_apply_result_get_subgoal(ctx, result, 0);
+            assert!(Z3_goal_is_decided_sat(ctx, subgoal));
+            let copied = Z3_goal_translate(ctx, subgoal, ctx);
+            assert!(!copied.is_null());
+            for g in [subgoal, copied] {
+                let model = Z3_goal_convert_model(ctx, g, empty);
+                assert!(!model.is_null());
+                if models {
+                    for root in [a, b] {
+                        let mut value = 0;
+                        assert!(Z3_model_eval(ctx, model, root, false, &mut value));
+                        assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+                    }
+                } else {
+                    assert_eq!(Z3_model_get_num_consts(ctx, model), 0);
+                }
+            }
+            let other = mk_ctx();
+            assert!(Z3_goal_translate(ctx, subgoal, other).is_null());
+            Z3_del_context(other);
+        }
+        let composite = Z3_tactic_and_then(ctx, Z3_mk_tactic(ctx, c"skip".as_ptr()), tactic);
+        for t in [tactic, composite] {
+            for (proofs, cores) in [(true, false), (false, true)] {
+                let goal = Z3_mk_goal(ctx, true, cores, proofs);
+                Z3_goal_assert(ctx, goal, a);
+                Z3_goal_assert(ctx, goal, b);
+                assert!(Z3_tactic_apply(ctx, t, goal).is_null());
+            }
+        }
+        Z3_del_context(ctx);
+    }
+}
+
+#[test]
+fn field_unique_goal_transport_refuses_proofs_and_cores_through_composition() {
+    // SAFETY: all handles belong to this live context and are released with it.
+    unsafe {
+        let ctx = mk_ctx();
+        let unique = Z3_mk_tactic(ctx, c"ff-unique".as_ptr());
+        assert!(!unique.is_null());
+        let identity = Z3_mk_tactic(ctx, c"skip".as_ptr());
+        let composed = Z3_tactic_and_then(ctx, identity, unique);
+        for tactic in [unique, composed] {
+            for (proofs, cores) in [(true, false), (false, true)] {
+                let goal = Z3_mk_goal(ctx, false, cores, proofs);
+                Z3_goal_assert(ctx, goal, Z3_mk_false(ctx));
+                assert!(Z3_tactic_apply(ctx, tactic, goal).is_null());
+                assert_ne!(Z3_get_error_code(ctx), Z3_OK);
+            }
+            let goal = Z3_mk_goal(ctx, false, false, false);
+            Z3_goal_assert(ctx, goal, Z3_mk_false(ctx));
+            let result = Z3_tactic_apply(ctx, tactic, goal);
+            assert!(!result.is_null());
+            let subgoal = Z3_apply_result_get_subgoal(ctx, result, 0);
+            assert!(Z3_goal_is_decided_unsat(ctx, subgoal));
+        }
+        Z3_del_context(ctx);
+    }
+}
+
 /// Build a fresh context.
 ///
 /// # Safety

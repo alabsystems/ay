@@ -37,6 +37,14 @@ impl Solver {
         // Update the clause with reordered literals
         self.drain_pending_garbage_mark(clause_idx);
         self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
+        if let Some(trace) = self
+            .cold
+            .clause_trace
+            .as_mut()
+            .filter(|trace| !trace.proof_work_exhausted())
+        {
+            trace.record_deletion(old_clause_id, self.arena.literals(clause_idx));
+        }
         self.arena.replace(clause_idx, reordered);
         if let Some(ref mut gc_occ) = self.gc_occ {
             gc_occ.add_clause(clause_idx, reordered);

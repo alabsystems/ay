@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 1;
+obji 1;
+rup >= 1;
+output NONE;
+conclusion ENUMERATION_COMPLETE 1 : 3;
+end pseudo-Boolean proof;

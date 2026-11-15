@@ -16,11 +16,12 @@
 //!
 //! * Pass B (executor/rm_domain.rs): EUF-lane domain axioms — the wrong sats
 //!   become `unsat`, while the 5-element-satisfiable duals STAY `sat`.
-//! * Pass C (executor/theories/fp/rm_expand.rs): FP-lane mode enumeration —
-//!   a declared RM const used as a rounding-op operand DECIDES like z3, with
-//!   the model pinning the forced mode (long spelling, z3-exact).
-//! * The strengthened `check_fp_support` backstop: out-of-scope symbolic-RM
-//!   shapes return `unknown`, never a guess.
+//! * The FP lane's three-bit mode encoding (ay-theories/fp/src/rm.rs; a
+//!   five-way case split, `rm_expand.rs`, until 2026-09-30): a declared RM
+//!   const or an `ite` of modes used as a rounding-op operand DECIDES like z3,
+//!   with the model pinning the forced mode (long spelling, z3-exact).
+//! * The `check_fp_support` backstop: a mode the bit-blaster cannot encode (a
+//!   user function returning a mode) returns `unknown`, never a guess.
 
 use ntest::timeout;
 
@@ -164,19 +165,40 @@ fn rm_equal_pair_conflicting_modes_unsat() {
     assert_eq!(r, "unsat");
 }
 
-// ---- Backstop: out-of-scope shapes fail closed, never guess ----
+// ---- An ite of modes is encoded; a mode computed by a function is not ----
 
 #[test]
 #[timeout(60_000)]
-fn rm_ite_of_modes_stays_fail_closed() {
-    // An RM-sorted ite is outside the v1 enumeration scope (documented
-    // residue): must be `unknown` — z3 decides `unsat` here, and a `sat`
-    // would be a wrong verdict.
+fn rm_ite_of_modes_decides() {
+    // The ite multiplexes the two modes' bits: RTP rounds 2.5 to 3, RTZ to 2,
+    // so 3.5 is out of reach (z3: unsat) and 3.0 is reached with b true.
     let r = first_result(
         "(declare-const b Bool)
          (assert (fp.eq (fp.roundToIntegral (ite b RTP RTZ) ((_ to_fp 8 24) RNE 2.5))
                         ((_ to_fp 8 24) RNE 3.5)))
          (check-sat)",
     );
-    assert_eq!(r, "unknown", "out-of-scope RM shape must fail closed");
+    assert_eq!(r, "unsat");
+    let r = first_result(
+        "(declare-const b Bool)
+         (assert (fp.eq (fp.roundToIntegral (ite b RTP RTZ) ((_ to_fp 8 24) RNE 2.5))
+                        ((_ to_fp 8 24) RNE 3.0)))
+         (check-sat)",
+    );
+    assert_eq!(r, "sat");
+}
+
+#[test]
+#[timeout(60_000)]
+fn rm_valued_function_stays_fail_closed() {
+    // A rounding mode computed by an uninterpreted function has no encoding
+    // in the FP lane: `unknown`, never a guess.
+    let r = first_result(
+        "(declare-fun f (Bool) RoundingMode)
+         (declare-const b Bool)
+         (assert (fp.eq (fp.roundToIntegral (f b) ((_ to_fp 8 24) RNE 2.5))
+                        ((_ to_fp 8 24) RNE 3.5)))
+         (check-sat)",
+    );
+    assert_ne!(r, "sat", "a mode no RTP/RTZ/... can reach 3.5 from 2.5");
 }

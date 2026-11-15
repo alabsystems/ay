@@ -11,6 +11,8 @@ mod common;
 
 #[path = "group_fp/fp_arithmetic_correctness.rs"]
 mod fp_arithmetic_correctness;
+#[path = "group_fp/fp_bmc_float_sum.rs"]
+mod fp_bmc_float_sum;
 #[path = "group_fp/fp_congruence.rs"]
 mod fp_congruence;
 #[path = "group_fp/fp_conversions.rs"]
@@ -19,6 +21,10 @@ mod fp_conversions;
 mod fp_forward_error;
 #[path = "group_fp/fp_guard_and_minmax.rs"]
 mod fp_guard_and_minmax;
+#[path = "group_fp/fp_hidden_bv_conditions.rs"]
+mod fp_hidden_bv_conditions;
+#[path = "group_fp/fp_hidden_bv_operators.rs"]
+mod fp_hidden_bv_operators;
 #[path = "group_fp/fp_indexed_special_constants.rs"]
 mod fp_indexed_special_constants;
 #[path = "group_fp/fp_integration.rs"]
@@ -33,9 +39,13 @@ mod fp_round_integral;
 mod fp_rounding_modes;
 #[path = "group_fp/fp_rounding_tests.rs"]
 mod fp_rounding_tests;
+#[path = "group_fp/fp_small_width_d13.rs"]
+mod fp_small_width_d13;
 
 #[path = "group_fp/fp_symbolic_rm.rs"]
 mod fp_symbolic_rm;
+#[path = "group_fp/fp_symbolic_rm_models.rs"]
+mod fp_symbolic_rm_models;
 #[path = "group_fp/fp_to_bv.rs"]
 mod fp_to_bv;
 #[path = "group_fp/fp_to_ieee_bv.rs"]

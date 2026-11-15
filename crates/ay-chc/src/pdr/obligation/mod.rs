@@ -9,6 +9,7 @@ use crate::{ChcExpr, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::cmp::Ordering;
 
+use super::cube::literals::LitCube;
 use super::derivation::DerivationId;
 
 /// Kind of proof obligation (GSpacer global guidance, CAV'20).
@@ -85,6 +86,13 @@ pub(crate) struct ProofObligation {
     /// Frame level the spawning heuristic ultimately wants a lemma at.
     /// Defaults to `level`; only meaningful when `kind != Must`.
     pub(crate) desired_level: usize,
+    /// Literal view of `state` (Workstream B, `DESIGN` §3.2, contract C1).
+    /// `Some` when the POB was built by the Spacer lane (`from_cube`, or a
+    /// child carrying `PredecessorState.lits`); `None` from `new`. `state`
+    /// stays the source of truth for every existing reader (dedup key, cex,
+    /// verbose, `is_query_derived`); `cube()` derives the view on demand when
+    /// `lits` is `None`, so the two never disagree.
+    pub(crate) lits: Option<std::sync::Arc<LitCube>>,
 }
 
 impl ProofObligation {
@@ -106,6 +114,24 @@ impl ProofObligation {
             kind: PobKind::Must,
             gas: 0,
             desired_level: level,
+            lits: None,
+        }
+    }
+
+    /// Build a POB from a literal cube (Spacer lane; `state = cube.expr().clone()`).
+    #[allow(dead_code)] // WP-B1-S child construction (R1)
+    pub(crate) fn from_cube(pred: PredicateId, cube: LitCube, level: usize) -> Self {
+        let state = cube.expr().clone();
+        let mut pob = Self::new(pred, state, level);
+        pob.lits = Some(std::sync::Arc::new(cube));
+        pob
+    }
+
+    /// The literal view: `lits.clone()` or a fresh `LitCube::from_expr(&self.state)`.
+    pub(crate) fn cube(&self) -> std::sync::Arc<LitCube> {
+        match &self.lits {
+            Some(c) => std::sync::Arc::clone(c),
+            None => std::sync::Arc::new(LitCube::from_expr(&self.state)),
         }
     }
 

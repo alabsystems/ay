@@ -1,0 +1,28 @@
+; Authored source-derived BMC kernel, not a captured MODEL_CHECKER_CONSUMER compiler export.
+; MODEL_CHECKER_CONSUMER d85cd869b254d8b848853b64787e24f82c35ff1c:
+; tests/trust-lane/float-intrinsics/relation_arithmetic.rs,
+; arith_sym_sum_sign_refuted. Ground min(+0,-0) keeps its fresh Bool choice
+; (statement/intrinsics/math.rs); arithmetic uses float_arithmetic.rs's
+; BV sign/exponent/significand -> FP -> fp.add RNE -> fp.to_ieee_bv route.
+; Expected SAT by source reasoning: x=#xbf800000 (-1.0), either zero choice.
+; This is exact BMC FP arithmetic, not the CHC uninterpreted float table.
+(set-logic ALL)
+(set-info :status sat)
+(declare-const x (_ BitVec 32))
+(declare-const minmax_equal_choice Bool)
+(define-fun m () (_ BitVec 32)
+  (ite minmax_equal_choice #x00000000 #x80000000))
+; Preserve kani::assume(x.is_finite() && x != 0.0), excluding BOTH zeros.
+(assert (and
+  (not (= ((_ extract 30 23) x) #xff))
+  (not (= (bvand x #x7fffffff) #x00000000))))
+(define-fun x_fp () (_ FloatingPoint 8 24)
+  (fp ((_ extract 31 31) x) ((_ extract 30 23) x) ((_ extract 22 0) x)))
+(define-fun m_fp () (_ FloatingPoint 8 24)
+  (fp ((_ extract 31 31) m) ((_ extract 30 23) m) ((_ extract 22 0) m)))
+(define-fun sum_bits () (_ BitVec 32)
+  (fp.to_ieee_bv (fp.add RNE x_fp m_fp)))
+; Negate assert!((x + m).is_sign_positive()). Do not fix x to the witness.
+(assert (not (= ((_ extract 31 31) sum_bits) #b0)))
+(check-sat)
+(exit)

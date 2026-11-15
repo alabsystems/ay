@@ -70,7 +70,9 @@ impl TermStore {
 
         // Create new term
         let id = TermId(self.terms.len() as u32);
+        let field_presence = self.entry_field_presence(&term, &sort);
         self.terms.push(TermEntry {
+            field_presence,
             term,
             sort,
             stamp: fresh_term_entry_stamp(),
@@ -106,7 +108,7 @@ impl TermStore {
         match term {
             TermData::Const(c) => match c {
                 Constant::String(s) => s.capacity(),
-                Constant::Bool(_) => 0,
+                Constant::Bool(_) | Constant::FiniteField { .. } => 0,
                 // BigInt stores digits in a heap-allocated Vec<u64>.
                 // We estimate the heap as ceil(bit_length / 64) * 8 bytes,
                 // falling back to 3 * size_of::<u64>() for small values
@@ -114,13 +116,10 @@ impl TermStore {
                 Constant::Int(n) => Self::bigint_heap_estimate(n),
                 Constant::Rational(r) => Self::bigint_heap_estimate(r.0.numer())
                     .saturating_add(Self::bigint_heap_estimate(r.0.denom())),
-                Constant::BitVec { value, width } => {
-                    // The BigInt stores ceil(width/64) limbs on the heap.
-                    let limbs = (*width as usize).div_ceil(64);
-                    let estimated = limbs.max(1).saturating_mul(size_of::<u64>());
-                    // Also count the BigInt's own heap from its magnitude.
-                    estimated.max(Self::bigint_heap_estimate(value))
-                }
+                // A normalized BigInt retains occupied digits, not a buffer
+                // for the declared bitvector width. Keep the same conservative
+                // scalar estimate used for integer constants.
+                Constant::BitVec { value, .. } => Self::bigint_heap_estimate(value),
             },
             TermData::Var(name, _) => name.capacity(),
             TermData::App(sym, args) => {
@@ -196,14 +195,55 @@ impl TermStore {
     pub fn mk_bitvec(&mut self, value: BigInt, width: u32) -> TermId {
         // Normalize to unsigned representation: value mod 2^width
         // This ensures -128 and 128 both become 128 for 8-bit bitvectors.
-        let modulus = BigInt::one() << width;
-        let normalized = ((value % &modulus) + &modulus) % &modulus;
+        // An already unsigned, in-range value is its own canonical residue.
+        // Do not allocate a width-sized modulus for sparse wide constants.
+        let normalized =
+            if value.sign() != num_bigint::Sign::Minus && value.bits() <= u64::from(width) {
+                value
+            } else {
+                let modulus = BigInt::one() << width;
+                ((value % &modulus) + &modulus) % &modulus
+            };
         self.intern(
             TermData::Const(Constant::BitVec {
                 value: normalized,
                 width,
             }),
             Sort::bitvec(width),
+        )
+    }
+
+    /// Construct a well-sorted prime-field arithmetic application.
+    /// `ff.bitsum` is positional; its arguments are never reordered here.
+    pub fn mk_ff_app(&mut self, operation: &str, args: &[TermId]) -> Option<TermId> {
+        let arity_ok = match operation {
+            "ff.neg" => args.len() == 1,
+            "ff.add" | "ff.mul" | "ff.bitsum" => args.len() >= 2,
+            _ => false,
+        };
+        if !arity_ok {
+            return None;
+        }
+        let Sort::FiniteField(field) = *self.sort(args[0]) else {
+            return None;
+        };
+        if args
+            .iter()
+            .any(|&arg| self.sort(arg) != &Sort::FiniteField(field))
+        {
+            return None;
+        }
+        Some(self.mk_app(Symbol::named(operation), args, Sort::FiniteField(field)))
+    }
+
+    /// Construct a canonical residue in a checked prime field.
+    pub fn mk_finite_field(&mut self, value: u32, field: crate::FiniteFieldSort) -> TermId {
+        self.intern(
+            TermData::Const(Constant::FiniteField {
+                value: value % field.modulus(),
+                field,
+            }),
+            Sort::FiniteField(field),
         )
     }
 
@@ -344,6 +384,23 @@ impl TermStore {
     /// Create a function application
     pub fn mk_app(&mut self, func: Symbol, args: impl AsRef<[TermId]>, sort: Sort) -> TermId {
         let args = args.as_ref();
+        if let Some(result) = self.fold_sequence_power_application(&func, args, &sort) {
+            return result;
+        }
+        self.mk_app_structural(func, args, sort)
+    }
+
+    /// Construct an application without rewriting its operator or arguments.
+    /// Public AST constructors use this when their structure is observable;
+    /// explicit simplification retains the ordinary bounded rewriting rules.
+    /// As with `mk_app`, the caller is responsible for operator typing.
+    pub fn mk_app_structural(
+        &mut self,
+        func: Symbol,
+        args: impl AsRef<[TermId]>,
+        sort: Sort,
+    ) -> TermId {
+        let args = args.as_ref();
         // Do NOT short-circuit through the sort-blind `find_app`: for a
         // sort-polymorphic nullary constructor (e.g. `seq.empty`) the same
         // `(func, args)` can exist at a different sort, and `find_app` would
@@ -373,11 +430,23 @@ impl TermStore {
     pub fn try_fold_datatype_selector(&mut self, sel_name: &str, arg: TermId) -> Option<TermId> {
         match self.get(arg).clone() {
             TermData::App(Symbol::Named(ctor_name), cargs) => {
-                let Sort::Datatype(dt) = self.sort(arg).clone() else {
-                    return None;
+                // Two carriers reach here. `Sort::Datatype` carries its own
+                // constructor table. A `declare-datatype` carrier does NOT: it
+                // is a `Sort::Uninterpreted` identity, so this arm used to
+                // return None and the fold was dead on every parsed SMT-LIB
+                // input. Fall back to the registered field order, which the
+                // declaring layer installs for exactly that case.
+                let idx = match self.sort(arg).clone() {
+                    Sort::Datatype(dt) => {
+                        let ctor = dt.constructors.iter().find(|c| c.name == ctor_name)?;
+                        ctor.fields.iter().position(|f| f.name == sel_name)?
+                    }
+                    _ => self
+                        .constructor_fields
+                        .get(ctor_name.as_str())?
+                        .iter()
+                        .position(|field| field == sel_name)?,
                 };
-                let ctor = dt.constructors.iter().find(|c| c.name == ctor_name)?;
-                let idx = ctor.fields.iter().position(|f| f.name == sel_name)?;
                 cargs.get(idx).copied()
             }
             TermData::Ite(cond, then_br, else_br) => {
@@ -387,6 +456,41 @@ impl TermStore {
             }
             _ => None,
         }
+    }
+
+    /// Record the ordered field (selector) names of a datatype constructor.
+    ///
+    /// Required only for a `declare-datatype` carrier, whose sort is a
+    /// `Sort::Uninterpreted` identity and therefore carries no constructor
+    /// table of its own. Without it
+    /// [`Self::try_fold_datatype_selector`] cannot resolve a field index and
+    /// every `sel(C(t..))` stays opaque, which makes each such term a fresh
+    /// array base and blows up the array-axiom census.
+    ///
+    /// Idempotent, and last write wins: re-declaring a constructor with the
+    /// same field order is a no-op. Registering nothing is always safe — the
+    /// fold simply declines.
+    pub fn register_constructor_fields(&mut self, ctor: &str, fields: Vec<String>) {
+        self.constructor_fields.insert(ctor.to_string(), fields);
+    }
+
+    /// The registered field order of a datatype constructor, if any.
+    #[must_use]
+    pub fn constructor_field_names(&self, ctor: &str) -> Option<&[String]> {
+        self.constructor_fields.get(ctor).map(Vec::as_slice)
+    }
+
+    /// Whether `name` is a registered datatype SELECTOR of any constructor.
+    ///
+    /// The registry is keyed by constructor, so this is the reverse lookup.
+    /// Callers use it to tell a datatype projection from a genuinely declared
+    /// uninterpreted function: a selector's value is fixed by the datatype
+    /// value it is applied to, so it needs no separate interpretation.
+    #[must_use]
+    pub fn name_is_registered_selector(&self, name: &str) -> bool {
+        self.constructor_fields
+            .values()
+            .any(|fields| fields.iter().any(|field| field == name))
     }
 
     /// Create a universal quantifier: forall ((x1 S1) ...) body

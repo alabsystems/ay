@@ -147,7 +147,7 @@ mod engine;
 
 use super::*;
 use crate::literal::{Literal, Variable};
-use engine::{BitEnum, EnumOutcome, ENUM_BITS, KIND_CLAUSE, KIND_XOR};
+use engine::{BitEnum, EnumOutcome, ENUM_BITS, KIND_AND, KIND_CLAUSE, KIND_XOR};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -226,6 +226,16 @@ const INDEP_ENUM_BUDGET_FRACTION: f64 = 0.45;
 /// idle time. At the 5000 s competition budget this is what keeps the probe at
 /// 16 % instead of 45 %.
 const INDEP_ENUM_BUDGET_MAX: Duration = Duration::from_secs(800);
+/// The slice ceiling: `INDEP_ENUM_BUDGET_MAX`, or `--sat-indep-enum-max-secs`.
+/// In SAT-COMP 2026 the route is admitted on 30 instances: the 14 SAT ones are
+/// answered within 218 s of wall time, and 16 are UNSAT or unknown (the
+/// multiplier miters among them), where the slice sweeps the whole support space
+/// (6-8e9 visits, ~620 s) and cannot answer.
+fn indep_enum_budget_max() -> Duration {
+    ay_core::sat_ab_switches()
+        .indep_enum_max_secs
+        .map_or(INDEP_ENUM_BUDGET_MAX, Duration::from_secs)
+}
 /// Head start when the caller installed no deadline (library embeddings that
 /// solve to completion). Absolute, because there is no budget to take a
 /// fraction of.
@@ -234,6 +244,10 @@ const INDEP_ENUM_HEAD_START_NO_DEADLINE: Duration = Duration::from_secs(30);
 /// an unbounded caller asked for a complete solve, not for a probe that owns
 /// the process.
 const INDEP_ENUM_BUDGET_NO_DEADLINE: Duration = Duration::from_secs(300);
+/// Engine visits per millisecond of enumeration: the measured 12.2-14.0M
+/// visits/s. Under `--sat-deterministic-inproc` a slice is this many visits
+/// per millisecond of the wall schedule's slice.
+const INDEP_ENUM_VISITS_PER_MS: u64 = 13_100;
 
 /// CLI-owned tri-state: `--sat-indep-enum <bool>`.
 fn indep_enum_enabled() -> bool {
@@ -291,6 +305,15 @@ pub(crate) struct PendingIndepEnum {
     head_start_until: ay_core::time::Instant,
     /// Total wall budget the slice may consume.
     budget: Duration,
+    /// Under `--sat-deterministic-inproc`: the head start in search ticks and
+    /// the slice in engine visits (`indep_enum_counted_schedule`).
+    head_start_ticks: u64,
+    slice_visits: u64,
+}
+
+thread_local! {
+    /// [`Solver::support_enumeration_builds`].
+    static STARTUP_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Solver {
@@ -304,7 +327,7 @@ impl Solver {
     /// six fast SAT solves into timeouts (module docs).
     pub(super) fn prepare_indep_enum_at_startup(&mut self) {
         self.cold.indep_enum_pending = None;
-        if !indep_enum_enabled() {
+        if !self.cold.support_enumeration || !indep_enum_enabled() {
             return;
         }
         // Plain-CNF startup construction only (mirrors the GF-probe gate).
@@ -319,6 +342,7 @@ impl Solver {
         {
             return;
         }
+        STARTUP_BUILDS.with(|builds| builds.set(builds.get().wrapping_add(1)));
         let t0 = ay_core::time::Instant::now();
         let pending = self.indep_enum_park();
         self.stats.indep_enum_time_ns = self
@@ -326,6 +350,25 @@ impl Solver {
             .indep_enum_time_ns
             .saturating_add(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         self.cold.indep_enum_pending = pending.map(Box::new);
+    }
+
+    /// Whether this solver may build the enumeration at startup: on unless
+    /// turned off here, and `--sat-indep-enum` still rules. Off for each
+    /// local solve of AY's SAT sweep
+    /// ([`crate::solve_resolution_dag_counted_local`]): a lemma solve ends
+    /// long before the head start that would let the parked engine run, so
+    /// the independent-support recovery and XOR collapse over its whole
+    /// clause set are all the build would cost it.
+    pub fn set_support_enumeration(&mut self, enabled: bool) {
+        self.cold.support_enumeration = enabled;
+    }
+
+    /// How many startup builds of the enumeration solvers on this thread
+    /// have begun, each the support recovery its gate reads, admitted or
+    /// not. A caller's test reads it to prove a solve began none.
+    #[doc(hidden)]
+    pub fn support_enumeration_builds() -> u64 {
+        STARTUP_BUILDS.with(std::cell::Cell::get)
     }
 
     /// Wall budget for one enumeration slice, and the head start search gets
@@ -343,13 +386,46 @@ impl Solver {
                     .min(INDEP_ENUM_HEAD_START_MAX),
                 budget
                     .mul_f64(INDEP_ENUM_BUDGET_FRACTION)
-                    .min(INDEP_ENUM_BUDGET_MAX),
+                    .min(indep_enum_budget_max()),
             ),
             None => (
                 INDEP_ENUM_HEAD_START_NO_DEADLINE,
                 INDEP_ENUM_BUDGET_NO_DEADLINE,
             ),
         }
+    }
+
+    /// The schedule under `--sat-deterministic-inproc`: the head start in
+    /// search ticks and the slice in engine visits. The wall schedule's
+    /// fractions and caps apply to the configured solve budget, a fixed input,
+    /// instead of the time remaining at park time, which moves with load, and
+    /// convert at `TICKS_PER_MS` and `INDEP_ENUM_VISITS_PER_MS`. Search keeps
+    /// the majority of the budget and resumes with it, as on the wall clock.
+    /// The head start counts search work from the start of search; the wall
+    /// head start runs from park time and also pays for preprocessing.
+    fn indep_enum_counted_schedule(&self) -> (u64, u64) {
+        let (head_start, slice) = match self.cold.solve_budget_ms {
+            Some(ms) => {
+                let budget = Duration::from_millis(ms);
+                (
+                    budget
+                        .mul_f64(INDEP_ENUM_HEAD_START_FRACTION)
+                        .min(INDEP_ENUM_HEAD_START_MAX),
+                    budget
+                        .mul_f64(INDEP_ENUM_BUDGET_FRACTION)
+                        .min(indep_enum_budget_max()),
+                )
+            }
+            None => (
+                INDEP_ENUM_HEAD_START_NO_DEADLINE,
+                INDEP_ENUM_BUDGET_NO_DEADLINE,
+            ),
+        };
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        (
+            ms(head_start).saturating_mul(crate::determinism::TICKS_PER_MS),
+            ms(slice).saturating_mul(INDEP_ENUM_VISITS_PER_MS),
+        )
     }
 
     /// Gate and build. `None` on any bail-out; the solver is untouched either
@@ -375,7 +451,20 @@ impl Solver {
                 root_ext_model[ext] = self.vals[Literal::positive(Variable(v as u32)).index()] > 0;
             }
         }
-        let (head_start, budget) = self.indep_enum_schedule();
+        // Under `--sat-deterministic-inproc` the head start and the slice are
+        // counted, and the wall schedule, which reads the deadline, is not
+        // consulted.
+        let det = self.deterministic_inproc();
+        let (head_start, budget) = if det {
+            (Duration::ZERO, Duration::ZERO)
+        } else {
+            self.indep_enum_schedule()
+        };
+        let (head_start_ticks, slice_visits) = if det {
+            self.indep_enum_counted_schedule()
+        } else {
+            (0, 0)
+        };
         let engine = BitEnum::new(orig_of.len(), kinds, starts, lits, dense_support);
         tracing::info!(
             head_start_ms = head_start.as_millis() as u64,
@@ -388,7 +477,18 @@ impl Solver {
             root_ext_model,
             head_start_until: ay_core::time::Instant::now() + head_start,
             budget,
+            head_start_ticks,
+            slice_visits,
         })
+    }
+
+    /// Under `--sat-deterministic-inproc`: the parked enumeration's head start
+    /// in search ticks, if one is parked.
+    pub(super) fn indep_enum_head_start_ticks(&self) -> Option<u64> {
+        self.cold
+            .indep_enum_pending
+            .as_ref()
+            .map(|pending| pending.head_start_ticks)
     }
 
     /// The instant at which the parked enumeration is allowed to start, if one
@@ -411,14 +511,23 @@ impl Solver {
         let mut pending = self.cold.indep_enum_pending.take()?;
         let t0 = ay_core::time::Instant::now();
         let slice_until = t0 + pending.budget;
+        let det = self.deterministic_inproc();
         let outcome = {
             let engine = &mut pending.engine;
+            let visit_cap = if det {
+                engine
+                    .visits
+                    .saturating_add(pending.slice_visits)
+                    .min(INDEP_ENUM_MAX_VISITS)
+            } else {
+                INDEP_ENUM_MAX_VISITS
+            };
             let stop = || {
                 self.is_interrupted()
                     || self.solve_deadline_expired()
-                    || ay_core::time::Instant::now() >= slice_until
+                    || (!det && ay_core::time::Instant::now() >= slice_until)
             };
-            engine.run(&stop, INDEP_ENUM_MAX_VISITS)
+            engine.run(&stop, visit_cap)
         };
         let elapsed = t0.elapsed();
         self.stats.indep_enum_time_ns = self
@@ -644,7 +753,8 @@ impl Solver {
                 _ => None,
             })
             .collect();
-        let (kinds, starts, lits) = collapse_xors(&raw);
+        let and_gates = ay_core::sat_ab_switches().indep_enum_and == Some(true);
+        let (kinds, starts, lits) = collapse_constraints(&raw, and_gates);
         Some(EnumProgram {
             orig_of,
             kinds,
@@ -677,6 +787,37 @@ impl Solver {
     }
 }
 
+impl Solver {
+    /// The support enumeration's counters for the stats JSON: whether it was
+    /// admitted, its support and program size, and what the sweep did.
+    pub fn indep_enum_profile(&self) -> [(&'static str, u64); 12] {
+        let st = &self.stats;
+        [
+            ("sat.indep_enum_admitted", st.indep_enum_admitted),
+            ("sat.indep_enum_support_size", st.indep_enum_support_size),
+            ("sat.indep_enum_constraints", st.indep_enum_constraints),
+            (
+                "sat.indep_enum_projected_visits",
+                st.indep_enum_projected_visits,
+            ),
+            ("sat.indep_enum_blocks", st.indep_enum_blocks),
+            ("sat.indep_enum_assignments", st.indep_enum_assignments),
+            ("sat.indep_enum_visits", st.indep_enum_visits),
+            ("sat.indep_enum_time_ms", st.indep_enum_time_ns / 1_000_000),
+            ("sat.indep_enum_exhausted", st.indep_enum_exhausted),
+            ("sat.indep_enum_stalled", st.indep_enum_stalled),
+            (
+                "sat.indep_enum_verify_failures",
+                st.indep_enum_verify_failures,
+            ),
+            (
+                "sat.indep_enum_budget_exhausted",
+                st.indep_enum_budget_exhausted,
+            ),
+        ]
+    }
+}
+
 /// Collapse complete XOR parity classes and emit the CSR constraint set.
 ///
 /// A set of `2^(k-1)` distinct clauses over the same `k` variables, all with
@@ -689,6 +830,19 @@ impl Solver {
 /// Emitted order follows the first clause each constraint came from, so the
 /// circuit's evaluation order survives the collapse.
 fn collapse_xors(raw: &[Vec<u32>]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
+    collapse_constraints(raw, false)
+}
+
+/// `collapse_xors`, then (`and_gates`, `--sat-indep-enum-and`) two-input AND
+/// gates among the clauses left: a ternary `(o ∨ ¬a ∨ ¬b)` whose binaries
+/// `(¬o ∨ a)` and `(¬o ∨ b)` are also still unconsumed becomes one `KIND_AND`
+/// constraint `[o, a, b]`. The constraint is exactly the conjunction of the
+/// three clauses it consumes, so the formula is unchanged, and one AND visit
+/// replaces three clause visits: an AND gate is otherwise 3 constraints and 7
+/// literal slots in the queue (on xorshift_r14_110, 882 of 4,133 constraints
+/// carrying 6,174 of 10,635 literal slots; multiplier miters are mostly AND
+/// partial products and adders).
+fn collapse_constraints(raw: &[Vec<u32>], and_gates: bool) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
     let mut groups: HashMap<Vec<u32>, Vec<(usize, u32)>> = HashMap::new();
     for (i, c) in raw.iter().enumerate() {
         if c.len() < 2 || c.len() > INDEP_ENUM_XOR_MAX_ARITY {
@@ -745,6 +899,38 @@ fn collapse_xors(raw: &[Vec<u32>]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
                 consumed[i] = true;
             }
             out.push((order, KIND_XOR, xlits));
+        }
+    }
+    if and_gates {
+        let pair = |x: u32, y: u32| (x.min(y), x.max(y));
+        let mut binaries: HashMap<(u32, u32), usize> = HashMap::new();
+        for (i, c) in raw.iter().enumerate() {
+            if !consumed[i] && c.len() == 2 {
+                binaries.entry(pair(c[0], c[1])).or_insert(i);
+            }
+        }
+        for (i, c) in raw.iter().enumerate() {
+            if consumed[i] || c.len() != 3 {
+                continue;
+            }
+            for k in 0..3 {
+                let o = c[k];
+                let (ia, ib) = (c[(k + 1) % 3] ^ 1, c[(k + 2) % 3] ^ 1);
+                let (Some(&j1), Some(&j2)) = (
+                    binaries.get(&pair(o ^ 1, ia)),
+                    binaries.get(&pair(o ^ 1, ib)),
+                ) else {
+                    continue;
+                };
+                if j1 == j2 || consumed[j1] || consumed[j2] {
+                    continue;
+                }
+                consumed[i] = true;
+                consumed[j1] = true;
+                consumed[j2] = true;
+                out.push((i.min(j1).min(j2), KIND_AND, vec![o, ia, ib]));
+                break;
+            }
         }
     }
     for (i, c) in raw.iter().enumerate() {

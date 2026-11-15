@@ -118,6 +118,23 @@ fn candidate_for(
     array_equality: TermId,
     premises: &mut Vec<NegatedEquality>,
 ) -> Option<Proof> {
+    // A unit array identity needs no index disequality. In particular,
+    // shadowed writes are equal for every aliasing of the remaining indices.
+    // The checker alone recognizes the theorem; the existing authored-scope
+    // and strict replay gate still authenticates this candidate before use.
+    if ay_proof::recognize_array_theory_lemma(&exec.ctx.terms, &[array_equality])
+        == Some(TheoryLemmaKind::ArrayRowChain)
+    {
+        let mut candidate = Proof::new();
+        let assume = candidate.add_assume(array_root, None);
+        let lemma = candidate.add_theory_lemma_with_kind(
+            "array",
+            vec![array_equality],
+            TheoryLemmaKind::ArrayRowChain,
+        );
+        candidate.add_resolution(Vec::new(), array_equality, lemma, assume);
+        return Some(candidate);
+    }
     shrink_to_schema(&exec.ctx.terms, premises, array_equality)?;
     Some(build_candidate(array_root, array_equality, premises))
 }

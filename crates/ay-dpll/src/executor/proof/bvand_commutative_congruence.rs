@@ -2,12 +2,22 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use ay_core::kani_compat::DetHashMap;
+use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::term::{Constant, TermData};
 use ay_core::{AletheRule, Proof, ProofId, Sort, Symbol, TermId, TermStore, TheoryLemmaKind};
 
+/// Pure-syntax admission for the general bounded, wiring-only leaf.
+mod bounded_leaf;
+/// Crosswise matching of a commutative ring node, shared with the frontier.
+mod crossed;
 /// Pure-syntax leaf shape predicates — which crux to hand the recognizer.
 mod leaf_shapes;
+
+use bounded_leaf::is_bounded_wiring_leaf_pair;
+pub(super) use crossed::{
+    add_crosswise_congruence_proof, add_ring_operand_swap, exceeds_printable_swaps,
+    RING_COMMUTATIVE_OPERATORS,
+};
 
 use leaf_shapes::{
     is_idempotent_bv_gate_of, is_ult_one_eq_zero_of, is_unsigned_compare_duality_of,
@@ -15,10 +25,46 @@ use leaf_shapes::{
 
 const MAX_CONGRUENCE_NODES: usize = 256;
 
+/// General bounded leaves one walk may use.
+const MAX_BOUNDED_LEAVES: usize = 4;
+
+/// The general-leaf state of one walk.
+///
+/// A general leaf at a wide width is an EXPENSIVE `BvBitBlast` lemma: the
+/// strict checker prices each one at a full proof-producing replay, and one
+/// strict walk's envelope admits a single such price. So a walk that needs
+/// several general leaves must not mint one lemma per leaf. The walk therefore
+/// runs twice: the planning pass decides every leaf with the recognizer and
+/// records the accepted equalities (as ordinary lemmas, discarded afterwards);
+/// the emitting pass proves their CONJUNCTION as one `BvBitBlast` lemma —
+/// itself re-decided by the recognizer — and hands each leaf its `and_pos`
+/// projection instead of a lemma of its own.
+#[derive(Default)]
+struct BoundedLeaves {
+    /// Leaves accepted in the planning pass, in walk order, with the step each
+    /// was minted as (so a rolled-back descent can drop exactly its own).
+    accepted: Vec<((TermId, TermId), ProofId)>,
+    /// Pairs the recognizer refused: decided once, however often reached.
+    refused: DetHashSet<(TermId, TermId)>,
+    /// Emitting pass: the projection step proving each planned leaf.
+    provided: Option<DetHashMap<(TermId, TermId), ProofId>>,
+    /// Whether a binary ring node whose positional descent fails is retried
+    /// crosswise (`crossed`). Set only by `add_crosswise_congruence_proof`.
+    crosswise: bool,
+}
+
 /// Build an exact equality proof when two terms differ only by local bit-vector
-/// gate rewrites — a binary `bvand` operand swap, a `bvand`/`bvor` idempotency
-/// collapse, or an unsigned comparison/negated-strict-dual swap — below
-/// otherwise identical applications/ites.
+/// rewrites below otherwise identical applications/ites: a binary `bvand`
+/// operand swap, a `bvand`/`bvor` idempotency collapse, an unsigned
+/// comparison/negated-strict-dual swap, or — generally — any bounded,
+/// arithmetic-free differing pair (see `bounded_leaf`). This walk matches
+/// arguments by position only; `crossed::add_crosswise_congruence_proof` is
+/// the same walk that also closes a `bvadd` or `bvmul` node crosswise.
+///
+/// The general leaf is what keeps a collapse whose two sides share an
+/// expensive circuit (a wide `bvmul`) from being refuted as one whole miter:
+/// only the differing operands are bit-blasted, and `cong` lifts their
+/// equality through the shared operator.
 ///
 /// Every rewrite leaf is first admitted by `ay-proof`'s independent
 /// proof-producing BV recognizer (bit-blast + surfaced LRAT replay at wide
@@ -33,9 +79,7 @@ pub(super) fn add_bvand_commutative_congruence_proof(
     right: TermId,
 ) -> Option<ProofId> {
     let initial_step_count = proof.steps.len();
-    let mut memo = DetHashMap::default();
-    let mut visited = 0;
-    let result = recurse(terms, proof, left, right, &mut memo, &mut visited);
+    let result = walk_with_joint_leaves(terms, proof, (left, right), initial_step_count, false);
     if result.is_none() {
         // Keep the caller's candidate transactional: a valid swap proved in an
         // early argument must not survive when a later differing argument
@@ -45,6 +89,63 @@ pub(super) fn add_bvand_commutative_congruence_proof(
     result
 }
 
+fn walk_with_joint_leaves(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+    (left, right): (TermId, TermId),
+    initial_step_count: usize,
+    crosswise: bool,
+) -> Option<ProofId> {
+    let mut leaves = BoundedLeaves {
+        crosswise,
+        ..BoundedLeaves::default()
+    };
+    let planned = walk(terms, proof, left, right, &mut leaves)?;
+    if leaves.accepted.len() < 2 {
+        return Some(planned);
+    }
+
+    // Re-emit with one joint lemma for all general leaves.
+    proof.steps.truncate(initial_step_count);
+    let equalities: Vec<TermId> = leaves
+        .accepted
+        .iter()
+        .map(|&((l, r), _)| terms.mk_app(Symbol::named("="), [l, r], Sort::Bool))
+        .collect();
+    let joint = terms.mk_app(Symbol::named("and"), equalities.clone(), Sort::Bool);
+    if !ay_proof::recognize_bv_bitblast(terms, &[joint]) {
+        return None;
+    }
+    let joint_step =
+        proof.add_theory_lemma_with_kind("bv", vec![joint], TheoryLemmaKind::BvBitBlast);
+    let not_joint = terms.mk_not_raw(joint);
+    let mut provided = DetHashMap::default();
+    for (position, (&equality, &(pair, _))) in equalities.iter().zip(&leaves.accepted).enumerate() {
+        let projection = proof.add_rule_step(
+            AletheRule::AndPos(u32::try_from(position).ok()?),
+            vec![not_joint, equality],
+            Vec::new(),
+            vec![joint],
+        );
+        let leaf = proof.add_resolution(vec![equality], joint, projection, joint_step);
+        provided.insert(pair, leaf);
+    }
+    leaves.provided = Some(provided);
+    walk(terms, proof, left, right, &mut leaves)
+}
+
+fn walk(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+    left: TermId,
+    right: TermId,
+    leaves: &mut BoundedLeaves,
+) -> Option<ProofId> {
+    let mut memo = DetHashMap::default();
+    let mut visited = 0;
+    recurse(terms, proof, left, right, &mut memo, &mut visited, leaves)
+}
+
 fn recurse(
     terms: &mut TermStore,
     proof: &mut Proof,
@@ -52,6 +153,7 @@ fn recurse(
     right: TermId,
     memo: &mut DetHashMap<(TermId, TermId), ProofId>,
     visited: &mut usize,
+    leaves: &mut BoundedLeaves,
 ) -> Option<ProofId> {
     if left == right {
         return None;
@@ -183,21 +285,122 @@ fn recurse(
             vec![left_condition, left_then, left_else],
             vec![right_condition, right_then, right_else],
         ),
-        _ => return None,
+        _ => return bounded_leaf(terms, proof, left, right, memo, leaves),
     };
 
-    let mut premises = Vec::new();
-    for (left_arg, right_arg) in left_args.into_iter().zip(right_args) {
-        if left_arg == right_arg {
-            continue;
-        }
-        premises.push(recurse(terms, proof, left_arg, right_arg, memo, visited)?);
-    }
+    let descent_start = proof.steps.len();
+    let Some(premises) = descend(terms, proof, left_args, right_args, memo, visited, leaves) else {
+        return retry_after_failed_descent(
+            terms,
+            proof,
+            (left, right),
+            memo,
+            visited,
+            leaves,
+            descent_start,
+        );
+    };
     if premises.is_empty() {
         return None;
     }
     let equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
     let step = proof.add_rule_step(AletheRule::Cong, vec![equality], premises, Vec::new());
+    memo.insert((left, right), step);
+    Some(step)
+}
+
+/// Prove each differing argument pair of a lockstep descent, in order; `None`
+/// as soon as one pair has no proof.
+fn descend(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+    left_args: Vec<TermId>,
+    right_args: Vec<TermId>,
+    memo: &mut DetHashMap<(TermId, TermId), ProofId>,
+    visited: &mut usize,
+    leaves: &mut BoundedLeaves,
+) -> Option<Vec<ProofId>> {
+    let mut premises = Vec::new();
+    for (left_arg, right_arg) in left_args.into_iter().zip(right_args) {
+        if left_arg != right_arg {
+            premises.push(recurse(
+                terms, proof, left_arg, right_arg, memo, visited, leaves,
+            )?);
+        }
+    }
+    Some(premises)
+}
+
+/// The lockstep descent below `(left, right)` found no proof for some argument
+/// pair. Drop that node's partial descent (and every memo entry or planned
+/// leaf naming a dropped step). Then, in a crosswise walk, try a binary ring
+/// node crosswise (`crossed`), and failing that the pair whole as a bounded
+/// leaf: a `bvxor` operand swap, say, has no per-argument proof but is itself
+/// small.
+fn retry_after_failed_descent(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+    (left, right): (TermId, TermId),
+    memo: &mut DetHashMap<(TermId, TermId), ProofId>,
+    visited: &mut usize,
+    leaves: &mut BoundedLeaves,
+    descent_start: usize,
+) -> Option<ProofId> {
+    drop_steps_from(proof, memo, leaves, descent_start);
+    if leaves.crosswise {
+        let crossed =
+            crossed::crossed_ring_node(terms, proof, (left, right), memo, visited, leaves);
+        if crossed.is_some() {
+            return crossed;
+        }
+        drop_steps_from(proof, memo, leaves, descent_start);
+    }
+    bounded_leaf(terms, proof, left, right, memo, leaves)
+}
+
+/// Truncate `proof` to `start` steps, with every memo entry and planned leaf
+/// that names a dropped step.
+fn drop_steps_from(
+    proof: &mut Proof,
+    memo: &mut DetHashMap<(TermId, TermId), ProofId>,
+    leaves: &mut BoundedLeaves,
+    start: usize,
+) {
+    let kept = |step: &ProofId| usize::try_from(step.0).is_ok_and(|id| id < start);
+    proof.steps.truncate(start);
+    memo.retain(|_, step| kept(step));
+    leaves.accepted.retain(|(_, step)| kept(step));
+}
+
+/// Prove `left = right` whole as a general bounded leaf: admitted by the pure
+/// syntax gate, then decided by the independent semantic recognizer. In the
+/// emitting pass a planned leaf is its joint-lemma projection instead.
+fn bounded_leaf(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+    left: TermId,
+    right: TermId,
+    memo: &mut DetHashMap<(TermId, TermId), ProofId>,
+    bounded_leaves: &mut BoundedLeaves,
+) -> Option<ProofId> {
+    if let Some(provided) = &bounded_leaves.provided {
+        let step = *provided.get(&(left, right))?;
+        memo.insert((left, right), step);
+        return Some(step);
+    }
+    if bounded_leaves.accepted.len() >= MAX_BOUNDED_LEAVES
+        || bounded_leaves.refused.contains(&(left, right))
+        || !is_bounded_wiring_leaf_pair(terms, left, right)
+    {
+        return None;
+    }
+    let equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+    if !ay_proof::recognize_bv_bitblast(terms, &[equality]) {
+        bounded_leaves.refused.insert((left, right));
+        return None;
+    }
+    let step = proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+    bounded_leaves.accepted.push(((left, right), step));
     memo.insert((left, right), step);
     Some(step)
 }

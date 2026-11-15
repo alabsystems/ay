@@ -1,0 +1,7 @@
+(set-logic ALL)
+(assert (= (ff.add #f1m7 #f1m5) #f2m7))
+(assert (= (ff.neg #f1m7 #f2m7) #f2m7))
+(assert (= (ff.bitsum true false) #f1m7))
+(declare-const composite (_ FiniteField 9))
+(declare-const m2 (_ FiniteField 7))
+(assert (= #f1m7m2 #f1m7))

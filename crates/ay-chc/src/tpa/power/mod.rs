@@ -12,7 +12,8 @@
 
 mod bool_partition;
 
-use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
+use crate::interpolation::stats::{self, EngineTag, ExitReason};
+use crate::interpolation::{interpolating_sat_constraints_lra_proof_first, InterpolatingSatResult};
 use crate::transition_system::TransitionSystem;
 use crate::ChcExpr;
 
@@ -245,7 +246,12 @@ impl TpaSolver {
         }
 
         // Standard interpolation (no Bool partitioning)
-        match interpolating_sat_constraints(&a_constraints, &b_constraints, &shared_vars) {
+        match interpolating_sat_constraints_lra_proof_first(
+            &a_constraints,
+            &b_constraints,
+            &shared_vars,
+            None,
+        ) {
             InterpolatingSatResult::Unsat(interpolant) => {
                 if self.config.verbose_level > 0 {
                     safe_eprintln!(
@@ -266,6 +272,14 @@ impl TpaSolver {
                         shared_vars.len()
                     );
                 }
+                // The power level stays unstrengthened (not an engine exit);
+                // the line attributes the failure by power and kind.
+                stats::record_engine_exit_detail(
+                    EngineTag::Tpa,
+                    ExitReason::ItpFail,
+                    power as usize,
+                    &format!("kind={kind_name} shared_vars={}", shared_vars.len()),
+                );
             }
         }
     }

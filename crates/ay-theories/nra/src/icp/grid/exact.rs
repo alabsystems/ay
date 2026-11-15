@@ -55,7 +55,7 @@ impl ExactState {
         self.remaining.set(self.remaining.get().saturating_sub(1));
         match outcome {
             ExactOutcome::Empty => {
-                let streak = self.empty_streak.get() + 1;
+                let streak = self.empty_streak.get().saturating_add(1);
                 self.empty_streak.set(streak);
                 if streak >= GRID_EXACT_EMPTY_STREAK {
                     diag!("NRA-LAST streak-cut after={streak}");
@@ -94,7 +94,9 @@ fn pinned_coordinates(
     free: TermId,
     bx: &VarBox,
 ) -> Option<Vec<(TermId, BigRational)>> {
-    let mut pins = Vec::with_capacity(vars.len());
+    // Fallible reservation: pins that cannot be held decline the prefix.
+    let mut pins = Vec::new();
+    pins.try_reserve_exact(vars.len()).ok()?;
     for &var in vars {
         if var == free {
             continue;
@@ -112,8 +114,17 @@ fn residual_system(
     constraints: &[MultiConstraint],
     pins: &[(TermId, BigRational)],
 ) -> ResidualBuild {
-    let mut decision = Vec::with_capacity(constraints.len() + 2);
-    let mut verification = Vec::with_capacity(constraints.len());
+    // Fallible reservation: a residual system that cannot be held declines.
+    let Some(decision_len) = constraints.len().checked_add(2) else {
+        return ResidualBuild::Declined;
+    };
+    let mut decision = Vec::new();
+    let mut verification = Vec::new();
+    if decision.try_reserve_exact(decision_len).is_err()
+        || verification.try_reserve_exact(constraints.len()).is_err()
+    {
+        return ResidualBuild::Declined;
+    }
     for constraint in constraints {
         let mut residual = constraint.poly.clone();
         for (var, value) in pins {

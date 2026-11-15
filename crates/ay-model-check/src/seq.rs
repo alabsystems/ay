@@ -17,6 +17,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 /// Evaluate a named sequence operator over already-evaluated arguments.
 pub(crate) fn eval(name: &str, args: &[ModelValue]) -> Result<ModelValue, String> {
     match name {
+        "seq.power" => power(args),
         "seq.empty" => Ok(ModelValue::Seq(Vec::new())),
         "seq.unit" => {
             let x = arg(args, 0)?;
@@ -163,6 +164,70 @@ pub(crate) fn eval(name: &str, args: &[ModelValue]) -> Result<ModelValue, String
         // Everything else (seq.to_re, seq.in_re, ...) is intentionally left
         // unimplemented ⇒ unevaluable (fail closed).
         _ => Err(format!("unsupported sequence operator {name}")),
+    }
+}
+
+/// Compute from argument values, never from an interpretation of seq.power.
+/// Bound materialization before allocation; refusing an enormous witness is
+/// incomplete validation, never evidence for a satisfiability verdict.
+fn power(args: &[ModelValue]) -> Result<ModelValue, String> {
+    let [base, ModelValue::Int(count)] = args else {
+        return Err("seq.power expects String or Seq and Int".to_string());
+    };
+    let length = match base {
+        ModelValue::Str(value) => value.len(),
+        ModelValue::Seq(value) => value.len(),
+        _ => return Err("seq.power base is not String or Seq".to_string()),
+    };
+    let copies = if count.is_negative() || count.is_zero() || length == 0 {
+        0
+    } else {
+        count
+            .to_usize()
+            .ok_or("seq.power exponent exceeds materialization budget")?
+    };
+    let output_length = length
+        .checked_mul(copies)
+        .ok_or("seq.power size overflow")?;
+    if output_length > (1 << 20) {
+        return Err("seq.power exceeds materialization budget".to_string());
+    }
+    match base {
+        ModelValue::Str(value) => Ok(ModelValue::Str(value.repeat(copies))),
+        ModelValue::Seq(value) => {
+            let mut output = Vec::with_capacity(output_length);
+            for _ in 0..copies {
+                output.extend_from_slice(value);
+            }
+            Ok(ModelValue::Seq(output))
+        }
+        _ => Err("seq.power base is not String or Seq".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+
+    #[test]
+    fn sequence_power_uses_argument_values_and_refuses_huge_witnesses() {
+        let unicode = ModelValue::Str("λ🦀".to_string());
+        let three = ModelValue::Int(BigInt::from(3));
+        assert!(matches!(eval("seq.power", &[unicode, three.clone()]),
+            Ok(ModelValue::Str(value)) if value == "λ🦀λ🦀λ🦀"));
+        let sequence = ModelValue::Seq(vec![ModelValue::Int(BigInt::from(7))]);
+        assert!(matches!(eval("seq.power", &[sequence.clone(), three]),
+            Ok(ModelValue::Seq(value)) if value.len() == 3));
+        assert!(
+            matches!(eval("seq.power", &[sequence.clone(), ModelValue::Int(BigInt::from(-1))]),
+            Ok(ModelValue::Seq(value)) if value.is_empty())
+        );
+        let huge = ModelValue::Int(BigInt::from(1u32) << 100usize);
+        assert!(eval("seq.power", &[sequence, huge.clone()]).is_err());
+        assert!(
+            matches!(eval("seq.power", &[ModelValue::Str(String::new()), huge]),
+            Ok(ModelValue::Str(value)) if value.is_empty())
+        );
     }
 }
 

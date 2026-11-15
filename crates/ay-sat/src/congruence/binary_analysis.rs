@@ -35,7 +35,8 @@ impl CongruenceClosure {
         let mut ternary_indices: Vec<usize> = Vec::new();
 
         for idx in clauses.indices() {
-            if clauses.is_empty_clause(idx) {
+            // Live clauses only: no derived binary may rest on a garbage clause.
+            if clauses.is_dead(idx) {
                 continue;
             }
             let lits = clauses.literals(idx);
@@ -128,7 +129,7 @@ impl CongruenceClosure {
             v.clear();
         }
         for idx in clauses.indices() {
-            if clauses.is_empty_clause(idx) || clauses.is_learned(idx) {
+            if clauses.is_dead(idx) || clauses.is_learned(idx) {
                 continue;
             }
             let lits = clauses.literals(idx);

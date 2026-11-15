@@ -67,7 +67,11 @@ impl Solver {
                     probe_lit,
                     Some(failed_lit),
                 );
+                let veripb_ids = self.veripb_probe_hints(&[failed_lit], Some(conflict_ref), None);
                 self.backtrack(0);
+                if let Some(ids) = &veripb_ids {
+                    self.veripb_ready_hints(&[failed_lit], ids);
+                }
                 let proof_id = self
                     .proof_emit_add(&[failed_lit], &hints, ProofAddKind::Derived)
                     .unwrap_or(0);

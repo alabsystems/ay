@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/veripb", "vendor/trust-exec-policy"]
 members = [
     "crates/ay",
     "crates/ay-core",
-    "crates/ay-param",
     "crates/ay-sat",
     "crates/ay-sat-congruence-core",
     "crates/ay-qbf",
@@ -13,6 +12,7 @@ members = [
     "crates/ay-count",
     "crates/ay-proof-complexity",
     "crates/ay-dpll",
+    "crates/ay-cdclt",
     "crates/ay-frontend",
     "crates/ay-proof",
     "crates/ay-tla-bridge",
@@ -60,15 +60,14 @@ members = [
     "crates/ay-pb",
     "crates/ay-lp",
     "crates/ay-milp",
-    "crates/ay-approx-bcp",
-    "crates/ay-proptest",
     "crates/ay-test-support",
+    "crates/ay-criterion-main",
     "crates/ay-model-check",
     "crates/ay-z3-parity",
 ]
 
 [workspace.package]
-version = "0.26.0"
+version = "0.28.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/ay"
@@ -77,9 +76,9 @@ authors = ["Andrew Yates"]
 
 readme = "README.md"
 [workspace.lints.rust]
-# Kani model checker sets the `kani` cfg flag; `ay_logging` is an internal
-# instrumentation cfg used by selected development builds.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(ay_logging)', 'cfg(feature, values("optional-chc25-repo-corpus-tests", "optional-chc-comp25-corpus-tests"))'] }
+# `ay_logging` is an internal instrumentation cfg used by selected development
+# builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ay_logging)', 'cfg(feature, values("optional-chc25-repo-corpus-tests", "optional-chc-comp25-corpus-tests"))'] }
 # DENY, not the on-by-default warn. A doubled attribute is rarely the defect
 # itself; it is the SYMPTOM of an item pasted between an attribute and the item
 # that attribute annotated, which STEALS it and silently un-tests the function
@@ -301,72 +300,67 @@ serial_test = "3.2"
 trybuild = "1.0"
 ntest = "0.9"
 wait-timeout = "0.2.1"
-pollster = "0.3"
-# default-features = false drops the wasm-only `webgpu` backend from the
-# build. Note the GLES fallback (OPENGL32.dll import) and DX12 FXC
-# (d3dcompiler_47.dll) are wired by wgpu's Windows target deps regardless of
-# features; crates/ay/build.rs delay-loads both to keep process startup free
-# of GPU driver DLLs (measured +66ms per launch otherwise, 2026-07-14).
-wgpu = { version = "0.19", default-features = false, features = ["wgsl", "dx12", "metal"] }
 
 # Internal crates
-ay = { version = "0.26.0", path = "crates/ay" }
-ay-core = { version = "0.26.0", path = "crates/ay-core" }
-ay-count = { version = "0.26.0", path = "crates/ay-count" }
-ay-model-check = { version = "0.26.0", path = "crates/ay-model-check" }
-ay-sat = { version = "0.26.0", path = "crates/ay-sat", default-features = false }
-ay-test-support = { version = "0.26.0", path = "crates/ay-test-support" }
-ay-sat-congruence-core = { version = "0.26.0", path = "crates/ay-sat-congruence-core" }
-ay-dpll = { version = "0.26.0", path = "crates/ay-dpll", default-features = false, features = ["proof-checker", "jit"] }
-ay-frontend = { version = "0.26.0", path = "crates/ay-frontend" }
-ay-proof = { version = "0.26.0", path = "crates/ay-proof" }
-ay-tla-bridge = { version = "0.26.0", path = "crates/ay-tla-bridge" }
-ay-euf = { version = "0.26.0", path = "crates/ay-theories/euf" }
-ay-lra = { version = "0.26.0", path = "crates/ay-theories/lra", default-features = false }
-ay-lia = { version = "0.26.0", path = "crates/ay-theories/lia" }
-ay-bv = { version = "0.26.0", path = "crates/ay-theories/bv" }
-ay-arrays = { version = "0.26.0", path = "crates/ay-theories/arrays" }
-ay-seq = { version = "0.26.0", path = "crates/ay-theories/seq" }
-ay-set = { version = "0.26.0", path = "crates/ay-theories/set" }
-ay-multiset = { version = "0.26.0", path = "crates/ay-theories/multiset" }
-ay-map = { version = "0.26.0", path = "crates/ay-theories/map" }
-ay-strings = { version = "0.26.0", path = "crates/ay-theories/strings" }
-ay-fp = { version = "0.26.0", path = "crates/ay-theories/fp" }
-ay-dt = { version = "0.26.0", path = "crates/ay-theories/dt" }
-ay-nia = { version = "0.26.0", path = "crates/ay-theories/nia" }
-ay-nra = { version = "0.26.0", path = "crates/ay-theories/nra" }
-ay-nonlinear-common = { version = "0.26.0", path = "crates/ay-theories/nonlinear-common" }
-ay-intsat = { version = "0.26.0", path = "crates/ay-theories/intsat" }
-ay-diff-logic = { version = "0.26.0", path = "crates/ay-theories/diff-logic" }
-ay-chc = { version = "0.26.0", path = "crates/ay-chc" }
-ay-dispatch = { version = "0.26.0", path = "crates/ay-dispatch" }
-ay-qbf = { version = "0.26.0", path = "crates/ay-qbf" }
-ay-maxsat = { version = "0.26.0", path = "crates/ay-maxsat" }
-ay-pb-core = { version = "0.26.0", path = "crates/ay-pb-core" }
-ay-pb = { version = "0.26.0", path = "crates/ay-pb" }
-ay-lp = { version = "0.26.0", path = "crates/ay-lp" }
-ay-milp = { version = "0.26.0", path = "crates/ay-milp" }
-ay-allsat = { version = "0.26.0", path = "crates/ay-allsat" }
-ay-proof-complexity = { version = "0.26.0", path = "crates/ay-proof-complexity" }
-ay-lean-bridge = { version = "0.26.0", path = "crates/ay-lean-bridge" }
-ay-xor = { version = "0.26.0", path = "crates/ay-xor" }
-ay-translate = { version = "0.26.0", path = "crates/ay-translate" }
-ay-bindings = { version = "0.26.0", path = "crates/ay-bindings" }
-ay-drat-check = { version = "0.26.0", path = "crates/ay-drat-check" }
-ay-lrat-check = { version = "0.26.0", path = "crates/ay-lrat-check" }
-ay-proof-common = { version = "0.26.0", path = "crates/ay-proof-common" }
-ay-flatzinc-parser = { version = "0.26.0", path = "crates/ay-flatzinc-parser" }
-ay-flatzinc-smt = { version = "0.26.0", path = "crates/ay-flatzinc-smt" }
-ay-fzn2smt = { version = "0.26.0", path = "crates/ay-fzn2smt" }
-ay-cp = { version = "0.26.0", path = "crates/ay-cp" }
-ay-search = { version = "0.26.0", path = "crates/ay-search" }
-ay-sys = { version = "0.26.0", path = "crates/ay-sys" }
-ay-bench = { version = "0.26.0", path = "crates/ay-bench" }
-ay-bisect = { version = "0.26.0", path = "crates/ay-bisect" }
-ay-prefetch = { version = "0.26.0", path = "crates/ay-prefetch" }
-ay-jit = { version = "0.26.0", path = "crates/ay-jit" }
-ay-replay = { version = "0.26.0", path = "crates/ay-replay" }
-ay-approx-bcp = { version = "0.26.0", path = "crates/ay-approx-bcp" }
+ay = { version = "0.28.0", path = "crates/ay" }
+ay-core = { version = "0.28.0", path = "crates/ay-core" }
+ay-count = { version = "0.28.0", path = "crates/ay-count" }
+ay-model-check = { version = "0.28.0", path = "crates/ay-model-check" }
+ay-sat = { version = "0.28.0", path = "crates/ay-sat", default-features = false }
+ay-test-support = { version = "0.28.0", path = "crates/ay-test-support" }
+ay-criterion-main = { version = "0.28.0", path = "crates/ay-criterion-main" }
+ay-sat-congruence-core = { version = "0.28.0", path = "crates/ay-sat-congruence-core" }
+ay-dpll = { version = "0.28.0", path = "crates/ay-dpll", default-features = false, features = ["proof-checker", "jit"] }
+ay-frontend = { version = "0.28.0", path = "crates/ay-frontend" }
+ay-proof = { version = "0.28.0", path = "crates/ay-proof" }
+ay-tla-bridge = { version = "0.28.0", path = "crates/ay-tla-bridge" }
+ay-euf = { version = "0.28.0", path = "crates/ay-theories/euf" }
+ay-lra = { version = "0.28.0", path = "crates/ay-theories/lra", default-features = false }
+ay-cdclt = { version = "0.28.0", path = "crates/ay-cdclt" }
+ay-lia = { version = "0.28.0", path = "crates/ay-theories/lia" }
+ay-bv = { version = "0.28.0", path = "crates/ay-theories/bv" }
+ay-arrays = { version = "0.28.0", path = "crates/ay-theories/arrays" }
+ay-seq = { version = "0.28.0", path = "crates/ay-theories/seq" }
+ay-set = { version = "0.28.0", path = "crates/ay-theories/set" }
+ay-multiset = { version = "0.28.0", path = "crates/ay-theories/multiset" }
+ay-map = { version = "0.28.0", path = "crates/ay-theories/map" }
+ay-strings = { version = "0.28.0", path = "crates/ay-theories/strings" }
+ay-fp = { version = "0.28.0", path = "crates/ay-theories/fp" }
+ay-dt = { version = "0.28.0", path = "crates/ay-theories/dt" }
+ay-nia = { version = "0.28.0", path = "crates/ay-theories/nia" }
+ay-nra = { version = "0.28.0", path = "crates/ay-theories/nra" }
+ay-nonlinear-common = { version = "0.28.0", path = "crates/ay-theories/nonlinear-common" }
+ay-intsat = { version = "0.28.0", path = "crates/ay-theories/intsat" }
+ay-diff-logic = { version = "0.28.0", path = "crates/ay-theories/diff-logic" }
+ay-chc = { version = "0.28.0", path = "crates/ay-chc" }
+ay-dispatch = { version = "0.28.0", path = "crates/ay-dispatch" }
+ay-qbf = { version = "0.28.0", path = "crates/ay-qbf" }
+ay-maxsat = { version = "0.28.0", path = "crates/ay-maxsat" }
+ay-pb-core = { version = "0.28.0", path = "crates/ay-pb-core" }
+ay-veripb = { package = "veripb", path = "vendor/veripb" }
+ay-pb = { version = "0.28.0", path = "crates/ay-pb" }
+ay-lp = { version = "0.28.0", path = "crates/ay-lp" }
+ay-milp = { version = "0.28.0", path = "crates/ay-milp" }
+ay-allsat = { version = "0.28.0", path = "crates/ay-allsat" }
+ay-proof-complexity = { version = "0.28.0", path = "crates/ay-proof-complexity" }
+ay-lean-bridge = { version = "0.28.0", path = "crates/ay-lean-bridge" }
+ay-xor = { version = "0.28.0", path = "crates/ay-xor" }
+ay-translate = { version = "0.28.0", path = "crates/ay-translate" }
+ay-bindings = { version = "0.28.0", path = "crates/ay-bindings" }
+ay-drat-check = { version = "0.28.0", path = "crates/ay-drat-check" }
+ay-lrat-check = { version = "0.28.0", path = "crates/ay-lrat-check" }
+ay-proof-common = { version = "0.28.0", path = "crates/ay-proof-common" }
+ay-flatzinc-parser = { version = "0.28.0", path = "crates/ay-flatzinc-parser" }
+ay-flatzinc-smt = { version = "0.28.0", path = "crates/ay-flatzinc-smt" }
+ay-fzn2smt = { version = "0.28.0", path = "crates/ay-fzn2smt" }
+ay-cp = { version = "0.28.0", path = "crates/ay-cp" }
+ay-search = { version = "0.28.0", path = "crates/ay-search" }
+ay-sys = { version = "0.28.0", path = "crates/ay-sys" }
+ay-bench = { version = "0.28.0", path = "crates/ay-bench" }
+ay-bisect = { version = "0.28.0", path = "crates/ay-bisect" }
+ay-prefetch = { version = "0.28.0", path = "crates/ay-prefetch" }
+ay-jit = { version = "0.28.0", path = "crates/ay-jit" }
+ay-replay = { version = "0.28.0", path = "crates/ay-replay" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -443,6 +437,32 @@ lto = "thin"
 
 [workspace.metadata.atpkg]
 # The user-facing commands for `ay`. The flagship `ay` bin is gated behind the `cli` feature,
-# so build-args enables it; a plain release build would otherwise omit it.
+# so build-args enables it (else a plain release build never produces it).
+# Select the shipped binaries explicitly: package cuts do not need to compile
+# the workspace's internal development, parity and quality-gate executables.
 expose = ["ay", "ay-maxsat", "ay-pb", "ay-qbf", "ay-lrat-check"]
-build-args = ["--workspace", "--features", "ay/cli"]
+build-args = [
+    "--workspace", "--features", "ay/cli",
+    "--bin", "ay",
+    "--bin", "ay-maxsat",
+    "--bin", "ay-pb",
+    "--bin", "ay-qbf",
+    "--bin", "ay-lrat-check",
+]
+
+# Trust: policy for `offline deductive checker` over this workspace.
+[trust]
+# The wall-clock backstop, per mille of Trust's reference clocks: 2.5x. targo
+# holds the verified Cargo driver to 8 h x 2500 / 1000 = 20 h absolute (its
+# silent and idle bounds to 5 h and 75 min) and passes the compiler a 300 s
+# per-function and 12.5 s per-query clock. Under Cargo the guarded process is
+# the driver, so this bounds the WHOLE workspace check, not one crate; the
+# progress watchdog (idle / silent bounds) still fires first on a genuinely
+# stuck compiler. Measured: the builtin 8 h killed this workspace's release
+# gate twice -- `ay-dpll` (lib test) at 8h00m00s with 31h45m09s of CPU on
+# 2026-09-15, and the whole check at 8h00m00s with 30h00m53s of CPU on seal 37
+# (trust-7d5533b2, 2026-09-23) -- both times still making progress. Before
+# Trust 0.11.0 this was `compiler_timeout_secs = 72000`, which 0.11.0 retires
+# into `backstop` (T7b) and refuses. Seal 9192 and older refuse `backstop`,
+# so this line needs the 0.11.0 toolchain or later (the development design notes DR-56).
+backstop = 2500

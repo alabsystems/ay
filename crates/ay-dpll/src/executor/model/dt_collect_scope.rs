@@ -69,8 +69,27 @@ impl Executor {
     /// assertion vector may already have been preprocessed; retaining the
     /// preserved authored roots is necessary for load-bearing datatype
     /// disequalities that model validation will replay later.
-    pub(super) fn datatype_model_collection_roots(&self, extra_roots: &[TermId]) -> Vec<TermId> {
-        let authored_roots = self.independent_gate_query_roots();
+    pub(super) fn datatype_model_collection_roots(
+        &self,
+        extra_roots: &[TermId],
+    ) -> Option<Vec<TermId>> {
+        if super::recovery_admission::RecoveryAdmission::current_for(self).is_some() {
+            let amount = self
+                .ctx
+                .assertions
+                .len()
+                .checked_add(extra_roots.len())
+                .and_then(|n| n.checked_add(self.lane_model_pin_roots.len()));
+            let bytes = amount.and_then(|n| n.checked_mul(std::mem::size_of::<TermId>()));
+            if !amount
+                .zip(bytes)
+                .is_some_and(|(work, bytes)| super::recovery_admission::pay_for(self, work, bytes))
+            {
+                super::recovery_admission::refuse_current();
+                return None;
+            }
+        }
+        let authored_roots = self.independent_gate_query_roots().ok()?;
         let authored_array_field_datatype = self
             .authored_datatype_array_construction_cells()
             .is_some_and(|cells| !cells.is_empty());
@@ -103,7 +122,31 @@ impl Executor {
                 .copied()
                 .filter(|root| seen.insert(*root)),
         );
-        roots
+        // The producing lane's exact value pins (#dt-fd-pin-roots): true in
+        // the stored model by construction, so they only turn guessed free
+        // classes into the lane's own values.
+        roots.extend(
+            self.lane_model_pin_roots
+                .iter()
+                .copied()
+                .filter(|root| seen.insert(*root)),
+        );
+        Some(roots)
+    }
+
+    /// Every term of the producing lane's value pins (#dt-fd-pin-roots): the
+    /// pinned terms and the ground constructor terms naming their values.
+    /// The pins are few (one per lane constant or selector application) and
+    /// their value terms are finite ground trees, so the closure is small.
+    pub(super) fn lane_model_pin_terms(&self) -> HashSet<TermId> {
+        let mut seen = HashSet::default();
+        let mut stack = self.lane_model_pin_roots.clone();
+        while let Some(t) = stack.pop() {
+            if seen.insert(t) {
+                stack.extend(self.ctx.terms.children(t));
+            }
+        }
+        seen
     }
 
     /// Traverse the exact collection roots without cloning application
@@ -113,7 +156,7 @@ impl Executor {
         &self,
         extra_roots: &[TermId],
     ) -> Option<OpaqueDtCollectionPreflight> {
-        if !self.query_has_opaque_datatype_candidate(extra_roots) {
+        if !self.query_has_opaque_datatype_candidate(extra_roots)? {
             return Some(OpaqueDtCollectionPreflight {
                 strict: false,
                 scope: None,
@@ -123,7 +166,7 @@ impl Executor {
                 datatype_members: HashMap::default(),
             });
         }
-        let roots = self.datatype_model_collection_roots(extra_roots);
+        let roots = self.datatype_model_collection_roots(extra_roots)?;
         let root_count = roots.len();
         let declarations = self.ctx.bounded_projection_declaration_inventory_size()?;
         let declaration_scan_work = declarations.checked_mul(8)?.checked_mul(257)?;
@@ -162,17 +205,17 @@ impl Executor {
         preflight.finish()
     }
 
-    fn query_has_opaque_datatype_candidate(&self, extra_roots: &[TermId]) -> bool {
+    fn query_has_opaque_datatype_candidate(&self, extra_roots: &[TermId]) -> Option<bool> {
         const MAX_DISCOVERY_TERMS: usize = 4_096;
         const MAX_DISCOVERY_EDGES: usize = 4_096;
         const MAX_DISCOVERY_ROOTS: usize = 1_024;
-        let roots = self.datatype_model_collection_roots(extra_roots);
+        let roots = self.datatype_model_collection_roots(extra_roots)?;
         if roots.len() > MAX_DISCOVERY_ROOTS {
-            return false;
+            return Some(false);
         }
         let guard = RenderedDatatypeGuard::new(self);
         if !guard.is_bounded() {
-            return false;
+            return Some(false);
         }
         let mut stack = roots;
         let mut seen = HashSet::default();
@@ -182,16 +225,16 @@ impl Executor {
                 continue;
             }
             if seen.len() > MAX_DISCOVERY_TERMS {
-                return false;
+                return Some(false);
             }
             match self.ctx.terms.get(term) {
                 TermData::App(symbol, args) => {
                     edges = match edges.checked_add(args.len()) {
                         Some(total) if total <= MAX_DISCOVERY_EDGES => total,
-                        _ => return false,
+                        _ => return Some(false),
                     };
                     if symbol.name().len() > 256 {
-                        return false;
+                        return Some(false);
                     }
                     if guard.datatype_name(self.ctx.terms.sort(term)).is_some() {
                         let kind = self
@@ -201,7 +244,7 @@ impl Executor {
                         if kind != Some(DeclarationKind::DatatypeConstructor)
                             && !(args.len() == 1 && kind == Some(DeclarationKind::DatatypeSelector))
                         {
-                            return true;
+                            return Some(true);
                         }
                     }
                     stack.extend(args.iter().copied());
@@ -209,14 +252,14 @@ impl Executor {
                 TermData::Not(inner) => {
                     edges += 1;
                     if edges > MAX_DISCOVERY_EDGES {
-                        return false;
+                        return Some(false);
                     }
                     stack.push(*inner);
                 }
                 TermData::Ite(condition, then_term, else_term) => {
                     edges += 3;
                     if edges > MAX_DISCOVERY_EDGES {
-                        return false;
+                        return Some(false);
                     }
                     stack.push(*condition);
                     stack.push(*then_term);
@@ -225,7 +268,7 @@ impl Executor {
                 _ => {}
             }
         }
-        false
+        Some(false)
     }
 }
 

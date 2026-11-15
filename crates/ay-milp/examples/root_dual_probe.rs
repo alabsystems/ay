@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = stem.trim_end_matches(".mps").to_owned();
 
     let text = if path.ends_with(".gz") {
-        decompress_gz(&std::fs::read(&path)?)?
+        decompress_gz(&path)?
     } else {
         std::fs::read_to_string(&path)?
     };
@@ -74,15 +74,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn decompress_gz(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("gzip")
-        .arg("-dc")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    child.stdin.as_mut().ok_or("no stdin")?.write_all(bytes)?;
-    let out = child.wait_with_output()?;
+/// Inflate `path` with the system `gzip`, which reads the file itself: no pipe
+/// is written, so a `gzip` that stops early (a corrupt file) is its non-zero
+/// exit, not a SIGPIPE that kills this probe (`unix_hardened` builds run with
+/// SIGPIPE at its default action), and its output can never fill a pipe this
+/// process is blocked writing into.
+fn decompress_gz(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("gzip")
+        .args(["-dc", "--", path])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "gzip -dc {path}: {} ({})",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            out.status
+        )
+        .into());
+    }
     Ok(String::from_utf8(out.stdout)?)
 }

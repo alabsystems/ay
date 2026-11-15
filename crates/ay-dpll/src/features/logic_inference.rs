@@ -14,6 +14,9 @@ impl StaticFeatures {
     /// Follows Z3's auto-detection logic from `smt_setup.cpp:831-935`.
     /// Extended to detect non-linear arithmetic (#1551).
     pub(crate) fn infer_logic(&self) -> &'static str {
+        if self.has_finite_field {
+            return "QF_FF";
+        }
         // Quantified logics
         if self.has_quantifiers {
             // BV with quantifiers - AY doesn't support this yet, but route to QF_BV

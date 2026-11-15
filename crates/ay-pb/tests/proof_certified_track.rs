@@ -268,26 +268,22 @@ fn verify_with_local_veripb_unchecked_deletions(test_name: &str, opb: &str, proo
     );
 }
 
+/// The checker for this suite, or `None` when the machine has none.
+///
+/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` (scrub
+/// log, 2026-07-18) records keeping `/tmp/veripb-3/bin/veripb` in as "the
+/// neutral candidate". Neutral it is — machine-independent, so it survives into
+/// a public snapshot — but neutral is not IDENTIFIED: nothing in this repo
+/// builds that path and its name records no commit and no patch. Neither does
+/// `$VERIPB_BIN`, and neither does `$PATH`. None of the three was put to a
+/// single probe here, and this file's assertions are of the form "the checker
+/// ACCEPTED ay's proof", which an unsound checker satisfies for free.
+///
+/// The ONE resolver keeps all three candidates and makes each earn it: the
+/// self-test battery, then the twenty-two committed fixtures on which published
+/// VeriPB 3.0.2 contradicts the truth.
 fn find_local_veripb() -> Option<PathBuf> {
-    for var in ["AY_PB26_VERIPB_BIN", "VERIPB_BIN", "VERIPB"] {
-        if let Some(candidate) = env::var_os(var).map(PathBuf::from) {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    for candidate in [Path::new("/tmp/veripb-3/bin/veripb")] {
-        if candidate.is_file() {
-            return Some(candidate.to_path_buf());
-        }
-    }
-
-    env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|dir| dir.join("veripb"))
-        .find(|candidate| candidate.is_file())
+    ay_test_support::veripb::optional_checker("proof_certified_track")
 }
 
 fn unique_temp_path(stem: &str, extension: &str) -> PathBuf {
@@ -485,6 +481,78 @@ fn test_standalone_cli_native_golomb_opb_opt_proof_verifies_original_source() {
         &proof,
         "conclusion BOUNDS 3 3;",
         None,
+    );
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&proof_path);
+}
+
+/// `--cert-debug` reaches the native proof-logging phase's `c [cert/phase]
+/// native-cdcl` line, which both frontends print through one shared function
+/// (`ay_pb::opt_fallback::trace_native_cdcl_phase`) and one stderr edge
+/// (`ay_pb::proof::cert_debug_line`), with its five fields in order. Without
+/// the flag no `c [cert/` line is written at all, and the verdict is the same
+/// either way.
+#[test]
+fn test_standalone_cli_cert_debug_traces_the_native_phase_only_when_asked() {
+    let opb = concat!(
+        "* #variable= 2 #constraint= 2\n",
+        "min: +1 x1 +2 x2 ;\n",
+        "+1 x1 +1 x2 <= 1 ;\n",
+        "+1 x1 +1 x2 >= 1 ;\n",
+    );
+    let input_path = write_temp_opb("cli-cert-debug", opb);
+    let proof_path = unique_temp_path("cli-cert-debug", "pbp");
+    let proof_arg = proof_path
+        .to_str()
+        .expect("temporary proof path should be utf-8");
+
+    let (status, stdout, stderr) = run_standalone_ay_pb(
+        &["--timeout", "5000", "--cert-debug", "--proof", proof_arg],
+        &input_path,
+    );
+    assert_eq!(
+        status.code(),
+        Some(30),
+        "--cert-debug must not change the verdict; stdout: {stdout}; stderr: {stderr}"
+    );
+    let phase: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("c [cert/phase] native-cdcl "))
+        .collect();
+    assert_eq!(
+        phase.len(),
+        1,
+        "exactly one native-phase line per proof solve: {stderr}"
+    );
+    let keys: Vec<&str> = phase[0]
+        .trim_start_matches("c [cert/phase] native-cdcl ")
+        .split(' ')
+        .map(|field| field.split_once('=').map_or(field, |(key, _)| key))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "elapsed",
+            "status",
+            "obj",
+            "proof-bytes-so-far",
+            "deferred-lb"
+        ],
+        "the native-phase line keeps its fields and their order: {}",
+        phase[0]
+    );
+
+    let (status, stdout, stderr) =
+        run_standalone_ay_pb(&["--timeout", "5000", "--proof", proof_arg], &input_path);
+    assert_eq!(
+        status.code(),
+        Some(30),
+        "the verdict without --cert-debug; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("c [cert/"),
+        "a cert trace line was written without --cert-debug: {stderr}"
     );
 
     let _ = fs::remove_file(&input_path);

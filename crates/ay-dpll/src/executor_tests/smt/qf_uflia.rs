@@ -4,8 +4,53 @@
 
 use super::*;
 
+/// Whether production's kernel-first step (`executor/engine_route.rs`)
+/// answered the last check: the kernel published a verdict and handed
+/// nothing to the lane.
+fn kernel_answered(exec: &Executor) -> bool {
+    let stats = exec.statistics();
+    matches!(stats.get_string("engine.kernel"), Some("sat" | "unsat"))
+        && stats.get_string("engine.fallback").is_none()
+}
+
+/// A conflict count far above anything these scripts need. A check that asks
+/// for a count keeps the lane (DR-36), so this pins the lane without
+/// limiting it.
+const LANE_COUNT: u64 = 10_000_000;
+
+/// Run `input` on the lane: the same script with a generous `:rlimit`
+/// count, which the kernel-first step declines (DR-36).
+fn run_on_lane(input: &str) -> (Vec<String>, Executor) {
+    let commands = parse(input).expect("valid QF_UFLIA input");
+    let mut exec = Executor::new();
+    exec.set_resource_limit(Some(LANE_COUNT));
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute QF_UFLIA on the lane");
+    assert!(
+        !kernel_answered(&exec),
+        "a check with a count must keep the lane (DR-36)"
+    );
+    (outputs, exec)
+}
+
+/// #8778's property: pure QF_UFLIA never takes the AUFLIA/array route.
+///
+/// Since the CDCL(T) kernel took QF_UFLIA (a0b0e14b5), it answers these
+/// checks before any lane. It has no array theory, so the AUFLIA detour
+/// cannot happen on that route, and it records none of the lane's
+/// per-theory counters. The lane's own routing is still asserted, both here
+/// when the kernel handed the check over and on the counted re-run of each
+/// #8778 script (`run_on_lane`).
 fn assert_pure_uflia_route_stats(exec: &Executor) {
     let stats = exec.statistics();
+    if kernel_answered(exec) {
+        assert!(
+            matches!(stats.get_int("smt.checks.arrays"), None | Some(0)),
+            "the kernel answered pure QF_UFLIA; the array solver must not have run"
+        );
+        return;
+    }
     assert_eq!(
         stats.get_int("smt.checks.arrays"),
         Some(0),
@@ -100,6 +145,21 @@ fn test_get_model_and_value_follow_pure_int_equality_8778() {
         outputs[2]
     );
     assert_pure_uflia_route_stats(&exec);
+    let (lane, lane_exec) = run_on_lane(input);
+    assert_eq!(lane.len(), 3);
+    assert_eq!(lane[0], "sat");
+    assert!(
+        lane[1].contains("(define-fun x () Int 101)")
+            && lane[1].contains("(define-fun y () Int 101)"),
+        "the lane's model keeps the recovered LIA equality value: {}",
+        lane[1]
+    );
+    assert!(
+        lane[2].contains("5"),
+        "the lane's (f y) reads f's table at x: {}",
+        lane[2]
+    );
+    assert_pure_uflia_route_stats(&lane_exec);
 }
 
 #[test]
@@ -282,6 +342,9 @@ fn test_executor_qf_uflia_pure_route_skips_array_solver_8778() {
     // self-inconsistent).
     assert_eq!(outputs, vec!["sat"]);
     assert_pure_uflia_route_stats(&exec);
+    let (lane, lane_exec) = run_on_lane(input);
+    assert_eq!(lane, vec!["sat"]);
+    assert_pure_uflia_route_stats(&lane_exec);
 }
 
 #[test]
@@ -311,6 +374,13 @@ fn test_executor_qf_uflia_seq_like_int_encoding_model_validates_8778() {
         "pure UF sequence-like equalities should remain EUF-backed in the UFLIA model"
     );
     assert_pure_uflia_route_stats(&exec);
+    let (lane, lane_exec) = run_on_lane(input);
+    assert_eq!(lane, vec!["sat"]);
+    assert_eq!(
+        lane_exec.statistics().get_int("model_validation_failures"),
+        Some(0)
+    );
+    assert_pure_uflia_route_stats(&lane_exec);
 }
 
 #[test]
@@ -455,6 +525,13 @@ fn test_executor_qf_uflia_bool_arith_equality_keeps_both_lia_sides_8778() {
         Some(0)
     );
     assert_pure_uflia_route_stats(&exec);
+    let (lane, lane_exec) = run_on_lane(input);
+    assert_eq!(lane, vec!["sat"]);
+    assert_eq!(
+        lane_exec.statistics().get_int("model_validation_failures"),
+        Some(0)
+    );
+    assert_pure_uflia_route_stats(&lane_exec);
 }
 
 #[test]
@@ -480,6 +557,13 @@ fn test_executor_qf_uflia_asymmetric_bool_arith_equality_keeps_simple_side_8778(
         Some(0)
     );
     assert_pure_uflia_route_stats(&exec);
+    let (lane, lane_exec) = run_on_lane(input);
+    assert_eq!(lane, vec!["sat"]);
+    assert_eq!(
+        lane_exec.statistics().get_int("model_validation_failures"),
+        Some(0)
+    );
+    assert_pure_uflia_route_stats(&lane_exec);
 }
 
 // ======================================================================

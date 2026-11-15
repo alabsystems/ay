@@ -214,24 +214,33 @@ fn two_user_declared_heads_stay_ambiguous_and_are_not_adopted() {
 }
 
 /// NARROWNESS PIN for the pinning path. A pre-definition raw application whose
-/// argument is a VARIABLE cannot be pinned: the enclosing quantifier's other
-/// instances are applications at points no ground pin covers. Adoption must keep
-/// REFUSING, leaving the `forall` asserted (so the query is merely incomplete,
-/// never wrongly decided).
+/// argument is a BOUND variable cannot be pinned: the enclosing quantifier's
+/// other instances are applications at points no ground pin covers. Adoption
+/// must keep REFUSING, leaving the `forall` asserted (so the query is merely
+/// incomplete, never wrongly decided).
+///
+/// The raw application here sits under its own quantifier — `forall y. sq(y)
+/// >= 0` — so its argument is genuinely bound. A DECLARED constant argument is
+/// a different case: `sq(x)` over `(declare-const x …)` is a ground term the
+/// pin covers exactly, and the twin below proves it is pinned and decided
+/// (#defmacro-named-preuse: deductive-checks's `out = f(i)` before the definition).
 #[test]
-fn prebuilt_call_on_a_variable_argument_refuses_adoption() {
+fn prebuilt_call_on_a_bound_variable_argument_refuses_adoption() {
     let mut solver = Solver::new(Logic::All);
     let bv32 = Sort::bitvec(32);
     let sq = solver
         .try_declare_fun("sq", &[bv32.clone()], bv32.clone())
         .expect("declare sq");
 
-    // A raw `sq(x)` over a declared constant, built BEFORE the definition.
-    let x = solver.try_declare_const("x", bv32.clone()).expect("x");
-    let call = solver.try_apply(&sq, &[x]).expect("apply sq");
-    let r = solver.try_declare_const("r", bv32.clone()).expect("r");
-    let body = solver.eq(r, call);
-    solver.try_assert_term(body).expect("assert body");
+    // A raw `sq(y)` under a quantifier over `y`, built BEFORE the definition.
+    let y = solver.try_fresh_var("y", bv32.clone()).expect("y");
+    let call = solver.try_apply(&sq, &[y]).expect("apply sq");
+    let zero = solver.bv_const_u64(0, 32);
+    let nonneg = solver.bvsge(call, zero);
+    let quantified_use = solver.try_forall(&[y], nonneg).expect("forall y");
+    solver
+        .try_assert_term(quantified_use)
+        .expect("assert quantified use");
 
     let v = solver.try_fresh_var("v", bv32.clone()).expect("v");
     let head = solver.try_apply(&sq, &[v]).expect("head");
@@ -250,16 +259,75 @@ fn prebuilt_call_on_a_variable_argument_refuses_adoption() {
         "the definition must still be an assertion: {rendered}"
     );
     assert!(
-        rendered.contains("forall"),
-        "a raw application over a VARIABLE argument cannot be pinned, so the \
-         quantifier must survive un-adopted rather than be discharged against \
+        rendered.contains("(= (sq ") || rendered.contains("(sq v"),
+        "a raw application over a BOUND argument cannot be pinned, so the \
+         definition must survive un-adopted rather than be discharged against \
          an incomplete pin set. rendered: {rendered}"
+    );
+    assert!(
+        rendered.matches("forall").count() >= 2,
+        "both quantifiers must survive: {rendered}"
+    );
+}
+
+/// TWIN of the narrowness pin: a pre-definition raw application over a
+/// DECLARED CONSTANT is ground, so it is pinned to its own definitional
+/// instance and the goal is decided in both polarities — `r = sq(x)`, `x = 3`
+/// entails `r = 9` and refutes `r = 10`.
+fn prebuilt_call_on_a_declared_constant(goal_value: u64) -> ay_dpll::api::VerifiedSolveResult {
+    let mut solver = Solver::new(Logic::All);
+    let bv32 = Sort::bitvec(32);
+    let sq = solver
+        .try_declare_fun("sq", &[bv32.clone()], bv32.clone())
+        .expect("declare sq");
+    let x = solver.try_declare_const("x", bv32.clone()).expect("x");
+    let call = solver.try_apply(&sq, &[x]).expect("apply sq");
+    let r = solver.try_declare_const("r", bv32.clone()).expect("r");
+    let body = solver.eq(r, call);
+    solver.try_assert_term(body).expect("assert body");
+    let three = solver.bv_const_u64(3, 32);
+    let x_is_three = solver.eq(x, three);
+    solver.try_assert_term(x_is_three).expect("assert x");
+
+    let v = solver.try_fresh_var("v", bv32.clone()).expect("v");
+    let head = solver.try_apply(&sq, &[v]).expect("head");
+    let rhs = solver.bvmul(v, v);
+    let definition_body = solver.eq(head, rhs);
+    let definition = solver.try_forall(&[v], definition_body).expect("forall");
+    solver
+        .try_assert_term(definition)
+        .expect("assert definition");
+    let rendered = solver.assertions_sexpr(&solver.assertions());
+    assert!(
+        !rendered.contains("forall"),
+        "a declared-constant argument is ground: the definition must be \
+         discharged against its pin, not left quantified. rendered: {rendered}"
+    );
+
+    let goal = solver.bv_const_u64(goal_value, 32);
+    let equality = solver.eq(r, goal);
+    let negated = solver.not(equality);
+    solver.try_assert_term(negated).expect("assert goal");
+    solver.try_check_sat().expect("check-sat")
+}
+
+#[test]
+fn prebuilt_call_on_a_declared_constant_argument_is_pinned_and_decided() {
+    let entailed = prebuilt_call_on_a_declared_constant(9);
+    assert!(
+        entailed.result().is_unsat(),
+        "sq(3) = 9 is entailed through the pin; got {entailed:?}"
+    );
+    let refuted = prebuilt_call_on_a_declared_constant(10);
+    assert!(
+        refuted.result().is_sat(),
+        "sq(3) = 10 is refuted through the pin; got {refuted:?}"
     );
 }
 
 /// The `sq` definition is arity-1, so its builtin RHS `(bvmul v v)` never had
 /// the binder count of the head and was always adoptable — this control proves
-/// the previous test's refusal comes from the VARIABLE argument, not from some
+/// the narrowness pin's refusal comes from the BOUND argument, not from some
 /// unrelated property of the fixture.
 #[test]
 fn same_definition_without_a_prebuilt_call_is_adopted() {

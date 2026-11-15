@@ -4,6 +4,44 @@
 
 use super::super::*;
 
+#[test]
+fn test_extract_low_add_narrows_extended_addresses_in_both_orders() {
+    for width in [1, 8, 32, 64, 256] {
+        let mut store = TermStore::new();
+        let p = store.mk_var("p", Sort::bitvec(width));
+        let off = store.mk_var("off", Sort::bitvec(width));
+        for (a, b) in [(p, off), (off, p)] {
+            let wide_a = store.mk_bvzero_extend(width, a);
+            let wide_b = store.mk_bvzero_extend(width, b);
+            let wide_sum = store.mk_bvadd(vec![wide_a, wide_b]);
+            let low = store.mk_bvextract(width - 1, 0, wide_sum);
+            let narrow = store.mk_bvadd(vec![a, b]);
+            assert_eq!(low, narrow, "width {width}: address kept a wide adder");
+        }
+    }
+}
+
+#[test]
+fn test_extract_low_add_keeps_carry_sensitive_and_full_slices() {
+    let mut store = TermStore::new();
+    let a = store.mk_var("a", Sort::bitvec(16));
+    let b = store.mk_var("b", Sort::bitvec(16));
+    let sum = store.mk_bvadd(vec![a, b]);
+    assert_eq!(store.mk_bvextract(15, 0, sum), sum);
+    let high = store.mk_bvextract(15, 8, sum);
+    assert!(
+        matches!(store.get(high), TermData::App(Symbol::Indexed(name, indices), args)
+        if name == "extract" && indices == &[15, 8] && args == &[sum])
+    );
+
+    // A carry from below the slice must survive: (255 + 1)[15:8] is 1.
+    let left = store.mk_bitvec(BigInt::from(255), 16);
+    let right = store.mk_bitvec(BigInt::from(1), 16);
+    let carried = store.mk_bvadd(vec![left, right]);
+    let result = store.mk_bvextract(15, 8, carried);
+    assert_eq!(store.get_bitvec(result), Some((&BigInt::from(1), 8)));
+}
+
 // =========================================================================
 // Bitvector extract, concat, extend, and rotate tests
 // =========================================================================

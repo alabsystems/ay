@@ -23,14 +23,25 @@ mod assertions;
 pub mod batch;
 mod bitblast_bool;
 mod comparisons;
+mod counted;
+mod encoding_control;
+mod encoding_scope;
+mod materialization;
+
+pub use counted::{CountedBvEncoder, CountedBvError, COUNTED_BV_WORK_VERSION};
+pub use encoding_control::BvEncodingGuard;
+pub use encoding_scope::ScopedBvEncodingOwner;
+mod constant_bits;
 mod delayed;
 mod delayed_solver;
 mod division;
 mod gates;
+mod offset_equality;
 mod shifts;
 mod state;
 mod theory_impl;
 mod validation;
+mod variable_probe;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -70,6 +81,29 @@ fn debug_bool_ite() -> bool {
 /// LSB is at index 0
 pub type BvBits = Vec<CnfLit>;
 
+/// Complement of a CNF literal: `neg_lit(lit) == -lit` for every literal.
+///
+/// CNF literals are DIMACS `±var` with `var` in `1..=i32::MAX`, a domain on
+/// which negation never overflows, so `wrapping_neg` is total and identical to
+/// `-lit` there (the same form as gates.rs and ay-core's `Tseitin::negate`).
+/// `i32::MIN` is not a literal of any variable; it is the one value
+/// `wrapping_neg` maps to itself.
+#[inline]
+const fn neg_lit(lit: CnfLit) -> CnfLit {
+    lit.wrapping_neg()
+}
+
+/// An empty `BvBits` with room for `n` literals reserved up front.
+///
+/// The reservation is fallible and only a pre-sizing hint: every caller pushes
+/// its literals one at a time, so a refused reservation leaves the vector to
+/// grow on push and the literals are identical.
+fn bits_with_capacity(n: usize) -> BvBits {
+    let mut bits = Vec::new();
+    let _ = bits.try_reserve_exact(n);
+    bits
+}
+
 /// Gate cache type: maps normalized `(min(a,b), max(a,b))` key to output literal.
 pub type GateCache = HashMap<(CnfLit, CnfLit), CnfLit>;
 
@@ -105,6 +139,16 @@ pub struct BvModel {
     /// When a Bool variable is substituted with a BV predicate (e.g., `p -> (bvult x #x42)`),
     /// the evaluated Bool result is stored here for model validation (#5524).
     pub bool_overrides: HashMap<TermId, bool>,
+}
+
+/// What cut [`BvSolver::bitblast_all`] short, leaving a partial CNF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlastCut {
+    /// The interrupt flag ([`BvSolver::set_interrupt`]) was raised.
+    Interrupt,
+    /// The process memory ceiling ([`ay_sys::process_memory_exceeded`]) was
+    /// exceeded.
+    MemoryCeiling,
 }
 
 /// Bitvector theory solver using eager bit-blasting
@@ -162,6 +206,8 @@ pub struct BvSolver<'a> {
     /// QF_BV/QF_ABV problems carry no extra per-gate memory. (AND provenance is
     /// always captured for the AIG rewriter and so is unaffected by this flag.)
     capture_gate_provenance: bool,
+    /// One diagnostic watch; never consumed by encoding or proof decisions.
+    variable_registration_watch: Option<(CnfLit, usize)>,
     /// Cache for OR gates: (min(a,b), max(a,b)) -> output literal
     /// Used for structural hashing to avoid duplicate gates. (#1774)
     or_cache: HashMap<(CnfLit, CnfLit), CnfLit>,
@@ -194,6 +240,7 @@ pub struct BvSolver<'a> {
     /// This allows `set_timeout()` and `interrupt()` to take effect during BV
     /// theory solving, rather than only after BV returns.
     interrupt: Option<Arc<AtomicBool>>,
+    encoding: Arc<encoding_control::EncodingControl>,
     /// Terms that must be eagerly internalized even when `delay_enabled` is true (#8142).
     ///
     /// In combined theories (QF_ABV, QF_UFBV), BV terms that appear as array
@@ -201,6 +248,9 @@ pub struct BvSolver<'a> {
     /// array/EUF axioms reason over constrained bits. Without this, delayed
     /// mul/div/rem operations produce unconstrained index bits, causing false-UNSAT.
     eager_terms: HashSet<TermId>,
+    /// The offset equalities this solver counted: only a reading that pays is
+    /// blasted through its difference (`offset_equality.rs`).
+    offset_shares: ay_core::BvOffsetShares,
     // Per-theory runtime statistics (#4706)
     check_count: u64,
     conflict_count: u64,
@@ -211,6 +261,10 @@ impl<'a> BvSolver<'a> {
     /// Create a new BV solver
     #[must_use]
     pub fn new(terms: &'a TermStore) -> Self {
+        Self::with_encoding(terms, encoding_control::EncodingControl::capture())
+    }
+
+    fn with_encoding(terms: &'a TermStore, encoding: encoding_control::EncodingControl) -> Self {
         BvSolver {
             terms,
             term_to_bits: HashMap::default(),
@@ -229,6 +283,7 @@ impl<'a> BvSolver<'a> {
             xor_children: HashMap::default(),
             mux_children: HashMap::default(),
             capture_gate_provenance: false,
+            variable_registration_watch: None,
             or_cache: HashMap::default(),
             xor_cache: HashMap::default(),
             mux_cache: HashMap::default(),
@@ -237,7 +292,9 @@ impl<'a> BvSolver<'a> {
             delayed_ops: Vec::new(),
             delay_enabled: false,
             interrupt: None,
+            encoding: Arc::new(encoding),
             eager_terms: HashSet::default(),
+            offset_shares: ay_core::BvOffsetShares::default(),
             check_count: 0,
             conflict_count: 0,
             propagation_count: 0,
@@ -246,8 +303,18 @@ impl<'a> BvSolver<'a> {
 
     /// Allocate a fresh CNF variable
     fn fresh_var(&mut self) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private unwind marker, never an admitted CNF literal.
+        }
+        if self.encoding.is_counted() && self.next_var > i32::MAX as u32 {
+            self.encoding
+                .counted_refuse(ay_core::original_query::CountedAdmissionError::WorkExhausted);
+            return 0;
+        }
         let var = self.next_var as CnfLit;
-        self.next_var += 1;
+        // A counter at `u32::MAX` stays there; literals past `i32::MAX` are
+        // already out of the DIMACS range the `as` cast above can express.
+        self.next_var = self.next_var.saturating_add(1);
         var
     }
 
@@ -257,6 +324,12 @@ impl<'a> BvSolver<'a> {
     /// external code generation kernels can reserve output variables up front and stamp
     /// clauses against a stable range without changing SAT runtime semantics.
     pub fn batch_fresh_vars(&mut self, count: usize) -> BvFreshVarRange {
+        if !self.encoding_complete() {
+            return BvFreshVarRange::new(1, 0);
+        }
+        if self.encoding.is_counted() {
+            return self.counted_fresh_range(count);
+        }
         let count_u32 = u32::try_from(count).expect("BV fresh-var batch count exceeds u32");
         let first = self.next_var;
         let next = first
@@ -277,20 +350,33 @@ impl<'a> BvSolver<'a> {
     /// outputs; `BvClauseBatch` can extract the resulting deterministic CNF
     /// without enabling native compilation.
     fn add_clause(&mut self, clause: CnfClause) {
-        self.clauses.push(clause);
+        if self.encoding.is_counted() {
+            self.counted_unsupported("unadmitted owned clause import");
+            return;
+        }
+        if !self.encoding.was_stopped() {
+            self.clauses.push(clause);
+        }
     }
 
     /// Allocate a fresh CNF variable constrained to false.
     /// The literal is tracked in `known_false` for optimization. (#1720)
     /// Cached: all zero bits share a single variable to avoid CNF bloat.
     fn fresh_false(&mut self) -> CnfLit {
+        if !self.encoding_step() {
+            return 0;
+        }
         if let Some(lit) = self.cached_false_lit {
             return lit;
         }
         let var = self.fresh_var();
-        self.add_clause(CnfClause::unit(-var));
-        self.known_false.insert(var);
-        self.cached_false_lit = Some(var);
+        self.emit_clause(&[neg_lit(var)]);
+        if !self.encoding.was_stopped()
+            && counted::memory::set(&mut self.known_false, &self.encoding)
+        {
+            self.known_false.insert(var);
+            self.cached_false_lit = Some(var);
+        }
         var
     }
 
@@ -301,7 +387,7 @@ impl<'a> BvSolver<'a> {
 
     /// Check if a literal is known to be true (i.e., constrained to true)
     fn is_known_true(&self, lit: CnfLit) -> bool {
-        lit < 0 && self.known_false.contains(&-lit)
+        lit < 0 && self.known_false.contains(&neg_lit(lit))
     }
 
     /// Check if a literal is a known constant (either true or false)
@@ -309,155 +395,28 @@ impl<'a> BvSolver<'a> {
         self.is_known_true(lit) || self.is_known_false(lit)
     }
 
-    /// Try to extract a constant usize value from a bit vector whose bits
-    /// are all known constants. Returns `None` if any bit is non-constant
-    /// or the value exceeds `usize::MAX`.
-    ///
-    /// Used by bitblaster shift/multiply shortcuts (#8111) to detect constant
-    /// operands and bypass barrel-shifter/multiplier circuits.
-    fn try_bits_to_usize(&self, bits: &BvBits) -> Option<usize> {
-        let mut value: usize = 0;
-        for (i, &lit) in bits.iter().enumerate() {
-            if self.is_known_true(lit) {
-                // Guard against overflow for very wide bitvectors
-                if i >= usize::BITS as usize {
-                    return None;
-                }
-                value |= 1usize << i;
-            } else if !self.is_known_false(lit) {
-                return None; // non-constant bit
-            }
-        }
-        Some(value)
-    }
-
-    /// Check if exactly one bit is set (power of 2) in a constant bit vector.
-    /// Returns the position of the set bit, or None if not a power of 2
-    /// or if any bit is non-constant.
-    ///
-    /// Used by bitblaster mul shortcut (#8111) to detect power-of-2 multipliers
-    /// and replace the multiplier circuit with simple wiring.
-    fn try_bits_power_of_2(&self, bits: &BvBits) -> Option<usize> {
-        let mut set_pos = None;
-        for (i, &lit) in bits.iter().enumerate() {
-            if self.is_known_true(lit) {
-                if set_pos.is_some() {
-                    return None; // more than one bit set
-                }
-                set_pos = Some(i);
-            } else if !self.is_known_false(lit) {
-                return None; // non-constant bit
-            }
-        }
-        set_pos
-    }
-
     /// Create a fresh literal constrained to true.
     ///
     /// Returns a negative literal -v where v is in known_false, so
     /// is_known_true(-v) returns true.
     fn fresh_true(&mut self) -> CnfLit {
+        if !self.encoding_step() {
+            return 0;
+        }
         let v = self.fresh_var();
         // Add v to known_false, then return -v
         // is_known_true(-v) = -v < 0 && known_false.contains(&-(-v)) = known_false.contains(&v)
-        self.known_false.insert(v);
+        if !self.encoding.was_stopped()
+            && counted::memory::set(&mut self.known_false, &self.encoding)
+        {
+            self.known_false.insert(v);
+        }
         // Add unit clause asserting v is false (which means -v is true)
-        self.add_clause(CnfClause::unit(-v));
-        -v
-    }
-
-    /// Get or create bit representation for a BV term.
-    /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#4602).
-    fn get_bits(&mut self, term: TermId) -> BvBits {
-        stacker::maybe_grow(BV_STACK_RED_ZONE, BV_STACK_SIZE, || {
-            if let Some(bits) = self.term_to_bits.get(&term) {
-                return bits.clone();
-            }
-
-            let bits = self.bitblast(term);
-            self.term_to_bits.insert(term, bits.clone());
-            bits
-        })
-    }
-
-    /// Bit-blast a bitvector term
-    fn bitblast(&mut self, term: TermId) -> BvBits {
-        let data = self.terms.get(term).clone();
-
-        match data {
-            TermData::Const(Constant::BitVec { ref value, width }) => {
-                // Constant: create bits from value.
-                // Zero bits use `fresh_false` to track in `known_false` for multiplication
-                // optimization (#1720).
-                let mut bits = Vec::with_capacity(width as usize);
-                for i in 0..width {
-                    let bit_set =
-                        (value >> i) & num_bigint::BigInt::from(1) != num_bigint::BigInt::from(0);
-                    let lit = if bit_set {
-                        // Use the canonical true representation recognized by
-                        // `is_known_true`, matching `const_bits`. Previously
-                        // positive unit literals here looked variable to every
-                        // constant-propagation and multiplier shortcut.
-                        -self.fresh_false()
-                    } else {
-                        self.fresh_false()
-                    };
-                    bits.push(lit);
-                }
-                bits
-            }
-            TermData::Var(ref _name, _) => {
-                // Variable: allocate fresh boolean variables
-                let width = match self.terms.sort(term) {
-                    Sort::BitVec(bv) => bv.width,
-                    _ => return Vec::new(),
-                };
-                self.batch_fresh_vars(width as usize).to_vec()
-            }
-            TermData::Ite(cond, then_term, else_term) => {
-                let Sort::BitVec(_) = self.terms.sort(term) else {
-                    return Vec::new();
-                };
-                self.bitblast_ite_flattened(cond, then_term, else_term)
-            }
-            TermData::App(ref sym, ref args) => self.bitblast_app(term, sym, args),
-            _ => {
-                // Unknown term type - allocate fresh bits
-                if let Sort::BitVec(bv) = self.terms.sort(term) {
-                    self.batch_fresh_vars(bv.width as usize).to_vec()
-                } else {
-                    Vec::new()
-                }
-            }
-        }
-    }
-
-    /// Return fresh unconstrained bits for the given term's sort width.
-    /// Used as fallback when bitblasting encounters width mismatches (#5595).
-    fn fresh_bits_for_term(&mut self, term: TermId) -> BvBits {
-        if let Sort::BitVec(bv) = self.terms.sort(term) {
-            self.batch_fresh_vars(bv.width as usize).to_vec()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Get bits for a binary BV operation, returning None if operands have
-    /// mismatched widths (0 bits from non-BV sub-terms). (#5595)
-    fn get_binary_bits(&mut self, a: TermId, b: TermId) -> Option<(BvBits, BvBits)> {
-        let a_bits = self.get_bits(a);
-        let b_bits = self.get_bits(b);
-        if a_bits.is_empty() || b_bits.is_empty() || a_bits.len() != b_bits.len() {
-            None
-        } else {
-            Some((a_bits, b_bits))
-        }
+        self.emit_clause(&[neg_lit(v)]);
+        neg_lit(v)
     }
 }
 
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

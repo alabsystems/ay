@@ -22,6 +22,8 @@ mod chain;
 #[cfg(test)]
 mod tests;
 
+mod counted;
+
 use crate::clause_arena::ClauseArena;
 use crate::literal::{Literal, Variable};
 use crate::occ_list::OccList;
@@ -37,6 +39,21 @@ pub(crate) const FACTOR_SIZE_LIMIT: usize = 5;
 
 /// Minimum factor count for a factoring candidate to be considered.
 const MIN_FACTOR_MATCHES: usize = 2;
+
+#[inline]
+fn factor_probe_enabled() -> bool {
+    ay_core::misc_cli_flags().factor_probe
+}
+
+impl Factor {
+    /// `--sat-factor-probe` diagnostic line from the pass driver (the engine
+    /// owns the probe's stderr surface).
+    pub(crate) fn probe_note(&self, note: std::fmt::Arguments<'_>) {
+        if factor_probe_enabled() {
+            eprintln!("c factor_probe {note}");
+        }
+    }
+}
 
 /// Factor occurrence-list elements (`usize` clause indices, 8 bytes each) that
 /// share one 64-byte cache line: `64 / 8 = 8`. kissat charges 1 tick per cache
@@ -626,6 +643,8 @@ pub(crate) struct Factor {
     /// Pooled scratch: `(sorted-literal signature, position)` pairs for the
     /// exact-duplicate source dedup in `try_candidate` (#dup-factor-poison).
     dedup_keys: Vec<([u32; FACTOR_SIZE_LIMIT], u32)>,
+    /// `--sat-factor-probe` diagnostic lines emitted so far (capped).
+    probe_lines: u32,
     /// Pooled scratch: per-clause dedup marks for matrix extraction (#rank5 —
     /// replaces the O(n^2) `to_delete_set.contains` scan).
     delete_marks: Vec<bool>,
@@ -672,6 +691,7 @@ impl Factor {
             cand_matches: Vec::new(),
             eligible_buf: Vec::new(),
             dedup_keys: Vec::new(),
+            probe_lines: 0,
             delete_marks: Vec::new(),
             step_deleted: Vec::new(),
             schedule: std::collections::BinaryHeap::new(),
@@ -750,6 +770,12 @@ impl Factor {
         if idx < self.marks.len() {
             self.marks[idx] &= !flag;
         }
+    }
+
+    /// All mark bits of `lit` (0 for a literal past the mark array).
+    #[inline]
+    fn mark_bits(&self, lit: Literal) -> u8 {
+        self.marks.get(lit.index()).copied().unwrap_or(0)
     }
 
     fn is_marked(&self, lit: Literal, flag: u8) -> bool {
@@ -983,6 +1009,7 @@ impl Factor {
 
         // Build quotient chain (CaDiCaL: first_factor + next_factor loop).
         // Level 0 takes ownership of the pooled buffer; it is recycled below.
+        let probe_eligible = eligible.len();
         let mut chain = self.build_quotient_chain(
             clause_db,
             occ,
@@ -993,6 +1020,23 @@ impl Factor {
             ticks,
             effort_limit,
         );
+        if factor_probe_enabled() && self.probe_lines < 12 {
+            self.probe_lines += 1;
+            let levels: Vec<String> = chain
+                .iter()
+                .map(|q| format!("{}:{}", q.factor.index(), q.clause_indices.len()))
+                .collect();
+            eprintln!(
+                "c factor_probe cand lit={} occ={} eligible={} chain=[{}] elim_bound={} ticks={} limit={}",
+                first_lit.index(),
+                occ.count(first_lit),
+                probe_eligible,
+                levels.join(" "),
+                elim_bound,
+                *ticks,
+                effort_limit
+            );
+        }
 
         let outcome = self.extract_factoring(
             clause_db, occ, vals, &mut chain, deleted, elim_bound, next_var,

@@ -5,6 +5,33 @@
 //! One checked adjacent-transposition derivation.
 
 use super::super::*;
+use std::fmt::{self, Write as _};
+
+pub(super) trait PermutationText: fmt::Write {
+    fn admit_copy(&mut self, bytes: usize) -> Option<()>;
+
+    fn term(&mut self, args: fmt::Arguments<'_>) -> Option<String> {
+        struct Length(usize);
+        impl fmt::Write for Length {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut length = Length(0);
+        length.write_fmt(args).ok()?;
+        self.admit_copy(length.0)?;
+        let mut output = String::with_capacity(length.0);
+        output.write_fmt(args).ok()?;
+        Some(output)
+    }
+}
+
+impl PermutationText for String {
+    fn admit_copy(&mut self, _bytes: usize) -> Option<()> {
+        Some(())
+    }
+}
 
 struct TranspositionTerms<'a> {
     tag: &'a str,
@@ -24,7 +51,7 @@ struct TranspositionTerms<'a> {
     eq_inner: String,
     not_outer: String,
     not_inner: String,
-    nf: String,
+    nf: &'a str,
 }
 
 /// Emit one adjacent transposition
@@ -35,8 +62,8 @@ struct TranspositionTerms<'a> {
 /// `{dl, dr} == {ii, jo}`; that disequality refutes the case in which the
 /// extensionality witness equals both indices.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn write_store_transposition(
-    output: &mut String,
+pub(super) fn write_store_transposition<W: PermutationText>(
+    output: &mut W,
     tag: &str,
     rest: &str,
     outer: &(String, String),
@@ -44,46 +71,51 @@ pub(super) fn write_store_transposition(
     index_sort: &str,
     premise: &str,
     diseq: (&str, &str),
-    id: ProofId,
+    false_fact: &str,
 ) -> Option<(String, String)> {
-    let terms = TranspositionTerms::new(tag, rest, outer, inner, index_sort, premise, id);
-    write_opening(output, &terms);
-    write_misses_both_case(output, &terms);
-    write_outer_index_case(output, &terms);
-    write_inner_index_case(output, &terms);
+    let terms = TranspositionTerms::new(
+        output, tag, rest, outer, inner, index_sort, premise, false_fact,
+    )?;
+    write_opening(output, &terms)?;
+    write_misses_both_case(output, &terms)?;
+    write_outer_index_case(output, &terms)?;
+    write_inner_index_case(output, &terms)?;
     write_both_indices_case(output, &terms, diseq)?;
-    write_closing(output, &terms);
+    write_closing(output, &terms)?;
     Some((terms.before, terms.after))
 }
 
 impl<'a> TranspositionTerms<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn new<W: PermutationText>(
+        output: &mut W,
         tag: &'a str,
         rest: &'a str,
         outer: &'a (String, String),
         inner: &'a (String, String),
         index_sort: &str,
         premise: &'a str,
-        id: ProofId,
-    ) -> Self {
+        false_fact: &'a str,
+    ) -> Option<Self> {
         let (jo, wo) = (&outer.0, &outer.1);
         let (ii, vi) = (&inner.0, &inner.1);
-        let before = format!("(store (store {rest} {ii} {vi}) {jo} {wo})");
-        let after = format!("(store (store {rest} {jo} {wo}) {ii} {vi})");
-        let inner_left = format!("(store {rest} {ii} {vi})");
-        let inner_right = format!("(store {rest} {jo} {wo})");
+        let before = output.term(format_args!("(store (store {rest} {ii} {vi}) {jo} {wo})"))?;
+        let after = output.term(format_args!("(store (store {rest} {jo} {wo}) {ii} {vi})"))?;
+        let inner_left = output.term(format_args!("(store {rest} {ii} {vi})"))?;
+        let inner_right = output.term(format_args!("(store {rest} {jo} {wo})"))?;
         let binder = EXT_CHOICE_BINDER;
-        let witness = format!(
+        let witness = output.term(format_args!(
             "(choice (({binder} {index_sort})) (or (= {before} {after}) \
              (not (= (select {before} {binder}) (select {after} {binder})))))"
-        );
-        let selected = format!("(= (select {before} {witness}) (select {after} {witness}))");
-        let eq_outer = format!("(= {jo} {witness})");
-        let eq_inner = format!("(= {ii} {witness})");
-        let not_outer = format!("(not {eq_outer})");
-        let not_inner = format!("(not {eq_inner})");
-        Self {
+        ))?;
+        let selected = output.term(format_args!(
+            "(= (select {before} {witness}) (select {after} {witness}))"
+        ))?;
+        let eq_outer = output.term(format_args!("(= {jo} {witness})"))?;
+        let eq_inner = output.term(format_args!("(= {ii} {witness})"))?;
+        let not_outer = output.term(format_args!("(not {eq_outer})"))?;
+        let not_inner = output.term(format_args!("(not {eq_inner})"))?;
+        Some(Self {
             tag,
             premise,
             rest,
@@ -101,12 +133,12 @@ impl<'a> TranspositionTerms<'a> {
             eq_inner,
             not_outer,
             not_inner,
-            nf: format!("{id}.nf"),
-        }
+            nf: false_fact,
+        })
     }
 }
 
-fn write_opening(output: &mut String, terms: &TranspositionTerms<'_>) {
+fn write_opening<W: PermutationText>(output: &mut W, terms: &TranspositionTerms<'_>) -> Option<()> {
     let TranspositionTerms {
         tag,
         before,
@@ -114,14 +146,20 @@ fn write_opening(output: &mut String, terms: &TranspositionTerms<'_>) {
         selected,
         ..
     } = terms;
-    output.push_str(&format!(
+    write!(
+        output,
         "(anchor :step {tag}.sp0)\n\
          (assume {tag}.h (not (= {before} {after})))\n\
          (step {tag}.ext (cl (not {selected})) :rule arrays_ext :premises ({tag}.h))\n"
-    ));
+    )
+    .ok()?;
+    Some(())
 }
 
-fn write_misses_both_case(output: &mut String, terms: &TranspositionTerms<'_>) {
+fn write_misses_both_case<W: PermutationText>(
+    output: &mut W,
+    terms: &TranspositionTerms<'_>,
+) -> Option<()> {
     let TranspositionTerms {
         tag,
         rest,
@@ -138,7 +176,7 @@ fn write_misses_both_case(output: &mut String, terms: &TranspositionTerms<'_>) {
         nf,
         ..
     } = terms;
-    output.push_str(&format!(
+    write!(output,
         "(anchor :step {tag}.nn0)\n\
          (assume {tag}.nn.j {not_outer})\n\
          (assume {tag}.nn.i {not_inner})\n\
@@ -157,10 +195,14 @@ fn write_misses_both_case(output: &mut String, terms: &TranspositionTerms<'_>) {
          (step {tag}.nb (cl (not (not {not_inner})) {eq_inner}) :rule not_not)\n\
          (step {tag}.nn2 (cl (not {not_inner}) {eq_outer}) :rule resolution :premises ({tag}.nn1 {tag}.na))\n\
          (step {tag}.nnR (cl {eq_outer} {eq_inner}) :rule resolution :premises ({tag}.nn2 {tag}.nb))\n"
-    ));
+    ).ok()?;
+    Some(())
 }
 
-fn write_outer_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
+fn write_outer_index_case<W: PermutationText>(
+    output: &mut W,
+    terms: &TranspositionTerms<'_>,
+) -> Option<()> {
     let TranspositionTerms {
         tag,
         jo,
@@ -176,7 +218,7 @@ fn write_outer_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
         nf,
         ..
     } = terms;
-    output.push_str(&format!(
+    write!(output,
         "(anchor :step {tag}.pj0)\n\
          (assume {tag}.pj.j {eq_outer})\n\
          (assume {tag}.pj.i {not_inner})\n\
@@ -196,10 +238,14 @@ fn write_outer_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
          (step {tag}.pj0 (cl (not {eq_outer}) (not {not_inner}) false) :rule subproof :discharge ({tag}.pj.j {tag}.pj.i))\n\
          (step {tag}.pj1 (cl (not {eq_outer}) (not {not_inner})) :rule resolution :premises ({tag}.pj0 {nf}))\n\
          (step {tag}.pjR (cl (not {eq_outer}) {eq_inner}) :rule resolution :premises ({tag}.pj1 {tag}.nb))\n"
-    ));
+    ).ok()?;
+    Some(())
 }
 
-fn write_inner_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
+fn write_inner_index_case<W: PermutationText>(
+    output: &mut W,
+    terms: &TranspositionTerms<'_>,
+) -> Option<()> {
     let TranspositionTerms {
         tag,
         ii,
@@ -215,7 +261,7 @@ fn write_inner_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
         nf,
         ..
     } = terms;
-    output.push_str(&format!(
+    write!(output,
         "(anchor :step {tag}.pi0)\n\
          (assume {tag}.pi.i {eq_inner})\n\
          (assume {tag}.pi.j {not_outer})\n\
@@ -234,11 +280,12 @@ fn write_inner_index_case(output: &mut String, terms: &TranspositionTerms<'_>) {
          (step {tag}.pi0 (cl (not {eq_inner}) (not {not_outer}) false) :rule subproof :discharge ({tag}.pi.i {tag}.pi.j))\n\
          (step {tag}.pi1 (cl (not {eq_inner}) (not {not_outer})) :rule resolution :premises ({tag}.pi0 {nf}))\n\
          (step {tag}.piR (cl (not {eq_inner}) {eq_outer}) :rule resolution :premises ({tag}.pi1 {tag}.na))\n"
-    ));
+    ).ok()?;
+    Some(())
 }
 
-fn write_both_indices_case(
-    output: &mut String,
+fn write_both_indices_case<W: PermutationText>(
+    output: &mut W,
     terms: &TranspositionTerms<'_>,
     diseq: (&str, &str),
 ) -> Option<()> {
@@ -255,20 +302,20 @@ fn write_both_indices_case(
     } = terms;
     let (contradiction, chained, flipped, flipped_conclusion) = match diseq {
         (lhs, rhs) if (lhs, rhs) == (*ii, *jo) => (
-            format!("(= {ii} {jo})"),
-            format!("{tag}.pp.i"),
-            format!("{tag}.pp.j"),
-            format!("(= {witness} {jo})"),
+            output.term(format_args!("(= {ii} {jo})"))?,
+            output.term(format_args!("{tag}.pp.i"))?,
+            output.term(format_args!("{tag}.pp.j"))?,
+            output.term(format_args!("(= {witness} {jo})"))?,
         ),
         (lhs, rhs) if (lhs, rhs) == (*jo, *ii) => (
-            format!("(= {jo} {ii})"),
-            format!("{tag}.pp.j"),
-            format!("{tag}.pp.i"),
-            format!("(= {witness} {ii})"),
+            output.term(format_args!("(= {jo} {ii})"))?,
+            output.term(format_args!("{tag}.pp.j"))?,
+            output.term(format_args!("{tag}.pp.i"))?,
+            output.term(format_args!("(= {witness} {ii})"))?,
         ),
         _ => return None,
     };
-    output.push_str(&format!(
+    write!(output,
         "(anchor :step {tag}.pp0)\n\
          (assume {tag}.pp.i {eq_inner})\n\
          (assume {tag}.pp.j {eq_outer})\n\
@@ -277,11 +324,11 @@ fn write_both_indices_case(
          (step {tag}.pp.3 (cl) :rule resolution :premises ({premise} {tag}.pp.2))\n\
          (step {tag}.pp0 (cl (not {eq_inner}) (not {eq_outer}) false) :rule subproof :discharge ({tag}.pp.i {tag}.pp.j))\n\
          (step {tag}.ppR (cl (not {eq_inner}) (not {eq_outer})) :rule resolution :premises ({tag}.pp0 {nf}))\n"
-    ));
+    ).ok()?;
     Some(())
 }
 
-fn write_closing(output: &mut String, terms: &TranspositionTerms<'_>) {
+fn write_closing<W: PermutationText>(output: &mut W, terms: &TranspositionTerms<'_>) -> Option<()> {
     let TranspositionTerms {
         tag,
         before,
@@ -290,7 +337,7 @@ fn write_closing(output: &mut String, terms: &TranspositionTerms<'_>) {
         nf,
         ..
     } = terms;
-    output.push_str(&format!(
+    write!(output,
         "(step {tag}.r1 (cl {eq_inner}) :rule resolution :premises ({tag}.nnR {tag}.pjR))\n\
          (step {tag}.r2 (cl (not {eq_inner})) :rule resolution :premises ({tag}.piR {tag}.ppR))\n\
          (step {tag}.bot (cl) :rule resolution :premises ({tag}.r1 {tag}.r2))\n\
@@ -298,5 +345,6 @@ fn write_closing(output: &mut String, terms: &TranspositionTerms<'_>) {
          (step {tag}.sp (cl (not (not (= {before} {after})))) :rule resolution :premises ({tag}.sp0 {nf}))\n\
          (step {tag}.nn3 (cl (not (not (not (= {before} {after})))) (= {before} {after})) :rule not_not)\n\
          (step {tag} (cl (= {before} {after})) :rule resolution :premises ({tag}.sp {tag}.nn3))\n"
-    ));
+    ).ok()?;
+    Some(())
 }

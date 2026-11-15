@@ -10,9 +10,11 @@ use ay_core::{ArraySort, Sort, TermId};
 use ay_model_check::ModelValue;
 
 use super::super::dt_construct::eval_to_mv;
+use super::super::rendered_dt_guard::RenderedDatatypeGuard;
 use super::{
-    charge_work, normalize_array_value, typed_array_value, ArrayAccumulator, ExactClass, Model,
-    SemanticNormalizationBudget, TypedArrayParseBudget, MAX_EXACT_ARRAY_FIELD_TERMS,
+    charge_work, normalize_array_value, typed_array_value, typed_datatype_array_value,
+    ArrayAccumulator, ExactClass, Model, SemanticNormalizationBudget, TypedArrayParseBudget,
+    MAX_EXACT_ARRAY_FIELD_TERMS,
 };
 use crate::executor::Executor;
 
@@ -48,7 +50,7 @@ impl Executor {
             if model
                 .array_model
                 .as_ref()
-                .is_some_and(|arrays| arrays.read_conflicted.contains(&app))
+                .is_some_and(|arrays| arrays.is_withheld(&app))
                 || !self.merge_active_field_reads(
                     model,
                     app,
@@ -85,7 +87,7 @@ impl Executor {
             return None;
         };
         if !parse_budget.charge_value(candidate)
-            || !typed_array_value(value, sort)
+            || !typed_array_value(value, sort, &RenderedDatatypeGuard::new(self))
             || normalize_array_value(value, semantic_budget).is_none()
         {
             return None;
@@ -158,8 +160,13 @@ impl Executor {
             else {
                 return false;
             };
-            let Some(value) = eval_to_mv(&self.evaluate_term(model, read), &sort.element_sort)
-            else {
+            let Some(value) = self.exact_constructor_source_value(
+                model,
+                read,
+                &sort.element_sort,
+                work,
+                parse_budget,
+            ) else {
                 return false;
             };
             if !parse_budget.charge_value(&key)
@@ -209,15 +216,15 @@ impl Executor {
         if !charge_work(work, interp.stores.len().saturating_add(1)) {
             return false;
         }
-        let default = interp
-            .default
-            .as_deref()
-            .and_then(|text| self.typed_scalar_text(text, &sort.element_sort, parse_budget));
+        let guard = RenderedDatatypeGuard::new(self);
+        let default = interp.default.as_deref().and_then(|text| {
+            self.typed_field_value_text(text, &sort.element_sort, &guard, parse_budget)
+        });
         let mut stores = Vec::with_capacity(interp.stores.len());
         for (key, value) in &interp.stores {
             let (Some(key), Some(value)) = (
-                self.typed_scalar_text(key, &sort.index_sort, parse_budget),
-                self.typed_scalar_text(value, &sort.element_sort, parse_budget),
+                self.typed_field_value_text(key, &sort.index_sort, &guard, parse_budget),
+                self.typed_field_value_text(value, &sort.element_sort, &guard, parse_budget),
             ) else {
                 return false;
             };
@@ -226,19 +233,19 @@ impl Executor {
         accumulator.merge_interpretation(default, stores)
     }
 
-    pub(super) fn typed_scalar_text(
+    pub(super) fn typed_field_value_text(
         &self,
         text: &str,
         sort: &Sort,
+        guard: &RenderedDatatypeGuard,
         budget: &mut TypedArrayParseBudget,
     ) -> Option<ModelValue> {
-        if !budget.charge_text(text) {
+        self.poll_evaluation_stop().ok()?;
+        let value = self.parse_rendered_value_with_budget(text, sort, guard, 0, budget)?;
+        if !typed_datatype_array_value(&value, sort, guard) || !budget.charge_value(&value) {
             return None;
         }
-        let value = eval_to_mv(
-            &self.parse_model_value_string(text, &Some(sort.clone())),
-            sort,
-        )?;
-        budget.charge_value(&value).then_some(value)
+        self.poll_evaluation_stop().ok()?;
+        Some(value)
     }
 }

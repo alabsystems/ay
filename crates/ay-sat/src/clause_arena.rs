@@ -63,6 +63,11 @@ const CONDITIONED_BIT: u16 = 0b1000_0000_0000;
 /// When the `instantiateonce` strategy is active, instantiated clauses are
 /// skipped in subsequent collection rounds.
 const INSTANTIATED_BIT: u16 = 0b1_0000_0000_0000;
+/// Vivification tried this clause in the current generation (Kissat's
+/// `vivify` clause flag, inverted): a candidate pass takes the untried
+/// clauses first and re-flags the tier only when none is left, so every
+/// clause is tried once per generation and passes resume across calls.
+pub(crate) const VIVIFY_TRIED_BIT: u16 = 0b10_0000_0000_0000;
 /// Marks clauses as IC3 lemmas (blocking clauses added between IC3 queries).
 ///
 /// IC3/PDR engines add blocking clauses between incremental SAT queries. These
@@ -75,7 +80,42 @@ const INSTANTIATED_BIT: u16 = 0b1_0000_0000_0000;
 /// This flag is ay-sat's equivalent of GipSAT's Lemma kind.
 ///
 /// Reference: GipSAT rIC3 gipsat/mod.rs clause kind management.
-const IC3_LEMMA_BIT: u16 = 0b10_0000_0000_0000;
+///
+/// Lives in header WORD 1, bit 16 (the high half, free on a live clause: the
+/// two-stage score uses the low half and `delete()` rewrites the whole word),
+/// because all 16 flag bits are taken. It used to be flag bit 13, the same bit
+/// as `VIVIFY_TRIED_BIT` (de46e19b8): every clause vivification tried read as an
+/// IC3 lemma, which `reduce_db` never deletes, so under vivification generations
+/// the protected learned clauses grew to 83 percent of the database
+/// (mp1-bsat201-707, 2026-09-27).
+pub(crate) const IC3_LEMMA_WORD1_BIT: u32 = 1 << 16;
+
+// Every header flag owns its bit: a collision silently merges two meanings.
+const _: () = {
+    let masks: [u16; 12] = [
+        LEARNED_BIT,
+        USED_MASK,
+        GARBAGE_BIT,
+        VIVIFY_SKIP_BIT,
+        PENDING_GARBAGE_BIT,
+        HYPER_BIT,
+        SUBSUME_TRIED_BIT,
+        CONDITIONED_BIT,
+        INSTANTIATED_BIT,
+        VIVIFY_TRIED_BIT,
+        SCOPE_LIM_MASK,
+        0,
+    ];
+    let mut i = 0;
+    while i < masks.len() {
+        let mut j = i + 1;
+        while j < masks.len() {
+            assert!(masks[i] & masks[j] == 0, "clause header flags overlap");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// 2-bit user-scope-depth-at-learn mask (bits 14-15).
 ///
@@ -291,6 +331,66 @@ impl ClauseArena {
         }
     }
 
+    pub(crate) fn try_with_capacity_counted(
+        clauses: usize,
+        literals: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::CountedAdmissionError;
+        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        let words = clauses
+            .checked_mul(HEADER_WORDS)
+            .and_then(|n| n.checked_add(literals))
+            .filter(|n| *n as u64 <= crate::arena_limits::MAX_ARENA_WORDS)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        // Empty arena construction is allocation-free. Both reservations are
+        // fallible and paid before the ordinary insertion path can use them.
+        let mut arena = Self::new();
+        arena.words = crate::counted_storage::try_reserved_exact(owner, words)?;
+        arena.learned_offsets = crate::counted_storage::try_reserved_exact(owner, clauses / 4)?;
+        arena.accounted_words = arena.words.capacity();
+        Ok(arena)
+    }
+
+    /// Reserve the exact existing arena insertion transaction before mutation.
+    pub(crate) fn reserve_original_counted(
+        &mut self,
+        literals: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<usize, ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::CountedAdmissionError;
+        let end = self
+            .words
+            .len()
+            .checked_add(HEADER_WORDS)
+            .and_then(|n| n.checked_add(literals))
+            .filter(|n| *n as u64 <= crate::arena_limits::MAX_ARENA_WORDS)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        if end > self.words.capacity() {
+            // Mirror reserve_words, including its bounded large-arena step.
+            let capacity = self.words.capacity();
+            let grown = if capacity < BOUNDED_GROWTH_THRESHOLD_WORDS {
+                capacity.checked_mul(2)
+            } else {
+                capacity.checked_add(capacity / 4)
+            }
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            let target = end.max(grown).max(VEC_MIN_NON_ZERO_CAP);
+            let bytes = target
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            let work = target
+                .checked_add(self.words.len())
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
+            owner.admit(work, bytes)?;
+            self.words
+                .try_reserve_exact(target - self.words.len())
+                .map_err(|_| owner.refuse(CountedAdmissionError::Memory))?;
+        }
+        owner.admit(literals.saturating_add(HEADER_WORDS + 16), 0)?;
+        Ok(self.words.len())
+    }
+
     /// Whether any clause too large for the 16-bit length field has been added.
     /// When true, the formula was stored with a strengthened (truncated) clause:
     /// SAT models stay valid for the original formula, but UNSAT verdicts are
@@ -301,6 +401,53 @@ impl ClauseArena {
     }
 
     #[inline]
+    pub(crate) fn reserve_learned_counted(
+        &mut self,
+        literals: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> crate::counted_storage::Result<usize> {
+        use ay_core::original_query::CountedAdmissionError;
+        let offset = self.reserve_original_counted(literals, owner)?;
+        crate::counted_storage::try_reserve(owner, &mut self.learned_offsets, 1)?;
+        let needed = self
+            .learned_offset_index
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        if needed > self.learned_offset_index.capacity() {
+            // Hashbrown's load-factor/power-of-two table fits this logical
+            // bucket envelope. Old table remains live while it is replaced.
+            let buckets = needed
+                .checked_mul(4)
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            let bytes = buckets
+                .checked_mul(std::mem::size_of::<(usize, usize)>() + 32)
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            // Bound real rehash/probe walks too, not only element hashing.
+            // Fixed hashing is deterministic but not a collision-freedom proof.
+            let work = buckets
+                .checked_mul(needed)
+                .and_then(|n| n.checked_add(self.learned_offset_index.capacity()))
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
+            owner.admit(work, bytes)?;
+            self.learned_offset_index
+                .try_reserve(1)
+                .map_err(|_| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            if self.learned_offset_index.capacity() > buckets {
+                return Err(owner.refuse(CountedAdmissionError::StorageExhausted));
+            }
+        }
+        // Actual contains/insert bookkeeping and eventual retained-row cleanup.
+        let probe_bound = self
+            .learned_offset_index
+            .capacity()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
+        owner.admit(probe_bound, 0)?;
+        Ok(offset)
+    }
+
     fn insert_learned_offset(&mut self, offset: usize) {
         if self.learned_offset_index.contains_key(&offset) {
             return;
@@ -731,7 +878,10 @@ impl Iterator for ArenaIter<'_> {
 
 #[path = "clause_arena_accessors.rs"]
 mod accessors;
+mod append_mark;
 mod storage;
+
+pub(crate) use append_mark::ArenaAppendMark;
 
 #[cfg(test)]
 #[path = "clause_arena_tests.rs"]

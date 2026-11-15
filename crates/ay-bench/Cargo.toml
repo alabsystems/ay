@@ -9,6 +9,10 @@ license.workspace = true
 name = "ay_bench"
 path = "src/lib.rs"
 
+[[bin]]
+name = "ay-bench-resource"
+path = "src/resource_worker.rs"
+
 [dependencies]
 serde_json.workspace = true
 serde.workspace = true
@@ -20,12 +24,17 @@ tempfile.workspace = true
 thiserror.workspace = true
 wait-timeout.workspace = true
 ay-proof-complexity.workspace = true
+ay-chc.workspace = true
+ay-core.workspace = true
+ay-encode = { path = "../ay-encode" }
+flate2 = "1.1.9"
+tar.workspace = true
+# On every target: the harness writes to its sidecars and targets only through
+# `ay_sys::child_pipe::ChildPipeWriter`.
+ay-sys.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs", "time", "user"] }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-ay-sys.workspace = true
+nix = { workspace = true, features = ["fs", "time", "user", "resource"] }
 
 [dev-dependencies]
 ay-test-support.workspace = true

@@ -413,6 +413,20 @@ impl Context {
     }
 
     fn reject_unqualified_ambiguous_polymorphic_symbols(&self, term: &ParsedTerm) -> Result<()> {
+        // The walk can only fail at a name of a declaration whose result sort
+        // is ambiguous (`reject_unqualified_ambiguous_polymorphic_name`) and
+        // has no other effect, so with no such declaration in scope it is
+        // skipped. That is every script without `par` declarations, where the
+        // walk's linear `bound` lookups made it quadratic in let-chain depth
+        // (the 8,550-deep chains of the incremental QF_LRA hybrid_networks
+        // files: ~6% of the solve thread).
+        if !self
+            .polymorphic_declarations
+            .iter()
+            .any(declaration_result_is_ambiguous)
+        {
+            return Ok(());
+        }
         self.reject_unqualified_ambiguous_polymorphic_symbols_with_bindings(term, &mut Vec::new())
     }
 
@@ -535,6 +549,7 @@ impl Context {
         self.assertions.truncate(retained);
         self.assertion_finite_set_metadata.truncate(retained);
         self.assertions_parsed.truncate(retained);
+        self.definitional_pass.parsed.truncate(retained);
         self.materialized_polymorphic_assertions = 0;
         self.polymorphic_instantiation_complete = true;
     }
@@ -572,6 +587,7 @@ impl Context {
                     self.assertions.truncate(base);
                     self.assertion_finite_set_metadata.truncate(base);
                     self.assertions_parsed.truncate(base);
+                    self.definitional_pass.parsed.truncate(base);
                     return Err(error);
                 }
             }
@@ -1321,6 +1337,12 @@ fn logic_sort_universe(logic: Option<&str>) -> (Vec<Sort>, bool) {
 }
 
 fn current_logic_has_theory_sort(logic: Option<&str>, name: &str) -> bool {
+    if name == "FiniteField" {
+        return matches!(logic, None | Some("ALL" | "QF_FF"));
+    }
+    if name == "Complex" {
+        return matches!(logic, None | Some("ALL"));
+    }
     if name == "Bool" {
         return true;
     }
@@ -1450,6 +1472,14 @@ fn is_core_theory_symbol(name: &str) -> bool {
 }
 
 fn current_logic_has_theory_function(logic: Option<&str>, name: &str) -> bool {
+    if matches!(name, "ff.add" | "ff.mul" | "ff.neg" | "ff.bitsum") {
+        return matches!(logic, None | Some("ALL" | "QF_FF"));
+    }
+    if matches!(logic, None | Some("ALL"))
+        && matches!(name, "complex.make" | "complex.real" | "complex.imag")
+    {
+        return true;
+    }
     if is_core_theory_symbol(name) {
         return true;
     }

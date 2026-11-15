@@ -4,6 +4,9 @@
 
 //! Grouped CLI integration tests: CLI flags, stats, progress, tracing, startup.
 
+#[path = "common/corpus.rs"]
+pub mod corpus;
+
 #[path = "common/spawn.rs"]
 pub mod spawn;
 
@@ -13,17 +16,25 @@ mod spawn_timeout_selftest;
 #[path = "group_cli/competition_mode_b1.rs"]
 mod competition_mode_b1;
 
+#[path = "group_cli/orbitope_detection_honors_the_deadline.rs"]
+mod orbitope_detection_honors_the_deadline;
+
 #[path = "group_cli/capability_ledger.rs"]
 mod capability_ledger;
 
 #[path = "group_cli/strings_kill_switches.rs"]
 mod strings_kill_switches;
 
+#[path = "group_cli/probe_ite_lift_promoter_switch.rs"]
+mod probe_ite_lift_promoter_switch;
+
 #[path = "group_cli/allsat_phase1_8777.rs"]
 mod allsat_phase1_8777;
 
 #[path = "group_cli/dimacs_sat_exit_codes.rs"]
 mod dimacs_sat_exit_codes;
+#[path = "group_cli/kernel_route_cli.rs"]
+mod kernel_route_cli;
 #[path = "group_cli/proof_staging_abnormal_exit.rs"]
 mod proof_staging_abnormal_exit;
 #[path = "group_cli/reexec_supervisor_gate.rs"]
@@ -39,6 +50,9 @@ mod set_option_unknown_key;
 
 #[path = "group_cli/model_output_demand.rs"]
 mod model_output_demand;
+
+#[path = "group_cli/sequence_power.rs"]
+mod sequence_power;
 
 #[path = "group_cli/unconfirmed_diagnostic_scope.rs"]
 mod unconfirmed_diagnostic_scope;
@@ -118,14 +132,20 @@ mod model_count_mc2026;
 #[path = "group_cli/fp_signed_zero_regressions.rs"]
 mod fp_signed_zero_regressions;
 
-#[path = "group_cli/gate_cli.rs"]
-mod gate_cli;
-
 #[path = "group_cli/firewall_route_rejection.rs"]
 mod firewall_route_rejection;
 
 #[path = "group_cli/proof_certificate_disclosure.rs"]
 mod proof_certificate_disclosure;
+
+#[path = "group_cli/authored_surface_disclosure.rs"]
+mod authored_surface_disclosure;
+
+#[path = "group_cli/refused_artifact_disclosure.rs"]
+mod refused_artifact_disclosure;
+
+#[path = "group_cli/surrogate_carrier_raw_input.rs"]
+mod surrogate_carrier_raw_input;
 
 #[path = "group_cli/fail_closed_result_authority.rs"]
 mod fail_closed_result_authority;
@@ -135,10 +155,6 @@ mod rewritten_constant_premise;
 
 #[path = "group_cli/lean_verify_8773.rs"]
 mod lean_verify_8773;
-
-#[cfg(unix)]
-#[path = "group_cli/launch_packet_cli.rs"]
-mod launch_packet_cli;
 
 #[path = "group_cli/rust_horn_bmc_canaries_9618.rs"]
 mod rust_horn_bmc_canaries_9618;
@@ -175,6 +191,9 @@ mod proof_artifact_v1_8885;
 #[path = "group_cli/proof_write_readonly_dir.rs"]
 mod proof_write_readonly_dir;
 
+#[path = "group_cli/proof_temp_debris.rs"]
+mod proof_temp_debris;
+
 #[path = "group_cli/startup_timing.rs"]
 mod startup_timing;
 
@@ -190,15 +209,28 @@ mod stats_schema_contract;
 #[path = "group_cli/sigterm_unknown_8674.rs"]
 mod sigterm_unknown_8674;
 
+#[path = "group_cli/query_response_contract.rs"]
+mod query_response_contract;
+
 #[cfg(unix)]
 #[path = "group_cli/supervisor_sigkill_orphan.rs"]
 mod supervisor_sigkill_orphan;
 
+#[cfg(unix)]
+#[path = "group_cli/supervisor_startup_sigterm.rs"]
+mod supervisor_startup_sigterm;
+
 #[path = "group_cli/solution_visualization_8702.rs"]
 mod solution_visualization_8702;
 
+#[path = "group_cli/memout_status_lock.rs"]
+mod memout_status_lock;
+#[path = "common/random_3sat.rs"]
+mod random_3sat;
 #[path = "group_cli/sat_primary_path_8884.rs"]
 mod sat_primary_path_8884;
+#[path = "group_cli/seal_latency_fast_publication.rs"]
+mod seal_latency_fast_publication;
 
 #[path = "group_cli/quiet_and_dash_stdin.rs"]
 mod quiet_and_dash_stdin;
@@ -234,5 +266,65 @@ mod wrapper_crash_unknown_chc25;
 #[path = "group_cli/z3_compat_args.rs"]
 mod z3_compat_args;
 
+#[path = "group_cli/z3_reference_semantics.rs"]
+mod z3_reference_semantics;
+
+#[path = "group_cli/z3_mode_failed_command.rs"]
+mod z3_mode_failed_command;
+
+#[path = "group_cli/label_answer_lanes.rs"]
+mod label_answer_lanes;
+
+#[path = "group_cli/z3_mode_label_gaps.rs"]
+mod z3_mode_label_gaps;
+
+#[path = "group_cli/z3_mode_label_guard.rs"]
+mod z3_mode_label_guard;
+
+#[path = "group_cli/z3_mode_label_reach.rs"]
+mod z3_mode_label_reach;
+
+#[path = "group_cli/z3_mode_labels_and_session_start.rs"]
+mod z3_mode_labels_and_session_start;
+
+#[path = "group_cli/z3_mode_rlimit_count.rs"]
+mod z3_mode_rlimit_count;
+
+#[path = "group_cli/z3_mode_model_after_unknown.rs"]
+mod z3_mode_model_after_unknown;
+
+#[path = "group_cli/z3_mode_opb_stderr.rs"]
+mod z3_mode_opb_stderr;
+
+#[path = "group_cli/z3_mode_quiet_stderr.rs"]
+mod z3_mode_quiet_stderr;
+
+#[path = "group_cli/z3_mode_reset_assertions.rs"]
+mod z3_mode_reset_assertions;
+
+#[path = "group_cli/z3_mode_skipped_subterms.rs"]
+mod z3_mode_skipped_subterms;
+
+#[path = "group_cli/z3_mode_syntactic_gaps.rs"]
+mod z3_mode_syntactic_gaps;
+
+#[path = "group_cli/stdin_line_recovery.rs"]
+mod stdin_line_recovery;
+
+#[path = "group_cli/stdin_open_command.rs"]
+mod stdin_open_command;
+
+#[path = "group_cli/rejected_command_answers.rs"]
+mod rejected_command_answers;
+
+#[path = "group_cli/pattern_let_scope.rs"]
+mod pattern_let_scope;
+
+#[path = "group_cli/z3_oracle_refuses_ay.rs"]
+mod z3_oracle_refuses_ay;
+
 #[path = "group_cli/z3_audit_public_snapshot.rs"]
 mod z3_audit_public_snapshot;
+
+#[path = "group_cli/exact_division_admission.rs"]
+mod exact_division_admission;

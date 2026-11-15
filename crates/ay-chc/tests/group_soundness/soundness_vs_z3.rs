@@ -5,13 +5,17 @@
 #![allow(clippy::panic)]
 
 use ay_chc::{testing, ChcParser, PdrConfig, PortfolioConfig, PortfolioResult};
+use ay_test_support::z3::optional_z3;
 use ntest::timeout;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use wait_timeout::ChildExt;
+
+/// The z3 oracle this suite takes verdicts from (`ay_test_support::z3`).
+const Z3_SUITE: &str = "ay-chc soundness_vs_z3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawResult {
@@ -283,7 +287,9 @@ fn run_z3(path: &Path, timeout_secs: u64) -> Result<RawResult, String> {
 
     // Use both Z3's internal timeout and an OS-level kill timeout.
     // This avoids leaving orphaned `z3` subprocesses if Z3 wedges.
-    let mut child = Command::new("z3")
+    let mut child = optional_z3(Z3_SUITE)
+        .ok_or("no usable z3 oracle (see the AY-TEST-SKIP line)")?
+        .command()
         .arg(format!("-T:{timeout_secs}"))
         .arg(path)
         .stdout(Stdio::piped())
@@ -331,15 +337,6 @@ fn run_z3(path: &Path, timeout_secs: u64) -> Result<RawResult, String> {
     }
 
     Ok(RawResult::from_z3_output(&stdout, &stderr))
-}
-
-fn z3_available() -> bool {
-    Command::new("z3")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Run Z3 on an SMT2 string (writes to temp file)
@@ -394,8 +391,8 @@ fn chc_example_paths() -> Vec<PathBuf> {
 #[test]
 #[timeout(180_000)]
 fn test_chc_soundness_vs_z3_examples() {
-    if !z3_available() {
-        eprintln!("skipping Z3 comparison examples: z3 executable not found");
+    // Optional; `optional_z3` announces the skip (fails when REQUIRED).
+    if optional_z3(Z3_SUITE).is_none() {
         return;
     }
 

@@ -1555,3 +1555,61 @@ fn test_decay_all_scores_denormal_collapse_rebuilds_heap() {
         vsids.remove_from_heap(top);
     }
 }
+
+/// The domain-restricted VMTF walk returns the most recently bumped
+/// in-domain unassigned variable (queue order), skips assigned/eliminated
+/// variables, and returns None on an empty domain.
+#[test]
+fn test_vmtf_in_domain_pick_follows_queue_order() {
+    use crate::solver::lifecycle::VarState;
+    let mut vsids = VSIDS::new(6);
+    let vals = make_vals(&[None; 6]);
+    vsids.bump_queue(Variable(2), &vals);
+    vsids.bump_queue(Variable(4), &vals);
+    let domain = [false, true, true, false, true, false];
+    assert_eq!(
+        vsids.pick_vmtf_in_domain(&vals, &[], &domain),
+        Some(Variable(4)),
+        "most recently bumped in-domain var wins"
+    );
+    // Assigning the front var moves the pick to the next in-domain var.
+    let vals = make_vals(&[None, None, None, None, Some(true), None]);
+    assert_eq!(
+        vsids.pick_vmtf_in_domain(&vals, &[], &domain),
+        Some(Variable(2))
+    );
+    // An eliminated front var is skipped the same way.
+    let vals = make_vals(&[None; 6]);
+    let mut states = vec![VarState::Active; 6];
+    states[4] = VarState::Eliminated;
+    assert_eq!(
+        vsids.pick_vmtf_in_domain(&vals, &states, &domain),
+        Some(Variable(2))
+    );
+    assert_eq!(vsids.pick_vmtf_in_domain(&vals, &[], &[false; 6]), None);
+}
+
+/// `bump_score_and_queue` (the `bump_variable_activity` path) must leave the
+/// queue consistent — score bumped, variable at the queue front, and crucially
+/// `vmtf_deferred` unset (the old stable+queue bump composition set it
+/// permanently, disabling queue-order consumers until a rebuild).
+#[test]
+fn test_bump_score_and_queue_keeps_queue_live() {
+    let mut vsids = VSIDS::new(5);
+    let vals = make_vals(&[None; 5]);
+    let before = vsids.activity(Variable(2));
+    vsids.bump_score_and_queue(Variable(2), &vals);
+    assert!(
+        vsids.activity(Variable(2)) > before,
+        "EVSIDS score must increase"
+    );
+    assert!(
+        !vsids.vmtf_is_deferred(),
+        "score+queue bump must not defer the queue"
+    );
+    assert_eq!(
+        vsids.pick_vmtf_in_domain(&vals, &[], &[true; 5]),
+        Some(Variable(2)),
+        "bumped variable must be at the queue front"
+    );
+}

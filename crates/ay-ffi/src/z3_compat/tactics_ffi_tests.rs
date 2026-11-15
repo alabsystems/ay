@@ -1313,3 +1313,35 @@ fn test_tactic_registry_enumeration() {
         Z3_del_context(ctx);
     }
 }
+
+#[test]
+fn owned_tactic_controls_distinguish_foreign_handles_from_current_owner_stop() {
+    // SAFETY: both contexts and all handles remain live until cleanup. Foreign
+    // handles are passed only to AY's validating entry points, which must
+    // reject them before dereferencing; calls do not alias either context.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        let other = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        let body = Z3_tactic_skip(ctx);
+        let foreign = Z3_tactic_skip(other);
+        let params = Z3_mk_params(ctx);
+        assert!(Z3_tactic_using_params(ctx, foreign, params).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+        assert!(Z3_tactic_try_for(ctx, foreign, 1).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+        assert!(Z3_tactic_get_param_descrs(ctx, foreign).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+
+        Z3_interrupt(ctx);
+        assert!(Z3_tactic_using_params(ctx, body, params).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_EXCEPTION);
+        assert!(Z3_tactic_try_for(ctx, body, 1).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_EXCEPTION);
+        assert!(Z3_tactic_get_param_descrs(ctx, body).is_null());
+        assert_eq!(Z3_get_error_code(ctx), Z3_EXCEPTION);
+        Z3_del_context(ctx);
+        Z3_del_context(other);
+    }
+}

@@ -20,6 +20,8 @@ use num_bigint::BigInt;
 use num_rational::Rational64;
 use num_traits::{One, ToPrimitive};
 
+mod loop_budget;
+
 pub(super) fn new_assumption_sat_solver(num_vars: usize) -> ay_sat::Solver {
     let mut sat = ay_sat::Solver::new(num_vars);
     // Assumption-mode CHC solving is a one-shot SAT query with temporary guards.
@@ -49,6 +51,19 @@ impl SmtContext {
     ) -> SmtResult {
         use ay_core::{TheoryResult, TheorySolver, Tseitin};
         use ay_lia::LiaSolver;
+
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return SmtResult::Unknown;
+        }
+        // Census (`--chc-session-coverage`): nothing is built when it is off.
+        let _census = super::lane::census::coverage_enabled().then(|| {
+            let exprs: Vec<&ChcExpr> = background.iter().chain(assumptions).collect();
+            super::lane::CensusFrame::enter(
+                super::lane::SmtEntry::AssumptionConjuncts,
+                Some(self.census_lane()),
+                &exprs,
+            )
+        });
 
         // Track consecutive budget exceedances (#2472).
         if self.conversion_budget_exceeded {
@@ -125,6 +140,10 @@ impl SmtContext {
                 .unwrap_or(ChcExpr::Bool(true));
             return self.check_sat(&bg);
         }
+        // The thread/context deadlines and lane cancellation (`loop_budget`).
+        let Some(budget) = loop_budget::AssumptionLoopBudget::capture(self) else {
+            return SmtResult::Unknown;
+        };
 
         let debug = crate::debug_chc_smt_enabled();
 
@@ -380,6 +399,9 @@ impl SmtContext {
         });
 
         loop {
+            if budget.exhausted() {
+                return SmtResult::Unknown;
+            }
             if TermStore::global_memory_exceeded() {
                 if debug {
                     safe_eprintln!("[CHC-SMT] assumption-mode global term memory budget exceeded");
@@ -400,6 +422,9 @@ impl SmtContext {
                 return SmtResult::Unknown;
             }
             dt_iterations += 1;
+            if crate::run_meter::charge(crate::run_meter::Step::TheoryRound).is_err() {
+                return SmtResult::Unknown;
+            }
             if debug && dt_iterations.is_multiple_of(10_000) {
                 safe_eprintln!(
                     "[CHC-SMT] assumption-mode DPLL(T) iteration {}",
@@ -407,10 +432,16 @@ impl SmtContext {
                 );
             }
 
-            let verified_assume = sat.solve_with_assumptions(&sat_assumptions);
+            let verified_assume = crate::run_meter::sat_solve(&mut sat, |sat| {
+                sat.solve_with_assumptions_interruptible(&sat_assumptions, || {
+                    ay_core::resource::note_sat_stop_poll();
+                    budget.exhausted()
+                })
+            });
             match verified_assume.result() {
                 ay_sat::AssumeResult::Sat(model) => {
                     let mut lia = LiaSolver::new(&self.terms);
+                    budget.arm(&mut lia);
                     for (&var_idx, &term_id) in &var_to_term {
                         if !is_theory_atom(&self.terms, term_id) {
                             continue;

@@ -67,11 +67,31 @@ fn aliased_store_permutation_select_conflict_has_a_strict_native_proof() {
         strict_exec
             .execute_all(&strict_commands)
             .expect("strict fixture executes"),
-        vec!["unknown"]
+        vec!["unsat"]
     );
-    assert_eq!(
-        strict_exec.unknown_reason(),
-        Some(crate::UnknownReason::ProofTrusted)
+    let published = strict_exec
+        .execute_all(&parse("(get-proof)").expect("get-proof parses"))
+        .expect("get-proof executes")
+        .pop()
+        .expect("get-proof returns its document");
+    let scratch = std::env::temp_dir().join(".ubd");
+    std::fs::create_dir_all(&scratch).expect("test scratch creates");
+    let path = scratch.join(format!("ay-aliased-store-wire-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "type":"alethe_certificate", "version":"1.0",
+            "problem":strict_input, "proof":published
+        }))
+        .expect("certificate encodes"),
+    )
+    .expect("diagnostic certificate writes");
+    println!("independent aliased certificate: {}", path.display());
+    assert!(
+        !published.starts_with("(error")
+            && !published.contains(":rule hole")
+            && !published.contains(":rule trust"),
+        "strict publication must retain a complete source-bound document: {published}"
     );
 }
 

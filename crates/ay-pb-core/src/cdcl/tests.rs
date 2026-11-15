@@ -5,6 +5,32 @@ use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Result of a test or fixture builder: a failed precondition or an
+/// arithmetic overflow is reported as an error instead of a panic.
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// Error text for checked test arithmetic that overflows.
+const TEST_OVERFLOW: &str = "test arithmetic overflows";
+
+/// Largest cardinality run `ge_card_run` builds; the fixtures use at most a
+/// handful of literals.
+const MAX_CARD_RUN_LEN: u32 = 1 << 16;
+
+/// `1 - value` for a 0/1 assignment value, checked.
+fn complement(value: i128) -> TestResult<i128> {
+    Ok(1i128.checked_sub(value).ok_or(TEST_OVERFLOW)?)
+}
+
+/// `sum(coeff * value)` over `(coeff, value)` pairs with checked arithmetic.
+fn checked_weighted_sum(pairs: &[(i128, i128)]) -> TestResult<i128> {
+    let mut total: i128 = 0;
+    for &(coeff, value) in pairs {
+        let product = coeff.checked_mul(value).ok_or(TEST_OVERFLOW)?;
+        total = total.checked_add(product).ok_or(TEST_OVERFLOW)?;
+    }
+    Ok(total)
+}
+
 /// A shared buffer for capturing proof output in tests.
 #[derive(Clone)]
 struct SharedBuf(Rc<RefCell<Vec<u8>>>);
@@ -65,13 +91,15 @@ fn ge_constraint(terms: Vec<PbTerm>, rhs: i128) -> PbConstraint {
 /// `reduce_db` tests that need learned lemmas larger than
 /// `REDUCE_DB_PROTECT_SIZE` so they are eligible for deletion (the opt-in
 /// short-lemma tier protects size <= 2 lemmas).
-fn ge_card_run(first: u32, len: u32) -> PbConstraint {
-    ge_constraint(
-        (first..first + len)
-            .map(|v| linear_term(1, lit(v)))
-            .collect(),
+fn ge_card_run(first: u32, len: u32) -> TestResult<PbConstraint> {
+    if len > MAX_CARD_RUN_LEN {
+        return Err(format!("cardinality run of {len} literals exceeds {MAX_CARD_RUN_LEN}").into());
+    }
+    let end = first.checked_add(len).ok_or(TEST_OVERFLOW)?;
+    Ok(ge_constraint(
+        (first..end).map(|v| linear_term(1, lit(v))).collect(),
         1,
-    )
+    ))
 }
 
 fn eq_constraint(terms: Vec<PbTerm>, rhs: i128) -> PbConstraint {
@@ -202,7 +230,7 @@ fn root_probe_decoy_pigeonhole_3_2_instance() -> PbInstance {
             (0..num_pigeons)
                 .map(|pigeon| linear_term(1, not(var_for(pigeon, hole))))
                 .collect(),
-            i128::from(num_pigeons) - 1,
+            i128::from(num_pigeons - 1),
         ));
     }
 
@@ -345,7 +373,7 @@ fn test_add_constraint_runtime_preserves_sat_then_forces_unsat() {
 }
 
 #[test]
-fn test_runtime_constraint_over_fresh_var_still_solves_correctly() {
+fn test_runtime_constraint_over_fresh_var_still_solves_correctly() -> TestResult {
     // Solve, allocate a fresh var r, add a constraint tying r to x1 (r >= x1,
     // encoded as ~x1 + r >= 1), and verify the solver still produces a model
     // that satisfies BOTH the original constraint and the runtime one.
@@ -365,7 +393,7 @@ fn test_runtime_constraint_over_fresh_var_still_solves_correctly() {
     );
     match solver.solve_with_assumptions(&[]) {
         PbCdclAssumptionResult::Satisfiable(model) => {
-            let r_idx = (r - 1) as usize;
+            let r_idx = usize::try_from(r.checked_sub(1).ok_or("fresh variable ids are 1-based")?)?;
             assert!(model[0], "x1 must be true");
             assert!(
                 model[r_idx],
@@ -374,6 +402,7 @@ fn test_runtime_constraint_over_fresh_var_still_solves_correctly() {
         }
         other => panic!("expected SAT, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
@@ -654,9 +683,9 @@ fn test_root_propagation_unsat_precheck_polls_while_screening_wide_row() {
         constraints: vec![ge_constraint(terms, 1)],
         objective: None,
     };
-    let calls = std::cell::Cell::new(0);
+    let calls = std::cell::Cell::new(0i32);
     let mut stop_on_second_poll = || {
-        calls.set(calls.get() + 1);
+        calls.set(calls.get().saturating_add(1));
         calls.get() >= 2
     };
 
@@ -689,7 +718,7 @@ fn test_root_propagation_unsat_precheck_interrupts_during_wide_import_scan() {
     let polls = std::cell::Cell::new(0usize);
 
     let result = PbCdclSolver::root_propagation_unsat_precheck_interruptible(&instance, || {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 2
     });
@@ -2146,8 +2175,8 @@ fn test_new_unpreprocessed_interruptible_honors_immediate_stop() {
 
 #[test]
 fn test_new_unpreprocessed_interruptible_stops_during_constraint_load() {
-    let constraints = (0..600)
-        .map(|idx| ge_constraint(vec![linear_term(1, lit(idx + 1))], 1))
+    let constraints = (1..=600)
+        .map(|var| ge_constraint(vec![linear_term(1, lit(var))], 1))
         .collect::<Vec<_>>();
     let instance = PbInstance {
         num_vars: constraints.len() as u32,
@@ -2158,7 +2187,7 @@ fn test_new_unpreprocessed_interruptible_stops_during_constraint_load() {
     let polls = std::cell::Cell::new(0usize);
 
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 2
     });
@@ -2187,7 +2216,7 @@ fn test_new_unpreprocessed_interruptible_stops_during_wide_constraint_import() {
     let polls = std::cell::Cell::new(0usize);
 
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 3
     });
@@ -2252,7 +2281,7 @@ fn test_backtrack_to_interruptible_stops_during_rebuild_and_can_resume() {
     let assignment_polls = std::cell::Cell::new(0usize);
     assert_eq!(
         solver.decide_interruptible(-1, &mut || {
-            let next = assignment_polls.get() + 1;
+            let next = assignment_polls.get().saturating_add(1);
             assignment_polls.set(next);
             next >= 5
         }),
@@ -2263,7 +2292,7 @@ fn test_backtrack_to_interruptible_stops_during_rebuild_and_can_resume() {
 
     let polls = std::cell::Cell::new(0usize);
     let interrupted = solver.backtrack_to_interruptible(0, &mut || {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 3
     });
@@ -2366,16 +2395,18 @@ fn test_root_propagation_rechecks_source_constraint_for_cardinality_chain() {
 }
 
 #[test]
-fn test_solve_interruptible_stops_during_root_propagation_scan() {
-    let constraints: Vec<PbConstraint> = (0..600)
+fn test_solve_interruptible_stops_during_root_propagation_scan() -> TestResult {
+    let constraints: Vec<PbConstraint> = (0..600u32)
         .map(|idx| {
-            let base = idx * 2 + 1;
-            ge_constraint(
-                vec![linear_term(1, lit(base)), linear_term(1, lit(base + 1))],
+            let base = idx.checked_mul(2)?.checked_add(1)?;
+            let next = base.checked_add(1)?;
+            Some(ge_constraint(
+                vec![linear_term(1, lit(base)), linear_term(1, lit(next))],
                 1,
-            )
+            ))
         })
-        .collect();
+        .collect::<Option<_>>()
+        .ok_or(TEST_OVERFLOW)?;
     let instance = PbInstance {
         num_vars: 1200,
         num_constraints: constraints.len() as u32,
@@ -2386,7 +2417,7 @@ fn test_solve_interruptible_stops_during_root_propagation_scan() {
     let polls = std::cell::Cell::new(0usize);
     let mut solver = PbCdclSolver::new(&instance);
     let result = solver.solve_interruptible(|| {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 3
     });
@@ -2396,19 +2427,22 @@ fn test_solve_interruptible_stops_during_root_propagation_scan() {
         polls.get() >= 3,
         "interrupt should be observed during the full propagation scan"
     );
+    Ok(())
 }
 
 #[test]
-fn test_solve_interruptible_with_proof_stops_during_root_scan_fail_closed() {
-    let constraints: Vec<PbConstraint> = (0..600)
+fn test_solve_interruptible_with_proof_stops_during_root_scan_fail_closed() -> TestResult {
+    let constraints: Vec<PbConstraint> = (0..600u32)
         .map(|idx| {
-            let base = idx * 2 + 1;
-            ge_constraint(
-                vec![linear_term(1, lit(base)), linear_term(1, lit(base + 1))],
+            let base = idx.checked_mul(2)?.checked_add(1)?;
+            let next = base.checked_add(1)?;
+            Some(ge_constraint(
+                vec![linear_term(1, lit(base)), linear_term(1, lit(next))],
                 1,
-            )
+            ))
         })
-        .collect();
+        .collect::<Option<_>>()
+        .ok_or(TEST_OVERFLOW)?;
     let instance = PbInstance {
         num_vars: 1200,
         num_constraints: constraints.len() as u32,
@@ -2421,7 +2455,7 @@ fn test_solve_interruptible_with_proof_stops_during_root_scan_fail_closed() {
         .expect("proof writer creation must succeed");
     let polls = std::cell::Cell::new(0usize);
     let result = solver.solve_interruptible(|| {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 3
     });
@@ -2439,6 +2473,7 @@ fn test_solve_interruptible_with_proof_stops_during_root_scan_fail_closed() {
         !proof.contains("conclusion UNSAT"),
         "interrupted proof must not claim UNSAT: {proof}"
     );
+    Ok(())
 }
 
 #[test]
@@ -2453,7 +2488,7 @@ fn test_decide_interruptible_rolls_back_uncommitted_assignment_state() {
     let polls = std::cell::Cell::new(0usize);
     let mut solver = PbCdclSolver::new(&instance);
     let result = solver.decide_interruptible(1, &mut || {
-        let next = polls.get() + 1;
+        let next = polls.get().saturating_add(1);
         polls.set(next);
         next >= 3
     });
@@ -2697,7 +2732,7 @@ fn test_solve_weighted_pb_unsat() {
 }
 
 #[test]
-fn test_solve_weighted_pb_sat() {
+fn test_solve_weighted_pb_sat() -> TestResult {
     // Weighted SAT instance that requires conflict analysis:
     //   3*x1 + 2*x2 + x3 >= 3
     //   2*~x1 + 3*x2 + x3 >= 3
@@ -2747,16 +2782,18 @@ fn test_solve_weighted_pb_sat() {
                 i128::from(model[1]),
                 i128::from(model[2]),
             ];
-            let neg = |v: i128| 1 - v;
-            let c1 = 3 * vals[1] + 2 * vals[2] + vals[3];
-            let c2 = 2 * neg(vals[1]) + 3 * vals[2] + vals[3];
-            let c3 = vals[1] + vals[2] + neg(vals[3]);
+            let c1 = checked_weighted_sum(&[(3, vals[1]), (2, vals[2]), (1, vals[3])])?;
+            let c2 =
+                checked_weighted_sum(&[(2, complement(vals[1])?), (3, vals[2]), (1, vals[3])])?;
+            let c3 =
+                checked_weighted_sum(&[(1, vals[1]), (1, vals[2]), (1, complement(vals[3])?)])?;
             assert!(c1 >= 3, "constraint 1 violated: {c1} < 3");
             assert!(c2 >= 3, "constraint 2 violated: {c2} < 3");
             assert!(c3 >= 1, "constraint 3 violated: {c3} < 1");
         }
         other => panic!("expected SAT, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
@@ -2835,9 +2872,9 @@ fn test_learned_activity_reducedb_default_off() {
 
     // Size-2 lemmas with weak LBD: with the opt-in OFF they are NOT size
     // protected, so the worst half is deleted (legacy behavior).
-    for i in 1..=4 {
+    for (i, next) in (1..=4).zip(2..=5) {
         solver.add_learned_constraint(ge_constraint(
-            vec![linear_term(1, lit(i)), linear_term(1, lit(i + 1))],
+            vec![linear_term(1, lit(i)), linear_term(1, lit(next))],
             1,
         ));
     }
@@ -2853,7 +2890,7 @@ fn test_learned_activity_reducedb_default_off() {
 }
 
 #[test]
-fn test_reduce_db_protects_short_lemmas_when_enabled() {
+fn test_reduce_db_protects_short_lemmas_when_enabled() -> TestResult {
     // Opt-in two-tier reduceDB must never delete a learned lemma of size
     // <= REDUCE_DB_PROTECT_SIZE, regardless of how poor its LBD is.
     let instance = PbInstance {
@@ -2870,10 +2907,10 @@ fn test_reduce_db_protects_short_lemmas_when_enabled() {
     solver.set_learned_activity_reducedb_enabled(true);
 
     // Two size-2 lemmas (protected) and two size-3 lemmas (deletable).
-    solver.add_learned_constraint(ge_card_run(1, 2));
-    solver.add_learned_constraint(ge_card_run(3, 2));
-    solver.add_learned_constraint(ge_card_run(5, 3));
-    solver.add_learned_constraint(ge_card_run(8, 3));
+    solver.add_learned_constraint(ge_card_run(1, 2)?);
+    solver.add_learned_constraint(ge_card_run(3, 2)?);
+    solver.add_learned_constraint(ge_card_run(5, 3)?);
+    solver.add_learned_constraint(ge_card_run(8, 3)?);
 
     // All weak LBD so only the size protection can save the binaries.
     for slot in solver.learned_lbd.iter_mut() {
@@ -2896,10 +2933,11 @@ fn test_reduce_db_protects_short_lemmas_when_enabled() {
         !solver.learned_active[2] || !solver.learned_active[3],
         "exactly one size-3 lemma should be deleted"
     );
+    Ok(())
 }
 
 #[test]
-fn test_reduce_db_breaks_lbd_ties_by_activity_when_enabled() {
+fn test_reduce_db_breaks_lbd_ties_by_activity_when_enabled() -> TestResult {
     // Among equal-LBD deletable lemmas, the one with the LOWEST activity is
     // the worst and must be deleted first.
     let instance = PbInstance {
@@ -2916,7 +2954,7 @@ fn test_reduce_db_breaks_lbd_ties_by_activity_when_enabled() {
     solver.set_learned_activity_reducedb_enabled(true);
 
     for i in 0..4 {
-        solver.add_learned_constraint(ge_card_run(1 + i * 3, 3));
+        solver.add_learned_constraint(ge_card_run(1 + i * 3, 3)?);
     }
 
     // Equal (weak) LBD for all four lemmas; only activity breaks the tie.
@@ -2939,6 +2977,7 @@ fn test_reduce_db_breaks_lbd_ties_by_activity_when_enabled() {
     );
     assert!(solver.learned_active[0], "high-activity lemma survives");
     assert!(solver.learned_active[2], "high-activity lemma survives");
+    Ok(())
 }
 
 #[test]
@@ -3355,7 +3394,7 @@ fn test_vsids_heap_update_percolates_correctly() {
 }
 
 #[test]
-fn test_phase_saving_remembers_polarity() {
+fn test_phase_saving_remembers_polarity() -> TestResult {
     let instance = PbInstance {
         num_vars: 3,
         num_constraints: 3,
@@ -3375,14 +3414,31 @@ fn test_phase_saving_remembers_polarity() {
             let x1 = i128::from(model[0]);
             let x2 = i128::from(model[1]);
             let x3 = i128::from(model[2]);
-            assert!(x1 + x2 >= 1, "constraint 1 violated");
-            assert!((1 - x1) + (1 - x2) >= 1, "constraint 2 violated");
-            assert!(x1 + x3 >= 1, "constraint 3 violated");
+            assert!(
+                x1.checked_add(x2).ok_or(TEST_OVERFLOW)? >= 1,
+                "constraint 1 violated"
+            );
+            assert!(
+                complement(x1)?
+                    .checked_add(complement(x2)?)
+                    .ok_or(TEST_OVERFLOW)?
+                    >= 1,
+                "constraint 2 violated"
+            );
+            assert!(
+                x1.checked_add(x3).ok_or(TEST_OVERFLOW)? >= 1,
+                "constraint 3 violated"
+            );
         }
         other => panic!("expected SAT, got {other:?}"),
     }
 
-    let any_phase_saved = solver.saved_phase[1..=3].iter().any(|&p| p);
+    let any_phase_saved = solver
+        .saved_phase
+        .get(1..=3)
+        .ok_or("saved_phase must cover variables 1..=3")?
+        .iter()
+        .any(|&p| p);
     assert_eq!(solver.saved_phase.len(), 4);
     let model = match solver.solve() {
         PbCdclResult::Satisfiable(m) => m,
@@ -3390,6 +3446,7 @@ fn test_phase_saving_remembers_polarity() {
     };
     let _ = any_phase_saved;
     assert_eq!(model.len(), 3);
+    Ok(())
 }
 
 // --- Optimization tests ---
@@ -3401,41 +3458,49 @@ fn objective(terms: Vec<PbTerm>) -> PbObjective {
 /// Brute-force the true integer optimum (minimum objective) over all 0/1
 /// assignments satisfying every `>=` / `=` constraint. Only used by the LP-bound
 /// soundness tests on tiny instances. Returns `None` if infeasible.
-fn brute_force_optimum(instance: &PbInstance, objective: &PbObjective) -> Option<i128> {
+fn brute_force_optimum(instance: &PbInstance, objective: &PbObjective) -> TestResult<Option<i128>> {
     let n = instance.num_vars as usize;
     assert!(n <= 20, "brute force only for tiny instances");
     let mut best: Option<i128> = None;
     for mask in 0u32..(1u32 << n) {
-        let model: Vec<bool> = (0..n).map(|i| (mask >> i) & 1 == 1).collect();
-        let feasible = instance.constraints.iter().all(|c| {
-            let lhs: i128 = c
-                .terms
-                .iter()
-                .map(|t| {
-                    let [l] = t.lits.as_slice() else {
-                        return 0;
-                    };
-                    let val = model[(l.var - 1) as usize];
-                    let lit_val = if l.negated { !val } else { val };
-                    if lit_val {
-                        t.coeff
-                    } else {
-                        0
-                    }
-                })
-                .sum();
-            match c.rel {
+        let model: Vec<bool> = (0..n)
+            .map(|i| Some(mask.checked_shr(u32::try_from(i).ok()?)? & 1 == 1))
+            .collect::<Option<_>>()
+            .ok_or("brute-force bit index exceeds the mask width")?;
+        let mut feasible = true;
+        for c in &instance.constraints {
+            let mut lhs: i128 = 0;
+            for t in &c.terms {
+                // A non-linear term contributes 0, as before.
+                let [l] = t.lits.as_slice() else {
+                    continue;
+                };
+                let index =
+                    usize::try_from(l.var.checked_sub(1).ok_or("variable ids are 1-based")?)?;
+                let val = *model
+                    .get(index)
+                    .ok_or("constraint variable outside the instance")?;
+                let lit_val = if l.negated { !val } else { val };
+                if lit_val {
+                    lhs = lhs.checked_add(t.coeff).ok_or(TEST_OVERFLOW)?;
+                }
+            }
+            let satisfied = match c.rel {
                 PbRel::Ge => lhs >= c.rhs,
                 PbRel::Eq => lhs == c.rhs,
+            };
+            if !satisfied {
+                feasible = false;
+                break;
             }
-        });
+        }
         if !feasible {
             continue;
         }
         let value = eval_objective(objective, &model);
         best = Some(best.map_or(value, |b| b.min(value)));
     }
-    best
+    Ok(best)
 }
 
 /// A small pseudo-random sequence (xorshift) so the soundness test sweeps many
@@ -3456,11 +3521,13 @@ fn xorshift_next(state: &mut u64) -> u64 {
 /// We exercise `lp_objective_lower_bound_at_root` directly so the assertion holds
 /// regardless of whether the opt-in loop fold is enabled.
 #[test]
-fn test_at_root_lp_bound_never_exceeds_true_optimum() {
+fn test_at_root_lp_bound_never_exceeds_true_optimum() -> TestResult {
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut checked = 0usize;
     for _ in 0..400 {
-        let num_vars = 3 + (xorshift_next(&mut rng) % 4) as u32; // 3..=6
+        let num_vars = u32::try_from(xorshift_next(&mut rng) % 4)?
+            .checked_add(3)
+            .ok_or(TEST_OVERFLOW)?; // 3..=6
         let num_constraints = 1 + (xorshift_next(&mut rng) % 3) as usize;
         let mut constraints = Vec::new();
         for _ in 0..num_constraints {
@@ -3476,7 +3543,8 @@ fn test_at_root_lp_bound_never_exceeds_true_optimum() {
                 terms.push(linear_term(1, lit(1)));
             }
             let total: i128 = terms.iter().map(|t| t.coeff).sum();
-            let rhs = (xorshift_next(&mut rng) % ((total + 2) as u64)) as i128;
+            let modulus = total.checked_add(2).ok_or(TEST_OVERFLOW)?;
+            let rhs = (xorshift_next(&mut rng) % (modulus as u64)) as i128;
             constraints.push(ge_constraint(terms, rhs));
         }
         let obj = objective(
@@ -3490,7 +3558,7 @@ fn test_at_root_lp_bound_never_exceeds_true_optimum() {
             constraints,
             objective: Some(obj.clone()),
         };
-        let Some(true_opt) = brute_force_optimum(&instance, &obj) else {
+        let Some(true_opt) = brute_force_optimum(&instance, &obj)? else {
             continue; // infeasible: skip.
         };
 
@@ -3511,6 +3579,7 @@ fn test_at_root_lp_bound_never_exceeds_true_optimum() {
         checked > 0,
         "expected the LP bound to fire on at least one random instance"
     );
+    Ok(())
 }
 
 /// The at-root LP relaxation is *tight* (= the integer optimum) on a small
@@ -3525,7 +3594,7 @@ fn test_at_root_lp_bound_never_exceeds_true_optimum() {
 /// independent set, value 7, i.e. objective `min -(5 x1 + 4 x2 + 3 x3 + 2 x4)`
 /// optimum = -7.
 #[test]
-fn test_at_root_lp_bound_tight_on_weighted_independent_set() {
+fn test_at_root_lp_bound_tight_on_weighted_independent_set() -> TestResult {
     let obj = objective(vec![
         linear_term(-5, lit(1)),
         linear_term(-4, lit(2)),
@@ -3540,7 +3609,7 @@ fn test_at_root_lp_bound_tight_on_weighted_independent_set() {
         constraints: vec![amo(1, 2), amo(1, 3), amo(2, 3), amo(2, 4)],
         objective: Some(obj.clone()),
     };
-    let true_opt = brute_force_optimum(&instance, &obj).expect("feasible");
+    let true_opt = brute_force_optimum(&instance, &obj)?.ok_or("fixture must be feasible")?;
     assert_eq!(
         true_opt, -7,
         "fixture optimum should be -7 (vertices 1 and 4)"
@@ -3558,6 +3627,7 @@ fn test_at_root_lp_bound_tight_on_weighted_independent_set() {
         lp_lb, true_opt,
         "LP relaxation should be tight (= integer optimum) on this independent-set fixture"
     );
+    Ok(())
 }
 
 /// D3 regression: an interrupted notification only marks `needs_rebuild` —
@@ -3597,7 +3667,7 @@ fn test_interrupt_dirty_state_forces_full_scan_on_next_drive() {
         // Decide x1 = false with an interrupt at the notification entry poll.
         let mut calls = 0u32;
         let result = solver.decide_interruptible(-1, &mut || {
-            calls += 1;
+            calls = calls.saturating_add(1);
             calls >= stop_at
         });
         // Only the "assignment landed, notification abandoned" interleaving
@@ -3637,7 +3707,7 @@ fn test_interrupt_dirty_state_forces_full_scan_on_next_drive() {
 /// high). We build an instance that forces a fixing, then assert the at-root LP
 /// bound is a sound lower bound.
 #[test]
-fn test_at_root_lp_bound_residualized_for_fixed_literals_is_sound() {
+fn test_at_root_lp_bound_residualized_for_fixed_literals_is_sound() -> TestResult {
     // x1 is forced true by a unit constraint; objective pays for x1..x4.
     let obj = objective(vec![
         linear_term(5, lit(1)),
@@ -3655,7 +3725,7 @@ fn test_at_root_lp_bound_residualized_for_fixed_literals_is_sound() {
         ],
         objective: Some(obj.clone()),
     };
-    let true_opt = brute_force_optimum(&instance, &obj).expect("feasible");
+    let true_opt = brute_force_optimum(&instance, &obj)?.ok_or("fixture must be feasible")?;
 
     let mut solver = PbCdclSolver::new(&instance);
     let result = solver.solve_optimize(&obj, None);
@@ -3675,6 +3745,7 @@ fn test_at_root_lp_bound_residualized_for_fixed_literals_is_sound() {
         }
         other => panic!("expected a feasible/optimal result, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
@@ -4062,7 +4133,7 @@ fn test_optimize_interruptible_negative_range_underflow_returns_unknown_before_p
     let mut solver = PbCdclSolver::new(&instance);
     let polls = std::cell::Cell::new(0usize);
     let result = solver.solve_optimize_interruptible(&obj, None, || {
-        polls.set(polls.get() + 1);
+        polls.set(polls.get().saturating_add(1));
         true
     });
 
@@ -4989,7 +5060,7 @@ fn test_root_probe_interrupt_undo_preserves_root_trail() {
     let mut checks = 0usize;
 
     let outcome = solver.run_single_root_probe_interruptible(4, &mut || {
-        checks += 1;
+        checks = checks.saturating_add(1);
         checks >= 2
     });
 
@@ -5048,7 +5119,7 @@ fn test_root_probe_temporary_assignments_do_not_poison_saved_phase() {
 
     assert_eq!(
         interrupted.run_single_root_probe_interruptible(-1, &mut || {
-            polls += 1;
+            polls = polls.saturating_add(1);
             polls >= 2
         }),
         RootProbeOutcome::Interrupted
@@ -5375,7 +5446,8 @@ fn test_iterative_bound_replacement_keeps_one_active_range_after_multiple_bounds
         ranges.push((start, end));
     }
 
-    let &(last_start, last_end) = ranges.last().expect("tightening added bounds");
+    let (&(last_start, last_end), stale_ranges) =
+        ranges.split_last().expect("tightening added bounds");
     assert_eq!(
         solver.active_optimization_bound_range,
         Some((last_start, last_end)),
@@ -5391,7 +5463,7 @@ fn test_iterative_bound_replacement_keeps_one_active_range_after_multiple_bounds
         active_ranges, 1,
         "exactly one optimization-bound range should remain active"
     );
-    for &(start, end) in &ranges[..ranges.len() - 1] {
+    for &(start, end) in stale_ranges {
         for cid in start..end {
             assert!(
                 !solver.propagator.is_constraint_active(cid),
@@ -5741,7 +5813,7 @@ fn test_proof_logging_interrupted_during_reduce_db_has_no_terminal_conclusion() 
 }
 
 #[test]
-fn test_proof_logging_sat_does_not_claim_contradiction() {
+fn test_proof_logging_sat_does_not_claim_contradiction() -> TestResult {
     // x1 + x2 >= 1 (trivially SAT)
     let instance = PbInstance {
         num_vars: 2,
@@ -5770,13 +5842,15 @@ fn test_proof_logging_sat_does_not_claim_contradiction() {
         .take(instance.num_vars as usize)
         .enumerate()
         .map(|(index, value)| {
-            if *value {
-                format!("x{}", index + 1)
+            let var = index.checked_add(1)?;
+            Some(if *value {
+                format!("x{var}")
             } else {
-                format!("~x{}", index + 1)
-            }
+                format!("~x{var}")
+            })
         })
-        .collect::<Vec<_>>()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(TEST_OVERFLOW)?
         .join(" ");
     let expected_conclusion = format!("conclusion SAT : {expected_assignment};");
 
@@ -5807,10 +5881,11 @@ fn test_proof_logging_sat_does_not_claim_contradiction() {
         proof_output.lines().last() == Some("end pseudo-Boolean proof;"),
         "SAT proof must end with the VeriPB terminator: {proof_output}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_proof_logging_weighted_unsat_emits_multiply_steps() {
+fn test_proof_logging_weighted_unsat_emits_multiply_steps() -> TestResult {
     // Weighted UNSAT instance with 4 variables to avoid preprocessing
     // solving it trivially. The constraints force conflicts that require
     // weighted cutting-planes resolution with LCM-based multiplication.
@@ -5887,13 +5962,15 @@ fn test_proof_logging_weighted_unsat_emits_multiply_steps() {
                 .take(instance.num_vars as usize)
                 .enumerate()
                 .map(|(index, value)| {
-                    if *value {
-                        format!("x{}", index + 1)
+                    let var = index.checked_add(1)?;
+                    Some(if *value {
+                        format!("x{var}")
                     } else {
-                        format!("~x{}", index + 1)
-                    }
+                        format!("~x{var}")
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(TEST_OVERFLOW)?
                 .join(" ");
             let expected_conclusion = format!("conclusion SAT : {expected_assignment};");
 
@@ -5920,6 +5997,7 @@ fn test_proof_logging_weighted_unsat_emits_multiply_steps() {
         }
         other => panic!("unexpected result: {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
@@ -6062,7 +6140,7 @@ fn test_proof_logging_constraint_ids_track_learned_constraints() {
 // --- Initial activity warm start tests ---
 
 #[test]
-fn test_initial_activity_from_coefficients() {
+fn test_initial_activity_from_coefficients() -> TestResult {
     // 3*x1 + 2*x2 + 1*x3 >= 4
     // After preprocessing, x1 should have highest initial activity
     // because its coefficient is largest.
@@ -6083,7 +6161,12 @@ fn test_initial_activity_from_coefficients() {
     let solver = PbCdclSolver::new(&instance);
 
     // Activities should be non-zero (warm start from coefficients).
-    let total_activity: f64 = solver.activity[1..=3].iter().sum();
+    let total_activity: f64 = solver
+        .activity
+        .get(1..=3)
+        .ok_or("activity must cover variables 1..=3")?
+        .iter()
+        .sum();
     assert!(
         total_activity > 0.0,
         "initial activities should be non-zero after coefficient warm start"
@@ -6102,6 +6185,7 @@ fn test_initial_activity_from_coefficients() {
             solver.activity[var]
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -6181,7 +6265,7 @@ fn test_strengthening_preserves_correctness_on_unsat() {
 }
 
 #[test]
-fn test_strengthening_preserves_correctness_on_sat() {
+fn test_strengthening_preserves_correctness_on_sat() -> TestResult {
     // SAT instance where strengthening should not break satisfying assignment
     // discovery.
     // 3*x1 + 2*x2 + x3 >= 3
@@ -6230,13 +6314,24 @@ fn test_strengthening_preserves_correctness_on_sat() {
                 i128::from(model[1]),
                 i128::from(model[2]),
             ];
-            let neg = |v: i128| 1 - v;
-            assert!(3 * vals[1] + 2 * vals[2] + vals[3] >= 3, "c1 violated");
-            assert!(2 * neg(vals[1]) + 3 * vals[2] + vals[3] >= 3, "c2 violated");
-            assert!(vals[1] + vals[2] + neg(vals[3]) >= 1, "c3 violated");
+            assert!(
+                checked_weighted_sum(&[(3, vals[1]), (2, vals[2]), (1, vals[3])])? >= 3,
+                "c1 violated"
+            );
+            assert!(
+                checked_weighted_sum(&[(2, complement(vals[1])?), (3, vals[2]), (1, vals[3])])?
+                    >= 3,
+                "c2 violated"
+            );
+            assert!(
+                checked_weighted_sum(&[(1, vals[1]), (1, vals[2]), (1, complement(vals[3])?)])?
+                    >= 1,
+                "c3 violated"
+            );
         }
         other => panic!("expected SAT, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
@@ -6530,10 +6625,12 @@ fn test_round_to_one_weighted_pigeonhole_4_3() {
     // fallback. Count BOTH families so the exercise still terminates as soon
     // as any round-to-one resolution step has run.
     let result = solver.solve_with_stop(|solver| {
-        solver.stats.round_to_one_count
-            + solver.stats.round_to_one_fallback_count
-            + solver.stats.proven_round_to_one_count
-            + solver.stats.proven_round_to_one_fallback_count
+        solver
+            .stats
+            .round_to_one_count
+            .saturating_add(solver.stats.round_to_one_fallback_count)
+            .saturating_add(solver.stats.proven_round_to_one_count)
+            .saturating_add(solver.stats.proven_round_to_one_fallback_count)
             >= 1
     });
 
@@ -6560,29 +6657,43 @@ fn test_round_to_one_weighted_pigeonhole_4_3() {
 /// `i128::MAX/3`, chosen so cutting-planes resolution overflows i128 in BOTH
 /// the proven and heuristic round-to-one paths, forcing the
 /// reduce-to-cardinality overflow fallback.
-fn overflow_market_split_instance(variant: i128) -> PbInstance {
+fn overflow_market_split_instance(variant: i128) -> TestResult<PbInstance> {
     let big = i128::MAX / 3;
+    // `big - offset - variant * factor`, checked.
+    let weight = |offset: i128, factor: i128| {
+        big.checked_sub(offset)?
+            .checked_sub(variant.checked_mul(factor)?)
+    };
     let w = [
-        big - variant,
-        big - 10 - variant * 3,
-        big - 100 - variant * 7,
-        big - 1000 - variant * 11,
-        big - 7 - variant * 13,
+        big.checked_sub(variant).ok_or(TEST_OVERFLOW)?,
+        weight(10, 3).ok_or(TEST_OVERFLOW)?,
+        weight(100, 7).ok_or(TEST_OVERFLOW)?,
+        weight(1000, 11).ok_or(TEST_OVERFLOW)?,
+        weight(7, 13).ok_or(TEST_OVERFLOW)?,
     ];
     // Two terms: s_lo <= 2*big <= i128::MAX, so degree construction is safe.
-    let s_lo = w[0] + w[2];
-    let pos: Vec<PbTerm> = (0..5)
-        .map(|i| linear_term(w[i], lit(i as u32 + 1)))
+    let s_lo = w[0].checked_add(w[2]).ok_or(TEST_OVERFLOW)?;
+    let pos: Vec<PbTerm> = w
+        .iter()
+        .zip(1u32..=5)
+        .map(|(&coeff, var)| linear_term(coeff, lit(var)))
         .collect();
-    let neg: Vec<PbTerm> = (0..5)
-        .map(|i| linear_term(-w[i], lit(i as u32 + 1)))
-        .collect();
-    PbInstance {
+    let neg: Vec<PbTerm> = w
+        .iter()
+        .zip(1u32..=5)
+        .map(|(&coeff, var)| Some(linear_term(coeff.checked_neg()?, lit(var))))
+        .collect::<Option<_>>()
+        .ok_or(TEST_OVERFLOW)?;
+    let neg_rhs = s_lo
+        .checked_sub(1)
+        .and_then(i128::checked_neg)
+        .ok_or(TEST_OVERFLOW)?;
+    Ok(PbInstance {
         num_vars: 5,
         num_constraints: 2,
-        constraints: vec![ge_constraint(pos, s_lo), ge_constraint(neg, -(s_lo - 1))],
+        constraints: vec![ge_constraint(pos, s_lo), ge_constraint(neg, neg_rhs)],
         objective: None,
-    }
+    })
 }
 
 /// Builds a weighted pigeonhole instance: `p` pigeons, `p-1` holes, with
@@ -6657,14 +6768,14 @@ fn test_reduce_to_cardinality_overflow_fallback_fires() {
 }
 
 #[test]
-fn test_reduce_to_cardinality_overflow_preserves_correctness() {
+fn test_reduce_to_cardinality_overflow_preserves_correctness() -> TestResult {
     // The market-split instances are trivially UNSAT: the two constraints
     // demand `s_lo <= sum w_i x_i <= s_lo - 1`, impossible for ANY
     // assignment. The overflow fallback only ever adds IMPLIED constraints,
     // so it can NEVER turn this UNSAT instance SAT. Under a bounded conflict
     // budget the solver must report UNSAT or Unknown — never SAT.
     for variant in 0..3 {
-        let instance = overflow_market_split_instance(variant);
+        let instance = overflow_market_split_instance(variant)?;
         let mut solver = solver_with_root_probe_disabled(&instance);
         let result = solver.solve_with_stop(|s| s.stats.conflicts >= 3000);
         assert!(
@@ -6688,10 +6799,11 @@ fn test_reduce_to_cardinality_overflow_preserves_correctness() {
                  reported SAT, got {result:?}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn test_round_to_one_preserves_sat_correctness() {
+fn test_round_to_one_preserves_sat_correctness() -> TestResult {
     // SAT instance with weighted constraints to verify that
     // round-to-one conflict analysis still produces correct models.
     //   4*x1 + 3*x2 + 2*x3 + 1*x4 >= 5
@@ -6739,17 +6851,18 @@ fn test_round_to_one_preserves_sat_correctness() {
     match result {
         PbCdclResult::Satisfiable(model) => {
             // Verify all constraints manually.
-            let v = |i: usize| if model[i] { 1i64 } else { 0 };
-            let nv = |i: usize| if model[i] { 0i64 } else { 1 };
-            let c1 = 4 * v(0) + 3 * v(1) + 2 * v(2) + v(3);
-            let c2 = 3 * nv(0) + 2 * v(1) + 4 * v(2) + v(3);
-            let c3 = v(0) + nv(1) + v(2) + v(3);
+            let v = |i: usize| if model[i] { 1i128 } else { 0 };
+            let nv = |i: usize| if model[i] { 0i128 } else { 1 };
+            let c1 = checked_weighted_sum(&[(4, v(0)), (3, v(1)), (2, v(2)), (1, v(3))])?;
+            let c2 = checked_weighted_sum(&[(3, nv(0)), (2, v(1)), (4, v(2)), (1, v(3))])?;
+            let c3 = checked_weighted_sum(&[(1, v(0)), (1, nv(1)), (1, v(2)), (1, v(3))])?;
             assert!(c1 >= 5, "constraint 1 violated: {c1} < 5");
             assert!(c2 >= 4, "constraint 2 violated: {c2} < 4");
             assert!(c3 >= 2, "constraint 3 violated: {c3} < 2");
         }
         other => panic!("expected SAT, got {other:?}"),
     }
+    Ok(())
 }
 
 /// Regression for the counting-propagation keystone: the bnn instance whose
@@ -6801,19 +6914,31 @@ fn bnn_back_image_73_is_not_wrongly_unsat_with_counting() {
 /// EVERY feasible `x`. It must NEVER overshoot — a wrong-high `F` would let a
 /// suboptimal incumbent be upgraded to a false OPTIMUM (=> category DQ). Five
 /// concrete cases (covering, adversarial 4-cycle vertex cover, weighted-DP,
-/// negated-literal, empty-objective) enumerate all feasible assignments. The
-/// Kani harness `kani_covering_bound::*` proves it for ALL small bounded
-/// instances (proofs/2026-06-16-pb-trust-soundness-harnesses.md).
+/// negated-literal, empty-objective) enumerate all feasible assignments;
+/// `portfolio::tests::gate_soundness_all_small_two_variable_covers` sweeps every
+/// small two-variable covering instance.
 #[test]
-fn test_objective_lower_bound_never_overshoots_concrete() {
-    fn assert_valid_lb(constraints: &[PbConstraint], objective: &PbObjective, num_vars: u32) {
+fn test_objective_lower_bound_never_overshoots_concrete() -> TestResult {
+    fn assert_valid_lb(
+        constraints: &[PbConstraint],
+        objective: &PbObjective,
+        num_vars: u32,
+    ) -> TestResult {
         let Some(f) = objective_lower_bound_from_constraints(constraints, objective, &|| false)
         else {
-            return;
+            return Ok(());
         };
+        // A `u32` mask enumerates at most 31 variables.
+        if num_vars >= u32::BITS {
+            return Err(format!("cannot enumerate {num_vars} variables in a u32 mask").into());
+        }
+        let limit = 1u32.checked_shl(num_vars).ok_or(TEST_OVERFLOW)?;
         let mut any_feasible = false;
-        for mask in 0u32..(1u32 << num_vars) {
-            let x: Vec<bool> = (0..num_vars).map(|i| mask & (1 << i) != 0).collect();
+        for mask in 0u32..limit {
+            let x: Vec<bool> = (0..num_vars)
+                .map(|i| Some(mask & 1u32.checked_shl(i)? != 0))
+                .collect::<Option<_>>()
+                .ok_or(TEST_OVERFLOW)?;
             if crate::eval::verify_all_constraints(constraints, &x) {
                 any_feasible = true;
                 let obj = eval_objective(objective, &x);
@@ -6824,6 +6949,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
             }
         }
         assert!(any_feasible, "emitted bound {f} but no feasible assignment");
+        Ok(())
     }
 
     // Case 1: direct covering row. min x1 + x2 s.t. x1 + x2 >= 1 (optimum 1).
@@ -6834,7 +6960,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         vec![linear_term(1, lit(1)), linear_term(1, lit(2))],
         1,
     )];
-    assert_valid_lb(&cs, &obj, 2);
+    assert_valid_lb(&cs, &obj, 2)?;
 
     // Case 2 (adversarial, surrogate-aggregation): 4-cycle vertex cover,
     // optimum 2, surrogate LP-dual bound exactly 2 (tight). A claim of 3 would
@@ -6853,7 +6979,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         ge_constraint(vec![linear_term(1, lit(3)), linear_term(1, lit(4))], 1),
         ge_constraint(vec![linear_term(1, lit(4)), linear_term(1, lit(1))], 1),
     ];
-    assert_valid_lb(&cs2, &obj2, 4);
+    assert_valid_lb(&cs2, &obj2, 4)?;
 
     // Case 3 (weighted/knapsack DP): min 2x1+3x2 s.t. 2x1+3x2 >= 3 (optimum 3).
     let obj3 = PbObjective {
@@ -6863,7 +6989,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         vec![linear_term(2, lit(1)), linear_term(3, lit(2))],
         3,
     )];
-    assert_valid_lb(&cs3, &obj3, 2);
+    assert_valid_lb(&cs3, &obj3, 2)?;
 
     // Case 4 (negated literal): min x1 s.t. x1 + ~x2 >= 1 (optimum 0 via x2=0).
     let obj4 = PbObjective {
@@ -6873,7 +6999,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         vec![linear_term(1, lit(1)), linear_term(1, not(2))],
         1,
     )];
-    assert_valid_lb(&cs4, &obj4, 2);
+    assert_valid_lb(&cs4, &obj4, 2)?;
 
     // Case 5 (empty objective short-circuit): Some(0), a valid LB.
     let obj5 = PbObjective { terms: vec![] };
@@ -6882,7 +7008,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         objective_lower_bound_from_constraints(&cs5, &obj5, &|| false),
         Some(0)
     );
-    assert_valid_lb(&cs5, &obj5, 1);
+    assert_valid_lb(&cs5, &obj5, 1)?;
 
     // Case 6 (equality-aggregation, mixed-sign constant 0): min x1 - x2 with
     // x1 - x2 = 0 (i.e. x1 == x2). The objective equals 0 on EVERY feasible
@@ -6904,7 +7030,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         objective_lower_bound_from_constraints(&cs6, &obj6, &|| false),
         Some(0)
     );
-    assert_valid_lb(&cs6, &obj6, 2);
+    assert_valid_lb(&cs6, &obj6, 2)?;
 
     // Case 7 (non-constant difference must DECLINE): min x1 - x2 with the
     // unrelated equality x3 = 1. The objective is genuinely variable on the
@@ -6919,7 +7045,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         equality_aggregation_objective_constant(&cs7, &obj7, &|| false),
         None
     );
-    assert_valid_lb(&cs7, &obj7, 3);
+    assert_valid_lb(&cs7, &obj7, 3)?;
 
     // Case 8 (negated-literal equality-implied constant 0): min x1 + ~x2 with
     // x1 + ~x2 = 1 (folds to x1 - x2 = 0). objective == 1 - x2 + x1; combined
@@ -6940,7 +7066,7 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         objective_lower_bound_from_constraints(&cs8, &obj8, &|| false),
         Some(1)
     );
-    assert_valid_lb(&cs8, &obj8, 2);
+    assert_valid_lb(&cs8, &obj8, 2)?;
 
     // Case 9 (NEGATIVE equality-implied constant -2; guards the .max(0)
     // clamp): min -x1 - x2 with x1 = 1 AND x2 = 1. Both vars forced true, so
@@ -6963,7 +7089,8 @@ fn test_objective_lower_bound_never_overshoots_concrete() {
         objective_lower_bound_from_constraints(&cs9, &obj9, &|| false),
         Some(-2)
     );
-    assert_valid_lb(&cs9, &obj9, 2);
+    assert_valid_lb(&cs9, &obj9, 2)?;
+    Ok(())
 }
 
 /// MEMGUARD (wf_fbcc80bb): the structural bound's stop hook must be honored —
@@ -7043,9 +7170,9 @@ fn test_equality_aggregation_bounded_by_stop_poll() {
         vec![linear_term(1, lit(1)), linear_term(1, lit(2))],
         1,
     )];
-    for i in 3..=2000u32 {
+    for (i, next) in (3..=2000u32).zip(4..=2001u32) {
         cs.push(eq_constraint(
-            vec![linear_term(1, lit(i)), linear_term(1, lit(i + 1))],
+            vec![linear_term(1, lit(i)), linear_term(1, lit(next))],
             1,
         ));
     }
@@ -7178,7 +7305,7 @@ fn seed_phases_steers_first_incumbent_between_equal_optima() {
 /// verdict or the optimal cost — phase saving is only a decision-polarity
 /// bias, invisible to propagation and conflict analysis.
 #[test]
-fn seed_phases_never_changes_verdict_or_optimal_cost() {
+fn seed_phases_never_changes_verdict_or_optimal_cost() -> TestResult {
     // exactly-one(x1,x2,x3) with costs 3/2/5 and a side row forbidding x2
     // unless x4: optimum is x2+x4 infeasible-free? Keep it simple:
     //   x1 + x2 + x3 = 1;  x4 + ~x2 >= 1  (choosing x2 forces x4, cost 1)
@@ -7229,61 +7356,80 @@ fn seed_phases_never_changes_verdict_or_optimal_cost() {
     assert_eq!(cost, base_cost);
     // The model itself must still satisfy the constraints (spot-check;
     // model is 0-indexed: model[v - 1] is variable v).
-    let m = |v: usize| model[v - 1];
-    let picked = [1usize, 2, 3].iter().filter(|&&v| m(v)).count();
+    let m = |v: usize| -> TestResult<bool> {
+        let index = v.checked_sub(1).ok_or("variable ids are 1-based")?;
+        Ok(*model.get(index).ok_or("model is missing a variable")?)
+    };
+    let picked = [m(1)?, m(2)?, m(3)?]
+        .iter()
+        .filter(|&&chosen| chosen)
+        .count();
     assert_eq!(picked, 1, "exactly-one violated: {model:?}");
-    if m(2) {
-        assert!(m(4), "x2 chosen without x4: {model:?}");
+    if m(2)? {
+        assert!(m(4)?, "x2 chosen without x4: {model:?}");
     }
+    Ok(())
 }
 
 // ---- Single-equality knapsack DP special case (eq_knapsack) ----
 
 /// Aardal_1-shaped complementary Ge pair: `sum a_i x_i >= b` and
 /// `sum -a_i x_i >= -b`, i.e. `sum a_i x_i == b`.
-fn eq_pair_instance(coeffs: &[i128], b: i128) -> PbInstance {
+fn eq_pair_instance(coeffs: &[i128], b: i128) -> TestResult<PbInstance> {
     let pos = ge_constraint(
         coeffs
             .iter()
             .enumerate()
-            .map(|(i, &c)| linear_term(c, lit(i as u32 + 1)))
-            .collect(),
+            .map(|(i, &c)| Some(linear_term(c, lit(u32::try_from(i).ok()?.checked_add(1)?))))
+            .collect::<Option<_>>()
+            .ok_or(TEST_OVERFLOW)?,
         b,
     );
     let neg = ge_constraint(
         coeffs
             .iter()
             .enumerate()
-            .map(|(i, &c)| linear_term(-c, lit(i as u32 + 1)))
-            .collect(),
-        -b,
+            .map(|(i, &c)| {
+                Some(linear_term(
+                    c.checked_neg()?,
+                    lit(u32::try_from(i).ok()?.checked_add(1)?),
+                ))
+            })
+            .collect::<Option<_>>()
+            .ok_or(TEST_OVERFLOW)?,
+        b.checked_neg().ok_or(TEST_OVERFLOW)?,
     );
-    PbInstance {
+    Ok(PbInstance {
         num_vars: coeffs.len() as u32,
         num_constraints: 2,
         constraints: vec![neg, pos], // negative row first, like the corpus files
         objective: None,
-    }
+    })
 }
 
-fn eq_pair_lhs(coeffs: &[i128], model: &[bool]) -> i128 {
-    coeffs
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| if model[i] { c } else { 0 })
-        .sum()
+fn eq_pair_lhs(coeffs: &[i128], model: &[bool]) -> TestResult<i128> {
+    let mut lhs: i128 = 0;
+    for (i, &c) in coeffs.iter().enumerate() {
+        if *model
+            .get(i)
+            .ok_or("model is shorter than the coefficient row")?
+        {
+            lhs = lhs.checked_add(c).ok_or(TEST_OVERFLOW)?;
+        }
+    }
+    Ok(lhs)
 }
 
 #[test]
-fn eq_knapsack_dp_decides_two_row_equality_sat() {
+fn eq_knapsack_dp_decides_two_row_equality_sat() -> TestResult {
     // 3, 5, 7, 11, 13 with target 18 = 5 + 13 (among others): SAT.
     let coeffs = [3, 5, 7, 11, 13];
-    let instance = eq_pair_instance(&coeffs, 18);
+    let instance = eq_pair_instance(&coeffs, 18)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
     match solver.solve() {
         PbCdclResult::Satisfiable(model) => {
             assert_eq!(
-                eq_pair_lhs(&coeffs, &model),
+                eq_pair_lhs(&coeffs, &model)?,
                 18,
                 "model must satisfy the equality"
             );
@@ -7295,30 +7441,32 @@ fn eq_knapsack_dp_decides_two_row_equality_sat() {
         1,
         "the DP special case must have decided this solve"
     );
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_decides_two_row_equality_unsat() {
+fn eq_knapsack_dp_decides_two_row_equality_unsat() -> TestResult {
     // 3, 5, 7, 11, 13 can never sum to 17, and 17 is root-quiet (every
     // coefficient fits under it in both rows, so plain root propagation and
     // probing cannot refute it before the DP hook runs; probing is disabled
     // for determinism).
-    let instance = eq_pair_instance(&[3, 5, 7, 11, 13], 17);
+    let instance = eq_pair_instance(&[3, 5, 7, 11, 13], 17)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
     solver.config.root_probe_enabled = false;
     assert_eq!(solver.solve(), PbCdclResult::Unsatisfiable);
     assert_eq!(solver.stats().eq_knapsack_dp, 1);
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_disabled_falls_back_to_search() {
+fn eq_knapsack_dp_disabled_falls_back_to_search() -> TestResult {
     let coeffs = [3, 5, 7, 11, 13];
-    let sat_instance = eq_pair_instance(&coeffs, 18);
+    let sat_instance = eq_pair_instance(&coeffs, 18)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&sat_instance, || false);
     solver.set_eq_knapsack_dp_enabled(false);
     match solver.solve() {
         PbCdclResult::Satisfiable(model) => {
-            assert_eq!(eq_pair_lhs(&coeffs, &model), 18);
+            assert_eq!(eq_pair_lhs(&coeffs, &model)?, 18);
         }
         other => panic!("expected SAT, got {other:?}"),
     }
@@ -7328,21 +7476,22 @@ fn eq_knapsack_dp_disabled_falls_back_to_search() {
         "knob off must bypass the DP"
     );
 
-    let unsat_instance = eq_pair_instance(&[3, 5, 7], 4);
+    let unsat_instance = eq_pair_instance(&[3, 5, 7], 4)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&unsat_instance, || false);
     solver.set_eq_knapsack_dp_enabled(false);
     assert_eq!(solver.solve(), PbCdclResult::Unsatisfiable);
     assert_eq!(solver.stats().eq_knapsack_dp, 0);
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_verdicts_match_search_verdicts() {
+fn eq_knapsack_dp_verdicts_match_search_verdicts() -> TestResult {
     // Differential: DP-on vs DP-off must agree on a spread of targets
     // (SAT and UNSAT alike). Coefficients chosen so both paths are fast.
     let coeffs = [3i128, 5, 7, 11, 13];
     let total: i128 = coeffs.iter().sum();
     for target in 0..=total {
-        let instance = eq_pair_instance(&coeffs, target);
+        let instance = eq_pair_instance(&coeffs, target)?;
         let mut dp = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
         let dp_result = dp.solve();
         let mut search = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
@@ -7351,12 +7500,12 @@ fn eq_knapsack_dp_verdicts_match_search_verdicts() {
         match (&dp_result, &search_result) {
             (PbCdclResult::Satisfiable(model), PbCdclResult::Satisfiable(search_model)) => {
                 assert_eq!(
-                    eq_pair_lhs(&coeffs, model),
+                    eq_pair_lhs(&coeffs, model)?,
                     target,
                     "DP model must hit target"
                 );
                 assert_eq!(
-                    eq_pair_lhs(&coeffs, search_model),
+                    eq_pair_lhs(&coeffs, search_model)?,
                     target,
                     "search model must hit target"
                 );
@@ -7365,13 +7514,14 @@ fn eq_knapsack_dp_verdicts_match_search_verdicts() {
             other => panic!("target {target}: DP and search disagree: {other:?}"),
         }
     }
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_skipped_under_proof_logging() {
+fn eq_knapsack_dp_skipped_under_proof_logging() -> TestResult {
     // Proof mode must bypass the DP (its derivation is not proof-logged)
     // and still reach the correct UNSAT verdict through logged search.
-    let instance = eq_pair_instance(&[3, 5, 7], 4);
+    let instance = eq_pair_instance(&[3, 5, 7], 4)?;
     let buf = SharedBuf::new();
     let mut solver = PbCdclSolver::with_proof_writer(&instance, buf.clone())
         .expect("proof writer construction must succeed");
@@ -7385,15 +7535,16 @@ fn eq_knapsack_dp_skipped_under_proof_logging() {
         !buf.as_string().is_empty(),
         "proof output must have been written"
     );
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_optimization_reaches_optimum() {
+fn eq_knapsack_dp_optimization_reaches_optimum() -> TestResult {
     // 3x1 + 5x2 + 7x3 == 8 has the unique solution {x1, x2}. The DP decides
     // the initial feasibility solve; the bound loop then proves optimality
     // through ordinary search (the added bound row disables the DP gate).
     let coeffs = [3, 5, 7];
-    let mut instance = eq_pair_instance(&coeffs, 8);
+    let mut instance = eq_pair_instance(&coeffs, 8)?;
     instance.objective = Some(PbObjective {
         terms: vec![
             linear_term(1, lit(1)),
@@ -7405,20 +7556,21 @@ fn eq_knapsack_dp_optimization_reaches_optimum() {
     let objective = instance.objective.clone().expect("objective present");
     match solver.solve_optimize(&objective, None) {
         PbCdclResult::Optimal(model, value) => {
-            assert_eq!(eq_pair_lhs(&coeffs, &model), 8);
+            assert_eq!(eq_pair_lhs(&coeffs, &model)?, 8);
             assert_eq!(value, 2, "unique solution {{x1, x2}} has objective 2");
         }
         other => panic!("expected Optimal, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_declines_with_extra_rows() {
+fn eq_knapsack_dp_declines_with_extra_rows() -> TestResult {
     // A third row must disable the special case (rows > 2) and the combined
     // instance must still be decided correctly by search: force x1 = 0,
     // making target 18 unreachable without coefficient 3.
     let coeffs = [3i128, 5, 7, 11, 13];
-    let mut instance = eq_pair_instance(&coeffs, 3);
+    let mut instance = eq_pair_instance(&coeffs, 3)?;
     instance
         .constraints
         .push(ge_constraint(vec![linear_term(1, not(1))], 1));
@@ -7430,18 +7582,19 @@ fn eq_knapsack_dp_declines_with_extra_rows() {
         0,
         "3-row instance must bypass the DP"
     );
+    Ok(())
 }
 
 #[test]
-fn eq_knapsack_dp_huge_coefficient_pair() {
+fn eq_knapsack_dp_huge_coefficient_pair() -> TestResult {
     // Aardal-style magnitudes (millions) stay exact and fast in the DP.
     let coeffs = [1_000_003i128, 2_000_006, 4_000_012, 8_000_024, 3_500_001];
     let b = 1_000_003 + 4_000_012 + 3_500_001; // reachable
-    let instance = eq_pair_instance(&coeffs, b);
+    let instance = eq_pair_instance(&coeffs, b)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
     match solver.solve() {
         PbCdclResult::Satisfiable(model) => {
-            assert_eq!(eq_pair_lhs(&coeffs, &model), b);
+            assert_eq!(eq_pair_lhs(&coeffs, &model)?, b);
         }
         other => panic!("expected SAT, got {other:?}"),
     }
@@ -7450,11 +7603,12 @@ fn eq_knapsack_dp_huge_coefficient_pair() {
     // And an unreachable root-quiet huge target: 8_250_000 exceeds every
     // coefficient (nothing is root-forced in either row) and lies strictly
     // between the achievable subset sums 8_000_024 and 8_500_016.
-    let instance = eq_pair_instance(&coeffs, 8_250_000);
+    let instance = eq_pair_instance(&coeffs, 8_250_000)?;
     let mut solver = PbCdclSolver::new_unpreprocessed_interruptible(&instance, || false);
     solver.config.root_probe_enabled = false;
     assert_eq!(solver.solve(), PbCdclResult::Unsatisfiable);
     assert_eq!(solver.stats().eq_knapsack_dp, 1);
+    Ok(())
 }
 
 #[test]
@@ -7580,7 +7734,7 @@ fn interrupted_assumption_solve_never_reports_a_bogus_core() {
         for budget in 0..12usize {
             let mut polls = 0usize;
             let mut stop = || {
-                polls += 1;
+                polls = polls.saturating_add(1);
                 budget != 11 && polls > budget
             };
             let mut solver = PbCdclSolver::new(&instance);
@@ -7588,7 +7742,7 @@ fn interrupted_assumption_solve_never_reports_a_bogus_core() {
 
             match result {
                 PbCdclAssumptionResult::Unsatisfiable { core } => {
-                    unsat_calls += 1;
+                    unsat_calls = unsat_calls.saturating_add(1);
                     // PROPERTY 2: the claimed core must really be unsatisfiable.
                     // Re-check with a fresh solver and NO interruption.
                     let mut check = PbCdclSolver::new(&instance);
@@ -7600,7 +7754,7 @@ fn interrupted_assumption_solve_never_reports_a_bogus_core() {
                          would add its weight to the bound and over-count"
                     );
                 }
-                PbCdclAssumptionResult::Unknown => aborted_calls += 1,
+                PbCdclAssumptionResult::Unknown => aborted_calls = aborted_calls.saturating_add(1),
                 PbCdclAssumptionResult::Satisfiable(_) | PbCdclAssumptionResult::Unsupported => {}
             }
         }
@@ -7616,6 +7770,34 @@ fn interrupted_assumption_solve_never_reports_a_bogus_core() {
         unsat_calls > 0,
         "no call ever returned a core — the instances were too easy to test the contract"
     );
+}
+
+/// `n` pigeons into `n` holes, `x[p][h] == p * n + h + 1`: every pigeon sits
+/// in some hole and every hole holds at most one pigeon.
+fn pigeonhole_instance(n: usize) -> PbInstance {
+    let var = |p: usize, h: usize| (p * n + h + 1) as u32;
+    let mut constraints = Vec::new();
+    // Every pigeon sits in some hole.
+    for p in 0..n {
+        constraints.push(ge_constraint(
+            (0..n).map(|h| linear_term(1, lit(var(p, h)))).collect(),
+            1,
+        ));
+    }
+    // Every hole holds at most one pigeon, written as a covering row over the
+    // complements: `sum_p ~x[p][h] >= n - 1`.
+    for h in 0..n {
+        constraints.push(ge_constraint(
+            (0..n).map(|p| linear_term(1, not(var(p, h)))).collect(),
+            (n - 1) as i128,
+        ));
+    }
+    PbInstance {
+        num_vars: (n * n) as u32,
+        num_constraints: constraints.len() as u32,
+        constraints,
+        objective: None,
+    }
 }
 
 /// THE ABORT-SEMANTICS CONTRACT — CONFLICT-CAP ARM.
@@ -7644,38 +7826,20 @@ fn interrupted_assumption_solve_never_reports_a_bogus_core() {
 ///   3. a cap large enough never to bind reproduces the uncapped verdict, i.e.
 ///      a cap changes EFFORT, never ANSWERS.
 #[test]
-fn conflict_capped_assumption_solve_never_reports_a_bogus_core() {
+fn conflict_capped_assumption_solve_never_reports_a_bogus_core() -> TestResult {
     let mut capped_unknowns = 0usize;
     let mut capped_cores = 0usize;
 
     for n in 3..=5usize {
         // x[p][h] == p * n + h + 1
         let var = |p: usize, h: usize| (p * n + h + 1) as u32;
-        let mut constraints = Vec::new();
-        // Every pigeon sits in some hole.
-        for p in 0..n {
-            constraints.push(ge_constraint(
-                (0..n).map(|h| linear_term(1, lit(var(p, h)))).collect(),
-                1,
-            ));
-        }
-        // Every hole holds at most one pigeon, written as a covering row over the
-        // complements: `sum_p ~x[p][h] >= n - 1`.
-        for h in 0..n {
-            constraints.push(ge_constraint(
-                (0..n).map(|p| linear_term(1, not(var(p, h)))).collect(),
-                (n - 1) as i128,
-            ));
-        }
-        let instance = PbInstance {
-            num_vars: (n * n) as u32,
-            num_constraints: constraints.len() as u32,
-            constraints,
-            objective: None,
-        };
+        let instance = pigeonhole_instance(n);
         // Forbid the last hole: n pigeons into n-1 holes is UNSAT, and proving it
         // takes real conflicts rather than a single propagation.
-        let assumptions: Vec<PbLit> = (0..n).map(|p| not(var(p, n - 1))).collect();
+        let last_hole = n
+            .checked_sub(1)
+            .ok_or("pigeonhole needs at least one hole")?;
+        let assumptions: Vec<PbLit> = (0..n).map(|p| not(var(p, last_hole))).collect();
 
         let uncapped = {
             let mut solver = PbCdclSolver::new(&instance);
@@ -7740,6 +7904,7 @@ fn conflict_capped_assumption_solve_never_reports_a_bogus_core() {
         capped_cores > 0,
         "no capped call ever returned a core — the caps bound too hard to test the contract"
     );
+    Ok(())
 }
 
 #[test]

@@ -52,6 +52,19 @@
 //! so one stuck subset cannot eat the whole pass, and the loop stops
 //! shrinking when the remaining budget no longer covers 2x the live attempt
 //! cap (#uc-minimize-policy P1) — a fat validated core beats a timeout.
+//! The pass is also bounded by what the ENTRY verdict itself cost
+//! (#uc-minimize-entry-cost): every subset attempt re-solves a problem the
+//! size of the original, and an adoption pays that twice (the subset solve
+//! plus its strict re-verification), so when the remaining budget cannot
+//! cover a few entry-sized solves the pass declines outright, and when the
+//! first probe of non-array content runs its whole budget without deciding
+//! its subset the pass stops there — the printed core is then the padded
+//! superset the declined pass would have printed anyway. Measured on
+//! deductive-checks's bit-blasted QF_BV obligations (cores on, proofs off, 30 s
+//! embedder wall): a 64-bit `bvmul` overflow refutation decided in 0.3 s,
+//! certified in 1.2 s, and then spent 8.6 s in eight subset attempts
+//! shrinking a five-member core to three; under the embedder's unoptimized
+//! theory crates the same pass ran the verdict into the wall.
 //!
 //! DETERMINISM: the candidate order is instance-derived (the combined
 //! named/assumption vector stable-sorted by term node-count ascending with
@@ -196,7 +209,48 @@ const NON_ARRAY_ORDER_FLIP_AFTER_ATTEMPTS: u64 = 12;
 /// re-solve costs.
 const NO_DEADLINE_BUDGET: Duration = Duration::from_secs(30);
 
+/// Entry-cost affordability (#uc-minimize-entry-cost): the pass does not
+/// start unless the shrink budget covers this many ENTRY-sized solves. The
+/// entry cost is the wall time the named-core redirect spent deciding and
+/// certifying the verdict (the direct solve plus `certify_assumption_core`'s
+/// harvest recheck; a rescue is accounted separately through `rescue4`).
+/// One adoption costs two entry-sized solves (the subset solve and its
+/// strict re-verification) and the scan needs at least a probe before it,
+/// so anything below four cannot shrink the core without risking the answer
+/// — the same "fat validated core beats a timeout" rule as P1, applied
+/// before the first attempt instead of before the last. Zero (the unit-test
+/// entry) never declines.
+const ENTRY_COST_AFFORDABILITY: u32 = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of the FIRST attempt's budget, so the
+    /// probe-undecided stop can be exercised deterministically instead of by
+    /// racing a real subset solve against the wall clock.
+    static PROBE_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install (or clear) the test-only first-attempt budget override.
+#[cfg(test)]
+pub(super) fn set_probe_budget_override_for_test(budget: Option<Duration>) {
+    PROBE_BUDGET_OVERRIDE.with(|cell| cell.set(budget));
+}
+
 impl Executor {
+    /// Run a nonpublishing nomination that consumes only a refutation. SAT and
+    /// Unknown both keep the deleted members; the exact adoption check runs
+    /// after this scope has restored the ordinary posture.
+    fn with_core_subset_nomination<R>(&mut self, solve: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.core_subset_nomination, true);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve(self)));
+        self.core_subset_nomination = saved;
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Shrink a certified UNSAT assumption core by deletion, re-solving
     /// subsets against the current (stripped) base assertions.
     ///
@@ -241,7 +295,19 @@ impl Executor {
         combined: &[TermId],
         result: Result<SolveResult>,
         rescue_elapsed: Option<Duration>,
+        entry_elapsed: Duration,
     ) -> Result<SolveResult> {
+        // A strict-native bundle is already the final exact-query artifact.
+        // Subset probes can only append terms and stale its full snapshot, so
+        // there is no sound benefit in minimizing a core after it was minted.
+        let current_native_bundle = self.last_proof.as_ref().is_some_and(|proof| {
+            self.strict_native_bv_lia_bundle_for_proof(proof).is_some()
+                || self.strict_native_nra_sos_bundle_for_proof(proof).is_some()
+        });
+        if current_native_bundle {
+            return result;
+        }
+        self.clear_strict_native_bundle_states();
         let saved_result = self.last_result.clone();
         let saved_unknown_reason = self.last_unknown_reason;
         let saved_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
@@ -259,6 +325,11 @@ impl Executor {
         // envelope, and it is what lets the gate above run on the internal
         // tracker without weakening the publish path.
         let saved_unsat_certificate = self.last_unsat_certificate.take();
+        // The bounded source route seals before core minimization. Park its
+        // affine outer-query token while the subset probes install and discard
+        // their own epochs and tokens; append-only term growth is allowed, but
+        // every other identity component is rechecked after restoration.
+        let saved_pending_bounded_bv_lia = self.pending_bounded_bv_lia_unsat.take();
         // ...and with it the PUBLICATION AUTHORITY the certificate is minted
         // from. `mint_unsat_certificate` does not re-verify a proof; it checks
         // that `unsat_query_epoch`'s bound assumptions equal the ones being
@@ -303,9 +374,31 @@ impl Executor {
             std::mem::take(&mut self.nested_array_row_reduction_unsat);
         let saved_ho_seq_unfold_array_free_unsat =
             std::mem::take(&mut self.ho_seq_unfold_array_free_unsat);
-        let out = self.minimize_assumption_core_inner(combined, result, rescue_elapsed);
+        let saved_simplifier_refutation_unsat =
+            std::mem::take(&mut self.simplifier_refutation_unsat);
+        let saved_nested_array_free_justification_unsat =
+            std::mem::take(&mut self.nested_array_free_justification_unsat);
+        // ...and the EVALUATION ATTEMPT the entry decision publishes through.
+        // Subset solves never begin a decision of their own, so a stop one of
+        // them records (its narrowed per-attempt `solve_deadline` expiring
+        // inside the model gate — `poll_evaluation_stop` writes the FIRST
+        // origin permanently) landed on the entry decision's ledger, every
+        // later attempt was dead on arrival, and `emit_sat_verdict`'s
+        // `publish_evaluation_stop` then published `Unknown(Timeout)` over
+        // the certified entry UNSAT. Measured on deductive-checks's `*_push_*`
+        // obligations: verdict decided and certified in ~1 s, published as a
+        // timeout at 8-10 s under a 30 s wall. Same clobber shape as the
+        // certification-deadline fix (search lanes narrow the search wall
+        // only): an attempt's expiry is evidence about ITS reduced problem.
+        // Restoring reinstates exactly the stop state the entry decision
+        // itself earned — a genuine entry-wall expiry is still in the parked
+        // object and still publishes.
+        let parked_attempt = self.park_evaluation_decision();
+        let out =
+            self.minimize_assumption_core_inner(combined, result, rescue_elapsed, entry_elapsed);
         // Unconditional: the take()s above must never be observable, whether or
         // not the inner pass did any work.
+        self.restore_evaluation_decision(parked_attempt);
         self.last_unsat_certificate = saved_unsat_certificate;
         self.unsat_query_epoch = saved_epoch;
         self.proof_problem_assertion_provenance = saved_provenance;
@@ -315,7 +408,16 @@ impl Executor {
         self.last_checked_sat_refutation = saved_checked_sat_refutation;
         self.nested_array_row_reduction_unsat = saved_nested_array_row_reduction_unsat;
         self.ho_seq_unfold_array_free_unsat = saved_ho_seq_unfold_array_free_unsat;
+        self.simplifier_refutation_unsat = saved_simplifier_refutation_unsat;
+        self.nested_array_free_justification_unsat = saved_nested_array_free_justification_unsat;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
+        if let Some(candidate) = saved_pending_bounded_bv_lia {
+            if self.pending_bounded_bv_lia_unsat_matches_bound_epoch(&candidate) {
+                self.pending_bounded_bv_lia_unsat = Some(candidate);
+            }
+        }
         // Only restore the verdict when the pass was entered on an UNSAT (the
         // inner function is a no-op otherwise, so nothing was clobbered).
         if matches!(saved_result, Some(SolveResult::Unsat(_))) {
@@ -331,6 +433,7 @@ impl Executor {
         combined: &[TermId],
         result: Result<SolveResult>,
         rescue_elapsed: Option<Duration>,
+        entry_elapsed: Duration,
     ) -> Result<SolveResult> {
         let rescued = rescue_elapsed.is_some();
         // Gate telemetry (#uc-minimize-gate-trace): this pass has several
@@ -381,6 +484,13 @@ impl Executor {
         // CLI-populated global (--no-uc-minimize) replaced the never-set env.
         if ay_core::theory_disable_flags().no_uc_minimize {
             decline!("cli-kill");
+        }
+        // A derived query (certification re-solve on a cloned context) reads
+        // its verdict and nothing else: shrinking a core nobody reads only
+        // spends the certification deadline (`Executor::new_derived_query_
+        // executor`).
+        if self.core_shrinking_suppressed {
+            decline!("derived-query");
         }
 
         // Category gate: EUF / ArrayEuf content only for now
@@ -542,6 +652,14 @@ impl Executor {
         let Some(shrink_deadline) = now.checked_add(shrink_budget) else {
             return result;
         };
+        // Entry-cost affordability (#uc-minimize-entry-cost, see the
+        // constant): a pass that cannot afford a few entry-sized solves
+        // cannot shrink the core without spending the answer's own budget.
+        if shrink_budget < entry_elapsed.saturating_mul(ENTRY_COST_AFFORDABILITY) {
+            decline!(format!(
+                "entry-cost entry={entry_elapsed:?} shrink_budget={shrink_budget:?}"
+            ));
+        }
         let slice = std::cmp::max(shrink_budget / 6, Duration::from_secs(1));
 
         // Saved for byte-identical restore on zero progress.
@@ -725,11 +843,23 @@ impl Executor {
                 std::cmp::max(ATTEMPT_CHURN_CAP, max_adoption_cost.saturating_mul(4))
             };
             let attempt_budget = std::cmp::min(slice, scaled_floor);
+            #[cfg(test)]
+            let attempt_budget = PROBE_BUDGET_OVERRIDE
+                .with(std::cell::Cell::get)
+                .filter(|_| attempts == 1)
+                .unwrap_or(attempt_budget);
             let attempt_started = Instant::now();
             let per_solve_deadline = attempt_started
                 .checked_add(attempt_budget)
                 .map_or(shrink_deadline, |d| d.min(shrink_deadline));
             self.solve_deadline.set(Some(per_solve_deadline));
+            // A clean evaluation attempt per subset solve (and its strict
+            // re-verification below): the ledger keeps its FIRST stop for
+            // good, so without this one attempt's expiry is read back as
+            // every later attempt's refusal and the scan is dead from that
+            // point on (measured: attempts 3-19 returning in 0.7-2 ms). The
+            // entry decision's own attempt is parked by the wrapper.
+            self.begin_subset_evaluation_attempt();
             // #uc-minimize-gate-window: RE-SCOPE the mandatory SAT gate's
             // authored root window to the problem THIS attempt actually solves,
             // `base_assertions AND candidate`.
@@ -792,22 +922,24 @@ impl Executor {
             // identical: `check-sat-assuming A` == `check-sat (base AND A)`,
             // and adoption still requires this fresh solve to return unsat.
             let scoped_engine = rescued || features.has_arrays;
-            let mut sub = if scoped_engine {
-                // The scoped engine assumes a fresh per-check state (the
-                // rescue runs it exactly once per check, right after the
-                // entry reset). Repeating it WITHOUT the reset compounds
-                // per-check scratch state across attempts — measured RSS
-                // blow-up/hang on QF_AX swap subsets that are trivially
-                // cheap in a fresh process. Reset before EVERY attempt.
-                self.reset_solve_session_state();
-                self.solve_scoped_assumptions(
-                    &base_assertions,
-                    &candidate,
-                    Self::solve_current_assertions_with_quantifier_support,
-                )
-            } else {
-                self.check_sat_assuming(&candidate)
-            };
+            let mut sub = self.with_core_subset_nomination(|executor| {
+                if scoped_engine {
+                    // The scoped engine assumes a fresh per-check state (the
+                    // rescue runs it exactly once per check, right after the
+                    // entry reset). Repeating it WITHOUT the reset compounds
+                    // per-check scratch state across attempts — measured RSS
+                    // blow-up/hang on QF_AX swap subsets that are trivially
+                    // cheap in a fresh process. Reset before EVERY attempt.
+                    executor.reset_solve_session_state();
+                    executor.solve_scoped_assumptions(
+                        &base_assertions,
+                        &candidate,
+                        Self::solve_current_assertions_with_quantifier_support,
+                    )
+                } else {
+                    executor.check_sat_assuming(&candidate)
+                }
+            });
             // A raw subset UNSAT is only a nomination.  This pass publishes a
             // reduced public core, while the outer query's eventual
             // UnsatCertificate authenticates the full original problem—not
@@ -873,6 +1005,19 @@ impl Executor {
                 attempt_ended.saturating_duration_since(per_solve_deadline) > OVERSHOOT_FUSE
             };
             headroom = headroom.max(attempt_elapsed);
+            // Probe-undecided stop (#uc-minimize-entry-cost), non-array
+            // content: the probe ran its whole budget and could not decide
+            // its subset (a solve cut at the deadline, or a subset UNSAT
+            // whose strict re-verification the deadline then declined).
+            // That is the P2 churner shape on the very first, largest-chunk
+            // deletion — no evidence any subset is cheaper than the entry
+            // solve, and every later attempt would pay the same cap. Array
+            // content keeps its own ladder: its calibration (storecomm)
+            // mixes cap-churning attempts with cheap adoptions by design.
+            let probe_undecided = attempts == 1
+                && !features.has_arrays
+                && matches!(sub, Ok(SolveResult::Unknown))
+                && attempt_ended >= per_solve_deadline;
             if matches!(sub, Ok(SolveResult::Unsat(_))) {
                 // Adaptive-difficulty signal (#uc-minimize-policy P2): the
                 // post-probe non-array cap scales from the costliest
@@ -955,6 +1100,15 @@ impl Executor {
                 if trace {
                     eprintln!(
                         "c phase-trace uc-minimize fuse=overshoot attempt_elapsed={attempt_elapsed:?}"
+                    );
+                }
+                break;
+            }
+            if probe_undecided {
+                if trace {
+                    eprintln!(
+                        "c phase-trace uc-minimize fuse=probe-undecided budget={attempt_budget:?} \
+                         attempt_elapsed={attempt_elapsed:?}"
                     );
                 }
                 break;

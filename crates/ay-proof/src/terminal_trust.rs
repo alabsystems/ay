@@ -183,7 +183,9 @@ where
                 report.foreign_assume_on_path = report.foreign_assume_on_path.saturating_add(1);
             }
             // Anchor is a leaf node; nothing to traverse.
-            ProofStep::Anchor { .. } => {}
+            ProofStep::Anchor { .. }
+            | ProofStep::NraSos { .. }
+            | ProofStep::FiniteFieldLinear { .. } => {}
             _ => {
                 // Exhaustive over current ProofStep variants. If a new
                 // variant is added, the default is to treat it as a leaf —
@@ -211,7 +213,9 @@ fn derives_empty_clause(step: &ProofStep) -> bool {
         // TheoryLemma cannot derive the empty clause in a well-formed proof
         // (a theory never asserts `false` directly), but we accept any step
         // whose conclusion clause is empty as a defensive measure.
-        ProofStep::TheoryLemma { clause, .. } => clause.is_empty(),
+        ProofStep::TheoryLemma { clause, .. }
+        | ProofStep::FiniteFieldLinear { clause, .. }
+        | ProofStep::NraSos { clause, .. } => clause.is_empty(),
         ProofStep::Assume(_) | ProofStep::Anchor { .. } => false,
         _ => false,
     }

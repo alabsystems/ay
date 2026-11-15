@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Companion, NOT run by the gate: same checker, same formula, a logged model.
+% Answers `s VERIFIED SATISFIABLE`, exit 0.
+f 2 ;
+sol ~x1 ~x2 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

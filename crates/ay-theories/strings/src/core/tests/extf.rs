@@ -598,10 +598,22 @@ fn eval_str_from_code_above_max_returns_empty() {
     assert_eq!(crate::eval::eval_str_from_code(&BigInt::from(196608)), "");
 }
 
+/// D8 (2026-09-23 hunt, witness w01): surrogates are SMT-LIB characters, so
+/// `str.from_code` of one is a ONE-character string whose `str.to_code` is the
+/// same code point. The old evaluator returned "" and AY refuted the
+/// satisfiable `(= (str.len (str.from_code 55296)) 1)`.
 #[test]
-fn eval_str_from_code_surrogate_returns_empty() {
-    // U+D800 is a surrogate code point, not a valid char.
-    assert_eq!(crate::eval::eval_str_from_code(&BigInt::from(0xD800)), "");
+fn eval_str_from_code_surrogate_is_one_character() {
+    for code in [0xD800_u32, 0xDABC, 0xDFFF] {
+        let s = crate::eval::eval_str_from_code(&BigInt::from(code));
+        assert_eq!(s.chars().count(), 1, "code {code:#x}");
+        assert_eq!(crate::eval::eval_str_to_code(&s), BigInt::from(code));
+    }
+    // Two distinct surrogates are two distinct strings (witness w04).
+    assert_ne!(
+        crate::eval::eval_str_from_code(&BigInt::from(56000)),
+        crate::eval::eval_str_from_code(&BigInt::from(56001))
+    );
 }
 
 #[test]

@@ -58,12 +58,115 @@ impl Executor {
         self.publish_unknown_from_origin(reason.origin());
     }
 
+    /// Publish `Unknown` for a decision query that ended in `error`, under
+    /// the error's own reason ([`ExecutorError::unknown_reason`]).
+    ///
+    /// A refusal ([`ExecutorError::UnsupportedLogic`]: no combined decision
+    /// procedure for the problem's theory mix) never searched, so its
+    /// diagnostic is the refusal itself: phase `theory-combination`, and the
+    /// error's text, which names the declared logic, as the detail. Without
+    /// it the diagnostic fell back to `theory-search` / "solver returned
+    /// Unknown", as if a search had run. Any other executor error publishes
+    /// `InternalError` with the default diagnostic. The native API's recorder
+    /// (`api/solving/check.rs::record_executor_failure_unknown`) and the CLI
+    /// both publish an errored decision query through here, so one refusal
+    /// reads the same on either surface.
+    pub fn replace_last_result_with_executor_error(&mut self, error: &ExecutorError) {
+        self.replace_last_result_with_unknown(error.unknown_reason());
+        if matches!(error, ExecutorError::UnsupportedLogic(_)) {
+            self.record_refusal_diagnostic(error);
+        }
+    }
+
+    /// The phase of a refusal's diagnostic.
+    const REFUSAL_PHASE: &'static str = "theory-combination";
+
+    /// The statistics an `unknown`'s diagnostic is read from.
+    const UNKNOWN_DIAGNOSTIC_KEYS: [&'static str; 4] = [
+        "unknown.reason",
+        "unknown.phase",
+        "unknown.cost_center",
+        "unknown.detail",
+    ];
+
+    /// A refusal's diagnostic: phase `theory-combination`, and the refusal's
+    /// text, which names the declared logic, as the detail.
+    fn record_refusal_diagnostic(&mut self, refusal: &ExecutorError) {
+        self.last_statistics
+            .set_string("unknown.phase", Self::REFUSAL_PHASE);
+        self.last_statistics
+            .set_string("unknown.detail", refusal.to_string());
+    }
+
+    /// Take the router's refusal diagnostic out of the statistics while the
+    /// partition rescue searches the components of the refused mix; `None`
+    /// when the last diagnostic is not the refusal.
+    ///
+    /// The refusal describes an `unknown` no lane searched. A firing rescue
+    /// searches, so the refusal describes its solve only when the rescue ends
+    /// by restoring the refusal's own `unknown`
+    /// ([`Self::restore_refusal_diagnostic`]). A definite verdict needs none,
+    /// and a component's deadline or budget stop publishes its own.
+    pub(in crate::executor) fn hold_refusal_diagnostic(
+        &mut self,
+    ) -> Option<[Option<crate::executor_types::StatValue>; 4]> {
+        if self.last_statistics.get_string("unknown.phase") != Some(Self::REFUSAL_PHASE) {
+            return None;
+        }
+        Some(Self::UNKNOWN_DIAGNOSTIC_KEYS.map(|key| self.last_statistics.extra.remove(key)))
+    }
+
+    /// Put a held refusal diagnostic back exactly as it was held, over
+    /// whatever the rescue's components recorded.
+    pub(in crate::executor) fn restore_refusal_diagnostic(
+        &mut self,
+        held: Option<[Option<crate::executor_types::StatValue>; 4]>,
+    ) {
+        let Some(values) = held else {
+            return;
+        };
+        for (key, value) in Self::UNKNOWN_DIAGNOSTIC_KEYS.into_iter().zip(values) {
+            match value {
+                Some(value) => {
+                    self.last_statistics.extra.insert(key.to_string(), value);
+                }
+                None => {
+                    self.last_statistics.extra.remove(key);
+                }
+            }
+        }
+    }
+
+    /// The `LogicCategory::Other` arm of `check-sat` and `check-sat-assuming`:
+    /// no combined decision procedure for this theory mix. Since 550b6b40e the
+    /// arm answers the standard `unknown` (`Incomplete`) instead of an
+    /// `UnsupportedLogic` error, which also lets the symbol-disjoint partition
+    /// rescue decide a mix whose components each have a lane. The refusal
+    /// stays the diagnostic of an `unknown` nothing else decides: without it
+    /// the diagnostic fell back to the active phase and "solver returned
+    /// Unknown", as if a search had run.
+    pub(in crate::executor) fn refuse_theory_mix_without_a_lane(&mut self) -> SolveResult {
+        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+        let refusal = ExecutorError::UnsupportedLogic(
+            self.ctx.logic().unwrap_or("<unspecified>").to_string(),
+        );
+        self.record_refusal_diagnostic(&refusal);
+        SolveResult::Unknown
+    }
+
     /// Classify a provisional internal Unknown through the typed origin
     /// registry. The public solve boundary subsequently calls
     /// [`Self::finalize_unknown_publication`] to revoke artifacts and publish
     /// the result. Production origin sites use this instead of independently
     /// pairing a reason with a code string.
     pub(crate) fn record_unknown_from_origin(&mut self, origin: UnknownOrigin) {
+        // DIAGNOSTIC ONLY, and the sibling of the `CERT/unknown-record` line in
+        // `check_sat.rs`: the typed origin is the stable evidence code, so this
+        // says WHICH chokepoint stopped, in order, where the statistics block
+        // keeps only the last. No verdict path reads it.
+        if ay_core::misc_cli_flags().debug_cert {
+            ay_core::safe_eprintln!("CERT/unknown-origin {}", origin.code());
+        }
         self.last_unknown_reason = Some(origin.reason());
         self.last_unknown_origin = Some(origin);
     }

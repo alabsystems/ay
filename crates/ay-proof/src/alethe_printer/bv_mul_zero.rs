@@ -10,6 +10,7 @@ mod shift_monotonicity;
 #[path = "bv_mul_zero/bv_mul_zero_tests.rs"]
 mod tests;
 
+use super::dialect::attempt;
 use super::{parse_printed_bitvec_literal, split_application, AlethePrinter};
 use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId};
 use circuit::{FalseWitness, MulCircuit};
@@ -44,13 +45,26 @@ impl AlethePrinter<'_> {
         id: ProofId,
         clause: &[TermId],
     ) -> Option<String> {
-        self.format_bv_constant_disequality(id, clause)
-            .or_else(|| self.format_bv_mul_zero_bitblast(id, clause))
-            .or_else(|| self.format_bv_shift_monotonicity(id, clause))
-            .or_else(|| self.format_bv_idempotent_gate_bitblast(id, clause))
-            .or_else(|| self.format_bv_double_negation_bitblast(id, clause))
-            .or_else(|| self.format_bv_ult_one_zero_equiv(id, clause))
-            .or_else(|| self.format_bv_unsigned_compare_duality(id, clause))
+        // Each lane is an `attempt`: a lane that declines keeps none of the
+        // Clean-only spellings it noted (`dialect`).
+        attempt(|| self.format_bv_constant_disequality(id, clause))
+            .or_else(|| attempt(|| self.format_bv_shared_endpoint_constant_conflict(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_mul_zero_bitblast(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_shift_monotonicity(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_idempotent_gate_bitblast(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_double_negation_bitblast(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_ult_one_zero_equiv(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_unsigned_compare_duality(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_packed_opaque_identity(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_packed_identity(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_complement_affine_identity(id, clause)))
+            .or_else(|| attempt(|| self.format_bv_circuit_refutation(id, clause)))
+            // LAST, and deliberately so: the exact lowerings above recognize a
+            // named identity and print a handful of steps for it. This one
+            // refutes an ARBITRARY QF_BV lemma by replaying a full bit-blast
+            // plus SAT refutation, which is correct wherever it applies but
+            // never smaller. It runs only once every named shape has declined.
+            .or_else(|| attempt(|| self.format_bv_complete_blast_refutation(id, clause)))
     }
 
     /// Lower the exact unit identity `(= (bvmul X 0_w) 0_w)` (including
@@ -274,14 +288,14 @@ impl AlethePrinter<'_> {
             ]
             .iter()
             .any(|rendered| rendered.contains(&prefix));
-            if !printed_collision && !self.mul_zero_term_name_collision(&prefix) {
+            if !printed_collision && !self.proof_definition_name_collision(&prefix) {
                 return Some(prefix);
             }
         }
         None
     }
 
-    fn mul_zero_term_name_collision(&self, prefix: &str) -> bool {
+    pub(super) fn proof_definition_name_collision(&self, prefix: &str) -> bool {
         (0..self.terms.len()).any(|index| {
             let term = self.terms.get(TermId(index as u32));
             match term {

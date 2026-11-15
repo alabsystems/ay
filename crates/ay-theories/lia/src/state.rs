@@ -156,6 +156,7 @@ impl LiaSolver<'_> {
             cached_substitutions: std::mem::take(&mut self.dioph_cached_substitutions),
             cached_modular_gcds: std::mem::take(&mut self.dioph_cached_modular_gcds),
             cached_reasons: std::mem::take(&mut self.dioph_cached_reasons),
+            cached_fold_reasons: std::mem::take(&mut self.dioph_cached_fold_reasons),
             propagated_equality_pairs: {
                 // Wholesale replacement of the pair set can change membership
                 // without changing length — the one stamp component that is a
@@ -167,6 +168,7 @@ impl LiaSolver<'_> {
             propagated_disequality_pairs: std::mem::take(&mut self.propagated_disequality_pairs),
             lra_propagated_equality_pairs,
             lra_propagated_disequality_pairs,
+            lattice_budget: self.lattice_budget,
         }
     }
 
@@ -189,6 +191,13 @@ impl LiaSolver<'_> {
         self.dioph_cached_substitutions = state.cached_substitutions;
         self.dioph_cached_modular_gcds = state.cached_modular_gcds;
         self.dioph_cached_reasons = state.cached_reasons;
+        // D2: caches built on folded bounds hold only while those bounds do,
+        // and this instance's assertions are not the exporter's; the next
+        // check re-validates them before any consumer reads them.
+        if !state.cached_fold_reasons.is_empty() {
+            self.dioph_needs_revalidation = true;
+        }
+        self.dioph_cached_fold_reasons = state.cached_fold_reasons;
         // See take_dioph_state: same-length pair-set replacement hazard.
         self.detect_algebraic_cache = None;
         self.propagated_equality_pairs = state.propagated_equality_pairs;
@@ -197,5 +206,6 @@ impl LiaSolver<'_> {
             state.lra_propagated_equality_pairs,
             state.lra_propagated_disequality_pairs,
         );
+        self.lattice_budget = state.lattice_budget;
     }
 }

@@ -29,8 +29,8 @@ fn expect_unsat(input: &str, label: &str) {
 }
 
 /// Pattern 1: Ground-pool E-matching.
-/// The universal `(=> (= x (some_uf)) (inv x))` with pattern `(inv x)` must
-/// be instantiated with x := 42 (from the ground assertion `(= 42 (some_uf))`
+/// The universal `(=> (= x some_uf) (inv x))` with pattern `(inv x)` must
+/// be instantiated with x := 42 (from the ground assertion `(= 42 some_uf)`
 /// and the negated goal `(not (inv 42))`). After instantiation, the formula
 /// is propositionally unsatisfiable.
 #[test]
@@ -41,8 +41,8 @@ fn test_ematching_ground_pool_7979() {
         (set-logic AUFLIA)
         (declare-fun inv (Int) Bool)
         (declare-fun some_uf () Int)
-        (assert (forall ((x Int)) (! (=> (= x (some_uf)) (inv x)) :pattern ((inv x)))))
-        (assert (= 42 (some_uf)))
+        (assert (forall ((x Int)) (! (=> (= x some_uf) (inv x)) :pattern ((inv x)))))
+        (assert (= 42 some_uf))
         (assert (not (inv 42)))
         (check-sat)
         "#,

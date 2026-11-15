@@ -22,7 +22,8 @@ fn result_retains_chokepoint_emission_witness() {
     );
     assert!(
         !verified.was_unsat_independently_verified()
-            && !verified.was_unsat_exact_semantically_verified(),
+            && !verified.was_unsat_exact_semantically_verified()
+            && !verified.was_unsat_corroborated(),
         "strict proof authority must remain disjoint from the other UNSAT classes"
     );
 }

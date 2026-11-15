@@ -28,30 +28,55 @@ impl LiaSolver<'_> {
 
     /// Uncached term-DAG walk behind [`Self::parse_linear_expr_with_vars`];
     /// called once per `(lhs, rhs)` by the #C2 cache builder.
+    ///
+    /// The row is EXACT: it has the same solution set as `lhs = rhs`. A
+    /// non-integral constant (`(+ (to_real c) 1/2)`) is collected as a
+    /// rational and the whole row is then multiplied by the least common
+    /// denominator, so `to_real c = to_real d + 1/2` becomes
+    /// `2·c' - 2·d' = 1`. The walk used to admit only integral constants and
+    /// SILENTLY DROPPED any other one, which turned that equality into
+    /// `c' - d' = 0`; on the unpreprocessed atom
+    /// `(= (to_real c) (+ (to_real c) 1/2))` the row became `0 = 0`, so its
+    /// (valid) negation was refuted as the self-contradictory disequality
+    /// `t != t` — a 1-literal conflict that turned a satisfiable query UNSAT.
+    /// Scaling by a positive constant changes no solution, over the integers
+    /// or the reals, so every consumer of the row stays exactly as justified
+    /// as it was for integral rows.
     pub(super) fn parse_linear_expr_with_vars_uncached(
         &self,
         lhs: TermId,
         rhs: TermId,
     ) -> (HashMap<TermId, BigInt>, BigInt) {
-        let mut var_coeffs: HashMap<TermId, BigInt> = HashMap::default();
-        let mut constant = BigInt::zero();
+        let mut var_coeffs: HashMap<TermId, BigRational> = HashMap::default();
+        let mut constant = BigRational::zero();
 
         let resolve_var = |t: TermId| Some(t);
-        let convert_const = |c: &Constant| -> Option<BigInt> {
+        let convert_const = |c: &Constant| -> Option<BigRational> {
             match c {
-                Constant::Int(n) => Some(n.clone()),
-                Constant::Rational(r) if r.0.denom().is_one() => Some(r.0.numer().clone()),
+                Constant::Int(n) => Some(BigRational::from_integer(n.clone())),
+                Constant::Rational(r) => Some(r.0.clone()),
+                // Not a numeric constant: the atom is ill-sorted for
+                // arithmetic and no linear row can denote it. The callers
+                // sort-guard their atoms, so this arm is unreachable for
+                // them; keep it total without inventing a value.
                 _ => None,
             }
         };
-        let terms = self.terms;
-        let extract_mul_const = |t: TermId| terms.extract_integer_constant(t);
+        let terms = self.terms();
+        // Multiplication keeps its historical shape: only an INTEGER factor
+        // scales a coefficient, so `(* 1/2 x)` stays one opaque column (a
+        // consistent abstraction, never a dropped constant).
+        let extract_mul_const = |t: TermId| {
+            terms
+                .extract_integer_constant(t)
+                .map(BigRational::from_integer)
+        };
 
         // Parse lhs with positive sign
         linear_collect::collect_linear_terms(
-            self.terms,
+            self.terms(),
             lhs,
-            &BigInt::one(),
+            &BigRational::one(),
             &mut var_coeffs,
             &mut constant,
             &resolve_var,
@@ -63,9 +88,9 @@ impl LiaSolver<'_> {
 
         // Parse rhs with negative sign
         linear_collect::collect_linear_terms(
-            self.terms,
+            self.terms(),
             rhs,
-            &-BigInt::one(),
+            &-BigRational::one(),
             &mut var_coeffs,
             &mut constant,
             &resolve_var,
@@ -78,7 +103,42 @@ impl LiaSolver<'_> {
         // Negate constant (we're solving for Σ(coeff * var) = constant)
         constant = -constant;
 
-        (var_coeffs, constant)
+        // Clear denominators: multiply the row by the lcm of every
+        // denominator (a positive integer), which preserves its solutions.
+        let scale = var_coeffs
+            .values()
+            .chain(std::iter::once(&constant))
+            .fold(BigInt::one(), |acc, value| acc.lcm(value.denom()));
+        let scale_value = |value: &BigRational| -> BigInt {
+            let scaled = value * BigRational::from_integer(scale.clone());
+            debug_assert!(scaled.is_integer(), "BUG: row scaling left a fraction");
+            scaled.to_integer()
+        };
+        let coeffs = var_coeffs
+            .iter()
+            .map(|(&term, coeff)| (term, scale_value(coeff)))
+            .collect();
+        (coeffs, scale_value(&constant))
+    }
+
+    /// Whether `term`, a column of a parsed row, takes only integer values:
+    /// an Int-sorted term, or `to_real` of one (the `to_real` coercion of an
+    /// unpreprocessed mixed atom). Integer-only reasoning (GCD divisibility,
+    /// residues) over a row is valid only when every column is one of these;
+    /// a Real-sorted column (a Real variable, an opaque `(/ x 2)`) may take a
+    /// fractional value, and `2·r = 1` is then satisfiable.
+    pub(super) fn is_integer_valued_column(&self, term: TermId) -> bool {
+        match self.terms().sort(term) {
+            Sort::Int => true,
+            Sort::Real => matches!(
+                self.terms().get(term),
+                TermData::App(Symbol::Named(name), args)
+                    if name == "to_real"
+                        && args.len() == 1
+                        && matches!(self.terms().sort(args[0]), Sort::Int)
+            ),
+            _ => false,
+        }
     }
 
     // parse_linear_expr_for_gcd was removed in #C2: `gcd_test` now reads the
@@ -118,7 +178,10 @@ impl LiaSolver<'_> {
         let parsed = self.parse_equality_for_dioph_uncached(lhs, rhs, term_to_idx);
         self.dioph_parse_cache.borrow_mut().insert(
             key,
-            (self.var_index_epoch, parsed.clone().map(std::rc::Rc::new)),
+            (
+                self.var_index_epoch,
+                parsed.clone().map(std::sync::Arc::new),
+            ),
         );
         parsed
     }
@@ -201,26 +264,36 @@ impl LiaSolver<'_> {
 
         for (idx, coeff) in var_coeffs {
             if let Some(&term_id) = idx_to_term.get(*idx) {
-                if let Some((Some(lb), Some(ub))) = self.lra.get_bounds(term_id) {
-                    if lb.value == ub.value && lb.value.denom().is_one() {
-                        // Variable is fixed to an integer value -- fold into constant.
-                        constant -= coeff * lb.value.numer();
-                        // Collect the reason literals that justify this tight bound.
-                        // These may come from N-O shared equalities (EUF-discovered)
-                        // and MUST be included in any conflict derived from the
-                        // folded equation (#8012 soundness fix).
-                        for (&reason_term, &reason_val) in
-                            lb.reasons.iter().zip(lb.reason_values.iter())
-                        {
-                            bound_reasons.push(TheoryLit::new(reason_term, reason_val));
+                // ATOM-JUSTIFIED bounds only (#nia-sign-cut-soundness): a
+                // variable pinned by an NIA rounding pin (`x = round(model(x))`,
+                // reason = the variable term) has `lb == ub` too, and folding
+                // it turned a satisfiable Diophantine system infeasible
+                // (attack corpus gen2/h0536, h0986). The pin is not a
+                // consequence of the asserted atoms, so it is not a constant.
+                // Sentinel-only HYPOTHESIS pins (factor-split branches, the
+                // NIA's tentative-patch verification) are excluded too: the
+                // folded system is cached across pops keyed on the equality
+                // set alone, so a hypothesis folded here would outlive its
+                // scope and could carry a later refutation.
+                if let Some((Some(lb), Some(ub))) = self.justified_bounds(term_id) {
+                    if lb.value == ub.value
+                        && lb.value.denom().is_one()
+                        && Self::bound_has_atom_reason(&lb)
+                        && Self::bound_has_atom_reason(&ub)
+                    {
+                        // A derived bound can have transitive provenance not
+                        // present in its direct reason pairs. Fold only when
+                        // both sides have complete, nameable justifications;
+                        // these become premises of every cached substitution.
+                        if let (Some(lower_reasons), Some(upper_reasons)) = (
+                            self.justified_lra_bound_reasons(&lb),
+                            self.justified_lra_bound_reasons(&ub),
+                        ) {
+                            constant -= coeff * lb.value.numer();
+                            bound_reasons.extend(lower_reasons);
+                            bound_reasons.extend(upper_reasons);
+                            continue;
                         }
-                        // Also collect upper-bound reasons if they differ from lower.
-                        for (&reason_term, &reason_val) in
-                            ub.reasons.iter().zip(ub.reason_values.iter())
-                        {
-                            bound_reasons.push(TheoryLit::new(reason_term, reason_val));
-                        }
-                        continue;
                     }
                 }
             }
@@ -257,7 +330,7 @@ impl LiaSolver<'_> {
             return;
         }
 
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => {
                 *constant += scale * n;
             }
@@ -318,7 +391,7 @@ impl LiaSolver<'_> {
                         let mut var_args = Vec::new();
 
                         for &arg in args {
-                            if let Some(c) = self.terms.extract_integer_constant(arg) {
+                            if let Some(c) = self.terms().extract_integer_constant(arg) {
                                 const_factor *= c;
                             } else {
                                 var_args.push(arg);
@@ -406,7 +479,26 @@ impl LiaSolver<'_> {
     /// Use this between SAT model iterations in DPLL(T) to retain HNF cuts
     /// that are globally valid (derived from the original constraint matrix).
     pub(crate) fn clear_assertions(&mut self) {
-        self.lra.reset();
+        self.clear_assertions_impl(false);
+    }
+
+    /// Warm variant for the persistent-theory arm: identical LIA-side
+    /// clearing, but the inner LRA relaxation keeps its simplex
+    /// values/basis (`soft_reset_warm`) so re-asserted atoms warm-start
+    /// instead of re-pivoting from scratch. The bound-revision bump
+    /// inside LRA's warm reset covers the stale-memo hazard, and the
+    /// Diophantine caches are revalidated exactly as in the cold path
+    /// (`dioph_needs_revalidation` below).
+    pub(crate) fn clear_assertions_warm(&mut self) {
+        self.clear_assertions_impl(true);
+    }
+
+    fn clear_assertions_impl(&mut self, warm: bool) {
+        if warm {
+            self.lra.soft_reset_warm();
+        } else {
+            self.lra.reset();
+        }
         self.integer_vars.clear();
         self.sorted_integer_vars.clear();
         // Fresh bound state → conservative full rescan (#C4).
@@ -420,6 +512,7 @@ impl LiaSolver<'_> {
         // trail included) since `asserted` and `scopes` are both cleared (#C1).
         self.assertion_view_cache.clear();
         self.scopes.clear();
+        self.tentative_scope_marks.clear();
         self.cut_scopes.clear();
         self.cut_state_scopes.clear();
         // #C7: all scopes are gone; preserved seen_hnf_cuts keys are now base
@@ -490,7 +583,7 @@ impl LiaSolver<'_> {
         sorted.sort_by_key(|(t, _)| t.0);
         self.affine_cache
             .borrow_mut()
-            .insert(term, std::rc::Rc::new((sorted, constant.clone())));
+            .insert(term, std::sync::Arc::new((sorted, constant.clone())));
 
         LinearCoeffs { vars, constant }
     }
@@ -503,7 +596,7 @@ impl LiaSolver<'_> {
         vars: &mut HashMap<TermId, BigRational>,
         constant: &mut BigRational,
     ) {
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => {
                 *constant += scale * BigRational::from(n.clone());
             }
@@ -534,7 +627,7 @@ impl LiaSolver<'_> {
                     let mut var_args = Vec::new();
 
                     for &arg in args {
-                        match self.terms.get(arg) {
+                        match self.terms().get(arg) {
                             TermData::Const(Constant::Int(n)) => {
                                 const_factor *= BigRational::from(n.clone());
                             }

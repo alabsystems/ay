@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression: a CHECKED core deletion whose obligation the kernel discharges.
+% Constraint 3 (`x2 >= 1`) is implied by 1 and 2, so `del id 3;` takes the RUP
+% path of `check_checked_deletion` -- which runs with `only_core = true` and
+% AFTER the constraint is removed, so the database it refutes `~c` against is
+% exactly `setNone i CO`, the hypothesis of `VeriPbCore.dbBack_delete_checked`.
+% The backward invariant therefore survives this deletion, and with no
+% exclusion and no bound the forward half goes through too, so the run reports
+% nothing outside the proved fragment.
+f 3;
+del id 3;
+output EQUISATISFIABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

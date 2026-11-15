@@ -23,6 +23,11 @@ pub(super) fn extract_equality_constants(expr: &ChcExpr, var_name: &str) -> FxHa
 
 fn extract_equality_constants_rec(expr: &ChcExpr, var_name: &str, out: &mut FxHashSet<i128>) {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            for value in lambda.captures() {
+                extract_equality_constants_rec(value, var_name, out);
+            }
+        }
         ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
             // Check if this is (= var k) or (= k var)
             let (left, right) = (&*args[0], &*args[1]);

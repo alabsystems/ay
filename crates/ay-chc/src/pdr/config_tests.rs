@@ -114,3 +114,86 @@ fn test_config_builder_chaining_idempotent() {
 
     assert_eq!(config.max_frames, 20);
 }
+
+// --- Workstream B: SpacerLane (DESIGN §3.7 / §4.5) ---
+
+#[test]
+fn spacer_lane_default_is_rung_2_and_off_ignores_other_flags() {
+    assert_eq!(SpacerLane::default(), SpacerLane::OFF);
+    assert_eq!(PdrConfig::default().spacer, SpacerLane::rung(2));
+    assert_eq!(SpacerLane::rung(0), SpacerLane::OFF);
+    let mut lane = SpacerLane::OFF;
+    lane.free_pob = true;
+    lane.lift_caps = true;
+    assert_eq!(lane.validate(false), SpacerLane::OFF);
+}
+
+#[test]
+fn spacer_lane_rungs_are_cumulative() {
+    let r1 = SpacerLane::rung(1);
+    assert!(r1.enabled && r1.core_lemma && r1.ind_gen && r1.confirm_cores && r1.lift_caps);
+    assert!(!r1.free_pob && !r1.mbp_exact_lia && !r1.ind_gen_weaken);
+    assert_eq!(r1.backend, OracleBackend::Legacy);
+    assert_eq!(r1.ind_gen_max_queries, 64);
+    assert_eq!(r1.rung_label(), 1);
+    let r2 = SpacerLane::rung(2);
+    assert!(r2.free_pob && r2.mbp_exact_lia && r2.core_lemma);
+    assert_eq!(r2.rung_label(), 2);
+    let r4 = SpacerLane::rung(4);
+    assert_eq!(r4.backend, OracleBackend::Session);
+    assert_eq!(r4.ind_gen_max_queries, 256);
+    assert!(r4.free_pob);
+    assert_eq!(r4.rung_label(), 4);
+    let r5 = SpacerLane::rung(5);
+    assert!(r5.ind_gen_weaken);
+    assert_eq!(r5.rung_label(), 5);
+    assert_eq!(SpacerLane::rung(9), r5);
+}
+
+#[test]
+fn spacer_lane_validate_refuses_lift_caps_without_core_lemma() {
+    let mut lane = SpacerLane::rung(1);
+    lane.core_lemma = false;
+    let v = lane.validate(false);
+    assert!(v.enabled);
+    assert!(!v.lift_caps);
+    assert!(v.ind_gen);
+}
+
+#[test]
+fn spacer_lane_from_default_switches_is_rung_2() {
+    let sw = crate::ab_switches::ChcAbSwitches::default();
+    assert_eq!(SpacerLane::from_ab_switches(&sw), SpacerLane::rung(2));
+    let mut sw0 = sw;
+    sw0.spacer_rung = 0;
+    sw0.spacer_free_pob = Some(true);
+    assert_eq!(
+        SpacerLane::from_ab_switches(&sw0),
+        SpacerLane::OFF,
+        "rung 0 is the legacy pipeline whatever the overrides say"
+    );
+    let mut sw2 = sw;
+    sw2.spacer_rung = 1;
+    assert_eq!(SpacerLane::from_ab_switches(&sw2), SpacerLane::rung(1));
+    let mut sw3 = sw;
+    sw3.spacer_rung = 2;
+    sw3.spacer_free_pob = Some(false);
+    let lane = SpacerLane::from_ab_switches(&sw3);
+    assert!(lane.enabled && !lane.free_pob && !lane.mbp_exact_lia && lane.core_lemma);
+    let mut sw4 = sw;
+    sw4.spacer_confirm_cores = Some(false);
+    let lane = SpacerLane::from_ab_switches(&sw4);
+    assert!(lane.enabled && !lane.confirm_cores && lane.core_lemma);
+}
+
+#[test]
+fn spacer_core_profile_sets_spacer_defaults() {
+    let p = PdrConfig::spacer_core_profile(PdrConfig::default().with_spacer(SpacerLane::OFF));
+    assert!(p.spacer.enabled);
+    assert_eq!(p.spacer, SpacerLane::rung(1));
+    assert!(!p.use_pob_push && !p.use_restarts && !p.use_may_pobs && !p.use_convex_closure);
+    assert!(p.use_mbp);
+    let base = PdrConfig::default().with_spacer(SpacerLane::rung(2));
+    let p2 = PdrConfig::spacer_core_profile(base);
+    assert_eq!(p2.spacer, SpacerLane::rung(2));
+}

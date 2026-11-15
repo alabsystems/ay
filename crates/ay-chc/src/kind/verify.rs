@@ -113,7 +113,11 @@ impl KindSolver {
         inv: &ChcExpr,
         run_start: ay_core::time::Instant,
     ) -> bool {
-        let mut ctx = self.problem.make_smt_context();
+        // INV-S2 (#horn-smt-session §7.2): Kind's fresh cross-checks decide
+        // whether a candidate becomes Safe; they never use a `HornSmt` session
+        // (their contexts are Search-lane since Rung 0, so this is their pin).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+        let mut ctx = self.problem.make_search_smt_context();
         let nominal_timeout = std::time::Duration::from_secs(2);
 
         // 1. init => inv
@@ -205,6 +209,8 @@ impl KindSolver {
         is_forward: bool,
         run_start: ay_core::time::Instant,
     ) -> bool {
+        // INV-S2 (#horn-smt-session §7.2).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let nominal_timeout = std::time::Duration::from_secs(5);
         let timeout = self.validation_stage_timeout_for_run(run_start, nominal_timeout);
         if timeout.is_zero() {
@@ -220,7 +226,7 @@ impl KindSolver {
         // 1. Re-check the induction step with a fresh context.
         // Forward: ¬Q(x0) ∧ Tr(x0,x1) ∧ ¬Q(x1) ∧ ... ∧ ¬Q(xk) ∧ Q(x{k+1})
         // Backward: Init(x0) ∧ Tr(x0,x1) ∧ ¬Init(x1) ∧ ... ∧ Tr(xk,x{k+1}) ∧ ¬Init(x{k+1})
-        let mut ctx = self.problem.make_smt_context();
+        let mut ctx = self.problem.make_search_smt_context();
         let induction_formula = if is_forward {
             let mut conjuncts = Vec::new();
             for i in 0..=k {
@@ -294,11 +300,13 @@ impl KindSolver {
         k: usize,
         run_start: ay_core::time::Instant,
     ) -> FreshCheckOutcome {
+        // INV-S2 (#horn-smt-session §7.2).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let timeout = self.fresh_cross_check_timeout(run_start);
         let outcome = if timeout.is_zero() {
             FreshCheckOutcome::BudgetUnknown { timeout }
         } else {
-            let mut ctx = self.problem.make_smt_context();
+            let mut ctx = self.problem.make_search_smt_context();
             let mut conjuncts = Vec::new();
             for i in 0..=k {
                 conjuncts.push(ts.neg_query_at(i));
@@ -331,11 +339,13 @@ impl KindSolver {
         k: usize,
         run_start: ay_core::time::Instant,
     ) -> FreshCheckOutcome {
+        // INV-S2 (#horn-smt-session §7.2).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let timeout = self.fresh_cross_check_timeout(run_start);
         let outcome = if timeout.is_zero() {
             FreshCheckOutcome::BudgetUnknown { timeout }
         } else {
-            let mut ctx = self.problem.make_smt_context();
+            let mut ctx = self.problem.make_search_smt_context();
             let mut conjuncts = vec![ts.init_at(0)];
             for i in 0..=k {
                 conjuncts.push(ts.transition_at(i));
@@ -374,6 +384,8 @@ impl KindSolver {
         k: usize,
         run_start: ay_core::time::Instant,
     ) {
+        // INV-S2 (#horn-smt-session §7.2): diagnostics on fresh contexts.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let nominal_timeout = std::time::Duration::from_secs(10);
 
         fn smt_label(r: &crate::smt::SmtResult) -> &'static str {
@@ -387,7 +399,7 @@ impl KindSolver {
         }
 
         // Sanity check 1: Is the query alone satisfiable?
-        let mut ctx = self.problem.make_smt_context();
+        let mut ctx = self.problem.make_search_smt_context();
         let timeout = self.stage_timeout_for_run(run_start, nominal_timeout);
         if timeout.is_zero() {
             safe_eprintln!("KIND DIAG: skipped (budget exhausted)");
@@ -652,12 +664,38 @@ impl KindSolver {
     /// (time 0: `x`, time k>0: `x_k`). We extract per-step assignments to build
     /// a proper counterexample that passes portfolio validation without the
     /// skeleton rejection path (#5010).
+    ///
+    /// The model is first read as a full concrete trace of the unrolling
+    /// `init@0 ∧ Tr@0 ∧ … ∧ query@depth`: when it ground-validates on this
+    /// problem the counterexample carries that ground derivation and its
+    /// witness, so validation is pure evaluation (Real-sorted states have no
+    /// `i64` step assignments at all and otherwise reached the portfolio
+    /// witness-less).
     pub(super) fn make_unsafe_with_trace(
         &self,
         ts: &TransitionSystem,
         model: &FxHashMap<String, SmtValue>,
         depth: usize,
     ) -> KindResult {
+        let token = self
+            .config
+            .base
+            .cancellation_token
+            .clone()
+            .unwrap_or_default();
+        if let Some(cex) = crate::ground_derivation::linear_trace::counterexample_from_linear_trace(
+            &self.problem,
+            &crate::ground_derivation::linear_trace::LinearTrace::from_ts_unrolling(
+                ts, model, depth,
+            ),
+            Some(crate::ground_derivation::linear_trace::trace_witness_deadline()),
+            &token,
+        ) {
+            tracing::debug!(
+                "KIND: counterexample at k = {depth} ground-validated from the base-case model"
+            );
+            return KindResult::Unsafe(cex);
+        }
         let pred = self
             .problem
             .predicates()

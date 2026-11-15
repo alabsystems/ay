@@ -1572,6 +1572,37 @@ impl OptLinCertRoute {
     }
 }
 
+/// `--cert-debug` timing for ONE unscheduled floor rung.
+///
+/// The three SEARCH rungs have carried `c [cert/budget] <rung> slice=.. elapsed=..`
+/// since [`super::route_budget`] was factored out; the ten FLOOR rungs carried
+/// nothing, so a chain that spent its whole budget in a floor rung and a chain
+/// that reached the search rungs with the budget already gone were the same
+/// observation from outside. Both halves of the chain are now visible in one
+/// stream, with the same two numbers the scheduler prints.
+///
+/// Diagnostics only: the closure is called exactly once on every path, so
+/// enabling or disabling `--cert-debug` cannot change which rung fires or what
+/// it emits.
+fn trace_floor_rung<F>(route: OptLinCertRoute, rung: F) -> Option<(String, OptLinCertRoute)>
+where
+    F: FnOnce() -> Option<String>,
+{
+    if !ay_core::misc_cli_flags().cert_debug {
+        return rung().map(|proof| (proof, route));
+    }
+    let started = Instant::now();
+    let out = rung();
+    super::cert_debug_line(format_args!(
+        "c [cert/floor] {} elapsed={}ms bytes={} -> {}",
+        route.as_str(),
+        started.elapsed().as_millis(),
+        out.as_ref().map_or(0, String::len),
+        if out.is_some() { "proof" } else { "none" }
+    ));
+    out.map(|proof| (proof, route))
+}
+
 /// THE OPT-LIN certificate chain: every floor/refutation route this crate has,
 /// in the one order that is allowed to exist, tried cheapest-first.
 ///
@@ -1707,65 +1738,84 @@ pub fn certify_opt_lin_any_interruptible(
     // so they must not be put behind a budget that can be zero — a caller that
     // reaches certification with its deadline already spent (which is the
     // normal case for the CLI) still gets every one of them.
-    let floor = certify_opt_lin_trivial_zero_floor(instance, incumbent, optimum)
-        .map(|p| (p, OptLinCertRoute::TrivialZeroFloor))
-        .or_else(|| {
+    let floor = trace_floor_rung(OptLinCertRoute::TrivialZeroFloor, || {
+        certify_opt_lin_trivial_zero_floor(instance, incumbent, optimum)
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::KnapsackCardinality, || {
             certify_opt_lin_knapsack_cardinality(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::KnapsackCardinality))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::CliqueColoring, || {
             certify_opt_lin_clique_coloring(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::CliqueColoring))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::HandshakeParity, || {
             certify_opt_lin_handshake_parity(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::HandshakeParity))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::DirectAggregationFloor, || {
             certify_opt_lin_direct_aggregation_floor(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::DirectAggregationFloor))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::LpDualFloor, || {
             certify_opt_lin_lp_dual_floor(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::LpDualFloor))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::FrustratedCycle, || {
             certify_opt_lin_frustrated_cycle(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::FrustratedCycle))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::OddCycleCover, || {
             certify_opt_lin_odd_cycle_cover(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::OddCycleCover))
         })
-        .or_else(|| {
+    })
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::LayeredPebbling, || {
             certify_opt_lin_layered_pebbling(instance, incumbent, optimum)
-                .map(|p| (p, OptLinCertRoute::LayeredPebbling))
         })
-        // LAST among the unscheduled rungs, and deliberately so. It is the only
-        // one that opens a SEARCH TREE, so it is much the most expensive — but
-        // its budget is a deterministic COUNT (nodes, depth, LP polls), not the
-        // caller's clock, so it still belongs here rather than in the scheduled
-        // block: a CLI whose deadline is already spent when certification starts
-        // (the normal case) must still get it, and giving it a wall slice would
-        // make its emitted bytes depend on machine load.
-        //
-        // It is nonetheless STOPPABLE, past the node envelope in which it has
-        // ever certified anything. That is not a wall slice and it is not a
-        // schedule: `should_stop` cannot change one byte it emits, only whether
-        // the last of its budget gets spent. Without it this rung was the one
-        // place a `--timeout` did not reach, and it cost 10.5 minutes on
-        // `single-obj-f17-DCdoubleLoss` for a decline.
-        .or_else(|| {
+    })
+    // LAST among the unscheduled rungs, and deliberately so. It is the only
+    // one that opens a SEARCH TREE, so it is much the most expensive — but
+    // its budget is a deterministic COUNT (nodes, depth, LP polls), not the
+    // caller's clock, so it still belongs here rather than in the scheduled
+    // block: a CLI whose deadline is already spent when certification starts
+    // (the normal case) must still get it, and giving it a wall slice would
+    // make its emitted bytes depend on machine load.
+    //
+    // It is nonetheless STOPPABLE, past the node envelope in which it has
+    // ever certified anything. That is not a wall slice and it is not a
+    // schedule: `should_stop` cannot change one byte it emits, only whether
+    // the last of its budget gets spent. Without it this rung was the one
+    // place a `--timeout` did not reach, and it cost 10.5 minutes on
+    // `single-obj-f17-DCdoubleLoss` for a decline.
+    .or_else(|| {
+        trace_floor_rung(OptLinCertRoute::CertifiedBb, || {
             certify_opt_lin_certified_bb_interruptible(instance, incumbent, optimum, should_stop)
-                .map(|p| (p, OptLinCertRoute::CertifiedBb))
-        });
+        })
+    });
     if floor.is_some() {
         return floor;
     }
+    certify_opt_lin_search_rungs(instance, incumbent, optimum, deadline, should_stop)
+}
 
-    // RUNGS 9-11: SEARCH, one deadline each. `bounds_pb_native` is last and is
-    // the rung that closes the most misses, so it is precisely the one a shared
-    // deadline starves.
+/// RUNGS 9-11 of [`certify_opt_lin_any_interruptible`]: SEARCH, one deadline
+/// each. `bounds_pb_native` is last and is the rung that closes the most
+/// misses, so it is precisely the one a shared deadline starves.
+fn certify_opt_lin_search_rungs(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    deadline: Option<Instant>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(String, OptLinCertRoute)> {
     let mut budget = CertRouteBudget::new(deadline, OPT_LIN_SEARCH_ROUTES, should_stop);
     let mut pbp = budget
         .run(OptLinCertRoute::BoundsCompact.as_str(), |stop| {

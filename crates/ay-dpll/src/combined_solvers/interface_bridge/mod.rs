@@ -5,6 +5,7 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 mod propagate;
+mod track_plan;
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{TermId, TermStore};
@@ -15,7 +16,10 @@ pub(super) use super::interface_bridge_eval::{
     evaluate_arith_term_with_reasons, evaluate_bool_term, evaluate_real_arith_term_with_reasons,
     evaluate_real_bool_term, lia_get_int_value_with_reasons, lra_get_real_value_with_reasons,
 };
-pub(in crate::combined_solvers) use propagate::has_unjustified_int_leaf;
+pub(in crate::combined_solvers) use propagate::{
+    has_unjustified_int_leaf, has_unjustified_real_leaf,
+};
+pub(in crate::combined_solvers) use track_plan::InterfaceTrackPlans;
 
 /// Trail entry for incremental push/pop of interface term tracking (#3077).
 /// Instead of cloning 3 HashSets on every push, we record individual insertions
@@ -65,6 +69,11 @@ pub(super) struct InterfaceBridge {
     interface_trail: Vec<InterfaceTrailEntry>,
     /// Push/pop depth counter for balance checking (#4714, #4995).
     scope_depth: usize,
+    /// Memoised LIA-lane tracking plan per literal (see `track_plan`). A pure
+    /// function of the term DAG, so push/pop/reset keep it.
+    track_plans: HashMap<TermId, std::rc::Rc<[track_plan::TrackOp]>>,
+    /// The LRA-lane counterpart of `track_plans` (rational constants).
+    real_track_plans: HashMap<TermId, std::rc::Rc<[track_plan::TrackOp]>>,
 }
 
 impl InterfaceBridge {
@@ -77,6 +86,8 @@ impl InterfaceBridge {
             propagated_term_values: HashMap::default(),
             interface_trail: Vec::new(),
             scope_depth: 0,
+            track_plans: HashMap::default(),
+            real_track_plans: HashMap::default(),
         }
     }
 
@@ -90,119 +101,16 @@ impl InterfaceBridge {
     /// `(distinct A B)` becomes `NOT(= A B)`. Both sides are registered so
     /// the bridge can evaluate them and propagate value equalities to EUF.
     pub(super) fn track_interface_term(&mut self, terms: &TermStore, literal: TermId) {
-        use crate::term_helpers::{extract_interface_arith_term, extract_uf_mixed_interface_term};
-        if let Some(arith_term) = extract_interface_arith_term(terms, literal) {
-            if self.interface_arith_terms.insert(arith_term) {
-                self.interface_trail
-                    .push(InterfaceTrailEntry::ArithTerm(arith_term));
-            }
-        }
-        // Also track UF-mixed terms like (+ (g x) 1) for evaluation by the bridge (#4767).
-        if let Some(uf_mixed_term) = extract_uf_mixed_interface_term(terms, literal) {
-            if self.interface_arith_terms.insert(uf_mixed_term) {
-                self.interface_trail
-                    .push(InterfaceTrailEntry::ArithTerm(uf_mixed_term));
-            }
-        }
-        // #uflia-hard-mixed-eq: track UF-mixed compound operands of equality
-        // atoms even when NEITHER side is pure arithmetic. The extractors
-        // above both require a pure-arith side, so an equality between a UF
-        // application and a UF-mixed compound (`(= (Sum a b) (+ (Sum c d) y x))`,
-        // mathsat EufLaArithmetic hard*) registered nothing: the bridge never
-        // evaluated the compound, the `compound = constant` interface equality
-        // was never proposed, and the disequality refutation (SAT asserts the
-        // atom false; EUF must derive both sides ~ the same constant) was
-        // unreachable — the N-O search accepted a model the strict
-        // ite_uf_definition gate then rejected, degrading UNSAT to unknown.
-        {
-            use crate::term_helpers::extract_uf_mixed_eq_operands;
-            let (mixed_lhs, mixed_rhs) = extract_uf_mixed_eq_operands(terms, literal);
-            for t in [mixed_lhs, mixed_rhs].into_iter().flatten() {
-                if self.interface_arith_terms.insert(t) {
-                    self.interface_trail.push(InterfaceTrailEntry::ArithTerm(t));
-                }
-            }
-        }
-        // Track distinct argument terms so the bridge evaluates them (#5081).
-        self.track_distinct_args(terms, literal);
-    }
-
-    /// Register both sides of distinct/disequality as interface arith terms (#5081).
-    ///
-    /// After `mk_distinct`, binary `distinct` becomes `NOT(= LHS RHS)`.
-    /// If LHS or RHS is an Int-sorted expression that is arithmetically evaluable,
-    /// register it so the bridge can evaluate it and propagate `term = constant`
-    /// equalities to EUF. When both sides evaluate to the same integer, EUF's
-    /// distinct check detects the conflict.
-    pub(super) fn track_distinct_args(&mut self, terms: &TermStore, literal: TermId) {
-        use crate::term_helpers::decode_non_bool_eq;
-        // Unwrap NOT for distinct (= NOT(= ...))
-        let inner = match terms.get(literal) {
-            TermData::Not(inner) => *inner,
-            _ => return,
-        };
-        let (lhs, rhs) = match decode_non_bool_eq(terms, inner) {
-            Some(pair) => pair,
-            None => return,
-        };
-        // Register both sides if they are arithmetic-sorted and evaluable.
-        // The bridge's evaluate_arith_term_with_reasons handles Int;
-        // evaluate_real_arith_term_with_reasons handles Real (#4906).
-        for arg in <[_; 2]>::from((lhs, rhs)) {
-            if matches!(terms.sort(arg), ay_core::Sort::Int | ay_core::Sort::Real)
-                && is_arith_evaluable(terms, arg)
-                && self.interface_arith_terms.insert(arg)
-            {
-                self.interface_trail
-                    .push(InterfaceTrailEntry::ArithTerm(arg));
-            }
-        }
+        let mut ops = Vec::new();
+        track_plan::plan_interface_term(terms, literal, &mut ops);
+        self.apply_track_ops(&ops);
     }
 
     /// Register arithmetic arguments of UF applications as interface terms. (#5081)
     pub(super) fn track_uf_arith_args(&mut self, terms: &TermStore, root: TermId) {
-        let mut stack = vec![root];
-        let mut visited = HashSet::default();
-        while let Some(term) = stack.pop() {
-            if !visited.insert(term) {
-                continue;
-            }
-            match terms.get(term) {
-                TermData::App(Symbol::Named(name), args) => {
-                    // Array congruence also needs arithmetic index terms from
-                    // builtins like `select` / `store`, not just UF arguments.
-                    let track_args = !BUILTIN_OPS.contains(&name.as_str())
-                        || name == "select"
-                        || name == "store";
-                    if track_args && !args.is_empty() {
-                        // #6846: Track the UF application ITSELF as an interface
-                        // arith term when it has Int/Real sort. Without this,
-                        // discover_model_equality() cannot detect when two UF
-                        // applications (e.g., RF(expr1) and RF(expr2)) evaluate
-                        // to the same value in the arithmetic model.
-                        if !BUILTIN_OPS.contains(&name.as_str())
-                            && matches!(terms.sort(term), ay_core::Sort::Int | ay_core::Sort::Real)
-                            && self.interface_arith_terms.insert(term)
-                        {
-                            self.interface_trail
-                                .push(InterfaceTrailEntry::ArithTerm(term));
-                        }
-                        for &arg in args {
-                            if is_arith_evaluable(terms, arg)
-                                && self.interface_arith_terms.insert(arg)
-                            {
-                                self.interface_trail
-                                    .push(InterfaceTrailEntry::ArithTerm(arg));
-                            }
-                        }
-                    }
-                    stack.extend(args.iter().copied());
-                }
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(c, t, e) => stack.extend([*c, *t, *e]),
-                _ => {}
-            }
-        }
+        let mut ops = Vec::new();
+        track_plan::plan_uf_arith_args(terms, root, &mut ops);
+        self.apply_track_ops(&ops);
     }
 
     // Constant collection and evaluation/propagation methods live in propagate.rs.
@@ -373,3 +281,7 @@ fn is_arith_evaluable(terms: &TermStore, term: TermId) -> bool {
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod track_plan_real_tests;
+#[cfg(test)]
+mod track_plan_tests;

@@ -31,12 +31,26 @@ CNF=$1
 TMO_MS=${2:-120000}
 AY=${3:-$(dirname "$0")/../target/release/ay}
 if [ -z "$CNF" ]; then echo "usage: ay_portfolio.sh <cnf> [timeout_ms] [ay_binary]" >&2; exit 2; fi
+
+# The arms share ONE job, so they split the SAT-COMP per-job memory limit
+# (competition/sat26_memory_limit.sh; the matrix states no separate limit for
+# the parallel/cloud tracks) rather than each taking a default sized from the
+# node's RAM. Every arm gets the job's ceiling with AY_CONCURRENCY set to the
+# arm count, so ay splits the shared bounds (the ceiling and the cgroup)
+# itself and still honours any tighter rlimit; its kernel-held budget (macOS)
+# is its share rounded up to MiB and bounds its supervising process.
+# shellcheck source=competition/sat26_memory_limit.sh
+. "$(dirname "$0")/sat26_memory_limit.sh"
+if [ "${AY_PF_ARM_C:-0}" = "1" ]; then ARM_COUNT=3; else ARM_COUNT=2; fi
+ARM_GOVERN_AY_MB=$(( (SAT26_MEMORY_LIMIT_BYTES / ARM_COUNT + 1048575) / 1048576 ))
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ay_pf.XXXXXX")
 
 PIDS=""
 start_arm() {  # name env-assignments...
   name=$1; shift
-  ( env "$@" "$AY" solve "$CNF" --competition -t "$TMO_MS" >"$WORK/out.$name" 2>"$WORK/err.$name"
+  ( env -u AY_GOVERN_ARMED -u AY_ROOT_PID GOVERN_AY_MB="$ARM_GOVERN_AY_MB" \
+      AY_CONCURRENCY="$ARM_COUNT" "$@" "$AY" solve "$CNF" --competition -t "$TMO_MS" \
+      --memory-ceiling-bytes "$SAT26_MEMORY_LIMIT_BYTES" >"$WORK/out.$name" 2>"$WORK/err.$name"
     if grep -qiE '^s (SATISFIABLE|UNSATISFIABLE)' "$WORK/out.$name"; then : >"$WORK/win.$name"; fi ) &
   PIDS="$PIDS $!"
 }

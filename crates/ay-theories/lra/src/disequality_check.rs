@@ -107,11 +107,11 @@ impl LraSolver {
                         let pinned = info
                             .lower
                             .as_ref()
-                            .is_some_and(|lb| lb.value == info.value.rational())
+                            .is_some_and(|lb| &lb.value == info.value.x())
                             && info
                                 .upper
                                 .as_ref()
-                                .is_some_and(|ub| ub.value == info.value.rational());
+                                .is_some_and(|ub| &ub.value == info.value.x());
                         if debug && !pinned {
                             safe_eprintln!(
                                 "[LRA] Var {} has slack: value={}, lb={:?}, ub={:?}",
@@ -407,6 +407,7 @@ impl LraSolver {
         // variable values — memo invalid and tracked-only chain broken
         // (#inc-guard-chain).
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         // #warm-simplex: untracked value writes (and rollback below).
         self.warm_invalidate();
@@ -496,11 +497,11 @@ impl LraSolver {
                     self.vars.get(var as usize).is_some_and(|info| {
                         info.lower
                             .as_ref()
-                            .is_some_and(|lb| lb.value == info.value.rational())
+                            .is_some_and(|lb| &lb.value == info.value.x())
                             && info
                                 .upper
                                 .as_ref()
-                                .is_some_and(|ub| ub.value == info.value.rational())
+                                .is_some_and(|ub| &ub.value == info.value.x())
                     })
                 });
 
@@ -625,11 +626,11 @@ impl LraSolver {
                     let is_pinned = info
                         .lower
                         .as_ref()
-                        .is_some_and(|lb| lb.value == info.value.rational() && !lb.strict)
+                        .is_some_and(|lb| &lb.value == info.value.x() && !lb.strict)
                         && info
                             .upper
                             .as_ref()
-                            .is_some_and(|ub| ub.value == info.value.rational() && !ub.strict);
+                            .is_some_and(|ub| &ub.value == info.value.x() && !ub.strict);
                     if debug {
                         safe_eprintln!(
                             "[LRA]   var={} coeff={} value={} pinned={} lb={:?} ub={:?}",
@@ -752,7 +753,7 @@ impl LraSolver {
                 value,
                 (term, value),
             );
-            materialized += 1;
+            materialized = materialized.saturating_add(1);
         }
         materialized
     }

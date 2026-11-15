@@ -6,7 +6,7 @@
 //! This module deliberately separates three things that are easy to conflate:
 //!
 //! * the normative SMT-LIB 2.7 language and registry,
-//! * Z3 5.1.0's extensions and observable behavior, and
+//! * Z3 5.3.3's extensions and observable behavior, and
 //! * evidence that this exact AY build implements either surface.
 //!
 //! A passing corpus is evidence for rows in a contract; it is never allowed to
@@ -27,16 +27,30 @@ use ay_bench::{
     ENFORCEMENT_RSS_WATCHDOG_V1,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
+mod checker_cohort;
+mod current_abi;
+mod current_behavior;
+mod current_release;
+mod domination;
+#[cfg(any(target_os = "linux", test))]
+mod elf_binding;
 mod gate_integrity;
 mod language_semantics;
 mod lexical_grammar;
 mod logic_registry;
 mod official_corpus;
+mod provision;
+mod qualify;
 mod reference_inventory;
+mod reference_platform;
 mod sat_models;
 mod standard_commands;
+mod stock_c;
+mod stock_cpp;
+mod stock_python;
 mod theory_registry;
 mod unknown_policy;
 mod unsat_proofs;
@@ -46,15 +60,27 @@ mod z3_source_inventory;
 const MANIFEST_SCHEMA: &str = "ay-smtlib-conformance-contract/v1";
 const VALIDATOR_RECEIPT_SCHEMA: &str = "ay-smtlib-validator-receipt/v2";
 const CHECK_RECEIPT_SCHEMA: &str = "ay-smtlib-conformance-check-receipt/v1";
-const PROFILE_ID: &str = "smtlib-2.7+z3-5.1.0";
+const PROFILE_ID: &str = "smtlib-2.7+z3-5.3.3";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_VALIDATOR_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
+// The current source owner retains every unresolved registration candidate;
+// its complete authenticated population needs about 10 MiB of detailed rows.
+const MAX_VALIDATOR_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSIONS: usize = 64;
 const MAX_REQUIREMENTS: usize = 100_000;
 const MAX_EVIDENCE_PER_ROW: usize = 64;
 const MAX_REFERENCE_INPUTS: usize = 64;
 const MAX_AUXILIARY_TOOLS: usize = 16;
 const UNASSIGNED_CAMPAIGN: &str = "unassigned";
+
+// These tests acquire the production machine-wide resource lease. Hold the
+// parent-side lock across isolated re-execution too: a fresh process cannot
+// coordinate through the parent's in-process resource state.
+#[cfg(test)]
+fn resource_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const SMTLIB_COMMANDS: [&str; 32] = [
     "assert",
@@ -195,9 +221,9 @@ const DIMENSIONS: [DimensionSpec; 12] = [
         validator_kind: ValidatorKind::UnknownPolicy,
     },
     DimensionSpec {
-        id: "overlay.z3-5.1.0",
-        title: "Exact Z3 5.1.0 overlay",
-        definition: "All Z3 5.1.0 commands, aliases, extensions, diagnostics, options, tactics, probes, and transcript quirks are source-inventoried and differentially validated.",
+        id: "overlay.z3-5.3.3",
+        title: "Exact Z3 5.3.3 overlay",
+        definition: "Require complete source inventory and differential validation of Z3 5.3.3 commands, aliases, extensions, diagnostics, options, tactics, probes, and transcript quirks; the historical 5.1 census cannot establish completion.",
         validator_kind: ValidatorKind::Z3Differential,
     },
     DimensionSpec {
@@ -564,6 +590,10 @@ enum CheckMode {
 #[serde(deny_unknown_fields)]
 struct AuditReport {
     complete: bool,
+    #[serde(default)]
+    universal_equivalence_proven: bool,
+    #[serde(default)]
+    query_evidence: Option<official_corpus::QueryEvidenceCoverage>,
     summary: AuditSummary,
     dimensions: Vec<DimensionReport>,
     blockers: Vec<String>,
@@ -594,6 +624,17 @@ struct DimensionReport {
 #[derive(Default)]
 struct ReceiptCache {
     values: BTreeMap<String, (String, ValidatorReceipt)>,
+    // Local to one validate_contract call over one immutable contract/base.
+    // Never persist this set or share it with another validation call.
+    completed_replays: Vec<ReceiptReplayKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReceiptReplayKey {
+    reference: EvidenceRef,
+    dimension: String,
+    expected_kind: ValidatorKind,
+    requested_mode: ValidationMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,8 +654,12 @@ impl ValidationMode {
     }
 }
 
-fn canonical_profile() -> Profile {
-    Profile {
+fn canonical_profile() -> Result<Profile, String> {
+    canonical_profile_for(reference_platform::Release::native()?)
+}
+
+fn canonical_profile_for(release: reference_platform::Release) -> Result<Profile, String> {
+    Ok(Profile {
         id: PROFILE_ID.to_string(),
         standard: StandardTarget {
             name: "SMT-LIB".to_string(),
@@ -654,45 +699,33 @@ fn canonical_profile() -> Profile {
         },
         z3_overlay: Z3Target {
             product: "Z3".to_string(),
-            version: "5.1.0".to_string(),
+            version: "5.3.3".to_string(),
             source_repository: "https://github.com/Z3Prover/z3.git".to_string(),
-            source_tag: "z3-5.1.0".to_string(),
-            source_commit: "0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8".to_string(),
-            tracked_source_file_count: 2_756,
+            source_tag: "z3-5.3.3".to_string(),
+            source_commit: "430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e".to_string(),
+            tracked_source_file_count: 3_661,
             tracked_source_tree_digest_kind: "sorted-path-git-blob-size-manifest/v1".to_string(),
             tracked_source_tree_sha256:
-                "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b".to_string(),
+                "a48aaa79d461d07f90ffbf4323a7c3b674457145fde1cd5ecf312bbd46343967".to_string(),
             reference_executable: ReferenceExecutable {
-                // NOTE: this public path is writable by anything on the machine,
-                // and on 2026-07-20 it WAS overwritten -- a hand-built Z3 5.0.0
-                // was copied over it, making the reference oracle's identity
-                // depend on whoever wrote last. The SHA-256 below is the only
-                // thing that catches that, so it is load-bearing rather than
-                // decorative: `stage_authenticated_executable` re-hashes this
-                // file and fails closed on any mismatch.
-                //
-                // A brew upgrade restoring the Cellar symlink would point this at
-                // 4.16.0 -- a DIFFERENT solver behind an unchanged filename --
-                // and the hash check is what turns that into a failure instead of
-                // a silently wrong differential.
-                path: "/opt/homebrew/bin/z3".to_string(),
-                architecture: "aarch64".to_string(),
-                version_output: "Z3 version 5.1.0 - 64 bit".to_string(),
-                sha256: "8b61a8bc0b7a4e14dfb119910502ef808b055df636b25c8b67b96ae630fbc29c"
-                    .to_string(),
+                // The audited release cache is only a locator. Staging hashes
+                // the executable again; cache presence never authenticates it.
+                path: release.cache_locator("z3"),
+                architecture: release.platform.architecture().to_string(),
+                version_output: "Z3 version 5.3.3 - 64 bit - build hashcode 430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e".to_string(),
+                sha256: release.executable_sha256.to_string(),
             },
             reference_shared_library: ReferenceSharedLibrary {
-                path: "/opt/homebrew/opt/z3/lib/libz3.dylib".to_string(),
-                full_version: "5.1.0.0".to_string(),
-                sha256: "45344d6a38b6f75304433c2458d6fa16bc4907d426c96e2bedf0a90603460422"
-                    .to_string(),
+                path: release.cache_locator(release.platform.library_name()),
+                full_version: "5.3.3.0 430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e 430d19e".to_string(),
+                sha256: release.library_sha256.to_string(),
             },
         },
-    }
+    })
 }
 
 fn canonical_profile_sha256() -> Result<String, String> {
-    let bytes = serde_json::to_vec(&canonical_profile())
+    let bytes = serde_json::to_vec(&canonical_profile()?)
         .map_err(|error| format!("serializing canonical profile: {error}"))?;
     Ok(sha256_bytes(&bytes))
 }
@@ -768,7 +801,7 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
                     Classification::Standard,
                     format!("Implement the SMT-LIB 2.7 `{name}` command production"),
                     expectation(
-                        Some("accept every well-formed standard production; accepted non-standard forms must be owned by the exact Z3 5.1.0 overlay, and all other malformed arity or delimiter forms are rejected"),
+                        Some("accept every well-formed standard production; accepted non-standard forms must be owned by the exact Z3 5.3.3 overlay, and all other malformed arity or delimiter forms are rejected"),
                         None,
                         Some("apply the command's normative preconditions, effects, and output behavior"),
                         None,
@@ -867,43 +900,43 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
             ),
             "the unknown-reason registry and artifact-revocation matrix are not exhaustively validated",
         )],
-        "overlay.z3-5.1.0" => vec![
+        "overlay.z3-5.3.3" => vec![
             requirement(
                 format!("{}.c-abi", spec.id),
                 SourceCohort::Z3Source,
-                "exact-11-header-z3-5.1.0-include-graph;clang-c11-declaration-manifest;authenticated-libz3-5.1.0-export-table;live-stock-c-api-probes;per-symbol-semantic-contracts",
+                "exact-11-header-z3-5.3.3-include-graph;clang-c11-declaration-manifest;authenticated-libz3-5.3.3-export-table;live-stock-c-api-probes;per-symbol-semantic-contracts",
                 Classification::ExactOverlay,
-                "Require the exact 805-declaration Z3 5.1.0 C header/signature surface, resolution of all 807 exports, all 99 scoped observations, and authenticated executed-call plus exhaustive semantic-contract evidence for every declaration",
+                "Require all 817 audited Z3 5.3.3 C declarations, the complete authenticated export and enum surface, and executed-call plus exhaustive semantic-contract evidence for every declaration",
                 expectation(
                     None,
-                    Some("all 805 header declarations and signatures match, all 807 required export names resolve, all 99 scoped observations match, and all 805 declarations pass executed-call and exhaustive semantic-contract differentials"),
+                    Some("all 817 declarations and signatures match, all 370 enum constants match including 31 shifted existing values, every required export resolves, and every declaration passes executed-call and exhaustive semantic-contract differentials"),
                     None,
                     Some("every header declaration, signature, required export, guarded scoped probe, per-symbol callability row, and per-symbol semantic-contract row passes"),
                     "the authenticated AY and Z3 shared-library bytes, clean current-main build stamp, exact headers/signatures/exports, scoped observations, executed calls, and semantic contracts are replayed; header and symbol resolution alone never prove an implementation ABI or behavior",
                 ),
-                "there is no authenticated current-main `builtin.z3-abi-5.0.v1` receipt",
+                "the full-domain semantic contracts of the 817-declaration Z3 5.3.3 surface remain open; named finite checks do not close them",
             ),
             requirement(
                 format!("{}.target-identity", spec.id),
                 SourceCohort::Z3Source,
                 "scripts/VERSION.txt;src/util/z3_version.h.in;live CLI/library identity",
                 Classification::ExactOverlay,
-                "Authenticate the pinned Z3 executable bytes and require AY's Z3-mode CLI identity transcript to report exactly Z3 5.1.0",
+                "Authenticate the pinned Z3 executable bytes and require AY's Z3-mode CLI identity transcript to report exactly Z3 5.3.3",
                 expectation(
                     None,
                     None,
                     None,
-                    Some("every oracle and differential receipt reports exactly Z3 5.1.0"),
+                    Some("every oracle and differential receipt reports exactly Z3 5.3.3"),
                     "the transcript is evidence only for the authenticated executable; source and shared-library closure remain separate profile and inventory obligations",
                 ),
-                "the exact Z3 5.1.0 executable and AY identity transcript have not been validated for one closed campaign",
+                "the exact Z3 5.3.3 executable and AY identity transcript have not been validated for one closed campaign",
             ),
             requirement(
                 format!("{}.source-inventory", spec.id),
                 SourceCohort::Z3Source,
                 "source-tree:commands,logics,theories,options,tactics,probes,extensions",
                 Classification::ExactOverlay,
-                "Extract every Z3 5.1.0 extension and alias that is observable through the CLI",
+                "Extract every Z3 5.3.3 extension and alias that is observable through the CLI",
                 expectation(
                     Some("all accepted Z3-only syntax and commands are owned by one overlay row"),
                     Some("all Z3-only signature and coercion behavior is explicit"),
@@ -911,14 +944,14 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
                     None,
                     "nothing discovered in the pinned source or live registries is unclassified",
                 ),
-                "the Z3 5.1.0 observable source inventory is not closed",
+                "the Z3 5.3.3 observable source inventory is not closed",
             ),
             requirement(
                 format!("{}.behavioral-transcripts", spec.id),
                 SourceCohort::Z3Source,
                 "live-oracle:exact-cli-transcript-matrix",
                 Classification::ExactOverlay,
-                "Differentially validate exit status, stdout, stderr, diagnostics, streaming, and stateful transcript behavior against the pinned Z3 5.1.0 binary",
+                "Differentially validate exit status, stdout, stderr, diagnostics, streaming, and stateful transcript behavior against the pinned Z3 5.3.3 binary",
                 expectation(
                     Some("accepted and rejected transcript forms match their declared comparator"),
                     None,
@@ -988,7 +1021,7 @@ fn starter_contract(subject: Subject) -> Result<Contract, String> {
     }
     Ok(Contract {
         schema: MANIFEST_SCHEMA.to_string(),
-        profile: canonical_profile(),
+        profile: canonical_profile()?,
         campaign_id: UNASSIGNED_CAMPAIGN.to_string(),
         resource_envelope: None,
         subject,
@@ -1002,7 +1035,7 @@ fn starter_inventory_granularity(spec: DimensionSpec) -> InventoryGranularity {
         | "gate.integrity"
         | "language.lexical-and-grammar"
         | "language.commands"
-        | "overlay.z3-5.1.0"
+        | "overlay.z3-5.3.3"
         | "registry.logics"
         | "registry.theories"
         | "semantics.command-state-machine"
@@ -1043,7 +1076,7 @@ fn validate_contract(
             contract.schema
         ));
     }
-    if contract.profile != canonical_profile() {
+    if contract.profile != canonical_profile()? {
         return Err(format!(
             "profile drift: the manifest must use the built-in {PROFILE_ID} profile byte-for-byte"
         ));
@@ -1243,6 +1276,30 @@ fn validate_contract(
         blockers.push("resource_envelope is not bound".to_string());
     }
 
+    // Fixed model/proof canaries exercise publication policy, not every
+    // decision in the official corpus. Exhaustive canary coverage cannot
+    // discharge the contract's per-query obligations.
+    let query_evidence = match official_corpus::query_evidence_coverage(
+        contract,
+        manifest_dir,
+        ValidationMode::Structural,
+    ) {
+        Ok(coverage) => {
+            if !coverage.sat_complete() {
+                blockers.push(format!("results.sat-models: independently checked {}/{} SAT queries; {} missing or regressed query results", coverage.sat_checked, coverage.sat, coverage.invalid_or_regressed));
+            }
+            if !coverage.unsat_complete() {
+                blockers.push(format!("results.unsat-proofs: independently checked {}/{} UNSAT queries; {} missing or regressed query results", coverage.unsat_checked, coverage.unsat, coverage.invalid_or_regressed));
+            }
+            Some(coverage)
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "results.sat-models/results.unsat-proofs: per-query evidence unavailable: {error}"
+            ));
+            None
+        }
+    };
     let reference_incomplete_dimensions = DIMENSIONS.len() - reference_complete_dimensions;
     let complete = blockers.is_empty()
         && reference_incomplete_dimensions == 0
@@ -1253,16 +1310,18 @@ fn validate_contract(
         verify_reference_artifact(
             &contract.profile.z3_overlay.reference_executable.path,
             &contract.profile.z3_overlay.reference_executable.sha256,
-            "Z3 5.1.0 executable",
+            "Z3 5.3.3 executable",
         )?;
         verify_reference_artifact(
             &contract.profile.z3_overlay.reference_shared_library.path,
             &contract.profile.z3_overlay.reference_shared_library.sha256,
-            "Z3 5.1.0 shared library",
+            "Z3 5.3.3 shared library",
         )?;
     }
     Ok(AuditReport {
         complete,
+        universal_equivalence_proven: false,
+        query_evidence,
         summary: AuditSummary {
             dimension_count: DIMENSIONS.len(),
             requirement_count,
@@ -1311,7 +1370,7 @@ fn validate_requirement(requirement: &Requirement, spec: DimensionSpec) -> Resul
         }
     }
     let expected_classification = match spec.id {
-        "overlay.z3-5.1.0" => Classification::ExactOverlay,
+        "overlay.z3-5.3.3" => Classification::ExactOverlay,
         "results.sat-models"
         | "results.unsat-proofs"
         | "results.unknown-policy"
@@ -1423,13 +1482,48 @@ fn validate_evidence_set(
     context: EvidenceContext<'_>,
     cache: &mut ReceiptCache,
 ) -> Result<EvidenceResults, String> {
+    validate_evidence_set_using(evidence, context, cache, validate_validator_receipt)
+}
+
+fn validate_evidence_set_using<'a>(
+    evidence: &[EvidenceRef],
+    context: EvidenceContext<'a>,
+    cache: &mut ReceiptCache,
+    mut validate: impl FnMut(&ValidatorReceipt, EvidenceContext<'a>) -> Result<bool, String>,
+) -> Result<EvidenceResults, String> {
     let mut results = EvidenceResults {
         empty: evidence.is_empty(),
         non_passing: 0,
     };
     for reference in evidence {
-        let receipt = load_validator_receipt(reference, context.manifest_dir, cache)?;
-        let passing = validate_validator_receipt(receipt, context)?;
+        let key = ReceiptReplayKey {
+            reference: reference.clone(),
+            dimension: context.dimension.id.clone(),
+            expected_kind: context.expected_kind,
+            requested_mode: context.mode,
+        };
+        let replay_already_completed =
+            context.mode.replays_registered_validators() && cache.completed_replays.contains(&key);
+        let row_context = EvidenceContext {
+            mode: if replay_already_completed {
+                ValidationMode::Structural
+            } else {
+                context.mode
+            },
+            ..context
+        };
+        let passing = {
+            let receipt = load_validator_receipt(reference, context.manifest_dir, cache)?;
+            // Every row still checks coverage, kind, subject, profile, current
+            // artifact hashes and the validator's structural obligations.
+            // Only a successfully completed guarded replay may be reused.
+            validate(receipt, row_context)?
+        };
+        if context.mode.replays_registered_validators() && !replay_already_completed {
+            // Ok(false) authenticates a non-passing receipt; reusing its replay
+            // must never turn that negative result into a passing row.
+            cache.completed_replays.push(key);
+        }
         if !passing {
             results.non_passing += 1;
         }
@@ -1440,6 +1534,14 @@ fn validate_evidence_set(
 fn validate_validator_receipt(
     receipt: &ValidatorReceipt,
     context: EvidenceContext<'_>,
+) -> Result<bool, String> {
+    validate_validator_receipt_using(receipt, context, validate_registered_validator)
+}
+
+fn validate_validator_receipt_using<'a>(
+    receipt: &ValidatorReceipt,
+    context: EvidenceContext<'a>,
+    validate_registered: impl FnOnce(&ValidatorReceipt, EvidenceContext<'a>) -> Result<(), String>,
 ) -> Result<bool, String> {
     if receipt.schema != VALIDATOR_RECEIPT_SCHEMA {
         return Err(format!(
@@ -1542,14 +1644,17 @@ fn validate_validator_receipt(
             .sha256;
         if receipt.z3_binary_sha256.as_deref() != Some(expected) {
             return Err(format!(
-                "{} evidence is not bound to the pinned Z3 5.1.0 executable",
+                "{} evidence is not bound to the pinned Z3 5.3.3 executable",
                 context.dimension.id
             ));
         }
     } else if let Some(value) = receipt.z3_binary_sha256.as_deref() {
         validate_sha256(value, "optional z3_binary_sha256")?;
     }
-    if receipt.validator.id == "builtin.z3-abi-5.0.v1" {
+    if matches!(
+        receipt.validator.id.as_str(),
+        "builtin.z3-abi-5.0.v1" | current_abi::VALIDATOR_ID
+    ) {
         let expected = &context
             .contract
             .profile
@@ -1558,7 +1663,7 @@ fn validate_validator_receipt(
             .sha256;
         if receipt.z3_shared_library_sha256.as_deref() != Some(expected) {
             return Err(
-                "builtin.z3-abi-5.0.v1 is not bound to the pinned Z3 5.1.0 shared library"
+                "builtin.z3-abi-5.0.v1 is not bound to the pinned Z3 5.3.3 shared library"
                     .to_string(),
             );
         }
@@ -1589,7 +1694,7 @@ fn validate_validator_receipt(
         );
     }
     validate_case_results(&receipt.case_results, &receipt.cases)?;
-    validate_registered_validator(receipt, context)?;
+    validate_registered(receipt, context)?;
     let passing = receipt.result == ValidatorResult::Pass
         && receipt.exhaustive
         && receipt.cases.total > 0
@@ -1632,7 +1737,10 @@ fn validate_receipt_subject(receipt: &ValidatorReceipt, contract: &Contract) -> 
         }
         return Ok(());
     }
-    if receipt.validator.id == "builtin.z3-abi-5.0.v1" {
+    if matches!(
+        receipt.validator.id.as_str(),
+        "builtin.z3-abi-5.0.v1" | current_abi::VALIDATOR_ID
+    ) {
         match (
             contract.subject.ay_executable.as_ref(),
             receipt.subject.ay_executable_sha256.as_deref(),
@@ -1773,6 +1881,7 @@ fn resolve_validator_artifact(
         receipt.validator.id.as_str(),
         "builtin.target-identity.v1"
             | "builtin.z3-abi-5.0.v1"
+            | current_abi::VALIDATOR_ID
             | gate_integrity::VALIDATOR_ID
             | language_semantics::TYPE_SCOPE_VALIDATOR_ID
             | language_semantics::STATE_MACHINE_VALIDATOR_ID
@@ -1807,11 +1916,12 @@ fn validate_registered_validator(
     receipt: &ValidatorReceipt,
     context: EvidenceContext<'_>,
 ) -> Result<(), String> {
+    require_current_z3_validator(&receipt.validator.id)?;
     match receipt.validator.id.as_str() {
         "builtin.target-identity.v1" => {
             if receipt.validator.kind != ValidatorKind::Z3Differential
-                || context.dimension.id != "overlay.z3-5.1.0"
-                || receipt.requirement_ids != ["overlay.z3-5.1.0.target-identity".to_string()]
+                || context.dimension.id != "overlay.z3-5.3.3"
+                || receipt.requirement_ids != ["overlay.z3-5.3.3.target-identity".to_string()]
                 || !receipt.exhaustive
                 || receipt.z3_shared_library_sha256.is_some()
                 || !receipt.reference_inputs.is_empty()
@@ -1823,7 +1933,7 @@ fn validate_registered_validator(
                 );
             }
             let expected_input = sha256_bytes(b"(get-info :name)\n(get-info :version)\n(exit)\n");
-            let expected_stdout = "(:name \"Z3\")\n(:version \"5.1.0\")\n";
+            let expected_stdout = "(:name \"Z3\")\n(:version \"5.3.3\")\n";
             let expected_ids = ["ay.identity", "z3.identity"];
             if receipt.case_results.len() != expected_ids.len() {
                 return Err(
@@ -1866,6 +1976,7 @@ fn validate_registered_validator(
             }
             Ok(())
         }
+        current_abi::VALIDATOR_ID => current_abi::validate_and_replay(receipt, context),
         gate_integrity::VALIDATOR_ID => gate_integrity::validate_and_replay(receipt, context),
         language_semantics::TYPE_SCOPE_VALIDATOR_ID => {
             language_semantics::validate_type_scope(receipt, context)
@@ -1898,6 +2009,24 @@ fn validate_registered_validator(
             "unregistered validator {other:?}; only validators implemented and dispatched by this parity binary may close a conformance row"
         )),
     }
+}
+
+/// A changed receipt label or binary hash cannot upgrade a historical
+/// population. Current owners use distinct identities after reconstructing
+/// their population from the pinned source and live registries.
+fn require_current_z3_validator(id: &str) -> Result<(), String> {
+    if matches!(
+        id,
+        "builtin.z3-abi-5.0.v1"
+            | "builtin.z3-source-inventory.v1"
+            | "builtin.z3-reference-inventory.v1"
+            | "builtin.z3-behavioral-transcripts-5.1.0.v1"
+    ) {
+        return Err(format!(
+            "{id} retains historical Z3 5.1.0 source/ABI coverage; it cannot certify {PROFILE_ID}; refresh the complete 5.3.3 population and semantic evidence first"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_z3_abi_receipt_shape(
@@ -2573,11 +2702,8 @@ fn verify_artifact(artifact: &Artifact, base: &Path, label: &str) -> Result<(), 
 
 fn verify_reference_artifact(path: &str, expected_sha256: &str, label: &str) -> Result<(), String> {
     validate_sha256(expected_sha256, &format!("{label} sha256"))?;
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        return Err(format!("{label} path must be absolute"));
-    }
-    let actual = sha256_file(path, label)?;
+    let path = reference_artifact_path(path)?;
+    let actual = sha256_file(&path, label)?;
     if actual != expected_sha256 {
         return Err(format!(
             "{label} hash mismatch for {}: expected {expected_sha256}, got {actual}",
@@ -2585,6 +2711,54 @@ fn verify_reference_artifact(path: &str, expected_sha256: &str, label: &str) -> 
         ));
     }
     Ok(())
+}
+
+/// Locate the measured native reference library. This does not authenticate
+/// its bytes; registered conformance lanes must still stage/hash the artifact.
+pub(crate) fn reference_library_path() -> Result<PathBuf, String> {
+    reference_artifact_path(
+        &canonical_profile()?
+            .z3_overlay
+            .reference_shared_library
+            .path,
+    )
+}
+
+fn reference_artifact_path(value: &str) -> Result<PathBuf, String> {
+    reference_artifact_path_from(
+        value,
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn reference_artifact_path_from(
+    value: &str,
+    xdg_cache: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let Some(leaf) = value.strip_prefix("cache:") else {
+        let path = Path::new(value);
+        return if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Err("reference artifact requires an absolute path or cache: locator".to_string())
+        };
+    };
+    validate_relative_path(leaf, "reference cache locator")?;
+    let root = if let Some(root) = xdg_cache.filter(|root| !root.is_empty()) {
+        PathBuf::from(root)
+    } else {
+        let home = home.ok_or("reference cache needs XDG_CACHE_HOME or HOME")?;
+        if !Path::new(home).is_absolute() {
+            return Err("reference cache HOME must be absolute".to_string());
+        }
+        Path::new(home).join(".cache")
+    };
+    if !root.is_absolute() {
+        return Err("reference cache XDG_CACHE_HOME must be absolute".to_string());
+    }
+    Ok(root.join(leaf))
 }
 
 fn artifact_path(base: &Path, value: &str) -> PathBuf {
@@ -2661,12 +2835,57 @@ fn read_bounded_bytes(
 
 fn usage() -> &'static str {
     "\
+Qualification workflow:
+  qualify <new-directory> --ay-executable PATH --ay-shared-library PATH
+      Provision dependencies and run every registered conformance owner plus
+      repeated complete-corpus performance comparisons. Use --plan first to
+      see the work; missing and obsolete coverage remains a nonzero result.
+  qualify-check QUALIFICATION.json
+      Authenticate journals and reports, replay correctness and consumer cases,
+      and recompute retained performance. Timing reproduction needs a new run.
+  provision --directory DIR [--offline]
+      Download and authenticate the pinned Z3 and SMT-LIB source inputs.
+  provision-corpus --directory DIR [--offline]
+      Acquire all 84 official archives and authenticate their full population.
+      Retain the manifest and inputs for a later qualification run.
+  dominate <manifest> --corpus-manifest FILE --directory DIR
+      Run three fresh full-corpus comparisons, with no sampling or checkpoint
+      reuse. A measured pass is limited to this corpus, release, and machine.
+  dominate-check <manifest> --corpus-manifest FILE --receipt FILE
+      Recompute the assessment from the exact retained measured population.
+
 ay-z3-parity smtlib-conformance <command> [options]
 
 COMMANDS:
+  current-release-inventory --source DIR --out FILE
+  current-release-check FILE
+      Authenticate current source bytes, public declarations and catalogs.
+  current-abi --source DIR --ay-library FILE --out FILE
+  current-abi-check FILE
+      Measure exports, types and linked consumers; retain untested semantics.
+  current-behavior --inventory FILE --ay FILE --out FILE
+  current-behavior-check FILE
+      Compare selected current tactic, probe, simplifier and parameter behavior.
+  stock-python --ay-library FILE --directory NEW [--bindings Z3_PACKAGE_DIR]
+      Run nine isolated consumer controls and all three upstream z3py doctest
+      suites (2,480 examples). Missing, skipped or failed tests fail; passing
+      this finite suite does not establish full API equivalence.
+  stock-python-check REPORT
+      Reauthenticate inputs and replay the retained stock-binding cases.
+  stock-cpp --source DIR --ay-library FILE --out FILE
+      Compile and execute the unmodified upstream assertion-enabled C++ example.
+  stock-cpp-check REPORT
+      Reauthenticate and rerun the stock C++ example and assertion controls.
+  stock-c --source DIR --ay-library FILE --out FILE
+      Run the unmodified upstream C example and active failure controls.
+  stock-c-check REPORT
+      Authenticate retained C inputs and binaries, and replay the complete census.
+
   profile [--out <path>]
-      Print the immutable SMT-LIB 2.7 + Z3 5.1.0 source and oracle profile, or
-      publish it to a new file.
+      Print the immutable SMT-LIB 2.7 + Z3 5.3.3 source and oracle profile, or
+      publish it to a new file. A cache: locator resolves under XDG_CACHE_HOME
+      or HOME/.cache without changing profile identity. Selected bytes are
+      still authenticated against the fixed executable/library hashes.
 
   init <manifest> [--campaign <id>] [--ay-executable <path>]
                   [--ay-shared-library <path>]
@@ -2690,9 +2909,9 @@ COMMANDS:
       Git blob object IDs, byte sizes, and the profile's selection SHA-256.
 
   z3-source-snapshot <git-checkout> --out <path>
-      Authenticate tag z3-5.1.0 and its exact commit, then retain the complete
-      sorted 2,756-row path/Git-blob/size manifest plus only the 43 UTF-8 source
-      blobs needed to replay shell, SMT2 command, and registry extraction.
+      Authenticate the pinned 3,661-file Z3 5.3.3 source tree, retain source
+      registration owners and the complete registration-candidate scan.
+      Snapshot authentication alone does not close unresolved source owners.
 
   official-corpus-manifest <corpus-root> --archive-root <path>
                            --record-metadata <path> --out <path>
@@ -2760,14 +2979,14 @@ COMMANDS:
       copy of the manifest-bound AY executable. It binds the exact 32 command
       productions from the pinned language snapshot to a closed, sorted
       positive/missing/trailing/malformed catalog, including explicitly owned
-      Z3 5.1.0 arity extensions. Every child runs sequentially under one
+      Z3 5.3.3 arity extensions. Every child runs sequentially under one
       `_oom_guard.py` plan; checks re-derive pass/fail from raw transcripts and
       repeat the complete live run.
 
   run target-identity <manifest> --receipt <path> [--ay <path>] [--z3 <path>]
                       [--timeout <seconds>]
       Run the first built-in executable validator: exact CLI identity against
-      the pinned Z3 5.1.0 binary and the manifest-bound AY executable. Z3 and AY
+      the pinned Z3 5.3.3 binary and the manifest-bound AY executable. Z3 and AY
       run sequentially under one `_oom_guard.py` plan. The validator retains
       bounded stdout/stderr and publishes a hash-bound evidence receipt even
       when AY fails; any stale or forged version transcript remains a hard
@@ -2775,56 +2994,38 @@ COMMANDS:
 
   run z3-abi-5.0 <manifest> --receipt <path> [--ay <path>]
                    [--timeout <seconds>]
-      Run `builtin.z3-abi-5.0.v1` against authenticated private copies of the
-      manifest-bound AY shared library and the profile-pinned Z3 5.1.0 shared
-      library. The receipt requires live HEAD at origin/main and a clean AY
-      build stamp for that exact full commit; unrelated caller-worktree edits
-      do not taint detached clean-build evidence. It authenticates the exact
-      11-header/805-declaration signature surface, requires all 807 exports and
-      all 99 scoped observations, and emits one executed-call row plus one
-      exhaustive semantic-contract row for every declaration. Current embedded
-      probes authenticate 217/805 calls and 0/805 exhaustive contracts, so the
-      full-ABI requirement remains red; all 588 missing calls have exact reason
-      rows. Header and symbol resolution alone never prove implementation ABI
-      behavior.
+      Currently refused: this historical validator covers 805 declarations
+      and 807 exports. The active 5.3.3 requirement covers all 817 audited
+      declarations and 370 enum constants, including 31 shifted existing
+      values, plus complete exports and per-declaration executed-call and
+      semantic-contract evidence. No AY ABI numeric parity is established.
 
   run z3-behavioral <manifest> --receipt <path> --source-snapshot <path>
                     [--ay <path>] [--z3 <path>] [--timeout <seconds>]
-      Run `builtin.z3-behavioral-transcripts-5.1.0.v1` against authenticated
-      private copies of the manifest-bound AY executable and profile-pinned Z3
-      5.1.0. It re-derives the exact 1,518-item observable manifest from the
-      authenticated source snapshot and gives every command, tactic, probe,
-      simplifier, parameter, parameter module, CLI option/help form, input mode,
-      filename extension, declaration builtin, logic-recognizer literal,
-      logic-strategy alias, information key, option key, and parser token
-      exactly one behavioral owner. The 37 simplifiers and every safely tunable
-      parameter require a distinguishing Z3 effect baseline; entries without a
-      safe witness remain explicit failed rows.
-      Catalog listing alone never counts as a semantic effect. Supplementary
-      command/state/artifact, diagnostic, combinator, model/value-formatting,
-      and phased live-stdin cases remain closed too. Structured comparators
-      elide numeric telemetry only, retaining syntax, keys, ordering, channels,
-      component names, and diagnostics.
+      Run the current 1,978-case population derived from the authenticated
+      1,635-item Z3 5.3.3 source/live catalog, with primitive tactic and probe
+      controls and fixed stateful witnesses. Every source item needs one exact
+      behavioral owner. Missing effect witnesses remain failed cases; matching
+      names or matching errors cannot substitute for a semantic effect.
+
+  run z3-abi-current <manifest> --source <checkout> --receipt <path>
+                     [--ay-library <path>] [--z3-library <path>]
+                     [--timeout <seconds>] [--measurement-report <path>]
+      Retain and replay the current 817-function ABI measurement. Every
+      incomplete full-domain contract remains a failed row, independently of
+      the named finite checks. An existing measurement must match all source,
+      provider, compiler, validator and resource identities before reuse.
 
   run z3-source-inventory <manifest> --receipt <path>
                           --source-snapshot <path> [--timeout <seconds>]
-      Run `builtin.z3-source-inventory.v1` against the exact profile-pinned Z3
-      executable under `_oom_guard.py`. The closed catalog binds all 2,756
-      source-tree entries, 94 accepted SMT2 commands (86 live-registry plus
-      eight parser-native-only names), 118 tactics, 42 probes, 37 simplifiers,
-      678 parameters, 21 parameter modules, 33 source CLI options, 27 live help
-      forms, nine input modes, 16 filename extensions, 323 declaration
-      builtins, 24 logic-recognizer literals, 33 logic-strategy aliases, 11
-      information keys, 20 option keys, and 22 parser tokens. This receipt
-      establishes only the Z3 source/observable inventory; it makes no AY
-      support claim.
+      Authenticate the complete 3,661-file Z3 5.3.3 tree and live registries.
+      Retain every registration candidate, with unresolved owners as failed
+      evidence. This inventory does not claim AY behavioral compatibility.
 
   run z3-reference-inventory <manifest> --receipt <path>
                              --source-snapshot <path>
-      Run `builtin.z3-reference-inventory.v1`, the specialized external-source
-      ReferenceExtractor for `overlay.z3-5.1.0`. It binds the exact four overlay
-      rows to the authenticated 2,756-file Z3 5.1.0 tree and retained source
-      owners without claiming any AY behavior.
+      Extract the current reference requirements from the authenticated source
+      snapshot. Unresolved source candidates prevent reference closure.
 
   run official-corpus-inventory <manifest> --receipt <path>
                                 --corpus-manifest <path>
@@ -2837,7 +3038,7 @@ COMMANDS:
                       --corpus-manifest <path> [--ay <path>] [--z3 <path>]
                       [--timeout <seconds>]
       Run every immutable corpus file and decision query against authenticated
-      AY and exact Z3 5.1.0 under the campaign's one-job `_oom_guard.py`
+      AY and exact Z3 5.3.3 under the campaign's one-job `_oom_guard.py`
       envelope. AY additionally receives the planned `--memory` budget plus
       `--self-check --strict-proofs`. Exact ordered verdict parity, clean
       execution, and a second full archive/member/materialization closure scan
@@ -2904,7 +3105,7 @@ VALIDATOR RECEIPTS:
   using schema `ay-smtlib-validator-receipt/v2`. Each receipt binds one
   campaign, this exact profile, the dimension inventory digest, sorted covered
   requirement IDs, the validator implementation hash, AY artifact hashes, the
-  exact Z3 5.1.0 binary and shared-library hashes when applicable,
+  exact Z3 5.3.3 binary and shared-library hashes when applicable,
   content-addressed replayable source snapshots and auxiliary checker binaries
   when used, source provenance, and an enforced resource envelope. A pass requires
   exhaustive=true, total>0, passed=total, and zero
@@ -2915,25 +3116,21 @@ VALIDATOR RECEIPTS:
   `builtin.lexical-grammar.v1`, `builtin.logic-registry.v1`,
   `builtin.standard-commands.v1`,
   `builtin.theory-registry.v1`,
-  `builtin.target-identity.v1`, `builtin.z3-abi-5.0.v1`,
-  `builtin.z3-behavioral-transcripts-5.1.0.v1`,
-  `builtin.z3-reference-inventory.v1`,
-  `builtin.z3-source-inventory.v1`,
+  `builtin.target-identity.v1`,
   `builtin.official-corpus-inventory.v1`,
-  `builtin.official-corpus-z3-5.1.0.v1`,
+  `builtin.official-corpus-z3-5.3.3.v1`,
   `builtin.gate-integrity.v1`, `builtin.sat-models.v1`,
   `builtin.unknown-policy.v1`, and
   `builtin.unsat-proofs.v1`. Checks replay
   them against private authenticated copies or live in-process mutations
   instead of trusting their JSON.
+  Historical ABI, Z3 source/reference inventory and 5.1 behavioral validators
+  are retained for provenance but refused for the active 5.3.3 profile.
 "
 }
 
 pub(crate) fn run(args: &[String]) -> i32 {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
-    {
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
         print!("{}", usage());
         return 0;
     }
@@ -2943,11 +3140,35 @@ pub(crate) fn run(args: &[String]) -> i32 {
     };
     let result = match command.as_str() {
         "profile" => profile_command(rest),
+        "provision" => provision::run(rest),
+        "provision-corpus" => provision::run_corpus(rest),
+        "provision-corpus-verify-child" => provision::corpus_verify_child(rest),
+        "qualify" => qualify::run(rest),
+        "qualify-check" => qualify::check(rest),
+        "dominate" => domination::run(rest),
+        "dominate-check" => domination::check(rest),
+        "current-release-inventory" => current_release::run(rest),
+        "current-release-check" => current_release::check(rest),
+        "current-abi" => current_abi::run(rest),
+        "current-abi-check" => current_abi::check(rest),
+        "current-behavior" => current_behavior::run(rest),
+        "current-behavior-check" => current_behavior::check(rest),
+        "current-abi-build-child" => current_abi::build_child(rest),
+        "stock-python" => stock_python::run(rest),
+        "stock-python-check" => stock_python::check(rest),
+        "stock-cpp" => stock_cpp::run(rest),
+        "stock-cpp-check" => stock_cpp::check(rest),
+        "stock-cpp-build-child" => stock_cpp::build_child(rest),
+        "stock-c" => stock_c::run(rest),
+        "stock-c-check" => stock_c::check(rest),
+        "stock-c-build-child" => stock_c::build_child(rest),
+        "stock-c-run-child" => stock_c::run_child(rest),
         "init" => init_command(rest),
         "attach" => attach_command(rest),
         "source-snapshot" => reference_inventory::snapshot(rest),
         "official-corpus-manifest" => official_corpus::create_manifest(rest),
-        "z3-source-snapshot" => z3_source_inventory::snapshot(rest),
+        "z3-source-snapshot" => require_current_z3_validator(z3_source_inventory::VALIDATOR_ID)
+            .and_then(|()| z3_source_inventory::snapshot(rest)),
         "run" => run_validator_command(rest),
         "check" => check_command(rest),
         "receipt-check" => receipt_check_command(rest),
@@ -2972,7 +3193,7 @@ fn profile_command(args: &[String]) -> Result<i32, String> {
             );
         }
     };
-    let bytes = pretty_json(&canonical_profile())?;
+    let bytes = pretty_json(&canonical_profile()?)?;
     if let Some(path) = output {
         atomic_write_new(&path, &bytes)?;
         println!("wrote {}", path.display());
@@ -3091,6 +3312,7 @@ fn attach_command(args: &[String]) -> Result<i32, String> {
 
     let mut candidate = loaded.contract;
     let attached = attach_receipt_reference(&mut candidate, reference, &receipt)?;
+    reconcile_attached_receipt_gaps(&mut candidate, &loaded.base, &receipt)?;
     let report = validate_contract(&candidate, &loaded.base, ValidationMode::Audit)?;
     let bytes = pretty_json(&candidate)?;
     atomic_write_new(&output, &bytes)?;
@@ -3173,7 +3395,11 @@ fn attach_receipt_reference(
             .inventory
             .evidence
             .sort_by(|left, right| left.path.cmp(&right.path));
-        dimension.inventory.gap = None;
+        reconcile_evidence_gap(
+            &mut dimension.inventory.gap,
+            receipt.result == ValidatorResult::Pass,
+            &format!("{} inventory", dimension.id),
+        );
         return Ok(format!("{} inventory", dimension.id));
     }
 
@@ -3220,19 +3446,136 @@ fn attach_receipt_reference(
         requirement
             .evidence
             .sort_by(|left, right| left.path.cmp(&right.path));
-        requirement.gap = None;
+        reconcile_evidence_gap(
+            &mut requirement.gap,
+            receipt.result == ValidatorResult::Pass,
+            &format!("requirement {id}"),
+        );
         attached.push(id);
     }
     Ok(attached.join(","))
 }
 
+fn reconcile_evidence_gap(gap: &mut Option<String>, complete: bool, label: &str) {
+    if complete {
+        *gap = None;
+    } else if gap.is_none() {
+        *gap = Some(format!(
+            "retained non-passing validator evidence for {label}"
+        ));
+    }
+}
+
+/// Reconcile only the newly affected rows from authenticated evidence. Every
+/// retained receipt must pass; a later passing receipt does not supersede a
+/// retained failure. This structural pass does not replace the caller's Audit
+/// replay of newly attached evidence.
+fn reconcile_attached_receipt_gaps(
+    contract: &mut Contract,
+    base: &Path,
+    receipt: &ValidatorReceipt,
+) -> Result<(), String> {
+    reconcile_attached_receipt_gaps_using(contract, base, receipt, validate_validator_receipt)
+}
+
+fn reconcile_attached_receipt_gaps_using(
+    contract: &mut Contract,
+    base: &Path,
+    receipt: &ValidatorReceipt,
+    mut validate: impl for<'a> FnMut(&ValidatorReceipt, EvidenceContext<'a>) -> Result<bool, String>,
+) -> Result<(), String> {
+    let dimension_index = contract
+        .dimensions
+        .iter()
+        .position(|dimension| dimension.id == receipt.dimension_id)
+        .ok_or("attached receipt dimension is missing")?;
+    let dimension = &contract.dimensions[dimension_index];
+    let spec = DIMENSIONS
+        .iter()
+        .find(|spec| spec.id == dimension.id)
+        .ok_or("attached receipt dimension has no registered specification")?;
+    let mut cache = ReceiptCache::default();
+    let mut states = Vec::new();
+    if receipt.validator.kind == ValidatorKind::ReferenceExtractor {
+        let ids = dimension
+            .requirements
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<BTreeSet<_>>();
+        let results = validate_evidence_set_using(
+            &dimension.inventory.evidence,
+            EvidenceContext {
+                contract,
+                manifest_dir: base,
+                dimension,
+                expected_kind: ValidatorKind::ReferenceExtractor,
+                required_requirement_id: None,
+                exact_requirement_ids: Some(&ids),
+                mode: ValidationMode::Structural,
+            },
+            &mut cache,
+            &mut validate,
+        )?;
+        let complete = dimension.inventory.granularity == InventoryGranularity::ItemLevel
+            && !results.empty
+            && results.non_passing == 0;
+        let dimension = &mut contract.dimensions[dimension_index];
+        reconcile_evidence_gap(
+            &mut dimension.inventory.gap,
+            complete,
+            &format!("{} inventory", dimension.id),
+        );
+    } else {
+        for (index, requirement) in dimension.requirements.iter().enumerate() {
+            if !receipt.requirement_ids.contains(&requirement.id) {
+                continue;
+            }
+            let results = validate_evidence_set_using(
+                &requirement.evidence,
+                EvidenceContext {
+                    contract,
+                    manifest_dir: base,
+                    dimension,
+                    expected_kind: spec.validator_kind,
+                    required_requirement_id: Some(&requirement.id),
+                    exact_requirement_ids: None,
+                    mode: ValidationMode::Structural,
+                },
+                &mut cache,
+                &mut validate,
+            )?;
+            states.push((index, !results.empty && results.non_passing == 0));
+        }
+        let dimension = &mut contract.dimensions[dimension_index];
+        for (index, complete) in states {
+            let requirement = &mut dimension.requirements[index];
+            reconcile_evidence_gap(
+                &mut requirement.gap,
+                complete,
+                &format!("requirement {}", requirement.id),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_validator_command(args: &[String]) -> Result<i32, String> {
     let Some((validator, rest)) = args.split_first() else {
         return Err(
-            "run needs a validator name (`reference-inventory`, `lexical-grammar`, `logic-registry`, `standard-commands`, `theory-registry`, `type-scope`, `command-state-machine`, `target-identity`, `z3-abi-5.0`, `z3-behavioral`, `z3-reference-inventory`, `z3-source-inventory`, `official-corpus-inventory`, `official-corpus`, `gate-integrity`, `sat-models`, `unknown-policy`, or `unsat-proofs`)"
+            "run needs a validator name (`reference-inventory`, `lexical-grammar`, `logic-registry`, `standard-commands`, `theory-registry`, `type-scope`, `command-state-machine`, `target-identity`, `z3-abi-current`, `z3-behavioral`, `z3-reference-inventory`, `z3-source-inventory`, `official-corpus-inventory`, `official-corpus`, `gate-integrity`, `sat-models`, `unknown-policy`, or `unsat-proofs`)"
                 .to_string(),
         );
     };
+    let legacy_id = match validator.as_str() {
+        "z3-abi-5.0" => Some("builtin.z3-abi-5.0.v1"),
+        "z3-source-inventory" => Some(z3_source_inventory::VALIDATOR_ID),
+        "z3-reference-inventory" => Some(z3_source_inventory::REFERENCE_VALIDATOR_ID),
+        "z3-behavioral" => Some(z3_behavioral::VALIDATOR_ID),
+        _ => None,
+    };
+    if let Some(id) = legacy_id {
+        require_current_z3_validator(id)?;
+    }
     match validator.as_str() {
         "reference-inventory" => reference_inventory::run(rest),
         "lexical-grammar" => lexical_grammar::run(rest),
@@ -3243,6 +3586,7 @@ fn run_validator_command(args: &[String]) -> Result<i32, String> {
         "command-state-machine" => language_semantics::run_command_state(rest),
         "target-identity" => run_target_identity(rest),
         "z3-abi-5.0" => run_z3_abi(rest),
+        "z3-abi-current" => current_abi::run_registered(rest),
         "z3-behavioral" => z3_behavioral::run(rest),
         "z3-reference-inventory" => z3_source_inventory::run_reference(rest),
         "z3-source-inventory" => z3_source_inventory::run(rest),
@@ -3416,7 +3760,7 @@ fn execute_target_identity(
     let expected_z3_sha = &contract.profile.z3_overlay.reference_executable.sha256;
     let staged_ay = stage_authenticated_executable(ay_source, &subject_ay.sha256, "AY executable")?;
     let staged_z3 =
-        stage_authenticated_executable(z3_source, expected_z3_sha, "Z3 5.1.0 executable")?;
+        stage_authenticated_executable(z3_source, expected_z3_sha, "Z3 5.3.3 executable")?;
 
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
@@ -3440,7 +3784,7 @@ fn execute_target_identity(
     }
 
     let input = b"(get-info :name)\n(get-info :version)\n(exit)\n";
-    let expected_stdout = "(:name \"Z3\")\n(:version \"5.1.0\")\n";
+    let expected_stdout = "(:name \"Z3\")\n(:version \"5.3.3\")\n";
 
     // Keep oracle and subject sequential: two simultaneous children would
     // exceed the single planner-admitted slot.
@@ -3450,7 +3794,7 @@ fn execute_target_identity(
             ["-in"],
             input,
             timeout,
-            "SMT-LIB target identity: Z3 5.1.0",
+            "SMT-LIB target identity: Z3 5.3.3",
         )
         .map_err(|error| error.to_string())?;
     let ay_output = resources
@@ -3518,14 +3862,14 @@ fn replay_target_identity_receipt(
         .as_ref()
         .ok_or("target-identity replay requires subject.ay_executable")?;
     let ay = artifact_path(context.manifest_dir, &subject.path);
-    let z3 = PathBuf::from(
+    let z3 = reference_artifact_path(
         &context
             .contract
             .profile
             .z3_overlay
             .reference_executable
             .path,
-    );
+    )?;
     let live = execute_target_identity(context.contract, &ay, &z3, parsed.timeout, Some(envelope))?;
     validate_target_identity_replay(receipt, &live)
 }
@@ -3589,9 +3933,12 @@ fn run_target_identity(args: &[String]) -> Result<i32, String> {
         .as_ref()
         .ok_or("target-identity requires subject.ay_executable")?;
     let ay = ay_override.unwrap_or_else(|| artifact_path(&loaded.base, &subject_ay.path));
-    let z3 = z3_override.unwrap_or_else(|| {
-        PathBuf::from(&loaded.contract.profile.z3_overlay.reference_executable.path)
-    });
+    let z3 = match z3_override {
+        Some(path) => path,
+        None => {
+            reference_artifact_path(&loaded.contract.profile.z3_overlay.reference_executable.path)?
+        }
+    };
     let target_receipt_relative = future_relative_output(&loaded.base, &receipt_path)?;
     let current_exe =
         std::env::current_exe().map_err(|error| format!("locating parity executable: {error}"))?;
@@ -3608,12 +3955,12 @@ fn run_target_identity(args: &[String]) -> Result<i32, String> {
     let validator_sha = sha256_file(&current_exe, "parity validator")?;
     let timeout = Duration::from_secs(timeout_secs);
     let execution = execute_target_identity(&loaded.contract, &ay, &z3, timeout, None)?;
-    let requirement_id = "overlay.z3-5.1.0.target-identity".to_string();
+    let requirement_id = "overlay.z3-5.3.3.target-identity".to_string();
     let overlay = loaded
         .contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.3.3")
         .ok_or("closed overlay dimension is missing")?;
     let receipt = ValidatorReceipt {
         schema: VALIDATOR_RECEIPT_SCHEMA.to_string(),
@@ -3663,7 +4010,7 @@ fn run_target_identity(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.1.0.target-identity: \
+        "attach to overlay.z3-5.3.3.target-identity: \
          {{\"path\":\"{target_receipt_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     println!(
@@ -3756,7 +4103,7 @@ fn abi_semantic_contract_expectation() -> &'static str {
 }
 
 fn is_expected_ay_abi_stderr(stderr: &[u8]) -> bool {
-    const PREFIX: &str = "c !! MODEL-UNCONFIRMED [UNCONFIRMED/published] \
+    const PREFIX: &str = "c !! MODEL-UNCONFIRMED [UNCONFIRMED/withheld] \
         (not a refutation — see [AY SOUNDNESS GATE] for caught invalid models) \
         model validation incomplete: SmtGroundAssertion: Assertion ";
     const REQUIRED_DETAIL: &str =
@@ -3964,6 +4311,98 @@ fn write_stock_c_probe_inputs(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macho_otool_body<'a>(stdout: &'a str, artifact: &Path) -> Result<Vec<&'a str>, String> {
+    let mut lines = stdout.lines();
+    let expected_header = format!("{}:", artifact.display());
+    if lines.next() != Some(expected_header.as_str()) {
+        return Err(format!(
+            "unexpected Mach-O inspection header for {}",
+            artifact.display()
+        ));
+    }
+    // otool indents load commands with a tab. Whitespace inside an install
+    // name, including ordinary spaces, is part of the name rather than a token
+    // separator. Multiple architecture blocks deliberately fail closed.
+    Ok(lines
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_prefix('\t').unwrap_or(line))
+        .collect())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macho_install_id<'a>(stdout: &'a str, library: &Path) -> Result<&'a str, String> {
+    let lines = macho_otool_body(stdout, library)?;
+    match lines.as_slice() {
+        [id] if !id.is_empty() && !id.contains('\0') => Ok(*id),
+        _ => Err("authenticated Mach-O library must have exactly one install ID".to_string()),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macho_dependencies<'a>(stdout: &'a str, binary: &Path) -> Result<Vec<&'a str>, String> {
+    macho_otool_body(stdout, binary)?
+        .into_iter()
+        .map(|line| {
+            let (dependency, versions) = line
+                .rsplit_once(" (compatibility version ")
+                .ok_or("Mach-O dependency lacks version metadata")?;
+            let versions = versions
+                .strip_suffix(')')
+                .and_then(|value| value.split_once(", current version "))
+                .ok_or("invalid Mach-O dependency version metadata")?;
+            if dependency.is_empty()
+                || dependency.contains('\0')
+                || [versions.0, versions.1].iter().any(|version| {
+                    let parts = version.split('.').collect::<Vec<_>>();
+                    parts.len() != 3 || parts.iter().any(|part| part.parse::<u32>().is_err())
+                })
+            {
+                return Err("invalid Mach-O dependency name or versions".to_string());
+            }
+            Ok(dependency)
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macho_solver_dependency<'a>(
+    dependencies: &[&'a str],
+    install_id: &str,
+    library: &str,
+) -> Result<&'a str, String> {
+    let matches = dependencies
+        .iter()
+        .copied()
+        .filter(|dependency| *dependency == install_id || *dependency == library)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [dependency] => Ok(*dependency),
+        _ => Err(format!(
+            "stock C consumer needs exactly one load command for authenticated install ID {install_id:?} or path {library:?}, found {}",
+            matches.len()
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stock_c_otool(option: &str, artifact: &Path) -> Result<String, String> {
+    let output = Command::new("/usr/bin/otool")
+        .arg(option)
+        .arg(artifact)
+        .output()
+        .map_err(|error| format!("inspecting stock C Mach-O identity: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspecting stock C Mach-O identity failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("stock C Mach-O identity is not UTF-8: {error}"))
+}
+
 #[cfg(target_os = "macos")]
 fn rebind_stock_c_library(binary: &Path, library: &Path) -> Result<(), String> {
     let library = fs::canonicalize(library).map_err(|error| {
@@ -3972,37 +4411,16 @@ fn rebind_stock_c_library(binary: &Path, library: &Path) -> Result<(), String> {
             library.display()
         )
     })?;
-    let file_name = library.file_name().ok_or_else(|| {
-        format!(
-            "authenticated stock C library has no file name: {}",
-            library.display()
-        )
-    })?;
-    let output = Command::new("/usr/bin/otool")
-        .arg("-L")
-        .arg(binary)
-        .output()
-        .map_err(|error| format!("inspecting stock C consumer load commands: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "inspecting stock C consumer load commands failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|error| format!("stock C consumer load commands are not UTF-8: {error}"))?;
-    let dependency = stdout
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .find(|dependency| Path::new(dependency).file_name() == Some(file_name))
-        .ok_or_else(|| {
-            format!(
-                "stock C consumer has no load command for {}",
-                library.display()
-            )
-        })?;
+    let library_path = library
+        .to_str()
+        .ok_or("stock C library path is not UTF-8")?;
+    // Staging may rename the file while preserving LC_ID_DYLIB. Match the ID
+    // read from the authenticated bytes, never a dependency's basename.
+    let identity = stock_c_otool("-D", &library)?;
+    let install_id = macho_install_id(&identity, &library)?;
+    let before = stock_c_otool("-L", binary)?;
+    let dependencies = macho_dependencies(&before, binary)?;
+    let dependency = macho_solver_dependency(&dependencies, install_id, library_path)?;
     let output = Command::new("/usr/bin/install_name_tool")
         .arg("-change")
         .arg(dependency)
@@ -4017,26 +4435,10 @@ fn rebind_stock_c_library(binary: &Path, library: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let output = Command::new("/usr/bin/otool")
-        .arg("-L")
-        .arg(binary)
-        .output()
-        .map_err(|error| format!("verifying rebound stock C load command: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "verifying rebound stock C load command failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|error| format!("rebound stock C load commands are not UTF-8: {error}"))?;
-    let rebound_dependency = stdout
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .find(|dependency| Path::new(dependency).file_name() == Some(file_name));
-    if rebound_dependency != Some(library.to_string_lossy().as_ref()) {
+    let after = stock_c_otool("-L", binary)?;
+    let dependencies = macho_dependencies(&after, binary)?;
+    let rebound_dependency = macho_solver_dependency(&dependencies, install_id, library_path)?;
+    if rebound_dependency != library_path {
         return Err(format!(
             "stock C consumer load command did not bind exactly to {}: {:?}",
             library.display(),
@@ -4046,8 +4448,50 @@ fn rebind_stock_c_library(binary: &Path, library: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn rebind_stock_c_library(binary: &Path, library: &Path) -> Result<(), String> {
+    elf_binding::validate(binary, library)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn rebind_stock_c_library(_binary: &Path, _library: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn link_stock_c_library(command: &mut Command, library: &Path) -> Result<(), String> {
+    let directory = library.parent().ok_or_else(|| {
+        format!(
+            "authenticated stock C library has no parent: {}",
+            library.display()
+        )
+    })?;
+    #[cfg(target_os = "macos")]
+    command
+        // Keep a real load command even when an assertion-only control does
+        // not call the provider. Separate linker arguments preserve spaces.
+        .args(["-Xlinker", "-needed_library", "-Xlinker"])
+        .arg(library)
+        .args(["-Xlinker", "-rpath", "-Xlinker"])
+        .arg(directory)
+        .arg("-Wl,-headerpad_max_install_names");
+    #[cfg(target_os = "linux")]
+    command
+        // Assertion-only controls still need a verifiable provider binding.
+        // Restore the driver's policy after this single required dependency.
+        .arg("-Wl,--push-state,--no-as-needed")
+        .arg(library)
+        .arg("-Wl,--pop-state");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    command.arg(library);
+    #[cfg(target_os = "linux")]
+    command
+        .arg(format!(
+            "-Wl,--disable-new-dtags,-rpath,{}",
+            directory.display()
+        ))
+        .arg("-ldl");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    command.arg(format!("-Wl,-rpath,{}", directory.display()));
     Ok(())
 }
 
@@ -4059,12 +4503,6 @@ fn compile_stock_c_probe(
 ) -> Result<PathBuf, String> {
     let source = directory.join(format!("{}.c", probe.id));
     let binary = directory.join(format!("{}-{subject}", probe.id));
-    let library_directory = library.parent().ok_or_else(|| {
-        format!(
-            "authenticated {subject} library has no parent: {}",
-            library.display()
-        )
-    })?;
     #[cfg(target_os = "macos")]
     let compiler = "/usr/bin/clang";
     #[cfg(not(target_os = "macos"))]
@@ -4079,22 +4517,9 @@ fn compile_stock_c_probe(
         .arg("-I")
         .arg(directory)
         .arg(&source)
-        .arg(library)
         .arg("-o")
         .arg(&binary);
-    #[cfg(target_os = "macos")]
-    command
-        .arg(format!("-Wl,-rpath,{}", library_directory.display()))
-        .arg("-Wl,-headerpad_max_install_names");
-    #[cfg(target_os = "linux")]
-    command
-        .arg(format!(
-            "-Wl,--disable-new-dtags,-rpath,{}",
-            library_directory.display()
-        ))
-        .arg("-ldl");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    command.arg(format!("-Wl,-rpath,{}", library_directory.display()));
+    link_stock_c_library(&mut command, library)?;
     let output = command.output().map_err(|error| {
         format!(
             "compiling stock C probe {} for {subject}: {error}",
@@ -4817,14 +5242,14 @@ fn replay_z3_abi_receipt(
         .as_ref()
         .ok_or("z3-abi-5.0 replay requires subject.ay_shared_library")?;
     let ay_path = artifact_path(context.manifest_dir, &ay.path);
-    let z3_path = PathBuf::from(
+    let z3_path = reference_artifact_path(
         &context
             .contract
             .profile
             .z3_overlay
             .reference_shared_library
             .path,
-    );
+    )?;
     let validator = fs::canonicalize(
         std::env::current_exe()
             .map_err(|error| format!("locating current ABI validator: {error}"))?,
@@ -4899,14 +5324,14 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
     let ay = ay_override.unwrap_or_else(|| artifact_path(&loaded.base, &subject_ay.path));
     // There is intentionally no Z3 override: this registered validator always
     // selects the immutable profile path and then authenticates its bytes.
-    let z3 = PathBuf::from(
+    let z3 = reference_artifact_path(
         &loaded
             .contract
             .profile
             .z3_overlay
             .reference_shared_library
             .path,
-    );
+    )?;
     let target_receipt_relative = future_relative_output(&loaded.base, &receipt_path)?;
     let current_exe =
         std::env::current_exe().map_err(|error| format!("locating parity executable: {error}"))?;
@@ -4925,7 +5350,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         .contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.3.3")
         .ok_or("closed overlay dimension is missing")?;
     let execution = execute_z3_abi(
         &loaded.contract,
@@ -4943,7 +5368,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         profile_id: PROFILE_ID.to_string(),
         profile_sha256: canonical_profile_sha256()?,
         dimension_id: overlay.id.clone(),
-        requirement_ids: vec!["overlay.z3-5.1.0.c-abi".to_string()],
+        requirement_ids: vec!["overlay.z3-5.3.3.c-abi".to_string()],
         inventory_sha256: overlay.inventory.sha256.clone(),
         validator: ValidatorIdentity {
             id: "builtin.z3-abi-5.0.v1".to_string(),
@@ -4993,7 +5418,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.1.0.c-abi: \
+        "attach to overlay.z3-5.3.3.c-abi: \
          {{\"path\":\"{target_receipt_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     println!(
@@ -5403,7 +5828,7 @@ fn print_utf8(bytes: &[u8]) -> Result<(), String> {
 }
 
 fn print_report(report: &AuditReport) {
-    println!("== SMT-LIB 2.7 + exact Z3 5.1.0 conformance contract ==");
+    println!("== SMT-LIB 2.7 + exact Z3 5.3.3 conformance contract ==");
     println!(
         "dimensions: {} (reference-complete {}, incomplete {})",
         report.summary.dimension_count,
@@ -5503,6 +5928,70 @@ fn atomic_write_new(path: &Path, contents: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn macho_binding_uses_authenticated_install_id_after_staging_rename() {
+        let library = Path::new("/tmp/AY provider/libay_ffi-0ea6.dylib");
+        let binary = Path::new("/tmp/consumer with spaces");
+        let identity = "/tmp/AY provider/libay_ffi-0ea6.dylib:\nlibay_ffi.dylib\n";
+        let install_id = macho_install_id(identity, library).unwrap();
+        let before = concat!(
+            "/tmp/consumer with spaces:\n",
+            "\tlibay_ffi.dylib (compatibility version 0.0.0, current version 0.0.0)\n",
+            "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)\n",
+        );
+        let before = macho_dependencies(before, binary).unwrap();
+        assert_eq!(
+            macho_solver_dependency(&before, install_id, library.to_str().unwrap()).unwrap(),
+            "libay_ffi.dylib"
+        );
+        let after = concat!(
+            "/tmp/consumer with spaces:\n",
+            "\t/tmp/AY provider/libay_ffi-0ea6.dylib (compatibility version 0.0.0, current version 0.0.0)\n",
+            "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)\n",
+        );
+        let after = macho_dependencies(after, binary).unwrap();
+        assert_eq!(
+            macho_solver_dependency(&after, install_id, library.to_str().unwrap()).unwrap(),
+            library.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn macho_binding_rejects_foreign_basename_and_ambiguous_loads() {
+        let install_id = "@rpath/libay_ffi.dylib";
+        let library = "/tmp/AY provider/libay_ffi-0ea6.dylib";
+        assert!(macho_solver_dependency(
+            &["/foreign/libay_ffi.dylib", "/foreign/libay_ffi-0ea6.dylib"],
+            install_id,
+            library,
+        )
+        .is_err());
+        assert!(macho_solver_dependency(&[install_id, library], install_id, library).is_err());
+        assert!(macho_solver_dependency(&[library, library], install_id, library).is_err());
+        assert!(macho_solver_dependency(&[], install_id, library).is_err());
+    }
+
+    #[test]
+    fn macho_install_identity_and_dependencies_require_complete_records() {
+        let library = Path::new("/tmp/lib with spaces.dylib");
+        assert_eq!(
+            macho_install_id(
+                "/tmp/lib with spaces.dylib:\n@rpath/lib with spaces.dylib\n",
+                library,
+            )
+            .unwrap(),
+            "@rpath/lib with spaces.dylib"
+        );
+        assert!(macho_install_id("/tmp/foreign.dylib:\nlib.dylib\n", library).is_err());
+        assert!(macho_install_id("/tmp/lib with spaces.dylib:\n", library).is_err());
+        assert!(macho_install_id(
+            "/tmp/lib with spaces.dylib:\nfirst.dylib\nsecond.dylib\n",
+            library,
+        )
+        .is_err());
+        assert!(macho_dependencies("/tmp/lib with spaces.dylib:\n\tlib.dylib\n", library).is_err());
+    }
+
     fn write(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("write fixture");
     }
@@ -5516,8 +6005,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_pins_corrected_smtlib_27_and_exact_z3_500() {
-        let profile = canonical_profile();
+    fn profile_pins_corrected_smtlib_27_and_audited_z3_533() {
+        let profile =
+            canonical_profile_for(reference_platform::Platform::MacosArm64.release().unwrap())
+                .unwrap();
         assert_eq!(profile.standard.version, "2.7");
         assert_eq!(profile.standard.release, "2026-03-27");
         assert_eq!(
@@ -5537,36 +6028,195 @@ mod tests {
             profile.standard.registry.sha256,
             "506519771cabc1ff0de8b1d6d482659c3fab4432a8c0304a1f50367cd516da04"
         );
-        assert_eq!(profile.z3_overlay.version, "5.1.0");
+        assert_eq!(profile.z3_overlay.version, "5.3.3");
         assert_eq!(
             profile.z3_overlay.source_commit,
-            "0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8"
+            "430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e"
         );
-        assert_eq!(profile.z3_overlay.tracked_source_file_count, 2_756);
+        assert_eq!(profile.z3_overlay.tracked_source_file_count, 3_661);
         assert_eq!(
             profile.z3_overlay.tracked_source_tree_digest_kind,
             "sorted-path-git-blob-size-manifest/v1"
         );
         assert_eq!(
             profile.z3_overlay.tracked_source_tree_sha256,
-            "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b"
+            "a48aaa79d461d07f90ffbf4323a7c3b674457145fde1cd5ecf312bbd46343967"
         );
         assert_eq!(
             profile.z3_overlay.reference_executable.version_output,
-            "Z3 version 5.1.0 - 64 bit"
+            "Z3 version 5.3.3 - 64 bit - build hashcode 430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e"
         );
         assert_eq!(
             profile.z3_overlay.reference_executable.sha256,
-            "8b61a8bc0b7a4e14dfb119910502ef808b055df636b25c8b67b96ae630fbc29c"
+            "9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4"
         );
         assert_eq!(
             profile.z3_overlay.reference_shared_library.full_version,
-            "5.1.0.0"
+            "5.3.3.0 430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e 430d19e"
         );
         assert_eq!(
             profile.z3_overlay.reference_shared_library.sha256,
-            "45344d6a38b6f75304433c2458d6fa16bc4907d426c96e2bedf0a90603460422"
+            "a24ed85970d2ba11f22e3c06dfe91c9d6a2ed51a47a4fee37734a4f5cb1178a0"
         );
+        assert_eq!(
+            sha256_bytes(&serde_json::to_vec(&profile).unwrap()),
+            "428219b52391d4588e22cf7ce70483edd22764285ab82aea61c5835f458ca1cd",
+            "expanding platform support must preserve the original ARM profile identity"
+        );
+    }
+
+    #[test]
+    fn platform_profiles_bind_distinct_artifacts_and_refuse_foreign_receipts() {
+        let mut identities = BTreeSet::new();
+        let native = reference_platform::Platform::native().unwrap();
+        for platform in reference_platform::Platform::ALL {
+            let profile = canonical_profile_for(platform.release().unwrap()).unwrap();
+            assert!(identities.insert(sha256_bytes(&serde_json::to_vec(&profile).unwrap())));
+            assert_eq!(
+                profile.z3_overlay.source_commit,
+                "430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e"
+            );
+            let mut contract = starter_contract(Subject::default()).unwrap();
+            contract.profile = profile;
+            if platform != native {
+                assert!(
+                    validate_contract(&contract, Path::new("."), ValidationMode::Structural)
+                        .unwrap_err()
+                        .contains("profile drift")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_cache_relocation_preserves_identity_and_authentication() {
+        let profile = canonical_profile().unwrap();
+        let before = canonical_profile_sha256().expect("profile digest");
+        let locator = &profile.z3_overlay.reference_shared_library.path;
+        let leaf = locator
+            .strip_prefix("cache:")
+            .expect("portable cache locator");
+        let scratch = tempfile::tempdir().expect("scratch");
+        let xdg = scratch.path().join("xdg");
+        let home = scratch.path().join("home");
+        let xdg_path = reference_artifact_path_from(locator, Some(xdg.as_os_str()), None)
+            .expect("XDG locator");
+        let home_path = reference_artifact_path_from(locator, None, Some(home.as_os_str()))
+            .expect("HOME locator");
+        assert_eq!(xdg_path, xdg.join(leaf));
+        assert_eq!(home_path, home.join(".cache").join(leaf));
+        assert_eq!(
+            reference_artifact_path_from(
+                locator,
+                Some(std::ffi::OsStr::new("")),
+                Some(home.as_os_str())
+            )
+            .expect("empty XDG uses HOME"),
+            home_path
+        );
+        for path in [&xdg_path, &home_path] {
+            fs::create_dir_all(path.parent().expect("parent")).expect("cache directory");
+            fs::write(path, b"authenticated fixture").expect("fixture");
+            let expected = sha256_bytes(b"authenticated fixture");
+            verify_reference_artifact(path.to_str().expect("UTF-8"), &expected, "fixture")
+                .expect("relocated identical bytes authenticate");
+            fs::write(path, b"replaced fixture").expect("replace");
+            assert!(
+                verify_reference_artifact(path.to_str().expect("UTF-8"), &expected, "fixture")
+                    .expect_err("cache location cannot authenticate replaced bytes")
+                    .contains("hash mismatch")
+            );
+        }
+        for (locator, xdg, home) in [
+            (locator.as_str(), None, None),
+            (
+                locator.as_str(),
+                Some(std::ffi::OsStr::new("relative")),
+                None,
+            ),
+            (locator.as_str(), None, Some(std::ffi::OsStr::new(""))),
+            ("cache:../escape", Some(xdg.as_os_str()), None),
+            ("cache:/escape", Some(xdg.as_os_str()), None),
+            ("cache:", Some(xdg.as_os_str()), None),
+            ("relative-library", None, None),
+        ] {
+            assert!(reference_artifact_path_from(locator, xdg, home).is_err());
+        }
+        assert_eq!(
+            canonical_profile_sha256().expect("unchanged profile digest"),
+            before
+        );
+        assert_eq!(canonical_profile().unwrap(), profile);
+    }
+
+    #[test]
+    fn active_z3_533_rejects_historical_and_relabelled_closure_receipts() {
+        let contract = starter_contract(Subject::default()).expect("starter");
+        let overlay = contract
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.id == "overlay.z3-5.3.3")
+            .expect("current overlay");
+        assert!(contract
+            .dimensions
+            .iter()
+            .all(|row| row.id != "overlay.z3-5.1.0"));
+        let context = EvidenceContext {
+            contract: &contract,
+            manifest_dir: Path::new("."),
+            dimension: overlay,
+            expected_kind: ValidatorKind::Z3Differential,
+            required_requirement_id: Some("overlay.z3-5.3.3.c-abi"),
+            exact_requirement_ids: None,
+            mode: ValidationMode::Structural,
+        };
+        let mut receipt = synthetic_abi_receipt(&contract);
+        receipt.campaign_id = contract.campaign_id.clone();
+        receipt.profile_id = "smtlib-2.7+z3-5.1.0".to_string();
+        assert!(validate_validator_receipt(&receipt, context)
+            .expect_err("historical profile cannot close a current row")
+            .contains("evidence targets profile"));
+        receipt.profile_id = PROFILE_ID.to_string();
+        receipt.profile_sha256 = "0".repeat(64);
+        assert!(validate_validator_receipt(&receipt, context)
+            .expect_err("relabelled profile needs its actual digest")
+            .contains("profile digest mismatch"));
+        receipt.profile_sha256 = canonical_profile_sha256().expect("profile digest");
+        receipt.requirement_ids = vec!["overlay.z3-5.3.3.c-abi".to_string()];
+        // Even a freshly bound label cannot upgrade the old census population.
+        for id in [
+            "builtin.z3-abi-5.0.v1",
+            "builtin.z3-source-inventory.v1",
+            "builtin.z3-reference-inventory.v1",
+            "builtin.z3-behavioral-transcripts-5.1.0.v1",
+        ] {
+            receipt.validator.id = id.to_string();
+            for mode in [
+                ValidationMode::Structural,
+                ValidationMode::Audit,
+                ValidationMode::Completion,
+            ] {
+                assert!(validate_registered_validator(
+                    &receipt,
+                    EvidenceContext { mode, ..context }
+                )
+                .expect_err("legacy population must remain an explicit gap")
+                .contains("cannot certify smtlib-2.7+z3-5.3.3"));
+            }
+        }
+        assert!(require_current_z3_validator("builtin.target-identity.v1").is_ok());
+        assert!(require_current_z3_validator(official_corpus::VALIDATOR_ID).is_ok());
+        for id in [
+            current_abi::VALIDATOR_ID,
+            z3_source_inventory::VALIDATOR_ID,
+            z3_source_inventory::REFERENCE_VALIDATOR_ID,
+            z3_behavioral::VALIDATOR_ID,
+        ] {
+            assert!(require_current_z3_validator(id).is_ok());
+        }
+        assert!(run_validator_command(&["z3-abi-5.0".to_string()])
+            .expect_err("legacy runner must refuse before reading files or spawning")
+            .contains("cannot certify"));
     }
 
     #[test]
@@ -5875,6 +6525,249 @@ mod tests {
         }
     }
 
+    fn shared_receipt_fixture(non_passing: bool) -> (tempfile::TempDir, Contract, EvidenceRef) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("subject");
+        let validator = directory.path().join("validator");
+        fs::write(&executable, b"subject fixture").unwrap();
+        fs::write(&validator, b"validator fixture").unwrap();
+        let subject_sha = sha256_file(&executable, "fixture").unwrap();
+        let mut contract = starter_contract(Subject {
+            ay_executable: Some(Artifact {
+                path: executable.to_str().unwrap().to_string(),
+                sha256: subject_sha.clone(),
+            }),
+            ay_shared_library: None,
+        })
+        .unwrap();
+        contract.campaign_id = "shared-receipt-test".to_string();
+        let envelope = "oom-guard-v2:jobs=1;memlimit_mb=1024;nbcore=1;headroom_mb=512;timeout_ns=1000000000;enforcement=ay-resource-v1:rss-watchdog-zero-grace;aggregate=ay-host-exclusive-flock-v1".to_string();
+        contract.resource_envelope = Some(envelope.clone());
+        let dimension = contract
+            .dimensions
+            .iter()
+            .find(|row| row.id == "language.commands")
+            .unwrap();
+        let ids = dimension
+            .requirements
+            .iter()
+            .take(2)
+            .map(|row| row.id.clone())
+            .collect();
+        let mut receipt = attach_fixture_receipt(
+            &contract,
+            "language.commands",
+            ids,
+            ValidatorKind::TranscriptConformance,
+            Some(envelope),
+        );
+        receipt.validator.path = "validator".to_string();
+        receipt.validator.sha256 = sha256_file(&validator, "fixture").unwrap();
+        receipt.subject.ay_executable_sha256 = Some(subject_sha);
+        if non_passing {
+            receipt.result = ValidatorResult::Fail;
+            receipt.case_results[0].outcome = ValidatorCaseOutcome::Fail;
+            receipt.cases = case_counts_from_rows(&receipt.case_results).unwrap();
+        }
+        let bytes = pretty_json(&receipt).unwrap();
+        fs::write(directory.path().join("shared.json"), &bytes).unwrap();
+        (
+            directory,
+            contract,
+            EvidenceRef {
+                path: "shared.json".to_string(),
+                sha256: sha256_bytes(&bytes),
+            },
+        )
+    }
+
+    fn validate_shared_fixture_row(
+        base: &Path,
+        contract: &Contract,
+        reference: &EvidenceRef,
+        row: usize,
+        cache: &mut ReceiptCache,
+        full_replays: &std::cell::Cell<usize>,
+        fail_replay: bool,
+    ) -> Result<EvidenceResults, String> {
+        let dimension = contract
+            .dimensions
+            .iter()
+            .find(|row| row.id == "language.commands")
+            .unwrap();
+        let context = EvidenceContext {
+            contract,
+            manifest_dir: base,
+            dimension,
+            expected_kind: ValidatorKind::TranscriptConformance,
+            required_requirement_id: Some(&dimension.requirements[row].id),
+            exact_requirement_ids: None,
+            mode: ValidationMode::Audit,
+        };
+        // Registered-validator dispatch (including owner-specific checks) is
+        // substituted. Production general coverage, profile, subject and
+        // artifact checks still run before this controlled dispatch.
+        validate_evidence_set_using(
+            std::slice::from_ref(reference),
+            context,
+            cache,
+            |receipt, context| {
+                validate_validator_receipt_using(receipt, context, |_, context| {
+                    if context.mode.replays_registered_validators() {
+                        full_replays.set(full_replays.get() + 1);
+                        if fail_replay {
+                            return Err("injected failed replay".to_string());
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn shared_receipt_replays_once_but_checks_every_row_and_artifact() {
+        let (directory, contract, reference) = shared_receipt_fixture(false);
+        let mut cache = ReceiptCache::default();
+        let replays = std::cell::Cell::new(0);
+        for row in [0, 1] {
+            assert_eq!(
+                validate_shared_fixture_row(
+                    directory.path(),
+                    &contract,
+                    &reference,
+                    row,
+                    &mut cache,
+                    &replays,
+                    false
+                )
+                .unwrap()
+                .non_passing,
+                0
+            );
+        }
+        assert_eq!(replays.get(), 1);
+        let error = validate_shared_fixture_row(
+            directory.path(),
+            &contract,
+            &reference,
+            2,
+            &mut cache,
+            &replays,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("does not cover required row"), "{error}");
+        fs::write(directory.path().join("validator"), b"changed validator").unwrap();
+        let error = validate_shared_fixture_row(
+            directory.path(),
+            &contract,
+            &reference,
+            0,
+            &mut cache,
+            &replays,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("validator implementation hash mismatch"),
+            "{error}"
+        );
+        assert_eq!(replays.get(), 1);
+    }
+
+    #[test]
+    fn failed_replay_never_enters_the_completed_set() {
+        let (directory, contract, reference) = shared_receipt_fixture(false);
+        let mut cache = ReceiptCache::default();
+        let replays = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert!(validate_shared_fixture_row(
+                directory.path(),
+                &contract,
+                &reference,
+                0,
+                &mut cache,
+                &replays,
+                true
+            )
+            .is_err());
+            assert!(cache.completed_replays.is_empty());
+        }
+        assert_eq!(replays.get(), 2);
+    }
+
+    #[test]
+    fn authenticated_nonpassing_receipt_is_cached_without_becoming_pass() {
+        let (directory, contract, reference) = shared_receipt_fixture(true);
+        let mut cache = ReceiptCache::default();
+        let replays = std::cell::Cell::new(0);
+        for row in [0, 1] {
+            assert_eq!(
+                validate_shared_fixture_row(
+                    directory.path(),
+                    &contract,
+                    &reference,
+                    row,
+                    &mut cache,
+                    &replays,
+                    false
+                )
+                .unwrap()
+                .non_passing,
+                1
+            );
+        }
+        assert_eq!(replays.get(), 1);
+        let mut fresh_validation = ReceiptCache::default();
+        validate_shared_fixture_row(
+            directory.path(),
+            &contract,
+            &reference,
+            0,
+            &mut fresh_validation,
+            &replays,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            replays.get(),
+            2,
+            "a new validation must not reuse an old replay"
+        );
+    }
+
+    #[test]
+    fn identical_receipt_bytes_at_another_path_require_another_replay() {
+        let (directory, contract, reference) = shared_receipt_fixture(false);
+        fs::copy(
+            directory.path().join("shared.json"),
+            directory.path().join("alias.json"),
+        )
+        .unwrap();
+        let alias = EvidenceRef {
+            path: "alias.json".to_string(),
+            sha256: reference.sha256.clone(),
+        };
+        let mut cache = ReceiptCache::default();
+        let replays = std::cell::Cell::new(0);
+        for reference in [&reference, &alias] {
+            validate_shared_fixture_row(
+                directory.path(),
+                &contract,
+                reference,
+                0,
+                &mut cache,
+                &replays,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(replays.get(), 2);
+    }
+
     #[test]
     fn attach_routes_inventory_and_semantic_receipts_without_manual_json_edits() {
         let mut contract = starter_contract(Subject::default()).expect("starter");
@@ -5941,9 +6834,153 @@ mod tests {
         assert!(gate.requirements[0].gap.is_none());
     }
 
+    fn attachment_fixture(
+        kind: ValidatorKind,
+        fail: bool,
+    ) -> (tempfile::TempDir, Contract, EvidenceRef, ValidatorReceipt) {
+        let (directory, contract, reference) = shared_receipt_fixture(fail);
+        let mut cache = ReceiptCache::default();
+        let mut receipt = load_validator_receipt(&reference, directory.path(), &mut cache)
+            .unwrap()
+            .clone();
+        receipt.validator.kind = kind;
+        if kind == ValidatorKind::ReferenceExtractor {
+            let dimension = contract
+                .dimensions
+                .iter()
+                .find(|row| row.id == receipt.dimension_id)
+                .unwrap();
+            receipt.requirement_ids = dimension
+                .requirements
+                .iter()
+                .map(|row| row.id.clone())
+                .collect();
+            receipt.subject.ay_executable_sha256 = None;
+            receipt.resource_envelope = None;
+        }
+        let reference = store_attachment_fixture(directory.path(), "first.json", &receipt);
+        (directory, contract, reference, receipt)
+    }
+
+    fn store_attachment_fixture(
+        base: &Path,
+        name: &str,
+        receipt: &ValidatorReceipt,
+    ) -> EvidenceRef {
+        let bytes = pretty_json(receipt).unwrap();
+        fs::write(base.join(name), &bytes).unwrap();
+        EvidenceRef {
+            path: name.to_string(),
+            sha256: sha256_bytes(&bytes),
+        }
+    }
+
+    fn reconcile_attachment_fixture(
+        contract: &mut Contract,
+        base: &Path,
+        receipt: &ValidatorReceipt,
+    ) -> Result<(), String> {
+        // Exercise the production metadata/hash/coverage/result guards. Only
+        // registered-owner dispatch is substituted for these controlled rows.
+        reconcile_attached_receipt_gaps_using(contract, base, receipt, |receipt, context| {
+            validate_validator_receipt_using(receipt, context, |_, _| Ok(()))
+        })
+    }
+
+    fn attachment_gap_and_refs(
+        contract: &Contract,
+        kind: ValidatorKind,
+    ) -> (&Option<String>, &[EvidenceRef]) {
+        let dimension = contract
+            .dimensions
+            .iter()
+            .find(|row| row.id == "language.commands")
+            .unwrap();
+        if kind == ValidatorKind::ReferenceExtractor {
+            (&dimension.inventory.gap, &dimension.inventory.evidence)
+        } else {
+            let requirement = &dimension.requirements[0];
+            (&requirement.gap, &requirement.evidence)
+        }
+    }
+
+    #[test]
+    fn failed_attachment_is_retained_and_later_pass_does_not_erase_it() {
+        for kind in [
+            ValidatorKind::ReferenceExtractor,
+            ValidatorKind::TranscriptConformance,
+        ] {
+            let (directory, mut contract, failed_ref, mut receipt) = attachment_fixture(kind, true);
+            let original_gap = attachment_gap_and_refs(&contract, kind).0.clone();
+            attach_receipt_reference(&mut contract, failed_ref.clone(), &receipt).unwrap();
+            reconcile_attachment_fixture(&mut contract, directory.path(), &receipt).unwrap();
+            let (gap, refs) = attachment_gap_and_refs(&contract, kind);
+            assert_eq!(*gap, original_gap);
+            assert_eq!(refs, [failed_ref.clone()]);
+            validate_gap_field(gap.as_deref(), false, "failed attachment").unwrap();
+
+            receipt.result = ValidatorResult::Pass;
+            receipt.case_results[0].outcome = ValidatorCaseOutcome::Pass;
+            receipt.cases = case_counts_from_rows(&receipt.case_results).unwrap();
+            let passed_ref = store_attachment_fixture(directory.path(), "later.json", &receipt);
+            attach_receipt_reference(&mut contract, passed_ref.clone(), &receipt).unwrap();
+            reconcile_attachment_fixture(&mut contract, directory.path(), &receipt).unwrap();
+            let (gap, refs) = attachment_gap_and_refs(&contract, kind);
+            assert!(
+                gap.is_some(),
+                "retained failure must still block completion"
+            );
+            assert_eq!(refs, [failed_ref, passed_ref]);
+            validate_gap_field(gap.as_deref(), false, "retained failure").unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_attachment_after_pass_keeps_both_receipts_and_restores_gap() {
+        for kind in [
+            ValidatorKind::ReferenceExtractor,
+            ValidatorKind::TranscriptConformance,
+        ] {
+            let (directory, mut contract, passed_ref, mut receipt) =
+                attachment_fixture(kind, false);
+            attach_receipt_reference(&mut contract, passed_ref.clone(), &receipt).unwrap();
+            reconcile_attachment_fixture(&mut contract, directory.path(), &receipt).unwrap();
+            assert!(attachment_gap_and_refs(&contract, kind).0.is_none());
+
+            receipt.result = ValidatorResult::Fail;
+            receipt.case_results[0].outcome = ValidatorCaseOutcome::Fail;
+            receipt.cases = case_counts_from_rows(&receipt.case_results).unwrap();
+            let failed_ref = store_attachment_fixture(directory.path(), "later.json", &receipt);
+            attach_receipt_reference(&mut contract, failed_ref.clone(), &receipt).unwrap();
+            reconcile_attachment_fixture(&mut contract, directory.path(), &receipt).unwrap();
+            let (gap, refs) = attachment_gap_and_refs(&contract, kind);
+            assert!(gap.is_some());
+            assert_eq!(refs, [passed_ref, failed_ref]);
+            validate_gap_field(gap.as_deref(), false, "failed addition").unwrap();
+        }
+    }
+
+    #[test]
+    fn forged_passing_attachment_still_fails_full_audit_validation() {
+        let (directory, mut contract, _, mut receipt) =
+            attachment_fixture(ValidatorKind::TranscriptConformance, true);
+        receipt.result = ValidatorResult::Pass;
+        receipt.cases.passed = 1;
+        receipt.cases.failed = 0;
+        let reference = store_attachment_fixture(directory.path(), "forged.json", &receipt);
+        attach_receipt_reference(&mut contract, reference, &receipt).unwrap();
+        assert!(reconcile_attachment_fixture(&mut contract, directory.path(), &receipt).is_err());
+        let error = validate_contract(&contract, directory.path(), ValidationMode::Audit)
+            .expect_err("a claimed pass cannot override its failed detailed row");
+        assert!(
+            error.contains("aggregate counts do not match recomputed detailed rows"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn ay_abi_stderr_policy_is_closed_to_the_four_known_array_diagnostics() {
-        let line = "c !! MODEL-UNCONFIRMED [UNCONFIRMED/published] \
+        let line = "c !! MODEL-UNCONFIRMED [UNCONFIRMED/withheld] \
             (not a refutation — see [AY SOUNDNESS GATE] for caught invalid models) \
             model validation incomplete: SmtGroundAssertion: Assertion 1: (= a b) \
             function-backed array equality could not be independently validated (#as-array-ext)\n";
@@ -5963,7 +7000,7 @@ mod tests {
         let overlay = contract
             .dimensions
             .iter()
-            .find(|dimension| dimension.id == "overlay.z3-5.1.0")
+            .find(|dimension| dimension.id == "overlay.z3-5.3.3")
             .expect("overlay");
         let ay_sha256 = "a".repeat(64);
         let validator_sha256 = "b".repeat(64);
@@ -6158,7 +7195,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_abi_receipt_requires_exact_manifest_provenance_and_case_hashes() {
+    fn historical_abi_shape_requires_exact_manifest_provenance_and_case_hashes() {
         let contract = starter_contract(Subject {
             ay_executable: None,
             ay_shared_library: Some(Artifact {
@@ -6167,15 +7204,17 @@ mod tests {
             }),
         })
         .expect("starter");
-        let overlay = contract
+        let mut legacy_overlay = contract
             .dimensions
             .iter()
-            .find(|dimension| dimension.id == "overlay.z3-5.1.0")
-            .expect("overlay");
+            .find(|dimension| dimension.id == "overlay.z3-5.3.3")
+            .expect("overlay")
+            .clone();
+        legacy_overlay.id = "overlay.z3-5.1.0".to_string();
         let context = EvidenceContext {
             contract: &contract,
             manifest_dir: Path::new("."),
-            dimension: overlay,
+            dimension: &legacy_overlay,
             expected_kind: ValidatorKind::Z3Differential,
             required_requirement_id: Some("overlay.z3-5.1.0.c-abi"),
             exact_requirement_ids: None,
@@ -6355,6 +7394,7 @@ mod tests {
 
     #[test]
     fn registered_identity_failure_remains_a_gap() {
+        let _resource_guard = resource_test_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         write(&directory.path().join("ay"), b"ay executable");
         write(&directory.path().join("libay"), b"ay library");
@@ -6377,7 +7417,7 @@ mod tests {
         .expect("starter");
         contract.campaign_id = "identity-failure".to_string();
         contract.resource_envelope = Some(envelope.clone());
-        let overlay = dimension_mut(&mut contract, "overlay.z3-5.1.0");
+        let overlay = dimension_mut(&mut contract, "overlay.z3-5.3.3");
         let input_sha = sha256_bytes(b"(get-info :name)\n(get-info :version)\n(exit)\n");
         let clean_process = ProcessObservation {
             stdin_complete: true,
@@ -6392,7 +7432,7 @@ mod tests {
             profile_id: PROFILE_ID.to_string(),
             profile_sha256: canonical_profile_sha256().expect("profile sha"),
             dimension_id: overlay.id.clone(),
-            requirement_ids: vec!["overlay.z3-5.1.0.target-identity".to_string()],
+            requirement_ids: vec!["overlay.z3-5.3.3.target-identity".to_string()],
             inventory_sha256: overlay.inventory.sha256.clone(),
             validator: ValidatorIdentity {
                 id: "builtin.target-identity.v1".to_string(),
@@ -6404,7 +7444,13 @@ mod tests {
                 ay_executable_sha256: Some(ay_sha),
                 ay_shared_library_sha256: Some(lib_sha),
             },
-            z3_binary_sha256: Some(canonical_profile().z3_overlay.reference_executable.sha256),
+            z3_binary_sha256: Some(
+                canonical_profile()
+                    .unwrap()
+                    .z3_overlay
+                    .reference_executable
+                    .sha256,
+            ),
             z3_shared_library_sha256: None,
             reference_inputs: Vec::new(),
             auxiliary_tools: Vec::new(),
@@ -6427,7 +7473,7 @@ mod tests {
                 ValidatorCase {
                     id: "ay.identity".to_string(),
                     input_sha256: input_sha.clone(),
-                    expected: "exact Z3 5.1.0 identity".to_string(),
+                    expected: "exact Z3 5.3.3 identity".to_string(),
                     observed: "AY reported 4.15.4".to_string(),
                     stdout: Some("(:name \"Z3\")\n(:version \"4.15.4\")\n".to_string()),
                     stderr: Some(String::new()),
@@ -6438,9 +7484,9 @@ mod tests {
                 ValidatorCase {
                     id: "z3.identity".to_string(),
                     input_sha256: input_sha,
-                    expected: "exact Z3 5.1.0 identity".to_string(),
-                    observed: "Z3 reported 5.1.0".to_string(),
-                    stdout: Some("(:name \"Z3\")\n(:version \"5.1.0\")\n".to_string()),
+                    expected: "exact Z3 5.3.3 identity".to_string(),
+                    observed: "Z3 reported 5.3.3".to_string(),
+                    stdout: Some("(:name \"Z3\")\n(:version \"5.3.3\")\n".to_string()),
                     stderr: Some(String::new()),
                     exit_code: Some(0),
                     process: Some(clean_process),
@@ -6469,7 +7515,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.id == "ay.identity")
             .expect("AY row");
-        forged_ay.stdout = Some("(:name \"Z3\")\n(:version \"5.1.0\")\n".to_string());
+        forged_ay.stdout = Some("(:name \"Z3\")\n(:version \"5.3.3\")\n".to_string());
         forged_ay.observed = "hand-authored passing transcript".to_string();
         forged_ay.outcome = ValidatorCaseOutcome::Pass;
         forged_pass.cases =
@@ -6484,7 +7530,7 @@ mod tests {
         let target = overlay
             .requirements
             .iter_mut()
-            .find(|row| row.id == "overlay.z3-5.1.0.target-identity")
+            .find(|row| row.id == "overlay.z3-5.3.3.target-identity")
             .expect("target identity row");
         target.evidence.push(EvidenceRef {
             path: "identity.json".to_string(),
@@ -6497,7 +7543,7 @@ mod tests {
         assert!(report
             .blockers
             .iter()
-            .any(|blocker| blocker == "overlay.z3-5.1.0.target-identity: semantic evidence gap"));
+            .any(|blocker| blocker == "overlay.z3-5.3.3.target-identity: semantic evidence gap"));
     }
 
     #[test]

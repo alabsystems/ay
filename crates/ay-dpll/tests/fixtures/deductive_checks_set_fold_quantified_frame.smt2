@@ -1,0 +1,23 @@
+(set-option :produce-unsat-cores true)
+(set-logic ALL)
+
+        (declare-const __deductive_checks_collection_ctor_Set_usize_empty (Array (_ BitVec 64) Bool))
+        (declare-const __set_len_insert_8 Int)
+        (declare-const __set_fold_ordering_9 (Array (_ BitVec 64) (_ BitVec 64)))
+        (declare-const __set_fold_inv_10 (Array (_ BitVec 64) (_ BitVec 64)))
+        (declare-const __set_fold_state_12 (Array (_ BitVec 64) (_ BitVec 64)))
+
+        (assert (! (= __deductive_checks_collection_ctor_Set_usize_empty ((as const (Array (_ BitVec 64) Bool)) false)) :named dn0))
+        (assert (! (ite (select __deductive_checks_collection_ctor_Set_usize_empty #x0000000000000009) (= 0 __set_len_insert_8) (= 1 __set_len_insert_8)) :named dn21))
+        (assert (! (and (<= __set_len_insert_8 18446744073709551615) (<= 0 __set_len_insert_8)) :named dn40))
+        (assert (! (or (select (store __deductive_checks_collection_ctor_Set_usize_empty #x0000000000000009 true) (select __set_fold_ordering_9 #x0000000000000000)) (not (bvult #x0000000000000000 ((_ int2bv 64) __set_len_insert_8)))) :named dn22))
+        (assert (! (or (select (store __deductive_checks_collection_ctor_Set_usize_empty #x0000000000000009 true) (select __set_fold_ordering_9 #x0000000000000001)) (not (bvult #x0000000000000001 ((_ int2bv 64) __set_len_insert_8)))) :named dn23))
+        (assert (! (or (not (bvult #x0000000000000000 ((_ int2bv 64) __set_len_insert_8))) (not (bvult #x0000000000000001 ((_ int2bv 64) __set_len_insert_8))) (not (= (select __set_fold_ordering_9 #x0000000000000000) (select __set_fold_ordering_9 #x0000000000000001)))) :named dn26))
+        (assert (! (forall ((__set_fold_surj_x_11 (_ BitVec 64))) (or (and (bvult (select __set_fold_inv_10 __set_fold_surj_x_11) ((_ int2bv 64) __set_len_insert_8)) (= __set_fold_surj_x_11 (select __set_fold_ordering_9 (select __set_fold_inv_10 __set_fold_surj_x_11)))) (not (select (store __deductive_checks_collection_ctor_Set_usize_empty #x0000000000000009 true) __set_fold_surj_x_11)))) :named dn32))
+        (assert (! (= #x0000000000000000 (select __set_fold_state_12 #x0000000000000000)) :named dn33))
+        (assert (! (forall ((__set_fold_step_i_13 (_ BitVec 64))) (or (= (bvadd (select __set_fold_state_12 __set_fold_step_i_13) (select __set_fold_ordering_9 __set_fold_step_i_13)) (select __set_fold_state_12 (bvadd __set_fold_step_i_13 #x0000000000000001))) (not (bvult __set_fold_step_i_13 ((_ int2bv 64) __set_len_insert_8))))) :named dn34))
+        (assert (! (or (not (bvult #x0000000000000000 ((_ int2bv 64) __set_len_insert_8))) (= (bvadd (select __set_fold_state_12 #x0000000000000000) (select __set_fold_ordering_9 #x0000000000000000)) (select __set_fold_state_12 #x0000000000000001))) :named dn35))
+        (assert (! (or (not (bvult #x0000000000000001 ((_ int2bv 64) __set_len_insert_8))) (= (bvadd (select __set_fold_state_12 #x0000000000000001) (select __set_fold_ordering_9 #x0000000000000001)) (select __set_fold_state_12 #x0000000000000002))) :named dn36))
+
+        (assert (! (not (= #x0000000000000009 (select __set_fold_state_12 ((_ int2bv 64) __set_len_insert_8)))) :named dn39))
+        (check-sat)

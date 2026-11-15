@@ -259,29 +259,31 @@ impl Factor {
                             {
                                 continue;
                             }
-                            if Self::clause_satisfied(clause_db.literals(di), vals) {
-                                continue;
-                            }
                             let d_lits = clause_db.literals(di);
 
-                            // Check: d differs from ci in exactly one non-factor literal.
+                            // Check: d differs from ci in exactly one non-factor
+                            // literal. This test usually fails on the first
+                            // literals, so it runs before the satisfaction scan
+                            // (which reads every literal); both must pass, so the
+                            // order changes no outcome, and ticks are charged per
+                            // occurrence list above, not per test.
                             let mut next_candidate = None;
                             let mut valid = true;
                             for &lit in d_lits {
-                                if self.is_marked(lit, MARK_QUOTIENT) {
+                                let marks = self.mark_bits(lit);
+                                if marks & MARK_QUOTIENT != 0 {
                                     continue;
                                 }
-                                if self.is_marked(lit, MARK_FACTOR)
-                                    || self.is_marked(lit, MARK_NOUNTED)
+                                if marks & (MARK_FACTOR | MARK_NOUNTED) != 0
+                                    || next_candidate.is_some()
                                 {
                                     valid = false;
                                     break;
                                 }
-                                if next_candidate.is_some() {
-                                    valid = false;
-                                    break;
-                                }
                                 next_candidate = Some(lit);
+                            }
+                            if valid && Self::clause_satisfied(d_lits, vals) {
+                                continue;
                             }
 
                             if valid {

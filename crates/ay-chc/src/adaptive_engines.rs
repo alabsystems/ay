@@ -33,18 +33,10 @@ const SHALLOW_UNSAFE_BMC_MAX_DEPTH: usize = 8;
 /// verification, original-clause validation). See `KindConfig::validation_grace`.
 const KIND_VALIDATION_GRACE: Duration = Duration::from_secs(3);
 
-/// Inc-16 S1b front-probe clamp parameters: stop the single-pred TS probe
-/// once this depth has been verified cex-free...
-const FRONT_PROBE_CLAMP_DEPTH: usize = 8;
-/// ...AND this much wall-clock has elapsed. See `BmcConfig::ts_probe_clamp`.
-const FRONT_PROBE_CLAMP_AFTER: Duration = Duration::from_secs(9);
-
-/// Kill switch for the inc-16 S1b front-probe clamp: `AY_FRONT_PROBE_CLAMP=0`
-/// restores the unclamped probe (full ~25%-of-remaining budget).
-fn front_probe_clamp_enabled() -> bool {
-    // B27: CLI-owned; env retired.
-    crate::ab_switches::get().front_probe_clamp
-}
+/// Share of the remaining window the ladder-race member probe searches in; the
+/// rest is the final validation's (a counterexample found at the very edge
+/// would otherwise reach `finalize_verified_result` with no replay budget).
+const FRONT_PROBE_MEMBER_SHARE: f64 = 0.9;
 
 impl AdaptivePortfolio {
     /// Try the ADT/array nullary-fact unsafe prepass.
@@ -194,7 +186,8 @@ impl AdaptivePortfolio {
             .with_max_depth(max_depth)
             .with_time_budget(budget)
             .with_per_depth_timeout(budget)
-            .with_verbose(self.config.verbose);
+            .with_verbose(self.config.verbose)
+            .with_smt_lane(crate::smt::SmtLane::Search);
         let bmc = crate::bmc::BmcSolver::new(self.problem.clone(), config);
         let start = Instant::now();
         let result = bmc.solve();
@@ -281,7 +274,8 @@ impl AdaptivePortfolio {
         }
         let config = BmcConfig::default()
             .with_time_budget(budget)
-            .with_verbose(self.config.verbose);
+            .with_verbose(self.config.verbose)
+            .with_smt_lane(crate::smt::SmtLane::Search);
         let bmc = crate::bmc::BmcSolver::new(self.problem.clone(), config);
         let start = Instant::now();
         let result = bmc.solve_datatype_bounded_refutation(max_tree_depth, budget, node_cap);
@@ -308,79 +302,84 @@ impl AdaptivePortfolio {
         }
     }
 
-    /// Focused front BMC probe for cyclic linear CHC problems.
+    /// Whether the front BMC probe applies to this problem at all.
+    pub(crate) fn front_bmc_probe_applies(&self, features: &ProblemFeatures) -> bool {
+        (features.is_single_predicate || features.is_linear)
+            && !features.uses_arrays
+            && !self.problem.has_bv_sorts()
+            && !self.problem.has_datatype_sorts()
+    }
+
+    /// Whether the SimpleLoop ladder races the front BMC member, and so drops
+    /// the portfolio's own BMC engine. The member takes a share of the solve's
+    /// budget ([`Self::front_bmc_probe_member`]); an unbounded solve (no
+    /// deadline, no time budget: the CLI without a timeout) has none to give,
+    /// and at e2e3bd3a8 such a solve ran no BMC at all.
+    pub(crate) fn front_bmc_probe_member_runs(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+    ) -> bool {
+        self.front_bmc_probe_applies(features)
+            && (deadline.is_some() || !self.config.time_budget.is_zero())
+    }
+
+    /// Focused front BMC probe for cyclic linear CHC problems, a concurrent
+    /// ladder-race member of the SimpleLoop and MultiPredLinear arms
+    /// (`adaptive_ladder_race`). Bug-finding only: any non-Unsafe result is
+    /// no verdict.
     ///
-    /// Runs FIRST in the SimpleLoop and MultiPredLinear strategy arms,
-    /// before the LIA/Farkas PDR route and the Kind probe. Rationale
-    /// (lustre/svcomp-class latency): unsafe transition systems and CFG
-    /// encodings usually have shallow counterexamples that BMC finds in
-    /// well under a second, while invariant-directed routes burn their
-    /// full budgets first. Bug-finding only: any non-Unsafe result falls
-    /// through to the normal pipeline.
-    pub(crate) fn try_front_bmc_probe(
+    /// Unsafe transition systems and CFG encodings usually have shallow
+    /// counterexamples; the probe runs next to the invariant routes and the
+    /// portfolio from t=0 for one bounded window — a share of the WHOLE
+    /// remaining budget, with no soft budget, depth clamp or hand-off. Those
+    /// existed only while the probe ran serially before the other stages:
+    /// it stopped at ~25 % of the wall (metros_2: depth 8 of the needed 13)
+    /// and handed its proven prefix to the portfolio's BMC, which ran on the
+    /// preprocessed problem, missed the fingerprint and restarted at level 0
+    /// with a 2 s budget. The SimpleLoop portfolio now drops its own BMC.
+    pub(crate) fn front_bmc_probe_member(
         &self,
         features: &ProblemFeatures,
         deadline: Option<Instant>,
     ) -> Option<(PortfolioResult, ValidationEvidence)> {
-        if !(features.is_single_predicate || features.is_linear)
-            || features.uses_arrays
-            || self.problem.has_bv_sorts()
-            || self.problem.has_datatype_sorts()
-        {
+        if !self.front_bmc_probe_applies(features) {
             return None;
         }
-        // Scaled with the global budget (#phase0c): a 1800s competition run
-        // buys a deeper probe (up to 30s) than a 30s dev run (1.5s floor).
-        //
-        // Fix 1 follow-up (sat-side-model-search diagnosis): raised from 5%
-        // to 25% of remaining. With LRA propagation off in the BMC TS lane,
-        // DRAGON-class sat-type depth checks answer in ~1-2s and the flat
-        // confirmation re-solve in ~3-5s, so an end-to-end shallow-cex find
-        // needs ~5-7s — a 5%-of-30s probe (1.5s) starved it one depth short
-        // of the counterexample. 25% keeps the competition-scale behavior
-        // unchanged (25% of 1800s still hits the 30s cap) while letting
-        // dev-scale (30-60s) runs complete depth-1/2 cex searches. Safe
-        // instances are not stalled by the larger budget: their per-depth
-        // UNSAT checks are fast in the eager arm, and the probe exits early
-        // on exhaustion.
-        let bmc_probe_budget = self.scaled_probe_budget(
-            deadline,
-            Duration::from_millis(1500),
-            25,
-            Duration::from_secs(30),
-        );
+        // Leave the tail of the window to the final Unsafe replay.
+        let bmc_probe_budget = self
+            .remaining_budget(deadline)
+            .unwrap_or(self.config.time_budget)
+            .mul_f64(FRONT_PROBE_MEMBER_SHARE);
         if bmc_probe_budget < Duration::from_millis(10) {
             return None;
         }
         if self.config.verbose {
             safe_eprintln!(
-                "Adaptive: front BMC probe (budget {:.1}s, direct)",
+                "Adaptive: front BMC probe (budget {:.1}s, ladder-race member)",
                 bmc_probe_budget.as_secs_f64()
             );
         }
-        // Child of the portfolio handle (item 5): budget timer stays lane-local,
-        // external cancellation propagates in.
-        let cancel = self.cancellation_token.child();
-        // Inc-16 S1b: clamp the single-pred TS probe once depth 8 is verified
-        // cex-free AND ~9s have elapsed (kill switch AY_FRONT_PROBE_CLAMP=0).
-        // Attribution: on sat lustre residuals the probe burns its full
-        // ~24%-of-wall budget reaching only depth 2-12 with no cex; unsafe TS
-        // instances find their (shallow) cex long before the clamp point.
-        // The clamp lives in the TS incremental lane only, so the multipred
-        // SingleLoop lane (inc-9, where the probe historically wins deep
-        // cexs) and all non-probe BMC runs keep their full budget.
-        let ts_probe_clamp = front_probe_clamp_enabled()
-            .then_some((FRONT_PROBE_CLAMP_DEPTH, FRONT_PROBE_CLAMP_AFTER))
-            .filter(|(_, after)| bmc_probe_budget > *after);
+        // Child of the portfolio handle (item 5) that also observes the
+        // query-flag proof signal and this member's lane.
+        let cancel = self.lane_token();
+        // #9690: every guard is armed at the budget the stage advertises.
         let bmc_config = BmcConfig {
             base: ChcEngineConfig {
                 verbose: self.config.verbose,
                 cancellation_token: Some(cancel.clone()),
             },
-            max_depth: 50,
+            // The portfolio's own depth bound (`BmcConfig::default`): in the
+            // SimpleLoop arm this member REPLACES the portfolio's BMC, so a
+            // probe-sized bound (it was 50) would leave deeper counterexamples
+            // to no engine at all.
             per_depth_timeout: Some(bmc_probe_budget),
             time_budget: Some(bmc_probe_budget),
-            ts_probe_clamp,
+            soft_time_budget: Some(bmc_probe_budget),
+            probe_extension_deadline: deadline,
+            // Rung 0: probe -> Search lane (an Unsafe is replayed on the
+            // original clauses by a Verification-lane verifier).
+            smt_lane: crate::smt::SmtLane::Search,
             ..BmcConfig::default()
         };
         let bmc_start = Instant::now();
@@ -393,7 +392,10 @@ impl AdaptivePortfolio {
         self.decision_log.log_decision(DecisionEntry {
             stage: "front_bmc_probe",
             gate_result: found,
-            gate_reason: "shallow counterexample probe before invariant routes".to_string(),
+            gate_reason: format!(
+                "shallow counterexample probe (ladder-race member); levels 0..{} proven free",
+                bmc_solver.proven_unsat_prefix()
+            ),
             budget_secs: bmc_probe_budget.as_secs_f64(),
             elapsed_secs: elapsed.as_secs_f64(),
             result: Self::result_to_str(&bmc_result),
@@ -715,10 +717,14 @@ impl AdaptivePortfolio {
             return None;
         };
 
+        let candidate = model.clone();
         let validated = self.validate_kind_safe_result_full_with_budget(model, validation_budget);
         let model = match validated {
             PdrResult::Safe(model) => model,
             PdrResult::Unknown | PdrResult::NotApplicable => {
+                // CH4b: a k-inductive candidate that is not 1-inductive per
+                // rule is still a seed (its conjuncts may be).
+                self.record_search_seed_model(&candidate);
                 self.log_direct_kind_demotion(
                     "original-clause validation returned unknown",
                     budget,
@@ -851,7 +857,7 @@ impl AdaptivePortfolio {
         // post-solve acceptance gates below extend by the same grace.
         let validation_grace = KIND_VALIDATION_GRACE;
         // Child of the portfolio handle (item 5).
-        let cancellation = self.cancellation_token.child();
+        let cancellation = self.lane_token();
         let cancellation_observer = cancellation.clone();
         let _timeout_guard = cancellation.cancel_after(budget + validation_grace);
         let kind_config = KindConfig::with_engine_config(
@@ -867,13 +873,17 @@ impl AdaptivePortfolio {
         // can operate on a synthetic single-predicate transition system.
         let problem = self.scalarized_problem();
         let mut kind_problem = problem.clone();
+        // Where each clause of an ITE-split `kind_problem` came from: Kind's
+        // counterexample names split clauses and is restated through it.
+        let mut split_origins: Option<Vec<usize>> = None;
         if kind_problem.predicates().len() <= 1
             && !kind_problem.has_bv_sorts()
             && !kind_problem.has_array_sorts()
             && !kind_problem.has_real_sorts()
             && !kind_problem.has_datatype_sorts()
         {
-            kind_problem.try_split_ites_in_clauses(32, self.config.verbose);
+            split_origins =
+                Some(kind_problem.try_split_ites_in_clauses_recorded(32, self.config.verbose));
         }
 
         let (solver_problem, singleloop_ctx) = if kind_problem.predicates().len() > 1 {
@@ -1012,8 +1022,14 @@ impl AdaptivePortfolio {
                     // Kind produces concrete counterexample traces via
                     // make_unsafe_with_trace (base case SAT + fresh cross-check).
                     // Return it as PortfolioResult::Unsafe for validation by
-                    // finalize_verified_result. Part of #7897.
-                    Some(PortfolioResult::Unsafe(cex.clone()))
+                    // finalize_verified_result. Part of #7897. Its clause
+                    // indices name the ITE-split copy Kind searched; the
+                    // validator reads them against `problem`.
+                    let cex = match &split_origins {
+                        Some(origins) => cex.clone().restated_over_unsplit(origins, problem),
+                        None => cex.clone(),
+                    };
+                    Some(PortfolioResult::Unsafe(cex))
                 }
             }
             KindResult::Unknown => None,
@@ -1251,6 +1267,10 @@ impl AdaptivePortfolio {
     /// }
     /// ```
     pub fn solve_bmc_only(&self, bmc_config: BmcConfig) -> crate::VerifiedChcResult {
+        let memory = crate::bmc::memory::Budget::capture(
+            bmc_config.memory_budget,
+            self.config.memory_budget,
+        );
         let solve_started = Instant::now();
         let requested_deadline = bmc_config.time_budget.map(|budget| solve_started + budget);
         // Resolve every caller-visible boundary before spawning: neither the
@@ -1262,6 +1282,17 @@ impl AdaptivePortfolio {
             .flatten()
             .min();
         let caller_cancellation = bmc_config.base.cancellation_token.clone();
+        let unknown = || {
+            crate::VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
+        };
+        if !memory.open()
+            || self.budget_exhausted(solve_deadline)
+            || caller_cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return unknown();
+        }
         // Run on a dedicated thread with a large stack to prevent stack
         // overflow from deep Arc<ChcExpr> recursive Drop (#6847).
         let config_for_fallback = bmc_config.clone();
@@ -1270,7 +1301,7 @@ impl AdaptivePortfolio {
                 .name("ay-bmc-only".to_string())
                 .stack_size(crate::adaptive::ADAPTIVE_SOLVER_STACK_SIZE)
                 .spawn_scoped(scope, || {
-                    self.solve_bmc_only_internal(bmc_config, solve_deadline)
+                    memory.run(|| self.solve_bmc_only_internal(bmc_config, solve_deadline))
                 }) {
                 Ok(handle) => match handle.join() {
                     Ok(result) => result,
@@ -1278,11 +1309,13 @@ impl AdaptivePortfolio {
                 },
                 Err(_) => {
                     // Fallback: run on calling thread if spawn fails
-                    self.solve_bmc_only_internal(config_for_fallback, solve_deadline)
+                    memory.run(|| self.solve_bmc_only_internal(config_for_fallback, solve_deadline))
                 }
             }
-        });
-        let boundary_closed = self.budget_exhausted(solve_deadline)
+        })
+        .unwrap_or_else(unknown);
+        let boundary_closed = !memory.open()
+            || self.budget_exhausted(solve_deadline)
             || caller_cancellation
                 .as_ref()
                 .is_some_and(crate::CancellationToken::is_cancelled);
@@ -1312,7 +1345,7 @@ impl AdaptivePortfolio {
 
         let bmc_verbose = bmc_config.base.verbose;
         let config_for_evidence = bmc_config.clone();
-        let mut route_cancellation = self.cancellation_token.child();
+        let mut route_cancellation = self.lane_token();
         if let Some(cancellation) = &bmc_config.base.cancellation_token {
             route_cancellation.link_upstream(cancellation);
         }
@@ -1321,7 +1354,8 @@ impl AdaptivePortfolio {
         });
         let _route_smt_deadline = solve_deadline.map(crate::smt::ScopedSmtDeadline::install_until);
         let boundary_open = || {
-            !self.cancellation_token.is_cancelled()
+            crate::bmc::memory::Budget::capture(None, None).open()
+                && !self.cancellation_token.is_cancelled()
                 && !route_cancellation.is_cancelled()
                 && solve_deadline.is_none_or(|deadline| Instant::now() < deadline)
         };
@@ -1531,6 +1565,7 @@ impl AdaptivePortfolio {
                 .map(|per_depth| per_depth.min(remaining));
         }
         bmc_config.base.cancellation_token = Some(route_cancellation.clone());
+        bmc_config.smt_lane = crate::smt::SmtLane::Search;
         let solver = BmcSolver::new(bmc_problem, bmc_config);
         if !boundary_open() {
             return unknown();
@@ -1784,6 +1819,56 @@ mod tests {
         pdr::{InvariantModel, PredicateInterpretation},
     };
 
+    /// The direct Kind lane searches an ITE-split copy of a single-predicate
+    /// problem. Its counterexample named the COPY's clauses: here the split
+    /// copy is query, two transition cases, fact, so the fact's index (3) runs
+    /// past the input's three clauses.
+    #[test]
+    fn direct_kind_unsafe_names_the_unsplit_clauses() {
+        use crate::portfolio::PortfolioResult;
+        use std::time::Duration;
+        let problem = ChcParser::parse(
+            r#"
+(set-logic HORN)
+(declare-fun inv (Int) Bool)
+(assert (forall ((x Int)) (=> (and (inv x) (>= x 7)) false)))
+(assert (forall ((x Int) (y Int)) (=> (and (inv x) (= y (ite (< x 3) (+ x 1) (+ x 2)))) (inv y))))
+(assert (forall ((x Int)) (=> (= x 0) (inv x))))
+(check-sat)
+"#,
+        )
+        .unwrap();
+        let solver = AdaptivePortfolio::new(
+            problem.clone(),
+            AdaptiveConfig::with_budget(Duration::from_secs(20), false),
+        );
+        let Some(PortfolioResult::Unsafe(cex)) = solver.try_kind(Duration::from_secs(10)) else {
+            panic!("Kind refutes the problem in its base case");
+        };
+        let clauses = problem.clauses();
+        let witness = cex
+            .witness
+            .as_ref()
+            .expect("Kind's counterexample has a witness");
+        for entry in &witness.entries {
+            if let Some(index) = entry.incoming_clause {
+                assert!(index < clauses.len(), "clause {index} of {}", clauses.len());
+                assert!(matches!(
+                    &clauses[index].head,
+                    ClauseHead::Predicate(head, _) if *head == entry.predicate
+                ));
+            }
+        }
+        if let Some(query) = witness.query_clause {
+            assert!(query < clauses.len() && clauses[query].is_query());
+        }
+        for step in &cex.steps {
+            if let Some(index) = step.clause_index {
+                assert!(index < clauses.len(), "step clause {index}");
+            }
+        }
+    }
+
     fn make_bmc_unsafe_problem() -> ChcProblem {
         let mut problem = ChcProblem::new();
         let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
@@ -1931,39 +2016,7 @@ mod tests {
         assert!(matches!(evidence, ValidationEvidence::BmcCounterexample));
     }
 
-    /// The marker-dag prepass only produces vacuous (all-`true`-state)
-    /// witnesses, whose replay validation is unsound (it reduces to query
-    /// satisfiability in isolation and emitted a FALSE UNSAFE on an
-    /// expected-safe harness). `validate_counterexample` now rejects vacuous
-    /// witnesses unconditionally, so the prepass must fail closed here even
-    /// though this chain is genuinely unsafe — other (replay-validated)
-    /// engines own this class now.
-    #[test]
-    fn adt_array_dag_prepass_fails_closed_on_array_chain() {
-        let problem = ChcParser::parse(include_str!(
-            "../../../tests/chc/regression/false_proof_array_chain.smt2"
-        ))
-        .expect("false_proof_array_chain.smt2 should parse");
-        let features = crate::classifier::ProblemClassifier::classify(&problem);
-        assert!(!features.has_cycles);
-        assert_eq!(features.num_facts, 1);
-        assert_eq!(features.num_queries, 1);
-        assert!(
-            features.dag_depth <= SHALLOW_UNSAFE_BMC_MAX_DEPTH,
-            "sample chain depth {} must be admitted by the bounded bug prepass",
-            features.dag_depth
-        );
-
-        let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
-        let deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(1);
-
-        assert!(
-            adaptive
-                .try_adt_array_nullary_unsafe_prepass(Some(deadline))
-                .is_none(),
-            "vacuous marker-dag witnesses must never be accepted as Unsafe"
-        );
-    }
+    mod adt_array_dag;
 
     #[test]
     fn direct_kind_acceptance_demotes_safe_when_validation_deadline_exhausted() {

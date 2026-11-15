@@ -8,6 +8,7 @@
 //! (Liang et al. CAV 2014). The propagation-only caller is in `nf_equality`.
 
 use super::*;
+mod nf_length_premise;
 
 impl CoreSolver {
     /// Compare two normal forms component-by-component (processSimpleNEq).
@@ -103,6 +104,19 @@ impl CoreSolver {
                 continue;
             }
 
+            // An empty component consumes nothing. Case A compares a concat NF
+            // against the empty-string EQC's singleton NF `[rep]`; as a "" constant
+            // it sent a non-empty variable to a ConstSplit on "". Skipped, that side
+            // is exhausted and Case 4 infers the rest empty (N_ENDPOINT_EQ).
+            if off1 == 0 && state.is_empty_string(terms, c1) {
+                i += 1;
+                continue;
+            }
+            if off2 == 0 && state.is_empty_string(terms, c2) {
+                j += 1;
+                continue;
+            }
+
             let s1 = Self::component_constant_owned(terms, state, c1);
             let s2 = Self::component_constant_owned(terms, state, c2);
 
@@ -189,7 +203,11 @@ impl CoreSolver {
                     //
                     // CVC5 reference: core_solver.cpp:1331
                     //   if (areEqual(len_x, len_y)) { ... sendInference(x == y) }
-                    if Self::are_lengths_equal_with_entail(terms, state, c1, c2) {
+                    //
+                    // The equality also rests on len(c1) = len(c2), so it carries
+                    // those literals (nf_length_premise.rs). Lengths equal only by
+                    // unexplainable facts do not unify; the splits below decide.
+                    if let Some(len_premise) = Self::unify_length_premise(terms, state, c1, c2) {
                         if *DEBUG_STRING_CORE {
                             eprintln!(
                                 "[STRING_CORE] process_simple_neq: N_UNIFY c1={c1:?} c2={c2:?}"
@@ -200,26 +218,12 @@ impl CoreSolver {
                         // explanation. If the explanation is empty, skip the
                         // internal equality to avoid poisoning the proof forest
                         // with unjustified merges (#6273).
-                        let Some(mut explanation) =
+                        let Some(explanation) =
                             Self::build_pair_explanation_for_lemma(terms, nf1, nf2, state)
                         else {
                             return NfCheckResult::Incomplete;
                         };
-                        // Closure 2 (`--str-nf`, sub-flag 2): the derived
-                        // equality depends on len(c1) = len(c2) — include the
-                        // guarding length literals so backtracking the length
-                        // decision retracts the merge justification too.
-                        // Reason-free entailments (pure ArithEntail) keep the
-                        // pre-closure explanation.
-                        if crate::str_nf_closure_enabled(2) {
-                            if let Some(len_reasons) =
-                                Self::length_equality_reasons(terms, state, c1, c2)
-                            {
-                                let mut seen: HashSet<TheoryLit> =
-                                    explanation.iter().copied().collect();
-                                Self::extend_dedup(&mut explanation, &mut seen, len_reasons);
-                            }
-                        }
+                        let explanation = Self::with_length_premise(explanation, len_premise);
                         infer.add_internal_equality(InferenceKind::Unify, c1, c2, explanation);
                         return NfCheckResult::Incomplete;
                     }
@@ -330,9 +334,10 @@ impl CoreSolver {
                             // prefix string constant and asserts the equality in
                             // one step, avoiding character-by-character ConstSplit
                             // that stalls on dual-concat NF comparisons.
-                            if let (Some(var_len), Some(cst_val)) =
-                                (state.known_length_full(terms, nc), cst_str.as_deref())
-                            {
+                            if let (Some((var_len, len_premise)), Some(cst_val)) = (
+                                Self::known_len_with_reasons(terms, state, nc),
+                                cst_str.as_deref(),
+                            ) {
                                 let cst_chars: Vec<char> = cst_val.chars().collect();
                                 if var_len <= cst_chars.len() {
                                     let Some(cst) = Self::constant_term_for_component(
@@ -345,14 +350,15 @@ impl CoreSolver {
                                     if *DEBUG_STRING_CORE {
                                         eprintln!("[STRING_CORE] process_simple_neq: ConstUnify nc={nc:?} cst={cst:?} var_len={var_len}");
                                     }
-                                    return NfCheckResult::NeedLemma(StringLemma {
-                                        kind: StringLemmaKind::ConstUnify,
-                                        x: nc,
-                                        y: cst,
-                                        char_offset: var_len,
-                                        start_offset: 0,
-                                        reason: require_nf_reasons!(),
-                                    });
+                                    let nf_reasons = require_nf_reasons!();
+                                    return Self::const_unify_lemma(
+                                        nc,
+                                        cst,
+                                        0,
+                                        var_len,
+                                        nf_reasons,
+                                        len_premise,
+                                    );
                                 }
                             }
 
@@ -457,8 +463,12 @@ impl CoreSolver {
                     // that length fits within the remaining constant portion,
                     // emit ConstUnify to unify in one step instead of splitting
                     // one character at a time (which diverges on dual-concat NFs).
+                    // The conflict and the lemma carry the literals behind the
+                    // length too (nf_length_premise.rs).
                     let cst_str_val = Self::component_constant_owned(terms, state, cst_component);
-                    if let Some(var_len) = state.known_length_full(terms, nc) {
+                    if let Some((var_len, len_premise)) =
+                        Self::known_len_with_reasons(terms, state, nc)
+                    {
                         if let Some(ref cst_val) = cst_str_val {
                             let remaining_chars: Vec<char> =
                                 cst_val.chars().skip(cst_off).collect();
@@ -486,6 +496,8 @@ impl CoreSolver {
                                     ) else {
                                         return NfCheckResult::Incomplete;
                                     };
+                                    let explanation =
+                                        Self::with_length_premise(explanation, len_premise);
                                     infer.add_conflict(InferenceKind::ConstantSplit, explanation);
                                     return NfCheckResult::Conflict;
                                 }
@@ -501,14 +513,15 @@ impl CoreSolver {
                                 // executor extracts the right slice (#4055 fix: the
                                 // prefix-only encoding mis-assigned later components,
                                 // e.g. y="ab" instead of y="b" on `x++y="ab"`).
-                                return NfCheckResult::NeedLemma(StringLemma {
-                                    kind: StringLemmaKind::ConstUnify,
-                                    x: nc,
-                                    y: cst,
-                                    char_offset: cst_off + var_len,
-                                    start_offset: cst_off,
-                                    reason: require_nf_reasons!(),
-                                });
+                                let nf_reasons = require_nf_reasons!();
+                                return Self::const_unify_lemma(
+                                    nc,
+                                    cst,
+                                    cst_off,
+                                    cst_off + var_len,
+                                    nf_reasons,
+                                    len_premise,
+                                );
                             }
                         }
                     }

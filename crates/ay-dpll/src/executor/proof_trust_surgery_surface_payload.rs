@@ -101,6 +101,128 @@ fn symbol_bytes(symbol: &Symbol, max_indices: usize) -> Option<usize> {
     }
 }
 
+fn application_bytes(
+    terms: &TermStore,
+    term: TermId,
+    remaining_terms: usize,
+    remaining_sort_nodes: &mut usize,
+) -> Option<usize> {
+    let TermData::App(symbol, args) = terms.get(term) else {
+        return None;
+    };
+    let bytes = symbol_bytes(symbol, remaining_terms)?.checked_add(args.len().checked_add(2)?)?;
+    // The constant-array printer may emit a result-sort annotation. Price it
+    // before that printer even compares the recursive element/value sorts.
+    let annotation = if matches!(symbol, Symbol::Named(name) if name == "const-array")
+        && args.len() == 1
+        && matches!(terms.sort(term), Sort::Array(_))
+    {
+        sort_bytes(terms.sort(term), remaining_sort_nodes)?
+    } else {
+        0
+    };
+    bytes.checked_add(annotation)
+}
+
+fn atomic_payload_bytes(
+    terms: &TermStore,
+    term: TermId,
+    remaining_terms: usize,
+    pending_terms: usize,
+    remaining_sort_nodes: &mut usize,
+) -> Option<usize> {
+    Some(match terms.get(term) {
+        TermData::Const(Constant::Bool(_)) => 5,
+        TermData::Const(Constant::Int(value)) => match decimal_bytes(value) {
+            Some(bytes) => bytes,
+            None => return None,
+        },
+        TermData::Const(Constant::Rational(value)) => {
+            let Some(numerator) = decimal_bytes(value.0.numer()) else {
+                return None;
+            };
+            let Some(denominator) = decimal_bytes(value.0.denom()) else {
+                return None;
+            };
+            match numerator
+                .checked_add(denominator)
+                .and_then(|n| n.checked_add(16))
+            {
+                Some(bytes) => bytes,
+                None => return None,
+            }
+        }
+        TermData::Const(Constant::BitVec { value, width }) => {
+            let Some(value_bytes) = decimal_bytes(value) else {
+                return None;
+            };
+            let Ok(width) = usize::try_from(*width) else {
+                return None;
+            };
+            value_bytes.max(width).saturating_add(2)
+        }
+        TermData::Const(Constant::String(value)) => {
+            match value.len().checked_mul(6).and_then(|n| n.checked_add(2)) {
+                Some(bytes) => bytes,
+                None => return None,
+            }
+        }
+        TermData::Var(name, _) => match name.len().checked_mul(2).and_then(|n| n.checked_add(2)) {
+            Some(bytes) => bytes,
+            None => return None,
+        },
+        TermData::App(..) => {
+            match application_bytes(terms, term, remaining_terms, remaining_sort_nodes) {
+                Some(bytes) => bytes,
+                None => return None,
+            }
+        }
+        TermData::Let(bindings, _) => {
+            if bindings.len().saturating_add(1) > remaining_terms.saturating_sub(pending_terms) {
+                return None;
+            }
+            let mut local = 8usize;
+            for (name, _) in bindings {
+                let Some(next) = name
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(3))
+                    .and_then(|n| local.checked_add(n))
+                else {
+                    return None;
+                };
+                local = next;
+            }
+            local
+        }
+        TermData::Not(_) => 6,
+        TermData::Ite(..) => 8,
+        TermData::Forall(bindings, _, _) | TermData::Exists(bindings, _, _) => {
+            if bindings.len().saturating_add(1) > remaining_terms.saturating_sub(pending_terms) {
+                return None;
+            }
+            let mut local = 12usize;
+            for (name, sort) in bindings {
+                let Some(sort_bytes) = sort_bytes(sort, remaining_sort_nodes) else {
+                    return None;
+                };
+                let Some(next) = name
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(sort_bytes))
+                    .and_then(|n| n.checked_add(3))
+                    .and_then(|n| local.checked_add(n))
+                else {
+                    return None;
+                };
+                local = next;
+            }
+            local
+        }
+        _ => return None,
+    })
+}
+
 /// Estimate every allocation-heavy atomic payload before invoking the
 /// recursive Alethe formatter. The formatter memoizes canonical TermIds, so
 /// shared subterms are charged once, while every binder sort is charged in
@@ -125,107 +247,14 @@ pub(in crate::executor) fn render_roots_have_bounded_payload(
         if seen.len() > max_terms {
             return false;
         }
-        let local = match terms.get(term) {
-            TermData::Const(Constant::Bool(_)) => 5,
-            TermData::Const(Constant::Int(value)) => match decimal_bytes(value) {
-                Some(bytes) => bytes,
-                None => return false,
-            },
-            TermData::Const(Constant::Rational(value)) => {
-                let Some(numerator) = decimal_bytes(value.0.numer()) else {
-                    return false;
-                };
-                let Some(denominator) = decimal_bytes(value.0.denom()) else {
-                    return false;
-                };
-                match numerator
-                    .checked_add(denominator)
-                    .and_then(|n| n.checked_add(16))
-                {
-                    Some(bytes) => bytes,
-                    None => return false,
-                }
-            }
-            TermData::Const(Constant::BitVec { value, width }) => {
-                let Some(value_bytes) = decimal_bytes(value) else {
-                    return false;
-                };
-                let Ok(width) = usize::try_from(*width) else {
-                    return false;
-                };
-                value_bytes.max(width).saturating_add(2)
-            }
-            TermData::Const(Constant::String(value)) => {
-                match value.len().checked_mul(6).and_then(|n| n.checked_add(2)) {
-                    Some(bytes) => bytes,
-                    None => return false,
-                }
-            }
-            TermData::Var(name, _) => {
-                match name.len().checked_mul(2).and_then(|n| n.checked_add(2)) {
-                    Some(bytes) => bytes,
-                    None => return false,
-                }
-            }
-            TermData::App(symbol, args) => {
-                match symbol_bytes(symbol, max_terms.saturating_sub(seen.len()))
-                    .and_then(|n| n.checked_add(args.len().saturating_add(2)))
-                {
-                    Some(bytes) => bytes,
-                    None => return false,
-                }
-            }
-            TermData::Let(bindings, _) => {
-                if bindings.len().saturating_add(1)
-                    > max_terms
-                        .saturating_sub(seen.len())
-                        .saturating_sub(pending.len())
-                {
-                    return false;
-                }
-                let mut local = 8usize;
-                for (name, _) in bindings {
-                    let Some(next) = name
-                        .len()
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_add(3))
-                        .and_then(|n| local.checked_add(n))
-                    else {
-                        return false;
-                    };
-                    local = next;
-                }
-                local
-            }
-            TermData::Not(_) => 6,
-            TermData::Ite(..) => 8,
-            TermData::Forall(bindings, _, _) | TermData::Exists(bindings, _, _) => {
-                if bindings.len().saturating_add(1)
-                    > max_terms
-                        .saturating_sub(seen.len())
-                        .saturating_sub(pending.len())
-                {
-                    return false;
-                }
-                let mut local = 12usize;
-                for (name, sort) in bindings {
-                    let Some(sort_bytes) = sort_bytes(sort, &mut remaining_sort_nodes) else {
-                        return false;
-                    };
-                    let Some(next) = name
-                        .len()
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_add(sort_bytes))
-                        .and_then(|n| n.checked_add(3))
-                        .and_then(|n| local.checked_add(n))
-                    else {
-                        return false;
-                    };
-                    local = next;
-                }
-                local
-            }
-            _ => return false,
+        let Some(local) = atomic_payload_bytes(
+            terms,
+            term,
+            max_terms.saturating_sub(seen.len()),
+            pending.len(),
+            &mut remaining_sort_nodes,
+        ) else {
+            return false;
         };
         let Some(next_bytes) = bytes.checked_add(local) else {
             return false;
@@ -249,6 +278,74 @@ pub(in crate::executor) fn render_roots_have_bounded_payload(
         }
     }
     true
+}
+
+/// Bound aggregate expanded output before formatting, including every copy of
+/// an override at every occurrence. Atomic DAG payload alone does not price
+/// expansion. The returned bound is in the existing printer's COPY-work units,
+/// separately from the output-byte cap: rendering every source subtree without
+/// cache reuse copies each local payload at most once per ancestor. A cached
+/// batch cannot do more work than that conservative unfolded bound.
+pub(in crate::executor) fn expanded_render_work_bound(
+    terms: &TermStore,
+    roots: &[TermId],
+    overrides: &ay_core::kani_compat::DetHashMap<TermId, String>,
+    max_terms: usize,
+    max_visits: usize,
+    max_bytes: usize,
+) -> Option<u64> {
+    let mut pending: Vec<_> = roots.iter().map(|&term| (term, 0usize)).collect();
+    let (mut visits, mut bytes, mut copy_work) = (0usize, 0usize, 0usize);
+    let mut remaining_sort_nodes = max_visits;
+    while let Some((term, depth)) = pending.pop() {
+        visits = visits.checked_add(1)?;
+        if visits > max_visits || depth > MAX_SURFACE_DEPTH {
+            return None;
+        }
+        let override_text = overrides.get(&term);
+        let local = match override_text {
+            Some(text) => text.len(),
+            None => {
+                // This preflight covers the existing ground-source printer
+                // fragment. Binders and other atomic spellings decline rather
+                // than borrowing an incomplete length model.
+                if !matches!(
+                    terms.get(term),
+                    TermData::Const(Constant::Bool(_) | Constant::BitVec { .. })
+                        | TermData::Var(..)
+                        | TermData::App(..)
+                        | TermData::Not(_)
+                        | TermData::Ite(..)
+                ) {
+                    return None;
+                }
+                let bytes =
+                    atomic_payload_bytes(terms, term, max_terms, 0, &mut remaining_sort_nodes)?;
+                // The tester printer resugars is-C to (_ is C), which adds
+                // syntax beyond an ordinary named application's payload.
+                let tester = matches!(terms.get(term), TermData::App(Symbol::Named(name), args)
+                    if args.len() == 1 && name.starts_with("is-"));
+                bytes.checked_add(if tester { 8 } else { 0 })?
+            }
+        };
+        bytes = bytes
+            .checked_add(local)
+            .filter(|&bytes| bytes <= max_bytes)?;
+        copy_work = copy_work.checked_add(local.checked_mul(depth.checked_add(1)?)?)?;
+        if override_text.is_none() {
+            let children = term_child_count(terms, term)?;
+            if visits.checked_add(pending.len())?.checked_add(children)? > max_visits {
+                return None;
+            }
+            pending.extend(
+                terms
+                    .children(term)
+                    .into_iter()
+                    .map(|child| (child, depth + 1)),
+            );
+        }
+    }
+    u64::try_from(copy_work).ok()
 }
 
 #[cfg(test)]

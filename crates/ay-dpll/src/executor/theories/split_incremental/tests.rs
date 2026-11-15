@@ -1058,3 +1058,156 @@ fn ensure_incremental_atom_encoded_keeps_positive_root_fallback_behavior_issue_8
         "asserting the false constant as true must remain UNSAT"
     );
 }
+
+/// Regression for the 2026-09-18 incremental QF_LRA false-UNSAT
+/// (`repros/lra-pushpop-false-unsat-2026-09-18/`): on a session-persistent
+/// solver, `pop()` leaves DEAD scope selectors (forced TRUE at level 0) above
+/// `user_num_vars`, and the split loop's former cursor seed
+/// `user_num_vars() + scope_depth()` re-issued those indices as "fresh" split
+/// atoms. Every minting site must now floor the cursor at
+/// `total_num_vars()`, so even a deliberately stale seed can never alias a
+/// selector.
+#[test]
+fn encode_split_pair_incremental_never_reissues_dead_scope_selectors() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let lt_atom = terms.mk_lt(x, y);
+    let gt_atom = terms.mk_gt(x, y);
+
+    let mut solver = SatSolver::new(0);
+    solver.ensure_num_vars(2); // two "user" atoms, as after a Tseitin encode
+                               // Two popped scopes leave two dead selectors; a third scope stays live.
+    solver.push();
+    assert!(solver.pop());
+    solver.push();
+    assert!(solver.pop());
+    solver.push();
+    let total_before = solver.total_num_vars();
+    assert_eq!(
+        total_before, 5,
+        "2 user vars + 3 selectors (2 dead, 1 live)"
+    );
+
+    // The pre-fix seed: it points INTO the dead-selector range.
+    let stale_seed = u32::try_from(solver.user_num_vars() + solver.scope_depth()).unwrap();
+    assert!(
+        (stale_seed as usize) < total_before,
+        "test premise: the stale seed ({stale_seed}) must lie below total_num_vars ({total_before})"
+    );
+
+    let mut local_term_to_var = super::HashMap::default();
+    let mut local_var_to_term = super::HashMap::default();
+    let mut local_next_var = stale_seed;
+    let mut negations = IncrementalNegationCache::seed(&mut terms, std::iter::empty(), false);
+
+    let (lt_var, gt_var) = encode_split_pair_incremental(
+        &terms,
+        &mut solver,
+        &mut local_term_to_var,
+        &mut local_var_to_term,
+        &mut local_next_var,
+        &mut negations,
+        (lt_atom, gt_atom),
+    )
+    .expect("split encoding should succeed");
+
+    assert!(
+        lt_var.index() >= total_before && gt_var.index() >= total_before,
+        "split atoms {lt_var:?}/{gt_var:?} must be minted above the pre-call total_num_vars \
+         ({total_before}); anything below is an existing var (here: a dead scope selector \
+         forced TRUE at level 0, which turns `x<y /\\ x>y` into a false UNSAT)"
+    );
+    assert_ne!(lt_var, gt_var);
+    assert_eq!(
+        local_next_var as usize,
+        solver.total_num_vars(),
+        "cursor must end exactly at the solver's total var count"
+    );
+    assert_eq!(
+        super::fresh_sat_var_floor(&solver) as usize,
+        solver.total_num_vars(),
+        "the floor is the total (selector-inclusive) var count"
+    );
+    // The general (delta-encode + polarity-adapter) path with the same stale
+    // seed: `(not (= x y))` delta-encodes the equality and then mints an
+    // adapter var for the negated root. Neither may land below the total.
+    let eq_atom = terms.mk_eq(x, y);
+    let neq_atom = terms.mk_not(eq_atom);
+    let mut stale_cursor = stale_seed;
+    let total_now = solver.total_num_vars();
+    let adapter = ensure_incremental_atom_encoded(
+        &terms,
+        &mut solver,
+        &mut local_term_to_var,
+        &mut local_var_to_term,
+        &mut stale_cursor,
+        &mut negations,
+        neq_atom,
+    );
+    assert!(
+        adapter.index() >= total_now,
+        "adapter var {adapter:?} must be minted above the pre-call total ({total_now})"
+    );
+    for (&var, &term) in &local_var_to_term {
+        if term == lt_atom || term == gt_atom {
+            continue;
+        }
+        assert!(
+            var as usize >= total_now,
+            "delta-encoded var {var} for {term:?} aliases a pre-existing var (total was {total_now})"
+        );
+    }
+    assert_eq!(stale_cursor as usize, solver.total_num_vars());
+}
+
+mod installed_row2;
+
+#[test]
+fn primary_checked_conflict_blocks_only_within_its_scope() {
+    use crate::verification::{verify_conflict_semantic_classified, ConflictSemanticVerdict};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("retained_x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let p = terms.mk_eq(x, zero);
+    let q = terms.mk_eq(x, one);
+    let conflict = [TheoryLit::new(p, true), TheoryLit::new(q, true)];
+    assert!(
+        matches!(
+            verify_conflict_semantic_classified(&conflict, &terms, &[], None, None),
+            Ok(ConflictSemanticVerdict::Reproved),
+        ),
+        "fixture must be a fresh arithmetic refutation, not a domain skip"
+    );
+
+    let mut solver = SatSolver::new(2);
+    solver.set_preprocess_enabled(false);
+    solver.enable_clause_trace();
+    let mut map = super::HashMap::default();
+    map.insert(p, 0);
+    map.insert(q, 1);
+    solver.push();
+    solver.add_clause(vec![SatLiteral::positive(SatVariable::new(0))]);
+    solver.add_clause(vec![SatLiteral::positive(SatVariable::new(1))]);
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+    // Scoped learned-lemma routing (DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111):
+    // the primary conflict must block inside its assertion scope and
+    // retract on pop. It deliberately does NOT enter the replay ledger
+    // as an original — that retention regressed the pinned smtopt
+    // trajectory, so no ledger/trace-original identity is asserted here.
+    match map_conflict_to_blocking_clause(&mut solver, &conflict, &[], &map) {
+        BlockingClauseResult::Added {
+            extra_original_ids, ..
+        } => {
+            assert!(extra_original_ids.is_empty());
+        }
+        _ => panic!("verified fully mapped primary must be admitted"),
+    };
+    assert!(solver.solve().into_inner().is_unsat());
+    assert!(solver.pop());
+    solver.add_clause(vec![SatLiteral::positive(SatVariable::new(0))]);
+    solver.add_clause(vec![SatLiteral::positive(SatVariable::new(1))]);
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+}

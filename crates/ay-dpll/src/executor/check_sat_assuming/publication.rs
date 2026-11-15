@@ -64,6 +64,40 @@ impl Executor {
             self.finalize_unknown_publication(result)
         }
     }
+
+    /// An UNSAT this decision's evaluation attempt has already refused is not
+    /// a verdict (#check-sat-assuming-empty-core).
+    ///
+    /// The refutation's proof is assembled inside the solve that found it, and
+    /// the assembly's repair lanes retain a stop they observe on the enclosing
+    /// evaluation attempt (`exact_authored_bv_refutation::control`). The next
+    /// `should_abort_theory_loop` poll publishes that stop, revoking the
+    /// decision's artifacts, the assumption core among them, while the theory
+    /// route still returns `Unsat`. `finalize_unknown_diagnostics` publishes
+    /// the held stop at the end of `finish_check_sat_assuming_result` anyway,
+    /// so the call already answered `Unknown`; this classifies it before
+    /// anything reads the provisional `Unsat`: the UNSAT-implies-core
+    /// postconditions, the fragile-LRA gate, and the PROOF NET, whose second,
+    /// non-idempotent proof build would otherwise be spent on a refused
+    /// decision. Measured at fd4e00f75: a core-minimizer subset attempt whose
+    /// 2 s slice expired while its proof was assembled returned `Unsat` with
+    /// no core. That slice no longer refuses the attempt (the repair
+    /// continuation imports no search-slice `Backstop`), but a repair lane
+    /// still retains its own refusal (a spent work allowance, a caller stop).
+    pub(super) fn refuse_unsat_held_by_evaluation_stop(
+        &mut self,
+        result: SolveResult,
+    ) -> SolveResult {
+        if !result.is_unsat() {
+            return result;
+        }
+        let Some(origin) = self.evaluation_stop_origin() else {
+            return result;
+        };
+        self.record_unknown_from_origin(origin);
+        self.last_assumption_core = None;
+        SolveResult::Unknown
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +162,54 @@ mod tests {
         assert_eq!(
             exec.unknown_origin(),
             Some(UnknownOrigin::IncompleteSolverLane)
+        );
+    }
+
+    /// #check-sat-assuming-empty-core: a proof-repair lane retained a stop on
+    /// the decision's evaluation attempt while the refutation's proof was
+    /// assembled, and a later stop poll published it, revoking the core. The
+    /// theory route still hands back `Unsat`; the call answers `Unknown`, not
+    /// an UNSAT without a core (which tripped the UNSAT-implies-core
+    /// postcondition in debug builds). That assertion is the counterfactual
+    /// signal: release builds already answered `Unknown` here.
+    #[test]
+    fn unsat_refused_by_a_held_evaluation_stop_answers_unknown() {
+        let mut exec = Executor::new();
+        let assumption = exec.ctx.terms.true_term();
+        exec.record_evaluation_stop(UnknownOrigin::SolveDeadline);
+        exec.last_assumption_core = None;
+
+        let result = exec.finish_check_sat_assuming_result(
+            &[assumption],
+            SolveResult::unsat(),
+            AssumptionSatPublication::EmitHere,
+        );
+        assert_eq!(result, SolveResult::Unknown);
+        assert_eq!(exec.last_result, Some(SolveResult::Unknown));
+        assert!(exec.last_assumption_core.is_none());
+        assert_eq!(exec.unknown_origin(), Some(UnknownOrigin::SolveDeadline));
+    }
+
+    /// Negative twin: with no stop held the same UNSAT keeps its verdict and
+    /// its core, and a SAT proposal stays the SAT funnel's even with one held.
+    #[test]
+    fn unsat_without_a_held_evaluation_stop_keeps_its_verdict_and_core() {
+        let mut exec = Executor::new();
+        let assumption = exec.ctx.terms.true_term();
+        exec.last_assumption_core = Some(vec![assumption]);
+
+        let result = exec.finish_check_sat_assuming_result(
+            &[assumption],
+            SolveResult::unsat(),
+            AssumptionSatPublication::EmitHere,
+        );
+        assert!(result.is_unsat());
+        assert_eq!(exec.last_assumption_core, Some(vec![assumption]));
+
+        exec.record_evaluation_stop(UnknownOrigin::SolveDeadline);
+        assert_eq!(
+            exec.refuse_unsat_held_by_evaluation_stop(SolveResult::Sat),
+            SolveResult::Sat
         );
     }
 }

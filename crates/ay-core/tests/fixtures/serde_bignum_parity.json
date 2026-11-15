@@ -746,8 +746,8 @@
       "json": "{\"Nope\":1}",
       "outcome": {
         "kind": "reject",
-        "message": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String` at line 1 column 7",
-        "message_trimmed": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`"
+        "message": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`, `FiniteField` at line 1 column 7",
+        "message_trimmed": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`, `FiniteField`"
       }
     },
     {

@@ -237,12 +237,11 @@ fn constant_propagation_folds_guards_and_strengthens_model() {
         .with(ConstantPropagator::new())
         .transform(problem.clone());
 
-    // The strengthened query constraint `m = 2 /\ m = 1` folds to false, so
-    // add_clause prunes the query clause.
-    assert!(
-        result.problem.clauses().len() < problem.clauses().len(),
-        "constant folding must prune the contradictory query clause"
-    );
+    // Preserve the source query identity while folding the contradictory
+    // guard. Original model validation below remains the authority.
+    assert!(result.problem.clauses().iter().any(|clause| {
+        clause.is_query() && clause.body.constraint == Some(ChcExpr::Bool(false))
+    }));
 
     let mut solver = PdrSolver::new(result.problem.clone(), bounded_pdr_config());
     match solver.solve() {

@@ -215,7 +215,13 @@ impl CoreSolver {
             let regex_term = args[1];
 
             // Resolve the string to a ground value via its EQC constant.
+            // When the class carries no constant, fall back to the
+            // explaining resolver: under a SAT branch choice (e.g.
+            // `v = ""` from a disjunction) the value often exists only
+            // through an EQC concat member (`x = "ab"·v·"cd"`), and
+            // without it the violated membership is never refuted.
             let rep = state.find(string_term);
+            let mut value_reasons: Vec<ay_core::TheoryLit> = Vec::new();
             let Some(s) = state
                 .get_eqc(&rep)
                 .and_then(|e| e.constant.as_deref())
@@ -223,6 +229,12 @@ impl CoreSolver {
                 .or_else(|| match terms.get(string_term) {
                     TermData::Const(Constant::String(s)) => Some(s.clone()),
                     _ => None,
+                })
+                .or_else(|| {
+                    Self::known_string_with_reasons(terms, state, string_term).map(|(s, r)| {
+                        value_reasons = r;
+                        s
+                    })
                 })
             else {
                 continue;
@@ -238,7 +250,12 @@ impl CoreSolver {
                 // Ground membership violation. Explanation: the membership
                 // literal plus why `string_term` equals its constant rep.
                 let mut explanation = vec![lit];
-                if let Some(const_id) = state.find_constant_term_id(terms, string_term) {
+                if !value_reasons.is_empty() {
+                    // Value came through the explaining resolver (EQC
+                    // concat member evaluation); its reasons are the
+                    // full justification for `string_term = s`.
+                    explanation.extend(value_reasons.iter().copied());
+                } else if let Some(const_id) = state.find_constant_term_id(terms, string_term) {
                     if const_id != string_term {
                         explanation.extend(state.explain(string_term, const_id));
                     }
@@ -272,11 +289,19 @@ impl CoreSolver {
     /// lengths any accepted string can have. So `str.in_re(x, R)` true implies
     /// `len(x) ∈ L`. We fire a conflict only when `len(x)` is a KNOWN concrete
     /// value `n` (from an EQC string constant or an N-O length bridge) AND
-    /// `n ∉ L`. The conflict explanation is the membership literal plus the
-    /// asserted length-equality literal that fixes `len(x) = n`. If we cannot
-    /// recover a sound length reason, we DO NOT fire (fail closed). This never
-    /// produces SAT and only emits UNSAT when the two assertions are genuinely
+    /// `n ∉ L`. The conflict explanation is the membership literal plus EVERY
+    /// literal behind `len(x) = n`, from [`Self::known_len_with_reasons`]. If
+    /// any link is unexplainable we DO NOT fire (fail closed). This never
+    /// produces SAT and only emits UNSAT when the explained facts are genuinely
     /// jointly inconsistent.
+    ///
+    /// The reasons must cover how the length VALUE was reached, not only the
+    /// equality that names the length term: an explanation of
+    /// `(= (str.len x) (str.len k))` without why `len(k) = 0` learns the clause
+    /// `¬in_re(x, R) ∨ ¬(len(x) = len(k))`, and when that equality is an axiom
+    /// the clause refutes the membership outright — a false UNSAT on the
+    /// satisfiable `(str.in_re (str.replace b "z" "") (re.union (str.to_re "u")
+    /// re.none))` and on cvc5's `issue8481.smt2`.
     pub(super) fn check_regex_length_disjoint(
         &mut self,
         terms: &TermStore,
@@ -321,8 +346,10 @@ impl CoreSolver {
                 return true;
             }
 
-            // The known concrete length of `x`, if any.
-            let Some(n) = state.known_length_full(terms, string_term) else {
+            // The known concrete length of `x` with every literal behind it, if
+            // any; `None` also when a link is unexplainable (fail closed).
+            let Some((n, length_reasons)) = Self::known_len_with_reasons(terms, state, string_term)
+            else {
                 continue;
             };
 
@@ -330,14 +357,9 @@ impl CoreSolver {
                 continue;
             }
 
-            // Length-set disjointness: len(x) = n ∉ L(R). Build a sound
-            // explanation. Start with the membership literal; add the
-            // length-establishing literal(s).
+            // Length-set disjointness: len(x) = n ∉ L(R).
             let mut explanation = vec![lit];
-            if !Self::add_length_reason(terms, state, string_term, n, &mut explanation) {
-                // No sound length reason recoverable: fail closed, do not fire.
-                continue;
-            }
+            explanation.extend(length_reasons);
 
             if *DEBUG_STRING_CORE {
                 eprintln!(
@@ -349,103 +371,6 @@ impl CoreSolver {
             return true;
         }
         infer.has_conflict()
-    }
-
-    /// Append the literal(s) that establish `len(string_term) = n` to
-    /// `explanation`. Returns `true` if a SOUND reason was found and added.
-    ///
-    /// Two sources are accepted, in priority order:
-    /// 1. An asserted-true equality `(= (str.len y) n)` (or commuted) where `y`
-    ///    is in the same EQC as `string_term`: the reason is that equality
-    ///    literal plus the `string_term ~ y` proof path. PREFERRED because the
-    ///    resulting learned clause `¬in_re(x,R) ∨ ¬(len(x)=n)` is a STRONG
-    ///    general conflict — the SAT solver cannot escape it by trying a
-    ///    different concrete value for `x`.
-    /// 2. `string_term` resolves to an EQC string constant of length `n`: the
-    ///    reason is the proof-forest path from `string_term` to that constant.
-    ///    Weaker (only refutes that one value branch) but still sound.
-    ///
-    /// Returns `false` (no fire) when neither yields a non-empty sound reason —
-    /// e.g. when the length is only known via an N-O bridge whose provenance we
-    /// cannot reconstruct here. Failing closed keeps the refutation sound.
-    fn add_length_reason(
-        terms: &TermStore,
-        state: &SolverState,
-        string_term: TermId,
-        n: usize,
-        explanation: &mut Vec<TheoryLit>,
-    ) -> bool {
-        // Source 1 (preferred): a direct asserted length equality on x's EQC.
-        let x_rep = state.find(string_term);
-        for &lit in state.assertions() {
-            let (lit_atom, lit_pol) = Self::atom_and_polarity(terms, lit);
-            if !lit_pol {
-                continue;
-            }
-            let TermData::App(eq_sym, eq_args) = terms.get(lit_atom) else {
-                continue;
-            };
-            if eq_sym.name() != "=" || eq_args.len() != 2 {
-                continue;
-            }
-            // Identify the (str.len y, int n) shape in either order.
-            let (a0, a1) = (eq_args[0], eq_args[1]);
-            for &(ls, is) in &[(a0, a1), (a1, a0)] {
-                let Some(y) = state.get_str_len_arg(terms, ls) else {
-                    continue;
-                };
-                // The int side must be exactly the constant n.
-                let matches_n = match terms.get(is) {
-                    TermData::Const(Constant::Int(v)) => {
-                        v.try_into().map(|vv: usize| vv == n).unwrap_or(false)
-                    }
-                    _ => state
-                        .resolve_int_constant(terms, is)
-                        .is_some_and(|v| v >= 0 && (v as usize) == n),
-                };
-                if !matches_n {
-                    continue;
-                }
-                // y must be the membership subject (same EQC).
-                if state.find(y) != x_rep {
-                    continue;
-                }
-                // Sound: this asserted equality fixes len(y)=n and y ~ x.
-                let before = explanation.len();
-                explanation.push(lit);
-                if y != string_term {
-                    let path = state.explain(string_term, y);
-                    if path.is_empty() {
-                        // No proof path: roll back, try other candidates.
-                        explanation.truncate(before);
-                        continue;
-                    }
-                    explanation.extend(path);
-                }
-                return true;
-            }
-        }
-
-        // Source 2 (fallback): x is in an EQC with a string constant of len n.
-        if let Some(const_id) = state.find_constant_term_id(terms, string_term) {
-            if let TermData::Const(Constant::String(s)) = terms.get(const_id) {
-                if s.chars().count() == n {
-                    if const_id != string_term {
-                        let path = state.explain(string_term, const_id);
-                        if path.is_empty() {
-                            return false;
-                        }
-                        explanation.extend(path);
-                    }
-                    // If string_term IS the constant, its length is fixed
-                    // syntactically; the membership literal already names the
-                    // subject. Accept (the conflict is sound by construction).
-                    return true;
-                }
-            }
-        }
-
-        false
     }
 
     /// Whether `t` (a string-sorted term) is a `str.at`/`str.substr` extraction

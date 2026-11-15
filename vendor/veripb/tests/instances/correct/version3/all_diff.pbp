@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+f 15;
+% step 1
+pol 3 4 + 5 +;
+% step 2
+pol 14 15 + y_x1_8 + y_x2_8 + y_x1_9 + y_x2_9 +;
+% step 3
+pol 16 17 +;
+e >= 1 : -1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

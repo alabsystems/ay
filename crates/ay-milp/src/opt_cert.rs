@@ -225,6 +225,52 @@ impl MilpOptimalityCertificate {
     }
 }
 
+/// Verify an `opttree` BLOCK BODY — the wire form — establishes
+/// `objective >= value` over the whole of `model`'s feasible set, WITHOUT
+/// building the tree.
+///
+/// Same obligations as [`verify_optimality_tree_bound`], same reconstructed
+/// boxes, same single `value`; what differs is that one leaf is live at a time,
+/// so a consumer's memory is bounded by the tree's DEPTH and not by its leaf
+/// count. That is what makes a certificate whose object form does not fit in
+/// RAM still checkable.
+///
+/// The body is the block's records WITHOUT its `opttree` opener and `end`
+/// terminator — exactly what [`StreamedOptTree::body`] returns.
+///
+/// # Errors
+///
+/// A [`CertificateError::LeafRejected`] when a leaf does not verify at the box
+/// its position implies, and [`CertificateError::InvalidSplit`] for a
+/// malformed, unlicensed or INCOMPLETE body. A truncated proof is a rejection,
+/// not a partial pass.
+pub fn verify_optimality_tree_block(
+    model: &Model,
+    value: &BigRational,
+    body: &str,
+) -> Result<(), CertificateError> {
+    use crate::cert_io::OptTreeStreamError as E;
+    match crate::cert_io::verify_opt_tree_body(model, value, body) {
+        Ok(_) => Ok(()),
+        Err(E::LeafRejected { index, error }) => {
+            Err(CertificateError::LeafRejected { index, error })
+        }
+        // The remaining reasons are all "this body is not a licensed split
+        // tree". They are reported under one variant rather than invented ones,
+        // because the wire-level detail is already in the emitter's own log and
+        // this function's contract is a verdict.
+        Err(E::InvalidSplit { index, col }) => Err(CertificateError::InvalidSplit { index, col }),
+        Err(E::Malformed { line, .. }) => Err(CertificateError::InvalidSplit {
+            index: line,
+            col: usize::MAX,
+        }),
+        Err(E::Incomplete) => Err(CertificateError::InvalidSplit {
+            index: usize::MAX,
+            col: usize::MAX,
+        }),
+    }
+}
+
 /// Verify that `root` establishes `objective >= value` (Minimize) / `<= value`
 /// (Maximize) over the WHOLE of `model`'s feasible set, in exact arithmetic.
 ///
@@ -381,6 +427,37 @@ impl MilpOptimalityCertificate {
         leaves
     }
 
+    /// This tree's dual half in WIRE form: the `opttree` block body, without
+    /// the block's `opttree` opener or its `end` terminator.
+    ///
+    /// The counterpart of [`StreamedOptTree::body`], written by the very same
+    /// record serialisers, which is what makes "the streamed lane produces the
+    /// same artifact" a statement a caller can CHECK — `assert_eq!` on two
+    /// strings — rather than a claim it has to take on trust.
+    #[must_use]
+    pub fn wire_body(&self) -> String {
+        let mut s = String::new();
+        // Explicit pre-order, iterative: a certificate is input data and its
+        // depth must not be the writer's stack limit.
+        let mut stack: Vec<&OptTreeNode> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                OptTreeNode::Split { col, cut, lo, hi } => {
+                    crate::cert_io::write_opt_tree_split(&mut s, *col, cut);
+                    stack.push(hi);
+                    stack.push(lo);
+                }
+                OptTreeNode::Empty { farkas } => {
+                    crate::cert_io::write_opt_tree_leaf(&mut s, &farkas.multipliers, false);
+                }
+                OptTreeNode::Dominated { multipliers } => {
+                    crate::cert_io::write_opt_tree_leaf(&mut s, multipliers, true);
+                }
+            }
+        }
+        s
+    }
+
     /// How many leaves close by domination rather than emptiness
     /// (diagnostics).
     #[must_use]
@@ -398,6 +475,189 @@ impl MilpOptimalityCertificate {
             }
         }
         n
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHERE THE LEAVES GO: the sink, and why the descent no longer owns its tree.
+// ---------------------------------------------------------------------------
+
+/// Where a certifying descent PUTS the leaves it proves.
+///
+/// # Why this exists: the feature was capped by RAM, not by its budget
+///
+/// The descent used to RETURN its tree, so every leaf it had ever proved was
+/// live until the last one closed and peak memory was `O(leaves x multipliers)`.
+/// That is a hard ceiling and it was measured, not feared:
+/// the development design notes found `khb05250`
+/// reaching 16,716 of its 17,124 leaves and `fiber` 14,889 of its own, both then
+/// SIGKILLed at this box's 3,072 MiB jetsam bound — **emitting nothing at all,
+/// not even the primal witness they emit successfully at the default budget**.
+/// A bigger budget DESTROYED evidence, which is the one direction a
+/// proof-carrying solver must never move in.
+///
+/// Routing every leaf through a sink lets the emitting caller write each record
+/// and DROP it, so peak memory becomes `O(depth + wire bytes)`. The descent
+/// itself is unchanged: the same nodes in the same order with the same
+/// per-leaf exact verification. Only the destination differs.
+///
+/// # The two implementations are not two behaviours
+///
+/// [`TreeSink`] rebuilds exactly the `OptTreeNode` the descent used to return,
+/// and [`TextSink`] writes exactly the wire records `cert_io` would have
+/// written from that node. Neither can alter what is proved: a sink is handed
+/// finished, already-exact-verified evidence and has no way to reach the
+/// descent's decisions. `streamed_and_built_trees_agree_byte_for_byte` pins
+/// that the two agree on the artifact.
+trait OptTreeSink {
+    /// Begin a split. Returns a MARK identifying the sink's state before it, to
+    /// be handed back to [`Self::rollback`] if the subtree does not close.
+    fn open_split(&mut self, col: Col, cut: &BigRational) -> usize;
+    /// Both children of the innermost open split have been delivered.
+    /// `false` means the sink's own bookkeeping did not add up, which the
+    /// descent reports as [`OptTreeDecline::VerifyFailed`] rather than
+    /// panicking.
+    fn close_split(&mut self) -> bool;
+    /// Discard everything delivered since `mark`, INCLUDING the split that
+    /// produced it. A descent that abandons a subtree must leave no trace of
+    /// it, because the node it abandoned may still close as a leaf.
+    fn rollback(&mut self, mark: usize);
+    /// An EMPTINESS leaf, already verified against the caller's model.
+    fn empty_leaf(&mut self, farkas: FarkasCertificate);
+    /// A DOMINATION leaf, already verified against the caller's model.
+    fn bound_leaf(&mut self, multipliers: Vec<Multiplier>);
+}
+
+/// The sink that REBUILDS the tree, i.e. the behaviour the descent used to have
+/// inline. Kept because the in-process API ([`derive_optimality_tree`]) hands
+/// callers a typed object and because it is the reference the streaming sink is
+/// measured against.
+#[derive(Default)]
+struct TreeSink {
+    /// Splits whose children are still arriving: `(col, cut, children so far)`.
+    frames: Vec<(Col, BigRational, Vec<OptTreeNode>)>,
+    root: Option<OptTreeNode>,
+}
+
+impl TreeSink {
+    fn attach(&mut self, node: OptTreeNode) {
+        match self.frames.last_mut() {
+            Some((_, _, children)) => children.push(node),
+            None => self.root = Some(node),
+        }
+    }
+
+    /// The finished tree, or `None` if the descent ended with a split still
+    /// open (which a completed descent cannot do).
+    fn finish(self) -> Option<OptTreeNode> {
+        self.frames.is_empty().then_some(self.root).flatten()
+    }
+}
+
+impl OptTreeSink for TreeSink {
+    fn open_split(&mut self, col: Col, cut: &BigRational) -> usize {
+        self.frames.push((col, cut.clone(), Vec::new()));
+        self.frames.len() - 1
+    }
+
+    fn close_split(&mut self) -> bool {
+        let Some((col, cut, children)) = self.frames.pop() else {
+            return false;
+        };
+        let mut children = children.into_iter();
+        let (Some(lo), Some(hi), None) = (children.next(), children.next(), children.next()) else {
+            return false;
+        };
+        self.attach(OptTreeNode::Split {
+            col,
+            cut,
+            lo: Box::new(lo),
+            hi: Box::new(hi),
+        });
+        true
+    }
+
+    fn rollback(&mut self, mark: usize) {
+        // The abandoned split is the frame AT `mark`, and every leaf proved
+        // under it is inside that frame's `children`, so one truncate drops the
+        // whole subtree.
+        self.frames.truncate(mark);
+    }
+
+    fn empty_leaf(&mut self, farkas: FarkasCertificate) {
+        self.attach(OptTreeNode::Empty { farkas });
+    }
+
+    fn bound_leaf(&mut self, multipliers: Vec<Multiplier>) {
+        self.attach(OptTreeNode::Dominated { multipliers });
+    }
+}
+
+/// THE STREAMING SINK: writes each record to the wire the moment it is proved
+/// and drops the evidence.
+///
+/// The wire form of an `opttree` block is a pre-order walk, and the descent IS
+/// a pre-order walk — `split_at` emits its split, then its `lo` subtree, then
+/// its `hi` subtree — so streaming needs NO format change whatsoever. The bytes
+/// this produces are the bytes `cert_io`'s tree walk produces from the
+/// equivalent [`TreeSink`] result, in the same order, because both call the
+/// same two record serialisers.
+///
+/// Its whole state is the buffer plus ONE FRAME PER OPEN SPLIT, so its object
+/// footprint is `O(depth)` and its byte footprint is the wire artifact itself
+/// rather than the object graph behind it. Measured on `khb05250` that is
+/// 38,285 B per leaf against 147,867 — and at 17,124 leaves it is the
+/// difference between a file and a SIGKILL.
+#[derive(Default)]
+struct TextSink {
+    body: String,
+    /// One entry per OPEN split: the buffer length and the leaf tallies as they
+    /// stood immediately before it. Rollback restores all three, so an
+    /// abandoned subtree leaves neither bytes nor counts behind. The frames are
+    /// strictly LIFO — `split_at` rolls its own split back before returning —
+    /// and holding `depth` frames is the whole of this sink's state, which is
+    /// what makes its footprint `O(depth)` in objects rather than `O(leaves)`.
+    frames: Vec<(usize, usize, usize)>,
+    leaves: usize,
+    dominated: usize,
+}
+
+impl OptTreeSink for TextSink {
+    fn open_split(&mut self, col: Col, cut: &BigRational) -> usize {
+        let mark = self.body.len();
+        self.frames.push((mark, self.leaves, self.dominated));
+        crate::cert_io::write_opt_tree_split(&mut self.body, col, cut);
+        mark
+    }
+
+    fn close_split(&mut self) -> bool {
+        self.frames.pop().is_some()
+    }
+
+    fn rollback(&mut self, mark: usize) {
+        // LIFO by construction, but restore by SEARCHING for the mark rather
+        // than assuming it: an unbalanced call must lose evidence loudly (the
+        // body is truncated and the descent's own re-verification then fails)
+        // rather than silently restore the wrong tallies.
+        while let Some((at, leaves, dominated)) = self.frames.pop() {
+            if at == mark {
+                self.leaves = leaves;
+                self.dominated = dominated;
+                break;
+            }
+        }
+        self.body.truncate(mark);
+    }
+
+    fn empty_leaf(&mut self, farkas: FarkasCertificate) {
+        self.leaves += 1;
+        crate::cert_io::write_opt_tree_leaf(&mut self.body, &farkas.multipliers, false);
+    }
+
+    fn bound_leaf(&mut self, multipliers: Vec<Multiplier>) {
+        self.leaves += 1;
+        self.dominated += 1;
+        crate::cert_io::write_opt_tree_leaf(&mut self.body, &multipliers, true);
     }
 }
 
@@ -999,6 +1259,145 @@ pub fn derive_optimality_tree_reported(
     witness: &[BigRational],
     budget: &OptimalityTreeBudget,
 ) -> (Option<MilpOptimalityCertificate>, OptTreeReport) {
+    let mut sink = TreeSink::default();
+    let (ok, mut report) = run_descent(&mut sink, model, value, witness, budget);
+    if !ok {
+        return (None, report);
+    }
+    let Some(root) = sink.finish() else {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    };
+
+    let cert = MilpOptimalityCertificate {
+        value: value.clone(),
+        witness: witness.to_vec(),
+        root,
+    };
+    // FAIL CLOSED ON THE WHOLE ARTIFACT. Every leaf was already verified
+    // against the box the deriver believed it was in; this re-verifies against
+    // the box the CONSUMER will reconstruct, which is the only box that counts.
+    if cert.verify(model).is_err() {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    }
+    (Some(cert), report)
+}
+
+/// A whole-tree optimality proof that was STREAMED: the `opttree` block body,
+/// plus the counts a caller needs in order to describe it. The multipliers are
+/// gone — each leaf was written to the wire and dropped as it was proved.
+///
+/// This is [`MilpOptimalityCertificate`]'s dual half in its WIRE form rather
+/// than its object form, and the two are the same artifact: the body is
+/// byte-for-byte what `cert_io` writes from the equivalent in-memory tree
+/// (pinned by `streamed_body_matches_the_built_tree_byte_for_byte`). What
+/// differs is only the peak memory it took to produce, which is the whole
+/// point — see [`stream_optimality_tree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedOptTree {
+    body: String,
+    leaves: usize,
+    dominated: usize,
+}
+
+impl StreamedOptTree {
+    /// The `opttree` block body: pre-order `split` / `leaf` / `boundleaf`
+    /// records, WITHOUT the block's `opttree` opener or its `end` terminator,
+    /// which the emitter owns.
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// The number of leaves in the streamed tree.
+    #[must_use]
+    pub fn num_leaves(&self) -> usize {
+        self.leaves
+    }
+
+    /// How many of them close by domination rather than emptiness.
+    #[must_use]
+    pub fn num_dominated_leaves(&self) -> usize {
+        self.dominated
+    }
+}
+
+/// [`derive_optimality_tree_reported`], but the tree is WRITTEN AS IT IS PROVED
+/// instead of being held.
+///
+/// # This is the same proof, produced within a bounded footprint
+///
+/// The descent is identical — same nodes, same order, same per-leaf exact
+/// verification against the caller's model — and the artifact is identical:
+/// the returned body is the very text `cert_io` would have written from the
+/// tree [`derive_optimality_tree_reported`] returns. The difference is what is
+/// LIVE at the peak. Holding the tree costs `O(leaves x multipliers)` heap
+/// objects; streaming costs `O(depth)` frames plus the wire bytes, and the wire
+/// bytes are an order of magnitude cheaper than the object graph that prints
+/// them because a `Multiplier` is a `FactRef` plus a `BigRational` — two heap
+/// allocations — while its wire record is one short line.
+///
+/// That distinction was the binding constraint on this whole feature, and it
+/// was measured rather than supposed:
+/// the development design notes found `khb05250` and
+/// `fiber` SIGKILLed at the 3,072 MiB jetsam bound when given more budget,
+/// emitting NOTHING — losing even the primal witness they emit at the default.
+///
+/// # Fail-closed is preserved, and it now covers more
+///
+/// The whole-artifact re-verification still runs, but against the BODY rather
+/// than the object graph: [`verify_optimality_tree_block`] re-parses the wire
+/// records and re-prices every leaf at a box it reconstructs from
+/// `model.col_bounds` intersected with the path's splits. That is strictly more
+/// than the object-form check did, because it also closes the serialiser
+/// round-trip — the bytes that will be on disk are the bytes that were
+/// verified — and it does so in `O(depth)` memory, so it cannot reintroduce the
+/// wall it exists to remove.
+#[must_use]
+pub fn stream_optimality_tree(
+    model: &Model,
+    value: &BigRational,
+    witness: &[BigRational],
+    budget: &OptimalityTreeBudget,
+) -> (Option<StreamedOptTree>, OptTreeReport) {
+    let mut sink = TextSink::default();
+    let (ok, mut report) = run_descent(&mut sink, model, value, witness, budget);
+    if !ok {
+        return (None, report);
+    }
+    if !sink.frames.is_empty() {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    }
+    // FAIL CLOSED ON THE WHOLE ARTIFACT — see the type's own note. The primal
+    // half is re-checked by `run_descent` before any dual work; this is the
+    // dual half, priced at the same single `value`.
+    if verify_optimality_tree_block(model, value, &sink.body).is_err() {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    }
+    let streamed = StreamedOptTree {
+        body: sink.body,
+        leaves: sink.leaves,
+        dominated: sink.dominated,
+    };
+    (Some(streamed), report)
+}
+
+/// The shared body of both entry points: re-check the primal half, run the
+/// certifying descent into `sink`, and fill in the report.
+///
+/// `true` means the descent closed the whole tree. The sink is the ONLY thing
+/// that differs between the two, which is what makes "same proof, different
+/// footprint" a property of the code rather than a claim about it.
+fn run_descent<S: OptTreeSink>(
+    sink: &mut S,
+    model: &Model,
+    value: &BigRational,
+    witness: &[BigRational],
+    budget: &OptimalityTreeBudget,
+) -> (bool, OptTreeReport) {
     let mut report = OptTreeReport::default();
     // THE PRIMAL HALF IS RE-CHECKED BEFORE ANY DUAL WORK. A tree proving
     // `objective >= value` is worthless — indeed misleading — if `value` is not
@@ -1006,15 +1405,15 @@ pub fn derive_optimality_tree_reported(
     // derivation here rather than producing a bound dressed as an optimum.
     if witness.len() != model.num_cols() || model.check_point(witness).is_err() {
         report.decline = Some(OptTreeDecline::WitnessRejected);
-        return (None, report);
+        return (false, report);
     }
     if &model.objective_value_at(witness) != value {
         report.decline = Some(OptTreeDecline::WitnessRejected);
-        return (None, report);
+        return (false, report);
     }
     if budget.leaf_cap == 0 {
         report.decline = Some(OptTreeDecline::Disabled);
-        return (None, report);
+        return (false, report);
     }
 
     let mut work = model.clone();
@@ -1037,7 +1436,7 @@ pub fn derive_optimality_tree_reported(
         diag: std::cell::RefCell::new(Diag::default()),
     };
     let mut leaves = 0usize;
-    let root = descent.node(&mut work, &mut leaves, 0);
+    let closed = descent.node(sink, &mut work, &mut leaves, 0).is_some();
     {
         let d = descent.diag.borrow();
         report.leaves = leaves;
@@ -1068,7 +1467,7 @@ pub fn derive_optimality_tree_reported(
             report.root_gap_rel = (&z_min - rb).to_f64().map(|g| g / denom);
         }
     }
-    let Some(root) = root else {
+    if !closed {
         // A descent that ended without raising anything is a caps-free give-up
         // we have no name for. Attribute it to the bound that is actually gone,
         // preferring the DETERMINISTIC one: a run that stopped with its work
@@ -1079,22 +1478,8 @@ pub fn derive_optimality_tree_reported(
         } else {
             OptTreeDecline::Deadline
         }));
-        return (None, report);
-    };
-
-    let cert = MilpOptimalityCertificate {
-        value: value.clone(),
-        witness: witness.to_vec(),
-        root,
-    };
-    // FAIL CLOSED ON THE WHOLE ARTIFACT. Every leaf was already verified
-    // against the box the deriver believed it was in; this re-verifies against
-    // the box the CONSUMER will reconstruct, which is the only box that counts.
-    if cert.verify(model).is_err() {
-        report.decline = Some(OptTreeDecline::VerifyFailed);
-        return (None, report);
     }
-    (Some(cert), report)
+    (closed, report)
 }
 
 /// The model's objective in the exact-rim's minimise frame: negated for a
@@ -1510,7 +1895,7 @@ struct Descent<'a> {
 }
 
 impl Descent<'_> {
-    fn raise(&self, r: OptTreeDecline) -> Option<OptTreeNode> {
+    fn raise(&self, r: OptTreeDecline) -> Option<()> {
         self.diag.borrow_mut().raise(r);
         None
     }
@@ -1534,7 +1919,13 @@ impl Descent<'_> {
 
     /// Certify the CURRENT box of `work`, splitting when it neither is empty
     /// nor carries a dual bound reaching `z`.
-    fn node(&self, work: &mut Model, leaves: &mut usize, depth: usize) -> Option<OptTreeNode> {
+    fn node<S: OptTreeSink>(
+        &self,
+        sink: &mut S,
+        work: &mut Model,
+        leaves: &mut usize,
+        depth: usize,
+    ) -> Option<()> {
         let (model, obj, obj_min, z, budget) = (
             self.model,
             self.obj.as_slice(),
@@ -1564,7 +1955,7 @@ impl Descent<'_> {
         for j in 0..work.num_cols() {
             let (lo, hi) = work.col_bounds(Col(j as u32));
             if lo > hi {
-                let out = trivial_empty_leaf(model, work, j, leaves, budget);
+                let out = trivial_empty_leaf(sink, model, work, j, leaves, budget);
                 if out.is_none() {
                     self.diag.borrow_mut().raise(if *leaves > budget.leaf_cap {
                         OptTreeDecline::LeafCap
@@ -1630,22 +2021,26 @@ impl Descent<'_> {
                     if *leaves > budget.leaf_cap {
                         return self.raise(OptTreeDecline::LeafCap);
                     }
-                    return Some(OptTreeNode::Empty { farkas });
+                    sink.empty_leaf(farkas);
+                    return Some(());
                 }
                 FloatVerdict::Dominated(multipliers) => {
                     *leaves += 1;
                     if *leaves > budget.leaf_cap {
                         return self.raise(OptTreeDecline::LeafCap);
                     }
-                    return Some(OptTreeNode::Dominated { multipliers });
+                    sink.bound_leaf(multipliers);
+                    return Some(());
                 }
                 FloatVerdict::Branch(j, floor) => {
-                    if let Some(node) = self.split_at(work, j, floor, leaves, depth) {
-                        return Some(node);
+                    if self.split_at(sink, work, j, floor, leaves, depth).is_some() {
+                        return Some(());
                     }
                     // The split itself declined (an inexact cut, or a child the
-                    // budget could not finish). Fall through: the exact rim may
-                    // still close this leaf outright.
+                    // budget could not finish). `split_at` has already rolled
+                    // the sink back to the state this node started in, so the
+                    // fall-through can still deliver a leaf HERE. Fall through:
+                    // the exact rim may still close this leaf outright.
                     if self.out_of_work() {
                         return self.raise(OptTreeDecline::WorkCap);
                     }
@@ -1698,7 +2093,8 @@ impl Descent<'_> {
                 if *leaves > budget.leaf_cap {
                     return self.raise(OptTreeDecline::LeafCap);
                 }
-                Some(OptTreeNode::Empty { farkas })
+                sink.empty_leaf(farkas);
+                Some(())
             }
             // A leaf whose relaxation runs to −∞ has no finite dual bound, so no
             // multiplier set can close it; splitting cannot fix an unbounded
@@ -1740,7 +2136,8 @@ impl Descent<'_> {
                     if *leaves > budget.leaf_cap {
                         return self.raise(OptTreeDecline::LeafCap);
                     }
-                    return Some(OptTreeNode::Dominated { multipliers });
+                    sink.bound_leaf(multipliers);
+                    return Some(());
                 }
                 // Not dominated: split on a column whose relaxation value is
                 // fractional.
@@ -1774,7 +2171,7 @@ impl Descent<'_> {
                 let Some(floor) = exact_f64(&vals[j].floor()) else {
                     return self.raise(OptTreeDecline::InexactCut);
                 };
-                self.split_at(work, j, floor, leaves, depth)
+                self.split_at(sink, work, j, floor, leaves, depth)
             }
         }
     }
@@ -1786,14 +2183,15 @@ impl Descent<'_> {
     /// and a cut that does not round-trip would put the two in different places.
     /// `exact_f64` is that guard, and failing it returns `None` rather than a tree
     /// whose leaves are priced somewhere the checker will not look.
-    fn split_at(
+    fn split_at<S: OptTreeSink>(
         &self,
+        sink: &mut S,
         work: &mut Model,
         c: usize,
         floor: f64,
         leaves: &mut usize,
         depth: usize,
-    ) -> Option<OptTreeNode> {
+    ) -> Option<()> {
         let Some(cut_r) = BigRational::from_float(floor) else {
             return self.raise(OptTreeDecline::InexactCut);
         };
@@ -1801,30 +2199,45 @@ impl Descent<'_> {
             return self.raise(OptTreeDecline::InexactCut);
         }
         let (lb0, ub0) = work.col_bounds(Col(c as u32));
-        let lo = self.descend(work, c, lb0, ub0.min(floor), leaves, depth)?;
-        let hi = self.descend(work, c, lb0.max(floor + 1.0), ub0, leaves, depth)?;
-        Some(OptTreeNode::Split {
-            col: Col(c as u32),
-            cut: cut_r,
-            lo: Box::new(lo),
-            hi: Box::new(hi),
-        })
+        // OPEN BEFORE DESCENDING, because the wire form is a PRE-ORDER walk:
+        // the split record precedes its subtrees, which is exactly the order a
+        // streaming sink can write and forget.
+        let mark = sink.open_split(Col(c as u32), &cut_r);
+        // ROLL BACK ON EITHER CHILD'S FAILURE. The caller may still close this
+        // node as a leaf (`node`'s `Branch` arm falls through to the exact rim),
+        // so an abandoned subtree must leave the sink exactly as it found it —
+        // no orphan split record, no leaves counted twice.
+        if self
+            .descend(sink, work, c, lb0, ub0.min(floor), leaves, depth)
+            .is_none()
+            || self
+                .descend(sink, work, c, lb0.max(floor + 1.0), ub0, leaves, depth)
+                .is_none()
+        {
+            sink.rollback(mark);
+            return None;
+        }
+        if !sink.close_split() {
+            return self.raise(OptTreeDecline::VerifyFailed);
+        }
+        Some(())
     }
 
     /// One branch: apply the branch box `[lo, hi]` to column `c` of `work`,
     /// build the child, restore the box.
-    fn descend(
+    fn descend<S: OptTreeSink>(
         &self,
+        sink: &mut S,
         work: &mut Model,
         c: usize,
         lo: f64,
         hi: f64,
         leaves: &mut usize,
         depth: usize,
-    ) -> Option<OptTreeNode> {
+    ) -> Option<()> {
         let (lb0, ub0) = work.col_bounds(Col(c as u32));
         work.set_col_bounds(Col(c as u32), lo, hi);
-        let out = self.node(work, leaves, depth + 1);
+        let out = self.node(sink, work, leaves, depth + 1);
         work.set_col_bounds(Col(c as u32), lb0, ub0);
         out
     }
@@ -1837,13 +2250,14 @@ impl Descent<'_> {
 /// like every other leaf: an empty box is only trivially contradictory when
 /// BOTH sides are finite, and the shared verifier is what establishes that
 /// rather than a comment.
-fn trivial_empty_leaf(
+fn trivial_empty_leaf<S: OptTreeSink>(
+    sink: &mut S,
     model: &Model,
     work: &Model,
     c: usize,
     leaves: &mut usize,
     budget: &OptimalityTreeBudget,
-) -> Option<OptTreeNode> {
+) -> Option<()> {
     let farkas = FarkasCertificate {
         multipliers: vec![
             Multiplier {
@@ -1868,7 +2282,8 @@ fn trivial_empty_leaf(
     if *leaves > budget.leaf_cap {
         return None;
     }
-    Some(OptTreeNode::Empty { farkas })
+    sink.empty_leaf(farkas);
+    Some(())
 }
 
 /// How far a rational sits from the nearest integer, as `f64` in `[0, 0.5]`.

@@ -101,6 +101,12 @@ pub struct FactorStats {
     pub factored_count: u64,
     /// Total extension variables introduced
     pub extension_vars: u64,
+    /// Calls that ran with the first-call bonus (`FACTOR_INIT_TICKS`), the
+    /// ticks the last of them consumed, and how many stopped before their
+    /// candidate schedule drained (the budget, not the formula, ended them).
+    pub init_calls: u64,
+    pub init_ticks: u64,
+    pub init_undrained: u64,
 }
 
 #[allow(clippy::panic)]
@@ -224,6 +230,12 @@ pub enum SatUnknownReason {
     InvalidUnsatCore,
     /// UNSAT proof finalization failed after the solver derived UNSAT.
     ProofFinalizationFailure,
+    /// The attached proof writer latched a write or flush failure (a full
+    /// disk, a broken pipe) and the solver then derived UNSAT, which no
+    /// certificate can back. The search itself goes on after the latch, so a
+    /// SAT found later is answered with its model; `last_unknown_detail` names
+    /// the OS error.
+    ProofWriteFailure,
     /// Deterministic conflict budget (`:rlimit`) was exhausted before a
     /// definitive result. Distinct from `Interrupted` (wall-clock/flag) so
     /// callers and diagnostics can tell a reproducible resource-out apart
@@ -254,6 +266,7 @@ impl SatUnknownReason {
             Self::InvalidSatModel => "invalid_sat_model",
             Self::InvalidUnsatCore => "invalid_unsat_core",
             Self::ProofFinalizationFailure => "proof_finalization_failure",
+            Self::ProofWriteFailure => "proof_write_failure",
             Self::ResourceBudget => "resource_budget",
             Self::ClauseTooLarge => "clause_too_large",
             Self::Unspecified => "unspecified",
@@ -297,7 +310,9 @@ pub enum AssumeResult {
     /// reconstruction data.
     ///
     /// The `Option<ProofCertificate>` may be `Some` when LRAT proof output is
-    /// enabled; early UNSAT paths can carry `None`. Consumers can use
+    /// enabled and the persistent formula itself was refuted. Conditional
+    /// UNSAT under assumptions or a temporary constraint carries `None`;
+    /// early UNSAT paths can also carry `None`. Consumers can use
     /// [`ProofCertificate::tracked_original_clause_ids()`] to inspect the
     /// producer's over-approximate original-clause support. That support is not
     /// a checked or minimal UNSAT core.

@@ -5,21 +5,26 @@
 use ntest::timeout;
 use std::process::Command;
 
-/// Run ay on a hwbench QF_UF benchmark and return the result line.
+use crate::corpus::tracked_fixture;
+
+/// Run ay on a vendored hwbench QF_UF benchmark and return the result line.
 ///
 /// Returns "error" if the process exits with a non-zero status (e.g., model
 /// validation failure). This prevents a model-validation crash from masking
 /// the real assertion: the test checks that no benchmark returns "sat".
+///
+/// The nine benchmarks (SMT-LIB `QF_UF/2018-Goel-hwbench`, CC BY 4.0, each
+/// `:status unsat`) are force-added under the gitignored
+/// `benchmarks/smtcomp/non-incremental/` tree, like `uart-23` (6a14e726d), and
+/// read through [`tracked_fixture`], so a missing file fails. They used to be
+/// optional corpus files: first a synthetic `"missing"` that the "not sat"
+/// oracle below accepted, then an announced skip. On 2026-09-24 they existed
+/// on no host, so both tests checked nothing anywhere (see `common/corpus.rs`).
 fn run_ay_hwbench(file_name: &str) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smtcomp/non-incremental/QF_UF/2018-Goel-hwbench/{file_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    if !std::path::Path::new(&benchmark_path).is_file() {
-        eprintln!("SKIP: optional hwbench benchmark not found: {benchmark_path}");
-        return "missing".to_string();
-    }
+    let benchmark_path = tracked_fixture(&format!(
+        "benchmarks/smtcomp/non-incremental/QF_UF/2018-Goel-hwbench/{file_name}"
+    ));
 
     let output = Command::new(ay_path)
         .arg(&benchmark_path)
@@ -73,7 +78,7 @@ fn test_hwbench_unsat_instances_never_return_sat() {
         // false-SATs return "error" (self-detected, no wrong answer
         // escapes to the user).
         assert!(
-            matches!(result.as_str(), "unsat" | "unknown" | "error" | "missing"),
+            matches!(result.as_str(), "unsat" | "unknown" | "error"),
             "{case} should not return sat (expected unsat/unknown/error), got: {result}"
         );
     }
@@ -85,9 +90,6 @@ fn test_hwbench_unsat_instances_never_return_sat() {
 #[timeout(60_000)]
 fn test_cache_coherence_three_ab_reg_max_returns_unsat_6869() {
     let result = run_ay_hwbench("QF_UF_cache_coherence_three_ab_reg_max.smt2");
-    if result == "missing" {
-        return;
-    }
     assert_eq!(
         result, "unsat",
         "#6869: cache_coherence benchmark must return unsat"

@@ -14,6 +14,7 @@ use super::executor_adapter::{
     install_uf_application_alias_values, parse_model_into, quote_symbol, sort_to_smtlib,
     UfApplicationAliasEmissionError,
 };
+use super::sort_unique::SortUniqueRenaming;
 use super::types::{SmtResult, SmtValue};
 use crate::pdr::model::InvariantModel;
 use crate::{ChcExpr, ChcSort, ChcVar};
@@ -44,6 +45,8 @@ enum PersistentExecutorError {
     UfAliasEmission(#[from] UfApplicationAliasEmissionError),
     #[error("check-sat produced no result")]
     MissingResult,
+    #[error("persistent executor term-memory limit exhausted")]
+    MemoryLimit,
 }
 
 struct PersistentExecutorAdapter {
@@ -55,12 +58,13 @@ struct PersistentExecutorAdapter {
     declared_functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
     uf_application_alias_counter: usize,
     query_count: usize,
+    memory_stopped: bool,
 }
 
 impl PersistentExecutorAdapter {
     fn new() -> Self {
         Self {
-            exec: Executor::new(),
+            exec: super::executor_adapter::new_search_executor(),
             background: None,
             background_hash: None,
             logic: None,
@@ -68,11 +72,24 @@ impl PersistentExecutorAdapter {
             declared_functions: FxHashMap::default(),
             uf_application_alias_counter: 0,
             query_count: 0,
+            memory_stopped: false,
         }
     }
 
+    fn memory_open(&mut self) -> bool {
+        let memory = crate::bmc::memory::Budget::capture(self.exec.term_memory_limit(), None);
+        self.memory_stopped |= !memory.constrain(&mut self.exec);
+        !self.memory_stopped
+    }
+
     fn reset(&mut self) {
+        let _open = self.memory_open();
+        let limit = self.exec.term_memory_limit();
+        let stopped = self.memory_stopped;
         *self = Self::new();
+        let tighter = limit.into_iter().chain(self.exec.term_memory_limit()).min();
+        self.exec.set_term_memory_limit(tighter);
+        self.memory_stopped |= stopped;
     }
 
     fn ensure_background(
@@ -81,6 +98,9 @@ impl PersistentExecutorAdapter {
         logic: &str,
         timeout: Duration,
     ) -> Result<(), PersistentExecutorError> {
+        if !self.memory_open() {
+            return Err(PersistentExecutorError::MemoryLimit);
+        }
         let background_hash = expr_hash(background);
         if self.background_hash == Some(background_hash) && self.logic.as_deref() == Some(logic) {
             return Ok(());
@@ -200,14 +220,27 @@ impl PersistentExecutorAdapter {
         if script.trim().is_empty() {
             return Ok(());
         }
+        if !self.memory_open() {
+            return Err(PersistentExecutorError::MemoryLimit);
+        }
         let commands = ay_frontend::parse(script)?;
-        self.exec.execute_all(&commands)?;
+        let executed = self.exec.execute_all(&commands);
+        if !self.memory_open() {
+            return Err(PersistentExecutorError::MemoryLimit);
+        }
+        executed?;
         Ok(())
     }
 }
 
 pub(crate) struct PersistentExecutorSmtContext {
+    /// Scratch context; on a context built by [`Self::new_search`] it is a
+    /// `Search`-lane context and holds the `HornSmt` session (Rung 4).
     scratch: SmtContext,
+    /// Rung 4: `(background hash, every background conjunct is
+    /// session-eligible)`, so an ineligible background (Int, arrays, ...)
+    /// is scanned once, not once per query.
+    session_background_eligible: Option<(u64, bool)>,
     backend: PersistentExecutorAdapter,
     /// Inc-21 session dv preference: seeded by dv-poisoned routes
     /// (`prefer_dv_off_first`) or learned once a dv-off retry rescues a raw
@@ -232,9 +265,22 @@ impl PersistentExecutorSmtContext {
     pub(crate) fn new() -> Self {
         Self {
             scratch: SmtContext::new(),
+            session_background_eligible: None,
             backend: PersistentExecutorAdapter::new(),
             dv_off_preferred: false,
         }
+    }
+
+    /// A context for engine SEARCH queries (INV-S1 opt-in, like
+    /// `SmtContext::new_search`): under `--chc-session` >= 1 an eligible
+    /// Bool/LRA `background ∧ delta` is answered by a persistent `HornSmt`
+    /// session before the executor (#horn-smt-session Rung 4). Never for a
+    /// validator; a live `ScopedVerificationMode` closes the gate anyway
+    /// (INV-S2).
+    pub(crate) fn new_search() -> Self {
+        let mut ctx = Self::new();
+        ctx.scratch = SmtContext::new_search();
+        ctx
     }
 
     /// Whether this session currently prefers the dv-off first attempt
@@ -287,15 +333,53 @@ impl PersistentExecutorSmtContext {
         propagated_model: &FxHashMap<String, SmtValue>,
         timeout: Duration,
     ) -> SmtResult {
+        let memory = crate::bmc::memory::Budget::capture(
+            self.backend.exec.term_memory_limit(),
+            self.scratch.term_memory_budget,
+        );
+        let _scope = memory.install();
+        self.scratch.set_term_memory_budget(memory.term_limit());
+        if !self.backend.memory_open() || self.scratch.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
         let Some(background) = self.backend.background.clone() else {
             return SmtResult::Unknown;
         };
+        // An executor context: its route is closed under an effort (P4a slice 8).
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err()
+            || crate::run_meter::close_route()
+        {
+            return SmtResult::Unknown;
+        }
+        let _census = super::lane::CensusFrame::enter(
+            super::lane::SmtEntry::PersistentExecutor,
+            None,
+            &[&background, query_delta],
+        );
 
         if let Err(reason) = collect_dt_declarations_for_expr(&[], query_delta) {
             tracing::debug!(
                 "persistent executor query admission failed before recursive preprocessing: {reason}"
             );
             return SmtResult::Unknown;
+        }
+
+        if self.scratch.session_gate_open() {
+            let hash = self.backend.background_hash.unwrap_or(0);
+            let eligible = match self.session_background_eligible {
+                Some((h, e)) if h == hash => e,
+                _ => {
+                    let e = super::session::shim::session_eligible(&background);
+                    self.session_background_eligible = Some((hash, e));
+                    e
+                }
+            };
+            if eligible {
+                let query = ChcExpr::and(background.clone(), query_delta.clone());
+                if let Some(routed) = self.scratch.try_session_route(&query, Some(timeout)) {
+                    return self.finish_memory(routed);
+                }
+            }
         }
 
         let namespace = format!("q{}", self.backend.query_count);
@@ -309,6 +393,21 @@ impl PersistentExecutorSmtContext {
             return SmtResult::Unknown;
         }
         let vars = collect_unique_vars(&[background.clone(), normalized_query.clone()]);
+        // Rung 0: sort-unique names against the session's declarations and
+        // within this query (see `crate::smt::sort_unique`); without it
+        // `declare_missing_vars` hit `SortMismatch` -> reset -> Unknown, and an
+        // intra-query clash produced an ill-typed script.
+        let sort_renaming = SortUniqueRenaming::plan_with_reserved(&vars, |name| {
+            self.backend.declared_vars.get(name).cloned()
+        });
+        let (background, normalized_query, vars) = match &sort_renaming {
+            Some(renaming) => (
+                renaming.apply(&background),
+                renaming.apply(&normalized_query),
+                renaming.renamed_vars(&vars),
+            ),
+            None => (background, normalized_query, vars),
+        };
         let required_logic = detect_logic(&vars, &combined);
 
         if self.backend.logic.as_deref() != Some(required_logic) {
@@ -378,7 +477,7 @@ impl PersistentExecutorSmtContext {
                 timeout,
                 true,
             );
-            return result;
+            return self.finish_memory(result);
         }
         let reserve = if dv_retry {
             (timeout / 3).min(Duration::from_millis(1500))
@@ -394,7 +493,7 @@ impl PersistentExecutorSmtContext {
             false,
         );
         if !raw_unknown || reserve.is_zero() {
-            return first;
+            return self.finish_memory(first);
         }
         // Retry budget: the leftover of the caller's window (>= the reserve
         // when the first attempt returned early), clamped to the thread SMT
@@ -421,7 +520,15 @@ impl PersistentExecutorSmtContext {
         if !matches!(retry, SmtResult::Unknown) {
             self.dv_off_preferred = true;
         }
-        retry
+        self.finish_memory(retry)
+    }
+
+    fn finish_memory(&mut self, result: SmtResult) -> SmtResult {
+        if !self.backend.memory_open() || self.scratch.exact_term_memory_exceeded() {
+            SmtResult::Unknown
+        } else {
+            result
+        }
     }
 
     /// One push/assert/check-sat/pop attempt against the persistent session.
@@ -580,6 +687,8 @@ impl PersistentExecutorSmtContext {
             }
         })();
 
+        // Observe actual backend refusal BEFORE Pop/reset can erase its reason.
+        let _open = self.backend.memory_open();
         if pushed {
             match self.backend.exec.execute(&Command::Pop(1)) {
                 Ok(None) => {}
@@ -625,6 +734,12 @@ impl PersistentExecutorSmtContext {
     pub(crate) fn reset_backend(&mut self) {
         self.scratch.reset();
         self.backend.reset();
+    }
+
+    /// `true` when the scratch context carries a `HornSmt` session (tests).
+    #[cfg(test)]
+    pub(crate) fn has_session(&self) -> bool {
+        self.scratch.has_session()
     }
 
     #[cfg(test)]
@@ -678,6 +793,10 @@ fn append_assertion(script: &mut String, expr: &ChcExpr) {
         script.push_str(&format!("(assert {expr_str})\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "persistent/memory_tests.rs"]
+mod memory_tests;
 
 #[cfg(test)]
 #[path = "persistent_tests.rs"]

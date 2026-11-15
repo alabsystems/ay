@@ -32,16 +32,14 @@ mod congruence_high_var_gate_regression;
 mod constrain_api;
 #[path = "group_misc/contract_postconditions.rs"]
 mod contract_postconditions;
-#[path = "group_misc/delete_policy_guard.rs"]
-mod delete_policy_guard;
 #[path = "group_misc/disabled_feature_guards.rs"]
 mod disabled_feature_guards;
 #[path = "group_misc/finalize_sat_fail_audit.rs"]
 mod finalize_sat_fail_audit;
 #[path = "group_misc/finalize_sat_fail_paths.rs"]
 mod finalize_sat_fail_paths;
-#[path = "group_misc/inprocessing_scheduler_source_of_truth.rs"]
-mod inprocessing_scheduler_source_of_truth;
+#[path = "group_misc/literal_proptest.rs"]
+mod literal_proptest;
 #[path = "group_misc/lscb_mli.rs"]
 mod lscb_mli;
 #[path = "group_misc/mab_integration.rs"]
@@ -50,8 +48,6 @@ mod mab_integration;
 mod new_var_internal_vectors;
 #[path = "group_misc/par2_benchmark.rs"]
 mod par2_benchmark;
-#[path = "group_misc/preprocess_guard.rs"]
-mod preprocess_guard;
 #[path = "group_misc/propagation_backtrack_coverage.rs"]
 mod propagation_backtrack_coverage;
 #[path = "group_misc/public_api_set_solution_error.rs"]

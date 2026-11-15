@@ -9,6 +9,26 @@ use super::{maybe_grow_expr_stack, ChcExpr, ChcOp, ChcSort, ChcVar, MAX_EXPR_REC
 impl ChcExpr {
     /// Check if the expression contains any array operations (select, store)
     pub fn contains_array_ops(&self) -> bool {
+        // DAG form (WP-F F0b); see `dag::any_node_or_deep` for exactness.
+        if let Some(found) = super::super::dag::any_node_or_deep(
+            self,
+            MAX_EXPR_RECURSION_DEPTH,
+            |e| match e {
+                ChcExpr::Var(v) => matches!(v.sort, ChcSort::Array(_, _)),
+                ChcExpr::Op(op, _) => matches!(op, ChcOp::Select | ChcOp::Store),
+                ChcExpr::FuncApp(_, sort, _) => matches!(sort, ChcSort::Array(_, _)),
+                ChcExpr::ConstArray(_, _) | ChcExpr::ArrayLambda(_) => true,
+                _ => false,
+            },
+            |e| {
+                matches!(
+                    e,
+                    ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::FuncApp(..)
+                )
+            },
+        ) {
+            return found;
+        }
         fn contains_array_ops_inner(expr: &ChcExpr, depth: usize) -> bool {
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 return true;
@@ -35,7 +55,7 @@ impl ChcExpr {
                             .any(|a| contains_array_ops_inner(a.as_ref(), depth + 1))
                 }
                 ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => false,
-                ChcExpr::ConstArray(_, _) => true,
+                ChcExpr::ConstArray(_, _) | ChcExpr::ArrayLambda(_) => true,
             })
         }
 
@@ -55,6 +75,23 @@ impl ChcExpr {
     /// to maintain congruence closure and prevent the LIA solver from flagging
     /// them as unsupported (#6047).
     pub fn contains_uf_apps(&self) -> bool {
+        // DAG form (WP-F F0b); see `dag::any_node_or_deep` for exactness.
+        if let Some(found) = super::super::dag::any_node_or_deep(
+            self,
+            MAX_EXPR_RECURSION_DEPTH,
+            |e| {
+                matches!(e, ChcExpr::FuncApp(..))
+                    || matches!(e, ChcExpr::ArrayLambda(_) if e.scan_features().has_uf_apps)
+            },
+            |e| {
+                matches!(
+                    e,
+                    ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::ConstArray(..)
+                )
+            },
+        ) {
+            return found;
+        }
         fn contains_uf_inner(expr: &ChcExpr, depth: usize) -> bool {
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 return true;
@@ -75,6 +112,13 @@ impl ChcExpr {
                     .iter()
                     .any(|a| contains_uf_inner(a.as_ref(), depth + 1)),
                 ChcExpr::ConstArray(_, val) => contains_uf_inner(val, depth + 1),
+                ChcExpr::ArrayLambda(lambda) => {
+                    contains_uf_inner(lambda.body(), depth + 1)
+                        || lambda
+                            .captures()
+                            .iter()
+                            .any(|value| contains_uf_inner(value, depth + 1))
+                }
             })
         }
 
@@ -88,6 +132,18 @@ impl ChcExpr {
     ///
     /// Returns `true` conservatively if recursion depth is exceeded.
     fn contains_op_matching(&self, predicate: &dyn Fn(&ChcOp) -> bool) -> bool {
+        // DAG form (WP-F F0b); see `dag::any_node_or_deep` for exactness.
+        if let Some(found) = super::super::dag::any_node_or_deep(
+            self,
+            MAX_EXPR_RECURSION_DEPTH,
+            |e| {
+                matches!(e, ChcExpr::Op(op, _) if predicate(op))
+                    || matches!(e, ChcExpr::ArrayLambda(lambda) if lambda.body().contains_op_matching(predicate))
+            },
+            |_| true,
+        ) {
+            return found;
+        }
         fn inner(expr: &ChcExpr, predicate: &dyn Fn(&ChcOp) -> bool, depth: usize) -> bool {
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 return true;
@@ -106,6 +162,13 @@ impl ChcExpr {
                 }
                 ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => false,
                 ChcExpr::ConstArray(_ks, val) => inner(val, predicate, depth + 1),
+                ChcExpr::ArrayLambda(lambda) => {
+                    inner(lambda.body(), predicate, depth + 1)
+                        || lambda
+                            .captures()
+                            .iter()
+                            .any(|value| inner(value, predicate, depth + 1))
+                }
             })
         }
 
@@ -279,89 +342,6 @@ impl ChcExpr {
         })
     }
 
-    /// Whether the expression contains a `Mod`/`Div` whose divisor is a *wide*
-    /// positive constant — value > `i64::MAX`, i.e. a `2^w` product tree for
-    /// w>=63, the shape a preserved BV64 modulus (W1-1B) takes after
-    /// `eliminate_mod_recursive` leaves it intact.
-    ///
-    /// Such a modulus is left for the BigInt executor to fold (`2^32 * 2^32 ->
-    /// 2^64`) and decide exactly. The native DPLL(T) LIA loop instead treats the
-    /// surviving `(mod x 2^64)` as an opaque factor (freeing `x` from its
-    /// residue), which can produce a spurious Sat. `check_sat` uses this to route
-    /// the query to the exact executor first, and to cap the native attempt, so
-    /// the executor — not the incomplete native loop — is the one that decides it.
-    pub(crate) fn contains_wide_const_mod_div(&self) -> bool {
-        fn check(expr: &ChcExpr, depth: usize) -> bool {
-            if depth >= MAX_EXPR_RECURSION_DEPTH {
-                return false; // Conservative: assume none if too deep
-            }
-            maybe_grow_expr_stack(|| match expr {
-                ChcExpr::Op(ChcOp::Mod | ChcOp::Div, args)
-                    if args.len() == 2
-                        && ChcExpr::positive_int_constant_expr_value(args[1].as_ref())
-                            .is_some_and(|v| v > i64::MAX as u128) =>
-                {
-                    true
-                }
-                ChcExpr::Op(_, args) => args.iter().any(|a| check(a.as_ref(), depth + 1)),
-                _ => false,
-            })
-        }
-        check(self, 0)
-    }
-
-    /// Check if expression contains nonlinear integer multiplication (Mul of two
-    /// non-constant sub-expressions). These produce Unknown from the LIA solver.
-    pub(crate) fn contains_nonlinear_mul(&self) -> bool {
-        // A product is nonlinear only when at least two of its factors each
-        // contain a free variable. A factor with no free variables is a
-        // constant regardless of its syntactic shape — e.g. `(- 1.0)`
-        // (`Op(Neg,[Real])`), `(* 2.0 3.0)`, or `(to_real 5)`. The previous
-        // implementation counted any arg that was not a *literal* `Int`/`Real`
-        // node as non-constant, so `(* (- 1.0) x)` was misclassified as
-        // nonlinear. That wrongly suppressed the executor fallback in
-        // `check_sat` (gated on `!contains_nonlinear_mul`) on otherwise-linear
-        // LRA queries (cav12/array_max etc.: every product is `(* (- 1.0) v)`),
-        // forcing a fast Unknown. Counting variable-bearing factors keeps
-        // genuine nonlinear products (`(* x y)`) classified as nonlinear.
-        fn factor_has_var(expr: &ChcExpr, depth: usize) -> bool {
-            if depth >= MAX_EXPR_RECURSION_DEPTH {
-                return true; // Conservative: assume a variable is present.
-            }
-            maybe_grow_expr_stack(|| match expr {
-                ChcExpr::Var(_) => true,
-                ChcExpr::Op(_, args) => args.iter().any(|a| factor_has_var(a, depth + 1)),
-                ChcExpr::ConstArray(_ks, val) => factor_has_var(val, depth + 1),
-                ChcExpr::PredicateApp(_, _, args) => {
-                    args.iter().any(|a| factor_has_var(a, depth + 1))
-                }
-                ChcExpr::FuncApp(_, _, args) => args.iter().any(|a| factor_has_var(a, depth + 1)),
-                _ => false,
-            })
-        }
-        fn inner(expr: &ChcExpr, depth: usize) -> bool {
-            if depth >= MAX_EXPR_RECURSION_DEPTH {
-                return true; // Conservative: assume nonlinear if too deep
-            }
-            maybe_grow_expr_stack(|| match expr {
-                ChcExpr::Op(ChcOp::Mul, args) => {
-                    let var_factor_count =
-                        args.iter().filter(|a| factor_has_var(a, depth + 1)).count();
-                    if var_factor_count >= 2 {
-                        return true;
-                    }
-                    args.iter().any(|a| inner(a, depth + 1))
-                }
-                ChcExpr::Op(_, args) => args.iter().any(|a| inner(a, depth + 1)),
-                ChcExpr::ConstArray(_ks, val) => inner(val, depth + 1),
-                ChcExpr::PredicateApp(_, _, args) => args.iter().any(|a| inner(a, depth + 1)),
-                ChcExpr::FuncApp(_, _, args) => args.iter().any(|a| inner(a, depth + 1)),
-                _ => false,
-            })
-        }
-        inner(self, 0)
-    }
-
     /// Check if expression contains any `ite` operations.
     ///
     /// Production callers use `scan_features().has_ite` instead (#6360).
@@ -396,6 +376,25 @@ impl ChcExpr {
     /// and `(= E 0)` has sort Bool. The LRA solver cannot handle Bool sub-expressions in
     /// arithmetic atoms, marking them as unsupported and causing Unknown results (#5925, #6167).
     pub(crate) fn contains_mixed_sort_eq(&self) -> bool {
+        // DAG form (WP-F F0b); see `dag::any_node_or_deep` for exactness.
+        if let Some(found) = super::super::dag::any_node_or_deep(
+            self,
+            MAX_EXPR_RECURSION_DEPTH,
+            |e| match e {
+                ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
+                    let s0 = args[0].sort();
+                    let s1 = args[1].sort();
+                    (s0 == ChcSort::Bool) != (s1 == ChcSort::Bool)
+                        && (matches!(s0, ChcSort::Int | ChcSort::Real)
+                            || matches!(s1, ChcSort::Int | ChcSort::Real))
+                }
+                ChcExpr::ArrayLambda(lambda) => lambda.body().contains_mixed_sort_eq(),
+                _ => false,
+            },
+            |_| true,
+        ) {
+            return found;
+        }
         fn inner(expr: &ChcExpr, depth: usize) -> bool {
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 return true; // Conservative: assume mixed-sort if too deep
@@ -420,6 +419,13 @@ impl ChcExpr {
                 ChcExpr::Op(_, args) => args.iter().any(|a| inner(a, depth + 1)),
                 ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => false,
                 ChcExpr::ConstArray(_ks, val) => inner(val, depth + 1),
+                ChcExpr::ArrayLambda(lambda) => {
+                    inner(lambda.body(), depth + 1)
+                        || lambda
+                            .captures()
+                            .iter()
+                            .any(|value| inner(value, depth + 1))
+                }
             })
         }
 
@@ -454,6 +460,15 @@ impl ChcExpr {
     /// This is the single canonical implementation; callers in mbp, parity,
     /// and lemma_cluster should delegate here instead of maintaining copies.
     pub(crate) fn contains_var_name(&self, name: &str) -> bool {
+        // DAG form (WP-F F0b); see `dag::any_node_or_deep` for exactness.
+        if let Some(found) = super::super::dag::any_node_or_deep(
+            self,
+            MAX_EXPR_RECURSION_DEPTH,
+            |e| matches!(e, ChcExpr::Var(v) if v.name == name),
+            |_| true,
+        ) {
+            return found;
+        }
         fn inner(expr: &ChcExpr, name: &str, depth: usize) -> bool {
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 return true;
@@ -469,6 +484,10 @@ impl ChcExpr {
                 | ChcExpr::FuncApp(_, _, args) => args.iter().any(|a| inner(a, name, depth + 1)),
                 ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => false,
                 ChcExpr::ConstArray(_ks, val) => inner(val, name, depth + 1),
+                ChcExpr::ArrayLambda(lambda) => lambda
+                    .captures()
+                    .iter()
+                    .any(|value| inner(value, name, depth + 1)),
             })
         }
         inner(self, name, 0)

@@ -4,6 +4,29 @@
 
 use super::*;
 
+/// Peel at most ONE `not`, the way the array and EUF schemas read a clause
+/// literal (`equality_sides` / `negated_equality_sides`), rather than peeling
+/// in parity the way `strip_not_local` does.
+///
+/// A theory conflict is recorded as the negation of each conflicting literal,
+/// so refuting an AUTHORED negation produces the raw term `(not (not X))` --
+/// `mk_not` does not fold the pair, which is the whole reason this module
+/// exists. A producer that peels in parity reports such a literal as the
+/// clause's POSITIVE atom and then copies the doubly-negated term verbatim
+/// into a lemma it labels itself; the strict checker, which peels one `not`,
+/// cannot see the atom and rejects the lemma. Peeling one `not` here makes the
+/// producer decline that shape instead, which is not a capability loss: the
+/// `Generic` lemma survives, and `collapse_double_negated_trust_lemma_literals`
+/// below -- which only ever sees TRUST-kind lemmas -- normalizes it, has the
+/// CHECKER'S OWN recognizer re-classify it, and re-validates the whole proof
+/// before adopting it. (#row-chain-dn-conclusion)
+pub(super) fn strip_one_not(terms: &TermStore, term: TermId) -> (TermId, bool) {
+    match terms.get(term) {
+        TermData::Not(inner) => (*inner, true),
+        _ => (term, false),
+    }
+}
+
 impl Executor {
     /// Collapse `(not (not X))` to `X` inside the clause of a TRUST-kind theory
     /// lemma, so the CHECKER'S OWN schema matcher can see the literal that is

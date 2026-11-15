@@ -25,7 +25,7 @@ manually. Either:
 
 The wrapper prefers an `ay` binary sitting next to it (packaged-bundle
 layout) and falls back to `ay` on PATH — build one with
-`cargo build -p ay --features cli --release` and either copy
+`targo --unverified build -p ay --features cli --release` (stock Rust: `cargo build -p ay --features cli --release`) and either copy
 `target/release/ay` next to `fzn-exec` or put it on PATH.
 
 Verify registration with:

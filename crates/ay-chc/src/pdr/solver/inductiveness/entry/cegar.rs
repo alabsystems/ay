@@ -88,6 +88,11 @@ pub(super) fn entry_cegar_discharge_state(
                 }
                 stack.push(child_pob);
             }
+            // A lane reach fact: a root is reachable; a child's parent re-queries.
+            BlockResult::MustReachable(_) if pob.parent.is_none() => {
+                return EntryCegarDischarge::Reachable
+            }
+            BlockResult::MustReachable(_) => {}
             BlockResult::Unknown => {
                 if let Some(parent) = pob.parent.as_deref() {
                     unknown_predecessors.push((parent.level, pob.predicate, pob.state.clone()));

@@ -64,8 +64,12 @@
 use num_bigint::{BigInt, BigUint, Sign};
 use num_rational::Rational64;
 use serde::de::{Error as DeError, SeqAccess, Unexpected, Visitor};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+
+#[cfg(test)]
+mod streaming_tests;
 
 /// Wording of the sign rejection, kept identical to `num-bigint`'s.
 const SIGN_EXPECTED: &str = "a sign of -1, 0, or 1";
@@ -174,15 +178,26 @@ struct WireBigInt(BigInt);
 /// Borrowing encode half of the `BigInt` wire form.
 struct WireBigIntRef<'a>(&'a BigInt);
 
+/// Stream the existing base-2^32 wire sequence without copying the magnitude.
+struct WireDigitsRef<'a>(&'a BigUint);
+
+impl Serialize for WireDigitsRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // num-bigint defines `to_u32_digits()` as this iterator collected into
+        // a Vec. Keep its exact word order and final high-word suppression,
+        // without allocating a full limb copy before the serializer can refuse.
+        let digits = self.0.iter_u32_digits();
+        let mut seq = serializer.serialize_seq(Some(digits.len()))?;
+        for digit in digits {
+            seq.serialize_element(&digit)?;
+        }
+        seq.end()
+    }
+}
+
 impl Serialize for WireBigIntRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // `to_u32_digits()` IS the recipe — see the module docs on trailing
-        // high-word suppression. Do not open-code a limb split here.
-        (
-            sign_to_i8(self.0.sign()),
-            self.0.magnitude().to_u32_digits(),
-        )
-            .serialize(serializer)
+        (sign_to_i8(self.0.sign()), WireDigitsRef(self.0.magnitude())).serialize(serializer)
     }
 }
 

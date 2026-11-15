@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 2;
+pol 1 2 +;
+delc 3;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -105,6 +105,7 @@ fn get_model_with_missing_sequence_table_provenance_errors_without_opaque_output
         term_to_var: DetHashMap::default(),
         bool_overrides: DetHashMap::default(),
         euf_model: Some(euf),
+        materialized_scalar_functions: Default::default(),
         array_model: None,
         lra_model: None,
         lia_model: None,
@@ -117,9 +118,14 @@ fn get_model_with_missing_sequence_table_provenance_errors_without_opaque_output
         certified_const_interps: Default::default(),
         formula_neutral_function_defaults: Default::default(),
         completed_values: DetHashMap::default(),
+        field_assignments: Default::default(),
         dt_ground: DetHashMap::default(),
         dt_pins: DetHashMap::default(),
         dt_array_field_classes: Vec::new(),
+        residual_arrays: None,
+        functional_arrays: None,
+        _scalar_candidate_memory: None,
+        construction_owner: None,
     });
 
     let output = exec.model();

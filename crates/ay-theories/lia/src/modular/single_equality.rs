@@ -37,7 +37,7 @@ impl LiaSolver<'_> {
 
         for &literal in &self.assertion_view().positive_equalities {
             // Check if this is an equality
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {
@@ -66,8 +66,10 @@ impl LiaSolver<'_> {
                     );
                 }
 
-                // Check bounds on var_term
-                if let Some((lb_opt, ub_opt)) = self.lra.get_bounds(var_term) {
+                // Check bounds on var_term — JUSTIFIED only
+                // (#nia-sign-cut-soundness): the conflict below is the
+                // asserted set, so no tentative bound may feed it.
+                if let Some((lb_opt, ub_opt)) = self.justified_bounds(var_term) {
                     let effective_lb = lb_opt.as_ref().map(Self::effective_int_lower);
                     let effective_ub = ub_opt.as_ref().map(Self::effective_int_upper);
 

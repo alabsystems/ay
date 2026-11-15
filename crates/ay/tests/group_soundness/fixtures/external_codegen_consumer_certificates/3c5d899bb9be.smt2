@@ -1,0 +1,6 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_ABV)
+(assert (not (= ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)) ((as const (Array (_ BitVec 64) (_ BitVec 32))) (_ bv0 32)))))
+(check-sat)
+(exit)

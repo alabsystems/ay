@@ -182,10 +182,27 @@ impl Executor {
         // there are no such arguments.
         // #boolarg-orphan: see the field doc — the rewritten applications must
         // stay resolvable to the twin the solve actually pinned.
+        // Named-core redirects keep their hypotheses in the assumption window.
+        // Purify both windows together so those hypotheses receive the same
+        // Boolean proxies and original-to-rewritten application correspondence.
+        // Only the fresh proxy definitions become unconditional base facts;
+        // each rewritten assumption retains its own activation and original ID.
+        let base_len = preprocessed_assertions.len();
+        let assumption_len = preprocessed_assumptions.len();
+        preprocessed_assertions
+            .extend(preprocessed_assumptions.iter().map(|(current, _)| *current));
         self.bool_arg_orphan_index = crate::executor::purify_bool_args::purify_bool_args(
             &mut self.ctx.terms,
             &mut preprocessed_assertions,
         );
+        let mut rewritten_assumptions = preprocessed_assertions.split_off(base_len);
+        let definitions = rewritten_assumptions.split_off(assumption_len);
+        preprocessed_assertions.extend(definitions);
+        let preprocessed_assumptions: Vec<(TermId, TermId)> = rewritten_assumptions
+            .into_iter()
+            .zip(preprocessed_assumptions)
+            .map(|(rewritten, (_, original))| (rewritten, original))
+            .collect();
 
         // Nelson-Oppen purification of opaque Int-sorted UF applications inside
         // arithmetic (e.g. `(__euclid!div a b)` in `(* b div)`): replace each
@@ -272,20 +289,9 @@ impl Executor {
             assumption_to_term.push((sat_lit, original_assumption));
         }
 
-        // Get clauses and mappings from Tseitin context
-        let clauses = tseitin.all_clauses().to_vec();
-        let proof_annotations = tseitin.proof_annotations().map(<[_]>::to_vec);
-        let num_vars = tseitin.num_vars();
-
-        // Build TseitinResult for DpllT
-        let result = ay_core::TseitinResult::new(
-            clauses,
-            tseitin.term_to_var().clone(),
-            tseitin.var_to_term().clone(),
-            0, // Not used when we manually add unit clauses
-            num_vars,
-        )
-        .with_parallel_proof_annotations(proof_annotations);
+        // Transfer the full database, maps and positional proof ledger without
+        // adding activation units for the separately supplied assumptions.
+        let result = tseitin.into_assertion_result();
 
         // Build negations map for proof tracking if needed
         let negations: HashMap<TermId, TermId> = if proof_enabled {
@@ -378,7 +384,7 @@ impl Executor {
             // Internal: create DpllT, solve, save clause trace on UNSAT (#4176)
             (@solve $dpll:ident, $res:ident, $sat_reason:ident, $theory:expr) => {
                 let mut $dpll = if proof_enabled {
-                    DpllT::from_tseitin_with_proof(&self.ctx.terms, &result, $theory)
+                    DpllT::from_tseitin_with_clause_capture(&self.ctx.terms, &result, $theory, self.clause_event_capture)
                 } else {
                     DpllT::from_tseitin(&self.ctx.terms, &result, $theory)
                 };
@@ -395,6 +401,7 @@ impl Executor {
                     $dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
                 }
                 self.apply_random_seed_to_dpll(&mut $dpll);
+                $dpll.sat_solver_mut().set_clause_event_capture(self.clause_event_capture);
                 self.apply_progress_to_dpll(&mut $dpll);
                 // #8123: hand the datatype tautology literals to the conflict
                 // verifier (no-op clone for non-DT theories: vector is empty).
@@ -472,6 +479,20 @@ impl Executor {
                 } else {
                     None
                 };
+                (res, lia_model, None, None, None, None, sat_unknown_reason)
+            }};
+            ($theory:expr, extract_nia) => {{
+                run_dpll_with_models!(@solve dpll, res, sat_unknown_reason, $theory);
+                let mut res = res;
+                let lia_model = if let AssumeResult::Sat(assignment) = &mut res {
+                    let witness: Vec<_> = dpll.theory_solver().boolean_witness().collect();
+                    if !Self::install_boolean_leaf_witness(&self.ctx.terms, assignment, &result.term_to_var, &witness) {
+                        res = AssumeResult::Unknown;
+                        None
+                    } else {
+                        dpll.theory_solver().extract_model().map(|m| LiaModel { values: m.values })
+                    }
+                } else { None };
                 (res, lia_model, None, None, None, None, sat_unknown_reason)
             }};
             ($theory:expr, extract_lra) => {{
@@ -607,7 +628,7 @@ impl Executor {
                 run_dpll_with_models!(LraSolver::new(&self.ctx.terms), extract_lra)
             }
             TheoryKind::Nia => {
-                run_dpll_with_models!(NiaSolver::new(&self.ctx.terms), extract_lia)
+                run_dpll_with_models!(NiaSolver::new(&self.ctx.terms), extract_nia)
             }
             TheoryKind::Nra => {
                 run_dpll_with_models!(NraSolver::new(&self.ctx.terms), extract_lra)

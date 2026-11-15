@@ -4,11 +4,15 @@
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod ite_premise;
 pub use ite_premise::assumed_is_authored_bool_ite_consequence;
+pub(crate) use ite_premise::assumed_is_authored_bool_ite_consequence_with_progress;
+mod terminal;
+pub(crate) use terminal::ensure_terminal_empty_clause;
 mod array_axiom;
+pub(crate) use array_axiom::shadowed_stores;
 pub(crate) use array_axiom::{
     array_row_chain_printer_terms, array_select_store_printer_terms,
     array_store_permutation_printer_terms, ArrayRowChainPrinterTerms, ArraySelectStorePrinterTerms,
-    RowChainEnd, RowChainPath,
+    RowChainEnd, RowChainPath, MAX_STORE_PERMUTATION_CHAIN,
 };
 pub use array_axiom::{
     ite_eval::recognize_array_row_chain_ite_eval, recognize_array_extensionality,
@@ -24,22 +28,34 @@ pub use array_finite::{
     recognize_array_finite_select_expansion_with_typed_context,
 };
 mod boolean;
+pub(crate) mod boolean_and_neg_shape;
 pub(crate) mod boolean_and_pos_shape;
 mod boolean_derived;
+pub(crate) mod boolean_equiv_pos_shape;
 mod boolean_negation;
-mod bv_bitblast;
+pub(crate) mod bv_bitblast;
+pub(crate) mod bv_eq_simplify;
 mod bv_lia_query;
+pub(crate) mod bv_offset_spines;
+pub(crate) mod bv_reconstruct;
+pub use bv_offset_spines::recognize_bv_offset_spines_with_progress;
+pub use bv_reconstruct::recognize_bv_reconstruct_with_progress;
+pub(crate) mod bv_urem_bound;
 mod closed_bv_evaluate;
 pub use bv_bitblast::{
     authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
     authenticate_uf_leaf_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
-    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
-    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    recognize_bool_tautology, recognize_bv_bitblast,
+    recognize_bv_bitblast_speculative_with_progress, recognize_bv_bitblast_with_progress,
+    recognize_bv_ground_evaluate, AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
     MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF,
     MAX_EXPENSIVE_BV_WORK_PER_LEMMA, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
     MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
-pub(crate) use bv_bitblast::{validate_expensive_bv_budget, MAX_BOUNDED_ASSIGNMENT_BITS};
+pub(crate) use bv_bitblast::{
+    bounded_bv_evaluation_is_refused, validate_expensive_bv_budget,
+    validate_expensive_bv_budget_with_progress, MAX_BOUNDED_ASSIGNMENT_BITS,
+};
 pub use bv_lia_query::{
     authenticate_bv_lia_unsat_query, AuthenticatedBvLiaUnsatQuery, BvLiaUnsatAuthenticationError,
     MAX_BV_LIA_QUERY_ROOTS, MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
@@ -48,13 +64,16 @@ pub use bv_lia_query::{
 mod clausification;
 mod datatype_axiom;
 mod datatype_ground;
-pub(crate) use datatype_axiom::validate_datatype_signature_context;
 pub use datatype_axiom::{
     recognize_datatype_acyclic_direct, recognize_datatype_constructor_reconstruct,
     recognize_datatype_distinct, recognize_datatype_exhaustive,
     recognize_datatype_selector_project, recognize_datatype_tester_eval,
     recognize_datatype_tester_eval_with_selectors, recognize_datatype_tester_exclusive,
     recognize_datatype_value_eq_congruence, DatatypeMemberSignature,
+};
+pub(crate) use datatype_axiom::{
+    unit_selector_projection, validate_datatype_signature_context,
+    validate_datatype_signature_context_with_progress, ProjectionOrientation,
 };
 pub use datatype_ground::recognize_datatype_ground_conflict;
 mod euf;
@@ -76,17 +95,23 @@ mod ground_subst;
 mod ite_branch;
 pub use ground_subst::{ground_substitution_image_matches, recognize_ground_equality_substitution};
 mod nia_fourier_motzkin;
+pub(crate) use ite_branch::{
+    array_guarded_row_printer_terms, GuardedRowCase, GuardedRowPrinterTerms, GuardedRowRead,
+};
 pub use ite_branch::{recognize_array_guarded_row_expansion, recognize_ite_branch_projection};
 mod nia_linear_ideal;
-pub use nia_linear_ideal::recognize_arith_clause_tautology;
+pub use nia_linear_ideal::{recognize_arith_clause_tautology, recognize_native_bv_affine_identity};
 mod nra_interval;
 mod nra_poly;
+mod nra_sos;
+pub(crate) use nra_sos::validate_nra_sos_with_progress;
 mod nra_univariate;
 pub use nra_interval::recognize_nra_interval_unsat;
 pub use nra_univariate::recognize_nra_univariate_unsat;
 mod order_ite;
 pub(crate) use order_ite::assignment_count as order_ite_assignment_count;
 pub use order_ite::recognize_order_ite_tautology;
+pub(crate) mod bv_affine;
 mod poly_simp;
 pub use poly_simp::recognize_arith_poly_simp;
 mod regex_empty;
@@ -116,19 +141,26 @@ pub(crate) use string_ground::{
 };
 pub use subset_axiom::recognize_subset_theory_lemma;
 mod fp_bounded;
+pub(crate) use fp_bounded::{is_exact_nan_identity, NanIdentityView};
 pub use fp_bounded::{
     recognize_fp_classification, recognize_fp_classification_op, recognize_fp_rounding_mode_domain,
 };
 mod fp_forward_error;
 pub use fp_forward_error::recognize_fp_forward_error;
+mod finite_field;
 mod fp_ground;
 pub use fp_ground::clause_mentions_floating_point;
-pub use fp_ground::recognize_fp_ground_eval;
-pub(crate) use fp_ground::FP_GROUND_WORK_LIMIT;
+pub use fp_ground::fp_ground_format_supported;
+pub use fp_ground::{
+    recognize_fp_ground_eval, recognize_fp_ground_eval_with_progress,
+    recognize_fp_ground_eval_without_enumeration_with_progress,
+};
+mod evaluate_literal;
 mod fp_to_bv;
+pub(crate) use evaluate_literal::{carcara_numeric_literal, validate_ground_evaluate_for_printer};
+pub(crate) use fp_to_bv::validate_canonical_clause_with_owner;
 mod ground_evaluate;
 pub use ground_evaluate::recognize_ground_evaluate;
-pub(crate) use ground_evaluate::validate_ground_evaluate as validate_ground_evaluate_for_printer;
 mod lia;
 pub use lia::recognize_arith_eq_implies_bound;
 pub use lia::recognize_arith_eq_triangle;
@@ -154,7 +186,10 @@ use euf_step_rules::{validate_cong, validate_refl, validate_trans};
 pub(crate) use nra_poly::{
     generic_rational_scratch_bytes, GENERIC_MONOMIAL_BYTES, GENERIC_MONOMIAL_WORK,
 };
-use quantifier::{validate_negated_exists_dual as qdual, validate_qnt_neg_exists as qne};
+use quantifier::{
+    validate_negated_exists_dual as qdual, validate_qnt_join_with_progress as qjoin,
+    validate_qnt_neg_exists as qne,
+};
 use resolution::{is_valid_binary_resolution, is_valid_rup_step, validate_resolution_rule};
 pub use string_word_identity::{
     recognize_string_concat_cancellation, recognize_string_containment_identity,
@@ -467,6 +502,9 @@ fn validate_fresh_definition_step(
             registry.validate_bound(terms, step_id, clause, premises, args)
         }
         AletheRule::FreshDefEq => registry.validate_eq(terms, step_id, clause, premises, args),
+        AletheRule::DivModDef => {
+            registry.validate_divmod_def(terms, step_id, clause, premises, args)
+        }
         other => Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
             reason: format!("`{}` is not a fresh-definition rule", other.name()),
@@ -493,7 +531,10 @@ pub(crate) fn validate_array_extensionality_for_provenance(
     clause: &[TermId],
     registry: Option<&ExtDiffRegistry>,
 ) -> Result<(), ProofCheckError> {
-    array_axiom::validate_array_extensionality(terms, step_id, clause, registry)
+    // The provenance re-validation is an unmetered whole-proof pass by design
+    // (see `validate_array_extensionality_provenance`); the fallback's
+    // debits go to an always-accepting envelope here.
+    array_axiom::validate_array_extensionality(terms, step_id, clause, registry, &mut |_, _| true)
 }
 
 include!("step_validation.rs");
@@ -505,10 +546,6 @@ mod fresh_def_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
-// DRIFT-PROOF native-operator lint; see the module docs for the bug class.
-#[cfg(test)]
-#[path = "name_authority_tests.rs"]
-mod name_authority_tests;
 
 #[cfg(test)]
 #[path = "bv_expensive_budget_tests.rs"]
@@ -556,6 +593,11 @@ fn validate_theory_lemma(
                     | TheoryLemmaKind::ArrayFiniteExtensionality
                     | TheoryLemmaKind::ArrayFiniteSelectExpansion
                     | TheoryLemmaKind::QuantifierNegatedExistsDual
+                    | TheoryLemmaKind::FiniteFieldLinear(_)
+                    | TheoryLemmaKind::FiniteFieldLinearWide(_)
+                    | TheoryLemmaKind::FiniteFieldQuadratic
+                    | TheoryLemmaKind::FiniteFieldUnivariate
+                    | TheoryLemmaKind::FiniteFieldIdeal
             )
         {
             return Err(ProofCheckError::InvalidTheoryLemma {
@@ -630,6 +672,13 @@ fn validate_generic_step(
     deferred: bool,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
+    // Intrinsic reconstruction has no premises. Prepay its attempt before
+    // allocating/looking up even a malformed incoming premise payload.
+    if strict && matches!(rule, AletheRule::BvReconstructV1) {
+        bv_reconstruct::validate(terms, step_id, clause, premises.len(), args.len(), progress)?;
+        derived_clauses.push(Some(clause.to_vec()));
+        return Ok(());
+    }
     let premise_clauses: Vec<&[TermId]> = premises
         .iter()
         .map(|premise| premise_clause(derived_clauses, step_id, *premise))
@@ -655,6 +704,16 @@ fn validate_generic_step(
         }
         AletheRule::Hole if !deferred => return Err(ProofCheckError::HoleStep { step: step_id }),
         AletheRule::Hole | AletheRule::Trust => {}
+        AletheRule::And if strict => {
+            clausification::validate_and_clausification(
+                terms,
+                step_id,
+                clause,
+                &premise_clauses,
+                args,
+                progress,
+            )?;
+        }
         AletheRule::AndPos(i) if strict => {
             boolean::validate_and_pos(terms, step_id, clause, *i, args.first().copied())?;
         }
@@ -666,7 +725,7 @@ fn validate_generic_step(
         }
         // Exact 0-variable validation rejects forged Tseitin constant units.
         AletheRule::True | AletheRule::False if strict => {
-            bv_bitblast::validate_bool_tautology(terms, step_id, clause)?;
+            bv_bitblast::validate_bool_tautology_with_progress(terms, step_id, clause, progress)?;
         }
         AletheRule::OrNeg if strict => {
             boolean::validate_or_neg(terms, step_id, clause)?;
@@ -782,6 +841,19 @@ fn validate_generic_step(
         AletheRule::Cong if strict => {
             validate_cong(terms, step_id, clause, &premise_clauses)?;
         }
+        AletheRule::EqSimplify if strict => {
+            bv_eq_simplify::validate(terms, step_id, clause, premises.len(), args.len(), progress)?;
+        }
+        AletheRule::BvOffsetSpinesV1 if strict => {
+            bv_offset_spines::validate(
+                terms,
+                step_id,
+                clause,
+                premises.len(),
+                args.len(),
+                progress,
+            )?;
+        }
         AletheRule::EqTransitive if strict => validate_euf_transitive(terms, step_id, clause)?,
         AletheRule::EqCongruent if strict => {
             validate_euf_congruent(terms, step_id, clause)?;
@@ -830,11 +902,28 @@ fn validate_generic_step(
             lia::validate_la_disequality(terms, step_id, clause, premises.len(), args)?;
         }
         AletheRule::ForallInst if strict => {
-            quantifier::validate_forall_inst(terms, step_id, clause, premises.len(), args)?;
+            quantifier::validate_forall_inst_with_progress(
+                terms,
+                step_id,
+                clause,
+                premises.len(),
+                args,
+                progress,
+            )?;
         }
         AletheRule::QntNegExists if strict => qne(terms, step_id, clause, premises.len(), args)?,
+        AletheRule::QntJoin if strict => {
+            qjoin(terms, step_id, clause, premises.len(), args, progress)?;
+        }
         AletheRule::Skolem if strict => {
-            quantifier::validate_sko_forall(terms, step_id, clause, premises.len(), args)?;
+            quantifier::validate_sko_forall_with_progress(
+                terms,
+                step_id,
+                clause,
+                premises.len(),
+                args,
+                progress,
+            )?;
         }
         _ => {
             if strict {
@@ -847,27 +936,6 @@ fn validate_generic_step(
     }
 
     derived_clauses.push(Some(clause.to_vec()));
-    Ok(())
-}
-
-pub(crate) fn ensure_terminal_empty_clause(
-    derived_clauses: &[Option<Vec<TermId>>],
-) -> Result<(), ProofCheckError> {
-    let Some((last_idx, last_clause)) = derived_clauses
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, clause)| clause.as_deref().map(|clause| (idx, clause)))
-    else {
-        return Err(ProofCheckError::NoClauseProducingSteps);
-    };
-
-    if !last_clause.is_empty() {
-        return Err(ProofCheckError::FinalClauseNotEmpty {
-            step: ProofId(last_idx as u32),
-        });
-    }
-
     Ok(())
 }
 

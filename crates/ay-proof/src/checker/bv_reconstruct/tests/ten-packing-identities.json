@@ -1,0 +1,952 @@
+[
+  {
+    "word": "frame_entry_x30",
+    "entry_offset": -8,
+    "goal_resume_offset": 72,
+    "source_read_count": 8,
+    "row_skip_occurrences": 28,
+    "raw_eq_simplify_shape_guards": 21,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 431,
+    "resume_pack_ast_id": 128,
+    "premise_ast_id": 432,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 402,
+        "key_ast_id": 62,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551608 64))",
+        "entry_offset": -8,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 404,
+        "key_ast_id": 68,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv1 64))",
+        "entry_offset": -7,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 408,
+        "key_ast_id": 77,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv2 64))",
+        "entry_offset": -6,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 412,
+        "key_ast_id": 86,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv3 64))",
+        "entry_offset": -5,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 416,
+        "key_ast_id": 95,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv4 64))",
+        "entry_offset": -4,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 420,
+        "key_ast_id": 104,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv5 64))",
+        "entry_offset": -3,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 424,
+        "key_ast_id": 113,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv6 64))",
+        "entry_offset": -2,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x30)"
+      },
+      {
+        "read_ast_id": 428,
+        "key_ast_id": 122,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv7 64))",
+        "entry_offset": -1,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x30)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x30)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x30)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x30)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x30)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x30)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x30)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x30)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x30)) (_ bv56 64))) frame_entry_x30)",
+    "pure_packing_equality_sha256": "d11e1f41022ddd7af5b91bf14ccdb20e6ceea92992703ced0d621322be44ef22",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551608 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1488,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv8 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x30)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551608 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551608 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551608 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x29",
+    "entry_offset": -16,
+    "goal_resume_offset": 64,
+    "source_read_count": 8,
+    "row_skip_occurrences": 92,
+    "raw_eq_simplify_shape_guards": 28,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 502,
+    "resume_pack_ast_id": 472,
+    "premise_ast_id": 503,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 473,
+        "key_ast_id": 435,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551600 64))",
+        "entry_offset": -16,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 475,
+        "key_ast_id": 438,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv1 64))",
+        "entry_offset": -15,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 479,
+        "key_ast_id": 443,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv2 64))",
+        "entry_offset": -14,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 483,
+        "key_ast_id": 448,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv3 64))",
+        "entry_offset": -13,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 487,
+        "key_ast_id": 453,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv4 64))",
+        "entry_offset": -12,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 491,
+        "key_ast_id": 458,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv5 64))",
+        "entry_offset": -11,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 495,
+        "key_ast_id": 463,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv6 64))",
+        "entry_offset": -10,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x29)"
+      },
+      {
+        "read_ast_id": 499,
+        "key_ast_id": 468,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv7 64))",
+        "entry_offset": -9,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x29)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x29)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x29)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x29)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x29)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x29)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x29)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x29)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x29)) (_ bv56 64))) frame_entry_x29)",
+    "pure_packing_equality_sha256": "2b664698488fd15d99bd0690d96a838dc19c5db89010efd192c55e474c5558c2",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551600 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1448,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_exit_0_resume_sp (_ bv64 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv64 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x29)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551600 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551600 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551600 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x19",
+    "entry_offset": -24,
+    "goal_resume_offset": 56,
+    "source_read_count": 8,
+    "row_skip_occurrences": 156,
+    "raw_eq_simplify_shape_guards": 21,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 573,
+    "resume_pack_ast_id": 543,
+    "premise_ast_id": 574,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 544,
+        "key_ast_id": 506,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551592 64))",
+        "entry_offset": -24,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 546,
+        "key_ast_id": 509,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv1 64))",
+        "entry_offset": -23,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 550,
+        "key_ast_id": 514,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv2 64))",
+        "entry_offset": -22,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 554,
+        "key_ast_id": 519,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv3 64))",
+        "entry_offset": -21,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 558,
+        "key_ast_id": 524,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv4 64))",
+        "entry_offset": -20,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 562,
+        "key_ast_id": 529,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv5 64))",
+        "entry_offset": -19,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 566,
+        "key_ast_id": 534,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv6 64))",
+        "entry_offset": -18,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x19)"
+      },
+      {
+        "read_ast_id": 570,
+        "key_ast_id": 539,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv7 64))",
+        "entry_offset": -17,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x19)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x19)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x19)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x19)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x19)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x19)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x19)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x19)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x19)) (_ bv56 64))) frame_entry_x19)",
+    "pure_packing_equality_sha256": "eb8b2059f3db374c23c32344efb02cdfe7a0dc91d5e21db048c28dd26b2b2209",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551592 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1129,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv8 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x19)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551592 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551592 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551592 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x20",
+    "entry_offset": -32,
+    "goal_resume_offset": 48,
+    "source_read_count": 8,
+    "row_skip_occurrences": 220,
+    "raw_eq_simplify_shape_guards": 28,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 646,
+    "resume_pack_ast_id": 616,
+    "premise_ast_id": 647,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 617,
+        "key_ast_id": 579,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551584 64))",
+        "entry_offset": -32,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 619,
+        "key_ast_id": 582,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv1 64))",
+        "entry_offset": -31,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 623,
+        "key_ast_id": 587,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv2 64))",
+        "entry_offset": -30,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 627,
+        "key_ast_id": 592,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv3 64))",
+        "entry_offset": -29,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 631,
+        "key_ast_id": 597,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv4 64))",
+        "entry_offset": -28,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 635,
+        "key_ast_id": 602,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv5 64))",
+        "entry_offset": -27,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 639,
+        "key_ast_id": 607,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv6 64))",
+        "entry_offset": -26,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x20)"
+      },
+      {
+        "read_ast_id": 643,
+        "key_ast_id": 612,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv7 64))",
+        "entry_offset": -25,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x20)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x20)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x20)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x20)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x20)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x20)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x20)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x20)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x20)) (_ bv56 64))) frame_entry_x20)",
+    "pure_packing_equality_sha256": "147031b7455210dbec7229684c223ba81e7b597ed44adee4463c1fa32f899fc1",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551584 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1168,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv48 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x20)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551584 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551584 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551584 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x21",
+    "entry_offset": -40,
+    "goal_resume_offset": 40,
+    "source_read_count": 8,
+    "row_skip_occurrences": 284,
+    "raw_eq_simplify_shape_guards": 21,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 717,
+    "resume_pack_ast_id": 687,
+    "premise_ast_id": 718,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 688,
+        "key_ast_id": 650,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551576 64))",
+        "entry_offset": -40,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 690,
+        "key_ast_id": 653,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv1 64))",
+        "entry_offset": -39,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 694,
+        "key_ast_id": 658,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv2 64))",
+        "entry_offset": -38,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 698,
+        "key_ast_id": 663,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv3 64))",
+        "entry_offset": -37,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 702,
+        "key_ast_id": 668,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv4 64))",
+        "entry_offset": -36,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 706,
+        "key_ast_id": 673,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv5 64))",
+        "entry_offset": -35,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 710,
+        "key_ast_id": 678,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv6 64))",
+        "entry_offset": -34,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x21)"
+      },
+      {
+        "read_ast_id": 714,
+        "key_ast_id": 683,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv7 64))",
+        "entry_offset": -33,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x21)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x21)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x21)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x21)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x21)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x21)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x21)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x21)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x21)) (_ bv56 64))) frame_entry_x21)",
+    "pure_packing_equality_sha256": "529ddb9322b1722a7ceb29341275e1619f7e125ab8f6335d83bd0e710ba1746e",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551576 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1209,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv8 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x21)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551576 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551576 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551576 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x22",
+    "entry_offset": -48,
+    "goal_resume_offset": 32,
+    "source_read_count": 8,
+    "row_skip_occurrences": 348,
+    "raw_eq_simplify_shape_guards": 28,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 789,
+    "resume_pack_ast_id": 759,
+    "premise_ast_id": 790,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 760,
+        "key_ast_id": 722,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551568 64))",
+        "entry_offset": -48,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 762,
+        "key_ast_id": 725,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv1 64))",
+        "entry_offset": -47,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 766,
+        "key_ast_id": 730,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv2 64))",
+        "entry_offset": -46,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 770,
+        "key_ast_id": 735,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv3 64))",
+        "entry_offset": -45,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 774,
+        "key_ast_id": 740,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv4 64))",
+        "entry_offset": -44,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 778,
+        "key_ast_id": 745,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv5 64))",
+        "entry_offset": -43,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 782,
+        "key_ast_id": 750,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv6 64))",
+        "entry_offset": -42,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x22)"
+      },
+      {
+        "read_ast_id": 786,
+        "key_ast_id": 755,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv7 64))",
+        "entry_offset": -41,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x22)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x22)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x22)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x22)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x22)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x22)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x22)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x22)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x22)) (_ bv56 64))) frame_entry_x22)",
+    "pure_packing_equality_sha256": "0e16c7b4f663d4357f427fd0fbcbc343ed8b302e513f7398d651d78717c2fa42",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551568 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1248,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv32 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x22)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551568 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551568 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551568 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x23",
+    "entry_offset": -56,
+    "goal_resume_offset": 24,
+    "source_read_count": 8,
+    "row_skip_occurrences": 412,
+    "raw_eq_simplify_shape_guards": 21,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 860,
+    "resume_pack_ast_id": 830,
+    "premise_ast_id": 861,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 831,
+        "key_ast_id": 793,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551560 64))",
+        "entry_offset": -56,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 833,
+        "key_ast_id": 796,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv1 64))",
+        "entry_offset": -55,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 837,
+        "key_ast_id": 801,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv2 64))",
+        "entry_offset": -54,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 841,
+        "key_ast_id": 806,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv3 64))",
+        "entry_offset": -53,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 845,
+        "key_ast_id": 811,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv4 64))",
+        "entry_offset": -52,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 849,
+        "key_ast_id": 816,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv5 64))",
+        "entry_offset": -51,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 853,
+        "key_ast_id": 821,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv6 64))",
+        "entry_offset": -50,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x23)"
+      },
+      {
+        "read_ast_id": 857,
+        "key_ast_id": 826,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv7 64))",
+        "entry_offset": -49,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x23)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x23)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x23)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x23)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x23)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x23)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x23)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x23)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x23)) (_ bv56 64))) frame_entry_x23)",
+    "pure_packing_equality_sha256": "c476b4adf4742fdc88fa2c380d45e2d366e34a6f16474cea89c86a20f32d7c47",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551560 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1289,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv8 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x23)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551560 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551560 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551560 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x24",
+    "entry_offset": -64,
+    "goal_resume_offset": 16,
+    "source_read_count": 8,
+    "row_skip_occurrences": 476,
+    "raw_eq_simplify_shape_guards": 28,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 934,
+    "resume_pack_ast_id": 904,
+    "premise_ast_id": 935,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 905,
+        "key_ast_id": 867,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551552 64))",
+        "entry_offset": -64,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 907,
+        "key_ast_id": 870,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv1 64))",
+        "entry_offset": -63,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 911,
+        "key_ast_id": 875,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv2 64))",
+        "entry_offset": -62,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 915,
+        "key_ast_id": 880,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv3 64))",
+        "entry_offset": -61,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 919,
+        "key_ast_id": 885,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv4 64))",
+        "entry_offset": -60,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 923,
+        "key_ast_id": 890,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv5 64))",
+        "entry_offset": -59,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 927,
+        "key_ast_id": 895,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv6 64))",
+        "entry_offset": -58,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x24)"
+      },
+      {
+        "read_ast_id": 931,
+        "key_ast_id": 900,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv7 64))",
+        "entry_offset": -57,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x24)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x24)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x24)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x24)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x24)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x24)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x24)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x24)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x24)) (_ bv56 64))) frame_entry_x24)",
+    "pure_packing_equality_sha256": "05c182f344990a2354dab5f6bb3356343c8b6aac07e30e94db9b5f7a799258ce",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551552 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1328,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv16 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x24)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551552 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551552 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551552 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x25",
+    "entry_offset": -72,
+    "goal_resume_offset": 8,
+    "source_read_count": 8,
+    "row_skip_occurrences": 540,
+    "raw_eq_simplify_shape_guards": 22,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 1005,
+    "resume_pack_ast_id": 975,
+    "premise_ast_id": 1006,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 976,
+        "key_ast_id": 938,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551544 64))",
+        "entry_offset": -72,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 978,
+        "key_ast_id": 941,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv1 64))",
+        "entry_offset": -71,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 982,
+        "key_ast_id": 946,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv2 64))",
+        "entry_offset": -70,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 986,
+        "key_ast_id": 951,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv3 64))",
+        "entry_offset": -69,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 990,
+        "key_ast_id": 956,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv4 64))",
+        "entry_offset": -68,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 994,
+        "key_ast_id": 961,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv5 64))",
+        "entry_offset": -67,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 998,
+        "key_ast_id": 966,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv6 64))",
+        "entry_offset": -66,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x25)"
+      },
+      {
+        "read_ast_id": 1002,
+        "key_ast_id": 971,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv7 64))",
+        "entry_offset": -65,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x25)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x25)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x25)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x25)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x25)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x25)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x25)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x25)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x25)) (_ bv56 64))) frame_entry_x25)",
+    "pure_packing_equality_sha256": "30c1f2210e09b3e14d3bf3d00e39365002e93036690e5dc054a3092f9196fa05",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551544 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1369,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv8 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x25)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551544 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551544 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551544 64)) (_ bv7 64)))) (_ bv56 64))))"
+  },
+  {
+    "word": "frame_entry_x26",
+    "entry_offset": -80,
+    "goal_resume_offset": 0,
+    "source_read_count": 8,
+    "row_skip_occurrences": 604,
+    "raw_eq_simplify_shape_guards": 35,
+    "pure_pack_context_nodes": 22,
+    "store_pack_ast_id": 1067,
+    "resume_pack_ast_id": 1037,
+    "premise_ast_id": 1068,
+    "width": 64,
+    "source_sha256": "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773",
+    "source_AST_ids_are_not_TermIds": true,
+    "pieces": [
+      {
+        "read_ast_id": 1038,
+        "key_ast_id": 132,
+        "key_exact": "(bvadd frame_entry_sp (_ bv18446744073709551536 64))",
+        "entry_offset": -80,
+        "extract_high": 7,
+        "extract_low": 0,
+        "replacement": "((_ extract 7 0) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1040,
+        "key_ast_id": 139,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv1 64))",
+        "entry_offset": -79,
+        "extract_high": 15,
+        "extract_low": 8,
+        "replacement": "((_ extract 15 8) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1044,
+        "key_ast_id": 144,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv2 64))",
+        "entry_offset": -78,
+        "extract_high": 23,
+        "extract_low": 16,
+        "replacement": "((_ extract 23 16) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1048,
+        "key_ast_id": 150,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv3 64))",
+        "entry_offset": -77,
+        "extract_high": 31,
+        "extract_low": 24,
+        "replacement": "((_ extract 31 24) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1052,
+        "key_ast_id": 156,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv4 64))",
+        "entry_offset": -76,
+        "extract_high": 39,
+        "extract_low": 32,
+        "replacement": "((_ extract 39 32) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1056,
+        "key_ast_id": 162,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv5 64))",
+        "entry_offset": -75,
+        "extract_high": 47,
+        "extract_low": 40,
+        "replacement": "((_ extract 47 40) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1060,
+        "key_ast_id": 168,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv6 64))",
+        "entry_offset": -74,
+        "extract_high": 55,
+        "extract_low": 48,
+        "replacement": "((_ extract 55 48) frame_entry_x26)"
+      },
+      {
+        "read_ast_id": 1064,
+        "key_ast_id": 174,
+        "key_exact": "(bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv7 64))",
+        "entry_offset": -73,
+        "extract_high": 63,
+        "extract_low": 56,
+        "replacement": "((_ extract 63 56) frame_entry_x26)"
+      }
+    ],
+    "pure_packing_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) ((_ extract 7 0) frame_entry_x26)) (bvshl ((_ zero_extend 56) ((_ extract 15 8) frame_entry_x26)) (_ bv8 64))) (bvshl ((_ zero_extend 56) ((_ extract 23 16) frame_entry_x26)) (_ bv16 64))) (bvshl ((_ zero_extend 56) ((_ extract 31 24) frame_entry_x26)) (_ bv24 64))) (bvshl ((_ zero_extend 56) ((_ extract 39 32) frame_entry_x26)) (_ bv32 64))) (bvshl ((_ zero_extend 56) ((_ extract 47 40) frame_entry_x26)) (_ bv40 64))) (bvshl ((_ zero_extend 56) ((_ extract 55 48) frame_entry_x26)) (_ bv48 64))) (bvshl ((_ zero_extend 56) ((_ extract 63 56) frame_entry_x26)) (_ bv56 64))) frame_entry_x26)",
+    "pure_packing_equality_sha256": "cf038231d4b55c28a8509972d6d2d782bea948307f737551586a47e287a89e57",
+    "store_side_pack_notation": "(bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551536 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv7 64)))) (_ bv56 64)))",
+    "actual_goal_ast_id": 1408,
+    "actual_goal_equality": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd frame_exit_0_resume_sp (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv0 64)) (_ bv7 64)))) (_ bv56 64))) frame_entry_x26)",
+    "authored_memory_equality_notation": "(= (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd frame_entry_sp (_ bv18446744073709551536 64)))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select frame_exit_0_resume_memory (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv7 64)))) (_ bv56 64))) (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 56) (select T80 (bvadd frame_entry_sp (_ bv18446744073709551536 64)))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv1 64)))) (_ bv8 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv2 64)))) (_ bv16 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv3 64)))) (_ bv24 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv4 64)))) (_ bv32 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv5 64)))) (_ bv40 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv6 64)))) (_ bv48 64))) (bvshl ((_ zero_extend 56) (select T80 (bvadd (bvadd frame_entry_sp (_ bv18446744073709551536 64)) (_ bv7 64)))) (_ bv56 64))))"
+  }
+]

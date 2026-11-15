@@ -64,7 +64,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Constant, Proof, ProofId, ProofStep, Sort, Symbol, TermData, TermId, TermStore};
 
-use crate::api::proofs::TrustClauseDischargeControls;
+use crate::api::proofs::{EffortShare, TrustClauseDischargeControls};
 use crate::api::{FuncDecl, Logic, Solver, Term};
 
 /// Verdict for a single proof step examined by the bit-vector checker.
@@ -226,9 +226,10 @@ fn check_bv_clause_impl(
     clause: &[TermId],
     controls: Option<&TrustClauseDischargeControls>,
 ) -> BvStepVerdict {
-    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    // A clause is step (3)'s: its solve draws from the certification pool.
+    let share = EffortShare::Pool;
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
@@ -241,8 +242,8 @@ fn check_bv_clause_impl(
     // A single-element clause may itself be an `(or ...)` term: flatten it so we
     // negate the actual disjunction rather than a structurally-nested literal.
     let literals = flatten_clause(terms, clause);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
@@ -265,18 +266,18 @@ fn check_bv_clause_impl(
     // the BV-inclusive array+UF logic so the discharge can model them. All of
     // these are decidable, so a well-formed clause resolves to UNSAT or SAT.
     let logic = pick_logic(terms, &literals);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
     let mut solver = Solver::new(logic);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.start_native_solver(&mut solver, deadline) {
+    if let Some(controls) = controls {
+        if !controls.start_native_solver(&mut solver) {
             return resource_unchecked();
         }
     }
-    let mut translator = Translator::new(controls.zip(controlled_deadline));
+    let mut translator = Translator::new(controls);
 
     // Assert the negation of each literal of the clause. `¬(l1 ∨ ... ∨ ln)` is
     // `¬l1 ∧ ... ∧ ¬ln`.
@@ -299,15 +300,15 @@ fn check_bv_clause_impl(
         }
         let negated = solver.not(translated);
         solver.assert_term(negated);
-        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-            if !controls.native_solver_live(&solver, deadline) {
+        if let Some(controls) = controls {
+            if !controls.native_solver_live(&solver) {
                 return resource_unchecked();
             }
         }
     }
 
-    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+    let result = if let Some(controls) = controls {
+        let Some(result) = controls.check_native_solver(&mut solver, share) else {
             return resource_unchecked();
         };
         result
@@ -359,25 +360,30 @@ fn check_bv_clause_impl(
 /// jointly UNSAT. An empty assertion set is `Unchecked` (an empty conjunction is
 /// trivially SAT, so it is never a valid UNSAT discharge).
 pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> BvStepVerdict {
-    check_bv_assertions_unsat_impl(terms, assertions, None)
+    check_bv_assertions_unsat_impl(terms, assertions, None, EffortShare::Pool)
 }
 
+/// [`check_bv_assertions_unsat`] under the certification envelope, its solve
+/// on `share` of the certification count: the pool for a terminal empty
+/// clause of the per-clause discharge, step (4)'s grant for the export
+/// path's whole-problem fallback.
 pub(crate) fn check_bv_assertions_unsat_with_controls(
     terms: &TermStore,
     assertions: &[TermId],
     controls: &TrustClauseDischargeControls,
+    share: EffortShare,
 ) -> BvStepVerdict {
-    check_bv_assertions_unsat_impl(terms, assertions, Some(controls))
+    check_bv_assertions_unsat_impl(terms, assertions, Some(controls), share)
 }
 
 fn check_bv_assertions_unsat_impl(
     terms: &TermStore,
     assertions: &[TermId],
     controls: Option<&TrustClauseDischargeControls>,
+    share: EffortShare,
 ) -> BvStepVerdict {
-    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
@@ -407,18 +413,18 @@ fn check_bv_assertions_unsat_impl(
     }
 
     let logic = pick_logic(terms, assertions);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
     let mut solver = Solver::new(logic);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.start_native_solver(&mut solver, deadline) {
+    if let Some(controls) = controls {
+        if !controls.start_native_solver(&mut solver) {
             return resource_unchecked();
         }
     }
-    let mut translator = Translator::new(controls.zip(controlled_deadline));
+    let mut translator = Translator::new(controls);
 
     // Assert each obligation POSITIVELY: we want UNSAT of their conjunction.
     for &assertion in assertions {
@@ -438,15 +444,15 @@ fn check_bv_assertions_unsat_impl(
             };
         }
         solver.assert_term(translated);
-        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-            if !controls.native_solver_live(&solver, deadline) {
+        if let Some(controls) = controls {
+            if !controls.native_solver_live(&solver) {
                 return resource_unchecked();
             }
         }
     }
 
-    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+    let result = if let Some(controls) = controls {
+        let Some(result) = controls.check_native_solver(&mut solver, share) else {
             return resource_unchecked();
         };
         result
@@ -629,11 +635,11 @@ struct Translator<'a> {
     /// Counter for unique leaf-constant names.
     next_id: u32,
     /// Mandatory-publication envelope, polled at every recursive node.
-    controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>,
+    controls: Option<&'a TrustClauseDischargeControls>,
 }
 
 impl<'a> Translator<'a> {
-    fn new(controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>) -> Self {
+    fn new(controls: Option<&'a TrustClauseDischargeControls>) -> Self {
         Self {
             memo: HashMap::default(),
             funcs: HashMap::default(),
@@ -658,7 +664,7 @@ impl<'a> Translator<'a> {
     ) -> Result<Term, String> {
         if self
             .controls
-            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+            .is_some_and(|controls| !controls.native_solver_live(solver))
         {
             return Err("proof-discharge resource envelope expired or was exceeded".to_string());
         }
@@ -668,7 +674,7 @@ impl<'a> Translator<'a> {
         let result = self.translate_uncached(solver, terms, tid)?;
         if self
             .controls
-            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+            .is_some_and(|controls| !controls.native_solver_live(solver))
         {
             return Err("proof-discharge resource envelope expired or was exceeded".to_string());
         }
@@ -851,6 +857,9 @@ impl<'a> Translator<'a> {
         name: &str,
         targs: &[Term],
     ) -> Option<Result<Term, String>> {
+        if name == "mkbv" {
+            return Some(self.translate_mkbv(solver, targs));
+        }
         // Binary BV arithmetic / bitwise / shift / comparison operators.
         if let [a, b] = targs {
             let (a, b) = (*a, *b);
@@ -912,6 +921,24 @@ impl<'a> Translator<'a> {
         }
 
         None
+    }
+
+    fn translate_mkbv(&mut self, solver: &mut Solver, bits: &[Term]) -> Result<Term, String> {
+        if bits.is_empty() || !bits.iter().all(|&bit| solver_is_bool(solver, bit)) {
+            return Err("mkbv requires Boolean operands".to_string());
+        }
+        let one = solver.bv_const(1, 1);
+        let zero = solver.bv_const(0, 1);
+        let mut bits = bits.iter().rev();
+        let first = *bits
+            .next()
+            .ok_or_else(|| "mkbv requires an operand".to_string())?;
+        let mut word = solver.ite(first, one, zero);
+        for &bit in bits {
+            let low = solver.ite(bit, one, zero);
+            word = self.bvconcat(solver, word, low)?;
+        }
+        Ok(word)
     }
 
     fn bvconcat(&mut self, solver: &mut Solver, a: Term, b: Term) -> Result<Term, String> {
@@ -1045,7 +1072,7 @@ fn is_uninterpreted_app(sym: &Symbol) -> bool {
             | "bvult" | "bvule" | "bvugt" | "bvuge"
             | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
             | "bvcomp"
-            | "concat"
+            | "concat" | "mkbv"
             // Arithmetic operators are NOT uninterpreted; treating them so would
             // be unsound. List the common ones so they fall through to a
             // fragment error instead of being modelled as opaque UFs.

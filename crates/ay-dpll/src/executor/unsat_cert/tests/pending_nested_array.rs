@@ -337,3 +337,62 @@ fn competition_raw_discards_current_pending_and_rejects_stale_pending() {
     assert!(stale.pending_nested_array_bool_bv_unsat.is_none());
     assert!(stale.take_unsat_certificate().is_none());
 }
+
+/// A nested-array query the authority ladder cannot seal: the index sorts are
+/// INFINITE, so the exact finite Bool/BV theorem has nothing to replay, and the
+/// fixture carries neither a strict proof nor an array-free residue.
+fn unsealed_nested_int_array_executor() -> Executor {
+    let commands = ay_frontend::parse(
+        "(set-logic QF_AX) \
+         (declare-const nested_free_a (Array Int (Array Int Int))) \
+         (declare-const nested_free_b (Array Int (Array Int Int))) \
+         (assert (not (= nested_free_a nested_free_b)))",
+    )
+    .expect("unsealed nested-array fixture must parse");
+    let mut executor = Executor::new();
+    executor
+        .execute_all(&commands)
+        .expect("unsealed nested-array fixture must elaborate");
+    executor.begin_public_solve(false);
+    executor.bind_unsat_query_assumptions(&[]);
+    executor
+}
+
+/// The justification registry's array-free marker is a THIRD consume-once
+/// exemption at the quarantine, and it behaves exactly like its two siblings:
+/// it converts one withheld verdict and is gone.
+///
+/// Without it this exact query degrades to `Unknown` — that is the control, and
+/// it is what every one of the 13 `--z3-mode` gap files does today.
+///
+/// MUTATION (verified by construction): drop
+/// `|| trusted_justified_array_free` from the marker arm in
+/// `quarantine_unverified_nested_array_unsat` and the second assertion fails;
+/// read the field without `std::mem::take` and the third fails.
+#[test]
+fn a_nested_array_free_justification_exempts_exactly_one_verdict() {
+    let mut control = unsealed_nested_int_array_executor();
+    let roots = control.ctx.assertions.clone();
+    assert!(
+        control
+            .quarantine_unverified_nested_array_unsat(&roots, None, SolveResult::unsat())
+            .is_unknown(),
+        "control: a nested-array UNSAT with no authority is withheld"
+    );
+
+    let mut exempt = unsealed_nested_int_array_executor();
+    let roots = exempt.ctx.assertions.clone();
+    exempt.nested_array_free_justification_unsat = true;
+    assert!(
+        exempt
+            .quarantine_unverified_nested_array_unsat(&roots, None, SolveResult::unsat())
+            .is_unsat(),
+        "an array-free justified refutation used no nested-array combination"
+    );
+    assert!(
+        exempt
+            .quarantine_unverified_nested_array_unsat(&roots, None, SolveResult::unsat())
+            .is_unknown(),
+        "the marker is consume-once: it must not authorize a second verdict"
+    );
+}

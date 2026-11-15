@@ -204,7 +204,8 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         needs_final: bool,
         ctx: &dyn SolverContext,
     ) -> ExtCheckResult {
-        match self.theory.check() {
+        let result = self.theory.check();
+        match self.recheck_installed_theory_lemmas(result, T::check) {
             TheoryResult::Sat => {
                 // The theory is satisfied under the current complete assignment.
                 // Clear stale pending single-var splits (#6303), but preserve
@@ -455,7 +456,10 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         // verify via congruence closure. Catches invalid EUF conflicts
         // that the domain-aware check misclassifies as Arithmetic (Int
         // variable equalities) and accepts optimistically.
-        let mut euf_prechecked = false;
+        // `Some(verdict)` only when the direct EUF re-check ran AND accepted;
+        // a rejection leaves it `None` so the dispatcher re-derives the exact
+        // error (and the memo records the rejection, not an acceptance).
+        let mut euf_precheck = None;
         if self.theory.supports_euf_semantic_check() {
             if let Some(terms) = self.terms {
                 // Threads the combined conflict-verification support set
@@ -465,15 +469,21 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 // only CONFIRM a genuine conflict, never launder a spurious one;
                 // empty for quantifier-free / non-datatype problems (#8123,
                 // #AUFLIA-support).
-                euf_prechecked = true;
-                if let Err(e) = verify_euf_conflict(&conflict_terms, terms, &self.support_axioms) {
-                    conflict_verified = false;
-                    tracing::warn!(
-                        theory = std::any::type_name::<T>(),
-                        error = %e,
-                        conflict_len = conflict_terms.len(),
-                        "BUG(#4704): EUF semantic verification failed in check(); escalating to Unknown"
-                    );
+                match crate::verification::verify_euf_conflict_classified(
+                    &conflict_terms,
+                    terms,
+                    &self.support_axioms,
+                ) {
+                    Ok(verdict) => euf_precheck = Some(verdict),
+                    Err(e) => {
+                        conflict_verified = false;
+                        tracing::warn!(
+                            theory = std::any::type_name::<T>(),
+                            error = %e,
+                            conflict_len = conflict_terms.len(),
+                            "BUG(#4704): EUF semantic verification failed in check(); escalating to Unknown"
+                        );
+                    }
                 }
             }
         }
@@ -506,7 +516,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             // literal set already proven jointly UNSAT this query skips the
             // fresh-combiner re-solve; failures always re-verify in full.
             let semantic_result =
-                self.verify_conflict_semantic_memo(&conflict_terms, terms, euf_prechecked);
+                self.verify_conflict_semantic_memo(&conflict_terms, terms, euf_precheck);
             if let Err(e) = semantic_result {
                 if matches!(e, crate::verification::VerificationError::ConflictIsSat)
                     && conflict_has_array_context(terms, &conflict_terms)
@@ -603,10 +613,12 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         }
 
         // #8424: EUF chain minimization at the theory level.
-        if let Some(terms) = self.terms {
-            let euf_removed =
-                crate::theory_inference::minimize_euf_conflict(&mut conflict_terms, terms);
-            self.eager_stats.theory_minimize_lits_removed += euf_removed as u64;
+        if self.proof.is_none() {
+            if let Some(terms) = self.terms {
+                let euf_removed =
+                    crate::theory_inference::minimize_euf_conflict(&mut conflict_terms, terms);
+                self.eager_stats.theory_minimize_lits_removed += euf_removed as u64;
+            }
         }
 
         let mut clause: Vec<Literal> = conflict_terms
@@ -680,9 +692,24 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             );
             ExtCheckResult::Unknown
         } else {
-            self.minimize_context_conflict(&conflict_terms, &mut clause, ctx);
+            if !matches!(
+                self.minimize_context_conflict(&conflict_terms, &mut clause, ctx),
+                crate::theory_inference::ConflictClauseReduction::Clause { .. }
+            ) {
+                return ExtCheckResult::Unknown;
+            }
             self.theory_conflict_count += 1;
-            ExtCheckResult::Conflict(clause)
+            // Retained minted mappings and backtracked variables are still
+            // complete mappings. Only actual current false values authorize
+            // conflict analysis; otherwise deliver the whole valid lemma.
+            if clause
+                .iter()
+                .all(|literal| ctx.value(literal.variable()) == Some(!literal.is_positive()))
+            {
+                ExtCheckResult::Conflict(clause)
+            } else {
+                ExtCheckResult::AddClauses(vec![clause])
+            }
         }
     }
 
@@ -771,7 +798,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             // #uflia-verify-memo: memoized (trust-true-only) — failures
             // always re-verify in full, preserving the `ConflictIsSat`
             // array-context carve-out below byte-identically.
-            if let Err(e) = self.verify_conflict_semantic_memo(&conflict.literals, terms, false) {
+            if let Err(e) = self.verify_conflict_semantic_memo(&conflict.literals, terms, None) {
                 if matches!(e, crate::verification::VerificationError::ConflictIsSat)
                     && conflict_has_array_context(terms, &conflict.literals)
                 {
@@ -817,18 +844,32 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             );
             ExtCheckResult::Unknown
         } else {
-            // #8424: Pre-minimize Farkas conflict clause, then level-0 removal.
-            let mut removed = if let Some(ref farkas) = conflict.farkas {
-                let mut coeffs = farkas.coefficients.clone();
-                crate::theory_inference::minimize_farkas_conflict(&mut clause, &mut coeffs)
+            // A structurally/semantically downgraded certificate cannot
+            // authorize projection. Keep the complete signed explanation.
+            let mut removed = 0;
+            let policy = if self.proof.is_some() {
+                crate::theory_inference::ConflictClausePolicy::PreserveLiterals
             } else {
-                0
+                crate::theory_inference::ConflictClausePolicy::Deduplicate
             };
-            // Level-0 removal applies to both Farkas and non-Farkas paths.
-            removed += crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                ctx.var_level(var)
-            });
+            match crate::theory_inference::minimize_conflict_clause(&mut clause, policy) {
+                crate::theory_inference::ConflictClauseReduction::Clause { removed: count } => {
+                    removed += count
+                }
+                crate::theory_inference::ConflictClauseReduction::Tautology
+                | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                    return ExtCheckResult::Unknown
+                }
+            }
             self.eager_stats.theory_minimize_lits_removed += removed as u64;
+            if !clause
+                .iter()
+                .all(|literal| ctx.value(literal.variable()) == Some(!literal.is_positive()))
+            {
+                // Preserve the coefficient-aligned Farkas conflict boundary:
+                // an unassigned/satisfied mapping is no conflict authority.
+                return ExtCheckResult::Unknown;
+            }
             self.theory_conflict_count += 1;
             ExtCheckResult::Conflict(clause)
         }

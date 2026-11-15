@@ -1,0 +1,34 @@
+pseudo-Boolean proof version 3.0
+% `def_order_transitivity_fresh_vars_valid.pbp` with the two `fresh_aux` lists deleted. The
+% order still declares the auxiliary variable `$z`, so the second `izip!` of
+% `get_transitivity_substitution` zipped a one-element list against two empty ones and produced
+% NOTHING: all three instances of the relation in the transitivity obligation shared the same
+% `$z` instead of getting their own copy, and the obligation checked was not the transitivity of
+% the order. The list arity is now part of what `def_order` validates.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 ~$z +1 u1 +1 ~v1 >= 1 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

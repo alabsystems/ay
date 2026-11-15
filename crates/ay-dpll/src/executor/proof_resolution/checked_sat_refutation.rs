@@ -13,8 +13,10 @@
 //!   byte-for-byte SAT literals to a proof step built from that same trace;
 //! * the strict proof checker authenticates the exact SMT clause at every such
 //!   proof-step identity against the frozen authored query roots, with each
-//!   `Generic` theory premise separately matched to an exact positive verdict
-//!   retained by this query's semantic-conflict verifier; and
+//!   `Generic` theory premise separately matched to an exact `Reproved`
+//!   verdict retained by this query's semantic-conflict verifier (a fresh
+//!   re-derivation that did not run the array theory; optimistic
+//!   acceptances and array-theory re-runs are not authority); and
 //! * the resulting capability remains bound to the same public query epoch,
 //!   frontend source stamp, ordered roots, and ordered assumption slice.
 //!
@@ -23,6 +25,8 @@
 
 mod builder;
 mod derivation_evidence;
+mod mapped_support;
+mod materialize;
 mod metering;
 
 use metering::*;
@@ -47,7 +51,7 @@ use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::sat_proof_manager::{
     ExactOriginalProofError, ExactOriginalProofFragment, SatProofManager,
 };
-use crate::verification::ConflictSemanticVerifyMemo;
+use crate::verification::{ConflictSemanticVerdict, ConflictSemanticVerifyMemo};
 #[cfg(test)]
 use derivation_evidence::{CheckedInstanceDerivation, CheckedSkolemDerivation};
 
@@ -601,8 +605,8 @@ include!("checked_sat_refutation/semantically_completed_premises.rs");
 ///
 /// Construction is private to this module and runs all three independent
 /// validators from one immutable trace bundle. The retained value contains
-/// only publication identity; the potentially large replay scratch and proof
-/// fragment are dropped after successful composition.
+/// publication identity and, when bounded reconstruction and strict scope
+/// checking succeed, an optional native proof. Replay scratch is then dropped.
 #[derive(Debug)]
 pub(in crate::executor) struct CheckedSatRefutation {
     query_epoch: QueryAuthorityEpoch,
@@ -611,9 +615,24 @@ pub(in crate::executor) struct CheckedSatRefutation {
     ordered_assumptions: Box<[TermId]>,
     original_clause_count: usize,
     derived_step_count: usize,
+    /// `Generic` theory premises authorised by a `Reproved` re-derivation
+    /// rather than by the strict checker (see
+    /// [`Self::rests_on_re_derived_premises`]).
+    re_derived_premises: usize,
+    native_proof: Option<Proof>,
 }
 
 impl CheckedSatRefutation {
+    /// Whether any premise of the refutation is a `Generic` theory lemma that
+    /// only AY's own semantic-conflict verifier re-derived. The SAT-level
+    /// refutation is independently replayed, but such a premise is a
+    /// re-derivation by AY's own theory code, not a check: evidence E1
+    /// (critic §9.1 of the 2026-10-02 evidence policy; on the Sep-20 main
+    /// this lane admitted 23 wrong unsats, all through such premises).
+    pub(in crate::executor) fn rests_on_re_derived_premises(&self) -> bool {
+        self.re_derived_premises > 0
+    }
+
     /// Whether this capability still denotes the exact public query being
     /// published, including assumption order and multiplicity.
     pub(in crate::executor) fn is_current_for(
@@ -632,6 +651,7 @@ impl CheckedSatRefutation {
     }
 
     fn build(executor: &mut Executor) -> Result<Self, CheckedSatRefutationError> {
+        mapped_support::reject_unmappable_refutation(executor)?;
         builder::build(executor)
     }
 }
@@ -646,6 +666,8 @@ impl Executor {
             ordered_assumptions: Box::new([]),
             original_clause_count: 1,
             derived_step_count: 1,
+            re_derived_premises: 0,
+            native_proof: None,
         });
     }
 }
@@ -670,6 +692,12 @@ enum CheckedSatRefutationError {
     CounterexampleContaminatedCone { clause: u64, symbol: String },
     #[error("the SAT trace has no authoritative solver variable-namespace size")]
     MissingSatVariableNamespace,
+    #[error(
+        "trace original {trace_id} references unmapped SAT variable {variable}, and the mapped \
+         originals with the unit premises are satisfiable, so every refutation cone rests on an \
+         unmapped original"
+    )]
+    UnmappableRefutation { trace_id: u64, variable: u32 },
     #[error("the SAT trace has no solver-minted active-scope authority")]
     MissingScopeAuthority,
     #[error("the SAT trace has no exact SAT-variable to SMT-term map")]
@@ -750,6 +778,10 @@ enum CheckedSatRefutationError {
         "deferred Generic premise {step:?} has no exact successful semantic-conflict verification in this query"
     )]
     DeferredGenericNotSemanticallyVerified { step: ProofId },
+    #[error(
+        "deferred Generic premise {step:?} was re-derived only by a combiner carrying the array theory that produced it"
+    )]
+    DeferredGenericReprovedOnlyByArrayTheory { step: ProofId },
     #[error("validated original count {validated} differs from semantic binding count {semantic}")]
     OriginalCountMismatch { validated: usize, semantic: usize },
     #[error(
@@ -1026,6 +1058,43 @@ fn verify_exact_composition<E: CheckedResolutionEvidence>(
 }
 
 impl Executor {
+    /// Read a reconstructed proof only while its exact query authority holds,
+    /// WITHOUT consuming it.
+    ///
+    /// A caller that must judge the reconstruction before committing to it
+    /// needs the sidecar's copy to survive a decline: the retention is only
+    /// ever allowed to add an artifact, so a candidate that loses its race
+    /// must leave the sidecar exactly as it found it. Clone here and
+    /// [`Self::take_current_checked_sat_proof`] on adoption instead of taking
+    /// first and trying to put back a document the authored-replacement
+    /// cascade has already rewritten.
+    pub(in crate::executor) fn current_checked_sat_proof_cloned(&self) -> Option<Proof> {
+        let native = self
+            .last_checked_sat_refutation
+            .as_ref()?
+            .native_proof
+            .as_ref()?;
+        if !self.checked_sat_refutation_authorizes_current_query() {
+            return None;
+        }
+        Some(native.clone())
+    }
+
+    /// Consume a reconstructed proof only while its exact query authority holds.
+    pub(in crate::executor) fn take_current_checked_sat_proof(&mut self) -> Option<Proof> {
+        self.last_checked_sat_refutation
+            .as_ref()?
+            .native_proof
+            .as_ref()?;
+        if !self.checked_sat_refutation_authorizes_current_query() {
+            return None;
+        }
+        self.last_checked_sat_refutation
+            .as_mut()?
+            .native_proof
+            .take()
+    }
+
     /// Whether the retained checked SAT-refutation sidecar proves the current
     /// public query: same epoch, source stamp, ordered roots, and assumptions.
     pub(in crate::executor) fn checked_sat_refutation_authorizes_current_query(&self) -> bool {
@@ -1388,10 +1457,8 @@ impl Executor {
                 crate::executor::unsat_cert::probe_cert_reject(|| {
                     format!("checked SAT refutation DECLINED: {error}")
                 });
-                // Bounded opt-in diagnostics: an unauthenticated original is
-                // reported WITH its rendered terms — the gate that refused it
-                // is otherwise unobservable outside this crate, and the term
-                // ids alone do not identify the axiom/rewrite family.
+                // Report bounded term IDs only. Rejection diagnostics must not
+                // render through the executor or change its evaluation-stop state.
                 let rendered_unauthenticated = match &error {
                     CheckedSatRefutationError::OriginalProof(
                         ExactOriginalProofError::UnauthenticatedOriginalClause { clause, .. },
@@ -1403,7 +1470,7 @@ impl Executor {
                 crate::executor::unsat_cert::probe_cert_reject(|| match rendered_unauthenticated {
                     Some(rendered) => format!(
                         "checked SAT refutation unavailable: {error}
-  rendered: {rendered}"
+  term_ids: {rendered}"
                     ),
                     None => format!("checked SAT refutation unavailable: {error}"),
                 });
@@ -1411,6 +1478,10 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "checked_sat_refutation/captured_scalar_scopes.rs"]
+mod captured_scalar_scopes;
 
 #[cfg(test)]
 mod tests {
@@ -1424,6 +1495,7 @@ mod tests {
     use crate::executor::SkolemInstanceRecord;
     use crate::executor_types::SolveResult;
     include!("checked_sat_refutation/incremental_id_tests.rs");
+    include!("checked_sat_refutation/native_materialization_tests.rs");
     include!("checked_sat_refutation/counterexample_cone_tests.rs");
     fn contradictory_unit_executor() -> (Executor, TermId, TermId) {
         let mut executor = Executor::new();
@@ -1562,6 +1634,14 @@ mod tests {
             executor.last_checked_sat_refutation.is_some(),
             "the sealed negative selector must support both structural replay and semantic projection"
         );
+        let proof = executor.take_current_checked_sat_proof().expect(
+            "authenticated positive scope guards can be projected before native resolution",
+        );
+        assert!(executor
+            .check_proof_strict_with_datatypes(&proof)
+            .unwrap()
+            .is_complete());
+        assert!(executor.checked_sat_refutation_authorizes_current_query());
     }
 
     #[test]

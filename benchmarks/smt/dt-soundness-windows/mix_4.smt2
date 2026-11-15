@@ -1,0 +1,7 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((W 0)) (((w1 (a1 W) (a2 W) (a3 Int)) (w2 (b1 W) (b2 Int)) (w3 (c1 Int)) (w4))))
+(declare-const w W)
+(assert (is-w2 w))
+(assert (= (b2 w) 10))
+(assert (is-w4 (b1 w)))
+(check-sat)

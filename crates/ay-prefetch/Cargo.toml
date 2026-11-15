@@ -1,6 +1,6 @@
 [package]
 name = "ay-prefetch"
-description = "Platform-specific software prefetch hints for ay-sat BCP"
+description = "Platform-specific software prefetch hints and bounds-contracted slice accessors for ay-sat's hot loops"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

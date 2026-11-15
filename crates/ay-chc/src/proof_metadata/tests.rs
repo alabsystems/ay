@@ -2492,3 +2492,96 @@ fn attributed_unknown_reasons_reach_consumers_without_invented_limit_codes() {
         assert_eq!(json["accepted_for_consumer"], false);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Trust superproject b62 lineage (ay-chc Unknown-cause split, 1198f48100):
+// additive coverage for behaviour this branch already implements. Carried when
+// the lineage was merged into main; every production symbol these exercise was
+// already here, so these only pin it.
+// ---------------------------------------------------------------------------
+/// The new reason codes reach consumer evidence, and they carry NO limit code.
+///
+/// `unknown_limit_code` is a resource-limit attribution: a `Some(..)` tells a
+/// consumer that more budget could change the answer. Neither new reason can
+/// evidence that.
+///
+/// - `OverApproximatedRefutation`: no limit was hit at all — the search
+///   returned an answer and a soundness guard discarded it. More budget cannot
+///   change the outcome.
+/// - `CandidateNotAdmitted`: a limit sometimes DOES contribute (some acceptance
+///   gates fail closed when their residual re-verification budget is gone), but
+///   the reason cannot distinguish that from a genuine non-admission. An
+///   unevidenced limit code is worse than none.
+#[test]
+fn new_unknown_reasons_carry_no_resource_limit_code() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int)) (=> (and (Inv x) (< x 0)) false)))
+(check-sat)
+"#,
+    );
+
+    for (result, expected_code) in [
+        (
+            crate::VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::overapproximated_refutation(),
+            ),
+            "overapproximated_refutation",
+        ),
+        (
+            crate::VerifiedChcResult::unknown_candidate_not_admitted(),
+            "candidate_not_admitted",
+        ),
+    ] {
+        let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
+        let evidence = run.consumer_evidence();
+
+        assert_eq!(evidence.verdict_code, "unknown");
+        assert!(!evidence.accepted_for_consumer);
+        assert_eq!(
+            evidence.unknown_reason_code.as_deref(),
+            Some(expected_code),
+            "the specific reason must reach consumer evidence"
+        );
+        assert_eq!(
+            evidence.consumer_rejection_code.as_deref(),
+            Some(format!("ay_chc_unknown_{expected_code}").as_str())
+        );
+        assert_eq!(
+            evidence.unknown_limit_code, None,
+            "{expected_code} is not a resource-limit outcome and must not claim one"
+        );
+        assert_eq!(evidence.unknown_depth_reached, None);
+        assert_eq!(evidence.unknown_depth_limit, None);
+    }
+}
+
+/// An effort is bound into the option identity, and every key built on it,
+/// only when present (P4a slice 8): the options of a run under an effort
+/// record B and the count caps the run did not arm, round-trip through their
+/// JSON, and differ from the same config's without one, whose identity and
+/// JSON carry no trace of the field.
+#[test]
+fn an_effort_is_bound_into_the_option_identity_only_when_present() {
+    let config = PdrConfig::default().with_max_frames(8);
+    let plain = ChcProofEvidenceOptions::pdr_strict(&config);
+    let counted = ChcProofEvidenceOptions::pdr_strict(&config.clone().with_effort(Some(20_000)));
+    assert_eq!((plain.effort, plain.max_frames), (None, 8));
+    assert_eq!(
+        (counted.effort, counted.max_frames),
+        (Some(20_000), u64::MAX)
+    );
+    assert!(!plain.identity_input().contains("effort"));
+    assert!(plain.to_json_value().get("effort").is_none());
+    assert_ne!(plain.identity_sha256(), counted.identity_sha256());
+    let json = counted.to_json_value();
+    assert_eq!(json["effort"], serde_json::json!(20_000));
+    let parsed = ChcProofEvidenceOptions::from_json_value(&json).expect("round-trips");
+    assert_eq!(parsed, counted);
+    assert_eq!(
+        ChcProofEvidenceOptions::from_json_value(&plain.to_json_value()).expect("round-trips"),
+        plain
+    );
+}

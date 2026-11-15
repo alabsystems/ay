@@ -102,7 +102,16 @@ impl ArraySolver<'_> {
         // from the store term. Without this, ROW2 axioms are never generated
         // for const-array + store patterns where the array variable is
         // indirectly equal to the store term via an asserted equality.
-        if array != store_term && !self.known_equal(array, store_term) {
+        // Guarded emission: an undecided alias is enough when the
+        // equality ATOM exists — callers must then guard the clause
+        // with that atom (check_row2 does). Measured on
+        // qlock.induction.5, requiring a PROVABLE alias parked 52,205
+        // of 52,211 drained ROW2 axioms in `remaining`, so no ROW2
+        // lemma was ever emitted during search.
+        if array != store_term
+            && !self.known_equal(array, store_term)
+            && self.get_eq_term(array, store_term).is_none()
+        {
             return None;
         }
 
@@ -125,89 +134,138 @@ impl ArraySolver<'_> {
     /// `register_select()` / `register_store()`, we scan for relevant pairs
     /// lazily during `check()`. The key optimization is a **budget**: only
     /// generate up to `LAZY_ROW2_BUDGET` new axioms per check() call. The
-    /// fingerprint mechanism (`axiom_fingerprints`) ensures axioms are never
-    /// duplicated. Remaining pairs are discovered on subsequent check() calls
+    /// queue indexes suppress already tracked obligations. Remaining pairs
+    /// are discovered on subsequent check() calls
     /// or in final_check().
     ///
     /// For benchmarks with hundreds of stores on one array (bubble_sort22,
     /// wchains400se), this spreads the cost over multiple DPLL iterations
     /// instead of generating all O(stores * selects) axioms upfront.
+    /// Candidate stores for ROW2-down generation over `array`: its
+    /// merged `stores_as_result` plus every store term equated to
+    /// `array` by an EXISTING equality atom. The second source is what
+    /// lets guarded ROW2 clauses (see `row2_down_clause_terms`) be
+    /// generated before the alias equality is ever asserted — without
+    /// it, generation only sees aliases the equality graph has
+    /// already merged, so search-time linkage waits for assignment.
+    fn row2_candidate_stores(&self, array: TermId) -> Option<Vec<TermId>> {
+        if self.interrupted_or_deadline() {
+            return None;
+        }
+        let mut stores: Vec<TermId> = self
+            .array_vars
+            .get(&array)
+            .map(|data| data.stores_as_result.clone())
+            .unwrap_or_default();
+        if let Some(eq_terms) = self.term_to_equalities.get(&array) {
+            for (index, &eq_term) in eq_terms.iter().enumerate() {
+                if index % 64 == 0 && self.interrupted_or_deadline() {
+                    return None;
+                }
+                if let TermData::App(sym, args) = self.terms.get(eq_term) {
+                    if sym.name() == "=" && args.len() == 2 {
+                        let other = if args[0] == array {
+                            args[1]
+                        } else if args[1] == array {
+                            args[0]
+                        } else {
+                            continue;
+                        };
+                        if self.store_cache.contains_key(&other) && !stores.contains(&other) {
+                            stores.push(other);
+                        }
+                    }
+                }
+            }
+        }
+        Some(stores)
+    }
+
+    /// Group only select IDs. Candidate-store vectors are built once per
+    /// visited array, after the lazy budget/final deadline boundary; never
+    /// materialize a select-by-store vector product before those checks.
+    fn row2_select_groups(&self) -> Option<HashMap<TermId, Vec<TermId>>> {
+        let mut groups: HashMap<TermId, Vec<TermId>> = HashMap::default();
+        for (index, (&select, &(array, _))) in self.select_cache.iter().enumerate() {
+            if index % 64 == 0 && self.interrupted_or_deadline() {
+                return None;
+            }
+            groups.entry(array).or_default().push(select);
+        }
+        Some(groups)
+    }
+
+    // The ROW1 branch is already discarded by check_row2. Do not spend a
+    // new-work slot on it every lazy round ahead of productive ROW2 pairs.
+    fn row2_indices_currently_equal(&self, store: TermId, select: TermId) -> bool {
+        let (Some(&(_, store_index, _)), Some(&(_, select_index))) =
+            (self.store_cache.get(&store), self.select_cache.get(&select))
+        else {
+            return false;
+        };
+        store_index == select_index || self.known_equal(store_index, select_index)
+    }
+
     pub(crate) fn generate_lazy_row2_axioms(&mut self) {
         const LAZY_ROW2_BUDGET: usize = 64;
         let mut generated = 0usize;
 
-        // Collect select terms to avoid borrowing issues.
-        // Only process selects whose array has stores_as_result entries.
-        let select_entries: Vec<(TermId, TermId)> = self
-            .select_cache
-            .iter()
-            .filter_map(|(&sel, &(arr, _))| {
-                self.array_vars
-                    .get(&arr)
-                    .filter(|d| !d.stores_as_result.is_empty())
-                    .map(|_| (sel, arr))
-            })
-            .collect();
-
-        for (select_term, array) in select_entries {
-            if generated >= LAZY_ROW2_BUDGET {
+        let Some(groups) = self.row2_select_groups() else {
+            return;
+        };
+        for (array, selects) in groups {
+            if generated >= LAZY_ROW2_BUDGET || self.interrupted_or_deadline() {
                 break;
             }
-            let stores = match self.array_vars.get(&array) {
-                Some(data) => data.stores_as_result.clone(),
-                None => continue,
+            let Some(stores) = self.row2_candidate_stores(array) else {
+                return;
             };
-            for store in stores {
+            for select in selects {
+                for &store in &stores {
+                    if generated >= LAZY_ROW2_BUDGET {
+                        break;
+                    }
+                    if self.interrupted_or_deadline() {
+                        return;
+                    }
+                    if self.row2_indices_currently_equal(store, select) {
+                        continue;
+                    }
+                    if self.queue_row2_down_axiom(store, select) {
+                        generated += 1;
+                    }
+                }
                 if generated >= LAZY_ROW2_BUDGET {
                     break;
-                }
-                // queue_row2_down_axiom checks fingerprints and only queues
-                // truly new axioms. Count the axiom as "generated" only if it
-                // wasn't already fingerprinted.
-                let select_idx = match self.select_cache.get(&select_term) {
-                    Some(&(_, idx)) => idx,
-                    None => continue,
-                };
-                if !self.row2_fingerprint_seen(store, select_idx) {
-                    self.queue_row2_down_axiom(store, select_term);
-                    generated += 1;
                 }
             }
         }
     }
 
-    /// Generate ALL remaining lazy ROW2 axioms (no budget).
-    ///
-    /// Called from `final_check()` to ensure completeness. Unlike
-    /// `generate_lazy_row2_axioms()`, this has no per-call limit.
+    /// Generate all current obligations, without a per-call count limit.
     pub(crate) fn generate_all_lazy_row2_axioms(&mut self) {
-        let select_entries: Vec<(TermId, TermId)> = self
-            .select_cache
-            .iter()
-            .filter_map(|(&sel, &(arr, _))| {
-                self.array_vars
-                    .get(&arr)
-                    .filter(|d| !d.stores_as_result.is_empty())
-                    .map(|_| (sel, arr))
-            })
-            .collect();
-
-        for (select_term, array) in select_entries {
-            // #8615: Check interrupt/deadline periodically to avoid indefinite
-            // axiom generation on large formulas (no budget limit in this path).
+        let Some(groups) = self.row2_select_groups() else {
+            return;
+        };
+        for (array, selects) in groups {
             if self.interrupted_or_deadline() {
                 return;
             }
-            let stores = match self.array_vars.get(&array) {
-                Some(data) => data.stores_as_result.clone(),
-                None => continue,
+            let Some(stores) = self.row2_candidate_stores(array) else {
+                return;
             };
-            for store in stores {
-                // M1 weak-equivalence invariant: the (select array, store)
-                // pair lies on a length-1 weak path (array ≈ store —[i]— base).
-                #[cfg(debug_assertions)]
-                self.debug_assert_row2_pair_on_length1_weak_path(array, store);
-                self.queue_row2_down_axiom(store, select_term);
+            for select in selects {
+                for &store in &stores {
+                    if self.interrupted_or_deadline() {
+                        return;
+                    }
+                    if self.row2_indices_currently_equal(store, select) {
+                        continue;
+                    }
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_row2_pair_on_length1_weak_path(array, store);
+                    self.queue_row2_down_axiom(store, select);
+                }
             }
         }
     }
@@ -216,13 +274,20 @@ impl ArraySolver<'_> {
     /// If i ≠ j, then select(store(a, i, v), j) = select(a, j).
     ///
     /// The array solver cannot create fresh equality terms directly, so this
-    /// pass has two stages:
+    /// pass first parks clauses satisfied by actual assigned literals, retaining
+    /// their exact work for later assignments. Otherwise it has two stages:
     /// 1. if both equality atoms already exist, emit the permanent ROW2 clause
     /// 2. otherwise, request the missing equality atoms via NeedModelEqualities
     ///
     /// Applied ROW2 clauses are remembered so later check() calls do not
     /// regenerate them after split-loop rebuilds (#6546 Packet 3).
     pub(crate) fn check_row2(&mut self) -> Option<TheoryResult> {
+        // This pass changes only queue/acknowledgment and model-request
+        // metadata. Assignments, equality/disequality edges, external reasons,
+        // term structure and interface requests stay fixed while every
+        // provability query runs. A fresh window shares those proofs within
+        // this pass, then restores any outer solver's cache on every exit.
+        let _eq_paths_cache_guard = eq_paths_cache::activate();
         let mut lemmas = Vec::new();
         let mut seen_lemmas = HashSet::default();
         let mut requests = Vec::new();
@@ -274,7 +339,17 @@ impl ArraySolver<'_> {
                     let Some(alias_reasons) = (if select_array == store {
                         Some(Vec::new())
                     } else {
+                        // Guarded form: when the alias is not yet provable
+                        // but its equality atom exists, use the atom itself
+                        // as the sole alias reason — negated into the clause
+                        // below it becomes the guard `select_array != store`,
+                        // making the clause a scope-independent tautology
+                        // that can be emitted before the alias is decided.
                         self.explain_equal_if_provable(select_array, store)
+                            .or_else(|| {
+                                self.get_eq_term(select_array, store)
+                                    .map(|eq_atom| vec![TheoryLit::new(eq_atom, true)])
+                            })
                     }) else {
                         remaining.push(PendingAxiom::Row2Down { store, select });
                         continue;
@@ -282,18 +357,27 @@ impl ArraySolver<'_> {
 
                     let idx_eq = self.get_eq_term(store_idx, select_idx);
                     let select_eq = self.get_eq_term(select, base_select);
-                    if let (Some(idx_eq), Some(select_eq)) = (idx_eq, select_eq) {
-                        // If either disjunct is already true under the current
-                        // assignment the clause is satisfied — skip emission.
-                        let idx_sat = self.assigns.get(&idx_eq) == Some(&true);
-                        let sel_sat = self.assigns.get(&select_eq) == Some(&true);
-                        if idx_sat || sel_sat {
-                            remaining.push(PendingAxiom::Row2Down { store, select });
-                            continue;
-                        }
+                    // A false alias premise or a true existing positive
+                    // disjunct already satisfies the guarded ROW2 clause.
+                    // Check before requesting ANY missing atom: inactive
+                    // branches must not grow the equality/interface fixpoint.
+                    // Unknown assignments do not satisfy a literal. Keep this
+                    // exact obligation for a later assignment or scope.
+                    let satisfied = alias_reasons.iter().any(|lit| {
+                        self.assigns
+                            .get(&lit.term)
+                            .is_some_and(|assigned| *assigned != lit.value)
+                    }) || idx_eq
+                        .is_some_and(|eq| self.assigns.get(&eq) == Some(&true))
+                        || select_eq.is_some_and(|eq| self.assigns.get(&eq) == Some(&true));
+                    if satisfied {
+                        remaining.push(PendingAxiom::Row2Down { store, select });
+                        continue;
+                    }
 
-                        // Both atoms exist — build and emit the clause, then
-                        // drain this axiom (don't push to remaining).
+                    if let (Some(idx_eq), Some(select_eq)) = (idx_eq, select_eq) {
+                        // Both atoms exist — derive the guarded clause while
+                        // retaining its obligation until actual acknowledgment.
                         let mut clause: Vec<_> = alias_reasons
                             .iter()
                             .copied()
@@ -307,12 +391,13 @@ impl ArraySolver<'_> {
                         clause.dedup_by_key(|lit| (lit.term, lit.value));
                         if !clause.is_empty() && seen_lemmas.insert(clause.clone()) {
                             // #lemma-must-prune / #refine-theory-memory: skip no-op lemmas.
-                            if self.lemma_is_unproductive(&clause) {
-                                continue;
+                            if !self.row2_clause_is_unproductive(store, select, &clause) {
+                                lemmas.push(TheoryLemma::new(clause));
                             }
-                            lemmas.push(TheoryLemma::new(clause));
                         }
-                        // Axiom completed — drained (not pushed to remaining).
+                        // An emitted/satisfied guard does not complete the
+                        // obligation for future assignments or explanations.
+                        remaining.push(PendingAxiom::Row2Down { store, select });
                         continue;
                     }
 
@@ -330,7 +415,6 @@ impl ArraySolver<'_> {
                             if let Some(idx_diseq_reasons) =
                                 self.explain_distinct_if_provable(store_idx, select_idx)
                             {
-                                let reasoned_index_diseq = !idx_diseq_reasons.is_empty();
                                 let mut clause: Vec<_> = alias_reasons
                                     .iter()
                                     .copied()
@@ -347,14 +431,11 @@ impl ArraySolver<'_> {
                                 clause.dedup_by_key(|lit| (lit.term, lit.value));
                                 if !clause.is_empty() && seen_lemmas.insert(clause.clone()) {
                                     // #lemma-must-prune / #refine-theory-memory: skip no-op lemmas.
-                                    if self.lemma_is_unproductive(&clause) {
-                                        continue;
+                                    if !self.row2_clause_is_unproductive(store, select, &clause) {
+                                        lemmas.push(TheoryLemma::new(clause));
                                     }
-                                    lemmas.push(TheoryLemma::new(clause));
                                 }
-                                if reasoned_index_diseq {
-                                    self.forget_row2_down_fingerprint(store, select_idx);
-                                }
+                                remaining.push(PendingAxiom::Row2Down { store, select });
                                 continue;
                             }
                         }
@@ -374,12 +455,18 @@ impl ArraySolver<'_> {
                             self.conflict_reasons_to_lemma(reasons)
                         {
                             for lemma in conflict_lemmas {
-                                if seen_lemmas.insert(lemma.clause.clone()) {
+                                if seen_lemmas.insert(lemma.clause.clone())
+                                    && !self.row2_clause_is_unproductive(
+                                        store,
+                                        select,
+                                        &lemma.clause,
+                                    )
+                                {
                                     lemmas.push(lemma);
                                 }
                             }
                         }
-                        self.forget_row2_down_fingerprint(store, select_idx);
+                        remaining.push(PendingAxiom::Row2Down { store, select });
                         continue;
                     }
 
@@ -427,6 +514,7 @@ impl ArraySolver<'_> {
         }
 
         self.pending_axioms = remaining;
+        self.rebuild_row2_down_work();
 
         if !lemmas.is_empty() {
             return Some(TheoryResult::NeedLemmas(lemmas));
@@ -570,14 +658,20 @@ impl ArraySolver<'_> {
                     }
                 }
             } else {
-                let store_select =
-                    self.get_exact_select_term_on_provable_array_alias(store_term, select_idx);
-                if require_value_diseq && store_select.is_none() {
+                // Split into whole values up front rather than destructuring
+                // the pair inside the `if let` below: moving the reasons out of
+                // the pair on one path left it partially moved where the paths
+                // rejoin, and the drop that follows switches on its niche-encoded
+                // discriminant with an `unreachable` arm the verifier refuted.
+                let (store_select_term, store_alias_reasons) = self
+                    .get_exact_select_term_on_provable_array_alias(store_term, select_idx)
+                    .unzip();
+                if require_value_diseq && store_select_term.is_none() {
                     continue;
                 }
                 let mut reason = base_reasons.clone();
                 let mut value = self.get_exact_select_term(store_term, select_idx);
-                if let Some((select_on_store, mut select_alias_reasons)) = store_select {
+                if let Some(select_on_store) = store_select_term {
                     if require_value_diseq {
                         let Some(val_diseq_reasons) =
                             self.explain_distinct_if_provable(select_on_base, select_on_store)
@@ -586,7 +680,7 @@ impl ArraySolver<'_> {
                         };
                         reason.extend(val_diseq_reasons);
                     }
-                    reason.append(&mut select_alias_reasons);
+                    reason.extend(store_alias_reasons.unwrap_or_default());
                     value = Some(select_on_store);
                 }
                 let key = if store_idx.0 <= select_idx.0 {
@@ -653,11 +747,9 @@ impl ArraySolver<'_> {
         let mut lemmas = Vec::new();
         let mut seen_clauses = HashSet::default();
 
-        #[cfg(not(kani))]
-        let mut needed: HashSet<TermId> =
-            ay_core::kani_compat::det_hash_set_with_capacity(candidate_pairs.len() * 2);
-        #[cfg(kani)]
-        let mut needed: HashSet<TermId> = HashSet::default();
+        let mut needed: HashSet<TermId> = ay_core::kani_compat::det_hash_set_with_capacity(
+            candidate_pairs.len().saturating_mul(2),
+        );
         for &(s1, s2) in candidate_pairs.iter() {
             needed.insert(s1);
             needed.insert(s2);

@@ -14,7 +14,7 @@ use sha1::Sha1;
 
 pub(super) const VALIDATOR_ID: &str = "builtin.reference-inventory.v1";
 
-const SNAPSHOT_SCHEMA: &str = "ay-smtlib-source-snapshot/v1";
+const SNAPSHOT_SCHEMA: &str = "ay-smtlib-source-snapshot/v2";
 const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 const SUPPORTED_DIMENSIONS: [&str; 10] = [
@@ -96,7 +96,125 @@ struct SnapshotFile {
     git_blob: String,
     size: usize,
     content_sha256: String,
+    encoding: SourceEncoding,
     content: String,
+}
+
+/// `OpaqueByteValues` is a reversible byte transport, not a claim that the
+/// source language is Latin-1. Each original byte is represented by its
+/// corresponding U+0000..U+00FF value; no byte is replaced or interpreted.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SourceEncoding {
+    Utf8,
+    OpaqueByteValues,
+}
+
+impl SourceEncoding {
+    fn encode(bytes: &[u8]) -> (Self, String) {
+        match std::str::from_utf8(bytes) {
+            Ok(content) => (Self::Utf8, content.to_string()),
+            Err(_) => (
+                Self::OpaqueByteValues,
+                bytes.iter().map(|byte| char::from(*byte)).collect(),
+            ),
+        }
+    }
+
+    fn raw_bytes(self, content: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Utf8 => Ok(content.as_bytes().to_vec()),
+            Self::OpaqueByteValues => content
+                .chars()
+                .map(|character| {
+                    u8::try_from(u32::from(character))
+                        .map_err(|_| "opaque source contains a non-byte code point".to_string())
+                })
+                .collect(),
+        }
+    }
+}
+
+impl SnapshotFile {
+    fn from_bytes(path: String, git_blob: String, bytes: &[u8]) -> Self {
+        let (encoding, content) = SourceEncoding::encode(bytes);
+        Self {
+            path,
+            git_blob,
+            size: bytes.len(),
+            content_sha256: sha256_bytes(bytes),
+            encoding,
+            content,
+        }
+    }
+
+    fn validate_bytes(&self) -> Result<Vec<u8>, String> {
+        let bytes = self.encoding.raw_bytes(&self.content)?;
+        if SourceEncoding::encode(&bytes) != (self.encoding, self.content.clone()) {
+            return Err(format!(
+                "snapshot file {} has noncanonical byte encoding",
+                self.path
+            ));
+        }
+        if bytes.len() != self.size {
+            return Err(format!("snapshot file {} size mismatch", self.path));
+        }
+        if sha256_bytes(&bytes) != self.content_sha256 {
+            return Err(format!("snapshot file {} content hash mismatch", self.path));
+        }
+        if git_blob_sha1(&bytes) != self.git_blob {
+            return Err(format!(
+                "snapshot file {} does not match its Git blob",
+                self.path
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn semantic_content(&self) -> Result<&str, String> {
+        if self.encoding == SourceEncoding::OpaqueByteValues {
+            let bytes = self.encoding.raw_bytes(&self.content)?;
+            if !self.path.ends_with(".tex") || !opaque_bytes_are_tex_comments(&bytes) {
+                return Err(format!("{} contains opaque non-UTF8 bytes outside ignored TeX comments; semantic decoding is unqualified", self.path));
+            }
+        }
+        Ok(&self.content)
+    }
+}
+
+fn opaque_bytes_are_tex_comments(bytes: &[u8]) -> bool {
+    // This is a deliberately small admission rule, not a TeX interpreter.
+    // Verbatim and category-code changes can give % a different meaning.
+    if [b"\\verb".as_slice(), b"\\catcode".as_slice()]
+        .iter()
+        .any(|token| bytes.windows(token.len()).any(|part| part == *token))
+    {
+        return false;
+    }
+    let mut comment = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\n' | b'\r') {
+            comment = false;
+        } else if !comment {
+            if !byte.is_ascii() {
+                return false;
+            }
+            if byte == b'%' {
+                comment = true;
+            } else if byte == b'\\' && index + 1 < bytes.len() {
+                // Escaped percent is not a comment. A double backslash
+                // consumes only the second slash, leaving a later % active.
+                index += 1;
+                if !bytes[index].is_ascii() {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    true
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -132,7 +250,7 @@ pub(super) fn snapshot(args: &[String]) -> Result<i32, String> {
     let kind = SnapshotKind::parse(&positionals[0])?;
     let checkout = PathBuf::from(&positionals[1]);
     let output = output.ok_or("source-snapshot requires --out <path>")?;
-    let source_snapshot = create_snapshot(kind, &checkout, &canonical_profile())?;
+    let source_snapshot = create_snapshot(kind, &checkout, &canonical_profile()?)?;
     let bytes = pretty_json(&source_snapshot)?;
     atomic_write_new(&output, &bytes)?;
     println!(
@@ -321,7 +439,7 @@ pub(super) fn validate_and_replay(
             [input] => Some(load_bound_snapshot(
                 input,
                 context.manifest_dir,
-                &canonical_profile(),
+                &canonical_profile()?,
             )?),
             [] => None,
             _ => return Err("reference inventory has an invalid source-input count".to_string()),
@@ -350,6 +468,21 @@ pub(super) struct LanguageSourceFile {
     pub(super) git_blob: String,
     pub(super) content_sha256: String,
     pub(super) content: String,
+    encoding: SourceEncoding,
+}
+
+impl LanguageSourceFile {
+    pub(super) fn original_bytes(&self, text: &str) -> Result<Vec<u8>, String> {
+        self.encoding.raw_bytes(text)
+    }
+
+    pub(super) fn original_offset(&self, decoded_offset: usize) -> Result<usize, String> {
+        let prefix = self
+            .content
+            .get(..decoded_offset)
+            .ok_or("invalid decoded source offset")?;
+        Ok(self.original_bytes(prefix)?.len())
+    }
 }
 
 pub(super) struct LoadedLanguageSource {
@@ -375,7 +508,7 @@ pub(super) fn load_language_source(
         .ok_or_else(|| format!("{} has no authenticated language snapshot", dimension.id))?;
     Ok(LoadedLanguageSource {
         binding: loaded.binding,
-        files: language_source_files(&loaded.snapshot),
+        files: language_source_files(&loaded.snapshot)?,
     })
 }
 
@@ -387,19 +520,22 @@ pub(super) fn load_bound_language_source(
     let snapshot = load_bound_snapshot(input, base, profile)?;
     Ok(LoadedLanguageSource {
         binding: input.clone(),
-        files: language_source_files(&snapshot),
+        files: language_source_files(&snapshot)?,
     })
 }
 
-fn language_source_files(snapshot: &SourceSnapshot) -> Vec<LanguageSourceFile> {
+fn language_source_files(snapshot: &SourceSnapshot) -> Result<Vec<LanguageSourceFile>, String> {
     snapshot
         .files
         .iter()
-        .map(|file| LanguageSourceFile {
-            path: file.path.clone(),
-            git_blob: file.git_blob.clone(),
-            content_sha256: file.content_sha256.clone(),
-            content: file.content.clone(),
+        .map(|file| {
+            Ok(LanguageSourceFile {
+                path: file.path.clone(),
+                git_blob: file.git_blob.clone(),
+                content_sha256: file.content_sha256.clone(),
+                content: file.semantic_content()?.to_string(),
+                encoding: file.encoding,
+            })
         })
         .collect()
 }
@@ -669,7 +805,7 @@ fn execute(dimension: &Dimension, snapshot: Option<&SourceSnapshot>) -> Result<E
         )?,
         "semantics.typing-and-scope" | "semantics.command-state-machine" => {
             let snapshot = snapshot.ok_or("semantic extractor has no language snapshot")?;
-            language_semantics::inventory_rows(dimension, &language_source_files(snapshot))?
+            language_semantics::inventory_rows(dimension, &language_source_files(snapshot)?)?
         }
         "gate.integrity"
         | "results.sat-models"
@@ -857,7 +993,7 @@ fn registry_logic_declarations(
         .map(|name| {
             let path = format!("Logics/{name}.smt2");
             let file = snapshot_file(snapshot, &path)?;
-            let declared = declared_registry_name(&file.content, "logic")?;
+            let declared = declared_registry_name(file.semantic_content()?, "logic")?;
             if declared != *name {
                 return Err(format!(
                     "registry file {path} declares logic {declared:?}, expected {name:?}"
@@ -868,7 +1004,7 @@ fn registry_logic_declarations(
                 path,
                 git_blob: file.git_blob.clone(),
                 content_sha256: file.content_sha256.clone(),
-                content: file.content.clone(),
+                content: file.semantic_content()?.to_string(),
             })
         })
         .collect()
@@ -902,7 +1038,7 @@ fn registry_theory_declarations(
         .iter()
         .map(|(name, path)| {
             let file = snapshot_file(snapshot, path)?;
-            let declared = declared_registry_name(&file.content, "theory")?;
+            let declared = declared_registry_name(file.semantic_content()?, "theory")?;
             if declared != *name {
                 return Err(format!(
                     "registry file {path} declares theory {declared:?}, expected {name:?}"
@@ -913,7 +1049,7 @@ fn registry_theory_declarations(
                 path: (*path).to_string(),
                 git_blob: file.git_blob.clone(),
                 content_sha256: file.content_sha256.clone(),
-                content: file.content.clone(),
+                content: file.semantic_content()?.to_string(),
             })
         })
         .collect()
@@ -924,11 +1060,14 @@ fn extract_contract_rows(dimension: &Dimension) -> Result<Vec<ValidatorCase>, St
         .requirements
         .iter()
         .map(|requirement| {
-            let bytes = serde_json::to_vec(requirement)
-                .map_err(|error| format!("serializing contract inventory row: {error}"))?;
+            // Evidence attachments and gap status evolve during qualification.
+            // They are not part of the requirement's semantic identity. Use
+            // the same canonical immutable fields as the inventory owner so
+            // attaching later evidence cannot invalidate this source census.
+            let identity = inventory_sha256(std::slice::from_ref(requirement))?;
             Ok(passing_inventory_case(
                 requirement,
-                &bytes,
+                identity.as_bytes(),
                 format!("closed contract owns canonical row {}", requirement.id),
             ))
         })
@@ -1014,7 +1153,7 @@ fn language_grammar_productions(
     ];
     let mut by_name = BTreeMap::new();
     for (macro_name, next_macro, expected_names) in specs {
-        let body = tex_macro_body(&syntax.content, macro_name, next_macro)?;
+        let body = tex_macro_body(syntax.semantic_content()?, macro_name, next_macro)?;
         for (name, production) in grammar_macro_productions(body, macro_name, expected_names)? {
             if lexical_grammar::source_macro_name(&name) != Some(macro_name) {
                 return Err(format!(
@@ -1112,7 +1251,13 @@ fn grammar_lhs_offsets(body: &str, macro_name: &str) -> Result<Vec<(String, usiz
         let line = raw_line
             .split_once('%')
             .map_or(raw_line, |(prefix, _)| prefix);
-        if let Some(offset) = line.find("\\nter") {
+        // Only a leading nonterminal can occupy the LHS column. In the
+        // pinned source, RHS alternatives wrap as `\alt\ \nter{...}`
+        // without any `&`; searching for the first nonterminal anywhere on
+        // the physical line mistakes those references for new productions.
+        let leading = line.trim_start();
+        if leading.starts_with("\\nter") {
+            let offset = line.len() - leading.len();
             let ampersand = line.find('&');
             if ampersand.is_none_or(|separator| offset < separator) {
                 if pending.is_some() {
@@ -1221,7 +1366,7 @@ fn language_command_productions(
     snapshot: &SourceSnapshot,
 ) -> Result<Vec<LanguageCommandProduction>, String> {
     let syntax = snapshot_file(snapshot, "Reference/syntax-macros.tex")?;
-    let alternatives = command_productions_from_source(&syntax.content)?;
+    let alternatives = command_productions_from_source(syntax.semantic_content()?)?;
     let actual = alternatives
         .iter()
         .map(|(name, _)| name.clone())
@@ -1369,15 +1514,7 @@ fn create_snapshot(
                 entry.path, entry.git_blob
             ));
         }
-        let content = String::from_utf8(bytes)
-            .map_err(|_| format!("selected source {} is not UTF-8", entry.path))?;
-        files.push(SnapshotFile {
-            path: entry.path,
-            git_blob: entry.git_blob,
-            size: entry.size,
-            content_sha256: sha256_bytes(content.as_bytes()),
-            content,
-        });
+        files.push(SnapshotFile::from_bytes(entry.path, entry.git_blob, &bytes));
     }
     let snapshot = SourceSnapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
@@ -1442,20 +1579,7 @@ fn validate_snapshot(
         }
         previous = Some(&file.path);
         validate_git_object_id(&file.git_blob)?;
-        if file.size != file.content.len() {
-            return Err(format!("snapshot file {} size mismatch", file.path));
-        }
-        let content_sha = sha256_bytes(file.content.as_bytes());
-        if content_sha != file.content_sha256 {
-            return Err(format!("snapshot file {} content hash mismatch", file.path));
-        }
-        let git_blob = git_blob_sha1(file.content.as_bytes());
-        if git_blob != file.git_blob {
-            return Err(format!(
-                "snapshot file {} content does not match Git blob {}",
-                file.path, file.git_blob
-            ));
-        }
+        file.validate_bytes()?;
         actual_paths.insert(file.path.clone());
         entries.push(TreeEntry {
             path: file.path.clone(),
@@ -1635,6 +1759,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contract_inventory_survives_evidence_and_gap_updates() {
+        let contract = starter_contract(Subject::default()).unwrap();
+        for id in [
+            "gate.integrity",
+            "results.sat-models",
+            "results.unsat-proofs",
+            "results.unknown-policy",
+        ] {
+            let original = contract
+                .dimensions
+                .iter()
+                .find(|dimension| dimension.id == id)
+                .unwrap();
+            let before = execute(original, None).unwrap();
+            let mut attached = original.clone();
+            attached.inventory.gap = None;
+            attached.inventory.evidence.push(EvidenceRef {
+                path: "inventory-receipt.json".to_string(),
+                sha256: "1".repeat(64),
+            });
+            for requirement in &mut attached.requirements {
+                requirement.gap = None;
+                requirement.evidence.push(EvidenceRef {
+                    path: "semantic-receipt.json".to_string(),
+                    sha256: "2".repeat(64),
+                });
+            }
+            assert_eq!(execute(&attached, None).unwrap(), before, "{id}");
+        }
+    }
+
+    #[test]
+    fn contract_inventory_remains_sensitive_to_requirement_semantics() {
+        let contract = starter_contract(Subject::default()).unwrap();
+        let original = contract
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.id == "results.sat-models")
+            .unwrap();
+        let before = execute(original, None).unwrap();
+        let mut changed = original.clone();
+        changed.requirements[0]
+            .claim
+            .push_str(" altered obligation");
+        let after = execute(&changed, None).unwrap();
+        assert_ne!(
+            before.case_results[0].input_sha256,
+            after.case_results[0].input_sha256
+        );
+        assert_ne!(before, after);
+    }
+
+    #[test]
     fn profile_manifest_hash_algorithm_is_frozen() {
         let entries = vec![TreeEntry {
             path: "Reference/example.tex".to_string(),
@@ -1652,6 +1829,95 @@ mod tests {
         assert_eq!(
             git_blob_sha1(b"test\n"),
             "9daeafb9864cf43055ae93beb0afd6c7d144bfa4"
+        );
+    }
+
+    fn source_file(bytes: &[u8]) -> SnapshotFile {
+        SnapshotFile::from_bytes(
+            "Reference/state-machine.tex".to_string(),
+            git_blob_sha1(bytes),
+            bytes,
+        )
+    }
+
+    #[test]
+    fn non_utf8_snapshot_roundtrips_exact_raw_bytes_and_hashes() {
+        let raw = b"% Slotz\x8ahler\n\\newcommand{\\state}{ready}\n";
+        let file = source_file(raw);
+        assert_eq!(file.encoding, SourceEncoding::OpaqueByteValues);
+        assert_eq!(file.size, raw.len());
+        assert_eq!(file.content_sha256, sha256_bytes(raw));
+        assert_eq!(file.validate_bytes().unwrap(), raw);
+        assert!(file.semantic_content().is_ok());
+        let encoded = serde_json::to_vec(&file).unwrap();
+        let restored: SnapshotFile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.validate_bytes().unwrap(), raw);
+        assert_eq!(restored, file);
+    }
+
+    #[test]
+    fn changed_raw_payload_and_forged_encodings_are_refused() {
+        let file = source_file(b"% Slotz\x8ahler\n");
+        let mut changed = file.clone();
+        changed.content = changed.content.replace('\u{008a}', "\u{008b}");
+        assert!(changed.validate_bytes().is_err());
+        let mut changed = file.clone();
+        changed.encoding = SourceEncoding::Utf8;
+        assert!(changed.validate_bytes().is_err());
+        let mut changed = file;
+        changed.content = changed.content.replace('\u{008a}', "\u{0100}");
+        assert!(changed.validate_bytes().is_err());
+        let mut utf8 = source_file("% UTF-8 ä\n".as_bytes());
+        assert_eq!(utf8.encoding, SourceEncoding::Utf8);
+        utf8.encoding = SourceEncoding::OpaqueByteValues;
+        assert!(utf8.validate_bytes().is_err());
+        let mut ascii = source_file(b"% ascii\n");
+        ascii.encoding = SourceEncoding::OpaqueByteValues;
+        assert!(ascii.validate_bytes().is_err());
+    }
+
+    #[test]
+    fn opaque_bytes_in_active_source_are_not_semantically_qualified() {
+        for bytes in [
+            b"\\state{\x8a}\n".as_slice(),
+            b"\\% literal \x8a\n",
+            b"\\verb|% \x8a|\n",
+            b"\\catcode37=12\n% \x8a\n",
+        ] {
+            let file = source_file(bytes);
+            file.validate_bytes().unwrap();
+            assert!(file.semantic_content().is_err());
+        }
+        assert!(source_file(b"\\\\% ignored \x8a\n")
+            .semantic_content()
+            .is_ok());
+    }
+
+    #[test]
+    fn language_source_offsets_and_line_hashes_refer_to_original_bytes() {
+        let raw = b"% opaque \x8a\nanchor\n";
+        let file = source_file(raw);
+        let source = LanguageSourceFile {
+            path: file.path.clone(),
+            git_blob: file.git_blob.clone(),
+            content_sha256: file.content_sha256.clone(),
+            content: file.semantic_content().unwrap().to_string(),
+            encoding: file.encoding,
+        };
+        let decoded_offset = source.content.find("anchor").unwrap();
+        let original_offset = raw
+            .windows(b"anchor".len())
+            .position(|value| value == b"anchor")
+            .unwrap();
+        assert_ne!(decoded_offset, original_offset);
+        assert_eq!(
+            source.original_offset(decoded_offset).unwrap(),
+            original_offset
+        );
+        assert_eq!(source.original_bytes(&source.content).unwrap(), raw);
+        assert_eq!(
+            sha256_bytes(&source.original_bytes(&source.content).unwrap()),
+            file.content_sha256
         );
     }
 
@@ -1691,6 +1957,54 @@ mod tests {
         );
         assert!(rows[0].1.contains("second\\_row"));
         assert!(!rows[1].1.contains("commented\\_row"));
+    }
+
+    #[test]
+    fn pinned_sexpression_rhs_wrapping_keeps_both_complete_productions() {
+        // Exact `sexpressions` body at SMT-LIB-2 69f45ad6, syntax-macros.tex
+        // blob ae9ef150945fe2ffa53c2da8ce1a72c948afb310, lines 83..91.
+        let body = r"\begin{tabular}{lcl}
+ \nter{spec\_constant} & ::= & \nter{numeral} \alt\ \nter{decimal}
+                         \alt\ \nter{hexadecimal} \alt\ \nter{binary}
+                         \alt\ \nter{string}
+ \\[1ex]
+ \nter{s\_expr} & ::= & \nter{spec\_constant} \alt\ \nter{symbol}
+                  \alt\ \nter{reserved} \alt\ \nter{keyword} \\
+                & \alt& \ter{(} \nter[*]{s\_expr} \ter{)}
+\end{tabular}
+";
+        let productions =
+            grammar_macro_productions(body, "sexpressions", &["spec_constant", "s_expr"]).unwrap();
+        assert_eq!(productions.len(), 2);
+        for alternative in ["numeral", "decimal", "hexadecimal", "binary", "string"] {
+            assert!(productions[0]
+                .1
+                .contains(&format!("\\nter{{{alternative}}}")));
+        }
+        assert!(productions[1].1.contains("\\nter{reserved}"));
+        assert!(productions[1].1.contains("\\nter{keyword}"));
+        assert!(productions[1].1.contains("\\nter[*]{s\\_expr}"));
+        assert!(grammar_macro_productions(body, "sexpressions", &["spec_constant"]).is_err());
+    }
+
+    #[test]
+    fn pinned_general_response_rhs_is_not_an_unfinished_lhs() {
+        // The same wrapping occurs in the pinned cGeneralResponse macro.
+        let body = r" \nter{general\_response}
+   & ::=  & \ter{success}
+     \alt\  \nter{specific\_success\_response} \\
+   & \alt & \ter{unsupported}
+     \alt\  \ter{(} \ter{error} \nter{string} \ter{)}
+";
+        let rows =
+            grammar_macro_productions(body, "cGeneralResponse", &["general_response"]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("\\ter{unsupported}"));
+        assert!(rows[0].1.contains("\\nter{specific\\_success\\_response}"));
+        assert!(
+            grammar_macro_productions("\\nter{a}\n\\nter{b} & ::= & x", "broken", &["a", "b"])
+                .is_err()
+        );
     }
 
     #[test]

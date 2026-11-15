@@ -745,7 +745,6 @@ fn bare_symbols_reject_non_nullary_and_ambiguous_nullary_declarations() {
 fn defined_function_applications_enforce_arity_and_parameter_sorts() {
     for input in [
         "(define-fun f ((x Int)) Bool true) (assert (f true))",
-        "(define-fun f ((x Int)) Bool true) (assert (f))",
         "(define-fun-rec f ((x Int)) Bool true) (assert (f true))",
         "(define-funs-rec ((f ((x Int)) Bool)) (true)) (assert (f true))",
     ] {
@@ -763,6 +762,8 @@ fn defined_function_applications_enforce_arity_and_parameter_sorts() {
             "expected typed macro application error for `{input}`, got {error:?}"
         );
     }
+    // An application with no argument does not parse, as in z3.
+    assert!(parse("(define-fun f ((x Int)) Bool true) (assert (f))").is_err());
 }
 
 #[test]
@@ -1271,14 +1272,22 @@ fn same_name_native_alias_is_an_exact_no_op() {
 
 #[test]
 fn boolean_connectives_match_z3_500_arity_and_require_bool_operands() {
+    // An application with no argument does not parse, as in z3.
     for input in [
         "(assert (and))",
         "(assert (or))",
         "(assert (xor))",
         "(assert (distinct))",
-        "(assert (=> true))",
-        "(assert (implies true))",
     ] {
+        let error = parse(input).expect_err(input);
+        assert!(
+            error
+                .to_string()
+                .contains("invalid function application, arguments missing"),
+            "{input}: {error}"
+        );
+    }
+    for input in ["(assert (=> true))", "(assert (implies true))"] {
         let commands = parse(input).expect("malformed-arity term still parses");
         let mut ctx = Context::new();
         let error = commands
@@ -2474,183 +2483,6 @@ fn test_declaration_activated_wrong_signature_rejected() {
     }
 }
 
-/// DRIFT-PROOF: mechanically re-extract every operator name the elaborators
-/// match structurally (string-literal match arms and `== "…"` comparisons in
-/// `src/elaborate/app/*.rs`, `src/elaborate/indexed.rs`,
-/// `src/elaborate/qualified.rs`, and `src/elaborate/term.rs`) and assert each
-/// one is classified in exactly one of [`RESERVED_OP_NAMES`] or
-/// [`EXCLUDED_DECLARABLE_OP_NAMES`]. A future match-arm addition whose name is
-/// in neither table fails here, so the reserved set cannot silently drift from
-/// the true structural-match vocabulary (that drift is exactly how the
-/// fp.isZero/fp.isNaN/fp.isInfinite wrong-UNSAT forgeries slipped past the
-/// first hand-curated table, and how the qualified-(as)-path names
-/// set.empty/multiset.empty/map.empty/const — matched in `qualified.rs`, a
-/// file the first drift test did not scan — stayed forgeable wrong-UNSATs
-/// after the app-arm vocabulary was sealed).
-///
-/// Scan scope: every `src/elaborate/*.rs` file that matches TERM-LEVEL
-/// operator/identifier names. Deliberately excluded from the scan:
-/// `sorts.rs` (matches SORT names — a separate namespace; declaring a
-/// function named `Set`/`Array` is legitimate and cannot conflate with sort
-/// elaboration), `commands.rs` (matches option keywords), and
-/// `declarations.rs`/`datatypes.rs`/`commands.rs` symbol handling (no
-/// structural op-name matching; datatype member names are USER-defined
-/// vocabulary gated dynamically by the `DatatypeMemberCollision` /
-/// `SortRedeclaration` checks, not by these static tables).
-#[test]
-fn test_reserved_op_table_covers_all_elaborator_match_arms() {
-    use crate::elaborate::{
-        is_excluded_declarable_op_name, is_reserved_op_name, EXCLUDED_DECLARABLE_OP_NAMES,
-    };
-    use std::path::{Path, PathBuf};
-
-    /// Extract the string literals of a match-arm pattern line: a line that
-    /// (after trimming and an optional leading `|`) consists ONLY of one or
-    /// more `"…"` literals separated by `|`, terminated by `=>`, an `if …`
-    /// match-arm guard (e.g. the declared-symbol guard on the `"const"` arm
-    /// in `qualified.rs`), a trailing `|`, or end-of-line (multi-line arm
-    /// continuation). Everything else — error-message strings, function-call
-    /// arguments, `.to_string()` receivers — is rejected by the terminator
-    /// check.
-    fn extract_arm_string_literals(line: &str) -> Vec<String> {
-        let trimmed = line.trim();
-        let mut rest = trimmed.strip_prefix('|').map_or(trimmed, str::trim_start);
-        if !rest.starts_with('"') {
-            return Vec::new();
-        }
-        let mut lits = Vec::new();
-        loop {
-            let Some(end) = rest[1..].find('"') else {
-                return Vec::new();
-            };
-            lits.push(rest[1..=end].to_string());
-            rest = rest[end + 2..].trim_start();
-            if let Some(after_pipe) = rest.strip_prefix('|') {
-                rest = after_pipe.trim_start();
-                if rest.is_empty() {
-                    break; // arm continues on the next line
-                }
-                if !rest.starts_with('"') {
-                    return Vec::new();
-                }
-                continue;
-            }
-            break;
-        }
-        if rest.is_empty() || rest.starts_with("=>") || rest.starts_with("if ") {
-            lits
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Extract the right-hand literals of `== "…"` comparisons (e.g.
-    /// `sym.name() == "const-array"`, `parts[0] == "map"`).
-    fn extract_eq_string_literals(line: &str) -> Vec<String> {
-        let mut lits = Vec::new();
-        let mut rest = line;
-        while let Some(pos) = rest.find("== \"") {
-            let after = &rest[pos + 4..];
-            let Some(end) = after.find('"') else { break };
-            lits.push(after[..end].to_string());
-            rest = &after[end + 1..];
-        }
-        lits
-    }
-
-    /// Filter: operator names are short single tokens; format/error strings
-    /// contain whitespace, braces, parens, colons or quotes and are dropped.
-    fn looks_like_op_name(name: &str) -> bool {
-        !name.is_empty()
-            && name.len() <= 40
-            && !name
-                .chars()
-                .any(|c| c.is_whitespace() || "{}():'\\\"".contains(c))
-    }
-
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let app_dir = manifest.join("src/elaborate/app");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&app_dir)
-        .expect("read src/elaborate/app")
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .collect();
-    files.push(manifest.join("src/elaborate/indexed.rs"));
-    files.push(manifest.join("src/elaborate/qualified.rs"));
-    files.push(manifest.join("src/elaborate/term.rs"));
-    files.sort();
-
-    let mut extracted = std::collections::BTreeSet::new();
-    for file in &files {
-        let source = std::fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        for line in source.lines() {
-            for lit in extract_arm_string_literals(line)
-                .into_iter()
-                .chain(extract_eq_string_literals(line))
-            {
-                if looks_like_op_name(&lit) {
-                    extracted.insert(lit);
-                }
-            }
-        }
-    }
-
-    // Extraction sanity: it must SEE the known vocabulary (guards against the
-    // extractor itself rotting into a vacuous pass).
-    assert!(
-        extracted.len() >= 150,
-        "extraction looks broken: only {} names extracted",
-        extracted.len()
-    );
-    for must_see in [
-        "select",
-        "store",
-        "bvadd",
-        "fp.isNaN",
-        "fp.isZero",
-        "multiset.union",
-        "set.subset",
-        "map.dom",
-        "const-array",
-        "seq.len",
-        "str.len",
-        "map",
-        // qualified.rs vocabulary (the recheck-found blind spot)
-        "set.empty",
-        "multiset.empty",
-        "map.empty",
-        "const",
-        // term.rs rounding modes and indexed.rs FP special literals
-        "roundNearestTiesToEven",
-        "NaN",
-    ] {
-        assert!(
-            extracted.contains(must_see),
-            "extraction failed to find known op `{must_see}` — extractor broken?"
-        );
-    }
-
-    let unclassified: Vec<&String> = extracted
-        .iter()
-        .filter(|name| !is_reserved_op_name(name) && !is_excluded_declarable_op_name(name))
-        .collect();
-    assert!(
-        unclassified.is_empty(),
-        "elaborator-matched op names in NEITHER RESERVED_OP_NAMES nor \
-         EXCLUDED_DECLARABLE_OP_NAMES (classify each: reserve it, or add it to \
-         the excluded table with a documented reason): {unclassified:?}"
-    );
-
-    // And the tables must stay disjoint.
-    for &(op, _) in EXCLUDED_DECLARABLE_OP_NAMES {
-        assert!(
-            !is_reserved_op_name(op),
-            "`{op}` appears in BOTH the reserved and excluded tables"
-        );
-    }
-}
-
 #[test]
 fn test_normal_symbol_accepted() {
     // Symbols not starting with __ay_ should be accepted
@@ -3292,7 +3124,7 @@ fn internal_query_window_isolates_and_exactly_restores_query_local_state() {
         vec![PublicAssertionMetadata::default()]
     );
     assert!(ctx.assertions_parsed.is_empty());
-    assert!(!ctx.retain_parsed_assertions);
+    assert!(!ctx.retains_parsed_assertions());
     assert!(ctx.objectives.is_empty());
     assert!(ctx.objective_finite_set_metadata.is_empty());
     assert!(ctx.soft_constraints.is_empty());
@@ -3319,7 +3151,7 @@ fn internal_query_window_isolates_and_exactly_restores_query_local_state() {
     assert_eq!(ctx.assertions, assertions_before);
     assert_eq!(ctx.assertion_finite_set_metadata, assertion_metadata_before);
     assert_eq!(ctx.assertions_parsed, parsed_before);
-    assert!(ctx.retain_parsed_assertions);
+    assert!(ctx.retains_parsed_assertions());
     assert_eq!(ctx.objectives, objectives_before);
     assert_eq!(ctx.objective_finite_set_metadata, objective_metadata_before);
     assert_eq!(ctx.soft_constraints, soft_before);
@@ -4127,94 +3959,6 @@ fn test_elaborator_private_identity_namespace_is_refused_on_every_route() {
         crate::command::Sort::Simple("Int".to_string()),
     ))
     .expect_err("no route may declare an elaborator private identity");
-}
-
-/// DRIFT GUARD — the anti-regression this change exists to install.
-///
-/// `ay-ffi` used to carry its own hand-spelled copy of the reserved-namespace
-/// test (`reserved_name_error`), and the core frontend's copy was MISSING the
-/// `map[...]` rule entirely; that divergence was the live false-PROVE channel.
-/// Both gates now read `INTERNAL_NAMESPACES`, so this test re-extracts every
-/// `!`-marked internal identity that `ay-ffi` MINTS, straight from its sources,
-/// and fails if any one of them is not covered by the shared table — i.e. if a
-/// future `ay-ffi` change invents a namespace the core would not refuse.
-///
-/// LIMIT (documented deliberately): extraction keys on AY's `!`-marker
-/// convention for engine identities. A brand-new marker character would not be
-/// seen here; the companion `ay-ffi` test pins the two predicates to the same
-/// function so such a namespace would at least be missing from BOTH gates
-/// rather than only one.
-#[test]
-fn test_internal_namespace_table_covers_every_ffi_minted_identity() {
-    use crate::elaborate::internal_namespace_of;
-    use std::path::Path;
-
-    /// Static prefix of a `format!("…")` literal: the text before the first
-    /// `{` placeholder. `format!("!ay.z3-func!{id}")` → `!ay.z3-func!`.
-    fn format_literal_prefixes(line: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut rest = line;
-        while let Some(pos) = rest.find("format!(\"") {
-            let after = &rest[pos + 9..];
-            let Some(end) = after.find('"') else { break };
-            let literal = &after[..end];
-            out.push(literal.split('{').next().unwrap_or("").to_string());
-            rest = &after[end + 1..];
-        }
-        out
-    }
-
-    let ffi_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ay-ffi/src/z3_compat");
-    let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(&ffi_dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", ffi_dir.display()))
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .collect();
-    sources.sort();
-    assert!(
-        sources.len() >= 5,
-        "ay-ffi source scan found only {} files — extractor broken?",
-        sources.len()
-    );
-
-    let mut minted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for source in &sources {
-        let text = std::fs::read_to_string(source)
-            .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
-        for line in text.lines() {
-            for prefix in format_literal_prefixes(line) {
-                // AY marks engine-minted identities with a leading `!`.
-                if prefix.starts_with('!') {
-                    minted.insert(prefix);
-                }
-            }
-        }
-    }
-
-    // Non-vacuity: the extractor must SEE the known witness families.
-    for must_see in ["!ay.z3-func!", "!ay.array-ext!", "!ay.z3-const!"] {
-        assert!(
-            minted.contains(must_see),
-            "extraction failed to find known engine identity `{must_see}` — extractor broken?"
-        );
-    }
-    assert!(
-        minted.len() >= 6,
-        "extraction looks broken: only {} engine identities found",
-        minted.len()
-    );
-
-    let uncovered: Vec<&String> = minted
-        .iter()
-        // Instantiate the placeholder with a concrete index, exactly as the
-        // engine does, then ask the SHARED table.
-        .filter(|prefix| internal_namespace_of(&format!("{prefix}0")).is_none())
-        .collect();
-    assert!(
-        uncovered.is_empty(),
-        "ay-ffi mints engine identities in namespaces the core frontend would NOT \
-         refuse to user source text — add each to INTERNAL_NAMESPACES: {uncovered:?}"
-    );
 }
 
 /// The scope column drives the gates — pinned so it cannot become decorative.

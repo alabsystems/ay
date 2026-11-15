@@ -1,659 +1,248 @@
-<div align="center">
-  <h1>AY</h1>
-  <p><strong>Solve constraints. Inspect models. Check certificates.</strong></p>
-  <p>A proof-oriented SAT, SMT, and CHC solver in Rust for Z3-compatible workflows,
-  with companion PB, MaxSAT, QBF, CP, and LP/MILP engines.</p>
-  <p>
-    <a href="#quick-start">Quick start</a> ·
-    <a href="#learn-ay-interactively">Tutorial</a> ·
-    <a href="#check-ays-answers-without-trusting-ay">Check the answers</a> ·
-    <a href="#use-ay">Use AY</a> ·
-    <a href="#capability-grid">Capabilities</a> ·
-    <a href="LIMITATIONS.md">Limitations</a> ·
-    <a href="#similar-programs">Similar programs</a> ·
-    <a href="#benchmarks-and-competition-readiness">Benchmarks</a> ·
-    <a href="#roadmap">Roadmap</a> ·
-    <a href="https://github.com/alabsystems/ay/issues">Issues</a>
-  </p>
-</div>
+# AY
 
-## What is AY?
+A constraint solver in Rust. You give it a logical problem; it tells you whether
+the problem has a solution, shows you one if it does, and can hand you a
+machine-checkable proof when it says there is none.
 
-AY turns formal constraints into models, counterexamples, optima, and
-checkable certificates. It combines SAT, SMT, and constrained Horn clause
-(CHC) solving with pseudo-Boolean optimization, MaxSAT, QBF, LP/MILP,
-FlatZinc, AllSAT, and exact model counting in one Rust workspace.
+AY covers SAT, SMT, Horn clauses, pseudo-Boolean, MaxSAT, QBF, LP/MILP,
+FlatZinc, and model counting in one binary.
 
-A solver answers questions of the form "can all of these requirements hold at
-once?" You state the constraints; the solver returns:
+## The idea
 
-| Answer | Meaning | Artifact |
+A solver answers one question: *can all of these requirements hold at once?*
+
+| Answer | Meaning | What you get |
 | --- | --- | --- |
-| `sat` | The constraints can all hold. | A model, such as `x = 7, y = 0`. |
-| `unsat` | No assignment satisfies them all. | A proof you can check independently. |
-| `unknown` | AY could not justify either answer within its supported methods or limits. | The reason. |
+| `sat` | Yes | A solution, e.g. `x = 7, y = 0` |
+| `unsat` | No | A proof, which you can check with a tool that isn't AY |
+| `unknown` | AY couldn't decide | The reason |
 
-Optimization adds "among the satisfying models, which is best?" — and AY can
-prove the optimum is the optimum. AY is aimed at systems where several formal
-problems meet: a compiler needing both SMT queries and optimization, a model
-checker moving between BMC and invariant synthesis, a theorem prover
-reconstructing a certificate, or an AI agent that needs a deterministic
-checker — an LLM can propose, and AY can check.
+The `unsat` row is the point of the project. Every solver can claim "no
+solution exists" — a wrong claim there is silent and expensive. AY writes a
+proof of that claim to a file, and ships checkers that replay it
+independently. You do not have to trust the search to trust the answer.
 
-AY is inspired by Z3 and is being built as a drop-in replacement, with a
-growing compatible command-line, C, and language-binding surface. Existing
-tools can adopt AY one workflow at a time; new tools can embed its native
-Rust APIs directly.
+## Build
 
-> **Status:** AY 0.x is under active development. Its tested Z3-compatible
-> subset is useful today, but the exact Z3 5.1.0 full-replacement gate is still
-> red. The gate authenticates all 807 required exports and the byte-exact
-> 11-header/805-declaration C surface; current runtime evidence executes
-> 217/805 declarations and has 0/805 exhaustive per-API semantic contracts.
-> The source-owned behavioral catalog leaves 301 owners explicitly unresolved
-> (asserted, pending a gate re-run — the owner-manifest digests are stale, so
-> the overlay validators fail closed), and the pinned 438,631-query official
-> corpus has not been run. Public SMT `sat` publication fails closed to
-> `unknown` in every mode whenever the independent model gate cannot confirm
-> the witness. Read [`LIMITATIONS.md`](LIMITATIONS.md) and run `ay z3-audit`
-> before substituting AY for Z3 anywhere the answer matters.
-
-## Quick start
-
-Build from source. The published snapshot's `rust-toolchain.toml` pins stock
-stable Rust, so `rustup` fetches the right toolchain for you:
+AY builds with ALab's Trust compiler, which `rust-toolchain.toml` pins. Install
+[aterm](https://github.com/alabsystems/aterm#install); atpkg installs Trust
+(`aterm pkg install trust` does it by hand; atpkg ships it for Apple-silicon
+macOS today).
 
 ```bash
 git clone https://github.com/alabsystems/ay.git
 cd ay
-cargo build --release --locked -p ay --features cli --bin ay
+targo --unverified build --release -p ay --features cli --bin ay
 export PATH="$PWD/target/release:$PATH"
 ```
 
-> AY builds with plain stable Rust, and that stays the supported path for
-> consumers: publication repins the exported toolchain to stock stable, so
-> nothing here requires a verifying compiler. ALab's own development tree is
-> different — since 2026-08-30 its default compiler is the ALab
-> [Trust](https://github.com/alabsystems/trust) toolchain, a
-> verification-oriented Rust toolchain, now published, with verification ON:
-> AY's contracts are written in Trust's native clause grammar in ordinary
-> `src/`, first-party code is verified in an advisory (report-everything,
-> fail-nothing) policy that is ratcheting toward fail-closed, and the strict
-> fail-closed policy still refuses the one crate measured end to end — a gap
-> that is recorded rather than claimed away. Trust also machine-checks selected
-> kernels through an explicit fail-closed lane; its public check builds on a
-> stock nightly, and its INSTALL.md documents the self-hosted fork lane.
+**The `--features cli` is not optional.** Without it Cargo builds the library
+and produces no executable, with no error explaining why.
 
-Solve a small integer problem from stdin:
+A **public snapshot's** `.cargo/config.toml` carries no verification policy.
+This **development** repo's requires `certify` policy on every unit, with no
+dependency or build-script exemptions. Name a lane:
 
 ```bash
-ay --z3-mode -in <<'SMT'
-(set-logic QF_LIA)
-(set-option :produce-models true)
-(declare-const x Int)
-(declare-const y Int)
-(assert (= (+ x y) 7))
-(assert (> x 2))
-(assert (< y 4))
-(check-sat)
-(get-model)
-SMT
+targo --unverified test -p ay-sat            # everyday: proof pipeline off,
+                                             # no proof claim
+offline deductive checker check -p ay-sat                  # fail-closed, per-unit proof report
+offline deductive checker test --allow-l0-gaps -p ay-sat   # advisory: run tests while the
+                                             # proof ratchet is still open
 ```
 
-AY returns `sat` and a model, for example `x = 7, y = 0`.
+The required posture is not a claim that the workspace currently discharges
+it — `ay-sat` alone still reports thousands of Level-0 gaps, mostly in derived
+`Clone`/`Default`/`thiserror` impls. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Learn AY interactively
+## Try it
 
-`ay tutorial` is the front door: fundamentals, an engineer course with
-Sudoku/routing/Minesweeper programs, an expert course with worked proof and
-incremental examples, and a feature atlas.
+Give `ay` a file. It works out the format from the contents.
 
 ```bash
-ay tutorial                    # the hub
-ay tutorial basics             # five interactive lessons: first model to first unsat
-ay tutorial engineers          # also: experts, features, play sudoku
-ay tutorial solve problem.smt2 # solve a file with educational output
-ay tutorial --challenge easy   # standalone puzzles: easy, medium, hard
+$ ay examples/quickstart.smt2
+c ay.session.start build.version=0.27.0 build.commit=…
+c writing Alethe proof to examples/quickstart.smt2.alethe on unsat
+sat
+(model
+  (define-fun y () Int 0)
+  (define-fun x () Int 7)
+)
+c ay.session.end exit.code=0 wall_time_ms=2
 ```
 
-For search, scheduling, routing, configuration, or puzzle problems, see the
-typed Rust/Python/TypeScript [`AY Search` guide](AY_SEARCH.md): the program
-declares finite choices, constraints, and an objective; AY supplies
-propagation, backtracking, enumeration, and optimization.
+Lines starting with `c` are comments recording which build ran and where a
+proof would go. `--z3-mode` suppresses them if you want bare Z3-shaped output.
 
-This supported QF_LIA example carries an Alethe proof. Solve it and re-check
-the certificate with [Carcara](https://github.com/ufmg-smite/carcara), the SMT
-community's independent Alethe checker (`ay tool install carcara` builds the
-exact commit AY's tests pin):
+An unsatisfiable problem writes a proof next to the input, then re-checks it:
 
 ```bash
-ay --rigor standard examples/quickstart_unsat.smt2   # prints: unsat
-carcara check examples/quickstart_unsat.smt2.alethe examples/quickstart_unsat.smt2
+$ ay problem.cnf              # DIMACS CNF
+unsat                         # also writes problem.cnf.drat
+
+$ ay check drat problem.cnf problem.cnf.drat
+s VERIFIED
 ```
 
-`--rigor standard` is what asks for the certificate: a plain `ay
-examples/quickstart_unsat.smt2` has z3's posture and writes nothing next to
-the input. At `standard` AY writes the `.alethe` proof beside it and Carcara
-replays it independently.
-
-## Check AY's answers without trusting AY
-
-`sat` is easy to verify: substitute the model into your own constraints. The
-hard claims are `unsat` and *optimal*. For those AY emits the community-standard
-proof format wherever one exists, and reduces its evidence to things you can
-already check where none does:
-
-| AY's claim | Evidence AY emits | Check it with |
-| --- | --- | --- |
-| SAT `unsat` | DRAT/LRAT proof | [drat-trim](https://github.com/marijnheule/drat-trim), the SAT community's reference checker (`ay tool install drat-trim`), plus standard LRAT checkers |
-| SMT `unsat` | Alethe proof | [Carcara](https://github.com/ufmg-smite/carcara), the community's independent Alethe checker |
-| PB `unsat` **and optimality** | VeriPB proof, including `BOUNDS optimum optimum` | [VeriPB](https://gitlab.com/MIAOresearch/software/VeriPB), the PB Competition's own proof system, at the build pinned by [`ci/veripb.pin`](ci/veripb.pin) |
-| CHC SAFE | Invariant certificate | `scripts/chc_cert_check.py`, which discharges the obligations to an external SMT solver of your choice |
-| CHC UNSAFE | Counterexample over the *original* clauses + standalone SMT-LIB replay obligations | Any SMT-LIB solver, Z3 included |
-| LP/MILP infeasible, LRA optimum | Exact rational Farkas certificates; MILP infeasibility as an integer split tree with Farkas leaves | Recombining the inequalities — elementary arithmetic |
-| Enumeration / counting / CP solutions | The models themselves | Substitution into your own model |
-
-QBF certificates are a roadmap item; that path returns verdicts and
-statistics today. MaxSAT emits a VeriPB certificate on request
-(`ay maxsat solve --proof STEM`, checked by `ay maxsat bench --proof-check`),
-but its lower bound is only derivable on some instances, so the certificate
-does not yet prove optimality on every one.
-
-"Checked by VeriPB" is itself pinned rather than assumed: published VeriPB
-3.0.2 has twenty-one confirmed wrong-verdict defects, so
-[`ci/veripb.pin`](ci/veripb.pin) names an exact commit plus the patches that
-close all of them, and the certified-PB gate re-proves those fixes against
-committed defect fixtures before it trusts a verdict.
-
-**Proofs are on by default where they are a byproduct of the solve.** Get
-`unsat` on a DIMACS or CHC file and AY writes the proof next to it
-(`problem.cnf.drat`, `problem.smt2.chccert`). An SMT-LIB Alethe certificate is
-not a byproduct — producing it arms search-time proof recording and a
-post-UNSAT mint that re-solves the problem, measured at 2.7x–20x the search
-time — so a plain `ay problem.smt2` has z3's posture (no proof, no
-certificate, nothing written) and `problem.smt2.alethe` appears at `--rigor
-standard` or above. A default proof that cannot be produced is reported, never
-silently swapped for a different verdict; an explicit `--proof FILE` that
-cannot be written is a hard failure. `--rigor` sets how much AY proves and
-re-checks about its own answer:
-
-| `--rigor LEVEL` | What you get |
-| --- | --- |
-| `fast` | just the answer, like `z3`: no default validation, proof emission, or proof re-check |
-| `standard` | validate the answer, emit a proof, and re-check that proof |
-| `strict` | strict proof checker; a terminal Trust-backed `unsat` it cannot prove becomes `unknown` |
-| `certified` | fail-closed: only answers AY can self-verify, everything else becomes `unknown` |
-
-With no `--rigor` at all, an SMT-LIB solve takes the `fast` rung's proof
-posture while keeping the validation batteries — including the always-on
-independent model gate behind every `sat` — switched on; DIMACS and CHC keep
-`standard`'s. The verdict is sound at every level — the ladder controls proof
-and self-check work, not confidence — and resolution is monotone, so the
-strongest level any flag requests wins. `--no-proof` suppresses default
-emission (benchmarking);
-`--proof FILE`, `--proof-format alethe|drat|lrat|lean4|veripb`, and
-`--proof-checker dsr-trim|dpr-trim|drat-trim|gratgen|veripb` select the
-artifact and the checker it must satisfy — routes whose steps the declared
-checker rejects are disabled rather than emitted. The older `--competition`,
-`--strict-proofs`, and `--self-check` flags remain as aliases for the ladder.
-
-Beyond external checkers, [`verification/lean`](verification/lean) states
-soundness theorems for selected solver kernels in Lean 4, the ALab
-[Clean](https://github.com/alabsystems/clean) proof kernel reconstructs
-supported SAT, SMT, arithmetic, and Farkas evidence in a minimal auditable
-kernel, and `ay check <drat|lrat|dpr|sr|model>` re-checks artifacts in-tree.
-
-## Use AY
-
-### Command line
-
-AY auto-detects its primary input formats and has dedicated commands for the
-other solver families:
+For SMT-LIB input the proof is [Alethe](https://verit.loria.fr/documentation/alethe-spec.pdf),
+which the external checker `carcara` reads:
 
 ```bash
-ay problem.smt2                       # SMT-LIB 2.6
-ay problem.cnf                        # DIMACS SAT
-ay horn-clauses.smt2                  # HORN logic selects CHC
-ay pb solve optimization.opb          # pseudo-Boolean decision or optimization
-ay maxsat solve weighted.wcnf         # weighted MaxSAT
-ay qbf solve quantified.qdimacs       # quantified Boolean formulas
-ay lp solve model.mps                 # LP / MILP
-ay flatzinc solve model.fzn           # constraint programming / MiniZinc output
-ay allsat formula.cnf                 # enumerate satisfying assignments
-ay model-count formula.cnf            # exact model count (mc, wmc, pmc, pwmc)
-ay simplify problem.smt2              # SMT-LIB2 AST simplification
-ay check <drat|lrat|dpr|sr|model>     # re-check a proof artifact or model
-ay tool <list|install|which|verify>   # external checkers/reference solvers (reference/tools.toml)
-ay scripts <list|show|run|check>      # the maintained-script index (scripts/index.toml)
-ay bench compare <list|show|check>    # competition registry + host preflight (needs --features bench)
+$ ay problem.smt2             # writes problem.smt2.alethe on unsat
+$ carcara check problem.smt2.alethe problem.smt2
+valid
 ```
 
-`ay --help`, `ay <command> --help`, and `ay --features` report the commands,
-build metadata, accepted logics, and proof coverage of the binary you built.
+Be aware that AY still emits some theory steps as opaque `trust` holes that
+carcara cannot expand. Fully hole-free proofs are demonstrated today only on
+small hand-written formulas, not across the board.
 
-### In place of Z3
+Pinned carcara also parses neither AY's `Seq`, `FloatingPoint` and `Char`
+sorts nor symbols spelled with the AY/Z3 `\|` escape extension, nor a problem
+written with constructs AY accepts and its parser refuses: a qualified
+`(as C S)` on a constructor of a non-parametric datatype, Z3 names such as
+`bv2nat`, `is-C` or `iff`, an implicit Int/Real coercion, or a use of a
+`define-const` symbol. AY still writes the certificate its own strict checker
+accepted for those problems and says so on the `c ay.proof.certificate` line
+as `carcara_surface=unsupported`
+(the reason follows on a `c warning:` line; a library consumer reads
+`UnsatProofArtifact::carcara_surface`, or takes the problem-scoped document and
+its verdict from one rendering with
+`Executor::try_export_last_proof_alethe_for_problem_scope_with_carcara_surface`).
+Such a verdict stands on AY's strict checker alone: `--rigor strict` and
+`--rigor certified` (legacy spellings `--strict-proofs` / `--self-check`)
+refuse it with that reason.
 
-AY speaks Z3's language: SMT-LIB 2 input, `z3py`-style Python, and the
-`(check-sat)` / `(get-model)` / `(get-proof)` workflow behave as a Z3 user
-expects.
+Pinned carcara and Clean's vendored carcara (which external-codegen replays with) also
+disagree on three spellings: the `bitblast_ashr` overshift layer,
+`zero_extend`, and the `bitblast_udiv`/`bitblast_urem` divider. They also
+disagree on one rule, `dt_project`, which checks a datatype selector over a
+constructor (`(= (fst (mk a b)) a)`): pinned carcara has no datatype rule and
+answers `unknown rule`, which rejects the whole document. By default AY
+prints Clean's (each names the Clean rule that admits it,
+`CleanOnlySpelling::consumer_rule`), and a certificate that keeps one says
+`carcara_surface=clean-dialect` (`CarcaraSurface::CleanDialect` on a library
+`UnsatProofArtifact`): pinned carcara refuses it. A problem pinned carcara
+cannot parse is `unsupported` in either dialect. `--alethe-dialect
+pinned-carcara` (`Executor::set_alethe_dialect`, `Solver::set_alethe_dialect`)
+prints the pinned spelling where one exists and is true, and prints the
+`dt_project` step as a `hole`. To check a QF_DT certificate with pinned
+carcara, write it with `--alethe-dialect pinned-carcara`. See LIMITATIONS.md.
 
-| Z3 | AY |
-| --- | --- |
-| `z3 -smt2 file.smt2` | `ay --z3-mode file.smt2` |
-| `z3 file.smt2` | `ay file.smt2` |
-| `z3 -in` (stdin, incremental) | `ay -in` |
-| `import z3` | `import ayz3 as z3` |
-| `Solver()`, `Optimize()`, `s.add(...)`, `s.check()`, `s.model()` | identical |
-| `(get-unsat-core)`, `(get-objectives)`, `(check-sat-assuming …)` | identical |
+Check a certificate as `carcara check -- PROOF PROBLEM`. A `let` the problem
+writes is eliminated with `:rule let`, which pinned carcara checks only in
+that invocation, never under `--expand-let-bindings`; such a certificate says
+`carcara_surface=without-let-expansion`.
 
-#### Replacing the z3 CLI
+`ay tutorial` is an interactive walkthrough if you'd rather start there.
 
-Named `z3` (a symlink is enough), AY selects its Z3-shaped transcript
-automatically; `--z3-mode` does the same under any name. Z3's common flags
-(`-in`, `-t:`, `-model`, `key=value`) are accepted, and unsupported options
-are rejected explicitly rather than ignored, so a staged migration is testable:
+## Commands
 
-```bash
-mkdir -p target/ay-z3-shim
-ln -sf "$PWD/target/release/ay" target/ay-z3-shim/z3
-PATH="$PWD/target/ay-z3-shim:$PATH" z3 -smt2 examples/quickstart.smt2
+```
+ay solve FILE      SMT-LIB 2.6, DIMACS CNF, or Horn clauses (the default)
+ay allsat          enumerate every solution of a CNF
+ay model-count     exact model counting
+ay simplify        rewrite an SMT-LIB formula
+ay check           replay a DRAT / LRAT / DPR / SR / VeriPB proof, or validate a model
+ay diagnose        investigate a suspected wrong answer
+ay maxsat          WCNF
+ay pb              pseudo-Boolean, OPB / WBO
+ay qbf             QDIMACS
+ay lp              MPS / LP
+ay flatzinc        FlatZinc / MiniZinc
+ay tutorial        interactive lessons
+ay commands        this list, grouped, from the binary itself
+ay options         AY_* environment options and their defaults
+ay help            topic pages: z3, formats, exit-codes, output
 ```
 
-#### Python
+`ay commands` prints the live list, `ay help` the topic pages, and
+`ay <command> --help` the flags. About fifteen more maintainer commands
+(benchmarks, corpora, gates, release and audit tooling) are hidden from that
+list but ship in the binary, and each answers to `ay <name> --help`. In AY's
+development tree, the development design notes maps every command, hidden ones
+included, to the crates behind it.
 
-[`ayz3`](bindings/python/README.md) implements a growing core slice of z3py
-over AY's C ABI. A migration changes the import and keeps the model code:
+`ay check veripb FORMULA PROOF` checks pseudo-Boolean certificates using AY's
+integrated checker. Incomplete conclusions, unproved assertions and weakened
+guarantees fail. A supplied output formula must be checked by an output FILE
+rule. No separate VeriPB installation is needed.
 
-```bash
-python3 -m pip install ./bindings/python
+`ay` also accepts Z3's command-line spellings (`-t:`, `-T:`, `-in`, `-model`,
+`-st`, …), so it can stand in for `z3` in an existing script. Symlinking the
+binary to `z3` turns that mode on automatically. Compatibility is partial —
+see [LIMITATIONS.md](LIMITATIONS.md).
+
+## What actually works
+
+Solid, with real algorithms and heavy test coverage:
+
+- **SAT** — a CDCL solver following CaDiCaL's design: two-watched-literal
+  propagation, 1UIP clause learning, EVSIDS/VMTF/CHB branching, Luby and
+  glue-based restarts, three-tier clause deletion, and a full preprocessing
+  suite (variable elimination, vivification, subsumption, probing, blocked
+  clause elimination, hyper-binary resolution).
+- **SMT** — DPLL(T): the SAT search above runs in lockstep with theory
+  solvers. Equality is congruence closure with proof-producing explanations;
+  linear real arithmetic is dual simplex with Farkas certificates; integers
+  add branch-and-bound with Gomory and Hermite-normal-form cuts; bitvectors
+  and floating point are bit-blasted. Arrays, datatypes and difference logic
+  are there too. Quantifiers go through E-matching, CEGQI and MBQI.
+- **MILP** — branch-and-cut. A floating-point simplex proposes a basis and an
+  exact-rational simplex re-verifies it, so floating point can cost search
+  time but cannot corrupt the answer. Sparse LU with Forrest-Tomlin updates;
+  cover, Gomory, MIR, flow-cover and clique cuts, each re-checked in exact
+  arithmetic before use.
+- **Pseudo-Boolean** — a native PB conflict-driven solver in the RoundingSat
+  style, four PB-to-CNF encodings, and VeriPB proof output.
+- **MaxSAT** — core-guided OLL/RC2 on one incremental SAT instance.
+- **Proof checking** — the DRAT and LRAT checkers are independently written,
+  not wrappers: two-watched-literal propagation, RUP and full RAT, forward and
+  backward modes, text and binary formats. (The repo does not currently ship a
+  cross-check against drat-trim — the fixtures for that live in a `reference/`
+  checkout you'd have to clone yourself, and the tests skip without it.)
+
+Known to be incomplete — these are design limits, not bugs:
+
+- **Nonlinear arithmetic** returns `unknown` on problems it can't linearize.
+  CAD projection exists but is not wired into the search.
+- **Strings** deliberately latch to `unknown` rather than risk a wrong `sat`.
+- **`ay lp`** uses a small dense simplex capped at 4096 search nodes. It is
+  sized for test fixtures. The serious MILP engine has no `ay` subcommand
+  yet; it is reached through `ay solve`'s MILP fast path, inside `ay maxsat`
+  and `ay pb`, and through the separate `ay-milp` binary
+  (`targo --unverified run -p ay-milp -- solve FILE.mps`; with stock Rust,
+  `cargo run -p ay-milp -- solve FILE.mps`).
+- **Certificates are uneven.** CNF and SMT `unsat` produce externally
+  checkable proofs. `sat` answers get model validation only. MILP emits exact
+  Farkas certificates that only AY can read, because no external checker
+  format exists. Model counting, QBF and AllSAT have no certificates at all.
+
+[LIMITATIONS.md](LIMITATIONS.md) has the details.
+
+## Layout
+
+```
+crates/          the workspace crates: ay-sat, ay-dpll, ay-theories/*, ay-milp,
+                 ay-pb-core, ay-proof, ay-chc, and the ay binary
+benchmarks/      test corpora
+examples/        small inputs to start from
+proofs/          Lean proof sources and certificate fixtures
+specs/           TLA+ models of the CDCL and PDR algorithms
+scripts/         maintainer tooling
 ```
 
-```python
-# import z3
-import ayz3 as z3
+## Status
 
-x = z3.Int("x")
-s = z3.Solver()
-s.add(x > 2, x < 7)
-assert s.check() == z3.sat
-```
+AY is 0.x and under active development. The API is not stable and there is no
+release cadence yet. The two sections above are meant to be read together: the
+first lists what has been checked against the source, the second lists what is
+known not to work. If something is in neither list, assume it is untested.
 
-#### Compiled library
+## Contributing
 
-For programs linked against Z3's C API, AY ships a native C ABI and a
-Z3-shaped C header ([`crates/ay-ffi/include/`](crates/ay-ffi/include/)), plus
-C++, Java, JavaScript/WASM, and OCaml bindings built on it
-([`bindings/`](bindings/)). Each surface exposes its tested subset and reports
-unsupported calls explicitly; `ay z3-audit` says exactly what is covered.
-
-The differential harness used in development ships too, so you can measure
-parity on your own problems against your own Z3:
-
-```bash
-# per-file: AY vs a reference Z3, with a verdict diff
-ay diagnose --reference z3 problem.smt2
-
-# the Python differential fuzzer (ayz3 vs real z3py), soundness oracle
-python3 -m ayz3_fuzz --fragment qf_lia --count 500 --seed 1
-```
-
-### Embed in Rust
-
-The native API builds terms and solves in-process, with no SMT-LIB
-serialization and no C boundary:
-
-```toml
-[dependencies]
-ay-dpll = { git = "https://github.com/alabsystems/ay.git" }
-```
-
-```rust
-use ay_dpll::api::{Logic, SolveResult, Solver, Sort};
-
-let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA");
-let x = solver.declare_const("x", Sort::Int);
-let zero = solver.int_const(0);
-let positive = solver.try_gt(x, zero).expect("integer comparison");
-solver.try_assert_term(positive).expect("Boolean assertion");
-
-let details = solver.check_sat_with_details();
-assert!(matches!(details.accept_for_consumer(), Ok(SolveResult::Sat)));
-println!("x = {:?}", solver.value(x));
-```
-
-Pin a commit in production. The complete runnable version is
-[`crates/ay-dpll/examples/native_api.rs`](crates/ay-dpll/examples/native_api.rs)
-(`cargo run -p ay-dpll --example native_api`).
-
-## Capability grid
-
-Coverage is fragment-specific. The grid names implemented paths and the
-evidence they expose.
-
-| Problem family | Entry point | Implemented surface | Evidence |
-| --- | --- | --- | --- |
-| SAT | DIMACS `.cnf` / `.dimacs` | CDCL, preprocessing/inprocessing, portfolios | Models, DRAT, LRAT, VeriPB |
-| SMT | SMT-LIB 2.6 / native API | Arithmetic, UF, BV, arrays, FP, strings/sequences, datatypes, quantifiers; incremental `push`/`pop` and assumptions; coverage varies by logic | Models, cores, Alethe, self-check |
-| CHC / Horn | SMT-LIB `HORN` | Adaptive PDR/IC3, BMC, k-induction, CEGAR, IMC, DAR, and related engines | Invariants, traces, CHC certificates |
-| OMT / MaxSMT | `minimize`, `maximize`, `assert-soft` | Linear arithmetic is the strongest path; weighted softs on a dedicated path (not jointly) | Models, objective values, LRA Farkas certificates |
-| Pseudo-Boolean | `ay pb`, OPB / WBO | Decision and optimization, linear and nonlinear | VeriPB proofs for linear `unsat` and optimality (opt-in) |
-| MaxSAT | `ay maxsat`, WCNF | Weighted and unweighted instances | Models, objective values, opt-in VeriPB certificates (`--proof`) |
-| QBF | `ay qbf`, QDIMACS | Quantified Boolean formulas | Verdict and statistics |
-| LP / MILP | `ay lp`, MPS / CPLEX LP | Continuous and mixed-integer models | Primal solutions, bounds, Farkas certificates |
-| Constraint programming | `ay flatzinc solve` | FlatZinc / MiniZinc adapter and developing global constraints | Solutions and objective values |
-| Enumeration / counting | `ay allsat`, `ay model-count` | Full/projected AllSAT; exact unweighted, weighted, and projected counting | Enumerated models or exact count |
-| Embedding | Rust, C, Python, C++, Java, JavaScript/WASM, OCaml | In-tree bindings over shared solver cores; each reports unsupported calls explicitly | Binding and differential test suites |
-| Z3 compatibility | Z3-style CLI, C header, `ayz3`, shaped bindings | Tested subset with explicit gap reporting | CLI smoke gate, differential tests, parity audit |
-
-For the build-specific list of accepted logics, proof formats, proof theories,
-and compiled features, run `ay --features`.
-
-## Novel improvements in AY
-
-The foundations — CDCL, DPLL(T), PDR/IC3, Farkas duality, branch and bound —
-come from decades of solver research. AY's contribution is how it composes
-them: recognize useful structure, select a suitable proof method, validate the
-result in the original problem's frame. These are AY implementation
-contributions, not claims that the techniques began here.
-
-- **Original-clause CHC replay.** Counterexamples are backtranslated through
-  datatype, array, bit-vector, ITE, and equality transformations, then checked
-  as a ground derivation over the original Horn clauses — search runs on a
-  transformed problem, evidence speaks about the user's. See the
-  [ground-derivation checker](crates/ay-chc/src/ground_derivation/mod.rs).
-- **Fail-closed partition rescue.** An unsupported mixed-theory conjunction
-  that separates into symbol-disjoint components is solved componentwise;
-  UNSAT follows from a component, SAT only after model merging and
-  full-formula checks. See
-  [`partition_rescue.rs`](crates/ay-dpll/src/executor/partition_rescue.rs).
-- **Exact optimization evidence.** A MILP infeasibility proof can be an
-  integer split tree with exact rational Farkas leaves, checkable against the
-  caller's model; certificate-required mode answers definitely only when the
-  bounded capture succeeds. See
-  [`tree_cert.rs`](crates/ay-milp/src/tree_cert.rs).
-- **Structure-directed exact solving.** Dedicated paths recognize algebraic
-  forms such as market-split 0/1 equalities and switch to meet-in-the-middle
-  or lattice methods, rechecking witnesses before admission. See
-  [`market_split.rs`](crates/ay-pb-core/src/optimize/market_split.rs) and
-  [`lattice.rs`](crates/ay-milp/src/lattice.rs).
-- **Proof production off the hot loop.** The PB decision solver streams
-  cutting-planes events through a bounded ring to an asynchronous VeriPB
-  serializer; backpressure, serializer failure, or incomplete draining voids
-  the certificate rather than committing partial evidence. See the
-  [proof tap](crates/ay-pb-core/src/proof/tap/mod.rs).
-- **A cooperative CHC portfolio.** Formula and graph features choose an engine
-  order, later engines reuse lemmas and hints through a shared blackboard, and
-  every accepted candidate crosses an original-problem validation firewall.
-  See the [selector](crates/ay-chc/src/portfolio/selector.rs) and
-  [acceptance gate](crates/ay-chc/src/portfolio/accept.rs).
-- **Checked code without a shadow implementation.** The
-  [Trust](https://github.com/alabsystems/trust) toolchain machine-checks
-  selected bounded kernels over the same source bytes Rust compiles, removing
-  the drift between an executable function and a proof model — for example
-  [`ay-sat-congruence-core`](crates/ay-sat-congruence-core/src/lib.rs).
-- **A checker audited before it is trusted.** The pinned VeriPB build is
-  re-proved against committed fixtures for all twenty-one confirmed
-  wrong-verdict defects of published 3.0.2 before any certified PB result is
-  admitted. See [`ci/veripb.pin`](ci/veripb.pin).
-- **Compatibility as executable evidence.** The parity tooling loads AY and Z3
-  independently, inventories symbols, isolates each corpus case in a child
-  process, and records versions, hashes, timeouts, disagreements, unknowns,
-  and crashes — measuring a named surface instead of turning one passing
-  corpus into a universal claim. See
-  [`ay-z3-parity`](crates/ay-z3-parity/src/main.rs). Its `smtlib-conformance`
-  gate pins SMT-LIB 2.7 and the exact Z3 5.1.0 overlay, then fails closed on
-  any unowned requirement, incomplete inventory, skip, unknown, or unvalidated
-  SAT model / UNSAT proof. All 18 validators across its twelve dimensions are
-  executable and fail closed — which closes the validator-implementation work,
-  not the product contract.
-
-## AY in ALab Systems
-
-AY is exercised as infrastructure by the other ALab Systems projects.
-[Trust VC](https://github.com/alabsystems/trust-vc) /
-[Trust WP](https://github.com/alabsystems/trust-wp) lower Rust contracts and
-verification conditions to SMT and retain AY's evidence for proof
-reconstruction, over typed compiler facts from
-[Trust IR](https://github.com/alabsystems/trust-ir).
-[Trust MC](https://github.com/alabsystems/trust-mc) /
-[Ty](https://github.com/alabsystems/ty) drive bounded and symbolic model
-checking with SAT, CHC/PDR, k-induction, counterexample validation, and
-LRAT-backed hardware checks. [Clean](https://github.com/alabsystems/clean)
-discharges theorem goals with AY-backed tactics and reconstructs SAT, SMT,
-arithmetic, and Farkas evidence in its proof kernel.
-[NY](https://github.com/alabsystems/ny) uses AY's in-process MILP and SMT
-escalation paths for neural-network properties, returning validated
-counterexamples and supported certificates, and
-[NN](https://github.com/alabsystems/nn) exposes partial NY/AY hooks.
-
-## Similar programs
-
-Evaluations of AY usually also consider these. Each has a different center of
-gravity:
-
-| Program | Primary focus | AY's focus |
-| --- | --- | --- |
-| [Z3](https://github.com/Z3Prover/z3) | General SMT, optimization, fixed points, tactics, widely used APIs | A Z3-shaped adoption path over a Rust-native, proof-oriented multi-solver workspace |
-| [cvc5](https://cvc5.github.io/) | Standards-oriented SMT, broad theories, proofs, synthesis | SMT plus dedicated SAT, CHC, PB, MaxSAT, QBF, counting, and LP/MILP commands |
-| [Kissat](https://github.com/arminbiere/kissat) / [CaDiCaL](https://github.com/arminbiere/cadical) | Highly tuned propositional SAT | An integrated SAT core that also feeds theories, CHC, proofs, and higher-level tools |
-| [Spacer](https://microsoft.github.io/z3guide/docs/fixedpoints/engineforpdr/) / [Golem](https://github.com/usi-verification-and-security/golem) / [Eldarica](https://github.com/uuverifiers/eldarica) | Constrained Horn clauses and invariant synthesis | An adaptive multi-engine CHC portfolio with original-problem validation before publication |
-| [SCIP](https://github.com/scipopt/scip) / [HiGHS](https://highs.dev/) / [OR-Tools](https://developers.google.com/optimization) | Mathematical optimization and constraint programming | Optimization engines shipped beside logical solving in one workspace and CLI |
-
-They are complementary reference points. AY is most distinctive when
-Z3-shaped integration, native Rust embedding, several formal problem families,
-and checkable result artifacts are wanted in the same system.
-
-## Benchmarks and competition readiness
-
-AY distinguishes an **official competition result** from a **replay on
-matched hardware** from a **laptop run** — a number never travels without its
-class. Official machine specs, budgets, scoring rules, and recent winners live
-in [`benchmarks/comparisons.toml`](benchmarks/comparisons.toml) (researched
-from the official sites, with citations): `ay bench compare list` shows the
-registry, and `ay bench compare check <id>` verifies the current host against
-the cited specs, so you learn whether a run there earns the `replay` class or
-is `laptop-only`. Competitions AY would enter but cannot yet (XCSP³, CASC,
-SyGuS) carry `status = "unsupported"`, and every *not yet* below is
-consolidated in the readiness file's **Future functionality** table.
-
-### Head to head with Z3
-
-Every cell was verified by running both solvers on concrete instances against
-**Z3 5.0.0**, the latest release (commands in
-[`benchmarks/COMPETITIONS.md`](benchmarks/COMPETITIONS.md)):
-
-| Capability | Z3 | AY |
-| --- | --- | --- |
-| SMT-LIB 2.6, incremental, models, unsat cores | ✓ | ✓ |
-| OMT (`minimize`/`maximize`) and MaxSMT (`assert-soft`) | ✓ incl. joint use | ◐ each alone; the joint combination returns `unknown` rather than a half-optimized answer |
-| CHC / fixedpoint (HORN) | ✓ | ✓ plus an inductive-invariant certificate and replay obligations |
-| Z3 tactic surface (`apply`, `check-sat-using`) | ✓ native engine | ◐ all 118 Z3 5.1.0 tactic + 42 probe names accepted with z3-style errors; `apply` runs real transforms, `check-sat-using` validates then solves with AY's engine |
-| `unsat` proofs | ◐ own format, no independent checker | ✓ Alethe + DRAT/LRAT, replayed by Carcara / drat-trim |
-| PB **certified** optimality | ✗ solves OPB, emits no certificate | ✓ VeriPB proof incl. `BOUNDS optimum optimum`, accepted by the pinned checker |
-| DIMACS SAT | ✓ | ✓ (+ DRAT/LRAT/VeriPB proofs) |
-| QDIMACS QBF / MPS LP / FlatZinc / AllSAT / model counting | ✗ | ✓ dedicated commands |
-| In-process Rust API | ◐ community FFI wrappers | ✓ native |
-| Formally verified validators | ✗ | ✓ 11 theory validators + combination firewall in Lean 4, zero `sorry` |
-
-Per-track readiness, verified by execution (the full table with evidence and
-paste-able commands is in the same file):
-
-| Competition | Ready today | Partial / not yet |
-| --- | --- | --- |
-| [SAT Competition](https://satcompetition.github.io/) | main (DRAT/LRAT verified by drat-trim), parallel (`--parallel N`), experimental | cloud (no distributed engine) |
-| [SMT-COMP](https://smt-comp.github.io/) | single-query in the entered divisions: QF_LIA/IDL, QF_LRA/RDL, QF_BV, QF_UF/AX, QF_DT, QF_ABV/AUFBV/UFBV, QF_UFLIA/AUFLIA | incremental, unsat-core, model-validation and proof-exhibition conventions work but are entered narrowly or not at all; quantified, FP/strings, nonlinear solve but are not entered; QF_UFLIA was withdrawn 2026-06-15 over a confirmed false-SAT and re-added 2026-07-28 once the fix was proven |
-| [CHC-COMP](https://chc-comp.github.io/) | LIA lin/nonlin (± arrays), ADT-LIA (± arrays), LRA-Lin, BV-Lin — with certificates | BV-Nonlin (honest `unknown` on a hard case) |
-| [PB Competition](https://www.cril.univ-artois.fr/PB26/) | DEC/OPT linear **and nonlinear**, WBO, and the **certified** DEC-LIN-CERT / OPT-LIN-CERT tracks (VeriPB, incl. optimality) | `ay pb solve --proof` refuses WBO and nonlinear rather than emit an uncertified answer |
-| [MaxSAT Evaluation](https://maxsat-evaluations.github.io/2024/) | exact weighted + unweighted, both wcnf formats; anytime via `--timeout` | certified (VeriPB certificates emit and check, but the lower bound is not always derivable, so optimality is not always proven), IPAMIR incremental, external-SIGTERM anytime |
-| [QBF Gallery](https://qbf.pages.sai.jku.at/gallery/) | PCNF, 2QBF (QDIMACS, right exit codes) | QCIR, DQBF, certificates |
-| [Model Counting Comp.](https://mccompetition.org/) | mc, wmc, pmc, pwmc, amc-complex — exact, competition output conventions | — |
-| [MiniZinc Challenge](https://www.minizinc.org/challenge/) | free class (CP+SMT portfolio, correct separators, proves optima) | fixed class prints `==========` after one satisfy solution; open class needs manual descriptor registration and has four native globals; parallel (CP satisfaction only), local search, floats |
-| [MIPLIB](https://miplib.zib.de/) | plain `.mps` LP/MIP to proven OPTIMAL | `.mps.gz` |
-
-AY has not yet entered these competitions; official scorecards will be linked
-here as result packets exist. Each packet identifies the AY commit and binary,
-reference-solver version, corpus revision, host and run class, budgets, proof
-mode, checker verdicts, solved and wrong/invalid counts, and scoring rule.
-
-### Generate the stats yourself
-
-Every number AY states about itself is reproducible from the shipped tree
-(each command is tested; `ay bench` needs a `--features bench` build):
-
-```bash
-ay --features                    # 57 accepted SMT logics (some conditional), 4 proof formats, 12 proof theories
-ay z3-audit --scope cli-subset --inventory-only --summary-json audit.json
-ay verifier-audit --consumer all --json surfaces.json  # 13 surfaces: 11 READY, 2 tracked gaps
-ay diagnose --reference z3 examples/quickstart_unsat.smt2
-ay tool list                     # external checkers/solvers registry + install state
-ay scripts list                  # every maintained script, indexed and grouped
-ay corpus list                   # managed corpora with provenance/status
-ay corpus campaign-audit         # exact 2025/26 track-to-asset/profile join
-ay bench campaign plan --profile reviewer-full  # one disposition for every track
-ay bench compare list            # the competition registry: specs, budgets, winners
-ay bench compare check <id>      # preflight on THIS host: replay-eligible or laptop-only
-cd bindings/python && python3 -m ayz3_fuzz --fragment qf_lia --count 500 --seed 1
-cd verification/lean && lake build   # the verified validators: 43 jobs, zero sorry
-```
-
-Reproduce a comparison locally (requires Z3 plus `curl`, `tar`, and `zstd`):
-
-```bash
-cargo build --release --locked -p ay --features bench --bin ay
-AY=./target/release/ay; Z3="$(command -v z3)"
-
-# The small suite shipped in the checkout.
-$AY bench run smt-local-suite --ay $AY --reference-solver "$Z3" \
-  --timeout 30 --runs 3 --output ay-vs-z3-local.json
-
-# One official SMT-LIB snapshot, fetched then compared.
-scripts/download_smtcomp_benchmarks.sh --logic QF_BV
-$AY bench run smt-smtcomp-qf-bv --ay $AY --reference-solver "$Z3" \
-  --output ay-vs-z3-qf-bv.json
-
-# Every eligible lane, after the corpus acquisition recipe below.
-$AY bench campaign run --profile reviewer-full --require-installed \
-  --output evals/results/campaign/reviewer-full.json
-```
-
-The scorecard reports solved, unknown, timeout, mismatch, and timing data, so
-a wrong answer stays visible instead of being averaged into a speed number.
-See [`benchmarks/README.md`](benchmarks/README.md) for the corpus manager and
-evaluation workflow.
-
-## Roadmap
-
-Ordered by evidence:
-
-1. **Publish a dependable 0.x distribution.** Reproducible source builds,
-   multi-platform CI, signed release artifacts, package-manager installation,
-   public benchmark packets.
-2. **Reach Z3 parity.** Close the remaining SMT-LIB, CLI, tactic, C API,
-   binding, incremental, model, proof, and CHC gaps until the full-replacement
-   gate passes.
-3. **Deepen completeness and performance.** Arrays with arithmetic, strings
-   and sequences, nonlinear and mixed arithmetic, quantifiers, large-theory
-   combination, CHC invariant synthesis, specialist-grade SAT/optimization
-   performance.
-4. **Expand independently checkable evidence.** Broaden end-to-end Alethe and
-   certificate replay, reduce residual trusted steps, make the MaxSAT
-   certificate's lower bound always derivable, and add a QBF proof format.
-5. **Compete in public.** Turn local replays into reproducible official
-   SAT/SMT/CHC/PB/MaxSAT/counting/MiniZinc submissions and publish every
-   result, losses and invalid outputs included.
-6. **Improve the embedding story.** Stabilize the Rust API, finish the
-   Z3-compatible surfaces, broaden language bindings, ship native and WASM
-   packages that work without a source checkout.
-
-The 1.0 bar is a stable, distributable solver whose compatibility,
-correctness, and performance claims survive its own audits and independent
-checkers.
-
-<details>
-<summary><strong>Repository layout and corpus management</strong></summary>
-
-## Repository layout
-
-AY is a Cargo workspace with these boundaries:
-
-| Path | Purpose |
-| --- | --- |
-| `crates/ay` | Unified command-line solver. |
-| `crates/ay-sat` | CDCL SAT engine and proof generation. |
-| `crates/ay-dpll` | DPLL(T) execution and SMT orchestration. |
-| `crates/ay-theories/` | Arithmetic, UF, BV, arrays, strings, FP, datatype, and related theory solvers. |
-| `crates/ay-chc` | CHC portfolio and certificate surfaces. |
-| `crates/ay-pb`, `ay-maxsat`, `ay-qbf`, `ay-count` | Discrete optimization and counting engines. |
-| `crates/ay-lp`, `ay-milp`, `ay-cp` | LP/MILP and constraint-programming paths. |
-| `crates/ay-search` | Typed finite-domain search, enumeration, optimization, portable SearchSpec v1. |
-| `crates/ay-bindings`, `crates/ay-ffi` | Typed Rust API and native/Z3-shaped interfaces. |
-| `bindings/` | Python, C++, Java, JavaScript/WASM, and OCaml adapters. |
-| `benchmarks/`, `evals/` | Fixtures, corpus metadata, reproducible evaluation definitions. |
-| `proofs/`, `verification/` | Proof fixtures and formal verification material, including the Lean 4 `AySoundness` project under `verification/lean`. |
-| `ci/` | Pinned external-checker identity and the gates built on it. |
-
-Large competition corpora are fetched on demand rather than committed. `ay
-corpus list` prints the catalog from
-[`benchmarks/corpora.toml`](benchmarks/corpora.toml):
-
-```bash
-# The 2025/26 campaign: plan is read-only, verify checks pinned hashes.
-GROUPS="--group competition-2025-2026 \
-        --group competition-2025-2026-competitors \
-        --group competition-2025-2026-external"
-ay corpus plan $GROUPS && ay corpus download $GROUPS && ay corpus verify $GROUPS
-ay corpus campaign-audit --require-installed
-
-# Or one corpus at a time.
-ay corpus download satcomp2024-sample
-ay corpus download chc-comp-2025-benchmarks
-```
-
-</details>
-
-## Developing and contributing
-
-Start with the narrowest check that covers a change, then broaden it:
-
-```bash
-cargo check --workspace --all-targets
-cargo test -p ay-sat
-cargo test -p ay-dpll
-cargo check -p ay --features cli
-```
-
-Check solver changes against a reference solver and, where possible, a proof
-or model checker. Benchmark evidence must carry provenance and wrong/invalid
-counts, not only speed.
-
-Contribution basics are in [`CONTRIBUTING.md`](CONTRIBUTING.md); known
-boundaries in [`LIMITATIONS.md`](LIMITATIONS.md); help and issue reporting in
-[`SUPPORT.md`](SUPPORT.md); private vulnerability reports in
-[`SECURITY.md`](SECURITY.md); community expectations in
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
-
-## Maintainer commands
-
-AY ships the machinery that gates its own releases, using a checked-in local
-publication process rather than hosted GitHub Actions. These commands are in
-every build but kept out of the default `ay --help` so the everyday verb set
-stays small; anyone can inspect and run what a release must pass:
-
-| Command | What it does |
-| --- | --- |
-| `ay gate` / `ay launch-gate` | The checked-in solver, publication, and release-readiness gates |
-| `ay release` / `ay launch-packet` | Generate and verify release evidence and benchmark-packet metadata |
-| `ay z3-audit` | Audit the measured Z3-compatibility surface |
-| `ay verifier-audit` | Audit AY as the SMT backend for Creusot / Why3 / Verus |
-| `ay submission` / `ay competition-jit` | Competition submission skeletons; matrix, gate, and ROI tooling |
-| `ay bisect` | Localize a soundness bug by bisecting feature flags |
-
-Run `ay <command> --help` for any of them.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE). AY was created by Andrew Yates.
-Vendored tools under `third_party/` and reference material under `reference/`
-keep their own licenses, recorded in [`THIRD_PARTY.md`](THIRD_PARTY.md);
-benchmark instance files under `benchmarks/` are third-party data under their
-own terms.
+Apache-2.0. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).

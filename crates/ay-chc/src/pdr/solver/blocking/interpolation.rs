@@ -4,6 +4,7 @@
 
 use super::bool_normalization::normalize_bool_to_int;
 use super::*;
+use crate::interpolation::stats;
 use crate::pdr::solver::core;
 use crate::pdr::solver::{
     compute_interpolant, compute_interpolant_from_lia_farkas,
@@ -27,6 +28,7 @@ impl PdrSolver {
         transition_constraints: Vec<ChcExpr>,
         clause_interpolation_data: Vec<ClauseInterpolationData>,
     ) -> InterpolationResult {
+        let _engine_tag = stats::ScopedEngineTag::install(stats::EngineTag::Pdr);
         if self.config.verbose {
             safe_eprintln!(
                 "PDR: Step 3 - transition_constraints.len()={}, use_interpolation={}",
@@ -52,15 +54,24 @@ impl PdrSolver {
                 None
             };
 
-            let transition_constraints: Vec<ChcExpr> = transition_constraints
+            // One entry per UNSAT clause (`reachability/mod.rs`,
+            // `single_body.rs`): keep that structure for the per-clause stage 1
+            // below. The flattened list is unchanged for the other stages.
+            let per_clause_raw_vars: Vec<FxHashSet<String>> = transition_constraints
+                .iter()
+                .map(|c| c.vars().into_iter().map(|v| v.name).collect())
+                .collect();
+            let per_clause: Vec<Vec<ChcExpr>> = transition_constraints
                 .into_iter()
                 .map(|c| {
                     c.propagate_constants()
                         .simplify_linear_equalities()
                         .simplify_constants()
+                        .collect_conjuncts()
                 })
-                .flat_map(|c| c.collect_conjuncts())
                 .collect();
+            let transition_constraints: Vec<ChcExpr> =
+                per_clause.iter().flatten().cloned().collect();
 
             let bad_state_constraints = pob.state.collect_conjuncts();
 
@@ -202,7 +213,41 @@ impl PdrSolver {
                         });
                     }
                 }
-                let interpolant_result = if skip_conjunctive {
+                // Workstream D ladder fix (DESIGN_lra_interp_tpa.md §4.1): a
+                // lemma for a predicate defined by clauses c1..cn needs
+                // `A_ci ⊨ L` for EVERY clause, so with two or more UNSAT
+                // clauses stage 1 interpolates each clause separately and
+                // serves `∨_c I_c` (∨ A_c ⊨ ∨ I_c; each I_c ∧ B is UNSAT). The
+                // conjunctive call certified only `∧_c A_c ⊨ I`, which is
+                // weaker, and was skipped whenever that conjunction was UNSAT.
+                //
+                // Real/mixed problems only, until an LIA A/B (the same wiring
+                // rule the design applies to k→1, D-6/INV-8): on the pure-LIA
+                // embedded benchmark s_multipl_12 the per-clause lemmas slowed
+                // PDR from a 73 s pass to a > 120 s timeout (group_pdr), and
+                // the aligned binary solves it in 24 s where this path did not
+                // within 30 s. Keyed on Real-sorted predicate arguments, not on
+                // "not integer arithmetic": that also enabled it on datatype,
+                // array and UF problems, and PDR lost `chc_dt_option_enum`
+                // (Int + datatype, group_pdr) to it.
+                let ladder_fix = self.problem.has_real_sorts();
+                let interpolant_result = if ladder_fix && per_clause.len() >= 2 {
+                    stats::record_ladder("stage1_per_clause_attempt");
+                    let result = per_clause_interpolant(
+                        &per_clause,
+                        &per_clause_raw_vars,
+                        has_bool_normalization,
+                        interp_b,
+                        &b_vars,
+                        &canonical_names,
+                    );
+                    stats::record_ladder(match result {
+                        InterpolatingSatResult::Unsat(_) => "stage1_per_clause_served",
+                        InterpolatingSatResult::Unknown => "stage1_per_clause_failed",
+                    });
+                    result
+                } else if skip_conjunctive {
+                    stats::record_ladder("stage1_skipped_conjunction_unsat");
                     InterpolatingSatResult::Unknown
                 } else {
                     interpolating_sat_constraints(interp_a, interp_b, &shared_vars)
@@ -293,7 +338,15 @@ impl PdrSolver {
                                 .iter()
                                 .flat_map(|d| d.farkas_conflicts.iter().cloned())
                                 .collect();
+                            // Stage 3 reads `TermId`s of `self.smt`; on non-integer
+                            // problems the skip probe above ran through
+                            // `check_sat_via_executor_backend`, which RESETS
+                            // `self.smt` first (`pdr/solver/mod.rs`), so those ids
+                            // are stale. Skip the stage there (Workstream D).
                             let precomputed_result = if all_clause_farkas.is_empty() {
+                                None
+                            } else if !self.problem_is_integer_arithmetic {
+                                stats::record_ladder("stage3_skipped_non_integer");
                                 None
                             } else {
                                 if self.config.is_lia_farkas_profile() {
@@ -354,9 +407,18 @@ impl PdrSolver {
                                     if self.config.is_lia_farkas_profile() {
                                         self.telemetry.lia_farkas_templates.record_farkas_check();
                                     }
-                                    if let Some(interpolant) =
+                                    // Stage 5 validates `A ⊨ I` on the same `∧A`;
+                                    // when the skip probe found it UNSAT that check
+                                    // is vacuous (`farkas/interpolant.rs` accepts
+                                    // any `¬b_i`), so the stage is skipped (Real/
+                                    // mixed problems, as the per-clause stage 1).
+                                    let syntactic = if skip_conjunctive && ladder_fix {
+                                        stats::record_ladder("stage5_skipped_vacuous_a");
+                                        None
+                                    } else {
                                         compute_interpolant(interp_a, interp_b, &shared_vars)
-                                    {
+                                    };
+                                    if let Some(interpolant) = syntactic {
                                         self.telemetry
                                             .interpolation_stats
                                             .syntactic_farkas_successes += 1;
@@ -514,6 +576,48 @@ impl PdrSolver {
     }
 }
 
+/// Stage 1 for a POB blocked by two or more UNSAT clauses: one cascade call
+/// per clause `c` on `(A_c, B)` with `shared_c = vars(A_c) ∩ vars(B) ∩
+/// canonical`, served as `∨_c I_c`. A clause whose `A_c` is itself
+/// unsatisfiable (the cascade validated `I_c = false`, i.e. `A_c ⊨ false`)
+/// contributes no disjunct. Any other failure, or a trivial `true` disjunct,
+/// fails the stage (the ladder continues).
+fn per_clause_interpolant(
+    per_clause: &[Vec<ChcExpr>],
+    per_clause_raw_vars: &[FxHashSet<String>],
+    has_bool_normalization: bool,
+    interp_b: &[ChcExpr],
+    b_vars: &FxHashSet<String>,
+    canonical_names: &FxHashSet<String>,
+) -> InterpolatingSatResult {
+    let mut disjuncts = Vec::with_capacity(per_clause.len());
+    for (clause, raw_vars) in per_clause.iter().zip(per_clause_raw_vars) {
+        let normalized;
+        let a_c: &[ChcExpr] = if has_bool_normalization {
+            normalized = normalize_bool_to_int(clause).0;
+            &normalized
+        } else {
+            clause
+        };
+        let shared_c: FxHashSet<String> = a_c
+            .iter()
+            .flat_map(ChcExpr::vars)
+            .map(|v| v.name)
+            .chain(raw_vars.iter().cloned())
+            .filter(|v| b_vars.contains(v) && canonical_names.contains(v))
+            .collect();
+        match interpolating_sat_constraints(a_c, interp_b, &shared_c) {
+            InterpolatingSatResult::Unsat(ChcExpr::Bool(false)) => {}
+            InterpolatingSatResult::Unsat(ChcExpr::Bool(true))
+            | InterpolatingSatResult::Unknown => {
+                return InterpolatingSatResult::Unknown;
+            }
+            InterpolatingSatResult::Unsat(interpolant) => disjuncts.push(interpolant),
+        }
+    }
+    InterpolatingSatResult::Unsat(ChcExpr::or_all(disjuncts))
+}
+
 fn has_ite_term(expr: &ChcExpr) -> bool {
     match expr {
         ChcExpr::Op(ChcOp::Ite, _) => true,
@@ -521,3 +625,8 @@ fn has_ite_term(expr: &ChcExpr) -> bool {
         _ => false,
     }
 }
+
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[cfg(test)]
+#[path = "interpolation_tests.rs"]
+mod tests;

@@ -466,6 +466,7 @@ fn test_cross_theory_euf_lia_conflict_split() {
     "#;
 
     let (exec, proof_text, quality) = run_unsat_proof(input);
+    assert_last_unsat_proof_is_strict(&exec);
     assert_eq!(
         quality.trust_count, 0,
         "cross-theory EUF+LIA conflict should be trust-free: {quality:?}\n{proof_text}"
@@ -483,23 +484,48 @@ fn test_cross_theory_euf_lia_conflict_split() {
         !proof_text.contains(":rule hole"),
         "no step of this refutation may be degraded to a hole:\n{proof_text}"
     );
-    // EXACT WIRE TEXT. `(> (f b) 5)` is confined to its authored assume, then
-    // a checked `comp_simplify` bridge derives AY's canonical `(< 5 (f b))`.
-    // The Farkas step consumes that canonical unit and carries the exact
-    // checked coefficient vector. Pinning both steps prevents either an
-    // unbridged source rewrite or a coefficient-free/holey arithmetic leaf.
-    assert!(
-        proof_text.contains("(assume t2.a (> (f b) 5))")
-            && proof_text.contains(
-                "(step t2.n (cl (= (> (f b) 5) (< 5 (f b)))) :rule trans :premises (t2.n.s0 t2.n.s1))"
-            )
-            && proof_text.contains(
-                "(step t2 (cl (< 5 (f b))) :rule resolution :premises (t2.e t2.n t2.a))"
-            )
-            && proof_text
-                .contains("(cl (not (= 5 (f b))) (not (< 5 (f b)))) :rule la_generic :args (1 1)"),
-        "the authored comparison must bridge to the canonical Farkas row with \
-         its checked coefficients:\n{proof_text}"
+    // Bind the authored comparison and every bridge premise by its emitted
+    // identifier. Congruence can add an earlier lemma, so its step number is
+    // not part of the arithmetic/source contract.
+    let comparison_assumptions: Vec<&str> = proof_text
+        .lines()
+        .filter_map(|line| {
+            let (id, formula) = line.strip_prefix("(assume ")?.split_once(' ')?;
+            (formula == "(> (f b) 5))").then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        comparison_assumptions.len(),
+        1,
+        "the original comparison must be assumed exactly once:\n{proof_text}"
     );
-    assert_last_unsat_proof_is_strict(&exec);
+    let unit = comparison_assumptions[0]
+        .strip_suffix(".a")
+        .expect("the authored comparison has a derived canonical unit");
+    let bridge = [
+        format!("(step {unit}.n.s0 (cl (= (> (f b) 5) (not (<= (f b) 5)))) :rule comp_simplify)"),
+        format!("(step {unit}.n.s1 (cl (= (not (<= (f b) 5)) (< 5 (f b)))) :rule comp_simplify)"),
+        format!("(step {unit}.n (cl (= (> (f b) 5) (< 5 (f b)))) :rule trans :premises ({unit}.n.s0 {unit}.n.s1))"),
+        format!("(step {unit}.e (cl (not (= (> (f b) 5) (< 5 (f b)))) (not (> (f b) 5)) (< 5 (f b))) :rule equiv_pos2)"),
+        format!("(step {unit} (cl (< 5 (f b))) :rule resolution :premises ({unit}.e {unit}.n {unit}.a))"),
+    ];
+    assert!(
+        bridge
+            .iter()
+            .all(|step| proof_text.lines().any(|line| line == step.as_str())),
+        "the authored comparison must have the complete checked canonical bridge:\n{proof_text}"
+    );
+    // Both graph shapes carry an exact checked clause/coefficient relation:
+    // f(b)=5 with f(b)>5, or f(a)=5 with f(b)>5 and f(a)=f(b).
+    // Keep the signed vector, all premises, and their order coupled.
+    let checked_farkas_rows = [
+        "(cl (not (= 5 (f b))) (not (< 5 (f b)))) :rule la_generic :args (1 1)",
+        "(cl (not (= (f a) 5)) (not (< 5 (f b))) (not (= (f a) (f b)))) :rule la_generic :args (-1 1 1)",
+    ];
+    assert!(
+        checked_farkas_rows
+            .iter()
+            .any(|row| proof_text.contains(*row)),
+        "the canonical Farkas clause must carry its exact checked coefficients:\n{proof_text}"
+    );
 }

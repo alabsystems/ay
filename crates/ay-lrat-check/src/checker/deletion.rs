@@ -31,6 +31,14 @@ impl LratChecker {
     ///
     /// Uses the `marks` scratch array for O(n) mark-and-check.
     /// Callers: `delete_verified`, `weaken`, `finalize_clause`.
+    ///
+    /// `marks` already covers every stored literal: `add_original` admits
+    /// only variables below `num_vars` (whose `2 * num_vars` slots the
+    /// constructor allocates) and every other insertion first passes
+    /// `check_tautological`, which grows `marks` for each literal. A provided
+    /// literal beyond `marks` therefore cannot equal any stored literal, so
+    /// it is left unmarked instead of growing the array to its index, which
+    /// on the public API could be as large as 2^32.
     fn verify_content(
         &mut self,
         clause_id: u64,
@@ -39,34 +47,37 @@ impl LratChecker {
         op_name: &str,
         exact_length: bool,
     ) -> bool {
-        // Ensure marks array is large enough.
-        for &lit in provided_lits {
-            let idx = lit.index();
-            if idx >= self.marks.len() {
-                self.marks.resize(idx + 1, false);
-            }
-        }
         // Phase 1: Mark all provided literals.
         for &lit in provided_lits {
-            self.marks[lit.index()] = true;
+            if let Some(mark) = self.marks.get_mut(lit.index()) {
+                *mark = true;
+            }
         }
         // Phase 2: Verify every stored literal is marked.
-        // Index-based iteration avoids borrow on clause_arena conflicting
-        // with mutable access to marks during cleanup.
         let start = entry.start as usize;
         let end = start + entry.len as usize;
         let mut ok = true;
-        for i in start..end {
-            let lit = self.clause_arena[i];
-            let idx = lit.index();
-            if idx >= self.marks.len() || !self.marks[idx] {
+        match self.clause_arena.get(start..end) {
+            Some(stored) => {
+                for &lit in stored {
+                    if self.marks.get(lit.index()) != Some(&true) {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "LRAT FAIL: {op_name} of clause {clause_id} content mismatch: \
+                             stored literal {lit} not in provided literals"
+                        );
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            None => {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "LRAT FAIL: {op_name} of clause {clause_id} content mismatch: \
-                     stored literal {lit} not in provided literals"
+                    "LRAT FAIL: {op_name} of clause {clause_id}: stored range \
+                     {start}..{end} lies outside the clause arena"
                 );
                 ok = false;
-                break;
             }
         }
         // Also check length for bidirectional completeness (when required).
@@ -116,9 +127,9 @@ impl LratChecker {
             return false;
         }
         if let Some(entry) = self.clause_index.remove(&clause_id) {
-            self.stats.deleted += 1;
+            self.stats.deleted = self.stats.deleted.saturating_add(1);
             if entry.original {
-                self.stats.deleted_originals += 1;
+                self.stats.deleted_originals = self.stats.deleted_originals.saturating_add(1);
             }
             // Compact arena when dead space exceeds live data size (#8624).
             self.maybe_compact_arena();
@@ -155,9 +166,9 @@ impl LratChecker {
             return false;
         }
         self.clause_index.remove(&clause_id);
-        self.stats.deleted += 1;
+        self.stats.deleted = self.stats.deleted.saturating_add(1);
         if entry.original {
-            self.stats.deleted_originals += 1;
+            self.stats.deleted_originals = self.stats.deleted_originals.saturating_add(1);
         }
         // Compact arena when dead space exceeds live data size (#8624).
         self.maybe_compact_arena();
@@ -199,17 +210,26 @@ impl LratChecker {
         // Save sorted content + original + tautological flags (CaDiCaL lratchecker.cpp:715).
         let start = entry.start as usize;
         let end = start + entry.len as usize;
-        let mut saved: Vec<Literal> = self.clause_arena[start..end].to_vec();
+        let Some(stored) = self.clause_arena.get(start..end) else {
+            // `verify_content` above already refuses such an entry.
+            let _ = writeln!(
+                std::io::stderr(),
+                "LRAT FAIL: weaken of clause {clause_id}: stored range lies outside the clause arena"
+            );
+            self.record_failure();
+            return false;
+        };
+        let mut saved: Vec<Literal> = stored.to_vec();
         saved.sort_by_key(|l| l.index());
         self.weakened_clauses
             .insert(clause_id, (saved, entry.original, entry.tautological));
         // Remove from active set (= CaDiCaL weaken_plus delete step).
         self.clause_index.remove(&clause_id);
-        self.stats.deleted += 1;
+        self.stats.deleted = self.stats.deleted.saturating_add(1);
         if entry.original {
-            self.stats.deleted_originals += 1;
+            self.stats.deleted_originals = self.stats.deleted_originals.saturating_add(1);
         }
-        self.stats.weakened += 1;
+        self.stats.weakened = self.stats.weakened.saturating_add(1);
         // Compact arena when dead space exceeds live data size (#8624).
         self.maybe_compact_arena();
         true
@@ -276,7 +296,7 @@ impl LratChecker {
             self.record_failure();
             return false;
         }
-        self.stats.restored += 1;
+        self.stats.restored = self.stats.restored.saturating_add(1);
         // Undo the deleted_originals increment from weaken() when the clause
         // was originally an original. Keeps finalization coverage correct.
         if was_original && self.stats.deleted_originals > 0 {
@@ -310,7 +330,7 @@ impl LratChecker {
         }
         // CaDiCaL only counts original clauses in finalization coverage.
         if entry.original {
-            self.stats.finalized += 1;
+            self.stats.finalized = self.stats.finalized.saturating_add(1);
         }
         true
     }

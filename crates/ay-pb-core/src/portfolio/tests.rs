@@ -3529,6 +3529,15 @@ fn planted_primal_spec(
 /// incumbent is collected (sanitize-gated) into the final answer.
 #[test]
 fn test_backfill_spawns_tail_spec_and_collects_planted_incumbent() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "test_backfill_spawns_tail_spec_and_collects_planted_incumbent",
+    )
+    .expect("isolated resource case")
+    {
+        return;
+    }
+    let _compute = ay_sys::compute_budget::ComputeScope::enter().expect("coordinator unit");
     let instance = worker_split_instance();
     let objective = instance.objective.clone().expect("fixture has objective");
 
@@ -3591,6 +3600,118 @@ fn test_backfill_spawns_tail_spec_and_collects_planted_incumbent() {
         backfill.queue.is_empty() && backfill.ctx.is_none(),
         "an exhausted queue must drop the held channel sender"
     );
+}
+
+#[test]
+fn test_backfill_waits_for_actual_worker_unit_after_finished_message() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "test_backfill_waits_for_actual_worker_unit_after_finished_message",
+    )
+    .expect("isolated resource case")
+    {
+        return;
+    }
+    let compute = ay_sys::compute_budget::ComputeScope::enter().expect("coordinator");
+    let worker_unit = compute
+        .try_extra()
+        .expect("probe")
+        .expect("native worker capacity");
+    let mut retained = Vec::new();
+    while let Some(unit) = compute.try_extra().expect("probe") {
+        retained.push(unit);
+    }
+    let instance = worker_split_instance();
+    let (tx, rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker_tx = tx.clone();
+    let worker = std::thread::spawn(move || {
+        worker_unit
+            .run(move || {
+                worker_tx
+                    .send(WorkerMsg::Finished {
+                        label: "sls-primal-opt",
+                    })
+                    .expect("finished");
+                release_rx.recv().expect("retained worker released");
+            })
+            .expect("worker computation");
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("finished message"),
+        WorkerMsg::Finished {
+            label: "sls-primal-opt"
+        }
+    ));
+    let mut controls = WorkerStopControls::default();
+    controls.register("sls-primal-opt");
+    assert!(controls.try_count("sls-primal-opt"));
+    assert_eq!(controls.active(), 0, "logical completion arrived first");
+    let mut backfill = backfill_with_specs(
+        vec![planted_primal_spec("sls-ddfw-opt", 1, vec![true, false])],
+        &instance,
+        tx,
+        1,
+    );
+    backfill.memory_pressured = || false;
+    let term = AtomicBool::new(false);
+    backfill.try_backfill(&mut controls, &term, None);
+    assert_eq!(
+        controls.spawned(),
+        1,
+        "Finished did not return the actual unit"
+    );
+    assert_eq!(backfill.queue.len(), 1);
+    assert!(backfill.ctx.is_some());
+    release_tx.send(()).expect("release actual work");
+    worker.join().expect("actual worker closure exited");
+    backfill.try_backfill(&mut controls, &term, None);
+    assert_eq!(controls.spawned(), 2);
+    assert!(backfill.queue.is_empty());
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("new actual worker"),
+        WorkerMsg::Improvement("sls-ddfw-opt", 1, _)
+    ));
+    for handle in controls.handles.into_iter().flatten() {
+        handle.join().expect("backfilled worker exited");
+    }
+    drop(retained);
+}
+
+#[test]
+fn test_parallel_pools_use_sequential_work_when_other_units_are_retained() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "test_parallel_pools_use_sequential_work_when_other_units_are_retained",
+    )
+    .expect("isolated resource case")
+    {
+        return;
+    }
+    let compute = ay_sys::compute_budget::ComputeScope::enter().expect("caller");
+    let mut retained = Vec::new();
+    while let Some(unit) = compute.try_extra().expect("probe") {
+        retained.push(unit);
+    }
+    let instance =
+        parse_opb("* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n").expect("decision fixture");
+    let answer = solve_decision_par(&instance, 8);
+    assert_eq!(answer.status, PbStatus::Satisfiable);
+    assert!(verify_all_constraints(
+        &instance.constraints,
+        &answer.assignment
+    ));
+    let instance = worker_split_instance();
+    let objective = instance.objective.clone().expect("objective");
+    let answer = solve_opt_par(&instance, &objective, 8);
+    assert_eq!(answer.status, PbStatus::OptimumFound);
+    assert_eq!(answer.objective, Some(1));
+    assert!(verify_all_constraints(
+        &instance.constraints,
+        &answer.assignment
+    ));
 }
 
 /// LIVENESS: a worker whose thread dies WITHOUT sending its completion
@@ -3756,6 +3877,15 @@ fn test_backfill_admissible_fail_closed_on_every_input() {
 /// held sender dropped).
 #[test]
 fn test_backfill_respects_memory_pressure_deadline_and_budget() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "test_backfill_respects_memory_pressure_deadline_and_budget",
+    )
+    .expect("isolated resource case")
+    {
+        return;
+    }
+    let _compute = ay_sys::compute_budget::ComputeScope::enter().expect("coordinator unit");
     let instance = worker_split_instance();
     let outer_term = AtomicBool::new(false);
     let far_deadline = Some(Instant::now() + Duration::from_mins(1));
@@ -3852,6 +3982,15 @@ fn test_backfill_respects_memory_pressure_deadline_and_budget() {
 /// one `try_backfill` call, and `disable` (the post-shed state) is permanent.
 #[test]
 fn test_shed_order_accounts_for_backfilled_workers() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "test_shed_order_accounts_for_backfilled_workers",
+    )
+    .expect("isolated resource case")
+    {
+        return;
+    }
+    let _compute = ay_sys::compute_budget::ComputeScope::enter().expect("coordinator unit");
     let instance = worker_split_instance();
     let (tx, _rx) = mpsc::channel();
     let outer_term = AtomicBool::new(false);
@@ -5519,12 +5658,11 @@ fn graph_seed_merge_recovers_seed_when_strategy_unknown() {
     assert_eq!(merged.status, PbStatus::Unknown);
 }
 
-// ── Optimality-upgrade gate soundness (Trust/Kani-mirrored) ──────────────
+// ── Optimality-upgrade gate soundness ────────────────────────────────────
 // The post-solve gate upgrades SATISFIABLE -> OPTIMUM only when a feasible
-// incumbent's value V <= a sound lower bound F. These tests + the Kani
-// harness `kani_optimality_upgrade::*` prove the gate never declares a
-// suboptimal incumbent optimal (a false OPTIMUM => category DQ). See
-// proofs/2026-06-16-pb-trust-soundness-harnesses.md.
+// incumbent's value V <= a sound lower bound F. These tests check that the gate
+// never declares a suboptimal incumbent optimal (a false OPTIMUM => category
+// DQ): hand-picked instances, then every small two-variable covering instance.
 
 fn gate_pos(var: u32) -> PbLit {
     PbLit {
@@ -5654,6 +5792,25 @@ fn gate_soundness_adversarial_loose_floor() {
         "suboptimal incumbent must exceed floor so the gate stays closed"
     );
     assert_gate_sound(&cs, &obj);
+}
+
+/// Every instance `min c1*x1 + c2*x2 s.t. a1*x1 + a2*x2 >= rhs` with
+/// `c in 1..=3`, `a in 0..=3`, `rhs in 1..=3` (432 instances): the structural
+/// floor never overshoots the optimum, and the gate fires only on an optimal
+/// incumbent.
+#[test]
+fn gate_soundness_all_small_two_variable_covers() {
+    for c1 in 1..=3 {
+        for c2 in 1..=3 {
+            for a1 in 0..=3 {
+                for a2 in 0..=3 {
+                    for rhs in 1..=3 {
+                        assert_gate_sound(&[gate_ge_row(a1, a2, rhs)], &gate_obj2(c1, c2));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

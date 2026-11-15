@@ -193,6 +193,12 @@ fn insert_dimacs_simplification_techniques(context: &mut DimacsStructuredStatist
     stats.insert("sat.cong_rounds", congruence.rounds);
     stats.insert("sat.cong_equivs", congruence.equivalences_found);
     stats.insert("sat.cong_lits_rwt", congruence.literals_rewritten);
+    stats.insert("sat.cong_non_rup_equivs", congruence.non_rup_equivalences);
+    stats.insert("sat.cong_xor_ladders", congruence.xor_ladders_emitted);
+    stats.insert(
+        "sat.cong_xor_ladder_failures",
+        congruence.xor_ladder_failures,
+    );
     let sweep = solver.sweep_stats();
     stats.insert("sat.sweep_rounds", sweep.rounds);
     stats.insert("sat.sweep_lits_rwt", sweep.literals_rewritten);
@@ -200,6 +206,9 @@ fn insert_dimacs_simplification_techniques(context: &mut DimacsStructuredStatist
     stats.insert("sat.sweep_environments", sweep.kitten_environments);
     stats.insert("sat.sweep_backbone", sweep.kitten_backbone);
     stats.insert("sat.sweep_clauses_rwt", sweep.clauses_rewritten);
+    stats.insert("sat.sweep_completed_passes", sweep.completed_passes);
+    stats.insert("sat.sweep_kitten_solves", sweep.kitten_solves);
+    stats.insert("sat.sweep_kitten_propagations", sweep.kitten_propagations);
     let symmetry = solver.symmetry_report();
     stats.insert("sat.symmetry_runs", symmetry.runs);
     stats.insert("sat.symmetry_candidate_pairs", symmetry.candidate_pairs);
@@ -211,6 +220,15 @@ fn insert_dimacs_simplification_techniques(context: &mut DimacsStructuredStatist
         symmetry.groups_over_budget,
     );
     stats.insert("sat.symmetry_largest_group", symmetry.largest_group);
+    stats.insert("sat.symmetry_chain_generators", symmetry.chain_generators);
+    stats.insert("sat.symmetry_chain_base_len", symmetry.chain_base_len);
+    stats.insert("sat.symmetry_chain_orbits", symmetry.chain_orbits);
+    stats.insert("sat.symmetry_fixings", symmetry.fixcut_fixings);
+    stats.insert("sat.symmetry_cuts", symmetry.fixcut_cuts);
+    stats.insert("sat.symmetry_fixcut_levels", symmetry.fixcut_levels);
+    stats.insert("sat.symmetry_fixcut_work", symmetry.fixcut_work);
+    stats.insert("sat.symmetry_fixcut_budget_hit", symmetry.fixcut_budget_hit);
+    stats.insert("sat.symmetry_fixcut_rounds", symmetry.fixcut_rounds);
 }
 
 fn insert_dimacs_decomposition_techniques(context: &mut DimacsStructuredStatistics<'_, '_, '_>) {
@@ -219,6 +237,18 @@ fn insert_dimacs_decomposition_techniques(context: &mut DimacsStructuredStatisti
     let decomposition = solver.decompose_stats();
     stats.insert("sat.decomp_rounds", decomposition.rounds);
     stats.insert("sat.decomp_subst", decomposition.substituted);
+    stats.insert(
+        "sat.decomp_stale_watches_skipped",
+        decomposition.stale_binary_watches_skipped,
+    );
+    stats.insert(
+        "sat.decomp_chained_reprs",
+        decomposition.chained_representatives,
+    );
+    stats.insert(
+        "sat.decomp_chain_refusals",
+        decomposition.chained_rounds_refused,
+    );
     insert_decompose_lrat_preflight_telemetry(stats, &solver.decompose_lrat_preflight_stats());
     let transred = solver.transred_stats();
     stats.insert("sat.transred_rounds", transred.rounds);
@@ -226,10 +256,67 @@ fn insert_dimacs_decomposition_techniques(context: &mut DimacsStructuredStatisti
     let factor = solver.factor_stats();
     stats.insert("sat.factor_rounds", factor.rounds);
     stats.insert("sat.factor_count", factor.factored_count);
+    stats.insert("sat.factor_extension_vars", factor.extension_vars);
+    stats.insert("sat.factor_init_calls", factor.init_calls);
+    stats.insert("sat.factor_init_ticks", factor.init_ticks);
+    stats.insert("sat.factor_init_undrained", factor.init_undrained);
+    stats.insert("sat.factor_stops", solver.num_factor_stops());
+    for (tag, n) in solver.bve_skip_breakdown() {
+        stats.insert(&format!("sat.inproc_bve_skip_{tag}"), n);
+    }
+    for (tag, n) in solver.bve_gate_skip_breakdown() {
+        stats.insert(&format!("sat.inproc_bve_gate_{tag}"), n);
+    }
+    let (bve_next_conflict, bve_phases, bve_unproductive) = solver.bve_schedule_state();
+    stats.insert("sat.bve_next_conflict", bve_next_conflict);
+    stats.insert("sat.bve_phases", bve_phases);
+    stats.insert("sat.bve_consecutive_unproductive", bve_unproductive);
+    stats.insert(
+        "sat.bve_ext_cooccur_skips",
+        solver.num_bve_ext_cooccur_skips(),
+    );
+    let [fast, binary_product, over_bound, resolved, max_bound] = solver.bve_rejection_profile();
+    stats.insert("sat.bve_rej_fast_limits", fast);
+    stats.insert("sat.bve_rej_binary_product", binary_product);
+    stats.insert("sat.bve_rej_over_bound", over_bound);
+    stats.insert("sat.bve_candidates_resolved", resolved);
+    stats.insert("sat.bve_max_growth_bound", max_bound);
+    let (gates_proved_mixed, [shape, pairs, incomplete, budget]) = solver.bve_gate_profile();
+    stats.insert("sat.bve_gates_proved_mixed", gates_proved_mixed);
+    stats.insert(
+        "sat.bve_gates_unproved",
+        shape + pairs + incomplete + budget,
+    );
+    stats.insert("sat.bve_gates_unproved_shape", shape);
+    stats.insert("sat.bve_gates_unproved_pairs", pairs);
+    stats.insert("sat.bve_gates_unproved_incomplete", incomplete);
+    stats.insert("sat.bve_gates_unproved_budget", budget);
+    let (sbva_rounds, sbva_groups, sbva_extension_vars) = solver.sbva_counts();
+    stats.insert("sat.sbva_rounds", sbva_rounds);
+    stats.insert("sat.sbva_groups", sbva_groups);
+    stats.insert("sat.sbva_extension_vars", sbva_extension_vars);
+    let (factor_density_skips, sbva_density_skips) = solver.density_band_skips();
+    stats.insert("sat.factor_density_skips", factor_density_skips);
+    stats.insert("sat.sbva_density_skips", sbva_density_skips);
     let vivify = solver.vivify_stats();
     stats.insert("sat.vivify_examined", vivify.clauses_examined);
+    stats.insert("sat.vivify_generations", vivify.generations);
     stats.insert("sat.vivify_strengthened", vivify.clauses_strengthened);
     stats.insert("sat.vivify_lits_rm", vivify.literals_removed);
+    stats.insert("sat.vivify_satisfied", vivify.clauses_satisfied);
+    for (i, name) in ["core", "tier2", "other", "irred"].iter().enumerate() {
+        stats.insert(
+            &format!("sat.vivify_{name}_examined"),
+            vivify.tier_examined[i],
+        );
+        stats.insert(
+            &format!("sat.vivify_{name}_vivified"),
+            vivify.tier_vivified[i],
+        );
+    }
+    stats.insert("sat.vivify_inline_subsumed", vivify.inline_subsumed);
+    stats.insert("sat.vivify_analysis_subsumed", vivify.analysis_subsumed);
+    stats.insert("sat.vivify_asym_deleted", vivify.asym_deleted);
     stats.insert("sat.vivify_irred_examined", vivify.irred_examined);
     stats.insert("sat.vivify_irred_strengthened", vivify.irred_strengthened);
     stats.insert("sat.vivify_irred_lits_rm", vivify.irred_literals_removed);
@@ -239,6 +326,19 @@ fn insert_dimacs_decomposition_techniques(context: &mut DimacsStructuredStatisti
         vivify.irred_calls_preprocess,
     );
     stats.insert("sat.vivify_irred_calls_inproc", vivify.irred_calls_inproc);
+    stats.insert("sat.vivify_inproc_admitted", vivify.inproc_admitted);
+    stats.insert(
+        "sat.vivify_inproc_skip_small_dense",
+        vivify.inproc_skip_small_dense,
+    );
+    stats.insert(
+        "sat.vivify_inproc_skip_interval",
+        vivify.inproc_skip_interval,
+    );
+    stats.insert(
+        "sat.vivify_inproc_skip_threshold",
+        vivify.inproc_skip_threshold,
+    );
     stats.insert("sat.vivify_preprocess_rounds", vivify.preprocess_rounds);
     stats.insert("sat.vivify_preprocess_ticks", vivify.preprocess_ticks);
     stats.insert(

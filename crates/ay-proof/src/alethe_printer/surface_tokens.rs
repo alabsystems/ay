@@ -41,6 +41,69 @@ pub fn split_alethe_application_bounded<'a>(
     Ok(fields)
 }
 
+/// Split one rendered Alethe STEP TEXT into its top-level commands.
+///
+/// A printed step is a sequence of `(anchor ..)` / `(assume ..)` / `(step ..)`
+/// commands, possibly with `;` comment lines between them. This is the reader
+/// a judgement uses to find the commands it must judge: scanning rendered
+/// LINES for a rule substring instead reads quoted symbols and string
+/// literals as code. MEASURED 2026-09-16: a legal function symbol
+/// `|g :rule la_generic :args (1 1)|`, a QF_SLIA string literal
+/// `" :rule la_generic :args (1 1)"` and `"x :rule poly_simp)"` each made the
+/// `la_generic` chokepoint decline the whole export of a document the pinned
+/// checker calls `valid`. Quoted symbols and strings are opaque here, because
+/// [`scan_parenthesized_term`] is the scanner.
+///
+/// `Malformed` when the text is not a whitespace/comment-separated sequence of
+/// balanced parenthesized commands; `BudgetExceeded` above `max_bytes`.
+pub(crate) fn split_alethe_commands_bounded(
+    input: &str,
+    max_bytes: usize,
+) -> Result<Vec<&str>, AletheSurfaceParseError> {
+    if input.len() > max_bytes {
+        return Err(AletheSurfaceParseError::BudgetExceeded);
+    }
+    let bytes = input.as_bytes();
+    let mut commands = Vec::new();
+    let mut index = 0usize;
+    while let Some(command) = next_alethe_command_slice(input, &mut index)? {
+        commands.push(command);
+    }
+    Ok(commands)
+}
+
+/// Borrow one complete command using the same lexer as the bounded reader.
+pub(super) fn next_alethe_command_slice<'a>(
+    input: &'a str,
+    cursor: &mut usize,
+) -> Result<Option<&'a str>, AletheSurfaceParseError> {
+    let bytes = input.as_bytes();
+    let mut index = *cursor;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index == bytes.len() {
+            break;
+        }
+        if bytes[index] == b';' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] != b'(' {
+            return Err(AletheSurfaceParseError::Malformed);
+        }
+        let start = index;
+        index = scan_parenthesized_term(bytes, index)?;
+        *cursor = index;
+        return Ok(Some(&input[start..index]));
+    }
+    *cursor = index;
+    Ok(None)
+}
+
 /// Split an SMT-LIB fragment into balanced top-level terms.
 pub(super) fn split_smt_terms(s: &str) -> Option<Vec<String>> {
     split_smt_term_slices_bounded(s, usize::MAX, usize::MAX)
@@ -70,36 +133,55 @@ pub(crate) fn split_smt_term_slices_bounded(
         if terms.len() >= max_terms {
             return Err(AletheSurfaceParseError::BudgetExceeded);
         }
-        let start = index;
-        match bytes[index] {
-            b'(' => {
-                index = scan_parenthesized_term(bytes, index)?;
-            }
-            b'"' => {
-                index = scan_string_term(bytes, index)?;
-            }
-            b'|' => {
-                index = scan_quoted_symbol(bytes, index)?;
-            }
-            b')' => return Err(AletheSurfaceParseError::Malformed),
-            _ => {
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && !matches!(bytes[index], b'(' | b')' | b'"' | b'|')
-                {
-                    index += 1;
-                }
-            }
-        }
-        if start == index {
-            return Err(AletheSurfaceParseError::Malformed);
-        }
-        // `start` and `index` are either input boundaries or ASCII delimiter
-        // positions, hence valid UTF-8 slice boundaries even though scanning
-        // itself is byte-oriented.
-        terms.push(&input[start..index]);
+        let term =
+            next_smt_term_slice(input, &mut index)?.ok_or(AletheSurfaceParseError::Malformed)?;
+        terms.push(term);
     }
     Ok(terms)
+}
+
+/// Read one complete top-level term without allocating or changing its bytes.
+/// The owning caller supplies its existing byte/work and scratch bounds.
+pub(super) fn next_smt_term_slice<'a>(
+    input: &'a str,
+    cursor: &mut usize,
+) -> Result<Option<&'a str>, AletheSurfaceParseError> {
+    let bytes = input.as_bytes();
+    let mut index = *cursor;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index == bytes.len() {
+        *cursor = index;
+        return Ok(None);
+    }
+    let start = index;
+    match bytes[index] {
+        b'(' => {
+            index = scan_parenthesized_term(bytes, index)?;
+        }
+        b'"' => {
+            index = scan_string_term(bytes, index)?;
+        }
+        b'|' => {
+            index = scan_quoted_symbol(bytes, index)?;
+        }
+        b')' => return Err(AletheSurfaceParseError::Malformed),
+        _ => {
+            while index < bytes.len()
+                && !bytes[index].is_ascii_whitespace()
+                && !matches!(bytes[index], b'(' | b')' | b'"' | b'|')
+            {
+                index += 1;
+            }
+        }
+    }
+    if start == index {
+        return Err(AletheSurfaceParseError::Malformed);
+    }
+    *cursor = index;
+    // Boundaries are input boundaries or ASCII delimiters, hence UTF-8 safe.
+    Ok(Some(&input[start..index]))
 }
 
 fn scan_parenthesized_term(
@@ -158,7 +240,10 @@ fn scan_parenthesized_term(
     Err(AletheSurfaceParseError::Malformed)
 }
 
-fn scan_string_term(bytes: &[u8], mut index: usize) -> Result<usize, AletheSurfaceParseError> {
+pub(super) fn scan_string_term(
+    bytes: &[u8],
+    mut index: usize,
+) -> Result<usize, AletheSurfaceParseError> {
     index += 1;
     while index < bytes.len() {
         if bytes[index] == b'"' {
@@ -173,7 +258,10 @@ fn scan_string_term(bytes: &[u8], mut index: usize) -> Result<usize, AletheSurfa
     Err(AletheSurfaceParseError::Malformed)
 }
 
-fn scan_quoted_symbol(bytes: &[u8], mut index: usize) -> Result<usize, AletheSurfaceParseError> {
+pub(super) fn scan_quoted_symbol(
+    bytes: &[u8],
+    mut index: usize,
+) -> Result<usize, AletheSurfaceParseError> {
     index += 1;
     while index < bytes.len() {
         if bytes[index] == b'\\' && matches!(bytes.get(index + 1), Some(b'|' | b'\\')) {

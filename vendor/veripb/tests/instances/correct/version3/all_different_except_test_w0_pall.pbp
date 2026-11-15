@@ -1,0 +1,50 @@
+pseudo-Boolean proof version 3.0
+f 2 ;
+% solution
+red 1 i[_1][b0] 2 i[_1][b1] 1 ~i[_1][ge1] >= 1 : i[_1][ge1] -> 0;
+red -1 i[_1][b0] -2 i[_1][b1] 3 i[_1][ge1] >= 0 : i[_1][ge1] -> 1;
+red 1 ~i[_1][ge1] 1 ~i[_1][eq0] >= 1 : i[_1][eq0] -> 0;
+red -1 ~i[_1][ge1] 1 i[_1][eq0] >= 0 : i[_1][eq0] -> 1;
+solx i[_1][eq0];
+% backtracking
+red 1 i[_1][b0] 2 i[_1][b1] 2 ~i[_1][ge2] >= 2 : i[_1][ge2] -> 0;
+red -1 i[_1][b0] -2 i[_1][b1] 2 i[_1][ge2] >= -1 : i[_1][ge2] -> 1;
+pol 4 8 + s ;
+red 1 i[_1][ge1] 1 ~i[_1][ge2] 2 ~i[_1][eq1] >= 2 : i[_1][eq1] -> 0;
+red -1 i[_1][ge1] -1 ~i[_1][ge2] 1 i[_1][eq1] >= -1 : i[_1][eq1] -> 1;
+red 1 i[_1][b0] 2 i[_1][b1] 3 ~i[_1][ge3] >= 3 : i[_1][ge3] -> 0;
+red -1 i[_1][b0] -2 i[_1][b1] 1 i[_1][ge3] >= -2 : i[_1][ge3] -> 1;
+pol 9 13 + s ;
+red 1 i[_1][ge2] 1 ~i[_1][ge3] 2 ~i[_1][eq2] >= 2 : i[_1][eq2] -> 0;
+red -1 i[_1][ge2] -1 ~i[_1][ge3] 1 i[_1][eq2] >= -1 : i[_1][eq2] -> 1;
+red 1 i[_1][ge3] 1 ~i[_1][eq3] >= 1 : i[_1][eq3] -> 0;
+red -1 i[_1][ge3] 1 i[_1][eq3] >= 0 : i[_1][eq3] -> 1;
+rup 1 i[_1][eq1] 1 i[_1][eq2] 1 i[_1][eq3] >= 1;
+% solution
+solx i[_1][eq3];
+% backtracking
+rup 1 i[_1][eq1] 1 i[_1][eq2] 1 ~i[_1][eq3] >= 1;
+% backtracking
+rup 1 i[_1][eq1] 1 i[_1][eq2] >= 1;
+del id 20;
+del id 22;
+% solution
+solx i[_1][eq2];
+% backtracking
+rup 1 i[_1][eq1] 1 ~i[_1][eq2] >= 1;
+% backtracking
+rup 1 i[_1][eq1] >= 1;
+del id 23;
+del id 25;
+% solution
+solx i[_1][eq1];
+% backtracking
+rup 1 ~i[_1][eq1] >= 1;
+% backtracking
+rup >= 1;
+del id 26;
+del id 28;
+rup >= 1 ;
+output NONE;
+conclusion ENUMERATION_COMPLETE 4 : -1 ;
+end pseudo-Boolean proof;

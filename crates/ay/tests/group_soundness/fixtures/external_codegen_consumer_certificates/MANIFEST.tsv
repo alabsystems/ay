@@ -1,0 +1,243 @@
+# external-codegen consumer-certificate corpus (AY Alethe certificates for external-codegen).
+#
+# Captured 2026-09-27 from external-codegen ba27f8da6 (origin/main), crates/external-codegen-verify
+# lib tests (ay_bridge, unified_synthesis, mir_semantics, wasm_*,
+# loop_backedge_symexec, checked_overflow_proofs, switch_proofs,
+# source_bound_frame, rule_discovery, pass_validators) and its cegis_layer_a/b,
+# cegis_stats_trace and macho_ay_relocation_proofs targets, through a recording
+# hook on the query external-codegen hands AY: 2785 distinct queries. Each <id>.smt2 is
+# one query file, byte-exact; id = first 12 hex digits of sha256(file).
+#
+# Every row is a query on which AY c6a80496e (origin/main 2026-09-27), under
+# external-codegen's one-shot argv (`-smt2 F --strict-proofs --proof F.alethe
+# --proof-format alethe`), did NOT hand external-codegen a certificate its checker
+# (`clean cert verify-external --verbose`, Clean 414913cce) accepts:
+#
+#   bitblast_ashr          `unsat` + certificate Clean refused: the zero-filled
+#                          overshift layer (Clean fills with the sign bit)
+#   and_simplify           `unsat` + certificate Clean refused: `(= (and true X) X)`
+#                          with X itself a conjunction
+#   or_simplify            the same for `(= (or X false) X)`
+#   problem-sort           `unsat` + certificate Clean cannot parse: the problem
+#                          declares a FloatingPoint constant
+#   problem-reserved-word  the same for a problem symbol named `step`
+#   whole-query-hole       `unknown (incomplete proof-trusted)`: the certificate
+#                          printed the whole-query bit-vector lemma as `hole`
+#
+# Measured 2026-09-28 on the same 2785 queries after those fixes (AY origin/main
+# b9ffcbf47 plus this corpus's series, `unknown` under the same argv):
+#
+#   ring-identity          `unknown (incomplete self-check-rejected)`, or no answer
+#                          within 60 s: a nonlinear product identity (commuted or
+#                          regrouped `bvmul` chains) that one `poly_simp` step
+#                          proves, which no lemma route recognized
+#
+# Added 2026-09-29: external-codegen's four per-lane x86 `<16 x i8>` unsigned compare
+# obligations as it spelled them before external-codegen 7b81d2cb1 (the sign-bit bias
+# as sixteen `(_ bv128 8)` lanes, repeated under each of the 32 `bvxor`s;
+# external-codegen the development design notes), `unknown (incomplete
+# proof-trusted)` under the same argv at AY 34885c663:
+#
+#   shared-lane-bias       the whole-query lemma printed as `hole`, and the
+#                          raw-authored bit-blast refutation that replaces it
+#                          was refused by the bit-blast producer, which sized
+#                          the lowered term as a tree and charged every term's
+#                          whole subtree. Measured at AY b34b653ec: the lemma
+#                          lowers to 7,127 occurrences of 501 distinct nodes
+#                          (`ult`) and 7,523 of 674 (`ule`), over the 4,096
+#                          node cap; with that cap raised, the raw `ule`/`uge`
+#                          lemmas were charged 103,994 constructed nodes, over
+#                          the 100,000 budget
+#
+# Measured 2026-09-29 on AY origin/main 755591481, same argv:
+#
+#   authored-literal-spelling  `unknown (incomplete self-check-rejected)`: the
+#                          preprocessor folded the authored root to `false`, and
+#                          all four fold rescues declined at "the raw root does
+#                          not print as authored" because the printer spells a
+#                          `(_ bvN w)` literal in binary. Since AY 1910b9168 the
+#                          raw ground closure re-derives all 19 (measured at AY
+#                          6212f9017 with --trace-cegqi-attr: "raw-ground-closure
+#                          committed" on each)
+#
+# Added 2026-10-02: external-codegen's x86-64 Darwin `core` body theorems (the
+# source-bound `x86-body` proof census, 95 distinct uncertified queries at AY
+# 0.27.0 b10530), one nested authored conjunction per query whose last
+# conjunct negates the claim. Measured on AY origin/main 57ea58ca3, same argv:
+# 80 of 95 certified, 45 of those over 3 s (whole-root bit-blast documents of
+# 3-15 MB that Clean replays in up to 111 s), 12 answered `unknown` at the
+# query's 30 s timeout with the guarded collapse still bit-blasting a 32- or
+# 64-bit multiplier or a 14-20 adder chain, 3 were refused (roots deeper
+# than MAX_SURFACE_DEPTH):
+#
+#   word-level-closure     the raw ground closure now runs first on a pure
+#                          bit-vector query and reads nested conjunctions,
+#                          negated `(= true (and ..))` claims, slice
+#                          identities (`extract`/`zero_extend`/`sign_extend`/
+#                          `concat`, validated by their wiring) and flags built
+#                          as `(ite c #x01 #x00)`; `acac8d970d40` is the
+#                          `DebugMap::finish` root of the zero-extending narrow
+#                          loads (`MovRR32` re-extension of a zero-extended byte)
+#
+# columns: id<TAB>class<TAB>external-codegen obligation name
+0196d57d5f59	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (8-bit)
+03a00866629d	bitblast_ashr	x86_64: SextractBits{lsb=7,width=13}_I32 -> SHL+SAR
+0639a0086a4a	problem-reserved-word	LoopUnroll: final IV (init + 4*step) matches unrolled
+074593258d54	and_simplify	narrow u8 mul -> i32-carried wasm mul + renormalize (width invariant)
+07c4e5869f60	whole-query-hole	StrengthReduce: x * 3 == (x << 2) - x (8-bit)
+0863d24c484a	whole-query-hole	MachO: Page21 alignment (8-bit)
+08b66f38dc7c	whole-query-hole	Call lowering: SP 16-byte aligned at call site
+09059919a891	or_simplify	LDSET_I32: mem[addr] = old | operand
+0ab585e2a382	bitblast_ashr	CheckedSmul_I64 -> MUL+SMULH+ASR+CMP+CSET_NE
+0c91223861b2	and_simplify	narrow u16 mul -> i32-carried wasm mul + renormalize (width invariant)
+0d5d8fa6fada	and_simplify	narrow u8 mul -> i32-carried wasm mul + renormalize (width invariant)
+0ef00cb68725	whole-query-hole	MachO: Page21 alignment (8-bit)
+10a589dda927	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (64-bit)
+10adef36a5ae	whole-query-hole	ClosedForm: sum_i2 m=0 == m(m-1)(2m-1)/6
+12b8fd3c4d95	whole-query-hole	FrameLayout: SP alignment preserved (8-bit, mod 4)
+12efa1f039a8	whole-query-hole	FrameLayout: SP alignment preserved (SP % 16 == 0 after SUB)
+1352b3e9c127	or_simplify	x86_64: AtomicRmwCasLoop_Or_I32 updates memory
+1dd102f7ebd8	whole-query-hole	MachO: alignment is power of two (64-bit)
+1fec9489d8f2	whole-query-hole	ClosedForm: sum_i2 m=10 == m(m-1)(2m-1)/6
+2380b85cc172	whole-query-hole	Peephole: MSUB Xd, Xn, #0, Xa ≡ MOV Xd, Xa
+23b424759598	whole-query-hole	ClosedForm: sum_i2 m=13 == m(m-1)(2m-1)/6
+2438ac420e4d	whole-query-hole	A64 decoded ADD Wd, Wn, #imm12, LSL #12 word == Wn + imm12 * 4096, Xd[63:32] zero
+247ef3f87e44	whole-query-hole	MachO: Page21 alignment (64-bit)
+275f29cfd199	problem-reserved-word	LoopUnroll: final IV (init + 4*step) matches unrolled (8-bit)
+2b87450d7a78	whole-query-hole	ClosedForm: sum_i2 m=9 == m(m-1)(2m-1)/6
+2c8a79628a0c	whole-query-hole	ClosedForm: sum_i2 m=1 == m(m-1)(2m-1)/6
+2d494502324b	and_simplify	narrow u16 and -> i32-carried wasm and + renormalize (width invariant)
+2ffaad6e7fb4	whole-query-hole	Peephole: MSUB Xn, #0, Xa ≡ MOV Xa (8-bit exhaustive)
+30415524c7df	whole-query-hole	cegis_iter_0
+314f9c7f9b74	whole-query-hole	FrameLayout: SP alignment preserved (8-bit, mod 8)
+32ac5e451757	whole-query-hole	ClosedForm: sum_i2 m=12 == m(m-1)(2m-1)/6
+333e01844aef	whole-query-hole	FrameLayout: SP alignment preserved (SP % 16 == 0 after SUB)
+33abf5957e3e	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (8-bit)
+3605fa09f750	whole-query-hole	A64 decoded ADD Xd, Xn, #imm12, LSL #12 word == Xn + imm12 * 4096
+36d36430d633	bitblast_ashr	Peephole: ASR Xd, Xn, #0 ≡ MOV Xd, Xn
+396be4a2f39d	whole-query-hole	Sub_Lsl_Shift_I32 k=7 -> SUB (shifted LSL, 32-bit): base - src*2^k == base - (src<<k)
+39f0d62f6c4f	and_simplify	narrow u8 and -> i32-carried wasm and + renormalize (width invariant)
+40513bd6727a	whole-query-hole	StrengthReduce: x * 7 == (x << 3) - x
+426e31c1b520	bitblast_ashr	cegis_iter_0
+448bbfe5c04d	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=16 -> SHL+SUB: x*(2^16-1) == (x<<16) - x
+44b5ddd02972	problem-reserved-word	LoopUnroll: final IV (init + 4*step) matches unrolled
+4586307b4a16	bitblast_ashr	NEON SshrVImm.4S #7 lanewise-intent == D-pair per-lane bvashr (faithful)
+4951160b6f7f	whole-query-hole	narrow u16 sub -> i32-carried wasm sub + renormalize (width invariant)
+4bcffcdbe664	whole-query-hole	StrengthReduce: x * 16 == x << 4
+4e2920a31d51	whole-query-hole	ClosedForm: sum_i2 m=2 == m(m-1)(2m-1)/6
+4f1d85f0db63	and_simplify	narrow u8 and -> i32-carried wasm and + renormalize (width invariant)
+502a084c61ea	bitblast_ashr	cegis_iter_0
+59f96a7bcdf3	whole-query-hole	StrengthReduce: x * 31 == (x << 5) - x (8-bit)
+5bd5d567eb4b	bitblast_ashr	x86_64: SextractBits{lsb=2,width=4}_I8 -> SHL+SAR+AND
+5e1055baefad	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (8-bit)
+608c7e4ef10f	whole-query-hole	ClosedForm: sum_i m=9 == m(m-1)/2
+648a95208e61	whole-query-hole	MachO: Page21 alignment (8-bit)
+65556154746c	whole-query-hole	Call lowering: stack overflow args 8-byte aligned (8-bit)
+66138380a21a	whole-query-hole	ClosedForm: sum_i2 m=7 == m(m-1)(2m-1)/6
+6634a499e161	problem-sort	FcvtToInt_I32_F32 -> FCVTZS Wd,Sn
+67a28649ca41	whole-query-hole	ClosedForm: sum_i m=16 == m(m-1)/2
+69d10b9ab8e3	whole-query-hole	narrow u16 sub -> i32-carried wasm sub + renormalize (width invariant)
+6d2f18bf619d	or_simplify	x86_64: AtomicRmwCasLoop16_Or_I16 updates memory
+6f5caa2d87ed	bitblast_ashr	Peephole: ASR Wd, Wn, #0 ≡ MOV Wd, Wn (32-bit)
+737444dad611	and_simplify	narrow u16 mul -> i32-carried wasm mul + renormalize (width invariant)
+73762d6c03df	whole-query-hole	Add_Lsl_Shift_I32 k=7 -> ADD (shifted LSL, 32-bit): base + src*2^k == base + (src<<k)
+7555c38b87d1	whole-query-hole	Call lowering: SP 16-byte aligned at call site (8-bit)
+77ad88509761	whole-query-hole	ClosedForm: sum_i2 m=8 == m(m-1)(2m-1)/6
+786a798b0c37	whole-query-hole	StrengthReduce: x * 7 == (x << 3) - x (8-bit)
+79e8748fb94e	and_simplify	narrow u16 and -> i32-carried wasm and + renormalize (width invariant)
+7ca8a6627cf4	whole-query-hole	narrow u8 sub -> i32-carried wasm sub + renormalize (width invariant)
+81f747323f18	whole-query-hole	FrameLayout: SP alignment preserved (SP % 32 == 0 after SUB)
+854fb7e07bc1	whole-query-hole	MachO: Page21 alignment (64-bit)
+8ea3ec05afd1	bitblast_ashr	CheckedSmul_I8 exact product overflow == SMULH high-half predicate (exhaustive w=8)
+8f9f418995e7	whole-query-hole	Sub_Lsl_Shift_I32 k=31 -> SUB (shifted LSL, 32-bit): base - src*2^k == base - (src<<k)
+9574a9e8114b	bitblast_ashr	CheckedSmul_I64 -> MUL+SMULH+ASR+CMP+CSET_NE
+978dcd204719	whole-query-hole	A64 decoded ADD Xd, Xn, #imm12, LSL #12 word == Xn + imm12 * 4096
+97c82196007b	whole-query-hole	FrameLayout: SP alignment preserved (8-bit, mod 4)
+993bd4401149	bitblast_ashr	CheckedSmul_I8 exact product overflow == SMULH high-half predicate (exhaustive w=8)
+9a556d7b3408	whole-query-hole	A64 decoded ADD Wd, Wn, #imm12, LSL #12 word == Wn + imm12 * 4096, Xd[63:32] zero
+9a71b2a5ee95	whole-query-hole	ClosedForm: sum_i2 m=11 == m(m-1)(2m-1)/6
+a22827bdcaf8	whole-query-hole	ClosedForm: sum_i2 m=6 == m(m-1)(2m-1)/6
+a63fa3433a84	whole-query-hole	ClosedForm: sum_i m=8 == m(m-1)/2
+a716986ec848	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=31 -> SHL+SUB: x*(2^31-1) == (x<<31) - x
+a9141bb0eb3a	whole-query-hole	x86_64: BSR_I8 (nonzero) == width-1-Ctlz
+aad035517077	whole-query-hole	MachO: alignment is power of two (8-bit)
+b572717b0864	whole-query-hole	RECONSTRUCTED Bxor_32 with Lsl #1 -> EorRRLsl (real-operand)
+b7dff5ca470d	whole-query-hole	ClosedForm: sum_i m=3 == m(m-1)/2
+b7fae4609685	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (64-bit)
+bcde828f535d	bitblast_ashr	Peephole: ASR Bd, Bn, #0 ≡ MOV Bd, Bn (8-bit exhaustive)
+bd5444ddadb0	whole-query-hole	AddrMode: jump-table LDRSW [Xn,Xm,LSL#2] scaled effective addr base+(index<<2) == base+4*index
+be6586125100	bitblast_ashr	x86_64: SextractBits{lsb=11,width=23}_I64 -> SHL+SAR
+bea44863c965	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=3 -> SHL+SUB: x*(2^3-1) == (x<<3) - x
+c1af6609fba6	whole-query-hole	narrow u8 sub -> i32-carried wasm sub + renormalize (width invariant)
+c2671e1a2e7b	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=7 -> SHL+SUB: x*(2^7-1) == (x<<7) - x
+c8b2d9c7a832	whole-query-hole	Add_Lsl_Shift_I32 k=16 -> ADD (shifted LSL, 32-bit): base + src*2^k == base + (src<<k)
+c9412268e479	whole-query-hole	Peephole: MSUB Xd, Xn, #0, Xa ≡ MOV Xd, Xa
+c94683aefab7	whole-query-hole	ClosedForm: sum_i m=4 == m(m-1)/2
+cd8fcf86b47e	whole-query-hole	StrengthReduce: x * 3 == (x << 2) - x
+ce0bf9b57602	whole-query-hole	StrengthReduce: x * 15 == (x << 4) - x (8-bit)
+ce46adc748cd	bitblast_ashr	cegis_iter_0
+cfd5692bd645	whole-query-hole	Call lowering: stack overflow args 8-byte aligned
+cffca512165c	whole-query-hole	Sub_Lsl_Shift_I32 k=25 -> SUB (shifted LSL, 32-bit): base - src*2^k == base - (src<<k)
+d27d9c2d0fd9	bitblast_ashr	x86_64: SextractBits{lsb=3,width=7}_I16 -> SHL+SAR+AND
+d4e9accbc160	whole-query-hole	ClosedForm: sum_i2 m=3 == m(m-1)(2m-1)/6
+d644ee5b4023	whole-query-hole	AddrMode: jump-table LDRSW [Xn,Xm,LSL#2] scaled effective addr base+(index<<2) == base+4*index
+d97eac454d6a	bitblast_ashr	Peephole: ASR Xd, Xn, #0 ≡ MOV Xd, Xn
+db99615da30e	whole-query-hole	ClosedForm: sum_i2 m=5 == m(m-1)(2m-1)/6
+de2ecbdcef93	whole-query-hole	MachO: ADRP+ADD pair reconstructs address (64-bit)
+df41f39bda9d	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=5 -> SHL+SUB: x*(2^5-1) == (x<<5) - x
+e1a80c1f69b3	bitblast_ashr	Peephole: ASR Wd, Wn, #0 ≡ MOV Wd, Wn (32-bit)
+e293352e0dc7	whole-query-hole	ClosedForm: sum_i m=5 == m(m-1)/2
+e5a49384460a	whole-query-hole	x86_64: ConstMul_Shift_Sub_I32 a=2 -> SHL+SUB: x*(2^2-1) == (x<<2) - x
+eb014adcbc62	whole-query-hole	ClosedForm: sum_i2 m=20 == m(m-1)(2m-1)/6
+ed4325a89fa3	whole-query-hole	ClosedForm: sum_i2 m=16 == m(m-1)(2m-1)/6
+eda41aba0712	whole-query-hole	MachO: alignment is power of two (64-bit)
+ef4fbaecdfa3	whole-query-hole	MachO: Page21 alignment (64-bit)
+f1cb8278ecb5	whole-query-hole	ClosedForm: sum_i2 m=4 == m(m-1)(2m-1)/6
+f3adfb728abb	whole-query-hole	Sub_Lsl_Shift_I64 k=63 -> SUB (shifted LSL, 64-bit): base - src*2^k == base - (src<<k)
+fac9f7e896ba	bitblast_ashr	NEON SshrVImm.2D #37 lanewise-intent == D-pair per-lane bvashr (faithful)
+31a9598a6238	ring-identity	ReductionSplit: mul split+tail N=4 M=6 (tail=2) (8-bit)
+35ddb798b059	ring-identity	ReductionSplit: mul split+tail N=4 M=5 (tail=1)
+37be94accab0	ring-identity	ReductionSplit: mul split+tail N=4 M=5 (tail=1) (8-bit)
+46b578428ba1	ring-identity	ReductionSplit: mul regroup N=4 M=4 (8-bit)
+65fa11de31c7	ring-identity	ReductionSplit: mul split+tail N=4 M=7 (tail=3) (8-bit)
+7389521b5b7b	ring-identity	ReductionSplit: mul split+tail N=4 M=6 (tail=2)
+bbd3cfd1c9b7	ring-identity	ReductionSplit: mul split+tail N=4 M=7 (tail=3)
+c985fcdc90b1	ring-identity	ReductionSplit: mul split+tail N=4 M=3 (tail=3)
+dd08c06bcd01	ring-identity	CSE commutative: mul(a, b) == mul(b, a)
+de4086d2899f	ring-identity	ReductionSplit: mul regroup N=4 M=8 (8-bit)
+f4b2df9c1134	ring-identity	ReductionSplit: mul regroup N=4 M=8
+f9d0b404140c	ring-identity	ReductionSplit: mul regroup N=4 M=4
+fc7744a883bc	ring-identity	ReductionSplit: mul split+tail N=4 M=3 (tail=3) (8-bit)
+dbbbd2c15e10	shared-lane-bias	x86_64: V16I8Icmp_Ult -> PXOR(sign-bias)+PCMPGTB(swapped)
+d400c9b75d5a	shared-lane-bias	x86_64: V16I8Icmp_Ule -> PXOR(sign-bias)+PCMPGTB(swapped)+PCMPEQB+POR
+5d413777b073	shared-lane-bias	x86_64: V16I8Icmp_Ugt -> PXOR(sign-bias)+PCMPGTB
+25077d0fb9ac	shared-lane-bias	x86_64: V16I8Icmp_Uge -> PXOR(sign-bias)+PCMPGTB+PCMPEQB+POR
+2e15b23eaeb5	authored-literal-spelling	gpu_map_NEG
+35869bc63721	authored-literal-spelling	gpu_map_SHL
+3bb2604f4200	authored-literal-spelling	Sched: WAW store-store ordering (8-bit)
+3c5d899bb9be	authored-literal-spelling	gpu_map_ADD
+5cb07f12596b	authored-literal-spelling	RegAlloc Phase2: copy coalescing soundness (8-bit)
+5f1e549b2729	authored-literal-spelling	gpu_map_MUL
+68e3bf41106a	authored-literal-spelling	RegAlloc Phase2: register file write-then-read identity (8-bit)
+7a951b35f7af	authored-literal-spelling	gpu_map_ADD
+a1e0c3d89137	authored-literal-spelling	gpu_map_AND
+a2d9031f54c6	authored-literal-spelling	gpu_map_XOR
+a56806549efe	authored-literal-spelling	gpu_map_ADD
+d109c0c1dc67	authored-literal-spelling	RegAlloc: spill store-then-load roundtrip (8-bit)
+d2b09666208b	authored-literal-spelling	gpu_map_OR
+d43729670a02	authored-literal-spelling	Sched: store-load memory ordering (8-bit)
+dcfa7b917740	authored-literal-spelling	gpu_map_MUL
+eab33a1f7da3	authored-literal-spelling	gpu_map_ADD
+f60a20859057	authored-literal-spelling	gpu_map_SUB
+fb3a008dfb02	authored-literal-spelling	FrameLayout: callee-save restore is identity (8-bit)
+fda031c25661	authored-literal-spelling	gpu_map_ADD
+101fca904a10	word-level-closure	x86-64 core body: 32-bit imul vs zero-extended register lowering
+0cfd04a7e440	word-level-closure	x86-64 core body: SSA copies only, negated (= true (and ..)) claim
+3904417e8413	word-level-closure	x86-64 core body: 14 64-bit bvadd address computations
+0b0b6a2f2376	word-level-closure	x86-64 core body: 32-bit argument re-read through zero_extend
+2a1aabb3949a	word-level-closure	x86-64 core body: flag bit through byte read of a concatenation
+2c1199dce00c	word-level-closure	x86-64 core body: sign-extended bytes re-read as 32-bit words
+39f3d554be5b	word-level-closure	x86-64 core body: masked 64-bit product with sign/zero extensions
+e2953c57e567	word-level-closure	x86-64 core body: cmp flag from a zero difference (ite c #x01 #x00)
+b32ed068cb36	word-level-closure	x86-64 core body: imul overflow flag (bvsub = 0 vs equality)
+acac8d970d40	word-level-closure	x86-64 core body: DebugMap::finish narrow load (MovRR32 of movzx)

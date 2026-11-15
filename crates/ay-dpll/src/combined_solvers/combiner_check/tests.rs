@@ -998,3 +998,120 @@ fn test_imported_reasoned_euf_array_notification_survives_soft_reset_8785() {
 fn test_group_activation_permutation_preserves_replay_connectivity() {
     replay_cache::assert_group_activation_permutation_preserves_connectivity();
 }
+
+/// A stopped check records no more of an equality batch than the first
+/// stride: one batch held AUFLIA Rodin `smt2370683544275539232` past its
+/// deadline until the watchdog's hard exit. Unstopped, the whole batch is
+/// recorded.
+#[test]
+fn a_stopped_check_leaves_the_rest_of_an_equality_batch_unrecorded() {
+    let mut terms = TermStore::new();
+    let guard = terms.mk_var("stop_guard", Sort::Bool);
+    let pairs: Vec<(TermId, TermId)> = (0..200)
+        .map(|i| {
+            (
+                terms.mk_var(&format!("sl{i}"), Sort::Int),
+                terms.mk_var(&format!("sr{i}"), Sort::Int),
+            )
+        })
+        .collect();
+    let batch: Vec<DiscoveredEquality> = pairs
+        .iter()
+        .map(|&(lhs, rhs)| DiscoveredEquality::new(lhs, rhs, vec![TheoryLit::new(guard, true)]))
+        .collect();
+
+    let mut stopped = TheoryCombiner::uf_lia(&terms);
+    stopped.assert_literal(guard, true);
+    stopped.set_interrupt(Some(std::sync::Arc::new(
+        std::sync::atomic::AtomicBool::new(true),
+    )));
+    stopped.record_cross_theory_equalities(&batch);
+    assert_eq!(stopped.export_cross_theory_equality_replays().len(), 64);
+
+    let mut running = TheoryCombiner::uf_lia(&terms);
+    running.assert_literal(guard, true);
+    running.record_cross_theory_equalities(&batch);
+    assert_eq!(running.export_cross_theory_equality_replays().len(), 200);
+}
+
+#[test]
+fn stable_array_replay_union_preserves_prefix_order_and_full_reason_identity() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("union_x", Sort::Int);
+    let y = terms.mk_var("union_y", Sort::Int);
+    let z = terms.mk_var("union_z", Sort::Int);
+    let g = terms.mk_var("union_g", Sort::Bool);
+    let h = terms.mk_var("union_h", Sort::Bool);
+    let a = ArrayPropagatedEqualityReplay::new(x, y, vec![TheoryLit::new(g, true)]);
+    let b = ArrayPropagatedEqualityReplay::new(y, z, vec![TheoryLit::new(h, true)]);
+    let c = ArrayPropagatedEqualityReplay::new(x, z, vec![TheoryLit::new(g, true)]);
+    let a_other_reason = ArrayPropagatedEqualityReplay::new(x, y, vec![TheoryLit::new(h, true)]);
+    assert_ne!(a, a_other_reason);
+    assert_eq!(
+        TheoryCombiner::stable_array_replay_union(
+            &[a.clone(), b.clone(), a.clone()],
+            &[
+                b.clone(),
+                c.clone(),
+                c.clone(),
+                a_other_reason.clone(),
+                a.clone()
+            ],
+        ),
+        vec![
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            c.clone(),
+            a_other_reason.clone()
+        ],
+    );
+    assert_eq!(
+        TheoryCombiner::stable_array_replay_union(
+            &[],
+            &[
+                a.clone(),
+                a.clone(),
+                a_other_reason.clone(),
+                b.clone(),
+                b.clone()
+            ],
+        ),
+        vec![a, a_other_reason, b],
+        "an empty imported prefix does not license cloning persistent duplicates unchanged",
+    );
+    assert!(TheoryCombiner::stable_array_replay_union(&[], &[]).is_empty());
+}
+
+#[test]
+fn array_replay_union_keeps_imported_duplicate_delivery_and_reason_liveness() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("delivery_x", Sort::Int);
+    let y = terms.mk_var("delivery_y", Sort::Int);
+    let z = terms.mk_var("delivery_z", Sort::Int);
+    let live_guard = terms.mk_var("live_guard", Sort::Bool);
+    let stale_guard = terms.mk_var("stale_guard", Sort::Bool);
+    let live = ArrayPropagatedEqualityReplay::new(x, y, vec![TheoryLit::new(live_guard, true)]);
+    let stale = ArrayPropagatedEqualityReplay::new(y, z, vec![TheoryLit::new(stale_guard, true)]);
+    let mut current = TheoryCombiner::array_euf(&terms);
+    current.import_array_equality_replays(&[live.clone(), stale.clone(), live.clone()]);
+    current.assert_literal(live_guard, true);
+    current.assert_literal(stale_guard, false);
+    assert_eq!(
+        current.replay_valid_array_equalities_to_euf(),
+        2,
+        "the existing imported duplicate delivery count must be preserved",
+    );
+    assert!(matches!(
+        TheorySolver::check(&mut current.euf),
+        TheoryResult::Sat
+    ));
+    assert!(current.euf.are_equal(x, y));
+    assert!(!current.euf.are_equal(y, z));
+    assert_eq!(current.export_array_equality_replays(), vec![live.clone()]);
+    assert!(!current
+        .export_array_sent_equality_replays()
+        .contains(&stale));
+    assert_eq!(current.replay_valid_array_equalities_to_euf(), 2);
+    assert_eq!(current.export_array_equality_replays(), vec![live]);
+}

@@ -23,6 +23,24 @@ impl Executor {
         s: &str,
         element_sort: &Option<Sort>,
     ) -> EvalValue {
+        self.parse_model_value_string_borrowed(s, element_sort.as_ref())
+    }
+
+    pub(super) fn parse_model_value_string_borrowed(
+        &self,
+        s: &str,
+        element_sort: Option<&Sort>,
+    ) -> EvalValue {
+        // Text is borrowed; price parsing/output scratch before any BigInt,
+        // unescaping or variable-sized string conversion.
+        if !super::evaluation_copies::validate(self)
+            || !s
+                .len()
+                .checked_mul(8)
+                .is_some_and(|bytes| super::evaluation_copies::pay(s.len(), bytes))
+        {
+            return EvalValue::Unknown;
+        }
         // Try to determine the expected sort
         match element_sort {
             Some(Sort::Int) => {
@@ -87,6 +105,13 @@ impl Executor {
     /// Handles: integer, `(- n)`, `(/ n d)`, `(/ (- n) d)`, `(- (/ n d))`,
     /// and decimal forms like `1.0` or `1.5`.
     pub(super) fn parse_real_string(s: &str) -> EvalValue {
+        if !s
+            .len()
+            .checked_mul(8)
+            .is_some_and(|bytes| super::evaluation_copies::pay(s.len(), bytes))
+        {
+            return EvalValue::Unknown;
+        }
         let trimmed = s.trim();
         // Integer
         if let Ok(n) = trimmed.parse::<BigInt>() {
@@ -148,6 +173,13 @@ impl Executor {
     ///
     /// Handles: `#x..`, `#b..`, decimal integers, and `(_ bvN W)`.
     pub(super) fn parse_bitvec_string(s: &str, width: u32) -> EvalValue {
+        if !s
+            .len()
+            .checked_mul(8)
+            .is_some_and(|bytes| super::evaluation_copies::pay(s.len(), bytes))
+        {
+            return EvalValue::Unknown;
+        }
         let trimmed = s.trim();
         if let Some(hex) = trimmed.strip_prefix("#x") {
             if let Some(value) = BigInt::parse_bytes(hex.as_bytes(), 16) {
@@ -349,6 +381,7 @@ impl Executor {
                 | "seq.empty"
                 | "seq.++"
                 | "seq.len"
+                | "seq.power"
                 | "seq.nth"
                 | "seq.extract"
                 | "seq.contains"

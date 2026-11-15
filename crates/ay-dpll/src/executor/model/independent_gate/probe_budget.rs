@@ -123,6 +123,19 @@ pub(in crate::executor) struct QuantifiedGateProbeBudget {
     /// `granted_ms` this is NOT refunded, so it is the clock-free measurement
     /// of fan-out: it counts arms even when every one of them returns in 0 ms.
     arms_opened: u32,
+    /// Confirming gate obligations admitted on a `discharged-trust` UNSAT
+    /// since the last external query boundary (monotonic within a query). The
+    /// publication gate compares it around its candidate loop to learn whether
+    /// a `confirmed` record rests on one.
+    trust_confirmations: u64,
+    /// SAT certificates (finite-table and default-row, constant
+    /// interpretation, CEGQI) minted since the last external query boundary
+    /// on at least one `discharged-trust` refutation. The gate's deferred arms
+    /// read it, so a grant they defer to is recorded as resting on one (at
+    /// worst over-disclosed when two certificates are minted in one query,
+    /// never under-disclosed). Like the budget it lives here, outside any
+    /// per-scope state a restore could roll back.
+    trust_certificates: u64,
     /// Last per-probe ceiling handed to `checked_ground_solve` by a gate
     /// obligation. Test-only, and the only way a barrier can observe that the
     /// call site passes the budgeted constant rather than a flat literal.
@@ -136,6 +149,8 @@ impl Default for QuantifiedGateProbeBudget {
             remaining_ms: QUERY_GATE_BUDGET_MS,
             granted_ms: 0,
             arms_opened: 0,
+            trust_confirmations: 0,
+            trust_certificates: 0,
             #[cfg(test)]
             last_probe_cap_ms: std::cell::Cell::new(0),
         }
@@ -178,6 +193,8 @@ impl QuantifiedGateProbeBudget {
         self.remaining_ms = QUERY_GATE_BUDGET_MS;
         self.granted_ms = 0;
         self.arms_opened = 0;
+        self.trust_confirmations = 0;
+        self.trust_certificates = 0;
     }
 
     /// Deduct and return the wall slice one gate arm may run for.
@@ -215,6 +232,26 @@ impl QuantifiedGateProbeBudget {
     pub(in crate::executor) fn record_probe_cap(&self, cap_ms: u64) {
         #[cfg(test)]
         self.last_probe_cap_ms.set(cap_ms);
+    }
+
+    /// Book one confirming obligation admitted on a `discharged-trust` UNSAT.
+    pub(in crate::executor) fn record_trust_confirmation(&mut self) {
+        self.trust_confirmations = self.trust_confirmations.saturating_add(1);
+    }
+
+    /// Confirming obligations admitted on `discharged-trust` so far this query.
+    pub(in crate::executor) fn trust_confirmations(&self) -> u64 {
+        self.trust_confirmations
+    }
+
+    /// Book one SAT certificate minted on a `discharged-trust` refutation.
+    pub(in crate::executor) fn record_trust_certificate(&mut self) {
+        self.trust_certificates = self.trust_certificates.saturating_add(1);
+    }
+
+    /// Whether a SAT certificate minted this query rests on `discharged-trust`.
+    pub(in crate::executor) fn certificate_rests_on_trust(&self) -> bool {
+        self.trust_certificates > 0
     }
 
     /// Return the unspent remainder of an arm slice. `spent_ms` is measured
@@ -280,7 +317,7 @@ impl crate::executor::Executor {
         let saved = self.solve_deadline.get();
         let arm = self.quantified_gate_probe_budget.open_arm(saved);
         let window = arm.deadline();
-        self.set_deadline(match saved {
+        self.set_search_deadline(match saved {
             Some(deadline) if deadline < window => Some(deadline),
             _ => Some(window),
         });
@@ -296,7 +333,7 @@ impl crate::executor::Executor {
         arm: GateArmGrant,
         saved_deadline: Option<Instant>,
     ) {
-        self.set_deadline(saved_deadline);
+        self.set_search_deadline(saved_deadline);
         self.quantified_gate_probe_budget
             .close_arm(arm, arm.spent_ms());
     }

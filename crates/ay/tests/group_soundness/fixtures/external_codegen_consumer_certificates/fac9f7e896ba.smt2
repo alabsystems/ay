@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const vn_lo (_ BitVec 64))
+(declare-const vn_hi (_ BitVec 64))
+(assert (not (= (concat (bvashr ((_ extract 63 0) vn_hi) (_ bv37 64)) (bvashr ((_ extract 63 0) vn_lo) (_ bv37 64))) (concat (bvashr ((_ extract 127 64) (concat vn_hi vn_lo)) (_ bv37 64)) (bvashr ((_ extract 63 0) (concat vn_hi vn_lo)) (_ bv37 64))))))
+(check-sat)
+(exit)

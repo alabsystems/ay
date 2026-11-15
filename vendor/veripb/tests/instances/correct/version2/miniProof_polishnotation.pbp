@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 2.0
+f 5
+p 3 1 * 4 1 * + s
+e 1 x1 +1 x3 >= 1 ; 6
+p 1 2 + 6 +
+e +2 x1 +2 x2 +2 x3 >= 3 ; 7
+p 1 2 + 6 + 2 d
+e 1 x1 1 x2 1 x3 >= 2 ; 8
+p 5 2 * 8 2 * +
+e >= 2 ; 9
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

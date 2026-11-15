@@ -30,15 +30,10 @@
 //! | `arith_base::can_update_num`                | [`Search::can_update`]        |
 //! | `ddfw::shift_weights` / `transfer_weight`   | [`Search::shift_weights`]     |
 //!
-//! **Deliberate specialization.** z3's loop alternates a Boolean mode (a `ddfw`
-//! flip over genuine Boolean variables) with an arithmetic mode. QF_NIA
-//! benchmarks of the target shape (VeryMax/AProVE termination VCs) have *no*
-//! Boolean variables — every literal is an arithmetic atom — so z3's own
-//! `bool_in_unsat == 0` branch would put it in arithmetic mode permanently.
-//! This port implements the arithmetic mode plus the `ddfw` weight transfer and
-//! declines (returns `None`) on any formula whose clausification would need
-//! genuine Boolean variables. The Boolean mode is therefore *absent*, not
-//! *approximated*.
+//! Genuine Boolean leaves use the DDfw weighted flip mode from Z3 5.3.3
+//! `src/ast/sls/sat_ddfw.cpp`. The arithmetic/Boolean scheduler follows
+//! `sls_arith_clausal.cpp`: only arithmetic atoms enter polynomial storage;
+//! genuine Bool assignments stay Boolean through exact replay and publication.
 //!
 //! ## Soundness
 //!
@@ -76,6 +71,13 @@ use ay_core::term::{Constant, Symbol, TermData, TermId};
 use ay_core::{Sort, TheoryResult};
 
 use super::{HashMap, NiaSolver};
+
+#[path = "local_search_witness.rs"]
+mod witness;
+use witness::SearchProgress;
+#[path = "local_search_boolean.rs"]
+mod boolean;
+use boolean::SearchMode;
 
 // ---------------------------------------------------------------------------
 // Budgets — every one of these is a completeness-only knob (#nia-clausal-sls).
@@ -116,6 +118,15 @@ const DEADLINE_POLL_STEPS: u64 = 64;
 /// whole deadline.
 const BUDGET_FRACTION: u32 = 60;
 
+/// The split probe's slice (#nia-split-probe): 1/`SPLIT_PROBE_DIVISOR` of the
+/// remaining solve budget, at most [`SPLIT_PROBE_MAX`].
+const SPLIT_PROBE_DIVISOR: u32 = 50;
+const SPLIT_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(test)]
+#[path = "local_search_stop_tests.rs"]
+mod stop_tests;
+
 // ---------------------------------------------------------------------------
 // Polynomial / atom representation (z3: `arith_base::ineq`)
 // ---------------------------------------------------------------------------
@@ -154,6 +165,8 @@ struct NlCoeff {
 
 #[derive(Debug)]
 struct Atom {
+    /// A genuine Bool leaf, separate from polynomial/numeric storage.
+    boolean: Option<TermId>,
     monos: Vec<Mono>,
     op: Op,
     /// Cached value of each monomial under the current assignment.
@@ -272,6 +285,7 @@ struct Builder<'t> {
     terms: &'t ay_core::term::TermStore,
     var_of: HashMap<TermId, VarIdx>,
     var_term: Vec<TermId>,
+    boolean_atom: HashMap<TermId, u32>,
     atom_of: HashMap<(Vec<(i128, Vec<(VarIdx, u32)>)>, Op), u32>,
     atoms: Vec<Atom>,
     /// First reason clausification declined, for the debug channel only.
@@ -286,6 +300,7 @@ impl<'t> Builder<'t> {
             terms,
             var_of: HashMap::default(),
             var_term: Vec::new(),
+            boolean_atom: HashMap::default(),
             atom_of: HashMap::default(),
             atoms: Vec::new(),
             decline: None,
@@ -303,7 +318,7 @@ impl<'t> Builder<'t> {
         if let Some(&v) = self.var_of.get(&t) {
             return Some(v);
         }
-        if self.var_term.len() >= MAX_VARS {
+        if self.var_term.len() + self.boolean_atom.len() >= MAX_VARS {
             return None;
         }
         let v = self.var_term.len() as VarIdx;
@@ -358,13 +373,13 @@ impl<'t> Builder<'t> {
                     }
                     "-" if args.len() == 1 => {
                         let p = self.poly(args[0])?;
-                        Some(neg_poly(p))
+                        neg_poly(p)
                     }
                     "-" if args.len() >= 2 => {
                         let mut acc = self.poly(args[0])?;
                         for a in &args[1..] {
                             let p = self.poly(*a)?;
-                            acc = add_poly(acc, neg_poly(p))?;
+                            acc = add_poly(acc, neg_poly(p)?)?;
                         }
                         Some(acc)
                     }
@@ -418,6 +433,7 @@ impl<'t> Builder<'t> {
             .collect();
         let n = poly.len();
         self.atoms.push(Atom {
+            boolean: None,
             monos: poly,
             op,
             mono_val: vec![0; n],
@@ -454,7 +470,7 @@ impl<'t> Builder<'t> {
         let Some(pb) = self.poly(b) else {
             return self.decline(|| format!("rhs of ({name} ..) is not a polynomial"));
         };
-        let Some(diff) = add_poly(pa, neg_poly(pb)) else {
+        let Some(diff) = neg_poly(pb).and_then(|npb| add_poly(pa, npb)) else {
             return self.decline(|| format!("({name} ..) polynomial too large"));
         }; // a - b
            // Each SMT relation becomes `p OP 0`; `positive == false` flips the
@@ -474,8 +490,11 @@ impl<'t> Builder<'t> {
                 Some(p) => (p, Op::Le, !positive),
                 None => return self.decline(|| "polynomial too large".to_string()),
             },
-            ">=" => (neg_poly(diff), Op::Le, !positive),
-            ">" => match add_poly(neg_poly(diff), one) {
+            ">=" => match neg_poly(diff) {
+                Some(p) => (p, Op::Le, !positive),
+                None => return self.decline(|| "polynomial too large".to_string()),
+            },
+            ">" => match neg_poly(diff).and_then(|d| add_poly(d, one)) {
                 Some(p) => (p, Op::Le, !positive),
                 None => return self.decline(|| "polynomial too large".to_string()),
             },
@@ -499,6 +518,34 @@ impl<'t> Builder<'t> {
             TermData::Not(inner) => {
                 let inner = *inner;
                 self.cnf(inner, !positive, depth + 1)
+            }
+            TermData::Var(_, _) if self.terms.sort(t) == &Sort::Bool => {
+                let atom = if let Some(&atom) = self.boolean_atom.get(&t) {
+                    atom
+                } else {
+                    if self.var_term.len() + self.boolean_atom.len() >= MAX_VARS
+                        || self.atoms.len() >= MAX_ATOMS
+                    {
+                        return None;
+                    }
+                    let atom = u32::try_from(self.atoms.len()).ok()?;
+                    self.atoms.push(Atom {
+                        boolean: Some(t),
+                        monos: Vec::new(),
+                        op: Op::Eq,
+                        mono_val: Vec::new(),
+                        value: 0,
+                        truth: false,
+                        occ: Vec::new(),
+                        lit_occ: Vec::new(),
+                    });
+                    self.boolean_atom.insert(t, atom);
+                    atom
+                };
+                Some(vec![vec![Lit {
+                    atom,
+                    negated: !positive,
+                }]])
             }
             TermData::Const(Constant::Bool(b)) => {
                 // `true` is the empty CONJUNCTION (no clauses); `false` is the
@@ -581,11 +628,25 @@ impl<'t> Builder<'t> {
     }
 }
 
-fn neg_poly(mut p: Poly) -> Poly {
+/// Negate every coefficient, DECLINING rather than panicking on `i128::MIN`.
+///
+/// `-m.coeff` panicked here — measured 2026-09-07 as `attempt to negate with
+/// overflow`, twice, while compiler_consumer verified `ty`'s workspace. The NIA solver runs
+/// IN-PROCESS inside the compiler, so this is not a solver error a caller can
+/// handle: it kills the rustc process with an ICE and the crate under
+/// verification reports nothing.
+///
+/// `i128::MIN` has no positive counterpart, so there is no value to return and
+/// no saturation that preserves the algebra — a saturated `i128::MAX` would make
+/// `neg(neg(p)) != p` and silently corrupt every downstream conflict. `None`
+/// ("this polynomial is out of range for me") is the same contract `add_poly`
+/// already has for its `checked_add`, and every call site was already in an
+/// `Option` context, so this costs no expressiveness.
+fn neg_poly(mut p: Poly) -> Option<Poly> {
     for m in &mut p {
-        m.coeff = -m.coeff;
+        m.coeff = m.coeff.checked_neg()?;
     }
-    p
+    Some(p)
 }
 
 fn add_poly(mut a: Poly, b: Poly) -> Option<Poly> {
@@ -711,6 +772,7 @@ struct Search {
     /// z3 `save_best_values`: best (lowest-cost) assignment seen so far, used
     /// to seed perturbed restarts.
     best_values: Vec<i128>,
+    best_booleans: Vec<(usize, bool)>,
     best_cost: usize,
 }
 
@@ -784,6 +846,7 @@ impl Search {
             best_last_step: u64::MAX,
             overflow: false,
             best_values: Vec::new(),
+            best_booleans: Vec::new(),
             best_cost: usize::MAX,
         }
     }
@@ -882,18 +945,18 @@ impl Search {
                 }
                 _ if c > 0 => {
                     // x <= floor((-k - strict)/c)
-                    let Some(n) = neg_k.checked_sub(strict_adj) else {
+                    let Some(bound) = neg_k.checked_sub(strict_adj).and_then(|n| floor_div(n, c))
+                    else {
                         continue;
                     };
-                    let bound = floor_div(n, c);
                     vi.hi = Some(vi.hi.map_or(bound, |h| h.min(bound)));
                 }
                 _ => {
                     // c < 0: x >= ceil((-k - strict)/c)
-                    let Some(n) = neg_k.checked_sub(strict_adj) else {
+                    let Some(bound) = neg_k.checked_sub(strict_adj).and_then(|n| ceil_div(n, c))
+                    else {
                         continue;
                     };
-                    let bound = ceil_div(n, c);
                     vi.lo = Some(vi.lo.map_or(bound, |l| l.max(bound)));
                 }
             }
@@ -933,6 +996,9 @@ impl Search {
     /// Full recomputation of every atom value / truth and every clause count.
     fn recompute_all(&mut self) {
         for ai in 0..self.atoms.len() {
+            if self.atoms[ai].boolean.is_some() {
+                continue;
+            }
             let n = self.atoms[ai].monos.len();
             let mut sum: i128 = 0;
             for mi in 0..n {
@@ -1113,7 +1179,7 @@ impl Search {
         if coeff == 0 {
             return None;
         }
-        Some(n / coeff)
+        n.checked_div(coeff)
     }
 
     /// z3 `find_linear_moves`.
@@ -1209,10 +1275,14 @@ impl Search {
         ) else {
             return;
         };
-        let mut ll = floor_div(nb_minus, two_a);
-        let mut lh = ceil_div(nb_minus, two_a);
-        let mut rl = floor_div(nb_plus, two_a);
-        let mut rh = ceil_div(nb_plus, two_a);
+        let (Some(mut ll), Some(mut lh), Some(mut rl), Some(mut rh)) = (
+            floor_div(nb_minus, two_a),
+            ceil_div(nb_minus, two_a),
+            floor_div(nb_plus, two_a),
+            ceil_div(nb_plus, two_a),
+        ) else {
+            return;
+        };
         if lh > rl {
             std::mem::swap(&mut ll, &mut rl);
             std::mem::swap(&mut lh, &mut rh);
@@ -1383,6 +1453,15 @@ impl Search {
                 self.find_linear_moves(ai, x, b);
             } else if let Some((a, b)) = self.is_quadratic(x, nl, atom_ref) {
                 self.find_quadratic_moves(ai, x, a, b);
+            } else {
+                // Zero-factor plateau (#nia-sls-zero-factor): every
+                // effective coefficient can vanish when another factor of
+                // a product is zero, leaving no linear/quadratic move even
+                // though a ±1 step makes a coefficient nonzero next step.
+                // Applies to equalities and to eqdv definition inequalities
+                // alike (the pair form reaches this lane as `<=`/`>=`).
+                self.add_update(x, 1);
+                self.add_update(x, -1);
             }
         }
         self.atoms[ai as usize].occ = occ;
@@ -1697,7 +1776,7 @@ impl Search {
         // 0: z3's plain reset. 1: perturb the best assignment seen. 2: a small
         // random point. Cycling the three keeps the trajectory from re-entering
         // the same plateau.
-        let mode = if self.best_values.is_empty() {
+        let mode = if self.best_values.is_empty() && self.best_booleans.is_empty() {
             0
         } else {
             restarts % 3
@@ -1723,6 +1802,20 @@ impl Search {
             self.vars[v].tabu_pos = 0;
             self.vars[v].tabu_neg = 0;
         }
+        for index in 0..self.best_booleans.len() {
+            let (ai, best) = self.best_booleans[index];
+            self.atoms[ai].truth = match mode {
+                1 => {
+                    if self.rng.below(4) == 0 {
+                        !best
+                    } else {
+                        best
+                    }
+                }
+                2 => self.rng.below(2) == 0,
+                _ => false,
+            };
+        }
         for c in &mut self.clauses {
             c.weight = INIT_WEIGHT;
         }
@@ -1733,8 +1826,16 @@ impl Search {
         self.recompute_all();
     }
 
-    /// z3 `arith_clausal::search`, arithmetic mode only (see module docs).
+    /// z3 `arith_clausal::search` (see module docs).
+    #[cfg(test)]
     fn run(&mut self, deadline: Option<ay_core::time::Instant>) -> bool {
+        self.run_with_progress(|| {
+            deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
+                || ay_core::resource::check_stop_requested()
+        })
+    }
+
+    fn run_with_progress(&mut self, mut should_stop: impl FnMut() -> bool) -> bool {
         self.extract_bounds();
         for v in 0..self.vars.len() {
             self.vars[v].value = self.base_value(v);
@@ -1746,17 +1847,28 @@ impl Search {
         // z3 `save_best_values`.
         self.best_cost = self.unsat.len();
         self.best_values = self.vars.iter().map(|v| v.value).collect();
+        self.best_booleans = self
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, atom)| atom.boolean.is_some())
+            .map(|(ai, atom)| (ai, atom.truth))
+            .collect();
         let mut local_best = self.unsat.len();
         let mut no_improve: u64 = 0;
         let mut restarts: u64 = 0;
+        let mut mode = SearchMode::Arithmetic;
+        let mut no_improve_bool = 0u64;
+        let mut no_improve_arith = 0u64;
+        let mut best_bool = self.unsat.len();
+        let mut best_arith = self.unsat.len();
+        let has_boolean = self.atoms.iter().any(|atom| atom.boolean.is_some());
         while self.step < MAX_STEPS {
+            if self.step.is_multiple_of(DEADLINE_POLL_STEPS) && should_stop() {
+                return false;
+            }
             if self.unsat.is_empty() {
                 return true;
-            }
-            if self.step.is_multiple_of(DEADLINE_POLL_STEPS)
-                && deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
-            {
-                return false;
             }
             self.step += 1;
             if no_improve > RESTART_AFTER {
@@ -1767,9 +1879,68 @@ impl Search {
                 }
                 no_improve = 0;
                 local_best = self.unsat.len();
+                no_improve_bool = 0;
+                no_improve_arith = 0;
+                best_bool = self.unsat.len();
+                best_arith = self.unsat.len();
+                mode = SearchMode::Arithmetic;
                 continue;
             }
-            self.move_arith_variable();
+            if has_boolean {
+                let Some((bools, external)) = self.unsat_kinds(&mut should_stop) else {
+                    return false;
+                };
+                let total = bools + external;
+                let previous = mode;
+                if bools == 0
+                    || (matches!(mode, SearchMode::Boolean)
+                        && external > 0
+                        && no_improve_bool.saturating_mul(total) > 5 * bools)
+                {
+                    mode = SearchMode::Arithmetic;
+                } else if external == 0
+                    || (matches!(mode, SearchMode::Arithmetic)
+                        && no_improve_arith.saturating_mul(total) > 20 * external)
+                {
+                    mode = SearchMode::Boolean;
+                }
+                if mode != previous {
+                    match mode {
+                        SearchMode::Boolean => {
+                            no_improve_bool = 0;
+                            best_bool = self.unsat.len();
+                        }
+                        SearchMode::Arithmetic => {
+                            no_improve_arith = 0;
+                            best_arith = self.unsat.len();
+                        }
+                    }
+                }
+                match mode {
+                    SearchMode::Boolean => {
+                        if self.move_boolean(&mut should_stop).is_none() {
+                            return false;
+                        }
+                        if self.unsat.len() < best_bool {
+                            best_bool = self.unsat.len();
+                            no_improve_bool = 0;
+                        } else {
+                            no_improve_bool += 1;
+                        }
+                    }
+                    SearchMode::Arithmetic => {
+                        self.move_arith_variable();
+                        if self.unsat.len() < best_arith {
+                            best_arith = self.unsat.len();
+                            no_improve_arith = 0;
+                        } else {
+                            no_improve_arith += 1;
+                        }
+                    }
+                }
+            } else {
+                self.move_arith_variable();
+            }
             if self.overflow {
                 return false;
             }
@@ -1778,6 +1949,9 @@ impl Search {
                 self.best_cost = cost;
                 self.best_values.clear();
                 self.best_values.extend(self.vars.iter().map(|v| v.value));
+                for (ai, value) in &mut self.best_booleans {
+                    *value = self.atoms[*ai].truth;
+                }
             }
             if cost < local_best {
                 local_best = cost;
@@ -1812,21 +1986,23 @@ fn describe(terms: &ay_core::term::TermStore, t: TermId) -> String {
     }
 }
 
-fn floor_div(a: i128, b: i128) -> i128 {
-    let q = a / b;
-    if (a % b != 0) && ((a < 0) != (b < 0)) {
-        q - 1
+/// `None` where the quotient is unrepresentable (`i128::MIN / -1`) or the
+/// rounding step leaves `i128`; callers skip the bound rather than wrap.
+fn floor_div(a: i128, b: i128) -> Option<i128> {
+    let q = a.checked_div(b)?;
+    if (a.checked_rem(b)? != 0) && ((a < 0) != (b < 0)) {
+        q.checked_sub(1)
     } else {
-        q
+        Some(q)
     }
 }
 
-fn ceil_div(a: i128, b: i128) -> i128 {
-    let q = a / b;
-    if (a % b != 0) && ((a < 0) == (b < 0)) {
-        q + 1
+fn ceil_div(a: i128, b: i128) -> Option<i128> {
+    let q = a.checked_div(b)?;
+    if (a.checked_rem(b)? != 0) && ((a < 0) == (b < 0)) {
+        q.checked_add(1)
     } else {
-        q
+        Some(q)
     }
 }
 
@@ -1861,16 +2037,63 @@ impl NiaSolver<'_> {
         positive: bool,
         var_map: &HashMap<TermId, i64>,
     ) -> Option<bool> {
-        match self.terms.get(term) {
+        self.eval_formula_exact_with_progress(term, positive, var_map, &mut || true)
+    }
+
+    /// The formula evaluator uses the same controlled integer evaluator;
+    /// a refused visit is never converted to a false/true witness result.
+    fn eval_formula_exact_with_progress(
+        &self,
+        term: TermId,
+        positive: bool,
+        var_map: &HashMap<TermId, i64>,
+        progress: &mut impl FnMut() -> bool,
+    ) -> Option<bool> {
+        self.eval_formula_with_boolean_witness(
+            term,
+            positive,
+            var_map,
+            &HashMap::default(),
+            progress,
+        )
+    }
+
+    fn eval_formula_with_boolean_witness(
+        &self,
+        term: TermId,
+        positive: bool,
+        var_map: &HashMap<TermId, i64>,
+        boolean_values: &HashMap<TermId, bool>,
+        progress: &mut impl FnMut() -> bool,
+    ) -> Option<bool> {
+        if !progress() {
+            return None;
+        }
+        let result = match self.terms.get(term) {
+            TermData::Var(_, _) if self.terms.sort(term) == &Sort::Bool => {
+                boolean_values.get(&term).map(|value| *value == positive)
+            }
             TermData::Const(Constant::Bool(b)) => Some(*b == positive),
-            TermData::Not(inner) => self.eval_formula_exact(*inner, !positive, var_map),
+            TermData::Not(inner) => self.eval_formula_with_boolean_witness(
+                *inner,
+                !positive,
+                var_map,
+                boolean_values,
+                progress,
+            ),
             TermData::App(Symbol::Named(name), args) => match name.as_str() {
                 "and" | "or" => {
                     // Under `positive == false` De Morgan swaps the connective.
                     let conjunctive = (name == "and") == positive;
                     let mut acc = conjunctive;
                     for &a in args {
-                        let v = self.eval_formula_exact(a, positive, var_map)?;
+                        let v = self.eval_formula_with_boolean_witness(
+                            a,
+                            positive,
+                            var_map,
+                            boolean_values,
+                            progress,
+                        )?;
                         if conjunctive {
                             acc &= v;
                         } else {
@@ -1884,14 +2107,31 @@ impl NiaSolver<'_> {
                     let mut acc = false;
                     for (i, &a) in args.iter().enumerate() {
                         let pol = i + 1 == n;
-                        acc |= self.eval_formula_exact(a, pol, var_map)?;
+                        acc |= self.eval_formula_with_boolean_witness(
+                            a,
+                            pol,
+                            var_map,
+                            boolean_values,
+                            progress,
+                        )?;
                     }
                     Some(acc == positive)
                 }
-                "not" if args.len() == 1 => self.eval_formula_exact(args[0], !positive, var_map),
-                _ => self.eval_constraint_exact(term, positive, var_map),
+                "not" if args.len() == 1 => self.eval_formula_with_boolean_witness(
+                    args[0],
+                    !positive,
+                    var_map,
+                    boolean_values,
+                    progress,
+                ),
+                _ => self.eval_constraint_exact_with_progress(term, positive, var_map, progress),
             },
-            _ => self.eval_constraint_exact(term, positive, var_map),
+            _ => self.eval_constraint_exact_with_progress(term, positive, var_map, progress),
+        };
+        if progress() {
+            result
+        } else {
+            None
         }
     }
 
@@ -1934,10 +2174,83 @@ impl NiaSolver<'_> {
         }
     }
 
+    /// The iteration-0 first offer (#nia-sls-first-offer): a SLICED run of
+    /// the lane — canonical-point witness, then clausal search for at most
+    /// the split-probe slice (1/50 of the remaining budget, capped at
+    /// [`SPLIT_PROBE_MAX`]) inside the shared cutoff.
+    ///
+    /// The full lane at this offer point starved exact decision procedures
+    /// that run immediately after it: on UNSAT shapes bounded enumeration
+    /// decides in well under a second (measured: a 60-link nonzero chain,
+    /// 0.44 s with the lane quarantined), while the SAT-only lane — which
+    /// can never refute — burned its whole 60%-of-wall shared budget
+    /// first and the query timed out `unknown`. The slice keeps the
+    /// first-offer's purpose (the lane is OFFERED on
+    /// monomial-inconsistent queries, p32315) without letting it own the
+    /// wall ahead of a deciding exact procedure; the full lane remains
+    /// available at the later offer points (`local_search_done` is left
+    /// untouched here, exactly as in `try_split_probe`).
+    pub(crate) fn try_local_search_first_offer(&mut self) -> Option<TheoryResult> {
+        if ay_core::theory_disable_flags().no_nia_clausal_sls
+            || self.root_assertions.is_empty()
+            || self.should_timeout()
+        {
+            return None;
+        }
+        let now = ay_core::time::Instant::now();
+        let slice = match self.deadline {
+            Some(dl) if dl > now => ((dl - now) / SPLIT_PROBE_DIVISOR).min(SPLIT_PROBE_MAX),
+            Some(_) => return None,
+            // No wall deadline: this offer repeats on every rebuilt theory
+            // instance (unlike the one-shot split probe), so an unbounded
+            // 250 ms-per-round burn is possible. Canonical witness only.
+            None => {
+                let mut progress = SearchProgress::new(self.local_search_budget());
+                return self.canonical_point_witness(&mut progress);
+            }
+        };
+        let end = match self.local_search_budget() {
+            Some(cutoff) => cutoff.min(now + slice),
+            None => now + slice,
+        };
+        if end <= now {
+            return None;
+        }
+        let start = ay_core::time::Instant::now();
+        let mut progress = SearchProgress::new(Some(end));
+        let result = self.canonical_point_witness(&mut progress).or_else(|| {
+            if progress.poll(self) {
+                self.clausal_local_search_until(&mut progress)
+            } else {
+                None
+            }
+        });
+        self.timings.enumeration += start.elapsed();
+        debug_assert!(
+            !matches!(result, Some(TheoryResult::Unsat(_))),
+            "clausal local search must never refute"
+        );
+        if self.debug {
+            safe_eprintln!(
+                "[NIA] SLS first offer ({} ms slice): {}",
+                slice.as_millis(),
+                if result.is_some() {
+                    "SAT with verified witness"
+                } else {
+                    "no witness"
+                }
+            );
+        }
+        result
+    }
+
     pub(crate) fn try_clausal_local_search(&mut self) -> Option<TheoryResult> {
         // B16 CLI kill switch for A/B measurement or quarantine; the default
         // keeps the clausal local-search lane enabled.
         if ay_core::theory_disable_flags().no_nia_clausal_sls {
+            return None;
+        }
+        if self.should_timeout() {
             return None;
         }
         if self.root_assertions.is_empty() {
@@ -1966,12 +2279,128 @@ impl NiaSolver<'_> {
         // they play no role here (the search owns its own assignment), but drop
         // them so nothing downstream sees a half-applied scope.
         self.undo_tentative_patch();
+        let mut progress = SearchProgress::new(self.local_search_budget());
+        self.clausal_local_search_until(&mut progress)
+    }
 
-        let roots = self.root_assertions.clone();
+    /// The split probe (#nia-split-probe): ONE short clausal local search per
+    /// solve, when the first factor split of the solve is about to enumerate.
+    ///
+    /// Every caller tries the factor split before this lane — so when the split
+    /// refutes the current Boolean assignment (it usually does), the local
+    /// search is never offered, although it searches the ORIGINAL assertions
+    /// and does not depend on that assignment. AProVE 3478322092999958257 has
+    /// the witness "every variable 1"; main reaches it through 404 full-set
+    /// split conflicts, the precise split conflicts send the search elsewhere
+    /// and it never gets there (`unknown` at 30 s; its refinement rarely
+    /// stalls, so a probe at the stall path never ran). The slice is 2 % of the
+    /// remaining budget,
+    /// at most [`SPLIT_PROBE_MAX`], inside the shared local-search cutoff; it
+    /// leaves the tentative scopes and `local_search_done` alone (the full lane
+    /// stays available), and like the lane it claims only a witness exact
+    /// evaluation accepts on every root — it can never refute.
+    pub(crate) fn try_split_probe(&mut self) -> Option<TheoryResult> {
+        if ay_core::theory_disable_flags().no_nia_clausal_sls
+            || self.root_assertions.is_empty()
+            || self.should_timeout()
+        {
+            return None;
+        }
+        self.split_probe.as_ref()?;
+        let now = ay_core::time::Instant::now();
+        let slice = match self.deadline {
+            Some(dl) if dl > now => ((dl - now) / SPLIT_PROBE_DIVISOR).min(SPLIT_PROBE_MAX),
+            Some(_) => return None,
+            None => SPLIT_PROBE_MAX,
+        };
+        let end = match self.local_search_budget() {
+            Some(cutoff) => cutoff.min(now + slice),
+            None => now + slice,
+        };
+        if end <= now {
+            return None;
+        }
+        let mut progress = SearchProgress::new(Some(end));
+        if !progress.poll(self) {
+            return None;
+        }
+        let flag = self.split_probe.as_ref()?;
+        if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let result = self.canonical_point_witness(&mut progress).or_else(|| {
+            if progress.poll(self) {
+                self.clausal_local_search_until(&mut progress)
+            } else {
+                None
+            }
+        });
+        if self.debug {
+            safe_eprintln!(
+                "[NIA] Split probe (#nia-split-probe, {} ms): {}",
+                slice.as_millis(),
+                if result.is_some() {
+                    "SAT with verified witness"
+                } else {
+                    "no witness"
+                }
+            );
+        }
+        result
+    }
+
+    /// The clausal local search itself, until `deadline`: builds the clause
+    /// set of the root assertions, searches, and claims `Sat` only for an
+    /// assignment [`NiaSolver::eval_formula_exact`] accepts on every root.
+    fn clausal_local_search_until(
+        &mut self,
+        progress: &mut SearchProgress,
+    ) -> Option<TheoryResult> {
+        if !progress.poll(self) {
+            return None;
+        }
+        let mut roots = Vec::new();
+        for &root in &self.root_assertions {
+            if !progress.poll(self) {
+                return None;
+            }
+            roots.push(root);
+        }
+        self.clausal_search_roots(&roots, progress, true)
+    }
+
+    /// One clausal search over `roots`. When a root declines to
+    /// clausify and `expand_or` allows, and that root is a plain
+    /// top-level disjunction, each disjunct is tried in its place
+    /// (#nia-sls-or-branch): a model of any disjunct (with the
+    /// other roots) is a model of the disjunction, and the final
+    /// exact verification against the ORIGINAL roots below is the
+    /// acceptance gate either way. This reaches queries whose
+    /// `or`-over-`and` distribution exceeds the clause budget
+    /// (measured: VeryMax p32315, part sizes [48, 48, 1770])
+    /// without weakening the distribution cap for the general
+    /// encoding.
+    fn clausal_search_roots(
+        &mut self,
+        roots: &[TermId],
+        progress: &mut SearchProgress,
+        expand_or: bool,
+    ) -> Option<TheoryResult> {
+        if !progress.poll(self) {
+            return None;
+        }
         let mut builder = Builder::new(self.terms);
         let mut clauses: Vec<Vec<Lit>> = Vec::new();
-        for &r in &roots {
+        for &r in roots {
+            if !progress.poll(self) {
+                return None;
+            }
             let Some(cs) = builder.cnf(r, true, 0) else {
+                if expand_or {
+                    if let Some(found) = self.try_or_disjuncts(roots, r, progress) {
+                        return Some(found);
+                    }
+                }
                 if self.debug {
                     safe_eprintln!(
                         "[NIA] Clausal SLS: assertion {:?} {} outside the supported fragment: \
@@ -1991,7 +2420,7 @@ impl NiaSolver<'_> {
                 return None;
             }
         }
-        if clauses.is_empty() || builder.var_term.is_empty() {
+        if clauses.is_empty() || (builder.var_term.is_empty() && builder.boolean_atom.is_empty()) {
             return None;
         }
         // A surviving EMPTY clause means the assertion set is refutable by
@@ -2013,6 +2442,9 @@ impl NiaSolver<'_> {
                 nvars
             );
         }
+        if !progress.poll(self) {
+            return None;
+        }
         let mut search = Search::new(builder, clauses, nvars);
         // Deterministic per-query salt that still varies across the split
         // loop's successive theory instances.
@@ -2025,7 +2457,7 @@ impl NiaSolver<'_> {
                     .wrapping_add(u64::from(v))
             });
         search.reseed(salt);
-        let found = search.run(self.local_search_budget());
+        let found = search.run_with_progress(|| !progress.poll(self));
         if !found {
             if self.debug {
                 safe_eprintln!(
@@ -2037,24 +2469,59 @@ impl NiaSolver<'_> {
             return None;
         }
 
+        self.verify_clausal_witness(&search, &var_term, progress)
+    }
+
+    /// Exact verification of a clausal-search candidate against the
+    /// ORIGINAL root assertions; on success records the witness and
+    /// returns Sat. Any mismatch or unencodable value declines
+    /// (None), preserving the lane's fail-closed contract.
+    fn verify_clausal_witness(
+        &mut self,
+        search: &Search,
+        var_term: &[TermId],
+        progress: &mut SearchProgress,
+    ) -> Option<TheoryResult> {
         // --- exact verification against the ORIGINAL assertion formulas -----
         let mut var_map: HashMap<TermId, i64> = HashMap::default();
         for (i, &t) in var_term.iter().enumerate() {
+            if !progress.poll(self) {
+                return None;
+            }
             let v = search.vars[i].value;
             var_map.insert(t, i64::try_from(v).ok()?);
+        }
+        let mut boolean_values = HashMap::default();
+        for atom in &search.atoms {
+            if !progress.poll(self) {
+                return None;
+            }
+            if let Some(term) = atom.boolean {
+                if !matches!(self.terms.get(term), TermData::Var(_, _))
+                    || self.terms.sort(term) != &Sort::Bool
+                {
+                    return None;
+                }
+                boolean_values.insert(term, atom.truth);
+            }
         }
         // Any Int leaf the search did not encode (it cannot happen for a
         // formula the builder accepted, but this is the fail-closed guard)
         // must still get a value for the evaluator.
-        let mut leaves: Vec<TermId> = Vec::new();
-        for &r in &roots {
-            self.collect_int_var_leaves(r, &mut leaves);
+        for leaf in self.local_search_leaves(progress)? {
+            if !progress.poll(self) {
+                return None;
+            }
+            var_map.entry(leaf).or_insert(0);
         }
-        for l in leaves {
-            var_map.entry(l).or_insert(0);
-        }
-        for &r in &roots {
-            match self.eval_formula_exact(r, true, &var_map) {
+        for &r in &self.root_assertions {
+            match self.eval_formula_with_boolean_witness(
+                r,
+                true,
+                &var_map,
+                &boolean_values,
+                &mut || progress.poll(self),
+            ) {
                 Some(true) => {}
                 _ => {
                     if self.debug {
@@ -2066,35 +2533,75 @@ impl NiaSolver<'_> {
                 }
             }
         }
-        let mut vars: Vec<TermId> = var_map.keys().copied().collect();
-        vars.sort_by_key(|t| t.0);
-        let values: Vec<i64> = vars.iter().map(|v| var_map[v]).collect();
-        self.record_local_search_model(&vars, &values);
+        let mut ordered = BTreeMap::new();
+        for (&term, &value) in &var_map {
+            if !progress.poll(self) {
+                return None;
+            }
+            ordered.insert(term, value);
+        }
+        let mut vars = Vec::new();
+        let mut values = Vec::new();
+        for (term, value) in ordered {
+            if !progress.poll(self) {
+                return None;
+            }
+            vars.push(term);
+            values.push(value);
+        }
         if self.debug {
             safe_eprintln!(
                 "[NIA] Clausal SLS: SAT with verified witness after {} steps",
                 search.step
             );
         }
+        self.record_local_search_model(&vars, &values, progress)?;
+        self.bounded_enum_bool_model = boolean_values;
         Some(TheoryResult::Sat)
     }
 
-    /// Publish the verified witness through the same channel bounded
-    /// enumeration uses, extending it with the monomial auxiliary variables so
-    /// the executor's model stays internally consistent.
-    fn record_local_search_model(&mut self, vars: &[TermId], values: &[i64]) {
-        let var_map: HashMap<TermId, i64> =
-            vars.iter().copied().zip(values.iter().copied()).collect();
-        let mut model: HashMap<TermId, BigInt> = HashMap::default();
-        for (&var, &value) in vars.iter().zip(values) {
-            model.insert(var, BigInt::from(value));
+    /// Try each disjunct of a top-level `or` root in its place
+    /// (#nia-sls-or-branch). Returns the first verified Sat.
+    /// Disjuncts are tried in input order for determinism; the
+    /// shared deadline bounds the whole loop.
+    fn try_or_disjuncts(
+        &mut self,
+        roots: &[TermId],
+        or_root: TermId,
+        progress: &mut SearchProgress,
+    ) -> Option<TheoryResult> {
+        if !progress.poll(self) {
+            return None;
         }
-        for mon in self.monomials.values() {
-            if let Some(value) = self.eval_term(mon.aux_var, &var_map) {
-                model.insert(mon.aux_var, value);
+        let TermData::App(Symbol::Named(name), args) = self.terms.get(or_root) else {
+            return None;
+        };
+        if name.as_str() != "or" || args.len() < 2 {
+            return None;
+        }
+        let mut disjuncts = Vec::new();
+        for &arg in args {
+            if !progress.poll(self) {
+                return None;
+            }
+            disjuncts.push(arg);
+        }
+        for d in disjuncts {
+            if !progress.poll(self) {
+                return None;
+            }
+            let mut replaced = Vec::new();
+            for &root in roots {
+                if !progress.poll(self) {
+                    return None;
+                }
+                replaced.push(if root == or_root { d } else { root });
+            }
+            if let Some(found) = self.clausal_search_roots(&replaced, progress, false) {
+                return Some(found);
             }
         }
-        self.bounded_enum_model = Some(model);
+        None
     }
 }
 
@@ -2103,6 +2610,51 @@ mod tests {
     use super::*;
     use ay_core::term::TermStore;
     use ay_core::TheorySolver;
+
+    /// Regression (#nia-sls-i128-min): an `i128::MIN` constant — the lower
+    /// bound `model-checker-consumer` emits for a 128-bit signed overflow obligation — fits
+    /// `Mono::coeff` but its negation does not. `atom_lit` builds `lhs - rhs`
+    /// through `neg_poly`, which negated the coefficient unchecked and
+    /// PANICKED (`attempt to negate with overflow`; 3 occurrences while compiler_consumer
+    /// verified `library/core`, all on
+    /// `core::num::<impl i128>::unchecked_mul`, whose obligation carries
+    /// `i128::MIN` verbatim). The lane must decline, never panic, and never
+    /// claim.
+    ///
+    /// End-to-end repro (`ay solve`), panicked at `local_search.rs:586:19`
+    /// before the fix and now returns a verdict:
+    /// `benchmarks/smt/QF_NIA/i128_min_constant_sls_8616.smt2`.
+    #[test]
+    fn lane_declines_i128_min_constant_without_overflow() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let xy = terms.mk_mul(vec![x, y]);
+        let min = terms.mk_int(BigInt::from(i128::MIN));
+        // `(<= x MIN)` keeps the constant on the right, so the polynomial of
+        // the atom is `x - MIN` and `neg_poly` meets the unrepresentable
+        // `-i128::MIN`. `x = MIN, y = 1` satisfies both atoms.
+        let upper = terms.mk_le(x, min);
+        let product = terms.mk_eq(xy, min);
+        let root = terms.mk_and(vec![upper, product]);
+        let mut solver = NiaSolver::new(&terms);
+        solver.set_root_assertions(vec![root]);
+        let result = solver.try_clausal_local_search();
+        assert!(
+            result.is_none(),
+            "the polynomial of `x - i128::MIN` is outside the i128 fragment; \
+             the lane must decline, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn neg_poly_rejects_unrepresentable_negation() {
+        let p = vec![mono(i128::MIN, &[]), mono(3, &[(0, 1)])];
+        assert!(neg_poly(p).is_none());
+        let q = vec![mono(-5, &[]), mono(i128::MAX, &[(0, 2)])];
+        let n = neg_poly(q).expect("representable");
+        assert_eq!(n, vec![mono(5, &[]), mono(-i128::MAX, &[(0, 2)])]);
+    }
 
     fn mono(coeff: i128, vars: &[(VarIdx, u32)]) -> Mono {
         Mono {
@@ -2131,14 +2683,17 @@ mod tests {
 
     #[test]
     fn floor_ceil_div_match_math() {
-        assert_eq!(floor_div(7, 2), 3);
-        assert_eq!(floor_div(-7, 2), -4);
-        assert_eq!(floor_div(7, -2), -4);
-        assert_eq!(floor_div(-7, -2), 3);
-        assert_eq!(ceil_div(7, 2), 4);
-        assert_eq!(ceil_div(-7, 2), -3);
-        assert_eq!(ceil_div(7, -2), -3);
-        assert_eq!(ceil_div(-7, -2), 4);
+        assert_eq!(floor_div(7, 2), Some(3));
+        assert_eq!(floor_div(-7, 2), Some(-4));
+        assert_eq!(floor_div(7, -2), Some(-4));
+        assert_eq!(floor_div(-7, -2), Some(3));
+        assert_eq!(ceil_div(7, 2), Some(4));
+        assert_eq!(ceil_div(-7, 2), Some(-3));
+        assert_eq!(ceil_div(7, -2), Some(-3));
+        assert_eq!(ceil_div(-7, -2), Some(4));
+        // `i128::MIN / -1` is unrepresentable: decline, never wrap or panic.
+        assert_eq!(floor_div(i128::MIN, -1), None);
+        assert_eq!(ceil_div(i128::MIN, -1), None);
     }
 
     #[test]
@@ -2257,6 +2812,171 @@ mod tests {
         );
     }
 
+    /// Regression (#nia-sls-or-branch): a root disjunction whose
+    /// distribution exceeds the clause budget is searched per
+    /// disjunct instead of declined outright. Each branch repeats
+    /// one atom 600 times, so distribution would need 360k clauses
+    /// (over the 250k product cap) while each branch alone is tiny.
+    #[test]
+    fn lane_searches_disjunct_when_distribution_exceeds_budget() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let xy = terms.mk_mul(vec![x, y]);
+        let six = terms.mk_int(BigInt::from(6));
+        let two = terms.mk_int(BigInt::from(2));
+        let prod_eq = terms.mk_eq(xy, six);
+        let x_ge = terms.mk_ge(x, two);
+        let left = terms.mk_and(vec![prod_eq; 600]);
+        let right = terms.mk_and(vec![x_ge; 600]);
+        let root = terms.mk_or(vec![left, right]);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.set_root_assertions(vec![root]);
+        let result = solver.try_clausal_local_search();
+        assert!(
+            matches!(result, Some(TheoryResult::Sat)),
+            "per-disjunct search should find a witness, got {result:?}"
+        );
+        let model = solver.bounded_enum_model.clone().expect("witness recorded");
+        let xv = model.get(&x).expect("x in model").clone();
+        let yv = model.get(&y).expect("y in model").clone();
+        assert!(
+            &xv * &yv == BigInt::from(6) || xv >= BigInt::from(2),
+            "witness satisfies a disjunct: x={xv} y={yv}"
+        );
+    }
+
+    /// Plateau at the bound-respecting zero point (#nia-sls-zero-factor):
+    /// `not(x*y = x*z ∧ x*w = x*z)` with every variable `>= 0` is false at
+    /// all-zero, yet each equality's effective coefficient for every one of
+    /// its factors is also zero there (the shared/other factors vanish), so
+    /// neither linear nor quadratic move generation can propose a move.
+    /// The lane must still offer an exploratory ±1 move on an equality
+    /// factor; without one, AProVE-style flag/product disequalities idle at
+    /// exactly one unsatisfied clause until a restart.
+    #[test]
+    fn lane_escapes_zero_factor_equality_plateau() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let z = terms.mk_var("z", Sort::Int);
+        let w = terms.mk_var("w", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let xy = terms.mk_mul(vec![x, y]);
+        let xz = terms.mk_mul(vec![x, z]);
+        let xw = terms.mk_mul(vec![x, w]);
+        let e1 = terms.mk_eq(xy, xz);
+        let e2 = terms.mk_eq(xw, xz);
+        let both = terms.mk_and(vec![e1, e2]);
+        let diseq = terms.mk_not(both);
+        let bounds: Vec<TermId> = [x, y, z, w].iter().map(|&v| terms.mk_ge(v, zero)).collect();
+        let mut conjuncts = bounds.clone();
+        conjuncts.push(diseq);
+        let root = terms.mk_and(conjuncts);
+
+        let mut builder = Builder::new(&terms);
+        let clauses = builder.cnf(root, true, 0).expect("root clausifies");
+        let plateau_vars: Vec<VarIdx> = [x, y, z, w].iter().map(|t| builder.var_of[t]).collect();
+        let nvars = builder.var_term.len();
+        let mut search = Search::new(builder, clauses, nvars);
+        search.extract_bounds();
+        for v in 0..search.vars.len() {
+            search.vars[v].value = search.base_value(v);
+        }
+        search.recompute_all();
+        assert_eq!(
+            search.unsat.len(),
+            1,
+            "only the disequality clause fails at zero"
+        );
+        search.lookahead_unsat();
+        assert!(
+            search
+                .updates
+                .iter()
+                .any(|u| plateau_vars.contains(&u.var) && u.delta.abs() == 1),
+            "zero-factor equality plateau must offer a ±1 factor move, got {:?}",
+            search.updates
+        );
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.set_deadline(ay_core::time::Instant::now() + std::time::Duration::from_secs(5));
+        solver.set_root_assertions(vec![root]);
+        for &bound in &bounds {
+            solver.assert_literal(bound, true);
+        }
+        solver.assert_literal(e1, false);
+        let result = solver.try_clausal_local_search();
+        assert!(
+            matches!(result, Some(TheoryResult::Sat)),
+            "lane should escape the plateau and find a witness, got {result:?}"
+        );
+        let model = solver.bounded_enum_model.clone().expect("witness recorded");
+        let value = |t: TermId| model.get(&t).cloned().expect("root leaf valued");
+        assert!(
+            &value(x) * &value(y) != &value(x) * &value(z)
+                || &value(x) * &value(w) != &value(x) * &value(z),
+            "witness must falsify at least one equality: {model:?}"
+        );
+    }
+
+    /// The eqdv-shaped plateau (#nia-sls-zero-factor): in `--z3-mode`
+    /// preprocessing rewrites `x*y = x*z` to `(= d 0)` plus the definition
+    /// pair `d <= x*y - x*z`, `d >= x*y - x*z`. Once a kick moves `d` off
+    /// zero, the violated definition is an inequality atom whose factor
+    /// coefficients are still all zero at the zero point, so it too must
+    /// offer ±1 factor moves — otherwise the only move resets `d` and the
+    /// search oscillates on the same one-clause plateau.
+    #[test]
+    fn lane_offers_factor_kicks_for_definition_inequalities() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let z = terms.mk_var("z", Sort::Int);
+        let d = terms.mk_var("d", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let xy = terms.mk_mul(vec![x, y]);
+        let xz = terms.mk_mul(vec![x, z]);
+        let lin = terms.mk_sub(vec![xy, xz]);
+        let def_le = terms.mk_le(d, lin);
+        let def_ge = terms.mk_ge(d, lin);
+        let d_zero = terms.mk_eq(d, zero);
+        let diseq = terms.mk_not(d_zero);
+        let bounds: Vec<TermId> = [x, y, z].iter().map(|&v| terms.mk_ge(v, zero)).collect();
+        let mut conjuncts = bounds;
+        conjuncts.extend([def_le, def_ge, diseq]);
+        let root = terms.mk_and(conjuncts);
+
+        let mut builder = Builder::new(&terms);
+        let clauses = builder.cnf(root, true, 0).expect("root clausifies");
+        let factor_vars: Vec<VarIdx> = [x, y, z].iter().map(|t| builder.var_of[t]).collect();
+        let d_idx = builder.var_of[&d] as usize;
+        let nvars = builder.var_term.len();
+        let mut search = Search::new(builder, clauses, nvars);
+        search.extract_bounds();
+        for v in 0..search.vars.len() {
+            search.vars[v].value = search.base_value(v);
+        }
+        // The state after the equality kick moved only the definition var.
+        search.vars[d_idx].value = 1;
+        search.recompute_all();
+        assert_eq!(
+            search.unsat.len(),
+            1,
+            "only one definition side fails at d=1, factors zero"
+        );
+        search.lookahead_unsat();
+        assert!(
+            search
+                .updates
+                .iter()
+                .any(|u| factor_vars.contains(&u.var) && u.delta.abs() == 1),
+            "definition-inequality plateau must offer a ±1 factor move, got {:?}",
+            search.updates
+        );
+    }
+
     /// The lane must never claim `sat` on an UNSAT formula, however long it
     /// searches. `x*x = 2` has no integer solution.
     #[test]
@@ -2368,5 +3088,56 @@ mod tests {
         assert_eq!(solver.eval_formula_exact(nested, true, &m), Some(true));
         m.insert(y, 5);
         assert_eq!(solver.eval_formula_exact(nested, true, &m), Some(false));
+    }
+
+    #[test]
+    fn neg_poly_declines_instead_of_panicking_on_i128_min_coefficient() {
+        // REGRESSION (2026-09-07). `neg_poly` was `m.coeff = -m.coeff`, which
+        // PANICS at `i128::MIN` — "attempt to negate with overflow". NIA runs
+        // in-process inside compiler_consumer, so that is an ICE that kills the whole
+        // compilation rather than a verdict the caller can handle; it was hit
+        // while verifying `ty`'s workspace.
+        //
+        // `None` is the only sound answer: `i128::MIN` has no positive
+        // counterpart, so there is no polynomial to return, and saturating to
+        // `i128::MAX` would break `neg(neg(p)) == p` and silently corrupt every
+        // conflict derived from it. That is what the second half asserts.
+        let min_poly = vec![Mono {
+            coeff: i128::MIN,
+            vars: Vec::new(),
+        }];
+        assert!(
+            neg_poly(min_poly).is_none(),
+            "i128::MIN has no negation; neg_poly must decline, not saturate"
+        );
+
+        // The ordinary case still negates, and is an involution.
+        let p = vec![
+            Mono {
+                coeff: 3,
+                vars: vec![],
+            },
+            Mono {
+                coeff: -7,
+                vars: vec![],
+            },
+        ];
+        let n = neg_poly(p.clone()).expect("ordinary coefficients negate");
+        assert_eq!(n[0].coeff, -3);
+        assert_eq!(n[1].coeff, 7);
+        let back = neg_poly(n).expect("negation is an involution here");
+        assert_eq!(back[0].coeff, p[0].coeff);
+        assert_eq!(back[1].coeff, p[1].coeff);
+
+        // i128::MIN + 1 is negatable and must NOT be declined — a fix that
+        // declined everything would pass the assertion above and be useless.
+        let ok = vec![Mono {
+            coeff: i128::MIN + 1,
+            vars: vec![],
+        }];
+        assert!(
+            neg_poly(ok).is_some(),
+            "the fix must not decline negatable coefficients"
+        );
     }
 }

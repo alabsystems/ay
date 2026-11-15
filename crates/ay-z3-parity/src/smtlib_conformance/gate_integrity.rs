@@ -204,23 +204,23 @@ fn execute() -> Result<Execution, String> {
         "aggregate counts do not match recomputed detailed rows",
         aggregate_spoof(),
     ));
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.artifact-hash-drift",
         b"manifest-bound artifact bytes changed",
         "hash mismatch",
-        artifact_hash_drift(),
+        artifact_hash_drift,
     ));
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.aux-tool-duplicate",
         b"two auxiliary checker bindings use the same identity",
         "sorted and duplicate-free",
-        duplicate_auxiliary_tools(),
+        duplicate_auxiliary_tools,
     ));
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.aux-tool-hash-drift",
         b"independent checker bytes changed after receipt creation",
         "hash mismatch",
-        auxiliary_tool_hash_drift(),
+        auxiliary_tool_hash_drift,
     ));
     rows.push(control(
         "gate.case-duplicate",
@@ -299,11 +299,11 @@ fn execute() -> Result<Execution, String> {
         context,
         "profile digest mismatch",
     )?);
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.evidence-hash-drift",
         b"evidence reference hash does not match receipt bytes",
         "receipt hash mismatch",
-        evidence_hash_drift(&base_receipt),
+        |directory| evidence_hash_drift(directory, &base_receipt),
     ));
     let mut stale = base_receipt.clone();
     stale.campaign_id = "stale-campaign".to_string();
@@ -356,24 +356,24 @@ fn execute() -> Result<Execution, String> {
     ));
 
     let mut profile_drift = starter_contract(Subject::default())?;
-    profile_drift.profile.z3_overlay.version = "not-5.1.0".to_string();
+    profile_drift.profile.z3_overlay.version = "not-5.3.3".to_string();
     rows.push(contract_control(
         "gate.profile-drift",
         &profile_drift,
         "profile drift",
     )?);
 
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.reference-input-duplicate",
         b"two normative source bindings use the same identity",
         "sorted and duplicate-free",
-        duplicate_reference_inputs(),
+        duplicate_reference_inputs,
     ));
-    rows.push(control(
+    rows.push(temporary_control(
         "gate.reference-snapshot-hash-drift",
         b"normative source snapshot bytes changed after receipt creation",
         "hash mismatch",
-        reference_snapshot_hash_drift(),
+        reference_snapshot_hash_drift,
     ));
 
     rows.sort_by(|left, right| left.id.cmp(&right.id));
@@ -468,6 +468,27 @@ fn control(id: &str, input: &[u8], expected: &str, rejection: Result<(), String>
     }
 }
 
+fn temporary_control(
+    id: &str,
+    input: &[u8],
+    expected: &str,
+    probe: impl FnOnce(&Path) -> Result<(), String>,
+) -> ValidatorCase {
+    let directory = match tempfile::tempdir() {
+        Ok(directory) => directory,
+        Err(error) => return control(id, input, expected, Err(error.to_string())),
+    };
+    let paths = match current_abi::StagingPaths::new(&[(directory.path(), "@GATE_FIXTURE@")]) {
+        Ok(paths) => paths,
+        Err(error) => return control(id, input, expected, Err(error)),
+    };
+    // Keep the actual rejection and expected-reason test authoritative. Only
+    // after classification replace this fixture's known random directory.
+    let mut row = control(id, input, expected, probe(directory.path()));
+    row.observed = paths.normalize(&row.observed);
+    row
+}
+
 fn aggregate_spoof() -> Result<(), String> {
     let row = ValidatorCase {
         id: "spoof.skipped".to_string(),
@@ -496,23 +517,21 @@ fn aggregate_spoof() -> Result<(), String> {
     )
 }
 
-fn artifact_hash_drift() -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let path = directory.path().join("ay");
+fn artifact_hash_drift(directory: &Path) -> Result<(), String> {
+    let path = directory.join("ay");
     fs::write(&path, b"changed bytes").map_err(|error| error.to_string())?;
     validate_optional_artifact(
         Some(&Artifact {
             path: "ay".to_string(),
             sha256: "0".repeat(64),
         }),
-        directory.path(),
+        directory,
         "AY executable",
     )
 }
 
-fn auxiliary_tool_hash_drift() -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    fs::write(directory.path().join("checker"), b"changed checker bytes")
+fn auxiliary_tool_hash_drift(directory: &Path) -> Result<(), String> {
+    fs::write(directory.join("checker"), b"changed checker bytes")
         .map_err(|error| error.to_string())?;
     validate_auxiliary_tool_rows(
         &[AuxiliaryTool {
@@ -524,16 +543,13 @@ fn auxiliary_tool_hash_drift() -> Result<(), String> {
             },
             version_output: "checker 1.0".to_string(),
         }],
-        directory.path(),
+        directory,
     )
 }
 
-fn duplicate_auxiliary_tools() -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    fs::write(directory.path().join("checker-a"), b"checker a")
-        .map_err(|error| error.to_string())?;
-    fs::write(directory.path().join("checker-b"), b"checker b")
-        .map_err(|error| error.to_string())?;
+fn duplicate_auxiliary_tools(directory: &Path) -> Result<(), String> {
+    fs::write(directory.join("checker-a"), b"checker a").map_err(|error| error.to_string())?;
+    fs::write(directory.join("checker-b"), b"checker b").map_err(|error| error.to_string())?;
     let tool = AuxiliaryTool {
         id: "independent-checker".to_string(),
         role: "strict proof replay".to_string(),
@@ -546,34 +562,27 @@ fn duplicate_auxiliary_tools() -> Result<(), String> {
     let mut duplicate = tool.clone();
     duplicate.artifact.path = "checker-b".to_string();
     duplicate.artifact.sha256 = sha256_bytes(b"checker b");
-    validate_auxiliary_tool_rows(&[tool, duplicate], directory.path())
+    validate_auxiliary_tool_rows(&[tool, duplicate], directory)
 }
 
-fn reference_snapshot_hash_drift() -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    fs::write(
-        directory.path().join("source.json"),
-        b"changed source bytes",
-    )
-    .map_err(|error| error.to_string())?;
+fn reference_snapshot_hash_drift(directory: &Path) -> Result<(), String> {
+    fs::write(directory.join("source.json"), b"changed source bytes")
+        .map_err(|error| error.to_string())?;
     validate_reference_input_rows(
         &[fixture_reference_input("smtlib-language", "source.json")],
-        directory.path(),
+        directory,
     )
 }
 
-fn duplicate_reference_inputs() -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    fs::write(directory.path().join("source-a.json"), b"source a")
-        .map_err(|error| error.to_string())?;
-    fs::write(directory.path().join("source-b.json"), b"source b")
-        .map_err(|error| error.to_string())?;
+fn duplicate_reference_inputs(directory: &Path) -> Result<(), String> {
+    fs::write(directory.join("source-a.json"), b"source a").map_err(|error| error.to_string())?;
+    fs::write(directory.join("source-b.json"), b"source b").map_err(|error| error.to_string())?;
     let mut first = fixture_reference_input("smtlib-language", "source-a.json");
     first.snapshot.sha256 = sha256_bytes(b"source a");
     let mut duplicate = first.clone();
     duplicate.snapshot.path = "source-b.json".to_string();
     duplicate.snapshot.sha256 = sha256_bytes(b"source b");
-    validate_reference_input_rows(&[first, duplicate], directory.path())
+    validate_reference_input_rows(&[first, duplicate], directory)
 }
 
 fn fixture_reference_input(id: &str, path: &str) -> ReferenceInput {
@@ -627,9 +636,8 @@ fn truncated_cases() -> Result<(), String> {
     )
 }
 
-fn evidence_hash_drift(receipt: &ValidatorReceipt) -> Result<(), String> {
-    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let path = directory.path().join("receipt.json");
+fn evidence_hash_drift(directory: &Path, receipt: &ValidatorReceipt) -> Result<(), String> {
+    let path = directory.join("receipt.json");
     let bytes = pretty_json(receipt)?;
     fs::write(&path, bytes).map_err(|error| error.to_string())?;
     let reference = EvidenceRef {
@@ -637,7 +645,7 @@ fn evidence_hash_drift(receipt: &ValidatorReceipt) -> Result<(), String> {
         sha256: "0".repeat(64),
     };
     let mut cache = ReceiptCache::default();
-    load_validator_receipt(&reference, directory.path(), &mut cache).map(|_| ())
+    load_validator_receipt(&reference, directory, &mut cache).map(|_| ())
 }
 
 fn interrupted_outcomes() -> Result<(), String> {
@@ -777,6 +785,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             CONTROL_IDS
         );
+    }
+
+    #[test]
+    fn repeated_mutation_replay_keeps_exact_rows_despite_private_temp_paths() {
+        let first = execute().expect("first mutation execution");
+        let second = execute().expect("fresh mutation execution");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn temporary_rejection_normalization_never_changes_the_verdict_or_reason() {
+        let first = temporary_control("fixture", b"input", "hash mismatch", |directory| {
+            Err(format!(
+                "hash mismatch for {}: expected 123, got 456",
+                directory.join("artifact").display()
+            ))
+        });
+        let second = temporary_control("fixture", b"input", "hash mismatch", |directory| {
+            Err(format!(
+                "hash mismatch for {}: expected 123, got 456",
+                directory.join("artifact").display()
+            ))
+        });
+        assert_eq!(first, second);
+        assert_eq!(first.outcome, ValidatorCaseOutcome::Pass);
+        let changed = temporary_control("fixture", b"input", "hash mismatch", |directory| {
+            Err(format!(
+                "hash mismatch for {}: expected 123, got 789",
+                directory.join("artifact").display()
+            ))
+        });
+        assert_ne!(first, changed);
+        let incorrect = temporary_control("fixture", b"input", "hash mismatch", |_| Ok(()));
+        assert_eq!(incorrect.outcome, ValidatorCaseOutcome::Fail);
     }
 
     #[test]

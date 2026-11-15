@@ -19,6 +19,16 @@ mimalloc-arena-trim = []
 
 [dependencies]
 libc.workspace = true
+wait-timeout.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+trust-exec-policy = { path = "../../vendor/trust-exec-policy" }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 # File identity (volume serial + file index) and hard-link counts are only
 # reachable through GetFileInformationByHandle; the std accessors for them are

@@ -58,6 +58,33 @@ pub(super) fn certify(
             translated_strict_proof: true,
         });
     }
+    // (#negated-exists-cegqi-witness-hints) The plain replay above has no
+    // instance to add when the refuting universal is the NNF dual of an
+    // authored `(not (exists ...))`: its CEGQI instance is recorded against
+    // the minted dual, which is not an authored root. The negated-exists
+    // BUILDER proposes the same witnesses on the authored dual and stitches
+    // the ground refutation onto `qnt_neg_exists` → `forall_inst`. The
+    // check-sat firewall (`translated_unsat_proof_or_downgrade`) consults it
+    // at its downgrade; the `check-sat-assuming` route — deductive-checks's named-core
+    // redirect — reaches a CEGQI UNSAT only through THIS certification, so it
+    // is consulted here too. Same lane, same attempt budget, same strict
+    // re-check of the installed proof at mint time.
+    if executor.try_translate_negated_exists_ground_instantiation_unsat() {
+        return Some(Checked {
+            source_context_stamp: executor.ctx.source_context_stamp(),
+            translated_strict_proof: true,
+        });
+    }
+    // (#exists-bridge-chain) Same reasoning as the negated-exists builder:
+    // the `check-sat-assuming` route reaches a quantified refutation only
+    // through this certification, so the exists-bridge chain builder is
+    // consulted here too.
+    if executor.try_translate_exists_bridge_chain_unsat() {
+        return Some(Checked {
+            source_context_stamp: executor.ctx.source_context_stamp(),
+            translated_strict_proof: true,
+        });
+    }
     if executor.cegqi_consequence_set_is_unsat(snapshot, category) {
         Some(Checked {
             source_context_stamp: executor.ctx.source_context_stamp(),

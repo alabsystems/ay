@@ -142,12 +142,17 @@ impl Executor {
     }
 
     fn collect_quant_source_replacements(plans: &mut SurgeryPlans) -> bool {
-        for plan in plans.quant_negations.values() {
-            if let Some(previous) = plans
-                .quant_source_replacements
-                .insert(plan.source_quantifier, plan.forall_term)
-            {
-                if previous != plan.forall_term {
+        let negations = plans
+            .quant_negations
+            .values()
+            .map(|plan| (plan.source_quantifier, plan.forall_term));
+        let consequences = plans
+            .quant_consequences
+            .values()
+            .map(|plan| (plan.source_quantifier, plan.forall_term));
+        for (source, raw) in negations.chain(consequences).collect::<Vec<_>>() {
+            if let Some(previous) = plans.quant_source_replacements.insert(source, raw) {
+                if previous != raw {
                     return false;
                 }
             }

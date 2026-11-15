@@ -35,11 +35,13 @@ ay-sys.workspace = true
 ay-dpll = { workspace = true, optional = true }
 ay-frontend = { workspace = true, optional = true }
 ay-translate = { workspace = true, optional = true }
+# Session scope digests (execute_direct/memo.rs).
+sha2 = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enable direct AY execution - allows AYProgram to be executed without serialization
-direct = ["ay-dpll", "ay-frontend", "ay-translate"]
+direct = ["ay-dpll", "ay-frontend", "ay-translate", "sha2"]
 
 [dev-dependencies]
 # For round-trip parser tests (#1840)

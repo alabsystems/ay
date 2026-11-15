@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% The positive half of the substitute-underflow pair, on the same shape the forgery uses: a
+% database row whose degree is exactly `i64::MIN` and a witness that touches its variable, so
+% the checker really does substitute into it. The proof is honest and must keep checking.
+%
+% It is the guard against a bogus fix. Refusing rows with extreme degrees, or clamping the
+% substituted degree instead of escalating it, would pass every negative test in this defect's
+% set and break this one.
+f 2;
+red 1 x3 >= 1 : x2 -> 1 x3 -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

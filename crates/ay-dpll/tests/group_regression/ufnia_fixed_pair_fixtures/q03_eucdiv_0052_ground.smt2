@@ -1,0 +1,15 @@
+; Sat twin of q03_eucdiv_0052.smt2: the definitions inlined. z3 4.12.5 sat.
+; AY answered unsat on it too before the fix.
+(declare-fun f (Int) Int)
+(declare-fun g (Int Int) Int)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const d Int)
+(declare-const e Int)
+(declare-const c Int)
+(declare-const z Int)
+(assert (= (div (* 3 d) d) (- 1)))
+(assert (distinct (* e d) (* c x)))
+(assert (= 0 (mod x (g e y))))
+(assert (= x c))
+(check-sat)

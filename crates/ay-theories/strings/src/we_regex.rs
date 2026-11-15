@@ -27,6 +27,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::{smtlib_char_cmp, smtlib_code_point, smtlib_next_char};
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
@@ -217,11 +218,14 @@ impl WeRegex {
 
     /// `re.range` with SMT-LIB semantics: `lo`/`hi` must each be a single
     /// character and `lo <= hi`, otherwise the EMPTY language.
+    ///
+    /// `lo <= hi` is SMT-LIB code-point order, which `char`'s own order is not
+    /// once a surrogate carrier is involved (see `ay_core::smtlib_char`).
     #[must_use]
     pub fn range(lo: &str, hi: &str) -> Self {
         let (mut lc, mut hc) = (lo.chars(), hi.chars());
         match (lc.next(), lc.next(), hc.next(), hc.next()) {
-            (Some(l), None, Some(h), None) if l <= h => Self::Range(l, h),
+            (Some(l), None, Some(h), None) if smtlib_char_cmp(l, h).is_le() => Self::Range(l, h),
             _ => Self::None,
         }
     }
@@ -416,7 +420,7 @@ impl WeRegex {
             Self::All => Self::All,
             Self::AnyChar => Self::Eps,
             Self::Range(lo, hi) => {
-                if *lo <= c && c <= *hi {
+                if smtlib_char_cmp(*lo, c).is_le() && smtlib_char_cmp(c, *hi).is_le() {
                     Self::Eps
                 } else {
                     Self::None
@@ -720,25 +724,13 @@ fn find_witnesses_with_work_budget(
     }
     let mut alphabet: BTreeSet<char> = crit.clone();
     // Representatives for the code points NOT mentioned in the constraints:
-    // one strictly inside each gap between adjacent criticals, and one strictly
-    // above all criticals. Complemented constraints accept unmentioned
-    // characters, so their witnesses often need a letter OUTSIDE the mentioned
-    // alphabet — mirroring the exhaustive `class_alphabet`. Sound: every
-    // returned witness is verified by exact derivatives (and re-validated by
-    // the caller) before use, so an extra letter can never yield a bad witness.
-    let crit_v: Vec<char> = crit.iter().copied().collect();
-    for w in crit_v.windows(2) {
-        if let Some(m) = next_char(w[0]) {
-            if m < w[1] {
-                alphabet.insert(m);
-            }
-        }
-    }
-    if let Some(&mx) = crit_v.last() {
-        if let Some(c) = next_char(mx) {
-            alphabet.insert(c);
-        }
-    }
+    // one strictly inside each gap between adjacent criticals, and one outside
+    // all criticals. Complemented constraints accept unmentioned characters,
+    // so their witnesses often need a letter OUTSIDE the mentioned alphabet —
+    // mirroring the exhaustive `class_alphabet`. Sound: every returned witness
+    // is verified by exact derivatives (and re-validated by the caller) before
+    // use, so an extra letter can never yield a bad witness.
+    alphabet.extend(non_critical_representatives(&crit));
     // Cover pure AnyChar/All constraints and keep the branching bounded.
     alphabet.insert('a');
     alphabet.insert('b');
@@ -836,16 +828,48 @@ fn emptiness_max_critical() -> usize {
     }
 }
 
-/// The next Unicode scalar value after `c`, if any.
-fn next_char(c: char) -> Option<char> {
-    let mut u = c as u32 + 1;
-    loop {
-        match char::from_u32(u) {
-            Some(n) => return Some(n),
-            None if u < char::MAX as u32 => u += 1, // skip the surrogate gap
-            None => return None,
+/// The critical characters in SMT-LIB code-point order.
+///
+/// `BTreeSet<char>` iterates in `char` order, which is NOT code-point order
+/// once a surrogate carrier is present (see `ay_core::smtlib_char`): the
+/// carrier of `U+D800` sorts above `U+2FFFF`. The gap and outside
+/// representatives below are only exact over code-point order.
+fn critical_in_code_order(critical: &BTreeSet<char>) -> Vec<char> {
+    let mut crit: Vec<char> = critical.iter().copied().collect();
+    crit.sort_unstable_by_key(|&c| smtlib_code_point(c));
+    crit
+}
+
+/// One representative strictly inside each gap between code-point-adjacent
+/// criticals, plus one character outside the whole critical span
+/// `[min, max]` when the alphabet has any.
+///
+/// Every alphabet character is then a critical, in a gap, or in the outside
+/// class — so these representatives plus the criticals cover every
+/// derivative-behavior class. The outside class is the characters below the
+/// least critical and above the greatest one; it is represented by the
+/// successor of the greatest critical, or by `U+0000` when nothing lies above
+/// (then something lies below, since `U+0000` is not critical). When the
+/// criticals span the whole alphabet `0..=0x2FFFF` the class is empty and no
+/// representative is added.
+fn non_critical_representatives(critical: &BTreeSet<char>) -> Vec<char> {
+    let crit = critical_in_code_order(critical);
+    let mut reps: Vec<char> = Vec::new();
+    for w in crit.windows(2) {
+        if let Some(m) = smtlib_next_char(w[0]) {
+            if smtlib_code_point(m) < smtlib_code_point(w[1]) {
+                reps.push(m);
+            }
         }
     }
+    if let (Some(&min), Some(&max)) = (crit.first(), crit.last()) {
+        if let Some(c) = smtlib_next_char(max) {
+            reps.push(c);
+        } else if smtlib_code_point(min) > 0 {
+            reps.push('\u{0}');
+        }
+    }
+    reps
 }
 
 /// An EXHAUSTIVE class alphabet for the given regexes: one representative per
@@ -860,11 +884,13 @@ fn next_char(c: char) -> Option<char> {
 /// adjacent criticals behaves identically (no `Range` bound can straddle the
 /// gap), as does every character outside the critical span — chars BELOW the
 /// least critical and chars ABOVE the greatest critical form one shared
-/// class (both are outside every `Range` and equal to no `Lit` char), so the
-/// single above-max representative covers both regions and the complement
-/// stays exact over the full alphabet. Returns `None` (caller must NOT
-/// conclude emptiness) when the critical set is too large or a
-/// representative cannot be built.
+/// class (both are outside every `Range` and equal to no `Lit` char), so a
+/// single outside representative covers both regions and the complement
+/// stays exact over the full alphabet. "Adjacent", "between" and "outside"
+/// are SMT-LIB code-point order, over the whole alphabet `0..=0x2FFFF` —
+/// the 2,048 surrogate code points included (`ay_core::smtlib_char`).
+/// Returns `None` (caller must NOT conclude emptiness) when the critical set
+/// is too large.
 fn class_alphabet(regexes: &[&WeRegex]) -> Option<Vec<char>> {
     let mut critical: BTreeSet<char> = BTreeSet::new();
     for r in regexes {
@@ -873,25 +899,11 @@ fn class_alphabet(regexes: &[&WeRegex]) -> Option<Vec<char>> {
     if critical.len() > emptiness_max_critical() {
         return None;
     }
-    let crit: Vec<char> = critical.iter().copied().collect();
-    let mut reps: Vec<char> = crit.clone();
-    // One representative inside each gap between adjacent criticals.
-    for w in crit.windows(2) {
-        if let Some(m) = next_char(w[0]) {
-            if m < w[1] {
-                reps.push(m);
-            }
-        }
+    if critical.is_empty() {
+        return Some(vec!['a']);
     }
-    // One representative OUTSIDE all criticals (behaves uniformly for every
-    // atom). Missing it could hide an accepting path — so give up if none.
-    match crit.last() {
-        None => reps.push('a'),
-        Some(&max) => {
-            let c = next_char(max)?;
-            reps.push(c)
-        }
-    }
+    let mut reps: Vec<char> = critical_in_code_order(&critical);
+    reps.extend(non_critical_representatives(&critical));
     Some(reps)
 }
 
@@ -981,6 +993,50 @@ pub fn concat_membership_definitely_empty(parts: &[Vec<WeRegex>], targets: &[WeR
     true // graph exhausted, no accepting state: definitely empty
 }
 
+/// EXACT language equality of two regexes, when decidable within the same
+/// caps as [`concat_membership_definitely_empty`]: explore the
+/// derivative-pair graph over the exhaustive [`class_alphabet`]. A
+/// reachable nullable-mismatched pair proves `Some(false)`; exhausting
+/// the graph proves `Some(true)`. Any cap (critical alphabet, state
+/// count, residual size) answers `None` — never a guessed verdict.
+#[must_use]
+pub fn languages_equal(left: &WeRegex, right: &WeRegex) -> Option<bool> {
+    if left == right {
+        return Some(true);
+    }
+    let alphabet = class_alphabet(&[left, right])?;
+    let max_states = emptiness_max_states();
+    type St = (WeRegex, WeRegex);
+    let mut seen: HashSet<St> = HashSet::default();
+    let mut frontier: VecDeque<St> = VecDeque::new();
+    seen.insert((left.clone(), right.clone()));
+    frontier.push_back((left.clone(), right.clone()));
+    while let Some((a, b)) = frontier.pop_front() {
+        if a.nullable() != b.nullable() {
+            return Some(false);
+        }
+        for &c in &alphabet {
+            let next: St = (a.derive(c), b.derive(c));
+            if next.0.nullable() != next.1.nullable() {
+                return Some(false);
+            }
+            if next.0 == next.1 {
+                continue;
+            }
+            if next.0.size().saturating_add(next.1.size()) > MATCH_SIZE_CAP {
+                return None; // residual blowup — cannot certify equality
+            }
+            if seen.insert(next.clone()) {
+                if seen.len() > max_states {
+                    return None;
+                }
+                frontier.push_back(next);
+            }
+        }
+    }
+    Some(true)
+}
+
 /// Best-effort WITNESS search for the concatenation-membership system of
 /// [`concat_membership_definitely_empty`]: find strings `(u_1, …, u_n)` with
 /// `u_i ∈ ⋂ parts[i]` and `u_1·…·u_n ∈ ⋂ targets` (strings S1).
@@ -1020,19 +1076,7 @@ pub fn concat_membership_witness(
         r.collect_chars(&mut crit);
     }
     let mut alphabet: BTreeSet<char> = crit.clone();
-    let crit_v: Vec<char> = crit.iter().copied().collect();
-    for w in crit_v.windows(2) {
-        if let Some(m) = next_char(w[0]) {
-            if m < w[1] {
-                alphabet.insert(m);
-            }
-        }
-    }
-    if let Some(&mx) = crit_v.last() {
-        if let Some(c) = next_char(mx) {
-            alphabet.insert(c);
-        }
-    }
+    alphabet.extend(non_critical_representatives(&crit));
     alphabet.insert('a');
     alphabet.insert('b');
     let alphabet: Vec<char> = alphabet.into_iter().take(witness_alphabet_cap()).collect();

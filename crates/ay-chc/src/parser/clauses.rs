@@ -62,6 +62,24 @@ impl ChcParser {
         head: &ChcExpr,
         action: Option<ActionId>,
     ) -> ChcResult<()> {
+        // A head hiding relations: `body => (and H1 .. Hn)` is the n clauses
+        // `body => Hi`, and `body => (=> C H)` is `(and body C) => H`, so each
+        // relation is a head or a body atom rather than a relation nested in
+        // the negated-head constraint (refused at clause insertion).
+        let head_relations = crate::ChcProblem::expr_contains_predicate_app(head);
+        match head {
+            ChcExpr::Op(ChcOp::And, conjuncts) if head_relations => {
+                for conjunct in conjuncts {
+                    self.add_implication(body, conjunct, action)?;
+                }
+                return Ok(());
+            }
+            ChcExpr::Op(ChcOp::Implies, args) if head_relations && args.len() == 2 => {
+                let body = ChcExpr::and(body.clone(), (*args[0]).clone());
+                return self.add_implication(&body, &args[1], action);
+            }
+            _ => {}
+        }
         // Extract predicates and constraints from body
         let (preds, constraint) = self.extract_body_parts(body);
 
@@ -98,7 +116,7 @@ impl ChcParser {
             };
 
             let clause = HornClause::new(clause_body, ClauseHead::False);
-            self.add_clause_with_optional_action(clause, action);
+            self.add_clause_with_optional_action(clause, action)?;
         } else {
             // Normal case: head is a predicate or false
             // Apply relational encoding normalization: substitute primed variables
@@ -122,7 +140,7 @@ impl ChcParser {
             };
 
             let clause = HornClause::new(clause_body, clause_head);
-            self.add_clause_with_optional_action(clause, action);
+            self.add_clause_with_optional_action(clause, action)?;
         }
 
         Ok(())
@@ -151,25 +169,44 @@ impl ChcParser {
         //
         // Facts that DO mention a predicate (`(assert (P 0))`, `(assert (and
         // (P x) ...))`) keep the original head-fact encoding untouched.
-        let (preds, _) = self.extract_body_parts(&expr);
+        let (preds, constraint) = self.extract_body_parts(&expr);
         if preds.is_empty() {
             let negated = ChcExpr::not(expr);
             let clause = HornClause::new(ClauseBody::constraint(negated), ClauseHead::False);
-            self.add_clause_with_optional_action(clause, action);
-            return Ok(());
+            return self.add_clause_with_optional_action(clause, action);
         }
-        let clause_head = self.determine_head(&expr)?;
-        let clause = HornClause::new(ClauseBody::constraint(ChcExpr::Bool(true)), clause_head);
-        self.add_clause_with_optional_action(clause, action);
+        // `(assert (and A1 .. An C))` under the implicit universal is the
+        // conjunction of its conjuncts: one fact per relation application and
+        // `NOT(C) => false` for the predicate-free rest. determine_head used to
+        // map the whole conjunction to `ClauseHead::False`, dropping every Ai
+        // and asserting `true => false`.
+        for (pred, args) in preds {
+            let clause = HornClause::new(
+                ClauseBody::constraint(ChcExpr::Bool(true)),
+                ClauseHead::Predicate(pred, args),
+            );
+            self.add_clause_with_optional_action(clause, action)?;
+        }
+        if let Some(constraint) = constraint {
+            let negated = ChcExpr::not(constraint);
+            let clause = HornClause::new(ClauseBody::constraint(negated), ClauseHead::False);
+            self.add_clause_with_optional_action(clause, action)?;
+        }
         Ok(())
     }
 
-    fn add_clause_with_optional_action(&mut self, clause: HornClause, action: Option<ActionId>) {
+    pub(super) fn add_clause_with_optional_action(
+        &mut self,
+        clause: HornClause,
+        action: Option<ActionId>,
+    ) -> ChcResult<()> {
+        let clause = Self::lift_constraint_relations(clause)?;
         if let Some(action) = action {
             self.problem.add_clause_with_action(clause, action);
         } else {
             self.problem.add_clause(clause);
         }
+        Ok(())
     }
 
     /// Extract predicate applications and constraints from body
@@ -247,6 +284,14 @@ impl ChcParser {
                 // Other expressions - check if there's a nested predicate application
                 if let Some((pred_id, args)) = self.try_extract_predicate(expr) {
                     Ok(ClauseHead::Predicate(pred_id, args))
+                } else if crate::ChcProblem::expr_contains_predicate_app(expr) {
+                    // A head hiding a relation application (`(and (P x) ..)`,
+                    // `(or ..)`, ...) is not one Horn head; `False` here would
+                    // drop the relations and assert `body => false`.
+                    Err(crate::ChcError::Parse(format!(
+                        "unsupported CHC input: clause head {expr} is not a single \
+                         relation application"
+                    )))
                 } else {
                     // Not a predicate - treat as a constraint that should be true
                     // This is typically an error in the input

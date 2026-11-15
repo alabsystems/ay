@@ -52,6 +52,10 @@ struct DimacsFinishState<'solver, 'input> {
     proof_writer_telemetry: Option<DimacsProofWriterTelemetry>,
     route_profile: VariantRouteProfile,
     unsat_authority: Option<AuthorizedDimacsUnsatPublication>,
+    /// The proof write failure the solver's writer latched, read before the
+    /// non-UNSAT cleanup drops that writer. A SAT answered after it is a real
+    /// answer without a proof, and the note says so.
+    proof_write_failure: Option<String>,
 }
 
 impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
@@ -67,6 +71,7 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
             request.proof,
         );
 
+        let proof_write_failure = request.solver.proof_write_failure();
         let mut proof_writer_telemetry = request.proof_writer_telemetry.or_else(|| {
             cleanup_dimacs_non_unsat_proof_sidecar(request.solver, &request.result, request.proof)
         });
@@ -94,6 +99,7 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
             proof_writer_telemetry,
             route_profile,
             unsat_authority: None,
+            proof_write_failure,
         };
         state.authorize_unsat();
         state
@@ -154,14 +160,22 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
         let Self {
             mut solver,
             result,
+            proof,
             mut unsat_authority,
+            proof_write_failure,
             ..
         } = self;
         match result {
             SatResult::Sat(model) => {
-                crate::mark_verdict_printed();
+                // A SAT answer needs no proof: found after the writer latched,
+                // it is still the answer, and the note says the proof is gone.
+                if let Some(detail) = proof_write_failure {
+                    safe_eprintln!("c {detail}; answering with the model, without a proof");
+                }
+                crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(10));
                 safe_println!("s SATISFIABLE");
-                emit_dimacs_sat_model(&model);
+                let visible = solver.as_ref().visible_model_vars().min(model.len());
+                emit_dimacs_sat_model(&model[..visible]);
                 let _ = io::stdout().flush();
                 let _ = io::stderr().flush();
                 std::process::exit(crate::dimacs_verdict_exit_code(10));
@@ -173,7 +187,7 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
                     );
                 };
                 validate_dimacs_unsat_publication_before_verdict(authority);
-                crate::mark_verdict_printed();
+                crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(20));
                 safe_println!("s UNSATISFIABLE");
                 authority.commit_after_verdict();
                 let _ = io::stdout().flush();
@@ -181,7 +195,7 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
                 std::process::exit(crate::dimacs_verdict_exit_code(20));
             }
             SatResult::Unknown => {
-                dimacs_exit_if_timed_out(Some(solver.as_mut()));
+                dimacs_exit_if_timed_out(Some(solver.as_mut()), proof);
                 // A memory abort must not masquerade as a decision gap: when
                 // the memory watchdog latched a breach (or the budget is still
                 // exceeded at publication), report the memout grammar and the
@@ -192,15 +206,30 @@ impl<'solver, 'input> DimacsFinishState<'solver, 'input> {
                 if crate::memout_abort_requested() {
                     crate::hard_memory_fallback_exit();
                 }
-                safe_eprintln!(
+                // A lost proof (disk full) names its cause instead of a
+                // generic `incomplete`; the partial proof was already
+                // discarded by the non-UNSAT sidecar cleanup.
+                let reason = proof_write_failure_note(
+                    solver.as_ref().last_unknown_reason(),
+                    solver.as_ref().last_unknown_detail(),
+                )
+                .unwrap_or_else(|| {
                     "c reason: incomplete (SAT solver could not determine satisfiability)"
-                );
-                safe_println!("s UNKNOWN");
+                        .to_string()
+                });
+                settle_unanswered_dimacs_exit();
+                safe_eprintln!("{reason}");
+                if !crate::mark_verdict_printed() {
+                    safe_println!("s UNKNOWN");
+                }
             }
             #[allow(unreachable_patterns)]
             _ => {
+                settle_unanswered_dimacs_exit();
                 safe_eprintln!("c reason: unknown");
-                safe_println!("s UNKNOWN");
+                if !crate::mark_verdict_printed() {
+                    safe_println!("s UNKNOWN");
+                }
             }
         }
     }
@@ -229,4 +258,44 @@ fn finish_dimacs_solve_with_source(
     let mut state = DimacsFinishState::prepare(request);
     state.emit_statistics();
     state.publish_verdict();
+}
+
+/// The stderr note for an unknown caused by a failed proof write, for example
+/// `c proof write failed: No space left on device (os error 28); answering
+/// unknown`. `None` for every other unknown.
+fn proof_write_failure_note(
+    reason: Option<ay_sat::SatUnknownReason>,
+    detail: Option<&str>,
+) -> Option<String> {
+    (reason == Some(ay_sat::SatUnknownReason::ProofWriteFailure)).then(|| {
+        let detail = detail.unwrap_or("proof write failed");
+        format!("c {detail}; answering unknown")
+    })
+}
+
+#[cfg(test)]
+mod proof_write_failure_note_tests {
+    use super::proof_write_failure_note;
+    use ay_sat::SatUnknownReason;
+
+    #[test]
+    fn names_the_os_error_only_for_a_proof_write_failure() {
+        assert_eq!(
+            proof_write_failure_note(
+                Some(SatUnknownReason::ProofWriteFailure),
+                Some("proof write failed: No space left on device (os error 28)"),
+            )
+            .as_deref(),
+            Some("c proof write failed: No space left on device (os error 28); answering unknown")
+        );
+        assert_eq!(
+            proof_write_failure_note(Some(SatUnknownReason::ProofWriteFailure), None).as_deref(),
+            Some("c proof write failed; answering unknown")
+        );
+        assert_eq!(
+            proof_write_failure_note(Some(SatUnknownReason::DeadlineExceeded), Some("x")),
+            None
+        );
+        assert_eq!(proof_write_failure_note(None, None), None);
+    }
 }

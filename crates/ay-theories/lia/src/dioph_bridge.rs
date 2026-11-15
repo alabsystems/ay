@@ -23,10 +23,7 @@ impl LiaSolver<'_> {
         let debug = self.debug_dioph;
         // Rebuild all Dioph-derived caches for the current equality structure.
         // This prevents stale substitutions/reasons from leaking across formula changes.
-        self.dioph_safe_dependent_vars.clear();
-        self.dioph_cached_substitutions.clear();
-        self.dioph_cached_modular_gcds.clear();
-        self.dioph_cached_reasons.clear();
+        self.clear_dioph_equality_caches();
 
         let num_equalities = self.count_equalities();
         let num_vars = self.integer_vars.len();
@@ -85,7 +82,7 @@ impl LiaSolver<'_> {
                 continue;
             }
 
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 
@@ -130,6 +127,13 @@ impl LiaSolver<'_> {
         if equality_literals.is_empty() {
             return None; // No parseable equalities
         }
+
+        // D2: everything cached below is a consequence of the equalities AND
+        // the folded bounds; record the latter so a backtrack that retracts
+        // one of them drops the caches (`dioph_cache`).
+        all_fold_reasons.sort_unstable();
+        all_fold_reasons.dedup();
+        self.dioph_cached_fold_reasons.clone_from(&all_fold_reasons);
 
         // Try to solve
         let result = solver.solve();

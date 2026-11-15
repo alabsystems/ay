@@ -34,18 +34,29 @@ fn collect_var_names(terms: &TermStore, term: TermId, out: &mut Vec<String>) {
     }
 }
 
+mod alpha_quantifier_sharing;
 mod arrays;
 mod bitvectors;
+mod complex;
 mod core;
 mod datatypes;
+mod declared_identity;
 mod finite_sets_z3_500;
 mod floating_point;
 mod macro_adoption;
 mod macro_memo;
+mod named_labels;
+mod negative_literal_scope;
 mod numerics;
+mod parsed_retention;
 mod provenance;
 mod pseudo_boolean;
+mod qualified_selectors;
 mod redefinition;
 mod sequences;
+mod skipped_subterms;
 mod special_relations;
 mod strings;
+mod syntactic_gaps;
+mod z3_mode_acceptance;
+mod z3_reach;

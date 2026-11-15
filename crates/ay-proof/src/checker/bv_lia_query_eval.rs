@@ -197,12 +197,21 @@ impl QueryChecker<'_> {
                 }
                 Some(value)
             }
-            "mod" if args.len() == 2 => {
+            "div" | "mod" if args.len() == 2 => {
                 let dividend = self.eval_int(args[0], env, memo, depth + 1)?;
                 let divisor = self.eval_int(args[1], env, memo, depth + 1)?;
                 match (dividend, divisor) {
-                    (Some(dividend), Some(divisor)) if divisor.is_positive() => {
-                        Some(self.modulo_bounded_ints(&dividend, &divisor)?)
+                    (Some(dividend), Some(divisor)) if !divisor.is_zero() => {
+                        Some(if name == "div" {
+                            self.divide_bounded_ints(&dividend, &divisor)?
+                        } else {
+                            let magnitude = if divisor.is_negative() {
+                                self.abs_bounded_int(divisor)?
+                            } else {
+                                divisor
+                            };
+                            self.modulo_bounded_ints(&dividend, &magnitude)?
+                        })
                     }
                     _ => None,
                 }
@@ -211,7 +220,8 @@ impl QueryChecker<'_> {
                 Some(value) => Some(self.abs_bounded_int(value)?),
                 None => None,
             },
-            "bv2nat" if args.len() == 1 => self
+            // Unsigned, exactly as `bv2nat`; see `named_app_is_well_sorted`.
+            "bv2nat" | "bv2int" if args.len() == 1 => self
                 .eval_bv(args[0], env, memo, depth + 1)?
                 .map(|(value, _)| BigInt::from(value)),
             _ => None,

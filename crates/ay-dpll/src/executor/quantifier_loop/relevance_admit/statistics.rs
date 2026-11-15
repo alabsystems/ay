@@ -26,6 +26,12 @@ impl Executor {
         let classifier_classes = self.classify_quantifier_families(classifier_foralls);
         self.last_statistics.ematching_rounds_completed = result.ematching_rounds_completed;
         self.last_statistics.ematching_instances_created = result.ematching_instances_created;
+        if result.guard_seed_instances > 0 {
+            self.last_statistics.set_int(
+                "quantifier.guard_seed.instances",
+                u64::try_from(result.guard_seed_instances).unwrap_or(u64::MAX),
+            );
+        }
 
         self.refresh_quantifier_campaign_statistics(&classifier_classes);
         classifier_classes

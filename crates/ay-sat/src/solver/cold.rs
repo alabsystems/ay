@@ -8,8 +8,11 @@
 //! cold tail lives here behind a single box so restart/proof/incremental/
 //! tracing state no longer inflates the main solver shell.
 
+use super::inprocessing::BveSkipReason;
 use super::inprocessing::FactorSkipReason;
 use super::*;
+#[path = "original_ledger_trace.rs"]
+mod original_ledger_trace;
 
 #[inline]
 pub(super) fn bcp_learned_1963_blocker_cert_elision_env_enabled() -> bool {
@@ -60,6 +63,8 @@ pub(crate) struct OriginalLedger {
     /// Clause `i` spans `literals[offsets[i] as usize .. end]` where
     /// `end = offsets[i+1]` (or `literals.len()` for the last clause).
     offsets: Vec<u32>,
+    /// Exact issued proof ID for each original; zero is an unbound private test entry.
+    clause_ids: Vec<u64>,
     /// Stack of (num_clauses, num_literals) snapshots at each push() scope.
     /// On pop(), the ledger is truncated back to the most recent snapshot,
     /// removing clauses that were added inside the scope (#8472).
@@ -79,6 +84,13 @@ pub(crate) struct OriginalLedger {
     pending_global_clauses: Vec<Literal>,
     /// Offsets into `pending_global_clauses` for each buffered clause.
     pending_global_offsets: Vec<u32>,
+    /// IDs replay in lockstep with their exact buffered clauses.
+    pending_global_clause_ids: Vec<u64>,
+    /// Scope depth each buffered clause belongs to: 0 for a global clause,
+    /// `d` for a clause added from a deeper scope for ancestor scope `d`. A
+    /// buffered clause is replayed after every pop that leaves at least `d`
+    /// scopes open, and dropped by the pop of scope `d` itself.
+    pending_global_depths: Vec<usize>,
     /// Stack of buffer-size snapshots: `pending_global_offsets.len()` at each
     /// `push_scope`. On `pop_scope`, only clauses added in the popped scope
     /// (indices >= snapshot) are replayed; earlier entries belong to outer
@@ -87,25 +99,64 @@ pub(crate) struct OriginalLedger {
 }
 
 impl OriginalLedger {
+    pub(super) fn reserve_original_counted(
+        &mut self,
+        len: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::CountedAdmissionError;
+        self.literals
+            .len()
+            .checked_add(len)
+            .filter(|n| *n <= u32::MAX as usize)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        self.offsets
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        crate::counted_storage::try_reserve(owner, &mut self.literals, len)?;
+        crate::counted_storage::try_reserve(owner, &mut self.offsets, 1)?;
+        crate::counted_storage::try_reserve(owner, &mut self.clause_ids, 1)?;
+        owner.admit(len.saturating_add(8), 0)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             literals: Vec::new(),
             offsets: Vec::new(),
+            clause_ids: Vec::new(),
             scope_starts: Vec::new(),
             pending_global_clauses: Vec::new(),
             pending_global_offsets: Vec::new(),
+            pending_global_clause_ids: Vec::new(),
+            pending_global_depths: Vec::new(),
             pending_global_scope_starts: Vec::new(),
         }
+    }
+
+    /// Reserve room for `clauses` more clauses of `literals` literals in all,
+    /// so a bulk load does not grow the two flat vectors by doubling (each
+    /// doubling briefly holds the old and the new buffer, both charged to the
+    /// counting allocator behind `--memory`).
+    pub(crate) fn reserve(&mut self, clauses: usize, literals: usize) {
+        self.offsets.reserve_exact(clauses);
+        self.clause_ids.reserve_exact(clauses);
+        self.literals.reserve_exact(literals);
     }
 
     /// Append a clause to the ledger.
     #[inline]
     pub(crate) fn push_clause(&mut self, lits: &[Literal]) {
+        self.push_clause_with_id(lits, 0);
+    }
+
+    pub(crate) fn push_clause_with_id(&mut self, lits: &[Literal], clause_id: u64) {
         debug_assert!(
             u32::try_from(self.literals.len()).is_ok(),
             "BUG: OriginalLedger literal count overflows u32"
         );
         self.offsets.push(self.literals.len() as u32);
+        self.clause_ids.push(clause_id);
         self.literals.extend_from_slice(lits);
     }
 
@@ -125,19 +176,83 @@ impl OriginalLedger {
     /// When NOT inside a scope, this is equivalent to `push_clause`.
     #[inline]
     pub(crate) fn push_clause_global(&mut self, lits: &[Literal]) {
+        self.push_clause_global_with_id(lits, 0);
+    }
+
+    pub(crate) fn push_clause_global_with_id(&mut self, lits: &[Literal], clause_id: u64) {
         if self.scope_starts.is_empty() {
             // No active scope — append directly to the main ledger.
-            self.push_clause(lits);
+            self.push_clause_with_id(lits, clause_id);
         } else {
             // Inside a scope — add to main ledger for immediate use,
             // AND buffer for replay after pop_scope truncation.
-            self.push_clause(lits);
-            self.pending_global_offsets
-                .push(self.pending_global_clauses.len() as u32);
-            self.pending_global_clauses.extend_from_slice(lits);
+            self.push_clause_with_id(lits, clause_id);
+            self.buffer_for_replay(lits, 0, clause_id);
             // Do NOT shift scope boundaries. The main-ledger copy will be
             // removed by pop_scope truncation, and the buffered copy will
             // be replayed afterward.
+        }
+    }
+
+    fn buffer_for_replay(&mut self, lits: &[Literal], depth: usize, clause_id: u64) {
+        self.pending_global_offsets
+            .push(self.pending_global_clauses.len() as u32);
+        self.pending_global_clauses.extend_from_slice(lits);
+        self.pending_global_clause_ids.push(clause_id);
+        self.pending_global_depths.push(depth);
+    }
+
+    /// Keep the clauses at ledger indices `from..` until scope `depth` is
+    /// popped, although they were added inside a deeper scope.
+    ///
+    /// `Solver::add_clause_at_scope_depth` guards such a clause with the
+    /// selector of ancestor scope `depth`. Without this, the pop of the scope
+    /// it was added in truncates it from the ledger while it is still in
+    /// force, and the next rebuild of the clause database from the ledger
+    /// loses it.
+    pub(crate) fn keep_until_scope_pop(&mut self, from: usize, depth: usize) {
+        if depth >= self.scope_starts.len() {
+            return;
+        }
+        for index in from..self.num_clauses() {
+            let start = self.offsets[index] as usize;
+            let end = self
+                .offsets
+                .get(index + 1)
+                .map_or(self.literals.len(), |&end| end as usize);
+            let lits = self.literals[start..end].to_vec();
+            self.buffer_for_replay(&lits, depth, self.clause_ids[index]);
+        }
+    }
+
+    /// Remove the buffered entries at indices `from..` whose scope depth
+    /// exceeds `depth`, keeping the order of the rest.
+    fn drop_pending_deeper_than(&mut self, from: usize, depth: usize) {
+        let num_pending = self.pending_global_offsets.len();
+        let kept: Vec<(Vec<Literal>, usize, u64)> = (from..num_pending)
+            .filter(|&i| self.pending_global_depths[i] <= depth)
+            .map(|i| {
+                let start = self.pending_global_offsets[i] as usize;
+                let end = self
+                    .pending_global_offsets
+                    .get(i + 1)
+                    .map_or(self.pending_global_clauses.len(), |&end| end as usize);
+                (
+                    self.pending_global_clauses[start..end].to_vec(),
+                    self.pending_global_depths[i],
+                    self.pending_global_clause_ids[i],
+                )
+            })
+            .collect();
+        if from < num_pending {
+            let tail_start = self.pending_global_offsets[from] as usize;
+            self.pending_global_clauses.truncate(tail_start);
+            self.pending_global_offsets.truncate(from);
+            self.pending_global_clause_ids.truncate(from);
+            self.pending_global_depths.truncate(from);
+        }
+        for (lits, clause_depth, clause_id) in kept {
+            self.buffer_for_replay(&lits, clause_depth, clause_id);
         }
     }
 
@@ -213,12 +328,24 @@ impl OriginalLedger {
         let global_start = self.pending_global_scope_starts.pop().unwrap_or(0);
 
         self.offsets.truncate(clause_count);
+        self.clause_ids.truncate(clause_count);
         self.literals.truncate(literal_count);
 
-        // Replay buffered global clauses from THIS scope level and deeper.
-        // Only clauses at index >= global_start were added after our push,
-        // so only they were removed by truncation. Earlier globals (from
-        // outer scopes) are still present in the main ledger.
+        // An ancestor-scoped entry whose own scope is the one being popped is
+        // no longer in force: drop it before the replay.
+        let open_scopes = self.scope_starts.len();
+        if self
+            .pending_global_depths
+            .get(global_start..)
+            .is_some_and(|tail| tail.iter().any(|&depth| depth > open_scopes))
+        {
+            self.drop_pending_deeper_than(global_start, open_scopes);
+        }
+
+        // Replay buffered global and ancestor-scoped clauses from THIS scope
+        // level and deeper. Only clauses at index >= global_start were added
+        // after our push, so only they were removed by truncation. Earlier
+        // entries (from outer scopes) are still present in the main ledger.
         //
         // Inline push_clause logic to avoid borrowing conflict (can't borrow
         // self.pending_global_clauses immutably and self.offsets/literals
@@ -233,6 +360,7 @@ impl OriginalLedger {
             };
             // Inline push_clause: append offset + copy literals.
             self.offsets.push(self.literals.len() as u32);
+            self.clause_ids.push(self.pending_global_clause_ids[i]);
             self.literals
                 .extend_from_slice(&self.pending_global_clauses[start..end]);
         }
@@ -243,10 +371,32 @@ impl OriginalLedger {
         if self.scope_starts.is_empty() {
             self.pending_global_clauses.clear();
             self.pending_global_offsets.clear();
+            self.pending_global_clause_ids.clear();
+            self.pending_global_depths.clear();
             self.pending_global_scope_starts.clear();
         }
 
         true
+    }
+
+    pub(crate) fn clause_id(&self, index: usize) -> u64 {
+        self.clause_ids.get(index).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn clause_ids(&self) -> &[u64] {
+        &self.clause_ids
+    }
+
+    /// Bind the global just added by the existing theory-definition API.
+    pub(crate) fn bind_last_global_clause_id(&mut self, clause_id: u64) {
+        if let Some(id) = self.clause_ids.last_mut() {
+            *id = clause_id;
+        }
+        if !self.scope_starts.is_empty() {
+            if let Some(id) = self.pending_global_clause_ids.last_mut() {
+                *id = clause_id;
+            }
+        }
     }
 
     /// Number of active scope boundaries.
@@ -282,7 +432,10 @@ impl OriginalLedger {
     /// trigger (`Solver::should_reduce_db`) can account for the immutable
     /// original-formula ledger in addition to the arena (#8672).
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.literals.capacity() * size_of::<Literal>() + self.offsets.capacity() * size_of::<u32>()
+        self.literals.capacity() * size_of::<Literal>()
+            + self.offsets.capacity() * size_of::<u32>()
+            + self.clause_ids.capacity() * size_of::<u64>()
+            + self.pending_global_clause_ids.capacity() * size_of::<u64>()
     }
 
     /// Hand back the unused reservation in both flat vectors, returning the
@@ -308,6 +461,10 @@ impl OriginalLedger {
         let offset_slack = (self.offsets.capacity() - self.offsets.len()) * size_of::<u32>();
         if offset_slack >= MIN_RECLAIM_BYTES {
             self.offsets.shrink_to_fit();
+        }
+        let id_slack = (self.clause_ids.capacity() - self.clause_ids.len()) * size_of::<u64>();
+        if id_slack >= MIN_RECLAIM_BYTES {
+            self.clause_ids.shrink_to_fit();
         }
         before - self.heap_bytes()
     }
@@ -411,7 +568,7 @@ pub(crate) struct ColdState {
     /// Minimum conflicts before considering restart (initial stabilization)
     pub(super) restart_min_conflicts: u64,
     /// Minimum conflicts since last restart before stable-mode EMA can fire.
-    /// Default: STABLE_EMA_MIN_CONFLICTS (50). Set to u64::MAX to disable
+    /// Default: STABLE_EMA_MIN_CONFLICTS. Set to u64::MAX to disable
     /// stable-mode EMA entirely (pure reluctant doubling, matching CaDiCaL).
     /// On small dense UNSAT formulas (clique_n2_k10: 180 vars, density 17.5),
     /// the EMA fires pathologically because LBD quality is structurally poor,
@@ -447,6 +604,90 @@ pub(crate) struct ColdState {
     pub(super) mode_switch_count: u64,
     /// Search-mode lock for SAT-tuned DIMACS profiles.
     pub(super) mode_lock: ModeLock,
+    /// `--sat-stable-lock-at`: the conflict count at which the stable-lock
+    /// classifier decides (`u64::MAX`: never), the learned-clause shapes it
+    /// reads, and whether a lock waits for the next switch into stable mode.
+    pub(super) stable_lock_at: u64,
+    pub(super) learned_shapes: Option<Box<super::stable_lock::LearnedShapeHistogram>>,
+    pub(super) stable_lock_pending: bool,
+    /// `--sat-reorder-kissat`: the conflict count of the next search-loop
+    /// reorder, and how many have run.
+    pub(super) kissat_reorder_next: u64,
+    /// `--sat-bcp-move-on-true` (see the BCP watch loop).
+    pub(super) bcp_move_on_true: bool,
+    /// `--sat-target-kissat` (see `update_target_and_best_phases`).
+    pub(super) target_kissat: bool,
+    /// `--sat-jump-reasons-kissat` (see `solver/jump_reasons.rs`).
+    pub(super) jump_reasons_kissat: bool,
+    /// `--sat-rephase-kissat` (see `Solver::rephase`).
+    pub(super) rephase_kissat: bool,
+    /// `--sat-bump-reasons-kissat`: the switch and Kissat's per-mode decision
+    /// rate (see `conflict_analysis_bumping.rs`).
+    pub(super) bump_reasons_kissat: bool,
+    pub(super) kissat_decision_rate: [super::conflict_analysis_bumping::KissatSmooth; 2],
+    /// CDCL search decisions only (Kissat's DECISIONS, decide.c): the
+    /// `--sat-bump-reasons-kissat` rate reads this, not `num_decisions`, which
+    /// also counts preprocessing, probing, vivification and backbone decisions.
+    pub(super) search_decisions: u64,
+    /// Set around a probe's own conflict analysis (backbone's bounded CDCL):
+    /// the `--sat-bump-reasons-kissat` rate and reason bumping skip it, as
+    /// Kissat skips both while probing (analyze.c:174, 534).
+    pub(super) kissat_probing: bool,
+    /// `--sat-subst-kissat` (see `subst_kissat.rs`).
+    pub(super) subst_kissat: bool,
+    /// `--sat-analysis-ticks-kissat`: conflict analysis charges search ticks
+    /// only for large reasons in minimize, shrink and reason-side bumping.
+    pub(super) analysis_ticks_kissat: bool,
+    /// `--sat-vivify-kissat` (see `inprocessing/vivify/kissat.rs`).
+    pub(super) vivify_kissat: bool,
+    /// `--sat-vivify-asym-kissat`: vivification deletes irredundant
+    /// asymmetric tautologies found on the conflict path.
+    pub(super) vivify_asym_kissat: bool,
+    /// `--sat-vivify-order-kissat`: Kissat's literal order for vivification.
+    pub(super) vivify_order_kissat: bool,
+    /// Kissat's irredundant vivification delay under `--sat-vivify-kissat`.
+    pub(super) vivify_irr_kissat_delay: super::subst_kissat::KissatDelay,
+    /// `--sat-eliminate-cadence-kissat` and Kissat's `eliminations`: the
+    /// in-search elimination calls so far (see `Solver::bve`).
+    pub(super) eliminate_cadence_kissat: bool,
+    pub(super) kissat_eliminations: u64,
+    /// `--sat-binary-irredundant-kissat` (see `binary_irredundant.rs`).
+    pub(super) binary_irredundant_kissat: bool,
+    /// `--sat-probe-round-kissat` (with `--sat-inproc-nlogn-schedule`): the
+    /// simplification round's passes run on Kissat's cadence.
+    pub(super) probe_round_kissat: bool,
+    /// Kissat's sweep delay under `--sat-probe-round-kissat`.
+    pub(super) sweep_kissat_delay: super::subst_kissat::KissatDelay,
+    /// `--sat-reduce-protect-kissat`: reduction protects glue-1 clauses only
+    /// while used and decays reasons' `used` too.
+    pub(super) reduce_protect_kissat: bool,
+    /// `--sat-subsume-kissat`: forward subsumption sees irredundant clauses
+    /// and binaries only, and runs only around elimination.
+    pub(super) subsume_kissat: bool,
+    /// `--sat-learned-order-kissat`: learned literals by descending level.
+    pub(super) learned_order_kissat: bool,
+    /// `--sat-factor-schedule-kissat`: factor's delay gate as Kissat's.
+    pub(super) factor_schedule_kissat: bool,
+    /// `--sat-reluctant-cap-kissat`: stable restart intervals capped at 2^20.
+    pub(super) reluctant_cap_kissat: bool,
+    /// `--sat-reorder-weights-kissat`: Kissat's reorder weights and timing.
+    pub(super) reorder_weights_kissat: bool,
+    /// `--sat-shrink-bump-uip-kissat`: shrinking's block UIPs are bumped.
+    pub(super) shrink_bump_uip_kissat: bool,
+    /// `--sat-shrink-removable-kissat`: shrinking's walked literals are
+    /// removable and the trail abort stops at the block UIP.
+    pub(super) shrink_removable_kissat: bool,
+    /// `--sat-compact-fixed`: compaction also drops root-fixed variables
+    /// (compact_fixed.rs).
+    pub(super) compact_fixed: bool,
+    /// Kissat's congruence delay under `--sat-subst-kissat`.
+    pub(super) congruence_kissat_delay: super::subst_kissat::KissatDelay,
+    /// `--sat-restart-gate-kissat` (see `Solver::should_restart`).
+    pub(super) restart_gate_kissat: bool,
+    /// `--sat-best-stable-kissat`, `--sat-restart-fixpoint-kissat`.
+    pub(super) best_stable_kissat: bool,
+    pub(super) restart_fixpoint_kissat: bool,
+    pub(super) kissat_reorders: u64,
     /// Cumulative ticks charged during probe BCP.
     /// CaDiCaL stats.ticks.probe (stats.hpp:36).
     pub(super) probe_ticks: u64,
@@ -545,6 +786,9 @@ pub(crate) struct ColdState {
     pub(super) learned_clause_trail: Vec<usize>,
     /// Number of clauses removed by eager subsumption (CaDiCaL `stats.eagersub`).
     pub(super) num_eager_subsumptions: u64,
+    /// Of those, binaries subsumed by their duplicate: the events
+    /// `--sat-eager-subsume-unlink-binaries` acts on.
+    pub(super) num_eager_subsumed_duplicate_binaries: u64,
     /// Conflict count at which to next run clause flush (CaDiCaL reduce.cpp:26-30).
     /// Flush is more aggressive than reduce -- marks ALL unused learned clauses
     /// as garbage regardless of tier. Grows geometrically by `FLUSH_FACTOR`.
@@ -567,11 +811,35 @@ pub(crate) struct ColdState {
     /// whether AY's factor pass is losing to a schedule gate or genuinely
     /// finding nothing.
     pub(super) factor_skip_counts: [u64; FactorSkipReason::COUNT],
+    /// Per-reason count of in-search BVE rounds refused by `bve_skip_reason`.
+    pub(super) bve_skip_counts: [u64; BveSkipReason::COUNT],
+    /// Count of due BVE rounds refused by the scheduler gates (`BVE_GATE_TAGS` order).
+    pub(super) bve_gate_skip_counts: [u64; 4],
+    /// Factor passes refused by `--sat-factor-max-density`.
+    pub(super) factor_density_skips: u64,
+    /// SBVA passes refused by `--sat-sbva-max-density`.
+    pub(super) sbva_density_skips: u64,
+    /// Factor passes ended by the solve's stop between applications.
+    pub(super) factor_stops: u64,
+    /// `user_num_vars` before the first oversized-clause split allocated its
+    /// linking variables: the variables a DIMACS model line may show.
+    pub(super) oversized_split_user_vars: Option<usize>,
+    /// BVE candidates refused (or, under `--sat-bve-ext-cooccur true`, admitted
+    /// and counted) because a live extension variable shares one of their clauses.
+    pub(super) bve_ext_cooccur_skips: u64,
+    /// Why BVE candidates were refused: [fast-elimination occurrence or clause
+    /// limit, binary-degree product limit, resolvents over the growth bound,
+    /// candidates that reached resolution, highest growth bound reached].
+    pub(super) bve_rejections: [u64; 5],
     /// Set when `should_compact_arena` fires at a moment the solver is not
     /// quiescent (inside `reduce_db`, where conflict analysis has just
     /// enqueued the asserting literal). The search loop performs the
     /// compaction at its next post-BCP scheduling point instead.
     pub(super) arena_compaction_pending: bool,
+    /// Set when an inprocessing round saw the search's stop fire
+    /// (`inprocessing_stop_requested`); taken by
+    /// `run_inprocessing_round_until`, which ends the solve with it.
+    pub(super) inprocessing_caller_stop: bool,
     /// Number of scoped clauses reclaimed by gc_scoped_clauses() during pop (#1444).
     /// Equivalent to Z3's gc_vars clause removal count.
     pub(super) scoped_clauses_reclaimed: u64,
@@ -582,6 +850,21 @@ pub(crate) struct ColdState {
     ///
     /// When exceeded, trigger aggressive clause database reduction.
     pub(super) max_learned_clauses: Option<usize>,
+    /// The learned-clause count the cap trigger, and the byte trigger
+    /// (`clause_db_byte_limit_exceeded`), wait for before they fire again:
+    /// what the last reduction left behind plus a tenth. Without it a
+    /// reduction that cannot delete (every learned binary clause touching
+    /// the trail is protected) leaves the count above the cap and
+    /// `learned_clause_limit_exceeded` re-fires every few conflicts:
+    /// SDP_134_18_4334, 40,534 reductions in 300K conflicts, each scanning
+    /// 500K protected clauses, the search ten times slower (2026-09-21).
+    pub(super) learned_cap_retrigger_floor: usize,
+    /// The clause DB's bytes when the last reduction finished, with a byte
+    /// limit set. The byte trigger also fires once the bytes have grown past
+    /// this by a tenth of the limit (at least
+    /// `CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH`), so the learned-count floor can
+    /// never let long learned clauses carry the DB far past its limit.
+    pub(super) clause_db_bytes_after_reduction: usize,
     /// Maximum clause database memory in bytes (None = no limit).
     ///
     /// When exceeded, trigger aggressive clause database reduction and arena compaction.
@@ -695,9 +978,17 @@ pub(crate) struct ColdState {
     pub(super) factor_factored_total: u64,
     /// Factorization stats: total extension variables introduced
     pub(super) factor_extension_vars_total: u64,
+    /// `FactorStats::init_calls`, `init_ticks`, `init_undrained`.
+    pub(super) factor_init_calls: u64,
+    pub(super) factor_init_ticks: u64,
+    pub(super) factor_init_undrained: u64,
     /// Per-variable signed factor candidate marks (CaDiCaL `Flags::factor`):
     /// bit0 = positive literal marked, bit1 = negative literal marked.
     pub(super) factor_candidate_marks: Vec<u8>,
+    /// While a factoring application's proof transaction is open: the marks'
+    /// length at its start and every (variable, old byte) written since, for
+    /// `end_factor_candidate_marks_undo` to roll back.
+    pub(super) factor_marks_undo: Option<(usize, Vec<(u32, u8)>)>,
     /// Monotonic epoch tracking irredundant clause mutations relevant to factoring.
     pub(super) factor_marked_epoch: u64,
     /// Last `factor_marked_epoch` consumed by a completed factor round.
@@ -719,6 +1010,9 @@ pub(crate) struct ColdState {
     /// Search ticks at last sweep call. Used for proportional sweep effort
     /// and tick-threshold scheduling (#7905, #8090).
     pub(super) last_sweep_ticks: u64,
+    /// Search ticks at the end of the last inprocessing round: the walk's
+    /// effort reference under `--sat-inproc-nlogn-schedule true`.
+    pub(super) last_inprobe_ticks: u64,
     // sweep_consecutive_unproductive REMOVED (#8450): sweep is no longer
     // permanently disabled. Growing backoff handles unproductive rounds.
     /// Search ticks at last backbone call. Used for tick-threshold scheduling (#8090).
@@ -741,6 +1035,29 @@ pub(crate) struct ColdState {
     /// Number of completed backbone phases. Used to enforce the round limit
     /// (`BACKBONE_MAX_ROUNDS`). CaDiCaL: `stats.backbone.phases` (backbone.cpp:533).
     pub(super) backbone_phases: u32,
+    /// The bounded-CDCL backbone pass each variable was last probed in, and
+    /// the current pass, under `--sat-inproc-nlogn-schedule` (see
+    /// `backbone()`): sized on first use, remapped on compaction.
+    pub(super) backbone_probed_in_pass: Vec<u32>,
+    pub(super) backbone_pass: u32,
+    /// Test override of the pass-marks switch.
+    pub(super) backbone_passes: Option<bool>,
+    /// Kissat's `backbone0/backbone1` flags for the stacked binary backbone
+    /// (`backbone_stacked.rs`), indexed by literal: a literal a consistent
+    /// probe satisfied is not a failed literal and is not probed again until
+    /// no flagged candidate is left. Sized on first use, remapped on
+    /// compaction.
+    pub(super) backbone_binary_candidate: Vec<bool>,
+    /// Test override of the stacked-backbone switch.
+    pub(super) backbone_binary_stacked: Option<bool>,
+    /// Test override of the vivify-generations switch.
+    pub(super) vivify_generations: Option<bool>,
+    /// Test override of the tier-histogram-binaries switch.
+    pub(super) tier_histogram_binaries: Option<bool>,
+    /// Test override of the keep-learned-binaries switch.
+    pub(super) keep_learned_binaries: Option<bool>,
+    /// Test override of the blanket-trail-protection switch.
+    pub(super) blanket_trail_protection: Option<bool>,
     /// Default-on post-vivify binary-backbone same-round admission gate.
     ///
     /// When enabled, a first binary backbone pass that passed the shared
@@ -785,6 +1102,25 @@ pub(crate) struct ColdState {
     /// When incremental state maintenance reduces this overhead, techniques
     /// can fire more frequently.
     pub(super) last_inprocessing_overhead_ms: f64,
+    /// Under `--sat-deterministic-inproc`: cumulative counted work (tick
+    /// equivalents) of every timed inprocessing pass. A round's overhead is
+    /// its own work minus this counter's delta, as the wall metric subtracts
+    /// the pass timers.
+    pub(super) inproc_pass_work_te: u64,
+    /// Under `--sat-deterministic-inproc`: cumulative counted work of the
+    /// maintenance scans that no tick counter sees (watch rebuilds and
+    /// reconnects, garbage drains, binary dedup, reason cleanup, compaction).
+    pub(super) inproc_scan_te: u64,
+    /// A search-tick target at which the solve loops stop with
+    /// `ResourceBudget` (`resource_budget_exhausted`). Set only for the
+    /// indep_enum head start under `--sat-deterministic-inproc`, which
+    /// overwrites it and clears it; a caller's stop is never kept here.
+    pub(super) search_tick_stop: Option<u64>,
+    /// The caller's search-tick stop (`Solver::set_search_tick_stop`): a
+    /// target at which the solve loops stop with `ResourceBudget`. Its own
+    /// field, so the head start's use of `search_tick_stop` can neither drop
+    /// it nor read it as the head start's end (GT-G6, DR-36).
+    pub(super) caller_search_tick_stop: Option<u64>,
     /// Post-rebuild BCP measurement (#8103): propagation count baseline.
     pub(super) post_rebuild_props_baseline: u64,
     /// Post-rebuild BCP measurement (#8103): true if a measurement is pending.
@@ -939,6 +1275,10 @@ pub(crate) struct ColdState {
     /// synthesized-default certificate degrades to the honest "no proof
     /// certificate emitted" warning while the verdict is unaffected.
     pub(super) proof_bookkeeping_budget: Option<u64>,
+    /// Exhaustion of that budget keeps the proof-mode inprocessing controls
+    /// instead of restoring the pristine ones; latched when the budget is set
+    /// (`proof_exhaustion_scope`).
+    pub(super) proof_exhaustion_keeps_proof_inprocessing: bool,
     /// Next clause ID to assign (for derived clauses and id-sync with proof writer)
     pub(super) next_clause_id: u64,
     /// Next original clause ID to assign (1-indexed, increments for each non-derived clause).
@@ -947,6 +1287,8 @@ pub(crate) struct ColdState {
     /// consistent with the LRAT proof even when derived clauses/deletions advance
     /// next_clause_id past the original range.
     pub(super) next_original_clause_id: u64,
+    /// Consumed at entry to add_clause_db_checked; never an ambient proof grant.
+    pub(super) registered_original_clause_id: Option<u64>,
     /// Highest clause ID ever issued to an original (non-derived) clause.
     ///
     /// Since the late-original allocator jumps `next_original_clause_id` past
@@ -1043,6 +1385,16 @@ pub(crate) struct ColdState {
     /// variable, bounding restatement cost at one line per root-fixed var.
     /// Grown lazily; empty on the DRAT/LRAT surfaces, which never state.
     pub(super) veripb_stated_root_units: Vec<u64>,
+    /// Set by `compact()` once variables were renumbered while a proof
+    /// surface was active (proof-posture-parity, site C). Proof lines are
+    /// written in the solver's internal numbering, which equals the input
+    /// numbering until the first compaction; from then on every literal that
+    /// reaches a proof writer is externalized through `i2e` at the emission
+    /// funnel. False means the funnels pass literals through untouched, so a
+    /// run that never compacts produces byte-identical proofs.
+    pub(super) proof_vars_compacted: bool,
+    /// `--sat-veripb-hints` state (`veripb_hints.rs`).
+    pub(super) veripb_hints: super::veripb_hints::VeripbHintState,
     /// Whether the empty clause derivation was already written to proof_manager.
     /// Prevents duplicate empty-clause entries between mark_empty_clause and
     /// finalize_unsat_proof (#4123).
@@ -1052,7 +1404,15 @@ pub(crate) struct ColdState {
     pub(super) empty_clause_lrat_id: Option<u64>,
     /// Scope depth at which has_empty_clause was first set.
     /// Used by pop() to preserve base-level (depth 0) UNSAT.
+    /// Recorded by `raise_empty_clause_flag` and reset by
+    /// `lower_empty_clause_flag`; the only other writer is
+    /// `add_original_empty_clause`, which pins a global empty clause to 0.
     pub(super) empty_clause_scope_depth: usize,
+    /// Set when a refutation is retracted (`pop()`, `clear_empty_clause()`):
+    /// the next reset must be a full one, because the incremental reset keeps
+    /// the level-0 trail and watches that already consumed the retracted
+    /// conflict. Cleared by `reset_search_state()`.
+    pub(super) full_reset_after_empty_clause_retraction: bool,
     // In-memory clause trace for SMT proof reconstruction
     /// Optional clause trace (only active when SMT proof production is enabled)
     pub(super) clause_trace: Option<ClauseTrace>,
@@ -1140,6 +1500,14 @@ pub(crate) struct ColdState {
     pub(super) lifetime_propagations: u64,
     /// Cumulative restarts across incremental solves (#qfuflia-stats).
     pub(super) lifetime_restarts: u64,
+    /// Cumulative search ticks of the solves before the current one: every
+    /// solve entry zeroes `search_ticks` (`Solver::lifetime_search_ticks`).
+    pub(super) lifetime_search_ticks: u64,
+    /// How much of this solver's lifetime conflicts and decisions the
+    /// process-wide work ledger has already been told about
+    /// ([`ay_core::resource`]), so each unit is reported once however often
+    /// the solver reports.
+    pub(super) work_watermark: ay_core::resource::WorkWatermark,
     /// Number of incremental solve calls (assumption-based or push/pop) (#8435).
     ///
     /// Incremented by `reset_search_state()` when `has_solved_once` is true.
@@ -1316,6 +1684,16 @@ pub(crate) struct ColdState {
     /// `solve_with_assumptions` entry. Polled amortized — never per BCP
     /// step. Fail-closed: an expired deadline can only produce Unknown.
     pub(super) solve_deadline: Option<ay_core::time::Instant>,
+    /// The caller's whole-solve budget in milliseconds, a fixed input that
+    /// accompanies `solve_deadline`. Under `--sat-deterministic-inproc` the
+    /// parked support enumeration sizes its schedule from it, because the
+    /// remaining time the wall schedule reads moves with load.
+    pub(super) solve_budget_ms: Option<u64>,
+    /// This solver's `--sat-deterministic-inproc`: whether its inner
+    /// schedules are counted work instead of wall time
+    /// (`Solver::set_deterministic_inproc`). Starts from the process-wide
+    /// switch.
+    pub(super) deterministic_inproc: bool,
     /// Bit-parallel support enumeration built at startup and parked until
     /// search has had its head start (`solver/indep_enum.rs`).
     ///
@@ -1324,6 +1702,9 @@ pub(crate) struct ColdState {
     /// turned six fast SAT solves into 300 s timeouts, so the built engine
     /// waits here instead and is given one metered slice of the budget.
     pub(super) indep_enum_pending: Option<Box<indep_enum::PendingIndepEnum>>,
+    /// Whether this solver builds that enumeration at all
+    /// (`Solver::set_support_enumeration`); `--sat-indep-enum` still rules.
+    pub(super) support_enumeration: bool,
     /// When `Some(offset)`, watches from the previous solve are still valid
     /// for all clauses below `offset` in the arena. Only clauses at or after
     /// `offset` need watch attachment. Set by `reset_search_state()` case (b)
@@ -1350,6 +1731,8 @@ pub(crate) struct ColdState {
     pub(super) bcp_lean_route_enabled: bool,
     pub(super) forward_checker: Option<crate::forward_checker::ForwardChecker>,
     pub(super) last_unknown_reason: Option<SatUnknownReason>,
+    /// One original invocation, never replaced or reset by search reuse.
+    pub(super) counted_admission: Option<ay_core::original_query::CountedAdmission>,
     /// Detail string explaining WHY the last Unknown was produced (#7917).
     /// Populated when finalization fails (e.g., which original clause was
     /// unsatisfied, reconstruction panic details).
@@ -1367,6 +1750,11 @@ pub(crate) struct ColdState {
     /// this flag is never set. (#oversized)
     pub(super) oversized_clause_poison: bool,
     pub(super) interrupt: Option<Arc<AtomicBool>>,
+    /// The flag the owner's deadline timer raises once `solve_deadline`
+    /// passes (`set_deadline_interrupt_handle`). Kept apart from `interrupt`
+    /// so the timer never writes the caller's reusable flag and that flag
+    /// stays visible while a deadline is armed.
+    pub(super) deadline_interrupt: Option<Arc<AtomicBool>>,
     pub(super) process_memory_interrupt: bool,
     /// #sparse-gap Cluster A: one positive memory-gate reading arms this
     /// PENDING flag; only a SECOND consecutive positive poll latches
@@ -1767,6 +2155,29 @@ pub(crate) struct ColdState {
     /// incremental QF_LRA engine lane (env `AY_LRA_INC_UNGUARDED_LEMMAS`,
     /// default-ON there, `=0` opts out). That lane excludes proof sessions.
     pub(crate) unguarded_theory_conflict_lemmas: bool,
+    /// Route the split-loop PRIMARY between-solves conflict through
+    /// `add_retained_theory_conflict_clause` (replay-ledger original)
+    /// instead of the deletable scoped learned tier. Retention is
+    /// load-bearing where destructive arena rebuilds would otherwise
+    /// forget validated conflicts mid-attempt (measured on the AUFLIA
+    /// twelve-read fixture), but it destroys other lanes' pinned
+    /// trajectories (measured on QF_LIRA smtopt:
+    /// DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111), so it is opt-in
+    /// per lane via `Solver::set_retain_primary_theory_conflicts`.
+    /// Default false.
+    pub(crate) retain_primary_theory_conflicts: bool,
+    /// Escalated retention budget: when `Some(n)`, the first `n` primary
+    /// split-loop conflicts of a solve entry route to the deletable tier
+    /// and every later one flips `retain_primary_theory_conflicts` on
+    /// (sticky for the entry). Lets a lane keep its pinned low-conflict
+    /// trajectory bit-identical while still converging on
+    /// forget-and-re-derive churn past the budget (QF_LIRA cruise vs
+    /// smtopt as opposing pins; DR-AY-LIRA-RETAIN-ESCALATION-20261113).
+    /// Default `None` (no escalation).
+    pub(crate) retain_primary_after: Option<u64>,
+    /// Primary split-loop conflicts routed since the last escalation
+    /// (re)arming (`Solver::set_retain_primary_escalation` zeroes it).
+    pub(crate) primary_theory_conflicts_routed: u64,
     /// Minimum formula variable count before domain-restricted BCP is used.
     ///
     /// `None` means mode default: IC3 uses `IC3_DOMAIN_BCP_MIN_VARS_DEFAULT`,
@@ -1918,9 +2329,15 @@ pub(crate) struct ColdState {
 }
 
 /// The INITIAL stable-mode Glucose-EMA restart gate. Post-init overrides in
-/// solve/mod.rs (small-dense / >1M-clause => u64::MAX) still apply. (B21:
-/// the campaign env override is retired; the named constant is the value.)
+/// solve/mod.rs (small-dense / >1M-clause => u64::MAX) apply unless the EMA
+/// is explicitly forced on with `--sat-stable-ema true`. (B21: the campaign
+/// env override is retired; the named constant is the value.)
 fn ab_stable_ema_gate() -> u64 {
+    // `--sat-stable-ema false`: stable mode restarts on reluctant doubling
+    // alone, as Kissat and CaDiCaL do.
+    if ay_core::sat_ab_switches().stable_ema == Some(false) {
+        return u64::MAX;
+    }
     STABLE_EMA_MIN_CONFLICTS
 }
 
@@ -1939,6 +2356,19 @@ impl ColdState {
         Self::grow_clause_ids(&mut self.clause_ids, self.clause_ids_reserve_hint, idx);
     }
 
+    /// Record `id` as the clause id of arena offset `idx`, unless the table is
+    /// disabled (the no-proof route never reads it). Every write that is not a
+    /// split-borrow rebuild goes through here, so a new call site cannot
+    /// allocate the table behind the switch: one unguarded write in congruence
+    /// did, 677 MiB on a 1.5M-variable formula (2026-09-26).
+    #[inline]
+    pub(super) fn record_clause_id(&mut self, idx: usize, id: u64) {
+        if !self.clause_ids_disabled {
+            self.clause_ids_grow_for(idx);
+            self.clause_ids[idx] = id;
+        }
+    }
+
     /// Split-borrow form of [`Self::clause_ids_grow_for`] for call sites that
     /// hold another `cold` field borrowed (e.g. iterating the original
     /// ledger).
@@ -1953,8 +2383,14 @@ impl ColdState {
     }
 
     /// Create the full cold solver tail for `Solver::build`.
-    pub(crate) fn new(num_vars: usize, clauses_capacity: usize, lrat_enabled: bool) -> Self {
-        Self {
+    pub(super) fn new<A: super::construction::Construction>(
+        num_vars: usize,
+        clauses_capacity: usize,
+        lrat_enabled: bool,
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        Ok(Self {
             lbd_ema_fast: 0.0,
             lbd_ema_slow: 0.0,
             lbd_ema_fast_biased: 0.0,
@@ -1997,6 +2433,67 @@ impl ColdState {
             stable_phase_count: 0,
             mode_switch_count: 0,
             mode_lock: ModeLock::None,
+            stable_lock_at: ay_core::sat_ab_switches()
+                .stable_lock_at
+                .unwrap_or(u64::MAX),
+            learned_shapes: if ay_core::sat_ab_switches().stable_lock_at.is_some() {
+                Some(a.boxed(a.choose(
+                    || super::stable_lock::LearnedShapeHistogram::new(),
+                    |owner| {
+                        super::stable_lock::LearnedShapeHistogram::build_admitted(
+                            &super::construction::Counted(owner),
+                        )
+                    },
+                )?)?)
+            } else {
+                None
+            },
+            stable_lock_pending: false,
+            // Never due when `--sat-reorder-kissat` is off, so the search loop's
+            // due test stays a single comparison on the default path.
+            kissat_reorder_next: if ay_core::sat_ab_switches().reorder_kissat == Some(true) {
+                super::constants::REORDER_INTERVAL
+            } else {
+                u64::MAX
+            },
+            bcp_move_on_true: ay_core::sat_ab_switches().bcp_move_on_true == Some(true),
+            target_kissat: ay_core::sat_ab_switches().target_kissat == Some(true),
+            jump_reasons_kissat: ay_core::sat_ab_switches().jump_reasons_kissat == Some(true),
+            rephase_kissat: ay_core::sat_ab_switches().rephase_kissat == Some(true),
+            bump_reasons_kissat: ay_core::sat_ab_switches().bump_reasons_kissat == Some(true),
+            kissat_decision_rate: Default::default(),
+            search_decisions: 0,
+            kissat_probing: false,
+            subst_kissat: ay_core::sat_ab_switches().subst_kissat == Some(true),
+            analysis_ticks_kissat: ay_core::sat_ab_switches().analysis_ticks_kissat == Some(true),
+            vivify_kissat: ay_core::sat_ab_switches().vivify_kissat == Some(true),
+            vivify_asym_kissat: ay_core::sat_ab_switches().vivify_asym_kissat == Some(true),
+            vivify_order_kissat: ay_core::sat_ab_switches().vivify_order_kissat == Some(true),
+            vivify_irr_kissat_delay: Default::default(),
+            eliminate_cadence_kissat: ay_core::sat_ab_switches().eliminate_cadence_kissat
+                == Some(true),
+            kissat_eliminations: 0,
+            binary_irredundant_kissat: ay_core::sat_ab_switches().binary_irredundant_kissat
+                == Some(true),
+            probe_round_kissat: ay_core::sat_ab_switches().probe_round_kissat == Some(true)
+                && ay_core::sat_ab_switches().inproc_nlogn_schedule == Some(true),
+            sweep_kissat_delay: Default::default(),
+            reduce_protect_kissat: ay_core::sat_ab_switches().reduce_protect_kissat == Some(true),
+            subsume_kissat: ay_core::sat_ab_switches().subsume_kissat == Some(true),
+            learned_order_kissat: ay_core::sat_ab_switches().learned_order_kissat == Some(true),
+            factor_schedule_kissat: ay_core::sat_ab_switches().factor_schedule_kissat == Some(true),
+            reluctant_cap_kissat: ay_core::sat_ab_switches().reluctant_cap_kissat == Some(true),
+            reorder_weights_kissat: ay_core::sat_ab_switches().reorder_weights_kissat == Some(true),
+            shrink_bump_uip_kissat: ay_core::sat_ab_switches().shrink_bump_uip_kissat == Some(true),
+            shrink_removable_kissat: ay_core::sat_ab_switches().shrink_removable_kissat
+                == Some(true),
+            compact_fixed: ay_core::sat_ab_switches().compact_fixed == Some(true),
+            congruence_kissat_delay: Default::default(),
+            restart_gate_kissat: ay_core::sat_ab_switches().restart_gate_kissat == Some(true),
+            best_stable_kissat: ay_core::sat_ab_switches().best_stable_kissat == Some(true),
+            restart_fixpoint_kissat: ay_core::sat_ab_switches().restart_fixpoint_kissat
+                == Some(true),
+            kissat_reorders: 0,
             probe_ticks: 0,
             vivify_ticks: 0,
             stabilize_tick_inc: 0,
@@ -2023,16 +2520,28 @@ impl ColdState {
             uniform_formula_cache: None,
             learned_clause_trail: Vec::new(),
             num_eager_subsumptions: 0,
+            num_eager_subsumed_duplicate_binaries: 0,
             next_flush: FLUSH_INIT,
             flush_inc: FLUSH_INIT,
             num_flushes: 0,
             num_arena_compactions: 0,
             num_arena_compaction_skips: 0,
             factor_skip_counts: [0; FactorSkipReason::COUNT],
+            bve_skip_counts: [0; BveSkipReason::COUNT],
+            bve_gate_skip_counts: [0; 4],
+            factor_density_skips: 0,
+            sbva_density_skips: 0,
+            factor_stops: 0,
+            oversized_split_user_vars: None,
+            bve_ext_cooccur_skips: 0,
+            bve_rejections: [0; 5],
             arena_compaction_pending: false,
+            inprocessing_caller_stop: false,
             scoped_clauses_reclaimed: 0,
             eager_subsumed: 0,
             max_learned_clauses: None,
+            learned_cap_retrigger_floor: 0,
+            clause_db_bytes_after_reduction: 0,
             max_clause_db_bytes: None,
             conflict_budget: None,
             decision_budget: None,
@@ -2065,7 +2574,11 @@ impl ColdState {
             factor_rounds: 0,
             factor_factored_total: 0,
             factor_extension_vars_total: 0,
-            factor_candidate_marks: vec![0; num_vars],
+            factor_init_calls: 0,
+            factor_init_ticks: 0,
+            factor_init_undrained: 0,
+            factor_candidate_marks: a.filled(num_vars, 0)?,
+            factor_marks_undo: None,
             factor_marked_epoch: 1,
             factor_last_completed_epoch: 0,
             last_factor_ticks: 0,
@@ -2074,6 +2587,7 @@ impl ColdState {
             sbva_extension_vars_total: 0,
             last_sbva_ticks: 0,
             last_sweep_ticks: 0,
+            last_inprobe_ticks: 0,
             last_backbone_ticks: 0,
             last_probe_ticks: 0,
             last_subsume_ticks: 0,
@@ -2082,6 +2596,19 @@ impl ColdState {
             last_transred_ticks: 0,
             last_bce_ticks: 0,
             backbone_phases: 0,
+            backbone_probed_in_pass: Vec::new(),
+            backbone_pass: 1,
+            backbone_passes: None,
+            backbone_binary_candidate: Vec::new(),
+            backbone_binary_stacked: None,
+            vivify_generations: None,
+            // Resolved once here: the per-learned-binary lookup of the switch
+            // table showed up on the conflict path. Tests still override it.
+            tier_histogram_binaries: Some(
+                ay_core::sat_ab_switches().tier_histogram_binaries == Some(true),
+            ),
+            keep_learned_binaries: None,
+            blanket_trail_protection: None,
             backbone_post_vivify_binary_admission: true,
             backbone_consecutive_empty: 0,
             next_bounded_backbone_conflict: 0,
@@ -2091,6 +2618,10 @@ impl ColdState {
             intree_failed: 0,
             intree_vars_set: 0,
             last_inprocessing_overhead_ms: 0.0,
+            inproc_pass_work_te: 0,
+            inproc_scan_te: 0,
+            search_tick_stop: None,
+            caller_search_tick_stop: None,
             post_rebuild_props_baseline: 0,
             post_rebuild_bcp_pending: false,
             post_rebuild_is_full: false,
@@ -2098,12 +2629,12 @@ impl ColdState {
             disconnected_deletions: 0,
             last_round_simplifications: 0,
             consecutive_low_productivity_rounds: 0,
-            eliminated_ext_vals: vec![false; num_vars],
-            e2i: (0..num_vars as u32).collect(),
-            i2e: (0..num_vars as u32).collect(),
+            eliminated_ext_vals: a.filled(num_vars, false)?,
+            e2i: a.indexed(num_vars, |index| index as u32)?,
+            i2e: a.indexed(num_vars, |index| index as u32)?,
             compact_next_conflict: 0,
             compact_count: 0,
-            freeze_counts: vec![0; num_vars],
+            freeze_counts: a.filled(num_vars, 0)?,
             // Clause IDs underpin deferred reconstruction, but the
             // reservation is lazy-on-first-write (`clause_ids_grow_for`): the
             // no-proof route disables clause_ids right after construction and
@@ -2115,13 +2646,15 @@ impl ColdState {
             load_slack_reclaimed_bytes: 0,
             bcp_learned_clause_birth_conflicts: Vec::new(),
             clause_birth_solve: Vec::new(),
-            level0_proof_id: vec![0; num_vars],
-            level0_proof_sign: vec![0; num_vars],
+            level0_proof_id: a.filled(num_vars, 0)?,
+            level0_proof_sign: a.filled(num_vars, 0)?,
             lrat_level0_unit_materialize_cursor: 0,
             lrat_level0_unit_materialize_pinned: Vec::new(),
             proof_bookkeeping_budget: None,
+            proof_exhaustion_keeps_proof_inprocessing: false,
             next_clause_id: 1,
             next_original_clause_id: 1,
+            registered_original_clause_id: None,
             issued_original_clause_id_max: 0,
             original_clause_id_bits: Vec::new(),
             lrat_enabled,
@@ -2139,9 +2672,12 @@ impl ColdState {
             fmla_decompose_lrat_preflight_route_consumed: false,
             jump_reasons_enabled: false, // computed in init_solve (#8034)
             veripb_stated_root_units: Vec::new(),
+            proof_vars_compacted: false,
+            veripb_hints: super::veripb_hints::VeripbHintState::default(),
             empty_clause_in_proof: false,
             empty_clause_lrat_id: None,
             empty_clause_scope_depth: 0,
+            full_reset_after_empty_clause_retraction: false,
             clause_trace: None,
             scope_selectors: Vec::new(),
             scope_var_starts: Vec::new(),
@@ -2162,6 +2698,8 @@ impl ColdState {
             lifetime_decisions: 0,
             lifetime_propagations: 0,
             lifetime_restarts: 0,
+            lifetime_search_ticks: 0,
+            work_watermark: ay_core::resource::WorkWatermark::default(),
             incremental_solve_count: 0,
             active_assumption_count: 0,
             last_between_solve_reduce_conflicts: 0,
@@ -2171,8 +2709,8 @@ impl ColdState {
             extension_trusted_lemmas: false,
             streaming_core: None,
             streaming_core_num_originals: 0,
-            scope_selector_set: vec![false; num_vars],
-            was_scope_selector: vec![false; num_vars],
+            scope_selector_set: a.filled(num_vars, false)?,
+            was_scope_selector: a.filled(num_vars, false)?,
             root_satisfied_saved: Vec::new(),
             inprocessing_modified_clause_db: false,
             l0_gc_modified_clause_db: false,
@@ -2196,12 +2734,15 @@ impl ColdState {
             cold_restart_enabled: !ay_core::sat_disable_flags().no_cold_restart,
             cold_restart_fo_enabled: true,
             cold_restart_fp_enabled: false,
-            forced_phase: vec![0; num_vars],
+            forced_phase: a.filled(num_vars, 0)?,
             preprocess_enabled: true,
             preprocess_watches_valid: false,
             preprocess_deadline: None,
             solve_deadline: None,
+            solve_budget_ms: None,
+            deterministic_inproc: crate::determinism::deterministic_inproc_enabled(),
             indep_enum_pending: None,
+            support_enumeration: true,
             incremental_watch_boundary: None,
             symmetry_enabled: false, // #8190: CaDiCaL has no symmetry detection; adaptive re-enables for small structured formulas
             symmetry_stats: crate::symmetry::SymmetryStats::default(),
@@ -2218,10 +2759,12 @@ impl ColdState {
             bcp_lean_route_enabled: false,
             forward_checker: None,
             last_unknown_reason: None,
+            counted_admission: None,
             last_unknown_detail: None,
             finalize_sat_fail_count: 0,
             oversized_clause_poison: false,
             interrupt: None,
+            deadline_interrupt: None,
             process_memory_interrupt: false,
             process_memory_interrupt_pending: false,
             backbone_binary_cursor: 0,
@@ -2287,6 +2830,9 @@ impl ColdState {
             ic3_mode: false,
             inc_engine_reset_mode: false,
             unguarded_theory_conflict_lemmas: false,
+            retain_primary_theory_conflicts: false,
+            retain_primary_after: None,
+            primary_theory_conflicts_routed: 0,
             domain_bcp_min_vars: None,
             ic3_constrain_act: None,
             ic3_constrained_offsets: Vec::new(),
@@ -2311,8 +2857,13 @@ impl ColdState {
             #[cfg(all(debug_assertions, feature = "jit"))]
             debug_jit_flags_buf: Vec::new(),
             #[cfg(all(debug_assertions, feature = "jit"))]
-            debug_interp_output: ay_jit::conflict_jit::ConflictProcessorOutput::new(num_vars),
-        }
+            debug_interp_output: a.choose(
+                || ay_jit::conflict_jit::ConflictProcessorOutput::new(num_vars),
+                |owner| {
+                    ay_jit::conflict_jit::ConflictProcessorOutput::try_new_counted(num_vars, owner)
+                },
+            )?,
+        })
     }
 }
 

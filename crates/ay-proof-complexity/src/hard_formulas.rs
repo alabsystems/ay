@@ -115,22 +115,26 @@ pub fn random_k_cnf(k: usize, n: usize, m: usize, seed: Option<u64>) -> Cnf {
     let mut cnf = Cnf::new_with_capacity(n as u32, m);
 
     for _ in 0..m {
-        // Sample k distinct variables
-        let mut vars: Vec<usize> = (0..n).collect();
+        // Sample k distinct variables. Both vectors are reserved fallibly
+        // and filled by push: a failed reservation only means the pushes
+        // grow them.
+        let mut vars: Vec<usize> = Vec::new();
+        let _ = vars.try_reserve_exact(n);
+        for v in 0..n {
+            vars.push(v);
+        }
         vars.shuffle(&mut rng);
         // Random polarity for each
-        let clause: Vec<Lit> = vars
-            .into_iter()
-            .take(k)
-            .map(|v| {
-                let var = Var::new(v as u32);
-                if rng.gen_bool(0.5) {
-                    Lit::positive(var)
-                } else {
-                    Lit::negative(var)
-                }
-            })
-            .collect();
+        let mut clause: Vec<Lit> = Vec::new();
+        let _ = clause.try_reserve_exact(k.min(n));
+        for v in vars.into_iter().take(k) {
+            let var = Var::new(v as u32);
+            clause.push(if rng.gen_bool(0.5) {
+                Lit::positive(var)
+            } else {
+                Lit::negative(var)
+            });
+        }
 
         cnf.add_clause(&clause);
     }
@@ -156,7 +160,13 @@ pub fn random_k_cnf(k: usize, n: usize, m: usize, seed: Option<u64>) -> Cnf {
 /// let formula = parity(4);  // x1 XOR x2 XOR x3 XOR x4 = 1
 /// ```
 pub fn parity(n: usize) -> Cnf {
-    let vars: Vec<Var> = (0..n).map(|i| Var::new(i as u32)).collect();
+    // Reserved fallibly and filled by push: a failed reservation only means
+    // the pushes grow the vector.
+    let mut vars: Vec<Var> = Vec::new();
+    let _ = vars.try_reserve_exact(n);
+    for i in 0..n {
+        vars.push(Var::new(i as u32));
+    }
 
     let clause_count = xor_clause_count(n, true);
     let mut cnf = Cnf::new_with_capacity(n as u32, clause_count);

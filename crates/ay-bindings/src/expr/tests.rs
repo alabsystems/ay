@@ -992,8 +992,9 @@ fn test_int_constants() {
     assert!(shorthand.sort().is_int());
     assert_eq!(shorthand.to_string(), "7");
 
+    // SMT-LIB 2.6 section 3.1: `-123` is a symbol, not a numeral.
     let neg = Expr::int_const(-123);
-    assert_eq!(neg.to_string(), "-123");
+    assert_eq!(neg.to_string(), "(- 123)");
 }
 
 #[test]

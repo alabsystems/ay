@@ -70,7 +70,7 @@ impl Sweeper {
                     if encoded >= COI_CLAUSE_LIMIT {
                         break;
                     }
-                    if arena.is_garbage(clause_idx) || arena.is_empty_clause(clause_idx) {
+                    if arena.is_dead(clause_idx) {
                         continue;
                     }
                     // CaDiCaL can_sweep_clause (sweep.cpp:64-70): only feed

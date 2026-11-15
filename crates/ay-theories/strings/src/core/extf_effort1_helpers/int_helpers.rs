@@ -109,7 +109,9 @@ impl CoreSolver {
     /// so the length constraint eliminates it.
     ///
     /// This prevents false SAT on assertions like `(< (str.to_code x) 0)`
-    /// when `(= (str.len x) 1)` is asserted (#6353).
+    /// when `(= (str.len x) 1)` is asserted (#6353). The narrowing uses only a
+    /// length the proof forest explains, and a conflict drawn from it must add
+    /// those literals ([`Self::range_conflict`]).
     pub(in super::super) fn int_app_bounds_with_state(
         terms: &TermStore,
         state: Option<&SolverState>,
@@ -124,8 +126,9 @@ impl CoreSolver {
                 // str.to_code(x) returns -1 when len(x) != 1, and a value
                 // in [0, 196607] when len(x) = 1. If len(x) = 1 is known
                 // via the solver state, tighten the lower bound to 0.
-                let len_is_one = state
-                    .is_some_and(|s| s.known_length_full(terms, args[0]).is_some_and(|n| n == 1));
+                let len_is_one = state.is_some_and(|s| {
+                    Self::known_len_with_reasons(terms, s, args[0]).is_some_and(|(n, _)| n == 1)
+                });
                 let min = if len_is_one {
                     BigInt::from(0)
                 } else {
@@ -136,5 +139,30 @@ impl CoreSolver {
             "str.to_code" => Some((BigInt::from(-1), Some(BigInt::from(196_607)))),
             _ => None,
         }
+    }
+
+    /// Explanation of a range conflict on the relation literal `lit` over the
+    /// function term `t`: `lit` plus the literals behind the state-aware
+    /// narrowing of `t`'s range (for `str.to_code(x)` with an explained
+    /// `len(x) = 1`, the reasons for that length; the static range needs none).
+    ///
+    /// With `lit` alone, a `len(x) = 1` the SAT solver merely decided learns
+    /// `¬(str.to_code(x) = -1)` outright: the pattern upstream 0eb3642a4
+    /// removed from the regex length check (nf_length_premise.rs).
+    pub(in super::super) fn range_conflict(
+        terms: &TermStore,
+        state: &SolverState,
+        lit: TheoryLit,
+        t: TermId,
+    ) -> Vec<TheoryLit> {
+        let mut explanation = vec![lit];
+        if let TermData::App(sym, args) = terms.get(t) {
+            if sym.name() == "str.to_code" && args.len() == 1 {
+                if let Some((1, reasons)) = Self::known_len_with_reasons(terms, state, args[0]) {
+                    explanation.extend(reasons);
+                }
+            }
+        }
+        explanation
     }
 }

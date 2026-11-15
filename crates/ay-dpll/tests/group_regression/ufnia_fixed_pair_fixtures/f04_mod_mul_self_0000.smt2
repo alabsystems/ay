@@ -1,0 +1,15 @@
+; Satisfiable; z3 4.12.5 sat with d = 0, c = -17, x = -97, y = 1, e = 12, f(13) = 0, (mod 0 0) = 7, (mod 7 0) = 8.
+; AY answered unsat before the fixed-term export required both sides justified.
+(declare-fun f (Int) Int)
+(declare-fun g (Int Int) Int)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const d Int)
+(declare-const e Int)
+(declare-const c Int)
+(declare-const z Int)
+(assert (= (mod (* c d) d) 7))
+(assert (distinct (* (f 0) d) (* x y)))
+(assert (distinct 2 (mod 7 (f (+ e 1)))))
+(assert (distinct x 1))
+(check-sat)

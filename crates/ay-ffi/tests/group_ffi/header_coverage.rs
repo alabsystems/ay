@@ -365,8 +365,11 @@ fn test_string_accessors_capi() {
         let cat_args = [x, hello];
         let cat = Z3_mk_seq_concat(ctx, 2, cat_args.as_ptr());
         assert!(!Z3_is_string(ctx, cat));
-        assert!(Z3_get_string(ctx, cat).is_null());
+        // z3: "" plus Z3_INVALID_ARG ("expression is not a string literal").
+        assert_eq!(CStr::from_ptr(Z3_get_string(ctx, cat)).to_bytes(), b"");
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
         assert_eq!(Z3_get_string_length(ctx, cat), 0);
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
 
         // Int numeral is not a string.
         let int_sort = Z3_mk_int_sort(ctx);

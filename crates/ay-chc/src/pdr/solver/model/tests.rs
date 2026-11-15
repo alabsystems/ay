@@ -159,7 +159,7 @@ fn nested_datatype_problem() -> ChcProblem {
     let mut problem = ChcProblem::new();
     let inner_sort = ChcSort::Datatype {
         name: "Inner".to_string(),
-        constructors: Arc::new(vec![crate::ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
             name: "mkInner".to_string(),
             selectors: vec![crate::ChcDtSelector {
                 name: "value".to_string(),
@@ -169,7 +169,7 @@ fn nested_datatype_problem() -> ChcProblem {
     };
     let outer_sort = ChcSort::Datatype {
         name: "Outer".to_string(),
-        constructors: Arc::new(vec![crate::ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
             name: "mkOuter".to_string(),
             selectors: vec![
                 crate::ChcDtSelector {
@@ -260,7 +260,10 @@ fn hyperedge_problem() -> ChcProblem {
 
 #[test]
 fn record_blocked_state_for_convex_caps_entries_fifo() {
-    let mut solver = PdrSolver::new(linear_problem(), test_config());
+    let mut solver = PdrSolver::new(
+        linear_problem(),
+        test_config().with_spacer(crate::pdr::config::SpacerLane::OFF),
+    );
     let pred = solver
         .problem
         .get_predicate_by_name("P")
@@ -309,7 +312,10 @@ fn record_blocked_state_for_convex_caps_predicate_map() {
         predicate_names.push(pred_name);
     }
 
-    let mut solver = PdrSolver::new(problem, test_config());
+    let mut solver = PdrSolver::new(
+        problem,
+        test_config().with_spacer(crate::pdr::config::SpacerLane::OFF),
+    );
     for (idx, pred_name) in predicate_names.iter().enumerate() {
         let pred = solver
             .problem
@@ -482,39 +488,60 @@ fn solver_with_guarded_lemma_at_level(max_level: usize) -> (PdrSolver, Lemma) {
     (solver, lemma)
 }
 
+// The guard-level filter through `can_push_lemma`. `linear_problem` is the
+// identity self-loop `P(x) → P(x)` with no fact, the lemma is `¬(x = 0)` and the
+// frames are empty, so a push succeeds iff the planted guard `¬(x = 0)` is read:
+// the push query is `guard(head) ∧ x = 0`, UNSAT with the guard, SAT without.
+//
+// A guard `(g, max_level)` is a body lemma at level L translated through the
+// clause and stored with `max_level = L + 1` (`propagate_lemma_to_users`, Z3's
+// `next_level`): it is valid for the head at level `max_level` and below. A push
+// from `level` to `level + 1` assumes the body frame `F_level`, so its head is at
+// level `level + 1` and it may read guards with `max_level ≥ level + 1` only
+// (`push_guard_check_level`; Spacer `propagate_to_next_level` →
+// `is_invariant(next_level(lvl))`). The earlier expectations "included at the
+// equal level" and "max_level 0 included at level 0" encoded the reading
+// `max_level ≥ level`, which admitted a guard from a body lemma at `level − 1`
+// that `F_level` does not imply — the non-inductive push behind the HOLA-44
+// demotion (`push_guard_level_tests.rs`). They are inverted here on purpose.
+
 #[test]
-fn clause_guarded_level_filter_includes_at_equal_level() {
-    // max_level=2, check_level=2: lemma included (2 >= 2)
+fn clause_guarded_level_filter_excludes_at_equal_level() {
+    // max_level=2, push from 2 ⇒ check_level=3: guard excluded (2 < 3), the
+    // unguarded query `x = 0` is SAT, no push.
     let (mut solver, lemma) = solver_with_guarded_lemma_at_level(2);
-    assert!(solver.can_push_lemma(&lemma, 2));
+    assert!(!solver.can_push_lemma(&lemma, 2));
 }
 
 #[test]
 fn clause_guarded_level_filter_includes_below_max() {
-    // max_level=2, check_level=1: lemma included (2 >= 1)
+    // max_level=2, push from 1 ⇒ check_level=2: guard included (2 >= 2)
     let (mut solver, lemma) = solver_with_guarded_lemma_at_level(2);
     assert!(solver.can_push_lemma(&lemma, 1));
 }
 
 #[test]
 fn clause_guarded_level_filter_excludes_above_max() {
-    // max_level=2, check_level=3: lemma excluded (2 < 3), falls back to unguarded behavior
+    // max_level=2, push from 3 ⇒ check_level=4: guard excluded (2 < 4), falls back to unguarded behavior
     let (mut solver, lemma) = solver_with_guarded_lemma_at_level(2);
     assert!(!solver.can_push_lemma(&lemma, 3));
 }
 
 #[test]
 fn clause_guarded_level_filter_excludes_zero_max_at_level_one() {
-    // max_level=0, check_level=1: lemma excluded (0 < 1)
+    // max_level=0, push from 1 ⇒ check_level=2: guard excluded (0 < 2)
     let (mut solver, lemma) = solver_with_guarded_lemma_at_level(0);
     assert!(!solver.can_push_lemma(&lemma, 1));
 }
 
 #[test]
-fn clause_guarded_level_filter_includes_zero_max_at_level_zero() {
-    // max_level=0, check_level=0: lemma included (0 >= 0)
+fn clause_guarded_level_filter_excludes_zero_max_at_level_zero() {
+    // max_level=0, push from 0 ⇒ check_level=1: guard excluded (0 < 1). A
+    // guard with `max_level = 0` would come from a body lemma at level −1,
+    // which `propagate_lemma_to_users` never produces (`target_level ≥ 1`); no
+    // push may ever read it.
     let (mut solver, lemma) = solver_with_guarded_lemma_at_level(0);
-    assert!(solver.can_push_lemma(&lemma, 0));
+    assert!(!solver.can_push_lemma(&lemma, 0));
 }
 
 #[test]
@@ -789,14 +816,14 @@ fn build_cex_steps_in_init_to_bad_order() {
     let leaf = build_pob_chain(pred);
     let cex = solver.build_cex(&leaf);
 
-    // Steps should be in init->bad order: level 2 (root) first, level 0 (leaf) last
+    // Steps run init -> bad: level 0 (leaf, the initial state) first, level 2 (root) last
     assert_eq!(cex.steps.len(), 3);
-    // Root (level 2) was assigned x=30
-    assert_eq!(cex.steps[0].assignments.get("x"), Some(&30));
+    // Leaf (level 0) was assigned x=10
+    assert_eq!(cex.steps[0].assignments.get("x"), Some(&10));
     // Mid (level 1) was assigned x=20
     assert_eq!(cex.steps[1].assignments.get("x"), Some(&20));
-    // Leaf (level 0) was assigned x=10
-    assert_eq!(cex.steps[2].assignments.get("x"), Some(&10));
+    // Root (level 2, the bad state) was assigned x=30
+    assert_eq!(cex.steps[2].assignments.get("x"), Some(&30));
 }
 
 #[test]
@@ -826,13 +853,13 @@ fn build_cex_non_point_states_still_use_smt_model_assignments() {
     assert_eq!(cex.steps.len(), 2);
     assert_eq!(
         cex.steps[0].assignments.get("x"),
-        Some(&42),
-        "build_cex must pull concrete values from SMT model for non-point root states"
+        Some(&7),
+        "build_cex must pull concrete values from SMT model for non-point leaf states"
     );
     assert_eq!(
         cex.steps[1].assignments.get("x"),
-        Some(&7),
-        "build_cex must pull concrete values from SMT model for non-point leaf states"
+        Some(&42),
+        "build_cex must pull concrete values from SMT model for non-point root states"
     );
 }
 
@@ -978,7 +1005,7 @@ fn build_cex_witness_entries_match_chain_order() {
 
     let witness = cex.witness.expect("witness should exist");
     assert_eq!(witness.entries.len(), 3);
-    // Entries should be in init->bad order matching steps
+    // Entries are root first (the reverse of `steps`, which run init -> bad)
     assert_eq!(witness.entries[0].level, 2); // root
     assert_eq!(witness.entries[1].level, 1); // mid
     assert_eq!(witness.entries[2].level, 0); // leaf

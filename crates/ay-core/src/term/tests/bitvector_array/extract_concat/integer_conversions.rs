@@ -17,6 +17,240 @@ fn test_bv2nat_constant_folding() {
 }
 
 #[test]
+fn test_bv2nat_masked_int2bv_residue_semantics() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    for width in 1..=6 {
+        let bv = store.mk_int2bv(width, x);
+        for bits in 0..=width {
+            let mask_value = (1_i64 << bits) - 1;
+            let mask = store.mk_bitvec(BigInt::from(mask_value), width);
+            for operands in [vec![bv, mask], vec![mask, bv]] {
+                let masked = store.mk_bvand(operands);
+                let nat = store.mk_bv2nat(masked);
+                if bits == width {
+                    assert_eq!(nat, store.mk_bv2nat(bv));
+                    continue;
+                }
+                if bits > 0 && bits < width {
+                    assert!(
+                        matches!(store.get(nat), TermData::App(Symbol::Named(name), _) if name == "mod")
+                    );
+                }
+                for value in -(1_i64 << width)..=(1_i64 << width) {
+                    let literal = store.mk_int(BigInt::from(value));
+                    let actual = store.substitute(nat, &[x], &[literal]);
+                    assert_eq!(
+                        store.get_int(actual),
+                        Some(&BigInt::from(value & mask_value)),
+                        "width={width}, mask={mask_value}, value={value}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_rejects_masks_with_holes() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    let bv = store.mk_int2bv(6, x);
+    for mask_value in 1_i64..64 {
+        if mask_value & (mask_value + 1) == 0 {
+            continue;
+        }
+        let mask = store.mk_bitvec(BigInt::from(mask_value), 6);
+        let masked = store.mk_bvand(vec![bv, mask]);
+        let nat = store.mk_bv2nat(masked);
+        assert!(
+            matches!(store.get(nat), TermData::App(Symbol::Named(name), _) if name == "bv2nat")
+        );
+    }
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_wide_negative_residue() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    let bv = store.mk_int2bv(129, x);
+    let mask_value: BigInt = (BigInt::from(1) << 100_u32) - 1;
+    let mask = store.mk_bitvec(mask_value.clone(), 129);
+    let masked = store.mk_bvand(vec![bv, mask]);
+    let nat = store.mk_bv2nat(masked);
+    let negative = store.mk_int(BigInt::from(-1));
+    let actual = store.substitute(nat, &[x], &[negative]);
+    assert_eq!(store.get_int(actual), Some(&mask_value));
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_normalized_mask_and_other_sources() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    let bv = store.mk_int2bv(8, x);
+    let expected_modulus = store.mk_int(BigInt::from(4));
+    let expected = store.mk_mod(x, expected_modulus);
+    for mask_value in [-253, 3, 259] {
+        let mask = store.mk_bitvec(BigInt::from(mask_value), 8);
+        let masked = store.mk_bvand(vec![bv, mask]);
+        assert_eq!(store.mk_bv2nat(masked), expected);
+    }
+    let leaf = store.mk_var("b", Sort::bitvec(64));
+    let extended = store.mk_bvsign_extend(56, bv);
+    let mask = store.mk_bitvec(BigInt::from(3), 64);
+    for source in [leaf, extended] {
+        let masked = store.mk_bvand(vec![source, mask]);
+        let nat = store.mk_bv2nat(masked);
+        assert!(
+            matches!(store.get(nat), TermData::App(Symbol::Named(name), _) if name == "bv2nat")
+        );
+    }
+}
+
+fn assert_raw_bv2nat_preserved(store: &mut TermStore, masked: TermId) {
+    let actual = store.mk_bv2nat(masked);
+    let expected = store.mk_app(Symbol::named("bv2nat"), [masked], Sort::Int);
+    assert_eq!(actual, expected);
+    assert_eq!(store.sort(actual), &Sort::Int);
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_raw_noninteger_sources() {
+    let mut store = TermStore::new();
+    for (name, sort) in [
+        ("boolean", Sort::Bool),
+        ("real", Sort::Real),
+        ("bitvector", Sort::bitvec(8)),
+    ] {
+        let source = store.mk_var(name, sort);
+        let bv = store.mk_app(
+            Symbol::indexed("int2bv", vec![8]),
+            [source],
+            Sort::bitvec(8),
+        );
+        for mask_value in [0, 3, 255] {
+            let mask = store.mk_bitvec(BigInt::from(mask_value), 8);
+            for operands in [[bv, mask], [mask, bv]] {
+                let masked = store.mk_app(Symbol::named("bvand"), operands, Sort::bitvec(8));
+                // In particular, the zero mask must not erase an ill-typed source.
+                assert_raw_bv2nat_preserved(&mut store, masked);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_raw_width_mismatches() {
+    let mut store = TermStore::new();
+    let source = store.mk_var("x", Sort::Int);
+    for (index, value_width, mask_width, result_width) in [
+        (8, 8, 8, 16),
+        (8, 16, 8, 8),
+        (8, 8, 16, 8),
+        (16, 8, 8, 8),
+        (8, 8, 8, 0),
+        (8, 0, 8, 8),
+        (0, 8, 8, 8),
+    ] {
+        let bv = store.mk_app(
+            Symbol::indexed("int2bv", vec![index]),
+            [source],
+            Sort::bitvec(value_width),
+        );
+        let mask = store.mk_bitvec(BigInt::from(3), mask_width);
+        for operands in [[bv, mask], [mask, bv]] {
+            let masked = store.mk_app(Symbol::named("bvand"), operands, Sort::bitvec(result_width));
+            assert_raw_bv2nat_preserved(&mut store, masked);
+        }
+    }
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_raw_operator_shapes() {
+    let mut store = TermStore::new();
+    let source = store.mk_var("x", Sort::Int);
+    let mask = store.mk_bitvec(BigInt::from(3), 8);
+    for (symbol, args) in [
+        (Symbol::named("int2bv"), vec![source]),
+        (Symbol::indexed("int2bv", vec![]), vec![source]),
+        (Symbol::indexed("int2bv", vec![8, 8]), vec![source]),
+        (Symbol::indexed("int2bv", vec![8]), vec![]),
+        (Symbol::indexed("int2bv", vec![8]), vec![source, source]),
+    ] {
+        let bv = store.mk_app(symbol, args, Sort::bitvec(8));
+        for operands in [[bv, mask], [mask, bv]] {
+            let masked = store.mk_app(Symbol::named("bvand"), operands, Sort::bitvec(8));
+            assert_raw_bv2nat_preserved(&mut store, masked);
+        }
+    }
+    let bv = store.mk_int2bv(8, source);
+    for args in [vec![], vec![bv], vec![bv, mask, mask]] {
+        let masked = store.mk_app(Symbol::named("bvand"), args, Sort::bitvec(8));
+        assert_raw_bv2nat_preserved(&mut store, masked);
+    }
+    let indexed = store.mk_app(
+        Symbol::indexed("bvand", vec![8]),
+        [bv, mask],
+        Sort::bitvec(8),
+    );
+    assert_raw_bv2nat_preserved(&mut store, indexed);
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_raw_mask_payloads() {
+    let mut store = TermStore::new();
+    let source = store.mk_var("x", Sort::Int);
+    let bv = store.mk_int2bv(8, source);
+    for (value, width, sort) in [
+        (511, 8, Sort::bitvec(8)),
+        (-1, 8, Sort::bitvec(8)),
+        (3, 8, Sort::Int),
+        (3, 8, Sort::bitvec(16)),
+        (3, 16, Sort::bitvec(8)),
+        (0, 8, Sort::Bool),
+        (0, 0, Sort::bitvec(8)),
+    ] {
+        // The existing internal interner permits raw payload fixtures without
+        // inventing IDs or minting terms in a checker-only reconstructed store.
+        let mask = store.intern(
+            TermData::Const(Constant::BitVec {
+                value: BigInt::from(value),
+                width,
+            }),
+            sort,
+        );
+        for operands in [[bv, mask], [mask, bv]] {
+            let masked = store.mk_app(Symbol::named("bvand"), operands, Sort::bitvec(8));
+            assert_raw_bv2nat_preserved(&mut store, masked);
+        }
+    }
+}
+
+#[test]
+fn test_bv2nat_masked_int2bv_well_typed_raw_controls() {
+    let mut store = TermStore::new();
+    let source = store.mk_var("x", Sort::Int);
+    for width in [1, 8, 129] {
+        let bv = store.mk_app(
+            Symbol::indexed("int2bv", vec![width]),
+            [source],
+            Sort::bitvec(width),
+        );
+        for bits in [0, width / 2, width] {
+            let modulus_value: BigInt = BigInt::from(1) << bits;
+            let mask = store.mk_bitvec(&modulus_value - 1, width);
+            let modulus = store.mk_int(modulus_value);
+            let expected = store.mk_mod(source, modulus);
+            for operands in [[bv, mask], [mask, bv]] {
+                // Raw bvand preserves zero/full masks until this conversion.
+                let masked = store.mk_app(Symbol::named("bvand"), operands, Sort::bitvec(width));
+                assert_eq!(store.mk_bv2nat(masked), expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn test_bv2int_signed_constant_folding() {
     let mut store = TermStore::new();
 

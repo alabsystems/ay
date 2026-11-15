@@ -44,6 +44,7 @@ impl LraSolver {
             propagated_equality_pairs: HashSet::default(),
             propagated_disequality_pairs: HashSet::default(),
             trivial_conflict: None,
+            trivial_conflict_scope: 0,
             bound_atoms: HashSet::default(),
             persistent_unsupported_atoms: HashSet::default(),
             persistent_unsupported_trail: Vec::new(),
@@ -68,6 +69,8 @@ impl LraSolver {
             pending_bound_refinements: Vec::new(),
             propagated_atoms: HashSet::default(),
             combined_theory_mode: false,
+            opaque_applications: false,
+            defined_operators: false,
             atom_slack: HashMap::default(),
             expr_to_slack: HashMap::default(),
             slack_var_set: HashSet::default(),
@@ -83,14 +86,22 @@ impl LraSolver {
             pivot_row_constant_buf: Rational::zero(),
             pivot_subst_i64_buf: Vec::new(),
             bland_mode: false,
-            basis_repeat_count: 0,
+            solve_deadline: None,
+            pivots_before_bland: 0,
             last_check_trail_pos: 0,
             last_diseq_check_had_violation: false,
+            assume_eqs_over_split: true,
             pending_diseq_splits: Vec::new(),
             pending_expr_splits: Vec::new(),
             bounds_tightened_since_simplex: true,
             post_simplex_bounds_added: false,
             vars_tightened_since_simplex: Vec::new(),
+            pre_scan_tightened_complete: false,
+            tightened_writes: 0,
+            tightened_writes_at_scan: 0,
+            pre_scan_scratch: Vec::new(),
+            pre_scan_targeted_count: 0,
+            materialization_delta_computations: std::cell::Cell::new(0),
             guard_clean_valid: false,
             last_simplex_verified: false,
             guard_tracked_only: false,
@@ -129,6 +140,8 @@ impl LraSolver {
             pivots_at_last_snapshot: u64::MAX,
             phase_hint_cache: HashMap::default(),
             phase_hint_epoch: 0,
+            phase_epoch_registered_len: 0,
+            model_epoch: 0,
             rows_at_check_start: 0,
             to_int_terms: Vec::new(),
             injected_to_int_axioms: HashSet::default(),
@@ -144,6 +157,9 @@ impl LraSolver {
             implied_bounds_fresh: false,
             disequality_trail: Vec::new(),
             disequality_trail_scopes: Vec::new(),
+            asserted_value_flips: 0,
+            diseq_retain_flip_snapshot: 0,
+            diseq_retain_scans: 0,
             shared_disequality_trail: Vec::new(),
             shared_disequality_trail_scopes: Vec::new(),
             unassigned_atom_count: Vec::new(),
@@ -162,15 +178,20 @@ impl LraSolver {
             bcp_cascade_dry_streak: 0,
             max_row_width: 0,
             dirty_vars_scratch: Vec::new(),
+            compound_wake_seen_scratch: HashSet::default(),
+            compound_wake_refs_scratch: Vec::new(),
             newly_bounded_scratch: HashSet::default(),
             theory_prop_jit: ay_jit::TheoryPropJit::new(),
             theory_prop_jit_compiled: false,
+            atom_index_atom_count: 0,
+            jit_stale_propagate_calls: 0,
             theory_prop_results: Vec::new(),
             pivot_row_cache: ay_jit::PivotRowCache::new(),
             lra_basis_region_requests: Vec::new(),
             lra_basis_region_candidate: None,
             lra_basis_region_basis_epoch: 0,
             no_theory_propagation: lra_debug_flags().no_theory_propagation,
+            no_bcp_implied_bounds: false,
             no_implied_bounds: lra_debug_flags().no_implied_bounds,
             no_bound_refinement: lra_debug_flags().no_bound_refinement,
             max_fixpoint_rounds: lra_debug_flags().max_fixpoint_rounds,
@@ -219,6 +240,11 @@ impl LraSolver {
             None => (ay_jit::TheoryPropJit::new(), false),
         };
         // Build propagation_dirty_vars from the atom and compound indices.
+        let atom_index_atom_count: u64 = snap
+            .atom_index
+            .values()
+            .map(|atoms| atoms.len() as u64)
+            .sum();
         let mut propagation_dirty_vars = DenseU32Set::default();
         propagation_dirty_vars.extend(snap.atom_index.keys().copied());
         propagation_dirty_vars.extend(snap.compound_use_index.keys().copied());
@@ -272,6 +298,7 @@ impl LraSolver {
             dirty: true,
             pending_equalities: Vec::new(),
             trivial_conflict: None,
+            trivial_conflict_scope: 0,
             bound_atoms: HashSet::default(),
             persistent_unsupported_atoms: HashSet::default(),
             persistent_unsupported_trail: Vec::new(),
@@ -290,20 +317,30 @@ impl LraSolver {
             pending_bound_refinements: Vec::new(),
             propagated_atoms: HashSet::default(),
             combined_theory_mode: false,
+            opaque_applications: false,
+            defined_operators: false,
             implied_bounds: Vec::new(),
             fixed_term_value_table: HashMap::default(),
             fixed_term_value_members: HashMap::default(),
             pending_fixed_term_equalities: Vec::new(),
             pending_offset_equalities: Vec::new(),
             bland_mode: false,
-            basis_repeat_count: 0,
+            solve_deadline: None,
+            pivots_before_bland: 0,
             last_check_trail_pos: 0,
             last_diseq_check_had_violation: false,
+            assume_eqs_over_split: true,
             pending_diseq_splits: Vec::new(),
             pending_expr_splits: Vec::new(),
             bounds_tightened_since_simplex: true,
             post_simplex_bounds_added: false,
             vars_tightened_since_simplex: Vec::new(),
+            pre_scan_tightened_complete: false,
+            tightened_writes: 0,
+            tightened_writes_at_scan: 0,
+            pre_scan_scratch: Vec::new(),
+            pre_scan_targeted_count: 0,
+            materialization_delta_computations: std::cell::Cell::new(0),
             guard_clean_valid: false,
             last_simplex_verified: false,
             guard_tracked_only: false,
@@ -342,6 +379,8 @@ impl LraSolver {
             pivots_at_last_snapshot: u64::MAX,
             phase_hint_cache: HashMap::default(),
             phase_hint_epoch: 0,
+            phase_epoch_registered_len: 0,
+            model_epoch: 0,
             rows_at_check_start: 0,
             injected_to_int_axioms: HashSet::default(),
             propagation_dirty_vars,
@@ -353,6 +392,9 @@ impl LraSolver {
             implied_bounds_fresh: false,
             disequality_trail: Vec::new(),
             disequality_trail_scopes: Vec::new(),
+            asserted_value_flips: 0,
+            diseq_retain_flip_snapshot: 0,
+            diseq_retain_scans: 0,
             shared_disequality_trail: Vec::new(),
             shared_disequality_trail_scopes: Vec::new(),
             infeasible_heap: std::collections::BinaryHeap::new(),
@@ -366,9 +408,13 @@ impl LraSolver {
             bcp_cascade_dry_streak: 0,
             max_row_width: 0,
             dirty_vars_scratch: Vec::new(),
+            compound_wake_seen_scratch: HashSet::default(),
+            compound_wake_refs_scratch: Vec::new(),
             newly_bounded_scratch: HashSet::default(),
             theory_prop_jit,
             theory_prop_jit_compiled,
+            atom_index_atom_count,
+            jit_stale_propagate_calls: 0,
             theory_prop_results: Vec::new(),
             // Policy decision (Fix A1): pivot_row_cache is not persisted —
             // it is lazily populated behind COMPILE_THRESHOLD use counts (no
@@ -379,6 +425,7 @@ impl LraSolver {
             lra_basis_region_candidate: None,
             lra_basis_region_basis_epoch: 0,
             no_theory_propagation: lra_debug_flags().no_theory_propagation,
+            no_bcp_implied_bounds: false,
             no_implied_bounds: lra_debug_flags().no_implied_bounds,
             no_bound_refinement: lra_debug_flags().no_bound_refinement,
             max_fixpoint_rounds: lra_debug_flags().max_fixpoint_rounds,
@@ -415,169 +462,6 @@ impl LraSolver {
         // atom is an unasserted decision candidate — rebuild the index to match.
         solver.rebuild_decision_index();
         Ok(solver)
-    }
-
-    /// Kani-only constructor: initializes only the pointer field, avoids
-    /// `TermStore::new()` and `lra_debug_flags()` which trigger deep
-    /// BTree/HashMap symbolic exploration that CBMC cannot handle (#6612).
-    #[cfg(kani)]
-    pub(crate) fn new_kani_minimal(ptr: *const TermStore) -> Self {
-        Self {
-            terms_ptr: ptr,
-            rows: Vec::new(),
-            vars: Vec::new(),
-            term_to_var: HashMap::default(),
-            var_to_term: HashMap::default(),
-            next_var: 0,
-            trail: Vec::new(),
-            bound_revision: 0,
-            scopes: Vec::new(),
-            asserted: HashMap::default(),
-            asserted_trail: Vec::new(),
-            cross_theory_asserted: HashMap::default(),
-            cross_theory_asserted_trail: Vec::new(),
-            cross_theory_asserted_scopes: Vec::new(),
-            atom_cache: HashMap::default(),
-            ite_link_terms: Vec::new(),
-            ite_link_terms_seen: HashSet::default(),
-            current_parsing_atom: None,
-            dirty: false,
-            pending_equalities: Vec::new(),
-            propagated_equality_pairs: HashSet::default(),
-            propagated_disequality_pairs: HashSet::default(),
-            trivial_conflict: None,
-            bound_atoms: HashSet::default(),
-            persistent_unsupported_atoms: HashSet::default(),
-            persistent_unsupported_trail: Vec::new(),
-            persistent_unsupported_scope_marks: Vec::new(),
-            integer_mode: false,
-            gomory_rng: 1,
-            pivot_rng: 1,
-            debug_lra: false,
-            debug_lra_bounds: false,
-            debug_lra_assert: false,
-            debug_lra_reset: false,
-            debug_lra_nelson_oppen: false,
-            debug_intern: false,
-            stats: stats::LraStats::default(),
-            registered_atoms: HashSet::default(),
-            decision_index: DecisionCandidateIndex::default(),
-            atom_index: HashMap::default(),
-            pending_propagations: Vec::new(),
-            pending_bound_refinements: Vec::new(),
-            propagated_atoms: HashSet::default(),
-            combined_theory_mode: false,
-            atom_slack: HashMap::default(),
-            expr_to_slack: HashMap::default(),
-            slack_var_set: HashSet::default(),
-            implied_bounds: Vec::new(),
-            fixed_term_value_table: HashMap::default(),
-            fixed_term_value_members: HashMap::default(),
-            pending_fixed_term_equalities: Vec::new(),
-            pending_offset_equalities: Vec::new(),
-            col_index: Vec::new(),
-            pivot_work_vec: Vec::new(),
-            pivot_work_dirty: Vec::new(),
-            pivot_row_coeffs_buf: Vec::new(),
-            pivot_row_constant_buf: Rational::zero(),
-            pivot_subst_i64_buf: Vec::new(),
-            bland_mode: false,
-            basis_repeat_count: 0,
-            last_check_trail_pos: 0,
-            last_diseq_check_had_violation: false,
-            pending_diseq_splits: Vec::new(),
-            bounds_tightened_since_simplex: false,
-            post_simplex_bounds_added: false,
-            vars_tightened_since_simplex: Vec::new(),
-            guard_clean_valid: false,
-            last_simplex_verified: false,
-            guard_tracked_only: false,
-            rows_len_at_last_implied: 0,
-            ib_overlay_complete: false,
-            warm_reuse_hint: false,
-            implied_trail: Vec::new(),
-            implied_trail_scopes: Vec::new(),
-            propagated_trail: Vec::new(),
-            propagated_trail_scopes: Vec::new(),
-            eager_repropagate_on_pop: false,
-            direct_bounds_changed_since_implied: false,
-            bcp_implied_single_pass: false,
-            direct_bounds_changed_vars: Vec::new(),
-            bound_generation: 0,
-            var_bound_gen: Vec::new(),
-            row_computed_gen: Vec::new(),
-            implied_tighten_streak: Vec::new(),
-            implied_tighten_scratch: Vec::new(),
-            implied_tighten_touched: Vec::new(),
-            ib_lb_contribs_scratch: Vec::new(),
-            ib_ub_contribs_scratch: Vec::new(),
-            ib_lb_contribs_f64_scratch: Vec::new(),
-            ib_ub_contribs_f64_scratch: Vec::new(),
-            ib_updates_scratch: Vec::new(),
-            ib_row_indices_scratch: Vec::new(),
-            ib_round_newly_bounded_scratch: Vec::new(),
-            ib_cross_neg_updates_scratch: Vec::new(),
-            ib_cascade_rows_scratch: Vec::new(),
-            ib_fixed_vars_scratch: Vec::new(),
-            implied_work_done: 0,
-            big_bound_seen: false,
-            last_simplex_feasible: false,
-            last_simplex_feasible_scopes: Vec::new(),
-            feasible_value_snapshot: Vec::new(),
-            pivots_at_last_snapshot: u64::MAX,
-            phase_hint_cache: HashMap::default(),
-            phase_hint_epoch: 0,
-            rows_at_check_start: 0,
-            to_int_terms: Vec::new(),
-            injected_to_int_axioms: HashSet::default(),
-            propagation_dirty_vars: DenseU32Set::default(),
-            compound_use_index: HashMap::default(),
-            var_to_atoms: HashMap::default(),
-            last_compound_propagations_queued: 0,
-            last_compound_wake_dirty_hits: 0,
-            last_compound_wake_candidates: 0,
-            basic_var_to_row: HashMap::default(),
-            touched_rows: DenseIdxSet::default(),
-            propagate_direct_touched_rows_pending: false,
-            implied_bounds_fresh: false,
-            disequality_trail: Vec::new(),
-            disequality_trail_scopes: Vec::new(),
-            shared_disequality_trail: Vec::new(),
-            shared_disequality_trail_scopes: Vec::new(),
-            unassigned_atom_count: Vec::new(),
-            infeasible_heap: std::collections::BinaryHeap::new(),
-            heap_epoch: 1,
-            in_infeasible_heap: Vec::new(),
-            heap_stale: true,
-            warm: warm_state::WarmSimplexState::new(),
-            float_simplex: simplex::float_simplex::FloatSimplex::new(),
-            reason_seen_buf: HashSet::default(),
-            not_inner_cache: HashMap::default(),
-            const_bool_cache: HashMap::default(),
-            refinement_eligible_cache: HashMap::default(),
-            is_integer_sort_cache: HashMap::default(),
-            dirty_vars_scratch: Vec::new(),
-            bcp_implied_dry_streak: 0,
-            bcp_cascade_dry_streak: 0,
-            max_row_width: 0,
-            theory_prop_jit: ay_jit::TheoryPropJit::new(),
-            theory_prop_jit_compiled: false,
-            theory_prop_results: Vec::new(),
-            pivot_row_cache: ay_jit::PivotRowCache::new(),
-            lra_basis_region_requests: Vec::new(),
-            lra_basis_region_candidate: None,
-            lra_basis_region_basis_epoch: 0,
-            negation_partners: Vec::new(),
-            standalone_simplex_mode: false,
-            propagation_output_buf: Vec::new(),
-            interval_reason_seen_buf: HashSet::default(),
-            all_newly_bounded_buf: DenseU32Set::default(),
-            // reason-alloc-wip: reused reason-collection DFS scratch (pure
-            // scratch, cleared on each use — starts empty).
-            scratch_reason_visited: std::cell::RefCell::default(),
-            scratch_reason_on_stack: std::cell::RefCell::default(),
-            scratch_reason_seen: std::cell::RefCell::default(),
-        }
     }
 
     /// Enable standalone-simplex mode (#8257).
@@ -629,6 +513,37 @@ impl LraSolver {
     /// the process-global flag, so re-apply after those constructors.
     pub fn set_no_theory_propagation(&mut self, disabled: bool) {
         self.no_theory_propagation = disabled;
+    }
+
+    /// Skip implied-bounds derivation (`compute_implied_bounds` and the
+    /// propagations/refinements derived from it) during BCP-time checks
+    /// ONLY. Direct bound propagation (asserted bounds implying other atoms
+    /// on the same variable) stays on, and the final-check cascade stays on,
+    /// so eager-arm completeness (which needs the cascade to feed LIA integer
+    /// reasoning at final check) is untouched.
+    ///
+    /// Motivation (BMC_T6_model_search_2026-09-19): on wide lustre unrollings
+    /// the BCP-time implied-bounds pass — even a single one — floods the
+    /// search with weak-reason propagations (8–11 M on queries z3 decides
+    /// with ~400), while turning ALL theory propagation off
+    /// (`set_no_theory_propagation`) removes the direct implications that
+    /// make each decision productive (DRAGON_5 depth-2: 154 k decisions /
+    /// 2.5 propagations per decision). Direct-only is the regime z3
+    /// effectively runs in: DRAGON_5 transcript 3.9 s → 0.26 s, MESI 12 → 3.5 s,
+    /// FIREFLY_all unknown → sat.
+    ///
+    /// Same lifecycle caveats as [`Self::set_no_theory_propagation`].
+    pub fn set_no_bcp_implied_bounds(&mut self, disabled: bool) {
+        self.no_bcp_implied_bounds = disabled;
+    }
+
+    /// Per-instance `--no-implied-bounds`: skip implied-bounds derivation;
+    /// direct propagation and the simplex are unchanged. Set only by the
+    /// nested quantified-LRA oracle probes (#qlra-nested-cegqi), where it is
+    /// the dominant cost (captured mjollnir1 query: 1.70 s -> 0.78 s, same
+    /// `sat`). Lifecycle caveats as [`Self::set_no_theory_propagation`].
+    pub fn set_no_implied_bounds(&mut self, disabled: bool) {
+        self.no_implied_bounds = disabled;
     }
 
     /// Set the TermStore pointer for the next operation batch (#6590 Packet 2).
@@ -711,13 +626,15 @@ impl LraSolver {
         // always runs BCP simplex. This counter is kept for statistics.
         self.stats.full_check_conflict_count = 0;
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // #inc-guard-memo: warm reset rewrites variable values below.
         // Also breaks the tracked-only chain (#inc-guard-chain).
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         self.direct_bounds_changed_since_implied = true;
         self.direct_bounds_changed_vars.clear();
-        self.last_simplex_feasible = false;
+        self.set_last_simplex_feasible(false);
         self.last_simplex_feasible_scopes.clear();
         self.rows_at_check_start = 0;
 
@@ -753,6 +670,7 @@ impl LraSolver {
         // tracking is stale.
         self.warm_invalidate();
         self.disequality_trail.clear();
+        self.asserted_value_flips = self.asserted_value_flips.wrapping_add(1);
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();
         self.shared_disequality_trail_scopes.clear();
@@ -812,12 +730,53 @@ impl LraSolver {
         self.integer_mode = enabled;
     }
 
+    /// See the `assume_eqs_over_split` field: `false` makes `check()` report
+    /// a violated disequality as its expression split even when a
+    /// model-value equality guess would apply. Default `true`.
+    pub fn set_assume_eqs_over_split(&mut self, on: bool) {
+        self.assume_eqs_over_split = on;
+    }
+
     /// Enable combined theory mode: suppress unsupported-atom marking for
     /// unknown function/term catch-all arms in `parse_linear_expr`.
     /// Cross-theory terms (array selects, UF applications) are expected in
     /// combined solvers and handled by the Nelson-Oppen loop (#5524).
     pub fn set_combined_theory_mode(&mut self, enabled: bool) {
         self.combined_theory_mode = enabled;
+    }
+
+    /// Treat applications of function symbols LRA does not interpret as
+    /// opaque variables without marking their atoms unsupported, and change
+    /// nothing else (unlike [`Self::set_combined_theory_mode`], which also
+    /// relaxes nonlinear, `div`/`mod` and `abs` handling and turns on
+    /// model-equality discovery over every variable). For the CDCL(T) kernel,
+    /// whose registry has already refused every operator that is neither
+    /// linear arithmetic nor an uninterpreted function, and whose hub decides
+    /// the uninterpreted applications (`ay-cdclt`, design H1).
+    pub fn set_opaque_applications(&mut self, enabled: bool) {
+        self.opaque_applications = enabled;
+    }
+
+    /// Treat a binary `div`/`mod` and `abs` as opaque variables whose atoms
+    /// stay supported: the caller adds their definitions (see the
+    /// `defined_operators` field).
+    pub fn set_defined_operators(&mut self, enabled: bool) {
+        self.defined_operators = enabled;
+    }
+
+    /// Whether an application of a function LRA does not interpret may stay
+    /// an opaque variable without marking its atom unsupported: a combined
+    /// solver or the kernel's hub decides it (`combined_theory_mode`,
+    /// `opaque_applications`).
+    pub(crate) fn unknown_functions_ok(&self) -> bool {
+        self.combined_theory_mode || self.opaque_applications
+    }
+
+    /// Whether a binary `div`/`mod` and `abs` may stay opaque without
+    /// marking their atoms unsupported: a combined solver or the caller
+    /// interprets them (`combined_theory_mode`, `defined_operators`).
+    pub(crate) fn opaque_operators_ok(&self) -> bool {
+        self.combined_theory_mode || self.defined_operators
     }
 
     /// Whether combined theory mode is enabled (see `set_combined_theory_mode`).

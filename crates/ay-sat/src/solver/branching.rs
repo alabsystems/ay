@@ -114,6 +114,7 @@ impl Solver {
                     self.stats.lbd_count,
                 );
                 let arm_switched = if completed {
+                    self.stats.mab_epochs += 1;
                     let prev = self.active_branch_heuristic;
                     let next = self.cold.branch_mab.select_next_arm();
                     self.switch_branch_heuristic(next);

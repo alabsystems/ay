@@ -94,22 +94,27 @@ a 2 3 0
 /// When clause database reduction is implemented, update this test to verify
 /// that learned_clauses can decrease between invocations.
 #[test]
-fn test_learned_clause_reduction() {
+fn test_learned_clause_reduction() -> Result<(), Box<dyn std::error::Error>> {
     // ∃x∀y. (x ∨ y) ∧ (¬x ∨ ¬y) — UNSAT (from test_exists_forall_unsat)
     // With clause database reduction, learned_clauses + clauses_deleted
     // equals the total clauses ever learned. Active count is bounded.
     let input = "p cnf 2 2\ne 1 0\na 2 0\n1 2 0\n-1 -2 0\n";
-    let formula = parse_qdimacs(input).unwrap();
+    let formula = parse_qdimacs(input)?;
     let mut solver = QbfSolver::new(formula);
     let _result = solver.solve();
 
     let stats = solver.stats();
     // Active learned clauses are bounded by total minus deleted
+    let total_learned = stats
+        .learned_clauses
+        .checked_add(stats.clauses_deleted)
+        .ok_or("active + deleted learned clauses overflow u64")?;
     assert!(
-        stats.learned_clauses + stats.clauses_deleted <= stats.conflicts,
+        total_learned <= stats.conflicts,
         "active ({}) + deleted ({}) should not exceed conflicts ({})",
         stats.learned_clauses,
         stats.clauses_deleted,
         stats.conflicts,
     );
+    Ok(())
 }

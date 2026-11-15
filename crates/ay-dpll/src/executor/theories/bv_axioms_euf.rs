@@ -18,7 +18,42 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::TermId;
 
 use super::super::Executor;
-use super::EufAxiomResult;
+use super::{CongruenceBail, EufAxiomResult};
+
+/// Clause budget for one BV congruence axiomatization.
+///
+/// Congruence is expanded eagerly into CNF for every same-symbol pair of
+/// applications, so its size is quadratic in the application count: 4,000
+/// applications of one 32-bit function are 8 million pairs and about 130 GB
+/// of clauses. Past this budget the generator stops, and the caller treats
+/// the partial axiomatization like any other bailed congruence pass: an
+/// UNSAT stands (the clauses emitted are a subset of the full theory), a
+/// SAT becomes `unknown (incomplete)`: a count cap, the same on every host
+/// ([`CongruenceBail::Count`]).
+const MAX_EUF_BV_CONGRUENCE_CLAUSES: usize = 2_000_000;
+
+/// Literal budget for the same pass; a clause over many argument bits costs
+/// more memory than a three-literal one.
+const MAX_EUF_BV_CONGRUENCE_LITERALS: usize = 16_000_000;
+
+/// Poll cadence for interrupt, deadline and memory checks in the pair loop.
+const EUF_BV_CONGRUENCE_POLL_MASK: u64 = 1023;
+
+/// A shared SAT variable and its negation cannot have equal Boolean values.
+/// Consequently these already encoded arguments can never be equal words,
+/// and their function-congruence implication is a tautology. This uses only
+/// the existing bit encoding, not source-name arithmetic or model values.
+fn argument_bits_prove_distinct(solver: &BvSolver<'_>, left: TermId, right: TermId) -> bool {
+    let (Some(left), Some(right)) = (solver.get_term_bits(left), solver.get_term_bits(right))
+    else {
+        return false;
+    };
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .any(|(&a, &b)| a != 0 && a.checked_neg() == Some(b))
+}
 
 impl Executor {
     /// Reify array-sorted equality atoms for UF arguments so the array theory ↔
@@ -218,7 +253,10 @@ impl Executor {
         let mut result = EufAxiomResult {
             clauses: Vec::new(),
             num_vars: 0,
+            bail: None,
         };
+        let mut literals_emitted: usize = 0;
+        let mut pair_index: u64 = 0;
 
         // Collect all uninterpreted function applications from assertions AND
         // extra terms (e.g., assumptions). UF applications in assumptions like
@@ -283,7 +321,7 @@ impl Executor {
             None
         };
 
-        for ((func_name, arity), applications) in &uf_apps {
+        'groups: for ((func_name, arity), applications) in &uf_apps {
             if applications.len() < 2 {
                 continue;
             }
@@ -301,6 +339,19 @@ impl Executor {
 
             for i in 0..applications.len() {
                 for j in (i + 1)..applications.len() {
+                    pair_index += 1;
+                    if result.clauses.len() > MAX_EUF_BV_CONGRUENCE_CLAUSES
+                        || literals_emitted > MAX_EUF_BV_CONGRUENCE_LITERALS
+                    {
+                        result.bail = Some(CongruenceBail::Count);
+                        break 'groups;
+                    }
+                    if pair_index & EUF_BV_CONGRUENCE_POLL_MASK == 0 {
+                        if let Some(origin) = self.encoding_phase_stop() {
+                            result.bail = Some(CongruenceBail::Stop(origin));
+                            break 'groups;
+                        }
+                    }
                     let (term1, args1) = &applications[i];
                     let (term2, args2) = &applications[j];
 
@@ -316,6 +367,16 @@ impl Executor {
                     // BV1 bit vector of an unrelated same-name application.
                     // Same-sorted pairs (the well-typed case) always pass.
                     if self.ctx.terms.sort(*term1) != self.ctx.terms.sort(*term2) {
+                        continue;
+                    }
+                    // Do this before allocating result copies, argument XOR
+                    // variables or CNF. One provably unequal argument makes
+                    // the whole congruence premise false. All other pairs
+                    // retain the original encoding and refusal controls.
+                    if args1.iter().zip(args2).any(|(&left, &right)| {
+                        self.ctx.terms.sort(left) == self.ctx.terms.sort(right)
+                            && argument_bits_prove_distinct(bv_solver, left, right)
+                    }) {
                         continue;
                     }
                     let bits1 = match bv_lits_for(*term1) {
@@ -409,6 +470,11 @@ impl Executor {
                                 for (bit_idx, (&bit1, &bit2)) in
                                     b1.iter().zip(b2.iter()).enumerate()
                                 {
+                                    // Equal encoded literals have an identically false
+                                    // XOR, so they add no disjunct to the premise.
+                                    if bit1 == bit2 {
+                                        continue;
+                                    }
                                     let ob1 = offset_bit(bit1);
                                     let ob2 = offset_bit(bit2);
                                     let diff_var = next_var as i32;
@@ -438,6 +504,7 @@ impl Executor {
                                     result
                                         .clauses
                                         .push(ay_core::CnfClause::new(vec![ob1, -ob2, diff_var]));
+                                    literals_emitted += 12;
                                 }
                             }
                             _ => {
@@ -457,7 +524,7 @@ impl Executor {
                         }
                     }
 
-                    if !all_args_have_bits || all_diff_vars.is_empty() {
+                    if !all_args_have_bits {
                         if debug {
                             safe_eprintln!(
                                 "  SKIPPING - all_args_have_bits={}, diff_vars={}",
@@ -485,6 +552,7 @@ impl Executor {
                     clause_buf.push(0); // Placeholder for bit1 literal
                     clause_buf.push(0); // Placeholder for bit2 literal
 
+                    literals_emitted += 2 * bits1.len() * clause_buf.len();
                     for (&bit1, &bit2) in bits1.iter().zip(bits2.iter()) {
                         let ob1 = offset_bit(bit1);
                         let ob2 = offset_bit(bit2);
@@ -624,6 +692,10 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bv_axioms_euf_distinct_bits_tests.rs"]
+mod distinct_bits_tests;
 
 #[cfg(test)]
 mod tests {

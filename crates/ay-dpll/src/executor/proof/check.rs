@@ -14,6 +14,8 @@ use ay_core::{AletheRule, Proof, ProofStep, TermId};
 #[cfg(feature = "proof-checker")]
 use ay_proof::PartialProofCheck;
 use ay_proof::{ProofCheckError, ProofQuality};
+#[path = "check/declarations.rs"]
+pub(super) mod declarations;
 #[path = "check/internal.rs"]
 mod internal;
 #[path = "check/strict.rs"]
@@ -23,7 +25,9 @@ mod strict_memo;
 #[cfg(test)]
 #[path = "check/strict_memo_tests.rs"]
 mod strict_memo_tests;
-pub(in crate::executor) use self::strict_memo::{StrictWalkKey, StrictWalkMemo};
+pub(in crate::executor) use self::strict_memo::{
+    document_payload, StrictWalkKey, StrictWalkMemo, STRICT_WALK_MEMO_MAX_PAYLOAD,
+};
 #[path = "strict_check_progress.rs"]
 mod strict_check_progress;
 use self::strict_check_progress::check_with_executor_progress;
@@ -32,6 +36,7 @@ use self::strict_check_progress::{
     check_partial_with_executor_progress, MeteredPartialCheck, WantQuality,
 };
 
+pub(super) use self::strict_check_progress::check_bounded_with_executor_progress;
 pub(in crate::executor) use self::strict_check_progress::{
     check_proof_gate_under_controls, check_proof_gate_with_executor_progress,
 };
@@ -190,6 +195,16 @@ impl Executor {
             "proof.ground_conflict_decomp_declined",
             self.ground_conflict_decomp_meters.declined.get(),
         );
+        // P4a.1: the deferred-trust pool's spend, a count of the query alone,
+        // and which discharge arm (if any) re-decided the published `unsat`.
+        self.last_statistics.set_int(
+            "cert.discharge_effort_spent",
+            self.certification_effort_spent.get(),
+        );
+        if let Some(corroboration) = self.last_unsat_corroboration.get() {
+            self.last_statistics
+                .set_string("cert.unsat_corroboration", corroboration.tag());
+        }
         self.publish_certification_accounting();
     }
 
@@ -242,6 +257,10 @@ impl Executor {
             (
                 "cert.publication_rejections",
                 accounting.publication_rejections,
+            ),
+            (
+                "cert.publication_rejections_nested",
+                accounting.publication_rejections_nested,
             ),
         ] {
             self.last_statistics.set_int(key, value);

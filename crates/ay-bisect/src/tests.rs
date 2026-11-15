@@ -48,7 +48,7 @@ struct ConcurrencyRunner {
 
 impl TrialRunner for ConcurrencyRunner {
     fn run(&self, flags: &[&str]) -> Result<SolveResult> {
-        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let active = self.active.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         self.max_active.fetch_max(active, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(5));
         self.active.fetch_sub(1, Ordering::SeqCst);

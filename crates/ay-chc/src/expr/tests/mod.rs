@@ -22,6 +22,9 @@ mod evaluator;
 mod i128_widening;
 mod linear_and_constructors;
 mod normalize_negations;
+mod replace_diseq_dag;
+mod select_store_expansion;
+mod top_level_definitions;
 
 fn right_leaf_of_left_associated_and_chain(mut expr: &ChcExpr, depth: usize) -> &ChcExpr {
     for _ in 0..depth {

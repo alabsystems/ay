@@ -14,6 +14,8 @@
 mod entry;
 mod inductive_blocking;
 mod insertion;
+#[cfg(test)]
+pub(in crate::pdr::solver) use insertion::ill_typed_candidates_rejected;
 mod parity;
 mod self_inductive;
 

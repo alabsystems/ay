@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+f 1;
+a 1 x1 >= 1 ;
+core id -1 ;
+e 1 x1 >= 1 ;
+del id 1 ;
+del id 2 : x1 1 ;
+rup 1 x1 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

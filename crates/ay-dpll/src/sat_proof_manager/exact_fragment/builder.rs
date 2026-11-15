@@ -93,8 +93,8 @@ impl SatProofManager<'_> {
 
     /// Publication-gate construction with an executor-owned diagnostic sink.
     ///
-    /// `diagnostic` receives the optional authority-census rows in output
-    /// order, leaving output policy with the executor boundary.
+    /// `diagnostic` receives the optional first-refusal row after the normal
+    /// fail-fast path has observed it, leaving output policy with the executor.
     pub(crate) fn build_exact_original_proof_fragment_metered_with_diagnostic(
         &mut self,
         trace: &ClauseTrace,
@@ -115,7 +115,7 @@ impl SatProofManager<'_> {
         )?;
         progress(initial_work, authored_bytes)?;
         let (term_store_baseline, charged_term_store_growth) =
-            self.precharge_term_store_growth(trace, progress)?;
+            self.precharge_term_store_growth(trace, original_id_cone, progress)?;
         let mut authored_problem_term_set = HashSet::default();
         for (index, &term) in authored_problem_terms.iter().enumerate() {
             if index % 1024 == 0 {
@@ -152,8 +152,9 @@ impl SatProofManager<'_> {
         })
     }
 
-    /// Emit the selected trace entries, optionally collecting every authority
-    /// rejection before returning the same first error as the fail-fast path.
+    /// Emit the selected trace entries with the same fail-fast sequence whether
+    /// diagnostics are enabled or not. A diagnostic describes only an already
+    /// observed refusal; it never retries the rest of the residual for a census.
     fn emit_exact_original_entries(
         &mut self,
         trace: &ClauseTrace,
@@ -162,73 +163,47 @@ impl SatProofManager<'_> {
         diagnostic: &mut dyn FnMut(String),
     ) -> Result<(), ExactOriginalProofError> {
         let final_failures = self.authenticate_original_entries(trace, state, progress);
-        // The typed probe remains observational: census only the hard
-        // residual, then return the same first error as the normal path.
-        if ay_core::misc_cli_flags().probe_cert_reject {
-            let mut first_error = None;
-            let mut resource_failures = 0usize;
-            let mut failures: Vec<Vec<TermId>> = Vec::new();
-            for &(trace_index, entry) in &final_failures {
-                match self.emit_exact_original_entry(trace_index, entry, state, progress) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        if let ExactOriginalProofError::UnauthenticatedOriginalClause {
-                            clause,
-                            ..
-                        } = &error
-                        {
-                            failures.push(clause.clone());
-                        } else {
-                            // NOT an authority failure — a resource/deadline
-                            // abort. Counted separately: an uncounted abort
-                            // renders as "0 unauthenticated" and reads as a
-                            // fully authenticated cone when the scan in fact
-                            // never ran (measured: 24 silent aborts).
-                            resource_failures += 1;
-                        }
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
+        for (residual_index, &(trace_index, entry)) in final_failures.iter().enumerate() {
+            if let Err(error) = self.emit_exact_original_entry(trace_index, entry, state, progress)
+            {
+                if ay_core::misc_cli_flags().probe_cert_reject {
+                    diagnostic(format!(
+                        "c authority-first-refusal trace_id={} residual_entries={} later_entries_not_replayed={}",
+                        entry.id,
+                        final_failures.len(),
+                        final_failures.len() - residual_index - 1,
+                    ));
+                    // Observe only this already refused entry. Never render
+                    // terms, register variables, replay, or inspect later rows.
+                    let literals: Vec<_> = entry
+                        .clause
+                        .iter()
+                        .take(32)
+                        .map(|lit| {
+                            let variable = lit.variable().index() as u32;
+                            (
+                                lit.raw(),
+                                variable,
+                                lit.is_positive(),
+                                self.var_to_term.get(&variable).copied(),
+                                self.is_scope_assumption_variable(variable),
+                            )
+                        })
+                        .collect();
+                    diagnostic(format!(
+                        "c authority-first-refusal-literals trace_address={:p} map_address={:p} trace_index={} trace_id={} origin={:?} namespace=sat-global-zero-based solver_num_vars={:?} mapped_vars={} literal_count={} shown_limit=32 tuple=(packed_raw,variable,positive,mapped_term,scope_selector) literals={:?}",
+                        trace,
+                        self.var_to_term,
+                        trace_index,
+                        entry.id,
+                        entry.origin,
+                        trace.solver_num_vars(),
+                        self.var_to_term.len(),
+                        entry.clause.len(),
+                        literals,
+                    ));
                 }
-            }
-            if resource_failures > 0 {
-                diagnostic(format!(
-                    "c authority-census INCOMPLETE resource_aborts={resource_failures} \
-                     (the census below counts only entries actually scanned)"
-                ));
-            }
-            diagnostic(format!(
-                "c authority-census unauthenticated_originals={}",
-                failures.len()
-            ));
-            let mut by_shape: std::collections::BTreeMap<String, (usize, Vec<TermId>)> =
-                std::collections::BTreeMap::new();
-            for clause in &failures {
-                let shape = clause
-                    .iter()
-                    .map(|&t| Self::census_shape(self.terms, t, 2))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let entry = by_shape.entry(shape).or_default();
-                entry.0 += 1;
-                if entry.1.is_empty() {
-                    entry.1 = clause.clone();
-                }
-            }
-            let mut rows: Vec<_> = by_shape.into_iter().collect();
-            rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
-            for (shape, (count, example)) in rows.into_iter().take(25) {
-                diagnostic(format!(
-                    "c authority-census {count:6} x {shape} example={example:?}"
-                ));
-            }
-            if let Some(error) = first_error {
                 return Err(error);
-            }
-        } else {
-            for &(trace_index, entry) in &final_failures {
-                self.emit_exact_original_entry(trace_index, entry, state, progress)?;
             }
         }
         Ok(())
@@ -281,36 +256,6 @@ impl SatProofManager<'_> {
             .collect();
         self.context_deep_retry = false;
         still_failed
-    }
-
-    /// Compact head-shape signature of a term for the census diagnostic.
-    fn census_shape(terms: &ay_core::TermStore, term: TermId, depth: usize) -> String {
-        use ay_core::{Symbol, TermData};
-        if depth == 0 {
-            return "_".to_string();
-        }
-        match terms.get(term) {
-            TermData::Var(name, _) => format!("var:{name}"),
-            TermData::Const(_) => "const".to_string(),
-            TermData::Not(inner) => {
-                format!("not({})", Self::census_shape(terms, *inner, depth - 1))
-            }
-            TermData::Ite(_, _, _) => "ite/3".to_string(),
-            TermData::App(Symbol::Named(name), args) => {
-                if depth == 1 {
-                    format!("{name}/{}", args.len())
-                } else {
-                    format!(
-                        "{name}({})",
-                        args.iter()
-                            .map(|&a| Self::census_shape(terms, a, depth - 1))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                }
-            }
-            _ => "?".to_string(),
-        }
     }
 
     fn emit_exact_original_entry(

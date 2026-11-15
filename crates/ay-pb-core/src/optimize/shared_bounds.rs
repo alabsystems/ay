@@ -49,7 +49,7 @@
 //!   ordering, so an "unchanged epoch" never proved an unchanged bus — and it
 //!   was deleted as dead code / a latent misuse trap.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Sentinel for "no upper bound published". `i64::MAX` can therefore never be
@@ -105,6 +105,35 @@ pub fn reset_reported_dual_global() {
     REPORTED_DUAL_GLOBAL.store(LB_ABSENT, Ordering::Relaxed);
 }
 
+/// Whether [`announce_reported_dual_global`] also writes its `c dual N` line to
+/// stderr. On by default: the PB-competition front ends (`ay pb solve`, the
+/// `ay-pb` binary) publish it there so the dual side of a run that ends
+/// SATISFIABLE stays measurable from outside. A front end whose stderr is itself
+/// a byte-exact contract turns it off — Z3-mode `-pbo`/`.opb` must match z3,
+/// whose stderr is silent, and whether an engine reaches its report before the
+/// portfolio winner stops it is a thread race, so the line leaked
+/// nondeterministically. The value is recorded either way.
+static REPORTED_DUAL_STDERR: AtomicBool = AtomicBool::new(true);
+
+/// Enables or silences the stderr line of [`announce_reported_dual_global`] for
+/// this process. See [`REPORTED_DUAL_STDERR`].
+pub fn set_reported_dual_stderr(enabled: bool) {
+    REPORTED_DUAL_STDERR.store(enabled, Ordering::Relaxed);
+}
+
+/// Publishes a reporting-only dual like [`publish_reported_dual_global`] and,
+/// when that raised the sink and the stderr announcement is enabled, prints it
+/// as `c dual N`. Returns whether the line was printed. The single place an
+/// engine announces a dual, so no call site can forget the switch.
+pub fn announce_reported_dual_global(value: i128) -> bool {
+    let printed =
+        publish_reported_dual_global(value) && REPORTED_DUAL_STDERR.load(Ordering::Relaxed);
+    if printed {
+        eprintln!("c dual {value}");
+    }
+    printed
+}
+
 /// A lower bound on the objective that is sound over ALL feasible points of
 /// the ORIGINAL instance (a "global-sound floor"), typed by source.
 ///
@@ -124,9 +153,9 @@ impl GlobalSoundFloor {
     /// That floor is derived purely from the ORIGINAL constraint set
     /// (direct / cardinality-covering / surrogate-aggregation bounds) with
     /// checked arithmetic, and is proven sound by:
-    /// * the Kani/model-checker-consumer harness `portfolio::kani_optimality_upgrade`
-    ///   (`gate_soundness_structural_floor`: the floor never overshoots the
-    ///   true optimum), and
+    /// * the exhaustive test
+    ///   `portfolio::tests::gate_soundness_all_small_two_variable_covers`
+    ///   (the floor never overshoots the true optimum), and
     /// * the deductive-checks lemmas `optimum_gate_sound` /
     ///   `optimum_achieved_and_minimal` licensing the `value <= floor =>
     ///   optimal` gate the coordinator applies against it.
@@ -387,6 +416,27 @@ mod tests {
         // Negative objective values are legal bus values.
         assert!(bus.publish_incumbent(-3, &[true, false]));
         assert_eq!(bus.ub(), Some(-3));
+    }
+
+    #[test]
+    fn silenced_dual_announcement_prints_nothing_but_still_records() {
+        // The sink and the switch are process-global and other tests' engines
+        // publish into the sink concurrently, so this uses a value no engine
+        // reaches and asserts only what a concurrent publish cannot change.
+        let value = i128::from(i64::MAX - 1);
+        set_reported_dual_stderr(false);
+        let printed = announce_reported_dual_global(value);
+        set_reported_dual_stderr(true);
+        assert!(!printed, "a silenced announcement must not print");
+        assert_eq!(
+            reported_dual_global(),
+            Some(value),
+            "silencing must not drop the value"
+        );
+        assert!(
+            !announce_reported_dual_global(value),
+            "an announcement that does not raise the sink never prints"
+        );
     }
 
     #[test]

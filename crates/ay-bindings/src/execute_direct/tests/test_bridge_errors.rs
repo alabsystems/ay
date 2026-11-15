@@ -73,6 +73,54 @@ fn test_execute_direct_reserved_definition_parameter_returns_error_without_unwin
     assert_reserved_declaration_is_error_without_unwind(program, "define_fun parameter");
 }
 
+/// A constant spelled like a declared datatype SELECTOR is a rebinding of an
+/// ay function symbol, and the bridge must refuse it as an `ExecuteError`, not
+/// unwind. This is the shape of `compiler_consumer-ice-2026-09-08T05_49_46`: the kernel
+/// `Expr` struct's field `kind` became a selector `kind`, a local `kind` became
+/// a constant `kind` declared AFTER the datatype, and the panicking
+/// `declare_const` path unwound into the embedding compiler. trust-router pins
+/// it on its side; this pins it at the ay boundary, for both entry points.
+#[test]
+fn test_execute_direct_constant_rebinding_a_selector_returns_error_without_unwinding() {
+    let expr_sort = Sort::struct_type("Expr", [("kind", Sort::int())]);
+    let mut program = AYProgram::new();
+    program.set_logic("ALL");
+    program.declare_datatype(expr_sort.datatype_sort().unwrap().clone());
+    let _ = program.declare_const("kind", Sort::int());
+    let e = program.declare_const("e", expr_sort);
+    let selected = e.field_select("Expr", "kind", Sort::int());
+    program.assert(selected.eq(Expr::var("kind", Sort::int())));
+    program.check_sat();
+
+    let assert_rebinding_error = |error: &ExecuteError, entry: &str| match error {
+        ExecuteError::ConstraintExecution(reason) => assert!(
+            reason.contains("declare_const")
+                && reason.contains("'kind'")
+                && reason.contains("already bound to a different declaration"),
+            "{entry}: the refusal must name the rebinding of `kind`, got: {reason}"
+        ),
+        other => panic!("{entry}: expected ConstraintExecution, got: {other:?}"),
+    };
+
+    let outer = catch_unwind(AssertUnwindSafe(|| execute(&program)));
+    let result =
+        outer.expect("execute: a selector rebinding must not unwind through execute_direct");
+    match result {
+        Err(error) => assert_rebinding_error(&error, "execute"),
+        Ok(result) => panic!("execute: ay must refuse the rebinding of `kind`, got {result:?}"),
+    }
+
+    let outer = catch_unwind(AssertUnwindSafe(|| execute_incremental(&program)));
+    let result = outer
+        .expect("execute_incremental: a selector rebinding must not unwind through execute_direct");
+    match result {
+        Err(error) => assert_rebinding_error(&error, "execute_incremental"),
+        Ok(outcomes) => {
+            panic!("execute_incremental: ay must refuse the rebinding of `kind`, got {outcomes:?}")
+        }
+    }
+}
+
 #[test]
 fn test_execute_direct_bridged_string_sort_error_returns_expr_translation() {
     let mut program = AYProgram::new();

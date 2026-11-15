@@ -19,7 +19,11 @@ pub(super) fn assert_strict_bundle_rows(checked: &ChcCheckedReplayRun) {
             )
         });
         assert_eq!(cert.verdict, "verified");
-        assert_eq!(cert.proof_bundle_schema, ay_dpll::api::PROOF_BUNDLE_SCHEMA);
+        assert_eq!(
+            cert.proof_bundle_schema,
+            ay_dpll::api::RETAINED_PROOF_BUNDLE_SCHEMA
+        );
+        assert!(cert.is_retained_bundle_commitment());
         if let Some(alethe_sha256) = &cert.alethe_sha256 {
             assert_eq!(alethe_sha256.len(), 64);
         }
@@ -43,11 +47,19 @@ pub(super) fn assert_strict_bundle_rows(checked: &ChcCheckedReplayRun) {
             .as_ref()
             .expect("UNSAT row must retain its strict commitment");
         assert_eq!(cert.bundle_sha256, sha256_hex(bundle_bytes));
-        let bundle: ay_dpll::api::SerializableProofBundle =
-            serde_json::from_slice(bundle_bytes).expect("retained strict bundle JSON");
-        assert_eq!(bundle.schema, cert.proof_bundle_schema);
-        let rechecked = ay_dpll::api::re_check_bundle_strict(&bundle)
-            .expect("retained strict bundle must independently recheck");
+        let deadline = ay_core::time::Instant::now() + Duration::from_secs(60);
+        let limits = ay_dpll::api::RetainedProofTransportLimits {
+            max_json_bytes: bundle_bytes.len(),
+            max_storage_bytes: ay_dpll::api::MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+            max_work: ay_dpll::api::MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
+        };
+        let rechecked = ay_dpll::api::re_check_retained_bundle_strict_with_resource_control(
+            bundle_bytes,
+            limits,
+            deadline,
+            &mut |_, _| true,
+        )
+        .expect("actual-v4 strict bundle must independently replay");
         assert!(rechecked.quality.is_complete());
         match (cert.alethe_sha256.as_deref(), payload.alethe_bytes()) {
             (Some(expected), Some(bytes)) => assert_eq!(expected, sha256_hex(bytes)),

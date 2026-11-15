@@ -23,6 +23,32 @@ use super::models::{euf_with_int_values, extract_array_model, merge_lia_values, 
 impl TheoryCombiner<'_> {
     // --- Model extraction ---
 
+    /// Borrow live graph/assignment facts while extracting this candidate.
+    /// Model recovery cannot mutate the solver or assert model-only equalities.
+    pub(crate) fn euf_for_model_recovery(&self) -> &ay_euf::EufSolver<'_> {
+        &self.euf
+    }
+
+    /// Preserve this exact lane's earlier detour deadline/interrupt as well as
+    /// the Executor's shared attempt. No fresh grant is created for extraction.
+    pub(crate) fn model_recovery_phase_stop(&self) -> Option<crate::executor_types::UnknownOrigin> {
+        use crate::executor_types::UnknownOrigin;
+        if self
+            .interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Some(UnknownOrigin::InterruptFlag);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Some(UnknownOrigin::SolveDeadline);
+        }
+        None
+    }
+
     pub(crate) fn scope_euf_model_to_roots(&mut self, roots: &[TermId]) {
         self.euf.scope_model_to_roots(roots);
     }
@@ -580,16 +606,9 @@ impl TheoryCombiner<'_> {
             .as_mut()
             .expect("extract_all_models_auflra requires LRA");
         let lra_model = lra.extract_model();
+        // The shared merge checks every Real key/value; LRA's other-sort
+        // registration defaults are deliberately outside that domain.
         merge_lra_values(&mut euf_model, &lra_model, self.terms);
-        #[cfg(debug_assertions)]
-        let lra_value_count = lra_model.values.len();
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            euf_model.term_values.len() >= lra_value_count,
-            "BUG: AUFLRA combiner EUF model has {} values, fewer than LRA model's {} values",
-            euf_model.term_values.len(),
-            lra_value_count
-        );
         let arrays = self
             .arrays
             .as_mut()

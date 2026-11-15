@@ -17,8 +17,15 @@ use ay_dpll::api::{
 };
 use ay_frontend::Command;
 
+use super::check_obligations::{
+    assert_reachable_wf_guards, has_loose_bound_variable, lossy_binder_refusal,
+    reachable_wf_obligations, recheck_due, validate_wf_model, WfPhase, WfVerdict,
+    UNBOUND_VARIABLES_REASON,
+};
+use super::handle_params::{begin_handle_query, finish_handle_query, EngineSettings, ParamSet};
+use super::parse_binding::{bound_parse, BoundParse, GivenDeclaration, ParseScope, ParsedContent};
 use super::{
-    apply_supported_params, bounded_array_ext_consequences, cache_ast_vector, cache_string,
+    bounded_array_ext_consequences, cache_ast_vector, cache_string,
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
@@ -26,7 +33,7 @@ use super::{
     term_to_ast, transfer_cross_context_ffi_metadata, DecisionOwnerFamily, FiniteSetDecisionGate,
     ModelHandle, SolverCheckOutcome, Z3Context, Z3SolverHandle, Z3_ast, Z3_ast_vector, Z3_context,
     Z3_func_decl, Z3_model, Z3_params, Z3_solver, Z3_sort, Z3_string, Z3_symbol, Z3_EXCEPTION,
-    Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK, Z3_PARSER_ERROR,
 };
 
 /// Translate a `VerifiedSolveResult` into the Z3 C API lbool return value,
@@ -325,6 +332,7 @@ pub unsafe extern "C" fn Z3_solver_reset(c: Z3_context, s: Z3_solver) {
             handle.scope_markers.clear();
             handle.tracked.clear();
             handle.tracked_scope_markers.clear();
+            handle.parse_prior = super::parse_binding::ParsePrior::default();
             handle.clear_check_artifacts();
         });
     }
@@ -368,20 +376,83 @@ pub unsafe extern "C" fn Z3_solver_assert(c: Z3_context, s: Z3_solver, a: Z3_ast
                 ctx.error_msg = Some(format!("{e}"));
                 return;
             }
+            // A converted goal owns exact auxiliary declaration identities.
+            // Adopt those existing terms at this explicit consumer boundary so
+            // ordinary model extraction publishes them; never consult unrelated
+            // live solver assignments when a caller model lacks a binding.
+            let admitted = (|| -> Result<(), SolverError> {
+                if ctx.goal_cache.is_empty() {
+                    return Ok(());
+                }
+                let operation = ctx.solver.begin_tactic_operation()?;
+                let owner = operation.admission();
+                owner.admit(ctx.goal_cache.len(), 0).map_err(|_| {
+                    SolverError::TacticFailed("goal consumer admission refused".into())
+                })?;
+                let mut selected = None;
+                for &goal in &ctx.goal_cache {
+                    // SAFETY: goal_cache exclusively owns each retained handle
+                    // until context destruction; no callback occurs while this
+                    // shared handle reference is borrowed.
+                    let (count, converter) = {
+                        // SAFETY: goal_cache exclusively owns the handle (see above).
+                        let goal = unsafe { &*goal };
+                        (goal.formulas.len(), goal.model_converter.clone())
+                    };
+                    if let Some(converter) = converter {
+                        owner.admit(count, 0).map_err(|_| {
+                            SolverError::TacticFailed("goal consumer admission refused".into())
+                        })?;
+                        if !operation.validate(&ctx.solver) {
+                            return Err(SolverError::TacticFailed(
+                                "goal consumer source changed".into(),
+                            ));
+                        }
+                        // SAFETY: the context retains the handle for its lifetime.
+                        let current = unsafe { &*goal };
+                        if current.formulas.len() != count {
+                            return Err(SolverError::TacticFailed("goal consumer changed".into()));
+                        }
+                        if current.formulas.contains(&a) {
+                            selected = Some(converter);
+                            break;
+                        }
+                    }
+                }
+                ay_core::term::reserve_counted(&mut handle.assertions, 1, owner).map_err(|_| {
+                    SolverError::TacticFailed("solver assertion admission refused".into())
+                })?;
+                if !operation.validate(&ctx.solver) {
+                    return Err(SolverError::TacticFailed(
+                        "goal consumer source changed".into(),
+                    ));
+                }
+                if let Some(converter) = selected {
+                    ctx.solver
+                        .adopt_tactic_model_constants_in_operation(operation, &converter)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = admitted {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(error.to_string());
+                return;
+            }
             handle.assertions.push(term);
             handle.clear_check_artifacts();
         });
     }
 }
 
-/// Set solver params.
+/// Set the params of the solver handle `s`.
 ///
-/// Only `timeout` is currently honored by AY.
+/// AY honours `timeout` and proof production; they are stored on the handle
+/// and applied for its own checks only.
 ///
 /// # Safety
 /// All pointers must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_solver_set_params(c: Z3_context, _s: Z3_solver, p: Z3_params) {
+pub unsafe extern "C" fn Z3_solver_set_params(c: Z3_context, s: Z3_solver, p: Z3_params) {
     if c.is_null() || p.is_null() {
         return;
     }
@@ -401,7 +472,14 @@ pub unsafe extern "C" fn Z3_solver_set_params(c: Z3_context, _s: Z3_solver, p: Z
             if !ctx.decision_engine_is_usable("Z3_solver_set_params") {
                 return;
             }
-            apply_supported_params(&mut ctx.solver, &params_owned);
+            // The parameters belong to THIS handle and govern its checks only
+            // (libz3 5.1.0: `s1.set("timeout", 1)` leaves a fresh `s2`'s
+            // pigeonhole `unsat`); see `handle_params`.
+            let Some(handle) = s.as_mut() else {
+                note_null_solver_handle(ctx, "Z3_solver_set_params");
+                return;
+            };
+            handle.params.record(&params_owned);
         });
     }
 }
@@ -577,11 +655,128 @@ pub(crate) fn rec_defs_tainted_by_undefined(ctx: &Z3Context) -> std::collections
         .rec_def_names_reaching(&ctx.rec_fun_defs, &undefined)
 }
 
-pub(crate) unsafe fn check_solver_handle(
+/// `Z3_solver_check` / `Z3_solver_check_assumptions` for the handle `s`
+/// ([`check_solver_handle`]), leaving no definition the check adopted
+/// installed on the context's shared engine ([`release_adopted_definitions`]).
+///
+/// # Safety
+/// `s` must be null or a live solver handle of `ctx`.
+pub(crate) unsafe fn check_solver_handle_isolated(
     ctx: &mut Z3Context,
     s: Z3_solver,
     assumptions: Option<&[Term]>,
     extra_lemmas: &[Term],
+) -> c_int {
+    // The handle's own parameters, applied in full for this check only, and
+    // a cleared interrupt (see `handle_params`).
+    // SAFETY: `s` is null or a live solver handle of `ctx`; the shared borrow
+    // ends at this statement.
+    let params = unsafe { s.as_ref() }.map_or_else(ParamSet::default, |handle| handle.params);
+    let settings = EngineSettings::apply(&mut ctx.solver, params.over(ctx.default_params));
+    let started = std::time::Instant::now();
+    // SAFETY: forwarded verbatim; see `refuse_undecided_goal` and
+    // `check_solver_handle`.
+    let verdict = match unsafe { refuse_undecided_goal(ctx, s, assumptions) } {
+        Some(verdict) => verdict,
+        None => {
+            let mut phase = WfPhase::default();
+            // SAFETY: `s` is null or a live solver handle of `ctx`, forwarded
+            // unchanged under this function's contract.
+            let first =
+                unsafe { check_solver_handle(ctx, s, assumptions, extra_lemmas, &mut phase) };
+            if recheck_due(ctx, &phase, started) {
+                release_adopted_definitions(ctx, "Z3_solver_check");
+                let configured = ctx.solver.timeout();
+                // What is left of the check's own timeout.
+                ctx.solver.set_timeout(
+                    configured.map(|timeout| timeout.saturating_sub(started.elapsed())),
+                );
+                let mut second = phase.next();
+                // SAFETY: as for the first check.
+                let second =
+                    unsafe { check_solver_handle(ctx, s, assumptions, extra_lemmas, &mut second) };
+                ctx.solver.set_timeout(configured);
+                second
+            } else {
+                first
+            }
+        }
+    };
+    release_adopted_definitions(ctx, "Z3_solver_check");
+    settings.restore(&mut ctx.solver);
+    verdict
+}
+
+/// Decide a check of `s` as `unknown` without the engine when its goal holds
+/// a loose bound variable or a binder of a lossy sort (see
+/// `check_obligations`); `None` when the goal goes to the engine.
+///
+/// libz3 5.1.0 answers an assertion with a loose variable `unknown`, reason
+/// "Formulas should not contain unbound variables", and an assumption with
+/// one with the same text as an error (`Z3_EXCEPTION`).
+///
+/// # Safety
+/// `s` must be null or a live solver handle of `ctx`.
+unsafe fn refuse_undecided_goal(
+    ctx: &mut Z3Context,
+    s: Z3_solver,
+    assumptions: Option<&[Term]>,
+) -> Option<c_int> {
+    // SAFETY: `s` is null or a live handle in the context arena (a separate
+    // allocation from `*ctx`); a null handle is reported by the check itself.
+    let handle = unsafe { s.as_mut() }?;
+    let mut roots = handle.assertions.clone();
+    roots.extend_from_slice(assumptions.unwrap_or(&[]));
+    let (reason, error) = if !has_loose_bound_variable(ctx, &roots) {
+        (lossy_binder_refusal(ctx, &roots)?, None)
+    } else if has_loose_bound_variable(ctx, &handle.assertions) {
+        (UNBOUND_VARIABLES_REASON.to_string(), None)
+    } else {
+        (UNBOUND_VARIABLES_REASON.to_string(), Some(Z3_EXCEPTION))
+    };
+    handle.clear_check_artifacts();
+    if let Some(code) = error {
+        ctx.last_error = code;
+        ctx.error_msg = Some(reason.clone());
+    }
+    handle.last_reason_unknown = Some(reason);
+    handle.record_check_outcome(SolverCheckOutcome::Unknown);
+    Some(Z3_L_UNDEF)
+}
+
+/// Remove the definitions the engine adopted from this check's definitional
+/// `forall`s (`forall y. f(y) = y + 1`), once every artefact of the check is
+/// captured on its handle.
+///
+/// Every handle of a context shares the context's engine, and while such a
+/// definition is installed the engine expands each new application of its
+/// head at construction. Left installed after the check, it rewrote terms the
+/// caller built for OTHER handles (measured: `f(x) == 0` built after one
+/// solver's check arrived in another solver as `0 == x + 1`, which answered
+/// unsat where z3 answers sat), and for the same handle after `reset` or `pop`.
+/// A reset that fails leaves the definition installed, so the engine is
+/// poisoned rather than allowed to build pre-expanded terms.
+pub(crate) fn release_adopted_definitions(ctx: &mut Z3Context, operation: &str) {
+    if !ctx.solver.has_assertion_derived_definitions() {
+        return;
+    }
+    if let Err(e) = ctx.reset_engine_for_solver_goal() {
+        ctx.poison_decision_engine(format!(
+            "{operation}: an adopted definition could not be removed after the check: {e}"
+        ));
+    }
+}
+
+/// The check of the handle `s` itself; see [`check_solver_handle_isolated`].
+///
+/// # Safety
+/// `s` must be null or a live solver handle of `ctx`.
+unsafe fn check_solver_handle(
+    ctx: &mut Z3Context,
+    s: Z3_solver,
+    assumptions: Option<&[Term]>,
+    extra_lemmas: &[Term],
+    phase: &mut WfPhase,
 ) -> c_int {
     if !ctx.decision_engine_is_usable("Z3_solver_check") {
         return Z3_L_UNDEF;
@@ -608,7 +803,65 @@ pub(crate) unsafe fn check_solver_handle(
         }
         handle.record_check_outcome(SolverCheckOutcome::Unknown);
     }
+    fn record_tactic_failure(
+        ctx: &mut Z3Context,
+        handle: &mut Z3SolverHandle,
+        operation: Option<ay_dpll::api::TacticOperation>,
+        error: SolverError,
+    ) {
+        if let Some(operation) = operation {
+            operation.publish_failure(&mut ctx.solver, &error);
+        }
+        ctx.last_error = Z3_EXCEPTION;
+        ctx.error_msg = Some(error.to_string());
+        handle.last_reason_unknown = ctx.solver.reason_unknown_smtlib();
+        record_unknown(ctx, handle);
+    }
+    fn record_decision_failure(
+        ctx: &mut Z3Context,
+        handle: &mut Z3SolverHandle,
+        decision: &ay_dpll::api::TacticDecision,
+        detail: &str,
+    ) {
+        let error = SolverError::TacticFailed(detail.into());
+        decision.publish_failure(&mut ctx.solver, &error);
+        record_tactic_failure(ctx, handle, None, error);
+    }
 
+    let check_started = std::time::Instant::now();
+    let mut request = if handle.tactic.is_some() {
+        match ctx.solver.begin_tactic_operation_for_check() {
+            Ok(operation) => Some(operation),
+            Err(error) => {
+                record_tactic_failure(ctx, handle, None, error);
+                return Z3_L_UNDEF;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(operation) = &request {
+        let count = handle
+            .assertions
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(handle.tracked.len()));
+        let accepted = count
+            .and_then(|n| {
+                n.checked_mul(std::mem::size_of::<Term>())
+                    .map(|bytes| (n, bytes))
+            })
+            .is_some_and(|(work, bytes)| operation.admission().admit(work, bytes).is_ok());
+        if !accepted || !operation.validate(&ctx.solver) {
+            record_tactic_failure(
+                ctx,
+                handle,
+                request.take(),
+                SolverError::TacticFailed("tactic input metadata refused".into()),
+            );
+            return Z3_L_UNDEF;
+        }
+    }
     // The goal is the handle's own assertion list, transformed by its tactic
     // when it has one (equivalence-preserving: identical verdict and models).
     let mut goal = handle.assertions.clone();
@@ -622,27 +875,113 @@ pub(crate) unsafe fn check_solver_handle(
     // reported by `Z3_solver_get_unsat_core` (a subset of these `p`s plus any
     // explicit check-assumptions — exactly Z3's assert-and-track core rule).
     let tracked_lits: Vec<Term> = handle.tracked.iter().map(|(p, _)| *p).collect();
-    if let Some(tactic) = handle.tactic.clone() {
-        match ctx.solver.apply_tactic_to_goal(&tactic, &mut goal) {
-            Ok(progressed) => {
-                // Persist the transformed goal as the handle's assertion list (it
-                // is observable via `Z3_solver_get_assertions`, e.g. elim-and
-                // yields the individual conjuncts after a check) — but only while
-                // no scopes are open, because the scope markers index the
-                // untransformed list.
-                if progressed && handle.scope_markers.is_empty() {
-                    handle.assertions = goal.clone();
+    // The timeout covers the whole check, the tactic's own work included.
+    let mut converted_request = None;
+    let mut _formulas_only_request = None;
+    if let (Some(tactic), Some(operation)) = (handle.tactic.as_ref(), request.take()) {
+        let kind = match tactic.execution_kind_admitted(operation.admission()) {
+            Ok(kind) => kind,
+            Err(error) => {
+                record_tactic_failure(
+                    ctx,
+                    handle,
+                    Some(operation),
+                    SolverError::TacticFailed(error.message),
+                );
+                return Z3_L_UNDEF;
+            }
+        };
+        if kind == ay_dpll::api::TacticExecutionKind::OwnedModelConversion {
+            let failure = |message: &str| SolverError::TacticFailed(message.into());
+            let outcome = (|| -> Result<_, SolverError> {
+                if !handle.tracked.is_empty()
+                    || ctx.solver.is_producing_proofs()
+                    || handle
+                        .params
+                        .over(ctx.default_params)
+                        .clause_proof_enabled()
+                {
+                    return Err(failure(
+                        "converted tactic proof/core transport is not implemented",
+                    ));
+                }
+                let mut source = Vec::new();
+                let count = goal
+                    .len()
+                    .checked_add(assumptions.map_or(0, <[Term]>::len))
+                    .ok_or_else(|| failure("converted tactic source overflow"))?;
+                ay_core::term::reserve_counted(&mut source, count, operation.admission())
+                    .map_err(|e| failure(&e.to_string()))?;
+                if !operation.validate(&ctx.solver) {
+                    return Err(failure("converted tactic source changed"));
+                }
+                source.extend_from_slice(&goal);
+                source.extend_from_slice(assumptions.unwrap_or(&[]));
+                let mut subgoals = ctx
+                    .solver
+                    .apply_tactic_subgoals_in_operation(&operation, tactic, &source, 0, None)?;
+                if subgoals.len() != 1 {
+                    return Err(failure("converted solver requires exactly one subgoal"));
+                }
+                let subgoal = subgoals
+                    .pop()
+                    .ok_or_else(|| failure("missing converted subgoal"))?;
+                let converter = subgoal
+                    .model_converter
+                    .ok_or_else(|| failure("missing tactic model converter"))?;
+                Ok((subgoal.formulas, converter))
+            })();
+            match outcome {
+                Ok((formulas, converter)) => {
+                    goal = formulas;
+                    converted_request = Some((operation, converter));
+                }
+                Err(error) => {
+                    record_tactic_failure(ctx, handle, Some(operation), error);
+                    return Z3_L_UNDEF;
                 }
             }
-            // HONEST FAILURE: the tactic produced NO goal (e.g. `bit-blast` on an
-            // out-of-fragment bit-vector goal). Surface it as an error + `unknown`
-            // rather than silently solving the untransformed goal — never a
-            // fabricated verdict for a goal the tactic did not actually produce.
-            Err(e) => {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some(format!("{e}"));
-                record_unknown(ctx, handle);
-                return Z3_L_UNDEF;
+        } else {
+            _formulas_only_request = Some(operation);
+            match ctx.solver.apply_tactic_to_goal(tactic, &mut goal) {
+                Ok(progressed) => {
+                    // Persist the transformed goal as the handle's assertion list (it
+                    // is observable via `Z3_solver_get_assertions`, e.g. elim-and
+                    // yields the individual conjuncts after a check) — but only while
+                    // no scopes are open, because the scope markers index the
+                    // untransformed list.
+                    //
+                    // A goal over other constants than the caller's (bit-blast's
+                    // bits and tseitin-cnf's definitions added, solve-eqs'
+                    // eliminated variables removed) is only equisatisfiable: its
+                    // model does not interpret the caller's constants, so the
+                    // published model falsified the caller's assertions (measured:
+                    // `bit-blast` on `bvult x y` published no `x`, `y`). Such a goal
+                    // is solved TOGETHER with the caller's assertions (the
+                    // transformation's models extend theirs, so the verdict is
+                    // unchanged) and is not persisted as the handle's assertions.
+                    if progressed {
+                        let original = free_constant_names(&ctx.solver, &asserted_keys);
+                        let transformed = free_constant_names(&ctx.solver, &goal);
+                        if transformed != original {
+                            for &assertion in &asserted_keys {
+                                if !goal.contains(&assertion) {
+                                    goal.push(assertion);
+                                }
+                            }
+                        } else if handle.scope_markers.is_empty() {
+                            handle.assertions = goal.clone();
+                        }
+                    }
+                }
+                // HONEST FAILURE: the tactic produced NO goal (e.g. `bit-blast` on an
+                // out-of-fragment bit-vector goal). Surface it as an error + `unknown`
+                // rather than silently solving the untransformed goal — never a
+                // fabricated verdict for a goal the tactic did not actually produce.
+                Err(e) => {
+                    record_tactic_failure(ctx, handle, _formulas_only_request.take(), e);
+                    return Z3_L_UNDEF;
+                }
             }
         }
     }
@@ -652,7 +991,9 @@ pub(crate) unsafe fn check_solver_handle(
     // preserving the original behavior for untracked solvers.
     let mut effective: Vec<Term> = Vec::new();
     if let Some(terms) = assumptions {
-        effective.extend_from_slice(terms);
+        if converted_request.is_none() {
+            effective.extend_from_slice(terms);
+        }
     }
     effective.extend(tracked_lits.iter().copied());
 
@@ -725,6 +1066,25 @@ pub(crate) unsafe fn check_solver_handle(
         }
     }
 
+    // The well-formedness obligations of the lossily lowered free symbols
+    // this check reaches (see `wf_guards` and `WfPhase`); a reached symbol
+    // whose guard could not be built leaves the goal undecided.
+    let wf = {
+        let mut wf_roots = goal.clone();
+        wf_roots.extend(effective.iter().copied());
+        wf_roots.extend(lemmas.iter().copied());
+        wf_roots.extend(ctx.global_definition_axioms.iter().copied());
+        match reachable_wf_obligations(ctx, &wf_roots) {
+            Ok(obligations) => obligations,
+            Err(reason) => {
+                handle.last_reason_unknown = Some(reason);
+                record_unknown(ctx, handle);
+                return Z3_L_UNDEF;
+            }
+        }
+    };
+    let wf_guards = phase.guards(&wf);
+
     // Public array extensionality over a BOUNDED carrier (see `bounded_arrays`).
     // Each equality is a consequence of a top-level assertion of THIS check, and
     // is released only after the whole term set this check will hand the engine
@@ -733,7 +1093,10 @@ pub(crate) unsafe fn check_solver_handle(
     // It stays out of `handle.assertions`, so `Z3_solver_get_assertions` and
     // unsat cores keep reporting only what the caller asserted.
     {
-        let mut canonicity_roots: Vec<Term> = Vec::new();
+        // Every guard the goal may be checked with, asserted now or by the
+        // guarded re-check.
+        let mut canonicity_roots: Vec<Term> = wf.eager.clone();
+        canonicity_roots.extend(wf.lazy.iter().copied());
         canonicity_roots.extend(asserted_keys.iter().copied());
         canonicity_roots.extend(goal.iter().copied());
         canonicity_roots.extend(effective.iter().copied());
@@ -752,58 +1115,136 @@ pub(crate) unsafe fn check_solver_handle(
 
     // Load THIS handle's goal into the shared engine, replacing the goal the
     // previous check (possibly another handle's) left behind.
-    if let Err(e) = ctx.solver.try_reset_assertions() {
-        ctx.last_error = Z3_EXCEPTION;
-        ctx.error_msg = Some(format!("{e}"));
-        record_unknown(ctx, handle);
-        return Z3_L_UNDEF;
-    }
-    for &term in &goal {
-        if let Err(e) = ctx.solver.try_assert_term(term) {
-            ctx.last_error = Z3_EXCEPTION;
-            ctx.error_msg = Some(format!("{e}"));
-            record_unknown(ctx, handle);
-            return Z3_L_UNDEF;
-        }
-    }
-    // Inject the theory-internal background axioms (special-relation orders,
-    // Char range invariants) so they constrain THIS check. The quantified
-    // recursive-definition axioms are omitted when the goal was fully
-    // expanded AND for grind-class residuals (see `RecDefMode::Residual`).
     let include_rec_axioms = match &rec_mode {
         RecDefMode::None => true,
         RecDefMode::Expanded => false,
         RecDefMode::Residual { keep_axioms, .. } => *keep_axioms,
     };
-    if let Err(e) = assert_background_axioms(ctx, include_rec_axioms) {
-        ctx.last_error = Z3_EXCEPTION;
-        ctx.error_msg = Some(e);
-        record_unknown(ctx, handle);
-        return Z3_L_UNDEF;
-    }
-    if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
-        ctx.last_error = Z3_EXCEPTION;
-        ctx.error_msg = Some(e);
-        record_unknown(ctx, handle);
-        return Z3_L_UNDEF;
-    }
-    // User-propagator consequence lemmas (see `propagate::user_propagator_check`):
-    // each is the consumer's theory axiom `(∧ justification) ⇒ conseq`, trusted
-    // exactly as Z3 trusts propagator lemmas. NOT part of the handle's
-    // `assertions`, so `Z3_solver_get_assertions` / unsat-core stay faithful.
-    for &lemma in &lemmas {
-        if let Err(e) = ctx.solver.try_assert_term(lemma) {
+    if converted_request.is_none() {
+        if let Err(e) = ctx.reset_engine_for_solver_goal() {
             ctx.last_error = Z3_EXCEPTION;
             ctx.error_msg = Some(format!("{e}"));
             record_unknown(ctx, handle);
             return Z3_L_UNDEF;
         }
+        for &term in &goal {
+            if let Err(e) = ctx.solver.try_assert_term(term) {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(format!("{e}"));
+                record_unknown(ctx, handle);
+                return Z3_L_UNDEF;
+            }
+        }
+        // Inject the theory-internal background axioms (special-relation orders,
+        // Char range invariants) so they constrain THIS check. The quantified
+        // recursive-definition axioms are omitted when the goal was fully
+        // expanded AND for grind-class residuals (see `RecDefMode::Residual`).
+        if let Err(e) = assert_background_axioms(ctx, include_rec_axioms) {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(e);
+            record_unknown(ctx, handle);
+            return Z3_L_UNDEF;
+        }
+        if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(e);
+            record_unknown(ctx, handle);
+            return Z3_L_UNDEF;
+        }
+        for &guard in &wf_guards {
+            if let Err(e) = ctx.solver.try_assert_term(guard) {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(format!("{e}"));
+                record_unknown(ctx, handle);
+                return Z3_L_UNDEF;
+            }
+        }
+        // User-propagator consequence lemmas (see `propagate::user_propagator_check`):
+        // each is the consumer's theory axiom `(∧ justification) ⇒ conseq`, trusted
+        // exactly as Z3 trusts propagator lemmas. NOT part of the handle's
+        // `assertions`, so `Z3_solver_get_assertions` / unsat-core stay faithful.
+        for &lemma in &lemmas {
+            if let Err(e) = ctx.solver.try_assert_term(lemma) {
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(format!("{e}"));
+                record_unknown(ctx, handle);
+                return Z3_L_UNDEF;
+            }
+        }
     }
-    let verified = if effective.is_empty() {
+    let configured_timeout = ctx.solver.timeout();
+    if let (Some(timeout), true) = (configured_timeout, handle.tactic.is_some()) {
+        let left = timeout.saturating_sub(check_started.elapsed());
+        ctx.solver
+            .set_timeout(Some(left.max(std::time::Duration::from_millis(1))));
+    }
+    if let Some(timeout) = phase.first_check_timeout(&wf, ctx.solver.timeout()) {
+        ctx.solver.set_timeout(Some(timeout));
+    }
+    let mut converted_decision = None;
+    let verified = if let Some((operation, converter)) = converted_request.take() {
+        let roots = (|| -> Result<Vec<Term>, String> {
+            let sets = reachable_finite_set_axioms(ctx, &finite_set_roots);
+            let rec: &[Term] = if match &rec_mode {
+                RecDefMode::None => true,
+                RecDefMode::Expanded => false,
+                RecDefMode::Residual { keep_axioms, .. } => *keep_axioms,
+            } {
+                &ctx.global_definition_axioms
+            } else {
+                &[]
+            };
+            let mut roots = Vec::new();
+            for slice in [
+                &goal[..],
+                &ctx.background_axioms[..],
+                rec,
+                &sets[..],
+                &wf_guards[..],
+                &lemmas[..],
+            ] {
+                ay_core::term::reserve_counted(&mut roots, slice.len(), operation.admission())
+                    .map_err(|e| e.to_string())?;
+                if !operation.validate(&ctx.solver) {
+                    return Err("tactic decision source changed".into());
+                }
+                roots.extend_from_slice(slice);
+            }
+            Ok(roots)
+        })();
+        let result = match roots {
+            Ok(roots) => {
+                if !ctx.optimize_handle_cache.is_empty() {
+                    ctx.optimize_engine_displaced = true;
+                }
+                ctx.solver.check_converted_tactic_goal_in_operation(
+                    operation, &converter, &roots, &effective,
+                )
+            }
+            Err(detail) => {
+                let error = SolverError::TacticFailed(detail);
+                operation.publish_failure(&mut ctx.solver, &error);
+                Err(error)
+            }
+        };
+        match result {
+            Ok(decision) => {
+                let verified = decision.result.clone();
+                converted_decision = Some(decision);
+                verified
+            }
+            Err(error) => {
+                ctx.solver.set_timeout(configured_timeout);
+                record_tactic_failure(ctx, handle, None, error);
+                return Z3_L_UNDEF;
+            }
+        }
+    } else if effective.is_empty() {
         ctx.solver.check_sat()
     } else {
         ctx.solver.check_sat_assuming(&effective)
     };
+    ctx.solver.set_timeout(configured_timeout);
     // Materialize the check artefacts into the handle (a later check by any
     // handle replaces the engine-side state). Each is the engine's own
     // artefact for exactly this goal — nothing is fabricated, and a
@@ -813,6 +1254,31 @@ pub(crate) unsafe fn check_solver_handle(
     // tables the parsed constants-only `Model` drops, so `Z3_model` handles
     // can resolve UF applications from the snapshot.
     handle.last_model_text = ctx.solver.model_str();
+    if let Some(decision) = converted_decision.as_mut() {
+        if let Some(model) = decision.model.take() {
+            // Converted models contain supported scalar interpretations only;
+            // use the same typed renderer as the public model API below.
+            match super::model_params::render_converted_model_text(ctx, model, decision) {
+                Some((model, text)) => {
+                    handle.last_model = Some(model);
+                    handle.last_model_text = Some(text);
+                }
+                None => {
+                    record_decision_failure(
+                        ctx,
+                        handle,
+                        decision,
+                        "converted model rendering refused",
+                    );
+                    return Z3_L_UNDEF;
+                }
+            }
+        }
+        if !decision.validate(&ctx.solver) {
+            record_decision_failure(ctx, handle, decision, "converted model source changed");
+            return Z3_L_UNDEF;
+        }
+    }
     // The engine saw EXPANDED assumptions in `RecDefMode::Expanded`; translate
     // its core back to the caller's original assumption terms. When several
     // originals share one expansion, ALL of them are included (a superset of a
@@ -878,12 +1344,439 @@ pub(crate) unsafe fn check_solver_handle(
             lbool = Z3_L_UNDEF;
         }
     }
+    // A SAT model must give every reached Char / finite-domain carrying
+    // symbol a value of its public sort; a first check that does not, or
+    // that answered `unknown`, is followed by a check in the other mode (see
+    // `WfPhase`).
+    if lbool == Z3_L_TRUE {
+        match validate_wf_model(
+            ctx,
+            &wf,
+            handle.last_model.as_ref(),
+            handle.last_model_text.as_deref(),
+            phase.asserts_quantified_guards(),
+            phase.may_recheck(&wf),
+        ) {
+            WfVerdict::Accept => {}
+            WfVerdict::Retry(reason) => {
+                phase.recheck = true;
+                handle.last_reason_unknown = Some(reason);
+                lbool = Z3_L_UNDEF;
+            }
+            WfVerdict::Refuse(reason) => {
+                handle.last_reason_unknown = Some(reason);
+                lbool = Z3_L_UNDEF;
+            }
+        }
+    } else if lbool == Z3_L_UNDEF {
+        phase.note_undecided(&wf);
+    }
+    // Publish the model of THIS handle's goal only, and only when the API can
+    // carry every value the engine's validated model assigns (see
+    // `scope_published_model`); otherwise SAT is not published.
+    if lbool == Z3_L_TRUE {
+        let mut scope_roots = asserted_keys.clone();
+        scope_roots.extend(goal.iter().copied());
+        scope_roots.extend(effective.iter().copied());
+        scope_roots.extend(assumptions.unwrap_or(&[]).iter().copied());
+        scope_roots.extend(lemmas.iter().copied());
+        if let Some(propagator) = &handle.propagator {
+            scope_roots.extend(propagator.registered.iter().copied());
+        }
+        let mut axioms = ctx.background_axioms.clone();
+        if include_rec_axioms {
+            axioms.extend(ctx.global_definition_axioms.iter().copied());
+        }
+        axioms.extend(reachable_finite_set_axioms(ctx, &finite_set_roots));
+        // The caller's own constraints of this check (before any tactic
+        // rewrote them): what the published model must not falsify (see
+        // `scope_published_model`).
+        let mut obligations = asserted_keys;
+        obligations.extend(assumptions.unwrap_or(&[]).iter().copied());
+        // The terms the engine received verbatim as assertions or
+        // assumptions: its validated model-check pipeline confirmed these.
+        let mut engine_roots = goal.clone();
+        engine_roots.extend(effective.iter().copied());
+        if let Err(reason) = scope_published_model(
+            ctx,
+            handle,
+            &scope_roots,
+            &axioms,
+            &PublicationObligations {
+                obligations: &obligations,
+                engine_roots: &engine_roots,
+            },
+        ) {
+            handle.last_reason_unknown = Some(reason);
+            lbool = Z3_L_UNDEF;
+        }
+    }
+    if lbool == Z3_L_FALSE && ctx.solver.is_producing_proofs() {
+        handle.last_clause_trail_requested = handle
+            .params
+            .over(ctx.default_params)
+            .clause_proof_enabled();
+        if handle.last_clause_trail_requested {
+            handle.last_clause_trail = ctx.solver.native_clause_trail();
+        }
+    }
+    if lbool == Z3_L_FALSE && handle.last_proof_alethe.is_some() {
+        handle.last_proof_dag = ctx.solver.native_proof_dag(
+            handle
+                .assertions
+                .iter()
+                .copied()
+                .chain(handle.tracked.iter().map(|(tracking, _)| *tracking))
+                .chain(assumptions.into_iter().flatten().copied()),
+        );
+    }
+    if lbool == Z3_L_FALSE {
+        if let Some(decision) = &converted_decision {
+            // The converter was captured from these exact authored
+            // assertions AND all check-local assumptions. A strictly
+            // accepted reduced UNSAT therefore supports their complete
+            // assumption set as a valid, deliberately nonminimal core.
+            let source_assumptions = assumptions.unwrap_or(&[]);
+            let mut core = Vec::new();
+            if ay_core::term::reserve_counted(
+                &mut core,
+                source_assumptions.len(),
+                decision.admission(),
+            )
+            .is_err()
+                || !decision.validate(&ctx.solver)
+            {
+                record_decision_failure(
+                    ctx,
+                    handle,
+                    decision,
+                    "converted source core copy refused",
+                );
+                return Z3_L_UNDEF;
+            }
+            core.extend_from_slice(source_assumptions);
+            handle.last_unsat_core = Some(core);
+        }
+    }
+    if let Some(decision) = &converted_decision {
+        if !decision.validate(&ctx.solver) {
+            record_decision_failure(
+                ctx,
+                handle,
+                decision,
+                "converted decision publication refused",
+            );
+            lbool = Z3_L_UNDEF;
+        }
+    }
     match lbool {
         Z3_L_TRUE => handle.record_check_outcome(SolverCheckOutcome::Sat),
         Z3_L_FALSE => handle.record_check_outcome(SolverCheckOutcome::Unsat),
         _ => record_unknown(ctx, handle),
     }
     lbool
+}
+
+/// What a published SAT model must satisfy.
+pub(crate) struct PublicationObligations<'a> {
+    /// The caller's own assertions (before a tactic rewrote them) and
+    /// assumptions.
+    pub(crate) obligations: &'a [Term],
+    /// The terms the engine received verbatim as assertions or assumptions.
+    pub(crate) engine_roots: &'a [Term],
+}
+
+/// Refuse a scoped SAT model whose API form would differ from the engine's
+/// validated one (a caller function the API tables cannot carry whole), or
+/// under which any of the caller's assertions or assumptions is not literally
+/// true, read as `Z3_model_eval` with model completion reads it — unless the
+/// engine's own validated model-check pipeline confirmed that very assertion
+/// for that very model (see [`engine_confirmed`]).
+fn refuse_untransported_model(
+    ctx: &mut Z3Context,
+    handle: &Z3SolverHandle,
+    publication: &PublicationObligations<'_>,
+) -> Result<(), String> {
+    let (Some(model), Some(text)) = (handle.last_model.clone(), handle.last_model_text.clone())
+    else {
+        return Ok(());
+    };
+    refuse_untransported_model_parts(ctx, model, &text, publication)
+}
+
+/// [`refuse_untransported_model`] for a model and its engine text, as an
+/// Optimize check publishes them too.
+pub(crate) fn refuse_untransported_model_parts(
+    ctx: &mut Z3Context,
+    model: ay_dpll::api::Model,
+    text: &str,
+    publication: &PublicationObligations<'_>,
+) -> Result<(), String> {
+    // Function interpretations travel as the engine's `define-fun` tables;
+    // every one the scoped text carries must reach the API whole (every row
+    // and the else value), or the published function differs from the one
+    // the engine validated (measured: a BV-ranged table vanished, and rows at
+    // negative Int points were dropped, publishing tables that violate the
+    // assertions).
+    let func_interps = super::model_params::model_func_interps(&mut ctx.solver, text);
+    if let Some((name, body)) =
+        super::model_params::unrepresented_function_tables(&mut ctx.solver, text, &func_interps)
+            .into_iter()
+            // Only the caller's own uninterpreted functions: a datatype selector's
+            // totalization (`(ite ((_ is some) x) (value x) 0)`) and a recursive
+            // definition are interpreted by their theory, not by the published table.
+            .find(|(name, _)| {
+                !ctx.rec_fun_defs.contains_key(name)
+                    && ctx.ffi_func_names.values().any(|f| f == name)
+            })
+    {
+        let message = format!(
+            "the validated model interprets {name} as {body}, which the API model \
+             cannot represent; sat is not published without it"
+        );
+        return Err(super::ffi_surface_text(ctx, &message));
+    }
+    // Backstop (fail closed): the published model, read exactly as
+    // `Z3_model_eval` with model completion reads it, must make every one of
+    // the caller's own assertions and assumptions literally true. A transport
+    // loss between the engine's validated model and the API model that the
+    // checks above do not name, or an obligation the engine never saw
+    // verbatim, is refused here instead of reaching the caller as a wrong
+    // witness (measured: a quantified assumption the published table
+    // falsified, a function left out of the model, an array without a value).
+    let probe = ModelHandle {
+        model,
+        func_interps,
+        user_const_interps: Vec::new(),
+        user_func_interps: Vec::new(),
+        rec_def_count: ctx.rec_fun_defs.len(),
+        complete_functions: true,
+        _ctx: ptr::null_mut(),
+    };
+    for &obligation in publication.obligations {
+        let value = super::model_params::eval_term_under_model(ctx, &probe, obligation, true);
+        match value.and_then(|value| ctx.solver.bool_value(value)) {
+            Some(true) => continue,
+            Some(false) => {
+                let shown = super::ffi_surface_text(ctx, &ctx.solver.format_term(obligation));
+                return Err(format!(
+                    "the published model falsifies the assertion {shown}; sat is not \
+                     published with a model that violates it"
+                ));
+            }
+            None => {}
+        }
+        if engine_confirmed(ctx, &probe, obligation, value, publication.engine_roots) {
+            continue;
+        }
+        let shown = super::ffi_surface_text(ctx, &ctx.solver.format_term(obligation));
+        let residual = match value {
+            Some(value) => format!(
+                "it evaluates to {}",
+                super::ffi_surface_text(ctx, &ctx.solver.format_term(value))
+            ),
+            None => "it cannot be evaluated".to_string(),
+        };
+        return Err(format!(
+            "the published model does not confirm the assertion {shown} ({residual}); sat \
+             is not published without confirming every assertion"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether AY's validated model-check pipeline confirmed `obligation` for the
+/// published model although the API evaluator leaves it undecided.
+///
+/// Only a QUANTIFIED residual qualifies (a quantifier the API evaluator cannot
+/// fold): a quantifier-free residual means the API model lacks an
+/// interpretation the engine relied on (a selector applied to the wrong
+/// constructor, a division by zero), which z3's completion would read
+/// differently. The obligation must have reached the engine verbatim (a
+/// tactic's or a recursive definition's rewrite was validated, not the
+/// caller's term), every SAT the engine reports passed its model gates for
+/// exactly the engine's printed model, and every symbol of the obligation
+/// must be interpreted by the published model itself, so completion cannot
+/// make the API model differ from the one the engine validated.
+fn engine_confirmed(
+    ctx: &Z3Context,
+    probe: &ModelHandle,
+    obligation: Term,
+    residual: Option<Term>,
+    engine_roots: &[Term],
+) -> bool {
+    if !engine_roots.contains(&obligation) {
+        return false;
+    }
+    let residual = residual.unwrap_or(obligation);
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![residual];
+    let mut quantified = false;
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if matches!(
+            ctx.solver.term_kind(term),
+            TermKind::Forall | TermKind::Exists
+        ) {
+            quantified = true;
+        }
+        stack.extend(ctx.solver.term_children(term));
+    }
+    if !quantified {
+        return false;
+    }
+    let Some(leaves) = super::model_params::scoped_free_leaves(&ctx.solver, obligation) else {
+        return false;
+    };
+    let constants_interpreted = leaves.iter().all(|&leaf| {
+        ctx.solver.var_name(leaf).is_some_and(|name| {
+            probe.model.value_by_name(&name).is_some() || ctx.solver.is_nullary_constructor(&name)
+        })
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![obligation];
+    let mut functions_interpreted = true;
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if let TermKind::App { name, num_args } = ctx.solver.term_kind(term) {
+            if num_args > 0
+                && ctx.ffi_func_names.values().any(|f| *f == name)
+                && !probe.func_interps.iter().any(|fi| fi.name == name)
+            {
+                functions_interpreted = false;
+                break;
+            }
+        }
+        stack.extend(ctx.solver.term_children(term));
+    }
+    constants_interpreted && functions_interpreted
+}
+
+/// Names of the constants (`Var` leaves) occurring in `roots`, declared or
+/// not (a tactic's fresh bits and definitions are undeclared).
+fn free_constant_names(
+    solver: &ay_dpll::api::Solver,
+    roots: &[Term],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<Term> = roots.to_vec();
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if let TermKind::Var { name } = solver.term_kind(term) {
+            names.insert(name);
+        }
+        stack.extend(solver.term_children(term));
+    }
+    names
+}
+
+/// Restrict the SAT model just materialized on `handle` to the symbols of this
+/// check's goal, and refuse a model the API cannot represent.
+///
+/// Every solver handle of a context runs on the context's single engine, whose
+/// model lists every symbol declared on that engine — including constants that
+/// only OTHER handles assert (measured: a model of `xi = 2^xi` listed `x = 0`
+/// from a sibling solver). Z3 publishes exactly the symbols of the solver's own
+/// assertions, so the published model keeps the declared symbols occurring in
+/// `roots` (the caller's assertions, the transformed goal, assumptions, tracked
+/// literals, propagator lemmas and registrations), closed under every axiom in
+/// `axioms` that mentions a kept symbol (a context-level theory axiom ties its
+/// symbols together, so model completion needs all of them). Restriction never
+/// changes a retained value, so the published model still satisfies the goal.
+///
+/// The constants-only API model is parsed from the engine's model text. A
+/// constant whose value it cannot parse (e.g. an irrational algebraic
+/// `(root-obj ...)` for `x * x = 2`) would silently vanish from the published
+/// model — measured: `sat` with an EMPTY model — so a validated model that
+/// cannot be carried whole is refused here and the check reports `unknown`
+/// with the reason instead.
+fn scope_published_model(
+    ctx: &mut Z3Context,
+    handle: &mut Z3SolverHandle,
+    roots: &[Term],
+    axioms: &[Term],
+    publication: &PublicationObligations<'_>,
+) -> Result<(), String> {
+    // A sat without the engine's model would publish an EMPTY model, under
+    // which the caller's assertions read as false (z3 completion defaults).
+    if handle.last_model.is_none() || handle.last_model_text.is_none() {
+        let detail = ctx
+            .solver
+            .try_get_model_str()
+            .err()
+            .map_or_else(|| "no model".to_string(), |e| e.to_string());
+        return Err(format!(
+            "the engine reported sat but its model is unavailable ({detail}); sat is not \
+             published without a model"
+        ));
+    }
+    let symbols_of = |terms: &[Term]| {
+        ctx.solver
+            .declared_symbols_in(terms)
+            .map_err(|e| format!("Z3_solver_check: model scope could not be computed: {e}"))
+    };
+    let mut keep = symbols_of(roots)?;
+    let mut pending_axioms = axioms
+        .iter()
+        .map(|&axiom| symbols_of(&[axiom]))
+        .collect::<Result<Vec<_>, _>>()?;
+    loop {
+        let before = pending_axioms.len();
+        pending_axioms.retain(|symbols| {
+            if symbols.is_disjoint(&keep) {
+                return true;
+            }
+            keep.extend(symbols.iter().cloned());
+            false
+        });
+        if pending_axioms.len() == before {
+            break;
+        }
+    }
+    if let Some(model) = handle.last_model.as_mut() {
+        model.retain_names(|name| keep.contains(name));
+    }
+    if let Some(text) = handle.last_model_text.as_deref() {
+        let scoped = super::model_params::retain_model_text_symbols(text, &keep);
+        handle.last_model_text = Some(scoped);
+    }
+    if let (Some(model), Some(text)) = (&handle.last_model, &handle.last_model_text) {
+        let missing = super::model_params::unrepresented_model_constants(text, model)
+            .into_iter()
+            .find(|(name, _)| !ctx.rec_fun_defs.contains_key(name));
+        if let Some((name, value)) = missing {
+            let name = super::model_params::model_entry_display_name(ctx, &name);
+            return Err(format!(
+                "the validated model assigns {name} the value {value}, which the API \
+                 model cannot represent; sat is not published without it"
+            ));
+        }
+    }
+    refuse_untransported_model(ctx, handle, publication)
+}
+
+/// The assertions a parse produced, unless they involve strings while z3's
+/// `encoding` is not unicode; each is marked as AY's own construction (see
+/// `provenance.rs`).
+fn accept_parsed_assertions(
+    ctx: &mut Z3Context,
+    operation: &str,
+    assertions: Vec<Term>,
+) -> Option<Vec<Term>> {
+    if super::zstring::refuse_parsed_under_non_unicode_encoding(ctx, operation, &assertions) {
+        return None;
+    }
+    for &term in &assertions {
+        super::provenance::mark_produced_term(ctx, term);
+    }
+    Some(assertions)
 }
 
 /// Parse through the context solver with a fail-closed transaction boundary.
@@ -896,11 +1789,234 @@ pub(crate) unsafe fn check_solver_handle(
 /// complete snapshot/rollback for unscoped declarations and options; therefore
 /// any execution error permanently poisons the context rather than allowing a
 /// later check over ambiguous state.
-pub(crate) fn parse_solver_transaction(
+///
+/// The text's declarations are bound to the context's with `scope` in view
+/// (see `parse_binding`).
+pub(crate) fn parse_solver_transaction_scoped(
     ctx: &mut Z3Context,
     input: &str,
     operation: &str,
-) -> Option<Vec<Term>> {
+    scope: &ParseScope,
+) -> Option<ParsedContent> {
+    let commands = parse_preflight(ctx, input, operation)?;
+    // Claim only after non-mutating preflight succeeds. A malformed or
+    // unsupported script must not reserve this otherwise-pristine context for
+    // the Solver family and thereby prevent a later Optimize constructor.
+    if !ctx.claim_decision_owner(DecisionOwnerFamily::Solver, operation) {
+        return None;
+    }
+    // The parse runs on the shared engine: an Optimize handle's engine state
+    // is displaced and replayed before its next use.
+    if !ctx.optimize_handle_cache.is_empty() {
+        ctx.optimize_engine_displaced = true;
+    }
+
+    ctx.decision_engine_poisoned = Some(format!(
+        "{operation}: parse transaction was interrupted before completion"
+    ));
+    // A scoped parse leaves the engine as it was (its scope is popped), so the
+    // other handles' check artefacts stay valid, as they do in z3 (measured:
+    // re-reading one solver's model after another solver's `from_string`
+    // returned no model, which z3py read as an empty, invalid one). The
+    // caller retires the parsing handle's own artefacts.
+    if let Some(decided) = bound_solver_parse(ctx, input, operation, scope, &commands) {
+        let mut content = decided?;
+        content.assertions = accept_parsed_assertions(ctx, operation, content.assertions)?;
+        return Some(content);
+    }
+    ctx.clear_decision_check_artifacts();
+    let before: std::collections::HashSet<String> = ctx
+        .solver
+        .symbol_signatures_core()
+        .into_iter()
+        .map(|(_, identity, ..)| identity)
+        .collect();
+    match ctx.solver.parse_smtlib2_z3_5(input) {
+        Ok(batch) => match super::retain_parsed_finite_set_batch(ctx, batch) {
+            Ok(retained) => {
+                ctx.decision_engine_poisoned = None;
+                ctx.last_error = Z3_OK;
+                ctx.error_msg = None;
+                register_global_parse_symbols(ctx, &commands, &before);
+                // The parsed assertions belong to the caller's handle, which
+                // re-asserts them at its check; a definition the engine
+                // adopted from them must not rewrite terms built meanwhile.
+                release_adopted_definitions(ctx, operation);
+                let assertions = accept_parsed_assertions(ctx, operation, retained.assertions)?;
+                Some(ParsedContent {
+                    assertions,
+                    ..ParsedContent::default()
+                })
+            }
+            Err(error) => {
+                ctx.poison_decision_engine(format!(
+                    "{operation}: parsed public FiniteSet metadata could not be retained: {error}"
+                ));
+                None
+            }
+        },
+        Err(e) => {
+            ctx.poison_decision_engine(format!(
+                "{operation}: parse execution failed after semantic mutation may have begun: {e}"
+            ));
+            None
+        }
+    }
+}
+
+/// The bound parse of a Solver-family text (see `parse_binding`): `Some` with
+/// the transaction's result when it decided the text, `None` when the text is
+/// outside the rebinding fragment and may take the global parse.
+fn bound_solver_parse(
+    ctx: &mut Z3Context,
+    input: &str,
+    operation: &str,
+    scope: &ParseScope,
+    commands: &[Command],
+) -> Option<Option<ParsedContent>> {
+    match bound_parse(ctx, input, scope) {
+        BoundParse::Ineligible(reason) => {
+            // The global parse declares the text's names as engine symbols of
+            // their own. A name the context already declares would then be
+            // two unrelated symbols (measured: `sat` with the model `[a = 0,
+            // a = 3]` where z3 answers `unsat`), so such a text is refused
+            // before anything executes.
+            if let Some(name) = global_parse_collision(ctx, commands) {
+                ctx.decision_engine_poisoned = None;
+                ctx.last_error = Z3_PARSER_ERROR;
+                ctx.error_msg = Some(format!(
+                    "{operation}: the text declares '{name}', which this context already \
+                     declares, and AY cannot bind the text's '{name}' to it in a text with \
+                     {reason}"
+                ));
+                return Some(None);
+            }
+        }
+        BoundParse::Parsed(content) => {
+            ctx.decision_engine_poisoned = None;
+            ctx.last_error = Z3_OK;
+            ctx.error_msg = None;
+            release_adopted_definitions(ctx, operation);
+            return Some(Some(content));
+        }
+        // The parse ran inside a scope that was popped, and the text
+        // sets no option, so the engine is as it was: an error, no
+        // poison.
+        BoundParse::Failed(reason) => {
+            ctx.decision_engine_poisoned = None;
+            ctx.last_error = Z3_PARSER_ERROR;
+            ctx.error_msg = Some(format!("{operation}: {reason}"));
+            return Some(None);
+        }
+        BoundParse::ScopeLost(reason) => {
+            ctx.clear_decision_check_artifacts();
+            ctx.poison_decision_engine(format!("{operation}: {reason}"));
+            return Some(None);
+        }
+    }
+    None
+}
+
+/// The names a text declares (functions, constants, sorts, datatypes and
+/// their members).
+fn text_declared_names(commands: &[Command]) -> Vec<String> {
+    let mut names = Vec::new();
+    for command in commands {
+        match command {
+            Command::DeclareFun(name, ..)
+            | Command::DeclareConst(name, _)
+            | Command::DefineFun(name, ..)
+            | Command::DefineFunRec(name, ..)
+            | Command::DeclareSort(name, _)
+            | Command::DefineSort(name, ..) => names.push(name.clone()),
+            Command::DefineFunsRec(declarations, _) => {
+                names.extend(declarations.iter().map(|(name, ..)| name.clone()));
+            }
+            Command::DeclareDatatype(name, datatype) => {
+                names.push(name.clone());
+                datatype_member_names(datatype, &mut names);
+            }
+            Command::DeclareDatatypes(sorts, datatypes) => {
+                names.extend(sorts.iter().map(|sort| sort.name.clone()));
+                for datatype in datatypes {
+                    datatype_member_names(datatype, &mut names);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn datatype_member_names(datatype: &ay_frontend::command::DatatypeDec, names: &mut Vec<String>) {
+    for constructor in &datatype.constructors {
+        names.push(constructor.name.clone());
+        names.extend(constructor.selectors.iter().map(|s| s.name.clone()));
+    }
+}
+
+/// The first name a globally parsed text would declare that this context
+/// already declares (a constant, function or sort of the API, or of an
+/// earlier parse).
+pub(crate) fn global_parse_collision(ctx: &Z3Context, commands: &[Command]) -> Option<String> {
+    text_declared_names(commands).into_iter().find(|name| {
+        ctx.ffi_used_decl_names.contains(name)
+            || ctx
+                .ffi_sort_symbols
+                .values()
+                .any(|symbol| symbol.display_name() == *name)
+            // An earlier text's `declare-sort` (see `datatype_name_collision`).
+            || ctx.uninterpreted_sort_names.contains(name)
+    })
+}
+
+/// Make the constants and functions a global parse declared the context's
+/// declarations of those names: a later `Z3_mk_const` / `Z3_mk_func_decl`
+/// with the same name and signature returns them (z3 identifies declarations
+/// by name and signature), and a later parse's collision check sees them.
+fn register_global_parse_symbols(
+    ctx: &mut Z3Context,
+    commands: &[Command],
+    before: &std::collections::HashSet<String>,
+) {
+    let declared: std::collections::HashSet<String> =
+        text_declared_names(commands).into_iter().collect();
+    for (name, identity, domain, range, is_definition) in ctx.solver.symbol_signatures_core() {
+        if is_definition || before.contains(&identity) || !declared.contains(&name) {
+            continue;
+        }
+        let symbol = super::SymbolKey::String(name.clone());
+        ctx.ffi_used_decl_names.insert(name.clone());
+        ctx.ffi_decl_symbols
+            .insert(identity.clone(), symbol.clone());
+        if domain.is_empty() {
+            if let Ok(term) = ctx.solver.try_declare_const(&identity, range.clone()) {
+                ctx.ffi_const_cache
+                    .entry((symbol.clone(), range))
+                    .or_insert(term);
+                ctx.ffi_const_metadata
+                    .entry(term)
+                    .or_insert((identity.clone(), symbol));
+                ctx.ffi_const_terms_by_identity
+                    .entry(identity)
+                    .or_insert(term);
+            }
+        } else {
+            let key = (symbol, domain.clone(), range.clone());
+            ctx.ffi_func_names
+                .entry(key.clone())
+                .or_insert(identity.clone());
+            ctx.ffi_func_decls
+                .entry(key)
+                .or_insert_with(|| ay_dpll::api::FuncDecl::new(identity, domain, range));
+        }
+    }
+}
+
+/// The non-mutating preflight of [`parse_solver_transaction_scoped`]: the
+/// text's commands, or `None` with the context error set for a text the
+/// assertion-returning parse bridge refuses before execution.
+fn parse_preflight(ctx: &mut Z3Context, input: &str, operation: &str) -> Option<Vec<Command>> {
     if !ctx.decision_engine_is_usable(operation) {
         return None;
     }
@@ -948,38 +2064,91 @@ pub(crate) fn parse_solver_transaction(
         ));
         return None;
     }
-    // Claim only after non-mutating preflight succeeds. A malformed or
-    // unsupported script must not reserve this otherwise-pristine context for
-    // the Solver family and thereby prevent a later Optimize constructor.
-    if !ctx.claim_decision_owner(DecisionOwnerFamily::Solver, operation) {
-        return None;
-    }
+    Some(commands)
+}
 
-    ctx.clear_decision_check_artifacts();
-    ctx.decision_engine_poisoned = Some(format!(
-        "{operation}: parse transaction was interrupted before completion"
-    ));
-    match ctx.solver.parse_smtlib2_z3_5(input) {
-        Ok(batch) => match super::retain_parsed_finite_set_batch(ctx, batch) {
-            Ok(retained) => {
-                ctx.decision_engine_poisoned = None;
-                ctx.last_error = Z3_OK;
-                ctx.error_msg = None;
-                Some(retained.assertions)
-            }
-            Err(error) => {
-                ctx.poison_decision_engine(format!(
-                    "{operation}: parsed public FiniteSet metadata could not be retained: {error}"
-                ));
-                None
-            }
-        },
-        Err(e) => {
-            ctx.poison_decision_engine(format!(
-                "{operation}: parse execution failed after semantic mutation may have begun: {e}"
-            ));
-            None
+/// The sorts and declarations a `Z3_parse_smtlib2_string` caller names.
+///
+/// # Safety
+/// Each non-null array holds its count of handles of `ctx`.
+pub(crate) unsafe fn caller_parse_scope(
+    ctx: &Z3Context,
+    num_sorts: c_uint,
+    sort_names: *const Z3_symbol,
+    sorts: *const Z3_sort,
+    num_decls: c_uint,
+    decl_names: *const Z3_symbol,
+    decls: *const Z3_func_decl,
+) -> Result<ParseScope, String> {
+    let mut scope = ParseScope::default();
+    let symbol_name = |symbol: Z3_symbol| -> Result<String, String> {
+        if symbol.is_null() {
+            return Err("null symbol".to_string());
         }
+        // SAFETY: a non-null symbol handle of this context.
+        Ok(unsafe { (*symbol).key.display_name() })
+    };
+    if num_sorts > 0 {
+        if sort_names.is_null() || sorts.is_null() {
+            return Err("null sort array".to_string());
+        }
+        for i in 0..num_sorts as usize {
+            // SAFETY: `i` is below the caller's count for both arrays.
+            let (name, sort) = unsafe { (*sort_names.add(i), *sorts.add(i)) };
+            let sort = super::sort_arg_handle(ctx, sort).ok_or("null sort")?;
+            // SAFETY: decoded to a live sort handle of this context.
+            scope
+                .sorts
+                .push((symbol_name(name)?, unsafe { (*sort).sort.clone() }));
+        }
+    }
+    if num_decls > 0 {
+        if decl_names.is_null() || decls.is_null() {
+            return Err("null declaration array".to_string());
+        }
+        for i in 0..num_decls as usize {
+            // SAFETY: `i` is below the caller's count for both arrays.
+            let (name, decl) = unsafe { (*decl_names.add(i), *decls.add(i)) };
+            let decl = super::func_decl_arg_handle(ctx, decl).ok_or("null declaration")?;
+            // SAFETY: decoded to a live declaration handle of this context.
+            let decl = unsafe { (*decl).decl.clone() };
+            let given = if decl.arity() == 0 {
+                let term = ctx
+                    .ffi_const_terms_by_identity
+                    .get(decl.name())
+                    .copied()
+                    .ok_or_else(|| format!("{} is not a declared constant", decl.name()))?;
+                GivenDeclaration::Constant(term)
+            } else {
+                GivenDeclaration::Function(decl)
+            };
+            scope.given.push((symbol_name(name)?, given));
+        }
+    }
+    Ok(scope)
+}
+
+/// Parse `text` into the solver handle `s`: its declarations are bound to the
+/// context's (`parse_binding`), the solver's earlier parsed declarations stay
+/// visible (z3 keeps one command context per solver), and the assertions join
+/// the handle's.
+///
+/// # Safety
+/// `s` must be a non-null solver handle of `ctx`.
+unsafe fn parse_into_solver_handle(ctx: &mut Z3Context, s: Z3_solver, text: &str, operation: &str) {
+    let scope = ParseScope {
+        // SAFETY: the caller guarantees `s` is a live handle; the arena
+        // allocation is separate from `*ctx`.
+        prior: unsafe { (*s).parse_prior.clone() },
+        ..ParseScope::default()
+    };
+    if let Some(content) = parse_solver_transaction_scoped(ctx, text, operation, &scope) {
+        // SAFETY: as above; no reference to the handle was held while the
+        // transaction retired every handle's check artefacts.
+        let handle = unsafe { &mut *s };
+        handle.assertions.extend(content.assertions);
+        handle.parse_prior.extend(content.prior);
+        handle.clear_check_artifacts();
     }
 }
 
@@ -1198,7 +2367,11 @@ pub unsafe extern "C" fn Z3_solver_check(c: Z3_context, s: Z3_solver) -> c_int {
     // `ffi_guard_int` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary. `s` is forwarded to `check_solver_handle`, which
     // null-checks it.
-    unsafe { ffi_guard_int(c, Z3_L_UNDEF, |ctx| check_solver_handle(ctx, s, None, &[])) }
+    unsafe {
+        ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
+            check_solver_handle_isolated(ctx, s, None, &[])
+        })
+    }
 }
 
 /// Check satisfiability of THIS solver handle's assertions under assumptions.
@@ -1302,7 +2475,7 @@ pub unsafe extern "C" fn Z3_solver_check_assumptions(
     unsafe {
         ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
             let assumptions = has_assumptions.then_some(terms.as_slice());
-            check_solver_handle(ctx, s, assumptions, &[])
+            check_solver_handle_isolated(ctx, s, assumptions, &[])
         })
     }
 }
@@ -1326,8 +2499,18 @@ pub unsafe extern "C" fn Z3_solver_get_model(c: Z3_context, s: Z3_solver) -> Z3_
                 note_null_solver_handle(ctx, "Z3_solver_get_model");
                 return ptr::null_mut();
             };
+            // Without a current model z3 raises "there is no current model";
+            // a null model without an error was read by z3py as an empty
+            // model (measured: an invalid re-read model of a sat check). An
+            // `unknown` publishes no model either: its candidate was not
+            // admitted.
+            let no_model = |ctx: &mut Z3Context| {
+                ctx.last_error = Z3_INVALID_USAGE;
+                ctx.error_msg = Some("Z3_solver_get_model: there is no current model".to_string());
+                ptr::null_mut()
+            };
             if solver_handle.last_check_outcome != Some(SolverCheckOutcome::Sat) {
-                return ptr::null_mut();
+                return no_model(ctx);
             }
             match solver_handle.last_model.clone() {
                 Some(model) => {
@@ -1336,7 +2519,7 @@ pub unsafe extern "C" fn Z3_solver_get_model(c: Z3_context, s: Z3_solver) -> Z3_
                     let func_interps = solver_handle
                         .last_model_text
                         .as_deref()
-                        .map(super::model_params::parse_func_interps)
+                        .map(|text| super::model_params::model_func_interps(&mut ctx.solver, text))
                         .unwrap_or_default();
                     let handle = Box::into_raw(Box::new(ModelHandle {
                         model,
@@ -1344,12 +2527,13 @@ pub unsafe extern "C" fn Z3_solver_get_model(c: Z3_context, s: Z3_solver) -> Z3_
                         user_const_interps: Vec::new(),
                         user_func_interps: Vec::new(),
                         rec_def_count: ctx.rec_fun_defs.len(),
+                        complete_functions: true,
                         _ctx: c,
                     }));
                     ctx.model_cache.push(handle);
                     handle
                 }
-                None => ptr::null_mut(),
+                None => no_model(ctx),
             }
         })
     }
@@ -1371,9 +2555,12 @@ pub unsafe extern "C" fn Z3_solver_to_string(c: Z3_context, s: Z3_solver) -> *co
             // shape (`(declare-fun ...)` + `(assert ...)`), never a placeholder.
             // The live assertions live on the solver handle, not the executor's
             // internal stack (which is only populated transiently at check time).
-            let sexpr = match s.as_ref() {
-                Some(handle) => ctx.solver.assertions_sexpr(&handle.assertions),
-                None => ctx.solver.assertions_sexpr(&[]),
+            let assertions = s
+                .as_ref()
+                .map(|handle| handle.assertions.as_slice())
+                .unwrap_or(&[]);
+            let Some(sexpr) = super::finite_field::format_public_assertions(ctx, assertions) else {
+                return ptr::null();
             };
             let sexpr = super::ffi_surface_text(ctx, &sexpr);
             cache_string(ctx, sexpr)
@@ -1523,12 +2710,12 @@ pub unsafe extern "C" fn Z3_solver_get_unsat_core(c: Z3_context, s: Z3_solver) -
 pub unsafe extern "C" fn Z3_parse_smtlib2_string(
     c: Z3_context,
     str: *const c_char,
-    _num_sorts: c_uint,
-    _sort_names: *const Z3_symbol,
-    _sorts: *const Z3_sort,
-    _num_decls: c_uint,
-    _decl_names: *const Z3_symbol,
-    _decls: *const Z3_func_decl,
+    num_sorts: c_uint,
+    sort_names: *const Z3_symbol,
+    sorts: *const Z3_sort,
+    num_decls: c_uint,
+    decl_names: *const Z3_symbol,
+    decls: *const Z3_func_decl,
 ) -> Z3_ast_vector {
     // Pre-validate and extract the input string outside the guard,
     // since raw pointer dereferences happen in the unsafe extern "C" context.
@@ -1570,8 +2757,26 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_string(
                 ctx.error_msg = Some("null input string".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             };
-            let terms =
-                parse_solver_transaction(ctx, input, "Z3_parse_smtlib2_string").unwrap_or_default();
+            // z3 parses with a fresh symbol table holding the caller-named
+            // sorts and declarations (`decls={'foo': x}` binds the text's
+            // `foo` to `x`).
+            // SAFETY: the caller guarantees each array holds its count of
+            // handles of this context.
+            let scope = caller_parse_scope(
+                ctx, num_sorts, sort_names, sorts, num_decls, decl_names, decls,
+            );
+            let terms = match scope {
+                Ok(scope) => {
+                    parse_solver_transaction_scoped(ctx, input, "Z3_parse_smtlib2_string", &scope)
+                        .map(|content| content.assertions)
+                        .unwrap_or_default()
+                }
+                Err(message) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_parse_smtlib2_string: {message}"));
+                    Vec::new()
+                }
+            };
             let asts = terms
                 .into_iter()
                 .map(|term| term_to_ast(ctx, term))
@@ -1710,12 +2915,8 @@ pub unsafe extern "C" fn Z3_solver_from_string(c: Z3_context, s: Z3_solver, str:
                     return;
                 }
             };
-            if let Some(terms) = parse_solver_transaction(ctx, text, "Z3_solver_from_string") {
-                // SAFETY: null-checked before the transaction; the handle is
-                // arena-owned and no reference to it was held while all handle
-                // artifacts were retired.
-                (&mut *s).assertions.extend(terms);
-            }
+            // SAFETY: `s` was null-checked above.
+            parse_into_solver_handle(ctx, s, text, "Z3_solver_from_string");
         });
     }
 }
@@ -1759,10 +2960,8 @@ pub unsafe extern "C" fn Z3_solver_from_file(c: Z3_context, s: Z3_solver, file_n
                     return;
                 }
             };
-            if let Some(terms) = parse_solver_transaction(ctx, &text, "Z3_solver_from_file") {
-                // SAFETY: see the string variant above.
-                (&mut *s).assertions.extend(terms);
-            }
+            // SAFETY: see the string variant.
+            parse_into_solver_handle(ctx, s, &text, "Z3_solver_from_file");
         });
     }
 }
@@ -1936,9 +3135,23 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
                 .unwrap_or_default(),
         )
     };
+    // The handle's own parameters for this query only, a cleared interrupt,
+    // and no definition the query adopted left installed afterwards (it
+    // rewrote later terms of every handle: `f(x) == 0` built after
+    // `consequences` arrived as `0 == x + 1`; libz3 5.1.0 keeps `f(x) == 0`
+    // and answers `sat`).
+    // SAFETY: `s` is null or a live solver handle of `c`; `c` is null or a
+    // live context, borrowed by each call in turn.
+    let settings = unsafe {
+        begin_handle_query(
+            c,
+            s.as_ref()
+                .map_or_else(ParamSet::default, |handle| handle.params),
+        )
+    };
     // SAFETY: `ffi_guard_int` validates/guards `c`; `s`/`consequences` are
     // null-checked before use.
-    unsafe {
+    let verdict = unsafe {
         ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
             if !ctx.decision_engine_is_usable("Z3_solver_get_consequences") {
                 return Z3_L_UNDEF;
@@ -1980,6 +3193,15 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
             else {
                 return Z3_L_UNDEF;
             };
+            // libz3 5.1.0 answers `unknown` with no consequence for a goal
+            // holding a loose bound variable; a lossy binder is undecided too.
+            let mut goal_roots = goal.clone();
+            goal_roots.extend(base_original.iter().copied());
+            if has_loose_bound_variable(ctx, &goal_roots)
+                || lossy_binder_refusal(ctx, &goal_roots).is_some()
+            {
+                return Z3_L_UNDEF;
+            }
             let mut finite_set_roots = goal.clone();
             finite_set_roots.extend(base_original.iter().copied());
             finite_set_roots.extend(vars_original.iter().copied());
@@ -2037,7 +3259,7 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
                 }
             }
             // Load the goal into the shared engine.
-            if let Err(e) = ctx.solver.try_reset_assertions() {
+            if let Err(e) = ctx.reset_engine_for_solver_goal() {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg = Some(format!("{e}"));
                 return Z3_L_UNDEF;
@@ -2058,6 +3280,13 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
             }
             if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
                 ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(e);
+                return Z3_L_UNDEF;
+            }
+            let mut wf_roots = finite_set_roots.clone();
+            wf_roots.extend(goal.iter().chain(&base).chain(&vars_probe).copied());
+            wf_roots.extend(ctx.global_definition_axioms.iter().copied());
+            if let Err(e) = assert_reachable_wf_guards(ctx, &wf_roots) {
                 ctx.error_msg = Some(e);
                 return Z3_L_UNDEF;
             }
@@ -2122,7 +3351,11 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
             ctx.last_error = Z3_OK;
             Z3_L_TRUE
         })
-    }
+    };
+    // SAFETY: the guarded query has returned, so no borrow of `c` remains;
+    // `c` is null or the caller's live context.
+    unsafe { finish_handle_query(c, settings, "Z3_solver_get_consequences") };
+    verdict
 }
 
 /// Whether `term` is a Boolean ATOM (a leaf of the propositional skeleton): a
@@ -2552,10 +3785,7 @@ impl<'a> DimacsEncoder<'a> {
         );
         if include_names {
             for (v, t) in &self.atoms {
-                let name = self
-                    .ctx
-                    .solver
-                    .format_term_checked(*t)
+                let name = super::finite_field::format_public_term_in_context(self.ctx, *t)
                     .unwrap_or_else(|| "?".to_string());
                 let name = super::ffi_surface_text(self.ctx, &name);
                 // Keep the mapping comment single-line.

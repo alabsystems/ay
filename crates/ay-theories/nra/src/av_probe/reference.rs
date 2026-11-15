@@ -182,18 +182,20 @@ fn spec_to_interval(s: &Spec, land: &Land, rng: &mut R, lit: i32) -> Option<Deci
     DecidedInterval::from_bounds(lo, s.lo_open, hi, s.hi_open, Just::of(lit).unwrap())
 }
 
+/// Membership bitmask of `set` over the landmark atoms, or `None` when an
+/// atom's index does not fit in the 64-bit mask.
 #[cfg(test)]
-fn ay_mask(set: &IntervalSet, land: &Land) -> u64 {
+fn ay_mask(set: &IntervalSet, land: &Land) -> Option<u64> {
     let mut m = 0u64;
     for (k, a) in land.atoms.iter().enumerate() {
         if set
             .contains(a)
             .expect("contains must decide on decidable landmarks")
         {
-            m |= 1u64 << k;
+            m |= 1u64.checked_shl(u32::try_from(k).ok()?)?;
         }
     }
-    m
+    Some(m)
 }
 
 #[cfg(test)]
@@ -317,8 +319,8 @@ fn assert_reference_set_operations(
         specs: sb,
     } = b;
 
-    assert_eq!(ay_mask(a, land), ma, "MEMBERSHIP diverged: {sa:?}");
-    assert_eq!(ay_mask(b, land), mb, "MEMBERSHIP diverged: {sb:?}");
+    assert_eq!(ay_mask(a, land), Some(ma), "MEMBERSHIP diverged: {sa:?}");
+    assert_eq!(ay_mask(b, land), Some(mb), "MEMBERSHIP diverged: {sb:?}");
     assert_eq!(
         a.is_empty(),
         ma == 0,
@@ -333,7 +335,7 @@ fn assert_reference_set_operations(
     let union = a.union(b).expect("union decides");
     assert_eq!(
         ay_mask(&union, land),
-        ma | mb,
+        Some(ma | mb),
         "UNION diverged: {sa:?} U {sb:?}"
     );
     assert_eq!(union.is_empty(), (ma | mb) == 0, "UNION is_empty diverged");
@@ -341,7 +343,7 @@ fn assert_reference_set_operations(
     let intersection = a.intersect(b).expect("intersect decides");
     assert_eq!(
         ay_mask(&intersection, land),
-        ma & mb,
+        Some(ma & mb),
         "INTERSECT diverged: {sa:?} n {sb:?}"
     );
     assert_eq!(
@@ -353,7 +355,7 @@ fn assert_reference_set_operations(
     let complement = a.complement().expect("complement decides");
     assert_eq!(
         ay_mask(&complement, land),
-        all & !ma,
+        Some(all & !ma),
         "COMPLEMENT diverged: {sa:?}"
     );
     assert_eq!(
@@ -365,7 +367,7 @@ fn assert_reference_set_operations(
     let difference = a.subtract(b).expect("subtract decides");
     assert_eq!(
         ay_mask(&difference, land),
-        ma & !mb,
+        Some(ma & !mb),
         "SUBTRACT diverged: {sa:?} \\ {sb:?}"
     );
     assert_eq!(
@@ -395,10 +397,13 @@ fn assert_reference_set_operations(
 }
 
 #[test]
-fn av_reference_model_differential() {
+fn av_reference_model_differential() -> Result<(), Box<dyn std::error::Error>> {
     let land = build_landmarks();
     let m = land.reps.len();
-    let n_atoms = 2 * m + 1;
+    let n_atoms = m
+        .checked_mul(2)
+        .and_then(|twice| twice.checked_add(1))
+        .ok_or("atom count fits usize")?;
     let all = if n_atoms >= 64 {
         u64::MAX
     } else {
@@ -429,4 +434,5 @@ fn av_reference_model_differential() {
         n_atoms,
         started.elapsed()
     );
+    Ok(())
 }

@@ -7,6 +7,10 @@
 use super::*;
 
 impl Executor {
+    pub(crate) fn native_clause_trace(&self) -> Option<&ay_sat::ClauseTrace> {
+        self.last_clause_trace.as_ref()
+    }
+
     /// Access the trail provenance data from the last SAT result (#8153, #8307).
     pub(crate) fn last_trail_provenance(&self) -> Option<&HashMap<u32, (u32, bool, Vec<u32>)>> {
         self.last_trail_provenance.as_ref()
@@ -154,6 +158,32 @@ impl Executor {
         }
     }
 
+    /// Free-form cause recorded beside [`Self::unknown_reason`] — the
+    /// `unknown.detail` statistic — for the last Unknown result.
+    ///
+    /// The typed reason is the stable evidence code; this is the sentence a
+    /// refusal prints, e.g. which arm of the strict-proof gate fired and, for
+    /// an unsupported external-recheck surface, the sort or symbol pinned
+    /// Carcara cannot parse (D7). `None` if the last result was not Unknown
+    /// or no detail was recorded.
+    #[must_use]
+    pub fn unknown_detail(&self) -> Option<&str> {
+        match self.last_result {
+            Some(SolveResult::Unknown) => self.last_statistics.get_string("unknown.detail"),
+            _ => None,
+        }
+    }
+
+    /// Demand strictly checked evidence for authority GRANTS (the
+    /// closed-sentence SAT/UNSAT certificates, #closed-sentence-cert). The
+    /// CLI sets this under `--rigor strict|certified`; it is independent of
+    /// the `check-proofs-strict` option, which also switches the whole
+    /// proof-checking posture — either one closes the gate
+    /// (`Executor::accepts_discharged_trust_grant`).
+    pub fn set_strict_grant_evidence_required(&mut self, required: bool) {
+        self.strict_grant_evidence_required = required;
+    }
+
     /// True when the last SAT result passed either ordinary final model
     /// validation or the independently checked total-projection lane (#5903).
     pub(crate) fn was_model_validated(&self) -> bool {
@@ -220,6 +250,15 @@ impl Executor {
     #[must_use]
     pub fn get_statistics(&self) -> &Statistics {
         &self.last_statistics
+    }
+
+    /// The `rlimit-count` work of every solve this executor has run, summed,
+    /// internal solves included. [`Statistics::rlimit_count`] is the work of
+    /// the last check-sat alone; this total never decreases, so the work one
+    /// command did is the difference of two readings around it.
+    #[must_use]
+    pub fn rlimit_work_total(&self) -> u64 {
+        self.rlimit_work_total
     }
 
     /// Return the reason for the last `Unknown` result, if any.

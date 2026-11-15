@@ -52,7 +52,7 @@ Example (paths under $HOME; never a target or output directory in /tmp):
     scripts/quantifier_census.py run --bucket WORK/bucket.jsonl --posture fast \\
         --ay ~/ay-bench/target-z3/release/ay --out WORK/census_fast.jsonl
     scripts/quantifier_census.py z3 --bucket WORK/bucket.jsonl \\
-        --z3 ~/ay-bench/oracles/z3-5.1.0-arm64-osx-13.3/bin/z3 \\
+        --z3 "$(python3 scripts/_z3_reference.py --path)" \\
         --out WORK/oracle_510.jsonl
     scripts/quantifier_census.py report WORK/census_*.jsonl WORK/oracle_*.jsonl
 

@@ -44,7 +44,24 @@ pub(crate) struct TierState {
     pub next_recompute_tier: u64,
     /// Number of times tier boundaries have been recomputed.
     pub tier_recomputed: u64,
+    /// `--sat-reduce-kissat-tiers`: Kissat 4.0.4's tier rule instead of
+    /// CaDiCaL's. The tier2 scan starts past the tier1 glue (Kissat tiers.c:28;
+    /// CaDiCaL counts the tier1 bucket twice, so a histogram with half its uses
+    /// at glue 1 always yields tier2 = 2), and reduction, vivification and
+    /// subsumption read tier2 from STABLE mode (Kissat internal.h:255-256,
+    /// `TIER2 = tier2[1]`). On E00X23 AY's tiers were 1/2 focused and 2/11
+    /// stable against Kissat's 1/7 and 4/19, so every recently used clause
+    /// with glue 3 or more went straight into the sort pool.
+    pub kissat_rule: bool,
 }
+
+/// Highest glue the usage histogram tells apart under CaDiCaL's rule; higher
+/// glues share its last bucket.
+const CADICAL_MAX_GLUE_USED: usize = 63;
+/// The same under Kissat's rule (`statistics.h` `MAX_GLUE_USED`): its stable
+/// tier2 reaches 127 on cabp-V-nos6, where 44-57 percent of stable-mode clause
+/// uses have glue 127 or more.
+const KISSAT_MAX_GLUE_USED: usize = 127;
 
 /// Initial conflict count before first tier boundary recomputation.
 /// CaDiCaL: 1 << 1 = 2.
@@ -54,7 +71,10 @@ impl TierState {
     /// Create tier state with default boundaries.
     pub(crate) fn new() -> Self {
         Self {
-            tier_usage: [vec![0u64; 64], vec![0u64; 64]],
+            tier_usage: [
+                vec![0u64; KISSAT_MAX_GLUE_USED + 1],
+                vec![0u64; KISSAT_MAX_GLUE_USED + 1],
+            ],
             tier_bump_total: [0, 0],
             tier1_lbd: [CORE_LBD; 2],
             tier2_lbd: [TIER1_LBD; 2],
@@ -62,6 +82,49 @@ impl TierState {
             kept_size: 0,
             next_recompute_tier: TIER_RECOMPUTE_INIT,
             tier_recomputed: 0,
+            kissat_rule: false,
+        }
+    }
+
+    pub(super) fn build_admitted<A: super::construction::Construction>(
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        Ok(Self {
+            tier_usage: [
+                a.filled(KISSAT_MAX_GLUE_USED + 1, 0)?,
+                a.filled(KISSAT_MAX_GLUE_USED + 1, 0)?,
+            ],
+            tier_bump_total: [0, 0],
+            tier1_lbd: [CORE_LBD; 2],
+            tier2_lbd: [TIER1_LBD; 2],
+            kept_glue: 0,
+            kept_size: 0,
+            next_recompute_tier: TIER_RECOMPUTE_INIT,
+            tier_recomputed: 0,
+            kissat_rule: false,
+        })
+    }
+
+    /// The last usage-histogram bucket a bump may land in.
+    #[inline]
+    pub(crate) fn max_glue_used(&self) -> usize {
+        if self.kissat_rule {
+            KISSAT_MAX_GLUE_USED
+        } else {
+            CADICAL_MAX_GLUE_USED
+        }
+    }
+
+    /// The tier2 glue boundary that reduction, vivification and subsumption
+    /// read: focused tier2 under CaDiCaL's rule, `max(tier1[focused],
+    /// tier2[stable])` under Kissat's (reduce.c:62-63).
+    #[inline]
+    pub(crate) fn reduce_tier2(&self) -> u32 {
+        if self.kissat_rule {
+            self.tier1_lbd[0].max(self.tier2_lbd[1])
+        } else {
+            self.tier2_lbd[0]
         }
     }
 }

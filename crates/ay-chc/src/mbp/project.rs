@@ -13,6 +13,8 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 use super::Mbp;
 
+mod array_values;
+
 impl Mbp {
     /// Project away variables from a formula under a model
     ///
@@ -302,13 +304,29 @@ impl Mbp {
         var: &ChcVar,
         model: &FxHashMap<String, SmtValue>,
     ) -> Option<ChcExpr> {
-        match (&var.sort, model.get(&var.name)) {
-            (ChcSort::Bool, Some(SmtValue::Bool(b))) => Some(ChcExpr::Bool(*b)),
-            (ChcSort::Int, Some(SmtValue::Int(n))) => Some(ChcExpr::Int(*n)),
-            (ChcSort::Int, Some(SmtValue::BigInt(n))) => {
-                Some(ChcExpr::from_bigint(n.as_ref().clone()))
-            }
-            (ChcSort::Real, Some(SmtValue::Real(r))) => {
+        // Arrays go through the bounded, stop-observing builder (adapted from
+        // 328db18f2, the same #mbp-sort-correct-substitution fix): it emits the
+        // same `const-array` + `store` chain, or refuses.
+        if matches!(var.sort, ChcSort::Array(..)) {
+            return array_values::model_value(var, model.get(&var.name));
+        }
+        Self::value_expr(&var.sort, model.get(&var.name)?)
+    }
+
+    /// `value` as a `ChcExpr` literal of `sort`; `None` when its kind does not
+    /// match the sort or it has no literal form (an opaque value).
+    ///
+    /// An array value is a `const-array` of its default with a `store` per
+    /// entry (#mbp-sort-correct-substitution): an array variable the
+    /// projection could not eliminate is substituted by its model value like
+    /// any other, and a value with no literal form leaves the caller's own
+    /// fallback in charge.
+    fn value_expr(sort: &ChcSort, value: &SmtValue) -> Option<ChcExpr> {
+        match (sort, value) {
+            (ChcSort::Bool, SmtValue::Bool(b)) => Some(ChcExpr::Bool(*b)),
+            (ChcSort::Int, SmtValue::Int(n)) => Some(ChcExpr::Int(*n)),
+            (ChcSort::Int, SmtValue::BigInt(n)) => Some(ChcExpr::from_bigint(n.as_ref().clone())),
+            (ChcSort::Real, SmtValue::Real(r)) => {
                 use num_traits::ToPrimitive;
                 let n = r.numer().to_i64()?;
                 let d = r.denom().to_i64()?;
@@ -316,28 +334,36 @@ impl Mbp {
             }
             (
                 ChcSort::BitVec(expected_width),
-                Some(
-                    value @ (SmtValue::BitVec(_, actual_width)
-                    | SmtValue::BigBitVec(_, actual_width)),
-                ),
+                value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
             ) if expected_width == actual_width => value.bitvec_to_chc_expr(),
+            (ChcSort::Array(key, element), SmtValue::ConstArray(default)) => Some(
+                ChcExpr::const_array(key.as_ref().clone(), Self::value_expr(element, default)?),
+            ),
+            (ChcSort::Array(key, element), SmtValue::ArrayMap { default, entries }) => {
+                let mut array =
+                    ChcExpr::const_array(key.as_ref().clone(), Self::value_expr(element, default)?);
+                for (index, entry) in entries {
+                    array = ChcExpr::store(
+                        array,
+                        Self::value_expr(key, index)?,
+                        Self::value_expr(element, entry)?,
+                    );
+                }
+                Some(array)
+            }
             // DT constructor application from model pipeline.
-            (ChcSort::Datatype { .. }, Some(SmtValue::Datatype(ctor, fields))) => {
+            (ChcSort::Datatype { .. }, SmtValue::Datatype(ctor, fields)) => {
                 let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                     .iter()
                     .map(|f| Self::smt_value_to_expr(f).map(std::sync::Arc::new))
                     .collect::<Option<_>>()?;
-                Some(ChcExpr::FuncApp(
-                    ctor.clone(),
-                    var.sort.clone(),
-                    field_exprs,
-                ))
+                Some(ChcExpr::FuncApp(ctor.clone(), sort.clone(), field_exprs))
             }
             // Nullary DT constructors may come as Opaque strings.
-            (ChcSort::Datatype { constructors, .. }, Some(SmtValue::Opaque(s))) => constructors
+            (ChcSort::Datatype { constructors, .. }, SmtValue::Opaque(s)) => constructors
                 .iter()
                 .find(|c| c.selectors.is_empty() && c.name == *s)
-                .map(|c| ChcExpr::FuncApp(c.name.clone(), var.sort.clone(), vec![])),
+                .map(|c| ChcExpr::FuncApp(c.name.clone(), sort.clone(), vec![])),
             _ => None,
         }
     }
@@ -349,37 +375,46 @@ impl Mbp {
         var: &ChcVar,
         model: &FxHashMap<String, SmtValue>,
     ) -> ChcExpr {
-        Self::model_value_expr(var, model).unwrap_or(match &var.sort {
+        if matches!(var.sort, ChcSort::Array(..)) {
+            // A refused conversion retains the variable for the caller's
+            // residual/validation checks; never invent an ill-sorted Int 0.
+            return array_values::model_value_or_default(var, model.get(&var.name))
+                .unwrap_or_else(|| ChcExpr::Var(var.clone()));
+        }
+        Self::model_value_expr(var, model).unwrap_or_else(|| Self::sort_default_expr(&var.sort))
+    }
+
+    /// A literal of `sort`. An array's is the `const-array` of its element
+    /// sort's default (#mbp-sort-correct-substitution): the `Int` 0 this used
+    /// to return for every sort it did not list put an ill-sorted
+    /// `(select 0 k)` into the projection, which no evaluator can decide.
+    fn sort_default_expr(sort: &ChcSort) -> ChcExpr {
+        match sort {
             ChcSort::Bool => ChcExpr::Bool(false),
             ChcSort::Int => ChcExpr::Int(0),
             ChcSort::Real => ChcExpr::Real(0, 1),
             ChcSort::BitVec(w) => ChcExpr::BitVec(0, *w),
+            ChcSort::Array(key, element) => {
+                ChcExpr::const_array(key.as_ref().clone(), Self::sort_default_expr(element))
+            }
             ChcSort::Datatype { constructors, .. } => {
                 // Sound default: first nullary constructor, or first constructor
                 // with recursively-defaulted arguments.
                 if let Some(ctor) = constructors.iter().find(|c| c.selectors.is_empty()) {
-                    ChcExpr::FuncApp(ctor.name.clone(), var.sort.clone(), vec![])
+                    ChcExpr::FuncApp(ctor.name.clone(), sort.clone(), vec![])
                 } else if let Some(ctor) = constructors.first() {
                     let default_args: Vec<std::sync::Arc<ChcExpr>> = ctor
                         .selectors
                         .iter()
-                        .map(|sel| {
-                            std::sync::Arc::new(Self::model_value_expr_or_default(
-                                &ChcVar {
-                                    name: String::new(),
-                                    sort: sel.sort.clone(),
-                                },
-                                model,
-                            ))
-                        })
+                        .map(|sel| std::sync::Arc::new(Self::sort_default_expr(&sel.sort)))
                         .collect();
-                    ChcExpr::FuncApp(ctor.name.clone(), var.sort.clone(), default_args)
+                    ChcExpr::FuncApp(ctor.name.clone(), sort.clone(), default_args)
                 } else {
                     ChcExpr::Int(0)
                 }
             }
             _ => ChcExpr::Int(0),
-        })
+        }
     }
 
     /// Convert an SmtValue to a ChcExpr (for DT field values in model_value_expr).

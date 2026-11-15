@@ -1,0 +1,8 @@
+(set-logic QF_BV)
+(set-option :produce-models true)
+(declare-fun entry_sp () (_ BitVec 64))
+(assert (bvuge entry_sp (_ bv48 64)))
+(assert (= (bvand entry_sp (_ bv15 64)) (_ bv0 64)))
+(assert (= (bvadd (bvadd entry_sp (_ bv18446744073709551580 64)) (_ bv0 64)) (bvadd entry_sp (_ bv18446744073709551584 64))))
+(check-sat)
+(exit)

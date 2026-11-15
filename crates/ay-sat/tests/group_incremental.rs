@@ -12,6 +12,8 @@
 
 mod common;
 
+#[path = "group_incremental/empty_clause_scope_lifecycle.rs"]
+mod empty_clause_scope_lifecycle;
 #[path = "group_incremental/incremental_soundness.rs"]
 mod incremental_soundness;
 #[path = "group_incremental/incremental_soundness_expanded.rs"]

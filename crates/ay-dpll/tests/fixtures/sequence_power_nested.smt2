@@ -1,0 +1,7 @@
+(declare-const s String)
+(declare-const n Int)
+(set-option :rewriter.max_power_expansion 1)
+(simplify (seq.power (seq.power (seq.power s 3) n) 2))
+(simplify (seq.power (seq.power s (* 2 n)) 3))
+(simplify (seq.power (seq.power s (* 2 (* 3 n))) 4))
+(simplify (seq.power (seq.power s n) 1))

@@ -39,7 +39,10 @@ mod bitvector;
 mod clauses;
 mod commands;
 mod expr;
+mod finite_forall;
+mod lambda;
 mod lexer;
+mod scoping;
 mod sorts;
 #[cfg(test)]
 mod tests;
@@ -91,6 +94,17 @@ pub struct ChcParser {
     /// Empty in every clause that has no capture, which is nearly all of them,
     /// so the lookup in `parse_symbol_expr` costs one `is_empty` check.
     active_renames: Vec<(String, String)>,
+    /// Names bound by the enclosing `let`s, innermost last.
+    ///
+    /// A `let` is expanded by substituting its value for the bound name after
+    /// the body is parsed, while stripped quantifier binders live on in the
+    /// flat clause scope under their (possibly renamed) names. A quantifier
+    /// binder inside a `let` body that reuses the let's name must therefore be
+    /// renamed apart, or the substitution would replace the binder's own
+    /// occurrences with the let value.
+    let_scope: Vec<String>,
+    /// A `check-sat` has been read: a later `assert` is an incremental script.
+    check_sat_seen: bool,
     /// Counter making each minted binder name unique within a parse.
     capture_counter: usize,
     /// Declared predicates (name -> (id, sorts))
@@ -101,7 +115,10 @@ pub struct ChcParser {
     declared_sorts: FxHashSet<String>,
     /// Declared datatype sorts with full constructor/selector metadata.
     /// Populated by `parse_declare_datatype`; looked up by `parse_sort`.
+    /// Change it only through `set_declared_datatype_sort`.
     declared_datatype_sorts: FxHashMap<String, ChcSort>,
+    /// What placeholder resolution has learned, across declarations.
+    dt_resolution: commands::resolve_sorts::ResolutionMemo,
     /// Declared functions (constructors, selectors, testers)
     /// Maps name -> (return_sort, arg_sorts)
     functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
@@ -122,6 +139,13 @@ pub struct ChcParser {
     /// positive polarity and `exists` at negative polarity, so
     /// `parse_quantifier_expr` needs to know where it is.
     polarity: i8,
+    /// A quantifier completed in the current expression body. Each quantifier
+    /// clears this before its body, then sets it before returning (including
+    /// exact rewrites). Nested resets cannot hide a child from its parent:
+    /// every completed child restores `true`. Used only to refuse exact
+    /// elimination across already-hoisted alternating/nested binders.
+    quantifier_seen: bool,
+    lambda_depth: usize,
     /// Current position in input
     pos: usize,
     /// Input string
@@ -137,15 +161,20 @@ impl ChcParser {
             clause_binder_names: FxHashSet::default(),
             declared_var_names: FxHashSet::default(),
             active_renames: Vec::new(),
+            let_scope: Vec::new(),
+            check_sat_seen: false,
             capture_counter: 0,
             predicates: FxHashMap::default(),
             actions: FxHashMap::default(),
             declared_sorts: FxHashSet::default(),
             declared_datatype_sorts: FxHashMap::default(),
+            dt_resolution: commands::resolve_sorts::ResolutionMemo::default(),
             functions: FxHashMap::default(),
             uninterpreted_functions: FxHashSet::default(),
             overloaded_functions: FxHashMap::default(),
             polarity: 1,
+            quantifier_seen: false,
+            lambda_depth: 0,
             pos: 0,
             input: String::new(),
         }
@@ -229,6 +258,7 @@ impl ChcParser {
     pub(super) fn end_clause_binder_scope(&mut self) {
         self.clause_binder_names.clear();
         self.active_renames.clear();
+        self.let_scope.clear();
     }
 
     /// Mint a binder name that cannot collide with any symbol in the input.

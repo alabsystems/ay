@@ -25,7 +25,7 @@
 #   * simplify is an IDENTITY in AY (eager simplification): asserted as an
 #     equivalent expression, never a wrong reduction.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import os
 import tempfile

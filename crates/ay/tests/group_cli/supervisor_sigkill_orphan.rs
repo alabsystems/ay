@@ -69,11 +69,21 @@ mod unix_tests {
         out.flush().expect("flush formula");
     }
 
-    /// `(pid, ppid, stat)` rows of every process, the portable way (`ps -axo`
-    /// is the same on macOS and procps).
-    fn process_table() -> Vec<(u32, u32, String)> {
+    /// One row of the process table.
+    struct ProcessRow {
+        pid: u32,
+        ppid: u32,
+        stat: String,
+        /// The executable's name or path (`comm`).
+        command: String,
+    }
+
+    /// Every process, the portable way (`ps -axo` is the same on macOS and
+    /// procps). `comm` is last because it is the one column that may hold a
+    /// space.
+    fn process_table() -> Vec<ProcessRow> {
         let output = Command::new("ps")
-            .args(["-axo", "pid=,ppid=,stat="])
+            .args(["-axo", "pid=,ppid=,stat=,comm="])
             .output()
             .expect("run ps");
         String::from_utf8_lossy(&output.stdout)
@@ -83,7 +93,13 @@ mod unix_tests {
                 let pid = fields.next()?.parse().ok()?;
                 let ppid = fields.next()?.parse().ok()?;
                 let stat = fields.next().unwrap_or("").to_string();
-                Some((pid, ppid, stat))
+                let command = fields.collect::<Vec<_>>().join(" ");
+                Some(ProcessRow {
+                    pid,
+                    ppid,
+                    stat,
+                    command,
+                })
             })
             .collect()
     }
@@ -93,21 +109,37 @@ mod unix_tests {
     fn solver_alive(pid: u32) -> bool {
         process_table()
             .iter()
-            .any(|(p, _, stat)| *p == pid && !stat.starts_with('Z'))
+            .any(|row| row.pid == pid && !row.stat.starts_with('Z'))
+    }
+
+    /// Whether `command` (a `comm` column) is the `ay` executable.
+    fn is_ay_image(command: &str) -> bool {
+        let ay = Path::new(env!("CARGO_BIN_EXE_ay"))
+            .file_name()
+            .expect("the ay binary has a file name");
+        Path::new(command).file_name() == Some(ay)
     }
 
     /// Wait for the supervisor to fork its solver child and return that pid.
+    ///
+    /// The solver child is the supervisor's child running the `ay` image. On
+    /// macOS the same pid has another, short-lived child first: before `main`
+    /// runs, the kernel memory governance (`ay_sys::govern::arm`) probes
+    /// `taskpolicy -m <MB> /usr/bin/true` from this very process, which then
+    /// re-execs itself under `taskpolicy` with its pid unchanged. Taking that
+    /// probe for the solver made the "still running" check below fail whenever
+    /// a loaded machine let a poll land inside the probe's lifetime.
     fn wait_for_solver_child(wrapper: &mut Child, budget: Duration) -> u32 {
         let deadline = Instant::now() + budget;
         loop {
             if let Some(status) = wrapper.try_wait().expect("poll the supervisor") {
                 panic!("the supervisor exited ({status:?}) before forking a solver child");
             }
-            if let Some((pid, _, _)) = process_table()
+            if let Some(row) = process_table()
                 .into_iter()
-                .find(|(_, ppid, _)| *ppid == wrapper.id())
+                .find(|row| row.ppid == wrapper.id() && is_ay_image(&row.command))
             {
-                return pid;
+                return row.pid;
             }
             assert!(
                 Instant::now() < deadline,

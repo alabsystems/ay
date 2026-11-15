@@ -82,13 +82,13 @@ pub fn validate_bv_assertions(
     assertions: &[TermId],
     model: &BvModel,
 ) -> Result<usize, BvValidationError> {
-    let mut checked = 0;
+    let mut checked: usize = 0;
     // One memo across ALL assertions: the model is immutable here, and
     // assertions share subterms heavily on BMC instances.
     let mut memo = BvValMemo::default();
     for (index, &assertion) in assertions.iter().enumerate() {
         if let Some(value) = eval_bool_memo(terms, assertion, model, &mut memo) {
-            checked += 1;
+            checked = checked.saturating_add(1);
             if !value {
                 return Err(BvValidationError {
                     assertion_index: index,

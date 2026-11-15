@@ -13,6 +13,38 @@ fn packed_bool_vec_bytes(capacity: usize) -> usize {
     capacity.div_ceil(8)
 }
 
+fn add_learned_composition_clause(solver: &mut Solver, len: u32, hyper: bool) -> usize {
+    let literals = (0..len)
+        .map(|index| Literal::positive(Variable::new(index)))
+        .collect::<Vec<_>>();
+    let offset = solver.arena.add(&literals, true);
+    solver.arena.set_hyper(offset, hyper);
+    offset
+}
+
+#[test]
+fn test_learned_composition_excludes_garbage_kept_and_pending_husks() {
+    let mut solver = Solver::new(16);
+
+    add_learned_composition_clause(&mut solver, 2, true);
+    add_learned_composition_clause(&mut solver, 2, false);
+    add_learned_composition_clause(&mut solver, 3, false);
+    add_learned_composition_clause(&mut solver, 9, false);
+
+    let garbage_hyper = add_learned_composition_clause(&mut solver, 2, true);
+    let pending_binary = add_learned_composition_clause(&mut solver, 2, false);
+    let garbage_short = add_learned_composition_clause(&mut solver, 3, false);
+    let pending_long = add_learned_composition_clause(&mut solver, 9, false);
+    solver.arena.mark_garbage_keep_data(garbage_hyper);
+    solver.arena.set_pending_garbage(pending_binary, true);
+    solver.arena.mark_garbage_keep_data(garbage_short);
+    solver.arena.set_pending_garbage(pending_long, true);
+
+    assert_eq!(solver.arena.active_indices().count(), 8);
+    assert_eq!(solver.arena.live_indices().count(), 4);
+    assert_eq!(solver.learned_composition(), (1, 1, 1, 1));
+}
+
 #[test]
 fn test_sat_native_code_helper_flat_counter_includes_live_helper_counters() {
     let mut solver = Solver::new(4);
@@ -65,16 +97,6 @@ fn test_sat_whole_loop_guard_counters_are_separate_from_native_helpers() {
         2,
         "whole-loop guard telemetry must not be folded into current native-helper evidence"
     );
-}
-
-#[test]
-fn test_gpu_bve_stats_accessor_reports_solver_counters() {
-    let mut solver = Solver::new(4);
-    solver.stats.gpu_bve_dispatches = 2;
-    solver.stats.gpu_bve_pairs = 4096;
-    solver.stats.gpu_bve_tautologies = 17;
-
-    assert_eq!(solver.gpu_bve_stats(), (2, 4096, 17));
 }
 
 #[test]

@@ -84,12 +84,24 @@ oddest datum -- "at --limit 300 p2756 is load-invariant over a 6.2x load swing,
   runs across the whole corpus.
   endgame_on_pace was evaluated 434,851 times on mas74 and fired zero times.
 
-BUILD:  CARGO_TARGET_DIR=<own> cargo build --release -p ay-milp \\
+BUILD:  CARGO_TARGET_DIR=<own> targo --unverified build --release -p ay-milp \\
             --features dcensus --example mps_solve
+        (without the Trust toolchain: cargo build with the same arguments)
 RUN:    python3 scripts/milp_decision_census.py --solver <that binary> --check
 
 A HARNESS THAT MEASURED NOTHING MUST NOT REPORT SUCCESS: an empty instance
 selection, or a missing instance, exits 2 (SETUP) rather than printing "0 fail".
+
+CORRECTION, 2026-08-28. As first shipped (`6e6077641`) the drift key was the
+whole result LINE, which carries `{dt:.3}` -- a wall clock -- so `--check` could
+never report clean and its exit code carried no information. Reproduced against
+a shim emitting a CONSTANT status, objective and node count (see `reproducible`
+below for the transcript): two instances, both reported DRIFT, exit 1. The key
+is now the parsed wall-free tuple, and the same shim run reports `0 drift`,
+exit 0. The census RESULTS recorded above were read off the printed per-run
+lines rather than off that classifier, so they are unaffected; what was broken
+was the pass/fail verdict, which could not distinguish p2756 from the stein45
+control because it called both DRIFT.
 """
 
 import argparse
@@ -110,6 +122,37 @@ DEFAULT_INSTANCES = ['misc07', 'p2756', 'mas76', 'stein45']
 SITE_RE = re.compile(
     r'^dcensus site=(\S+)\s+evals=(\d+)\s+fires=(\d+)\s+steer_sum=(\d+)')
 RESULT_RE = re.compile(r'^(OPTIMAL|FEASIBLE|INFEASIBLE|UNKNOWN|BOUND)\b(.*)$')
+
+
+def reproducible(verdict):
+    """The load-INVARIANT part of a `mps_solve` result line.
+
+    THE INSTRUMENT DEFECT THIS EXISTS TO CLOSE, reproduced 2026-08-28 before it
+    was fixed. `mps_solve` prints `<status> <objective> {dt:.3} <nodes>`
+    (`crates/ay-milp/examples/mps_solve.rs:542` and its five siblings), so the
+    SECOND-TO-LAST field is a wall clock. Keying drift on the whole line made
+    every run drift: driven against a shim that emits a constant status,
+    objective and node count and varies only the wall, `--check` reported
+
+        p0033  LOW  [OPTIMAL 3089 0.228 287]   p0033  HIGH [OPTIMAL 3089 0.266 287]
+        p0282  LOW  [OPTIMAL 258411 0.033 368] p0282  HIGH [OPTIMAL 258411 0.354 368]
+          p0033 DRIFT ; p0282 DRIFT ; === 2 drift ===        exit 1
+
+    i.e. it could never report clean, so its green/red output carried no
+    information and could not distinguish p2756 from the stein45 control.
+
+    The wall is dropped by POSITION, not by parsing the number, so a status
+    whose payload contains spaces (`UNKNOWN {reason:?}`) keeps all of it.
+    """
+    # ALWAYS A TUPLE, so a run that printed no result line at all sorts beside
+    # the ones that did instead of raising `TypeError: '<' not supported between
+    # NoneType and tuple` in the summary. A crashed arm is drift, loudly.
+    if verdict is None:
+        return ('<NO RESULT LINE>',)
+    fields = verdict.split()
+    if len(fields) < 3:
+        return tuple(fields)
+    return tuple(fields[:-2]) + (fields[-1],)
 
 
 def load1():
@@ -172,8 +215,10 @@ def main():
 
     if not os.path.exists(a.solver):
         print('SETUP: census solver not built at %s\n'
-              '  CARGO_TARGET_DIR=<own> cargo build --release -p ay-milp '
-              '--features dcensus --example mps_solve' % a.solver,
+              '  CARGO_TARGET_DIR=<own> targo --unverified build --release -p ay-milp '
+              '--features dcensus --example mps_solve\n'
+              '  (without the Trust toolchain: cargo build with the same arguments)'
+              % a.solver,
               file=sys.stderr)
         return 2
 
@@ -234,23 +279,30 @@ def main():
     fails = 0
     for n in names:
         rs = [r for r in records if r['instance'] == n]
-        verdicts = sorted({r['verdict'] for r in rs})
-        low = {r['verdict'] for r in rs if r['arm'] == 'LOW'}
-        high = {r['verdict'] for r in rs if r['arm'] == 'HIGH'}
+        # DRIFT IS KEYED ON THE PARSED, WALL-FREE TUPLE (see `reproducible`).
+        # The full line is still what gets PRINTED, because the wall is useful
+        # context; it is simply not allowed to decide the verdict.
+        keys = sorted({reproducible(r['verdict']) for r in rs})
+        low = {reproducible(r['verdict']) for r in rs if r['arm'] == 'LOW'}
+        high = {reproducible(r['verdict']) for r in rs if r['arm'] == 'HIGH'}
         steered = sorted({s for r in rs for s, v in r['sites'].items() if v[1]})
-        drift = len(verdicts) > 1
+        drift = len(keys) > 1
         fails += 1 if drift else 0
         print('  %-9s %s  D-sites that FIRED: %s'
               % (n, 'DRIFT' if drift else 'stable',
                  ', '.join(steered) if steered else '<none>'))
         if drift:
-            for v in verdicts:
+            for k in keys:
                 where = []
-                if v in low:
+                if k in low:
                     where.append('LOW')
-                if v in high:
+                if k in high:
                     where.append('HIGH')
-                print('      %s   [%s]' % (v, '+'.join(where)))
+                lines = sorted({r['verdict'] for r in rs
+                                if reproducible(r['verdict']) == k})
+                print('      %s   [%s]' % (' '.join(k), '+'.join(where)))
+                for line in lines:
+                    print('          seen as: %s' % line)
     print('=== %d drift ===' % fails)
     return 1 if (a.check and fails) else 0
 

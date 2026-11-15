@@ -22,7 +22,7 @@
 //!     per basic block (`bb0`, `bb1`, ..., plus the `error` query), edges as
 //!     linear Horn rules `bb_i(s) /\ guard -> bb_j(s')`. The loop body spans
 //!     several blocks, so the whole loop is one strongly-connected component
-//!     (SCC). [`linearize_to_single_loop`] performs proper Gaussian/unfold
+//!     (SCC). [`linearize::linearize_to_single_loop`] performs proper Gaussian/unfold
 //!     elimination: it repeatedly resolves away every predicate that is not
 //!     *directly* self-recursive (entry blocks, body blocks, error). Each
 //!     elimination resolves a predicate's definition clauses into its use sites
@@ -56,6 +56,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use ay_sat::{Literal, Variable};
@@ -69,11 +70,19 @@ use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, PredicateId};
 use crate::ic3::solver::{Ic3Result, Ic3Solver};
 
 mod back_translation;
+mod control;
+mod linearize;
+mod resources;
 mod widening;
 
+#[cfg(test)]
 use back_translation::back_translate;
-pub use widening::try_prove_chc_loop;
-use widening::{BlastWidth, INT_WIDTH, MAX_IC3_STATE_LATCHES};
+use back_translation::back_translate_controlled;
+use control::Control;
+#[cfg(test)]
+use widening::INT_WIDTH;
+pub use widening::{try_prove_chc_loop, try_prove_chc_loop_with_resources};
+use widening::{BlastWidth, MAX_IC3_STATE_LATCHES};
 
 /// Lift a collapsed loop-header invariant onto EVERY original predicate of a
 /// multi-block CFG, producing a full multi-predicate candidate model that the
@@ -118,13 +127,28 @@ use widening::{BlastWidth, INT_WIDTH, MAX_IC3_STATE_LATCHES};
 /// image cannot be computed (a non-invertible head argument, or a clause-local
 /// variable that cannot be eliminated), we return `None` and contribute no
 /// proof.
-fn lift_header_to_full_model(
+fn lift_header_to_full_model_controlled(
     original: &ChcProblem,
     header: PredicateId,
     h_vars: &[ChcVar],
     h_formula: &ChcExpr,
-    _timeout: Duration,
+    control: &Control<'_>,
 ) -> Option<InvariantModel> {
+    control.poll()?;
+    let result = lift_header_to_full_model_inner(original, header, h_vars, h_formula, control)?;
+    // Temporary maps, clause images and abandoned alternatives are gone.
+    control.poll()?;
+    Some(result)
+}
+
+fn lift_header_to_full_model_inner(
+    original: &ChcProblem,
+    header: PredicateId,
+    h_vars: &[ChcVar],
+    h_formula: &ChcExpr,
+    control: &Control<'_>,
+) -> Option<InvariantModel> {
+    control.poll()?;
     let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     if dbg {
         eprintln!(
@@ -132,6 +156,7 @@ fn lift_header_to_full_model(
             header.index()
         );
         for p in original.predicates() {
+            control.poll()?;
             eprintln!(
                 "IC3_LIFT: pred#{} name={} sorts={:?}",
                 p.id.index(),
@@ -140,6 +165,7 @@ fn lift_header_to_full_model(
             );
         }
         for (ci, c) in original.clauses().iter().enumerate() {
+            control.poll()?;
             let head = match &c.head {
                 ClauseHead::Predicate(h, a) => format!("pred#{}({:?})", h.index(), a),
                 ClauseHead::False => "false".to_string(),
@@ -168,20 +194,30 @@ fn lift_header_to_full_model(
     }
     // Canonical parameter vars per predicate (`__lift_<pid>_<i>`), and the header
     // invariant expressed over the header's canonical params.
-    let params_of = |pid: PredicateId, sorts: &[ChcSort]| -> Vec<ChcVar> {
+    let params_of = |pid: PredicateId, sorts: &[ChcSort]| -> Option<Vec<ChcVar>> {
         sorts
             .iter()
             .enumerate()
-            .map(|(i, s)| ChcVar::new(format!("__lift_{}_{}", pid.index(), i), s.clone()))
+            .map(|(i, s)| {
+                control.poll()?;
+                Some(ChcVar::new(
+                    format!("__lift_{}_{}", pid.index(), i),
+                    s.clone(),
+                ))
+            })
             .collect()
     };
-    let hparams = params_of(header, &hpred.arg_sorts);
+    let hparams = params_of(header, &hpred.arg_sorts)?;
     let header_subst: Vec<(ChcVar, ChcExpr)> = h_vars
         .iter()
-        .cloned()
-        .zip(hparams.iter().cloned().map(ChcExpr::var))
-        .collect();
+        .zip(&hparams)
+        .map(|(source, target)| {
+            control.poll()?;
+            Some((source.clone(), ChcExpr::var(target.clone())))
+        })
+        .collect::<Option<Vec<_>>>()?;
     let header_formula = h_formula.substitute(&header_subst);
+    control.poll()?;
 
     // interps[pid] = (params, formula). The header is pinned to the IC3 result.
     let mut interps: HashMap<PredicateId, (Vec<ChcVar>, ChcExpr)> = HashMap::new();
@@ -213,15 +249,26 @@ fn lift_header_to_full_model(
     // the kernel rejects the incoming transition).
     let mut doomed: HashSet<PredicateId> = HashSet::new();
     loop {
+        control.poll()?;
         let mut changed = false;
         for p in original.predicates() {
+            control.poll()?;
             if doomed.contains(&p.id) || p.id == header {
                 continue;
             }
             let mut appears = false;
             let mut all_bad = true;
             for c in original.clauses() {
-                if c.body.predicates.iter().any(|(q, _)| *q == p.id) {
+                control.poll()?;
+                let mut contains = false;
+                for (q, _) in &c.body.predicates {
+                    control.poll()?;
+                    if *q == p.id {
+                        contains = true;
+                        break;
+                    }
+                }
+                if contains {
                     appears = true;
                     let head_bad = match &c.head {
                         ClauseHead::False => true,
@@ -243,30 +290,34 @@ fn lift_header_to_full_model(
         }
     }
     for p in original.predicates() {
+        control.poll()?;
         if doomed.contains(&p.id) && !interps.contains_key(&p.id) {
-            let qparams = params_of(p.id, &p.arg_sorts);
+            let qparams = params_of(p.id, &p.arg_sorts)?;
             interps.insert(p.id, (qparams, ChcExpr::Bool(false)));
         }
     }
 
-    let preds: Vec<_> = original.predicates().iter().collect();
+    let preds = original.predicates();
     // Forward-image fixpoint: a predicate is finalized once EVERY one of its
     // defining clauses has all body predicates already interpreted (so the OR of
     // disjuncts is complete). The body is acyclic given the pinned header, so
     // this converges in at most `num_preds` rounds.
-    let max_rounds = preds.len() + 2;
+    let max_rounds = preds.len().checked_add(2)?;
     for _ in 0..max_rounds {
+        control.poll()?;
         let mut progressed = false;
-        for p in &preds {
+        for p in preds {
+            control.poll()?;
             if interps.contains_key(&p.id) {
                 continue;
             }
-            let tparams = params_of(p.id, &p.arg_sorts);
+            let tparams = params_of(p.id, &p.arg_sorts)?;
             // Gather the defining clauses of p; require all body preds ready.
             let mut disjuncts: Vec<ChcExpr> = Vec::new();
             let mut all_ready = true;
             let mut any_clause = false;
             for c in original.clauses() {
+                control.poll()?;
                 let ClauseHead::Predicate(h, headargs) = &c.head else {
                     continue;
                 };
@@ -274,15 +325,17 @@ fn lift_header_to_full_model(
                     continue;
                 }
                 any_clause = true;
-                if c.body
-                    .predicates
-                    .iter()
-                    .any(|(q, _)| !interps.contains_key(q))
-                {
-                    all_ready = false;
+                for (q, _) in &c.body.predicates {
+                    control.poll()?;
+                    if !interps.contains_key(q) {
+                        all_ready = false;
+                        break;
+                    }
+                }
+                if !all_ready {
                     break;
                 }
-                match edge_image(c, headargs, &tparams, &interps) {
+                match edge_image(c, headargs, &tparams, &interps, control) {
                     Some(img) => disjuncts.push(img),
                     None => {
                         if dbg {
@@ -321,7 +374,8 @@ fn lift_header_to_full_model(
 
     // Every predicate referenced in the problem must have an interpretation.
     let mut model = InvariantModel::new();
-    for p in &preds {
+    for p in preds {
+        control.poll()?;
         let Some((vars, formula)) = interps.get(&p.id) else {
             if dbg {
                 eprintln!(
@@ -350,7 +404,9 @@ fn edge_image(
     headargs: &[ChcExpr],
     tparams: &[ChcVar],
     interps: &HashMap<PredicateId, (Vec<ChcVar>, ChcExpr)>,
+    control: &Control<'_>,
 ) -> Option<ChcExpr> {
+    control.poll()?;
     let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     if headargs.len() != tparams.len() {
         if dbg {
@@ -366,6 +422,7 @@ fn edge_image(
     // call args, plus the clause guard.
     let mut conj: Vec<ChcExpr> = Vec::new();
     for (q, qargs) in &clause.body.predicates {
+        control.poll()?;
         let Some((qparams, qformula)) = interps.get(q) else {
             if dbg {
                 eprintln!("IC3_EDGE: body pred#{} not interpreted -> None", q.index());
@@ -383,8 +440,14 @@ fn edge_image(
             }
             return None;
         }
-        let subst: Vec<(ChcVar, ChcExpr)> =
-            qparams.iter().cloned().zip(qargs.iter().cloned()).collect();
+        let subst: Vec<(ChcVar, ChcExpr)> = qparams
+            .iter()
+            .zip(qargs)
+            .map(|(var, arg)| {
+                control.poll()?;
+                Some((var.clone(), arg.clone()))
+            })
+            .collect::<Option<Vec<_>>>()?;
         conj.push(qformula.substitute(&subst));
     }
     if let Some(g) = &clause.body.constraint {
@@ -419,8 +482,11 @@ fn edge_image(
     let mut seen: HashMap<ChcVar, ChcExpr> = HashMap::new();
     let mut link_eqs: Vec<ChcExpr> = Vec::new();
     for (t, harg) in tparams.iter().zip(headargs.iter()) {
+        control.poll()?;
         let t_expr = ChcExpr::var(t.clone());
-        match invert_head_arg(harg, &t_expr) {
+        let inverse = invert_head_arg(harg, &t_expr);
+        control.poll()?;
+        match inverse {
             Some((var, value)) => match seen.get(&var) {
                 Some(prev) => link_eqs.push(ChcExpr::eq(prev.clone(), value.clone())),
                 None => {
@@ -444,6 +510,7 @@ fn edge_image(
     // the image; the unchanged trusted validator re-checks init/consec/safety.
     let mut extras: Vec<ChcExpr> = Vec::new();
     for (t_expr, harg) in &complex {
+        control.poll()?;
         let eq_applied = ChcExpr::eq(t_expr.clone(), harg.clone()).substitute(&sigma);
         if eq_applied.vars().into_iter().all(|v| allowed.contains(&v)) {
             extras.push(eq_applied);
@@ -455,7 +522,8 @@ fn edge_image(
     // interpretation is visible to the equality-elimination below.
     let mut atoms: Vec<ChcExpr> = Vec::new();
     for c in conj {
-        flatten_conjuncts(&c.substitute(&sigma), &mut atoms);
+        control.poll()?;
+        flatten_conjuncts(&c.substitute(&sigma), &mut atoms, control)?;
     }
 
     // EQUALITY-ELIMINATION of leftover (non-target) clause variables that the body
@@ -476,6 +544,7 @@ fn edge_image(
     // (bounded by the atom count; each step strictly removes one leftover and
     // introduces none, since `val` is target-only).
     for _ in 0..=atoms.len().saturating_add(1) {
+        control.poll()?;
         let leftover_now: HashSet<ChcVar> = ChcExpr::and_all(atoms.clone())
             .vars()
             .into_iter()
@@ -486,6 +555,7 @@ fn edge_image(
         }
         let mut elim: Option<(ChcVar, ChcExpr)> = None;
         'find: for c in &atoms {
+            control.poll()?;
             let ChcExpr::Op(ChcOp::Eq, args) = c else {
                 continue;
             };
@@ -497,7 +567,10 @@ fn edge_image(
                 (args[1].as_ref(), args[0].as_ref()),
             ];
             for (lhs, rhs) in sides {
-                let Some((w, val)) = invert_head_arg(lhs, rhs) else {
+                control.poll()?;
+                let inverse = invert_head_arg(lhs, rhs);
+                control.poll()?;
+                let Some((w, val)) = inverse else {
                     continue;
                 };
                 // `w` must be a leftover and `val` expressed purely over target
@@ -512,6 +585,7 @@ fn edge_image(
         let Some((w, val)) = elim else { break };
         let sub = [(w, val)];
         for c in &mut atoms {
+            control.poll()?;
             *c = c.substitute(&sub);
         }
     }
@@ -535,6 +609,7 @@ fn edge_image(
         }
         return None;
     }
+    control.poll()?;
     if extras.is_empty() && link_eqs.is_empty() {
         Some(applied)
     } else {
@@ -550,15 +625,21 @@ fn edge_image(
 /// nested `And` nodes. A non-`And` expression contributes itself. Used by the
 /// lift's equality-elimination so an equality nested inside a body predicate's
 /// (conjunctive) interpretation is visible as a top-level atom.
-fn flatten_conjuncts(e: &ChcExpr, out: &mut Vec<ChcExpr>) {
-    match e {
-        ChcExpr::Op(ChcOp::And, args) => {
-            for a in args {
-                flatten_conjuncts(a.as_ref(), out);
+fn flatten_conjuncts(e: &ChcExpr, out: &mut Vec<ChcExpr>, control: &Control<'_>) -> Option<()> {
+    let mut stack = vec![e];
+    while let Some(expr) = stack.pop() {
+        control.poll()?;
+        match expr {
+            ChcExpr::Op(ChcOp::And, args) => {
+                for arg in args.iter().rev() {
+                    control.poll()?;
+                    stack.push(arg.as_ref());
+                }
             }
+            other => out.push(other.clone()),
         }
-        other => out.push(other.clone()),
     }
+    control.poll()
 }
 
 /// Constant-fold a head-arg expression into the invertible shape
@@ -785,13 +866,20 @@ fn as_bool_const(e: &ChcExpr) -> Option<bool> {
 /// Sound: substitution under an asserted equality preserves meaning, so this can
 /// only sharpen `bad`/`guard` back onto the real state; the lane's candidate is
 /// re-validated word-level regardless, so a mis-resolution can only miss a proof.
-fn resolve_temps_to_args(constraint: &ChcExpr, bound: &HashSet<String>) -> ChcExpr {
+fn resolve_temps_to_args(
+    constraint: &ChcExpr,
+    bound: &HashSet<String>,
+    control: &Control<'_>,
+) -> Option<ChcExpr> {
+    control.poll()?;
     let mut atoms: Vec<ChcExpr> = Vec::new();
-    flatten_conjuncts(constraint, &mut atoms);
+    flatten_conjuncts(constraint, &mut atoms, control)?;
     // Fixpoint bounded by the atom count (each iteration eliminates one temp).
     for _ in 0..=atoms.len() {
+        control.poll()?;
         let mut chosen: Option<(usize, ChcVar, ChcExpr)> = None;
         'scan: for (k, atom) in atoms.iter().enumerate() {
+            control.poll()?;
             let ChcExpr::Op(ChcOp::Eq, args) = atom else {
                 continue;
             };
@@ -802,7 +890,9 @@ fn resolve_temps_to_args(constraint: &ChcExpr, bound: &HashSet<String>) -> ChcEx
                 (args[0].as_ref(), args[1].as_ref()),
                 (args[1].as_ref(), args[0].as_ref()),
             ] {
-                if let Some((w, val)) = invert_head_arg(lhs, rhs) {
+                let inverse = invert_head_arg(lhs, rhs);
+                control.poll()?;
+                if let Some((w, val)) = inverse {
                     // `w` a clause-local temp; `val` over bound args only (so the
                     // substitution cannot reintroduce a temp — this also rules out a
                     // circular `w == f(w)`).
@@ -819,22 +909,27 @@ fn resolve_temps_to_args(constraint: &ChcExpr, bound: &HashSet<String>) -> ChcEx
         atoms.remove(k); // one-point: drop the consumed defining equality
         let sub = [(w, val)];
         for a in atoms.iter_mut() {
+            control.poll()?;
             *a = a.substitute(&sub);
         }
     }
-    ChcExpr::and_all(atoms)
+    let result = ChcExpr::and_all(atoms);
+    control.poll()?;
+    Some(result)
 }
 
 /// Variable names of the (simple-variable) predicate arguments `args` (non-`Var`
 /// positions are skipped; `bind_in_args` has already required them all to be
 /// simple vars before this is used).
-fn arg_var_names(args: &[ChcExpr]) -> HashSet<String> {
-    args.iter()
-        .filter_map(|a| match a {
-            ChcExpr::Var(v) => Some(v.name.clone()),
-            _ => None,
-        })
-        .collect()
+fn arg_var_names(args: &[ChcExpr], control: &Control<'_>) -> Option<HashSet<String>> {
+    let mut names = HashSet::new();
+    for arg in args {
+        control.poll()?;
+        if let ChcExpr::Var(var) = arg {
+            names.insert(var.name.clone());
+        }
+    }
+    Some(names)
 }
 
 /// The lowered transition system plus the metadata needed to back-translate the
@@ -878,7 +973,8 @@ enum Val {
 }
 
 /// Mutable CNF builder over a flat SAT variable space.
-struct Builder {
+struct Builder<'a, 'p> {
+    control: &'a Control<'p>,
     blast: BlastWidth,
     next: u32,
     init: Vec<Vec<Literal>>,
@@ -898,7 +994,7 @@ struct Builder {
     consts: HashMap<u32, bool>,
 }
 
-impl Builder {
+impl Builder<'_, '_> {
     fn fresh(&mut self) -> Variable {
         let v = Variable::new(self.next);
         self.next += 1;
@@ -943,15 +1039,29 @@ struct LatchLayout {
     latches: Vec<LatchMeaning>,
 }
 
+#[cfg(test)]
 fn build_latch_layout(
     arg_sorts: &[ChcSort],
     blast: BlastWidth,
     debug: bool,
 ) -> Option<LatchLayout> {
+    let deadline = ay_core::time::Instant::now().checked_add(Duration::from_secs(3600))?;
+    let mut live = || true;
+    build_latch_layout_controlled(arg_sorts, blast, debug, &Control::new(deadline, &mut live))
+}
+
+fn build_latch_layout_controlled(
+    arg_sorts: &[ChcSort],
+    blast: BlastWidth,
+    debug: bool,
+    control: &Control<'_>,
+) -> Option<LatchLayout> {
+    control.poll()?;
     let mut arg_offset = Vec::with_capacity(arg_sorts.len());
     let mut arg_width = Vec::with_capacity(arg_sorts.len());
     let mut total_latches = 0usize;
     for sort in arg_sorts {
+        control.poll()?;
         let Some(width) = blast.sort(sort) else {
             if debug {
                 eprintln!("IC3_LANE: unblastable arg sort {sort:?}");
@@ -976,6 +1086,7 @@ fn build_latch_layout(
 
     let mut latches = Vec::with_capacity(total_latches);
     for (arg, (sort, width)) in arg_sorts.iter().zip(&arg_width).enumerate() {
+        control.poll()?;
         if matches!(sort, ChcSort::Bool) {
             latches.push(LatchMeaning { arg, bit: None });
         } else {
@@ -992,14 +1103,38 @@ fn build_latch_layout(
     })
 }
 
+#[cfg(test)]
 fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
+    let deadline = ay_core::time::Instant::now().checked_add(Duration::from_secs(3600))?;
+    let mut keep_going = || true;
+    lower_loop_controlled(problem, blast, &Control::new(deadline, &mut keep_going))
+}
+
+fn lower_loop_controlled(
+    problem: &ChcProblem,
+    blast: BlastWidth,
+    control: &Control<'_>,
+) -> Option<Lowering> {
+    control.poll()?;
+    let result = lower_loop_inner(problem, blast, control)?;
+    // The rewritten problem, encoder maps and unsliced scratch are gone.
+    control.poll()?;
+    Some(result)
+}
+
+fn lower_loop_inner(
+    problem: &ChcProblem,
+    blast: BlastWidth,
+    control: &Control<'_>,
+) -> Option<Lowering> {
+    control.poll()?;
     // (a) LINEARIZE: collapse a multi-block CFG to a single recursive predicate.
     // A single-predicate problem is already in the driven form.
     let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     let linearized;
     let mut orig_header: Option<PredicateId> = None;
     let problem: &ChcProblem = if problem.predicates().len() > 1 {
-        match linearize_to_single_loop(problem) {
+        match linearize::linearize_to_single_loop(problem, control) {
             Some((l, header)) => {
                 orig_header = Some(header);
                 linearized = l;
@@ -1040,7 +1175,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
         arg_offset,
         arg_width,
         latches,
-    } = build_latch_layout(&pred.arg_sorts, blast, dbg)?;
+    } = build_latch_layout_controlled(&pred.arg_sorts, blast, dbg, control)?;
     let total_latches = latches.len();
 
     // Partition clauses.
@@ -1048,6 +1183,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     let mut transitions = Vec::new();
     let mut queries = Vec::new();
     for clause in problem.clauses() {
+        control.poll()?;
         let body_preds = &clause.body.predicates;
         match &clause.head {
             ClauseHead::Predicate(h, args) if *h == pid => {
@@ -1114,6 +1250,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
         .map(Variable::new)
         .collect();
     let mut b = Builder {
+        control,
         blast,
         next: 2 * total_latches as u32,
         init: Vec::new(),
@@ -1141,6 +1278,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     {
         let mut fact_lits: Vec<Literal> = Vec::with_capacity(facts.len());
         for (args, constraint) in &facts {
+            control.poll()?;
             if args.len() != arity {
                 return None;
             }
@@ -1148,6 +1286,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
             // f_k = /\_i (latch_i == arg_i) [/\ constraint]. Seed with `true`.
             let mut f_k = mk_const(&mut b, Target::Init, true);
             for (i, a) in args.iter().enumerate() {
+                control.poll()?;
                 let v = encode(a, &mut env, &mut b, Target::Init)?;
                 let eq = match &v {
                     Val::Bool(lit) => {
@@ -1217,6 +1356,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
         // every out arg to a per-latch `Val`.
         let mut per_trans: Vec<(Literal, Vec<Val>)> = Vec::with_capacity(transitions.len());
         for (in_args, out_args, constraint) in &transitions {
+            control.poll()?;
             if in_args.len() != arity || out_args.len() != arity {
                 return None;
             }
@@ -1228,12 +1368,14 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
                 &arg_width,
                 blast,
                 &mut env,
+                control,
             )?;
             let guard = match constraint {
                 // Resolve any loaded-cell temps back onto this transition's in-args so
                 // the guard is over current-state latches, not freshly-minted free bits.
                 Some(c) => {
-                    let resolved = resolve_temps_to_args(c, &arg_var_names(in_args));
+                    let resolved =
+                        resolve_temps_to_args(c, &arg_var_names(in_args, control)?, control)?;
                     encode_bool(&resolved, &mut env, &mut b, Target::Trans)?
                 }
                 None => mk_const(&mut b, Target::Trans, true),
@@ -1243,6 +1385,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
             let sel = mk_and(&mut b, Target::Trans, s_t, guard);
             let mut outs = Vec::with_capacity(arity);
             for a in out_args.iter() {
+                control.poll()?;
                 outs.push(encode(a, &mut env, &mut b, Target::Trans)?);
             }
             per_trans.push((sel, outs));
@@ -1250,10 +1393,14 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
         // For each latch/arg position, build the priority-ITE chain across transitions
         // with the current state as the final (stutter) else.
         for i in 0..arity {
+            control.poll()?;
             let per: Vec<(Literal, &Val)> = per_trans
                 .iter()
-                .map(|(sel, outs)| (*sel, &outs[i]))
-                .collect();
+                .map(|(sel, outs)| {
+                    control.poll()?;
+                    Some((*sel, &outs[i]))
+                })
+                .collect::<Option<Vec<_>>>()?;
             gate_next_disjunctive(
                 &mut b,
                 &state_vars,
@@ -1268,17 +1415,26 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     // --- Bad/query: OR of all query bodies (over current state) ---
     let mut disjunct_lits = Vec::new();
     for (args, constraint) in &queries {
+        control.poll()?;
         if args.len() != arity {
             return None;
         }
         let mut env: HashMap<String, Val> = HashMap::new();
-        bind_in_args(args, &state_vars, &arg_offset, &arg_width, blast, &mut env)?;
+        bind_in_args(
+            args,
+            &state_vars,
+            &arg_offset,
+            &arg_width,
+            blast,
+            &mut env,
+            control,
+        )?;
         let lit = match constraint {
             // Resolve the assert-condition temp chain (`la == acc`, `lc == count`,
             // `Not(la == (lc & 1 == 1))`) down onto the query's arg vars so `bad`
             // fans into the acc/count[0] latches instead of fresh free bits.
             Some(c) => {
-                let resolved = resolve_temps_to_args(c, &arg_var_names(args));
+                let resolved = resolve_temps_to_args(c, &arg_var_names(args, control)?, control)?;
                 encode_bool(&resolved, &mut env, &mut b, Target::Both)?
             }
             None => {
@@ -1294,9 +1450,11 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     c1.extend(disjunct_lits.iter().copied());
     let mut def_clauses = vec![c1];
     for l in &disjunct_lits {
+        control.poll()?;
         def_clauses.push(vec![l.negated(), Literal::positive(bad)]);
     }
     for c in &def_clauses {
+        control.poll()?;
         b.init.push(c.clone());
         b.trans.push(c.clone());
     }
@@ -1308,8 +1466,11 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
         .arg_sorts
         .iter()
         .enumerate()
-        .map(|(i, s)| ChcVar::new(format!("__ic3_p{i}"), s.clone()))
-        .collect();
+        .map(|(i, s)| {
+            control.poll()?;
+            Some(ChcVar::new(format!("__ic3_p{i}"), s.clone()))
+        })
+        .collect::<Option<Vec<_>>>()?;
 
     // --- CONE-OF-INFLUENCE SLICE of the state latches ---
     //
@@ -1328,7 +1489,7 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     // behaviours, so a sliced `Safe` implies the unsliced system is safe too. And
     // the back-translated candidate is re-validated word-level downstream, so a
     // too-aggressive slice can at worst miss a proof, never forge one.
-    let coi = coi_state_latches(&b.deps, &bad_literals, total_latches);
+    let coi = coi_state_latches(&b.deps, &bad_literals, total_latches, control)?;
     let coi_idx: Vec<usize> = (0..total_latches).filter(|&i| coi[i]).collect();
 
     // SOUNDNESS/ROBUSTNESS GUARD: decline when `bad` can be satisfiable yet fans in
@@ -1342,7 +1503,14 @@ fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     // with a clean `None`). We do NOT decline when `bad` is identically false (all
     // disjuncts fold to `false`): that is a genuinely safe empty query IC3 discharges
     // trivially.
-    let bad_maybe_sat = disjunct_lits.iter().any(|l| b.cval(*l) != Some(false));
+    let mut bad_maybe_sat = false;
+    for lit in &disjunct_lits {
+        control.poll()?;
+        if b.cval(*lit) != Some(false) {
+            bad_maybe_sat = true;
+            break;
+        }
+    }
     if total_latches > 0 && coi_idx.is_empty() && bad_maybe_sat {
         if dbg {
             eprintln!(
@@ -1422,331 +1590,12 @@ struct WClause {
 /// second element is the ORIGINAL predicate id of the surviving loop header (the
 /// `r` below, before it is remapped to a fresh id in the collapsed problem). The
 /// caller needs it to LIFT the header invariant back onto every original
-/// predicate (see [`lift_header_to_full_model`]).
+/// predicate (see [`lift_header_to_full_model_controlled`]).
+#[cfg(test)]
 fn linearize_to_single_loop(problem: &ChcProblem) -> Option<(ChcProblem, PredicateId)> {
-    let mut clauses: Vec<WClause> = problem
-        .clauses()
-        .iter()
-        .map(|c| WClause {
-            body: c.body.predicates.clone(),
-            constraint: c.body.constraint.clone(),
-            head: c.head.clone(),
-        })
-        .collect();
-
-    // Protect the loop header(s) so the *header* survives each loop SCC (its
-    // invariant is the one stated at the loop head, e.g. `acc <=> count[0]`). A
-    // header is a recursive predicate with an in-edge from outside its SCC
-    // (the entry edge); if an SCC has no such member, its lowest-id member is
-    // protected. Computed once over the original call graph; ids are stable
-    // until the final rebuild.
-    let protected = protected_headers(&clauses);
-
-    let mut suffix_ctr: usize = 0;
-    loop {
-        // Pick any still-referenced predicate that is not *directly* self-
-        // recursive and not a protected header. Eliminating it preserves the
-        // loop structure: when the penultimate SCC member is removed, the
-        // resolvent makes the protected header self-recursive, so exactly one
-        // recursive predicate per loop remains.
-        let referenced = collect_referenced(&clauses);
-        let candidate = referenced
-            .iter()
-            .copied()
-            .find(|&q| !is_self_recursive(&clauses, q) && !protected.contains(&q));
-        let Some(q) = candidate else { break };
-        eliminate(&mut clauses, q, &mut suffix_ctr)?;
-    }
-
-    // All survivors must now be directly self-recursive; require exactly one.
-    let referenced = collect_referenced(&clauses);
-    if referenced.len() != 1 {
-        return None;
-    }
-    let r = referenced[0];
-
-    // Rebuild a single-predicate problem; remap the survivor to its fresh id.
-    let r_pred = problem.get_predicate(r)?;
-    let mut out = ChcProblem::new();
-    let new_pid = out.declare_predicate(r_pred.name.clone(), r_pred.arg_sorts.clone());
-
-    for wc in clauses {
-        let mut body = Vec::with_capacity(wc.body.len());
-        for (p, args) in wc.body {
-            if p != r {
-                return None; // a non-survivor predicate leaked: unsupported
-            }
-            body.push((new_pid, args));
-        }
-        let head = match wc.head {
-            ClauseHead::Predicate(h, args) => {
-                if h != r {
-                    return None;
-                }
-                ClauseHead::Predicate(new_pid, args)
-            }
-            ClauseHead::False => ClauseHead::False,
-        };
-        out.add_clause(HornClause::new(ClauseBody::new(body, wc.constraint), head));
-    }
-    Some((out, r))
-}
-
-/// Predicates that appear in any clause head or body, first-seen order.
-fn collect_referenced(clauses: &[WClause]) -> Vec<PredicateId> {
-    let mut seen = Vec::new();
-    let push = |p: PredicateId, seen: &mut Vec<PredicateId>| {
-        if !seen.contains(&p) {
-            seen.push(p);
-        }
-    };
-    for c in clauses {
-        for (p, _) in &c.body {
-            push(*p, &mut seen);
-        }
-        if let ClauseHead::Predicate(h, _) = &c.head {
-            push(*h, &mut seen);
-        }
-    }
-    seen
-}
-
-/// Whether `q` appears in the body of one of its own defining clauses.
-fn is_self_recursive(clauses: &[WClause], q: PredicateId) -> bool {
-    clauses.iter().any(|c| {
-        matches!(&c.head, ClauseHead::Predicate(h, _) if *h == q)
-            && c.body.iter().any(|(p, _)| *p == q)
-    })
-}
-
-/// Loop headers to protect from elimination: one representative per nontrivial
-/// SCC of the predicate call graph (preferring a member with an external
-/// predecessor — the natural loop head). Eliminating everything else collapses
-/// each loop SCC onto its header, whose invariant is the loop-head invariant.
-fn protected_headers(clauses: &[WClause]) -> HashSet<PredicateId> {
-    // Call-graph adjacency: body predicate `q` -> head predicate `h`.
-    let mut adj: HashMap<PredicateId, HashSet<PredicateId>> = HashMap::new();
-    let mut nodes: HashSet<PredicateId> = HashSet::new();
-    for c in clauses {
-        for (q, _) in &c.body {
-            nodes.insert(*q);
-        }
-        if let ClauseHead::Predicate(h, _) = &c.head {
-            nodes.insert(*h);
-            for (q, _) in &c.body {
-                adj.entry(*q).or_default().insert(*h);
-            }
-        }
-    }
-
-    // Forward reachability per node (transitive closure via DFS).
-    let reach_of: HashMap<PredicateId, HashSet<PredicateId>> = nodes
-        .iter()
-        .map(|&start| {
-            let mut seen = HashSet::new();
-            let mut stack = vec![start];
-            while let Some(n) = stack.pop() {
-                if let Some(succ) = adj.get(&n) {
-                    for &m in succ {
-                        if seen.insert(m) {
-                            stack.push(m);
-                        }
-                    }
-                }
-            }
-            (start, seen)
-        })
-        .collect();
-
-    let recursive = |p: PredicateId| reach_of[&p].contains(&p);
-    let same_scc =
-        |p: PredicateId, q: PredicateId| reach_of[&p].contains(&q) && reach_of[&q].contains(&p);
-
-    let mut protected: HashSet<PredicateId> = HashSet::new();
-    // Headers: recursive predicate with a predecessor outside its SCC.
-    for c in clauses {
-        if let ClauseHead::Predicate(h, _) = &c.head {
-            if recursive(*h) && c.body.iter().any(|(q, _)| !same_scc(*h, *q)) {
-                protected.insert(*h);
-            }
-        }
-    }
-    // Ensure every nontrivial SCC has a protected member (fallback: lowest id).
-    let recs: Vec<PredicateId> = nodes.iter().copied().filter(|&p| recursive(p)).collect();
-    for &p in &recs {
-        let scc: Vec<PredicateId> = recs.iter().copied().filter(|&q| same_scc(p, q)).collect();
-        if !scc.iter().any(|m| protected.contains(m)) {
-            if let Some(&m) = scc.iter().min_by_key(|m| m.index()) {
-                protected.insert(m);
-            }
-        }
-    }
-    protected
-}
-
-/// Resolve away predicate `q`: replace every use of `q` in a body with each of
-/// `q`'s definitions, then drop `q`'s defining clauses. `q` must not be directly
-/// self-recursive (guaranteed by the caller).
-fn eliminate(clauses: &mut Vec<WClause>, q: PredicateId, ctr: &mut usize) -> Option<()> {
-    let defs: Vec<WClause> = clauses
-        .iter()
-        .filter(|c| matches!(&c.head, ClauseHead::Predicate(h, _) if *h == q))
-        .cloned()
-        .collect();
-
-    let mut out = Vec::new();
-    for c in std::mem::take(clauses) {
-        if matches!(&c.head, ClauseHead::Predicate(h, _) if *h == q) {
-            continue; // a definition of q: consumed by resolution
-        }
-        let occ: Vec<usize> = c
-            .body
-            .iter()
-            .enumerate()
-            .filter(|(_, (p, _))| *p == q)
-            .map(|(i, _)| i)
-            .collect();
-        match occ.len() {
-            0 => out.push(c),
-            1 => {
-                let j = occ[0];
-                if defs.is_empty() {
-                    // q is unconstrained (no definition): treat as `true` and
-                    // drop the body occurrence (sound over-approximation; a
-                    // missed candidate at worst).
-                    let mut cc = c.clone();
-                    cc.body.remove(j);
-                    out.push(cc);
-                } else {
-                    for d in &defs {
-                        *ctr += 1;
-                        out.push(resolve(&c, j, d, q, *ctr)?);
-                    }
-                }
-            }
-            _ => return None, // same predicate twice in one body: unsupported
-        }
-    }
-    *clauses = out;
-    Some(())
-}
-
-/// Resolvent of use-clause `u` (body slot `j` is `q(s)`) against definition `d`
-/// (head `q(t)`), by SUBSTITUTION (proper Gaussian/unfold elimination): the use
-/// arguments `s` must be distinct simple variables, so unifying `q(s)` with the
-/// definition's `q(t)` is the substitution `σ = {s_k ↦ t_k}`. `σ` is applied to
-/// the rest of `u` (its other body predicates, constraint, and head); `d`'s body
-/// and constraint (variables renamed fresh to avoid capture) are spliced in.
-///
-/// Substitution (rather than introducing equalities) keeps the data-flow
-/// (e.g. `count + 1`) inside the resulting *head arguments* as explicit
-/// expressions, leaving the residual constraint a PURE GUARD over current-state
-/// variables. That separation lets the transition be lowered with a stuttering
-/// guard (a total transition that never constrains the current state) instead of
-/// a hard current-state assertion that would hide states from the model checker.
-fn resolve(u: &WClause, j: usize, d: &WClause, q: PredicateId, ctr: usize) -> Option<WClause> {
-    // Use arguments must be distinct simple variables for substitution.
-    let s = &u.body[j].1;
-    let mut names: Vec<String> = Vec::with_capacity(s.len());
-    for a in s {
-        match a {
-            ChcExpr::Var(v) => {
-                if names.contains(&v.name) {
-                    return None; // repeated argument variable: unsupported
-                }
-                names.push(v.name.clone());
-            }
-            _ => return None, // non-variable argument: unsupported
-        }
-    }
-
-    let suf = format!("$e{ctr}");
-    let d_body: Vec<(PredicateId, Vec<ChcExpr>)> = d
-        .body
-        .iter()
-        .map(|(p, args)| (*p, args.iter().map(|a| rename_expr(a, &suf)).collect()))
-        .collect();
-    let d_constraint = d.constraint.as_ref().map(|c| rename_expr(c, &suf));
-    let t: Vec<ChcExpr> = match &d.head {
-        ClauseHead::Predicate(h, args) if *h == q => {
-            args.iter().map(|a| rename_expr(a, &suf)).collect()
-        }
-        _ => return None,
-    };
-    if t.len() != names.len() {
-        return None;
-    }
-    let sigma: HashMap<String, ChcExpr> = names.into_iter().zip(t).collect();
-
-    let mut body = Vec::with_capacity(u.body.len() - 1 + d_body.len());
-    for (k, (p, args)) in u.body.iter().enumerate() {
-        if k == j {
-            continue;
-        }
-        body.push((*p, args.iter().map(|a| subst_expr(a, &sigma)).collect()));
-    }
-    body.extend(d_body);
-
-    let mut conj = Vec::new();
-    if let Some(c) = &u.constraint {
-        conj.push(subst_expr(c, &sigma));
-    }
-    if let Some(c) = d_constraint {
-        conj.push(c);
-    }
-
-    let head = match &u.head {
-        ClauseHead::Predicate(h, args) => {
-            ClauseHead::Predicate(*h, args.iter().map(|a| subst_expr(a, &sigma)).collect())
-        }
-        ClauseHead::False => ClauseHead::False,
-    };
-
-    Some(WClause {
-        body,
-        constraint: and_of(conj),
-        head,
-    })
-}
-
-/// Substitute variables by name with their mapped expressions.
-fn subst_expr(e: &ChcExpr, sigma: &HashMap<String, ChcExpr>) -> ChcExpr {
-    match e {
-        ChcExpr::Var(v) => sigma.get(&v.name).cloned().unwrap_or_else(|| e.clone()),
-        ChcExpr::Op(op, args) => ChcExpr::Op(
-            *op,
-            args.iter()
-                .map(|a| Arc::new(subst_expr(a, sigma)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// Conjoin a list of constraints (`None` for the empty conjunction = `true`).
-fn and_of(mut conj: Vec<ChcExpr>) -> Option<ChcExpr> {
-    match conj.len() {
-        0 => None,
-        1 => Some(conj.pop().unwrap()),
-        _ => Some(ChcExpr::Op(
-            ChcOp::And,
-            conj.into_iter().map(Arc::new).collect(),
-        )),
-    }
-}
-
-/// Rename every variable in `e` by appending `suf` (avoids capture when a
-/// definition clause is spliced into a use clause). Only `Var`/`Op` carry
-/// variables in linearized constraints; other leaves are cloned unchanged.
-fn rename_expr(e: &ChcExpr, suf: &str) -> ChcExpr {
-    match e {
-        ChcExpr::Var(v) => ChcExpr::Var(ChcVar::new(format!("{}{}", v.name, suf), v.sort.clone())),
-        ChcExpr::Op(op, args) => ChcExpr::Op(
-            *op,
-            args.iter().map(|a| Arc::new(rename_expr(a, suf))).collect(),
-        ),
-        other => other.clone(),
-    }
+    let mut keep_going = || true;
+    let deadline = ay_core::time::Instant::now().checked_add(Duration::from_secs(3600))?;
+    linearize::linearize_to_single_loop(problem, &Control::new(deadline, &mut keep_going))
 }
 
 /// Bind the recursive-call (`in`) argument variables to their current-state
@@ -1759,8 +1608,10 @@ fn bind_in_args(
     arg_width: &[usize],
     blast: BlastWidth,
     env: &mut HashMap<String, Val>,
+    control: &Control<'_>,
 ) -> Option<()> {
     for (i, a) in args.iter().enumerate() {
+        control.poll()?;
         match a {
             ChcExpr::Var(v) => {
                 let w = blast.sort(&v.sort)?;
@@ -1806,7 +1657,7 @@ fn bind_in_args(
 /// the `Val` it writes to THIS latch/arg position. `Val::Bool` requires `width == 1`
 /// and `Val::Int` a `width`-bit vector.
 fn gate_next_disjunctive(
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     state_vars: &[Variable],
     next_vars: &[Variable],
     offset: usize,
@@ -1814,10 +1665,12 @@ fn gate_next_disjunctive(
     per_transition: &[(Literal, &Val)],
 ) -> Option<()> {
     for bit in 0..width {
+        b.control.poll()?;
         // Fold from the innermost stutter (current bit) outwards so transition 1 is
         // the outermost (highest-priority) ITE — iterate transitions in reverse.
         let mut chain = Literal::positive(state_vars[offset + bit]);
         for (sel, v) in per_transition.iter().rev() {
+            b.control.poll()?;
             let out_bit = match v {
                 Val::Bool(lit) => {
                     if width != 1 {
@@ -1846,12 +1699,12 @@ fn gate_next_disjunctive(
 }
 
 /// Append `o <=> l` clauses to the given target.
-fn iff_clause(b: &mut Builder, target: Target, o: Literal, l: Literal) {
+fn iff_clause(b: &mut Builder<'_, '_>, target: Target, o: Literal, l: Literal) {
     push_target(b, target, vec![o.negated(), l]);
     push_target(b, target, vec![l.negated(), o]);
 }
 
-fn push_target(b: &mut Builder, target: Target, clause: Vec<Literal>) {
+fn push_target(b: &mut Builder<'_, '_>, target: Target, clause: Vec<Literal>) {
     match target {
         Target::Init => b.init.push(clause),
         Target::Trans => b.trans.push(clause),
@@ -1867,7 +1720,7 @@ fn push_target(b: &mut Builder, target: Target, clause: Vec<Literal>) {
 // ---------------------------------------------------------------------------
 
 /// A literal whose value is forced to `val` via a unit clause.
-fn mk_const(b: &mut Builder, target: Target, val: bool) -> Literal {
+fn mk_const(b: &mut Builder<'_, '_>, target: Target, val: bool) -> Literal {
     let f = b.fresh();
     let lit = Literal::positive(f);
     push_target(b, target, vec![if val { lit } else { lit.negated() }]);
@@ -1879,7 +1732,7 @@ fn mk_const(b: &mut Builder, target: Target, val: bool) -> Literal {
 /// `o <=> (a /\ c)`, constant-folded: `a & false = false`, `a & true = a`. When
 /// a const operand collapses the gate there is NO fan-in to the other operand,
 /// so the cone-of-influence does not mark dead masked bits live.
-fn mk_and(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
+fn mk_and(b: &mut Builder<'_, '_>, target: Target, a: Literal, c: Literal) -> Literal {
     match (b.cval(a), b.cval(c)) {
         (Some(false), _) | (_, Some(false)) => return mk_const(b, target, false),
         (Some(true), Some(true)) => return mk_const(b, target, true),
@@ -1897,7 +1750,7 @@ fn mk_and(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
 }
 
 /// `o <=> (a \/ c)`, constant-folded: `a | true = true`, `a | false = a`.
-fn mk_or(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
+fn mk_or(b: &mut Builder<'_, '_>, target: Target, a: Literal, c: Literal) -> Literal {
     match (b.cval(a), b.cval(c)) {
         (Some(true), _) | (_, Some(true)) => return mk_const(b, target, true),
         (Some(false), Some(false)) => return mk_const(b, target, false),
@@ -1916,7 +1769,7 @@ fn mk_or(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
 
 /// `o <=> (a == c)` (XNOR), constant-folded: `true == c` is `c`, `false == c`
 /// is `!c`.
-fn mk_xnor(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
+fn mk_xnor(b: &mut Builder<'_, '_>, target: Target, a: Literal, c: Literal) -> Literal {
     match (b.cval(a), b.cval(c)) {
         (Some(x), Some(y)) => return mk_const(b, target, x == y),
         (Some(true), _) => return c,
@@ -1936,12 +1789,18 @@ fn mk_xnor(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
 }
 
 /// `o <=> (a != c)` (XOR).
-fn mk_xor(b: &mut Builder, target: Target, a: Literal, c: Literal) -> Literal {
+fn mk_xor(b: &mut Builder<'_, '_>, target: Target, a: Literal, c: Literal) -> Literal {
     mk_xnor(b, target, a, c).negated()
 }
 
 /// `o <=> (s ? th : el)`, constant-folded on the selector and on equal branches.
-fn mk_ite(b: &mut Builder, target: Target, s: Literal, th: Literal, el: Literal) -> Literal {
+fn mk_ite(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    s: Literal,
+    th: Literal,
+    el: Literal,
+) -> Literal {
     match b.cval(s) {
         Some(true) => return th,
         Some(false) => return el,
@@ -1964,7 +1823,12 @@ fn mk_ite(b: &mut Builder, target: Target, s: Literal, th: Literal, el: Literal)
 
 /// Little-endian ripple-carry adder, wrapping at the operand width (carry-out
 /// discarded). `a` and `c` must be the same length.
-fn ripple_add(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> Vec<Literal> {
+fn ripple_add(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    a: &[Literal],
+    c: &[Literal],
+) -> Vec<Literal> {
     let mut carry = mk_const(b, target, false);
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
@@ -1985,7 +1849,12 @@ fn bit_not(a: &[Literal]) -> Vec<Literal> {
 
 /// Two's-complement subtraction `a - c`, wrapping at the operand width
 /// (`a + ~c + 1`). `a` and `c` must be the same length.
-fn ripple_sub(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> Vec<Literal> {
+fn ripple_sub(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    a: &[Literal],
+    c: &[Literal],
+) -> Vec<Literal> {
     let nc = bit_not(c);
     let mut carry = mk_const(b, target, true);
     let mut out = Vec::with_capacity(a.len());
@@ -2001,21 +1870,21 @@ fn ripple_sub(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> 
 }
 
 /// Two's-complement negation `-a` (`~a + 1`).
-fn ripple_neg(b: &mut Builder, target: Target, a: &[Literal]) -> Vec<Literal> {
+fn ripple_neg(b: &mut Builder<'_, '_>, target: Target, a: &[Literal]) -> Vec<Literal> {
     let zero: Vec<Literal> = (0..a.len()).map(|_| mk_const(b, target, false)).collect();
     ripple_sub(b, target, &zero, a)
 }
 
 /// Per-bit binary gate over equal-length operands.
 fn bitwise<F>(
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
     a: &[Literal],
     c: &[Literal],
     f: F,
 ) -> Option<Vec<Literal>>
 where
-    F: Fn(&mut Builder, Target, Literal, Literal) -> Literal,
+    F: Fn(&mut Builder<'_, '_>, Target, Literal, Literal) -> Literal,
 {
     if a.len() != c.len() {
         return None;
@@ -2024,7 +1893,12 @@ where
 }
 
 /// `o <=> (a == c)` over equal-length bit vectors (AND of per-bit XNOR).
-fn int_eq(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> Option<Literal> {
+fn int_eq(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    a: &[Literal],
+    c: &[Literal],
+) -> Option<Literal> {
     if a.len() != c.len() {
         return None;
     }
@@ -2037,7 +1911,12 @@ fn int_eq(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> Opti
 }
 
 /// `o <=> (a < c)` unsigned, over equal-length bit vectors (LSB-first ripple).
-fn unsigned_lt(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) -> Option<Literal> {
+fn unsigned_lt(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    a: &[Literal],
+    c: &[Literal],
+) -> Option<Literal> {
     if a.len() != c.len() {
         return None;
     }
@@ -2053,7 +1932,7 @@ fn unsigned_lt(b: &mut Builder, target: Target, a: &[Literal], c: &[Literal]) ->
 
 /// Little-endian bits of the integer constant `c` at `width` bits (low bits,
 /// two's-complement for negatives).
-fn int_const_bits(b: &mut Builder, target: Target, c: i128, width: usize) -> Vec<Literal> {
+fn int_const_bits(b: &mut Builder<'_, '_>, target: Target, c: i128, width: usize) -> Vec<Literal> {
     // Bit-preserving reinterpretation (i128 -> u128, not a lossy narrowing);
     // the low-bit window is this untrusted lane's documented blast semantics
     // (candidates are re-validated word-level, see module docs).
@@ -2064,7 +1943,12 @@ fn int_const_bits(b: &mut Builder, target: Target, c: i128, width: usize) -> Vec
 }
 
 /// Little-endian bits of the bit-vector constant `value` at `width` bits.
-fn bv_const_bits(b: &mut Builder, target: Target, value: u128, width: usize) -> Vec<Literal> {
+fn bv_const_bits(
+    b: &mut Builder<'_, '_>,
+    target: Target,
+    value: u128,
+    width: usize,
+) -> Vec<Literal> {
     (0..width)
         .map(|i| mk_const(b, target, (value >> i) & 1 == 1))
         .collect()
@@ -2077,9 +1961,10 @@ fn bv_const_bits(b: &mut Builder, target: Target, value: u128, width: usize) -> 
 fn encode(
     expr: &ChcExpr,
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
 ) -> Option<Val> {
+    b.control.poll()?;
     let int_width = b.blast.cap;
     match expr {
         ChcExpr::Bool(v) => Some(Val::Bool(mk_const(b, target, *v))),
@@ -2102,7 +1987,11 @@ fn encode(
     }
 }
 
-fn lookup_or_fresh_bool(name: &str, env: &mut HashMap<String, Val>, b: &mut Builder) -> Literal {
+fn lookup_or_fresh_bool(
+    name: &str,
+    env: &mut HashMap<String, Val>,
+    b: &mut Builder<'_, '_>,
+) -> Literal {
     if let Some(Val::Bool(l)) = env.get(name) {
         return *l;
     }
@@ -2115,7 +2004,7 @@ fn lookup_or_fresh_bits(
     name: &str,
     width: usize,
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
 ) -> Vec<Literal> {
     if let Some(Val::Int(bits)) = env.get(name) {
         if bits.len() == width {
@@ -2130,7 +2019,7 @@ fn lookup_or_fresh_bits(
 fn encode_bool(
     expr: &ChcExpr,
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
 ) -> Option<Literal> {
     match encode(expr, env, b, target)? {
@@ -2142,7 +2031,7 @@ fn encode_bool(
 fn encode_int(
     expr: &ChcExpr,
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
 ) -> Option<Vec<Literal>> {
     match encode(expr, env, b, target)? {
@@ -2155,7 +2044,7 @@ fn encode_op(
     op: ChcOp,
     args: &[Arc<ChcExpr>],
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
 ) -> Option<Val> {
     match op {
@@ -2168,10 +2057,12 @@ fn encode_op(
         ChcOp::And | ChcOp::Or => {
             let mut lits = Vec::with_capacity(args.len());
             for a in args {
+                b.control.poll()?;
                 lits.push(encode_bool(a, env, b, target)?);
             }
             let mut acc = mk_const(b, target, matches!(op, ChcOp::And));
             for l in lits {
+                b.control.poll()?;
                 acc = if matches!(op, ChcOp::And) {
                     mk_and(b, target, acc, l)
                 } else {
@@ -2337,12 +2228,12 @@ fn encode_op(
 fn binary_int<F>(
     args: &[Arc<ChcExpr>],
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
     f: F,
 ) -> Option<Val>
 where
-    F: Fn(&mut Builder, Target, &[Literal], &[Literal]) -> Option<Vec<Literal>>,
+    F: Fn(&mut Builder<'_, '_>, Target, &[Literal], &[Literal]) -> Option<Vec<Literal>>,
 {
     if args.len() != 2 {
         return None;
@@ -2356,12 +2247,12 @@ where
 fn binary_cmp<F>(
     args: &[Arc<ChcExpr>],
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
     f: F,
 ) -> Option<Val>
 where
-    F: Fn(&mut Builder, Target, &[Literal], &[Literal]) -> Option<Literal>,
+    F: Fn(&mut Builder<'_, '_>, Target, &[Literal], &[Literal]) -> Option<Literal>,
 {
     if args.len() != 2 {
         return None;
@@ -2375,7 +2266,7 @@ where
 fn shift_by_const(
     args: &[Arc<ChcExpr>],
     env: &mut HashMap<String, Val>,
-    b: &mut Builder,
+    b: &mut Builder<'_, '_>,
     target: Target,
     left: bool,
 ) -> Option<Val> {
@@ -2446,7 +2337,9 @@ fn coi_state_latches(
     deps: &HashMap<u32, Vec<u32>>,
     bad_literals: &[Literal],
     total_latches: usize,
-) -> Vec<bool> {
+    control: &Control<'_>,
+) -> Option<Vec<bool>> {
+    control.poll()?;
     let mut in_coi = vec![false; total_latches];
     let mut visited: HashSet<u32> = HashSet::new();
     // Combinational worklist of gate-output vars to expand backward.
@@ -2455,6 +2348,7 @@ fn coi_state_latches(
         .map(|l| l.variable().index() as u32)
         .collect();
     while let Some(v) = stack.pop() {
+        control.poll()?;
         if (v as usize) < total_latches {
             // A state latch read by the cone: record it and seed its next-state
             // gate so its temporal update (and that gate's inputs) join the COI.
@@ -2470,14 +2364,19 @@ fn coi_state_latches(
         }
         if let Some(inputs) = deps.get(&v) {
             for &inp in inputs {
+                control.poll()?;
                 stack.push(inp);
             }
         }
     }
-    in_coi
+    control.poll()?;
+    Some(in_coi)
 }
 
 // ---------------------------------------------------------------------------
 // Back-translation.
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod control_tests;

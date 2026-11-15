@@ -43,19 +43,33 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             self.emit_conflict_unknown(round);
             return ExtPropagateResult::none();
         }
-        let Some(mut clause) = self.map_conflict_clause(&conflict.literals, ConflictOrigin::Farkas)
+        // Farkas origin never mints. Require an actually falsified clause;
+        // unassigned mappings cannot use the coefficient-aligned proof path.
+        let Some(super::conflict::MappedConflict::Falsified(mut clause)) =
+            self.map_conflict_clause(&conflict.literals, ConflictOrigin::Farkas, round.ctx)
         else {
             self.emit_conflict_unknown(round);
             return ExtPropagateResult::none();
         };
-        let mut removed = conflict.farkas.as_ref().map_or(0, |annotation| {
-            let mut coefficients = annotation.coefficients.clone();
-            crate::theory_inference::minimize_farkas_conflict(&mut clause, &mut coefficients)
-        });
-        removed +=
-            crate::theory_inference::minimize_conflict_with_levels(&mut clause, |variable| {
-                round.ctx.var_level(variable)
-            });
+        // A downgraded certificate does not authorize projection by its zero
+        // weights. Classify/retain the whole validated literal explanation.
+        let mut removed = 0;
+        let policy = if self.proof.is_some() {
+            crate::theory_inference::ConflictClausePolicy::PreserveLiterals
+        } else {
+            crate::theory_inference::ConflictClausePolicy::Deduplicate
+        };
+        match crate::theory_inference::minimize_conflict_clause(&mut clause, policy) {
+            crate::theory_inference::ConflictClauseReduction::Clause { removed: count } => {
+                removed += count
+            }
+            crate::theory_inference::ConflictClauseReduction::Tautology
+            | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                self.pending_split = Some(TheoryResult::Unknown);
+                self.emit_conflict_unknown(round);
+                return ExtPropagateResult::none();
+            }
+        }
         self.eager_stats.theory_minimize_lits_removed += removed as u64;
         self.finish_theory_conflict(clause, round, ConflictOrigin::Farkas)
     }
@@ -103,7 +117,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         let Some(terms) = self.terms else {
             return true;
         };
-        if let Err(error) = self.verify_conflict_semantic_memo(&conflict.literals, terms, false) {
+        if let Err(error) = self.verify_conflict_semantic_memo(&conflict.literals, terms, None) {
             tracing::error!(
                 error = %error,
                 conflict_len = conflict.literals.len(),

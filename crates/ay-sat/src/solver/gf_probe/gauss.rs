@@ -6,7 +6,7 @@
 //! linear-equation fitting and dense Gaussian elimination. Pure functions on
 //! small `u8` matrices — no solver state, no dependencies.
 
-use std::time::Instant;
+use super::GfBudget;
 
 /// `base^exp` with overflow checking, bailing above `cap`.
 pub(super) fn checked_pow(base: usize, exp: usize, cap: usize) -> Option<usize> {
@@ -94,7 +94,7 @@ pub(super) fn solve_linear_system(
     d: usize,
     n: usize,
     eqs: &[(Vec<u32>, Vec<u8>, u8)],
-    deadline: Instant,
+    deadline: &GfBudget,
 ) -> Option<Vec<u8>> {
     let dp = d as u8;
     let m = eqs.len();
@@ -121,9 +121,10 @@ pub(super) fn solve_linear_system(
         // Per-pivot deadline check: worst-case a pivot column costs O(m*n)
         // u8 operations, which bounds the check granularity at ~10ms even at
         // the structural caps.
-        if Instant::now() >= deadline {
+        if deadline.exhausted() {
             return None;
         }
+        deadline.charge((m * w) as u64);
         let Some(pr) = (pivot_row..m).find(|&ri| mat[ri * w + col] != 0) else {
             continue;
         };

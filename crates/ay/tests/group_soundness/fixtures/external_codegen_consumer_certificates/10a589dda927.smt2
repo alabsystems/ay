@@ -1,0 +1,8 @@
+(set-option :timeout 10000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const target (_ BitVec 64))
+(declare-const pc (_ BitVec 64))
+(assert (not (= target (bvadd (bvadd (bvand (_ bv18446744073709547520 64) pc) (bvand (_ bv4095 64) target)) (bvsub (bvand (_ bv18446744073709547520 64) target) (bvand (_ bv18446744073709547520 64) pc))))))
+(check-sat)
+(exit)

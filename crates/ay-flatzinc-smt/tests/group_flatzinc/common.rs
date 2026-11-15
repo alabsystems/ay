@@ -3,7 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 use ay_test_support::{
-    build_ay_cli, build_bound_target_name, BuiltWorkspaceBinary, AY_CLI_TARGET_NAME,
+    build_ay_cli, build_bound_target_name, cargo_target_root, BuiltWorkspaceBinary,
+    AY_CLI_TARGET_NAME,
 };
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -46,7 +47,11 @@ pub(crate) fn ay_process_guard() -> MutexGuard<'static, ()> {
 fn exact_cli_lane_runs_without_ay_path_or_ambient_target_binary() {
     let _ay_guard = ay_process_guard();
     let built = exact_ay_cli();
-    let target_root = workspace_root().join("target");
+    // The outer root the test-support crate selected: `<workspace>/target`,
+    // or a workspace-bound namespace under an explicit CARGO_TARGET_DIR
+    // (5bb64b81d). Hardcoding `<workspace>/target` failed every run with its
+    // own CARGO_TARGET_DIR, while the isolation below is what this pins.
+    let target_root = cargo_target_root(&workspace_root());
     assert_eq!(
         built.target_dir.parent(),
         Some(target_root.as_path()),

@@ -85,6 +85,8 @@ struct OwnedDimacsProof {
     published: Option<PublishedDimacsProof>,
     status_reservation: Option<DimacsProofStatusReservation>,
     invalidation: DimacsPublicationInvalidation,
+    /// What an exit that cannot take this registry's lock can reach.
+    custody: Arc<DimacsProofCustody>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -94,6 +96,9 @@ struct DimacsProofStatusReservation {
     lock_path: PathBuf,
     lock_descriptor: File,
     lock_identity: ProofFileIdentity,
+    /// Reachable by an exit wherever the run holds the reservation
+    /// (status_custody.rs).
+    custody: Arc<DimacsStatusCustody>,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -107,6 +112,7 @@ struct RetainedDimacsPublication {
     sha256: Sha256Digest,
     label: &'static str,
     invalidation: DimacsPublicationInvalidation,
+    recheck: DimacsPublicationRecheck,
 }
 
 #[derive(Clone, Copy)]
@@ -185,7 +191,7 @@ fn inject_anonymous_dimacs_staging_error_once(raw_os_error: i32) {
     INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR.with(|error| error.set(Some(raw_os_error)));
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn inject_dimacs_rename_noreplace_error_once(raw_os_error: i32) {
     INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.set(Some(raw_os_error)));
 }
@@ -247,9 +253,10 @@ fn resolved_dimacs_proof_path(path: &str) -> io::Result<PathBuf> {
 
 /// Arm the process-exit sweep that releases unpublished proof transactions.
 ///
-/// Called once, when the first proof generation is registered — the moment its
-/// staging file and status lock exist on disk with the registry, a `static`
-/// that runs no destructor, as their only owner. Registration is deliberately
+/// Called once, when the first status transaction is reserved or proof
+/// generation is registered — before its status lock or staging file exists on
+/// disk, where the registry, a `static` that runs no destructor, or a status
+/// custody will be its only owner. Registration is deliberately
 /// lazy: a run that never reserves a proof target has nothing to release and
 /// pays nothing.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -267,6 +274,9 @@ fn arm_abandoned_dimacs_proof_sweep() {
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 extern "C" fn sweep_abandoned_dimacs_proof_transactions() {
     discard_abandoned_dimacs_proof_transactions();
+    // What the registry could not reach, or never held (status_custody.rs).
+    // A current marker goes stale only with the proofs of an unanswered run.
+    settle_open_dimacs_status_custodies(crate::run_claimed_unanswered());
 }
 
 /// Filename prefix every staging entry reserved by THIS process carries.
@@ -309,8 +319,8 @@ fn is_abandoned_dimacs_proof_transaction(state: &OwnedDimacsProof, owner_prefix:
 ///
 /// Deliberately NOT the quarantine dance [`cleanup_owned_dimacs_proof_state`]
 /// performs. That one guards a PUBLIC pathname another process may legitimately
-/// own, and pays for the guarantee with a retained tombstone directory beside
-/// the proof target. A staging pathname is private to this process —
+/// own, and pays for the guarantee with a round trip through a private
+/// directory beside the target. A staging pathname is private to this process —
 /// `create_named_dimacs_staging_file` reserved it with `O_EXCL` under this PID
 /// and a nonce that is never reused — so authenticating the visible inode
 /// against the descriptor this run still holds is the whole guarantee here, and
@@ -324,7 +334,17 @@ fn discard_abandoned_dimacs_proof_stage(state: &mut OwnedDimacsProof) -> io::Res
     let Some(staging_path) = state.staging_path.as_deref() else {
         return Ok(());
     };
-    let visible = open_dimacs_regular_file(staging_path)?;
+    let visible = match open_dimacs_regular_file(staging_path) {
+        Ok(visible) => visible,
+        // An unanswered exit already reclaimed and unlinked it through its
+        // custody, without this registry's lock.
+        Err(error) if error.kind() == io::ErrorKind::NotFound && state.custody.is_abandoned() => {
+            state.staging_path = None;
+            state.location = OwnedDimacsProofLocation::Removed;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let visible_identity = regular_file_identity(&visible, staging_path)?;
     drop(visible);
     if visible_identity != state.identity {
@@ -391,6 +411,8 @@ fn discard_abandoned_dimacs_proof_transactions() {
         // run ended without a certificate, which is exactly what that marker
         // states, and publishing it releases the lock pathname.
         let status = match state.status_reservation.take() {
+            // An unanswered exit already settled it stale-not-current.
+            Some(reservation) if reservation.custody.settled_by_exit() => Ok(()),
             Some(reservation) => {
                 publish_reserved_dimacs_proof_status(reservation, "stale-not-current", None)
                     .map(drop)

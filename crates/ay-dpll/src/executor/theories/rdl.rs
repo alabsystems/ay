@@ -12,6 +12,7 @@
 //! `crate::executor::theories` internals.
 
 use crate::executor::dl_theory::{atom_is_routable, DiffLogicTheory};
+use crate::executor::guard_nodes::ShareOf;
 use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult};
 
@@ -79,8 +80,9 @@ impl Executor {
     }
 
     /// Run one difference-logic attempt with the proof tracker DISARMED and
-    /// the solve deadline NARROWED when its refutation could never be
-    /// published, restoring both afterwards.
+    /// on a share of the solve deadline when its refutation could never be
+    /// published, re-arming the tracker afterwards. Without a share the
+    /// deadline it found is put back after it (`end_sliced_attempt`).
     ///
     /// Disarming is state-preserving (`ProofTracker::enable`/`disable` flip a
     /// flag; the ledger is untouched) and is pure cost hygiene: under
@@ -99,11 +101,14 @@ impl Executor {
     /// once propagation made the attempt slower). Half the remaining budget
     /// leaves the certified lane at least what it had, and a SAT the DL lane
     /// cannot find in half the budget it rarely finds in the other half. Only
-    /// `solve_deadline` is narrowed; the certification deadline (the
+    /// `solve_deadline` is shared; the certification deadline (the
     /// publication boundary) is untouched, and `pre_iter_check` /
     /// `Solver::set_solve_deadline` both read the shared cell, so the cap
-    /// reaches the SAT search. (The old `--rigor fast` lane budgeted nothing,
-    /// and still does: there the DL refutation IS the verdict.)
+    /// reaches the SAT search. The half is a deadline share (GT6, GuardTree
+    /// step S3): the executor's deadline is never written, and the share
+    /// counts itself spent as it closes. (The old `--rigor fast` lane
+    /// budgeted nothing, and still does: there the DL refutation IS the
+    /// verdict.)
     fn run_dl_attempt<F>(
         &mut self,
         disposition: DlUnsatDisposition,
@@ -113,20 +118,22 @@ impl Executor {
         F: FnOnce(&mut Self) -> Result<SolveResult>,
     {
         let tracker_was_armed = self.proof_tracker.is_enabled();
-        let saved_deadline = self.solve_deadline.get();
+        let found_deadline = self.solve_deadline.get();
+        let mut share = None;
         if disposition == DlUnsatDisposition::Discard {
             if tracker_was_armed {
                 self.proof_tracker.disable();
             }
-            if let Some(deadline) = saved_deadline {
-                let now = ay_core::time::Instant::now();
-                if let Some(remaining) = deadline.checked_duration_since(now) {
-                    self.solve_deadline.set(Some(now + remaining / 2));
-                }
+            if self
+                .solve_deadline
+                .get()
+                .is_some_and(|deadline| deadline >= ay_core::time::Instant::now())
+            {
+                share = self.open_deadline_share(ShareOf::Search);
             }
         }
         let result = attempt(self);
-        self.solve_deadline.set(saved_deadline);
+        self.end_sliced_attempt(share, found_deadline);
         if tracker_was_armed {
             self.proof_tracker.enable();
         }
@@ -916,5 +923,50 @@ mod routing_tests {
         })
         .expect("attempt");
         assert_eq!(exec.solve_deadline.get(), None);
+    }
+
+    /// A write inside the attempt that does not restore itself (as
+    /// `eq_qe_bound_legacy_refutation` narrows the rest of its check-sat)
+    /// never outlives the attempt: with a share it moved the share's cell,
+    /// and without one the deadline the attempt found is put back, as before
+    /// the slicers opened shares (GuardTree S3).
+    #[test]
+    fn run_dl_attempt_undoes_an_unbalanced_deadline_write_with_or_without_a_share() {
+        use ay_core::time::Instant;
+        use std::time::Duration;
+        let narrowed = Instant::now() + Duration::from_secs(5);
+        let unbalanced = |e: &mut Executor| {
+            e.solve_deadline.set(Some(narrowed));
+            Ok(SolveResult::Unknown)
+        };
+        let mut exec = Executor::new();
+        let future = Instant::now() + Duration::from_secs(600);
+        let passed = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond must fit before the current instant");
+        for (disposition, found, shared) in [
+            (DlUnsatDisposition::Discard, Some(future), true),
+            (DlUnsatDisposition::Discard, Some(passed), false),
+            (DlUnsatDisposition::Discard, None, false),
+            (DlUnsatDisposition::PublishRaw, Some(future), false),
+            (DlUnsatDisposition::PublishRaw, None, false),
+        ] {
+            exec.solve_deadline.set(found);
+            let own = exec.solve_deadline.live().generation();
+            let verdict = exec
+                .run_dl_attempt(disposition, unbalanced)
+                .expect("attempt");
+            assert_eq!(verdict, SolveResult::Unknown);
+            assert_eq!(
+                exec.solve_deadline.get(),
+                found,
+                "{disposition:?} from {found:?}: the deadline it found is back"
+            );
+            assert_eq!(
+                exec.solve_deadline.live().generation() == own,
+                shared,
+                "{disposition:?} from {found:?}: only a share leaves the own cell unwritten"
+            );
+        }
     }
 }

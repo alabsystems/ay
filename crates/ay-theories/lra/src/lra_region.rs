@@ -71,7 +71,7 @@ impl LraBasisRegionLoweringContract {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub(crate) enum LraBasisRegionExactReason {
     MissingRow {
         row_idx: u32,
@@ -88,6 +88,55 @@ pub(crate) enum LraBasisRegionExactReason {
         row_idx: u32,
         reason: LraRowExactReason,
     },
+}
+
+// Written out rather than derived: the derived `eq` ends its variant match in
+// an `unreachable` arm (after comparing discriminants), which the Level-0
+// verifier refutes. Every variant pairing is spelled here, so adding a variant
+// is a compile error until its comparison is written.
+impl PartialEq for LraBasisRegionExactReason {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::MissingRow { row_idx: a }, Self::MissingRow { row_idx: b }) => a == b,
+            (
+                Self::RegionRowsTooLarge {
+                    row_count: a_count,
+                    max_rows: a_max,
+                },
+                Self::RegionRowsTooLarge {
+                    row_count: b_count,
+                    max_rows: b_max,
+                },
+            ) => a_count == b_count && a_max == b_max,
+            (
+                Self::RegionCoefficientsTooLarge {
+                    coefficient_count: a_count,
+                    max_coefficients: a_max,
+                },
+                Self::RegionCoefficientsTooLarge {
+                    coefficient_count: b_count,
+                    max_coefficients: b_max,
+                },
+            ) => a_count == b_count && a_max == b_max,
+            (
+                Self::RowRequiresExact {
+                    row_idx: a_row,
+                    reason: a_reason,
+                },
+                Self::RowRequiresExact {
+                    row_idx: b_row,
+                    reason: b_reason,
+                },
+            ) => a_row == b_row && a_reason == b_reason,
+            (
+                Self::MissingRow { .. }
+                | Self::RegionRowsTooLarge { .. }
+                | Self::RegionCoefficientsTooLarge { .. }
+                | Self::RowRequiresExact { .. },
+                _,
+            ) => false,
+        }
+    }
 }
 
 impl LraBasisRegionExactReason {
@@ -151,24 +200,37 @@ impl LraSolver {
         let Some(candidate) = self.lra_basis_region_candidate.take() else {
             return;
         };
-        self.stats.lra_basis_region_boundary_checks += 1;
+        self.stats.lra_basis_region_boundary_checks = self
+            .stats
+            .lra_basis_region_boundary_checks
+            .saturating_add(1);
 
         if self.lra_basis_region_disabled_by_policy() {
-            self.stats.lra_basis_region_disabled_skips += 1;
+            self.stats.lra_basis_region_disabled_skips =
+                self.stats.lra_basis_region_disabled_skips.saturating_add(1);
             return;
         }
         if self.lra_basis_region_requests.len() >= MAX_LRA_BASIS_REGION_REQUESTS {
-            self.stats.lra_basis_region_queue_full_skips += 1;
+            self.stats.lra_basis_region_queue_full_skips = self
+                .stats
+                .lra_basis_region_queue_full_skips
+                .saturating_add(1);
             return;
         }
 
         match self.build_lra_basis_region_request(&candidate) {
             Ok(request) => {
                 self.lra_basis_region_requests.push(request);
-                self.stats.lra_basis_region_requests_queued += 1;
+                self.stats.lra_basis_region_requests_queued = self
+                    .stats
+                    .lra_basis_region_requests_queued
+                    .saturating_add(1);
             }
             Err(_) => {
-                self.stats.lra_basis_region_ineligible_skips += 1;
+                self.stats.lra_basis_region_ineligible_skips = self
+                    .stats
+                    .lra_basis_region_ineligible_skips
+                    .saturating_add(1);
             }
         }
     }
@@ -239,8 +301,13 @@ impl LraSolver {
 
         let max_coefficients = guards.max_region_coefficients as usize;
         let mut coefficient_count = 0usize;
-        let mut rows = Vec::with_capacity(row_ids.len());
-        let mut row_metadata = Vec::with_capacity(row_ids.len());
+        // The reservations are capacity hints only (the guard's row limit is a
+        // runtime value, not an allocation bound): if one fails, `push` grows
+        // the vector as rows are lowered.
+        let mut rows = Vec::new();
+        let _ = rows.try_reserve_exact(row_ids.len());
+        let mut row_metadata = Vec::new();
+        let _ = row_metadata.try_reserve_exact(row_ids.len());
         for row_idx in row_ids {
             let idx = row_idx as usize;
             let Some(row) = self.rows.get(idx) else {
@@ -291,9 +358,11 @@ impl LraSolver {
     }
 
     fn lra_basis_region_row_ids(candidate: &LraBasisRegionCandidate) -> Vec<u32> {
-        let mut row_ids = Vec::with_capacity(candidate.affected_rows.len() + 1);
+        let mut row_ids = Vec::new();
+        // Capacity hint only: on failure `push`/`extend` grow the vector.
+        let _ = row_ids.try_reserve_exact(candidate.affected_rows.len().saturating_add(1));
         row_ids.push(candidate.root_row);
-        row_ids.extend(candidate.affected_rows.iter().copied());
+        row_ids.extend_from_slice(&candidate.affected_rows);
         row_ids.sort_unstable();
         row_ids.dedup();
         row_ids
@@ -315,7 +384,9 @@ impl LraSolver {
         let coefficient_count =
             u32::try_from(row.coeffs.len()).map_err(|_| LraRowExactReason::RowTooWide)?;
 
-        let mut coefficients = Vec::with_capacity(row.coeffs.len());
+        // Capacity hint only: on failure `push` grows the vector.
+        let mut coefficients = Vec::new();
+        let _ = coefficients.try_reserve_exact(row.coeffs.len());
         let mut previous_var = None;
         for &(var, ref coeff) in &row.coeffs {
             if previous_var.is_some_and(|previous| previous >= var) {

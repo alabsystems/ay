@@ -53,8 +53,9 @@ use crate::literal::Literal;
 
 #[cfg(test)]
 mod tests;
-#[cfg(kani)]
-mod verification;
+
+pub(crate) mod counted;
+mod counted_initial;
 
 /// Defragment watch buffers once dead slots exceed 1/8 of the unified buffer.
 ///
@@ -118,7 +119,6 @@ const WATCH_BUF_GROWTH_STEP_DIVISOR: usize = 8;
 
 /// Index of a clause in the clause database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct ClauseRef(pub(crate) u32);
 
 impl ClauseRef {
@@ -302,27 +302,6 @@ impl Watcher {
             clause_raw: u64::from(clause.0),
             blocker_raw: blocker.0,
         }
-    }
-
-    /// Check if this is a binary clause watcher
-    #[inline]
-    #[cfg(kani)]
-    pub(crate) fn is_binary(self) -> bool {
-        self.clause_raw & BINARY_FLAG != 0
-    }
-
-    /// Get the clause reference (strips binary flag)
-    #[inline]
-    #[cfg(kani)]
-    pub(crate) fn clause_ref(self) -> ClauseRef {
-        ClauseRef((self.clause_raw & !BINARY_FLAG) as u32)
-    }
-
-    /// Get the blocker/other literal
-    #[inline]
-    #[cfg(kani)]
-    pub(crate) fn blocker(self) -> Literal {
-        Literal(self.blocker_raw)
     }
 }
 
@@ -631,6 +610,25 @@ impl WatchedLists {
             meta: vec![WatchMeta::default(); num_lits],
             dead_slots: 0,
         }
+    }
+
+    pub(crate) fn try_new_counted(
+        num_vars: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::{CountedAdmissionError, QueryError};
+        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        let num_lits = crate::counted_storage::checked_double(owner, num_vars)?;
+        if num_lits > ENTRY_BINARY_FLAG as usize {
+            return Err(owner.refuse(CountedAdmissionError::Original(
+                QueryError::Invalid("SAT namespace exceeds packed watch bound").into(),
+            )));
+        }
+        Ok(Self {
+            buf_entries: Vec::new(),
+            meta: crate::counted_storage::try_vec_with(owner, num_lits, |_| WatchMeta::default())?,
+            dead_slots: 0,
+        })
     }
 
     /// Ensure the watched lists can index literals for `num_vars` variables.
@@ -1054,10 +1052,8 @@ impl WatchedLists {
             self.buf_entries.push(entry);
         }
 
-        // Pad remaining capacity with zeros.
-        for _ in (old_len + 1)..new_capacity {
-            self.buf_entries.push(0);
-        }
+        // Pad remaining capacity with zeros (one fill, not a push per slot).
+        self.buf_entries.resize(new_offset + new_capacity, 0);
 
         // Mark old region as dead.
         self.dead_slots += m.capacity as usize;
@@ -1299,6 +1295,27 @@ impl WatchedLists {
     /// Add a watcher for a literal
     #[inline]
     pub(crate) fn add_watch(&mut self, lit: Literal, watcher: Watcher) {
+        self.push_watcher(lit, watcher);
+    }
+
+    /// `add_watch` for BCP's deferred replacement watches (long clauses):
+    /// the in-capacity append is inlined, anything else (a binary watcher, a
+    /// full region, an unsized literal) takes `push_entry` as before. The
+    /// resulting lists are identical; the out-of-line `push_entry` call was
+    /// 2.1 percent of search time on the multiplier miters.
+    #[inline(always)]
+    pub(crate) fn add_long_watch(&mut self, lit: Literal, watcher: Watcher) {
+        let li = lit.index();
+        if watcher.clause_raw & BINARY_FLAG == 0 {
+            if let Some(&m) = self.meta.get(li) {
+                if m.len < m.capacity {
+                    let entry = pack_entry(watcher.blocker_raw, watcher.clause_raw);
+                    self.buf_entries[m.offset as usize + m.len as usize] = entry;
+                    self.meta[li].len += 1;
+                    return;
+                }
+            }
+        }
         self.push_watcher(lit, watcher);
     }
 
@@ -1765,13 +1782,6 @@ impl WatchedLists {
     #[cfg(test)]
     pub(crate) fn buffer_slots(&self) -> usize {
         self.buf_entries.len()
-    }
-
-    /// Get the length of a watch list (kani proofs only)
-    #[inline]
-    #[cfg(kani)]
-    pub(crate) fn watch_count(&self, lit: Literal) -> usize {
-        self.meta[lit.index()].len as usize
     }
 
     /// Capacity of a single literal's watch list region.

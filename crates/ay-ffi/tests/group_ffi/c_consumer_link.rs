@@ -9,31 +9,10 @@
 //! and runs the resulting binary.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-/// Find the ay-ffi static library in the cargo target directory.
-fn find_static_lib() -> Option<PathBuf> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
-    let workspace_root = Path::new(&manifest_dir).parent()?.parent()?;
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    // Strategy 1: CARGO_TARGET_DIR or standard target/
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"));
-
-    let lib_path = target_dir.join(profile).join("libay_ffi.a");
-    if lib_path.exists() {
-        return Some(lib_path);
-    }
-
-    None
-}
+use super::native_link::find_static_lib;
 
 /// Compile c_consumer.c to an object file (header compatibility check).
 fn compile_only(header_dir: &Path, c_source: &Path, obj_file: &Path) {
@@ -62,17 +41,7 @@ fn compile_and_link(header_dir: &Path, c_source: &Path, static_lib: &Path, binar
         .arg("-o")
         .arg(binary.as_os_str());
 
-    if cfg!(target_os = "macos") {
-        cmd.args([
-            "-framework",
-            "Security",
-            "-framework",
-            "CoreFoundation",
-            "-lresolv",
-            "-Wl,-no_warn_duplicate_libraries",
-        ]);
-    }
-    cmd.args(["-lpthread", "-lm"]);
+    super::native_link::add_native_libraries(&mut cmd);
 
     let output = cmd.output().expect("failed to invoke cc for linking");
     if !output.status.success() {
@@ -82,7 +51,7 @@ fn compile_and_link(header_dir: &Path, c_source: &Path, static_lib: &Path, binar
 }
 
 /// Run the compiled C consumer binary and verify output.
-fn run_and_verify(binary: &Path) {
+fn run_and_verify(binary: &Path, expected_stdout: &str) {
     let output = Command::new(binary)
         .output()
         .expect("failed to run c_consumer binary");
@@ -99,7 +68,7 @@ fn run_and_verify(binary: &Path) {
         "c_consumer exited with error.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains("All 21 C consumer tests passed"),
+        stdout.contains(expected_stdout),
         "c_consumer did not report all tests passing.\nstdout: {stdout}"
     );
 }
@@ -122,8 +91,8 @@ fn test_c_consumer_compiles_and_links() {
         header_dir.display()
     );
 
-    let tmpdir = env::temp_dir().join("ay_c_consumer_test");
-    let _ = std::fs::create_dir_all(&tmpdir);
+    let temporary = tempfile::tempdir().expect("create isolated consumer directory");
+    let tmpdir = temporary.path();
 
     let static_lib = match find_static_lib() {
         Some(p) => {
@@ -134,7 +103,6 @@ fn test_c_consumer_compiles_and_links() {
             eprintln!("SKIP link: libay_ffi.a not found, compile-only check");
             compile_only(&header_dir, &c_source, &tmpdir.join("c_consumer.o"));
             eprintln!("PASS: compile-only header check");
-            let _ = std::fs::remove_dir_all(&tmpdir);
             return;
         }
     };
@@ -143,8 +111,22 @@ fn test_c_consumer_compiles_and_links() {
     compile_and_link(&header_dir, &c_source, &static_lib, &binary);
     eprintln!("PASS: compiled and linked against libay_ffi.a");
 
-    run_and_verify(&binary);
+    run_and_verify(&binary, "All 21 C consumer tests passed");
     eprintln!("PASS: c_consumer ran, all 17 subtests passed");
+}
 
-    let _ = std::fs::remove_dir_all(&tmpdir);
+#[test]
+fn mkbv_c_consumer_preserves_ast_and_solver_semantics() {
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let header_dir = crate_root.join("include");
+    let source = crate_root.join("tests/capi_mkbv_consumer.c");
+    let temp = tempfile::tempdir().expect("create mkbv consumer directory");
+    if let Some(static_lib) = find_static_lib() {
+        let binary = temp.path().join("mkbv");
+        compile_and_link(&header_dir, &source, &static_lib, &binary);
+        run_and_verify(&binary, "mkbv AST and bit order passed");
+    } else {
+        eprintln!("SKIP link: libay_ffi.a not found, compile-only check");
+        compile_only(&header_dir, &source, &temp.path().join("mkbv.o"));
+    }
 }

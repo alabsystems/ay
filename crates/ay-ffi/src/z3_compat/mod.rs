@@ -48,12 +48,16 @@ mod ast_inspect;
 mod bitvectors;
 mod bitvectors_overflow;
 mod bounded_arrays;
+mod check_obligations;
 mod context;
 mod datatypes;
 mod engine_ext;
 mod engine_local;
 mod ffi_guards;
+mod finite_field;
 pub(crate) use ffi_guards::*;
+mod complex;
+mod eval_session;
 mod finite_sets;
 mod fixedpoint;
 mod fixedpoint_ext;
@@ -64,16 +68,22 @@ mod fpa_introspect;
 mod getters_ext;
 mod global_params;
 mod goals;
+mod handle_params;
 mod misc_ext;
 mod mk_ext;
 mod model_build;
 mod model_params;
 mod numerals;
 mod optimize;
+mod parse_binding;
 mod parser_context;
 mod probes;
+mod proof_callback;
+mod proof_dag;
 mod proofs;
 mod propagate;
+mod provenance;
+mod pub_ast;
 mod quantifier_inspect;
 mod quantifiers;
 mod rcf;
@@ -86,6 +96,8 @@ mod sorts;
 mod statistics;
 mod tactics;
 mod terms;
+mod wf_guards;
+mod zstring;
 
 #[cfg(test)]
 mod bv_numeral_radix_tests;
@@ -94,7 +106,35 @@ mod finite_sets_tests;
 #[cfg(test)]
 mod rec_def_ffi_tests;
 #[cfg(test)]
+mod solver_model_fuzz_tests;
+#[cfg(test)]
+mod solver_model_r3_tests;
+#[cfg(test)]
+mod solver_model_r3b_tests;
+#[cfg(test)]
+mod solver_model_r4_tests;
+#[cfg(test)]
+mod solver_model_r4b_tests;
+#[cfg(test)]
+mod solver_model_scope_tests;
+#[cfg(test)]
+mod t1_repair_tests;
+#[cfg(test)]
+mod t1_repair_text_tests;
+#[cfg(test)]
+mod t5_p0_fix_tests;
+#[cfg(test)]
+mod t5_p0_y_handle_tests;
+#[cfg(test)]
+mod t5_p0_y_obligation_tests;
+#[cfg(test)]
+mod t5_p0_y_tests;
+#[cfg(test)]
+mod t5_p1_pub_ast_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod value_decl_tests;
 
 // Re-export all public items from submodules
 pub use accessors::*;
@@ -109,6 +149,7 @@ pub use bitvectors_overflow::*;
 // surface of its own, it only constrains what the quantifier entry points
 // register and what a check injects.
 pub(crate) use bounded_arrays::*;
+pub use complex::*;
 pub use context::*;
 pub use datatypes::*;
 pub use engine_ext::*;
@@ -131,6 +172,7 @@ pub use numerals::*;
 pub use optimize::*;
 pub use parser_context::*;
 pub use probes::*;
+pub use proof_callback::{Z3_proof_check_eh, Z3_set_proof_check_callback};
 pub use proofs::*;
 pub use propagate::*;
 pub use quantifier_inspect::*;
@@ -194,10 +236,10 @@ impl std::fmt::Display for FfiTextError {
     }
 }
 
-unsafe fn ffi_read_utf8_with_limit(
+unsafe fn ffi_read_bytes_with_limit<'a>(
     text: *const c_char,
     max_bytes: usize,
-) -> Result<String, FfiTextError> {
+) -> Result<&'a [u8], FfiTextError> {
     if text.is_null() {
         return Err(FfiTextError::Null);
     }
@@ -207,14 +249,35 @@ unsafe fn ffi_read_utf8_with_limit(
         // than the explicit `max_bytes + 1` inspection window.
         if unsafe { *text.add(text_bytes) } == 0 {
             // SAFETY: the bounded scan established the readable extent before
-            // the terminator; `u8` has alignment one.
-            let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), text_bytes) };
-            return std::str::from_utf8(bytes)
-                .map(str::to_owned)
-                .map_err(|_| FfiTextError::InvalidUtf8);
+            // the terminator; `u8` has alignment one. Every caller ends the
+            // borrow `'a` within the FFI call that lent `text`.
+            return Ok(unsafe { std::slice::from_raw_parts(text.cast::<u8>(), text_bytes) });
         }
     }
     Err(FfiTextError::TooLong(max_bytes))
+}
+
+unsafe fn ffi_read_utf8_with_limit(
+    text: *const c_char,
+    max_bytes: usize,
+) -> Result<String, FfiTextError> {
+    // SAFETY: forwarded from this function's contract.
+    let bytes = unsafe { ffi_read_bytes_with_limit(text, max_bytes) }?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| FfiTextError::InvalidUtf8)
+}
+
+/// Copy the bytes of a caller-owned C string (without its terminator) with the
+/// same scan cap as [`ffi_read_bounded_text`], for entry points that read the
+/// bytes themselves rather than as UTF-8 (z3's `Z3_mk_string`).
+///
+/// # Safety
+/// Same as [`ffi_read_bounded_text`].
+pub(crate) unsafe fn ffi_read_bounded_bytes(text: *const c_char) -> Result<Vec<u8>, FfiTextError> {
+    // SAFETY: forwarded from this function's contract; the slice is copied
+    // before this call returns.
+    unsafe { ffi_read_bytes_with_limit(text, MAX_FFI_TEXT_BYTES) }.map(<[u8]>::to_vec)
 }
 
 /// Decode a caller-owned UTF-8 C string with an explicit scan/allocation cap.
@@ -382,7 +445,6 @@ pub(crate) unsafe fn ffi_counts_within_limit(
 /// exact-polynomial allocations.
 pub(crate) const MAX_FFI_ALGEBRAIC_EXPONENT: c_uint = 4_096;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, CString};
 use std::ptr;
@@ -502,6 +564,21 @@ pub(crate) const SORT_AST_TAG: u64 = 1u64 << 61;
 /// hashes and `==`-compares `as_ast()` results.
 pub(crate) const FUNC_DECL_AST_TAG: u64 = 1u64 << 60;
 
+/// Tag for the two objective-infinity ASTs (`oo` / `-oo`) returned by
+/// `Z3_optimize_get_lower`/`_upper` for an unbounded objective.
+///
+/// All four single-bit nibble values are taken, so this tag is the
+/// two-bit value `0x3` in the top nibble. That is safe because every
+/// dispatch site compares the FULL masked nibble for equality (never a
+/// single-bit test): `0x3` matches no existing arm. The index payload
+/// is 0 for `+oo`, 1 for `-oo`; there is no side table — the value is
+/// fully determined by the index. Like every tagged handle it is
+/// rejected by `checked_ast_to_term`, so it can be inspected and
+/// printed but never enters the solver (z3 lets it flow into term
+/// building as an ordinary Int constant; AY fails closed instead —
+/// see DR-60).
+pub(crate) const OO_AST_TAG: u64 = 0x3u64 << 60;
+
 /// Mask covering every non-term `Z3_ast` tag: proof (63), algebraic (62),
 /// sort (61), func_decl (60) — the reserved top nibble.
 ///
@@ -556,35 +633,6 @@ pub(crate) fn next_handle_salt() -> u32 {
     }
 }
 
-/// Context-owned identity arena for ordinary term AST handles.
-///
-/// Both directions are kept together so minting an AST is one invariant-
-/// preserving operation: `ids[terms[index]] == index`. The full authenticated
-/// [`Term`] is stored, never just its reusable numeric slot.
-#[derive(Default)]
-pub(crate) struct TermAstArena {
-    ids: HashMap<Term, u32>,
-    terms: Vec<Term>,
-}
-
-impl TermAstArena {
-    fn intern(&mut self, term: Term) -> Option<u32> {
-        if let Some(index) = self.ids.get(&term).copied() {
-            return Some(index);
-        }
-        let index = u32::try_from(self.terms.len()).ok()?;
-        self.terms.try_reserve(1).ok()?;
-        self.ids.try_reserve(1).ok()?;
-        self.terms.push(term);
-        self.ids.insert(term, index);
-        Some(index)
-    }
-
-    fn get(&self, index: usize) -> Option<Term> {
-        self.terms.get(index).copied()
-    }
-}
-
 // ============================================================================
 // Z3 Constants
 // ============================================================================
@@ -616,14 +664,22 @@ pub const Z3_CHAR_SORT: c_uint = 13;
 /// Type-variable sort kind (verified against z3_api.h 4.16: `Z3_TYPE_VAR` is
 /// the enum entry immediately after `Z3_CHAR_SORT`).
 pub const Z3_TYPE_VAR: c_uint = 14;
+/// Complex sort kind, appended in Z3 5.3 (existing sort kinds are unchanged).
+pub const Z3_FINITE_FIELD_SORT: c_uint = 15;
+pub const Z3_COMPLEX_SORT: c_uint = 16;
+pub const Z3_OP_FF_NUM: c_uint = 0xd000;
+pub const Z3_OP_FF_ADD: c_uint = 0xd001;
+pub const Z3_OP_FF_MUL: c_uint = 0xd002;
+pub const Z3_OP_FF_NEG: c_uint = 0xd003;
+pub const Z3_OP_FF_BITSUM: c_uint = 0xd004;
 pub const Z3_UNKNOWN_SORT: c_uint = 1000;
 
 /// AY's dense bit-vector/FP-significand construction envelope. Public FFI
 /// builders reject larger compact widths before allocating.
 pub(crate) const MAX_FFI_BITVECTOR_WIDTH: c_uint = 1 << 20;
-/// `FpPrecision` represents exponent bias in `u32`, so 32-bit exponent fields
-/// are not representable by the current core API.
-pub(crate) const MAX_FFI_FP_EXPONENT_BITS: c_uint = 31;
+/// Use the same native encoding limit as exact numeral construction. The core
+/// exponent/bias carrier is u64; the reference admits exponent widths to 63.
+pub(crate) const MAX_FFI_FP_EXPONENT_BITS: c_uint = ay_fp::MAX_ENCODING_EXPONENT_BITS;
 
 /// Validate the rounding-mode operand shared by every FPA constructor.
 ///
@@ -636,7 +692,7 @@ pub(crate) fn require_fpa_rounding_mode(
     operation: &str,
     ast: Z3_ast,
 ) -> Option<Term> {
-    let term = require_term_ast(ctx, ast, operation, "rounding-mode operand")?;
+    let term = require_ast(ctx, ast, operation, "rounding-mode operand")?.term;
     if matches!(
         ctx.solver.sort_of(term),
         Sort::Uninterpreted(name) if name == "RoundingMode"
@@ -701,6 +757,9 @@ pub const Z3_OP_TO_INT: c_uint = 0x20f;
 pub const Z3_OP_IS_INT: c_uint = 0x210;
 pub const Z3_OP_POWER: c_uint = 0x211;
 pub const Z3_OP_ABS: c_uint = 0x212;
+pub const Z3_OP_COMPLEX: c_uint = 0x213;
+pub const Z3_OP_REAL_PART: c_uint = 0x214;
+pub const Z3_OP_IMAG_PART: c_uint = 0x215;
 // Arrays
 pub const Z3_OP_STORE: c_uint = 0x300;
 pub const Z3_OP_SELECT: c_uint = 0x301;
@@ -736,6 +795,7 @@ pub const Z3_OP_BNAND: c_uint = 0x41d;
 pub const Z3_OP_BNOR: c_uint = 0x41e;
 pub const Z3_OP_BXNOR: c_uint = 0x41f;
 pub const Z3_OP_CONCAT: c_uint = 0x420;
+pub const Z3_OP_MKBV: c_uint = 0x43d;
 pub const Z3_OP_SIGN_EXT: c_uint = 0x421;
 pub const Z3_OP_ZERO_EXT: c_uint = 0x422;
 pub const Z3_OP_EXTRACT: c_uint = 0x423;
@@ -759,6 +819,18 @@ pub const Z3_OP_FINITE_SET_FILTER: c_uint = 0xc009;
 pub const Z3_OP_FINITE_SET_RANGE: c_uint = 0xc00a;
 pub const Z3_OP_FINITE_SET_EXT: c_uint = 0xc00b;
 pub const Z3_OP_FINITE_SET_MAP_INVERSE: c_uint = 0xc00c;
+/// A finite-domain value's declaration (z3 5.1.0 reports 1549).
+pub const Z3_OP_FD_CONSTANT: c_uint = 0x60d;
+/// Sequence and character literal kinds in the pinned Z3 5.3.3 ABI.
+pub const Z3_OP_SEQ_LENGTH: c_uint = 0x61c;
+pub const Z3_OP_SEQ_POWER: c_uint = 0x625;
+pub const Z3_OP_CHAR_CONST: c_uint = 0x63f;
+// Datatype operators (z3_api.h `Z3_OP_DT_*`).
+pub const Z3_OP_DT_CONSTRUCTOR: c_uint = 0x800;
+pub const Z3_OP_DT_RECOGNISER: c_uint = 0x801;
+pub const Z3_OP_DT_IS: c_uint = 0x802;
+pub const Z3_OP_DT_ACCESSOR: c_uint = 0x803;
+pub const Z3_OP_DT_UPDATE_FIELD: c_uint = 0x804;
 // Z3 5.0.0 tail values. Keep these exact: bindings use the numeric ABI.
 pub const Z3_OP_INTERNAL: c_uint = 0xc00d;
 pub const Z3_OP_RECURSIVE: c_uint = 0xc00e;
@@ -783,12 +855,15 @@ pub const Z3_EXCEPTION: c_uint = 12;
 // Internal Handle Types
 // ============================================================================
 
-/// Family currently authorized to mutate/check the context's shared SMT engine.
+/// Family that first claimed the context's shared SMT engine.
 ///
 /// Ordinary solver handles replay independent goals and may coexist with each
-/// other. Optimize is eager and cannot be replayed yet, so it is an exclusive
-/// family: mixing it with solver/global-parser semantic state would silently
-/// union or wipe constraints.
+/// other. Optimize is eager (its handle mutates the engine as it goes), so a
+/// Solver-family engine use DISPLACES its engine state; the Optimize handle
+/// then replays its recorded hard constraints, soft constraints, objectives and
+/// scopes before its next engine use (see `optimize::restore_optimize_engine`).
+/// Content parsed into an Optimize handle (`Z3_optimize_from_string`) is not
+/// replayable, so that handle and Solver handles stay mutually exclusive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecisionOwnerFamily {
     Solver,
@@ -831,8 +906,21 @@ impl Default for QuantifierFfiMetadata {
 /// Internal context state
 pub struct Z3Context {
     pub(crate) solver: Solver,
+    /// Persistent command context for Z3_eval_smtlib2_string, independent of
+    /// ordinary C solver handles but owned for this context's entire lifetime.
+    pub(crate) eval_session: Option<eval_session::EvalSession>,
+    pub(crate) eval_active: bool,
+    pub(crate) proof_check_callback: proof_callback::Z3_proof_check_eh,
+    pub(crate) proof_check_user_context: *mut std::ffi::c_void,
+    pub(crate) proof_tracking: ay_dpll::api::NativeProofTrackingCache,
     pub(crate) last_error: c_uint,
     pub(crate) error_msg: Option<String>,
+    /// Caller-installed error callback (`Z3_set_error_handler`), invoked by
+    /// the FFI guards once per API call that leaves a non-OK error state.
+    pub(crate) error_handler: Option<unsafe extern "C" fn(Z3_context, c_uint)>,
+    /// Reentrancy latch: while the error handler runs, nested API calls it
+    /// makes do not re-invoke it.
+    pub(crate) error_handler_active: bool,
     /// Exclusive family owning semantic mutation/check access to `solver`.
     /// Term/sort/declaration construction and fixedpoint's independent CHC
     /// engine do not claim this field.
@@ -841,6 +929,19 @@ pub struct Z3Context {
     /// that could not be rolled back (currently cross-context Optimize
     /// translation failure). No later decision owner may claim the context.
     pub(crate) decision_engine_poisoned: Option<String>,
+    /// A Solver-family operation reset the shared engine since the Optimize
+    /// handle last installed its state there; the handle must replay before
+    /// its next engine use.
+    pub(crate) optimize_engine_displaced: bool,
+    /// The Optimize handle whose state the shared engine holds (several
+    /// Optimize handles may share a context, as in z3: the others replay
+    /// their recorded state before their next engine use).
+    pub(crate) optimize_engine_owner: *const OptimizeHandle,
+    /// Datatypes and recursive definitions parsed texts declared in this
+    /// context: sort name (or `define-fun-rec <name>`) -> the declaring
+    /// command, so the same declaration in another text denotes the same sort
+    /// or function (z3 identifies them by name).
+    pub(crate) text_datatypes: HashMap<String, String>,
     /// Interned strings for Z3_ast_to_string etc. (Z3 returns context-owned ptrs)
     pub(crate) string_cache: Vec<CString>,
     /// Cached symbol handles — freed on context deletion (#5528).
@@ -862,10 +963,35 @@ pub struct Z3Context {
     /// `(symbol kind/value, domain, range)` receives its own private name.
     pub(crate) ffi_func_names: HashMap<(SymbolKey, Vec<Sort>, Sort), String>,
     /// Successfully registered native declaration for each exact C-API
-    /// function identity. Repeated `Z3_mk_func_decl` calls must allocate
-    /// distinct handles for one declaration, not attempt a second frontend
-    /// declaration of the same private name.
+    /// function identity, so a repeated `Z3_mk_func_decl` does not attempt
+    /// a second frontend declaration of the same private name.
     pub(crate) ffi_func_decls: HashMap<(SymbolKey, Vec<Sort>, Sort), FuncDecl>,
+    /// The recursive-function declarations (`Z3_mk_rec_func_decl`) by exact
+    /// identity, kept apart from [`Self::ffi_func_decls`]: z3 keys a
+    /// declaration by its kind as well, so a recursive function and an
+    /// uninterpreted function of one name and signature are two functions
+    /// (libz3 5.1.0: `RecFunction('f', I, I).eq(Function('f', I, I))` is
+    /// False), and a second recursive declaration of one signature is an error.
+    pub(crate) ffi_rec_func_decls: HashMap<(SymbolKey, Vec<Sort>, Sort), FuncDecl>,
+    /// Well-formedness guards of free symbols whose values lower lossily
+    /// (`Char` / finite-domain ranges, arrays of them), keyed by engine name.
+    /// See `check_obligations`.
+    pub(crate) wf_guards: HashMap<String, check_obligations::WfGuard>,
+    /// Engine names of the uninterpreted sorts the API or a parsed text
+    /// declared. A datatype of one of these names would share its engine
+    /// sort (both lower to `Uninterpreted(name)`), so it is refused, and so
+    /// is an uninterpreted sort named like a datatype.
+    pub(crate) uninterpreted_sort_names: std::collections::HashSet<String>,
+    /// Terms whose AST handle was recorded with a `Char` / finite-domain sort
+    /// and later re-recorded with another (`Z3_mk_char_to_int` returns its
+    /// argument's handle as an `Int`). A quantifier binding such a constant
+    /// may have been built after the overwrite, without the relativization
+    /// to its carrier, so `check_obligations` refuses it.
+    pub(crate) bounded_sort_lost: std::collections::HashSet<Term>,
+    /// Context-level parameter defaults (`Z3_mk_context` configuration,
+    /// `Z3_update_param_value`); each handle's own parameters override them
+    /// for that handle's checks (see `handle_params`).
+    pub(crate) default_params: handle_params::ParamSet,
     /// Original Z3 symbol identity for solver-internal declaration names.
     /// Used to preserve `Z3_get_decl_name` kind/display after integer-symbol
     /// and fresh declarations are assigned collision-proof internal names.
@@ -883,17 +1009,23 @@ pub struct Z3Context {
     pub(crate) ffi_used_decl_names: std::collections::HashSet<String>,
     /// Monotonic identity/name source shared by fresh constants and functions.
     pub(crate) next_ffi_fresh_id: u64,
-    /// Canonical AST identity for each exact native term capability.
+    /// The public AST: what every untagged `Z3_ast` names (a node, interned
+    /// by engine term and public sort) and the context's sort ids (see
+    /// `pub_ast`).
     ///
-    /// A raw `TermId` is only a reusable slot. Keeping the full authenticated
-    /// [`Term`] as the key prevents a declaration reset or speculative suffix
-    /// rollback from making an old `Z3_ast` compare equal to a reincarnated
-    /// term that later occupies the same slot. Interior mutability keeps
-    /// [`term_to_ast`] usable from read-only introspection paths; Z3 contexts
-    /// already require externally synchronized, non-aliased access.
-    pub(crate) term_asts: RefCell<TermAstArena>,
-    /// Track sorts associated with AST handles for sort queries
-    pub(crate) ast_sorts: Vec<Option<Sort>>,
+    /// A raw `TermId` is only a reusable slot. Nodes keep the full
+    /// authenticated [`Term`], so a declaration reset or speculative suffix
+    /// rollback can never make an old `Z3_ast` compare equal to a
+    /// reincarnated term that later occupies the same slot.
+    pub(crate) pub_ast: pub_ast::PubStore,
+    /// Which terms are stored exactly as the caller built them, for the
+    /// structural entry points `Z3_substitute` and `Z3_update_term` (see
+    /// `provenance.rs`).
+    pub(crate) provenance: provenance::Provenance,
+    /// The latest datatype constructor/tester/accessor handle for each
+    /// (name, domain, range), so `Z3_get_app_decl` finds it without scanning
+    /// `func_decl_cache` (which grows with every decl handed out).
+    pub(crate) dt_decl_index: HashMap<(String, Vec<Sort>, Sort), Z3_func_decl>,
     /// Public Z3 5.0.0 finite-set sort identity -> public element sort.
     pub(crate) finite_set_sorts: HashMap<Sort, Sort>,
     /// Canonical public element sort -> finite-set sort identity.
@@ -924,12 +1056,11 @@ pub struct Z3Context {
     /// Atomic signature guarding the two side maps above plus the core qid and
     /// skolemid maps against hash-consed metadata aliasing.
     pub(crate) quantifier_ffi_metadata: HashMap<Term, QuantifierFfiMetadata>,
-    /// Public finite-set applications retained over their engine witnesses.
-    pub(crate) finite_set_apps: HashMap<Term, FiniteSetApp>,
-    /// Exact characteristic-array meaning of each retained application.
-    pub(crate) finite_set_app_backings: HashMap<Term, Term>,
+    /// Public finite-set applications, by the public node of the engine
+    /// witness each is retained over.
+    pub(crate) finite_set_apps: HashMap<pub_ast::PubId, FiniteSetApp>,
     /// Z3-style hash-consing for retained finite-set applications.
-    pub(crate) finite_set_app_cache: HashMap<FiniteSetAppKey, Term>,
+    pub(crate) finite_set_app_cache: HashMap<FiniteSetAppKey, pub_ast::PubId>,
     /// Public signatures for declarations whose engine signature lowers a
     /// finite-set sort to its characteristic-array representation.
     pub(crate) finite_set_decl_signatures: HashMap<String, (Vec<Sort>, Sort)>,
@@ -978,14 +1109,11 @@ pub struct Z3Context {
     /// verified at checked decode boundaries, so foreign-context handles fail
     /// CLOSED instead of decoding to an unrelated object.
     pub(crate) handle_salt: u32,
-    /// Stable semantic sort IDs: same Sort → same ID within a context (#6580).
-    pub(crate) sort_ids: HashMap<Sort, c_uint>,
-    /// Next available sort ID (monotonically increasing, starting at 1).
-    pub(crate) next_sort_id: c_uint,
     /// Decode table for SORT-AST handles: `sort_id` → a live `SortHandle` of
     /// that semantic sort (the FIRST handle allocated for the id). Filled by
     /// [`alloc_sort`] (the single sort-allocation path — every `Z3_sort` flows
-    /// through it), so it can never desync from `sort_ids`. Slot 0 is unused
+    /// through it), so it can never desync from the sort ids of
+    /// [`Self::pub_ast`]. Slot 0 is unused
     /// (ids start at 1); unfilled slots are null. Non-owning aliases into
     /// `sort_cache`.
     pub(crate) sort_ast_handles: Vec<*mut SortHandle>,
@@ -996,6 +1124,12 @@ pub struct Z3Context {
     /// with the same name/domain/range/params/dt-op therefore mint the SAME
     /// tagged ast — required for z3py's `as_ast()` equality/hash contract.
     pub(crate) decl_ast_ids: HashMap<DeclAstKey, u32>,
+    /// Hash-consing of `Z3_func_decl` handles by the same semantic identity:
+    /// repeated construction of one declaration returns the SAME handle, as
+    /// in z3 (whose decls are hash-consed ASTs; clients compare and hash the
+    /// pointers). Handles stay arena-owned in `func_decl_cache`; this map is
+    /// a non-owning index into it.
+    pub(crate) func_decl_intern: HashMap<DeclAstKey, Z3_func_decl>,
     /// Decode table for FUNC-DECL-AST handles: interned index → the canonical
     /// `FuncDeclHandle` (the first handle presented for that key). Non-owning
     /// aliases into `func_decl_cache`.
@@ -1035,6 +1169,9 @@ pub struct Z3Context {
     /// `Z3_ast_to_string` recognizes the tag and returns the indexed text. These
     /// handles live until `Z3_del_context`.
     pub(crate) proof_texts: Vec<String>,
+    pub(crate) proof_applications: HashMap<usize, proof_dag::ProofApplication>,
+    pub(crate) proof_application_intern: HashMap<(u32, Vec<Z3_ast>), Z3_ast>,
+    pub(crate) proof_declarations: HashMap<Z3_func_decl, u32>,
     /// Arena of Real-Closed-Field numerals (`Z3_rcf_num` handles). Each is a
     /// `Box::into_raw` of an exact [`rcf::RcfNum`] (an `ay_nra::RealScalar`);
     /// `Z3_rcf_*` producers push here and hand back the raw pointer, and the
@@ -1230,15 +1367,50 @@ impl Z3Context {
                 true
             }
             Some(owner) if owner == requested => true,
+            // Solver and Optimize handles share the engine: a Solver-family
+            // use displaces the Optimize state, which the Optimize handle
+            // replays before its next engine use. That needs every Optimize
+            // handle's content to be recorded on the handle; parsed content
+            // is not, and keeps the families exclusive.
             Some(owner) => {
-                self.last_error = Z3_INVALID_USAGE;
-                self.error_msg = Some(format!(
-                    "{operation}: context SMT decision engine is already owned by the {owner:?} \
-                     family; use a separate Z3_context for {requested:?}"
-                ));
-                false
+                if let Some(reason) = self.optimize_replay_blocker() {
+                    self.last_error = Z3_INVALID_USAGE;
+                    self.error_msg = Some(format!(
+                        "{operation}: context SMT decision engine is already owned by the \
+                         {owner:?} family ({reason}); use a separate Z3_context for {requested:?}"
+                    ));
+                    return false;
+                }
+                true
             }
         }
+    }
+
+    /// Why an Optimize handle of this context could not replay its engine
+    /// state after a Solver-family use displaced it, if any.
+    pub(crate) fn optimize_replay_blocker(&self) -> Option<String> {
+        self.optimize_handle_cache.iter().find_map(|&handle| {
+            // SAFETY: cache entries are live arena-owned allocations and
+            // decision operations are single-threaded per context.
+            (!handle.is_null())
+                .then(|| unsafe { (*handle).replay_blocker.clone() })
+                .flatten()
+        })
+    }
+
+    /// Whether Solver-family handles exist alongside Optimize on this context.
+    pub(crate) fn has_solver_family_handles(&self) -> bool {
+        !self.solver_handle_cache.is_empty()
+    }
+
+    /// Clear the shared engine's assertions for a Solver-family goal. Any
+    /// Optimize handle's engine state is displaced by this and is replayed
+    /// before that handle's next engine use.
+    pub(crate) fn reset_engine_for_solver_goal(&mut self) -> Result<(), ay_dpll::api::SolverError> {
+        if !self.optimize_handle_cache.is_empty() {
+            self.optimize_engine_displaced = true;
+        }
+        self.solver.try_reset_assertions()
     }
 
     /// Permanently prevent the shared SMT engine from admitting later work.
@@ -1362,7 +1534,7 @@ fn public_bound_term_descriptors(
                     .get(&bound)
                     .map(|(_, symbol)| symbol.clone())
                     .unwrap_or(SymbolKey::String(engine_name));
-                let sort = lookup_ast_sort(context, term_to_ast(context, bound))
+                let sort = engine_stated_sort(context, bound)
                     .cloned()
                     .unwrap_or(engine_sort);
                 (symbol, sort)
@@ -1499,7 +1671,7 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
             let public_sorts: Vec<Sort> = source_bounds
                 .iter()
                 .map(|&bound| {
-                    lookup_ast_sort(source, term_to_ast(source, bound))
+                    engine_stated_sort(source, bound)
                         .cloned()
                         .unwrap_or_else(|| source.solver.term_sort(bound))
                 })
@@ -1748,9 +1920,7 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
             );
         }
         for (&bound, public_sort) in bounds.iter().zip(public_sorts) {
-            if lookup_ast_sort(target, term_to_ast(target, bound))
-                .is_some_and(|existing| existing != public_sort)
-            {
+            if engine_stated_sort(target, bound).is_some_and(|existing| existing != public_sort) {
                 return translation_metadata_error(
                     target,
                     operation,
@@ -2001,6 +2171,19 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
         rebound_map_signature_copies.push((name, target_decl));
     }
 
+    // A graft only re-interns each constant's `Var`; declare it in the target
+    // engine too, or the target's models never interpret it (see
+    // `Solver::try_adopt_translated_constant`).
+    for (term, _, _, sort) in &const_copies {
+        if let Err(error) = target
+            .solver
+            .try_adopt_translated_constant(*term, sort.clone())
+        {
+            let detail =
+                format!("translated constant could not be declared in the target context: {error}");
+            return translation_metadata_error(target, operation, &detail);
+        }
+    }
     for (term, identity, symbol, sort) in const_copies {
         target
             .ffi_const_metadata
@@ -2016,6 +2199,9 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
     for (key, name, decl) in rebound_function_copies {
         target.ffi_func_names.insert(key.clone(), name);
         if let Some(decl) = decl {
+            // The target's goals reaching a translated `Char` /
+            // finite-domain valued function need its guard as well.
+            check_obligations::register_function_wf_guard(target, &decl, &key.1, &key.2);
             target.ffi_func_decls.insert(key, decl);
         }
     }
@@ -2024,8 +2210,8 @@ pub(crate) fn transfer_cross_context_ffi_metadata(
     }
     for (quantifier, (bounds, public_sorts)) in quantifier_public_bound_copies {
         for (&bound, public_sort) in bounds.iter().zip(public_sorts) {
-            let ast = term_to_ast(target, bound);
-            record_ast_sort(target, ast, public_sort);
+            // Stated so the bound term reads at its public sort.
+            let _bound_ast = mk_ast(target, bound, public_sort);
         }
         target
             .quantifier_public_bound_terms
@@ -2095,6 +2281,10 @@ impl Drop for Z3Context {
             drain_arena(&mut self.solver_handle_cache);
             drain_arena(&mut self.optimize_handle_cache);
             drain_arena(&mut self.fixedpoint_handle_cache);
+            // Constructors share earlier immutable expressions. Drop parents
+            // first so context-owned children never form a recursive last-Arc
+            // destruction cascade.
+            self.tactic_handle_cache.reverse();
             drain_arena(&mut self.tactic_handle_cache);
             drain_arena(&mut self.simplifier_handle_cache);
             drain_arena(&mut self.stats_handle_cache);
@@ -2155,6 +2345,24 @@ pub struct FuncDeclHandle {
     /// Finite-set builtin provenance. A user UF may legally have the same
     /// display name and must remain `Z3_OP_UNINTERPRETED`.
     pub(crate) finite_set_op: Option<FiniteSetOp>,
+    /// Set only on the declaration of a literal (see [`ValueDecl`]).
+    pub(crate) value: Option<ValueDecl>,
+}
+
+/// The declaration of a literal, as z3 reports it for `true`, `false`, an
+/// arithmetic or bit-vector numeral and a string (`Z3_get_app_decl` on a
+/// value): the literal itself and its `Z3_decl_kind` (`Z3_OP_TRUE`,
+/// `Z3_OP_FALSE`, `Z3_OP_ANUM`, `Z3_OP_BNUM`, `Z3_OP_INTERNAL`).
+///
+/// The kind comes from the literal term, never from the declaration's NAME:
+/// a user constant named `Int` or `true` keeps `Z3_OP_UNINTERPRETED`. The
+/// literal is part of the declaration's identity ([`DeclAstKey`],
+/// `Z3_is_eq_func_decl`), so the decls of `7` and `8` stay distinct, and
+/// `Z3_mk_app` of the decl with no arguments rebuilds exactly this literal.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ValueDecl {
+    pub(crate) term: Term,
+    pub(crate) kind: c_uint,
 }
 
 /// Identifies a datatype operator backing a [`FuncDeclHandle`] (#phase3-dt).
@@ -2210,6 +2418,7 @@ pub(crate) struct DeclAstKey {
     pub(crate) params: Vec<c_int>,
     pub(crate) dt_op: DtOpKind,
     pub(crate) finite_set_op: Option<FiniteSetOp>,
+    pub(crate) value: Option<ValueDecl>,
 }
 
 /// Internal state for a `Z3_solver` handle.
@@ -2270,6 +2479,9 @@ pub struct Z3SolverHandle {
     /// Alethe proof text from this handle's last UNSAT check (present only
     /// when proof production was enabled at check time; never fabricated).
     pub(crate) last_proof_alethe: Option<String>,
+    pub(crate) last_clause_trail: Option<ay_dpll::api::NativeClauseTrail>,
+    pub(crate) last_clause_trail_requested: bool,
+    pub(crate) last_proof_dag: Option<ay_dpll::api::NativeProofDag>,
     /// Solver statistics snapshot from this handle's last check, materialized
     /// right after the check (a later check by any handle overwrites the
     /// engine-side counters). These are the executor's REAL counters —
@@ -2289,12 +2501,22 @@ pub struct Z3SolverHandle {
     /// returns Z3's empty "rest of the space" cube). Invalidated (reset to
     /// `None`) on every assertion-stack mutation.
     pub(crate) pending_cubes: Option<std::collections::VecDeque<Vec<(Term, bool)>>>,
+    /// Declarations, sorts and definitions made by this solver's
+    /// `Z3_solver_from_string` / `Z3_solver_from_file` texts: visible to its
+    /// later parses, as z3's per-solver command context keeps them (see
+    /// `parse_binding`).
+    pub(crate) parse_prior: parse_binding::ParsePrior,
+    /// This handle's own parameters (`Z3_solver_set_params`,
+    /// `Z3_solver_set_proof_production`), applied in full for its checks
+    /// only (see `handle_params`).
+    pub(crate) params: handle_params::ParamSet,
 }
 
 impl Z3SolverHandle {
     /// A fresh, empty solver handle (optionally carrying a tactic).
     pub(crate) fn new(tactic: Option<Tactic>) -> Self {
         Self {
+            params: handle_params::ParamSet::default(),
             tactic,
             assertions: Vec::new(),
             scope_markers: Vec::new(),
@@ -2306,9 +2528,13 @@ impl Z3SolverHandle {
             last_unsat_core: None,
             last_reason_unknown: None,
             last_proof_alethe: None,
+            last_proof_dag: None,
+            last_clause_trail: None,
+            last_clause_trail_requested: false,
             last_statistics: None,
             propagator: None,
             pending_cubes: None,
+            parse_prior: parse_binding::ParsePrior::default(),
         }
     }
 
@@ -2322,6 +2548,9 @@ impl Z3SolverHandle {
         self.last_unsat_core = None;
         self.last_reason_unknown = None;
         self.last_proof_alethe = None;
+        self.last_proof_dag = None;
+        self.last_clause_trail = None;
+        self.last_clause_trail_requested = false;
         self.last_statistics = None;
         // The cube cursor is derived from the assertion stack; any mutation
         // invalidates it (a fresh Z3_solver_cube call re-generates).
@@ -2340,6 +2569,9 @@ impl Z3SolverHandle {
         if outcome != SolverCheckOutcome::Unsat {
             self.last_unsat_core = None;
             self.last_proof_alethe = None;
+            self.last_proof_dag = None;
+            self.last_clause_trail = None;
+            self.last_clause_trail_requested = false;
         }
         if outcome != SolverCheckOutcome::Unknown {
             self.last_reason_unknown = None;
@@ -2363,7 +2595,7 @@ impl Z3SolverHandle {
 /// only ever compose tactics built this way, so the whole tree is
 /// equivalence-preserving.
 pub struct TacticHandle {
-    pub(crate) tactic: Tactic,
+    pub(crate) tactic: std::sync::Arc<ay_dpll::api::TacticInstance>,
 }
 
 /// Internal state for a `Z3_simplifier` (preprocessing goal-to-goal transformer)
@@ -2417,8 +2649,29 @@ pub struct OptimizeScopeMarker {
     pub(crate) tracked_len: usize,
     /// `public_objectives.len()` at push.
     pub(crate) public_objective_len: usize,
+    /// `objective_slots.len()` at push.
+    pub(crate) objective_slot_len: usize,
     /// `parsed_soft_public_terms.len()` at push.
     pub(crate) parsed_soft_public_len: usize,
+}
+
+/// One objective in z3's numbering of an Optimize's objectives: each
+/// `maximize` / `minimize` is one, and so is each soft-constraint group (all
+/// soft constraints with the same id share an objective, the sum of the
+/// weights they violate).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectiveSlot {
+    /// The arithmetic objective at this index of `public_objectives`.
+    Arith(usize),
+    /// The soft-constraint group with this id.
+    Soft(Option<String>),
+}
+
+/// Direction of an Optimize objective registered through the API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectiveSense {
+    Maximize,
+    Minimize,
 }
 
 /// Publicly admitted outcome of the last optimize decision query.
@@ -2466,8 +2719,30 @@ pub struct OptimizeHandle {
     /// Public objective roots, aligned with every registered objective
     /// (programmatic and parsed) in the aliased solver.
     pub(crate) public_objectives: Vec<Term>,
+    /// Direction of each objective, aligned with `public_objectives`; `None`
+    /// for an objective parsed from SMT-LIB text (not replayable).
+    pub(crate) objective_senses: Vec<Option<ObjectiveSense>>,
+    /// z3's objective numbering (see [`ObjectiveSlot`]): the index
+    /// `Z3_optimize_maximize` / `_minimize` / `_assert_soft` return and
+    /// `Z3_optimize_get_lower` / `_get_upper` take.
+    pub(crate) objective_slots: Vec<ObjectiveSlot>,
+    /// Why this handle's engine state cannot be replayed (content parsed in
+    /// from SMT-LIB text), or `None` when every item is recorded on the handle.
+    pub(crate) replay_blocker: Option<String>,
+    /// Sort and optimum of every objective, captured at the last SAT
+    /// `Z3_optimize_check` (the engine may since have been reset by a Solver
+    /// check on the same context).
+    pub(crate) last_objective_values: Vec<(Option<Sort>, Option<ay_dpll::api::ObjectiveValue>)>,
+    /// An unattained optimum of each objective as `(value, eps_coeff)` (the
+    /// optimum is `value + eps_coeff * epsilon`), captured with
+    /// `last_objective_values`.
+    pub(crate) last_objective_epsilons:
+        Vec<Option<(num_rational::BigRational, num_rational::BigRational)>>,
     /// Model realizing the optimum found by the last `Z3_optimize_check`.
     pub(crate) last_model: Option<Model>,
+    /// The engine's model text of the same check: it carries the function
+    /// tables the constants-only `last_model` drops.
+    pub(crate) last_model_text: Option<String>,
     /// The last publicly admitted check outcome. This is the authority for
     /// every outcome-dependent accessor: the aliased solver can retain a
     /// backend model or objective value even when the FFI subsequently rejects
@@ -2475,10 +2750,9 @@ pub struct OptimizeHandle {
     pub(crate) last_check_outcome: Option<OptimizeCheckOutcome>,
     /// Tracked hard assertions from `Z3_optimize_assert_and_track`: `(p, a)`
     /// pairs where `p` is the tracking literal and `a` the asserted formula.
-    /// `a` is asserted UNCONDITIONALLY on the engine (a real hard assertion);
-    /// the pair is retained for faithful assertion introspection and a future
-    /// engine with participating-core extraction. The current Optimize core
-    /// accessor honestly returns empty rather than invent an over-approximation.
+    /// The engine holds `p => a` (also in `hard`) and `p` itself, z3's
+    /// assumption; the literals are replayed with the scopes and form the
+    /// core of an unsat check.
     pub(crate) tracked: Vec<(Term, Term)>,
     /// User backtracking markers (one per outstanding `Z3_optimize_push`).
     pub(crate) scope_markers: Vec<OptimizeScopeMarker>,
@@ -2492,6 +2766,9 @@ pub struct OptimizeHandle {
     /// Permanent fail-closed latch after an Optimize parse transaction could
     /// not be proven fully rolled back. A poisoned handle never checks again.
     pub(crate) terminal_error: Option<String>,
+    /// This handle's own parameters (`Z3_optimize_set_params`), applied in
+    /// full for its checks only (see `handle_params`).
+    pub(crate) params: handle_params::ParamSet,
 }
 
 impl OptimizeHandle {
@@ -2503,6 +2780,9 @@ impl OptimizeHandle {
     /// retired independently.
     pub(crate) fn clear_check_artifacts(&mut self) {
         self.last_model = None;
+        self.last_model_text = None;
+        self.last_objective_values.clear();
+        self.last_objective_epsilons.clear();
         self.last_check_outcome = None;
         self.last_unsat_core = None;
         self.last_reason_unknown = None;
@@ -2516,6 +2796,9 @@ impl OptimizeHandle {
         self.last_check_outcome = Some(outcome);
         if outcome != OptimizeCheckOutcome::Sat {
             self.last_model = None;
+            self.last_model_text = None;
+            self.last_objective_values.clear();
+            self.last_objective_epsilons.clear();
         }
         if outcome != OptimizeCheckOutcome::Unsat {
             self.last_unsat_core = None;
@@ -2557,6 +2840,12 @@ pub struct ModelHandle {
     /// `f` as a plain UF before `f` was defined must never re-answer through
     /// the definition).
     pub(crate) rec_def_count: usize,
+    /// Whether `func_interps` carries every function interpretation of the
+    /// model (a Solver check's validated model text), so that model
+    /// completion may give an ABSENT function z3's default interpretation.
+    /// `false` for a model whose function tables are not materialized
+    /// (Optimize) or are kept elsewhere (`Z3_mk_model`).
+    pub(crate) complete_functions: bool,
     /// Context for evaluating model values (kept for future model_eval)
     pub(crate) _ctx: Z3_context,
 }
@@ -2738,9 +3027,18 @@ impl SymbolHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoredParamKind {
+    Bool,
+    UInt,
+    Double,
+    Symbol,
+}
 pub struct ParamsHandle {
-    /// Stored until solver params are applied; only supported keys take effect.
+    /// Text remains the maintained solver-parameter input; setter types are
+    /// retained in parallel so tactic validation never guesses from spelling.
     pub(crate) params: Vec<(String, String)>,
+    pub(crate) kinds: Vec<StoredParamKind>,
 }
 
 /// One parameter descriptor: name, its `Z3_param_kind`, and a documentation
@@ -2858,6 +3156,11 @@ pub struct GoalHandle {
     /// produced by `Z3_tactic_apply` carries the engine's real transformation
     /// depth. Read by `Z3_goal_depth` and the `depth` probe.
     pub(crate) depth: usize,
+    pub(crate) model_converter: Option<ay_dpll::api::TacticModelConverter>,
+    pub(crate) models: bool,
+    pub(crate) proofs: bool,
+    pub(crate) unsat_cores: bool,
+    pub(crate) context: Z3_context,
 }
 
 /// The result of applying a tactic to a goal: the produced subgoals.
@@ -2954,6 +3257,9 @@ pub struct ParserContextHandle {
     /// Function declarations injected via `Z3_parser_context_add_decl` (same
     /// role as `added_sorts`).
     pub(crate) added_decls: Vec<FuncDecl>,
+    /// Declarations, sorts and definitions of this parser context's earlier
+    /// `Z3_parser_context_from_string` texts (see `parse_binding`).
+    pub(crate) parse_prior: parse_binding::ParsePrior,
     /// `inc_ref`/`dec_ref` bookkeeping count. The handle is arena-owned and is
     /// NEVER freed by reference counting; this only records outstanding
     /// references for discipline tracking.
@@ -2964,22 +3270,43 @@ pub struct ParserContextHandle {
 // Helpers
 // ============================================================================
 
-/// Convert one exact AY term capability to its canonical context-owned AST.
+/// Encode a public node of `ctx` as its `Z3_ast`.
 ///
-/// The payload is a stable 1-based index into [`Z3Context::term_asts`],
-/// not the reusable raw `TermId`. Re-exporting the same live [`Term`] therefore
-/// preserves Z3's hash-consed AST identity, while a later term born in the same
-/// raw slot receives a different handle. The context salt keeps otherwise
-/// equal arena indices from aliasing across contexts.
+/// The payload is the node's stable 1-based index into [`Z3Context::pub_ast`],
+/// not a reusable raw `TermId`; the context salt keeps equal indices of two
+/// contexts from aliasing.
+#[inline]
+pub(crate) fn pub_id_to_ast(ctx: &Z3Context, id: pub_ast::PubId) -> Z3_ast {
+    (u64::from(ctx.handle_salt) << TERM_AST_SALT_SHIFT) | (u64::from(id.raw()) + 1)
+}
+
+/// The node an untagged AST of `ctx` names, without checking that the store
+/// holds it (see [`checked_ast_to_term`]).
+#[inline]
+fn ast_to_pub_id(ctx: &Z3Context, ast: Z3_ast) -> Option<pub_ast::PubId> {
+    if !term_ast_belongs_to(ctx, ast) {
+        return None;
+    }
+    let index = (ast & TERM_AST_PAYLOAD_MASK).checked_sub(1)?;
+    Some(pub_ast::PubId::from_raw(u32::try_from(index).ok()?))
+}
+
+/// The AST of one exact engine term when the caller states no public sort.
+///
+/// It reads as the public node last minted over `term` (so a term built at a
+/// public sort keeps that sort when the engine hands it back, as a child or a
+/// model value), or as a new node at the engine's own sort. Re-exporting the
+/// same live [`Term`] therefore keeps z3's hash-consed AST identity, while a
+/// later term born in the same raw slot receives a different handle. A caller
+/// that knows the public sort passes the handle to [`record_ast_sort`].
 #[inline]
 pub(crate) fn term_to_ast(ctx: &Z3Context, term: Term) -> Z3_ast {
     if !ctx.solver.is_valid_term(term) {
         return 0;
     }
-    let Some(index) = ctx.term_asts.borrow_mut().intern(term) else {
-        return 0;
-    };
-    (u64::from(ctx.handle_salt) << TERM_AST_SALT_SHIFT) | (u64::from(index) + 1)
+    ctx.pub_ast
+        .engine_node(term)
+        .map_or(0, |id| pub_id_to_ast(ctx, id))
 }
 
 /// True exactly when an untagged, non-null term AST carries `ctx`'s salt and a
@@ -2992,25 +3319,109 @@ pub(crate) fn term_ast_belongs_to(ctx: &Z3Context, ast: Z3_ast) -> bool {
         && ast & TERM_AST_PAYLOAD_MASK != 0
 }
 
-/// Decode a term AST only when it is structurally valid, salted for `ctx`, and
-/// its exact stored capability still names the same live native term entry.
+/// Decode a term AST only when it is structurally valid, salted for `ctx`,
+/// names a node of `ctx`'s public store, and that node's exact stored
+/// capability still names the same live native term entry.
 ///
 /// This is the sole term-handle decoder. Keeping the payload conversion behind
-/// the context check and capability arena makes it impossible for a consumer
-/// to accept a same-number handle minted by another context or by a later term
+/// the context check and the store makes it impossible for a consumer to
+/// accept a same-number handle minted by another context or by a later term
 /// incarnation in this context.
 #[inline]
 pub(crate) fn checked_ast_to_term(ctx: &Z3Context, ast: Z3_ast) -> Option<Term> {
-    if !term_ast_belongs_to(ctx, ast) {
-        return None;
+    checked_ast_to_pub(ctx, ast).map(|decoded| decoded.term)
+}
+
+/// A caller's term AST, decoded: the public node it names and the live engine
+/// term that node carries. The node, not the term, is the caller's object:
+/// its public sort ([`stated_sort`]) and its handle ([`pub_to_ast`]) are the
+/// caller's, where the term may stand for several public objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PubTerm {
+    pub(crate) id: pub_ast::PubId,
+    pub(crate) term: Term,
+}
+
+/// [`checked_ast_to_term`], keeping the node.
+#[inline]
+pub(crate) fn checked_ast_to_pub(ctx: &Z3Context, ast: Z3_ast) -> Option<PubTerm> {
+    let id = ast_to_pub_id(ctx, ast)?;
+    let pub_ast::NodeData::Engine { term, .. } = ctx.pub_ast.node(id)?;
+    ctx.solver
+        .is_valid_term(term)
+        .then_some(PubTerm { id, term })
+}
+
+/// The handle of a decoded AST: returning an argument unchanged returns the
+/// caller's own handle, at the caller's own sort.
+#[inline]
+pub(crate) fn pub_to_ast(ctx: &Z3Context, decoded: PubTerm) -> Z3_ast {
+    pub_id_to_ast(ctx, decoded.id)
+}
+
+/// The public sort stated for a decoded AST; `None` when none was stated and
+/// it reads as its engine term's own sort (see [`public_sort`]).
+pub(crate) fn stated_sort(ctx: &Z3Context, decoded: PubTerm) -> Option<&Sort> {
+    let pub_ast::NodeData::Engine { sort, .. } = ctx.pub_ast.node(decoded.id)?;
+    ctx.pub_ast.sort(sort?)
+}
+
+/// The public sort of a decoded AST: the stated one, else the engine's.
+pub(crate) fn public_sort(ctx: &Z3Context, decoded: PubTerm) -> Sort {
+    stated_sort(ctx, decoded)
+        .cloned()
+        .unwrap_or_else(|| ctx.solver.term_sort(decoded.term))
+}
+
+/// The AST of the engine term `term` at the public sort `sort`: one interning
+/// of (term, sort). This is [`term_to_ast`] followed by [`record_ast_sort`].
+#[must_use = "a null AST reports a failed construction"]
+pub(crate) fn mk_ast(ctx: &mut Z3Context, term: Term, sort: Sort) -> Z3_ast {
+    if !ctx.solver.is_valid_term(term) {
+        return 0;
     }
-    let payload = ast & TERM_AST_PAYLOAD_MASK;
-    if payload > u64::from(u32::MAX) + 1 {
-        return None;
+    state_term_sort(ctx, term, sort)
+}
+
+/// The AST of an engine-produced term whose public sort the caller does not
+/// know (a child, a simplified form, a model value): [`term_to_ast`], named
+/// for what it is. A caller that knows the sort uses [`mk_ast`].
+#[inline]
+pub(crate) fn engine_ast(ctx: &Z3Context, term: Term) -> Z3_ast {
+    term_to_ast(ctx, term)
+}
+
+/// The node an engine term reads as (see [`term_to_ast`]), without minting
+/// one: `None` when no handle was ever made for the term.
+pub(crate) fn latest_pub_id(ctx: &Z3Context, term: Term) -> Option<pub_ast::PubId> {
+    ctx.pub_ast.latest(term)
+}
+
+/// The engine terms of decoded ASTs, in order.
+pub(crate) fn terms_of(decoded: &[PubTerm]) -> Vec<Term> {
+    decoded.iter().map(|d| d.term).collect()
+}
+
+/// The node an engine-produced term reads as (see [`term_to_ast`]), decoded.
+/// Every read through it goes from a term back to a public object, which is
+/// ambiguous where several public objects share the term; P4a replaces each
+/// with a walk over public nodes.
+pub(crate) fn engine_pub(ctx: &Z3Context, term: Term) -> Option<PubTerm> {
+    checked_ast_to_pub(ctx, term_to_ast(ctx, term))
+}
+
+/// The public sort stated for the node an engine-produced term reads as.
+pub(crate) fn engine_stated_sort(ctx: &Z3Context, term: Term) -> Option<&Sort> {
+    stated_sort(ctx, engine_pub(ctx, term)?)
+}
+
+/// The public sort of the node an engine-produced term reads as, else the
+/// engine's sort of the term.
+pub(crate) fn engine_public_sort(ctx: &Z3Context, term: Term) -> Sort {
+    match engine_pub(ctx, term) {
+        Some(decoded) => public_sort(ctx, decoded),
+        None => ctx.solver.term_sort(term),
     }
-    let index = usize::try_from(payload - 1).ok()?;
-    let term = ctx.term_asts.borrow().get(index)?;
-    ctx.solver.is_valid_term(term).then_some(term)
 }
 
 /// Return whether an opaque AST handle names a live object owned by `ctx`.
@@ -3024,11 +3435,12 @@ pub(crate) fn checked_ast_to_term(ctx: &Z3Context, ast: Z3_ast) -> Option<Term> 
 #[inline]
 pub(crate) fn ast_handle_belongs_to(ctx: &Z3Context, ast: Z3_ast) -> bool {
     match ast & HANDLE_TAG_MASK {
-        0 => checked_ast_to_term(ctx, ast).is_some(),
+        0 => checked_ast_to_pub(ctx, ast).is_some(),
         PROOF_AST_TAG => proof_text_for_ast(ctx, ast).is_some(),
         ALGEBRAIC_AST_TAG => ast_as_scalar(ctx, ast).is_some(),
         SORT_AST_TAG => !sort_ast_to_handle(ctx, ast).is_null(),
         FUNC_DECL_AST_TAG => !func_decl_ast_to_handle(ctx, ast).is_null(),
+        OO_AST_TAG => decode_oo_ast(ctx, ast).is_some(),
         _ => false,
     }
 }
@@ -3059,14 +3471,40 @@ pub(crate) fn require_term_ast(
     operation: &str,
     role: &str,
 ) -> Option<Term> {
-    let term = checked_ast_to_term(ctx, ast);
-    if term.is_none() {
-        ctx.last_error = Z3_INVALID_ARG;
-        ctx.error_msg = Some(format!(
-            "{operation}: {role} is null, malformed, stale, or belongs to a different context"
-        ));
+    require_ast(ctx, ast, operation, role).map(|decoded| decoded.term)
+}
+
+/// [`require_term_ast`], keeping the node.
+#[inline]
+pub(crate) fn require_ast(
+    ctx: &mut Z3Context,
+    ast: Z3_ast,
+    operation: &str,
+    role: &str,
+) -> Option<PubTerm> {
+    let decoded = checked_ast_to_pub(ctx, ast);
+    match decoded {
+        Some(decoded) => ctx.provenance.note_decoded(decoded.term),
+        None => {
+            ctx.last_error = Z3_INVALID_ARG;
+            ctx.error_msg = Some(format!(
+                "{operation}: {role} is null, malformed, stale, or belongs to a different context"
+            ));
+        }
     }
-    term
+    decoded
+}
+
+/// [`require_term_asts`], keeping the nodes.
+pub(crate) fn require_asts(
+    ctx: &mut Z3Context,
+    asts: &[Z3_ast],
+    operation: &str,
+) -> Option<Vec<PubTerm>> {
+    asts.iter()
+        .enumerate()
+        .map(|(index, &ast)| require_ast(ctx, ast, operation, &format!("argument {index}")))
+        .collect()
 }
 
 /// Authenticate a caller-owned sequence of term ASTs under one context.
@@ -3118,6 +3556,34 @@ macro_rules! require_term_asts_or_return {
 }
 pub(crate) use require_term_asts_or_return;
 
+/// [`require_term_ast_or_return`], yielding the decoded [`PubTerm`].
+macro_rules! require_ast_or_return {
+    ($ctx:expr, $ast:expr, $operation:expr, $role:expr $(,)?) => {{
+        let Some(decoded) = $crate::z3_compat::require_ast($ctx, $ast, $operation, $role) else {
+            return;
+        };
+        decoded
+    }};
+    ($ctx:expr, $ast:expr, $operation:expr, $role:expr, $fallback:expr) => {{
+        let Some(decoded) = $crate::z3_compat::require_ast($ctx, $ast, $operation, $role) else {
+            return $fallback;
+        };
+        decoded
+    }};
+}
+pub(crate) use require_ast_or_return;
+
+/// [`require_term_asts_or_return`], yielding the decoded [`PubTerm`]s.
+macro_rules! require_asts_or_return {
+    ($ctx:expr, $asts:expr, $operation:expr, $fallback:expr) => {{
+        let Some(decoded) = $crate::z3_compat::require_asts($ctx, $asts, $operation) else {
+            return $fallback;
+        };
+        decoded
+    }};
+}
+pub(crate) use require_asts_or_return;
+
 /// Apply the subset of configuration/solver params that AY actually honors.
 ///
 /// Supported keys:
@@ -3160,6 +3626,19 @@ pub(crate) fn apply_supported_params(solver: &mut Solver, params: &[(String, Str
 /// Z3 convention: returned strings are owned by the context.
 pub(crate) fn cache_string(ctx: &mut Z3Context, s: String) -> *const c_char {
     match CString::new(s) {
+        Ok(cs) => {
+            let ptr = cs.as_ptr();
+            ctx.string_cache.push(cs);
+            ptr
+        }
+        Err(_) => ptr::null(),
+    }
+}
+
+/// [`cache_string`] for text that is not UTF-8 (z3's Latin-1 `Z3_get_lstring`
+/// bytes). Null when `bytes` holds a NUL.
+pub(crate) fn cache_bytes(ctx: &mut Z3Context, bytes: Vec<u8>) -> *const c_char {
+    match CString::new(bytes) {
         Ok(cs) => {
             let ptr = cs.as_ptr();
             ctx.string_cache.push(cs);
@@ -3253,6 +3732,15 @@ pub(crate) fn ffi_try_declare_function(
             ctx.finite_set_decl_signatures
                 .insert(semantic_name, (domain.to_vec(), range.clone()));
             ctx.ffi_func_decls.insert(key, decl.clone());
+            // The caller-visible symbol of the private identity, for every
+            // path that declares (a parsed text's rebound declaration too,
+            // whose model listed `!ay.z3-func!1` for `h`).
+            ctx.ffi_decl_symbols
+                .insert(decl.name().to_string(), symbol.clone());
+            // A free function with a `Char` / finite-domain range is guarded
+            // by `∀x̄. wf(f(x̄))` in every goal that reaches it (libz3 5.1.0:
+            // `Exists x. code(ch(x)) > 196607` is unsat).
+            check_obligations::register_function_wf_guard(ctx, &decl, domain, range);
             Ok(decl)
         }
         Err(error) => {
@@ -3262,6 +3750,113 @@ pub(crate) fn ffi_try_declare_function(
             Err(error)
         }
     }
+}
+
+/// Declare a recursive function (`Z3_mk_rec_func_decl`): an identity of its
+/// own, distinct from the uninterpreted function of the same name and
+/// signature (z3 keys declarations by kind too). A second recursive
+/// declaration of one name and signature is refused as libz3 5.1.0 refuses it
+/// (`Z3_EXCEPTION`, "recursive function f already defined"); another
+/// signature is a new function.
+///
+/// # Errors
+///
+/// The error code and message, with nothing declared.
+pub(crate) fn ffi_try_declare_rec_function(
+    ctx: &mut Z3Context,
+    symbol: &SymbolKey,
+    domain: &[Sort],
+    range: &Sort,
+) -> Result<FuncDecl, (c_uint, String)> {
+    let key = (symbol.clone(), domain.to_vec(), range.clone());
+    if ctx.ffi_rec_func_decls.contains_key(&key) {
+        return Err((
+            Z3_EXCEPTION,
+            format!(
+                "recursive function {} already defined",
+                symbol.display_name()
+            ),
+        ));
+    }
+    if domain
+        .iter()
+        .chain(std::iter::once(range))
+        .any(|sort| has_unsupported_finite_set_datatype_embedding(ctx, sort))
+    {
+        return Err((
+            Z3_SORT_ERROR,
+            "a datatype containing FiniteSet fields cannot be lowered without changing the \
+             datatype identity"
+                .to_string(),
+        ));
+    }
+    let semantic_name = format!("!ay.z3-func!{}", ctx.next_ffi_fresh_id);
+    ctx.next_ffi_fresh_id += 1;
+    let engine_domain: Vec<Sort> = domain
+        .iter()
+        .map(|sort| finite_set_engine_public_sort(ctx, sort))
+        .collect();
+    let engine_range = finite_set_engine_public_sort(ctx, range);
+    let decl = ctx
+        .solver
+        .try_declare_fun(&semantic_name, &engine_domain, engine_range)
+        .map_err(|e| (Z3_SORT_ERROR, e.to_string()))?;
+    ctx.finite_set_decl_signatures
+        .insert(semantic_name, (domain.to_vec(), range.clone()));
+    ctx.ffi_rec_func_decls.insert(key, decl.clone());
+    ctx.ffi_decl_symbols
+        .insert(decl.name().to_string(), symbol.clone());
+    Ok(decl)
+}
+
+/// Whether `decl` was declared by `Z3_mk_rec_func_decl`.
+pub(crate) fn is_rec_func_decl(ctx: &Z3Context, decl: &FuncDecl) -> bool {
+    ctx.ffi_rec_func_decls
+        .values()
+        .any(|rec| rec.name() == decl.name())
+}
+
+/// Why a datatype named `name` (engine name) cannot be declared beside the
+/// context's sorts: an uninterpreted sort of that name exists. Both lower to
+/// the engine sort `Uninterpreted(name)`, so the datatype's constructor
+/// axioms would constrain the uninterpreted sort (measured: `DeclareSort('C')`
+/// and `EnumSort('C', [r, g])` answered `Distinct(a, b, c)` over the former
+/// `unsat`; libz3 5.1.0 keeps them apart and answers `sat`).
+pub(crate) fn datatype_name_collision(ctx: &mut Z3Context, name: &str) -> Option<String> {
+    let engine_uninterpreted = matches!(
+        ctx.solver.resolve_sort_name(name),
+        Some(Sort::Uninterpreted(_))
+    );
+    let taken = ctx.uninterpreted_sort_names.contains(name)
+        || (engine_uninterpreted && !is_known_datatype_name(ctx, name));
+    taken.then(|| {
+        format!(
+            "sort '{name}' is already declared as an uninterpreted sort; AY cannot keep a \
+             datatype of the same name apart from it"
+        )
+    })
+}
+
+/// Whether the API or a parsed text declared a datatype named `name`.
+fn is_known_datatype_name(ctx: &Z3Context, name: &str) -> bool {
+    ctx.text_datatypes.contains_key(name)
+        || ctx
+            .ffi_sort_symbols
+            .keys()
+            .any(|sort| matches!(sort, Sort::Datatype(dt) if dt.name == name))
+}
+
+/// Why an uninterpreted sort named `name` (engine name) cannot be declared:
+/// a datatype of that name exists (see [`datatype_name_collision`]).
+pub(crate) fn uninterpreted_sort_name_collision(ctx: &mut Z3Context, name: &str) -> Option<String> {
+    let taken = matches!(ctx.solver.resolve_sort_name(name), Some(Sort::Datatype(_)))
+        || is_known_datatype_name(ctx, name);
+    taken.then(|| {
+        format!(
+            "sort '{name}' is already declared as a datatype; AY cannot keep an uninterpreted \
+             sort of the same name apart from it"
+        )
+    })
 }
 
 /// Translate private declaration/sort identities in formatted solver text back
@@ -3278,7 +3873,7 @@ pub(crate) fn apply_surface_replacements(
     rendered: &str,
     replacements: &HashMap<String, String>,
 ) -> String {
-    if replacements.is_empty() {
+    if replacements.is_empty() && !rendered.contains("__db") {
         return rendered.to_string();
     }
     let bytes = rendered.as_bytes();
@@ -3320,7 +3915,20 @@ pub(crate) fn apply_surface_replacements(
             }
         }
         let token = &rendered[start..i];
-        out.push_str(replacements.get(token).map_or(token, String::as_str));
+        if let Some(replacement) = replacements.get(token) {
+            out.push_str(replacement);
+            continue;
+        }
+        // A de Bruijn bound variable prints as z3 prints one: `(:var i)`
+        // (it printed `__db0` or `|__db0:1|`).
+        let bare = token
+            .strip_prefix('|')
+            .and_then(|t| t.strip_suffix('|'))
+            .unwrap_or(token);
+        match ay_dpll::api::de_bruijn_index(bare) {
+            Some(index) => out.push_str(&format!("(:var {index})")),
+            None => out.push_str(token),
+        }
     }
     out
 }
@@ -3370,39 +3978,70 @@ pub(crate) fn ffi_surface_text(ctx: &Z3Context, rendered: &str) -> String {
 /// `[0, AY_MAX_CHAR]`.
 pub(crate) const AY_MAX_CHAR: i64 = 196607;
 
-/// Record the sort for an AST handle.
+/// The AST for `ast`'s engine term at the public sort `sort`: interning
+/// (term, sort) in the public store, which may mint a different handle from
+/// `ast` (the finite-domain value 3 and the integer 3 are one engine term and
+/// two z3 ASTs). Callers return the result, never `ast`.
+///
+/// A handle whose node has no sort yet takes `sort` in place and is returned
+/// unchanged. A null, foreign or stale `ast` is returned unchanged.
 ///
 /// If `sort` is [`Sort::Char`] or a [`Sort::FiniteDomain`], this also wires the
 /// standing invariant `0 <= t <= hi` for the term (once per bound), so a free
 /// `Char` / finite-domain value is never an unbounded `Int`. See
 /// [`emit_range_axiom`].
-pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) {
-    let belongs_to_context = term_ast_belongs_to(ctx, ast);
+#[must_use = "the public sort may re-intern the handle: return the result, not the argument"]
+pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) -> Z3_ast {
     debug_assert!(
-        belongs_to_context,
+        term_ast_belongs_to(ctx, ast),
         "attempted to record a foreign or malformed term AST"
     );
-    if !belongs_to_context {
-        return;
-    }
-    if ast != 0 {
-        if sort.is_char() {
-            emit_range_axiom(ctx, ast, AY_MAX_CHAR);
-        } else if let Some(size) = sort.finite_domain_size() {
-            // `size >= 1` is enforced at `Z3_mk_finite_domain_sort`; saturate
-            // defensively (a `>= i64::MAX` domain is unbounded in practice).
-            let hi = i64::try_from(size.saturating_sub(1)).unwrap_or(i64::MAX);
-            emit_range_axiom(ctx, ast, hi);
-        }
-    }
-    let idx = (ast & TERM_AST_PAYLOAD_MASK) as usize;
-    if idx >= ctx.ast_sorts.len() {
-        ctx.ast_sorts.resize(idx + 1, None);
-    }
-    ctx.ast_sorts[idx] = Some(sort);
+    let Some(term) = checked_ast_to_term(ctx, ast) else {
+        return ast;
+    };
+    state_term_sort(ctx, term, sort)
 }
 
-/// Push the range invariant `0 <= t <= hi` for the term behind `ast` into
+/// [`record_ast_sort`] for the live engine term `term`.
+fn state_term_sort(ctx: &mut Z3Context, term: Term, sort: Sort) -> Z3_ast {
+    if sort.is_char() {
+        emit_range_axiom(ctx, term, AY_MAX_CHAR);
+    } else if let Some(size) = sort.finite_domain_size() {
+        // `size >= 1` is enforced at `Z3_mk_finite_domain_sort`; saturate
+        // defensively (a `>= i64::MAX` domain is unbounded in practice).
+        let hi = i64::try_from(size.saturating_sub(1)).unwrap_or(i64::MAX);
+        emit_range_axiom(ctx, term, hi);
+    } else if matches!(sort, Sort::Array(_) | Sort::Datatype(_) | Sort::Seq(_)) {
+        // A free `Array(_, Char)` constant is guarded by `∀i. wf(a[i])`
+        // in every goal that reaches it (libz3 5.1.0: `Exists x.
+        // code(A[x]) > 196607` is unsat); a datatype or sequence constant
+        // with such a component refuses the binder goals that reach it.
+        check_obligations::register_constant_wf_guard(ctx, term, &sort);
+    }
+    let Some(sort_id) = ctx.pub_ast.intern_sort(&sort) else {
+        return 0;
+    };
+    let Some((id, previous)) = ctx.pub_ast.sorted_node(term, sort_id) else {
+        return 0;
+    };
+    // A bare engine term reads as its latest public node. While some readers
+    // still go from a term back to a handle (a quantifier's bound variables),
+    // re-sorting a Char/FD term away from its bounded sort is recorded, so
+    // those readers can refuse instead of reading an unbounded Int.
+    if let Some(previous) = previous.filter(|&previous| previous != sort_id) {
+        if ctx
+            .pub_ast
+            .sort(previous)
+            .and_then(bounded_sort_hi)
+            .is_some()
+        {
+            ctx.bounded_sort_lost.insert(term);
+        }
+    }
+    pub_id_to_ast(ctx, id)
+}
+
+/// Push the range invariant `0 <= t <= hi` for the term `t` into
 /// `ctx.background_axioms` (deduped, once per interned term per bound).
 ///
 /// SOUNDNESS: a `Char` (`hi = 196607`, the exact range Z3 enforces via
@@ -3413,11 +4052,7 @@ pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) {
 /// a finite domain) stay unsat in AY. The bound only ADDS a constraint, so it
 /// can never flip unsat→sat; and it is trivially satisfiable, so it introduces
 /// no spurious unsat. For an in-range *literal* it is redundant and folds away.
-fn emit_range_axiom(ctx: &mut Z3Context, ast: Z3_ast, hi_inclusive: i64) {
-    let Some(t) = checked_ast_to_term(ctx, ast) else {
-        debug_assert!(false, "internal range axiom received an invalid term AST");
-        return;
-    };
+fn emit_range_axiom(ctx: &mut Z3Context, t: Term, hi_inclusive: i64) {
     if !ctx.range_bounded.insert((t, hi_inclusive)) {
         return; // this exact range invariant was already emitted for this term
     }
@@ -3452,11 +4087,24 @@ pub(crate) fn bounded_sort_hi(sort: &Sort) -> Option<i64> {
     }
 }
 
-/// Look up sort for an AST handle
+/// The public sort stated for an AST handle; `None` when the handle is not a
+/// live term of `ctx` or no sort was stated for it (it then reads as the
+/// engine term's own sort).
 pub(crate) fn lookup_ast_sort(ctx: &Z3Context, ast: Z3_ast) -> Option<&Sort> {
-    checked_ast_to_term(ctx, ast)?;
-    let idx = (ast & TERM_AST_PAYLOAD_MASK) as usize;
-    ctx.ast_sorts.get(idx).and_then(|s| s.as_ref())
+    let id = ast_to_pub_id(ctx, ast)?;
+    let pub_ast::NodeData::Engine { term, sort } = ctx.pub_ast.node(id)?;
+    if !ctx.solver.is_valid_term(term) {
+        return None;
+    }
+    ctx.pub_ast.sort(sort?)
+}
+
+/// The public sort of `ast` (the decoded `term`): the stated one, else the
+/// engine's. The PubId-aware form is [`public_sort`].
+pub(crate) fn public_ast_sort(ctx: &Z3Context, ast: Z3_ast, term: Term) -> Sort {
+    lookup_ast_sort(ctx, ast)
+        .cloned()
+        .unwrap_or_else(|| ctx.solver.sort_of(term))
 }
 
 /// Allocate a sort handle and register it in the context arena (#5498).
@@ -3477,22 +4125,17 @@ pub(crate) fn lookup_ast_sort(ctx: &Z3Context, ast: Z3_ast) -> Option<&Sort> {
 /// owning pointer per sort id and `Drop`'s `drain_arena` still frees each box
 /// exactly once.
 pub(crate) fn alloc_sort(ctx: &mut Z3Context, sort: Sort) -> Z3_sort {
-    let sort_id = if let Some(&id) = ctx.sort_ids.get(&sort) {
-        id
-    } else {
-        let id = ctx.next_sort_id;
-        ctx.next_sort_id += 1;
-        ctx.sort_ids.insert(sort.clone(), id);
-        id
+    let Some(sort_id) = ctx.pub_ast.intern_sort(&sort).map(pub_ast::SortId::raw) else {
+        return ptr::null_mut();
     };
     // This is the single sort-allocation path, so `sort_ast_handles` cannot
-    // desync from `sort_ids`.
+    // desync from the store's sort ids.
     let idx = sort_id as usize;
     if idx >= ctx.sort_ast_handles.len() {
         ctx.sort_ast_handles.resize(idx + 1, ptr::null_mut());
     }
     debug_assert!(
-        ctx.sort_ast_handles.len() <= ctx.next_sort_id as usize + 1,
+        ctx.sort_ast_handles.len() <= ctx.pub_ast.sort_count() + 1,
         "sort_ast_handles must track sort_id assignment"
     );
     if !ctx.sort_ast_handles[idx].is_null() {
@@ -3539,7 +4182,7 @@ fn handle_salt_matches(ctx: &Z3Context, a: Z3_ast) -> bool {
 /// inserting the value so no two objects can acquire the same handle.
 pub(crate) fn encode_indexed_ast(ctx: &Z3Context, tag: u64, index: usize) -> Option<Z3_ast> {
     debug_assert_eq!(tag & HANDLE_TAG_MASK, tag);
-    debug_assert_eq!(tag.count_ones(), 1);
+    debug_assert_ne!(tag, 0);
     let index = u32::try_from(index).ok()?;
     Some(tag | (u64::from(ctx.handle_salt) << HANDLE_SALT_SHIFT) | u64::from(index))
 }
@@ -3551,7 +4194,7 @@ pub(crate) fn encode_indexed_ast(ctx: &Z3Context, tag: u64, index: usize) -> Opt
 /// the caller's responsibility because each tagged kind has a different store.
 pub(crate) fn decode_indexed_ast(ctx: &Z3Context, a: Z3_ast, tag: u64) -> Option<usize> {
     debug_assert_eq!(tag & HANDLE_TAG_MASK, tag);
-    debug_assert_eq!(tag.count_ones(), 1);
+    debug_assert_ne!(tag, 0);
     if a & HANDLE_TAG_MASK != tag || !handle_salt_matches(ctx, a) {
         return None;
     }
@@ -3561,6 +4204,33 @@ pub(crate) fn decode_indexed_ast(ctx: &Z3Context, a: Z3_ast, tag: u64) -> Option
         return None;
     }
     Some((a & TAGGED_AST_INDEX_MASK) as usize)
+}
+
+/// Mint this context's `+oo` (`negative == false`) or `-oo` AST handle.
+/// Value-canonical: the same inputs always produce the identical `u64`,
+/// so `Z3_is_eq_ast` (raw equality) holds across calls, as in z3.
+pub(crate) fn oo_ast(ctx: &Z3Context, negative: bool) -> Z3_ast {
+    encode_indexed_ast(ctx, OO_AST_TAG, usize::from(negative)).unwrap_or(0)
+}
+
+/// Decode an `oo` AST handle to its sign (`Some(true)` = `-oo`), or
+/// `None` for a foreign/forged/malformed handle.
+pub(crate) fn decode_oo_ast(ctx: &Z3Context, a: Z3_ast) -> Option<bool> {
+    match decode_indexed_ast(ctx, a, OO_AST_TAG)? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// z3's exact renderings of the two infinity ASTs (measured libz3
+/// 5.1.0: `oo` and `(* (- 1) oo)`).
+pub(crate) fn oo_ast_string(negative: bool) -> &'static str {
+    if negative {
+        "(* (- 1) oo)"
+    } else {
+        "oo"
+    }
 }
 
 /// Decode a SORT-AST handle back to the canonical `SortHandle`, or null if the
@@ -3592,6 +4262,7 @@ pub(crate) unsafe fn func_decl_handle_to_ast(ctx: &mut Z3Context, d: Z3_func_dec
             params: (*d).params.clone(),
             dt_op: DtOpKind::of((*d).dt_op.as_ref()),
             finite_set_op: (*d).finite_set_op,
+            value: (*d).value,
         }
     };
     let idx = if let Some(&i) = ctx.decl_ast_ids.get(&key) {
@@ -3606,11 +4277,9 @@ pub(crate) unsafe fn func_decl_handle_to_ast(ctx: &mut Z3Context, d: Z3_func_dec
 }
 
 /// Decode a FUNC-DECL-AST handle back to the canonical `FuncDeclHandle`, or
-/// null if the value is not a live func-decl-ast of this context. The returned
-/// pointer is the CANONICAL handle for the declaration and may differ from the
-/// pointer the ast was minted from; equality is by value
-/// (`Z3_is_eq_func_decl` value-compares) — documented divergence from z3's
-/// hash-consed pointer identity.
+/// null if the value is not a live func-decl-ast of this context. Declaration
+/// handles are hash-consed at mint, so the returned pointer is the one every
+/// presentation of this declaration yields.
 pub(crate) fn func_decl_ast_to_handle(ctx: &Z3Context, a: Z3_ast) -> Z3_func_decl {
     let Some(idx) = decode_indexed_ast(ctx, a, FUNC_DECL_AST_TAG) else {
         return ptr::null_mut();
@@ -3675,6 +4344,40 @@ pub(crate) fn cache_func_decl_with_params(
     decl: FuncDecl,
     params: Vec<c_int>,
 ) -> Z3_func_decl {
+    cache_func_decl_interned(ctx, decl, params, None)
+}
+
+/// Mint a declaration handle carrying a finite-set operator, through the
+/// same interning as ordinary declarations (the operator is part of the
+/// key, so it must be known at mint time rather than patched in after).
+pub(crate) fn cache_func_decl_with_finite_set_op(
+    ctx: &mut Z3Context,
+    decl: FuncDecl,
+    op: FiniteSetOp,
+) -> Z3_func_decl {
+    cache_func_decl_interned(ctx, decl, Vec::new(), Some(op))
+}
+
+/// The single mint for non-datatype declaration handles: hash-consed by
+/// [`DeclAstKey`], so every presentation of one declaration — repeated
+/// `Z3_mk_func_decl`, `Z3_get_app_decl` round-trips, builtin operators —
+/// yields the same handle (z3 hash-conses decls as ASTs).
+fn cache_func_decl_interned(
+    ctx: &mut Z3Context,
+    decl: FuncDecl,
+    params: Vec<c_int>,
+    finite_set_op: Option<FiniteSetOp>,
+) -> Z3_func_decl {
+    let key = DeclAstKey {
+        decl: decl.clone(),
+        params: params.clone(),
+        dt_op: DtOpKind::None,
+        finite_set_op,
+        value: None,
+    };
+    if let Some(&handle) = ctx.func_decl_intern.get(&key) {
+        return handle;
+    }
     let symbol = ctx.ffi_decl_symbols.get(decl.name()).cloned();
     let decl_id = ctx.next_decl_id;
     ctx.next_decl_id += 1;
@@ -3683,8 +4386,34 @@ pub(crate) fn cache_func_decl_with_params(
         symbol,
         params,
         dt_op: None,
+        finite_set_op,
+        decl_id,
+        value: None,
+    }));
+    ctx.func_decl_cache.push(handle);
+    ctx.func_decl_intern.insert(key, handle);
+    handle
+}
+
+/// Allocate the declaration of a literal ([`ValueDecl`]): a nullary decl
+/// named `name` (z3's `true`/`false`/`Int`/`Real`/`bv`/`String`) whose
+/// caller-visible symbol is exactly `name`.
+pub(crate) fn cache_value_func_decl(
+    ctx: &mut Z3Context,
+    name: &str,
+    range: Sort,
+    value: ValueDecl,
+) -> Z3_func_decl {
+    let decl_id = ctx.next_decl_id;
+    ctx.next_decl_id += 1;
+    let handle = Box::into_raw(Box::new(FuncDeclHandle {
+        decl: FuncDecl::new(name.to_string(), Vec::new(), range),
+        symbol: Some(SymbolKey::String(name.to_string())),
+        params: Vec::new(),
+        dt_op: None,
         finite_set_op: None,
         decl_id,
+        value: Some(value),
     }));
     ctx.func_decl_cache.push(handle);
     handle
@@ -3809,9 +4538,24 @@ pub(crate) fn cache_dt_func_decl(
         Ok(authenticated) => authenticated,
         Err(_) => decl,
     };
+    let key = DeclAstKey {
+        decl: decl.clone(),
+        params: Vec::new(),
+        dt_op: DtOpKind::of(Some(&dt_op)),
+        finite_set_op: None,
+        value: None,
+    };
+    if let Some(&handle) = ctx.func_decl_intern.get(&key) {
+        return handle;
+    }
     let symbol = ctx.ffi_decl_symbols.get(decl.name()).cloned();
     let decl_id = ctx.next_decl_id;
     ctx.next_decl_id += 1;
+    let index_key = (
+        decl.name().to_string(),
+        decl.domain().to_vec(),
+        decl.range().clone(),
+    );
     let handle = Box::into_raw(Box::new(FuncDeclHandle {
         decl,
         symbol,
@@ -3819,8 +4563,11 @@ pub(crate) fn cache_dt_func_decl(
         dt_op: Some(dt_op),
         finite_set_op: None,
         decl_id,
+        value: None,
     }));
     ctx.func_decl_cache.push(handle);
+    ctx.func_decl_intern.insert(key, handle);
+    ctx.dt_decl_index.insert(index_key, handle);
     handle
 }
 
@@ -3832,6 +4579,25 @@ pub(crate) fn cache_dt_func_decl_with_symbol(
     dt_op: DatatypeOp,
     symbol: SymbolKey,
 ) -> Z3_func_decl {
+    // A recognizer's caller-visible name is the canonical tester spelling
+    // `is-<ctor>` (the core decl's own name), never the symbol handed to
+    // `Z3_mk_constructor`: libz3 ignores that symbol for decl naming (its
+    // recognizers are all named `is`), so a consumer may pass a placeholder
+    // (`"r"`) and still pattern-match `Z3_get_decl_name` on the `is` prefix.
+    // Preserving the placeholder broke exactly that check. When the
+    // constructor's own name lives in the private symbol namespace (integer
+    // or escaped symbols), the decl name would leak that encoding; fall back
+    // to libz3's bare `is`, which is what libz3 returns there too.
+    let symbol = if matches!(dt_op, DatatypeOp::Recognizer { .. }) {
+        let decl_name = decl.name();
+        let visible = match decl_name.strip_prefix("is-") {
+            Some(suffix) if suffix.starts_with("!ay.z3-symbol.") => "is".to_string(),
+            _ => decl_name.to_string(),
+        };
+        SymbolKey::String(visible)
+    } else {
+        symbol
+    };
     if let DatatypeOp::Recognizer { ctor } = &dt_op {
         if let Some(dt_sort) = decl.domain().first() {
             ctx.ffi_dt_recognizers
@@ -3942,7 +4708,15 @@ pub(crate) fn cache_goal_with_depth(
     formulas: Vec<Z3_ast>,
     depth: usize,
 ) -> Z3_goal {
-    let handle = Box::into_raw(Box::new(GoalHandle { formulas, depth }));
+    let handle = Box::into_raw(Box::new(GoalHandle {
+        formulas,
+        depth,
+        model_converter: None,
+        models: true,
+        proofs: false,
+        unsat_cores: false,
+        context: ctx as *mut Z3Context,
+    }));
     ctx.goal_cache.push(handle);
     handle
 }
@@ -3968,8 +4742,11 @@ pub(crate) fn cache_parser_context(ctx: &mut Z3Context) -> Z3_parser_context {
     let handle = Box::into_raw(Box::new(ParserContextHandle {
         added_sorts: Vec::new(),
         added_decls: Vec::new(),
+        parse_prior: parse_binding::ParsePrior::default(),
         refcount: 0,
     }));
     ctx.parser_context_cache.push(handle);
     handle
 }
+
+pub use finite_field::*;

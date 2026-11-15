@@ -48,6 +48,11 @@ thiserror.workspace = true
 ay-test-support.workspace = true
 proptest.workspace = true
 
+# Files outside `src/` that this crate's shipped code embeds (`include_str!`):
+# inputs of every build-provenance stamp built from it (build_support/provenance_scope.rs).
+[package.metadata.ay-provenance]
+inputs = ["tooling_env_names.txt"]
+
 [lints]
 workspace = true
 

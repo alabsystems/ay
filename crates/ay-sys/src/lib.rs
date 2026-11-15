@@ -13,6 +13,7 @@
 //! operations. It is one of the small set of boundary crates in the AY
 //! workspace that permits `unsafe` code, keeping OS calls centralized and
 //! auditable.
+
 //!
 //! ## Why this crate exists
 //!
@@ -21,22 +22,77 @@
 //! code.
 
 use std::alloc::{GlobalAlloc, Layout};
+
+/// Native allocation granularity, observed without a fallback guess. This is
+/// data, not memory custody or an admission grant.
+#[must_use]
+pub fn allocation_page_size() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf's page-size selector has no pointer/preconditions and
+        // returns a scalar or -1; invalid/unavailable values are refused.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(page).ok().filter(|page| *page != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+pub mod build_observation;
+pub mod child_pipe;
+pub mod compute_budget;
+#[cfg(target_os = "macos")]
+pub mod darwin_child;
+#[cfg(unix)]
+pub mod early_sigterm;
+pub mod embedded_python;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs;
 #[cfg(windows)]
 #[path = "fs_windows.rs"]
 pub mod fs;
 pub mod govern;
+pub mod memory_ceiling;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod memory_observation;
+pub mod memory_observations;
+pub mod metadata_capture;
+pub mod owned_child;
 #[cfg(unix)]
 pub mod supervisor;
+pub mod thread_clock;
 pub mod time;
 #[cfg(windows)]
 pub mod windows_fs;
+pub mod z3_oracle;
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+mod ceiling_settlement;
+mod footprint_cache;
 mod hard_ceiling_writer;
+mod live_bytes;
+pub mod memory_governor;
+mod memory_group;
+#[cfg(target_os = "linux")]
+mod statm;
+pub use live_bytes::{add_live_bytes, current_live_bytes, sub_live_bytes};
+#[cfg(test)]
+use live_bytes::{
+    add_to_stripe_for_test, caller_stripe_index_for_test, exact_live_bytes, published_live_bytes,
+    stripe_balance_for_test, LIVE_BYTES_BATCH, STRIPES,
+};
+pub use memory_group::{
+    charge_current_for_testing, current_memory_group_observation,
+    current_memory_group_over_hard_limit, current_memory_group_soft_tripped, enter_memory_group,
+    memory_group_census, shed_fattest_memory_group, try_current_memory_group_observation,
+    MemoryGroup, MemoryGroupObservation, MemoryGroupScope, MemoryGroupUsage,
+};
 
+pub use ceiling_settlement::{
+    set_hard_memory_ceiling_settlement, write_stderr_unlocked, CeilingSettlement,
+};
 use hard_ceiling_writer::{write_fd, STDERR_FD, STDOUT_FD};
 
 /// Process-wide memory limit in bytes. 0 = no limit.
@@ -52,24 +108,14 @@ static PROCESS_MEMORY_LIMIT: AtomicUsize = AtomicUsize::new(0);
 /// never kill its host, so [`set_process_memory_limit`] does not arm this.
 static HARD_MEMORY_CEILING: AtomicUsize = AtomicUsize::new(0);
 
-/// One-shot latch so concurrently allocating threads cannot interleave the
-/// verdict when the ceiling is breached.
+/// One-shot latch: the first thread to breach settles the run and ends the
+/// process, and every later one parks, so neither the verdict nor the
+/// settlement can be cut short or interleaved.
 static HARD_MEMORY_CEILING_FIRED: AtomicBool = AtomicBool::new(false);
 
 /// What to emit on breach; null until armed.
 static HARD_MEMORY_CEILING_ACTION: AtomicPtr<HardMemoryCeiling> =
     AtomicPtr::new(std::ptr::null_mut());
-
-/// Live bytes currently allocated through [`CountingAllocator`], summed across
-/// all threads. 0 when no counting allocator is installed.
-///
-/// This is the **instantaneous** heap signal: it is incremented on every
-/// `alloc`/`realloc`-grow and decremented on every `dealloc`/`realloc`-shrink,
-/// so it reflects a bulk allocation the moment it happens — before the OS's RSS
-/// (`getrusage`, which we read via [`current_rss_bytes`]) catches up, and before
-/// an OOM-killer can fire. Two relaxed atomics per allocation, no syscalls, no
-/// polling. See [`CountingAllocator`].
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// Test-only per-thread override forcing [`process_memory_exceeded`] to
@@ -81,6 +127,21 @@ thread_local! {
     /// spawn-failure test hook.
     static FORCE_PROCESS_MEMORY_EXCEEDED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    /// Test-only per-thread override forcing the *predictive* (sub-95%)
+    /// thresholds of [`process_memory_exceeded_at_percent`] to return `true` on
+    /// the current thread, without affecting the hard 95% guard.
+    ///
+    /// Separate from [`FORCE_PROCESS_MEMORY_EXCEEDED`] because that hook
+    /// deliberately represents a REAL >=95% breach and is ignored by the
+    /// predictive probes. Without a hook of its own, a test covering a
+    /// predictive backpressure path (e.g. the optimizer's pre-clone guard) had
+    /// to flip the process-global `PROCESS_MEMORY_LIMIT` to a tiny value — which
+    /// every solve on every OTHER test thread also observes for the duration,
+    /// aborting them to `Unknown` and making unrelated tests fail under load
+    /// while passing in isolation. Thread-local state cannot leak that way.
+    static FORCE_PROCESS_MEMORY_PREDICTIVE_EXCEEDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Test-only: force (or clear) [`process_memory_exceeded`] on the current thread.
@@ -90,6 +151,19 @@ thread_local! {
 #[doc(hidden)]
 pub fn force_process_memory_exceeded_for_testing(force: bool) {
     FORCE_PROCESS_MEMORY_EXCEEDED.with(|cell| cell.set(force));
+}
+
+/// Test-only: force (or clear) the *predictive* (sub-95%) memory thresholds of
+/// [`process_memory_exceeded_at_percent`] on the current thread. The hard 95%
+/// guard is unaffected — use [`force_process_memory_exceeded_for_testing`] for
+/// that.
+///
+/// Thread-local by design: it lets a test exercise a pre-allocation backpressure
+/// path without flipping the process-global limit that concurrently running
+/// tests share.
+#[doc(hidden)]
+pub fn force_process_memory_predictive_exceeded_for_testing(force: bool) {
+    FORCE_PROCESS_MEMORY_PREDICTIVE_EXCEEDED.with(|cell| cell.set(force));
 }
 
 /// Set the process-wide memory limit in bytes.
@@ -110,7 +184,9 @@ pub fn get_process_memory_limit() -> usize {
 /// Check if the process has exceeded its memory limit.
 ///
 /// Returns `false` if no limit is set (limit == 0) or if measurement fails.
-/// This is cheap to call (single syscall, no subprocess).
+/// Each enabled poll uses a footprint reading at most 2 ms old (one system
+/// call per window, not per poll: `footprint_cache`); fallback signals are
+/// read only when the preference policy needs them.
 ///
 /// The signals are consulted in preference order against the same limit
 /// (see [`memory_signals_exceed`] for the pinned policy):
@@ -124,7 +200,8 @@ pub fn get_process_memory_limit() -> usize {
 ///    peak in (5700,6175] MB while physical settled at 4.79 GB) and aborted
 ///    runs the physical budget allowed.
 /// 2. **Live heap bytes** ([`current_live_bytes`]), fallback when no
-///    footprint API exists: exact and instantaneous when a
+///    footprint API exists: instantaneous for bursts, and within one
+///    64 KiB batch per active stack window otherwise, when a
 ///    [`CountingAllocator`] is installed (the `ay` binary installs one); 0
 ///    for library consumers, in which case only signal 3 applies.
 /// 3. **Peak RSS** ([`current_rss_bytes`]): the OS's view via `getrusage`.
@@ -135,7 +212,7 @@ pub fn get_process_memory_limit() -> usize {
 ///
 /// Burst protection does NOT live here: the allocator's hard ceiling
 /// ([`arm_hard_memory_ceiling`], enforced synchronously in [`add_live_bytes`]
-/// on exact live bytes) is what refuses the growth no checkpoint ever saw —
+/// on live bytes) is what refuses the growth no checkpoint ever saw —
 /// e.g. the 82.75 GB SmallVec runaway class — and it deliberately keeps the
 /// live-bytes signal.
 pub fn process_memory_exceeded() -> bool {
@@ -164,6 +241,12 @@ pub fn process_memory_exceeded_at_percent(percent: usize) -> bool {
         // so a forced "exceeded" still exercises the hard-limit code paths.
         return true;
     }
+    if percent < 95 && FORCE_PROCESS_MEMORY_PREDICTIVE_EXCEEDED.with(std::cell::Cell::get) {
+        // Companion test-only hook for the PREDICTIVE thresholds only, so a test
+        // can drive pre-allocation backpressure without the process-global limit
+        // (and therefore without disturbing concurrent solves on other threads).
+        return true;
+    }
     let limit = PROCESS_MEMORY_LIMIT.load(Ordering::Relaxed);
     if limit == 0 {
         return false;
@@ -171,12 +254,33 @@ pub fn process_memory_exceeded_at_percent(percent: usize) -> bool {
     // Trigger at `percent`% of limit (95% for the hard guard; lower for
     // pre-allocation backpressure) to leave headroom for graceful cleanup.
     let threshold = limit.saturating_mul(percent) / 100;
-    memory_signals_exceed(
+    memory_signals_exceed_with(
         threshold,
-        current_footprint_bytes(),
-        current_live_bytes(),
-        current_rss_bytes(),
+        footprint_cache::cached_footprint_bytes,
+        current_live_bytes,
+        current_rss_bytes,
     )
+}
+
+/// Acquire only the signals used by the pinned advisory policy. The footprint
+/// provider is the cached reading (`footprint_cache`); refusal state is not
+/// cached.
+#[inline]
+fn memory_signals_exceed_with(
+    threshold: usize,
+    footprint: impl FnOnce() -> usize,
+    live: impl FnOnce() -> usize,
+    rss: impl FnOnce() -> usize,
+) -> bool {
+    let footprint = footprint();
+    if footprint > 0 {
+        return memory_signals_exceed(threshold, footprint, 0, 0);
+    }
+    let live = live();
+    if live > threshold {
+        return true;
+    }
+    memory_signals_exceed(threshold, 0, live, rss())
 }
 
 /// The advisory's signal-preference policy, pure so it is pinned by tests.
@@ -197,10 +301,11 @@ pub fn process_memory_exceeded_at_percent(percent: usize) -> bool {
 /// footprint reading exists: live bytes count reserved-but-untouched
 /// capacity, measured ~20-25% above physical on the .xz giants, and aborted
 /// runs the physical budget allowed. Bursts between checkpoints are the hard
-/// ceiling's job ([`add_live_bytes`]), which keeps exact live bytes.
+/// ceiling's job ([`add_live_bytes`]), which keeps live bytes to within one
+/// 64 KiB batch per active stack window.
 ///
 /// Signal 2 (fallback, platforms with no footprint API): live heap bytes —
-/// exact, instantaneous, no syscall; 0 when no [`CountingAllocator`] is
+/// instantaneous for bursts, no syscall; 0 when no [`CountingAllocator`] is
 /// installed.
 ///
 /// Signal 3 (last resort): peak RSS via `getrusage`. Conservative — never
@@ -218,7 +323,7 @@ fn memory_signals_exceed(threshold: usize, footprint: usize, live: usize, rss: u
 }
 
 /// Syscall-free subset of [`process_memory_exceeded_at_percent`]: consults ONLY
-/// the instantaneous live-heap signal (signal 1 — a single relaxed atomic load),
+/// the instantaneous live-heap signal (signal 1 — two relaxed atomic loads),
 /// never the `getrusage`/`task_info` footprint syscall.
 ///
 /// Intended as a per-call pre-check on a hot `should_stop` path: a steadily
@@ -245,50 +350,6 @@ pub fn live_bytes_exceeded_at_percent(percent: usize) -> bool {
     current_live_bytes() > threshold
 }
 
-/// Current live heap bytes tracked by [`CountingAllocator`].
-///
-/// Returns 0 when no counting allocator is installed (e.g. library consumers
-/// that keep their own allocator). Single relaxed atomic load.
-#[must_use]
-pub fn current_live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-/// Add to the live-bytes counter. Internal to [`CountingAllocator`]; exposed
-/// `#[doc(hidden)]` only so the wiring is testable without performing real
-/// allocations.
-#[doc(hidden)]
-#[inline]
-pub fn add_live_bytes(bytes: usize) {
-    let live = LIVE_BYTES
-        .fetch_add(bytes, Ordering::Relaxed)
-        .saturating_add(bytes);
-    // The only synchronous point at which growth can be refused. Every
-    // observer-based signal (checkpoint polls, the watchdog thread) can only
-    // *request* a stop, and the heap keeps growing until that request is read
-    // — measured at 3-4x the budget on a bit-blasting burst. See
-    // [`arm_hard_memory_ceiling`].
-    if hard_memory_ceiling_breached(live) {
-        breach_hard_memory_ceiling();
-    }
-}
-
-/// Subtract from the live-bytes counter. Saturating: a counter underflow would
-/// otherwise wrap to a huge value and spuriously trip the limit. Internal to
-/// [`CountingAllocator`]; see [`add_live_bytes`].
-#[doc(hidden)]
-#[inline]
-pub fn sub_live_bytes(bytes: usize) {
-    // `fetch_sub` wraps on underflow; clamp at zero instead. The CAS loop runs
-    // only in the (impossible-under-correct-pairing) underflow case, so the
-    // common path is one relaxed `fetch_sub`.
-    let prev = LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-    if prev < bytes {
-        // Underflowed past zero — restore to a non-negative floor.
-        LIVE_BYTES.fetch_add(bytes - prev, Ordering::Relaxed);
-    }
-}
-
 /// What to emit when the hard allocation ceiling is breached.
 ///
 /// The breach is detected *inside* the global allocator, so the exit path must
@@ -305,6 +366,10 @@ pub struct HardMemoryCeiling {
     pub stderr_line: &'static [u8],
     /// Status passed to `_exit`.
     pub exit_code: i32,
+    /// Writes the run's statistics to stderr after the verdict, or `None`.
+    /// Called inside the global allocator: it must not allocate, lock or run a
+    /// destructor, and it gets an allocation-free writer to stderr.
+    pub statistics: Option<fn(&mut dyn FnMut(&[u8]))>,
 }
 
 /// Arm the hard allocation ceiling at `bytes`, emitting `action` on breach.
@@ -333,7 +398,7 @@ fn hard_memory_ceiling_breached(live: usize) -> bool {
     ceiling != 0 && live > ceiling
 }
 
-/// Emit the armed verdict and leave immediately.
+/// Settle the run, emit the armed verdict, and leave.
 ///
 /// Out of line and `#[cold]` so the hot allocation path keeps only the compare.
 #[cold]
@@ -341,21 +406,43 @@ fn hard_memory_ceiling_breached(live: usize) -> bool {
 fn breach_hard_memory_ceiling() -> ! {
     let action = HARD_MEMORY_CEILING_ACTION.load(Ordering::SeqCst);
     // Armed action or not, the process must not continue growing.
-    let (stdout_line, stderr_line, exit_code) = if action.is_null() {
-        (&b"unknown\n"[..], &b"(:reason-unknown \"memout\")\n"[..], 1)
+    let (stdout_line, stderr_line, exit_code, statistics) = if action.is_null() {
+        (
+            &b"unknown\n"[..],
+            &b"(:reason-unknown \"memout\")\n"[..],
+            1,
+            None,
+        )
     } else {
         // SAFETY: `arm_hard_memory_ceiling` is the only writer and stores a
         // `&'static HardMemoryCeiling`, published before the ceiling that makes
         // this path reachable. The referent therefore outlives the process and
         // is never mutated.
         let action = unsafe { &*action };
-        (action.stdout_line, action.stderr_line, action.exit_code)
+        (
+            action.stdout_line,
+            action.stderr_line,
+            action.exit_code,
+            action.statistics,
+        )
     };
-    // Only the first thread to breach writes; a loser leaves with the same
-    // status so the two verdicts cannot interleave.
-    if !HARD_MEMORY_CEILING_FIRED.swap(true, Ordering::SeqCst) {
+    // Only the first thread to breach settles, writes and leaves. A later one
+    // parks: leaving now would end the process before the settlement had
+    // discarded what an unanswered run must not leave.
+    if HARD_MEMORY_CEILING_FIRED.swap(true, Ordering::SeqCst) {
+        ceiling_settlement::park_until_the_process_ends();
+    }
+    let (write_verdict, exit_code) = match ceiling_settlement::settle(exit_code) {
+        CeilingSettlement::ArmedVerdict => (true, exit_code),
+        CeilingSettlement::ArmedVerdictWithStatus(status) => (true, status),
+        CeilingSettlement::Silent(status) => (false, status),
+    };
+    if write_verdict {
         write_fd(STDOUT_FD, stdout_line);
         write_fd(STDERR_FD, stderr_line);
+        if let Some(write_statistics) = statistics {
+            write_statistics(&mut |bytes| write_fd(STDERR_FD, bytes));
+        }
     }
     // SAFETY: `_exit` performs no allocation and runs no atexit handler or
     // destructor, which is required here — this runs inside the global
@@ -373,9 +460,10 @@ fn breach_hard_memory_ceiling() -> ! {
 /// been published yet, say — can be released without enumerating every exit
 /// site in the binary and hoping none is ever added.
 ///
-/// It does NOT run for the `_exit` in [`breach_hard_memory_ceiling`], for
-/// `abort`, or for a signal that kills the process outright (`SIGKILL` above
-/// all). Callers must stay correct when it never runs.
+/// It does NOT run for the `_exit` in [`breach_hard_memory_ceiling`], which
+/// runs the settlement registered with [`set_hard_memory_ceiling_settlement`]
+/// instead, for `abort`, or for a signal that kills the process outright
+/// (`SIGKILL` above all). Callers must stay correct when it never runs.
 ///
 /// `handler` runs on the exiting thread with other threads still live, so it
 /// must not block on a lock another thread may hold.
@@ -390,8 +478,9 @@ pub fn at_process_exit(handler: extern "C" fn()) -> bool {
     unsafe { libc::atexit(handler) == 0 }
 }
 
-/// A `#[global_allocator]` wrapper that maintains [`LIVE_BYTES`], the exact
-/// count of live heap bytes, while delegating every allocation to an inner
+/// A `#[global_allocator]` wrapper that maintains the live-heap-byte count
+/// (the striped counter in `live_bytes`, accurate to one 64 KiB batch per
+/// active stack window), while delegating every allocation to an inner
 /// allocator `A`.
 ///
 /// # Why
@@ -400,16 +489,20 @@ pub fn at_process_exit(handler: extern "C" fn()) -> bool {
 /// allocation bursts: a single 40 GB `Vec`/`Box`/`alloc::alloc` can land — and
 /// the kernel OOM-killer can fire — in the gap between two RSS samples. By
 /// hooking the global allocator we observe the burst *synchronously*, the
-/// instant the bytes are committed, with no syscall and no polling. The solver
+/// instant the bytes are committed (any allocation of two 64 KiB batches or
+/// more is published at once), with no syscall and no polling. The solver
 /// then trips its existing cancellation at the next checkpoint and returns
 /// `Unknown` instead of panicking the machine. This is the binary's allocator
-/// only; library consumers keep their own allocator and `LIVE_BYTES` stays 0.
+/// only; library consumers keep their own allocator and the count stays 0.
 ///
 /// # Overhead
 ///
-/// Two relaxed atomics per allocation (one on alloc, one on dealloc); none on
-/// the read side beyond a single relaxed load in [`process_memory_exceeded`],
-/// which already ran at every solver checkpoint. No syscalls, no locks.
+/// One relaxed atomic add per allocation and per free, on a stripe picked by
+/// the caller's stack window; the published total is written only when a
+/// stripe's balance reaches a 64 KiB batch, so threads allocating in parallel
+/// do not contend on one cache line. The read side is two relaxed loads in
+/// [`process_memory_exceeded`], which already ran at every solver checkpoint.
+/// No syscalls, no locks.
 ///
 /// # Soundness
 ///
@@ -478,6 +571,7 @@ impl<A> MimallocCountingAllocator<A> {
         if ARENA_TRIM_DONE.swap(true, Ordering::Relaxed) {
             return;
         }
+        install_heap_purge(Self::mimalloc_collect);
 
         // v3 `mi_option_t` ordinal for `mi_option_arena_reserve`, verified
         // against the linked libmimalloc-sys 0.1.49 vendored v3 header.
@@ -500,14 +594,55 @@ impl<A> MimallocCountingAllocator<A> {
             }
         }
     }
+
+    /// The heap purge for [`purge_freed_heap_pages`]: mimalloc's forced
+    /// collect, which returns every arena page freed so far to the OS now
+    /// instead of after its purge delay (1 s in v3).
+    fn mimalloc_collect() {
+        extern "C" {
+            fn mi_collect(force: bool);
+        }
+        // SAFETY: `mi_collect` is supplied by the mimalloc linked into the
+        // binary that instantiates this wrapper; it takes no pointer argument
+        // and is callable from any thread.
+        unsafe { mi_collect(true) }
+    }
+}
+
+/// How to return freed heap pages to the OS, installed by the allocator
+/// wrapper that knows its allocator ([`MimallocCountingAllocator`]); null
+/// until then. A fn pointer in an atomic: installing it runs inside the
+/// allocator, so it must not allocate or lock.
+static HEAP_PURGE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(feature = "mimalloc-arena-trim")]
+fn install_heap_purge(purge: fn()) {
+    HEAP_PURGE.store(purge as *mut (), Ordering::Release);
+}
+
+/// Return the heap pages freed so far to the OS, when the global allocator
+/// holds them back (mimalloc keeps freed pages resident for its purge delay,
+/// so a lane that was just cancelled still counts against RSS). Returns
+/// whether a purge hook was installed. Called by the memory governor under
+/// pressure; costs one walk over the allocator's arenas.
+pub fn purge_freed_heap_pages() -> bool {
+    let hook = HEAP_PURGE.load(Ordering::Acquire);
+    if hook.is_null() {
+        return false;
+    }
+    // SAFETY: the only writer stores a `fn()` cast to `*mut ()`; function and
+    // data pointers have the same size on every supported target.
+    let purge = unsafe { std::mem::transmute::<*mut (), fn()>(hook) };
+    purge();
+    true
 }
 
 // SAFETY: All four methods forward verbatim to `self.inner`, which upholds the
-// `GlobalAlloc` contract by assumption. The only added work is updating the
-// `LIVE_BYTES` atomic with the exact `layout.size()` / `new_size` that the
-// inner allocator just (de)committed; this performs no allocation and touches
-// only a `'static` atomic, so it introduces no new safety obligations and does
-// not alter the returned pointers.
+// `GlobalAlloc` contract by assumption. The only added work is accounting the
+// exact `layout.size()` / `new_size` that the inner allocator just
+// (de)committed, in `'static` atomics and the calling thread's memory group;
+// this performs no allocation, so it introduces no new safety obligations and
+// does not alter the returned pointers.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -671,6 +806,48 @@ pub fn thread_cpu_time() -> Option<std::time::Duration> {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn current_footprint_bytes() -> usize {
+    memory_observations::observe(|| {
+        task_vm_footprint_and_resident().map_or(0, |(footprint, _)| footprint)
+    })
+}
+
+/// The larger of the physical footprint and the current resident set, in
+/// bytes: what an external memory judge can hold against this process. A
+/// harness or benchmark executor that polls RSS (the CHC-COMP harness here,
+/// `rss_watchdog`) sees resident pages the allocator has freed but not yet
+/// returned, which the footprint does not always count; the footprint sees
+/// compressed pages RSS does not. The memory governor keys on this. One Mach
+/// call on macOS; current resident on Linux; peak RSS elsewhere.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn current_memory_pressure_bytes() -> usize {
+    task_vm_footprint_and_resident().map_or_else(current_rss_bytes, |(footprint, resident)| {
+        footprint.max(resident)
+    })
+}
+
+/// [`current_memory_pressure_bytes`] on Linux: current resident (the
+/// footprint analog there).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn current_memory_pressure_bytes() -> usize {
+    match current_footprint_bytes() {
+        0 => current_rss_bytes(),
+        resident => resident,
+    }
+}
+
+/// [`current_memory_pressure_bytes`] where no current reading exists: the
+/// peak RSS, else the allocator's live bytes.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+pub fn current_memory_pressure_bytes() -> usize {
+    current_rss_bytes().max(current_live_bytes())
+}
+
+/// `(phys_footprint, resident_size)` from one `task_info(TASK_VM_INFO)`.
+#[cfg(target_os = "macos")]
+fn task_vm_footprint_and_resident() -> Option<(usize, usize)> {
     // Hand-declared subset of <mach/task_info.h>'s task_vm_info: the fields up
     // to and including `phys_footprint` (mach_vm_size_t / integer_t are fixed
     // width, so the offsets are stable ABI). Declaring the prefix only keeps
@@ -720,12 +897,12 @@ pub fn current_footprint_bytes() -> usize {
     if kr != 0 || count < full_words {
         // Call failed, or the kernel returned a truncated struct that does not
         // reach phys_footprint (pre-10.9 ABI) — no footprint signal.
-        return 0;
+        return None;
     }
     // SAFETY: kr == KERN_SUCCESS and count covers the full prefix, so every
     // field up to phys_footprint was written.
     let info = unsafe { info.assume_init() };
-    info.phys_footprint as usize
+    Some((info.phys_footprint as usize, info.resident_size as usize))
 }
 
 /// Linux: current resident set from `/proc/self/statm` (field 2, pages).
@@ -735,27 +912,23 @@ pub fn current_footprint_bytes() -> usize {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn current_footprint_bytes() -> usize {
-    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
-        return 0;
-    };
-    let Some(resident_pages) = statm.split_whitespace().nth(1) else {
-        return 0;
-    };
-    let Ok(pages) = resident_pages.parse::<usize>() else {
-        return 0;
-    };
-    // SAFETY: sysconf(_SC_PAGESIZE) is async-signal-safe and has no
-    // preconditions; a failure returns -1, mapped to the universal 4 KiB.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page = if page > 0 { page as usize } else { 4096 };
-    pages.saturating_mul(page)
+    memory_observations::observe(|| {
+        let Some(pages) = statm::resident_pages() else {
+            return 0;
+        };
+        // SAFETY: sysconf(_SC_PAGESIZE) is async-signal-safe and has no
+        // preconditions; a failure returns -1, mapped to the universal 4 KiB.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        pages.saturating_mul(page)
+    })
 }
 
 /// Other platforms: no footprint API; peak RSS is the only (fallback) signal.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[must_use]
 pub fn current_footprint_bytes() -> usize {
-    0
+    memory_observations::observe(|| 0)
 }
 
 /// Returns the total physical memory of the system in bytes.
@@ -794,18 +967,59 @@ pub fn physical_memory_bytes() -> usize {
 /// kernel OOM-kills the process (a crash, never a graceful `Unknown`).
 #[cfg(target_os = "linux")]
 pub fn physical_memory_bytes() -> usize {
+    effective_physical_memory_from(
+        observed_host_memory_bytes().unwrap_or(0),
+        cgroup_memory_limit_bytes(),
+    )
+}
+
+/// Host RAM observation without interpreting it as container/campaign capacity.
+/// A planner must additionally restrict it by controller limits and usage.
+#[cfg(target_os = "linux")]
+pub fn observed_host_memory_bytes() -> Option<usize> {
     // SAFETY: `sysconf` takes a valid sysconf name constant defined in
     // `<unistd.h>`; `_SC_PHYS_PAGES` is a read-only query with no pointer
     // parameters and returns `-1` on failure (handled below).
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     // SAFETY: Same as above — `_SC_PAGE_SIZE` is a read-only sysconf query.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-    let host_ram = if pages > 0 && page_size > 0 {
-        (pages as usize) * (page_size as usize)
-    } else {
-        0
-    };
-    effective_physical_memory_from(host_ram, cgroup_memory_limit_bytes())
+    host_bytes_from_pages(pages, page_size)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn host_bytes_from_pages(pages: libc::c_long, page_size: libc::c_long) -> Option<usize> {
+    let pages = usize::try_from(pages).ok().filter(|value| *value > 0)?;
+    let page_size = usize::try_from(page_size).ok().filter(|value| *value > 0)?;
+    pages.checked_mul(page_size)
+}
+
+#[cfg(test)]
+mod host_memory_observation_tests {
+    #[test]
+    fn host_bytes_refuse_unknown_and_unaddressable_page_samples() {
+        assert_eq!(super::host_bytes_from_pages(-1, 4096), None);
+        assert_eq!(super::host_bytes_from_pages(1024, 0), None);
+        assert_eq!(super::host_bytes_from_pages(libc::c_long::MAX, 65536), None);
+        assert_eq!(
+            super::host_bytes_from_pages(1024, 4096),
+            Some(4 * 1024 * 1024)
+        );
+        let host = super::observed_host_memory_bytes().expect("actual host physical memory");
+        assert!(host > 0);
+        assert!(super::physical_memory_bytes() <= host);
+    }
+}
+
+/// Actual host physical RAM on Darwin; no container/campaign authority.
+#[cfg(target_os = "macos")]
+pub fn observed_host_memory_bytes() -> Option<usize> {
+    let bytes = physical_memory_bytes();
+    (bytes > 0).then_some(bytes)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn observed_host_memory_bytes() -> Option<usize> {
+    None
 }
 
 /// Reads the process's cgroup memory ceiling, if any.
@@ -900,6 +1114,25 @@ pub fn physical_memory_bytes() -> usize {
 /// Returns 0 only when no memory figure is available at all.
 #[cfg(target_os = "macos")]
 pub fn system_available_bytes() -> usize {
+    mac_available_memory_bytes(AvailableMemorySample::LegacyEstimate)
+        .unwrap_or_else(physical_memory_bytes)
+}
+
+/// An actual available-memory sample, without the legacy physical-memory
+/// fallback. Admission must distinguish an unavailable observation from free RAM.
+#[cfg(target_os = "macos")]
+pub fn observed_available_memory_bytes() -> Option<usize> {
+    mac_available_memory_bytes(AvailableMemorySample::Observed)
+}
+
+#[cfg(target_os = "macos")]
+enum AvailableMemorySample {
+    LegacyEstimate,
+    Observed,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_available_memory_bytes(sample: AvailableMemorySample) -> Option<usize> {
     // Query vm_statistics64 via host_statistics64. `free + inactive` is the
     // macOS analogue of Linux's `MemAvailable`: inactive pages are clean and
     // the kernel can reclaim them without paging.
@@ -907,9 +1140,9 @@ pub fn system_available_bytes() -> usize {
     // SAFETY: `mach_host_self` returns a valid host port for the calling
     // process; `host_statistics64` fills the stats struct with a known count.
     unsafe {
-        // `vm_statistics64_data_t` is 38 * u64 = 304 bytes as of macOS 14.
-        // We only read `free_count`, `inactive_count`, `speculative_count`.
-        // Allocate a zeroed buffer large enough for any reasonable variant.
+        // The returned count is in natural_t/u32 words. We need only the
+        // free/inactive fields; keep a fully initialized buffer and validate
+        // the returned bounds before decoding them.
         const VM_STATS_WORDS: usize = 64;
         let mut stats: [u64; VM_STATS_WORDS] = [0; VM_STATS_WORDS];
         // `HOST_VM_INFO64_COUNT` per Darwin XNU headers: 38 (natural_t = u32
@@ -940,56 +1173,56 @@ pub fn system_available_bytes() -> usize {
         if ret != 0 {
             // Fallback: physical memory (caller's 0.75 headroom factor still
             // protects us from over-commit).
-            return physical_memory_bytes();
+            return None;
         }
         // vm_statistics64 layout (first eight u32 fields):
         //   free_count, active_count, inactive_count, wire_count, ...
         // Read as u32 words:
-        let words = stats.as_ptr().cast::<u32>();
-        let free_count = u64::from(words.read());
-        let inactive_count = u64::from(words.add(2).read());
+        // SAFETY: the initialized u64 array backs exactly twice as many u32
+        // words, and its alignment satisfies u32. The decoder checks count.
+        let words = std::slice::from_raw_parts(stats.as_ptr().cast::<u32>(), VM_STATS_WORDS * 2);
         // speculative_count is at offset 15 in natural_t-words on modern macOS;
         // conservatively exclude it (treat as unavailable) rather than risk
         // misreading layout — `free + inactive` is the accepted approximation.
         let page_size = {
             let ps = libc::sysconf(libc::_SC_PAGESIZE);
-            if ps > 0 {
-                ps as u64
-            } else {
-                4096
-            }
+            u64::try_from(ps).ok().filter(|value| *value > 0)
         };
-        let avail_bytes = (free_count + inactive_count).saturating_mul(page_size);
-        usize::try_from(avail_bytes).unwrap_or(usize::MAX)
+        if matches!(sample, AvailableMemorySample::Observed) {
+            page_size?;
+        }
+        // Preserve this API's legacy page-size estimate and physical-memory
+        // fallback; malformed counts/arithmetic must not become a MAX sample.
+        memory_observation::mac_available_bytes(words, count, page_size)
     }
 }
 
 #[cfg(target_os = "linux")]
 pub fn system_available_bytes() -> usize {
+    observed_available_memory_bytes().unwrap_or_else(physical_memory_bytes)
+}
+
+/// An actual available-memory sample, without a physical-memory estimate.
+#[cfg(target_os = "linux")]
+pub fn observed_available_memory_bytes() -> Option<usize> {
     // Parse `MemAvailable:` from /proc/meminfo. This is the kernel's own
     // estimate accounting for reclaimable slab/cache, suitable for use as
     // `effective_available` per the Linux kernel docs (Documentation/
     // filesystems/proc.rst, `/proc/meminfo`).
     use std::fs;
-    let Ok(contents) = fs::read_to_string("/proc/meminfo") else {
-        return physical_memory_bytes();
-    };
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            // Format: "MemAvailable:   12345678 kB"
-            let trimmed = rest.trim();
-            let kb_str = trimmed.split_whitespace().next().unwrap_or("0");
-            if let Ok(kb) = kb_str.parse::<u64>() {
-                return usize::try_from(kb.saturating_mul(1024)).unwrap_or(usize::MAX);
-            }
-        }
-    }
-    physical_memory_bytes()
+    let contents = fs::read_to_string("/proc/meminfo").ok()?;
+    memory_observation::linux_available_bytes(&contents)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn system_available_bytes() -> usize {
     physical_memory_bytes()
+}
+
+/// No native available-memory observation is implemented on this target.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn observed_available_memory_bytes() -> Option<usize> {
+    None
 }
 
 /// Effective memory budget for the current process in bytes.
@@ -1248,6 +1481,11 @@ pub(crate) fn default_standalone_memory_limit_from_parts(
         .max(floor)
 }
 
+/// Peer ay processes sharing this job's memory ([`detected_concurrency`]).
+pub const CONCURRENCY_ENV: &str = "AY_CONCURRENCY";
+/// Marks an ay test harness, which splits memory across the CPU count.
+pub const TEST_HARNESS_ENV: &str = "AY_TEST";
+
 /// How many peer `ay`-class processes to assume are competing for RAM, used to
 /// divide the unarmed [`default_standalone_memory_limit`] budget.
 ///
@@ -1267,13 +1505,13 @@ fn detected_concurrency() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    let env_override = std::env::var("AY_CONCURRENCY")
+    let env_override = std::env::var(CONCURRENCY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0);
     let is_test_harness = std::env::var_os("NEXTEST").is_some()
         || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
-        || std::env::var_os("AY_TEST").is_some();
+        || std::env::var_os(TEST_HARNESS_ENV).is_some();
     detected_concurrency_from(env_override, is_test_harness, parallelism)
 }
 

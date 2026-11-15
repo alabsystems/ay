@@ -13,13 +13,8 @@ fn cleanup_dimacs_non_unsat_proof_sidecar(
 
     retain_fmla_learned_lrat_dry_run_artifact_from_env(solver);
     let writer_telemetry = dimacs_proof_writer_telemetry(solver);
-    if let Some(mut proof_output) = solver.take_proof_writer() {
-        if let Err(error) = proof_output.flush() {
-            safe_eprintln!("c Warning: failed to flush discarded non-UNSAT proof output: {error}");
-        }
-    }
-
-    cleanup_dimacs_non_unsat_proof_paths(proof_config);
+    // A non-UNSAT solve's proof is discarded, never completed.
+    discard_owned_dimacs_proof(Some(solver), proof_config);
     writer_telemetry
 }
 
@@ -87,6 +82,47 @@ fn required_dimacs_proof_gate_name() -> Option<&'static str> {
         (false, true) => Some("--self-check"),
         (false, false) => None,
     }
+}
+
+/// Whether a proof generation is published on the competition fast path: its
+/// writer takes the proof's SHA-256 while writing, the seal carries that digest
+/// instead of reading the proof back, and the gates before the verdict check
+/// identity, link count and length instead of re-hashing (2026-09-13).
+///
+/// Measured on 166e1e5a in the SAT-COMP posture: nine whole-file SHA-256 passes
+/// over a 2.73 GB proof put 47 s between the UNSAT and `s UNSATISFIABLE`, and a
+/// budget that ended inside them lost the answer. In that posture no in-process
+/// consumer reads the proof's bytes, which is what each negated term below
+/// guarantees: the independent re-check, the Lean check, the strict and
+/// self-check gates, the synthesized-default status marker, the temporary
+/// verification proof, and the proof artifact. Competition mode disables
+/// optional batteries, never soundness: the proof, the custody (an abandoned
+/// proof is never published) and the verdict claim are unchanged. A new
+/// in-process reader of the proof's bytes must add its gate here.
+fn dimacs_fast_publication(proof: &ProofConfig) -> bool {
+    dimacs_fast_publication_for(
+        crate::competition_mode::COMPETITION_MODE_ENABLED.load(Ordering::SeqCst),
+        super::VERIFY_PROOF_ENABLED.load(Ordering::SeqCst),
+        super::LEAN_VERIFY_ENABLED.load(Ordering::SeqCst),
+        required_dimacs_proof_gate_name().is_some(),
+        proof,
+    )
+}
+
+fn dimacs_fast_publication_for(
+    competition: bool,
+    verify_proof: bool,
+    lean_verify: bool,
+    gated: bool,
+    proof: &ProofConfig,
+) -> bool {
+    competition
+        && !verify_proof
+        && !lean_verify
+        && !gated
+        && !proof.synthesized_default
+        && !proof.is_temp
+        && proof.artifact_path.is_none()
 }
 
 fn required_dimacs_proof_gate_error(proof_config: Option<&ProofConfig>) -> Option<String> {

@@ -85,7 +85,7 @@ BIN="${1:-}"
 if [ -z "$BIN" ]; then
     if [ -x target/release/ay ]; then BIN=target/release/ay
     elif [ -x target/debug/ay ]; then BIN=target/debug/ay
-    else echo "FATAL: no ay binary found (build with: cargo build -p ay --features cli)"; exit 2; fi
+    else echo "FATAL: no ay binary found (build with: targo --unverified build -p ay --features cli, or cargo build -p ay --features cli without the Trust toolchain)"; exit 2; fi
 fi
 FMT="${2:-drat}"     # drat (SAT-COMP Main canonical) or lrat
 TIMEOUT="${3:-60}"

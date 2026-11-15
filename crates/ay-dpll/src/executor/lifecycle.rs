@@ -5,11 +5,31 @@
 use super::*;
 use ay_core::Sort;
 
+/// #a2b-sweep. `AY_A2B_BUDGET_SCALE`: `Some(1)` (the default, and the value for
+/// anything unparseable) is today's behaviour exactly; `Some(n)` multiplies the
+/// search-time proof-bookkeeping budget by `n`; `inf` removes it. Read once per
+/// process. Measurement only — nothing in the product sets it.
+fn a2b_budget_scale() -> Option<u64> {
+    static SCALE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| match std::env::var("AY_A2B_BUDGET_SCALE") {
+        Ok(v) if v.eq_ignore_ascii_case("inf") => None,
+        Ok(v) => Some(v.parse::<u64>().ok().filter(|&n| n > 0).unwrap_or(1)),
+        Err(_) => Some(1),
+    })
+}
+
 mod finite_array_sat;
+mod interpolation_records;
+pub(in crate::executor) use interpolation_records::InterpolationRecords;
 mod proof_access;
 mod proof_records;
 mod public_solve;
+mod session_proof_configuration;
+use session_proof_configuration::SessionProofConfiguration;
 mod resource_options;
+pub(in crate::executor) use resource_options::ScriptOverriddenResourceOptions;
+mod session_reset;
+mod term_clone_budget;
 include!("lifecycle/new_stack_guarded_expr.rs");
 /// Reconstruction step budget installed when a quantified public query arms
 /// the proof trace under competition shedding (#quantified-trace-arming;
@@ -147,6 +167,8 @@ impl Executor {
     pub(super) fn invalidate_last_check_result(&mut self) {
         self.last_result = None;
         self.last_model = None;
+        self.lane_ground_model = None;
+        self.unknown_candidate.invalidate();
         // The pigeonhole witness describes ONE query's refutation. Leaving it
         // set let a later solve rebuild its proof from a stale clique, which
         // clobbered ~1100 unrelated proofs.
@@ -154,7 +176,10 @@ impl Executor {
         self.last_sat_certificate = None;
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         self.last_command_unsat_admission = None;
+        self.last_command_unsat_evidence = None;
         if ay_core::misc_cli_flags().debug_cert && self.unsat_query_epoch.is_some() {
             eprintln!(
                 "CERT/epoch cleared: lifecycle reset (had epoch) exec={:p}\n{}",
@@ -169,6 +194,7 @@ impl Executor {
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
+        self.last_proof_surface_withheld = None;
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         if self.proof_problem_assertion_provenance.is_some() {
@@ -177,11 +203,17 @@ impl Executor {
             });
         }
         self.proof_problem_assertion_provenance = None;
+        self.interpolation.clear_query();
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.last_proof_raw_original_assertions.clear();
         self.last_proof_expanded_let_sources.clear();
         self.last_proof_decline = None;
+        self.last_trust_closure_census = None;
+        self.last_semantic_token_census = None;
+        self.last_unbounded_census = None;
+        self.last_sat_reconstruction = Default::default();
+        self.last_unsat_corroboration.set(None);
         self.last_proof_quality = None;
         self.last_unknown_reason = None;
         self.last_unknown_origin = None;
@@ -207,6 +239,7 @@ impl Executor {
         self.last_soft_cost = None;
         self.last_soft_cost_optimal = true;
         self.last_soft_violations = None;
+        self.last_soft_group_costs = None;
         self.finite_objective_values.clear();
         self.unbounded_objectives.clear();
         self.infinitesimal_objectives.clear();
@@ -219,6 +252,8 @@ impl Executor {
         // front can never contaminate a different problem or corrupt lex / box /
         // single-objective / plain check-sat (none of which read this field).
         self.pareto_state = None;
+        // Proof DATA in interpolation/presentation records has now died too.
+        self.proof_construction_memory = Vec::new();
     }
 
     /// Revoke every quantified-SAT grant together with the exact model-side
@@ -292,6 +327,10 @@ impl Executor {
         // Evaluate BEFORE publishing: publication revokes the proof the
         // predicate reads.
         let origin = if self.unsat_proof_terminal_trust_detected() {
+            // The refusal carries its cause (D7): a consumer that claims an
+            // external check names the unsupported surface it refused.
+            let detail = self.terminal_trust_refusal_detail();
+            self.record_unknown_diagnostic(UnknownReason::ProofTrusted, detail);
             UnknownOrigin::TerminalTrust
         } else {
             UnknownOrigin::IncompleteSolverLane
@@ -326,7 +365,18 @@ impl Executor {
         self.invalidate_last_check_result();
     }
 
-    /// Create a new executor
+    /// Creates an executor whose public UNSAT results require internal
+    /// certification by default, even without a proof-output request.
+    /// Failure to obtain required certification returns `Unknown`; exhausting
+    /// proof work does not implicitly authorize a raw verdict. Export requirements
+    /// are separate: see [`Self::set_produce_proofs`] and
+    /// [`Self::set_best_effort_produce_proofs`].
+    ///
+    /// [`Self::set_competition_mode`] documents the explicit opt-in to UNSAT
+    /// without a checked refutation; query-scope authentication and independent
+    /// SAT model validation remain enforced. [`Self::set_deadline`],
+    /// [`Self::set_timeout`], and [`Self::set_interrupt`] configure cooperative
+    /// search/certification controls, not a hard wall-clock return guarantee.
     #[must_use]
     pub fn new() -> Self {
         // Guard against small embedder/test thread stacks: constructing an
@@ -478,11 +528,11 @@ impl Executor {
 
     /// Enable or disable competition mode (#proof-capability B1) — the
     /// executor's proof-cycle-shedding posture. The CLI selects it for
-    /// `--competition` / `AY_COMPETITION=1`, `--no-proof`, `--z3-mode`, and
-    /// for every plain SMT-LIB solve that requests no certification (the z3
-    /// default posture; see `certification_requested` in the `ay` binary).
-    /// The name is historical: the mode sheds proof work only and leaves the
-    /// independent model gate and every wrong-answer guard untouched.
+    /// `--competition` / `AY_COMPETITION=1`, `--no-proof` and `--z3-mode`
+    /// only — a plain SMT-LIB solve is proof-carrying by default and never
+    /// sheds (see `proof_cycle_shed` in the `ay` binary). The name is
+    /// historical: the mode sheds proof work only and leaves the independent
+    /// model gate and every wrong-answer guard untouched.
     ///
     /// In competition mode a public solve with no explicit proof demand sheds
     /// the internal proof cycle: `begin_public_solve` leaves the proof tracker
@@ -500,6 +550,12 @@ impl Executor {
     /// demand in scope the raw lane is dead code and every publication is
     /// certified exactly as without competition mode. A raw UNSAT whose scope
     /// fails authentication still degrades to `unknown`.
+    ///
+    /// Besides the CLI, ay-chc makes this opt-in for executors it builds
+    /// itself: its search executors under the CLI's shedding flags, a search
+    /// marked verdict-only (`ScopedVerdictOnlySearch`, the counterexample
+    /// replay, in every posture), and the empty-acyclic safe check's second
+    /// decision procedure.
     pub fn set_competition_mode(&mut self, enabled: bool) {
         self.competition_mode = enabled;
     }
@@ -524,7 +580,9 @@ impl Executor {
     /// - `strict_proofs_enabled`: the `(set-option :check-proofs-strict true)`
     ///   context option, reachable without any artifact request;
     /// - `self_check`: API `set_self_check(true)` without a paired proof
-    ///   request must still keep the checked-refutation lane armed.
+    ///   request must still keep the checked-refutation lane armed;
+    /// - [`Self::set_verification_level`]: `ProofChecked` and `FullyVerified`
+    ///   require checked refutations independently of proof artifact output.
     ///
     /// Consulted at every `begin_public_solve`, so an in-script option flip
     /// re-arms (or re-sheds) the certified lanes on the NEXT public solve.
@@ -538,6 +596,7 @@ impl Executor {
             && !self.is_producing_proofs()
             && !self.strict_proofs_enabled()
             && !self.self_check
+            && !self.verification_level.has_proof_checking()
     }
 
     /// Whether an inner theory transaction that swaps a PREPROCESSED assertion
@@ -587,8 +646,12 @@ impl Executor {
     /// nobody asked for an artifact but wrong when the recorder is armed purely
     /// for internal certification — reconstruction must never trade a fast
     /// verdict for minutes of materialization. A mandatory proof request keeps
-    /// its unbudgeted slot.
-    pub(in crate::executor) fn arm_quantified_trace_for_retry(&mut self) {
+    /// its unbudgeted slot. Returns what the retry borrows, for the disarm.
+    #[must_use = "the borrowed session proof configuration must be handed back"]
+    pub(in crate::executor) fn arm_quantified_trace_for_retry(
+        &mut self,
+    ) -> SessionProofConfiguration {
+        let borrowed = self.session_proof_configuration();
         self.quantified_query_defeats_shedding = true;
         self.proof_tracker.enable();
         self.ctx.set_retain_parsed_assertions(true);
@@ -616,11 +679,17 @@ impl Executor {
                 self.install_proof_source_provenance(&authored);
             }
         }
+        borrowed
     }
 
     /// Undo [`Self::arm_quantified_trace_for_retry`]'s recorder arming so the
-    /// executor leaves the public decision in its ordinary shed posture.
-    pub(in crate::executor) fn disarm_quantified_trace_after_retry(&mut self) {
+    /// executor leaves the public decision in its ordinary shed posture, and
+    /// hand back the retention and budget the retry borrowed for its query.
+    pub(in crate::executor) fn disarm_quantified_trace_after_retry(
+        &mut self,
+        borrowed: SessionProofConfiguration,
+    ) {
+        self.restore_session_proof_configuration(borrowed);
         self.quantified_query_defeats_shedding = false;
         if self.competition_shedding_active() {
             self.proof_tracker.disable();
@@ -701,6 +770,7 @@ impl Executor {
     ///
     /// This is required for VerifierConsumer integration (proof certificates).
     pub fn set_produce_proofs(&mut self, enabled: bool) {
+        self.interpolation.enabled = false;
         self.proof_output_requested = enabled;
         if enabled {
             self.proof_tracker.enable();
@@ -722,6 +792,7 @@ impl Executor {
     /// an explicit API proof request cannot be confused with the CLI default by
     /// merely observing that a reconstruction budget happens to be present.
     pub fn set_best_effort_produce_proofs(&mut self, step_budget: u64) {
+        self.interpolation.enabled = false;
         self.proof_output_requested = true;
         self.proof_tracker.enable();
         self.ctx.set_retain_parsed_assertions(true);
@@ -754,6 +825,15 @@ impl Executor {
     /// it running) or over `ay_frontend` ASTs (safe to skip).
     pub fn set_retain_parsed_assertions(&mut self, retain: bool) {
         self.ctx.set_retain_parsed_assertions(retain);
+    }
+
+    /// Give the check-sat-time definitional-forall pass its own parsed copy
+    /// of the assertions, bounded to `nodes` parsed nodes, without turning
+    /// proof-surface retention on — the host's peak-RSS optimization and
+    /// its certification posture stay exactly as they are. See
+    /// [`ay_frontend::Context::set_definitional_pass_parsed_budget`].
+    pub fn set_definitional_pass_parsed_budget(&mut self, nodes: usize) {
+        self.ctx.set_definitional_pass_parsed_budget(nodes);
     }
 
     /// Lifetime entry counters for the mode-guarded check-sat pre-passes
@@ -839,7 +919,35 @@ impl Executor {
         if script_demands_proof {
             return None;
         }
-        reconstruction_budget.map(|b| (b / SEARCH_PROOF_BOOKKEEPING_WORK_DIVISOR).max(1))
+        // #a2b-sweep. Measurement knob, DEFAULT UNCHANGED.
+        //
+        // The 2026-09-08 closure diagnosis A/B'd this budget against NO budget,
+        // found 17 of 17 verdicts lost and 0 certificates gained, and concluded
+        // "do not touch the budget". Two points cannot tell a cliff from a
+        // gradient, and that unbudgeted arm ran under an EXPLICIT proof demand,
+        // where certification is mandatory and a failed check downgrades the
+        // verdict — not the posture that publishes these refutations.
+        //
+        // Re-measured 2026-09-11 in the DEFAULT posture over 27 exhausting
+        // files: removing the budget costs 2 of 27 verdicts (not 17 of 17) and
+        // 16x costs none, while the decline moves off
+        // `assume-family-trust-closure` onto `terminal-trust-step-on-path` for
+        // 10 of 27 — a derivation that reaches the empty clause. Every setting
+        // still yields ZERO tier-A certificates, because the blocker is the
+        // missing blast-variable term map, so the conclusion stands and the
+        // reason for it changes. The knob stays so the next attempt can price
+        // a change instead of assuming one.
+        //
+        // `AY_A2B_BUDGET_SCALE=<n>` multiplies the budget; `=inf` removes it.
+        // Unset, or any unparseable value, is exactly today's behaviour.
+        match a2b_budget_scale() {
+            None => None,
+            Some(scale) => reconstruction_budget.map(|b| {
+                (b / SEARCH_PROOF_BOOKKEEPING_WORK_DIVISOR)
+                    .max(1)
+                    .saturating_mul(scale)
+            }),
+        }
     }
 
     /// Per-query budget, in registered-bound units, for the fresh theory
@@ -961,6 +1069,30 @@ impl Executor {
     /// Whether the default deterministic ground-phase budget is in force.
     pub fn ground_budget_enabled(&self) -> bool {
         self.ground_budget_enabled
+    }
+
+    /// Arm this fresh nested certification executor with a counted grant
+    /// (P4a.1, `api::proofs::CertificationEffort::arm`): `conflicts` and
+    /// `decisions` per SAT solve, the default ground budget off so it cannot
+    /// replace them, the caller's `interrupt` and `backstop`, and quantified
+    /// solving never relaxing that backstop. Its check-sats are `Full`
+    /// children of the certification's node, `certify` (DR-39: a nested
+    /// certification check is a Check node under Certify); the grant stays
+    /// counted in conflicts until GuardTree step S6.
+    pub(crate) fn arm_certification_grant(
+        &mut self,
+        conflicts: u64,
+        decisions: u64,
+        backstop: Option<ay_core::time::Instant>,
+        interrupt: Option<Arc<AtomicBool>>,
+        certify: Option<ay_core::resource::Guard>,
+    ) {
+        self.set_resource_limit(Some(conflicts));
+        self.set_decision_limit(Some(decisions));
+        self.set_ground_budget_enabled(false);
+        self.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
+        self.set_solve_controls(interrupt, backstop);
+        self.set_certification_parent(certify);
     }
 
     /// Per-SAT-solve conflict allowance for the current configuration
@@ -1087,6 +1219,54 @@ impl Executor {
     #[must_use]
     pub fn no_lra_theory_propagation(&self) -> bool {
         self.no_lra_theory_propagation
+    }
+
+    /// Make every LIA theory solver this executor constructs skip BCP-time
+    /// LRA implied-bounds derivation (`LraSolver::set_no_bcp_implied_bounds`)
+    /// while keeping direct bound propagation and the final-check cascade.
+    ///
+    /// Intended caller: the CHC BMC transition-system lanes, in place of
+    /// [`Self::set_no_lra_theory_propagation`]. Measured on the lane's own
+    /// depth-k scripts (BMC_T6_model_search_2026-09-19): all-propagation-off
+    /// leaves the search deciding theory atoms with ~2.5 implications per
+    /// decision (DRAGON_5 depth 2: 154 k decisions), full propagation
+    /// livelocks on the implied-bounds flood (8–11 M propagations), and
+    /// direct-only is 3–15× faster than either on the SAT-side checks.
+    pub fn set_no_lra_bcp_implied_bounds(&mut self, disabled: bool) {
+        self.no_lra_bcp_implied_bounds = disabled;
+    }
+
+    /// Whether LIA theory solvers created by this executor skip BCP-time
+    /// implied bounds (see [`Self::set_no_lra_bcp_implied_bounds`]).
+    #[must_use]
+    pub fn no_lra_bcp_implied_bounds(&self) -> bool {
+        self.no_lra_bcp_implied_bounds
+    }
+
+    /// Forbid the #9505 adaptive "theory decides every decision" branching
+    /// mode in the theory extensions this executor builds; the theory-aware
+    /// brancher then keeps its 1-in-2 fractional gating throughout.
+    ///
+    /// Intended caller: the CHC BMC transition-system lanes, together with
+    /// [`Self::set_no_lra_bcp_implied_bounds`]. On wide lustre unrollings the
+    /// wandering ratio (decisions/conflicts > 10) trips within the first few
+    /// hundred decisions and the every-decision round-robin then enumerates
+    /// theory-atom assignments one at a time; measured on the lane's own
+    /// depth-k scripts (BMC_T6_model_search_2026-09-19): peterson_vt depth 3
+    /// 11.1 s -> 1.8 s, FIREFLY_all depth 2 13.3 -> 5.7 s, metros_2's ten
+    /// unsat depths unknown -> 4.5 s, FIREFLY_4 depth 3 unknown -> sat. The
+    /// QF_LRA induction families the mode was added for (#9505) are not on
+    /// this lane and keep it.
+    pub fn set_no_theory_every_decision(&mut self, disabled: bool) {
+        self.no_theory_every_decision = disabled;
+    }
+
+    /// Whether theory extensions built by this executor may enter the
+    /// every-decision theory-branching mode (see
+    /// [`Self::set_no_theory_every_decision`]).
+    #[must_use]
+    pub fn no_theory_every_decision(&self) -> bool {
+        self.no_theory_every_decision
     }
 
     /// Set the random seed for SAT solver VSIDS tie-breaking (#6961).
@@ -1243,58 +1423,19 @@ impl Executor {
 
     /// Reset the executor to initial state.
     ///
-    /// Aligns with the SMT-LIB `(reset)` command handler: resets all solving
-    /// state, incremental state, quantifier manager, proof tracking, and
-    /// interrupt/deadline. Configuration settings (debug_ufbv,
-    /// counterexample_style, learned clause limits, verification_level)
-    /// are preserved.
+    /// Every solving, incremental, quantifier, proof and session-history field
+    /// is rebuilt as [`Executor::new`] builds it (see `lifecycle/session_reset.rs`
+    /// for the carried-over host configuration). Unlike SMT-LIB `(reset)`, this
+    /// API reset also replaces the frontend context with a new one and drops the
+    /// per-call controls: the interrupt flag, both deadlines and the quantified
+    /// deadline policy.
     pub fn reset(&mut self) {
-        // Revoke every artifact authorized by the old problem before replacing
-        // its context. Keep this centralized so newly added result/proof/model
-        // authority cannot survive a direct API reset by omission.
-        self.invalidate_last_check_result();
-        self.ctx = Context::new();
-        self.array_ext_witness_cache.clear();
-        self.finite_array_expansion = FiniteArrayExpansionLedger::default();
-        // ctx (and its append-only TermStore) is replaced wholesale: term ids
-        // restart, so the prefix-extended select index MUST restart with them.
-        *self.select_by_array_index.borrow_mut() = (0, Default::default());
-        *self.array_def_index.borrow_mut() = None;
-        *self.required_terms_index.borrow_mut() = None;
-        self.last_statistics = Statistics::default();
-        self.last_negations = None;
-        self.incremental_mode = false;
-        self.pivot_enum_depth = 0;
-        self.defer_model_validation = false;
-        self.defer_counterexample_minimization = false;
-        self.skip_model_eval = false;
-        self.read_pin_repair_done = false;
-        self.nra_algebraic_model.clear();
-        self.clear_dt_theory_model();
-        self.recorded_var_substitutions.clear();
-        self.bypass_string_tautology_guard = false;
-        self.slia_accepted_unknown = false;
-        self.array_axiom_scope = None;
-        self.array_axiom_dead_skolems.clear();
-        // `ctx` (and its TermStore) was replaced wholesale above: term ids
-        // restart, so the epoch mark must restart with them.
-        self.assertion_epoch_terms_len = 0;
-        self.row_seeded_terms.clear();
-        self.array_default_epsilon_by_sort.clear();
-        self.array_default_diag_by_sort.clear();
-        self.cached_store_eqs.clear();
-        self.store_eq_scan_hwm = 0;
-        self.cached_select_indices_by_array.clear();
-        self.select_index_scan_hwm = 0;
+        self.reset_to_fresh_session(Context::new());
         self.solve_interrupt = None;
         self.solve_deadline.set(None);
         self.certification_deadline.set(None);
-        self.quantifier_deadline_backstop_installed = false;
         self.quantifier_deadline_policy = QuantifierDeadlinePolicy::RelaxToBackstop;
         self.quantifier_deadline_backstop_opt_in = false;
-        self.quantifier_pipeline_engaged = false;
-        self.clear_query_scoped_authority();
-        for_each_incremental_subsystem!(reset self);
     }
 }
 

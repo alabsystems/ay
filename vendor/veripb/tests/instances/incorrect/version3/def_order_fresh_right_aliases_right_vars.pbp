@@ -1,0 +1,48 @@
+pseudo-Boolean proof version 3.0
+% The second route to the same forged transitivity, and the reason a LENGTH check alone is not
+% enough: `fresh_right v1 v2 ;` has exactly the right arity, so the `izip!` runs to completion —
+% but the "fresh" variables ARE the right variables, so the `x->z` substitution is the identity
+% and every transitivity proofgoal is again one of its own premises. Same bogus 4-cycle, same
+% forged UNSAT. Closing this needs the freshness/distinctness check.
+f 3;
+
+def_order bogus
+    vars
+        left u1 u2;
+        right v1 v2;
+        aux;
+    end;
+
+    def
+        1 u1 1 u2 1 v1 1 ~v2 >= 1;
+        1 u1 1 ~u2 1 ~v1 1 ~v2 >= 1;
+        1 ~u1 1 ~u2 1 ~v1 1 v2 >= 1;
+        1 ~u1 1 u2 1 v1 1 v2 >= 1;
+    end;
+
+    transitivity
+        vars
+            fresh_right v1 v2;
+        end;
+        proof
+        qed;
+    end;
+end;
+
+load_order bogus x1 x2;
+
+dom >= 1 : x1 -> x2 x2 -> ~x1 : subproof
+    proofgoal #5
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 -3 + s;
+        pol -3 -2 + s;
+        pol -1 -2 +;
+    qed : -1;
+qed;
+
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

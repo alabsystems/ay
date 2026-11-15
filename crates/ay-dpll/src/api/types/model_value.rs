@@ -4,18 +4,26 @@
 
 //! Model value types and extraction methods.
 
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 
 use super::SolverError;
 
-/// A value from the solver's model, obtained via `get_value`.
+/// Refusal to decode a complete batch of closed, caller-sorted model literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("typed model literals are malformed, unsupported, ill-sorted or over budget")]
+pub struct TypedModelValueDecodeError;
+
+/// A model value obtained through evaluation or exact data-only decoding.
 ///
 /// This enum represents values from term-based model evaluation, supporting
 /// more sorts than the legacy [`Model`](super::Model) struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ModelValue {
+    /// Exact floating-point fields beyond the native field-based variants.
+    /// Immutable shared fields preserve every occupied bit when models clone.
+    FloatingPointExact(ay_fp::FpFields),
     /// Boolean value.
     Bool(bool),
     /// Unbounded integer value.
@@ -57,6 +65,25 @@ pub enum ModelValue {
         /// Significand bit width (including hidden bit).
         sb: u32,
     },
+    /// IEEE 754 value with a stored significand wider than 64 bits.
+    ///
+    /// Binary128 uses 112 stored bits. The narrow variant and its extraction
+    /// signatures remain available; use [`Self::as_fp_wide`] for lossless
+    /// extraction of either representation. Decoders select this variant by
+    /// declared width, even when a particular fraction fits `u64`. Derived
+    /// equality compares variants and fields, not IEEE numeric equivalence.
+    FloatingPointWide {
+        /// Sign bit: true = negative.
+        sign: bool,
+        /// Raw biased exponent bits.
+        exponent: u64,
+        /// Raw stored significand bits (without hidden bit).
+        significand: u128,
+        /// Exponent bit width.
+        eb: u32,
+        /// Significand bit width (including hidden bit).
+        sb: u32,
+    },
     /// Floating-point special value (+zero, -zero, +oo, -oo, NaN).
     FloatingPointSpecial {
         /// The kind of special value.
@@ -75,6 +102,13 @@ pub enum ModelValue {
     },
     /// Sequence value: ordered list of elements.
     Seq(Vec<Self>),
+    /// Canonical prime-field residue with its checked field identity.
+    FiniteField {
+        /// Residue in `0..field.modulus()`.
+        value: u32,
+        /// Checked prime field.
+        field: ay_core::FiniteFieldSort,
+    },
     /// Value could not be determined.
     Unknown,
 }
@@ -96,6 +130,29 @@ pub enum FpSpecialKind {
 }
 
 impl ModelValue {
+    /// Decode one closed SMT-LIB literal per entry against its supplied sort.
+    ///
+    /// This is data-only: no solver, declaration context or term store is used,
+    /// and success attests neither native-model provenance nor satisfiability.
+    /// Caller sorts must contain complete finite datatype metadata; unresolved
+    /// carriers, opaque arrays and missing defaults are refused. Every array
+    /// default, ordered store (including duplicates), and constructor field is
+    /// checked. No width truncation, invented value or partial batch is returned.
+    ///
+    /// At most 4096 literals share one 8 MiB/131072-conservative-token lexical
+    /// envelope (depth 128), and one 1048576-work/16 MiB copy allowance for parser
+    /// preflight, metadata and values (typed depth 64). All borrowed text and
+    /// sorts are admitted before the first AST is built. These cumulative
+    /// charges can refuse inputs below the outer limits; they are conservative
+    /// allowances, not measured allocator/RSS or wall-clock latency bounds.
+    /// Primitive, sequence and floating-point forms use the existing strict
+    /// decoder grammar; arbitrary evaluated SMT expressions are not literals.
+    pub fn decode_typed_literals(
+        input: &[(&str, &ay_core::Sort)],
+    ) -> Result<Vec<Self>, TypedModelValueDecodeError> {
+        crate::api::model_parse::decode_typed_literals(input).ok_or(TypedModelValueDecodeError)
+    }
+
     /// Returns true if this is an Unknown value.
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
@@ -104,6 +161,7 @@ impl ModelValue {
     /// Returns the variant name as a static string (for error messages).
     pub fn variant_name(&self) -> &'static str {
         match self {
+            Self::FloatingPointExact(_) => "FloatingPointExact",
             Self::Bool(_) => "Bool",
             Self::Int(_) => "Int",
             Self::Real(_) => "Real",
@@ -113,9 +171,11 @@ impl ModelValue {
             Self::ArraySmtlib(_) => "ArraySmtlib",
             Self::Array { .. } => "Array",
             Self::FloatingPoint { .. } => "FloatingPoint",
+            Self::FloatingPointWide { .. } => "FloatingPointWide",
             Self::FloatingPointSpecial { .. } => "FloatingPointSpecial",
             Self::Datatype { .. } => "Datatype",
             Self::Seq(_) => "Seq",
+            Self::FiniteField { .. } => "FiniteField",
             Self::Unknown => "Unknown",
         }
     }
@@ -263,10 +323,38 @@ impl ModelValue {
         }
     }
 
-    /// Try to extract a floating-point value. Returns `None` if not `FloatingPoint`.
+    /// Extract floating-point fields if the stored significand fits in `u64`.
+    ///
+    /// A wide value is narrowed only when exact. Use [`Self::as_fp_wide`] to
+    /// preserve every bit of a binary128 value. Special-value variants are
+    /// handled separately by [`Self::as_fp_special`].
     pub fn as_fp(&self) -> Option<(bool, u64, u64, u32, u32)> {
+        let (sign, exponent, significand, eb, sb) = self.as_fp_wide()?;
+        Some((sign, exponent, u64::try_from(significand).ok()?, eb, sb))
+    }
+
+    /// Extract raw floating-point fields without narrowing the significand.
+    ///
+    /// Accepts field-based variants when both actual fields fit; larger fields
+    /// return `None` without truncation. See `as_fp_exact` for arbitrary fields.
+    /// This accessor does not validate manually constructed field payloads.
+    pub fn as_fp_wide(&self) -> Option<(bool, u64, u128, u32, u32)> {
         match self {
+            Self::FloatingPointExact(fields) => Some((
+                fields.sign(),
+                u64::try_from(fields.exponent()).ok()?,
+                u128::try_from(fields.significand()).ok()?,
+                fields.exponent_bits(),
+                fields.significand_bits(),
+            )),
             Self::FloatingPoint {
+                sign,
+                exponent,
+                significand,
+                eb,
+                sb,
+            } => Some((*sign, *exponent, u128::from(*significand), *eb, *sb)),
+            Self::FloatingPointWide {
                 sign,
                 exponent,
                 significand,
@@ -275,6 +363,17 @@ impl ModelValue {
             } => Some((*sign, *exponent, *significand, *eb, *sb)),
             _ => None,
         }
+    }
+
+    /// Read validated exact fields from any field-based FP representation.
+    /// Cloning the exact variant shares its immutable integer payloads.
+    /// Special-value variants are available separately through `as_fp_special`.
+    pub fn as_fp_exact(&self) -> Option<ay_fp::FpFields> {
+        if let Self::FloatingPointExact(fields) = self {
+            return Some(fields.clone());
+        }
+        let (sign, exponent, significand, eb, sb) = self.as_fp_wide()?;
+        ay_fp::FpFields::new(sign, exponent.into(), significand.into(), eb, sb)
     }
 
     /// Try to extract a floating-point special value. Returns `None` if not `FloatingPointSpecial`.
@@ -330,14 +429,87 @@ impl ModelValue {
             })
     }
 
-    /// Fallible extraction as floating-point value. Returns `Err` if not `FloatingPoint`.
+    /// Extract floating-point fields with a checked `u64` significand.
     ///
-    /// Returns `(sign, exponent, significand, eb, sb)`.
+    /// Returns `(sign, exponent, significand, eb, sb)`. A wide significand that
+    /// cannot be narrowed exactly returns `Err`; it is never truncated.
     pub fn try_fp(&self) -> Result<(bool, u64, u64, u32, u32), SolverError> {
         self.as_fp().ok_or_else(|| SolverError::ModelValueMismatch {
             expected: "FloatingPoint",
             actual: self.variant_name().to_string(),
         })
+    }
+
+    /// Extract `(sign, exponent, significand, eb, sb)` with no narrowing.
+    pub fn try_fp_wide(&self) -> Result<(bool, u64, u128, u32, u32), SolverError> {
+        self.as_fp_wide()
+            .ok_or_else(|| SolverError::ModelValueMismatch {
+                expected: "FloatingPoint or FloatingPointWide",
+                actual: self.variant_name().to_string(),
+            })
+    }
+
+    /// Construct exact field-based data after validating its declared widths.
+    ///
+    /// This is representation admission, not permission to solve the format.
+    pub(crate) fn from_fp_fields(
+        sign: bool,
+        exponent: u64,
+        significand: u128,
+        eb: u32,
+        sb: u32,
+    ) -> Option<Self> {
+        if !(2..=64).contains(&eb) || !(2..=129).contains(&sb) {
+            return None;
+        }
+        let fraction_width = sb - 1;
+        if (eb < 64 && exponent >= 1u64 << eb)
+            || (fraction_width < 128 && significand >= 1u128 << fraction_width)
+        {
+            return None;
+        }
+        if fraction_width <= 64 {
+            Some(Self::FloatingPoint {
+                sign,
+                exponent,
+                significand: u64::try_from(significand).ok()?,
+                eb,
+                sb,
+            })
+        } else {
+            Some(Self::FloatingPointWide {
+                sign,
+                exponent,
+                significand,
+                eb,
+                sb,
+            })
+        }
+    }
+
+    pub(crate) fn from_fp_exact_fields(
+        sign: bool,
+        exponent: BigUint,
+        significand: BigUint,
+        eb: u32,
+        sb: u32,
+    ) -> Option<Self> {
+        if (2..=64).contains(&eb) && (2..=129).contains(&sb) {
+            return Self::from_fp_fields(
+                sign,
+                u64::try_from(exponent).ok()?,
+                u128::try_from(significand).ok()?,
+                eb,
+                sb,
+            );
+        }
+        Some(Self::FloatingPointExact(ay_fp::FpFields::new(
+            sign,
+            exponent,
+            significand,
+            eb,
+            sb,
+        )?))
     }
 
     /// Fallible extraction as floating-point special value. Returns `Err` if not `FloatingPointSpecial`.
@@ -420,13 +592,14 @@ impl ModelValue {
             .expect("expected ArraySmtlib ModelValue")
     }
 
-    /// Unwrap as a floating-point value, panicking if not FloatingPoint.
+    /// Extract floating-point fields with a checked `u64` significand.
     ///
     /// Prefer [`try_fp`](Self::try_fp) for fallible extraction.
     ///
     /// # Panics
     ///
-    /// Panics if `self` is not [`ModelValue::FloatingPoint`].
+    /// Panics if `self` has no field-based floating-point value or its stored
+    /// significand cannot be narrowed exactly to `u64`.
     pub fn unwrap_fp(&self) -> (bool, u64, u64, u32, u32) {
         self.try_fp().expect("expected FloatingPoint ModelValue")
     }
@@ -476,3 +649,6 @@ impl ModelValue {
         self.try_seq().expect("expected Seq ModelValue")
     }
 }
+
+#[cfg(test)]
+mod wide_tests;

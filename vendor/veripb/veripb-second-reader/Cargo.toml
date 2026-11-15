@@ -1,0 +1,22 @@
+[package]
+name = "veripb-second-reader"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "A second, deliberately simple reader for VeriPB formula files (OPB / DIMACS CNF / WCNF), used to cross-check what the checker stored against the bytes on disk."
+
+# The dependency list IS the independence argument, so it is kept minimal and
+# is meant to be read: there is no `veripb-parser` here, and no
+# `veripb-formula` either. A defect in either cannot reach this crate, which
+# is the entire reason the crate exists. `malachite-bigint` is the same
+# arbitrary-precision integer `veripb-core-proved` and `veripb-formula`
+# already use, so this adds no package to the workspace lockfile.
+[dependencies]
+malachite-bigint = "0.10.0"
+
+[lib]
+name = "veripb_second_reader"
+path = "src/lib.rs"

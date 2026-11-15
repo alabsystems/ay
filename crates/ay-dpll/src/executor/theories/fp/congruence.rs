@@ -44,10 +44,13 @@ use std::collections::BTreeMap;
 /// Applications of one symbol: `(application term, arguments)`.
 type Application = (TermId, Vec<TermId>);
 
-/// Largest same-symbol group that is Ackermannized in full. Beyond this the
-/// pair count (n²/2) stops being worth it; the group is skipped and the scan
-/// is marked unencodable so `sat` fails closed instead of dropping congruence.
+/// Largest same-symbol group that is Ackermannized in full. Larger groups
+/// may omit clause-forced equal Boolean results and encode bounded residual
+/// pairs. The zero-pair case still needs argument encoding for the model.
 const MAX_GROUP_APPLICATIONS: usize = 64;
+
+/// No oversized group may request more pairs than one legacy full group.
+const MAX_RESIDUAL_PAIRS: usize = MAX_GROUP_APPLICATIONS * (MAX_GROUP_APPLICATIONS - 1) / 2;
 
 /// The uninterpreted structure found under a set of FP-path assertions.
 pub(super) struct ForeignScan {
@@ -94,9 +97,9 @@ pub(super) struct CongruencePlan {
 
 /// Sorts the eager FP path can represent for itself.
 ///
-/// `RoundingMode` is carried as an uninterpreted sort but every surviving
-/// RM-sorted term is a literal mode by the time this runs (`check_fp_support`
-/// fails the solve closed otherwise), so it needs no bits of its own.
+/// `RoundingMode` is carried as an uninterpreted sort; the bit-blaster gives
+/// every symbolic mode three bits (`ay-theories/fp/src/rm.rs`), and
+/// `check_fp_support` fails the solve closed on a mode it cannot encode.
 fn sort_is_representable(sort: &Sort) -> bool {
     match sort {
         Sort::Bool | Sort::FloatingPoint(..) | Sort::BitVec(_) => true,
@@ -245,179 +248,36 @@ fn is_array_leaf(terms: &TermStore, term: TermId) -> bool {
     matches!(terms.get(term), TermData::Var(..)) && matches!(terms.sort(term), Sort::Array(_))
 }
 
+#[path = "congruence/controlled.rs"]
+mod controlled;
+#[path = "congruence/forced_outputs.rs"]
+mod forced_outputs;
+
+#[cfg(test)]
+#[path = "congruence/tests.rs"]
+mod tests;
+
+pub(super) use controlled::{plan_congruence_controlled, scan_foreign_controlled};
+
 /// Collect the uninterpreted structure reachable from `roots`.
 pub(super) fn scan_foreign(terms: &TermStore, roots: &[TermId]) -> ForeignScan {
-    let mut grouped: BTreeMap<(String, usize), Vec<Application>> = BTreeMap::new();
-    let mut unencodable = false;
-    let mut visited: HashSet<TermId> = HashSet::default();
-    let mut stack: Vec<TermId> = roots.to_vec();
-
-    while let Some(term) = stack.pop() {
-        if !visited.insert(term) {
-            continue;
-        }
-        if !sort_is_representable(terms.sort(term)) {
-            unencodable = true;
-        }
-        match terms.get(term) {
-            TermData::App(sym, args) => {
-                let name = sym.name();
-                // `(select <array var> i)`: congruence over the index, and the
-                // array operand is deliberately NOT walked — it carries no
-                // bits, and any other use of it is caught by the sort check.
-                if name == "select" && args.len() == 2 && is_array_leaf(terms, args[0]) {
-                    grouped
-                        .entry((name.to_string(), 2))
-                        .or_default()
-                        .push((term, args.clone()));
-                    stack.push(args[1]);
-                    continue;
-                }
-                if is_uninterpreted(sym, args) {
-                    grouped
-                        .entry((name.to_string(), args.len()))
-                        .or_default()
-                        .push((term, args.clone()));
-                }
-                stack.extend_from_slice(args);
-            }
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(cond, then_term, else_term) => {
-                stack.push(*cond);
-                stack.push(*then_term);
-                stack.push(*else_term);
-            }
-            TermData::Let(bindings, body) => {
-                for (_, value) in bindings {
-                    stack.push(*value);
-                }
-                stack.push(*body);
-            }
-            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
-            _ => {}
-        }
-    }
-
-    ForeignScan {
-        groups: grouped.into_values().filter(|g| g.len() > 1).collect(),
-        unencodable,
-    }
+    super::bitblast::backend::infallible(controlled::scan(terms, roots, &mut || {
+        Ok::<(), std::convert::Infallible>(())
+    }))
 }
 
-/// Build the congruence clauses for a scan.
-///
-/// Every clause has the shape `¬(a₁ = b₁) ∨ … ∨ ¬(aₙ = bₙ) ∨ <results equal>`,
-/// which is exactly the Ackermann instance of the congruence axiom and is
-/// therefore valid in every structure: adding it cannot make a satisfiable
-/// input `unsat`.
+/// Build valid Ackermann clauses in the same group and pair order as before.
 pub(super) fn plan_congruence(
     terms: &TermStore,
     fp_solver: &mut FpSolver<'_>,
     tseitin: &ay_core::TseitinResult,
     scan: &ForeignScan,
 ) -> CongruencePlan {
-    let mut clauses: Vec<Vec<PlanLit>> = Vec::new();
-    let mut incomplete = false;
-
-    for group in &scan.groups {
-        if group.len() > MAX_GROUP_APPLICATIONS {
-            // Too many applications to Ackermannize; the dropped congruence
-            // must not be reported as `sat`.
-            incomplete = true;
-            continue;
-        }
-        for i in 0..group.len() {
-            for j in (i + 1)..group.len() {
-                let (term_a, ref args_a) = group[i];
-                let (term_b, ref args_b) = group[j];
-                let Some(premises) =
-                    argument_premises(terms, fp_solver, args_a.as_slice(), args_b.as_slice())
-                else {
-                    incomplete = true;
-                    continue;
-                };
-                if premises.is_empty() {
-                    // Every argument is the same interned term, so the two
-                    // applications are the same term: nothing to relate.
-                    continue;
-                }
-                let antecedent: Vec<PlanLit> =
-                    premises.iter().map(|&lit| PlanLit::Fp(-lit)).collect();
-                match terms.sort(term_a).clone() {
-                    Sort::Bool => {
-                        let (Some(var_a), Some(var_b)) =
-                            (tseitin.var_for_term(term_a), tseitin.var_for_term(term_b))
-                        else {
-                            // Reached from an assertion yet absent from the
-                            // Tseitin map: the atom lives only inside the FP
-                            // bit-blaster's own namespace (an FP-sorted `ite`
-                            // condition), where this plan cannot reach it.
-                            incomplete = true;
-                            continue;
-                        };
-                        let (lit_a, lit_b) = (var_a as i32, var_b as i32);
-                        let mut forward = antecedent.clone();
-                        forward.push(PlanLit::Tseitin(-lit_a));
-                        forward.push(PlanLit::Tseitin(lit_b));
-                        let mut backward = antecedent;
-                        backward.push(PlanLit::Tseitin(lit_a));
-                        backward.push(PlanLit::Tseitin(-lit_b));
-                        clauses.push(forward);
-                        clauses.push(backward);
-                    }
-                    Sort::FloatingPoint(..) => {
-                        let equal = fp_solver.bitblast_fp_structural_eq(term_a, term_b);
-                        let mut clause = antecedent;
-                        clause.push(PlanLit::Fp(equal));
-                        clauses.push(clause);
-                    }
-                    Sort::BitVec(_) => {
-                        let Some(equal) = fp_solver.try_bitblast_bv_eq(term_a, term_b) else {
-                            incomplete = true;
-                            continue;
-                        };
-                        let mut clause = antecedent;
-                        clause.push(PlanLit::Fp(equal));
-                        clauses.push(clause);
-                    }
-                    _ => incomplete = true,
-                }
-            }
-        }
-    }
-
-    CongruencePlan {
-        clauses,
-        incomplete,
-    }
-}
-
-/// Literals asserting that each differing argument pair is equal, or `None`
-/// when some pair's equality cannot be encoded in this path.
-fn argument_premises(
-    terms: &TermStore,
-    fp_solver: &mut FpSolver<'_>,
-    args_a: &[TermId],
-    args_b: &[TermId],
-) -> Option<Vec<i32>> {
-    let mut premises = Vec::new();
-    for (&arg_a, &arg_b) in args_a.iter().zip(args_b.iter()) {
-        if arg_a == arg_b {
-            continue;
-        }
-        let sort_a = terms.sort(arg_a).clone();
-        if sort_a != *terms.sort(arg_b) {
-            // Unreachable for well-sorted applications of one symbol at one
-            // arity; fail closed rather than guess at the intended relation.
-            return None;
-        }
-        match sort_a {
-            Sort::FloatingPoint(..) => {
-                premises.push(fp_solver.bitblast_fp_structural_eq(arg_a, arg_b));
-            }
-            Sort::BitVec(_) => premises.push(fp_solver.try_bitblast_bv_eq(arg_a, arg_b)?),
-            _ => return None,
-        }
-    }
-    Some(premises)
+    super::bitblast::backend::infallible(controlled::plan(
+        terms,
+        fp_solver,
+        tseitin,
+        scan,
+        &mut || Ok(()),
+    ))
 }

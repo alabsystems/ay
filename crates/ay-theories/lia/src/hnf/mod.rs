@@ -314,8 +314,10 @@ pub(crate) fn compute_hnf(a: &IntMatrix, d: &BigInt) -> Option<HnfResult> {
                 }
                 w.set(k, i, new_val);
             }
-            w.set(i, i, new_wii.clone());
         }
+        // A unit scale still needs modular diagonal normalization: the old
+        // entry can differ from its gcd with R (including its sign).
+        w.set(i, i, new_wii.clone());
 
         // Fix elements below diagonal in columns < i
         for j in 0..i {

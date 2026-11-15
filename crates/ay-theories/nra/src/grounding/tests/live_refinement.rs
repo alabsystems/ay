@@ -95,17 +95,23 @@ fn assert_verified_live_refinement_model(
     solver: &NraSolver<'_>,
     multipliers: &[TermId],
     templates: &[TermId],
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     // And the reported model must be the VERIFIED point — the value grounding
     // proved, not whatever the relaxation happened to hold.  (This does NOT
     // discriminate on the pop: deleting `undo_tentative_patch` was measured to
     // change no test outcome.  Claiming otherwise is the failure mode this
     // test was written to end.)
     let value = |term: TermId| solver.var_value(term).expect("model value");
-    let m0 = value(multipliers[0]);
-    let m1 = value(multipliers[1]);
-    let t0 = value(templates[0]);
-    let t1 = value(templates[1]);
+    let term = |terms: &[TermId], index: usize| {
+        terms
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("fixture has no row {index}"))
+    };
+    let m0 = value(term(multipliers, 0)?);
+    let m1 = value(term(multipliers, 1)?);
+    let t0 = value(term(templates, 0)?);
+    let t1 = value(term(templates, 1)?);
     assert_eq!(&m0 * &t0 + &m1 * &t1, BigRational::one(), "straight row");
     assert_eq!(
         &m1 * &t0 + &m0 * &t1,
@@ -122,10 +128,11 @@ fn assert_verified_live_refinement_model(
     }
     for index in 2..7 {
         assert!(
-            (value(multipliers[index]) * value(templates[index])).is_zero(),
+            (value(term(multipliers, index)?) * value(term(templates, index)?)).is_zero(),
             "padding row {index}"
         );
     }
+    Ok(())
 }
 
 /// THE STRUCTURAL RISK, inside ONE `check()`: this phase is the only exact
@@ -153,7 +160,8 @@ fn assert_verified_live_refinement_model(
 /// the upper bounds sits on its first point for all 15 debug iterations and
 /// the phase is offered exactly two distinct pin vectors in the whole check).
 #[test]
-fn grounding_installs_its_verified_point_over_live_refinement_bounds() {
+fn grounding_installs_its_verified_point_over_live_refinement_bounds(
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut terms = TermStore::new();
     let fixture = live_refinement_fixture(&mut terms);
     let mut solver = NraSolver::new(&terms);
@@ -166,5 +174,5 @@ fn grounding_installs_its_verified_point_over_live_refinement_bounds() {
     let result = solver.check();
     assert!(matches!(result, TheoryResult::Sat), "got {result:?}");
     assert_live_refinement_probe(test_probe());
-    assert_verified_live_refinement_model(&solver, &fixture.multipliers, &fixture.templates);
+    assert_verified_live_refinement_model(&solver, &fixture.multipliers, &fixture.templates)
 }

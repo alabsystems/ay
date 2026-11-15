@@ -49,21 +49,44 @@ impl LraSolver {
 
         let basic_delta = &target_basic - &basic_info.value;
         // #8406: i64 fast path for reciprocal multiplication. When coeff is
-        // Small(n, d), its reciprocal is (d, n) with sign adjustment.
+        // Small(n, d), its reciprocal is (d, n) with sign adjustment — which
+        // needs `-n`, and `n == i64::MIN` has none: the sign fix used
+        // `wrapping_neg`, which maps `i64::MIN` to itself, so the reciprocal
+        // of `i64::MIN / d` was built as `-d / i64::MIN` — a `Small` with a
+        // NEGATIVE denominator (the invariant is `d > 0`). Cross-multiplied
+        // comparisons then read it with the wrong sign (a release build does
+        // not check the invariant). That reciprocal has no `Small` form, so it
+        // takes the exact `recip` path.
         let nb_target = if let Rational::Small(cn, cd) = coeff_ref {
-            let (inv_n, inv_d) = if *cn > 0 {
-                (*cd, *cn)
+            let inverse = if *cn > 0 {
+                Some((*cd, *cn))
             } else if *cn < 0 {
-                (cd.wrapping_neg(), cn.wrapping_neg())
+                cd.checked_neg().zip(cn.checked_neg())
             } else {
-                let inv_coeff = coeff_ref.recip();
-                return &nb_info.value + &basic_delta.mul_rat(&inv_coeff);
+                None
             };
-            &nb_info.value + &basic_delta.mul_rat_i64(inv_n, inv_d)
+            match inverse {
+                Some((inv_n, inv_d)) => &nb_info.value + &basic_delta.mul_rat_i64(inv_n, inv_d),
+                None => {
+                    let inv_coeff = coeff_ref.recip();
+                    &nb_info.value + &basic_delta.mul_rat(&inv_coeff)
+                }
+            }
         } else {
             let inv_coeff = coeff_ref.recip();
             &nb_info.value + &basic_delta.mul_rat(&inv_coeff)
         };
+
+        // In least-index mode, implement pivotAndUpdate from Dutertre and de
+        // Moura (CAV 2006, Fig. 2): the leaving basic reaches its violated
+        // bound exactly. The entering variable becomes basic at the pivot and
+        // may then violate its own bound; it is enqueued for the next repair.
+        // Clamping here could leave the old basic infeasible and defeat the
+        // finite pivot rule's premise. The ordinary heuristic keeps its
+        // historical clamped update.
+        if self.bland_mode {
+            return nb_target;
+        }
 
         // Clamp to nb_var's bounds
         let clamped = if let Some(ref lb) = nb_info.lower {
@@ -104,6 +127,7 @@ impl LraSolver {
         // var in its column) — the guard's clean memo no longer holds. This is
         // the single value-mutation chokepoint for simplex/assert paths.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         // #warm-simplex: first-write-wins log of the pre-change values (this
         // var + every basic var in its column, below) so the last-feasible
         // assignment can be restored on conflict. No-op unless the flag is on

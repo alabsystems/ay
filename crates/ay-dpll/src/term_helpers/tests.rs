@@ -20,6 +20,32 @@ fn mk_or(terms: &mut TermStore, a: TermId, b: TermId) -> TermId {
 }
 
 #[test]
+fn arithmetic_classification_walks_boolean_structure_without_reclassifying_bare_ufs() {
+    let mut terms = TermStore::new();
+    let n = terms.mk_var("n", Sort::Int);
+    let p = terms.mk_var("p", Sort::Bool);
+    let zero = terms.mk_int(0.into());
+    let comparison = terms.mk_lt(zero, n);
+    let conjunction = mk_and(&mut terms, p, comparison);
+    let disjunction = mk_or(&mut terms, p, conjunction);
+    assert!(contains_arithmetic_ops(&terms, conjunction));
+    assert!(contains_arithmetic_ops(&terms, disjunction));
+    let equality = mk_eq(&mut terms, comparison, p);
+    assert!(contains_arithmetic_ops(&terms, equality));
+    let conditional = terms.mk_ite_raw(comparison, p, p);
+    assert!(contains_arithmetic_ops(&terms, conditional));
+    let f = terms.mk_app(Symbol::named("f"), [n], Sort::Int);
+    let bare = mk_eq(&mut terms, f, zero);
+    let wrapped_bare = mk_and(&mut terms, p, bare);
+    assert!(!contains_arithmetic_ops(&terms, wrapped_bare));
+    let mut shared = p;
+    for _ in 0..64 {
+        shared = mk_and(&mut terms, shared, shared);
+    }
+    assert!(!contains_arithmetic_ops(&terms, shared));
+}
+
+#[test]
 fn arithmetic_term_classifiers_handle_basic_cases() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);
@@ -78,6 +104,73 @@ fn involves_int_and_real_arithmetic_routes_equalities_only_when_pure() {
     let distinct_sel = terms.mk_app(Symbol::named("distinct"), vec![sel, sel2], Sort::Bool);
     assert!(involves_int_arithmetic(&terms, distinct_sel));
     assert!(contains_arithmetic_ops(&terms, eq_sel_5));
+
+    // #ufnia-symdiv-decomp-routing: a compound arithmetic side routes the
+    // equality to the arithmetic solver even with a UF leaf inside — the
+    // symbolic-div decomposition `(= x (+ (* (f x) q) r))` shape. The bare
+    // UF side above (`eq_fx_5`) must still NOT route (shared-equality
+    // channel), and a compound side on `distinct` routes likewise.
+    let q = terms.mk_var("q", Sort::Int);
+    let prod = terms.mk_app(Symbol::named("*"), vec![f_x, q], Sort::Int);
+    let sum = terms.mk_app(Symbol::named("+"), vec![prod, x], Sort::Int);
+    let eq_decomp = mk_eq(&mut terms, x, sum);
+    assert!(involves_int_arithmetic(&terms, eq_decomp));
+    assert!(contains_arithmetic_ops(&terms, eq_decomp));
+    let distinct_decomp = terms.mk_app(Symbol::named("distinct"), vec![sum, five], Sort::Bool);
+    assert!(involves_int_arithmetic(&terms, distinct_decomp));
+
+    // Real mirror: `(= r (+ (g r) r))` routes; `(= (g r) 5.0)` does not.
+    let g_r = terms.mk_app(Symbol::named("g"), vec![r], Sort::Real);
+    let real_sum = terms.mk_app(Symbol::named("+"), vec![g_r, r], Sort::Real);
+    let eq_real_decomp = mk_eq(&mut terms, r, real_sum);
+    assert!(involves_real_arithmetic(&terms, eq_real_decomp));
+    assert!(!involves_int_arithmetic(&terms, eq_real_decomp));
+}
+
+/// #compound-side-bv2nat-channel: a compound side claims an equality for the
+/// arithmetic channel unless a side is a bare `bv2nat` term. The BV/LIA
+/// bridge's residue congruence `(= (bv2nat b) (- s (* 256 k)))` stays on the
+/// shared-equality channel; claiming it cost `bv_lia_int_blast_lane` two
+/// pinned `sat`s. A UF-application side against a compound side still
+/// routes, the class a628c3b2a added, and so does a `bv2nat` leaf inside a
+/// compound side.
+#[test]
+fn compound_side_routes_unless_a_side_is_bv2nat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let s = terms.mk_var("s", Sort::Int);
+    let k = terms.mk_var("k", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let modulus = terms.mk_int(BigInt::from(256));
+    let bv = terms.mk_var("b", Sort::bitvec(8));
+    let nat = terms.mk_bv2nat(bv);
+    let scaled = terms.mk_app(Symbol::named("*"), vec![modulus, k], Sort::Int);
+    let residue = terms.mk_app(Symbol::named("-"), vec![s, scaled], Sort::Int);
+    let congruence = mk_eq(&mut terms, nat, residue);
+    assert!(!involves_int_arithmetic(&terms, congruence));
+    assert!(!contains_arithmetic_ops(&terms, congruence));
+    assert!(
+        is_uf_int_equality(&terms, congruence).is_some(),
+        "the shared-equality channel keeps the bridge congruence"
+    );
+    let distinct_bridge = terms.mk_app(Symbol::named("distinct"), vec![nat, residue], Sort::Bool);
+    assert!(!involves_int_arithmetic(&terms, distinct_bridge));
+    assert!(!contains_arithmetic_ops(&terms, distinct_bridge));
+
+    let x_plus_one = terms.mk_app(Symbol::named("+"), vec![x, one], Sort::Int);
+    let nat_plus_one = terms.mk_app(Symbol::named("+"), vec![nat, one], Sort::Int);
+    let eq_nested_nat = mk_eq(&mut terms, nat_plus_one, x_plus_one);
+    assert!(involves_int_arithmetic(&terms, eq_nested_nat));
+    assert!(contains_arithmetic_ops(&terms, eq_nested_nat));
+
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let eq_fx_sum = mk_eq(&mut terms, f_x, x_plus_one);
+    assert!(involves_int_arithmetic(&terms, eq_fx_sum));
+    assert!(contains_arithmetic_ops(&terms, eq_fx_sum));
+    let distinct_fx_sum =
+        terms.mk_app(Symbol::named("distinct"), vec![f_x, x_plus_one], Sort::Bool);
+    assert!(involves_int_arithmetic(&terms, distinct_fx_sum));
+    assert!(contains_arithmetic_ops(&terms, distinct_fx_sum));
 }
 
 #[test]

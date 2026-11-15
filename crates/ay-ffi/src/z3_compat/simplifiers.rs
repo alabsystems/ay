@@ -34,8 +34,8 @@
 //!
 //! # Recognized simplifier names (and how unknown names are handled — HONEST)
 //!
-//! [`SUPPORTED_SIMPLIFIER_NAMES`] is exactly the 37-name registry reported by
-//! Z3 5.0.0's `Z3_get_simplifier_name`, in the same order. (The `z3
+//! [`SUPPORTED_SIMPLIFIER_NAMES`] retains the historical registry and adds
+//! implemented current-target passes. (The `z3
 //! -simplifiers` presentation sorts that registry and therefore is not the C
 //! API enumeration order.) In particular, tactic names `elim-and` and `nnf`
 //! are not simplifier names and are rejected here. Any name outside this set
@@ -51,7 +51,7 @@ use super::{
     Z3_simplifier, Z3_solver, Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
 
-/// The exact Z3 5.0.0 simplifier registry, in C API enumeration order.
+/// Supported simplifiers, retaining historical entries and native extensions.
 pub const SUPPORTED_SIMPLIFIER_NAMES: &[&str] = &[
     "bit2int",
     "bit-blast",
@@ -90,10 +90,11 @@ pub const SUPPORTED_SIMPLIFIER_NAMES: &[&str] = &[
     "solve-eqs",
     "special-relations",
     "euf-completion",
+    "ff-simplify",
 ];
 
 /// Resolve a simplifier NAME to a verdict-preserving [`Tactic`], or `Err` with an
-/// honest diagnostic if the name is not a Z3 5.0.0 simplifier.
+/// honest diagnostic if the name is unsupported.
 ///
 /// Exact or close existing passes are used where possible. The remaining names
 /// map to `Skip`, a deliberate conservative implementation: identity is always
@@ -114,6 +115,8 @@ fn simplifier_from_name(name: &str) -> Result<Tactic, String> {
         "propagate-values" => Tactic::PropagateValues,
         "qe-light" | "cheap-fourier-motzkin" => Tactic::QeLight,
         "reduce-args" => Tactic::ReduceArgs,
+        "max-bv-sharing" => Tactic::MaxBvSharing,
+        "ff-simplify" => Tactic::FieldSimplify,
         "simplify" | "card2bv" | "dom-simplify" => Tactic::FlattenAnd,
         "solve-eqs" | "elim-unconstrained" | "fold-unfold" => Tactic::SolveEqs,
 
@@ -129,7 +132,6 @@ fn simplifier_from_name(name: &str) -> Result<Tactic, String> {
         | "euf-completion"
         | "factor"
         | "injectivity"
-        | "max-bv-sharing"
         | "ng-push-app-ite"
         | "ng-push-app-ite-conservative"
         | "pull-nested-quantifiers"
@@ -141,7 +143,7 @@ fn simplifier_from_name(name: &str) -> Result<Tactic, String> {
     Ok(tactic)
 }
 
-/// Z3 5.0.0's per-name catalog descriptions. Covers exactly
+/// Per-name catalog descriptions. Covers exactly
 /// [`SUPPORTED_SIMPLIFIER_NAMES`]; `None` for any other name.
 fn simplifier_descr(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -172,6 +174,7 @@ fn simplifier_descr(name: &str) -> Option<&'static str> {
         "elim-unconstrained" => "eliminate unconstrained variables.",
         "euf-completion" => "simplify modulo congruence closure.",
         "factor" => "polynomial factorization.",
+        "ff-simplify" => "simplify prime-field goals ahead of QF_FF decision procedures.",
         "fold-unfold" => "solve for variables.",
         "injectivity" => "Identifies and applies injectivity axioms.",
         "max-bv-sharing" => {
@@ -204,7 +207,7 @@ fn simplifier_descr(name: &str) -> Option<&'static str> {
 
 /// Create a simplifier by name.
 ///
-/// Recognizes exactly Z3 5.0.0's registry ([`SUPPORTED_SIMPLIFIER_NAMES`]).
+/// Recognizes [`SUPPORTED_SIMPLIFIER_NAMES`].
 /// Any other name returns NULL and sets `Z3_INVALID_ARG`.
 ///
 /// # Safety
@@ -381,55 +384,39 @@ pub unsafe extern "C" fn Z3_solver_add_simplifier(
     solver: Z3_solver,
     simplifier: Z3_simplifier,
 ) -> Z3_solver {
-    // Pre-extract the source solver's state and the simplifier's tactic outside
-    // the guard (raw-pointer derefs; both handles live in `c`).
-    // SAFETY: each handle, when non-null, is a live handle kept in `c`'s arena;
-    // the Z3 C API is single-threaded per context, so these shared reads do not
-    // race. `as_ref` null-checks.
-    let (solver_data, simp) = unsafe {
-        (
-            solver.as_ref().map(|h| {
-                (
-                    h.assertions.clone(),
-                    h.scope_markers.clone(),
-                    h.tracked.clone(),
-                    h.tracked_scope_markers.clone(),
-                    h.tactic.clone(),
-                )
-            }),
-            simplifier.as_ref().map(|h| h.tactic.clone()),
-        )
-    };
-
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             if !ctx.decision_engine_is_usable("Z3_solver_add_simplifier") {
                 return ptr::null_mut();
             }
-            let (
-                Some((assertions, scope_markers, tracked, tracked_scope_markers, src_tactic)),
-                Some(simp),
-            ) = (solver_data, simp)
-            else {
+            // SAFETY: valid non-null handles belong to c and occupy separate
+            // arena allocations from ctx. This API is single-threaded per
+            // context; these shared reads cannot race with handle mutation.
+            let (Some(source), Some(simplifier)) = (solver.as_ref(), simplifier.as_ref()) else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg =
                     Some("Z3_solver_add_simplifier: null solver or simplifier handle".to_string());
                 return ptr::null_mut();
             };
+            // Pinned Z3 api_solver.cpp refuses a populated source. Check the
+            // borrowed stack before copying any caller-sized assertion data.
+            if !source.assertions.is_empty() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("adding a simplifier to a solver with assertions is not allowed".into());
+                return ptr::null_mut();
+            }
             // Compose the source solver's existing preprocessing (when any) THEN
             // the newly-attached simplifier, so chaining `add_simplifier` calls
             // (and add-on-top-of-a-tactic-solver) all run in order. Every operand
             // is verdict-preserving, so the composed transform is too.
-            let combined = match src_tactic {
-                Some(t) => t.then(simp),
-                None => simp,
+            let combined = match &source.tactic {
+                Some(t) => t.clone().then(simplifier.tactic.clone()),
+                None => simplifier.tactic.clone(),
             };
             let mut new_handle = Z3SolverHandle::new(Some(combined));
-            new_handle.assertions = assertions;
-            new_handle.scope_markers = scope_markers;
-            new_handle.tracked = tracked;
-            new_handle.tracked_scope_markers = tracked_scope_markers;
+            new_handle.params = source.params.clone();
             let handle = Box::into_raw(Box::new(new_handle));
             ctx.solver_handle_cache.push(handle);
             ctx.last_error = Z3_OK;

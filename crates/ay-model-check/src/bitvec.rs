@@ -18,6 +18,9 @@ pub(crate) fn normalize(v: &BigInt, width: u32) -> BigInt {
     if width == 0 {
         return BigInt::zero();
     }
+    if v.sign() != num_bigint::Sign::Minus && v.bits() <= u64::from(width) {
+        return v.clone();
+    }
     let m = pow2(width);
     let r = v % &m;
     if r.sign() == num_bigint::Sign::Minus {

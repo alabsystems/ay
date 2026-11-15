@@ -73,7 +73,14 @@ fn is_datatype_constructor_app(name: &str, sort: &ChcSort) -> bool {
     constructors.iter().any(|ctor| ctor.name == name)
 }
 
-fn eval_nonnegative_const_u128(expr: &ChcExpr, depth: usize) -> Option<u128> {
+fn eval_nonnegative_const_u128(
+    expr: &ChcExpr,
+    depth: usize,
+    budget: &crate::expr::rewrite_budget::RewriteBudget<'_>,
+) -> Option<u128> {
+    if budget.stopped() {
+        return None;
+    }
     if depth >= MAX_EXPR_RECURSION_DEPTH {
         return None;
     }
@@ -82,31 +89,31 @@ fn eval_nonnegative_const_u128(expr: &ChcExpr, depth: usize) -> Option<u128> {
         ChcExpr::Op(ChcOp::Add, args) => {
             let mut acc = 0u128;
             for arg in args {
-                acc = acc.checked_add(eval_nonnegative_const_u128(arg, depth + 1)?)?;
+                acc = acc.checked_add(eval_nonnegative_const_u128(arg, depth + 1, budget)?)?;
             }
             Some(acc)
         }
         ChcExpr::Op(ChcOp::Mul, args) => {
             let mut acc = 1u128;
             for arg in args {
-                acc = acc.checked_mul(eval_nonnegative_const_u128(arg, depth + 1)?)?;
+                acc = acc.checked_mul(eval_nonnegative_const_u128(arg, depth + 1, budget)?)?;
             }
             Some(acc)
         }
         ChcExpr::Op(ChcOp::Sub, args) if args.len() == 2 => {
-            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1)?;
-            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1)?;
+            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1, budget)?;
+            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1, budget)?;
             lhs.checked_sub(rhs)
         }
         ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
-            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1)?;
-            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1)?;
-            (rhs != 0).then_some(lhs % rhs)
+            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1, budget)?;
+            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1, budget)?;
+            lhs.checked_rem(rhs)
         }
         ChcExpr::Op(ChcOp::Div, args) if args.len() == 2 => {
-            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1)?;
-            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1)?;
-            (rhs != 0).then_some(lhs / rhs)
+            let lhs = eval_nonnegative_const_u128(&args[0], depth + 1, budget)?;
+            let rhs = eval_nonnegative_const_u128(&args[1], depth + 1, budget)?;
+            lhs.checked_div(rhs)
         }
         _ => None,
     })
@@ -119,9 +126,45 @@ impl ChcExpr {
     /// pathological expression trees. On budget exhaustion, returns `self`
     /// unchanged — semantically correct, just unsimplified.
     pub(crate) fn simplify_constants(&self) -> Self {
-        use std::cell::Cell;
+        self.simplify_constants_checked(|| false)
+            .unwrap_or_else(|| self.clone())
+    }
 
-        let budget = Cell::new(MAX_PREPROCESSING_NODES);
+    /// The same simplification, but no expression escapes when the caller
+    /// stops. Node/depth limits retain their existing unsimplified semantics.
+    pub(crate) fn simplify_constants_checked(
+        &self,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        let budget =
+            super::rewrite_budget::RewriteBudget::new(MAX_PREPROCESSING_NODES, &mut should_stop);
+        self.simplify_constants_with_budget(&budget)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simplify_constants_at_node_limit(&self, nodes: usize) -> Option<Self> {
+        let mut never_stop = || false;
+        let budget = super::rewrite_budget::RewriteBudget::new(nodes, &mut never_stop);
+        self.simplify_constants_with_budget(&budget)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simplify_with_poll_count(
+        &self,
+        mut stop: impl FnMut() -> bool,
+    ) -> (Option<Self>, usize) {
+        let budget = super::rewrite_budget::RewriteBudget::new(MAX_PREPROCESSING_NODES, &mut stop);
+        let result = self.simplify_constants_with_budget(&budget);
+        (result, budget.poll_count())
+    }
+
+    fn simplify_constants_with_budget(
+        &self,
+        budget: &super::rewrite_budget::RewriteBudget<'_>,
+    ) -> Option<Self> {
+        if budget.stopped() {
+            return None;
+        }
         let mut memo: SimplifyMemo = SimplifyMemo::default();
 
         /// Simplify a child `Arc` subtree, memoizing on pointer identity so each
@@ -139,23 +182,39 @@ impl ChcExpr {
         /// sound, just less sharing.
         fn simplify_arg(
             a: &Arc<ChcExpr>,
-            budget: &Cell<usize>,
+            budget: &super::rewrite_budget::RewriteBudget<'_>,
             depth: usize,
             memo: &mut SimplifyMemo,
-        ) -> Arc<ChcExpr> {
+        ) -> Option<Arc<ChcExpr>> {
+            if budget.stopped() {
+                return None;
+            }
             let key = Arc::as_ptr(a);
             if let Some(cached) = memo.get(&key) {
-                return Arc::clone(cached);
+                return Some(Arc::clone(cached));
             }
             match simplify_inner(a.as_ref(), budget, depth, memo) {
                 Some(simplified) => {
-                    let result = Arc::new(simplified);
+                    // An unchanged node comes back as a shallow clone (same node
+                    // data, the very same child `Arc`s). Hand back the INPUT `Arc`
+                    // then (WP-F F0b): structurally identical, and the parent's
+                    // "did any argument change?" check becomes a pointer test
+                    // instead of a deep comparison of two copies of a shared DAG.
+                    let result = if super::dag::shallow_same(&simplified, a) {
+                        Arc::clone(a)
+                    } else {
+                        Arc::new(simplified)
+                    };
+                    if budget.stopped() {
+                        return None;
+                    }
                     memo.insert(key, Arc::clone(&result));
-                    result
+                    Some(result)
                 }
                 // Budget/depth exhausted: keep the original subtree (sound, and
                 // preserves sharing) without caching.
-                None => Arc::clone(a),
+                None if budget.stopped() => None,
+                None => Some(Arc::clone(a)),
             }
         }
 
@@ -167,18 +226,25 @@ impl ChcExpr {
         /// the temporary's subtree pointers are unrelated to the input's and may
         /// alias freed addresses once the temporary is dropped; scoping the memo
         /// to this sub-call keeps pointer identity sound.
-        fn resimplify(e: ChcExpr, budget: &Cell<usize>, depth: usize) -> ChcExpr {
+        fn resimplify(
+            e: ChcExpr,
+            budget: &super::rewrite_budget::RewriteBudget<'_>,
+            depth: usize,
+        ) -> ChcExpr {
             let mut memo: SimplifyMemo = SimplifyMemo::default();
             simplify_inner(&e, budget, depth, &mut memo).unwrap_or(e)
         }
 
         fn simplify_inner(
             expr: &ChcExpr,
-            budget: &Cell<usize>,
+            budget: &super::rewrite_budget::RewriteBudget<'_>,
             depth: usize,
             memo: &mut SimplifyMemo,
         ) -> Option<ChcExpr> {
             maybe_grow_expr_stack(|| {
+                if budget.stopped() {
+                    return None;
+                }
                 // Depth bound (#2988): prevent unbounded stacker heap allocation.
                 // At depth 500, stacker has allocated up to 1 GB of heap segments.
                 if depth >= MAX_EXPR_RECURSION_DEPTH {
@@ -205,7 +271,7 @@ impl ChcExpr {
                         let simplified_args: Vec<Arc<ChcExpr>> = args
                             .iter()
                             .map(|a| simplify_arg(a, budget, depth + 1, memo))
-                            .collect();
+                            .collect::<Option<Vec<_>>>()?;
 
                         // Track whether any argument actually changed (#3665)
                         let args_changed = !args
@@ -281,9 +347,12 @@ impl ChcExpr {
                                     coeff: i128,
                                     constant_sum: &mut i128,
                                     var_terms: &mut Vec<Arc<ChcExpr>>,
-                                    budget: &Cell<usize>,
+                                    budget: &super::rewrite_budget::RewriteBudget<'_>,
                                     depth: usize,
                                 ) {
+                                    if budget.stopped() {
+                                        return;
+                                    }
                                     // Depth bound (#2988)
                                     if depth >= MAX_EXPR_RECURSION_DEPTH {
                                         push_scaled_term(var_terms, expr, coeff);
@@ -432,10 +501,12 @@ impl ChcExpr {
                                         eval_nonnegative_const_u128(
                                             simplified_args[0].as_ref(),
                                             depth + 1,
+                                            budget,
                                         ),
                                         eval_nonnegative_const_u128(
                                             simplified_args[1].as_ref(),
                                             depth + 1,
+                                            budget,
                                         ),
                                     ) {
                                         let result = if matches!(op, ChcOp::Div) {
@@ -699,33 +770,42 @@ impl ChcExpr {
                                     expr: &ChcExpr,
                                     result: &mut Vec<Arc<ChcExpr>>,
                                     depth: usize,
-                                ) -> bool {
-                                    // Depth bound (#2988)
+                                    budget: &super::rewrite_budget::RewriteBudget<'_>,
+                                ) -> Option<bool> {
+                                    if budget.stopped() {
+                                        return None;
+                                    }
                                     if depth >= MAX_EXPR_RECURSION_DEPTH {
                                         result.push(Arc::new(expr.clone()));
-                                        return true;
+                                        return Some(true);
                                     }
                                     maybe_grow_expr_stack(|| match expr {
-                                        ChcExpr::Bool(true) => true,
-                                        ChcExpr::Bool(false) => false,
+                                        ChcExpr::Bool(true) => Some(true),
+                                        ChcExpr::Bool(false) => Some(false),
                                         ChcExpr::Op(ChcOp::And, args) => {
                                             for arg in args {
-                                                if !flatten_and(arg.as_ref(), result, depth + 1) {
-                                                    return false;
+                                                if !flatten_and(
+                                                    arg.as_ref(),
+                                                    result,
+                                                    depth + 1,
+                                                    budget,
+                                                )? {
+                                                    return Some(false);
                                                 }
                                             }
-                                            true
+                                            Some(true)
                                         }
                                         _ => {
                                             result.push(Arc::new(expr.clone()));
-                                            true
+                                            Some(true)
                                         }
                                     })
                                 }
 
                                 let mut new_args = Vec::new();
                                 for arg in &simplified_args {
-                                    if !flatten_and(arg.as_ref(), &mut new_args, depth + 1) {
+                                    if !flatten_and(arg.as_ref(), &mut new_args, depth + 1, budget)?
+                                    {
                                         return Some(ChcExpr::Bool(false));
                                     }
                                 }
@@ -741,6 +821,9 @@ impl ChcExpr {
                                 let mut negated_conjuncts: Vec<&ChcExpr> = Vec::new();
 
                                 for arg in &new_args {
+                                    if budget.stopped() {
+                                        return None;
+                                    }
                                     if let ChcExpr::Op(ChcOp::Not, not_args) = arg.as_ref() {
                                         if not_args.len() == 1 {
                                             negated_conjuncts.push(not_args[0].as_ref());
@@ -752,6 +835,9 @@ impl ChcExpr {
 
                                 for pos in &positive_conjuncts {
                                     for neg in &negated_conjuncts {
+                                        if budget.stopped() {
+                                            return None;
+                                        }
                                         if pos == neg {
                                             return Some(ChcExpr::Bool(false));
                                         }
@@ -1172,7 +1258,7 @@ impl ChcExpr {
                         let simplified_args: Vec<Arc<ChcExpr>> = args
                             .iter()
                             .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
-                            .collect();
+                            .collect::<Option<Vec<_>>>()?;
                         if simplified_args.len() == 1 {
                             if let Some(field) = datatype_selector_projection(
                                 name,
@@ -1206,7 +1292,7 @@ impl ChcExpr {
                         let simplified_args: Vec<Arc<ChcExpr>> = args
                             .iter()
                             .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
-                            .collect();
+                            .collect::<Option<Vec<_>>>()?;
                         let args_changed = !args
                             .iter()
                             .zip(simplified_args.iter())
@@ -1217,15 +1303,43 @@ impl ChcExpr {
                             expr.clone()
                         }
                     }
-                    _ => expr.map_children_with(|child| {
-                        simplify_inner(child, budget, depth + 1, memo)
-                            .unwrap_or_else(|| child.clone())
-                    }),
+                    ChcExpr::ArrayLambda(lambda) => {
+                        let values = lambda
+                            .captures()
+                            .iter()
+                            .map(|value| simplify_arg(value, budget, depth + 1, memo))
+                            .collect::<Option<Vec<_>>>()?;
+                        ChcExpr::ArrayLambda(lambda.with_captures(values))
+                    }
+                    ChcExpr::ConstArray(sort, value) => {
+                        // Preserve the direct child traversal: an earlier shallow
+                        // memo entry must not bypass this depth/node boundary.
+                        let rewritten = simplify_inner(value, budget, depth + 1, memo);
+                        if budget.stopped() {
+                            return None;
+                        }
+                        let rewritten = rewritten.unwrap_or_else(|| value.as_ref().clone());
+                        if value.as_ref() == &rewritten {
+                            expr.clone()
+                        } else {
+                            ChcExpr::ConstArray(sort.clone(), Arc::new(rewritten))
+                        }
+                    }
+                    _ => expr.clone(),
                 })
             })
         }
 
-        simplify_inner(self, &budget, 0, &mut memo).unwrap_or_else(|| self.clone())
+        let result = match simplify_inner(self, &budget, 0, &mut memo) {
+            Some(result) => result,
+            None if budget.stopped() => return None,
+            None => self.clone(),
+        };
+        if budget.stopped() {
+            None
+        } else {
+            Some(result)
+        }
     }
 }
 

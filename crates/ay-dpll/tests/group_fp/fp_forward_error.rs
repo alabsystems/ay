@@ -17,7 +17,7 @@
 //! (incomplete) bit-precise lane — a sound unknown, never a wrong unsat.
 
 use ay_core::{ProofStep, TheoryLemmaKind};
-use ay_dpll::Executor;
+use ay_dpll::{Executor, UnknownReason};
 use ay_frontend::parse;
 use ntest::timeout;
 use std::path::PathBuf;
@@ -153,40 +153,70 @@ fn guard_claim_mirror_mismatch_not_unsat() {
     assert_ne!(outputs, vec!["unsat"]);
 }
 
-/// Solve one guard-claim instance with proofs + fail-closed self-check
-/// enabled, returning the executor for proof inspection.
-fn solve_self_checked_unsat(smt: &str) -> Executor {
+/// Solve one guard-claim instance in proof mode, returning the executor for
+/// proof inspection.
+///
+/// `--self-check` is deliberately NOT enabled here: since owner decision D7 it
+/// is a CLAIMING consumer and refuses this certificate for its unsupported
+/// external-recheck surface. That refusal is pinned, with its reason, by
+/// [`guard_claim_self_check_refuses_the_unsupported_fp_surface`] below.
+fn solve_proof_mode_unsat(smt: &str) -> Executor {
     let commands = parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"));
     let mut exec = Executor::new();
     exec.set_produce_proofs(true);
-    exec.set_self_check(true);
     let outputs = exec
         .execute_all(&commands)
         .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"));
     assert_eq!(
         outputs,
         vec!["unsat"],
-        "forward-error UNSAT must survive --self-check (self-certified proof)"
+        "the forward-error refutation must publish its UNSAT in proof mode"
     );
     exec
 }
 
 /// STRICT PROOF SUBSET: the forward-error UNSATs close through the
-/// independently checked `FpForwardError` lemma kind, not internal trust — so the
-/// proof is trust-free on the empty-clause path (the exact predicate the
-/// `--strict-proofs` CLI gate applies via `terminal_trust_report`), passes
-/// the strict checker with zero trust steps, and the verdict stays `unsat`
-/// under `--self-check`.
+/// independently checked `FpForwardError` lemma kind, not internal trust — so
+/// the proof is trust-free on the empty-clause path (the exact predicate the
+/// `--strict-proofs` CLI gate applies via `terminal_trust_report`) and passes
+/// the strict checker with zero trust steps.
+///
+/// RENAMED AND SPLIT (2026-09-22). This test was
+/// `guard_claim_unsat_is_trust_free_and_self_check_certified` and additionally
+/// required the verdict to stay `unsat` under `--self-check`. That half pinned
+/// a contract the owner has since replaced TWICE, and nothing here was weakened
+/// to accommodate it: every assertion below is the one it always made, and the
+/// `--self-check` half moved to
+/// [`guard_claim_self_check_refuses_the_unsupported_fp_surface`], which pins the
+/// refusal AND its disclosed reason — strictly more than "the verdict survives".
+///
+/// The evidence that the old half is stale, not that the product regressed:
+///
+/// * `c93a232b2` (2026-08-30) redefined
+///   `Executor::unsat_proof_references_uncheckable_seq_theory` — the TIER-0 leak
+///   arm of `unsat_proof_self_certified` — as "pinned Carcara cannot parse this
+///   document's surface". `FloatingPoint` is not in that checker's sort grammar,
+///   so every FP certificate trips it.
+/// * Owner decision D7 (`31c874c43`, 2026-09-22) re-affirmed that arm for the
+///   consumers that CLAIM an external check and named `--self-check` as one of
+///   them, adding only the reason. Its own test
+///   `strict_proof_terminal_trust_library_gate::self_check_refusal_names_the_unsupported_carcara_surface`
+///   asserts exactly this refusal, and its twin
+///   `strict_proofs_refusal_names_the_unsupported_carcara_surface` asserts it for
+///   `(_ FloatingPoint 3 5)` by name.
+/// * D7 also flipped the in-crate FP twins of this test
+///   (`executor::proof::tests::bv_fp::test_qf_fplra_forward_error_is_strict_checkable`)
+///   to the document-renders-and-discloses contract the assertions below pin.
 #[test]
 #[timeout(60_000)]
-fn guard_claim_unsat_is_trust_free_and_self_check_certified() {
+fn guard_claim_unsat_is_trust_free_and_strictly_certified() {
     for claim in [
         "(assert (>= (- (fp.to_real rf) rreal) 0.3))",
         "(assert (>= (- (fp.to_real rf) rreal) 2.0))",
         "(assert (<= (- rreal (fp.to_real rf)) (- 0.3)))",
         "(assert (> (- (fp.to_real rf) rreal) (/ 13.0 64.0)))",
     ] {
-        let exec = solve_self_checked_unsat(&guard_claim_smt(claim));
+        let exec = solve_proof_mode_unsat(&guard_claim_smt(claim));
         let proof = exec.last_proof().expect("proof after UNSAT");
 
         // Zero trust steps on the empty-clause path (the --strict-proofs gate).
@@ -238,6 +268,50 @@ fn guard_claim_unsat_is_trust_free_and_self_check_certified() {
             "{claim}: proof must not fall back to :rule trust; got:\n{text}"
         );
     }
+}
+
+/// D7 (owner decision, ay `31c874c43`, 2026-09-22): `--self-check` CLAIMS an
+/// external-style check, so it refuses a certificate whose external-recheck
+/// surface pinned Carcara cannot parse — and names the offending sort. The
+/// forward-error certificate is trust-free and strictly certified (the test
+/// above), and it is still withheld here, because `FloatingPoint` is not in
+/// pinned Carcara 1.1.0's sort grammar.
+///
+/// This is the negative control for the positive one above, and the FP twin of
+/// `strict_proof_terminal_trust_library_gate::self_check_refusal_names_the_unsupported_carcara_surface`.
+/// A regression that made `--self-check` publish this `unsat` bare would be the
+/// §0-class certification leak that arm exists to close; one that dropped the
+/// reason would put the taxonomy back where D7 found it.
+#[test]
+#[timeout(60_000)]
+fn guard_claim_self_check_refuses_the_unsupported_fp_surface() {
+    let smt = guard_claim_smt("(assert (>= (- (fp.to_real rf) rreal) 0.3))");
+    let commands = parse(&smt).unwrap_or_else(|err| panic!("parse failed: {err}"));
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    exec.set_self_check(true);
+    let outputs = exec
+        .execute_all(&commands)
+        .unwrap_or_else(|err| panic!("execution failed: {err}"));
+    assert_eq!(
+        outputs,
+        vec!["unknown"],
+        "--self-check claims an external check, so it must withhold an \
+         unsupported-surface certificate rather than publish it bare"
+    );
+    assert_eq!(
+        exec.unknown_reason(),
+        Some(UnknownReason::SelfCheckRejected),
+        "the typed reason must name the gate that refused"
+    );
+    let detail = exec
+        .unknown_detail()
+        .expect("the self-check refusal must record its cause");
+    assert!(
+        detail.contains("external-recheck surface is unsupported")
+            && detail.contains("FloatingPoint"),
+        "the refusal must name the unsupported surface, got: {detail}"
+    );
 }
 
 /// The checked-in benchmark files agree with their :status annotations

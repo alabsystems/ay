@@ -29,6 +29,21 @@ impl Executor {
         }
     }
 
+    /// [`Self::dt_name_of`] for `dt_term`, one side of the equality `eq`, or
+    /// `None` when the two sides of `eq` differ in sort. Raw `mk_app`
+    /// interning admits such an `=` (store residue that no assertion owns);
+    /// it relates nothing, so a whole-store scan must not read `dt_term` as a
+    /// value of the other side's datatype and mint `(is-C dt_term)` for it.
+    pub(super) fn dt_name_of_equality_side(&self, eq: TermId, dt_term: TermId) -> Option<String> {
+        let TermData::App(_, args) = self.ctx.terms.get(eq) else {
+            return None;
+        };
+        if args.len() != 2 || self.ctx.terms.sort(args[0]) != self.ctx.terms.sort(args[1]) {
+            return None;
+        }
+        self.dt_name_of(dt_term)
+    }
+
     /// Whether `term` is an application of a declared datatype constructor.
     pub(super) fn term_is_constructor_app(&self, term: TermId) -> bool {
         matches!(
@@ -37,3 +52,6 @@ impl Executor {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

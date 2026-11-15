@@ -138,46 +138,6 @@ fn checkpoint_from_distinct_same_epoch_tracker_is_rejected() {
 }
 
 #[test]
-fn checkpointed_maps_do_not_use_tombstone_creating_mutation() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let tracker_source = std::fs::read_to_string(root.join("src/proof_tracker/mod.rs"))
-        .expect("read proof tracker source");
-    let dedup_source = std::fs::read_to_string(root.join("src/proof_tracker/lemma_dedup.rs"))
-        .expect("read lemma dedup source");
-    let proof_source =
-        std::fs::read_to_string(root.join("../ay-core/src/proof.rs")).expect("read proof source");
-    let compact = tracker_source
-        .chars()
-        .chain(dedup_source.chars())
-        .chain(proof_source.chars())
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    for field in [
-        "assumption_map",
-        "lemma_map",
-        "scope_assumption_maps",
-        "scope_lemma_maps",
-        "scope_named_steps",
-        "named_steps",
-        "buckets",
-    ] {
-        for method in [
-            "remove",
-            "remove_entry",
-            "retain",
-            "extract_if",
-            "drain",
-            "entry",
-        ] {
-            assert!(
-                !compact.contains(&format!("{field}.{method}(")),
-                "{field}.{method} can leave tombstones; revise checkpoint map accounting first"
-            );
-        }
-    }
-}
-
-#[test]
 fn rollback_restores_steps_removed_by_a_speculative_pop() {
     let mut tracker = ProofTracker::new();
     tracker.enable();

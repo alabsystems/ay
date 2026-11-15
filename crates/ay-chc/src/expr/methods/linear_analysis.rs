@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 
 use super::{
@@ -13,16 +14,91 @@ use super::{
     MAX_EXPR_RECURSION_DEPTH,
 };
 
+/// Node visits [`ChcExpr::vars`] makes before it starts memoising shared
+/// children (keeps small expressions on the plain, allocation-free walk).
+const VARS_PLAIN_VISITS: usize = 512;
+
+struct VarsWalk {
+    seen: FxHashSet<ChcVar>,
+    result: Vec<ChcVar>,
+    plain_visits_left: usize,
+    /// Child `Arc` address -> smallest depth at which it was fully explored.
+    /// Nodes stay alive (borrowed from the root) for the whole walk.
+    explored_at: FxHashMap<*const ChcExpr, usize>,
+}
+
+impl VarsWalk {
+    fn visit(&mut self, expr: &ChcExpr, depth: usize) {
+        if depth >= MAX_EXPR_RECURSION_DEPTH {
+            return;
+        }
+        maybe_grow_expr_stack(|| match expr {
+            ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {}
+            ChcExpr::Var(v) => {
+                if self.seen.insert(v.clone()) {
+                    self.result.push(v.clone());
+                }
+            }
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => {
+                for arg in args {
+                    self.visit_child(arg, depth + 1);
+                }
+            }
+            ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => {}
+            ChcExpr::ConstArray(_ks, val) => self.visit_child(val, depth + 1),
+            ChcExpr::ArrayLambda(lambda) => {
+                for value in lambda.captures() {
+                    self.visit_child(value, depth + 1);
+                }
+            }
+        })
+    }
+
+    fn visit_child(&mut self, child: &Arc<ChcExpr>, depth: usize) {
+        if self.plain_visits_left > 0 {
+            self.plain_visits_left -= 1;
+            self.visit(child, depth);
+            return;
+        }
+        if matches!(child.as_ref(), ChcExpr::Var(_)) {
+            self.visit(child, depth);
+            return;
+        }
+        let key = Arc::as_ptr(child);
+        match self.explored_at.get(&key) {
+            Some(&explored) if explored <= depth => return,
+            _ => {}
+        }
+        self.explored_at.insert(key, depth);
+        self.visit(child, depth);
+    }
+}
+
 impl ChcExpr {
-    /// Get all variables in the expression.
+    /// Get all variables in the expression, in first-occurrence preorder.
     ///
     /// Uses `FxHashSet` for O(1) deduplication, avoiding the O(n²) complexity
     /// of the previous `Vec::contains()` approach (#1120).
+    ///
+    /// DAG-linear (WP-F F0b): after [`VARS_PLAIN_VISITS`] node visits the walk
+    /// remembers, per shared child `Arc`, the smallest depth at which it was
+    /// fully explored, and skips a later visit at an equal or greater depth.
+    /// That skip is exact: the earlier visit (which finished before the later
+    /// one started — the input is acyclic) already explored everything the
+    /// later one could reach under the `MAX_EXPR_RECURSION_DEPTH` cut-off, so
+    /// every variable it would meet is already in `seen` and the result —
+    /// including its order — equals the tree walk's.
     pub fn vars(&self) -> Vec<ChcVar> {
-        let mut seen = FxHashSet::default();
-        let mut result = Vec::new();
-        self.collect_vars_dedupe(&mut seen, &mut result, 0);
-        result
+        let mut walk = VarsWalk {
+            seen: FxHashSet::default(),
+            result: Vec::new(),
+            plain_visits_left: VARS_PLAIN_VISITS,
+            explored_at: FxHashMap::default(),
+        };
+        walk.visit(self, 0);
+        walk.result
     }
 
     /// Get all variables in the expression whose sort matches `sort`.
@@ -36,42 +112,6 @@ impl ChcExpr {
             .into_iter()
             .filter(|v| &v.sort == sort)
             .collect()
-    }
-
-    fn collect_vars_dedupe(
-        &self,
-        seen: &mut FxHashSet<ChcVar>,
-        result: &mut Vec<ChcVar>,
-        depth: usize,
-    ) {
-        if depth >= MAX_EXPR_RECURSION_DEPTH {
-            return;
-        }
-        maybe_grow_expr_stack(|| match self {
-            Self::Bool(_) | Self::Int(_) | Self::Real(_, _) | Self::BitVec(_, _) => {}
-            Self::Var(v) => {
-                if seen.insert(v.clone()) {
-                    result.push(v.clone());
-                }
-            }
-            Self::Op(_, args) => {
-                for arg in args {
-                    arg.collect_vars_dedupe(seen, result, depth + 1);
-                }
-            }
-            Self::PredicateApp(_, _, args) => {
-                for arg in args {
-                    arg.collect_vars_dedupe(seen, result, depth + 1);
-                }
-            }
-            Self::FuncApp(_, _, args) => {
-                for arg in args {
-                    arg.collect_vars_dedupe(seen, result, depth + 1);
-                }
-            }
-            Self::ConstArrayMarker(_) | Self::IsTesterMarker(_) => {}
-            Self::ConstArray(_ks, val) => val.collect_vars_dedupe(seen, result, depth + 1),
-        })
     }
 
     /// Check if this expression is Bool-sorted at the top level.
@@ -110,7 +150,7 @@ impl ChcExpr {
             Self::PredicateApp(_, _, _) => true, // Predicates are Bool-sorted
             Self::FuncApp(_, sort, _) => matches!(sort, ChcSort::Bool),
             Self::ConstArrayMarker(_) | Self::IsTesterMarker(_) => false,
-            Self::ConstArray(_, _) => false,
+            Self::ConstArray(_, _) | Self::ArrayLambda(_) => false,
         }
     }
 
@@ -384,6 +424,11 @@ impl ChcExpr {
                     }
                 }
                 ChcExpr::ConstArray(_ks, val) => count_inner(val, count, limit, depth + 1),
+                ChcExpr::ArrayLambda(lambda) => {
+                    for value in lambda.captures() {
+                        count_inner(value, count, limit, depth + 1);
+                    }
+                }
             });
         }
         count_inner(self, &count, limit, 0);

@@ -55,6 +55,7 @@ mod local_var_elimination;
 // parallel-edge merging half of the NodeEliminator loop.
 pub(crate) mod multi_edge_merger;
 mod node_eliminator;
+mod parameter_vars;
 // SLayerCF-shaped pc-directed location splitting (campaign recon lever 8):
 // specializes predicates whose arg0 is a constraint-pinned program counter
 // into per-pc-value location predicates. Kill switch AY_CHC_DISABLE_PC_SPLIT.
@@ -869,3 +870,6 @@ mod tests;
 #[cfg(test)]
 #[path = "soundness_tests.rs"]
 mod soundness_tests;
+
+#[cfg(test)]
+mod array_lambda_tests;

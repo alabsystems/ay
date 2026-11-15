@@ -71,68 +71,29 @@ impl Variable {
     ///
     /// # Panics
     ///
-    /// Panics if `id` exceeds [`Self::MAX_ID`]. That panic is the whole reason
-    /// this function's panic-freedom obligation is FALSE unconditionally: the
-    /// `# Panics` clause above IS the missing precondition, and the contract
-    /// below is that clause written where a prover can read it.
+    /// Panics if `id` exceeds [`Self::MAX_ID`]. That panic is this function's
+    /// documented behaviour for out-of-range input, so the verifier's refutation
+    /// of unconditional panic-freedom here (`[assert] FAILED`, witness
+    /// `id = 2_147_483_648`) is correct, and the annotation below declares it:
+    /// `trust::contract_panic` marks the one panic whose message contains the
+    /// payload; the advisory lane reports it as `contract-panic:matched`
+    /// evidence — its own bucket, never proof credit — while strict and certify
+    /// keep it a failure, and an annotation that matches no panic is an
+    /// always-FAILED `contract-panic-unused` row. It is a tool attribute, hence
+    /// `register_tool(trust)` in `lib.rs`, and it is `cfg_attr`-gated so the
+    /// clause-free `literal_stock.rs` twin never resolves it.
     ///
-    /// The bound is spelled as a LITERAL rather than as `Self::MAX_ID`, and
-    /// that is forced, not stylistic. MEASURED on trust-e26541e3: a contract
-    /// predicate naming an associated constant is rejected by the frontend
-    /// ("unsupported contract predicate expression
-    /// `id <= Variable::MAX_ID`") and discharges nothing. The
-    /// `const _: ()` assertion above `impl Variable` makes the duplication
-    /// safe: if `MAX_ID` ever changes, this file stops compiling rather than
-    /// silently carrying a contract that no longer matches the assertion it is
-    /// supposed to justify.
-    ///
-    /// ── WHY THERE IS NO `requires` CLAUSE HERE, DESPITE ALL OF THE ABOVE ────
-    ///
-    /// There WAS one, as ``, and it never ran: the attribute form needed an
-    /// `--extern trust` overlay, so it fired only in the ratchet lane. A
-    /// verified probe made its runtime behavior observable and showed that it
-    /// CONTRADICTS this function's tested public behavior.
-    ///
-    /// The overlay half of that story is now obsolete — the default toolchain
-    /// is Trust and the sanctioned spelling is the native clause
-    /// `pub fn new(id: u32) -> Self requires id <= 2_147_483_647`, which needs
-    /// no overlay and fires in EVERY build. That makes the objection below
-    /// stronger, not weaker, and it is why this clause is still absent: the
-    /// decision it records is about the API, not about how the precondition is
-    /// spelled.
-    ///
-    /// A `requires` clause is not only a static claim. Where a caller cannot
-    /// discharge it, the compiler installs a kernel-certified RUNTIME MONITOR,
-    /// and that monitor is a NON-UNWINDING abort:
-    ///
-    /// ```text
-    /// thread '..' panicked at core/src/panicking.rs:225:5:
-    /// kernel-certified Trust monitor failed
-    /// thread caused non-unwinding panic. aborting.
-    /// process didn't exit successfully (signal: 6, SIGABRT)
-    /// ```
-    ///
-    /// `literal_tests::test_overflow_variable_panics` asserts the opposite, and
-    /// says why in its own body: "Invalid state is rejected at the Variable
-    /// boundary in every build mode". It calls `Variable::new(MAX_VAR + 1)`
-    /// under `#[should_panic(expected = "exceeds Variable::MAX_ID")]`. A
-    /// `should_panic` test cannot catch an abort — the process dies — so the
-    /// contract does not merely fail that test, it removes the recoverable,
-    /// catchable panic this API documents and guarantees.
-    ///
-    /// Both designs are coherent; they are just different APIs. "Out-of-range
-    /// input is a caller error the prover must rule out" and "out-of-range
-    /// input is a supported, tested, recoverable failure" cannot both hold.
-    /// Choosing between them is an API decision, not a verification-lane
-    /// decision, so turning verification on does not get to make it silently.
-    /// The precondition is left unstated here and the guarantee kept.
-    ///
-    /// The statically-checkable half is not lost: [`Self::try_new`] carries the
-    /// same bound in its return type, needs no precondition, and is what the
-    /// `# Panics` note above already tells external callers to prefer.
-    ///
-    /// To adopt the contract instead, the panic tests must first move to a
-    /// subprocess harness that can observe SIGABRT.
+    /// A `requires id <= 2_147_483_647` clause is expressible (the bound must be
+    /// a literal) and deliberately absent: where a caller cannot discharge it
+    /// the compiler installs a kernel-certified runtime monitor, and under this
+    /// workspace's `unix_hardened` profile that monitor is a non-unwinding
+    /// abort (re-measured 2026-09-22 on trust 3e7b7b15b:
+    /// `test_overflow_variable_panics` dies with "kernel-certified Trust
+    /// monitor failed … aborting" instead of catching the panic; under
+    /// `certify` the violating call is a build error). That turns a documented,
+    /// recoverable panic into a process abort — an API change, not a
+    /// verification setting. [`Self::try_new`] is the statically checkable half
+    /// and what external callers should use.
     #[inline]
     pub fn new(id: u32) -> Self {
         assert!(
@@ -485,20 +446,6 @@ impl std::fmt::Display for Literal {
         write!(f, "{}", self.to_dimacs_i64())
     }
 }
-
-/// Bounded model-checking harnesses that PROVE the soundness invariants of the
-/// literal encoding (`positive = 2*var`, `negative = 2*var+1`) over all inputs
-/// in a tractable range — the formal upgrade of the sample/dense tests in
-/// `literal_tests.rs`. A wrong encoding round-trip would silently corrupt a
-/// DRAT/LRAT proof checker's clause database, so these are genuine soundness
-/// obligations. The harnesses are written in the `kani`-attribute format
-/// (`#[cfg(kani)]` gates them out of ordinary builds) but are **executed by
-/// Trust's `model-checker-consumer` bounded model checker** (which uses AY itself as its SMT
-/// backend), not the standalone `kani` tool. See the
-/// `[[trust-verification-toolchain]]` methodology.
-#[cfg(kani)]
-#[path = "literal/verification.rs"]
-mod verification;
 
 #[cfg(test)]
 #[path = "literal_tests.rs"]

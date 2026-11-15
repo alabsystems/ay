@@ -19,24 +19,10 @@
 //! against ay-ffi and require all checks to pass.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-/// Find the ay-ffi static library in the cargo target directory.
-fn find_static_lib() -> Option<PathBuf> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
-    let workspace_root = Path::new(&manifest_dir).parent()?.parent()?;
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"));
-    let lib_path = target_dir.join(profile).join("libay_ffi.a");
-    lib_path.exists().then_some(lib_path)
-}
+use super::native_link::find_static_lib;
 
 /// The registry sizes the consumer pins, taken live from the Rust constants that
 /// back `Z3_get_num_tactics` / `Z3_get_num_simplifiers`. Injecting them as `-D`
@@ -82,17 +68,7 @@ fn compile_and_link(header_dir: &Path, c_source: &Path, static_lib: &Path, binar
         .arg(static_lib.as_os_str())
         .arg("-o")
         .arg(binary.as_os_str());
-    if cfg!(target_os = "macos") {
-        cmd.args([
-            "-framework",
-            "Security",
-            "-framework",
-            "CoreFoundation",
-            "-lresolv",
-            "-Wl,-no_warn_duplicate_libraries",
-        ]);
-    }
-    cmd.args(["-lpthread", "-lm"]);
+    super::native_link::add_native_libraries(&mut cmd);
     let output = cmd.output().expect("failed to invoke cc for linking");
     assert!(
         output.status.success(),
@@ -113,8 +89,8 @@ fn test_capi_quantifier_meta_consumer_compiles_links_runs() {
         c_source.display()
     );
 
-    let tmpdir = env::temp_dir().join("ay_capi_quantifier_meta_test");
-    let _ = std::fs::create_dir_all(&tmpdir);
+    let temporary = tempfile::tempdir().expect("create isolated consumer directory");
+    let tmpdir = temporary.path();
 
     let Some(static_lib) = find_static_lib() else {
         eprintln!("SKIP link: libay_ffi.a not found, compile-only check");
@@ -123,7 +99,6 @@ fn test_capi_quantifier_meta_consumer_compiles_links_runs() {
             &c_source,
             &tmpdir.join("capi_quantifier_meta.o"),
         );
-        let _ = std::fs::remove_dir_all(&tmpdir);
         return;
     };
 
@@ -143,6 +118,4 @@ fn test_capi_quantifier_meta_consumer_compiles_links_runs() {
         stdout.contains("quantifier-meta C consumer checks passed"),
         "quantifier_meta consumer did not report all checks passing.\nstdout: {stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }

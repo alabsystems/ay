@@ -151,6 +151,9 @@ fn assert_flat_and_arity(expr: &ChcExpr, expected_arity: usize, label: &str) {
 fn contains_var_equality(expr: &ChcExpr, lhs: &ChcVar, rhs: &ChcVar) -> bool {
     fn visit(expr: &ChcExpr, lhs: &ChcExpr, rhs: &ChcExpr) -> bool {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                lambda.captures().iter().any(|value| visit(value, lhs, rhs))
+            }
             ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
                 let left = args[0].as_ref();
                 let right = args[1].as_ref();
@@ -175,6 +178,9 @@ fn contains_var_equality(expr: &ChcExpr, lhs: &ChcVar, rhs: &ChcVar) -> bool {
 
 fn contains_ite(expr: &ChcExpr) -> bool {
     match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            contains_ite(lambda.body()) || lambda.captures().iter().any(|value| contains_ite(value))
+        }
         ChcExpr::Op(ChcOp::Ite, _) => true,
         ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
             args.iter().any(|arg| contains_ite(arg))
@@ -460,7 +466,7 @@ fn deterministic_bv_bool_recognizer_rejects_unsupported_datatype_terms() {
     let flag_next = ChcVar::new("flag_next", ChcSort::Bool);
     let dt_sort = ChcSort::Datatype {
         name: "Node".to_string(),
-        constructors: Arc::new(Vec::new()),
+        constructors: crate::ChcDtConstructors::new(Vec::new()),
     };
     let node = ChcVar::new("node", dt_sort);
     let ts = TransitionSystem::new(

@@ -50,7 +50,7 @@ mod types;
 mod verification;
 
 // Re-export public types
-pub use config::PdrConfig;
+pub use config::{DropOrder, OracleBackend, PdrConfig, SpacerLane};
 pub use counterexample::{Counterexample, CounterexampleStep};
 pub use frame::PdrResult;
 pub use model::{

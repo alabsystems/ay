@@ -611,6 +611,17 @@ impl ModDivElimState {
         let q = terms.mk_fresh_var("_divmod_q", Sort::Int);
         let r = terms.mk_fresh_var("_divmod_r", Sort::Int);
         self.add_division_constraints(terms, dividend, k.clone(), q, r);
+        // Provenance for the proof producer (`proof_divmod_def`), recorded at
+        // this single mint site and never read by the solver. The literal
+        // already exists (the constraints above use it), so the store's
+        // contents are unchanged.
+        let divisor = terms.mk_int(k.clone());
+        terms.register_divmod_purification(ay_core::term::DivModPurification {
+            quotient: q,
+            remainder: r,
+            dividend,
+            divisor,
+        });
         self.const_divmod_qr.insert((dividend, k), (q, r));
         (q, r)
     }
@@ -1045,6 +1056,16 @@ impl ModDivElimState {
     ) {
         let zero = terms.mk_int(BigInt::from(0));
         let divisor_eq_zero = terms.mk_eq(divisor, zero);
+        // (#nia-symbolic-division-exact) When the operands fix the quotient,
+        // the exact form below REPLACES this definition rather than joining it.
+        if let Some(quotient) = exact_symbolic_quotient(terms, dividend, divisor) {
+            let q_eq = terms.mk_eq(q, quotient);
+            let r_eq = terms.mk_eq(r, zero);
+            let exact = terms.mk_and(vec![q_eq, r_eq]);
+            self.constraints
+                .push(terms.mk_or(vec![divisor_eq_zero, exact]));
+            return;
+        }
 
         let divisor_times_q = terms.mk_mul(vec![divisor, q]);
         let recomposed = terms.mk_add(vec![divisor_times_q, r]);
@@ -1072,6 +1093,63 @@ impl ModDivElimState {
 
         self.constraints
             .push(terms.mk_or(vec![divisor_eq_zero, positive_case, negative_case]));
+    }
+}
+
+/// (#nia-symbolic-division-exact) The quotient of a symbolic division whose
+/// value is fixed by the syntax of its operands, or `None`. These are the
+/// rewrites z3 applies to `(div x x)`, `(div 0 x)` and `(mod (* a x) x)`:
+///
+/// * `x` and `y` the same term: `q = 1`;
+/// * `x` the literal `0`: `q = 0`;
+/// * `x` a product with `y` among its factors, `x = y*a`: `q = a`.
+///
+/// In each case `r = 0`. For `y != 0` the pair `(q, r)` with `x = y*q + r` and
+/// `0 <= r < |y|` is unique and this one satisfies it, so
+/// `y = 0 \/ (q = k /\ r = 0)` is EQUIVALENT to the Euclidean definition
+/// `add_symbolic_division_constraints` emits otherwise; for `y = 0` both leave
+/// `q` and `r` free, as SMT-LIB leaves division by zero.
+///
+/// The exact form replaces the definition instead of joining it. Without it
+/// the solver has to derive `q` through the product `y*q`, which the
+/// nonlinear core does not do: `d != 0 /\ (div d d) != 1` ran to its deadline
+/// (Verus fix queue, row D2). Asserted next to the definition, it made the
+/// solver split one more disjunction on every query holding such a term: the
+/// `(mod x x)` regression tests went from 0.1 to 0.4 CPU s and past their
+/// 10 s wall limit under load. Replacing it also drops the product `y*q`.
+///
+/// Only these exact cases are rewritten. Linear bounds on `q` by sign case
+/// (`y > 0, x >= 0 => 0 <= q <= x`, ...) were measured as well and rejected:
+/// they add four sign-case clauses and fresh atoms per division, and on
+/// `x < 0, y < 0, (div x y) <= 0` (UNSAT) and `(div d d) != 1` (SAT) they took
+/// both from under a second to past 30 CPU seconds.
+fn exact_symbolic_quotient(
+    terms: &mut TermStore,
+    dividend: TermId,
+    divisor: TermId,
+) -> Option<TermId> {
+    if dividend == divisor {
+        return Some(terms.mk_int(BigInt::from(1)));
+    }
+    if extract_int_constant(terms, dividend).is_some_and(|c| c == BigInt::from(0)) {
+        return Some(terms.mk_int(BigInt::from(0)));
+    }
+    product_cofactor(terms, dividend, divisor)
+}
+
+/// `a` when `product` is `(* f1 ... fn)` with `factor` among the `fi`, where
+/// `a` is the product of the remaining factors (`product = factor * a`).
+fn product_cofactor(terms: &mut TermStore, product: TermId, factor: TermId) -> Option<TermId> {
+    let mut rest = match terms.get(product) {
+        TermData::App(Symbol::Named(name), args) if name == "*" => args.clone(),
+        _ => return None,
+    };
+    let position = rest.iter().position(|&a| a == factor)?;
+    let _ = rest.remove(position); // `factor` itself; only the rest is needed
+    match rest.len() {
+        0 => None,
+        1 => Some(rest[0]),
+        _ => Some(terms.mk_mul(rest)),
     }
 }
 

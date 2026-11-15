@@ -20,7 +20,12 @@ impl LiaSolver<'_> {
         for (i, &free_col) in free_vars.iter().enumerate() {
             if free_col < idx_to_term.len() {
                 let term_id = idx_to_term[free_col];
-                if let Some((lb, ub)) = self.lra.get_bounds_ref(term_id) {
+                // JUSTIFIED bounds only (#nia-sign-cut-soundness): the box
+                // decides `Unsat(conflict_from_asserted())`, so a tentative
+                // NIA bound (sign cut / rounding pin) must not shrink it
+                // (attack corpus: `[ENUM] Infeasible bounds: [-2, -4] x
+                // [1, 1000]` on gen2/h0139, a satisfiable file).
+                if let Some((lb, ub)) = self.justified_bounds_ref(term_id) {
                     if let Some(lb) = lb {
                         lower[i] = Some(Self::ceil_bigint(&lb.value.to_big()));
                     }
@@ -37,7 +42,8 @@ impl LiaSolver<'_> {
             }
             let pivot_term = idx_to_term[*pivot_col];
 
-            let (pivot_lb, pivot_ub) = match self.lra.get_bounds_ref(pivot_term) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness), as above.
+            let (pivot_lb, pivot_ub) = match self.justified_bounds_ref(pivot_term) {
                 Some((lb, ub)) => (lb.map(|b| b.value_big()), ub.map(|b| b.value_big())),
                 None => (None, None),
             };
@@ -258,7 +264,7 @@ impl LiaSolver<'_> {
                 _ => None,
             }
         };
-        let terms = self.terms;
+        let terms = self.terms();
         let extract_mul_const = |t: TermId| -> Option<BigRational> {
             fn extract_from(terms: &TermStore, t: TermId) -> Option<BigRational> {
                 match terms.get(t) {
@@ -274,7 +280,7 @@ impl LiaSolver<'_> {
         };
 
         crate::linear_collect::collect_linear_terms(
-            self.terms,
+            self.terms(),
             term,
             scale,
             coeffs,

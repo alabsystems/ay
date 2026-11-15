@@ -161,15 +161,19 @@ pub(crate) fn debug_algebraic_enabled() -> bool {
 pub mod ab_switches;
 pub(crate) mod acyclic_cert_cache;
 mod adaptive;
+mod adaptive_array_refutation;
 mod adaptive_bv_dual_lane;
 mod adaptive_bv_strategy;
 mod adaptive_cata;
+mod adaptive_collapse_first;
 mod adaptive_decision_log;
 mod adaptive_engines;
 mod adaptive_houdini;
+mod adaptive_ladder_race;
 mod adaptive_multi_pred;
 mod adaptive_multi_pred_complex;
 mod adaptive_prestage_budget;
+mod adaptive_query_flag_race;
 mod adaptive_route_admission;
 mod adaptive_validation;
 mod adt_array_nullary;
@@ -186,10 +190,12 @@ pub(crate) mod chc_graph;
 mod chc_statistics;
 mod classifier;
 mod clause;
+mod compact_datatype_route;
 mod convex_closure;
 pub(crate) mod cvp;
 mod dar;
 pub(crate) mod decomposition;
+mod empty_acyclic_safe_check;
 mod engine_config;
 pub(crate) mod engine_result;
 mod engine_utils;
@@ -199,6 +205,7 @@ mod expr_vars;
 pub(crate) mod failure_analysis;
 mod farkas;
 mod farkas_decomposition;
+pub mod fp_adapter;
 mod generalize;
 pub(crate) mod ground_derivation;
 mod ic3;
@@ -230,8 +237,10 @@ mod proof_metadata;
 mod qf_invariant_artifact;
 mod qual_mine;
 mod qualifier;
+pub mod quantified;
 pub mod quotient_certificate;
 pub(crate) mod recurrence;
+mod run_meter;
 pub(crate) mod single_loop;
 mod smt;
 mod synthesis;
@@ -246,10 +255,20 @@ pub(crate) mod trp;
 
 // Core data model — used in public API signatures (ChcParser::parse -> ChcProblem, etc.)
 pub use clause::HornClause;
-pub use expr::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcSort, ChcVar};
+pub use expr::{
+    ChcDtConstructor, ChcDtConstructors, ChcDtId, ChcDtSelector, ChcExpr, ChcSort, ChcVar,
+};
+pub use ground_derivation::compact_artifact::{
+    validate_chc_compact_ground_derivation_artifact,
+    validate_chc_compact_ground_derivation_artifact_with_progress, ChcCompactGroundStepView,
+    ChcCompactValueId, ChcCompactValueView, ChcValidatedCompactGroundDerivation,
+    CHC_COMPACT_GROUND_DERIVATION_ROLE, CHC_COMPACT_GROUND_DERIVATION_SCHEMA,
+};
 pub use ground_derivation::{
     validate_chc_ground_derivation_artifact, validate_chc_ground_derivation_artifact_v2,
-    ChcGroundDerivationArtifactError, ChcGroundDerivationArtifactErrorReason,
+    validate_chc_ground_derivation_artifact_v2_with_progress,
+    validate_chc_ground_derivation_artifact_with_progress, ChcGroundDerivationArtifactError,
+    ChcGroundDerivationArtifactErrorReason, ChcGroundDerivationStepView,
     ChcValidatedGroundDerivation, CHC_GROUND_DERIVATION_ARTIFACT_MAX_BINDINGS,
     CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES, CHC_GROUND_DERIVATION_ARTIFACT_MAX_CLAUSES,
     CHC_GROUND_DERIVATION_ARTIFACT_MAX_NESTING_DEPTH,
@@ -266,6 +285,7 @@ pub use interpolant_command::{compute_smt_interpolant, InterpolantError, SortRes
 pub use predicate::Predicate;
 pub use problem::ChcPrunedQueryObligationId;
 pub use problem::{ChcProblem, ChcQueryObligation, ChcQueryObligationId};
+pub use problem::{ChcQueryPlayback, ChcQueryPlaybackControl, ChcQueryPlaybackError};
 // Core types used by integration tests for problem construction
 pub use adaptive_decision_log::{
     AdaptiveSolveReport, AdaptiveSolveTrace, AdaptiveStrategyObservation, AdaptiveStrategyOutcome,
@@ -275,39 +295,44 @@ pub use expr::ChcOp;
 pub use predicate::PredicateId;
 pub use proof_metadata::{
     bmc_unsafe_trace_assignment_completeness, bmc_unsafe_trace_assignment_contract,
-    normalized_chc_input, normalized_chc_input_sha256, ChcBmcUnsafeTraceAssignmentCompleteness,
-    ChcBmcUnsafeTraceAssignmentCompletenessReason, ChcBmcUnsafeTraceAssignmentCompletenessStatus,
-    ChcBmcUnsafeTraceAssignmentContract, ChcCheckedReplayArtifacts,
-    ChcCheckedReplayManifestBinding, ChcCheckedReplayObligation, ChcCheckedReplayObligationPayload,
-    ChcCheckedReplayRun, ChcCheckedReplaySummary, ChcCheckedReplaySummaryError,
-    ChcObligationStrictCert, ChcPdrProofRun, ChcProofArtifactDigest, ChcProofEvidenceManifest,
-    ChcProofEvidenceOptions, ChcProofEvidenceParseError, ChcProofQueryAdmissionKey,
-    ChcProofQueryCache, ChcProofQueryCacheAdmissionDecision, ChcProofQueryCacheAdmissionPolicy,
-    ChcProofQueryCacheAdmissionStatus, ChcProofQueryCacheLookupKey, ChcProofQueryCacheLookupResult,
-    ChcProofQueryCacheLookupStatus, ChcProofQueryCacheMetrics, ChcProofRunArtifact,
-    ChcProofRunArtifactBundleValidationError, ChcProofRunArtifactBundleValidationErrorReason,
-    ChcProofRunArtifactValidationError, ChcProofRunArtifactValidationErrorReason,
-    ChcProofRunArtifacts, ChcProofRunStopReason, ChcProofRunWithBudgetReport,
-    ChcProofSolverIdentity, ChcProofTranscriptConsumerEvidence, ChcProofTranscriptMetadata,
-    ChcReplayCheckResult, ChcReplayCheckerIdentity, ChcReplayEvidence, ChcReplayObligationArtifact,
-    ChcReplayPayloadFormat, ChcTraceAssignmentEvidence, ChcTraceStepEvidence,
-    ChcUnsafeTraceEvidence, CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
+    normalized_chc_input, normalized_chc_input_schema, normalized_chc_input_schema_of,
+    normalized_chc_input_sha256, prepare_normalized_chc_input_with_work,
+    ChcBmcUnsafeTraceAssignmentCompleteness, ChcBmcUnsafeTraceAssignmentCompletenessReason,
+    ChcBmcUnsafeTraceAssignmentCompletenessStatus, ChcBmcUnsafeTraceAssignmentContract,
+    ChcCheckedReplayArtifacts, ChcCheckedReplayManifestBinding, ChcCheckedReplayObligation,
+    ChcCheckedReplayObligationPayload, ChcCheckedReplayRun, ChcCheckedReplaySummary,
+    ChcCheckedReplaySummaryError, ChcObligationStrictCert, ChcPdrProofRun, ChcProofArtifactDigest,
+    ChcProofEvidenceManifest, ChcProofEvidenceOptions, ChcProofEvidenceParseError,
+    ChcProofQueryAdmissionKey, ChcProofQueryCache, ChcProofQueryCacheAdmissionDecision,
+    ChcProofQueryCacheAdmissionPolicy, ChcProofQueryCacheAdmissionStatus,
+    ChcProofQueryCacheLookupKey, ChcProofQueryCacheLookupResult, ChcProofQueryCacheLookupStatus,
+    ChcProofQueryCacheMetrics, ChcProofRunArtifact, ChcProofRunArtifactBundleValidationError,
+    ChcProofRunArtifactBundleValidationErrorReason, ChcProofRunArtifactValidationError,
+    ChcProofRunArtifactValidationErrorReason, ChcProofRunArtifacts, ChcProofRunStopReason,
+    ChcProofRunWithBudgetReport, ChcProofSolverIdentity, ChcProofTranscriptConsumerEvidence,
+    ChcProofTranscriptMetadata, ChcReplayCheckResult, ChcReplayCheckerIdentity, ChcReplayEvidence,
+    ChcReplayObligationArtifact, ChcReplayPayloadFormat, ChcTraceAssignmentEvidence,
+    ChcTraceStepEvidence, ChcUnsafeTraceEvidence, PreparedNormalizedChcInput,
+    CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
     CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_CONTRACT_SCHEMA, CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA,
     CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2,
-    CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3, CHC_EVIDENCE_MANIFEST_SCHEMA,
-    CHC_IN_PROCESS_REPLAY_CHECKER_NAME, CHC_PROOF_ARTIFACT_DIGEST_SCHEMA,
-    CHC_PROOF_QUERY_ADMISSION_KEY_SCHEMA, CHC_PROOF_QUERY_CACHE_ADMISSION_DECISION_SCHEMA,
-    CHC_PROOF_QUERY_CACHE_ADMISSION_POLICY_SCHEMA, CHC_PROOF_QUERY_CACHE_LOOKUP_KEY_SCHEMA,
-    CHC_PROOF_QUERY_CACHE_LOOKUP_RESULT_SCHEMA, CHC_PROOF_QUERY_CACHE_METRICS_SCHEMA,
-    CHC_PROOF_QUERY_CACHE_SCHEMA, CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE,
-    CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA, CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE,
-    CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_SCHEMA, CHC_PROOF_TRANSCRIPT_CONSUMER_EVIDENCE_SCHEMA,
-    CHC_PROOF_TRANSCRIPT_SCHEMA, CHC_REPLAY_EVIDENCE_SCHEMA, NORMALIZED_CHC_INPUT_SCHEMA,
+    CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3, CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4,
+    CHC_EVIDENCE_MANIFEST_SCHEMA, CHC_IN_PROCESS_REPLAY_CHECKER_NAME,
+    CHC_PROOF_ARTIFACT_DIGEST_SCHEMA, CHC_PROOF_QUERY_ADMISSION_KEY_SCHEMA,
+    CHC_PROOF_QUERY_CACHE_ADMISSION_DECISION_SCHEMA, CHC_PROOF_QUERY_CACHE_ADMISSION_POLICY_SCHEMA,
+    CHC_PROOF_QUERY_CACHE_LOOKUP_KEY_SCHEMA, CHC_PROOF_QUERY_CACHE_LOOKUP_RESULT_SCHEMA,
+    CHC_PROOF_QUERY_CACHE_METRICS_SCHEMA, CHC_PROOF_QUERY_CACHE_SCHEMA,
+    CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE, CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA,
+    CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE, CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_SCHEMA,
+    CHC_PROOF_TRANSCRIPT_CONSUMER_EVIDENCE_SCHEMA, CHC_PROOF_TRANSCRIPT_SCHEMA,
+    CHC_REPLAY_EVIDENCE_SCHEMA, NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA,
+    NORMALIZED_CHC_INPUT_SCHEMA,
 };
 pub use qf_invariant_artifact::{
-    parse_qf_invariant_model_artifact, ChcQfInvariantModelArtifactError,
-    ChcQfInvariantModelArtifactErrorReason, CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_BYTES,
-    CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_MODEL_BYTES,
+    parse_qf_invariant_model_artifact, prepare_qf_invariant_envelope_with_work,
+    ChcQfInvariantModelArtifactError, ChcQfInvariantModelArtifactErrorReason,
+    PreparedQfInvariantEnvelope, QfEnvelopePreparationError, QfInvariantEnvelopeView,
+    CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_BYTES, CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_MODEL_BYTES,
     CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_NESTING_DEPTH,
     CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_PARAMETERS, CHC_QF_INVARIANT_MODEL_ARTIFACT_MAX_PREDICATES,
     CHC_QF_INVARIANT_MODEL_ARTIFACT_MODEL_FORMAT, CHC_QF_INVARIANT_MODEL_ARTIFACT_ROLE,
@@ -336,13 +361,16 @@ pub use pdr::{
     ChcReplayObligation, ChcReplayObligationKind, Counterexample, CounterexampleStep,
     InvariantModel,
 };
-pub use pdr::{PdrConfig, PdrResult, PdrSolver};
+pub use pdr::{DropOrder, OracleBackend, PdrConfig, PdrResult, PdrSolver, SpacerLane};
 pub use portfolio::{
     BudgetPolicy, BudgetReport, EngineBudgetEntry, EngineConfig, EngineStopReason, EngineType,
     PortfolioConfig, PortfolioResult, PortfolioSolver,
 };
 pub use progress::{ChcProgressReport, ChcProgressSnapshot};
-pub use smt::{InterpolationResult, SmtContext, SmtResult, SmtValue, UnsatCoreDiagnostics};
+pub use run_meter::ChcRunWork;
+pub use smt::{
+    InterpolationResult, SmtContext, SmtLane, SmtResult, SmtValue, UnsatCoreDiagnostics,
+};
 
 /// Stable public API for constructing individual CHC engines.
 ///
@@ -372,10 +400,28 @@ pub mod engines {
     use std::panic::AssertUnwindSafe;
     use std::time::Duration;
 
+    /// The process-wide `HornSmt` session counters as one line (#horn-smt-session
+    /// Rung 1 board, design §10.4), or `None` when no query was ever routed —
+    /// i.e. the session is off. The CLI prints it to stderr at the end of a
+    /// CHC run when `--chc-session-stats` is set.
+    pub fn horn_session_totals_report() -> Option<String> {
+        crate::smt::lane::totals_report()
+    }
+
+    /// The Rung-4 coverage census lines (`--chc-session-coverage`; empty
+    /// otherwise).
+    pub fn horn_session_coverage_report() -> Vec<String> {
+        crate::smt::lane::census::coverage_report()
+    }
+
+    /// `true` when `--chc-session-stats` asked for the session report.
+    pub fn horn_session_stats_requested() -> bool {
+        crate::smt::lane::session_stats_enabled()
+    }
+
     const BMC_PROOF_ENGINE_NAME: &str = "bmc";
     const PDR_PROOF_ENGINE_NAME: &str = "pdr";
     const PDR_PROOF_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
-    const PDR_PROOF_PER_RULE_BUDGET: Duration = Duration::from_secs(2);
 
     /// Construct a [`PdrSolver`] with the given configuration.
     ///
@@ -409,9 +455,7 @@ pub mod engines {
     ///   `VerifiedChcResult::Unknown`;
     /// - `Unknown` metadata is always `accepted_as_proof == false`.
     pub fn solve_pdr_proof(problem: ChcProblem, config: PdrConfig) -> ChcResult<ChcPdrProofRun> {
-        let solve_deadline = config
-            .solve_timeout
-            .map(|timeout| ay_core::time::Instant::now() + timeout);
+        let solve_deadline = deadline::for_config(&config);
         // Install a thread-wide solve deadline so EVERY check_sat on this thread
         // (main PDR context, startup discovery, the fresh re-validation verifier,
         // and any portfolio engine) is bounded by solve_timeout — closing the gap
@@ -461,27 +505,94 @@ pub mod engines {
     /// the run is returned exactly as [`solve_pdr_proof`] would have returned
     /// it (metadata-only, non-admissible), so opting in can never change a
     /// solve verdict or over-claim replayability.
+    /// Both configured cancellation channels reach replay's cooperative polls
+    /// and active SMT work. Rendering, offline checking and teardown remain opaque;
+    /// this does not promise a hard cancellation deadline. The final poll
+    /// admits attachment; disposal of the original run can still follow it.
     pub fn solve_pdr_proof_with_checked_replay(
         problem: ChcProblem,
         config: PdrConfig,
         replay_budget: Duration,
     ) -> ChcResult<ChcPdrProofRun> {
+        let cancellation = config.effective_cancellation_token();
         let run = solve_pdr_proof(problem, config)?;
-        Ok(attach_checked_replay(run, replay_budget))
+        Ok(attach_checked_replay_with_cancellation(
+            run,
+            replay_budget,
+            cancellation.as_ref(),
+        ))
+    }
+
+    fn attach_checked_replay_with_cancellation(
+        run: ChcPdrProofRun,
+        replay_budget: Duration,
+        cancellation: Option<&CancellationToken>,
+    ) -> ChcPdrProofRun {
+        match cancellation {
+            Some(token) => {
+                attach_checked_replay_with_controls(run, replay_budget, &mut || true, Some(token))
+            }
+            None => attach_checked_replay_with_progress(run, replay_budget, &mut || true),
+        }
     }
 
     /// Fail-closed helper: swap in checked-replay metadata when the pass
     /// succeeds, otherwise return the metadata-only run unchanged.
-    fn attach_checked_replay(run: ChcPdrProofRun, replay_budget: Duration) -> ChcPdrProofRun {
+    fn attach_checked_replay_with_progress(
+        run: ChcPdrProofRun,
+        replay_budget: Duration,
+        progress: &mut dyn FnMut() -> bool,
+    ) -> ChcPdrProofRun {
+        attach_checked_replay_with_controls(run, replay_budget, progress, None)
+    }
+
+    fn attach_checked_replay_with_controls(
+        run: ChcPdrProofRun,
+        replay_budget: Duration,
+        progress: &mut dyn FnMut() -> bool,
+        parent: Option<&CancellationToken>,
+    ) -> ChcPdrProofRun {
         if !run.accepted_as_proof() {
             return run;
         }
+        let started = ay_core::time::Instant::now();
+        let cancellation = parent.map(crate::smt::executor_adapter::ReplayCancellation::new);
+        let mut stopped = false;
+        let mut poll = || {
+            if !stopped {
+                stopped = started.elapsed() >= replay_budget
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    || !progress()
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    || started.elapsed() >= replay_budget;
+            }
+            !stopped
+        };
         let checked = ay_core::catch_ay_panics(
-            AssertUnwindSafe(|| run.run_checked_replay(replay_budget)),
+            AssertUnwindSafe(|| {
+                let checked = run.run_checked_replay_with_controls_started_at(
+                    started,
+                    replay_budget,
+                    &mut poll,
+                    parent,
+                )?;
+                let attached = checked.into_proof_run();
+                if !poll() {
+                    return Err(ChcError::Verification(
+                        "checked replay attachment interrupted; retaining original evidence"
+                            .to_owned(),
+                    ));
+                }
+                Ok(attached)
+            }),
             |reason| Err(ChcError::Internal(reason)),
         );
         match checked {
-            Ok(checked) => checked.into_proof_run(),
+            Ok(checked) => checked,
             Err(_) => run,
         }
     }
@@ -494,11 +605,11 @@ pub mod engines {
     pub fn solve_pdr_proof_from_str(input: &str, config: PdrConfig) -> ChcResult<ChcPdrProofRun> {
         ay_core::catch_ay_panics(
             AssertUnwindSafe(|| {
-                let problem = ChcParser::parse(input)?;
-                let solve_deadline = config
-                    .solve_timeout
-                    .map(|timeout| ay_core::time::Instant::now() + timeout);
+                // Parsing consumes the same caller clock, even though the
+                // parser's opaque work is not a hard-latency guarantee.
+                let solve_deadline = deadline::for_config(&config);
                 let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
+                let problem = ChcParser::parse(input)?;
                 Ok(solve_pdr_proof_unchecked(problem, config, solve_deadline))
             }),
             |reason| Err(ChcError::Internal(reason)),
@@ -512,19 +623,61 @@ pub mod engines {
     ) -> ChcResult<ChcPdrProofRun> {
         ay_core::catch_ay_panics(
             AssertUnwindSafe(|| {
+                // Do not mint a fresh budget after IO and parsing finish.
+                let solve_deadline = deadline::for_config(&config);
+                let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
                 let input = std::fs::read_to_string(path)?;
                 let problem = ChcParser::parse(&input)?;
-                let solve_deadline = config
-                    .solve_timeout
-                    .map(|timeout| ay_core::time::Instant::now() + timeout);
-                let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
                 Ok(solve_pdr_proof_unchecked(problem, config, solve_deadline))
             }),
             |reason| Err(ChcError::Internal(reason)),
         )
     }
 
+    /// Run `run` on a metered GuardTree node and attach its work: with no
+    /// effort observation only, the count decides nothing (P4a slice 7,
+    /// guard-tree.md §13), and below a node that counts no node is opened and
+    /// the work is `None`; with an effort the node is allotted it, its own
+    /// deadline is the run's `backstop`, and its count is the run's stop
+    /// (slice 8, §14). A run that ends without a verdict is settled first, so
+    /// its work names a backstop that ended it (`cancelled`: the run's token).
+    fn metered(
+        effort: Option<u64>,
+        backstop: Option<ay_core::time::Instant>,
+        cancelled: impl FnOnce() -> bool,
+        run: impl FnOnce() -> ChcPdrProofRun,
+    ) -> ChcPdrProofRun {
+        let meter = crate::run_meter::RunMeter::open(effort, backstop);
+        let run = run();
+        if run.result().is_unknown() {
+            meter.settle(cancelled());
+        }
+        run.with_work(meter.close())
+    }
+
+    /// Whether the run's own cancellation token is set (`metered`'s settle).
+    fn run_cancelled(config: &PdrConfig) -> bool {
+        config
+            .effective_cancellation_token()
+            .is_some_and(|token| token.is_cancelled())
+    }
+
     fn solve_pdr_proof_unchecked(
+        problem: ChcProblem,
+        config: PdrConfig,
+        solve_deadline: Option<ay_core::time::Instant>,
+    ) -> ChcPdrProofRun {
+        let effort = config.effort;
+        let token = config.effective_cancellation_token();
+        metered(
+            effort,
+            solve_deadline,
+            || token.is_some_and(|token| token.is_cancelled()),
+            || solve_pdr_proof_unmetered(problem, config, solve_deadline),
+        )
+    }
+
+    fn solve_pdr_proof_unmetered(
         problem: ChcProblem,
         mut config: PdrConfig,
         solve_deadline: Option<ay_core::time::Instant>,
@@ -537,6 +690,38 @@ pub mod engines {
         // Keeping the original clauses here also makes the solving,
         // validation, and checked-replay boundaries agree.
         config.preserve_original_clauses = true;
+        // Under an effort the run's count is its stop: no count cap beside it
+        // (P4a slice 8, DR-37).
+        if config.effort.is_some() {
+            config.disarm_count_caps();
+        }
+
+        // Complete compact values avoid datatype tree expansion in PDR setup.
+        // This candidate-only route replays every original clause and keeps
+        // the original owner for subsequent checked export/publication.
+        let cancellation = config.effective_cancellation_token();
+        if let Some(result) = crate::compact_datatype_route::acceptance::run(
+            &problem,
+            solve_deadline,
+            cancellation.as_ref(),
+            config.memory_budget,
+        ) {
+            let result = VerifiedChcResult::from_validated(
+                result,
+                ValidationEvidence::CounterexampleVerification,
+            );
+            let result =
+                downgrade_unsafe_if_overapproximated(result, problem.has_stripped_body_forall());
+            let result = enforce_pdr_proof_return_boundary(result, &config, solve_deadline);
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
+        }
+
+        // Keep a propositional refutation's original-clause ground witness.
+        // The helper retains validation/body-forall/publication gates. Only
+        // missing evidence falls through; observed interruption is terminal.
+        if let Some(result) = propositional::run(&problem, &config, solve_deadline) {
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
+        }
 
         // Exact acyclic BMC certificate prepass.
         //
@@ -546,19 +731,39 @@ pub mod engines {
         // `bmc::BmcSolver::solve_acyclic_safe_first_once`, which trusts only
         // UNSAT as a safety proof). Pure PDR/IC3 can return Inconclusive on
         // these problems even though they are trivially safe, so try the exact
-        // certificate first. Only a `Safe` certificate is accepted as proof;
-        // any other outcome falls through to the PDR search below.
-        if let Some((true, depth)) = run_scalar_acyclic_bmc_certificate(&problem, &config) {
-            let result = VerifiedChcResult::from_validated(
-                ChcEngineResult::Safe(InvariantModel::default()),
-                ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
-            );
-            let result = enforce_pdr_proof_return_boundary(result, &config, solve_deadline);
+        // certificate first. Only a `Safe` certificate that the independent
+        // empty-model check (`crate::empty_acyclic_safe_check`) confirms is
+        // accepted as proof; any other outcome falls through to the PDR search.
+        // Under an effort the prepass is closed, and the PDR search decides
+        // (`BmcSolver::closed_under_effort`, P4a slice 8).
+        if let Some(result) = confirmed_acyclic_bmc_certificate(&problem, &config, solve_deadline) {
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
+        }
+
+        // Finite observed cells can expose a scalar candidate invariant. The
+        // candidate must lift to complete original signatures and pass every
+        // original clause; reduced Unsafe has no refutation authority.
+        if let Some(result) = array_observation::run(&problem, &config, solve_deadline) {
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
+        }
+
+        // Array columns can obscure an otherwise scalar invariant. This
+        // bounded attempt only supplies a lifted candidate: admission still
+        // checks the unchanged original clauses, and projected Unsafe never
+        // stands in for an original counterexample.
+        if let Some(result) = array_projection::run(&problem, &config, solve_deadline) {
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
+        }
+
+        // A cyclic PDR search can miss even shallow original reachability.
+        // Only a fresh original-clause BMC witness, independently revalidated
+        // through the ordinary strict boundary, may end this bounded attempt.
+        if let Some(result) = original_unsafe::run(&problem, &config, solve_deadline) {
             return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
         }
 
         let raw = PdrSolver::solve_problem(&problem, config.clone());
-        let result = validate_pdr_proof_result(&problem, raw, &config);
+        let result = validate_pdr_proof_result(&problem, raw, &config, solve_deadline);
         // Refutations do not survive body-`forall` over-approximation.
         let result =
             downgrade_unsafe_if_overapproximated(result, problem.has_stripped_body_forall());
@@ -566,18 +771,63 @@ pub mod engines {
         ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME)
     }
 
+    /// The exact acyclic BMC certificate prepass of
+    /// `solve_pdr_proof_unmetered`: a `Safe` certificate the independent
+    /// empty-model check confirms, at the proof return boundary; `None`
+    /// otherwise, so the PDR search decides.
+    fn confirmed_acyclic_bmc_certificate(
+        problem: &ChcProblem,
+        config: &PdrConfig,
+        solve_deadline: Option<ay_core::time::Instant>,
+    ) -> Option<VerifiedChcResult> {
+        let (true, depth) = run_scalar_acyclic_bmc_certificate(problem, config)? else {
+            return None;
+        };
+        let recheck_budget = solve_deadline.map_or(PDR_PROOF_VALIDATION_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(ay_core::time::Instant::now())
+        });
+        let cancellation = config.cancellation_token.as_ref();
+        if !crate::empty_acyclic_safe_check::confirmed(problem, recheck_budget, cancellation) {
+            return None;
+        }
+        let result = VerifiedChcResult::from_validated(
+            ChcEngineResult::Safe(InvariantModel::default()),
+            ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
+        );
+        Some(enforce_pdr_proof_return_boundary(
+            result,
+            config,
+            solve_deadline,
+        ))
+    }
+
     fn enforce_pdr_proof_return_boundary(
         result: VerifiedChcResult,
         config: &PdrConfig,
         solve_deadline: Option<ay_core::time::Instant>,
     ) -> VerifiedChcResult {
+        // Under an effort a result the run decided is the count's: the solve
+        // deadline is a backstop that stops a search, never a reason to
+        // discard what was decided within B, and a cancel that came after the
+        // decision did not stop it (P4a slice 8). A stopped search publishes
+        // `unknown` before it reaches here.
+        if config.effort.is_some() {
+            return result;
+        }
         let cancelled = config
             .cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled);
         let deadline_expired =
             solve_deadline.is_some_and(|deadline| ay_core::time::Instant::now() >= deadline);
-        if (cancelled || deadline_expired)
+        let compact_stopped = match &result {
+            VerifiedChcResult::Unsafe(cex) => cex
+                .counterexample()
+                .compact_evidence()
+                .is_some_and(|evidence| evidence.owner().poll().is_err()),
+            _ => false,
+        };
+        if (cancelled || deadline_expired || compact_stopped)
             && matches!(
                 &result,
                 VerifiedChcResult::Safe(_) | VerifiedChcResult::Unsafe(_)
@@ -598,7 +848,10 @@ pub mod engines {
             strict_proofs: true,
             cancellation_token: base.cancellation_token.clone(),
             solve_timeout: Some(PDR_PROOF_VALIDATION_TIMEOUT),
+            memory_budget: base.memory_budget,
             disable_array_scalarization: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
             // Proof validation is a consumer of the candidate model for the
             // exact caller-supplied problem. Re-running solve-time nullary-fail
             // expansion here can erase `fail => false` and validate a model
@@ -614,7 +867,10 @@ pub mod engines {
             strict_proofs: true,
             cancellation_token: base.cancellation_token.clone(),
             solve_timeout: base.solve_timeout.or(Some(PDR_PROOF_VALIDATION_TIMEOUT)),
+            memory_budget: base.memory_budget,
             disable_array_scalarization: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
             // External models are bound to the original predicate signatures
             // and clauses. In particular, do not erase nullary fail/query
             // predicates before checking their interpretations.
@@ -633,51 +889,20 @@ pub mod engines {
     /// the original CHC relation signatures.
     ///
     /// Returns `Ok(true)` only when full PDR clause verification succeeds, or
-    /// when the caller-provided empty model is independently validated as a
-    /// scalar acyclic exhaustive BMC certificate.
+    /// when the caller-provided empty model of an acyclic certificate-class
+    /// problem is confirmed both by exhaustive acyclic BMC and by
+    /// `crate::empty_acyclic_safe_check`, which decides the original clauses
+    /// without any CHC engine.
     /// Panics from the internal verifier are converted to [`ChcError::Internal`].
+    /// For a rejection/stop reason use [`validate_external_invariant_model_typed`];
+    /// false alone is NOT evidence of a refuted model.
     pub fn validate_external_invariant_model(
         problem: &ChcProblem,
         model: &InvariantModel,
         config: &PdrConfig,
     ) -> ChcResult<bool> {
-        ay_core::catch_ay_panics(
-            AssertUnwindSafe(|| {
-                let validation_config = external_model_validation_config(config);
-                // FORALL-ARR ghost-pair certificates (agenda #16): the model's
-                // quantifier-free interpretations are intentionally empty; the
-                // sealed certificate denotes the quantified invariant. Validate
-                // by re-running the full per-rule quantified discharge on the
-                // ORIGINAL clauses (fail-closed on any undischarged clause).
-                if let Some(certificate) = model.ghost_pair_certificate() {
-                    return Ok(crate::transform::recheck_ghost_pair_certificate(
-                        problem,
-                        certificate,
-                        validation_config.solve_timeout,
-                        false,
-                    ));
-                }
-                if model.is_empty() {
-                    if let Some(result) =
-                        validate_empty_scalar_acyclic_bmc_certificate(problem, &validation_config)
-                    {
-                        return result;
-                    }
-                }
-
-                let validation_budget = validation_config.solve_timeout;
-                let mut verifier = PdrSolver::new(problem.clone(), validation_config);
-                match validation_budget {
-                    Some(budget) if budget.is_zero() => Ok(false),
-                    Some(budget) => {
-                        verifier.set_validation_deadline(budget);
-                        Ok(verifier.verify_model_with_budget(model, budget))
-                    }
-                    None => verifier.try_verify_model(model),
-                }
-            }),
-            |reason| Err(ChcError::Internal(reason)),
-        )
+        validate_external_invariant_model_typed(problem, model, config)
+            .map(|result| result == ExternalInvariantValidation::Valid)
     }
 
     /// Re-validate an externally-produced candidate invariant `model` and, on
@@ -712,6 +937,12 @@ pub mod engines {
         model: InvariantModel,
         config: PdrConfig,
     ) -> ChcResult<ChcPdrProofRun> {
+        // The validation's backstop: its budget, the solve timeout, runs from
+        // here (`external_model_validation_config`).
+        let backstop = config
+            .solve_timeout
+            .and_then(|timeout| ay_core::time::Instant::now().checked_add(timeout));
+        let meter = crate::run_meter::RunMeter::open(config.effort, backstop);
         // Mandatory re-validation gate. This is the entire soundness story: the
         // candidate is not trusted until the full clause check confirms it.
         // `?` propagates a verifier panic as `Err` (also non-accepting).
@@ -720,7 +951,9 @@ pub mod engines {
             // arm of `validate_pdr_proof_result`: the full clause check ran and
             // did not confirm the model, so no proof-grade Safe is emitted.
             let result = VerifiedChcResult::unknown_candidate_not_admitted();
-            return Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME));
+            meter.settle(run_cancelled(&config));
+            return Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME)
+                .with_work(meter.close()));
         }
 
         // Re-validated: the full init + transition + query clause check passed
@@ -730,14 +963,7 @@ pub mod engines {
             ChcEngineResult::Safe(model),
             ValidationEvidence::FullVerification,
         );
-        Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME))
-    }
-
-    fn validate_empty_scalar_acyclic_bmc_certificate(
-        problem: &ChcProblem,
-        config: &PdrConfig,
-    ) -> Option<ChcResult<bool>> {
-        run_scalar_acyclic_bmc_certificate(problem, config).map(|(is_safe, _depth)| Ok(is_safe))
+        Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME).with_work(meter.close()))
     }
 
     /// Soundness gate: does `model` EXCLUDE the error state, i.e. does it satisfy
@@ -756,6 +982,8 @@ pub mod engines {
         model: &InvariantModel,
         config: &PdrConfig,
     ) -> ChcResult<bool> {
+        // INV-S2 (#horn-smt-session §7.2): the excludes-error Safe gate.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         ay_core::catch_ay_panics(
             AssertUnwindSafe(|| {
                 let validation_config = external_model_validation_config(config);
@@ -810,15 +1038,17 @@ pub mod engines {
     /// and demoted genuinely-proved SAFEs to unknown.
     ///
     /// For exactly that shape, the sound validation artifact is the
-    /// deterministic exhaustive re-run — the SAME check the discharge gate
+    /// empty-model validation — the SAME validation the discharge gate
     /// (`external_invariant_model_excludes_error`) already applies to
-    /// empty models via `validate_empty_scalar_acyclic_bmc_certificate`:
-    /// complete for acyclic scalar/finite-ADT DAGs, fail-closed on
-    /// SMT-unknowns, arrays/reals/recursive datatypes excluded. When that
-    /// re-run confirms Safe, there are no invariant obligations to replay
-    /// and this returns an empty set (the certificate stands on the
-    /// re-validated exhaustive search). In every other case — non-empty
-    /// models, non-eligible problems, or a re-run that does not confirm —
+    /// empty models via `validate_empty_scalar_acyclic_bmc_certificate`
+    /// (exhaustive acyclic BMC AND the engine-free
+    /// `crate::empty_acyclic_safe_check`): complete for acyclic
+    /// scalar/finite-ADT DAGs, fail-closed on SMT-unknowns,
+    /// arrays/reals/recursive datatypes excluded. When both confirm Safe,
+    /// there are no invariant obligations to replay and this returns an
+    /// empty set (the certificate stands on the re-validated exhaustive
+    /// search). In every other case — non-empty models, non-eligible
+    /// problems, or a validation that does not confirm —
     /// this defers to the standard exporter unchanged, preserving its
     /// fail-closed missing-interpretation error. Nothing is fabricated:
     /// this branch can only ever REMOVE the obligation step for proofs the
@@ -827,6 +1057,9 @@ pub mod engines {
         problem: &ChcProblem,
         model: &InvariantModel,
     ) -> ChcResult<Vec<ChcReplayObligation>> {
+        // INV-S2 (#horn-smt-session §7.2): replay obligations are certificate
+        // material; the re-proof they may run stays off the session.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         // FORALL-ARR ghost-pair certificates (agenda #16): the Safe model is
         // an empty per-predicate map carrying a sealed quantified certificate,
         // so the standard invariant exporter has nothing to instantiate. The
@@ -837,7 +1070,21 @@ pub mod engines {
             return crate::transform::ghost_pair_replay_obligations(problem, certificate);
         }
         if model.is_empty() {
-            let config = PdrConfig::default().with_strict_proofs(true);
+            let config = PdrConfig::default()
+                .with_strict_proofs(true)
+                .with_spacer(SpacerLane::OFF);
+            // Checked replay installs its ORIGINAL wall and linked sticky
+            // caller token before rendering. Legacy callers without a scope
+            // retain the existing finite validation allowance.
+            let config = PdrConfig {
+                cancellation_token: crate::smt::deadline::current_lane_token(),
+                solve_timeout: Some(
+                    crate::smt::deadline::smt_deadline_remaining()
+                        .unwrap_or(PDR_PROOF_VALIDATION_TIMEOUT)
+                        .min(PDR_PROOF_VALIDATION_TIMEOUT),
+                ),
+                ..config
+            };
             let validation_config = external_model_validation_config(&config);
             if let Some(Ok(true)) =
                 validate_empty_scalar_acyclic_bmc_certificate(problem, &validation_config)
@@ -886,153 +1133,18 @@ pub mod engines {
         .unwrap_or(false)
     }
 
-    /// Run the exact acyclic BMC certificate for a scalar/acyclic/BV
-    /// multi-predicate problem.
-    ///
-    /// Returns `None` when the problem is not eligible (has predicates, no
-    /// arrays, has BV sorts, no cycles, more than one predicate). When
-    /// eligible, returns `Some((is_safe, depth))` where `is_safe` is `true`
-    /// only if the exact acyclic path expansion discharged every
-    /// error-reachability branch as UNSAT in the original theory, and `depth`
-    /// is the exhaustive DAG depth used (admissible evidence metadata). A zero
-    /// budget yields `Some((false, depth))`.
-    fn run_scalar_acyclic_bmc_certificate(
-        problem: &ChcProblem,
-        config: &PdrConfig,
-    ) -> Option<(bool, usize)> {
-        // Dead-end-cycle parity (ay#8578): the SOLVE lane
-        // (`AdaptivePortfolio::new`) strips provably-dead-end cycle predicates
-        // (a self-loop with no path to any query) so an acyclic-modulo-dead-end
-        // CHC routes to the fast bounded-BMC lane, and then ships an EMPTY
-        // acyclic-BMC certificate for the now-acyclic DAG. The CLI discharges
-        // that certificate against `solver.problem()` (already stripped), but an
-        // out-of-crate re-validation caller (e.g. model-checker-consumer's native CHC path)
-        // hands us the ORIGINAL, un-stripped problem, whose lone dead-end
-        // self-loop makes `has_cycles()` true and would spuriously reject the
-        // honest empty certificate below — demoting a genuinely-proved Safe to
-        // UNKNOWN. Apply the SAME verdict-preserving strip here so validation
-        // classifies and re-checks the identical acyclic-modulo-dead-end problem
-        // the solve lane proved. `strip_dead_end_cycle_predicates` is a strict
-        // no-op (byte-identical) for every problem outside that class, so this
-        // only recovers the lost decision and cannot change any other verdict.
-        let stripped_owned;
-        let problem = if problem.has_cycles() {
-            let mut p = problem.clone();
-            p.strip_dead_end_cycle_predicates();
-            stripped_owned = p;
-            &stripped_owned
-        } else {
-            problem
-        };
-
-        // Accept scalar acyclic DAGs over any combination of Bool/Int/BV — NOT just BV.
-        // The production path emits these acyclic-BMC Safe certificates for pure Bool/Int
-        // scalar DAGs (source_exact_bool_int_dag, adaptive_multi_pred.rs:397), but this
-        // validator previously required BV (`!has_bv_sorts()` -> bail), so pure-LIA proofs
-        // were emitted then rejected and the genuinely-proved Safe was demoted to unknown.
-        // SOUND: this validator re-runs EXHAUSTIVE acyclic BMC below (finalize_bounded_search
-        // returns Safe only with no SMT-unknown AND every depth <= dag_depth.max(num_preds)
-        // discharged UNSAT in the original theory) — complete for acyclic DAGs over scalar
-        // theories AND over FINITE (non-recursive) datatypes. Arrays/reals stay excluded (not
-        // complete under bounded unroll). Datatypes: admit NON-recursive ADTs (a struct of
-        // bitvectors, `Option<bv64>`, an enum of scalar variants, `CoroutineState`, `Pin<bv64>`)
-        // — their value space is finite, so bounded acyclic unrolling is complete for them.
-        // RECURSIVE datatypes (unbounded value space) stay excluded: bounded unrolling is not
-        // complete for them, so admitting their acyclic-BMC Safe would be a false proof.
-        if problem.predicates().is_empty()
-            || problem.has_array_sorts()
-            || problem.has_real_sorts()
-            || problem.has_recursive_datatype_sorts()
-        {
-            return None;
-        }
-
-        let features = ProblemClassifier::classify(problem);
-        if features.has_cycles || features.uses_arrays || features.num_predicates <= 1 {
-            return None;
-        }
-
-        let depth = features.dag_depth.max(features.num_predicates).max(1);
-        let budget = config.solve_timeout.or(Some(PDR_PROOF_VALIDATION_TIMEOUT));
-        if budget.is_some_and(|budget| budget.is_zero())
-            || config
-                .cancellation_token
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Some((false, depth));
-        }
-
-        // Reuse the solve lane's already-computed acyclic-BMC safety proof
-        // instead of recomputing the identical exhaustive BMC (the whole point
-        // of this optimization; count_zero/loop_with_old: ~8.5 s proved twice →
-        // once). This is reached ONLY after the eligibility, zero-budget, and
-        // pre-cancellation gates above, so a hit can only ever stand in for the
-        // `BmcSolver::solve()` run below — never bypass a gate. The memo records
-        // `problem` (the same dead-end-stripped problem classified here) ONLY
-        // immediately after complete acyclic BMC genuinely proved it safe.
-        // The key is the full structural identity, and the cached bound must
-        // cover the freshly recomputed exhaustive depth, so a hit is exactly
-        // equivalent to re-running: it yields `Some((true, depth))`, the same
-        // Safe verdict the re-run would establish. On any miss (the problem
-        // was not proved this session, is not structurally identical, or was
-        // proved only to a shallower bound) we fall through to the
-        // correct-but-slower re-run. See `crate::acyclic_cert_cache`.
-        if crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(problem)
-            .is_some_and(|cached_depth| cached_depth >= depth)
-        {
-            return Some((true, depth));
-        }
-
-        let bmc_config = BmcConfig {
-            base: ChcEngineConfig {
-                verbose: config.verbose,
-                cancellation_token: config.cancellation_token.clone(),
-            },
-            max_depth: depth,
-            acyclic_safe: true,
-            prefer_exact_acyclic_first: true,
-            per_depth_timeout: None,
-            time_budget: budget,
-            enable_k_induction: false,
-            enable_adaptive_stepping: false,
-            proof_cross_check: false,
-            ts_probe_clamp: None,
-            sweep_past_spurious_sat: true,
-        };
-
-        let result = BmcSolver::new(problem.clone(), bmc_config.clone()).solve();
-        match result {
-            PortfolioResult::Safe(_) => Some((true, depth)),
-            // A definite Unsafe is a hard reject — never fall back to another engine.
-            PortfolioResult::Unsafe(_) => Some((false, depth)),
-            // The streaming exact-acyclic engine (prefer_exact_acyclic_first: true) fails
-            // CLOSED to Unknown on a single per-branch SMT-unknown (e.g. intro1/intro2's
-            // symbolic-LIA query expansion). Retry once with the EXHAUSTIVE engine
-            // (prefer_exact_acyclic_first: false -> solve_acyclic_exhaustive_once), the same
-            // complete decision procedure the production probe used to PROVE these Safe: it
-            // builds the full level encoding as one combined check-sat. SOUND — still only
-            // Safe on a full UNSAT unroll, and this arm is never reached on a definite Unsafe.
-            PortfolioResult::Unknown | PortfolioResult::NotApplicable => {
-                let exhaustive_config = BmcConfig {
-                    prefer_exact_acyclic_first: false,
-                    ..bmc_config
-                };
-                let exhaustive = BmcSolver::new(problem.clone(), exhaustive_config).solve();
-                Some((matches!(exhaustive, PortfolioResult::Safe(_)), depth))
-            }
-        }
-    }
-
     fn validate_pdr_proof_result(
         problem: &ChcProblem,
         result: PdrResult,
         base_config: &PdrConfig,
+        solve_deadline: Option<ay_core::time::Instant>,
     ) -> VerifiedChcResult {
+        // INV-S2 (#horn-smt-session §7.2): the proof-run validator.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         match result {
             PdrResult::Safe(model) => {
                 let mut verifier = PdrSolver::new(problem.clone(), validation_config(base_config));
-                if verifier.verify_model_per_rule(&model, PDR_PROOF_PER_RULE_BUDGET) {
+                if verifier.verify_model_at_safe_boundary(&model, solve_deadline) {
                     VerifiedChcResult::from_validated(
                         ChcEngineResult::Safe(model),
                         ValidationEvidence::FullVerification,
@@ -1042,13 +1154,29 @@ pub mod engines {
                 }
             }
             PdrResult::Unsafe(cex) => {
+                if cex.compact_evidence().is_some() {
+                    let cancellation = base_config.effective_cancellation_token();
+                    return match crate::compact_datatype_route::acceptance::confirm(
+                        problem,
+                        &cex,
+                        solve_deadline,
+                        cancellation.as_ref(),
+                        base_config.memory_budget,
+                    ) {
+                        Some(confirmed) => VerifiedChcResult::from_validated(
+                            ChcEngineResult::Unsafe(confirmed),
+                            ValidationEvidence::CounterexampleVerification,
+                        ),
+                        None => VerifiedChcResult::unknown_candidate_not_admitted(),
+                    };
+                }
                 let mut verifier = PdrSolver::new(problem.clone(), validation_config(base_config));
-                if matches!(
-                    verifier.verify_counterexample(&cex),
-                    CexVerificationResult::Valid
-                ) {
+                // Wrap what passed: the bounded replay's own trace when only the
+                // replay decided, or the trace of `cex`'s validated ground derivation
+                // when its steps claimed another one (see `confirm_counterexample`).
+                if let Ok(confirmed) = verifier.confirm_counterexample(cex) {
                     VerifiedChcResult::from_validated(
-                        ChcEngineResult::Unsafe(cex),
+                        ChcEngineResult::Unsafe(confirmed),
                         ValidationEvidence::CounterexampleVerification,
                     )
                 } else {
@@ -1101,9 +1229,9 @@ pub mod engines {
     ///     // BMC searched the requested bound without finding a contradiction
     /// }
     /// ```
-    pub fn solve_bmc_only(problem: ChcProblem, bmc_config: BmcConfig) -> VerifiedChcResult {
-        let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::default());
-        adaptive.solve_bmc_only(bmc_config)
+    pub fn solve_bmc_only(problem: ChcProblem, mut bmc_config: BmcConfig) -> VerifiedChcResult {
+        let attempt = direct_bmc::Attempt::capture(&mut bmc_config);
+        attempt.solve(|| problem, bmc_config)
     }
 
     /// Map `Unsafe` -> `Unknown` when the problem was over-approximated by
@@ -1159,6 +1287,13 @@ pub mod engines {
         input: &str,
         bmc_config: BmcConfig,
     ) -> ChcResult<VerifiedChcResult> {
+        let memory = crate::bmc::memory::Budget::capture(bmc_config.memory_budget, None);
+        if !memory.open() {
+            return Ok(VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::new(),
+            ));
+        }
+        let _memory = memory.install();
         let problem = ChcParser::parse(input).map_err(|e| ChcError::Parse(e.to_string()))?;
         Ok(solve_bmc_only(problem, bmc_config))
     }
@@ -1173,10 +1308,11 @@ pub mod engines {
     /// construct proof metadata outside the sealed run.
     pub fn solve_bmc_proof(
         problem: ChcProblem,
-        bmc_config: BmcConfig,
+        mut bmc_config: BmcConfig,
     ) -> ChcResult<ChcPdrProofRun> {
+        let attempt = direct_bmc::Attempt::capture(&mut bmc_config);
         ay_core::catch_ay_panics(
-            AssertUnwindSafe(|| Ok(solve_bmc_proof_unchecked(problem, bmc_config))),
+            AssertUnwindSafe(|| Ok(solve_bmc_proof_unchecked(problem, bmc_config, &attempt))),
             |reason| Err(ChcError::Internal(reason)),
         )
     }
@@ -1188,13 +1324,27 @@ pub mod engines {
     /// empty-model acyclic-exhaustion SAFE certificates the replay pass
     /// synthesizes one Safety obligation per query clause encoding the
     /// depth-exhaustion UNSAT check. Fail-closed exactly like the PDR variant.
+    /// The configured cancellation token also reaches replay's cooperative
+    /// polls and active SMT work, with the same limitations as the PDR variant.
     pub fn solve_bmc_proof_with_checked_replay(
         problem: ChcProblem,
-        bmc_config: BmcConfig,
+        mut bmc_config: BmcConfig,
         replay_budget: Duration,
     ) -> ChcResult<ChcPdrProofRun> {
-        let run = solve_bmc_proof(problem, bmc_config)?;
-        Ok(attach_checked_replay(run, replay_budget))
+        let attempt = direct_bmc::Attempt::capture(&mut bmc_config);
+        let memory = attempt.memory;
+        let _memory = memory.install();
+        let cancellation = bmc_config.base.cancellation_token.clone();
+        let run = ay_core::catch_ay_panics(
+            AssertUnwindSafe(|| Ok(solve_bmc_proof_unchecked(problem, bmc_config, &attempt))),
+            |reason| Err(ChcError::Internal(reason)),
+        )?;
+        Ok(attach_checked_replay_with_controls(
+            run,
+            replay_budget,
+            &mut || memory.open(),
+            cancellation.as_ref(),
+        ))
     }
 
     /// Parse a CHC problem from an SMT-LIB string and run BMC-only evidence mode.
@@ -1202,15 +1352,52 @@ pub mod engines {
         input: &str,
         bmc_config: BmcConfig,
     ) -> ChcResult<ChcPdrProofRun> {
+        let memory = crate::bmc::memory::Budget::capture(bmc_config.memory_budget, None);
+        if !memory.open() {
+            return Err(ChcError::TermMemoryBudgetExhausted);
+        }
+        let _memory = memory.install();
         let problem = ChcParser::parse(input).map_err(|e| ChcError::Parse(e.to_string()))?;
         solve_bmc_proof(problem, bmc_config)
     }
 
-    fn solve_bmc_proof_unchecked(problem: ChcProblem, bmc_config: BmcConfig) -> ChcPdrProofRun {
-        let adaptive = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::default());
-        let result = adaptive.solve_bmc_only(bmc_config);
-        ChcPdrProofRun::new(problem, result, BMC_PROOF_ENGINE_NAME)
+    fn solve_bmc_proof_unchecked(
+        problem: ChcProblem,
+        bmc_config: BmcConfig,
+        attempt: &direct_bmc::Attempt,
+    ) -> ChcPdrProofRun {
+        metered(
+            None,
+            None,
+            || false,
+            || {
+                let result = attempt.solve(|| problem.clone(), bmc_config);
+                ChcPdrProofRun::new(problem, result, BMC_PROOF_ENGINE_NAME)
+            },
+        )
     }
+
+    mod acyclic_certificate;
+    mod external_model_validation;
+    pub use external_model_validation::{
+        validate_external_invariant_model_typed, validate_external_invariant_model_with_owner,
+        ExternalInvariantValidation, ExternalInvariantValidationOwner,
+    };
+    mod ambient_cancellation;
+    mod array_observation;
+    mod array_projection;
+    mod deadline;
+    mod direct_bmc;
+    mod original_unsafe;
+    mod propositional;
+    use acyclic_certificate::{
+        run_scalar_acyclic_bmc_certificate, validate_empty_scalar_acyclic_bmc_certificate,
+    };
+
+    #[cfg(test)]
+    mod effort_tests;
+    #[cfg(test)]
+    mod replay_progress_tests;
 }
 
 /// Test support: factory functions for constructing individual CHC engines.

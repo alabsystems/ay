@@ -38,13 +38,16 @@
 use super::PreprocessingPass;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_core::term::{Constant, TermData};
+use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 
 /// Preprocessing pass that normalizes BV equalities involving concat.
 pub(crate) struct NormalizeEqBvConcat {
     /// Track terms we've already processed to avoid reprocessing
     processed: HashSet<TermId>,
+    /// Variables whose slice definitions were already joined into a
+    /// word equality (join direction runs once per variable).
+    joined: HashSet<TermId>,
 }
 
 impl NormalizeEqBvConcat {
@@ -52,6 +55,7 @@ impl NormalizeEqBvConcat {
     pub(crate) fn new() -> Self {
         Self {
             processed: HashSet::default(),
+            joined: HashSet::default(),
         }
     }
 
@@ -120,6 +124,133 @@ impl NormalizeEqBvConcat {
         };
         (Self::is_extract(terms, high) && Self::is_zero_bitvec_const(terms, low))
             || (Self::is_zero_bitvec_const(terms, high) && Self::is_extract(terms, low))
+    }
+
+    /// `(base, hi, lo)` when `term` is `((_ extract hi lo) base)`.
+    fn extract_parts(terms: &TermStore, term: TermId) -> Option<(TermId, u32, u32)> {
+        match terms.get(term) {
+            TermData::App(Symbol::Indexed(name, indices), args)
+                if name == "extract" && args.len() == 1 && indices.len() == 2 =>
+            {
+                Some((args[0], indices[0], indices[1]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Push `(var, hi, lo, value)` for each side of `assertion` that
+    /// defines one slice of a BV variable:
+    /// `(= ((_ extract hi lo) var) value)`. Both orientations are
+    /// tried — on real input both sides are typically extracts
+    /// (`(= (extract R) (extract x))` with `R` a compound term), and
+    /// only the variable side can act as the joined definition.
+    fn slice_definitions(
+        terms: &TermStore,
+        assertion: TermId,
+        out: &mut Vec<(TermId, u32, u32, TermId)>,
+    ) {
+        let (lhs, rhs) = match terms.get(assertion) {
+            TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => (args[0], args[1]),
+            _ => return,
+        };
+        for (side, value) in [(lhs, rhs), (rhs, lhs)] {
+            let Some((base, hi, lo)) = Self::extract_parts(terms, side) else {
+                continue;
+            };
+            // Only plain variables join: they are what variable
+            // substitution can replace with the joined word.
+            if !matches!(terms.get(base), TermData::Var(_, _)) || hi < lo {
+                continue;
+            }
+            // Defensive sort agreement (raw terms can be forged):
+            // the value must be exactly the slice width.
+            let sorts_ok = matches!(
+                (terms.sort(base), terms.sort(value)),
+                (Sort::BitVec(base_bv), Sort::BitVec(value_bv))
+                    if hi < base_bv.width && value_bv.width == hi - lo + 1
+            );
+            if sorts_ok {
+                out.push((base, hi, lo, value));
+            }
+        }
+    }
+
+    /// For every variable whose asserted slice definitions exactly
+    /// partition its bits, build the entailed word equality
+    /// `(= var (concat top .. bottom))`. Sound as an *addition*:
+    /// the slices already fix every bit of `var`. Cyclic families
+    /// (a slice value mentioning `var` itself) are skipped: such a
+    /// word equality is not a usable substitution definition.
+    fn collect_word_joins(&mut self, terms: &mut TermStore, assertions: &[TermId]) -> Vec<TermId> {
+        // (var, lo, hi, value); sorted run-grouping keeps this
+        // allocation-light and deterministic without a hash map.
+        let mut found: Vec<(TermId, u32, u32, TermId)> = Vec::new();
+        for &assertion in assertions {
+            Self::slice_definitions(terms, assertion, &mut found);
+        }
+        let mut slices: Vec<(TermId, u32, u32, TermId)> = found
+            .into_iter()
+            .map(|(base, hi, lo, value)| (base, lo, hi, value))
+            .filter(|(base, ..)| !self.joined.contains(base))
+            .collect();
+        if slices.is_empty() {
+            return Vec::new();
+        }
+        slices.sort();
+        let mut joins = Vec::new();
+        let mut run_start = 0;
+        while run_start < slices.len() {
+            let var = slices[run_start].0;
+            let mut run_end = run_start + 1;
+            while run_end < slices.len() && slices[run_end].0 == var {
+                run_end += 1;
+            }
+            if let Some(word_eq) = self.try_join(terms, var, &slices[run_start..run_end]) {
+                joins.push(word_eq);
+            }
+            run_start = run_end;
+        }
+        joins
+    }
+
+    fn try_join(
+        &mut self,
+        terms: &mut TermStore,
+        var: TermId,
+        slices: &[(TermId, u32, u32, TermId)],
+    ) -> Option<TermId> {
+        // A single full-width slice is the identity — nothing to join.
+        if slices.len() < 2 {
+            return None;
+        }
+        let Sort::BitVec(var_bv) = terms.sort(var) else {
+            return None;
+        };
+        let width = var_bv.width;
+        // Exact partition of [0, width): starts at 0, contiguous,
+        // ends at width-1 (slices arrive sorted by lo).
+        let mut expected_lo = 0u32;
+        for &(_, lo, hi, value) in slices {
+            if lo != expected_lo || Self::contains_term(terms, value, var) {
+                return None;
+            }
+            expected_lo = hi.checked_add(1)?;
+        }
+        if expected_lo != width {
+            return None;
+        }
+        self.joined.insert(var);
+        // Build the word as a LEFT-NESTED binary concat chain
+        // (`concat(concat(concat(top, ..), ..), bottom)`): that is
+        // the association the parser produces for spelled-out
+        // concats, so the joined word is the very same hash-consed
+        // term the goal already spells (a flat n-ary concat would
+        // intern differently and downstream folds would miss the
+        // syntactic identity).
+        let mut parts = slices.iter().rev().map(|&(_, _, _, value)| value);
+        let first = parts.next()?;
+        let word = parts.fold(first, |acc, part| terms.mk_bvconcat(vec![acc, part]));
+        Some(terms.mk_eq(var, word))
     }
 
     /// Try to normalize a BV equality involving concat.
@@ -275,6 +406,23 @@ impl PreprocessingPass for NormalizeEqBvConcat {
             } else {
                 new_assertions.push(assertion);
             }
+        }
+
+        // Join direction: slice definitions `(= ((_ extract hi lo) x) e)`
+        // that partition variable `x` entail `(= x (concat e_top .. e_bot))`.
+        // Adding it (originals kept) lets variable substitution replace
+        // `x` whole where downstream atoms mention the full word — the
+        // shape produced on instruction-selection dumps, where every
+        // byte of an input word is defined separately but the goal
+        // multiplies the whole word.
+        let joins = self.collect_word_joins(terms, &new_assertions);
+        for word_eq in joins {
+            // Mark processed so the split direction never tears the
+            // joined equality back into slices on the next fixpoint
+            // iteration (which would ping-pong with the join).
+            self.processed.insert(word_eq);
+            new_assertions.push(word_eq);
+            modified = true;
         }
 
         if modified {

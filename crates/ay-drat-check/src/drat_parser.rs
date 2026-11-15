@@ -37,12 +37,16 @@ pub enum ProofStep {
 /// line's first literal (the pivot). If such a repeat exists the record is a PR
 /// addition `AddPr { clause, witness }`; otherwise it is a plain `Add`.
 fn classify_addition(lits: Vec<Literal>) -> ProofStep {
-    if let Some(pivot) = lits.first().copied() {
-        if let Some(rel) = lits[1..].iter().position(|&l| l == pivot) {
-            let split = rel + 1;
-            let witness = lits[split..].to_vec();
-            let clause = lits[..split].to_vec();
-            return ProofStep::AddPr { clause, witness };
+    if let Some((&pivot, rest)) = lits.split_first() {
+        if let Some(rel) = rest.iter().position(|&l| l == pivot) {
+            // The repeat sits at `lits[rel + 1]`: the clause is everything
+            // before it and the witness starts at it.
+            if let (Some(clause), Some(witness)) = (lits.get(..=rel), rest.get(rel..)) {
+                return ProofStep::AddPr {
+                    clause: clause.to_vec(),
+                    witness: witness.to_vec(),
+                };
+            }
         }
     }
     ProofStep::Add(lits)
@@ -166,15 +170,20 @@ pub fn parse_binary_drat(data: &[u8]) -> Result<Vec<ProofStep>, DratParseError> 
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(data.len());
 
-    while pos < data.len() {
-        let marker = data[pos];
-        pos += 1;
+    while let Some(&marker) = data.get(pos) {
+        let marker_offset = pos;
+        pos = pos
+            .checked_add(1)
+            .ok_or_else(|| DratParseError::InvalidBinary {
+                offset: marker_offset,
+                detail: "record offset overflows usize".to_string(),
+            })?;
         let is_delete = match marker {
             0x61 => false, // 'a'
             0x64 => true,  // 'd'
             _ => {
                 return Err(DratParseError::InvalidBinary {
-                    offset: pos - 1,
+                    offset: marker_offset,
                     detail: format!("unexpected marker byte 0x{marker:02x}"),
                 })
             }
@@ -207,10 +216,14 @@ pub fn parse_binary_drat(data: &[u8]) -> Result<Vec<ProofStep>, DratParseError> 
             let var_i32 = i32::try_from(var_idx).map_err(|_| DratParseError::InvalidLiteral {
                 detail: format!("binary DRAT variable {var_idx} exceeds i32 range"),
             })?;
+            let out_of_range = || DratParseError::InvalidLiteral {
+                detail: format!("binary DRAT variable {var_idx} exceeds i32 range"),
+            };
+            let magnitude = var_i32.checked_add(1).ok_or_else(out_of_range)?;
             let dimacs = if val & 1 == 0 {
-                var_i32 + 1
+                magnitude
             } else {
-                -(var_i32 + 1)
+                magnitude.checked_neg().ok_or_else(out_of_range)?
             };
             lits.push(Literal::try_from_dimacs(dimacs)?);
         }

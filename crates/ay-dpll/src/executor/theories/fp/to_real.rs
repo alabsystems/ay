@@ -14,10 +14,11 @@ use ay_euf::EufModel;
 use ay_fp::FpModel;
 use ay_lra::LraModel;
 
+use crate::executor::model::MaterializedScalarFunctions;
 use crate::executor_types::SolveResult;
 
 pub(super) use super::to_real_rewrite::{
-    rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars,
+    collect_child_mode_dependencies, rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars,
 };
 
 /// A site where `fp.to_real` is applied to an FP term in the mixed assertions.
@@ -34,6 +35,8 @@ pub(super) struct FpEncoding {
     pub(super) tseitin_result: ay_core::TseitinResult,
     /// Term-to-FP decomposition for model extraction and blocking clauses.
     pub(super) term_to_fp: HashMap<TermId, ay_fp::FpDecomposed>,
+    /// The bits of every symbolic rounding-mode term, for model extraction.
+    pub(super) rm_terms: HashMap<TermId, ay_fp::RmBits>,
     /// Variable offset between Tseitin and FP namespaces.
     pub(super) var_offset: i32,
     /// Total variable count (Tseitin + FP).
@@ -52,6 +55,7 @@ pub(super) struct MixedSubproblemResult {
     pub(super) result: SolveResult,
     pub(super) lra_model: Option<LraModel>,
     pub(super) euf_model: Option<EufModel>,
+    pub(super) materialized_scalar_functions: MaterializedScalarFunctions,
 }
 
 /// Refinement loop step result: what to do after trying a mixed subproblem.
@@ -60,8 +64,10 @@ pub(super) enum FpRefinementStep {
     Sat,
     /// Mixed subproblem is Unknown — give up.
     Unknown,
-    /// Mixed subproblem is UNSAT — add blocking clause and retry.
-    Block,
+    /// Mixed subproblem is UNSAT — add blocking clause and retry. The block
+    /// also names the decided rounding modes the refutation needs, none when
+    /// the site values alone refute it (`modes_the_refutation_needs`).
+    Block(Vec<TermId>),
 }
 
 /// Build an LRA model by evaluating fp.to_real terms from the FP model.
@@ -362,5 +368,5 @@ pub(super) fn rational_to_f64(r: &num_rational::BigRational) -> f64 {
 
 // Re-exported here so existing `use to_real::{offset_cnf_lit, ...}` imports continue to work.
 pub(super) use super::blocking::{
-    build_fp_target_unit_clauses, choose_blocking_clause, offset_cnf_lit,
+    block_decided_modes, build_fp_target_unit_clauses, choose_blocking_clause, offset_cnf_lit,
 };

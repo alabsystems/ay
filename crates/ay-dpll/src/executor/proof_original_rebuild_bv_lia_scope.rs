@@ -8,7 +8,9 @@ use super::*;
 use crate::executor_types::{SolveResult, UnknownReason};
 
 impl Executor {
-    fn commit_authenticated_plain_bv_lia_refutation(
+    /// Install an authenticated exact-source refutation and retire all stale
+    /// solver/proof sidecars. Shared by the BV/LIA and native polynomial lanes.
+    pub(in crate::executor) fn commit_authenticated_plain_refutation(
         &mut self,
         candidate: Proof,
         quality: ay_proof::ProofQuality,
@@ -28,9 +30,14 @@ impl Executor {
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
         self.last_proof_decline = None;
+        self.last_trust_closure_census = None;
+        self.last_semantic_token_census = None;
+        self.last_unbounded_census = None;
+        self.last_unsat_corroboration.set(None);
         self.last_bv_drat_self_cert = false;
         self.clear_finite_enum_proof_state();
         self.pending_nested_array_bool_bv_unsat = None;
+        self.clear_strict_native_bundle_states();
         self.clear_quantified_sat_authority();
         self.last_model = None;
         self.last_model_validated = false;
@@ -243,7 +250,7 @@ impl Executor {
             self.last_statistics = saved_statistics;
             return false;
         }
-        self.commit_authenticated_plain_bv_lia_refutation(candidate, quality);
+        self.commit_authenticated_plain_refutation(candidate, quality);
         true
     }
 

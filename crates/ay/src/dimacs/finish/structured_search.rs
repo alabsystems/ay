@@ -39,6 +39,30 @@ fn insert_dimacs_shrink_and_snapshot_stats(context: &mut DimacsStructuredStatist
     stats.insert("sat.shrink_attempts", solver.shrink_block_attempts());
     stats.insert("sat.shrink_successes", solver.shrink_block_successes());
     stats.insert("sat.shrink_singleton_fast_path_skips", singleton_skips);
+    let (deduced, block_removed, fallback_removed, fail_decision, fail_lower) =
+        solver.shrink_literal_profile();
+    stats.insert("sat.shrink_lits_deduced", deduced);
+    stats.insert("sat.shrink_lits_block_removed", block_removed);
+    stats.insert("sat.shrink_lits_fallback_removed", fallback_removed);
+    stats.insert("sat.shrink_fail_decision", fail_decision);
+    stats.insert("sat.shrink_fail_lower", fail_lower);
+    for (key, value) in solver.indep_enum_profile() {
+        stats.insert(key, value);
+    }
+    let (hinted, hint_fallbacks, hint_units) = solver.veripb_hint_profile();
+    stats.insert("sat.veripb_hinted", hinted);
+    stats.insert("sat.veripb_hint_fallbacks", hint_fallbacks);
+    stats.insert("sat.veripb_hint_units", hint_units);
+    for (key, count) in solver.veripb_hint_fail_profile() {
+        if count > 0 {
+            stats.insert(key, count);
+        }
+    }
+    for (key, count) in solver.proof_add_profile() {
+        if count > 0 {
+            stats.insert(&key, count);
+        }
+    }
     stats.insert("sat.lrat_original_learned_snapshot_copies", snapshot_copies);
     stats.insert(
         "sat.lrat_original_learned_snapshot_literals",
@@ -65,7 +89,21 @@ fn insert_dimacs_mode_and_inprocessing_stats(context: &mut DimacsStructuredStati
     stats.insert("sat.stable_ema_fires", solver.stable_ema_fires());
     stats.insert("sat.focused_decisions", focused_decisions);
     stats.insert("sat.stable_decisions", stable_decisions);
+    stats.insert("sat.stable_conflicts", solver.stable_conflicts());
+    // The stable-lock classifier's score x1000, as magnitude and sign.
+    let (lock_score_milli, locked_at) = solver.stable_lock_stats();
+    stats.insert(
+        "sat.stable_lock_score_milli_abs",
+        lock_score_milli.unsigned_abs(),
+    );
+    stats.insert(
+        "sat.stable_lock_score_negative",
+        u64::from(lock_score_milli < 0),
+    );
+    stats.insert("sat.stable_locked_at", locked_at);
     stats.insert("sat.mab_switches", solver.mab_arm_switches());
+    stats.insert("sat.mab_epochs", solver.mab_epochs());
+    stats.insert("sat.branch_selector_code", solver.branch_selector_code());
     let search_ticks = solver.total_search_ticks();
     stats.insert("sat.search_ticks", search_ticks);
     // Per-mode ticks: the stabilization share the schedule actually budgets.
@@ -150,6 +188,19 @@ fn insert_dimacs_reduction_core(context: &mut DimacsStructuredStatistics<'_, '_,
     let (occ_scans, full_scans, no_occ_skips, satisfied_deleted) =
         solver.reduction_l0_satisfied_prepass_stats();
     stats.insert("sat.reductions", solver.num_reductions());
+    let [tier1_focused, tier2_focused, tier1_stable, tier2_stable] = solver.tier_boundaries();
+    stats.insert("sat.tier1_lbd_focused", u64::from(tier1_focused));
+    stats.insert("sat.tier2_lbd_focused", u64::from(tier2_focused));
+    stats.insert("sat.tier1_lbd_stable", u64::from(tier1_stable));
+    stats.insert("sat.tier2_lbd_stable", u64::from(tier2_stable));
+    let histogram = solver.tier_usage_histogram();
+    for (mode, name) in ["focused", "stable"].iter().enumerate() {
+        for (glue, &count) in histogram[mode].iter().enumerate() {
+            if count > 0 {
+                stats.insert(&format!("sat.tier_usage_{name}_g{glue}"), count);
+            }
+        }
+    }
     stats.insert("sat.flushes", solver.num_flushes());
     stats.insert("sat.arena_compactions", solver.num_arena_compactions());
     stats.insert("sat.reduction_l0_satisfied_occ_scans", occ_scans);
@@ -175,6 +226,10 @@ fn insert_dimacs_learned_reduction_stats(context: &mut DimacsStructuredStatistic
     stats.insert("sat.learned_reduction_considered", considered);
     stats.insert("sat.learned_reduction_deleted", deleted);
     stats.insert("sat.learned_reduction_reason_protected", reason_protected);
+    stats.insert(
+        "sat.learned_reduction_binary_kept",
+        context.solver.learned_reduction_binary_kept(),
+    );
     stats.insert("sat.learned_reduction_ic3_protected", ic3_protected);
     stats.insert("sat.learned_reduction_low_lbd_protected", low_lbd_protected);
     stats.insert("sat.learned_reduction_usage_protected", usage_protected);

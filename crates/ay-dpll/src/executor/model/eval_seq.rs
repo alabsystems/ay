@@ -334,7 +334,7 @@ impl Executor {
         let EvalValue::Element(ref s) = v else {
             return v;
         };
-        let parsed = self.parse_model_value_string(s, &Some(sort.clone()));
+        let parsed = self.parse_model_value_string_borrowed(s, Some(sort));
         if matches!(parsed, EvalValue::Unknown | EvalValue::Element(_)) {
             v
         } else {
@@ -521,10 +521,17 @@ impl Executor {
         if let Some(first) = pinned.first() {
             // All pinned values must agree and dodge every avoid value; a
             // conflict is beyond this completion (likely unsat anyway).
-            if pinned.iter().any(|p| p != first) || avoid.iter().any(|a| a == first) {
-                return None;
+            for value in &pinned {
+                if !super::evaluation_copies::equal(value, first)? {
+                    return None;
+                }
             }
-            return Some(first.clone());
+            for value in &avoid {
+                if super::evaluation_copies::equal(value, first)? {
+                    return None;
+                }
+            }
+            return Some(super::evaluation_copies::copy(first));
         }
         let elem_sort = self.ctx.terms.sort(tid).clone();
         Self::smallest_value_avoiding(&elem_sort, &avoid)
@@ -616,7 +623,12 @@ impl Executor {
                 let elem = self.evaluate_term(model, args[0]);
                 match elem {
                     EvalValue::Unknown => EvalValue::Unknown,
-                    v => EvalValue::Seq(vec![v]),
+                    v => {
+                        if !super::evaluation_copies::cells(1) {
+                            return EvalValue::Unknown;
+                        }
+                        EvalValue::Seq(vec![v])
+                    }
                 }
             }
             "seq.empty" => EvalValue::Seq(vec![]),
@@ -624,7 +636,14 @@ impl Executor {
                 let mut result = Vec::new();
                 for &arg in args {
                     match self.evaluate_term(model, arg) {
-                        EvalValue::Seq(elems) => result.extend(elems),
+                        EvalValue::Seq(elems) => {
+                            if !super::evaluation_copies::cells(
+                                result.len().saturating_add(elems.len()),
+                            ) {
+                                return EvalValue::Unknown;
+                            }
+                            result.extend(elems)
+                        }
                         _ => return EvalValue::Unknown,
                     }
                 }
@@ -685,8 +704,9 @@ impl Executor {
                         if i < BigInt::zero() || n <= BigInt::zero() || i >= len {
                             EvalValue::Seq(vec![])
                         } else if let (Some(start), Some(count)) = (i.to_usize(), n.to_usize()) {
-                            let end = std::cmp::min(start + count, elems.len());
-                            EvalValue::Seq(elems[start..end].to_vec())
+                            let end = std::cmp::min(start.saturating_add(count), elems.len());
+                            super::evaluation_copies::copy_slice(&elems[start..end])
+                                .map_or(EvalValue::Unknown, EvalValue::Seq)
                         } else {
                             EvalValue::Unknown
                         }
@@ -705,10 +725,10 @@ impl Executor {
                         } else if needle.len() > haystack.len() {
                             EvalValue::Bool(false)
                         } else {
-                            let found = haystack
-                                .windows(needle.len())
-                                .any(|w| w == needle.as_slice());
-                            EvalValue::Bool(found)
+                            super::evaluation_copies::position(&haystack, &needle)
+                                .map_or(EvalValue::Unknown, |found| {
+                                    EvalValue::Bool(found.is_some())
+                                })
                         }
                     }
                     _ => EvalValue::Unknown,
@@ -720,7 +740,12 @@ impl Executor {
                     self.evaluate_term(model, args[1]),
                 ) {
                     (EvalValue::Seq(prefix), EvalValue::Seq(s)) => {
-                        EvalValue::Bool(s.starts_with(prefix.as_slice()))
+                        if prefix.len() > s.len() {
+                            EvalValue::Bool(false)
+                        } else {
+                            super::evaluation_copies::equal_slice(&s[..prefix.len()], &prefix)
+                                .map_or(EvalValue::Unknown, EvalValue::Bool)
+                        }
                     }
                     _ => EvalValue::Unknown,
                 }
@@ -731,7 +756,15 @@ impl Executor {
                     self.evaluate_term(model, args[1]),
                 ) {
                     (EvalValue::Seq(suffix), EvalValue::Seq(s)) => {
-                        EvalValue::Bool(s.ends_with(suffix.as_slice()))
+                        if suffix.len() > s.len() {
+                            EvalValue::Bool(false)
+                        } else {
+                            super::evaluation_copies::equal_slice(
+                                &s[s.len() - suffix.len()..],
+                                &suffix,
+                            )
+                            .map_or(EvalValue::Unknown, EvalValue::Bool)
+                        }
                     }
                     _ => EvalValue::Unknown,
                 }
@@ -766,7 +799,13 @@ impl Executor {
                             let mut result = -1i64;
                             if start + t.len() <= s.len() {
                                 for i in start..=(s.len() - t.len()) {
-                                    if s[i..i + t.len()] == *t.as_slice() {
+                                    let Some(equal) = super::evaluation_copies::equal_slice(
+                                        &s[i..i + t.len()],
+                                        &t,
+                                    ) else {
+                                        return EvalValue::Unknown;
+                                    };
+                                    if equal {
                                         result = i as i64;
                                         break;
                                     }
@@ -795,7 +834,13 @@ impl Executor {
                             // Scan from right to left
                             let mut result = -1i64;
                             for i in (0..=(haystack.len() - needle.len())).rev() {
-                                if haystack[i..i + needle.len()] == *needle.as_slice() {
+                                let Some(equal) = super::evaluation_copies::equal_slice(
+                                    &haystack[i..i + needle.len()],
+                                    &needle,
+                                ) else {
+                                    return EvalValue::Unknown;
+                                };
+                                if equal {
                                     result = i as i64;
                                     break;
                                 }
@@ -813,17 +858,41 @@ impl Executor {
                     self.evaluate_term(model, args[2]),
                 ) {
                     (EvalValue::Seq(s), EvalValue::Seq(src), EvalValue::Seq(dst)) => {
+                        let Some(position) = super::evaluation_copies::position(&s, &src) else {
+                            return EvalValue::Unknown;
+                        };
                         if src.is_empty() {
                             // Replace empty: prepend dst
                             let mut result = dst;
+                            if !super::evaluation_copies::cells(
+                                result.len().saturating_add(s.len()),
+                            ) {
+                                return EvalValue::Unknown;
+                            }
                             result.extend(s);
                             EvalValue::Seq(result)
-                        } else if let Some(pos) =
-                            s.windows(src.len()).position(|w| w == src.as_slice())
-                        {
-                            let mut result = s[..pos].to_vec();
+                        } else if let Some(pos) = position {
+                            let Some(mut result) = super::evaluation_copies::copy_slice(&s[..pos])
+                            else {
+                                return EvalValue::Unknown;
+                            };
+                            if !super::evaluation_copies::cells(
+                                result.len().saturating_add(dst.len()),
+                            ) {
+                                return EvalValue::Unknown;
+                            }
                             result.extend(dst);
-                            result.extend(s[pos + src.len()..].to_vec());
+                            let Some(tail) =
+                                super::evaluation_copies::copy_slice(&s[pos + src.len()..])
+                            else {
+                                return EvalValue::Unknown;
+                            };
+                            if !super::evaluation_copies::cells(
+                                result.len().saturating_add(tail.len()),
+                            ) {
+                                return EvalValue::Unknown;
+                            }
+                            result.extend(tail);
                             EvalValue::Seq(result)
                         } else {
                             // Not found: return original
@@ -848,13 +917,38 @@ impl Executor {
                             let mut result = Vec::new();
                             let mut i = 0;
                             while i < s.len() {
-                                if i + src.len() <= s.len()
-                                    && s[i..i + src.len()] == *src.as_slice()
-                                {
+                                let equal = if src.len() <= s.len() - i {
+                                    let Some(equal) = super::evaluation_copies::equal_slice(
+                                        &s[i..i + src.len()],
+                                        &src,
+                                    ) else {
+                                        return EvalValue::Unknown;
+                                    };
+                                    equal
+                                } else {
+                                    false
+                                };
+                                if equal {
+                                    if !super::evaluation_copies::admit_slice(&dst)
+                                        || !super::evaluation_copies::cells(
+                                            result.len().saturating_add(dst.len()),
+                                        )
+                                    {
+                                        return EvalValue::Unknown;
+                                    }
                                     result.extend_from_slice(&dst);
                                     i += src.len();
                                 } else {
-                                    result.push(s[i].clone());
+                                    if !super::evaluation_copies::cells(
+                                        result.len().saturating_add(1),
+                                    ) {
+                                        return EvalValue::Unknown;
+                                    }
+                                    let value = super::evaluation_copies::copy(&s[i]);
+                                    if matches!(value, EvalValue::Unknown) {
+                                        return EvalValue::Unknown;
+                                    }
+                                    result.push(value);
                                     i += 1;
                                 }
                             }

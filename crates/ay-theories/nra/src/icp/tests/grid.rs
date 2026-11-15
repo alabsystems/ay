@@ -5,7 +5,7 @@
 // Textually included by `icp::tests` to preserve existing test FQNs.
 
 #[test]
-fn dyadic_grid_is_cumulative_and_capped() {
+fn dyadic_grid_is_cumulative_and_capped() -> Result<(), Box<dyn std::error::Error>> {
     // Level 0 is the integers in [-4, 4], zero first, positive before its
     // negation; each finer level ADDS only the new denominators.
     let l0 = dyadic_grid(0);
@@ -14,10 +14,11 @@ fn dyadic_grid_is_cumulative_and_capped() {
         ["0", "1", "-1", "2", "-2", "3", "-3", "4", "-4"]
     );
     for level in 0..GRID_MAX_LEVEL {
-        let (a, b) = (dyadic_grid(level), dyadic_grid(level + 1));
+        let next = level.checked_add(1).ok_or("grid level fits usize")?;
+        let (a, b) = (dyadic_grid(level), dyadic_grid(next));
         assert_eq!(
-            &b[..a.len()],
-            a,
+            b.get(..a.len()),
+            Some(a),
             "level {level} must be a prefix of the next"
         );
         assert!(b.len() > a.len(), "level {level} must gain values");
@@ -37,6 +38,7 @@ fn dyadic_grid_is_cumulative_and_capped() {
     seen.sort();
     seen.dedup();
     assert_eq!(seen.len(), fine.len(), "no value repeats across levels");
+    Ok(())
 }
 
 #[test]

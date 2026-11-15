@@ -1,0 +1,21 @@
+; Authored PbTerm/Vec carrier control, not a captured compiler export.
+(set-logic ALL)
+(set-info :status sat)
+(declare-datatypes ((Vec_bv40 0))
+ (((Vec_bv40_mk (fld_ptr (_ BitVec 64)) (fld_len (_ BitVec 64))
+   (fld_cap (_ BitVec 64)) (fld_data (Array (_ BitVec 64) (_ BitVec 40)))))))
+(declare-datatypes ((PbTerm 0))
+ (((PbTerm_mk (fld_coeff (_ BitVec 128)) (fld_lits Vec_bv40)))))
+(declare-const a (Array (_ BitVec 64) PbTerm))
+(declare-const b (Array (_ BitVec 64) PbTerm))
+(assert (= a b))
+(assert (= (select
+ (store (fld_data (fld_lits (select
+   (store a (_ bv0 64)
+     (PbTerm_mk (_ bv0 128)
+       (Vec_bv40_mk (_ bv0 64) (_ bv0 64) (_ bv0 64)
+         ((as const (Array (_ BitVec 64) (_ BitVec 40))) (_ bv0 40)))))
+   (_ bv9 64)))) (_ bv64 64) (_ bv7 40))
+ (_ bv65 64)) (_ bv8 40)))
+(check-sat)
+(exit)

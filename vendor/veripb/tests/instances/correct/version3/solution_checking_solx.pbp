@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: ignore(elaborate)
+f 1;
+solx x1 x2;
+solx ~x1;
+solx ~x2;
+rup 1 x1 >= 1 ;
+rup >= 1 ;
+output NONE;
+conclusion ENUMERATION_COMPLETE 3;
+end pseudo-Boolean proof;

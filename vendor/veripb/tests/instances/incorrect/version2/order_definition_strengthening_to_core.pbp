@@ -1,0 +1,47 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): defect 19's payload reached through the
+* placement hole of incorrect/version2/order_definition_sol rather than
+* through a set-membership one.
+*
+* `strengthening_to_core on` promises that the derived set holds nothing but
+* constraints entailed by the core set, and it keeps that promise by moving
+* the whole database to core. Executed inside the order definition it moved
+* the EMPTY sub-database instead, while setting `context.is_strengthening_to_core`
+* -- which is global, and survives the `end`. The outer derived set, which by
+* then holds the merely satisfiability-preserving `1 y1 >= 1`, was never moved,
+* so the following `red` was handed `add_derived_goals = false` and never had
+* to preserve it. Two contradictory witnessed constraints then coexist and
+* `u >= 1` closes the proof.
+*
+* `1 x1 1 x2 >= 1` is satisfied by `x1 = 1, x2 = 0`; the same binary verifies
+* that in correct/version2/order_definition_strengthening_to_core_outside,
+* whose proof is this one with the mode switch moved back to the top level,
+* where it is correctly refused as an unproven proofgoal.
+f 1
+red 1 y1 >= 1 ; y1 -> 1 ;
+pre_order simple
+    strengthening_to_core on
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+red 1 ~y1 >= 1 ; y1 -> 0 ;
+u >= 1 ;
+output NONE
+conclusion UNSAT : -1
+end pseudo-Boolean proof

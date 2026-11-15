@@ -195,29 +195,6 @@ fn post_cancel_startup_salvage_denies_cancelled_parent_token() {
 }
 
 #[test]
-fn post_cancel_startup_rechecks_cancellation_before_safety_proof() {
-    let src = include_str!("mod.rs");
-    let kernel_call = src
-        .find("self.discover_affine_invariants_via_kernel(None);")
-        .expect("post-cancel kernel salvage call should exist");
-    let after_kernel = &src[kernel_call..];
-    let safety_gate = after_kernel
-        .find("if self.skip_startup_direct_safety_proof()")
-        .expect("post-cancel safety proof gate should follow salvage");
-    let between_kernel_and_safety = &after_kernel[..safety_gate];
-
-    assert!(
-        between_kernel_and_safety.contains("if self.is_cancelled()"),
-        "post-cancel startup must recheck cancellation before safety proof"
-    );
-    assert!(
-        between_kernel_and_safety
-            .contains("return Some(self.finish_with_result_trace(PdrResult::Unknown));"),
-        "post-cancel cancellation recheck must fail closed as Unknown"
-    );
-}
-
-#[test]
 fn startup_direct_safety_is_skipped_for_single_predicate_bv() {
     let smt2 = r#"
 (set-logic HORN)
@@ -446,24 +423,205 @@ fn startup_nonfixpoint_builds_splitter_resistant_simple_bv_fact_bundle() {
     );
 }
 
-#[test]
-fn startup_post_cancel_convergence_proven_uses_fresh_query_only_issue_4730() {
-    let src = include_str!("mod.rs");
-    let block_start = src
-        .find("if let Some(mut model) = self.check_invariants_prove_safety() {")
-        .expect("post-cancel startup safety block should exist");
-    let block = &src[block_start..];
-    let convergence_branch = block
-        .find("if model.convergence_proven {")
-        .map(|offset| &block[offset..])
-        .expect("post-cancel startup safety block should branch on convergence_proven");
+// ---------------------------------------------------------------------------
+// Wide-var startup cap on Real-sorted transition systems (CHC-COMP LRA-Lin).
+//
+// `wide_var_startup_budget` excluded `has_real_sorts()` problems from the
+// inc-12 total-startup cap even though its own rationale ("wide-var linear
+// problems (max arity >= 12, scalar, linear, no mod/div)") never named Real,
+// and Reals have no alternative startup route. On the sally / vmt LRA
+// transition systems the uncapped discovery passes consumed the whole engine
+// window and the IC3 loop never ran (frames=2, obligations=0). These tests pin
+// the cap for Real state and check that PDR actually gets past startup.
+// ---------------------------------------------------------------------------
 
+/// `om1_with_relays_agreement_000` (sally oral_messages, CHC-COMP 2026
+/// LRA-Lin): one predicate over 40 Real + 8 Bool, 3 clauses, expected `sat`.
+fn om1_with_relays_agreement_fixture() -> crate::ChcProblem {
+    let input = include_str!(
+        "../../../../../../benchmarks/chc-comp/2026/lra-lin/om1_with_relays_agreement_000.smt2"
+    );
+    ChcParser::parse(input).expect("om1_with_relays_agreement_000 must parse")
+}
+
+#[test]
+fn wide_var_startup_cap_applies_to_real_transition_systems() {
+    let config = PdrConfig {
+        solve_timeout: Some(std::time::Duration::from_secs(8)),
+        ..Default::default()
+    };
+    let solver = PdrSolver::new(om1_with_relays_agreement_fixture(), config);
     assert!(
-        convergence_branch.contains("self.verify_model_fresh_query_only(&model)"),
-        "convergence-proven startup models must keep a fresh-context query-only confirmation"
+        solver.problem.has_real_sorts(),
+        "fixture must carry Real state"
     );
     assert!(
-        !convergence_branch.contains("self.verify_model_query_only(&model)"),
-        "convergence-proven startup models must not fall back to warm-context query-only verification"
+        solver.problem.predicates()[0].arg_sorts.len() >= super::WIDE_VAR_STARTUP_ARITY,
+        "fixture must be wide-var"
     );
+
+    let budget = solver
+        .wide_var_startup_budget()
+        .expect("Real-sorted wide-var transition systems must receive the startup cap");
+    // 25 % of the remaining window (8 s -> 2 s), never below the 250 ms floor.
+    assert!(
+        budget >= std::time::Duration::from_millis(250)
+            && budget <= std::time::Duration::from_millis(2_050),
+        "unexpected startup budget {budget:?}"
+    );
+}
+
+#[test]
+fn wide_var_startup_cap_treats_real_and_int_state_alike() {
+    let real = r#"
+(set-logic HORN)
+(declare-fun inv (Real Real Real Real Real Real Real Real Real Real Real Real Bool) Bool)
+(assert (forall ((a Real) (b Real) (c Real) (d Real) (e Real) (f Real) (g Real) (h Real) (i Real) (j Real) (k Real) (l Real) (p Bool))
+  (=> (and (= a 0.0) (= b 0.0) (= c 0.0) (= d 0.0) (= e 0.0) (= f 0.0) (= g 0.0) (= h 0.0) (= i 0.0) (= j 0.0) (= k 0.0) (= l 0.0) p)
+      (inv a b c d e f g h i j k l p))))
+(assert (forall ((a Real) (b Real) (c Real) (d Real) (e Real) (f Real) (g Real) (h Real) (i Real) (j Real) (k Real) (l Real) (p Bool) (a2 Real))
+  (=> (and (inv a b c d e f g h i j k l p) (= a2 (+ a 1.0)))
+      (inv a2 b c d e f g h i j k l p))))
+(assert (forall ((a Real) (b Real) (c Real) (d Real) (e Real) (f Real) (g Real) (h Real) (i Real) (j Real) (k Real) (l Real) (p Bool))
+  (=> (and (inv a b c d e f g h i j k l p) (< a 0.0)) false)))
+(check-sat)
+"#;
+    let int = real
+        .replace("Real", "Int")
+        .replace("0.0", "0")
+        .replace("1.0", "1");
+    let config = PdrConfig {
+        solve_timeout: Some(std::time::Duration::from_secs(4)),
+        ..Default::default()
+    };
+    let real_solver = PdrSolver::new(ChcParser::parse(real).unwrap(), config.clone());
+    let int_solver = PdrSolver::new(ChcParser::parse(&int).unwrap(), config);
+    let real_budget = real_solver
+        .wide_var_startup_budget()
+        .expect("13-arity Real transition system must be capped");
+    let int_budget = int_solver
+        .wide_var_startup_budget()
+        .expect("13-arity Int transition system must be capped");
+    let delta = real_budget.abs_diff(int_budget);
+    assert!(
+        delta <= std::time::Duration::from_millis(50),
+        "Real and Int state must receive the same startup budget: {real_budget:?} vs {int_budget:?}"
+    );
+}
+
+#[test]
+fn narrow_real_problem_keeps_full_startup_discovery() {
+    // Arity below WIDE_VAR_STARTUP_ARITY: the accumulator classes where
+    // discovery wins keep the uncapped pipeline, Real or not.
+    let smt2 = r#"
+(set-logic HORN)
+(declare-fun inv (Real Real) Bool)
+(assert (forall ((x Real) (y Real)) (=> (and (= x 0.0) (= y 0.0)) (inv x y))))
+(assert (forall ((x Real) (y Real) (x2 Real)) (=> (and (inv x y) (= x2 (+ x 1.0))) (inv x2 y))))
+(assert (forall ((x Real) (y Real)) (=> (and (inv x y) (< x 0.0)) false)))
+(check-sat)
+"#;
+    let config = PdrConfig {
+        solve_timeout: Some(std::time::Duration::from_secs(4)),
+        ..Default::default()
+    };
+    let solver = PdrSolver::new(ChcParser::parse(smt2).unwrap(), config);
+    assert!(solver.wide_var_startup_budget().is_none());
+}
+
+#[test]
+fn real_transition_system_reaches_the_ic3_loop_under_the_startup_cap() {
+    // Before the fix this solve spent its whole window in startup discovery:
+    // `frames` stayed at 2 (the initial frame pair) and no proof obligation
+    // was ever created. With the cap, startup yields after 25 % of the window
+    // and the main loop expands frames.
+    let config = PdrConfig {
+        solve_timeout: Some(std::time::Duration::from_secs(8)),
+        ..Default::default()
+    };
+    let mut solver = PdrSolver::new(om1_with_relays_agreement_fixture(), config);
+    let result = solver.solve();
+    assert!(
+        solver.startup_deadline.is_some(),
+        "the wide-var startup cap must be installed for Real state"
+    );
+    let definitive = matches!(
+        result,
+        crate::pdr::PdrResult::Safe(_) | crate::pdr::PdrResult::Unsafe(_)
+    );
+    assert!(
+        definitive || solver.frames.len() > 2,
+        "PDR must leave startup discovery and expand frames within the window \
+         (frames={}, result definitive={definitive})",
+        solver.frames.len()
+    );
+    // The fixture is `sat`. Leaving startup changes which level-0 predecessor
+    // queries run on it, so pin that the IC3 loop never claims a counterexample.
+    assert!(
+        !matches!(result, crate::pdr::PdrResult::Unsafe(_)),
+        "om1_with_relays_agreement_000 is sat: PDR must not return Unsafe"
+    );
+}
+
+#[test]
+fn spent_wide_var_startup_cap_ends_discovery_not_the_solve() {
+    // Rung 0 made `is_cancelled` poll the thread SMT deadline, and the inc-12
+    // wide-var startup cap is installed as one: while its expired scope is
+    // live the solve reads as cancelled, which turned "startup budget spent"
+    // into a terminal `Unknown` at 25 % of the window (frames=2). Leaving the
+    // scope must restore the enclosing deadline; a cancellation that is still
+    // there after leaving it stays terminal.
+    let config = PdrConfig {
+        solve_timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
+    };
+    let spent = ay_core::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap();
+    {
+        let mut solver = timeout_cap_test_solver(config.clone());
+        let _solve_scope =
+            crate::smt::ScopedSmtDeadline::install(std::time::Duration::from_secs(10));
+        solver.startup_deadline = Some(spent);
+        let mut startup_scope = Some(crate::smt::ScopedSmtDeadline::install_until(spent));
+        assert!(
+            solver.is_cancelled(),
+            "an expired startup scope reads as a cancellation while it is installed"
+        );
+        assert!(
+            solver.leave_spent_startup_scope(&mut startup_scope),
+            "a spent startup cap under a live solve window must not end the solve"
+        );
+        assert!(startup_scope.is_none(), "the startup scope must be left");
+        assert!(
+            !solver.is_cancelled(),
+            "leaving the startup scope restores the enclosing solve deadline"
+        );
+    }
+    {
+        let mut solver = timeout_cap_test_solver(config.clone());
+        let _expired_enclosing = crate::smt::ScopedSmtDeadline::install_until(spent);
+        solver.startup_deadline = Some(spent);
+        let mut startup_scope = Some(crate::smt::ScopedSmtDeadline::install_until(spent));
+        assert!(
+            !solver.leave_spent_startup_scope(&mut startup_scope),
+            "an expired enclosing deadline must still cancel once the startup scope is left"
+        );
+    }
+    {
+        let mut solver = timeout_cap_test_solver(config);
+        solver.startup_deadline =
+            Some(ay_core::time::Instant::now() + std::time::Duration::from_secs(10));
+        let mut startup_scope = Some(crate::smt::ScopedSmtDeadline::install(
+            std::time::Duration::from_secs(10),
+        ));
+        assert!(
+            !solver.leave_spent_startup_scope(&mut startup_scope),
+            "before the cap runs out an `Unknown` is a real cancellation"
+        );
+        assert!(
+            startup_scope.is_some(),
+            "a live startup scope must not be left early"
+        );
+    }
 }

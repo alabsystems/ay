@@ -247,3 +247,165 @@ fn mutable_context_escape_revokes_checked_sat_and_model_consumers() {
         );
     }
 }
+
+/// The `model_check_gate.result` value written when the ordinary
+/// model-validation funnel's independent gate confirms a witness.
+const CONFIRMED_SAT_INDEPENDENT_GATE: &str = "confirmed-sat";
+
+/// The `model_check_gate.result` value written by the constructive projection
+/// lane. It shares the `confirmed-sat` prefix so one census counts every
+/// confirmed SAT, and carries a distinct suffix so the two authorities stay
+/// tellable apart.
+const CONFIRMED_SAT_CHECKED_PROJECTION: &str = "confirmed-sat-checked-projection";
+
+/// A published `sat` must always name the authority that confirmed it.
+///
+/// This is the exact shape of the two UFBV corpus files
+/// `wintersteiger/fmsd13/fixpoint/{small-swap2-fixpoint-6, itc-b13-fixpoint-7}`,
+/// which reached `sat` through this lane while writing NO
+/// `model_check_gate.result` at all — indistinguishable, to an evidence census,
+/// from a `sat` nothing had confirmed. The lane's confirmation is real (an
+/// `ay_model_check` proof kernel that depends on no solver code) but it was
+/// reported only under `model_validation.checked_projection_certificate`, so
+/// the signal every other SAT carries was simply missing.
+#[test]
+fn checked_projection_sat_names_its_confirming_authority() {
+    let (output, gate) =
+        crate::common::solve_authored_vec_with_gate_result(DIRECT_PROJECTION_QUERY);
+    assert_eq!(output, ["sat"]);
+    assert_eq!(
+        gate.as_deref(),
+        Some(CONFIRMED_SAT_CHECKED_PROJECTION),
+        "the checked-projection lane must publish its own confirming authority"
+    );
+}
+
+/// The lane names a DIFFERENT authority than the compositional gate.
+///
+/// The projection kernel proves a universal implication; the ordinary gate
+/// evaluates a witness compositionally and reports `CannotConfirm` on any
+/// quantifier. Collapsing both onto the bare `confirmed-sat` string would claim
+/// an evaluation that never happened, so the values must stay distinguishable
+/// while still sharing the prefix a census matches on.
+#[test]
+fn checked_projection_authority_is_distinguishable_from_the_compositional_gate() {
+    let (_, gate) = crate::common::solve_authored_vec_with_gate_result(DIRECT_PROJECTION_QUERY);
+    let gate = gate.expect("the checked-projection lane publishes a SAT-evidence signal");
+    assert_ne!(
+        gate, CONFIRMED_SAT_INDEPENDENT_GATE,
+        "the projection lane must not be reported as the compositional gate's verdict"
+    );
+    assert!(
+        gate.starts_with(CONFIRMED_SAT_INDEPENDENT_GATE),
+        "a confirmed-SAT authority value must carry the shared census prefix: {gate}"
+    );
+}
+
+/// An ordinary ground SAT keeps reporting exactly `confirmed-sat`.
+///
+/// The evidence value existing runs already publish must not shift under this
+/// change: the constructive lanes add values, they do not rename the gate's.
+#[test]
+fn ordinary_ground_sat_still_reports_the_bare_independent_gate_value() {
+    let (output, gate) = crate::common::solve_authored_vec_with_gate_result(
+        "(set-logic QF_BV)\n\
+         (declare-fun a () (_ BitVec 8))\n\
+         (assert (= a #x2a))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(output, ["sat"]);
+    assert_eq!(
+        gate.as_deref(),
+        Some(CONFIRMED_SAT_INDEPENDENT_GATE),
+        "the ordinary funnel's published evidence value is unchanged"
+    );
+}
+
+/// A query the lane cannot certify never acquires its authority value.
+///
+/// `check-sat-assuming` is a different, ineligible authority origin, so the
+/// constructive lane declines and the verdict is not `sat`. Nothing may print
+/// the lane's green signal for it — a confirmation value with no confirmation
+/// behind it is the defect this signal exists to expose.
+#[test]
+fn ineligible_origin_gets_no_checked_projection_authority() {
+    let assuming = DIRECT_PROJECTION_QUERY.replace("(check-sat)", "(check-sat-assuming ())");
+    let (output, gate) = crate::common::solve_authored_vec_with_gate_result(&assuming);
+    assert_ne!(
+        output.first().map(String::as_str),
+        Some("sat"),
+        "an ineligible authority origin must not publish sat: {output:?}"
+    );
+    assert_ne!(
+        gate.as_deref(),
+        Some(CONFIRMED_SAT_CHECKED_PROJECTION),
+        "an unconfirmed query must never carry the lane's confirmation value"
+    );
+}
+
+/// A later checked query reports its own authority, not the previous solve's.
+///
+/// The scoped ordinary `check-sat` here is confirmed by the compositional gate;
+/// the second is decided by the projection lane. Statistics are reset per
+/// `check-sat`, so the published signal must describe the LAST verdict — a
+/// stale `confirmed-sat` carried forward would attribute the quantified answer
+/// to an evaluator that never saw it.
+#[test]
+fn later_checked_query_reports_its_own_authority_not_the_previous_solves() {
+    let script = r#"
+(set-logic UFBV)
+(set-option :produce-models true)
+(declare-fun seed () (_ BitVec 8))
+(push 1)
+(assert (= seed #x5a))
+(check-sat)
+(pop 1)
+(declare-fun scoped_projection ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+(assert
+  (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+    (=> (= x y) (= (scoped_projection y x) y))))
+(check-sat)
+"#;
+    let (output, gate) = crate::common::solve_authored_vec_with_gate_result(script);
+    assert_eq!(
+        output.iter().filter(|line| line.as_str() == "sat").count(),
+        2,
+        "both queries must solve: {output:?}"
+    );
+    assert_eq!(
+        gate.as_deref(),
+        Some(CONFIRMED_SAT_CHECKED_PROJECTION),
+        "the published signal must name the authority for the last verdict"
+    );
+}
+
+/// The two named UFBV corpus files themselves carry the signal.
+///
+/// The hermetic tests above pin the shape; this pins the literal files the
+/// evidence census counts. The corpus is gitignored, so this skips-and-passes
+/// when it is absent — set `AY_REQUIRE_CORPUS=1` to make that a failure.
+#[test]
+fn wintersteiger_fixpoint_corpus_files_carry_the_sat_evidence_signal() {
+    for name in [
+        "non-incremental__UFBV__wintersteiger__fmsd13__fixpoint__small-swap2-fixpoint-6.smt2",
+        "non-incremental__UFBV__wintersteiger__fmsd13__fixpoint__itc-b13-fixpoint-7.smt2",
+    ] {
+        let path = crate::common::workspace_path(format!("benchmarks/smtlib-all/UFBV/{name}"));
+        if !path.exists() {
+            assert!(crate::common::corpus_skip_allowed(&path));
+            continue;
+        }
+        let smt = std::fs::read_to_string(&path).expect("readable corpus file");
+        let (output, gate) = crate::common::solve_authored_vec_with_gate_result(&smt);
+        assert_eq!(
+            output.first().map(String::as_str),
+            Some("sat"),
+            "{name} must still solve sat"
+        );
+        assert_eq!(
+            gate.as_deref(),
+            Some(CONFIRMED_SAT_CHECKED_PROJECTION),
+            "{name} must publish the checked-projection confirmation authority"
+        );
+    }
+}

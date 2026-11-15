@@ -14,9 +14,13 @@ pub struct Graph {
 impl Graph {
     /// Create an empty graph with n vertices and no edges.
     pub fn new(n: usize) -> Self {
-        Self {
-            adj: vec![Vec::new(); n],
-        }
+        // One empty adjacency list per vertex: `vec![Vec::new(); n]` with the
+        // buffer reserved fallibly. A failed reservation only forgoes the
+        // pre-sizing; `extend` then grows the vector itself.
+        let mut adj = Vec::new();
+        let _ = adj.try_reserve_exact(n);
+        adj.extend(std::iter::repeat_n(Vec::new(), n));
+        Self { adj }
     }
 
     /// Number of vertices.
@@ -71,7 +75,8 @@ impl Graph {
     pub fn complete(n: usize) -> Self {
         let mut g = Self::new(n);
         for u in 0..n {
-            for v in (u + 1)..n {
+            // `u < n`, so `u + 1` never saturates.
+            for v in u.saturating_add(1)..n {
                 g.add_edge(u, v);
             }
         }
@@ -85,7 +90,9 @@ impl Graph {
         }
         let mut g = Self::new(n);
         for i in 0..n {
-            g.add_edge(i, (i + 1) % n);
+            // `i < n` and `n >= 3`: the successor never saturates and the
+            // divisor is nonzero.
+            g.add_edge(i, i.saturating_add(1) % n);
         }
         g
     }
@@ -97,7 +104,8 @@ impl Graph {
         }
         let mut g = Self::new(n);
         for i in 0..(n - 1) {
-            g.add_edge(i, i + 1);
+            // `i < n - 1`, so `i + 1` never saturates.
+            g.add_edge(i, i.saturating_add(1));
         }
         g
     }
@@ -129,7 +137,8 @@ impl Graph {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         for u in 0..n {
-            for v in (u + 1)..n {
+            // `u < n`, so `u + 1` never saturates.
+            for v in u.saturating_add(1)..n {
                 if rng.gen_bool(p) {
                     g.add_edge(u, v);
                 }
@@ -139,11 +148,15 @@ impl Graph {
     }
 
     /// Create a bipartite graph with given sizes and edges between partitions.
+    ///
+    /// Vertices `0..n1` form one side and `n1..n1 + n2` the other. Sizes whose
+    /// sum exceeds `usize::MAX` ask for more vertices than can be allocated
+    /// and fail in [`Graph::new`] like any other unallocatable vertex count.
     pub fn complete_bipartite(n1: usize, n2: usize) -> Self {
-        let n = n1 + n2;
+        let n = n1.saturating_add(n2);
         let mut g = Self::new(n);
         for u in 0..n1 {
-            for v in n1..(n1 + n2) {
+            for v in n1..n {
                 g.add_edge(u, v);
             }
         }

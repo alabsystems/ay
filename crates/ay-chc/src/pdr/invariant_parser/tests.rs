@@ -81,7 +81,7 @@ fn parse_spacer_wrapper_multiple_definitions() {
 fn parse_z3_recursive_datatype_model_selectors_and_testers() {
     let list_sort = ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "conslistOfInt".to_string(),
                 selectors: vec![

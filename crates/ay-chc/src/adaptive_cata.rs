@@ -785,7 +785,7 @@ impl AdaptivePortfolio {
                     return CataLevelOutcome::Refine;
                 }
                 // Child of the portfolio handle (item 5).
-                let cancel = self.cancellation_token.child();
+                let cancel = self.lane_token();
                 let bmc_config = BmcConfig {
                     base: ChcEngineConfig {
                         verbose: self.config.verbose,

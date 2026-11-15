@@ -50,14 +50,23 @@ impl Executor {
         // rather than nearly true: an unrun pass now leaves an EMPTY map, which
         // fails closed to today's behaviour, instead of a stale one.
         self.bool_arg_orphan_index.clear();
-        // Retention re-arm is gated exactly like the tracker: a shedding
-        // competition session keeps whatever retention state the CLI/API chose
-        // (the CLI turns it off at session start), while any proof demand —
-        // including an in-script `:produce-proofs true` — re-arms it here for
-        // proof surface-syntax alignment.
-        if !self.competition_shedding_active() {
-            self.ctx.set_retain_parsed_assertions(true);
-        }
+        // Parsed-assertion retention is deliberately NOT touched here. It is
+        // session configuration: the host sets it (the CLI turns it off for a
+        // session that emits no proof artifact), and the proof-artifact demands
+        // arm it at the moment the demand is made (`set_produce_proofs`,
+        // `set_best_effort_produce_proofs`, `set_mandatory_proof_collection`,
+        // in-script `:produce-proofs true`); strict checking and self-check
+        // alone keep the host's retention for every query. This boundary used
+        // to re-arm it for every non-shedding solve. That could not help the
+        // query being solved (its assertions were already elaborated), and it
+        // switched retention on for every LATER query of the process.
+        // Retention selects the certification funnel's lanes, so the first
+        // query of an `ay --incremental` session and every later one took
+        // different lanes, and where the lanes disagree the verdict depended on
+        // what the session had solved before: on 5da8198d1
+        // `benchmarks/smt/QF_LIA/system_03.smt2` answered `unsat` first and
+        // `unknown (incomplete self-check-rejected)` after any earlier
+        // `check-sat`, and on build 8256 so did external-codegen's copy refutations.
     }
 
     /// Revoke every user-visible artefact at the start of a public decision
@@ -66,11 +75,38 @@ impl Executor {
     /// the previously emitted result/model/certificate are still always cleared.
     pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
         self.advance_query_authority_epoch();
+        // The CEGQI witness ledger lives exactly one public decision
+        // (#negated-exists-cegqi-witness-hints): it is deliberately NOT part
+        // of `clear_preprocessing_proof_records`, which the CEGAR refinement
+        // loop re-runs between its iterations, because the artifact firewall
+        // consults the ledger in a LATER iteration than the round that filled
+        // it.
+        self.cegqi_witness_hints.clear();
+        self.instance_witness_hints.clear();
+        // What the ground solves hand to each other serves the re-solves of
+        // ONE public decision, its unknown retries included. The carried
+        // conflicts hold in the theory alone, so this bounds their number and
+        // keeps a later command's declarations out of their reach, not their
+        // validity within the query (see `ground_solve_carry`).
+        self.ground_solve_carry.begin_query();
+        self.preprocess_eliminated_constants.clear();
+        self.qlra_lane.memo = None;
+        self.qsat_route.begin_public_solve();
+        self.qlra_lane.unsat_log = None;
+        self.qlra_lane.expansion_hints = None;
+        self.eq_qe_lane_declined = None;
+        self.quantified_refutation_withheld = false;
+        self.authored_ground_core_refutation = None;
+        self.ground_first_spent = false;
+        self.ground_first_stats = Default::default();
         // M0(a): these counters describe one public publication attempt.
         // Internal probes deliberately share their enclosing attempt, while a
         // new user-visible decision starts a fresh attribution window.
         self.strict_check_invocations.set(0);
         self.strict_check_steps_validated.set(0);
+        // The strengthening ledger names what a corroborating re-solve ran
+        // without; it describes one public decision.
+        self.strengthenings_applied = Default::default();
         #[cfg(test)]
         {
             self.last_authored_query_authority_seen = false;
@@ -123,6 +159,7 @@ impl Executor {
     /// Start a caller-visible decision query and replenish resource envelopes
     /// that must remain cumulative across every nested solve/restart it owns.
     pub(crate) fn begin_external_decision_query(&mut self, preserve_pareto_enumeration: bool) {
+        self.begin_evaluation_decision();
         self.begin_external_proof_checkpoint_budget();
         // The consequence-replay lane's WALL envelope re-arms HERE and nowhere
         // else. `begin_public_solve` is the wrong boundary: nested
@@ -138,6 +175,16 @@ impl Executor {
         self.finite_array_expansion
             .prune_to_active_assertions(&self.ctx.terms, &self.ctx.assertions);
         self.finite_array_expansion.begin_external_query();
+        // `ay_lia`'s probe trajectory state (the #probe-subset-cache hint and
+        // the #probe-prefix-bisect fail streak and total) is per THREAD, and a
+        // thread serves query after query in an API session: re-arm it here so
+        // a query starts from the same state however many solves ran before it.
+        // A nested internal executor that runs a `CheckSat` command crosses
+        // this boundary too and starts clean as well; its enclosing solve then
+        // resumes from whatever state the nested solve left, as it did before
+        // this reset. Only the UFLIA detour (which resets at its own entry) and
+        // the opt-in `--probe-prescreen` read the state.
+        ay_lia::reset_probe_subset_hint();
         self.begin_public_solve(preserve_pareto_enumeration);
     }
 

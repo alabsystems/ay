@@ -90,7 +90,7 @@ impl InterpolatingSmtContext {
     /// Create a new incremental interpolating context.
     pub(crate) fn new() -> Self {
         Self {
-            smt: SmtContext::new(),
+            smt: SmtContext::new_search(),
             a_constraints: Vec::new(),
             query_count: 0,
             rebuild_limit: Self::DEFAULT_REBUILD_LIMIT,
@@ -103,7 +103,7 @@ impl InterpolatingSmtContext {
     #[cfg(test)]
     pub(crate) fn with_rebuild_limit(rebuild_limit: usize) -> Self {
         Self {
-            smt: SmtContext::new(),
+            smt: SmtContext::new_search(),
             a_constraints: Vec::new(),
             query_count: 0,
             rebuild_limit,
@@ -138,6 +138,22 @@ impl InterpolatingSmtContext {
     /// On successful interpolant extraction, caches the interpolant for retrieval
     /// via [`last_interpolant()`](Self::last_interpolant).
     pub(crate) fn check_with_query(&mut self, query: &ChcExpr) -> InterpolatingResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return InterpolatingResult::Unknown;
+        }
+        // Census (`--chc-session-coverage`): nothing is built when it is off.
+        let _census = super::lane::census::coverage_enabled().then(|| {
+            let exprs: Vec<&ChcExpr> = self
+                .a_constraints
+                .iter()
+                .chain(std::iter::once(query))
+                .collect();
+            super::lane::CensusFrame::enter(
+                super::lane::SmtEntry::Interpolating,
+                Some(self.smt.census_lane()),
+                &exprs,
+            )
+        });
         // Clear cached interpolant from previous query
         self.last_interpolant = None;
 

@@ -2,46 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::{ChcExpr, ChcSort, ChcVar, FxHashMap, FxHashSet, PdrSolver, PredicateId};
-
-pub(super) fn rename_fact_variables(
-    fact_constraint: &ChcExpr,
-    fact_head_args: &[ChcExpr],
-    prefix: &str,
-) -> (ChcExpr, Vec<ChcExpr>) {
-    let mut all_vars: FxHashMap<String, ChcSort> = FxHashMap::default();
-    for var in fact_constraint.vars() {
-        all_vars.insert(var.name.clone(), var.sort.clone());
-    }
-    for arg in fact_head_args {
-        for var in arg.vars() {
-            all_vars.insert(var.name.clone(), var.sort.clone());
-        }
-    }
-
-    let subst: Vec<(ChcVar, ChcExpr)> = all_vars
-        .into_iter()
-        .map(|(name, sort)| {
-            let old_var = ChcVar {
-                name: name.clone(),
-                sort: sort.clone(),
-            };
-            let new_var = ChcVar {
-                name: format!("{prefix}{name}"),
-                sort,
-            };
-            (old_var, ChcExpr::var(new_var))
-        })
-        .collect();
-
-    let renamed_constraint = fact_constraint.substitute(&subst);
-    let renamed_args: Vec<ChcExpr> = fact_head_args
-        .iter()
-        .map(|arg| arg.substitute(&subst))
-        .collect();
-
-    (renamed_constraint, renamed_args)
-}
+use super::{ChcExpr, FxHashMap, FxHashSet, PdrSolver, PredicateId};
 
 pub(super) fn predicate_has_facts(solver: &PdrSolver, pred: PredicateId) -> bool {
     solver.caches.predicates_with_facts.contains(&pred)

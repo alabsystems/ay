@@ -39,7 +39,7 @@ fn test_perf_many_selects_check_completes() {
     let mut current_arr = a;
     let mut values = Vec::with_capacity(n);
     for (idx, val_offset) in indices.iter().zip(0..n) {
-        let val = store.mk_int(BigInt::from(100 + val_offset));
+        let val = store.mk_int(BigInt::from(100) + BigInt::from(val_offset));
         current_arr = store.mk_store(current_arr, *idx, val);
         values.push(val);
     }
@@ -57,9 +57,11 @@ fn test_perf_many_selects_check_completes() {
         .zip(values.iter())
         .map(|(&sel, &val)| store.mk_eq(sel, val))
         .collect();
+    // Adjacent pairs `(selects[k], selects[k + 1])`.
     let diseq_terms: Vec<_> = selects
-        .windows(2)
-        .map(|w| store.mk_eq(w[0], w[1]))
+        .iter()
+        .zip(selects.iter().skip(1))
+        .map(|(&lhs, &rhs)| store.mk_eq(lhs, rhs))
         .collect();
 
     let mut solver = ArraySolver::new(&store);

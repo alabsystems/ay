@@ -109,8 +109,11 @@ fn build_scaled_plan(
         // A zero multiplier contributes nothing, so its orientation is not a
         // real choice — pin it to the first alternative exactly as the
         // node-at-a-time search did.
-        let candidates: &[NormalizedConstraint] =
-            if lambda.is_zero() { std::slice::from_ref(first) } else { alts };
+        let candidates: &[NormalizedConstraint] = if lambda.is_zero() {
+            std::slice::from_ref(first)
+        } else {
+            alts
+        };
 
         if let Some((alt, [])) = candidates.split_first() {
             base.add_scaled(&alt.expr, lambda);
@@ -157,7 +160,10 @@ fn build_remaining_bounds(branches: &[ScaledBranch]) -> Vec<BTreeMap<TermId, Big
     // slice holds at most `isize::MAX` elements, so it never actually
     // saturates) and the `min` cap below still bounds the preallocation.
     let mut remaining = Vec::with_capacity(
-        branches.len().saturating_add(1).min(MAX_FARKAS_CONFLICT_LITERALS),
+        branches
+            .len()
+            .saturating_add(1)
+            .min(MAX_FARKAS_CONFLICT_LITERALS),
     );
     remaining.push(BTreeMap::new());
     let mut bounds: BTreeMap<TermId, BigRational> = BTreeMap::new();
@@ -242,9 +248,7 @@ fn search_plan_suffix(
         return is_contradiction(acc, strict_acc);
     };
 
-    for (alt_idx, (scaled, strict)) in
-        branch.scaled.iter().zip(branch.strict.iter()).enumerate()
-    {
+    for (alt_idx, (scaled, strict)) in branch.scaled.iter().zip(branch.strict.iter()).enumerate() {
         acc.add_expr(scaled);
         if let Some(choice) = choice.as_deref_mut() {
             if let Some(slot) = choice.get_mut(branch.idx) {

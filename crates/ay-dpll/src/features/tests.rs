@@ -5,6 +5,16 @@
 use super::*;
 
 #[test]
+fn complex_sort_and_nested_carriers_route_through_real_and_uf_theories() {
+    let mut features = StaticFeatures::default();
+    features.detect_sort_theory(&Sort::Complex);
+    assert!(features.has_real && features.has_uf);
+    assert!(!features.has_int);
+    features.detect_sort_theory(&Sort::array(Sort::Int, Sort::Complex));
+    assert!(features.has_arrays && features.has_int && features.has_real && features.has_uf);
+}
+
+#[test]
 fn test_infer_pure_uf() {
     let features = StaticFeatures::default();
     assert_eq!(features.infer_logic(), "QF_UF");

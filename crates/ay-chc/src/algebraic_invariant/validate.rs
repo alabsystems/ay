@@ -1,15 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{conjoin, SynthesisBudget};
+use super::{conjoin_checked, SynthesisBudget};
 use crate::expr::{maybe_grow_expr_stack, MAX_EXPR_RECURSION_DEPTH};
-use crate::pdr::cube::is_trivial_contradiction;
+use crate::pdr::cube::is_trivial_contradiction_checked;
 use crate::pdr::model::InvariantModel;
 use crate::smt::{SmtContext, SmtResult};
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseHead, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use ay_core::time::Instant;
 use std::time::Duration;
+
+mod budget;
+#[cfg(test)]
+mod budget_tests;
+mod ite_eval;
+use budget::{check, ValidationResult};
+
+macro_rules! validation_some {
+    ($value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
 
 /// Per-query SMT timeout used during algebraic validation.
 ///
@@ -228,45 +243,61 @@ impl ValidationInterval {
     }
 }
 
-fn validation_formula_proves_unsat(formula: &ChcExpr) -> bool {
-    let raw_conjuncts: Vec<ChcExpr> = formula.conjuncts().into_iter().cloned().collect();
-    if bool_encoded_exclusions_are_syntactically_unsat(&raw_conjuncts) {
-        return true;
-    }
-
-    let simplified = formula.simplify_constants();
-    if matches!(simplified, ChcExpr::Bool(false)) || is_trivial_contradiction(&simplified) {
-        return true;
-    }
-
-    let conjuncts: Vec<ChcExpr> = simplified.conjuncts().into_iter().cloned().collect();
-    if active_diff_query_formula_is_syntactically_unsat(&conjuncts) {
-        return true;
-    }
-    if bool_encoded_exclusions_are_syntactically_unsat(&conjuncts) {
-        return true;
-    }
-
-    let mut int_env = FxHashMap::default();
-    if !collect_validation_interval_bounds(&conjuncts, &mut int_env) {
-        return true;
-    }
-    let Some(residue_env) = collect_validation_mod_residues(&conjuncts) else {
-        return true;
-    };
-    if !refine_validation_intervals_with_residues(&mut int_env, &residue_env) {
-        return true;
-    }
-
-    let Some(bool_env) = collect_validation_bool_assignments(&conjuncts) else {
-        return true;
-    };
-
-    conjuncts.iter().any(|conjunct| {
-        matches!(
-            validation_bool_result(conjunct, &int_env, &bool_env, &residue_env),
-            Some(false)
-        )
+fn validation_formula_proves_unsat_checked(
+    formula: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let raw_conjuncts: Vec<ChcExpr> =
+            budget::cloned(budget::conjuncts(&formula, budget)?, budget)?;
+        if bool_encoded_exclusions_are_syntactically_unsat_checked(&raw_conjuncts, budget)? {
+            return Ok(true);
+        }
+        let simplified = budget::simplify(formula, budget)?;
+        check(budget)?;
+        if matches!(simplified, ChcExpr::Bool(false))
+            || is_trivial_contradiction_checked(&simplified, || budget.expired())
+                .ok_or(budget::ValidationStopped)?
+        {
+            return Ok(true);
+        }
+        let conjuncts: Vec<ChcExpr> =
+            budget::cloned(budget::conjuncts(&simplified, budget)?, budget)?;
+        if active_diff_query_formula_is_syntactically_unsat(&conjuncts, budget)? {
+            return Ok(true);
+        }
+        if bool_encoded_exclusions_are_syntactically_unsat_checked(&conjuncts, budget)? {
+            return Ok(true);
+        }
+        let mut int_env = FxHashMap::default();
+        if !collect_validation_interval_bounds_checked(&conjuncts, &mut int_env, budget)? {
+            return Ok(true);
+        }
+        let Some(residue_env) = collect_validation_mod_residues(&conjuncts, budget)? else {
+            return Ok(true);
+        };
+        check(budget)?;
+        if !refine_validation_intervals_with_residues(&mut int_env, &residue_env, budget)? {
+            return Ok(true);
+        }
+        let Some(bool_env) = collect_validation_bool_assignments(&conjuncts, budget)? else {
+            return Ok(true);
+        };
+        for conjunct in &conjuncts {
+            if matches!(
+                validation_bool_result_checked(
+                    conjunct,
+                    &int_env,
+                    &bool_env,
+                    &residue_env,
+                    budget
+                )?,
+                Some(false)
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })
 }
 
@@ -276,54 +307,62 @@ struct ActiveDiffContradictions {
     positive_epsilons: FxHashSet<String>,
 }
 
-fn active_diff_query_formula_is_syntactically_unsat(conjuncts: &[ChcExpr]) -> bool {
+fn active_diff_query_formula_is_syntactically_unsat(
+    conjuncts: &[ChcExpr],
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     let mut facts = ActiveDiffContradictions::default();
     for conjunct in conjuncts {
-        if let Some((active_a, active_b, epsilon, value_a, value_b)) =
-            parse_active_diff_invariant_clause(conjunct)
-        {
-            facts.diff_guards.insert(active_diff_fact_key(
-                &active_a, &active_b, &epsilon, &value_a, &value_b,
-            ));
+        check(budget)?;
+        if let Some((a, b, e, x, y)) = parse_active_diff_invariant_clause(conjunct, budget)? {
+            facts
+                .diff_guards
+                .insert(active_diff_fact_key(&a, &b, &e, &x, &y));
             continue;
         }
         if let Some(epsilon) = parse_positive_epsilon_fact(conjunct) {
             facts.positive_epsilons.insert(epsilon.name);
         }
     }
-
     if facts.diff_guards.is_empty() && facts.positive_epsilons.is_empty() {
-        return false;
+        return Ok(false);
     }
-
-    conjuncts
-        .iter()
-        .any(|conjunct| active_diff_query_expr_is_unsat(conjunct, &mut Vec::new(), &facts))
+    budget::any(conjuncts, budget, |c| {
+        active_diff_query_expr_is_unsat(c, &mut Vec::new(), &facts, budget)
+    })
 }
 
-fn bool_encoded_exclusions_are_syntactically_unsat(conjuncts: &[ChcExpr]) -> bool {
-    let mut facts: FxHashMap<String, BoolEncodedDomainFacts> = FxHashMap::default();
-    for conjunct in conjuncts {
-        if let Some((key, value)) = bool_encoded_equality_key(conjunct) {
-            let entry = facts.entry(key).or_default();
-            if entry.required.is_some_and(|old| old != value) {
-                return true;
+fn bool_encoded_exclusions_are_syntactically_unsat_checked(
+    conjuncts: &[ChcExpr],
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            let mut facts: FxHashMap<String, BoolEncodedDomainFacts> = FxHashMap::default();
+            for conjunct in conjuncts {
+                check(budget)?;
+                if let Some((key, value)) = bool_encoded_equality_key_checked(conjunct, budget)? {
+                    let entry = facts.entry(key).or_default();
+                    if entry.required.is_some_and(|old| old != value) {
+                        return Ok(true);
+                    }
+                    entry.required = Some(value);
+                    if entry.excluded & bool_encoded_value_bit(value) != 0 {
+                        return Ok(true);
+                    }
+                }
+                if let Some((key, value)) = bool_encoded_exclusion_key_checked(conjunct, budget)? {
+                    let bit = bool_encoded_value_bit(value);
+                    let entry = facts.entry(key).or_default();
+                    entry.excluded |= bit;
+                    if entry.required == Some(value) || entry.excluded == 0b11 {
+                        return Ok(true);
+                    }
+                }
             }
-            entry.required = Some(value);
-            if entry.excluded & bool_encoded_value_bit(value) != 0 {
-                return true;
-            }
-        }
-        if let Some((key, value)) = bool_encoded_exclusion_key(conjunct) {
-            let bit = bool_encoded_value_bit(value);
-            let entry = facts.entry(key).or_default();
-            entry.excluded |= bit;
-            if entry.required == Some(value) || entry.excluded == 0b11 {
-                return true;
-            }
-        }
-    }
-    false
+            false
+        })
+    })
 }
 
 #[derive(Default)]
@@ -340,158 +379,191 @@ fn bool_encoded_value_bit(value: i64) -> u8 {
     }
 }
 
-fn bool_encoded_equality_key(expr: &ChcExpr) -> Option<(String, i64)> {
-    if let Some(key) = bool_encoded_equality_key_raw(expr) {
-        return Some(key);
-    }
-    let simplified = expr.simplify_constants();
-    bool_encoded_equality_key_raw(&simplified)
-}
-
-fn bool_encoded_equality_key_raw(expr: &ChcExpr) -> Option<(String, i64)> {
-    match expr {
-        ChcExpr::Op(ChcOp::Eq, eq_args) => bool_encoded_eq_key(eq_args),
-        _ => None,
-    }
-}
-
-fn bool_encoded_eq_key(args: &[std::sync::Arc<ChcExpr>]) -> Option<(String, i64)> {
-    if args.len() != 2 {
-        return None;
-    }
-    if let Some(value @ (0 | 1)) = args[1].as_i64() {
-        if validation_expr_has_bool_domain(args[0].as_ref()) {
-            return Some((validation_expr_key(args[0].as_ref()), value));
+fn bool_encoded_equality_key_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    budget::run(budget, || {
+        if let Some(value) = bool_encoded_equality_key_raw_checked(expr, budget)? {
+            return Ok(Some(value));
         }
-    }
-    if let Some(value @ (0 | 1)) = args[0].as_i64() {
-        if validation_expr_has_bool_domain(args[1].as_ref()) {
-            return Some((validation_expr_key(args[1].as_ref()), value));
+        bool_encoded_equality_key_raw_checked(&budget::simplify(expr, budget)?, budget)
+    })
+}
+
+fn bool_encoded_equality_key_raw_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    budget::run(budget, || match expr {
+        ChcExpr::Op(ChcOp::Eq, args) => bool_encoded_eq_key_checked(args, budget),
+        _ => Ok(None),
+    })
+}
+
+fn bool_encoded_eq_key_checked(
+    args: &[std::sync::Arc<ChcExpr>],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    budget::run(budget, || {
+        if args.len() != 2 {
+            return Ok(None);
         }
-    }
-    None
+        if let Some(value @ (0 | 1)) = args[1].as_i64() {
+            if validation_expr_has_bool_domain_checked(args[0].as_ref(), budget)? {
+                return Ok(Some((
+                    validation_expr_key_checked(args[0].as_ref(), budget)?,
+                    value,
+                )));
+            }
+        }
+        if let Some(value @ (0 | 1)) = args[0].as_i64() {
+            if validation_expr_has_bool_domain_checked(args[1].as_ref(), budget)? {
+                return Ok(Some((
+                    validation_expr_key_checked(args[1].as_ref(), budget)?,
+                    value,
+                )));
+            }
+        }
+        Ok(None)
+    })
 }
 
-fn bool_encoded_exclusion_key(expr: &ChcExpr) -> Option<(String, i64)> {
-    if let Some(key) = bool_encoded_exclusion_key_raw(expr) {
-        return Some(key);
-    }
-    let simplified = expr.simplify_constants();
-    bool_encoded_exclusion_key_raw(&simplified)
+fn bool_encoded_exclusion_key_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    budget::run(budget, || {
+        if let Some(value) = bool_encoded_exclusion_key_raw_checked(expr, budget)? {
+            return Ok(Some(value));
+        }
+        bool_encoded_exclusion_key_raw_checked(&budget::simplify(expr, budget)?, budget)
+    })
 }
 
-fn bool_encoded_exclusion_key_raw(expr: &ChcExpr) -> Option<(String, i64)> {
-    match expr {
+fn bool_encoded_exclusion_key_raw_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    budget::run(budget, || match expr {
         ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
             let ChcExpr::Op(ChcOp::Eq, eq_args) = args[0].as_ref() else {
-                return None;
+                return Ok(None);
             };
-            bool_encoded_neq_key(eq_args)
+            bool_encoded_neq_key_checked(eq_args, budget)
         }
-        ChcExpr::Op(ChcOp::Ne, args) => bool_encoded_neq_key(args),
-        _ => None,
-    }
+        ChcExpr::Op(ChcOp::Ne, args) => bool_encoded_neq_key_checked(args, budget),
+        _ => Ok(None),
+    })
 }
 
-fn bool_encoded_neq_key(args: &[std::sync::Arc<ChcExpr>]) -> Option<(String, i64)> {
-    if args.len() != 2 {
-        return None;
-    }
-    if let Some(value @ (0 | 1)) = args[1].as_i64() {
-        if validation_expr_has_bool_domain(args[0].as_ref()) {
-            return Some((validation_expr_key(args[0].as_ref()), value));
-        }
-    }
-    if let Some(value @ (0 | 1)) = args[0].as_i64() {
-        if validation_expr_has_bool_domain(args[1].as_ref()) {
-            return Some((validation_expr_key(args[1].as_ref()), value));
-        }
-    }
-    None
+fn bool_encoded_neq_key_checked(
+    args: &[std::sync::Arc<ChcExpr>],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i64)>> {
+    bool_encoded_eq_key_checked(args, budget)
 }
 
-fn validation_expr_has_bool_domain(expr: &ChcExpr) -> bool {
-    if validation_expr_has_bool_domain_raw(expr) {
-        return true;
-    }
-    let simplified = expr.simplify_constants();
-    validation_expr_key(&simplified) != validation_expr_key(expr)
-        && validation_expr_has_bool_domain_raw(&simplified)
+fn validation_expr_has_bool_domain_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        if validation_expr_has_bool_domain_raw_checked(expr, budget)? {
+            return Ok(true);
+        }
+        let simplified = budget::simplify(expr, budget)?;
+        check(budget)?;
+        Ok(simplified != *expr
+            && validation_expr_has_bool_domain_raw_checked(&simplified, budget)?
+            && validation_expr_key_checked(&simplified, budget)?
+                != validation_expr_key_checked(expr, budget)?)
+    })
 }
 
-fn validation_expr_has_bool_domain_raw(expr: &ChcExpr) -> bool {
-    if let Some((payload, width)) = signed_bv_to_int_payload_and_width(expr) {
-        return width > 1 && validation_expr_has_bool_domain(payload);
-    }
-    if let Some((payload, _)) = unsigned_bv_to_int_payload(expr) {
-        return validation_expr_has_bool_domain(payload);
-    }
-    match expr {
-        ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
-            matches!(
-                (args[1].as_i64(), args[2].as_i64()),
-                (Some(0), Some(1)) | (Some(1), Some(0))
-            ) || bool_bitvec_ite_payload(expr).is_some()
+fn validation_expr_has_bool_domain_raw_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        if let Some((payload, width)) = signed_bv_to_int_payload_and_width_checked(expr, budget)? {
+            return Ok(width > 1 && validation_expr_has_bool_domain_checked(payload, budget)?);
         }
-        ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
-            eval_validation_nonnegative_const_u128(args[1].as_ref(), 0)
-                .is_some_and(|modulus| modulus > 1)
-                && validation_expr_has_bool_domain(args[0].as_ref())
+        if let Some((payload, _)) = unsigned_bv_to_int_payload(expr, budget)? {
+            return validation_expr_has_bool_domain_checked(payload, budget);
         }
-        _ => false,
-    }
+        Ok(match expr {
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                matches!(
+                    (args[1].as_i64(), args[2].as_i64()),
+                    (Some(0), Some(1)) | (Some(1), Some(0))
+                ) || bool_bitvec_ite_payload(expr).is_some()
+            }
+            ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
+                eval_validation_nonnegative_const_u128(args[1].as_ref(), 0, budget)?
+                    .is_some_and(|modulus| modulus > 1)
+                    && validation_expr_has_bool_domain_checked(args[0].as_ref(), budget)?
+            }
+            _ => false,
+        })
+    })
 }
 
 fn active_diff_query_expr_is_unsat(
     expr: &ChcExpr,
     active_context: &mut Vec<ChcVar>,
     facts: &ActiveDiffContradictions,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    check(budget)?;
     if matches!(expr, ChcExpr::Bool(false)) {
-        return true;
+        return Ok(true);
     }
     if matches!(expr, ChcExpr::Bool(true)) {
-        return false;
+        return Ok(false);
     }
     if let Some(epsilon) = parse_epsilon_nonpositive_guard(expr) {
-        return facts.positive_epsilons.contains(&epsilon.name);
+        return Ok(facts.positive_epsilons.contains(&epsilon.name));
     }
-    if let Some((epsilon, value_a, value_b)) = parse_epsilon_distance_guard(expr) {
-        return active_context.iter().enumerate().any(|(idx, active_a)| {
-            active_context.iter().skip(idx + 1).any(|active_b| {
-                facts.diff_guards.contains(&active_diff_fact_key(
-                    active_a, active_b, &epsilon, &value_a, &value_b,
-                ))
-            })
-        });
+    if let Some((epsilon, x, y)) = parse_epsilon_distance_guard(expr) {
+        for (idx, a) in active_context.iter().enumerate() {
+            for b in active_context.iter().skip(idx + 1) {
+                check(budget)?;
+                if facts
+                    .diff_guards
+                    .contains(&active_diff_fact_key(a, b, &epsilon, &x, &y))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
     }
-
     let ChcExpr::Op(op, args) = expr else {
-        return false;
+        return Ok(false);
     };
     match op {
         ChcOp::And => {
-            let original_len = active_context.len();
+            let len = active_context.len();
             for arg in args {
+                check(budget)?;
                 if let Some(var) = positive_validation_bool_var(arg) {
-                    if !active_context.iter().any(|active| active.name == var.name) {
+                    if !budget::any(active_context.iter(), budget, |a| Ok(a.name == var.name))? {
                         active_context.push(var);
                     }
                 }
             }
-            let unsat = args
-                .iter()
-                .any(|arg| active_diff_query_expr_is_unsat(arg, active_context, facts));
-            active_context.truncate(original_len);
-            unsat
+            let result = budget::any(args, budget, |a| {
+                active_diff_query_expr_is_unsat(a, active_context, facts, budget)
+            });
+            active_context.truncate(len);
+            result
         }
-        ChcOp::Or => {
-            !args.is_empty()
-                && args
-                    .iter()
-                    .all(|arg| active_diff_query_expr_is_unsat(arg, active_context, facts))
-        }
-        _ => false,
+        ChcOp::Or => Ok(!args.is_empty()
+            && budget::all(args, budget, |a| {
+                active_diff_query_expr_is_unsat(a, active_context, facts, budget)
+            })?),
+        _ => Ok(false),
     }
 }
 
@@ -551,168 +623,241 @@ fn is_validation_zero(expr: &ChcExpr) -> bool {
     matches!(expr, ChcExpr::Int(0) | ChcExpr::Real(0, 1))
 }
 
-fn collect_validation_interval_bounds(
+fn collect_validation_interval_bounds_checked(
     conjuncts: &[ChcExpr],
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    let max_rounds = conjuncts.len().saturating_add(4).clamp(1, 32);
-    for _ in 0..max_rounds {
-        let before = env.clone();
-        for conjunct in conjuncts {
-            if !collect_validation_interval_bound(conjunct, env) {
-                return false;
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            let max_rounds = conjuncts.len().saturating_add(4).clamp(1, 32);
+            for _ in 0..max_rounds {
+                check(budget)?;
+                let before = budget::clone_map(env, budget)?;
+                for conjunct in conjuncts {
+                    check(budget)?;
+                    if !collect_validation_interval_bound_checked(conjunct, env, budget)? {
+                        return Ok(false);
+                    }
+                }
+                for conjunct in conjuncts {
+                    check(budget)?;
+                    if !propagate_validation_var_bound(conjunct, env, budget)? {
+                        return Ok(false);
+                    }
+                }
+                for conjunct in conjuncts {
+                    check(budget)?;
+                    if !propagate_validation_linear_bound(conjunct, env, budget)? {
+                        return Ok(false);
+                    }
+                }
+                for conjunct in conjuncts {
+                    check(budget)?;
+                    if !propagate_validation_implication_bound_checked(conjunct, env, budget)? {
+                        return Ok(false);
+                    }
+                }
+                if *env == before {
+                    return Ok(true);
+                }
             }
-        }
-        for conjunct in conjuncts {
-            if !propagate_validation_var_bound(conjunct, env) {
-                return false;
-            }
-        }
-        for conjunct in conjuncts {
-            if !propagate_validation_linear_bound(conjunct, env) {
-                return false;
-            }
-        }
-        for conjunct in conjuncts {
-            if !propagate_validation_implication_bound(conjunct, env) {
-                return false;
-            }
-        }
-        if *env == before {
-            return true;
-        }
-    }
-    true
+            true
+        })
+    })
 }
 
-fn collect_validation_interval_bound(
+fn collect_validation_interval_bound_checked(
     conjunct: &ChcExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    let simplified = conjunct.simplify_constants();
-    if let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) {
-        return collect_validation_direct_bound(op, lhs, rhs, env);
-    }
-    if let ChcExpr::Op(ChcOp::Not, args) = &simplified {
-        if args.len() == 1 {
-            if let Some((op, lhs, rhs)) = validation_interval_atom(args[0].as_ref()) {
-                return collect_validation_direct_bound(
-                    negated_validation_comparison(op),
-                    lhs,
-                    rhs,
-                    env,
-                );
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            let simplified = budget::simplify(conjunct, budget)?;
+            if let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) {
+                return Ok(collect_validation_direct_bound_checked(
+                    op, lhs, rhs, env, budget,
+                )?);
             }
-        }
-    }
-    true
+            if let ChcExpr::Op(ChcOp::Not, args) = &simplified {
+                if args.len() == 1 {
+                    if let Some((op, lhs, rhs)) = validation_interval_atom(args[0].as_ref()) {
+                        return Ok(collect_validation_direct_bound_checked(
+                            negated_validation_comparison(op),
+                            lhs,
+                            rhs,
+                            env,
+                            budget,
+                        )?);
+                    }
+                }
+            }
+            true
+        })
+    })
 }
 
-fn collect_validation_direct_bound(
+fn collect_validation_direct_bound_checked(
     op: ChcOp,
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    match op {
-        ChcOp::Eq => {
-            if let (Some((name, coeff, offset)), Some(value)) =
-                (validation_single_var_affine(lhs), rhs.as_i128())
-            {
-                if let Some(interval) = validation_affine_exact_interval(coeff, offset, value) {
-                    return add_validation_interval(env, name, interval);
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            match op {
+                ChcOp::Eq => {
+                    return collect_validation_equality_bound_checked(lhs, rhs, env, budget)
                 }
-            }
-            if let (Some(value), Some((name, coeff, offset))) =
-                (lhs.as_i128(), validation_single_var_affine(rhs))
-            {
-                if let Some(interval) = validation_affine_exact_interval(coeff, offset, value) {
-                    return add_validation_interval(env, name, interval);
-                }
-            }
-            if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
-                return add_validation_interval(env, name, ValidationInterval::exact(value));
-            }
-            if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
-                return add_validation_interval(env, name, ValidationInterval::exact(value));
-            }
-            if let Some(name) = int_var_name(lhs) {
-                if let Some(interval) = validation_expr_interval(rhs, env) {
-                    if interval.has_bound() {
-                        return add_validation_interval(env, name, interval);
+                ChcOp::Le => {
+                    if let (Some((name, coeff, offset)), Some(value)) =
+                        (validation_single_var_affine(lhs, budget)?, rhs.as_i128())
+                    {
+                        if let Some(interval) =
+                            validation_affine_upper_interval(coeff, offset, value)
+                        {
+                            return Ok(add_validation_interval(env, name, interval));
+                        }
+                    }
+                    if let (Some(value), Some((name, coeff, offset))) =
+                        (lhs.as_i128(), validation_single_var_affine(rhs, budget)?)
+                    {
+                        if let Some(interval) =
+                            validation_affine_lower_interval(coeff, offset, value)
+                        {
+                            return Ok(add_validation_interval(env, name, interval));
+                        }
+                    }
+                    if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
+                        return Ok(add_validation_interval(
+                            env,
+                            name,
+                            ValidationInterval::upper(value),
+                        ));
+                    }
+                    if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
+                        return Ok(add_validation_interval(
+                            env,
+                            name,
+                            ValidationInterval::lower(value),
+                        ));
                     }
                 }
-            }
-            if let Some(name) = int_var_name(rhs) {
-                if let Some(interval) = validation_expr_interval(lhs, env) {
-                    if interval.has_bound() {
-                        return add_validation_interval(env, name, interval);
+                ChcOp::Lt => {
+                    if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
+                        return Ok(value.checked_sub(1).is_some_and(|upper| {
+                            add_validation_interval(env, name, ValidationInterval::upper(upper))
+                        }));
+                    }
+                    if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
+                        return Ok(value.checked_add(1).is_some_and(|lower| {
+                            add_validation_interval(env, name, ValidationInterval::lower(lower))
+                        }));
                     }
                 }
+                ChcOp::Ge => {
+                    return collect_validation_direct_bound_checked(
+                        ChcOp::Le,
+                        rhs,
+                        lhs,
+                        env,
+                        budget,
+                    )
+                }
+                ChcOp::Gt => {
+                    return collect_validation_direct_bound_checked(
+                        ChcOp::Lt,
+                        rhs,
+                        lhs,
+                        env,
+                        budget,
+                    )
+                }
+                _ => {}
+            }
+            true
+        })
+    })
+}
+
+fn collect_validation_equality_bound_checked(
+    lhs: &ChcExpr,
+    rhs: &ChcExpr,
+    env: &mut FxHashMap<String, ValidationInterval>,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        if let (Some((name, coeff, offset)), Some(value)) =
+            (validation_single_var_affine(lhs, budget)?, rhs.as_i128())
+        {
+            if let Some(interval) = validation_affine_exact_interval(coeff, offset, value) {
+                return Ok(add_validation_interval(env, name, interval));
             }
         }
-        ChcOp::Le => {
-            if let (Some((name, coeff, offset)), Some(value)) =
-                (validation_single_var_affine(lhs), rhs.as_i128())
-            {
-                if let Some(interval) = validation_affine_upper_interval(coeff, offset, value) {
-                    return add_validation_interval(env, name, interval);
+        if let (Some(value), Some((name, coeff, offset))) =
+            (lhs.as_i128(), validation_single_var_affine(rhs, budget)?)
+        {
+            if let Some(interval) = validation_affine_exact_interval(coeff, offset, value) {
+                return Ok(add_validation_interval(env, name, interval));
+            }
+        }
+        if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
+            return Ok(add_validation_interval(
+                env,
+                name,
+                ValidationInterval::exact(value),
+            ));
+        }
+        if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
+            return Ok(add_validation_interval(
+                env,
+                name,
+                ValidationInterval::exact(value),
+            ));
+        }
+        if let Some(name) = int_var_name(lhs) {
+            if let Some(interval) = validation_expr_interval_checked(rhs, env, budget)? {
+                if interval.has_bound() {
+                    return Ok(add_validation_interval(env, name, interval));
                 }
             }
-            if let (Some(value), Some((name, coeff, offset))) =
-                (lhs.as_i128(), validation_single_var_affine(rhs))
-            {
-                if let Some(interval) = validation_affine_lower_interval(coeff, offset, value) {
-                    return add_validation_interval(env, name, interval);
+        }
+        if let Some(name) = int_var_name(rhs) {
+            if let Some(interval) = validation_expr_interval_checked(lhs, env, budget)? {
+                if interval.has_bound() {
+                    return Ok(add_validation_interval(env, name, interval));
                 }
             }
-            if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
-                return add_validation_interval(env, name, ValidationInterval::upper(value));
-            }
-            if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
-                return add_validation_interval(env, name, ValidationInterval::lower(value));
-            }
         }
-        ChcOp::Lt => {
-            if let (Some(name), Some(value)) = (int_var_name(lhs), rhs.as_i128()) {
-                return value.checked_sub(1).is_some_and(|upper| {
-                    add_validation_interval(env, name, ValidationInterval::upper(upper))
-                });
-            }
-            if let (Some(value), Some(name)) = (lhs.as_i128(), int_var_name(rhs)) {
-                return value.checked_add(1).is_some_and(|lower| {
-                    add_validation_interval(env, name, ValidationInterval::lower(lower))
-                });
-            }
-        }
-        ChcOp::Ge => return collect_validation_direct_bound(ChcOp::Le, rhs, lhs, env),
-        ChcOp::Gt => return collect_validation_direct_bound(ChcOp::Lt, rhs, lhs, env),
-        _ => {}
-    }
-    true
+
+        Ok(true)
+    })
 }
 
 fn propagate_validation_var_bound(
     conjunct: &ChcExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    let simplified = conjunct.simplify_constants();
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    let simplified = budget::simplify(conjunct, budget)?;
     if let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) {
-        return propagate_validation_var_bound_atom(op, lhs, rhs, env);
+        return Ok(propagate_validation_var_bound_atom(op, lhs, rhs, env));
     }
     if let ChcExpr::Op(ChcOp::Not, args) = &simplified {
         if args.len() == 1 {
             if let Some((op, lhs, rhs)) = validation_interval_atom(args[0].as_ref()) {
-                return propagate_validation_var_bound_atom(
+                return Ok(propagate_validation_var_bound_atom(
                     negated_validation_comparison(op),
                     lhs,
                     rhs,
                     env,
-                );
+                ));
             }
         }
     }
-    true
+    Ok(true)
 }
 
 fn propagate_validation_var_bound_atom(
@@ -759,38 +904,51 @@ fn propagate_validation_var_bound_atom(
     }
 }
 
-fn propagate_validation_implication_bound(
+fn propagate_validation_implication_bound_checked(
     conjunct: &ChcExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    let simplified = conjunct.simplify_constants();
-    let ChcExpr::Op(op, args) = &simplified else {
-        return true;
-    };
-    if matches!(op, ChcOp::Implies) && args.len() == 2 {
-        if validation_atom_is_true(args[0].as_ref(), env) {
-            return collect_validation_interval_bound(args[1].as_ref(), env);
-        }
-        return true;
-    }
-    if !matches!(op, ChcOp::Or) || args.len() != 2 {
-        return true;
-    }
-    if let Some((antecedent, consequent)) =
-        validation_or_implication_parts(args[0].as_ref(), args[1].as_ref())
-    {
-        if validation_atom_is_true(antecedent, env) {
-            return collect_validation_interval_bound(consequent, env);
-        }
-    }
-    if let Some((antecedent, consequent)) =
-        validation_or_implication_parts(args[1].as_ref(), args[0].as_ref())
-    {
-        if validation_atom_is_true(antecedent, env) {
-            return collect_validation_interval_bound(consequent, env);
-        }
-    }
-    true
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            let simplified = budget::simplify(conjunct, budget)?;
+            let ChcExpr::Op(op, args) = &simplified else {
+                return Ok(true);
+            };
+            if matches!(op, ChcOp::Implies) && args.len() == 2 {
+                if validation_atom_is_true_checked(args[0].as_ref(), env, budget)? {
+                    return Ok(collect_validation_interval_bound_checked(
+                        args[1].as_ref(),
+                        env,
+                        budget,
+                    )?);
+                }
+                return Ok(true);
+            }
+            if !matches!(op, ChcOp::Or) || args.len() != 2 {
+                return Ok(true);
+            }
+            if let Some((antecedent, consequent)) =
+                validation_or_implication_parts(args[0].as_ref(), args[1].as_ref())
+            {
+                if validation_atom_is_true_checked(antecedent, env, budget)? {
+                    return Ok(collect_validation_interval_bound_checked(
+                        consequent, env, budget,
+                    )?);
+                }
+            }
+            if let Some((antecedent, consequent)) =
+                validation_or_implication_parts(args[1].as_ref(), args[0].as_ref())
+            {
+                if validation_atom_is_true_checked(antecedent, env, budget)? {
+                    return Ok(collect_validation_interval_bound_checked(
+                        consequent, env, budget,
+                    )?);
+                }
+            }
+            true
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -802,48 +960,63 @@ struct ValidationLinearExpr {
 fn propagate_validation_linear_bound(
     conjunct: &ChcExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
-    let simplified = conjunct.simplify_constants();
-    let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) else {
-        return true;
-    };
-    let Some(expr) = validation_linear_expr_sub(lhs, rhs) else {
-        return true;
-    };
-    match op {
-        ChcOp::Eq => {
-            propagate_validation_linear_le(&expr, env)
-                && propagate_validation_linear_le(&validation_linear_expr_scale(&expr, -1), env)
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let simplified = budget::simplify(conjunct, budget)?;
+        let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) else {
+            return Ok(true);
+        };
+        let Some(expr) = validation_linear_expr_sub(lhs, rhs, budget)? else {
+            return Ok(true);
+        };
+        match op {
+            ChcOp::Eq => Ok(propagate_validation_linear_le(&expr, env, budget)?
+                && propagate_validation_linear_le(
+                    &validation_linear_expr_scale(&expr, -1, budget)?,
+                    env,
+                    budget,
+                )?),
+            ChcOp::Le => propagate_validation_linear_le(&expr, env, budget),
+            ChcOp::Ge => propagate_validation_linear_le(
+                &validation_linear_expr_scale(&expr, -1, budget)?,
+                env,
+                budget,
+            ),
+            ChcOp::Lt => propagate_validation_linear_le(
+                &validation_linear_expr_add_constant(&expr, 1, budget)?,
+                env,
+                budget,
+            ),
+            ChcOp::Gt => propagate_validation_linear_le(
+                &validation_linear_expr_add_constant(
+                    &validation_linear_expr_scale(&expr, -1, budget)?,
+                    1,
+                    budget,
+                )?,
+                env,
+                budget,
+            ),
+            _ => Ok(true),
         }
-        ChcOp::Le => propagate_validation_linear_le(&expr, env),
-        ChcOp::Ge => propagate_validation_linear_le(&validation_linear_expr_scale(&expr, -1), env),
-        ChcOp::Lt => {
-            let expr = validation_linear_expr_add_constant(&expr, 1);
-            propagate_validation_linear_le(&expr, env)
-        }
-        ChcOp::Gt => {
-            let expr =
-                validation_linear_expr_add_constant(&validation_linear_expr_scale(&expr, -1), 1);
-            propagate_validation_linear_le(&expr, env)
-        }
-        _ => true,
-    }
+    })
 }
 
 fn propagate_validation_linear_le(
     expr: &ValidationLinearExpr,
     env: &mut FxHashMap<String, ValidationInterval>,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     for (target, coeff) in &expr.coeffs {
+        check(budget)?;
         if *coeff == 0 {
             continue;
         }
-        let Some(other_min) = validation_linear_min_without(expr, target, env) else {
+        let Some(other_min) = validation_linear_min_without(expr, target, env, budget)? else {
             continue;
         };
-        let rhs = match other_min.checked_neg() {
-            Some(value) => value,
-            None => return false,
+        let Some(rhs) = other_min.checked_neg() else {
+            return Ok(false);
         };
         let interval = if *coeff > 0 {
             ValidationInterval::upper(div_floor_i128(rhs, *coeff))
@@ -851,19 +1024,21 @@ fn propagate_validation_linear_le(
             ValidationInterval::lower(div_ceil_i128(rhs, *coeff))
         };
         if !add_validation_interval(env, target, interval) {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 fn validation_linear_min_without(
     expr: &ValidationLinearExpr,
     target: &str,
     env: &FxHashMap<String, ValidationInterval>,
-) -> Option<i128> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<i128>> {
     let mut acc = expr.constant;
     for (name, coeff) in &expr.coeffs {
+        check(budget)?;
         if name == target || *coeff == 0 {
             continue;
         }
@@ -871,38 +1046,47 @@ fn validation_linear_min_without(
             .get(name)
             .copied()
             .unwrap_or_else(ValidationInterval::top);
-        let value = if *coeff > 0 {
-            interval.lower?
+        let value = validation_some!(if *coeff > 0 {
+            interval.lower
         } else {
-            interval.upper?
-        };
-        acc = acc.checked_add(coeff.checked_mul(value)?)?;
+            interval.upper
+        });
+        acc = validation_some!(acc.checked_add(validation_some!(coeff.checked_mul(value))));
     }
-    Some(acc)
+    Ok(Some(acc))
 }
 
-fn validation_linear_expr_sub(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<ValidationLinearExpr> {
-    let lhs = validation_linear_expr(lhs)?;
-    let rhs = validation_linear_expr(rhs)?;
-    Some(validation_linear_expr_add(
+fn validation_linear_expr_sub(
+    lhs: &ChcExpr,
+    rhs: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    let lhs = validation_some!(validation_linear_expr(lhs, budget)?);
+    let rhs = validation_some!(validation_linear_expr(rhs, budget)?);
+    Ok(Some(validation_linear_expr_add(
         &lhs,
-        &validation_linear_expr_scale(&rhs, -1),
-    ))
+        &validation_linear_expr_scale(&rhs, -1, budget)?,
+        budget,
+    )?))
 }
 
-fn validation_linear_expr(expr: &ChcExpr) -> Option<ValidationLinearExpr> {
+fn validation_linear_expr(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    check(budget)?;
     match expr {
-        ChcExpr::Int(value) => Some(ValidationLinearExpr {
+        ChcExpr::Int(value) => Ok(Some(ValidationLinearExpr {
             coeffs: FxHashMap::default(),
             constant: *value,
-        }),
+        })),
         ChcExpr::Var(var) if var.sort == ChcSort::Int => {
             let mut coeffs = FxHashMap::default();
             coeffs.insert(var.name.clone(), 1);
-            Some(ValidationLinearExpr {
+            Ok(Some(ValidationLinearExpr {
                 coeffs,
                 constant: 0,
-            })
+            }))
         }
         ChcExpr::Op(ChcOp::Add, args) => {
             let mut result = ValidationLinearExpr {
@@ -910,41 +1094,50 @@ fn validation_linear_expr(expr: &ChcExpr) -> Option<ValidationLinearExpr> {
                 constant: 0,
             };
             for arg in args {
-                result = validation_linear_expr_add(&result, &validation_linear_expr(arg)?);
+                let value = validation_some!(validation_linear_expr(arg, budget)?);
+                result = validation_linear_expr_add(&result, &value, budget)?;
             }
-            Some(result)
+            Ok(Some(result))
         }
         ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
             let mut iter = args.iter();
-            let mut result = validation_linear_expr(iter.next()?.as_ref())?;
+            let mut result = validation_some!(validation_linear_expr(
+                validation_some!(iter.next()),
+                budget
+            )?);
             for arg in iter {
+                let value = validation_some!(validation_linear_expr(arg, budget)?);
                 result = validation_linear_expr_add(
                     &result,
-                    &validation_linear_expr_scale(&validation_linear_expr(arg)?, -1),
-                );
+                    &validation_linear_expr_scale(&value, -1, budget)?,
+                    budget,
+                )?;
             }
-            Some(result)
+            Ok(Some(result))
         }
-        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => Some(validation_linear_expr_scale(
-            &validation_linear_expr(args[0].as_ref())?,
-            -1,
-        )),
+        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
+            let value = validation_some!(validation_linear_expr(&args[0], budget)?);
+            Ok(Some(validation_linear_expr_scale(&value, -1, budget)?))
+        }
         ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => match (&*args[0], &*args[1]) {
-            (ChcExpr::Int(coeff), expr) | (expr, ChcExpr::Int(coeff)) => Some(
-                validation_linear_expr_scale(&validation_linear_expr(expr)?, *coeff),
-            ),
-            _ => None,
+            (ChcExpr::Int(coeff), expr) | (expr, ChcExpr::Int(coeff)) => {
+                let value = validation_some!(validation_linear_expr(expr, budget)?);
+                Ok(Some(validation_linear_expr_scale(&value, *coeff, budget)?))
+            }
+            _ => Ok(None),
         },
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 fn validation_linear_expr_add(
     lhs: &ValidationLinearExpr,
     rhs: &ValidationLinearExpr,
-) -> ValidationLinearExpr {
-    let mut coeffs = lhs.coeffs.clone();
+    budget: &SynthesisBudget,
+) -> ValidationResult<ValidationLinearExpr> {
+    let mut coeffs = budget::clone_map(&lhs.coeffs, budget)?;
     for (name, coeff) in &rhs.coeffs {
+        check(budget)?;
         let next = coeffs
             .get(name)
             .copied()
@@ -956,35 +1149,40 @@ fn validation_linear_expr_add(
             coeffs.insert(name.clone(), next);
         }
     }
-    ValidationLinearExpr {
+    Ok(ValidationLinearExpr {
         coeffs,
         constant: lhs.constant.saturating_add(rhs.constant),
-    }
+    })
 }
 
-fn validation_linear_expr_scale(expr: &ValidationLinearExpr, scale: i128) -> ValidationLinearExpr {
-    let coeffs = expr
-        .coeffs
-        .iter()
-        .filter_map(|(name, coeff)| {
-            let scaled = coeff.saturating_mul(scale);
-            (scaled != 0).then_some((name.clone(), scaled))
-        })
-        .collect();
-    ValidationLinearExpr {
+fn validation_linear_expr_scale(
+    expr: &ValidationLinearExpr,
+    scale: i128,
+    budget: &SynthesisBudget,
+) -> ValidationResult<ValidationLinearExpr> {
+    let mut coeffs = FxHashMap::default();
+    for (name, coeff) in &expr.coeffs {
+        check(budget)?;
+        let scaled = coeff.saturating_mul(scale);
+        if scaled != 0 {
+            coeffs.insert(name.clone(), scaled);
+        }
+    }
+    Ok(ValidationLinearExpr {
         coeffs,
         constant: expr.constant.saturating_mul(scale),
-    }
+    })
 }
 
 fn validation_linear_expr_add_constant(
     expr: &ValidationLinearExpr,
     constant: i128,
-) -> ValidationLinearExpr {
-    ValidationLinearExpr {
-        coeffs: expr.coeffs.clone(),
+    budget: &SynthesisBudget,
+) -> ValidationResult<ValidationLinearExpr> {
+    Ok(ValidationLinearExpr {
+        coeffs: budget::clone_map(&expr.coeffs, budget)?,
         constant: expr.constant.saturating_add(constant),
-    }
+    })
 }
 
 fn div_floor_i128(numerator: i128, denominator: i128) -> i128 {
@@ -1012,13 +1210,21 @@ fn validation_or_implication_parts<'a>(
     }
 }
 
-fn validation_atom_is_true(expr: &ChcExpr, env: &FxHashMap<String, ValidationInterval>) -> bool {
-    let bool_env = FxHashMap::default();
-    let residue_env = FxHashMap::default();
-    matches!(
-        validation_bool_result(expr, env, &bool_env, &residue_env),
-        Some(true)
-    )
+fn validation_atom_is_true_checked(
+    expr: &ChcExpr,
+    env: &FxHashMap<String, ValidationInterval>,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok({
+            let bool_env = FxHashMap::default();
+            let residue_env = FxHashMap::default();
+            matches!(
+                validation_bool_result_checked(expr, env, &bool_env, &residue_env, budget)?,
+                Some(true)
+            )
+        })
+    })
 }
 
 fn add_validation_interval(
@@ -1039,17 +1245,28 @@ fn add_validation_interval(
 
 fn collect_validation_mod_residues(
     conjuncts: &[ChcExpr],
-) -> Option<FxHashMap<String, (i128, i128)>> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<FxHashMap<String, (i128, i128)>>> {
     let mut residues = FxHashMap::default();
     for conjunct in conjuncts {
-        let simplified = conjunct.simplify_constants();
-        let Some((name, modulus, residue)) = validation_mod_residue_atom(&simplified) else {
+        let simplified = budget::simplify(conjunct, budget)?;
+        let Some((name, modulus, residue)) = validation_mod_residue_atom(&simplified, budget)?
+        else {
             continue;
         };
-        add_validation_mod_residue(&mut residues, &name, modulus, residue)?;
+        validation_some!(add_validation_mod_residue(
+            &mut residues,
+            &name,
+            modulus,
+            residue
+        ));
     }
-    propagate_validation_mod_residue_equalities(conjuncts, &mut residues)?;
-    Some(residues)
+    validation_some!(propagate_validation_mod_residue_equalities(
+        conjuncts,
+        &mut residues,
+        budget
+    )?);
+    Ok(Some(residues))
 }
 
 fn add_validation_mod_residue(
@@ -1090,22 +1307,26 @@ fn add_validation_mod_residue(
 fn propagate_validation_mod_residue_equalities(
     conjuncts: &[ChcExpr],
     residues: &mut FxHashMap<String, (i128, i128)>,
-) -> Option<()> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<()>> {
     let max_rounds = conjuncts.len().saturating_add(4).clamp(1, 32);
     for _ in 0..max_rounds {
-        let before = residues.clone();
+        check(budget)?;
+        let before = budget::clone_map(residues, budget)?;
         for conjunct in conjuncts {
-            let simplified = conjunct.simplify_constants();
+            let simplified = budget::simplify(conjunct, budget)?;
             let Some((ChcOp::Eq, lhs, rhs)) = validation_interval_atom(&simplified) else {
                 continue;
             };
-            propagate_validation_mod_residue_equality(lhs, rhs, residues)?;
+            validation_some!(propagate_validation_mod_residue_equality(
+                lhs, rhs, residues, budget
+            )?);
         }
         if *residues == before {
             break;
         }
     }
-    Some(())
+    Ok(Some(()))
 }
 
 struct ValidationUnitAffineEquality {
@@ -1120,59 +1341,65 @@ fn propagate_validation_mod_residue_equality(
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     residues: &mut FxHashMap<String, (i128, i128)>,
-) -> Option<()> {
-    let Some(expr) = validation_unit_affine_equality(lhs, rhs) else {
-        return Some(());
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<()>> {
+    let Some(expr) = validation_unit_affine_equality(lhs, rhs, budget)? else {
+        return Ok(Some(()));
     };
-    let vars = [
-        (expr.lhs_name.as_str(), expr.lhs_coeff),
-        (expr.rhs_name.as_str(), expr.rhs_coeff),
-    ];
+    Ok((|| {
+        let vars = [
+            (expr.lhs_name.as_str(), expr.lhs_coeff),
+            (expr.rhs_name.as_str(), expr.rhs_coeff),
+        ];
 
-    let mut inferred = Vec::new();
-    for target_idx in 0..2 {
-        let (target, target_coeff) = vars[target_idx];
-        let (source, source_coeff) = vars[1 - target_idx];
-        if !matches!(target_coeff, -1 | 1) || !matches!(source_coeff, -1 | 1) {
-            continue;
+        let mut inferred = Vec::new();
+        for target_idx in 0..2 {
+            let (target, target_coeff) = vars[target_idx];
+            let (source, source_coeff) = vars[1 - target_idx];
+            if !matches!(target_coeff, -1 | 1) || !matches!(source_coeff, -1 | 1) {
+                continue;
+            }
+            let Some((modulus, source_residue)) = residues.get(source).copied() else {
+                continue;
+            };
+            let Some(target_residue) = validation_unit_equality_residue(
+                target_coeff,
+                source_coeff,
+                expr.constant,
+                modulus,
+                source_residue,
+            ) else {
+                continue;
+            };
+            inferred.push((target.to_string(), modulus, target_residue));
         }
-        let Some((modulus, source_residue)) = residues.get(source).copied() else {
-            continue;
-        };
-        let Some(target_residue) = validation_unit_equality_residue(
-            target_coeff,
-            source_coeff,
-            expr.constant,
-            modulus,
-            source_residue,
-        ) else {
-            continue;
-        };
-        inferred.push((target.to_string(), modulus, target_residue));
-    }
 
-    for (target, modulus, residue) in inferred {
-        add_validation_mod_residue(residues, &target, modulus, residue)?;
-    }
-    Some(())
+        for (target, modulus, residue) in inferred {
+            add_validation_mod_residue(residues, &target, modulus, residue)?;
+        }
+        Some(())
+    })())
 }
 
 fn validation_unit_affine_equality(
     lhs: &ChcExpr,
     rhs: &ChcExpr,
-) -> Option<ValidationUnitAffineEquality> {
-    let (lhs_name, lhs_coeff, lhs_offset) = validation_single_var_affine(lhs)?;
-    let (rhs_name, rhs_coeff, rhs_offset) = validation_single_var_affine(rhs)?;
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationUnitAffineEquality>> {
+    let (lhs_name, lhs_coeff, lhs_offset) =
+        validation_some!(validation_single_var_affine(lhs, budget)?);
+    let (rhs_name, rhs_coeff, rhs_offset) =
+        validation_some!(validation_single_var_affine(rhs, budget)?);
     if lhs_name == rhs_name {
-        return None;
+        return Ok(None);
     }
-    Some(ValidationUnitAffineEquality {
+    Ok(Some(ValidationUnitAffineEquality {
         lhs_name: lhs_name.to_string(),
         lhs_coeff,
         rhs_name: rhs_name.to_string(),
-        rhs_coeff: rhs_coeff.checked_neg()?,
-        constant: lhs_offset.checked_sub(rhs_offset)?,
-    })
+        rhs_coeff: validation_some!(rhs_coeff.checked_neg()),
+        constant: validation_some!(lhs_offset.checked_sub(rhs_offset)),
+    }))
 }
 
 fn validation_unit_equality_residue(
@@ -1209,21 +1436,24 @@ fn validation_gcd_i128(mut a: i128, mut b: i128) -> i128 {
     a
 }
 
-fn validation_mod_residue_atom(expr: &ChcExpr) -> Option<(String, i128, i128)> {
+fn validation_mod_residue_atom(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i128, i128)>> {
     let ChcExpr::Op(ChcOp::Eq, args) = expr else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
     match (&*args[0], &*args[1]) {
-        (ChcExpr::Op(ChcOp::Mod, mod_args), ChcExpr::Int(residue)) if mod_args.len() == 2 => {
-            validation_mod_residue_from_parts(mod_args[0].as_ref(), mod_args[1].as_ref(), *residue)
+        (ChcExpr::Op(ChcOp::Mod, mod_args), ChcExpr::Int(residue))
+        | (ChcExpr::Int(residue), ChcExpr::Op(ChcOp::Mod, mod_args))
+            if mod_args.len() == 2 =>
+        {
+            validation_mod_residue_from_parts(&mod_args[0], &mod_args[1], *residue, budget)
         }
-        (ChcExpr::Int(residue), ChcExpr::Op(ChcOp::Mod, mod_args)) if mod_args.len() == 2 => {
-            validation_mod_residue_from_parts(mod_args[0].as_ref(), mod_args[1].as_ref(), *residue)
-        }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1231,26 +1461,34 @@ fn validation_mod_residue_from_parts(
     term: &ChcExpr,
     modulus_expr: &ChcExpr,
     residue: i128,
-) -> Option<(String, i128, i128)> {
-    let modulus = modulus_expr.as_i128()?;
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, i128, i128)>> {
+    let modulus = validation_some!(modulus_expr.as_i128());
     if modulus <= 1 {
-        return None;
+        return Ok(None);
     }
-    let (name, offset) = validation_single_var_offset(term)?;
-    Some((name.to_string(), modulus, residue - offset))
+    let (name, offset) = validation_some!(validation_single_var_offset(term, budget)?);
+    Ok(Some((name.to_string(), modulus, residue - offset)))
 }
 
-fn validation_single_var_offset(expr: &ChcExpr) -> Option<(&str, i128)> {
-    let (name, coeff, offset) = validation_single_var_affine(expr)?;
-    (coeff == 1).then_some((name, offset))
+fn validation_single_var_offset<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a str, i128)>> {
+    let (name, coeff, offset) = validation_some!(validation_single_var_affine(expr, budget)?);
+    Ok((coeff == 1).then_some((name, offset)))
 }
 
-fn validation_single_var_affine(expr: &ChcExpr) -> Option<(&str, i128, i128)> {
+fn validation_single_var_affine<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a str, i128, i128)>> {
+    check(budget)?;
     if let Some(name) = int_var_name(expr) {
-        return Some((name, 1, 0));
+        return Ok(Some((name, 1, 0)));
     }
     let ChcExpr::Op(op, args) = expr else {
-        return None;
+        return Ok(None);
     };
     match op {
         ChcOp::Add => {
@@ -1258,47 +1496,59 @@ fn validation_single_var_affine(expr: &ChcExpr) -> Option<(&str, i128, i128)> {
             let mut coeff = 0i128;
             let mut offset = 0i128;
             for arg in args {
+                check(budget)?;
                 if let Some(value) = arg.as_i128() {
-                    offset = offset.checked_add(value)?;
+                    offset = validation_some!(offset.checked_add(value));
                 } else if let Some((arg_name, arg_coeff, arg_offset)) =
-                    validation_single_var_affine(arg.as_ref())
+                    validation_single_var_affine(arg, budget)?
                 {
                     if let Some(existing) = name {
                         if existing != arg_name {
-                            return None;
+                            return Ok(None);
                         }
                     } else {
                         name = Some(arg_name);
                     }
-                    coeff = coeff.checked_add(arg_coeff)?;
-                    offset = offset.checked_add(arg_offset)?;
+                    coeff = validation_some!(coeff.checked_add(arg_coeff));
+                    offset = validation_some!(offset.checked_add(arg_offset));
                     if !matches!(coeff, -1..=1) {
-                        return None;
+                        return Ok(None);
                     }
                 } else {
-                    return None;
+                    return Ok(None);
                 }
             }
-            name.and_then(|name| (coeff != 0).then_some((name, coeff, offset)))
+            Ok(name.and_then(|name| (coeff != 0).then_some((name, coeff, offset))))
         }
         ChcOp::Sub if args.len() == 2 => {
-            let (lhs_name, lhs_coeff, lhs_offset) = validation_single_var_affine(args[0].as_ref())?;
+            let (lhs_name, lhs_coeff, lhs_offset) =
+                validation_some!(validation_single_var_affine(&args[0], budget)?);
             if let Some(rhs_value) = args[1].as_i128() {
-                return Some((lhs_name, lhs_coeff, lhs_offset.checked_sub(rhs_value)?));
+                return Ok(Some((
+                    lhs_name,
+                    lhs_coeff,
+                    validation_some!(lhs_offset.checked_sub(rhs_value)),
+                )));
             }
-            let (rhs_name, rhs_coeff, rhs_offset) = validation_single_var_affine(args[1].as_ref())?;
+            let (rhs_name, rhs_coeff, rhs_offset) =
+                validation_some!(validation_single_var_affine(&args[1], budget)?);
             if lhs_name != rhs_name {
-                return None;
+                return Ok(None);
             }
-            let coeff = lhs_coeff.checked_sub(rhs_coeff)?;
-            let offset = lhs_offset.checked_sub(rhs_offset)?;
-            (coeff != 0 && matches!(coeff, -1 | 1)).then_some((lhs_name, coeff, offset))
+            let coeff = validation_some!(lhs_coeff.checked_sub(rhs_coeff));
+            let offset = validation_some!(lhs_offset.checked_sub(rhs_offset));
+            Ok((coeff != 0 && matches!(coeff, -1 | 1)).then_some((lhs_name, coeff, offset)))
         }
         ChcOp::Neg if args.len() == 1 => {
-            let (name, coeff, offset) = validation_single_var_affine(args[0].as_ref())?;
-            Some((name, coeff.checked_neg()?, offset.checked_neg()?))
+            let (name, coeff, offset) =
+                validation_some!(validation_single_var_affine(&args[0], budget)?);
+            Ok(Some((
+                name,
+                validation_some!(coeff.checked_neg()),
+                validation_some!(offset.checked_neg()),
+            )))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1341,18 +1591,20 @@ fn validation_affine_lower_interval(
 fn refine_validation_intervals_with_residues(
     env: &mut FxHashMap<String, ValidationInterval>,
     residues: &FxHashMap<String, (i128, i128)>,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     for (name, (modulus, residue)) in residues {
+        check(budget)?;
         let Some(current) = env.get(name).copied() else {
             continue;
         };
         let refined = refine_validation_interval_to_residue(current, *modulus, *residue);
         if refined.is_empty() {
-            return false;
+            return Ok(false);
         }
         env.insert(name.clone(), refined);
     }
-    true
+    Ok(true)
 }
 
 fn refine_validation_interval_to_residue(
@@ -1375,20 +1627,26 @@ fn refine_validation_interval_to_residue(
     ValidationInterval { lower, upper }
 }
 
-fn collect_validation_bool_assignments(conjuncts: &[ChcExpr]) -> Option<FxHashMap<String, bool>> {
+fn collect_validation_bool_assignments(
+    conjuncts: &[ChcExpr],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<FxHashMap<String, bool>>> {
     let mut env = FxHashMap::default();
     for conjunct in conjuncts {
-        collect_validation_bool_assignment(conjunct, &mut env)?;
+        validation_some!(collect_validation_bool_assignment(
+            conjunct, &mut env, budget
+        )?);
     }
-    Some(env)
+    Ok(Some(env))
 }
 
 fn collect_validation_bool_assignment(
     conjunct: &ChcExpr,
     env: &mut FxHashMap<String, bool>,
-) -> Option<()> {
-    let simplified = conjunct.simplify_constants();
-    match &simplified {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<()>> {
+    let simplified = budget::simplify(conjunct, budget)?;
+    Ok(match &simplified {
         ChcExpr::Var(var) if var.sort == ChcSort::Bool => {
             add_validation_bool_assignment(env, &var.name, true)
         }
@@ -1404,17 +1662,17 @@ fn collect_validation_bool_assignment(
             if let (Some(name), ChcExpr::Bool(value)) =
                 (bool_var_name(args[0].as_ref()), args[1].as_ref())
             {
-                return add_validation_bool_assignment(env, name, *value ^ negated);
+                return Ok(add_validation_bool_assignment(env, name, *value ^ negated));
             }
             if let (ChcExpr::Bool(value), Some(name)) =
                 (args[0].as_ref(), bool_var_name(args[1].as_ref()))
             {
-                return add_validation_bool_assignment(env, name, *value ^ negated);
+                return Ok(add_validation_bool_assignment(env, name, *value ^ negated));
             }
             Some(())
         }
         _ => Some(()),
-    }
+    })
 }
 
 fn add_validation_bool_assignment(
@@ -1431,196 +1689,211 @@ fn add_validation_bool_assignment(
     Some(())
 }
 
-fn validation_bool_result(
+fn validation_bool_result_checked(
     expr: &ChcExpr,
     int_env: &FxHashMap<String, ValidationInterval>,
     bool_env: &FxHashMap<String, bool>,
     residue_env: &FxHashMap<String, (i128, i128)>,
-) -> Option<bool> {
-    let simplified = expr.simplify_constants();
-    match &simplified {
-        ChcExpr::Bool(value) => Some(*value),
-        ChcExpr::Var(var) if var.sort == ChcSort::Bool => bool_env.get(&var.name).copied(),
-        ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => Some(!validation_bool_result(
-            args[0].as_ref(),
-            int_env,
-            bool_env,
-            residue_env,
-        )?),
-        ChcExpr::Op(ChcOp::And, args) => {
-            let mut all_true = true;
-            for arg in args {
-                match validation_bool_result(arg.as_ref(), int_env, bool_env, residue_env) {
-                    Some(false) => return Some(false),
-                    Some(true) => {}
-                    None => all_true = false,
-                }
-            }
-            all_true.then_some(true)
-        }
-        ChcExpr::Op(ChcOp::Or, args) => {
-            let mut all_false = true;
-            for arg in args {
-                match validation_bool_result(arg.as_ref(), int_env, bool_env, residue_env) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => all_false = false,
-                }
-            }
-            all_false.then_some(false)
-        }
-        ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
-            if let Some(condition) =
-                validation_bool_result(args[0].as_ref(), int_env, bool_env, residue_env)
-            {
-                return validation_bool_result(
-                    args[if condition { 1 } else { 2 }].as_ref(),
-                    int_env,
-                    bool_env,
-                    residue_env,
-                );
-            }
-            let then_result =
-                validation_bool_result(args[1].as_ref(), int_env, bool_env, residue_env);
-            let else_result =
-                validation_bool_result(args[2].as_ref(), int_env, bool_env, residue_env);
-            if then_result.is_some() && then_result == else_result {
-                return then_result;
-            }
-            validation_same_condition_nested_ite_result(
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
+    budget::run(budget, || {
+        let simplified = budget::simplify(expr, budget)?;
+        check(budget)?;
+        Ok(match &simplified {
+            ChcExpr::Bool(value) => Some(*value),
+            ChcExpr::Var(var) if var.sort == ChcSort::Bool => bool_env.get(&var.name).copied(),
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => validation_bool_result_checked(
                 args[0].as_ref(),
-                args[1].as_ref(),
-                args[2].as_ref(),
                 int_env,
                 bool_env,
                 residue_env,
-            )
-        }
-        ChcExpr::Op(op @ (ChcOp::Eq | ChcOp::Ne), args) if args.len() == 2 => {
-            let negated = matches!(*op, ChcOp::Ne);
+                budget,
+            )?
+            .map(|value| !value),
+            ChcExpr::Op(ChcOp::And, args) => {
+                let mut all_true = true;
+                for arg in args {
+                    match validation_bool_result_checked(
+                        arg,
+                        int_env,
+                        bool_env,
+                        residue_env,
+                        budget,
+                    )? {
+                        Some(false) => return Ok(Some(false)),
+                        Some(true) => {}
+                        None => all_true = false,
+                    }
+                }
+                all_true.then_some(true)
+            }
+            ChcExpr::Op(ChcOp::Or, args) => {
+                let mut all_false = true;
+                for arg in args {
+                    match validation_bool_result_checked(
+                        arg,
+                        int_env,
+                        bool_env,
+                        residue_env,
+                        budget,
+                    )? {
+                        Some(true) => return Ok(Some(true)),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                all_false.then_some(false)
+            }
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                ite_eval::validation_ite_eval_checked(args, int_env, bool_env, residue_env, budget)?
+                    .value
+            }
+            ChcExpr::Op(op @ (ChcOp::Eq | ChcOp::Ne), args) if args.len() == 2 => {
+                validation_equality_result_checked(
+                    *op,
+                    args,
+                    int_env,
+                    bool_env,
+                    residue_env,
+                    budget,
+                )?
+            }
+            ChcExpr::Op(op @ (ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge), args)
+                if args.len() == 2 =>
+            {
+                if let Some(result) = validation_interval_compare_result_checked(
+                    *op,
+                    args[0].as_ref(),
+                    args[1].as_ref(),
+                    int_env,
+                    budget,
+                )? {
+                    return Ok(Some(result));
+                }
+                if validation_bounded_increment_wrap_comparison_is_false(
+                    *op,
+                    args[0].as_ref(),
+                    args[1].as_ref(),
+                    int_env,
+                    budget,
+                )? {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    })
+}
+
+fn validation_equality_result_checked(
+    op: ChcOp,
+    args: &[std::sync::Arc<ChcExpr>],
+    int_env: &FxHashMap<String, ValidationInterval>,
+    bool_env: &FxHashMap<String, bool>,
+    residue_env: &FxHashMap<String, (i128, i128)>,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
+    budget::run(budget, || {
+        Ok({
+            let negated = matches!(op, ChcOp::Ne);
             if let (Some(lhs), Some(rhs)) = (
-                validation_bool_result(args[0].as_ref(), int_env, bool_env, residue_env),
-                validation_bool_result(args[1].as_ref(), int_env, bool_env, residue_env),
+                validation_bool_result_checked(
+                    args[0].as_ref(),
+                    int_env,
+                    bool_env,
+                    residue_env,
+                    budget,
+                )?,
+                validation_bool_result_checked(
+                    args[1].as_ref(),
+                    int_env,
+                    bool_env,
+                    residue_env,
+                    budget,
+                )?,
             ) {
-                return Some((lhs == rhs) ^ negated);
+                return Ok(Some((lhs == rhs) ^ negated));
             }
             if let Some(result) =
                 bool_bitvec_sign_extract_eq_result(args[0].as_ref(), args[1].as_ref())
             {
-                return Some(result ^ negated);
+                return Ok(Some(result ^ negated));
             }
-            if let Some(result) =
-                validation_mod_compare_result(args[0].as_ref(), args[1].as_ref(), residue_env)
-            {
-                return Some(result ^ negated);
+            if let Some(result) = validation_mod_compare_result(
+                args[0].as_ref(),
+                args[1].as_ref(),
+                residue_env,
+                budget,
+            )? {
+                return Ok(Some(result ^ negated));
             }
-            if let Some(result) = validation_interval_compare_result(
+            validation_interval_compare_result_checked(
                 ChcOp::Eq,
                 args[0].as_ref(),
                 args[1].as_ref(),
                 int_env,
-            ) {
-                return Some(result ^ negated);
-            }
-            None
-        }
-        ChcExpr::Op(op @ (ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge), args)
-            if args.len() == 2 =>
-        {
-            if let Some(result) =
-                validation_interval_compare_result(*op, args[0].as_ref(), args[1].as_ref(), int_env)
-            {
-                return Some(result);
-            }
-            if validation_bounded_increment_wrap_comparison_is_false(
-                *op,
-                args[0].as_ref(),
-                args[1].as_ref(),
-                int_env,
-            ) {
-                return Some(false);
-            }
-            None
-        }
-        _ => None,
-    }
+                budget,
+            )?
+            .map(|result| result ^ negated)
+        })
+    })
 }
 
-fn validation_static_bool_result(expr: &ChcExpr) -> Option<bool> {
-    let simplified = expr.simplify_constants();
-    match &simplified {
-        ChcExpr::Bool(value) => Some(*value),
-        ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
-            Some(!validation_static_bool_result(args[0].as_ref())?)
-        }
-        ChcExpr::Op(ChcOp::And, args) => {
-            let mut all_true = true;
-            for arg in args {
-                match validation_static_bool_result(arg.as_ref()) {
-                    Some(false) => return Some(false),
-                    Some(true) => {}
-                    None => all_true = false,
-                }
+fn validation_static_bool_result_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
+    budget::run(budget, || {
+        let simplified = budget::simplify(expr, budget)?;
+        check(budget)?;
+        Ok(match &simplified {
+            ChcExpr::Bool(value) => Some(*value),
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
+                validation_static_bool_result_checked(args[0].as_ref(), budget)?.map(|value| !value)
             }
-            all_true.then_some(true)
-        }
-        ChcExpr::Op(ChcOp::Or, args) => {
-            let mut all_false = true;
-            for arg in args {
-                match validation_static_bool_result(arg.as_ref()) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => all_false = false,
+            ChcExpr::Op(ChcOp::And, args) => {
+                let mut all_true = true;
+                for arg in args {
+                    match validation_static_bool_result_checked(arg, budget)? {
+                        Some(false) => return Ok(Some(false)),
+                        Some(true) => {}
+                        None => all_true = false,
+                    }
                 }
+                all_true.then_some(true)
             }
-            all_false.then_some(false)
-        }
-        ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
-            let condition = validation_static_bool_result(args[0].as_ref())?;
-            validation_static_bool_result(args[if condition { 1 } else { 2 }].as_ref())
-        }
-        ChcExpr::Op(op @ (ChcOp::Eq | ChcOp::Ne), args) if args.len() == 2 => {
-            let negated = matches!(*op, ChcOp::Ne);
-            if let Some(result) =
+            ChcExpr::Op(ChcOp::Or, args) => {
+                let mut all_false = true;
+                for arg in args {
+                    match validation_static_bool_result_checked(arg, budget)? {
+                        Some(true) => return Ok(Some(true)),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                all_false.then_some(false)
+            }
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                let Some(condition) =
+                    validation_static_bool_result_checked(args[0].as_ref(), budget)?
+                else {
+                    return Ok(None);
+                };
+                validation_static_bool_result_checked(
+                    args[if condition { 1 } else { 2 }].as_ref(),
+                    budget,
+                )?
+            }
+            ChcExpr::Op(op @ (ChcOp::Eq | ChcOp::Ne), args) if args.len() == 2 => {
+                let negated = matches!(*op, ChcOp::Ne);
                 bool_bitvec_sign_extract_eq_result(args[0].as_ref(), args[1].as_ref())
-            {
-                return Some(result ^ negated);
+                    .map(|value| value ^ negated)
             }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn validation_same_condition_nested_ite_result(
-    condition: &ChcExpr,
-    then_expr: &ChcExpr,
-    else_expr: &ChcExpr,
-    int_env: &FxHashMap<String, ValidationInterval>,
-    bool_env: &FxHashMap<String, bool>,
-    residue_env: &FxHashMap<String, (i128, i128)>,
-) -> Option<bool> {
-    let condition_key = validation_expr_key(condition);
-    let then_selected = validation_nested_ite_branch_for_condition(then_expr, &condition_key, true);
-    let else_selected =
-        validation_nested_ite_branch_for_condition(else_expr, &condition_key, false);
-    let then_result = validation_bool_result(then_selected, int_env, bool_env, residue_env)?;
-    let else_result = validation_bool_result(else_selected, int_env, bool_env, residue_env)?;
-    (then_result == else_result).then_some(then_result)
-}
-
-fn validation_nested_ite_branch_for_condition<'a>(
-    expr: &'a ChcExpr,
-    condition_key: &str,
-    condition_value: bool,
-) -> &'a ChcExpr {
-    let ChcExpr::Op(ChcOp::Ite, args) = expr else {
-        return expr;
-    };
-    if args.len() != 3 || validation_expr_key(args[0].as_ref()) != condition_key {
-        return expr;
-    }
-    args[if condition_value { 1 } else { 2 }].as_ref()
+            _ => None,
+        })
+    })
 }
 
 fn validation_bounded_increment_wrap_comparison_is_false(
@@ -1628,118 +1901,130 @@ fn validation_bounded_increment_wrap_comparison_is_false(
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     env: &FxHashMap<String, ValidationInterval>,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     let lhs = match op {
         ChcOp::Lt => lhs,
         ChcOp::Le => {
             let Some(stripped) = strip_plus_one(lhs) else {
-                return false;
+                return Ok(false);
             };
             stripped
         }
-        _ => return false,
+        _ => return Ok(false),
     };
-    let Some((name, modulus)) = increment_mod_less_than_base_pattern(lhs, rhs) else {
-        return false;
+    let Some((name, modulus)) = increment_mod_less_than_base_pattern(lhs, rhs, budget)? else {
+        return Ok(false);
     };
     let Some(interval) = env.get(name) else {
-        return false;
+        return Ok(false);
     };
     let (Some(lower), Some(upper)) = (interval.lower, interval.upper) else {
-        return false;
+        return Ok(false);
     };
     if lower < 0 {
-        return false;
+        return Ok(false);
     }
     let Ok(upper) = u128::try_from(upper) else {
-        return false;
+        return Ok(false);
     };
     let Some(last_residue) = modulus.checked_sub(1) else {
-        return false;
+        return Ok(false);
     };
-    upper < last_residue
+    Ok(upper < last_residue)
 }
 
 fn validation_mod_compare_result(
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     residues: &FxHashMap<String, (i128, i128)>,
-) -> Option<bool> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
     if let (Some(lhs_residue), Some(rhs_value)) = (
-        validation_mod_expr_known_residue(lhs, residues),
+        validation_mod_expr_known_residue(lhs, residues, budget)?,
         rhs.as_i128(),
     ) {
-        return Some(lhs_residue == rhs_value);
+        return Ok(Some(lhs_residue == rhs_value));
     }
     if let (Some(lhs_value), Some(rhs_residue)) = (
         lhs.as_i128(),
-        validation_mod_expr_known_residue(rhs, residues),
+        validation_mod_expr_known_residue(rhs, residues, budget)?,
     ) {
-        return Some(lhs_value == rhs_residue);
+        return Ok(Some(lhs_value == rhs_residue));
     }
-    None
+    Ok(None)
 }
 
 fn validation_mod_expr_known_residue(
     expr: &ChcExpr,
     residues: &FxHashMap<String, (i128, i128)>,
-) -> Option<i128> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<i128>> {
     let ChcExpr::Op(ChcOp::Mod, args) = expr else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    let modulus = args[1].as_i128()?;
+    let modulus = validation_some!(args[1].as_i128());
     if modulus <= 1 {
-        return None;
+        return Ok(None);
     }
-    let (name, offset) = validation_single_var_offset(args[0].as_ref())?;
-    let (known_modulus, residue) = residues.get(name)?;
+    let (name, offset) = validation_some!(validation_single_var_offset(&args[0], budget)?);
+    let (known_modulus, residue) = validation_some!(residues.get(name));
     if *known_modulus != modulus && *known_modulus % modulus != 0 {
-        return None;
+        return Ok(None);
     }
-    Some((*residue + offset).rem_euclid(modulus))
+    Ok(Some((*residue + offset).rem_euclid(modulus)))
 }
 
 fn increment_mod_less_than_base_pattern<'a>(
     lhs: &'a ChcExpr,
     rhs: &'a ChcExpr,
-) -> Option<(&'a str, u128)> {
-    let (lhs_inner, lhs_modulus) = outer_mod(lhs)?;
-    let (rhs_inner, rhs_modulus) = outer_mod(rhs)?;
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a str, u128)>> {
+    let (lhs_inner, lhs_modulus) = validation_some!(outer_mod(lhs, budget)?);
+    let (rhs_inner, rhs_modulus) = validation_some!(outer_mod(rhs, budget)?);
     if lhs_modulus != rhs_modulus || lhs_modulus <= 1 {
-        return None;
+        return Ok(None);
     }
-    let lhs_name = add_one_int_var_name(lhs_inner)?;
-    let rhs_name = int_var_name(rhs_inner)?;
-    (lhs_name == rhs_name).then_some((lhs_name, lhs_modulus))
+    let lhs_name = validation_some!(add_one_int_var_name(lhs_inner));
+    let rhs_name = validation_some!(int_var_name(rhs_inner));
+    Ok((lhs_name == rhs_name).then_some((lhs_name, lhs_modulus)))
 }
 
-fn outer_mod(expr: &ChcExpr) -> Option<(&ChcExpr, u128)> {
+fn outer_mod<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a ChcExpr, u128)>> {
     let ChcExpr::Op(ChcOp::Mod, args) = expr else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    let modulus = eval_validation_nonnegative_const_u128(args[1].as_ref(), 0)?;
+    let modulus = validation_some!(eval_validation_nonnegative_const_u128(&args[1], 0, budget)?);
     if modulus == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((strip_same_mod(args[0].as_ref(), modulus), modulus))
+    Ok(Some((strip_same_mod(&args[0], modulus, budget)?, modulus)))
 }
 
-fn strip_same_mod(mut expr: &ChcExpr, modulus: u128) -> &ChcExpr {
+fn strip_same_mod<'a>(
+    mut expr: &'a ChcExpr,
+    modulus: u128,
+    budget: &SynthesisBudget,
+) -> ValidationResult<&'a ChcExpr> {
     while let ChcExpr::Op(ChcOp::Mod, args) = expr {
+        check(budget)?;
         if args.len() != 2
-            || eval_validation_nonnegative_const_u128(args[1].as_ref(), 0) != Some(modulus)
+            || eval_validation_nonnegative_const_u128(&args[1], 0, budget)? != Some(modulus)
         {
             break;
         }
-        expr = args[0].as_ref();
+        expr = &args[0];
     }
-    expr
+    Ok(expr)
 }
 
 fn add_one_int_var_name(expr: &ChcExpr) -> Option<&str> {
@@ -1774,51 +2059,82 @@ fn strip_plus_one(expr: &ChcExpr) -> Option<&ChcExpr> {
     None
 }
 
-fn eval_validation_nonnegative_const_u128(expr: &ChcExpr, depth: usize) -> Option<u128> {
+fn eval_validation_nonnegative_const_u128(
+    expr: &ChcExpr,
+    depth: usize,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<u128>> {
+    check(budget)?;
     if depth >= MAX_EXPR_RECURSION_DEPTH {
-        return None;
+        return Ok(None);
     }
     maybe_grow_expr_stack(|| match expr {
-        ChcExpr::Int(n) if *n >= 0 => Some(*n as u128),
-        ChcExpr::Op(ChcOp::Add, args) => {
-            let mut acc = 0u128;
+        ChcExpr::Int(n) if *n >= 0 => Ok(Some(*n as u128)),
+        ChcExpr::Op(op @ (ChcOp::Add | ChcOp::Mul), args) => {
+            let mut acc = if *op == ChcOp::Add { 0u128 } else { 1u128 };
             for arg in args {
-                acc = acc.checked_add(eval_validation_nonnegative_const_u128(arg, depth + 1)?)?;
+                let value = validation_some!(eval_validation_nonnegative_const_u128(
+                    arg,
+                    depth + 1,
+                    budget
+                )?);
+                acc = validation_some!(if *op == ChcOp::Add {
+                    acc.checked_add(value)
+                } else {
+                    acc.checked_mul(value)
+                });
             }
-            Some(acc)
+            Ok(Some(acc))
         }
-        ChcExpr::Op(ChcOp::Mul, args) => {
-            let mut acc = 1u128;
-            for arg in args {
-                acc = acc.checked_mul(eval_validation_nonnegative_const_u128(arg, depth + 1)?)?;
-            }
-            Some(acc)
+        ChcExpr::Op(op @ (ChcOp::Sub | ChcOp::Mod), args) if args.len() == 2 => {
+            let lhs = validation_some!(eval_validation_nonnegative_const_u128(
+                &args[0],
+                depth + 1,
+                budget
+            )?);
+            let rhs = validation_some!(eval_validation_nonnegative_const_u128(
+                &args[1],
+                depth + 1,
+                budget
+            )?);
+            Ok(if *op == ChcOp::Sub {
+                lhs.checked_sub(rhs)
+            } else {
+                lhs.checked_rem(rhs)
+            })
         }
-        ChcExpr::Op(ChcOp::Sub, args) if args.len() == 2 => {
-            let lhs = eval_validation_nonnegative_const_u128(args[0].as_ref(), depth + 1)?;
-            let rhs = eval_validation_nonnegative_const_u128(args[1].as_ref(), depth + 1)?;
-            lhs.checked_sub(rhs)
-        }
-        ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
-            let lhs = eval_validation_nonnegative_const_u128(args[0].as_ref(), depth + 1)?;
-            let rhs = eval_validation_nonnegative_const_u128(args[1].as_ref(), depth + 1)?;
-            (rhs != 0).then_some(lhs % rhs)
-        }
-        _ => None,
+        _ => Ok(None),
     })
 }
 
-fn validation_interval_compare_result(
+fn validation_interval_compare_result_checked(
     op: ChcOp,
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     env: &FxHashMap<String, ValidationInterval>,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
+    budget::run(budget, || {
+        if let Some(result) =
+            validation_interval_u128_compare_result_checked(op, lhs, rhs, env, budget)?
+        {
+            return Ok(Some(result));
+        }
+        let Some(lhs_interval) = validation_expr_interval_checked(lhs, env, budget)? else {
+            return Ok(None);
+        };
+        let Some(rhs_interval) = validation_expr_interval_checked(rhs, env, budget)? else {
+            return Ok(None);
+        };
+        Ok(compare_validation_intervals(op, lhs_interval, rhs_interval))
+    })
+}
+
+fn compare_validation_intervals(
+    op: ChcOp,
+    lhs_interval: ValidationInterval,
+    rhs_interval: ValidationInterval,
 ) -> Option<bool> {
-    if let Some(result) = validation_interval_u128_compare_result(op, lhs, rhs, env) {
-        return Some(result);
-    }
-    let lhs_interval = validation_expr_interval(lhs, env)?;
-    let rhs_interval = validation_expr_interval(rhs, env)?;
     match op {
         ChcOp::Lt => {
             if lhs_interval.upper? < rhs_interval.lower? {
@@ -1901,25 +2217,28 @@ fn validation_interval_compare_result(
     }
 }
 
-fn validation_interval_u128_compare_result(
+fn validation_interval_u128_compare_result_checked(
     op: ChcOp,
     lhs: &ChcExpr,
     rhs: &ChcExpr,
     env: &FxHashMap<String, ValidationInterval>,
-) -> Option<bool> {
-    if let (Some(lhs_interval), Some(rhs_const)) = (
-        validation_expr_interval(lhs, env),
-        eval_validation_nonnegative_const_u128(rhs, 0),
-    ) {
-        return compare_interval_to_u128(lhs_interval, op, rhs_const);
-    }
-    if let (Some(lhs_const), Some(rhs_interval)) = (
-        eval_validation_nonnegative_const_u128(lhs, 0),
-        validation_expr_interval(rhs, env),
-    ) {
-        return compare_u128_to_interval(lhs_const, op, rhs_interval);
-    }
-    None
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<bool>> {
+    budget::run(budget, || {
+        if let (Some(lhs_interval), Some(rhs_const)) = (
+            validation_expr_interval_checked(lhs, env, budget)?,
+            eval_validation_nonnegative_const_u128(rhs, 0, budget)?,
+        ) {
+            return Ok(compare_interval_to_u128(lhs_interval, op, rhs_const));
+        }
+        if let (Some(lhs_const), Some(rhs_interval)) = (
+            eval_validation_nonnegative_const_u128(lhs, 0, budget)?,
+            validation_expr_interval_checked(rhs, env, budget)?,
+        ) {
+            return Ok(compare_u128_to_interval(lhs_const, op, rhs_interval));
+        }
+        Ok(None)
+    })
 }
 
 fn compare_interval_to_u128(interval: ValidationInterval, op: ChcOp, value: u128) -> Option<bool> {
@@ -2011,180 +2330,266 @@ fn i128_nonnegative_eq_u128(value: i128, expected: u128) -> bool {
     value >= 0 && (value as u128) == expected
 }
 
-fn validation_expr_interval(
+fn validation_expr_interval_checked(
     expr: &ChcExpr,
     env: &FxHashMap<String, ValidationInterval>,
-) -> Option<ValidationInterval> {
-    if matches!(expr.sort(), ChcSort::Int) && validation_expr_has_bool_domain(expr) {
-        return Some(ValidationInterval {
-            lower: Some(0),
-            upper: Some(1),
-        });
-    }
-    if let Some(interval) = signed_bv_to_int_interval(expr) {
-        return Some(interval);
-    }
-    match expr {
-        ChcExpr::Int(value) => Some(ValidationInterval::exact(*value)),
-        ChcExpr::Var(var) if var.sort == ChcSort::Int => Some(
-            env.get(&var.name)
-                .copied()
-                .unwrap_or_else(ValidationInterval::top),
-        ),
-        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
-            Some(validation_expr_interval(args[0].as_ref(), env)?.checked_neg())
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationInterval>> {
+    budget::run(budget, || {
+        if matches!(expr.sort(), ChcSort::Int)
+            && validation_expr_has_bool_domain_checked(expr, budget)?
+        {
+            return Ok(Some(ValidationInterval {
+                lower: Some(0),
+                upper: Some(1),
+            }));
         }
-        ChcExpr::Op(ChcOp::Add, args) if !args.is_empty() => {
-            let mut interval = ValidationInterval::exact(0);
-            for arg in args {
-                interval = interval.checked_add(validation_expr_interval(arg.as_ref(), env)?);
-            }
-            Some(interval)
+        if let Some(interval) = signed_bv_to_int_interval_checked(expr, budget)? {
+            return Ok(Some(interval));
         }
-        ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
-            let mut iter = args.iter();
-            let first = validation_expr_interval(iter.next()?.as_ref(), env)?;
-            if args.len() == 1 {
-                return Some(first.checked_neg());
+        Ok(match expr {
+            ChcExpr::Int(value) => Some(ValidationInterval::exact(*value)),
+            ChcExpr::Var(var) if var.sort == ChcSort::Int => Some(
+                env.get(&var.name)
+                    .copied()
+                    .unwrap_or_else(ValidationInterval::top),
+            ),
+            ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
+                validation_expr_interval_checked(args[0].as_ref(), env, budget)?
+                    .map(ValidationInterval::checked_neg)
             }
-            let mut interval = first;
-            for arg in iter {
-                interval = interval.checked_sub(validation_expr_interval(arg.as_ref(), env)?);
+            ChcExpr::Op(ChcOp::Add, args) if !args.is_empty() => {
+                let mut interval = ValidationInterval::exact(0);
+                for arg in args {
+                    let Some(value) = validation_expr_interval_checked(arg.as_ref(), env, budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    interval = interval.checked_add(value);
+                }
+                Some(interval)
             }
-            Some(interval)
-        }
-        ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
-            if let Some(factor) = args[0].as_i128() {
-                return Some(
-                    validation_expr_interval(args[1].as_ref(), env)?.checked_scale(factor),
-                );
+            ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
+                let Some(first) = validation_expr_interval_checked(args[0].as_ref(), env, budget)?
+                else {
+                    return Ok(None);
+                };
+                if args.len() == 1 {
+                    return Ok(Some(first.checked_neg()));
+                }
+                let mut interval = first;
+                for arg in &args[1..] {
+                    let Some(value) = validation_expr_interval_checked(arg.as_ref(), env, budget)?
+                    else {
+                        return Ok(None);
+                    };
+                    interval = interval.checked_sub(value);
+                }
+                Some(interval)
             }
-            if let Some(factor) = args[1].as_i128() {
-                return Some(
-                    validation_expr_interval(args[0].as_ref(), env)?.checked_scale(factor),
-                );
+            ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
+                if let Some(factor) = args[0].as_i128() {
+                    return Ok(
+                        validation_expr_interval_checked(args[1].as_ref(), env, budget)?
+                            .map(|value| value.checked_scale(factor)),
+                    );
+                }
+                if let Some(factor) = args[1].as_i128() {
+                    return Ok(
+                        validation_expr_interval_checked(args[0].as_ref(), env, budget)?
+                            .map(|value| value.checked_scale(factor)),
+                    );
+                }
+                Some(ValidationInterval::top())
             }
-            Some(ValidationInterval::top())
-        }
-        _ if matches!(expr.sort(), ChcSort::Int) => Some(ValidationInterval::top()),
-        _ => None,
-    }
-}
-
-fn signed_bv_to_int_interval(expr: &ChcExpr) -> Option<ValidationInterval> {
-    let (_, width) = signed_bv_to_int_payload_and_width(expr)?;
-    if width == 0 || width > 64 {
-        return None;
-    }
-    if width == 64 {
-        return Some(ValidationInterval {
-            lower: Some(i128::from(i64::MIN)),
-            upper: Some(i128::from(i64::MAX)),
-        });
-    }
-    let upper = (1_i128.checked_shl(width - 1)?).checked_sub(1)?;
-    let lower = -(1_i128.checked_shl(width - 1)?);
-    Some(ValidationInterval {
-        lower: Some(lower),
-        upper: Some(upper),
+            _ if matches!(expr.sort(), ChcSort::Int) => Some(ValidationInterval::top()),
+            _ => None,
+        })
     })
 }
 
-fn signed_bv_to_int_payload_and_width(expr: &ChcExpr) -> Option<(&ChcExpr, u32)> {
-    let ChcExpr::Op(ChcOp::Ite, args) = expr else {
-        return None;
-    };
-    if args.len() != 3 {
-        return None;
-    }
-    let (guard_key, width) = signed_bv_sign_guard_payload(args[0].as_ref())?;
-    let (then_payload, then_width) = signed_bv_negative_branch_payload(args[1].as_ref())?;
-    let (else_payload, else_width) = unsigned_bv_to_int_payload(args[2].as_ref())?;
-    if width != then_width || width != else_width {
-        return None;
-    }
-    let then_key = validation_expr_key(then_payload);
-    let else_key = validation_expr_key(else_payload);
-    (guard_key == then_key && guard_key == else_key).then_some((else_payload, width))
-}
-
-fn signed_bv_sign_guard_payload(expr: &ChcExpr) -> Option<(String, u32)> {
-    let ChcExpr::Op(ChcOp::Eq, args) = expr else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    signed_bv_sign_guard_payload_sides(args[0].as_ref(), args[1].as_ref())
-        .or_else(|| signed_bv_sign_guard_payload_sides(args[1].as_ref(), args[0].as_ref()))
-}
-
-fn signed_bv_sign_guard_payload_sides(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(String, u32)> {
-    match rhs {
-        ChcExpr::BitVec(1, 1) => {
-            let ChcExpr::Op(ChcOp::BvExtract(hi, lo), extract_args) = lhs else {
-                return None;
-            };
-            if extract_args.len() != 1 || hi != lo {
+fn signed_bv_to_int_interval_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationInterval>> {
+    budget::run(budget, || {
+        let Some((_, width)) = signed_bv_to_int_payload_and_width_checked(expr, budget)? else {
+            return Ok(None);
+        };
+        Ok((|| {
+            if width == 0 || width > 64 {
                 return None;
             }
-            if let ChcExpr::Op(ChcOp::Int2Bv(width), int2bv_args) = extract_args[0].as_ref() {
-                if int2bv_args.len() != 1 || *hi + 1 != *width {
-                    return None;
+            if width == 64 {
+                return Some(ValidationInterval {
+                    lower: Some(i128::from(i64::MIN)),
+                    upper: Some(i128::from(i64::MAX)),
+                });
+            }
+            let upper = (1_i128.checked_shl(width - 1)?).checked_sub(1)?;
+            let lower = -(1_i128.checked_shl(width - 1)?);
+            Some(ValidationInterval {
+                lower: Some(lower),
+                upper: Some(upper),
+            })
+        })())
+    })
+}
+
+fn signed_bv_to_int_payload_and_width_checked<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a ChcExpr, u32)>> {
+    budget::run(budget, || {
+        let ChcExpr::Op(ChcOp::Ite, args) = expr else {
+            return Ok(None);
+        };
+        if args.len() != 3 {
+            return Ok(None);
+        }
+        let Some((guard_key, width)) =
+            signed_bv_sign_guard_payload_checked(args[0].as_ref(), budget)?
+        else {
+            return Ok(None);
+        };
+        let Some((then_payload, then_width)) =
+            signed_bv_negative_branch_payload(args[1].as_ref(), budget)?
+        else {
+            return Ok(None);
+        };
+        let Some((else_payload, else_width)) =
+            unsigned_bv_to_int_payload(args[2].as_ref(), budget)?
+        else {
+            return Ok(None);
+        };
+        if width != then_width || width != else_width {
+            return Ok(None);
+        }
+        let then_key = validation_expr_key_checked(then_payload, budget)?;
+        let else_key = validation_expr_key_checked(else_payload, budget)?;
+        Ok((guard_key == then_key && guard_key == else_key).then_some((else_payload, width)))
+    })
+}
+
+fn signed_bv_sign_guard_payload_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, u32)>> {
+    budget::run(budget, || {
+        let ChcExpr::Op(ChcOp::Eq, args) = expr else {
+            return Ok(None);
+        };
+        if args.len() != 2 {
+            return Ok(None);
+        }
+        if let Some(value) =
+            signed_bv_sign_guard_payload_sides_checked(args[0].as_ref(), args[1].as_ref(), budget)?
+        {
+            return Ok(Some(value));
+        }
+        signed_bv_sign_guard_payload_sides_checked(args[1].as_ref(), args[0].as_ref(), budget)
+    })
+}
+
+fn signed_bv_sign_guard_payload_sides_checked(
+    lhs: &ChcExpr,
+    rhs: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(String, u32)>> {
+    budget::run(budget, || {
+        Ok(match rhs {
+            ChcExpr::BitVec(1, 1) => {
+                let ChcExpr::Op(ChcOp::BvExtract(hi, lo), extract_args) = lhs else {
+                    return Ok(None);
+                };
+                if extract_args.len() != 1 || hi != lo {
+                    return Ok(None);
                 }
-                return Some((validation_expr_key(int2bv_args[0].as_ref()), *width));
+                if let ChcExpr::Op(ChcOp::Int2Bv(width), int2bv_args) = extract_args[0].as_ref() {
+                    if int2bv_args.len() != 1 || *hi + 1 != *width {
+                        return Ok(None);
+                    }
+                    return Ok(Some((
+                        validation_expr_key_checked(int2bv_args[0].as_ref(), budget)?,
+                        *width,
+                    )));
+                }
+                let Some((payload, width)) = bool_bitvec_ite_payload(extract_args[0].as_ref())
+                else {
+                    return Ok(None);
+                };
+                if *hi + 1 != width {
+                    return Ok(None);
+                }
+                Some((validation_expr_key_checked(payload, budget)?, width))
             }
-            let (payload, width) = bool_bitvec_ite_payload(extract_args[0].as_ref())?;
-            if *hi + 1 != width {
-                return None;
+            ChcExpr::Int(1) => {
+                let ChcExpr::Op(ChcOp::Div, div_args) = lhs else {
+                    return Ok(None);
+                };
+                if div_args.len() != 2 {
+                    return Ok(None);
+                }
+                let Some(half_modulus) =
+                    eval_validation_nonnegative_const_u128(div_args[1].as_ref(), 0, budget)?
+                else {
+                    return Ok(None);
+                };
+                if half_modulus <= 1 {
+                    return Ok(None);
+                }
+                let Some((payload, width)) =
+                    unsigned_bv_to_int_payload(div_args[0].as_ref(), budget)?
+                else {
+                    return Ok(None);
+                };
+                let Some(expected_half) = width.checked_sub(1).and_then(pow2_u128) else {
+                    return Ok(None);
+                };
+                if half_modulus == expected_half {
+                    Some((validation_expr_key_checked(payload, budget)?, width))
+                } else {
+                    None
+                }
             }
-            Some((validation_expr_key(payload), width))
-        }
-        ChcExpr::Int(1) => {
-            let ChcExpr::Op(ChcOp::Div, div_args) = lhs else {
-                return None;
-            };
-            if div_args.len() != 2 {
-                return None;
-            }
-            let half_modulus = eval_validation_nonnegative_const_u128(div_args[1].as_ref(), 0)?;
-            if half_modulus <= 1 {
-                return None;
-            }
-            let (payload, width) = unsigned_bv_to_int_payload(div_args[0].as_ref())?;
-            let expected_half = pow2_u128(width.checked_sub(1)?)?;
-            (half_modulus == expected_half).then_some((validation_expr_key(payload), width))
-        }
-        _ => None,
-    }
+            _ => None,
+        })
+    })
 }
 
-fn signed_bv_negative_branch_payload(expr: &ChcExpr) -> Option<(&ChcExpr, u32)> {
+fn signed_bv_negative_branch_payload<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a ChcExpr, u32)>> {
     let ChcExpr::Op(ChcOp::Sub, args) = expr else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    let (payload, width) = unsigned_bv_to_int_payload(args[0].as_ref())?;
-    let modulus = eval_validation_nonnegative_const_u128(args[1].as_ref(), 0)?;
-    (modulus == pow2_u128(width)?).then_some((payload, width))
+    let (payload, width) = validation_some!(unsigned_bv_to_int_payload(&args[0], budget)?);
+    let modulus = validation_some!(eval_validation_nonnegative_const_u128(&args[1], 0, budget)?);
+    Ok((modulus == validation_some!(pow2_u128(width))).then_some((payload, width)))
 }
 
-fn unsigned_bv_to_int_payload(expr: &ChcExpr) -> Option<(&ChcExpr, u32)> {
+fn unsigned_bv_to_int_payload<'a>(
+    expr: &'a ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(&'a ChcExpr, u32)>> {
     match expr {
         ChcExpr::Op(ChcOp::Bv2Nat, args) if args.len() == 1 => {
-            if let ChcExpr::Op(ChcOp::Int2Bv(width), int2bv_args) = args[0].as_ref() {
-                return (int2bv_args.len() == 1).then(|| (int2bv_args[0].as_ref(), *width));
+            if let ChcExpr::Op(ChcOp::Int2Bv(width), inner) = args[0].as_ref() {
+                return Ok((inner.len() == 1).then(|| (inner[0].as_ref(), *width)));
             }
-            bool_bitvec_ite_payload(args[0].as_ref())
+            Ok(bool_bitvec_ite_payload(&args[0]))
         }
         ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
-            let modulus = eval_validation_nonnegative_const_u128(args[1].as_ref(), 0)?;
-            let width = modulus_to_pow2_width(modulus)?;
-            Some((args[0].as_ref(), width))
+            let modulus =
+                validation_some!(eval_validation_nonnegative_const_u128(&args[1], 0, budget)?);
+            let width = validation_some!(modulus_to_pow2_width(modulus));
+            Ok(Some((args[0].as_ref(), width)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -2391,13 +2796,15 @@ fn validate_model_with_smt_and_stats(
 
         for (pred_id, args) in &clause.body.predicates {
             if let Some(interp) = model.get(pred_id) {
-                let substitution: Vec<(ChcVar, ChcExpr)> = interp
-                    .vars
-                    .iter()
-                    .zip(args.iter())
-                    .map(|(v, a)| (v.clone(), a.clone()))
-                    .collect();
-                body_conjuncts.push(interp.formula.substitute(&substitution));
+                let Ok(substitution) = budget::bindings(&interp.vars, args, budget) else {
+                    stats.record_unknown();
+                    return AlgebraicValidationResult::DeadlineExceeded;
+                };
+                let Ok(formula) = budget::substitute(&interp.formula, &substitution, budget) else {
+                    stats.record_unknown();
+                    return AlgebraicValidationResult::DeadlineExceeded;
+                };
+                body_conjuncts.push(formula);
             }
         }
 
@@ -2405,18 +2812,24 @@ fn validate_model_with_smt_and_stats(
             body_conjuncts.push(constraint.clone());
         }
 
-        let body_formula = conjoin(body_conjuncts);
+        let Some(body_formula) = conjoin_checked(body_conjuncts, budget) else {
+            stats.record_unknown();
+            return AlgebraicValidationResult::DeadlineExceeded;
+        };
 
         let head_formula = match &clause.head {
             ClauseHead::Predicate(pred_id, args) => {
                 if let Some(interp) = model.get(pred_id) {
-                    let substitution: Vec<(ChcVar, ChcExpr)> = interp
-                        .vars
-                        .iter()
-                        .zip(args.iter())
-                        .map(|(v, a)| (v.clone(), a.clone()))
-                        .collect();
-                    interp.formula.substitute(&substitution)
+                    let Ok(substitution) = budget::bindings(&interp.vars, args, budget) else {
+                        stats.record_unknown();
+                        return AlgebraicValidationResult::DeadlineExceeded;
+                    };
+                    let Ok(formula) = budget::substitute(&interp.formula, &substitution, budget)
+                    else {
+                        stats.record_unknown();
+                        return AlgebraicValidationResult::DeadlineExceeded;
+                    };
+                    formula
                 } else {
                     ChcExpr::Bool(true)
                 }
@@ -2456,15 +2869,23 @@ fn validate_model_with_smt_and_stats(
             && head_formula.node_count(ALGEBRAIC_FASTPATH_NODE_CAP + 1)
                 <= ALGEBRAIC_FASTPATH_NODE_CAP;
 
-        if fastpath_ok
-            && validation_body_syntactically_implies_head(
+        let implication = if fastpath_ok {
+            validation_body_syntactically_implies_head_checked(
                 &body_formula,
                 &head_formula,
                 verbose,
                 budget,
             )
-        {
-            continue;
+        } else {
+            Ok(false)
+        };
+        match implication {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => {
+                stats.record_unknown();
+                return AlgebraicValidationResult::DeadlineExceeded;
+            }
         }
 
         // #9110: the syntactic fast path above declines (returns `false`)
@@ -2482,10 +2903,22 @@ fn validate_model_with_smt_and_stats(
         }
 
         // Check: body AND NOT(head) is UNSAT
-        let check = ChcExpr::and(body_formula.clone(), ChcExpr::not(head_formula.clone()))
-            .simplify_constants();
-        if fastpath_ok && validation_formula_proves_unsat(&check) {
-            continue;
+        let Ok(check) = budget::simplify(
+            &ChcExpr::and(body_formula.clone(), ChcExpr::not(head_formula.clone())),
+            budget,
+        ) else {
+            stats.record_unknown();
+            return AlgebraicValidationResult::DeadlineExceeded;
+        };
+        if fastpath_ok {
+            match validation_formula_proves_unsat_checked(&check, budget) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => {
+                    stats.record_unknown();
+                    return AlgebraicValidationResult::DeadlineExceeded;
+                }
+            }
         }
 
         smt.reset();
@@ -2512,7 +2945,15 @@ fn validate_model_with_smt_and_stats(
         match smt.check_sat_with_timeout(&check, per_query_timeout) {
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {}
             SmtResult::Unknown => {
-                if triangular_accumulator_query_is_syntactically_unsat(&check) {
+                let discharged =
+                    match triangular_accumulator_query_is_syntactically_unsat(&check, budget) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            stats.record_unknown();
+                            return AlgebraicValidationResult::DeadlineExceeded;
+                        }
+                    };
+                if discharged {
                     if verbose {
                         safe_eprintln!(
                             "Algebraic: discharged triangular accumulator query after SMT Unknown"
@@ -2522,8 +2963,8 @@ fn validate_model_with_smt_and_stats(
                 }
                 if verbose {
                     safe_eprintln!(
-                        "Algebraic: original-clause validation rejected SMT Unknown on clause {:?}",
-                        clause
+                        "Algebraic: original-clause validation rejected SMT Unknown on clause {}",
+                        crate::expr::dag::debug_prefix(clause, super::VERBOSE_EXPR_BYTES)
                     );
                 }
                 stats.record_unknown();
@@ -2532,9 +2973,9 @@ fn validate_model_with_smt_and_stats(
             result => {
                 if verbose {
                     safe_eprintln!(
-                        "Algebraic: validation failed on clause {:?} with result {:?}",
-                        clause,
-                        result
+                        "Algebraic: validation failed on clause {} with result {}",
+                        crate::expr::dag::debug_prefix(clause, super::VERBOSE_EXPR_BYTES),
+                        crate::expr::dag::debug_prefix(&result, super::VERBOSE_EXPR_BYTES)
                     );
                 }
                 stats.record_failure();
@@ -2543,6 +2984,10 @@ fn validate_model_with_smt_and_stats(
         }
     }
 
+    if budget.expired() {
+        stats.record_unknown();
+        return AlgebraicValidationResult::DeadlineExceeded;
+    }
     stats.record_success();
     AlgebraicValidationResult::Valid
 }
@@ -2556,172 +3001,220 @@ fn validate_model_with_smt_and_stats(
 /// keeps to a few milliseconds.
 const VALIDATION_FASTPATH_POLL_STRIDE: usize = 32;
 
-fn validation_body_syntactically_implies_head(
+fn validation_body_syntactically_implies_head_checked(
     body: &ChcExpr,
     head: &ChcExpr,
     verbose: bool,
     budget: &SynthesisBudget,
-) -> bool {
-    if matches!(head.simplify_constants(), ChcExpr::Bool(true)) {
-        return true;
-    }
-    if validation_formula_proves_unsat(body) {
-        return true;
-    }
-
-    let alias_substitution = validation_alias_substitution(body);
-    let mut implied: FxHashSet<String> = body
-        .conjuncts()
-        .into_iter()
-        .map(|expr| validation_alias_normalized_expr_key(expr, &alias_substitution))
-        .collect();
-    collect_guarded_active_diff_implications(body, &mut Vec::new(), &mut implied);
-    let active_diff_shape = extract_active_diff_invariant_shape(head);
-
-    for (index, conjunct) in head.conjuncts().into_iter().enumerate() {
-        // #9110: THE budget poll that bounds algebraic validation.
-        //
-        // Each iteration re-scans the whole body, so this loop is Θ(|head| ·
-        // |body|) — on a synthesized interpretation with thousands of
-        // conjuncts it runs for seconds inside ONE iteration of the caller's
-        // per-clause loop, which is why the per-clause poll upstream bounded
-        // nothing. Measured on a 120-variable lockstep problem: 2.024s of a
-        // 2.035s solve was this loop alone, against a 10ms budget.
-        //
-        // SOUNDNESS: tripping returns `false`, i.e. "not syntactically
-        // proven". `false` is the conservative answer — it only DECLINES to
-        // discharge the clause, handing it to the SMT check (and, once the
-        // budget is spent, to `DeadlineExceeded`). It can never accept a
-        // clause the fast path had not actually proven, so an interrupted
-        // scan can lose a proof but never manufacture one.
-        if index % VALIDATION_FASTPATH_POLL_STRIDE == 0 && budget.expired() {
-            if verbose {
-                safe_eprintln!(
-                    "Algebraic: syntactic implication scan hit the budget at head conjunct \
-                     {index}; declining the fast path (#9110)"
-                );
-            }
-            return false;
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        if matches!(budget::simplify(head, budget)?, ChcExpr::Bool(true)) {
+            return Ok(true);
         }
-        if !validation_body_syntactically_implies_conjunct(
+        if validation_formula_proves_unsat_checked(body, budget)? {
+            return Ok(true);
+        }
+        let alias_substitution = validation_alias_substitution_checked(body, budget)?;
+        let mut implied = FxHashSet::default();
+        for expr in budget::conjuncts(&body, budget)? {
+            implied.insert(validation_alias_normalized_expr_key_checked(
+                expr,
+                &alias_substitution,
+                budget,
+            )?);
+        }
+        collect_guarded_active_diff_implications_checked(
             body,
-            conjunct,
-            &implied,
-            &alias_substitution,
-            active_diff_shape.as_ref(),
-        ) {
-            if verbose {
-                safe_eprintln!(
-                    "Algebraic: syntactic implication missing head conjunct {:?}",
-                    conjunct.simplify_constants()
-                );
+            &mut Vec::new(),
+            &mut implied,
+            budget,
+        )?;
+        let active_diff_shape = extract_active_diff_invariant_shape(head, budget)?;
+        for (index, conjunct) in budget::conjuncts(&head, budget)?.into_iter().enumerate() {
+            if index % VALIDATION_FASTPATH_POLL_STRIDE == 0 {
+                check(budget)?;
             }
-            return false;
+            if !validation_body_syntactically_implies_conjunct_checked(
+                body,
+                conjunct,
+                &implied,
+                &alias_substitution,
+                active_diff_shape.as_ref(),
+                budget,
+            )? {
+                if verbose {
+                    safe_eprintln!(
+                        "Algebraic: syntactic implication missing head conjunct {:?}",
+                        budget::simplify(conjunct, budget)?
+                    );
+                }
+                return Ok(false);
+            }
         }
-    }
-    true
+        Ok(true)
+    })
 }
 
-fn validation_body_syntactically_implies_conjunct(
+fn validation_body_syntactically_implies_conjunct_checked(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     implied: &FxHashSet<String>,
     alias_substitution: &[(ChcVar, ChcExpr)],
     active_diff_shape: Option<&ActiveDiffInvariantShape>,
-) -> bool {
-    let conjunct = conjunct.simplify_constants();
-    if matches!(conjunct, ChcExpr::Bool(true)) {
-        return true;
-    }
-
-    if let Some(shape) = active_diff_shape {
-        if active_diff_transition_syntactically_preserves_conjunct(body, &conjunct, shape) {
-            return true;
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let conjunct = budget::simplify(conjunct, budget)?;
+        check(budget)?;
+        if matches!(conjunct, ChcExpr::Bool(true)) {
+            return Ok(true);
         }
-    }
-    if validation_body_implies_linear_equality(body, &conjunct, alias_substitution) {
-        return true;
-    }
-    if validation_body_implies_linear_inequality(body, &conjunct, alias_substitution) {
-        return true;
-    }
-    if validation_body_implies_positive_product_lower_bound(body, &conjunct, alias_substitution) {
-        return true;
-    }
-    if validation_body_preserves_linear_mod_residue(body, &conjunct, alias_substitution) {
-        return true;
-    }
-    if validation_formula_proves_unsat(&ChcExpr::not(conjunct.clone()).simplify_constants()) {
-        return true;
-    }
-    if validation_formula_proves_unsat(&ChcExpr::and(body.clone(), ChcExpr::not(conjunct.clone())))
-    {
-        return true;
-    }
-    if implied.contains(&validation_alias_normalized_expr_key(
-        &conjunct,
-        alias_substitution,
-    )) {
-        return true;
-    }
-
-    match &conjunct {
-        ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
-            if let Some(condition) = validation_static_bool_result(args[0].as_ref()) {
-                return validation_body_syntactically_implies_conjunct(
-                    body,
-                    args[if condition { 1 } else { 2 }].as_ref(),
-                    implied,
-                    alias_substitution,
-                    active_diff_shape,
-                );
+        if let Some(shape) = active_diff_shape {
+            if active_diff_transition_syntactically_preserves_conjunct(
+                body, &conjunct, shape, budget,
+            )? {
+                return Ok(true);
             }
-            false
         }
-        ChcExpr::Op(ChcOp::And, args) => args.iter().all(|arg| {
-            validation_body_syntactically_implies_conjunct(
-                body,
-                arg.as_ref(),
-                implied,
-                alias_substitution,
-                active_diff_shape,
-            )
-        }),
-        ChcExpr::Op(ChcOp::Or, args) => args.iter().any(|arg| {
-            validation_body_syntactically_implies_conjunct(
-                body,
-                arg.as_ref(),
-                implied,
-                alias_substitution,
-                active_diff_shape,
-            )
-        }),
-        _ => false,
-    }
+        if validation_arithmetic_implies_checked(body, &conjunct, alias_substitution, budget)? {
+            return Ok(true);
+        }
+        if validation_formula_proves_unsat_checked(
+            &budget::simplify(&ChcExpr::not(conjunct.clone()), budget)?,
+            budget,
+        )? || validation_formula_proves_unsat_checked(
+            &ChcExpr::and(body.clone(), ChcExpr::not(conjunct.clone())),
+            budget,
+        )? {
+            return Ok(true);
+        }
+        if implied.contains(&validation_alias_normalized_expr_key_checked(
+            &conjunct,
+            alias_substitution,
+            budget,
+        )?) {
+            return Ok(true);
+        }
+        match &conjunct {
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                if let Some(condition) =
+                    validation_static_bool_result_checked(args[0].as_ref(), budget)?
+                {
+                    return validation_body_syntactically_implies_conjunct_checked(
+                        body,
+                        args[if condition { 1 } else { 2 }].as_ref(),
+                        implied,
+                        alias_substitution,
+                        active_diff_shape,
+                        budget,
+                    );
+                }
+                Ok(false)
+            }
+            ChcExpr::Op(ChcOp::And, args) => {
+                for arg in args {
+                    if !validation_body_syntactically_implies_conjunct_checked(
+                        body,
+                        arg,
+                        implied,
+                        alias_substitution,
+                        active_diff_shape,
+                        budget,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            ChcExpr::Op(ChcOp::Or, args) => {
+                for arg in args {
+                    if validation_body_syntactically_implies_conjunct_checked(
+                        body,
+                        arg,
+                        implied,
+                        alias_substitution,
+                        active_diff_shape,
+                        budget,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    })
 }
 
-fn validation_body_implies_positive_product_lower_bound(
+fn validation_arithmetic_implies_checked(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     alias_substitution: &[(ChcVar, ChcExpr)],
-) -> bool {
-    let simplified = conjunct.substitute(alias_substitution).simplify_constants();
-    let Some((product, lower_bound)) = validation_product_lower_bound_atom(&simplified) else {
-        return false;
-    };
-    if lower_bound > 1 {
-        return false;
-    }
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        Ok(validation_body_implies_linear_equality_checked(
+            body,
+            conjunct,
+            alias_substitution,
+            budget,
+        )? || validation_body_implies_linear_inequality_checked(
+            body,
+            conjunct,
+            alias_substitution,
+            budget,
+        )? || validation_body_implies_positive_product_lower_bound_checked(
+            body,
+            conjunct,
+            alias_substitution,
+            budget,
+        )? || validation_body_preserves_linear_mod_residue_checked(
+            body,
+            conjunct,
+            alias_substitution,
+            budget,
+        )?)
+    })
+}
 
-    let ChcExpr::Op(ChcOp::Mul, factors) = product else {
-        return false;
-    };
-    factors.iter().all(|factor| match factor.as_ref() {
-        ChcExpr::Int(value) => *value >= 1,
-        factor => {
-            let positive_factor = ChcExpr::ge(factor.clone(), ChcExpr::Int(1)).simplify_constants();
-            validation_body_implies_linear_inequality(body, &positive_factor, alias_substitution)
+fn validation_body_implies_positive_product_lower_bound_checked(
+    body: &ChcExpr,
+    conjunct: &ChcExpr,
+    alias_substitution: &[(ChcVar, ChcExpr)],
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let substituted = budget::substitute(conjunct, alias_substitution, budget)?;
+        let simplified = budget::simplify(&substituted, budget)?;
+        let Some((product, lower_bound)) = validation_product_lower_bound_atom(&simplified) else {
+            return Ok(false);
+        };
+        if lower_bound > 1 {
+            return Ok(false);
         }
+        let ChcExpr::Op(ChcOp::Mul, factors) = product else {
+            return Ok(false);
+        };
+        for factor in factors {
+            check(budget)?;
+            match factor.as_ref() {
+                ChcExpr::Int(value) if *value >= 1 => {}
+                ChcExpr::Int(_) => return Ok(false),
+                factor => {
+                    let positive_factor =
+                        budget::simplify(&ChcExpr::ge(factor.clone(), ChcExpr::Int(1)), budget)?;
+                    if !validation_body_implies_linear_inequality_checked(
+                        body,
+                        &positive_factor,
+                        alias_substitution,
+                        budget,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
     })
 }
 
@@ -2758,53 +3251,47 @@ fn validation_product_lower_bound_atom(expr: &ChcExpr) -> Option<(&ChcExpr, i128
     }
 }
 
-fn validation_body_implies_linear_equality(
+fn validation_body_implies_linear_equality_checked(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     alias_substitution: &[(ChcVar, ChcExpr)],
-) -> bool {
-    let substitution = validation_body_linear_substitution(body, alias_substitution);
-    // Every substitution entry `var -> expr` is an equality entailed by the
-    // body, so substituting equals-for-equals preserves body-equivalence. If
-    // the conjunct collapses to `true` under it (e.g. `F = G` with body
-    // equalities `A = B`, `F = A + 1`, `G = B + 1` collapsing both sides to
-    // `A + 1`), the body implies the conjunct outright. Without this check the
-    // key comparison below misses identically-true equalities because
-    // `simplify_constants` folds them away before a linear key can be built.
-    if matches!(
-        conjunct.substitute(&substitution).simplify_constants(),
-        ChcExpr::Bool(true)
-    ) {
-        return true;
-    }
-    if let Some(head_key) = validation_linear_equality_key(conjunct, &substitution) {
-        if body.conjuncts().into_iter().any(|body_conjunct| {
-            validation_linear_equality_key(body_conjunct, &substitution).as_deref()
-                == Some(head_key.as_str())
-        }) {
-            return true;
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let substitution =
+            validation_body_linear_substitution_checked(body, alias_substitution, budget)?;
+        let substituted = budget::substitute(conjunct, &substitution, budget)?;
+        if matches!(budget::simplify(&substituted, budget)?, ChcExpr::Bool(true)) {
+            return Ok(true);
         }
-    }
-    // Polynomial fallback: discharge equalities whose sides contain small
-    // products of variables (e.g. the conserved quantity `2*D = C + C*C`
-    // following from body equalities `2*B = A + A*A`, `C = A + 1`,
-    // `D = B + C`). Both sides are expanded into monomial-keyed polynomials
-    // after the body substitution; the head equality is implied when its
-    // normalized difference polynomial is identically zero or matches a body
-    // equality's normalized difference exactly (equal up to rational scale).
-    // Monomials are treated as opaque atoms, which is sound: any model
-    // assigns each monomial a single value, so equal normalized atom-linear
-    // combinations denote the same constraint.
-    let Some(head_poly) = validation_poly_equality_normalized(conjunct, &substitution) else {
-        return false;
-    };
-    if head_poly.is_empty() {
-        // lhs - rhs expanded to the zero polynomial: identically true.
-        return true;
-    }
-    body.conjuncts().into_iter().any(|body_conjunct| {
-        validation_poly_equality_normalized(body_conjunct, &substitution)
-            .is_some_and(|body_poly| body_poly == head_poly)
+        if let Some(head_key) =
+            validation_linear_equality_key_checked(conjunct, &substitution, budget)?
+        {
+            for body_conjunct in budget::conjuncts(&body, budget)? {
+                if validation_linear_equality_key_checked(body_conjunct, &substitution, budget)?
+                    .as_deref()
+                    == Some(head_key.as_str())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        let Some(head_poly) =
+            validation_poly_equality_normalized_checked(conjunct, &substitution, budget)?
+        else {
+            return Ok(false);
+        };
+        if head_poly.is_empty() {
+            return Ok(true);
+        }
+        for body_conjunct in budget::conjuncts(&body, budget)? {
+            if validation_poly_equality_normalized_checked(body_conjunct, &substitution, budget)?
+                .is_some_and(|body_poly| body_poly == head_poly)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })
 }
 
@@ -2822,61 +3309,74 @@ const VALIDATION_POLY_MAX_TERMS: usize = 16;
 /// monomial-keyed polynomial (gcd-reduced, deterministic sign). Returns
 /// `None` for non-equalities or expressions outside the supported
 /// Int/Var/Add/Sub/Neg/Mul fragment.
-fn validation_poly_equality_normalized(
+fn validation_poly_equality_normalized_checked(
     expr: &ChcExpr,
     substitution: &[(ChcVar, ChcExpr)],
-) -> Option<ValidationPolyExpr> {
-    let simplified = expr.substitute(substitution).simplify_constants();
-    let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    let lhs = validation_poly_expr(args[0].as_ref())?;
-    let rhs = validation_poly_expr(args[1].as_ref())?;
-    let mut diff = validation_poly_sub(&lhs, &rhs)?;
-    validation_poly_normalize(&mut diff)?;
-    Some(diff)
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationPolyExpr>> {
+    budget::run(budget, || {
+        let substituted = budget::substitute(expr, substitution, budget)?;
+        let simplified = budget::simplify(&substituted, budget)?;
+        let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
+            return Ok(None);
+        };
+        if args.len() != 2 {
+            return Ok(None);
+        }
+        let lhs = validation_some!(validation_poly_expr(&args[0], budget)?);
+        let rhs = validation_some!(validation_poly_expr(&args[1], budget)?);
+        let mut diff = validation_some!(validation_poly_sub(&lhs, &rhs));
+        validation_some!(validation_poly_normalize(&mut diff));
+        Ok(Some(diff))
+    })
 }
 
-fn validation_poly_expr(expr: &ChcExpr) -> Option<ValidationPolyExpr> {
+fn validation_poly_expr(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationPolyExpr>> {
+    check(budget)?;
     match expr {
         ChcExpr::Int(value) => {
             let mut poly = ValidationPolyExpr::new();
             if *value != 0 {
                 poly.insert(Vec::new(), *value);
             }
-            Some(poly)
+            Ok(Some(poly))
         }
         ChcExpr::Var(var) if var.sort == ChcSort::Int => {
             let mut poly = ValidationPolyExpr::new();
             poly.insert(vec![var.name.clone()], 1);
-            Some(poly)
+            Ok(Some(poly))
         }
         ChcExpr::Op(ChcOp::Add, args) => {
             let mut result = ValidationPolyExpr::new();
             for arg in args {
-                result = validation_poly_add(&result, &validation_poly_expr(arg)?)?;
+                let value = validation_some!(validation_poly_expr(arg, budget)?);
+                result = validation_some!(validation_poly_add(&result, &value));
             }
-            Some(result)
+            Ok(Some(result))
         }
         ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
             let mut iter = args.iter();
-            let mut result = validation_poly_expr(iter.next()?.as_ref())?;
+            let mut result =
+                validation_some!(validation_poly_expr(validation_some!(iter.next()), budget)?);
             for arg in iter {
-                result = validation_poly_sub(&result, &validation_poly_expr(arg)?)?;
+                let value = validation_some!(validation_poly_expr(arg, budget)?);
+                result = validation_some!(validation_poly_sub(&result, &value));
             }
-            Some(result)
+            Ok(Some(result))
         }
         ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
-            validation_poly_scale(&validation_poly_expr(args[0].as_ref())?, -1)
+            let value = validation_some!(validation_poly_expr(&args[0], budget)?);
+            Ok(validation_poly_scale(&value, -1))
         }
-        ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => validation_poly_mul(
-            &validation_poly_expr(args[0].as_ref())?,
-            &validation_poly_expr(args[1].as_ref())?,
-        ),
-        _ => None,
+        ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
+            let lhs = validation_some!(validation_poly_expr(&args[0], budget)?);
+            let rhs = validation_some!(validation_poly_expr(&args[1], budget)?);
+            Ok(validation_poly_mul(&lhs, &rhs))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -2981,114 +3481,160 @@ fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
     a
 }
 
-fn validation_body_implies_linear_inequality(
+fn validation_body_implies_linear_inequality_checked(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     alias_substitution: &[(ChcVar, ChcExpr)],
-) -> bool {
-    let substitution = validation_body_linear_substitution(body, alias_substitution);
-    let Some(head_key) = validation_linear_inequality_key(conjunct, &substitution) else {
-        return false;
-    };
-    if body.conjuncts().into_iter().any(|body_conjunct| {
-        validation_linear_inequality_key(body_conjunct, &substitution).as_deref()
-            == Some(head_key.as_str())
-    }) {
-        return true;
-    }
-
-    let Some(head_expr) = validation_linear_inequality_expr(conjunct, &substitution) else {
-        return false;
-    };
-    let mut body_equalities = Vec::new();
-    let mut body_inequalities = Vec::new();
-    for body_conjunct in body.conjuncts() {
-        if let Some(equality) = validation_linear_equality_expr(body_conjunct, &substitution) {
-            body_equalities.push(equality);
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let substitution =
+            validation_body_linear_substitution_checked(body, alias_substitution, budget)?;
+        let Some(head_key) =
+            validation_linear_inequality_key_checked(conjunct, &substitution, budget)?
+        else {
+            return Ok(false);
+        };
+        for body_conjunct in budget::conjuncts(&body, budget)? {
+            if validation_linear_inequality_key_checked(body_conjunct, &substitution, budget)?
+                .as_deref()
+                == Some(head_key.as_str())
+            {
+                return Ok(true);
+            }
         }
-        if let Some(inequality) = validation_linear_inequality_expr(body_conjunct, &substitution) {
-            body_inequalities.push(inequality);
+        let Some(head_expr) =
+            validation_linear_inequality_expr_checked(conjunct, &substitution, budget)?
+        else {
+            return Ok(false);
+        };
+        let mut body_equalities = Vec::new();
+        let mut body_inequalities = Vec::new();
+        for body_conjunct in budget::conjuncts(&body, budget)? {
+            if let Some(equality) =
+                validation_linear_equality_expr_checked(body_conjunct, &substitution, budget)?
+            {
+                body_equalities.push(equality);
+            }
+            if let Some(inequality) =
+                validation_linear_inequality_expr_checked(body_conjunct, &substitution, budget)?
+            {
+                body_inequalities.push(inequality);
+            }
         }
-    }
-    body_inequalities.iter().any(|inequality| {
-        (1..=4).any(|scale| {
-            let Some(scaled_inequality) = validation_linear_expr_checked_scale(inequality, scale)
-            else {
-                return false;
-            };
-            let Some(residual) = validation_linear_expr_checked_sub(&head_expr, &scaled_inequality)
-            else {
-                return false;
-            };
-            validation_linear_expr_in_equality_span_bounded(&residual, &body_equalities)
-        })
+        for inequality in &body_inequalities {
+            for scale in 1..=4 {
+                check(budget)?;
+                let Some(scaled) = validation_linear_expr_checked_scale(inequality, scale, budget)?
+                else {
+                    continue;
+                };
+                let Some(residual) =
+                    validation_linear_expr_checked_sub(&head_expr, &scaled, budget)?
+                else {
+                    continue;
+                };
+                if validation_linear_expr_in_equality_span_bounded(
+                    &residual,
+                    &body_equalities,
+                    budget,
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     })
 }
 
-fn validation_linear_inequality_key(
+fn validation_linear_inequality_key_checked(
     expr: &ChcExpr,
     substitution: &[(ChcVar, ChcExpr)],
-) -> Option<String> {
-    let linear = validation_linear_inequality_expr(expr, substitution)?;
-    validation_normalized_linear_inequality_key(&linear)
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<String>> {
+    budget::run(budget, || {
+        let Some(linear) = validation_linear_inequality_expr_checked(expr, substitution, budget)?
+        else {
+            return Ok(None);
+        };
+        validation_normalized_linear_inequality_key(&linear, budget)
+    })
 }
 
-fn validation_linear_inequality_expr(
+fn validation_linear_inequality_expr_checked(
     expr: &ChcExpr,
     substitution: &[(ChcVar, ChcExpr)],
-) -> Option<ValidationLinearExpr> {
-    let simplified = expr.substitute(substitution).simplify_constants();
-    let ChcExpr::Op(op, args) = &simplified else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    let linear = match op {
-        ChcOp::Le => validation_linear_expr_sub(args[0].as_ref(), args[1].as_ref())?,
-        ChcOp::Ge => validation_linear_expr_sub(args[1].as_ref(), args[0].as_ref())?,
-        ChcOp::Lt => {
-            let expr = validation_linear_expr_sub(args[0].as_ref(), args[1].as_ref())?;
-            validation_linear_expr_add_constant(&expr, 1)
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    budget::run(budget, || {
+        let substituted = budget::substitute(expr, substitution, budget)?;
+        let simplified = budget::simplify(&substituted, budget)?;
+        let ChcExpr::Op(op, args) = &simplified else {
+            return Ok(None);
+        };
+        if args.len() != 2 {
+            return Ok(None);
         }
-        ChcOp::Gt => {
-            let expr = validation_linear_expr_sub(args[1].as_ref(), args[0].as_ref())?;
-            validation_linear_expr_add_constant(&expr, 1)
+        let (lhs, rhs, strict) = match op {
+            ChcOp::Le => (&args[0], &args[1], false),
+            ChcOp::Ge => (&args[1], &args[0], false),
+            ChcOp::Lt => (&args[0], &args[1], true),
+            ChcOp::Gt => (&args[1], &args[0], true),
+            _ => return Ok(None),
+        };
+        let linear = validation_some!(validation_linear_expr_sub(lhs, rhs, budget)?);
+        Ok(Some(if strict {
+            validation_linear_expr_add_constant(&linear, 1, budget)?
+        } else {
+            linear
+        }))
+    })
+}
+
+fn validation_linear_equality_key_checked(
+    expr: &ChcExpr,
+    substitution: &[(ChcVar, ChcExpr)],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<String>> {
+    budget::run(budget, || {
+        let Some(linear) = validation_linear_equality_expr_checked(expr, substitution, budget)?
+        else {
+            return Ok(None);
+        };
+        validation_normalized_linear_expr_key(&linear, budget)
+    })
+}
+
+fn validation_linear_equality_expr_checked(
+    expr: &ChcExpr,
+    substitution: &[(ChcVar, ChcExpr)],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    budget::run(budget, || {
+        let substituted = budget::substitute(expr, substitution, budget)?;
+        let simplified = budget::simplify(&substituted, budget)?;
+        let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
+            return Ok(None);
+        };
+        if args.len() != 2 {
+            return Ok(None);
         }
-        _ => return None,
-    };
-    Some(linear)
+        validation_linear_expr_sub(&args[0], &args[1], budget)
+    })
 }
 
-fn validation_linear_equality_key(
-    expr: &ChcExpr,
-    substitution: &[(ChcVar, ChcExpr)],
-) -> Option<String> {
-    let linear = validation_linear_equality_expr(expr, substitution)?;
-    validation_normalized_linear_expr_key(&linear)
-}
-
-fn validation_linear_equality_expr(
-    expr: &ChcExpr,
-    substitution: &[(ChcVar, ChcExpr)],
-) -> Option<ValidationLinearExpr> {
-    let simplified = expr.substitute(substitution).simplify_constants();
-    let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    validation_linear_expr_sub(args[0].as_ref(), args[1].as_ref())
-}
-
-fn validation_normalized_linear_expr_key(expr: &ValidationLinearExpr) -> Option<String> {
+fn validation_normalized_linear_expr_key(
+    expr: &ValidationLinearExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<String>> {
+    check(budget)?;
     let mut gcd = 0;
     for value in expr.coeffs.values().copied().chain([expr.constant]) {
+        check(budget)?;
         if value == 0 {
             continue;
         }
-        let abs = value.checked_abs()?;
+        let abs = validation_some!(value.checked_abs());
         gcd = if gcd == 0 {
             abs
         } else {
@@ -3096,15 +3642,16 @@ fn validation_normalized_linear_expr_key(expr: &ValidationLinearExpr) -> Option<
         };
     }
     if gcd == 0 {
-        return Some("0".to_string());
+        return Ok(Some("0".to_string()));
     }
 
-    let mut terms: Vec<_> = expr
-        .coeffs
-        .iter()
-        .map(|(name, coeff)| (name.as_str(), coeff / gcd))
-        .collect();
+    let mut terms = Vec::new();
+    for (name, coeff) in &expr.coeffs {
+        check(budget)?;
+        terms.push((name.as_str(), coeff / gcd));
+    }
     terms.sort_unstable_by_key(|(name, _)| *name);
+    check(budget)?;
     let mut constant = expr.constant / gcd;
     let sign = terms
         .iter()
@@ -3112,152 +3659,177 @@ fn validation_normalized_linear_expr_key(expr: &ValidationLinearExpr) -> Option<
         .unwrap_or_else(|| constant.signum());
     if sign < 0 {
         for (_, coeff) in &mut terms {
-            *coeff = coeff.checked_neg()?;
+            check(budget)?;
+            *coeff = validation_some!(coeff.checked_neg());
         }
-        constant = constant.checked_neg()?;
+        constant = validation_some!(constant.checked_neg());
     }
 
     let mut key = format!("const={constant}");
     for (name, coeff) in terms {
+        check(budget)?;
         if coeff != 0 {
             key.push_str(&format!(";{name}={coeff}"));
         }
     }
-    Some(key)
+    Ok(Some(key))
 }
 
-fn validation_normalized_linear_inequality_key(expr: &ValidationLinearExpr) -> Option<String> {
-    let gcd = validation_linear_expr_gcd(expr)?;
-    let mut terms: Vec<_> = expr
-        .coeffs
-        .iter()
-        .map(|(name, coeff)| (name.as_str(), coeff / gcd))
-        .collect();
+fn validation_normalized_linear_inequality_key(
+    expr: &ValidationLinearExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<String>> {
+    let gcd = validation_some!(validation_linear_expr_gcd(expr, budget)?);
+    let mut terms = Vec::new();
+    for (name, coeff) in &expr.coeffs {
+        check(budget)?;
+        terms.push((name.as_str(), coeff / gcd));
+    }
     terms.sort_unstable_by_key(|(name, _)| *name);
+    check(budget)?;
     let constant = expr.constant / gcd;
 
     let mut key = format!("const={constant}");
     for (name, coeff) in terms {
+        check(budget)?;
         if coeff != 0 {
             key.push_str(&format!(";{name}={coeff}"));
         }
     }
-    Some(key)
+    Ok(Some(key))
 }
 
-fn validation_linear_expr_gcd(expr: &ValidationLinearExpr) -> Option<i128> {
+fn validation_linear_expr_gcd(
+    expr: &ValidationLinearExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<i128>> {
+    check(budget)?;
     let mut gcd = 0;
     for value in expr.coeffs.values().copied().chain([expr.constant]) {
+        check(budget)?;
         if value == 0 {
             continue;
         }
-        let abs = value.checked_abs()?;
+        let abs = validation_some!(value.checked_abs());
         gcd = if gcd == 0 {
             abs
         } else {
             validation_gcd_i128(gcd, abs)
         };
     }
-    (gcd != 0).then_some(gcd)
+    Ok((gcd != 0).then_some(gcd))
 }
 
 fn validation_linear_expr_in_equality_span_bounded(
     target: &ValidationLinearExpr,
     equalities: &[ValidationLinearExpr],
-) -> bool {
-    const MAX_EQUALITIES: usize = 6;
-    if validation_linear_expr_is_zero(target) {
-        return true;
-    }
-    if equalities.len() > MAX_EQUALITIES {
-        return false;
-    }
-    validation_linear_expr_in_equality_span_rec(target, equalities, 0)
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        const MAX_EQUALITIES: usize = 6;
+        if validation_linear_expr_is_zero(target) {
+            return Ok(true);
+        }
+        if equalities.len() > MAX_EQUALITIES {
+            return Ok(false);
+        }
+        validation_linear_expr_in_equality_span_rec(target, equalities, 0, budget)
+    })
 }
 
 fn validation_linear_expr_in_equality_span_rec(
     residual: &ValidationLinearExpr,
     equalities: &[ValidationLinearExpr],
     idx: usize,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    check(budget)?;
     if validation_linear_expr_is_zero(residual) {
-        return true;
+        return Ok(true);
     }
     if idx >= equalities.len() {
-        return false;
+        return Ok(false);
     }
-    if validation_linear_expr_in_equality_span_rec(residual, equalities, idx + 1) {
-        return true;
+    if validation_linear_expr_in_equality_span_rec(residual, equalities, idx + 1, budget)? {
+        return Ok(true);
     }
     for coeff in -4..=4 {
+        check(budget)?;
         if coeff == 0 {
             continue;
         }
-        let Some(scaled) = validation_linear_expr_checked_scale(&equalities[idx], coeff) else {
+        let Some(scaled) = validation_linear_expr_checked_scale(&equalities[idx], coeff, budget)?
+        else {
             continue;
         };
-        let Some(next) = validation_linear_expr_checked_sub(residual, &scaled) else {
+        let Some(next) = validation_linear_expr_checked_sub(residual, &scaled, budget)? else {
             continue;
         };
-        if validation_linear_expr_in_equality_span_rec(&next, equalities, idx + 1) {
-            return true;
+        if validation_linear_expr_in_equality_span_rec(&next, equalities, idx + 1, budget)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn validation_linear_expr_checked_sub(
     lhs: &ValidationLinearExpr,
     rhs: &ValidationLinearExpr,
-) -> Option<ValidationLinearExpr> {
-    let negated = validation_linear_expr_checked_scale(rhs, -1)?;
-    validation_linear_expr_checked_add(lhs, &negated)
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    let negated = validation_some!(validation_linear_expr_checked_scale(rhs, -1, budget)?);
+    validation_linear_expr_checked_add(lhs, &negated, budget)
 }
 
 fn validation_linear_expr_checked_add(
     lhs: &ValidationLinearExpr,
     rhs: &ValidationLinearExpr,
-) -> Option<ValidationLinearExpr> {
-    let mut coeffs = lhs.coeffs.clone();
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    let mut coeffs = budget::clone_map(&lhs.coeffs, budget)?;
     for (name, coeff) in &rhs.coeffs {
-        let next = coeffs.get(name).copied().unwrap_or(0).checked_add(*coeff)?;
+        check(budget)?;
+        let next = validation_some!(coeffs.get(name).copied().unwrap_or(0).checked_add(*coeff));
         if next == 0 {
             coeffs.remove(name);
         } else {
             coeffs.insert(name.clone(), next);
         }
     }
-    Some(ValidationLinearExpr {
+    Ok(Some(ValidationLinearExpr {
         coeffs,
-        constant: lhs.constant.checked_add(rhs.constant)?,
-    })
+        constant: validation_some!(lhs.constant.checked_add(rhs.constant)),
+    }))
 }
 
 fn validation_linear_expr_checked_scale(
     expr: &ValidationLinearExpr,
     scale: i128,
-) -> Option<ValidationLinearExpr> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
     let mut coeffs = FxHashMap::default();
     for (name, coeff) in &expr.coeffs {
-        let scaled = coeff.checked_mul(scale)?;
+        check(budget)?;
+        let scaled = validation_some!(coeff.checked_mul(scale));
         if scaled != 0 {
             coeffs.insert(name.clone(), scaled);
         }
     }
-    Some(ValidationLinearExpr {
+    Ok(Some(ValidationLinearExpr {
         coeffs,
-        constant: expr.constant.checked_mul(scale)?,
-    })
+        constant: validation_some!(expr.constant.checked_mul(scale)),
+    }))
 }
 
 fn validation_linear_expr_checked_add_constant(
     expr: &ValidationLinearExpr,
     constant: i128,
-) -> Option<ValidationLinearExpr> {
-    Some(ValidationLinearExpr {
-        coeffs: expr.coeffs.clone(),
-        constant: expr.constant.checked_add(constant)?,
-    })
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearExpr>> {
+    Ok(Some(ValidationLinearExpr {
+        coeffs: budget::clone_map(&expr.coeffs, budget)?,
+        constant: validation_some!(expr.constant.checked_add(constant)),
+    }))
 }
 
 fn validation_linear_expr_is_zero(expr: &ValidationLinearExpr) -> bool {
@@ -3271,210 +3843,283 @@ struct ValidationLinearModResidue {
     residue: i128,
 }
 
-fn validation_body_preserves_linear_mod_residue(
+fn validation_body_preserves_linear_mod_residue_checked(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     alias_substitution: &[(ChcVar, ChcExpr)],
-) -> bool {
-    let substitution = validation_body_linear_substitution(body, alias_substitution);
-    let head_expr = conjunct.substitute(&substitution).simplify_constants();
-    let Some(head_residue) = validation_linear_mod_residue_atom(&head_expr) else {
-        return false;
-    };
-
-    body.conjuncts().into_iter().any(|body_conjunct| {
-        let body_expr = body_conjunct.substitute(&substitution).simplify_constants();
-        validation_linear_mod_residue_atom(&body_expr).is_some_and(|body_residue| {
-            validation_linear_mod_residue_implies(&body_residue, &head_residue)
-        })
-    }) || validation_body_equalities_imply_linear_mod_residue(body, &substitution, &head_residue)
-}
-
-fn validation_body_equalities_imply_linear_mod_residue(
-    body: &ChcExpr,
-    substitution: &[(ChcVar, ChcExpr)],
-    head_residue: &ValidationLinearModResidue,
-) -> bool {
-    let equalities: Vec<_> = body
-        .conjuncts()
-        .into_iter()
-        .filter_map(|body_conjunct| validation_linear_equality_expr(body_conjunct, substitution))
-        .collect();
-    (-4..=4).any(|multiple| {
-        let Some(offset) = head_residue
-            .modulus
-            .checked_mul(multiple)
-            .and_then(|value| value.checked_add(head_residue.residue))
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let substitution =
+            validation_body_linear_substitution_checked(body, alias_substitution, budget)?;
+        let substituted = budget::substitute(conjunct, &substitution, budget)?;
+        let head_expr = budget::simplify(&substituted, budget)?;
+        let Some(head_residue) = validation_linear_mod_residue_atom_checked(&head_expr, budget)?
         else {
-            return false;
+            return Ok(false);
         };
-        let Some(residual) =
-            validation_linear_expr_checked_add_constant(&head_residue.expr, -offset)
-        else {
-            return false;
-        };
-        validation_linear_expr_in_equality_span_bounded(&residual, &equalities)
+        for body_conjunct in budget::conjuncts(&body, budget)? {
+            let substituted = budget::substitute(body_conjunct, &substitution, budget)?;
+            let body_expr = budget::simplify(&substituted, budget)?;
+            if let Some(value) = validation_linear_mod_residue_atom_checked(&body_expr, budget)? {
+                if validation_linear_mod_residue_implies(&value, &head_residue, budget)? {
+                    return Ok(true);
+                }
+            }
+        }
+        validation_body_equalities_imply_linear_mod_residue_checked(
+            body,
+            &substitution,
+            &head_residue,
+            budget,
+        )
     })
 }
 
-fn validation_body_linear_substitution(
+fn validation_body_equalities_imply_linear_mod_residue_checked(
     body: &ChcExpr,
-    alias_substitution: &[(ChcVar, ChcExpr)],
-) -> Vec<(ChcVar, ChcExpr)> {
-    let mut substitution = alias_substitution.to_vec();
-    let max_rounds = body.conjuncts().len().saturating_add(4).clamp(1, 32);
-    for _ in 0..max_rounds {
-        let before = substitution.len();
-        for conjunct in body.conjuncts() {
-            let simplified = conjunct.substitute(&substitution).simplify_constants();
-            let Some((var, expr)) = validation_linear_expr_alias(&simplified) else {
+    substitution: &[(ChcVar, ChcExpr)],
+    head_residue: &ValidationLinearModResidue,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::run(budget, || {
+        let mut equalities = Vec::new();
+        for conjunct in budget::conjuncts(&body, budget)? {
+            if let Some(value) =
+                validation_linear_equality_expr_checked(conjunct, substitution, budget)?
+            {
+                equalities.push(value);
+            }
+        }
+        for multiple in -4..=4 {
+            check(budget)?;
+            let Some(offset) = head_residue
+                .modulus
+                .checked_mul(multiple)
+                .and_then(|value| value.checked_add(head_residue.residue))
+            else {
                 continue;
             };
-            if substitution.iter().any(|(existing, _)| existing == &var)
-                || expr.contains_var_name(&var.name)
-                || expr.sort() != var.sort
-            {
+            let Some(residual) =
+                validation_linear_expr_checked_add_constant(&head_residue.expr, -offset, budget)?
+            else {
                 continue;
+            };
+            if validation_linear_expr_in_equality_span_bounded(&residual, &equalities, budget)? {
+                return Ok(true);
             }
-            substitution.push((var, expr));
         }
-        if substitution.len() == before {
-            break;
-        }
-    }
-    substitution
+        Ok(false)
+    })
 }
 
-fn validation_linear_expr_alias(expr: &ChcExpr) -> Option<(ChcVar, ChcExpr)> {
+fn validation_body_linear_substitution_checked(
+    body: &ChcExpr,
+    alias_substitution: &[(ChcVar, ChcExpr)],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Vec<(ChcVar, ChcExpr)>> {
+    budget::run(budget, || {
+        let mut substitution = budget::cloned(alias_substitution, budget)?;
+        let max_rounds = budget::conjuncts(&body, budget)?
+            .len()
+            .saturating_add(4)
+            .clamp(1, 32);
+        for _ in 0..max_rounds {
+            check(budget)?;
+            let before = substitution.len();
+            for conjunct in budget::conjuncts(&body, budget)? {
+                let substituted = budget::substitute(conjunct, &substitution, budget)?;
+                let simplified = budget::simplify(&substituted, budget)?;
+                let Some((var, expr)) = validation_linear_expr_alias(&simplified, budget)? else {
+                    continue;
+                };
+                if budget::any(substitution.iter(), budget, |(existing, _)| {
+                    Ok(existing == &var)
+                })? || budget::contains_var_name(&expr, &var.name, budget)?
+                    || expr.sort() != var.sort
+                {
+                    continue;
+                }
+                substitution.push((var, expr));
+            }
+            if substitution.len() == before {
+                break;
+            }
+        }
+        Ok(substitution)
+    })
+}
+
+fn validation_linear_expr_alias(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(ChcVar, ChcExpr)>> {
     let ChcExpr::Op(ChcOp::Eq, args) = expr else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    validation_linear_expr_alias_sides(args[0].as_ref(), args[1].as_ref())
-        .or_else(|| validation_linear_expr_alias_sides(args[1].as_ref(), args[0].as_ref()))
+    if let Some(value) = validation_linear_expr_alias_sides(&args[0], &args[1], budget)? {
+        return Ok(Some(value));
+    }
+    validation_linear_expr_alias_sides(&args[1], &args[0], budget)
 }
 
-fn validation_linear_expr_alias_sides(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(ChcVar, ChcExpr)> {
+fn validation_linear_expr_alias_sides(
+    lhs: &ChcExpr,
+    rhs: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(ChcVar, ChcExpr)>> {
     let ChcExpr::Var(var) = lhs else {
-        return None;
+        return Ok(None);
     };
     if var.sort != ChcSort::Int || matches!(rhs, ChcExpr::Var(_)) {
-        return None;
+        return Ok(None);
     }
-    validation_linear_expr(rhs)?;
-    Some((var.clone(), rhs.clone()))
+    validation_some!(validation_linear_expr(rhs, budget)?);
+    Ok(Some((var.clone(), rhs.clone())))
 }
 
-fn validation_linear_mod_residue_atom(expr: &ChcExpr) -> Option<ValidationLinearModResidue> {
-    let simplified = expr.simplify_constants();
-    let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    validation_linear_mod_residue_from_parts(args[0].as_ref(), args[1].as_ref())
-        .or_else(|| validation_linear_mod_residue_from_parts(args[1].as_ref(), args[0].as_ref()))
+fn validation_linear_mod_residue_atom_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearModResidue>> {
+    budget::run(budget, || {
+        let simplified = budget::simplify(expr, budget)?;
+        let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
+            return Ok(None);
+        };
+        if args.len() != 2 {
+            return Ok(None);
+        }
+        if let Some(value) = validation_linear_mod_residue_from_parts(&args[0], &args[1], budget)? {
+            return Ok(Some(value));
+        }
+        validation_linear_mod_residue_from_parts(&args[1], &args[0], budget)
+    })
 }
 
 fn validation_linear_mod_residue_from_parts(
     lhs: &ChcExpr,
     rhs: &ChcExpr,
-) -> Option<ValidationLinearModResidue> {
-    let ChcExpr::Op(ChcOp::Mod, mod_args) = lhs else {
-        return None;
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ValidationLinearModResidue>> {
+    let ChcExpr::Op(ChcOp::Mod, args) = lhs else {
+        return Ok(None);
     };
-    if mod_args.len() != 2 {
-        return None;
+    if args.len() != 2 {
+        return Ok(None);
     }
-    let modulus = mod_args[1].as_i128()?;
+    let modulus = validation_some!(args[1].as_i128());
     if modulus <= 1 {
-        return None;
+        return Ok(None);
     }
-    let residue = rhs.as_i128()?.rem_euclid(modulus);
-    Some(ValidationLinearModResidue {
-        expr: validation_linear_expr(mod_args[0].as_ref())?,
+    let residue = validation_some!(rhs.as_i128()).rem_euclid(modulus);
+    Ok(Some(ValidationLinearModResidue {
+        expr: validation_some!(validation_linear_expr(&args[0], budget)?),
         modulus,
         residue,
-    })
+    }))
 }
 
 fn validation_linear_mod_residue_implies(
     body: &ValidationLinearModResidue,
     head: &ValidationLinearModResidue,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     if body.modulus % head.modulus != 0 {
-        return false;
+        return Ok(false);
     }
     let modulus = i128::from(head.modulus);
-    let mut names: FxHashSet<&str> = FxHashSet::default();
-    names.extend(body.expr.coeffs.keys().map(String::as_str));
-    names.extend(head.expr.coeffs.keys().map(String::as_str));
+    let mut names = FxHashSet::default();
+    for name in body.expr.coeffs.keys().chain(head.expr.coeffs.keys()) {
+        check(budget)?;
+        names.insert(name.as_str());
+    }
     for name in names {
+        check(budget)?;
         let body_coeff = i128::from(body.expr.coeffs.get(name).copied().unwrap_or(0));
         let head_coeff = i128::from(head.expr.coeffs.get(name).copied().unwrap_or(0));
         if (head_coeff - body_coeff).rem_euclid(modulus) != 0 {
-            return false;
+            return Ok(false);
         }
     }
     let constant_delta = i128::from(head.expr.constant) - i128::from(body.expr.constant);
     let implied_residue = (i128::from(body.residue) + constant_delta).rem_euclid(modulus);
-    implied_residue == i128::from(head.residue.rem_euclid(head.modulus))
+    Ok(implied_residue == i128::from(head.residue.rem_euclid(head.modulus)))
 }
 
-fn validation_alias_normalized_expr_key(
+fn validation_alias_normalized_expr_key_checked(
     expr: &ChcExpr,
     substitution: &[(ChcVar, ChcExpr)],
-) -> String {
-    if substitution.is_empty() {
-        return validation_expr_key(&expr.simplify_constants());
-    }
-    validation_expr_key(&expr.substitute(substitution).simplify_constants())
+    budget: &SynthesisBudget,
+) -> ValidationResult<String> {
+    budget::run(budget, || {
+        let normalized = if substitution.is_empty() {
+            expr.clone()
+        } else {
+            budget::substitute(expr, substitution, budget)?
+        };
+        check(budget)?;
+        validation_expr_key_checked(&budget::simplify(&normalized, budget)?, budget)
+    })
 }
 
-fn validation_alias_substitution(body: &ChcExpr) -> Vec<(ChcVar, ChcExpr)> {
-    let mut parent: FxHashMap<ChcVar, ChcVar> = FxHashMap::default();
-    for conjunct in body.conjuncts() {
-        let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
-            continue;
-        };
-        if args.len() != 2 {
-            continue;
+fn validation_alias_substitution_checked(
+    body: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Vec<(ChcVar, ChcExpr)>> {
+    budget::run(budget, || {
+        let mut parent = FxHashMap::default();
+        for conjunct in budget::conjuncts(&body, budget)? {
+            check(budget)?;
+            let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
+                continue;
+            };
+            if args.len() != 2 {
+                continue;
+            }
+            let (ChcExpr::Var(lhs), ChcExpr::Var(rhs)) = (args[0].as_ref(), args[1].as_ref())
+            else {
+                continue;
+            };
+            if lhs.sort != rhs.sort {
+                continue;
+            }
+            validation_alias_union_checked(&mut parent, lhs.clone(), rhs.clone(), budget)?;
         }
-        let (ChcExpr::Var(lhs), ChcExpr::Var(rhs)) = (args[0].as_ref(), args[1].as_ref()) else {
-            continue;
-        };
-        if lhs.sort != rhs.sort {
-            continue;
+        let mut keys = Vec::new();
+        for key in parent.keys() {
+            check(budget)?;
+            keys.push(key.clone());
         }
-        validation_alias_union(&mut parent, lhs.clone(), rhs.clone());
-    }
-
-    let keys: Vec<ChcVar> = parent.keys().cloned().collect();
-    let mut substitution = Vec::new();
-    for var in keys {
-        let root = validation_alias_find(&mut parent, &var);
-        if root != var {
-            substitution.push((var, ChcExpr::var(root)));
+        let mut substitution = Vec::new();
+        for var in keys {
+            let root = validation_alias_find_checked(&mut parent, &var, budget)?;
+            if root != var {
+                substitution.push((var, ChcExpr::var(root)));
+            }
         }
-    }
-    for conjunct in body.conjuncts() {
-        let Some((var, expr)) = validation_bool_expr_alias(conjunct) else {
-            continue;
-        };
-        if substitution.iter().any(|(existing, _)| existing == &var)
-            || expr.contains_var_name(&var.name)
-        {
-            continue;
+        for conjunct in budget::conjuncts(&body, budget)? {
+            check(budget)?;
+            let Some((var, expr)) = validation_bool_expr_alias(conjunct) else {
+                continue;
+            };
+            if budget::any(substitution.iter(), budget, |(existing, _)| {
+                Ok(existing == &var)
+            })? || budget::contains_var_name(&expr, &var.name, budget)?
+            {
+                continue;
+            }
+            let expr = budget::substitute(&expr, &substitution, budget)?;
+            let expr = budget::simplify(&expr, budget)?;
+            if !budget::contains_var_name(&expr, &var.name, budget)? {
+                substitution.push((var, expr));
+            }
         }
-        let expr = expr.substitute(&substitution).simplify_constants();
-        if !expr.contains_var_name(&var.name) {
-            substitution.push((var, expr));
-        }
-    }
-    substitution
+        Ok(substitution)
+    })
 }
 
 fn validation_bool_expr_alias(expr: &ChcExpr) -> Option<(ChcVar, ChcExpr)> {
@@ -3498,64 +4143,99 @@ fn validation_bool_expr_alias_sides(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(Chc
     Some((var.clone(), rhs.clone()))
 }
 
-fn validation_alias_union(parent: &mut FxHashMap<ChcVar, ChcVar>, lhs: ChcVar, rhs: ChcVar) {
-    parent.entry(lhs.clone()).or_insert_with(|| lhs.clone());
-    parent.entry(rhs.clone()).or_insert_with(|| rhs.clone());
-    let lhs_root = validation_alias_find(parent, &lhs);
-    let rhs_root = validation_alias_find(parent, &rhs);
-    if lhs_root == rhs_root {
-        return;
-    }
-    let (keep, replace) =
-        if validation_alias_var_key(&lhs_root) <= validation_alias_var_key(&rhs_root) {
+fn validation_alias_union_checked(
+    parent: &mut FxHashMap<ChcVar, ChcVar>,
+    lhs: ChcVar,
+    rhs: ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<()> {
+    budget::run(budget, || {
+        parent.entry(lhs.clone()).or_insert_with(|| lhs.clone());
+        parent.entry(rhs.clone()).or_insert_with(|| rhs.clone());
+        let lhs_root = validation_alias_find_checked(parent, &lhs, budget)?;
+        let rhs_root = validation_alias_find_checked(parent, &rhs, budget)?;
+        if lhs_root == rhs_root {
+            return Ok(());
+        }
+        let (keep, replace) = if validation_alias_var_key_checked(&lhs_root, budget)?
+            <= validation_alias_var_key_checked(&rhs_root, budget)?
+        {
             (lhs_root, rhs_root)
         } else {
             (rhs_root, lhs_root)
         };
-    parent.insert(replace, keep);
+        parent.insert(replace, keep);
+        Ok(())
+    })
 }
 
-fn validation_alias_find(parent: &mut FxHashMap<ChcVar, ChcVar>, var: &ChcVar) -> ChcVar {
-    let Some(current) = parent.get(var).cloned() else {
-        return var.clone();
-    };
-    if current == *var {
-        return current;
-    }
-    let root = validation_alias_find(parent, &current);
-    parent.insert(var.clone(), root.clone());
-    root
+fn validation_alias_find_checked(
+    parent: &mut FxHashMap<ChcVar, ChcVar>,
+    var: &ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<ChcVar> {
+    budget::run(budget, || {
+        let mut current = var.clone();
+        let mut path = Vec::new();
+        loop {
+            check(budget)?;
+            let Some(next) = parent.get(&current).cloned() else {
+                break;
+            };
+            if next == current {
+                break;
+            }
+            path.push(current);
+            current = next;
+        }
+        for item in path.into_iter().rev() {
+            check(budget)?;
+            parent.insert(item, current.clone());
+        }
+        Ok(current)
+    })
 }
 
-fn validation_alias_var_key(var: &ChcVar) -> String {
-    format!("{:?}:{}", var.sort, var.name)
+fn validation_alias_var_key_checked(
+    var: &ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<String> {
+    budget::run(budget, || {
+        let mut key = budget::debug_key(&var.sort, budget)?;
+        key.push(':');
+        key.push_str(&var.name);
+        Ok(key)
+    })
 }
 
 fn active_diff_transition_syntactically_preserves_conjunct(
     body: &ChcExpr,
     conjunct: &ChcExpr,
     shape: &ActiveDiffInvariantShape,
-) -> bool {
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
     let Some((active_a, active_b, epsilon, value_a, value_b)) =
-        parse_active_diff_invariant_clause(conjunct)
+        parse_active_diff_invariant_clause(conjunct, budget)?
     else {
-        return false;
+        return Ok(false);
     };
     if shape
         .epsilon
         .as_ref()
         .is_none_or(|shape_epsilon| shape_epsilon.name != epsilon.name)
-        || !shape.has_active(&active_a)
-        || !shape.has_active(&active_b)
-        || !shape.has_value(&value_a)
-        || !shape.has_value(&value_b)
+        || !shape.has_active(&active_a, budget)?
+        || !shape.has_active(&active_b, budget)?
+        || !shape.has_value(&value_a, budget)?
+        || !shape.has_value(&value_b, budget)?
     {
-        return false;
+        return Ok(false);
     }
-    (body_has_guarded_average_assignment(body, &active_a, &value_a)
-        && body_has_guarded_average_assignment(body, &active_b, &value_b))
-        || (body_has_guarded_average_assignment(body, &active_a, &value_b)
-            && body_has_guarded_average_assignment(body, &active_b, &value_a))
+    Ok(
+        (body_has_guarded_average_assignment(body, &active_a, &value_a, budget)?
+            && body_has_guarded_average_assignment(body, &active_b, &value_b, budget)?)
+            || (body_has_guarded_average_assignment(body, &active_a, &value_b, budget)?
+                && body_has_guarded_average_assignment(body, &active_b, &value_a, budget)?),
+    )
 }
 
 struct ActiveDiffInvariantShape {
@@ -3565,67 +4245,69 @@ struct ActiveDiffInvariantShape {
 }
 
 impl ActiveDiffInvariantShape {
-    fn has_active(&self, var: &ChcVar) -> bool {
-        self.active_vars
-            .iter()
-            .any(|active| active.name == var.name)
+    fn has_active(&self, var: &ChcVar, budget: &SynthesisBudget) -> ValidationResult<bool> {
+        budget::any(&self.active_vars, budget, |v| Ok(v.name == var.name))
     }
-
-    fn has_value(&self, var: &ChcVar) -> bool {
-        self.value_vars.iter().any(|value| value.name == var.name)
+    fn has_value(&self, var: &ChcVar, budget: &SynthesisBudget) -> ValidationResult<bool> {
+        budget::any(&self.value_vars, budget, |v| Ok(v.name == var.name))
     }
 }
 
-fn extract_active_diff_invariant_shape(head: &ChcExpr) -> Option<ActiveDiffInvariantShape> {
+fn extract_active_diff_invariant_shape(
+    head: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ActiveDiffInvariantShape>> {
     let mut active_vars: Vec<ChcVar> = Vec::new();
     let mut value_vars: Vec<ChcVar> = Vec::new();
     let mut eps: Option<ChcVar> = None;
     let mut diff_clause_count = 0usize;
 
-    for conjunct in head.conjuncts() {
+    for conjunct in budget::conjuncts(&head, budget)? {
         let Some((active_a, active_b, clause_eps, value_a, value_b)) =
-            parse_active_diff_invariant_clause(conjunct)
+            parse_active_diff_invariant_clause(conjunct, budget)?
         else {
             continue;
         };
         if let Some(existing) = &eps {
             if existing.name != clause_eps.name {
-                return None;
+                return Ok(None);
             }
         } else {
             eps = Some(clause_eps);
         }
-        push_unique_var(&mut active_vars, active_a);
-        push_unique_var(&mut active_vars, active_b);
-        push_unique_var(&mut value_vars, value_a);
-        push_unique_var(&mut value_vars, value_b);
+        push_unique_var(&mut active_vars, active_a, budget)?;
+        push_unique_var(&mut active_vars, active_b, budget)?;
+        push_unique_var(&mut value_vars, value_a, budget)?;
+        push_unique_var(&mut value_vars, value_b, budget)?;
         diff_clause_count += 1;
     }
 
     if active_vars.len() != value_vars.len() || active_vars.len() < 2 {
-        return None;
+        return Ok(None);
     }
     let expected_diff_clauses = active_vars.len() * active_vars.len().saturating_sub(1);
     if diff_clause_count < expected_diff_clauses {
-        return None;
+        return Ok(None);
     }
 
-    Some(ActiveDiffInvariantShape {
+    Ok(Some(ActiveDiffInvariantShape {
         epsilon: eps,
         active_vars,
         value_vars,
-    })
+    }))
 }
 
 fn parse_active_diff_invariant_clause(
     expr: &ChcExpr,
-) -> Option<(ChcVar, ChcVar, ChcVar, ChcVar, ChcVar)> {
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(ChcVar, ChcVar, ChcVar, ChcVar, ChcVar)>> {
     let ChcExpr::Op(ChcOp::Or, args) = expr else {
-        return None;
+        return Ok(None);
     };
     let mut active = Vec::new();
     let mut diff = None;
     for arg in args {
+        check(budget)?;
         if let Some(var) = negative_bool_var(arg) {
             active.push(var);
             continue;
@@ -3635,30 +4317,46 @@ fn parse_active_diff_invariant_clause(
         }
     }
     if active.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    let (eps, value_a, value_b) = diff?;
-    Some((active[0].clone(), active[1].clone(), eps, value_a, value_b))
+    let (eps, value_a, value_b) = validation_some!(diff);
+    Ok(Some((
+        active[0].clone(),
+        active[1].clone(),
+        eps,
+        value_a,
+        value_b,
+    )))
 }
 
-fn push_unique_var(vars: &mut Vec<ChcVar>, var: ChcVar) {
-    if !vars.iter().any(|existing| existing.name == var.name) {
+fn push_unique_var(
+    vars: &mut Vec<ChcVar>,
+    var: ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<()> {
+    if !budget::any(vars.iter(), budget, |v| Ok(v.name == var.name))? {
         vars.push(var);
     }
+    Ok(())
 }
 
-fn body_has_guarded_average_assignment(body: &ChcExpr, active: &ChcVar, value: &ChcVar) -> bool {
+fn body_has_guarded_average_assignment(
+    body: &ChcExpr,
+    active: &ChcVar,
+    value: &ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    check(budget)?;
     match body {
         ChcExpr::Op(ChcOp::Or, args) => {
-            let has_guard = args
-                .iter()
-                .any(|arg| negative_bool_var(arg).is_some_and(|var| var.name == active.name));
-            has_guard && args.iter().any(|arg| is_assignment_to_average(arg, value))
+            Ok(budget::any(args, budget, |a| {
+                Ok(negative_bool_var(a).is_some_and(|v| v.name == active.name))
+            })? && budget::any(args, budget, |a| Ok(is_assignment_to_average(a, value)))?)
         }
-        ChcExpr::Op(_, args) => args
-            .iter()
-            .any(|arg| body_has_guarded_average_assignment(arg, active, value)),
-        _ => false,
+        ChcExpr::Op(_, args) => budget::any(args, budget, |a| {
+            body_has_guarded_average_assignment(a, active, value, budget)
+        }),
+        _ => Ok(false),
     }
 }
 
@@ -3693,74 +4391,97 @@ fn is_half_scaled_expr(expr: &ChcExpr) -> bool {
             .any(|arg| matches!(arg.as_ref(), ChcExpr::Real(1, 2)))
 }
 
-fn collect_guarded_active_diff_implications(
+fn collect_guarded_active_diff_implications_checked(
     expr: &ChcExpr,
     active_context: &mut Vec<ChcVar>,
     implied: &mut FxHashSet<String>,
-) {
-    if let Some((epsilon, value_a, value_b)) = parse_negated_epsilon_distance_guard(expr) {
-        let mut active = active_context.clone();
-        active.sort_by(|a, b| a.name.cmp(&b.name));
-        active.dedup_by(|a, b| a.name == b.name);
-        if active.len() == 2 {
-            let clause = ChcExpr::or_all([
-                ChcExpr::not(ChcExpr::var(active[0].clone())),
-                ChcExpr::not(ChcExpr::var(active[1].clone())),
-                ChcExpr::not(ChcExpr::le(
-                    ChcExpr::var(epsilon),
-                    ChcExpr::sub(ChcExpr::var(value_a), ChcExpr::var(value_b)),
-                )),
-            ]);
-            implied.insert(validation_expr_key(&clause));
-        }
-        return;
-    }
-
-    let ChcExpr::Op(op, args) = expr else {
-        return;
-    };
-
-    match op {
-        ChcOp::And => {
-            for arg in args {
-                collect_guarded_active_diff_implications(arg, active_context, implied);
+    budget: &SynthesisBudget,
+) -> ValidationResult<()> {
+    budget::run(budget, || {
+        if let Some((epsilon, value_a, value_b)) = parse_negated_epsilon_distance_guard(expr) {
+            let mut active = Vec::new();
+            for var in active_context.iter() {
+                check(budget)?;
+                active.push(var.clone());
             }
+            active.sort_by(|a, b| a.name.cmp(&b.name));
+            active.dedup_by(|a, b| a.name == b.name);
+            if active.len() == 2 {
+                let clause = ChcExpr::or_all([
+                    ChcExpr::not(ChcExpr::var(active[0].clone())),
+                    ChcExpr::not(ChcExpr::var(active[1].clone())),
+                    ChcExpr::not(ChcExpr::le(
+                        ChcExpr::var(epsilon),
+                        ChcExpr::sub(ChcExpr::var(value_a), ChcExpr::var(value_b)),
+                    )),
+                ]);
+                implied.insert(validation_expr_key_checked(&clause, budget)?);
+            }
+            return Ok(());
         }
-        ChcOp::Or => {
-            let mut guards = Vec::new();
-            let mut guarded_payloads = Vec::new();
-            for arg in args {
-                if let Some(var) = negative_bool_var(arg) {
-                    guards.push(var);
-                } else {
-                    guarded_payloads.push(arg);
+
+        let ChcExpr::Op(op, args) = expr else {
+            return Ok(());
+        };
+
+        match op {
+            ChcOp::And => {
+                for arg in args {
+                    check(budget)?;
+                    collect_guarded_active_diff_implications_checked(
+                        arg,
+                        active_context,
+                        implied,
+                        budget,
+                    )?;
                 }
             }
-            if !guards.is_empty() && guarded_payloads.len() == 1 {
-                let original_len = active_context.len();
-                for guard in guards {
-                    if !active_context
-                        .iter()
-                        .any(|active| active.name == guard.name)
-                    {
-                        active_context.push(guard);
+            ChcOp::Or => {
+                let mut guards = Vec::new();
+                let mut guarded_payloads = Vec::new();
+                for arg in args {
+                    check(budget)?;
+                    if let Some(var) = negative_bool_var(arg) {
+                        guards.push(var);
+                    } else {
+                        guarded_payloads.push(arg);
                     }
                 }
-                collect_guarded_active_diff_implications(
-                    guarded_payloads[0],
-                    active_context,
-                    implied,
-                );
-                active_context.truncate(original_len);
+                if !guards.is_empty() && guarded_payloads.len() == 1 {
+                    let original_len = active_context.len();
+                    for guard in guards {
+                        check(budget)?;
+                        if !budget::any(active_context.iter(), budget, |active| {
+                            Ok(active.name == guard.name)
+                        })? {
+                            active_context.push(guard);
+                        }
+                    }
+                    collect_guarded_active_diff_implications_checked(
+                        guarded_payloads[0],
+                        active_context,
+                        implied,
+                        budget,
+                    )?;
+                    active_context.truncate(original_len);
+                }
+            }
+            ChcOp::Not => {}
+            _ => {
+                for arg in args {
+                    check(budget)?;
+                    collect_guarded_active_diff_implications_checked(
+                        arg,
+                        active_context,
+                        implied,
+                        budget,
+                    )?;
+                }
             }
         }
-        ChcOp::Not => {}
-        _ => {
-            for arg in args {
-                collect_guarded_active_diff_implications(arg, active_context, implied);
-            }
-        }
-    }
+
+        Ok(())
+    })
 }
 
 fn negative_bool_var(expr: &ChcExpr) -> Option<ChcVar> {
@@ -3859,30 +4580,41 @@ fn is_minus_one(expr: &ChcExpr) -> bool {
         || matches!(expr, ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 && matches!(args[0].as_ref(), ChcExpr::Int(1) | ChcExpr::Real(1, 1)))
 }
 
-fn validation_expr_key(expr: &ChcExpr) -> String {
-    format!("{:?}", canonical_validation_expr(expr))
+fn validation_expr_key_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<String> {
+    budget::run(budget, || {
+        let canonical = canonical_validation_expr_checked(expr, budget)?;
+        budget::debug_key(&canonical, budget)
+    })
 }
 
-fn canonical_bool_domain_int_expr(expr: &ChcExpr) -> Option<ChcExpr> {
-    if let Some(as_int) = bool_bitvec_ite_as_int_expr(expr) {
-        return Some(as_int);
-    }
-    if let ChcExpr::Op(ChcOp::Bv2Nat, args) = expr {
-        if args.len() == 1 {
-            return bool_bitvec_ite_as_int_expr(args[0].as_ref());
+fn canonical_bool_domain_int_expr_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<ChcExpr>> {
+    budget::run(budget, || {
+        if let Some(as_int) = bool_bitvec_ite_as_int_expr(expr) {
+            return Ok(Some(as_int));
         }
-    }
-    if let Some((payload, width)) = signed_bv_to_int_payload_and_width(expr) {
-        if width > 1 && validation_expr_has_bool_domain(payload) {
-            return bool_domain_payload_to_int_expr(payload);
+        if let ChcExpr::Op(ChcOp::Bv2Nat, args) = expr {
+            if args.len() == 1 {
+                return Ok(bool_bitvec_ite_as_int_expr(args[0].as_ref()));
+            }
         }
-    }
-    if let Some((payload, _)) = unsigned_bv_to_int_payload(expr) {
-        if validation_expr_has_bool_domain(payload) {
-            return bool_domain_payload_to_int_expr(payload);
+        if let Some((payload, width)) = signed_bv_to_int_payload_and_width_checked(expr, budget)? {
+            if width > 1 && validation_expr_has_bool_domain_checked(payload, budget)? {
+                return Ok(bool_domain_payload_to_int_expr(payload));
+            }
         }
-    }
-    None
+        if let Some((payload, _)) = unsigned_bv_to_int_payload(expr, budget)? {
+            if validation_expr_has_bool_domain_checked(payload, budget)? {
+                return Ok(bool_domain_payload_to_int_expr(payload));
+            }
+        }
+        Ok(None)
+    })
 }
 
 fn bool_domain_payload_to_int_expr(payload: &ChcExpr) -> Option<ChcExpr> {
@@ -3892,102 +4624,122 @@ fn bool_domain_payload_to_int_expr(payload: &ChcExpr) -> Option<ChcExpr> {
     bool_bitvec_ite_as_int_expr(payload)
 }
 
-fn canonical_validation_expr(expr: &ChcExpr) -> ChcExpr {
-    if let Some(as_int) = canonical_bool_domain_int_expr(expr) {
-        return canonical_validation_expr(&as_int);
+fn canonical_validation_expr_checked(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<ChcExpr> {
+    budget::run(budget, || {
+        if let Some(as_int) = canonical_bool_domain_int_expr_checked(expr, budget)? {
+            return canonical_validation_expr_checked(&as_int, budget);
+        }
+        if let ChcExpr::Op(ChcOp::Ite, args) = expr {
+            if args.len() == 3 {
+                if let Some(condition) =
+                    validation_static_bool_result_checked(args[0].as_ref(), budget)?
+                {
+                    return canonical_validation_expr_checked(
+                        args[if condition { 1 } else { 2 }].as_ref(),
+                        budget,
+                    );
+                }
+            }
+        }
+        Ok(match expr {
+            ChcExpr::Op(
+                op @ (ChcOp::And | ChcOp::Or | ChcOp::Add | ChcOp::Mul | ChcOp::Eq | ChcOp::Ne),
+                args,
+            ) => {
+                // Only complete keys reach the stable sort. No failed or truncated
+                // key participates in ordering or in a canonical identity.
+                let mut keyed = Vec::with_capacity(args.len());
+                for arg in args {
+                    let value = canonical_validation_expr_checked(arg, budget)?;
+                    let key = budget::debug_key(&value, budget)?;
+                    keyed.push((key, value));
+                }
+                check(budget)?;
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                check(budget)?;
+                ChcExpr::Op(
+                    *op,
+                    keyed
+                        .into_iter()
+                        .map(|(_, value)| std::sync::Arc::new(value))
+                        .collect(),
+                )
+            }
+            ChcExpr::Op(op, args) => ChcExpr::Op(*op, canonical_args_checked(args, budget)?),
+            ChcExpr::PredicateApp(name, pred, args) => {
+                ChcExpr::PredicateApp(name.clone(), *pred, canonical_args_checked(args, budget)?)
+            }
+            ChcExpr::FuncApp(name, sort, args) => ChcExpr::FuncApp(
+                name.clone(),
+                sort.clone(),
+                canonical_args_checked(args, budget)?,
+            ),
+            ChcExpr::ConstArray(sort, value) => ChcExpr::ConstArray(
+                sort.clone(),
+                std::sync::Arc::new(canonical_validation_expr_checked(value, budget)?),
+            ),
+            other => other.clone(),
+        })
+    })
+}
+
+fn canonical_args_checked(
+    args: &[std::sync::Arc<ChcExpr>],
+    budget: &SynthesisBudget,
+) -> ValidationResult<Vec<std::sync::Arc<ChcExpr>>> {
+    args.iter()
+        .map(|arg| canonical_validation_expr_checked(arg, budget).map(std::sync::Arc::new))
+        .collect()
+}
+
+fn triangular_accumulator_query_is_syntactically_unsat(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    let conjuncts = budget::conjuncts(expr, budget)?;
+    let mut identities = Vec::new();
+    for conjunct in &conjuncts {
+        if let Some(identity) = triangular_accumulator_identity(conjunct, budget)? {
+            identities.push(identity);
+        }
     }
-    if let ChcExpr::Op(ChcOp::Ite, args) = expr {
-        if args.len() == 3 {
-            if let Some(condition) = validation_static_bool_result(args[0].as_ref()) {
-                return canonical_validation_expr(args[if condition { 1 } else { 2 }].as_ref());
+    if identities.is_empty() {
+        return Ok(false);
+    }
+    for conjunct in &conjuncts {
+        check(budget)?;
+        if let Some((sum_var, bound_var)) = sum_gt_square_query(conjunct) {
+            for (identity_sum, counter_var) in &identities {
+                check(budget)?;
+                if identity_sum == &sum_var
+                    && has_nonnegative_bound(&conjuncts, counter_var, budget)?
+                    && has_nonnegative_bound(&conjuncts, &bound_var, budget)?
+                    && has_le_relation(&conjuncts, counter_var, &bound_var, budget)?
+                {
+                    return Ok(true);
+                }
             }
         }
     }
-    match expr {
-        ChcExpr::Op(
-            op @ (ChcOp::And | ChcOp::Or | ChcOp::Add | ChcOp::Mul | ChcOp::Eq | ChcOp::Ne),
-            args,
-        ) => {
-            let mut canonical_args: Vec<ChcExpr> = args
-                .iter()
-                .map(|arg| canonical_validation_expr(arg))
-                .collect();
-            // Perf: sort_by_cached_key formats each arg's Debug string exactly
-            // once (n times) instead of sort_by_key re-evaluating it on every
-            // comparison (O(n log n) full-subtree Debug formats). Identical
-            // canonical ordering; this is a hot path in algebraic-invariant
-            // validation (profiled as the dominant Debug::fmt/alloc churn on
-            // sally/oral_messages). #9072
-            canonical_args.sort_by_cached_key(|arg| format!("{arg:?}"));
-            ChcExpr::Op(
-                *op,
-                canonical_args
-                    .into_iter()
-                    .map(std::sync::Arc::new)
-                    .collect(),
-            )
-        }
-        ChcExpr::Op(op, args) => ChcExpr::Op(
-            *op,
-            args.iter()
-                .map(|arg| std::sync::Arc::new(canonical_validation_expr(arg)))
-                .collect(),
-        ),
-        ChcExpr::PredicateApp(name, pred, args) => ChcExpr::PredicateApp(
-            name.clone(),
-            *pred,
-            args.iter()
-                .map(|arg| std::sync::Arc::new(canonical_validation_expr(arg)))
-                .collect(),
-        ),
-        ChcExpr::FuncApp(name, sort, args) => ChcExpr::FuncApp(
-            name.clone(),
-            sort.clone(),
-            args.iter()
-                .map(|arg| std::sync::Arc::new(canonical_validation_expr(arg)))
-                .collect(),
-        ),
-        ChcExpr::ConstArray(sort, value) => ChcExpr::ConstArray(
-            sort.clone(),
-            std::sync::Arc::new(canonical_validation_expr(value)),
-        ),
-        other => other.clone(),
-    }
+    Ok(false)
 }
 
-fn triangular_accumulator_query_is_syntactically_unsat(check: &ChcExpr) -> bool {
-    let conjuncts = check.conjuncts();
-    let identities: Vec<(ChcVar, ChcVar)> = conjuncts
-        .iter()
-        .filter_map(|expr| triangular_accumulator_identity(expr))
-        .collect();
-    if identities.is_empty() {
-        return false;
-    }
-
-    conjuncts
-        .iter()
-        .filter_map(|expr| sum_gt_square_query(expr))
-        .any(|(sum_var, bound_var)| {
-            identities.iter().any(|(identity_sum, counter_var)| {
-                identity_sum == &sum_var
-                    && has_nonnegative_bound(&conjuncts, counter_var)
-                    && has_nonnegative_bound(&conjuncts, &bound_var)
-                    && has_le_relation(&conjuncts, counter_var, &bound_var)
-            })
-        })
-}
-
-fn triangular_accumulator_identity(expr: &ChcExpr) -> Option<(ChcVar, ChcVar)> {
-    let simplified = expr.simplify_constants();
+fn triangular_accumulator_identity(
+    expr: &ChcExpr,
+    budget: &SynthesisBudget,
+) -> ValidationResult<Option<(ChcVar, ChcVar)>> {
+    let simplified = budget::simplify(expr, budget)?;
     let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
-        return None;
+        return Ok(None);
     };
     if args.len() != 2 {
-        return None;
+        return Ok(None);
     }
-    triangular_accumulator_identity_sides(args[0].as_ref(), args[1].as_ref())
-        .or_else(|| triangular_accumulator_identity_sides(args[1].as_ref(), args[0].as_ref()))
+    Ok(triangular_accumulator_identity_sides(&args[0], &args[1])
+        .or_else(|| triangular_accumulator_identity_sides(&args[1], &args[0])))
 }
 
 fn triangular_accumulator_identity_sides(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(ChcVar, ChcVar)> {
@@ -4017,21 +4769,32 @@ fn sum_gt_square_sides(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(ChcVar, ChcVar)>
     Some((sum_var, bound_var))
 }
 
-fn has_nonnegative_bound(conjuncts: &[&ChcExpr], var: &ChcVar) -> bool {
-    conjuncts
-        .iter()
-        .any(|expr| matches_lower_bound(expr, var).is_some_and(|lower| lower >= 0))
+fn has_nonnegative_bound(
+    conjuncts: &[&ChcExpr],
+    var: &ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::any(conjuncts, budget, |expr| {
+        Ok(matches_lower_bound(expr, var).is_some_and(|lower| lower >= 0))
+    })
 }
 
-fn has_le_relation(conjuncts: &[&ChcExpr], lhs_var: &ChcVar, rhs_var: &ChcVar) -> bool {
-    conjuncts.iter().any(|expr| match expr {
-        ChcExpr::Op(ChcOp::Le, args) if args.len() == 2 => {
-            same_var(args[0].as_ref(), lhs_var) && same_var(args[1].as_ref(), rhs_var)
-        }
-        ChcExpr::Op(ChcOp::Ge, args) if args.len() == 2 => {
-            same_var(args[0].as_ref(), rhs_var) && same_var(args[1].as_ref(), lhs_var)
-        }
-        _ => false,
+fn has_le_relation(
+    conjuncts: &[&ChcExpr],
+    lhs_var: &ChcVar,
+    rhs_var: &ChcVar,
+    budget: &SynthesisBudget,
+) -> ValidationResult<bool> {
+    budget::any(conjuncts, budget, |expr| {
+        Ok(match expr {
+            ChcExpr::Op(ChcOp::Le, args) if args.len() == 2 => {
+                same_var(args[0].as_ref(), lhs_var) && same_var(args[1].as_ref(), rhs_var)
+            }
+            ChcExpr::Op(ChcOp::Ge, args) if args.len() == 2 => {
+                same_var(args[0].as_ref(), rhs_var) && same_var(args[1].as_ref(), lhs_var)
+            }
+            _ => false,
+        })
     })
 }
 
@@ -4213,12 +4976,84 @@ fn int_literal(expr: &ChcExpr) -> Option<i128> {
 }
 
 #[cfg(test)]
+fn validation_expr_key(expr: &ChcExpr) -> String {
+    validation_expr_key_checked(expr, &SynthesisBudget::unbounded())
+        .expect("unbounded test validation must complete")
+}
+
+#[cfg(test)]
+fn validation_expr_has_bool_domain(expr: &ChcExpr) -> bool {
+    validation_expr_has_bool_domain_checked(expr, &SynthesisBudget::unbounded())
+        .expect("unbounded test validation must complete")
+}
+
+#[cfg(test)]
+fn validation_expr_has_bool_domain_raw(expr: &ChcExpr) -> bool {
+    validation_expr_has_bool_domain_raw_checked(expr, &SynthesisBudget::unbounded())
+        .expect("unbounded test validation must complete")
+}
+
+#[cfg(test)]
+fn validation_body_syntactically_implies_head(
+    body: &ChcExpr,
+    head: &ChcExpr,
+    verbose: bool,
+    budget: &SynthesisBudget,
+) -> bool {
+    validation_body_syntactically_implies_head_checked(body, head, verbose, budget)
+        .expect("unbounded test validation must complete")
+}
+
+#[cfg(test)]
+fn validation_formula_proves_unsat(formula: &ChcExpr) -> bool {
+    validation_formula_proves_unsat_checked(formula, &SynthesisBudget::unbounded())
+        .expect("unbounded test validation must complete")
+}
+
+#[cfg(test)]
 mod validation_syntax_tests {
     use super::*;
     use std::sync::Arc;
 
     fn arc(expr: ChcExpr) -> Arc<ChcExpr> {
         Arc::new(expr)
+    }
+
+    #[test]
+    fn nested_modular_non_boolean_payloads_remain_distinct() {
+        let mut left = ChcExpr::var(ChcVar::new("left", ChcSort::Int));
+        let mut right = ChcExpr::var(ChcVar::new("right", ChcSort::Int));
+        for _ in 0..24 {
+            left = ChcExpr::Op(ChcOp::Mod, vec![arc(left), arc(ChcExpr::Int(256))]);
+            right = ChcExpr::Op(ChcOp::Mod, vec![arc(right), arc(ChcExpr::Int(256))]);
+        }
+        assert!(!validation_expr_has_bool_domain(&left));
+        assert!(!validation_expr_has_bool_domain(&right));
+        assert_ne!(validation_expr_key(&left), validation_expr_key(&right));
+    }
+
+    #[test]
+    fn nested_modular_boolean_payload_still_canonicalizes_after_simplification() {
+        let boolean = ChcExpr::Op(
+            ChcOp::Ite,
+            vec![
+                arc(ChcExpr::var(ChcVar::new("condition", ChcSort::Bool))),
+                arc(ChcExpr::Int(1)),
+                arc(ChcExpr::Int(0)),
+            ],
+        );
+        // Add is outside the raw domain recognizer; simplification exposes the Ite.
+        let mut expr = ChcExpr::Op(ChcOp::Add, vec![arc(boolean.clone()), arc(ChcExpr::Int(0))]);
+        assert!(!validation_expr_has_bool_domain_raw(&expr));
+        assert!(validation_expr_has_bool_domain(&expr));
+        for _ in 0..24 {
+            expr = ChcExpr::Op(ChcOp::Mod, vec![arc(expr), arc(ChcExpr::Int(256))]);
+        }
+        assert!(validation_expr_has_bool_domain(&expr));
+        assert_eq!(
+            validation_expr_key(&expr.simplify_constants()),
+            validation_expr_key(&boolean)
+        );
     }
 
     fn pow2_63_expr() -> ChcExpr {
@@ -5310,6 +6145,54 @@ mod validation_syntax_tests {
         assert!(
             validation_formula_proves_unsat(&impossible),
             "repeated BV sign-bit condition should reduce to the selected true branches"
+        );
+    }
+
+    /// A zero divisor nested in the modulus position must make the u128
+    /// widening lane ABSTAIN, never panic.
+    ///
+    /// `eval_validation_nonnegative_const_u128` is a near-copy of
+    /// `expr::simplify::eval_nonnegative_const_u128`, and it carried the same
+    /// defect: `(rhs != 0).then_some(lhs % rhs)` passes its argument BY VALUE,
+    /// so `lhs % rhs` ran *before* the guard was consulted. The AY solver runs
+    /// in-process as compiler_consumer's verification backend, so that panic was a
+    /// compiler ICE. `checked_rem` moves the guard inside the operation.
+    #[test]
+    fn validation_const_eval_nested_zero_divisor_abstains_without_panicking() {
+        // `(mod 5 0)`: the divisor is a literal zero, so the fold must abstain.
+        let zero_divisor =
+            ChcExpr::Op(ChcOp::Mod, vec![arc(ChcExpr::Int(5)), arc(ChcExpr::Int(0))]);
+        assert_eq!(
+            eval_validation_nonnegative_const_u128(&zero_divisor, 0, &SynthesisBudget::unbounded())
+                .unwrap(),
+            None,
+            "mod by a zero divisor must abstain"
+        );
+
+        // `(mod 7 (mod 5 0))`: the *outer* arm is the one that reaches the
+        // panic site, because it evaluates a non-`Int` operand recursively and
+        // then divides by the `None`-worthy result of the inner fold.
+        let nested = ChcExpr::Op(
+            ChcOp::Mod,
+            vec![arc(ChcExpr::Int(7)), arc(zero_divisor.clone())],
+        );
+        assert_eq!(
+            eval_validation_nonnegative_const_u128(&nested, 0, &SynthesisBudget::unbounded())
+                .unwrap(),
+            None,
+            "mod by a nested zero divisor must abstain"
+        );
+
+        // And through the nearest real caller: `outer_mod` reads args[1] as a
+        // constant modulus, which is exactly how a solver-side term reaches the
+        // evaluator on the invariant-validation path.
+        let x = ChcVar::new("x", ChcSort::Int);
+        let over_var = ChcExpr::Op(ChcOp::Mod, vec![arc(ChcExpr::var(x)), arc(zero_divisor)]);
+        assert!(
+            outer_mod(&over_var, &SynthesisBudget::unbounded())
+                .unwrap()
+                .is_none(),
+            "a zero-divisor modulus is not a usable modulus"
         );
     }
 }

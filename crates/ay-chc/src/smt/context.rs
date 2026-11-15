@@ -4,20 +4,22 @@
 
 //! Core SMT context definition and lifecycle methods.
 
+mod datatypes;
+
+use super::bv_cache::{BvCacheKey, BvCacheKeys};
 use super::types::{SmtResult, SmtValue};
 use crate::expr::maybe_grow_expr_stack;
 use crate::{ChcExpr, ChcSort, PredicateId};
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::kani_compat::{DetHashMap as HbHashMap, DetHashSet as HbHashSet};
-use ay_core::term::TermData;
 use ay_core::{CnfClause, TermId, TermStore};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 type CachedBvBits = Vec<i32>;
-type CachedBvTermMap<T> = HbHashMap<String, T>;
+type CachedBvTermMap<T> = HbHashMap<BvCacheKey, T>;
 
 thread_local! {
     /// Absolute wall-clock deadline for the whole enclosing CHC/PDR proof solve
@@ -236,7 +238,7 @@ impl Drop for ScopedNoProgressBreaker {
     }
 }
 
-type CachedBvDivKey = (String, String);
+type CachedBvDivKey = (BvCacheKey, BvCacheKey);
 
 /// Maximum number of total entries across all PersistentBvCache maps.
 ///
@@ -254,13 +256,16 @@ pub(super) const MAX_PERSISTENT_CACHE_ENTRIES: usize = 500_000;
 
 #[derive(Default)]
 pub(super) struct PersistentBvCache {
-    pub(super) signature: Vec<String>,
+    /// Interning table of the structural keys every map below is keyed by
+    /// (and `signature` lists); cleared together with them.
+    pub(super) keys: BvCacheKeys,
+    pub(super) signature: Vec<BvCacheKey>,
     pub(super) clauses: Vec<CnfClause>,
     pub(super) next_var: u32,
     pub(super) term_to_bits: CachedBvTermMap<CachedBvBits>,
     pub(super) predicate_to_var: CachedBvTermMap<i32>,
     pub(super) bool_to_var: CachedBvTermMap<i32>,
-    pub(super) ite_conditions: HbHashSet<String>,
+    pub(super) ite_conditions: HbHashSet<BvCacheKey>,
     pub(super) and_cache: HbHashMap<(i32, i32), i32>,
     pub(super) and_children: HbHashMap<i32, (i32, i32)>,
     pub(super) or_cache: HbHashMap<(i32, i32), i32>,
@@ -289,6 +294,7 @@ impl PersistentBvCache {
 
     /// Clear all cached state, releasing memory.
     pub(super) fn clear(&mut self) {
+        self.keys.clear();
         self.signature.clear();
         self.clauses.clear();
         self.next_var = 0;
@@ -384,9 +390,16 @@ pub struct SmtContext {
     /// The cache is keyed by canonical term fingerprints rather than `TermId`
     /// so it remains valid after `reset()` replaces the query-local term graph.
     pub(super) persistent_bv_cache: PersistentBvCache,
-    /// Count of executor fallback attempts in the current solve (#7109 regression fix).
-    /// Capped at MAX_EXECUTOR_FALLBACKS to prevent timeout exhaustion on benchmarks
-    /// where the internal solver returns Unknown hundreds of times.
+    /// Count of executor fallback attempts in the current solve (stats / trace).
+    ///
+    /// History: #7109 capped this at 10 per context so hundreds of internal
+    /// Unknowns could not exhaust the budget through ~30 ms fallbacks. Rung 0
+    /// (CHC-COMP 2026) removed the cap on BOTH lanes: every fallback is
+    /// already bounded by the per-check timeout AND the thread SMT deadline
+    /// (`clamp_timeout_to_smt_deadline`), and a capped fallback is a spurious
+    /// Unknown — on the Verification lane a lost solve (never a wrong answer),
+    /// on the Search lane the T4 "fallback exhaustion" bucket (44–95 % Unknown
+    /// on some lustre instances, DIAG_LIA_LIN_2026-09-18.md).
     pub(super) executor_fallback_count: u32,
     /// Executor-first `check_sat` policy (inc-12 spacer lane).
     ///
@@ -396,6 +409,30 @@ pub struct SmtContext {
     /// portfolio PDR engine); default keeps the internal-first slice.
     /// Preserved across `reset()` — engine-level policy, not query state.
     pub(super) executor_first_check_sat: bool,
+    /// Verdict-consumer lane (Rung 0, CHC-COMP 2026 bridge hygiene): a
+    /// CONSTRUCTION-TIME policy pin. `Verification` (the default of `new()` and
+    /// `ChcProblem::make_smt_context()`) keeps the conservative internal-first
+    /// schedule that every final Safe/Unsafe re-verification runs on; `Search`
+    /// (engines: PDR, BMC, Kind, IMC, TPA, PDKind, LAWI, ...) opts a context
+    /// into the executor-first / EqDiffVar-off policies for pure Bool/LIA/LRA
+    /// queries. Both lanes run the SAME sound deciders — the lane is not a
+    /// verdict source — but any future search-only core may be reached from
+    /// `Search` ONLY. Preserved across `reset()`.
+    pub(super) lane: SmtLane,
+    /// The `HornSmt` session (#horn-smt-session, Rung 1): created lazily by
+    /// the router gate in `check_sat` on the first eligible `Search`-lane
+    /// query while `lane::session_mode() > 0`; never on the `Verification`
+    /// lane and never under `lane::verification_mode_active()` (INV-S1/S2).
+    /// PRESERVED by `reset()` — the engines call `reset()` per query and a
+    /// session that died there would buy nothing (design §2.11). Owns its own
+    /// term universe; `self.terms` is untouched by it.
+    pub(super) session: Option<Box<super::session::HornSmt>>,
+    /// #horn-smt-session Rung 4: a `Verification`-lane context whose engine
+    /// designates it a SEARCH context for the session only (INV-S1 opt-in at
+    /// construction, [`SmtContext::with_session_opt_in`]) while keeping the
+    /// lane's legacy schedule: engines Rung 0 left on the internal-first
+    /// schedule (CEGAR's abstract-post context). Preserved across `reset()`.
+    pub(super) session_opt_in: bool,
     /// Datatype definitions from the CHC problem (#7016).
     /// When non-empty, queries with UF apps are routed through the executor
     /// adapter which emits declare-datatype commands before the formula.
@@ -450,6 +487,34 @@ impl Drop for SmtTermMemoryBudgetGuard {
     }
 }
 
+/// Which verdict consumer an [`SmtContext`] serves (Rung 0 of the CHC-COMP 2026
+/// campaign, the development design notes
+/// §5 pin 1).
+///
+/// * `Verification` — the default. Final Safe/Unsafe re-verification
+///   (`PdrSolver::verify_model_*`, `verify_counterexample`, the CLI discharge
+///   gate, BMC-as-verifier) constructs contexts through `SmtContext::new()` /
+///   `ChcProblem::make_smt_context()` / `PdrConfig::default()` and therefore
+///   lands here. Policies: internal DPLL(T) first, EqDiffVar on, uncapped
+///   executor fallback bounded by the lane deadline.
+/// * `Search` — engines opt in explicitly (`SmtContext::new_search()`,
+///   `ChcProblem::make_search_smt_context()`, `PdrConfig::smt_lane`,
+///   `BmcConfig::smt_lane`). Policies: pure Bool/LIA/LRA queries go to the
+///   ay-dpll executor first, `(set-option :ay-eq-diffvar false)` on every
+///   executor script, uncapped fallback bounded by the lane deadline.
+///
+/// A false UNSAT on the `Verification` lane is the single mechanism by which
+/// a wrong `sat` could be printed; that lane must never be routed to a
+/// search-only decider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SmtLane {
+    /// Engine search guidance; verdicts are re-derived before publication.
+    Search,
+    /// Final-verdict re-verification (default).
+    #[default]
+    Verification,
+}
+
 impl Default for SmtContext {
     fn default() -> Self {
         Self::new()
@@ -464,40 +529,7 @@ pub(super) const MAX_CONVERSION_NODES: usize = 1_000_000;
 /// short-circuiting to `Unknown` permanently (#2472).
 pub(super) const MAX_CONVERSION_STRIKES: u32 = 3;
 
-/// Maximum executor fallback attempts per SmtContext lifetime.
-/// 10 attempts × ~30ms each = ~300ms max overhead. Enough to resolve
-/// the 2-4 high-disequality queries on half_true_modif_m while preventing
-/// the 334-attempt overhead on dillig02_m.
-pub(super) const MAX_EXECUTOR_FALLBACKS: u32 = 10;
-
 impl SmtContext {
-    fn term_is_bv_cacheable(&self, term: TermId, memo: &mut FxHashMap<TermId, bool>) -> bool {
-        maybe_grow_expr_stack(|| {
-            if let Some(&cached) = memo.get(&term) {
-                return cached;
-            }
-
-            let cacheable = match self.terms.get(term) {
-                TermData::Const(_) => true,
-                TermData::Var(name, _) => self.var_original_names.contains_key(name),
-                TermData::Not(inner) => self.term_is_bv_cacheable(*inner, memo),
-                TermData::Ite(cond, then_term, else_term) => {
-                    self.term_is_bv_cacheable(*cond, memo)
-                        && self.term_is_bv_cacheable(*then_term, memo)
-                        && self.term_is_bv_cacheable(*else_term, memo)
-                }
-                TermData::Let(_, body) => self.term_is_bv_cacheable(*body, memo),
-                TermData::Forall(..) | TermData::Exists(..) => false,
-                TermData::App(_, args) => {
-                    args.iter().all(|&arg| self.term_is_bv_cacheable(arg, memo))
-                }
-                _ => false,
-            };
-            memo.insert(term, cacheable);
-            cacheable
-        })
-    }
-
     fn is_internal_aux_var_name(name: &str) -> bool {
         name.starts_with("_ite_")
             || name.starts_with("_mod_q_")
@@ -532,6 +564,15 @@ impl SmtContext {
                 budget.set(remaining - 1);
 
                 Some(match expr {
+                    ChcExpr::ArrayLambda(lambda) => ChcExpr::ArrayLambda(
+                        lambda.with_captures(
+                            lambda
+                                .captures()
+                                .iter()
+                                .map(|value| rename_inner(value, namespace, budget).map(Arc::new))
+                                .collect::<Option<Vec<_>>>()?,
+                        ),
+                    ),
                     ChcExpr::Bool(_)
                     | ChcExpr::Int(_)
                     | ChcExpr::Real(_, _)
@@ -646,6 +687,9 @@ impl SmtContext {
             persistent_bv_cache: PersistentBvCache::default(),
             executor_fallback_count: 0,
             executor_first_check_sat: false,
+            lane: SmtLane::Verification,
+            session: None,
+            session_opt_in: false,
             datatype_defs: FxHashMap::default(),
             term_memory_budget,
             #[cfg(test)]
@@ -674,6 +718,9 @@ impl SmtContext {
         // the owning solver.
         // Preserve `forced_check_sat_results` across reset in tests so verification
         // harnesses can synthesize a solver answer for the next query.
+        // Preserve `session` across reset (#horn-smt-session): the session owns
+        // its own term store and assertion table; the per-query `reset()` of the
+        // engines must not discard the warm solver (design §2.11).
     }
 
     pub(crate) fn set_verbose(&mut self, verbose: bool) {
@@ -685,6 +732,74 @@ impl SmtContext {
         self.executor_first_check_sat = on;
     }
 
+    /// Create a context on the [`SmtLane::Search`] lane (engine search
+    /// guidance). Final verifiers must keep using [`SmtContext::new`].
+    pub fn new_search() -> Self {
+        let mut smt = Self::new();
+        smt.lane = SmtLane::Search;
+        smt
+    }
+
+    /// The lane this context was constructed for.
+    pub fn lane(&self) -> SmtLane {
+        self.lane
+    }
+
+    /// Set the lane (engine constructors that receive a context from
+    /// `ChcProblem::make_smt_context()` and hold a `smt_lane` config field).
+    ///
+    /// Moving a context OFF the `Search` lane drops its session: a
+    /// `Verification` context never carries one (INV-S1).
+    pub(crate) fn set_lane(&mut self, lane: SmtLane) {
+        self.lane = lane;
+        if lane != SmtLane::Search && !self.session_opt_in {
+            self.session = None;
+        }
+    }
+
+    /// Designate this context a SEARCH context for the `HornSmt` session
+    /// without changing its lane's legacy schedule (see `session_opt_in`).
+    /// Construction-time only (INV-S1): never for a validator.
+    pub(crate) fn with_session_opt_in(mut self) -> Self {
+        self.session_opt_in = true;
+        self
+    }
+
+    /// The session designation the router gate and the census read: the
+    /// `Search` lane, or a session opt-in.
+    pub(crate) fn session_designated(&self) -> bool {
+        self.lane == SmtLane::Search || self.session_opt_in
+    }
+
+    /// The lane the coverage census reports (`Search` for a session opt-in).
+    pub(crate) fn census_lane(&self) -> SmtLane {
+        if self.session_designated() {
+            SmtLane::Search
+        } else {
+            self.lane
+        }
+    }
+
+    /// Board counters of this context's `HornSmt` session, if one exists
+    /// (#horn-smt-session; `None` on the `Verification` lane by construction).
+    pub(crate) fn session_stats(&self) -> Option<&super::session::SessionStats> {
+        self.session.as_deref().map(super::session::HornSmt::stats)
+    }
+
+    /// `true` when this context carries a `HornSmt` session (tests / locks).
+    pub(crate) fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Search-lane executor scripts carry `(set-option :ay-eq-diffvar false)`:
+    /// the inc-14 EqDiffVar pass turns SAT-shaped transition checks into
+    /// 360k-decision wanders (38 ms -> unknown at 8 s, MICROBENCH §4 item i)
+    /// and the dv-off retry that used to rescue them cost a budget reserve.
+    /// The Verification lane keeps the pass on (plus the dv-off retry).
+    pub(crate) fn executor_disables_eq_diffvar(&self) -> bool {
+        self.lane == SmtLane::Search
+    }
+
     /// Set datatype definitions from the CHC problem (#7016).
     /// When set, queries containing UF apps are routed through the executor
     /// adapter to get full DT theory support (constructor/selector/tester axioms).
@@ -693,117 +808,6 @@ impl SmtContext {
         defs: FxHashMap<String, Vec<(String, Vec<(String, ChcSort)>)>>,
     ) {
         self.datatype_defs = defs;
-    }
-
-    /// Reconstruct a full CHC datatype sort from `self.datatype_defs`.
-    fn datatype_sort_from_defs(&self, dt_name: &str) -> Option<ChcSort> {
-        let ctors = self.datatype_defs.get(dt_name)?;
-        Some(ChcSort::Datatype {
-            name: dt_name.to_string(),
-            constructors: Arc::new(
-                ctors
-                    .iter()
-                    .map(|(ctor_name, fields)| crate::ChcDtConstructor {
-                        name: ctor_name.clone(),
-                        selectors: fields
-                            .iter()
-                            .map(|(sel_name, sel_sort)| crate::ChcDtSelector {
-                                name: sel_name.clone(),
-                                sort: sel_sort.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            ),
-        })
-    }
-
-    /// Try to convert a ay-core App to a CHC DT expression (#7016).
-    ///
-    /// Checks if `name` matches a known DT constructor, selector, or tester
-    /// from `self.datatype_defs`. Returns `Some(ChcExpr)` on match, `None` otherwise.
-    pub(super) fn try_dt_app_to_chc_expr(
-        &self,
-        name: &str,
-        args: &[TermId],
-        mut convert_arg: impl FnMut(TermId) -> Option<ChcExpr>,
-    ) -> Option<ChcExpr> {
-        for (dt_name, ctors) in &self.datatype_defs {
-            for (ctor_name, fields) in ctors {
-                // Constructor match: name == ctor_name, args.len() == fields.len()
-                if name == ctor_name && args.len() == fields.len() {
-                    let field_exprs: Option<Vec<Arc<ChcExpr>>> =
-                        args.iter().map(|&a| convert_arg(a).map(Arc::new)).collect();
-                    let result_sort = self
-                        .datatype_sort_from_defs(dt_name)
-                        .unwrap_or_else(|| ChcSort::Uninterpreted(dt_name.clone()));
-                    return Some(ChcExpr::FuncApp(
-                        ctor_name.clone(),
-                        result_sort,
-                        field_exprs?,
-                    ));
-                }
-                // Selector match: name == field.0, single arg
-                for (sel_name, sel_sort) in fields {
-                    if name == sel_name && args.len() == 1 {
-                        let arg_expr = convert_arg(args[0])?;
-                        return Some(ChcExpr::FuncApp(
-                            sel_name.clone(),
-                            sel_sort.clone(),
-                            vec![Arc::new(arg_expr)],
-                        ));
-                    }
-                }
-            }
-            // Tester match: name == "is-{ctor_name}", single arg
-            for (ctor_name, _) in ctors {
-                let tester_name = format!("is-{ctor_name}");
-                if name == tester_name && args.len() == 1 {
-                    let arg_expr = convert_arg(args[0])?;
-                    return Some(ChcExpr::FuncApp(
-                        tester_name,
-                        ChcSort::Bool,
-                        vec![Arc::new(arg_expr)],
-                    ));
-                }
-            }
-        }
-        None
-    }
-
-    pub(super) fn bv_cache_key(
-        &self,
-        term: TermId,
-        memo: &mut FxHashMap<TermId, Option<String>>,
-    ) -> Option<String> {
-        if let Some(cached) = memo.get(&term) {
-            return cached.clone();
-        }
-        let mut cacheable_memo = FxHashMap::default();
-        if !self.term_is_bv_cacheable(term, &mut cacheable_memo) {
-            memo.insert(term, None);
-            return None;
-        }
-        let key = self.term_to_chc_expr(term).map(|expr| {
-            let expr_key = crate::InvariantModel::expr_to_smtlib(&expr);
-            format!("{:?}::{expr_key}", self.terms.sort(term))
-        });
-        memo.insert(term, key.clone());
-        key
-    }
-
-    pub(super) fn bv_cache_signature(
-        &self,
-        terms: impl IntoIterator<Item = TermId>,
-        memo: &mut FxHashMap<TermId, Option<String>>,
-    ) -> Vec<String> {
-        let mut signature: Vec<String> = terms
-            .into_iter()
-            .filter_map(|term| self.bv_cache_key(term, memo))
-            .collect();
-        signature.sort_unstable();
-        signature.dedup();
-        signature
     }
 
     /// Temporarily install a SAT phase-seed model for the duration of `f`.
@@ -859,6 +863,37 @@ impl SmtContext {
         self.global_deadline.get()
     }
 
+    /// True when this context's global solve deadline or the thread's effective
+    /// deadline (SMT scope ∧ solve scope) has passed — the executor adapter's
+    /// entry condition, now shared by the internal lane (Rung 0).
+    pub(crate) fn deadlines_expired(&self) -> bool {
+        crate::smt::smt_deadline_expired()
+            || self
+                .global_deadline
+                .get()
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
+    /// `clamp_timeout_to_smt_deadline` that additionally honours this context's
+    /// global solve deadline. `Err(())` = some deadline already passed.
+    pub(crate) fn clamp_timeout_to_deadlines(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<std::time::Duration>, ()> {
+        let clamped = crate::smt::clamp_timeout_to_smt_deadline(timeout)?;
+        match self.global_deadline.get() {
+            None => Ok(clamped),
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(ay_core::time::Instant::now());
+                if remaining.is_zero() {
+                    Err(())
+                } else {
+                    Ok(Some(clamped.map_or(remaining, |t| t.min(remaining))))
+                }
+            }
+        }
+    }
+
     /// Set the per-engine term memory budget (#8600).
     pub fn set_term_memory_budget(&mut self, budget: Option<usize>) {
         self.term_memory_budget = budget;
@@ -867,8 +902,11 @@ impl SmtContext {
     /// Returns true if the owning `TermStore` has exceeded the per-engine budget.
     #[inline]
     pub fn term_memory_exceeded(&self) -> bool {
-        self.term_memory_budget
-            .is_some_and(|budget| self.terms.instance_memory_exceeded(budget))
+        let exceeded = self
+            .term_memory_budget
+            .is_some_and(|budget| self.terms.instance_memory_exceeded(budget));
+        super::resource_observation::note_memory_refusal(exceeded);
+        exceeded
     }
 
     /// Exact capacity census for cold result-publication boundaries, including
@@ -877,10 +915,12 @@ impl SmtContext {
     /// SAT/UNSAT result must not use that bounded overshoot allowance or ignore
     /// a sibling that trips the global ceiling during result postprocessing.
     pub(crate) fn exact_term_memory_exceeded(&self) -> bool {
-        ay_core::TermStore::global_memory_exceeded()
+        let exceeded = ay_core::TermStore::global_memory_exceeded()
             || self
                 .term_memory_budget
-                .is_some_and(|budget| self.terms.true_memory_bytes() > budget)
+                .is_some_and(|budget| self.terms.true_memory_bytes() > budget);
+        super::resource_observation::note_memory_refusal(exceeded);
+        exceeded
     }
 
     /// Set the thread-local per-engine term memory budget and return an RAII guard
@@ -893,6 +933,11 @@ impl SmtContext {
         let prev = THREAD_TERM_MEMORY_BUDGET.get();
         THREAD_TERM_MEMORY_BUDGET.set(budget);
         SmtTermMemoryBudgetGuard { prev }
+    }
+
+    /// Borrow the caller's per-context term cap before crossing a thread boundary.
+    pub(crate) fn current_thread_term_memory_budget() -> Option<usize> {
+        THREAD_TERM_MEMORY_BUDGET.get()
     }
 
     /// Access the sort-qualified variable name → TermId mapping.
@@ -956,14 +1001,18 @@ mod tests {
         assert_eq!(cache.total_entries(), 0);
     }
 
+    fn key(raw: u32) -> BvCacheKey {
+        BvCacheKey::from_raw_for_tests(raw)
+    }
+
     #[test]
     fn test_persistent_bv_cache_total_entries_counts_all_maps() {
         let mut cache = PersistentBvCache::default();
         cache.clauses.push(CnfClause(vec![]));
-        cache.term_to_bits.insert("a".into(), vec![1]);
-        cache.predicate_to_var.insert("b".into(), 2);
-        cache.bool_to_var.insert("c".into(), 3);
-        cache.ite_conditions.insert("d".into());
+        cache.term_to_bits.insert(key(0), vec![1]);
+        cache.predicate_to_var.insert(key(1), 2);
+        cache.bool_to_var.insert(key(2), 3);
+        cache.ite_conditions.insert(key(3));
         cache.and_cache.insert((1, 2), 3);
         cache.and_children.insert(3, (1, 2));
         cache.or_cache.insert((4, 5), 6);
@@ -971,10 +1020,10 @@ mod tests {
         cache.mux_cache.insert((1, 2, 3), 4);
         cache
             .unsigned_div_cache
-            .insert(("a".into(), "b".into()), (vec![1], vec![2]));
+            .insert((key(0), key(1)), (vec![1], vec![2]));
         cache
             .signed_div_cache
-            .insert(("c".into(), "d".into()), (vec![3], vec![4], 5, 6));
+            .insert((key(2), key(3)), (vec![3], vec![4], 5, 6));
         // 12 entries total: 1 clause + 1 term_to_bits + 1 predicate_to_var +
         // 1 bool_to_var + 1 ite_conditions + 1 and + 1 and_children + 1 or +
         // 1 xor + 1 mux + 1 unsigned_div + 1 signed_div
@@ -984,12 +1033,12 @@ mod tests {
     #[test]
     fn test_persistent_bv_cache_clear_resets_all() {
         let mut cache = PersistentBvCache {
-            signature: vec!["sig".into()],
+            signature: vec![key(7)],
             ..Default::default()
         };
         cache.clauses.push(CnfClause(vec![]));
         cache.next_var = 42;
-        cache.term_to_bits.insert("a".into(), vec![1]);
+        cache.term_to_bits.insert(key(0), vec![1]);
         cache.and_cache.insert((1, 2), 3);
         cache.and_children.insert(3, (1, 2));
         assert!(cache.total_entries() > 0);
@@ -1003,10 +1052,10 @@ mod tests {
     #[test]
     fn test_persistent_bv_cache_capacity_clear_is_sound_eviction_policy() {
         let mut cache = PersistentBvCache {
-            signature: vec!["sig".into()],
+            signature: vec![key(7)],
             ..Default::default()
         };
-        cache.term_to_bits.insert("a".into(), vec![1]);
+        cache.term_to_bits.insert(key(0), vec![1]);
         cache.and_cache.insert((1, 2), 3);
 
         assert_eq!(cache.clear_if_over_capacity(1), Some(2));

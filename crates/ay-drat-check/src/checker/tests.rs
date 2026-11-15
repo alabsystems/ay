@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::checker::test_helpers::lit;
+use crate::drat_parser::ProofStep;
 
 #[test]
 fn test_rup_unit_resolution() {

@@ -1,0 +1,16 @@
+* #variable= 4 #constraint= 8
+* The constraint is normalized before the antecedent is added at the degree as coefficient, since
+* terms that cancel each other change the degree.
+z1 ==> 3 x1 2 ~x1 >= 3 ;
+z4 <== 3 x1 2 ~x1 >= 3 ;
+* A constraint that is trivially satisfied is implied by anything, in particular by a conjunction
+* of more than one literal.
+z1 z2 ==> 1 x1 >= -1 ;
+z1 z2 ==> 1 x1 <= 5 ;
+* The literals of the antecedent may occur in the constraint themselves.
+z1 z2 ==> 2 z1 1 x1 >= 2 ;
+* A constraint that is contradicting implies anything, so a left implication of one is its
+* trivially satisfied negation.
+z3 <== 1 x1 >= 5 ;
+z3 <== 3 x1 2 ~x1 >= 5 ;
+z3 <== 1 x1 <= -2 ;

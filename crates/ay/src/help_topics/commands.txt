@@ -24,13 +24,14 @@ Formats — native front ends beyond SMT-LIB.
 Learn & meta — the tour and the self-describing surfaces.
   tutorial      Interactive tutorial
   commands      This screen: every visible command, grouped
-  options       AY_* environment options, with each one's current value
+  options       AY_* environment options and their defaults
   help          Print help for ay or for a named subcommand
 
 About fifteen further commands are hidden from this list: benchmarking,
 corpora, tooling, gates, release, and audit machinery aimed at AY's own
 maintainers. Hidden is not secret. Each still answers to
-ay <name> --help, and the development design notes describes that surface.
+ay <name> --help. In AY's development tree, the development design notes maps
+every command, hidden ones included, to the crates behind it.
 
 Every command has its own screen, with its own flags and arguments:
 

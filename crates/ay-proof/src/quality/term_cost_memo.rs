@@ -3,12 +3,18 @@
 
 //! Cancellation-aware memoization of proof term unfolding cost.
 
-use ay_core::kani_compat::{DetHashMap, DetHashSet};
+#[cfg(test)]
+use ay_core::kani_compat::DetHashSet;
 use ay_core::{TermData, TermId, TermStore};
+use std::collections::BTreeMap;
 
 use super::{charge_progress, checked_add_usize, ProofCheckError};
 
-/// Maximum memo operations between caller-owned cancellation/deadline polls.
+mod metered;
+pub(super) use metered::unfolded_work_memoized_with_progress;
+
+/// Poll interval of the test-only legacy result oracle.
+#[cfg(test)]
 pub(super) const TERM_COST_MEMO_POLL_INTERVAL: usize = 1_024;
 
 /// Validation-scoped memo for the pure tree-unfolding cost
@@ -17,11 +23,14 @@ pub(super) const TERM_COST_MEMO_POLL_INTERVAL: usize = 1_024;
 /// Only pure costs are shared across steps. The parent module still performs
 /// the full per-step payload walk because those charges bound decode/clone
 /// work that recurs for every citing proof step.
+/// Ordered keys give the progress meter a logarithmic worst-case lookup bound;
+/// fixed hashing otherwise requires a linear collision bound on every lookup.
 #[derive(Debug, Default)]
 pub(super) struct TermCostMemo {
-    costs: DetHashMap<TermId, usize>,
+    costs: BTreeMap<TermId, usize>,
 }
 
+#[cfg(test)]
 fn poll(
     operations: &mut usize,
     progress: &mut dyn FnMut(usize, usize) -> bool,
@@ -33,6 +42,7 @@ fn poll(
     Ok(())
 }
 
+#[cfg(test)]
 fn push_child(
     children: &mut Vec<TermId>,
     child: TermId,
@@ -44,6 +54,7 @@ fn push_child(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_children_polled(
     terms: &TermStore,
     term: TermId,
@@ -82,12 +93,9 @@ fn append_children_polled(
     Ok(())
 }
 
-/// Exact checked tree-unfolding cost over `roots`, memoized across steps.
-///
-/// Positive work/byte debits were already paid by the parent's per-step walk.
-/// Zero-debit polls preserve caller-owned cancellation, deadline, and memory
-/// controls throughout cold fills, high-fanout scheduling, warm root scans,
-/// and the final sum.
+/// Legacy result oracle, not a resource-accounting implementation. Production
+/// separately pays for the memo's traversal and retained storage.
+#[cfg(test)]
 pub(super) fn unfolded_work_memoized(
     memo: &mut TermCostMemo,
     terms: &TermStore,

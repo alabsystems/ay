@@ -1,0 +1,11 @@
+; z3 5.1.0: sat sat
+(set-logic QF_DT)
+(declare-datatypes ((U 0)) (((zz) (ss (pp U)))))
+(declare-const c0 U) (declare-const c1 U) (declare-const c2 U) (declare-const c3 U) (declare-const c4 U)
+(declare-const e U)
+(push 1)(pop 1)
+(assert (distinct c0 c1 c2 c3 c4))
+(assert (or (= e c0) (= e c1) (= e c2) (= e c3) (= e c4)))
+(check-sat)
+(assert (= e c4))
+(check-sat)

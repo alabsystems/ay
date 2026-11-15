@@ -114,7 +114,7 @@ fn test_bv_classifier_meter_is_debited_before_budget_classification() {
     let clause = vec![equality, negated];
 
     // Nine proof-producing lemmas exceed the private replay aggregate cap. A callback rejecting
-    // the classifier debit must observe ResourceLimit before unmetered classification reports it.
+    // the classifier debit must observe ResourceLimit before classification reports it.
     let mut proof = Proof::new();
     for _ in 0..9 {
         proof.add_theory_lemma_with_kind("BV", clause.clone(), TheoryLemmaKind::BvBitBlast);
@@ -124,9 +124,12 @@ fn test_bv_classifier_meter_is_debited_before_budget_classification() {
             true
         })
         .expect("small payload census should fit usize");
-    let classifier_charge =
-        proof_producing_bv_classifier_charge(&proof, authentication_stats.aggregate)
-            .expect("small classifier charge should fit usize");
+    let classifier_charge = proof_producing_bv_classifier_charge(
+        &proof,
+        authentication_stats.aggregate,
+        &mut |_, _| true,
+    )
+    .expect("small classifier charge should fit usize");
     assert!(classifier_charge.0 > 0);
     assert!(classifier_charge.1 > 0);
 
@@ -164,6 +167,7 @@ fn test_semantic_meter_charges_repeated_edge_matching_quadratically() {
         work: 257,
         bytes: 4096,
         unfolded_work: 257,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (work, bytes) = semantic_validator_charge(&step, payload, SemanticChargeClass::General)
@@ -189,6 +193,7 @@ fn resolution_route_defers_to_the_dedicated_resolution_accountants() {
         work: 6_638,
         bytes: 91_442,
         unfolded_work: 1_165,
+        fp_assignments: 0,
         order_assignments: 0,
     };
 
@@ -225,8 +230,8 @@ fn resolution_route_defers_to_the_dedicated_resolution_accountants() {
     // The exemption is only sound because leading-not decoding is now paid by
     // the dedicated accountants: both must strictly increase with the step's
     // unfolded literal payload.
-    let flat = binary_resolution_charge(4, 4, 4, 0).expect("charge fits usize");
-    let deep = binary_resolution_charge(4, 4, 4, 1_000).expect("charge fits usize");
+    let flat = binary_resolution_charge(4, 4, 4, 0, false).expect("charge fits usize");
+    let deep = binary_resolution_charge(4, 4, 4, 1_000, false).expect("charge fits usize");
     assert_eq!(deep.0, flat.0 + 4_000);
 
     // The binary precharge now covers only the GUARANTEED decode+sort of the
@@ -238,7 +243,7 @@ fn resolution_route_defers_to_the_dedicated_resolution_accountants() {
     // trial-by-trial. So the precharge no longer carries the width term. The
     // measured step that used to exhaust the byte envelope is 23 + 23 -> 304.
     let (measured_work, measured_bytes) =
-        binary_resolution_charge(23, 23, 304, 0).expect("charge fits usize");
+        binary_resolution_charge(23, 23, 304, 0, false).expect("charge fits usize");
     let total = 23 + 23 + 304;
     assert_eq!(measured_bytes, total * 4 * size_of::<(TermId, bool)>());
     assert!(measured_bytes < 12 * 1024);
@@ -246,13 +251,24 @@ fn resolution_route_defers_to_the_dedicated_resolution_accountants() {
         measured_work,
         sort_comparison_bound(23).unwrap() * 2
             + sort_comparison_bound(304).unwrap()
-            // The fourth sort bound covers the argument-directed resolvent sort.
-            + sort_comparison_bound(total).unwrap()
+            // The linear three-pointer merge (`resolves_to`), at most twice.
+            + 2 * total
     );
+    // Only the argument-DIRECTED validator builds and sorts a resolvent; the
+    // pivot-annotated and argument-free forms compare the merge in place
+    // (`resolves_to`), so the fourth sort bound is charged to the directed
+    // form and to nothing else.
+    let (directed_work, directed_bytes) =
+        binary_resolution_charge(23, 23, 304, 0, true).expect("charge fits usize");
+    assert_eq!(
+        directed_work,
+        measured_work + sort_comparison_bound(total).unwrap()
+    );
+    assert_eq!(directed_bytes, measured_bytes);
     // Parity: the precharge still grows with the clause widths (via the sort
     // bounds and decoded-set bytes), so a wider binary resolution still consumes
     // more budget even before its metered search runs.
-    let wider = binary_resolution_charge(24, 23, 304, 0).expect("charge fits usize");
+    let wider = binary_resolution_charge(24, 23, 304, 0, false).expect("charge fits usize");
     assert!(wider.0 > measured_work && wider.1 > measured_bytes);
 
     let derived: Vec<Option<Vec<TermId>>> = vec![Some(vec![atom, atom]); 4];
@@ -338,6 +354,7 @@ fn euf_identity_charge_is_linear_in_dag_not_unfolded_square() {
         work: 512,
         bytes: 8_192,
         unfolded_work: 20_000,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (work, bytes) =
@@ -369,12 +386,14 @@ fn euf_identity_charge_still_grows_with_dag_work() {
         work: 1_000,
         bytes: 1_000,
         unfolded_work: 1,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let wide = PayloadStats {
         work: 1_000_000,
         bytes: 1_000_000,
         unfolded_work: 1,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (nw, _) = semantic_validator_charge(&step, narrow, SemanticChargeClass::EufIdentityRoute)
@@ -387,6 +406,7 @@ fn euf_identity_charge_still_grows_with_dag_work() {
         work: 50_000_000,
         bytes: 1,
         unfolded_work: 1,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (hw, _) = semantic_validator_charge(&step, huge, SemanticChargeClass::EufIdentityRoute)
@@ -395,4 +415,43 @@ fn euf_identity_charge_still_grows_with_dag_work() {
         hw > 350_000_000,
         "a genuinely huge EUF DAG payload must still exhaust the envelope: {hw}"
     );
+}
+
+#[test]
+fn test_datatype_free_payload_metering_ignores_unreachable_terms() {
+    // `Some(&[])` (typed context, no datatype members) has no global scan to
+    // pay for: the payload is the proof's own reachable terms, so unrelated
+    // terms in a long session's store must not change the charge.
+    let meter = |terms: &TermStore, proof: &Proof, signatures: &[DatatypeMemberSignature]| {
+        meter_authentication_payload(
+            proof,
+            terms,
+            None,
+            None,
+            Some(signatures),
+            None,
+            &mut |_, _| true,
+        )
+        .expect("small payload census fits")
+        .aggregate
+        .work
+    };
+    let mut terms = TermStore::new();
+    let premise = terms.mk_var("metered_premise", Sort::Bool);
+    let mut proof = Proof::new();
+    proof.add_assume(premise, None);
+    let before = meter(&terms, &proof, &[]);
+    for index in 0..5_000 {
+        terms.mk_var(format!("unrelated_{index}"), Sort::Int);
+    }
+    assert_eq!(meter(&terms, &proof, &[]), before);
+
+    // A non-empty member registry keeps metering the whole store.
+    let signature = DatatypeMemberSignature {
+        identity: "metered-ctor".into(),
+        argument_sorts: Vec::new(),
+        result_sort: Sort::Uninterpreted("MeteredBox".into()),
+        nullary_term: None,
+    };
+    assert!(meter(&terms, &proof, std::slice::from_ref(&signature)) >= before + 5_000);
 }

@@ -149,6 +149,9 @@ impl Executor {
         }
 
         let assertion_features = StaticFeatures::collect(&self.ctx.terms, assertions);
+        if assertion_features.has_finite_field {
+            return (LogicCategory::Other, assertion_features);
+        }
 
         // Datatype + non-DT-content routing must be LOGIC-AGNOSTIC. A datatype
         // problem whose selectors return Int/Real/BitVec (e.g. `(hd (tl (tl x)))`

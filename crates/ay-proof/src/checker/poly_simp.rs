@@ -6,8 +6,8 @@
 //!
 //! Carcara accepts `(cl (= lhs rhs))` under `poly_simp` when distributing
 //! arithmetic `+`, `-`, and `*` makes both sides the same polynomial.  This
-//! module independently implements a bounded subset of that rule for Int and
-//! Real terms.  Unsupported syntax and every resource-cap trip decline; no
+//! module checks bounded Int/Real polynomials and BV affine identities.
+//! Unsupported syntax and every resource-cap trip decline; no
 //! solver result or producer annotation is trusted.
 
 use std::collections::BTreeMap;
@@ -304,7 +304,8 @@ fn polynomial_identity(terms: &TermStore, clause: &[TermId]) -> Result<(), Strin
 /// Whether the clause is an exact premise-free `poly_simp` identity.
 #[must_use]
 pub fn recognize_arith_poly_simp(terms: &TermStore, clause: &[TermId]) -> bool {
-    polynomial_identity(terms, clause).is_ok()
+    super::bv_affine::check(terms, clause, &mut |_, _| true).unwrap_or(false)
+        || polynomial_identity(terms, clause).is_ok()
 }
 
 #[cfg(test)]

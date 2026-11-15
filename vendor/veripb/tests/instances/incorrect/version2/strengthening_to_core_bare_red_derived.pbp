@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict), version 2 spelling of the same defect: under
+* `strengthening_to_core on` a `red` without an explicit subproof stored its constraint in the
+* DERIVED set, where no later `red` generates a proofgoal for it. Two contradictory witnesses
+* then refuted a satisfiable formula (x1 alone satisfies it).
+f 1
+strengthening_to_core on
+red 1 y1 >= 1 ; y1 -> 1
+red 1 ~y1 >= 1 ; y1 -> 0
+u >= 1 ;
+output NONE
+conclusion UNSAT
+end pseudo-Boolean proof

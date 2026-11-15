@@ -99,16 +99,21 @@ fn ic3_rejects_internal_lrat_and_exhausted_trace_tombstone() {
 #[test]
 fn public_drat_writer_detach_keeps_conservative_controls() {
     let mut solver = Solver::with_proof(2, Vec::<u8>::new());
+    // Sweep is proof-logged on DRAT since proof-posture-parity site S
+    // (e367fd456), so a DRAT writer no longer clamps it; this test asserted
+    // the old clamp and failed from that merge (349414c19) until 2026-09-12.
     solver.set_sweep_enabled(true);
-    assert!(!solver.is_sweep_enabled());
+    assert!(solver.is_sweep_enabled());
     assert!(solver.inproc_ctrl_pre_proof.is_some());
 
     let detached = solver.take_proof_writer();
     assert!(detached.is_some());
     assert!(solver.proof_writer().is_none());
     assert!(!solver.cold.lrat_enabled);
+    // Detaching keeps the controls chosen under the writer and drops the
+    // pre-proof snapshot instead of restoring it.
     assert!(solver.inproc_ctrl_pre_proof.is_none());
-    assert!(!solver.is_sweep_enabled());
+    assert!(solver.is_sweep_enabled());
 }
 
 #[test]
@@ -382,4 +387,110 @@ fn clause_trace_snapshots_preserve_persistent_solver_ownership() {
     assert!(second.is_some());
     assert!(solver.clause_trace_enabled());
     assert!(solver.cold.lrat_enabled);
+}
+
+/// #destroyed-trace. The #A2b clear must leave behind a truthful census of
+/// what it destroyed.
+///
+/// This is the measurement the 2026-09-08 closure diagnosis asserted without
+/// taking: it called the exhausted population "a propositional refutation AY
+/// recorded and then deliberately discarded" while its own instrument reported
+/// `clause_trace_entries=0`, because the clear had already happened. Mutating
+/// `snapshot_before_exhaustion_clear` to run AFTER `clear_entries` makes every
+/// assertion below fail with zeroes.
+#[test]
+fn exhaustion_snapshot_records_what_the_clear_destroyed() {
+    let mut solver = Solver::new(4);
+    solver.enable_clause_trace();
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    assert!(solver.add_clause(vec![a, b]));
+    assert!(solver.add_clause(vec![a.negated(), b]));
+    let recorded = solver.clause_trace().map_or(0, ClauseTrace::len);
+    assert!(recorded >= 2, "the trace must hold the added clauses");
+
+    solver.set_proof_bookkeeping_budget(Some(0));
+    if let Some(trace) = solver.cold.clause_trace.as_mut() {
+        trace.mark_proof_work_exhausted();
+    }
+    solver.degrade_proof_bookkeeping_after_exhaustion();
+
+    let trace = solver
+        .clause_trace()
+        .expect("the trace survives the degrade");
+    assert!(trace.is_empty(), "entries are cleared");
+    let snap = trace
+        .exhaustion_snapshot()
+        .expect("the clear must leave its census behind");
+    assert_eq!(snap.entries as usize, recorded);
+    assert_eq!(snap.originals as usize, recorded);
+    assert_eq!(snap.learned, 0);
+    assert!(
+        !snap.has_empty,
+        "no empty clause was derived before the budget ran out"
+    );
+}
+
+/// #destroyed-trace. The counterpart: when the trace HAD reached the empty
+/// clause before exhaustion, the census says so. Without this arm the
+/// `has_empty` field could be hard-wired to `false` and the test above would
+/// still pass.
+#[test]
+fn exhaustion_snapshot_reports_a_destroyed_refutation_as_one() {
+    let mut solver = Solver::new(2);
+    solver.enable_clause_trace();
+    let x = Literal::positive(Variable(0));
+    assert!(solver.add_clause(vec![x]));
+    assert!(solver.add_clause(vec![x.negated()]));
+    assert!(matches!(solver.solve().into_inner(), SatResult::Unsat(_)));
+    assert!(
+        solver
+            .clause_trace()
+            .is_some_and(ClauseTrace::has_empty_clause),
+        "the solve must have recorded the empty clause"
+    );
+
+    solver.set_proof_bookkeeping_budget(Some(0));
+    if let Some(trace) = solver.cold.clause_trace.as_mut() {
+        trace.mark_proof_work_exhausted();
+    }
+    solver.degrade_proof_bookkeeping_after_exhaustion();
+
+    let snap = solver
+        .clause_trace()
+        .and_then(ClauseTrace::exhaustion_snapshot)
+        .expect("the clear must leave its census behind");
+    assert!(snap.has_empty, "a destroyed refutation must read as one");
+    assert!(snap.entries > 0);
+}
+
+/// #destroyed-trace. A second degrade on an already-emptied trace must not
+/// overwrite the real measurement with zeroes. The degrade path is reachable
+/// from three call sites and the trace is cleared by the first one.
+#[test]
+fn a_second_degrade_cannot_erase_the_first_census() {
+    let mut solver = Solver::new(4);
+    solver.enable_clause_trace();
+    let a = Literal::positive(Variable(0));
+    assert!(solver.add_clause(vec![a]));
+    let recorded = solver.clause_trace().map_or(0, ClauseTrace::len);
+    assert!(recorded > 0);
+
+    solver.set_proof_bookkeeping_budget(Some(0));
+    if let Some(trace) = solver.cold.clause_trace.as_mut() {
+        trace.mark_proof_work_exhausted();
+    }
+    solver.degrade_proof_bookkeeping_after_exhaustion();
+    if let Some(trace) = solver.cold.clause_trace.as_mut() {
+        // The second `degrade` returns early on `lrat_enabled`, so drive the
+        // census directly: this is the call that would zero the measurement if
+        // the snapshot were a last-write rather than a first-write.
+        trace.snapshot_before_exhaustion_clear();
+    }
+
+    let snap = solver
+        .clause_trace()
+        .and_then(ClauseTrace::exhaustion_snapshot)
+        .expect("census present");
+    assert_eq!(snap.entries as usize, recorded);
 }

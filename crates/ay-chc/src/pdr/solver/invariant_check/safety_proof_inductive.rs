@@ -10,7 +10,11 @@
 
 use super::*;
 
+#[cfg(test)]
+mod error_guided_tests;
 mod outcome;
+#[cfg(test)]
+mod query_translation_tests;
 pub(super) use outcome::InductiveSubsetOutcome;
 mod subset_analysis;
 
@@ -45,6 +49,54 @@ impl PdrSolver {
         self.evaluate_inductive_subset(queries, model)
     }
 
+    /// A single-body query's predicate, that predicate's canonical variables,
+    /// and the query's error region over them, exactly. A variable argument
+    /// renames to its position's canonical variable; any other argument (an
+    /// expression, or a variable already renamed) is pinned by
+    /// `(= canonical argument)`, its variables staying query locals under
+    /// their own names (`to_canonical`), as does every other local. So a
+    /// caller that makes lemmas of it must check closedness, and one that
+    /// conjoins it with another clause must rename that clause apart.
+    ///
+    /// Renaming an expression argument's variables onto its canonical
+    /// variable instead (#2492's shape) describes a different region: under
+    /// `P(x + 1)` it reads `x = 4` as `canonical = 4` where the error is
+    /// `canonical = 5`, and a Bool `b` in `P((ite b 1 0))` lands on an Int.
+    pub(super) fn canonical_query_error(
+        &self,
+        query: &HornClause,
+    ) -> Option<(PredicateId, Vec<ChcVar>, ChcExpr)> {
+        let [(qpred, qbody_args)] = query.body.predicates.as_slice() else {
+            return None;
+        };
+        let qcanonical_vars = self.canonical_vars(*qpred)?.to_vec();
+        if qbody_args.len() != qcanonical_vars.len() {
+            return None;
+        }
+        let mut qvar_map: FxHashMap<String, ChcVar> = FxHashMap::default();
+        let mut pinned = Vec::new();
+        for (arg, canon) in qbody_args.iter().zip(qcanonical_vars.iter()) {
+            match arg {
+                ChcExpr::Var(v) if !qvar_map.contains_key(&v.name) => {
+                    qvar_map.insert(v.name.clone(), canon.clone());
+                }
+                arg => pinned.push((canon, arg)),
+            }
+        }
+        let constraint = query.body.constraint.as_ref().map_or_else(
+            || Some(ChcExpr::Bool(true)),
+            |c| Self::to_canonical(c, &qvar_map),
+        );
+        let pins = pinned.into_iter().map(|(canon, arg)| {
+            Self::to_canonical(arg, &qvar_map)
+                .map(|arg| ChcExpr::eq(ChcExpr::var(canon.clone()), arg))
+        });
+        let qerror = std::iter::once(constraint)
+            .chain(pins)
+            .collect::<Option<Vec<_>>>()?;
+        Some((*qpred, qcanonical_vars, ChcExpr::and_all(qerror)))
+    }
+
     /// Error-guided lemma discovery (#5425).
     ///
     /// For multi-predicate problems with non-strictly-inductive lemmas,
@@ -59,45 +111,24 @@ impl PdrSolver {
         let mut found_new = false;
 
         for query in queries {
-            if query.body.predicates.len() != 1 {
+            let Some((qpred, qcanonical_vars, qerror)) = self.canonical_query_error(query) else {
                 continue;
-            }
-            let (qpred_id, qbody_args) = &query.body.predicates[0];
-            let qpred = *qpred_id;
-
-            let qcanonical_vars = match self.canonical_vars(qpred) {
-                Some(v) => v.to_vec(),
-                None => continue,
-            };
-
-            let mut qvar_map: FxHashMap<String, ChcVar> = FxHashMap::default();
-            for (arg, canon) in qbody_args.iter().zip(qcanonical_vars.iter()) {
-                match arg {
-                    ChcExpr::Var(v) => {
-                        qvar_map.insert(v.name.clone(), canon.clone());
-                    }
-                    expr => {
-                        for v in expr.vars() {
-                            qvar_map
-                                .entry(v.name.clone())
-                                .or_insert_with(|| canon.clone());
-                        }
-                    }
-                }
-            }
-
-            let qerror = match &query.body.constraint {
-                Some(c) => match Self::to_canonical(c, &qvar_map) {
-                    Some(ec) => ec,
-                    None => continue,
-                },
-                None => continue,
             };
 
             let conjuncts = Self::extract_conjuncts(&qerror);
             for conjunct in &conjuncts {
                 let negated = Self::negate_atomic_constraint(conjunct);
                 if let Some(candidate) = negated {
+                    // A conjunct over a query local keeps that local free under
+                    // its source name, and a frame lemma has no binder for it:
+                    // it is captured by whatever clause the lemma meets, at
+                    // that clause's sort (#5805's shape). Only a candidate
+                    // closed over the predicate's canonical variables is a
+                    // lemma, and it is refused before any check builds a query
+                    // around it.
+                    if !self.closed_over(&candidate, &qcanonical_vars) {
+                        continue;
+                    }
                     let blocking = ChcExpr::not(candidate.clone());
                     let strict = self.is_strictly_self_inductive_blocking(&blocking, qpred);
                     if !strict {

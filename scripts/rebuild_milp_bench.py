@@ -3,10 +3,11 @@
 """Rebuild ~/ay-bench/milp from MIPLIB 2017 — instances, .solu and manifest.json.
 
 WHY THIS EXISTS. On 2026-08-06 `~/ay-bench/milp/` was found EMPTY. That directory
-held the instances and the `manifest.json` for `scripts/ay_gurobi_closure.py`, the
-authoritative AY-vs-Gurobi gate, so the gate had been silently inoperable — it
-could not run at all, and nothing surfaced that until someone went looking for a
-Gurobi number. Reports in this repo cite instance sets BY PATH, and paths rot.
+held the instances and the `manifest.json` for `scripts/ay_gurobi_closure.py`, then
+the authoritative AY-vs-Gurobi gate (deleted 2026-09-25 as dead), so the gate had
+been silently inoperable — it could not run at all, and nothing surfaced that until
+someone went looking for a Gurobi number. Reports in this repo cite instance sets
+BY PATH, and paths rot.
 
 The instance NAMES survived only because four committed gate reports
 (the development design notes and friends) recorded them. They are embedded below so

@@ -1,0 +1,7 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const bridge_dom_bce_idx (_ BitVec 64))
+(assert (and (bvule bridge_dom_bce_idx (_ bv1024 64)) (not (= (bvult bridge_dom_bce_idx (_ bv1024 64)) true))))
+(check-sat)
+(get-value (bridge_dom_bce_idx))

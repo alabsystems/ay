@@ -1,9 +1,10 @@
-# AY <-> VeriPB checker PIN. Single source of truth.
+# AY's separately built VeriPB reference checker PIN.
 #
-# Everything that verifies an AY proof — CI, `scripts/ci/pb_certified_gate.sh`,
-# `scripts/cert_ci.sh`, and the Rust gates in `crates/ay-test-support/src/veripb.rs`
-# (module `pin`, which `include_str!`s THIS file) and `crates/ay/src/maxsat_cert.rs`
-# — reads the checker identity from here. There is no second copy to drift.
+# CI, `scripts/ci/pb_certified_gate.sh`, `scripts/cert_ci.sh`, and the Rust
+# reference gates in `crates/ay-test-support/src/veripb.rs` read this identity.
+# Production `ay check veripb` and MaxSAT certification use the maintained
+# libraries in vendor/veripb instead; their cohort is recorded in
+# the development design notes and their integration is bound by AY release provenance.
 #
 # WHY A PIN AT ALL. "VeriPB accepted it" only means something if you can say
 # WHICH VeriPB. Upstream 3.0.2 as published has TWENTY-ONE confirmed wrong-verdict
@@ -100,12 +101,16 @@ VERIPB_VERSION=3.0.2
 # VERIPB_COMMIT. It is `git diff --binary 4bb10c2c b1e80c0f` VERBATIM (the
 # `--binary` is load-bearing: the fork added ten binary files after f7f9d442 —
 # a `.cleancert` and nine compressed parser-test instances — that a text-only
-# diff cannot carry). 601 files, +76944/-3084. Reproducible from public sources:
-# clone the upstream repo, `git checkout 4bb10c2c`, `git apply` this patch,
-# `cargo build --release --bin veripb`. Verified 2026-08-29 from a fresh clone
-# of the fork at b1e80c0f: applying this patch to a clean 4bb10c2c checkout
-# reproduces the fork tip's tree EXACTLY (`git write-tree` == b1e80c0f^{tree},
-# `git diff b1e80c0f` empty).
+# diff cannot carry). 601 files, +76944/-3084. Reproducible from the public
+# upstream plus this patch: clone the upstream repo, `git checkout 4bb10c2c`,
+# `git apply` this patch, `cargo build --release --bin veripb`. The patch file
+# itself is kept in the development tree only: the public snapshot ships this
+# pin (its sha256 is still the identity) and the soundness fixtures, and there
+# a checker supplied through VERIPB_BIN is vetted by behaviour, the self-test
+# battery and all twenty-two fixtures, not by provenance. Verified 2026-08-29
+# from a fresh clone of the fork at b1e80c0f: applying this patch to a clean
+# 4bb10c2c checkout reproduces the fork tip's tree EXACTLY (`git write-tree` ==
+# b1e80c0f^{tree}, `git diff b1e80c0f` empty).
 #
 # WHY THE FORK, NOT UPSTREAM. `alab-main` carries all twenty-one soundness fixes
 # plus diagnostics and the Clean-proved kernel `veripb-core-proved`. Upstream
@@ -118,29 +123,32 @@ VERIPB_VERSION=3.0.2
 #   b1e80c0f  chore(kernel-verify): re-bless coverage snapshot and census for
 #             the ported instances
 #
-# KERNEL STATUS ON THIS BOX, STATED HONESTLY. `veripb-core-proved` is a
-# workspace MEMBER that nothing depends on: `cargo build --bin veripb` does not
-# compile it, and the shipped binary contains none of its symbols, so it decides
-# NO verdict (the gate's phase 2b MEASURES that, it does not assume it). It is
-# built and its tests are run on every gate invocation so it cannot rot. What the
-# gate does NOT do is run `clean check` on the kernel proof itself, and here is
-# why, measured on this box:
+# KERNEL TRUST BOUNDARY. The pinned `veripb-checker` directly depends on
+# `veripb-core-proved`; its kernel bridge is available through the optional
+# `--kernel-verify` mode, which defaults to false. This gate's certificate
+# commands do not request that mode. Phase 2b builds the crate and runs its
+# Rust tests; it does not run `clean check` on the kernel proof. Its scan for
+# selected symbol names is a regression tripwire, not a reachability proof:
+# optimized binaries can lack those names despite this dependency and bridge.
+# A green phase gives no formal kernel-proof credit to a checker verdict.
+#
+# Historical measurement retained from the earlier toolchain investigation:
 #
 #   clean 1.2.0, from the `trust` stage3-tools-bin tree
 #   (.../trust/build/aarch64-apple-darwin/stage3-tools-bin/
 #   aarch64-apple-darwin/clean)
 #     tip (b1e80c0f)  kernel: 874 declarations, 471 checked, 403 unchecked (rc 1)
 #
-# The gap is a TOOLCHAIN LINEAGE mismatch, not rotted proofs: `Nat.eq_of_beq_eq_true`
+# That report attributed the gap to a TOOLCHAIN LINEAGE mismatch: `Nat.eq_of_beq_eq_true`
 # does not exist in clean 1.2.0 under that or any probed alias, and one explicit
 # `sorry` compatibility shim is present. The fork's own `scripts/verify-proofs.sh`
-# checks the same kernel GREEN under the Clean lineage its pins name
-# (`clean 0.1.0|v0.1.0-22-g...`, 77 suites), which is not present on this box.
-# Until that toolchain is available here the kernel is UNVERIFIABLE on this box,
-# and — exactly as when the pin sat at f7f9d442 — this gate makes NO claim about
-# the kernel proof, only about the crate (that it compiles and its Rust tests
-# pass). Do not read the kernel's presence as an increase in the trustworthiness
-# of any existing certification claim. See ci/veripb-soundness/README.md.
+# was reported GREEN under the Clean lineage its pins name
+# (`clean 0.1.0|v0.1.0-22-g...`, 77 suites), unavailable for that earlier check.
+# This gate does not repeat that formal proof check or establish a current
+# kernel-proof verdict. It claims only that the crate compiles and its Rust
+# tests pass, separately from the default checker's behavioral and certificate
+# checks. The optional bridge remains unqualified by this gate. Do not read its
+# presence as a higher proof grade. See ci/veripb-soundness/README.md.
 VERIPB_PATCH=ci/veripb-patches/0001-ay-veripb-alab-main.patch
 VERIPB_PATCH_SHA256=11d772ada406cc637979058c5d218b026ecb77c84713c2bda10938e1896c32a0
 

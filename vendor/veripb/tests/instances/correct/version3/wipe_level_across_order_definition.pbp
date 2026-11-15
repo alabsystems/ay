@@ -1,0 +1,55 @@
+pseudo-Boolean proof version 3.0
+% Regression test: a level crossing an order definition's database swap. The
+% `setlvl` below is still in force when `def_order` installs its fresh scratch
+% database, and the checker recorded `database.len()` at the level for every
+% constraint added while it was installed -- the `def` constraint and the
+% transitivity proof's lines, i.e. SCRATCH indices 1-4. `wiplvl` is refused
+% inside the definition (`OrderDefinitionPlacement`), so it always resolves the
+% recorded indices against the PROBLEM database: here it deleted formula
+% constraints 1-4, which the proof never tagged. Every one of them is trivially
+% rederivable, so even forced checked deletion discharged them without a word
+% -- the mis-deletion was completely silent, and only the `e` checks below
+% catch it ("Trying to access constraint with ID 1 that has already been
+% deleted"). Level recording is now suspended while an order-definition
+% subcontext is open (`checker.rs`); the definition's constraints need no level
+% bookkeeping, since they are discarded wholesale when their block ends and no
+% deletion rule can reach them.
+%
+% What the format grants: `setlvl` marks "all following constraints" and
+% `wiplvl` deletes only constraints "marked with <level> or a greater number"
+% (proof_format_overview.md). The one problem-database constraint added after
+% the `setlvl` is the `pol` sum, so that is what this `wiplvl` owes deletion --
+% `is_deleted` pins that the suspension did not simply stop level recording
+% altogether. This proof must verify: rejected before the fix, accepted after.
+f 6;
+setlvl 1;
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux;
+    end;
+    def
+        -1 u1 1 v1 >= 0;
+    end;
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+            proofgoal #1
+                pol -2 -3 + -1 +;
+            qed : -1;
+        qed;
+    end;
+end;
+pol 1 2 +;
+wiplvl 1;
+e 1 x1 >= 0 : 1;
+e 1 x2 >= 0 : 2;
+e 1 x3 >= 0 : 3;
+e 1 x4 >= 0 : 4;
+is_deleted 1 x1 1 x2 >= 0 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

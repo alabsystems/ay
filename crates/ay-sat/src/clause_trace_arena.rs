@@ -4,6 +4,7 @@
 
 //! Capacity-bounded arena storage for [`ClauseTrace`].
 
+use crate::ClauseEventOrigin;
 use std::mem::size_of;
 
 use super::{
@@ -78,6 +79,8 @@ fn replacement_peak_fits(
 ) -> bool {
     current
         .peak_with_replacements(replacement_capacities(meta, literals, hints))
+        .and_then(|peak| peak.checked_add(trace.originals.bytes))
+        .and_then(|peak| peak.checked_add(trace.deletion_bytes()))
         .is_some_and(|peak| peak <= trace.budget_bytes)
 }
 
@@ -86,14 +89,19 @@ impl ClauseTrace {
     pub fn new() -> Self {
         Self {
             meta: Vec::new(),
+            deletions: Vec::new(),
+            event_capture: super::ClauseEventCapture::Additions,
+            retirements_omitted: false,
             lit_pool: Vec::new(),
             hint_pool: Vec::new(),
             has_empty: false,
             budget_bytes: DEFAULT_BUDGET_BYTES,
             is_truncated: false,
             proof_work_exhausted: false,
+            exhaustion_snapshot: None,
             hint_omissions: HintOmissionCounters::default(),
             solver_num_vars: None,
+            originals: super::originals::OriginalStorage::default(),
         }
     }
 
@@ -170,6 +178,11 @@ impl ClauseTrace {
     /// an entire trace if two entries carry the same ID.
     pub fn contains_id(&self, id: u64) -> bool {
         self.meta.iter().any(|entry| entry.id == id)
+            || self
+                .originals
+                .arena
+                .as_ref()
+                .is_some_and(|arena| arena.ids.contains(&id))
     }
 
     /// Record a clause addition with explicit resolution hints.
@@ -198,6 +211,10 @@ impl ClauseTrace {
         resolution_hints: &[u64],
     ) {
         self.solver_num_vars = None;
+        if !self.original_event_open(is_original) {
+            self.mark_proof_work_exhausted();
+            return;
+        }
         if clause.is_empty() {
             self.has_empty = true;
         }
@@ -211,12 +228,32 @@ impl ClauseTrace {
             return;
         }
         self.report_duplicate_if_probed(id, is_original, clause.len());
+        self.publish_entry(meta, clause, resolution_hints);
+    }
+
+    /// Allocation-free publication after the exact slices and all capacities
+    /// were admitted. Counted callers retain exclusive ownership until their
+    /// enclosing original-owner fence; this does not grant proof authority.
+    pub(crate) fn set_inserted_origin(&mut self, id: u64, origin: ClauseEventOrigin) {
+        if let Some(last) = self.meta.last_mut().filter(|last| last.id == id) {
+            last.origin = origin;
+        }
+    }
+
+    pub(super) fn publish_entry(
+        &mut self,
+        meta: EntryMeta,
+        clause: &[Literal],
+        resolution_hints: &[u64],
+    ) {
+        self.solver_num_vars = None;
+        self.has_empty |= clause.is_empty();
         self.lit_pool.extend_from_slice(clause);
         self.hint_pool.extend_from_slice(resolution_hints);
         self.meta.push(meta);
     }
 
-    fn preflight_entry_meta(
+    pub(super) fn preflight_entry_meta(
         &self,
         id: u64,
         clause: &[Literal],
@@ -240,22 +277,42 @@ impl ClauseTrace {
             hints_off,
             hints_len: u32::try_from(resolution_hints.len()).ok()?,
             is_original,
+            origin: if is_original {
+                ClauseEventOrigin::Assumption
+            } else {
+                ClauseEventOrigin::Lemma
+            },
+            original_prefix_len: self.originals.count,
         })
     }
 
-    fn reserve_for_add(&mut self, clause_len: usize, hints_len: usize) -> bool {
+    pub(super) fn reserve_for_add(&mut self, clause_len: usize, hints_len: usize) -> bool {
         let current = ArenaCapacities::current(self);
         let Some(required) = ArenaCapacities::required_after_add(self, clause_len, hints_len)
         else {
             return false;
         };
-        let Some(target) = current.bounded_growth(required, self.budget_bytes) else {
-            return false;
-        };
-        let Some((mut meta, mut literals, mut hints)) = reserve_replacements(self, current, target)
+        let Some(budget) = self
+            .budget_bytes
+            .checked_sub(self.originals.bytes)
+            .and_then(|n| n.checked_sub(self.deletion_bytes()))
         else {
             return false;
         };
+        let Some(target) = current.bounded_growth(required, budget) else {
+            return false;
+        };
+        let Some(replacements) = reserve_replacements(self, current, target) else {
+            return false;
+        };
+        self.install_replacements(replacements);
+        true
+    }
+
+    pub(super) fn install_replacements(
+        &mut self,
+        (mut meta, mut literals, mut hints): ArenaReplacements,
+    ) {
         if let Some(replacement) = &mut meta {
             replacement.extend_from_slice(&self.meta);
         }
@@ -274,7 +331,6 @@ impl ClauseTrace {
         if let Some(replacement) = hints {
             self.hint_pool = replacement;
         }
-        true
     }
 
     fn reject_entry(&mut self, reason: &'static str) {
@@ -370,7 +426,12 @@ impl ClauseTrace {
             literals: 0,
             hints: new_pool_len,
         };
-        if current.peak_with_replacements(planned_replacement)? > self.budget_bytes {
+        if current
+            .peak_with_replacements(planned_replacement)?
+            .checked_add(self.originals.bytes)?
+            .checked_add(self.deletion_bytes())?
+            > self.budget_bytes
+        {
             return None;
         }
         let mut compact = Vec::new();
@@ -380,7 +441,12 @@ impl ClauseTrace {
             literals: 0,
             hints: compact.capacity(),
         };
-        if current.peak_with_replacements(actual_replacement)? > self.budget_bytes {
+        if current
+            .peak_with_replacements(actual_replacement)?
+            .checked_add(self.originals.bytes)?
+            .checked_add(self.deletion_bytes())?
+            > self.budget_bytes
+        {
             return None;
         }
         for (entry_index, meta) in self.meta.iter().enumerate() {
@@ -432,14 +498,23 @@ impl ClauseTrace {
     pub fn clear_entries(&mut self) {
         self.solver_num_vars = None;
         self.meta = Vec::new();
+        self.deletions = Vec::new();
+        self.retirements_omitted = false;
         self.lit_pool = Vec::new();
         self.hint_pool = Vec::new();
+        self.originals.arena = None;
+        if !self.originals.is_pending() {
+            self.originals.bytes = 0;
+            self.originals.count = 0;
+        }
     }
 
     /// Exact bytes retained by entry, literal, and hint vector capacities.
     pub fn used_bytes(&self) -> usize {
         ArenaCapacities::current(self)
             .retained_bytes()
+            .and_then(|bytes| bytes.checked_add(self.originals.bytes))
+            .and_then(|bytes| bytes.checked_add(self.deletion_bytes()))
             .unwrap_or(usize::MAX)
     }
 }

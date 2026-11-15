@@ -1,0 +1,24 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. Both rows have a left-hand side in {0,1} and a hugely
+% NEGATIVE right-hand side, so both are trivially true. `sat.pbp` here makes
+% the same checker say `s VERIFIED SATISFIABLE`, with the model x1 = 0.
+%
+% Correct result of `pol 1 2 +`: the two degrees sum to exactly i64::MIN, x1
+% and ~x1 cancel for a cancellation of 1, so the sum is the EMPTY constraint
+% `>= -9223372036854775809` -- trivially true, degree below i64::MIN.
+%
+% Unfixed: `Cardinality::add` validates that the summed degree fits into i64
+% and then subtracts the cancellation with a plain `-` in that same i64
+% (cardinality.rs, the `TryInto::<i64>` branch: `degree_sum - cancel`). The
+% check covers `degree_sum` but not `degree_sum - cancel`, so i64::MIN - 1
+% wraps to i64::MAX and the sum is stored as the EMPTY CONTRADICTION
+% `>= 9223372036854775807`. `conclusion UNSAT : 3` is then accepted.
+%
+% Control: change both degrees to -4611686018427387903. The summed degree is
+% then i64::MIN + 2, the decrement does not wrap, and the same proof is
+% REJECTED.
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

@@ -22,6 +22,8 @@
 //! Reference: Heule, Järvisalo, Biere, "Covered Clause Elimination", LPAR 2010.
 //! Implementation: CaDiCaL `cover.cpp` (704 lines).
 
+mod counted;
+
 use crate::clause_arena::ClauseArena;
 use crate::literal::Literal;
 use crate::occ_list::OccList;

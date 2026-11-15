@@ -66,6 +66,7 @@ fn bitvec_width(sort: &ChcSort) -> Option<u32> {
 #[allow(dead_code)]
 fn supported_bool_bv_sort(expr: &ChcExpr, allowed_vars: &FxHashSet<ChcVar>) -> Option<ChcSort> {
     match expr {
+        ChcExpr::ArrayLambda(_) => None,
         ChcExpr::Bool(_) => Some(ChcSort::Bool),
         ChcExpr::BitVec(_, width) => Some(ChcSort::BitVec(*width)),
         ChcExpr::Var(var) => {
@@ -389,6 +390,37 @@ impl TransitionSystem {
     ///
     /// Part of #1032 (TPA engine).
     pub(crate) fn from_chc_problem(problem: &ChcProblem) -> Result<Self, String> {
+        let (pred_id, vars, parts) = Self::extract_parts(problem)?;
+        let init = parts
+            .init_constraint()
+            .ok_or_else(|| "No fact clause found".to_string())?;
+        let transition = parts
+            .transition_constraint()
+            .ok_or_else(|| "No transition clause found".to_string())?;
+        let query = parts
+            .query_constraint()
+            .ok_or_else(|| "No query clause found".to_string())?;
+        Ok(Self::new(pred_id, vars, init, transition, query))
+    }
+
+    /// The per-clause disjuncts `from_chc_problem` folds into `init`,
+    /// `transition` and `query`, each paired with the index of the clause it
+    /// came from. Byte-identical canonicalization: `from_chc_problem` is built
+    /// on this same extraction, so a disjunct here IS the corresponding term
+    /// of the system's constraint (before `TransitionSystem::new`'s mod/div
+    /// elimination, which touches neither variable names nor clause order).
+    ///
+    /// Consumers use it to attribute a model of the unrolled system back to
+    /// the original clauses (`bmc::ts_witness`).
+    pub(crate) fn clause_disjuncts(problem: &ChcProblem) -> Result<TsClauseDisjuncts, String> {
+        Self::extract_parts(problem).map(|(_, _, parts)| parts)
+    }
+
+    /// Shared front half of `from_chc_problem`: the single used predicate, its
+    /// canonical variables, and the per-clause canonical disjuncts.
+    fn extract_parts(
+        problem: &ChcProblem,
+    ) -> Result<(PredicateId, Vec<ChcVar>, TsClauseDisjuncts), String> {
         // Check: exactly one USED predicate. Orphan declarations — e.g. a
         // 0-arity query marker `fail` unfolded away by
         // `eliminate_trivial_bool_markers` (#9078) — remain in `predicates()`
@@ -430,19 +462,12 @@ impl TransitionSystem {
             .map(|(i, sort)| ChcVar::new(format!("v{i}"), sort.clone()))
             .collect();
 
-        // Extract init constraint from fact clauses
-        let init = Self::extract_init_constraint(problem, pred_id, &vars)
-            .ok_or_else(|| "No fact clause found".to_string())?;
-
-        // Extract transition constraint from transition clauses
-        let transition = Self::extract_transition_constraint(problem, pred_id, &vars)
-            .ok_or_else(|| "No transition clause found".to_string())?;
-
-        // Extract query constraint from query clauses
-        let query = Self::extract_query_constraint(problem, pred_id, &vars)
-            .ok_or_else(|| "No query clause found".to_string())?;
-
-        Ok(Self::new(pred_id, vars, init, transition, query))
+        let parts = TsClauseDisjuncts {
+            facts: Self::extract_init_disjuncts(problem, pred_id, &vars),
+            transitions: Self::extract_transition_disjuncts(problem, pred_id, &vars),
+            queries: Self::extract_query_disjuncts(problem, pred_id, &vars),
+        };
+        Ok((pred_id, vars, parts))
     }
 
     /// Substitute clause arguments to canonical variables in a constraint.
@@ -548,15 +573,23 @@ impl TransitionSystem {
         }
     }
 
-    /// Extract init constraint: maps fact clauses to constraint on canonical vars.
-    fn extract_init_constraint(
+    /// Extract the per-fact-clause init disjuncts (canonical vars, prefixed
+    /// locals). `idx` enumerates `problem.facts()` exactly as before, so the
+    /// `__init{idx}_` local prefix is unchanged.
+    fn extract_init_disjuncts(
         problem: &ChcProblem,
         pred_id: PredicateId,
         vars: &[ChcVar],
-    ) -> Option<ChcExpr> {
+    ) -> Vec<TsClauseDisjunct> {
         let mut init_disjuncts = Vec::new();
 
-        for (idx, fact) in problem.facts().enumerate() {
+        for (idx, (clause_idx, fact)) in problem
+            .clauses()
+            .iter()
+            .enumerate()
+            .filter(|(_, clause)| clause.is_fact() && !clause.is_query())
+            .enumerate()
+        {
             if fact.head.predicate_id() != Some(pred_id) {
                 continue;
             }
@@ -573,37 +606,44 @@ impl TransitionSystem {
             let combined = Self::finalize_constraint(constraint, extra_eqs);
             // Rename local variables to avoid collisions with transition/query locals (#6789)
             let prefix = format!("__init{idx}_");
-            init_disjuncts.push(Self::rename_local_vars(combined, vars, None, &prefix));
+            init_disjuncts.push(TsClauseDisjunct {
+                clause_idx,
+                constraint: Self::rename_local_vars(combined, vars, None, &prefix),
+                local_prefix: prefix,
+            });
         }
 
-        if init_disjuncts.is_empty() {
-            None
-        } else {
-            Some(ChcExpr::or_all(init_disjuncts))
-        }
+        init_disjuncts
     }
 
-    /// Extract transition constraint from transition clauses.
-    fn extract_transition_constraint(
+    /// Extract the per-transition-clause disjuncts. `idx` enumerates
+    /// `problem.transitions()` exactly as before (`__tr{idx}_` local prefix).
+    fn extract_transition_disjuncts(
         problem: &ChcProblem,
         pred_id: PredicateId,
         vars: &[ChcVar],
-    ) -> Option<ChcExpr> {
+    ) -> Vec<TsClauseDisjunct> {
         let mut trans_disjuncts = Vec::new();
 
-        for (idx, trans) in problem.transitions().enumerate() {
+        for (idx, (clause_idx, trans)) in problem
+            .clauses()
+            .iter()
+            .enumerate()
+            .filter(|(_, clause)| !clause.is_fact() && !clause.is_query())
+            .enumerate()
+        {
             if let Some(canonical) =
                 Self::canonical_transition_clause_constraint(trans, pred_id, vars, idx)
             {
-                trans_disjuncts.push(canonical);
+                trans_disjuncts.push(TsClauseDisjunct {
+                    clause_idx,
+                    constraint: canonical,
+                    local_prefix: format!("__tr{idx}_"),
+                });
             }
         }
 
-        if trans_disjuncts.is_empty() {
-            None
-        } else {
-            Some(ChcExpr::or_all(trans_disjuncts))
-        }
+        trans_disjuncts
     }
 
     /// Canonicalize one self-transition clause into the `vars`/`vars_next` form.
@@ -668,17 +708,26 @@ impl TransitionSystem {
         ))
     }
 
-    /// Extract query constraint from query clauses.
-    fn extract_query_constraint(
+    /// Extract the per-query-clause disjuncts. `idx` enumerates
+    /// `problem.queries()` exactly as before (`__qry{idx}_` local prefix).
+    fn extract_query_disjuncts(
         problem: &ChcProblem,
         pred_id: PredicateId,
         vars: &[ChcVar],
-    ) -> Option<ChcExpr> {
+    ) -> Vec<TsClauseDisjunct> {
         let mut query_disjuncts = Vec::new();
 
-        for (idx, query) in problem.queries().enumerate() {
+        for (idx, (clause_idx, query)) in problem
+            .clauses()
+            .iter()
+            .enumerate()
+            .filter(|(_, clause)| clause.is_query())
+            .enumerate()
+        {
             // Body should have the predicate
-            let (body_pred, body_args) = query.body.predicates.first()?;
+            let Some((body_pred, body_args)) = query.body.predicates.first() else {
+                return query_disjuncts;
+            };
             if *body_pred != pred_id {
                 continue;
             }
@@ -689,13 +738,58 @@ impl TransitionSystem {
             let combined = Self::finalize_constraint(constraint, extra_eqs);
             // Rename local variables to avoid collisions with init/transition locals (#6789)
             let prefix = format!("__qry{idx}_");
-            query_disjuncts.push(Self::rename_local_vars(combined, vars, None, &prefix));
+            query_disjuncts.push(TsClauseDisjunct {
+                clause_idx,
+                constraint: Self::rename_local_vars(combined, vars, None, &prefix),
+                local_prefix: prefix,
+            });
         }
 
-        if query_disjuncts.is_empty() {
+        query_disjuncts
+    }
+}
+
+/// One original clause as it enters the transition system: its canonical
+/// constraint (over `v{i}` / `v{i}_next` and `local_prefix`-renamed locals,
+/// before per-step versioning) and its index in `ChcProblem::clauses()`.
+#[derive(Debug, Clone)]
+pub(crate) struct TsClauseDisjunct {
+    pub(crate) clause_idx: usize,
+    pub(crate) constraint: ChcExpr,
+    /// Prefix `rename_local_vars` put on this clause's local variables.
+    pub(crate) local_prefix: String,
+}
+
+/// The per-clause disjuncts behind a transition system's `init` (facts),
+/// `transition` (self-transitions) and `query` (queries), in the order they
+/// were folded.
+#[derive(Debug, Clone)]
+pub(crate) struct TsClauseDisjuncts {
+    pub(crate) facts: Vec<TsClauseDisjunct>,
+    pub(crate) transitions: Vec<TsClauseDisjunct>,
+    pub(crate) queries: Vec<TsClauseDisjunct>,
+}
+
+impl TsClauseDisjuncts {
+    fn fold(disjuncts: &[TsClauseDisjunct]) -> Option<ChcExpr> {
+        if disjuncts.is_empty() {
             None
         } else {
-            Some(ChcExpr::or_all(query_disjuncts))
+            Some(ChcExpr::or_all(
+                disjuncts.iter().map(|d| d.constraint.clone()),
+            ))
         }
+    }
+
+    fn init_constraint(&self) -> Option<ChcExpr> {
+        Self::fold(&self.facts)
+    }
+
+    fn transition_constraint(&self) -> Option<ChcExpr> {
+        Self::fold(&self.transitions)
+    }
+
+    fn query_constraint(&self) -> Option<ChcExpr> {
+        Self::fold(&self.queries)
     }
 }

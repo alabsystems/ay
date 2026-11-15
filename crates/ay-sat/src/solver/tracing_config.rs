@@ -22,7 +22,7 @@ impl Solver {
     ///
     /// Only compiled when `ay_logging` is active (#4293).
     #[cfg(ay_logging)]
-    pub(crate) fn fmt_lit(&self, lit: Literal) -> String {
+    pub(crate) fn fmt_lit(&self, lit: Literal) -> decision_commit::output::LiteralLabel {
         let var = lit.variable();
         let idx = var.index();
         let level = if idx < self.var_data.len() {
@@ -59,7 +59,12 @@ impl Solver {
         } else {
             ""
         };
-        format!("{}@{}{}{}", lit.to_dimacs(), level, reason, val)
+        decision_commit::output::LiteralLabel {
+            lit,
+            level,
+            reason,
+            value: val,
+        }
     }
 
     /// Enable online forward DRUP checking (CaDiCaL `--check --checkproof`).
@@ -69,9 +74,11 @@ impl Solver {
     /// implied by existing clauses, the solver panics immediately.
     ///
     /// Overhead: ~3x slowdown. Call before adding any clauses.
+    /// With a counted owner attached, bootstrap uses that original grant;
+    /// bootstrap refusal preserves the existing checker and stops later solving. This
+    /// does not yet account for subsequent checker insertion or RUP work.
     pub fn enable_forward_checker(&mut self) {
-        self.cold.forward_checker =
-            Some(crate::forward_checker::ForwardChecker::new(self.num_vars));
+        self.enable_forward_checker_with_sampling(0);
     }
 
     /// Enable sampled forward DRUP checking (#5625).
@@ -84,10 +91,28 @@ impl Solver {
     /// Systematic bugs (affecting most derived clauses) are caught with
     /// >99.99% probability over a typical solve.
     pub fn enable_forward_checker_sampled(&mut self, sample_period: u64) {
-        self.cold.forward_checker = Some(crate::forward_checker::ForwardChecker::new_sampled(
-            self.num_vars,
-            sample_period,
-        ));
+        self.enable_forward_checker_with_sampling(sample_period);
+    }
+
+    fn enable_forward_checker_with_sampling(&mut self, sample_period: u64) {
+        use crate::forward_checker::ForwardChecker;
+        let checker = if let Some(owner) = &self.cold.counted_admission {
+            let Ok(checker) = ForwardChecker::try_new_counted(self.num_vars, sample_period, owner)
+            else {
+                return;
+            };
+            checker
+        } else {
+            ForwardChecker::new_sampled(self.num_vars, sample_period)
+        };
+        // Do not drop an existing checker unless its replacement is complete
+        // and admitted. A failed bootstrap never silently disables checking.
+        self.cold.forward_checker = Some(checker);
+        if let Some(owner) = &self.cold.counted_admission {
+            // The displaced checker's cleanup may outlive a genuine deadline.
+            // A refusal here remains terminal, even though replacement committed.
+            let _ = owner.check();
+        }
     }
 
     /// Set the deterministic search-time proof bookkeeping work budget
@@ -100,6 +125,10 @@ impl Solver {
     /// `proof_work_exhausted`, so downstream reconstruction fails closed
     /// (verdict kept, honest "no proof certificate emitted" warning).
     ///
+    /// A `Some` set inside a
+    /// [`crate::keep_proof_inprocessing_after_exhaustion`] scope keeps the
+    /// proof-mode inprocessing controls on exhaustion.
+    ///
     /// # Panics
     ///
     /// Panics for `Some` unless one live synthesized clause trace is the sole
@@ -109,6 +138,8 @@ impl Solver {
             self.assert_can_set_proof_bookkeeping_budget();
         }
         self.cold.proof_bookkeeping_budget = budget;
+        self.cold.proof_exhaustion_keeps_proof_inprocessing =
+            budget.is_some() && proof_exhaustion_scope::proof_inprocessing_kept_after_exhaustion();
         self.refresh_proof_consumer_state();
     }
 
@@ -142,11 +173,22 @@ impl Solver {
     /// would assign unstable or colliding clause IDs.
     pub fn enable_clause_trace(&mut self) {
         self.assert_can_enable_clause_trace();
+        let capacity = self.num_vars.saturating_mul(4).min(100_000);
+        self.install_clause_trace(ClauseTrace::with_capacity(capacity));
+    }
+
+    /// Shared arming/publication kernel; callers own allocation and admission.
+    pub(in crate::solver) fn install_clause_trace(&mut self, trace: ClauseTrace) {
+        // #recording-gap. Diagnostic only. The closure census reports
+        // `sat_reconstruction=no-trace` for 65% of the largest decline class
+        // and could not say whether the deciding lane HAS proof-recording code
+        // that declined to run, or has NONE. A process counter of armings
+        // separates those two without plumbing a flag through every lane.
+        crate::clause_trace::note_clause_trace_armed();
         // unit_proof_id, level0_proof_id, and clause_ids are now allocated
         // unconditionally at construction (#8069: Phase 2a). No resizing needed.
         // Allocate clause trace
-        let capacity = self.num_vars.saturating_mul(4).min(100_000);
-        self.cold.clause_trace = Some(ClauseTrace::with_capacity(capacity));
+        self.cold.clause_trace = Some(trace);
         self.refresh_proof_consumer_state();
     }
 
@@ -249,15 +291,29 @@ impl Solver {
     /// through a public [`ClauseTrace`] mutator clears that provenance.
     #[must_use]
     pub fn snapshot_clause_trace(&self) -> Option<ClauseTrace> {
+        if self.consuming_trace_pending() {
+            return None;
+        }
         let mut trace = self.cold.clause_trace.clone()?;
         trace.stamp_solver_provenance(self.total_num_vars(), &self.active_scope_assumptions());
         Some(trace)
     }
 
+    /// Select the retained artifact policy of an already enabled trace.
+    /// Missing past events cannot become a complete lifecycle snapshot.
+    pub fn set_clause_event_capture(&mut self, policy: crate::ClauseEventCapture) {
+        if let Some(trace) = self.cold.clause_trace.as_mut() {
+            trace.set_event_capture(policy);
+        }
+    }
+
     /// Get a reference to the clause trace
     #[must_use]
     pub fn clause_trace(&self) -> Option<&ClauseTrace> {
-        self.cold.clause_trace.as_ref()
+        self.cold
+            .clause_trace
+            .as_ref()
+            .filter(|trace| !trace.original_transfer_pending())
     }
 
     /// Return the structured Extended Resolution extension-variable proof log.
@@ -470,7 +526,7 @@ impl Solver {
     }
 
     #[inline]
-    fn diagnostic_pass_code(pass: DiagnosticPass) -> u8 {
+    pub(super) fn diagnostic_pass_code(pass: DiagnosticPass) -> u8 {
         match pass {
             DiagnosticPass::None => 0,
             DiagnosticPass::Input => 1,
@@ -510,6 +566,9 @@ impl Solver {
         }
     }
 }
+
+#[cfg(test)]
+mod counted_constructor_tests;
 
 #[cfg(test)]
 mod bounded_posture_tests {

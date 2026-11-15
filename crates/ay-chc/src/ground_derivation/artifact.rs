@@ -18,20 +18,44 @@ use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 use num_traits::{Signed, Zero};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::control::{GroundValidationControl, GroundValidationInterrupted};
+#[cfg(test)]
+use super::eval_ground_pub;
+#[cfg(any(test, doc))]
+use super::validate_ground_derivation;
 use super::{
-    eval_ground_pub, ground_uf_congruence_key, validate_ground_derivation, GroundDerivation,
+    ground_uf_congruence_key, validate_ground_derivation_with_control, GroundDerivation,
     GroundDerivationError, GroundDerivationStep, GroundSourceSurfaceCache,
     GroundSourceSurfaceError, GroundUfCongruenceKey, CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH,
 };
+#[cfg(test)]
+use crate::normalized_chc_input_sha256;
+#[cfg(test)]
 use crate::proof_metadata::ordered_chc_clause_sequence_sha256;
 use crate::{
-    normalized_chc_input_sha256, ChcError, ChcExpr, ChcPdrProofRun, ChcProblem,
-    ChcProofRunArtifact, ChcResult, ChcSort, Counterexample, SmtValue, VerifiedChcResult,
-    NORMALIZED_CHC_INPUT_SCHEMA,
+    ChcError, ChcExpr, ChcPdrProofRun, ChcProblem, ChcProofRunArtifact, ChcResult, ChcSort,
+    Counterexample, SmtValue, VerifiedChcResult,
 };
+
+#[path = "compact_artifact.rs"]
+pub(crate) mod compact_artifact;
+mod producer;
+mod rebuild;
+mod source_identity;
+mod transport;
+mod view;
+
+pub use view::ChcGroundDerivationStepView;
+
+#[cfg(test)]
+mod decoding_progress_tests;
+
+#[cfg(test)]
+mod encoding_progress_tests;
 
 /// Schema for a canonical ground-derivation artifact.
 pub const CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA: &str = "ay.chc-ground-derivation-artifact/v1";
@@ -170,6 +194,8 @@ struct WireArrayEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ChcGroundDerivationArtifactErrorReason {
+    /// The caller refused continuation at a cooperative validation boundary.
+    Interrupted,
     /// The counterexample does not carry a candidate ground derivation.
     MissingGroundDerivation,
     /// The complete artifact exceeds the byte bound.
@@ -244,6 +270,7 @@ impl ChcGroundDerivationArtifactErrorReason {
     /// Stable lower-snake-case reason code.
     pub const fn code(self) -> &'static str {
         match self {
+            Self::Interrupted => "interrupted",
             Self::MissingGroundDerivation => "missing_ground_derivation",
             Self::ArtifactTooLarge => "artifact_too_large",
             Self::TooManyPredicates => "too_many_predicates",
@@ -408,6 +435,14 @@ fn error(
     ChcGroundDerivationArtifactError::new(reason, detail)
 }
 
+fn interruption_error(_: GroundValidationInterrupted) -> ChcGroundDerivationArtifactError {
+    error(
+        ChcGroundDerivationArtifactErrorReason::Interrupted,
+        "ground-derivation validation interrupted by the caller",
+    )
+}
+
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -436,438 +471,30 @@ fn checked_u32(value: usize, label: &str) -> Result<u32, ChcGroundDerivationArti
     })
 }
 
-fn source_identity_error(message: impl Into<String>) -> ChcGroundDerivationArtifactError {
-    error(
-        ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded,
-        message,
-    )
-}
-
-fn charge_source_identity_work(
-    work: &mut usize,
-    amount: usize,
-) -> Result<(), ChcGroundDerivationArtifactError> {
-    *work = work
-        .checked_add(amount)
-        .filter(|work| *work <= super::CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
-        .ok_or_else(|| source_identity_error("whole-problem source identity exceeds work bound"))?;
-    Ok(())
-}
-
-fn source_bitvector_width_work(width: u32) -> Result<usize, ChcGroundDerivationArtifactError> {
-    if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
-        return Err(source_identity_error(format!(
-            "source bitvector width {width} is outside 1..={}",
-            crate::MAX_BITVECTOR_WIDTH
-        )));
-    }
-    // Whole-problem identity and namespace passes render only this bounded
-    // decimal width; they never allocate a `width`-bit value or mask. Selected
-    // ground replay charges ceil(width/8) separately before evaluation.
-    Ok(16)
-}
-
-fn preflight_source_identity_sort(
-    root: &ChcSort,
-    work: &mut usize,
-) -> Result<(), ChcGroundDerivationArtifactError> {
-    let mut stack = vec![(root, 1usize)];
-    while let Some((sort, depth)) = stack.pop() {
-        if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
-            return Err(source_identity_error(
-                "whole-problem source sort exceeds depth bound",
-            ));
-        }
-        // `normalized_sort` constructs child strings bottom-up. Weight every
-        // node and name by its sort-ancestor depth so a deep sort's repeated
-        // copying is admitted only when the fixed envelope dominates it.
-        charge_source_identity_work(
-            work,
-            32usize
-                .checked_mul(depth)
-                .ok_or_else(|| source_identity_error("source sort node work overflow"))?,
-        )?;
-        match sort {
-            ChcSort::Array(index, value) => {
-                charge_source_identity_work(
-                    work,
-                    2usize
-                        .checked_mul(depth)
-                        .ok_or_else(|| source_identity_error("source array sort work overflow"))?,
-                )?;
-                let child_depth = depth.checked_add(1).ok_or_else(|| {
-                    source_identity_error("whole-problem source sort depth overflow")
-                })?;
-                stack.push((index, child_depth));
-                stack.push((value, child_depth));
-            }
-            ChcSort::Uninterpreted(name) => charge_source_identity_work(
-                work,
-                name.len().checked_mul(depth).ok_or_else(|| {
-                    source_identity_error("source uninterpreted-sort name work overflow")
-                })?,
-            )?,
-            ChcSort::Datatype { name, constructors } => {
-                charge_source_identity_work(
-                    work,
-                    name.len()
-                        .checked_add(constructors.len())
-                        .and_then(|amount| amount.checked_mul(depth))
-                        .ok_or_else(|| {
-                            source_identity_error("source datatype identity work overflow")
-                        })?,
-                )?;
-                let child_depth = depth.checked_add(1).ok_or_else(|| {
-                    source_identity_error("whole-problem datatype depth overflow")
-                })?;
-                for constructor in constructors.iter() {
-                    charge_source_identity_work(
-                        work,
-                        constructor
-                            .name
-                            .len()
-                            .checked_add(constructor.selectors.len())
-                            .and_then(|amount| amount.checked_mul(depth))
-                            .ok_or_else(|| {
-                                source_identity_error("source constructor work overflow")
-                            })?,
-                    )?;
-                    for selector in &constructor.selectors {
-                        charge_source_identity_work(
-                            work,
-                            selector.name.len().checked_mul(depth).ok_or_else(|| {
-                                source_identity_error("source selector work overflow")
-                            })?,
-                        )?;
-                        stack.push((&selector.sort, child_depth));
-                    }
-                }
-            }
-            ChcSort::BitVec(width) => charge_source_identity_work(
-                work,
-                source_bitvector_width_work(*width)?
-                    .checked_mul(depth)
-                    .ok_or_else(|| source_identity_error("source bitvector sort work overflow"))?,
-            )?,
-            ChcSort::Bool | ChcSort::Int | ChcSort::Real => {}
-        }
-    }
-    Ok(())
-}
-
-fn preflight_source_identity_sort_multiplied(
-    root: &ChcSort,
-    work: &mut usize,
-    multiplier: usize,
-) -> Result<(), ChcGroundDerivationArtifactError> {
-    let starting_work = *work;
-    preflight_source_identity_sort(root, work)?;
-    let sort_work = work
-        .checked_sub(starting_work)
-        .ok_or_else(|| source_identity_error("whole-problem sort work underflow"))?;
-    let additional = multiplier
-        .checked_sub(1)
-        .and_then(|multiplier| sort_work.checked_mul(multiplier))
-        .ok_or_else(|| source_identity_error("whole-problem sort identity work overflow"))?;
-    charge_source_identity_work(work, additional)
-}
-
-fn push_source_identity_expr<'a>(
-    stack: &mut Vec<(&'a ChcExpr, usize)>,
-    expression: &'a ChcExpr,
-    depth: usize,
-    work: usize,
-) -> Result<(), ChcGroundDerivationArtifactError> {
-    if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH
-        || work
-            .checked_add(stack.len())
-            .is_none_or(|projected| projected >= super::CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
-    {
-        return Err(source_identity_error(
-            "whole-problem source expression exceeds depth/work bound",
-        ));
-    }
-    stack.push((expression, depth));
-    Ok(())
-}
-
-fn preflight_problem_source_identity(
+/// Bound and validate exactly the live source authenticated by ground artifacts
+/// and native replay, reusing the caller's sticky cancellation state. Node/edge
+/// traversal polls internally; individual sort derivations and semantic
+/// validators remain opaque between phase polls.
+pub(super) fn validate_ground_source_problem_with_control(
     problem: &ChcProblem,
+    control: &mut GroundValidationControl<'_>,
 ) -> Result<(), ChcGroundDerivationArtifactError> {
-    let mut work = 0usize;
-    let mut expression_nodes = 0usize;
-    let mut bounded_expression_sorts = Vec::new();
-    for predicate in problem.predicates() {
-        charge_source_identity_work(&mut work, 64)?;
-        charge_source_identity_work(
-            &mut work,
-            predicate
-                .name
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("predicate name work overflow"))?,
-        )?;
-        charge_source_identity_work(
-            &mut work,
-            predicate
-                .arg_sorts
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("predicate signature work overflow"))?,
-        )?;
-        for sort in &predicate.arg_sorts {
-            preflight_source_identity_sort_multiplied(sort, &mut work, 2)?;
-        }
-    }
-    for action_name in problem.action_names() {
-        charge_source_identity_work(&mut work, 32)?;
-        charge_source_identity_work(
-            &mut work,
-            action_name
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("action name work overflow"))?,
-        )?;
-    }
-    for (datatype_name, constructors) in problem.datatype_defs() {
-        charge_source_identity_work(&mut work, 64)?;
-        charge_source_identity_work(
-            &mut work,
-            datatype_name
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("datatype name work overflow"))?,
-        )?;
-        for (constructor_name, selectors) in constructors {
-            charge_source_identity_work(
-                &mut work,
-                constructor_name
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| source_identity_error("constructor name work overflow"))?,
-            )?;
-            for (selector_name, sort) in selectors {
-                charge_source_identity_work(
-                    &mut work,
-                    selector_name
-                        .len()
-                        .checked_mul(2)
-                        .ok_or_else(|| source_identity_error("selector name work overflow"))?,
-                )?;
-                preflight_source_identity_sort_multiplied(sort, &mut work, 2)?;
-            }
-        }
-    }
-
-    let mut stack = Vec::new();
-    for clause in problem.clauses() {
-        charge_source_identity_work(&mut work, 64)?;
-        charge_source_identity_work(
-            &mut work,
-            clause
-                .body
-                .predicates
-                .len()
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("clause structure work overflow"))?,
-        )?;
-        if let Some(action_name) = clause
-            .action_id
-            .and_then(|action| problem.action_name(action))
-        {
-            charge_source_identity_work(
-                &mut work,
-                action_name
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| source_identity_error("clause action work overflow"))?,
-            )?;
-        }
-        if let Some(constraint) = &clause.body.constraint {
-            push_source_identity_expr(&mut stack, constraint, 1, work)?;
-        }
-        for (_, arguments) in &clause.body.predicates {
-            for argument in arguments {
-                push_source_identity_expr(&mut stack, argument, 1, work)?;
-            }
-        }
-        if let crate::ClauseHead::Predicate(_, arguments) = &clause.head {
-            for argument in arguments {
-                push_source_identity_expr(&mut stack, argument, 1, work)?;
-            }
-        }
-        while let Some((expression, depth)) = stack.pop() {
-            expression_nodes = expression_nodes
-                .checked_add(1)
-                .ok_or_else(|| source_identity_error("source expression count overflow"))?;
-            let identity_multiplier = depth
-                .checked_mul(2)
-                .ok_or_else(|| source_identity_error("source identity depth work overflow"))?;
-            charge_source_identity_work(
-                &mut work,
-                64usize
-                    .checked_mul(identity_multiplier)
-                    .ok_or_else(|| source_identity_error("source node work overflow"))?,
-            )?;
-            bounded_expression_sorts.push((expression, identity_multiplier));
-            match expression {
-                ChcExpr::Var(variable) => {
-                    charge_source_identity_work(
-                        &mut work,
-                        variable
-                            .name
-                            .len()
-                            .checked_mul(identity_multiplier)
-                            .ok_or_else(|| source_identity_error("variable name work overflow"))?,
-                    )?;
-                    preflight_source_identity_sort_multiplied(
-                        &variable.sort,
-                        &mut work,
-                        identity_multiplier,
-                    )?;
-                }
-                ChcExpr::FuncApp(name, return_sort, _) => {
-                    charge_source_identity_work(
-                        &mut work,
-                        name.len()
-                            .checked_mul(identity_multiplier)
-                            .ok_or_else(|| source_identity_error("function name work overflow"))?,
-                    )?;
-                    preflight_source_identity_sort_multiplied(
-                        return_sort,
-                        &mut work,
-                        identity_multiplier,
-                    )?;
-                }
-                ChcExpr::PredicateApp(name, _, _) | ChcExpr::IsTesterMarker(name) => {
-                    charge_source_identity_work(
-                        &mut work,
-                        name.len()
-                            .checked_mul(identity_multiplier)
-                            .ok_or_else(|| source_identity_error("source name work overflow"))?,
-                    )?;
-                }
-                ChcExpr::ConstArray(sort, _) | ChcExpr::ConstArrayMarker(sort) => {
-                    preflight_source_identity_sort_multiplied(
-                        sort,
-                        &mut work,
-                        identity_multiplier,
-                    )?;
-                }
-                ChcExpr::Bool(_)
-                | ChcExpr::Int(_)
-                | ChcExpr::Real(_, _)
-                | ChcExpr::BitVec(_, _)
-                | ChcExpr::Op(_, _) => {}
-            }
-            let children: &[std::sync::Arc<ChcExpr>] = match expression {
-                ChcExpr::Op(_, arguments)
-                | ChcExpr::PredicateApp(_, _, arguments)
-                | ChcExpr::FuncApp(_, _, arguments) => arguments,
-                ChcExpr::ConstArray(_, value) => std::slice::from_ref(value),
-                ChcExpr::Bool(_)
-                | ChcExpr::Int(_)
-                | ChcExpr::Real(_, _)
-                | ChcExpr::BitVec(_, _)
-                | ChcExpr::Var(_)
-                | ChcExpr::ConstArrayMarker(_)
-                | ChcExpr::IsTesterMarker(_) => &[],
-            };
-            let child_depth = depth.checked_add(1).ok_or_else(|| {
-                source_identity_error("whole-problem source expression depth overflow")
-            })?;
-            for child in children {
-                push_source_identity_expr(&mut stack, child, child_depth, work)?;
-            }
-        }
-    }
-    // Recursive operator-sort derivation is safe only after the complete
-    // iterative expression/sort preflight has accepted every live clause.
-    for (expression, identity_multiplier) in bounded_expression_sorts {
-        let expression_sort =
-            catch_unwind(AssertUnwindSafe(|| expression.sort())).map_err(|_| {
-                source_identity_error("whole-problem expression sort derivation panicked")
-            })?;
-        if let ChcSort::BitVec(width) = expression_sort {
-            charge_source_identity_work(
-                &mut work,
-                source_bitvector_width_work(width)?
-                    .checked_mul(identity_multiplier)
-                    .ok_or_else(|| {
-                        source_identity_error("source bitvector expression work overflow")
-                    })?,
-            )?;
-        }
-    }
-    let sort_items = expression_nodes
-        .max(problem.predicates().len())
-        .max(problem.clauses().len())
-        .max(problem.datatype_defs().len())
-        .max(problem.action_names().len());
-    let sort_rounds = sort_items.checked_sub(1).map_or(0, |maximum_index| {
-        usize::BITS as usize - maximum_index.leading_zeros() as usize
-    });
-    let sort_work = work
-        .checked_mul(sort_rounds)
-        .ok_or_else(|| source_identity_error("whole-problem canonical sort work overflow"))?;
-    charge_source_identity_work(&mut work, sort_work)
+    source_identity::preflight_problem_source_identity(control, problem)?;
+    source_identity::validate_source_semantics(problem, control)
 }
 
-/// Bound and validate exactly the live source surface authenticated by ground
-/// artifacts and native derivation replay.
-///
-/// The iterative identity pass runs first. Only then may the action, predicate,
-/// background-expression, and typed-function validators inspect the bounded
-/// source, or the global ordinary-UF collector clone/hash/sort source terms.
-/// Pruned-query provenance is intentionally excluded because neither the
-/// artifact hashes nor clause ordinals authenticate it.
-pub(super) fn validate_ground_source_problem(
-    problem: &ChcProblem,
-) -> Result<(), ChcGroundDerivationArtifactError> {
-    preflight_problem_source_identity(problem)?;
-    catch_unwind(AssertUnwindSafe(|| {
-        problem.validate_live_clause_actions()?;
-        problem.validate_live_background_theory_expressions()?;
-        problem.validate_live_predicate_applications()?;
-        problem.validate_live_typed_function_applications()?;
-        let expressions = problem.clauses().iter().flat_map(|clause| {
-            let head_arguments = match &clause.head {
-                crate::ClauseHead::Predicate(_, arguments) => arguments.as_slice(),
-                crate::ClauseHead::False => &[],
-            };
-            clause
-                .body
-                .constraint
-                .iter()
-                .chain(
-                    clause
-                        .body
-                        .predicates
-                        .iter()
-                        .flat_map(|(_, arguments)| arguments),
-                )
-                .chain(head_arguments)
-        });
-        crate::smt::executor_adapter::collect_uninterpreted_function_declarations_for_exprs(
-            expressions,
-        )
-        .map(|_| ())
-    }))
-    .map_err(|_| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
-            "bounded live source validation panicked",
-        )
-    })?
-    .map_err(|source_error| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::InvalidSourceProblem,
-            source_error.to_string(),
-        )
-    })
-}
-
+#[cfg(test)]
 fn validate_problem_bounds(problem: &ChcProblem) -> Result<(), ChcGroundDerivationArtifactError> {
+    let mut progress = || true;
+    let mut control = GroundValidationControl::new(&mut progress);
+    validate_problem_bounds_with_control(problem, &mut control)
+}
+
+pub(super) fn validate_problem_bounds_with_control(
+    problem: &ChcProblem,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(), ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if problem.predicates().len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_PREDICATES {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManyPredicates,
@@ -888,9 +515,10 @@ fn validate_problem_bounds(problem: &ChcProblem) -> Result<(), ChcGroundDerivati
             ),
         ));
     }
-    validate_ground_source_problem(problem)
+    validate_ground_source_problem_with_control(problem, control)
 }
 
+#[cfg(test)]
 fn validate_json_surface(bytes: &[u8]) -> Result<(), ChcGroundDerivationArtifactError> {
     let mut depth = 0usize;
     let mut in_string = false;
@@ -980,12 +608,15 @@ fn validate_json_surface(bytes: &[u8]) -> Result<(), ChcGroundDerivationArtifact
 
 /// Count the recursive wire-value occurrences a sort-directed decoder will
 /// visit, without consulting datatype constructor tables.
-fn wire_value_typecheck_occurrences(
+fn wire_value_typecheck_occurrences_with_control(
     root: &WireValue,
+    control: &mut GroundValidationControl<'_>,
 ) -> Result<usize, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     let mut occurrences = 0usize;
     let mut stack = vec![root];
     while let Some(value) = stack.pop() {
+        control.poll().map_err(interruption_error)?;
         occurrences = occurrences
             .checked_add(1)
             .filter(|count| *count <= CHC_GROUND_DERIVATION_ARTIFACT_MAX_VALUE_NODES)
@@ -1000,17 +631,24 @@ fn wire_value_typecheck_occurrences(
             WireValue::ArrayMap { default, entries } => {
                 stack.push(default);
                 for entry in entries {
+                    control.poll().map_err(interruption_error)?;
                     stack.push(&entry.index);
                     stack.push(&entry.value);
                 }
             }
-            WireValue::Datatype { fields, .. } => stack.extend(fields),
+            WireValue::Datatype { fields, .. } => {
+                for field in fields {
+                    control.poll().map_err(interruption_error)?;
+                    stack.push(field);
+                }
+            }
             WireValue::Bool { .. }
             | WireValue::Int { .. }
             | WireValue::Real { .. }
             | WireValue::Bitvector { .. } => {}
         }
     }
+    control.poll().map_err(interruption_error)?;
     Ok(occurrences)
 }
 
@@ -1085,12 +723,30 @@ fn validate_array_index_sort(sort: &ChcSort) -> Result<(), ChcGroundDerivationAr
     ))
 }
 
+#[cfg(test)]
 fn encode_value(
     value: &SmtValue,
     expected_sort: &ChcSort,
     depth: usize,
     value_nodes: &mut usize,
 ) -> Result<WireValue, ChcGroundDerivationArtifactError> {
+    encode_value_with_control(
+        value,
+        expected_sort,
+        depth,
+        value_nodes,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn encode_value_with_control(
+    value: &SmtValue,
+    expected_sort: &ChcSort,
+    depth: usize,
+    value_nodes: &mut usize,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<WireValue, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     validate_value_depth(depth)?;
     increment_count(
         value_nodes,
@@ -1099,22 +755,24 @@ fn encode_value(
         "value node",
     )?;
 
-    match (value, expected_sort) {
+    let encoded = match (value, expected_sort) {
         (SmtValue::Bool(value), ChcSort::Bool) => Ok(WireValue::Bool { value: *value }),
         (SmtValue::Int(value), ChcSort::Int) => Ok(WireValue::Int {
-            decimal: value.to_string(),
+            decimal: decoding_phase(control, || value.to_string())?,
         }),
         (SmtValue::BigInt(value), ChcSort::Int) => Ok(WireValue::Int {
-            decimal: value.to_string(),
+            decimal: decoding_phase(control, || value.to_string())?,
         }),
         (SmtValue::Real(value), ChcSort::Real) => Ok(WireValue::Real {
-            numerator: value.numer().to_string(),
-            denominator: value.denom().to_string(),
+            numerator: decoding_phase(control, || value.numer().to_string())?,
+            denominator: decoding_phase(control, || value.denom().to_string())?,
         }),
         (SmtValue::BitVec(_, width) | SmtValue::BigBitVec(_, width), ChcSort::BitVec(expected))
             if width == expected =>
         {
-            let Some((value, canonical_width)) = value.bitvec_to_biguint() else {
+            let Some((value, canonical_width)) =
+                decoding_phase(control, || value.bitvec_to_biguint())?
+            else {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::InvalidValue,
                     "bitvector width is outside AY's public bound",
@@ -1122,24 +780,48 @@ fn encode_value(
             };
             Ok(WireValue::Bitvector {
                 width: canonical_width,
-                value_hex: value.to_str_radix(16),
+                value_hex: decoding_phase(control, || value.to_str_radix(16))?,
             })
         }
         (SmtValue::ConstArray(default), ChcSort::Array(index_sort, value_sort)) => {
-            validate_array_index_sort(index_sort)?;
+            decoding_phase(control, || validate_array_index_sort(index_sort))??;
             Ok(WireValue::ConstArray {
-                default: Box::new(encode_value(default, value_sort, depth + 1, value_nodes)?),
+                default: Box::new(encode_value_with_control(
+                    default,
+                    value_sort,
+                    depth + 1,
+                    value_nodes,
+                    control,
+                )?),
             })
         }
         (SmtValue::ArrayMap { default, entries }, ChcSort::Array(index_sort, value_sort)) => {
-            validate_array_index_sort(index_sort)?;
-            let default = Box::new(encode_value(default, value_sort, depth + 1, value_nodes)?);
+            decoding_phase(control, || validate_array_index_sort(index_sort))??;
+            let default = Box::new(encode_value_with_control(
+                default,
+                value_sort,
+                depth + 1,
+                value_nodes,
+                control,
+            )?);
             let entries = entries
                 .iter()
                 .map(|(index, value)| {
                     Ok(WireArrayEntry {
-                        index: encode_value(index, index_sort, depth + 1, value_nodes)?,
-                        value: encode_value(value, value_sort, depth + 1, value_nodes)?,
+                        index: encode_value_with_control(
+                            index,
+                            index_sort,
+                            depth + 1,
+                            value_nodes,
+                            control,
+                        )?,
+                        value: encode_value_with_control(
+                            value,
+                            value_sort,
+                            depth + 1,
+                            value_nodes,
+                            control,
+                        )?,
                     })
                 })
                 .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
@@ -1147,10 +829,15 @@ fn encode_value(
         }
         (SmtValue::Datatype(constructor, fields), ChcSort::Datatype { constructors, .. }) => {
             validate_text_value(constructor, "datatype constructor")?;
-            let Some(definition) = constructors
-                .iter()
-                .find(|definition| definition.name == *constructor)
-            else {
+            let mut definition = None;
+            for candidate in constructors.iter() {
+                control.poll().map_err(interruption_error)?;
+                if decoding_phase(control, || candidate.name == *constructor)? {
+                    definition = Some(candidate);
+                    break;
+                }
+            }
+            let Some(definition) = definition else {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::BindingSortMismatch,
                     format!("datatype constructor `{constructor}` is not in the source sort"),
@@ -1170,11 +857,17 @@ fn encode_value(
                 .iter()
                 .zip(&definition.selectors)
                 .map(|(field, selector)| {
-                    encode_value(field, &selector.sort, depth + 1, value_nodes)
+                    encode_value_with_control(
+                        field,
+                        &selector.sort,
+                        depth + 1,
+                        value_nodes,
+                        control,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(WireValue::Datatype {
-                constructor: constructor.clone(),
+                constructor: decoding_phase(control, || constructor.clone())?,
                 fields,
             })
         }
@@ -1190,9 +883,12 @@ fn encode_value(
             ChcGroundDerivationArtifactErrorReason::BindingSortMismatch,
             format!("value {value:?} does not match source sort {expected_sort}"),
         )),
-    }
+    };
+    control.poll().map_err(interruption_error)?;
+    encoded
 }
 
+#[cfg(test)]
 fn canonical_decimal(value: &str) -> bool {
     if value == "0" {
         return true;
@@ -1203,18 +899,52 @@ fn canonical_decimal(value: &str) -> bool {
         && digits.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
-fn parse_canonical_bigint(
+/// Poll around an individually opaque numeric, hashing or allocation phase.
+/// This is cooperative cancellation, not an operation-duration bound.
+fn decoding_phase<T>(
+    control: &mut GroundValidationControl<'_>,
+    phase: impl FnOnce() -> T,
+) -> Result<T, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
+    let value = phase();
+    control.poll().map_err(interruption_error)?;
+    Ok(value)
+}
+
+fn canonical_decimal_with_control(
+    value: &str,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<bool, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let mut canonical = value == "0" || (!digits.is_empty() && !digits.starts_with('0'));
+    if canonical {
+        for chunk in digits.as_bytes().chunks(4096) {
+            control.poll().map_err(interruption_error)?;
+            if !chunk.iter().all(u8::is_ascii_digit) {
+                canonical = false;
+                break;
+            }
+        }
+    }
+    control.poll().map_err(interruption_error)?;
+    Ok(canonical)
+}
+
+fn parse_canonical_bigint_with_control(
     value: &str,
     label: &str,
+    control: &mut GroundValidationControl<'_>,
 ) -> Result<BigInt, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     validate_text_value(value, label)?;
-    if !canonical_decimal(value) {
+    if !canonical_decimal_with_control(value, control)? {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::InvalidValue,
             format!("{label} is not canonical decimal"),
         ));
     }
-    BigInt::parse_bytes(value.as_bytes(), 10).ok_or_else(|| {
+    decoding_phase(control, || BigInt::parse_bytes(value.as_bytes(), 10))?.ok_or_else(|| {
         error(
             ChcGroundDerivationArtifactErrorReason::InvalidValue,
             format!("{label} is not an integer"),
@@ -1222,6 +952,7 @@ fn parse_canonical_bigint(
     })
 }
 
+#[cfg(test)]
 fn canonical_hex(value: &str) -> bool {
     !value.is_empty()
         && (value == "0" || !value.starts_with('0'))
@@ -1231,12 +962,52 @@ fn canonical_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn canonical_hex_with_control(
+    value: &str,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<bool, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
+    let mut canonical = !value.is_empty() && (value == "0" || !value.starts_with('0'));
+    if canonical {
+        for chunk in value.as_bytes().chunks(4096) {
+            control.poll().map_err(interruption_error)?;
+            if !chunk
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                canonical = false;
+                break;
+            }
+        }
+    }
+    control.poll().map_err(interruption_error)?;
+    Ok(canonical)
+}
+
+#[cfg(test)]
 fn decode_value(
     value: &WireValue,
     expected_sort: &ChcSort,
     depth: usize,
     value_nodes: &mut usize,
 ) -> Result<SmtValue, ChcGroundDerivationArtifactError> {
+    decode_value_with_control(
+        value,
+        expected_sort,
+        depth,
+        value_nodes,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn decode_value_with_control(
+    value: &WireValue,
+    expected_sort: &ChcSort,
+    depth: usize,
+    value_nodes: &mut usize,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<SmtValue, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     validate_value_depth(depth)?;
     increment_count(
         value_nodes,
@@ -1245,11 +1016,12 @@ fn decode_value(
         "value node",
     )?;
 
-    match (value, expected_sort) {
+    let decoded = match (value, expected_sort) {
         (WireValue::Bool { value }, ChcSort::Bool) => Ok(SmtValue::Bool(*value)),
-        (WireValue::Int { decimal }, ChcSort::Int) => Ok(SmtValue::int_from_bigint(
-            parse_canonical_bigint(decimal, "integer value")?,
-        )),
+        (WireValue::Int { decimal }, ChcSort::Int) => {
+            let value = parse_canonical_bigint_with_control(decimal, "integer value", control)?;
+            decoding_phase(control, || SmtValue::int_from_bigint(value))
+        }
         (
             WireValue::Real {
                 numerator,
@@ -1257,15 +1029,17 @@ fn decode_value(
             },
             ChcSort::Real,
         ) => {
-            let numerator = parse_canonical_bigint(numerator, "real numerator")?;
-            let denominator = parse_canonical_bigint(denominator, "real denominator")?;
+            let numerator =
+                parse_canonical_bigint_with_control(numerator, "real numerator", control)?;
+            let denominator =
+                parse_canonical_bigint_with_control(denominator, "real denominator", control)?;
             if denominator.is_zero() || denominator.is_negative() {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::InvalidValue,
                     "real denominator must be positive",
                 ));
             }
-            let rational = BigRational::new(numerator, denominator);
+            let rational = decoding_phase(control, || BigRational::new(numerator, denominator))?;
             let WireValue::Real {
                 numerator,
                 denominator,
@@ -1273,8 +1047,8 @@ fn decode_value(
             else {
                 unreachable!("matched real value above")
             };
-            if rational.numer().to_string() != *numerator
-                || rational.denom().to_string() != *denominator
+            if decoding_phase(control, || rational.numer().to_string())? != *numerator
+                || decoding_phase(control, || rational.denom().to_string())? != *denominator
             {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::InvalidValue,
@@ -1291,44 +1065,66 @@ fn decode_value(
                     format!("bitvector width {width} does not match source width {expected_width}"),
                 ));
             }
-            if !canonical_hex(value_hex) {
+            if !canonical_hex_with_control(value_hex, control)? {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::InvalidValue,
                     "bitvector value is not canonical lowercase hexadecimal",
                 ));
             }
-            let parsed = BigUint::parse_bytes(value_hex.as_bytes(), 16).ok_or_else(|| {
-                error(
-                    ChcGroundDerivationArtifactErrorReason::InvalidValue,
-                    "bitvector value is not hexadecimal",
-                )
-            })?;
+            let parsed =
+                decoding_phase(control, || BigUint::parse_bytes(value_hex.as_bytes(), 16))?
+                    .ok_or_else(|| {
+                        error(
+                            ChcGroundDerivationArtifactErrorReason::InvalidValue,
+                            "bitvector value is not hexadecimal",
+                        )
+                    })?;
             if parsed.bits() > u64::from(*width) {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::InvalidValue,
                     "bitvector value has set bits outside its declared width",
                 ));
             }
-            Ok(SmtValue::bitvec_from_biguint(parsed, *width))
+            decoding_phase(control, || SmtValue::bitvec_from_biguint(parsed, *width))
         }
         (WireValue::ConstArray { default }, ChcSort::Array(index_sort, value_sort)) => {
             validate_array_index_sort(index_sort)?;
-            Ok(SmtValue::ConstArray(Box::new(decode_value(
+            Ok(SmtValue::ConstArray(Box::new(decode_value_with_control(
                 default,
                 value_sort,
                 depth + 1,
                 value_nodes,
+                control,
             )?)))
         }
         (WireValue::ArrayMap { default, entries }, ChcSort::Array(index_sort, value_sort)) => {
             validate_array_index_sort(index_sort)?;
-            let default = Box::new(decode_value(default, value_sort, depth + 1, value_nodes)?);
+            let default = Box::new(decode_value_with_control(
+                default,
+                value_sort,
+                depth + 1,
+                value_nodes,
+                control,
+            )?);
             let entries = entries
                 .iter()
                 .map(|entry| {
+                    control.poll().map_err(interruption_error)?;
                     Ok((
-                        decode_value(&entry.index, index_sort, depth + 1, value_nodes)?,
-                        decode_value(&entry.value, value_sort, depth + 1, value_nodes)?,
+                        decode_value_with_control(
+                            &entry.index,
+                            index_sort,
+                            depth + 1,
+                            value_nodes,
+                            control,
+                        )?,
+                        decode_value_with_control(
+                            &entry.value,
+                            value_sort,
+                            depth + 1,
+                            value_nodes,
+                            control,
+                        )?,
                     ))
                 })
                 .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
@@ -1342,10 +1138,15 @@ fn decode_value(
             ChcSort::Datatype { constructors, .. },
         ) => {
             validate_text_value(constructor, "datatype constructor")?;
-            let Some(definition) = constructors
-                .iter()
-                .find(|definition| definition.name == *constructor)
-            else {
+            let mut matched = None;
+            for definition in constructors.iter() {
+                control.poll().map_err(interruption_error)?;
+                if definition.name == *constructor {
+                    matched = Some(definition);
+                    break;
+                }
+            }
+            let Some(definition) = matched else {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::BindingSortMismatch,
                     format!("datatype constructor `{constructor}` is not in the source sort"),
@@ -1365,7 +1166,13 @@ fn decode_value(
                 .iter()
                 .zip(&definition.selectors)
                 .map(|(field, selector)| {
-                    decode_value(field, &selector.sort, depth + 1, value_nodes)
+                    decode_value_with_control(
+                        field,
+                        &selector.sort,
+                        depth + 1,
+                        value_nodes,
+                        control,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(SmtValue::Datatype(constructor.clone(), fields))
@@ -1378,7 +1185,9 @@ fn decode_value(
             ChcGroundDerivationArtifactErrorReason::BindingSortMismatch,
             format!("wire value does not match source sort {expected_sort}"),
         )),
-    }
+    }?;
+    control.poll().map_err(interruption_error)?;
+    Ok(decoded)
 }
 
 struct SourceSurfacePreflight<'a> {
@@ -1393,6 +1202,7 @@ fn map_source_surface_error(
     surface_error: GroundSourceSurfaceError,
 ) -> ChcGroundDerivationArtifactError {
     match surface_error {
+        GroundSourceSurfaceError::Interrupted => interruption_error(GroundValidationInterrupted),
         GroundSourceSurfaceError::ClauseOutOfRange => error(
             ChcGroundDerivationArtifactErrorReason::IndexOutOfRange,
             format!(
@@ -1421,29 +1231,45 @@ fn map_source_surface_error(
     }
 }
 
+#[cfg(test)]
 fn preflight_source_surfaces<'a>(
     problem: &'a ChcProblem,
     clause_indices: &[usize],
 ) -> Result<SourceSurfacePreflight<'a>, ChcGroundDerivationArtifactError> {
-    let mut cache = GroundSourceSurfaceCache::new(problem);
+    preflight_source_surfaces_with_control(
+        problem,
+        clause_indices,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn preflight_source_surfaces_with_control<'a>(
+    problem: &'a ChcProblem,
+    clause_indices: &[usize],
+    control: &mut GroundValidationControl<'_>,
+) -> Result<SourceSurfacePreflight<'a>, ChcGroundDerivationArtifactError> {
+    let mut cache = decoding_phase(control, || GroundSourceSurfaceCache::new(problem))?;
     let mut binding_count = 0usize;
     let mut uf_observation_count = 0usize;
-    let mut validated_source_names = vec![false; problem.clauses().len()];
+    let mut validated_source_names =
+        decoding_phase(control, || vec![false; problem.clauses().len()])?;
     for (step_index, clause_index) in clause_indices.iter().copied().enumerate() {
-        let (variables, applications) =
-            cache
-                .charge_step_reuse(clause_index)
-                .map_err(|surface_error| {
-                    map_source_surface_error(step_index, clause_index, surface_error)
-                })?;
+        control.poll().map_err(interruption_error)?;
+        let (variables, applications) = cache
+            .charge_step_reuse_with_control(clause_index, control)
+            .map_err(|surface_error| {
+                map_source_surface_error(step_index, clause_index, surface_error)
+            })?;
+        control.poll().map_err(interruption_error)?;
         if !validated_source_names[clause_index] {
             for variable in &cache
-                .surface(clause_index)
+                .surface_with_control(clause_index, control)
                 .map_err(|surface_error| {
                     map_source_surface_error(step_index, clause_index, surface_error)
                 })?
                 .variables
             {
+                control.poll().map_err(interruption_error)?;
                 validate_text_value(&variable.name, "source variable name")?;
             }
             validated_source_names[clause_index] = true;
@@ -1463,6 +1289,7 @@ fn preflight_source_surfaces<'a>(
             "UF observation",
         )?;
     }
+    control.poll().map_err(interruption_error)?;
     Ok(SourceSurfacePreflight {
         cache,
         binding_count,
@@ -1470,6 +1297,7 @@ fn preflight_source_surfaces<'a>(
     })
 }
 
+#[cfg(test)]
 fn preflight_derivation_scalar_work(
     cache: &mut GroundSourceSurfaceCache<'_>,
     derivation: &GroundDerivation,
@@ -1534,6 +1362,7 @@ fn canonical_real_value(value: &BigRational) -> bool {
     reduced.numer() == value.numer() && reduced.denom() == value.denom()
 }
 
+#[cfg(test)]
 fn install_authenticated_uf_observations(
     step_index: usize,
     applications: &[ChcExpr],
@@ -1541,11 +1370,30 @@ fn install_authenticated_uf_observations(
     env: &mut FxHashMap<String, SmtValue>,
     global_congruence: &mut FxHashMap<GroundUfCongruenceKey, SmtValue>,
 ) -> Result<(), ChcGroundDerivationArtifactError> {
+    install_authenticated_uf_observations_with_control(
+        step_index,
+        applications,
+        results,
+        env,
+        global_congruence,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn install_authenticated_uf_observations_with_control(
+    step_index: usize,
+    applications: &[ChcExpr],
+    results: &[SmtValue],
+    env: &mut FxHashMap<String, SmtValue>,
+    global_congruence: &mut FxHashMap<GroundUfCongruenceKey, SmtValue>,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(), ChcGroundDerivationArtifactError> {
     use crate::expr::evaluate::{
         uf_application_model_key, UF_APPLICATION_MODEL_MARKER_KEY,
         UF_APPLICATION_MODEL_MARKER_VALUE,
     };
 
+    control.poll().map_err(interruption_error)?;
     if applications.len() != results.len() {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::UfObservationSetMismatch,
@@ -1557,17 +1405,24 @@ fn install_authenticated_uf_observations(
         ));
     }
     for (application_index, (application, result)) in applications.iter().zip(results).enumerate() {
+        control.poll().map_err(interruption_error)?;
         let ChcExpr::FuncApp(_, return_sort, arguments) = application else {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UnsupportedUninterpretedFunction,
                 format!("step {step_index} application {application_index} is not a function"),
             ));
         };
-        if !scalar_uf_sort(return_sort)
-            || !arguments
-                .iter()
-                .all(|argument| scalar_uf_sort(&argument.sort()))
-        {
+        let mut scalar_signature = scalar_uf_sort(return_sort);
+        if scalar_signature {
+            for argument in arguments {
+                control.poll().map_err(interruption_error)?;
+                if !decoding_phase(control, || scalar_uf_sort(&argument.sort()))? {
+                    scalar_signature = false;
+                    break;
+                }
+            }
+        }
+        if !scalar_signature {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UnsupportedUninterpretedFunction,
                 format!(
@@ -1575,7 +1430,7 @@ fn install_authenticated_uf_observations(
                 ),
             ));
         }
-        if !scalar_value_matches_sort(result, return_sort) {
+        if !decoding_phase(control, || scalar_value_matches_sort(result, return_sort))? {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
                 format!(
@@ -1583,15 +1438,17 @@ fn install_authenticated_uf_observations(
                 ),
             ));
         }
-        let Some(key) = uf_application_model_key(application) else {
+        let Some(key) = decoding_phase(control, || uf_application_model_key(application))? else {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
                 format!("step {step_index} application {application_index} has no exact key"),
             ));
         };
-        if env.insert(key, result.clone()).is_some_and(|previous| {
-            crate::expr::evaluate::smt_values_equal(&previous, result) != Some(true)
-        }) {
+        if decoding_phase(control, || {
+            env.insert(key, result.clone()).is_some_and(|previous| {
+                crate::expr::evaluate::smt_values_equal(&previous, result) != Some(true)
+            })
+        })? {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UfCongruenceViolation,
                 format!(
@@ -1601,29 +1458,38 @@ fn install_authenticated_uf_observations(
         }
     }
     if !applications.is_empty() {
-        env.insert(
-            UF_APPLICATION_MODEL_MARKER_KEY.to_string(),
-            SmtValue::Opaque(UF_APPLICATION_MODEL_MARKER_VALUE.to_string()),
-        );
+        decoding_phase(control, || {
+            env.insert(
+                UF_APPLICATION_MODEL_MARKER_KEY.to_string(),
+                SmtValue::Opaque(UF_APPLICATION_MODEL_MARKER_VALUE.to_string()),
+            );
+        })?;
     }
 
     for (application_index, (application, result)) in applications.iter().zip(results).enumerate() {
+        control.poll().map_err(interruption_error)?;
         let ChcExpr::FuncApp(_, _, arguments) = application else {
             unreachable!("ordinary-UF application shape checked above")
         };
-        let argument_values = arguments
-            .iter()
-            .map(|argument| eval_ground_pub(argument, env))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                error(
-                    ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
-                    format!(
-                        "step {step_index} application {application_index} arguments are not ground"
-                    ),
-                )
-            })?;
-        let Some(key) = ground_uf_congruence_key(application, &argument_values) else {
+        let mut argument_values = decoding_phase(control, || Vec::with_capacity(arguments.len()))?;
+        for argument in arguments {
+            control.poll().map_err(interruption_error)?;
+            let value = super::eval_ground_with_control(argument, env, control)
+                .map_err(map_v2_derivation_error)?
+                .ok_or_else(|| {
+                    error(
+                        ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
+                        format!(
+                            "step {step_index} application {application_index} arguments are not ground"
+                        ),
+                    )
+                })?;
+            argument_values.push(value);
+        }
+        let Some(key) = decoding_phase(control, || {
+            ground_uf_congruence_key(application, &argument_values)
+        })?
+        else {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
                 format!(
@@ -1631,9 +1497,11 @@ fn install_authenticated_uf_observations(
                 ),
             ));
         };
-        if global_congruence.get(&key).is_some_and(|previous| {
-            crate::expr::evaluate::smt_values_equal(previous, result) != Some(true)
-        }) {
+        if decoding_phase(control, || {
+            global_congruence.get(&key).is_some_and(|previous| {
+                crate::expr::evaluate::smt_values_equal(previous, result) != Some(true)
+            })
+        })? {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::UfCongruenceViolation,
                 format!(
@@ -1641,17 +1509,34 @@ fn install_authenticated_uf_observations(
                 ),
             ));
         }
-        global_congruence
-            .entry(key)
-            .or_insert_with(|| result.clone());
+        decoding_phase(control, || {
+            global_congruence
+                .entry(key)
+                .or_insert_with(|| result.clone());
+        })?;
     }
+    control.poll().map_err(interruption_error)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn wire_steps_from_derivation(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<(Vec<WireStep>, ContentCounts), ChcGroundDerivationArtifactError> {
+    wire_steps_from_derivation_with_control(
+        problem,
+        derivation,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn wire_steps_from_derivation_with_control(
+    problem: &ChcProblem,
+    derivation: &GroundDerivation,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(Vec<WireStep>, ContentCounts), ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if derivation.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -1666,19 +1551,30 @@ fn wire_steps_from_derivation(
     let clause_indices = derivation
         .steps
         .iter()
-        .map(|step| step.clause_index)
-        .collect::<Vec<_>>();
+        .map(|step| {
+            control.poll().map_err(interruption_error)?;
+            Ok(step.clause_index)
+        })
+        .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
     let SourceSurfacePreflight {
         mut cache,
         binding_count,
         ..
-    } = preflight_source_surfaces(problem, &clause_indices)?;
-    preflight_derivation_scalar_work(&mut cache, derivation)?;
+    } = preflight_source_surfaces_with_control(problem, &clause_indices, control)?;
+    for (step_index, step) in derivation.steps.iter().enumerate() {
+        decoding_phase(control, || {
+            cache.charge_step_scalar_replay(step.clause_index, &step.env, &[])
+        })?
+        .map_err(|surface_error| {
+            map_source_surface_error(step_index, step.clause_index, surface_error)
+        })?;
+    }
     let mut counts = ContentCounts {
         bindings: binding_count,
         ..ContentCounts::default()
     };
     for step in &derivation.steps {
+        control.poll().map_err(interruption_error)?;
         add_count(
             &mut counts.premise_edges,
             step.premises.len(),
@@ -1687,9 +1583,11 @@ fn wire_steps_from_derivation(
             "premise edge",
         )?;
     }
-    let mut steps = Vec::with_capacity(derivation.steps.len());
+    let mut steps = decoding_phase(control, || Vec::with_capacity(derivation.steps.len()))?;
     for (step_index, step) in derivation.steps.iter().enumerate() {
+        control.poll().map_err(interruption_error)?;
         for name in step.env.keys() {
+            control.poll().map_err(interruption_error)?;
             validate_text_value(name, "binding name")?;
             if name.starts_with('\0') {
                 return Err(error(
@@ -1703,7 +1601,7 @@ fn wire_steps_from_derivation(
         }
 
         let variables = &cache
-            .surface(step.clause_index)
+            .surface_with_control(step.clause_index, control)
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, step.clause_index, surface_error)
             })?
@@ -1722,7 +1620,8 @@ fn wire_steps_from_derivation(
         let bindings = variables
             .iter()
             .map(|variable| {
-                let Some(value) = step.env.get(&variable.name) else {
+                control.poll().map_err(interruption_error)?;
+                let Some(value) = decoding_phase(control, || step.env.get(&variable.name))? else {
                     return Err(error(
                         ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
                         format!(
@@ -1732,15 +1631,24 @@ fn wire_steps_from_derivation(
                     ));
                 };
                 Ok(WireBinding {
-                    name: variable.name.clone(),
-                    value: encode_value(value, &variable.sort, 1, &mut counts.value_nodes)?,
+                    name: decoding_phase(control, || variable.name.clone())?,
+                    value: encode_value_with_control(
+                        value,
+                        &variable.sort,
+                        1,
+                        &mut counts.value_nodes,
+                        control,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
         let premises = step
             .premises
             .iter()
-            .map(|premise| checked_u32(*premise, "premise index"))
+            .map(|premise| {
+                control.poll().map_err(interruption_error)?;
+                checked_u32(*premise, "premise index")
+            })
             .collect::<Result<Vec<_>, _>>()?;
         steps.push(WireStep {
             clause_index: checked_u32(step.clause_index, "clause index")?,
@@ -1748,13 +1656,28 @@ fn wire_steps_from_derivation(
             bindings,
         });
     }
+    control.poll().map_err(interruption_error)?;
     Ok((steps, counts))
 }
 
+#[cfg(test)]
 fn wire_steps_v2_from_derivation(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<(Vec<WireStepV2>, ContentCounts), ChcGroundDerivationArtifactError> {
+    wire_steps_v2_from_derivation_with_control(
+        problem,
+        derivation,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn wire_steps_v2_from_derivation_with_control(
+    problem: &ChcProblem,
+    derivation: &GroundDerivation,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(Vec<WireStepV2>, ContentCounts), ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if derivation.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -1769,20 +1692,31 @@ fn wire_steps_v2_from_derivation(
     let clause_indices = derivation
         .steps
         .iter()
-        .map(|step| step.clause_index)
-        .collect::<Vec<_>>();
+        .map(|step| {
+            control.poll().map_err(interruption_error)?;
+            Ok(step.clause_index)
+        })
+        .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
     let SourceSurfacePreflight {
         mut cache,
         binding_count,
         uf_observation_count,
-    } = preflight_source_surfaces(problem, &clause_indices)?;
-    preflight_derivation_scalar_work(&mut cache, derivation)?;
+    } = preflight_source_surfaces_with_control(problem, &clause_indices, control)?;
+    for (step_index, step) in derivation.steps.iter().enumerate() {
+        decoding_phase(control, || {
+            cache.charge_step_scalar_replay(step.clause_index, &step.env, &[])
+        })?
+        .map_err(|surface_error| {
+            map_source_surface_error(step_index, step.clause_index, surface_error)
+        })?;
+    }
     let mut counts = ContentCounts {
         bindings: binding_count,
         uf_observations: uf_observation_count,
         ..ContentCounts::default()
     };
     for step in &derivation.steps {
+        control.poll().map_err(interruption_error)?;
         add_count(
             &mut counts.premise_edges,
             step.premises.len(),
@@ -1792,20 +1726,26 @@ fn wire_steps_v2_from_derivation(
         )?;
     }
     let mut global_congruence = FxHashMap::default();
-    let mut steps = Vec::with_capacity(derivation.steps.len());
+    let mut steps = decoding_phase(control, || Vec::with_capacity(derivation.steps.len()))?;
     for (step_index, step) in derivation.steps.iter().enumerate() {
-        let surface = cache.surface(step.clause_index).map_err(|surface_error| {
-            map_source_surface_error(step_index, step.clause_index, surface_error)
-        })?;
+        control.poll().map_err(interruption_error)?;
+        let surface = cache
+            .surface_with_control(step.clause_index, control)
+            .map_err(|surface_error| {
+                map_source_surface_error(step_index, step.clause_index, surface_error)
+            })?;
         let variables = &surface.variables;
         let applications = &surface.uf_applications;
-        let variable_names: FxHashSet<&str> = variables
-            .iter()
-            .map(|variable| variable.name.as_str())
-            .collect();
+        let mut variable_names: FxHashSet<&str> = FxHashSet::default();
+        for variable in variables {
+            decoding_phase(control, || variable_names.insert(variable.name.as_str()))?;
+        }
         for name in step.env.keys() {
+            control.poll().map_err(interruption_error)?;
             validate_text_value(name, "binding name")?;
-            if !variable_names.contains(name.as_str()) && !private_uf_model_key(name) {
+            if !decoding_phase(control, || variable_names.contains(name.as_str()))?
+                && !private_uf_model_key(name)
+            {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
                     format!(
@@ -1818,7 +1758,8 @@ fn wire_steps_v2_from_derivation(
         let bindings = variables
             .iter()
             .map(|variable| {
-                let Some(value) = step.env.get(&variable.name) else {
+                control.poll().map_err(interruption_error)?;
+                let Some(value) = decoding_phase(control, || step.env.get(&variable.name))? else {
                     return Err(error(
                         ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
                         format!(
@@ -1827,10 +1768,18 @@ fn wire_steps_v2_from_derivation(
                         ),
                     ));
                 };
-                authenticated_env.insert(variable.name.clone(), value.clone());
+                decoding_phase(control, || {
+                    authenticated_env.insert(variable.name.clone(), value.clone())
+                })?;
                 Ok(WireBinding {
-                    name: variable.name.clone(),
-                    value: encode_value(value, &variable.sort, 1, &mut counts.value_nodes)?,
+                    name: decoding_phase(control, || variable.name.clone())?,
+                    value: encode_value_with_control(
+                        value,
+                        &variable.sort,
+                        1,
+                        &mut counts.value_nodes,
+                        control,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
@@ -1839,7 +1788,10 @@ fn wire_steps_v2_from_derivation(
             .iter()
             .enumerate()
             .map(|(application_index, application)| {
-                eval_ground_pub(application, &step.env).ok_or_else(|| {
+                control.poll().map_err(interruption_error)?;
+                super::eval_ground_with_control(application, &step.env, control)
+                    .map_err(map_v2_derivation_error)?
+                    .ok_or_else(|| {
                     error(
                         ChcGroundDerivationArtifactErrorReason::UfObservationNotGround,
                         format!(
@@ -1849,31 +1801,42 @@ fn wire_steps_v2_from_derivation(
                 })
             })
             .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
-        install_authenticated_uf_observations(
+        install_authenticated_uf_observations_with_control(
             step_index,
             applications,
             &results,
             &mut authenticated_env,
             &mut global_congruence,
+            control,
         )?;
         let uf_observations = applications
             .iter()
             .zip(&results)
             .enumerate()
             .map(|(application_index, (application, result))| {
+                control.poll().map_err(interruption_error)?;
                 let ChcExpr::FuncApp(_, return_sort, _) = application else {
                     unreachable!("ordinary-UF collector returned a function application")
                 };
                 Ok(WireUfObservation {
                     application_ordinal: checked_u32(application_index, "UF application ordinal")?,
-                    result: encode_value(result, return_sort, 1, &mut counts.value_nodes)?,
+                    result: encode_value_with_control(
+                        result,
+                        return_sort,
+                        1,
+                        &mut counts.value_nodes,
+                        control,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
         let premises = step
             .premises
             .iter()
-            .map(|premise| checked_u32(*premise, "premise index"))
+            .map(|premise| {
+                control.poll().map_err(interruption_error)?;
+                checked_u32(*premise, "premise index")
+            })
             .collect::<Result<Vec<_>, _>>()?;
         steps.push(WireStepV2 {
             clause_index: checked_u32(step.clause_index, "clause index")?,
@@ -1882,14 +1845,31 @@ fn wire_steps_v2_from_derivation(
             uf_observations,
         });
     }
+    control.poll().map_err(interruption_error)?;
     Ok((steps, counts))
 }
 
+#[cfg(test)]
 fn derivation_from_wire_steps(
     problem: &ChcProblem,
     steps: &[WireStep],
     query_step: u32,
 ) -> Result<(GroundDerivation, ContentCounts), ChcGroundDerivationArtifactError> {
+    derivation_from_wire_steps_with_control(
+        problem,
+        steps,
+        query_step,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn derivation_from_wire_steps_with_control(
+    problem: &ChcProblem,
+    steps: &[WireStep],
+    query_step: u32,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(GroundDerivation, ContentCounts), ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -1905,6 +1885,7 @@ fn derivation_from_wire_steps(
         .iter()
         .enumerate()
         .map(|(step_index, step)| {
+            control.poll().map_err(interruption_error)?;
             usize::try_from(step.clause_index).map_err(|_| {
                 error(
                     ChcGroundDerivationArtifactErrorReason::IndexOutOfRange,
@@ -1917,12 +1898,13 @@ fn derivation_from_wire_steps(
         mut cache,
         binding_count,
         ..
-    } = preflight_source_surfaces(problem, &clause_indices)?;
+    } = preflight_source_surfaces_with_control(problem, &clause_indices, control)?;
     let mut counts = ContentCounts {
         bindings: binding_count,
         ..ContentCounts::default()
     };
     for step in steps {
+        control.poll().map_err(interruption_error)?;
         add_count(
             &mut counts.premise_edges,
             step.premises.len(),
@@ -1931,8 +1913,9 @@ fn derivation_from_wire_steps(
             "premise edge",
         )?;
     }
-    let mut decoded_steps = Vec::with_capacity(steps.len());
+    let mut decoded_steps = decoding_phase(control, || Vec::with_capacity(steps.len()))?;
     for (step_index, (step, clause_index)) in steps.iter().zip(clause_indices).enumerate() {
+        control.poll().map_err(interruption_error)?;
         let variable_count = cache
             .surface(clause_index)
             .map_err(|surface_error| {
@@ -1940,6 +1923,7 @@ fn derivation_from_wire_steps(
             })?
             .variables
             .len();
+        control.poll().map_err(interruption_error)?;
         if step.bindings.len() != variable_count {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
@@ -1953,21 +1937,25 @@ fn derivation_from_wire_steps(
         let value_occurrences = step
             .bindings
             .iter()
-            .map(|binding| wire_value_typecheck_occurrences(&binding.value))
+            .map(|binding| wire_value_typecheck_occurrences_with_control(&binding.value, control))
             .collect::<Result<Vec<_>, _>>()?;
+        control.poll().map_err(interruption_error)?;
         cache
             .charge_step_wire_type_replay(clause_index, &value_occurrences)
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?;
+        control.poll().map_err(interruption_error)?;
         let variables = &cache
             .surface(clause_index)
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?
             .variables;
+        control.poll().map_err(interruption_error)?;
         let mut env = FxHashMap::default();
         for (binding, variable) in step.bindings.iter().zip(variables) {
+            control.poll().map_err(interruption_error)?;
             validate_text_value(&binding.name, "binding name")?;
             if binding.name.starts_with('\0') {
                 return Err(error(
@@ -1984,23 +1972,32 @@ fn derivation_from_wire_steps(
                     ),
                 ));
             }
-            let value = decode_value(&binding.value, &variable.sort, 1, &mut counts.value_nodes)?;
-            if env.insert(binding.name.clone(), value).is_some() {
+            let value = decode_value_with_control(
+                &binding.value,
+                &variable.sort,
+                1,
+                &mut counts.value_nodes,
+                control,
+            )?;
+            if decoding_phase(control, || env.insert(binding.name.clone(), value))?.is_some() {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
                     format!("step {step_index} repeats binding `{}`", binding.name),
                 ));
             }
         }
+        control.poll().map_err(interruption_error)?;
         cache
             .charge_step_scalar_replay(clause_index, &env, &[])
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?;
+        control.poll().map_err(interruption_error)?;
         let premises = step
             .premises
             .iter()
             .map(|premise| {
+                control.poll().map_err(interruption_error)?;
                 usize::try_from(*premise).map_err(|_| {
                     error(
                         ChcGroundDerivationArtifactErrorReason::IndexOutOfRange,
@@ -2021,6 +2018,7 @@ fn derivation_from_wire_steps(
             "query step does not fit usize",
         )
     })?;
+    control.poll().map_err(interruption_error)?;
     Ok((
         GroundDerivation {
             steps: decoded_steps,
@@ -2030,11 +2028,27 @@ fn derivation_from_wire_steps(
     ))
 }
 
+#[cfg(test)]
 fn derivation_from_wire_steps_v2(
     problem: &ChcProblem,
     steps: &[WireStepV2],
     query_step: u32,
 ) -> Result<(GroundDerivation, ContentCounts), ChcGroundDerivationArtifactError> {
+    derivation_from_wire_steps_v2_with_control(
+        problem,
+        steps,
+        query_step,
+        &mut GroundValidationControl::new(&mut || true),
+    )
+}
+
+fn derivation_from_wire_steps_v2_with_control(
+    problem: &ChcProblem,
+    steps: &[WireStepV2],
+    query_step: u32,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(GroundDerivation, ContentCounts), ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -2050,6 +2064,7 @@ fn derivation_from_wire_steps_v2(
         .iter()
         .enumerate()
         .map(|(step_index, step)| {
+            control.poll().map_err(interruption_error)?;
             usize::try_from(step.clause_index).map_err(|_| {
                 error(
                     ChcGroundDerivationArtifactErrorReason::IndexOutOfRange,
@@ -2062,13 +2077,14 @@ fn derivation_from_wire_steps_v2(
         mut cache,
         binding_count,
         uf_observation_count,
-    } = preflight_source_surfaces(problem, &clause_indices)?;
+    } = preflight_source_surfaces_with_control(problem, &clause_indices, control)?;
     let mut counts = ContentCounts {
         bindings: binding_count,
         uf_observations: uf_observation_count,
         ..ContentCounts::default()
     };
     for step in steps {
+        control.poll().map_err(interruption_error)?;
         add_count(
             &mut counts.premise_edges,
             step.premises.len(),
@@ -2078,8 +2094,9 @@ fn derivation_from_wire_steps_v2(
         )?;
     }
     let mut global_congruence = FxHashMap::default();
-    let mut decoded_steps = Vec::with_capacity(steps.len());
+    let mut decoded_steps = decoding_phase(control, || Vec::with_capacity(steps.len()))?;
     for (step_index, (step, clause_index)) in steps.iter().zip(clause_indices).enumerate() {
+        control.poll().map_err(interruption_error)?;
         let mut env = {
             let variable_count = cache
                 .surface(clause_index)
@@ -2088,6 +2105,7 @@ fn derivation_from_wire_steps_v2(
                 })?
                 .variables
                 .len();
+            control.poll().map_err(interruption_error)?;
             if step.bindings.len() != variable_count {
                 return Err(error(
                     ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
@@ -2101,21 +2119,27 @@ fn derivation_from_wire_steps_v2(
             let value_occurrences = step
                 .bindings
                 .iter()
-                .map(|binding| wire_value_typecheck_occurrences(&binding.value))
+                .map(|binding| {
+                    wire_value_typecheck_occurrences_with_control(&binding.value, control)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
+            control.poll().map_err(interruption_error)?;
             cache
                 .charge_step_wire_type_replay(clause_index, &value_occurrences)
                 .map_err(|surface_error| {
                     map_source_surface_error(step_index, clause_index, surface_error)
                 })?;
+            control.poll().map_err(interruption_error)?;
             let variables = &cache
                 .surface(clause_index)
                 .map_err(|surface_error| {
                     map_source_surface_error(step_index, clause_index, surface_error)
                 })?
                 .variables;
+            control.poll().map_err(interruption_error)?;
             let mut env = FxHashMap::default();
             for (binding, variable) in step.bindings.iter().zip(variables) {
+                control.poll().map_err(interruption_error)?;
                 validate_text_value(&binding.name, "binding name")?;
                 if binding.name.starts_with('\0') {
                     return Err(error(
@@ -2132,9 +2156,14 @@ fn derivation_from_wire_steps_v2(
                         ),
                     ));
                 }
-                let value =
-                    decode_value(&binding.value, &variable.sort, 1, &mut counts.value_nodes)?;
-                if env.insert(binding.name.clone(), value).is_some() {
+                let value = decode_value_with_control(
+                    &binding.value,
+                    &variable.sort,
+                    1,
+                    &mut counts.value_nodes,
+                    control,
+                )?;
+                if decoding_phase(control, || env.insert(binding.name.clone(), value))?.is_some() {
                     return Err(error(
                         ChcGroundDerivationArtifactErrorReason::BindingSetMismatch,
                         format!("step {step_index} repeats binding `{}`", binding.name),
@@ -2145,9 +2174,11 @@ fn derivation_from_wire_steps_v2(
         };
 
         let (results, application_count, argument_occurrences, value_replay_occurrences) = {
+            control.poll().map_err(interruption_error)?;
             let surface = cache.surface(clause_index).map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?;
+            control.poll().map_err(interruption_error)?;
             let applications = &surface.uf_applications;
             if step.uf_observations.len() != applications.len() {
                 return Err(error(
@@ -2165,6 +2196,7 @@ fn derivation_from_wire_steps_v2(
                 .zip(applications)
                 .enumerate()
                 .map(|(application_index, (observation, application))| {
+                    control.poll().map_err(interruption_error)?;
                     if usize::try_from(observation.application_ordinal).ok()
                         != Some(application_index)
                     {
@@ -2184,7 +2216,13 @@ fn derivation_from_wire_steps_v2(
                             ),
                         ));
                     };
-                    decode_value(&observation.result, return_sort, 1, &mut counts.value_nodes)
+                    decode_value_with_control(
+                        &observation.result,
+                        return_sort,
+                        1,
+                        &mut counts.value_nodes,
+                        control,
+                    )
                 })
                 .collect::<Result<Vec<_>, ChcGroundDerivationArtifactError>>()?;
             (
@@ -2194,6 +2232,7 @@ fn derivation_from_wire_steps_v2(
                 surface.value_replay_occurrences,
             )
         };
+        control.poll().map_err(interruption_error)?;
         cache
             .charge_scalar_replay(
                 application_count,
@@ -2205,24 +2244,28 @@ fn derivation_from_wire_steps_v2(
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?;
+        control.poll().map_err(interruption_error)?;
         let applications = &cache
             .surface(clause_index)
             .map_err(|surface_error| {
                 map_source_surface_error(step_index, clause_index, surface_error)
             })?
             .uf_applications;
-        install_authenticated_uf_observations(
+        control.poll().map_err(interruption_error)?;
+        install_authenticated_uf_observations_with_control(
             step_index,
             applications,
             &results,
             &mut env,
             &mut global_congruence,
+            control,
         )?;
 
         let premises = step
             .premises
             .iter()
             .map(|premise| {
+                control.poll().map_err(interruption_error)?;
                 usize::try_from(*premise).map_err(|_| {
                     error(
                         ChcGroundDerivationArtifactErrorReason::IndexOutOfRange,
@@ -2243,6 +2286,7 @@ fn derivation_from_wire_steps_v2(
             "query step does not fit usize",
         )
     })?;
+    control.poll().map_err(interruption_error)?;
     Ok((
         GroundDerivation {
             steps: decoded_steps,
@@ -2252,52 +2296,50 @@ fn derivation_from_wire_steps_v2(
     ))
 }
 
+#[cfg(test)]
+fn test_normalized_input_schema(problem: &ChcProblem) -> &'static str {
+    crate::normalized_chc_input_schema_of(&crate::normalized_chc_input(problem))
+        .expect("normalized input names its schema")
+}
+
+#[cfg(test)]
 fn envelope_for_derivation(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<GroundDerivationEnvelope, ChcGroundDerivationArtifactError> {
     validate_problem_bounds(problem)?;
     let (steps, counts) = wire_steps_from_derivation(problem, derivation)?;
-    Ok(GroundDerivationEnvelope {
-        schema: CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA.to_string(),
-        schema_version: 1,
-        role: CHC_GROUND_DERIVATION_ARTIFACT_ROLE.to_string(),
-        normalized_input_schema: NORMALIZED_CHC_INPUT_SCHEMA.to_string(),
-        normalized_input_sha256: normalized_chc_input_sha256(problem),
-        source_clause_sequence_sha256: ordered_chc_clause_sequence_sha256(problem),
-        step_count: checked_u64(steps.len(), "step count")?,
-        query_step: checked_u32(derivation.query_step, "query step")?,
-        premise_edge_count: checked_u64(counts.premise_edges, "premise edge count")?,
-        binding_count: checked_u64(counts.bindings, "binding count")?,
-        value_node_count: checked_u64(counts.value_nodes, "value node count")?,
+    GroundDerivationEnvelope::from_parts(
         steps,
-    })
+        counts,
+        derivation.query_step,
+        test_normalized_input_schema(problem),
+        normalized_chc_input_sha256(problem),
+        ordered_chc_clause_sequence_sha256(problem),
+    )
 }
 
+#[cfg(test)]
 fn envelope_v2_for_derivation(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<GroundDerivationEnvelopeV2, ChcGroundDerivationArtifactError> {
     validate_problem_bounds(problem)?;
     let (steps, counts) = wire_steps_v2_from_derivation(problem, derivation)?;
-    Ok(GroundDerivationEnvelopeV2 {
-        schema: CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA.to_string(),
-        schema_version: 2,
-        role: CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE.to_string(),
-        normalized_input_schema: NORMALIZED_CHC_INPUT_SCHEMA.to_string(),
-        normalized_input_sha256: normalized_chc_input_sha256(problem),
-        source_clause_sequence_sha256: ordered_chc_clause_sequence_sha256(problem),
-        step_count: checked_u64(steps.len(), "step count")?,
-        query_step: checked_u32(derivation.query_step, "query step")?,
-        premise_edge_count: checked_u64(counts.premise_edges, "premise edge count")?,
-        binding_count: checked_u64(counts.bindings, "binding count")?,
-        uf_observation_count: checked_u64(counts.uf_observations, "UF observation count")?,
-        value_node_count: checked_u64(counts.value_nodes, "value node count")?,
+    GroundDerivationEnvelopeV2::from_parts(
         steps,
-    })
+        counts,
+        derivation.query_step,
+        test_normalized_input_schema(problem),
+        normalized_chc_input_sha256(problem),
+        ordered_chc_clause_sequence_sha256(problem),
+    )
 }
 
 fn map_derivation_error(error_value: GroundDerivationError) -> ChcGroundDerivationArtifactError {
+    if matches!(error_value, GroundDerivationError::Interrupted) {
+        return interruption_error(GroundValidationInterrupted);
+    }
     error(
         ChcGroundDerivationArtifactErrorReason::DerivationRejected,
         error_value.to_string(),
@@ -2306,6 +2348,7 @@ fn map_derivation_error(error_value: GroundDerivationError) -> ChcGroundDerivati
 
 fn map_v2_derivation_error(error_value: GroundDerivationError) -> ChcGroundDerivationArtifactError {
     let reason = match &error_value {
+        GroundDerivationError::Interrupted => ChcGroundDerivationArtifactErrorReason::Interrupted,
         GroundDerivationError::UfSurfaceInvalid { .. } => {
             ChcGroundDerivationArtifactErrorReason::UnsupportedUninterpretedFunction
         }
@@ -2346,70 +2389,22 @@ pub(crate) fn encode_ground_derivation_artifact(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<ChcProofRunArtifact, ChcGroundDerivationArtifactError> {
-    validate_problem_bounds(problem)?;
-    // Build the strict wire form first. Besides producing stable diagnostics,
-    // this rejects Opaque values, private UF keys, incomplete environments and
-    // mis-sorted values that the legacy in-memory validator was never designed
-    // to classify as serialization errors.
-    let envelope = envelope_for_derivation(problem, derivation)?;
-    validate_ground_derivation(problem, derivation).map_err(map_derivation_error)?;
-    let bytes = serde_json::to_vec(&envelope).map_err(|serialization_error| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::SerializationFailed,
-            serialization_error.to_string(),
-        )
-    })?;
-    if bytes.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ArtifactTooLarge,
-            format!(
-                "artifact has {} bytes, maximum is {}",
-                bytes.len(),
-                CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES
-            ),
-        ));
-    }
-    let _validated = validate_chc_ground_derivation_artifact(problem, &bytes)?;
-    Ok(ChcProofRunArtifact::new(
-        CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA,
-        CHC_GROUND_DERIVATION_ARTIFACT_ROLE,
-        bytes,
-    ))
+    producer::encode_v1_with_control(
+        problem,
+        derivation,
+        &mut GroundValidationControl::new(&mut || true),
+    )
 }
 
 pub(crate) fn encode_ground_derivation_artifact_v2(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<ChcProofRunArtifact, ChcGroundDerivationArtifactError> {
-    validate_problem_bounds(problem)?;
-    // Authenticate exact, canonical source bindings before the v2 producer
-    // evaluates ordinary-UF arguments or clones values into its wire form.
-    // In-memory producers are not constrained by the bounded decoder, so the
-    // native check is the resource and type-safety boundary here as well.
-    validate_ground_derivation(problem, derivation).map_err(map_v2_derivation_error)?;
-    let envelope = envelope_v2_for_derivation(problem, derivation)?;
-    let bytes = serde_json::to_vec(&envelope).map_err(|serialization_error| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::SerializationFailed,
-            serialization_error.to_string(),
-        )
-    })?;
-    if bytes.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ArtifactTooLarge,
-            format!(
-                "artifact has {} bytes, maximum is {}",
-                bytes.len(),
-                CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES
-            ),
-        ));
-    }
-    let _validated = validate_chc_ground_derivation_artifact_v2(problem, &bytes)?;
-    Ok(ChcProofRunArtifact::new(
-        CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA,
-        CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE,
-        bytes,
-    ))
+    producer::encode_v2_with_control(
+        problem,
+        derivation,
+        &mut GroundValidationControl::new(&mut || true),
+    )
 }
 
 impl Counterexample {
@@ -2509,6 +2504,36 @@ pub fn validate_chc_ground_derivation_artifact(
     problem: &ChcProblem,
     bytes: &[u8],
 ) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    validate_chc_ground_derivation_artifact_with_progress(problem, bytes, &mut || true)
+}
+
+/// Validate v1 evidence with caller-owned cooperative cancellation.
+///
+/// The callback returns `true` to continue. A refusal is sticky and returns
+/// [`ChcGroundDerivationArtifactErrorReason::Interrupted`], never validated
+/// evidence. JSON transport and artifact hashing poll at bounded byte chunks;
+/// source traversal/hashing, typed decoding and reconstruction poll nodes and
+/// edges. Individual semantic validators, arithmetic, sorting and allocation
+/// still have opaque intervals. Native checking supplies its own cooperative
+/// boundaries. This is not a wall-clock latency guarantee or
+/// an allocation-accounting API. No partial result is published on refusal.
+/// Reader-based parsing may cost more than slice parsing; deployment throughput
+/// and cancellation latency require measurement.
+pub fn validate_chc_ground_derivation_artifact_with_progress(
+    problem: &ChcProblem,
+    bytes: &[u8],
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    let mut control = GroundValidationControl::new(progress);
+    validate_ground_artifact_with_control(problem, bytes, &mut control)
+}
+
+fn validate_ground_artifact_with_control(
+    problem: &ChcProblem,
+    bytes: &[u8],
+    control: &mut GroundValidationControl<'_>,
+) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if bytes.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::ArtifactTooLarge,
@@ -2519,27 +2544,16 @@ pub fn validate_chc_ground_derivation_artifact(
             ),
         ));
     }
-    validate_problem_bounds(problem)?;
-    validate_json_surface(bytes)?;
-    let envelope: GroundDerivationEnvelope =
-        serde_json::from_slice(bytes).map_err(|parse_error| {
-            error(
-                ChcGroundDerivationArtifactErrorReason::MalformedEnvelope,
-                parse_error.to_string(),
-            )
-        })?;
-    let canonical_bytes = serde_json::to_vec(&envelope).map_err(|serialization_error| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::SerializationFailed,
-            serialization_error.to_string(),
-        )
-    })?;
-    if canonical_bytes != bytes {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::NonCanonicalEnvelope,
-            "artifact JSON differs from AY's canonical field order/escaping",
-        ));
-    }
+    validate_problem_bounds_with_control(problem, control)?;
+    control.poll().map_err(interruption_error)?;
+    transport::validate_json_surface(bytes, control)?;
+    let envelope: GroundDerivationEnvelope = transport::parse_envelope(bytes, control)?;
+    transport::check_canonical_json(
+        &envelope,
+        bytes,
+        "artifact JSON differs from AY's canonical field order/escaping",
+        control,
+    )?;
     if envelope.schema != CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA || envelope.schema_version != 1 {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::SchemaMismatch,
@@ -2555,7 +2569,9 @@ pub fn validate_chc_ground_derivation_artifact(
             format!("unexpected artifact role `{}`", envelope.role),
         ));
     }
-    if envelope.normalized_input_schema != NORMALIZED_CHC_INPUT_SCHEMA {
+    if crate::proof_metadata::normalized_chc_input_schema(&envelope.normalized_input_schema)
+        .is_none()
+    {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::SchemaMismatch,
             format!(
@@ -2564,20 +2580,15 @@ pub fn validate_chc_ground_derivation_artifact(
             ),
         ));
     }
-    let expected_problem_hash = normalized_chc_input_sha256(problem);
-    if envelope.normalized_input_sha256 != expected_problem_hash {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ProblemHashMismatch,
-            "artifact normalized-input hash does not match the supplied problem",
-        ));
-    }
-    let expected_clause_hash = ordered_chc_clause_sequence_sha256(problem);
-    if envelope.source_clause_sequence_sha256 != expected_clause_hash {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ClauseSequenceHashMismatch,
-            "artifact source-clause sequence hash does not match the supplied problem",
-        ));
-    }
+    control.poll().map_err(interruption_error)?;
+    let identity = rebuild::AuthenticatedSource::check(
+        problem,
+        &envelope.normalized_input_schema,
+        &envelope.normalized_input_sha256,
+        &envelope.source_clause_sequence_sha256,
+        "artifact",
+        control,
+    )?;
     if envelope.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -2595,15 +2606,23 @@ pub fn validate_chc_ground_derivation_artifact(
         ));
     }
 
+    control.poll().map_err(interruption_error)?;
     let decoded = catch_unwind(AssertUnwindSafe(|| {
-        derivation_from_wire_steps(problem, &envelope.steps, envelope.query_step)
-    }))
-    .map_err(|_| {
+        derivation_from_wire_steps_with_control(
+            problem,
+            &envelope.steps,
+            envelope.query_step,
+            control,
+        )
+    }));
+    control.poll().map_err(interruption_error)?;
+    let decoded = decoded.map_err(|_| {
         error(
             ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
             "bounded ground-derivation decoding panicked",
         )
     })??;
+    control.poll().map_err(interruption_error)?;
     let (derivation, counts) = decoded;
     if envelope.premise_edge_count != checked_u64(counts.premise_edges, "premise edge count")?
         || envelope.binding_count != checked_u64(counts.bindings, "binding count")?
@@ -2618,29 +2637,44 @@ pub fn validate_chc_ground_derivation_artifact(
     // Re-encode the typed values as well as the JSON envelope. This catches
     // non-canonical decimal/rational/BV spellings and any future decoder form
     // that serde's field-order round trip alone cannot normalize.
-    let rebuilt = envelope_for_derivation(problem, &derivation)?;
-    if rebuilt != envelope {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::NonCanonicalEnvelope,
-            "decoded derivation does not round-trip to AY's canonical value encoding",
-        ));
-    }
+    control.poll().map_err(interruption_error)?;
+    let rebuilt = identity.rebuild_v1(&derivation, control)?;
+    control.poll().map_err(interruption_error)?;
+    transport::check_canonical_json(
+        &rebuilt,
+        bytes,
+        "decoded derivation does not round-trip to AY's canonical value encoding",
+        control,
+    )?;
 
-    catch_unwind(AssertUnwindSafe(|| {
-        validate_ground_derivation(problem, &derivation)
-    }))
-    .map_err(|_| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
-            "native ground-derivation validation panicked",
-        )
-    })?
-    .map_err(map_derivation_error)?;
+    // The artifact digest is bookkeeping over the input bytes, so it is paid
+    // BEFORE the decision: the derivation check is then the last work that
+    // consults the caller (#completed-check-accepted).
+    let artifact_sha256 = transport::sha256_hex(bytes, control)?;
+    control.poll().map_err(interruption_error)?;
+    let checked = catch_unwind(AssertUnwindSafe(|| {
+        validate_ground_derivation_with_control(problem, &derivation, control)
+    }));
+    // #completed-check-accepted: consult the LATCH, not the caller. A refusal
+    // the check observed stays final even if a validator swallowed it, but a
+    // stop that arrives after its last poll neither discards a derivation it
+    // accepted nor masks one it rejected.
+    if control.is_stopped() {
+        return Err(interruption_error(GroundValidationInterrupted));
+    }
+    checked
+        .map_err(|_| {
+            error(
+                ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
+                "native ground-derivation validation panicked",
+            )
+        })?
+        .map_err(map_derivation_error)?;
 
     Ok(ChcValidatedGroundDerivation {
         artifact_schema: CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA,
         artifact_role: CHC_GROUND_DERIVATION_ARTIFACT_ROLE,
-        artifact_sha256: sha256_hex(bytes),
+        artifact_sha256,
         artifact_bytes: checked_u64(bytes.len(), "artifact byte length")?,
         normalized_input_sha256: envelope.normalized_input_sha256,
         source_clause_sequence_sha256: envelope.source_clause_sequence_sha256,
@@ -2664,6 +2698,29 @@ pub fn validate_chc_ground_derivation_artifact_v2(
     problem: &ChcProblem,
     bytes: &[u8],
 ) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    validate_chc_ground_derivation_artifact_v2_with_progress(problem, bytes, &mut || true)
+}
+
+/// Validate v2 finite-UF evidence with caller-owned cooperative cancellation.
+///
+/// This has the same sticky-refusal and phase-boundary limitations as
+/// [`validate_chc_ground_derivation_artifact_with_progress`]. The callback is
+/// not a proof assumption; refusal always prevents capability publication.
+pub fn validate_chc_ground_derivation_artifact_v2_with_progress(
+    problem: &ChcProblem,
+    bytes: &[u8],
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    let mut control = GroundValidationControl::new(progress);
+    validate_ground_artifact_v2_with_control(problem, bytes, &mut control)
+}
+
+fn validate_ground_artifact_v2_with_control(
+    problem: &ChcProblem,
+    bytes: &[u8],
+    control: &mut GroundValidationControl<'_>,
+) -> Result<ChcValidatedGroundDerivation, ChcGroundDerivationArtifactError> {
+    control.poll().map_err(interruption_error)?;
     if bytes.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::ArtifactTooLarge,
@@ -2674,27 +2731,16 @@ pub fn validate_chc_ground_derivation_artifact_v2(
             ),
         ));
     }
-    validate_problem_bounds(problem)?;
-    validate_json_surface(bytes)?;
-    let envelope: GroundDerivationEnvelopeV2 =
-        serde_json::from_slice(bytes).map_err(|parse_error| {
-            error(
-                ChcGroundDerivationArtifactErrorReason::MalformedEnvelope,
-                parse_error.to_string(),
-            )
-        })?;
-    let canonical_bytes = serde_json::to_vec(&envelope).map_err(|serialization_error| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::SerializationFailed,
-            serialization_error.to_string(),
-        )
-    })?;
-    if canonical_bytes != bytes {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::NonCanonicalEnvelope,
-            "v2 artifact JSON differs from AY's canonical field order/escaping",
-        ));
-    }
+    validate_problem_bounds_with_control(problem, control)?;
+    control.poll().map_err(interruption_error)?;
+    transport::validate_json_surface(bytes, control)?;
+    let envelope: GroundDerivationEnvelopeV2 = transport::parse_envelope(bytes, control)?;
+    transport::check_canonical_json(
+        &envelope,
+        bytes,
+        "v2 artifact JSON differs from AY's canonical field order/escaping",
+        control,
+    )?;
     if envelope.schema != CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA || envelope.schema_version != 2 {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::SchemaMismatch,
@@ -2710,7 +2756,9 @@ pub fn validate_chc_ground_derivation_artifact_v2(
             format!("unexpected v2 artifact role `{}`", envelope.role),
         ));
     }
-    if envelope.normalized_input_schema != NORMALIZED_CHC_INPUT_SCHEMA {
+    if crate::proof_metadata::normalized_chc_input_schema(&envelope.normalized_input_schema)
+        .is_none()
+    {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::SchemaMismatch,
             format!(
@@ -2719,20 +2767,15 @@ pub fn validate_chc_ground_derivation_artifact_v2(
             ),
         ));
     }
-    let expected_problem_hash = normalized_chc_input_sha256(problem);
-    if envelope.normalized_input_sha256 != expected_problem_hash {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ProblemHashMismatch,
-            "v2 artifact normalized-input hash does not match the supplied problem",
-        ));
-    }
-    let expected_clause_hash = ordered_chc_clause_sequence_sha256(problem);
-    if envelope.source_clause_sequence_sha256 != expected_clause_hash {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::ClauseSequenceHashMismatch,
-            "v2 artifact source-clause sequence hash does not match the supplied problem",
-        ));
-    }
+    control.poll().map_err(interruption_error)?;
+    let identity = rebuild::AuthenticatedSource::check(
+        problem,
+        &envelope.normalized_input_schema,
+        &envelope.normalized_input_sha256,
+        &envelope.source_clause_sequence_sha256,
+        "v2 artifact",
+        control,
+    )?;
     if envelope.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
         return Err(error(
             ChcGroundDerivationArtifactErrorReason::TooManySteps,
@@ -2750,15 +2793,23 @@ pub fn validate_chc_ground_derivation_artifact_v2(
         ));
     }
 
+    control.poll().map_err(interruption_error)?;
     let decoded = catch_unwind(AssertUnwindSafe(|| {
-        derivation_from_wire_steps_v2(problem, &envelope.steps, envelope.query_step)
-    }))
-    .map_err(|_| {
+        derivation_from_wire_steps_v2_with_control(
+            problem,
+            &envelope.steps,
+            envelope.query_step,
+            control,
+        )
+    }));
+    control.poll().map_err(interruption_error)?;
+    let decoded = decoded.map_err(|_| {
         error(
             ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
             "bounded v2 ground-derivation decoding panicked",
         )
     })??;
+    control.poll().map_err(interruption_error)?;
     let (derivation, counts) = decoded;
     if envelope.premise_edge_count != checked_u64(counts.premise_edges, "premise edge count")?
         || envelope.binding_count != checked_u64(counts.bindings, "binding count")?
@@ -2772,29 +2823,44 @@ pub fn validate_chc_ground_derivation_artifact_v2(
         ));
     }
 
-    let rebuilt = envelope_v2_for_derivation(problem, &derivation)?;
-    if rebuilt != envelope {
-        return Err(error(
-            ChcGroundDerivationArtifactErrorReason::NonCanonicalEnvelope,
-            "decoded v2 derivation does not round-trip to AY's canonical encoding",
-        ));
-    }
+    control.poll().map_err(interruption_error)?;
+    let rebuilt = identity.rebuild_v2(&derivation, control)?;
+    control.poll().map_err(interruption_error)?;
+    transport::check_canonical_json(
+        &rebuilt,
+        bytes,
+        "decoded v2 derivation does not round-trip to AY's canonical encoding",
+        control,
+    )?;
 
-    catch_unwind(AssertUnwindSafe(|| {
-        validate_ground_derivation(problem, &derivation)
-    }))
-    .map_err(|_| {
-        error(
-            ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
-            "native v2 ground-derivation validation panicked",
-        )
-    })?
-    .map_err(map_v2_derivation_error)?;
+    // The artifact digest is bookkeeping over the input bytes, so it is paid
+    // BEFORE the decision: the derivation check is then the last work that
+    // consults the caller (#completed-check-accepted).
+    let artifact_sha256 = transport::sha256_hex(bytes, control)?;
+    control.poll().map_err(interruption_error)?;
+    let checked = catch_unwind(AssertUnwindSafe(|| {
+        validate_ground_derivation_with_control(problem, &derivation, control)
+    }));
+    // #completed-check-accepted: consult the LATCH, not the caller. A refusal
+    // the check observed stays final even if a validator swallowed it, but a
+    // stop that arrives after its last poll neither discards a derivation it
+    // accepted nor masks one it rejected.
+    if control.is_stopped() {
+        return Err(interruption_error(GroundValidationInterrupted));
+    }
+    checked
+        .map_err(|_| {
+            error(
+                ChcGroundDerivationArtifactErrorReason::ValidationPanicked,
+                "native v2 ground-derivation validation panicked",
+            )
+        })?
+        .map_err(map_v2_derivation_error)?;
 
     Ok(ChcValidatedGroundDerivation {
         artifact_schema: CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA,
         artifact_role: CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE,
-        artifact_sha256: sha256_hex(bytes),
+        artifact_sha256,
         artifact_bytes: checked_u64(bytes.len(), "artifact byte length")?,
         normalized_input_sha256: envelope.normalized_input_sha256,
         source_clause_sequence_sha256: envelope.source_clause_sequence_sha256,
@@ -2828,7 +2894,7 @@ mod tests {
             .collect()
     }
 
-    fn fixture() -> (ChcProblem, GroundDerivation) {
+    pub(super) fn fixture() -> (ChcProblem, GroundDerivation) {
         let mut problem = ChcProblem::new();
         let p = problem.declare_predicate("P", vec![ChcSort::Int]);
         let q = problem.declare_predicate("Q", vec![ChcSort::Int]);
@@ -3161,7 +3227,7 @@ mod tests {
         env
     }
 
-    fn uf_fixture() -> (ChcProblem, GroundDerivation) {
+    pub(super) fn uf_fixture() -> (ChcProblem, GroundDerivation) {
         let mut problem = ChcProblem::new();
         let p = problem.declare_predicate("P", vec![ChcSort::Int]);
         let fx = int_uf("f", int_var("x"));
@@ -3393,7 +3459,7 @@ mod tests {
     fn value_codec_round_trips_all_supported_recursive_forms() {
         let datatype_sort = ChcSort::Datatype {
             name: "Pair".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mk-pair".to_string(),
                 selectors: vec![
                     ChcDtSelector {

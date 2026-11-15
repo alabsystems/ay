@@ -25,6 +25,24 @@ use ay_proof::{check_proof, check_proof_with_quality, ProofQuality};
 use ntest::timeout;
 
 fn run_unsat_proof(input: &str) -> (Executor, String, ProofQuality) {
+    let (exec, proof_text, quality) = run_unsat_proof_object(input);
+    assert!(
+        proof_text.contains("(cl)"),
+        "expected empty-clause derivation in proof:\n{proof_text}"
+    );
+    (exec, proof_text, quality)
+}
+
+/// Solve, check the proof OBJECT, and hand back whatever the exporter produced
+/// — including a refusal.
+///
+/// The two are different artifacts and this file previously conflated them. A
+/// proof object the internal checker accepts can still have a printed rendering
+/// the external checker refuses, because the rule name comes from the term DAG
+/// and the term text comes from a surface override. Tests whose subject is the
+/// OBJECT use this; tests that also assert a shippable document use
+/// [`run_unsat_proof`].
+fn run_unsat_proof_object(input: &str) -> (Executor, String, ProofQuality) {
     let commands = parse(input).expect("proof-enabled SMT-LIB script should parse");
     let mut exec = Executor::new();
     let outputs = exec
@@ -35,10 +53,6 @@ fn run_unsat_proof(input: &str) -> (Executor, String, ProofQuality) {
     assert_eq!(outputs[0].trim(), "unsat", "expected UNSAT result");
 
     let proof_text = outputs[1].clone();
-    assert!(
-        proof_text.contains("(cl)"),
-        "expected empty-clause derivation in proof:\n{proof_text}"
-    );
 
     let proof = exec
         .last_proof()
@@ -208,20 +222,48 @@ fn test_relu_case_split_disjunction_exports_certified_resolution() {
         (get-proof)
     "#;
 
-    let (_exec, proof_text, quality) = run_unsat_proof(input);
+    let (_exec, proof_text, quality) = run_unsat_proof_object(input);
 
-    assert!(
-        !proof_text.contains(":rule trust"),
-        "1-ReLU case-split UNSAT must not export trust glue:\n{proof_text}"
-    );
+    // The no-trust-glue claim is about the proof OBJECT and is asserted there.
+    // It cannot be read off `proof_text` here: the refusal document below
+    // itself contains the words ":rule trust" in its explanation.
     assert_eq!(quality.trust_count, 0, "trust_count must be 0: {quality:?}");
+    assert_relu_or_pos_surface_is_refused(&proof_text);
+}
+
+/// The ReLU family's `or_pos` gate does not survive PRINTING, and the export
+/// must say so rather than ship it.
+///
+/// This assertion used to be `proof_text.contains("(cl)")`, and that was the
+/// blind spot the whole printed-surface gate exists to close: the proof OBJECT
+/// is fine — the internal checker accepts it and `trust_count` is 0 — while the
+/// document it prints is refused by the pinned external checker. MEASURED on
+/// carcara 1.1.0 against the PREVIOUS output of this exact fixture:
+///
+/// ```text
+/// (step t4 (cl (not (or (and (<= z 0.0) (= y 0.0)) (and (<= 0.0 z) (= y z))))
+///              (and (<= z 0.0) (= y 0.0))
+///              (and (>= z 0.0) (= y z))) :rule or_pos)
+/// [ERROR] checking failed on step 't4' with rule 'or_pos':
+/// expected terms to be equal: '(and (<= 0.0 z) (= y z))' and '(and (>= z 0.0) (= y z))'
+/// ```
+///
+/// The authored `(>= z 0)` and the canonical `(<= 0 z)` are the same atom and
+/// the clause is TRUE; the printed step is simply not an `or_pos` instance. The
+/// faithful repair is a bridge — `comp_simplify` + `cong` + `equiv_pos2` per
+/// differing operand, exactly the chain this document already builds at `t3.n`
+/// — for a POSITIVE operand nested inside a conjunct. `format_surface_tautology`
+/// carries that bridge only for NEGATED top-level operands
+/// (`Bridge::LinearOrder`), so until it is extended the honest outcome is a
+/// refusal, not a document the checker throws away.
+fn assert_relu_or_pos_surface_is_refused(proof_text: &str) {
     assert!(
-        proof_text.contains(":rule la_generic"),
-        "expected certified la_generic leaves:\n{proof_text}"
+        proof_text.contains("UNVERIFIABLE PROOF"),
+        "expected the export to refuse the unprintable or_pos gate:\n{proof_text}"
     );
     assert!(
-        proof_text.contains(":rule resolution :premises"),
-        "expected a genuine resolution chain to (cl):\n{proof_text}"
+        proof_text.contains("no or_pos instance over the printed surface"),
+        "the refusal must name the printed-surface mismatch:\n{proof_text}"
     );
 }
 
@@ -250,15 +292,11 @@ fn test_relu_chain_two_case_splits_export_certified_resolution() {
         (get-proof)
     "#;
 
-    let (_exec, proof_text, quality) = run_unsat_proof(input);
+    let (_exec, proof_text, quality) = run_unsat_proof_object(input);
 
-    assert!(
-        !proof_text.contains(":rule trust"),
-        "2-ReLU chain UNSAT must not export trust glue:\n{proof_text}"
-    );
+    // See the 1-ReLU shape: the no-trust-glue claim lives on the object.
     assert_eq!(quality.trust_count, 0, "trust_count must be 0: {quality:?}");
-    assert!(
-        proof_text.contains(":rule la_generic"),
-        "expected certified la_generic leaves:\n{proof_text}"
-    );
+    // Same printed-surface refusal as the 1-ReLU shape; see
+    // `assert_relu_or_pos_surface_is_refused`.
+    assert_relu_or_pos_surface_is_refused(&proof_text);
 }

@@ -1,0 +1,6 @@
+(set-logic QF_NIA)
+(declare-fun __trust_u__0 () Int)
+(declare-fun __trust_u__2 () Int)
+(declare-fun __trust_u_crc () Int)
+(assert (and (<= 0 __trust_u__2) (<= __trust_u__2 4294967295) (<= 0 __trust_u__0) (<= __trust_u__0 4294967295) (<= 0 __trust_u__2) (<= __trust_u__2 4294967295) (<= 0 __trust_u__0) (<= __trust_u__0 4294967295) (=> (= (ite (>= __trust_u_crc 0) (mod __trust_u_crc 2) (- (mod (- __trust_u_crc) 2))) 0) (= __trust_u__2 0)) (=> (not (= (ite (>= __trust_u_crc 0) (mod __trust_u_crc 2) (- (mod (- __trust_u_crc) 2))) 0)) (= __trust_u__2 3988292384)) (<= 0 __trust_u_crc) (<= __trust_u_crc 4294967295) (= __trust_u__0 __trust_u__2) (not (= __trust_u__0 0))))
+(check-sat)

@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+% CHECKED DELETION reaches the same fabrication, and turns it into the OPPOSITE wrong verdict.
+% With `strengthening_to_core on` a `delc` subproof is a proof by contradiction and registers no
+% proofgoals, so `proofgoal 1` fabricated one; closing it discharged the deletion obligation and
+% core constraint 2 left the database for free. What remains, `x1 >= 1`, is satisfied by the
+% logged solution -- and the formula `x1 AND ~x1` is UNSATISFIABLE.
+f 2 ;
+strengthening_to_core on;
+delc 2 : : subproof
+proofgoal 1
+rup >= 1 ;
+qed;
+qed;
+sol x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

@@ -5,12 +5,13 @@
 // #8529: Use deterministic hash maps/sets in all builds.
 use ay_arrays::{ArrayModel, ArraySolver};
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{TermData, TermId, TermStore, TheoryLit, TheoryResult, TheorySolver};
+use ay_core::{TermId, TermStore, TheoryLit, TheoryResult, TheorySolver};
 use ay_euf::{EufModel, EufSolver};
 use ay_lia::{LiaModel, LiaSolver};
 use ay_lra::{LraModel, LraSolver};
 use num_bigint::BigInt;
 
+use super::auf_lira_state::SplitLoopReads;
 use crate::combined_solvers::check_loops::{
     debug_nelson_oppen, defer_non_local_result, forward_non_sat, propagate_equalities_to,
 };
@@ -20,8 +21,7 @@ use crate::combined_solvers::models::{
     reconcile_lia_lra_values,
 };
 use crate::term_helpers::{
-    arg_involves_select_or_store, involves_int_arithmetic, involves_real_arithmetic,
-    is_select_or_store, is_uf_int_equality, is_uf_real_equality,
+    involves_int_arithmetic, involves_real_arithmetic, is_uf_int_equality, is_uf_real_equality,
 };
 
 /// Result of checking all sub-solvers in the N-O fixpoint loop.
@@ -85,6 +85,8 @@ pub(crate) struct AufLiraSolver<'a> {
     pub(super) asserted_real_int_terms: HashSet<TermId>,
     /// Scope depth counter for push/pop symmetry checking (#4714, #4995).
     pub(super) scope_depth: usize,
+    /// Which solvers the lazy split loop reads between two rounds.
+    pub(super) split_loop_reads: SplitLoopReads,
 }
 
 impl<'a> AufLiraSolver<'a> {
@@ -109,6 +111,7 @@ impl<'a> AufLiraSolver<'a> {
             cross_sort_trail: Vec::new(),
             asserted_real_int_terms: HashSet::default(),
             scope_depth: 0,
+            split_loop_reads: SplitLoopReads::RealSolver,
         }
     }
 
@@ -122,7 +125,8 @@ impl<'a> AufLiraSolver<'a> {
         let patched_lra_terms = reconcile_lia_lra_values(
             &mut lia_model,
             &mut lra_model,
-            &self.lia.shared_equality_terms(),
+            &self.lia.model_authoritative_terms(),
+            &|model| self.lia.model_falsifies_asserted(model),
         );
         if !patched_lra_terms.is_empty() {
             let patched_var_ids: HashSet<u32> = patched_lra_terms
@@ -132,28 +136,13 @@ impl<'a> AufLiraSolver<'a> {
             self.lra
                 .propagate_model_equalities(&mut lra_model, &patched_var_ids);
         }
-        #[cfg(debug_assertions)]
-        let lia_value_count = lia_model.as_ref().map_or(0, |m| m.values.len());
-        #[cfg(debug_assertions)]
-        let lra_value_count = lra_model.values.len();
+        // Shared merge boundaries check exact key/value coverage in each
+        // arithmetic owner's domain. LRA registration-only non-Real keys
+        // deliberately do not participate in the EUF value merge.
         merge_lia_values(&mut euf_model, lia_model.as_ref());
+        // LRA also carries Int relaxation terms. Only Real values belong to
+        // its EUF projection; Int values stay with the reconciled LIA model.
         merge_lra_values(&mut euf_model, &lra_model, self.terms);
-        // Postcondition: arithmetic values must be subsumed by merged EUF term_values (#4714)
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                euf_model.term_values.len() >= lia_value_count,
-                "BUG: AUFLIRA merged EUF model has fewer entries ({}) than LIA values ({})",
-                euf_model.term_values.len(),
-                lia_value_count,
-            );
-            debug_assert!(
-                euf_model.term_values.len() >= lra_value_count,
-                "BUG: AUFLIRA merged EUF model has fewer entries ({}) than LRA values ({})",
-                euf_model.term_values.len(),
-                lra_value_count,
-            );
-        }
         let array_model = extract_array_model(&mut self.arrays, &euf_model);
         (euf_model, array_model, lia_model, lra_model)
     }
@@ -164,6 +153,10 @@ impl TheorySolver for AufLiraSolver<'_> {
         self.arrays.register_atom(atom);
         self.lia.register_atom(atom);
         self.lra.register_atom(atom);
+    }
+
+    fn reads_bool_argument_values(&self) -> bool {
+        matches!(self.split_loop_reads, SplitLoopReads::EverySolver)
     }
 
     fn assert_literal(&mut self, literal: TermId, value: bool) {
@@ -365,6 +358,13 @@ impl TheorySolver for AufLiraSolver<'_> {
         self.arrays.note_applied_theory_lemma(clause);
     }
 
+    fn reacknowledge_applied_theory_lemma(
+        &mut self,
+        clause: &[TheoryLit],
+    ) -> ay_core::TheoryLemmaReplay {
+        self.arrays.reacknowledge_applied_theory_lemma(clause)
+    }
+
     fn push(&mut self) {
         self.scope_depth += 1;
         self.euf.push();
@@ -444,30 +444,7 @@ impl TheorySolver for AufLiraSolver<'_> {
     }
 
     fn suggest_phase(&self, atom: TermId) -> Option<bool> {
-        // Index equality atoms: suggest false (distinct).
-        // See auf_lia.rs for full rationale (#6282).
-        if let TermData::App(ref sym, ref args) = self.terms.get(atom) {
-            if sym.name() == "=" && args.len() == 2 {
-                let lhs_is_simple = !is_select_or_store(self.terms, args[0]);
-                let rhs_is_simple = !is_select_or_store(self.terms, args[1]);
-                if lhs_is_simple && rhs_is_simple {
-                    return Some(false);
-                }
-            }
-        }
-        // Suppress LRA phase hints for inequality atoms involving select/store (#6303).
-        // See auf_lia.rs suggest_phase for full rationale.
-        if let TermData::App(ref sym, ref args) = self.terms.get(atom) {
-            let name = sym.name();
-            if (name == "<=" || name == ">=" || name == "<" || name == ">")
-                && args.len() == 2
-                && (arg_involves_select_or_store(self.terms, args[0])
-                    || arg_involves_select_or_store(self.terms, args[1]))
-            {
-                return None;
-            }
-        }
-        self.lra.suggest_phase(atom)
+        self.phase_hint(atom)
     }
 
     fn sort_atom_index(&mut self) {
@@ -482,3 +459,7 @@ impl TheorySolver for AufLiraSolver<'_> {
         self.lra.generate_incremental_bound_axioms(atom)
     }
 }
+
+#[cfg(test)]
+#[path = "auf_lira_tests.rs"]
+mod tests;

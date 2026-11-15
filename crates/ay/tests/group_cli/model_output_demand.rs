@@ -8,7 +8,14 @@
 //! the first solve, so it is the only one that can PROVE nobody will read a
 //! model. When it can, the executor skips witness cosmetics (counterexample
 //! minimization) -- and nothing else. `:model_minimization.runs` is the
-//! observable; `--stats` prints it.
+//! observable; `--stats-full` prints it.
+//!
+//! `--stats-full`, not `--stats`: since 58f2aaa13 (Meridian PR1) `--stats`
+//! prints a curated 30-key block and `--stats-full` keeps every counter, the
+//! extra-map keys this file reads included. Under `--stats` both keys read as
+//! absent, which `minimization_runs` maps to 0 -- so the positive arms failed
+//! and the `== 0` arms passed without measuring anything. `assert_sat` now also
+//! requires the gate key, so an output that carries neither can never pass.
 //!
 //! Motive, measured on `incremental/ABVFPLRA/inv_Newton_true-unreach-call.c`:
 //! 85 `(check-sat)`, zero `(get-model)`, and every satisfiable answer paid for
@@ -46,7 +53,7 @@ fn run(script: &str, extra_args: &[&str]) -> String {
     let _guard = CleanupGuard(path.clone());
 
     let output = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .arg("--stats")
+        .arg("--stats-full")
         .args(extra_args)
         .arg(&path)
         .output()
@@ -58,8 +65,9 @@ fn run(script: &str, extra_args: &[&str]) -> String {
     )
 }
 
-/// `--stats` prints extra counters as `:name value`; absent means never set,
-/// which for this counter means never entered.
+/// `--stats-full` prints extra counters as `:name value`; absent means never
+/// set, which for this counter means never entered. That reading is only
+/// sound on a FULL block, which `assert_sat` checks for every sat run.
 fn minimization_runs(out: &str) -> u64 {
     out.lines()
         .filter_map(|line| line.trim().strip_prefix(":model_minimization.runs "))
@@ -72,6 +80,14 @@ fn assert_sat(out: &str) {
     assert!(
         out.lines().any(|l| l.trim() == "sat"),
         "script must answer sat: {out:?}"
+    );
+    // Every `sat` answer runs the model gate, and only the FULL statistics
+    // block prints its key. Without this, a block that dropped the extra
+    // counters would read as "0 minimization runs" and pass every shedding arm.
+    assert!(
+        out.lines()
+            .any(|l| l.trim().starts_with(":model_check_gate.result ")),
+        "the full statistics block (with the model gate's key) must be printed: {out:?}"
     );
 }
 

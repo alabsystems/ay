@@ -4,34 +4,37 @@
 
 //! Primitive model-reconstruction operations.
 
+use super::admitted::{ordinary, Ordinary, Work};
 use crate::literal::{Literal, Variable};
 
 pub(super) fn reconstruct_witness(model: &mut Vec<bool>, witness: &[Literal], clause: &[Literal]) {
+    ordinary(reconstruct_witness_admitted(
+        model, witness, clause, &Ordinary,
+    ));
+}
+
+pub(super) fn reconstruct_witness_admitted<P: Work>(
+    model: &mut Vec<bool>,
+    witness: &[Literal],
+    clause: &[Literal],
+    policy: &P,
+) -> Result<(), P::Error> {
     for &w in witness {
+        policy.work(1)?;
         let var_idx = w.variable().index();
         if var_idx >= model.len() {
-            model.resize(var_idx + 1, false);
+            policy.resize(model, var_idx + 1)?;
         }
     }
 
-    let already_sat = clause.iter().any(|&lit| {
-        let v = lit.variable().index();
-        if v >= model.len() {
-            false
-        } else if lit.is_positive() {
-            model[v]
-        } else {
-            !model[v]
-        }
-    });
-
-    if already_sat {
-        return;
+    if clause_satisfied_admitted(clause, model, policy)? {
+        return Ok(());
     }
 
     // CaDiCaL-style conditional autarky: for each witness literal, if it is
     // currently false under the model, flip its variable assignment.
     for &w in witness {
+        policy.work(1)?;
         let var_idx = w.variable().index();
         let lit_satisfied = if w.is_positive() {
             model[var_idx]
@@ -43,23 +46,29 @@ pub(super) fn reconstruct_witness(model: &mut Vec<bool>, witness: &[Literal], cl
         }
     }
 
-    // Post-condition: clause must be satisfied after witness flipping.
-    // Reference: CaDiCaL extend.cpp:200 has the same assertion.
-    debug_assert!(
-        clause.iter().any(|&lit| {
-            let v = lit.variable().index();
-            v < model.len() && (model[v] == lit.is_positive())
-        }),
-        "BUG: reconstruct_witness postcondition: clause={clause:?} witness={witness:?}"
-    );
+    // Reference: CaDiCaL extend.cpp:200. The ordinary diagnostic remains
+    // debug-only; counted replay checks without formatting a panic payload.
+    policy.witness_postcondition(model, witness, clause)
 }
 
 pub(super) fn reconstruct_sweep(model: &mut Vec<bool>, num_vars: usize, lit_map: &[Literal]) {
+    ordinary(reconstruct_sweep_admitted(
+        model, num_vars, lit_map, &Ordinary,
+    ));
+}
+
+pub(super) fn reconstruct_sweep_admitted<P: Work>(
+    model: &mut Vec<bool>,
+    num_vars: usize,
+    lit_map: &[Literal],
+    policy: &P,
+) -> Result<(), P::Error> {
     if num_vars > model.len() {
-        model.resize(num_vars, false);
+        policy.resize(model, num_vars)?;
     }
 
     for var_idx in 0..num_vars {
+        policy.work(1)?;
         let pos_lit = Literal::positive(Variable(var_idx as u32));
         let pos_idx = pos_lit.index();
 
@@ -79,4 +88,20 @@ pub(super) fn reconstruct_sweep(model: &mut Vec<bool>, num_vars: usize, lit_map:
             };
         }
     }
+    Ok(())
+}
+
+pub(crate) fn clause_satisfied_admitted<P: Work>(
+    clause: &[Literal],
+    model: &[bool],
+    policy: &P,
+) -> Result<bool, P::Error> {
+    for lit in clause {
+        policy.work(1)?;
+        let var = lit.variable().index();
+        if var < model.len() && model[var] == lit.is_positive() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -4,6 +4,29 @@
 
 // Bounded planning for authenticated proof surface rewrites.
 
+/// Why the override plan declined, as far as the derivation behind it is
+/// concerned (#certify-before-presentation).
+pub(in crate::executor) struct OverridePlanDecline {
+    /// Every canonical root the plan refused was refused for its binder
+    /// SHAPE alone (no size, visit or symbol refusal, no ceiling), and the
+    /// largest of them expands to at most [`SHAPE_ONLY_MAX_EXPANDED_NODES`]
+    /// nodes. The bound then says nothing about the size of the terms a
+    /// derivation over these roots carries, so the derivation is kept for
+    /// certification and only the document is withheld. Any other exit is a
+    /// SIZE statement — measured on QF_UFLRA cpachecker `minepump_spec4_
+    /// product58` (a root expanding to 674,862,507 nodes), strict-checking the
+    /// kept derivation ran the process out of memory, `unsat` 7.2 s ->
+    /// `memout` — and keeps the one-line poison.
+    pub(in crate::executor) shape_only: bool,
+}
+
+/// The per-root expansion a shape-only decline admits: the visit bound the
+/// canonical work probe itself prices a root against
+/// (`canonical_term_work_probe`). Measured on the D7 list: every binder-veto
+/// decline is at most 20,201 expanded nodes, every size decline at least
+/// 209,605.
+const SHAPE_ONLY_MAX_EXPANDED_NODES: u64 = 100_000;
+
 impl Executor {
     fn poison_input_syntax_rewrite(proof: &mut Proof) {
         let mut poisoned = Proof::new();
@@ -107,15 +130,75 @@ impl Executor {
         pairs
     }
 
-    fn prepare_surface_overrides(
+    /// Record one override-plan exit and decline.
+    ///
+    /// #unbounded-population. The census stays write-only: nothing
+    /// downstream reads `last_unbounded_census` to decide anything. The
+    /// plan's own [`OverridePlanDecline`] verdict is computed here, from the
+    /// counts this exit took.
+    fn decline_override_plan<T>(
         &mut self,
-    ) -> Option<(
-        Vec<(TermId, ay_frontend::command::Term)>,
-        HashMap<TermId, String>,
-    )> {
+        mut census: crate::executor::OverridePlanCensus,
+        exit: crate::executor::OverridePlanExit,
+    ) -> Result<T, OverridePlanDecline> {
+        census.exit = Some(exit);
+        let shape_only = exit == crate::executor::OverridePlanExit::CanonicalRootsUnbounded
+            && census.canonical_roots_refused_shape > 0
+            && census.canonical_roots_refused_size == 0
+            && census.canonical_roots_refused_symbol == 0
+            && census.largest_canonical.expanded_nodes <= SHAPE_ONLY_MAX_EXPANDED_NODES;
+        self.last_unbounded_census = Some(crate::executor::UnboundedCensus::OverridePlan(census));
+        Err(OverridePlanDecline { shape_only })
+    }
+
+    pub(in crate::executor) fn prepare_surface_overrides(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<(TermId, ay_frontend::command::Term)>,
+            HashMap<TermId, String>,
+        ),
+        OverridePlanDecline,
+    > {
+        // #unbounded-population. Six exits below decline under ONE tag, and
+        // the census could not say which. Record what each one saw. Write-only:
+        // every decision below is taken exactly as it was, and a `None` exit is
+        // still a `None` exit.
+        let mut census = crate::executor::OverridePlanCensus {
+            has_provenance: self.proof_problem_assertion_provenance.is_some(),
+            ..Default::default()
+        };
+        let mut pair_specs = self.surface_override_pair_specs(&mut census)?;
+        let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
+        let override_pairs: Vec<(TermId, ay_frontend::command::Term)> = pair_specs
+            .drain(..)
+            .filter_map(|(canonical, index)| {
+                let parsed = parsed_assertions.get(index)?;
+                // The native API marker aligns counts; it is not surface text.
+                (!matches!(
+                    strip_frontend_annotations(parsed),
+                    ay_frontend::command::Term::Symbol(name)
+                        if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
+                ))
+                .then(|| (canonical, parsed.clone()))
+            })
+            .collect();
+        self.collect_surface_override_spellings(override_pairs, census)
+    }
+
+    /// The pair specs the override plan will render, or `None` at one of the
+    /// four exits that decline before any spelling is collected.
+    fn surface_override_pair_specs(
+        &mut self,
+        census: &mut crate::executor::OverridePlanCensus,
+    ) -> Result<Vec<(TermId, usize)>, OverridePlanDecline> {
         let problem_assertions = self.proof_problem_assertions();
         let original_problem_assertions = self.proof_original_problem_assertions();
         let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
+        census.problem_assertions = u32::try_from(problem_assertions.len()).unwrap_or(u32::MAX);
+        census.original_problem_assertions =
+            u32::try_from(original_problem_assertions.len()).unwrap_or(u32::MAX);
+        census.parsed_assertions = u32::try_from(parsed_assertions.len()).unwrap_or(u32::MAX);
         let mut override_plan_valid = problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN
             && original_problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN;
         let mut source_scan_work = problem_assertions.len();
@@ -138,51 +221,94 @@ impl Executor {
             override_plan_valid = false;
             Vec::new()
         };
-        surface_pairs::retain_available_surface_pairs(&mut pair_specs, parsed_assertions.len());
+        let parsed_len = self.ctx.assertions_parsed().len();
+        surface_pairs::retain_available_surface_pairs(&mut pair_specs, parsed_len);
+        census.source_scan_work = source_scan_work as u64;
+        census.pair_specs = u32::try_from(pair_specs.len()).unwrap_or(u32::MAX);
         let canonical_plan_is_bounded =
             super::proof_surface_syntax::surface_override_roots_have_bounded_work(
                 &self.ctx.terms,
                 pair_specs.iter().map(|(canonical, _)| *canonical),
             );
-        if !override_plan_valid
-            || pair_specs.len() > MAX_OVERRIDE_PAIRS
-            || !canonical_plan_is_bounded
-            || !self.proof_source_work.spend(
-                super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxOverridePairs,
-                pair_specs
-                    .iter()
-                    .filter_map(|(_, index)| parsed_assertions.get(*index)),
-            )
-        {
-            return None;
+        if !override_plan_valid {
+            return self
+                .decline_override_plan(*census, crate::executor::OverridePlanExit::ScanCeiling);
         }
+        if pair_specs.len() > MAX_OVERRIDE_PAIRS {
+            return self
+                .decline_override_plan(*census, crate::executor::OverridePlanExit::PairCeiling);
+        }
+        if !canonical_plan_is_bounded {
+            crate::executor::proof::census_canonical_roots(
+                &self.ctx.terms,
+                census,
+                pair_specs.iter().map(|(canonical, _)| *canonical),
+            );
+            return self.decline_override_plan(
+                *census,
+                crate::executor::OverridePlanExit::CanonicalRootsUnbounded,
+            );
+        }
+        census.envelope_remaining = self.proof_source_work.remaining() as u64;
+        let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
+        if self.proof_source_work.spend(
+            super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxOverridePairs,
+            pair_specs
+                .iter()
+                .filter_map(|(_, index)| parsed_assertions.get(*index)),
+        ) {
+            return Ok(pair_specs);
+        }
+        census.envelope_charge = super::proof_trust_surgery_surface_audit::surface_pass_work(
+            pair_specs
+                .iter()
+                .filter_map(|(_, index)| parsed_assertions.get(*index)),
+        )
+        .map(|work| work as u64);
+        self.decline_override_plan(*census, crate::executor::OverridePlanExit::EnvelopeRefused)
+    }
 
-        let override_pairs: Vec<(TermId, ay_frontend::command::Term)> = pair_specs
-            .drain(..)
-            .filter_map(|(canonical, index)| {
-                let parsed = parsed_assertions.get(index)?;
-                // The native API marker aligns counts; it is not surface text.
-                (!matches!(
-                    strip_frontend_annotations(parsed),
-                    ay_frontend::command::Term::Symbol(name)
-                        if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
-                ))
-                .then(|| (canonical, parsed.clone()))
-            })
-            .collect();
+    /// Collect the exact source spelling of every pair, or decline at one of
+    /// the two exits the collector owns.
+    fn collect_surface_override_spellings(
+        &mut self,
+        override_pairs: Vec<(TermId, ay_frontend::command::Term)>,
+        mut census: crate::executor::OverridePlanCensus,
+    ) -> Result<
+        (
+            Vec<(TermId, ay_frontend::command::Term)>,
+            HashMap<TermId, String>,
+        ),
+        OverridePlanDecline,
+    > {
         let mut term_overrides = HashMap::default();
-        for (canonical, parsed) in &override_pairs {
-            if !collect_surface_term_overrides(
+        for (pair_index, (canonical, parsed)) in override_pairs.iter().enumerate() {
+            let collected = collect_surface_term_overrides(
                 &mut self.ctx,
                 *canonical,
                 parsed,
                 &mut term_overrides,
-            ) || !surface_override_map_is_bounded(&term_overrides)
-            {
-                return None;
+            );
+            if !collected || !surface_override_map_is_bounded(&term_overrides) {
+                let exit = if collected {
+                    crate::executor::OverridePlanExit::OverrideMapUnbounded
+                } else {
+                    crate::executor::OverridePlanExit::CollectorRefused
+                };
+                census.collector_refused_pair = Some(u32::try_from(pair_index).unwrap_or(u32::MAX));
+                census.overrides = u32::try_from(term_overrides.len()).unwrap_or(u32::MAX);
+                census.override_bytes = term_overrides.values().fold(0u64, |bytes, spelling| {
+                    bytes.saturating_add(spelling.len() as u64)
+                });
+                crate::executor::proof::census_canonical_roots(
+                    &self.ctx.terms,
+                    &mut census,
+                    std::iter::once(*canonical),
+                );
+                return self.decline_override_plan(census, exit);
             }
         }
-        Some((override_pairs, term_overrides))
+        Ok((override_pairs, term_overrides))
     }
 
     /// Add exact source spellings for ground instances of authored quantifiers.
@@ -211,7 +337,8 @@ impl Executor {
             .cloned()
             .collect();
         let mut failed = false;
-        for step in &proof.steps {
+        let debug = ay_core::misc_cli_flags().debug_cert;
+        for (index, step) in proof.steps.iter().enumerate() {
             let ProofStep::Step {
                 rule: AletheRule::ForallInst,
                 clause,
@@ -235,12 +362,27 @@ impl Executor {
                 continue;
             };
             let Some(parsed) = parsed_foralls.get(quantifier) else {
+                // A census line, not a decision: which `forall_inst` steps
+                // this pass cannot re-spell, and why. The sko_ex sibling of
+                // the eighth false green shipped a canonical instance under an
+                // authored quantifier because the step's quantifier was not
+                // an authored root here.
+                if debug {
+                    ay_core::safe_eprintln!(
+                        "c !! forall-inst surface at t{index}: quantifier is not an authored root, no instance spelling"
+                    );
+                }
                 continue;
             };
             let instance = disjuncts[1];
             let Some(surface) =
                 format_forall_instance_surface(&self.ctx.terms, parsed, args, term_overrides)
             else {
+                if debug {
+                    ay_core::safe_eprintln!(
+                        "c !! forall-inst surface at t{index}: authored body does not render under the substitution"
+                    );
+                }
                 failed = true;
                 break;
             };
@@ -248,13 +390,25 @@ impl Executor {
                 .get(&instance)
                 .is_some_and(|existing| existing != &surface)
             {
+                if debug {
+                    ay_core::safe_eprintln!(
+                        "c !! forall-inst surface at t{index}: instance already spelled another way"
+                    );
+                }
                 failed = true;
                 break;
+            }
+            if debug {
+                ay_core::safe_eprintln!("c !! forall-inst surface at t{index}: {surface}");
             }
             term_overrides.insert(instance, surface);
         }
         if failed {
             self.suppress_unsat_proof_reconstruction();
+            // #evidence-stage-3, second pass.
+            self.record_proof_decline(
+                crate::executor::ProofDeclineMechanism::ForallInstanceSurfaceConflict,
+            );
         }
     }
 
@@ -262,11 +416,13 @@ impl Executor {
     ///
     /// Auxiliary quotient/remainder recognition is name-based: it recognizes
     /// `_mod_q`, `_div_q`, `_divmod_q`, and their `_r` twins. AY's own div/mod
-    /// elimination never mints those names; `ay-chc` declares them to the
-    /// executor as ordinary client constants. A match can therefore belong to
-    /// the authored problem, and its inferred side condition can be derived
-    /// rather than authored. Merely asking whether that side condition is an
-    /// assertion does not protect the authority boundary.
+    /// elimination mints `_divmod_q`/`_divmod_r` (its purification is derived
+    /// by `proof_divmod_def`, from the mint-site record, not here), and
+    /// `ay-chc` declares such names to the executor as ordinary client
+    /// constants. A match can therefore belong to the authored problem, and
+    /// its inferred side condition can be derived rather than authored.
+    /// Merely asking whether that side condition is an assertion does not
+    /// protect the authority boundary.
     ///
     /// What is decisive is the effect: if rewriting changes an `Assume` leaf
     /// into a term absent from the frozen problem obligation, discard the whole

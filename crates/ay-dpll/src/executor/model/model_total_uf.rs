@@ -99,6 +99,7 @@ impl Model {
             default,
             rendered_rows: rendered_table[..rendered_table.len().saturating_sub(1)].to_vec(),
             rendered_default: rendered_table.last()?.1.clone(),
+            element_carriers: false,
         };
         // Any quantified theorem named the exact model before this table was
         // installed. Revoke every model-relative identity only after all
@@ -107,6 +108,9 @@ impl Model {
         self.quantified_confirmation_seal.revoke();
         self.revoke_quantified_grant_model();
         self.certified_total_ufs.cegqi_recompletion_epoch = None;
+        // The checked total interpretation supersedes the ground model's
+        // frozen raw-row view for this head. Retire it only at this commit.
+        self.materialized_scalar_functions.remove(&name);
         let euf = self.euf_model.get_or_insert_with(EufModel::default);
         euf.function_tables.insert(name.clone(), rendered_table);
         euf.function_table_terms.remove(&name);
@@ -234,12 +238,14 @@ impl Model {
             default,
             rendered_rows,
             rendered_default,
+            element_carriers: false,
         };
         // See the scalar-table installer above: a changed certified function
         // interpretation cannot retain any earlier theorem's model identity.
         self.quantified_confirmation_seal.revoke();
         self.revoke_quantified_grant_model();
         self.certified_total_ufs.cegqi_recompletion_epoch = None;
+        self.materialized_scalar_functions.remove(&name);
         let euf = self.euf_model.get_or_insert_with(EufModel::default);
         // The raw EUF representation encodes its default as the last row and
         // therefore cannot represent a total datatype table without inventing
@@ -264,6 +270,12 @@ impl Model {
     /// candidate M.  Callers that need to invalidate certified authority must
     /// discard the whole result-local [`Model`] instead.
     pub(in crate::executor) fn remove_raw_uf_table_interpretation(&mut self, name: &str) {
+        // Cleanup may remove a redundant raw view of an already-owned total
+        // interpretation. Without that owner, leave an obsolete view stale
+        // until a successful promotion commits; cleanup alone grants nothing.
+        if self.has_certified_total_uf(name) {
+            self.materialized_scalar_functions.remove(name);
+        }
         if let Some(euf) = self.euf_model.as_mut() {
             euf.function_tables.remove(name);
             euf.function_table_terms.remove(name);

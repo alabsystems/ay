@@ -442,6 +442,9 @@ fn expr_mentions_pattern_var(expr: &ChcExpr, var_to_idx: &FxHashMap<String, usiz
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
         match e {
+            ChcExpr::ArrayLambda(lambda) => {
+                stack.extend(lambda.captures().iter().map(AsRef::as_ref))
+            }
             ChcExpr::Var(v) => {
                 if var_to_idx.contains_key(&v.name) {
                     return true;

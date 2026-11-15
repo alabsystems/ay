@@ -45,23 +45,45 @@ impl CoverView {
         self.rhs.len()
     }
 
+    /// The `(var, coeff)` entries of `row`; empty when `row` is not a row of
+    /// this view.
     pub(super) fn row_entries(&self, row: usize) -> impl Iterator<Item = (u32, i64)> + '_ {
-        let lo = self.row_start[row] as usize;
-        let hi = self.row_start[row + 1] as usize;
-        self.row_var[lo..hi]
-            .iter()
-            .copied()
-            .zip(self.row_coeff[lo..hi].iter().copied())
+        csr_entries(&self.row_start, &self.row_var, &self.row_coeff, row)
     }
 
+    /// The `(row, coeff)` entries of `var`; empty when `var` is not a variable
+    /// of this view.
     pub(super) fn var_entries(&self, var: usize) -> impl Iterator<Item = (u32, i64)> + '_ {
-        let lo = self.var_start[var] as usize;
-        let hi = self.var_start[var + 1] as usize;
-        self.var_row[lo..hi]
-            .iter()
-            .copied()
-            .zip(self.var_coeff[lo..hi].iter().copied())
+        csr_entries(&self.var_start, &self.var_row, &self.var_coeff, var)
     }
+}
+
+/// The entries of line `index` of a CSR index (`start`, `ids`, `coeffs`).
+///
+/// Every line of a built [`CoverView`] is in range by construction, so the
+/// empty result for an out-of-range line (or a malformed span) never changes
+/// what callers see; it only replaces a panic in this advisory view.
+fn csr_entries<'a>(
+    start: &[u32],
+    ids: &'a [u32],
+    coeffs: &'a [i64],
+    index: usize,
+) -> impl Iterator<Item = (u32, i64)> + 'a {
+    let (ids, coeffs) = csr_span(start, ids, coeffs, index).unwrap_or((&[], &[]));
+    ids.iter().copied().zip(coeffs.iter().copied())
+}
+
+/// The `[start[index], start[index + 1])` slices of `ids` and `coeffs`, or
+/// `None` when that span is not inside both.
+fn csr_span<'a>(
+    start: &[u32],
+    ids: &'a [u32],
+    coeffs: &'a [i64],
+    index: usize,
+) -> Option<(&'a [u32], &'a [i64])> {
+    let lo = *start.get(index)? as usize;
+    let hi = *start.get(index.checked_add(1)?)? as usize;
+    Some((ids.get(lo..hi)?, coeffs.get(lo..hi)?))
 }
 
 /// One normalized row, or a verdict about it.
@@ -83,7 +105,9 @@ fn normalize_row(constraint: &PbConstraint, num_vars: usize, acc: &mut [i128]) -
         return NormRow::Reject;
     }
     let mut rhs: i128 = constraint.rhs;
-    let mut touched: Vec<u32> = Vec::with_capacity(constraint.terms.len());
+    let mut touched: Vec<u32> = Vec::new();
+    // Capacity hint only; `push` grows `touched` if the reservation fails.
+    let _ = touched.try_reserve(constraint.terms.len());
     let mut rejected = false;
     for term in &constraint.terms {
         let Some(lit) = term.lits.first().filter(|_| term.lits.len() == 1) else {
@@ -94,15 +118,34 @@ fn normalize_row(constraint: &PbConstraint, num_vars: usize, acc: &mut [i128]) -
             rejected = true;
             break;
         };
-        if acc[var] == 0 {
+        // `acc` has length `num_vars`, so a variable past it cannot occur.
+        let Some(slot) = acc.get_mut(var) else {
+            rejected = true;
+            break;
+        };
+        if *slot == 0 {
             touched.push(var as u32);
         }
-        if lit.negated {
-            acc[var] -= term.coeff;
-            rhs -= term.coeff;
+        // Coefficients up to `+-i128::MAX` parse and a row may repeat a
+        // variable, so the running sums can leave i128. There is then no
+        // exact value to normalize with: decline the row, which declines this
+        // advisory arm (fail-closed; it never decides what is reported).
+        let updated = if lit.negated {
+            match (slot.checked_sub(term.coeff), rhs.checked_sub(term.coeff)) {
+                (Some(coeff), Some(bound)) => {
+                    rhs = bound;
+                    Some(coeff)
+                }
+                _ => None,
+            }
         } else {
-            acc[var] += term.coeff;
-        }
+            slot.checked_add(term.coeff)
+        };
+        let Some(coeff) = updated else {
+            rejected = true;
+            break;
+        };
+        *slot = coeff;
     }
     let outcome = if rejected {
         NormRow::Reject
@@ -110,7 +153,9 @@ fn normalize_row(constraint: &PbConstraint, num_vars: usize, acc: &mut [i128]) -
         collect_normalized(&touched, acc, rhs)
     };
     for &var in &touched {
-        acc[var as usize] = 0;
+        if let Some(slot) = acc.get_mut(var as usize) {
+            *slot = 0;
+        }
     }
     outcome
 }
@@ -130,7 +175,11 @@ fn collect_normalized(touched: &[u32], acc: &[i128], rhs: i128) -> NormRow {
     // `primes-dimacs-cnf/ii16d2` and 99us on `routing/s4-4-3-1pb`, against
     // the microsecond structural declines this gate promises. Rejecting here
     // makes the same verdict structural and O(row).
-    if touched.iter().any(|&var| acc[var as usize] < 0) {
+    // A touched variable missing from `acc` cannot be normalized either.
+    if touched
+        .iter()
+        .any(|&var| !matches!(acc.get(var as usize), Some(&coeff) if coeff >= 0))
+    {
         return NormRow::Reject;
     }
     if rhs <= 0 {
@@ -139,10 +188,14 @@ fn collect_normalized(touched: &[u32], acc: &[i128], rhs: i128) -> NormRow {
     let Ok(rhs) = i64::try_from(rhs) else {
         return NormRow::Reject;
     };
-    let mut entries: Vec<(u32, i64)> = Vec::with_capacity(touched.len());
+    let mut entries: Vec<(u32, i64)> = Vec::new();
+    // Capacity hint only; `push` grows `entries` if the reservation fails.
+    let _ = entries.try_reserve(touched.len());
     let mut reach: i64 = 0;
     for &var in touched {
-        let coeff = acc[var as usize];
+        let Some(&coeff) = acc.get(var as usize) else {
+            return NormRow::Reject;
+        };
         debug_assert!(coeff >= 0, "negative coefficients were rejected above");
         if coeff == 0 {
             continue;
@@ -242,7 +295,7 @@ pub(super) fn build_cover_view(
         .filter(|v| in_ground[*v])
         .map(|v| v as u32)
         .collect();
-    let (var_start, var_row, var_coeff) = transpose(num_vars, &row_start, &row_var, &row_coeff);
+    let (var_start, var_row, var_coeff) = transpose(num_vars, &row_start, &row_var, &row_coeff)?;
     Some(CoverView {
         num_vars,
         row_start,
@@ -257,32 +310,42 @@ pub(super) fn build_cover_view(
 }
 
 /// Row-major CSR -> variable-major CSR (counting sort).
+///
+/// Returns `None` when the row-major index is malformed (a variable past
+/// `num_vars`, a row span outside `row_var`/`row_coeff`, or a count past
+/// `u32`); [`build_cover_view`] never builds one, and declines if it did.
 fn transpose(
     num_vars: usize,
     row_start: &[u32],
     row_var: &[u32],
     row_coeff: &[i64],
-) -> (Vec<u32>, Vec<u32>, Vec<i64>) {
-    let mut var_start = vec![0u32; num_vars + 1];
+) -> Option<(Vec<u32>, Vec<u32>, Vec<i64>)> {
+    let mut var_start = vec![0u32; num_vars.checked_add(1)?];
     for &var in row_var {
-        var_start[var as usize + 1] += 1;
+        let count = var_start.get_mut((var as usize).checked_add(1)?)?;
+        *count = count.checked_add(1)?;
     }
-    for index in 0..num_vars {
-        var_start[index + 1] += var_start[index];
+    // In-place prefix sum: `var_start[v]` becomes the first slot of `v`.
+    let mut running: u32 = 0;
+    for start in &mut var_start {
+        running = running.checked_add(*start)?;
+        *start = running;
     }
     let mut cursor = var_start.clone();
     let mut var_row = vec![0u32; row_var.len()];
     let mut var_coeff = vec![0i64; row_var.len()];
-    for row in 0..row_start.len() - 1 {
-        let lo = row_start[row] as usize;
-        let hi = row_start[row + 1] as usize;
-        for slot in lo..hi {
-            let var = row_var[slot] as usize;
-            let at = cursor[var] as usize;
-            var_row[at] = row as u32;
-            var_coeff[at] = row_coeff[slot];
-            cursor[var] += 1;
+    for (row, span) in row_start.windows(2).enumerate() {
+        let &[lo, hi] = span else {
+            continue;
+        };
+        for slot in lo as usize..hi as usize {
+            let var = *row_var.get(slot)? as usize;
+            let next = cursor.get_mut(var)?;
+            let at = *next as usize;
+            *next = next.checked_add(1)?;
+            *var_row.get_mut(at)? = row as u32;
+            *var_coeff.get_mut(at)? = *row_coeff.get(slot)?;
         }
     }
-    (var_start, var_row, var_coeff)
+    Some((var_start, var_row, var_coeff))
 }

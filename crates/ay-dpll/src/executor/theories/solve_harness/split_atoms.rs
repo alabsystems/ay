@@ -64,6 +64,22 @@ pub(in crate::executor) fn check_split_oscillation(
     }
 }
 
+/// Whether [`check_split_oscillation`] would report unbounded oscillation for
+/// this split, without recording it (#split-walk-sat-fallback): the split
+/// loop asks its theory for a SAT-only attempt before the guard gives up.
+pub(in crate::executor) fn split_oscillation_would_trigger(
+    tracking: &SplitOscillationMap,
+    variable: TermId,
+    value: &num_rational::BigRational,
+) -> bool {
+    let Some(entry) = tracking.get(&variable) else {
+        return false;
+    };
+    let mut probe = SplitOscillationMap::default();
+    probe.insert(variable, entry.clone());
+    check_split_oscillation(&mut probe, variable, value)
+}
+
 /// Result of creating disequality split atoms from a [`DisequalitySplitRequest`].
 ///
 /// The 3-way branch depends on the sort of the variable and whether the excluded

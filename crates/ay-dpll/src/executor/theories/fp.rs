@@ -9,32 +9,34 @@
 //! trivially SAT. The real work is linking FP predicate results back to
 //! Tseitin variables so the SAT solver sees the FP semantics.
 
+mod abvfp_window;
 mod bitblast;
 mod blocking;
 mod congruence;
 mod flatten_reads;
 mod forward_error;
 mod incremental;
+mod namespace;
+mod nested_bv_guards;
 mod pin_reals;
-mod rm_expand;
+mod stateless;
+mod stop;
+pub(in crate::executor) use namespace::FpNamespace;
+pub(in crate::executor) use stop::{FpStop, MemoryPollGate};
 mod support;
 #[cfg(test)]
 mod tests;
-mod to_fp_const;
 mod to_real;
 mod to_real_rewrite;
 mod to_real_solve;
+mod unread_arrays;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{CnfClause, Tseitin};
-use ay_fp::FpSolver;
-use ay_sat::{SatResult, Solver as SatSolver};
 
 use super::super::Executor;
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 
-use support::{check_fp_support, FpPredicateResult, FpSupportStatus};
-use to_real::offset_cnf_lit;
+use support::{check_fp_support, FpSupportStatus};
 
 impl Executor {
     /// Solve QF_FP (quantifier-free IEEE 754 floating-point) using eager bit-blasting.
@@ -46,30 +48,67 @@ impl Executor {
     /// 4. Feed combined CNF to SAT solver
     pub(in crate::executor) fn solve_fp(&mut self) -> Result<SolveResult> {
         // CONSUME the persistent-lane authorization here, at the single shared
-        // entry point, before anything can re-enter. `try_solve_fp_symbolic_rm`
-        // (5^k mutually contradictory RM branches) and `try_fp_pin_unsat_probe`
-        // both call back into `solve_fp` further down this very function with a
-        // substituted `ctx.assertions`; taking the flag now guarantees those
-        // branches never share session state with each other or with the
-        // authored query. See `Executor::fp_persistent_armed`.
+        // entry point, before anything can re-enter. `try_fp_pin_unsat_probe`
+        // calls back into `solve_fp` further down this very function with a
+        // substituted `ctx.assertions`; taking the flag now guarantees that
+        // probe never shares session state with the authored query. See
+        // `Executor::fp_persistent_armed`.
         let persistent_authorized = std::mem::take(&mut self.fp_persistent_armed);
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
-        // Fold `((_ to_fp eb sb) <const-rm> <const-real>)` to its IEEE bit
-        // pattern (the supported 1-arg `to_fp(<BV>)` form) so the standard
-        // FP-literal syntax is solved instead of bailing to `unknown`.
-        self.ctx.assertions =
-            to_fp_const::fold_to_fp_real_constants(&mut self.ctx.terms, &self.ctx.assertions);
-
-        // Symbolic-RoundingMode finite-domain enumeration (#P0.2, Pass C):
-        // declared RM consts case-split over the 5 modes and DECIDE like z3
-        // (see rm_expand.rs). Not-applicable shapes fall through to
-        // `check_fp_support`, whose strengthened guard fails ANY remaining
-        // non-literal RM-sorted term closed to `unknown`.
-        if let Some(result) = self.try_solve_fp_symbolic_rm()? {
-            return Ok(result);
+        // The FP word-level rewriter (fpa_rewriter), the first pass of the
+        // pipeline: every FP operation over constants folds to the constant it
+        // denotes, exactly, and so does one over a symbolic rounding mode when
+        // all five modes agree. The standard FP-literal syntax
+        // `((_ to_fp eb sb) RNE 0.5)` is the commonest case. Every rule is an
+        // equivalence (ay-theories/fp/src/rewriter.rs).
+        // A literal definition can already supply a concrete witness. This
+        // advisory check runs no solver and cannot refute anything or mint
+        // SAT authority. The ordinary funnel still checks ALL original roots.
+        let literal_candidate = {
+            // Retain the exact input IDs at this rewrite boundary; roots from
+            // an earlier preprocessing window must not be inferred by position.
+            // Stage in the same one cloned root buffer as the old rewriter.
+            // Keep the live assertion stack intact if rewriting unwinds; an
+            // FFI caller may catch that failure and continue using its context.
+            let mut rewritten_fp_assertions = self.ctx.assertions.clone();
+            let mut rewriter = ay_fp::rewriter::FpRewriter::new();
+            for root in &mut rewritten_fp_assertions {
+                *root = rewriter.rewrite(&mut self.ctx.terms, *root);
+            }
+            let original_fp_assertions =
+                std::mem::replace(&mut self.ctx.assertions, rewritten_fp_assertions);
+            self.last_statistics
+                .set_int("fp.rewriter.folds", rewriter.folds());
+            self.try_literal_fp_model(&original_fp_assertions)
+        };
+        match literal_candidate {
+            Ok(Some(model)) => {
+                self.last_statistics.set_int(
+                    "fp.literal_model.bindings",
+                    model.completed_values.len() as u64,
+                );
+                self.last_model = Some(model);
+                self.last_model_validated = false;
+                self.last_unknown_reason = None;
+                return Ok(SolveResult::Sat);
+            }
+            Ok(None) => {}
+            Err(origin) => return Ok(self.fp_stopped(origin)),
         }
+
+        if self.try_install_pinned_fp_refutation() {
+            self.last_model = None;
+            self.last_unknown_reason = None;
+            self.last_statistics
+                .set_int("fp.pinned.checked_presolve", 1);
+            return Ok(SolveResult::unsat());
+        }
+
+        // Symbolic rounding modes need no case split: the bit-blaster carries
+        // each declared mode as three bits (ay-theories/fp/src/rm.rs), and
+        // `check_fp_support` fails closed on a mode it cannot encode.
 
         // --- Guard: check for unsupported FP operations ---
         // Supported with full bit-blasting (#3586):
@@ -120,9 +159,8 @@ impl Executor {
 
         // --- Persistent incremental lane (fifth incremental subsystem) ---
         // Engages only for an authorized, push/pop-scoped solve whose session
-        // state has not opted out. Everything below this point is the original
-        // stateless pipeline, byte-for-byte, and remains the behaviour for
-        // every single-shot solve and every declined incremental one.
+        // state has not opted out. Single-shot solves and declined incremental
+        // attempts continue through the cooperatively owned stateless pipeline.
         //
         // The lane is SOUND — 1,820 check-sat indices compared against bitwuzla
         // 0.9.1 AND cvc5 1.3.0 with zero conflicts, plus 3,260 more by the
@@ -172,278 +210,7 @@ impl Executor {
             }
         }
 
-        // --- Phase 1: Tseitin transformation ---
-        //
-        // `encode_assertion`, not `assert_term`, so DEFINITIONS and ACTIVATION
-        // are separable (#fp-incremental-subsystem, prerequisite step).
-        //
-        // The two calls differ in exactly one respect: `encode_and_assert`
-        // (which `assert_term` wraps) is `encode(t, true)` followed by
-        // `add_clause(unit(lit))`, while `encode_assertion` is the same
-        // `encode(t, true)` and hands the root literal BACK instead of pushing
-        // it. So re-pushing the unit here in the same position reproduces the
-        // previous clause sequence exactly — this is behaviour-preserving, and
-        // `fp_tseitin_split_reconstructs_the_flat_encoding` pins that.
-        //
-        // Why it has to exist before the FP lane can ever retain anything:
-        // definitional clauses are scope-INDEPENDENT and belong in
-        // `add_clause_global` (they constrain only fresh Tseitin variables, so
-        // they remove no model of the user's formula), whereas the root unit is
-        // the ASSERTION and must stay scope-guarded. `TseitinEncodedAssertion`'s
-        // own documentation states that split. While the two are fused into one
-        // flat vector there is no way to make the definitions survive a pop
-        // without also making the assertion survive it — which is a wrong
-        // answer, not an optimisation. See
-        // the development design notes.
-        //
-        // Nothing is retained yet: both halves are recombined immediately below
-        // and handed to a fresh solver exactly as before.
-        let mut tseitin = Tseitin::new(&self.ctx.terms);
-        let mut tseitin_definitions: Vec<CnfClause> = Vec::new();
-        let mut tseitin_activations: Vec<CnfClause> = Vec::new();
-        let mut tseitin_clauses: Vec<CnfClause> = Vec::new();
-        for &assertion in &self.ctx.assertions {
-            let encoded = tseitin.encode_assertion(assertion);
-            let activation = CnfClause::unit(encoded.root_lit);
-            tseitin_clauses.extend(encoded.def_clauses.iter().cloned());
-            tseitin_clauses.push(activation.clone());
-            tseitin_definitions.extend(encoded.def_clauses);
-            tseitin_activations.push(activation);
-        }
-        debug_assert_eq!(
-            tseitin_clauses.len(),
-            tseitin_definitions.len() + tseitin_activations.len(),
-            "the def/activation split must partition the flat encoding"
-        );
-        let tseitin_result = ay_core::TseitinResult::new(
-            tseitin_clauses,
-            tseitin.term_to_var().clone(),
-            tseitin.var_to_term().clone(),
-            0,
-            tseitin.num_vars(),
-        );
-
-        // --- Phase 2: FP bit-blasting ---
-        let mut fp_solver = FpSolver::new_with_tseitin(&self.ctx.terms, tseitin.term_to_var());
-
-        // Walk Tseitin-encoded terms for FP predicates. Each FP predicate
-        // (fp.eq, fp.lt, fp.isNaN, etc.) gets a Tseitin variable that must
-        // be linked to the FP bit-blast result.
-        let mut linking_pairs: Vec<(i32, i32)> = Vec::new();
-        let mut congruence_plan_clauses: Vec<Vec<congruence::PlanLit>> = Vec::new();
-        for (&tseitin_var, &term) in &tseitin_result.var_to_term {
-            match self.bitblast_fp_predicate(&mut fp_solver, term) {
-                FpPredicateResult::Bitblasted(fp_lit) => {
-                    linking_pairs.push((tseitin_var as i32, fp_lit));
-                }
-                FpPredicateResult::NotFpPredicate => {}
-                FpPredicateResult::Unsupported => {
-                    // Unrecognized FP predicate — return Unknown rather than
-                    // leaving the Tseitin variable free (false-SAT risk, #6189).
-                    self.last_unknown_reason = Some(UnknownReason::Unsupported);
-                    return Ok(SolveResult::Unknown);
-                }
-            }
-        }
-
-        // --- Phase 2b: congruence for symbols this path does not interpret ---
-        // A user-declared `f` or an array read over an FP index is only a
-        // Tseitin atom here, so without these Ackermann clauses `(= x y)`
-        // would not force `(= (f x) (f y))` and the relaxation reports a
-        // wrong `sat` (SMT-LIB 2.6 §5.2: `=` is identity and every function
-        // symbol is total). Anything the scan could not encode sets
-        // `congruence_incomplete`, which fails a later `sat` closed — `unsat`
-        // stays valid because the encoding only ever relaxes the input.
-        // Snapshot the gap flag BEFORE the congruence pre-pass so the two causes
-        // stay distinguishable — see the split check below.
-        let gap_before_congruence = fp_solver.has_encoding_gap();
-
-        let foreign = congruence::scan_foreign(&self.ctx.terms, &self.ctx.assertions);
-        let mut congruence_incomplete = if foreign.is_empty() {
-            false
-        } else {
-            let plan = congruence::plan_congruence(
-                &self.ctx.terms,
-                &mut fp_solver,
-                &tseitin_result,
-                &foreign,
-            );
-            congruence_plan_clauses = plan.clauses;
-            // `solve_fp` owns the whole formula, so a sort it cannot represent
-            // anywhere is as disqualifying as an unencodable congruence pair.
-            foreign.unencodable || plan.incomplete
-        };
-
-        // Encoding gaps: an ITE condition that could not be resolved as an FP
-        // predicate or linked via the Tseitin map. The two possible causes carry
-        // DIFFERENT consequences and must not be conflated.
-        if gap_before_congruence {
-            // The BASE encoding is holed: a condition variable is unconstrained
-            // in the formula the solver will actually see, which makes a `sat`
-            // unsound. Fail closed, as this path always has.
-            tracing::warn!("FP encoding has unresolvable ITE condition — returning Unknown");
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            self.record_unknown_diagnostic(
-                UnknownReason::Incomplete,
-                "FP base encoding left an `ite` condition unresolved (not an FP predicate and not \
-                 linkable through the Tseitin map), so a `sat` over it would be unsound",
-            );
-            return Ok(SolveResult::Unknown);
-        }
-        if fp_solver.has_encoding_gap() {
-            // The gap was introduced by the congruence pre-pass itself, which
-            // touches argument terms the base encoder never bit-blasted. That is
-            // only a failure to add congruence clauses, i.e. a RELAXATION: fewer
-            // constraints than the input, so an `unsat` on it still entails
-            // `unsat` of the input, and a `sat` is already downgraded below by
-            // `congruence_incomplete`.
-            //
-            // Returning Unknown here instead DESTROYED correct refutations that
-            // the base encoding found on its own — measured on an FP-sorted
-            // `ite` beneath an uninterpreted application, where this path went
-            // unsat (correct, and z3 agrees) to unknown purely because adding
-            // congruence tripped the check.
-            tracing::debug!(
-                "FP congruence pre-pass could not encode every pair; keeping the \
-                 relaxation and downgrading a later `sat`"
-            );
-            congruence_incomplete = true;
-        }
-
-        let fp_clauses = fp_solver.take_clauses();
-        let condition_links = fp_solver.take_pending_condition_links();
-        let fp_num_vars = fp_solver.num_vars();
-        let var_offset = tseitin_result.num_vars as i32;
-
-        // --- Phase 3: Combine Tseitin + FP clauses ---
-        let mut all_clauses = tseitin_result.clauses.clone();
-
-        // Add FP clauses with variable offset
-        for clause in fp_clauses {
-            let offset_lits: Vec<i32> = clause
-                .literals()
-                .iter()
-                .map(|&lit| offset_cnf_lit(lit, var_offset))
-                .collect();
-            all_clauses.push(CnfClause::new(offset_lits));
-        }
-
-        // Add linking clauses (bidirectional equivalence)
-        for (tseitin_lit, fp_lit) in linking_pairs {
-            let fp_lit_offset = offset_cnf_lit(fp_lit, var_offset);
-            all_clauses.push(CnfClause::binary(-tseitin_lit, fp_lit_offset));
-            all_clauses.push(CnfClause::binary(tseitin_lit, -fp_lit_offset));
-        }
-
-        // Add the congruence clauses planned above, resolving each literal's
-        // namespace now that the FP offset is known.
-        for clause in congruence_plan_clauses {
-            let lits: Vec<i32> = clause
-                .into_iter()
-                .map(|lit| match lit {
-                    congruence::PlanLit::Fp(fp_lit) => offset_cnf_lit(fp_lit, var_offset),
-                    congruence::PlanLit::Tseitin(tseitin_lit) => tseitin_lit,
-                })
-                .collect();
-            all_clauses.push(CnfClause::new(lits));
-        }
-
-        // Add ITE condition linking clauses (#3586): connect FP proxy variables
-        // allocated by encode_bool_condition to their Tseitin counterparts.
-        for (fp_var, tseitin_var) in condition_links {
-            let fp_lit_offset = offset_cnf_lit(fp_var as i32, var_offset);
-            let tseitin_lit = tseitin_var as i32;
-            all_clauses.push(CnfClause::binary(-tseitin_lit, fp_lit_offset));
-            all_clauses.push(CnfClause::binary(tseitin_lit, -fp_lit_offset));
-        }
-
-        let total_vars = tseitin_result.num_vars + fp_num_vars;
-
-        // --- Phase 4: SAT solving ---
-        let mut solver = SatSolver::new(total_vars as usize);
-        self.apply_random_seed_to_sat(&mut solver);
-        self.apply_progress_to_sat(&mut solver);
-        solver.set_congruence_enabled(false);
-        // Adaptive reorder gate for large FP instances (#8118).
-        if total_vars as usize > 50_000 {
-            solver.set_reorder_enabled(false);
-        }
-        if let Some(seed) = self.random_seed {
-            solver.set_random_seed(seed);
-        }
-
-        for clause in &all_clauses {
-            let lits: Vec<ay_sat::Literal> = clause
-                .literals()
-                .iter()
-                .map(|&lit| crate::cnf_lit_to_sat(lit))
-                .collect();
-            solver.add_clause(lits);
-        }
-        self.arm_sat_conflict_budget(&mut solver, 0);
-        let should_stop = self.make_should_stop();
-        let result = solver.solve_interruptible(should_stop).into_inner();
-
-        collect_sat_stats!(self, &solver);
-
-        // A model of an encoding that dropped structure is not a model of the
-        // input: fail the `sat` closed. `unsat` is untouched — the encoding is
-        // a relaxation, so its refutation refutes the input too.
-        if congruence_incomplete && matches!(result, SatResult::Sat(_)) {
-            tracing::warn!(
-                "FP path could not encode all uninterpreted structure — degrading sat to unknown"
-            );
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            self.record_unknown_diagnostic(
-                UnknownReason::Incomplete,
-                "FP lane found a `sat` for a RELAXATION of the input: uninterpreted structure \
-                 (a declared function, or an array read the lane could not eliminate) has \
-                 congruence clauses missing, so the model is not a model of the input. The \
-                 relaxation keeps `unsat` valid; only `sat` degrades",
-            );
-            return Ok(SolveResult::Unknown);
-        }
-
-        // Extract FP and BV models from SAT assignment before storing
-        let (fp_model, bv_model) = if let SatResult::Sat(ref sat_model) = result {
-            let term_to_fp = fp_solver.term_to_fp().clone();
-            let fp = Self::extract_fp_model_from_bits(
-                sat_model,
-                &term_to_fp,
-                var_offset,
-                &self.ctx.terms,
-            );
-            // Extract BV model from FP solver's cached BV term bits (#3586).
-            // This enables model validation for QF_BVFP formulas where BV
-            // variables participate in to_fp/to_fp_unsigned conversions.
-            let bv_term_bits = fp_solver.bv_term_bits();
-            let bv = if bv_term_bits.is_empty() {
-                None
-            } else {
-                Some(Self::extract_bv_model_from_fp_bits(
-                    sat_model,
-                    bv_term_bits,
-                    var_offset,
-                    &self.ctx.terms,
-                ))
-            };
-            (Some(fp), bv)
-        } else {
-            (None, None)
-        };
-
-        self.solve_and_store_model_full(
-            result,
-            &tseitin_result,
-            None,
-            None,
-            None,
-            None,
-            bv_model,
-            fp_model,
-            None,
-            None,
-        )
+        self.solve_fp_stateless()
     }
 
     /// Tier A `to_fp`-from-symbolic-Real probe: re-solve with pinned Real
@@ -455,6 +222,13 @@ impl Executor {
     /// variable would otherwise be reported with a default value that need not
     /// satisfy the original assertions.
     fn try_fp_pin_unsat_probe(&mut self) -> Result<Option<SolveResult>> {
+        self.try_fp_pin_unsat_probe_with(&mut |executor| executor.solve_fp())
+    }
+
+    fn try_fp_pin_unsat_probe_with(
+        &mut self,
+        solve: &mut impl FnMut(&mut Self) -> Result<SolveResult>,
+    ) -> Result<Option<SolveResult>> {
         let Some(pinned) =
             pin_reals::pin_real_assertions(&mut self.ctx.terms, &self.ctx.assertions)
         else {
@@ -464,12 +238,15 @@ impl Executor {
         // Re-enter the FP pipeline on the pinned assertions. This cannot loop:
         // after substitution the pinned `Var` TermIds no longer occur, so a
         // nested `pin_real_assertions` finds an empty pin map and returns `None`.
-        let result = self.solve_fp();
+        let result = solve(self);
         self.ctx.assertions = saved;
         match result {
             Ok(SolveResult::Unsat(core)) => {
                 self.last_unknown_reason = None;
                 Ok(Some(SolveResult::Unsat(core)))
+            }
+            Ok(SolveResult::Unknown) if self.fp_recorded_resource_stop() => {
+                Ok(Some(SolveResult::Unknown))
             }
             _ => {
                 // Do not trust SAT/unknown from the pinned formula, and never
@@ -500,11 +277,12 @@ impl Executor {
     /// the BV index guard and FP value equality to the bit-blast solver.
     pub(in crate::executor) fn solve_abvfp(&mut self) -> Result<SolveResult> {
         // Belt for R3: every route out of this function substitutes
-        // `ctx.assertions` before reaching `solve_fp` — read-over-write store
-        // expansion, constant-index read flattening, finite-array closure. The
-        // substituted TermIds are not the authored ones and the flattened set
-        // is not model-equivalent to the original, so nothing here may share
-        // the session's persistent FP encoding.
+        // `ctx.assertions` before reaching `solve_fp` — unread-array
+        // elimination, read-over-write store expansion, constant-index read
+        // flattening, finite-array closure. The substituted TermIds are not
+        // the authored ones and the flattened set is not model-equivalent to
+        // the original, so nothing here may share the session's persistent FP
+        // encoding.
         self.fp_persistent_armed = false;
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
@@ -515,6 +293,16 @@ impl Executor {
             return Ok(SolveResult::unsat());
         }
 
+        // An array that occurs once, as one side of a positive equality (an
+        // unread datatype field, after the frontend splits the datatype into
+        // field constants), is dropped before both array transforms below:
+        // either would otherwise refuse the window for that single occurrence.
+        self.solve_abvfp_eliminating_unread_arrays()
+    }
+
+    /// The array transforms and the BVFP solve of one ABVFP window.
+    fn solve_abvfp_window(&mut self) -> Result<SolveResult> {
+        let false_term = self.ctx.terms.false_term();
         // Constant-index array-read elimination (`flatten_reads`). Runs FIRST,
         // because the read-over-write expansion below is provably INERT on the
         // population this targets: with zero `store`s
@@ -526,9 +314,9 @@ impl Executor {
         // ADDITIVE BY CONSTRUCTION: on `Unknown` the original assertions are
         // restored and the untouched legacy path below runs, so this can only
         // convert an `unknown` into `sat`/`unsat`, never the reverse.
-        let flatten_note = match self.try_flatten_constant_index_reads()? {
+        let mut flatten_note = match self.try_flatten_constant_index_reads()? {
             FlattenOutcome::Decided(result) => return Ok(result),
-            FlattenOutcome::Abstained(reason) => Some(reason.detail()),
+            FlattenOutcome::Abstained(reason) => Some(reason),
             FlattenOutcome::Undecided => None,
         };
 
@@ -546,22 +334,26 @@ impl Executor {
         // would retain store/read aliases that this transform removes. Restore
         // the exact original vector because the inner FP pipeline can rewrite
         // assertion contents without changing their length.
+        let expansion_rewrote = expanded_assertions != self.ctx.assertions;
         let original_assertions = std::mem::replace(&mut self.ctx.assertions, expanded_assertions);
-        let result = self.solve_abvfp_final_array_window();
+        let result = self.solve_abvfp_expanded_window(expansion_rewrote, &mut flatten_note);
         self.ctx.assertions = original_assertions;
 
         // Abstention telemetry: attribute the `unknown` to the specific side
         // condition that stopped the read elimination, instead of letting the
         // whole population land in the "no specific reason recorded" bucket.
         // Only ever refines an `unknown`'s DETAIL — never a verdict, and never a
-        // reason more specific than `Incomplete`.
+        // reason more specific than `Incomplete`; a bit-blaster `unsupported`
+        // keeps its reason and gains a detail naming the array gap.
         if let (Some(note), Ok(SolveResult::Unknown)) = (flatten_note, &result) {
             if matches!(
                 self.last_unknown_reason,
                 None | Some(UnknownReason::Incomplete) | Some(UnknownReason::Unknown)
             ) {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                self.record_unknown_diagnostic(UnknownReason::Incomplete, note);
+                self.record_unknown_diagnostic(UnknownReason::Incomplete, note.detail());
+            } else {
+                self.name_abvfp_array_gap(note);
             }
         }
         result
@@ -610,6 +402,15 @@ impl Executor {
     /// Disable with `--dpll-no-abvfp-flatten` (default ON; the pass is additive —
     /// see `FlattenOutcome::Undecided`).
     fn try_flatten_constant_index_reads(&mut self) -> Result<FlattenOutcome> {
+        self.try_flatten_constant_index_reads_with(&mut |executor| {
+            executor.solve_abvfp_final_array_window()
+        })
+    }
+
+    fn try_flatten_constant_index_reads_with(
+        &mut self,
+        solve: &mut impl FnMut(&mut Self) -> Result<SolveResult>,
+    ) -> Result<FlattenOutcome> {
         if !flatten_reads_enabled() {
             return Ok(FlattenOutcome::Abstained(
                 flatten_reads::FlattenAbstain::NoArrays,
@@ -628,6 +429,12 @@ impl Executor {
             Ok(plan) => plan,
             Err(reason) => return Ok(FlattenOutcome::Abstained(reason)),
         };
+        let bool_uf_transport = plan.capture_bool_uf_transport(self);
+        // Capture can observe a stop whose live flag or memory pressure then
+        // clears. Its recorded refusal still owns this transform attempt.
+        if self.fp_recorded_resource_stop() || self.should_abort_theory_loop() {
+            return Ok(FlattenOutcome::Decided(SolveResult::Unknown));
+        }
         self.last_statistics
             .set_string("abvfp_flatten.status", "fired");
         self.last_statistics
@@ -637,7 +444,7 @@ impl Executor {
         // The plan is now the final, array-eliminated assertion window. Run the
         // common exact-closure boundary here so a Decided result cannot bypass
         // it, then restore the authored vector exactly on every outcome.
-        let result = self.solve_abvfp_final_array_window();
+        let result = solve(self);
         self.ctx.assertions = saved;
 
         match result {
@@ -654,16 +461,36 @@ impl Executor {
                 // the model is dropped and the verdict falls through to the
                 // legacy path rather than shipping a witness that does not pin
                 // the array.
-                if self.attach_flattened_array_model(&plan.cells) {
+                // Restoring the roots also restores UF application IDs. Carry
+                // only their exact rewritten SAT assignments back; this adds
+                // no default interpretation and bypasses no model gate.
+                if self.attach_flattened_array_model(&plan.cells)
+                    && bool_uf_transport
+                        .as_ref()
+                        .is_some_and(|transport| transport.install(self))
+                {
                     self.last_unknown_reason = None;
                     Ok(FlattenOutcome::Decided(SolveResult::Sat))
                 } else {
                     self.last_model = None;
                     self.last_model_validated = false;
-                    self.last_statistics
-                        .set_string("abvfp_flatten.status", "fired: array model incomplete");
-                    Ok(FlattenOutcome::Undecided)
+                    self.last_statistics.set_string(
+                        "abvfp_flatten.status",
+                        "fired: array or Boolean-UF model incomplete",
+                    );
+                    // Dropping the candidate can itself relieve memory
+                    // pressure; that cannot revoke an already observed stop.
+                    if self.fp_recorded_resource_stop() || self.should_abort_theory_loop() {
+                        Ok(FlattenOutcome::Decided(SolveResult::Unknown))
+                    } else {
+                        Ok(FlattenOutcome::Undecided)
+                    }
                 }
+            }
+            // A captured stop survives teardown/reset and is not permission to
+            // run another transform. Original assertions are already restored.
+            Ok(SolveResult::Unknown) if self.fp_recorded_resource_stop() => {
+                Ok(FlattenOutcome::Decided(SolveResult::Unknown))
             }
             // Finite-array exhaustion is query-cumulative. It is terminal even
             // when the flattened attempt was otherwise Unknown: the untouched
@@ -750,6 +577,10 @@ impl Executor {
         model.array_model = Some(ay_arrays::ArrayModel {
             array_values: interps,
             read_conflicted: HashSet::default(),
+            pending_definitions: HashMap::default(),
+            pending_definition_dependents: HashSet::default(),
+            store_chain_class_candidate: None,
+            definition_authoritative: HashSet::default(),
         });
         true
     }

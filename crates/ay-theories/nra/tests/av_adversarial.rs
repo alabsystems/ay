@@ -13,7 +13,7 @@ use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 use std::cmp::Ordering;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 // ===========================================================================
 // An INDEPENDENT exact model over Q. Nothing here calls into ay.
@@ -427,8 +427,10 @@ fn smt_poly(p: &[BigInt], v: &str) -> String {
     acc
 }
 
+/// z3's verdict on `script`: the MANDATORY oracle, reached by path (`ay_test_support::z3`).
 fn z3_sat(script: &str) -> Option<bool> {
-    let mut c = Command::new("z3")
+    let mut c = ay_test_support::z3::require_z3("ay-nra av_adversarial")
+        .command()
         .arg("-in")
         .arg("-T:60")
         .stdin(Stdio::piped())

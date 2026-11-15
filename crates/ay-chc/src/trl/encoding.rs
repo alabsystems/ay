@@ -104,7 +104,10 @@ impl TrlSolver {
             Some(TRL_PER_CHECK_TIMEOUT),
         );
 
-        if matches!(result, IncrementalCheckResult::Unknown) {
+        // A cancelled TRL (portfolio winner, lane budget) gets Unknown from
+        // every check: rebuilding the whole unrolling for the fallback would
+        // be wasted work after cancellation.
+        if matches!(result, IncrementalCheckResult::Unknown) && !self.config.base.is_cancelled() {
             // Build fresh BMC formula: init@0 AND steps AND query@depth
             let fresh = self.build_error_reachability_formula(depth, &query_at_depth);
             self.smt_helper.reset();

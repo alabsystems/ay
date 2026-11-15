@@ -132,6 +132,13 @@ impl IndependentModelView<'_> {
                 self.exec
                     .collect_uf_applications(assertion, &mut applications, &mut visited);
             }
+            // Mirror the printer's census root, not just its guard: an exact
+            // finite-domain expansion carries the ground applications of the
+            // authored binder it replaced.
+            for root in self.exec.finitely_expanded_ground_roots() {
+                self.exec
+                    .collect_uf_applications(root, &mut applications, &mut visited);
+            }
             let applications = applications.get(&(surface.to_string(), arg_sorts.len()))?;
             self.exec
                 .uf_table_from_ground_applications(self.model, applications)?
@@ -191,6 +198,10 @@ impl IndependentModelView<'_> {
             self.exec
                 .collect_uf_applications(assertion, &mut ground_applications, &mut visited);
         }
+        for root in self.exec.finitely_expanded_ground_roots() {
+            self.exec
+                .collect_uf_applications(root, &mut ground_applications, &mut visited);
+        }
         for (surface, info) in self.exec.ctx.symbol_iter() {
             if ground_applications.contains_key(&(surface.to_string(), info.arg_sorts.len())) {
                 identities.insert(
@@ -242,13 +253,41 @@ impl IndependentModelView<'_> {
         // application keeps today's pin-only read
         // (`test_enum_sat_lane_gate_excludes_uf_at_variable_args` pins that).
         let read_atom = |atom: &str, sort: &Sort| -> Option<ModelValue> {
-            let v = self.parse_leaf(atom, sort)?;
-            self.printed_atom_in_gate_encoding(&v, sort).then_some(v)
+            // Authenticated readings win: `parse_leaf` resolves exact-cell
+            // class values (the model's own structured values, in the same
+            // representation the gate's leaf path builds) before any
+            // syntactic re-parse. Only when it yields nothing in the gate
+            // encoding may the fallback below read the atom directly.
+            if let Some(value) = self.parse_leaf(atom, sort) {
+                if self.printed_atom_in_gate_encoding(&value, sort) {
+                    return Some(value);
+                }
+            }
+            // A printed UF body can carry a concrete constructor tree for a
+            // branching recursive datatype outside the narrower exact
+            // array-cell fragment. Parse that bounded syntax through the
+            // same schema-checked rendered-datatype reader used for datatype
+            // UF pins; opaque carriers still fail here and stay unreadable.
+            if self.datatype_guard().datatype_name(sort).is_some()
+                && !self.exec.datatype_sort_carries_array_field(sort)
+            {
+                if let Some(value) =
+                    self.exec
+                        .parse_rendered_dt_value_cached(atom, sort, self.datatype_guard())
+                {
+                    if self.printed_atom_in_gate_encoding(&value, sort) {
+                        return Some(value);
+                    }
+                }
+            }
+            None
         };
         let Some((_, else_atom)) = rows.last() else {
             // Empty table => the printer emits the canonical constant body.
-            let else_value =
-                read_atom(&format_default_value_surface(ctx, result_sort), result_sort)?;
+            let else_value = read_atom(
+                &format_default_value_surface(ctx, result_sort)?,
+                result_sort,
+            )?;
             return Some(PrintedUfInterpretation {
                 arity: arg_sorts.len(),
                 rows: Vec::new(),

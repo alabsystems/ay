@@ -84,10 +84,43 @@ pub enum ProofStep {
         /// Variables introduced in this subproof
         variables: Vec<(String, crate::sort::Sort)>,
     },
+
+    /// Exact rational SOS theorem: the conjunction of the NEGATIONS of the
+    /// ordered clause literals is inconsistent. Factors name those exact
+    /// clause positions, never a filtered polynomial list. Independently
+    /// checked by ay-proof; stock Alethe retains an honest hole. Appended to
+    /// preserve the existing variants' ordinal tags in binary serde formats.
+    NraSos {
+        /// Conclusion disjunction in the order authenticated by the witness.
+        #[serde(deserialize_with = "nra_sos::deserialize_clause")]
+        clause: Vec<TermId>,
+        /// Source-bound, bounded algebraic evidence; no solver state is trusted.
+        certificate: NraSosCertificate,
+    },
+    /// Variable-length source-ordered prime-field linear combination. The
+    /// independent checker reparses each negated clause literal. This owning
+    /// variant is appended; historical step and theory-kind tags are stable.
+    /// Decode through AY's resource-admitted retained reader, not generic
+    /// serde (which has no caller work/storage owner).
+    FiniteFieldLinear {
+        /// Source-ordered conclusion literals checked by the retained reader.
+        #[serde(deserialize_with = "require_retained_reader")]
+        clause: Vec<TermId>,
+        /// Field coefficients aligned with the selected source constraints.
+        #[serde(deserialize_with = "require_retained_reader")]
+        multipliers: Vec<u32>,
+    },
+}
+
+fn require_retained_reader<'de, D: serde::Deserializer<'de>, T>(_: D) -> Result<Vec<T>, D::Error> {
+    Err(serde::de::Error::custom(
+        "variable finite-field certificate requires the resource-admitted retained reader",
+    ))
 }
 pub use crate::alethe::{
-    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
-    CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
+    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, is_clean_dialect_alethe_rule,
+    wire_rule_name, AletheRule, CHECKABLE_ALETHE_RULES, CLEAN_DIALECT_ALETHE_RULES,
+    UNPROVED_STEP_RULE,
 };
 
 /// Proof step identifier

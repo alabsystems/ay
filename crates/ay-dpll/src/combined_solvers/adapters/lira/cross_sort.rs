@@ -161,7 +161,7 @@ impl LiraSolver<'_> {
             // floor/ceil splits creates artificial gaps (e.g., x<=2 OR x>=3)
             // that exclude valid Real values like 2.5, causing false UNSAT.
             // Matches AUFLIRA adapter behavior (auf_lira.rs:286-288).
-            if !matches!(self.terms.sort(term), ay_core::Sort::Int) {
+            if !matches!(self.terms().sort(term), ay_core::Sort::Int) {
                 continue;
             }
             // #8790: `(to_int x)` is represented in LIA's internal LRA with
@@ -406,7 +406,7 @@ impl LiraSolver<'_> {
         // flag), so `(to_real n)` no longer denotes `n` — forcing `n` integral
         // here would fabricate `unsat` for a satisfiable free-function instance.
         // Stand down in lockstep with the constructor rewrites (fail-closed).
-        if self.terms.to_real_is_shadowed() {
+        if self.terms().to_real_is_shadowed() {
             return None;
         }
         if !self.lra.to_int_terms().is_empty() {

@@ -347,6 +347,24 @@ impl ClauseArena {
         self.set_flags(offset, f);
     }
 
+    /// Whether vivification tried this clause in the current generation
+    /// (`VIVIFY_TRIED_BIT`).
+    #[inline]
+    pub(crate) fn is_vivify_tried(&self, offset: usize) -> bool {
+        self.flags(offset) & VIVIFY_TRIED_BIT != 0
+    }
+
+    #[inline]
+    pub(crate) fn set_vivify_tried(&mut self, offset: usize, tried: bool) {
+        let mut f = self.flags(offset);
+        if tried {
+            f |= VIVIFY_TRIED_BIT;
+        } else {
+            f &= !VIVIFY_TRIED_BIT;
+        }
+        self.set_flags(offset, f);
+    }
+
     /// Returns true if this clause was produced by hyper binary or ternary
     /// resolution. CaDiCaL clause.hpp:46 `bool hyper : 1`.
     #[inline]
@@ -429,7 +447,8 @@ impl ClauseArena {
     /// on consecution queries. GipSAT equivalent: `ClauseKind::Lemma`.
     #[inline]
     pub(crate) fn is_ic3_lemma(&self, offset: usize) -> bool {
-        self.flags(offset) & IC3_LEMMA_BIT != 0
+        // Word 1's high half holds a saved length once the clause is deleted.
+        self.flags(offset) & GARBAGE_BIT == 0 && self.words[offset + 1] & IC3_LEMMA_WORD1_BIT != 0
     }
 
     /// Mark or unmark a clause as an IC3 lemma.
@@ -439,13 +458,11 @@ impl ClauseArena {
     /// `reduce_db` deletion and `between_solve_reduce` aging.
     #[inline]
     pub(crate) fn set_ic3_lemma(&mut self, offset: usize, val: bool) {
-        let mut f = self.flags(offset);
         if val {
-            f |= IC3_LEMMA_BIT;
+            self.words[offset + 1] |= IC3_LEMMA_WORD1_BIT;
         } else {
-            f &= !IC3_LEMMA_BIT;
+            self.words[offset + 1] &= !IC3_LEMMA_WORD1_BIT;
         }
-        self.set_flags(offset, f);
     }
 
     /// Read the user-scope depth at which this clause was learned (0-3,
@@ -658,16 +675,7 @@ impl ClauseArena {
         // hashbrown stores entries as (K, V) tuples (with alignment padding)
         // plus 1 control byte per bucket. (u32, u16) is 8 bytes due to
         // alignment, not 6. The 56 covers the HashMap struct overhead.
-        // Under `#[cfg(kani)]` the maps are `BTreeMap` (see `kani_compat`), which
-        // has no `capacity()`; `len()` is an adequate proxy for the diagnostic-only
-        // memory accounting and keeps the graph compiling for model checking.
-        #[cfg(kani)]
-        let shrink_map_cap = self.shrink_map.len();
-        #[cfg(not(kani))]
         let shrink_map_cap = self.shrink_map.capacity();
-        #[cfg(kani)]
-        let learned_offset_index_cap = self.learned_offset_index.len();
-        #[cfg(not(kani))]
         let learned_offset_index_cap = self.learned_offset_index.capacity();
         // Phantom charge for the RETIRED signature side table. The table is
         // gone (subsumption/BVE build pass-local tables; cold readers
@@ -675,12 +683,7 @@ impl ClauseArena {
         // decides WHEN reduction fires. `phantom_signature_table_capacity`
         // reproduces the `capacity()` the DetHashMap would report after
         // `phantom_signature_entries` one-at-a-time inserts, so the trigger
-        // basis — and the search trajectory — do not move. Under `#[cfg(kani)]`
-        // the map was a BTreeMap whose `len()` stood in for capacity; the
-        // entry count reproduces that directly.
-        #[cfg(kani)]
-        let signatures_cap = self.phantom_signature_entries;
-        #[cfg(not(kani))]
+        // basis — and the search trajectory — do not move.
         let signatures_cap = phantom_signature_table_capacity(self.phantom_signature_entries);
         let shrink_map_bytes = 56 + shrink_map_cap.saturating_mul(size_of::<(u32, u16)>() + 1);
         // Signature side table (R2 header slimming): one (u32 offset, u64 sig)
@@ -709,7 +712,6 @@ impl ClauseArena {
 /// table doubles its buckets on the next insert — hence the ladder
 /// 0, 3, 7, 14, 28, 56, ... Pinned against the real container by the
 /// `phantom_signature_capacity_matches_dethashmap` barrier test.
-#[cfg(not(kani))]
 pub(crate) fn phantom_signature_table_capacity(len: usize) -> usize {
     match len {
         0 => 0,

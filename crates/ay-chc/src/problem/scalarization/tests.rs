@@ -4,6 +4,97 @@
 
 use super::*;
 
+#[test]
+fn computed_bitvector_indices_keep_width_and_enable_lambda_observation() {
+    let binary = |op, left, right| ChcExpr::Op(op, vec![Arc::new(left), Arc::new(right)]);
+    for (op, left, right, width, expected) in [
+        (ChcOp::BvAdd, 0, 0, 64, 0),
+        (ChcOp::BvAdd, 0, 1, 64, 1),
+        (ChcOp::BvAdd, u64::MAX as u128, 1, 64, 0),
+        (ChcOp::BvSub, 0, 1, 64, u64::MAX as u128),
+        (ChcOp::BvAdd, u128::MAX, 1, 128, 0),
+    ] {
+        let index = binary(
+            op,
+            ChcExpr::BitVec(left, width),
+            ChcExpr::BitVec(right, width),
+        );
+        assert_eq!(
+            ChcProblem::try_eval_const_index(&index),
+            Some(ConstIndex::BitVec(expected, width))
+        );
+    }
+    for index in [
+        binary(ChcOp::BvAdd, ChcExpr::BitVec(0, 64), ChcExpr::BitVec(1, 32)),
+        binary(
+            ChcOp::BvAdd,
+            ChcExpr::BitVec(0, 129),
+            ChcExpr::BitVec(1, 129),
+        ),
+        binary(ChcOp::BvAdd, ChcExpr::BitVec(0, 0), ChcExpr::BitVec(0, 0)),
+        binary(
+            ChcOp::BvAdd,
+            ChcExpr::Var(ChcVar::new("symbolic", ChcSort::BitVec(64))),
+            ChcExpr::BitVec(1, 64),
+        ),
+    ] {
+        assert_eq!(ChcProblem::try_eval_const_index(&index), None);
+    }
+    let mut shared = Arc::new(ChcExpr::BitVec(1, 64));
+    for _ in 0..40 {
+        shared = Arc::new(ChcExpr::Op(
+            ChcOp::BvAdd,
+            vec![Arc::clone(&shared), Arc::clone(&shared)],
+        ));
+    }
+    assert_eq!(
+        ChcProblem::try_eval_const_index(&shared),
+        Some(ConstIndex::BitVec(1 << 40, 64))
+    );
+
+    let array_sort = ChcSort::Array(Box::new(ChcSort::BitVec(64)), Box::new(ChcSort::BitVec(8)));
+    let lambda = ChcExpr::array_lambda(
+        ChcVar::new("i", ChcSort::BitVec(64)),
+        ChcExpr::BitVec(42, 8),
+    )
+    .expect("typed lambda");
+    let array = ChcExpr::Var(ChcVar::new("a", array_sort.clone()));
+    let index = binary(ChcOp::BvAdd, ChcExpr::BitVec(0, 64), ChcExpr::BitVec(1, 64));
+    let mut problem = build_problem(
+        vec![array_sort],
+        vec![
+            HornClause::new(
+                ClauseBody::constraint(ChcExpr::Bool(true)),
+                ClauseHead::Predicate(PredicateId::new(0), vec![lambda.clone()]),
+            ),
+            HornClause::new(
+                ClauseBody::new(
+                    vec![(PredicateId::new(0), vec![array.clone()])],
+                    Some(ChcExpr::and_all(vec![
+                        ChcExpr::eq(
+                            ChcExpr::Var(ChcVar::new("read", ChcSort::BitVec(8))),
+                            ChcExpr::select(lambda, index.clone()),
+                        ),
+                        ChcExpr::not(ChcExpr::eq(
+                            ChcExpr::select(array, index.clone()),
+                            ChcExpr::BitVec(42, 8),
+                        )),
+                    ])),
+                ),
+                ClauseHead::False,
+            ),
+        ],
+    );
+    assert!(problem
+        .try_scalarize_const_array_selects_allow_symbolic_keys_with_map(&[])
+        .is_some());
+    assert!(!problem.has_array_lambda());
+    assert_eq!(problem.predicates()[0].arg_sorts, vec![ChcSort::BitVec(8)]);
+
+    let _deadline = crate::smt::ScopedSmtDeadline::install(std::time::Duration::ZERO);
+    assert_eq!(ChcProblem::try_eval_const_index(&index), None);
+}
+
 fn build_problem(pred_sorts: Vec<ChcSort>, clauses: Vec<HornClause>) -> ChcProblem {
     let mut problem = ChcProblem::new();
     problem.declare_predicate("inv", pred_sorts);

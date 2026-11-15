@@ -409,23 +409,32 @@ fn test_kind_discriminator_issue_151() {
 /// This benchmark is a real mod+ITE hard-tail case. The #7371 guard skips the
 /// spurious base-case SAT, then accepts the deferred Safe only after forward
 /// induction and extended BMC validation succeed.
+///
+/// The verdict is decided by counts: KIND's step count (`max_k` = 20 base
+/// cases and induction depths) and, inside every query, the executor's
+/// default ground budget (400,000 conflicts and 24,000,000 decisions per SAT
+/// solve, ay-dpll's `DEFAULT_GROUND_*_ALLOWANCE`). KindConfig has no count of
+/// its own, so the walls are set as hang backstops far above the run. They
+/// were 2 s per query and 15 s in all, which decided the verdict: a loaded
+/// host spent them before the queries settled, and a fresh base-case
+/// confirmation that ran out of its 2 s (`kind/solve.rs`, `confirm_timeout`)
+/// or a run that ran out of its 15 s answered `Unknown`.
 #[test]
-#[cfg_attr(debug_assertions, timeout(30_000))]
-#[cfg_attr(not(debug_assertions), timeout(20_000))]
+#[timeout(300_000)]
 fn test_kind_issue_7371_const_mod_3_remains_safe() {
+    // Hang backstops only: on an idle host the run reached Safe under 2 s per
+    // query and 15 s in all. ntest's 300 s stays above the run's 240 s.
+    const QUERY_BACKSTOP: Duration = Duration::from_secs(60);
+    const RUN_BACKSTOP: Duration = Duration::from_secs(240);
     let problem = ChcParser::parse(include_str!(
         "../../../../benchmarks/chc-comp/2025/extra-small-lia/const_mod_3_000.smt2"
     ))
     .expect("parse const_mod_3 benchmark");
-    let config = KindConfig::with_engine_config(
-        20,
-        Duration::from_secs(2),
-        Duration::from_secs(15),
-        false,
-        None,
-    );
+    let config = KindConfig::with_engine_config(20, QUERY_BACKSTOP, RUN_BACKSTOP, false, None);
     let mut solver = testing::new_kind_solver(problem, config);
+    let started = std::time::Instant::now();
     let result = solver.solve();
+    let elapsed = started.elapsed();
 
     match result {
         KindResult::Safe(_) => {}
@@ -435,8 +444,22 @@ fn test_kind_issue_7371_const_mod_3_remains_safe() {
                 cex.steps.len()
             );
         }
+        // Every wall that can turn this run into Unknown is at least
+        // QUERY_BACKSTOP (the 2 s validation stages and internal pre-slices
+        // only reroute to the deferred-Safe path or to the executor), so an
+        // Unknown that arrives sooner was reached by the counts.
+        KindResult::Unknown if elapsed >= QUERY_BACKSTOP => {
+            panic!(
+                "COULD NOT RUN (#7371): KIND answered Unknown after {elapsed:?}, past its \
+                 {QUERY_BACKSTOP:?} per-query hang backstop; a backstop fired before the \
+                 counts decided, which is not a verdict about const_mod_3."
+            );
+        }
         KindResult::Unknown => {
-            panic!("KIND regression (#7371): const_mod_3 should remain Safe, got Unknown.");
+            panic!(
+                "KIND regression (#7371): const_mod_3 should remain Safe, got Unknown after \
+                 {elapsed:?}, inside every hang backstop."
+            );
         }
         KindResult::NotApplicable => {
             panic!("KIND regression (#7371): const_mod_3 is a single-predicate benchmark.");

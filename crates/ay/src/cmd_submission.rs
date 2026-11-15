@@ -29,6 +29,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
 use crate::build_info::BUILD_INFO;
+use ay_sys::child_pipe::ChildPipeWriter;
 
 use self::chc_worker::{run_chc_comp_worker, ChcCompBenchmarkCase};
 
@@ -69,9 +70,12 @@ const CHC_LATE_PREFLIGHT_SCHEMA: &str = "ay.chccomp-late-entry-preflight/v1";
 const CHC_WORKER_REPORT_SCHEMA: &str = "ay.chccomp-worker-report/v1";
 const CHC_WORKER_AUDIT_SCHEMA: &str = "ay.chccomp-worker-audit/v1";
 const CHC_WORKER_DEFAULT_REPORT_DIR: &str = "the development design notes";
-const CHC_BASELINE_COMPARE_DEFAULT_BASELINE: &str = "benchmarks/chc-extra-small-lia-baseline.json";
-const CHC_BASELINE_COMPARE_DEFAULT_AY: &str = "target/release/ay";
-const CHC_BASELINE_COMPARE_DEFAULT_OUTPUT_DIR: &str = "target/chc-baseline-compare";
+// Well-formedness check for the BenchExec benchmark definition. The CHC gates
+// already require python3 (the tooldef compile check), so parse with its
+// standard-library XML parser instead of also requiring `xmllint`, which is not
+// a declared prerequisite and is absent from stock Linux hosts (libxml2-utils).
+const CHC_BENCHEXEC_XML_PARSE: &str =
+    "import sys, xml.etree.ElementTree as ElementTree; ElementTree.parse(sys.argv[1])";
 const CHC_OFFICIAL_SOURCE_URL: &str = "https://chc-comp.github.io/";
 const CHC_NORMAL_SOLVER_BENCHMARK_DEADLINE: &str = "2026-04-25";
 const CHC_TECHNICAL_SOLVER_RESUBMISSION_DEADLINE: &str = "2026-05-02";
@@ -347,32 +351,11 @@ impl SubmissionPrepareProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-pub(crate) enum ChcBaselineCompareProfile {
-    /// Use the timeout recorded in the baseline; direct regression gate.
-    SameTimeout,
-    /// Run an explicit short timeout; warning-only proxy evidence.
-    FastProxy,
-}
-
-impl ChcBaselineCompareProfile {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SameTimeout => "same-timeout",
-            Self::FastProxy => "fast-proxy",
-        }
-    }
-}
-
 /// Submission preflight targets.
 #[derive(Subcommand)]
 pub(crate) enum PreflightTarget {
     /// Run the CHC-COMP 2026 late-entry local preflight.
     ChcLateEntry(ChcLateEntryPreflightOptions),
-    /// Compare CHC baseline evidence with timeout-safe run classification.
-    #[command(name = "chc-baseline-compare")]
-    ChcBaselineCompare(ChcBaselineCompareOptions),
     /// Run Rust-owned SAT-COMP repair diagnostics.
     #[command(name = "sat-comp-repair", subcommand)]
     SatCompRepair(satcomp_repair::SatCompRepairCommand),
@@ -803,41 +786,6 @@ pub(crate) struct ChcLateEntryPreflightOptions {
     /// Keep existing work-dir contents before running.
     #[arg(long)]
     keep_work_dir: bool,
-}
-
-#[derive(Args)]
-pub(crate) struct ChcBaselineCompareOptions {
-    /// Baseline JSON snapshot to compare against.
-    #[arg(
-        long,
-        value_name = "FILE",
-        default_value = CHC_BASELINE_COMPARE_DEFAULT_BASELINE
-    )]
-    baseline: PathBuf,
-
-    /// Benchmark directory override. Defaults to benchmarks_dir from the baseline.
-    #[arg(long, value_name = "DIR")]
-    bench_dir: Option<PathBuf>,
-
-    /// ay executable to run against the CHC baseline.
-    #[arg(long, value_name = "FILE", default_value = CHC_BASELINE_COMPARE_DEFAULT_AY)]
-    ay: PathBuf,
-
-    /// Evidence profile. same-timeout is a direct gate; fast-proxy is warning-only.
-    #[arg(long, value_enum, default_value_t = ChcBaselineCompareProfile::SameTimeout)]
-    profile: ChcBaselineCompareProfile,
-
-    /// Required for --profile fast-proxy; forbidden for same-timeout evidence.
-    #[arg(long, value_name = "SECONDS")]
-    timeout_sec: Option<u64>,
-
-    /// Directory for JSON and CSV evidence reports.
-    #[arg(
-        long,
-        value_name = "DIR",
-        default_value = CHC_BASELINE_COMPARE_DEFAULT_OUTPUT_DIR
-    )]
-    output_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -1338,7 +1286,6 @@ pub(crate) fn run(cmd: SubmissionCommand) -> Result<()> {
         },
         SubmissionCommand::Preflight(target) => match target {
             PreflightTarget::ChcLateEntry(opts) => preflight_chc_late_entry(&opts),
-            PreflightTarget::ChcBaselineCompare(opts) => compare_chc_baseline(&opts),
             PreflightTarget::SatCompRepair(cmd) => satcomp_repair::run(cmd),
             PreflightTarget::SatMatrix(cmd) => satcomp_matrix::run(cmd),
             PreflightTarget::ChcCompVerify(opts) => verify_chc_comp(&opts),
@@ -1657,8 +1604,8 @@ fn gate_chc(package: &Path, cfg: GateConfig) -> Result<()> {
         "CHC Python tooldef compiles",
     );
     gate.command(
-        Command::new("xmllint")
-            .arg("--noout")
+        Command::new("python3")
+            .args(["-c", CHC_BENCHEXEC_XML_PARSE])
             .arg(pr.join("benchmark-defs").join("ay.xml.template")),
         "CHC BenchExec XML parses",
     );
@@ -1953,138 +1900,6 @@ fn preflight_chc_late_entry(opts: &ChcLateEntryPreflightOptions) -> Result<()> {
     Ok(())
 }
 
-fn compare_chc_baseline(opts: &ChcBaselineCompareOptions) -> Result<()> {
-    let root = workspace_root();
-    if opts.profile == ChcBaselineCompareProfile::SameTimeout && opts.timeout_sec.is_some() {
-        bail!("--timeout-sec is only valid with --profile fast-proxy");
-    }
-    if opts.profile == ChcBaselineCompareProfile::FastProxy && opts.timeout_sec.is_none() {
-        bail!("--profile fast-proxy requires --timeout-sec");
-    }
-
-    let baseline = repo_relative_path(&root, &opts.baseline);
-    let ay = repo_relative_path(&root, &opts.ay);
-    let output_dir = repo_relative_path(&root, &opts.output_dir);
-    let json_path = output_dir.join("chc-baseline-compare.json");
-    let csv_path = output_dir.join("chc-baseline-compare.csv");
-    let script = root.join("scripts/chc_baseline_compare.py");
-
-    if !script.is_file() {
-        bail!(
-            "CHC baseline compare implementation missing: {}",
-            script.display()
-        );
-    }
-    if !baseline.is_file() {
-        bail!("baseline JSON not found: {}", baseline.display());
-    }
-    if !ay.is_file() {
-        bail!("ay binary not found: {}", ay.display());
-    }
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("failed to create '{}'", output_dir.display()))?;
-
-    println!(
-        "status=running evidence=chc-baseline-compare profile={} baseline={} ay={} output_dir={}",
-        opts.profile.as_str(),
-        display_path_for_report(&baseline, &root),
-        display_path_for_report(&ay, &root),
-        display_path_for_report(&output_dir, &root),
-    );
-
-    let mut command = Command::new("python3");
-    command
-        .current_dir(&root)
-        .env("PYTHONUNBUFFERED", "1")
-        .arg(&script)
-        .arg("compare")
-        .arg("--baseline")
-        .arg(&baseline)
-        .arg("--ay")
-        .arg(&ay)
-        .arg("--run-all")
-        .arg("--json-out")
-        .arg(&json_path)
-        .arg("--csv-out")
-        .arg(&csv_path);
-    if let Some(bench_dir) = &opts.bench_dir {
-        command
-            .arg("--bench-dir")
-            .arg(repo_relative_path(&root, bench_dir));
-    }
-    if let Some(timeout_sec) = opts.timeout_sec {
-        command.arg("--timeout").arg(timeout_sec.to_string());
-    }
-
-    let status = command
-        .status()
-        .context("failed to run CHC baseline compare")?;
-    let payload = if json_path.is_file() {
-        let text = fs::read_to_string(&json_path)
-            .with_context(|| format!("failed to read '{}'", json_path.display()))?;
-        serde_json::from_str::<JsonValue>(&text)
-            .with_context(|| format!("failed to parse '{}'", json_path.display()))?
-    } else {
-        json!({})
-    };
-    print_chc_baseline_compare_summary(
-        opts.profile,
-        status.success(),
-        &payload,
-        &json_path,
-        &csv_path,
-        &root,
-    );
-
-    if status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "status=fail evidence=chc-baseline-compare profile={} exit_code={}",
-            opts.profile.as_str(),
-            status.code().unwrap_or(-1)
-        )
-    }
-}
-
-fn print_chc_baseline_compare_summary(
-    profile: ChcBaselineCompareProfile,
-    success: bool,
-    payload: &JsonValue,
-    json_path: &Path,
-    csv_path: &Path,
-    root: &Path,
-) {
-    let summary = &payload["summary"];
-    let run_type = payload["run_classification"]["run_type"]
-        .as_str()
-        .unwrap_or("unavailable");
-    let timeout_relation = payload["run_classification"]["timeout_relation"]
-        .as_str()
-        .unwrap_or("unavailable");
-    let checked = summary["checked"].as_u64().unwrap_or(0);
-    let solved = summary["current_solved_checked"].as_u64().unwrap_or(0);
-    let direct_regressions = summary["direct_regressions"].as_u64().unwrap_or(0);
-    let proxy_regressions = summary["proxy_regressions"].as_u64().unwrap_or(0);
-    let wrong_answers = summary["wrong_answers"].as_u64().unwrap_or(0);
-    let invalid_answers = summary["invalid_answers"].as_u64().unwrap_or(0);
-    println!("wrote {}", display_path_for_report(json_path, root));
-    println!("wrote {}", display_path_for_report(csv_path, root));
-    println!(
-        "status={} evidence=chc-baseline-compare profile={} run_type={} timeout_relation={} current_solved={}/{} direct_regressions={} proxy_regressions={} wrong_answers={} invalid_answers={}",
-        if success { "pass" } else { "fail" },
-        profile.as_str(),
-        run_type,
-        timeout_relation,
-        solved,
-        checked,
-        direct_regressions,
-        proxy_regressions,
-        wrong_answers,
-        invalid_answers,
-    );
-}
-
 fn verify_chc_comp(opts: &ChcCompVerifyOptions) -> Result<()> {
     if opts.work_dir.exists() && !opts.keep_work_dir {
         fs::remove_dir_all(&opts.work_dir)
@@ -2236,11 +2051,11 @@ fn verify_chc_comp(opts: &ChcCompVerifyOptions) -> Result<()> {
     );
     chc_verify_command(
         &mut checks,
-        "xml:xmllint",
-        Command::new("xmllint")
-            .arg("--noout")
+        "xml:parse",
+        Command::new("python3")
+            .args(["-c", CHC_BENCHEXEC_XML_PARSE])
             .arg(pr.join("benchmark-defs").join("ay.xml.template")),
-        "xmllint parses CHC BenchExec XML",
+        "Python ElementTree parses CHC BenchExec XML",
     );
     verify_chc_xml_tracks(
         &mut checks,
@@ -4445,15 +4260,17 @@ fn zenodo_post_json(
     url: &str,
     payload: JsonValue,
 ) -> Result<JsonValue> {
-    zenodo_response_json(
-        agent
-            .post(url)
-            .set("Authorization", auth)
-            .set("Content-Type", "application/json")
-            .send_json(payload),
-        "POST",
-        url,
-    )
+    zenodo_exchange("POST", url, || {
+        zenodo_response_json(
+            agent
+                .post(url)
+                .set("Authorization", auth)
+                .set("Content-Type", "application/json")
+                .send_json(payload),
+            "POST",
+            url,
+        )
+    })
 }
 
 #[cfg(feature = "submission-live")]
@@ -4463,37 +4280,60 @@ fn zenodo_put_json(
     url: &str,
     payload: JsonValue,
 ) -> Result<JsonValue> {
-    zenodo_response_json(
-        agent
-            .put(url)
-            .set("Authorization", auth)
-            .set("Content-Type", "application/json")
-            .send_json(payload),
-        "PUT",
-        url,
-    )
+    zenodo_exchange("PUT", url, || {
+        zenodo_response_json(
+            agent
+                .put(url)
+                .set("Authorization", auth)
+                .set("Content-Type", "application/json")
+                .send_json(payload),
+            "PUT",
+            url,
+        )
+    })
 }
 
 #[cfg(feature = "submission-live")]
 fn zenodo_put_bytes(agent: &ureq::Agent, auth: &str, url: &str, bytes: &[u8]) -> Result<JsonValue> {
-    zenodo_response_json(
-        agent
-            .put(url)
-            .set("Authorization", auth)
-            .set("Content-Type", "application/octet-stream")
-            .send_bytes(bytes),
-        "PUT",
-        url,
-    )
+    zenodo_exchange("PUT", url, || {
+        zenodo_response_json(
+            agent
+                .put(url)
+                .set("Authorization", auth)
+                .set("Content-Type", "application/octet-stream")
+                .send_bytes(bytes),
+            "PUT",
+            url,
+        )
+    })
 }
 
 #[cfg(feature = "submission-live")]
 fn zenodo_post_no_body(agent: &ureq::Agent, auth: &str, url: &str) -> Result<JsonValue> {
-    zenodo_response_json(
-        agent.post(url).set("Authorization", auth).call(),
-        "POST",
-        url,
-    )
+    zenodo_exchange("POST", url, || {
+        zenodo_response_json(
+            agent.post(url).set("Authorization", auth).call(),
+            "POST",
+            url,
+        )
+    })
+}
+
+/// Run one Zenodo exchange, the request and the reading of its answer, with
+/// SIGPIPE held off this thread (`ay_sys::child_pipe::with_sigpipe_held`).
+/// `ureq`'s rustls layer writes TLS records with `write_vectored`, which std
+/// sends on Linux as a plain `writev`; under `unix_hardened`'s SIGPIPE
+/// disposition a server that resets the connection would kill `ay` instead of
+/// failing this request. Reading stays inside the scope, because rustls may
+/// write (an alert, a key update) while it reads.
+#[cfg(feature = "submission-live")]
+fn zenodo_exchange<T>(what: &str, url: &str, exchange: impl FnOnce() -> Result<T>) -> Result<T> {
+    ay_sys::child_pipe::with_sigpipe_held(exchange).with_context(|| {
+        format!(
+            "Zenodo {what} {}: could not hold SIGPIPE for the request",
+            redact_submit_url(url)
+        )
+    })?
 }
 
 #[cfg(feature = "submission-live")]
@@ -4520,6 +4360,17 @@ fn zenodo_response_json(
 
 #[cfg(feature = "submission-live")]
 fn verify_zenodo_download(
+    agent: &ureq::Agent,
+    archive_url: &str,
+    expected_sha256: &str,
+) -> Result<()> {
+    zenodo_exchange("download", archive_url, || {
+        verify_zenodo_download_held(agent, archive_url, expected_sha256)
+    })
+}
+
+#[cfg(feature = "submission-live")]
+fn verify_zenodo_download_held(
     agent: &ureq::Agent,
     archive_url: &str,
     expected_sha256: &str,
@@ -4847,6 +4698,9 @@ fn redact_submit_url(url: &str) -> String {
 
 #[cfg(test)]
 mod submit_tests;
+
+#[cfg(test)]
+mod sat_memory_pin_tests;
 
 fn chc_verify_file(
     checks: &mut Vec<serde_json::Value>,
@@ -6617,10 +6471,6 @@ fn write_chc_late_entry_markdown(
         String::new(),
         "```sh".to_string(),
         "ay submission preflight chc-late-entry".to_string(),
-        format!(
-            "# compatibility wrapper: python3 {}",
-            display_path_for_report(&workspace_root().join("scripts/chccomp_late_entry_preflight.py"), root)
-        ),
         "```".to_string(),
         String::new(),
     ]);
@@ -6763,6 +6613,28 @@ fn absolute_path_for_report(path: &Path) -> String {
         .to_string()
 }
 
+/// The SAT Competition 2026 memory limit per solver run, in bytes: "32GB"
+/// read conservatively as decimal. The runner [`generate_sat`] writes passes it
+/// as `--memory-ceiling-bytes` (a ceiling, not an override: ay takes 90 % of
+/// the smallest of it and any cgroup or rlimit bound) and sets `GOVERN_AY_MB`
+/// to it rounded up to MiB, like the generated submission runner does. Locked
+/// by a unit test to `competition/sat26_memory_limit.sh` and to the SAT
+/// profile matrix's `main_track_contract.memory_limit_gb`.
+const SAT_COMP_2026_MEMORY_LIMIT_BYTES: u64 = 32_000_000_000;
+
+/// Placeholder in the [`generate_sat`] run.sh template for
+/// [`SAT_COMP_2026_MEMORY_LIMIT_BYTES`].
+const SAT_COMP_MEMORY_LIMIT_PLACEHOLDER: &str = "@SAT26_MEMORY_LIMIT_BYTES@";
+
+/// Placeholders in the [`generate_sat`] run.sh template for the variables the
+/// runner scrubs: govern markers (so ay re-arms) and inherited peer counts.
+const GOVERN_MARKER_PLACEHOLDERS: [(&str, &str); 4] = [
+    ("@GOVERN_ARMED_ENV@", ay_sys::govern::ARMED_ENV),
+    ("@GOVERN_ROOT_PID_ENV@", ay_sys::govern::ROOT_PID_ENV),
+    ("@CONCURRENCY_ENV@", ay_sys::CONCURRENCY_ENV),
+    ("@TEST_HARNESS_ENV@", ay_sys::TEST_HARNESS_ENV),
+];
+
 fn generate_sat(output: &Path) -> Result<()> {
     let build_sh = r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -6794,6 +6666,13 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCHMARK="$1"
 PROOF_DIR="$2"
 PROOF_FILE="$PROOF_DIR/proof.out"
+# SAT-COMP 2026 memory limit (bytes, 32 GB read as decimal): a ceiling, so ay
+# takes 90 percent of the smallest of it and any visible cgroup or rlimit.
+# GOVERN_AY_MB is the kernel-held budget ay arms on macOS, the limit rounded
+# up to MiB. The solve runs in a forked child, which holds the ceiling; the
+# peer-count variables are scrubbed so nothing inherited splits it.
+SAT26_MEMORY_LIMIT_BYTES=@SAT26_MEMORY_LIMIT_BYTES@
+SAT26_GOVERN_AY_MB=$(( (SAT26_MEMORY_LIMIT_BYTES + 1048575) / 1048576 ))
 
 mkdir -p "$PROOF_DIR"
 
@@ -6828,7 +6707,7 @@ if [ -z "$TIMEOUT_MS" ]; then
   fi
 fi
 
-SOLVER_ARGS=(--sat-variant default --proof-format drat --proof "$PROOF_FILE")
+SOLVER_ARGS=(--sat-variant default --memory-ceiling-bytes "$SAT26_MEMORY_LIMIT_BYTES" --proof-format drat --proof "$PROOF_FILE")
 if is_uint "${TIMEOUT_MS:-}" && [ "$TIMEOUT_MS" -gt 0 ]; then
   SOLVER_ARGS+=(--timeout "$TIMEOUT_MS")
 fi
@@ -6841,14 +6720,25 @@ if [[ "${AY_SATCOMP_MATRIX:-}" == "1" \
   && -f "$FMLA_AUTHORITY_REPLAY" \
   && "$FMLA_CURRENT_PROOF_OUT" == "$PROOF_FILE" ]]; then
   exec env -u AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE \
+    -u @GOVERN_ARMED_ENV@ -u @GOVERN_ROOT_PID_ENV@ -u @CONCURRENCY_ENV@ -u NEXTEST -u NEXTEST_EXECUTION_MODE -u @TEST_HARNESS_ENV@ \
+    GOVERN_AY_MB="$SAT26_GOVERN_AY_MB" \
     "$DIR/ay" "${SOLVER_ARGS[@]}"
 fi
 
 exec env -u AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE \
   -u AY_SAT_FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY \
   -u AY_SAT_FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT \
+  -u @GOVERN_ARMED_ENV@ -u @GOVERN_ROOT_PID_ENV@ -u @CONCURRENCY_ENV@ -u NEXTEST -u NEXTEST_EXECUTION_MODE -u @TEST_HARNESS_ENV@ \
+  GOVERN_AY_MB="$SAT26_GOVERN_AY_MB" \
   "$DIR/ay" "${SOLVER_ARGS[@]}"
 "#;
+    let run_sh = GOVERN_MARKER_PLACEHOLDERS.iter().fold(
+        run_sh.replace(
+            SAT_COMP_MEMORY_LIMIT_PLACEHOLDER,
+            &SAT_COMP_2026_MEMORY_LIMIT_BYTES.to_string(),
+        ),
+        |text, (placeholder, name)| text.replace(placeholder, name),
+    );
 
     let readme = format!(
         r#"# ay SAT-COMP 2026 Skeleton
@@ -6891,7 +6781,7 @@ Fill these before uploading the final documentation:
 "#;
 
     write_text(&output.join("build.sh"), build_sh, true)?;
-    write_text(&output.join("run.sh"), run_sh, true)?;
+    write_text(&output.join("run.sh"), &run_sh, true)?;
     write_text(&output.join("README.md"), &readme, false)?;
     write_text(&output.join("system-description-notes.md"), notes, false)?;
     println!("generated SAT-COMP skeleton at {}", output.display());
@@ -8718,23 +8608,11 @@ fn smt_archive_smoke(root: &Path, json_path: &Path) -> Result<()> {
 
     smt_incremental_interactive_smoke(root, &incr)?;
 
-    let mut child = Command::new(root.join(&incr))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn SMT incremental wrapper")?;
-    child
-        .stdin
-        .as_mut()
-        .context("failed to open SMT incremental stdin")?
-        .write_all(
-            b"(set-logic QF_UF)\n(set-option :print-success false)\n(declare-const a Bool)\n(push 1)\n(assert a)\n(check-sat)\n(pop 1)\n(check-sat)\n(exit)\n",
-        )
-        .context("failed to write SMT incremental input")?;
-    let output = child
-        .wait_with_output()
-        .context("failed waiting for SMT incremental wrapper")?;
+    let output = run_with_stdin_script(
+        &root.join(&incr),
+        b"(set-logic QF_UF)\n(set-option :print-success false)\n(declare-const a Bool)\n(push 1)\n(assert a)\n(check-sat)\n(pop 1)\n(check-sat)\n(exit)\n",
+        "SMT incremental wrapper",
+    )?;
     let incremental_stdout = String::from_utf8_lossy(&output.stdout);
     let verdicts: Vec<&str> = incremental_stdout
         .lines()
@@ -8755,6 +8633,36 @@ fn smt_archive_smoke(root: &Path, json_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run `program` with `script` on its stdin, then EOF, and capture its output.
+///
+/// A program that exits before reading the script fails the smoke, never the
+/// gate: `ay` runs with SIGPIPE at its default (terminate) disposition, so the
+/// script goes through `ChildPipeWriter`, which reports the dead reader as
+/// `EPIPE`. Every path reaps the child.
+fn run_with_stdin_script(
+    program: &Path,
+    script: &[u8],
+    what: &str,
+) -> Result<std::process::Output> {
+    let mut child = Command::new(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {what}"))?;
+    // The writer drops (EOF) as soon as the script is written.
+    let written =
+        ChildPipeWriter::take_from(&mut child).and_then(|mut stdin| stdin.write_all(script));
+    if let Err(error) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).with_context(|| format!("failed to write {what} input"));
+    }
+    child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for {what}"))
+}
+
 fn smt_incremental_interactive_smoke(root: &Path, command: &str) -> Result<()> {
     let mut child = Command::new(root.join(command))
         .stdin(Stdio::piped())
@@ -8762,14 +8670,23 @@ fn smt_incremental_interactive_smoke(root: &Path, command: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn SMT incremental interactive wrapper")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("failed to open SMT incremental interactive stdin")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to open SMT incremental interactive stdout")?;
+    // A wrapper that exits before reading its commands fails this smoke; it
+    // must not kill the gate, which runs with SIGPIPE at its default
+    // disposition. Every early return kills and reaps the wrapper.
+    let mut stdin = match ChildPipeWriter::take_from(&mut child) {
+        Ok(stdin) => stdin,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to open SMT incremental interactive stdin");
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("failed to open SMT incremental interactive stdout");
+    };
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -8777,27 +8694,52 @@ fn smt_incremental_interactive_smoke(root: &Path, command: &str) -> Result<()> {
         let result = reader.read_line(&mut line).map(|_| line);
         let _ = tx.send(result);
     });
-    stdin
+    let written = stdin
         .write_all(
             b"(set-logic QF_UF)\n(set-option :print-success false)\n(declare-const a Bool)\n(assert a)\n(check-sat)\n",
         )
-        .context("failed to write first SMT incremental command")?;
-    stdin
-        .flush()
-        .context("failed to flush SMT incremental stdin")?;
-    let line = rx
+        .context("failed to write first SMT incremental command")
+        .and_then(|()| {
+            stdin
+                .flush()
+                .context("failed to flush SMT incremental stdin")
+        });
+    if let Err(error) = written {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let line = match rx
         .recv_timeout(Duration::from_secs(3))
-        .context("SMT incremental wrapper did not answer before EOF")?
-        .context("failed to read SMT incremental stdout")?;
-    // End the interactive session by closing stdin BEFORE waiting. The wrapper
-    // runs `ay` as a child (not exec), so killing the wrapper alone orphans a
-    // solver that (a) never exits — its REPL is waiting on the stdin write end
-    // this function still held — and (b) keeps the shared stderr pipe open,
-    // deadlocking `wait_with_output`'s drain (task #22: every `gate smt` run
-    // hung here, success or not). EOF ends the solver, which closes stderr and
-    // lets the wait finish; the kill stays as a belt for a wedged wrapper.
+        .context("SMT incremental wrapper did not answer before EOF")
+        .and_then(|read| read.context("failed to read SMT incremental stdout"))
+    {
+        Ok(line) => line,
+        Err(error) => {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    // End the session the way a client does: close stdin, then let EOF finish
+    // it. The wrapper execs `ay`, whose supervising parent runs the solver as a
+    // child sharing our stderr pipe. Holding stdin kept that REPL alive and the
+    // pipe open, deadlocking `wait_with_output`'s drain (task #22: every `gate
+    // smt` run hung here). Killing straight after the close raced EOF instead:
+    // since ae33123fe the solver takes its parent-death shutdown when its
+    // supervisor is SIGKILLed, and after a published verdict that shutdown
+    // prints `c timeout after the verdict was published; verdict stands` to the
+    // stderr this smoke requires empty, so a correct package failed whenever
+    // the host was loaded. The kill stays as a belt for a wrapper ignoring EOF.
     drop(stdin);
-    let _ = child.kill();
+    if !matches!(
+        wait_timeout::ChildExt::wait_timeout(&mut child, Duration::from_secs(10)),
+        Ok(Some(_))
+    ) {
+        let _ = child.kill();
+    }
     let output = child
         .wait_with_output()
         .context("failed waiting for SMT incremental interactive wrapper")?;

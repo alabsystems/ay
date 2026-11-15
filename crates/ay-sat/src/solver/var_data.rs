@@ -219,6 +219,29 @@ impl VarData {
             self.flags &= !Self::FLAG_LAZY_THEORY_REASON;
         }
     }
+
+    /// Whether this variable's reason is the arena clause `cref`.
+    ///
+    /// A lazy theory reason stores a `lazy_theory_reasons` table index in
+    /// `reason`, and table indices start at 0 just like arena offsets. A raw
+    /// `reason == cref.0` comparison therefore matches a lazy-reason variable
+    /// whose table index happens to equal `cref`. Every "is this clause the
+    /// reason of that variable" test must go through this method.
+    #[inline(always)]
+    pub(crate) fn has_clause_reason(self, cref: crate::watched::ClauseRef) -> bool {
+        self.reason == cref.0 && !self.is_lazy_theory_reason()
+    }
+
+    /// Forget this variable's reason: it is now justified as a decision.
+    ///
+    /// Clears the lazy theory reason flag together with the reason field.
+    /// Leaving the flag set over `NO_REASON` makes the next lazy
+    /// materialization walk read `NO_REASON` (`u32::MAX`) as a table index.
+    #[inline(always)]
+    pub(crate) fn clear_reason(&mut self) {
+        self.reason = NO_REASON;
+        self.flags &= !Self::FLAG_LAZY_THEORY_REASON;
+    }
 }
 
 // Compile-time assertion: VarData must be exactly 16 bytes.

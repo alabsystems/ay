@@ -33,5 +33,10 @@ nix.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+# Files outside `src/` that this crate's shipped code embeds (`include_str!`):
+# inputs of every build-provenance stamp built from it (build_support/provenance_scope.rs).
+[package.metadata.ay-provenance]
+inputs = ["../../scripts/_oom_guard.py"]
+
 [lints]
 workspace = true

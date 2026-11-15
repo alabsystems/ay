@@ -24,8 +24,15 @@ impl Solver {
     /// assigned at decision levels 1, 2, ..., n. When a conflict occurs that
     /// requires backtracking past all assumptions (to level 0), the assumptions
     /// involved in the conflict analysis form the unsat core.
+    ///
+    /// With an attached proof output, a conditional UNSAT answer does not
+    /// terminate the persistent formula's DRAT/LRAT stream or carry an
+    /// unconditional proof certificate. The stream is only a base-proof
+    /// prefix; checking a complete assumption-query proof requires an artifact
+    /// explicitly bound to that query's assumptions.
     pub fn solve_with_assumptions(&mut self, assumptions: &[Literal]) -> SolverAssumeResult {
-        SolverAssumeResult::from_solver_result(self.solve_with_assumptions_raw(assumptions))
+        let result = self.solve_with_assumptions_raw(assumptions);
+        SolverAssumeResult::from_solver_result(self.finish_counted_assume(result))
     }
 
     /// Internal assumption solve returning raw `AssumeResult`.
@@ -87,7 +94,9 @@ impl Solver {
     /// The callback is checked periodically (every ~100 conflicts). If it returns
     /// `true`, solving is interrupted and `AssumeResult::Unknown` is returned.
     ///
-    /// This is useful for timeout enforcement and parallel solving.
+    /// This is useful for timeout enforcement and parallel solving. The same
+    /// callback is checked again after original proof/model/trace/constraint
+    /// cleanup, and its first observed refusal stays sticky for this attempt.
     pub fn solve_with_assumptions_interruptible<F>(
         &mut self,
         assumptions: &[Literal],
@@ -96,9 +105,42 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
-        SolverAssumeResult::from_solver_result(
-            self.solve_with_assumptions_interruptible_raw(assumptions, should_stop),
-        )
+        // One borrowed caller callback spans the original raw algorithm and
+        // its mandatory proof/model/trace/constraint cleanup. An observed stop
+        // is sticky for this attempt, not a renewed owner or solver field.
+        let stopped = std::cell::Cell::new(false);
+        let stop = || {
+            let requested = stopped.get() || should_stop();
+            stopped.set(requested);
+            requested
+        };
+        let result = self.solve_with_assumptions_interruptible_raw(assumptions, &stop);
+        let final_result = if matches!(result, AssumeResult::Unknown) {
+            // Keep an actual writer/chain/authority failure's exact priority.
+            // A later callback must not reclassify an already refused result.
+            result
+        } else {
+            // Raw trace/constraint cleanup already ran. Do not append a
+            // second terminal decision-trace event or reset those states again.
+            match self.optional_solve_stop_reason(Some(&stop)) {
+                Some(reason) => {
+                    // Raw recording already completed, but cannot represent
+                    // this rejected public result. Detach before invalidating
+                    // only the writer's original inode; never guess its path.
+                    if let Some(writer) = self.cold.decision_trace.take() {
+                        if let Err(error) = writer.invalidate_exact_owned() {
+                            self.cold.last_unknown_detail = Some(format!(
+                                "decision trace invalidation after caller refusal failed: {error}",
+                            ));
+                        }
+                    }
+                    self.declare_assume_unknown_with_reason(reason)
+                }
+                None => result,
+            }
+        };
+        drop(should_stop);
+        SolverAssumeResult::from_solver_result(self.finish_counted_assume(final_result))
     }
 
     /// Internal interruptible assumption solve returning raw `AssumeResult`.
@@ -244,12 +286,27 @@ impl Solver {
                 self.stats.ext_incremental_reset_hits += 1;
             }
             self.reset_search_state_incremental();
+            if self.original_ledger_replay_failed() {
+                return self.declare_assume_unknown_with_reason(
+                    SatUnknownReason::ProofFinalizationFailure,
+                );
+            }
+            // Attaching the clauses added since the last solve can refute the
+            // clause database; no search runs on a refuted database.
+            if self.has_empty_clause {
+                return self.declare_unsat_assume(vec![]);
+            }
         } else {
             self.stats.assumption_cache_misses += 1;
             if inc_engine_lane {
                 self.stats.ext_full_reset_hits += 1;
             }
             self.reset_search_state();
+            if self.original_ledger_replay_failed() {
+                return self.declare_assume_unknown_with_reason(
+                    SatUnknownReason::ProofFinalizationFailure,
+                );
+            }
         }
         // Record the assumption-prefix depth after reset so conflict analysis
         // can classify assumption-level conflicts.
@@ -417,11 +474,10 @@ impl Solver {
         // This prevents running inprocessing on every solve call (which would be
         // overhead for short solves) while ensuring simplification happens for
         // long-running incremental sessions.
-        if self.cold.has_been_incremental
-            && self.inprocessing_gates_pass()
-            && self.run_incremental_inprocessing()
-        {
-            return self.declare_unsat_assume(vec![]);
+        if self.cold.has_been_incremental && self.inprocessing_gates_pass() {
+            if let Some(result) = self.run_incremental_inprocessing_round_until(should_stop) {
+                return result;
+            }
         }
 
         // Run initial preprocessing (subsumption, probing, decompose, congruence, HTR).
@@ -553,6 +609,9 @@ impl Solver {
         // time-based deadline fail-closed regardless of which branch dominates.
         let mut loop_iters: u64 = 0;
         loop {
+            if let Some(reason) = self.counted_step_stop_reason() {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
             // Parity with solve_no_assumptions in solve/mod.rs:322 —
             // honor external interrupt handle and process memory limit (#6552).
             if let Some(reason) = self.active_interrupt_reason() {
@@ -598,9 +657,24 @@ impl Solver {
             let assume_pending_conflict = self.take_live_pending_theory_conflict();
 
             // Propagate — search-specialized BCP (no probe/vivify overhead).
-            if let Some(conflict_ref) = assume_pending_conflict.or_else(|| self.search_propagate())
-            {
-                // Conflict found
+            let propagation = match assume_pending_conflict {
+                Some(conflict) => Some(conflict),
+                None => match self.search_propagate_counted() {
+                    Ok(conflict) => conflict,
+                    Err(reason) => return self.declare_assume_unknown_with_reason(reason),
+                },
+            };
+            if let Some(conflict_ref) = propagation {
+                // Conflict found. One wholly below the current level (a
+                // theory conflict among root or outer-level facts; the session
+                // profile runs without chrono) is analysed at its own level.
+                if let Some(level) =
+                    self.backtrack_to_lower_conflict_level(conflict_ref, eager_ext.as_deref_mut())
+                {
+                    if (level as usize) < assumptions.len() {
+                        assumption_idx = level as usize;
+                    }
+                }
                 if self.decision_level == 0 {
                     self.record_level0_conflict_chain(conflict_ref);
                     return self.declare_unsat_assume(failed_assumptions);
@@ -635,11 +709,14 @@ impl Solver {
                 let num_assumptions = (assump_idx_at_level.len().saturating_sub(1)) as u32;
                 // #8423: Track backtrack level for eager extension callback.
                 let mut ext_bt_level: Option<u32> = None;
-                let has_eager_ext = eager_ext.is_some();
+                // #8467: the extension's lazy reasons become clauses before
+                // 1UIP (current level) and before each SAT backtrack (the
+                // levels it keeps, in the hook), as in the theory-backend loop.
+                self.materialize_lazy_reasons_for_assumption_analysis(eager_ext.as_deref_mut());
                 self.analyze_and_backtrack_with_core_hook(
                     conflict_ref,
                     "assumption loop",
-                    |_solver, bt_level| {
+                    |solver, bt_level| {
                         // CONSERVATIVE rewind, deliberately unchanged from HEAD.
                         // Rewinding via the level->index map would set a HIGHER
                         // index and thereby SKIP assumptions that the backtrack
@@ -650,7 +727,11 @@ impl Solver {
                         if (bt_level as usize) < assumptions.len() {
                             assumption_idx = bt_level as usize;
                         }
-                        if has_eager_ext {
+                        if let Some(ref mut ext) = eager_ext {
+                            solver.materialize_lazy_reasons_through_level_for_backtrack(
+                                &mut **ext, bt_level,
+                            );
+                            solver.cold.lazy_materialization_failed = false;
                             ext_bt_level = Some(bt_level);
                         }
                     },
@@ -688,9 +769,21 @@ impl Solver {
                         for &lit in learned_clause {
                             let var_idx = lit.variable().index();
                             let var_level = solver.var_data[var_idx].level;
+                            // #horn-smt-session: `is_assumption` / `assumption_lit`
+                            // are sized to `num_vars` at solve entry, but an eager
+                            // extension may MINT variables mid-solve through
+                            // `add_theory_lemma` (`ensure_num_vars`). A minted
+                            // literal re-propagated inside the assumption prefix
+                            // after a backjump and kept by 1UIP in a learned
+                            // clause indexes past both arrays (observed:
+                            // `tests/extension_tests.rs` t3). It is never an
+                            // assumption, so out of range reads as `false`;
+                            // `assumption_lit` is reached only under this guard,
+                            // `is_failed` is guarded above, and the core walk
+                            // (`minimize_unsat_core`) already guards.
                             if var_level > 0
                                 && var_level <= num_assumptions
-                                && is_assumption[var_idx]
+                                && is_assumption.get(var_idx).copied().unwrap_or(false)
                             {
                                 if let Some(assump_lit) = assumption_lit[var_idx] {
                                     if !is_failed[var_idx] {
@@ -703,11 +796,9 @@ impl Solver {
                     },
                 );
                 // #8423: Notify eager extension of backtrack after conflict
-                // analysis completes. Called outside the closure to avoid
-                // borrow conflicts with eager_ext.
+                // analysis completes (the hook above materialized the lazy
+                // reasons that survive it).
                 if let (Some(ref mut ext), Some(bt_level)) = (&mut eager_ext, ext_bt_level) {
-                    self.materialize_lazy_reasons_through_level_for_backtrack(&mut **ext, bt_level);
-                    self.cold.lazy_materialization_failed = false;
                     ext.backtrack(bt_level);
                 }
             } else {
@@ -852,15 +943,21 @@ impl Solver {
                     // we call propagate() once per iteration rather than looping
                     // to a fixpoint, since the outer CDCL loop already re-enters.
                     if ext.can_propagate(self) {
-                        let result = ext.propagate(self);
+                        if let Some(reason) = self.counted_step_stop_reason() {
+                            return self.declare_assume_unknown_with_reason(reason);
+                        }
+                        let mut result = ext.propagate(self);
 
                         // Process VSIDS bumps for theory-conflict-driven variables.
                         if !result.bump_vars.is_empty() {
                             self.bump_theory_vars(&result.bump_vars);
                         }
+                        // G3 then G1 (see `solve/extension_effects.rs`).
+                        let has_definitions = !result.definitions.is_empty();
+                        self.apply_extension_growth_and_definitions(&mut result);
                         if let Some(conflict) = result.conflict {
                             for clause in result.clauses {
-                                self.add_theory_lemma(clause);
+                                self.add_extension_clause(clause, result.clause_origin);
                             }
                             if conflict.is_empty() {
                                 return self.declare_unsat_assume(failed_assumptions);
@@ -868,12 +965,10 @@ impl Solver {
                             self.add_theory_lemma(conflict);
                             continue;
                         }
-                        let has_work = !result.clauses.is_empty()
-                            || !result.propagations.is_empty()
-                            || !result.lazy_propagations.is_empty();
+                        let has_work = has_definitions || result.has_work();
 
                         for clause in result.clauses {
-                            self.add_theory_lemma(clause);
+                            self.add_extension_clause(clause, result.clause_origin);
                         }
                         for (clause, propagated) in result.propagations {
                             self.add_theory_propagation(clause, propagated);
@@ -901,6 +996,9 @@ impl Solver {
                     // full scans — same values, fewer atom-index lookups.
                     ext.seed_phase_hints_dual(&mut self.phase, &mut self.target_phase, &self.vals);
                 } else if let Some(ref mut tc) = theory_check {
+                    if let Some(reason) = self.counted_step_stop_reason() {
+                        return self.declare_assume_unknown_with_reason(reason);
+                    }
                     match tc(self) {
                         TheoryPropResult::Continue => {}
                         TheoryPropResult::Propagate => {
@@ -1000,6 +1098,14 @@ impl Solver {
                     } else {
                         self.pick_phase(var)
                     };
+                    // G4: the extension sees the heuristic's pick.
+                    let lit = match eager_ext.as_deref_mut() {
+                        Some(ext) => {
+                            let alternative = ext.on_decide(self, lit);
+                            self.extension_decision(lit, alternative)
+                        }
+                        None => lit,
+                    };
                     self.decide(lit);
 
                     // Keep interrupt semantics consistent with solve_no_assumptions:
@@ -1034,6 +1140,9 @@ impl Solver {
                     // All variables assigned — check eager extension before
                     // declaring SAT (#8423).
                     if let Some(ref mut ext) = eager_ext {
+                        if let Some(reason) = self.counted_step_stop_reason() {
+                            return self.declare_assume_unknown_with_reason(reason);
+                        }
                         match ext.check(self) {
                             ExtCheckResult::Sat => {}
                             ExtCheckResult::Conflict(clause) => {
@@ -1050,6 +1159,22 @@ impl Solver {
                             }
                             ExtCheckResult::AddClauses(clauses) => {
                                 for clause in clauses {
+                                    self.add_theory_lemma(clause);
+                                }
+                                if self.has_empty_clause {
+                                    return self.declare_unsat_assume(failed_assumptions);
+                                }
+                                continue;
+                            }
+                            ExtCheckResult::Continue(cont) => {
+                                // G2 (current level); a falsified lemma is
+                                // queued as a pending conflict by
+                                // add_theory_lemma and taken at the loop top.
+                                self.grow_for_extension_vars(cont.num_vars);
+                                for clause in cont.definitions {
+                                    self.add_theory_definition(clause);
+                                }
+                                for clause in cont.lemmas {
                                     self.add_theory_lemma(clause);
                                 }
                                 if self.has_empty_clause {
@@ -1227,10 +1352,10 @@ impl Solver {
                     // branch; fall back rather than under-approximate.
                     incomplete = true;
                     // Lazy theory reasons should have been pre-materialized
-                    // before conflict analysis. If we reach here during
-                    // assumption core extraction, treat as decision (no expansion).
-                    // Assumption-based solving does not use lazy propagations
-                    // in practice (#8467).
+                    // before conflict analysis (the assumption loop does so
+                    // for the current level and for every level a backtrack
+                    // keeps, #8467). If we reach here during assumption core
+                    // extraction, treat as decision (no expansion).
                 }
             }
         }

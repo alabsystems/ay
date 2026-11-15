@@ -5,7 +5,8 @@
 //! Bounded owned-integer operations for the independent BV/LIA interpreter.
 
 use num_bigint::BigInt;
-use num_traits::{One, Signed, ToPrimitive};
+use num_integer::Integer;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use super::{
     bv_mask, BvLiaUnsatAuthenticationError, QueryChecker, MAX_INTEGER_BITS, MAX_LIVE_INTEGER_LIMBS,
@@ -142,6 +143,38 @@ impl QueryChecker<'_> {
         let result = value.abs();
         self.ensure_integer_magnitude(&result)?;
         Ok(result)
+    }
+
+    /// SMT-LIB Ints division: the remainder is nonnegative for either sign
+    /// of nonzero divisor (https://smt-lib.org/theories-Ints.shtml).
+    /// Zero is under-specified, so it cannot yield a value in this checker.
+    pub(super) fn divide_bounded_ints(
+        &mut self,
+        dividend: &BigInt,
+        divisor: &BigInt,
+    ) -> Result<BigInt, BvLiaUnsatAuthenticationError> {
+        self.ensure_integer_magnitude(dividend)?;
+        self.ensure_integer_magnitude(divisor)?;
+        if divisor.is_zero() {
+            return Err(BvLiaUnsatAuthenticationError::UnsupportedFragment {
+                reason: "integer division by zero is under-specified".to_string(),
+            });
+        }
+        let work = integer_limb_units(dividend)
+            .checked_mul(integer_limb_units(divisor))
+            .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer division accounting",
+            })?;
+        self.meter.charge(work.max(1))?;
+        let (quotient, remainder) = dividend.div_rem(divisor);
+        let quotient = if remainder.is_negative() {
+            let correction = BigInt::from(if divisor.is_negative() { 1 } else { -1 });
+            self.add_bounded_ints(&quotient, &correction)?
+        } else {
+            quotient
+        };
+        self.ensure_integer_magnitude(&quotient)?;
+        Ok(quotient)
     }
 
     pub(super) fn modulo_bounded_ints(

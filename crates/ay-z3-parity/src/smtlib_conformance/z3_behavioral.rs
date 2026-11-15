@@ -1,18 +1,17 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Exact, executable Z3 5.1.0 CLI transcript differential.
+//! Exact, executable Z3 5.3.3 CLI transcript differential.
 //!
 //! This validator intentionally records mismatches.  The catalog is closed in
 //! code and a receipt cannot pass by dropping a case, changing its comparator,
 //! accepting an interrupted child, or substituting a different oracle.  AY and
-//! Z3 run sequentially under the same single-job `_oom_guard.py` plan.
+//! Z3 run sequentially under the same native single-job resource plan.
 
 mod declaration_builtins;
 mod parser_tokens;
 
 use super::*;
-use ay_frontend::SUPPORTED_TACTIC_NAMES;
 use std::io::{BufRead as _, BufReader};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,45 +19,25 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
-pub(super) const VALIDATOR_ID: &str = "builtin.z3-behavioral-transcripts-5.1.0.v1";
+pub(super) const VALIDATOR_ID: &str = "builtin.z3-behavioral-transcripts-5.3.3.v1";
 
-const DIMENSION_ID: &str = "overlay.z3-5.1.0";
-const REQUIREMENT_ID: &str = "overlay.z3-5.1.0.behavioral-transcripts";
+const DIMENSION_ID: &str = "overlay.z3-5.3.3";
+const REQUIREMENT_ID: &str = "overlay.z3-5.3.3.behavioral-transcripts";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const FILE_PLACEHOLDER: &str = "{INPUT_FILE}";
 const STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_LIMIT: usize = 1024 * 1024;
 const ARTIFACT_FILE_LIMIT: usize = 256;
 const ARTIFACT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
-const TACTIC_COUNT: usize = 118;
-#[cfg(test)]
-const Z3_5_HELP_FIXTURE_SHA256: &str =
-    "26765e7d789867158b226672f183d9a28a1ce65d07a4ed46465b275a33f48e5b";
-#[cfg(test)]
-const Z3_5_HELP_SIMPLIFIER_FIXTURE_SHA256: &str =
-    "b274b48cbd8722b061f8d69e0af7ff0e8734d06287c3e8a712369d66911c9c92";
-#[cfg(test)]
-const Z3_5_HELP_TACTIC_FIXTURE_SHA256: &str =
-    "10b8bedc54c73b8943fae20aaee07b1117940cd38b86edba2183110facb29ca6";
-const BASE_CASE_COUNT: usize = 338;
-const EXPECTED_SOURCE_OWNER_COUNT: usize = z3_source_inventory::EXPECTED_OBSERVABLE_ITEMS;
-const EXPECTED_CASE_COUNT: usize = BASE_CASE_COUNT + EXPECTED_SOURCE_OWNER_COUNT;
-const EXPECTED_UNRESOLVED_COMMAND_OWNERS: usize = 57;
-#[cfg(test)]
-const EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERS: usize = 63;
-const EXPECTED_UNRESOLVED_SOURCE_OWNERS: usize = 301;
-const EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS: usize = 496;
-const EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS: usize = 0;
-const EXPECTED_OWNERSHIP_SHA256: &str =
-    "03c1110cf963723ebb37c64c292bb0435f1fc86487818a286a5799bb03121fac";
-const EXPECTED_AUDITED_GAP_UNIVERSE_OWNERSHIP_SHA256: &str =
-    "a11767c6a15546d1739add25a4e10ce5487269e58db88f8969e0a20c8c2c31d4";
-#[cfg(test)]
-const EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERSHIP_SHA256: &str =
-    "80fa62d97c35766652f1841ae4dfe541aade80cdf2052ff754a7ace81c7f0260";
-const EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERSHIP_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS: [(&str, &str); EXPECTED_UNRESOLVED_COMMAND_OWNERS] = [
+const ARTIFACT_DEPTH_LIMIT: usize = 32;
+const TRANSCRIPT_STORAGE_POLICY: &str = "normalized-transcript-commitments/v1";
+const TRANSCRIPT_PREVIEW_BYTES: usize = 64;
+// Fixed authored transcripts are supplemented by every tactic and probe in
+// the authenticated current reference catalog, never the AY registry.
+const BASE_FIXED_CASE_COUNT: usize = 178;
+// These known partial commands remain gaps even when an old narrow happy-path
+// witness exists. Newly discovered commands without a witness also fail closed.
+const KNOWN_PARTIAL_COMMAND_OWNERS: [(&str, &str); 57] = [
     ("smt-command", "apply"),
     ("smt-command", "assert-soft"),
     ("smt-command", "assume"),
@@ -117,6 +96,7 @@ const EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS: [(&str, &str); EXPECTED_UNRESOLVED
     ("smt-command", "set-simplifier"),
     ("smt-command", "simplify"),
 ];
+#[cfg(test)]
 const RESOLVED_EXTENSION_COMMANDS: [&str; 6] = [
     "assert-not",
     "dbg-params",
@@ -125,6 +105,7 @@ const RESOLVED_EXTENSION_COMMANDS: [&str; 6] = [
     "help-simplifier",
     "help-tactic",
 ];
+#[cfg(test)]
 const RESOLVED_INFO_KEYS: [&str; 11] = [
     ":?",
     ":all-statistics",
@@ -156,65 +137,6 @@ const RESOLVED_OPTION_KEYS: [&str; 16] = [
     ":random-seed",
     ":verbosity",
 ];
-const RESOLVED_LOGIC_RECOGNIZER_LITERALS: [&str; 24] = [
-    "A", "ALL", "BV", "DT", "FP", "FS", "HORN", "HO_ALL", "IDL", "LIA", "LIRA", "LRA", "NIA",
-    "NIRA", "NRA", "QF_A", "QF_BVRE", "QF_FD", "QF_S", "QF_SLIA", "QF_SNIA", "RDL", "SMTFD", "UF",
-];
-const UNRESOLVED_SOURCE_CATEGORIES: [&str; 5] = [
-    "declaration-builtin",
-    "logic-strategy-alias",
-    "smt-info-key",
-    "smt-option-key",
-    "smt-parser-token",
-];
-const EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNER_KEYS: [(&str, &str);
-    EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS] = [];
-
-const PROBE_NAMES: [&str; 42] = [
-    "ackr-bound-probe",
-    "arith-avg-bw",
-    "arith-avg-deg",
-    "arith-max-bw",
-    "arith-max-deg",
-    "depth",
-    "has-patterns",
-    "has-quantifiers",
-    "is-ilp",
-    "is-lia",
-    "is-lira",
-    "is-lra",
-    "is-nia",
-    "is-nira",
-    "is-nra",
-    "is-pb",
-    "is-propositional",
-    "is-qfaufbv",
-    "is-qfauflia",
-    "is-qfbv",
-    "is-qfbv-eq",
-    "is-qffp",
-    "is-qffpbv",
-    "is-qffplra",
-    "is-qflia",
-    "is-qflira",
-    "is-qflra",
-    "is-qfnia",
-    "is-qfnra",
-    "is-qfufnra",
-    "is-quasi-pb",
-    "is-unbounded",
-    "memory",
-    "num-arith-consts",
-    "num-bool-consts",
-    "num-bv-consts",
-    "num-consts",
-    "num-exprs",
-    "produce-model",
-    "produce-proofs",
-    "produce-unsat-cores",
-    "size",
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Comparator {
     /// Compare exit status and both byte streams without transformation.
@@ -231,7 +153,7 @@ impl Comparator {
     const fn id(self) -> &'static str {
         match self {
             Self::ExactBytes => "exact-exit-stdout-stderr-bytes/v1",
-            Self::Statistics => "stats-shape-with-only-numeric-values-elided/v1",
+            Self::Statistics => "stats-shape-with-only-numeric-values-elided/v2",
             Self::ComponentTrace => "component-trace-with-numeric-telemetry-elided/v1",
         }
     }
@@ -271,12 +193,14 @@ impl SourceOwner {
     }
 
     fn display(&self) -> String {
-        format!("{}\t{}", self.category, self.name)
+        // The canonical hash encoding above deliberately contains delimiters.
+        // Receipt prose must instead be lossless, escaped, single-line text.
+        format!("{:?}", (&self.category, &self.name))
     }
 }
 
 fn source_proven_no_effect_reason(_owner: &SourceOwner) -> Option<&'static str> {
-    // No Z3 5.1.0 CLI owner currently receives no-effect credit. A future
+    // No Z3 5.3.3 CLI owner currently receives no-effect credit. A future
     // claim must first retain every relevant source blob and add executable
     // occurrence and call-site predicates to the source snapshot validator.
     None
@@ -288,6 +212,9 @@ enum EffectRequirement {
     Inherent,
     /// The authenticated Z3 candidate must observably differ from a baseline.
     OracleDiffersFromBaseline,
+    /// A valid OPB file is accepted only when the explicit parser flag is
+    /// selected; the same file under SMT-LIB has its exact parse rejection.
+    OracleAcceptsParserRejectedInput,
     /// The exact pinned source proves that this advertised CLI parameter has
     /// no reachable advertised effect. Candidate and baseline must execute
     /// cleanly and agree exactly, and AY must agree with that no-effect result.
@@ -302,6 +229,7 @@ impl EffectRequirement {
         match self {
             Self::Inherent => "inherent-semantic-execution/v1",
             Self::OracleDiffersFromBaseline => "oracle-differs-from-baseline/v1",
+            Self::OracleAcceptsParserRejectedInput => "oracle-accepts-parser-rejected-input/v1",
             Self::SourceProvenNoEffect => "source-proven-no-cli-effect/v1",
             Self::Unresolved => "explicit-unresolved-no-safe-witness/v1",
         }
@@ -332,6 +260,14 @@ struct CaseSpec {
 
 impl CaseSpec {
     fn source_effect_reason(&self) -> &'static str {
+        if self.effect_requirement == EffectRequirement::Unresolved
+            && self.source_owner.as_ref().is_some_and(|owner| {
+                (owner.category == "module-parameter" && owner.name == "parallel.enable")
+                    || (owner.category == "parameter-module" && owner.name == "parallel")
+            })
+        {
+            return "no stable causal parallel-execution witness; non-unique model selection is not an effect";
+        }
         if self.effect_requirement != EffectRequirement::SourceProvenNoEffect {
             return "none";
         }
@@ -343,7 +279,7 @@ impl CaseSpec {
 
     fn descriptor(&self) -> String {
         format!(
-            "id={};style={:?};file-extension={:?};artifact-policy={};oracle-args={:?};subject-args={:?};stdin-sha256={};comparator={};source-owner={:?};effect={};source-effect-reason={};baseline={:?}",
+            "id={};style={:?};file-extension={:?};artifact-policy={};file-limit={ARTIFACT_BYTE_LIMIT};artifact-entry-limit={ARTIFACT_FILE_LIMIT};artifact-depth-limit={ARTIFACT_DEPTH_LIMIT};transcript-storage={TRANSCRIPT_STORAGE_POLICY};preview-bytes={TRANSCRIPT_PREVIEW_BYTES};oracle-args={:?};subject-args={:?};stdin-sha256={};comparator={};source-owner={:?};effect={};source-effect-reason={};baseline={:?}",
             self.id,
             self.style,
             self.file_extension,
@@ -365,7 +301,7 @@ impl CaseSpec {
 
     fn expected(&self) -> String {
         format!(
-            "source-owner={};effect={};artifact-policy={};source-effect-reason={};pinned Z3 5.1.0 and manifest-bound AY agree under {}; oracle-args={:?}; subject-args={:?}; stdin-sha256={}; both guarded, complete, untruncated, UTF-8",
+            "source-owner={};effect={};artifact-policy={};file-limit={ARTIFACT_BYTE_LIMIT};artifact-entry-limit={ARTIFACT_FILE_LIMIT};artifact-depth-limit={ARTIFACT_DEPTH_LIMIT};transcript-storage={TRANSCRIPT_STORAGE_POLICY};preview-bytes={TRANSCRIPT_PREVIEW_BYTES};source-effect-reason={};pinned Z3 5.3.3 and manifest-bound AY agree under {}; oracle-args={:?}; subject-args={:?}; stdin-sha256={}; full normalized hashes with bounded previews, re-executed at audit; both providers guarded, complete, untruncated, UTF-8; file inputs remain byte-identical",
             self.source_owner
                 .as_ref()
                 .map_or_else(|| "none".to_string(), SourceOwner::display),
@@ -424,6 +360,10 @@ struct StreamDriverReport {
 }
 
 pub(super) fn run(args: &[String]) -> Result<i32, String> {
+    if args == ["--help"] || args == ["-h"] {
+        println!("Usage: ay-z3-parity smtlib-conformance z3-behavioral <manifest> --source-snapshot <file> --receipt <file> [--ay <file>] [--z3 <file>] [--timeout <seconds>]\nExecutes the pinned Z3 5.3.3 observable catalog against AY, retaining unresolved owners as failures.");
+        return Ok(0);
+    }
     let mut manifest: Option<PathBuf> = None;
     let mut receipt_path: Option<PathBuf> = None;
     let mut snapshot_path: Option<PathBuf> = None;
@@ -508,9 +448,12 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         .as_ref()
         .ok_or("z3-behavioral requires subject.ay_executable")?;
     let ay = ay_override.unwrap_or_else(|| artifact_path(&loaded.base, &subject.path));
-    let z3 = z3_override.unwrap_or_else(|| {
-        PathBuf::from(&loaded.contract.profile.z3_overlay.reference_executable.path)
-    });
+    let z3 = match z3_override {
+        Some(path) => path,
+        None => {
+            reference_artifact_path(&loaded.contract.profile.z3_overlay.reference_executable.path)?
+        }
+    };
     let loaded_source =
         z3_source_inventory::load_snapshot_for_run(&loaded.contract, &loaded.base, &snapshot_path)?;
     let output_relative = future_relative_output(&loaded.base, &receipt_path)?;
@@ -562,6 +505,11 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         case_results: execution.case_results,
     };
     let bytes = pretty_json(&receipt)?;
+    if bytes.len() as u64 > MAX_VALIDATOR_RECEIPT_BYTES {
+        return Err(format!(
+            "behavioral receipt exceeds its fixed {MAX_VALIDATOR_RECEIPT_BYTES}-byte bound"
+        ));
+    }
     atomic_write_new(&receipt_path, &bytes)?;
     let receipt_sha = sha256_bytes(&bytes);
     println!(
@@ -622,7 +570,9 @@ pub(super) fn validate_and_replay(
         context.manifest_dir,
         &context.contract.profile,
     )?;
-    validate_receipt_rows(receipt)?;
+    let observable_items = z3_source_inventory::authenticated_observable_catalog(&source_snapshot)?;
+    let catalog = case_catalog(&observable_items)?;
+    validate_receipt_rows(receipt, &catalog)?;
     if context.mode.replays_registered_validators() {
         let envelope = receipt
             .resource_envelope
@@ -641,378 +591,200 @@ pub(super) fn validate_and_replay(
         let live = execute(
             context.contract,
             &artifact_path(context.manifest_dir, &subject.path),
-            Path::new(
+            &reference_artifact_path(
                 &context
                     .contract
                     .profile
                     .z3_overlay
                     .reference_executable
                     .path,
-            ),
+            )?,
             &source_snapshot,
             parsed.timeout,
             Some(envelope),
         )?;
-        if receipt.result != live.result
-            || receipt.cases != live.cases
-            || receipt.case_results != live.case_results
-        {
-            return Err(format!(
-                "{VALIDATOR_ID} receipt does not match a fresh authenticated differential replay"
-            ));
-        }
+        require_execution_match(receipt.result, &receipt.cases, &receipt.case_results, &live)?;
     }
     Ok(())
 }
 
-fn validate_receipt_rows(receipt: &ValidatorReceipt) -> Result<(), String> {
-    if receipt.case_results.len() != EXPECTED_CASE_COUNT {
+fn require_execution_match(
+    result: ValidatorResult,
+    counts: &CaseCounts,
+    rows: &[ValidatorCase],
+    live: &Execution,
+) -> Result<(), String> {
+    if result != live.result || counts != &live.cases || rows != live.case_results.as_slice() {
         return Err(format!(
-            "{VALIDATOR_ID} requires exactly {EXPECTED_CASE_COUNT} detailed cases, got {}",
-            receipt.case_results.len()
+            "{VALIDATOR_ID} receipt does not match a fresh authenticated differential replay: {}",
+            replay_difference(result, counts, rows, live)
         ));
     }
-    if !receipt
-        .case_results
-        .windows(2)
-        .all(|pair| pair[0].id < pair[1].id)
-    {
+    Ok(())
+}
+
+fn replay_preview(value: &str) -> String {
+    let mut prefix = String::new();
+    for ch in value.chars() {
+        let escaped = ch.escape_debug().to_string();
+        if prefix.len().saturating_add(escaped.len()) > 160 {
+            break;
+        }
+        prefix.push_str(&escaped);
+    }
+    format!("{prefix:?}")
+}
+
+fn first_changed_piece(recorded: &str, replayed: &str, delimiter: char) -> String {
+    let mut left = recorded.split(delimiter);
+    let mut right = replayed.split(delimiter);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return "none".to_string(),
+            (Some(a), Some(b)) if a == b => continue,
+            (a, b) => {
+                return format!(
+                    "recorded={};replayed={}",
+                    a.map_or_else(|| "<missing>".to_string(), replay_preview),
+                    b.map_or_else(|| "<missing>".to_string(), replay_preview)
+                )
+            }
+        }
+    }
+}
+
+fn replay_difference(
+    result: ValidatorResult,
+    counts: &CaseCounts,
+    rows: &[ValidatorCase],
+    live: &Execution,
+) -> String {
+    let mut message = format!(
+        "result={result:?}/{:?};counts={counts:?}/{:?};rows={}/{}",
+        live.result,
+        live.cases,
+        rows.len(),
+        live.case_results.len()
+    );
+    let shared = rows.len().min(live.case_results.len());
+    if let Some(index) = (0..shared).find(|index| rows[*index] != live.case_results[*index]) {
+        let before = &rows[index];
+        let after = &live.case_results[index];
+        let fields = [
+            ("id", before.id != after.id),
+            ("input_sha256", before.input_sha256 != after.input_sha256),
+            ("expected", before.expected != after.expected),
+            ("observed", before.observed != after.observed),
+            ("stdout", before.stdout != after.stdout),
+            ("stderr", before.stderr != after.stderr),
+            ("exit_code", before.exit_code != after.exit_code),
+            ("process", before.process != after.process),
+            ("outcome", before.outcome != after.outcome),
+        ]
+        .into_iter()
+        .filter_map(|(field, changed)| changed.then_some(field))
+        .collect::<Vec<_>>();
+        message.push_str(&format!(
+            ";first-row={index};recorded-id={};replayed-id={};fields={fields:?}",
+            replay_preview(&before.id),
+            replay_preview(&after.id)
+        ));
+        if before.observed != after.observed {
+            message.push_str(&format!(
+                ";observed-entry: {}",
+                first_changed_piece(&before.observed, &after.observed, ';')
+            ));
+        }
+        for (field, before, after) in [
+            ("stdout-record", &before.stdout, &after.stdout),
+            ("stderr-record", &before.stderr, &after.stderr),
+        ] {
+            if before != after {
+                message.push_str(&format!(
+                    ";{field}: {}",
+                    first_changed_piece(
+                        before.as_deref().unwrap_or("<missing>"),
+                        after.as_deref().unwrap_or("<missing>"),
+                        '\n'
+                    )
+                ));
+            }
+        }
+        if before.exit_code != after.exit_code
+            || before.process != after.process
+            || before.outcome != after.outcome
+        {
+            message.push_str(&format!(
+                ";execution={:?}/{:?}/{:?} -> {:?}/{:?}/{:?}",
+                before.exit_code,
+                before.process,
+                before.outcome,
+                after.exit_code,
+                after.process,
+                after.outcome
+            ));
+        }
+    } else if rows.len() != live.case_results.len() {
+        message.push_str(&format!(
+            ";first-row={shared};recorded-id={};replayed-id={};fields=[row-presence]",
+            rows.get(shared)
+                .map_or_else(|| "<missing>".to_string(), |row| replay_preview(&row.id)),
+            live.case_results
+                .get(shared)
+                .map_or_else(|| "<missing>".to_string(), |row| replay_preview(&row.id))
+        ));
+    } else {
+        message.push_str(";row-content=identical");
+    }
+    const LIMIT: usize = 4096;
+    if message.len() > LIMIT {
+        let mut end = LIMIT - " [diagnostic capped]".len();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str(" [diagnostic capped]");
+    }
+    message
+}
+
+fn validate_receipt_rows(receipt: &ValidatorReceipt, catalog: &[CaseSpec]) -> Result<(), String> {
+    validate_case_rows(&receipt.case_results, catalog)
+}
+
+fn validate_case_rows(rows: &[ValidatorCase], catalog: &[CaseSpec]) -> Result<(), String> {
+    if rows.len() != catalog.len() {
         return Err(format!(
-            "{VALIDATOR_ID} detailed cases are not exact and sorted"
+            "{VALIDATOR_ID} requires exactly {} detailed cases, got {}",
+            catalog.len(),
+            rows.len()
         ));
     }
-    let mut owners = Vec::new();
-    let mut unresolved_owners = Vec::new();
-    let mut logic_recognizer_owners = Vec::new();
-    let mut resolved_extension_command_owners = Vec::new();
-    let mut resolved_declaration_builtin_owners = Vec::new();
-    let mut resolved_info_key_owners = Vec::new();
-    let mut resolved_option_key_owners = Vec::new();
-    let mut resolved_parser_token_owners = Vec::new();
-    let mut source_proven_no_effect_owners = Vec::new();
-    for row in &receipt.case_results {
-        if row.process.is_none()
+    // The catalog is regenerated from the authenticated current source and
+    // frozen reference discovery transcripts. Comparing the complete expected
+    // descriptor binds every owner, input, comparator, baseline, artifact
+    // policy, and unresolved decision; owner counts alone cannot do that.
+    for (row, spec) in rows.iter().zip(catalog) {
+        if row.id != spec.id
+            || row.input_sha256 != spec.input_sha256()
+            || row.expected != spec.expected()
+            || row.process.is_none()
             || row.stdout.is_none()
             || row.stderr.is_none()
-            || row.input_sha256.len() != 64
-            || !row
-                .input_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(format!(
-                "{VALIDATOR_ID} case identity, transcript, or process binding drift at {}",
+                "{VALIDATOR_ID} case identity, witness, transcript, or process binding drift at {}",
                 row.id
             ));
         }
-        let (owner, effect_and_rest) = row
-            .expected
-            .strip_prefix("source-owner=")
-            .and_then(|rest| rest.split_once(";effect="))
-            .ok_or_else(|| {
-                format!(
-                    "{VALIDATOR_ID} case has no ownership declaration: {}",
-                    row.id
-                )
-            })?;
-        let (effect, artifact_and_rest) = effect_and_rest
-            .split_once(";artifact-policy=")
-            .ok_or_else(|| {
-                format!(
-                    "{VALIDATOR_ID} case has no effect or artifact declaration: {}",
-                    row.id
-                )
-            })?;
-        let (artifact_policy, reason_and_rest) = artifact_and_rest
-            .split_once(";source-effect-reason=")
-            .ok_or_else(|| {
-                format!(
-                    "{VALIDATOR_ID} case has no artifact or source-effect declaration: {}",
-                    row.id
-                )
-            })?;
-        let (source_effect_reason, _) =
-            reason_and_rest
-                .split_once(";pinned Z3 5.1.0")
-                .ok_or_else(|| {
-                    format!(
-                        "{VALIDATOR_ID} case has no bounded source-effect reason: {}",
-                        row.id
-                    )
-                })?;
-        if ![
-            EffectRequirement::Inherent.id(),
-            EffectRequirement::OracleDiffersFromBaseline.id(),
-            EffectRequirement::SourceProvenNoEffect.id(),
-            EffectRequirement::Unresolved.id(),
-        ]
-        .contains(&effect)
-        {
-            return Err(format!(
-                "{VALIDATOR_ID} case has a foreign effect declaration: {}",
-                row.id
-            ));
-        }
-        if ![
-            ArtifactPolicy::None.id(),
-            ArtifactPolicy::IsolatedDirectory.id(),
-        ]
-        .contains(&artifact_policy)
-        {
-            return Err(format!(
-                "{VALIDATOR_ID} case has a foreign artifact policy: {}",
-                row.id
-            ));
-        }
-        if owner != "none" {
-            let (category, name) = owner
-                .split_once('\t')
-                .ok_or_else(|| format!("{VALIDATOR_ID} malformed source owner at {}", row.id))?;
-            let owner = SourceOwner {
-                category: category.to_string(),
-                name: name.to_string(),
-            };
-            if row.id != owned_case_id(&owner) {
-                return Err(format!(
-                    "{VALIDATOR_ID} source owner and case identity drift at {}",
-                    row.id
-                ));
-            }
-            if effect == EffectRequirement::Unresolved.id() {
-                unresolved_owners.push(owner.clone());
-            }
-            if owner.category == "logic-recognizer-literal" {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} logic-recognizer owner lacks a distinguishing witness at {}",
-                        row.id
-                    ));
-                }
-                logic_recognizer_owners.push(owner.clone());
-            }
-            if owner.category == "smt-command"
-                && RESOLVED_EXTENSION_COMMANDS.contains(&owner.name.as_str())
-            {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} resolved extension command lacks a distinguishing witness at {}",
-                        row.id
-                    ));
-                }
-                resolved_extension_command_owners.push(owner.clone());
-            }
-            if owner.category == "declaration-builtin"
-                && declaration_builtins::semantic_predicate(&owner.name).is_some()
-            {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} resolved declaration builtin lacks a semantic witness at {}",
-                        row.id
-                    ));
-                }
-                resolved_declaration_builtin_owners.push(owner.clone());
-            }
-            if owner.category == "smt-info-key" && RESOLVED_INFO_KEYS.contains(&owner.name.as_str())
-            {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} resolved info key lacks a distinguishing witness at {}",
-                        row.id
-                    ));
-                }
-                resolved_info_key_owners.push(owner.clone());
-            }
-            if owner.category == "smt-option-key"
-                && RESOLVED_OPTION_KEYS.contains(&owner.name.as_str())
-            {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} resolved option key lacks a distinguishing witness at {}",
-                        row.id
-                    ));
-                }
-                resolved_option_key_owners.push(owner.clone());
-            }
-            if owner.category == "smt-parser-token"
-                && parser_tokens::semantic_witness(&owner.name).is_some()
-            {
-                if effect != EffectRequirement::OracleDiffersFromBaseline.id() {
-                    return Err(format!(
-                        "{VALIDATOR_ID} resolved parser token lacks a semantic witness at {}",
-                        row.id
-                    ));
-                }
-                resolved_parser_token_owners.push(owner.clone());
-            }
-            let expected_source_effect_reason =
-                if effect == EffectRequirement::SourceProvenNoEffect.id() {
-                    source_proven_no_effect_reason(&owner).ok_or_else(|| {
-                        format!(
-                            "{VALIDATOR_ID} case has no exact source-proven no-effect anchor: {}",
-                            row.id
-                        )
-                    })?
-                } else {
-                    "none"
-                };
-            if source_effect_reason != expected_source_effect_reason {
-                return Err(format!(
-                    "{VALIDATOR_ID} source-effect reason drift at {}",
-                    row.id
-                ));
-            }
-            if effect == EffectRequirement::SourceProvenNoEffect.id() {
-                source_proven_no_effect_owners.push(owner.clone());
-            }
-            owners.push(owner);
-        } else if source_effect_reason != "none" {
-            return Err(format!(
-                "{VALIDATOR_ID} unowned case has a source-effect reason at {}",
-                row.id
-            ));
-        }
-        if effect == EffectRequirement::Unresolved.id() && row.outcome == ValidatorCaseOutcome::Pass
+        if spec.effect_requirement == EffectRequirement::Unresolved
+            && row.outcome == ValidatorCaseOutcome::Pass
         {
             return Err(format!(
                 "{VALIDATOR_ID} unresolved behavioral owner fabricated PASS at {}",
                 row.id
             ));
         }
-    }
-    owners.sort();
-    if owners.len() != EXPECTED_SOURCE_OWNER_COUNT
-        || owners.windows(2).any(|pair| pair[0] == pair[1])
-        || sha256_bytes(
-            owners
-                .iter()
-                .map(SourceOwner::canonical_line)
-                .collect::<Vec<_>>()
-                .concat()
-                .as_bytes(),
-        ) != EXPECTED_OWNERSHIP_SHA256
-    {
-        return Err(format!(
-            "{VALIDATOR_ID} does not bind every authenticated source item to exactly one behavioral owner"
-        ));
-    }
-    unresolved_owners.sort();
-    if unresolved_owners.len() != EXPECTED_UNRESOLVED_SOURCE_OWNERS {
-        return Err(format!(
-            "{VALIDATOR_ID} explicit unresolved source-owner inventory drift"
-        ));
-    }
-    logic_recognizer_owners.sort();
-    let expected_logic_recognizer_owners = RESOLVED_LOGIC_RECOGNIZER_LITERALS
-        .iter()
-        .map(|name| SourceOwner {
-            category: "logic-recognizer-literal".to_string(),
-            name: (*name).to_string(),
-        })
-        .collect::<Vec<_>>();
-    if logic_recognizer_owners != expected_logic_recognizer_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved logic-recognizer owner inventory drift"
-        ));
-    }
-    resolved_extension_command_owners.sort();
-    let expected_resolved_extension_command_owners = RESOLVED_EXTENSION_COMMANDS
-        .iter()
-        .map(|name| SourceOwner {
-            category: "smt-command".to_string(),
-            name: (*name).to_string(),
-        })
-        .collect::<Vec<_>>();
-    if resolved_extension_command_owners != expected_resolved_extension_command_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved extension-command owner inventory drift"
-        ));
-    }
-    resolved_declaration_builtin_owners.sort();
-    let expected_resolved_declaration_builtin_owners = declaration_builtins::semantic_owner_names()
-        .map(|name| SourceOwner {
-            category: "declaration-builtin".to_string(),
-            name: name.to_string(),
-        })
-        .collect::<Vec<_>>();
-    if resolved_declaration_builtin_owners != expected_resolved_declaration_builtin_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved declaration-builtin owner inventory drift"
-        ));
-    }
-    resolved_info_key_owners.sort();
-    let expected_resolved_info_key_owners = RESOLVED_INFO_KEYS
-        .iter()
-        .map(|name| SourceOwner {
-            category: "smt-info-key".to_string(),
-            name: (*name).to_string(),
-        })
-        .collect::<Vec<_>>();
-    if resolved_info_key_owners != expected_resolved_info_key_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved info-key owner inventory drift"
-        ));
-    }
-    resolved_option_key_owners.sort();
-    let expected_resolved_option_key_owners = RESOLVED_OPTION_KEYS
-        .iter()
-        .map(|name| SourceOwner {
-            category: "smt-option-key".to_string(),
-            name: (*name).to_string(),
-        })
-        .collect::<Vec<_>>();
-    if resolved_option_key_owners != expected_resolved_option_key_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved option-key owner inventory drift"
-        ));
-    }
-    resolved_parser_token_owners.sort();
-    let expected_resolved_parser_token_owners = parser_tokens::semantic_owner_names()
-        .map(|name| SourceOwner {
-            category: "smt-parser-token".to_string(),
-            name: name.to_string(),
-        })
-        .collect::<Vec<_>>();
-    if resolved_parser_token_owners != expected_resolved_parser_token_owners {
-        return Err(format!(
-            "{VALIDATOR_ID} resolved parser-token owner inventory drift"
-        ));
-    }
-    let mut audited_gap_universe_owners = unresolved_owners;
-    audited_gap_universe_owners.extend(logic_recognizer_owners);
-    audited_gap_universe_owners.extend(resolved_extension_command_owners);
-    audited_gap_universe_owners.extend(resolved_declaration_builtin_owners);
-    audited_gap_universe_owners.extend(resolved_info_key_owners);
-    audited_gap_universe_owners.extend(resolved_option_key_owners);
-    audited_gap_universe_owners.extend(resolved_parser_token_owners);
-    audited_gap_universe_owners.sort();
-    if audited_gap_universe_owners.len() != EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS
-        || sha256_bytes(
-            audited_gap_universe_owners
-                .iter()
-                .map(SourceOwner::canonical_line)
-                .collect::<Vec<_>>()
-                .concat()
-                .as_bytes(),
-        ) != EXPECTED_AUDITED_GAP_UNIVERSE_OWNERSHIP_SHA256
-    {
-        return Err(format!(
-            "{VALIDATOR_ID} authenticated audited-gap universe drift"
-        ));
-    }
-    source_proven_no_effect_owners.sort();
-    if source_proven_no_effect_owners.len() != EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS
-        || sha256_bytes(
-            source_proven_no_effect_owners
-                .iter()
-                .map(SourceOwner::canonical_line)
-                .collect::<Vec<_>>()
-                .concat()
-                .as_bytes(),
-        ) != EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERSHIP_SHA256
-    {
-        return Err(format!(
-            "{VALIDATOR_ID} source-proven no-effect owner inventory drift"
-        ));
     }
     Ok(())
 }
@@ -1036,7 +808,7 @@ fn execute(
     let z3_profile = &contract.profile.z3_overlay.reference_executable;
     let staged_ay = stage_authenticated_executable(ay_source, &subject.sha256, "AY executable")?;
     let staged_z3 =
-        stage_authenticated_executable(z3_source, &z3_profile.sha256, "Z3 5.1.0 executable")?;
+        stage_authenticated_executable(z3_source, &z3_profile.sha256, "Z3 5.3.3 executable")?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
         &repo_root,
@@ -1066,6 +838,17 @@ fn execute(
         .prefix("ay-z3-behavioral-input-")
         .tempdir()
         .map_err(|error| format!("creating behavioral input directory: {error}"))?;
+    let diagnostic_paths = current_abi::StagingPaths::new(&[
+        (input_directory.path(), "@BEHAVIOR_INPUT@"),
+        (
+            staged_ay.path.parent().ok_or("AY staging root missing")?,
+            "@BEHAVIOR_AY@",
+        ),
+        (
+            staged_z3.path.parent().ok_or("Z3 staging root missing")?,
+            "@BEHAVIOR_Z3@",
+        ),
+    ])?;
     let current_exe = fs::canonicalize(
         std::env::current_exe().map_err(|error| format!("locating parity executable: {error}"))?,
     )
@@ -1115,9 +898,9 @@ fn execute(
             &spec.input,
             spec.style,
             oracle_directory.as_deref(),
-            (isolated && spec.style == RunStyle::File).then_some(relative_input.as_path()),
+            (spec.style == RunStyle::File).then_some(oracle_input_path.as_path()),
             timeout,
-            &format!("Z3 5.1.0 behavioral case {}", spec.id),
+            &format!("Z3 5.3.3 behavioral case {}", spec.id),
         )?;
         let ay = run_target(
             &resources,
@@ -1127,7 +910,7 @@ fn execute(
             &spec.input,
             spec.style,
             subject_directory.as_deref(),
-            (isolated && spec.style == RunStyle::File).then_some(relative_input.as_path()),
+            (spec.style == RunStyle::File).then_some(subject_input_path.as_path()),
             timeout,
             &format!("AY behavioral case {}", spec.id),
         )?;
@@ -1143,14 +926,25 @@ fn execute(
                 &baseline.input,
                 baseline.style,
                 baseline_directory.as_deref(),
-                (isolated && baseline.style == RunStyle::File).then_some(relative_input.as_path()),
+                (baseline.style == RunStyle::File).then_some(baseline_input_path.as_path()),
                 timeout,
-                &format!("Z3 5.1.0 effect baseline for {}", spec.id),
+                &format!("Z3 5.3.3 effect baseline for {}", spec.id),
             )?)
         } else {
             None
         };
-        rows.push(row_from_pair(spec, oracle, ay, oracle_baseline));
+        let row =
+            row_from_pair_with_paths(spec, oracle, ay, oracle_baseline, Some(&diagnostic_paths));
+        case_counts_from_rows(std::slice::from_ref(&row))
+            .map_err(|error| format!("invalid produced behavioral row {}: {error}", row.id))?;
+        rows.push(row);
+        if rows.len() % 100 == 0 || rows.len() == catalog.len() {
+            eprintln!(
+                "behavioral cases completed {}/{}",
+                rows.len(),
+                catalog.len()
+            );
+        }
     }
     let ay_post = sha256_file(&staged_ay.path, "staged AY after behavioral probes")?;
     let z3_post = sha256_file(&staged_z3.path, "staged Z3 after behavioral probes")?;
@@ -1191,12 +985,12 @@ fn discover_observable_items(
 ) -> Result<Vec<z3_source_inventory::ObservableItem>, String> {
     let capture = |id: &str, args: &[&str], input: &[u8]| -> Result<String, String> {
         let output = resources
-            .run_external_transcript(
+            .run_external_transcript_scrubbed(
                 z3,
                 args.iter().copied(),
                 input,
                 timeout,
-                &format!("Z3 5.1.0 behavioral ownership discovery: {id}"),
+                &format!("Z3 5.3.3 behavioral ownership discovery: {id}"),
             )
             .map_err(|error| error.to_string())?;
         let exit_code = output.status.and_then(|status| status.code());
@@ -1253,6 +1047,13 @@ fn run_target(
     label: &str,
 ) -> Result<Captured, String> {
     if style != RunStyle::Streaming {
+        // A file invocation consumes its authenticated file, not a second
+        // copy sent to an unread stdin pipe.
+        let stdin = if style == RunStyle::File {
+            b"".as_slice()
+        } else {
+            input
+        };
         let output = if let Some(directory) = working_directory {
             let mut wrapped_args = vec![
                 std::ffi::OsString::from("-C"),
@@ -1263,12 +1064,32 @@ fn run_target(
                 args.iter()
                     .map(|argument| std::ffi::OsString::from(argument.as_str())),
             );
-            resources.run_external_transcript("/usr/bin/env", &wrapped_args, input, timeout, label)
+            resources.run_external_transcript_scrubbed_with_file_limit(
+                "/usr/bin/env",
+                &wrapped_args,
+                stdin,
+                timeout,
+                label,
+                ARTIFACT_BYTE_LIMIT,
+            )
         } else {
-            resources.run_external_transcript(target, args, input, timeout, label)
+            resources.run_external_transcript_scrubbed_with_file_limit(
+                target,
+                args,
+                stdin,
+                timeout,
+                label,
+                ARTIFACT_BYTE_LIMIT,
+            )
         }
         .map_err(|error| error.to_string())?;
         let mut captured = Captured::from(output);
+        if style == RunStyle::File {
+            let path =
+                input_file.ok_or("file-style behavioral child has no authenticated input path")?;
+            let path = working_directory.map_or_else(|| path.to_path_buf(), |root| root.join(path));
+            verify_preserved_input(&path, input)?;
+        }
         if let Some(directory) = working_directory {
             captured.artifacts = capture_artifact_manifest(directory, input_file)?;
         }
@@ -1289,7 +1110,16 @@ fn run_target(
         driver_args.push(arg.clone());
     }
     let outer = resources
-        .run_external_transcript(driver, &driver_args, b"", timeout, label)
+        // The nested streaming target inherits both this scrubbed environment
+        // and this kernel file-size limit from the authenticated driver.
+        .run_external_transcript_scrubbed_with_file_limit(
+            driver,
+            &driver_args,
+            b"",
+            timeout,
+            label,
+            ARTIFACT_BYTE_LIMIT,
+        )
         .map_err(|error| error.to_string())?;
     if outer.memout || outer.timed_out || outer.stdout_truncated || outer.stderr_truncated {
         return Ok(Captured::from(outer));
@@ -1317,6 +1147,22 @@ fn run_target(
     })
 }
 
+fn verify_preserved_input(path: &Path, expected: &[u8]) -> Result<(), String> {
+    let actual = read_bounded_bytes(
+        path,
+        expected.len() as u64,
+        "behavioral input after execution",
+        true,
+    )?;
+    if actual != expected {
+        return Err(format!(
+            "behavioral child changed its authenticated input {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 impl From<GuardedTranscriptOutput> for Captured {
     fn from(output: GuardedTranscriptOutput) -> Self {
         Self {
@@ -1341,20 +1187,36 @@ fn capture_artifact_manifest(
         root: &Path,
         directory: &Path,
         excluded_input: Option<&Path>,
+        depth: usize,
+        entries_seen: &mut usize,
         total_bytes: &mut u64,
         artifacts: &mut Vec<ArtifactObservation>,
     ) -> Result<(), String> {
-        let mut entries = fs::read_dir(directory)
-            .map_err(|error| {
-                format!(
-                    "reading artifact directory {}: {error}",
-                    directory.display()
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
+        if depth > ARTIFACT_DEPTH_LIMIT {
+            return Err(format!(
+                "artifact directory exceeds depth {ARTIFACT_DEPTH_LIMIT}"
+            ));
+        }
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(directory).map_err(|error| {
+            format!(
+                "reading artifact directory {}: {error}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
                 format!("reading artifact entry in {}: {error}", directory.display())
             })?;
+            *entries_seen = entries_seen
+                .checked_add(1)
+                .ok_or("artifact entry count overflow")?;
+            if *entries_seen > ARTIFACT_FILE_LIMIT {
+                return Err(format!(
+                    "artifact tree exceeds {ARTIFACT_FILE_LIMIT} total file/directory entries"
+                ));
+            }
+            entries.push(entry);
+        }
         entries.sort_by_key(fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
@@ -1374,7 +1236,15 @@ fn capture_artifact_manifest(
                 ));
             }
             if metadata.is_dir() {
-                visit(root, &path, excluded_input, total_bytes, artifacts)?;
+                visit(
+                    root,
+                    &path,
+                    excluded_input,
+                    depth + 1,
+                    entries_seen,
+                    total_bytes,
+                    artifacts,
+                )?;
                 continue;
             }
             if !metadata.is_file() {
@@ -1411,7 +1281,16 @@ fn capture_artifact_manifest(
 
     let mut artifacts = Vec::new();
     let mut total_bytes = 0u64;
-    visit(root, root, excluded_input, &mut total_bytes, &mut artifacts)?;
+    let mut entries_seen = 0usize;
+    visit(
+        root,
+        root,
+        excluded_input,
+        0,
+        &mut entries_seen,
+        &mut total_bytes,
+        &mut artifacts,
+    )?;
     artifacts.sort();
     Ok(artifacts)
 }
@@ -1429,11 +1308,43 @@ fn artifact_manifest_text(artifacts: &[ArtifactObservation]) -> String {
     manifest
 }
 
+/// A bounded display of a complete normalized stream. The full string still
+/// owns comparison and replay; preview omission is not child truncation.
+fn normalized_transcript_record(role: &str, value: &str) -> String {
+    let mut preview = String::new();
+    let mut consumed = 0usize;
+    for ch in value.chars() {
+        let escaped = ch.escape_debug().to_string();
+        if preview.len().saturating_add(escaped.len()) > TRANSCRIPT_PREVIEW_BYTES {
+            break;
+        }
+        preview.push_str(&escaped);
+        consumed += ch.len_utf8();
+    }
+    format!(
+        "{role}: normalized-bytes={}; sha256={}; preview-prefix={preview:?}; omitted-bytes={}\n",
+        value.len(),
+        sha256_bytes(value.as_bytes()),
+        value.len() - consumed
+    )
+}
+
+#[cfg(test)]
 fn row_from_pair(
     spec: &CaseSpec,
     oracle: Captured,
     subject: Captured,
     oracle_baseline: Option<Captured>,
+) -> ValidatorCase {
+    row_from_pair_with_paths(spec, oracle, subject, oracle_baseline, None)
+}
+
+fn row_from_pair_with_paths(
+    spec: &CaseSpec,
+    oracle: Captured,
+    subject: Captured,
+    oracle_baseline: Option<Captured>,
+    diagnostic_paths: Option<&current_abi::StagingPaths>,
 ) -> ValidatorCase {
     let oracle_stdout = String::from_utf8(oracle.stdout.clone());
     let oracle_stderr = String::from_utf8(oracle.stderr.clone());
@@ -1486,12 +1397,21 @@ fn row_from_pair(
         &subject_stdout,
         &subject_stderr,
     );
-    let recorded_oracle_stdout = record_stream(spec.comparator, &oracle_stdout);
-    let recorded_oracle_stderr = record_stream(spec.comparator, &oracle_stderr);
-    let recorded_subject_stdout = record_stream(spec.comparator, &subject_stdout);
-    let recorded_subject_stderr = record_stream(spec.comparator, &subject_stderr);
-    let recorded_baseline_stdout = record_stream(spec.comparator, &baseline_stdout);
-    let recorded_baseline_stderr = record_stream(spec.comparator, &baseline_stderr);
+    // Outcome, effect and byte comparisons below use the original captures.
+    // Only retained diagnostics replace exact owned staging roots and their
+    // canonical aliases, so unchanged failed runs can replay. Artifacts retain
+    // their exact bytes and hashes.
+    let record = |value: &str| {
+        let text =
+            diagnostic_paths.map_or_else(|| value.to_string(), |paths| paths.normalize(value));
+        record_stream(spec.comparator, &text)
+    };
+    let recorded_oracle_stdout = record(&oracle_stdout);
+    let recorded_oracle_stderr = record(&oracle_stderr);
+    let recorded_subject_stdout = record(&subject_stdout);
+    let recorded_subject_stderr = record(&subject_stderr);
+    let recorded_baseline_stdout = record(&baseline_stdout);
+    let recorded_baseline_stderr = record(&baseline_stderr);
     let oracle_artifacts = artifact_manifest_text(&oracle.artifacts);
     let subject_artifacts = artifact_manifest_text(&subject.artifacts);
     let baseline_artifacts = oracle_baseline
@@ -1522,20 +1442,67 @@ fn row_from_pair(
         owner_category,
         Some("smt-command" | "tactic" | "declaration-builtin" | "smt-parser-token")
     );
-    let oracle_clean = if owner_category == Some("smt-option-key") {
+    let probe_case = owner_category == Some("probe") || spec.id.starts_with("tactic.probe.");
+    let allows_component_diagnostics = matches!(
+        owner_category,
+        Some(
+            "smt-option-key"
+                | "simplifier"
+                | "global-parameter"
+                | "module-parameter"
+                | "parameter-module"
+                | "cli-option"
+                | "cli-help-option"
+        )
+    );
+    let oracle_clean = if probe_case {
+        clean_probe_execution(&oracle, &oracle_stdout, &oracle_stderr)
+    } else if allows_component_diagnostics {
         clean_z3_execution_with_redirected_output(&oracle, &oracle_stdout, &oracle_stderr)
     } else {
         !requires_clean_oracle || clean_z3_execution(&oracle, &oracle_stdout, &oracle_stderr)
     };
-    let baseline_clean = !requires_clean_baseline
-        || oracle_baseline.as_ref().is_some_and(|baseline| {
-            clean_z3_execution(baseline, &baseline_stdout, &baseline_stderr)
-        });
+    let baseline_clean = if spec.effect_requirement
+        == EffectRequirement::OracleAcceptsParserRejectedInput
+    {
+        oracle_baseline.as_ref().is_some_and(|baseline| {
+            opb_parser_rejection(baseline, &baseline_stdout, &baseline_stderr)
+        })
+    } else if probe_case {
+        oracle_baseline.as_ref().is_some_and(|baseline| {
+            clean_probe_execution(baseline, &baseline_stdout, &baseline_stderr)
+        })
+    } else if allows_component_diagnostics && owner_category != Some("smt-option-key") {
+        oracle_baseline.as_ref().is_none_or(|baseline| {
+            clean_z3_execution_with_redirected_output(baseline, &baseline_stdout, &baseline_stderr)
+        })
+    } else {
+        !requires_clean_baseline
+            || oracle_baseline.as_ref().is_some_and(|baseline| {
+                clean_z3_execution(baseline, &baseline_stdout, &baseline_stderr)
+            })
+    };
     let effect_witness = match spec.effect_requirement {
         EffectRequirement::Inherent => true,
         EffectRequirement::Unresolved => false,
+        EffectRequirement::OracleAcceptsParserRejectedInput => {
+            clean_z3_execution(&oracle, &oracle_stdout, &oracle_stderr)
+                && oracle_stdout == "sat\n"
+                && oracle_baseline.as_ref().is_some_and(|baseline| {
+                    opb_parser_rejection(baseline, &baseline_stdout, &baseline_stderr)
+                })
+        }
         EffectRequirement::OracleDiffersFromBaseline => {
             oracle_baseline.as_ref().is_some_and(|baseline| {
+                let complementary_probe = !probe_case
+                    || matches!(
+                        (
+                            probe_branch(&oracle, &oracle_stdout, &oracle_stderr),
+                            probe_branch(baseline, &baseline_stdout, &baseline_stderr)
+                        ),
+                        (Some(ProbeBranch::Goal), Some(ProbeBranch::Failure))
+                            | (Some(ProbeBranch::Failure), Some(ProbeBranch::Goal))
+                    );
                 let (stdout_same, stderr_same) = compare_streams(
                     spec.comparator,
                     &oracle_stdout,
@@ -1544,6 +1511,7 @@ fn row_from_pair(
                     &baseline_stderr,
                 );
                 process_complete(baseline)
+                    && complementary_probe
                     && (oracle.exit_code != baseline.exit_code
                         || !stdout_same
                         || !stderr_same
@@ -1585,7 +1553,7 @@ fn row_from_pair(
     } else {
         ValidatorCaseOutcome::Fail
     };
-    let observed = format!(
+    let mut observed = format!(
         "source-owner={};effect-requirement={};effect-witness={effect_witness};comparator={};artifact-policy={};oracle-exit={:?};subject-exit={:?};baseline-exit={:?};status-match={status_match};stdout-match={stdout_match};stderr-match={stderr_match};artifact-match={artifact_match};oracle-clean={oracle_clean};baseline-clean={baseline_clean};utf8={utf8};oracle-complete={};subject-complete={};baseline-complete={};oracle-stdout-sha256={};subject-stdout-sha256={};baseline-stdout-sha256={};oracle-stderr-sha256={};subject-stderr-sha256={};baseline-stderr-sha256={};oracle-artifact-manifest-sha256={};subject-artifact-manifest-sha256={};baseline-artifact-manifest-sha256={}",
         spec.source_owner
             .as_ref()
@@ -1609,17 +1577,38 @@ fn row_from_pair(
         sha256_bytes(subject_artifacts.as_bytes()),
         sha256_bytes(baseline_artifacts.as_bytes()),
     );
+    observed.push_str(&format!(
+        ";transcript-storage={TRANSCRIPT_STORAGE_POLICY};oracle-stdout-bytes={};subject-stdout-bytes={};baseline-stdout-bytes={};oracle-stderr-bytes={};subject-stderr-bytes={};baseline-stderr-bytes={};oracle-artifact-manifest-bytes={};subject-artifact-manifest-bytes={};baseline-artifact-manifest-bytes={}",
+        recorded_oracle_stdout.len(), recorded_subject_stdout.len(), recorded_baseline_stdout.len(),
+        recorded_oracle_stderr.len(), recorded_subject_stderr.len(), recorded_baseline_stderr.len(),
+        oracle_artifacts.len(), subject_artifacts.len(), baseline_artifacts.len(),
+    ));
+    let stdout = [
+        ("pinned-z3.stdout", recorded_oracle_stdout.as_str()),
+        ("manifest-ay.stdout", recorded_subject_stdout.as_str()),
+        ("effect-baseline.stdout", recorded_baseline_stdout.as_str()),
+        ("pinned-z3.artifacts", oracle_artifacts.as_str()),
+        ("manifest-ay.artifacts", subject_artifacts.as_str()),
+        ("effect-baseline.artifacts", baseline_artifacts.as_str()),
+    ]
+    .into_iter()
+    .map(|(role, text)| normalized_transcript_record(role, text))
+    .collect::<String>();
+    let stderr = [
+        ("pinned-z3.stderr", recorded_oracle_stderr.as_str()),
+        ("manifest-ay.stderr", recorded_subject_stderr.as_str()),
+        ("effect-baseline.stderr", recorded_baseline_stderr.as_str()),
+    ]
+    .into_iter()
+    .map(|(role, text)| normalized_transcript_record(role, text))
+    .collect::<String>();
     ValidatorCase {
         id: spec.id.clone(),
         input_sha256: spec.input_sha256(),
         expected: spec.expected(),
         observed,
-        stdout: Some(format!(
-            "--- pinned-z3-5.1.0 stdout ---\n{recorded_oracle_stdout}--- manifest-ay stdout ---\n{recorded_subject_stdout}--- pinned-z3-5.1.0 effect-baseline stdout ---\n{recorded_baseline_stdout}--- pinned-z3-5.1.0 artifacts ---\n{oracle_artifacts}--- manifest-ay artifacts ---\n{subject_artifacts}--- pinned-z3-5.1.0 effect-baseline artifacts ---\n{baseline_artifacts}"
-        )),
-        stderr: Some(format!(
-            "--- pinned-z3-5.1.0 stderr ---\n{recorded_oracle_stderr}--- manifest-ay stderr ---\n{recorded_subject_stderr}--- pinned-z3-5.1.0 effect-baseline stderr ---\n{recorded_baseline_stderr}"
-        )),
+        stdout: Some(stdout),
+        stderr: Some(stderr),
         exit_code: subject.exit_code,
         process: Some(ProcessObservation {
             stdin_complete: processes.iter().all(|process| process.stdin_complete),
@@ -1637,6 +1626,41 @@ fn clean_z3_execution(process: &Captured, stdout: &str, stderr: &str) -> bool {
         && process.exit_code == Some(0)
         && stderr.is_empty()
         && !stdout.lines().any(z3_error_output_line)
+}
+
+const OPB_SMT2_REJECTION: &str = "(error \"line 1 column 1: invalid command, '(' expected\")\n(error \"line 1 column 4: invalid bit-vector literal, expecting 'x' or 'b'\")\n(error \"line 1 column 17: invalid bit-vector literal, expecting 'x' or 'b'\")\n";
+
+fn opb_parser_rejection(process: &Captured, stdout: &str, stderr: &str) -> bool {
+    process_complete(process)
+        && process.exit_code == Some(1)
+        && stderr.is_empty()
+        && stdout == OPB_SMT2_REJECTION
+}
+
+#[derive(Clone, Copy)]
+enum ProbeBranch {
+    Goal,
+    Failure,
+}
+
+fn probe_branch(process: &Captured, stdout: &str, stderr: &str) -> Option<ProbeBranch> {
+    if !process_complete(process) || process.exit_code != Some(0) || !stderr.is_empty() {
+        return None;
+    }
+    if stdout == "(error \"tactic failed: fail-if tactic\")\n" {
+        return Some(ProbeBranch::Failure);
+    }
+    // All registered probe witnesses use the same nonempty integer goal.
+    // A successful fail-if must preserve it, rather than merely print no
+    // error or another syntactically valid response.
+    let actual = ay_frontend::sexp::parse_sexp(stdout).ok()?;
+    let expected =
+        ay_frontend::sexp::parse_sexp("(goals (goal (> x 0) :precision precise :depth 0))").ok()?;
+    (actual == expected).then_some(ProbeBranch::Goal)
+}
+
+fn clean_probe_execution(process: &Captured, stdout: &str, stderr: &str) -> bool {
+    probe_branch(process, stdout, stderr).is_some()
 }
 
 fn clean_z3_execution_with_redirected_output(
@@ -1706,6 +1730,10 @@ fn record_stream(comparator: Comparator, value: &str) -> String {
 fn canonicalize_statistics(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for line in value.split_inclusive('\n') {
+        if let Some(normalized) = normalize_legacy_log_statistic(line) {
+            output.push_str(&normalized);
+            continue;
+        }
         let trimmed = line.trim_start();
         let key_start = if trimmed.starts_with("(:") { 1 } else { 0 };
         if !trimmed[key_start..].starts_with(':') {
@@ -1746,6 +1774,34 @@ fn canonicalize_statistics(value: &str) -> String {
     output
 }
 
+fn normalize_legacy_log_statistic(line: &str) -> Option<String> {
+    let (body, newline) = line
+        .strip_suffix('\n')
+        .map_or((line, ""), |body| (body, "\n"));
+    let (label, rest, unit) = if let Some(rest) = body.strip_prefix("max. heap size:") {
+        ("max. heap size:", rest, "Mbytes")
+    } else if let Some(rest) = body.strip_prefix("time:") {
+        ("time:", rest, "")
+    } else {
+        return None;
+    };
+    let number_and_unit = rest.trim_start_matches([' ', '\t']);
+    let leading = &rest[..rest.len() - number_and_unit.len()];
+    if leading.is_empty() {
+        return None;
+    }
+    let number_end = number_and_unit
+        .find(char::is_whitespace)
+        .unwrap_or(number_and_unit.len());
+    let number = &number_and_unit[..number_end];
+    let suffix = &number_and_unit[number_end..];
+    let value = number.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 || suffix.trim() != unit {
+        return None;
+    }
+    Some(format!("{label}{leading}<numeric>{suffix}{newline}"))
+}
+
 fn canonicalize_component_trace(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
@@ -1771,7 +1827,7 @@ fn overlay_dimension(contract: &Contract) -> Result<&Dimension, String> {
         .dimensions
         .iter()
         .find(|dimension| dimension.id == DIMENSION_ID)
-        .ok_or("contract has no overlay.z3-5.1.0 dimension".to_string())
+        .ok_or("contract has no overlay.z3-5.3.3 dimension".to_string())
 }
 
 fn batch_case(id: impl Into<String>, input: &str) -> CaseSpec {
@@ -1863,13 +1919,7 @@ fn source_owned_case(
     let case = match item.category.as_str() {
         "smt-command" => source_command_case(&item.name),
         "tactic" => source_tactic_case(&item.name),
-        "probe" => batch_case(
-            "source-probe",
-            &format!(
-                "(set-logic ALL)\n(declare-const x Int)\n(assert (> x 0))\n(apply (fail-if {}))\n(exit)\n",
-                item.name
-            ),
-        ),
+        "probe" => source_probe_case(&item.name),
         "simplifier" => source_simplifier_case(&item.name),
         "global-parameter" | "module-parameter" => source_parameter_case(item),
         "parameter-module" => source_parameter_module_case(item, items)?,
@@ -1886,10 +1936,9 @@ fn source_owned_case(
             unresolved_case(batch_case("source-option-key-unresolved", "(exit)\n"))
         }),
         "smt-parser-token" => source_parser_token_case(&item.name),
-        "logic-strategy-alias" => unresolved_case(batch_case(
-            "source-observable-unresolved",
-            "(exit)\n",
-        )),
+        "logic-strategy-alias" => {
+            unresolved_case(batch_case("source-observable-unresolved", "(exit)\n"))
+        }
         category => return Err(format!("unowned Z3 observable category {category:?}")),
     };
     Ok(attach_owner(case, item))
@@ -1969,7 +2018,7 @@ fn source_info_key_case(name: &str) -> Option<CaseSpec> {
         case,
         BaselineSpec {
             args: vec!["-in".to_string()],
-            // Z3 5.1.0 exits zero for an unknown query while deliberately
+            // Z3 5.3.3 exits zero for an unknown query while deliberately
             // emitting its positioned diagnostic. That makes this a complete,
             // observable negative control rather than an interrupted invocation.
             input: b"(get-info :ay-no-such-info)\n(exit)\n".to_vec(),
@@ -2325,7 +2374,7 @@ fn source_fixedpoint_command_case(name: &str) -> Option<CaseSpec> {
 }
 
 fn source_command_case(name: &str) -> CaseSpec {
-    if EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS
+    if KNOWN_PARTIAL_COMMAND_OWNERS
         .iter()
         .any(|(category, owner)| *category == "smt-command" && *owner == name)
     {
@@ -2357,15 +2406,46 @@ fn source_command_case(name: &str) -> CaseSpec {
 }
 
 fn source_tactic_case(name: &str) -> CaseSpec {
-    const GOAL: &str =
-        "(set-logic QF_BV)\n(declare-const x (_ BitVec 8))\n(assert (= (bvadd x #x01) #x02))\n";
-    let candidate = format!("{GOAL}(apply {name})\n(exit)\n");
-    let baseline = format!("{GOAL}(apply skip)\n(exit)\n");
+    let goal = tactic_goal(name);
+    let candidate = format!("{goal}(apply {name})\n(exit)\n");
+    let baseline = format!("{goal}(apply skip)\n(exit)\n");
     require_oracle_difference(
         batch_case("source-tactic", &candidate),
         BaselineSpec {
             args: vec!["-in".to_string()],
             input: baseline.into_bytes(),
+            style: RunStyle::Batch,
+        },
+    )
+}
+
+fn tactic_goal(name: &str) -> &'static str {
+    if matches!(
+        name,
+        "ff-sat" | "ff-simplify" | "ff-solve" | "ff-unique" | "ff2bv"
+    ) {
+        // The five current field tactics need a field goal. The two assertions
+        // contradict modulo 5: x + 1 = 2 implies x = 1. A generic BV goal would
+        // only measure the field tactic's unsupported-input diagnostic.
+        "(set-logic QF_FF)\n(define-sort F () (_ FiniteField 5))\n(declare-const x F)\n(assert (= (ff.add x (as ff1 F)) (as ff2 F)))\n(assert (not (= x (as ff1 F))))\n"
+    } else {
+        "(set-logic QF_BV)\n(declare-const x (_ BitVec 8))\n(assert (= (bvadd x #x01) #x02))\n"
+    }
+}
+
+fn source_probe_case(name: &str) -> CaseSpec {
+    const GOAL: &str = "(set-logic ALL)\n(declare-const x Int)\n(assert (> x 0))\n";
+    // `not` complements the probe's zero/nonzero result. A real probe must
+    // therefore produce a goal on one side and fail-if's exact failure on the
+    // other. Unknown-probe errors or two no-op transcripts cannot count.
+    require_oracle_difference(
+        batch_case(
+            "source-probe",
+            &format!("{GOAL}(apply (fail-if {name}))\n(exit)\n"),
+        ),
+        BaselineSpec {
+            args: vec!["-in".to_string()],
+            input: format!("{GOAL}(apply (fail-if (not {name})))\n(exit)\n").into_bytes(),
             style: RunStyle::Batch,
         },
     )
@@ -2728,6 +2808,10 @@ fn source_parameter_witness_case(name: &str) -> Option<CaseSpec> {
 
 fn source_parameter_case(item: &z3_source_inventory::ObservableItem) -> CaseSpec {
     const INPUT: &str = "(set-option :produce-models true)\n(declare-const a Bool)\n(declare-const b Bool)\n(assert (or a b))\n(check-sat)\n(get-model)\n(exit)\n";
+    if item.name == "parallel.enable" {
+        return unresolved_case(cli_case("source-parallel-unresolved", &["parallel.enable=true", "-in"],
+            "(set-logic QF_BV)\n(declare-const x (_ BitVec 2))\n(assert (= x #b01))\n(check-sat)\n(exit)\n"));
+    }
     if let Some(case) = source_parameter_witness_case(&item.name) {
         return case;
     }
@@ -2788,6 +2872,23 @@ fn cli_introspection_only(name: &str) -> bool {
 
 fn source_cli_option_case(name: &str) -> CaseSpec {
     const INPUT: &str = "(check-sat)\n(exit)\n";
+    if name == "pbo" {
+        let mut case = source_filename_extension_case("opb");
+        // Use a misleading suffix so the flag, not extension autodetection,
+        // selects the OPB parser. The exact rejection is a negative control.
+        case.file_extension = "smt2".to_string();
+        case.oracle_args = vec!["-pbo".to_string(), FILE_PLACEHOLDER.to_string()];
+        case.subject_args = vec![
+            "--z3-mode".to_string(),
+            "-pbo".to_string(),
+            FILE_PLACEHOLDER.to_string(),
+        ];
+        if let Some(baseline) = &mut case.oracle_baseline {
+            baseline.args = vec![FILE_PLACEHOLDER.to_string()];
+        }
+        case.effect_requirement = EffectRequirement::OracleAcceptsParserRejectedInput;
+        return case;
+    }
     let flag = match name {
         "?" => "-?".to_string(),
         "T" => "-T:0".to_string(),
@@ -2804,6 +2905,9 @@ fn source_cli_option_case(name: &str) -> CaseSpec {
         other => format!("-{other}"),
     };
     let mut case = cli_case("source-cli-option", &[&flag, "-in"], INPUT);
+    if matches!(name, "log" | "st") {
+        case.comparator = Comparator::Statistics;
+    }
     if name == "file" {
         case.style = RunStyle::File;
         case.oracle_args = vec![flag.clone()];
@@ -2865,12 +2969,36 @@ fn input_for_extension(extension: &str) -> &'static str {
         "drat" => "a arith 1 0\n",
         // This is a complete Z3 API-replay log: version header plus a user-log
         // message. It exercises replay dispatch without calling an ABI entry.
-        "log" => "V \"5.1.0.0\"\nM \"ay-z3-log-dispatch\"\n",
+        "log" => "V \"5.3.3.0\"\nM \"ay-z3-log-dispatch\"\n",
         _ => "(check-sat)\n(exit)\n",
     }
 }
 
 fn source_filename_extension_case(extension: &str) -> CaseSpec {
+    if !matches!(
+        extension,
+        "cnf"
+            | "dimacs"
+            | "wcnf"
+            | "opb"
+            | "lp"
+            | "datalog"
+            | "dl"
+            | "fof"
+            | "p"
+            | "tff"
+            | "thf"
+            | "tptp"
+            | "drat"
+            | "log"
+            | "smt"
+            | "smt2"
+    ) {
+        return unresolved_case(batch_case(
+            "source-filename-extension-unresolved",
+            "(exit)\n",
+        ));
+    }
     let input = input_for_extension(extension);
     let case = CaseSpec {
         id: "source-filename-extension".to_string(),
@@ -2898,7 +3026,7 @@ fn source_filename_extension_case(extension: &str) -> CaseSpec {
         },
     );
     if extension == "drat" {
-        // Z3 5.1.0 stores a `.drat` argument separately from `g_input_file`
+        // Z3 5.3.3 stores a `.drat` argument separately from `g_input_file`
         // but still applies the generic "input file was not specified" guard.
         // `-in` satisfies that guard; the DRAT reader still consumes the file.
         case.oracle_args.push("-in".to_string());
@@ -2906,7 +3034,7 @@ fn source_filename_extension_case(extension: &str) -> CaseSpec {
     } else if extension == "log" {
         // Replay emits wall/allocation telemetry. Preserve its exact shape and
         // message while eliding only numeric values.
-        case.comparator = Comparator::ComponentTrace;
+        case.comparator = Comparator::Statistics;
     }
     case
 }
@@ -2922,7 +3050,7 @@ fn source_input_mode_case(mode: &str) -> CaseSpec {
         "IN_TPTP" => ("tptp", Some("-tptp")),
         "IN_WCNF" => ("wcnf", Some("-wcnf")),
         "IN_Z3_LOG" => ("log", Some("-log")),
-        _ => ("smt2", None),
+        _ => return unresolved_case(batch_case("source-input-mode-unresolved", "(exit)\n")),
     };
     let mut case = source_filename_extension_case(extension);
     if let Some(flag) = flag {
@@ -2936,6 +3064,7 @@ fn source_input_mode_case(mode: &str) -> CaseSpec {
     case
 }
 
+#[cfg(test)]
 fn ownership_sha256(cases: &[CaseSpec]) -> String {
     let mut lines = cases
         .iter()
@@ -2956,6 +3085,7 @@ fn unresolved_ownership_sha256(cases: &[CaseSpec]) -> String {
     sha256_bytes(lines.concat().as_bytes())
 }
 
+#[cfg(test)]
 fn audited_gap_universe_ownership_sha256(cases: &[CaseSpec]) -> String {
     let mut lines = cases
         .iter()
@@ -2992,25 +3122,79 @@ fn audited_gap_universe_ownership_sha256(cases: &[CaseSpec]) -> String {
     sha256_bytes(lines.concat().as_bytes())
 }
 
-fn source_proven_no_effect_ownership_sha256(cases: &[CaseSpec]) -> String {
-    let mut lines = cases
-        .iter()
-        .filter(|case| case.effect_requirement == EffectRequirement::SourceProvenNoEffect)
-        .filter_map(|case| case.source_owner.as_ref().map(SourceOwner::canonical_line))
-        .collect::<Vec<_>>();
-    lines.sort();
-    sha256_bytes(lines.concat().as_bytes())
-}
-
 fn case_catalog(
     observable_items: &[z3_source_inventory::ObservableItem],
 ) -> Result<Vec<CaseSpec>, String> {
-    if SUPPORTED_TACTIC_NAMES.len() != TACTIC_COUNT {
-        return Err(format!(
-            "AY tactic registry drift: expected {TACTIC_COUNT}, got {}",
-            SUPPORTED_TACTIC_NAMES.len()
-        ));
+    if observable_items.len() != z3_source_inventory::EXPECTED_OBSERVABLE_ITEMS
+        || z3_source_inventory::observable_manifest_sha256(observable_items)
+            != z3_source_inventory::EXPECTED_OBSERVABLE_SHA256
+    {
+        return Err("z3-behavioral received a foreign observable source manifest".to_string());
     }
+    catalog_from_authenticated_items(observable_items)
+}
+
+fn validate_catalog_descriptors(cases: &[CaseSpec]) -> Result<(), String> {
+    validate_id(VALIDATOR_ID, "behavioral validator id")?;
+    validate_id(DIMENSION_ID, "behavioral dimension id")?;
+    validate_id(REQUIREMENT_ID, "behavioral requirement id")?;
+    for case in cases {
+        if produces_known_telemetry(case) && case.comparator == Comparator::ExactBytes {
+            return Err(format!(
+                "{} has a known telemetry route without a statistics comparator",
+                case.id
+            ));
+        }
+        validate_id(&case.id, "behavioral case id")?;
+        validate_text(&case.expected(), &format!("{} expected", case.id))?;
+        validate_sha256(&case.input_sha256(), "behavioral input digest")?;
+        if let Some(owner) = &case.source_owner {
+            validate_text(&owner.display(), &format!("{} source owner", case.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn input_requests_statistics(input: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(input) else {
+        return false;
+    };
+    let Ok(commands) = ay_frontend::sexp::parse_sexps(text) else {
+        return false;
+    };
+    commands.iter().any(|command| {
+        matches!(command.as_list(), Some([head, ay_frontend::SExpr::Keyword(key)])
+            if head.is_symbol("get-info") && key == ":all-statistics")
+    })
+}
+
+fn produces_known_telemetry(case: &CaseSpec) -> bool {
+    let arguments_request_statistics = |args: &[String]| {
+        args.iter()
+            .any(|argument| matches!(argument.as_str(), "-log" | "-st" | "stats=true"))
+    };
+    case.file_extension == "log"
+        || arguments_request_statistics(&case.oracle_args)
+        || arguments_request_statistics(&case.subject_args)
+        || input_requests_statistics(&case.input)
+        || case.oracle_baseline.as_ref().is_some_and(|baseline| {
+            arguments_request_statistics(&baseline.args)
+                || input_requests_statistics(&baseline.input)
+        })
+}
+
+fn assign_telemetry_comparator(case: &mut CaseSpec) {
+    // Component traces already have a typed comparator for their broader
+    // telemetry grammar. Other known statistics producers use only the
+    // narrow SMT statistics and two legacy API-log numeric productions.
+    if produces_known_telemetry(case) && case.comparator != Comparator::ComponentTrace {
+        case.comparator = Comparator::Statistics;
+    }
+}
+
+fn catalog_from_authenticated_items(
+    observable_items: &[z3_source_inventory::ObservableItem],
+) -> Result<Vec<CaseSpec>, String> {
     let mut cases = standard_command_cases();
     cases.extend(standard_command_arity_cases());
     cases.extend(extension_command_cases());
@@ -3018,20 +3202,6 @@ fn case_catalog(
     cases.extend(state_and_diagnostic_cases());
     cases.extend(cli_cases());
     cases.extend(combinator_cases());
-    for tactic in SUPPORTED_TACTIC_NAMES {
-        cases.push(batch_case(
-            format!("tactic.primitive.{}", case_token(tactic)),
-            &format!("(set-logic ALL)\n(assert (= 1 1))\n(apply {tactic})\n(exit)\n"),
-        ));
-    }
-    for probe in PROBE_NAMES {
-        cases.push(batch_case(
-            format!("tactic.probe.{}", case_token(probe)),
-            &format!(
-                "(set-logic ALL)\n(declare-const x Int)\n(assert (> x 0))\n(apply (fail-if {probe}))\n(exit)\n"
-            ),
-        ));
-    }
     cases.push(CaseSpec {
         id: "streaming.echo-check-sat-echo".to_string(),
         oracle_args: vec!["-in".to_string()],
@@ -3045,278 +3215,124 @@ fn case_catalog(
         effect_requirement: EffectRequirement::Inherent,
         oracle_baseline: None,
     });
-    if cases.len() != BASE_CASE_COUNT {
+    if cases.len() != BASE_FIXED_CASE_COUNT {
         return Err(format!(
-            "z3-behavioral base catalog drift: expected {BASE_CASE_COUNT}, got {}",
+            "z3-behavioral fixed catalog drift: expected {BASE_FIXED_CASE_COUNT}, got {}",
             cases.len()
         ));
     }
-    if observable_items.len() != EXPECTED_SOURCE_OWNER_COUNT
-        || z3_source_inventory::observable_manifest_sha256(observable_items)
-            != z3_source_inventory::EXPECTED_OBSERVABLE_SHA256
-    {
-        return Err("z3-behavioral received a foreign observable source manifest".to_string());
-    }
+    let mut reference_registry_cases = 0;
     for item in observable_items {
+        match item.category.as_str() {
+            "tactic" => {
+                let goal = if matches!(
+                    item.name.as_str(),
+                    "ff-sat" | "ff-simplify" | "ff-solve" | "ff-unique" | "ff2bv"
+                ) {
+                    tactic_goal(&item.name)
+                } else {
+                    "(set-logic ALL)\n(assert (= 1 1))\n"
+                };
+                cases.push(batch_case(
+                    format!("tactic.primitive.{}", case_token(&item.name)),
+                    &format!("{goal}(apply {})\n(exit)\n", item.name),
+                ));
+                reference_registry_cases += 1;
+            }
+            "probe" => {
+                let mut case = source_probe_case(&item.name);
+                case.id = format!("tactic.probe.{}", case_token(&item.name));
+                cases.push(case);
+                reference_registry_cases += 1;
+            }
+            _ => {}
+        }
         cases.push(source_owned_case(item, observable_items)?);
     }
+    for case in &mut cases {
+        assign_telemetry_comparator(case);
+    }
     cases.sort_by(|left, right| left.id.cmp(&right.id));
-    let ids = cases
-        .iter()
-        .map(|case| case.id.as_str())
-        .collect::<BTreeSet<_>>();
-    if ids.len() != cases.len() {
-        return Err("duplicate z3-behavioral case id".to_string());
+    if cases.len() != BASE_FIXED_CASE_COUNT + reference_registry_cases + observable_items.len()
+        || cases.windows(2).any(|pair| pair[0].id >= pair[1].id)
+    {
+        return Err("z3-behavioral case inventory is not complete and unique".to_string());
     }
-    if cases.len() != EXPECTED_CASE_COUNT {
-        return Err(format!(
-            "z3-behavioral catalog drift: expected {EXPECTED_CASE_COUNT}, got {}",
-            cases.len()
-        ));
-    }
-    let source_owners = cases
+    let owners = cases
         .iter()
         .filter_map(|case| case.source_owner.as_ref())
-        .collect::<Vec<_>>();
-    let actual_ownership_sha256 = ownership_sha256(&cases);
-    if source_owners.len() != EXPECTED_SOURCE_OWNER_COUNT
-        || source_owners.iter().collect::<BTreeSet<_>>().len() != source_owners.len()
-        || actual_ownership_sha256 != EXPECTED_OWNERSHIP_SHA256
-    {
-        return Err(format!(
-            "z3-behavioral source-item ownership is not exact and unique: expected count={EXPECTED_SOURCE_OWNER_COUNT} sha256={EXPECTED_OWNERSHIP_SHA256}, got count={} sha256={actual_ownership_sha256}",
-            source_owners.len()
-        ));
-    }
-    let unresolved_source_owners = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.is_some() && case.effect_requirement == EffectRequirement::Unresolved
-        })
-        .count();
-    let unresolved_owner_keys = cases
-        .iter()
-        .filter(|case| case.effect_requirement == EffectRequirement::Unresolved)
-        .filter_map(|case| case.source_owner.as_ref())
-        .map(|owner| (owner.category.as_str(), owner.name.as_str()))
         .collect::<BTreeSet<_>>();
-    let mut expected_unresolved_owner_keys = EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS
-        .into_iter()
+    let expected_owners = observable_items
+        .iter()
+        .map(|item| SourceOwner {
+            category: item.category.clone(),
+            name: item.name.clone(),
+        })
         .collect::<BTreeSet<_>>();
-    expected_unresolved_owner_keys.extend(
-        observable_items
-            .iter()
-            .filter(|item| {
-                UNRESOLVED_SOURCE_CATEGORIES.contains(&item.category.as_str())
-                    && !(item.category == "declaration-builtin"
-                        && declaration_builtins::semantic_predicate(&item.name).is_some())
-                    && !(item.category == "smt-info-key"
-                        && RESOLVED_INFO_KEYS.contains(&item.name.as_str()))
-                    && !(item.category == "smt-option-key"
-                        && RESOLVED_OPTION_KEYS.contains(&item.name.as_str()))
-                    && !(item.category == "smt-parser-token"
-                        && parser_tokens::semantic_witness(&item.name).is_some())
-            })
-            .map(|item| (item.category.as_str(), item.name.as_str())),
-    );
-    if unresolved_source_owners != EXPECTED_UNRESOLVED_SOURCE_OWNERS
-        || unresolved_owner_keys != expected_unresolved_owner_keys
-    {
-        return Err("z3-behavioral explicit unresolved source-owner inventory drift".to_string());
+    if owners.len() != observable_items.len() || owners.iter().copied().ne(expected_owners.iter()) {
+        return Err("z3-behavioral source-item ownership is not exact and unique".to_string());
     }
-    let logic_recognizer_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner
-                .as_ref()
-                .is_some_and(|owner| owner.category == "logic-recognizer-literal")
-        })
-        .collect::<Vec<_>>();
-    let logic_recognizer_names = logic_recognizer_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if logic_recognizer_names
-        != RESOLVED_LOGIC_RECOGNIZER_LITERALS
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-        || logic_recognizer_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved logic-recognizer inventory drift".to_string());
-    }
-    let resolved_extension_command_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.as_ref().is_some_and(|owner| {
-                owner.category == "smt-command"
-                    && RESOLVED_EXTENSION_COMMANDS.contains(&owner.name.as_str())
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_extension_command_names = resolved_extension_command_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if resolved_extension_command_names
-        != RESOLVED_EXTENSION_COMMANDS
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-        || resolved_extension_command_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved extension-command inventory drift".to_string());
-    }
-    let resolved_declaration_builtin_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.as_ref().is_some_and(|owner| {
-                owner.category == "declaration-builtin"
-                    && declaration_builtins::semantic_predicate(&owner.name).is_some()
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_declaration_builtin_names = resolved_declaration_builtin_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if resolved_declaration_builtin_names
-        != declaration_builtins::semantic_owner_names().collect::<BTreeSet<_>>()
-        || resolved_declaration_builtin_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved declaration-builtin inventory drift".to_string());
-    }
-    let resolved_info_key_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.as_ref().is_some_and(|owner| {
-                owner.category == "smt-info-key"
-                    && RESOLVED_INFO_KEYS.contains(&owner.name.as_str())
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_info_key_names = resolved_info_key_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if resolved_info_key_names != RESOLVED_INFO_KEYS.into_iter().collect::<BTreeSet<_>>()
-        || resolved_info_key_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved info-key inventory drift".to_string());
-    }
-    let resolved_option_key_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.as_ref().is_some_and(|owner| {
-                owner.category == "smt-option-key"
-                    && RESOLVED_OPTION_KEYS.contains(&owner.name.as_str())
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_option_key_names = resolved_option_key_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if resolved_option_key_names != RESOLVED_OPTION_KEYS.into_iter().collect::<BTreeSet<_>>()
-        || resolved_option_key_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved option-key inventory drift".to_string());
-    }
-    let resolved_parser_token_cases = cases
-        .iter()
-        .filter(|case| {
-            case.source_owner.as_ref().is_some_and(|owner| {
-                owner.category == "smt-parser-token"
-                    && parser_tokens::semantic_witness(&owner.name).is_some()
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_parser_token_names = resolved_parser_token_cases
-        .iter()
-        .filter_map(|case| case.source_owner.as_ref().map(|owner| owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    if resolved_parser_token_names != parser_tokens::semantic_owner_names().collect::<BTreeSet<_>>()
-        || resolved_parser_token_cases.iter().any(|case| {
-            case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
-                || case.oracle_baseline.is_none()
-        })
-    {
-        return Err("z3-behavioral resolved parser-token inventory drift".to_string());
-    }
-    let actual_audited_gap_universe_sha256 = audited_gap_universe_ownership_sha256(&cases);
-    if unresolved_source_owners
-        + logic_recognizer_cases.len()
-        + resolved_extension_command_cases.len()
-        + resolved_declaration_builtin_cases.len()
-        + resolved_info_key_cases.len()
-        + resolved_option_key_cases.len()
-        + resolved_parser_token_cases.len()
-        != EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS
-        || actual_audited_gap_universe_sha256 != EXPECTED_AUDITED_GAP_UNIVERSE_OWNERSHIP_SHA256
-    {
-        return Err(format!(
-            "z3-behavioral authenticated audited-gap universe drift: expected count={EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS} sha256={EXPECTED_AUDITED_GAP_UNIVERSE_OWNERSHIP_SHA256}, got count={} sha256={actual_audited_gap_universe_sha256}",
-            unresolved_source_owners
-                + logic_recognizer_cases.len()
-                + resolved_extension_command_cases.len()
-                + resolved_declaration_builtin_cases.len()
-                + resolved_info_key_cases.len()
-                + resolved_option_key_cases.len()
-                + resolved_parser_token_cases.len()
-        ));
-    }
-    let source_proven_no_effect_owner_keys = cases
-        .iter()
-        .filter(|case| case.effect_requirement == EffectRequirement::SourceProvenNoEffect)
-        .filter_map(|case| case.source_owner.as_ref())
-        .map(|owner| (owner.category.as_str(), owner.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    let expected_source_proven_no_effect_owner_keys = EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNER_KEYS
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if source_proven_no_effect_owner_keys.len() != EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS
-        || source_proven_no_effect_owner_keys != expected_source_proven_no_effect_owner_keys
-        || source_proven_no_effect_ownership_sha256(&cases)
-            != EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERSHIP_SHA256
-    {
-        return Err("z3-behavioral source-proven no-effect owner inventory drift".to_string());
-    }
-    if cases.iter().any(|case| {
+    for case in &cases {
         let requires_baseline = matches!(
             case.effect_requirement,
-            EffectRequirement::OracleDiffersFromBaseline | EffectRequirement::SourceProvenNoEffect
+            EffectRequirement::OracleDiffersFromBaseline
+                | EffectRequirement::OracleAcceptsParserRejectedInput
+                | EffectRequirement::SourceProvenNoEffect
         );
-        requires_baseline != case.oracle_baseline.is_some()
-    }) {
-        return Err("z3-behavioral effect-baseline ownership drift".to_string());
+        if requires_baseline != case.oracle_baseline.is_some() {
+            return Err(format!(
+                "z3-behavioral effect-baseline ownership drift at {}",
+                case.id
+            ));
+        }
+        if case.effect_requirement == EffectRequirement::SourceProvenNoEffect
+            && case
+                .source_owner
+                .as_ref()
+                .and_then(source_proven_no_effect_reason)
+                .is_none()
+        {
+            return Err(format!(
+                "z3-behavioral no authenticated no-effect proof at {}",
+                case.id
+            ));
+        }
+        if let Some(owner) = &case.source_owner {
+            let needs_difference = matches!(
+                owner.category.as_str(),
+                "tactic" | "probe" | "simplifier" | "logic-recognizer-literal"
+            ) || (owner.category == "smt-command"
+                && !KNOWN_PARTIAL_COMMAND_OWNERS.iter().any(|(category, name)| {
+                    *category == owner.category.as_str() && *name == owner.name.as_str()
+                }));
+            if needs_difference
+                && case.effect_requirement != EffectRequirement::Unresolved
+                && case.effect_requirement != EffectRequirement::OracleDiffersFromBaseline
+            {
+                return Err(format!(
+                    "z3-behavioral mechanism lacks a distinguishing witness at {}",
+                    case.id
+                ));
+            }
+        }
     }
-    let standard = cases
-        .iter()
-        .filter_map(|case| case.id.strip_prefix("command.standard."))
-        .collect::<BTreeSet<_>>();
-    if standard != SMTLIB_COMMANDS.into_iter().collect() {
-        return Err("z3-behavioral standard-command inventory drift".to_string());
+    for (prefix, expected) in [
+        ("command.standard.", SMTLIB_COMMANDS.as_slice()),
+        ("arity.standard.", SMTLIB_COMMANDS.as_slice()),
+    ] {
+        let actual = cases
+            .iter()
+            .filter_map(|case| case.id.strip_prefix(prefix))
+            .collect::<BTreeSet<_>>();
+        if actual != expected.iter().copied().collect() {
+            return Err(format!(
+                "z3-behavioral standard-command inventory drift at {prefix}"
+            ));
+        }
     }
-    let arities = cases
-        .iter()
-        .filter_map(|case| case.id.strip_prefix("arity.standard."))
-        .collect::<BTreeSet<_>>();
-    if arities != SMTLIB_COMMANDS.into_iter().collect() {
-        return Err("z3-behavioral standard-command arity inventory drift".to_string());
-    }
+    // Check every static receipt field before executing any of the cases.
+    // Inputs remain raw bytes; only human-readable identity text is escaped.
+    validate_catalog_descriptors(&cases)?;
     Ok(cases)
 }
 
@@ -3808,9 +3824,7 @@ fn cli_cases() -> Vec<CaseSpec> {
         ),
     ];
     for case in &mut cases {
-        if case.id.starts_with("cli.stats.") {
-            case.comparator = Comparator::Statistics;
-        }
+        assign_telemetry_comparator(case);
     }
     cases.push(CaseSpec {
         id: "cli.input.file-alias".to_string(),
@@ -3885,26 +3899,20 @@ fn case_token(value: &str) -> String {
 /// helper is itself the hash-bound parity executable and is run under the same
 /// RSS watchdog as the target it spawns; the target inherits its process group.
 pub(super) fn run_stream_driver(args: &[String]) -> Result<i32, String> {
-    let mut target: Option<PathBuf> = None;
-    let mut target_args = Vec::new();
-    let mut index = 0usize;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--target" => {
-                index += 1;
-                target = Some(PathBuf::from(
-                    args.get(index).ok_or("--target needs a path")?,
-                ));
-            }
-            "--target-arg" => {
-                index += 1;
-                target_args.push(args.get(index).ok_or("--target-arg needs a value")?.clone());
-            }
-            other => return Err(format!("unknown stream-driver flag {other:?}")),
-        }
-        index += 1;
-    }
-    let target = target.ok_or("stream driver requires --target")?;
+    let (report, _stdin_write_failed) = drive_stream_target(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&report)
+            .map_err(|error| format!("serializing stream-driver report: {error}"))?
+    );
+    Ok(0)
+}
+
+/// One run of the stream target for [`run_stream_driver`]: the report it
+/// prints, and whether a write to the target's stdin failed because the target
+/// had stopped reading.
+fn drive_stream_target(args: &[String]) -> Result<(StreamDriverReport, bool), String> {
+    let (target, target_args) = parse_stream_driver_args(args)?;
     let mut child = Command::new(&target)
         .args(&target_args)
         .stdin(Stdio::piped())
@@ -3912,9 +3920,20 @@ pub(super) fn run_stream_driver(args: &[String]) -> Result<i32, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("spawning stream target {}: {error}", target.display()))?;
-    let mut stdin = child.stdin.take().ok_or("stream target has no stdin")?;
-    let stdout = child.stdout.take().ok_or("stream target has no stdout")?;
-    let stderr = child.stderr.take().ok_or("stream target has no stderr")?;
+    // A target that stops reading between phases is a failed phase
+    // (`phase_complete: false`), never a SIGPIPE: this binary runs with SIGPIPE
+    // at its default (terminate) disposition, so the phases go through
+    // `ChildPipeWriter`, which reports the dead reader as `EPIPE`.
+    let pipes = (
+        ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child),
+        child.stdout.take(),
+        child.stderr.take(),
+    );
+    let (Ok(mut stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("stream target pipes are missing or unusable".to_string());
+    };
     let stdout_truncated = Arc::new(AtomicBool::new(false));
     let stdout_read_error = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -3945,39 +3964,8 @@ pub(super) fn run_stream_driver(args: &[String]) -> Result<i32, String> {
         }
     });
     let stderr_worker = thread::spawn(move || drain_bounded(stderr));
-    let phases: [(&[u8], &[u8]); 3] = [
-        (b"(echo \"phase-one\")\n", b"phase-one\n"),
-        (b"(check-sat)\n", b"sat\n"),
-        (b"(echo \"phase-two\")\n", b"phase-two\n"),
-    ];
     let mut combined_stdout = Vec::new();
-    let mut phase_complete = true;
-    for (request, expected) in phases {
-        if stdin
-            .write_all(request)
-            .and_then(|()| stdin.flush())
-            .is_err()
-        {
-            phase_complete = false;
-            break;
-        }
-        match receiver.recv_timeout(STREAM_PHASE_TIMEOUT) {
-            Ok(line) => {
-                phase_complete &= line == expected;
-                combined_stdout.extend_from_slice(&line);
-            }
-            Err(_) => {
-                phase_complete = false;
-                break;
-            }
-        }
-    }
-    if phase_complete {
-        phase_complete &= stdin
-            .write_all(b"(exit)\n")
-            .and_then(|()| stdin.flush())
-            .is_ok();
-    }
+    let phases = exchange_stream_phases(&mut stdin, &receiver, &mut combined_stdout);
     drop(stdin);
     let (status, target_timed_out) = wait_stream_target(&mut child, STREAM_PHASE_TIMEOUT)?;
     stdout_worker
@@ -3997,18 +3985,95 @@ pub(super) fn run_stream_driver(args: &[String]) -> Result<i32, String> {
         exit_code: status.and_then(|status| status.code()),
         stdout: String::from_utf8_lossy(&combined_stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        phase_complete,
+        phase_complete: phases.complete,
         target_timed_out,
         stdout_truncated: stdout_truncated.load(Ordering::Acquire),
         stderr_truncated,
         read_error: stdout_read_error.load(Ordering::Acquire) || stderr_read_error,
     };
-    println!(
-        "{}",
-        serde_json::to_string(&report)
-            .map_err(|error| format!("serializing stream-driver report: {error}"))?
-    );
-    Ok(0)
+    Ok((report, phases.stdin_write_failed))
+}
+
+/// The stream target and its arguments, from the driver's command line.
+fn parse_stream_driver_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+    let mut target: Option<PathBuf> = None;
+    let mut target_args = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--target" => {
+                index += 1;
+                target = Some(PathBuf::from(
+                    args.get(index).ok_or("--target needs a path")?,
+                ));
+            }
+            "--target-arg" => {
+                index += 1;
+                target_args.push(args.get(index).ok_or("--target-arg needs a value")?.clone());
+            }
+            other => return Err(format!("unknown stream-driver flag {other:?}")),
+        }
+        index += 1;
+    }
+    let target = target.ok_or("stream driver requires --target")?;
+    Ok((target, target_args))
+}
+
+/// How the phase exchange with a stream target went.
+struct PhaseOutcome {
+    /// Every phase was answered as expected and `(exit)` was written.
+    complete: bool,
+    /// A write failed because the target had stopped reading.
+    stdin_write_failed: bool,
+}
+
+/// Write each phase to `stdin` and wait for its answer line, then `(exit)`
+/// once every phase answered as expected. The answers are appended to
+/// `combined_stdout`.
+fn exchange_stream_phases(
+    stdin: &mut impl std::io::Write,
+    answers: &mpsc::Receiver<Vec<u8>>,
+    combined_stdout: &mut Vec<u8>,
+) -> PhaseOutcome {
+    let phases: [(&[u8], &[u8]); 3] = [
+        (b"(echo \"phase-one\")\n", b"phase-one\n"),
+        (b"(check-sat)\n", b"sat\n"),
+        (b"(echo \"phase-two\")\n", b"phase-two\n"),
+    ];
+    let mut outcome = PhaseOutcome {
+        complete: true,
+        stdin_write_failed: false,
+    };
+    for (request, expected) in phases {
+        if stdin
+            .write_all(request)
+            .and_then(|()| stdin.flush())
+            .is_err()
+        {
+            outcome.stdin_write_failed = true;
+            outcome.complete = false;
+            return outcome;
+        }
+        match answers.recv_timeout(STREAM_PHASE_TIMEOUT) {
+            Ok(line) => {
+                outcome.complete &= line == expected;
+                combined_stdout.extend_from_slice(&line);
+            }
+            Err(_) => {
+                outcome.complete = false;
+                return outcome;
+            }
+        }
+    }
+    if outcome.complete {
+        let exited = stdin
+            .write_all(b"(exit)\n")
+            .and_then(|()| stdin.flush())
+            .is_ok();
+        outcome.stdin_write_failed = !exited;
+        outcome.complete = exited;
+    }
+    outcome
 }
 
 fn wait_stream_target(
@@ -4058,39 +4123,533 @@ fn drain_bounded(mut reader: impl std::io::Read) -> (Vec<u8>, bool, bool) {
     (retained, truncated, read_error)
 }
 
+#[cfg(all(test, unix))]
+mod child_pipe_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn diagnostic_execution(rows: Vec<ValidatorCase>) -> Execution {
+        Execution {
+            ay_sha256: "a".repeat(64),
+            z3_sha256: "b".repeat(64),
+            resource_envelope: "fixture".to_string(),
+            result: overall_validator_result(&rows),
+            cases: case_counts_from_rows(&rows).unwrap(),
+            case_results: rows,
+        }
+    }
+
     #[test]
-    fn base_catalog_and_source_ownership_cardinalities_are_closed() {
-        let base_count = standard_command_cases().len()
-            + standard_command_arity_cases().len()
-            + extension_command_cases().len()
-            + extension_command_arity_cases().len()
-            + state_and_diagnostic_cases().len()
-            + cli_cases().len()
-            + combinator_cases().len()
-            + TACTIC_COUNT
-            + PROBE_NAMES.len()
-            + 1;
-        assert_eq!(base_count, BASE_CASE_COUNT);
-        assert_eq!(EXPECTED_SOURCE_OWNER_COUNT, 1_518);
-        assert_eq!(EXPECTED_CASE_COUNT, 1_856);
-        assert_eq!(EXPECTED_UNRESOLVED_COMMAND_OWNERS, 57);
-        assert_eq!(EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERS, 63);
-        assert_eq!(EXPECTED_UNRESOLVED_SOURCE_OWNERS, 301);
-        assert_eq!(EXPECTED_AUDITED_GAP_UNIVERSE_OWNERS, 496);
-        assert_eq!(RESOLVED_EXTENSION_COMMANDS.len(), 6);
-        assert_eq!(RESOLVED_INFO_KEYS.len(), 11);
-        assert_eq!(RESOLVED_OPTION_KEYS.len(), 16);
-        assert_eq!(parser_tokens::semantic_owner_names().count(), 12);
-        assert_eq!(declaration_builtins::semantic_owner_names().count(), 126);
-        assert_eq!(RESOLVED_LOGIC_RECOGNIZER_LITERALS.len(), 24);
-        assert_eq!(EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS, 0);
+    fn replay_diagnostic_locates_first_changed_row_fields_and_commitment() {
+        let cases = [
+            batch_case("diagnostic-first", "(exit)\n"),
+            batch_case("diagnostic-second", "(exit)\n"),
+        ];
+        let rows = cases
+            .iter()
+            .map(|case| row_from_pair(case, completed(""), completed(""), None))
+            .collect::<Vec<_>>();
+        let mut changed = rows.clone();
+        changed[1].observed = changed[1].observed.replacen(
+            "oracle-stdout-sha256=",
+            "oracle-stdout-sha256=changed-",
+            1,
+        );
+        changed[1].stdout = Some("different normalized record".to_string());
+        let live = diagnostic_execution(changed);
+        let error = require_execution_match(
+            overall_validator_result(&rows),
+            &case_counts_from_rows(&rows).unwrap(),
+            &rows,
+            &live,
+        )
+        .unwrap_err();
+        assert!(error.contains("first-row=1"), "{error}");
+        assert!(error.contains("diagnostic-second"), "{error}");
+        assert!(
+            error.contains("fields=[\"observed\", \"stdout\"]"),
+            "{error}"
+        );
+        assert!(error.contains("oracle-stdout-sha256="), "{error}");
+    }
+
+    #[test]
+    fn replay_diagnostic_distinguishes_count_drift_and_missing_rows() {
+        let case = batch_case("diagnostic-row", "(exit)\n");
+        let rows = vec![row_from_pair(&case, completed(""), completed(""), None)];
+        let live = diagnostic_execution(rows.clone());
+        let mut wrong_counts = live.cases.clone();
+        wrong_counts.passed = 0;
+        wrong_counts.failed = 1;
+        let error = require_execution_match(ValidatorResult::Fail, &wrong_counts, &rows, &live)
+            .unwrap_err();
+        assert!(
+            error.contains("row-content=identical") && error.contains("counts="),
+            "{error}"
+        );
+        let absent = diagnostic_execution(Vec::new());
+        let error = require_execution_match(live.result, &live.cases, &rows, &absent).unwrap_err();
+        assert!(
+            error.contains("first-row=0")
+                && error.contains("row-presence")
+                && error.contains("<missing>"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_diagnostic_is_bounded_and_escapes_control_bytes() {
+        let case = batch_case("diagnostic-bounded", "(exit)\n");
+        let rows = vec![row_from_pair(&case, completed(""), completed(""), None)];
+        let mut changed = rows.clone();
+        changed[0].observed = "\u{1b}\t\n🦀".repeat(100_000);
+        changed[0].stdout = Some("\0\r\n".repeat(100_000));
+        let mut live = diagnostic_execution(rows.clone());
+        live.case_results = changed;
+        let detail = replay_difference(live.result, &live.cases, &rows, &live);
+        assert!(detail.len() <= 4096);
+        assert!(!detail.chars().any(char::is_control));
+    }
+
+    fn oversized_committed_row() -> (CaseSpec, ValidatorCase) {
+        let pattern = "\"\\\0é🦀";
+        let text = pattern.repeat(STREAM_LIMIT / pattern.len());
+        let mut candidate = completed(&text);
+        candidate.stderr = text.as_bytes().to_vec();
+        candidate.artifacts = (0..ARTIFACT_FILE_LIMIT)
+            .map(|index| ArtifactObservation {
+                path: format!("{index}/{}", "quoted\"\\\né/".repeat(100)),
+                size: u64::MAX,
+                sha256: "f".repeat(64),
+            })
+            .collect();
+        let mut baseline = candidate.clone();
+        baseline.stdout[0] = b'x';
+        let spec = require_oracle_difference(
+            batch_case("oversized-commitments", "(exit)\n"),
+            BaselineSpec {
+                args: vec!["-in".to_string()],
+                input: b"(exit)\n".to_vec(),
+                style: RunStyle::Batch,
+            },
+        );
+        let row = row_from_pair(&spec, candidate.clone(), candidate, Some(baseline));
+        (spec, row)
+    }
+
+    #[test]
+    fn oversized_complete_captures_keep_commitments_without_faking_child_truncation() {
+        let (spec, row) = oversized_committed_row();
+        assert_eq!(row.outcome, ValidatorCaseOutcome::Pass);
+        assert!(row.stdout.as_ref().unwrap().len() < 4096);
+        assert!(row.stderr.as_ref().unwrap().len() < 4096);
+        assert!(row.stdout.as_ref().unwrap().contains("omitted-bytes="));
+        assert!(!row.process.as_ref().unwrap().stdout_truncated);
+        assert!(!row.process.as_ref().unwrap().stderr_truncated);
+        let counts = case_counts_from_rows(std::slice::from_ref(&row)).unwrap();
+        let live = Execution {
+            ay_sha256: "a".repeat(64),
+            z3_sha256: "b".repeat(64),
+            resource_envelope: "fixture".to_string(),
+            result: ValidatorResult::Pass,
+            cases: counts.clone(),
+            case_results: vec![row.clone()],
+        };
+        require_execution_match(
+            ValidatorResult::Pass,
+            &counts,
+            std::slice::from_ref(&row),
+            &live,
+        )
+        .unwrap();
+        let mut forged = row.clone();
+        forged.stdout.as_mut().unwrap().push_str("forged preview");
+        assert!(require_execution_match(ValidatorResult::Pass, &counts, &[forged], &live).is_err());
+        let mut forged = row;
+        let start =
+            forged.observed.find("oracle-stdout-sha256=").unwrap() + "oracle-stdout-sha256=".len();
+        forged
+            .observed
+            .replace_range(start..start + 64, &"0".repeat(64));
+        assert!(require_execution_match(ValidatorResult::Pass, &counts, &[forged], &live).is_err());
+        assert!(spec.expected().contains(TRANSCRIPT_STORAGE_POLICY));
+    }
+
+    #[test]
+    fn replay_checks_bytes_beyond_the_diagnostic_preview() {
+        let spec = batch_case("tail-commitment", "(exit)\n");
+        let first = format!("{}x", "a".repeat(4096));
+        let second = format!("{}y", "a".repeat(4096));
+        let recorded = row_from_pair(&spec, completed(&first), completed(&first), None);
+        let fresh = row_from_pair(&spec, completed(&second), completed(&second), None);
+        assert_eq!(recorded.outcome, ValidatorCaseOutcome::Pass);
+        assert_eq!(fresh.outcome, ValidatorCaseOutcome::Pass);
+        let counts = case_counts_from_rows(std::slice::from_ref(&fresh)).unwrap();
+        let live = Execution {
+            ay_sha256: "a".repeat(64),
+            z3_sha256: "b".repeat(64),
+            resource_envelope: "fixture".to_string(),
+            result: ValidatorResult::Pass,
+            cases: counts.clone(),
+            case_results: vec![fresh],
+        };
+        assert!(
+            require_execution_match(ValidatorResult::Pass, &counts, &[recorded], &live).is_err()
+        );
+    }
+
+    #[test]
+    fn all_1978_worst_case_diagnostic_records_fit_the_receipt_bound() {
+        let cases = case_catalog(&current_observable_fixture()).unwrap();
+        let (_, worst) = oversized_committed_row();
+        let rows = cases
+            .iter()
+            .map(|case| {
+                let mut row = row_from_pair(
+                    case,
+                    completed(""),
+                    completed(""),
+                    case.oracle_baseline.as_ref().map(|_| completed("")),
+                );
+                // Reuse the maximally escaped record to stress serialized size,
+                // rather than hashing gigabytes of duplicate payload in this test.
+                row.stdout = worst.stdout.clone();
+                row.stderr = worst.stderr.clone();
+                row.observed = format!(
+                    "{};case-owner-bound={}",
+                    worst.observed,
+                    case.source_owner
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), SourceOwner::display)
+                );
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1978);
+        case_counts_from_rows(&rows).unwrap();
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "case_results": rows,
+            "receipt_metadata_headroom": "x".repeat(256 * 1024)
+        }))
+        .unwrap();
+        assert!(
+            bytes.len() as u64 <= MAX_VALIDATOR_RECEIPT_BYTES,
+            "worst-case receipt uses {} bytes",
+            bytes.len()
+        );
+    }
+
+    fn current_observable_fixture() -> Vec<z3_source_inventory::ObservableItem> {
+        let bytes = include_str!("../../data/z3-5.3.3/observable-items.tsv");
+        assert_eq!(
+            sha256_bytes(bytes.as_bytes()),
+            z3_source_inventory::EXPECTED_OBSERVABLE_SHA256
+        );
+        bytes
+            .lines()
+            .map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                z3_source_inventory::ObservableItem {
+                    category: fields.next().unwrap().to_string(),
+                    name: fields.next().unwrap().to_string(),
+                    detail: fields.next().unwrap().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_current_behavioral_rows_have_serializable_validated_descriptors() {
+        let items = current_observable_fixture();
+        let cases = case_catalog(&items).unwrap();
+        assert_eq!(cases.len(), 1978);
+        let rows = cases
+            .iter()
+            .map(|case| {
+                row_from_pair(
+                    case,
+                    completed(""),
+                    completed(""),
+                    case.oracle_baseline.as_ref().map(|_| completed("")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let counts = case_counts_from_rows(&rows).unwrap();
+        validate_case_results(&rows, &counts).unwrap();
+        let encoded = serde_json::to_vec(&rows).unwrap();
+        let decoded: Vec<ValidatorCase> = serde_json::from_slice(&encoded).unwrap();
+        validate_case_results(&decoded, &counts).unwrap();
+        validate_case_rows(&decoded, &cases).unwrap();
+    }
+
+    #[test]
+    fn owner_display_escapes_controls_without_changing_canonical_or_input_bytes() {
+        let owner = SourceOwner {
+            category: "tactic".to_string(),
+            name: "name\twith\ncontrols\\".to_string(),
+        };
+        assert_eq!(owner.canonical_line(), "tactic\tname\twith\ncontrols\\\n");
+        let display = owner.display();
+        validate_text(&display, "escaped owner").unwrap();
+        assert!(display.contains("\\t") && display.contains("\\n") && display.contains("\\\\"));
+        let raw_input = b"(echo \"literal\tinput\")\n";
+        let mut case = batch_case("display-controls", std::str::from_utf8(raw_input).unwrap());
+        case.source_owner = Some(owner);
+        validate_catalog_descriptors(std::slice::from_ref(&case)).unwrap();
+        assert_eq!(case.input, raw_input);
+        assert!(case.expected().contains(&sha256_bytes(raw_input)));
+        case.id.push('\n');
+        assert!(validate_catalog_descriptors(&[case]).is_err());
+    }
+
+    #[test]
+    fn changed_or_replaced_file_input_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.smt2");
+        let bytes = b"(check-sat)\n";
+        fs::write(&input, bytes).unwrap();
+        verify_preserved_input(&input, bytes).unwrap();
+        fs::write(&input, b"(check-sat) ").unwrap();
+        assert!(verify_preserved_input(&input, bytes).is_err());
+        fs::remove_file(&input).unwrap();
+        assert!(verify_preserved_input(&input, bytes).is_err());
+        #[cfg(unix)]
+        {
+            let replacement = directory.path().join("replacement");
+            fs::write(&replacement, bytes).unwrap();
+            std::os::unix::fs::symlink(&replacement, &input).unwrap();
+            assert!(verify_preserved_input(&input, bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_artifact_directories_cannot_evade_entry_or_depth_bounds() {
+        let wide = tempfile::tempdir().unwrap();
+        for index in 0..=ARTIFACT_FILE_LIMIT {
+            fs::create_dir(wide.path().join(format!("directory-{index}"))).unwrap();
+        }
+        assert!(capture_artifact_manifest(wide.path(), None)
+            .unwrap_err()
+            .contains("total file/directory entries"));
+        let deep = tempfile::tempdir().unwrap();
+        let mut path = deep.path().to_path_buf();
+        for _ in 0..=ARTIFACT_DEPTH_LIMIT {
+            path = path.join("directory");
+            fs::create_dir(&path).unwrap();
+        }
+        assert!(capture_artifact_manifest(deep.path(), None)
+            .unwrap_err()
+            .contains("depth"));
+    }
+
+    fn completed(stdout: &str) -> Captured {
+        Captured {
+            exit_code: Some(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            stdin_complete: true,
+            timed_out: false,
+            memout: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn observable(category: &str, name: &str) -> z3_source_inventory::ObservableItem {
+        z3_source_inventory::ObservableItem {
+            category: category.to_string(),
+            name: name.to_string(),
+            detail: "test source owner".to_string(),
+        }
+    }
+
+    #[test]
+    fn current_catalog_requires_authenticated_source_and_never_ay_registry_counts() {
+        assert!(case_catalog(&[]).is_err());
+        let cases = catalog_from_authenticated_items(&[]).expect("fixed catalog");
+        assert_eq!(cases.len(), BASE_FIXED_CASE_COUNT);
         assert_eq!(standard_command_cases().len(), SMTLIB_COMMANDS.len());
-        assert_eq!(SUPPORTED_TACTIC_NAMES.len(), TACTIC_COUNT);
-        assert_eq!(PROBE_NAMES.len(), 42);
+    }
+
+    #[test]
+    fn new_reference_components_and_unknown_commands_keep_individual_owners() {
+        let items = [
+            observable("tactic", "ff-sat"),
+            observable("probe", "is-qflia"),
+            observable("simplifier", "lambda-macros"),
+            observable("smt-command", "new-unaudited-command"),
+            observable("input-mode", "IN_NEW_FORMAT"),
+            observable("filename-extension", "new-format"),
+        ];
+        let cases = catalog_from_authenticated_items(&items).expect("owner catalog");
+        assert_eq!(cases.len(), BASE_FIXED_CASE_COUNT + items.len() + 2);
+        for item in &items {
+            let case = cases
+                .iter()
+                .find(|case| {
+                    case.source_owner.as_ref().is_some_and(|owner| {
+                        owner.category == item.category && owner.name == item.name
+                    })
+                })
+                .expect("every item owns a case");
+            let expected = if matches!(item.category.as_str(), "tactic" | "probe" | "simplifier") {
+                EffectRequirement::OracleDiffersFromBaseline
+            } else {
+                EffectRequirement::Unresolved
+            };
+            assert_eq!(case.effect_requirement, expected, "{}", item.name);
+        }
+        assert!(cases
+            .iter()
+            .any(|case| case.id == "tactic.primitive.ff-sat"));
+        assert!(cases.iter().any(|case| case.id == "tactic.probe.is-qflia"));
+    }
+
+    #[test]
+    fn current_receipt_binds_each_witness_and_refuses_fabricated_unresolved_pass() {
+        let item = observable("smt-command", "new-unaudited-command");
+        let spec = source_owned_case(&item, std::slice::from_ref(&item)).expect("owned case");
+        let row = row_from_pair(&spec, completed(""), completed(""), None);
+        assert_eq!(row.outcome, ValidatorCaseOutcome::Fail);
+        validate_case_rows(std::slice::from_ref(&row), std::slice::from_ref(&spec))
+            .expect("honest failure");
+        let mut fabricated = row.clone();
+        fabricated.outcome = ValidatorCaseOutcome::Pass;
+        assert!(validate_case_rows(&[fabricated], std::slice::from_ref(&spec)).is_err());
+        let mut altered = row;
+        altered.expected = altered.expected.replace(
+            EffectRequirement::Unresolved.id(),
+            EffectRequirement::Inherent.id(),
+        );
+        assert!(validate_case_rows(&[altered], std::slice::from_ref(&spec)).is_err());
+        assert!(validate_case_rows(&[], &[spec]).is_err());
+    }
+
+    #[test]
+    fn probe_requires_complementary_execution_not_matching_error_or_noop() {
+        let item = observable("probe", "is-qflia");
+        let spec = attach_owner(source_probe_case(&item.name), &item);
+        let failure = completed("(error \"tactic failed: fail-if tactic\")\n");
+        let goal = completed("(goals\n(goal (> x 0) :precision precise :depth 0)\n)\n");
+        assert_eq!(
+            row_from_pair(&spec, failure.clone(), failure.clone(), Some(goal.clone())).outcome,
+            ValidatorCaseOutcome::Pass
+        );
+        assert_eq!(
+            row_from_pair(&spec, goal.clone(), goal.clone(), Some(failure.clone())).outcome,
+            ValidatorCaseOutcome::Pass
+        );
+        assert_eq!(
+            row_from_pair(&spec, goal.clone(), goal.clone(), Some(goal)).outcome,
+            ValidatorCaseOutcome::Fail
+        );
+        let malformed = completed("(error \"invalid tactic, unknown probe is-qflia\")\n");
+        assert_eq!(
+            row_from_pair(&spec, malformed.clone(), malformed, Some(failure)).outcome,
+            ValidatorCaseOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn probe_effect_cannot_come_from_empty_duplicate_or_reformatted_branches() {
+        let item = observable("probe", "is-qflia");
+        let spec = attach_owner(source_probe_case(&item.name), &item);
+        let failure = completed("(error \"tactic failed: fail-if tactic\")\n");
+        for baseline in [
+            completed(""),
+            completed("(error \"tactic failed: fail-if tactic\")\n\n"),
+            completed("(error \"tactic failed: fail-if tactic\")\n(error \"tactic failed: fail-if tactic\")\n"),
+            completed("(goals)\n"),
+            completed("(goals (goal false :precision precise :depth 0))\n"),
+        ] {
+            assert_eq!(
+                row_from_pair(&spec, failure.clone(), failure.clone(), Some(baseline)).outcome,
+                ValidatorCaseOutcome::Fail
+            );
+        }
+        let goal = completed("(goals (goal (> x 0) :precision precise :depth 0))\n");
+        let same_goal_reformatted =
+            completed("(goals\n (goal (> x 0) :precision precise :depth 0)\n)\n");
+        assert_eq!(
+            row_from_pair(&spec, goal.clone(), goal, Some(same_goal_reformatted)).outcome,
+            ValidatorCaseOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn parameter_rejection_is_not_an_observable_effect_pass() {
+        let item = observable("module-parameter", "sat.phase");
+        let spec = attach_owner(source_parameter_case(&item), &item);
+        let error = completed("(error \"unknown parameter phase\")\n");
+        assert_eq!(
+            row_from_pair(&spec, error.clone(), error, Some(completed("sat\n"))).outcome,
+            ValidatorCaseOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn valid_option_can_use_intentional_unknown_option_negative_control() {
+        let item = observable("smt-option-key", ":produce-models");
+        let spec = attach_owner(
+            source_option_key_case(&item.name).expect("known option"),
+            &item,
+        );
+        let valid = completed("true\n");
+        let negative = completed("(error \"unknown option ay-no-such-option\")\n");
+        assert_eq!(
+            row_from_pair(&spec, valid.clone(), valid, Some(negative.clone())).outcome,
+            ValidatorCaseOutcome::Pass
+        );
+        assert_eq!(
+            row_from_pair(&spec, negative.clone(), negative.clone(), Some(negative)).outcome,
+            ValidatorCaseOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn current_field_tactics_receive_real_field_constraints_and_require_an_effect() {
+        for name in ["ff-sat", "ff-simplify", "ff-solve", "ff-unique", "ff2bv"] {
+            let item = observable("tactic", name);
+            let spec = attach_owner(source_tactic_case(name), &item);
+            assert!(String::from_utf8_lossy(&spec.input).contains("(set-logic QF_FF)"));
+            assert!(String::from_utf8_lossy(&spec.input).contains("(not (= x (as ff1 F)))"));
+            let unchanged = completed("(goals\n(goal (= x x) :precision precise :depth 0)\n)\n");
+            assert_eq!(
+                row_from_pair(&spec, unchanged.clone(), unchanged.clone(), Some(unchanged)).outcome,
+                ValidatorCaseOutcome::Fail,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_owned_paths_normalize_only_retained_failed_diagnostics() {
+        let first = tempfile::tempdir().expect("first owned root");
+        let second = tempfile::tempdir().expect("second owned root");
+        let item = observable("smt-command", "assert");
+        let spec = attach_owner(source_command_case(&item.name), &item);
+        let row = |root: &Path, reason: &str| {
+            let paths =
+                current_abi::StagingPaths::new(&[(root, "@BEHAVIOR_INPUT@")]).expect("owned root");
+            let error = completed(&format!(
+                "(error \"{}: {reason}\")\n",
+                root.join("case.smt2").display()
+            ));
+            row_from_pair_with_paths(
+                &spec,
+                error.clone(),
+                error,
+                Some(completed("sat\n")),
+                Some(&paths),
+            )
+        };
+        let first_row = row(first.path(), "invalid assertion");
+        assert_eq!(first_row.outcome, ValidatorCaseOutcome::Fail);
+        assert_eq!(first_row, row(second.path(), "invalid assertion"));
+        assert_ne!(first_row, row(second.path(), "invalid command"));
     }
 
     #[test]
@@ -4110,7 +4669,7 @@ mod tests {
 
     #[test]
     fn known_partial_commands_override_stale_happy_path_witnesses() {
-        for &(category, name) in &EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS {
+        for &(category, name) in &KNOWN_PARTIAL_COMMAND_OWNERS {
             assert_eq!(category, "smt-command");
             let case = source_command_case(name);
             assert_eq!(
@@ -4151,28 +4710,6 @@ mod tests {
             assert_eq!(baseline.args, ["-in"], "{name}");
             assert_eq!(baseline.style, RunStyle::Batch, "{name}");
         }
-    }
-
-    #[test]
-    fn pinned_z3_5_help_fixtures_have_exact_hashes() {
-        assert_eq!(
-            sha256_bytes(include_bytes!(
-                "../../../ay-frontend/src/command/z3_5_help.txt"
-            )),
-            Z3_5_HELP_FIXTURE_SHA256
-        );
-        assert_eq!(
-            sha256_bytes(include_bytes!(
-                "../../../ay-frontend/src/command/z3_5_help_simplifier.txt"
-            )),
-            Z3_5_HELP_SIMPLIFIER_FIXTURE_SHA256
-        );
-        assert_eq!(
-            sha256_bytes(include_bytes!(
-                "../../../ay-frontend/src/command/z3_5_help_tactic.txt"
-            )),
-            Z3_5_HELP_TACTIC_FIXTURE_SHA256
-        );
     }
 
     #[test]
@@ -4217,14 +4754,14 @@ mod tests {
             assert_eq!(case.subject_args, ["--z3-mode", FILE_PLACEHOLDER], "{name}");
             assert!(
                 !String::from_utf8_lossy(&case.input).contains("(query ("),
-                "Z3 5.1.0 query expects a registered predicate name: {name}"
+                "Z3 5.3.3 query expects a registered predicate name: {name}"
             );
         }
     }
 
     #[test]
     fn every_z3_logic_recognizer_literal_has_a_distinguishing_witness() {
-        for name in RESOLVED_LOGIC_RECOGNIZER_LITERALS {
+        for name in ["ALL", "QF_FD", "LRA"] {
             let case = source_logic_recognizer_case(name);
             assert_eq!(
                 case.input,
@@ -4468,54 +5005,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_audited_command_gap_universe_digest_is_recomputed_from_canonical_rows() {
-        let mut owners = EXPECTED_UNRESOLVED_COMMAND_OWNER_KEYS
-            .iter()
-            .map(|(category, name)| SourceOwner {
-                category: (*category).to_string(),
-                name: (*name).to_string(),
+    fn no_owner_receives_no_effect_credit_without_source_proof() {
+        for (category, name) in KNOWN_PARTIAL_COMMAND_OWNERS {
+            assert!(source_proven_no_effect_reason(&SourceOwner {
+                category: category.to_string(),
+                name: name.to_string()
             })
-            .collect::<Vec<_>>();
-        owners.extend(RESOLVED_EXTENSION_COMMANDS.iter().map(|name| SourceOwner {
-            category: "smt-command".to_string(),
-            name: (*name).to_string(),
-        }));
-        owners.sort();
-        let digest = sha256_bytes(
-            owners
-                .iter()
-                .map(SourceOwner::canonical_line)
-                .collect::<Vec<_>>()
-                .concat()
-                .as_bytes(),
-        );
-        assert_eq!(owners.len(), EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERS);
-        assert_eq!(
-            digest,
-            EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERSHIP_SHA256
-        );
-    }
-
-    #[test]
-    fn exact_source_proven_no_effect_digest_is_recomputed_from_canonical_rows() {
-        let mut owners = EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNER_KEYS
-            .iter()
-            .map(|(category, name)| SourceOwner {
-                category: (*category).to_string(),
-                name: (*name).to_string(),
-            })
-            .collect::<Vec<_>>();
-        owners.sort();
-        let digest = sha256_bytes(
-            owners
-                .iter()
-                .map(SourceOwner::canonical_line)
-                .collect::<Vec<_>>()
-                .concat()
-                .as_bytes(),
-        );
-        assert_eq!(owners.len(), EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERS);
-        assert_eq!(digest, EXPECTED_SOURCE_PROVEN_NO_EFFECT_OWNERSHIP_SHA256);
+            .is_none());
+        }
     }
 
     #[test]
@@ -4577,6 +5074,226 @@ mod tests {
         assert_ne!(
             canonicalize_statistics(left),
             canonicalize_statistics("sat\n(error \"diagnostic\")\n(:memory 1.25\n :other 7)\n")
+        );
+    }
+
+    #[test]
+    fn legacy_log_statistics_preserve_labels_units_and_other_output() {
+        let first = "max. heap size:     0.195114 Mbytes\ntime:               7.5e-05\n";
+        let second = "max. heap size:     1.25 Mbytes\ntime:               0.004\n";
+        assert_eq!(
+            canonicalize_statistics(first),
+            canonicalize_statistics(second)
+        );
+        let normalized = canonicalize_statistics(first);
+        assert!(normalized.contains("max. heap size:     <numeric> Mbytes"));
+        assert!(normalized.contains("time:               <numeric>"));
+        for changed in [
+            first.replace("Mbytes", "Gbytes"),
+            first.replace("time:", "duration:"),
+            format!("{first}(error \"not statistics\")\n"),
+            first.replace("7.5e-05", "NaN"),
+            first.replace("7.5e-05", "-0.01"),
+        ] {
+            assert_ne!(normalized, canonicalize_statistics(&changed));
+        }
+    }
+
+    #[test]
+    fn every_current_log_or_statistics_route_has_a_typed_comparator() {
+        let cases = case_catalog(&current_observable_fixture()).unwrap();
+        let mut routes = std::collections::BTreeSet::new();
+        for case in &cases {
+            if produces_known_telemetry(case) {
+                assert!(
+                    matches!(
+                        case.comparator,
+                        Comparator::Statistics | Comparator::ComponentTrace
+                    ),
+                    "{}",
+                    case.id
+                );
+                routes.insert(case.source_owner.as_ref().map_or_else(
+                    || case.id.clone(),
+                    |owner| format!("{}:{}", owner.category, owner.name),
+                ));
+            }
+        }
+        let expected = [
+            "cli.conflict.input-log-with-stdin",
+            "cli.stats.dash-st",
+            "cli.stats.param",
+            "cli-option:log",
+            "cli-option:st",
+            "cli-help-option:06",
+            "cli-help-option:26",
+            "filename-extension:log",
+            "input-mode:IN_Z3_LOG",
+            "smt-info-key::all-statistics",
+            "smt-command:set-logic",
+            "global-parameter:stats",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(routes, expected);
+        let mut missed = cases
+            .iter()
+            .find(|case| case.id == "cli.conflict.input-log-with-stdin")
+            .unwrap()
+            .clone();
+        missed.comparator = Comparator::ExactBytes;
+        assert!(validate_catalog_descriptors(&[missed]).is_err());
+    }
+
+    #[test]
+    fn telemetry_detection_parses_commands_and_preserves_component_trace_policy() {
+        assert!(input_requests_statistics(b"(get-info\n :all-statistics)\n"));
+        assert!(!input_requests_statistics(
+            b"; (get-info :all-statistics)\n(echo \"(get-info :all-statistics)\")\n"
+        ));
+        assert!(!input_requests_statistics(
+            b"(get-info :all-statistics extra)\n"
+        ));
+        let mut trace = batch_case("trace-telemetry", "(get-info :all-statistics)\n");
+        trace.comparator = Comparator::ComponentTrace;
+        assign_telemetry_comparator(&mut trace);
+        assert_eq!(trace.comparator, Comparator::ComponentTrace);
+        let unrelated = cli_case(
+            "unrelated-flag",
+            &["-logger", "other=stats=true"],
+            "(exit)\n",
+        );
+        assert!(!produces_known_telemetry(&unrelated));
+    }
+
+    #[test]
+    fn fixed_input_log_conflict_replays_changed_legacy_timing() {
+        let cases = case_catalog(&current_observable_fixture()).unwrap();
+        let case = cases
+            .iter()
+            .find(|case| case.id == "cli.conflict.input-log-with-stdin")
+            .unwrap();
+        let first = "max. heap size:     0.195114 Mbytes\ntime:               7.5e-05\n";
+        let second = "max. heap size:     0.195114 Mbytes\ntime:               7.6e-05\n";
+        let recorded = row_from_pair(
+            case,
+            completed(first),
+            completed("stable AY response\n"),
+            None,
+        );
+        let replayed = row_from_pair(
+            case,
+            completed(second),
+            completed("stable AY response\n"),
+            None,
+        );
+        assert_eq!(recorded, replayed);
+        let changed = row_from_pair(
+            case,
+            completed("sat\n"),
+            completed("stable AY response\n"),
+            None,
+        );
+        assert_ne!(recorded, changed);
+    }
+
+    #[test]
+    fn log_help_and_stats_owners_replay_measured_numeric_changes() {
+        let items = current_observable_fixture();
+        for (category, name) in [
+            ("cli-option", "log"),
+            ("cli-help-option", "06"),
+            ("cli-option", "st"),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item.category == category && item.name == name)
+                .unwrap();
+            let case = source_owned_case(item, &items).unwrap();
+            assert_eq!(case.comparator, Comparator::Statistics);
+            let mut first_ay = completed("sat\n");
+            first_ay.stderr = b"(:statistics\n :result sat\n :total-time 0.1\n)\n".to_vec();
+            let mut second_ay = first_ay.clone();
+            second_ay.stderr = b"(:statistics\n :result sat\n :total-time 0.9\n)\n".to_vec();
+            let first = row_from_pair(
+                &case,
+                completed("max. heap size:     0.195114 Mbytes\ntime:               7.5e-05\n"),
+                first_ay,
+                case.oracle_baseline.as_ref().map(|_| completed("sat\n")),
+            );
+            let second = row_from_pair(
+                &case,
+                completed("max. heap size:     0.195114 Mbytes\ntime:               7.6e-05\n"),
+                second_ay,
+                case.oracle_baseline.as_ref().map(|_| completed("sat\n")),
+            );
+            assert_eq!(first, second, "{category}:{name}");
+        }
+    }
+
+    #[test]
+    fn pbo_requires_valid_file_acceptance_and_its_exact_negative_parser_control() {
+        let item = observable("cli-option", "pbo");
+        let case = source_owned_case(&item, std::slice::from_ref(&item)).unwrap();
+        assert_eq!(case.style, RunStyle::File);
+        assert_eq!(case.file_extension, "smt2");
+        assert!(case.input.starts_with(b"* #variable="));
+        let mut rejected = completed(OPB_SMT2_REJECTION);
+        rejected.exit_code = Some(1);
+        let good = row_from_pair(
+            &case,
+            completed("sat\n"),
+            completed("sat\n"),
+            Some(rejected.clone()),
+        );
+        assert_eq!(good.outcome, ValidatorCaseOutcome::Pass);
+        rejected.stdout = b"(error \"unrelated failure\")\n".to_vec();
+        assert_eq!(
+            row_from_pair(
+                &case,
+                completed("sat\n"),
+                completed("sat\n"),
+                Some(rejected)
+            )
+            .outcome,
+            ValidatorCaseOutcome::Fail
+        );
+        let mut rejected = completed(OPB_SMT2_REJECTION);
+        rejected.exit_code = Some(1);
+        assert_eq!(
+            row_from_pair(
+                &case,
+                completed("unknown\n"),
+                completed("unknown\n"),
+                Some(rejected)
+            )
+            .outcome,
+            ValidatorCaseOutcome::Fail
+        );
+    }
+
+    #[test]
+    fn parallel_model_choice_is_not_a_causal_effect_witness() {
+        let parameter = observable("module-parameter", "parallel.enable");
+        let module = observable("parameter-module", "parallel");
+        let items = [parameter.clone(), module.clone()];
+        for item in &items {
+            let case = source_owned_case(item, &items).unwrap();
+            assert_eq!(case.effect_requirement, EffectRequirement::Unresolved);
+            assert!(!case
+                .input
+                .windows(b"get-model".len())
+                .any(|piece| piece == b"get-model"));
+            assert!(case
+                .expected()
+                .contains("non-unique model selection is not an effect"));
+            let row = row_from_pair(&case, completed("sat\n"), completed("sat\n"), None);
+            assert_eq!(row.outcome, ValidatorCaseOutcome::Fail);
+        }
+        assert_eq!(
+            case_catalog(&current_observable_fixture()).unwrap().len(),
+            1978
         );
     }
 

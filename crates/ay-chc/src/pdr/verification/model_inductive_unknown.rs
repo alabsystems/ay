@@ -40,9 +40,10 @@ impl PdrSolver {
             safe_eprintln!("  head={}", head);
         }
         // Budget check: if budget expired on a transition clause that
-        // returned Unknown, reject the model.
+        // returned Unknown, reject the model. A counted allowance
+        // (`verify_model_per_rule_counted`) expires when its work is spent.
         if let (Some(start), Some(b)) = (budget_start, budget) {
-            if start.elapsed() > b {
+            if start.elapsed() > b || crate::smt::executor_work::executor_work_spent() {
                 let has_bv = self
                     .problem
                     .predicates()
@@ -224,11 +225,13 @@ impl PdrSolver {
                 ChcExpr::Bool(false),
             ));
         }
-        // Blocking lemma fallback: try with only core invariants.
+        // Removing body conjuncts weakens the antecedent: proving the stronger
+        // implication still validates the original clause. The head must stay
+        // exact; a proof of a filtered head would certify a different model,
+        // which query-only rechecks cannot authorize for this caller.
         let body_filtered = Self::filter_blocking_lemmas_aggressive(body);
-        let head_filtered = Self::filter_blocking_lemmas(head);
-        let query_filtered =
-            ChcExpr::and(body_filtered.clone(), ChcExpr::not(head_filtered.clone()));
+        let head_exact = head.clone();
+        let query_filtered = ChcExpr::and(body_filtered.clone(), ChcExpr::not(head_exact.clone()));
         self.smt.reset();
         let mut filtered_result = self.smt.check_sat_with_timeout(
             &query_filtered,
@@ -280,8 +283,7 @@ impl PdrSolver {
         if or_cases.len() > 1 {
             let mut all_cases_pass = true;
             for (case_idx, case_body) in or_cases.iter().enumerate() {
-                let case_query =
-                    ChcExpr::and(case_body.clone(), ChcExpr::not(head_filtered.clone()));
+                let case_query = ChcExpr::and(case_body.clone(), ChcExpr::not(head_exact.clone()));
                 self.smt.reset();
                 match self.smt.check_sat_with_timeout(
                     &case_query,
@@ -302,7 +304,7 @@ impl PdrSolver {
                         if Self::verify_model_clause_algebraically(
                             clause,
                             &body_filtered,
-                            &head_filtered,
+                            &head_exact,
                             case_body,
                         ) {
                             if self.config.verbose {
@@ -314,7 +316,7 @@ impl PdrSolver {
                             continue;
                         }
 
-                        if Self::verify_implication_algebraically(case_body, &head_filtered) {
+                        if Self::verify_implication_algebraically(case_body, &head_exact) {
                             if self.config.verbose {
                                 safe_eprintln!(
                                     "PDR: verify_model: clause {} case {} passed via algebraic implication",
@@ -332,7 +334,7 @@ impl PdrSolver {
                             clause_idx,
                             Some(case_idx),
                             case_body,
-                            &head_filtered,
+                            &head_exact,
                             case_split_timeout,
                         ) {
                             continue;
@@ -370,7 +372,7 @@ impl PdrSolver {
             clause_idx,
             None,
             &body_filtered,
-            &head_filtered,
+            &head_exact,
             verify_timeout,
         ) {
             *used_filtered_invariant = true;
@@ -378,7 +380,7 @@ impl PdrSolver {
         }
 
         // Algebraic implication fallback
-        if Self::verify_implication_algebraically(&body_filtered, &head_filtered) {
+        if Self::verify_implication_algebraically(&body_filtered, &head_exact) {
             if self.config.verbose {
                 safe_eprintln!(
                     "PDR: verify_model: clause {} passed via algebraic implication",
@@ -447,3 +449,7 @@ impl PdrSolver {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "model_inductive_unknown/exact_head_tests.rs"]
+mod exact_head_tests;

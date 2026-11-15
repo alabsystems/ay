@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% DEFECT: same as `enumeration_after_soli`, reached through `obji`, which stores
+% the very same objective-improving constraint without even exhibiting a
+% solution. `obji 0` asserts `obj <= -1`, which is contradictory here; the
+% formula is satisfiable and has two projections onto x1.
+f 1;
+obji 0;
+output NONE;
+conclusion ENUMERATION_COMPLETE 0;
+end pseudo-Boolean proof;

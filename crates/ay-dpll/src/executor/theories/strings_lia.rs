@@ -925,9 +925,8 @@ impl Executor {
     /// `(=> atom (= x char(K)))` — a VALID theorem by injectivity of codepoints
     /// (z3-confirmed g2a/zt5; control g2ctl stays sat). `K` outside `[0,196607]`
     /// is already handled by the existing `to_code ∈ [-1,196607]` range axiom.
-    /// SURROGATE guard: `K ∈ [0xD800, 0xDFFF]` has no Rust `char`, so it is
-    /// skipped (sound fall-through to unknown; z3 reports such K as sat — a
-    /// completeness, not soundness, gap).
+    /// A surrogate `K ∈ [0xD800, 0xDFFF]` is a character like any other; its
+    /// string holds the surrogate's carrier (`ay_core::smtlib_char`).
     pub(in crate::executor) fn collect_str_to_code_inversion_axioms(&mut self) -> Vec<TermId> {
         const PAIR_CAP: usize = 256;
         let mut atoms: Vec<(TermId, i64, TermId)> = Vec::new();
@@ -989,12 +988,8 @@ impl Executor {
         }
         let mut axioms: Vec<TermId> = Vec::new();
         for (x, k, atom) in atoms {
-            if !(0..=196_607).contains(&k) {
-                continue; // out-of-range: refuted by the to_code range axiom
-            }
-            // char::from_u32 returns None for surrogates [0xD800,0xDFFF] and for
-            // out-of-Unicode values — surrogate case fail-closes to unknown.
-            let Some(ch) = u32::try_from(k).ok().and_then(char::from_u32) else {
+            // Out of range: refuted by the to_code range axiom instead.
+            let Some(ch) = u32::try_from(k).ok().and_then(ay_core::smtlib_char) else {
                 continue;
             };
             let lit = self.ctx.terms.mk_string(ch.to_string());
@@ -1727,8 +1722,8 @@ impl Executor {
         let to_int_pin_axioms = self.collect_str_to_int_digit_pin_axioms();
         preprocessed.extend(to_int_pin_axioms);
 
-        // A2: `str.to_code(x)=K` (constant K in range, non-surrogate) pins `x` to
-        // the unique single-character string `char(K)`. Valid theorem (g2a/zt5).
+        // A2: `str.to_code(x)=K` (constant K in range) pins `x` to the unique
+        // single-character string `char(K)`. Valid theorem (g2a/zt5).
         let to_code_axioms = self.collect_str_to_code_inversion_axioms();
         preprocessed.extend(to_code_axioms);
 

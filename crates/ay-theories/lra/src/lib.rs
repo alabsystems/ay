@@ -39,8 +39,8 @@ extern crate ay_core;
 use crate::rational::Rational;
 // #8529: Use deterministic hash maps (FixedState) in all builds to prevent
 // non-deterministic HashMap iteration order from causing false-SAT results.
-// Previously, non-kani builds used hashbrown::{HashMap, HashSet} with
-// RandomState, making theory propagation order process-dependent.
+// Previously this used hashbrown::{HashMap, HashSet} with RandomState,
+// making theory propagation order process-dependent.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol, TermData, TermId, TermStore};
 use ay_core::{
@@ -194,6 +194,7 @@ mod implied_refinement;
 mod implied_row_reasons;
 mod implied_row_recursive;
 mod infrational;
+mod lia_dive;
 mod lia_patch;
 mod lia_support;
 mod lifecycle;
@@ -209,7 +210,6 @@ mod propagation;
 pub mod rational;
 mod rational_ops;
 mod simplex;
-mod sparse_matrix;
 mod stats;
 mod tableau;
 mod theory_solver;
@@ -223,10 +223,11 @@ mod rational_tests;
 mod rational_proptest;
 
 // Explicit re-exports: types used in the public API or by other crates
+pub use gomory::TermCut;
 pub use optimality_certificate::{CertificateAtom, OptimalityCertificate};
 pub use types::{
-    Bound, BoundProvenance, GcdRowInfo, GomoryCut, LinearExpr, LraModel, OptimizationResult,
-    OptimizationSense, VarStatus,
+    Bound, BoundProvenance, BoundReasons, GcdRowInfo, GomoryCut, LinearExpr, LraModel,
+    OptimizationResult, OptimizationSense, VarStatus,
 };
 // Crate-internal imports
 use types::{
@@ -250,7 +251,10 @@ use types::{
 ///   reconstructs reasons only during conflict analysis. ~90% of propagations
 ///   are never explained, so deferring avoids O(reason_len) allocation per
 ///   propagation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` is written out below: the derived form ends in an intrinsic
+/// `unreachable` arm.
+#[derive(Debug, Clone, Copy, Eq)]
 enum DeferredReason {
     /// Deferred reason for implied-bound propagation (row-walking).
     #[allow(dead_code)]
@@ -298,6 +302,56 @@ enum DeferredReason {
         /// `true` = upper bound, `false` = lower bound.
         need_upper: bool,
     },
+}
+
+impl PartialEq for DeferredReason {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ImpliedRow {
+                    var: a_var,
+                    need_upper: a_upper,
+                    fallback_row_idx: a_row,
+                },
+                Self::ImpliedRow {
+                    var: b_var,
+                    need_upper: b_upper,
+                    fallback_row_idx: b_row,
+                },
+            ) => a_var == b_var && a_upper == b_upper && a_row == b_row,
+            (
+                Self::DirectBound {
+                    var: a_var,
+                    need_upper: a_upper,
+                },
+                Self::DirectBound {
+                    var: b_var,
+                    need_upper: b_upper,
+                },
+            )
+            | (
+                Self::ImpliedBound {
+                    var: a_var,
+                    need_upper: a_upper,
+                },
+                Self::ImpliedBound {
+                    var: b_var,
+                    need_upper: b_upper,
+                },
+            ) => a_var == b_var && a_upper == b_upper,
+            (
+                Self::Interval {
+                    atom_term: a_term,
+                    for_upper: a_upper,
+                },
+                Self::Interval {
+                    atom_term: b_term,
+                    for_upper: b_upper,
+                },
+            ) => a_term == b_term && a_upper == b_upper,
+            _ => false,
+        }
+    }
 }
 
 /// Internal pending propagation with optional deferred reason materialization.
@@ -565,6 +619,12 @@ pub struct LraSolver {
     /// For example, `0 < 0` or `-1 >= 0`.
     /// Stores ALL reason literals so blocking clauses are complete (#8012).
     trivial_conflict: Option<Vec<TheoryLit>>,
+    /// #lra-scope-trail: scope depth at which `trivial_conflict` was
+    /// recorded. `pop_inner` clears the conflict only when it pops BELOW this
+    /// depth: a constant contradiction applied at push time
+    /// (`apply_pending_atoms_before_push`) in the scope of its assertion must
+    /// survive the pops of deeper scopes exactly like a trailed bound.
+    trivial_conflict_scope: usize,
     /// Set of (atom TermId, asserted value) pairs whose bounds have been asserted
     /// into the tableau. Prevents creating duplicate slack variables and tableau
     /// rows when the same atom is re-asserted across check() calls (#4919).
@@ -603,6 +663,9 @@ pub struct LraSolver {
     // #8319: Theory-layer disable flags for soundness debugging.
     no_theory_propagation: bool,
     no_implied_bounds: bool,
+    /// Skip implied-bounds derivation during BCP-time checks only; the
+    /// final-check cascade is kept. See [`LraSolver::set_no_bcp_implied_bounds`].
+    no_bcp_implied_bounds: bool,
     no_bound_refinement: bool,
     max_fixpoint_rounds: Option<u32>,
     /// Per-theory runtime statistics (#4706, consolidated into sub-struct #8841).
@@ -641,6 +704,16 @@ pub struct LraSolver {
     /// cross-theory terms (select, UF applications) are expected and handled
     /// by the outer Nelson-Oppen loop (#5524).
     combined_theory_mode: bool,
+    /// Uninterpreted applications are opaque variables that another theory
+    /// decides; their atoms are not unsupported (`set_opaque_applications`).
+    opaque_applications: bool,
+    /// When true, a binary `div`/`mod` and `abs` are opaque tableau variables
+    /// WITHOUT marking their atoms unsupported, because the caller defines
+    /// them itself: the CDCL(T) kernel's arithmetic plug-in adds their
+    /// defining clauses to the search (`ay-cdclt`, design K4 "a div/mod
+    /// definition over a fresh symbol") and admits `div`/`mod` only by a
+    /// non-zero numeral. Nothing else changes, unlike `combined_theory_mode`.
+    defined_operators: bool,
     /// Persistent mapping from (atom TermId, asserted_value) to (slack_var, orig_constant).
     /// Prevents creating duplicate slack variables when the same atom is re-asserted
     /// after push/pop cycles (#4919). The orig_constant is stored so re-assertions
@@ -700,12 +773,16 @@ pub struct LraSolver {
     /// Reused across substitute_var_i64_with_col_deltas calls within a single pivot
     /// to avoid per-affected-row allocation of Vec<(u32, i128)>.
     pivot_subst_i64_buf: Vec<(u32, i128)>,
-    /// Bland mode: when true, use smallest-index pivot selection (anti-cycling).
-    /// Activated after `basis_repeat_count` exceeds threshold (#4919 Phase 2).
+    /// When true, use the least-index feasibility pivot rule.
+    /// Activated after `pivots_before_bland` reaches BLAND_THRESHOLD.
     bland_mode: bool,
-    /// Count of consecutive iterations where the basis set repeated.
-    /// When this exceeds BLAND_THRESHOLD, bland_mode is activated.
-    basis_repeat_count: u32,
+    /// Wall-clock deadline of the enclosing solve, when the owner installed
+    /// one ([`Self::set_deadline`]). The dual simplex polls it before every
+    /// iteration and answers `Unknown` once it has passed: a pivot over exploding rationals can take seconds,
+    /// so the per-check pivot budget alone does not bound wall time.
+    solve_deadline: Option<ay_core::time::Instant>,
+    /// Number of pivots in this check before least-index selection takes over.
+    pivots_before_bland: u32,
     /// Position in `asserted_trail` up to which atoms have been processed by
     /// `check()`. On the next `check()` call, only atoms from this position
     /// onward need to be evaluated, avoiding the O(n log n) clone+sort of the
@@ -716,6 +793,13 @@ pub struct LraSolver {
     /// disequalities even when model_may_have_changed is false, to prevent
     /// the optimization from suppressing known violations (#4919).
     last_diseq_check_had_violation: bool,
+    /// `check()` answers a violated multi-variable disequality with Z3-style
+    /// `assume_eqs` model-value equality guesses in preference to the
+    /// expression split when a guess applies (#8707). Default `true`. A
+    /// caller that has already encoded every guessed pair (the CHC `HornSmt`
+    /// session) turns it off for one re-check so the violation comes back as
+    /// the split instead of an exhausted hint.
+    assume_eqs_over_split: bool,
     /// Buffered disequality split requests from batch evaluation (#6259).
     /// When check() finds multiple violated disequalities, the first is returned
     /// as NeedDisequalitySplit and the rest are stored here for batch draining
@@ -768,6 +852,37 @@ pub struct LraSolver {
     /// check instead of the O(vars) full scan when running with a small budget.
     /// Cleared when simplex completes (alongside `bounds_tightened_since_simplex`).
     vars_tightened_since_simplex: Vec<u32>,
+    /// Completeness chain for the simplex contradictory-bounds pre-scan:
+    /// true while every `vars[]` bound write since the last full pre-scan
+    /// is recorded in `vars_tightened_since_simplex`, so scanning only
+    /// those vars (ascending) finds exactly the full scan's first
+    /// contradiction. Set when a pre-scan completes over all vars (or
+    /// over the tightened set under this same invariant) without
+    /// skipping a contradictory var; broken by pops (trail-restored
+    /// bounds are unrecorded), lifecycle resets, snapshot restore, the
+    /// float layer, seeded-simplex save/restore, and the
+    /// refresh-for-propagate tightened clear — each enumerated at its
+    /// site. A debug-build oracle re-checks completeness on every
+    /// targeted scan (canary for a missed breaker, as with
+    /// `guard_tracked_only`).
+    pre_scan_tightened_complete: bool,
+    /// Bound-write counter vs its value at the last completed pre-scan:
+    /// post-simplex clears of `vars_tightened_since_simplex` may keep
+    /// `pre_scan_tightened_complete` only when every recorded write was
+    /// already scanned (an early-return Unsat pre-scan leaves vars
+    /// unscanned, and clearing then would lose their records while
+    /// their bounds persist).
+    tightened_writes: u64,
+    tightened_writes_at_scan: u64,
+    /// Sorted/deduped scratch for the targeted pre-scan.
+    pre_scan_scratch: Vec<u32>,
+    /// Number of sorted-targeted pre-scans run (test/diagnostic surface).
+    pub(crate) pre_scan_targeted_count: u64,
+    /// Number of `compute_materialization_delta` computations (each an
+    /// O(#vars) scan). Read-only evaluation passes over one unchanged
+    /// model should share one delta (see `get_value_sharing_delta`);
+    /// this counter makes repeated scans observable in tests.
+    materialization_delta_computations: std::cell::Cell<u64>,
     /// Guard-scan memo (#inc-guard-memo): true when the current (values, bounds)
     /// pair has been verified violation-free — either by a full
     /// `first_current_assignment_bound_violation` scan that found nothing, or by
@@ -798,7 +913,7 @@ pub struct LraSolver {
     /// predicate the fail-close guard uses). False for the pre-loop fast-path
     /// Sat (targeted tightened-vars scan only — trusts invariants #8810 says
     /// not to trust), for budget-exhaustion optimistic Sat (converted
-    /// Unknown→Sat in `dual_simplex_propagate`), for the BLAS bridge, and for
+    /// Unknown→Sat in `dual_simplex_propagate`), and for
     /// all non-Sat exits. Only a verified Sat may anchor `guard_clean_valid`
     /// in `save_feasible_snapshot`.
     last_simplex_verified: bool,
@@ -1019,15 +1134,36 @@ pub struct LraSolver {
     /// Invalidated on reset/soft_reset (same lifecycle as feasible_value_snapshot).
     phase_hint_cache: HashMap<TermId, bool>,
     /// Monotonic generation counter for `phase_hint_cache`. Bumped whenever the
-    /// cache content could have changed (full/incremental rebuild or clear).
+    /// cache content actually changes (a cached phase flips, an entry appears
+    /// or disappears, the registered-atom set grows, or the cache is cleared).
     /// Exposed via `TheorySolver::phase_hint_epoch` so the SAT-side phase
     /// seeder can skip its O(atoms) re-seed when the suggestions are unchanged
     /// since the last seed (#8003 follow-up: phase seeding was the top
     /// in-solver self-time leaf on QF_LRA induction benchmarks). Over-bumping
     /// is safe (an unnecessary re-seed); the invariant that matters is that it
-    /// never stays put across a real cache change, which is why every mutation
-    /// site bumps it.
+    /// never stays put across a real suggestion change.
     phase_hint_epoch: u64,
+    /// `registered_atoms.len()` as of the last `phase_hint_epoch` bump from a
+    /// snapshot rebuild. A newly registered atom has no cached phase yet, so
+    /// its (fallback-computed) suggestion was never seeded; a length delta
+    /// therefore counts as a suggestion change for epoch purposes.
+    phase_epoch_registered_len: usize,
+    /// Generation counter over the REST of what a phase query can read
+    /// (#nonlinear-phase-hints): the assignment (`vars[i].value`), the bounds
+    /// (through the materialisation delta), the columns (`term_to_var`,
+    /// `vars.len()`), the registered-atom set (`atom_cache`) and
+    /// `last_simplex_feasible` (which selects the live-vs-snapshot fallback in
+    /// `suggest_phase`). Bumped by `note_phase_state_change` at every site that
+    /// clears the guard memo `guard_clean_valid` — that memo's soundness
+    /// argument (see its doc) already enumerates every value and bound
+    /// mutation — plus bound retraction, `intern_var`, every new column,
+    /// `registered_atoms.insert` and `set_last_simplex_feasible`. Over-bumping
+    /// costs a re-seed; the invariant is that it never stays put across a
+    /// change one of those reads could observe. `phase_state_epoch` sums it
+    /// with `phase_hint_epoch`; the NRA / NIA `phase_hint_epoch` forward that
+    /// sum, and the DPLL extension's debug canary re-derives every hint on a
+    /// skipped seed.
+    model_epoch: u64,
     /// Number of tableau rows at the start of check(). Used to detect if
     /// new rows were added during atom processing (which requires simplex).
     rows_at_check_start: usize,
@@ -1047,6 +1183,14 @@ pub struct LraSolver {
     /// Scratch buffer for collecting dirty vars into a Vec for functions that
     /// require `&[u32]`. Reused across calls to avoid per-check allocation (#7719 D3).
     dirty_vars_scratch: Vec<u32>,
+    /// Scratch for `queue_compound_propagations_for_dirty_vars`: compound
+    /// atoms already visited by the current wake (cleared per call, capacity
+    /// kept), so the per-BCP-check wake allocates no fresh set.
+    compound_wake_seen_scratch: HashSet<TermId>,
+    /// Scratch for `queue_compound_propagations_for_dirty_vars`: one dirty
+    /// variable's compound refs, copied out of `compound_use_index` so the
+    /// queueing loop can borrow `self` mutably (cleared per variable).
+    compound_wake_refs_scratch: Vec<CompoundAtomRef>,
     /// Scratch buffer returned by `compute_implied_bounds()` for reuse across
     /// fixpoint iterations, avoiding per-iteration HashSet allocation.
     #[allow(dead_code)]
@@ -1110,6 +1254,16 @@ pub struct LraSolver {
     pub(crate) a5_core: bool,
     /// Position in `disequality_trail` at each push scope, for backtracking.
     disequality_trail_scopes: Vec<usize>,
+    /// Count of in-place value flips in `asserted` (an atom re-asserted
+    /// with the opposite value without an intervening pop). Flips and
+    /// this pop's unasserted atoms are the only events that can kill a
+    /// `disequality_trail` entry, so `pop_inner` skips its O(trail)
+    /// retain scan when neither happened since the last scan
+    /// (`diseq_retain_flip_snapshot`); resets/restore bump the counter
+    /// to force a rescan. `diseq_retain_scans` counts actual scans.
+    pub(crate) asserted_value_flips: u64,
+    pub(crate) diseq_retain_flip_snapshot: u64,
+    pub(crate) diseq_retain_scans: u64,
     /// Shared disequalities from Nelson-Oppen: (expr, reason_lits, eq_term) (#5228).
     /// These are disequalities forwarded from other theories (e.g., negated UF-equalities).
     /// Unlike `disequality_trail`, reasons are TheoryLit vectors rather than a single atom.
@@ -1201,6 +1355,15 @@ pub struct LraSolver {
     /// Set to `true` after `compile_theory_propagation_jit()`, reset to `false`
     /// when new atoms are registered.
     theory_prop_jit_compiled: bool,
+    /// Live entry count across `atom_index` values, maintained incrementally
+    /// at registration (and recomputed on snapshot import). Lets the lazy
+    /// JIT recompile in `propagate_var_atoms` amortize: recompiling on every
+    /// registration is O(atoms) native work per atom, quadratic over a search
+    /// that keeps registering (measured ~65% of Certora QF_UFDTLIA runtime).
+    atom_index_atom_count: u64,
+    /// `propagate_var_atoms` calls served interpreted since the last JIT
+    /// compile; bounds the stale window (see `jit_recompile_due`).
+    jit_stale_propagate_calls: u32,
     /// Reusable result buffer for JIT propagation to avoid per-call allocation.
     theory_prop_results: Vec<ay_jit::PropagationResult>,
     /// JIT-compiled pivot row cache (#8276).
@@ -1294,8 +1457,7 @@ pub struct LraSolver {
 // - No `Arc<LraSolver>` exists anywhere in the codebase
 // - All usages are owned (`let mut lra = LraSolver::new(...)`) or struct fields
 //   accessed via `&mut self` (e.g., `combiner.rs:51`)
-// - Kani proof `proof_set_terms_unset_terms_toggle_pointer_6612` in
-//   `verification/unsafe_bracket.rs` verifies the pointer state machine
+// - `issue_6612_tests.rs` checks the set_terms/unset_terms pointer state machine
 // SAFETY: LraSolver contains a `*const TermStore` raw pointer which is not
 // auto-Send. The pointer is safe to send across threads because:
 // 1. The pointer is never dereferenced after `unset_terms()` (nulled out).
@@ -1326,6 +1488,37 @@ impl LraSolver {
         }
     }
 
+    /// #nonlinear-phase-hints: record that something a phase query can read
+    /// has (possibly) changed. See `model_epoch`.
+    #[inline]
+    pub(crate) fn note_phase_state_change(&mut self) {
+        self.model_epoch = self.model_epoch.wrapping_add(1);
+    }
+
+    /// Write `last_simplex_feasible`, advancing `model_epoch` only when the
+    /// value actually flips (it selects which model `suggest_phase`'s cache
+    /// miss evaluates against).
+    #[inline]
+    pub(crate) fn set_last_simplex_feasible(&mut self, feasible: bool) {
+        if self.last_simplex_feasible != feasible {
+            self.last_simplex_feasible = feasible;
+            self.note_phase_state_change();
+        }
+    }
+
+    /// Generation counter covering EVERYTHING `get_value`, `has_value`,
+    /// `value_sign` and `suggest_phase` read: `phase_hint_epoch` (the phase
+    /// cache and feasible snapshot) plus `model_epoch` (assignment, bounds,
+    /// columns, atom registration, fallback selection). Both summands are
+    /// monotone, so the sum advances whenever either does. A theory whose
+    /// phase suggestion is a function of this solver's observable state and
+    /// the (immutable) term store may report it as its
+    /// `TheorySolver::phase_hint_epoch` (#nonlinear-phase-hints: NRA / NIA).
+    #[must_use]
+    pub fn phase_state_epoch(&self) -> u64 {
+        self.phase_hint_epoch.wrapping_add(self.model_epoch)
+    }
+
     /// Number of atoms registered with this solver (#certora-phase-epoch).
     /// Used by the combined-theory phase-hint epoch gate to distinguish
     /// giant industrial instances (where the SAT seeder's O(atoms) re-scan
@@ -1337,221 +1530,6 @@ impl LraSolver {
         self.registered_atoms.len()
     }
 }
-
-#[cfg(kani)]
-impl LraSolver {
-    /// Kani-only constructor: initializes only the pointer field, avoids
-    /// `TermStore::new()` and `lra_debug_flags()` which trigger deep
-    /// BTree/HashMap symbolic exploration that CBMC cannot handle (#6612).
-    #[cfg(kani)]
-    pub(crate) fn new_kani_minimal(ptr: *const TermStore) -> Self {
-        Self {
-            terms_ptr: ptr,
-            rows: Vec::new(),
-            vars: Vec::new(),
-            term_to_var: HashMap::default(),
-            var_to_term: HashMap::default(),
-            next_var: 0,
-            trail: Vec::new(),
-            bound_revision: 0,
-            scopes: Vec::new(),
-            asserted: HashMap::default(),
-            asserted_trail: Vec::new(),
-            cross_theory_asserted: HashMap::default(),
-            cross_theory_asserted_trail: Vec::new(),
-            cross_theory_asserted_scopes: Vec::new(),
-            atom_cache: HashMap::default(),
-            ite_link_terms: Vec::new(),
-            ite_link_terms_seen: HashSet::default(),
-            current_parsing_atom: None,
-            dirty: false,
-            pending_equalities: Vec::new(),
-            propagated_equality_pairs: HashSet::default(),
-            propagated_disequality_pairs: HashSet::default(),
-            trivial_conflict: None,
-            bound_atoms: HashSet::default(),
-            persistent_unsupported_atoms: HashSet::default(),
-            persistent_unsupported_trail: Vec::new(),
-            persistent_unsupported_scope_marks: Vec::new(),
-            integer_mode: false,
-            gomory_rng: 1,
-            pivot_rng: 1,
-            debug_lra: false,
-            debug_lra_bounds: false,
-            debug_lra_assert: false,
-            debug_lra_reset: false,
-            debug_lra_nelson_oppen: false,
-            debug_intern: false,
-            no_theory_propagation: false,
-            // (B9: the #warm-theory AY_LRA_NO_IMPLIED probe switch is retired —
-            // the O(depth²) implied-bounds question it existed to test is
-            // settled; flip this field directly for any future probe.)
-            no_implied_bounds: false,
-            no_bound_refinement: false,
-            max_fixpoint_rounds: None,
-            check_count: 0,
-            conflict_count: 0,
-            propagation_count: 0,
-            propagation_budget_exhaustions: 0,
-            bcp_simplex_skips: 0,
-            bcp_post_simplex_fast_skips: 0,
-            assert_dirty_skips: 0,
-            propagate_implied_bounds_fresh_skips: 0,
-            full_check_conflict_count: 0,
-            eager_reason_count: 0,
-            deferred_reason_count: 0,
-            deferred_direct_count: 0,
-            deferred_interval_count: 0,
-            deferred_implied_count: 0,
-            lazy_emitted_count: 0,
-            lazy_rejected_count: 0,
-            emitted_direct_count: 0,
-            emitted_implied_count: 0,
-            emitted_implied_row_count: 0,
-            stale_reason_filtered_count: 0,
-            stale_conflict_rejected_count: 0,
-            simplex_sat_count: 0,
-            total_pivots: 0,
-            full_check_pivots: 0,
-            simplex_budget_exhaustions: 0,
-            global_budget_exhaustions: 0,
-            check_pivot_count: 0,
-            check_pivot_budget_exhaustions: 0,
-            max_inner_cascade_depth: 0,
-            total_inner_cascade_rounds: 0,
-            f64_rows_skipped: 0,
-            f64_vars_skipped: 0,
-            max_outer_fixpoint_iters: 0,
-            total_outer_fixpoint_iters: 0,
-            cascade_depth_throttles: 0,
-            registered_atoms: HashSet::default(),
-            atom_index: HashMap::default(),
-            pending_propagations: Vec::new(),
-            pending_bound_refinements: Vec::new(),
-            propagated_atoms: HashSet::default(),
-            combined_theory_mode: false,
-            atom_slack: HashMap::default(),
-            expr_to_slack: HashMap::default(),
-            slack_var_set: HashSet::default(),
-            implied_bounds: Vec::new(),
-            fixed_term_value_table: HashMap::default(),
-            fixed_term_value_members: HashMap::default(),
-            pending_fixed_term_equalities: Vec::new(),
-            pending_offset_equalities: Vec::new(),
-            col_index: Vec::new(),
-            pivot_work_vec: Vec::new(),
-            pivot_work_dirty: Vec::new(),
-            pivot_row_coeffs_buf: Vec::new(),
-            pivot_row_constant_buf: Rational::zero(),
-            pivot_subst_i64_buf: Vec::new(),
-            bland_mode: false,
-            basis_repeat_count: 0,
-            last_check_trail_pos: 0,
-            last_diseq_check_had_violation: false,
-            pending_diseq_splits: Vec::new(),
-            pending_expr_splits: Vec::new(),
-            bounds_tightened_since_simplex: false,
-            post_simplex_bounds_added: false,
-            vars_tightened_since_simplex: Vec::new(),
-            guard_clean_valid: false,
-            last_simplex_verified: false,
-            guard_tracked_only: false,
-            rows_len_at_last_implied: 0,
-            ib_overlay_complete: false,
-            implied_trail: Vec::new(),
-            implied_trail_scopes: Vec::new(),
-            propagated_trail: Vec::new(),
-            propagated_trail_scopes: Vec::new(),
-            eager_repropagate_on_pop: false,
-            direct_bounds_changed_since_implied: true,
-            bcp_implied_single_pass: false,
-            warm_reuse_hint: false,
-            direct_bounds_changed_vars: Vec::new(),
-            bound_generation: 0,
-            var_bound_gen: Vec::new(),
-            row_computed_gen: Vec::new(),
-            last_simplex_feasible: false,
-            last_simplex_feasible_scopes: Vec::new(),
-            feasible_value_snapshot: Vec::new(),
-            pivots_at_last_snapshot: u64::MAX,
-            snapshot_pivot_skips: 0,
-            rows_at_check_start: 0,
-            to_int_terms: Vec::new(),
-            injected_to_int_axioms: HashSet::default(),
-            propagation_dirty_vars: DenseU32Set::default(),
-            dirty_vars_scratch: Vec::new(),
-            newly_bounded_scratch: HashSet::default(),
-            compound_use_index: HashMap::default(),
-            var_to_atoms: HashMap::default(),
-            last_compound_propagations_queued: 0,
-            last_compound_wake_dirty_hits: 0,
-            last_compound_wake_candidates: 0,
-            basic_var_to_row: HashMap::default(),
-            touched_rows: DenseIdxSet::default(),
-            propagate_direct_touched_rows_pending: false,
-            implied_bounds_fresh: false,
-            disequality_trail: Vec::new(),
-            deferred_eq_atoms: Vec::new(),
-            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
-            disequality_trail_scopes: Vec::new(),
-            shared_disequality_trail: Vec::new(),
-            shared_disequality_trail_scopes: Vec::new(),
-            unassigned_atom_count: Vec::new(),
-            infeasible_heap: std::collections::BinaryHeap::new(),
-            heap_epoch: 1,
-            in_infeasible_heap: Vec::new(),
-            heap_stale: true,
-            warm: warm_state::WarmSimplexState::new(),
-            float_simplex: simplex::float_simplex::FloatSimplex::new(),
-            reason_seen_buf: HashSet::default(),
-            not_inner_cache: HashMap::default(),
-            const_bool_cache: HashMap::default(),
-            refinement_eligible_cache: HashMap::default(),
-            is_integer_sort_cache: HashMap::default(),
-            bcp_implied_dry_streak: 0,
-            bcp_cascade_dry_streak: 0,
-            max_row_width: 0,
-            theory_prop_jit: ay_jit::TheoryPropJit::new(),
-            theory_prop_jit_compiled: false,
-            theory_prop_results: Vec::new(),
-            jit_propagation_count: 0,
-            pivot_row_cache: ay_jit::PivotRowCache::new(),
-            lra_basis_region_requests: Vec::new(),
-            lra_basis_region_candidate: None,
-            lra_basis_region_basis_epoch: 0,
-            precision_i64_rows: 0,
-            precision_i128_rows: 0,
-            precision_big_rows: 0,
-            negation_partners: Vec::new(),
-            standalone_simplex_mode: false,
-            propagation_candidates_buf: Vec::new(),
-            propagation_seen_buf: HashSet::default(),
-            touched_rows_snapshot_buf: DenseIdxSet::default(),
-            newly_bounded_sorted_buf: Vec::new(),
-            propagation_output_buf: Vec::new(),
-            interval_reason_seen_buf: HashSet::default(),
-            all_newly_bounded_buf: DenseU32Set::default(),
-            // reason-alloc-wip: reused reason-collection DFS scratch (pure
-            // scratch, cleared on each use — starts empty).
-            scratch_reason_visited: std::cell::RefCell::default(),
-            scratch_reason_on_stack: std::cell::RefCell::default(),
-            scratch_reason_seen: std::cell::RefCell::default(),
-        }
-    }
-}
-
-// ============================================================================
-// Kani Verification Harnesses
-// ============================================================================
-//
-// These proofs verify the core invariants of the LRA (Linear Real Arithmetic) solver:
-// 1. LinearExpr operations: term combining, scaling, negation
-// 2. Bounds consistency: lower <= upper implies feasibility
-// 3. Tableau invariants: pivot operations preserve structure
-// 4. Push/pop state consistency
-
-#[cfg(kani)]
-mod verification;
 
 #[cfg(test)]
 mod empty_conflict_tests;

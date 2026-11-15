@@ -71,18 +71,18 @@ fn partition_residuals(
     };
     for constraint in &plan.constraints {
         let Some((constant, linear)) = substitute_pins(&constraint.poly, pins) else {
-            system.relaxed += 1;
+            system.relaxed = system.relaxed.saturating_add(1);
             continue;
         };
-        match linear.as_slice() {
-            [] => {
+        match (linear.first(), linear.len()) {
+            (None, _) => {
                 if !constraint.rel.holds_for_sign(rational_sign(&constant)) {
                     return None;
                 }
             }
-            [(variable, coefficient)] => {
+            (Some((variable, coefficient)), 1) => {
                 if matches!(constraint.rel, Rel::Ne) {
-                    system.relaxed += 1;
+                    system.relaxed = system.relaxed.saturating_add(1);
                     continue;
                 }
                 let bound = -constant / coefficient;
@@ -91,28 +91,38 @@ fn partition_residuals(
                 } else {
                     constraint.rel
                 };
-                let interval = interval_for(&mut system.intervals, *variable);
+                let interval = interval_for(&mut system.intervals, *variable)?;
                 if !interval.tighten(&bound, relation) {
                     return None;
                 }
             }
-            _ if matches!(constraint.rel, Rel::Ne) => system.relaxed += 1,
+            _ if matches!(constraint.rel, Rel::Ne) => {
+                system.relaxed = system.relaxed.saturating_add(1);
+            }
             _ => system.coupled.push((constant, linear, constraint.rel)),
         }
     }
     Some(system)
 }
 
-fn interval_for(intervals: &mut Vec<(TermId, Interval)>, variable: TermId) -> &mut Interval {
-    if let Some(slot) = intervals
+/// The interval slot for `variable`, appended unbounded on first use.  `None`
+/// only if the slot just found or pushed is not addressable, which cannot
+/// happen; the caller declines the candidate rather than panicking.
+fn interval_for(
+    intervals: &mut Vec<(TermId, Interval)>,
+    variable: TermId,
+) -> Option<&mut Interval> {
+    let slot = match intervals
         .iter()
         .position(|(candidate, _)| *candidate == variable)
     {
-        return &mut intervals[slot].1;
-    }
-    intervals.push((variable, Interval::unbounded()));
-    let last = intervals.len() - 1;
-    &mut intervals[last].1
+        Some(slot) => slot,
+        None => {
+            intervals.push((variable, Interval::unbounded()));
+            intervals.len().checked_sub(1)?
+        }
+    };
+    intervals.get_mut(slot).map(|(_, interval)| interval)
 }
 
 fn solve_private_linear_system(
@@ -137,7 +147,7 @@ fn solve_private_linear_system(
             &-constant,
             *relation,
             linear[0].0,
-        );
+        )?;
     }
     for (variable, interval) in &residual.intervals {
         let lra_variable = solver.ensure_var_registered(*variable);
@@ -167,7 +177,7 @@ fn assert_relation(
     bound: &BigRational,
     relation: Rel,
     reason: TermId,
-) {
+) -> Option<()> {
     match relation {
         Rel::Eq => {
             solver.assert_linear_bound(coefficients, bound, true, false, reason);
@@ -177,8 +187,11 @@ fn assert_relation(
         Rel::Lt => solver.assert_linear_bound(coefficients, bound, false, true, reason),
         Rel::Ge => solver.assert_linear_bound(coefficients, bound, true, false, reason),
         Rel::Gt => solver.assert_linear_bound(coefficients, bound, true, true, reason),
-        Rel::Ne => unreachable!("disequalities are relaxed before private LRA assertion"),
+        // Disequalities are relaxed before private LRA assertion; one that
+        // reaches here declines the candidate instead of panicking.
+        Rel::Ne => return None,
     }
+    Some(())
 }
 
 fn assemble_candidate(
@@ -188,7 +201,9 @@ fn assemble_candidate(
     linear_model: &ay_lra::LraSolver,
     coupled_vars: &crate::HashSet<TermId>,
 ) -> Option<Vec<(TermId, BigRational)>> {
-    let mut model = Vec::with_capacity(plan.model_vars.len());
+    // Fallible reservation: a model that cannot be held is no candidate.
+    let mut model = Vec::new();
+    model.try_reserve_exact(plan.model_vars.len()).ok()?;
     for &variable in &plan.model_vars {
         let value = if let Some(value) = pins.get(&variable) {
             (*value).clone()

@@ -20,7 +20,7 @@ fn competition_raw_is_dead_under_every_proof_demand() {
         (assert (not p))
         (check-sat)
     ";
-    let demands: [(&str, fn(&mut Executor)); 5] = [
+    let demands: [(&str, fn(&mut Executor)); 7] = [
         ("no demand (certified default twin)", |_| {}),
         ("set_produce_proofs(true)", |exec| {
             exec.set_produce_proofs(true);
@@ -33,6 +33,12 @@ fn competition_raw_is_dead_under_every_proof_demand() {
         }),
         ("set_self_check(true)", |exec| {
             exec.set_self_check(true);
+        }),
+        ("ProofChecked", |exec| {
+            exec.set_verification_level(crate::VerificationLevel::ProofChecked);
+        }),
+        ("FullyVerified", |exec| {
+            exec.set_verification_level(crate::VerificationLevel::FullyVerified);
         }),
     ];
     for (demand, arm) in demands {
@@ -81,7 +87,7 @@ fn competition_raw_is_dead_under_every_proof_demand() {
             "{demand}: the raw lane must be unreachable outside shedding"
         );
         for (twin, exec) in [("certified", &certified), ("competition", &competition)] {
-            assert_eq!(
+            ::std::assert_eq!(
                 exec.statistics().get_string("unsat_admission"),
                 None,
                 "{demand}: {twin} twin statistics must not carry the raw \
@@ -179,8 +185,20 @@ fn competition_mode_publishes_an_instantiation_driven_quantified_unsat() {
         "certified default must agree, got {certified_outputs:?}"
     );
 
+    // "Pre-campaign" is a moving target. Killing the shedding yield alone no
+    // longer measures this barrier: the trace-arming retry DOES decline and
+    // return the fail-closed `unknown` at its own guard
+    // (`unknown_retries.rs:197`), but the stage-4 counterexample-free
+    // consequence re-solve (#quantifier-ce-free-resolve, 10375b113, made the
+    // solve's last resort by 20472280c / 4155c6f70) landed AFTER this test
+    // (529c2640a) and refutes this same shape one pass later, from
+    // `fire_stashed_ce_free_resolve` in `check_sat_guarded`
+    // (`check_sat.rs:2704`) -- after `cegar_refine_solve` has already run the
+    // retry. Kill both post-campaign lanes, each through its own committed
+    // switch, so the arm really is the pre-campaign path.
     let off = ay_core::MiscCliFlags {
         no_quantified_shedding_yield: true,
+        no_quantifier_ce_free_resolve: true,
         ..ay_core::MiscCliFlags::default()
     };
     let _guard = ay_core::misc_test_override::set(off);

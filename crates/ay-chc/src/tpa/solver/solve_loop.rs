@@ -6,7 +6,12 @@
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcVar, SmtResult};
 
-use super::{PowerKind, PowerResult, ReachResult, TpaResult, TpaSolver};
+use super::{ConcretePath, PowerKind, PowerResult, ReachResult, TpaResult, TpaSolver};
+use crate::engine_result::skeleton_counterexample;
+use crate::ground_derivation::linear_trace::{
+    engine_trace_counterexample, LinearTrace, TraceEdgeHint,
+};
+use crate::pdr::Counterexample;
 
 impl TpaSolver {
     /// Solve the CHC problem using TPA.
@@ -87,16 +92,10 @@ impl TpaSolver {
                         power,
                     };
                 }
-                PowerResult::Unsafe { steps, model } => {
-                    // Extract counterexample trace from the SAT model
-                    let ts = self
-                        .transition_system
-                        .as_ref()
-                        .expect("transition system set before solve");
-                    let trace = self.extract_trace_from_model(&model, ts);
+                PowerResult::Unsafe { steps, path } => {
                     return TpaResult::Unsafe {
                         steps,
-                        trace: if trace.is_empty() { None } else { Some(trace) },
+                        counterexample: self.unsafe_counterexample(steps, path),
                     };
                 }
                 PowerResult::Unknown => {
@@ -117,8 +116,70 @@ impl TpaSolver {
     }
 
     /// Extract transition system from CHC problem.
-    fn extract_transition_system(&self) -> Result<TransitionSystem, String> {
-        TransitionSystem::from_chc_problem(&self.problem)
+    fn extract_transition_system(&mut self) -> Result<TransitionSystem, String> {
+        let ts = TransitionSystem::from_chc_problem(&self.problem)?;
+        self.ts_from_problem = true;
+        Ok(ts)
+    }
+
+    /// The counterexample for an Unsafe verdict at `steps` transitions.
+    fn unsafe_counterexample(&self, steps: u64, path: Option<ConcretePath>) -> Counterexample {
+        match self.transition_system.as_ref() {
+            Some(ts) => self.counterexample_for_path(ts, steps, path),
+            None => skeleton_counterexample(&self.problem, Self::skeleton_depth(steps)),
+        }
+    }
+
+    fn skeleton_depth(steps: u64) -> usize {
+        usize::try_from(steps.min(100)).unwrap_or(100)
+    }
+
+    /// Ground-evidenced counterexample for `path` over this solver's
+    /// problem, or a skeleton of `steps` when the path is missing, does not
+    /// have `steps` transitions, belongs to a caller-supplied system, or does
+    /// not ground-validate. Consumers re-validate either way.
+    pub(super) fn counterexample_for_path(
+        &self,
+        ts: &TransitionSystem,
+        steps: u64,
+        path: Option<ConcretePath>,
+    ) -> Counterexample {
+        let skeleton = || skeleton_counterexample(&self.problem, Self::skeleton_depth(steps));
+        let Some(path) = path.filter(|path| {
+            self.ts_from_problem
+                && path.states.len() <= ConcretePath::MAX_STEPS + 1
+                && u64::try_from(path.states.len()).ok() == steps.checked_add(1)
+                && path.transition_locals.len() + 1 == path.states.len()
+        }) else {
+            return skeleton();
+        };
+        let endpoint = TraceEdgeHint {
+            ts_locals: path.endpoint_locals,
+            ..TraceEdgeHint::default()
+        };
+        let mut edges = Vec::with_capacity(path.states.len() + 1);
+        edges.push(endpoint.clone());
+        edges.extend(
+            path.transition_locals
+                .into_iter()
+                .map(|ts_locals| TraceEdgeHint {
+                    ts_locals,
+                    ..TraceEdgeHint::default()
+                }),
+        );
+        edges.push(endpoint);
+        let trace = LinearTrace {
+            predicate: ts.predicate,
+            states: path.states,
+            edges,
+        };
+        engine_trace_counterexample(
+            &self.problem,
+            &trace,
+            Self::skeleton_depth(steps),
+            self.config.base.cancellation_token.as_ref(),
+            "TPA",
+        )
     }
 
     /// Check trivial unreachability cases.
@@ -147,10 +208,10 @@ impl TpaSolver {
         {
             SmtResult::Sat(model) => {
                 // Immediate counterexample: init state satisfies query
-                let trace = self.extract_trace_from_model(&model, ts);
+                let path = self.trivial_path(&model, ts);
                 return Some(TpaResult::Unsafe {
                     steps: 0,
-                    trace: if trace.is_empty() { None } else { Some(trace) },
+                    counterexample: self.counterexample_for_path(ts, 0, Some(path)),
                 });
             }
             // SOUNDNESS NOTE (#2659): Unknown → fall through is conservative. We cannot
@@ -218,9 +279,7 @@ impl TpaSolver {
 
         // First check less-than reachability: can we reach query in <2^{power+1} steps?
         let result = match self.reachability_less_than(&init, &query, power, &ts) {
-            ReachResult::Reachable { steps, model, .. } => {
-                Some(PowerResult::Unsafe { steps, model })
-            }
+            ReachResult::Reachable { steps, path, .. } => Some(PowerResult::Unsafe { steps, path }),
             ReachResult::Unreachable => {
                 if self.config.verbose_level > 1 {
                     safe_eprintln!("TPA: System safe up to <2^{} steps", power + 1);
@@ -256,7 +315,7 @@ impl TpaSolver {
 
         // Then check exact reachability: can we reach query in exactly 2^{power+1} steps?
         let result = match self.reachability_exact(&init, &query, power, &ts) {
-            ReachResult::Reachable { steps, model, .. } => PowerResult::Unsafe { steps, model },
+            ReachResult::Reachable { steps, path, .. } => PowerResult::Unsafe { steps, path },
             ReachResult::Unreachable => {
                 if self.config.verbose_level > 1 {
                     safe_eprintln!("TPA: System safe up to 2^{} steps", power + 1);

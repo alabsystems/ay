@@ -7,6 +7,8 @@
 //! Implements propositional resolution checking and reverse-unit-propagation
 //! (RUP) for DRUP proof steps in Alethe proofs.
 
+#[path = "resolution_chain_fold.rs"]
+mod chain_fold;
 #[path = "resolution_exact.rs"]
 mod exact;
 #[path = "resolution_parity.rs"]
@@ -542,6 +544,29 @@ pub(crate) fn validate_chain_resolution_rule(
         return Err(invalid());
     }
 
+    // The unambiguous prefix folds incrementally in the total premise size
+    // (`resolution_chain_fold.rs`); only an ambiguous link reaches the search.
+    let (start, initial) =
+        match chain_fold::fold_unambiguous_prefix(terms, premise_clauses, progress) {
+            chain_fold::ChainFold::Complete(accumulator) => {
+                let mut target = det_hash_set_with_capacity(clause.len());
+                for &literal in clause {
+                    target.insert(decode_literal(terms, literal));
+                }
+                return if accumulator == target {
+                    Ok(())
+                } else {
+                    Err(invalid())
+                };
+            }
+            chain_fold::ChainFold::Stuck => return Err(invalid()),
+            chain_fold::ChainFold::Refused => return Err(ProofCheckError::ResourceLimit),
+            chain_fold::ChainFold::Ambiguous { index, accumulator } => {
+                let mut accumulator: Vec<SignedLiteral> = accumulator.into_iter().collect();
+                accumulator.sort_unstable();
+                (index, accumulator)
+            }
+        };
     let target = clause_as_set(terms, clause);
 
     // BOUNDED SEARCH over the ambiguous links, not a unique-pair demand.
@@ -575,8 +600,7 @@ pub(crate) fn validate_chain_resolution_rule(
         .saturating_mul(CHAIN_BRANCH_BUDGET_PER_LINK)
         .saturating_add(CHAIN_BRANCH_BUDGET_BASE);
 
-    let mut stack: Vec<(usize, Vec<SignedLiteral>)> =
-        vec![(1, clause_as_set(terms, premise_clauses[0]))];
+    let mut stack: Vec<(usize, Vec<SignedLiteral>)> = vec![(start, initial)];
     while let Some((idx, acc)) = stack.pop() {
         if idx == premise_clauses.len() {
             if acc == target {

@@ -5,11 +5,14 @@
 //! Minimal, proof-free symmetry detection for root preprocessing.
 
 pub(crate) mod detector;
+pub(crate) mod fixcut;
+pub(crate) mod flips;
 pub(crate) mod hhw;
 pub(crate) mod ir;
 pub(crate) mod orbitope;
 pub(crate) mod orbits;
 pub(crate) mod refinement;
+pub(crate) mod schreier;
 pub(crate) mod stats;
 
 use std::collections::BTreeMap;
@@ -33,6 +36,30 @@ pub(crate) const IR_MAX_GENERATORS: usize = 96;
 /// Deterministic work ceiling for the whole IR search, in edge-visits. Sized so
 /// detection stays in the tens of milliseconds on the instances it fires on.
 pub(crate) const IR_WORK_BUDGET: u64 = 30_000_000;
+/// Fix-and-cut (`--sat-symmetry-fix-and-cut`) runs the IR finder with the
+/// detector's size caps and these larger budgets: the route earns its time
+/// on the symmetric UNSAT families only when the whole group is found.
+pub(crate) const FIX_AND_CUT_IR_NODE_BUDGET: u64 = 200_000;
+/// Work ceiling for that IR search, in splitter visits. With the partition
+/// persistent along the search path a tree node costs only its refinement
+/// work, so this is the time bound: under a second on the largest misses
+/// (the 200M it was cost 3–4 s per multi-million-edge formula and found
+/// nothing there); em_8_4_5_fbc's whole group takes 66 ms, xor_op's search
+/// finishes within it.
+pub(crate) const FIX_AND_CUT_IR_WORK_BUDGET: u64 = 50_000_000;
+/// Generator cap for that IR search: a group of sign flips needs one
+/// generator per independent flip (Satsuma's dejavu returned 3,120 on
+/// xor_op_n40_d3), so the composite route's 96 would leave most of the
+/// group, and its fixings, unfound.
+pub(crate) const FIX_AND_CUT_IR_MAX_GENERATORS: usize = 8_192;
+/// Work ceiling for the fix-and-cut walk itself (chain sifts, orbit unions,
+/// clause scans), the analogue of Satsuma's cost limit.
+pub(crate) const FIX_AND_CUT_WORK_BUDGET: u64 = 400_000_000;
+/// Fix-and-cut rounds: after a round derives units, the residual formula
+/// (units propagated, the round's binaries added) is searched again, as
+/// Satsuma's `-iter` does — fixing breaks symmetries and exposes new ones
+/// (em_8_4_5_fbc: 12 fixings in one round, 18 for Satsuma over three).
+pub(crate) const FIX_AND_CUT_ROUNDS: u32 = 4;
 /// Substantiality gate for the signed route: breaking pays only when the
 /// symmetry is global. Measured: `ntil-90d-34` (1 generator) 30.5 s -> timeout;
 /// `homer11.shuffled` (96 generators / 220 vars) 44.8 s -> 1.85 s.

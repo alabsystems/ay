@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+% The same formula and binary, proved SATISFIABLE: x1 = x2 = 1 is its only model.
+f 2;
+sol x1 x2;
+output NONE;
+conclusion SAT;
+end pseudo-Boolean proof;

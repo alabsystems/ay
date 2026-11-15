@@ -11,6 +11,7 @@ use super::*;
 use crate::parser::ChcParser;
 use crate::pdr::PdrConfig;
 use crate::portfolio::{EngineConfig, PortfolioConfig, PortfolioResult, PortfolioSolver};
+use crate::ChcVar;
 
 fn parse_problem(smt: &str) -> ChcProblem {
     ChcParser::parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"))
@@ -281,6 +282,7 @@ fn test_dead_param_array_sort() {
 }
 
 mod frame_conditions;
+mod projection;
 
 /// Test: Body-to-body cross-predicate join variable must stay live.
 ///

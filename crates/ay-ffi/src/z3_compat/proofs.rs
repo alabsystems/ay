@@ -14,29 +14,28 @@
 //!   set an honest error code) unless the last `Z3_solver_check` was UNSAT
 //!   **and** proof production was enabled before that check. They NEVER return a
 //!   proof for a SAT/Unknown result or when production was off.
-//! - The returned text is the solver's own exporter output
+//! - The Alethe accessor and opaque fallback use the solver's exporter output
 //!   ([`Solver::export_last_proof_alethe`]). No proof text is invented here.
 //!
-//! # Representation deviation from Z3
+//! # Native proof applications and opaque fallback
 //!
-//! In real Z3, `Z3_solver_get_proof` returns a `Z3_ast` whose
-//! `Z3_ast_to_string` yields the proof. AY's proof is an `ay_core::Proof`
-//! (a separate DAG), not a `Term`, and ordinary AY `Z3_ast` handles index the
-//! context's authenticated term-capability arena — there is no faithful way to
-//! encode a proof as an ordinary term handle.
+//! Supported native asserted/unit-resolution derivations project structurally
+//! into context-owned proof applications. Their normal app/declaration/sort
+//! introspection and structural printing reflect the actual native DAG.
+//! No printed Alethe text is parsed to construct these applications.
 //!
-//! To preserve the Z3 surface while staying honest, [`Z3_solver_get_proof`]
-//! returns an opaque proof-AST handle tagged with the high bit
-//! ([`PROOF_AST_TAG`]); calling [`Z3_ast_to_string`](super::Z3_ast_to_string)
-//! on it returns the real Alethe text. The proof-AST handle is otherwise NOT a
-//! valid term and must not be passed to term inspection functions. Consumers
-//! that want the text directly should prefer the explicitly named
-//! [`Z3_solver_get_proof_string`]. This deviation is documented in the header.
+//! Other native rules retain the documented opaque, context-salted Alethe
+//! handle (kind UNKNOWN), rather than invent a Z3 proof-rule correspondence.
+//! [`Z3_solver_get_proof_string`] always returns the real Alethe artifact.
+//! The client proof-check callback uses this same arena. Unsupported native
+//! derivations or ambiguous tracked-premise bindings produce command errors;
+//! they are never presented to a client as invented proof applications.
 
 use std::ffi::c_char;
 
+use super::handle_params::ParamSet;
 use super::{
-    cache_string, decode_indexed_ast, encode_indexed_ast, ffi_guard_ast, ffi_guard_const_ptr,
+    cache_string, decode_indexed_ast, encode_indexed_ast, ffi_guard_const_ptr, ffi_guard_produced,
     ffi_guard_void, SolverCheckOutcome, Z3Context, Z3_ast, Z3_context, Z3_solver, Z3_string,
     PROOF_AST_TAG, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK,
 };
@@ -107,18 +106,19 @@ unsafe fn last_proof_alethe_or_error(ctx: &mut Z3Context, s: Z3_solver) -> Optio
 
 // ---- Proof production control ----
 
-/// Enable or disable proof production for this context's solver.
+/// Enable or disable proof production for the solver handle `s`.
 ///
-/// This is AY's named setter for the Z3 `proof` global parameter. Equivalent to
-/// `Z3_set_param_value(cfg, "proof", "true")` on the config before context
-/// creation. Enable this *before* the `Z3_solver_check` whose proof you want.
+/// This is AY's named setter for the Z3 `proof` parameter of one solver: it
+/// governs that handle's checks only, over the context default
+/// (`Z3_set_param_value(cfg, "proof", "true")` before context creation).
+/// Enable this *before* the `Z3_solver_check` whose proof you want.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must be a valid context pointer; `s` null or a live solver handle of it.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_set_proof_production(
     c: Z3_context,
-    _s: Z3_solver,
+    s: Z3_solver,
     enabled: bool,
 ) {
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
@@ -130,30 +130,46 @@ pub unsafe extern "C" fn Z3_solver_set_proof_production(
             if !ctx.decision_engine_is_usable("Z3_solver_set_proof_production") {
                 return;
             }
-            ctx.solver.set_produce_proofs(enabled);
-            ctx.clear_decision_check_artifacts();
+            // `s` is null or a live handle in the context arena (a separate
+            // allocation from `*ctx`).
+            let Some(handle) = s.as_mut() else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_solver_set_proof_production: null Z3_solver handle".to_string());
+                return;
+            };
+            handle.params.set_proofs(enabled);
+            handle.clear_check_artifacts();
             ctx.last_error = Z3_OK;
         });
     }
 }
 
-/// Returns true iff proof production is currently enabled for this context.
+/// Returns true iff proof production is enabled for the checks of `s`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must be a valid context pointer; `s` null or a live solver handle of it.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_solver_get_proof_production(c: Z3_context, _s: Z3_solver) -> bool {
+pub unsafe extern "C" fn Z3_solver_get_proof_production(c: Z3_context, s: Z3_solver) -> bool {
     // SAFETY: see Z3_solver_set_proof_production. `ffi_guard_int` null-checks `c`
     // and contains any panic; we re-route its c_int sentinel through a bool.
-    unsafe { super::ffi_guard_int(c, 0, |ctx| i32::from(ctx.solver.is_producing_proofs())) != 0 }
+    unsafe {
+        super::ffi_guard_int(c, 0, |ctx| {
+            let params = s
+                .as_ref()
+                .map_or_else(ParamSet::default, |handle| handle.params);
+            let engine = ctx.solver.is_producing_proofs();
+            i32::from(params.over(ctx.default_params).proofs_enabled(engine))
+        }) != 0
+    }
 }
 
 // ---- Proof retrieval ----
 
 /// Get the proof of unsatisfiability from the last `Z3_solver_check`.
 ///
-/// Returns an opaque proof-AST handle (see the module / header deviation note):
-/// `Z3_ast_to_string` on the returned handle yields AY's real Alethe proof text.
+/// Returns genuine proof applications for the supported native fragment,
+/// otherwise a context-owned opaque Alethe handle (see the module contract).
 ///
 /// Returns NULL (0) and sets `Z3_INVALID_USAGE` when:
 /// - proof production was not enabled before the check, or
@@ -173,21 +189,52 @@ pub unsafe extern "C" fn Z3_solver_get_proof(c: Z3_context, s: Z3_solver) -> Z3_
     // cannot cross the FFI boundary. `s` is null-checked inside
     // `last_proof_alethe_or_error`.
     unsafe {
-        ffi_guard_ast(c, |ctx| match last_proof_alethe_or_error(ctx, s) {
-            Some(text) => {
-                let Some(ast) = encode_indexed_ast(ctx, PROOF_AST_TAG, ctx.proof_texts.len())
-                else {
+        ffi_guard_produced(c, |ctx| {
+            if ctx.solver_handle_cache.contains(&s) {
+                // SAFETY: context ownership was checked in the handle arena.
+                if let Some(handle) = s
+                    .as_ref()
+                    .filter(|handle| handle.last_clause_trail_requested)
+                {
+                    if handle.last_check_outcome == Some(SolverCheckOutcome::Unsat) {
+                        if let Some(ast) = handle.last_clause_trail.as_ref().and_then(|trail| {
+                            super::proof_dag::materialize_clause_trail(ctx, trail)
+                        }) {
+                            ctx.last_error = Z3_OK;
+                            return ast;
+                        }
+                    }
                     ctx.last_error = Z3_INVALID_USAGE;
-                    ctx.error_msg = Some(
+                    ctx.error_msg = Some("Z3_solver_get_proof: complete native clause insertion trail is unavailable".into());
+                    return 0;
+                }
+            }
+            match last_proof_alethe_or_error(ctx, s) {
+                Some(text) => {
+                    // SAFETY: last_proof_alethe_or_error authenticated the owning
+                    // solver arena before this immutable snapshot read.
+                    let dag = s.as_ref().and_then(|handle| handle.last_proof_dag.clone());
+                    if let Some(ast) = dag
+                        .filter(|_| text.len() <= 1_048_576)
+                        .as_ref()
+                        .and_then(|dag| super::proof_dag::materialize(ctx, dag))
+                    {
+                        return ast;
+                    }
+                    let Some(ast) = encode_indexed_ast(ctx, PROOF_AST_TAG, ctx.proof_texts.len())
+                    else {
+                        ctx.last_error = Z3_INVALID_USAGE;
+                        ctx.error_msg = Some(
                         "Z3_solver_get_proof: proof handle arena exhausted its representable index space"
                             .to_string(),
                     );
-                    return 0;
-                };
-                ctx.proof_texts.push(text);
-                ast
+                        return 0;
+                    };
+                    ctx.proof_texts.push(text);
+                    ast
+                }
+                None => 0,
             }
-            None => 0,
         })
     }
 }

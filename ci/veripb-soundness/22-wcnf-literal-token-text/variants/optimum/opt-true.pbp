@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 1;
+% the hard clause forces x1, so the weight-5 soft clause (~x1) must be paid
+pol 1 5 *;
+output NONE;
+conclusion BOUNDS 5 5 : x1;
+end pseudo-Boolean proof;

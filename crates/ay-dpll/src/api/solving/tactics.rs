@@ -64,7 +64,7 @@ use crate::api::types::{
 };
 use crate::api::{Logic, Solver};
 use crate::preprocess::{
-    BitBlast, Der, DistributeForall, FlattenAnd, Nnf, PreprocessingPass, PropagateIneqs,
+    BitBlast, DistributeForall, FlattenAnd, Nnf, PreprocessingPass, PropagateIneqs,
     PropagateValues, QeLight, ReduceArgs, TseitinCnf, VariableSubstitution,
 };
 use crate::UnknownReason;
@@ -78,13 +78,107 @@ pub struct Goal {
     pub formulas: Vec<TermId>,
     /// The Z3 goal depth reached to produce this goal.
     pub depth: usize,
+    /// Immutable typed reconstruction; absent for identity transformations.
+    /// Created only by the solver's context-bound converted-goal entry.
+    pub model_converter: Option<super::tactic_model::TacticModelConverter>,
+}
+
+/// A public subgoal retaining the model reconstruction its terms require.
+#[derive(Debug, Clone)]
+pub struct TacticSubgoal {
+    pub formulas: Vec<Term>,
+    pub depth: usize,
+    pub model_converter: Option<super::tactic_model::TacticModelConverter>,
+}
+
+/// Retained native request for an adapter's input/output metadata copies.
+/// It borrows the existing evaluation controls/counter/arena and supplies no
+/// machine admission, proof or model authority. Nested requests share it.
+pub struct TacticOperation {
+    scope: crate::executor::TacticConstructionScope,
+    _read: crate::executor::EvaluationReadScope,
+    started_at: std::time::Instant,
+}
+/// The same original operation after its explicit native assertion handoff.
+/// Keeps construction scratch and controls alive through adapter publication.
+pub struct TacticDecision {
+    scope: crate::executor::TacticDeclarationScope,
+    _read: crate::executor::EvaluationReadScope,
+    pub result: VerifiedSolveResult,
+    pub model: Option<super::super::Model>,
+}
+impl TacticDecision {
+    /// Publish a terminal adapter failure before releasing this original read.
+    pub fn publish_failure(&self, solver: &mut Solver, error: &SolverError) {
+        solver.set_tactic_error_unknown(error);
+    }
+    /// Debit the actual native declaration table traversal, including vacant
+    /// buckets retained after scope rollback, before a borrowed adapter scan.
+    pub fn admit_declaration_scan(&self, solver: &Solver) -> bool {
+        self.validate(solver)
+            && self
+                .admission()
+                .admit(solver.var_names.allocation_size(), 0)
+                .is_ok()
+            && self.validate(solver)
+    }
+    pub fn validate(&self, solver: &Solver) -> bool {
+        self.scope.validate_decision(&solver.executor)
+    }
+    pub fn admission(&self) -> &dyn ay_core::term::TermConstructionAdmission {
+        self.scope.admission()
+    }
+}
+impl TacticOperation {
+    pub(super) fn sublimit_end(
+        &self,
+        milliseconds: Option<u32>,
+    ) -> Result<Option<std::time::Instant>, SolverError> {
+        match milliseconds.filter(|v| *v != 0 && *v != u32::MAX) {
+            None => Ok(None),
+            Some(ms) => self
+                .started_at
+                .checked_add(std::time::Duration::from_millis(u64::from(ms)))
+                .map(Some)
+                .ok_or_else(|| SolverError::TacticFailed("direct timeout overflow".into())),
+        }
+    }
+    /// Retire a failed adapter request while its original first refusal is
+    /// still live. This publishes negative evidence only.
+    pub fn publish_failure(self, solver: &mut Solver, error: &SolverError) {
+        solver.set_tactic_error_unknown(error);
+    }
+    pub fn admission(&self) -> &dyn ay_core::term::TermConstructionAdmission {
+        self.scope.admission()
+    }
+    pub fn validate(&self, solver: &Solver) -> bool {
+        self.scope.validate(&solver.executor)
+    }
 }
 
 impl Goal {
+    pub(crate) fn capture_model_converter<'a>(
+        &mut self,
+        terms: &TermStore,
+        names: impl Iterator<Item = (&'a String, &'a ay_frontend::SymbolInfo)>,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<(), TacticFailure> {
+        self.model_converter = Some(super::tactic_model::TacticModelConverter::capture(
+            terms,
+            &self.formulas,
+            names,
+            owner,
+        )?);
+        Ok(())
+    }
     /// A root goal (depth 0) over `formulas`, exactly as given.
     #[must_use]
     pub fn root(formulas: Vec<TermId>) -> Self {
-        Goal { formulas, depth: 0 }
+        Goal {
+            formulas,
+            depth: 0,
+            model_converter: None,
+        }
     }
 
     /// A root goal (depth 0) built the way Z3's `goal` is: every top-level
@@ -104,6 +198,7 @@ impl Goal {
         Goal {
             formulas: flatten_goal_formulas(terms, formulas),
             depth: 0,
+            model_converter: None,
         }
     }
 }
@@ -117,12 +212,27 @@ impl Goal {
 pub struct TacticFailure {
     /// The Z3-style failure reason (without the `tactic failed: ` prefix).
     pub message: String,
+    pub(crate) local_limit: Option<crate::api::TacticLimitKind>,
 }
 
 impl TacticFailure {
-    fn new(message: impl Into<String>) -> Self {
+    pub(super) fn limited(kind: crate::api::TacticLimitKind) -> Self {
+        Self {
+            message: kind.to_string(),
+            local_limit: Some(kind),
+        }
+    }
+    pub(super) fn into_solver_error(self) -> SolverError {
+        match self.local_limit {
+            Some(kind) => SolverError::TacticLimit(kind),
+            None => SolverError::TacticFailed(self.message),
+        }
+    }
+
+    pub(super) fn new(message: impl Into<String>) -> Self {
         TacticFailure {
             message: message.into(),
+            local_limit: None,
         }
     }
 }
@@ -137,6 +247,125 @@ pub type ApplyResult = Result<Vec<Goal>, TacticFailure>;
 struct StepOutcome {
     goals: Vec<Goal>,
     progressed: bool,
+}
+
+fn logical_failure(
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+    message: &str,
+) -> Result<StepOutcome, TacticFailure> {
+    if let Some(owner) = owner {
+        owner
+            .admit(message.len(), message.len())
+            .map_err(|_| TacticFailure::new("tactic original owner stopped"))?;
+    }
+    Err(TacticFailure::new(message))
+}
+
+fn reserve_owned<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+) -> Result<(), TacticFailure> {
+    if let Some(owner) = owner {
+        ay_core::term::reserve_counted(values, additional, owner)
+            .map_err(|_| TacticFailure::new("tactic original buffer admission refused"))
+    } else {
+        values.reserve(additional);
+        Ok(())
+    }
+}
+fn singleton_outcome(
+    goal: Goal,
+    progressed: bool,
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+) -> Result<StepOutcome, TacticFailure> {
+    let mut goals = Vec::new();
+    reserve_owned(&mut goals, 1, owner)?;
+    goals.push(goal);
+    Ok(StepOutcome { goals, progressed })
+}
+fn clone_goal_owned(
+    goal: &Goal,
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+) -> Result<Goal, TacticFailure> {
+    let mut formulas = Vec::new();
+    reserve_owned(&mut formulas, goal.formulas.len(), owner)?;
+    if let Some(owner) = owner {
+        owner
+            .admit(goal.formulas.len(), 0)
+            .map_err(|_| TacticFailure::new("tactic goal copy stopped"))?;
+    }
+    formulas.extend_from_slice(&goal.formulas);
+    Ok(Goal {
+        formulas,
+        depth: goal.depth,
+        model_converter: goal.model_converter.clone(),
+    })
+}
+fn append_goals_owned(
+    target: &mut Vec<Goal>,
+    source: Vec<Goal>,
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+) -> Result<(), TacticFailure> {
+    reserve_owned(target, source.len(), owner)?;
+    target.extend(source);
+    Ok(())
+}
+
+fn flatten_owned(
+    terms: &TermStore,
+    roots: &[TermId],
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<Vec<TermId>, TacticFailure> {
+    let mut seen = Vec::new();
+    reserve_owned(&mut seen, terms.len(), Some(owner))?;
+    seen.resize(terms.len(), false);
+    let mut pending = Vec::new();
+    reserve_owned(&mut pending, roots.len(), Some(owner))?;
+    pending.extend(roots.iter().rev().copied());
+    let mut result = Vec::new();
+    while let Some(id) = pending.pop() {
+        owner
+            .admit(1, 0)
+            .map_err(|_| TacticFailure::new("tactic flatten stopped"))?;
+        if id.index() >= terms.len() || terms.sort(id) != &ay_core::Sort::Bool {
+            return Err(TacticFailure::new("invalid Boolean goal"));
+        }
+        if seen[id.index()] {
+            continue;
+        }
+        seen[id.index()] = true;
+        if let TermData::App(ay_core::Symbol::Named(name), _) = terms.get(id) {
+            owner
+                .admit(name.len(), 0)
+                .map_err(|_| TacticFailure::new("tactic flatten stopped"))?;
+        }
+        match terms.get(id) {
+            TermData::App(ay_core::Symbol::Named(name), args)
+                if name == "and" && !terms.is_declared_function(name) =>
+            {
+                reserve_owned(&mut pending, args.len(), Some(owner))?;
+                for &child in args.iter().rev() {
+                    if child.index() >= id.index() {
+                        return Err(TacticFailure::new("invalid goal edge"));
+                    }
+                    pending.push(child);
+                }
+            }
+            TermData::Const(ay_core::Constant::Bool(true)) => {}
+            TermData::Const(ay_core::Constant::Bool(false)) => {
+                result.clear();
+                reserve_owned(&mut result, 1, Some(owner))?;
+                result.push(id);
+                return Ok(result);
+            }
+            _ => {
+                reserve_owned(&mut result, 1, Some(owner))?;
+                result.push(id);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// A goal-to-goal transformation.
@@ -155,6 +384,25 @@ struct StepOutcome {
 /// ```
 #[derive(Debug, Clone)]
 pub enum Tactic {
+    /// Shared immutable expression with the existing C tactic's settings.
+    Shared(std::sync::Arc<super::tactic_parameters::TacticInstance>),
+    /// Existing try-for API: an additional deadline, never a renewed owner.
+    TryFor(Box<Tactic>, u32),
+    /// Typed, validated existing simplifier parameters.
+    WithParams(Box<Tactic>, super::tactic_parameters::TacticParameters),
+    /// The native simplifier, distinct from the standalone flatten-and pass.
+    Simplify,
+    /// Exact modular BV encoding with a typed finite-field model converter.
+    FieldToBv,
+    /// Modular field constant propagation/ring reduction, retaining defining
+    /// equations and original free variables (identity model converter).
+    FieldSimplify,
+    /// Owned affine functional-dependency propagation; stalling keeps roots.
+    FieldUnique,
+    /// Owned field conjunction decision with independent model/theorem replay.
+    FieldSolve,
+    /// Owned lazy Boolean SAT/field algebra with native resolution checking.
+    FieldSat,
     /// The identity tactic (`skip`): one subgoal, unchanged, depth unchanged.
     Skip,
     /// The always-failing tactic (`fail`): yields an honest failure, no goal.
@@ -285,6 +533,8 @@ pub enum Tactic {
     /// Introduces fresh symbols, so the result is **equisatisfiable** (NOT
     /// equivalent). One depth increment.
     ReduceArgs,
+    /// Share common binary circuits in BV addition, multiplication, AND and OR.
+    MaxBvSharing,
     /// A CLASS F fragment tactic (`diff-neq`, `nlqsat`, `pb2bv`, `horn`,
     /// `horn-simplify`): every application is an HONEST failure carrying
     /// `message` — it produces NO goal, never a fabricated transform. z3
@@ -308,7 +558,238 @@ pub enum Tactic {
     Bv1Blast,
 }
 
+/// Execution metadata, not a resource grant or a claim of tactic completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TacticExecutionKind {
+    Legacy,
+    OwnedEquivalence,
+    OwnedModelConversion,
+}
+struct Requirements {
+    kind: TacticExecutionKind,
+    solver: bool,
+    simplifier: bool,
+    proof_transport: bool,
+}
+
 impl Tactic {
+    /// Shared sequence rewriter for an existing explicit simplify request.
+    /// The caller retains the same source/construction and output fences.
+    pub(crate) fn simplify_sequence_term(
+        terms: &mut TermStore,
+        source: TermId,
+        maximum: u32,
+        polynomial: super::PolynomialParameters,
+        limits: super::TacticParameters,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<TermId, TacticFailure> {
+        let restricted = super::tactic_parameters::Restricted::new(owner, None, limits.max_memory)?;
+        let result = (|| {
+            let mut steps = super::tactic_parameters::Steps::new(limits.max_steps);
+            let roots = super::tactic_polynomial::rewrite_with_sequences(
+                terms,
+                &[source],
+                maximum,
+                polynomial,
+                &mut steps,
+                &restricted,
+            )?;
+            let roots = if limits.elim_and == Some(true) {
+                super::tactic_bool_rewrite::rewrite(
+                    terms,
+                    &roots,
+                    super::tactic_bool_rewrite::ConjunctionMode::Eliminate,
+                    &mut steps,
+                    &restricted,
+                )?
+            } else {
+                roots
+            };
+            let source = roots
+                .first()
+                .copied()
+                .ok_or_else(|| TacticFailure::new("simplifier produced no term"))?;
+            // Ring/sequence normalization can create closed conditionals and
+            // comparisons after frontend elaboration. Finish through the same
+            // paid scalar worker as the direct API, retaining this request's
+            // Steps, deadline, arena and namespace checks.
+            super::tactic_propagate_values::simplify_term(
+                terms,
+                source,
+                super::tactic_bool_rewrite::ConjunctionMode::Retain,
+                &mut steps,
+                &restricted,
+            )
+        })();
+        restricted.settle(result)
+    }
+
+    /// Whether this tactic needs the caller's original construction owner.
+    pub fn requires_construction_admission(&self) -> bool {
+        self.requirements(None)
+            .map_or(true, |r| r.kind != TacticExecutionKind::Legacy)
+    }
+
+    /// Whether formulas alone are insufficient to reconstruct original models.
+    pub fn requires_model_conversion(&self) -> bool {
+        self.requirements(None).map_or(true, |r| {
+            r.kind == TacticExecutionKind::OwnedModelConversion
+        })
+    }
+
+    /// Inspect the actual tactic tree under the adapter's retained owner,
+    /// including traversal storage. A refusal must never select a fallback.
+    pub fn execution_kind_admitted(
+        &self,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<TacticExecutionKind, TacticFailure> {
+        self.requirements(Some(owner)).map(|r| r.kind)
+    }
+
+    pub(crate) fn execution_metadata_admitted(
+        &self,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<(TacticExecutionKind, bool), TacticFailure> {
+        self.requirements(Some(owner))
+            .map(|required| (required.kind, required.solver))
+    }
+
+    /// Whether this tree contains a transformation whose proof/core transport
+    /// is unavailable. This is inspected under the SAME original owner.
+    pub fn unsupported_goal_proof_transport_admitted(
+        &self,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<bool, TacticFailure> {
+        self.requirements(Some(owner)).map(|r| r.proof_transport)
+    }
+
+    fn requirements(
+        &self,
+        owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+    ) -> Result<Requirements, TacticFailure> {
+        let mut pending = Vec::new();
+        reserve_owned(&mut pending, 1, owner)?;
+        pending.push(self);
+        let mut result = Requirements {
+            kind: TacticExecutionKind::Legacy,
+            solver: false,
+            simplifier: false,
+            proof_transport: false,
+        };
+        while let Some(tactic) = pending.pop() {
+            if let Some(owner) = owner {
+                owner
+                    .admit(1, 0)
+                    .map_err(|_| TacticFailure::new("tactic metadata inspection stopped"))?;
+            }
+            match tactic {
+                Self::Shared(instance) => {
+                    reserve_owned(&mut pending, 1, owner)?;
+                    pending.push(&instance.body);
+                }
+                Self::TryFor(body, _) | Self::WithParams(body, _) => {
+                    if result.kind == TacticExecutionKind::Legacy {
+                        result.kind = TacticExecutionKind::OwnedEquivalence;
+                    }
+                    reserve_owned(&mut pending, 1, owner)?;
+                    pending.push(body);
+                }
+                Self::Simplify => {
+                    result.simplifier = true;
+                    // Ring normalization is equivalent, but this path does
+                    // not yet produce an independently replayable proof/core
+                    // converter. Never publish an identity certificate.
+                    result.proof_transport = true;
+                    if result.kind == TacticExecutionKind::Legacy {
+                        result.kind = TacticExecutionKind::OwnedEquivalence;
+                    }
+                }
+                Self::FieldToBv => result.kind = TacticExecutionKind::OwnedModelConversion,
+                Self::SolveEqs => {
+                    result.kind = TacticExecutionKind::OwnedModelConversion;
+                    result.proof_transport = true;
+                }
+                Self::PropagateValues => {
+                    if result.kind == TacticExecutionKind::Legacy {
+                        result.kind = TacticExecutionKind::OwnedEquivalence;
+                    }
+                    result.proof_transport = true;
+                }
+                Self::FieldSolve | Self::FieldSat => {
+                    result.kind = TacticExecutionKind::OwnedModelConversion;
+                    result.proof_transport = true;
+                }
+                Self::FieldUnique => {
+                    result.proof_transport = true;
+                    if result.kind == TacticExecutionKind::Legacy {
+                        result.kind = TacticExecutionKind::OwnedEquivalence;
+                    }
+                }
+                Self::FieldSimplify if result.kind == TacticExecutionKind::Legacy => {
+                    result.kind = TacticExecutionKind::OwnedEquivalence
+                }
+                Self::CtxSolverSimplify => result.solver = true,
+                Self::Then(a, b) | Self::OrElse(a, b) | Self::Cond(_, a, b) => {
+                    reserve_owned(&mut pending, 2, owner)?;
+                    pending.push(a.as_ref());
+                    pending.push(b.as_ref());
+                }
+                Self::Repeat(a, _) | Self::When(_, a) => {
+                    reserve_owned(&mut pending, 1, owner)?;
+                    pending.push(a.as_ref());
+                }
+                _ => {}
+            }
+        }
+        if let Some(owner) = owner {
+            owner
+                .check()
+                .map_err(|_| TacticFailure::new("tactic metadata inspection stopped"))?;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn apply_goals_admitted(
+        &self,
+        terms: &mut TermStore,
+        goal: Goal,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> ApplyResult {
+        self.apply_step_admitted(terms, goal, Some(owner))
+            .map(|out| out.goals)
+    }
+
+    fn apply_or_fail_admitted(
+        &self,
+        terms: &mut TermStore,
+        assertions: &mut Vec<TermId>,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<bool, TacticFailure> {
+        if self.requirements(Some(owner))?.kind == TacticExecutionKind::OwnedModelConversion {
+            return Err(TacticFailure::new(
+                "in-place tactic API cannot discard a model converter",
+            ));
+        }
+        owner
+            .admit(
+                assertions.len(),
+                assertions
+                    .len()
+                    .checked_mul(std::mem::size_of::<TermId>())
+                    .ok_or_else(|| TacticFailure::new("tactic root size overflow"))?,
+            )
+            .map_err(|_| TacticFailure::new("tactic original root admission refused"))?;
+        let out = self.apply_step_admitted(terms, Goal::root(assertions.clone()), Some(owner))?;
+        if out.goals.len() == 1 && out.progressed {
+            let mut goals = out.goals.into_iter();
+            if let Some(goal) = goals.next() {
+                *assertions = goal.formulas;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     /// The `flatten-and` tactic.
     #[must_use]
     pub fn flatten_and() -> Self {
@@ -325,6 +806,96 @@ impl Tactic {
     #[must_use]
     pub fn tseitin_cnf() -> Self {
         Tactic::TseitinCnf
+    }
+
+    /// Whether this descriptor union contains the implemented simplifier.
+    pub fn has_simplifier_parameters(
+        &self,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<bool, TacticFailure> {
+        self.requirements(Some(owner)).map(|r| r.simplifier)
+    }
+
+    /// Validate the supported descriptor union before changing configuration.
+    pub fn validate_parameters(
+        &self,
+        params: super::tactic_parameters::TacticParameters,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<(), TacticFailure> {
+        let required = self.requirements(Some(owner))?;
+        if !params.is_empty() && !required.simplifier {
+            return Err(TacticFailure::new(
+                "these parameters are unsupported by this tactic",
+            ));
+        }
+        owner
+            .check()
+            .map_err(|_| TacticFailure::new("original parameter owner stopped"))
+    }
+
+    /// Apply a validated update to actual shared tactic identities. Collect the
+    /// complete paid plan before changing any setting; no lock spans callbacks.
+    /// Stored using-params options override later updates, as upstream append.
+    pub fn update_parameters(
+        &self,
+        params: super::tactic_parameters::TacticParameters,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<(), TacticFailure> {
+        self.validate_parameters(params, owner)?;
+        let mut pending = Vec::new();
+        reserve_owned(&mut pending, 1, Some(owner))?;
+        pending.push((self, params));
+        let mut updates: Vec<(
+            &super::tactic_parameters::TacticInstance,
+            super::tactic_parameters::TacticParameters,
+        )> = Vec::new();
+        while let Some((node, incoming)) = pending.pop() {
+            owner
+                .admit(1, 0)
+                .map_err(|_| TacticFailure::new("original parameter owner stopped"))?;
+            match node {
+                Self::Shared(instance) => {
+                    owner
+                        .admit(updates.len(), 0)
+                        .map_err(|_| TacticFailure::new("original parameter owner stopped"))?;
+                    if let Some((_, configured)) = updates
+                        .iter_mut()
+                        .find(|(entry, _)| std::ptr::eq(*entry, instance.as_ref()))
+                    {
+                        *configured = incoming.over(*configured);
+                    } else {
+                        let configured = incoming.over(instance.configured()?);
+                        reserve_owned(&mut updates, 1, Some(owner))?;
+                        updates.push((instance.as_ref(), configured));
+                    }
+                    reserve_owned(&mut pending, 1, Some(owner))?;
+                    pending.push((&instance.body, incoming));
+                }
+                Self::WithParams(body, stored) => {
+                    reserve_owned(&mut pending, 1, Some(owner))?;
+                    pending.push((body, stored.over(incoming)));
+                }
+                Self::Then(a, b) | Self::OrElse(a, b) | Self::Cond(_, a, b) => {
+                    reserve_owned(&mut pending, 2, Some(owner))?;
+                    pending.push((b, incoming));
+                    pending.push((a, incoming));
+                }
+                Self::TryFor(body, _) | Self::Repeat(body, _) | Self::When(_, body) => {
+                    reserve_owned(&mut pending, 1, Some(owner))?;
+                    pending.push((body, incoming));
+                }
+                _ => {}
+            }
+        }
+        owner
+            .check()
+            .map_err(|_| TacticFailure::new("original parameter owner stopped"))?;
+        // Existing C contexts are single-threaded/non-aliased. These fixed
+        // scalar commits invoke no callbacks or allocations.
+        for (instance, configured) in updates {
+            instance.install(configured)?;
+        }
+        Ok(())
     }
 
     /// Translate a front-end [`ApplyTactic`](ay_frontend::ApplyTactic) — the
@@ -348,7 +919,8 @@ impl Tactic {
         match tactic {
             ApplyTactic::Skip => Tactic::Skip,
             ApplyTactic::Fail => Tactic::Fail,
-            ApplyTactic::Simplify | ApplyTactic::ElimAnd => Tactic::FlattenAnd,
+            ApplyTactic::Simplify => Tactic::Simplify,
+            ApplyTactic::ElimAnd => Tactic::FlattenAnd,
             ApplyTactic::SolveEqs => Tactic::SolveEqs,
             ApplyTactic::PropagateValues => Tactic::PropagateValues,
             ApplyTactic::PropagateIneqs => Tactic::PropagateIneqs,
@@ -361,6 +933,11 @@ impl Tactic {
             ApplyTactic::Nnf => Tactic::Nnf,
             ApplyTactic::TseitinCnf => Tactic::TseitinCnf,
             ApplyTactic::BitBlast => Tactic::BitBlast,
+            ApplyTactic::FieldSimplify => Tactic::FieldSimplify,
+            ApplyTactic::FieldUnique => Tactic::FieldUnique,
+            ApplyTactic::FieldSolve => Tactic::FieldSolve,
+            ApplyTactic::FieldSat => Tactic::FieldSat,
+            ApplyTactic::FieldToBv => Tactic::FieldToBv,
             ApplyTactic::SplitClause => Tactic::SplitClause,
             ApplyTactic::CtxSolverSimplify => Tactic::CtxSolverSimplify,
             ApplyTactic::ElimTermIte => Tactic::ElimTermIte,
@@ -368,6 +945,7 @@ impl Tactic {
             ApplyTactic::Der => Tactic::Der,
             ApplyTactic::DistributeForall => Tactic::DistributeForall,
             ApplyTactic::ReduceArgs => Tactic::ReduceArgs,
+            ApplyTactic::MaxBvSharing => Tactic::MaxBvSharing,
             ApplyTactic::Then(children) | ApplyTactic::ParThen(children) => {
                 Self::fold_children(children, Tactic::then)
             }
@@ -377,8 +955,34 @@ impl Tactic {
             ApplyTactic::Repeat(body, bound) => {
                 Tactic::Repeat(Box::new(Tactic::from_apply(body)), *bound)
             }
-            ApplyTactic::TryFor(body, _ms) => Tactic::from_apply(body),
-            ApplyTactic::UsingParams(body, _params) => Tactic::from_apply(body),
+            ApplyTactic::TryFor(body, ms) => match u32::try_from(*ms) {
+                Ok(ms) => Tactic::TryFor(Box::new(Tactic::from_apply(body)), ms),
+                Err(_) => Tactic::FailMsg {
+                    name: "try-for",
+                    message: "tactic timeout exceeds uint32",
+                },
+            },
+            ApplyTactic::UsingParams(body, params) => {
+                let mut configured = super::tactic_parameters::TacticParameters::default();
+                for (key, value) in params {
+                    use super::tactic_parameters::TacticParameterValue as V;
+                    use ay_frontend::ParamValue;
+                    let typed = match value {
+                        ParamValue::Bool(b) => V::Bool(*b),
+                        ParamValue::Int(n) => {
+                            u32::try_from(*n).map(V::UInt).unwrap_or(V::Unsupported)
+                        }
+                        _ => V::Unsupported,
+                    };
+                    if configured.set(key, typed).is_err() {
+                        return Tactic::FailMsg {
+                            name: "using-params",
+                            message: "unsupported tactic parameter name or type",
+                        };
+                    }
+                }
+                Tactic::WithParams(Box::new(Tactic::from_apply(body)), configured)
+            }
             ApplyTactic::When(probe, body) => {
                 Tactic::When(probe.clone(), Box::new(Tactic::from_apply(body)))
             }
@@ -456,16 +1060,7 @@ impl Tactic {
     /// but not with `ctx-solver-simplify` hidden inside a combinator: those
     /// probes would compete with the caller's single requested CNF artifact.
     pub(crate) fn may_invoke_solver(&self) -> bool {
-        match self {
-            Tactic::CtxSolverSimplify => true,
-            Tactic::Then(first, second)
-            | Tactic::OrElse(first, second)
-            | Tactic::Cond(_, first, second) => {
-                first.may_invoke_solver() || second.may_invoke_solver()
-            }
-            Tactic::Repeat(body, _) | Tactic::When(_, body) => body.may_invoke_solver(),
-            _ => false,
-        }
+        self.requirements(None).map_or(true, |r| r.solver)
     }
 
     /// A stable, Z3-style name for this tactic (diagnostics/tests).
@@ -474,6 +1069,10 @@ impl Tactic {
         match self {
             Tactic::Skip => "skip".to_string(),
             Tactic::Fail => "fail".to_string(),
+            Tactic::Shared(instance) => instance.body.name(),
+            Tactic::TryFor(body, ms) => format!("(try-for {} {ms})", body.name()),
+            Tactic::WithParams(body, _) => format!("(using-params {})", body.name()),
+            Tactic::Simplify => "simplify".to_string(),
             Tactic::FlattenAnd => "flatten-and".to_string(),
             Tactic::SolveEqs => "solve-eqs".to_string(),
             Tactic::PropagateValues => "propagate-values".to_string(),
@@ -482,6 +1081,11 @@ impl Tactic {
             Tactic::Nnf => "nnf".to_string(),
             Tactic::TseitinCnf => "tseitin-cnf".to_string(),
             Tactic::BitBlast => "bit-blast".to_string(),
+            Tactic::FieldSimplify => "ff-simplify".to_string(),
+            Tactic::FieldUnique => "ff-unique".to_string(),
+            Tactic::FieldSolve => "ff-solve".to_string(),
+            Tactic::FieldSat => "ff-sat".to_string(),
+            Tactic::FieldToBv => "ff2bv".to_string(),
             Tactic::SplitClause => "split-clause".to_string(),
             Tactic::CtxSolverSimplify => "ctx-solver-simplify".to_string(),
             Tactic::Then(a, b) => format!("(then {} {})", a.name(), b.name()),
@@ -497,6 +1101,7 @@ impl Tactic {
             Tactic::Der => "der".to_string(),
             Tactic::DistributeForall => "distribute-forall".to_string(),
             Tactic::ReduceArgs => "reduce-args".to_string(),
+            Tactic::MaxBvSharing => "max-bv-sharing".to_string(),
             Tactic::FailMsg { name, .. } => (*name).to_string(),
             Tactic::Bv1Blast => "bv1-blast".to_string(),
         }
@@ -515,12 +1120,326 @@ impl Tactic {
     /// The recursive worker: apply to one goal, returning the subgoals and a
     /// progress flag.
     fn apply_step(&self, terms: &mut TermStore, goal: Goal) -> Result<StepOutcome, TacticFailure> {
+        self.apply_step_admitted(terms, goal, None)
+    }
+
+    fn apply_step_admitted(
+        &self,
+        terms: &mut TermStore,
+        goal: Goal,
+        owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+    ) -> Result<StepOutcome, TacticFailure> {
+        if let Some(owner) = owner {
+            return ay_core::render_admission::stacked(
+                Some(owner),
+                || {
+                    Err(TacticFailure::new(
+                        "tactic original stack admission refused",
+                    ))
+                },
+                || self.apply_step_owned_body(terms, goal, Some(owner)),
+            );
+        }
+        self.apply_step_owned_body(terms, goal, None)
+    }
+
+    fn apply_step_owned_body(
+        &self,
+        terms: &mut TermStore,
+        goal: Goal,
+        owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+    ) -> Result<StepOutcome, TacticFailure> {
+        use super::tactic_parameters as configured;
+        use ay_core::term::TermConstructionAdmission as _;
         match self {
-            Tactic::Skip => Ok(StepOutcome {
-                goals: vec![goal],
-                progressed: false,
-            }),
-            Tactic::Fail => Err(TacticFailure::new("fail tactic")),
+            Self::Shared(instance) => {
+                let _settings = configured::install(instance.configured()?);
+                return instance.body.apply_step_admitted(terms, goal, owner);
+            }
+            Self::WithParams(body, params) => {
+                let owner = owner.ok_or_else(|| {
+                    TacticFailure::new("parameterized tactic requires original admission")
+                })?;
+                body.validate_parameters(*params, owner)?;
+                let _settings = configured::install(*params);
+                return body.apply_step_admitted(terms, goal, Some(owner));
+            }
+            Self::TryFor(body, ms) => {
+                let owner = owner
+                    .ok_or_else(|| TacticFailure::new("try-for requires original admission"))?;
+                let duration = (*ms != 0 && *ms != u32::MAX)
+                    .then(|| std::time::Duration::from_millis(u64::from(*ms)));
+                let _deadline = tactic_deadline::install(duration);
+                let restricted = configured::Restricted::new(owner, tactic_deadline::end(), None)?;
+                let result = body.apply_step_admitted(terms, goal, Some(&restricted));
+                return restricted.settle(result);
+            }
+            Self::Simplify => {
+                let owner = owner
+                    .ok_or_else(|| TacticFailure::new("simplify requires original admission"))?;
+                let params = configured::current();
+                let restricted = configured::Restricted::new(owner, None, params.max_memory)?;
+                let result = (|| -> Result<StepOutcome, TacticFailure> {
+                    let mut steps = configured::Steps::new(params.max_steps);
+                    let sequence_roots = super::tactic_polynomial::rewrite_with_sequences(
+                        terms,
+                        &goal.formulas,
+                        params.max_power_expansion.unwrap_or(2),
+                        params.polynomial,
+                        &mut steps,
+                        &restricted,
+                    )?;
+                    let formulas = if params.elim_and == Some(true)
+                        || params.max_steps.is_some_and(|v| v != u32::MAX)
+                    {
+                        let roots = super::tactic_bool_rewrite::rewrite(
+                            terms,
+                            &sequence_roots,
+                            if params.elim_and == Some(true) {
+                                super::tactic_bool_rewrite::ConjunctionMode::Eliminate
+                            } else {
+                                super::tactic_bool_rewrite::ConjunctionMode::Retain
+                            },
+                            &mut steps,
+                            &restricted,
+                        )?;
+                        flatten_owned(terms, &roots, &restricted)?
+                    } else {
+                        flatten_owned(terms, &sequence_roots, &restricted)?
+                    };
+                    let progressed = formulas != goal.formulas;
+                    singleton_outcome(
+                        Goal {
+                            formulas,
+                            depth: goal
+                                .depth
+                                .checked_add(1)
+                                .ok_or_else(|| TacticFailure::new("tactic depth overflow"))?,
+                            model_converter: goal.model_converter,
+                        },
+                        progressed,
+                        Some(&restricted),
+                    )
+                })();
+                return restricted.settle(result);
+            }
+            _ => {}
+        }
+        if let Some(owner) = owner {
+            owner
+                .admit(1, 0)
+                .map_err(|_| TacticFailure::new("tactic original owner stopped"))?;
+            if goal.depth == usize::MAX && !matches!(self, Self::Skip) {
+                return Err(TacticFailure::new("tactic depth overflow"));
+            }
+            if matches!(self, Self::SplitClause) {
+                for (position, &root) in goal.formulas.iter().enumerate() {
+                    owner
+                        .admit(1, 0)
+                        .map_err(|_| TacticFailure::new("original split owner stopped"))?;
+                    if root.index() >= terms.len() {
+                        return Err(TacticFailure::new("invalid split root"));
+                    }
+                    if let TermData::App(symbol, children) = terms.get(root) {
+                        owner
+                            .admit(symbol.name().len(), 0)
+                            .map_err(|_| TacticFailure::new("original split owner stopped"))?;
+                        if symbol.name() == "or"
+                            && !terms.is_declared_function(symbol.name())
+                            && children.len() >= 2
+                        {
+                            let mut result = Vec::new();
+                            reserve_owned(&mut result, children.len(), Some(owner))?;
+                            for &child in children {
+                                owner.admit(1, 0).map_err(|_| {
+                                    TacticFailure::new("original split owner stopped")
+                                })?;
+                                if child.index() >= terms.len() || terms.sort(child) != &Sort::Bool
+                                {
+                                    return Err(TacticFailure::new("invalid split disjunct"));
+                                }
+                                let mut branch = clone_goal_owned(&goal, Some(owner))?;
+                                branch.formulas[position] = child;
+                                branch.depth = branch
+                                    .depth
+                                    .checked_add(1)
+                                    .ok_or_else(|| TacticFailure::new("split depth overflow"))?;
+                                result.push(branch);
+                            }
+                            return Ok(StepOutcome {
+                                goals: result,
+                                progressed: true,
+                            });
+                        }
+                    }
+                }
+                return logical_failure(
+                    Some(owner),
+                    "split-clause tactic failed, goal does not contain any clause",
+                );
+            }
+            if matches!(self, Self::FlattenAnd) {
+                let formulas = flatten_owned(terms, &goal.formulas, owner)?;
+                let progressed = formulas != goal.formulas;
+                return singleton_outcome(
+                    Goal {
+                        formulas,
+                        depth: goal.depth + 1,
+                        model_converter: goal.model_converter,
+                    },
+                    progressed,
+                    Some(owner),
+                );
+            }
+            if matches!(self, Self::SolveEqs) {
+                let formulas = flatten_owned(terms, &goal.formulas, owner)?;
+                let eliminated = super::tactic_solve_eqs::eliminate(terms, formulas, owner)?;
+                let converter = goal
+                    .model_converter
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TacticFailure::new("solve-eqs requires a context-bound model converter")
+                    })?
+                    .equations(terms, eliminated.definitions, owner)?;
+                let progressed = eliminated.roots != goal.formulas;
+                let depth = goal
+                    .depth
+                    .checked_add(1)
+                    .ok_or_else(|| TacticFailure::new("solve-eqs depth overflow"))?;
+                return singleton_outcome(
+                    Goal {
+                        formulas: eliminated.roots,
+                        depth,
+                        model_converter: Some(converter),
+                    },
+                    progressed,
+                    Some(owner),
+                );
+            }
+            if matches!(self, Self::PropagateValues) {
+                let formulas = flatten_owned(terms, &goal.formulas, owner)?;
+                let formulas = super::tactic_propagate_values::apply(terms, formulas, owner)?;
+                let formulas = flatten_owned(terms, &formulas, owner)?;
+                let progressed = formulas != goal.formulas;
+                let depth = goal
+                    .depth
+                    .checked_add(1)
+                    .ok_or_else(|| TacticFailure::new("propagate-values depth overflow"))?;
+                return singleton_outcome(
+                    Goal {
+                        formulas,
+                        depth,
+                        model_converter: goal.model_converter,
+                    },
+                    progressed,
+                    Some(owner),
+                );
+            }
+            if !matches!(
+                self,
+                Self::FieldSimplify
+                    | Self::FieldUnique
+                    | Self::FieldSolve
+                    | Self::FieldSat
+                    | Self::FieldToBv
+                    | Self::Skip
+                    | Self::Fail
+                    | Self::FailMsg { .. }
+                    | Self::Then(..)
+                    | Self::OrElse(..)
+                    | Self::Repeat(..)
+                    | Self::When(..)
+                    | Self::Cond(..)
+                    | Self::FailIf(..)
+                    | Self::FailIfNotDecided
+            ) {
+                return logical_failure(Some(owner),"this composite primitive has no original-owner execution/model-conversion path");
+            }
+        }
+        match self {
+            Tactic::Shared(..) | Tactic::TryFor(..) | Tactic::WithParams(..) | Tactic::Simplify => {
+                Err(TacticFailure::new("tactic control dispatch invariant"))
+            }
+            Tactic::FieldSolve | Tactic::FieldSat => {
+                let owner = owner.ok_or_else(|| {
+                    TacticFailure::new("ff-solve requires original construction admission")
+                })?;
+                let converter = goal.model_converter.as_ref().ok_or_else(|| {
+                    TacticFailure::new("ff-solve requires a context-bound model converter")
+                })?;
+                let (formulas, converter) = if matches!(self, Self::FieldSat) {
+                    super::field_sat::apply(terms, &goal.formulas, converter, owner)?
+                } else {
+                    super::field_solve::apply(terms, &goal.formulas, converter, owner)?
+                };
+                let progressed = formulas != goal.formulas;
+                singleton_outcome(
+                    Goal {
+                        formulas,
+                        depth: goal.depth + 1,
+                        model_converter: Some(converter),
+                    },
+                    progressed,
+                    Some(owner),
+                )
+            }
+            Tactic::FieldToBv => {
+                let owner = owner.ok_or_else(|| {
+                    TacticFailure::new("ff2bv requires original construction admission")
+                })?;
+                let converter = goal.model_converter.as_ref().ok_or_else(|| {
+                    TacticFailure::new("ff2bv requires a context-bound model converter")
+                })?;
+                if !converter.valid(terms) {
+                    return Err(TacticFailure::new("ff2bv source context retired"));
+                }
+                if converter.is_active() {
+                    let mut goal = goal;
+                    goal.depth += 1;
+                    return singleton_outcome(goal, false, Some(owner));
+                }
+                let encoded = super::field_to_bv::encode(
+                    terms,
+                    &goal.formulas,
+                    converter.namespace(),
+                    owner,
+                )?;
+                let progressed = encoded.formulas != goal.formulas;
+                let converter = converter.encoded(encoded.bindings, owner)?;
+                singleton_outcome(
+                    Goal {
+                        formulas: encoded.formulas,
+                        depth: goal.depth + 1,
+                        model_converter: Some(converter),
+                    },
+                    progressed,
+                    Some(owner),
+                )
+            }
+            Tactic::FieldSimplify | Tactic::FieldUnique => {
+                let owner = owner.ok_or_else(|| {
+                    TacticFailure::new("ff-simplify requires original construction admission")
+                })?;
+                let formulas = if matches!(self, Self::FieldUnique) {
+                    super::field_unique::apply(terms, &goal.formulas, owner)?
+                } else {
+                    super::field_simplify::apply(terms, &goal.formulas, owner)?
+                };
+                owner
+                    .admit(1, std::mem::size_of::<Goal>())
+                    .map_err(|_| TacticFailure::new("tactic original output admission refused"))?;
+                let progressed = formulas != goal.formulas;
+                Ok(StepOutcome {
+                    goals: vec![Goal {
+                        formulas,
+                        depth: goal.depth + 1,
+                        model_converter: goal.model_converter,
+                    }],
+                    progressed,
+                })
+            }
+            Tactic::Skip => singleton_outcome(goal, false, owner),
+            Tactic::Fail => logical_failure(owner, "fail tactic"),
             Tactic::FlattenAnd => Ok(Self::primitive(
                 goal,
                 |terms, fs| FlattenAnd::new().apply(terms, fs),
@@ -609,54 +1528,62 @@ impl Tactic {
             Tactic::SplitClause => split_clause(terms, goal),
             Tactic::CtxSolverSimplify => Ok(Self::primitive(goal, ctx_solver_simplify, terms)),
             Tactic::Then(first, second) => {
-                let first_out = first.apply_step(terms, goal)?;
+                let first_out = first.apply_step_admitted(terms, goal, owner)?;
                 let mut goals = Vec::new();
                 let mut progressed = first_out.progressed;
                 for g in first_out.goals {
-                    let second_out = second.apply_step(terms, g)?;
+                    let second_out = second.apply_step_admitted(terms, g, owner)?;
                     progressed |= second_out.progressed;
-                    goals.extend(second_out.goals);
+                    append_goals_owned(&mut goals, second_out.goals, owner)?;
                 }
                 Ok(StepOutcome { goals, progressed })
             }
-            Tactic::OrElse(first, alt) => match first.apply_step(terms, goal.clone()) {
-                Ok(out) => Ok(out),
-                // Z3's or-else falls through on FAILURE only.
-                Err(_) => alt.apply_step(terms, goal),
-            },
-            Tactic::Repeat(body, bound) => Self::apply_repeat(body, *bound, terms, goal),
+            Tactic::OrElse(first, alt) => {
+                let copy = clone_goal_owned(&goal, owner)?;
+                match first.apply_step_admitted(terms, copy, owner) {
+                    Ok(out) => Ok(out),
+                    // Z3's or-else falls through on FAILURE only.
+                    Err(failure) => {
+                        if owner.is_some_and(|owner| owner.check().is_err()) {
+                            Err(failure)
+                        } else {
+                            alt.apply_step_admitted(terms, goal, owner)
+                        }
+                    }
+                }
+            }
+            Tactic::Repeat(body, bound) => Self::apply_repeat(body, *bound, terms, goal, owner),
             Tactic::When(probe, body) => {
                 let depth = goal.depth;
-                if eval_probe(probe, terms, &goal.formulas, depth) {
-                    body.apply_step(terms, goal)
+                if eval_probe_owned(probe, terms, &goal.formulas, depth, owner)? {
+                    body.apply_step_admitted(terms, goal, owner)
                 } else {
-                    Ok(StepOutcome {
-                        goals: vec![goal],
-                        progressed: false,
-                    })
+                    singleton_outcome(goal, false, owner)
                 }
             }
             Tactic::FailIf(probe) => {
-                if eval_probe(probe, terms, &goal.formulas, goal.depth) {
-                    Err(TacticFailure::new("fail-if tactic"))
+                if eval_probe_owned(probe, terms, &goal.formulas, goal.depth, owner)? {
+                    logical_failure(owner, "fail-if tactic")
                 } else {
-                    Ok(StepOutcome {
-                        goals: vec![goal],
-                        progressed: false,
-                    })
+                    singleton_outcome(goal, false, owner)
                 }
             }
             Tactic::Cond(probe, t1, t2) => {
                 // Evaluate the probe once on the goal, then commit to that branch.
                 // A failure of the chosen branch propagates (no fall-through) —
                 // Z3's `cond` is NOT `(or-else (when p t1) t2)`.
-                if eval_probe(probe, terms, &goal.formulas, goal.depth) {
-                    t1.apply_step(terms, goal)
+                if eval_probe_owned(probe, terms, &goal.formulas, goal.depth, owner)? {
+                    t1.apply_step_admitted(terms, goal, owner)
                 } else {
-                    t2.apply_step(terms, goal)
+                    t2.apply_step_admitted(terms, goal, owner)
                 }
             }
             Tactic::FailIfNotDecided => {
+                if let Some(owner) = owner {
+                    owner
+                        .admit(goal.formulas.len(), 0)
+                        .map_err(|_| TacticFailure::new("tactic decided scan stopped"))?;
+                }
                 // Decided ⟺ empty goal (trivially SAT) OR the goal carries the
                 // literal `false` (trivially UNSAT) — exactly Z3's goal
                 // `inconsistent()`/`size()==0` test. Decided ⇒ identity; anything
@@ -664,14 +1591,11 @@ impl Tactic {
                 let decided = goal.formulas.is_empty()
                     || goal.formulas.iter().any(|&f| is_false_literal(terms, f));
                 if decided {
-                    Ok(StepOutcome {
-                        goals: vec![goal],
-                        progressed: false,
-                    })
+                    singleton_outcome(goal, false, owner)
                 } else {
                     // z3's byte text: `(error "tactic failed: undecided")`
                     // (measured, z3 4.15.4 `(apply fail-if-undecided)`).
-                    Err(TacticFailure::new("undecided"))
+                    logical_failure(owner, "undecided")
                 }
             }
             Tactic::ElimTermIte => Ok(Self::primitive(
@@ -703,14 +1627,20 @@ impl Tactic {
                 },
                 terms,
             )),
+            // The quantifier pipeline's DER pass (one implementation).
             Tactic::Der => Ok(Self::primitive(
                 goal,
-                |terms, fs| Der::new().apply(terms, fs),
+                |terms, fs| crate::simplifier::der_tactic(terms, fs),
                 terms,
             )),
             Tactic::DistributeForall => Ok(Self::primitive(
                 goal,
                 |terms, fs| DistributeForall::new().apply(terms, fs),
+                terms,
+            )),
+            Tactic::MaxBvSharing => Ok(Self::primitive(
+                goal,
+                |terms, fs| terms.maximize_bv_sharing(fs),
                 terms,
             )),
             Tactic::ReduceArgs => Ok(Self::primitive(
@@ -721,7 +1651,7 @@ impl Tactic {
             // CLASS F: always an honest failure — NO goal is ever produced, so
             // this can never mint or change a verdict; `or-else` catches it
             // exactly as on z3 (which fails these tactics on generic goals).
-            Tactic::FailMsg { message, .. } => Err(TacticFailure::new(*message)),
+            Tactic::FailMsg { message, .. } => logical_failure(owner, message),
             Tactic::Bv1Blast => {
                 // Measured z3 semantics: fail iff the goal contains a
                 // bit-vector term; identity (one applied primitive, depth+1)
@@ -752,6 +1682,7 @@ impl Tactic {
             goals: vec![Goal {
                 formulas,
                 depth: goal.depth + 1,
+                model_converter: goal.model_converter,
             }],
             progressed,
         }
@@ -772,8 +1703,11 @@ impl Tactic {
         bound: Option<usize>,
         terms: &mut TermStore,
         goal: Goal,
+        owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
     ) -> Result<StepOutcome, TacticFailure> {
-        let mut frontier = vec![goal];
+        let mut frontier = Vec::new();
+        reserve_owned(&mut frontier, 1, owner)?;
+        frontier.push(goal);
         let mut done: Vec<Goal> = Vec::new();
         let mut any_progress_overall = false;
         let mut iterations = 0usize;
@@ -781,28 +1715,28 @@ impl Tactic {
         loop {
             if let Some(limit) = bound {
                 if iterations >= limit {
-                    done.extend(frontier);
+                    append_goals_owned(&mut done, frontier, owner)?;
                     break;
                 }
             }
             let mut next = Vec::new();
             let mut progressed_this_round = false;
             for g in std::mem::take(&mut frontier) {
-                let out = body.apply_step(terms, g)?;
+                let out = body.apply_step_admitted(terms, g, owner)?;
                 if out.progressed {
                     progressed_this_round = true;
                     any_progress_overall = true;
-                    next.extend(out.goals);
+                    append_goals_owned(&mut next, out.goals, owner)?;
                 } else {
                     // Fixpoint: keep the APPLIED result (its depth increment
                     // counts — Z3 counts every applied primitive). The formulas
                     // are unchanged from the input goal; only the depth may have
                     // ticked (0 for `skip`, +1 for a depth-incrementing body).
-                    done.extend(out.goals);
+                    append_goals_owned(&mut done, out.goals, owner)?;
                 }
             }
             if !progressed_this_round {
-                done.extend(next);
+                append_goals_owned(&mut done, next, owner)?;
                 break;
             }
             frontier = next;
@@ -912,6 +1846,7 @@ fn split_clause(terms: &TermStore, goal: Goal) -> Result<StepOutcome, TacticFail
                     Goal {
                         formulas,
                         depth: goal.depth + 1,
+                        model_converter: goal.model_converter.clone(),
                     }
                 })
                 .collect();
@@ -924,6 +1859,53 @@ fn split_clause(terms: &TermStore, goal: Goal) -> Result<StepOutcome, TacticFail
     Err(TacticFailure::new(
         "split-clause tactic failed, goal does not contain any clause",
     ))
+}
+
+/// The deadline of the tactic application in progress on this thread: the
+/// nested checks of a solver-invoking pass (`ctx-solver-simplify`) run under
+/// the applying solver's timeout instead of without one.
+mod tactic_deadline {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Restores the enclosing application's deadline when dropped.
+    pub(super) struct Installed(Option<Instant>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            DEADLINE.with(|cell| cell.set(self.0));
+        }
+    }
+
+    /// Install `now + timeout` (the earlier of it and an enclosing deadline).
+    pub(super) fn install(timeout: Option<Duration>) -> Installed {
+        let previous = DEADLINE.with(Cell::get);
+        let mine = timeout.and_then(|t| Instant::now().checked_add(t));
+        let effective = match (previous, mine) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        DEADLINE.with(|cell| cell.set(effective));
+        Installed(previous)
+    }
+
+    /// `None` without a deadline; `Some(None)` once it passed; otherwise the
+    /// time left.
+    pub(super) fn remaining() -> Option<Option<Duration>> {
+        DEADLINE.with(Cell::get).map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+        })
+    }
+
+    pub(super) fn end() -> Option<Instant> {
+        DEADLINE.with(Cell::get)
+    }
 }
 
 /// The outcome of a single nested context-implication sub-check.
@@ -947,6 +1929,13 @@ fn ctx_check_unsat(
     after: &[TermId],
     target: TermId,
 ) -> SubCheck {
+    // The caller's deadline bounds every nested check (an expired one proves
+    // nothing, which keeps the assertion: sound).
+    match tactic_deadline::remaining() {
+        Some(Some(remaining)) => sub.set_timeout(Some(remaining)),
+        Some(None) => return SubCheck::NotProven,
+        None => {}
+    }
     if sub.try_push().is_err() {
         return SubCheck::NotProven;
     }
@@ -1094,13 +2083,99 @@ fn is_false_literal(terms: &TermStore, id: TermId) -> bool {
 /// disjuncts; otherwise `None`.
 fn as_clause(terms: &TermStore, id: TermId) -> Option<Vec<TermId>> {
     match terms.get(id) {
-        TermData::App(sym, args) if sym.name() == "or" && args.len() >= 2 => Some(args.clone()),
+        TermData::App(ay_core::Symbol::Named(name), args)
+            if name == "or" && !terms.is_declared_function(name) && args.len() >= 2 =>
+        {
+            Some(args.clone())
+        }
         _ => None,
     }
 }
 
 /// Evaluate a Z3 probe over a goal to a boolean (`> 0` is true, mirroring Z3's
 /// numeric-probe-as-condition convention).
+fn eval_probe_owned(
+    probe: &Probe,
+    terms: &TermStore,
+    formulas: &[TermId],
+    depth: usize,
+    owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
+) -> Result<bool, TacticFailure> {
+    let Some(owner) = owner else {
+        return Ok(eval_probe(probe, terms, formulas, depth));
+    };
+    let mut pending = Vec::new();
+    let mut values: Vec<f64> = Vec::new();
+    reserve_owned(&mut pending, 1, Some(owner))?;
+    pending.push((probe, false));
+    while let Some((probe, finish)) = pending.pop() {
+        owner
+            .admit(1, 0)
+            .map_err(|_| TacticFailure::new("tactic probe stopped"))?;
+        let value = match probe {
+            Probe::Not(a) if !finish => {
+                reserve_owned(&mut pending, 2, Some(owner))?;
+                pending.push((probe, true));
+                pending.push((a, false));
+                continue;
+            }
+            Probe::And(a, b) | Probe::Or(a, b) | Probe::Cmp(_, a, b) if !finish => {
+                reserve_owned(&mut pending, 3, Some(owner))?;
+                pending.push((probe, true));
+                pending.push((b, false));
+                pending.push((a, false));
+                continue;
+            }
+            Probe::Not(_) => f64::from(
+                values
+                    .pop()
+                    .ok_or_else(|| TacticFailure::new("invalid probe"))?
+                    == 0.0,
+            ),
+            Probe::And(..) | Probe::Or(..) | Probe::Cmp(..) => {
+                let b = values
+                    .pop()
+                    .ok_or_else(|| TacticFailure::new("invalid probe"))?;
+                let a = values
+                    .pop()
+                    .ok_or_else(|| TacticFailure::new("invalid probe"))?;
+                f64::from(match probe {
+                    Probe::And(..) => a != 0.0 && b != 0.0,
+                    Probe::Or(..) => a != 0.0 || b != 0.0,
+                    Probe::Cmp(op, ..) => match op {
+                        ProbeCmp::Lt => a < b,
+                        ProbeCmp::Le => a <= b,
+                        ProbeCmp::Gt => a > b,
+                        ProbeCmp::Ge => a >= b,
+                        ProbeCmp::Eq => a == b,
+                    },
+                    _ => false,
+                })
+            }
+            Probe::Const(text) => {
+                owner
+                    .admit(text.len(), 0)
+                    .map_err(|_| TacticFailure::new("probe parse stopped"))?;
+                text.parse::<f64>()
+                    .map_err(|_| TacticFailure::new("invalid numeric probe"))?
+            }
+            Probe::Depth => depth as f64,
+            Probe::Size => flatten_owned(terms, formulas, owner)?.len() as f64,
+            _ => {
+                return Err(TacticFailure::new(
+                    "this probe has no original-owner execution path",
+                ))
+            }
+        };
+        reserve_owned(&mut values, 1, Some(owner))?;
+        values.push(value);
+    }
+    owner
+        .check()
+        .map_err(|_| TacticFailure::new("tactic probe stopped"))?;
+    Ok(values.len() == 1 && values[0] != 0.0)
+}
+
 fn eval_probe(probe: &Probe, terms: &TermStore, formulas: &[TermId], depth: usize) -> bool {
     eval_probe_num(probe, terms, formulas, depth) != 0.0
 }
@@ -1767,6 +2842,7 @@ fn graft_term(
             Constant::Rational(r) => dst.mk_rational(r.0),
             Constant::BitVec { value, width } => dst.mk_bitvec(value, width),
             Constant::String(s) => dst.mk_string(s),
+            Constant::FiniteField { value, field } => dst.mk_finite_field(value, field),
             // `Constant` is `#[non_exhaustive]`; all present variants are handled
             // above. A future kind reaching here fails the translate loudly (the
             // FFI guard turns the panic into an honest NULL + error) rather than
@@ -1953,6 +3029,19 @@ pub struct TacticSolver {
 }
 
 impl TacticSolver {
+    fn inspect_request(&self) -> Result<(TacticOperation, TacticExecutionKind), SolverError> {
+        let operation = self.inner.begin_tactic_operation()?;
+        let kind = self
+            .tactic
+            .execution_kind_admitted(operation.admission())
+            .map_err(TacticFailure::into_solver_error)?;
+        if !operation.validate(&self.inner) {
+            return Err(SolverError::TacticFailed(
+                "tactic source changed during inspection".into(),
+            ));
+        }
+        Ok((operation, kind))
+    }
     /// Mutable access to the underlying solver for building terms and asserting.
     pub fn solver_mut(&mut self) -> &mut Solver {
         &mut self.inner
@@ -2008,15 +3097,43 @@ impl TacticSolver {
     /// future equivalence-certificate path may authorize solving transformed
     /// roots; structural equality or a tactic/shape whitelist never does.
     pub fn check_sat(&mut self) -> VerifiedSolveResult {
+        let _read = self.inner.begin_model_evaluation_read();
+        let _deadline = tactic_deadline::install(self.inner.timeout());
         // Applying the tactic is itself fallible work in this PUBLIC decision
         // query. Retire the previous model/certificate before it starts, rather
         // than relying on Solver::check_sat (which is never reached on failure).
         self.inner.clear_last_solve_state(true, false);
-        let source_assertions = self.inner.executor.context().assertions.clone();
+        let (_operation, kind) = match self.inspect_request() {
+            Ok(value) => value,
+            Err(error) => {
+                self.inner.set_tactic_error_unknown(&error);
+                return self.inner.finish_verified_result(SolveResult::Unknown);
+            }
+        };
+        let owned = kind != TacticExecutionKind::Legacy;
         let source_requires_strict = self
             .inner
             .executor
             .active_unsat_query_requires_strict_proof();
+        let (source_assertions, source_custody) = if owned && source_requires_strict {
+            match self
+                .inner
+                .executor
+                .capture_tactic_source_roots(tactic_deadline::end())
+            {
+                Ok((roots, scope)) => (roots, Some(scope)),
+                Err(origin) => {
+                    self.inner.set_internal_error_unknown(&format!(
+                        "tactic source admission refused: {origin:?}"
+                    ));
+                    return self.inner.finish_verified_result(SolveResult::Unknown);
+                }
+            }
+        } else if owned {
+            (Vec::new(), None)
+        } else {
+            (self.inner.executor.context().assertions.clone(), None)
+        };
         let tactic_result = if source_requires_strict {
             self.inner
                 .validate_tactic_on_detached_goal(&self.tactic, &source_assertions)
@@ -2028,10 +3145,15 @@ impl TacticSolver {
             // it as Unknown rather than silently solving a possibly-wrong goal.
             self.inner
                 .record_native_replay_event(NativeReplayEventKind::CheckSat);
-            self.inner.set_internal_error_unknown(&e.to_string());
+            self.inner.set_tactic_error_unknown(&e);
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
-        if source_requires_strict && self.inner.executor.context().assertions != source_assertions {
+        if source_custody
+            .as_ref()
+            .is_some_and(|owner| !owner.validate(&self.inner.executor))
+            || (source_requires_strict
+                && self.inner.executor.context().assertions != source_assertions)
+        {
             self.inner
                 .record_native_replay_event(NativeReplayEventKind::CheckSat);
             self.inner.set_internal_error_unknown(
@@ -2039,6 +3161,8 @@ impl TacticSolver {
             );
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
+        drop(source_assertions);
+        drop(source_custody);
         // This is the caller-visible authored decision, not a solver-internal
         // probe. Enter through the authored wrapper so quantified SAT can use
         // the exact source/declaration capability minted there. This begins the
@@ -2054,21 +3178,55 @@ impl TacticSolver {
     /// while the exact caller-supplied assumptions remain bound to the source
     /// query.
     pub fn check_sat_assuming(&mut self, assumptions: &[Term]) -> VerifiedSolveResult {
+        let _read = self.inner.begin_model_evaluation_read();
+        let _deadline = tactic_deadline::install(self.inner.timeout());
         // Retire the prior query before even validating caller handles. A stale
         // or foreign assumption is itself a failed public decision attempt and
         // must not leave the preceding assumption map or artefacts observable.
         self.inner.clear_last_solve_state(true, false);
-        let assumption_ids = match self
-            .inner
-            .resolve_terms("tactic_check_sat_assuming", assumptions)
-        {
-            Ok(ids) => ids,
+        let (_operation, kind) = match self.inspect_request() {
+            Ok(value) => value,
             Err(error) => {
-                self.inner.last_executor_error = Some(error.to_string());
-                return self.inner.preflight_unknown(UnknownReason::Incomplete);
+                self.inner.set_tactic_error_unknown(&error);
+                return self.inner.finish_verified_result(SolveResult::Unknown);
             }
         };
-        let source_assertions = self.inner.executor.context().assertions.clone();
+        let owned = kind != TacticExecutionKind::Legacy;
+        let mut assumption_ids = Vec::new();
+        if owned {
+            if ay_core::term::reserve_counted(
+                &mut assumption_ids,
+                assumptions.len(),
+                _operation.admission(),
+            )
+            .is_err()
+                || !_operation.validate(&self.inner)
+            {
+                self.inner
+                    .set_internal_error_unknown("tactic assumption metadata refused");
+                return self.inner.finish_verified_result(SolveResult::Unknown);
+            }
+            for &term in assumptions {
+                match self.inner.resolve_term("tactic_check_sat_assuming", term) {
+                    Ok(id) => assumption_ids.push(id),
+                    Err(error) => {
+                        self.inner.last_executor_error = Some(error.to_string());
+                        return self.inner.preflight_unknown(UnknownReason::Incomplete);
+                    }
+                }
+            }
+        } else {
+            assumption_ids = match self
+                .inner
+                .resolve_terms("tactic_check_sat_assuming", assumptions)
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    self.inner.last_executor_error = Some(error.to_string());
+                    return self.inner.preflight_unknown(UnknownReason::Incomplete);
+                }
+            };
+        }
         self.inner
             .executor
             .bind_native_query_assumptions(&assumption_ids);
@@ -2076,6 +3234,25 @@ impl TacticSolver {
             .inner
             .executor
             .active_unsat_query_requires_strict_proof();
+        let (source_assertions, source_custody) = if owned && source_requires_strict {
+            match self
+                .inner
+                .executor
+                .capture_tactic_source_roots(tactic_deadline::end())
+            {
+                Ok((roots, scope)) => (roots, Some(scope)),
+                Err(origin) => {
+                    self.inner.set_internal_error_unknown(&format!(
+                        "tactic source admission refused: {origin:?}"
+                    ));
+                    return self.inner.finish_verified_result(SolveResult::Unknown);
+                }
+            }
+        } else if owned {
+            (Vec::new(), None)
+        } else {
+            (self.inner.executor.context().assertions.clone(), None)
+        };
         let tactic_result = if source_requires_strict {
             self.inner
                 .validate_tactic_on_detached_goal(&self.tactic, &source_assertions)
@@ -2087,10 +3264,15 @@ impl TacticSolver {
                 .record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
                     assumptions: assumption_ids.clone(),
                 });
-            self.inner.set_internal_error_unknown(&e.to_string());
+            self.inner.set_tactic_error_unknown(&e);
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
-        if source_requires_strict && self.inner.executor.context().assertions != source_assertions {
+        if source_custody
+            .as_ref()
+            .is_some_and(|owner| !owner.validate(&self.inner.executor))
+            || (source_requires_strict
+                && self.inner.executor.context().assertions != source_assertions)
+        {
             self.inner
                 .record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
                     assumptions: assumption_ids,
@@ -2100,11 +3282,57 @@ impl TacticSolver {
             );
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
+        drop(source_assertions);
+        drop(source_custody);
         self.inner.check_sat_assuming_continuation(assumptions)
     }
 }
 
 impl Solver {
+    /// Begin one explicit native tactic adapter operation; nested calls reuse
+    /// the retained original evaluation attempt rather than replenish it.
+    pub fn begin_tactic_operation(&self) -> Result<TacticOperation, SolverError> {
+        let started_at = std::time::Instant::now();
+        let read = self.begin_model_evaluation_read();
+        let scope = self
+            .executor
+            .capture_tactic_construction_until(tactic_deadline::end())
+            .map_err(|e| SolverError::TacticFailed(format!("tactic operation refused: {e:?}")))?;
+        Ok(TacticOperation {
+            scope,
+            _read: read,
+            started_at,
+        })
+    }
+
+    /// Decision adapters retire old artifacts on constructor failure while
+    /// retaining the same original read through first-origin publication.
+    pub fn begin_tactic_operation_for_check(&mut self) -> Result<TacticOperation, SolverError> {
+        let _read = self.begin_model_evaluation_read();
+        let result = self.begin_tactic_operation();
+        if let Err(error) = &result {
+            self.set_tactic_error_unknown(error);
+        }
+        result
+    }
+
+    // Capture the original request BEFORE inspecting an arbitrarily large
+    // tactic tree. Metadata failure is a failure, never a legacy classification.
+    fn inspect_tactic_request(
+        &self,
+        tactic: &Tactic,
+    ) -> Result<(TacticOperation, Requirements), SolverError> {
+        let operation = self.begin_tactic_operation()?;
+        let requirements = tactic
+            .requirements(Some(operation.admission()))
+            .map_err(TacticFailure::into_solver_error)?;
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "tactic source changed during metadata inspection".into(),
+            ));
+        }
+        Ok((operation, requirements))
+    }
     /// Execute `tactic` against a fully detached copy of the term universe and
     /// `source_assertions`.
     ///
@@ -2118,16 +3346,69 @@ impl Solver {
         tactic: &Tactic,
         source_assertions: &[TermId],
     ) -> Result<(), SolverError> {
-        if tactic.may_invoke_solver() {
+        let _deadline = tactic_deadline::install(self.timeout());
+        let (operation, requirements) = self.inspect_tactic_request(tactic)?;
+        let TacticOperation {
+            scope,
+            _read,
+            started_at: _,
+        } = operation;
+        if requirements.solver {
             self.reject_composite_bv_cnf_export(
                 "validate_tactic_on_detached_goal(ctx-solver-simplify)",
             )?;
         }
-        let mut detached_terms = self.terms().clone();
-        let mut detached_goal = source_assertions.to_vec();
+        let owner = scope.admission();
+        let bytes = source_assertions
+            .len()
+            .checked_mul(std::mem::size_of::<TermId>())
+            .ok_or_else(|| SolverError::TacticFailed("detached roots size overflow".into()))?;
+        owner.admit(source_assertions.len(), bytes).map_err(|_| {
+            SolverError::TacticFailed("detached roots original admission refused".into())
+        })?;
+        let mut detached_terms = self
+            .terms()
+            .clone_with_progress(&mut |work, bytes| owner.admit(work, bytes).is_ok())
+            .map_err(|_| SolverError::TacticFailed("detached term clone refused".into()))?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "detached source changed during clone".into(),
+            ));
+        }
+        let mut detached_roots = source_assertions.to_vec();
+        if requirements.kind != TacticExecutionKind::Legacy {
+            let result = (|| {
+                let mut detached_goal = Goal::root(detached_roots);
+                if requirements.kind == TacticExecutionKind::OwnedModelConversion {
+                    detached_goal.capture_model_converter(
+                        &detached_terms,
+                        self.executor.ctx.symbols_iter(),
+                        owner,
+                    )?;
+                }
+                if !scope.validate(&self.executor) {
+                    return Err(TacticFailure::new(
+                        "detached source changed during converter capture",
+                    ));
+                }
+                tactic.apply_goals_admitted(&mut detached_terms, detached_goal, owner)?;
+                Ok(())
+            })();
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic original construction fence refused".into(),
+                ));
+            }
+            return result.map_err(TacticFailure::into_solver_error);
+        }
         tactic
-            .apply_or_fail(&mut detached_terms, &mut detached_goal)
-            .map_err(|failure| SolverError::TacticFailed(failure.message))?;
+            .apply_or_fail(&mut detached_terms, &mut detached_roots)
+            .map_err(TacticFailure::into_solver_error)?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "detached tactic original request refused".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2156,17 +3437,67 @@ impl Solver {
     /// failure rather than solve a goal the tactic did not actually produce. Also
     /// returns an error if resetting or re-asserting fails.
     pub fn apply_tactic(&mut self, tactic: &Tactic) -> Result<(), SolverError> {
-        if tactic.may_invoke_solver() {
+        let _deadline = tactic_deadline::install(self.timeout());
+        let (operation, requirements) = self.inspect_tactic_request(tactic)?;
+        let TacticOperation {
+            scope,
+            _read,
+            started_at: _,
+        } = operation;
+        if requirements.kind == TacticExecutionKind::OwnedModelConversion {
+            return Err(SolverError::TacticFailed(
+                "in-place tactic API requires a retained model converter".into(),
+            ));
+        }
+        if requirements.solver {
             self.reject_composite_bv_cnf_export("apply_tactic(ctx-solver-simplify)")?;
         }
-        let mut goal: Vec<TermId> = self.executor.context().assertions.clone();
-        let changed = tactic
-            .apply_or_fail(self.terms_mut(), &mut goal)
-            .map_err(|f| SolverError::TacticFailed(f.message))?;
+        let (goal, changed) = if requirements.kind != TacticExecutionKind::Legacy {
+            let count = self.executor.context().assertions.len();
+            scope
+                .admission()
+                .admit(
+                    count,
+                    count
+                        .checked_mul(std::mem::size_of::<TermId>())
+                        .ok_or_else(|| SolverError::TacticFailed("tactic roots overflow".into()))?,
+                )
+                .map_err(|_| {
+                    SolverError::TacticFailed("tactic original root admission refused".into())
+                })?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during admission".into(),
+                ));
+            }
+            let mut goal = self.executor.context().assertions.clone();
+            let changed = tactic
+                .apply_or_fail_admitted(self.terms_mut(), &mut goal, scope.admission())
+                .map_err(TacticFailure::into_solver_error)?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during construction".into(),
+                ));
+            }
+            (goal, changed)
+        } else {
+            let mut goal = self.executor.context().assertions.clone();
+            let changed = tactic
+                .apply_or_fail(self.terms_mut(), &mut goal)
+                .map_err(TacticFailure::into_solver_error)?;
+            (goal, changed)
+        };
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "tactic source changed before assertion publication".into(),
+            ));
+        }
         if !changed {
             return Ok(());
         }
-
+        // Finish immutable construction before the existing authored assertion
+        // update. Keep the same read controls/counter alive through that update.
+        drop(scope);
         self.try_reset_assertions()?;
         for id in goal {
             let term = self.wrap_term(id);
@@ -2197,13 +3528,60 @@ impl Solver {
         tactic: &Tactic,
         goal: &mut Vec<Term>,
     ) -> Result<bool, SolverError> {
-        let mut ids = self.resolve_terms("apply_tactic_to_goal", goal)?;
-        if tactic.may_invoke_solver() {
+        let _deadline = tactic_deadline::install(self.timeout());
+        let (operation, requirements) = self.inspect_tactic_request(tactic)?;
+        let TacticOperation {
+            scope,
+            _read,
+            started_at: _,
+        } = operation;
+        if requirements.kind == TacticExecutionKind::OwnedModelConversion {
+            return Err(SolverError::TacticFailed(
+                "in-place tactic API requires a retained model converter".into(),
+            ));
+        }
+        if requirements.solver {
             self.reject_composite_bv_cnf_export("apply_tactic_to_goal(ctx-solver-simplify)")?;
         }
+        if requirements.kind != TacticExecutionKind::Legacy {
+            let bytes = goal
+                .len()
+                .checked_mul(std::mem::size_of::<TermId>() + std::mem::size_of::<Term>())
+                .ok_or_else(|| SolverError::TacticFailed("tactic input size overflow".into()))?;
+            scope.admission().admit(goal.len(), bytes).map_err(|_| {
+                SolverError::TacticFailed("tactic original input admission refused".into())
+            })?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during admission".into(),
+                ));
+            }
+            let mut ids = self.resolve_terms("apply_tactic_to_goal", goal)?;
+            let changed = tactic
+                .apply_or_fail_admitted(self.terms_mut(), &mut ids, scope.admission())
+                .map_err(TacticFailure::into_solver_error)?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during construction".into(),
+                ));
+            }
+            if changed {
+                *goal = ids.into_iter().map(|id| self.wrap_term(id)).collect();
+            }
+            return Ok(changed);
+        }
+        let mut ids = self.resolve_terms("apply_tactic_to_goal", goal)?;
+        // A solver-invoking pass runs its nested checks under this solver's
+        // timeout (measured: `ctx-simplify` in a tactic solver with a 3 s
+        // timeout ran 43-50 s before the solver's own check began).
         let changed = tactic
             .apply_or_fail(self.terms_mut(), &mut ids)
-            .map_err(|f| SolverError::TacticFailed(f.message))?;
+            .map_err(TacticFailure::into_solver_error)?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "tactic original request refused before goal publication".into(),
+            ));
+        }
         if changed {
             *goal = ids.into_iter().map(|id| self.wrap_term(id)).collect();
         }
@@ -2234,13 +3612,95 @@ impl Solver {
         tactic: &Tactic,
         goal: &[Term],
     ) -> Result<Vec<(Vec<Term>, usize)>, SolverError> {
-        let ids = self.resolve_terms("apply_tactic_subgoals", goal)?;
-        if tactic.may_invoke_solver() {
+        let _deadline = tactic_deadline::install(self.timeout());
+        let (operation, requirements) = self.inspect_tactic_request(tactic)?;
+        let TacticOperation {
+            scope,
+            _read,
+            started_at: _,
+        } = operation;
+        if requirements.kind == TacticExecutionKind::OwnedModelConversion {
+            return Err(SolverError::TacticFailed(
+                "this tactic requires the typed model-converting subgoal API".into(),
+            ));
+        }
+        if requirements.solver {
             self.reject_composite_bv_cnf_export("apply_tactic_subgoals(ctx-solver-simplify)")?;
         }
+        if requirements.kind != TacticExecutionKind::Legacy {
+            let bytes = goal
+                .len()
+                .checked_mul(std::mem::size_of::<TermId>())
+                .ok_or_else(|| SolverError::TacticFailed("tactic input size overflow".into()))?;
+            scope.admission().admit(goal.len(), bytes).map_err(|_| {
+                SolverError::TacticFailed("tactic original input admission refused".into())
+            })?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during admission".into(),
+                ));
+            }
+            let ids = self.resolve_terms("apply_tactic_subgoals", goal)?;
+            let subgoals = tactic
+                .apply_goals_admitted(self.terms_mut(), Goal::root(ids), scope.admission())
+                .map_err(TacticFailure::into_solver_error)?;
+            for g in &subgoals {
+                scope
+                    .admission()
+                    .admit(
+                        g.formulas.len(),
+                        g.formulas
+                            .len()
+                            .checked_mul(std::mem::size_of::<Term>())
+                            .ok_or_else(|| {
+                                SolverError::TacticFailed("tactic output size overflow".into())
+                            })?,
+                    )
+                    .map_err(|_| {
+                        SolverError::TacticFailed("tactic original output admission refused".into())
+                    })?;
+            }
+            scope
+                .admission()
+                .admit(
+                    subgoals.len(),
+                    subgoals
+                        .len()
+                        .checked_mul(std::mem::size_of::<(Vec<Term>, usize)>())
+                        .ok_or_else(|| {
+                            SolverError::TacticFailed("tactic output size overflow".into())
+                        })?,
+                )
+                .map_err(|_| {
+                    SolverError::TacticFailed("tactic original output admission refused".into())
+                })?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed(
+                    "tactic source changed during construction".into(),
+                ));
+            }
+            return Ok(subgoals
+                .into_iter()
+                .map(|g| {
+                    (
+                        g.formulas
+                            .into_iter()
+                            .map(|id| self.wrap_term(id))
+                            .collect(),
+                        g.depth,
+                    )
+                })
+                .collect());
+        }
+        let ids = self.resolve_terms("apply_tactic_subgoals", goal)?;
         let subgoals = tactic
             .apply_subgoals(self.terms_mut(), Goal::root(ids))
-            .map_err(|f| SolverError::TacticFailed(f.message))?;
+            .map_err(TacticFailure::into_solver_error)?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "tactic original request refused before subgoal publication".into(),
+            ));
+        }
         Ok(subgoals
             .into_iter()
             .map(|g| {
@@ -2253,6 +3713,499 @@ impl Solver {
                 )
             })
             .collect())
+    }
+
+    /// Apply with typed reconstruction retained on every returned subgoal.
+    /// Reusing a converter requires the same original physical term universe.
+    pub fn apply_tactic_subgoals_converted(
+        &mut self,
+        tactic: &Tactic,
+        goal: &[Term],
+        depth: usize,
+        converter: Option<super::tactic_model::TacticModelConverter>,
+    ) -> Result<Vec<TacticSubgoal>, SolverError> {
+        let operation = self.begin_tactic_operation()?;
+        self.apply_tactic_subgoals_in_operation(&operation, tactic, goal, depth, converter)
+    }
+
+    /// Adapter entry retaining exactly the supplied operation's arena through
+    /// input decoding, construction, output handles and final publication.
+    pub fn apply_tactic_subgoals_in_operation(
+        &mut self,
+        operation: &TacticOperation,
+        tactic: &Tactic,
+        goal: &[Term],
+        depth: usize,
+        converter: Option<super::tactic_model::TacticModelConverter>,
+    ) -> Result<Vec<TacticSubgoal>, SolverError> {
+        let scope = &operation.scope;
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "foreign or stopped tactic operation".into(),
+            ));
+        }
+        let requirements = tactic
+            .requirements(Some(scope.admission()))
+            .map_err(TacticFailure::into_solver_error)?;
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "tactic source changed during inspection".into(),
+            ));
+        }
+        let mut ids = Vec::new();
+        ay_core::term::reserve_counted(&mut ids, goal.len(), scope.admission())
+            .map_err(|e| SolverError::TacticFailed(e.to_string()))?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed("tactic source changed".into()));
+        }
+        for &term in goal {
+            ids.push(self.resolve_term("apply_tactic_subgoals_converted", term)?);
+        }
+        let converter = if let Some(converter) = converter {
+            if !converter.valid(self.terms()) {
+                return Err(SolverError::TacticFailed(
+                    "foreign or retired model converter".into(),
+                ));
+            }
+            Some(converter)
+        } else if requirements.kind == TacticExecutionKind::OwnedModelConversion {
+            Some(
+                super::tactic_model::TacticModelConverter::capture(
+                    self.terms(),
+                    &ids,
+                    self.executor.ctx.symbols_iter(),
+                    scope.admission(),
+                )
+                .map_err(TacticFailure::into_solver_error)?,
+            )
+        } else {
+            None
+        };
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed("tactic source changed".into()));
+        }
+        let root = Goal {
+            formulas: ids,
+            depth,
+            model_converter: converter,
+        };
+        let goals = tactic
+            .apply_goals_admitted(self.terms_mut(), root, scope.admission())
+            .map_err(TacticFailure::into_solver_error)?;
+        let mut result = Vec::new();
+        ay_core::term::reserve_counted(&mut result, goals.len(), scope.admission())
+            .map_err(|e| SolverError::TacticFailed(e.to_string()))?;
+        for goal in goals {
+            let mut formulas = Vec::new();
+            ay_core::term::reserve_counted(&mut formulas, goal.formulas.len(), scope.admission())
+                .map_err(|e| SolverError::TacticFailed(e.to_string()))?;
+            if !scope.validate(&self.executor) {
+                return Err(SolverError::TacticFailed("tactic source changed".into()));
+            }
+            for id in goal.formulas {
+                formulas.push(self.wrap_term(id));
+            }
+            result.push(TacticSubgoal {
+                formulas,
+                depth: goal.depth,
+                model_converter: goal.model_converter,
+            });
+        }
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed("tactic source changed".into()));
+        }
+        Ok(result)
+    }
+
+    /// Register the exact auxiliary constants of an owned converted subgoal
+    /// for ordinary solver model extraction. This is an explicit declaration
+    /// command; it does not assert the goal or supply any model verdict.
+    pub fn adopt_tactic_model_constants(
+        &mut self,
+        converter: &super::tactic_model::TacticModelConverter,
+    ) -> Result<(), SolverError> {
+        let operation = self.begin_tactic_operation()?;
+        self.adopt_tactic_model_constants_in_operation(operation, converter)
+    }
+
+    /// Consume the adapter's original read/construction operation into the
+    /// declaration-only phase, retaining its same counter, arena and controls.
+    pub fn adopt_tactic_model_constants_in_operation(
+        &mut self,
+        operation: TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+    ) -> Result<(), SolverError> {
+        let (_scope, _read) = self.adopt_tactic_constants_retained(operation, converter)?;
+        Ok(())
+    }
+
+    fn adopt_tactic_constants_retained(
+        &mut self,
+        operation: TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+    ) -> Result<
+        (
+            crate::executor::TacticDeclarationScope,
+            crate::executor::EvaluationReadScope,
+        ),
+        SolverError,
+    > {
+        use ay_core::term::{reserve_counted, reserve_map_counted};
+        let failure =
+            || SolverError::TacticFailed("tactic representative declaration refused".into());
+        if !operation.validate(self) || !converter.valid(self.terms()) {
+            return Err(failure());
+        }
+        converter
+            .check_namespace(
+                self.terms(),
+                self.executor.ctx.symbols_iter(),
+                &self.adopted_tactic_declarations,
+                operation.admission(),
+            )
+            .map_err(|e| SolverError::TacticFailed(e.message))?;
+        let TacticOperation {
+            scope,
+            _read,
+            started_at: _,
+        } = operation;
+        let declarations = scope
+            .into_declarations(&self.executor)
+            .map_err(|_| failure())?;
+        let owner = declarations.admission();
+        for binding in converter.bindings() {
+            if binding.field.is_none() {
+                continue;
+            }
+            if !declarations.validate_controls(&self.executor) {
+                return Err(failure());
+            }
+            let id = binding.representative;
+            let ay_core::TermData::Var(name, _) = self.terms().get(id) else {
+                return Err(failure());
+            };
+            let sort = self.terms().sort(id).clone();
+            if !matches!(sort, ay_core::Sort::BitVec(_)) {
+                return Err(failure());
+            }
+            owner
+                .admit(
+                    name.len()
+                        .checked_add(self.adopted_tactic_declarations.len())
+                        .ok_or_else(failure)?,
+                    0,
+                )
+                .map_err(|_| failure())?;
+            if let Some(existing) = self.var_terms_by_name.get(name) {
+                if *existing != id
+                    || !self
+                        .adopted_tactic_declarations
+                        .iter()
+                        .any(|(term, _)| *term == id)
+                {
+                    return Err(failure());
+                }
+                continue;
+            }
+            // Four native name copies are made by the canonical adoption
+            // operation, plus this temporary borrowed-name escape.
+            let bytes = name.len().checked_mul(5).ok_or_else(failure)?;
+            owner.admit(bytes, bytes).map_err(|_| failure())?;
+            if !declarations.validate_controls(&self.executor) {
+                return Err(failure());
+            }
+            let name = name.clone();
+            reserve_map_counted(&mut self.var_names, 1, owner).map_err(|_| failure())?;
+            if self.var_terms_by_name.len() == self.var_terms_by_name.capacity() {
+                owner
+                    .admit(self.var_terms_by_name.capacity(), 0)
+                    .map_err(|_| failure())?;
+                for key in self.var_terms_by_name.keys() {
+                    owner.admit(key.len(), 0).map_err(|_| failure())?;
+                }
+            }
+            reserve_map_counted(&mut self.var_terms_by_name, 1, owner).map_err(|_| failure())?;
+            reserve_map_counted(&mut self.var_sorts, 1, owner).map_err(|_| failure())?;
+            reserve_counted(&mut self.native_replay_events, 1, owner).map_err(|_| failure())?;
+            reserve_counted(&mut self.adopted_tactic_declarations, 1, owner)
+                .map_err(|_| failure())?;
+            self.executor
+                .context_mut_internal()
+                .reserve_native_global_constant_adoption(&name, id, owner)
+                .map_err(|_| failure())?;
+            if !declarations.validate_controls(&self.executor) {
+                return Err(failure());
+            }
+            // No callbacks occur inside the canonical, now prepaid update.
+            // It registers this existing id, never a substitute variable.
+            self.try_adopt_translated_constant(self.wrap_term(id), sort.clone())?;
+            let info = self
+                .executor
+                .context()
+                .symbol_info_with_signature(&name, &[], &sort)
+                .ok_or_else(failure)?;
+            if info.term != Some(id) {
+                return Err(failure());
+            }
+            self.adopted_tactic_declarations
+                .push((id, info.declaration_identity().clone()));
+            declarations.recorded_native_declaration(&self.executor);
+            if !declarations.validate_controls(&self.executor) {
+                return Err(failure());
+            }
+        }
+        if !declarations.validate_controls(&self.executor) {
+            return Err(failure());
+        }
+        Ok((declarations, _read))
+    }
+
+    /// Consume a converted single goal using its original operation. The
+    /// exact supplied semantic roots replace the old assertion stack; native
+    /// replay still checks the actual reduced decision. Reconstruction then
+    /// independently checks the converter's original authored roots.
+    pub fn check_converted_tactic_goal_in_operation(
+        &mut self,
+        operation: TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+        roots: &[Term],
+        assumptions: &[Term],
+    ) -> Result<TacticDecision, SolverError> {
+        let _original_read = operation._read.retain();
+        let result =
+            self.check_converted_tactic_goal_retained(operation, converter, roots, assumptions);
+        if let Err(error) = &result {
+            self.set_tactic_error_unknown(error);
+        }
+        result
+    }
+
+    fn check_converted_tactic_goal_retained(
+        &mut self,
+        operation: TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+        roots: &[Term],
+        assumptions: &[Term],
+    ) -> Result<TacticDecision, SolverError> {
+        let failure = || SolverError::TacticFailed("converted tactic decision refused".into());
+        if self.is_producing_proofs() || !operation.validate(self) {
+            return Err(failure());
+        }
+        // Resolve every handle before the explicit assertion handoff.
+        for &term in roots.iter().chain(assumptions) {
+            operation.admission().admit(1, 0).map_err(|_| failure())?;
+            if !operation.validate(self) {
+                return Err(failure());
+            }
+            if self
+                .terms()
+                .sort(self.resolve_term("converted tactic decision", term)?)
+                != &ay_core::Sort::Bool
+            {
+                return Err(failure());
+            }
+        }
+        if !operation.validate(self) {
+            return Err(failure());
+        }
+        let (scope, _read) = self.adopt_tactic_constants_retained(operation, converter)?;
+        if !scope.validate_controls(&self.executor) {
+            return Err(failure());
+        }
+        // These are canonical synchronous source commands, not observer
+        // callbacks. Record each exact expected source update immediately.
+        self.try_reset_assertions()?;
+        scope.recorded_native_declaration(&self.executor);
+        for &term in roots {
+            if !scope.validate_controls(&self.executor) {
+                return Err(failure());
+            }
+            self.try_assert_term(term)?;
+            scope.recorded_native_declaration(&self.executor);
+        }
+        if !scope.validate_controls(&self.executor) {
+            return Err(failure());
+        }
+        let result = if assumptions.is_empty() {
+            self.check_sat_authored_continuation()
+        } else {
+            self.check_sat_assuming_continuation(assumptions)
+        };
+        if !scope.validate_decision(&self.executor) {
+            return Err(failure());
+        }
+        let model = if matches!(result.result(), SolveResult::Sat) {
+            let mut input = self.model().ok_or_else(failure)?.into_inner();
+            if !scope.validate_decision(&self.executor) {
+                return Err(failure());
+            }
+            // The native text model lists unused declared constants too.
+            // They are completion defaults, not assignments constrained by
+            // this reduced goal; a fixed converter must supply those source
+            // leaves itself. Keep exactly the actual reduced free leaves.
+            let mut ids = Vec::new();
+            ay_core::term::reserve_counted(
+                &mut ids,
+                roots
+                    .len()
+                    .checked_add(assumptions.len())
+                    .ok_or_else(failure)?,
+                scope.admission(),
+            )
+            .map_err(|_| failure())?;
+            ids.extend(roots.iter().chain(assumptions).map(|term| term.id()));
+            let reachable =
+                super::tactic_solve_eqs::reachable(self.terms(), &ids, scope.admission())
+                    .map_err(TacticFailure::into_solver_error)?;
+            let mut names = Vec::new();
+            for (index, present) in reachable.into_iter().enumerate() {
+                scope.admission().admit(1, 0).map_err(|_| failure())?;
+                if !scope.validate_decision(&self.executor) {
+                    return Err(failure());
+                }
+                if present {
+                    let id = TermId(u32::try_from(index).map_err(|_| failure())?);
+                    if let ay_core::TermData::Var(name, _) = self.terms().get(id) {
+                        let len = name.len();
+                        scope.admission().admit(len, len).map_err(|_| failure())?;
+                        ay_core::term::reserve_counted(&mut names, 1, scope.admission())
+                            .map_err(|_| failure())?;
+                        if !scope.validate_decision(&self.executor) {
+                            return Err(failure());
+                        }
+                        let ay_core::TermData::Var(name, _) = self.terms().get(id) else {
+                            return Err(failure());
+                        };
+                        names.push(name.clone());
+                    }
+                }
+            }
+            let paid = std::cell::Cell::new(true);
+            input.retain_names(|name| {
+                if scope
+                    .admission()
+                    .admit(name.len().saturating_add(1), 0)
+                    .is_err()
+                {
+                    paid.set(false);
+                    return false;
+                }
+                names.iter().any(|candidate| {
+                    if scope
+                        .admission()
+                        .admit(name.len().saturating_add(candidate.len()), 0)
+                        .is_err()
+                    {
+                        paid.set(false);
+                        return false;
+                    }
+                    name == candidate
+                })
+            });
+            if !paid.get() || !scope.validate_decision(&self.executor) {
+                return Err(failure());
+            }
+            converter
+                .check_namespace(
+                    self.terms(),
+                    self.executor.ctx.symbols_iter(),
+                    &self.adopted_tactic_declarations,
+                    scope.admission(),
+                )
+                .map_err(TacticFailure::into_solver_error)?;
+            if !scope.validate_decision(&self.executor) {
+                return Err(failure());
+            }
+            let model = converter
+                .convert(self.terms(), &input, scope.admission())
+                .map_err(TacticFailure::into_solver_error)?;
+            if !scope.validate_decision(&self.executor) {
+                return Err(failure());
+            }
+            Some(model)
+        } else {
+            None
+        };
+        Ok(TacticDecision {
+            scope,
+            _read,
+            result,
+            model,
+        })
+    }
+
+    /// Preserve an encoded goal's scalar model DATA when the existing C goal
+    /// disabled model reconstruction. Uses the caller's same original owner;
+    /// this does not validate or claim the original goal has a model.
+    pub fn copy_unconverted_tactic_model_in_operation(
+        &self,
+        operation: &TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+        model: &crate::api::Model,
+    ) -> Result<crate::api::Model, SolverError> {
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "model copy original owner refused".into(),
+            ));
+        }
+        let result = converter
+            .copy_unconverted(self.terms(), model, operation.admission())
+            .map_err(|e| SolverError::TacticFailed(e.message))?;
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "model copy source changed".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Reconstruct DATA and freshly check the complete original goal using the
+    /// independent evaluator under this operation's original controls.
+    pub fn convert_tactic_model(
+        &self,
+        converter: &super::tactic_model::TacticModelConverter,
+        model: &crate::api::Model,
+    ) -> Result<crate::api::Model, SolverError> {
+        let operation = self.begin_tactic_operation()?;
+        self.convert_tactic_model_in_operation(&operation, converter, model)
+    }
+
+    /// Reuse the adapter's retained original arena; output storage remains
+    /// charged until that adapter has completed handle publication.
+    pub fn convert_tactic_model_in_operation(
+        &self,
+        operation: &TacticOperation,
+        converter: &super::tactic_model::TacticModelConverter,
+        model: &crate::api::Model,
+    ) -> Result<crate::api::Model, SolverError> {
+        let scope = &operation.scope;
+        if !operation.validate(self) {
+            return Err(SolverError::TacticFailed(
+                "foreign or stopped model conversion operation".into(),
+            ));
+        }
+        converter
+            .check_namespace(
+                self.terms(),
+                self.executor.ctx.symbols_iter(),
+                &self.adopted_tactic_declarations,
+                scope.admission(),
+            )
+            .map_err(|e| SolverError::TacticFailed(e.message))?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "model conversion namespace changed".into(),
+            ));
+        }
+        let result = converter
+            .convert(self.terms(), model, scope.admission())
+            .map_err(|e| SolverError::TacticFailed(e.message))?;
+        if !scope.validate(&self.executor) {
+            return Err(SolverError::TacticFailed(
+                "model conversion source changed".into(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Evaluate a Z3 *probe* over an explicit goal, returning the REAL double
@@ -2284,6 +4237,17 @@ impl Solver {
     #[must_use]
     pub fn translate_terms_from(&mut self, source: &Solver, formulas: &[Term]) -> Vec<Term> {
         let source_ids = source.require_terms("translate_terms_from", formulas);
+        self.translate_native_terms_from(source.terms(), &source_ids)
+    }
+
+    /// Internal authenticated-arena bridge used by the SMT-LIB proof view.
+    /// Source IDs are consumed only against the explicitly borrowed store;
+    /// returned capabilities are minted by this destination Solver.
+    pub(crate) fn translate_native_terms_from(
+        &mut self,
+        source: &TermStore,
+        source_ids: &[TermId],
+    ) -> Vec<Term> {
         // Propagate the `to_real`-shadowed latch for the same reason as the
         // `is_int` latch below. `graft_term` rebuilds applications directly and
         // therefore does not revisit declaration-time shadow detection. Losing
@@ -2291,7 +4255,7 @@ impl Solver {
         // assign builtin integrality semantics to a translated user UF named
         // `to_real`, which is a wrong-verdict channel. Carrying it is
         // conservative and can only disable an optimization. (#to-real-bridge)
-        if source.terms().to_real_is_shadowed() {
+        if source.to_real_is_shadowed() {
             self.terms_mut().mark_to_real_shadowed();
         }
         // Propagate the `is_int`-shadowed latch across the context boundary. The
@@ -2303,14 +4267,14 @@ impl Solver {
         // eliminator produces (`ForAll([x], is_int(x))` over the UF → `unsat`
         // where z3 exhibits `is_int ≡ λx.true`). The latch is sticky and
         // conservative, so carrying it forward can only fail-close. (#isint-shadow)
-        if source.terms().is_int_is_shadowed() {
+        if source.is_int_is_shadowed() {
             self.terms_mut().mark_is_int_shadowed();
         }
-        let src = source.terms();
+        let src = source;
         let mut memo: std::collections::HashMap<TermId, TermId> = std::collections::HashMap::new();
         let out: Vec<TermId> = source_ids
-            .into_iter()
-            .map(|id| graft_term(src, self.terms_mut(), id, &mut memo))
+            .iter()
+            .map(|&id| graft_term(src, self.terms_mut(), id, &mut memo))
             .collect();
         out.into_iter().map(|id| self.wrap_term(id)).collect()
     }
@@ -2320,14 +4284,42 @@ impl Solver {
     /// Used by tactic front-ends so a transformation failure surfaces honestly
     /// as Unknown(InternalError) instead of a fabricated SAT/UNSAT.
     pub(crate) fn set_internal_error_unknown(&mut self, detail: &str) {
+        self.publish_tactic_failure(detail, None);
+    }
+
+    // A local tactic limit is negative evidence only. Capture the original
+    // owner's first refusal before retiring its read or publishing diagnostics.
+    fn set_tactic_error_unknown(&mut self, error: &SolverError) {
+        let local = match error {
+            SolverError::TacticLimit(crate::api::TacticLimitKind::Deadline) => {
+                Some(crate::UnknownOrigin::SolveDeadline)
+            }
+            SolverError::TacticLimit(crate::api::TacticLimitKind::Work) => {
+                Some(crate::UnknownOrigin::DeterministicResourceBudget)
+            }
+            SolverError::TacticLimit(crate::api::TacticLimitKind::Memory) => {
+                Some(crate::UnknownOrigin::MemoryBudget)
+            }
+            _ => None,
+        };
+        self.publish_tactic_failure(&error.to_string(), local);
+    }
+
+    fn publish_tactic_failure(&mut self, detail: &str, local: Option<crate::UnknownOrigin>) {
+        // Capture while the enclosing native read still owns its first cause;
+        // dropping that read restores the unrelated parked decision.
+        let origin = self
+            .executor
+            .tactic_refusal_origin()
+            .or(local)
+            .unwrap_or_else(|| UnknownReason::InternalError.origin());
         // A composite tactic can itself issue internal solves before a later
         // step fails. Revoke both the preceding public result and every partial
         // tactic-probe artefact before publishing Unknown diagnostics.
         self.executor.begin_public_solve(false);
-        self.executor
-            .replace_last_result_with_unknown(UnknownReason::InternalError);
+        self.executor.publish_unknown_from_origin(origin);
         self.last_assumptions = None;
-        self.last_unknown_reason = Some(UnknownReason::InternalError);
+        self.last_unknown_reason = Some(origin.reason());
         self.last_executor_error = Some(detail.to_string());
     }
 }

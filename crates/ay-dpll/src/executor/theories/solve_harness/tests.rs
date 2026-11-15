@@ -8,8 +8,8 @@ use ay_frontend::parse;
 use num_rational::BigRational;
 use num_traits::FromPrimitive;
 
+mod int_const_subst_zero_divisor;
 mod split_atoms;
-mod var_subst_provenance;
 
 fn rat(n: i64) -> BigRational {
     BigRational::from_i64(n).unwrap()
@@ -321,7 +321,8 @@ fn eq_diffvar_runs_and_mandatory_unsat_certification_survives() {
     assert!(
         exec.last_command_unsat_was_strictly_verified()
             || exec.last_command_unsat_was_independently_verified()
-            || exec.last_command_unsat_was_exact_semantically_verified(),
+            || exec.last_command_unsat_was_exact_semantically_verified()
+            || exec.last_command_unsat_was_corroborated(),
         "the `unsat` must be backed by a real certificate, not published as a \
          bare admission"
     );
@@ -361,7 +362,8 @@ fn eq_diffvar_runs_and_mandatory_unsat_certification_survives() {
     assert!(
         exec.last_command_unsat_was_strictly_verified()
             || exec.last_command_unsat_was_independently_verified()
-            || exec.last_command_unsat_was_exact_semantically_verified(),
+            || exec.last_command_unsat_was_exact_semantically_verified()
+            || exec.last_command_unsat_was_corroborated(),
         "the `unsat` must be backed by a real certificate, not published as a \
          bare admission"
     );

@@ -225,3 +225,55 @@ fn test_phase_hint_cache_populated_after_check() {
         "phase hint cache should be populated after feasible check"
     );
 }
+
+/// The phase-hint epoch must advance exactly when a suggestion changes:
+/// a value move that flips no cached phase leaves it stable (so the
+/// SAT-side seeder may skip), while a flip advances it. The row `y <= x`
+/// couples the variables so raising `y`'s bound drives `x` through the
+/// tableau (a bound-only repair would skip the snapshot refresh).
+#[test]
+fn phase_hint_epoch_stable_when_values_move_without_phase_flip() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let ten = terms.mk_rational(BigRational::from(BigInt::from(10)));
+    let atom_le = terms.mk_le(x, ten); // x <= 10
+    let row = terms.mk_le(y, x); // y <= x
+    let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
+    let ge_y1 = terms.mk_ge(y, one); // y >= 1
+    let two = terms.mk_rational(BigRational::from(BigInt::from(2)));
+    let ge_y2 = terms.mk_ge(y, two); // y >= 2
+    let twenty = terms.mk_rational(BigRational::from(BigInt::from(20)));
+    let ge_y20 = terms.mk_ge(y, twenty); // y >= 20
+
+    let mut solver = LraSolver::new(&terms);
+    solver.register_atom(atom_le);
+    solver.assert_literal(row, true);
+    solver.assert_literal(ge_y1, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert_eq!(solver.suggest_phase(atom_le), Some(true));
+    let epoch_after_first = solver.phase_hint_epoch();
+    assert!(epoch_after_first.is_some());
+
+    // Raise y from 1 to 2: x follows through the row, (x <= 10) stays true.
+    solver.push();
+    solver.assert_literal(ge_y2, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert_eq!(solver.suggest_phase(atom_le), Some(true));
+    assert_eq!(
+        solver.phase_hint_epoch(),
+        epoch_after_first,
+        "epoch must not advance when no cached phase flipped"
+    );
+
+    // Force y >= 20 in the same scope: x >= y >= 20 flips (x <= 10) false.
+    solver.assert_literal(ge_y20, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert_eq!(solver.suggest_phase(atom_le), Some(false));
+    assert_ne!(
+        solver.phase_hint_epoch(),
+        epoch_after_first,
+        "epoch must advance when a cached phase flips"
+    );
+    solver.pop();
+}

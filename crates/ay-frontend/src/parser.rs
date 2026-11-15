@@ -8,6 +8,9 @@
 //!
 //! Parses SMT-LIB 2.7 input into commands.
 
+mod raw_commands;
+pub use raw_commands::{RawCommandCursor, RawCommandError, RawCommandFrame};
+
 use crate::command::Command;
 use crate::sexp::{ParseError, SExpr, SExprParser};
 

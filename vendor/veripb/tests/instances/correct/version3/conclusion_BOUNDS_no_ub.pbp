@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+f 3;
+% derive lower bound
+pol 1 2 + 3 + 2 d;
+% conclude bounds
+output NONE;
+conclusion BOUNDS 2 : 4 INF;
+end pseudo-Boolean proof;

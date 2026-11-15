@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+f 0
+strengthening_to_core on
+* derive x1 <-> x2 and x3
+red 1 x1 1 ~x2 1 ~x3 >= 1 ; x1 -> 1
+red 2 ~x1 1 x2 1 x3 >= 2 ; x1 -> 0
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

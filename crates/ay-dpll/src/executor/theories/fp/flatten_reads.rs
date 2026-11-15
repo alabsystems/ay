@@ -100,6 +100,8 @@
 
 mod congruence;
 mod rewrite;
+mod transport;
+mod unread;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol, TermData};
@@ -107,6 +109,7 @@ use ay_core::{Sort, TermId, TermStore};
 use congruence::congruence_axioms;
 use num_bigint::BigInt;
 use rewrite::{is_array_free, rewrite};
+pub(super) use unread::eliminate_unread_array_equalities;
 
 /// What identifies a read cell within one array.
 ///
@@ -229,6 +232,17 @@ pub(super) struct FlattenPlan {
     pub(super) assertions: Vec<TermId>,
     /// The eliminated cells, in deterministic discovery order.
     pub(super) cells: Vec<FlatCell>,
+    /// Exact application images from this attempt, not a name-based alias map.
+    rewrites: HashMap<TermId, TermId>,
+}
+
+impl FlattenPlan {
+    pub(super) fn capture_bool_uf_transport(
+        &self,
+        executor: &mut crate::executor::Executor,
+    ) -> Option<transport::BoolUfTransport> {
+        transport::BoolUfTransport::capture(executor, &self.rewrites)
+    }
 }
 
 /// What `plan_cells` collected before any term is built.
@@ -483,6 +497,7 @@ pub(super) fn plan(
     Ok(FlattenPlan {
         assertions: rewritten,
         cells,
+        rewrites: memo,
     })
 }
 

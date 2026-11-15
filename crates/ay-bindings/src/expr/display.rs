@@ -63,7 +63,20 @@ impl Expr {
                     write!(f, "#b{bits}")
                 }
             }
+            // SMT-LIB 2.6 section 3.1: a <numeral> is an unsigned digit
+            // sequence, and `-7` lexes as a simple symbol, not a number. A
+            // negative constant is the application `(- 7)` of the Ints/Reals
+            // theory's unary minus. The bare spelling is not the term this
+            // expression denotes, so any consumer that replays this text (the
+            // retained proof source, an external solver, a proof checker)
+            // sees a different term than the one that was built.
+            ExprValue::IntConst(v) if v.sign() == num_bigint::Sign::Minus => {
+                write!(f, "(- {})", v.magnitude())
+            }
             ExprValue::IntConst(v) => write!(f, "{v}"),
+            ExprValue::RealConst(v) if v.sign() == num_bigint::Sign::Minus => {
+                write!(f, "(- {}.0)", v.magnitude())
+            }
             ExprValue::RealConst(v) => write!(f, "{v}.0"),
             ExprValue::Var { name } => write!(f, "{}", format_symbol(name)),
             ExprValue::Not(e) => write!(f, "(not {e})"),
@@ -255,6 +268,13 @@ impl Expr {
             ExprValue::RealToInt(e) => write!(f, "(to_int {e})"),
             ExprValue::IsInt(e) => write!(f, "(is_int {e})"),
             ExprValue::RealDiv(a, b) => write!(f, "(/ {a} {b})"),
+            ExprValue::ArrayRangeCopy {
+                dst,
+                src,
+                lo,
+                hi,
+                src_start,
+            } => super::range_copy::display([dst, src, lo, hi, src_start], f),
             ExprValue::Select { array, index } => write!(f, "(select {array} {index})"),
             ExprValue::Store {
                 array,
@@ -324,6 +344,9 @@ impl Expr {
                 for (name, sort) in vars {
                     write!(f, "({} {}) ", format_symbol(name), sort)?;
                 }
+                // The matrix's lets belong inside this binder. The enclosing
+                // sharing region never traverses/replaces quantified children.
+                let body = body.to_smtlib_shared_scoped(vars);
                 if triggers.is_empty() {
                     write!(f, ") {body})")
                 } else {
@@ -350,6 +373,7 @@ impl Expr {
                 for (name, sort) in vars {
                     write!(f, "({} {}) ", format_symbol(name), sort)?;
                 }
+                let body = body.to_smtlib_shared_scoped(vars);
                 if triggers.is_empty() {
                     write!(f, ") {body})")
                 } else {
@@ -408,6 +432,7 @@ impl Expr {
 
             // FP binary (no rounding mode)
             ExprValue::FpRem(a, b) => write!(f, "(fp.rem {a} {b})"),
+            ExprValue::FpTruncatingRem(a, b) => super::truncating::display(f, a, b),
             ExprValue::FpMin(a, b) => write!(f, "(fp.min {a} {b})"),
             ExprValue::FpMax(a, b) => write!(f, "(fp.max {a} {b})"),
 

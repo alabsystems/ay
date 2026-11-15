@@ -22,9 +22,31 @@ impl Solver {
     /// This does not make learned theory clauses permanent across an
     /// incremental reset: they retain their bounded, deletable, theory-re-driven
     /// lifetime and are intentionally absent from the immutable input ledger.
-    fn add_unscoped_theory_clause_db(&mut self, literals: &[Literal]) -> usize {
+    fn add_unscoped_theory_clause_db(
+        &mut self,
+        literals: &[Literal],
+        origin: crate::ClauseEventOrigin,
+    ) -> usize {
         let idx = self.add_clause_db_checked(literals, true, false, &[]);
+        let id = self.cold.clause_ids[idx];
+        if let Some(trace) = self.live_clause_trace_mut() {
+            trace.set_inserted_origin(id, origin);
+        }
         self.arena.set_scope_lim(idx, 0);
+        // Every theory clause is learned, and a learned clause whose LBD stays
+        // at the arena default of 0 is permanently protected by
+        // `reduce_permanent_protect_lbd` (1). `add_theory_lemma` gave its
+        // lemmas a deletable LBD for that reason; the reason clauses of
+        // `add_theory_propagation` and `materialize_lazy_reason_with_ext` did
+        // not, so on a formula the XOR/Gauss route propagates through, every
+        // propagation left a permanent clause: mdp-32-11-sat (1,038 variables,
+        // 5,842 clauses; the field's best 0.3 s) held 1,680,463 learned clauses
+        // at 300,000 conflicts, 99 percent of them at LBD 0, and searched at
+        // 3,175 conflicts per second against Kissat's 44,843 (2026-09-19). A
+        // reason clause is protected by the reason marks while it is one, and
+        // the theory re-derives it afterwards, so it is deletable like a lemma.
+        let lbd = self.reduce_permanent_protect_lbd().saturating_add(1);
+        self.arena.set_lbd(idx, lbd);
         idx
     }
 
@@ -114,6 +136,41 @@ impl Solver {
         self.add_theory_lemma_scoped(literals)
     }
 
+    /// Retain a validated conflict across solves in the current assertion scope.
+    ///
+    /// This is a BETWEEN-SOLVES API for a caller that has already checked the
+    /// theory conflict and owns the SMT proof authority for its exact clause.
+    /// It uses the same scoped replay ledger as add_clause: a rebuild restores
+    /// the clause and its identity, while pop retracts it. It does not provide
+    /// an immediate watched-clause callback; use add_theory_conflict_lemma for
+    /// additions made during search.
+    ///
+    /// A retained theory axiom is still not a SAT-resolution derivation.
+    /// Preserve the ordinary theory-lemma LRAT refusal before registering it
+    /// in the replay ledger; SMT proof capture must supply its theory authority.
+    /// This API neither validates the conflict nor makes it an authored input.
+    pub fn add_retained_theory_conflict_clause(&mut self, mut literals: Vec<Literal>) -> bool {
+        if let Some(manager) = self.proof_manager.as_mut() {
+            if manager.is_lrat() {
+                manager.block_lrat_for_theory_lemmas();
+            }
+        }
+        // Preserve the atom prioritization of the immediate theory path.
+        literals.sort_by_key(|lit| lit.0);
+        literals.dedup();
+        for lit in &literals {
+            let var = lit.variable();
+            if var.index() < self.num_vars {
+                self.vsids.bump(
+                    var,
+                    &self.vals,
+                    self.active_branch_heuristic != BranchHeuristic::Vmtf,
+                );
+            }
+        }
+        self.add_clause(literals)
+    }
+
     /// Add a theory lemma clause during solving.
     ///
     /// Unlike `add_clause`, this properly sets up watches so the clause can
@@ -125,7 +182,31 @@ impl Solver {
     /// - `literals[1]` is unassigned or the next best choice for watching
     ///
     /// Returns the clause reference, or None if the clause is trivially SAT/UNSAT.
-    pub fn add_theory_lemma(&mut self, mut literals: Vec<Literal>) -> Option<ClauseRef> {
+    pub fn add_theory_lemma(&mut self, literals: Vec<Literal>) -> Option<ClauseRef> {
+        self.add_theory_clause_with_origin(literals, crate::ClauseEventOrigin::TheoryLemma)
+    }
+
+    pub(super) fn add_extension_clause(
+        &mut self,
+        clause: Vec<Literal>,
+        origin: crate::TheoryClauseOrigin,
+    ) -> Option<ClauseRef> {
+        match origin {
+            crate::TheoryClauseOrigin::Axiom => self.add_theory_axiom(clause),
+            crate::TheoryClauseOrigin::Lemma => self.add_theory_lemma(clause),
+        }
+    }
+
+    /// Insert an unconditional theory axiom and retain its insertion origin.
+    pub fn add_theory_axiom(&mut self, literals: Vec<Literal>) -> Option<ClauseRef> {
+        self.add_theory_clause_with_origin(literals, crate::ClauseEventOrigin::TheoryAssumption)
+    }
+
+    fn add_theory_clause_with_origin(
+        &mut self,
+        mut literals: Vec<Literal>,
+        origin: crate::ClauseEventOrigin,
+    ) -> Option<ClauseRef> {
         if literals.is_empty() {
             self.mark_empty_clause();
             return None;
@@ -204,7 +285,7 @@ impl Solver {
             // Every other unit must be stored. In particular, a true assignment
             // above root is retractable and an unassigned unit enqueued at the
             // current level has no watches that can restore it after backtrack.
-            let idx = self.add_unscoped_theory_clause_db(&literals);
+            let idx = self.add_unscoped_theory_clause_db(&literals, origin);
             self.provenance
                 .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
             self.mark_subsume_dirty_if_kept(idx);
@@ -269,7 +350,7 @@ impl Solver {
         // Theory lemmas are axioms from the SMT layer, NOT derived
         // by SAT resolution. Use forward_check_derived=false so the
         // forward checker adds them as originals (not RUP-checked).
-        let idx = self.add_unscoped_theory_clause_db(&literals);
+        let idx = self.add_unscoped_theory_clause_db(&literals, origin);
         self.provenance
             .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
         // Theory lemmas default to LBD 0, which `reduce_permanent_protect_lbd`
@@ -536,7 +617,8 @@ impl Solver {
         // With watches on clause[0] (propagated) and clause[1] (highest
         // false reason), BCP will re-discover unit propagation after
         // backtracking past the propagated literal's level.
-        let idx = self.add_unscoped_theory_clause_db(&clause);
+        let idx =
+            self.add_unscoped_theory_clause_db(&clause, crate::ClauseEventOrigin::TheoryLemma);
         self.provenance.tag(
             idx,
             crate::clause_provenance::ClauseProvenance::TheoryPropagation,
@@ -634,9 +716,31 @@ impl Solver {
         self.num_propagations += 1;
     }
 
+    /// The lazy table entry that justifies `var_idx`'s current assignment.
+    ///
+    /// `None` unless `var_idx` carries the lazy flag, its `reason` indexes the
+    /// lazy table, and that entry records `var_idx`'s own currently-true
+    /// literal. Anything else is a broken lazy-reason invariant (for example a
+    /// flag left over a `NO_REASON` reset): reading the indexed entry would
+    /// justify this variable with another variable's theory reason, so the
+    /// caller must treat the assignment as unjustified instead.
+    fn lazy_reason_entry(&self, var_idx: usize) -> Option<(u64, Literal)> {
+        let vd = self.var_data[var_idx];
+        if !vd.is_lazy_theory_reason() {
+            return None;
+        }
+        let idx = vd.reason as usize;
+        let reason_data = *self.cold.lazy_theory_reasons.get(idx)?;
+        let propagated = *self.cold.lazy_theory_propagated.get(idx)?;
+        if propagated.variable().index() != var_idx || self.lit_val(propagated) <= 0 {
+            return None;
+        }
+        Some((reason_data, propagated))
+    }
+
     /// Materialize a lazy theory reason using the given Extension (#8467).
     ///
-    /// Reads the `reason_data` from `lazy_theory_reasons[lazy_idx]`, calls
+    /// Reads the `reason_data` from the lazy table entry of `var_idx`, calls
     /// `Extension::explain_lazy_reason()` to get the full clause, stores it
     /// in the arena, and updates `VarData` to point to the new clause.
     ///
@@ -644,21 +748,12 @@ impl Solver {
     /// the reason could not be reconstructed (bound was retracted).
     pub(super) fn materialize_lazy_reason_with_ext(
         &mut self,
-        lazy_idx: u32,
+        var_idx: usize,
         ext: &mut dyn Extension,
         max_reason_level: Option<u32>,
     ) -> Option<ClauseRef> {
-        let idx = lazy_idx as usize;
-        debug_assert!(
-            idx < self.cold.lazy_theory_reasons.len(),
-            "BUG: lazy_idx {} out of bounds (len={})",
-            idx,
-            self.cold.lazy_theory_reasons.len()
-        );
-
-        let reason_data = self.cold.lazy_theory_reasons[idx];
-        let propagated = self.cold.lazy_theory_propagated[idx];
-        let propagated_level = self.var_data[propagated.variable().index()].level;
+        let (reason_data, propagated) = self.lazy_reason_entry(var_idx)?;
+        let propagated_level = self.var_data[var_idx].level;
 
         let clause = ext.explain_lazy_reason(propagated, reason_data)?;
 
@@ -792,18 +887,35 @@ impl Solver {
         // When a reason literal is not falsified, reject the entire lazy
         // reason (return None). The variable's VarData retains the lazy flag
         // and conflict analysis treats it as a decision, which is sound.
+        let propagated_trail_pos = self.var_data[propagated.variable().index()].trail_pos;
         for &reason_lit in clause.iter().skip(1) {
             if self.lit_val(reason_lit) >= 0 {
                 // Reason literal is unassigned or satisfied — stale reason.
                 // Reject this lazy materialization.
                 return None;
             }
-            let reason_level = self.var_data[reason_lit.variable().index()].level;
-            if reason_level > max_reason_level {
+            let reason_var = self.var_data[reason_lit.variable().index()];
+            if reason_var.level > max_reason_level {
                 // A propagated assignment can survive any backtrack down to its
                 // own level. Its stored reason must therefore be falsified by
                 // literals no higher than the propagated assignment's level, and
                 // no higher than any stricter caller-provided survivor level.
+                return None;
+            }
+            if reason_var.level == propagated_level && reason_var.trail_pos > propagated_trail_pos {
+                // The theory explains under its CURRENT bounds, which include
+                // facts asserted after the propagation, possibly ones derived
+                // FROM it (an LRA bound decided by the propagated atom's own
+                // bound, or a BCP consequence of it). A reason through such a
+                // literal closes a cycle in the implication graph: 1UIP
+                // resolves both ends as if they justified each other and drops
+                // the premises that really implied them, scope selectors
+                // included. Measured on the session-persistent QF_LRA lane: a
+                // learned clause without its selector outlived the pop and
+                // refuted a satisfiable base (a false UNSAT the strict
+                // certification caught). Every reason literal at the
+                // propagation level must therefore precede it on the trail; a
+                // lower-level literal cannot depend on it.
                 return None;
             }
         }
@@ -817,7 +929,8 @@ impl Solver {
             }
         }
 
-        let arena_idx = self.add_unscoped_theory_clause_db(&clause);
+        let arena_idx =
+            self.add_unscoped_theory_clause_db(&clause, crate::ClauseEventOrigin::TheoryLemma);
         self.provenance.tag(
             arena_idx,
             crate::clause_provenance::ClauseProvenance::TheoryPropagation,
@@ -835,7 +948,6 @@ impl Solver {
         }
 
         // Update VarData to point to the real clause, clearing the lazy flag.
-        let var_idx = propagated.variable().index();
         let vd = &mut self.var_data[var_idx];
         let seen_flag = vd.flags & VarData::FLAG_SEEN_PUB;
         vd.reason = arena_idx as u32;
@@ -936,9 +1048,8 @@ impl Solver {
                 continue;
             }
             if self.var_data[var_idx].is_lazy_theory_reason() {
-                let lazy_idx = self.var_data[var_idx].reason;
                 if self
-                    .materialize_lazy_reason_with_ext(lazy_idx, ext, max_reason_level)
+                    .materialize_lazy_reason_with_ext(var_idx, ext, max_reason_level)
                     .is_none()
                 {
                     // Materialization failed: the theory could not reconstruct
@@ -956,6 +1067,10 @@ impl Solver {
                     // the lazy flag set — causes conflict analysis to skip
                     // resolution, producing an overly STRONG clause that can
                     // prune valid solutions, causing false UNSAT.
+                    //
+                    // A lazy flag whose index names no entry for this variable
+                    // (see `lazy_reason_entry`) takes the same exit: it is not
+                    // a reason and must never be read as one.
                     let vd = &mut self.var_data[var_idx];
                     let seen_flag = vd.flags & VarData::FLAG_SEEN_PUB;
                     vd.reason = NO_REASON;
@@ -990,5 +1105,66 @@ impl Solver {
         self.cold.lazy_theory_reasons.clear();
         self.cold.lazy_theory_propagated.clear();
         self.cold.lazy_materialization_failed = false;
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/retained_theory_conflict.rs"]
+mod retained_conflict_tests;
+
+#[cfg(test)]
+mod insertion_origin_tests {
+    use super::*;
+
+    #[test]
+    fn actual_retirement_keeps_addition_snapshot_and_records_deleted_literals() {
+        let mut solver = Solver::new(3);
+        solver.enable_clause_trace();
+        solver.set_clause_event_capture(crate::ClauseEventCapture::Lifecycle);
+        let a = Literal::positive(Variable::new(0));
+        let b = Literal::positive(Variable::new(1));
+        solver.add_theory_axiom(vec![a, b]);
+        let idx = solver.arena.active_indices().next().expect("stored axiom");
+        let before = solver.snapshot_clause_trace().expect("enabled");
+        solver.delete_clause_checked(idx, crate::solver::mutate::ReasonPolicy::Skip);
+        assert!(!solver.arena.is_active(idx));
+        let after = solver.snapshot_clause_trace().expect("enabled");
+        assert_eq!(after.len(), before.len());
+        let events: Vec<_> = after.events().collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].origin, crate::ClauseEventOrigin::Deleted);
+        assert_eq!(
+            events[1].clause,
+            before.entries().first().expect("axiom").clause
+        );
+        assert_eq!(before.events().count(), 1);
+    }
+
+    #[test]
+    fn theory_insertions_retain_their_origin_and_snapshot() {
+        let mut solver = Solver::new(3);
+        solver.enable_clause_trace();
+        solver.set_clause_event_capture(crate::ClauseEventCapture::Lifecycle);
+        let a = Literal::positive(Variable::new(0));
+        let b = Literal::positive(Variable::new(1));
+        let c = Literal::positive(Variable::new(2));
+        solver.add_theory_axiom(vec![a, b]);
+        solver.add_theory_lemma(vec![a.negated(), c]);
+        let first = solver.snapshot_clause_trace().expect("trace enabled");
+        let origins = first
+            .entries()
+            .iter()
+            .map(|entry| entry.origin)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            origins,
+            vec![
+                crate::ClauseEventOrigin::TheoryAssumption,
+                crate::ClauseEventOrigin::TheoryLemma
+            ]
+        );
+        solver.add_theory_lemma(vec![b.negated(), c]);
+        assert_eq!(first.len(), 2);
+        assert_eq!(solver.snapshot_clause_trace().expect("trace").len(), 3);
     }
 }

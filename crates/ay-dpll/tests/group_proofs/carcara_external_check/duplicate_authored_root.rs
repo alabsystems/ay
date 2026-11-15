@@ -16,6 +16,17 @@ const CANONICAL_IDENTITY_PRESENT: &str = r#"
 (check-sat)
 "#;
 
+/// Two rows spelling one root differently: the first is the `assume`.
+const DIFFERING_NONCANONICAL_ROWS: &str = r#"
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-const b Int)
+(assert (>= (f b) 0))
+(assert (<= (+ 0 0) (f b)))
+(assert (not (<= 0 (f b))))
+(check-sat)
+"#;
+
 const IDENTICAL_NONCANONICAL_ROWS: &str = r#"
 (set-logic QF_UFLIA)
 (declare-fun f (Int) Int)
@@ -77,5 +88,31 @@ fn duplicate_authored_root_proofs_are_exactly_bound_or_withheld() {
     assert!(
         valid,
         "AY must not publish a proof real Carcara rejects: {diagnostic}"
+    );
+}
+
+/// Each of two differently spelled rows is a premise, so binding the first
+/// one's spelling is exact: pinned Carcara checks the document `valid`. The
+/// surface used to be withheld (and `--proof FILE` lost the verdict, #8821).
+#[test]
+#[cfg_attr(debug_assertions, timeout(120_000))]
+#[cfg_attr(not(debug_assertions), timeout(60_000))]
+fn differing_duplicate_rows_bind_the_first_rows_spelling() {
+    let carcara = required_carcara_for_corpus();
+    let proof = solve_unsat_and_get_proof(DIFFERING_NONCANONICAL_ROWS, "duplicate_differing_rows");
+    let assumed = extract_assume_terms(&proof);
+    assert!(
+        assumed.iter().any(|assume| assume == "(>= (f b) 0)"),
+        "the first row's spelling is the duplicate root's assume:\n{proof}"
+    );
+    let asserted = extract_asserted_terms(DIFFERING_NONCANONICAL_ROWS);
+    assert!(
+        assumed.iter().all(|assume| asserted.contains(assume)),
+        "{proof}"
+    );
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, DIFFERING_NONCANONICAL_ROWS, &proof);
+    assert!(
+        valid,
+        "AY must not publish a proof real Carcara rejects: {diagnostic}\n{proof}"
     );
 }

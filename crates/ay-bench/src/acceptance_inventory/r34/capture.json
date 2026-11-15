@@ -1,0 +1,1172 @@
+{
+  "archive": {
+    "path": "the development design notes",
+    "sha256": "0669ca9e181d5d87d3ad89fd69c56484283d0ecd02f9ac1babf46d5bdb3b9586",
+    "bytes": 234769
+  },
+  "consumer_revision": "4b18310a33a75fde702bfd3dd8c733eaebd1d0de",
+  "ay_revision": "48c98a43d90c627d5643b3240c1ff8db86b1b6b4",
+  "sources": {
+    "static": {
+      "base": "w5-w6-export/static-generator-main/main",
+      "source": {
+        "file": "source.smt2",
+        "sha256": "b76f7cc32a31b2db199f11b9a95c31a9646ef8e9be63388b1ed0f0532bfef625",
+        "bytes": 64008,
+        "what": "exact bytes passed to ay::chc::ChcParser::parse: the harness CHC after the driver's (bv2int #x..) literal fold and cover-metadata strip",
+        "compiler_smt_file": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/static-generator-main-export/src/static_generator__RNvCs9yT8oxFSyPZ_16static_generator4main.symtab.smt2",
+        "compiler_smt_sha256": "b76f7cc32a31b2db199f11b9a95c31a9646ef8e9be63388b1ed0f0532bfef625",
+        "compiler_smt_bytes": 64008
+      },
+      "source_problem": {
+        "file": "source.normalized",
+        "normalized_input_sha256": "7adc74b3f5045e6f2f8c7e61406e6676bdf3e9a8102e3e4f9cdaa99e0ca15ef8",
+        "ay_normalized_input_sha256": "7adc74b3f5045e6f2f8c7e61406e6676bdf3e9a8102e3e4f9cdaa99e0ca15ef8",
+        "predicates": 51,
+        "clauses": 69
+      },
+      "aggregate_problem": {
+        "file": "aggregate.normalized",
+        "normalized_input_sha256": "6547fc5ea8b6fbb4dce677ecb43b8c0e1261520bc12243dc53462175aaad9a7c",
+        "ay_normalized_input_sha256": "6547fc5ea8b6fbb4dce677ecb43b8c0e1261520bc12243dc53462175aaad9a7c",
+        "predicates": 51,
+        "clauses": 68,
+        "passes": {
+          "expand_nullary_fail_queries": true,
+          "transforms": {
+            "enabled": false,
+            "selected": []
+          }
+        },
+        "received_by": "the acyclic-BMC shortcut (after an undecided batch by default) and the forced-engine lanes; the per-property rows are sliced from source.smt2 instead"
+      },
+      "per_property_batch": {
+        "obligation_count": 24,
+        "slicing": "ChcProblem::query_obligations() on the problem as parsed from source.smt2 (before expand_nullary_fail_queries)",
+        "row_preparation": {
+          "expand_nullary_fail_queries": true,
+          "transforms": "ObligationTransforms { scalarize: false, split_ite: false, split_or: false }"
+        },
+        "execution": {
+          "mode": "adaptive-parallel",
+          "requested_by": "default",
+          "env": {
+            "MODEL_CHECKER_CONSUMER_AY_CHC_DETERMINISTIC": null,
+            "AY_DETERMINISTIC": null
+          }
+        },
+        "batch_budget_ms": 15000,
+        "per_row_cap_ms": 15000,
+        "batch_guard_grace_ms": 5000,
+        "harness_deadline_remaining_ms_at_batch_start": 69900,
+        "skip_verify": false,
+        "memory_budget_bytes": 65286912000,
+        "rows_after_refutation": "skip",
+        "second_pass": "rows left budget-bound are re-solved from what the batch clock has left when the new share is >= 250 ms and >= 1.5x the previous share",
+        "row_validation": "each proved row's invariant model is re-validated against its own problem after the rows run",
+        "lemma_hints": {
+          "file": "lemma-hints.txt",
+          "count": 0,
+          "debug_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "shared_by_every_row": true
+        },
+        "obligations": [
+          {
+            "label": "error_p0",
+            "content_sha256": "2f09094c5963e9e86c302ae218fb01b63857bfb9facd591a3237e98f20d0b7cf"
+          },
+          {
+            "label": "error_definition_7",
+            "content_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63"
+          },
+          {
+            "label": "error_p1",
+            "content_sha256": "a7c4468d00fb12665c6f66d8d05bd135b7b1b8b3499afdd154ee07d39c4c8876"
+          },
+          {
+            "label": "error_p2",
+            "content_sha256": "ff69166791f5ca554cc5fa228f4254f850139a96f13452a3c1e34074e85642c7"
+          },
+          {
+            "label": "error_p3",
+            "content_sha256": "7d9481ab878f91e5458a15e48110aa8f4c0441b567d7f13d268bb5e39b132a21"
+          },
+          {
+            "label": "error_p4",
+            "content_sha256": "b5f468ffd24d637890162d390af837f563e633bde5b513d36d59bbd6ee055732"
+          },
+          {
+            "label": "error_p5",
+            "content_sha256": "2925296ae6e2d03c48ff609d418c0e65102877d06f7d45db13138ee66ae74b07"
+          },
+          {
+            "label": "error_p6",
+            "content_sha256": "1a42c81902ac3767eabdf35415e9b99c4af1770bb74fe6ad3d5ecbc5c10e90eb"
+          },
+          {
+            "label": "error_p7",
+            "content_sha256": "866b88307ad8032242ac69da35e731b05ea6d8d3a2fd5c9cb8f238921a5cc0ad"
+          },
+          {
+            "label": "error_p8",
+            "content_sha256": "dc09375c6cf5dcaf58a71fb51507da66c4fd1c05cacb8ef6eb99639175687bda"
+          },
+          {
+            "label": "error_p9",
+            "content_sha256": "86405456b4f54594b4ef79e63dcd8cbf45f12056644148ccbc7e986b8c48032b"
+          },
+          {
+            "label": "error_p10",
+            "content_sha256": "75e73e58375142789a3023fd84e5ff51855cb17f588a9b3551124d33035e27b9"
+          },
+          {
+            "label": "error_p11",
+            "content_sha256": "9bd7335811ce769190320c13ec20fad840669e868bf50a13559cec7e8bc67149"
+          },
+          {
+            "label": "error_p12",
+            "content_sha256": "645f38af156f1b4df02f3981c2799c72ca07e091ec180f3889ef83b764d9d9ab"
+          },
+          {
+            "label": "error_p13",
+            "content_sha256": "4743fae4ffae5c7e95ff1e8610353e41fb84ddfcaa32c9ebc25d31a7ebb0fb1c"
+          },
+          {
+            "label": "error_p14",
+            "content_sha256": "6a0a558e8c73252cbad33ff2cdf01f7866e1129b3db32050364664b18fd317d6"
+          },
+          {
+            "label": "error_p15",
+            "content_sha256": "fd5fda4eeed8a456c77106a8c317728d586706fda4f72f85720f3b4ea7f35fbe"
+          },
+          {
+            "label": "error_p16",
+            "content_sha256": "df56d2a577c0e2d78e8e730ad80325311299ea6006bc363884df46e704fd6973"
+          },
+          {
+            "label": "error_p17",
+            "content_sha256": "e0a2a863b703fd9f594d78a74dee0ac0a712fa11395287eac805b0c561a66367"
+          },
+          {
+            "label": "error_p18",
+            "content_sha256": "b198df88f5f30652600919a6eb42efac901c8c7c458f007479b2360597e4cc3e"
+          },
+          {
+            "label": "error_p19",
+            "content_sha256": "5bd93ceb976af9179e8d7674bda5026bc0cab6c385c1cf44672ee74237f2fcbf"
+          },
+          {
+            "label": "error_p20",
+            "content_sha256": "74ce7ede99719943b87296e65e1d6bc93b6fc21bacb74411403cac1d4f672c3e"
+          },
+          {
+            "label": "error_p21",
+            "content_sha256": "1c3c41b1f61f9cf797b6d92e4d7410933917e3104a0502c76cbb794a5a703d06"
+          },
+          {
+            "label": "error_p22",
+            "content_sha256": "bea4f2d71293cee562c10ea6887c0b960165cad1d68adbb3fe05877f78c890cc"
+          }
+        ],
+        "reparse_check": {
+          "status": "ok",
+          "what": "source.smt2 re-read from disk, parsed, sliced with query_obligations() and each slice prepared as the driver prepares it; status=ok means the labels and content_sha256 values equal the in-process obligations in order",
+          "reparsed_obligations": [
+            {
+              "label": "error_p0",
+              "content_sha256": "2f09094c5963e9e86c302ae218fb01b63857bfb9facd591a3237e98f20d0b7cf"
+            },
+            {
+              "label": "error_definition_7",
+              "content_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63"
+            },
+            {
+              "label": "error_p1",
+              "content_sha256": "a7c4468d00fb12665c6f66d8d05bd135b7b1b8b3499afdd154ee07d39c4c8876"
+            },
+            {
+              "label": "error_p2",
+              "content_sha256": "ff69166791f5ca554cc5fa228f4254f850139a96f13452a3c1e34074e85642c7"
+            },
+            {
+              "label": "error_p3",
+              "content_sha256": "7d9481ab878f91e5458a15e48110aa8f4c0441b567d7f13d268bb5e39b132a21"
+            },
+            {
+              "label": "error_p4",
+              "content_sha256": "b5f468ffd24d637890162d390af837f563e633bde5b513d36d59bbd6ee055732"
+            },
+            {
+              "label": "error_p5",
+              "content_sha256": "2925296ae6e2d03c48ff609d418c0e65102877d06f7d45db13138ee66ae74b07"
+            },
+            {
+              "label": "error_p6",
+              "content_sha256": "1a42c81902ac3767eabdf35415e9b99c4af1770bb74fe6ad3d5ecbc5c10e90eb"
+            },
+            {
+              "label": "error_p7",
+              "content_sha256": "866b88307ad8032242ac69da35e731b05ea6d8d3a2fd5c9cb8f238921a5cc0ad"
+            },
+            {
+              "label": "error_p8",
+              "content_sha256": "dc09375c6cf5dcaf58a71fb51507da66c4fd1c05cacb8ef6eb99639175687bda"
+            },
+            {
+              "label": "error_p9",
+              "content_sha256": "86405456b4f54594b4ef79e63dcd8cbf45f12056644148ccbc7e986b8c48032b"
+            },
+            {
+              "label": "error_p10",
+              "content_sha256": "75e73e58375142789a3023fd84e5ff51855cb17f588a9b3551124d33035e27b9"
+            },
+            {
+              "label": "error_p11",
+              "content_sha256": "9bd7335811ce769190320c13ec20fad840669e868bf50a13559cec7e8bc67149"
+            },
+            {
+              "label": "error_p12",
+              "content_sha256": "645f38af156f1b4df02f3981c2799c72ca07e091ec180f3889ef83b764d9d9ab"
+            },
+            {
+              "label": "error_p13",
+              "content_sha256": "4743fae4ffae5c7e95ff1e8610353e41fb84ddfcaa32c9ebc25d31a7ebb0fb1c"
+            },
+            {
+              "label": "error_p14",
+              "content_sha256": "6a0a558e8c73252cbad33ff2cdf01f7866e1129b3db32050364664b18fd317d6"
+            },
+            {
+              "label": "error_p15",
+              "content_sha256": "fd5fda4eeed8a456c77106a8c317728d586706fda4f72f85720f3b4ea7f35fbe"
+            },
+            {
+              "label": "error_p16",
+              "content_sha256": "df56d2a577c0e2d78e8e730ad80325311299ea6006bc363884df46e704fd6973"
+            },
+            {
+              "label": "error_p17",
+              "content_sha256": "e0a2a863b703fd9f594d78a74dee0ac0a712fa11395287eac805b0c561a66367"
+            },
+            {
+              "label": "error_p18",
+              "content_sha256": "b198df88f5f30652600919a6eb42efac901c8c7c458f007479b2360597e4cc3e"
+            },
+            {
+              "label": "error_p19",
+              "content_sha256": "5bd93ceb976af9179e8d7674bda5026bc0cab6c385c1cf44672ee74237f2fcbf"
+            },
+            {
+              "label": "error_p20",
+              "content_sha256": "74ce7ede99719943b87296e65e1d6bc93b6fc21bacb74411403cac1d4f672c3e"
+            },
+            {
+              "label": "error_p21",
+              "content_sha256": "1c3c41b1f61f9cf797b6d92e4d7410933917e3104a0502c76cbb794a5a703d06"
+            },
+            {
+              "label": "error_p22",
+              "content_sha256": "bea4f2d71293cee562c10ea6887c0b960165cad1d68adbb3fe05877f78c890cc"
+            }
+          ],
+          "prepared_by_label": {
+            "error_p0": "851253fbd2fe3e7d4bb9901a9bb21fb7d8018c5b9fc8e721a831e2182ea397e3",
+            "error_definition_7": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+            "error_p1": "a7c4468d00fb12665c6f66d8d05bd135b7b1b8b3499afdd154ee07d39c4c8876",
+            "error_p2": "ff69166791f5ca554cc5fa228f4254f850139a96f13452a3c1e34074e85642c7",
+            "error_p3": "7d9481ab878f91e5458a15e48110aa8f4c0441b567d7f13d268bb5e39b132a21",
+            "error_p4": "b5f468ffd24d637890162d390af837f563e633bde5b513d36d59bbd6ee055732",
+            "error_p5": "09b20e509a74f8925aee0b835587ea191bee44cc2880bbbcae8986c4a9eb3f70",
+            "error_p6": "1a42c81902ac3767eabdf35415e9b99c4af1770bb74fe6ad3d5ecbc5c10e90eb",
+            "error_p7": "b330d7f4219062b1e761a971f097e565ebfb3c69576b7ade62884cb80868a3b9",
+            "error_p8": "1e66fd7d22e1d100516dbd9c5cd64ac66813daf08aafa08f3abbd1539f060616",
+            "error_p9": "934e3ed8b5963bad98bd2f2d9e91b61f7d1573733db202e060537e980b62449b",
+            "error_p10": "75e73e58375142789a3023fd84e5ff51855cb17f588a9b3551124d33035e27b9",
+            "error_p11": "9bd7335811ce769190320c13ec20fad840669e868bf50a13559cec7e8bc67149",
+            "error_p12": "645f38af156f1b4df02f3981c2799c72ca07e091ec180f3889ef83b764d9d9ab",
+            "error_p13": "91995b7ca77e3d1c9838be3ea9974fe9cc5f93c4a2572c36ecca54e5bb421e85",
+            "error_p14": "6a0a558e8c73252cbad33ff2cdf01f7866e1129b3db32050364664b18fd317d6",
+            "error_p15": "c10088c6ae32607a29a5c805752119e504c38bfde0d5873e1991d9d41fea5f55",
+            "error_p16": "df56d2a577c0e2d78e8e730ad80325311299ea6006bc363884df46e704fd6973",
+            "error_p17": "722a80326797c49a21e97fe6bfd36573d8feb8013128b28cd2470df6463643e7",
+            "error_p18": "12c9c43e53d1299a34049a271476beba31abf2e86be2d35aebec9e83fbfc548d",
+            "error_p19": "0a49e28aadc584d4eee49b592004a91660fd8ea43cfd14117d8454f0b96277b7",
+            "error_p20": "588242766f312139cdeeae59e521e767e3601ace637471349d9fdde66d39c0c3",
+            "error_p21": "2db05c3d8276d923bfe6fc132cead7a1ed967b63967d1d6d13e04c225c3a4aa8",
+            "error_p22": "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a"
+          }
+        }
+      },
+      "execution_environment": {
+        "available_parallelism": 20,
+        "harness_workers": 1,
+        "process_memory_cap_bytes": 65331501056,
+        "process_memory_cap_note": "the process-wide RSS cap main() armed for AY (ay_sys::get_process_memory_limit); null when none is armed",
+        "env": {
+          "MODEL_CHECKER_CONSUMER_CHC_ROW_EXPORT_DIR": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/static-generator-main-export/export",
+          "MODEL_CHECKER_CONSUMER_SYSROOT": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/merge-bundle"
+        },
+        "env_note": "every AY_* and MODEL_CHECKER_CONSUMER_* variable set in the driver's environment"
+      }
+    },
+    "alloc": {
+      "base": "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice",
+      "source": {
+        "file": "source.smt2",
+        "sha256": "1831017f60a9e457e87177ee1cdcbb98dc506d844ace07c83719e5f3847a158a",
+        "bytes": 47146,
+        "what": "exact bytes passed to ay::chc::ChcParser::parse: the harness CHC after the driver's (bv2int #x..) literal fold and cover-metadata strip",
+        "compiler_smt_file": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/alloc-to-slice-check_uninit_slice-export/src/alloc_to_slice__RNvCshcvnbfysO32_14alloc_to_slice18check_uninit_slice.symtab.smt2",
+        "compiler_smt_sha256": "1831017f60a9e457e87177ee1cdcbb98dc506d844ace07c83719e5f3847a158a",
+        "compiler_smt_bytes": 47146
+      },
+      "source_problem": {
+        "file": "source.normalized",
+        "normalized_input_sha256": "fc48f653224c7f0a78ce49366b298bbe971abe8783935f118dfaefdc86f47a97",
+        "ay_normalized_input_sha256": "fc48f653224c7f0a78ce49366b298bbe971abe8783935f118dfaefdc86f47a97",
+        "predicates": 59,
+        "clauses": 76
+      },
+      "aggregate_problem": {
+        "file": "aggregate.normalized",
+        "normalized_input_sha256": "b3176bba853576d9fa23c546fd0acd9d879a8bbd5a80c32a161b97fb053023ad",
+        "ay_normalized_input_sha256": "b3176bba853576d9fa23c546fd0acd9d879a8bbd5a80c32a161b97fb053023ad",
+        "predicates": 59,
+        "clauses": 75,
+        "passes": {
+          "expand_nullary_fail_queries": true,
+          "transforms": {
+            "enabled": false,
+            "selected": []
+          }
+        },
+        "received_by": "the acyclic-BMC shortcut (after an undecided batch by default) and the forced-engine lanes; the per-property rows are sliced from source.smt2 instead"
+      },
+      "per_property_batch": {
+        "obligation_count": 30,
+        "slicing": "ChcProblem::query_obligations() on the problem as parsed from source.smt2 (before expand_nullary_fail_queries)",
+        "row_preparation": {
+          "expand_nullary_fail_queries": true,
+          "transforms": "ObligationTransforms { scalarize: false, split_ite: false, split_or: false }"
+        },
+        "execution": {
+          "mode": "adaptive-parallel",
+          "requested_by": "default",
+          "env": {
+            "MODEL_CHECKER_CONSUMER_AY_CHC_DETERMINISTIC": null,
+            "AY_DETERMINISTIC": null
+          }
+        },
+        "batch_budget_ms": 15000,
+        "per_row_cap_ms": 15000,
+        "batch_guard_grace_ms": 5000,
+        "harness_deadline_remaining_ms_at_batch_start": 66371,
+        "skip_verify": false,
+        "memory_budget_bytes": 65270532096,
+        "rows_after_refutation": "skip",
+        "second_pass": "rows left budget-bound are re-solved from what the batch clock has left when the new share is >= 250 ms and >= 1.5x the previous share",
+        "row_validation": "each proved row's invariant model is re-validated against its own problem after the rows run",
+        "lemma_hints": {
+          "file": "lemma-hints.txt",
+          "count": 0,
+          "debug_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "shared_by_every_row": true
+        },
+        "obligations": [
+          {
+            "label": "error_definition_5",
+            "content_sha256": "cbd2845f2600e364f3113bded8acabbab6e2fe818dc8b8ef4a27742e3a29ab62"
+          },
+          {
+            "label": "error_p0",
+            "content_sha256": "7b80c96d1a9d1f471cc5a890555b8aa0d804e7aef0b8cca6c8d7adee73bb0ea9"
+          },
+          {
+            "label": "error_p1",
+            "content_sha256": "e78fdb1c957961dbf45ed4010f96a8bc9224692aff808e9671998da5a91e040e"
+          },
+          {
+            "label": "error_p2",
+            "content_sha256": "9bd463a938ee3d2702b5c2b917f94c20d1b9a0429f725c7b1111858d040cfcc7"
+          },
+          {
+            "label": "error_p3",
+            "content_sha256": "33d81835ca10902cf0648d3c0af9cfa04456ec8c76c7f5546d9e6d72bbe35070"
+          },
+          {
+            "label": "error_p4",
+            "content_sha256": "f49ff96774ee5293f203ecc8c0753db0d65fccee902d73600488b0563757ee55"
+          },
+          {
+            "label": "error_p5",
+            "content_sha256": "23409e360fc9d4a54e5fff9628dab547e41575f89aecee2e1d668c80271d5329"
+          },
+          {
+            "label": "error_p6",
+            "content_sha256": "2ea6c292d42d4325241d012a6240a3629d68713e4810e8c896949568ccb5eeb7"
+          },
+          {
+            "label": "error_p7",
+            "content_sha256": "9010766fc72bc55a224422728664d212f7236bf3899a3a4c368a391958bcd530"
+          },
+          {
+            "label": "error_p8",
+            "content_sha256": "b3d2b1badc3021fbd3e6f42f771ff7e0a0a8c9e08b78fa61fff581f8b4669e34"
+          },
+          {
+            "label": "error_p9",
+            "content_sha256": "fa0dde367174855d29efd16f5ff90cd7d9ac2d47195ec209ef07ec1bb07e56ec"
+          },
+          {
+            "label": "error_p10",
+            "content_sha256": "32de2a7c6316c5a120f0621b20fd804f1b7555164322edb666829dc0388125a3"
+          },
+          {
+            "label": "error_p11",
+            "content_sha256": "39f3867c25452647f57d96d121e584fb02a333f52b136c18a4b78c8490d741fc"
+          },
+          {
+            "label": "error_p12",
+            "content_sha256": "d616325203b3c49e70ba83d053cd1cc417689914d489ad3cab78917ad4d000be"
+          },
+          {
+            "label": "error_p13",
+            "content_sha256": "73162882589cd85212b6af3f29e28743026df7fabac4d696295130d39a9e0834"
+          },
+          {
+            "label": "error_p14",
+            "content_sha256": "faa9afbdc2d78f3d79b942bc8d6457c7e2361ceecb3ce58596b273683f57f10d"
+          },
+          {
+            "label": "error_p15",
+            "content_sha256": "b3fd88c657e2a8fd4f835ecc2851db87e15e915de33f297e5fbe4f5db98ba5f0"
+          },
+          {
+            "label": "error_p16",
+            "content_sha256": "cdc3edabca3fffb2c61d6e4cafb3323d55b1d17c03f4bce8f9629bf941ef04fe"
+          },
+          {
+            "label": "error_p17",
+            "content_sha256": "52f74872cf87b07d79ba2238349d8f7ae681cb1581c6bb340eccf540db1569ac"
+          },
+          {
+            "label": "error_p18",
+            "content_sha256": "77dbbc0e80f067ad6286dd226ab9d3f01f37b2d0a3d920b179bead3cb0f06e8a"
+          },
+          {
+            "label": "error_p19",
+            "content_sha256": "72248fac55853c04846262cc9db4398ebfaae661a453cfdbdbdfe16c982ee8d6"
+          },
+          {
+            "label": "error_p20",
+            "content_sha256": "e2f6d71eaa51f09d391e6b604a9637d7b9a02f43560a772fdb5175345ba9d376"
+          },
+          {
+            "label": "error_p21",
+            "content_sha256": "34ab9540e8daa3c01c4b167f86a99e1150d9f27e0291559e4afcb8d7c9df331b"
+          },
+          {
+            "label": "error_p22",
+            "content_sha256": "6dc3b9e464b2177dc02c603cf1c6425a7973bdc3557894a5f78e0060b6d4caee"
+          },
+          {
+            "label": "error_p23",
+            "content_sha256": "68b93e2b7634d3ad7028883b6f3783e8c74b9f3c4d2e7ec16eb6a28ebe7c2f64"
+          },
+          {
+            "label": "error_p24",
+            "content_sha256": "29337db5034a73f852e8048a3d9507a76d183dffceef1c934700f7027398d771"
+          },
+          {
+            "label": "error_p25",
+            "content_sha256": "053025298e545dd9111976e3b9392313faac8b728532bea110971ed5c665161c"
+          },
+          {
+            "label": "error_p26",
+            "content_sha256": "bec97ad6e5a8fccda4de2dd6b4563f611cb76676a3757f86f20bc507b287bf02"
+          },
+          {
+            "label": "error_p27",
+            "content_sha256": "f4e44bd00080e1640c460ae4d83836e41702a8647f0c61b3aabe1f2090d5253e"
+          },
+          {
+            "label": "error_p28",
+            "content_sha256": "c1a468f7933fc0d3f82273a4e383fde984b7ad5719a3805dc2bea91f25b9bd92"
+          }
+        ],
+        "reparse_check": {
+          "status": "ok",
+          "what": "source.smt2 re-read from disk, parsed, sliced with query_obligations() and each slice prepared as the driver prepares it; status=ok means the labels and content_sha256 values equal the in-process obligations in order",
+          "reparsed_obligations": [
+            {
+              "label": "error_definition_5",
+              "content_sha256": "cbd2845f2600e364f3113bded8acabbab6e2fe818dc8b8ef4a27742e3a29ab62"
+            },
+            {
+              "label": "error_p0",
+              "content_sha256": "7b80c96d1a9d1f471cc5a890555b8aa0d804e7aef0b8cca6c8d7adee73bb0ea9"
+            },
+            {
+              "label": "error_p1",
+              "content_sha256": "e78fdb1c957961dbf45ed4010f96a8bc9224692aff808e9671998da5a91e040e"
+            },
+            {
+              "label": "error_p2",
+              "content_sha256": "9bd463a938ee3d2702b5c2b917f94c20d1b9a0429f725c7b1111858d040cfcc7"
+            },
+            {
+              "label": "error_p3",
+              "content_sha256": "33d81835ca10902cf0648d3c0af9cfa04456ec8c76c7f5546d9e6d72bbe35070"
+            },
+            {
+              "label": "error_p4",
+              "content_sha256": "f49ff96774ee5293f203ecc8c0753db0d65fccee902d73600488b0563757ee55"
+            },
+            {
+              "label": "error_p5",
+              "content_sha256": "23409e360fc9d4a54e5fff9628dab547e41575f89aecee2e1d668c80271d5329"
+            },
+            {
+              "label": "error_p6",
+              "content_sha256": "2ea6c292d42d4325241d012a6240a3629d68713e4810e8c896949568ccb5eeb7"
+            },
+            {
+              "label": "error_p7",
+              "content_sha256": "9010766fc72bc55a224422728664d212f7236bf3899a3a4c368a391958bcd530"
+            },
+            {
+              "label": "error_p8",
+              "content_sha256": "b3d2b1badc3021fbd3e6f42f771ff7e0a0a8c9e08b78fa61fff581f8b4669e34"
+            },
+            {
+              "label": "error_p9",
+              "content_sha256": "fa0dde367174855d29efd16f5ff90cd7d9ac2d47195ec209ef07ec1bb07e56ec"
+            },
+            {
+              "label": "error_p10",
+              "content_sha256": "32de2a7c6316c5a120f0621b20fd804f1b7555164322edb666829dc0388125a3"
+            },
+            {
+              "label": "error_p11",
+              "content_sha256": "39f3867c25452647f57d96d121e584fb02a333f52b136c18a4b78c8490d741fc"
+            },
+            {
+              "label": "error_p12",
+              "content_sha256": "d616325203b3c49e70ba83d053cd1cc417689914d489ad3cab78917ad4d000be"
+            },
+            {
+              "label": "error_p13",
+              "content_sha256": "73162882589cd85212b6af3f29e28743026df7fabac4d696295130d39a9e0834"
+            },
+            {
+              "label": "error_p14",
+              "content_sha256": "faa9afbdc2d78f3d79b942bc8d6457c7e2361ceecb3ce58596b273683f57f10d"
+            },
+            {
+              "label": "error_p15",
+              "content_sha256": "b3fd88c657e2a8fd4f835ecc2851db87e15e915de33f297e5fbe4f5db98ba5f0"
+            },
+            {
+              "label": "error_p16",
+              "content_sha256": "cdc3edabca3fffb2c61d6e4cafb3323d55b1d17c03f4bce8f9629bf941ef04fe"
+            },
+            {
+              "label": "error_p17",
+              "content_sha256": "52f74872cf87b07d79ba2238349d8f7ae681cb1581c6bb340eccf540db1569ac"
+            },
+            {
+              "label": "error_p18",
+              "content_sha256": "77dbbc0e80f067ad6286dd226ab9d3f01f37b2d0a3d920b179bead3cb0f06e8a"
+            },
+            {
+              "label": "error_p19",
+              "content_sha256": "72248fac55853c04846262cc9db4398ebfaae661a453cfdbdbdfe16c982ee8d6"
+            },
+            {
+              "label": "error_p20",
+              "content_sha256": "e2f6d71eaa51f09d391e6b604a9637d7b9a02f43560a772fdb5175345ba9d376"
+            },
+            {
+              "label": "error_p21",
+              "content_sha256": "34ab9540e8daa3c01c4b167f86a99e1150d9f27e0291559e4afcb8d7c9df331b"
+            },
+            {
+              "label": "error_p22",
+              "content_sha256": "6dc3b9e464b2177dc02c603cf1c6425a7973bdc3557894a5f78e0060b6d4caee"
+            },
+            {
+              "label": "error_p23",
+              "content_sha256": "68b93e2b7634d3ad7028883b6f3783e8c74b9f3c4d2e7ec16eb6a28ebe7c2f64"
+            },
+            {
+              "label": "error_p24",
+              "content_sha256": "29337db5034a73f852e8048a3d9507a76d183dffceef1c934700f7027398d771"
+            },
+            {
+              "label": "error_p25",
+              "content_sha256": "053025298e545dd9111976e3b9392313faac8b728532bea110971ed5c665161c"
+            },
+            {
+              "label": "error_p26",
+              "content_sha256": "bec97ad6e5a8fccda4de2dd6b4563f611cb76676a3757f86f20bc507b287bf02"
+            },
+            {
+              "label": "error_p27",
+              "content_sha256": "f4e44bd00080e1640c460ae4d83836e41702a8647f0c61b3aabe1f2090d5253e"
+            },
+            {
+              "label": "error_p28",
+              "content_sha256": "c1a468f7933fc0d3f82273a4e383fde984b7ad5719a3805dc2bea91f25b9bd92"
+            }
+          ],
+          "prepared_by_label": {
+            "error_definition_5": "cbd2845f2600e364f3113bded8acabbab6e2fe818dc8b8ef4a27742e3a29ab62",
+            "error_p0": "7b80c96d1a9d1f471cc5a890555b8aa0d804e7aef0b8cca6c8d7adee73bb0ea9",
+            "error_p1": "e78fdb1c957961dbf45ed4010f96a8bc9224692aff808e9671998da5a91e040e",
+            "error_p2": "9bd463a938ee3d2702b5c2b917f94c20d1b9a0429f725c7b1111858d040cfcc7",
+            "error_p3": "33d81835ca10902cf0648d3c0af9cfa04456ec8c76c7f5546d9e6d72bbe35070",
+            "error_p4": "f49ff96774ee5293f203ecc8c0753db0d65fccee902d73600488b0563757ee55",
+            "error_p5": "23409e360fc9d4a54e5fff9628dab547e41575f89aecee2e1d668c80271d5329",
+            "error_p6": "2ea6c292d42d4325241d012a6240a3629d68713e4810e8c896949568ccb5eeb7",
+            "error_p7": "9010766fc72bc55a224422728664d212f7236bf3899a3a4c368a391958bcd530",
+            "error_p8": "b3d2b1badc3021fbd3e6f42f771ff7e0a0a8c9e08b78fa61fff581f8b4669e34",
+            "error_p9": "fa0dde367174855d29efd16f5ff90cd7d9ac2d47195ec209ef07ec1bb07e56ec",
+            "error_p10": "bf22d8ad90525b7cf7b1898a50454e8f95eb2a04ce0c71c20fdd06105c36a600",
+            "error_p11": "515c07e31eb0a13c4fe879a3f07f91645816aeb7158af708b05a533419b43a31",
+            "error_p12": "6e9be2119643e61a2681cc138a60aec53a234f8488a646b3930cac71e0a44bbe",
+            "error_p13": "37e345ca6701b1b48490d2b2414db5c10b006cf7f74057f171ad43ef72471fa9",
+            "error_p14": "faa9afbdc2d78f3d79b942bc8d6457c7e2361ceecb3ce58596b273683f57f10d",
+            "error_p15": "6e9be2119643e61a2681cc138a60aec53a234f8488a646b3930cac71e0a44bbe",
+            "error_p16": "fcd82878ed41e4b12d3d62438d2a8c859fd3c55d34664bc796514c498fb7eb9f",
+            "error_p17": "fbb67db1fe622f11d88f308277b1f13856d8f19a2561de2b91ea07639a9f7984",
+            "error_p18": "1e7f512a5c398f0619b7862223d5d90dab763b4f5d93bce18ff29cc3c70334e4",
+            "error_p19": "b7f04ee95c0d0337a29531344859b175f69448d1a1e4e597f8fe1214620a22e1",
+            "error_p20": "e2f6d71eaa51f09d391e6b604a9637d7b9a02f43560a772fdb5175345ba9d376",
+            "error_p21": "1e7f512a5c398f0619b7862223d5d90dab763b4f5d93bce18ff29cc3c70334e4",
+            "error_p22": "e0c84604c5e87c2f21b9e0fff75ba2fdbbd339e984b56ee6180af6b7bc62f786",
+            "error_p23": "7742ad3a2f2499d4263e7cc86edb1c9609032f8329bed8bf36dc6b2bbbb17493",
+            "error_p24": "7359aa5e644f86478f4f52a1aa2cbc68282be543706626de1b758f70615eb6fc",
+            "error_p25": "22132d21058ef067907d7f2bbaf45cad775c466ee3f4221c00d2c04d241a166d",
+            "error_p26": "bec97ad6e5a8fccda4de2dd6b4563f611cb76676a3757f86f20bc507b287bf02",
+            "error_p27": "7359aa5e644f86478f4f52a1aa2cbc68282be543706626de1b758f70615eb6fc",
+            "error_p28": "698067b870b291c3013b7f30054f5da773f4687dabbdabbd9010a3d1156b7e64"
+          }
+        }
+      },
+      "execution_environment": {
+        "available_parallelism": 20,
+        "harness_workers": 1,
+        "process_memory_cap_bytes": 65331501056,
+        "process_memory_cap_note": "the process-wide RSS cap main() armed for AY (ay_sys::get_process_memory_limit); null when none is armed",
+        "env": {
+          "MODEL_CHECKER_CONSUMER_CHC_ROW_EXPORT_DIR": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/alloc-to-slice-check_uninit_slice-export/export",
+          "MODEL_CHECKER_CONSUMER_SYSROOT": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/merge-bundle"
+        },
+        "env_note": "every AY_* and MODEL_CHECKER_CONSUMER_* variable set in the driver's environment"
+      }
+    },
+    "bitmask": {
+      "base": "w5-w6-export/bitmask-check_unsigned_bitmask/check_unsigned_bitmask",
+      "source": {
+        "file": "source.smt2",
+        "sha256": "ebace52a8b9b2d04f7453da88f01278ed75a1df33b5f8c11481e1536b09a13f4",
+        "bytes": 197030,
+        "what": "exact bytes passed to ay::chc::ChcParser::parse: the harness CHC after the driver's (bv2int #x..) literal fold and cover-metadata strip",
+        "compiler_smt_file": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/bitmask-check_unsigned_bitmask-export/src/bitmask__RNvCs7458shq5FI1_7bitmask22check_unsigned_bitmask.symtab.smt2",
+        "compiler_smt_sha256": "ebace52a8b9b2d04f7453da88f01278ed75a1df33b5f8c11481e1536b09a13f4",
+        "compiler_smt_bytes": 197030
+      },
+      "source_problem": {
+        "file": "source.normalized",
+        "normalized_input_sha256": "8c4c8816a20662a01b042c943e88d8c271e49062fd911c696a5db3bf65da1e74",
+        "ay_normalized_input_sha256": "8c4c8816a20662a01b042c943e88d8c271e49062fd911c696a5db3bf65da1e74",
+        "predicates": 60,
+        "clauses": 80
+      },
+      "aggregate_problem": null,
+      "per_property_batch": null,
+      "execution_environment": {
+        "available_parallelism": 20,
+        "harness_workers": 1,
+        "process_memory_cap_bytes": 65331501056,
+        "process_memory_cap_note": "the process-wide RSS cap main() armed for AY (ay_sys::get_process_memory_limit); null when none is armed",
+        "env": {
+          "MODEL_CHECKER_CONSUMER_CHC_ROW_EXPORT_DIR": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/runs/w5/bitmask-check_unsigned_bitmask-export/export",
+          "MODEL_CHECKER_CONSUMER_SYSROOT": "/tmp/claude-1000/-home-ayates-model-checker-consumer/1a20a613-f79e-4b86-a4f8-ce14d0d9aa1b/scratchpad/ayalign8/merge-bundle"
+        },
+        "env_note": "every AY_* and MODEL_CHECKER_CONSUMER_* variable set in the driver's environment"
+      }
+    }
+  },
+  "rows": [
+    {
+      "source": "static",
+      "label": "error_p0",
+      "timeout_ns": 622866572,
+      "config_file": "w5-w6-export/static-generator-main/main/rows/00-error_p0.first.config.txt",
+      "row": {
+        "index": 0,
+        "pass": "first",
+        "identity": {
+          "label": "error_p0",
+          "relation": "error_p0",
+          "content_sha256": "2f09094c5963e9e86c302ae218fb01b63857bfb9facd591a3237e98f20d0b7cf",
+          "source_query_ordinal": 0,
+          "query_clause_index": 68,
+          "defining_clause_index": 3
+        },
+        "grant": {
+          "row_budget_ms": 622,
+          "rows_left_including_this_one": 24,
+          "batch_clock_remaining_ms_before_row": 14948,
+          "harness_deadline_remaining_ms_before_row": 69849,
+          "rule": "row budget = min(per_row_cap, min(batch_remaining, harness_remaining) / rows_left)"
+        },
+        "prepared_problem": {
+          "file": "rows/00-error_p0.first.prepared.normalized",
+          "normalized_input_sha256": "851253fbd2fe3e7d4bb9901a9bb21fb7d8018c5b9fc8e721a831e2182ea397e3",
+          "ay_normalized_input_sha256": "851253fbd2fe3e7d4bb9901a9bb21fb7d8018c5b9fc8e721a831e2182ea397e3",
+          "predicates": 51,
+          "clauses": 17
+        },
+        "slice_normalized_sha256": "2f09094c5963e9e86c302ae218fb01b63857bfb9facd591a3237e98f20d0b7cf",
+        "prepared_matches_reparse": true,
+        "solve_call": {
+          "entry_point": "ay_encode::invoke::solve_with_proof_report_with_cancellation",
+          "proof_mode": "None",
+          "engine": "Auto",
+          "strict_validation": true,
+          "adaptive_strict_proofs": true,
+          "execution_mode": "AdaptiveParallel",
+          "timeout_ms": 622,
+          "memory_budget_bytes": 65286912000,
+          "lemma_hints": 0,
+          "cancellation": "parent token armed with the batch clock before the call; the call runs synchronously on the harness thread",
+          "config_file": "rows/00-error_p0.first.config.txt"
+        },
+        "outcome": {
+          "label": "error_p0",
+          "relation": "error_p0",
+          "content_sha256": "2f09094c5963e9e86c302ae218fb01b63857bfb9facd591a3237e98f20d0b7cf",
+          "outcome": "unknown",
+          "detail": "undecided (budget-exhausted)",
+          "stop_reason": "budget-exhausted",
+          "cancellation_requested_at_return": false,
+          "elapsed_ms": 625,
+          "budget_ms": 622,
+          "adaptive_stages": [
+            "adt_array_nullary_unsafe_prepass:RouteSpecific(\"dag_unknown\")",
+            "datatype_bounded_bmc_refutation:Unknown",
+            "arg_constant_invariant:Quarantined",
+            "solidity_array_dt_projection:NotApplicable",
+            "array_const_key_cegar:Unknown",
+            "algebraic_synthesis_bvtoint:Unknown",
+            "multi_pred_linear_case_split:Unknown",
+            "strategy_dispatch:Unknown",
+            "adaptive_round:Unknown",
+            "authoritative_solve:Unknown"
+          ],
+          "ay_transcript_metadata": {
+            "schema": "ay.chc-proof-transcript/v1",
+            "result": "unknown",
+            "accepted_as_proof": false,
+            "proof_status": "non-proof",
+            "normalized_input_sha256": "851253fbd2fe3e7d4bb9901a9bb21fb7d8018c5b9fc8e721a831e2182ea397e3",
+            "replay_status": "not-replayable",
+            "transcript_status": "non-proof",
+            "transcript_metadata_only": true,
+            "trust_full_verifier_admissible": false
+          }
+        }
+      }
+    },
+    {
+      "source": "static",
+      "label": "error_definition_7",
+      "timeout_ns": 622477385,
+      "config_file": "w5-w6-export/static-generator-main/main/rows/01-error_definition_7.first.config.txt",
+      "row": {
+        "index": 1,
+        "pass": "first",
+        "identity": {
+          "label": "error_definition_7",
+          "relation": null,
+          "content_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+          "source_query_ordinal": 0,
+          "query_clause_index": 68,
+          "defining_clause_index": 7
+        },
+        "grant": {
+          "row_budget_ms": 622,
+          "rows_left_including_this_one": 23,
+          "batch_clock_remaining_ms_before_row": 14316,
+          "harness_deadline_remaining_ms_before_row": 69217,
+          "rule": "row budget = min(per_row_cap, min(batch_remaining, harness_remaining) / rows_left)"
+        },
+        "prepared_problem": {
+          "file": "rows/01-error_definition_7.first.prepared.normalized",
+          "normalized_input_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+          "ay_normalized_input_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+          "predicates": 51,
+          "clauses": 17
+        },
+        "slice_normalized_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+        "prepared_matches_reparse": true,
+        "solve_call": {
+          "entry_point": "ay_encode::invoke::solve_with_proof_report_with_cancellation",
+          "proof_mode": "None",
+          "engine": "Auto",
+          "strict_validation": true,
+          "adaptive_strict_proofs": true,
+          "execution_mode": "AdaptiveParallel",
+          "timeout_ms": 622,
+          "memory_budget_bytes": 65286912000,
+          "lemma_hints": 0,
+          "cancellation": "parent token armed with the batch clock before the call; the call runs synchronously on the harness thread",
+          "config_file": "rows/01-error_definition_7.first.config.txt"
+        },
+        "outcome": {
+          "label": "error_definition_7",
+          "relation": null,
+          "content_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+          "outcome": "unknown",
+          "detail": "undecided (budget-exhausted)",
+          "stop_reason": "budget-exhausted",
+          "cancellation_requested_at_return": false,
+          "elapsed_ms": 624,
+          "budget_ms": 622,
+          "adaptive_stages": [
+            "adt_array_nullary_unsafe_prepass:RouteSpecific(\"dag_unknown\")",
+            "datatype_bounded_bmc_refutation:Unknown",
+            "arg_constant_invariant:Quarantined",
+            "solidity_array_dt_projection:NotApplicable",
+            "array_const_key_cegar:Unknown",
+            "algebraic_synthesis_bvtoint:Unknown",
+            "multi_pred_linear_case_split:Unknown",
+            "strategy_dispatch:Unknown",
+            "adaptive_round:Unknown",
+            "authoritative_solve:Unknown"
+          ],
+          "ay_transcript_metadata": {
+            "schema": "ay.chc-proof-transcript/v1",
+            "result": "unknown",
+            "accepted_as_proof": false,
+            "proof_status": "non-proof",
+            "normalized_input_sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+            "replay_status": "not-replayable",
+            "transcript_status": "non-proof",
+            "transcript_metadata_only": true,
+            "trust_full_verifier_admissible": false
+          }
+        }
+      }
+    },
+    {
+      "source": "static",
+      "label": "error_p22",
+      "timeout_ns": 1907606927,
+      "config_file": "w5-w6-export/static-generator-main/main/rows/23-error_p22.first.config.txt",
+      "row": {
+        "index": 23,
+        "pass": "first",
+        "identity": {
+          "label": "error_p22",
+          "relation": "error_p22",
+          "content_sha256": "bea4f2d71293cee562c10ea6887c0b960165cad1d68adbb3fe05877f78c890cc",
+          "source_query_ordinal": 0,
+          "query_clause_index": 68,
+          "defining_clause_index": 66
+        },
+        "grant": {
+          "row_budget_ms": 1907,
+          "rows_left_including_this_one": 1,
+          "batch_clock_remaining_ms_before_row": 1907,
+          "harness_deadline_remaining_ms_before_row": 56807,
+          "rule": "row budget = min(per_row_cap, min(batch_remaining, harness_remaining) / rows_left)"
+        },
+        "prepared_problem": {
+          "file": "rows/23-error_p22.first.prepared.normalized",
+          "normalized_input_sha256": "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a",
+          "ay_normalized_input_sha256": "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a",
+          "predicates": 51,
+          "clauses": 12
+        },
+        "slice_normalized_sha256": "bea4f2d71293cee562c10ea6887c0b960165cad1d68adbb3fe05877f78c890cc",
+        "prepared_matches_reparse": true,
+        "solve_call": {
+          "entry_point": "ay_encode::invoke::solve_with_proof_report_with_cancellation",
+          "proof_mode": "None",
+          "engine": "Auto",
+          "strict_validation": true,
+          "adaptive_strict_proofs": true,
+          "execution_mode": "AdaptiveParallel",
+          "timeout_ms": 1907,
+          "memory_budget_bytes": 65286912000,
+          "lemma_hints": 0,
+          "cancellation": "parent token armed with the batch clock before the call; the call runs synchronously on the harness thread",
+          "config_file": "rows/23-error_p22.first.config.txt"
+        },
+        "outcome": {
+          "label": "error_p22",
+          "relation": "error_p22",
+          "content_sha256": "bea4f2d71293cee562c10ea6887c0b960165cad1d68adbb3fe05877f78c890cc",
+          "outcome": "proved",
+          "detail": "definitive safe",
+          "stop_reason": "definitive",
+          "cancellation_requested_at_return": false,
+          "elapsed_ms": 529,
+          "budget_ms": 1907,
+          "adaptive_stages": [
+            "datatype_bounded_bmc_refutation:Unknown",
+            "arg_constant_invariant:Quarantined",
+            "solidity_array_dt_projection:NotApplicable",
+            "array_const_key_cegar:Unknown",
+            "algebraic_synthesis_bvtoint:Safe",
+            "adaptive_round:Safe",
+            "authoritative_solve:Safe"
+          ],
+          "ay_transcript_metadata": {
+            "schema": "ay.chc-proof-transcript/v1",
+            "result": "safe",
+            "accepted_as_proof": true,
+            "proof_status": "verified-invariant",
+            "normalized_input_sha256": "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a",
+            "replay_status": "replay-artifacts-required",
+            "transcript_status": "metadata-only",
+            "transcript_metadata_only": true,
+            "trust_full_verifier_admissible": false
+          }
+        }
+      }
+    },
+    {
+      "source": "alloc",
+      "label": "error_p28",
+      "timeout_ns": 5185898469,
+      "config_file": "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice/rows/29-error_p28.first.config.txt",
+      "row": {
+        "index": 29,
+        "pass": "first",
+        "identity": {
+          "label": "error_p28",
+          "relation": "error_p28",
+          "content_sha256": "c1a468f7933fc0d3f82273a4e383fde984b7ad5719a3805dc2bea91f25b9bd92",
+          "source_query_ordinal": 0,
+          "query_clause_index": 75,
+          "defining_clause_index": 72
+        },
+        "grant": {
+          "row_budget_ms": 5185,
+          "rows_left_including_this_one": 1,
+          "batch_clock_remaining_ms_before_row": 5185,
+          "harness_deadline_remaining_ms_before_row": 56557,
+          "rule": "row budget = min(per_row_cap, min(batch_remaining, harness_remaining) / rows_left)"
+        },
+        "prepared_problem": {
+          "file": "rows/29-error_p28.first.prepared.normalized",
+          "normalized_input_sha256": "698067b870b291c3013b7f30054f5da773f4687dabbdabbd9010a3d1156b7e64",
+          "ay_normalized_input_sha256": "698067b870b291c3013b7f30054f5da773f4687dabbdabbd9010a3d1156b7e64",
+          "predicates": 59,
+          "clauses": 29
+        },
+        "slice_normalized_sha256": "c1a468f7933fc0d3f82273a4e383fde984b7ad5719a3805dc2bea91f25b9bd92",
+        "prepared_matches_reparse": true,
+        "solve_call": {
+          "entry_point": "ay_encode::invoke::solve_with_proof_report_with_cancellation",
+          "proof_mode": "None",
+          "engine": "Auto",
+          "strict_validation": true,
+          "adaptive_strict_proofs": true,
+          "execution_mode": "AdaptiveParallel",
+          "timeout_ms": 5185,
+          "memory_budget_bytes": 65270532096,
+          "lemma_hints": 0,
+          "cancellation": "parent token armed with the batch clock before the call; the call runs synchronously on the harness thread",
+          "config_file": "rows/29-error_p28.first.config.txt"
+        },
+        "outcome": {
+          "label": "error_p28",
+          "relation": "error_p28",
+          "content_sha256": "c1a468f7933fc0d3f82273a4e383fde984b7ad5719a3805dc2bea91f25b9bd92",
+          "outcome": "unknown",
+          "detail": "undecided (budget-exhausted)",
+          "stop_reason": "budget-exhausted",
+          "cancellation_requested_at_return": false,
+          "elapsed_ms": 5188,
+          "budget_ms": 5185,
+          "adaptive_stages": [
+            "adt_array_nullary_unsafe_prepass:RouteSpecific(\"dag_not_found\")",
+            "arg_constant_invariant:Quarantined",
+            "array_const_key_cegar:Unknown",
+            "array_ghost_pairs:Unknown",
+            "algebraic_synthesis:Skipped",
+            "multi_pred_linear_case_split:Unknown",
+            "strategy_dispatch:Unknown",
+            "adaptive_round:Unknown",
+            "authoritative_solve:Unknown"
+          ],
+          "ay_transcript_metadata": {
+            "schema": "ay.chc-proof-transcript/v1",
+            "result": "unknown",
+            "accepted_as_proof": false,
+            "proof_status": "non-proof",
+            "normalized_input_sha256": "698067b870b291c3013b7f30054f5da773f4687dabbdabbd9010a3d1156b7e64",
+            "replay_status": "not-replayable",
+            "transcript_status": "non-proof",
+            "transcript_metadata_only": true,
+            "trust_full_verifier_admissible": false
+          }
+        }
+      }
+    }
+  ],
+  "witnesses": [
+    {
+      "source": "static",
+      "record": {
+        "seq": 1,
+        "clause_index": 14,
+        "purpose": "is-sat",
+        "constraint_query": {
+          "file": "witness/0001.normalized",
+          "normalized_input_sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+          "ay_normalized_input_sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+          "predicates": 0,
+          "clauses": 1
+        },
+        "formula_debug_sha256": "3d0841049868b5f25866a6fe503f5d7c6255f078cb82f34663d33df259cf45ac",
+        "smtlib": {
+          "file": null,
+          "not_rendered": "function application Coroutine_390_mk"
+        },
+        "result": "unknown"
+      },
+      "remaining_budget_recorded": false
+    },
+    {
+      "source": "static",
+      "record": {
+        "seq": 3,
+        "clause_index": 14,
+        "purpose": "is-sat",
+        "constraint_query": {
+          "file": "witness/0003.normalized",
+          "normalized_input_sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+          "ay_normalized_input_sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+          "predicates": 0,
+          "clauses": 1
+        },
+        "formula_debug_sha256": "3d0841049868b5f25866a6fe503f5d7c6255f078cb82f34663d33df259cf45ac",
+        "smtlib": {
+          "file": null,
+          "not_rendered": "function application Coroutine_390_mk"
+        },
+        "result": "unknown"
+      },
+      "remaining_budget_recorded": false
+    },
+    {
+      "source": "bitmask",
+      "record": {
+        "seq": 26,
+        "clause_index": 26,
+        "purpose": "is-sat",
+        "constraint_query": {
+          "file": "witness/0026.normalized",
+          "normalized_input_sha256": "a9ce1af044c96487620f8b467a02a027257f79576a7a311ed1f1252707261c88",
+          "ay_normalized_input_sha256": "a9ce1af044c96487620f8b467a02a027257f79576a7a311ed1f1252707261c88",
+          "predicates": 0,
+          "clauses": 1
+        },
+        "formula_debug_sha256": "edfe5562e773bf314a23374335570ccbcea54133d5ffae3bd2221660dd8582f7",
+        "smtlib": {
+          "file": "witness/0026.smt2",
+          "sha256": "1600f7ec7236b52fe54da2b3f31895007fc3caad505921620987763159f317a3"
+        },
+        "result": "unknown"
+      },
+      "remaining_budget_recorded": false
+    }
+  ],
+  "files": {
+    "w5-w6-export/static-generator-main/main/manifest.json": {
+      "sha256": "5ec3b7d02628d2f4dba90e2daadd1e00463325e8974d7ae4b492e398c6141788",
+      "bytes": 99394
+    },
+    "w5-w6-export/static-generator-main/main/source.smt2": {
+      "sha256": "b76f7cc32a31b2db199f11b9a95c31a9646ef8e9be63388b1ed0f0532bfef625",
+      "bytes": 64008
+    },
+    "w5-w6-export/static-generator-main/main/rows/00-error_p0.first.config.txt": {
+      "sha256": "dc8175c2d764cecca74026486245cd240babcb3164c2810b9be305959ca67278",
+      "bytes": 875
+    },
+    "w5-w6-export/static-generator-main/main/rows/00-error_p0.first.prepared.normalized": {
+      "sha256": "851253fbd2fe3e7d4bb9901a9bb21fb7d8018c5b9fc8e721a831e2182ea397e3",
+      "bytes": 74815
+    },
+    "w5-w6-export/static-generator-main/main/rows/01-error_definition_7.first.config.txt": {
+      "sha256": "19791124bbcc507a226f1e7b3af1ed6f4f899402b3da5691529d409c758384e8",
+      "bytes": 875
+    },
+    "w5-w6-export/static-generator-main/main/rows/01-error_definition_7.first.prepared.normalized": {
+      "sha256": "649b6a3a934e714dd1ff08ed078e3d6241b5b96d612e5f98b94714d5752fde63",
+      "bytes": 87267
+    },
+    "w5-w6-export/static-generator-main/main/rows/23-error_p22.first.config.txt": {
+      "sha256": "94a2860c205e10cfec489276449175b1827cac5f9533f02baa032e398f3287be",
+      "bytes": 875
+    },
+    "w5-w6-export/static-generator-main/main/rows/23-error_p22.first.prepared.normalized": {
+      "sha256": "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a",
+      "bytes": 50264
+    },
+    "w5-w6-export/static-generator-main/main/witness/0001.normalized": {
+      "sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+      "bytes": 3107
+    },
+    "w5-w6-export/static-generator-main/main/witness/0003.normalized": {
+      "sha256": "16d3e5c37525ac46567bc21669867ab63e21bdad12e105a65f6de7c766126ce1",
+      "bytes": 3107
+    },
+    "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice/manifest.json": {
+      "sha256": "876968c67db4d0f93bae09e053b88a730450c35ad739c787f76bb9ca6aea6616",
+      "bytes": 137499
+    },
+    "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice/source.smt2": {
+      "sha256": "1831017f60a9e457e87177ee1cdcbb98dc506d844ace07c83719e5f3847a158a",
+      "bytes": 47146
+    },
+    "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice/rows/29-error_p28.first.config.txt": {
+      "sha256": "7151b4e2bd56267cbbf12a306eb355fa5e33ce59b41c5140bda28879aa6547d0",
+      "bytes": 875
+    },
+    "w5-w6-export/alloc-to-slice-check_uninit_slice/check_uninit_slice/rows/29-error_p28.first.prepared.normalized": {
+      "sha256": "698067b870b291c3013b7f30054f5da773f4687dabbdabbd9010a3d1156b7e64",
+      "bytes": 48916
+    },
+    "w5-w6-export/bitmask-check_unsigned_bitmask/check_unsigned_bitmask/manifest.json": {
+      "sha256": "4b735c6ecf131a9073faa9f98761491ec21fdad12a6bd8089c61be3e826968ae",
+      "bytes": 22981
+    },
+    "w5-w6-export/bitmask-check_unsigned_bitmask/check_unsigned_bitmask/source.smt2": {
+      "sha256": "ebace52a8b9b2d04f7453da88f01278ed75a1df33b5f8c11481e1536b09a13f4",
+      "bytes": 197030
+    },
+    "w5-w6-export/bitmask-check_unsigned_bitmask/check_unsigned_bitmask/witness/0026.normalized": {
+      "sha256": "a9ce1af044c96487620f8b467a02a027257f79576a7a311ed1f1252707261c88",
+      "bytes": 1771
+    },
+    "w5-w6-export/bitmask-check_unsigned_bitmask/check_unsigned_bitmask/witness/0026.smt2": {
+      "sha256": "1600f7ec7236b52fe54da2b3f31895007fc3caad505921620987763159f317a3",
+      "bytes": 8479
+    }
+  },
+  "dispositions": {
+    "alloc-to-slice": "Source Unsafe; CHC memory-safety witness is not automatically Kani uninitialized-read failure",
+    "static-generator": "Source Safe",
+    "double-coercion": "Source Safe; captured consumer OverApproximation is not an AY wrong answer",
+    "check_u8": "Source Safe; no AY invocation",
+    "unsigned-bitmask": "Source Safe; query0026 unresolved, query0027 consumer OverApproximation"
+  }
+}

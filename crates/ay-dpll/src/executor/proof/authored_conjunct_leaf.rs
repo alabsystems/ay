@@ -322,7 +322,7 @@ impl Executor {
                     clause: vec![atom],
                 },
             );
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+            if self.check_proof_strict_until_stopped(&closed).is_err() {
                 continue;
             }
             // Guard 5: the PRINTER decides renderability, with the export's own

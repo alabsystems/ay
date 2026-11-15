@@ -1,0 +1,37 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): the optimisation spelling of
+* incorrect/version2/order_definition_sol. The vacuous `sol` inside the order
+* definition records an objective value of 0 for an assignment that is not
+* feasible, and `conclusion BOUNDS 0 0` then rests on it.
+*
+* The feasible points are exactly `x1 = 1, x2 = 0` (value 1) and
+* `x1 = 1, x2 = 1` (value 2): `x1 = 0, x2 = 0` falsifies `1 x1 1 x2 >= 1` and
+* `x1 = 0, x2 = 1` falsifies `1 x1 1 ~x2 >= 1`. The true optimum is therefore
+* 1, and the same binary accepts that answer -- see
+* correct/version2/order_definition_bounds_outside. This used to print
+* `s VERIFIED BOUNDS 0 <= obj <= 0` at exit 0 under default flags.
+f 2
+pre_order simple
+    sol ~x1 ~x2
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+output NONE
+conclusion BOUNDS 0 0
+end pseudo-Boolean proof

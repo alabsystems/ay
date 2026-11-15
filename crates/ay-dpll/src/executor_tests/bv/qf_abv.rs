@@ -2335,13 +2335,46 @@ fn test_executor_qf_abv_no_init_multi_member_array_wrappers_delegate_11936() {
         "covered no-init array wrapper should not fail model validation; statistics={:?}",
         exec.statistics()
     );
+    // The independent gate can finish validation when the canonical array
+    // evaluator is incomplete. Its checked=total result deliberately has no
+    // canonical array-delegation counter. Require the actual model and source
+    // coverage contract whichever complete validation path produced it.
+    let statistics = exec.statistics();
+    assert_eq!(
+        statistics.get_string("model_check_gate.result"),
+        Some("confirmed-sat")
+    );
+    assert_eq!(
+        statistics.get_int("model_validation.bv.source_sets_present"),
+        Some(1)
+    );
+    assert_eq!(
+        statistics.get_int("model_validation.bv.source_sets_valid"),
+        Some(1)
+    );
+    assert!(exec.assertion_count() > 0);
+    assert_eq!(
+        statistics.get_int("model_validation.bv.source_mapped_assertions"),
+        Some(u64::try_from(exec.assertion_count()).expect("source assertion count fits u64"))
+    );
+    let covered = statistics
+        .get_int("model_validation.bv.covered_assertions")
+        .expect("the BV validation coverage inventory");
+    assert!(covered > 0);
+    assert_eq!(
+        statistics.get_int("model_validation.bv.coverage_assertions"),
+        Some(covered)
+    );
+    let total = statistics
+        .get_int("model_validation.total")
+        .expect("the complete model validation inventory");
+    assert!(total > 0);
+    assert_eq!(statistics.get_int("model_validation.checked"), Some(total));
     assert!(
-        exec.statistics()
-            .get_int("model_validation.array_delegated")
-            .unwrap_or(0)
-            > 0,
-        "no-init array wrappers should be delegated to the covered BV encoding; statistics={:?}",
-        exec.statistics()
+        statistics
+            .get_int("model_validation.bv.restored_delegated_assertions")
+            .expect("the restored source-root coverage inventory")
+            > 0
     );
 }
 
@@ -2439,6 +2472,123 @@ fn test_executor_bv_lia_bridge_lshr_sat_bound_not_unsat() {
     assert_ne!(outputs, vec!["unsat"]);
 }
 
+/// Cross-array FC through a store-chain definition edge plus a
+/// var<->var equality edge (dwp mem-generation idiom): the read
+/// on `m2` at `base` must equal the read on `m0` at `base`
+/// because `m2 = m1 = store(m0, base+1, 0)`. The bit encoding
+/// links neither, so only the FC audit's definition-linked
+/// congruence refutes the disagreeing candidate.
+#[test]
+fn test_executor_qf_abv_def_linked_congruence_unsat() {
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const m0 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m1 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m2 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const base (_ BitVec 32))
+        (assert (= #b1 (bvand (ite (= m1 (store m0 (bvadd base #x00000001) #x00)) #b1 #b0)
+                              (bvand (ite (= m2 m1) #b1 #b0)
+                                     (bvand (ite (= (select m2 base) #xaa) #b1 #b0)
+                                            (ite (= (select m0 base) #xbb) #b1 #b0))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+/// Read-over-write through a definition edge: the select on `m2`
+/// at the very index `m1`'s definition stores to must equal the
+/// stored value, via the `m2 = m1` equality.
+#[test]
+fn test_executor_qf_abv_stored_value_through_equality_unsat() {
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const m0 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m1 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m2 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const base (_ BitVec 32))
+        (assert (= #b1 (bvand (ite (= m1 (store m0 base #x00)) #b1 #b0)
+                              (bvand (ite (= m2 m1) #b1 #b0)
+                                     (ite (= (select m2 base) #xaa) #b1 #b0)))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+/// At a stored index the defined array and its base legitimately
+/// disagree (the stored-disequality guard must not force them
+/// equal there).
+#[test]
+fn test_executor_qf_abv_stored_index_legit_disagreement_sat() {
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const m0 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m1 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const base (_ BitVec 32))
+        (assert (= #b1 (bvand (ite (= m1 (store m0 base #x00)) #b1 #b0)
+                              (bvand (ite (= (select m1 base) #x00) #b1 #b0)
+                                     (ite (= (select m0 base) #xbb) #b1 #b0)))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["sat"]);
+}
+
+/// Transitive (star) var<->var congruence: reads on `b` and `c`
+/// disagree, both equal to `a`, no reads on `a` at that index —
+/// edge-wise checks pass, the class check must refute.
+#[test]
+fn test_executor_qf_abv_star_equality_congruence_unsat() {
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const a (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const b (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const c (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const i (_ BitVec 32))
+        (assert (= #b1 (bvand (ite (= a b) #b1 #b0)
+                              (bvand (ite (= a c) #b1 #b0)
+                                     (bvand (ite (= (select b i) #xaa) #b1 #b0)
+                                            (ite (= (select c i) #xbb) #b1 #b0))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+/// A load through two store generations plus an equality hop
+/// stays satisfiable with the consistent value (model completion
+/// across definition-linked classes).
+#[test]
+fn test_executor_qf_abv_generation_load_sat() {
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const m0 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m1 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m2 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const m3 (Array (_ BitVec 32) (_ BitVec 8)))
+        (declare-const base (_ BitVec 32))
+        (assert (= #b1 (bvand (ite (= m1 (store m0 (bvadd base #x00000001) #x00)) #b1 #b0)
+                              (bvand (ite (= m2 (store m1 (bvadd base #x00000002) #x11)) #b1 #b0)
+                                     (bvand (ite (= m3 m2) #b1 #b0)
+                                            (bvand (ite (= (select m0 base) #x42) #b1 #b0)
+                                                   (ite (= (select m3 base) #x42) #b1 #b0)))))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["sat"]);
+}
+
 #[test]
 fn test_executor_bv_lia_bridge_lshr_exact_boundary_sat_not_unsat() {
     let input = r#"
@@ -2455,4 +2605,46 @@ fn test_executor_bv_lia_bridge_lshr_exact_boundary_sat_not_unsat() {
         .execute_all(&commands)
         .expect("execute bvlshr boundary input");
     assert_ne!(outputs, vec!["unsat"]);
+}
+
+/// R29 manufacture seed: the satisfying assignment comes from the pure
+/// bit-blasted BV lane, which never values the Int `.loc_*_1` variables.
+/// Their pins live only inside the satisfied disjunct of a case-split
+/// transition, so top-level equality extraction cannot see them and the
+/// Int gaps must be derived from the SAT-true nested pin atoms.
+/// Before the fix the stored model carried the sort defaults and the
+/// transition evaluated false (`model_validation_failures == 1`).
+#[test]
+fn test_executor_bv_lane_int_gap_derived_from_true_disjunct_pin() {
+    let input = r#"
+(set-logic ALL)
+(declare-const .loc_25_1 Int)
+(declare-const .loc_0_2 Int)
+(declare-const .loc_28_2 Int)
+(declare-const .loc_25_2 Int)
+(declare-const .arg_0_40_2 (_ BitVec 64))
+(declare-const .arg_0_39_2 (_ BitVec 64))
+(declare-const .loc_28_1 Int)
+(declare-const .loc_26_1 Int)
+(declare-const .loc_26_2 Int)
+(declare-const .loc_0_1 Int)
+(assert (<= .loc_0_1 0))
+(assert (or (and (= .loc_0_1 0) (= .loc_25_1 0) (= .loc_26_1 0) (= .loc_28_1 0) (= .loc_0_2 1) (= .loc_25_2 0) (= .loc_26_2 0) (= .loc_28_2 0) (or (bvule (bvadd .arg_0_39_2 #x0000000000000010) .arg_0_40_2) (bvule (bvadd .arg_0_40_2 #x0000000000000018) .arg_0_39_2))) (and (= .loc_0_1 0) (= .loc_25_1 0) (= .loc_26_1 0) (= .loc_26_2 0) (= .loc_28_2 0) (= .loc_0_2 0) (= .loc_25_2 1) (= .loc_28_1 1)) (and (= .loc_0_1 0) (= .loc_25_1 0) (= .loc_28_1 0) (= .loc_26_2 0) (= .loc_28_2 0) (= .loc_0_2 0) (= .loc_26_1 1) (= .loc_25_2 1))))
+(assert (= .loc_25_2 1))
+(check-sat)
+"#;
+    let commands = parse(input).expect("parse disjunct-pin input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute disjunct-pin input");
+    assert_eq!(outputs, vec!["sat"]);
+    assert_eq!(
+        exec.statistics()
+            .get_int("model_validation_failures")
+            .unwrap_or(0),
+        0,
+        "SAT model must carry the satisfied disjunct's Int pins; statistics={:?}",
+        exec.statistics()
+    );
 }

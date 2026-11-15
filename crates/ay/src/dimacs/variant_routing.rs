@@ -288,8 +288,10 @@ fn emit_sat_applied_run_summary(
 ) {
     // `-q`/`--quiet` suppresses AY's provenance commentary; the policy preamble
     // is pure stderr commentary, so skip it entirely. stdout/proof/exit-code
-    // paths are untouched.
-    if super::quiet_enabled() {
+    // paths are untouched. `--z3-mode` suppresses it too: a Z3-compatible
+    // DIMACS transcript is exactly `s ...`/`v ...` on stdout with an empty
+    // stderr.
+    if super::quiet_enabled() || crate::Z3_MODE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let proof_active = proof_config.is_some();

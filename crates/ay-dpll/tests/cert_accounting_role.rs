@@ -174,6 +174,7 @@ fn certification_counters_are_published_into_statistics() {
         "cert.nested_corroboration_nanos",
         "cert.raw_admissions",
         "cert.publication_rejections",
+        "cert.publication_rejections_nested",
     ] {
         assert!(
             statistics.get_int(key).is_some(),

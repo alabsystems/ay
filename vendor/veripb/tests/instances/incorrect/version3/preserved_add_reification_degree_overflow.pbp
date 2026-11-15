@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the reified degree `coeff_sum - degree + 1` used to be computed in the
+% constraint own integer width. Here it is 2^63+1, which wrapped negative, flipped the
+% reification literal and left the `constraint ==> variable` proof goal at degree 0, so it
+% was auto-discharged as trivial and `preserved_add` was accepted with no proof.
+f 1 ;
+preserved_add x2 : 4611686018427387904 x1 >= -4611686018427387904 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

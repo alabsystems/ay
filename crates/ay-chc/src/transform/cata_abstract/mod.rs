@@ -2489,7 +2489,7 @@ fn run_obligation_expect_unsat_impl(script: &str, budget: Duration) -> bool {
     };
     let outputs = match ay_core::catch_ay_panics(
         AssertUnwindSafe(|| {
-            let mut exec = ay_dpll::Executor::new();
+            let mut exec = crate::smt::executor_adapter::new_search_executor();
             exec.execute_all(&commands).map_err(|_| ())
         }),
         |_| Err(()),

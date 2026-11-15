@@ -166,6 +166,11 @@ fn value_to_literal(value: &SmtValue, sort: &ChcSort) -> Option<ChcExpr> {
         {
             value.bitvec_to_chc_expr()
         }
+        // `ChcExpr::Real` holds an i64 fraction; a wider rational is refused.
+        (ChcSort::Real, SmtValue::Real(r)) => Some(ChcExpr::Real(
+            i64::try_from(r.numer()).ok()?,
+            i64::try_from(r.denom()).ok()?,
+        )),
         _ => None,
     }
 }
@@ -346,13 +351,12 @@ fn clause_var_sorts(clause: &HornClause) -> FxHashMap<String, ChcSort> {
 mod tests {
     use super::*;
     use crate::{ChcDtConstructor, ChcDtSelector};
-    use std::sync::Arc;
 
     /// `Option_u8 ::= None | Some(val: BitVec 8)` — the archetype's datatype.
     fn option_u8() -> ChcSort {
         ChcSort::Datatype {
             name: "Option_u8".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 ChcDtConstructor {
                     name: "None_Option_u8".to_string(),
                     selectors: vec![],

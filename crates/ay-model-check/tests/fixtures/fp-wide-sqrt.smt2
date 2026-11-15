@@ -1,0 +1,6 @@
+(set-logic QF_FP)
+(declare-const x (_ FloatingPoint 8 200))
+(assert (= x ((_ to_fp 8 200) RNE 4.0)))
+(assert (fp.eq (fp.sqrt RNE x) ((_ to_fp 8 200) RNE 2.0)))
+(check-sat)
+(get-info :reason-unknown)

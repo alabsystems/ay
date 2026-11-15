@@ -18,6 +18,9 @@
 
 use crate::literal::Variable;
 
+mod counted;
+pub(super) use counted::BacktrackBuckets;
+
 /// Maximum number of buckets. 32 covers typical IC3 domains well:
 /// each bucket spans one IEEE 754 exponent value (a factor of 2),
 /// so 32 buckets cover a 2^32 = 4 billion ratio between highest and

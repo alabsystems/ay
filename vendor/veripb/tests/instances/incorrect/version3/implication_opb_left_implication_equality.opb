@@ -1,0 +1,4 @@
+* #variable= 3 #constraint= 2
+* A left implication of an equality would state that the literal is implied by both directions of
+* the equality, i.e., by a tautology, so it is not a valid constraint.
+z1 <== 1 x1 1 x2 = 1 ;

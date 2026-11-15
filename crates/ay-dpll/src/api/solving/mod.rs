@@ -25,6 +25,11 @@ mod controls;
 mod core_evolution;
 mod cross_check;
 mod explanation;
+mod field_sat;
+mod field_simplify;
+mod field_solve;
+mod field_to_bv;
+mod field_unique;
 mod interpolant;
 pub(crate) mod interpolant_farkas;
 mod maxsmt;
@@ -32,12 +37,27 @@ mod model;
 mod model_blocking;
 mod model_minimize;
 mod model_provenance;
+mod named_values;
+mod native_assertion_source;
 mod native_replay;
 mod optimize;
 mod panic_safe;
 mod parse;
+mod polynomial_parameters;
 mod proofs;
+mod scalar_functions;
 mod scope;
+mod tactic_bool_rewrite;
+mod tactic_model;
+mod tactic_parameters;
+mod tactic_polynomial;
+pub use polynomial_parameters::PolynomialParameters;
+mod tactic_prepare;
+mod tactic_propagate_values;
+mod tactic_sequence_rewrite;
+mod tactic_solve_eqs;
+mod term_simplifier;
+pub use term_simplifier::SimplifyParameters;
 mod tactics;
 
 pub use abduction::{PatchStrength, PatchSuggestion};
@@ -45,4 +65,10 @@ pub use parse::{
     ParsedPublicFormulaMetadata, ParsedPublicTermMetadata, ParsedSmtlib2Batch, ParsedSmtlib2Formula,
 };
 pub use scope::SolverScope;
-pub use tactics::{ApplyResult, Goal, Tactic, TacticFailure, TacticSolver};
+pub use tactic_model::TacticModelConverter;
+pub use tactic_parameters::{TacticInstance, TacticParameterValue, TacticParameters};
+pub(crate) use tactic_prepare::PreparedTactic;
+pub use tactics::{
+    ApplyResult, Goal, Tactic, TacticDecision, TacticExecutionKind, TacticFailure, TacticOperation,
+    TacticSolver, TacticSubgoal,
+};

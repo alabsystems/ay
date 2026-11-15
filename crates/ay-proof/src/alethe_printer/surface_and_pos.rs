@@ -5,10 +5,14 @@
 //! Linear, surface-safe rendering of flat Boolean `and_pos` steps.
 
 use super::{
-    split_alethe_application_bounded, split_application, AlethePrintError, AlethePrinter,
-    AletheSurfaceParseError,
+    split_alethe_application_bounded, split_application, split_binary_implies, AlethePrintError,
+    AlethePrinter, AletheSurfaceParseError,
 };
 use ay_core::{AletheRule, ProofId, Sort, Symbol, TermData, TermId};
+
+#[path = "surface_and_pos_alpha.rs"]
+mod alpha;
+mod quantified_body;
 
 impl AlethePrinter<'_> {
     /// Render one exact, premise-free Boolean `and_pos` against its effective
@@ -152,14 +156,22 @@ impl AlethePrinter<'_> {
             ));
         }
         let selected_surface = &printed[selected_position];
-        let Some(surface_index) = surface_operands
-            .iter()
-            .position(|operand| *operand == selected_surface)
-        else {
-            // The indexed conjunct is not a TOP-LEVEL printed operand. Two
-            // certified printed-shape divergences can still be bridged with
-            // spec-valid steps over the exact printed spellings; anything
-            // else keeps failing closed below.
+        // carcara's `and_pos` compares PARSED terms (`#x00` is `#b00000000`).
+        let Some(surface_index) = surface_operands.iter().position(|operand| {
+            super::surface_literal::same_printed_term(operand, selected_surface)
+        }) else {
+            if let Some(text) = self.quantified_alpha_and_pos_bridge(
+                id,
+                selected,
+                *internal_index as usize,
+                &expected_gate,
+                selected_surface,
+                &surface_operands,
+            )? {
+                return Ok(Some(text));
+            }
+            // Bridge supported differences between the authored conjunction
+            // and its canonical projection; every other shape still refuses.
             //
             // (1) The surface override re-nests AY's flat internal
             //     conjunction (the authored grouping), leaving the conjunct a
@@ -210,9 +222,63 @@ impl AlethePrinter<'_> {
                      (step {id} (cl {expected_gate} {selected_surface}) :rule resolution :premises ({id}.a {id}.n))"
                 )));
             }
+            // (3b) The same normalization under a negation: the authored
+            // `(not (>= (* c 2) (* c 4)))` is stored as `(not (<= (* c 4) (* c
+            // 2)))`. Project the authored `(not A)`, then the printed
+            // `la_generic` clause `(cl (not B) A)` for the canonical `(not B)`.
+            if let Some(text) =
+                negated_comparison_and_pos(id, &expected_gate, selected_surface, &surface_operands)
+            {
+                return Ok(Some(text));
+            }
+            // (4) Elaboration discharges an authored implication whose
+            // antecedent is itself a sibling conjunct: `(and P (=> P Q))`
+            // becomes `(and P Q)`. Project both authored operands and
+            // eliminate the implication with `implies_pos`.
+            if let Some(text) = contextual_implication_and_pos(
+                id,
+                &expected_gate,
+                selected_surface,
+                &surface_operands,
+            ) {
+                return Ok(Some(text));
+            }
+            // (5) The authored conjunct is the canonical one up to the
+            // spelling differences the authored-assume equivalence proves
+            // (`(* 2 c)` for `(* c 2)`, a reversed comparison, an equality's
+            // orientation, all under congruence): project it, prove the
+            // equality with those stock rules, and transport.
+            if let Some(text) = self.equivalent_operand_and_pos(
+                id,
+                &expected_gate,
+                selected,
+                selected_surface,
+                &surface_operands,
+            ) {
+                return Ok(Some(text));
+            }
+            if self.work_budget_exhausted() {
+                return Err(self.work_budget_error(id.0));
+            }
+            // Printer-installed Skolem spellings retain the established hole
+            // fallback. Producer-authored overrides still refuse export:
+            // a changed projection cannot acquire proof authority here.
+            if self.skolem_overrides.borrow().contains_key(&source) {
+                return Ok(Some(format!(
+                    "(step {id} (cl {} {}) :rule {})",
+                    printed[0],
+                    printed[1],
+                    ay_core::UNPROVED_STEP_RULE
+                )));
+            }
             return Err(invalid_and_pos(
                 id,
-                "and_pos indexed conjunct is absent from its effective source",
+                format!(
+                    "and_pos indexed conjunct is absent from its effective source \
+                     (source={:?}; conjunct={:?})",
+                    super::surface_congruence::bounded_surface_diagnostic(&source_surface),
+                    super::surface_congruence::bounded_surface_diagnostic(selected_surface)
+                ),
             ));
         };
 
@@ -227,6 +293,63 @@ impl AlethePrinter<'_> {
         Ok(Some(format!(
             "(step {id} (cl {expected_gate} {selected_surface}) :rule and_pos :args ({surface_index}))"
         )))
+    }
+
+    /// Bridge (5) of [`Self::format_flat_surface_and_pos`]: the first authored
+    /// operand (or operand of a nested authored conjunction, one level down)
+    /// the authored-assume equivalence proves equal to the printed canonical
+    /// conjunct. Declines unless the conjunct prints as its own canonical
+    /// rendering, the right-hand side every equivalence concludes.
+    fn equivalent_operand_and_pos(
+        &self,
+        id: ProofId,
+        expected_gate: &str,
+        selected: TermId,
+        selected_surface: &str,
+        surface_operands: &[&str],
+    ) -> Option<String> {
+        if crate::render_term_canonical(self.terms, selected) != selected_surface {
+            return None;
+        }
+        // `(operand, the steps concluding (cl GATE operand) as {id}.a)`.
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for (index, operand) in surface_operands.iter().enumerate() {
+            candidates.push((
+                (*operand).to_string(),
+                format!(
+                    "(step {id}.a (cl {expected_gate} {operand}) :rule and_pos :args ({index}))"
+                ),
+            ));
+            for (inner, child) in split_application(operand, "and")
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                candidates.push((
+                    child.clone(),
+                    format!(
+                        "(step {id}.a0 (cl {expected_gate} {operand}) :rule and_pos :args ({index}))\n\
+                         (step {id}.a1 (cl (not {operand}) {child}) :rule and_pos :args ({inner}))\n\
+                         (step {id}.a (cl {expected_gate} {child}) :rule resolution :premises ({id}.a0 {id}.a1))"
+                    ),
+                ));
+            }
+        }
+        let equality_id = format!("{id}.q");
+        candidates.into_iter().find_map(|(operand, projection)| {
+            let (mut nodes, mut steps) = (0, Vec::new());
+            if !self.authored_equivalence(&equality_id, &operand, selected, &mut nodes, &mut steps) {
+                return None;
+            }
+            let equality = format!("(= {operand} {selected_surface})");
+            Some(format!(
+                "{projection}\n\
+                 {}\n\
+                 (step {id}.e (cl (not {equality}) (not {operand}) {selected_surface}) :rule equiv_pos2)\n\
+                 (step {id} (cl {expected_gate} {selected_surface}) :rule resolution :premises ({id}.a {equality_id} {id}.e))",
+                steps.join("\n")
+            ))
+        })
     }
 
     /// Rebuild an `and_pos` tautology when the authored spelling wraps the
@@ -319,8 +442,15 @@ impl AlethePrinter<'_> {
         let false_id = format!("{id}.ow1");
         let and_id = format!("{id}.ow2");
         let drop_id = format!("{id}.ow3");
+        // `or_pos` lists the disjuncts in the ROOT's printed order: carcara
+        // 1.1.0 compares them position by position. MEASURED at `2c356fd15`
+        // on `(assert (or (and p q) false))` + `(assert (not p))`: the
+        // false-first clause shipped under `trust_free=yes` and carcara
+        // answered `invalid` ("expected terms to be equal: '(and p q)' and
+        // 'false'").
+        let (first, second) = (&root_operands[0], &root_operands[1]);
         Some(format!(
-            "(step {or_id} (cl (not {root}) {false_operand} {inner}) :rule or_pos)\n\
+            "(step {or_id} (cl (not {root}) {first} {second}) :rule or_pos)\n\
              (step {false_id} (cl (not {false_operand})) :rule false)\n\
              (step {and_id} (cl (not {inner}) {ak_str}) :rule and_pos :args ({inner_index}))\n\
              (step {drop_id} (cl (not {root}) {inner}) :rule resolution :premises ({or_id} {false_id}))\n\
@@ -459,4 +589,73 @@ fn invalid_and_pos(id: ProofId, reason: impl Into<String>) -> AlethePrintError {
         id,
         reason: reason.into(),
     }
+}
+
+/// Derive `(cl (not SOURCE) Q)` from the authored conjuncts `(=> P Q)` and
+/// `P` of the printed conjunction `SOURCE`. Only the first implication (in
+/// operand order) whose consequent is exactly the selected conjunct and whose
+/// antecedent is exactly another operand is used; anything else declines.
+fn contextual_implication_and_pos(
+    id: ProofId,
+    expected_gate: &str,
+    selected_surface: &str,
+    surface_operands: &[&str],
+) -> Option<String> {
+    surface_operands
+        .iter()
+        .enumerate()
+        .find_map(|(implication_index, operand)| {
+            let (antecedent, consequent) = split_binary_implies(operand)?;
+            if consequent != selected_surface {
+                return None;
+            }
+            let antecedent_index = surface_operands
+                .iter()
+                .enumerate()
+                .find(|&(index, other)| index != implication_index && *other == antecedent)?
+                .0;
+            Some(format!(
+                "(step {id}.i (cl {expected_gate} {operand}) :rule and_pos :args ({implication_index}))\n\
+                 (step {id}.p (cl {expected_gate} {antecedent}) :rule and_pos :args ({antecedent_index}))\n\
+                 (step {id}.e (cl (not {operand}) (not {antecedent}) {selected_surface}) :rule implies_pos)\n\
+                 (step {id}.r (cl {expected_gate} {expected_gate} {selected_surface}) :rule resolution :premises ({id}.i {id}.p {id}.e))\n\
+                 (step {id} (cl {expected_gate} {selected_surface}) :rule contraction :premises ({id}.r))"
+            ))
+        })
+}
+
+/// The atom `A` of a printed `(not A)`.
+fn printed_negation_operand(printed: &str) -> Option<String> {
+    let operands = split_application(printed, "not")?;
+    let [operand] = operands.as_slice() else {
+        return None;
+    };
+    Some(operand.clone())
+}
+
+/// Derive `(cl (not SOURCE) (not B))` from an authored conjunct `(not A)` of
+/// the printed conjunction `SOURCE` when `B` implies `A` by the narrowly
+/// checked printed `la_generic` unit implication (the recognizer of bridge
+/// (3), with the roles of premise and conclusion swapped by the negation).
+fn negated_comparison_and_pos(
+    id: ProofId,
+    expected_gate: &str,
+    selected_surface: &str,
+    surface_operands: &[&str],
+) -> Option<String> {
+    let canonical_atom = printed_negation_operand(selected_surface)?;
+    surface_operands
+        .iter()
+        .enumerate()
+        .find_map(|(surface_index, operand)| {
+            let authored_atom = printed_negation_operand(operand)?;
+            crate::printed_la_generic_unit_implication_is_supported(&canonical_atom, &authored_atom)
+                .then(|| {
+                    format!(
+                        "(step {id}.a (cl {expected_gate} {operand}) :rule and_pos :args ({surface_index}))\n\
+                         (step {id}.n (cl (not {canonical_atom}) {authored_atom}) :rule la_generic :args (1 1))\n\
+                         (step {id} (cl {expected_gate} {selected_surface}) :rule resolution :premises ({id}.a {id}.n))"
+                    )
+                })
+        })
 }

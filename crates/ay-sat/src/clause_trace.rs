@@ -20,6 +20,31 @@ use std::sync::OnceLock;
 
 use crate::literal::Literal;
 
+/// The insertion event's origin, independent of proof reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClauseEventOrigin {
+    /// Boolean encoding or an externally supplied clause.
+    Assumption,
+    /// Boolean learned clause.
+    Lemma,
+    /// A theory module's unconditional axiom.
+    TheoryAssumption,
+    /// A theory conflict or propagation clause.
+    TheoryLemma,
+    /// Actual retirement of a stored clause.
+    Deleted,
+}
+
+/// Internal artifact capture policy; neither mode grants proof authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClauseEventCapture {
+    /// Preserve only additions needed by ordinary proof reconstruction.
+    #[default]
+    Additions,
+    /// Retain the full clause lifecycle for an explicit clause-proof request.
+    Lifecycle,
+}
+
 /// An owned clause addition entry.
 ///
 /// Borrowing consumers use [`ClauseTraceEntryRef`]; this type is the retained
@@ -33,6 +58,8 @@ pub struct ClauseTraceEntry {
     pub clause: Vec<Literal>,
     /// True if this is an original (input) clause, false if learned
     pub is_original: bool,
+    /// Origin recorded when this clause entered the solver.
+    pub origin: ClauseEventOrigin,
     /// Resolution hints (clause IDs) used to derive this clause.
     ///
     /// Non-empty for learned clauses produced by conflict analysis.
@@ -54,6 +81,11 @@ impl ClauseTraceEntry {
             id,
             clause,
             is_original,
+            origin: if is_original {
+                ClauseEventOrigin::Assumption
+            } else {
+                ClauseEventOrigin::Lemma
+            },
             resolution_hints,
         }
     }
@@ -68,6 +100,8 @@ pub struct ClauseTraceEntryRef<'a> {
     pub clause: &'a [Literal],
     /// True if this is an original (input) clause, false if learned
     pub is_original: bool,
+    /// Origin recorded at insertion.
+    pub origin: ClauseEventOrigin,
     /// Resolution hints (clause IDs) used to derive this clause.
     pub resolution_hints: &'a [u64],
 }
@@ -76,12 +110,14 @@ impl ClauseTraceEntryRef<'_> {
     /// Owned snapshot of this entry.
     #[must_use]
     pub fn to_entry(&self) -> ClauseTraceEntry {
-        ClauseTraceEntry::new(
+        let mut entry = ClauseTraceEntry::new(
             self.id,
             self.clause.to_vec(),
             self.is_original,
             self.resolution_hints.to_vec(),
-        )
+        );
+        entry.origin = self.origin;
+        entry
     }
 }
 
@@ -94,6 +130,9 @@ struct EntryMeta {
     hints_off: u32,
     hints_len: u32,
     is_original: bool,
+    origin: ClauseEventOrigin,
+    /// Originals admitted before this event; not a clause-ID bound.
+    original_prefix_len: u32,
 }
 
 /// Default 256 MB budget, accounting exact retained arena capacities.
@@ -167,8 +206,61 @@ impl Clone for HintOmissionCounters {
     }
 }
 
+/// #recording-gap. How many times ANY solver in this process armed clause
+/// tracing. Diagnostic only; nothing reads it to decide anything.
+///
+/// The closure census reports `no-trace` when the executor holds no clause
+/// trace at reconstruction time, which conflates two different worlds: a lane
+/// that armed recording and then lost or consumed the trace, and a lane whose
+/// code never arms recording at all. Those have opposite remedies, and a
+/// process counter tells them apart without threading a flag through every
+/// theory lane.
+static CLAUSE_TRACE_ARMINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record that a solver armed clause tracing. See [`CLAUSE_TRACE_ARMINGS`].
+pub(crate) fn note_clause_trace_armed() {
+    CLAUSE_TRACE_ARMINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many times clause tracing was armed in this process.
+#[must_use]
+pub fn clause_trace_armings() -> u32 {
+    CLAUSE_TRACE_ARMINGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Solver-minted `(variable count, active scope premises)` authority.
 type SolverProvenance = (usize, Vec<Literal>);
+
+/// What the trace held at the instant #A2b budget exhaustion destroyed it.
+///
+/// #destroyed-trace. `degrade_proof_bookkeeping_after_exhaustion` calls
+/// [`ClauseTrace::clear_entries`], so every consumer downstream sees
+/// `entries=0` and cannot say whether the discarded trace was a complete
+/// propositional refutation or a partial search record. The
+/// `2026-09-08-assume-family-trust-closure` report called that population
+/// "a propositional refutation … deliberately discarded" WITHOUT measuring it.
+/// This snapshot is taken immediately before the clear so the claim can be
+/// settled from the artifact instead of asserted.
+///
+/// Write-only: no gate, verdict, certificate, or export reads any field.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ExhaustionSnapshot {
+    /// Trace entries present at the clear.
+    pub entries: u32,
+    /// Of those, original (input) clauses.
+    pub originals: u32,
+    /// Of those, learned clauses.
+    pub learned: u32,
+    /// Learned clauses carrying at least one resolution hint. A learned clause
+    /// with no hints gives replay nothing to resolve against.
+    pub learned_with_hints: u32,
+    /// Whether the trace reached the EMPTY CLAUSE at the clear. This is the
+    /// whole question: a destroyed refutation has this `true`, a destroyed
+    /// partial search record has it `false`.
+    pub has_empty: bool,
+    /// Retained arena bytes at the clear.
+    pub used_bytes: u64,
+}
 
 /// In-memory clause trace for proof reconstruction
 ///
@@ -190,6 +282,10 @@ type SolverProvenance = (usize, Vec<Literal>);
 pub struct ClauseTrace {
     /// Per-entry metadata (id, flags, pool spans) in addition order.
     meta: Vec<EntryMeta>,
+    /// Retirement metadata and addition position; proof replay remains addition-only.
+    deletions: Vec<(usize, EntryMeta)>,
+    event_capture: ClauseEventCapture,
+    retirements_omitted: bool,
     /// Shared literal pool; every entry's clause is a contiguous span here.
     lit_pool: Vec<Literal>,
     /// Shared hint pool; every entry's hints are a contiguous span here.
@@ -202,10 +298,15 @@ pub struct ClauseTrace {
     is_truncated: bool,
     /// True if search-time proof bookkeeping exhausted its work budget (#A2b)
     proof_work_exhausted: bool,
+    /// #destroyed-trace. What the trace held when #A2b exhaustion cleared it.
+    /// Survives [`Self::clear_entries`] on purpose; that is its whole point.
+    exhaustion_snapshot: Option<ExhaustionSnapshot>,
     /// Why level-0 minimize-chain hints were dropped (introspection).
     hint_omissions: HintOmissionCounters,
     /// Namespace and active-scope authority; mutators clear the whole value.
     solver_num_vars: Option<SolverProvenance>,
+    /// Original vectors are moved from the fixed-CNF solver ledger on handoff.
+    originals: originals::OriginalStorage,
 }
 
 impl Default for ClauseTrace {
@@ -218,6 +319,12 @@ impl Default for ClauseTrace {
 mod arena;
 #[path = "clause_trace_capacity.rs"]
 mod capacity;
+#[path = "clause_trace_counted.rs"]
+pub(crate) mod counted;
+#[path = "clause_trace_events.rs"]
+mod events;
+#[path = "clause_trace_originals.rs"]
+pub(crate) mod originals;
 
 /// Borrowed, indexable view of all trace entries.
 ///
@@ -229,6 +336,7 @@ pub struct TraceEntries<'a> {
     meta: &'a [EntryMeta],
     lit_pool: &'a [Literal],
     hint_pool: &'a [u64],
+    originals: Option<&'a originals::OriginalArena>,
 }
 
 impl<'a> TraceEntries<'a> {
@@ -241,6 +349,7 @@ impl<'a> TraceEntries<'a> {
             id: meta.id,
             clause: &self.lit_pool[clause_start..clause_end],
             is_original: meta.is_original,
+            origin: meta.origin,
             resolution_hints: &self.hint_pool[hints_start..hints_end],
         }
     }
@@ -248,18 +357,21 @@ impl<'a> TraceEntries<'a> {
     /// Number of entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.meta.len()
+        self.meta.len() + self.originals.map_or(0, |arena| arena.ids.len())
     }
 
     /// True when there are no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.meta.is_empty()
+        self.len() == 0
     }
 
     /// Entry at `index`, if present.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<ClauseTraceEntryRef<'a>> {
+        if let Some(originals) = self.originals {
+            return self.combined_entry(originals, index);
+        }
         self.meta.get(index).map(|meta| self.view(meta))
     }
 
@@ -279,7 +391,7 @@ impl<'a> TraceEntries<'a> {
     /// Last entry, if any.
     #[must_use]
     pub fn last(&self) -> Option<ClauseTraceEntryRef<'a>> {
-        self.meta.last().map(|meta| self.view(meta))
+        self.get(self.len().checked_sub(1)?)
     }
 
     /// Iterator over all entries in addition order.
@@ -288,6 +400,8 @@ impl<'a> TraceEntries<'a> {
         TraceEntriesIter {
             entries: *self,
             index: 0,
+            derived: 0,
+            original: 0,
         }
     }
 }
@@ -315,13 +429,32 @@ impl<'a> IntoIterator for &TraceEntries<'a> {
 pub struct TraceEntriesIter<'a> {
     entries: TraceEntries<'a>,
     index: usize,
+    derived: usize,
+    original: usize,
 }
 
 impl<'a> Iterator for TraceEntriesIter<'a> {
     type Item = ClauseTraceEntryRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.entries.get(self.index)?;
+        let item = if let Some(originals) = self.entries.originals {
+            let next = self.entries.meta.get(self.derived);
+            if self.original < originals.ids.len()
+                && next.is_none_or(|entry| self.original < entry.original_prefix_len as usize)
+            {
+                let entry = originals.entry(self.original)?;
+                self.original += 1;
+                entry
+            } else {
+                let entry = self.entries.view(next?);
+                self.derived += 1;
+                entry
+            }
+        } else {
+            let entry = self.entries.view(self.entries.meta.get(self.derived)?);
+            self.derived += 1;
+            entry
+        };
         self.index += 1;
         Some(item)
     }
@@ -405,12 +538,53 @@ impl ClauseTrace {
         self.proof_work_exhausted
     }
 
+    /// Record what the trace holds, for the census, immediately before #A2b
+    /// exhaustion clears it.
+    ///
+    /// #destroyed-trace. Idempotent in the sense that the FIRST snapshot wins:
+    /// a trace can only be destroyed once, and a later no-op call on an
+    /// already-emptied trace must not overwrite the real measurement with
+    /// zeroes.
+    pub fn snapshot_before_exhaustion_clear(&mut self) {
+        if self.exhaustion_snapshot.is_some() {
+            return;
+        }
+        let mut snap = ExhaustionSnapshot {
+            has_empty: self.has_empty,
+            used_bytes: u64::try_from(self.used_bytes()).unwrap_or(u64::MAX),
+            ..ExhaustionSnapshot::default()
+        };
+        for entry in self.entries().iter() {
+            snap.entries = snap.entries.saturating_add(1);
+            if entry.is_original {
+                snap.originals = snap.originals.saturating_add(1);
+            } else {
+                snap.learned = snap.learned.saturating_add(1);
+                if !entry.resolution_hints.is_empty() {
+                    snap.learned_with_hints = snap.learned_with_hints.saturating_add(1);
+                }
+            }
+        }
+        if self.originals.is_pending() {
+            snap.originals = snap.originals.saturating_add(self.originals.count);
+            snap.entries = snap.entries.saturating_add(self.originals.count);
+        }
+        self.exhaustion_snapshot = Some(snap);
+    }
+
+    /// What the trace held when #A2b exhaustion destroyed it, if it did.
+    #[must_use]
+    pub fn exhaustion_snapshot(&self) -> Option<ExhaustionSnapshot> {
+        self.exhaustion_snapshot
+    }
+
     /// Get all trace entries as a borrowed, iterable view.
     pub fn entries(&self) -> TraceEntries<'_> {
         TraceEntries {
             meta: &self.meta,
             lit_pool: &self.lit_pool,
             hint_pool: &self.hint_pool,
+            originals: self.originals.arena.as_ref(),
         }
     }
 
@@ -429,12 +603,12 @@ impl ClauseTrace {
 
     /// Number of entries in the trace.
     pub fn len(&self) -> usize {
-        self.meta.len()
+        self.entries().len()
     }
 
     /// Check if trace is empty.
     pub fn is_empty(&self) -> bool {
-        self.meta.is_empty()
+        self.len() == 0
     }
 
     /// Get original clauses only.

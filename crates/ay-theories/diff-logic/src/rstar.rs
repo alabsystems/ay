@@ -94,11 +94,19 @@ impl Weight for RStar {
 
 impl Negate for RStar {
     #[inline]
-    fn negate(&self) -> Self {
-        Self {
+    fn negate(&self) -> Option<Self> {
+        // `-i64::MIN` has no i64: wrapping it back to `i64::MIN` would flip
+        // the sign of the ε-count, and saturating it to `i64::MAX` would be
+        // off by one ε — a wrong weight either way, so refuse with `None`.
+        Some(Self {
             q: -&self.q,
-            eps: -self.eps,
-        }
+            eps: self.eps.checked_neg()?,
+        })
+    }
+
+    #[inline]
+    fn can_negate(&self) -> bool {
+        self.eps != i64::MIN
     }
 }
 
@@ -127,17 +135,19 @@ pub fn pick_delta_from_slacks(slacks: &[(BigRational, i64)]) -> BigRational {
     let mut bound: Option<BigRational> = None;
     for (g, k) in slacks {
         if g.is_positive() && *k < 0 {
-            // need δ < g / (-k)
-            let limit = g / BigRational::from_integer((-*k).into());
-            bound = Some(match bound {
-                Some(b) if b <= limit => b,
-                _ => limit,
-            });
+            // need δ < g / (-k); `-k` as `unsigned_abs` (equal for `k < 0`):
+            // `i64::MIN` has no positive i64.
+            let limit = g / BigRational::from_integer(k.unsigned_abs().into());
+            // Keep the tighter (smaller) bound.
+            if bound.as_ref().is_none_or(|b| limit < *b) {
+                bound = Some(limit);
+            }
         }
     }
-    match bound {
-        Some(b) => b / BigRational::from_integer(2.into()),
-        None => <BigRational as One>::one(),
+    if let Some(b) = bound {
+        b / BigRational::from_integer(2.into())
+    } else {
+        <BigRational as One>::one()
     }
 }
 
@@ -201,6 +211,36 @@ mod tests {
         // slack (1, -2): need δ < 1/2 ⇒ δ = 1/4.
         let slacks = vec![(r(1, 1), -2)];
         assert_eq!(pick_delta_from_slacks(&slacks), r(1, 4));
+    }
+
+    #[test]
+    fn pick_delta_accepts_the_most_negative_eps_count() {
+        // `-k` overflowed for `k = i64::MIN`; the bound is g / 2^63.
+        let slacks = vec![(r(1, 1), i64::MIN)];
+        let two_pow_63 = BigRational::from_integer(num_bigint::BigInt::from(1u64 << 63));
+        assert_eq!(pick_delta_from_slacks(&slacks), r(1, 2) / two_pow_63);
+    }
+
+    #[test]
+    fn negate_refuses_the_most_negative_eps_count() -> Result<(), String> {
+        // `-i64::MIN` has no i64: `None`, never a wrapped (sign-flipped) or
+        // saturated (off-by-one ε) weight.
+        let min = RStar::new(r(3, 2), i64::MIN);
+        if let Some(n) = min.negate() {
+            return Err(format!("{min:?} negated to {n:?}; expected None"));
+        }
+        if min.can_negate() {
+            return Err(format!("{min:?} claims to be negatable"));
+        }
+        let edge = RStar::new(r(3, 2), i64::MIN + 1);
+        if !edge.can_negate() {
+            return Err(format!("{edge:?} claims to be unnegatable"));
+        }
+        let want = RStar::new(r(-3, 2), i64::MAX);
+        match edge.negate() {
+            Some(n) if n == want => Ok(()),
+            got => Err(format!("{edge:?} negated to {got:?}; expected {want:?}")),
+        }
     }
 
     #[test]

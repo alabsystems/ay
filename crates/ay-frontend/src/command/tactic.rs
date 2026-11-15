@@ -116,12 +116,11 @@
 //! - `(par-then t1 t2)` / `(par-or t1 t2 …)` — Z3's parallel combinators;
 //!   composed sequentially here (documented), same result set.
 //! - `(repeat t)` / `(repeat t n)` — apply until fixpoint (or `n` iterations).
-//! - `(try-for t ms)` — apply `t` (Z3 attaches a wall-clock bound; AY's passes
-//!   are already bounded, so it reduces to `t`).
+//! - `(try-for t ms)` — an additional deadline that cannot clear an
+//!   original/enclosing resource stop.
 //! - `(using-params t :k v …)` / `(with t :k v …)` / `(! t :k v …)` —
-//!   parameters to a tactic; AY always applies the equivalence-preserving
-//!   transform, so shape-only params are parsed and ignored (documented sound
-//!   divergence). `!` is z3's annotation spelling of `using-params`.
+//!   typed supported parameters are enforced; unsupported combinations refuse.
+//!   `!` is Z3's annotation spelling of `using-params`.
 //! - `(when p t)` — apply `t` iff probe `p` holds, else `skip`.
 //! - `(fail-if p)` — fail iff probe `p` holds, else `skip`.
 //! - `(if p t1 t2)` / `(cond p t1 t2)` — apply `t1` iff probe `p` holds, else
@@ -154,6 +153,11 @@ pub const SUPPORTED_TACTIC_NAMES: &[&str] = &[
     "nnf",
     "tseitin-cnf",
     "bit-blast",
+    "ff-simplify",
+    "ff-unique",
+    "ff-solve",
+    "ff-sat",
+    "ff2bv",
     "split-clause",
     "ctx-solver-simplify",
     "propagate-ineqs",
@@ -293,9 +297,8 @@ pub const SUPPORTED_TACTIC_NAMES: &[&str] = &[
 
 /// A value supplied to a tactic parameter (`using-params`/`with`).
 ///
-/// AY's tactics are always the equivalence-preserving transform, so parameters
-/// that would only affect output *shape* (not the model set) are parsed for
-/// fidelity and then ignored — this type just records what was written.
+/// Preserve setter types for validated native tactic configuration. Unsupported
+/// parameter/primitive combinations refuse instead of dropping directives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParamValue {
@@ -499,6 +502,14 @@ pub enum ProbeCmp {
 /// honest-failure tactic into a silent success and defeat `or-else` routing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyTactic {
+    /// Model-preserving modular field constant/ring simplification.
+    FieldSimplify,
+    /// Functional dependency propagation; no SAT/model or proof transport.
+    FieldUnique,
+    /// Owned prime-field conjunction decision with checked model reconstruction.
+    FieldSolve,
+    FieldSat,
+    FieldToBv,
     /// `skip` — the identity tactic. Leaves the goal unchanged (depth 0).
     Skip,
     /// `fail` — the always-failing tactic. Yields no goal; the surface reports
@@ -585,6 +596,8 @@ pub enum ApplyTactic {
     /// in every occurrence, specializing the function per constant tuple into
     /// fresh `f!k` symbols. Equisatisfiable (fresh symbols).
     ReduceArgs,
+    /// Share BV addition, multiplication, AND and OR subexpressions.
+    MaxBvSharing,
     /// `(then t1 t2 …)` / `(and-then t1 t2 …)` — sequential composition.
     Then(Vec<ApplyTactic>),
     /// `(or-else t1 t2 …)` — try `t1`; on *failure* fall through to the next.
@@ -597,8 +610,7 @@ pub enum ApplyTactic {
     /// `(repeat t)` / `(repeat t n)` — apply `t` to fixpoint, or at most `n`
     /// iterations when a bound is given.
     Repeat(Box<ApplyTactic>, Option<usize>),
-    /// `(try-for t ms)` — apply `t` under a wall-clock bound `ms`. AY's passes
-    /// are already bounded, so this reduces to `t` (the bound is recorded).
+    /// `(try-for t ms)` — apply `t` under an additional wall-clock bound `ms`.
     TryFor(Box<ApplyTactic>, u64),
     /// `(using-params t :k v …)` / `(with t :k v …)` — parameters to `t`.
     UsingParams(Box<ApplyTactic>, Vec<(String, ParamValue)>),
@@ -700,6 +712,11 @@ impl ApplyTactic {
             "nnf" => Ok(Self::Nnf),
             "tseitin-cnf" => Ok(Self::TseitinCnf),
             "bit-blast" => Ok(Self::BitBlast),
+            "ff-simplify" => Ok(Self::FieldSimplify),
+            "ff-unique" => Ok(Self::FieldUnique),
+            "ff-solve" => Ok(Self::FieldSolve),
+            "ff-sat" => Ok(Self::FieldSat),
+            "ff2bv" => Ok(Self::FieldToBv),
             "split-clause" => Ok(Self::SplitClause),
             "ctx-solver-simplify" => Ok(Self::CtxSolverSimplify),
             // z3 tactic names reduced to their closest equisatisfiable AY pass:
@@ -719,6 +736,7 @@ impl ApplyTactic {
             "der" => Ok(Self::Der),
             "distribute-forall" => Ok(Self::DistributeForall),
             "reduce-args" => Ok(Self::ReduceArgs),
+            "max-bv-sharing" => Ok(Self::MaxBvSharing),
             // Terminal "solve" tactics: z3's `smt` is the SMT engine, `sat` the
             // SAT engine, `default` its default strategy. In a tactic CHAIN they
             // are the step that decides the goal, and AY realizes that by running
@@ -795,7 +813,6 @@ impl ApplyTactic {
             | "lia2card"
             | "lia2pb"
             | "macro-finder"
-            | "max-bv-sharing"
             | "nla2bv"
             | "normalize-bounds"
             | "occf"
@@ -1031,6 +1048,11 @@ impl ApplyTactic {
             | Self::Nnf
             | Self::TseitinCnf
             | Self::BitBlast
+            | Self::FieldSimplify
+            | Self::FieldUnique
+            | Self::FieldSolve
+            | Self::FieldSat
+            | Self::FieldToBv
             | Self::SplitClause
             | Self::CtxSolverSimplify
             | Self::PropagateIneqs
@@ -1038,7 +1060,8 @@ impl ApplyTactic {
             | Self::BlastTermIte
             | Self::Der
             | Self::DistributeForall
-            | Self::ReduceArgs => 1,
+            | Self::ReduceArgs
+            | Self::MaxBvSharing => 1,
             Self::Then(children) | Self::ParThen(children) => {
                 children.iter().map(Self::depth).sum()
             }

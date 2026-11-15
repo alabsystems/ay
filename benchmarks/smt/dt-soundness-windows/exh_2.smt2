@@ -1,0 +1,5 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((C 0)) (((red) (green) (blue))))
+(declare-const c C)
+(assert (or (is-red c) (is-green c) (is-blue c)))
+(check-sat)

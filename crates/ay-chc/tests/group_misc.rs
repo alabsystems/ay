@@ -60,3 +60,11 @@ mod tla2_trace_mutation_validation;
 mod tla2_trace_validation;
 #[path = "group_misc/trl_dillig02_validation_7182.rs"]
 mod trl_dillig02_validation_7182;
+#[path = "group_misc/wsd_bridge.rs"]
+mod wsd_bridge;
+#[path = "group_misc/wsd_imc.rs"]
+mod wsd_imc;
+#[path = "group_misc/wsd_ladder.rs"]
+mod wsd_ladder;
+#[path = "group_misc/wsd_proof_groups.rs"]
+mod wsd_proof_groups;

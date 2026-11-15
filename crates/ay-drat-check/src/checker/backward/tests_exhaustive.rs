@@ -31,6 +31,15 @@ fn all_proof_clauses_2var() -> Vec<Vec<Literal>> {
     clauses
 }
 
+/// Whether bit `i` of the subset `mask` is set (`mask & (1 << i) != 0`); an
+/// index past the mask's width is never a member.
+fn subset_contains(mask: u32, i: usize) -> bool {
+    match u32::try_from(i) {
+        Ok(shift) if shift < u32::BITS => mask & (1 << shift) != 0,
+        _ => false,
+    }
+}
+
 /// Check forward/backward agreement for a single (formula, proof) pair.
 /// Returns None if they agree, Some(description) if they disagree.
 fn check_parity(clauses: &[Vec<Literal>], steps: &[ProofStep]) -> Option<String> {
@@ -91,7 +100,7 @@ fn test_exhaustive_2var_1step() {
             continue;
         }
         let formula: Vec<Vec<Literal>> = (0..n)
-            .filter(|&i| mask & (1 << i) != 0)
+            .filter(|&i| subset_contains(mask, i))
             .map(|i| all_clauses[i].clone())
             .collect();
 
@@ -127,7 +136,7 @@ fn test_exhaustive_2var_2step() {
             continue;
         }
         let formula: Vec<Vec<Literal>> = (0..n)
-            .filter(|&i| mask & (1 << i) != 0)
+            .filter(|&i| subset_contains(mask, i))
             .map(|i| all_clauses[i].clone())
             .collect();
 
@@ -165,7 +174,7 @@ fn test_exhaustive_2var_3step() {
             continue;
         }
         let formula: Vec<Vec<Literal>> = (0..n)
-            .filter(|&i| mask & (1 << i) != 0)
+            .filter(|&i| subset_contains(mask, i))
             .map(|i| all_clauses[i].clone())
             .collect();
 

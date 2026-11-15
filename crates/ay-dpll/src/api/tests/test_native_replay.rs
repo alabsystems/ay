@@ -108,6 +108,9 @@ fn native_replay_with_checked_proof_returns_the_same_strict_artifact() {
         StrictProofVerdict::Rejected(reason) => {
             panic!("strict replay returned a rejected proof artifact: {reason}")
         }
+        StrictProofVerdict::Stopped(stop) => {
+            panic!("strict replay returned a stopped proof artifact: {stop:?}")
+        }
     };
     assert_eq!(strict_quality.trust_count, 0);
     assert_eq!(strict_quality.hole_count, 0);
@@ -1835,11 +1838,16 @@ fn native_replay_remaps_interleaved_private_datatype_member_identities() {
     solver
         .try_declare_datatype(&operation)
         .expect("declare colliding datatype");
+    // Selectors and testers over a LITERAL constructor fold away exactly as
+    // their surface spelling elaborates, which would leave no member symbol in
+    // the exported terms at all. An OPAQUE scrutinee keeps every one of the
+    // five members applied, which is what identity remapping is about.
+    let scrutinee = solver.declare_const("replay-private-op", Sort::Datatype(operation.clone()));
     let unit = solver.datatype_constructor(&operation, "mod", &[]);
     let boxed = solver.datatype_constructor(&operation, "abs", &[modulo_value]);
-    let selected = solver.datatype_selector("min", boxed, Sort::Int);
-    let unit_is_mod = solver.datatype_tester("mod", unit);
-    let boxed_is_abs = solver.datatype_tester("abs", boxed);
+    let selected = solver.datatype_selector("min", scrutinee, Sort::Int);
+    let scrutinee_is_mod = solver.datatype_tester("mod", scrutinee);
+    let scrutinee_is_abs = solver.datatype_tester("abs", scrutinee);
     let selected_is_value = solver.try_eq(selected, modulo_value).expect("selector law");
     let true_value = solver.bool_const(true);
     let absolute_true = solver
@@ -1847,16 +1855,30 @@ fn native_replay_remaps_interleaved_private_datatype_member_identities() {
         .expect("apply member-surface overload");
     let zero = solver.int_const(0);
     let absolute_true_is_zero = solver.try_eq(absolute_true, zero).expect("overload value");
-    let unit_is_not_mod = solver.try_not(unit_is_mod).expect("negated tester law");
-    let boxed_is_not_abs = solver.try_not(boxed_is_abs).expect("negated tester law");
+    let scrutinee_is_unit = solver.try_eq(scrutinee, unit).expect("nullary constructor");
+    let scrutinee_is_not_mod = solver
+        .try_not(scrutinee_is_mod)
+        .expect("negated tester law");
+    let scrutinee_is_not_boxed = solver
+        .try_eq(scrutinee, boxed)
+        .and_then(|equal| solver.try_not(equal))
+        .expect("negated constructor equality");
     let selected_is_not_value = solver
         .try_not(selected_is_value)
         .expect("negated selector law");
     solver
         .try_assert_term(absolute_true_is_zero)
         .expect("assert");
-    solver.try_assert_term(unit_is_not_mod).expect("assert");
-    solver.try_assert_term(boxed_is_not_abs).expect("assert");
+    // `(= op mod)` together with `(not ((_ is mod) op))` is the refutation;
+    // the remaining assertions keep the other members live in the export.
+    solver.try_assert_term(scrutinee_is_unit).expect("assert");
+    solver
+        .try_assert_term(scrutinee_is_not_mod)
+        .expect("assert");
+    solver.try_assert_term(scrutinee_is_abs).expect("assert");
+    solver
+        .try_assert_term(scrutinee_is_not_boxed)
+        .expect("assert");
     solver
         .try_assert_term(selected_is_not_value)
         .expect("assert");

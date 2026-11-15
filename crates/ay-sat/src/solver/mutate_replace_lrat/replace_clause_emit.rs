@@ -43,6 +43,7 @@ impl Solver {
         }
     }
 
+    #[track_caller]
     pub(super) fn emit_replacement_clause_lrat(
         &mut self,
         clause_idx: usize,
@@ -53,6 +54,9 @@ impl Solver {
         old_lits: &[Literal],
     ) -> Option<Option<u64>> {
         let mut replacement_clause_id = None;
+        // `--sat-veripb-hints`: the replaced clause is an antecedent of its
+        // replacement (with root units, all a level-0 strengthening needs).
+        self.veripb_note_antecedent(old_lits);
         // Forward check + proof emit: add clause, then delete old (#4564).
         if let Ok(new_id) = self.proof_emit_add(reordered, proof_hints, proof_kind) {
             // Guard: LRAT returns Ok(0) as a no-op sentinel after I/O

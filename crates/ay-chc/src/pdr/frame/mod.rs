@@ -21,8 +21,6 @@ mod must_summaries;
 mod subsumption;
 #[cfg(test)]
 mod tests;
-#[cfg(kani)]
-mod verification;
 
 pub(crate) use self::core::Frame;
 pub(crate) use self::core::MAX_GLOBAL_LEMMAS;

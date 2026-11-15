@@ -1,0 +1,8 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((Lst 0)) (((cons (hd Int) (tl Lst)) (nil))))
+(declare-fun f (Lst) Int)
+(declare-const x Lst)
+(assert (is-cons x))
+(assert (= (f x) (f (tl x))))
+(assert (= (f nil) 42))
+(check-sat)

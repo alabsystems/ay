@@ -299,6 +299,7 @@ impl RelevantVariableProjectionGeneralizer {
     /// Check if an expression is a constant (no variables).
     fn is_constant(expr: &ChcExpr) -> bool {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(_) => false,
             ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::BitVec(_, _) | ChcExpr::Real(..) => true,
             ChcExpr::Var(_) => false,
             ChcExpr::Op(_, args) => args.iter().all(|a| Self::is_constant(a)),

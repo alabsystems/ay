@@ -32,6 +32,11 @@ impl SymbolInfo {
         self.binding_origin == SymbolBindingOrigin::DirectSourceDeclaration
     }
 
+    /// Whether this binding is the definition a `:named` label made.
+    fn is_named_label(&self) -> bool {
+        self.binding_origin == SymbolBindingOrigin::NamedLabel
+    }
+
     /// Whether an unconstrained declaration with this binding may receive a
     /// canonical default value during quantified-output model completion.
     ///

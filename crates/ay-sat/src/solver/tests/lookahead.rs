@@ -304,3 +304,88 @@ fn test_generate_cubes_coverage() {
     }
     assert!(found_sat, "at least one cube should be satisfiable");
 }
+
+/// proof-posture-parity, site 1: under a DRAT proof surface the failed-literal
+/// unit must still be learned, and it must appear in the proof. Before this,
+/// lookahead skipped every failed literal whenever a proof was being emitted,
+/// so the proof posture searched a different formula than the no-proof one.
+#[test]
+fn test_lookahead_failed_literal_is_learned_and_emitted_under_drat() {
+    use crate::ProofOutput;
+    let proof = ProofOutput::drat_text(Vec::<u8>::new());
+    let mut solver: Solver = Solver::with_proof_output(3, proof);
+    // x0=true forces x1=true and x1=false: x0 is a failed literal.
+    solver.add_clause(vec![
+        Literal::negative(Variable(0)),
+        Literal::positive(Variable(1)),
+    ]);
+    solver.add_clause(vec![
+        Literal::negative(Variable(0)),
+        Literal::negative(Variable(1)),
+    ]);
+    solver.add_clause(vec![
+        Literal::positive(Variable(0)),
+        Literal::positive(Variable(2)),
+    ]);
+    solver.initialize_watches();
+    assert!(solver.process_initial_clauses().is_none());
+    let _ = solver.lookahead();
+    assert_eq!(
+        solver.lit_val(Literal::negative(Variable(0))),
+        1,
+        "x0 must be forced false by failed-literal detection under a proof surface"
+    );
+    assert_eq!(solver.decision_level, 0);
+    let writer = solver
+        .take_proof_writer()
+        .expect("proof writer should exist with DRAT output");
+    let text = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
+    assert!(
+        text.lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>() == ["-1", "0"]),
+        "DRAT proof must carry the derived unit `-1 0`, got:\n{text}"
+    );
+}
+
+/// proof-posture-parity, site 1 (LRAT): the derived unit must carry a
+/// non-empty hint chain, so it is a checker-visible RUP step rather than a
+/// hidden TrustedTransform.
+#[test]
+fn test_lookahead_failed_literal_emits_lrat_hints() {
+    use crate::ProofOutput;
+    let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 3);
+    let mut solver: Solver = Solver::with_proof_output(3, proof);
+    solver.add_clause(vec![
+        Literal::negative(Variable(0)),
+        Literal::positive(Variable(1)),
+    ]);
+    solver.add_clause(vec![
+        Literal::negative(Variable(0)),
+        Literal::negative(Variable(1)),
+    ]);
+    solver.add_clause(vec![
+        Literal::positive(Variable(0)),
+        Literal::positive(Variable(2)),
+    ]);
+    solver.initialize_watches();
+    assert!(solver.process_initial_clauses().is_none());
+    let _ = solver.lookahead();
+    assert_eq!(
+        solver.lit_val(Literal::negative(Variable(0))),
+        1,
+        "x0 must be forced false by failed-literal detection under LRAT"
+    );
+    let writer = solver
+        .take_proof_writer()
+        .expect("proof writer should exist with LRAT output");
+    let text = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
+    let unit_with_hints = text.lines().any(|line| {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        // `<id> -1 0 <hint>+ 0`
+        t.len() >= 5 && t[1] == "-1" && t[2] == "0" && t[t.len() - 1] == "0"
+    });
+    assert!(
+        unit_with_hints,
+        "LRAT proof must carry the derived unit `-1` with a non-empty hint chain, got:\n{text}"
+    );
+}

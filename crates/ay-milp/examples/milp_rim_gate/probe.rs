@@ -12,11 +12,20 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::baseline::Row;
-use crate::cli::BusyPolicy;
 use crate::{GateError, GateResult};
 
 const WATCHDOG_TIMEOUT_EXIT: i32 = 124;
 const WATCHDOG_BREACH_EXIT: i32 = 86;
+/// The status of a solve short of an optimum that the probe's `RIM_SECS` wall
+/// backstop had passed when it returned: the clock, not the pivot counts, may
+/// have ended it, so the row is COULD NOT RUN, never a pin and never a drift.
+pub(crate) const CLOCK_ENDED: &str = "CLOCK_ENDED";
+
+/// Whether a measured row is COULD NOT RUN: the probe's wall backstop or the
+/// watchdog's timeout ended it before its counts decided.
+pub(crate) fn could_not_run(row: &Row) -> bool {
+    row.status == CLOCK_ENDED || row.status == "HARNESS_TIMEOUT"
+}
 
 pub(crate) struct Resources {
     memlimit_mb: usize,
@@ -98,30 +107,29 @@ pub(crate) fn plan_resources(repo: &Path) -> GateResult<Resources> {
     parse_plan(&output_text(&output.stdout))
 }
 
-fn load_average() -> Option<f64> {
-    let text = fs::read_to_string("/proc/loadavg").ok()?;
-    text.split_whitespace().next()?.parse().ok()
-}
-
-pub(crate) fn require_quiet_host(policy: BusyPolicy) -> GateResult<()> {
-    if policy == BusyPolicy::AllowBusy {
-        return Ok(());
+/// The Cargo-family frontend that builds the probe: the Trust toolchain's
+/// `targo` in its unverified lane when it is installed (the probe is a
+/// measurement subject, not a proof claim), plain Cargo otherwise. The
+/// discriminator is the one that holds: stock Cargo refuses `--unverified`.
+fn cargo_frontend() -> Command {
+    let targo = Command::new("targo")
+        .args(["--unverified", "--version"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if targo {
+        let mut command = Command::new("targo");
+        command.arg("--unverified");
+        command
+    } else {
+        Command::new("cargo")
     }
-    let Some(load) = load_average() else {
-        return Ok(());
-    };
-    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-    if load > 0.35 * cpus as f64 {
-        return Err(GateError::setup(format!(
-            "load average {load:.1} on {cpus} cpus -- the rim pins are only deadline-free\n\
-             while every instance finishes inside --limit. Wait, or pass --allow-busy."
-        )));
-    }
-    Ok(())
 }
 
 fn cargo_probe(repo: &Path) -> GateResult<PathBuf> {
-    let output = Command::new("cargo")
+    let output = cargo_frontend()
         .args([
             "test",
             "-p",
@@ -250,10 +258,24 @@ fn measured_row(pin: &Row, fields: &BTreeMap<&str, &str>, wall_s: f64) -> GateRe
             ))
         })
     };
+    let deadline_passed = match field("deadline_passed")? {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(GateError::setup(format!(
+                "probe returned invalid `deadline_passed` for {}: {other}",
+                pin.name
+            )));
+        }
+    };
+    let status = match field("status")? {
+        status if status != "OPTIMAL" && deadline_passed => CLOCK_ENDED,
+        status => status,
+    };
     Ok(Row {
         name: pin.name.clone(),
         class: pin.class.clone(),
-        status: field("status")?.to_owned(),
+        status: status.to_owned(),
         form: field("form")?.to_owned(),
         switch_at: integer("switch_at")?,
         p1_pivots: integer("p1_pivots")?,
@@ -362,6 +384,51 @@ pub(crate) fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pin() -> Row {
+        Row {
+            name: "fixture".to_owned(),
+            class: "reduced".to_owned(),
+            status: "OPTIMAL".to_owned(),
+            form: "reduced".to_owned(),
+            switch_at: 0,
+            p1_pivots: 1,
+            pivots: 2,
+            value: "1/2".to_owned(),
+            tier: "fast".to_owned(),
+            wall_s: 0.0,
+            raw: None,
+        }
+    }
+
+    fn decided(status: &str, deadline_passed: &str) -> GateResult<Row> {
+        let text = format!(
+            "RIMRESULT status={status} form=reduced switch_at=0 deadline_passed={deadline_passed} \
+             p1_pivots=1 pivots=2 value=1/2\n"
+        );
+        let fields = parse_result(&text).expect("a RIMRESULT line");
+        measured_row(&pin(), &fields, 1.0)
+    }
+
+    #[test]
+    fn a_solve_short_of_an_optimum_past_its_wall_backstop_could_not_run() {
+        let ended = decided("NONOPTIMAL", "true").expect("a well-formed row");
+        assert_eq!(ended.status, CLOCK_ENDED);
+        assert!(could_not_run(&ended));
+        // A count stopped it before the backstop: the row decides, as a drift.
+        let counted = decided("NONOPTIMAL", "false").expect("a well-formed row");
+        assert_eq!(counted.status, "NONOPTIMAL");
+        assert!(!could_not_run(&counted));
+        // An optimum is the counts' answer, whenever it arrived.
+        let optimal = decided("OPTIMAL", "true").expect("a well-formed row");
+        assert_eq!(optimal.status, "OPTIMAL");
+        assert!(!could_not_run(&optimal));
+        // A probe that does not say is not trusted to have finished by its counts.
+        assert!(decided("NONOPTIMAL", "maybe").is_err());
+        let text = "RIMRESULT status=OPTIMAL form=reduced switch_at=0 p1_pivots=1 pivots=2\n";
+        let silent = parse_result(text).expect("a RIMRESULT line");
+        assert!(measured_row(&pin(), &silent, 1.0).is_err());
+    }
 
     #[test]
     fn result_parser_keeps_the_exact_rational() {

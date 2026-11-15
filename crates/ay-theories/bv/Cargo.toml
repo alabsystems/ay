@@ -11,9 +11,11 @@ readme.workspace = true
 workspace = true
 
 [dependencies]
+ay-arrays.workspace = true
 ay-core.workspace = true
 ay-sys.workspace = true
 num-bigint.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 stacker.workspace = true
 

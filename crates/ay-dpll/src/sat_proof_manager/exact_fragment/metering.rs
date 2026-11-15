@@ -4,6 +4,7 @@
 
 use std::mem::size_of;
 
+use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Symbol, TermData, TermId, TheoryLemmaProof};
 use ay_sat::{ClauseTrace, ResolutionValidationError, ResolutionValidationResource};
 
@@ -130,6 +131,7 @@ impl SatProofManager<'_> {
     pub(in crate::sat_proof_manager) fn precharge_term_store_growth(
         &self,
         trace: &ClauseTrace,
+        original_id_cone: Option<&HashSet<u64>>,
         progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
     ) -> Result<(usize, usize), ResolutionValidationError> {
         let mut potential_new_nots = 0usize;
@@ -137,7 +139,8 @@ impl SatProofManager<'_> {
             if trace_index % 1024 == 0 {
                 progress(0, 0)?;
             }
-            if !entry.is_original {
+            if !entry.is_original || original_id_cone.is_some_and(|cone| !cone.contains(&entry.id))
+            {
                 continue;
             }
 

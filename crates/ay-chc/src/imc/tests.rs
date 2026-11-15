@@ -8,6 +8,7 @@ use crate::{ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 
 mod proof_interpolants;
+mod wsd_retry_k1;
 
 #[test]
 fn test_imc_golem_simple_unsafe() {
@@ -55,6 +56,57 @@ fn test_imc_golem_simple_unsafe() {
     );
     let result = solver.solve();
     assert!(matches!(&result, ImcResult::Unsafe(cex) if cex.steps.len() == 3));
+}
+
+/// The Real counter `x' = x + 1` from `x = 0` with bad `x > 1`: IMC's depth-2
+/// base check is satisfiable from the true init, and its model reads as a
+/// counterexample WITH a derivation witness (so the portfolio validates it by
+/// replaying the witness instead of re-solving the unrolling).
+#[test]
+fn test_imc_real_unsafe_carries_a_witness() {
+    let mut problem = ChcProblem::new();
+    let s1 = problem.declare_predicate("s1", vec![ChcSort::Real]);
+    let x = ChcVar::new("x", ChcSort::Real);
+    let xp = ChcVar::new("xp", ChcSort::Real);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(xp.clone()), ChcExpr::Real(0, 1))),
+        ClauseHead::Predicate(s1, vec![ChcExpr::var(xp.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(s1, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(
+                ChcExpr::var(xp.clone()),
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::Real(1, 1)),
+            )),
+        ),
+        ClauseHead::Predicate(s1, vec![ChcExpr::var(xp)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(s1, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::gt(ChcExpr::var(x), ChcExpr::Real(1, 1))),
+        ),
+        ClauseHead::False,
+    ));
+    let solver = ImcSolver::new(
+        problem,
+        ImcConfig {
+            base: ChcEngineConfig::default(),
+            max_k: 10,
+            max_iters_per_k: 100,
+            query_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(10),
+            proof_interpolants: None,
+        },
+    );
+    match solver.solve() {
+        ImcResult::Unsafe(cex) => {
+            assert_eq!(cex.steps.len(), 3);
+            assert!(cex.witness.is_some(), "expected a model witness: {cex:?}");
+        }
+        other => panic!("expected Unsafe, got {other:?}"),
+    }
 }
 
 #[test]

@@ -34,7 +34,9 @@ impl DratChecker {
             "BUG: hash_buckets.len() = {} is not a power of two",
             self.hash_buckets.len()
         );
-        (hash as usize) & (self.hash_buckets.len() - 1)
+        // The assertion above makes `len >= 1`, so the saturating form is the
+        // exact `len - 1` mask.
+        (hash as usize) & self.hash_buckets.len().saturating_sub(1)
     }
 
     pub(super) fn maybe_rehash(&mut self) {
@@ -42,11 +44,19 @@ impl DratChecker {
             return;
         }
         let new_cap = match self.hash_buckets.len().checked_mul(2) {
-            Some(c) => c,
-            None => return, // usize overflow — keep current capacity
+            Some(c) if c <= super::MAX_HASH_CAPACITY => c,
+            // usize overflow or the size ceiling — keep current capacity
+            _ => return,
         };
-        let mut new_buckets = vec![Vec::new(); new_cap];
-        let mask = new_cap - 1;
+        let Some(mask) = new_cap.checked_sub(1) else {
+            return; // zero buckets cannot be doubled — keep current capacity
+        };
+        // Up to 2^27 buckets of 24 bytes: allocate fallibly. A refusal keeps
+        // the current table, exactly like reaching the size ceiling above,
+        // since bucket count affects lookup speed only.
+        let Some(mut new_buckets) = super::try_filled(Vec::new(), new_cap) else {
+            return;
+        };
         for bucket in &self.hash_buckets {
             for &cidx in bucket {
                 if let Some(ref clause) = self.clauses[cidx] {
@@ -59,6 +69,15 @@ impl DratChecker {
     }
 
     pub(super) fn insert_clause(&mut self, clause: Vec<Literal>) -> usize {
+        for &lit in &clause {
+            if let Err(refusal) = self.ensure_capacity(lit.variable().index()) {
+                // Callers ensure capacity first, so this is a defensive
+                // refusal: store nothing (the `usize::MAX` no-clause sentinel)
+                // and fail any conclusion closed.
+                self.record_dense_refusal(refusal);
+                return usize::MAX;
+            }
+        }
         let cidx = self.free_clause_slots.pop().unwrap_or(self.clauses.len());
         if clause.is_empty() {
             // Empty clause cannot be hashed or watched. Caller should handle
@@ -72,9 +91,6 @@ impl DratChecker {
                 self.clauses[cidx] = Some(clause);
             }
             return cidx;
-        }
-        for &lit in &clause {
-            self.ensure_capacity(lit.variable().index());
         }
         if clause.len() >= 2 {
             let (c0, c1) = (clause[0], clause[1]);
@@ -92,7 +108,7 @@ impl DratChecker {
         self.add_clause_occurrences(cidx, &clause);
         let bucket = self.bucket_idx(Self::hash_clause(&clause));
         self.hash_buckets[bucket].push(cidx);
-        self.live_clauses += 1;
+        self.live_clauses = self.live_clauses.saturating_add(1);
         if cidx == self.clauses.len() {
             self.clauses.push(Some(clause));
         } else {
@@ -195,7 +211,8 @@ impl DratChecker {
         counts.clear();
         consumed.clear();
         for &lit in clause {
-            *counts.entry(lit).or_insert(0) += 1;
+            let count = counts.entry(lit).or_insert(0);
+            *count = count.saturating_add(1);
         }
 
         let mut found = None;
@@ -219,7 +236,8 @@ impl DratChecker {
                 }
                 for &lit in &consumed {
                     if let Some(remaining) = counts.get_mut(&lit) {
-                        *remaining += 1;
+                        // Restores the decrement above, so it cannot saturate.
+                        *remaining = remaining.saturating_add(1);
                     } else {
                         // Defensive only: every consumed literal was obtained
                         // from this map immediately above.

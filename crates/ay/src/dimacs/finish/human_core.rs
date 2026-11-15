@@ -46,18 +46,6 @@ fn emit_dimacs_human_search_core(solver: &SatSolver) {
     safe_eprintln!("c mli_reimplied:   {mli_reimplied:>12}");
     safe_eprintln!("c mli_used_anlyz:  {mli_used:>12}");
     safe_eprintln!("c random_decs:     {:>12}", solver.num_random_decisions());
-    safe_eprintln!(
-        "c approxbcp_noop:  {:>12}",
-        solver.approx_bcp_noop_matched()
-    );
-    safe_eprintln!(
-        "c approxbcp_conf:  {:>12}",
-        solver.approx_bcp_conflict_matched()
-    );
-    safe_eprintln!(
-        "c approxbcp_bad:   {:>12}",
-        solver.approx_bcp_mismatch_detected()
-    );
     safe_eprintln!("c fixed_vars:      {:>12}", solver.num_fixed());
     safe_eprintln!("c original_cls:    {:>12}", solver.num_original_clauses());
     safe_eprintln!("c learned_cls:     {:>12}", solver.num_learned_clauses());
@@ -139,9 +127,9 @@ fn emit_dimacs_human_sidecars(
 /// Independent-support brancher counters (`solver/indep_support.rs`). Silent
 /// unless the analysis actually ran, so off-route stats output is unchanged.
 fn emit_dimacs_human_indep_support(solver: &SatSolver) {
-    let (installed, size, decidable, gates, rejected, decisions, fallbacks, ns) =
+    let (installed, size, decidable, gates, rejected, decisions, fallbacks, ns, ge_free) =
         solver.indep_support_report();
-    if size == 0 && rejected == 0 && gates == 0 && ns == 0 {
+    if size == 0 && rejected == 0 && gates == 0 && ns == 0 && ge_free == 0 {
         return;
     }
     safe_eprintln!("c --- indep support ---");
@@ -149,6 +137,7 @@ fn emit_dimacs_human_indep_support(solver: &SatSolver) {
     safe_eprintln!("c indep_support_size: {:>10}", size);
     safe_eprintln!("c indep_support_decidable_vars: {:>10}", decidable);
     safe_eprintln!("c indep_support_gates: {:>10}", gates);
+    safe_eprintln!("c indep_support_ge_free_vars: {:>10}", ge_free);
     safe_eprintln!("c indep_support_rejected_size: {:>10}", rejected);
     safe_eprintln!("c indep_support_decisions: {:>10}", decisions);
     safe_eprintln!("c indep_support_fallback_decisions: {:>10}", fallbacks);

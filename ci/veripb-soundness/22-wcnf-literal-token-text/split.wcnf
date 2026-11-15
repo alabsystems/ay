@@ -1,0 +1,8 @@
+c MaxSAT instance in the MSE-2022 (new) WCNF format.
+c Hard clause 1:  h 1 0     ->  (x1)
+c Hard clause 2:  h -01 0   ->  (~x1)      because DIMACS literal -01 == -1
+c Soft clause  :  5 2 0     ->  (x2) with weight 5
+c The two hard clauses are contradictory, so the instance is INFEASIBLE.
+h 1 0
+h -01 0
+5 2 0

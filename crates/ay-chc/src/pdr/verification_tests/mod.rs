@@ -192,7 +192,7 @@ fn test_instance_subst_var_and_value_uses_declared_array_sort_6293() {
 fn test_smt_value_to_chc_expr_for_sort_canonicalizes_recursive_dt_backedge_9692() {
     let list_sort = ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             crate::ChcDtConstructor {
                 name: "conslistOfInt".to_string(),
                 selectors: vec![
@@ -666,6 +666,7 @@ fn verify_counterexample_accepts_valid_witness_via_query() {
                 instances,
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
     let result = solver.verify_counterexample(&cex);
@@ -687,6 +688,7 @@ fn verify_counterexample_rejects_empty_trace_when_query_not_init_reachable_6293(
     let cex = Counterexample {
         steps: Vec::new(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -729,6 +731,7 @@ fn verify_counterexample_rejects_spurious_witness() {
                 instances: inst_0,
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
     let result = solver.verify_counterexample(&cex);
@@ -795,6 +798,7 @@ fn verify_counterexample_accepts_multilevel_witness_with_canonical_mapping() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -845,6 +849,7 @@ fn verify_counterexample_hyperedge_query_uses_body_arg_to_canonical_mapping() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -917,6 +922,7 @@ fn verify_counterexample_transition_chain_canonical_only() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
     let result = solver.verify_counterexample(&cex);
@@ -956,6 +962,7 @@ fn verify_counterexample_state_implication_fallback_accepts_when_state_implies_q
                 instances: failing_instances,
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
     let result = solver.verify_counterexample(&cex);
@@ -991,6 +998,7 @@ fn verify_counterexample_state_implication_fallback_rejects_when_state_does_not_
                 instances: failing_instances,
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
     let result = solver.verify_counterexample(&cex);
@@ -1025,6 +1033,7 @@ fn verify_counterexample_rejects_empty_instances_when_state_violates_query() {
                 instances: FxHashMap::default(),
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1060,6 +1069,7 @@ fn verify_counterexample_accepts_empty_instances_when_state_implies_query() {
                 instances: FxHashMap::default(),
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1111,6 +1121,7 @@ fn verify_counterexample_transition_empty_instances_returns_unknown() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1373,7 +1384,6 @@ fn test_mod_div_budget_exhaustion_before_smt_rejects_clause_7546() {
     };
 
     let mut used_filtered_invariant = false;
-    let mut concrete_elapsed = Duration::ZERO;
     let mut concrete_unsat_count = 0;
     let failure = verifier.verify_transition_clause(
         &clause,
@@ -1390,9 +1400,12 @@ fn test_mod_div_budget_exhaustion_before_smt_rejects_clause_7546() {
         ),
         Some(Duration::from_nanos(1)),
         &mut used_filtered_invariant,
-        Duration::ZERO,
-        &mut concrete_elapsed,
+        &mut super::concrete::ConcreteBudget::new(
+            Duration::ZERO,
+            super::concrete::ConcreteStop::none(),
+        ),
         &mut concrete_unsat_count,
+        &mut crate::ground_derivation::compact::Owner::capture().expect("original verifier owner"),
     );
 
     assert!(
@@ -1603,6 +1616,7 @@ fn test_verify_counterexample_sort_map_from_canonical_vars_6249() {
                 instances: inst_3,
             }],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1763,6 +1777,7 @@ fn test_verify_counterexample_sort_map_bv_sorted_problem_6249() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1865,6 +1880,7 @@ fn test_verify_counterexample_bv_to_int_coercion_6249() {
                 },
             ],
         }),
+        compact_derivation: None,
         ground_derivation: None,
     };
 

@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Companion to `add.pbp`, NOT run by the gate: the same checker and the same `add.opb`,
+% with a logged model. It answers `s VERIFIED SATISFIABLE`, exit 0, before and after the
+% fix. One checker, one formula, both verdicts -- so `add.pbp`'s `s VERIFIED UNSATISFIABLE`
+% is visibly false without trusting any second tool.
+%
+% It is also the guard against a bogus fix: a "fix" that made the checker refuse rows with
+% extreme degrees outright would pass the negative test and break this one.
+f 1 ;
+sol x1 ~x2 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

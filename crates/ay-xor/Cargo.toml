@@ -18,6 +18,7 @@ serde_json.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+ay-criterion-main.workspace = true
 ntest = "0.9"
 ay-drat-check.workspace = true
 

@@ -477,3 +477,23 @@ fn c5b_kinds_remain_inert_with_both_registries() {
         "registry-free acyclicity must stay unsupported: {unauthorized:?}"
     );
 }
+
+#[test]
+fn reconstruct_accepts_nominal_complex_eta_without_user_registries() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Complex);
+    let real = terms.mk_complex_real(x).unwrap();
+    let imaginary = terms.mk_complex_imaginary(x).unwrap();
+    let rebuilt = terms.mk_complex(real, imaginary).unwrap();
+    for sides in [[x, rebuilt], [rebuilt, x]] {
+        let axiom = terms.mk_app(Symbol::named("="), sides, Sort::Bool);
+        validate_reconstruct(&terms, vec![axiom], None, None)
+            .expect("nominal Complex reconstruction is independently authenticated");
+        assert!(recognize_datatype_constructor_reconstruct(
+            &terms,
+            &[axiom],
+            &[],
+            &[]
+        ));
+    }
+}

@@ -16,17 +16,17 @@ impl TheorySolver for LiaSolver<'_> {
 
     fn assert_literal(&mut self, literal: TermId, value: bool) {
         debug_assert!(
-            (literal.0 as usize) < self.terms.len(),
+            (literal.0 as usize) < self.terms().len(),
             "BUG: LIA assert_literal: term {} out of range (term store len={})",
             literal.0,
-            self.terms.len()
+            self.terms().len()
         );
 
         // Any new assertion invalidates cached direct-enumeration models.
         self.direct_enum_witness = None;
 
         // Unwrap NOT: NOT(inner)=true means inner=false
-        let (term, val) = unwrap_not(self.terms, literal, value);
+        let (term, val) = unwrap_not(self.terms(), literal, value);
 
         // Collect integer variables from this literal
         self.collect_integer_vars(term);
@@ -36,7 +36,7 @@ impl TheorySolver for LiaSolver<'_> {
         // #C3: Detect a Boolean-constant atom asserted with the opposite
         // polarity once, here, rather than rescanning all of `asserted` on every
         // check. This is an immediate, assignment-independent contradiction.
-        if let TermData::Const(Constant::Bool(b)) = self.terms.get(term) {
+        if let TermData::Const(Constant::Bool(b)) = self.terms().get(term) {
             if val != *b {
                 let idx = self.asserted.len() - 1;
                 self.const_bool_conflicts
@@ -62,7 +62,7 @@ impl TheorySolver for LiaSolver<'_> {
             }
         }
         // Keep the incremental assertion view in lockstep with `asserted` (#C1).
-        self.assertion_view_cache.on_assert(self.terms, term, val);
+        self.assertion_view_cache.on_assert(self.terms(), term, val);
 
         // Forward to LRA solver (which also handles NOT unwrapping)
         self.lra.assert_literal(literal, value);
@@ -93,6 +93,7 @@ impl TheorySolver for LiaSolver<'_> {
             }
             other => other,
         };
+        let result = self.refuse_unjustified_conflict(result);
         if matches!(
             result,
             TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
@@ -122,6 +123,7 @@ impl TheorySolver for LiaSolver<'_> {
             }
             other => other,
         };
+        let result = self.refuse_unjustified_conflict(result);
         if matches!(
             result,
             TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
@@ -135,15 +137,136 @@ impl TheorySolver for LiaSolver<'_> {
         true
     }
 
+    /// SAT-only diving lane for the split-walk giveup
+    /// (#split-walk-sat-fallback): when branch-and-bound splits walk
+    /// monotonically without landing on an integer point (the split loop's
+    /// oscillation guard is about to answer `unknown`), dive from the
+    /// current LP point — fix fractional integer variables to integers one
+    /// at a time, re-solving the LP after each fixing, backtracking on
+    /// failure (`LraSolver::try_integer_dive`). A fully integral point is
+    /// re-verified exactly against every asserted literal (the
+    /// direct-enumeration witness gate) before it is stored as the model
+    /// `extract_model` reports; every other outcome declines with no side
+    /// effects, leaving the guard's `unknown` unchanged. Can never
+    /// contribute to an `unsat`.
+    ///
+    /// Gated exactly like the finite-domain witness search in
+    /// `check_inner`: under shared equalities or a hidden interface the
+    /// asserted-literal view is not the whole obligation, so decline.
+    fn try_sat_before_split_giveup(&mut self) -> bool {
+        /// LP re-solves per dive (its whole backtracking tree). Only paid
+        /// on the oscillation-giveup path, where the alternative is the
+        /// guard's immediate `unknown`. The budget scales with the
+        /// integer-variable count: a dive spends at least one node per
+        /// fractional variable it fixes, so a flat 512 cannot reach any
+        /// witness on wide problems (measured: convert-1546 has 1329
+        /// integer variables and its first witness needs thousands of
+        /// nodes). The ceiling keeps one giveup bounded.
+        const MAX_DIVE_NODES: usize = 512;
+        const MAX_DIVE_NODES_CEILING: usize = 8192;
+
+        /// Bounded re-dives steering off violated disequalities
+        /// (#lia-dive-repair): the LP cannot see asserted
+        /// disequalities, so a dive can land exactly on one
+        /// (measured on convert-1546: a 1329-variable witness
+        /// violating exactly one trail disequality). Each repair
+        /// pre-fixes one more variable of a violated disequality's
+        /// difference form one step off its witness value, so the
+        /// prefixed set grows strictly and the loop terminates;
+        /// every candidate still passes the same exact asserted
+        /// re-verification before anything is stored.
+        const MAX_DIVE_REPAIRS: usize = 8;
+
+        if !self.shared_equalities.is_empty() || self.hidden_interface {
+            return false;
+        }
+        let dive_nodes =
+            (8 * self.integer_vars.len()).clamp(MAX_DIVE_NODES, MAX_DIVE_NODES_CEILING);
+        let (term_to_idx, idx_to_term) = self.build_var_index();
+        let mut prefixed: Vec<(TermId, BigInt)> = Vec::new();
+        // A repair fixing steps one above the witness value; when
+        // that step leaves the variable's feasible range the LP is
+        // infeasible and the dive declines — retry that fixing one
+        // step below the witness value once before giving up
+        // (measured on convert-1546, whose first repair variable
+        // is bounded above by its witness value).
+        let mut flipped_last = false;
+        for _attempt in 0..=MAX_DIVE_REPAIRS {
+            if self.should_timeout() {
+                return false;
+            }
+            let Some(witness) =
+                self.lra
+                    .try_integer_dive_prefixed(&self.integer_vars, &prefixed, dive_nodes)
+            else {
+                if !flipped_last {
+                    if let Some(last) = prefixed.last_mut() {
+                        last.1 -= BigInt::from(2);
+                        flipped_last = true;
+                        continue;
+                    }
+                }
+                return false;
+            };
+            let mut solution: Vec<(usize, BigInt)> = Vec::with_capacity(witness.len());
+            for (term, value) in &witness {
+                let Some(&idx) = term_to_idx.get(term) else {
+                    return false;
+                };
+                solution.push((idx, value.clone()));
+            }
+            match self.violated_disequalities(&solution, &idx_to_term) {
+                Some(violated) if violated.is_empty() => {
+                    if self.check_solution_satisfies_asserted(&solution, &idx_to_term, false)
+                        != Some(true)
+                    {
+                        return false;
+                    }
+                    if !self.witness_satisfies_shared_equalities(&solution, &idx_to_term) {
+                        return false;
+                    }
+                    self.direct_enum_witness =
+                        Some(Self::solution_to_model(&solution, &idx_to_term));
+                    return true;
+                }
+                Some(violated) => {
+                    let values: HashMap<TermId, BigInt> = witness.into_iter().collect();
+                    let Some(fixing) = violated.iter().find_map(|&literal| {
+                        self.disequality_repair_fixing(literal, &values, &prefixed)
+                    }) else {
+                        return false;
+                    };
+                    prefixed.push(fixing);
+                    flipped_last = false;
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
     fn set_search_phase(&mut self, in_search: bool) {
         self.in_search_phase = in_search;
-        self.dioph_bcp_unproductive_streak = 0;
+        self.dioph_bcp.reset_for_search_phase();
     }
 
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
         let props = self.lra.propagate();
         self.propagation_count += props.len() as u64;
         props
+    }
+
+    /// The lazy propagations above are the inner LRA's, so only the LRA can
+    /// explain them. Without this a proof-tracking QF_LIA solve could not
+    /// prove any level-0 implied bound (ty BEANS `live_decrease`), and the
+    /// consumer dropped them instead, which turned a level-0 refutation
+    /// into a search (k-induction BMC: 0 conflicts became 126,943).
+    fn explain_level0_propagation(
+        &mut self,
+        lit: TermId,
+        reason_data: u64,
+    ) -> Option<Vec<TheoryLit>> {
+        self.lra.explain_propagation(lit, reason_data)
     }
 
     /// Forward buffered single-var disequality splits from the inner LRA solver
@@ -179,92 +302,7 @@ impl TheorySolver for LiaSolver<'_> {
     }
 
     fn pop(&mut self) {
-        if let Some(mark) = self.scopes.pop() {
-            debug_assert!(
-                mark <= self.asserted.len(),
-                "BUG: LIA pop: scope mark {} exceeds asserted length {}",
-                mark,
-                self.asserted.len()
-            );
-            self.asserted.truncate(mark);
-            // #C3: drop const-bool conflicts whose literal was just popped, so a
-            // reported conflict reason is always a live literal (#8784). The Vec
-            // is empty in the overwhelmingly common case, so retain is O(1).
-            if !self.const_bool_conflicts.is_empty() {
-                self.const_bool_conflicts.retain(|(idx, _)| *idx < mark);
-            }
-            // Truncate the incremental view in the SAME transaction as the
-            // asserted-trail truncation (#C1, plan §3.4): otherwise
-            // `conflict_reasons_all_live` could see stale view-derived
-            // literals and publish a false-UNSAT conflict.
-            self.assertion_view_cache.on_pop();
-            self.lra.pop();
-            self.direct_enum_witness = None;
-            let cut_mark = self.cut_scopes.pop().unwrap_or(0);
-            self.learned_cuts.truncate(cut_mark);
-            // Restore cut state from the outer scope (#3685).
-            // Previously these were hard-reset to 0/empty, losing the outer
-            // scope's iteration progress and seen-cut deduplication set.
-            let saved = self.cut_state_scopes.pop().unwrap_or_default();
-            self.gomory_iterations = saved.gomory_iterations;
-            self.hnf_iterations = saved.hnf_iterations;
-            // #C7: undo only the HNF-cut keys inserted in this scope, restoring
-            // the exact pre-push `seen_hnf_cuts` (#3685) without a per-push clone.
-            while self.seen_hnf_cuts_trail.len() > saved.seen_hnf_cuts_mark {
-                if let Some(key) = self.seen_hnf_cuts_trail.pop() {
-                    self.seen_hnf_cuts.remove(&key);
-                }
-            }
-            // #shared-eq-idempotent: drop exactly the keys whose trail entries
-            // this pop removes, keeping `shared_eq_seen` in lockstep with the
-            // trail. Insertion is deduped, so each key occurs at most once on
-            // the trail and this undo is exact (same discipline as #C7's
-            // `seen_hnf_cuts_trail`).
-            while self.shared_equalities.len() > saved.shared_eq_mark {
-                if let Some((lhs, rhs, _)) = self.shared_equalities.pop() {
-                    let key = if lhs.0 <= rhs.0 {
-                        (lhs, rhs)
-                    } else {
-                        (rhs, lhs)
-                    };
-                    self.shared_eq_seen.remove(&key);
-                }
-            }
-            // Truncation changes the algebraic-detection input set; bump the
-            // revision so the memo cannot alias a pop+push of equal length.
-            self.shared_eq_revision += 1;
-            self.shared_disequalities.truncate(saved.shared_diseq_mark);
-            // #8124: Clear pending shared equality conflict on pop — the conflict
-            // may have been derived from literals that are no longer asserted.
-            self.pending_shared_eq_conflict = None;
-            // #C8: Preserve the equality-derived Diophantine caches across pop.
-            // They depend only on the asserted equality SET (captured by
-            // `dioph_equality_key`), not on the inequality bounds that
-            // branch-and-bound and BMC backtracking churn. Re-solving the full
-            // Diophantine system after EVERY backtrack was a dominant per-check
-            // cost on deep (depth>=2) BMC counterexamples. Instead, mark the
-            // caches for re-validation; the unconditional `dioph_equality_key`
-            // comparison in check()/check_during_propagate() reuses them when the
-            // equality set is unchanged and drops+rebuilds them when it changed —
-            // the exact staleness gate #3736 references. This mirrors what
-            // `soft_reset` already does across a (more drastic) LRA reset
-            // (parsing.rs:437-453).
-            self.dioph_needs_revalidation = true;
-            // The bound-tracking state records bounds Dioph ADDED to LRA; those
-            // bounds were just popped, so it is stale. Clear it conservatively;
-            // propagate_bounds_through_substitutions repopulates it in the new
-            // scope (#8147).
-            self.dioph_modified_bounds = false;
-            self.dioph_bound_term_ids.clear();
-
-            // AUDIT FIX [P]90: Clear propagated_equality_pairs on pop().
-            // Without this, after backtracking, equalities that were previously propagated
-            // won't be re-propagated even if they get re-established. This could cause
-            // the N-O combination to miss conflicts in alternate search branches.
-            self.propagated_equality_pairs.clear();
-            self.propagated_disequality_pairs.clear();
-            self.pending_equalities.clear();
-        }
+        self.pop_inner(false);
     }
 
     fn reset(&mut self) {
@@ -282,6 +320,7 @@ impl TheorySolver for LiaSolver<'_> {
         self.const_bool_conflicts.clear();
         self.assertion_view_cache.clear();
         self.scopes.clear();
+        self.tentative_scope_marks.clear();
         self.cut_scopes.clear();
         self.cut_state_scopes.clear();
         self.direct_enum_witness = None;
@@ -292,9 +331,9 @@ impl TheorySolver for LiaSolver<'_> {
         self.learned_cuts.clear();
         self.dioph_equality_key.clear();
         self.dioph_needs_revalidation = false;
-        self.dioph_safe_dependent_vars.clear();
-        self.dioph_cached_substitutions.clear();
-        self.dioph_cached_reasons.clear();
+        // Includes dioph_cached_modular_gcds (#8628: once missed here, so
+        // stale modular GCD constraints persisted across resets).
+        self.clear_dioph_equality_caches();
         self.dioph_modified_bounds = false;
         self.dioph_bound_term_ids.clear();
         self.pending_equalities.clear();
@@ -310,14 +349,18 @@ impl TheorySolver for LiaSolver<'_> {
         self.detect_algebraic_cache = None;
         self.shared_disequalities.clear();
         self.pending_shared_eq_conflict = None;
-        // #8628: Clear dioph_cached_modular_gcds that was previously missed,
-        // causing stale modular GCD constraints to persist across resets.
-        self.dioph_cached_modular_gcds.clear();
     }
 
     fn soft_reset(&mut self) {
         // Use clear_assertions which preserves learned HNF cuts
         self.clear_assertions();
+    }
+
+    fn soft_reset_warm(&mut self) {
+        // Warm twin of soft_reset for the persistent-theory arm:
+        // same LIA-side clearing (HNF cuts preserved), but the inner
+        // LRA relaxation keeps its simplex warm start.
+        self.clear_assertions_warm();
     }
 
     fn propagate_equalities(&mut self) -> EqualityPropagationResult {
@@ -391,7 +434,12 @@ impl TheorySolver for LiaSolver<'_> {
         let mut tight_bound_vars: Vec<(TermId, BigRational, Vec<TheoryLit>)> = Vec::new();
 
         for &var_term in &self.integer_vars {
-            if let Some((Some(lower), Some(upper))) = self.lra.get_bounds(var_term) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness): a tight bound
+            // becomes an equality propagated to EUF under these reasons. The
+            // NIA leaves its tentative scope (rounding / patch pins, reason =
+            // the variable term) in force while Nelson-Oppen runs, so a pin
+            // would otherwise propagate `x = c` justified by a non-atom.
+            if let Some((Some(lower), Some(upper))) = self.justified_bounds(var_term) {
                 // Check if bounds are equal (tight)
                 if lower.value == upper.value && !lower.strict && !upper.strict {
                     // Collect reasons from both bounds
@@ -482,7 +530,7 @@ impl TheorySolver for LiaSolver<'_> {
                         // SOUNDNESS (#cross-sort-alias): never emit an
                         // ill-sorted disequality between terms of different
                         // sorts (mirrors propagate_tight_bound_equalities).
-                        if self.terms.sort(*term_a) != self.terms.sort(*term_b) {
+                        if self.terms().sort(*term_a) != self.terms().sort(*term_b) {
                             continue;
                         }
                         let pair = if term_a.0 < term_b.0 {
@@ -525,7 +573,7 @@ impl TheorySolver for LiaSolver<'_> {
         }
 
         let mut equalities = propagate_tight_bound_equalities(
-            self.terms,
+            self.terms(),
             tight_bound_vars,
             &mut self.propagated_equality_pairs,
         );
@@ -558,6 +606,10 @@ impl TheorySolver for LiaSolver<'_> {
         {
             let candidates: Vec<TermId> = self.integer_vars.iter().copied().collect();
             let implied = self.lra.find_entailed_difference_equalities(&candidates);
+            // Classes the sent pairs (the tight-bound anchor stars included)
+            // already join; built once, at the first pair not literally sent
+            // (#tight-bound-star-dedup).
+            let mut sent_closure: Option<SentEqualityClosure> = None;
             for (lhs, rhs, reasons) in implied {
                 // Dedup against equalities already propagated this round / earlier.
                 let pair = if lhs.0 < rhs.0 {
@@ -568,7 +620,15 @@ impl TheorySolver for LiaSolver<'_> {
                 if self.propagated_equality_pairs.contains(&pair) {
                     continue;
                 }
+                let already_joined = sent_closure
+                    .get_or_insert_with(|| {
+                        SentEqualityClosure::new(self.propagated_equality_pairs.iter())
+                    })
+                    .connected(lhs, rhs);
                 self.propagated_equality_pairs.insert(pair);
+                if already_joined {
+                    continue;
+                }
 
                 if debug {
                     safe_eprintln!(
@@ -681,16 +741,16 @@ impl TheorySolver for LiaSolver<'_> {
         // which affects bounds on (f 5) in the simplex tableau.
 
         debug_assert!(
-            (lhs.0 as usize) < self.terms.len(),
+            (lhs.0 as usize) < self.terms().len(),
             "BUG: LIA assert_shared_equality: lhs term {} out of range (term store len={})",
             lhs.0,
-            self.terms.len()
+            self.terms().len()
         );
         debug_assert!(
-            (rhs.0 as usize) < self.terms.len(),
+            (rhs.0 as usize) < self.terms().len(),
             "BUG: LIA assert_shared_equality: rhs term {} out of range (term store len={})",
             rhs.0,
-            self.terms.len()
+            self.terms().len()
         );
 
         // #7451: Reject equalities involving non-arithmetic terms. In SLIA
@@ -698,8 +758,8 @@ impl TheorySolver for LiaSolver<'_> {
         // to LIA. Without this guard, term_to_linear_coeffs treats String terms
         // as opaque LRA variables with value 0, causing propagate_equalities to
         // produce spurious cross-sort equalities (String = Int) → false UNSAT.
-        let lhs_sort = self.terms.sort(lhs);
-        let rhs_sort = self.terms.sort(rhs);
+        let lhs_sort = self.terms().sort(lhs);
+        let rhs_sort = self.terms().sort(rhs);
         if !matches!(lhs_sort, Sort::Int | Sort::Real)
             || !matches!(rhs_sort, Sort::Int | Sort::Real)
         {
@@ -750,6 +810,12 @@ impl TheorySolver for LiaSolver<'_> {
         if !self.shared_eq_seen.insert(key) {
             return;
         }
+
+        // #lia-dive-repair: a new interface obligation invalidates
+        // any stored witness (it was verified against the previous
+        // shared set; re-assertions of a known pair returned above
+        // and keep it).
+        self.direct_enum_witness = None;
 
         // Store the shared equality for algebraic detection in propagate_equalities (#3581).
         self.shared_equalities.push((lhs, rhs, reason.to_vec()));
@@ -895,6 +961,8 @@ impl TheorySolver for LiaSolver<'_> {
         if !reason.is_empty() {
             self.lra.record_cross_theory_reasons_from_lits(reason);
         }
+        // #lia-dive-repair: interface mutation invalidates witnesses.
+        self.direct_enum_witness = None;
         self.shared_disequalities.push((lhs, rhs, reason.to_vec()));
 
         // #certora-diseq-epoch: a shared disequality changes neither `terms`
@@ -997,6 +1065,10 @@ impl TheorySolver for LiaSolver<'_> {
         let mut stats = vec![
             ("lia_checks", self.check_count),
             ("lia_conflicts", self.conflict_count),
+            (
+                "lia_unjustified_conflicts",
+                self.unjustified_conflicts_dropped,
+            ),
             ("lia_propagations", self.propagation_count),
             (
                 "lia_affine_min_core_attempts",
@@ -1028,7 +1100,7 @@ impl LiaSolver<'_> {
         if depth == 0 {
             return false;
         }
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(_) => true,
             TermData::App(sym, args) if matches!(sym.name(), "+" | "-" | "*") => args
                 .iter()
@@ -1042,7 +1114,7 @@ impl LiaSolver<'_> {
     /// variable / is not one of those relations. Used by the `#C3b` immediate
     /// contradiction check.
     fn ground_arith_atom_truth(&self, term: TermId) -> Option<bool> {
-        let TermData::App(sym, args) = self.terms.get(term) else {
+        let TermData::App(sym, args) = self.terms().get(term) else {
             return None;
         };
         if args.len() != 2 {

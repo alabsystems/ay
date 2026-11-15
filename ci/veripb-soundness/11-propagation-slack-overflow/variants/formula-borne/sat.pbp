@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Companion for `formula-borne.opb`, NOT run by the gate: the same checker,
+% the same formula, a logged model. Answers `s VERIFIED SATISFIABLE`, exit 0.
+f 2 ;
+sol ~x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

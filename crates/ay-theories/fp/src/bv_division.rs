@@ -41,6 +41,9 @@
 use ay_core::term::{Symbol, TermId};
 use ay_core::CnfLit;
 
+use crate::construction::control::{uninterrupted, BuildControl};
+use crate::construction::FpBuildStage;
+
 use super::FpSolver;
 
 /// The five SMT-LIB division/remainder operators [`FpSolver::bv_div_family`]
@@ -82,33 +85,75 @@ impl FpSolver<'_> {
         args: &[TermId],
         expected_sz: usize,
     ) -> Option<Vec<CnfLit>> {
-        let op = BvDivOp::from_name(sym.name())?;
-        if args.len() != 2
-            || self.bv_width(args[0])? != expected_sz
-            || self.bv_width(args[1])? != expected_sz
-        {
-            return None;
-        }
-        let lhs = self.bitblast_bv_value(args[0], expected_sz)?;
-        let rhs = self.bitblast_bv_value(args[1], expected_sz)?;
-        Some(self.bv_div_family(op, &lhs, &rhs))
+        uninterrupted(|control| {
+            self.bitblast_bv_div_app_with_control(sym, args, expected_sz, control)
+        })
+    }
+
+    pub(crate) fn bitblast_bv_div_app_with_control<C: BuildControl>(
+        &mut self,
+        sym: &Symbol,
+        args: &[TermId],
+        expected_sz: usize,
+        control: &mut C,
+    ) -> Result<Option<Vec<CnfLit>>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        let result = (|| -> Result<Option<Vec<CnfLit>>, C::Error> {
+            let Some(op) = BvDivOp::from_name(sym.name()) else {
+                return Ok(None);
+            };
+            if args.len() != 2 {
+                return Ok(None);
+            }
+            if self.bv_width(args[0]) != Some(expected_sz)
+                || self.bv_width(args[1]) != Some(expected_sz)
+            {
+                return Ok(None);
+            }
+            let Some(lhs) = self.bitblast_bv_value_with_control(args[0], expected_sz, control)?
+            else {
+                return Ok(None);
+            };
+            let Some(rhs) = self.bitblast_bv_value_with_control(args[1], expected_sz, control)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(
+                self.bv_div_family_with_control(op, &lhs, &rhs, control)?,
+            ))
+        })()?;
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        Ok(result)
     }
 
     /// Emit the circuit for `op` over already-blasted operand bits.
     ///
     /// See the module docs for what is proven and where.
     pub(crate) fn bv_div_family(&mut self, op: BvDivOp, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
+        uninterrupted(|control| self.bv_div_family_with_control(op, a, b, control))
+    }
+
+    pub(crate) fn bv_div_family_with_control<C: BuildControl>(
+        &mut self,
+        op: BvDivOp,
+        a: &[CnfLit],
+        b: &[CnfLit],
+        control: &mut C,
+    ) -> Result<Vec<CnfLit>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let n = a.len();
         debug_assert_eq!(n, b.len());
         debug_assert!(n > 0);
 
         if matches!(op, BvDivOp::Udiv | BvDivOp::Urem) {
-            let (quot, rem) = self.bv_udiv_urem(a, b);
-            return if matches!(op, BvDivOp::Udiv) {
+            let (quot, rem) = self.bv_udiv_urem_with_control(a, b, control)?;
+            let result = if matches!(op, BvDivOp::Udiv) {
                 quot
             } else {
                 rem
             };
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            return Ok(result);
         }
 
         // Signed operators: normalise to magnitudes, divide unsigned, fix signs.
@@ -118,9 +163,10 @@ impl FpSolver<'_> {
         let neg_b = self.bv_neg(b);
         let abs_a = self.make_ite_bits(msb_a, &neg_a, a);
         let abs_b = self.make_ite_bits(msb_b, &neg_b, b);
-        let (quot, rem) = self.bv_udiv_urem(&abs_a, &abs_b);
+        let (quot, rem) = self.bv_udiv_urem_with_control(&abs_a, &abs_b, control)?;
 
-        match op {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let result = match op {
             BvDivOp::Udiv | BvDivOp::Urem => unreachable!("handled above"),
             BvDivOp::Sdiv => {
                 // Negate the quotient iff the operand signs differ.
@@ -134,7 +180,9 @@ impl FpSolver<'_> {
                 self.make_ite_bits(msb_a, &neg_rem, &rem)
             }
             BvDivOp::Smod => self.bv_smod_fixup(msb_a, msb_b, &rem, b),
-        }
+        };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// The `bvsmod` sign fix-up: the SMT-LIB nested `ite`, built innermost out.

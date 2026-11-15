@@ -8,6 +8,7 @@
 // This loads the wasm module (NOT a native dylib) and drives genuine solves
 // through it, then checks the verdicts and models the solver returns. Run:
 //
+//   # STOCK EXCEPTION: Trust seal 9192 has no wasm32-unknown-unknown std (2026-09-28: E0463).
 //   cargo build --release --target wasm32-unknown-unknown \
 //       -p ay-ffi --lib --no-default-features
 //   node bindings/js/test-wasm.mjs

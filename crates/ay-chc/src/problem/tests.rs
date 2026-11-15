@@ -51,7 +51,7 @@ fn datatype_feature_detection_includes_constraint_only_locals() {
 
 #[test]
 fn datatype_feature_detection_includes_typed_local_without_registry() {
-    let constructors = std::sync::Arc::new(vec![crate::ChcDtConstructor {
+    let constructors = crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
         name: "typed-box".to_string(),
         selectors: vec![crate::ChcDtSelector {
             name: "typed-box-value".to_string(),
@@ -343,7 +343,7 @@ fn typed_function_problem(
 fn validation_box_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "ValidationBox".to_string(),
-        constructors: Arc::new(vec![crate::ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
             name: "mkValidationBox".to_string(),
             selectors: vec![crate::ChcDtSelector {
                 name: "validationPayload".to_string(),
@@ -1067,6 +1067,13 @@ mod clause_simplification_tests {
         independently_built.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
             false,
         ))));
+        assert_ne!(
+            independently_built.pruned_false_query_ids()[0],
+            ids[0],
+            "even an untagged clause binds the source's final action registry"
+        );
+        independently_built.declare_action("step");
+        assert_eq!(independently_built.action_names(), problem.action_names());
         assert_eq!(independently_built.pruned_false_query_ids()[0], ids[0]);
     }
 

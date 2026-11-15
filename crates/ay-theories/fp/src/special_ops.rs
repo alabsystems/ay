@@ -4,7 +4,12 @@
 
 //! Remaining FP operations: remainder, min, and max.
 
+mod truncating;
+
 use ay_core::CnfLit;
+
+use crate::construction::control::{uninterrupted, BuildControl};
+use crate::construction::FpBuildStage;
 
 use super::{FpDecomposed, FpPrecision, FpSolver, RoundingMode};
 
@@ -22,22 +27,63 @@ struct RemSpecialCases {
 struct RemCore {
     rndd: FpDecomposed,
     adj_cnd: CnfLit,
-    b_sgn: CnfLit,
 }
 
 impl FpSolver<'_> {
     /// IEEE 754 remainder: `fp.rem(x, y)`.
     pub fn make_rem(&mut self, x: &FpDecomposed, y: &FpDecomposed) -> FpDecomposed {
+        uninterrupted(|control| self.make_rem_with_control(x, y, control))
+    }
+
+    pub(crate) fn make_rem_with_control<C: BuildControl>(
+        &mut self,
+        x: &FpDecomposed,
+        y: &FpDecomposed,
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let precision = x.precision;
         let special_cases = self.rem_special_cases(x, y);
-        let core = self.rem_round_down_candidate(x, y);
-        let signs_differ = self.make_xor(core.rndd.sign, core.b_sgn);
-        let rounded_add = self.make_add(&core.rndd, y, RoundingMode::RNE);
-        let rounded_sub = self.make_sub(&core.rndd, y, RoundingMode::RNE);
-        let adjusted = self.make_ite_fp(signs_differ, &rounded_add, &rounded_sub, precision);
+        if [
+            special_cases.c1,
+            special_cases.c2,
+            special_cases.c3,
+            special_cases.c4,
+            special_cases.c5,
+            special_cases.c6,
+        ]
+        .into_iter()
+        .any(|condition| self.known_literal_value(condition) == Some(true))
+        {
+            // A known-true selector makes the entire special-case ITE chain
+            // independent of its normal candidate. Preserve that exact chain
+            // and its precedence, using zero for the discarded candidate.
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            let result =
+                self.rem_apply_special_cases(x, &special_cases, &special_cases.pzero, precision);
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            let result = self.rem_fix_zero_sign(x, &result, precision);
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            return Ok(result);
+        }
+        let core = self.rem_round_down_candidate(x, y, control)?;
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        // The selected adjustment is always rndd minus a divisor carrying
+        // rndd's sign. If the original signs differ, negating this aligned
+        // divisor gives the original addend; otherwise it gives the original
+        // subtrahend's negation. One RNE operation therefore covers both arms.
+        let mut aligned_divisor = y.clone();
+        aligned_divisor.sign = core.rndd.sign;
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let adjusted = self.make_sub(&core.rndd, &aligned_divisor, RoundingMode::RNE);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let base = self.make_ite_fp(core.adj_cnd, &adjusted, &core.rndd, precision);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let result = self.rem_apply_special_cases(x, &special_cases, &base, precision);
-        self.rem_fix_zero_sign(x, &result, precision)
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let result = self.rem_fix_zero_sign(x, &result, precision);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     fn rem_special_cases(&mut self, x: &FpDecomposed, y: &FpDecomposed) -> RemSpecialCases {
@@ -69,17 +115,42 @@ impl FpSolver<'_> {
         }
     }
 
-    fn rem_round_down_candidate(&mut self, x: &FpDecomposed, y: &FpDecomposed) -> RemCore {
+    fn rem_round_down_candidate<C: BuildControl>(
+        &mut self,
+        x: &FpDecomposed,
+        y: &FpDecomposed,
+        control: &mut C,
+    ) -> Result<RemCore, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let precision = x.precision;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
-        let (a_sgn, a_sig, a_exp, a_lz) = self.unpack(x, true);
-        let (b_sgn, b_sig, b_exp, b_lz) = self.unpack(y, true);
+        let (a_sgn, mut a_sig, a_exp, a_lz) = self.unpack(x, true);
+        let (_, mut b_sig, b_exp, b_lz) = self.unpack(y, true);
 
-        let a_exp_ext = self.sign_extend(&a_exp, 2);
-        let b_exp_ext = self.sign_extend(&b_exp, 2);
-        let a_lz_ext = self.zero_extend(&a_lz, 2);
-        let b_lz_ext = self.zero_extend(&b_lz, 2);
+        // Normalization places every nonzero significand in [2^(sb-1),2^sb).
+        // This normal candidate is discarded for either zero operand by the
+        // existing special-case selectors, so its leading bits may always be
+        // canonical ones. Keep the original operands/classifiers untouched:
+        // this is an IEEE normalization invariant under those guards, never a
+        // guess about a SAT assignment. In particular the restoring divider
+        // can now simplify its leading zero rows against a known positive MSB.
+        let one = self.const_true();
+        if let Some(top) = a_sig.last_mut() {
+            *top = one;
+        }
+        if let Some(top) = b_sig.last_mut() {
+            *top = one;
+        }
+
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        // Signed, `eb + 2` bits (z3's) unless the exponent difference or the
+        // remainder's rounding needs more (`rem_exponent_width`).
+        let rw = Self::rem_exponent_width(eb, sb);
+        let a_exp_ext = self.sign_extend(&a_exp, rw - eb);
+        let b_exp_ext = self.sign_extend(&b_exp, rw - eb);
+        let a_lz_ext = self.zero_extend(&a_lz, rw - a_lz.len());
+        let b_lz_ext = self.zero_extend(&b_lz, rw - b_lz.len());
         let a_eff_exp = self.bv_sub(&a_exp_ext, &a_lz_ext);
         let b_eff_exp = self.bv_sub(&b_exp_ext, &b_lz_ext);
         let exp_diff = self.bv_sub(&a_eff_exp, &b_eff_exp);
@@ -106,27 +177,47 @@ impl FpSolver<'_> {
         // so `8R = T` when `T < 8*b_sig` and `8R = T - 8*b_sig` otherwise, and
         // `Q` is odd exactly when `T >= 8*b_sig`. The result is exact (no
         // intermediate rounding), matching the wide-divide encoding bit for bit.
-        let (rndd_sig, quot_odd) = self.rem_modular_reduce(&a_sig, &b_sig, &exp_diff, eb, sb);
+        let (rndd_sig, quot_odd) =
+            self.rem_modular_reduce(&a_sig, &b_sig, &exp_diff, eb, sb, control)?;
 
-        let adj_cnd = self.rem_adjustment_condition(quot_odd, &rndd_sig, &b_sig, eb);
-        let rndd = self.fp_round(precision, RoundingMode::RNE, a_sgn, &rndd_sig, &b_eff_exp);
-        RemCore {
-            rndd,
-            adj_cnd,
-            b_sgn,
-        }
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let adj_cnd = self.rem_adjustment_condition(quot_odd, &rndd_sig, &b_sig, rw);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let rndd = self.fp_round(
+            precision,
+            RoundingMode::RNE.into(),
+            a_sgn,
+            &rndd_sig,
+            &b_eff_exp,
+        );
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(RemCore { rndd, adj_cnd })
     }
 
     /// Multiply-modulo: returns `(x * y) mod m`, all values `< m`, width `= m.len()`.
-    fn mulmod(&mut self, x: &[CnfLit], y: &[CnfLit], m: &[CnfLit]) -> Vec<CnfLit> {
-        let wm = m.len();
-        let dw = 2 * wm;
-        let xw = self.zero_extend(x, dw - x.len());
-        let yw = self.zero_extend(y, dw - y.len());
-        let prod = self.bv_mul(&xw, &yw);
-        let mw = self.zero_extend(m, dw - wm);
-        let (_, rem) = self.bv_udiv_urem(&prod, &mw);
-        rem[..wm].to_vec()
+    fn mulmod<C: BuildControl>(
+        &mut self,
+        x: &[CnfLit],
+        y: &[CnfLit],
+        m: &[CnfLit],
+        control: &mut C,
+    ) -> Result<Vec<CnfLit>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        // These modular states have the modulus width. Literal powers of two
+        // need only low product bits; other divisors retain the full product.
+        debug_assert_eq!(x.len(), m.len());
+        debug_assert_eq!(y.len(), m.len());
+        if let Some(power) = self.rem_literal_power_with_control(m, control)? {
+            let result = self.rem_low_product_with_control(x, y, power, control)?;
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            return Ok(result);
+        }
+        let product = self.rem_full_product_with_control(x, y, control)?;
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let result = self.rem_narrow_remainder_with_control(&product, m, control)?;
+        drop(product);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Double-modulo: returns `(2 * p) mod m`, given `p < m`, width `= m.len()`.
@@ -143,14 +234,16 @@ impl FpSolver<'_> {
 
     /// Exact bounded computation of `(rndd_sig, quot_odd)` (see caller). Returns
     /// `rndd_sig = 8*R` (width `sb+4`) and the quotient-parity bit.
-    fn rem_modular_reduce(
+    fn rem_modular_reduce<C: BuildControl>(
         &mut self,
         a_sig: &[CnfLit],
         b_sig: &[CnfLit],
         exp_diff: &[CnfLit],
         eb: usize,
         sb: usize,
-    ) -> (Vec<CnfLit>, CnfLit) {
+        control: &mut C,
+    ) -> Result<(Vec<CnfLit>, CnfLit), C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let wm = sb + 4;
         let false_lit = self.const_false();
         // M2 = 16 * b_sig  (< 2^(sb+4)), MB = 8 * b_sig, both width wm.
@@ -174,16 +267,30 @@ impl FpSolver<'_> {
 
         // Positive branch: T_pos = A * (2^exp_diff mod M2) mod M2 via
         // square-and-multiply over the bits of exp_diff (MSB first).
-        let mut p = self.const_bv(1, wm); // 2^0 mod M2
-        for i in (0..exp_diff.len()).rev() {
-            p = self.mulmod(&p, &p, &m2); // square
-            let doubled = self.double_mod(&p, &m2);
-            p = self.make_ite_bits(exp_diff[i], &doubled, &p);
-        }
-        let t_pos = self.mulmod(&a8, &p, &m2);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let t_pos = if let Some(power) = self.rem_literal_power_with_control(&m2, control)? {
+            // A*2^e modulo 2^k is the low k bits of A shifted left by e.
+            // The signed-negative branch below ignores this unsigned result.
+            self.rem_power_scale_with_control(&a8, exp_diff, power, control)?
+        } else if let Some(width) = Self::rem_direct_shift_width(wm, exp_diff.len()) {
+            // The narrow-exponent/wide-significand case has fewer restoring
+            // rows as one exact shifted numerator than repeated full products.
+            // No guessed operand value or exponent bound licenses this choice.
+            self.rem_direct_scale_with_control(&a8, exp_diff, &m2, width, control)?
+        } else {
+            let mut p = self.const_bv(1, wm); // 2^0 mod M2
+            for i in (0..exp_diff.len()).rev() {
+                control.checkpoint(self.construction_progress(FpBuildStage::RemainderExponent))?;
+                p = self.mulmod(&p, &p, &m2, control)?; // square
+                let doubled = self.double_mod(&p, &m2);
+                p = self.make_ite_bits(exp_diff[i], &doubled, &p);
+            }
+            self.mulmod(&a8, &p, &m2, control)?
+        };
 
         // Negative branch: right-shift A by |exp_diff| (lossy, keeping the guard
         // bits), staying `< M2` so no reduction is needed before the MB step.
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let neg_exp_diff = self.bv_neg(exp_diff);
         let t_neg = self.bv_lshr(&a8, &neg_exp_diff);
 
@@ -196,7 +303,8 @@ impl FpSolver<'_> {
         let t_minus_mb = self.bv_sub(&t, &mb);
         let rndd_sig = self.make_ite_bits(quot_odd, &t_minus_mb, &t); // width wm = sb+4
         let _ = eb;
-        (rndd_sig, quot_odd)
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok((rndd_sig, quot_odd))
     }
 
     fn rem_adjustment_condition(
@@ -204,11 +312,12 @@ impl FpSolver<'_> {
         quot_odd: CnfLit,
         rndd_sig: &[CnfLit],
         b_sig: &[CnfLit],
-        eb: usize,
+        width: usize,
     ) -> CnfLit {
-        let rndd_sig_lz = self.bv_leading_zeros(rndd_sig, eb + 2);
-        let one_lz = self.const_bv(1, eb + 2);
-        let two_lz = self.const_bv(2, eb + 2);
+        // `width` holds the count, up to `sb + 4` (`rem_exponent_width`).
+        let rndd_sig_lz = self.bv_leading_zeros(rndd_sig, width);
+        let one_lz = self.const_bv(1, width);
+        let two_lz = self.const_bv(2, width);
         let rndd_exp_eq_y_exp = self.make_bv_eq(&rndd_sig_lz, &one_lz);
         let rndd_exp_eq_y_exp_m1 = self.make_bv_eq(&rndd_sig_lz, &two_lz);
 

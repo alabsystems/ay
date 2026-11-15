@@ -5,23 +5,64 @@
 mod adapter_api;
 pub mod backward;
 mod clause_db;
+mod construct;
 mod propagation;
 mod rat;
 mod rup_deps;
 pub mod sr;
 mod sr_reduct_core;
+mod steps;
 mod types;
 
+pub use construct::CheckerConstructionError;
 pub use sr::SrChecker;
 pub use types::{ConcludeFailure, ConcludeResult, Stats};
 pub(crate) use types::{Visit, Watch};
 
-use crate::drat_parser::ProofStep;
 use crate::error::DratCheckError;
 use crate::literal::Literal;
 use rustc_hash::FxHashMap;
+use std::collections::TryReserveError;
 
 const INITIAL_HASH_CAPACITY: usize = 1024;
+
+/// Largest clause hash table, in buckets. Beyond it the table stops doubling
+/// and chains grow longer instead: bucket count affects lookup speed only,
+/// never which clause a lookup finds. 2^27 buckets (a 3 GiB bucket array)
+/// keep the load factor at most one up to 134M live clauses.
+const MAX_HASH_CAPACITY: usize = 1 << 27;
+
+/// Why the dense per-variable arrays could not be grown to cover a variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DenseRefusal {
+    /// The variable index lies beyond [`MAX_DENSE_VARS`].
+    OutOfEnvelope,
+    /// The variable lies inside the envelope, but the allocator refused the
+    /// growth of the dense arrays (or the requested universe).
+    AllocationFailed,
+}
+
+impl DenseRefusal {
+    /// The step error for a clause mentioning `variable` that was refused.
+    pub(super) fn step_error(self, variable: usize, step: u64) -> DratCheckError {
+        match self {
+            Self::OutOfEnvelope => DratCheckError::VariableOutOfRange {
+                variable,
+                maximum: MAX_DENSE_VARS,
+                step,
+            },
+            Self::AllocationFailed => DratCheckError::DenseAllocationFailed { variable, step },
+        }
+    }
+
+    /// The conclusion failure once a clause could not be stored.
+    fn conclude_failure(self) -> ConcludeFailure {
+        match self {
+            Self::OutOfEnvelope => ConcludeFailure::VariableOutOfRange,
+            Self::AllocationFailed => ConcludeFailure::DenseAllocationFailed,
+        }
+    }
+}
 
 /// Largest dense variable universe accepted by the checker frontends.
 ///
@@ -29,6 +70,69 @@ const INITIAL_HASH_CAPACITY: usize = 1024;
 /// The ceiling matches AY's supported 58.6M-variable competition giant while
 /// rejecting the former 268M-variable worst-case envelope before allocation.
 pub const MAX_DENSE_VARS: usize = 1 << 26;
+
+/// The dense arrays indexed by variable or by literal code, allocated
+/// together by [`DratChecker::new`].
+#[derive(Default)]
+struct DenseArrays {
+    assigns: Vec<Option<bool>>,
+    watches: Vec<Vec<Watch>>,
+    occ_lists: Vec<Vec<usize>>,
+    marks: Vec<bool>,
+    reasons: Vec<Option<usize>>,
+    conflict_marked: Vec<bool>,
+}
+
+impl DenseArrays {
+    /// Allocate every array for `num_vars` variables (`2 * num_vars` literal
+    /// slots), or `None` if the literal count overflows or the allocator
+    /// refuses any of them.
+    fn try_alloc(num_vars: usize) -> Option<Self> {
+        let num_lits = num_vars.checked_mul(2)?;
+        Some(Self {
+            assigns: try_filled(None, num_vars)?,
+            watches: try_filled(Vec::new(), num_lits)?,
+            occ_lists: try_filled(Vec::new(), num_lits)?,
+            marks: try_filled(false, num_lits)?,
+            reasons: try_filled(None, num_vars)?,
+            conflict_marked: try_filled(false, num_vars)?,
+        })
+    }
+}
+
+/// Reserve room for `v` to reach length `len` without reallocating, or
+/// report the allocator's refusal. A vector already that long is left as is.
+///
+/// The reservation is amortized (`try_reserve`, not `try_reserve_exact`):
+/// proofs that introduce extension variables grow the universe one variable
+/// at a time, and exact reservations would reallocate every array on every
+/// new variable (quadratic copying on an allocator that cannot grow in
+/// place). Peak capacity is what the former infallible `resize` reserved.
+fn try_reserve_to<T>(v: &mut Vec<T>, len: usize) -> Result<(), TryReserveError> {
+    match len.checked_sub(v.len()) {
+        Some(additional) => v.try_reserve(additional),
+        None => Ok(()),
+    }
+}
+
+/// Pad `v` with copies of `elem` up to length `len` (no-op when already that
+/// long). After [`try_reserve_to`] for the same `len` this never reallocates.
+fn fill_to<T: Clone>(v: &mut Vec<T>, len: usize, elem: T) {
+    if let Some(additional) = len.checked_sub(v.len()) {
+        v.extend(std::iter::repeat_n(elem, additional));
+    }
+}
+
+/// `len` copies of `elem`, or `None` if the allocator refuses the buffer.
+///
+/// The buffer is reserved up front with `try_reserve_exact`, so filling it
+/// never reallocates: this is `vec![elem; len]` with a fallible allocation.
+pub(super) fn try_filled<T: Clone>(elem: T, len: usize) -> Option<Vec<T>> {
+    let mut filled = Vec::new();
+    filled.try_reserve_exact(len).ok()?;
+    filled.extend(std::iter::repeat_n(elem, len));
+    Some(filled)
+}
 
 /// Forward DRAT checker.
 ///
@@ -53,6 +157,19 @@ pub struct DratChecker {
     /// Diagnostic clients may keep using the clause database, but an
     /// authoritative proof conclusion must then fail closed.
     authority_tainted: bool,
+    /// Set permanently (to the first refusal) when a clause could not be
+    /// stored because the dense arrays could not cover one of its variables:
+    /// it lies outside the dense envelope ([`MAX_DENSE_VARS`]), or the
+    /// allocator refused the growth. The database then lacks a clause of the
+    /// formula or derivation, so an authoritative proof conclusion must fail
+    /// closed. Also set by [`Self::new`] when the allocator refuses the
+    /// requested variable universe.
+    dense_refusal: Option<DenseRefusal>,
+    /// Test-only fault injection: the number of further dense-array
+    /// reservations [`Self::ensure_capacity`] may make before the next one is
+    /// refused as if by the allocator. `None` (the default) never refuses.
+    #[cfg(test)]
+    reservations_before_refusal: Option<usize>,
     /// The bulk `verify` API is intentionally one-shot. Reusing a checker would
     /// otherwise carry clauses or an earlier contradiction into a new problem.
     bulk_verify_started: bool,
@@ -109,6 +226,9 @@ impl DratChecker {
         if self.stats.failures > 0 {
             return ConcludeResult::Failed(ConcludeFailure::StepFailures);
         }
+        if let Some(refusal) = self.dense_refusal {
+            return ConcludeResult::Failed(refusal.conclude_failure());
+        }
         if self.authority_tainted {
             return ConcludeResult::Failed(ConcludeFailure::UncheckedAdapterMutation);
         }
@@ -118,41 +238,45 @@ impl DratChecker {
         ConcludeResult::Verified
     }
 
+    /// Create a checker for variables `0..num_vars`.
+    ///
+    /// The dense per-variable and per-literal arrays are allocated fallibly.
+    /// If the allocator refuses them (or `2 * num_vars` overflows), the
+    /// checker starts with an empty universe and fails every conclusion
+    /// closed instead of aborting the process or panicking with a capacity
+    /// overflow: [`ConcludeFailure::VariableOutOfRange`] for a universe
+    /// beyond [`MAX_DENSE_VARS`], [`ConcludeFailure::DenseAllocationFailed`]
+    /// for one inside it.
     pub fn new(num_vars: usize, check_rat: bool) -> Self {
-        Self {
+        let (num_vars, dense, dense_refusal) = match DenseArrays::try_alloc(num_vars) {
+            Some(dense) => (num_vars, dense, None),
+            None if num_vars > MAX_DENSE_VARS => {
+                (0, DenseArrays::default(), Some(DenseRefusal::OutOfEnvelope))
+            }
+            None => (
+                0,
+                DenseArrays::default(),
+                Some(DenseRefusal::AllocationFailed),
+            ),
+        };
+        Self::from_arrays(
             num_vars,
-            assigns: vec![None; num_vars],
-            trail: Vec::new(),
-            propagate_cursor: 0,
-            watches: vec![Vec::new(); num_vars * 2],
-            occ_lists: vec![Vec::new(); num_vars * 2],
-            clauses: Vec::new(),
-            free_clause_slots: Vec::new(),
-            hash_buckets: vec![Vec::new(); INITIAL_HASH_CAPACITY],
-            live_clauses: 0,
-            inconsistent: false,
-            authority_tainted: false,
-            bulk_verify_started: false,
-            stats: Stats::default(),
-            check_rat,
-            marks: vec![false; num_vars * 2],
-            reasons: vec![None; num_vars],
-            bcp_conflict_cidx: None,
-            conflict_marked: vec![false; num_vars],
-            conflict_marked_dirty: Vec::new(),
-            scratch_resolvent: Vec::new(),
-            clause_match_counts: FxHashMap::default(),
-            clause_match_consumed: Vec::new(),
-            core_first: false,
-            prep: false,
-            simplify_buf: Vec::new(),
-        }
+            dense,
+            vec![Vec::new(); INITIAL_HASH_CAPACITY],
+            if check_rat {
+                construct::CheckMode::Rat
+            } else {
+                construct::CheckMode::Drup
+            },
+            dense_refusal,
+        )
     }
 
     /// Start one authoritative bulk verification on pristine checker state.
     pub(super) fn begin_bulk_verify(&mut self) -> Result<(), DratCheckError> {
         if self.bulk_verify_started
             || self.authority_tainted
+            || self.dense_refusal.is_some()
             || !self.clauses.is_empty()
             || !self.trail.is_empty()
             || self.inconsistent
@@ -164,16 +288,94 @@ impl DratChecker {
         Ok(())
     }
 
-    pub(super) fn ensure_capacity(&mut self, var_idx: usize) {
-        if var_idx >= self.num_vars {
-            let new_num_vars = var_idx + 1;
-            self.assigns.resize(new_num_vars, None);
-            self.watches.resize(new_num_vars * 2, Vec::new());
-            self.occ_lists.resize(new_num_vars * 2, Vec::new());
-            self.marks.resize(new_num_vars * 2, false);
-            self.reasons.resize(new_num_vars, None);
-            self.conflict_marked.resize(new_num_vars, false);
-            self.num_vars = new_num_vars;
+    /// Grow the dense per-variable arrays to cover variable index `var_idx`.
+    ///
+    /// Returns [`DenseRefusal::OutOfEnvelope`], leaving the checker's
+    /// contents unchanged, when `var_idx` lies beyond both the current
+    /// universe and [`MAX_DENSE_VARS`]. The frontends refuse such variables
+    /// before parsing a proof; this refusal covers the library API, where one
+    /// literal of variable `Variable::MAX_ID` would otherwise demand two
+    /// 2^32-entry watch arrays (~200GB) and abort.
+    ///
+    /// Inside the envelope the growth is still up to 2^27 slots of 24 bytes
+    /// per literal array (~3 GiB each), so it is fallible: every array is
+    /// reserved before any is filled, and an allocator refusal returns
+    /// [`DenseRefusal::AllocationFailed`] with every array length (and the
+    /// universe) unchanged, instead of aborting the process with the arrays
+    /// out of step. Callers record the refusal and fail closed.
+    pub(super) fn ensure_capacity(&mut self, var_idx: usize) -> Result<(), DenseRefusal> {
+        if var_idx < self.num_vars {
+            return Ok(());
+        }
+        if var_idx >= MAX_DENSE_VARS {
+            return Err(DenseRefusal::OutOfEnvelope);
+        }
+        // `var_idx < MAX_DENSE_VARS = 2^26`, so neither step can overflow and
+        // every array stays below 2^27 entries.
+        let new_num_vars = var_idx + 1;
+        let new_num_lits = new_num_vars * 2;
+        if self.try_reserve_dense(new_num_vars, new_num_lits).is_err() {
+            return Err(DenseRefusal::AllocationFailed);
+        }
+        fill_to(&mut self.assigns, new_num_vars, None);
+        fill_to(&mut self.watches, new_num_lits, Vec::new());
+        fill_to(&mut self.occ_lists, new_num_lits, Vec::new());
+        fill_to(&mut self.marks, new_num_lits, false);
+        fill_to(&mut self.reasons, new_num_vars, None);
+        fill_to(&mut self.conflict_marked, new_num_vars, false);
+        self.num_vars = new_num_vars;
+        Ok(())
+    }
+
+    /// Record that a clause could not be stored because of `refusal`. The
+    /// first refusal sticks and fails every later conclusion closed.
+    pub(super) fn record_dense_refusal(&mut self, refusal: DenseRefusal) {
+        self.dense_refusal.get_or_insert(refusal);
+    }
+
+    /// Reserve every dense array for `num_vars` variables and `num_lits`
+    /// literal slots, stopping at the first allocator refusal. Lengths (and
+    /// so the checker's observable state) are untouched either way.
+    fn try_reserve_dense(
+        &mut self,
+        num_vars: usize,
+        num_lits: usize,
+    ) -> Result<(), TryReserveError> {
+        let len = self.reservation_len(num_vars);
+        try_reserve_to(&mut self.assigns, len)?;
+        let len = self.reservation_len(num_lits);
+        try_reserve_to(&mut self.watches, len)?;
+        let len = self.reservation_len(num_lits);
+        try_reserve_to(&mut self.occ_lists, len)?;
+        let len = self.reservation_len(num_lits);
+        try_reserve_to(&mut self.marks, len)?;
+        let len = self.reservation_len(num_vars);
+        try_reserve_to(&mut self.reasons, len)?;
+        let len = self.reservation_len(num_vars);
+        try_reserve_to(&mut self.conflict_marked, len)
+    }
+
+    /// The length one dense-array reservation asks for: `len` itself.
+    #[cfg(not(test))]
+    #[inline]
+    fn reservation_len(&mut self, len: usize) -> usize {
+        len
+    }
+
+    /// The length one dense-array reservation asks for. Under test fault
+    /// injection ([`Self::reservations_before_refusal`]) an exhausted budget
+    /// asks for `usize::MAX` elements, which the real `try_reserve` refuses
+    /// without touching the vector: the same error path an allocator refusal
+    /// takes.
+    #[cfg(test)]
+    fn reservation_len(&mut self, len: usize) -> usize {
+        match self.reservations_before_refusal.as_mut() {
+            None => len,
+            Some(0) => usize::MAX,
+            Some(budget) => {
+                *budget -= 1;
+                len
+            }
         }
     }
 
@@ -231,7 +433,7 @@ impl DratChecker {
     /// Check if `clause` is RUP (Reverse Unit Propagation) implied:
     /// assume the negation of each literal, propagate, check for conflict.
     pub(super) fn check_rup(&mut self, clause: &[Literal]) -> bool {
-        self.stats.checks += 1;
+        self.stats.checks = self.stats.checks.saturating_add(1);
         self.bcp_conflict_cidx = None;
         if self.inconsistent {
             return true;
@@ -255,228 +457,6 @@ impl DratChecker {
         self.backtrack(saved);
         !no_conflict
     }
-
-    fn process_unit(&mut self, lit: Literal) {
-        match self.value(lit) {
-            Some(true) => {}
-            Some(false) => self.inconsistent = true,
-            None => {
-                self.assign(lit);
-                if !self.propagate() {
-                    self.inconsistent = true;
-                }
-            }
-        }
-    }
-
-    /// O(n) tautology check using per-literal markers (drat-trim pattern).
-    /// Callers must ensure_capacity() for all literals before calling.
-    pub(super) fn is_tautology(&mut self, clause: &[Literal]) -> bool {
-        let mut found = false;
-        for &lit in clause {
-            if self.marks[lit.negated().index()] {
-                found = true;
-                break;
-            }
-            self.marks[lit.index()] = true;
-        }
-        for &lit in clause {
-            self.marks[lit.index()] = false;
-        }
-        found
-    }
-
-    pub(super) fn add_clause_internal(&mut self, clause: &[Literal]) {
-        for &lit in clause {
-            self.ensure_capacity(lit.variable().index());
-        }
-        // Filter falsified literals into a retained scratch buffer to avoid
-        // per-call heap allocation (#5626, allocation #3).
-        //
-        // Take the buffer out of `self` to avoid borrow-checker conflicts:
-        // the filter closure needs `self.assigns` (via `value`) while `extend`
-        // needs `&mut buf`. Putting it back after is zero-cost (just pointer swap).
-        let mut buf = std::mem::take(&mut self.simplify_buf);
-        buf.clear();
-        buf.extend(
-            clause
-                .iter()
-                .copied()
-                .filter(|&lit| self.value(lit) != Some(false)),
-        );
-        if self.is_tautology(&buf) {
-            self.simplify_buf = buf;
-            return;
-        }
-        if buf.iter().any(|&lit| self.value(lit) == Some(true)) {
-            self.simplify_buf = buf;
-            return;
-        }
-        match buf.len() {
-            0 => {
-                self.simplify_buf = buf;
-                self.inconsistent = true;
-            }
-            1 => {
-                let unit = buf[0];
-                let owned = buf.clone();
-                self.simplify_buf = buf;
-                self.process_unit(unit);
-                self.insert_clause(owned);
-            }
-            _ => {
-                let owned = buf.clone();
-                self.simplify_buf = buf;
-                self.insert_clause(owned);
-            }
-        }
-    }
-
-    // -- Public API --
-
-    /// Add an original (input formula) clause. No RUP/RAT check.
-    pub fn add_original(&mut self, clause: &[Literal]) {
-        if self.inconsistent {
-            return;
-        }
-        self.stats.original += 1;
-        self.add_clause_internal(clause);
-    }
-
-    /// Add a derived clause. Returns `Ok(())` if RUP (or RAT) implied.
-    pub fn add_derived(&mut self, clause: &[Literal]) -> Result<(), DratCheckError> {
-        if self.inconsistent && !clause.is_empty() {
-            self.stats.additions += 1;
-            return Ok(());
-        }
-        self.stats.additions += 1;
-        for &lit in clause {
-            self.ensure_capacity(lit.variable().index());
-        }
-        if self.is_tautology(clause) {
-            return Ok(());
-        }
-        if self.check_rup(clause) {
-            self.add_clause_internal(clause);
-            return Ok(());
-        }
-        if self.check_rat && !clause.is_empty() && self.check_rat_for_clause(clause) {
-            self.add_clause_internal(clause);
-            return Ok(());
-        }
-        self.stats.failures += 1;
-        let lits: Vec<_> = clause.iter().map(ToString::to_string).collect();
-        Err(DratCheckError::NotImplied {
-            clause: format!("{lits:?}"),
-            step: self.stats.additions,
-            kind: if self.check_rat { "RUP/RAT " } else { "RUP " },
-        })
-    }
-
-    /// Delete a clause from the database.
-    ///
-    /// Pseudo-unit protection (drat-trim.c:806-814): if the clause is the
-    /// current propagation reason for its first literal, the deletion is
-    /// silently ignored. Deleting a reason clause would corrupt the BCP
-    /// trail -- the literal was assigned because of this clause, and removing
-    /// it while keeping the assignment breaks the invariant that every
-    /// assigned literal has a valid reason.
-    pub fn delete_clause(&mut self, clause: &[Literal]) {
-        self.stats.deletions += 1;
-        for &lit in clause {
-            self.ensure_capacity(lit.variable().index());
-        }
-        let hash = Self::hash_clause(clause);
-        let bucket = self.bucket_idx(hash);
-        if let Some(cidx) = self.find_clause_idx(clause) {
-            // Pseudo-unit check: if this clause is the reason for its first
-            // literal's assignment, skip the deletion (drat-trim.c:807).
-            if self.is_reason_for_first_lit(cidx) {
-                self.stats.pseudo_unit_skips += 1;
-                return;
-            }
-            if let Some(bucket_pos) = self.hash_buckets[bucket]
-                .iter()
-                .position(|&candidate| candidate == cidx)
-            {
-                self.hash_buckets[bucket].swap_remove(bucket_pos);
-            }
-            self.unlink_clause(cidx);
-            self.live_clauses -= 1;
-        } else {
-            self.stats.missed_deletes += 1;
-        }
-    }
-
-    /// Check if a clause is the propagation reason for its first literal.
-    ///
-    /// drat-trim.c:807: `S->reason[abs(lemmas[0])] - 1 == lemmas - S->DB`
-    /// Our BCP engine reorders clause[0] to the propagated literal
-    /// (propagation.rs visit_clause/visit_long), matching drat-trim.c:212.
-    pub(super) fn is_reason_for_first_lit(&self, cidx: usize) -> bool {
-        let clause = match &self.clauses[cidx] {
-            // Top-level unit clauses are assigned without a reason index.
-            // Refuse to delete a currently satisfied unit anyway: retaining a
-            // redundant clause is always safe, while unlinking it and keeping
-            // the assignment makes later RUP/RAT checks unsound.
-            Some(c) if c.len() == 1 => return self.value(c[0]) == Some(true),
-            Some(c) if c.len() >= 2 => c,
-            _ => return false,
-        };
-        let var_idx = clause[0].variable().index();
-        var_idx < self.reasons.len() && self.reasons[var_idx] == Some(cidx)
-    }
-
-    /// Verify a complete proof against a formula on a fresh checker.
-    ///
-    /// This bulk API is one-shot: reusing a checker could bind retained clauses
-    /// or an earlier contradiction to a different formula, so every later call
-    /// fails closed. Incremental diagnostic users should use the individual
-    /// adapter methods and must not treat that state as proof authority.
-    pub fn verify(
-        &mut self,
-        clauses: &[Vec<Literal>],
-        steps: &[ProofStep],
-    ) -> Result<(), DratCheckError> {
-        self.begin_bulk_verify()?;
-        for clause in clauses {
-            self.add_original(clause);
-        }
-        if self.inconsistent {
-            return match self.conclude_unsat() {
-                ConcludeResult::Verified => Ok(()),
-                ConcludeResult::Failed(reason) => Err(DratCheckError::from(reason)),
-            };
-        }
-        for (i, step) in steps.iter().enumerate() {
-            match step {
-                ProofStep::Add(lits) => {
-                    self.add_derived(lits)
-                        .map_err(|e| DratCheckError::StepFailed {
-                            step: i + 1,
-                            source: Box::new(e),
-                        })?;
-                }
-                ProofStep::Delete(lits) => {
-                    self.delete_clause(lits);
-                }
-                ProofStep::AddPr { clause, .. } => {
-                    // PR/DPR additions are outside the RUP/RAT trusted fragment.
-                    // Fail closed: never silently accept an unverified PR step.
-                    return Err(DratCheckError::StepFailed {
-                        step: i + 1,
-                        source: Box::new(DratCheckError::UnsupportedPr {
-                            clause: format!("{clause:?}"),
-                        }),
-                    });
-                }
-            }
-        }
-        match self.conclude_unsat() {
-            ConcludeResult::Verified => Ok(()),
-            ConcludeResult::Failed(reason) => Err(DratCheckError::from(reason)),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -491,6 +471,8 @@ mod tests;
 mod tests_algorithm_audit;
 #[cfg(test)]
 mod tests_coverage;
+#[cfg(test)]
+mod tests_dense_envelope;
 #[cfg(test)]
 mod tests_performance;
 #[cfg(test)]

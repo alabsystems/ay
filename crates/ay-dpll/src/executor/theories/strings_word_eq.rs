@@ -1435,6 +1435,16 @@ impl Executor {
                 other => other,
             };
 
+            // With no witness assignments, the isolated solve contains exactly
+            // the original assertions. Its UNSAT result therefore proves the
+            // original query, unlike rejection of a nonempty guessed witness.
+            if assumptions.is_empty() && matches!(&result, Ok(SolveResult::Unsat(_))) {
+                self.pivot_enum_depth -= 1;
+                self.solve_deadline.set(saved_deadline);
+                self.last_assumption_core = saved_last_assumption_core;
+                return result.map(Some);
+            }
+
             if let Ok(SolveResult::Sat) = result {
                 self.merge_explicit_string_assignments_into_model(&assumptions);
                 // Materialize witnesses for any OTHER string variables at the

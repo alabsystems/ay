@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use ay_chc::{
-    ChcCheckedReplayRun, ChcProofArtifactDigest, ChcProofRunStopReason,
-    ChcProofRunWithBudgetReport, ChcPrunedQueryObligationId, ChcQueryObligationId,
-    VerifiedChcResult, NORMALIZED_CHC_INPUT_SCHEMA,
+    normalized_chc_input_schema_of, ChcCheckedReplayRun, ChcProofArtifactDigest,
+    ChcProofRunStopReason, ChcProofRunWithBudgetReport, ChcPrunedQueryObligationId,
+    ChcQueryObligationId, VerifiedChcResult,
 };
 
 use crate::{EncodeError, Result};
@@ -266,6 +266,7 @@ impl QueryObligationProofReportRow {
 #[must_use = "multi-query proof reports must be inspected"]
 pub struct QueryObligationBatchProofReport {
     source_normalized_input: String,
+    source_normalized_input_schema: &'static str,
     source_normalized_input_sha256: String,
     source_normalized_input_bytes: u64,
     source_query_count: usize,
@@ -286,14 +287,13 @@ impl QueryObligationBatchProofReport {
         rows: Vec<QueryObligationProofReportRow>,
         total_elapsed: Duration,
     ) -> Result<Self> {
-        if !source_normalized_input
-            .strip_prefix(NORMALIZED_CHC_INPUT_SCHEMA)
-            .is_some_and(|remainder| remainder.starts_with('\n'))
-        {
+        let Some(source_normalized_input_schema) =
+            normalized_chc_input_schema_of(&source_normalized_input)
+        else {
             return Err(EncodeError::Chc(ay_chc::ChcError::Internal(
                 "query proof report source is not canonical normalized CHC input".to_string(),
             )));
-        }
+        };
         let source_descriptor = ChcProofArtifactDigest::from_bytes(
             "source-normalized-chc-input",
             source_normalized_input.as_bytes(),
@@ -332,6 +332,7 @@ impl QueryObligationBatchProofReport {
         }
 
         let obligation_set = identity::obligation_set_identity(
+            source_normalized_input_schema,
             &source_normalized_input_sha256,
             source_normalized_input_bytes,
             source_pruned_false_query_ids,
@@ -340,6 +341,7 @@ impl QueryObligationBatchProofReport {
         );
         Ok(Self {
             source_normalized_input,
+            source_normalized_input_schema,
             source_normalized_input_sha256,
             source_normalized_input_bytes,
             source_query_count,
@@ -350,6 +352,11 @@ impl QueryObligationBatchProofReport {
             rows,
             total_elapsed,
         })
+    }
+
+    /// Schema the normalized aggregate CHC input names on its first line.
+    pub fn source_normalized_input_schema(&self) -> &'static str {
+        self.source_normalized_input_schema
     }
 
     /// SHA-256 of the exact aggregate CHC problem supplied to the batch API.
@@ -492,6 +499,7 @@ fn stop_reason_code(reason: ChcProofRunStopReason) -> &'static str {
         ChcProofRunStopReason::BudgetExhausted => "budget-exhausted",
         ChcProofRunStopReason::ExternallyCancelled => "externally-cancelled",
         ChcProofRunStopReason::Inconclusive => "inconclusive",
+        ChcProofRunStopReason::EffortExhausted => "effort-exhausted",
         _ => "unclassified",
     }
 }

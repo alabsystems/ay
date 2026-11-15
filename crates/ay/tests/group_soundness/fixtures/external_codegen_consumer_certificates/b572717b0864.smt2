@@ -1,0 +1,8 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const recon_src1 (_ BitVec 32))
+(declare-const recon_src2 (_ BitVec 32))
+(assert (not (= (bvxor (bvmul (_ bv2 32) recon_src2) recon_src1) (bvxor (bvshl recon_src2 (_ bv1 32)) recon_src1))))
+(check-sat)
+(exit)

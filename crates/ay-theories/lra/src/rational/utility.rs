@@ -62,10 +62,15 @@ impl Rational {
     }
 
     /// Check if the rational is an integer (denominator == 1).
+    ///
+    /// Zero is an integer whatever denominator it is spelled with. The
+    /// `Small` invariant makes that spelling `0/1`, and `normalize_small`
+    /// enforces it, but `is_zero` already tolerates `Small(0, d)` -- so this
+    /// does too, rather than reading a non-canonical zero as a fraction.
     #[inline]
     pub fn is_integer(&self) -> bool {
         match self {
-            Self::Small(_, 1) => true,
+            Self::Small(0, _) | Self::Small(_, 1) => true,
             Self::Small(_, _) => false,
             Self::Big(br) => br.is_integer(),
         }
@@ -163,8 +168,9 @@ impl Rational {
             Self::Small(n, d) => {
                 let q = n / d;
                 let r = n % d;
+                // The adjustment is done in `BigInt`, which cannot overflow.
                 if r < 0 {
-                    BigInt::from(q - 1)
+                    BigInt::from(q) - 1
                 } else {
                     BigInt::from(q)
                 }
@@ -188,7 +194,8 @@ impl Rational {
             Self::Small(n, d) => {
                 let q = n / d;
                 let r = n % d;
-                Some(if r < 0 { q - 1 } else { q })
+                // Never `None` for `d > 0` (see above); checked all the same.
+                Some(if r < 0 { q.checked_sub(1)? } else { q })
             }
             Self::Big(_) => None,
         }
@@ -207,7 +214,8 @@ impl Rational {
             Self::Small(n, d) => {
                 let q = n / d;
                 let r = n % d;
-                Some(if r > 0 { q + 1 } else { q })
+                // Never `None` for `d > 0` (see `floor_int`); checked all the same.
+                Some(if r > 0 { q.checked_add(1)? } else { q })
             }
             Self::Big(_) => None,
         }
@@ -220,8 +228,9 @@ impl Rational {
             Self::Small(n, d) => {
                 let q = n / d;
                 let r = n % d;
+                // The adjustment is done in `BigInt`, which cannot overflow.
                 if r > 0 {
-                    BigInt::from(q + 1)
+                    BigInt::from(q) + 1
                 } else {
                     BigInt::from(q)
                 }

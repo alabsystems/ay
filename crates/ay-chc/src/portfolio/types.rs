@@ -470,13 +470,13 @@ pub struct PortfolioConfig {
     /// Per-portfolio term memory budget in bytes (#8629).
     ///
     /// When `Some(bytes)`, the portfolio divides this budget equally across
-    /// the concrete workers that may be live at once. This overrides the
-    /// global `TermStore::per_engine_budget()` for those worker threads.
+    /// the concrete workers that may be live at once. This replaces those
+    /// workers' fallback shares; the global term-memory guard still applies.
     /// It does not isolate aggregate RSS across nested or concurrent
     /// portfolios, and validation may use separate solver state.
     ///
-    /// When `None` (default), per-engine budgets fall back to the global
-    /// `TermStore::per_engine_budget()`.
+    /// When `None` (default), the configured global term-memory limit is
+    /// snapshotted and divided by this portfolio's own worker capacity.
     pub(crate) memory_budget: Option<usize>,
     /// External cooperative-cancellation parent token (item 5).
     ///
@@ -830,9 +830,9 @@ impl PortfolioConfig {
     /// Compute the per-engine term memory budget for this portfolio (#8629).
     ///
     /// When `self.memory_budget` is `Some(bytes)`, divides the budget equally
-    /// across the engines that may run concurrently. Otherwise falls back to the global
-    /// `TermStore::per_engine_budget()` (which divides the process-level limit
-    /// by engine count).
+    /// across the engines that may run concurrently. Otherwise snapshots the
+    /// configured global term-memory limit and divides it by this schedule's
+    /// worker capacity, independently of other portfolios' engine counts.
     ///
     /// This scopes the configured term budget across the live workers of one
     /// concrete portfolio. It is not a complete process-wide RSS envelope:
@@ -841,8 +841,9 @@ impl PortfolioConfig {
         if let Some(total_bytes) = self.memory_budget {
             Some(total_bytes / concurrent_engines.max(1))
         } else {
-            // Fall back to global per-engine budget.
-            Some(ay_core::TermStore::per_engine_budget())
+            Some(ay_core::TermStore::per_engine_budget_for(
+                concurrent_engines,
+            ))
         }
     }
 
@@ -883,17 +884,7 @@ impl From<TpaResult> for PortfolioResult {
                 }
                 Self::Safe(model)
             }
-            TpaResult::Unsafe { steps, trace: _ } => {
-                let step_count = steps.min(100) as usize;
-                let cex_steps = (0..=step_count)
-                    .map(|_| CounterexampleStep::new(crate::PredicateId(0), FxHashMap::default()))
-                    .collect();
-                Self::Unsafe(Counterexample {
-                    steps: cex_steps,
-                    witness: None,
-                    ground_derivation: None,
-                })
-            }
+            TpaResult::Unsafe { counterexample, .. } => Self::Unsafe(counterexample),
             TpaResult::Unknown => Self::Unknown,
         }
     }
@@ -916,6 +907,7 @@ impl From<CegarResult> for PortfolioResult {
                 Self::Unsafe(Counterexample {
                     steps,
                     witness: None,
+                    compact_derivation: None,
                     ground_derivation: None,
                 })
             }

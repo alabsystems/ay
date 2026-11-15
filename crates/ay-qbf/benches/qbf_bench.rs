@@ -7,8 +7,9 @@
 //! Benchmarks QCIR and QDIMACS solving performance.
 //! Requires benchmark files in `benchmarks/qbf/`.
 
+use ay_criterion_main::criterion_main;
 use ay_qbf::{parse_qdimacs, QbfSolver};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 use std::fs;
 use std::path::PathBuf;
 

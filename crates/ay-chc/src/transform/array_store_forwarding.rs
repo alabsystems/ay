@@ -420,6 +420,10 @@ fn mentions_any_var(expr: &ChcExpr, defs: &FxHashMap<ChcVar, ChcExpr>) -> bool {
             return true;
         }
         maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => lambda
+                .captures()
+                .iter()
+                .any(|value| inner(value, defs, depth + 1)),
             ChcExpr::Var(v) => defs.contains_key(v),
             ChcExpr::Bool(_)
             | ChcExpr::Int(_)
@@ -440,6 +444,20 @@ fn mentions_any_var(expr: &ChcExpr, defs: &FxHashMap<ChcVar, ChcExpr>) -> bool {
 /// all? Without one, nothing can fold. Depth-cap hits answer `false` (the
 /// clause-size gate skips such clauses anyway).
 fn mentions_store_or_const_array(expr: &ChcExpr) -> bool {
+    // DAG form (WP-F F0b): exact when no path reaches the depth cut-off.
+    if crate::expr::dag::prefer_dag_walk(expr, MAX_EXPR_RECURSION_DEPTH) {
+        use crate::expr::dag::Step;
+        let mut found = false;
+        crate::expr::dag::walk_distinct_preorder(expr, |e| match e {
+            ChcExpr::Op(ChcOp::Store, _) | ChcExpr::ConstArray(_, _) => {
+                found = true;
+                Step::Stop
+            }
+            ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::FuncApp(..) => Step::Descend,
+            _ => Step::Skip,
+        });
+        return found;
+    }
     fn inner(expr: &ChcExpr, depth: usize) -> bool {
         if depth >= MAX_EXPR_RECURSION_DEPTH {
             return false;

@@ -11,7 +11,9 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::Sort;
 
 use super::types::Term;
-use super::Solver;
+use super::{Solver, SolverError};
+
+mod fallible;
 
 /// Describes the kind of a term node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,7 @@ impl Solver {
     /// opaque handle. Use this method when you need the term's reconstructed
     /// expression, including variables, constants, applications, lets, and
     /// quantifiers.
+    /// Bounded field-numeral rendering refusal returns an SMT-LIB error response.
     ///
     /// # Panics
     ///
@@ -57,11 +60,16 @@ impl Solver {
     #[must_use]
     pub fn format_term(&self, term: Term) -> String {
         let id = self.require_term("format_term", term);
-        self.executor.format_term(id)
+        if self.executor.terms().finite_field_presence(id) == Some(false) {
+            self.executor.format_term(id)
+        } else {
+            self.executor
+                .checked_evaluation_output(|| self.executor.format_term(id))
+        }
     }
 
     /// Format a term as SMT-LIB text, or `None` if `term` does not index a
-    /// live node in this solver's term store.
+    /// live node in this solver's term store or bounded rendering refuses.
     ///
     /// Unlike [`format_term`](Self::format_term), which panics on a stale or
     /// foreign handle, this bounds-checks the handle first and returns `None`
@@ -70,8 +78,27 @@ impl Solver {
     /// string rather than unwind a panic across the C boundary.
     #[must_use]
     pub fn format_term_checked(&self, term: Term) -> Option<String> {
+        self.format_term_checked_with_bindings(term, |_| false)
+    }
+
+    /// Format a term while avoiding both native bindings and the caller's
+    /// additional public declaration namespace when spelling field numerals.
+    /// Foreign/stale handles and bounded rendering refusal return `None`.
+    pub fn format_term_checked_with_bindings(
+        &self,
+        term: Term,
+        mut occupied: impl FnMut(&str) -> bool,
+    ) -> Option<String> {
         let id = self.resolve_term("format_term_checked", term).ok()?;
-        Some(self.executor.format_term(id))
+        let needs_check = self.executor.terms().finite_field_presence(id) != Some(false);
+        if needs_check {
+            self.executor.check_evaluation_read().ok()?;
+        }
+        let text = self.executor.format_term_in_namespace(id, &mut occupied);
+        if needs_check {
+            self.executor.check_evaluation_read().ok()?;
+        }
+        Some(text)
     }
 
     /// Serialize the current assertion stack as a self-contained SMT-LIB2
@@ -82,6 +109,106 @@ impl Solver {
     #[must_use]
     pub fn to_smtlib2(&self) -> String {
         self.executor.to_smtlib2()
+    }
+
+    /// Surface names of the declared symbols (constants and function heads)
+    /// that occur in the DAGs under `roots`, as `get-model` prints them.
+    ///
+    /// A model printed by this solver lists every symbol declared on it. The
+    /// Z3 C API runs several logical solvers over one engine, so it restricts
+    /// each handle's published model to the symbols of that handle's goal with
+    /// this set. Matching covers both the surface name and the internal
+    /// identity of an overloaded or builtin-colliding declaration. Only FREE
+    /// occurrences count: a variable bound by an enclosing quantifier, `let`
+    /// or lambda (`lambda-array`) is not a symbol of the goal, even when the API built it from a
+    /// declared constant of the same name (the Z3 C API's `Z3_mk_forall_const`
+    /// binds named constants), so `exists q0. q0 < 0` does not list `q0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SolverError`](super::types::SolverError) if a root is not a
+    /// live term of this solver.
+    pub fn declared_symbols_in(
+        &self,
+        roots: &[Term],
+    ) -> Result<std::collections::BTreeSet<String>, super::types::SolverError> {
+        let terms = self.terms();
+        // Binder scopes: (enclosing scope, names bound here). Scope 0 is the
+        // top level; a binder's body is walked in a fresh child scope, and a
+        // term is visited once per scope it occurs in.
+        let mut scopes: Vec<(usize, Vec<&str>)> = vec![(0, Vec::new())];
+        fn is_bound(scopes: &[(usize, Vec<&str>)], mut scope: usize, name: &str) -> bool {
+            while scope != 0 {
+                let (parent, names) = &scopes[scope];
+                if names.iter().any(|bound| *bound == name) {
+                    return true;
+                }
+                scope = *parent;
+            }
+            false
+        }
+        let mut pending: Vec<(ay_core::TermId, usize)> = self
+            .resolve_terms("declared_symbols_in", roots)?
+            .into_iter()
+            .map(|id| (id, 0))
+            .collect();
+        let mut seen: ay_core::kani_compat::DetHashSet<(ay_core::TermId, usize)> =
+            ay_core::kani_compat::det_hash_set_new();
+        let mut occurring: ay_core::kani_compat::DetHashSet<&str> =
+            ay_core::kani_compat::det_hash_set_new();
+        while let Some((id, scope)) = pending.pop() {
+            if !seen.insert((id, scope)) {
+                continue;
+            }
+            match terms.get(id) {
+                TermData::Var(name, _) => {
+                    if !is_bound(&scopes, scope, name) {
+                        occurring.insert(name.as_str());
+                    }
+                }
+                TermData::App(symbol, _) => {
+                    // A lambda binds its variable (the Z3 API's
+                    // `Z3_mk_lambda_const` binds the caller's own constant):
+                    // the variable is not an occurrence, and the body is
+                    // walked with it bound.
+                    if let Some((var, body)) = terms.get_lambda_array(id) {
+                        if let TermData::Var(name, _) = terms.get(var) {
+                            scopes.push((scope, vec![name.as_str()]));
+                            pending.push((body, scopes.len() - 1));
+                            continue;
+                        }
+                    }
+                    occurring.insert(symbol.name());
+                }
+                TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                    scopes.push((scope, vars.iter().map(|(name, _)| name.as_str()).collect()));
+                    let inner = scopes.len() - 1;
+                    pending.push((*body, inner));
+                    pending.extend(triggers.iter().flatten().map(|&t| (t, inner)));
+                    continue;
+                }
+                TermData::Let(bindings, body) => {
+                    pending.extend(bindings.iter().map(|&(_, value)| (value, scope)));
+                    scopes.push((
+                        scope,
+                        bindings.iter().map(|(name, _)| name.as_str()).collect(),
+                    ));
+                    pending.push((*body, scopes.len() - 1));
+                    continue;
+                }
+                _ => {}
+            }
+            pending.extend(terms.children(id).into_iter().map(|child| (child, scope)));
+        }
+        let context = self.executor.context();
+        Ok(context
+            .symbol_iter()
+            .filter(|(surface, info)| {
+                occurring.contains(surface.as_str())
+                    || occurring.contains(context.symbol_identity_name(surface, info))
+            })
+            .map(|(surface, _)| surface.clone())
+            .collect())
     }
 
     /// Serialize the given assertion list in Z3's `Z3_solver_to_string` /
@@ -95,6 +222,32 @@ impl Solver {
     pub fn assertions_sexpr(&self, assertions: &[Term]) -> String {
         let ids = self.require_terms("assertions_sexpr", assertions);
         self.executor.assertions_sexpr_for(&ids)
+    }
+
+    /// Serialize assertions while avoiding an adapter's additional public
+    /// declaration namespace. Invalid handles or bounded rendering refusal
+    /// return `None`, without publishing a partial assertion dump.
+    pub fn assertions_sexpr_with_bindings(
+        &self,
+        assertions: &[Term],
+        mut occupied: impl FnMut(&str) -> bool,
+    ) -> Option<String> {
+        let ids = self
+            .resolve_terms("assertions_sexpr_with_bindings", assertions)
+            .ok()?;
+        let needs_check = ids
+            .iter()
+            .any(|&id| self.terms().finite_field_presence(id) != Some(false));
+        if needs_check {
+            self.executor.check_evaluation_read().ok()?;
+        }
+        let text = self
+            .executor
+            .assertions_sexpr_in_namespace(&ids, &mut occupied);
+        if needs_check {
+            self.executor.check_evaluation_read().ok()?;
+        }
+        Some(text)
     }
 
     /// Get the kind of a term, including operator info for applications.
@@ -152,13 +305,95 @@ impl Solver {
             .collect()
     }
 
+    /// Immediate public children, counted without allocating either the native
+    /// ID vector or its larger public-handle conversion. Like term_children,
+    /// quantifier patterns are not public application children.
+    pub fn try_term_child_count(&self, term: Term) -> Result<usize, SolverError> {
+        let id = self.resolve_term("term child count", term)?;
+        Ok(match self.terms().get(id) {
+            TermData::Const(_) | TermData::Var(..) => 0,
+            TermData::App(_, arguments) => arguments.len(),
+            // A Vec cannot occupy usize::MAX entries; its allocation is
+            // bounded by isize::MAX, so this extra body slot cannot overflow.
+            TermData::Let(bindings, _) => bindings.len() + 1,
+            TermData::Not(_) | TermData::Forall(..) | TermData::Exists(..) => 1,
+            TermData::Ite(..) => 3,
+            _ => {
+                return Err(SolverError::TacticFailed(
+                    "unsupported immediate-child shape".into(),
+                ))
+            }
+        })
+    }
+
+    /// Compare the exact ordered immediate children without materializing a
+    /// copy. This observes DATA only; callers that need original admission
+    /// first call try_term_child_count and prepay that work through their
+    /// retained operation BEFORE calling this comparison. No owner is minted.
+    pub fn try_term_children_match(
+        &self,
+        term: Term,
+        expected: &[Term],
+    ) -> Result<(usize, bool), SolverError> {
+        let count = self.try_term_child_count(term)?;
+        if count != expected.len() {
+            return Ok((count, false));
+        }
+        let id = self.resolve_term("term children comparison", term)?;
+        let mut position = 0;
+        let mut same = true;
+        let mut compare = |child| {
+            same &= expected[position] == self.wrap_term(child);
+            position += 1;
+        };
+        match self.terms().get(id) {
+            TermData::Const(_) | TermData::Var(..) => {}
+            TermData::App(_, arguments) => {
+                for &child in arguments {
+                    compare(child);
+                }
+            }
+            TermData::Let(bindings, body) => {
+                for (_, child) in bindings {
+                    compare(*child);
+                }
+                compare(*body);
+            }
+            TermData::Not(child)
+            | TermData::Forall(_, child, _)
+            | TermData::Exists(_, child, _) => compare(*child),
+            TermData::Ite(condition, yes, no) => {
+                compare(*condition);
+                compare(*yes);
+                compare(*no);
+            }
+            _ => {
+                return Err(SolverError::TacticFailed(
+                    "unsupported immediate-child shape".into(),
+                ))
+            }
+        }
+        Ok((count, same))
+    }
+
     /// Get the sort (type) of a term.
     ///
     /// Works for all sort kinds: Bool, Int, Real, BitVec, FloatingPoint, Array,
     /// String, Datatype, Uninterpreted, etc.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `term` is not a live handle of this solver. Use
+    /// [`Self::try_term_sort`] for a fallible version.
     #[must_use]
     pub fn term_sort(&self, term: Term) -> Sort {
         let id = self.require_term("term_sort", term);
+        self.sort_of_live_term(id)
+    }
+
+    /// The sort of an authenticated term: the one lookup `term_sort` and
+    /// `try_term_sort` share.
+    fn sort_of_live_term(&self, id: ay_core::TermId) -> Sort {
         self.var_sorts
             .get(&id)
             .cloned()
@@ -229,10 +464,10 @@ impl Solver {
     ///
     /// Rebuilds the term bottom-up through AY's simplifying constructors, which
     /// re-applies eager constant-folding and identity simplification to every
-    /// node. AY folds eagerly at construction, so terms built through the `mk_*`
-    /// API are already a fixpoint (the result is the same interned term). The
-    /// value-add is for terms whose constant/identity subexpressions were not
-    /// folded at build time (e.g. raw parser-built or consumer-assembled terms):
+    /// node. FP constructors preserve their application shape; this explicit
+    /// operation also applies the exact FP word-level rewriter used by solving.
+    /// It folds constant/identity subexpressions not folded at build time
+    /// (including raw parser-built or consumer-assembled terms):
     /// `(+ 2 3)` folds to `5`, `(and true p)` to `p`, `(+ x 0)` to `x`,
     /// `(ite true a b)` to `a`, `(select (store a i v) i)` to `v`, etc.
     ///
@@ -243,6 +478,16 @@ impl Solver {
     pub fn simplify(&mut self, term: Term) -> Term {
         let id = self.require_term("simplify", term);
         let result = self.terms_mut().simplify(id);
+        // Use the same exact FP rewrites as the solving pipeline. Constructors
+        // retain their application shape until explicit simplification; NaN's
+        // unspecified IEEE encoding remains symbolic.
+        let fp_result = ay_fp::rewriter::FpRewriter::new().rewrite(self.terms_mut(), result);
+        let result = if fp_result == result {
+            result
+        } else {
+            // An FP fold can expose a constant BV/Boolean parent.
+            self.terms_mut().simplify(fp_result)
+        };
         self.wrap_term(result)
     }
 }

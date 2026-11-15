@@ -153,6 +153,15 @@ fn expr_fallback_reason_inner(expr: &Expr) -> Option<String> {
         } => expr_fallback_reason(array)
             .or_else(|| expr_fallback_reason(index))
             .or_else(|| expr_fallback_reason(value)),
+        ExprValue::ArrayRangeCopy {
+            dst,
+            src,
+            lo,
+            hi,
+            src_start,
+        } => [dst, src, lo, hi, src_start]
+            .into_iter()
+            .find_map(expr_fallback_reason),
         // Binary array
         ExprValue::Select { array, index } => {
             expr_fallback_reason(array).or_else(|| expr_fallback_reason(index))
@@ -234,7 +243,9 @@ fn fp_or_binary_fallback_reason(expr: &Expr) -> Option<String> {
         ExprValue::FpSqrt(_, inner) | ExprValue::FpRoundToIntegral(_, inner) => {
             expr_fallback_reason(inner)
         }
-        ExprValue::FpRem(a, b) => expr_fallback_reason(a).or_else(|| expr_fallback_reason(b)),
+        ExprValue::FpRem(a, b) | ExprValue::FpTruncatingRem(a, b) => {
+            expr_fallback_reason(a).or_else(|| expr_fallback_reason(b))
+        }
         // FP constants — leaf nodes, fully supported.
         ExprValue::FpPlusInfinity { .. }
         | ExprValue::FpMinusInfinity { .. }

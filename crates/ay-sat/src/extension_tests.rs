@@ -169,6 +169,7 @@ fn solver_context_defaults_return_zero() {
     assert_eq!(ctx.decisions(), 0);
     assert_eq!(ctx.restarts(), 0);
     assert_eq!(ctx.propagations(), 0);
+    assert_eq!(ctx.search_ticks(), 0);
     assert_eq!(ctx.activity(Variable(0)), 0.0);
     assert_eq!(ctx.activity(Variable(42)), 0.0);
 }

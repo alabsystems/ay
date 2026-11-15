@@ -339,18 +339,34 @@ fn carcara_bare_linear_atom_is_supported(atom: &str) -> bool {
         )
 }
 
-/// Conservative Carcara-faithful term grammar for the authored-assume
-/// arithmetic implication bridge.
+/// How a printed `(* a b)` with no direct numeric coefficient is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrintedProductPolicy {
+    /// Carcara's `LinearComb::from_term` makes such a product ONE opaque
+    /// atom, and so does AY's linearizer once it meets a second nonconstant
+    /// factor. This is the reading required of any gate that decides whether
+    /// a published `la_generic` step is checkable, because the checker really
+    /// does accept those rows (measured on pinned carcara 1.1.0, git 9a352ee:
+    /// a three-row Farkas conflict sharing `(* i i)` checks `valid`).
+    OpaqueAtom,
+    /// Refuse the product outright. The authored-assume implication bridge
+    /// needs only sums/subtractions and direct numeric scaling, and its own
+    /// coefficient replay (`parse_lin`) declines nonlinear products anyway.
+    Refused,
+}
+
+/// Conservative Carcara-faithful term grammar.
 ///
-/// The bridge needs only ordinary sums/subtractions and direct numeric
-/// scaling.  In particular it deliberately rejects multiplication whose
-/// coefficient is computed (`(* (+ 1 1) x)`) and opaque nonlinear products:
-/// the former is interpreted differently by AY and Carcara, while the latter
-/// is unnecessary for this narrow source-to-canonical normalization lane.
+/// Multiplication whose coefficient is COMPUTED (`(* (+ 1 1) x)`) is rejected
+/// under either policy: AY and Carcara interpret it differently. A product
+/// with two structurally nonconstant factors is admitted only under
+/// [`PrintedProductPolicy::OpaqueAtom`]; see that variant for why the two
+/// callers differ.
 fn carcara_bridge_linear_term_supported(
     printed: &str,
     depth: usize,
     nodes_left: &mut usize,
+    products: PrintedProductPolicy,
 ) -> bool {
     const MAX_DEPTH: usize = 256;
     if depth > MAX_DEPTH {
@@ -377,19 +393,106 @@ fn carcara_bridge_linear_term_supported(
         return false;
     };
     let recurse = |operand: &str, nodes_left: &mut usize| {
-        carcara_bridge_linear_term_supported(operand, depth + 1, nodes_left)
+        carcara_bridge_linear_term_supported(operand, depth + 1, nodes_left, products)
     };
     match operator.as_str() {
         "+" => operands.len() >= 2 && operands.iter().all(|operand| recurse(operand, nodes_left)),
         "-" => !operands.is_empty() && operands.iter().all(|operand| recurse(operand, nodes_left)),
-        "*" => matches!(operands, [left, right]
-            if (carcara_direct_fraction(left).is_some() && recurse(right, nodes_left))
-                || (carcara_direct_fraction(right).is_some() && recurse(left, nodes_left))),
+        "*" => {
+            if matches!(operands, [left, right]
+                if (carcara_direct_fraction(left).is_some() && recurse(right, nodes_left))
+                    || (carcara_direct_fraction(right).is_some() && recurse(left, nodes_left)))
+            {
+                return true;
+            }
+            // No direct binary coefficient: the COMPLETE product is one opaque
+            // atom for Carcara. Mirror `wire_rule::carcara_linear_term_supported`
+            // exactly, including its refusal to treat a computed constant such
+            // as `(+ 1 1)` as the first of the two nonconstant factors.
+            products == PrintedProductPolicy::OpaqueAtom
+                && printed_at_least_two_definitely_nonconstant(operands, depth + 1, nodes_left)
+        }
         "/" => carcara_direct_fraction(printed).is_some(),
         // Every other application is one opaque arithmetic atom in Carcara's
         // `LinearComb::from_term`; do not recurse into its arguments.
         _ => true,
     }
+}
+
+/// Printed-text mirror of `wire_rule::ay_linear_term_definitely_nonconstant`.
+///
+/// A fail-closed witness that AY's linear parser cannot reduce the printed
+/// term to a constant. It exists only to prove that a multiplication reaches
+/// AY's "second nonconstant factor" branch and therefore becomes the complete
+/// product's opaque atom -- the same judgement the term-level grammar makes,
+/// taken over the bytes that actually ship.
+fn printed_term_definitely_nonconstant(
+    printed: &str,
+    depth: usize,
+    nodes_left: &mut usize,
+) -> bool {
+    const MAX_DEPTH: usize = 256;
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(remaining) = nodes_left.checked_sub(1) else {
+        return false;
+    };
+    *nodes_left = remaining;
+
+    let printed = printed.trim();
+    if printed.is_empty() {
+        return false;
+    }
+    if !printed.starts_with('(') {
+        // A bare token is nonconstant exactly when it is a supported symbol
+        // rather than a numeral. An unsupported spelling fails closed here.
+        return parse_numeral(printed).is_none()
+            && !printed_atom_starts_like_carcara_number(printed)
+            && carcara_bare_linear_atom_is_supported(printed);
+    }
+    let Some(parts) = split_sexpr(printed) else {
+        return false;
+    };
+    let Some((operator, operands)) = parts.split_first() else {
+        return false;
+    };
+    match operator.as_str() {
+        // A sum may evaluate to a constant, so it is never a WITNESS of
+        // nonconstancy.
+        "+" => false,
+        "-" => matches!(operands, [inner]
+            if printed_term_definitely_nonconstant(inner, depth + 1, nodes_left)),
+        "*" => printed_at_least_two_definitely_nonconstant(operands, depth + 1, nodes_left),
+        // A well-shaped quotient may become constant once AY evaluates its
+        // operands. Decline it conservatively.
+        "/" if operands.len() == 2 => false,
+        // Every other named form is AY's opaque-variable branch, hence
+        // necessarily nonconstant.
+        _ => true,
+    }
+}
+
+fn printed_at_least_two_definitely_nonconstant(
+    operands: &[String],
+    depth: usize,
+    nodes_left: &mut usize,
+) -> bool {
+    let mut found = 0_u8;
+    for operand in operands {
+        // Stop traversing a wide node as soon as the shared work allowance is
+        // exhausted, so the nominal node cap stays effective.
+        if *nodes_left == 0 {
+            return false;
+        }
+        if printed_term_definitely_nonconstant(operand, depth, nodes_left) {
+            found += 1;
+            if found == 2 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Parse exactly the direct numeric forms recognized by Carcara's
@@ -453,8 +556,13 @@ fn carcara_bridge_comparison_supported(printed: &str) -> bool {
         return false;
     }
     let mut nodes_left = 100_000;
-    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left)
-        && carcara_bridge_linear_term_supported(right, 0, &mut nodes_left)
+    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left, PrintedProductPolicy::Refused)
+        && carcara_bridge_linear_term_supported(
+            right,
+            0,
+            &mut nodes_left,
+            PrintedProductPolicy::Refused,
+        )
 }
 
 /// Whether a complete printed clause literal has exactly the relation and
@@ -464,8 +572,10 @@ fn carcara_bridge_comparison_supported(printed: &str) -> bool {
 /// a surface override may be keyed on the outer `not` node and therefore
 /// replace both relation and polarity at once. Carcara accepts an unnegated
 /// order comparison, or one `not` around an order comparison/equality. Its
-/// linearizer recognizes only binary multiplication with a direct numeric
-/// operand; computed coefficients and n-ary products remain opaque atoms.
+/// linearizer scales a binary multiplication by a DIRECT numeric operand and
+/// makes every other product one opaque atom -- so an opaque nonlinear
+/// product (`(* i i)`) is supported here, while a COMPUTED coefficient
+/// (`(* (+ 1 1) x)`) is not: AY and Carcara scale that one differently.
 pub(crate) fn carcara_printed_la_generic_literal_supported(printed: &str) -> bool {
     if !surface_audit::printed_atom_is_bounded(printed) {
         return false;
@@ -487,8 +597,13 @@ pub(crate) fn carcara_printed_la_generic_literal_supported(printed: &str) -> boo
         return false;
     }
     let mut nodes_left = 100_000;
-    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left)
-        && carcara_bridge_linear_term_supported(right, 0, &mut nodes_left)
+    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left, PrintedProductPolicy::OpaqueAtom)
+        && carcara_bridge_linear_term_supported(
+            right,
+            0,
+            &mut nodes_left,
+            PrintedProductPolicy::OpaqueAtom,
+        )
 }
 
 /// Whether Carcara can prove the exact implication `premise => conclusion`

@@ -125,7 +125,12 @@ impl DratReplayExecutionProfile {
         let concluding_empty_clause_step = steps
             .iter()
             .position(|step| matches!(step, ProofStep::Add(lits) if lits.is_empty()));
-        let replay_step_limit = concluding_empty_clause_step.map_or(steps.len(), |idx| idx + 1);
+        // `position` returns an index below `steps.len()`, so the step after it
+        // is at most `steps.len()` and the saturating form never saturates.
+        let replay_step_limit = match concluding_empty_clause_step {
+            Some(idx) => idx.saturating_add(1),
+            None => steps.len(),
+        };
         Self {
             replay_step_limit,
             concluding_empty_clause_step,
@@ -265,32 +270,30 @@ impl SequentialReplayer {
         let mut dels: usize = 0;
         let mut failure_reason: Option<String> = None;
 
-        let mut steps_replayed = 0;
-        for (idx, step) in plan
+        let mut steps_replayed: usize = 0;
+        for step in plan
             .steps
             .iter()
             .take(plan.execution_profile.replay_step_limit)
-            .enumerate()
         {
-            steps_replayed += 1;
+            // After the increment `steps_replayed` is this step's 1-based
+            // number. The loop visits at most `steps.len()` steps, so neither
+            // it nor the add/delete counters can saturate.
+            steps_replayed = steps_replayed.saturating_add(1);
             match step {
-                ProofStep::Add(lits) => match checker.add_derived(lits) {
-                    Ok(()) => add_ok += 1,
-                    Err(DratCheckError::NotImplied { clause, step, kind }) => {
-                        failure_reason = Some(format!(
-                            "step {}: clause {clause} not {kind}implied (reported step {step})",
-                            idx + 1
-                        ));
+                ProofStep::Add(lits) => {
+                    // Inspect the result by reference: moving the error out of
+                    // it would leave a partially-moved local to drop.
+                    let added = checker.add_derived(lits);
+                    if let Err(err) = &added {
+                        failure_reason = Some(add_failure_reason(steps_replayed, err));
                         break;
                     }
-                    Err(other) => {
-                        failure_reason = Some(format!("step {}: {other}", idx + 1));
-                        break;
-                    }
-                },
+                    add_ok = add_ok.saturating_add(1);
+                }
                 ProofStep::Delete(lits) => {
                     checker.delete_clause(lits);
-                    dels += 1;
+                    dels = dels.saturating_add(1);
                 }
                 // `ProofStep` is #[non_exhaustive]; any step kind this RUP/RAT
                 // replay checker does not handle — `AddPr` (PR/DPR clauses need a
@@ -299,8 +302,7 @@ impl SequentialReplayer {
                 // verified on the strength of a step we could not check.
                 other => {
                     failure_reason = Some(format!(
-                        "step {}: unsupported proof step {other:?} for the RUP/RAT replay checker",
-                        idx + 1
+                        "step {steps_replayed}: unsupported proof step {other:?} for the RUP/RAT replay checker"
                     ));
                     break;
                 }
@@ -345,6 +347,17 @@ impl SequentialReplayer {
                 failure_reason: Some(reason),
             })
         }
+    }
+}
+
+/// The failure reason for the derived step numbered `step_no` (1-based) that
+/// the checker rejected with `err`.
+fn add_failure_reason(step_no: usize, err: &DratCheckError) -> String {
+    match err {
+        DratCheckError::NotImplied { clause, step, kind } => {
+            format!("step {step_no}: clause {clause} not {kind}implied (reported step {step})")
+        }
+        other => format!("step {step_no}: {other}"),
     }
 }
 

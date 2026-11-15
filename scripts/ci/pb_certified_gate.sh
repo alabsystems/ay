@@ -18,11 +18,11 @@
 #   2. PIN       resolve the checker named by ci/veripb.pin (build it from the
 #                pinned upstream commit + the pinned patch if we do not have it),
 #                and refuse to proceed if its --version disagrees with the pin.
-#                2b builds and tests `veripb-core-proved`, the proved kernel the
-#                pinned patch now carries. It is a workspace member NOTHING
-#                depends on, so `cargo build --bin veripb` would never compile
-#                it and it would rot unnoticed. See the phase body for exactly
-#                what that does and does not establish.
+#                2b builds and tests `veripb-core-proved`, which the pinned
+#                checker depends on for its optional kernel-verification bridge.
+#                The Rust tests and symbol regression scan do not qualify that
+#                mode or check its formal proof. See the phase body for the
+#                precise boundary.
 #   3. SELFTEST  prove the resolved binary is a proof checker at all, with the
 #                shared six-probe battery in scripts/lib/veripb_verdict.sh. A
 #                version string is trivially forgeable — every fake checker in
@@ -111,8 +111,9 @@ if [ -n "${AY_PB_BIN:-}" ]; then
     echo "   source: not asserted for an external solver"
     run_solver() { "$BIN" "$@"; }
 else
-    command -v cargo >/dev/null 2>&1 || {
-        echo "ERROR: cargo is required to build the exact checked-out ay-pb" >&2
+    command -v targo >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1 || {
+        echo "ERROR: targo (or, without the Trust toolchain, cargo) is required" >&2
+        echo "       to build the exact checked-out ay-pb" >&2
         echo "       or set AY_PB_BIN explicitly to opt into an external binary" >&2
         exit 2
     }
@@ -123,12 +124,15 @@ else
         echo "       commit the source, or set AY_PB_BIN to identify an external binary" >&2
         exit 2
     }
-    expected_pkg=$(cargo pkgid -p ay-pb)
+    # veripb_cargo (scripts/lib/veripb_build_id.sh): `targo --unverified`
+    # with the Trust toolchain — the solver is a measurement subject here, the
+    # certificates are the claim — and plain cargo without it.
+    expected_pkg=$(veripb_cargo pkgid -p ay-pb)
     artifact_log=$(mktemp "${TMPDIR:-/tmp}/ay-pb-cargo-artifact.XXXXXX")
-    if ! cargo build --release -p ay-pb --bin ay-pb \
+    if ! veripb_cargo build --release -p ay-pb --bin ay-pb \
         --message-format=json-render-diagnostics >"$artifact_log"
     then
-        echo "ERROR: cargo could not build the checked-out ay-pb" >&2
+        echo "ERROR: $(veripb_cargo --version 2>/dev/null | head -1) could not build the checked-out ay-pb" >&2
         tail -50 "$artifact_log" >&2
         rm -f "$artifact_log"
         exit 2
@@ -176,7 +180,7 @@ else
         exit 2
     }
     echo "   solver: $BIN (Cargo artifact; sha256 $solver_sha)"
-    echo "   source: $source_rev (clean working tree; $(cargo --version); $(rustc --version))"
+    echo "   source: $source_rev (clean working tree; $(veripb_cargo --version); $("$(veripb_rustc_path)" --version))"
     run_solver() { "$BIN" "$@"; }
 fi
 
@@ -186,8 +190,19 @@ note_fail() { echo "FAIL $*" >&2; fail=1; }
 # ---------------------------------------------------------------- phase 2: pin
 echo "== phase 2/6: pinned checker"
 
+# ABSENT is not MISMATCHED. The public snapshot ships the pin but not the patch
+# file (a private fork's delta; publish/DECISIONS.md, 2026-09-25). With no file
+# there is no second identity to disagree with the pin: the build id below is
+# keyed by VERIPB_PATCH_SHA256 either way, and phases 3 and 4 vet whatever
+# checker is used. An absent patch cannot BUILD, so that branch refuses as
+# SETUP. A file that is present and does not match stays a hard error.
+PATCH_ABSENT=0
+if [ ! -e "$VERIPB_PATCH" ]; then
+    PATCH_ABSENT=1
+    echo "   NOTE: $VERIPB_PATCH is not in this tree; the pin's sha256 is the identity"
+fi
 actual_patch_sha=$(sha256_file "$VERIPB_PATCH" 2>/dev/null || true)
-if [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
+if [ "$PATCH_ABSENT" = 0 ] && [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
     echo "ERROR: $VERIPB_PATCH does not match VERIPB_PATCH_SHA256 in $PIN_FILE" >&2
     echo "       pin:  $VERIPB_PATCH_SHA256" >&2
     echo "       file: ${actual_patch_sha:-<could not hash>}" >&2
@@ -236,11 +251,12 @@ CACHE=${VERIPB_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"}
 # fixed the rlibs, but the tool reading them was still the wrong one. Only
 # `cargo test` runs doctests, which is why `cargo build` never showed it.
 # AY_VERIPB_RUSTC is the compiler the key names, resolved by the shared lib
-# ($RUSTC, then rustc on PATH, then the compiler_consumer sysroot's compat rustc — a
-# Trust-only machine has no bare rustc). Every cargo invocation against the
-# cache directory passes it explicitly as RUSTC so the compiler in the key is
-# provably the compiler that built (and re-tests) the artifact — otherwise
-# cargo's own resolution could drift from the fingerprinted one.
+# ($RUSTC, then the compiler_consumer sysroot's compat rustc — the compiler targo runs —
+# then, on a host without the Trust toolchain, rustc on PATH). Every build
+# against the cache directory (veripb_cargo) passes it explicitly as RUSTC so
+# the compiler in the key is provably the compiler that built (and re-tests)
+# the artifact — otherwise the frontend's own resolution could drift from the
+# fingerprinted one.
 AY_VERIPB_RUSTC=$(veripb_rustc_path) || exit 2
 
 if [ -z "${RUSTDOC:-}" ]; then
@@ -274,6 +290,12 @@ if [ -n "$CHECKER" ]; then
     echo "   using VERIPB_BIN=$CHECKER (pin build skipped; version + soundness still enforced)"
 else
     CHECKER="$BUILD_DIR/target/release/veripb"
+    if [ ! -x "$CHECKER" ] && [ "$PATCH_ABSENT" = 1 ]; then
+        echo "SETUP: no pinned build at $BUILD_DIR, and $VERIPB_PATCH is not in this" >&2
+        echo "       tree, so the pinned checker cannot be built here. Supply one with" >&2
+        echo "       VERIPB_BIN=/path/to/veripb; phases 3 and 4 then vet it." >&2
+        exit 2
+    fi
     if [ ! -x "$CHECKER" ]; then
         echo "   building pinned checker into $BUILD_DIR"
         rm -rf "$BUILD_DIR"
@@ -286,7 +308,9 @@ else
             exit 2
         }
         git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
-        ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet --bin veripb )
+        # All checker commands enter the keyed cache, so an explicit relative
+        # target also handles relative VERIPB_CACHE without following AY's target.
+        ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" veripb_cargo build --release --quiet --bin veripb --target-dir target )
     else
         echo "   reusing cached pinned build $BUILD_DIR"
     fi
@@ -307,33 +331,35 @@ echo "   checker: $CHECKER (veripb $reported; $PROVENANCE)"
 # axiom, weaken, and the RUP-to-UNSAT reduction), plus the width guards that
 # re-certify every machine-width value against unbounded Int.
 #
-# READ THIS BEFORE CITING IT. The crate is a workspace MEMBER THAT NOTHING
-# DEPENDS ON. `cargo build --bin veripb` does not compile it and the shipped
-# binary contains none of its symbols, so it decides NO verdict. Nothing in
-# phases 3-6 gets more trustworthy because this phase is green.
+# READ THIS BEFORE CITING IT. The pinned checker directly depends on this
+# crate and offers its bridge through `--kernel-verify` (default false). The
+# certificate commands below do not request that mode. Building the crate,
+# running Rust tests and scanning selected names do not check its formal proof
+# or qualify the optional bridge. Nothing in phases 3-6 gains a proof grade
+# because this phase is green.
 #
-# What this phase is for is narrower and still worth having: an artifact that
-# no build touches is an artifact that rots, and this repo has repeatedly found
-# gates that were green because they were running nothing. So the kernel is
-# compiled and its tests are run on every gate invocation, and the "it is an
-# island" claim above is MEASURED rather than asserted.
+# This phase explicitly builds and tests the crate so its Rust behavior cannot
+# rot unnoticed. The symbol scan retains the existing regression predicate,
+# but absence of selected names cannot establish absence of linked or reachable
+# code: optimization can erase those names despite the dependency and bridge.
 #
 # What it deliberately does NOT do is run `clean check` on the proof itself.
-# The Clean toolchain is a local unreleased build, not something CI can obtain
-# or pin by hash, and as committed the kernel checks 102/105 (the DIVIDE rule,
-# the RUP bridge and one arithmetic lemma fail to elaborate). Adding a proof
-# check that cannot run, or one weakened to accept 102/105, would be worse than
-# having none. Until the toolchain is pinnable AND the file checks clean, this
-# gate makes no claim about the proof — only about the crate.
+# Earlier toolchain investigations recorded partial formal checks (see the
+# retained measurements in ci/veripb.pin and ci/veripb-patches/README.md).
+# This phase's older record was 102/105: DIVIDE, the RUP bridge and one
+# arithmetic lemma failed to elaborate. The pin separately records 471/874
+# under clean 1.2.0; these are distinct historical measurements.
+# This phase neither repeats those checks nor establishes a current formal
+# verdict; it makes no claim about the proof, only about the Rust crate.
 echo "== phase 2b/6: proved kernel (veripb-core-proved) builds and its tests pass"
 if [ -n "${VERIPB_BIN:-}" ]; then
     echo "   SKIPPED: VERIPB_BIN supplied a prebuilt checker, so there is no"
-    echo "   pinned source tree here to build the kernel from. The kernel is"
-    echo "   not part of the binary either way; phases 3-6 are unaffected."
+    echo "   pinned source tree here for phase 2b. The proved-core Rust tests"
+    echo "   and optional kernel bridge are not qualified here."
 elif [ ! -d "$BUILD_DIR/veripb-core-proved" ]; then
     note_fail "[proved-core] $BUILD_DIR/veripb-core-proved is missing — the pinned patch should have created it"
 else
-    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet -p veripb-core-proved ); then
+    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" veripb_cargo build --release --quiet -p veripb-core-proved --target-dir target ); then
         echo "   built     veripb-core-proved"
     else
         note_fail "[proved-core] veripb-core-proved failed to COMPILE from the pinned patch"
@@ -341,14 +367,13 @@ else
     # island_sync (proof text in the Rust trust surface matches clean/veripb_kernel.lean)
     # and width_guards (the machine-width re-certification the kernel's checked
     # variants describe), plus the crate's own unit tests.
-    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo test --release --quiet -p veripb-core-proved ); then
+    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" veripb_cargo test --release --quiet -p veripb-core-proved --target-dir target ); then
         echo "   tested    veripb-core-proved (unit + island_sync + width_guards)"
     else
         note_fail "[proved-core] veripb-core-proved test suite FAILED"
     fi
-    # The island claim, measured. If this fires, someone wired the kernel into
-    # the checker for real — that is GOOD NEWS, and the honest response is to
-    # update this phase and ci/veripb.pin to say so, not to delete the check.
+    # Preserve the existing named-symbol regression tripwire. A changed scan
+    # needs review; neither a hit nor a miss establishes proof qualification.
     if command -v strings >/dev/null 2>&1; then
         kernel_syms=$(strings -a "$CHECKER" 2>/dev/null | grep -c 'core_proved\|VeriPbCore' || true)
         control_syms=$(strings -a "$CHECKER" 2>/dev/null | grep -c 'veripb_checker\|veripb_propagator' || true)
@@ -360,12 +385,12 @@ else
         control_syms=${control_syms:-0}
         if [ "$control_syms" -eq 0 ]; then
             echo "   NOTE: symbol scan found no veripb_checker/veripb_propagator either,"
-            echo "   so it proves nothing here; skipping the linkage assertion."
+            echo "   so the symbol regression check supplies no judgment here."
         elif [ "$kernel_syms" -eq 0 ]; then
-            echo "   linkage   0 kernel symbols in the shipped binary (control: $control_syms checker symbols)"
-            echo "             — confirms the kernel decides no verdict, as documented"
+            echo "   symbols   0 selected kernel names (control: $control_syms checker symbols)"
+            echo "             — regression scan only; no reachability or formal-proof claim"
         else
-            note_fail "[proved-core] the shipped checker now references the proved kernel ($kernel_syms symbols), but ci/veripb.pin and ci/veripb-soundness/README.md still say it is an unused island. Update them — the docs, not this check, are what is stale."
+            note_fail "[proved-core] selected kernel-name scan changed ($kernel_syms matches); review the checker build and documented trust boundary before accepting this regression. The scan does not qualify the optional bridge or its formal proof."
         fi
     fi
 fi

@@ -186,7 +186,8 @@ fn the_published_unsat_is_still_backed_by_a_certificate() {
     assert!(
         exec.last_command_unsat_was_strictly_verified()
             || exec.last_command_unsat_was_independently_verified()
-            || exec.last_command_unsat_was_exact_semantically_verified(),
+            || exec.last_command_unsat_was_exact_semantically_verified()
+            || exec.last_command_unsat_was_corroborated(),
         "the `unsat` must stay backed by a real certificate"
     );
 }

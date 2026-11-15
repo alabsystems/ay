@@ -237,7 +237,6 @@ Termination == <>(state \in {"SAT", "UNSAT"})
 
 -----------------------------------------------------------------------------
 \* Watched Literal Invariant (for 2WL scheme)
-\* This is checked at the implementation level with Kani
 -----------------------------------------------------------------------------
 
 \* For every clause of length >= 2, at least one of the first two

@@ -36,13 +36,12 @@ mod analysis;
 #[cfg(test)]
 mod tests;
 
-#[cfg(kani)]
-mod verification;
-
 pub(crate) use analysis::{
     failed_literal_dominator, failed_literal_dominator_forced_only, find_failed_literal_uip,
     hyper_binary_resolve, DominatorFailure, FailedLiteralDominatorResult,
 };
+
+mod counted;
 
 use crate::clause_arena::ClauseArena;
 use crate::literal::{Literal, Variable};

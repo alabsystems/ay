@@ -18,6 +18,30 @@ fn cond_trail_enabled() -> bool {
 }
 
 impl LraSolver {
+    /// Would `(bound, strict)` tighten `info`'s `bound_type` bound?
+    ///
+    /// The single source of the `should_update` predicate used by
+    /// `assert_var_bound[_with_reasons]`: a strictly tighter value, or the
+    /// same value with a strict bound replacing a non-strict one.
+    #[inline]
+    fn bound_tightens(
+        info: &VarInfo,
+        bound_type: BoundType,
+        bound: &Rational,
+        strict: bool,
+    ) -> bool {
+        match bound_type {
+            BoundType::Lower => match &info.lower {
+                None => true,
+                Some(e) => *bound > e.value || (*bound == e.value && strict && !e.strict),
+            },
+            BoundType::Upper => match &info.upper {
+                None => true,
+                Some(e) => *bound < e.value || (*bound == e.value && strict && !e.strict),
+            },
+        }
+    }
+
     /// #8406: Takes `Rational` instead of `BigRational` to avoid heap allocation
     /// on every bound assertion. Callers pass `Rational::zero()` for the common
     /// case of `expr <= 0` / `expr >= 0` comparisons.
@@ -108,6 +132,8 @@ impl LraSolver {
                         .map(|&(term, value)| TheoryLit::new(term, value))
                         .collect();
                     self.trivial_conflict = Some(conflict_lits);
+                    // #lra-scope-trail: the conflict lives in the current scope.
+                    self.trivial_conflict_scope = self.scopes.len();
                 }
             }
             return;
@@ -255,6 +281,7 @@ impl LraSolver {
 
         while self.vars.len() <= var as usize {
             self.vars.push(VarInfo::default());
+            self.note_phase_state_change(); // a new column (#nonlinear-phase-hints)
         }
         let info = &mut self.vars[var as usize];
 
@@ -266,29 +293,10 @@ impl LraSolver {
             );
         }
 
-        // Save old bound for backtracking (only clone the bound being modified).
-        let old_bound = match bound_type {
-            BoundType::Lower => info.lower.clone(),
-            BoundType::Upper => info.upper.clone(),
-        };
-        // #lra-inc-engine P1: default pushes unconditionally (`||` short-circuits
-        // on the flag → zero extra work, byte-identical). With --lra-cond-trail
-        // on, skip trailing a non-tightening re-assert (peek mirrors the
-        // should_update logic below) so pop replay is O(delta).
-        if !cond_trail_enabled()
-            || (match bound_type {
-                BoundType::Lower => match &info.lower {
-                    None => true,
-                    Some(e) => bound > e.value || (bound == e.value && strict && !e.strict),
-                },
-                BoundType::Upper => match &info.upper {
-                    None => true,
-                    Some(e) => bound < e.value || (bound == e.value && strict && !e.strict),
-                },
-            })
-        {
-            self.trail.push((var, bound_type, old_bound));
-        }
+        // Tightening test, computed ONCE (#bound-churn). This is the exact
+        // `should_update` predicate: strictly tighter value, or equal value
+        // with strict replacing non-strict.
+        let should_update = Self::bound_tightens(info, bound_type, &bound, strict);
         // LIA algebraic-detection memo invalidation (`bound_revision`) is
         // decided AFTER the write below, and only when the write touches a
         // TIGHT (lower == upper, non-strict) pair — the only bound state the
@@ -300,47 +308,38 @@ impl LraSolver {
             (Some(l), Some(u)) if l.value == u.value && !l.strict && !u.strict
         );
 
-        let new_bound = Bound::new(
-            bound,
-            vec![reason],
-            vec![reason_value],
-            vec![reason_scale],
-            strict,
-        );
-
-        let tightened = match bound_type {
-            BoundType::Lower => {
-                // Only update if tighter
-                let should_update = match &info.lower {
-                    None => true,
-                    Some(existing) => {
-                        new_bound.value > existing.value
-                            || (new_bound.value == existing.value
-                                && new_bound.strict
-                                && !existing.strict)
-                    }
+        // Trail + write (#bound-churn). Historically the replaced bound was
+        // CLONED for the trail unconditionally and the new `Bound` was built
+        // even when it was then dropped. The 2026-09-09 gate profile showed
+        // `Bound::clone`/`Bound::new`/`Bound` drop glue under
+        // `assert_var_bound` as a top leaf. Now:
+        //   * tightening: the old bound is MOVED into the trail (the pop
+        //     replay restores it by move, so the trail entry is the same
+        //     value it always was), and the new bound is built only here;
+        //   * non-tightening: nothing is written; the trail entry (a clone of
+        //     the unchanged bound) is pushed exactly when it was before —
+        //     unconditionally by default, skipped under --lra-cond-trail
+        //     (#lra-inc-engine P1), whose semantics are untouched.
+        // Restore semantics are byte-identical: every trail entry holds the
+        // value that was in the slot before this call.
+        let tightened = if should_update {
+            let new_bound = Bound::new(bound, [reason], [reason_value], [reason_scale], strict);
+            let slot = match bound_type {
+                BoundType::Lower => &mut info.lower,
+                BoundType::Upper => &mut info.upper,
+            };
+            let old_bound = std::mem::replace(slot, Some(new_bound));
+            self.trail.push((var, bound_type, old_bound));
+            true
+        } else {
+            if !cond_trail_enabled() {
+                let old_bound = match bound_type {
+                    BoundType::Lower => info.lower.clone(),
+                    BoundType::Upper => info.upper.clone(),
                 };
-                if should_update {
-                    info.lower = Some(new_bound);
-                }
-                should_update
+                self.trail.push((var, bound_type, old_bound));
             }
-            BoundType::Upper => {
-                // Only update if tighter
-                let should_update = match &info.upper {
-                    None => true,
-                    Some(existing) => {
-                        new_bound.value < existing.value
-                            || (new_bound.value == existing.value
-                                && new_bound.strict
-                                && !existing.strict)
-                    }
-                };
-                if should_update {
-                    info.upper = Some(new_bound);
-                }
-                should_update
-            }
+            false
         };
 
         if debug {
@@ -377,7 +376,9 @@ impl LraSolver {
             // #inc-guard-memo: a tightened bound can newly exclude the current
             // assignment — the guard must rescan.
             self.guard_clean_valid = false;
+            self.note_phase_state_change();
             self.vars_tightened_since_simplex.push(var);
+            self.tightened_writes = self.tightened_writes.wrapping_add(1);
             self.direct_bounds_changed_since_implied = true;
             self.direct_bounds_changed_vars.push(var);
             self.bcp_implied_dry_streak = 0; // #8200
@@ -473,32 +474,14 @@ impl LraSolver {
     ) -> bool {
         while self.vars.len() <= var as usize {
             self.vars.push(VarInfo::default());
+            self.note_phase_state_change(); // a new column (#nonlinear-phase-hints)
         }
         let info = &mut self.vars[var as usize];
 
-        // Save old bound for backtracking (only clone the bound being modified).
-        let old_bound = match bound_type {
-            BoundType::Lower => info.lower.clone(),
-            BoundType::Upper => info.upper.clone(),
-        };
-        // #lra-inc-engine P1: default pushes unconditionally (`||` short-circuits
-        // on the flag → zero extra work, byte-identical). With --lra-cond-trail
-        // on, skip trailing a non-tightening re-assert (peek mirrors the
-        // should_update logic below) so pop replay is O(delta).
-        if !cond_trail_enabled()
-            || (match bound_type {
-                BoundType::Lower => match &info.lower {
-                    None => true,
-                    Some(e) => bound > e.value || (bound == e.value && strict && !e.strict),
-                },
-                BoundType::Upper => match &info.upper {
-                    None => true,
-                    Some(e) => bound < e.value || (bound == e.value && strict && !e.strict),
-                },
-            })
-        {
-            self.trail.push((var, bound_type, old_bound));
-        }
+        // Same structure as `assert_var_bound` (#bound-churn): one tightening
+        // test, move-not-clone on the tightening path, historical trail
+        // behaviour (clone-and-push unless --lra-cond-trail) otherwise.
+        let should_update = Self::bound_tightens(info, bound_type, &bound, strict);
         // LIA algebraic-detection memo invalidation (`bound_revision`) is
         // decided AFTER the write below, and only when the write touches a
         // TIGHT (lower == upper, non-strict) pair — the only bound state the
@@ -510,48 +493,35 @@ impl LraSolver {
             (Some(l), Some(u)) if l.value == u.value && !l.strict && !u.strict
         );
 
-        let (reason_ids, reason_vals): (Vec<_>, Vec<_>) = reasons.iter().copied().unzip();
-        let new_bound = Bound::new(
-            bound,
-            reason_ids,
-            reason_vals,
-            reason_scales.to_vec(),
-            strict,
-        );
-
-        let tightened = match bound_type {
-            BoundType::Lower => {
-                // Only update if tighter
-                let should_update = match &info.lower {
-                    None => true,
-                    Some(existing) => {
-                        new_bound.value > existing.value
-                            || (new_bound.value == existing.value
-                                && new_bound.strict
-                                && !existing.strict)
-                    }
+        let tightened = if should_update {
+            let reason_ids: BoundReasons<TermId> = reasons.iter().map(|&(t, _)| t).collect();
+            let reason_vals: BoundReasons<bool> = reasons.iter().map(|&(_, v)| v).collect();
+            let new_bound = Bound::new(
+                bound,
+                reason_ids,
+                reason_vals,
+                reason_scales
+                    .iter()
+                    .cloned()
+                    .collect::<BoundReasons<Rational>>(),
+                strict,
+            );
+            let slot = match bound_type {
+                BoundType::Lower => &mut info.lower,
+                BoundType::Upper => &mut info.upper,
+            };
+            let old_bound = std::mem::replace(slot, Some(new_bound));
+            self.trail.push((var, bound_type, old_bound));
+            true
+        } else {
+            if !cond_trail_enabled() {
+                let old_bound = match bound_type {
+                    BoundType::Lower => info.lower.clone(),
+                    BoundType::Upper => info.upper.clone(),
                 };
-                if should_update {
-                    info.lower = Some(new_bound);
-                }
-                should_update
+                self.trail.push((var, bound_type, old_bound));
             }
-            BoundType::Upper => {
-                // Only update if tighter
-                let should_update = match &info.upper {
-                    None => true,
-                    Some(existing) => {
-                        new_bound.value < existing.value
-                            || (new_bound.value == existing.value
-                                && new_bound.strict
-                                && !existing.strict)
-                    }
-                };
-                if should_update {
-                    info.upper = Some(new_bound);
-                }
-                should_update
-            }
+            false
         };
 
         // Tight-pair-aware memo invalidation (see comment at the trail push).
@@ -573,7 +543,9 @@ impl LraSolver {
             // #inc-guard-memo: a tightened bound can newly exclude the current
             // assignment — the guard must rescan.
             self.guard_clean_valid = false;
+            self.note_phase_state_change();
             self.vars_tightened_since_simplex.push(var);
+            self.tightened_writes = self.tightened_writes.wrapping_add(1);
             self.direct_bounds_changed_since_implied = true;
             self.direct_bounds_changed_vars.push(var);
             self.bcp_implied_dry_streak = 0; // #8200

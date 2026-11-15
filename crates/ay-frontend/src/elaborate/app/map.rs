@@ -12,9 +12,20 @@
 //!
 //! The constructors stay as **opaque Map-sorted apps** (`map.insert`,
 //! `map.remove`) so the readers can push through them and update both carriers
-//! in lockstep via `store`/`select` read-through. The empty map is the
-//! constant-false-domain pair (its value carrier is an unconstrained const
-//! array; reads are gated by the false domain).
+//! in lockstep via `store`/`select` read-through. The empty map is the pair
+//! (the sort's one unconstrained value array, the constant-false domain).
+//!
+//! ## Semantics
+//!
+//! A map IS that pair: `insert(m, k, v)` stores `v` at `k` in the values and
+//! `true` at `k` in the domain, `remove(m, k)` stores `false` at `k` in the
+//! domain and leaves the values alone, `get` reads the values whether or not
+//! the key is in the domain, and two maps are equal when both carriers are.
+//! The read-through pins this — `get(insert(m, 1, v), 2) = get(m, 2)` is
+//! valid (`get_of_insert_at_other_key_is_unchanged`) — and a finite map with
+//! extensional equality would not satisfy it. Where the encoding is weaker
+//! than this semantics the SAT funnel's native-map gate withholds `sat`; where
+//! it is stronger, see the domain-carrier notes below and `LIMITATIONS.md`.
 //!
 //! - `(map.get m k)` : V — value read pushed through the constructors of `m`
 //!   (insert -> `ite(k=k', v', get(m', k))`, remove -> `get(m', k)`, var/empty
@@ -42,7 +53,7 @@
 use ay_core::term::TermData;
 use ay_core::{Sort, Symbol, TermId};
 
-use super::super::{Context, ElaborateError, PublicSort, Result, SymbolInfo};
+use super::super::{Context, DeclarationKind, ElaborateError, PublicSort, Result, SymbolInfo};
 
 /// Registered name of a map's PUBLISHED domain carrier: the constant a
 /// `(get-model)` witness prints so the model pins `map.dom` / `map.contains_key`.
@@ -54,7 +65,7 @@ const DOMAIN_CARRIER_PREFIX: &str = "__ay_map_dom!";
 const DOMAIN_FREE_PREFIX: &str = "__ay_map_dom_free!";
 
 /// Out-of-fragment / higher-order map operators emitted as opaque apps.
-const MAP_OPAQUE_OPS: &[&str] = &[
+pub(super) const MAP_OPAQUE_OPS: &[&str] = &[
     "map.values",
     "map.entries",
     "map.filter_keys",
@@ -72,8 +83,16 @@ impl Context {
         name: &str,
         arg_ids: &[TermId],
     ) -> Result<Option<TermId>> {
+        let elaborated = self.elaborate_map_op(name, arg_ids);
+        if matches!(elaborated, Ok(Some(_))) {
+            self.mark_uses_map();
+        }
+        elaborated
+    }
+
+    fn elaborate_map_op(&mut self, name: &str, arg_ids: &[TermId]) -> Result<Option<TermId>> {
         match name {
-            // get(m, k): value read, gated by the domain, pushed through the
+            // get(m, k): value read (in the domain or not), pushed through the
             // constructors of `m`.
             "map.get" => {
                 self.expect_exact_arity("map.get", arg_ids, 2)?;
@@ -179,9 +198,8 @@ impl Context {
                 self.terms.mk_ite(cond, v_prime, else_branch)
             }
             TermData::App(sym, args) if sym.name() == "map.remove" && args.len() == 2 => {
-                // remove does not change values of other keys; the value at a
-                // removed key is unconstrained but gated false by the domain, so
-                // reading through the inner map is sound.
+                // remove leaves the value array alone (see the module's
+                // Semantics): only the domain loses the key.
                 let inner = args[0];
                 self.elaborate_map_get(inner, key)
             }
@@ -210,7 +228,7 @@ impl Context {
                 self.terms.mk_store(inner_dom, k_prime, false_t)
             }
             // Empty map: the constant-false domain.
-            TermData::App(sym, _) if sym.name() == "const-array" && self.is_empty_map(map) => {
+            _ if self.is_native_empty_map(map) => {
                 let key_sort = self.map_key_sort(map);
                 let false_t = self.terms.false_term();
                 self.terms.mk_const_array(key_sort, false_t)
@@ -298,6 +316,14 @@ impl Context {
         if let Some(existing) = self.symbols.get(&carrier_name).and_then(|info| info.term) {
             return existing;
         }
+        // The chain gives congruence between maps that OWN carriers. Only a
+        // declared constant is fully described by one: a bound variable's
+        // carrier ignores the variable, and an `ite`/`select`/UF map can equal an
+        // empty map or constructor, whose domain lives only at its readers. The
+        // SAT funnel's native-map gate refuses `sat` once this is set.
+        if !self.is_declared_map_constant(map) {
+            self.mark_map_domain_unfaithful();
+        }
 
         // The free array this map falls back to when it equals no earlier map.
         // Registered so the model pins it (the chain reads through it), and
@@ -352,7 +378,7 @@ impl Context {
                 PublicSort::from_engine(sort),
                 vec![],
                 None,
-                super::super::DeclarationKind::SolverInternal,
+                DeclarationKind::SolverInternal,
             ),
         );
     }
@@ -374,14 +400,6 @@ impl Context {
             TermData::Var(name, _) => format!("{prefix}{name}!{}", map.0),
             _ => format!("{prefix}term!{}", map.0),
         }
-    }
-
-    /// Whether `map` is an empty-map value carrier: a const array whose default
-    /// value carries the empty-map marker. We treat any const-array value
-    /// carrier as having an empty (all-false) domain — a const-array Map term is
-    /// only produced by `(as map.empty (Map K V))`.
-    fn is_empty_map(&self, map: TermId) -> bool {
-        matches!(self.terms.get(map), TermData::App(sym, _) if sym.name() == "const-array")
     }
 
     /// The key (index) sort of a Map value carrier `Array(K -> V)`.

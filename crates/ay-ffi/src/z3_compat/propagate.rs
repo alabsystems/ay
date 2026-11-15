@@ -75,10 +75,12 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term, TermKind};
 
 use super::model_params::Z3_model_eval;
-use super::solver::{check_solver_handle, is_unit_literal, DimacsEncoder, Z3_solver_get_model};
+use super::solver::{
+    check_solver_handle_isolated, is_unit_literal, DimacsEncoder, Z3_solver_get_model,
+};
 use super::{
     cache_ast_vector, cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit,
-    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, ffi_try_declare_function,
+    ffi_guard_int, ffi_guard_produced, ffi_guard_ptr, ffi_guard_void, ffi_try_declare_function,
     record_ast_sort, require_term_ast, require_term_ast_or_return, term_to_ast, ParamDescr,
     ParamDescrsHandle, SymbolKey, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl,
     Z3_param_descrs, Z3_solver, Z3_sort, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE,
@@ -325,7 +327,7 @@ pub(crate) unsafe fn user_propagator_check(
         // SAFETY: scoped context borrow; released before callbacks run.
         let verdict = unsafe {
             ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
-                check_solver_handle(ctx, s, assumptions, &lemmas)
+                check_solver_handle_isolated(ctx, s, assumptions, &lemmas)
             })
         };
         if verdict != Z3_L_TRUE {
@@ -977,7 +979,7 @@ pub unsafe extern "C" fn Z3_solver_congruence_explain(
     // pointer defensively before the closure accesses context state. The ASTs
     // are opaque integer handles and are not dereferenced here.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             if a == 0 || b == 0 {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_solver_congruence_explain: null AST".to_string());
@@ -987,8 +989,7 @@ pub unsafe extern "C" fn Z3_solver_congruence_explain(
                 // Congruent with the empty explanation.
                 let t = ctx.solver.bool_const(true);
                 let ast = term_to_ast(ctx, t);
-                record_ast_sort(ctx, ast, Sort::Bool);
-                ast
+                record_ast_sort(ctx, ast, Sort::Bool)
             } else {
                 // Distinct terms are in distinct singleton classes: AY cannot
                 // (and must not) fabricate a congruence explanation.
@@ -1069,8 +1070,7 @@ pub unsafe extern "C" fn Z3_solver_cube(
                         .map(|(atom, positive)| {
                             let t = if positive { atom } else { ctx.solver.not(atom) };
                             let ast = term_to_ast(ctx, t);
-                            record_ast_sort(ctx, ast, Sort::Bool);
-                            ast
+                            record_ast_sort(ctx, ast, Sort::Bool)
                         })
                         .collect();
                     cache_ast_vector(ctx, asts)
@@ -1407,10 +1407,10 @@ pub unsafe extern "C" fn Z3_solver_solve_for(
                 if let Some(t) = solution {
                     let sort = ctx.solver.sort_of(t);
                     let t_ast = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, t_ast, sort);
+                    let t_ast = record_ast_sort(ctx, t_ast, sort);
                     let tru = ctx.solver.bool_const(true);
                     let tru_ast = term_to_ast(ctx, tru);
-                    record_ast_sort(ctx, tru_ast, Sort::Bool);
+                    let tru_ast = record_ast_sort(ctx, tru_ast, Sort::Bool);
                     solved_vars.push(var_ast);
                     solved_terms.push(t_ast);
                     solved_guards.push(tru_ast);

@@ -18,6 +18,8 @@ mod capi_finite_set_link;
 mod capi_func_interp_link;
 #[path = "group_ffi/capi_goal_probe_link.rs"]
 mod capi_goal_probe_link;
+#[path = "group_ffi/capi_model_validity_link.rs"]
+mod capi_model_validity_link;
 #[path = "group_ffi/capi_numeral_sortstruct_link.rs"]
 mod capi_numeral_sortstruct_link;
 #[path = "group_ffi/capi_optimize_link.rs"]
@@ -40,6 +42,8 @@ mod capi_z3_500_remaining_link;
 mod cpp_consumer_link;
 #[path = "group_ffi/header_coverage.rs"]
 mod header_coverage;
+#[path = "group_ffi/native_link.rs"]
+mod native_link;
 #[path = "group_ffi/soundness_5511.rs"]
 mod soundness_5511;
 #[path = "group_ffi/z3_500_typed_surface_link.rs"]

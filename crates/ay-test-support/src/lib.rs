@@ -20,9 +20,21 @@
 //! absolute host paths even though ambient home and temporary-directory
 //! variables are withheld.
 
+mod cargo_config;
 pub mod env;
+pub mod isolated_test;
+pub mod lean;
+mod nested_lane;
+#[cfg(unix)]
+pub mod sigpipe;
+pub mod trybuild_lane;
 pub mod veripb;
+pub mod z3;
 
+use cargo_config::{cargo_config_paths, reject_unbound_semantic_cargo_config};
+use nested_lane::{
+    clear_inherited_rustflags, nested_cargo_build_arguments, targo_takes_a_trust_lane, CargoDriver,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -1285,14 +1297,27 @@ impl SourceSnapshot {
     }
 }
 
+// Toolchain-selection variables survive the environment clear (defect fixed
+// 2026-09-10): the paired cargo spawned below runs with `RUSTC` pinned, but
+// rustup's toolchain choice and the Trust launcher's own switches are what
+// make that cargo the SAME toolchain the test was built with. Clearing them
+// let a bare cargo fall through to whatever `rustc` PATH offered first — on a
+// Trust machine the Homebrew stock rustc behind the aterm reroute — which
+// rejects the repo's `-Z` flags ("only accepted on the nightly compiler").
 const BUILD_ENV_PASSTHROUGH: &[&str] = &[
     "COMSPEC",
     "DEVELOPER_DIR",
     "MACOSX_DEPLOYMENT_TARGET",
     "PATH",
     "PATHEXT",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
     "SDKROOT",
     "SYSTEMROOT",
+    "TRUST_BOOTSTRAP_NO_VERIFY",
+    "TRUST_NO_MIGRATE_WARN",
+    "TRUST_REQUIRE_SEALED_LAUNCHER",
+    "TRUST_TARGO_VERIFY",
 ];
 
 const TOOL_SELECTION_ENV_PASSTHROUGH: &[&str] = &[
@@ -1309,6 +1334,7 @@ const TOOL_SELECTION_ENV_PASSTHROUGH: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InventoriedBuildContext {
     cargo: PathBuf,
+    driver: CargoDriver,
     rustc: PathBuf,
     cargo_scheduling: NestedCargoScheduling,
     environment: BTreeMap<OsString, OsString>,
@@ -1341,6 +1367,7 @@ impl NestedCargoScheduling {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PairedToolchain {
     cargo: PathBuf,
+    driver: CargoDriver,
     rustc: PathBuf,
     sysroot: PathBuf,
     host: String,
@@ -1430,6 +1457,7 @@ fn sanitized_build_environment_from(
     environment.insert("CARGO_TERM_COLOR".into(), "never".into());
     environment.insert("RUSTC".into(), rustc.as_os_str().to_owned());
     environment.insert("SOURCE_DATE_EPOCH".into(), "1".into());
+    clear_inherited_rustflags(&mut environment);
     if let Some(path) = environment.get(OsStr::new("PATH")).cloned() {
         environment.insert("PATH".into(), normalized_absolute_path(Some(&path)));
     }
@@ -1718,7 +1746,25 @@ fn resolve_paired_toolchain(workspace: &Path) -> PairedToolchain {
     let seed_path = selection_environment
         .get(OsStr::new("PATH"))
         .map(OsString::as_os_str);
-    let rustc_seed = scan_path_for_program(Path::new("rustc"), seed_path.unwrap_or_default())
+    // The cargo running this test names the toolchain the test was built with:
+    // Cargo sets `CARGO` for every test process, and a sysroot ships its rustc
+    // (or Trust's `compiler_consumer`) beside that cargo. Seed from there first; the PATH
+    // scan below is only the fallback when `CARGO` is unset. Seeding from PATH
+    // alone picked the first `rustc` on PATH, which on a Trust machine is the
+    // aterm reroute's upstream (Homebrew) rustc — a different toolchain from
+    // the one compiling the test, and one that rejects the repo's `-Z` flags.
+    let rustc_seed = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .filter(|cargo| cargo.is_file())
+        .and_then(|cargo| cargo.parent().map(Path::to_path_buf))
+        .and_then(|bin| {
+            ["rustc", "compiler_consumer"]
+                .iter()
+                .map(|name| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+                .find(|candidate| candidate.is_file())
+                .map(|candidate| absolute_program_path_preserving_final_symlink(&candidate))
+        })
+        .or_else(|| scan_path_for_program(Path::new("rustc"), seed_path.unwrap_or_default()))
         .or_else(|| {
             scan_path_for_program(
                 Path::new("compiler_consumer"),
@@ -1767,8 +1813,20 @@ fn resolve_paired_toolchain(workspace: &Path) -> PairedToolchain {
         "selected sysroot should contain its paired cargo at {}",
         cargo.display()
     );
+    // See `CargoDriver`: drive through the `targo` entry when that entry takes
+    // a Trust lane. ASK it, rather than comparing it with the sysroot's
+    // `cargo`; `targo_takes_a_trust_lane` says what byte-equality gets wrong.
+    let targo = sysroot
+        .join("bin")
+        .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+    let (cargo, driver) = match targo_takes_a_trust_lane(&targo, workspace, &selection_environment)
+    {
+        true => (targo, CargoDriver::Targo),
+        false => (cargo, CargoDriver::Cargo),
+    };
     PairedToolchain {
         cargo,
+        driver,
         rustc,
         sysroot,
         host,
@@ -1928,20 +1986,7 @@ fn sysroot_library_identity(toolchain: &PairedToolchain) -> String {
 }
 
 fn resolve_optional_program(program: &str, path: &OsStr) -> Option<PathBuf> {
-    let requested = Path::new(program);
-    for directory in std::env::split_paths(path) {
-        let candidate = directory.join(requested);
-        if candidate.is_file() {
-            return Some(absolute_program_path_preserving_final_symlink(&candidate));
-        }
-        if !std::env::consts::EXE_SUFFIX.is_empty() {
-            let candidate = directory.join(format!("{program}{}", std::env::consts::EXE_SUFFIX));
-            if candidate.is_file() {
-                return Some(absolute_program_path_preserving_final_symlink(&candidate));
-            }
-        }
-    }
-    None
+    scan_path_for_program(Path::new(program), path)
 }
 
 fn selected_external_build_tools() -> BTreeMap<String, PathBuf> {
@@ -2321,20 +2366,6 @@ fn cargo_dependency_source_identity(
     finish_build_identity(hasher)
 }
 
-fn cargo_config_paths(workspace: &Path, cargo_home: &Path) -> Vec<PathBuf> {
-    let mut candidates = BTreeSet::new();
-    for ancestor in workspace.ancestors() {
-        candidates.insert(ancestor.join(".cargo").join("config"));
-        candidates.insert(ancestor.join(".cargo").join("config.toml"));
-    }
-    candidates.insert(cargo_home.join("config"));
-    candidates.insert(cargo_home.join("config.toml"));
-    candidates
-        .into_iter()
-        .filter(|path| std::fs::symlink_metadata(path).is_ok())
-        .collect()
-}
-
 fn git_path_status(
     context: &GitContext,
     workspace: &Path,
@@ -2509,77 +2540,6 @@ fn cargo_config_is_source_bound(context: &GitContext, workspace: &Path, path: &P
     }
 }
 
-fn reject_unbound_semantic_cargo_config(path: &Path, parsed: &toml::Value) {
-    let table = parsed
-        .as_table()
-        .unwrap_or_else(|| panic!("Cargo config {} must be a TOML table", path.display()));
-    for (key, value) in table {
-        let nonsemantic = matches!(
-            key.as_str(),
-            "alias"
-                | "cache"
-                | "cargo-new"
-                | "credential-alias"
-                | "doc"
-                | "future-incompat-report"
-                | "http"
-                | "net"
-                | "registries"
-                | "registry"
-                | "term"
-        ) || (key == "env"
-            && value.as_table().is_some_and(|t| {
-                // Empty, or purely sccache cache configuration. `SCCACHE_DIR`
-                // and `SCCACHE_CACHE_SIZE` tell the wrapper where to keep its
-                // cache and how large to let it grow; they do not reach rustc
-                // and cannot change what is compiled. Same rationale as the
-                // `build.rustc-wrapper` allowance below — the workspace config
-                // directs sccache setup into a user-local config, and sccache
-                // is unusable without these. Any other env key still fails,
-                // because a build script can read it.
-                t.is_empty() || t.keys().all(|k| k.starts_with("SCCACHE_"))
-            }))
-            // `build` is semantic in general, but two of its keys are BUILD
-            // ACCELERATION rather than source identity, and the workspace's own
-            // `.cargo/config.toml` explicitly directs developers to set them in
-            // exactly this place:
-            //
-            //   "Do not set `build.rustc-wrapper` here: if `sccache` is useful on
-            //    a given machine, opt into it with `RUSTC_WRAPPER=sccache` or a
-            //    user-local Cargo config."
-            //
-            // Rejecting them here contradicted that instruction and turned three
-            // LRAT tests red on any machine following it — which on this host is
-            // not optional: the user-global sccache config was added after a
-            // kernel panic caused by uncoordinated parallel rebuilds of the same
-            // ~1,693-crate graph across worktrees.
-            //
-            // Neither key changes what the compiler is asked to build:
-            // `rustc-wrapper = sccache` is a content-addressed cache keyed on the
-            // rustc invocation (rustflags included), and `incremental` selects
-            // codegen caching, not program semantics. Any OTHER `build` key
-            // (`target`, `target-dir`, `rustflags`, `rustc`) still fails.
-            // `jobs` joined the pair 2026-08-31: the trust superproject's
-            // committed .cargo/config.toml (a5012b03c) bounds Cargo fanout with
-            // `[build] jobs = 4` on a shared-UMA machine, and cargo's ancestor
-            // discovery hands that file to every ay-inside-trust checkout.
-            // Parallelism selects scheduling, never what the compiler is asked
-            // to build, so it belongs with the cache keys, not the semantic
-            // ones. Any OTHER `build` key (`target`, `target-dir`, `rustflags`,
-            // `rustc`) still fails.
-            || (key == "build"
-                && value.as_table().is_some_and(|t| {
-                    t.keys()
-                        .all(|k| matches!(k.as_str(), "rustc-wrapper" | "incremental" | "jobs"))
-                }));
-        assert!(
-            nonsemantic,
-            "Cargo config {} is outside exact source identity but sets semantic key {key:?}; move it into the workspace or remove the override",
-            path.display()
-        );
-    }
-}
-
 fn cargo_configuration_identity(workspace: &Path, cargo_home: &Path) -> String {
     let workspace = workspace
         .canonicalize()
@@ -2684,9 +2644,20 @@ fn shared_checker_artifact_group(spec: WorkspaceBinarySpec<'_>) -> bool {
 fn workspace_invocation_identity(
     spec: WorkspaceBinarySpec<'_>,
     cargo_scheduling: NestedCargoScheduling,
+    driver: CargoDriver,
 ) -> String {
     let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"schema", b"ay-test-cargo-invocation-v2");
+    hash_component(&mut hasher, b"schema", b"ay-test-cargo-invocation-v3");
+    // Compiler-driver mode affects conditional compilation, so the lane is an
+    // input to the artifact, not just to how it was checked.
+    hash_component(
+        &mut hasher,
+        b"cargo-driver",
+        match driver {
+            CargoDriver::Cargo => b"cargo".as_slice(),
+            CargoDriver::Targo => b"targo-unverified".as_slice(),
+        },
+    );
     if shared_checker_artifact_group(spec) {
         // These two whitelisted packages have distinct output filenames and
         // identical feature/binding requirements. Their build context binds
@@ -2734,37 +2705,6 @@ fn workspace_invocation_identity(
         }
     }
     finish_build_identity(hasher)
-}
-
-fn nested_cargo_build_arguments(
-    spec: WorkspaceBinarySpec<'_>,
-    target_dir: &Path,
-    cargo_scheduling: NestedCargoScheduling,
-) -> Vec<OsString> {
-    let mut arguments = vec![OsString::from("build")];
-    if let Some(jobs) = cargo_scheduling.jobs() {
-        arguments.push("--jobs".into());
-        arguments.push(jobs.to_string().into());
-    }
-    arguments.extend(
-        [
-            "--locked",
-            "--offline",
-            "-p",
-            spec.package,
-            "--bin",
-            spec.binary,
-            "--target-dir",
-        ]
-        .into_iter()
-        .map(OsString::from),
-    );
-    arguments.push(target_dir.as_os_str().to_owned());
-    if !spec.features.is_empty() {
-        arguments.push("--features".into());
-        arguments.push(spec.features.join(",").into());
-    }
-    arguments
 }
 
 fn inventoried_build_context(
@@ -2894,7 +2834,8 @@ fn inventoried_build_context(
         source_config_policy.as_bytes(),
     );
     hash_environment(&mut hasher, &environment);
-    let invocation_identity = workspace_invocation_identity(spec, cargo_scheduling);
+    let invocation_identity =
+        workspace_invocation_identity(spec, cargo_scheduling, toolchain.driver);
     hash_component(
         &mut hasher,
         b"cargo-invocation",
@@ -2903,6 +2844,7 @@ fn inventoried_build_context(
 
     InventoriedBuildContext {
         cargo: toolchain.cargo,
+        driver: toolchain.driver,
         rustc: toolchain.rustc,
         cargo_scheduling,
         environment,
@@ -3285,6 +3227,7 @@ fn build_workspace_binary_from_snapshot(
             spec,
             &target_dir,
             build_context.cargo_scheduling,
+            build_context.driver,
         ));
     if matches!(
         spec.source_binding,
@@ -3610,10 +3553,15 @@ mod tests {
         };
 
         let parent_scheduling = NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 3 };
-        let lrat_identity = workspace_invocation_identity(lrat, parent_scheduling);
-        let drat_identity = workspace_invocation_identity(drat, parent_scheduling);
-        let other_identity =
-            workspace_invocation_identity(colliding_other_package, parent_scheduling);
+        let lrat_identity =
+            workspace_invocation_identity(lrat, parent_scheduling, CargoDriver::Cargo);
+        let drat_identity =
+            workspace_invocation_identity(drat, parent_scheduling, CargoDriver::Cargo);
+        let other_identity = workspace_invocation_identity(
+            colliding_other_package,
+            parent_scheduling,
+            CargoDriver::Cargo,
+        );
         assert_eq!(
             lrat_identity, drat_identity,
             "the distinct standalone checker outputs should reuse compiled dependencies"
@@ -3634,20 +3582,26 @@ mod tests {
             lrat_identity,
             workspace_invocation_identity(
                 lrat,
-                NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 2 }
+                NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 2 },
+                CargoDriver::Cargo
             ),
             "Cargo exposes its job count to build scripts, so the cap is an artifact input"
         );
         assert_ne!(
             lrat_identity,
-            workspace_invocation_identity(lrat, NestedCargoScheduling::CargoDefault),
+            workspace_invocation_identity(
+                lrat,
+                NestedCargoScheduling::CargoDefault,
+                CargoDriver::Cargo
+            ),
             "an explicit cap and Cargo's host-dependent default must not share provenance"
         );
         assert_ne!(
             lrat_identity,
             workspace_invocation_identity(
                 lrat,
-                NestedCargoScheduling::ExplicitPerInvocation { jobs: 3 }
+                NestedCargoScheduling::ExplicitPerInvocation { jobs: 3 },
+                CargoDriver::Cargo
             ),
             "serialized parent-envelope scheduling must be explicit in provenance"
         );
@@ -3704,56 +3658,6 @@ mod tests {
                 "invalid nested Cargo resource environment must fail closed: {entries:?}"
             );
         }
-    }
-
-    #[test]
-    fn nested_cargo_command_explicitly_applies_validated_job_cap() {
-        let spec = WorkspaceBinarySpec {
-            workspace: Path::new("."),
-            target_name: "exact",
-            package: "example-package",
-            binary: "example-binary",
-            features: &["one", "two"],
-            source_binding: SourceBinding::IdentityTarget,
-        };
-        let capped = nested_cargo_build_arguments(
-            spec,
-            Path::new("exact-target"),
-            NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 3 },
-        );
-        assert_eq!(
-            capped,
-            [
-                "build",
-                "--jobs",
-                "3",
-                "--locked",
-                "--offline",
-                "-p",
-                "example-package",
-                "--bin",
-                "example-binary",
-                "--target-dir",
-                "exact-target",
-                "--features",
-                "one,two",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
-        );
-
-        let uncapped = nested_cargo_build_arguments(
-            spec,
-            Path::new("exact-target"),
-            NestedCargoScheduling::CargoDefault,
-        );
-        assert!(
-            !uncapped
-                .iter()
-                .any(|argument| argument == OsStr::new("--jobs")),
-            "ordinary tests without a configured cap retain Cargo's default"
-        );
     }
 
     #[test]
@@ -3828,8 +3732,13 @@ mod tests {
                 OsString::from("fake-workspace-wrapper"),
             ),
             (OsString::from("RUSTFLAGS"), OsString::from("--cfg=fake")),
+            (OsString::from("RUSTDOCFLAGS"), OsString::from("--cfg=fake")),
             (
                 OsString::from("CARGO_ENCODED_RUSTFLAGS"),
+                OsString::from("--cfg=fake"),
+            ),
+            (
+                OsString::from("CARGO_ENCODED_RUSTDOCFLAGS"),
                 OsString::from("--cfg=fake"),
             ),
             (
@@ -3886,7 +3795,8 @@ mod tests {
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
             "RUSTFLAGS",
-            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "CARGO_ENCODED_RUSTDOCFLAGS",
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_TARGET",
             "CARGO_PROFILE_DEV_OPT_LEVEL",
@@ -3899,6 +3809,39 @@ mod tests {
                 "ambient override {removed} must not reach nested Cargo"
             );
         }
+    }
+
+    /// The nested lane's environment half, at the funnel that installs it.
+    ///
+    /// `nested_lane` pins what `clear_inherited_rustflags` writes; this pins
+    /// that the one environment every nested Cargo build gets actually carries
+    /// it. An ABSENT key is the failure that matters: it would let the
+    /// workspace's required build posture through from the snapshot's own
+    /// Cargo config and put the oracle build back in third-party crates.
+    #[test]
+    fn nested_build_environment_carries_an_empty_rustflags_list() {
+        let path_dir = tempfile::tempdir().expect("temporary PATH directory");
+        let ambient = vec![
+            (
+                OsString::from("PATH"),
+                path_dir.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from(nested_lane::NESTED_RUSTFLAGS_ENV),
+                OsString::from("--cfg=ambient"),
+            ),
+        ];
+        let environment = sanitized_build_environment_from(
+            ambient,
+            Path::new("/exact/cargo-home"),
+            Path::new("/exact/rustc"),
+        );
+        assert_eq!(
+            environment.get(OsStr::new(nested_lane::NESTED_RUSTFLAGS_ENV)),
+            Some(&OsString::new()),
+            "the nested build must carry an EMPTY rustflags list of its own, \
+             and never the caller's"
+        );
     }
 
     #[test]

@@ -46,6 +46,9 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Pow, Signed, Zero};
 
+mod sos_source;
+pub(crate) use sos_source::extract_sos_clause_sources;
+
 // ============================================================================
 // Budget caps (fail-closed: every trip is a refusal, never an acceptance)
 // ============================================================================
@@ -90,7 +93,8 @@ const fn ceil_log2(value: usize) -> usize {
     let mut bits = 0_usize;
     while power < value {
         power = power.saturating_mul(2);
-        bits += 1;
+        // At most `usize::BITS` doublings reach `usize::MAX`; never saturates.
+        bits = bits.saturating_add(1);
     }
     bits
 }
@@ -259,7 +263,16 @@ impl<'a> WorkMeter<'a> {
 }
 
 pub(crate) fn generic_rational_scratch_bytes(transient_bits: u64) -> Result<usize, String> {
-    if transient_bits > MAX_RATIONAL_TRANSIENT_BITS {
+    bounded_rational_scratch_bytes(transient_bits, MAX_RATIONAL_TRANSIENT_BITS)
+}
+
+/// The same exact-arithmetic workspace model under another checker's explicit
+/// precision bound. Keep the polynomial checker's own bound unchanged above.
+pub(crate) fn bounded_rational_scratch_bytes(
+    transient_bits: u64,
+    maximum_bits: u64,
+) -> Result<usize, String> {
+    if transient_bits > maximum_bits {
         return Err(WORK_METER_RESOURCE_LIMIT.to_string());
     }
     let payload = usize::try_from(transient_bits.saturating_add(7) / 8)
@@ -431,7 +444,10 @@ impl MPoly {
                 "nra polynomial coefficient exceeds cap {MAX_POLY_COEFF_BITS} bits"
             ));
         }
-        meter.charge_ops(bit_scaled(other.terms.len() as u64 + 1, bits))?;
+        meter.charge_ops(bit_scaled(
+            (other.terms.len() as u64).saturating_add(1),
+            bits,
+        ))?;
         meter.charge_monomials(other.terms.len())?;
         for (index, (m, c)) in other.terms.iter().enumerate() {
             meter.poll_loop(index)?;
@@ -457,7 +473,10 @@ impl MPoly {
                 "nra polynomial coefficient exceeds cap {MAX_POLY_COEFF_BITS} bits"
             ));
         }
-        meter.charge_ops(bit_scaled(other.terms.len() as u64 + 1, bits))?;
+        meter.charge_ops(bit_scaled(
+            (other.terms.len() as u64).saturating_add(1),
+            bits,
+        ))?;
         meter.charge_monomials(other.terms.len())?;
         for (index, (m, c)) in other.terms.iter().enumerate() {
             meter.poll_loop(index)?;
@@ -582,31 +601,38 @@ fn merge_monomials(a: &Monomial, b: &Monomial) -> Result<Monomial, String> {
         .len()
         .checked_add(b.len())
         .ok_or_else(|| "nra monomial key capacity overflow".to_string())?;
-    let mut out = Vec::with_capacity(capacity);
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].0.cmp(&b[j].0) {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| "nra monomial key allocation refused".to_string())?;
+    let mut rest_a = a.iter().copied().peekable();
+    let mut rest_b = b.iter().copied().peekable();
+    // Both keys still have an entry: emit the smaller variable (or the
+    // shared one with summed exponents). The loop ends exactly when either
+    // side is exhausted, and the other side's tail is appended below.
+    while let (Some((var_a, exp_a)), Some((var_b, exp_b))) =
+        (rest_a.peek().copied(), rest_b.peek().copied())
+    {
+        match var_a.cmp(&var_b) {
             std::cmp::Ordering::Less => {
-                out.push(a[i]);
-                i += 1;
+                out.push((var_a, exp_a));
+                rest_a.next();
             }
             std::cmp::Ordering::Greater => {
-                out.push(b[j]);
-                j += 1;
+                out.push((var_b, exp_b));
+                rest_b.next();
             }
             std::cmp::Ordering::Equal => {
-                let e = a[i]
-                    .1
-                    .checked_add(b[j].1)
+                let e = exp_a
+                    .checked_add(exp_b)
                     .ok_or_else(|| "nra monomial exponent overflow".to_string())?;
-                out.push((a[i].0, e));
-                i += 1;
-                j += 1;
+                out.push((var_a, e));
+                rest_a.next();
+                rest_b.next();
             }
         }
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
+    out.extend(rest_a);
+    out.extend(rest_b);
     Ok(out)
 }
 
@@ -685,7 +711,12 @@ fn extract_polynomial_relation(
     memo: &mut BTreeMap<TermId, MPoly>,
     meter: &mut WorkMeter<'_>,
 ) -> Result<RelationExtraction, String> {
-    let (a, b) = (args[0], args[1]);
+    let &[a, b] = args else {
+        return Err(format!(
+            "relation {name} expects 2 arguments, got {}",
+            args.len()
+        ));
+    };
     if !matches!(terms.sort(a), Sort::Int | Sort::Real)
         || !matches!(terms.sort(b), Sort::Int | Sort::Real)
     {
@@ -1092,13 +1123,27 @@ fn parse_real_division(
     if args.iter().any(|&arg| *terms.sort(arg) != Sort::Real) {
         return Err("ill-sorted real division".to_string());
     }
+    let &[numer_term, denom_term] = args else {
+        return Err(format!(
+            "real division expects 2 arguments, got {}",
+            args.len()
+        ));
+    };
+    let next_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "nra parse depth overflow".to_string())?;
     // Division ONLY by a subtree that evaluates to a nonzero rational
     // constant (exact scaling); otherwise the whole node is an opaque leaf
-    // (universal abstraction, sound for refutation).
-    let denom = parse_poly(terms, args[1], memo, meter, depth + 1)?;
-    Ok(match denom.as_constant(meter)? {
-        Some(c) if !c.is_zero() => {
-            let numer = parse_poly(terms, args[0], memo, meter, depth + 1)?;
+    // (universal abstraction, sound for refutation). The zero test is a
+    // `filter` on the whole `Option` rather than a match guard: a guarded
+    // arm that moves the payload leaves a drop switching on the `Option`'s
+    // discriminant with an `unreachable` default.
+    let divisor = parse_poly(terms, denom_term, memo, meter, next_depth)?
+        .as_constant(meter)?
+        .filter(|c| !c.is_zero());
+    Ok(match divisor {
+        Some(c) => {
+            let numer = parse_poly(terms, numer_term, memo, meter, next_depth)?;
             ensure_coeff_width(&c)?;
             meter.charge_ops(bit_scaled(1, rat_bits(&c)))?;
             meter.charge_private_allocation(0, rational_clone_bytes(&c)?)?;
@@ -1107,7 +1152,7 @@ fn parse_real_division(
             ensure_coeff_width(&inverse)?;
             numer.scale(&inverse, meter)?
         }
-        _ => {
+        None => {
             meter.charge_monomials(1)?;
             MPoly::var(term)
         }
@@ -1210,13 +1255,33 @@ pub(crate) fn bit_scaled(ops: u64, bits: u64) -> u64 {
 }
 
 /// Compare two endpoints by VALUE only (openness ignored).
+///
+/// Matched one endpoint at a time: the or-pattern match on the pair re-tested
+/// a discriminant in a block whose `unreachable` default the per-function
+/// verifier could not rule out. The order is unchanged: `-inf` below every
+/// finite value below `+inf`, each infinity equal only to itself.
 fn cmp_bnd_val(a: &Bnd, b: &Bnd) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    match (a, b) {
-        (Bnd::NegInf, Bnd::NegInf) | (Bnd::PosInf, Bnd::PosInf) => Equal,
-        (Bnd::NegInf, _) | (_, Bnd::PosInf) => Less,
-        (_, Bnd::NegInf) | (Bnd::PosInf, _) => Greater,
-        (Bnd::Fin(x, _), Bnd::Fin(y, _)) => x.cmp(y),
+    match a {
+        Bnd::NegInf => {
+            if matches!(b, Bnd::NegInf) {
+                Equal
+            } else {
+                Less
+            }
+        }
+        Bnd::PosInf => {
+            if matches!(b, Bnd::PosInf) {
+                Equal
+            } else {
+                Greater
+            }
+        }
+        Bnd::Fin(x, _) => match b {
+            Bnd::NegInf => Greater,
+            Bnd::PosInf => Less,
+            Bnd::Fin(y, _) => x.cmp(y),
+        },
     }
 }
 
@@ -1322,7 +1387,7 @@ impl Ival {
     /// Total endpoint bit-size — the work-meter cost driver for this
     /// interval's arithmetic.
     pub(crate) fn bits(&self) -> u64 {
-        self.lo.bits() + self.hi.bits()
+        self.lo.bits().saturating_add(self.hi.bits())
     }
 
     pub(crate) fn add(&self, other: &Self, meter: &mut WorkMeter<'_>) -> Result<Self, String> {
@@ -1387,13 +1452,30 @@ impl Ival {
             Fin(BigRational),
             PosInf,
         }
+        // Matched one value at a time, as `cmp_bnd_val` is, and for the
+        // same reason; the order is unchanged.
         fn cmp_val(a: &Val, b: &Val) -> std::cmp::Ordering {
             use std::cmp::Ordering::{Equal, Greater, Less};
-            match (a, b) {
-                (Val::NegInf, Val::NegInf) | (Val::PosInf, Val::PosInf) => Equal,
-                (Val::NegInf, _) | (_, Val::PosInf) => Less,
-                (_, Val::NegInf) | (Val::PosInf, _) => Greater,
-                (Val::Fin(x), Val::Fin(y)) => x.cmp(y),
+            match a {
+                Val::NegInf => {
+                    if matches!(b, Val::NegInf) {
+                        Equal
+                    } else {
+                        Less
+                    }
+                }
+                Val::PosInf => {
+                    if matches!(b, Val::PosInf) {
+                        Equal
+                    } else {
+                        Greater
+                    }
+                }
+                Val::Fin(x) => match b {
+                    Val::NegInf => Greater,
+                    Val::PosInf => Less,
+                    Val::Fin(y) => x.cmp(y),
+                },
             }
         }
         // (value, attained-by-this-pair)
@@ -1458,7 +1540,7 @@ impl Ival {
     /// Multiply by a nonzero rational scalar (openness preserved, ends
     /// swapped for negative scalars).
     pub(crate) fn scale(&self, c: &BigRational, meter: &mut WorkMeter<'_>) -> Result<Self, String> {
-        meter.charge_ops(2 + (self.bits() + rat_bits(c)) / 32)?;
+        meter.charge_ops((self.bits().saturating_add(rat_bits(c)) / 32).saturating_add(2))?;
         if self.is_empty() {
             return Ok(Self::empty());
         }
@@ -1648,12 +1730,15 @@ pub(crate) fn rat_pow(v: &BigRational, k: u32) -> BigRational {
 // ============================================================================
 
 /// `floor(n^(1/k))` for `n >= 0`, by binary search (no external deps).
-fn bigint_nth_root_floor(n: &BigInt, k: u32) -> BigInt {
+/// `None` for the undefined zeroth root (`k == 0`, `n > 1`), and for a search
+/// bound `bits / k + 2` beyond `u64` (unreachable: `k >= 2` there).
+fn bigint_nth_root_floor(n: &BigInt, k: u32) -> Option<BigInt> {
     if n.is_zero() || n.is_one() || k == 1 {
-        return n.clone();
+        return Some(n.clone());
     }
     let bits = n.bits();
-    let mut hi: BigInt = BigInt::one() << (bits / u64::from(k) + 2);
+    let per_root = bits.checked_div(u64::from(k))?;
+    let mut hi: BigInt = BigInt::one() << per_root.checked_add(2)?;
     let mut lo = BigInt::zero();
     // Invariant: lo^k <= n < hi^k.
     while &lo + 1u32 < hi {
@@ -1664,7 +1749,7 @@ fn bigint_nth_root_floor(n: &BigInt, k: u32) -> BigInt {
             hi = mid;
         }
     }
-    lo
+    Some(lo)
 }
 
 /// Outward rational bounds `(lower, upper, exact)` for `q^(1/k)` with
@@ -1688,7 +1773,8 @@ pub(crate) fn rat_nth_root_bounds(
     meter.charge_ops(bit_cost)?;
     // q^(1/k) = (a * b^(k-1))^(1/k) / b.
     let n: BigInt = &a * Pow::pow(&b, k - 1);
-    let s = bigint_nth_root_floor(&n, k);
+    let s =
+        bigint_nth_root_floor(&n, k).ok_or_else(|| "nth root search bound overflow".to_string())?;
     let exact = Pow::pow(&s, k) == n;
     let lower = BigRational::new(s.clone(), b.clone());
     let upper = if exact {

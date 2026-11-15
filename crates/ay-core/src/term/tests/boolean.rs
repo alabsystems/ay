@@ -1654,3 +1654,98 @@ fn test_xor_canonical_order() {
     let result2 = store.mk_xor(y, x);
     assert_eq!(result1, result2);
 }
+
+// Independent truth evaluation for the small Boolean constructor fixtures.
+// A declared head denotes a committed constant UF, never a connective.
+fn declared_boolean_truth(store: &TermStore, term: TermId, vars: [bool; 4], uf: bool) -> bool {
+    match store.get(term) {
+        TermData::Const(Constant::Bool(value)) => *value,
+        TermData::Var(name, _) => {
+            vars[match name.as_str() {
+                "ns_x" => 0,
+                "ns_y" => 1,
+                "ns_c" => 2,
+                "ns_z" => 3,
+                _ => panic!("unknown fixture variable"),
+            }]
+        }
+        TermData::Not(inner) => !declared_boolean_truth(store, *inner, vars, uf),
+        TermData::Ite(condition, yes, no) => declared_boolean_truth(
+            store,
+            if declared_boolean_truth(store, *condition, vars, uf) {
+                *yes
+            } else {
+                *no
+            },
+            vars,
+            uf,
+        ),
+        TermData::App(Symbol::Named(name), _) if store.is_declared_function(name) => uf,
+        TermData::App(Symbol::Named(name), args) if name == "and" => args
+            .iter()
+            .all(|id| declared_boolean_truth(store, *id, vars, uf)),
+        TermData::App(Symbol::Named(name), args) if name == "or" => args
+            .iter()
+            .any(|id| declared_boolean_truth(store, *id, vars, uf)),
+        other => panic!("unsupported Boolean fixture: {other:?}"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BooleanRegistration {
+    BeforeNegation,
+    AfterCachedNegation,
+}
+
+fn check_declared_boolean_negation(when: BooleanRegistration) {
+    for (head, generated) in [("and", "or"), ("or", "and")] {
+        for declared in [head, generated] {
+            let mut store = TermStore::new();
+            if matches!(when, BooleanRegistration::BeforeNegation) {
+                store.register_declared_function(declared);
+            }
+            let x = store.mk_var("ns_x", Sort::Bool);
+            let y = store.mk_var("ns_y", Sort::Bool);
+            let c = store.mk_var("ns_c", Sort::Bool);
+            let z = store.mk_var("ns_z", Sort::Bool);
+            let app = store.mk_app_structural(Symbol::named(head), &[x, y], Sort::Bool);
+            let conditional = store.mk_ite(c, app, z);
+            if matches!(when, BooleanRegistration::AfterCachedNegation) {
+                let _ = store.mk_not(app);
+                let _ = store.mk_not(conditional);
+                store.register_declared_function(declared);
+            }
+            for source in [app, conditional] {
+                let negated = store.mk_not(source);
+                let mut copied = store.clone();
+                let copied_negated = copied.mk_not(source);
+                for bits in 0..16 {
+                    let vars = std::array::from_fn(|index| bits & (1 << index) != 0);
+                    for uf in [false, true] {
+                        let expected = !declared_boolean_truth(&store, source, vars, uf);
+                        assert_eq!(
+                            declared_boolean_truth(&store, negated, vars, uf),
+                            expected,
+                            "declared {declared}, source {head}, bits {bits}, UF {uf}"
+                        );
+                        assert_eq!(
+                            declared_boolean_truth(&copied, copied_negated, vars, uf),
+                            expected,
+                            "clone must preserve current namespace"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn negation_preserves_declared_boolean_function_truth() {
+    check_declared_boolean_negation(BooleanRegistration::BeforeNegation);
+}
+
+#[test]
+fn negation_memo_does_not_cross_declared_boolean_namespace_changes() {
+    check_declared_boolean_negation(BooleanRegistration::AfterCachedNegation);
+}

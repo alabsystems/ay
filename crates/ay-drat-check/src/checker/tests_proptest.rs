@@ -24,6 +24,15 @@ fn arb_clause(max_var: u32, max_len: usize) -> impl Strategy<Value = Vec<crate::
     prop::collection::vec(arb_literal(max_var), 1..=max_len)
 }
 
+/// Checker size for properties over variables `0..=max_var`: `max_var + 2`,
+/// refused (rather than wrapped) if it overflows.
+fn checker_vars(max_var: u32) -> Result<usize, TestCaseError> {
+    let vars = max_var
+        .checked_add(2)
+        .ok_or_else(|| TestCaseError::fail("variable count overflows u32"))?;
+    usize::try_from(vars).map_err(|_| TestCaseError::fail("variable count overflows usize"))
+}
+
 // ─── Property tests ─────────────────────────────────────────────────
 
 proptest! {
@@ -33,7 +42,7 @@ proptest! {
     /// clauses should set the checker to inconsistent.
     #[test]
     fn prop_contradictory_units_make_inconsistent(var in 0..100u32) {
-        let mut checker = DratChecker::new((var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(var)?, false);
         checker.add_original(&[lit(var, true)]);
         checker.add_original(&[lit(var, false)]);
         prop_assert!(checker.inconsistent, "formula with {{v, ~v}} should be inconsistent");
@@ -45,7 +54,7 @@ proptest! {
     /// is_tautology() check should short-circuit and return Ok.
     #[test]
     fn prop_tautological_derived_always_accepted(var in 0..100u32) {
-        let mut checker = DratChecker::new((var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(var)?, false);
         checker.add_original(&[lit(0, true)]);  // need at least one original
         let result = checker.add_derived(&[lit(var, true), lit(var, false)]);
         prop_assert!(result.is_ok(), "tautological clause should be accepted: {result:?}");
@@ -63,7 +72,7 @@ proptest! {
     ) {
         prop_assume!(a != b);
         let max_var = a.max(b);
-        let mut checker = DratChecker::new((max_var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(max_var)?, false);
         checker.add_original(&[lit(a, true), lit(b, true)]);     // a v b
         checker.add_original(&[lit(a, false), lit(b, true)]);    // ~a v b
         // Derive {b}: assume ~b. Clause 1: a unit. Clause 2: ~a false, b false → conflict.
@@ -83,7 +92,7 @@ proptest! {
     ) {
         prop_assume!(a != b);
         let max_var = a.max(b);
-        let mut checker = DratChecker::new((max_var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(max_var)?, false);
         checker.add_original(&[lit(a, true)]);
         let result = checker.add_derived(&[lit(b, true)]);
         prop_assert!(result.is_err(), "non-implied clause should fail");
@@ -116,7 +125,7 @@ proptest! {
     fn prop_delete_nonexistent_increments_counter(
         var in 0..50u32,
     ) {
-        let mut checker = DratChecker::new((var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(var)?, false);
         checker.add_original(&[lit(var, true)]);
         // Delete a clause we never added.
         checker.delete_clause(&[lit(var, false)]);
@@ -135,7 +144,7 @@ proptest! {
     ) {
         prop_assume!(a != b);
         let max_var = a.max(b);
-        let mut checker = DratChecker::new((max_var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(max_var)?, false);
         let clauses = vec![
             vec![lit(a, true), lit(b, true)],    // a v b
             vec![lit(a, false), lit(b, true)],   // ~a v b
@@ -153,7 +162,7 @@ proptest! {
     /// should detect this during add_original without any proof steps.
     #[test]
     fn prop_verify_contradictory_formula_no_steps(var in 0..100u32) {
-        let mut checker = DratChecker::new((var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(var)?, false);
         let clauses = vec![
             vec![lit(var, true)],
             vec![lit(var, false)],
@@ -191,10 +200,10 @@ proptest! {
             ProofStep::Add(vec![]),  // empty clause
         ];
 
-        let mut forward = DratChecker::new((var + 2) as usize, false);
+        let mut forward = DratChecker::new(checker_vars(var)?, false);
         let fwd_result = forward.verify(&clauses, &steps);
 
-        let mut backward = BackwardChecker::new((var + 2) as usize, false);
+        let mut backward = BackwardChecker::new(checker_vars(var)?, false);
         let bwd_result = backward.verify(&clauses, &steps);
 
         prop_assert!(fwd_result.is_ok(), "forward should accept: {fwd_result:?}");
@@ -222,17 +231,23 @@ proptest! {
     /// (tautology or satisfied by prior assignments).
     #[test]
     fn prop_add_delete_roundtrip(var in 0..50u32) {
-        let mut checker = DratChecker::new((var + 2) as usize, false);
+        let mut checker = DratChecker::new(checker_vars(var)?, false);
         // Use a non-unit clause. Assigned units are deliberately retained as
         // pseudo-units so deleting them cannot leave a stale top-level value.
-        let clause = vec![lit(var, true), lit(var + 1, true)];
+        let next = var
+            .checked_add(1)
+            .ok_or_else(|| TestCaseError::fail("variable overflows u32"))?;
+        let clause = vec![lit(var, true), lit(next, true)];
         checker.add_original(&clause);
         let live_before = checker.live_clauses;
         prop_assert!(live_before >= 1, "should have at least 1 live clause");
         checker.delete_clause(&clause);
+        let expected = live_before
+            .checked_sub(1)
+            .ok_or_else(|| TestCaseError::fail("no live clause to delete"))?;
         prop_assert_eq!(
             checker.live_clauses,
-            live_before - 1,
+            expected,
             "deleting the clause should reduce live_clauses"
         );
     }

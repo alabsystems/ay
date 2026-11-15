@@ -6,3 +6,13 @@
 * text=auto eol=lf
 *.sh text eol=lf
 crates/ay-pb/tests/instances/koops_mat12_11_identity_complement_red_capacity.pbp -filter -diff -merge text eol=lf
+# A detached Ed25519 signature (publish/known-red.jsonl.sig, signed by a
+# rostered release machine) is 64 raw bytes: never text, whatever git's
+# heuristic makes of one, or `text=auto` above could rewrite it on `git add`.
+*.sig binary
+# the development design notes is append-only: concurrent landings each add an entry, and
+# a text merge of two entries added at the same place is a conflict that
+# stopped two landings in a row (2026-10-14). Union keeps both entries, and
+# merges two entries that took the same id without a conflict, so
+# scripts/tests/test_land_select.py holds every DR id to one entry (DR-48).
+the development design notes merge=union

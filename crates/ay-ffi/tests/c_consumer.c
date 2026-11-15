@@ -278,8 +278,10 @@ static int test_optimize_maxsat(void) {
     Z3_ast not_b = Z3_mk_not(ctx, b);
     unsigned i0 = Z3_optimize_assert_soft(ctx, opt, not_a, "1", NULL);
     unsigned i1 = Z3_optimize_assert_soft(ctx, opt, not_b, "1", NULL);
+    // z3 returns the objective index of the soft constraint's group: both
+    // are in the default group, objective 0.
     assert(i0 == 0);
-    assert(i1 == 1);
+    assert(i1 == 0);
     assert(Z3_get_error_code(ctx) == Z3_OK);
 
     int res = Z3_optimize_check(ctx, opt, 0, NULL);
@@ -344,11 +346,15 @@ static int test_optimize_maxsat(void) {
     assert(Z3_get_bool_value(ctx2, b2v) == Z3_L_FALSE);
     assert(Z3_get_bool_value(ctx2, c2v) == Z3_L_FALSE);
 
-    // assumptions are unsupported -> honest Z3_L_UNDEF.
-    Z3_ast assumptions[1] = { a2 };
+    // Check-time assumptions hold for that check only (z3's semantics).
+    Z3_ast assumptions[1] = { Z3_mk_not(ctx2, a2) };
     int res3 = Z3_optimize_check(ctx2, opt2, 1, assumptions);
-    assert(res3 == Z3_L_UNDEF);
-    assert(Z3_get_error_code(ctx2) == Z3_INVALID_ARG);
+    assert(res3 == Z3_L_TRUE);
+    Z3_model m3 = Z3_optimize_get_model(ctx2, opt2);
+    Z3_ast a3v = 0;
+    Z3_model_eval(ctx2, m3, a2, true, &a3v);
+    assert(Z3_get_bool_value(ctx2, a3v) == Z3_L_FALSE);
+    assert(Z3_get_error_code(ctx2) == Z3_OK);
 
     Z3_del_context(ctx2);
     return 0;
@@ -425,7 +431,7 @@ static int test_optimize_objectives(void) {
 }
 
 // Z3_substitute: simultaneous, hash-consed subterm replacement.
-// (a) (+ x 1)[x:=5] eager-folds to 6 and equals directly-built (+ 5 1).
+// (a) (+ x 1)[x:=5] and directly-built (+ 5 1) both simplify to 6.
 // (b) simultaneous swap x<->y in (- x y) yields (- y x), not (- x x).
 // (c) sort mismatch (Int x -> Bool b) sets Z3_SORT_ERROR and returns `a`.
 static int test_substitute(void) {
@@ -449,10 +455,11 @@ static int test_substitute(void) {
 
     Z3_ast direct_args[2] = { five, one };
     Z3_ast direct = Z3_mk_add(ctx, 2, direct_args);
-    assert(got == direct);              // hash-consing identity
     int v = 0;
-    assert(Z3_get_numeral_int(ctx, got, &v));
-    assert(v == 6);                     // eager-folded to 6
+    assert(Z3_get_numeral_int(ctx, Z3_simplify(ctx, got), &v));
+    assert(v == 6);
+    assert(Z3_get_numeral_int(ctx, Z3_simplify(ctx, direct), &v));
+    assert(v == 6);
 
     // (b) simultaneous swap (- x y) -> (- y x)
     Z3_ast sub_xy[2] = { x, y };
@@ -874,13 +881,12 @@ static int test_tactics(void) {
     return 0;
 }
 
-// Proofs (Alethe): after an UNSAT check with proof production enabled, the
-// solver must hand back its real Alethe proof artifact via Z3_solver_get_proof /
-// Z3_solver_get_proof_string. The HONESTY half of the test is the important
+// Proofs: supported native rules project as applications; the explicit string
+// accessor retains the Alethe artifact. The HONESTY half is the important
 // half: a SAT result and a proofs-disabled run must both return NULL with
 // Z3_INVALID_USAGE — never a fabricated proof.
 static int test_proofs(void) {
-    // --- UNSAT + proofs enabled: real Alethe text is returned. ---
+    // --- UNSAT + proofs enabled: real resolution and premises are returned. ---
     Z3_config cfg = Z3_mk_config();
     Z3_context ctx = Z3_mk_context(cfg);
     Z3_del_config(cfg);
@@ -902,14 +908,26 @@ static int test_proofs(void) {
     assert(Z3_get_error_code(ctx) == Z3_OK);
     Z3_string proof_text = Z3_ast_to_string(ctx, proof);
     assert(proof_text != NULL);
-    // Real Alethe text carries structural markers, not the generic placeholder.
-    assert(strstr(proof_text, "assume") != NULL ||
-           strstr(proof_text, "step") != NULL ||
-           strstr(proof_text, "(cl") != NULL);
+    assert(Z3_get_ast_kind(ctx, proof) == Z3_APP_AST);
+    Z3_app root = Z3_to_app(ctx, proof);
+    assert(Z3_get_decl_kind(ctx, Z3_get_app_decl(ctx, root)) == Z3_OP_PR_UNIT_RESOLUTION);
+    assert(Z3_get_app_num_args(ctx, root) == 3);
+    assert(Z3_is_eq_ast(ctx, Z3_get_app_arg(ctx, root, 2), Z3_mk_false(ctx)));
+    Z3_ast literals[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        Z3_ast premise_ast = Z3_get_app_arg(ctx, root, i);
+        assert(Z3_get_ast_kind(ctx, premise_ast) == Z3_APP_AST);
+        Z3_app premise = Z3_to_app(ctx, premise_ast);
+        assert(Z3_get_decl_kind(ctx, Z3_get_app_decl(ctx, premise)) == Z3_OP_PR_ASSERTED);
+        assert(Z3_get_app_num_args(ctx, premise) == 1);
+        literals[i] = Z3_get_app_arg(ctx, premise, 0);
+    }
+    assert((Z3_is_eq_ast(ctx, literals[0], p) && Z3_is_eq_ast(ctx, literals[1], not_p)) ||
+           (Z3_is_eq_ast(ctx, literals[1], p) && Z3_is_eq_ast(ctx, literals[0], not_p)));
     assert(strncmp(proof_text, "(ast ", 5) != 0);    // not the term placeholder
     assert(strncmp(proof_text, "(error", 6) != 0);   // not an error sexpr
 
-    // The direct string accessor returns the same kind of artifact.
+    // The direct string accessor retains the separate Alethe artifact.
     Z3_string proof_str = Z3_solver_get_proof_string(ctx, solver);
     assert(proof_str != NULL);
     assert(strstr(proof_str, "assume") != NULL ||
@@ -1185,14 +1203,21 @@ static int test_string_accessors(void) {
     Z3_ast cat_args[2] = { x, hello };
     Z3_ast cat = Z3_mk_seq_concat(ctx, 2, cat_args);
     assert(!Z3_is_string(ctx, cat));
-    assert(Z3_get_string(ctx, cat) == NULL);
+    /* z3: "" plus Z3_INVALID_ARG ("expression is not a string literal"). */
+    assert(strcmp(Z3_get_string(ctx, cat), "") == 0);
+    assert(Z3_get_error_code(ctx) == Z3_INVALID_ARG);
     assert(Z3_get_string_length(ctx, cat) == 0);
+    assert(Z3_get_error_code(ctx) == Z3_INVALID_ARG);
 
     // An Int numeral is not a string.
     Z3_sort int_sort = Z3_mk_int_sort(ctx);
     Z3_ast five = Z3_mk_int(ctx, 5, int_sort);
     assert(!Z3_is_string(ctx, five));
-    assert(Z3_get_string(ctx, five) == NULL);
+    assert(strcmp(Z3_get_string(ctx, five), "") == 0);
+    assert(Z3_get_error_code(ctx) == Z3_INVALID_ARG);
+    // The next context call clears the error code, as in z3.
+    assert(!Z3_is_string(ctx, five));
+    assert(Z3_get_error_code(ctx) == Z3_OK);
 
     // Version APIs report the pinned Z3 5.1.0 compatibility identity.
     unsigned int major = 0, minor = 0, build = 0, revision = 0;

@@ -105,11 +105,14 @@ fn self_check_accepts_strict_boolean_refutation() {
 }
 
 include!("self_check/wire_gap_policy.rs");
+include!("self_check/ground_substitution_wire.rs");
 
 /// Verify that invalid proofs record a failure without panicking (#7959).
 /// Previously, debug builds would panic via `debug_assert!(false, ...)`,
 /// which triggered `catch_unwind` in downstream consumers (verification-consumer).
-/// Now all builds log the error and record the failure in statistics.
+/// Now all builds log the error and record the failure in statistics, with
+/// the walk's own counts: the two assumptions validated, the resolution at
+/// step 2 did not, so `checked_steps` is 2 of 3 (#4592), not the proof's shape.
 #[cfg(feature = "proof-checker")]
 #[test]
 fn test_internal_proof_checker_records_failure_without_panic() {
@@ -132,7 +135,7 @@ fn test_internal_proof_checker_records_failure_without_panic() {
     let stats = exec.statistics();
     assert_eq!(stats.get_int(PROOF_CHECKER_FAILURES_KEY), Some(1));
     assert_eq!(stats.get_int(PROOF_CHECKER_SKIPPED_HOLE_STEPS_KEY), Some(0));
-    assert_eq!(stats.get_int(PROOF_CHECKER_CHECKED_STEPS_KEY), Some(3));
+    assert_eq!(stats.get_int(PROOF_CHECKER_CHECKED_STEPS_KEY), Some(2));
     assert_eq!(stats.get_int(PROOF_CHECKER_TOTAL_STEPS_KEY), Some(3));
 }
 

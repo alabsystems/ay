@@ -475,7 +475,18 @@ impl LraSolver {
         // Determine max slack var id for sizing the vector.
         let max_slack = self.slack_var_set.iter().copied().max().unwrap_or(0) as usize;
         self.negation_partners.clear();
-        self.negation_partners.resize(max_slack + 1, None);
+        // One slot per slack id up to `max_slack`, reserved up front so the
+        // pushes below stay within the reservation. If the reservation fails
+        // the table is left empty: every reader treats a missing slot as "no
+        // partner" (`get` below, the `len` check in implied_bounds), and the
+        // table only strengthens propagation, so an empty table is sound.
+        let slots = max_slack.saturating_add(1);
+        if self.negation_partners.try_reserve_exact(slots).is_err() {
+            return;
+        }
+        while self.negation_partners.len() <= max_slack {
+            self.negation_partners.push(None);
+        }
 
         let keys: Vec<Vec<(u32, Rational)>> = self.expr_to_slack.keys().cloned().collect();
         let mut processed_pairs: HashSet<(u32, u32)> = HashSet::default();
@@ -499,10 +510,17 @@ impl LraSolver {
 
             let k_sum = oc1 + oc2; // K = oc1 + oc2, the constant sum s1 + s2
 
-            // Ensure both indices fit.
+            // Ensure both indices fit. If the extra slots cannot be reserved,
+            // skip this pair: a missing partner only weakens propagation.
             let max_id = std::cmp::max(s1, s2) as usize;
-            if max_id >= self.negation_partners.len() {
-                self.negation_partners.resize(max_id + 1, None);
+            let need = max_id
+                .saturating_add(1)
+                .saturating_sub(self.negation_partners.len());
+            if self.negation_partners.try_reserve_exact(need).is_err() {
+                continue;
+            }
+            while self.negation_partners.len() <= max_id {
+                self.negation_partners.push(None);
             }
 
             self.negation_partners[s1 as usize] = Some((s2, k_sum.clone()));

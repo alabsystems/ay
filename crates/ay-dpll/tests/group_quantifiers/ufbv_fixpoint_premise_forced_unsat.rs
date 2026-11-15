@@ -229,45 +229,210 @@ fn de_morgan_user_bv_prefix_candidate_is_never_refuted() {
     );
 }
 
-/// The satisfiable variant lacks a constructed/rechecked total UF model, so
-/// repeated checks must fail closed deterministically and model requests must
-/// remain unavailable. The disposable premise probes must also never register
-/// their fresh constants in user-visible state.
+/// Declarations shared by the repeated-check scripts below.
+const FIXPOINT_DECLS: &str = "
+(declare-fun fa0 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+(declare-fun fa1 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+(declare-fun fa2 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))";
+
+/// The satisfiable variant's body over the binders `a0 a1 a2` (z3 4.12.5:
+/// sat). Its premise holds only at `(a2, a1, a0) = (#x03, #x02, #x01)`, where
+/// it needs `fa0`, `fa1`, `fa2` to be `#x01`, `#x02`, `#x03`.
+const PINNED_SAT_BODY: &str = "
+(=> (and (= a0 #x01) (= a1 (bvadd a0 #x01)) (= a2 (bvadd a1 #x01)))
+    (and (= (fa0 a2 a1 a0) #x01)
+         (= (fa1 a2 a1 a0) (bvadd (fa0 a2 a1 a0) #x01))
+         (= (fa2 a2 a1 a0) (bvadd (fa1 a2 a1 a0) #x01))
+         (or (= a2 (fa0 a2 a1 a0)) (= a2 (fa2 a2 a1 a0)))))";
+
+/// `fa0`, `fa1`, `fa2` at [`PINNED_SAT_BODY`]'s only binding point.
+const BINDING_VALUES: &str =
+    "(get-value ((fa0 #x03 #x02 #x01) (fa1 #x03 #x02 #x01) (fa2 #x03 #x02 #x01)))";
+
+/// The ways a caller reaches `check-sat`, as `(name, authored, self_check)`:
+/// the generic adapter (`execute_all`) or the caller-authored CLI boundary
+/// (`execute_authored`), each with and without `--self-check`.
+const POSTURES: [(&str, bool, bool); 4] = [
+    ("default", false, false),
+    ("self-check", false, true),
+    ("authored", true, false),
+    ("authored self-check", true, true),
+];
+
+/// `(check-sat) (get-model)` twice on `forall a0 a1 a2. body`, then `tail`.
+fn repeated_check_script(body: &str, tail: &str) -> String {
+    format!(
+        "(set-logic UFBV)\n(set-option :produce-models true)\n{FIXPOINT_DECLS}\n\
+         (assert (forall ((a0 (_ BitVec 8)) (a1 (_ BitVec 8)) (a2 (_ BitVec 8))) {body}))\n\
+         (check-sat)\n(get-model)\n(check-sat)\n(get-model)\n{tail}\n"
+    )
+}
+
+/// The output of `smt` in one posture, plus the quantified SAT-evidence label
+/// (`model_check_gate.quantified`) the last `check-sat` recorded.
+fn solve_in_posture(smt: &str, authored: bool, self_check: bool) -> (Vec<String>, Option<String>) {
+    let commands = ay_frontend::parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}"));
+    let mut exec = ay_dpll::Executor::new();
+    exec.set_self_check(self_check);
+    let output = if authored {
+        let mut lines = Vec::new();
+        for command in &commands {
+            lines.extend(
+                exec.execute_authored(command)
+                    .unwrap_or_else(|err| panic!("execution failed: {err}")),
+            );
+        }
+        lines
+    } else {
+        exec.execute_all(&commands)
+            .unwrap_or_else(|err| panic!("execution failed: {err}"))
+    };
+    let label = exec
+        .statistics()
+        .get_string("model_check_gate.quantified")
+        .map(str::to_owned);
+    (output, label)
+}
+
+/// z3's first answer line, or `None` after a visible skip when no oracle exists.
+fn z3_verdict(smt: &str) -> Option<String> {
+    if !crate::common::check_z3_or_skip() {
+        return None;
+    }
+    let output = crate::common::solve_with_z3(smt)
+        .unwrap_or_else(|err| panic!("z3 failed on the replay: {err}\n{smt}"));
+    Some(output.lines().next().unwrap_or_default().trim().to_string())
+}
+
+/// Independently, under the model `defs`: z3 must accept the universal over
+/// `body` and refute its negated body at fresh binder constants.
+fn assert_z3_validates(defs: &str, body: &str) {
+    let replay = format!(
+        "(set-logic UFBV)\n{defs}\n(assert (forall ((a0 (_ BitVec 8)) (a1 (_ BitVec 8)) \
+         (a2 (_ BitVec 8))) {body}))\n(check-sat)\n"
+    );
+    if let Some(verdict) = z3_verdict(&replay) {
+        assert_eq!(verdict, "sat", "z3 rejects the model:\n{replay}");
+    }
+    let negation = format!(
+        "(set-logic UFBV)\n{defs}\n(declare-const a0 (_ BitVec 8))\n\
+         (declare-const a1 (_ BitVec 8))\n(declare-const a2 (_ BitVec 8))\n\
+         (assert (not {body}))\n(check-sat)\n"
+    );
+    if let Some(verdict) = z3_verdict(&negation) {
+        assert_eq!(
+            verdict, "unsat",
+            "a binder point falsifies the model:\n{negation}"
+        );
+    }
+}
+
+/// PIN REFRESH, tightening ad4d58fcc (which accepted `unknown` or `sat`).
+/// This pinned `unknown` "until a total model certificate exists" (80b9777a4).
+/// The generic quantified model check (ecc040bff, `finite_model_mbqi/generic.rs`)
+/// is that certificate: every function is a table plus an else value, the
+/// universal is decided true by a checked refutation of its Skolemized
+/// negation under that interpretation, and the published model is the staged
+/// one bound to the grant. So in every posture the pin demands two `sat`
+/// answers publishing one model, recorded on checked quantified evidence
+/// (never `deferred-discharged-trust-*`), defining every function, with no
+/// private qpf symbol, whose values at the only binding point satisfy the
+/// body; and z3 must accept each published model on replay and refute the
+/// negated body under it.
 #[test]
-fn repeated_failclosed_checks_do_not_leak_qpf_symbols() {
-    let smt = r#"
-        (set-logic UFBV)
-        (set-option :produce-models true)
-        (declare-fun fa0 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
-        (declare-fun fa1 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
-        (declare-fun fa2 ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
-        (assert (forall ((a0 (_ BitVec 8)) (a1 (_ BitVec 8)) (a2 (_ BitVec 8)))
-          (=> (and (= a0 #x01) (= a1 (bvadd a0 #x01)) (= a2 (bvadd a1 #x01)))
-              (and (= (fa0 a2 a1 a0) #x01)
-                   (= (fa1 a2 a1 a0) (bvadd (fa0 a2 a1 a0) #x01))
-                   (= (fa2 a2 a1 a0) (bvadd (fa1 a2 a1 a0) #x01))
-                   (or (= a2 (fa0 a2 a1 a0)) (= a2 (fa2 a2 a1 a0)))))))
-        (check-sat)
-        (get-model)
-        (check-sat)
-        (get-model)
-    "#;
-    let results = crate::common::solve_vec(smt);
-    assert_eq!(
-        results,
-        [
-            "unknown",
-            "(error \"model is not available\")",
-            "unknown",
-            "(error \"model is not available\")",
-        ],
-        "the semantically satisfiable variant must fail closed until a total \
-         model certificate exists"
-    );
-    assert!(
-        results.iter().all(|r| !r.contains("__ay_qpf")),
-        "disposable premise symbols must never escape into a visible model; got {results:?}"
-    );
+fn repeated_sat_checks_publish_a_replay_checked_model_without_qpf_symbols() {
+    let script = repeated_check_script(PINNED_SAT_BODY, BINDING_VALUES);
+    let mut models: Vec<String> = Vec::new();
+    for (posture, authored, self_check) in POSTURES {
+        let (results, evidence) = solve_in_posture(&script, authored, self_check);
+        assert_eq!(results.len(), 5, "{posture}: {results:?}");
+        assert_eq!(
+            [results[0].as_str(), results[2].as_str()],
+            ["sat", "sat"],
+            "{posture}: the certified total model decides both checks; got {results:?}"
+        );
+        assert!(
+            evidence.as_deref().is_some_and(
+                |label| label == "confirmed" || label.starts_with("deferred-certified-")
+            ),
+            "{posture}: the sat must rest on checked quantified evidence, not a trust \
+             discharge; got {evidence:?}"
+        );
+        assert_eq!(
+            results[1], results[3],
+            "{posture}: repeated checks must publish one model"
+        );
+        assert!(
+            results.iter().all(|r| !r.contains("__ay_qpf")),
+            "{posture}: disposable premise symbols must never escape into a visible model; \
+             got {results:?}"
+        );
+        // The premise holds only at (a2, a1, a0) = (#x03, #x02, #x01), so these
+        // three values decide the universal: a complete check that needs no z3.
+        assert_eq!(
+            results[4],
+            "(((fa0 #x03 #x02 #x01) #x01) ((fa1 #x03 #x02 #x01) #x02) ((fa2 #x03 #x02 #x01) #x03))",
+            "{posture}: the published model must satisfy the universal at its only binding"
+        );
+        let defs = results[1]
+            .trim()
+            .strip_prefix("(model")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{posture}: get-model must print a model: {results:?}"));
+        for name in ["fa0", "fa1", "fa2"] {
+            assert!(
+                defs.contains(&format!("(define-fun {name} ")),
+                "{posture}: the model must define {name} totally: {defs}"
+            );
+        }
+        if !models.iter().any(|seen| seen == defs) {
+            models.push(defs.to_owned());
+        }
+    }
+    for defs in &models {
+        assert_z3_validates(defs, PINNED_SAT_BODY);
+    }
+}
+
+/// Fail-closed twin the model check cannot cover. With `a0` unpinned the
+/// formula is still satisfiable (`fa0 = x2`, `fa1 = x2+1`, `fa2 = x2+2`; z3
+/// checks that witness below), but `fa0` must take 256 different values, which
+/// no table plus else value reachable within the refinement rounds
+/// (`MAX_FINITE_MODEL_ROUNDS`) represents. Without a checked total model every
+/// posture stays `unknown` with the model unavailable. This is also the
+/// negative twin of the acceptance: a model check that skipped its checked
+/// refutation would publish a wrong constant model here. If a checked lane
+/// later constructs this model, flip the pin to the replay-checked form above;
+/// never to a bare `sat`.
+#[test]
+fn unrepresentable_fixpoint_model_fails_closed_in_every_posture() {
+    let body = "
+(=> (and (= a1 (bvadd a0 #x01)) (= a2 (bvadd a1 #x01)))
+    (and (= (fa0 a2 a1 a0) a0)
+         (= (fa1 a2 a1 a0) (bvadd (fa0 a2 a1 a0) #x01))
+         (= (fa2 a2 a1 a0) (bvadd (fa1 a2 a1 a0) #x01))
+         (or (= a2 (fa0 a2 a1 a0)) (= a2 (fa2 a2 a1 a0)))))";
+    let script = repeated_check_script(body, "");
+    for (posture, authored, self_check) in POSTURES {
+        let (results, _) = solve_in_posture(&script, authored, self_check);
+        assert_eq!(
+            results,
+            [
+                "unknown",
+                "(error \"model is not available\")",
+                "unknown",
+                "(error \"model is not available\")",
+            ],
+            "{posture}: a satisfiable variant with no checked total model must fail closed"
+        );
+    }
+    let witness = "(define-fun fa0 ((x0 (_ BitVec 8)) (x1 (_ BitVec 8)) (x2 (_ BitVec 8))) \
+                   (_ BitVec 8) x2)\n\
+                   (define-fun fa1 ((x0 (_ BitVec 8)) (x1 (_ BitVec 8)) (x2 (_ BitVec 8))) \
+                   (_ BitVec 8) (bvadd x2 #x01))\n\
+                   (define-fun fa2 ((x0 (_ BitVec 8)) (x1 (_ BitVec 8)) (x2 (_ BitVec 8))) \
+                   (_ BitVec 8) (bvadd x2 #x02))";
+    assert_z3_validates(witness, body);
 }
 
 /// Proof/self-check mode must never emit a satisfiable answer for the false

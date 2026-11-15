@@ -54,8 +54,7 @@ use ay_sat::SatResult;
 // so it cannot be hidden from a compiler that lacks the extension, and it would
 // make all 10k lines of this file unreadable to one. It therefore lives alone in a
 // fragment: the verifier reads `portfolio/optimum_guard.rs`, everyone else reads
-// `portfolio/optimum_guard_stock.rs`, and the two are pinned together by
-// `tests/native_contract_twins.rs`. Both are `include!`d rather than made a
+// `portfolio/optimum_guard_stock.rs`. Both are `include!`d rather than made a
 // submodule so the function keeps this module, its visibility and its doc links.
 #[cfg(deductive_verify)]
 include!("portfolio/optimum_guard.rs");
@@ -4423,10 +4422,9 @@ pub use crate::optimize::shared_bounds::{GlobalSoundFloor, SharedBounds};
 ///   its own body can construct a `WorkerMsg::Done`.
 /// On completion the sender's verdict-free `Finished` signal keeps the
 /// coordinator's worker accounting identical to the complete-worker path.
-/// `pub` so the `tests/trybuild.rs` compile-fail suite can lock this signature
-/// (a primal run returning a `PbSolution`, or reaching for a verdict channel,
-/// must not compile).
-pub fn spawn_primal_optimization_worker(
+/// The public run/sender types retain the compile-time verdict boundary.
+/// Spawning is internal and additionally requires an actually held unit.
+fn spawn_primal_optimization_worker(
     run: PrimalWorkerRun,
     instance: Arc<PbInstance>,
     objective: Arc<PbObjective>,
@@ -4434,17 +4432,20 @@ pub fn spawn_primal_optimization_worker(
     start: Instant,
     shared_stop: Arc<AtomicBool>,
     sender: PrimalSender,
+    permit: ay_sys::compute_budget::ExtraPermit,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        run(
-            instance.as_ref(),
-            objective.as_ref(),
-            timeout_dur,
-            start,
-            shared_stop.as_ref(),
-            &sender,
-        );
-        sender.finish();
+        let _ = permit.run(move || {
+            run(
+                instance.as_ref(),
+                objective.as_ref(),
+                timeout_dur,
+                start,
+                shared_stop.as_ref(),
+                &sender,
+            );
+            sender.finish();
+        });
     })
 }
 
@@ -4682,6 +4683,32 @@ fn solve_optimization_portfolio_parallel_routed(
     )
 }
 
+fn enter_parallel_compute(
+    timeout_dur: Option<Duration>,
+    start: Instant,
+    term_flag: &AtomicBool,
+) -> Option<ay_sys::compute_budget::ComputeScope> {
+    ay_sys::compute_budget::ComputeScope::enter_until(|| {
+        term_flag.load(Ordering::Relaxed)
+            || timeout_dur.is_some_and(|timeout| start.elapsed() >= timeout)
+            || ay_sys::process_memory_exceeded()
+    })
+    .ok()
+    .flatten()
+}
+
+fn reserve_parallel_extras(maximum: usize) -> Option<Vec<ay_sys::compute_budget::ExtraPermit>> {
+    let mut permits = Vec::new();
+    for _ in 0..maximum {
+        match ay_sys::compute_budget::try_extra() {
+            Ok(Some(permit)) => permits.push(permit),
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(permits)
+}
+
 fn run_parallel_decision(
     instance: &Arc<PbInstance>,
     timeout_dur: Option<Duration>,
@@ -4689,6 +4716,9 @@ fn run_parallel_decision(
     term_flag: &AtomicBool,
     worker_count: usize,
 ) -> PbSolution {
+    let Some(_compute) = enter_parallel_compute(timeout_dur, start, term_flag) else {
+        return unknown_solution();
+    };
     let profile = InstanceProfile::from_instance(instance);
     // `decision_worker_specs` returns candidates IN PRIORITY ORDER. We spawn the
     // first `spawn` of them, where `spawn = min(candidates, core_budget)`. This is
@@ -4702,6 +4732,9 @@ fn run_parallel_decision(
     // toward the sequential fallback below) rather than relying on the
     // reactive MEMLIMIT watermark mid-flight.
     let core_budget = clamp_parallel_workers_by_memory(instance, worker_count);
+    let Some(permits) = reserve_parallel_extras(core_budget) else {
+        return unknown_solution();
+    };
     let mut specs = decision_worker_specs(&profile);
     // [P0] Concurrent symmetry arm, prepended ONLY for highly-symmetric linear
     // candidates. The other workers do not include the symmetry arm, so without
@@ -4720,8 +4753,9 @@ fn run_parallel_decision(
             },
         );
     }
-    let spawn = specs.len().min(core_budget.max(1));
+    let spawn = specs.len().min(permits.len());
     if spawn <= 1 {
+        drop(permits);
         // No diversity benefit (single core). The binaries route budget-<2
         // solves to the sequential path before ever reaching here (see
         // `should_parallelize_decision`); this fallback covers direct callers.
@@ -4770,20 +4804,22 @@ fn run_parallel_decision(
     // all rows once per parallel solve (~0.3s of the budget at 6.4M rows on
     // lopes-172) before any worker started.
     let shared_instance = Arc::clone(instance);
-    for spec in specs.into_iter().take(spawn) {
+    for (spec, permit) in specs.into_iter().take(spawn).zip(permits) {
         let worker_instance = Arc::clone(&shared_instance);
         let worker_stop = controls.register(spec.label);
         let tx = tx.clone();
         let label = spec.label;
         let run = spec.run;
         let handle = std::thread::spawn(move || {
-            let solution = run(
-                worker_instance.as_ref(),
-                timeout_dur,
-                start,
-                worker_stop.as_ref(),
-            );
-            let _ = tx.send(WorkerMsg::Done { label, solution });
+            let _ = permit.run(move || {
+                let solution = run(
+                    worker_instance.as_ref(),
+                    timeout_dur,
+                    start,
+                    worker_stop.as_ref(),
+                );
+                let _ = tx.send(WorkerMsg::Done { label, solution });
+            });
         });
         controls.attach_last_handle(handle);
     }
@@ -4985,6 +5021,9 @@ fn run_parallel_optimization_traced_with_upgrade(
     route: OptimizationPortfolioRoute,
     optimum_upgrade: Option<&'static dyn LinearOptimumUpgrade>,
 ) -> (PbSolution, Vec<&'static str>, Option<i128>) {
+    let Some(_compute) = enter_parallel_compute(timeout_dur, start, term_flag) else {
+        return (unknown_solution(), Vec::new(), None);
+    };
     if !objective_range_fits_i64(objective) {
         return (unsupported_solution(), Vec::new(), None);
     }
@@ -5007,9 +5046,13 @@ fn run_parallel_optimization_traced_with_upgrade(
     // toward the sequential fallback below) rather than relying on the
     // reactive MEMLIMIT watermark mid-flight.
     let core_budget = clamp_parallel_workers_by_memory(instance, worker_count);
+    let Some(permits) = reserve_parallel_extras(core_budget) else {
+        return (unknown_solution(), Vec::new(), None);
+    };
     let mut specs = optimization_worker_specs_with_upgrade(&profile, route, optimum_upgrade);
-    let spawn = specs.len().min(core_budget.max(1));
+    let spawn = specs.len().min(permits.len());
     if spawn <= 1 {
+        drop(permits);
         let solution = match optimum_upgrade {
             Some(upgrade) => solve_optimization_portfolio_with_upgrade(
                 instance,
@@ -5047,8 +5090,8 @@ fn run_parallel_optimization_traced_with_upgrade(
     // floor is the same `objective_lower_bound_from_constraints` bound the
     // sequential path already trusts for its SATISFIABLE -> OPTIMUM upgrade
     // (root surrogate-aggregation upgrade + `sanitize_optimization_solution`),
-    // proven never to overshoot by `kani_optimality_upgrade`. Publish it once
-    // up front; publish failure (i64-transport overflow) just leaves the bus
+    // tested never to overshoot (`gate_soundness_*` in portfolio/tests.rs).
+    // Publish it once up front; publish failure (i64-transport overflow) just leaves the bus
     // floor absent == no upgrade license (fail-closed).
     // Certification bound (see the sequential upgrade above): bounded by the
     // deadline, the memory guard, and the work-proxy — never `term_flag`, so an
@@ -5103,8 +5146,8 @@ fn run_parallel_optimization_traced_with_upgrade(
     // leaving the core idle for the rest of the solve.
     let unspawned: std::collections::VecDeque<OptimizationWorkerSpec> =
         specs.split_off(spawn).into();
-    for spec in specs {
-        spawn_optimization_worker_spec(spec, &ctx, &mut controls);
+    for (spec, permit) in specs.into_iter().zip(permits) {
+        spawn_optimization_worker_spec(spec, &ctx, &mut controls, permit);
     }
     drop(tx);
     let mut backfill = OptimizationBackfill::new(unspawned, ctx, core_budget);
@@ -5159,6 +5202,7 @@ fn spawn_optimization_worker_spec(
     spec: OptimizationWorkerSpec,
     ctx: &OptimizationSpawnContext,
     controls: &mut WorkerStopControls,
+    permit: ay_sys::compute_budget::ExtraPermit,
 ) {
     let worker_instance = Arc::clone(&ctx.instance);
     let worker_objective = Arc::clone(&ctx.objective);
@@ -5171,23 +5215,28 @@ fn spawn_optimization_worker_spec(
         OptimizationWorkerKind::Complete(run) => {
             let worker_bounds = Arc::clone(&ctx.shared_bounds);
             std::thread::spawn(move || {
-                let tx_improve = tx.clone();
-                // Forward this worker's feasible incumbents to the coordinator,
-                // which re-verifies them before trusting any of them.
-                let mut on_improve = |obj_value: i128, model: &[bool]| {
-                    let _ =
-                        tx_improve.send(WorkerMsg::Improvement(label, obj_value, model.to_vec()));
-                };
-                let solution = run(
-                    worker_instance.as_ref(),
-                    worker_objective.as_ref(),
-                    timeout_dur,
-                    start,
-                    worker_stop.as_ref(),
-                    &mut on_improve,
-                    worker_bounds.as_ref(),
-                );
-                let _ = tx.send(WorkerMsg::Done { label, solution });
+                let _ = permit.run(move || {
+                    let tx_improve = tx.clone();
+                    // Forward this worker's feasible incumbents to the coordinator,
+                    // which re-verifies them before trusting any of them.
+                    let mut on_improve = |obj_value: i128, model: &[bool]| {
+                        let _ = tx_improve.send(WorkerMsg::Improvement(
+                            label,
+                            obj_value,
+                            model.to_vec(),
+                        ));
+                    };
+                    let solution = run(
+                        worker_instance.as_ref(),
+                        worker_objective.as_ref(),
+                        timeout_dur,
+                        start,
+                        worker_stop.as_ref(),
+                        &mut on_improve,
+                        worker_bounds.as_ref(),
+                    );
+                    let _ = tx.send(WorkerMsg::Done { label, solution });
+                });
             })
         }
         // PRIMAL specs go through the STRUCTURALLY verdict-incapable spawn
@@ -5202,6 +5251,7 @@ fn spawn_optimization_worker_spec(
             start,
             worker_stop,
             PrimalSender::new(tx, label),
+            permit,
         ),
     };
     // Retain the handle for the panicked-worker reap (coordinator liveness:
@@ -5334,10 +5384,20 @@ impl OptimizationBackfill {
                 // queue — the next completion retries.
                 return;
             }
+            // A Done/shed marker is logical accounting, not actual worker
+            // exit. Only a returned computational unit can back new work.
+            let permit = match ay_sys::compute_budget::try_extra() {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return,
+                Err(_) => {
+                    self.disable();
+                    return;
+                }
+            };
             let Some(spec) = self.queue.pop_front() else {
                 return;
             };
-            spawn_optimization_worker_spec(spec, ctx, controls);
+            spawn_optimization_worker_spec(spec, ctx, controls, permit);
         }
     }
 }
@@ -5671,7 +5731,7 @@ fn collect_optimization_result(
     // and every spawned worker (up-front or backfilled) sends exactly one
     // completion message, so `finished` must be measured against the live
     // registration count.
-    while finished < controls.spawned() {
+    while finished < controls.spawned() || !backfill.queue.is_empty() {
         // A proven OPTIMUM/UNSAT wins immediately; stop waiting for stragglers.
         if definitive.is_some() {
             break;
@@ -5718,9 +5778,12 @@ fn collect_optimization_result(
                 let reaped = controls.reap_panicked();
                 if reaped > 0 {
                     finished += reaped;
-                    if definitive.is_none() {
-                        backfill.try_backfill(controls, outer_term, hard_deadline);
-                    }
+                }
+                // Actual closure cleanup may return a unit AFTER its last
+                // message. Keep the same pending spec and original deadline;
+                // a new completion message is not required to retry it.
+                if definitive.is_none() {
+                    backfill.try_backfill(controls, outer_term, hard_deadline);
                 }
                 continue;
             }
@@ -5949,7 +6012,7 @@ fn collect_optimization_result(
 ///    `sanitize_optimization_incumbent` (feasibility against the ORIGINAL
 ///    constraints + exact fail-closed objective recompute — the bus `ub`
 ///    value is never trusted, or even read),
-///    [`optimum_upgrade_guard`] (the kani/deductive-checks-locked
+///    [`optimum_upgrade_guard`] (the deductive-checks-locked
 ///    `value <= floor && verify_all_constraints` rule shared with the
 ///    sequential upgrades), and finally the full
 ///    [`sanitize_optimization_solution`] claim gate (which also applies the
@@ -6255,7 +6318,7 @@ fn make_native_deadline_closure(
             // Syscall-free memory pre-check at the wall-clock stride (once per
             // NATIVE_DEADLINE_CLOCK_STRIDE calls — never per-call, so it stays
             // off the per-decision hot path the striding was tuned to protect).
-            // A single relaxed atomic load of the live-heap counter: steadily-
+            // Two relaxed atomic loads of the live-heap counter: steadily-
             // growing heap — e.g. the permanent objective-bound rows the
             // optimize loop accretes, which the learnt-DB shed cannot reclaim —
             // trips this ~CLOCK_STRIDE calls sooner than the coarser strided
@@ -10277,6 +10340,3 @@ fn unsupported_solution() -> PbSolution {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod kani_optimality_upgrade;

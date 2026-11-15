@@ -112,7 +112,12 @@ impl Executor {
             return false;
         }
         let records = self.skolem_witness_records.clone();
-        let roots = self.independent_gate_query_roots();
+        let roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return false;
+            }
+        };
         if roots.is_empty() {
             return false;
         }
@@ -507,6 +512,8 @@ mod tests {
              (get-info :reason-unknown)";
         let off = ay_core::MiscCliFlags {
             no_skolem_witness_sat: true,
+            no_eq_qe_lane: true,
+            no_qsat: true,
             ..ay_core::MiscCliFlags::default()
         };
         let _guard = ay_core::misc_test_override::set(off);

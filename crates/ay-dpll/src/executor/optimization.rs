@@ -23,7 +23,7 @@ use ay_frontend::ObjectiveDirection;
 use ay_lra::{LraSolver, OptimizationResult, OptimizationSense};
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use super::check_sat::contains_symbolic_integer_power;
 use super::model::{EvalValue, Model};
@@ -44,6 +44,119 @@ pub(crate) const MAXSMT_EXACT_MAX_TOTAL_WEIGHT: u64 = 4096;
 /// solver also inherits the enclosing solve's earlier deadline and resource
 /// controls, so this never extends a public optimization query's budget.
 const OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS: u64 = 2_000;
+
+/// The actual witness selected by a native optimization producer after its
+/// private search window has been restored. The obligations pin the published
+/// values/partition; they are validation roots, not public assumptions.
+pub(in crate::executor) struct OptimizationModelPublication<'a> {
+    model: Option<Model>,
+    obligations: &'a [TermId],
+}
+
+impl<'a> OptimizationModelPublication<'a> {
+    pub(in crate::executor) fn into_parts(self) -> (Option<Model>, &'a [TermId]) {
+        (self.model, self.obligations)
+    }
+}
+
+/// One `:id` group's violated weight in an admitted grouped MaxSMT witness,
+/// rendered by `(get-objectives)` in Z3's per-group shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SoftGroupCost {
+    /// The group's `:id` label; `None` is the anonymous group (softs without
+    /// `:id`), which Z3 renders with an empty objective name.
+    pub(crate) id: Option<String>,
+    /// Total weight of this group's softs violated by the witness. When
+    /// `interval` is set this instead holds the group's TOTAL weight (the
+    /// interval's upper end).
+    pub(crate) cost: u64,
+    /// The group follows an unbounded/unattained lexicographic predecessor,
+    /// so no scalar optimum exists; Z3 renders `(interval 0 total)`.
+    pub(crate) interval: bool,
+}
+
+/// `(finite arithmetic values, per-group optima, suffix-interval, relax vars)`.
+type JointSteps<'a> = (
+    Vec<(usize, BigRational)>,
+    Vec<Option<u64>>,
+    bool,
+    Option<std::borrow::Cow<'a, [TermId]>>,
+);
+
+/// `(soft classification roots, (total_cost, violated, group costs))`.
+type JointAccounting = (Vec<TermId>, (u64, Vec<usize>, Vec<SoftGroupCost>));
+
+/// Outcome of the joint lex window search.
+enum JointCaptured {
+    /// The hard base decided the query before any optimization step.
+    Verdict(SolveResult),
+    /// An optimal witness: finite arithmetic values, soft classification
+    /// roots, captured soft accounting `(total_cost, violated, groups)`, and
+    /// the arithmetic values the published witness must attain (all of them
+    /// under lex; only the first objective's under box, whose independent
+    /// optima no single witness realizes jointly).
+    Sat(
+        Box<(
+            Vec<(usize, BigRational)>,
+            Vec<TermId>,
+            (u64, Vec<usize>, Vec<SoftGroupCost>),
+            Vec<(usize, BigRational)>,
+        )>,
+    ),
+}
+
+/// One `:id` partition cell of the soft list: the soft indices sharing a label.
+struct SoftGroup {
+    id: Option<String>,
+    indices: Vec<usize>,
+}
+
+/// Partition soft assertions by `:id` in first-appearance order (Z3's group
+/// objective order). Softs without `:id` form the anonymous group.
+fn partition_soft_groups(softs: &[ay_frontend::SoftAssertion]) -> Vec<SoftGroup> {
+    let mut groups: Vec<SoftGroup> = Vec::new();
+    for (index, soft) in softs.iter().enumerate() {
+        match groups.iter_mut().find(|group| group.id == soft.id) {
+            Some(group) => group.indices.push(index),
+            None => groups.push(SoftGroup {
+                id: soft.id.clone(),
+                indices: vec![index],
+            }),
+        }
+    }
+    groups
+}
+
+/// Per-group violated weights for `(get-objectives)`, derived purely from the
+/// admitted violation partition. Always `Some` for a well-formed partition:
+/// soft objectives render in Z3's shape for every group layout, including a
+/// single anonymous group.
+fn soft_group_costs(
+    softs: &[ay_frontend::SoftAssertion],
+    violated: &[usize],
+) -> Option<Vec<SoftGroupCost>> {
+    let groups = partition_soft_groups(softs);
+    let mut is_violated = vec![false; softs.len()];
+    for &index in violated {
+        *is_violated.get_mut(index)? = true;
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let mut cost = 0u64;
+            for &index in &group.indices {
+                if is_violated[index] {
+                    cost = cost.checked_add(softs[index].weight)?;
+                }
+            }
+            Some(SoftGroupCost {
+                id: group.id.clone(),
+                cost,
+                interval: false,
+            })
+        })
+        .collect()
+}
 
 /// Multi-objective priority requested via `(set-option :opt.priority ...)`.
 ///
@@ -128,8 +241,17 @@ pub(crate) struct ParetoFrontExhaustionExtension {
     source_context_stamp: ay_frontend::SourceContextStamp,
     hard_roots: Box<[TermId]>,
     hard_root_entries: Box<[TermEntryStamp]>,
+    /// The sealed objective inventory authenticated against
+    /// `ctx.objectives()` (the caller's real objectives) and copied into
+    /// the epoch's declared extension.
     objectives: Box<[ay_frontend::Objective]>,
     objective_entries: Box<[TermEntryStamp]>,
+    /// The objective vector the blockers were built over. Identical to
+    /// `objectives` in the pure-arithmetic lane; in the joint lane it is
+    /// the extended vector (real objectives interleaved with synthesized
+    /// soft-group cost objectives), which never enters `ctx`.
+    blocking_objectives: Box<[ay_frontend::Objective]>,
+    blocking_objective_entries: Box<[TermEntryStamp]>,
     blocking: Box<[TermId]>,
     blocking_entries: Box<[TermEntryStamp]>,
 }
@@ -152,6 +274,22 @@ impl ParetoFrontExhaustionExtension {
                 .objectives
                 .iter()
                 .map(|objective| executor.ctx.terms.entry_stamp(objective.term)))
+            && self.blocking_objective_entries.len() == self.blocking_objectives.len()
+            && self
+                .blocking_objective_entries
+                .iter()
+                .copied()
+                .map(Some)
+                .eq(self
+                    .blocking_objectives
+                    .iter()
+                    .map(|objective| executor.ctx.terms.entry_stamp(objective.term)))
+    }
+
+    /// Whether the blocker construction had no objective inventory at
+    /// all (the declaration gate's emptiness test).
+    pub(in crate::executor) fn inventory_is_empty(&self) -> bool {
+        self.blocking_objectives.is_empty()
     }
 
     pub(in crate::executor) fn is_current(&self, executor: &Executor) -> bool {
@@ -200,12 +338,53 @@ pub(in crate::executor) struct ParetoFrontExhaustionBinding {
     pub(in crate::executor) blocking_entries: Box<[TermEntryStamp]>,
 }
 
+/// Borrowed per-call data for one joint Pareto search: the sealed real
+/// objectives, the extended objective vector with its step map, and the
+/// soft relaxation (vars plus unasserted clauses).
+struct JointParetoFrame<'a> {
+    sealed_objectives: &'a [ay_frontend::Objective],
+    sequence: &'a [ay_frontend::ObjectiveStep],
+    extended: &'a [ay_frontend::Objective],
+    step_map: &'a [ParetoStepKind],
+    softs: &'a [ay_frontend::SoftAssertion],
+    groups: &'a [SoftGroup],
+    soft_terms: &'a [TermId],
+    soft_weights: &'a [u64],
+    relax_vars: &'a [TermId],
+    relax_clauses: &'a [TermId],
+}
+
 /// Outcome of one Pareto feasibility probe (see [`Executor::pareto_probe`]).
 ///
 /// Only the verdict matters to the caller: the seed probe just needs to know
 /// whether a non-dominated feasible point exists, and the optimal witness +
 /// objective values are read from `self.last_model` after the lex-push, not from
 /// here. (Carrying the model/values in the variant would otherwise be dead.)
+/// One position of the joint Pareto extended objective vector: a real
+/// arithmetic objective (by its declaration index) or a soft group (by
+/// partition index) whose synthesized cost term sits at this position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParetoStepKind {
+    Arithmetic(usize),
+    Group(usize),
+}
+
+/// Captured outcome of one joint Pareto search call, mirroring
+/// [`JointCaptured`]: publication happens after the transactional cleanup.
+enum JointParetoCaptured {
+    /// The hard base decided the query, or the front is exhausted.
+    Verdict(SolveResult),
+    /// An emitted point: finite arithmetic values (real indices), soft
+    /// classification roots, and captured soft accounting.
+    Sat(
+        Box<(
+            Vec<(usize, BigRational)>,
+            Vec<TermId>,
+            (u64, Vec<usize>, Vec<SoftGroupCost>),
+        )>,
+    ),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParetoProbe {
     /// Feasible under the probe's assumptions.
@@ -403,6 +582,7 @@ impl Executor {
     pub(in crate::executor) fn maxsmt_check_sat(&mut self) -> Result<SolveResult> {
         self.last_sat_certificate = None;
         self.last_soft_violations = None;
+        self.last_soft_group_costs = None;
         let softs = self.ctx.soft_constraints().to_vec();
         debug_assert!(
             !softs.is_empty(),
@@ -424,16 +604,24 @@ impl Executor {
             return Ok(result);
         }
 
-        // `:id` is semantic: it partitions soft assertions into independent
-        // optimization objectives. The current executor/result presentation is
-        // a single flat weighted objective, so ignoring IDs would solve and
-        // certify a different problem. Fail closed until exact group semantics
-        // and a representable result are implemented.
-        if softs.iter().any(|soft| soft.id.is_some()) {
-            self.invalidate_last_check_result();
-            self.last_unknown_reason = Some(UnknownReason::Unsupported);
-            self.last_result = Some(SolveResult::Unknown);
-            return Ok(SolveResult::Unknown);
+        // `:id` is semantic (Z3): it partitions soft assertions into separate
+        // group objectives. Under the default (lex) priority they optimize
+        // lexicographically in first-appearance order
+        // (`maxsmt_solve_grouped_lex`); under `box` each group optimizes
+        // independently (`maxsmt_solve_grouped_box`). A single group (named
+        // or anonymous) under lex/box is the flat problem the existing
+        // engines already solve. Under `pareto` with a multi-objective
+        // vector the stateful front enumerator owns the query; a single
+        // unified objective degenerates to the flat optimum (z3 too).
+        let groups = partition_soft_groups(&softs);
+        if self.opt_priority() == OptPriority::Pareto {
+            let objectives = self.ctx.objectives().to_vec();
+            // A single unified objective degenerates to plain optimization
+            // in z3 (optimum re-emitted, never exhausted): the flat engine
+            // below already has exactly that behavior for one group.
+            if groups.len() > 1 || !objectives.is_empty() {
+                return self.joint_optimize_pareto(&objectives);
+            }
         }
 
         // Snapshot the assertion stack so the temporary relaxation clauses (and
@@ -454,7 +642,25 @@ impl Executor {
             Some(ay_frontend::OptionValue::String(s)) => s.clone(),
             _ => "binary".to_string(),
         };
+        // Box publication needs the solver's independent per-group optima
+        // (the published witness attains only the first group's), so the box
+        // arm returns them alongside the usual outcome tuple.
+        let mut solver_group_costs: Option<Vec<SoftGroupCost>> = None;
         let outcome = match engine.as_str() {
+            // Grouped softs always take a grouped engine (the priority gate
+            // above already refused pareto): OLL covers only non-grouped
+            // instances, and the flat baseline would optimize the wrong
+            // (summed) objective.
+            "binary" | "oll" if groups.len() > 1 && self.opt_priority() == OptPriority::Box => {
+                match self.maxsmt_solve_grouped_box(&softs, &groups) {
+                    Ok((tuple, costs)) => {
+                        solver_group_costs = Some(costs);
+                        Ok(tuple)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "binary" | "oll" if groups.len() > 1 => self.maxsmt_solve_grouped_lex(&softs, &groups),
             "binary" => self.maxsmt_solve(&softs),
             "oll" => match self.maxsmt_solve_oll(&softs) {
                 // OLL covered the instance: use its optimum directly. Any
@@ -549,6 +755,7 @@ impl Executor {
         self.last_soft_cost = None;
         self.last_soft_cost_optimal = false;
         self.last_soft_violations = None;
+        self.last_soft_group_costs = None;
         // Bind the public certificate to the exact soft partition established
         // while the relaxation variables still existed.  A satisfied soft is
         // an additional positive root; a violated soft is an additional
@@ -564,16 +771,17 @@ impl Executor {
         } else {
             Vec::new()
         };
-        let emitted = match self.emit_sat_verdict(captured_result, &classification_roots) {
-            Ok(emitted) => emitted,
-            Err(error) => {
-                // Errors are also non-admissions. The executor remains usable
-                // after many recoverable command errors, so no partial optimum
-                // or pre-error witness may remain queryable.
-                self.invalidate_last_check_result();
-                return Err(error);
-            }
-        };
+        let emitted =
+            match self.emit_captured_optimization_witness(captured_result, &classification_roots) {
+                Ok(emitted) => emitted,
+                Err(error) => {
+                    // Errors are also non-admissions. The executor remains usable
+                    // after many recoverable command errors, so no partial optimum
+                    // or pre-error witness may remain queryable.
+                    self.invalidate_last_check_result();
+                    return Err(error);
+                }
+            };
         if emitted == SolveResult::Sat {
             #[cfg(test)]
             if self.forced_maxsmt_post_emit_soft_flip.replace(false) {
@@ -610,9 +818,18 @@ impl Executor {
             }
 
             // Publish the objective only after the final witness itself was
-            // admitted and re-accounted.
+            // admitted and re-accounted. Per-group costs are a pure function
+            // of the admitted violation partition, so deriving them here (not
+            // in the solver) keeps them bound to the final witness by the
+            // same equality check above.
             self.last_soft_cost = Some(captured_cost);
             self.last_soft_cost_optimal = captured_optimal;
+            // Box group costs are independent optima the published witness
+            // need not attain (it attains the first group's), so they come
+            // from the solver; every other path derives them from the
+            // admitted violation partition.
+            self.last_soft_group_costs =
+                solver_group_costs.or_else(|| soft_group_costs(&softs, &captured_violations));
             self.last_soft_violations = Some(captured_violations);
         } else {
             // A fail-closed model-validation downgrade admits neither a witness
@@ -624,6 +841,7 @@ impl Executor {
             self.last_soft_cost = None;
             self.last_soft_cost_optimal = false;
             self.last_soft_violations = None;
+            self.last_soft_group_costs = None;
             self.finite_objective_values.clear();
             self.unbounded_objectives.clear();
             self.infinitesimal_objectives.clear();
@@ -990,6 +1208,296 @@ impl Executor {
             violated_weight,
             false,
             violated_softs,
+        ))
+    }
+
+    /// Assert every committed group pin (a proven per-group optimum bound)
+    /// inside a grouped-lex probe scope.
+    fn maxsmt_assert_group_pins(&mut self, pins: &[(Vec<TermId>, Vec<u64>, u64)]) {
+        for (terms, weights, bound) in pins {
+            self.maxsmt_assert_weighted_at_most_w(terms, weights, *bound);
+        }
+    }
+
+    /// Exact optimum of one group under the committed pins, by binary search
+    /// on the group's violated-weight budget (feasibility is monotone in the
+    /// budget with pins fixed). `None` when a probe is inconclusive.
+    fn maxsmt_group_optimum(
+        &mut self,
+        pins: &[(Vec<TermId>, Vec<u64>, u64)],
+        group_relax: &[TermId],
+        group_weights: &[u64],
+        group_total: u64,
+    ) -> Option<u64> {
+        let mut lo: u64 = 0;
+        let mut hi: u64 = group_total;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let probe_pins = pins.to_vec();
+            let probe_relax = group_relax.to_vec();
+            let probe_weights = group_weights.to_vec();
+            let probe = self.maxsmt_scoped_checked_decision(move |exec| {
+                exec.maxsmt_assert_group_pins(&probe_pins);
+                exec.maxsmt_assert_weighted_at_most_w(&probe_relax, &probe_weights, mid);
+            });
+            match probe {
+                CheckedOptimizationDecision::Sat => hi = mid,
+                CheckedOptimizationDecision::Unsat => lo = mid + 1,
+                CheckedOptimizationDecision::Unknown => return None,
+            }
+        }
+        Some(lo)
+    }
+
+    /// Grouped MaxSMT search: Z3 `:id` semantics under lexicographic priority.
+    ///
+    /// Groups optimize in first-appearance order. Each group's exact optimum
+    /// is found with the same trusted weighted-at-most binary search the flat
+    /// exact lane uses, then committed as a hard pin (`weighted-at-most-W*`
+    /// over that group's relaxation indicators) inside every later probe, so
+    /// later groups optimize subject to all earlier optima — exactly Z3's
+    /// lexicographic combination of group objectives. The returned tuple has
+    /// the flat engine's shape `(result, model, total_cost, optimal,
+    /// violated)` where `total_cost` is the sum of the per-group optima, so
+    /// the caller's final-witness accounting binds unchanged; per-group
+    /// costs are re-derived from `violated` at publication.
+    ///
+    /// Exactness envelope: the TOTAL soft weight must fit the flat exact
+    /// lane's cap ([`MAXSMT_EXACT_MAX_TOTAL_WEIGHT`]), because every probe
+    /// re-asserts all pins and the copy encoding is sized by total weight.
+    /// Above the cap there is no grouped approximate lane — the flat
+    /// count-then-greedy fallback optimizes a different objective — so the
+    /// search fails closed to `Unknown` instead.
+    fn maxsmt_solve_grouped_lex(
+        &mut self,
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+    ) -> Result<(SolveResult, Option<Model>, u64, bool, Vec<usize>)> {
+        debug_assert!(
+            groups.len() > 1,
+            "grouped lex solver requires multiple groups"
+        );
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        let Some(total_weight) = soft_weights
+            .iter()
+            .try_fold(0u64, |sum, &weight| sum.checked_add(weight))
+        else {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok((SolveResult::Unknown, None, 0, false, Vec::new()));
+        };
+        if total_weight > MAXSMT_EXACT_MAX_TOTAL_WEIGHT {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok((SolveResult::Unknown, None, 0, false, Vec::new()));
+        }
+
+        let relax_vars = self.maxsmt_build_relaxation(&soft_terms);
+
+        // Base feasibility (all relaxations free): is the hard formula SAT?
+        match self.maxsmt_scoped_checked_decision(|_| {}) {
+            CheckedOptimizationDecision::Sat => {}
+            CheckedOptimizationDecision::Unsat => {
+                return Ok((SolveResult::unsat(), None, 0, true, Vec::new()));
+            }
+            CheckedOptimizationDecision::Unknown => {
+                return Ok((SolveResult::Unknown, None, 0, false, Vec::new()));
+            }
+        }
+
+        // Committed optima of earlier groups, re-asserted in every probe.
+        let mut pins: Vec<(Vec<TermId>, Vec<u64>, u64)> = Vec::new();
+        for group in groups {
+            let group_relax: Vec<TermId> = group.indices.iter().map(|&i| relax_vars[i]).collect();
+            let group_weights: Vec<u64> = group.indices.iter().map(|&i| soft_weights[i]).collect();
+            let group_total: u64 = group_weights.iter().sum();
+            let Some(optimum) =
+                self.maxsmt_group_optimum(&pins, &group_relax, &group_weights, group_total)
+            else {
+                // Inconclusive probe (resource limit): report a feasible
+                // model under the committed pins with its TRUE violated
+                // weights, marked approximate — never a proven bound
+                // masquerading as an optimum.
+                let fallback_pins = pins.clone();
+                let (_, model) = self.maxsmt_scoped_check_sat(move |exec| {
+                    exec.maxsmt_assert_group_pins(&fallback_pins);
+                })?;
+                let Some((cost, violated)) =
+                    self.maxsmt_violations(&soft_terms, &relax_vars, &soft_weights, model.as_ref())
+                else {
+                    return Ok(self.maxsmt_accounting_failure());
+                };
+                return Ok((SolveResult::Sat, model, cost, false, violated));
+            };
+            pins.push((group_relax, group_weights, optimum));
+        }
+
+        self.maxsmt_grouped_final_witness(&soft_terms, &soft_weights, &relax_vars, groups, &pins)
+    }
+
+    /// Final grouped solve under every committed pin, capturing the
+    /// lex-optimal model and verifying it realizes EVERY group's proven
+    /// optimum (not merely the summed total — two groups could trade
+    /// violations and keep the sum while breaking lex order).
+    fn maxsmt_grouped_final_witness(
+        &mut self,
+        soft_terms: &[TermId],
+        soft_weights: &[u64],
+        relax_vars: &[TermId],
+        groups: &[SoftGroup],
+        pins: &[(Vec<TermId>, Vec<u64>, u64)],
+    ) -> Result<(SolveResult, Option<Model>, u64, bool, Vec<usize>)> {
+        let final_pins = pins.to_vec();
+        let (final_result, model) = self.maxsmt_scoped_check_sat(move |exec| {
+            exec.maxsmt_assert_group_pins(&final_pins);
+        })?;
+        if !final_result.is_sat() {
+            // Every pin bound was proven feasible in sequence; fall back
+            // soundly to a feasible (approximate) witness.
+            let (_, model) = self.maxsmt_scoped_check_sat(|_| {})?;
+            let Some((cost, violated)) =
+                self.maxsmt_violations(soft_terms, relax_vars, soft_weights, model.as_ref())
+            else {
+                return Ok(self.maxsmt_accounting_failure());
+            };
+            return Ok((SolveResult::Sat, model, cost, false, violated));
+        }
+        let Some((violated_weight, violated_softs)) =
+            self.maxsmt_violations(soft_terms, relax_vars, soft_weights, model.as_ref())
+        else {
+            return Ok(self.maxsmt_accounting_failure());
+        };
+        let mut is_violated = vec![false; soft_terms.len()];
+        for &index in &violated_softs {
+            is_violated[index] = true;
+        }
+        for (group, (_, _, bound)) in groups.iter().zip(pins.iter()) {
+            let group_cost: u64 = group
+                .indices
+                .iter()
+                .filter(|&&i| is_violated[i])
+                .map(|&i| soft_weights[i])
+                .sum();
+            if group_cost != *bound {
+                return Ok(self.maxsmt_accounting_failure());
+            }
+        }
+        Ok((
+            SolveResult::Sat,
+            model,
+            violated_weight,
+            true,
+            violated_softs,
+        ))
+    }
+
+    /// Grouped MaxSMT search under Z3's `box` priority: each `:id` group is
+    /// optimized INDEPENDENTLY against the hard assertions alone, and the
+    /// published witness is the FIRST group's optimum model (z3's box
+    /// get-model behavior). Returns the flat outcome tuple (whose cost and
+    /// violations describe that witness over ALL softs) plus the independent
+    /// per-group optima for `(get-objectives)` — later groups' optima are
+    /// generally NOT attained by the witness, exactly as in z3.
+    ///
+    /// Same exactness envelope as [`Self::maxsmt_solve_grouped_lex`]: total
+    /// soft weight must fit the exact lane's cap, else fail closed.
+    fn maxsmt_solve_grouped_box(
+        &mut self,
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+    ) -> Result<(
+        (SolveResult, Option<Model>, u64, bool, Vec<usize>),
+        Vec<SoftGroupCost>,
+    )> {
+        debug_assert!(groups.len() > 1, "grouped box solver requires groups");
+        let unknown = (
+            (SolveResult::Unknown, None, 0, false, Vec::new()),
+            Vec::new(),
+        );
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        let Some(total_weight) = soft_weights
+            .iter()
+            .try_fold(0u64, |sum, &weight| sum.checked_add(weight))
+        else {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(unknown);
+        };
+        if total_weight > MAXSMT_EXACT_MAX_TOTAL_WEIGHT {
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(unknown);
+        }
+
+        let relax_vars = self.maxsmt_build_relaxation(&soft_terms);
+        match self.maxsmt_scoped_checked_decision(|_| {}) {
+            CheckedOptimizationDecision::Sat => {}
+            CheckedOptimizationDecision::Unsat => {
+                return Ok((
+                    (SolveResult::unsat(), None, 0, true, Vec::new()),
+                    Vec::new(),
+                ));
+            }
+            CheckedOptimizationDecision::Unknown => return Ok(unknown),
+        }
+
+        let mut group_costs = Vec::with_capacity(groups.len());
+        let mut first_model: Option<Model> = None;
+        for (group_index, group) in groups.iter().enumerate() {
+            let group_relax: Vec<TermId> = group.indices.iter().map(|&i| relax_vars[i]).collect();
+            let group_weights: Vec<u64> = group.indices.iter().map(|&i| soft_weights[i]).collect();
+            let group_total: u64 = group_weights.iter().sum();
+            // Independent: no pins from other groups, ever.
+            let Some(optimum) =
+                self.maxsmt_group_optimum(&[], &group_relax, &group_weights, group_total)
+            else {
+                return Ok(unknown);
+            };
+            group_costs.push(SoftGroupCost {
+                id: group.id.clone(),
+                cost: optimum,
+                interval: false,
+            });
+            if group_index == 0 {
+                let witness_relax = group_relax.clone();
+                let witness_weights = group_weights.clone();
+                let (result, model) = self.maxsmt_scoped_check_sat(move |exec| {
+                    exec.maxsmt_assert_weighted_at_most_w(
+                        &witness_relax,
+                        &witness_weights,
+                        optimum,
+                    );
+                })?;
+                if !result.is_sat() {
+                    return Ok((self.maxsmt_accounting_failure(), Vec::new()));
+                }
+                first_model = model;
+            }
+        }
+
+        let Some((total_cost, violated)) = self.maxsmt_violations(
+            &soft_terms,
+            &relax_vars,
+            &soft_weights,
+            first_model.as_ref(),
+        ) else {
+            return Ok((self.maxsmt_accounting_failure(), Vec::new()));
+        };
+        // The witness must attain the FIRST group's proven optimum.
+        let mut is_violated = vec![false; softs.len()];
+        for &index in &violated {
+            is_violated[index] = true;
+        }
+        let first_witnessed: u64 = groups[0]
+            .indices
+            .iter()
+            .filter(|&&i| is_violated[i])
+            .map(|&i| soft_weights[i])
+            .sum();
+        if first_witnessed != group_costs[0].cost {
+            return Ok((self.maxsmt_accounting_failure(), Vec::new()));
+        }
+        Ok((
+            (SolveResult::Sat, first_model, total_cost, true, violated),
+            group_costs,
         ))
     }
 
@@ -1644,7 +2152,7 @@ impl Executor {
             self.record_unknown_from_origin(UnknownOrigin::UnsupportedArithmeticFragment);
             self.record_unknown_diagnostic(
                 UnknownReason::UnsupportedArithmetic,
-                "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
+                "exponentiation with a symbolic exponent (or a native `^` exponent that is not a positive integer literal) is accepted and typed but has no sound decision procedure",
             );
             return Ok(SolveResult::Unknown);
         }
@@ -1774,6 +2282,16 @@ impl Executor {
         // "unbounded" and are skipped inside `warn_unbounded_objectives`.
         self.warn_unbounded_objectives(&objectives);
 
+        // Soft constraints present: the joint engine owns base feasibility
+        // (its relaxation must be in place first) and the whole search.
+        if !self.ctx.soft_constraints().is_empty() {
+            return match self.opt_priority() {
+                OptPriority::Box => self.joint_optimize_box(&objectives),
+                OptPriority::Pareto => self.joint_optimize_pareto(&objectives),
+                OptPriority::Lex => self.joint_optimize_lex(&objectives),
+            };
+        }
+
         let base_result = self.check_sat_internal()?;
         if base_result != SolveResult::Sat {
             // Hard constraints alone are UNSAT/unknown: no Pareto front exists.
@@ -1790,29 +2308,8 @@ impl Executor {
         // constraint before the next objective (lex) or not (box). Pareto is
         // STATEFUL: it emits one Pareto-optimal point per `(check-sat)`.
         let priority = self.opt_priority();
-        // PARETO LIMITATION (honest restriction): Pareto enumeration is supported
-        // ONLY for objectives over FINITE domains (Int and BitVec), where the
-        // Pareto front is finite and the GIA lex-push is sound AND complete (every
-        // emitted point is genuinely Pareto-optimal, no point is missed, verified
-        // against Z3). REAL objectives are NOT supported in pareto mode: AY's LRA
-        // multi-objective optimizer is itself incomplete (it reports `oo` for some
-        // derived-bounded Real objectives), so a Real lex-push could land on a
-        // non-Pareto point — which we must never emit. Rather than risk an unsound
-        // point, a Real objective under `pareto` warns once and falls back to lex
-        // (sound per-objective optima). Int/BV pareto is unaffected.
-        if priority == OptPriority::Pareto
-            && objectives
-                .iter()
-                .any(|o| matches!(self.ctx.terms.sort(o.term), Sort::Real))
-        {
-            safe_eprintln!(
-                "Warning: opt.priority=pareto is supported only for Int/BitVec objectives \
-                 (finite Pareto front); a Real objective is present, so falling back to \
-                 lexicographic for soundness."
-            );
-            self.pareto_state = None;
-            return self.optimize_lex(&objectives);
-        }
+        // Pareto uses a certified seed's closed weak-dominance cone, including
+        // Real and infinite Int fronts. Each call emits at most one point.
         match priority {
             OptPriority::Box => self.optimize_box(&objectives),
             OptPriority::Lex => self.optimize_lex(&objectives),
@@ -1852,6 +2349,35 @@ impl Executor {
     /// scalar outcome is recorded unavailable (Z3 uses an interval there).
     /// Caller guarantees the hard constraints are SAT.
     fn optimize_lex(&mut self, objectives: &[ay_frontend::Objective]) -> Result<SolveResult> {
+        match self.optimize_lex_search(objectives) {
+            Ok(Some(finite_values)) => {
+                // Certify the captured optimum witness against the restored USER
+                // formula, not against the transient lex commits. Exact value
+                // roots bind every attainable finite prefix outcome to the
+                // final consumer-visible model.
+                self.finalize_optimization(&finite_values, true)
+            }
+            Ok(None) => Ok(self.optimization_inconclusive()),
+            Err(error) => {
+                // An internal probe may have minted a certificate before a later
+                // objective errored. No partial witness/objective is public.
+                self.invalidate_last_check_result();
+                Err(error)
+            }
+        }
+    }
+
+    /// The lex search half of [`Self::optimize_lex`] WITHOUT final
+    /// publication: runs the commit-as-you-go optimization over
+    /// `objectives` transactionally and returns the attained finite
+    /// values (keyed by position in `objectives`), leaving the witness
+    /// in `last_model`. The joint Pareto lane pushes with this over its
+    /// extended objective vector (whose indices are not `ctx` objective
+    /// indices) and publishes through the joint finalizer instead.
+    fn optimize_lex_search(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+    ) -> Result<Option<Vec<(usize, BigRational)>>> {
         // Earlier-objective optimum commits constrain only this lexicographic
         // search. They are NOT user assertions: leaking one into the persistent
         // stack makes a later check solve a strictly stronger problem (for
@@ -1917,21 +2443,1165 @@ impl Executor {
         self.ctx.truncate_assertions(assertion_snapshot);
 
         match search {
-            Ok(true) => {
-                // Certify the captured optimum witness against the restored USER
-                // formula, not against the transient lex commits. Exact value
-                // roots bind every attainable finite prefix outcome to the
-                // final consumer-visible model.
-                self.finalize_optimization(&finite_values, true)
+            Ok(true) => Ok(Some(finite_values)),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Joint lexicographic optimization over arithmetic objectives AND soft
+    /// groups in unified declaration order (Z3's single objective list).
+    ///
+    /// One transactional window: the soft relaxation is asserted once, then
+    /// each step in `objective_sequence` is optimized with all earlier
+    /// steps' optima committed — arithmetic optima as bound commits (as in
+    /// [`Self::optimize_lex`]), soft-group optima as weighted-at-most pins
+    /// over the group's relaxation indicators (as in
+    /// [`Self::maxsmt_solve_grouped_lex`]). An unbounded or unattained
+    /// arithmetic step ends the search like pure lex: later arithmetic
+    /// objectives are unavailable and later soft groups render as
+    /// `(interval 0 total)`, matching z3. Only the lex priority is joint for
+    /// now; box/pareto and above-cap total soft weight fail closed to
+    /// `unknown`. Caller guarantees objectives are sort-valid.
+    fn joint_optimize_lex(&mut self, objectives: &[ay_frontend::Objective]) -> Result<SolveResult> {
+        self.joint_optimize(objectives, OptPriority::Lex)
+    }
+
+    fn joint_optimize_box(&mut self, objectives: &[ay_frontend::Objective]) -> Result<SolveResult> {
+        self.joint_optimize(objectives, OptPriority::Box)
+    }
+
+    /// Relaxation vars and their `(or soft relax)` clause terms for the
+    /// joint Pareto search, created WITHOUT asserting and WITHOUT symbol
+    /// registration: the exhaustion extension must be built while
+    /// `ctx.assertions` is still exactly the authored set, and registering
+    /// a symbol mid-call would advance the source revision and stale the
+    /// public query epoch the terminal declaration authenticates against
+    /// (the vars are referenced by TermId everywhere in this lane).
+    fn pareto_relaxation_terms(&mut self, soft_terms: &[TermId]) -> (Vec<TermId>, Vec<TermId>) {
+        let mut relax_vars = Vec::with_capacity(soft_terms.len());
+        let mut clauses = Vec::with_capacity(soft_terms.len());
+        for (i, &soft_term) in soft_terms.iter().enumerate() {
+            let relax = self
+                .ctx
+                .terms
+                .mk_fresh_named_var(format!("__ay_soft_relax_{i}"), Sort::Bool);
+            relax_vars.push(relax);
+            clauses.push(self.ctx.terms.mk_or(vec![soft_term, relax]));
+        }
+        (relax_vars, clauses)
+    }
+
+    /// The Int term `Σ (ite relax_i w_i 0)` — group `group`'s violated
+    /// weight as an objective term for the shared Pareto enumerator.
+    fn pareto_group_cost_term(
+        &mut self,
+        group: &SoftGroup,
+        relax_vars: &[TermId],
+        soft_weights: &[u64],
+    ) -> TermId {
+        let mut parts = Vec::with_capacity(group.indices.len());
+        for &i in &group.indices {
+            let weight = self.ctx.terms.mk_int(BigInt::from(soft_weights[i]));
+            let zero = self.ctx.terms.mk_int(BigInt::zero());
+            parts.push(self.ctx.terms.mk_ite(relax_vars[i], weight, zero));
+        }
+        match parts.len() {
+            1 => parts[0],
+            _ => self.ctx.terms.mk_app(Symbol::named("+"), parts, Sort::Int),
+        }
+    }
+
+    /// Joint soft + arithmetic Pareto enumeration (Z3's stateful front
+    /// protocol over the unified declaration order): each soft group
+    /// contributes one synthesized minimize objective (its weighted
+    /// violation sum over the relaxation), and the enumerator mirrors
+    /// [`Self::optimize_pareto`]'s GIA (seed probe under blockers, lex
+    /// push, emit) with joint publication and the same certified seed cone.
+    fn joint_optimize_pareto(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+    ) -> Result<SolveResult> {
+        let softs: Vec<ay_frontend::SoftAssertion> = self.ctx.soft_constraints().to_vec();
+        let groups = partition_soft_groups(&softs);
+        let sequence: Vec<ay_frontend::ObjectiveStep> = self.ctx.objective_sequence().to_vec();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        if !self.joint_pareto_consistent(objectives, &groups, &sequence, &soft_weights) {
+            return Ok(self.optimization_inconclusive());
+        }
+        // Single unified objective never reaches here (routing sends it
+        // to the flat/lex lanes, matching z3's degeneration); guard
+        // anyway so a stray call cannot engage the enumerator.
+        if sequence.len() <= 1 {
+            return Ok(self.optimization_inconclusive());
+        }
+
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let (relax_vars, relax_clauses) = self.pareto_relaxation_terms(&soft_terms);
+        let Some((extended, step_map)) = self.joint_pareto_extended_objectives(
+            objectives,
+            &groups,
+            &sequence,
+            &relax_vars,
+            &soft_weights,
+        ) else {
+            return Ok(self.optimization_inconclusive());
+        };
+        let frame = JointParetoFrame {
+            sealed_objectives: objectives,
+            sequence: &sequence,
+            extended: &extended,
+            step_map: &step_map,
+            softs: &softs,
+            groups: &groups,
+            soft_terms: &soft_terms,
+            soft_weights: &soft_weights,
+            relax_vars: &relax_vars,
+            relax_clauses: &relax_clauses,
+        };
+
+        let mut state = self.pareto_state.take().unwrap_or_default();
+        if state
+            .emitted
+            .iter()
+            .any(|point| point.len() != extended.len())
+        {
+            // The objective inventory changed mid-enumeration; restart
+            // rather than misalign points.
+            state = ParetoState::default();
+        }
+        let base_assertion_count = self.ctx.assertions.len();
+        let outcome = self.joint_pareto_search(&frame, &mut state);
+        self.ctx.truncate_assertions(base_assertion_count);
+        match outcome {
+            Ok(Some(JointParetoCaptured::Sat(captured))) => {
+                let (finite_values, soft_roots, soft_publication) = *captured;
+                let witness_values = finite_values.clone();
+                self.finalize_joint_optimization(
+                    &finite_values,
+                    &soft_roots,
+                    &soft_publication,
+                    &witness_values,
+                )
             }
-            Ok(false) => Ok(self.optimization_inconclusive()),
+            Ok(Some(JointParetoCaptured::Verdict(verdict))) => Ok(verdict),
+            Ok(None) => Ok(self.optimization_inconclusive()),
             Err(error) => {
-                // An internal probe may have minted a certificate before a later
-                // objective errored. No partial witness/objective is public.
                 self.invalidate_last_check_result();
                 Err(error)
             }
         }
+    }
+
+    /// The extended objective vector in declaration order (real
+    /// objectives interleaved with one synthesized group-cost minimize
+    /// objective per soft group) plus the per-position map back.
+    fn joint_pareto_extended_objectives(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+        relax_vars: &[TermId],
+        soft_weights: &[u64],
+    ) -> Option<(Vec<ay_frontend::Objective>, Vec<ParetoStepKind>)> {
+        let mut extended = Vec::with_capacity(sequence.len());
+        let mut step_map = Vec::with_capacity(sequence.len());
+        for step in sequence {
+            match step {
+                ay_frontend::ObjectiveStep::Arithmetic(index) => {
+                    extended.push(objectives[*index].clone());
+                    step_map.push(ParetoStepKind::Arithmetic(*index));
+                }
+                ay_frontend::ObjectiveStep::SoftGroup(id) => {
+                    let group_index = groups.iter().position(|group| &group.id == id)?;
+                    let cost =
+                        self.pareto_group_cost_term(&groups[group_index], relax_vars, soft_weights);
+                    extended.push(ay_frontend::Objective {
+                        direction: ObjectiveDirection::Minimize,
+                        term: cost,
+                    });
+                    step_map.push(ParetoStepKind::Group(group_index));
+                }
+            }
+        }
+        Some((extended, step_map))
+    }
+
+    /// The joint Pareto gates shared with the lex/box engines: the
+    /// declared sequence must exactly recount the live objectives and
+    /// soft groups, and the total soft weight must fit the exact lane.
+    fn joint_pareto_consistent(
+        &self,
+        objectives: &[ay_frontend::Objective],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+        soft_weights: &[u64],
+    ) -> bool {
+        let arith_steps: Vec<usize> = sequence
+            .iter()
+            .filter_map(|step| match step {
+                ay_frontend::ObjectiveStep::Arithmetic(index) => Some(*index),
+                ay_frontend::ObjectiveStep::SoftGroup(_) => None,
+            })
+            .collect();
+        let group_steps: Vec<Option<String>> = sequence
+            .iter()
+            .filter_map(|step| match step {
+                ay_frontend::ObjectiveStep::SoftGroup(id) => Some(id.clone()),
+                ay_frontend::ObjectiveStep::Arithmetic(_) => None,
+            })
+            .collect();
+        let total_weight = soft_weights
+            .iter()
+            .try_fold(0u64, |sum, &weight| sum.checked_add(weight));
+        arith_steps == (0..objectives.len()).collect::<Vec<_>>()
+            && group_steps
+                == groups
+                    .iter()
+                    .map(|group| group.id.clone())
+                    .collect::<Vec<_>>()
+            && total_weight.is_some_and(|total| total <= MAXSMT_EXACT_MAX_TOTAL_WEIGHT)
+    }
+
+    /// Strict improvement of a soft cost uses its AUTHORED Boolean domain at
+    /// the endpoints: nonnegative costs cannot improve below zero, and a cost
+    /// is below its total weight exactly when some positive-weight literal is
+    /// false. This avoids asking mixed arithmetic to rediscover those Boolean
+    /// identities. Interior bounds keep the existing exact Int comparison.
+    fn joint_pareto_point_blocker(
+        &mut self,
+        frame: &JointParetoFrame<'_>,
+        point: &[BigRational],
+    ) -> Result<TermId> {
+        use super::model::evaluation_copies;
+        use ay_core::term::{CountedBuiltin, CountedTermBuilder};
+        let unavailable = || {
+            ExecutorError::UnsupportedOptimization(
+                "joint Pareto blocker construction unavailable under original controls".into(),
+            )
+        };
+        if point.len() != frame.extended.len() || point.len() != frame.step_map.len() {
+            return Err(unavailable());
+        }
+        let scope =
+            evaluation_copies::EvaluationCopyScope::enter(self).map_err(|_| unavailable())?;
+        let metadata = point
+            .len()
+            .checked_mul(std::mem::size_of::<TermId>() + std::mem::size_of::<(usize, usize)>())
+            .and_then(|bytes| {
+                frame
+                    .relax_vars
+                    .len()
+                    .checked_mul(std::mem::size_of::<TermId>())
+                    .and_then(|vars| bytes.checked_add(vars))
+            })
+            .ok_or_else(unavailable)?;
+        let visits = point
+            .len()
+            .checked_add(frame.relax_vars.len())
+            .and_then(|visits| visits.checked_mul(2))
+            .ok_or_else(unavailable)?;
+        if !evaluation_copies::pay(visits, metadata) || !evaluation_copies::validate(self) {
+            return Err(unavailable());
+        }
+        let cost_domain = |group_index: usize, value: &BigRational| {
+            let total = frame
+                .groups
+                .get(group_index)?
+                .indices
+                .iter()
+                .try_fold(0u64, |sum, &index| {
+                    sum.checked_add(*frame.soft_weights.get(index)?)
+                })?;
+            let cost = value
+                .is_integer()
+                .then(|| value.numer().to_u64())
+                .flatten()
+                .filter(|&cost| cost <= total)?;
+            Some((cost, total))
+        };
+        let mut scalar_bytes = 0usize;
+        for (kind, value) in frame.step_map.iter().zip(point) {
+            if !evaluation_copies::pay(0, 0) || !evaluation_copies::validate(self) {
+                return Err(unavailable());
+            }
+            let copies_scalar = match kind {
+                ParetoStepKind::Arithmetic(_) => true,
+                ParetoStepKind::Group(index) => {
+                    let (cost, total) = cost_domain(*index, value).ok_or_else(unavailable)?;
+                    cost != 0 && cost != total
+                }
+            };
+            // Boolean endpoints borrow a u64 cost and create NO rational
+            // buffers. Price only the numeric comparisons actually constructed.
+            if copies_scalar {
+                scalar_bytes = scalar_bytes
+                    .checked_add(std::mem::size_of::<BigRational>())
+                    .ok_or_else(unavailable)?;
+                for bits in [value.numer().bits(), value.denom().bits()] {
+                    let bytes = bits
+                        .checked_add(63)
+                        .and_then(|bits| usize::try_from(bits / 64).ok())
+                        .and_then(|limbs| limbs.checked_mul(8))
+                        .ok_or_else(unavailable)?;
+                    scalar_bytes = scalar_bytes.checked_add(bytes).ok_or_else(unavailable)?;
+                }
+            }
+        }
+        let bytes = scalar_bytes.checked_mul(8).ok_or_else(unavailable)?;
+        let work = scalar_bytes.checked_mul(6).ok_or_else(unavailable)?;
+        if !evaluation_copies::pay(work, bytes) || !evaluation_copies::validate(self) {
+            return Err(unavailable());
+        }
+        let construction = scope.into_construction(self).map_err(|_| unavailable())?;
+        let mut strict = vec![self.ctx.terms.false_term(); point.len()];
+        let mut upper_endpoints = Vec::with_capacity(point.len());
+        for (position, kind) in frame.step_map.iter().enumerate() {
+            match kind {
+                ParetoStepKind::Arithmetic(_) => {
+                    strict[position] =
+                        self.mk_strict_improve_atom(&frame.extended[position], &point[position])?;
+                }
+                ParetoStepKind::Group(group_index) => {
+                    let value = &point[position];
+                    let (cost, total) = cost_domain(*group_index, value).ok_or_else(unavailable)?;
+                    if cost == 0 {
+                        // The default false literal is EXACT for this domain.
+                    } else if cost == total {
+                        upper_endpoints.push((position, *group_index));
+                    } else {
+                        strict[position] =
+                            self.mk_strict_improve_atom(&frame.extended[position], value)?;
+                    }
+                }
+            }
+        }
+        if !construction.validate(self) {
+            return Err(unavailable());
+        }
+        let mut builder =
+            CountedTermBuilder::with_admission(&mut self.ctx.terms, construction.term_admission())
+                .map_err(|_| unavailable())?;
+        for (position, group_index) in upper_endpoints {
+            let group = &frame.groups[group_index];
+            let mut positive = Vec::with_capacity(group.indices.len());
+            for &index in &group.indices {
+                if frame.soft_weights[index] != 0 {
+                    positive.push(frame.relax_vars[index]);
+                }
+            }
+            let all = match positive.as_slice() {
+                [] => return Err(unavailable()), // Positive total requires a positive coefficient.
+                [only] => *only,
+                _ => builder
+                    .apply(CountedBuiltin::And, &positive)
+                    .map_err(|_| unavailable())?,
+            };
+            strict[position] = builder
+                .apply(CountedBuiltin::Not, &[all])
+                .map_err(|_| unavailable())?;
+        }
+        let blocker = builder
+            .apply(CountedBuiltin::Or, &strict)
+            .map_err(|_| unavailable())?;
+        builder.finish().map_err(|_| unavailable())?;
+        if !construction.validate(self) {
+            return Err(unavailable());
+        }
+        Ok(blocker)
+    }
+
+    /// One joint Pareto call inside its transactional frame: base
+    /// feasibility over the hard problem, exhaustion-extension
+    /// construction, and the seed probe (delegating emission to
+    /// [`Self::joint_pareto_push_point`]). `Ok(None)` is inconclusive.
+    fn joint_pareto_search(
+        &mut self,
+        frame: &JointParetoFrame<'_>,
+        state: &mut ParetoState,
+    ) -> Result<Option<JointParetoCaptured>> {
+        // Base feasibility over the HARD problem (relaxation free = the
+        // same verdict): also installs the unsat-query epoch over exactly
+        // the authored assertions for the exhaustion declaration.
+        let base_result = self.check_sat_internal()?;
+        if base_result != SolveResult::Sat {
+            return Ok(match base_result {
+                SolveResult::Unknown => None,
+                other => Some(JointParetoCaptured::Verdict(other)),
+            });
+        }
+        // The relaxation clauses are folded into the extension's blocking
+        // vector: the certified terminal obligation is
+        // authored ∧ relaxation ∧ point-blockers — exactly the refuted
+        // scope. The per-point blockers alone come first (the seed probe
+        // assumes exactly those; the clauses are asserted separately).
+        let Ok(exhaustion) = self.build_pareto_front_exhaustion_extension_with(
+            frame.extended,
+            &state.emitted,
+            frame.relax_clauses,
+            frame.sealed_objectives,
+            |executor, point| executor.joint_pareto_point_blocker(frame, point),
+        ) else {
+            return Ok(None);
+        };
+        let point_blockers: Vec<TermId> = exhaustion.blocking()[..state.emitted.len()].to_vec();
+
+        // The seed probe assumes the blockers AND the relaxation clauses
+        // (asserting the clauses first would make the probe bind its
+        // unsat epoch over authored+relaxation, which the exhaustion
+        // declaration then rejects; as assumptions they line up exactly
+        // with the extension's folded blocking vector).
+        let snapshot = self.ctx.assertions.len();
+        let mut seed_assumptions = point_blockers.clone();
+        seed_assumptions.extend_from_slice(frame.relax_clauses);
+        let seed = self.pareto_probe(&seed_assumptions)?;
+        match seed {
+            ParetoProbe::Sat => {}
+            ParetoProbe::Unknown => return Ok(None),
+            ParetoProbe::Unsat => {
+                // Front exhausted: declare the extended obligation while
+                // assertions/objectives are still exactly the exhausted
+                // scope's, then reset the enumeration (Z3 cycles).
+                if !self.declare_pareto_front_exhaustion_extension(exhaustion) {
+                    return Ok(None);
+                }
+                let last = state.last_point.clone();
+                self.pareto_state = Some(ParetoState {
+                    emitted: Vec::new(),
+                    last_point: last,
+                });
+                self.last_assumptions = None;
+                self.last_assumption_core = None;
+                self.last_model = None;
+                self.last_result = Some(SolveResult::unsat());
+                return Ok(Some(JointParetoCaptured::Verdict(SolveResult::unsat())));
+            }
+        }
+        self.joint_pareto_push_point(frame, state, &seed_assumptions, snapshot)
+    }
+
+    /// Lex-push under the blockers and capture the emitted point (a
+    /// lex-optimal point is Pareto-optimal). The relaxation clauses live
+    /// only inside this push frame.
+    fn joint_pareto_push_point(
+        &mut self,
+        frame: &JointParetoFrame<'_>,
+        state: &mut ParetoState,
+        seed_assumptions: &[TermId],
+        snapshot: usize,
+    ) -> Result<Option<JointParetoCaptured>> {
+        let push_snapshot = self.ctx.assertions.len();
+        let Some(cone) = self.pareto_seed_cone(frame.extended, seed_assumptions)? else {
+            return Ok(None);
+        };
+        for &clause in frame.relax_clauses {
+            self.maxsmt_assert(clause);
+        }
+        for &b in &cone {
+            self.optimization_assert(b);
+        }
+        // A soft group has a known nonnegative weighted Boolean domain. Reuse
+        // its maintained bounded optimizer rather than sending a synthetic Int
+        // ITE through generic arithmetic (including impossible negative probes).
+        // Arithmetic steps retain their ACTUAL declared certificate indices.
+        let push_result = self.joint_optimize_steps(
+            frame.sealed_objectives,
+            frame.groups,
+            frame.sequence,
+            frame.soft_terms,
+            frame.soft_weights,
+            Some(frame.relax_vars),
+        );
+        if !self.unbounded_objectives.is_empty() || !self.infinitesimal_objectives.is_empty() {
+            // Unbounded/unattained coordinate: no finite front (fail
+            // closed, exactly like the arithmetic lane).
+            self.unbounded_objectives.clear();
+            self.infinitesimal_objectives.clear();
+            self.unavailable_objectives.clear();
+            self.ctx.truncate_assertions(snapshot);
+            return Ok(None);
+        }
+        let point = match push_result {
+            Ok(Some(_)) => self.joint_pareto_capture_point(frame),
+            Ok(None) => None,
+            Err(error) => {
+                self.ctx.truncate_assertions(snapshot);
+                self.invalidate_last_check_result();
+                return Err(error);
+            }
+        };
+        self.ctx.truncate_assertions(push_snapshot);
+        let Some((values, finite_values, soft_roots, publication)) = point else {
+            self.ctx.truncate_assertions(snapshot);
+            return Ok(None);
+        };
+        debug_assert!(
+            !state.emitted.iter().any(|e| e == &values),
+            "joint pareto: emitted a duplicate point {values:?}"
+        );
+        state.emitted.push(values.clone());
+        state.last_point = Some(values);
+        self.pareto_state = Some(ParetoState {
+            emitted: state.emitted.clone(),
+            last_point: state.last_point.clone(),
+        });
+        self.ctx.truncate_assertions(snapshot);
+        Ok(Some(JointParetoCaptured::Sat(Box::new((
+            finite_values,
+            soft_roots,
+            publication,
+        )))))
+    }
+
+    /// Capture the lex-pushed witness as a Pareto point: extended values,
+    /// the real-indexed finite arithmetic values, and the joint soft
+    /// accounting (which also verifies the witness realizes every group
+    /// cost). `None` rejects the push.
+    fn joint_pareto_capture_point(
+        &mut self,
+        frame: &JointParetoFrame<'_>,
+    ) -> Option<(
+        Vec<BigRational>,
+        Vec<(usize, BigRational)>,
+        Vec<TermId>,
+        (u64, Vec<usize>, Vec<SoftGroupCost>),
+    )> {
+        let model = self.last_model.clone()?;
+        let mut values = Vec::with_capacity(frame.extended.len());
+        for obj in frame.extended {
+            values.push(self.eval_objective_value(&model, obj.term).ok()?);
+        }
+        let mut finite_values = Vec::new();
+        let mut group_optima: Vec<Option<u64>> = vec![None; frame.groups.len()];
+        for (position, kind) in frame.step_map.iter().enumerate() {
+            match kind {
+                ParetoStepKind::Arithmetic(index) => {
+                    finite_values.push((*index, values[position].clone()));
+                }
+                ParetoStepKind::Group(group_index) => {
+                    group_optima[*group_index] =
+                        Some(u64::try_from(values[position].to_integer()).ok()?);
+                }
+            }
+        }
+        let (soft_roots, publication) = self.joint_capture_soft_accounting(
+            frame.softs,
+            frame.groups,
+            frame.soft_terms,
+            frame.soft_weights,
+            frame.relax_vars,
+            &group_optima,
+            false,
+        )?;
+        Some((values, finite_values, soft_roots, publication))
+    }
+
+    /// Shared joint-entry discipline: the declared objective sequence must
+    /// exactly recount the live objectives and soft groups, the priority
+    /// must be the one this entry implements, and the window's assertion
+    /// additions plus internal relaxation symbols are rolled back before
+    /// publication.
+    fn joint_optimize(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        priority: OptPriority,
+    ) -> Result<SolveResult> {
+        let softs: Vec<ay_frontend::SoftAssertion> = self.ctx.soft_constraints().to_vec();
+        let groups = partition_soft_groups(&softs);
+        let sequence: Vec<ay_frontend::ObjectiveStep> = self.ctx.objective_sequence().to_vec();
+        // The sequence is authoritative only when it exactly recounts the
+        // live objectives and soft groups (a native-API soft replacement or
+        // any other out-of-band mutation leaves it stale; fail closed).
+        let arith_steps: Vec<usize> = sequence
+            .iter()
+            .filter_map(|step| match step {
+                ay_frontend::ObjectiveStep::Arithmetic(index) => Some(*index),
+                ay_frontend::ObjectiveStep::SoftGroup(_) => None,
+            })
+            .collect();
+        let group_steps: Vec<Option<String>> = sequence
+            .iter()
+            .filter_map(|step| match step {
+                ay_frontend::ObjectiveStep::SoftGroup(id) => Some(id.clone()),
+                ay_frontend::ObjectiveStep::Arithmetic(_) => None,
+            })
+            .collect();
+        let consistent = arith_steps == (0..objectives.len()).collect::<Vec<_>>()
+            && group_steps
+                == groups
+                    .iter()
+                    .map(|group| group.id.clone())
+                    .collect::<Vec<_>>();
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        let total_weight = soft_weights
+            .iter()
+            .try_fold(0u64, |sum, &weight| sum.checked_add(weight));
+        if !consistent
+            || self.opt_priority() != priority
+            || total_weight.is_none_or(|total| total > MAXSMT_EXACT_MAX_TOTAL_WEIGHT)
+        {
+            return Ok(self.optimization_inconclusive());
+        }
+
+        let base_assertion_count = self.ctx.assertions.len();
+        let outcome = match priority {
+            OptPriority::Box => {
+                self.joint_optimize_box_window(objectives, &softs, &groups, &sequence)
+            }
+            _ => self.joint_optimize_lex_window(objectives, &softs, &groups, &sequence),
+        };
+        self.ctx.truncate_assertions(base_assertion_count);
+        let internal_symbols: Vec<String> = self
+            .ctx
+            .symbol_iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| name.starts_with("__ay_soft_"))
+            .collect();
+        self.ctx.remove_symbols(&internal_symbols);
+        match outcome {
+            Ok(Some(JointCaptured::Sat(captured))) => {
+                let (finite_values, soft_roots, soft_publication, witness_values) = *captured;
+                self.finalize_joint_optimization(
+                    &finite_values,
+                    &soft_roots,
+                    &soft_publication,
+                    &witness_values,
+                )
+            }
+            Ok(Some(JointCaptured::Verdict(verdict))) if verdict.is_unsat() => {
+                // The window verdict was over the relaxed scope; re-establish
+                // UNSAT over the restored hard assertions so its proof is
+                // certifiable, exactly as the pure MaxSMT path does.
+                self.begin_public_solve(false);
+                self.bind_unsat_query_assumptions(&[]);
+                let hard_result = self.check_sat();
+                if hard_result.is_err() {
+                    self.invalidate_last_check_result();
+                }
+                hard_result
+            }
+            Ok(Some(JointCaptured::Verdict(verdict))) => Ok(verdict),
+            Ok(None) => Ok(self.optimization_inconclusive()),
+            Err(error) => {
+                self.invalidate_last_check_result();
+                Err(error)
+            }
+        }
+    }
+
+    /// The joint search inside its transactional window. `Ok(None)` means
+    /// inconclusive; `Ok(Some(..))` carries everything publication needs:
+    /// finite arithmetic values, soft classification roots, and the captured
+    /// soft accounting `(total_cost, violated, group_costs)`.
+    fn joint_optimize_lex_window(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+    ) -> Result<Option<JointCaptured>> {
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        let base_result = self.check_sat_internal()?;
+        if base_result != SolveResult::Sat {
+            return Ok(match base_result {
+                SolveResult::Unknown => None,
+                other => return Ok(Some(JointCaptured::Verdict(other))),
+            });
+        }
+        let Some((finite_values, group_optima, suffix_interval, mut relax_vars)) = self
+            .joint_optimize_steps(
+                objectives,
+                groups,
+                sequence,
+                &soft_terms,
+                &soft_weights,
+                None,
+            )?
+        else {
+            return Ok(None);
+        };
+        // Capture soft accounting against the final in-window witness. The
+        // relaxation may never have been built (search stopped at an
+        // unbounded arithmetic step); build it now — accounting falls back
+        // to term evaluation where the witness lacks relax values.
+        if relax_vars.is_none() {
+            relax_vars = Some(self.maxsmt_build_relaxation(&soft_terms).into());
+        }
+        let Some(relax_vars) = relax_vars else {
+            return Ok(None);
+        };
+        let Some((soft_roots, publication)) = self.joint_capture_soft_accounting(
+            softs,
+            groups,
+            &soft_terms,
+            &soft_weights,
+            &relax_vars,
+            &group_optima,
+            suffix_interval,
+        ) else {
+            return Ok(None);
+        };
+        // Lex: the published witness attains every finite arithmetic value.
+        let witness_values = finite_values.clone();
+        Ok(Some(JointCaptured::Sat(Box::new((
+            finite_values,
+            soft_roots,
+            publication,
+            witness_values,
+        )))))
+    }
+
+    /// Joint `box` window: every objective (arithmetic or soft group) is
+    /// optimized INDEPENDENTLY against the hard assertions alone, and the
+    /// published witness attains the FIRST declared objective's optimum
+    /// (z3's box behavior). Same capture contract as the lex window, except
+    /// `witness_values` holds only the first objective's finite value when
+    /// it is arithmetic.
+    fn joint_optimize_box_window(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+    ) -> Result<Option<JointCaptured>> {
+        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
+        let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
+        let base_result = self.check_sat_internal()?;
+        if base_result != SolveResult::Sat {
+            return Ok(match base_result {
+                SolveResult::Unknown => None,
+                other => return Ok(Some(JointCaptured::Verdict(other))),
+            });
+        }
+        let Some((finite_values, group_optima, relax_vars)) = self.joint_optimize_box_steps(
+            objectives,
+            groups,
+            sequence,
+            &soft_terms,
+            &soft_weights,
+        )?
+        else {
+            return Ok(None);
+        };
+        // The first declared objective selects the witness requirement.
+        let (witness_values, first_group) = match sequence.first() {
+            Some(ay_frontend::ObjectiveStep::Arithmetic(index)) => (
+                finite_values
+                    .iter()
+                    .filter(|(i, _)| i == index)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            Some(ay_frontend::ObjectiveStep::SoftGroup(id)) => {
+                (Vec::new(), groups.iter().position(|group| &group.id == id))
+            }
+            None => return Ok(None),
+        };
+        let Some((soft_roots, publication)) = self.joint_capture_box_accounting(
+            softs,
+            groups,
+            &soft_terms,
+            &soft_weights,
+            &relax_vars,
+            &group_optima,
+            first_group,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(JointCaptured::Sat(Box::new((
+            finite_values,
+            soft_roots,
+            publication,
+            witness_values,
+        )))))
+    }
+
+    /// Independent per-step optima for joint `box`. Nothing is committed
+    /// between steps, so each step sees exactly the hard problem; afterwards
+    /// the FIRST step's optimum is pinned and the witness refreshed so the
+    /// published model attains it, as in z3. Arithmetic optima are computed
+    /// BEFORE the soft relaxation exists (independence makes the order
+    /// irrelevant, and the relaxation's disjunctions make the arithmetic
+    /// optimizer decline — the same reason lex builds it lazily). Returns
+    /// finite values, per-group optima and the relaxation; `None` is
+    /// inconclusive.
+    fn joint_optimize_box_steps(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+        soft_terms: &[TermId],
+        soft_weights: &[u64],
+    ) -> Result<Option<(Vec<(usize, BigRational)>, Vec<Option<u64>>, Vec<TermId>)>> {
+        let mut finite_values: Vec<(usize, BigRational)> = Vec::new();
+        let mut group_optima: Vec<Option<u64>> = vec![None; groups.len()];
+        // Pass 1: independent arithmetic optima, before any relaxation.
+        for step in sequence {
+            if let ay_frontend::ObjectiveStep::Arithmetic(objective_index) = step {
+                let obj = &objectives[*objective_index];
+                let Some((model, value)) = self.optimize_one_objective(*objective_index, obj)?
+                else {
+                    return Ok(None);
+                };
+                self.last_model = Some(model);
+                // Unbounded/infinitesimal outcomes do not stop the other
+                // independent steps (unlike lex's suffix rule).
+                if !self.unbounded_objectives.contains_key(objective_index)
+                    && !self.infinitesimal_objectives.contains_key(objective_index)
+                {
+                    finite_values.push((*objective_index, value));
+                }
+            }
+        }
+        // Pass 2: independent soft-group optima over the relaxation.
+        let relax_vars = self.maxsmt_build_relaxation(soft_terms);
+        for step in sequence {
+            if let ay_frontend::ObjectiveStep::SoftGroup(id) = step {
+                let Some(group_index) = groups.iter().position(|group| &group.id == id) else {
+                    return Ok(None);
+                };
+                let group = &groups[group_index];
+                let group_relax: Vec<TermId> =
+                    group.indices.iter().map(|&i| relax_vars[i]).collect();
+                let group_weights: Vec<u64> =
+                    group.indices.iter().map(|&i| soft_weights[i]).collect();
+                let group_total: u64 = group_weights.iter().sum();
+                let Some(optimum) =
+                    self.maxsmt_group_optimum(&[], &group_relax, &group_weights, group_total)
+                else {
+                    return Ok(None);
+                };
+                group_optima[group_index] = Some(optimum);
+            }
+        }
+        // Pin the first step's optimum and refresh: the published witness
+        // attains the first declared objective, as in z3's box mode.
+        match sequence.first() {
+            Some(ay_frontend::ObjectiveStep::Arithmetic(index)) => {
+                if let Some((_, value)) = finite_values.iter().find(|(i, _)| i == index).cloned() {
+                    let obj = &objectives[*index];
+                    let obj_sort = self.ctx.terms.sort(obj.term).clone();
+                    let commit = match obj.direction {
+                        ObjectiveDirection::Maximize => {
+                            self.mk_commit_ge(obj.term, &value, &obj_sort)
+                        }
+                        ObjectiveDirection::Minimize => {
+                            self.mk_commit_le(obj.term, &value, &obj_sort)
+                        }
+                    };
+                    self.optimization_assert(commit);
+                }
+            }
+            Some(ay_frontend::ObjectiveStep::SoftGroup(id)) => {
+                let Some(group_index) = groups.iter().position(|group| &group.id == id) else {
+                    return Ok(None);
+                };
+                let Some(optimum) = group_optima[group_index] else {
+                    return Ok(None);
+                };
+                let group = &groups[group_index];
+                let group_relax: Vec<TermId> =
+                    group.indices.iter().map(|&i| relax_vars[i]).collect();
+                let group_weights: Vec<u64> =
+                    group.indices.iter().map(|&i| soft_weights[i]).collect();
+                self.maxsmt_assert_weighted_at_most_w(&group_relax, &group_weights, optimum);
+            }
+            None => return Ok(None),
+        }
+        if !self.joint_refresh_witness()? {
+            return Ok(None);
+        }
+        Ok(Some((finite_values, group_optima, relax_vars)))
+    }
+
+    /// Box counterpart of [`Self::joint_capture_soft_accounting`]: group
+    /// costs are the INDEPENDENT optima (the witness generally attains only
+    /// the first group's, and only when a soft group is declared first);
+    /// violations and total cost describe the published witness.
+    fn joint_capture_box_accounting(
+        &mut self,
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+        soft_terms: &[TermId],
+        soft_weights: &[u64],
+        relax_vars: &[TermId],
+        group_optima: &[Option<u64>],
+        first_group: Option<usize>,
+    ) -> Option<JointAccounting> {
+        let (total_cost, violated) = self.maxsmt_violations(
+            soft_terms,
+            relax_vars,
+            soft_weights,
+            self.last_model.as_ref(),
+        )?;
+        let mut is_violated = vec![false; softs.len()];
+        for &index in &violated {
+            *is_violated.get_mut(index)? = true;
+        }
+        let mut group_costs = Vec::with_capacity(groups.len());
+        for (group_index, group) in groups.iter().enumerate() {
+            let optimum = group_optima[group_index]?;
+            if first_group == Some(group_index) {
+                let witnessed: u64 = group
+                    .indices
+                    .iter()
+                    .filter(|&&i| is_violated[i])
+                    .map(|&i| soft_weights[i])
+                    .sum();
+                if witnessed != optimum {
+                    return None;
+                }
+            }
+            group_costs.push(SoftGroupCost {
+                id: group.id.clone(),
+                cost: optimum,
+                interval: false,
+            });
+        }
+        let soft_roots = self.maxsmt_classification_roots(softs, &violated)?;
+        Some((soft_roots, (total_cost, violated, group_costs)))
+    }
+
+    /// Run the lex steps in declaration order inside the window, committing
+    /// each optimum (arithmetic bounds; soft weighted-at-most pins). The
+    /// soft relaxation is built LAZILY at the first soft step: its
+    /// `(or soft relax)` clauses are disjunctions, under which the arithmetic
+    /// optimizer's simplex unboundedness proof declines, so an arithmetic
+    /// step before any soft step must see the pristine hard+commits problem.
+    /// Returns finite values, per-group optima, the suffix-interval flag,
+    /// and the (maybe built) relaxation vars; `None` is inconclusive.
+    fn joint_optimize_steps<'a>(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        groups: &[SoftGroup],
+        sequence: &[ay_frontend::ObjectiveStep],
+        soft_terms: &[TermId],
+        soft_weights: &[u64],
+        prepared_relaxation: Option<&'a [TermId]>,
+    ) -> Result<Option<JointSteps<'a>>> {
+        if prepared_relaxation.is_some_and(|vars| vars.len() != soft_terms.len()) {
+            return Ok(None);
+        }
+        // Pareto already owns these exact variables and their clauses. Borrow
+        // them: a fresh relaxation would describe a different cost coordinate.
+        let mut relax_vars = prepared_relaxation.map(std::borrow::Cow::Borrowed);
+        let mut finite_values: Vec<(usize, BigRational)> = Vec::new();
+        let mut group_optima: Vec<Option<u64>> = vec![None; groups.len()];
+        let mut suffix_interval = false;
+        for (step_pos, step) in sequence.iter().enumerate() {
+            let last_step = step_pos + 1 == sequence.len();
+            match step {
+                ay_frontend::ObjectiveStep::Arithmetic(objective_index) => {
+                    let obj = &objectives[*objective_index];
+                    let Some((model, value)) =
+                        self.optimize_one_objective(*objective_index, obj)?
+                    else {
+                        return Ok(None);
+                    };
+                    self.last_model = Some(model);
+                    if self.unbounded_objectives.contains_key(objective_index)
+                        || self.infinitesimal_objectives.contains_key(objective_index)
+                    {
+                        // No attainable value to commit: later arithmetic
+                        // objectives are unavailable, later soft groups take
+                        // z3's interval outcome, and the search stops here.
+                        for later in &sequence[step_pos + 1..] {
+                            if let ay_frontend::ObjectiveStep::Arithmetic(index) = later {
+                                self.unavailable_objectives.insert(*index);
+                            }
+                        }
+                        suffix_interval = true;
+                        break;
+                    }
+                    finite_values.push((*objective_index, value.clone()));
+                    if !last_step {
+                        let obj_sort = self.ctx.terms.sort(obj.term).clone();
+                        let commit = match obj.direction {
+                            ObjectiveDirection::Maximize => {
+                                self.mk_commit_ge(obj.term, &value, &obj_sort)
+                            }
+                            ObjectiveDirection::Minimize => {
+                                self.mk_commit_le(obj.term, &value, &obj_sort)
+                            }
+                        };
+                        self.optimization_assert(commit);
+                    }
+                }
+                ay_frontend::ObjectiveStep::SoftGroup(id) => {
+                    let Some(group_index) = groups.iter().position(|group| &group.id == id) else {
+                        return Ok(None);
+                    };
+                    if relax_vars.is_none() {
+                        relax_vars = Some(self.maxsmt_build_relaxation(soft_terms).into());
+                        // The warm witness predates the relaxation vars;
+                        // refresh it so later accounting sees their values.
+                        if !self.joint_refresh_witness()? {
+                            return Ok(None);
+                        }
+                    }
+                    let Some(relax_vars_ref) = relax_vars.as_ref() else {
+                        return Ok(None);
+                    };
+                    let group = &groups[group_index];
+                    let group_relax: Vec<TermId> =
+                        group.indices.iter().map(|&i| relax_vars_ref[i]).collect();
+                    let group_weights: Vec<u64> =
+                        group.indices.iter().map(|&i| soft_weights[i]).collect();
+                    let group_total: u64 = group_weights.iter().sum();
+                    // Earlier commits are live assertions in this window, so
+                    // the binary search needs no separate pin set.
+                    let Some(optimum) =
+                        self.maxsmt_group_optimum(&[], &group_relax, &group_weights, group_total)
+                    else {
+                        return Ok(None);
+                    };
+                    group_optima[group_index] = Some(optimum);
+                    // Commit and refresh even on the last step: unlike an
+                    // arithmetic step (which returns its attaining model), a
+                    // soft step's binary search leaves the warm witness at an
+                    // arbitrary feasible point, so final accounting needs a
+                    // witness that attains this group's optimum too.
+                    self.maxsmt_assert_weighted_at_most_w(&group_relax, &group_weights, optimum);
+                    if !self.joint_refresh_witness()? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some((
+            finite_values,
+            group_optima,
+            suffix_interval,
+            relax_vars,
+        )))
+    }
+
+    /// Re-solve the window as committed so far and install its witness.
+    fn joint_refresh_witness(&mut self) -> Result<bool> {
+        let (result, model) = self.maxsmt_scoped_check_sat(|_| {})?;
+        if result.is_sat() && model.is_some() {
+            self.last_model = model;
+        }
+        Ok(result.is_sat())
+    }
+
+    /// Verify the final in-window witness realizes every decided group's
+    /// proven optimum, and build the publication triple plus classification
+    /// roots. Groups past a suffix-interval break get interval outcomes.
+    fn joint_capture_soft_accounting(
+        &mut self,
+        softs: &[ay_frontend::SoftAssertion],
+        groups: &[SoftGroup],
+        soft_terms: &[TermId],
+        soft_weights: &[u64],
+        relax_vars: &[TermId],
+        group_optima: &[Option<u64>],
+        suffix_interval: bool,
+    ) -> Option<JointAccounting> {
+        let (total_cost, violated) = self.maxsmt_violations(
+            soft_terms,
+            relax_vars,
+            soft_weights,
+            self.last_model.as_ref(),
+        )?;
+        let mut is_violated = vec![false; softs.len()];
+        for &index in &violated {
+            *is_violated.get_mut(index)? = true;
+        }
+        let mut group_costs = Vec::with_capacity(groups.len());
+        for (group_index, group) in groups.iter().enumerate() {
+            let group_total: u64 = group.indices.iter().map(|&i| soft_weights[i]).sum();
+            match group_optima[group_index] {
+                Some(optimum) => {
+                    let witnessed: u64 = group
+                        .indices
+                        .iter()
+                        .filter(|&&i| is_violated[i])
+                        .map(|&i| soft_weights[i])
+                        .sum();
+                    if witnessed != optimum {
+                        return None;
+                    }
+                    group_costs.push(SoftGroupCost {
+                        id: group.id.clone(),
+                        cost: optimum,
+                        interval: false,
+                    });
+                }
+                None if suffix_interval => group_costs.push(SoftGroupCost {
+                    id: group.id.clone(),
+                    cost: group_total,
+                    interval: true,
+                }),
+                None => return None,
+            }
+        }
+        let soft_roots = self.maxsmt_classification_roots(softs, &violated)?;
+        Some((soft_roots, (total_cost, violated, group_costs)))
+    }
+
+    /// Joint counterpart of [`Self::finalize_optimization`]: certify the
+    /// captured witness with arithmetic value roots AND soft classification
+    /// roots, re-account both objective classes against the final model,
+    /// then publish both outcome families together.
+    fn finalize_joint_optimization(
+        &mut self,
+        finite_values: &[(usize, BigRational)],
+        soft_roots: &[TermId],
+        soft_publication: &(u64, Vec<usize>, Vec<SoftGroupCost>),
+        witness_values: &[(usize, BigRational)],
+    ) -> Result<SolveResult> {
+        self.last_assumptions = None;
+        self.last_assumption_core = None;
+        self.last_result = Some(SolveResult::Sat);
+        self.last_unknown_reason = None;
+        self.last_model_validated = false;
+        self.finite_objective_values.clear();
+        self.last_soft_cost = None;
+        self.last_soft_violations = None;
+        self.last_soft_group_costs = None;
+
+        // Roots certify the published witness, so they cover only the
+        // values it attains; under box the other independent optima are
+        // published without a witness attaining them (as in `optimize_box`).
+        let Some(mut value_roots) = self.optimization_value_roots(witness_values) else {
+            return Ok(self.reject_optimization_final_witness());
+        };
+        value_roots.extend_from_slice(soft_roots);
+        let emitted = match self.emit_captured_optimization_witness(SolveResult::Sat, &value_roots)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.invalidate_last_check_result();
+                return Err(error);
+            }
+        };
+        if emitted != SolveResult::Sat {
+            return Ok(self.optimization_inconclusive());
+        }
+        // Only the witness-attained values are re-checked against the final
+        // model: under box the remaining finite values are independent
+        // optima no single witness realizes (just as in `optimize_box`).
+        if !self.optimization_final_values_match(witness_values) {
+            return Ok(self.reject_optimization_final_witness());
+        }
+        let softs: Vec<ay_frontend::SoftAssertion> = self.ctx.soft_constraints().to_vec();
+        let (total_cost, violated, group_costs) = soft_publication;
+        match self.maxsmt_final_witness_accounting(&softs) {
+            Some((final_cost, final_violated))
+                if final_cost == *total_cost && &final_violated == violated => {}
+            _ => return Ok(self.reject_optimization_final_witness()),
+        }
+        self.finite_objective_values
+            .extend(finite_values.iter().cloned());
+        self.last_soft_cost = Some(*total_cost);
+        self.last_soft_cost_optimal = true;
+        self.last_soft_group_costs = Some(group_costs.clone());
+        self.last_soft_violations = Some(violated.clone());
+        Ok(emitted)
     }
 
     /// BOX (independent) multi-objective optimization.
@@ -1999,21 +3669,17 @@ impl Executor {
     /// `(check-sat)` after that terminal `unsat` RESTARTS the enumeration from the
     /// first point (Z3's cyclic behavior — confirmed: a 3-point front over 8
     /// `(check-sat)` calls yields `sat sat sat unsat sat sat sat unsat`). The
-    /// emitted SET is exactly the Pareto front; AY's emission ORDER is its own
+    /// checked finite exhaustion establishes the complete Pareto set. AY's emission ORDER is its own
     /// deterministic GIA discovery order (Z3's order is algorithm-specific and not
     /// a clean sort, so per the task we match the SET, not the sequence).
     ///
     /// ## Supported objective sorts (LIMITATION)
     ///
-    /// Pareto enumeration is supported ONLY for objectives over FINITE domains —
-    /// **Int and BitVec** — where the Pareto front is finite and the algorithm is
-    /// sound AND complete. **Real** objectives are routed to a sound lex fallback
-    /// upstream in `optimize_check_sat_inner` (AY's LRA multi-objective optimizer
-    /// is itself incomplete — it reports `oo` for some derived-bounded Real
-    /// objectives — so a Real Pareto push could land on a non-Pareto point, which
-    /// we must never emit), so this routine only ever sees Int/BitVec objectives.
+    /// Int, Real and unsigned BitVec objectives share the checked lex push.
+    /// Infinite fronts are emitted incrementally; exhaustion is not promised.
+    /// A push with an unbounded or unattained coordinate remains inconclusive.
     ///
-    /// ## Algorithm (Guided Improvement Algorithm; sound and complete on finite fronts)
+    /// ## Algorithm (Guided Improvement Algorithm with checked lex pushes)
     ///
     /// A point p DOMINATES q iff p is at-least-as-good as q on EVERY objective (in
     /// each objective's optimize direction) and STRICTLY better on at least one.
@@ -2027,12 +3693,12 @@ impl Executor {
     ///    `unsat` and CLEAR the emitted set so the next `(check-sat)` restarts (Z3
     ///    cyclic behavior).
     /// 2. PUSH to a Pareto-optimal point by LEXICOGRAPHIC optimization subject to
-    ///    those blocking constraints: temporarily assert the blocking literals onto
+    ///    a certified seed's weak-dominance cone: temporarily assert its bounds onto
     ///    the hard stack and run the tested [`Self::optimize_lex`] (maximize obj0,
     ///    then obj1 under obj0's optimum, ...). A lex-optimal point is ALWAYS
     ///    Pareto-optimal. Reusing lex makes the push sound for every supported sort
-    ///    and mixed min/max, and it TERMINATES (it lands on a lex-extreme vertex)
-    ///    rather than climbing forever via epsilon strict improvements. The
+    ///    and mixed min/max when an attained finite lex optimum is established.
+    ///    An inconclusive or unattained push withholds a point. The
     ///    temporary blocking + lex's committed optima are reverted afterward.
     /// 3. EMIT it: record its objective values in `emitted` and `last_point`, and
     ///    install its witness model so `(get-objectives)` reports it.
@@ -2041,21 +3707,25 @@ impl Executor {
     /// any objective without worsening an earlier one is impossible by lex
     /// construction; improving a later one without worsening an earlier one is
     /// blocked by the committed earlier optima), so every emitted point is
-    /// genuinely Pareto-optimal — a debug-assert re-probes "strictly dominates
-    /// this point" and requires UNSAT. Step 1's blocking guarantees each new point
+    /// genuinely Pareto-optimal — a debug re-probe also rejects any certified
+    /// strict dominator. Step 1's blocking guarantees each new point
     /// is not dominated-or-equal by any prior emitted point, and (being
     /// Pareto-optimal) it cannot dominate a prior point either, so the emitted set
     /// is duplicate-free and dominated-free. Step 1 UNSAT means every feasible
     /// point is dominated-or-equal by some emitted point — the front is truly
-    /// exhausted. COMPLETENESS on finite fronts: any un-emitted Pareto point
+    /// exhausted. Any un-emitted Pareto point
     /// satisfies the seed's "not dominated-or-equal by any emitted" constraint
     /// (emitted points are all Pareto, none dominates-or-equals a distinct Pareto
     /// point), so step 1 stays SAT until every Pareto point is emitted. A
     /// non-Pareto point is NEVER emitted.
     fn optimize_pareto(&mut self, objectives: &[ay_frontend::Objective]) -> Result<SolveResult> {
-        // Base SAT model (caller guaranteed SAT) seeds step 1's first probe.
-        let base_model = self.last_model.clone();
-
+        // Z3 degenerates single-objective `pareto` to plain optimization:
+        // the optimum is re-emitted on every call and the front never
+        // exhausts (measured against z3 4.16 for both directions).
+        if objectives.len() <= 1 {
+            self.pareto_state = None;
+            return self.optimize_lex(objectives);
+        }
         // Take the persisted enumeration (or start fresh). We move it out so the
         // borrow checker lets us mutate `self` during probing; it is written back
         // before returning on every path.
@@ -2108,24 +3778,25 @@ impl Executor {
             }
         }
 
-        let block = exhaustion.blocking().to_vec();
+        let Some(block) = self.pareto_seed_cone(objectives, exhaustion.blocking())? else {
+            return Ok(self.optimization_inconclusive());
+        };
 
         // (2) PUSH TO PARETO-OPTIMALITY by LEXICOGRAPHIC optimization subject to
-        // the seed-blocking constraints. A lex-optimal point (maximize obj0, then
+        // the certified seed's closed cone. A lex-optimal point (maximize obj0, then
         // obj1 under obj0's optimum, ...) is ALWAYS Pareto-optimal: improving any
         // objective without worsening an earlier one is impossible by construction,
         // and improving a later one without worsening an earlier one is impossible
         // because the earlier optima are committed. Reusing the tested `optimize_lex`
         // machinery (Int exp+binary / Real simplex / BV binary) makes the push sound
-        // for every supported sort and mixed min/max, and crucially it TERMINATES on
-        // continuous (Real) fronts (it lands on a lex-extreme vertex) unlike an
-        // iterative strict-improve climb, which can converge without reaching the
-        // supremum.
+        // for supported sorts and mixed min/max. An attained finite lex optimum
+        // avoids an epsilon climb that approaches but never reaches a supremum;
+        // unsupported, unbounded and unattained pushes remain inconclusive.
         //
-        // The blocking constraints (one per emitted point: "strictly better than
-        // that point on >= 1 objective") are asserted TEMPORARILY onto the hard
-        // assertion stack so `optimize_lex` optimizes within the not-yet-emitted
-        // region; they (and `optimize_lex`'s own committed optima) are reverted by
+        // The weak cone replaces old strict blockers during this push. Every
+        // cone point still escapes every prior point, while the closed boundary
+        // avoids an unattained optimum caused solely by an old strict blocker.
+        // These bounds (and `optimize_lex`'s committed optima) are reverted by
         // the snapshot/truncate below, leaving `ctx.assertions` pristine.
         let snapshot = self.ctx.assertions.len();
         for &b in &block {
@@ -2166,11 +3837,9 @@ impl Executor {
         // Revert blocking constraints + optimize_lex's committed optima.
         self.ctx.truncate_assertions(snapshot);
 
-        // An unbounded objective admits NO Pareto-optimal point (any candidate
-        // is dominated by a further point along the unbounded direction), so
-        // enumeration cannot proceed soundly — without this guard, the
-        // unbounded probe firing inside the first lex-push would emit a fake
-        // "Pareto-optimal" point. Fail closed (matches the pre-fix unknown).
+        // An objective unbounded inside this improvement cone prevents the lex
+        // push from establishing an attained finite vector. Withhold the point
+        // instead of emitting an infinity placeholder as a Pareto optimum.
         // `unbounded_objectives` is cleared so the structured API
         // (`objective_optimum`, which consults it BEFORE `last_result`) cannot
         // report PosInfinity/NegInfinity alongside an unknown verdict. Later
@@ -2178,10 +3847,8 @@ impl Executor {
         // `ctx.assertions`, so the faithfulness audit forces NotApplicable.
         if !self.unbounded_objectives.is_empty() || !self.infinitesimal_objectives.is_empty() {
             self.unbounded_objectives.clear();
-            // Defensive mirror: pareto only sees Int/BV objectives (Real is
-            // routed to lex upstream) and those never produce an infinitesimal
-            // outcome, but if one ever appeared it would poison the push the
-            // same way an unbounded one does. Fail closed identically.
+            // A strict authored Real bound can still make a coordinate's
+            // optimum unattained. It must not become a public Pareto point.
             self.infinitesimal_objectives.clear();
             self.pareto_state = Some(state);
             return Ok(self.optimization_inconclusive());
@@ -2216,9 +3883,6 @@ impl Executor {
 
         self.last_model = Some(cur_model);
         let finite_values: Vec<_> = cur_vals.iter().cloned().enumerate().collect();
-        // Base model only matters as a feasibility witness; the emitted witness
-        // model is the one we keep installed.
-        let _ = base_model;
         // Bind the emitted point to the final model after the temporary Pareto
         // blocking scope has been restored. If emission repairs or completes a
         // different point, finalization revokes both the point and enumeration.
@@ -2242,6 +3906,155 @@ impl Executor {
         }
     }
 
+    /// GIA's improvement region is the CLOSED weak-dominance cone of a feasible
+    /// seed, not the open complement of the already emitted front. A seed escapes
+    /// every old point strictly somewhere; all points no worse than that seed do
+    /// too. Consequently a lex optimum inside this cone is globally Pareto.
+    /// This also applies to infinite integer fronts (Int does not imply finite).
+    /// See Z3 5.3.3 `src/opt/opt_pareto.cpp`, `gia_pareto::operator()`.
+    ///
+    /// The raw search model is not imported from the independent SAT decision.
+    /// Certify its EXACT objective vector with the original blockers before
+    /// discarding them, so the cone cannot acquire authority from another model.
+    fn pareto_seed_cone(
+        &mut self,
+        objectives: &[ay_frontend::Objective],
+        blockers: &[TermId],
+    ) -> Result<Option<Vec<TermId>>> {
+        use super::model::evaluation_copies;
+        let Some(model) = self.last_model.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(scope) = evaluation_copies::EvaluationCopyScope::enter(self) else {
+            return Ok(None);
+        };
+        let Some(metadata) = objectives
+            .len()
+            .checked_mul(std::mem::size_of::<BigRational>())
+        else {
+            return Ok(None);
+        };
+        if !evaluation_copies::pay(objectives.len(), metadata) || !evaluation_copies::validate(self)
+        {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(objectives.len());
+        let mut payload = metadata;
+        for objective in objectives {
+            let Ok(value) = self.eval_objective_value(model, objective.term) else {
+                return Ok(None);
+            };
+            let sort = self.ctx.terms.sort(objective.term);
+            if matches!(sort, Sort::Int | Sort::BitVec(_)) && !value.is_integer() {
+                return Ok(None);
+            }
+            if let Sort::BitVec(bv) = sort {
+                if value.is_negative() || value.numer().bits() > u64::from(bv.width) {
+                    return Ok(None);
+                }
+            }
+            let limb_bytes = |bits: u64| {
+                bits.checked_add(63)
+                    .and_then(|bits| usize::try_from(bits / 64).ok())
+                    .and_then(|limbs| limbs.checked_mul(8))
+            };
+            let Some(bytes) = limb_bytes(value.numer().bits())
+                .and_then(|numerator| {
+                    limb_bytes(value.denom().bits())
+                        .and_then(|denominator| numerator.checked_add(denominator))
+                })
+                .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<BigInt>()))
+            else {
+                return Ok(None);
+            };
+            let Some(total) = payload.checked_add(bytes) else {
+                return Ok(None);
+            };
+            payload = total;
+            values.push(value);
+        }
+        if !evaluation_copies::validate(self) {
+            return Ok(None);
+        }
+        // Three scalar constants per objective (two exact bounds and the cone
+        // bound), the retained vector, and up to four concurrent scalar buffers
+        // for integer quotient, bound conversion and term interning. This prices
+        // occupied payload, never the declared BV width.
+        let scalar_buffers = 1usize + 3 + 4;
+        let Some(root_slots) = self
+            .ctx
+            .assertions
+            .len()
+            .checked_add(blockers.len())
+            .and_then(|base| {
+                objectives
+                    .len()
+                    .checked_mul(3)
+                    .and_then(|extra| base.checked_add(extra))
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = payload.checked_mul(scalar_buffers).and_then(|bytes| {
+            root_slots
+                .checked_mul(std::mem::size_of::<TermId>())
+                .and_then(|metadata| bytes.checked_add(metadata))
+        }) else {
+            return Ok(None);
+        };
+        let Ok(_arena) = self.admit_evaluation_scratch(bytes) else {
+            return Ok(None);
+        };
+        // Three bound constants read their scalar; integer/BV conversion may
+        // additionally scan it to obtain the integral quotient. Pay both passes
+        // on the retained original functional counter before constructing terms.
+        let Some(work) = payload
+            .checked_mul(3 + 3)
+            .and_then(|work| work.checked_add(root_slots))
+        else {
+            return Ok(None);
+        };
+        if !evaluation_copies::pay(work, 0) {
+            return Ok(None);
+        }
+        // Retain the same-attempt construction arena BEFORE releasing the read
+        // scope's scalar charges. No new store snapshot is captured after growth.
+        if !evaluation_copies::validate(self) {
+            return Ok(None);
+        }
+        let Ok(construction) = scope.into_construction(self) else {
+            return Ok(None);
+        };
+        let mut exact = Vec::with_capacity(root_slots - objectives.len());
+        exact.extend_from_slice(&self.ctx.assertions);
+        exact.extend_from_slice(blockers);
+        let mut cone = Vec::with_capacity(objectives.len());
+        for (objective, value) in objectives.iter().zip(&values) {
+            let sort = self.ctx.terms.sort(objective.term).clone();
+            exact.push(self.mk_commit_ge(objective.term, value, &sort));
+            exact.push(self.mk_commit_le(objective.term, value, &sort));
+            cone.push(self.mk_at_least_as_good_atom(objective, value)?);
+        }
+        let constructed = self.ctx.terms.snapshot_stamp();
+        if _arena
+            .check_usage(
+                self.ctx.terms.true_memory_bytes(),
+                bytes,
+                self.evaluation_term_memory_limit(),
+            )
+            .is_err()
+            || !matches!(
+                self.checked_optimization_roots_decision(&exact),
+                CheckedOptimizationDecision::Sat
+            )
+            || !construction.validate(self)
+            || constructed != self.ctx.terms.snapshot_stamp()
+        {
+            return Ok(None);
+        }
+        Ok(Some(cone))
+    }
+
     /// Build the exact blocker vector used by the next-front feasibility probe
     /// and seal it to the current public optimization query.
     fn build_pareto_front_exhaustion_extension(
@@ -2249,10 +4062,39 @@ impl Executor {
         objectives: &[ay_frontend::Objective],
         emitted: &[Vec<BigRational>],
     ) -> Result<ParetoFrontExhaustionExtension> {
-        let mut blocking = Vec::with_capacity(emitted.len());
+        self.build_pareto_front_exhaustion_extension_with(
+            objectives,
+            emitted,
+            &[],
+            objectives,
+            |executor, point| executor.mk_not_dominated_or_equal_by(objectives, point),
+        )
+    }
+
+    /// [`Self::build_pareto_front_exhaustion_extension`] over a blocker
+    /// objective vector (`blocking_objectives`) that may extend the sealed
+    /// inventory, with extra conjuncts appended to the blocking vector.
+    /// The joint Pareto lane builds blockers over its extended vector
+    /// (with synthesized soft-group cost objectives), folds its
+    /// soft-relaxation clauses in as extra conjuncts (so the certified
+    /// terminal obligation is authored ∧ relaxation ∧ point-blockers),
+    /// and seals the caller's REAL objectives — the extended vector
+    /// never enters `ctx`. The per-point blockers always come first, in
+    /// emission order.
+    fn build_pareto_front_exhaustion_extension_with(
+        &mut self,
+        blocking_objectives: &[ay_frontend::Objective],
+        emitted: &[Vec<BigRational>],
+        extra_conjuncts: &[TermId],
+        sealed_objectives: &[ay_frontend::Objective],
+        mut point_blocker: impl FnMut(&mut Self, &[BigRational]) -> Result<TermId>,
+    ) -> Result<ParetoFrontExhaustionExtension> {
+        let objectives = blocking_objectives;
+        let mut blocking = Vec::with_capacity(emitted.len() + extra_conjuncts.len());
         for point in emitted {
-            blocking.push(self.mk_not_dominated_or_equal_by(objectives, point)?);
+            blocking.push(point_blocker(self, point)?);
         }
+        blocking.extend_from_slice(extra_conjuncts);
         let hard_root_entries = self
             .ctx
             .assertions
@@ -2264,7 +4106,16 @@ impl Executor {
                     "Pareto exhaustion roots contain a stale term entry".to_string(),
                 )
             })?;
-        let objective_entries = objectives
+        let objective_entries = sealed_objectives
+            .iter()
+            .map(|objective| self.ctx.terms.entry_stamp(objective.term))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ExecutorError::UnsupportedOptimization(
+                    "Pareto exhaustion objectives contain a stale term entry".to_string(),
+                )
+            })?;
+        let blocking_objective_entries = objectives
             .iter()
             .map(|objective| self.ctx.terms.entry_stamp(objective.term))
             .collect::<Option<Vec<_>>>()
@@ -2287,8 +4138,10 @@ impl Executor {
             source_context_stamp: self.ctx.source_context_stamp(),
             hard_roots: self.ctx.assertions.clone().into_boxed_slice(),
             hard_root_entries: hard_root_entries.into_boxed_slice(),
-            objectives: objectives.into(),
+            objectives: sealed_objectives.into(),
             objective_entries: objective_entries.into_boxed_slice(),
+            blocking_objectives: objectives.into(),
+            blocking_objective_entries: blocking_objective_entries.into_boxed_slice(),
             blocking: blocking.into_boxed_slice(),
             blocking_entries: blocking_entries.into_boxed_slice(),
         })
@@ -2363,7 +4216,6 @@ impl Executor {
     /// Atom: objective `obj` is at-least-as-good as `value` (weak improvement in
     /// `obj`'s optimize direction). Maximize → `obj >= value`; minimize →
     /// `obj <= value`. Dispatches on the objective's sort.
-    #[cfg(debug_assertions)]
     fn mk_at_least_as_good_atom(
         &mut self,
         obj: &ay_frontend::Objective,
@@ -2894,7 +4746,8 @@ impl Executor {
         // authoritative-failclosed gates (previously it ran the strict gate via
         // finalize_sat_model_validation only, never the independent gate) and
         // mints the SatCertificate (#4642 D5).
-        let emitted = match self.emit_sat_verdict(SolveResult::Sat, &value_roots) {
+        let emitted = match self.emit_captured_optimization_witness(SolveResult::Sat, &value_roots)
+        {
             Ok(result) => result,
             Err(error) => {
                 self.invalidate_last_check_result();
@@ -2992,6 +4845,18 @@ impl Executor {
         self.last_unknown_reason = Some(UnknownReason::InternalError);
         self.last_result = Some(SolveResult::Unknown);
         SolveResult::Unknown
+    }
+
+    fn emit_captured_optimization_witness(
+        &mut self,
+        proposed: SolveResult,
+        obligations: &[TermId],
+    ) -> Result<SolveResult> {
+        if proposed != SolveResult::Sat {
+            return self.emit_sat_verdict(proposed, obligations);
+        }
+        let model = self.last_model.take();
+        self.emit_optimization_sat_verdict(OptimizationModelPublication { model, obligations })
     }
 
     /// Create `lhs >= value` for committing an optimal value as a hard constraint.
@@ -3731,6 +5596,11 @@ impl Executor {
     /// Without bounds, the optimizer may return arbitrary values (Z3 does
     /// this silently; AY warns explicitly).
     fn warn_unbounded_objectives(&self, objectives: &[ay_frontend::Objective]) {
+        // Not under `--z3-mode` (or in the z3 C API library), whose stderr
+        // stays as empty as z3's.
+        if ay_core::misc_cli_flags().z3_transcript {
+            return;
+        }
         // Collect all variables in each objective and check bounds.
         for obj in objectives {
             // BitVector objectives are over a FINITE domain, so they are always
@@ -3747,6 +5617,11 @@ impl Executor {
                     TermData::Var(name, _) => name.clone(),
                     _ => continue,
                 };
+                // A native API constant's private identity (`!ay.z3-const!0`)
+                // is not a name its caller knows; z3's API warns about none.
+                if var_name.starts_with('!') {
+                    continue;
+                }
                 let var_sort = self.ctx.terms.sort(var_id).clone();
 
                 let (needs_lower, needs_upper) = match obj.direction {

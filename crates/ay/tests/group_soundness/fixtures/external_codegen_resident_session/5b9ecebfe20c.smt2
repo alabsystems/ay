@@ -1,0 +1,8 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const sa_v70 (_ BitVec 64))
+(declare-const sa_v71 (_ BitVec 64))
+(declare-const sa_v72 (_ BitVec 64))
+(assert (not (= (bvadd sa_v70 sa_v71) (bvadd sa_v70 (bvmul sa_v71 (_ bv1 64))))))
+(check-sat)

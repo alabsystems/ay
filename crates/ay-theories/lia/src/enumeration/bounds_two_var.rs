@@ -35,7 +35,7 @@ impl LiaSolver<'_> {
         let mut constraints: Vec<Constraint> = Vec::new();
 
         for &(literal, value) in &self.assertion_view().inequalities {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 
@@ -82,7 +82,9 @@ impl LiaSolver<'_> {
             }
             let pivot_term = idx_to_term[*pivot_col];
 
-            let (pivot_lb, pivot_ub) = match self.lra.get_bounds_ref(pivot_term) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness): the two-var
+            // box decides `Unsat(conflict_from_asserted())`.
+            let (pivot_lb, pivot_ub) = match self.justified_bounds_ref(pivot_term) {
                 Some((lb, ub)) => (lb.map(|b| b.value.clone()), ub.map(|b| b.value.clone())),
                 None => (None, None),
             };

@@ -270,11 +270,11 @@ fn guard_seven_refuses_a_forged_different_index_overwrite() {
     );
 }
 
-/// The wire: the store-over-store fragment prints, its own leaf falls through
-/// to the honest `hole` (Carcara has no store-overwrite rule), and the rest of
-/// the fragment prints as real Alethe rules. The `trust` step it replaces is
-/// GONE — the trade is one `hole` for one `trust`, and only the `hole` keeps
-/// the document checkable-as-holey.
+/// The wire preserves the exact store-over-store identity and derives it
+/// through array extensionality and read-over-write rules. Neither a `trust`
+/// step nor an unproved `hole` may survive. The surrounding bridge still
+/// discharges its hypotheses with th_resolution and reaches the original
+/// assertion through congruence.
 #[test]
 fn the_store_overwrite_leaf_prints_on_the_wire() {
     let exec = solve(STORE_OVER_STORE);
@@ -289,9 +289,12 @@ fn the_store_overwrite_leaf_prints_on_the_wire() {
         "no trust step may survive:\n{document}"
     );
     assert!(
-        document.contains("(= (store (store a1 i0 e1) i0 e2) (store a1 i0 e2))) :rule hole)"),
-        "the store-over-store leaf must print as the honest hole with its own raw \
-         overwrite term:\n{document}"
+        !document.contains(":rule hole")
+            && document.contains("(= (store (store a1 i0 e1) i0 e2) (store a1 i0 e2))")
+            && document.contains(":rule arrays_ext")
+            && document.contains(":rule arrays_idx")
+            && document.contains(":rule arrays_row"),
+        "the exact store-over-store leaf must print a checked array derivation:\n{document}"
     );
     assert!(
         document.contains(":rule th_resolution"),

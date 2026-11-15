@@ -22,6 +22,9 @@ use super::Executor;
 impl Executor {
     /// Convert an evaluated value into the atom format used in EUF function tables.
     pub(super) fn eval_value_to_model_atom(&self, value: &EvalValue) -> Option<String> {
+        if !super::evaluation_copies::atom(value) {
+            return None;
+        }
         match value {
             EvalValue::Bool(true) => Some("true".to_string()),
             EvalValue::Bool(false) => Some("false".to_string()),
@@ -35,8 +38,16 @@ impl Executor {
             }
             EvalValue::BitVec { value, width } => Some(format_bitvec(value, *width)),
             EvalValue::Fp(fp_val) => Some(fp_val.to_smtlib()),
+            EvalValue::FiniteField { value, field } => {
+                self.format_field_literal_checked(*value, *field)
+            }
             EvalValue::String(s) => Some(s.clone()),
             EvalValue::Seq(_) => None, // Seq values have no atomic representation
+            EvalValue::Complex { real, imaginary } => Some(format!(
+                "(complex.make {} {})",
+                Self::format_complex_component(real).ok()?,
+                Self::format_complex_component(imaginary).ok()?
+            )),
             // Exact NRA algebraic value: rational-valued expressions render as
             // rationals, irrational ones in z3 `root-obj` syntax.
             EvalValue::Algebraic(a) => match a.to_number_for_output() {
@@ -74,6 +85,9 @@ impl Executor {
             return Some(rendered);
         }
         if let Some(value) = model.dt_ground.get(&term) {
+            if !super::evaluation_copies::model_value(value) {
+                return None;
+            }
             return self.format_gate_model_value(value, sort);
         }
         if let Some(value) = self.certified_dt_literal_model_value(model, term, 64) {
@@ -115,6 +129,9 @@ impl Executor {
             }
             TermData::App(symbol, args) => {
                 let (_datatype, ctor) = self.ctx.is_constructor(symbol.name())?;
+                if !super::evaluation_copies::cells(args.len()) {
+                    return None;
+                }
                 (ctor, args.clone())
             }
             _ => return None,
@@ -172,18 +189,27 @@ impl Executor {
             return None;
         }
 
+        // A model-check completion table (`element_carriers`) also carries
+        // bit-vector, floating-point and abstract plain-uninterpreted
+        // elements, all read off the model it was installed into.
+        let carriers = interpretation.element_carriers;
+        let carrier_matches = |value: &EvalValue, sort: &Sort| {
+            carriers && self.model_check_carrier_matches(value, sort)
+        };
         let argument_matches_sort = |value: &EvalValue, sort: &Sort| match (value, sort) {
             (EvalValue::Rational(r), Sort::Int) => r.is_integer(),
             (EvalValue::Rational(_), Sort::Real) | (EvalValue::Algebraic(_), Sort::Real) => true,
-            (EvalValue::Element(atom), Sort::Datatype(_) | Sort::Uninterpreted(_)) => {
-                !atom.is_empty() && !atom.starts_with('@') && !atom.contains('?')
+            (EvalValue::Element(atom), Sort::Datatype(_) | Sort::Uninterpreted(_))
+                if !atom.is_empty() && !atom.starts_with('@') && !atom.contains('?') =>
+            {
+                true
             }
-            _ => false,
+            _ => carrier_matches(value, sort),
         };
         let result_matches_sort = |value: &EvalValue| match (value, result_sort) {
             (EvalValue::Bool(_), Sort::Bool) | (EvalValue::Rational(_), Sort::Real) => true,
             (EvalValue::Rational(r), Sort::Int) => r.is_integer(),
-            _ => false,
+            _ => carrier_matches(value, result_sort),
         };
         let actual: Vec<EvalValue> = args
             .iter()
@@ -223,8 +249,8 @@ impl Executor {
                     .rendered_rows
                     .iter()
                     .position(|(key, _)| key == &rendered_actual)
-                    .map(|index| interpretation.rows[index].1.clone())
-                    .unwrap_or_else(|| interpretation.default.clone());
+                    .map(|index| super::evaluation_copies::copy(&interpretation.rows[index].1))
+                    .unwrap_or_else(|| super::evaluation_copies::copy(&interpretation.default));
                 return result_matches_sort(&result).then_some(result);
             }
         }
@@ -259,7 +285,7 @@ impl Executor {
                 }
             }
             if !row_mismatch && !row_undecided {
-                return result_matches_sort(value).then(|| value.clone());
+                return result_matches_sort(value).then(|| super::evaluation_copies::copy(value));
             }
             if !row_mismatch && row_undecided {
                 undecided_row = true;
@@ -268,7 +294,7 @@ impl Executor {
         if undecided_row || !result_matches_sort(&interpretation.default) {
             return None;
         }
-        Some(interpretation.default.clone())
+        Some(super::evaluation_copies::copy(&interpretation.default))
     }
 
     /// Whether a term is an interpreted ARITHMETIC composite (`+ - * div mod
@@ -306,7 +332,7 @@ impl Executor {
             }
             if let Some(raw) = euf_model.term_values.get(&arg) {
                 if raw == "true" || raw == "false" {
-                    return Some(raw.clone());
+                    return super::evaluation_copies::copy_string(raw);
                 }
             }
             if let EvalValue::Bool(value) = self.evaluate_term(model, arg) {
@@ -364,7 +390,7 @@ impl Executor {
         }
 
         if let Some(raw) = euf_model.term_values.get(&arg) {
-            return Some(raw.clone());
+            return super::evaluation_copies::copy_string(raw);
         }
 
         if matches!(self.ctx.terms.get(arg), TermData::Const(_)) {
@@ -498,7 +524,12 @@ impl Executor {
                     None
                 }
             })
-            .or_else(|| euf_model.term_values.get(&term_id).cloned())
+            .or_else(|| {
+                euf_model
+                    .term_values
+                    .get(&term_id)
+                    .and_then(super::evaluation_copies::copy_string)
+            })
     }
 
     /// Evaluate UF applications via extracted function tables when available.
@@ -556,9 +587,17 @@ impl Executor {
                 lia_leaf
                     .or(arithmetic_composite)
                     .or_else(|| euf_model.int_values.get(&term_id).map(ToString::to_string))
-                    .or_else(|| euf_model.term_values.get(&term_id).cloned())
+                    .or_else(|| {
+                        euf_model
+                            .term_values
+                            .get(&term_id)
+                            .and_then(super::evaluation_copies::copy_string)
+                    })
             } else {
-                euf_model.term_values.get(&term_id).cloned()
+                euf_model
+                    .term_values
+                    .get(&term_id)
+                    .and_then(super::evaluation_copies::copy_string)
             }
             .or_else(|| {
                 // #uf-table-entry-nonrec: an APP-valued ENTRY atom is
@@ -656,7 +695,7 @@ impl Executor {
                     self.committed_app_atom(model, euf_model, term_id)
                 }
                 Some(term_id) => self.eval_value_to_model_atom(&self.evaluate_term(model, term_id)),
-                None => Some(raw_result.clone()),
+                None => super::evaluation_copies::copy_string(raw_result),
             };
             if let Some(c) = candidate {
                 if !c.starts_with("@?") {
@@ -666,7 +705,7 @@ impl Executor {
             }
         }
         let resolved_result = resolved?;
-        let parsed = self.parse_model_value_string(&resolved_result, &Some(result_sort.clone()));
+        let parsed = self.parse_model_value_string_borrowed(&resolved_result, Some(result_sort));
         // If parsing returned Unknown, the function table had a placeholder value
         // (e.g., "@?{id}" for Int/Real-sorted results built before term_values
         // were populated). Fall through to per-sort model lookups which have
@@ -707,8 +746,14 @@ impl Executor {
         // body's distinct beta instances.
         if !context_dependent && matches!(sort, Sort::Seq(_)) {
             if let Some(value @ EvalValue::Seq(_)) = model.completed_values.get(&term_id) {
-                return value.clone();
+                return super::evaluation_copies::copy(value);
             }
+        }
+        // Explicit non-nullary constructors denote their structural fields,
+        // not an opaque EUF class token. Only complete bounded values override
+        // the existing path; no model entry is mutated or installed here.
+        if let Some(value) = self.evaluate_exact_datatype_constructor(model, term_id) {
+            return value;
         }
         // DT constructor recognition: nullary constructors like `Green`
         // or `Nothing` are 0-arity applications that should evaluate to
@@ -769,6 +814,9 @@ impl Executor {
             }
             if let Some(ref lia_model) = model.lia_model {
                 if let Some(val) = lia_model.values.get(&term_id) {
+                    if !super::evaluation_copies::integer(val) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::Rational(BigRational::from(val.clone()));
                 }
             }
@@ -787,6 +835,14 @@ impl Executor {
                 .evaluate_certified_total_uf_app(model, name, args, sort)
                 .unwrap_or(EvalValue::Unknown);
         }
+        // Scalar cosmetics retain the extracted total function interpretation.
+        // A changed argument must read that same function, including its else
+        // value, rather than the application's stale pre-minimization pin.
+        if let Some(function) = model.materialized_scalar_functions.get(name) {
+            return function
+                .evaluate(self, model, name, args, sort)
+                .unwrap_or(EvalValue::Unknown);
+        }
         // An uninterpreted-sort UF application's OWN committed element
         // (`term_values[term_id]`) is authoritative over the arg-keyed function
         // table (#uflia-uninterp-eq-recover). The extracted function table bakes
@@ -800,6 +856,9 @@ impl Executor {
         if !context_dependent && matches!(sort, Sort::Uninterpreted(_)) {
             if let Some(ref euf_model) = model.euf_model {
                 if let Some(elem) = euf_model.term_values.get(&term_id) {
+                    if !super::evaluation_copies::string(elem) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::Element(elem.clone());
                 }
             }
@@ -838,7 +897,7 @@ impl Executor {
                 if !euf_model.speculative_int_terms.contains(&term_id) {
                     if let Some(raw) = euf_model.term_values.get(&term_id) {
                         if let EvalValue::Rational(r) =
-                            self.parse_model_value_string(raw, &Some(sort.clone()))
+                            self.parse_model_value_string_borrowed(raw, Some(sort))
                         {
                             return EvalValue::Rational(r);
                         }
@@ -904,6 +963,17 @@ impl Executor {
             if let Some(b) = self.term_value(&model.sat_model, &model.term_to_var, term_id) {
                 return EvalValue::Bool(b);
             }
+            // UF congruence, as `find_congruent_bv_app` does for BV-valued
+            // applications (#5461): this predicate application may have no
+            // literal of its own because preprocessing substituted an argument
+            // away (`(= x c0)` eliminates `x`, so the SAT problem holds
+            // `(p c0)` and never `(p x)`). Then the value at this argument
+            // point is the literal of a committed application of `p` whose
+            // arguments evaluate to the same values (2026-10-02 audit V1: a
+            // QF_UFBV `(= x c0) (p x)` came back `unknown`).
+            if let Some(b) = self.find_congruent_bool_app(model, name, args, term_id) {
+                return EvalValue::Bool(b);
+            }
         }
         // For non-Bool applications, consult models by term ID.
         // For user-visible UF/selector apps (#5432), check EUF
@@ -936,11 +1006,17 @@ impl Executor {
                 // fallback for non-depth terms.
                 if let Some(ref lia_model) = model.lia_model {
                     if let Some(val) = lia_model.values.get(&term_id) {
+                        if !super::evaluation_copies::integer(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::Rational(BigRational::from(val.clone()));
                     }
                 }
                 if let Some(ref lra_model) = model.lra_model {
                     if let Some(val) = lra_model.values.get(&term_id) {
+                        if !super::evaluation_copies::rational(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::Rational(val.clone());
                     }
                 }
@@ -957,6 +1033,9 @@ impl Executor {
                 }
                 if let Some(ref euf_model) = model.euf_model {
                     if let Some(val) = euf_model.int_values.get(&term_id) {
+                        if !super::evaluation_copies::integer(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::Rational(BigRational::from(val.clone()));
                     }
                 }
@@ -979,6 +1058,9 @@ impl Executor {
                 }
                 if let Some(ref lra_model) = model.lra_model {
                     if let Some(val) = lra_model.values.get(&term_id) {
+                        if !super::evaluation_copies::rational(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::Rational(val.clone());
                     }
                 }
@@ -989,6 +1071,9 @@ impl Executor {
             Sort::BitVec(bv) => {
                 if let Some(ref bv_model) = model.bv_model {
                     if let Some(val) = bv_model.values.get(&term_id) {
+                        if !super::evaluation_copies::integer(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::BitVec {
                             value: val.clone(),
                             width: bv.width,
@@ -1026,6 +1111,9 @@ impl Executor {
                 // FP-sorted unrecognized application: check FP model
                 if let Some(ref fp_model) = model.fp_model {
                     if let Some(val) = fp_model.values.get(&term_id) {
+                        if !super::evaluation_copies::fp(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::Fp(val.clone());
                     }
                 }
@@ -1035,6 +1123,9 @@ impl Executor {
         // Then try EUF model
         if let Some(ref euf_model) = model.euf_model {
             if let Some(elem) = euf_model.term_values.get(&term_id) {
+                if !super::evaluation_copies::string(elem) {
+                    return EvalValue::Unknown;
+                }
                 return EvalValue::Element(elem.clone());
             }
             // Check for function application constant values (#385)
@@ -1148,6 +1239,74 @@ impl Executor {
         Some(EvalValue::Bool(true))
     }
 
+    /// Find the committed SAT value of a Bool UF application congruent to
+    /// `func_name(target_args)`: same symbol, every argument evaluating to the
+    /// same value. Every congruent committed application must carry the SAME
+    /// value; if two disagree the model is not a function at that point and
+    /// the lookup declines (`None`), so this can only publish what the solve
+    /// decided, never choose between contradicting commitments.
+    pub(super) fn find_congruent_bool_app(
+        &self,
+        model: &Model,
+        func_name: &str,
+        target_args: &[TermId],
+        target_term_id: TermId,
+    ) -> Option<bool> {
+        if target_args.is_empty() {
+            return None;
+        }
+        let target_arg_vals: Vec<EvalValue> = target_args
+            .iter()
+            .map(|&a| self.evaluate_term(model, a))
+            .collect();
+        if target_arg_vals
+            .iter()
+            .any(|v| matches!(v, EvalValue::Unknown))
+        {
+            return None;
+        }
+        let mut found: Option<bool> = None;
+        for &candidate_tid in model.term_to_var.keys() {
+            if candidate_tid == target_term_id {
+                continue;
+            }
+            let TermData::App(sym, cand_args) = self.ctx.terms.get(candidate_tid) else {
+                continue;
+            };
+            if sym.name() != func_name || cand_args.len() != target_args.len() {
+                continue;
+            }
+            // An ambient TermId-keyed literal never stands for a beta instance.
+            if super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, candidate_tid) {
+                continue;
+            }
+            let args_match =
+                cand_args
+                    .iter()
+                    .zip(target_arg_vals.iter())
+                    .all(|(&cand_arg, target_val)| {
+                        let cand_val = self.evaluate_term(model, cand_arg);
+                        matches!(
+                            Self::eval_values_equal_exact(&cand_val, target_val),
+                            Some(true)
+                        )
+                    });
+            if !args_match {
+                continue;
+            }
+            let Some(value) = self.term_value(&model.sat_model, &model.term_to_var, candidate_tid)
+            else {
+                continue;
+            };
+            match found {
+                None => found = Some(value),
+                Some(previous) if previous == value => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
     /// Find a congruent BV UF application in the BV model (#5461).
     ///
     /// When `f(y)` is not in `bv_model.values` (because it only appeared in
@@ -1204,6 +1363,9 @@ impl Executor {
                             )
                         });
                 if args_match {
+                    if !super::evaluation_copies::integer(candidate_val) {
+                        return None;
+                    }
                     return Some(candidate_val.clone());
                 }
             }

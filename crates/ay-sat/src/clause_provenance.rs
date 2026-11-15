@@ -97,6 +97,24 @@ impl ProvenanceTracker {
         self.tags[clause_idx] = Some(provenance);
     }
 
+    pub(crate) fn reserve_tag_counted(
+        &mut self,
+        offset: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
+        if self.enabled {
+            let additional = (offset + 1).saturating_sub(self.tags.len());
+            crate::counted_storage::try_reserve(owner, &mut self.tags, additional)?;
+            owner.admit(
+                (offset + 1)
+                    .saturating_sub(self.tags.len())
+                    .saturating_add(1),
+                0,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Get the provenance of a clause at the given arena index.
     #[inline]
     pub(crate) fn get(&self, clause_idx: usize) -> Option<ClauseProvenance> {

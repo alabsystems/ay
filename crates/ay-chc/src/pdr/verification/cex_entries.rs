@@ -519,6 +519,17 @@ impl PdrSolver {
     ) -> Vec<(ChcVar, ChcExpr)> {
         let mut subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
         for (name, value) in &entry.instances {
+            // `sort_map` names every variable this entry's replay can mention
+            // (the entry's and its premises' canonical arguments and the
+            // clause's variables). An instance outside it is engine
+            // bookkeeping, e.g. the `__lvl0_fact_<i>_` renames of a level-0
+            // reachability model, and substituting it is a no-op. A datatype
+            // value records its constructor, not its sort, so such an
+            // instance cannot even be typed; skip it rather than mark an
+            // otherwise replayable witness Unknown.
+            if !sort_map.contains_key(name.as_str()) && matches!(value, SmtValue::Datatype(..)) {
+                continue;
+            }
             subst.push(instance_subst_var_and_value(
                 name,
                 value,

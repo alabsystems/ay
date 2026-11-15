@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+pbc >= 0 : subproof
+    start_time test ;
+    pol -1 2 * ;
+    end_time test ;
+qed : -1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

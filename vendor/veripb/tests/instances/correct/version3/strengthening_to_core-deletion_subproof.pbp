@@ -1,0 +1,27 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: allow-unchecked-deletion
+f 2 ;
+
+% constraint 3 in derived set
+pol 1 ;
+
+% switch to unchecked deletion
+delc 2 ;
+
+
+% enable strengthening-to-core
+strengthening_to_core on ;
+
+
+% constraint 3 should now be in the core
+
+% derive something in the derived set
+pol 1 ;
+
+% delete constraint 3 with a subproof
+delc 3 : : subproof
+	pol -1 1 +;
+qed : -1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

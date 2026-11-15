@@ -172,8 +172,8 @@ Z3 transcript mode changes the visible protocol, not AY's reasoning, and each
 binding documents its implemented subset. Differentially test the exact
 operations your program uses.
 
-Start with:
-  cargo run -p ay-dpll --example native_api
+Start with (`cargo run ...` without the Trust toolchain):
+  targo --unverified run -p ay-dpll --example native_api
   python3 -m pip install ./bindings/python
   cd bindings/js && npm install && npm test
 "#,
@@ -204,7 +204,8 @@ fn tooling() {
   ay solve --stats-json --progress-json progress.jsonl problem.smt2
       Machine-readable statistics and streaming progress evidence.
 
-Benchmark-only functionality may require `cargo build -p ay --features bench`.
+Benchmark-only functionality may require `targo --unverified build -p ay
+--features bench` (`cargo build ...` without the Trust toolchain).
 Parallel benchmark runs must use the repository OOM planner and persist the
 enforced per-child memory envelope; timings without it are not comparable.
 "#,

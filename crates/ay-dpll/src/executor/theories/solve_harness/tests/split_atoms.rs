@@ -163,3 +163,35 @@ fn test_create_int_split_atoms_exact_half_prefers_floor_first() {
     assert_eq!(ge, expected_ge);
     assert_eq!(prefer_ceil, Some(false));
 }
+
+/// #split-walk-sat-fallback: the peek answers exactly what the guard would,
+/// at every step of a monotone walk, and records nothing.
+#[test]
+fn test_split_oscillation_would_trigger_matches_the_guard_without_recording() {
+    use super::super::{
+        check_split_oscillation, split_oscillation_would_trigger, SplitOscillationMap,
+    };
+    let var = ay_core::TermId(7);
+    let mut tracking = SplitOscillationMap::default();
+    // An unseen variable never triggers, and the peek does not seed it.
+    assert!(!split_oscillation_would_trigger(&tracking, var, &rat(0)));
+    assert!(tracking.is_empty());
+    assert!(!check_split_oscillation(&mut tracking, var, &rat(0)));
+    let mut fired = 0;
+    for i in 1..=30 {
+        let before = tracking.get(&var).cloned();
+        let peek = split_oscillation_would_trigger(&tracking, var, &rat(-i));
+        assert_eq!(
+            tracking.get(&var).cloned(),
+            before,
+            "the peek recorded step {i}"
+        );
+        let guard = check_split_oscillation(&mut tracking, var, &rat(-i));
+        assert_eq!(peek, guard, "peek and guard disagree at step {i}");
+        fired += usize::from(guard);
+    }
+    assert_eq!(fired, 11, "the guard fires from the 20th monotone move on");
+    // A reversal resets the counter: neither the peek nor the guard fires.
+    assert!(!split_oscillation_would_trigger(&tracking, var, &rat(5)));
+    assert!(!check_split_oscillation(&mut tracking, var, &rat(5)));
+}

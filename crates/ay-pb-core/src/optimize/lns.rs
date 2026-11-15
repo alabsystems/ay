@@ -269,7 +269,7 @@ pub(crate) fn improve_with_lns(
     // This `stop` is threaded through `solve_neighborhood` into the sub-solver's
     // per-decision search loop, so its memory component MUST stay off the
     // syscall path: it uses the syscall-free live-heap signal
-    // (`live_bytes_exceeded_at_percent`, a single relaxed atomic load). The full
+    // (`live_bytes_exceeded_at_percent`, two relaxed atomic loads). The full
     // footprint/RSS poll (`process_memory_exceeded`, a `task_info`/`getrusage`
     // syscall) is applied only at the one-time entry and the per-round loop
     // top (see below) — O(rounds), never per decision. The sub-solver's own

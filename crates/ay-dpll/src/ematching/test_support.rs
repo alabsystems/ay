@@ -21,6 +21,8 @@ pub(super) fn perform_ematching_with_config(
     perform_ematching_with_generations(
         terms,
         assertions,
+        &[],
+        &[],
         config,
         GenerationTracker::new(),
         None,

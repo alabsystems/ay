@@ -884,7 +884,17 @@ impl CnfEncoder {
         }
 
         self.profile.strategies.record(strategy);
+        self.encode_with_strategy(strategy, coeffs, lits, rhs);
+    }
 
+    /// Emit a `>=` row with `strategy`, the last step of [`Self::encode_ge`].
+    fn encode_with_strategy(
+        &mut self,
+        strategy: EncodingStrategy,
+        coeffs: &[i128],
+        lits: &[i32],
+        rhs: i128,
+    ) {
         match strategy {
             EncodingStrategy::SequentialCounter => {
                 sequential_counter::encode_sequential_counter(
@@ -908,7 +918,19 @@ impl CnfEncoder {
                 );
             }
             EncodingStrategy::Adder => {
-                adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var);
+                // `None` means the row does not fit DIMACS literals (auxiliary
+                // variables past `i32::MAX`, or an `i32::MIN` input literal);
+                // the parser's variable cap keeps real instances far below
+                // that. The plain encoder has no failure channel, so the row is
+                // left unencoded: a RELAXATION (the adder's partial clauses
+                // only define fresh auxiliaries), which can never manufacture
+                // UNSAT, and whose models the caller must verify. The
+                // interruptible encoder abandons the encode instead.
+                if adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var)
+                    .is_none()
+                {
+                    return;
+                }
             }
         }
     }
@@ -1133,7 +1155,14 @@ impl CnfEncoder {
                 }
             }
             EncodingStrategy::Adder => {
-                adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var);
+                // `None`: the row does not fit DIMACS literals. Abandon the
+                // whole encode (the caller reports no CNF) rather than emit a
+                // row that means something else.
+                if adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var)
+                    .is_none()
+                {
+                    return true;
+                }
             }
         }
 

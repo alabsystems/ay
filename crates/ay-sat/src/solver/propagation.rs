@@ -94,7 +94,7 @@ impl Solver {
     /// raw access pattern (#7998). Also uses `val_at()` (unchecked) instead of
     /// `lit_val()` for the same reason.
     #[inline(always)]
-    fn assignment_level(&self, lit: Literal, reason: ClauseRef) -> u32 {
+    pub(super) fn assignment_level(&self, lit: Literal, reason: ClauseRef) -> u32 {
         let decision_level = self.decision_level;
         // Fast path: at decision level 0, all assigned literals are at
         // level 0, so the max over reason literals is trivially 0.
@@ -147,7 +147,7 @@ impl Solver {
     /// `assignment_level`), this skips the arena fetch + length check +
     /// literal comparison. CaDiCaL propagate.cpp:25-35.
     #[inline(always)]
-    fn assignment_level_binary(&self, other: Literal) -> u32 {
+    pub(super) fn assignment_level_binary(&self, other: Literal) -> u32 {
         if self.lit_val(other) < 0 {
             self.var_data[other.variable().index()]
                 .level
@@ -165,46 +165,7 @@ impl Solver {
     pub(super) fn enqueue(&mut self, lit: Literal, reason: Option<ClauseRef>) {
         let var = lit.variable();
         let reason_clause = reason;
-        // Soundness-triage tripwire (--sat-ab-triage-var <dimacs var>): report
-        // every assignment of that variable with level + pass attribution.
-        {
-            use std::sync::OnceLock;
-            static TVAR: OnceLock<Option<usize>> = OnceLock::new();
-            let t = TVAR.get_or_init(|| {
-                ay_core::misc_cli_flags()
-                    .ab_triage_var
-                    .and_then(|n| usize::try_from(n).ok())
-            });
-            if let Some(tv) = t {
-                if var.index() + 1 == *tv {
-                    let rinfo = match reason {
-                        Some(r) => {
-                            let lits: Vec<String> = self
-                                .arena
-                                .literals(r.0 as usize)
-                                .iter()
-                                .map(|l| l.index().to_string())
-                                .collect();
-                            format!(
-                                "ref={} cid={} learned={} lits=[{}]",
-                                r.0,
-                                self.cold.clause_ids.get(r.0 as usize).copied().unwrap_or(0),
-                                self.arena.is_learned(r.0 as usize),
-                                lits.join(" ")
-                            )
-                        }
-                        None => "NONE".to_string(),
-                    };
-                    eprintln!(
-                        "TRIAGE_ASSIGN: lit_idx={} level={} pass={:?} reason {}",
-                        lit.index(),
-                        self.decision_level,
-                        self.cold.diagnostic_pass,
-                        rinfo,
-                    );
-                }
-            }
-        }
+        self.trace_assignment_triage(lit, reason);
         // Safety net (#8359, #8382): skip stale literals with var_index >= num_vars.
         // This catches JIT/compaction producing out-of-bounds variable indices.
         // Tracked via stats.stale_enqueue_skips; zero is expected when correct.
@@ -280,6 +241,21 @@ impl Solver {
                 reason_clause.map_or(NO_REASON, |r| r.0),
             )
         };
+        self.commit_assignment(lit, reason_clause, assigned_level, assigned_reason);
+        self.log_assignment(lit, assigned_level, reason_clause);
+        self.check_completed_assignment(lit);
+    }
+
+    /// Shared actual assignment-state update. Decisions use NO_REASON; general
+    /// enqueue retains its original chronological-level and proof-use work.
+    pub(super) fn commit_assignment(
+        &mut self,
+        lit: Literal,
+        reason_clause: Option<ClauseRef>,
+        assigned_level: u32,
+        assigned_reason: u32,
+    ) {
+        let var = lit.variable();
         // vals[] is the sole source of truth for assignment state (#3758 Phase 3).
         ay_prefetch::val_set(&mut self.vals, lit.index(), 1);
         ay_prefetch::val_set(&mut self.vals, lit.negated().index(), -1);
@@ -328,6 +304,16 @@ impl Solver {
             self.two_stage_note_bcp_use(reason);
         }
         self.trail.push(lit);
+    }
+
+    pub(super) fn log_assignment(
+        &self,
+        lit: Literal,
+        assigned_level: u32,
+        reason_clause: Option<ClauseRef>,
+    ) {
+        // The compile-time no-op macro must not leave unused parameters.
+        let _ = (lit, assigned_level, reason_clause);
         solver_log!(
             self,
             "assign {} at level {} (dl={}) reason {:?}",
@@ -336,6 +322,9 @@ impl Solver {
             self.decision_level,
             reason_clause
         );
+    }
+
+    pub(super) fn check_completed_assignment(&self, lit: Literal) {
         // Propagation events are omitted from the decision trace because BCP is
         // deterministic: given the same decisions and clause database state,
         // propagations are identical. Omitting them keeps traces compact
@@ -373,6 +362,45 @@ impl Solver {
         // non-blocking L2 prefetch to hide main-memory latency (~60-80 cycles)
         // behind the current propagation work.
         self.watches.prefetch_first(lit.negated());
+    }
+
+    pub(super) fn trace_assignment_triage(&self, lit: Literal, reason: Option<ClauseRef>) {
+        // MiscCliFlags already owns the immutable process cache. A second
+        // OnceLock here would hide scoped test configuration and serves no
+        // production purpose; counted decisions require capture before entry.
+        let target = ay_core::misc_cli_flags()
+            .ab_triage_var
+            .and_then(|n| usize::try_from(n).ok());
+        if target != Some(lit.variable().index() + 1) {
+            return;
+        }
+        let rinfo = match reason {
+            Some(r) => {
+                let lits: Vec<String> = self
+                    .arena
+                    .literals(r.0 as usize)
+                    .iter()
+                    .map(|l| l.index().to_string())
+                    .collect();
+                std::borrow::Cow::Owned(format!(
+                    "ref={} cid={} learned={} lits=[{}]",
+                    r.0,
+                    self.cold.clause_ids.get(r.0 as usize).copied().unwrap_or(0),
+                    self.arena.is_learned(r.0 as usize),
+                    lits.join(" ")
+                ))
+            }
+            None => std::borrow::Cow::Borrowed("NONE"),
+        };
+        eprintln!(
+            "{}",
+            decision_commit::output::TriageLine {
+                lit,
+                level: self.decision_level,
+                pass: self.cold.diagnostic_pass,
+                reason: &rinfo,
+            }
+        );
     }
 
     /// Lightweight enqueue for BCP propagation assignments (Kissat fastassign.h).
@@ -932,7 +960,7 @@ impl Solver {
         let other_var = reason_lit.variable().index();
         if other_var < self.num_vars {
             let other_vd = self.var_data[other_var];
-            if other_vd.is_binary_reason() {
+            if other_vd.is_binary_reason() && is_binary_literal_reason(other_vd.reason) {
                 reason_lit = Literal(binary_reason_lit(other_vd.reason));
                 self.stats.jumped_reasons += 1;
             }
@@ -1022,7 +1050,7 @@ impl Solver {
             return;
         }
         let other_vd = self.var_data[other_var];
-        if other_vd.is_binary_reason() {
+        if other_vd.is_binary_reason() && is_binary_literal_reason(other_vd.reason) {
             reason_lit = Literal(binary_reason_lit(other_vd.reason));
             self.stats.jumped_reasons += 1;
         }
@@ -1075,6 +1103,18 @@ impl Solver {
     /// ENSURES: decision_level incremented, trail_lim extended, literal enqueued with no reason
     #[inline]
     pub(super) fn decide(&mut self, lit: Literal) {
+        match self.decide_admitted(lit, &mut decision_commit::Ordinary) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn decide_admitted<P: decision_commit::Policy>(
+        &mut self,
+        lit: Literal,
+        policy: &mut P,
+    ) -> Result<(), P::Error> {
+        policy.prepare(self, lit)?;
         // CaDiCaL propagate.cpp:188: all propagations complete before deciding
         debug_assert_eq!(
             self.qhead,
@@ -1103,14 +1143,32 @@ impl Solver {
         );
         self.trail_lim.push(self.trail.len());
         self.num_decisions += 1;
+        if self.qhead < self.trail.len() {
+            self.stats.decisions_with_pending_props += 1;
+        }
+        self.stats.record_prop_decision(
+            self.num_propagations,
+            self.num_conflicts,
+            self.decision_level,
+            self.stable_mode,
+        );
         self.stats.record_decision_level(self.decision_level);
         if self.stable_mode {
             self.stats.stable_decisions += 1;
         } else {
             self.stats.focused_decisions += 1;
         }
-        self.trace_decide(lit);
-        self.enqueue(lit, None);
+        policy.trace(self, lit);
+        policy.triage(self, lit);
+        self.enqueue_decision_state(lit);
+        policy.assignment_log(self, lit);
+        self.check_completed_assignment(lit);
+        policy.decision_log(self, lit);
+        policy.finish(self, lit)
+    }
+
+    pub(super) fn log_decision(&self, lit: Literal) {
+        let _ = lit;
         solver_log!(
             self,
             "decide {} level {}",
@@ -1129,6 +1187,19 @@ impl Solver {
     /// letting BCP handle the rest via propagation.
     #[inline]
     pub(super) fn pick_next_decision_variable(&mut self) -> Option<Variable> {
+        match self
+            .pick_next_decision_variable_admitted(&mut decision_admission::Ordinary::default())
+        {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn pick_next_decision_variable_admitted<P: decision_admission::Policy>(
+        &mut self,
+        policy: &mut P,
+    ) -> Result<Option<Variable>, P::Error> {
+        policy.prepare(self)?;
         // Domain-restricted path (#8430): when active, only decide on domain vars.
         // This takes priority over random decisions and the normal heuristic.
         // GipSAT rIC3 design: domain restriction applies at decision level > 0.
@@ -1145,13 +1216,13 @@ impl Solver {
             } else {
                 (self.active_domain.take().unwrap(), false)
             };
-            let result = self.pick_domain_restricted_decision(&domain);
+            let result = self.pick_domain_restricted_decision(&domain, None, policy.skipped());
             if from_decision {
                 self.decision_domain = Some(domain);
             } else {
                 self.active_domain = Some(domain);
             }
-            return result;
+            return Ok(result);
         }
 
         // Relevancy brancher (Increment 1): hybrid Scheme-A CNF-frontier
@@ -1163,18 +1234,18 @@ impl Solver {
         // A `None` result is the SAT signal (empty frontier), re-verified by the
         // authoritative model gate exactly like the IC3 domain path above.
         if self.relevancy_should_engage() {
-            return self.pick_relevancy_frontier_decision();
+            return Ok(self.pick_relevancy_frontier_decision_with(policy));
         }
 
         #[cfg(debug_assertions)]
         if self.cold.ic3_mode {
-            return self.pick_next_decision_variable_non_main();
+            return Ok(self.pick_next_decision_variable_non_main());
         }
 
         #[cfg(debug_assertions)]
         self.debug_assert_main_decision_route_ready();
 
-        self.pick_next_decision_variable_main()
+        Ok(self.pick_next_decision_variable_main())
     }
 
     #[cfg(debug_assertions)]
@@ -1256,7 +1327,12 @@ impl Solver {
     /// from the heap, reinserting non-domain variables. For VMTF, scan domain
     /// variables directly (IC3 domains are typically 5-50 vars, so a linear
     /// scan is faster than walking the full VMTF linked list).
-    pub(super) fn pick_domain_restricted_decision(&mut self, domain: &[bool]) -> Option<Variable> {
+    pub(super) fn pick_domain_restricted_decision(
+        &mut self,
+        domain: &[bool],
+        members: Option<&[u32]>,
+        skipped: &mut Vec<Variable>,
+    ) -> Option<Variable> {
         // Bucket-queue fast path (#8476): O(1) amortized variable selection
         // for small domain-restricted IC3 queries.
         if self.bucket_queue_active {
@@ -1267,7 +1343,6 @@ impl Solver {
             BranchHeuristic::Evsids | BranchHeuristic::Chb => {
                 // Pop from the VSIDS heap, skipping non-domain variables.
                 // Skipped variables are collected and reinserted after.
-                let mut skipped: Vec<Variable> = Vec::new();
                 let result = loop {
                     match self.vsids.pick_branching_variable(&self.vals) {
                         None => break None,
@@ -1292,7 +1367,7 @@ impl Solver {
                         }
                     }
                 };
-                for v in skipped {
+                for v in skipped.drain(..) {
                     self.vsids.insert_into_heap(v);
                 }
                 result
@@ -1300,20 +1375,63 @@ impl Solver {
             BranchHeuristic::Vmtf => {
                 // VMTF uses a linked list, not a heap. Rather than walking the
                 // entire list filtering by domain, scan domain vars directly.
-                // IC3 domains are small (5-50 vars) so this is O(domain_size).
+                // The relevancy frontier supplies its dense member list
+                // (exactly the domain-true variables), making the scan
+                // O(frontier size); the IC3 caller passes `None` and keeps the
+                // legacy O(num_vars) bitmap scan (its domains are small sets
+                // but it owns no maintained member list).
                 let mut best: Option<Variable> = None;
                 let mut best_order = 0u64;
-                for (idx, &in_domain) in domain.iter().enumerate() {
-                    if !in_domain {
-                        continue;
+                if let Some(members) = members {
+                    // Fast path: walk the VMTF queue from its front — the
+                    // first in-domain unassigned variable on it is the pick
+                    // (queue order is bump recency, including rephase
+                    // shuffles and burials, exactly as the unrestricted VMTF
+                    // pick follows it). Only while the queue is live: under
+                    // stable-mode deferred bumps the list is stale and the
+                    // members scan below (over current bump_order) serves.
+                    // A walk that finds nothing falls through to the scan,
+                    // which confirms emptiness or rescues an inconsistency.
+                    if !self.vsids.vmtf_is_deferred() {
+                        if let Some(var) = self.vsids.pick_vmtf_in_domain(
+                            &self.vals,
+                            self.var_lifecycle.as_slice(),
+                            domain,
+                        ) {
+                            return Some(var);
+                        }
                     }
-                    if self.var_is_assigned(idx) || self.var_lifecycle.is_removed(idx) {
-                        continue;
+                    // Members are in maintenance order, not index order; the
+                    // tie-break below (lowest index wins equal bump order)
+                    // reproduces the bitmap scan's choice exactly.
+                    for &m in members {
+                        let idx = m as usize;
+                        debug_assert!(idx < domain.len() && domain[idx]);
+                        if self.var_is_assigned(idx) || self.var_lifecycle.is_removed(idx) {
+                            continue;
+                        }
+                        let order = self.vsids.bump_order(Variable(m));
+                        if best.is_none()
+                            || order > best_order
+                            || (order == best_order && idx < best.unwrap().index())
+                        {
+                            best = Some(Variable(m));
+                            best_order = order;
+                        }
                     }
-                    let order = self.vsids.bump_order(Variable(idx as u32));
-                    if best.is_none() || order > best_order {
-                        best = Some(Variable(idx as u32));
-                        best_order = order;
+                } else {
+                    for (idx, &in_domain) in domain.iter().enumerate() {
+                        if !in_domain {
+                            continue;
+                        }
+                        if self.var_is_assigned(idx) || self.var_lifecycle.is_removed(idx) {
+                            continue;
+                        }
+                        let order = self.vsids.bump_order(Variable(idx as u32));
+                        if best.is_none() || order > best_order {
+                            best = Some(Variable(idx as u32));
+                            best_order = order;
+                        }
                     }
                 }
                 best
@@ -1344,75 +1462,6 @@ impl Solver {
             !self.probing_mode,
             "BUG: Main decision route entered with probing_mode"
         );
-    }
-
-    /// Start a new random decision burst. Sets burst length and schedules
-    /// the next burst using CaDiCaL's phase * ln(phase) interval growth.
-    pub(crate) fn start_random_sequence(&mut self) {
-        let count = self.cold.random_decision_phases + 1;
-        self.cold.random_decision_phases = count;
-
-        // Burst length: RANDEC_LENGTH * ln(count + 10)
-        let length = (RANDEC_LENGTH * ((count + 10) as f64).ln()) as u64;
-        self.cold.randomized_deciding = length.max(1);
-
-        // Schedule next burst: conflicts + phases * ln(phases) * RANDEC_INT
-        let phases = self.cold.random_decision_phases as f64;
-        let delta = phases * phases.ln();
-        self.cold.next_random_decision = self
-            .num_conflicts
-            .saturating_add((delta * RANDEC_INT) as u64);
-    }
-
-    /// Check if a random decision should be made. Returns a random unassigned
-    /// variable if we are in a random burst, or starts one if the conflict
-    /// threshold is reached. CaDiCaL only enables this in focused mode.
-    fn next_random_decision(&mut self) -> Option<Variable> {
-        // Only inject random decisions in focused mode (CaDiCaL: randecfocused=1, randecstable=0)
-        if self.stable_mode {
-            return None;
-        }
-
-        // Not yet time for random decisions
-        if self.num_conflicts < self.cold.next_random_decision {
-            return None;
-        }
-
-        // Start a new random burst if not already in one
-        if self.cold.randomized_deciding == 0 {
-            // CaDiCaL decide.cpp:80: delay random burst start if too deep.
-            // `level > assumptions.size()` — with no assumptions, only level 0.
-            if self.decision_level > 0 {
-                return None;
-            }
-            self.start_random_sequence();
-        }
-
-        // Pick a random unassigned, non-eliminated variable using LCG seeded from decisions
-        let num_vars = self.num_vars;
-        if num_vars == 0 {
-            return None;
-        }
-        let mut rng = Random::new(self.num_decisions);
-        for _ in 0..num_vars {
-            let idx = rng.pick(num_vars);
-            if !self.var_is_assigned(idx) && !self.var_lifecycle.is_removed(idx) {
-                self.stats.random_decisions += 1;
-                return Some(Variable(idx as u32));
-            }
-        }
-        // All sampled vars are assigned or eliminated; fall through to normal decision
-        None
-    }
-
-    /// Decrement the random decision burst counter on conflict.
-    /// Called from conflict analysis paths to end the burst after enough conflicts.
-    #[inline]
-    pub(super) fn on_conflict_random_decision(&mut self) {
-        self.poll_process_memory_limit();
-        if self.cold.randomized_deciding > 0 {
-            self.cold.randomized_deciding -= 1;
-        }
     }
 
     /// Initialize 2-watched literals for all clauses, or incrementally attach
@@ -1649,7 +1698,7 @@ impl Solver {
 
     /// Legacy propagation entry point kept for compatibility with tests and
     /// verification harnesses.
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     #[inline]
     pub(super) fn propagate(&mut self) -> Option<ClauseRef> {
         // Invalidate reason marks before BCP (#8569): see probe_propagate.

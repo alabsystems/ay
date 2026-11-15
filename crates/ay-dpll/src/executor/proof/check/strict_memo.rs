@@ -104,33 +104,34 @@
 //! (#strict-memo-term-metadata-contract)
 //!
 //! The key above is complete only if we KNOW everything the checker reads
-//! from the `TermStore`. That enumeration is pinned — audited rather than
-//! inferred — by `the_checker_read_term_store_surface_is_audited` in
-//! `check/strict_memo_tests.rs`, a grep-style inventory of every
-//! term-module accessor name called from `ay-proof`'s strict-walk source
-//! (`checker/**`, `quality/**` and the entry files), compared EXACTLY
-//! against the allowlist in that test. Today the checker-read state is:
+//! from the `TermStore`, so that enumeration is audited rather than inferred
+//! over `ay-proof`'s strict-walk source (`checker/**`, `quality/**` and the
+//! entry files). Today the checker-read state is:
 //!
 //!  * the immutable term entries and sorts (`get`, `sort`, `children`,
 //!    `len`, `entry_stamp`, …) — covered by the SNAPSHOT-STAMP conjunct;
 //!  * the four metadata families above — covered by the
 //!    CHECKER-VISIBLE-METADATA-GENERATION conjunct;
-//!  * `strict_bv_semantics_ok` (via `strict_bv_semantics_validated` /
-//!    `record_strict_bv_semantics_validated`) — deliberately NOT keyed: it
-//!    is the checker's own accept-only memo of COMPLETED `bv_bitblast`
-//!    decisions, keyed by `(store, clause)`; no failure is ever recorded,
-//!    so growth is monotone toward accepting recorded semantic FACTS, and
-//!    its only clearing writers (`rollback_to`, `mark_and_compact`, clone)
-//!    all retire the snapshot stamp. A stored verdict can therefore differ
-//!    from a fresh walk only as an uncached checker run differs from a
-//!    cached one — the fresh walk may ACCEPT a fact whose re-derivation the
-//!    stored walk's budget rejected, never the reverse — and replaying the
-//!    older, at-most-more-conservative verdict is the fail-closed side.
+//!  * `strict_bv_semantics` (via `strict_bv_semantics_validated` /
+//!    `record_strict_bv_semantics_validated` and `strict_bv_semantics_refusal`
+//!    / `record_strict_bv_semantics_refusal`) — deliberately NOT keyed: it is
+//!    the checker's own memo of COMPLETED `bv_bitblast` decisions, keyed by
+//!    `(store, clause)` — acceptances, and refusals by the COUNTED producer
+//!    envelope, keyed also by that envelope's identity. No stop (caller
+//!    cancellation, caller deadline, hang guard) is ever recorded, so a
+//!    recorded refusal repeats exactly the rejection a fresh walk under the
+//!    same caps reaches (the producer's counted trajectory is deterministic
+//!    up to the small wobble `producer_limits.rs` notes), and the acceptance
+//!    table is consulted first, so a refusal never overrides an accepted
+//!    fact. Its clearing writers (`rollback_to`, `mark_and_compact`) retire
+//!    the snapshot stamp, and a clone — which keeps only the refusals — mints
+//!    a new stamp. A stored verdict can therefore differ from a fresh walk
+//!    only as one checker run differs from another over the same caps, and
+//!    every stored ACCEPT rests on a refutation that was actually replayed.
 //!
-//! Any NEW `TermStore` read appearing in that source fails the audit test
-//! loudly until the key (or the counter's family set) is re-audited, and a
-//! row VANISHING from the surface fails it too, so the allowlist cannot rot
-//! into fiction. The write side is the counter's own contract
+//! A NEW checker-side `TermStore` read must be re-audited against the key
+//! (or the counter's family set) before it lands. The write side is the
+//! counter's own contract
 //! (#checker-visible-metadata-generation): every mutation of the four
 //! families either bumps the generation or retires the stamp.
 //!
@@ -241,7 +242,7 @@ fn entry_is_current(
 
 /// Structural payload of `proof`: steps plus every stored id/literal. Linear,
 /// and only computed when a walk finished and might be stored.
-fn document_payload(proof: &Proof) -> usize {
+pub(in crate::executor) fn document_payload(proof: &Proof) -> usize {
     let mut payload = proof.steps.len();
     for step in &proof.steps {
         payload = payload.saturating_add(match step {
@@ -290,11 +291,11 @@ impl Executor {
         }
         // A STOPPING caller never gets a cached answer: a real walk's first
         // charge poll cancels it, and `Cancelled` has calibrated downstream
-        // meaning (revert, nothing learned, nothing latched — see the
-        // commit gate's tier 4). Miss and walk, so the stop is observed
-        // exactly as it always was.
+        // meaning (revert, nothing learned — see the commit gate's tier 4).
+        // Return the observed refusal directly, not a miss followed by a new
+        // walk: a one-shot original callback must not be asked to resume.
         if super::strict_check_progress::executor_stop_signals_asserted(self) {
-            return None;
+            return Some((Err(ProofCheckError::Cancelled), 0));
         }
         let memo = self.strict_walk_memo.borrow();
         for entry in memo.entries.iter() {

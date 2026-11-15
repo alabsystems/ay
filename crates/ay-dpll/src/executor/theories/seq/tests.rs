@@ -14,6 +14,62 @@ fn make_executor() -> Executor {
     Executor::new()
 }
 
+#[test]
+fn determined_length_expansion_reconstructs_public_sequence_values() {
+    use crate::executor::model::{EvalValue, Model};
+    use ay_core::kani_compat::DetHashMap as HashMap;
+    use num_rational::BigRational;
+
+    for length in [0, 1, 3] {
+        let mut exec = make_executor();
+        let sort = Sort::Seq(Box::new(Sort::Int));
+        let sequence = exec
+            .ctx
+            .terms
+            .mk_var("reconstructed-sequence", sort.clone());
+        exec.ctx
+            .register_symbol("reconstructed-sequence".to_string(), sequence, sort);
+        let len = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("seq.len"), vec![sequence], Sort::Int);
+        let count = exec.ctx.terms.mk_int(BigInt::from(length));
+        let equality = exec.ctx.terms.mk_eq(len, count);
+        exec.ctx.assertions.push(equality);
+        exec.expand_determined_length_seq_vars();
+
+        let replacement = exec.recorded_var_substitutions[&sequence];
+        let mut pending = vec![replacement];
+        let mut rows = HashMap::default();
+        while let Some(term) = pending.pop() {
+            match exec.ctx.terms.get(term) {
+                TermData::Var(_, _) if exec.ctx.terms.sort(term) == &Sort::Int => {
+                    rows.insert(term, BigInt::from(7));
+                }
+                TermData::App(_, children) => pending.extend_from_slice(children),
+                _ => {}
+            }
+        }
+        let mut model = Model::empty();
+        model.lia_model = Some(ay_lia::LiaModel { values: rows });
+        model.seq_model = Some(ay_seq::SeqModel::default());
+        exec.last_model = Some(model);
+        exec.last_result = Some(SolveResult::Sat);
+        exec.complete_model_for_validation(&[]);
+        let model = exec.last_model.as_ref().expect("completion retains model");
+        assert_eq!(
+            exec.evaluate_term(model, sequence),
+            EvalValue::Seq(vec![
+                EvalValue::Rational(BigRational::from_integer(
+                    BigInt::from(7)
+                ));
+                length as usize
+            ]),
+            "the original public sequence must inherit its fresh-element values"
+        );
+    }
+}
+
 /// Helper: create `seq.contains(s, t)` and return `(contains_term, s, t)`.
 fn mk_contains(exec: &mut Executor, s: TermId, t: TermId) -> TermId {
     exec.ctx

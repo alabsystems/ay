@@ -9,6 +9,8 @@ use ay_frontend::SourceContextStamp;
 
 use crate::api::{Solver, SolverCacheToken, Term};
 
+mod resources;
+
 /// Opaque same-solver binding for one exact, plain SMT-LIB parse delta.
 ///
 /// Minted only by [`Solver::parse_smtlib2_with_exact_query_binding`]. Its

@@ -3,7 +3,7 @@
 #
 # Builds the solver at the current HEAD, re-measures the corpus against the
 # committed baseline, and leaves a dated report. Non-zero exit means a shipped
-# default has drifted -- see the development design notes for what it drifted
+# default has drifted -- see reports/corpus-baseline.json for what it drifted
 # FROM, and the development design notes for the whole series.
 #
 # The point of running this on a clock rather than on a commit hook: the
@@ -25,7 +25,7 @@
 # about once per 1.36M nodes -- so until the Rust `milp_rim_gate` existed,
 # nothing under crates/ay-milp/src/exact/ was watched at all. It is nightly-only
 # for a cost reason and states it plainly: it measures through the #[cfg(test)]
-# probe, so it needs a `cargo test --no-run` build of the ay-milp lib (minutes
+# probe, so it needs a `targo --unverified test --no-run` build of the ay-milp lib (minutes
 # cold) on top of the example build the other two share. `--tier fast` (17s, 10
 # instances) is affordable pre-push if that build is already warm; --tier all
 # (105s, adds qiu) belongs here.
@@ -44,6 +44,10 @@ LOG="$OUT/$STAMP.log"
 {
   print "=== ay-milp nightly corpus guard: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   cd "$REPO" || exit 2
+  # Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+  # (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+  # public clone without it.
+  . "$REPO/scripts/lib/cargo_frontend.sh"
   print "HEAD: $(git rev-parse --short HEAD)  ($(git log -1 --format=%s | cut -c1-72))"
 
   if [[ ! -d "$CORPUS" ]]; then
@@ -53,7 +57,7 @@ LOG="$OUT/$STAMP.log"
   fi
 
   print "\n--- build ---"
-  if ! cargo build --release -p ay-milp \
+  if ! ay_cargo build --release -p ay-milp \
       --example mps_solve --example milp_rim_gate 2>&1 | tail -3; then
     print "BUILD FAILED -- guard did not run."
     exit 2
@@ -82,11 +86,11 @@ LOG="$OUT/$STAMP.log"
   # same reason the example is: a gate that cannot build is UNKNOWN (2), never
   # clean, and the compile's own load average must not be the thing that makes
   # the quiet-box precondition refuse.
-  # NOT `if ! cargo ... | tail -3`: a pipeline's status is its LAST command's, so
+  # NOT `if ! ay_cargo ... | tail -3`: a pipeline's status is its LAST command's, so
   # that form is always tail's 0 and the failure branch below could never run --
   # a build-failure branch that cannot fire is the dead gate this file argues
   # against. zsh's $pipestatus keeps the compiler's own status.
-  cargo test -p ay-milp --release --lib --no-run 2>&1 | tail -3
+  ay_cargo test -p ay-milp --release --lib --no-run 2>&1 | tail -3
   if [[ ${pipestatus[1]} -ne 0 ]]; then
     print "RIM PROBE BUILD FAILED -- the rim ratchet did not run."
     rrc=2

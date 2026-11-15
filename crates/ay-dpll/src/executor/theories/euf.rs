@@ -10,9 +10,13 @@ mod array_congruence;
 mod array_fixpoint;
 mod array_patterns;
 mod array_row;
+mod array_scope;
+mod array_store_eq_indices;
 mod dt;
+mod dt_finite;
 mod enum_sat;
 mod pigeonhole_core;
+mod query_uf_apps;
 #[cfg(test)]
 mod tests;
 
@@ -164,7 +168,7 @@ impl Executor {
     }
 
     /// Check whether a term is in scope for array axiom generation (#6726).
-    /// Returns `true` when no scope filter is active (non-incremental mode),
+    /// Returns `true` when no scope filter is active (an unscoped caller),
     /// when the term was created during the current fixpoint (idx >= start_len),
     /// or when the term is reachable from current assertions.
     #[inline]
@@ -173,7 +177,7 @@ impl Executor {
         // of scope no matter what the reachability filter says — see
         // `array_axiom_dead_skolems`. This is checked first because it is the
         // one exclusion that also applies when no scope filter is active at
-        // all, which is the ordinary state of a non-incremental solve.
+        // all; some array-theory callers deliberately remain unscoped.
         if self.term_indexes_dead_skolem(term_id) {
             return false;
         }
@@ -309,6 +313,7 @@ impl Executor {
             return;
         }
         self.trace_array_axiom_assertion_site(axiom, site);
+        self.include_array_axiom_scope_root(axiom);
         self.ctx.assertions.push(axiom);
         self.record_array_axiom_proof(axiom);
     }
@@ -329,6 +334,7 @@ impl Executor {
         if axiom == self.ctx.terms.true_term() {
             return false;
         }
+        self.include_array_axiom_scope_root(axiom);
         let inserted = if self.ctx.assertions.contains(&axiom) {
             false
         } else {
@@ -355,6 +361,7 @@ impl Executor {
         if axiom == self.ctx.terms.true_term() {
             return false;
         }
+        self.include_array_axiom_scope_root(axiom);
         let inserted = active_assertions.insert(axiom);
         if inserted {
             self.trace_array_axiom_assertion_site(axiom, site);
@@ -407,7 +414,19 @@ impl Executor {
                         &datatype_member_signatures,
                     )
                 });
-            if let Some(kind) = array_kind {
+            if ay_proof::recognize_datatype_constructor_reconstruct(
+                &self.ctx.terms,
+                &clause,
+                &[],
+                &[],
+            ) {
+                let _ = self.proof_tracker.add_theory_lemma_with_kind(
+                    vec![axiom],
+                    TheoryLemmaKind::DatatypeConstructorReconstruct,
+                );
+                self.injected_axiom_theory_kinds
+                    .insert(axiom, TheoryLemmaKind::DatatypeConstructorReconstruct);
+            } else if let Some(kind) = array_kind {
                 let _ = self
                     .proof_tracker
                     .add_theory_lemma_with_kind(vec![axiom], kind);
@@ -439,36 +458,62 @@ impl Executor {
     /// interpretation of the uninterpreted symbols, recorded as a theory
     /// lemma through `push_array_axiom_assertion_site`; verdicts remain
     /// licensed by the solve pipeline + the independent model gate.
-    /// BOUND: pairs within each same-symbol group; `cap` fences quadratic
-    /// blowup (the stage only runs on otherwise-unknown ground problems).
+    /// BOUND: current-query traversal, examined pairs and emitted clauses are
+    /// capped. Used by the small ground primary stage and the larger demand
+    /// retry; all generated clauses remain theory tautologies.
     /// Returns the number of clauses emitted.
     pub(in crate::executor) fn add_uf_ackermann_congruence_clauses(&mut self, cap: usize) -> usize {
-        use ay_core::kani_compat::DetHashMap;
         let should_stop = self.make_should_stop();
-        let mut groups: DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>> =
-            DetHashMap::default();
-        for idx in 0..self.ctx.terms.len() {
-            let term_id = TermId(idx as u32);
-            if let TermData::App(sym, args) = self.ctx.terms.get(term_id) {
-                if args.is_empty() || crate::features::is_builtin_symbol_name(sym.name()) {
-                    continue;
-                }
-                groups
-                    .entry((sym.name().to_string(), args.len()))
-                    .or_default()
-                    .push((term_id, args.clone()));
-            }
+        if cap == 0 {
+            return 0;
         }
+        let Some(groups) = query_uf_apps::collect(
+            &self.ctx.terms,
+            &self.ctx.assertions,
+            cap.saturating_mul(32),
+            &should_stop,
+        ) else {
+            return 0;
+        };
         let mut keys: Vec<(String, usize)> = groups.keys().cloned().collect();
         keys.sort_unstable();
+        // Decline when the pair space exceeds the examined budget
+        // (DR-AY-UFLIA-PRIMARY-CONG-ALL-OR-NOTHING): emitting the first
+        // `cap` clauses of a pair space too large to even enumerate
+        // within `4 * cap` examined pairs covers under a quarter of the
+        // space in sorted-key order — an arbitrary heuristic change with
+        // no completeness benefit, measured catastrophic on c6id_s
+        // (~2,840 pairs: the injected 512 clauses take the solve from
+        // 6,305 decisions to 62,843+ and `unknown`). Within the examined
+        // budget the partial subset is retained: measured load-bearing
+        // on vhard3 / c6bi_s / g6i (603-1,341 pairs), which regress
+        // without it. The demand retry re-offers with its larger cap,
+        // whose examined budget scales with it.
+        {
+            let mut counted = 0_usize;
+            for key in &keys {
+                let apps = &groups[key];
+                for i in 0..apps.len() {
+                    for _j in (i + 1)..apps.len() {
+                        if counted >= cap.saturating_mul(4) || should_stop() {
+                            return 0;
+                        }
+                        counted += 1;
+                    }
+                }
+            }
+        }
         let mut emitted = 0_usize;
+        let mut examined = 0_usize;
+        let mut present: HashSet<_> = self.ctx.assertions.iter().copied().collect();
         for key in keys {
             let apps = &groups[&key];
             for i in 0..apps.len() {
                 for j in (i + 1)..apps.len() {
-                    if emitted >= cap || should_stop() {
+                    if emitted >= cap || examined >= cap.saturating_mul(4) || should_stop() {
                         return emitted;
                     }
+                    examined += 1;
                     let (lhs_app, ref lhs_args) = apps[i];
                     let (rhs_app, ref rhs_args) = apps[j];
                     if self.ctx.terms.sort(lhs_app) != self.ctx.terms.sort(rhs_app)
@@ -495,8 +540,10 @@ impl Executor {
                     } else {
                         self.ctx.terms.mk_or(disj)
                     };
-                    self.push_array_axiom_assertion_site(clause, "uf_ackermann");
-                    emitted += 1;
+                    if present.insert(clause) {
+                        self.push_array_axiom_assertion_site(clause, "uf_ackermann");
+                        emitted += 1;
+                    }
                 }
             }
         }

@@ -30,6 +30,11 @@ use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
 
+mod guarded_row_printer_terms;
+pub(crate) use guarded_row_printer_terms::{
+    array_guarded_row_printer_terms, GuardedRowCase, GuardedRowPrinterTerms, GuardedRowRead,
+};
+
 fn invalid(step: ProofId, rule: &str, reason: &str) -> ProofCheckError {
     ProofCheckError::InvalidTheoryLemma {
         step,

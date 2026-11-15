@@ -167,38 +167,13 @@ impl TransitionSystem {
     ///
     /// The shift is clamped at time 0 to avoid creating negative time indices.
     pub(crate) fn shift_versioned_state_vars(&self, expr: &ChcExpr, delta: i32) -> ChcExpr {
-        fn split_base_and_time(name: &str) -> (&str, i32) {
-            if let Some((base, suffix)) = name.rsplit_once('_') {
-                let bytes = suffix.as_bytes();
-                let is_canonical_pos_int = !bytes.is_empty()
-                    && bytes[0].is_ascii_digit()
-                    && (bytes[0] != b'0' || bytes.len() == 1)
-                    && bytes.iter().all(u8::is_ascii_digit);
-
-                if is_canonical_pos_int {
-                    if let Ok(t) = suffix.parse::<i32>() {
-                        // Treat only strictly-positive suffixes as time indices.
-                        //
-                        // This matches `version_var` which uses `x` (not `x_0`) for time 0.
-                        if t > 0 {
-                            return (base, t);
-                        }
-                    }
-                }
-            }
-            (name, 0)
-        }
-
         let state_bases: FxHashSet<&str> = self.vars.iter().map(|v| v.name.as_str()).collect();
 
         let subst: Vec<(ChcVar, ChcExpr)> = expr
             .vars()
             .into_iter()
             .filter_map(|v| {
-                let (base, t) = split_base_and_time(&v.name);
-                if !state_bases.contains(base) {
-                    return None;
-                }
+                let (base, t) = state_var_time(&v.name, &state_bases)?;
 
                 let new_t = (t + delta).max(0);
                 let new_name = if new_t == 0 {
@@ -367,6 +342,17 @@ impl TransitionSystem {
     /// - `vars` → `vars_k`
     /// - `vars_next` → `vars_{k+1}`
     pub(crate) fn transition_at(&self, k: usize) -> ChcExpr {
+        self.version_transition_expr(&self.transition, k)
+    }
+
+    /// Version a transition-shaped expression (over `v{i}` / `v{i}_next` and
+    /// locals) for the step `k -> k+1`, exactly as [`Self::transition_at`]
+    /// versions the whole transition relation: state variables to step `k`,
+    /// `_next` variables to step `k+1`, every other variable to its `__t{k}`
+    /// local. Renaming is per variable name, so versioning one disjunct of
+    /// `self.transition` here yields the same names that disjunct has inside
+    /// `transition_at(k)`.
+    pub(crate) fn version_transition_expr(&self, expr: &ChcExpr, k: usize) -> ChcExpr {
         let mut substitutions: Vec<_> = self
             .vars
             .iter()
@@ -391,7 +377,7 @@ impl TransitionSystem {
         // Version local (non-canonical) variables per timestep to avoid collisions
         // across unrollings (#6789). Without this, Tr(0) ∧ Tr(1) shares local vars,
         // adding spurious constraints that make reachable states unreachable.
-        let all_vars = self.transition.vars();
+        let all_vars = expr.vars();
         for v in all_vars {
             if !canonical_names.contains(&v.name) {
                 let versioned = ChcVar::new(format!("{}__t{}", v.name, k), v.sort.clone());
@@ -399,19 +385,33 @@ impl TransitionSystem {
             }
         }
 
-        self.transition.substitute(&substitutions)
+        expr.substitute(&substitutions)
     }
 
     /// Create init constraint at step k.
     pub(crate) fn init_at(&self, k: usize) -> ChcExpr {
-        let versioned = Self::version_expr(&self.init, &self.vars, k);
+        self.version_init_expr(&self.init, k)
+    }
+
+    /// Version an init-shaped expression for step `k` exactly as
+    /// [`Self::init_at`] versions `self.init` (state variables to step `k`,
+    /// locals to `__i{k}`); per-name renaming, so one disjunct of `self.init`
+    /// gets the names it has inside `init_at(k)`.
+    pub(crate) fn version_init_expr(&self, expr: &ChcExpr, k: usize) -> ChcExpr {
+        let versioned = Self::version_expr(expr, &self.vars, k);
         // Version local variables per timestep (#6789)
         Self::version_local_vars(&versioned, &self.vars, None, k, "i")
     }
 
     /// Create query constraint at step k.
     pub(crate) fn query_at(&self, k: usize) -> ChcExpr {
-        let versioned = Self::version_expr(&self.query, &self.vars, k);
+        self.version_query_expr(&self.query, k)
+    }
+
+    /// Version a query-shaped expression for step `k` exactly as
+    /// [`Self::query_at`] versions `self.query` (locals to `__q{k}`).
+    pub(crate) fn version_query_expr(&self, expr: &ChcExpr, k: usize) -> ChcExpr {
+        let versioned = Self::version_expr(expr, &self.vars, k);
         // Version local variables per timestep (#6789)
         Self::version_local_vars(&versioned, &self.vars, None, k, "q")
     }
@@ -541,4 +541,34 @@ impl TransitionSystem {
         }
         None
     }
+}
+
+/// The state variable `name` denotes and the time step it is at, under the
+/// `version_var` scheme (`x` at time 0, `x_t` at time `t > 0`).
+///
+/// The whole name is matched first: a state variable may itself end in
+/// `_<digits>` (SingleLoop's `.loc_1` and `.arg_0_6`, mod elimination's
+/// `_mod_q_1`). Splitting first read `.loc_1` as `.loc` at time 1, found no
+/// state variable `.loc`, and left `.loc_1` unshifted, so TPA's composition
+/// `T(v, v₁) ∧ T(v₁, v₂)` linked only `.loc_0` between its two copies: every
+/// other location and argument of the second copy was freshened into an
+/// unconstrained local (`.loc_1_f1`), and its target was checked at time 0.
+/// Only a canonical positive suffix (`1`, `12`; never `0`, `01` or `+1`) is a
+/// time index, matching `version_var`.
+pub(crate) fn state_var_time<'n>(
+    name: &'n str,
+    state_bases: &FxHashSet<&str>,
+) -> Option<(&'n str, i32)> {
+    if state_bases.contains(name) {
+        return Some((name, 0));
+    }
+    let (base, suffix) = name.rsplit_once('_')?;
+    let bytes = suffix.as_bytes();
+    let canonical_positive =
+        !bytes.is_empty() && bytes[0] != b'0' && bytes.iter().all(u8::is_ascii_digit);
+    if !canonical_positive || !state_bases.contains(base) {
+        return None;
+    }
+    let time = suffix.parse::<i32>().ok()?;
+    Some((base, time))
 }

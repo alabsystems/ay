@@ -6,6 +6,8 @@
 
 use super::*;
 
+mod rewritten_conjuncts;
+
 pub(super) enum AndPath {
     Found(Vec<u32>),
     Missing,
@@ -38,6 +40,9 @@ impl PropagationChainPlanner<'_> {
         if cx.problem_set.contains(&term) {
             return Some(cx.chain.add_assume(term, None));
         }
+        if let Some(id) = self.plan_array_unit_base(cx, term) {
+            return Some(id);
+        }
         // A definitional bound `EqDiffVar` minted is a base case, not something
         // to derive (#4751): it is exactly the `fresh_def_bound` step the strict
         // checker re-validates. Reaching it HERE is what lets a LATER pass's
@@ -61,6 +66,15 @@ impl PropagationChainPlanner<'_> {
         if let Some(id) = self.plan_instance_root_base(cx, term) {
             return Some(id);
         }
+        let mark = cx.mark();
+        if let Some(id) = self.plan_recorded_clause(cx, term) {
+            return Some(id);
+        }
+        cx.rollback(mark);
+        self.plan_rewritten_conjunct(cx, term)
+    }
+
+    fn plan_recorded_clause(&mut self, cx: &mut PlanCx<'_>, term: TermId) -> Option<ProofId> {
         let (before, stamp) = *cx.record_by_after.get(&term)?;
         if let Some(before_id) = self.plan_derive_clause(cx, before) {
             if let Some(id) = self.plan_record_bridge(cx, before, before_id, term, stamp) {
@@ -434,11 +448,32 @@ impl PropagationChainPlanner<'_> {
         after: TermId,
         stamp: u32,
     ) -> Option<ProofId> {
-        if let Some(EqRes::Changed { to, eq_term, id }) = self.plan_derive_eq(cx, before, stamp) {
-            if to == after {
-                return Some(self.plan_equiv_bridge(cx, before, before_id, after, eq_term, id));
+        // Preserve every exact legacy spelling first. Only a failed/mismatched
+        // record may retry canonical BV equalities in the array-unit L1 lane.
+        // Nested record calls restore their caller's mode; all memo outcomes
+        // include that mode. Failed suffixes roll back without refunding work.
+        let saved_mode = cx.scalar_equality_mode;
+        for mode in [
+            ScalarEqualityMode::Legacy,
+            ScalarEqualityMode::ArrayCanonical,
+        ] {
+            if mode == ScalarEqualityMode::ArrayCanonical && cx.array_units.is_empty() {
+                break;
+            }
+            cx.scalar_equality_mode = mode;
+            let mark = cx.mark();
+            if let Some(EqRes::Changed { to, eq_term, id }) = self.plan_derive_eq(cx, before, stamp)
+            {
+                if to == after {
+                    cx.scalar_equality_mode = saved_mode;
+                    return Some(self.plan_equiv_bridge(cx, before, before_id, after, eq_term, id));
+                }
+            }
+            if !cx.array_units.is_empty() {
+                cx.rollback(mark);
             }
         }
+        cx.scalar_equality_mode = saved_mode;
         if let Some(id) = self.plan_or_elimination_bridge(cx, before, before_id, after, stamp) {
             return Some(id);
         }

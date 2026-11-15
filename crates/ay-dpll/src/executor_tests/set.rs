@@ -1325,3 +1325,45 @@ fn card_over_bitvector_element_sort_exhibits_a_witness() {
     assert_eq!(printed_set_size(&out), 2, "{out}");
     assert_eq!(get_value_int(&out), 2, "{out}");
 }
+
+// Rows from the 2026-08-02 crash-salvage set oracle (#gate-set-blind-spot).
+// Its oracle is superseded — main builds valid cardinality witnesses — but
+// these three shapes were pinned nowhere else.
+
+/// `(Set (_ BitVec 2))` has 4 possible members, so cardinality 5 is UNSAT. The
+/// salvage recorded it answering `sat`; it answers `unknown` now (no finite-set
+/// witness could be materialized).
+#[test]
+fn card_above_the_element_universe_is_never_sat() {
+    let smt = r#"
+(declare-const s (Set (_ BitVec 2)))
+(assert (= 5 (set.card s)))
+(check-sat)
+"#;
+    assert_ne!(verdict(&solve(smt)), Some("sat"));
+}
+
+/// A variable aliased to two concrete inserts is structurally counted.
+#[test]
+fn card_of_var_aliased_to_two_concrete_inserts_is_sat() {
+    let smt = r#"
+(declare-const s (Set Int))
+(assert (= s (set.insert 2 (set.singleton 1))))
+(assert (= 2 (set.card s)))
+(check-sat)
+"#;
+    assert_eq!(verdict(&solve(smt)), Some("sat"));
+}
+
+/// An `(Array Int Bool)` problem with no set operator stays an array problem.
+#[test]
+fn plain_bool_array_is_not_a_set_problem() {
+    let smt = r#"
+(set-logic QF_AX)
+(declare-const a (Array Int Bool))
+(declare-const i Int)
+(assert (select a i))
+(check-sat)
+"#;
+    assert_eq!(verdict(&solve(smt)), Some("sat"));
+}

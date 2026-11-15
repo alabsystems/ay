@@ -106,8 +106,9 @@ pub(crate) enum HybridIntegerLiftCertificateCodecError {
     Malformed(#[source] serde_json::Error),
 }
 
+/// A reason integer-lift replay failed to establish source-model infeasibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum HybridIntegerLiftCertificateVerificationError {
+pub enum HybridIntegerLiftCertificateVerificationError {
     #[error("hybrid integer-lift certificate verification was interrupted")]
     Interrupted,
     #[error("original model is not an admissible exact bounded-integer lift")]
@@ -150,6 +151,36 @@ pub(crate) fn try_solve_certified(
 pub(crate) fn try_solve_certified_interruptible<F>(
     original: &Model,
     deadline: Option<Instant>,
+    should_stop: F,
+) -> Option<CertifiedHybridIntegerLiftDecision>
+where
+    F: FnMut() -> bool,
+{
+    try_solve_certified_goal(
+        original,
+        deadline,
+        crate::hybrid_pb_lp::HybridGoal::Solve,
+        should_stop,
+    )
+}
+
+/// The lifted infeasibility probe also stops on a checked feasible witness.
+pub(crate) fn try_refute_certified(
+    original: &Model,
+    deadline: Option<Instant>,
+) -> Option<CertifiedHybridIntegerLiftDecision> {
+    try_solve_certified_goal(
+        original,
+        deadline,
+        crate::hybrid_pb_lp::HybridGoal::Refute,
+        || false,
+    )
+}
+
+fn try_solve_certified_goal<F>(
+    original: &Model,
+    deadline: Option<Instant>,
+    goal: crate::hybrid_pb_lp::HybridGoal,
     mut should_stop: F,
 ) -> Option<CertifiedHybridIntegerLiftDecision>
 where
@@ -162,6 +193,7 @@ where
     let decision = crate::hybrid_pb_lp::try_solve_certified_interruptible(
         &lift.transformed,
         deadline,
+        goal,
         &mut should_stop,
     )?;
     if stopped(deadline, &mut should_stop) {
@@ -242,7 +274,13 @@ fn drop_integer_lift_certificate(
     }
 }
 
-pub(crate) fn verify_hybrid_integer_lift_infeasibility_certificate(
+/// Rebuild the exact radix lift from the caller's original model and replay
+/// the nested hybrid proof. The artifact supplies no trusted transformed model.
+///
+/// # Errors
+/// Returns an error for an unsupported model, malformed artifact, or rejected
+/// nested proof. No failed or interrupted replay proves infeasibility.
+pub fn verify_hybrid_integer_lift_infeasibility_certificate(
     original: &Model,
     certificate: &HybridIntegerLiftInfeasibilityCertificate,
 ) -> Result<(), HybridIntegerLiftCertificateVerificationError> {
@@ -254,7 +292,32 @@ pub(crate) fn verify_hybrid_integer_lift_infeasibility_certificate(
     )
 }
 
-pub(crate) fn verify_hybrid_integer_lift_infeasibility_certificate_interruptible<F>(
+/// Replay an integer-lift proof under the caller's existing absolute deadline.
+/// Polling is cooperative; this grants no fresh time allowance.
+///
+/// # Errors
+/// Returns [`HybridIntegerLiftCertificateVerificationError::Interrupted`] on
+/// expiry, or the same errors as the deadline-free verifier.
+pub fn verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+    original: &Model,
+    certificate: &HybridIntegerLiftInfeasibilityCertificate,
+    deadline: Option<Instant>,
+) -> Result<(), HybridIntegerLiftCertificateVerificationError> {
+    verify_hybrid_integer_lift_infeasibility_certificate_interruptible(
+        original,
+        certificate,
+        deadline,
+        &mut || false,
+    )
+}
+
+/// Replay an integer-lift proof with an existing deadline and cancellation poll.
+/// Both reconstruction and nested proof checking share that budget.
+///
+/// # Errors
+/// Returns [`HybridIntegerLiftCertificateVerificationError::Interrupted`] when
+/// either stop condition fires, or the same errors as the deadline-free verifier.
+pub fn verify_hybrid_integer_lift_infeasibility_certificate_interruptible<F>(
     original: &Model,
     certificate: &HybridIntegerLiftInfeasibilityCertificate,
     deadline: Option<Instant>,

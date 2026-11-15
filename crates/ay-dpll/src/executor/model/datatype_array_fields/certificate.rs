@@ -188,6 +188,7 @@ impl Executor {
                 work,
                 parse_budget,
                 semantic_budget,
+                guard,
             ) {
                 return None;
             }
@@ -210,6 +211,7 @@ impl Executor {
         work: &mut usize,
         parse_budget: &mut TypedArrayParseBudget,
         semantic_budget: &mut SemanticNormalizationBudget,
+        guard: &RenderedDatatypeGuard,
     ) -> bool {
         let (Sort::Array(array_sort), ModelValue::Array(value)) = (sort, installed) else {
             return false;
@@ -233,7 +235,7 @@ impl Executor {
             return false;
         }
         let sources = sources.exact;
-        if !typed_array_value(value, array_sort) {
+        if !typed_array_value(value, array_sort, guard) {
             return false;
         }
         let Some(normalized) = normalize_array_value(value, semantic_budget) else {
@@ -286,6 +288,7 @@ impl Executor {
                 work,
                 parse_budget,
                 semantic_budget,
+                guard,
             ) {
                 return false;
             }
@@ -307,7 +310,7 @@ impl Executor {
         if model
             .array_model
             .as_ref()
-            .is_some_and(|arrays| arrays.read_conflicted.contains(&app))
+            .is_some_and(|arrays| arrays.is_withheld(&app))
         {
             return false;
         }
@@ -330,7 +333,13 @@ impl Executor {
             }
             let (Some(key), Some(actual)) = (
                 eval_to_mv(&self.evaluate_term(model, args[1]), &sort.index_sort),
-                eval_to_mv(&self.evaluate_term(model, read), &sort.element_sort),
+                self.exact_constructor_source_value(
+                    model,
+                    read,
+                    &sort.element_sort,
+                    work,
+                    parse_budget,
+                ),
             ) else {
                 return false;
             };
@@ -353,6 +362,7 @@ impl Executor {
         work: &mut usize,
         parse_budget: &mut TypedArrayParseBudget,
         semantic_budget: &mut SemanticNormalizationBudget,
+        guard: &RenderedDatatypeGuard,
     ) -> bool {
         let Some(interp) = model
             .array_model
@@ -364,15 +374,14 @@ impl Executor {
         if !charge_work(work, interp.stores.len().saturating_add(1)) {
             return false;
         }
-        let default = interp
-            .default
-            .as_deref()
-            .and_then(|value| self.typed_scalar_text(value, &sort.element_sort, parse_budget));
+        let default = interp.default.as_deref().and_then(|value| {
+            self.typed_field_value_text(value, &sort.element_sort, guard, parse_budget)
+        });
         let mut stores = Vec::with_capacity(interp.stores.len());
         for (key, value) in &interp.stores {
             let (Some(key), Some(value)) = (
-                self.typed_scalar_text(key, &sort.index_sort, parse_budget),
-                self.typed_scalar_text(value, &sort.element_sort, parse_budget),
+                self.typed_field_value_text(key, &sort.index_sort, guard, parse_budget),
+                self.typed_field_value_text(value, &sort.element_sort, guard, parse_budget),
             ) else {
                 return false;
             };

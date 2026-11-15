@@ -4,8 +4,9 @@
 
 //! Backbone and equivalence probing for kitten-based sweep.
 
-use super::Sweeper;
+use super::{SweepProofFact, Sweeper};
 use crate::clause_arena::ClauseArena;
+use crate::kitten::CoreLemmas;
 #[cfg(debug_assertions)]
 use crate::kitten::Kitten;
 use crate::literal::Literal;
@@ -74,7 +75,21 @@ impl Sweeper {
         // Cap at 32 probes to bound cost.
         let max_backbone_probes = surviving_candidates.len().min(32);
         for &true_lit in surviving_candidates.iter().take(max_backbone_probes) {
-            if self.kitten.fixed_value(true_lit) > 0 {
+            // A spent budget or a stop ends the environment, the equivalence
+            // phase included (CaDiCaL sweep.cpp:1618-1619).
+            if self.limit_hit() {
+                return;
+            }
+            // A candidate fixed at kitten's root is a unit without a solve.
+            // Not under a proof surface: kitten is reused across the probes of
+            // an environment, so a root-fixed literal may rest on learned
+            // clauses of earlier probes, whose lifted lemmas the proof has
+            // already deleted, and the bare unit is then not RUP for the
+            // checker. VeriPB rejected exactly such a unit (oski15a01b15s_opt,
+            // arm C, 2026-09-16: `red 1 x99978 >= 1`, "proofgoal could not be
+            // autoproven"). Under a proof the assumption solve below returns
+            // at once for a fixed literal and its core names the lemmas.
+            if !self.want_proof && self.kitten.fixed_value(true_lit) > 0 {
                 new_units.push(Literal(true_lit));
                 self.stats.kitten_backbone += 1;
                 continue;
@@ -87,6 +102,13 @@ impl Sweeper {
                 // contradiction in the full formula.
                 new_units.push(Literal(true_lit));
                 self.stats.kitten_backbone += 1;
+                if self.want_proof {
+                    let lemmas = self.kitten.core_lemmas_external();
+                    self.proof_facts.push(SweepProofFact::Unit {
+                        lit: true_lit,
+                        lemmas,
+                    });
+                }
             }
         }
 
@@ -128,11 +150,24 @@ impl Sweeper {
             let mut idx = 1;
 
             while idx < active_class.len() && equivalences.len() < 1000 {
+                // Before every probe, as before every backbone candidate
+                // (sweep.cpp:1656-1657).
+                if self.limit_hit() {
+                    return;
+                }
                 let other = active_class[idx];
                 match self.probe_equivalence_against_rep(rep, other) {
-                    EquivalenceProbe::Equivalent => {
+                    EquivalenceProbe::Equivalent { forward, backward } => {
                         equivalences.push((rep, other));
                         self.stats.kitten_equivalences += 1;
+                        if self.want_proof {
+                            self.proof_facts.push(SweepProofFact::Equivalence {
+                                rep,
+                                lit: other,
+                                forward,
+                                backward,
+                            });
+                        }
                         active_class.remove(idx);
 
                         // Defense-in-depth: verify against full formula in
@@ -204,6 +239,13 @@ impl Sweeper {
         if forward != 20 {
             return EquivalenceProbe::Unknown;
         }
+        // Core lemmas for `lit ∧ ¬rep` UNSAT, taken BEFORE the next solve
+        // resets kitten's failing clause.
+        let forward_lemmas = if self.want_proof {
+            self.kitten.core_lemmas_external()
+        } else {
+            CoreLemmas::default()
+        };
 
         self.kitten.assume(lit ^ 1);
         self.kitten.assume(rep);
@@ -214,19 +256,31 @@ impl Sweeper {
         if backward != 20 {
             return EquivalenceProbe::Unknown;
         }
+        let backward_lemmas = if self.want_proof {
+            self.kitten.core_lemmas_external()
+        } else {
+            CoreLemmas::default()
+        };
 
-        EquivalenceProbe::Equivalent
+        EquivalenceProbe::Equivalent {
+            forward: forward_lemmas,
+            backward: backward_lemmas,
+        }
     }
 
-    /// Debug-only: verify a single equivalence claim against the full clause set.
+    /// Debug-only: check a single equivalence claim against the full clause
+    /// set, for kitten false-UNSAT bugs on the bounded neighborhood (#7049).
     ///
     /// Builds a fresh kitten with ALL non-garbage clauses plus current level-0
-    /// assignments. Returns true if `lit_a ≡ lit_b` holds on the full formula.
-    /// Called only under `debug_assertions` — zero cost in release.
+    /// assignments and solves each direction's negation. Returns false only
+    /// for a counterexample (SAT): the claimed equivalence is false.
     ///
-    /// Use this to diagnose kitten CDCL false-UNSAT bugs (#7049). If the COI
-    /// probing claims an equivalence but this function rejects it, kitten
-    /// produced an incorrect UNSAT result on the bounded neighborhood.
+    /// Bounded like the rest of sweep, because a debug-assertions build can
+    /// ship: a Trust toolchain built with them carries this check inside its
+    /// compiler. Skipped above `DEBUG_ORACLE_MAX_CLAUSES` live clauses; each
+    /// solve stops at `DEBUG_ORACLE_TICKS` ticks or at sweep's terminator, and
+    /// a stopped solve proves nothing, so the claim passes. With no limit it
+    /// held such a compiler for hours on a 334K-clause FP division formula.
     #[cfg(debug_assertions)]
     pub(super) fn debug_verify_equivalence_claim(
         &self,
@@ -235,10 +289,15 @@ impl Sweeper {
         clauses: &ClauseArena,
         vals: &[i8],
     ) -> bool {
+        if clauses.active_clause_count() > DEBUG_ORACLE_MAX_CLAUSES {
+            return true;
+        }
         let build_verifier = || {
             let mut verifier = Kitten::new();
+            verifier.set_terminator(self.kitten.terminator().clone());
+            verifier.set_ticks_limit(DEBUG_ORACLE_TICKS);
             for idx in clauses.indices() {
-                if clauses.is_garbage(idx) || clauses.is_empty_clause(idx) {
+                if clauses.is_dead(idx) {
                     continue;
                 }
                 let ext_lits: Vec<u32> = clauses.literals(idx).iter().map(|lit| lit.0).collect();
@@ -261,10 +320,8 @@ impl Sweeper {
         v1.assume(lit_a ^ 1);
         v1.assume(lit_b);
         let d1 = v1.solve();
-        if d1 != 20 {
-            eprintln!(
-                "[sweep-verify] FAILED direction 1: ¬{lit_a} ∧ {lit_b} gave {d1} (expected 20/UNSAT)"
-            );
+        if d1 == 10 {
+            eprintln!("[sweep-verify] FAILED direction 1: ¬{lit_a} ∧ {lit_b} is satisfiable");
             return false;
         }
 
@@ -273,19 +330,31 @@ impl Sweeper {
         v2.assume(lit_a);
         v2.assume(lit_b ^ 1);
         let d2 = v2.solve();
-        if d2 != 20 {
-            eprintln!(
-                "[sweep-verify] FAILED direction 2: {lit_a} ∧ ¬{lit_b} gave {d2} (expected 20/UNSAT)"
-            );
+        if d2 == 10 {
+            eprintln!("[sweep-verify] FAILED direction 2: {lit_a} ∧ ¬{lit_b} is satisfiable");
             return false;
         }
         true
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Live clauses above which the debug-only equivalence oracle is skipped: it
+/// copies the whole formula twice per claimed equivalence, up to 1000 per
+/// sweep call. An environment's clause limit.
+#[cfg(debug_assertions)]
+const DEBUG_ORACLE_MAX_CLAUSES: usize = super::COI_CLAUSE_LIMIT;
+/// Tick limit of each debug-only oracle solve.
+#[cfg(debug_assertions)]
+const DEBUG_ORACLE_TICKS: u64 = 50_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EquivalenceProbe {
-    Equivalent,
+    /// Both implications proved; the kitten core lemmas certifying each
+    /// direction (empty unless certificate material was requested).
+    Equivalent {
+        forward: CoreLemmas,
+        backward: CoreLemmas,
+    },
     NotEquivalent,
     Unknown,
 }

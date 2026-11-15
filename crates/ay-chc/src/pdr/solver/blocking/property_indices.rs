@@ -162,6 +162,11 @@ fn collect_select_indices_recursive(
     result: &mut FxHashMap<usize, Vec<ChcExpr>>,
 ) {
     match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            for value in lambda.captures() {
+                collect_select_indices_recursive(value, arg_to_pos, result);
+            }
+        }
         ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
             // Check if the array argument is a variable we're tracking
             if let ChcExpr::Var(arr_var) = args[0].as_ref() {

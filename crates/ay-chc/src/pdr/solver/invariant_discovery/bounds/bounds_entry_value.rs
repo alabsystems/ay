@@ -56,7 +56,17 @@ impl PdrSolver {
                 }
             }
             for k in literals {
-                if k.abs() <= ENTRY_VALUE_BOUND_MAX_CONST && !consts.contains(&k) {
+                // `checked_abs`, not `abs`: `i128::MIN` is a literal a CHC
+                // problem really carries (it is the lower bound of a 128-bit
+                // signed overflow obligation) and `i128::abs` PANICS on it —
+                // `attempt to negate with overflow` (#chc-i128-min-magnitude).
+                // A magnitude that is not representable is by construction
+                // larger than the cap, so `None` and "over the cap" are the
+                // same answer here; the candidate is dropped either way.
+                if k.checked_abs()
+                    .is_some_and(|magnitude| magnitude <= ENTRY_VALUE_BOUND_MAX_CONST)
+                    && !consts.contains(&k)
+                {
                     consts.push(k);
                 }
             }
@@ -142,20 +152,21 @@ impl PdrSolver {
     }
 
     /// Collect all integer literals appearing in an expression.
-    fn collect_int_literals(expr: &ChcExpr, out: &mut Vec<i128>) {
-        match expr {
-            ChcExpr::Int(k) => out.push(*k),
-            ChcExpr::Op(_, args) => {
-                for arg in args {
-                    Self::collect_int_literals(arg, out);
-                }
+    ///
+    /// The caller deduplicates and sorts, so each distinct (shared) sub-term
+    /// is visited once: the tree walk this replaces was exponential in the
+    /// nesting of shared sub-terms (startup discovery on a shared `let`
+    /// chain). A `ConstArray` value is not searched, as before.
+    pub(super) fn collect_int_literals(expr: &ChcExpr, out: &mut Vec<i128>) {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
+            ChcExpr::Int(k) => {
+                out.push(*k);
+                crate::expr::dag::Step::Skip
             }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                for arg in args {
-                    Self::collect_int_literals(arg, out);
-                }
+            ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::FuncApp(..) => {
+                crate::expr::dag::Step::Descend
             }
-            _ => {}
-        }
+            _ => crate::expr::dag::Step::Skip,
+        });
     }
 }

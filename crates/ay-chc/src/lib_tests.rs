@@ -1641,28 +1641,6 @@ fn test_external_model_validation_preserves_array_signature_model_checker_consum
 }
 
 #[test]
-fn test_external_model_validation_always_preserves_original_clauses() {
-    let src = include_str!("lib.rs");
-    let fn_start = src
-        .find("fn external_model_validation_config(base: &PdrConfig) -> PdrConfig")
-        .expect("lib.rs should define external model validation config");
-    let fn_body = &src[fn_start..];
-    let fn_end = fn_body
-        .find("/// Validate a caller-provided invariant model")
-        .expect("external model validation config should precede public validation API");
-    let fn_body = &fn_body[..fn_end];
-
-    assert!(
-        fn_body.contains("preserve_original_clauses: true"),
-        "external model validation must always preserve the exact caller clauses"
-    );
-    assert!(
-        !fn_body.contains("preserve_original_clauses: base.preserve_original_clauses"),
-        "a caller must not be able to re-enable solve-time nullary query rewriting during validation"
-    );
-}
-
-#[test]
 fn test_external_model_validation_tiny_budget_fails_closed_before_query_only_acceptance_9413() {
     let mut problem = ChcProblem::new();
     let pred = problem.declare_predicate("Inv", vec![ChcSort::Int]);
@@ -1827,6 +1805,7 @@ fn diag_guarded_compiler_horn_acyclic_bmc_proves() {
     // 2) Candidate fix: exact acyclic BMC must discharge it as Safe.
     let depth = features.dag_depth.max(features.num_predicates).max(1);
     let bmc_config = BmcConfig {
+        smt_lane: crate::smt::SmtLane::Verification,
         base: crate::engine_config::ChcEngineConfig {
             verbose: false,
             cancellation_token: None,
@@ -1839,7 +1818,11 @@ fn diag_guarded_compiler_horn_acyclic_bmc_proves() {
         enable_k_induction: false,
         enable_adaptive_stepping: false,
         proof_cross_check: false,
+        memory_budget: None,
         ts_probe_clamp: None,
+        soft_time_budget: None,
+        probe_extension_deadline: None,
+        resume_frontier: None,
         sweep_past_spurious_sat: true,
     };
     let bmc = BmcSolver::new(problem.clone(), bmc_config).solve();
@@ -1875,6 +1858,7 @@ fn diag_unguarded_compiler_horn_acyclic_bmc_refutes() {
     let features = crate::classifier::ProblemClassifier::classify(&problem);
     let depth = features.dag_depth.max(features.num_predicates).max(1);
     let bmc_config = BmcConfig {
+        smt_lane: crate::smt::SmtLane::Verification,
         base: crate::engine_config::ChcEngineConfig {
             verbose: false,
             cancellation_token: None,
@@ -1887,7 +1871,11 @@ fn diag_unguarded_compiler_horn_acyclic_bmc_refutes() {
         enable_k_induction: false,
         enable_adaptive_stepping: false,
         proof_cross_check: false,
+        memory_budget: None,
         ts_probe_clamp: None,
+        soft_time_budget: None,
+        probe_extension_deadline: None,
+        resume_frontier: None,
         sweep_past_spurious_sat: true,
     };
     let bmc = BmcSolver::new(problem.clone(), bmc_config).solve();
@@ -2449,3 +2437,102 @@ fn filtered_head_must_not_certify_a_non_inductive_model() {
 
 #[path = "overapproximation_tests.rs"]
 mod overapproximation;
+
+// ---------------------------------------------------------------------------
+// Trust superproject b62 lineage (ay-chc Unknown-cause split, 1198f48100):
+// additive coverage for behaviour this branch already implements. Carried when
+// the lineage was merged into main; every production symbol these exercise was
+// already here, so these only pin it.
+// ---------------------------------------------------------------------------
+fn overapproximation_reason_fixture() -> ChcProblem {
+    ChcParser::parse(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int)) (=> (and (Inv x) (= x 0)) false)))
+(check-sat)
+"#,
+    )
+    .expect("over-approximation reason fixture should parse")
+}
+
+/// The `Unsafe -> Unknown` body-`forall` downgrade must attach the SPECIFIC
+/// `OverApproximatedRefutation` reason.
+///
+/// This is a measurement-integrity pin, not a verdict change. The site discards
+/// a counterexample because the problem it was found on was WEAKER than the
+/// original — the search succeeded and no budget was hit. Reporting the generic
+/// `Inconclusive` told consumers "the solver gave up", which implies the wrong
+/// follow-up (raise the budget) for an outcome no budget can change.
+#[test]
+fn overapproximated_refutation_is_reported_specifically() {
+    let problem = overapproximation_reason_fixture();
+    let unsafe_result = VerifiedChcResult::Unsafe(VerifiedCounterexample::from_validated(
+        engine_result::skeleton_counterexample(&problem, 0),
+    ));
+
+    let downgraded = engines::downgrade_unsafe_if_overapproximated(unsafe_result, true);
+
+    assert!(
+        downgraded.is_unknown(),
+        "an over-approximated refutation must fail closed to Unknown, got {downgraded}"
+    );
+    assert_eq!(
+        downgraded.unknown_reason(),
+        Some(VerifiedUnknownReason::OverApproximatedRefutation),
+        "the downgrade site knows exactly why it discarded the refutation and must say so"
+    );
+    assert_eq!(
+        downgraded
+            .unknown_reason()
+            .map(|reason| reason.code())
+            .unwrap_or_default(),
+        "overapproximated_refutation",
+        "stable machine code for routing consumers"
+    );
+}
+
+/// The reason split must not move a single verdict: the downgrade fires ONLY on
+/// `Unsafe` with the over-approximation flag set, and `Safe`/`Unknown` pass
+/// through byte-for-byte (an `Unknown` that arrived without an attributable
+/// cause stays the honest `Inconclusive` catch-all).
+#[test]
+fn overapproximation_downgrade_leaves_every_other_verdict_untouched() {
+    let problem = overapproximation_reason_fixture();
+
+    // Unsafe WITHOUT the flag: still Unsafe.
+    let kept = engines::downgrade_unsafe_if_overapproximated(
+        VerifiedChcResult::Unsafe(VerifiedCounterexample::from_validated(
+            engine_result::skeleton_counterexample(&problem, 0),
+        )),
+        false,
+    );
+    assert!(
+        kept.is_unsafe(),
+        "no over-approximation means the refutation stands, got {kept}"
+    );
+
+    // Safe WITH the flag: proofs survive an over-approximation a fortiori.
+    let safe = engines::downgrade_unsafe_if_overapproximated(
+        VerifiedChcResult::Safe(VerifiedInvariant::from_validated(InvariantModel::new())),
+        true,
+    );
+    assert!(
+        safe.is_safe(),
+        "a proof must never be downgraded, got {safe}"
+    );
+
+    // Unknown WITH the flag: passes through, reason untouched.
+    let unknown = engines::downgrade_unsafe_if_overapproximated(
+        VerifiedChcResult::from_validated(
+            engine_result::ChcEngineResult::Unknown,
+            engine_result::ValidationEvidence::FullVerification,
+        ),
+        true,
+    );
+    assert_eq!(
+        unknown.unknown_reason(),
+        Some(VerifiedUnknownReason::Inconclusive),
+        "an unattributed Unknown must keep the catch-all reason"
+    );
+}

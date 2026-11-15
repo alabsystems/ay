@@ -771,7 +771,7 @@ pub(super) fn validate_and_replay(
     let declarations = reference_inventory::load_bound_registry_source(
         input,
         context.manifest_dir,
-        &canonical_profile(),
+        &canonical_profile()?,
     )?;
     let prepared = prepare_campaign(&declarations)?;
     validate_recorded_shape(receipt, &prepared)?;
@@ -1016,7 +1016,7 @@ fn parse_semantic_fields(
             catalog.name, declaration.name
         ));
     }
-    let parsed = ay_frontend::sexp::parse_sexp(&declaration.content)
+    let parsed = parse_logic_declaration(&declaration.content)
         .map_err(|error| format!("parsing authenticated {}: {error}", declaration.path))?;
     let items = parsed
         .as_list()
@@ -1120,6 +1120,72 @@ fn parse_semantic_fields(
         note,
         notes,
     })
+}
+
+/// Registry files are authenticated reference documents, not solver inputs.
+/// The pinned AUFLIRA history quotes old syntax with unescaped quote marks.
+/// Preserve that metadata as opaque prose while keeping every semantic field
+/// under the ordinary strict S-expression parser. Never rewrite source bytes
+/// or apply this compatibility handling to executable SMT-LIB.
+fn parse_logic_declaration(source: &str) -> Result<SExpr, String> {
+    let original_error = match ay_frontend::sexp::parse_sexp(source) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error.to_string(),
+    };
+    const KEY: &str = ":update-history";
+    let mut markers = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(tail) = trimmed.strip_prefix(KEY) {
+            if tail.is_empty() || tail.starts_with(char::is_whitespace) {
+                markers.push(offset + line.len() - trimmed.len());
+            }
+        }
+        offset += line.len();
+    }
+    let [marker] = markers.as_slice() else {
+        return Err(original_error);
+    };
+    // The source before the marker must itself form complete top-level
+    // attribute pairs. This prevents matching a lookalike inside prior prose.
+    let prefix = ay_frontend::sexp::parse_sexp(&format!("{})", &source[..*marker]))
+        .map_err(|_| original_error.clone())?;
+    let items = prefix.as_list().ok_or_else(|| original_error.clone())?;
+    if items.len() < 2 || !items[0].is_symbol("logic") || (items.len() - 2) % 2 != 0 {
+        return Err(original_error);
+    }
+    let value_start = *marker + KEY.len();
+    let tail = &source[value_start..];
+    let trimmed = tail.trim_start();
+    let open = value_start + tail.len() - trimmed.len();
+    if !trimmed.starts_with('"') {
+        return Err(original_error);
+    }
+    let mut next_line = open + 1;
+    for line in source[open + 1..].split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let boundary = next_line + line.len() - trimmed.len();
+        next_line += line.len();
+        if !(trimmed.starts_with(':') || trimmed.starts_with(')')) {
+            continue;
+        }
+        let value = source[open + 1..boundary].trim_end();
+        let Some(body) = value.strip_suffix('"') else {
+            return Err(original_error);
+        };
+        let close = open + 1 + body.len();
+        let encoded = format!(
+            "{}\"{}\"{}",
+            &source[..open],
+            body.replace('"', "\"\""),
+            &source[close + 1..]
+        );
+        // Use the immediately following field, never a later boundary that
+        // could accidentally absorb semantic attributes into the history.
+        return ay_frontend::sexp::parse_sexp(&encoded).map_err(|_| original_error);
+    }
+    Err(original_error)
 }
 
 fn set_one_string(
@@ -1973,6 +2039,83 @@ fn validate_recorded_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("../../data/registry/auflira_source.rs");
+
+    fn pinned_auflira() -> RegistryLogicDeclaration {
+        // Exact registry source at 47f7ee09ea05de990277781bbb2091245ea4a3f1.
+        let content = PINNED_AUFLIRA_SOURCE.to_string();
+        RegistryLogicDeclaration {
+            name: "AUFLIRA".to_string(),
+            path: "Logics/AUFLIRA.smt2".to_string(),
+            git_blob: "fa3776432996ffd52373fa6c076d92ca4aa1b0aa".to_string(),
+            content_sha256: sha256_bytes(content.as_bytes()),
+            content,
+        }
+    }
+
+    #[test]
+    fn pinned_history_literal_quotes_preserve_every_semantic_field() {
+        let declaration = pinned_auflira();
+        assert_eq!(
+            declaration.content_sha256,
+            "1bbd21e9a9646ec234c9b786fdcecdef26193185538de855f42b3847c40754c9"
+        );
+        assert!(ay_frontend::sexp::parse_sexp(&declaration.content).is_err());
+        let catalog = CATALOG
+            .iter()
+            .find(|entry| entry.name == "AUFLIRA")
+            .unwrap();
+        let fields = parse_semantic_fields(&declaration, catalog).unwrap();
+        assert_eq!(fields.theories, ["Reals_Ints", "ArraysEx"]);
+        assert!(fields.language.contains("all array terms have sort"));
+        assert_eq!(fields.extensions.len(), 2);
+        assert!(fields.extensions[0].contains("(op (to_real t1) t)"));
+        assert!(fields.extensions[1].contains("terms of the form c, (* c x), or (* x c)"));
+        let parsed = parse_logic_declaration(&declaration.content).unwrap();
+        let history = parsed.as_list().unwrap()[2..]
+            .chunks_exact(2)
+            .find(|pair| matches!(&pair[0], SExpr::Keyword(key) if key == ":update-history"))
+            .unwrap();
+        let SExpr::String(history) = &history[1] else {
+            panic!("history must remain prose")
+        };
+        assert!(
+            history.contains("Replaced \"(* c x), or (* x c)\" with \"c, (* c x), or (* x c)\"")
+        );
+    }
+
+    #[test]
+    fn history_recovery_does_not_swallow_or_repair_semantic_fields() {
+        let catalog = CATALOG
+            .iter()
+            .find(|entry| entry.name == "AUFLIRA")
+            .unwrap();
+        let original = pinned_auflira();
+        for content in [
+            original
+                .content
+                .replace(":theories (Reals_Ints ArraysEx)", ":theories (Ints)"),
+            original.content.replace(
+                "\"Closed formulas built",
+                "\"bad \"unescaped\" Closed formulas built",
+            ),
+            original
+                .content
+                .replace(":language", ":unowned-semantic-field"),
+        ] {
+            let declaration = RegistryLogicDeclaration {
+                content,
+                ..original.clone()
+            };
+            assert!(parse_semantic_fields(&declaration, catalog).is_err());
+        }
+        let mut duplicate = original.content.clone();
+        duplicate.insert_str(
+            duplicate.find(":theories").unwrap(),
+            ":update-history \"duplicate\"\n",
+        );
+        assert!(parse_logic_declaration(&duplicate).is_err());
+    }
 
     #[test]
     fn policy_catalog_is_exact_and_source_field_count_is_closed() {

@@ -88,7 +88,7 @@ impl GateExtractor {
         let mut largecount: Vec<u32> = vec![0; num_lits];
         let mut candidates: Vec<usize> = Vec::new();
         'harvest: for idx in clauses.indices() {
-            if clauses.is_empty_clause(idx) || clauses.is_learned(idx) {
+            if clauses.is_dead(idx) || clauses.is_learned(idx) {
                 continue;
             }
             let lits = clauses.literals(idx);
@@ -305,7 +305,40 @@ impl GateExtractor {
         None
     }
 
+    /// Live ternaries of `occs` that contain `pivot_lit`.
+    fn ternary_count(clauses: &ClauseArena, occs: &[usize], pivot_lit: Literal) -> usize {
+        occs.iter()
+            .filter(|&&ci| {
+                ci < clauses.len()
+                    && !clauses.is_empty_clause(ci)
+                    && Self::get_ternary_others(clauses.literals(ci), pivot_lit).is_some()
+            })
+            .count()
+    }
+
     pub(super) fn find_xor_gate_db(
+        &self,
+        pivot: Variable,
+        clauses: &ClauseArena,
+        pos_occs: &[usize],
+        neg_occs: &[usize],
+    ) -> Option<Gate> {
+        // An arity-2 gate takes two ternaries on each side of the pivot; with
+        // fewer, its search finds nothing, so it is skipped.
+        if Self::ternary_count(clauses, pos_occs, Literal::positive(pivot)) >= 2
+            && Self::ternary_count(clauses, neg_occs, Literal::negative(pivot)) >= 2
+        {
+            if let Some(gate) = self.find_xor_gate_arity2(pivot, clauses, pos_occs, neg_occs) {
+                return Some(gate);
+            }
+        }
+        // Arity-2 fast path didn't find a gate. Try higher arities (3..=XOR_ARITY_LIMIT)
+        // using CaDiCaL's generalized even-parity sign enumeration.
+        self.find_xor_gate_higher_arity(pivot, clauses, pos_occs, neg_occs)
+    }
+
+    /// The arity-2 XOR gate search of `find_xor_gate_db`.
+    fn find_xor_gate_arity2(
         &self,
         pivot: Variable,
         clauses: &ClauseArena,
@@ -397,10 +430,7 @@ impl GateExtractor {
                 }
             }
         }
-
-        // Arity-2 fast path didn't find a gate. Try higher arities (3..=XOR_ARITY_LIMIT)
-        // using CaDiCaL's generalized even-parity sign enumeration.
-        self.find_xor_gate_higher_arity(pivot, clauses, pos_occs, neg_occs)
+        None
     }
 
     /// Higher-arity XOR gate detection (arity 3..=XOR_ARITY_LIMIT).
@@ -416,6 +446,31 @@ impl GateExtractor {
     ) -> Option<Gate> {
         let pivot_pos = Literal::positive(pivot);
 
+        // An arity-a gate has 2^(a-1) clauses of size a + 1 on each side of
+        // the pivot. A seed whose size either side lacks that many of is
+        // passed over: the pattern search would fail on it, after scanning an
+        // occurrence list per pattern (on the pair rows this search was most of
+        // BVE's time, and it finds no gate there).
+        let size_counts = |occs: &[usize]| {
+            let mut counts = [0usize; XOR_ARITY_LIMIT + 2];
+            for &ci in occs {
+                if ci < clauses.len() && !clauses.is_empty_clause(ci) {
+                    let size = clauses.literals(ci).len();
+                    if size < counts.len() {
+                        counts[size] += 1;
+                    }
+                }
+            }
+            counts
+        };
+        let pos_sizes = size_counts(pos_occs);
+        let neg_sizes = size_counts(neg_occs);
+        // Each occurrence's (size, literal signature), read once per call and
+        // only when some seed passes the size test; the pattern lookups then
+        // read a clause only on a signature match.
+        let mut pos_sigs: Vec<OccSignature> = Vec::new();
+        let mut neg_sigs: Vec<OccSignature> = Vec::new();
+
         for &clause_idx in pos_occs {
             if clause_idx >= clauses.len() || clauses.is_empty_clause(clause_idx) {
                 continue;
@@ -429,6 +484,14 @@ impl GateExtractor {
             let arity = size - 1;
             if arity > XOR_ARITY_LIMIT {
                 continue;
+            }
+            let per_side = 1usize << (arity - 1);
+            if pos_sizes[size] < per_side || neg_sizes[size] < per_side {
+                continue;
+            }
+            if pos_sigs.is_empty() {
+                pos_sigs = occ_signatures(clauses, pos_occs);
+                neg_sigs = occ_signatures(clauses, neg_occs);
             }
 
             // Build working literal buffer: lits[0] = pivot_pos, rest from clause.
@@ -468,13 +531,13 @@ impl GateExtractor {
                 }
 
                 // Search the appropriate occurrence list based on pivot polarity.
-                let search_occs = if lits[0] == pivot_pos {
-                    pos_occs
+                let search_sigs = if lits[0] == pivot_pos {
+                    &pos_sigs
                 } else {
-                    neg_occs
+                    &neg_sigs
                 };
 
-                if let Some(idx) = self.find_clause_by_lits(&lits, clauses, search_occs) {
+                if let Some(idx) = find_clause_by_signature(&lits, clauses, search_sigs) {
                     gate_clauses.push(idx);
                 } else {
                     found_all = false;
@@ -530,31 +593,44 @@ impl GateExtractor {
 
         None
     }
+}
 
-    /// Find a clause in `occs` that matches the given literal set exactly.
-    /// CaDiCaL reference: `gates.cpp:617-629`.
-    fn find_clause_by_lits(
-        &self,
-        lits: &[Literal],
-        clauses: &ClauseArena,
-        occs: &[usize],
-    ) -> Option<usize> {
-        let target_size = lits.len();
-        'next_clause: for &ci in occs {
-            if ci >= clauses.len() || clauses.is_empty_clause(ci) {
-                continue;
-            }
+/// An occurrence's clause index, size and literal signature
+/// (`literal_signature`), in occurrence order.
+type OccSignature = (usize, usize, (u64, u32));
+
+/// The literal sum and xor of a clause: two clauses with the same literal set
+/// agree in both, so a differing candidate is passed over unread.
+fn literal_signature(lits: &[Literal]) -> (u64, u32) {
+    lits.iter().fold((0u64, 0u32), |(sum, xor), lit| {
+        (sum.wrapping_add(u64::from(lit.0)), xor ^ lit.0)
+    })
+}
+
+/// `OccSignature`s of the live clauses of `occs`.
+fn occ_signatures(clauses: &ClauseArena, occs: &[usize]) -> Vec<OccSignature> {
+    occs.iter()
+        .filter(|&&ci| ci < clauses.len() && !clauses.is_empty_clause(ci))
+        .map(|&ci| {
             let c = clauses.literals(ci);
-            if c.len() != target_size {
-                continue;
-            }
-            for &want in lits {
-                if !c.contains(&want) {
-                    continue 'next_clause;
-                }
-            }
-            return Some(ci);
-        }
-        None
-    }
+            (ci, c.len(), literal_signature(c))
+        })
+        .collect()
+}
+
+/// The first clause of `sigs` whose literal set is exactly `lits`
+/// (CaDiCaL `gates.cpp:617-629`, there over the occurrence list itself).
+fn find_clause_by_signature(
+    lits: &[Literal],
+    clauses: &ClauseArena,
+    sigs: &[OccSignature],
+) -> Option<usize> {
+    let target = literal_signature(lits);
+    sigs.iter()
+        .filter(|&&(_, size, sig)| size == lits.len() && sig == target)
+        .map(|&(ci, _, _)| ci)
+        .find(|&ci| {
+            let c = clauses.literals(ci);
+            lits.iter().all(|want| c.contains(want))
+        })
 }

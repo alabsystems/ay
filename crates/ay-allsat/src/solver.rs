@@ -262,7 +262,10 @@ impl AllSatSolver {
         };
 
         self.validate_backend_size()?;
-        let mut seen = HashSet::with_capacity(projection.len());
+        // Grow on insert rather than pre-sizing from the caller's projection
+        // length: a valid projection is bounded by the variable count, and an
+        // oversized one fails at its first duplicate or out-of-range entry.
+        let mut seen = HashSet::new();
         for &variable in projection {
             if !seen.insert(variable) {
                 return Err(AllSatInputError::DuplicateProjectionVariable(variable));

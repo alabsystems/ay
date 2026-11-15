@@ -47,14 +47,14 @@
 //!
 //! ## Search vs. checking (soundness / completeness split)
 //!
-//! * [`search`] looks for a certificate by a degree-2 **LP** relaxation and is
+//! * [`search_with_progress`] looks for a certificate by a degree-2 **LP** relaxation and is
 //!   **sound but incomplete**.
-//! * [`SosCertificate::verify`] is the **independent checker**: it re-derives the
+//! * [`SosCertificate::verify_with_progress`] is the **independent checker**: it re-derives the
 //!   oriented polynomials from the original constraints, verifies `Q` is PSD by
 //!   exact rational LDLᵀ, checks the multiplier signs, and confirms the
 //!   polynomial identity by exact coefficient matching. It is deliberately
 //!   ignorant of *how* the certificate was found, so a tampered certificate is
-//!   rejected. [`search`] runs the checker on its own output before returning.
+//!   rejected. [`search_with_progress`] runs the checker on its own output before returning.
 
 use ay_core::term::TermId;
 use num_bigint::BigInt;
@@ -66,10 +66,12 @@ mod lp;
 
 use budget::{
     checked_poly_add, checked_poly_mul, checked_poly_sub, polynomial_fits, rational_fits,
-    SosLpBudget, SosPolynomialBudget, MAX_SOS_ASSERTED_LITERALS, MAX_SOS_LP_CELLS,
+    SosLpBudget, SosPolynomialBudget, SosProgress, MAX_SOS_ASSERTED_LITERALS, MAX_SOS_LP_CELLS,
     MAX_SOS_TOTAL_POLY_TERMS,
 };
-use lp::{lp_add, lp_mul, lp_phase1_feasible, lp_sub};
+#[cfg(test)]
+use lp::lp_phase1_feasible;
+use lp::{lp_add, lp_mul, lp_phase1_feasible_with_progress, lp_sub};
 
 // ============================================================================
 // nia-local slim copies of NRA's MultiPoly / Rel / MultiConstraint.
@@ -304,11 +306,17 @@ include!("sos/certificate_polynomial.rs");
 /// so it is not PSD).
 #[cfg(test)]
 pub(crate) fn is_psd(matrix: &[Vec<BigRational>]) -> bool {
-    is_psd_bounded(matrix).unwrap_or(false)
+    is_psd_bounded(matrix, &SosProgress::new(&|| true)).unwrap_or(false)
 }
 
 #[allow(clippy::needless_range_loop)] // Schur complement: index is the pivot/row/col identity.
-fn is_psd_bounded(matrix: &[Vec<BigRational>]) -> Result<bool, SosError> {
+fn is_psd_bounded(
+    matrix: &[Vec<BigRational>],
+    progress: &SosProgress<'_>,
+) -> Result<bool, SosError> {
+    if !progress.poll() {
+        return Err(SosError::ResourceLimit);
+    }
     let n = matrix.len();
     if matrix.iter().any(|row| row.len() != n) {
         return Ok(false);
@@ -319,6 +327,9 @@ fn is_psd_bounded(matrix: &[Vec<BigRational>]) -> Result<bool, SosError> {
     // Work on a mutable copy of the trailing submatrix.
     let mut m: Vec<Vec<BigRational>> = matrix.to_vec();
     for k in 0..n {
+        if !progress.poll() {
+            return Err(SosError::ResourceLimit);
+        }
         let pivot = m[k][k].clone();
         if pivot.is_negative() {
             return Ok(false);
@@ -337,13 +348,22 @@ fn is_psd_bounded(matrix: &[Vec<BigRational>]) -> Result<bool, SosError> {
             if m[i][k].is_zero() {
                 continue;
             }
+            if !progress.poll() {
+                return Err(SosError::ResourceLimit);
+            }
             let factor = &m[i][k] / &pivot;
             if !rational_fits(&factor) {
                 return Err(SosError::ResourceLimit);
             }
             for j in (k + 1)..n {
+                if !progress.poll() {
+                    return Err(SosError::ResourceLimit);
+                }
                 let d = &factor * &m[k][j];
                 if !rational_fits(&d) {
+                    return Err(SosError::ResourceLimit);
+                }
+                if !progress.poll() {
                     return Err(SosError::ResourceLimit);
                 }
                 m[i][j] -= d;
@@ -356,8 +376,13 @@ fn is_psd_bounded(matrix: &[Vec<BigRational>]) -> Result<bool, SosError> {
     Ok(true)
 }
 
-fn certificate_input_fits(certificate: &SosCertificate, constraints: &[MultiConstraint]) -> bool {
-    if certificate.basis.len() > MAX_VARS + 1
+fn certificate_input_fits(
+    certificate: &SosCertificate,
+    constraints: &[MultiConstraint],
+    progress: &SosProgress<'_>,
+) -> bool {
+    if !progress.poll()
+        || certificate.basis.len() > MAX_VARS + 1
         || certificate.terms.len() > MAX_ATOMS
         || constraints.len() > MAX_SOS_ASSERTED_LITERALS
         || !rational_fits(&certificate.rhs)
@@ -380,12 +405,15 @@ fn certificate_input_fits(certificate: &SosCertificate, constraints: &[MultiCons
     if total_terms > MAX_SOS_TOTAL_POLY_TERMS
         || !constraints
             .iter()
-            .all(|constraint| polynomial_fits(&constraint.poly, None))
+            .all(|constraint| progress.poll() && polynomial_fits(&constraint.poly, None))
     {
         return false;
     }
     let mut variables = Vec::new();
     for constraint in constraints {
+        if !progress.poll() {
+            return false;
+        }
         for variable in constraint.poly.variables() {
             if !variables.contains(&variable) {
                 variables.push(variable);
@@ -410,32 +438,50 @@ impl SosCertificate {
     ///    multiplier;
     /// 4. the polynomial identity `σ0 + Σ c_i g_i ≡ R` holds by coefficient
     ///    matching.
+    #[cfg(test)]
     pub(crate) fn verify(&self, constraints: &[MultiConstraint]) -> Result<(), SosError> {
+        self.verify_with_progress(constraints, &SosProgress::new(&|| true))
+    }
+
+    fn verify_with_progress(
+        &self,
+        constraints: &[MultiConstraint],
+        progress: &SosProgress<'_>,
+    ) -> Result<(), SosError> {
+        if !progress.poll() {
+            return Err(SosError::ResourceLimit);
+        }
         let n = self.basis.len();
         if self.gram.len() != n || self.gram.iter().any(|r| r.len() != n) {
             return Err(SosError::GramShape);
         }
-        if !certificate_input_fits(self, constraints) {
+        if !certificate_input_fits(self, constraints, progress) {
             return Err(SosError::ResourceLimit);
         }
         for i in 0..n {
+            if !progress.poll() {
+                return Err(SosError::ResourceLimit);
+            }
             for j in 0..n {
                 if self.gram[i][j] != self.gram[j][i] {
                     return Err(SosError::GramAsymmetric);
                 }
             }
         }
-        if !is_psd_bounded(&self.gram)? {
+        if !is_psd_bounded(&self.gram, progress)? {
             return Err(SosError::GramNotPsd);
         }
         if self.rhs.is_positive() {
             return Err(SosError::PositiveRhs);
         }
 
-        let mut budget = SosPolynomialBudget::default();
+        let mut budget = SosPolynomialBudget::with_progress(progress);
         let mut lhs = sigma0_poly(&self.basis, &self.gram, &mut budget)?;
         let mut has_strict_positive = false;
         for term in &self.terms {
+            if !progress.poll() {
+                return Err(SosError::ResourceLimit);
+            }
             let (g, kind) = derive_oriented(term.origin, constraints, &mut budget)?;
             if kind.is_inequality() && term.multiplier.is_negative() {
                 return Err(SosError::NegativeMultiplier);
@@ -456,6 +502,9 @@ impl SosCertificate {
             .ok_or(SosError::ResourceLimit)?;
         if !diff.is_zero() {
             return Err(SosError::IdentityMismatch);
+        }
+        if !progress.poll() {
+            return Err(SosError::ResourceLimit);
         }
         Ok(())
     }
@@ -604,9 +653,18 @@ struct Square {
 
 /// Search for a degree-2 rational Positivstellensatz certificate refuting the
 /// conjunction `{ constraints }`. Returns a certificate only if it *also passes
-/// the independent checker* ([`SosCertificate::verify`]); otherwise `None`.
+/// the independent checker* ([`SosCertificate::verify_with_progress`]); otherwise `None`.
+#[cfg(test)]
 pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option<SosCertificate> {
-    if !search_input_fits(constraints, vars) {
+    search_with_progress(constraints, vars, &SosProgress::new(&|| true))
+}
+
+pub(crate) fn search_with_progress(
+    constraints: &[MultiConstraint],
+    vars: &[TermId],
+    progress: &SosProgress<'_>,
+) -> Option<SosCertificate> {
+    if !progress.poll() || !search_input_fits(constraints, vars) {
         return None;
     }
 
@@ -620,23 +678,29 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
     // Position of variable v within the basis (index 1..=n).
     let var_pos = |v: TermId| -> usize { vars.iter().position(|&u| u == v).unwrap() + 1 };
 
-    let (atoms, eqs) = collect_certificate_atoms(constraints)?;
+    let (atoms, eqs) = collect_certificate_atoms(constraints, progress)?;
 
     // 3. Dictionary of squares for σ0: x_i², (x_i ± x_j)². All homogeneous
     //    degree-2, so their Gram lives in the `x` block of the basis.
     let mut squares: Vec<Square> = Vec::new();
     for &v in vars {
+        if !progress.poll() {
+            return None;
+        }
         let mut form = vec![zero(); basis_len];
         form[var_pos(v)] = one();
-        squares.push(make_square(form, &basis)?);
+        squares.push(make_square(form, &basis, progress)?);
     }
     for a in 0..vars.len() {
         for b in (a + 1)..vars.len() {
             for sign in [one(), -one()] {
+                if !progress.poll() {
+                    return None;
+                }
                 let mut form = vec![zero(); basis_len];
                 form[var_pos(vars[a])] = one();
                 form[var_pos(vars[b])] = sign;
-                squares.push(make_square(form, &basis)?);
+                squares.push(make_square(form, &basis, progress)?);
             }
         }
     }
@@ -644,14 +708,14 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
     // 4. Try template A (R = −1), then template B (R = 0 with a forced strict
     //    positive term).
     let has_strict = atoms.iter().any(|a| a.kind.is_strict());
-    if let Some(cert) = try_template(&basis, &squares, &atoms, &eqs, false) {
-        if cert.verify(constraints).is_ok() {
+    if let Some(cert) = try_template(&basis, &squares, &atoms, &eqs, false, progress) {
+        if cert.verify_with_progress(constraints, progress).is_ok() && progress.poll() {
             return Some(cert);
         }
     }
-    if has_strict {
-        if let Some(cert) = try_template(&basis, &squares, &atoms, &eqs, true) {
-            if cert.verify(constraints).is_ok() {
+    if has_strict && progress.poll() {
+        if let Some(cert) = try_template(&basis, &squares, &atoms, &eqs, true, progress) {
+            if cert.verify_with_progress(constraints, progress).is_ok() && progress.poll() {
                 return Some(cert);
             }
         }
@@ -681,11 +745,17 @@ fn search_input_fits(constraints: &[MultiConstraint], vars: &[TermId]) -> bool {
             .all(|constraint| polynomial_fits(&constraint.poly, Some(vars)))
 }
 
-fn collect_certificate_atoms(constraints: &[MultiConstraint]) -> Option<(Vec<Atom>, Vec<EqAtom>)> {
+fn collect_certificate_atoms(
+    constraints: &[MultiConstraint],
+    progress: &SosProgress<'_>,
+) -> Option<(Vec<Atom>, Vec<EqAtom>)> {
     let mut atoms = Vec::new();
     let mut eqs = Vec::new();
     let mut linear_ineqs = Vec::new();
     for (index, constraint) in constraints.iter().enumerate() {
+        if !progress.poll() {
+            return None;
+        }
         let Some((poly, kind)) = orient(constraint) else {
             continue;
         };
@@ -707,7 +777,7 @@ fn collect_certificate_atoms(constraints: &[MultiConstraint]) -> Option<(Vec<Ato
         }
     }
 
-    let mut budget = SosPolynomialBudget::default();
+    let mut budget = SosPolynomialBudget::with_progress(progress);
     'outer: for (position, &left) in linear_ineqs.iter().enumerate() {
         for &right in &linear_ineqs[position..] {
             if atoms.len() >= MAX_ATOMS {
@@ -735,15 +805,22 @@ fn collect_certificate_atoms(constraints: &[MultiConstraint]) -> Option<(Vec<Ato
 }
 
 /// Build `q²` for a linear form and package it as a [`Square`].
-fn make_square(form: Vec<BigRational>, basis: &[Vec<TermId>]) -> Option<Square> {
+fn make_square(
+    form: Vec<BigRational>,
+    basis: &[Vec<TermId>],
+    progress: &SosProgress<'_>,
+) -> Option<Square> {
     // q = Σ_k form[k] · basis[k].
     let mut q = MultiPoly::zero();
     for (k, coeff) in form.iter().enumerate() {
+        if !progress.poll() {
+            return None;
+        }
         if !coeff.is_zero() {
             q.add_term(basis[k].clone(), coeff.clone());
         }
     }
-    let mut budget = SosPolynomialBudget::default();
+    let mut budget = SosPolynomialBudget::with_progress(progress);
     let poly = checked_poly_mul(&q, &q, &mut budget)?;
     Some(Square { form, poly })
 }
@@ -772,7 +849,11 @@ fn try_template(
     atoms: &[Atom],
     eqs: &[EqAtom],
     strict_template: bool,
+    progress: &SosProgress<'_>,
 ) -> Option<SosCertificate> {
+    if !progress.poll() {
+        return None;
+    }
     let rhs_const = if strict_template { zero() } else { -one() };
 
     // Column layout (all structural columns are ≥ 0):
@@ -798,16 +879,25 @@ fn try_template(
     // Seed the constant monomial as row 0 so the R term lands cleanly.
     intern_mono(&mut monos, &[]);
     for sq in squares {
+        if !progress.poll() {
+            return None;
+        }
         for (m, _) in &sq.poly.terms {
             intern_mono(&mut monos, m);
         }
     }
     for a in atoms {
+        if !progress.poll() {
+            return None;
+        }
         for (m, _) in &a.poly.terms {
             intern_mono(&mut monos, m);
         }
     }
     for e in eqs {
+        if !progress.poll() {
+            return None;
+        }
         for (m, _) in &e.poly.terms {
             intern_mono(&mut monos, m);
         }
@@ -820,9 +910,12 @@ fn try_template(
     }
 
     // Build A (total_rows × n_cols) and b.
+    if !progress.poll() {
+        return None;
+    }
     let mut a: Vec<Vec<BigRational>> = vec![vec![zero(); n_cols]; total_rows];
     let mut b: Vec<BigRational> = vec![zero(); total_rows];
-    let mut arithmetic_budget = SosLpBudget::default();
+    let mut arithmetic_budget = SosLpBudget::with_progress(progress);
 
     let row_of = |m: &[TermId]| monos.iter().position(|x| x.as_slice() == m);
 
@@ -862,7 +955,7 @@ fn try_template(
         b[r] = one();
     }
 
-    let solution = lp_phase1_feasible(a, b, n_cols)?;
+    let solution = lp_phase1_feasible_with_progress(a, b, n_cols, progress)?;
     reconstruct_certificate(
         basis,
         squares,
@@ -890,12 +983,15 @@ fn reconstruct_certificate(
     col_at: usize,
     col_eq: usize,
     rhs: BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<SosCertificate> {
     // Gram = Σ_s s_s · outer(form_s, form_s).
     let basis_len = basis.len();
     let mut gram = vec![vec![zero(); basis_len]; basis_len];
     for (sidx, sq) in squares.iter().enumerate() {
+        if !budget.poll() {
+            return None;
+        }
         let s = &solution[col_sq + sidx];
         if s.is_zero() {
             continue;
@@ -917,6 +1013,9 @@ fn reconstruct_certificate(
 
     let mut terms: Vec<CertTerm> = Vec::new();
     for (aidx, at) in atoms.iter().enumerate() {
+        if !budget.poll() {
+            return None;
+        }
         let c = solution[col_at + aidx].clone();
         if !c.is_zero() {
             terms.push(CertTerm {
@@ -939,6 +1038,9 @@ fn reconstruct_certificate(
         }
     }
 
+    if !budget.poll() {
+        return None;
+    }
     Some(SosCertificate {
         basis: basis.to_vec(),
         gram,

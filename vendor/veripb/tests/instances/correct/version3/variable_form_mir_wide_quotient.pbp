@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the in-situ variable-form MIR cut built the new coefficient of a negated term
+% as `ceil(a/d)*r - min((-a) mod d, r)`. The result is bounded by `a`, but the leading product is
+% not -- here `a = i64::MAX`, `d = a - 1`, `r = 9223372036854775805` and `ceil(a/d)*r` is `2r`.
+% The two wraps used to cancel exactly; once the release profile enabled overflow checks, this
+% valid one-line proof aborted the checker instead. The `e` pins the coefficient the rule
+% defines, so the instance fails on the plain path too and not only under `--kernel-verify`.
+f 1 ;
+pol 1 9223372036854775806 m ;
+e 9223372036854775805 ~x1 >= 0 : 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -38,19 +38,14 @@ pub enum ExprValue {
     // ===== Boolean Operations =====
     /// Logical NOT.
     Not(Expr),
-
     /// Logical AND (n-ary).
     And(Vec<Expr>),
-
     /// Logical OR (n-ary).
     Or(Vec<Expr>),
-
     /// Logical XOR.
     Xor(Expr, Expr),
-
     /// Logical implication (a => b).
     Implies(Expr, Expr),
-
     /// If-then-else (ite c t e).
     Ite {
         cond: Expr,
@@ -61,14 +56,12 @@ pub enum ExprValue {
     // ===== Equality and Comparison =====
     /// Equality (=).
     Eq(Expr, Expr),
-
     /// Distinct (not equal, n-ary).
     Distinct(Vec<Expr>),
 
     // ===== Bitvector Operations =====
     /// Bitvector addition.
     BvAdd(Expr, Expr),
-
     /// Bitvector subtraction.
     BvSub(Expr, Expr),
 
@@ -258,6 +251,16 @@ pub enum ExprValue {
         value: Expr,
     },
 
+    /// Unsigned BV64 half-open range copy using the entire pre-write source.
+    /// Child order is destination, source, lo, hi, source start.
+    ArrayRangeCopy {
+        dst: Expr,
+        src: Expr,
+        lo: Expr,
+        hi: Expr,
+        src_start: Expr,
+    },
+
     /// Constant array: ((as const (Array K V)) val).
     ConstArray { index_sort: Sort, value: Expr },
 
@@ -326,6 +329,8 @@ pub enum ExprValue {
 
     /// FP remainder: (fp.rem x y).
     FpRem(Expr, Expr),
+    /// Rust/fmod remainder: exact truncating quotient, distinct from IEEE fp.rem.
+    FpTruncatingRem(Expr, Expr),
 
     /// FP round to integral: (fp.roundToIntegral rm x).
     FpRoundToIntegral(RoundingMode, Expr),

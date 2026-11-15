@@ -1,0 +1,46 @@
+pseudo-Boolean proof version 2.0
+* Regression test: two `transitivity` blocks in one order definition.
+*
+* Not a wrong verdict on its own -- and this used to be ACCEPTED at exit 0.
+* It is refused now because the format admits each block of an order
+* definition once, in one position, and the second block proves its
+* obligations against the same definition as the first while overwriting the
+* `transitivity_proven` flag the first set. Whatever the second block proves,
+* it is the flag that the order's `end` reads, so "the last block wins" is the
+* rule nothing stated. Found by the sweep that followed the
+* transitivity-before-`def` wrong verdict; see
+* incorrect/version2/pre_order_transitivity_before_def.
+f 4
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

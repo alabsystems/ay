@@ -1,0 +1,27 @@
+pseudo-Boolean proof version 3.0
+f 4;
+red 1 x1 1 ~x5 >= 1 : x5 -> 0 : subproof
+qed;
+core id 6;
+red 1 ~x1 1 x5 >= 1 : x5 -> 1 : subproof
+qed;
+core id 8;
+preserved_add x5 : 1 x1 >= 1 : subproof
+    proofgoal #1
+        pol 9 6 +;
+    qed : 10;
+    proofgoal #2
+        pol 11 8 +;
+    qed : 12;
+qed;
+preserved_rm x1 : 1 x5 >= 1 : subproof
+    proofgoal #1
+        pol 13 8 +;
+    qed : 14;
+    proofgoal #2
+        pol 15 6 +;
+    qed : 16;
+qed;
+output EQUIENUMERABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

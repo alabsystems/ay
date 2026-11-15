@@ -334,3 +334,5 @@ fn render_alethe_contains_rule_and_rhs() {
     // A rational multiplier renders as (/ n d).
     assert_eq!(render_rat(&rf(1, 2)), "(/ 1 2)");
 }
+
+mod progress;

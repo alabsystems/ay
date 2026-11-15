@@ -145,6 +145,23 @@ pub(crate) struct SolverStats {
     pub consecutive_stagnant_windows: usize,
     /// Whether the solver terminated due to convergence stagnation detection.
     pub terminated_by_stagnation: bool,
+
+    // Workstream B board counters (DESIGN_spacer_pob_lemma_pipeline.md §4.6).
+    /// Proof obligations popped by `strengthen`.
+    pub spacer_pobs_processed: usize,
+    /// POBs that returned `BlockResult::Blocked`.
+    pub spacer_blocked_pobs: usize,
+    /// Lemmas recorded by the board (legacy + lane).
+    pub spacer_lemmas: usize,
+    /// Share of processed POBs whose cube was a point cube.
+    pub spacer_point_cube_share: f64,
+    /// Lemmas per blocked POB (the om1 0.18 → 1.0 metric).
+    pub spacer_lemmas_per_blocked_pob: f64,
+    /// The full `SpacerCoreStats::json()` block (`Null` when unavailable).
+    pub spacer_counters: serde_json::Value,
+    /// Candidate models that failed verification (#9227 demotions; the
+    /// board's `model_failures`).
+    pub model_verification_failures: usize,
 }
 
 impl SolverStats {

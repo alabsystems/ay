@@ -32,19 +32,43 @@ TIMEOUT="${3:-5}"
 Z3_LIB="${Z3_LIB:-/opt/homebrew/lib/libz3.dylib}"
 Z3_BIN="${Z3_BIN:-/opt/homebrew/bin/z3}"
 
-# Tier-0 corpora: committed micro-corpus + BOTH shipped-bug families.
+# Tier-0 corpora: committed micro-corpus + BOTH shipped-bug families + the
+# wrong-verdict repros under repros/. An entry is a directory or one file; one
+# the public export does not carry is dropped, not failed.
+#
+# The repros entries are the ones filed for a wrong or quarantined verdict:
+# cs_stateful (a likely wrong unsat, moved out of the retired docs/ handoff
+# directory, which this gate never scanned), the QF_LRA push/pop false unsat,
+# FP chainable comparisons, the unsat-certificate inputs and the two
+# quarantined ABV unsats. The rest of repros/ is a wrong model under a right
+# verdict (arrays-model-bug, qf-bvfp-model-writeback), which a verdict gate
+# cannot see, or performance and completeness (dpll-lra-perf, lra-scope-trail,
+# qlock-array, the string and mixed-arithmetic gaps), mostly timeouts at this
+# gate's bound. Measured 2026-09-27 at 5 s: the whole of repros/ (60 files) has
+# 0 declared-status contradictions and 0 sat-vs-unsat disputes with libz3, and
+# these entries add 13 files to the 30 above and take the two passes from 22 s
+# to 44 s.
 CORPORA=()
 for d in \
     crates/ay-z3-parity/corpus \
     benchmarks/smt/regression/soundness_qf_ax \
     benchmarks/smt/regression/soundness_qf_slia_fuzz \
-    repros
+    repros/cs_stateful-1.i_2.MINIMIZED.smt2 \
+    repros/lra-pushpop-false-unsat-2026-09-18 \
+    repros/fp-chainable-comparisons \
+    repros/unsat-cert \
+    repros/abv-nested-array-quantified-unsat-quarantine.smt2 \
+    repros/abv-record-boxed-nested-array-quantified-unsat-quarantine.smt2
 do
-    [ -d "$d" ] && CORPORA+=("$d")
+    [ -e "$d" ] && CORPORA+=("$d")
 done
 
 echo "== building --release -p ay-ffi -p ay-z3-parity ..."
-if ! cargo build --release -p ay-ffi -p ay-z3-parity; then
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. "$REPO_ROOT/scripts/lib/cargo_frontend.sh"
+if ! ay_cargo build --release -p ay-ffi -p ay-z3-parity; then
     echo "FATAL: build failed"; exit 2
 fi
 

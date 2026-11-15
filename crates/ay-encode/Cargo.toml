@@ -10,7 +10,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Shared AY encoding/invocation surface for model-checker-consumer and ty: sort/term builders, a single invocation config, a frontend-neutral verdict, and a proof-certificate hook."
+description = "Shared AY encoding/invocation surface for model-checker-consumer: sort/term builders, a single invocation config, a frontend-neutral verdict, and a proof-certificate hook."
 
 [lints]
 workspace = true
@@ -27,8 +27,8 @@ ay-core.workspace = true
 serde_json.workspace = true
 
 # Optional: Alethe (SAT-level) proof export. Off by default so the leaf
-# crate stays minimal; model-checker-consumer/ty opt in when they want re-checkable
-# SAT-level certificates in addition to CHC proof transcripts.
+# crate stays minimal; a consumer such as model-checker-consumer opts in when it wants
+# re-checkable SAT-level certificates in addition to CHC proof transcripts.
 ay-proof = { workspace = true, optional = true }
 
 [features]

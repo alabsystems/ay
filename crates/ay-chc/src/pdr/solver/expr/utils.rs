@@ -92,11 +92,13 @@ impl PdrSolver {
         best
     }
 
-    /// Extract all disequalities (not (= a b)) from an expression.
-    /// Returns Vec<(lhs, rhs)> for each disequality found.
-    /// Delegated to generalization module.
-    pub(in crate::pdr::solver) fn extract_disequalities(expr: &ChcExpr) -> Vec<(ChcExpr, ChcExpr)> {
-        crate::pdr::generalization::extract_disequalities(expr)
+    /// The first `cap` disequalities (not (= a b)) of an expression, in tree
+    /// order. Delegated to the generalization module.
+    pub(in crate::pdr::solver) fn extract_disequalities(
+        expr: &ChcExpr,
+        cap: usize,
+    ) -> Vec<(ChcExpr, ChcExpr)> {
+        crate::pdr::generalization::extract_disequalities(expr, cap)
     }
 
     /// Build a conjunction from a list of formulas.

@@ -1,0 +1,1875 @@
+\documentclass[a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{amsmath, amssymb}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+
+\newcommand{\defBNF}[1]{\hypertarget{def:#1}{<\detokenize{#1}>}}
+\newcommand{\lnkBNF}[1]{\hyperlink{def:#1}{<\detokenize{#1}>}}
+\newcommand{\wave}[0]{\raisebox{0.5ex}{\texttildelow}}
+\newcommand{\veriPB}[0]{\textsc{VeriPB}}
+
+\definecolor{ebnf-background}{HTML}{EFEFEF}
+\definecolor{ebnf-text}{HTML}{000000}
+\definecolor{ebnf-comment}{HTML}{7F7F7F}
+\definecolor{ebnf-terminal}{HTML}{DC7828}
+\definecolor{ebnf-other}{HTML}{006000}
+\definecolor{ebnf-separator}{HTML}{CC0055}
+
+\lstdefinelanguage{ebnf}{
+	basicstyle=\ttfamily\small\color{ebnf-text},
+	backgroundcolor=\color{ebnf-background},
+	%
+	morecomment=[l]{\%},
+	commentstyle=\color{ebnf-comment},
+	%
+	morestring=[b][\color{ebnf-other}]{?},
+	morestring=[b][\color{ebnf-terminal}]{"},
+	%
+	escapeinside={!}{!},
+	%
+	literate=*%
+		{|}{{\color{ebnf-separator}|}}{1}
+		{,}{{\color{ebnf-separator},}}{1}
+		{::=}{{\color{ebnf-separator}::=}}{1}
+		{~}{{\wave}}{1}
+}
+
+\definecolor{veripb-background}{HTML}{FFFFFF}
+\definecolor{veripb-text}{HTML}{000000}
+\definecolor{veripb-comment}{HTML}{7F7F7F}
+\definecolor{veripb-rule}{HTML}{95133B}
+\definecolor{veripb-environment}{HTML}{246272}
+\definecolor{veripb-constant}{HTML}{934E11}
+\definecolor{veripb-operator}{HTML}{95133B}
+\definecolor{veripb-separator}{HTML}{000000}
+\definecolor{veripb-valid-text}{HTML}{006000}
+\definecolor{veripb-invalid-text}{HTML}{FF0000}
+
+\lstdefinelanguage{veripb}{
+	backgroundcolor=\color{veripb-background},
+	basicstyle=\ttfamily\small\color{veripb-text},
+	%
+	alsoletter={_},
+	alsodigit={[]\{\}\^-},
+	alsoother={@},
+	%
+	morecomment=[l]{\%},
+	commentstyle=\color{veripb-comment},
+	%
+	keywordstyle=[1]{\color{veripb-operator}},
+	morekeywords=[1]{
+		c,%
+		d,%
+		m,%
+		n,%
+		s,%
+		w,%
+	},
+	%
+	keywordstyle=[2]{\color{veripb-rule}},
+	morekeywords=[2]{%
+		a,%
+		aux,%
+		conclusion,%
+		core,%
+		del,%
+		delc,%
+		deld,%
+		diff,%
+		dom,%
+		e,%
+		end_time,%
+		eobj,%
+		eord_def,%
+		eord_loaded,%
+		f,%
+		fail,%
+		fresh_aux_1,%
+		fresh_aux_2,%
+		fresh_right,%
+		i,%
+		ia,%
+		id,%
+		is_deleted,%
+		left,%
+		load_order,%
+		new,%
+		obji,%
+		obju,%
+		output,%
+		pbc,%
+		pol,%
+		range,%
+		red,%
+		right,%
+		rup,%
+		setlvl,%
+		sol,%
+		soli,%
+		solx,%
+		start_time,%
+		strengthening_to_core,%
+		wiplvl,%
+		preserved_add,%
+		preserved_rm,%
+		epreserved,%
+	},
+	%
+	keywordstyle=[3]{\color{veripb-environment}},
+	morekeywords=[3]{%
+		def,%
+		def_order,%
+		end,%
+		proof,%
+		proofgoal,%
+		qed,%
+		reflexivity,%
+		pseudo-Boolean,%
+		scope,%
+		spec,%
+		subproof,%
+		transitivity,%
+		vars,%
+		version,%
+	},
+	%
+	keywordstyle=[4]{\color{veripb-constant}},
+	morekeywords=[4]{%
+		BOUNDS,%
+		DERIVABLE,%
+		EQUIOPTIMAL,%
+		EQUISATISFIABLE,%
+		EQUIENUMERABLE,%
+		FILE,%
+		geq,%
+		IMPLICIT,%
+		INF,%
+		leq,%
+		NONE,%
+		off,%
+		on,%
+		PERMUTATION,%
+		SAT,%
+		UNSAT,%
+		ENUMERATION_COMPLETE,%
+		ENUMERATION_PARTIAL,%
+	},
+	escapeinside={!}{!},
+	%
+	literate=*%
+		{pseudo-Boolean}{{\color{veripb-environment}pseudo-Boolean}}{14}%
+		{-}{{\color{veripb-operator}-}}{1}%
+		{->}{{\color{veripb-separator}->}}{2}%
+		{,}{{\color{veripb-separator},}}{1}%
+		{:}{{\color{veripb-separator}:}}{1}%
+		{;}{{\color{veripb-separator};}}{1}%
+		{~}{{\color{veripb-operator}\wave}}{1}%
+		{+}{{\color{veripb-operator}+}}{1}%
+		{*}{{\color{veripb-operator}*}}{1}%
+		{>=}{{\color{veripb-operator}>=}}{2}%
+		{<=}{{\color{veripb-operator}<=}}{2}%
+		{==>}{{\color{veripb-operator}==>}}{3}%
+		{<==}{{\color{veripb-operator}<==}}{3}%
+		{...}{{\color{veripb-comment}...}}{3}%
+}
+
+\lstset{
+	breaklines=true,
+	columns=fullflexible,
+	captionpos=b,
+	keepspaces=true,
+	showstringspaces=false,
+	showtabs=false,
+	tabsize=4,
+	frame=single,
+	rulecolor=\color{black},
+	texcl=true,
+	language=ebnf
+}
+
+\renewcommand{\sectionautorefname}{Section}
+\let\subsectionautorefname\sectionautorefname
+\let\subsubsectionautorefname\sectionautorefname
+
+\title{\veriPB{} 3.0 Grammar}
+\author{Various Authors}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\section{Introduction}\label{sec:introduction}
+This document contains a complete overview of the \veriPB{} grammar 3.0 in EBNF and includes examples. The breaking changes in \veriPB{} 3.0 compared to \veriPB{} 2.0 is described in \autoref{sec:migration} which also includes a migration guide. The new features in \veriPB{} 3.0 are described in \autoref{sec:new-features}.
+
+The grammar notation and the allowed characters is described in \autoref{sec:syntax}. The full \veriPB{} 3.0 grammar and examples is described in \autoref{sec:grammar-pbp}. The format for XPB-files (extended pseudo-Boolean) supported by \veriPB{} 3.0 is shown in \autoref{sec:grammar-opb}. Note that this document does \emph{not} contain an overview of the semantics (yet).
+
+Through out this document, every non-terminal symbol in the grammar contains a link to its definition, for instance \texttt{\lnkBNF{proof_line}} links to the definition of a proof line. Furthermore:
+\begin{figure}[H]
+	\begin{minipage}{.49\linewidth}
+		\begin{lstlisting}[gobble=8]
+		Gray boxes show the !\veriPB{}! grammar in EBNF.
+		\end{lstlisting}
+	\end{minipage}\hfill%
+	\begin{minipage}{.49\linewidth}
+		\begin{lstlisting}[backgroundcolor=\color{veripb-background}, gobble=8]
+		White boxes show examples of !\veriPB{}! syntax.
+		\end{lstlisting}
+	\end{minipage}
+\end{figure}
+
+
+\section{\veriPB{} 3.0 Migration Guide}\label{sec:migration}
+This section describes all the breaking changes in the \veriPB{} 3.0 grammar compared to the \veriPB{} 2.0 grammar. This migration guide assumes that you have working \veriPB{} 2.0 proofs. The items below describes the changes needed to output valid 3.0 proofs.
+\begin{itemize}
+	\item Every proof line (rule or definition) now ends by semicolon (\verb!;!) instead of newline (\verb!\n!, \verb!\r! or \verb!\r\n!). Newlines are allowed after the semicolons and are treated as whitespace. \textbf{NOTE}: Starting a subcontext, for instance with \lstinline[language=veripb]!subproof! (previously {\color{veripb-environment}\verb!begin!}) or \lstinline[language=veripb]!proofgoal!, is not considered a proof step on its own (see later examples in the migration guide).
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		pol 1 2 +
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		pol 1 2 +;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Constraint IDs may no longer be prefixed with a plus sign \verb!+!.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		pol +1 +2 +
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		pol 1 2 +;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Comments now start with percentage sign (\verb!%!) instead of asterisk (\verb!*!) which means they now work like \LaTeX{} comments (and no longer as OPB comments).
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		!*! This is no longer !a! comment.
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		% This is now a comment.
+		\end{lstlisting}
+	      \end{minipage}
+	\item Optional arguments in rules are now separated by colon (\verb!:!) instead of semicolons (\verb!;!).
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 ; r1 -> 0
+		e +1 ~r1 +1 x1 >= 1 ; -1
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 : r1 -> 0;
+		e +1 ~r1 +1 x1 >= 1 : -1;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Witnesses/Substitutions (in strengthening rules) may no longer contain optional commas (\verb!,!) to separate assignments. Furthermore, whitespace is now required around the optional arrows (\verb!->!).
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		aa -> bb, cc dd, ee -> ff
+		aa ->bb cc ->dd ee ->ff
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		aa -> bb cc dd ee -> ff
+		aa -> bb cc -> dd ee -> ff
+		\end{lstlisting}
+	      \end{minipage}
+	\item Subproofs for strengthening rules, the objective update rule (\lstinline[language=veripb]!obju!), and checked deletion now start with \verb!subproof! instead of \verb!begin!. Subproofs, proofs (in order definitions) and proof goals now always ends with \verb!qed! instead of \verb!end!.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 ; r1 -> 0 ; !\color{veripb-environment}begin!
+			proofgoal #1
+				...
+			end
+		end
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 : r1 -> 0 : subproof
+			proofgoal #1
+				...
+			qed;
+		qed;
+		\end{lstlisting}
+	      \end{minipage}
+	\item It is no longer allowed to use the redundance-based strengthening rule with an empty witness. The new proof by contradiction should be used instead. See \texttt{\lnkBNF{pbc_rule}}.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		red +1 x1 >= 0 ; ; !\color{veripb-environment}begin!
+			proofgoal #1
+				...
+			end
+		end
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		pbc +1 x1 >= 0 : subproof
+
+			...
+
+		qed;
+		\end{lstlisting}
+	      \end{minipage}
+	\item The hints (for the contradicting constraint) that are allowed at the end of subproofs and proofgoals must now be preceded by a colon (\verb!:!).
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 ; r1 -> 0 ; !\color{veripb-environment}begin!
+			proofgoal #1
+				...
+			end -1
+		end -1
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		red +1 ~r1 +1 x1 >= 1 : r1 -> 0 : subproof
+			proofgoal #1
+				...
+			qed : -1;
+		qed : -1;
+		\end{lstlisting}
+	      \end{minipage}
+	\item The equals and add rule (\verb!ea!-rule) have been removed in favor of the equals rule (\verb!e!-rule) with a label, since the \verb!e!-rule now return the ID of a matching constraint such that a label can be assigned that ID.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		!\color{veripb-comment}* The line below adds a new ID\!!
+		@label !\color{veripb-rule}ea! +1 x1 >= 1
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		% The line below does NOT add a new ID!
+		@label e +1 x1 >= 1;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Multiplication by zero is not longer allowed in the \verb!pol!-rule. Furthermore, it is no longer allowed to prefix integers with leading zeros.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		!\color{veripb-comment}* Multiply constraint with ID 42 by int.!
+		pol 42 0 *
+		pol 42 002 *
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		% Multiply constraint with ID 42 by int.
+		pol 42;
+		pol 42 2 *;
+		\end{lstlisting}
+	      \end{minipage}
+	\item All short/alternative names for rules and definitions with multiple names have been removed.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		!\color{veripb-rule}p! 1 2 +
+		!\color{veripb-rule}u! +1 x1 >= 0;
+		!\color{veripb-rule}d! 42
+		!\color{veripb-rule}v! ~x1 x2 x3
+		!\color{veripb-rule}o! ~x1 x2 x3
+		!\color{veripb-environment}pre\_order!
+			...
+		end
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		pol 1 2 +;
+		rup +1 x1 >= 0;
+		del 42;
+		solx ~x1 x2 x3;
+		soli ~x1 x2 x3;
+		def_order
+			...
+		end;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Rename the set level rule from \verb!#! to \verb!setlvl! and the wipe level rule from \verb!w! to \verb!wiplvl!.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		!\color{veripb-rule}\#! 1
+		!\color{veripb-rule}w! 3
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		setlvl 1;
+		wiplvl 3;
+		\end{lstlisting}
+	      \end{minipage}
+	\item The output type {\color{veripb-constant}\verb!CONSTRAINT!} has been removed (it was never fully supported). Please write the contents to a file, specify that filename on the command line and use the output type \lstinline[language=veripb]!FILE!.
+	      \\[1mm]
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-invalid-text}, caption={\veriPB{} 2.0 syntax.}]
+		output EQUISATISFIABLE !\color{veripb-constant}CONSTRAINT! ...
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}[t]{.05\linewidth}
+		      \centering \vspace*{-5mm}$\to$
+	      \end{minipage}\hfill%
+	      \hfill%
+	      \begin{minipage}{.47\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8, rulecolor=\color{veripb-valid-text}, caption={\veriPB{} 3.0 syntax.}]
+		output EQUISATISFIABLE FILE;
+		\end{lstlisting}
+	      \end{minipage}
+\end{itemize}
+
+\section{New Features in \veriPB{} 3.0}\label{sec:new-features}
+\begin{itemize}
+	\item Comments and whitespace (even newlines) may appear (almost) everywhere. Comments and whitespace will separate tokens but otherwise have no effect. See \texttt{\lnkBNF{header}} for the exception.
+	\item Added a new rule: Proof by contradiction rule (\verb!pbc!-rule) which is allowed in all contexts as replacement for using the redundance-based strengthening rule (\verb!red!-rule) with an empty witness. See \texttt{\lnkBNF{pbc_rule}}.
+	\item Every rule using a subproof and every proof goal may now optionally end by (repeating) the name of the rule or proof goal being proved before the optional hint, if any. Note that the optional hint must now be preceded by a colon (\verb!:!). Examples of what is allowed now:
+	      \\[1mm]
+	      \begin{minipage}{.49\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8]
+		proofgoal #1 ... qed #1 : -1;
+		proofgoal #1 ... qed #1;
+		proofgoal #1 ... qed : -1;
+		proofgoal #1 ... qed;
+		\end{lstlisting}
+	      \end{minipage}\hfill%
+	      \begin{minipage}{.49\linewidth}
+		      \begin{lstlisting}[language=veripb, gobble=8]
+		pbc ... : subproof ... qed pbc : -1;
+		pbc ... : subproof ... qed pbc;
+		pbc ... : subproof ... qed : -1;
+		pbc ... : subproof ... qed;
+		\end{lstlisting}
+	      \end{minipage}
+	\item Similarly, every definition ending with \verb!end! can now optionally be followed by the name of the definition i.e.\ \lstinline[language=veripb]!reflexivity ... end;! can now also be \lstinline[language=veripb]!reflexivity ... end reflexivity;! .
+	\item The equals rule (\verb!e!-rule) and the implied rule (\verb!i!-rule) now return the ID of a matching constraint such that a label can be assigned that ID, e.g., write \lstinline[language=veripb]!@label e !\verb!<constraint>;! to assign \lstinline[language=veripb]!@label! to the ID of a constraint equal to/implying \verb!<constraint>!.
+	\item Constraints specified in rules (like \verb!rup!, \verb!red!, \verb!del spec!, etc.) no longer end with a semicolon (\verb!;!) --- since the rule describes where to put (semi)colons and not the constraints (arguments).
+	\item Extended the order definition (\verb!def_order!) to also contain a specification (a derivation from the empty set) block and two fresh sets of auxiliary variables for the transitivity proof. This is to allow orders with auxiliary variables. See \texttt{\lnkBNF{def_order_rule}}. For further details on the syntax and semantics of orders with auxiliary variables, have a look at the paper introducing this feature: \url{https://arxiv.org/abs/2511.16637}.
+	\item Auxiliary variables used in orders must start with a dollar sign (\verb!$!) followed by any allowed character for variable names. (The grammar does not restrict the usage of auxiliary variables in places where normal variables are used. However, their usage will be restricted at the semantic level.) See \texttt{\lnkBNF{aux_variable}}.
+	\item Added \verb!scope!'s to subproofs for strengthening rules (\verb!dom! and \verb!red!). Scopes work like a subproof inside the subproof and are used to introduce the additional specification constraints used in orders with auxiliary variables. See \texttt{\lnkBNF{scope}}.
+	\item Added a new rule: Equal order rule (\verb!eord_def!-rule). See \texttt{\lnkBNF{eord_def_rule}}.
+	\item Added a new rule: Equal loaded order rule (\verb!eord_loaded!-rule). See \texttt{\lnkBNF{eord_loaded_rule}}.
+	\item Added a new rule: Objective improvement rule (\verb!obji!-rule) that allows to log an objective value using \verb!obji <objective value>;! without specifying a solution and add the corresponding objective improving constraint. However, a valid solution with the same or a better objective value must be specified later in the proof. The \verb!soli!-rule and \verb!sol!-rule now allow to optionally specify an objective value using \verb!(sol|soli) <solution> [: <objective value>];!. See \texttt{\lnkBNF{soli_rule}} and \texttt{\lnkBNF{obji_rule}}.
+	\item Constraints may now also be written as a reification in one direction where the right implication is a (non-empty) conjunction of literals (\lstinline[language=veripb]!z1 z2 ~z3 ==> +1 x1 +2 x2 +3 x3 +4 x4 >= 4!) and the left implication is a single literal (\lstinline[language=veripb]!z1 <== +1 x1 +2 x2 +3 x3 +4 x4 >= 4!). This also applies to constraints in the formula file, see \texttt{\lnkBNF{xpb_reification}}, where a right implication may also be used for an equality constraint, but a left implication may not.
+	\item The reverse polish notation rule (\verb!pol!) for cutting plane derivations have been updated with new derivation rules: Variable normal form division (\verb!c!), variable normal form mixed integer rounding (MIR) cut (\verb!m!), literal normal form MIR cut (\verb!n!) and decrementing the right-hand side (\verb!-!). The difference between the variable normal form operations (\verb!c! and \verb!m!) and their literal normal form (normalized form) counterparts (\verb!d! and \verb!n!) is which representation of the constraint that division and MIR cut, respectively, is applied to. All of these rules expect two elements on the \verb!pol\verb! stack: an positive integer at the top and a constraint below it. E.g., \lstinline[language=veripb]!pol 42 1 - 2 d 3 c 4 n 5 m;! would decrease the right-hand side of the constraint with ID 42 by 1, then divide the result in normalized form by 2, then divide that result in variable normal form by 3, then apply MIR with divisor 4 on this result in normalized form and finally apply MIR with divisor 5 on the previous result in variable normal form.
+	\item New conclusions for enumeration proofs \lstinline[language=veripb]!ENUMERATION_COMPLETE! and \lstinline[language=veripb]!ENUMERATION_PARTIAL!.
+	\item Rules \lstinline[language=veripb]!preserved_add!, \lstinline[language=veripb]!preserved_rm!, and \lstinline[language=veripb]!epreserved! to handle the preserved (or projected) set of variables.
+	\item New output guarantee \lstinline[language=veripb]!EQUIENUMERABLE! for the same number of projected solutions.
+	\item Assertions may now optionally carry three colon-separated annotation fields — a list
+of antecedent constraint IDs, a name, and free-text hints — intended to be read by external tools.
+\end{itemize}
+
+\section{Grammar Syntax}\label{sec:syntax}
+The \veriPB{} 3.0 grammar accepts proofs written in ASCII with the following exceptions:
+\begin{itemize}
+	\item No control characters\footnote{\url{https://en.wikipedia.org/wiki/C0_and_C1_control_codes\#ASCII}} are allowed, except those mentioned below.
+	\item \emph{Line feed} (\lstinline!"\n"! : 0x0a) and \emph{carriage return} (\lstinline!"\r"! : 0x0d) are allowed to separate lines, see \texttt{\lnkBNF{eol}}.
+	\item The \emph{character tabulation} (\lstinline!"\t"! : 0x09) character is allowed where space is allowed, see \texttt{\lnkBNF{space}}.
+	\item It is allowed to end the file with the \emph{null} (\lstinline!"\0"! : 0x00) character.
+\end{itemize}
+
+The grammar in this document is written in \emph{Extended Backus-Naur form (EBNF)}\footnote{\url{https://en.wikipedia.org/wiki/Extended_Backus\%E2\%80\%93Naur_form}} where we use the following notation:
+\begin{itemize}
+	\item \lstinline!::=! denotes a definition (we use \lstinline!::=! instead of \lstinline!=! and we omit the end of definition symbol \verb!;!).
+	\item \lstinline!<non_terminal>! is a non-terminal symbol.
+	\item \lstinline!,! denotes concatenation.
+	\item \lstinline!|! denotes alternation (choose one of the options).
+	\item \lstinline![...]! denotes zero or one occurrence.
+	\item \lstinline!{...}! denotes zero or more occurrence.
+	\item \lstinline!(...)! denotes a group (that could be refactored to a new definition).
+	\item \lstinline!"..."! denotes a terminal string (this one outputs three dots i.e.\ \verb!...!).
+	\item \lstinline!? ... ?! denotes a group of characters that require too much space to write out, for instance \lstinline!? A-Z ?! would mean all capital letters from \verb!A! to \verb!Z! (26 characters).
+\end{itemize}
+
+Example: If we have the following definition of \texttt{\lnkBNF{example}} the result is either \verb!ab! or \verb!cd!.
+\begin{lstlisting}
+!\defBNF{example}! ::=
+	"a", "b" | "c", "d"
+\end{lstlisting}
+
+
+
+\section{\veriPB{} 3.0 Grammar}\label{sec:grammar-pbp}
+A general design choice in the grammar is that definitions of non-terminals as far as possible produce content without preceding or trailing whitespace. This is instead specified in the parent rule(s) that know if whitespace and/or separators are needed before/after non-terminals. This also makes the grammar easier to read in the sense the reader does not have to remember if a non-terminal produces whitespace at the start/end. However, the exception to this rule is the optional arguments in rules like \texttt{\lnkBNF{colon}} in \texttt{\lnkBNF{witness_subproof_arguments}} that includes the colon(s) before optional argument(s) which allows optional whitespace around the colon(s). The same applies to optional whitespace before semicolons when \texttt{\lnkBNF{semicolon}} is used.
+
+Definitions like \texttt{\lnkBNF{variables}} define one or more \texttt{\lnkBNF{variable}} separated by a separator. This allows to specify zero or more \texttt{\lnkBNF{variable}} separated by a separator as \texttt{[\lnkBNF{variables}]}. This pattern is used to be able to specify both types in a uniform manner in the grammar.
+
+
+\subsection{Whitespace and Comments}\label{sec:white-space}
+\begin{lstlisting}
+!\defBNF{space}! ::=
+	(" " | "\t"), {!\lnkBNF{space}!}
+
+!\defBNF{eol}! ::=
+	"\n" | "\r" | "\r\n"
+
+!\defBNF{comment}! ::=
+	"%", {? any allowed symbol except "\n","\r" and "\0" ?}, !\lnkBNF{eol}!
+
+!\defBNF{skip}! ::=
+	(!\lnkBNF{space}! | !\lnkBNF{eol}! | !\lnkBNF{comment}!), {!\lnkBNF{skip}!}
+\end{lstlisting}
+\texttt{\lnkBNF{skip}} is used to denote a \emph{mandatory} whitespace separation while \texttt{[\lnkBNF{skip}]} describes arbitrary \emph{optional} whitespace (comments are considered whitespace).
+
+~\\
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct comment.}]
+	% This is a comment.
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect comment.}]
+	!*! This is no longer !a! comment.
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Integers}\label{sec:integers}
+\begin{lstlisting}
+!\defBNF{signed_integer}! ::=
+	[!\lnkBNF{sign}!], !\lnkBNF{unsigned_integer}!
+
+!\defBNF{unsigned_integer}! ::=
+	"0" | !\lnkBNF{positive_integer}!
+
+!\defBNF{positive_integer}! ::=
+	!\lnkBNF{non_zero_digit}!, {!\lnkBNF{digit}!}
+
+!\defBNF{non_zero_integer}! ::=
+	["-"], !\lnkBNF{positive_integer}!
+
+!\defBNF{sign}! ::=
+	"+" | "-"
+
+!\defBNF{digit}! ::=
+	"0" | !\lnkBNF{non_zero_digit}!
+
+!\defBNF{non_zero_digit}! ::=
+	"1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+\end{lstlisting}
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct signed integers.}]
+	42 -42 +42 0 -0 +0
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect signed integers.}]
+	- 1 000 01 -01 +01
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Names, Variables and Literals}\label{sec:variables-literals}
+\begin{lstlisting}
+!\defBNF{name}! ::=
+	!\lnkBNF{letter_or_underscore}!, {!\lnkBNF{identifier_symbol}!}
+
+!\defBNF{variable}! ::=
+	!\lnkBNF{letter_or_underscore}!, !\lnkBNF{identifier_symbol}!, {!\lnkBNF{identifier_symbol}!}
+
+!\defBNF{variables}! ::=
+	!\lnkBNF{variable}!, {!\lnkBNF{skip}!, !\lnkBNF{variable}!}
+
+!\defBNF{aux_variable}! ::=
+	"$", !\lnkBNF{identifier_symbol}!, {!\lnkBNF{identifier_symbol}!}
+
+!\defBNF{aux_variables}! ::=
+	!\lnkBNF{aux_variable}!, {!\lnkBNF{skip}!, !\lnkBNF{aux_variable}!}
+
+!\defBNF{literal}! ::=
+	["~"], (!\lnkBNF{variable}! | !\lnkBNF{aux_variable}!)
+
+!\defBNF{literals}! ::=
+	!\lnkBNF{literal}!, {!\lnkBNF{skip}!, !\lnkBNF{literal}!}
+
+!\defBNF{letter_or_underscore}! ::=
+	"_" | ? A-Z ? | ? a-z ?
+
+!\defBNF{identifier_symbol}! ::=
+	!\lnkBNF{letter_or_underscore}! | !\lnkBNF{digit}! | "^" | "[" | "]" | "{" | "}" | "-"
+\end{lstlisting}
+Note that variable names must contain at least two symbols and start with an ASCII letter or underscore!
+\\~\\
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct variable names.}]
+	x1 _var !V-A-R! a[0]^1_2
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect variable names.}]
+	0x1 !\S!1 -ab ^hat NO$@ x
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Objectives and Constraints}\label{sec:constraints}
+\begin{lstlisting}
+!\defBNF{objective}! ::=
+	!\lnkBNF{sum}!, [!\lnkBNF{skip}!, !\lnkBNF{coefficient}!] | !\lnkBNF{coefficient}!
+
+!\defBNF{constraint}! ::=
+	[!\lnkBNF{reification}!], [!\lnkBNF{skip}!], [!\lnkBNF{sum}!], [!\lnkBNF{skip}!], !\lnkBNF{relational_operator}!, [!\lnkBNF{skip}!], !\lnkBNF{coefficient}!
+
+!\defBNF{reification}! ::=
+	!\lnkBNF{literals}!, [!\lnkBNF{skip}!], "==>" | !\lnkBNF{literal}!, [!\lnkBNF{skip}!], "<=="
+
+!\defBNF{relational_operator}! ::=
+	">=" | "<="
+
+!\defBNF{sum}! ::=
+	!\lnkBNF{weighted_term}!, {!\lnkBNF{skip}!, !\lnkBNF{weighted_term}!}
+
+!\defBNF{weighted_term}! ::=
+	!\lnkBNF{coefficient}!, !\lnkBNF{skip}!, !\lnkBNF{term}!
+
+!\defBNF{coefficient}! ::=
+	!\lnkBNF{signed_integer}!
+
+!\defBNF{term}! ::=
+	!\lnkBNF{literal}!
+\end{lstlisting}
+The empty objective should be expressed as \verb!0! .
+
+~\\
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct objectives.}]
+	+1 aa -2 bb
+	+1 aa -2 ~bb +3
+	+3
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect objectives.}]
+	+3 +1 aa -2 bb % Constant not at end.
+	+1 aa +3 -2 bb % Constant not at end.
+	-4 aa bb % Non-linear not allowed.
+	\end{lstlisting}
+\end{minipage}
+\\
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct constraints.}]
+	+1 aa -2 bb >= 4
+	aa bb ==> +1 cc -2 ~dd <= -3
+	bb <== +1 cc -2 ~dd <= -3
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect constraints.}]
+	+1 aa -2 bb > 4 % Strict op. not allowed.
+	+1 aa -2 ~bb = -3 % Equal not allowed.
+	aa bb <== +1 cc -2 ~dd <= -3 % Not 1 variable.
+	\end{lstlisting}
+\end{minipage}
+
+A constraint written with a \texttt{\lnkBNF{reification}} is syntactic sugar for a single pseudo-Boolean constraint. The constraint is normalized first, so the degree that is used for the reification is the one after terms have been cancelled. For a right implication the negation of every literal is added to the constraint with the degree as coefficient, e.g., \lstinline[language=veripb]!z1 z2 ==> +1 x1 +2 x2 >= 2! stands for \lstinline[language=veripb]!2 ~z1 2 ~z2 1 x1 2 x2 >= 2!. For a left implication the constraint is negated, and the literal is added to the constraint with the degree of the negation as coefficient, e.g., \lstinline[language=veripb]!z1 <== +1 x1 +2 x2 >= 2! stands for \lstinline[language=veripb]!2 z1 1 ~x1 2 ~x2 >= 2!.
+
+An implication whose truth does not depend on its literals is written without them. If the constraint of a right implication is trivially satisfied, i.e., its degree is non-positive after normalization, then it is implied by anything, e.g., \lstinline[language=veripb]!z1 z2 ==> +1 x1 >= -1! stands for \lstinline[language=veripb]!+1 x1 >= -1!. If the constraint of a left implication is contradicting, i.e., its degree is larger than the sum of its coefficients after normalization, then it implies anything, e.g., \lstinline[language=veripb]!z1 <== +1 x1 >= 5! stands for \lstinline[language=veripb]!+1 ~x1 >= -3!.
+
+
+\subsection{Constraint IDs and Labels}\label{sec:constraint-ids}
+\begin{lstlisting}
+!\defBNF{constraint_id}! ::=
+	!\lnkBNF{label}! | !\lnkBNF{non_zero_integer}!
+
+!\defBNF{label}! ::=
+	"@", !\lnkBNF{identifier_symbol}!, {!\lnkBNF{identifier_symbol}!}
+
+!\defBNF{constraint_ids}! ::=
+	!\lnkBNF{constraint_id}!, {!\lnkBNF{skip}!, !\lnkBNF{constraint_id}!}
+\end{lstlisting}
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct constraint IDs.}]
+	8 42 -1 -88 @label @another
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect constraint IDs.}]
+	0 @label+2 @label-2
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Solutions}\label{sec:solutions}
+\begin{lstlisting}
+!\defBNF{solution}! ::=
+	[!\lnkBNF{literals}!]
+\end{lstlisting}
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct solution.}]
+	x1 ~x2 x3
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect solution.}]
+	x1, x2, x3 % No commas allowed.
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Substitutions (Witnesses)}\label{sec:substitutions}
+\begin{lstlisting}
+!\defBNF{substitution}! ::=
+	!\lnkBNF{assignment}!, {!\lnkBNF{skip}!, !\lnkBNF{assignment}!}
+
+!\defBNF{assignment}! ::=
+	(!\lnkBNF{variable}! | !\lnkBNF{aux_variable}!), !\lnkBNF{skip}!, ["->", !\lnkBNF{skip}!], ("0" | "1" | !\lnkBNF{literal}!)
+\end{lstlisting}
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct substitutions.}]
+	aa bb
+	aa bb bb 0 cc 1
+	aa -> bb bb -> 0 cc -> 1
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect substitutions.}]
+	aa bb cc % Odd number of variables.
+	1 -> aa % Assignment of constant.
+	aa -> bb, bb -> 0, cc -> 1 % No commas allowed.
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsection{Subproofs and Proof Goals}\label{sec:subproofs}
+\begin{lstlisting}
+!\defBNF{subproof}! ::=
+	"subproof", !\lnkBNF{skip}!,
+		[!\lnkBNF{subproof_lines}!], [!\lnkBNF{skip}!],
+	"qed"
+
+!\defBNF{proofgoal}! ::=
+	"proofgoal", !\lnkBNF{skip}!, !\lnkBNF{proofgoal_id}!, !\lnkBNF{skip}!,
+		[!\lnkBNF{proofgoal_lines}!], [!\lnkBNF{skip}!],
+	"qed", [!\lnkBNF{skip}!, !\lnkBNF{proofgoal_id}!], [!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!], !\lnkBNF{semicolon}!
+
+!\defBNF{proofgoal_id}! ::=
+	"#", !\lnkBNF{positive_integer}! | !\lnkBNF{constraint_id}!
+
+!\defBNF{semicolon}! ::=
+	[!\lnkBNF{skip}!], ";"
+
+!\defBNF{colon}! ::=
+	[!\lnkBNF{skip}!], ":", [!\lnkBNF{skip}!]
+
+!\defBNF{witness_subproof_arguments}! ::=
+	!\lnkBNF{witness_argument}!, [!\lnkBNF{subproof_argument}!]
+
+!\defBNF{witness_argument}! ::=
+	!\lnkBNF{colon}!, [!\lnkBNF{substitution}!]
+
+!\defBNF{subproof_argument}! ::=
+	!\lnkBNF{colon}!, !\lnkBNF{subproof}!, [!\lnkBNF{skip}!, !\lnkBNF{rule_name}!], [!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!]
+
+!\defBNF{rule_name}! ::=
+	"del" | "delc" | "pbc" | "red" | "dom" | "obju" | "preserved_add" | "preserved_rm"
+\end{lstlisting}
+If the second/optional \texttt{\lnkBNF{proofgoal_id}} is specified then it must match the first/mandatory \texttt{\lnkBNF{proofgoal_id}} (this is not feasible to write directly in the grammar). Similarly, specifying a \texttt{\lnkBNF{rule_name}} after a subproof must match the name of the rule where it is used (this could be written directly in the grammar by defining a subproof variant for each \texttt{\lnkBNF{rule_name}}).
+
+For examples of subproofs and proofgoals, please see
+\texttt{\lnkBNF{del_rule}}, \texttt{\lnkBNF{delc_rule}}, \texttt{\lnkBNF{pbc_rule}}, \texttt{\lnkBNF{red_rule}}, especially \texttt{\lnkBNF{dom_rule}} if you are using orders with auxiliary variables, \texttt{\lnkBNF{obju_rule}}, \texttt{\lnkBNF{preserved_add_rule}}, \texttt{\lnkBNF{preserved_rm_rule}} and \texttt{\lnkBNF{order_proof}}.
+
+
+\subsection{Proof File}\label{sec:proof-file}
+\begin{lstlisting}
+!\defBNF{pbp_file}! ::=
+	!\lnkBNF{proof}!, {!\lnkBNF{space}! | !\lnkBNF{eol}!}, ["\0"]
+\end{lstlisting}
+
+
+\subsection{Proof}\label{sec:proof}
+\begin{lstlisting}
+!\defBNF{proof}! ::=
+	!\lnkBNF{header}!, [!\lnkBNF{skip}!], [!\lnkBNF{proof_lines}!], [!\lnkBNF{skip}!], !\lnkBNF{footer}!
+\end{lstlisting}
+
+
+\subsection{Proof Header}\label{sec:header}
+\begin{lstlisting}
+!\defBNF{header}! ::=
+	"pseudo-Boolean proof version", !\lnkBNF{space}!, !\lnkBNF{version}!, [!\lnkBNF{space}!], !\lnkBNF{eol}!
+
+!\defBNF{version}! ::=
+	!\lnkBNF{unsigned_integer}!, ".", !\lnkBNF{unsigned_integer}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+pseudo-Boolean proof version 3.0
+\end{lstlisting}
+To be somewhat backwards compatible, the whitespace rules are more strict in \texttt{\lnkBNF{header}} than in most other places. In particular, no comments and newlines are allowed as whitespace before the mandatory newline at the end.
+
+
+\subsection{Proof Footer}\label{sec:footer}
+\begin{lstlisting}
+!\defBNF{footer}! ::=
+	!\lnkBNF{output}!, [!\lnkBNF{skip}!], !\lnkBNF{conclusion}!, [!\lnkBNF{skip}!], !\lnkBNF{end}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;
+\end{lstlisting}
+
+
+\subsubsection{Output Section}\label{sec:footer-output}
+\begin{lstlisting}
+!\defBNF{output}! ::=
+	"output", !\lnkBNF{skip}!, "NONE", !\lnkBNF{semicolon}! |
+	"output", !\lnkBNF{skip}!, !\lnkBNF{output_guarantee}!, !\lnkBNF{skip}!, !\lnkBNF{output_type}!, !\lnkBNF{semicolon}!
+
+!\defBNF{output_guarantee}! ::=
+	"DERIVABLE" |
+	"EQUISATISFIABLE" |
+	"EQUIOPTIMAL" |
+	"EQUIENUMERABLE"
+
+!\defBNF{output_type}! ::=
+	"FILE", |
+	"IMPLICIT" |
+	"PERMUTATION", [!\lnkBNF{skip}!, !\lnkBNF{constraint_ids}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+output DERIVABLE FILE;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+output EQUIOPTIMAL PERMUTATION -1 2 1; % 3 constraints outputted in reverse order.
+\end{lstlisting}
+
+
+\subsubsection{Conclusion Section}\label{sec:footer-conclusion}
+\begin{lstlisting}
+!\defBNF{conclusion}! ::=
+	"conclusion", !\lnkBNF{skip}!, !\lnkBNF{conclusion_type}!, !\lnkBNF{semicolon}!
+
+!\defBNF{conclusion_type}! ::=
+	"NONE" |
+	"SAT", [!\lnkBNF{conclusion_solution}!] |
+	"UNSAT", [!\lnkBNF{conclusion_contradiction}!] |
+	"BOUNDS", !\lnkBNF{skip}!,
+		!\lnkBNF{lower_bound}!, [!\lnkBNF{conclusion_contradiction}!] !\lnkBNF{skip}!,
+		!\lnkBNF{upper_bound}!, [!\lnkBNF{conclusion_solution}!] |
+	"ENUMERATION_PARTIAL", !\lnkBNF{enumeration_count}! |
+	"ENUMERATION_COMPLETE", !\lnkBNF{enumeration_count}!, [!\lnkBNF{conclusion_contradiction}!]
+
+!\defBNF{lower_bound}! ::=
+	!\lnkBNF{signed_integer}! | "INF"
+
+!\defBNF{upper_bound}! ::=
+	!\lnkBNF{signed_integer}! | "INF"
+
+!\defBNF{enumeration_count}! ::=
+    !\lnkBNF{unsigned_integer}!
+
+!\defBNF{conclusion_solution}! ::=
+	!\lnkBNF{colon}!, !\lnkBNF{solution}!
+
+!\defBNF{conclusion_contradiction}! ::=
+	!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion SAT : x1 ~x2 x3;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion UNSAT : -1;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion BOUNDS INF INF;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion BOUNDS 10 : @contradiction 20 : x1 ~x2 x3;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion ENUMERATION_PARTIAL 42;
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+conclusion ENUMERATION_COMPLETE 42 : -1;
+\end{lstlisting}
+
+
+\subsubsection{End Section}\label{sec:footer-end}
+\begin{lstlisting}
+!\defBNF{end}! ::=
+	"end pseudo-Boolean proof", !\lnkBNF{semicolon}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+end pseudo-Boolean proof;
+\end{lstlisting}
+
+
+\subsection{Rules}\label{sec:rules}
+Note that the definition of \texttt{\lnkBNF{proof_line}}, \texttt{\lnkBNF{rule}}, and more have been split into multiple definitions to already at the syntactic level define where rules can be used.
+\begin{lstlisting}
+!\defBNF{proof_line}! ::=
+	!\lnkBNF{top_rule}!, !\lnkBNF{semicolon}! |
+	!\lnkBNF{label}!, !\lnkBNF{skip}!, !\lnkBNF{top_output_rule}!, !\lnkBNF{semicolon}!
+
+!\defBNF{proof_lines}! ::=
+	!\lnkBNF{proof_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{proof_line}!}
+
+!\defBNF{subproof_line}! ::=
+	!\lnkBNF{scope}! | !\lnkBNF{scope_line}!
+
+!\defBNF{subproof_lines}! ::=
+	!\lnkBNF{subproof_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{subproof_line}!}
+
+!\defBNF{scope_line}! ::=
+	!\lnkBNF{proofgoal}! | !\lnkBNF{proofgoal_line}!
+
+!\defBNF{scope_lines}! ::=
+	!\lnkBNF{scope_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{scope_line}!}
+
+!\defBNF{proofgoal_line}! ::=
+	!\lnkBNF{rule}!, !\lnkBNF{semicolon}! |
+	!\lnkBNF{label}!, !\lnkBNF{skip}!, !\lnkBNF{output_rule}!, !\lnkBNF{semicolon}!
+
+!\defBNF{proofgoal_lines}! ::=
+	!\lnkBNF{proofgoal_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{proofgoal_line}!}
+
+!\defBNF{specification_line}! ::=
+	!\lnkBNF{specification_rule}!, !\lnkBNF{semicolon}! |
+	!\lnkBNF{label}!, !\lnkBNF{skip}!, !\lnkBNF{specification_output_rule}!, !\lnkBNF{semicolon}!
+
+!\defBNF{specification_lines}! ::=
+	!\lnkBNF{specification_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{specification_line}!}
+
+!\defBNF{top_rule}! ::=
+	!\lnkBNF{top_output_rule}! |
+	!\lnkBNF{rule}! |
+	!\lnkBNF{del_rule}! |           % Delete constraint(s).
+	!\lnkBNF{delc_rule}! |          % Delete constraint(s) from the core set.
+	!\lnkBNF{deld_rule}! |          % Delete constraint(s) from the derived set.
+	!\lnkBNF{obju_rule}! |          % Update (rewrite) objective.
+	!\lnkBNF{load_order_rule}! |    % Load defined order.
+	!\lnkBNF{core_rule}! |          % Move constraint(s) from derived set to core set.
+	!\lnkBNF{setlvl_rule}! |        % Set the current level (for easier deletion).
+	!\lnkBNF{wiplvl_rule}! |        % Delete constraints marked with at least the level.
+	!\lnkBNF{str_to_core_rule}! |   % Toggle strengthening to core mode.
+	!\lnkBNF{sol_rule}! |           % Log solution.
+	!\lnkBNF{def_order_rule}! |     % Defines a pre-order.
+	!\lnkBNF{preserved_add_rule}! | % Add variable to preserved set.
+	!\lnkBNF{preserved_rm_rule}!    % Remove variable from preserved set.
+
+!\defBNF{top_output_rule}! ::=
+	!\lnkBNF{specification_output_rule}! |
+	!\lnkBNF{dom_rule}! |         % Add constraint by dominance-based strengthening.
+	!\lnkBNF{soli_rule}! |        % Log solution and add objective-improving constraint.
+	!\lnkBNF{obji_rule}! |        % Log objective value and add objective-improving constraint.
+	!\lnkBNF{solx_rule}!          % Log solution and add solution-excluding constraint.
+
+!\defBNF{specification_rule}! ::=
+	!\lnkBNF{specification_output_rule}! |
+	!\lnkBNF{rule}!
+
+!\defBNF{specification_output_rule}! ::=
+	!\lnkBNF{output_rule}! |
+	!\lnkBNF{red_rule}!           % Add constraint by redundance based strengthening.
+
+!\defBNF{rule}! ::=
+	!\lnkBNF{output_rule}! |
+	!\lnkBNF{f_rule}! |           % Check input formula size.
+	!\lnkBNF{eobj_rule}! |        % Check if objective is equal.
+	!\lnkBNF{eord_def_rule}! |    % Check if the order is equal.
+	!\lnkBNF{eord_loaded_rule}! | % Check if the loaded order is equal.
+	!\lnkBNF{epreserved_rule}! |  % Check if the preserved set is equal.
+	!\lnkBNF{start_time_rule}! |  % Start a timer.
+	!\lnkBNF{end_time_rule}! |    % Stop a timer.
+	!\lnkBNF{is_deleted_rule}! |  % Check if constraint is deleted.
+	!\lnkBNF{fail_rule}!          % Fails the proof.
+
+!\defBNF{output_rule}! ::=
+	!\lnkBNF{pol_rule}! |         % Add constraint by cutting planes derivation.
+	!\lnkBNF{rup_rule}! |         % Add constraint by reverse unit propagation.
+	!\lnkBNF{pbc_rule}! |         % Add constraint by proof by contradiction.
+	!\lnkBNF{e_rule}! |           % Check if constraint is equal (exists).
+	!\lnkBNF{i_rule}! |           % Check if constraint is implied.
+	!\lnkBNF{ia_rule}! |          % Check if constraint is implied and add it.
+	!\lnkBNF{a_rule}!             % Add constraint as unchecked assertion.
+\end{lstlisting}
+Output rules (\texttt{\lnkBNF{top_output_rule}}, \texttt{\lnkBNF{specification_output_rule}} and \texttt{\lnkBNF{output_rule}}) may optionally be prefixed with a label to assign the label to the ID of the returned constraint. All rules must end with a semicolon (\verb!;!).
+\\~\\
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-valid-text}, caption={Syntactically correct labelled rules.}]
+	@label pol 42;
+	@label rup 1 x1 >= 1;
+	\end{lstlisting}
+\end{minipage}\hfill%
+\begin{minipage}{.49\linewidth}
+	\begin{lstlisting}[language=veripb, gobble=4, rulecolor=\color{veripb-invalid-text}, caption={Syntactically incorrect labelled rules.}]
+	@label core 42;            % Not output rule.
+	@label del !\color{veripb-rule}spec! 1 x1 >= 1; % Not output rule.
+	\end{lstlisting}
+\end{minipage}
+
+
+\subsubsection{\texttt{pol}: Reverse Polish Notation}\label{sec:rules-pol}
+\begin{lstlisting}
+!\defBNF{pol_rule}! ::=
+	"pol", !\lnkBNF{skip}!, !\lnkBNF{pol_constraint}!
+
+!\defBNF{pol_constraint}! ::=
+	!\lnkBNF{constraint_id}! |
+	!\lnkBNF{literal}! |
+	!\lnkBNF{pol_constraint}!, !\lnkBNF{skip}!, !\lnkBNF{pol_constraint}!, !\lnkBNF{skip}!, "+" |
+	!\lnkBNF{pol_constraint}!, !\lnkBNF{skip}!, !\lnkBNF{positive_integer}!, !\lnkBNF{skip}!, ("*" | "-" | "c" | "d" | "m" | "n") |
+	!\lnkBNF{pol_constraint}!, !\lnkBNF{skip}!, "s" |
+	!\lnkBNF{pol_constraint}!, !\lnkBNF{skip}!, (!\lnkBNF{variable}! | !\lnkBNF{aux_variable}!), !\lnkBNF{skip}!, "w"
+\end{lstlisting}
+Parsing note: \texttt{\lnkBNF{pol_constraint}} cannot be written as a LL1 grammar so it might be easier to parse an arbitrary sequence of allowed terminals and use a stack (initially empty) to check that the sequence ends with exactly one element on the stack.
+\begin{lstlisting}[language=veripb]
+pol 12 x2 +;           % Add constraint 12 and the literal axiom `x2 >= 0'.
+pol 12 2 *;            % Multiply constraint 12 by 2.
+pol 12 3 -;            % Reduce the right hand side of constraint 12 by 3.
+pol 12 4 c;            % Divide constraint 12 in variable normal form by 4.
+pol 12 5 d;            % Divide constraint 12 in literal normal form by 5.
+pol 12 6 m;            % Apply MIR with divisor 6 to constraint 12 in variable normal form.
+pol 12 7 n;            % Apply MIR with divisor 7 to constraint 12 in literal normal form.
+pol 12 s;              % Saturate constraint 12 (in literal normal form).
+pol 12 x2 w;           % Weaken away `x2' (or `\wave x2') from constraint 12.
+
+@c4 pol 1 3 * 2 4 * +; % Add constraint 1 multiplied by 3 to constraint 2 multiplied by 4.
+\end{lstlisting}
+Derives
+
+\subsubsection{\texttt{rup}: Reverse Unit Propagation}\label{sec:rules-rup}
+\begin{lstlisting}
+!\defBNF{rup_rule}! ::=
+	"rup", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{colon}!, [!\lnkBNF{rup_constraint_ids}!]]
+
+!\defBNF{rup_constraint_ids}! ::=
+	!\lnkBNF{rup_constraint_id}!, {!\lnkBNF{skip}!, !\lnkBNF{rup_constraint_id}!}
+
+!\defBNF{rup_constraint_id}! ::=
+	"~" | !\lnkBNF{constraint_id}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+@label rup +1 x1 -1 x2 >= 1;       % Propagate on all constraints.
+
+rup +1 x1 +1 x2 >= 2 : 1 @label ~; % Only propagate on the listed constraints.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{del}: Delete Constraint(s)}\label{sec:rules-del}
+\begin{lstlisting}
+!\defBNF{del_rule}! ::=
+	"del", !\lnkBNF{skip}!, !\lnkBNF{delete_types}!, [!\lnkBNF{witness_subproof_arguments}!]
+
+!\defBNF{delete_types}! ::=
+	"id", [!\lnkBNF{skip}!, !\lnkBNF{constraint_ids}!] |
+	"spec", !\lnkBNF{skip}!, !\lnkBNF{constraint}! |
+	"range", !\lnkBNF{skip}!, !\lnkBNF{constraint_id}!, !\lnkBNF{skip}!, !\lnkBNF{constraint_id}!
+\end{lstlisting}
+It is only allowed to specify a witness and a subproof if exactly one non-deleted constraint is matched by the given ID(s), that also all must be valid. This is enforced at the semantic level.
+\begin{lstlisting}[language=veripb]
+del id 2;                  % Deletes constraint 2.
+
+del id 2 3;                % Only deletes constraint 3 since constraint 2 is already deleted.
+
+del !\color{veripb-rule}spec! +1 x1 >= 1;       % Deletes by specifiction.
+
+del range 1 3 : : subproof % Only deletes constraint 1, so a subproof is allowed.
+	proofgoal #1
+		pol 3 s x2 + -1 +;
+	qed #1 : -1;           % It is allowed to omit `\#1' as well as the hint `: -1'.
+qed del;                   % It is allowed to omit `del'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{delc}: Delete Core Constraint(s)}\label{sec:rules-delc}
+\begin{lstlisting}
+!\defBNF{delc_rule}! ::=
+	"delc", [!\lnkBNF{skip}!, !\lnkBNF{constraint_ids}!], [!\lnkBNF{witness_subproof_arguments}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+delc 2 3;                   % Subproof not allowed for multiple constraints.
+
+delc 1 : x1 -> 1 : subproof % Subproof allowed for single constraint. Has a witness.
+	proofgoal #1
+		pol 3 s x2 + -1 +;
+	qed;                    % It is allowed to add `\#1' as well as a hint like `:-1'.
+qed;                        % It is allowed to add `delc' (a hint does not make sense here).
+\end{lstlisting}
+
+
+\subsubsection{\texttt{deld}: Delete Derived Constraint(s)}\label{sec:rules-deld}
+\begin{lstlisting}
+!\defBNF{deld_rule}! ::=
+	"deld", [!\lnkBNF{skip}!, !\lnkBNF{constraint_ids}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+deld 42 -1 @label3;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{pbc}: Proof by Contraction}\label{sec:pbc}
+\begin{lstlisting}
+!\defBNF{pbc_rule}! ::=
+	"pbc", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{subproof_argument}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+@l1 pbc +1 x1 +2 ~x2 <= 3;       % No subproof.
+
+pbc +1 x1 +2 ~x2 <= 3 : subproof % Explicit subproof.
+	rup >= 1 : ~;
+qed pbc;                         % It is allowed to add a hint i.e. `: -1'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{red}: Redundance-Based Strengthening}\label{sec:rules-red}
+\begin{lstlisting}
+!\defBNF{red_rule}! ::=
+	"red", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, !\lnkBNF{witness_subproof_arguments}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+@l2 red 1 x1 1 ~x2 1 ~x3 >= 1 : x1 -> 1;     % With label and witness.
+
+red 1 x1 >= 1 : x1 -> x3 x3 -> x5 : subproof % Also with witness and subproof.
+	@con pbc +1 x1 +1 x2 >= 1 : subproof     % Nested proof by contradiction.
+		pol -1 5 +;
+	qed pbc;                                 % You also could write `qed;' or `qed pbc : -1;'.
+
+	proofgoal #1
+		pol -1 -5 + 5 + 6 +;
+		pol -1 4 +;
+		pol -1 x6 +;
+	qed : -1;                                % You also could write `qed;' or `qed \#1 : -1;'.
+
+	proofgoal 1
+		pol -1 2 +;
+	qed : -1;                                % You also could write `qed;' or `qed 1 : -1;'.
+qed red;                                     % You also could just write `qed;'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{dom}: Dominance-Based Strengthening}\label{sec:rules-dom}
+\begin{lstlisting}
+!\defBNF{dom_rule}! ::=
+	"dom", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, !\lnkBNF{witness_subproof_arguments}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+dom 1 ~x1 1 x2 >= 1 : x1 x2 x2 x1;           % With label and witness.
+
+dom 1 ~x1 1 x2 >= 1 : x1 x2 x2 x1 : subproof % Also with witness and subproof.
+	proofgoal #1
+		@qed pol 14 15 +;
+	qed #1 : @qed;                           % `\#1' and `: @qed' can be omitted.
+	scope geq
+		proofgoal #2
+			pol 14 15 +;
+		qed;                                 % `\#2' and a hint can be added.
+	end scope;                               % `scope' can be omitted.
+qed dom;                                     % `dom' can be omitted.
+
+dom 1 x1 1 x2 >= 1 : x1 x2 x2 x1 : subproof % Large example.
+	@random pol -1;
+	proofgoal 1
+		@qed pol 14 15 +;
+	qed 1 : @qed;
+	pol @random;
+	scope leq
+		proofgoal #1
+			pol 14 15 +;
+		qed;
+	end scope;
+	pol @random;
+	scope geq
+		pol @random;
+		proofgoal #2
+			pol 14 15 +;
+		qed;
+		pol @random;
+	end scope;
+	pol @random;
+	proofgoal #3
+		@qed pol 14 15 +;
+	qed #3 : @qed;
+	pol @random;
+qed dom;
+
+\end{lstlisting}
+
+
+\subsubsection{\texttt{scope}: Subproof Scope}\label{sec:rules-scope}
+\begin{lstlisting}
+!\defBNF{scope}! ::=
+	"scope", !\lnkBNF{skip}!, ("geq" | "leq"), !\lnkBNF{skip}!,
+		[!\lnkBNF{scope_lines}!], [!\lnkBNF{skip}!],
+	"end", [!\lnkBNF{skip}!, "scope"], !\lnkBNF{semicolon}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+scope geq
+	proofgoal #2
+		pol 14 15 +;
+	qed;             % `\#2' and a hint can be added.
+end scope;           % `scope' can be omitted.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{def\_order}: Pre-order Definition}\label{sec:rules-def-order}
+\begin{lstlisting}
+!\defBNF{def_order_rule}! ::=
+	"def_order", !\lnkBNF{skip}!, !\lnkBNF{name}!, !\lnkBNF{skip}!,
+		!\lnkBNF{order_vars}!, [!\lnkBNF{skip}!],
+		[!\lnkBNF{order_specification}!], [!\lnkBNF{skip}!]
+		!\lnkBNF{order_definition}!, [!\lnkBNF{skip}!],
+		[!\lnkBNF{order_transitivity}!], [!\lnkBNF{skip}!]
+		[!\lnkBNF{order_reflexivity}!], [!\lnkBNF{skip}!]
+	"end", [!\lnkBNF{skip}!, "def_order"]
+
+!\defBNF{order_vars}! ::=
+	"vars", !\lnkBNF{skip}!,
+		"left", [!\lnkBNF{skip}!, !\lnkBNF{variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!],
+		"right", [!\lnkBNF{skip}!, !\lnkBNF{variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!],
+		["aux", [!\lnkBNF{skip}!, !\lnkBNF{aux_variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!]],
+	"end", [!\lnkBNF{skip}!, "vars"], !\lnkBNF{semicolon}!
+
+!\defBNF{order_specification}! ::=
+	"spec", !\lnkBNF{skip}!,
+		[!\lnkBNF{specification_lines}!], [!\lnkBNF{skip}!],
+	"end", [!\lnkBNF{skip}!, "spec"], !\lnkBNF{semicolon}!
+
+!\defBNF{order_definition}! ::=
+	"def", !\lnkBNF{skip}!,
+		[!\lnkBNF{constraint_lines}!], [!\lnkBNF{skip}!]
+	"end", [!\lnkBNF{skip}!, "def"], !\lnkBNF{semicolon}!
+
+!\defBNF{constraint_lines}! ::=
+	!\lnkBNF{constraint_line}!, {[!\lnkBNF{skip}!], !\lnkBNF{constraint_line}!}
+
+!\defBNF{constraint_line}! ::=
+	!\lnkBNF{constraint}!, !\lnkBNF{semicolon}!
+
+!\defBNF{order_transitivity}! ::=
+	"transitivity", !\lnkBNF{skip}!,
+		!\lnkBNF{order_transitivity_vars}!, [!\lnkBNF{skip}!],
+		!\lnkBNF{order_proof}!, [!\lnkBNF{skip}!],
+	"end", [!\lnkBNF{skip}!, "transitivity"], !\lnkBNF{semicolon}!
+
+!\defBNF{order_transitivity_vars}! ::=
+	"vars", !\lnkBNF{skip}!,
+		"fresh_right", [!\lnkBNF{skip}!, !\lnkBNF{variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!]
+		[
+		"fresh_aux_1", [!\lnkBNF{skip}!, !\lnkBNF{aux_variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!]
+		"fresh_aux_2", [!\lnkBNF{skip}!, !\lnkBNF{aux_variables}!], !\lnkBNF{semicolon}!, [!\lnkBNF{skip}!]
+		]
+	"end", [!\lnkBNF{skip}!, "vars"], !\lnkBNF{semicolon}!
+
+!\defBNF{order_reflexivity}! ::=
+	"reflexivity", !\lnkBNF{skip}!,
+		!\lnkBNF{order_proof}!, [!\lnkBNF{skip}!],
+	"end", [!\lnkBNF{skip}!, "reflexivity"], !\lnkBNF{semicolon}!
+
+!\defBNF{order_proof}! ::=
+	"proof", !\lnkBNF{skip}!,
+		[!\lnkBNF{subproof_lines}!], [!\lnkBNF{skip}!],
+	"qed", [!\lnkBNF{skip}!, "proof"], !\lnkBNF{semicolon}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+def_order lex3 % Defines lexicographical order (u1, u2, u3) <= (v1, v2, v3).
+	vars                % Variables used in the order.
+		left u1 u2 u3;  % Must contain the same number of variables as in `right'.
+		right v1 v2 v3; % Must contain the same number of variables as in `left'.
+	end vars;           % `end vars' could just be `end'.
+
+	def % Constraint(s) defining the order.
+		-1 u1 +1 v1 -2 u2 +2 v2 -4 u3 +4 v3 >= 0;
+	end def; % `end def' could be `def'.
+
+	transitivity                  % Proof of transitivity (must come before reflexivity).
+		vars                      % Fresh variables used in proof.
+			fresh_right w1 w2 w3; % Must contain the same number of variables as in `right'.
+		end vars;                 % `end vars' could just be `end'.
+
+		proof
+			proofgoal #1     % -1 u1 +1 v1 -2 u2 +2 v2 -4 u3 +4 v3 >= 0;
+				pol 1 2 + 3 +;
+			qed #1 : -1;     % `\#1' and `: -1' are optional.
+		qed proof;           % `proof' is optional.
+	end transitivity;        % `end transitivity' could just be `end'.
+
+	reflexivity         % Proof of reflexivity (could be omitted in this case).
+		proof
+			rup >= 1;
+		qed proof;      % `proof' is optional.
+	end reflexivity;    % `end reflexivity' could just be `end'.
+end def_order; % `end def\_order' could just be `end'.
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+def_order lex3_aux % Defines lexicographical order (u1, u2, u3) <= (v1, v2, v3).
+	vars                % Variables used in the order.
+		left u1 u2 u3;  % Must contain the same number of variables as in `right'.
+		right v1 v2 v3; % Must contain the same number of variables as in `left'.
+		aux $a1 $a2;    % Auxiliary variables.
+	end vars;           % `end vars' could just be `end'.
+
+	spec % Order specification.
+		% \$a1 <=> +1 u1 +1 \wave v1 >= 1;
+		red $a1 ==> +1 u1 +1 ~v1 >= 1 : $a1 -> 0;
+		red $a1 <== +1 u1 +1 ~v1 >= 1 : $a1 -> 1;
+		% \$a2 <=> +2 \$a1 +1 u2 +1 \wave v2 >= 2;
+		red $a2 ==> +2 $a1 +1 u2 +1 ~v2 >= 2 : $a2 -> 0;
+		red $a2 <== +2 $a1 +1 u2 +1 ~v2 >= 2 : $a2 -> 1;
+	end spec; % `end spec' could just be `end'.
+
+	def % Constraint(s) defining the order.
+		+1 ~u1 +1 v1 >= 1;
+		+1 ~$a1 +1 ~u2 +1 v2 >= 1;
+		+1 ~$a2 +1 ~u3 +1 v3 >= 1;
+	end def; % `end def' could just be `end'.
+
+	transitivity                  % Proof of transitivity (must come before reflexivity).
+		vars                      % Fresh variables used in proof.
+			fresh_right w1 w2 w3; % Must contain the same number of variables as in `right'.
+			fresh_aux_1 $b1 $b2;  % Must contain the same number of variables as in `aux'.
+			fresh_aux_2 $c1 $c2;  % Must contain the same number of variables as in `aux'.
+		end vars;                 % `vars' is optional.
+
+		proof
+			proofgoal #1         % +1 \wave u1 +1 w1 >= 1;
+				pol -1 5 12 + +;
+			qed #1 : -1;         % `\#1' and `: -1' are optional.
+
+			proofgoal #2         % +1 \wave \$c1 +1 \wave u2 +1 w2 >= 1;
+				a >= 1;          % non-trivial pol-statement.
+			qed #2 : -1;         % `\#2' and `: -1' are optional.
+
+			proofgoal #3         % +1 \wave \$c2 +1 \wave u3 +1 w3 >= 1;
+				a >= 1;          % non-trivial pol-statement.
+			qed #3 : -1;         % `\#3' and `: -1' are optional.
+		qed proof;               % `qed proof' could just be `qed'.
+	end transitivity;            % `end transitivity' could just be `end'.
+
+	reflexivity          % Proof of reflexivity (could be omitted in this case).
+		proof
+			proofgoal #1 % +1 \wave u1 +1 u1 >= 1;
+			qed #1 : -1; % `\#1' and `: -1' are optional.
+
+			proofgoal #2 % +1 \wave \$a1 +1 \wave u2 +1 u2 >= 1;
+			qed #2 : -1; % `\#2' and `: -1' are optional.
+
+			proofgoal #3 % +1 \wave \$a2 +1 \wave u3 +1 u3 >= 1;
+			qed #3 : -1; % `\#3' and `: -1' are optional.
+		qed proof;       % `qed proof' could just be `qed'.
+	end reflexivity;     % `end reflexivity' could just be `end'.
+end def_order; % `end def\_order' could just be `end'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{load\_order}: Load Order}\label{sec:rules-load-order}
+\begin{lstlisting}
+!\defBNF{load_order_rule}! ::=
+	"load_order", [!\lnkBNF{skip}!, !\lnkBNF{name}!, [!\lnkBNF{skip}!, !\lnkBNF{literals}!]]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+load_order lex3 x1 x2 ~x3; % Loads the order named `lex3' (and unloads any current order).
+
+load_order;                % Unloads the current order.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{core}: Move Constraint(s) to Core}\label{sec:rules-core}
+\begin{lstlisting}
+!\defBNF{core_rule}! ::=
+	"core", !\lnkBNF{skip}!, !\lnkBNF{core_types}!
+
+!\defBNF{core_types}! ::=
+	"id", [!\lnkBNF{skip}!, !\lnkBNF{constraint_ids}!] |
+	"range", !\lnkBNF{skip}!, !\lnkBNF{constraint_id}!, !\lnkBNF{skip}!, !\lnkBNF{constraint_id}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+core id 1 5 @label; % Move constraints 1, 5 and the one with label `@label' to core.
+
+core range 6 10;    % Move all constraints (not already in the core) in the range.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{obju}: Objective Update}\label{sec:rules-obju}
+\begin{lstlisting}
+!\defBNF{obju_rule}! ::=
+	"obju", !\lnkBNF{skip}!, ("new" | "diff"), !\lnkBNF{skip}!, !\lnkBNF{objective}!, [!\lnkBNF{subproof_argument}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+obju new +1 aa +2 bb -3 cc;         % Overwrites existing objective.
+
+obju diff +3 cc +1 bb +7;           % Updated existing objective by the given difference.
+
+obju diff +3 cc +1 bb +7 : subproof % With explicit subproof.
+    proofgoal #1                    % Proof of `f\_new >= f\_current'.
+        pol 18 16 +;
+    qed;                            % `qed' could be `qed \#1'.
+
+    proofgoal #2                    % Proof of `f\_current >= f\_new'.
+        pol 20 17 +;
+    qed;                            % `qed' could be `qed \#2'.
+qed obju;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{f}: (Input) Formula Size}\label{sec:rules-f}
+\begin{lstlisting}
+!\defBNF{f_rule}! ::=
+	"f", !\lnkBNF{skip}!, !\lnkBNF{unsigned_integer}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+f 12;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{e}: Equals}\label{sec:rules-e}
+\begin{lstlisting}
+!\defBNF{e_rule}! ::=
+	"e", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+e +1 x2 -4 x6 >= 0;        % Check that the constraint exists in the database.
+
+e +1 x2 -4 x6 >= 0 : 2;    % Check that the constraint with ID 2 equals the given constraint.
+
+@label e +1 x2 -4 x6 >= 0; % Assign the ID of the given constraint (if found) to `@label'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{eobj}: Equal Objective}\label{sec:rules-eobj}
+\begin{lstlisting}
+!\defBNF{eobj_rule}! ::=
+	"eobj", !\lnkBNF{skip}!, !\lnkBNF{objective}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+eobj +1 aa +2 bb -3 cc; % Check if the current objective is equal to the given one.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{eord\_def}: Equal Order}\label{sec:rules-eord-def}
+\begin{lstlisting}
+!\defBNF{eord_def_rule}! ::=
+	"eord_def", !\lnkBNF{skip}!, !\lnkBNF{name}!, !\lnkBNF{skip}!,
+		!\lnkBNF{order_vars}!, [!\lnkBNF{skip}!],
+		[!\lnkBNF{eord_def_specification}!], [!\lnkBNF{skip}!],
+		!\lnkBNF{order_definition}!, [!\lnkBNF{skip}!],
+	"end", [!\lnkBNF{skip}!, "eord_def"]
+
+!\defBNF{eord_def_specification}! ::=
+	"spec", !\lnkBNF{skip}!,
+		[!\lnkBNF{constraint_lines}!], [!\lnkBNF{skip}!]
+	"end", [!\lnkBNF{skip}!, "spec"], !\lnkBNF{semicolon}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+eord_def lex3_aux % Same as `lex3\_aux' defined in \autoref{sec:rules-def-order}.
+	vars                % Variables used in the order.
+		left u1 u2 u3;  % Must contain the same number of variables as in `right'.
+		right v1 v2 v3; % Must contain the same number of variables as in `left'.
+		aux $a1 $a2;    % Auxiliary variables.
+	end vars;           % `end vars' could just be `end'.
+
+	spec % Order specification.
+		% \$a1 <=> +1 u1 +1 \wave v1 >= 1;
+		$a1 ==> +1 u1 +1 ~v1 >= 1;
+		$a1 <== +1 u1 +1 ~v1 >= 1;
+		% \$a2 <=> +2 \$a1 +1 u2 +1 \wave v2 >= 2;
+		$a2 ==> +2 $a1 +1 u2 +1 ~v2 >= 2;
+		$a2 <== +2 $a1 +1 u2 +1 ~v2 >= 2;
+	end spec; % `end spec' could just be `end'.
+
+	def  % Constraint(s) defining the order.
+		+1 ~u1 +1 v1 >= 1;
+		+1 ~$a1 +1 ~u2 +1 v2 >= 1;
+		+1 ~$a2 +1 ~u3 +1 v3 >= 1;
+	end def; % `end def' could just be `end'.
+end eord_def; % `end eord\_def' could just be `end'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{eord\_loaded}: Equal Loaded Order}\label{sec:rules-eord-loaded}
+\begin{lstlisting}
+!\defBNF{eord_loaded_rule}! ::=
+	"eord_loaded", [!\lnkBNF{skip}!, !\lnkBNF{name}!, [!\lnkBNF{skip}!, !\lnkBNF{literals}!]]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+eord_loaded lex3 x1 x2 ~x3; % Check that the current order is `lex3' on x1, x2 and x3.
+
+eord_loaded;                % Check that no order is loaded.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{i}: Implies}\label{sec:rules-i}
+\begin{lstlisting}
+!\defBNF{i_rule}! ::=
+	"i", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+i +1 x2 -4 x6 >= 0;     % Check if syntactically implied by a constraint in the database.
+
+i +1 x2 -4 x6 >= 0 : 2; % Check that the constraint with ID 2 implies the given constraint.
+
+@label i +1 x2 -4 x6 >= 0; % Assign the ID of an implying constraint (if found) to `@label'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{ia}: Implies and Add}\label{sec:rules-ia}
+\begin{lstlisting}
+!\defBNF{ia_rule}! ::=
+	"ia", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{colon}!, !\lnkBNF{constraint_id}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+ia +1 x2 -4 x6 >= 0;            % Add if syntactically implied by a constraint in the database.
+
+@label ia +1 x2 -4 x6 >= 0 : 2; % Add the constraint if implied by constraint with ID 2.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{setlvl}: Set Level}\label{sec:rules-setlvl}
+\begin{lstlisting}
+!\defBNF{setlvl_rule}! ::=
+	"setlvl", !\lnkBNF{skip}!, !\lnkBNF{unsigned_integer}!
+\end{lstlisting}
+See next section for example.
+
+
+\subsubsection{\texttt{wiplvl}: Wipe Level}\label{sec:rules-wiplvl}
+\begin{lstlisting}
+!\defBNF{wiplvl_rule}! ::=
+	"wiplvl", !\lnkBNF{skip}!, !\lnkBNF{unsigned_integer}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+setlvl 1;           % Set current level to 1.
+@c1 rup +1 x1 >= 1; % Added to level 1.
+
+setlvl 3;           % Set current level to 3.
+@c2 rup +1 x2 >= 1; % Added to level 3.
+
+setlvl 2;           % Set current level to 2.
+@c3 rup +1 x3 >= 1; % Added to level 2.
+
+setlvl 1;           % Set current level to 1.
+@c4 rup +1 x4 >= 1; % Added to level 1.
+
+wiplvl 3;           % Deletes level 3 and above which is `@c2'.
+wiplvl 1;           % Deletes level 1 and above which is `@c1', `@c4' and `@c3'.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{strengthening\_to\_core}: Strengthening to Core Mode}\label{sec:rules-strengthening-to-core}
+\begin{lstlisting}
+!\defBNF{str_to_core_rule}! ::=
+	"strengthening_to_core", !\lnkBNF{skip}!, ("on" | "off")
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+strengthening_to_core on;
+% ...
+strengthening_to_core off;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{sol}: Log Solution}\label{sec:rules-sol}
+\begin{lstlisting}
+!\defBNF{sol_rule}! ::=
+	"sol", [!\lnkBNF{skip}!, !\lnkBNF{solution}!], [!\lnkBNF{colon}!, !\lnkBNF{coefficient}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+sol x1 x2 ~x3;      % Log solution.
+
+sol x1 x2 ~x3 : 77; % Specify an optional objective value at the end.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{soli}: Log Solution and Add Objective-Improving Constraint}\label{sec:rules-soli}
+\begin{lstlisting}
+!\defBNF{soli_rule}! ::=
+	"soli", [!\lnkBNF{skip}!, !\lnkBNF{solution}!, [!\lnkBNF{colon}!, !\lnkBNF{coefficient}!]]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+soli x1 x2 ~x3;            % Log solution and add solution improving constraint.
+
+@improving soli x1 x2 ~x3; % Supports having a label.
+
+soli x1 x2 ~x3 : 77;       % Specify an optional objective value at the end.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{obji}: Log Objective Value and Add Objective-Improving Constraint}\label{sec:rules-obji}
+\begin{lstlisting}
+!\defBNF{obji_rule}! ::=
+	"obji", !\lnkBNF{skip}!, !\lnkBNF{coefficient}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+obji 77;            % Log objective value and add solution improving constraint.
+
+@improving obji 77; % Supports having a label.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{solx}: Log Solution and Add Solution-Excluding Constraint}\label{sec:rules-solx}
+\begin{lstlisting}
+!\defBNF{solx_rule}! ::=
+	"solx", [!\lnkBNF{skip}!, !\lnkBNF{solution}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+solx x1 x2 ~x3;            % Log solution and add solution excluding constraint.
+
+@excluding solx x1 x2 ~x3; % Supports having a label.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{a}: Unchecked Assertion}\label{sec:rules-a}
+% \paragraph{- 3.0 (Stable)}~
+\begin{lstlisting}
+!\defBNF{a_rule}! ::=
+	"a", !\lnkBNF{skip}!, !\lnkBNF{constraint}!, [!\lnkBNF{assertion_annotations}!]
+
+!\defBNF{assertion_annotations}! ::=
+	!\lnkBNF{colon}!, [!\lnkBNF{constraint_ids}!], [!\lnkBNF{colon}!, [!\lnkBNF{name}!], [!\lnkBNF{colon}!, [!\lnkBNF{assertion_hints}!]]]
+
+!\defBNF{assertion_hints}! ::=
+	{{? any allowed symbol except "%", ";" and "\0" ?} | !\lnkBNF{comment}!}
+\end{lstlisting}
+Annotations are optional and intended to be read by external tools; they have no semantic meaning in the main proof format.
+\begin{lstlisting}[language=veripb]
+a +1 x10 >= 1;                       % Adds unchecked assertion (not sound).
+
+@contradiction a +1 x10 >= 1;        % Supports having a label.
+
+a +1 x10 >= 1 : @label 2 252;        % Antecedent constraint IDs.
+
+a +1 x10 >= 1 : @label 2 252         % Antecedent IDs and an assertion name.
+	: my_assertion;
+
+a +1 ~xge4 +1 yge5 >= 1              % Antecedent IDs, name, and free-text hints
+	: @label 2 252 : justify_lin_eq  %   for an external tool to parse.
+	: fzn_line_num = 5,
+	  justf_function = lin_eq;
+
+a +1 x10 >= 1 :::                    % Comments in the free-text hints are ignored
+	This assertion needs
+	some free text for some reason
+	% this is a comment explaining the assertion
+	% and it contains a semicolon; but that is not read by the parser
+	its very useful
+;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{start\_time}: Start Custom Timer}\label{sec:rules-start-time}
+\begin{lstlisting}
+!\defBNF{start_time_rule}! ::=
+	"start_time", !\lnkBNF{skip}!, !\lnkBNF{name}!
+\end{lstlisting}
+See next section for example.
+
+
+\subsubsection{\texttt{end\_time}: End Custom Timer}\label{sec:rules-end-time}
+\begin{lstlisting}
+!\defBNF{end_time_rule}! ::=
+	"end_time", !\lnkBNF{skip}!, !\lnkBNF{name}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+start_time timer1; % Start timer.
+
+rup +1 x2 >= 1;    % Do something.
+
+start_time timer2; % Start second timer.
+
+pol 1 2 +;         % Do something else.
+
+end_time timer2;   % Stop second timer.
+
+end_time timer1;   % Stop first timer.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{preserved\_add}: Add Variable to Preserved Set}\label{sec:rules-preserved-add}
+\begin{lstlisting}
+!\defBNF{preserved_add_rule}! ::=
+	"preserved_add", !\lnkBNF{skip}!, !\lnkBNF{variable}!, !\lnkBNF{colon}!, !\lnkBNF{constraint}!, [!\lnkBNF{subproof_argument}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+preserved_add x1 : 1 x2 2 x3 >= 1;           % Add x1 to preserved set with 1 x2 2 x3 >= 1.
+
+preserved_add x1 : 1 x2 2 x3 >= 1 : subproof % With explicit subproof.
+    proofgoal #1                             % Proof for x1 ==> 1 x2 2 x3 >= 1.
+        pol 18 16 +;
+    qed;                                     % `qed' could be `qed \#1'.
+    proofgoal #2                             % Proof for x1 <== 1 x2 2 x3 >= 1.
+        pol 20 17 +;
+    qed;                                     % `qed' could be `qed \#2'.
+qed preserved_add;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{preserved\_rm}: Remove Variable From Preserved Set}\label{sec:rules-preserved-rm}
+\begin{lstlisting}
+!\defBNF{preserved_rm_rule}! ::=
+	"preserved_rm", !\lnkBNF{skip}!, !\lnkBNF{variable}!, !\lnkBNF{colon}!, !\lnkBNF{constraint}!, [!\lnkBNF{subproof_argument}!]
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+preserved_rm x1 : 1 x2 2 x3 >= 1;           % Remove x1 from preserved set with 1 x2 2 x3 >= 1.
+
+preserved_rm x1 : 1 x2 2 x3 >= 1 : subproof % With explicit subproof.
+    proofgoal #1                            % Proof for x1 ==> 1 x2 2 x3 >= 1.
+        pol 18 16 +;
+    qed;                                    % `qed' could be `qed \#1'.
+    proofgoal #2                            % Proof for x1 <== 1 x2 2 x3 >= 1.
+        pol 20 17 +;
+    qed;                                    % `qed' could be `qed \#2'.
+qed preserved_rm;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{epreserved}: Equal Preserved Set}\label{sec:rules-epreserved}
+\begin{lstlisting}
+!\defBNF{epreserved_rule}! ::=
+	"epreserved", !\lnkBNF{skip}!, !\lnkBNF{variables}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+epreserved x1 x2 x3 x42 v[1]; % Current preserved set should equal \{x1, x2, x3, x42, v[1]\}.
+\end{lstlisting}
+
+
+\subsubsection{\texttt{is\_deleted}: Check If Constraint is Deleted}\label{sec:rules-is-deleted}
+\begin{lstlisting}
+!\defBNF{is_deleted_rule}! ::=
+	"is_deleted", !\lnkBNF{skip}!, !\lnkBNF{constraint}!
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+is_deleted +1 x2 +2 x3 >= 1;
+\end{lstlisting}
+
+
+\subsubsection{\texttt{fail}: Fail Proof}\label{sec:rules-fail}
+\begin{lstlisting}
+!\defBNF{fail_rule}! ::=
+	"fail"
+\end{lstlisting}
+\begin{lstlisting}[language=veripb]
+fail;
+\end{lstlisting}
+
+
+\section{XPB Grammar}\label{sec:grammar-opb}
+\begin{lstlisting}
+!\defBNF{xpb}! ::=
+	{!\lnkBNF{xpb_skip}!}, [!\lnkBNF{xpb_objective}!], {!\lnkBNF{xpb_skip}! | !\lnkBNF{xpb_constraint}!}
+\end{lstlisting}
+
+
+\subsection{Whitespace and Comments}
+\begin{lstlisting}
+!\defBNF{xpb_comment}! ::=
+	"*", {? any allowed symbol except "\n", "\r" and "\0" ?}, !\lnkBNF{eol}!
+
+!\defBNF{xpb_skip}! ::=
+	(!\lnkBNF{space}! | !\lnkBNF{eol}! | !\lnkBNF{xpb_comment}!), {!\lnkBNF{xpb_skip}!}
+\end{lstlisting}
+
+
+\subsection{Objectives and Constraints}
+\begin{lstlisting}
+!\defBNF{xpb_objective}! ::=
+	!\lnkBNF{xpb_objective_type}!, [!\lnkBNF{space}!], (!\lnkBNF{xpb_sum}!, [!\lnkBNF{space}!, !\lnkBNF{coefficient}!] | !\lnkBNF{coefficient}!), [!\lnkBNF{space}!], ";", [!\lnkBNF{space}!], !\lnkBNF{eol}!
+
+!\defBNF{xpb_objective_type}! ::=
+	("min" | "max"), [!\lnkBNF{space}!], ":"
+
+!\defBNF{xpb_sum}! ::=
+	!\lnkBNF{xpb_weighted_term}!, {!\lnkBNF{space}!, !\lnkBNF{xpb_weighted_term}!}
+
+!\defBNF{xpb_constraint}! ::=
+	[!\lnkBNF{xpb_labels}!, !\lnkBNF{space}!], (!\lnkBNF{xpb_inequality}! | !\lnkBNF{xpb_equality}!)
+
+!\defBNF{xpb_labels}! ::=
+	!\lnkBNF{label}!, {!\lnkBNF{space}!, !\lnkBNF{label}!}
+
+!\defBNF{xpb_inequality}! ::=
+	[!\lnkBNF{xpb_reification}!, [!\lnkBNF{space}!]], [!\lnkBNF{xpb_sum}!], [!\lnkBNF{space}!], !\lnkBNF{relational_operator}!, [!\lnkBNF{space}!], !\lnkBNF{coefficient}!, [!\lnkBNF{space}!], ";", [!\lnkBNF{space}!], !\lnkBNF{eol}!
+
+!\defBNF{xpb_equality}! ::=
+	[!\lnkBNF{xpb_right_implication}!, [!\lnkBNF{space}!]], [!\lnkBNF{xpb_sum}!], [!\lnkBNF{space}!], "=", [!\lnkBNF{space}!], !\lnkBNF{coefficient}!, [!\lnkBNF{space}!], ";", [!\lnkBNF{space}!], !\lnkBNF{eol}!
+
+!\defBNF{xpb_reification}! ::=
+	!\lnkBNF{xpb_right_implication}! | !\lnkBNF{xpb_left_implication}! | !\lnkBNF{xpb_equivalence}!
+
+!\defBNF{xpb_right_implication}! ::=
+	!\lnkBNF{xpb_literals}!, [!\lnkBNF{space}!], "==>"
+
+!\defBNF{xpb_left_implication}! ::=
+	!\lnkBNF{literal}!, [!\lnkBNF{space}!], "<=="
+
+!\defBNF{xpb_equivalence}! ::=
+	!\lnkBNF{literal}!, [!\lnkBNF{space}!], "<==>"
+
+!\defBNF{xpb_literals}! ::=
+	!\lnkBNF{literal}!, {!\lnkBNF{space}!, !\lnkBNF{literal}!}
+
+!\defBNF{xpb_weighted_term}! ::=
+	!\lnkBNF{coefficient}!, !\lnkBNF{space}!, !\lnkBNF{term}!
+\end{lstlisting}
+
+The reification shorthands of the formula file are the same as in the proof file, see \autoref{sec:constraints}, with one addition: an equivalence (\texttt{\lnkBNF{xpb_equivalence}}) is the right and the left implication of the same constraint together, and is loaded as two constraints, the \verb!==>! direction followed by the \verb!<==! direction. Like a left implication it takes a single literal, since the reverse direction of a conjunction is one constraint per literal, and like a left implication it can not be combined with an equality. It is accepted in the formula file only, because no rule of the proof format derives more than one constraint. So, for instance, \lstinline[language=veripb]!z1 <==> +1 x1 +2 x2 >= 2! stands for \lstinline[language=veripb]!2 ~z1 +1 x1 +2 x2 >= 2! followed by \lstinline[language=veripb]!2 z1 +1 ~x1 +2 ~x2 >= 2!.
+
+A label names one constraint, so a line of the formula file that stands for more than one constraint carries one label for each of them and the $i$-th label names the $i$-th constraint the line is loaded as. The grammar admits any number of labels (see \texttt{\lnkBNF{xpb_labels}}); that a line carries either no labels at all or exactly as many as it has constraints is a semantic requirement, since how many constraints a line stands for is not decided by the labels. An equality is loaded as its \verb!>=! direction followed by its \verb!<=! direction, so \lstinline[language=veripb]!@sum_lo @sum_hi +1 x1 +1 x2 = 1! names \lstinline[language=veripb]!+1 x1 +1 x2 >= 1! as \verb!@sum_lo! and \lstinline[language=veripb]!+1 ~x1 +1 ~x2 >= 1! as \verb!@sum_hi!. An equivalence is loaded as its \verb!==>! direction followed by its \verb!<==! direction, so \lstinline[language=veripb]!@right @left z1 <==> +1 x1 +1 x2 >= 1! names the two directions in that order.
+
+\end{document}

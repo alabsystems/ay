@@ -296,6 +296,8 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             minted_var_to_term: HashMap::default(),
             minted_var_count: 0,
             pending_split: None,
+            installed_theory_lemmas: &[],
+            installed_theory_should_stop: None,
             pending_bound_refinements: Vec::new(),
             level_trail_positions: Vec::new(),
             has_checked: false,
@@ -320,6 +322,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             theory_var_bitset: std::mem::take(&mut cached.theory_var_bitset),
             seed_index,
             last_seed_epoch: Cell::new(None),
+            last_seed_hints: RefCell::new(Vec::new()),
             wander_latched: Cell::new(false),
             wander_phase_clear_pending: Cell::new(false),
             ite_branch_guards: std::mem::take(&mut cached.ite_branch_guards),
@@ -357,6 +360,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             // Set post-construction by `with_solve_deadline` on the paths that
             // carry the executor's wall-clock budget (CHC/PDR, CLI `:timeout`).
             solve_deadline: None,
+            theory_every_decision_enabled: true,
             // Set post-construction by `with_support_axioms` from DpllT's combined
             // (dt ++ ematching) conflict-verification support set.
             support_axioms: Vec::new(),
@@ -888,6 +892,8 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             minted_var_to_term: HashMap::default(),
             minted_var_count: 0,
             pending_split: None,
+            installed_theory_lemmas: &[],
+            installed_theory_should_stop: None,
             pending_bound_refinements: Vec::new(),
             level_trail_positions: Vec::new(),
             has_checked: false,
@@ -912,6 +918,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             theory_var_bitset,
             seed_index,
             last_seed_epoch: Cell::new(None),
+            last_seed_hints: RefCell::new(Vec::new()),
             wander_latched: Cell::new(false),
             wander_phase_clear_pending: Cell::new(false),
             ite_branch_guards,
@@ -949,6 +956,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             // Set post-construction by `with_solve_deadline` on the paths that
             // carry the executor's wall-clock budget (CHC/PDR, CLI `:timeout`).
             solve_deadline: None,
+            theory_every_decision_enabled: true,
             // Set post-construction by `with_support_axioms` from DpllT's combined
             // (dt ++ ematching) conflict-verification support set.
             support_axioms: Vec::new(),
@@ -1104,6 +1112,43 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
     /// A deadline hit only ever degrades the solve to `Unknown` (fail-closed).
     /// `None` (the default) disables the poll entirely for plain no-timeout
     /// solves, so the hot loop pays nothing.
+    /// Allow or forbid the #9505 every-decision theory-branching mode for
+    /// this extension (see `theory_every_decision_enabled`).
+    pub(crate) fn with_theory_every_decision(mut self, enabled: bool) -> Self {
+        self.theory_every_decision_enabled = enabled;
+        self
+    }
+
+    /// Reconcile requests against actual clauses installed earlier in this
+    /// current SAT scope. This borrow ends with the extension; the owner may
+    /// append only after the normal SAT add and proof bookkeeping complete.
+    pub(crate) fn with_installed_theory_lemmas(
+        mut self,
+        installed: &'a [ay_core::TheoryLemma],
+        should_stop: &'a dyn Fn() -> bool,
+    ) -> Self {
+        self.installed_theory_lemmas = installed;
+        self.installed_theory_should_stop = Some(should_stop);
+        self
+    }
+
+    pub(super) fn recheck_installed_theory_lemmas(
+        &mut self,
+        initial: ay_core::TheoryResult,
+        check: impl FnMut(&mut T) -> ay_core::TheoryResult,
+    ) -> ay_core::TheoryResult {
+        let Some(should_stop) = self.installed_theory_should_stop else {
+            return initial;
+        };
+        crate::executor::theories::split_incremental::recheck_installed_theory_lemmas_with(
+            self.theory,
+            initial,
+            self.installed_theory_lemmas,
+            should_stop,
+            check,
+        )
+    }
+
     pub(crate) fn with_solve_deadline(mut self, deadline: Option<ay_core::time::Instant>) -> Self {
         self.solve_deadline = deadline;
         self

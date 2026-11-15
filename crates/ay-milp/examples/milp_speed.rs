@@ -91,10 +91,13 @@ fn to_lp_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
 }
 
 /// Serialize this generator's deliberately integral model as deterministic
-/// free-form MPS.  The closure harness feeds these exact bytes to both AY and
-/// Gurobi; neither solver gets an in-memory construction or a different parser
-/// lane.  This generator only creates integer coefficients and one-sided rows,
-/// so refusing any future shape drift is safer than rounding it silently.
+/// free-form MPS (`MPS_DUMP=<path>`, plus `DUMP_ONLY=1` to skip the solve).
+/// `scripts/milp_dense_ladder_closure.py` fed these exact bytes to both AY and
+/// Gurobi, so neither solver got an in-memory construction or a different
+/// parser lane. That harness was deleted 2026-09-25 as dead, and nothing in the
+/// tree sets `MPS_DUMP` now. This generator only creates integer coefficients
+/// and one-sided rows, so refusing any future shape drift is safer than
+/// rounding it silently.
 fn to_mps_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
     fn integer(value: f64) -> i64 {
         assert!(value.is_finite(), "dense-ladder MPS value must be finite");

@@ -32,35 +32,34 @@
 
 use ntest::timeout;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+use crate::corpus::tracked_fixture;
 
 fn ay_bin() -> String {
     env!("CARGO_BIN_EXE_ay").to_string()
 }
 
-fn repo_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // CARGO_MANIFEST_DIR points at crates/ay; repo root is two up.
-    manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or(manifest)
+/// `(stdout, stderr)` of `ay` on a vendored SMT-LIB `storecomm_invalid`
+/// benchmark.
+///
+/// The three reproducers (SMT-LIB `QF_AUFLIA/storecomm`, each `:status sat`)
+/// are force-added under the gitignored `benchmarks/smtcomp/QF_AUFLIA/` tree,
+/// like `uart-23` (6a14e726d), and read through [`tracked_fixture`], so a
+/// missing file fails the test. They used to be optional corpus files: first a
+/// synthetic `"unknown\n"` stdout, which every `assert_ne!(result, "unsat")`
+/// below accepts, then an announced skip. On 2026-09-24 they existed on no
+/// host, so these fences checked nothing anywhere (see `common/corpus.rs`).
+fn run_ay_on_fixture(rel_path: &str) -> (String, String) {
+    run_ay_on_path(&tracked_fixture(rel_path))
 }
 
-fn run_ay_on_file(rel_path: &str) -> (String, String) {
-    let path = repo_root().join(rel_path);
-    if !path.exists() {
-        eprintln!(
-            "SKIP: optional storecomm benchmark not found: {}",
-            path.display()
-        );
-        return ("unknown\n".to_string(), String::new());
-    }
+/// `(stdout, stderr)` of `ay` on an existing benchmark file.
+fn run_ay_on_path(path: &Path) -> (String, String) {
     let output = Command::new(ay_bin())
         .arg("-t:20000")
-        .arg(&path)
+        .arg(path)
         .output()
         .expect("failed to spawn ay");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -276,7 +275,7 @@ fn first_line(stdout: &str) -> String {
 #[test]
 #[timeout(60_000)]
 fn auflia_storecomm_invalid_40_003_is_not_unsat() {
-    let (stdout, stderr) = run_ay_on_file(
+    let (stdout, stderr) = run_ay_on_fixture(
         "benchmarks/smtcomp/QF_AUFLIA/storecomm_invalid_t3_pp_nf_ni_00040_003.cvc.smt2",
     );
     let result = first_line(&stdout);
@@ -296,7 +295,7 @@ fn auflia_storecomm_invalid_40_003_is_not_unsat() {
 #[test]
 #[timeout(60_000)]
 fn auflia_storecomm_invalid_40_002_is_not_unsat() {
-    let (stdout, stderr) = run_ay_on_file(
+    let (stdout, stderr) = run_ay_on_fixture(
         "benchmarks/smtcomp/QF_AUFLIA/storecomm_invalid_t3_pp_nf_ni_00040_002.cvc.smt2",
     );
     let result = first_line(&stdout);
@@ -317,9 +316,13 @@ fn auflia_storecomm_invalid_40_002_is_not_unsat() {
 #[test]
 #[timeout(60_000)]
 fn auflia_storecomm_invalid_30_008_is_not_unsat() {
-    let (stdout, stderr) = run_ay_on_file(
-        "benchmarks/smtcomp/QF_AUFLIA/storecomm_invalid_t1_pp_sf_ni_00030_008.cvc.smt2",
-    );
+    // This reproducer is already committed, as the fixture ay-dpll's
+    // `auflia_storecomm_completeness_8785` `include_str!`s, so this CLI fence
+    // reads that copy and runs everywhere instead of skipping with the
+    // gitignored `benchmarks/smtcomp` corpus. Its absence fails.
+    let (stdout, stderr) = run_ay_on_path(&tracked_fixture(
+        "crates/ay-dpll/tests/group_auflia/data/storecomm_invalid_t1_pp_sf_ni_00030_008.cvc.smt2",
+    ));
     let result = first_line(&stdout);
     let panicked = stderr.contains("panicked at")
         || stderr.contains("BUG:")
@@ -347,7 +350,7 @@ fn auflia_storecomm_invalid_30_008_is_not_unsat() {
 #[test]
 #[timeout(60_000)]
 fn auflia_storecomm_invalid_30_007_direct_disequality_is_not_unsat() {
-    let (stdout, stderr) = run_ay_on_file(
+    let (stdout, stderr) = run_ay_on_fixture(
         "benchmarks/smtcomp/QF_AUFLIA/storecomm_invalid_t1_np_nf_ni_00030_007.cvc.smt2",
     );
     let result = first_line(&stdout);

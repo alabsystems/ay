@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% INTEGRATION-TEST: lenient-header-counts
+% The positive sibling of `cnf_variable_index_out_of_range`: the literal
+% 9223372036854775807 packs to `usize::MAX - 1`, which equalled `-last_lit` on
+% the first iteration of the dedup loop and drove `new_idx -= 1` through an
+% unsigned underflow (release builds have no overflow checks). The subsequent
+% `lits.truncate(usize::MAX)` was a no-op and the clause was either dropped
+% outright or indexed out of bounds, aborting the process.
+f 1;
+sol ~x1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

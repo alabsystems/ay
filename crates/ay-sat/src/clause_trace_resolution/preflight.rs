@@ -39,6 +39,9 @@ fn preflight_trace_shape(
         meter,
     )?;
 
+    shape.recorded_hints = shape.hints;
+    shape.recorded_max_row_hints = shape.max_row_hints;
+    shape.widened_hints = widened_hints;
     let planned = choose_trace_plan(
         shape,
         widened_hints,
@@ -89,6 +92,7 @@ fn retained_source_trace_bytes(trace: &ClauseTrace) -> Result<usize, ResolutionV
         ResolutionValidationResource::Bytes,
     )?;
     for (capacity, element_size) in [
+        (trace.owned_original_bytes(), 1),
         (trace.lit_pool_capacity(), size_of::<Literal>()),
         (trace.hint_pool_capacity(), size_of::<u64>()),
         (trace.scope_assumptions_capacity(), size_of::<Literal>()),
@@ -211,6 +215,12 @@ fn planned_trace_peaks(
         num_vars,
         shape.max_row_hints.max(reconstruction_row_bound),
     )?;
+    shape.compaction_scratch_bytes = CompactionScratch::planned_bytes(num_vars)?;
+    shape.root_index_scratch_bytes = root_occurrence_index::planned_bytes(
+        num_vars,
+        shape.original_clauses,
+        shape.original_literals,
+    )?;
     let retained = planned_retained_bytes(shape, additional_retained_bytes)?;
     let conversion = checked_resource_add(
         checked_resource_add(
@@ -218,7 +228,19 @@ fn planned_trace_peaks(
             namespace_bytes,
             ResolutionValidationResource::Bytes,
         )?,
-        shape.synthesis_scratch_bytes,
+        checked_resource_add(
+            checked_resource_add(
+                shape.synthesis_scratch_bytes,
+                shape.compaction_scratch_bytes,
+                ResolutionValidationResource::Bytes,
+            )?,
+            checked_resource_add(
+                shape.root_index_scratch_bytes,
+                shape.candidate_scheduler_bytes,
+                ResolutionValidationResource::Bytes,
+            )?,
+            ResolutionValidationResource::Bytes,
+        )?,
         ResolutionValidationResource::Bytes,
     )?;
     let replay = checked_resource_add(
@@ -230,6 +252,24 @@ fn planned_trace_peaks(
         assignment_bytes,
         ResolutionValidationResource::Bytes,
     )?;
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        ay_core::safe_eprintln!(
+            "--probe-cert-reject: trace-plan originals={} original-literals={} hints={} source-bytes={} caller-bytes={} retained-bytes={} namespace-bytes={} synthesis-bytes={} compaction-bytes={} root-index-bytes={} scheduler-bytes={} conversion-peak={} replay-peak={}",
+            shape.original_clauses,
+            shape.original_literals,
+            shape.hints,
+            shape.source_trace_bytes,
+            additional_retained_bytes,
+            retained,
+            namespace_bytes,
+            shape.synthesis_scratch_bytes,
+            shape.compaction_scratch_bytes,
+            shape.root_index_scratch_bytes,
+            shape.candidate_scheduler_bytes,
+            conversion,
+            replay,
+        );
+    }
     Ok(PlannedPeaks {
         shape,
         conversion,
@@ -289,4 +329,50 @@ fn choose_trace_plan(
         }
     }
     Ok(planned)
+}
+
+/// The namespace is already admitted and validated. Its exact hint census
+/// refines the conversion peak before any original/derived copies or hint
+/// widening. Reconsider both recorded and widened plans with the new peak;
+/// a previously affordable widened plan must not hide a still-fitting fallback.
+fn admit_candidate_scheduler(
+    mut shape: TraceShape,
+    candidate_count: usize,
+    candidate_literals: usize,
+    entry_count: usize,
+    num_vars: usize,
+    retained_premise_bytes: usize,
+    meter: &mut ConversionMeter<'_>,
+) -> Result<TraceShape, ResolutionValidationError> {
+    meter.check_controls()?;
+    shape.candidate_scheduler_bytes =
+        rooted_scheduler::Scheduler::planned_bytes(num_vars, candidate_count, candidate_literals)?;
+    shape.hints = shape.recorded_hints;
+    shape.max_row_hints = shape.recorded_max_row_hints;
+    shape.row_hint_budget = 0;
+    let reconstruction_row_bound = entry_count.min(checked_resource_add(
+        num_vars,
+        1,
+        ResolutionValidationResource::Hints,
+    )?);
+    let planned = choose_trace_plan(
+        shape,
+        shape.widened_hints,
+        entry_count,
+        num_vars,
+        reconstruction_row_bound,
+        retained_premise_bytes,
+        meter.limits,
+    )?;
+    let peak = planned.conversion.max(planned.replay);
+    enforce_resource(
+        ResolutionValidationResource::Bytes,
+        peak,
+        meter.limits.max_bytes,
+    )?;
+    shape = planned.shape;
+    shape.widening_hint_slack = meter.limits.max_hints.saturating_sub(shape.hints);
+    shape.widening_byte_slack = meter.limits.max_bytes.saturating_sub(peak);
+    meter.check_controls()?;
+    Ok(shape)
 }

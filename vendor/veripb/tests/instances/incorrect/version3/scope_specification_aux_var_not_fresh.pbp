@@ -1,0 +1,67 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): found by the sweep that followed the
+% `fresh_right` and `contradiction_proven` defects, and the same shape -- a
+% premise trusted to mean something the code never establishes.
+%
+% The constraints a `scope` introduces are the loaded order's SPECIFICATION,
+% derived inside `def_order` from the EMPTY formula. They are premises about
+% the order's auxiliary variables and are a conservative extension of the
+% current database only while those auxiliary variables are unconstrained in
+% it. Nothing established that. `checker::validate_aux_var` checks `$`-prefixed
+% names against the active order, but before any `load_order` there is no
+% active order and the check passes vacuously, so the `red` below puts
+% `+1 ~$q >= 1` into the database for a variable that the order then declares
+% as `aux`. Inside `scope leq` / `scope geq` the specification contributes
+% `+1 $q >= 1`, which contradicts it, and every proofgoal in the scope is
+% discharged by `rup >= 1` against a contradiction that has nothing to do with
+% the goal. `dom` then added `+1 ~x1 >= 1` for free and the formula, which
+% `x1 = 1, x2 = 0` satisfies, verified as `s VERIFIED UNSATISFIABLE`.
+%
+% `ScopeRule` now refuses to introduce specification premises while any of the
+% order's auxiliary variables occurs in the database. A `scope` over an order
+% whose auxiliary variables really are fresh is unaffected -- see
+% correct/version3/dominance_with_aux_vars, which opens both scopes.
+f 2;
+red +1 ~$q >= 1 : $q -> 0 ;
+def_order o
+  vars
+    left u1;
+    right v1;
+    aux $q;
+  end;
+  spec
+    red +1 $q >= 1 : $q -> 1;
+  end;
+  def
+    +1 ~u1 +1 v1 >= 1;
+  end;
+  transitivity
+    vars
+      fresh_right w1;
+      fresh_aux_1 $b1;
+      fresh_aux_2 $c1;
+    end;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed;
+    qed;
+  end;
+end;
+load_order o x1;
+dom +1 ~x1 >= 1 : x1 -> 1 : subproof
+  scope leq
+    proofgoal #1
+      rup >= 1;
+    qed;
+  end scope;
+  scope geq
+    proofgoal #2
+      rup >= 1;
+    qed;
+  end scope;
+qed;
+rup >= 1;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

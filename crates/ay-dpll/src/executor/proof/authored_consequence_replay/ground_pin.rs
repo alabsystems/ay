@@ -4,22 +4,24 @@
 
 //! Strict direct refutations from recorded instances and authored value pins.
 //!
-//! `GroundEqualitySubstitution` is authenticated by AY's native strict checker
-//! but has no checked external Alethe spelling. The ordinary native/default
-//! result may publish; `:check-proofs-strict true` remains fail-closed.
+//! `GroundEqualitySubstitution` is authenticated by AY's native strict checker.
+//! Its bounded structural/Boolean subset also lowers to checked Alethe steps;
+//! external publication still refuses shapes outside that renderer's domain.
 
 use super::*;
 
 mod bounds;
+mod fingerprint;
+mod fp;
 
 const MAX_PINS: usize = 16;
-const MAX_CANDIDATE_CHECKS: usize = 4;
+pub(super) const MAX_CANDIDATE_CHECKS: usize = 4;
 /// Shared walk budget for one direct-replay attempt, across all candidate
 /// instances and equality pins.
 const MAX_OCCURRENCE_WORK: usize = 100_000;
 /// Recursive `TermStore::substitute_terms` is safe only after this iterative
 /// preflight bounds the longest path through the whole candidate instance.
-const MAX_INSTANCE_DEPTH: usize = 512;
+pub(super) const MAX_INSTANCE_DEPTH: usize = 512;
 
 #[derive(Clone, Copy)]
 struct GroundPin {
@@ -30,101 +32,36 @@ struct GroundPin {
     value: TermId,
 }
 
-fn fingerprint_mix(state: &mut u64, value: u64) {
-    *state ^= value;
-    *state = state.wrapping_mul(0x100_0000_01b3);
-}
-
 impl Executor {
     pub(super) fn try_distinct_ground_pin(
         &mut self,
         plans: &ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan>,
         instances: &[TermId],
     ) -> Option<Proof> {
-        let fingerprint = Self::ground_pin_input_fingerprint(plans, instances);
-        let direct_state = self.consequence_replay_direct_state.get();
-        let already_tried = direct_state.is_some_and(|(last, _)| last == fingerprint);
-        let attempts = direct_state.map_or(0, |(_, attempts)| attempts);
-        if already_tried || attempts >= MAX_DIRECT_REPLAY_ATTEMPTS {
+        if !self.claim_direct_consequence_attempt(plans, instances) {
             return None;
         }
-        self.consequence_replay_direct_state
-            .set(Some((fingerprint, attempts + 1)));
         let authored = self.exact_concrete_authored_scope();
         let closure = self.authored_and_conjunct_closure(&authored);
         self.try_ground_pinned_instance_refutation(&authored, &closure, plans, instances)
     }
 
-    /// Fingerprint the exact ordered direct-replay plan. A collision can only
-    /// skip a completeness attempt; every accepted proof is still strict.
-    pub(super) fn ground_pin_input_fingerprint(
+    /// The closed-instance completion and ordinary pin replay share one ledger.
+    pub(super) fn claim_direct_consequence_attempt(
+        &self,
         plans: &ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan>,
         instances: &[TermId],
-    ) -> u64 {
-        let mut state = 0xcbf2_9ce4_8422_2325;
-        fingerprint_mix(&mut state, instances.len() as u64);
-        for instance in instances {
-            fingerprint_mix(&mut state, u64::from(instance.0));
-            match plans.get(instance) {
-                Some(ConsequencePlan::ForallInstance {
-                    quantifier,
-                    binding,
-                }) => {
-                    fingerprint_mix(&mut state, 1);
-                    fingerprint_mix(&mut state, u64::from(quantifier.0));
-                    fingerprint_mix(&mut state, binding.len() as u64);
-                    for value in binding {
-                        fingerprint_mix(&mut state, u64::from(value.0));
-                    }
-                    // A recorded forall instance may be authorized through a
-                    // negated-existential dual plan stored under its source
-                    // quantifier. Include that transitive authority edge so a
-                    // newly admitted dual plan receives its own bounded scan.
-                    match plans.get(quantifier) {
-                        Some(ConsequencePlan::NegatedExistsDual {
-                            not_exists_root,
-                            exists,
-                        }) => {
-                            fingerprint_mix(&mut state, 5);
-                            fingerprint_mix(&mut state, u64::from(not_exists_root.0));
-                            fingerprint_mix(&mut state, u64::from(exists.0));
-                        }
-                        Some(_) => fingerprint_mix(&mut state, 6),
-                        None => fingerprint_mix(&mut state, 7),
-                    }
-                }
-                Some(ConsequencePlan::SkolemInstance {
-                    source,
-                    quantified,
-                    witness,
-                    instance,
-                    positive,
-                }) => {
-                    fingerprint_mix(&mut state, 2 + u64::from(*positive));
-                    for term in [source, quantified, witness, instance] {
-                        fingerprint_mix(&mut state, u64::from(term.0));
-                    }
-                }
-                Some(ConsequencePlan::NegatedExistsDual {
-                    not_exists_root,
-                    exists,
-                }) => {
-                    fingerprint_mix(&mut state, 4);
-                    fingerprint_mix(&mut state, u64::from(not_exists_root.0));
-                    fingerprint_mix(&mut state, u64::from(exists.0));
-                }
-                Some(ConsequencePlan::ImpliedConsequent {
-                    implication,
-                    antecedent,
-                }) => {
-                    fingerprint_mix(&mut state, 8);
-                    fingerprint_mix(&mut state, u64::from(implication.0));
-                    fingerprint_mix(&mut state, u64::from(antecedent.0));
-                }
-                None => fingerprint_mix(&mut state, 0),
-            }
+    ) -> bool {
+        let fingerprint = Self::ground_pin_input_fingerprint(plans, instances);
+        let direct_state = self.consequence_replay_direct_state.get();
+        let already_tried = direct_state.is_some_and(|(last, _)| last == fingerprint);
+        let attempts = direct_state.map_or(0, |(_, attempts)| attempts);
+        if already_tried || attempts >= MAX_DIRECT_REPLAY_ATTEMPTS {
+            return false;
         }
-        state
+        self.consequence_replay_direct_state
+            .set(Some((fingerprint, attempts + 1)));
+        true
     }
 
     /// Build a strict refutation from one exact ground instance and authored
@@ -149,36 +86,38 @@ impl Executor {
                     ay_proof::render_term_canonical(&self.ctx.terms, instance)
                 )
             });
-            let Some(pins) =
-                self.collect_ground_pins(derivable_sources, instance, &mut occurrence_work)
-            else {
-                continue;
-            };
-            let replacements = pins.iter().map(|pin| (pin.key, pin.value)).collect();
-            let substituted = self.ctx.terms.substitute_terms(instance, &replacements);
-            let pairs: Vec<_> = pins.iter().map(|pin| (pin.key, pin.value)).collect();
-            if !ay_proof::ground_substitution_image_matches(
-                &self.ctx.terms,
-                instance,
-                substituted,
-                &pairs,
-            ) {
-                continue;
-            }
-            if let Some(candidate) = self.build_ground_pin_candidate(
-                authored,
-                instance_plan,
-                instance,
-                substituted,
-                &pins,
-            ) {
+            let candidate = self
+                .build_fp_instance_refutation(authored, instance_plan, instance)
+                .or_else(|| {
+                    let pins = self.collect_ground_pins(
+                        derivable_sources,
+                        instance,
+                        &mut occurrence_work,
+                    )?;
+                    let replacements = pins.iter().map(|pin| (pin.key, pin.value)).collect();
+                    let substituted = self.ctx.terms.substitute_terms(instance, &replacements);
+                    let pairs: Vec<_> = pins.iter().map(|pin| (pin.key, pin.value)).collect();
+                    if !ay_proof::ground_substitution_image_matches(
+                        &self.ctx.terms,
+                        instance,
+                        substituted,
+                        &pairs,
+                    ) {
+                        return None;
+                    }
+                    self.build_ground_pin_candidate(
+                        authored,
+                        instance_plan,
+                        instance,
+                        substituted,
+                        &pins,
+                    )
+                });
+            if let Some(candidate) = candidate {
                 candidate_checks += 1;
                 if self.ground_pin_candidate_is_strict(&candidate, authored) {
                     replay_note(|| {
-                        format!(
-                            "ground-pin built strict candidate for {instance:?} from {} pin(s)",
-                            pins.len()
-                        )
+                        format!("direct replay built strict candidate for {instance:?}")
                     });
                     return Some(candidate);
                 }
@@ -190,7 +129,11 @@ impl Executor {
         None
     }
 
-    fn ground_pin_candidate_is_strict(&mut self, candidate: &Proof, authored: &[TermId]) -> bool {
+    pub(super) fn ground_pin_candidate_is_strict(
+        &mut self,
+        candidate: &Proof,
+        authored: &[TermId],
+    ) -> bool {
         ay_proof::validate_reachable_assumes_in_problem_scope(candidate, authored).is_ok()
             && Self::proof_derives_empty_clause(candidate)
             && self

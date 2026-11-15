@@ -1,5 +1,6 @@
 # Fuzz testing targets for AY SMT solver
 # Author: Andrew Yates
+# STOCK EXCEPTION (running): Trust seal 9192 has no ASan runtime (2026-09-28: ld: library 'rustc-trust_rt.asan' not found).
 
 [package]
 name = "ay-fuzz"

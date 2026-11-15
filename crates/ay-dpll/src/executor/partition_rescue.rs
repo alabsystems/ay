@@ -75,6 +75,10 @@ use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::features::is_builtin_symbol_name;
 
+#[cfg(test)]
+#[path = "partition_rescue/resource_stop_tests.rs"]
+mod resource_stop_tests;
+
 /// Snapshot of the verdict-shaping state the rescue mutates while solving
 /// components, restored verbatim on every fail-closed exit so the primary's
 /// original `Unknown` is byte-identical to a no-rescue run.
@@ -124,8 +128,16 @@ impl Executor {
             "solver.partition_rescue.components",
             components.len() as u64,
         );
+        // The router's refusal diagnostic says no lane searched, and the
+        // components now do: it comes back only with the refusal's `unknown`.
+        let refusal = self.hold_refusal_diagnostic();
 
-        match self.run_partition_components(&components, &connectors, pre_dispatch_assertions) {
+        match self.run_partition_components(
+            &components,
+            &connectors,
+            pre_dispatch_assertions,
+            &mut Self::solve_partition_component,
+        ) {
             Some(decided) => {
                 let label = match &decided {
                     Ok(SolveResult::Sat) => "sat",
@@ -139,6 +151,7 @@ impl Executor {
             None => {
                 self.last_statistics
                     .set_string("solver.partition_rescue.outcome", "restore-unknown");
+                self.restore_refusal_diagnostic(refusal);
                 primary
             }
         }
@@ -193,6 +206,7 @@ impl Executor {
         components: &[Vec<TermId>],
         connectors: &[Connector],
         pre_dispatch_assertions: &[TermId],
+        solve_component: &mut impl FnMut(&mut Self, &[TermId]) -> Result<SolveResult>,
     ) -> Option<Result<SolveResult>> {
         let guard = RescueStateGuard {
             last_unknown_reason: self.last_unknown_reason,
@@ -213,7 +227,7 @@ impl Executor {
                 self.restore_after_rescue(&guard);
                 return None;
             }
-            let result = match self.solve_partition_component(component) {
+            let result = match solve_component(self, component) {
                 Ok(r) => r,
                 Err(e) => {
                     // A hard solver error must not surface from a rescue: restore
@@ -238,21 +252,20 @@ impl Executor {
                 self.qfax_refinement_clause = guard.qfax_refinement_clause.clone();
                 return Some(Ok(SolveResult::Unknown));
             }
-            if matches!(
-                self.last_unknown_reason,
-                Some(UnknownReason::Interrupted)
-                    | Some(UnknownReason::Timeout)
-                    | Some(UnknownReason::MemoryLimit)
-            ) {
+            if let Some(
+                reason @ (UnknownReason::Interrupted
+                | UnknownReason::Timeout
+                | UnknownReason::MemoryLimit
+                | UnknownReason::ResourceLimit),
+            ) = self.last_unknown_reason
+            {
                 // In particular, singleton closure can abort after emitting a
                 // sound but incomplete prefix in its isolated component window.
                 // Preserve the full checkpoint's reason while unwinding all
                 // other rescue-local verdict state, and do not visit another
                 // component.
-                let stop_reason = self.last_unknown_reason;
                 self.restore_after_rescue(&guard);
-                self.last_unknown_reason = stop_reason;
-                self.last_result = Some(SolveResult::Unknown);
+                self.publish_unknown_from_origin(reason.origin());
                 return Some(Ok(SolveResult::Unknown));
             }
             match result {

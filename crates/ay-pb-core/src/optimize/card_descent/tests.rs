@@ -173,6 +173,50 @@ fn declines_unsatisfiable_row() {
     );
 }
 
+/// The view of `source`, built without a panicking step.
+fn try_view_of(source: &str) -> Result<Option<CoverView>, Box<dyn std::error::Error>> {
+    let instance = parse_opb(source)?;
+    let objective = instance
+        .objective
+        .as_ref()
+        .ok_or("test instance has an objective")?;
+    Ok(build_cover_view(&instance, objective))
+}
+
+/// Regression: a repeated variable whose coefficients sum past `i128::MAX`
+/// overflowed the normalization accumulator (a panic under the workspace's
+/// release overflow checks). The exact row `(2 * i128::MAX) x1 >= 1` has a
+/// coefficient no i64 view can hold, so the gate must decline it.
+#[test]
+fn declines_row_whose_repeated_coefficient_overflows_i128() -> Result<(), Box<dyn std::error::Error>>
+{
+    let view = try_view_of(
+        "* #variable= 1 #constraint= 1\nmin: +1 x1 ;\n\
++170141183460469231731687303715884105727 x1 \
++170141183460469231731687303715884105727 x1 >= 1 ;\n",
+    )?;
+    if view.is_some() {
+        return Err("an i128-overflowing coefficient must decline, not wrap".into());
+    }
+    Ok(())
+}
+
+/// Regression: expanding `~x1 = 1 - x1` moved `i128::MAX` into an rhs of
+/// `-i128::MAX`, overflowing it. The exact row `-i128::MAX x1 >= -2 * i128::MAX`
+/// is not monotone, so the gate must decline it.
+#[test]
+fn declines_negated_row_whose_rhs_overflows_i128() -> Result<(), Box<dyn std::error::Error>> {
+    let view = try_view_of(
+        "* #variable= 1 #constraint= 1\nmin: +1 x1 ;\n\
++170141183460469231731687303715884105727 ~x1 \
+>= -170141183460469231731687303715884105727 ;\n",
+    )?;
+    if view.is_some() {
+        return Err("an i128-overflowing rhs must decline, not wrap".into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The fixed-cardinality invariant
 // ---------------------------------------------------------------------------

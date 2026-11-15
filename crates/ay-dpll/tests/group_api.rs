@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated api integration tests for ay-dpll.
-//! Groups 6 test modules into a single binary to reduce link time.
+//! Groups 8 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -13,6 +13,10 @@ mod common;
 mod counterexample_benchmark_4522;
 #[path = "group_api/counterexample_style_public_api.rs"]
 mod counterexample_style_public_api;
+#[path = "group_api/deductive_checks_modern_bool_model.rs"]
+mod deductive_checks_modern_bool_model;
+#[path = "group_api/external_codegen_guarded_quotient.rs"]
+mod external_codegen_guarded_quotient;
 #[path = "group_api/interface_bridge_5227.rs"]
 mod interface_bridge_5227;
 #[path = "group_api/interface_bridge_5230.rs"]

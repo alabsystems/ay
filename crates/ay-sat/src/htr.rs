@@ -25,8 +25,6 @@
 mod resolve;
 #[cfg(test)]
 mod tests;
-#[cfg(kani)]
-mod verification;
 
 use crate::clause_arena::ClauseArena;
 use crate::lit_marks::LitMarks;

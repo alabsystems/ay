@@ -19,31 +19,24 @@ impl IndependentModelView<'_> {
         index_sort: &Sort,
         element_sort: &Sort,
     ) -> Option<ModelValue> {
-        if let Some(cached) = self.resolved.borrow().get(&t) {
-            return Some(cached.clone());
+        // This model owns the completed whole array. Read it before caches,
+        // asserted definitions and theory fallbacks; stale ownership is not
+        // permission to reconstruct a different interpretation.
+        match self.model.residual_array_value(&self.exec.ctx, t) {
+            Ok(Some(value)) => return Some(value.clone()),
+            Ok(None) => {}
+            Err(()) => return None,
         }
-        if self.resolved_none.borrow().contains(&t) {
-            return None; // cached stack-independent failure (#gate-none-cache)
+        // Exact memo and cycle cut (#gate-exact-leaf-memo): a memoized value
+        // is returned only where resolving `t` again would compute it.
+        if let Some(memoized) = self.memoized_leaf(t) {
+            return memoized;
         }
-        if !self.resolving.borrow_mut().insert(t) {
-            self.cycle_hits.set(self.cycle_hits.get() + 1);
+        if !self.enter_leaf(t) {
             return None; // cycle
         }
-        let hits_before = self.cycle_hits.get();
         let result = self.array_leaf_inner(t, index_sort, element_sort);
-        self.resolving.borrow_mut().remove(&t);
-        match &result {
-            Some(v) => {
-                self.resolved.borrow_mut().insert(t, v.clone());
-            }
-            // A failure whose frame observed NO cycle re-entry never consulted
-            // the in-flight stack, so it is a pure function of the fixed model
-            // — cacheable (#gate-none-cache). A post-cycle failure is not.
-            None if self.cycle_hits.get() == hits_before => {
-                self.resolved_none.borrow_mut().insert(t);
-            }
-            None => {}
-        }
+        self.leave_leaf(t, &result, true);
         result
     }
 
@@ -63,7 +56,7 @@ impl IndependentModelView<'_> {
         //    enforced: each OTHER definition is itself a top-level assertion the
         //    gate ground-checks, so two definitions that disagree under the model
         //    produce a `ModelViolates` there (never suppressed here).
-        for def in self.array_definitions(t) {
+        for def in self.array_definitions(t)? {
             let ev = Evaluator::new(&self.exec.ctx.terms, self);
             if let EvalOutcome::Value(v @ ModelValue::Array(_)) = ev.evaluate(def) {
                 return Some(v);
@@ -100,7 +93,7 @@ impl IndependentModelView<'_> {
             .model
             .array_model
             .as_ref()
-            .is_some_and(|arrays| arrays.read_conflicted.contains(&t))
+            .is_some_and(|arrays| arrays.is_withheld(&t))
         {
             return None;
         }
@@ -158,7 +151,7 @@ impl IndependentModelView<'_> {
         // Extraction dropped at least one disputed cell. Neither an existing
         // default nor a later completion may turn that deliberately-partial
         // interpretation into independent evidence for a total array.
-        if array_model.read_conflicted.contains(&t) {
+        if array_model.is_withheld(&t) {
             return None;
         }
         let interp = array_model.array_values.get(&t)?;

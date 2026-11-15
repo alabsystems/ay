@@ -7,11 +7,10 @@
 use super::*;
 
 fn lit(var: u32, positive: bool) -> Literal {
-    if positive {
-        Literal::from_dimacs(var as i32 + 1)
-    } else {
-        Literal::from_dimacs(-(var as i32 + 1))
-    }
+    // The packed encoding `2 * var + negative` is `from_dimacs(±(var + 1))`
+    // for every variable up to `Variable::MAX_ID`, with no DIMACS arithmetic
+    // to overflow.
+    Literal::from_raw((var << 1) | u32::from(!positive))
 }
 
 // ─── Medium-scale pigeonhole tests (CaDiCaL-generated, drat-trim verified) ──

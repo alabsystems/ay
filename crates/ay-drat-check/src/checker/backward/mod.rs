@@ -72,8 +72,12 @@ impl BackwardChecker {
 
 /// Remove literals at the given positions from a clause.
 /// Positions must be sorted ascending. drat-trim.c:174-179.
+///
+/// The result grows as literals are kept rather than being preallocated from
+/// `clause.len() - positions.len()`: that size is only a hint, and unsorted or
+/// duplicate positions could make the subtraction underflow.
 fn reduce_clause(clause: &[Literal], positions: &[usize]) -> Vec<Literal> {
-    let mut reduced = Vec::with_capacity(clause.len() - positions.len());
+    let mut reduced = Vec::new();
     let mut remove_iter = positions.iter().peekable();
     for (i, &lit) in clause.iter().enumerate() {
         if remove_iter.peek() == Some(&&i) {

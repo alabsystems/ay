@@ -12,7 +12,7 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Sort, TermId};
 use ay_frontend::OptionValue;
 
-use super::check_sat::contains_symbolic_integer_power;
+use super::check_sat::{contains_symbolic_integer_power, has_only_uf_lia_theories};
 use super::dt_axioms::DtSolverDispatch;
 use super::theories::bv_cnf_dump;
 use super::Executor;
@@ -25,6 +25,12 @@ use crate::logic_detection::{LogicCategory, TheoryKind, FAIL_CLOSED_COMBINED};
 #[path = "check_sat_assuming/publication.rs"]
 mod publication;
 pub(in crate::executor) use publication::AssumptionSatPublication;
+#[path = "check_sat_assuming/fragile_lra_gate.rs"]
+mod fragile_lra_gate;
+mod scoped_authority;
+#[path = "check_sat_assuming/stateless_subsolve.rs"]
+mod stateless_subsolve;
+pub(in crate::executor) use stateless_subsolve::ScopedWindowLanes;
 
 /// Which wrapper owns the one final nested-array UNSAT quarantine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +38,13 @@ enum AssumptionNestedArrayQuarantine {
     Local,
     DeferToCaller,
 }
+
+// Own the actual original assumption buffer while a scoped solver lowers it
+// into assertions and hides last_assumptions from lane dispatch. This is query
+// identity DATA, never a grant or a late retarget of an existing model.
+pub(in crate::executor) struct OriginalModelAssumptions(
+    pub(in crate::executor) Option<Vec<TermId>>,
+);
 
 impl Executor {
     /// Run check-sat with assumptions.
@@ -85,8 +98,28 @@ impl Executor {
         publication: AssumptionSatPublication,
         quarantine: AssumptionNestedArrayQuarantine,
     ) -> Result<SolveResult> {
+        self.with_scope_root_depths(|this| {
+            this.check_sat_assuming_with_captured_roots(assumptions, publication, quarantine)
+        })
+    }
+
+    fn check_sat_assuming_with_captured_roots(
+        &mut self,
+        assumptions: &[TermId],
+        publication: AssumptionSatPublication,
+        quarantine: AssumptionNestedArrayQuarantine,
+    ) -> Result<SolveResult> {
+        // Evidence policy P1: a checking re-solve's nested probes run no
+        // strengthening either (`strengthening.rs`).
+        let _checking_scope = self.enter_checking_solve_scope();
+        if let Some(result) = self.reject_pending_fp_namespace_refusal() {
+            Self::invalidate_bv_cnf_export_for_rejected_check()?;
+            return Ok(result);
+        }
         self.last_sat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         let mut symbolic_power_roots = self.ctx.assertions.clone();
         symbolic_power_roots.extend_from_slice(assumptions);
         if contains_symbolic_integer_power(&self.ctx.terms, &symbolic_power_roots) {
@@ -94,7 +127,7 @@ impl Executor {
             self.record_unknown_from_origin(UnknownOrigin::UnsupportedArithmeticFragment);
             self.record_unknown_diagnostic(
                 UnknownReason::UnsupportedArithmetic,
-                "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
+                "exponentiation with a symbolic exponent (or a native `^` exponent that is not a positive integer literal) is accepted and typed but has no sound decision procedure",
             );
             return Ok(SolveResult::Unknown);
         }
@@ -114,7 +147,10 @@ impl Executor {
         let dump_transaction = bv_cnf_dump::prepare_for_check()?;
         self.validate_bv_cnf_export_roots(&dump_roots)?;
         let solve_started_at = Instant::now();
+        let assembly_started_at = super::proof::assembly_observations::thread_observations();
         let previous_deadline = self.install_timeout_deadline_for_call();
+        let check = self.open_check_node();
+        let _in_check = check.enter();
         // A direct assumption query captures its exact pre-solve base just as
         // plain `check-sat` does. A nested named-core redirect retains the
         // already-installed outer authored snapshot; replacing it with the
@@ -127,10 +163,27 @@ impl Executor {
             .clone()
             .unwrap_or_else(|| self.ctx.assertions.clone());
         self.independent_gate_authored_assertions = Some(active_authored_roots);
-        let result = self.check_sat_assuming_with_controls(assumptions, publication);
+        // (#quantifier-ce-free-resolve) The counterexample-free probe is
+        // PARKED by the quantifier loop and fired at the executor, at the one
+        // site in `check_sat_guarded` that runs after every pass which could
+        // still publish. This path never reaches that site -- it has no CEGAR
+        // loop, no deep-QE or trace-arming retry, no finite-model last chance
+        // and no model-rejection re-solve behind it -- so a stash parked by a
+        // solve under this call must not survive it. Two reasons, and the
+        // first is soundness: an assumption query's pre-dispatch vector is not
+        // the plain query's, and letting an outer `check_sat_guarded` fire a
+        // stash an assumption solve parked would re-solve the wrong problem
+        // and publish its refutation as the outer verdict. The second is that
+        // an OUTER stash must survive a nested assumption probe (optimization
+        // bound probes and the MaxSMT disjoint-core lower bound call
+        // `check_sat_assuming` from inside a plain solve), which a bare clear
+        // would destroy. Save and restore, exactly like the gate window above.
+        let saved_ce_free_stash = self.cegqi_ce_free_stash.take();
+        let result = self.check_sat_assuming_with_array_refutation_retry(assumptions, publication);
+        self.cegqi_ce_free_stash = saved_ce_free_stash;
         self.independent_gate_authored_assertions = saved_independent_gate_authored;
         self.restore_timeout_deadline_after_call(previous_deadline);
-        self.record_z3_resource_statistics(solve_started_at);
+        self.record_z3_resource_statistics(solve_started_at, assembly_started_at, &check);
         let result = result.and_then(|result| {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
@@ -173,12 +226,20 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
     ) -> Result<SolveResult> {
+        if let Some(result) = self.reject_pending_fp_namespace_refusal() {
+            Self::invalidate_bv_cnf_export_for_rejected_check()?;
+            return Ok(result);
+        }
         // Capture the public query before named assertions move into the
         // solver-assumption slot. The inner solve, rescue, and minimizer can
         // all grow the term store; finite-array evidence is therefore sealed
         // only by this wrapper's final quarantine after they finish.
         let decision_roots = self.public_solve_roots(assumptions);
-        let result = self.check_sat_assuming_with_named_cores_inner(assumptions)?;
+        // The redirect below strips named roots out of `ctx.assertions`: the
+        // scope-tracked stack is read before it does.
+        let result = self.with_scope_root_depths(|this| {
+            this.check_sat_assuming_with_named_cores_inner(assumptions)
+        })?;
         Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, None, result))
     }
 
@@ -280,8 +341,12 @@ impl Executor {
     /// Certify, rescue, and minimize while named roots remain in the temporary
     /// solver-assumption slot. No nested-array quarantine is allowed here.
     fn complete_named_core_redirect(&mut self, combined: &[TermId]) -> Result<SolveResult> {
+        // What the verdict cost to decide and certify: the minimizer's
+        // affordability gate (#uc-minimize-entry-cost) is keyed on it.
+        let entry_started = Instant::now();
         let result = self.check_sat_assuming_deferred_to_named_outer(combined);
         let result = self.certify_assumption_core(combined, result);
+        let entry_elapsed = entry_started.elapsed();
         let (result, rescue_elapsed) = match result {
             Ok(SolveResult::Unknown) => {
                 let rescue_started = Instant::now();
@@ -293,7 +358,7 @@ impl Executor {
             }
             other => (other, None),
         };
-        self.minimize_assumption_core(combined, result, rescue_elapsed)
+        self.minimize_assumption_core(combined, result, rescue_elapsed, entry_elapsed)
     }
 
     /// Check if produce-unsat-assumptions is enabled (SMT-LIB 2.6 §4.1.7).
@@ -387,7 +452,6 @@ impl Executor {
     /// solve cleared provenance outright, the outer authority is reinstated
     /// verbatim. Either way no solver-generated term becomes an authored
     /// `assume`.
-    #[cfg(test)]
     fn reroot_proof_authority(
         &mut self,
         outer: Option<&super::theories::solve_harness::ProofProblemAssertionProvenance>,
@@ -468,10 +532,11 @@ impl Executor {
         self.begin_unsat_query_epoch(&rescue_roots);
         self.install_proof_source_provenance(&rescue_roots);
         self.bind_unsat_query_assumptions(&[]);
-        let result = self.solve_scoped_assumptions(
+        let result = self.solve_scoped_assumptions_with_publication(
             &base_assertions,
             assumptions,
             Self::solve_current_assertions_with_quantifier_support,
+            publication,
         );
         let result = match result {
             // SINGLE SAT-EMISSION CHOKEPOINT (#sat-chokepoint): this path
@@ -485,6 +550,41 @@ impl Executor {
         };
         self.restore_timeout_deadline_after_call(previous_deadline);
         result
+    }
+
+    /// `check_sat_assuming_with_controls`, then the assumption-query form of
+    /// the #array-refutation-retry re-solve (see
+    /// `array_refutation_resolve`): an `unknown` left by a refuted
+    /// or unvalidated model on a query with an asserted store-chain equality
+    /// is re-solved ONCE with the array fixpoint asserting the written-index
+    /// read instances. A call made from inside an armed re-solve (a nested
+    /// assumption probe) leaves the outer re-solve's flags alone.
+    fn check_sat_assuming_with_array_refutation_retry(
+        &mut self,
+        assumptions: &[TermId],
+        publication: AssumptionSatPublication,
+    ) -> Result<SolveResult> {
+        if self.array_refutation_instances_armed {
+            return self.check_sat_assuming_with_controls(assumptions, publication);
+        }
+        self.array_model_refuted = false;
+        self.array_refutation_retry_done = false;
+        let first = self.check_sat_assuming_with_controls(assumptions, publication)?;
+        if !self.array_refutation_retry_armed(&first, assumptions) {
+            return Ok(first);
+        }
+        self.array_refutation_retry_done = true;
+        self.array_refutation_instances_armed = true;
+        self.last_unknown_reason = None;
+        self.last_result = None;
+        self.last_model = None;
+        let retry = self.check_sat_assuming_with_controls(assumptions, publication);
+        // Never let the fixpoint-facing flag outlive the re-solve.
+        self.array_refutation_instances_armed = false;
+        let retry = retry?;
+        self.last_statistics
+            .set_int("model_validation.array_refutation_retry", 1);
+        Ok(retry)
     }
 
     fn check_sat_assuming_with_controls(
@@ -520,6 +620,7 @@ impl Executor {
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
+        self.last_proof_surface_withheld = None;
         self.proof_source_work.reset();
         self.best_effort_rebuild_refutation_spent = 0;
         self.last_lrat_certificate = None;
@@ -529,6 +630,8 @@ impl Executor {
         self.report_checked_refutation_clear("reset_solve_session_state");
         self.last_checked_sat_refutation = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
@@ -575,6 +678,9 @@ impl Executor {
         self.nested_array_row_reduction_unsat = false;
         self.clear_quantified_sat_authority();
         self.ho_seq_unfold_array_free_unsat = false;
+        self.simplifier_refutation_unsat = false;
+        self.nested_array_free_justification_unsat = false;
+        self.justified_obligation_has_nested_arrays = None;
         self.array_axiom_scope = None;
         self.array_axiom_dead_skolems.clear();
         self.row_seeded_terms.clear();
@@ -653,6 +759,16 @@ impl Executor {
             return Ok(self.finalize_assumption_unknown(publication));
         }
 
+        // Direct assumption routes also require Complex product reconstruction.
+        let complex_axioms = self.complex_product_axioms(&solve_roots);
+        if !complex_axioms.is_empty() {
+            let authored_base = self.ctx.assertions.clone();
+            self.install_proof_source_provenance(&authored_base);
+            for axiom in complex_axioms {
+                self.push_array_axiom_assertion_site(axiom, "complex_product_reconstruct");
+            }
+        }
+
         // RoundingMode finite-domain axioms (#P0.2 symbolic RoundingMode,
         // Pass B) for the ASSUMPTION routes: the QfUf/QfAx/propositional
         // assumption arms dispatch straight to
@@ -710,6 +826,23 @@ impl Executor {
         // window, while direct ground dispatch receives the post-gate snapshot.
         let initial_base_assertions = self.ctx.assertions.clone();
 
+        let mut all_assertions = initial_base_assertions.clone();
+        all_assertions.extend(assumptions.iter().copied());
+        let mut field_roots = all_assertions.clone();
+        field_roots.extend(self.ctx.objectives().iter().map(|o| o.term));
+        field_roots.extend(self.ctx.soft_constraints().iter().map(|o| o.term));
+        if let Some(result) = self.try_finite_field(&field_roots) {
+            let result = if result.is_sat() {
+                self.publish_or_defer_assumption_sat(assumptions, publication)?
+            } else {
+                result
+            };
+            if result.is_unsat() {
+                self.last_assumption_core = Some(assumptions.to_vec());
+            }
+            return Ok(self.finish_check_sat_assuming_result(assumptions, result, publication));
+        }
+
         if initial_base_assertions.is_empty() && assumptions.is_empty() {
             // SOUNDNESS: No assertions and no assumptions means the formula is
             // trivially satisfiable (empty conjunction = true). This fast path
@@ -730,9 +863,6 @@ impl Executor {
             // nothing-to-validate fast path.
             return self.publish_or_defer_assumption_sat(assumptions, publication);
         }
-
-        let mut all_assertions = initial_base_assertions.clone();
-        all_assertions.extend(assumptions.iter().copied());
 
         let (pre_quantifier_category, pre_quantifier_features) =
             self.detect_logic_category(&all_assertions);
@@ -783,6 +913,12 @@ impl Executor {
             eprintln!("c phase-trace check-sat-assuming category={category:?}");
         }
         self.set_active_solve_phase("assumption-solving", format!("theory:{category:?}"));
+
+        if let Some(result) =
+            self.try_solve_via_bounded_scalar_mod(category, &features, assumptions)
+        {
+            return Ok(self.finish_check_sat_assuming_result(assumptions, result, publication));
+        }
 
         // One route-aware assumption boundary covers base and temporary roots.
         // Dedicated array routes defer here because they must enumerate after
@@ -844,10 +980,11 @@ impl Executor {
                     TheoryKind::Lra,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -888,10 +1025,11 @@ impl Executor {
                     TheoryKind::Nia,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -919,10 +1057,11 @@ impl Executor {
                     TheoryKind::Nra,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -962,10 +1101,11 @@ impl Executor {
                 // hard Unknown made every such query incomplete precisely
                 // when `produce-unsat-cores` redirected named assertions
                 // here.
-                self.solve_scoped_assumptions(
+                self.solve_scoped_assumptions_with_publication(
                     &base_assertions,
                     assumptions,
                     Self::solve_current_assertions_with_quantifier_support,
+                    publication,
                 )
             }
             LogicCategory::QfUflia => {
@@ -979,7 +1119,29 @@ impl Executor {
                         ));
                     }
                 }
-                self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
+                // QF_UFLIA's ordinary pipeline uses the dedicated ground
+                // UF+LIA solver. The AUFLIA assumption solver instead selects
+                // the array-capable combiner, bypassing that pipeline's
+                // preprocessing and model construction even when there are no
+                // arrays. Compound named assertions can therefore exhaust the
+                // deadline or leave a model the independent gate rejects.
+                // Solve the same conjunction through fresh scoped lanes, as
+                // for UF+nonlinear arithmetic above. This preserves the base
+                // and temporary-assumption boundary, revalidates SAT models,
+                // and returns a conservative full assumption core on UNSAT.
+                if has_only_uf_lia_theories(&features) {
+                    self.solve_scoped_assumptions_with_publication(
+                        &base_assertions,
+                        assumptions,
+                        Self::solve_current_assertions_with_quantifier_support,
+                        publication,
+                    )
+                } else {
+                    // Match the plain dispatcher's pure-theory boundary.
+                    // Integer div/mod/rem still need the broader lane's
+                    // assumption-aware lowering and alias substitution.
+                    self.solve_auf_lia_with_assumptions(&base_assertions, assumptions)
+                }
             }
             LogicCategory::QfSeq => self.solve_seq_with_assumptions(&base_assertions, assumptions),
             // Route Seq<BitVec> through the scoped-assertion Seq path so every
@@ -1041,13 +1203,13 @@ impl Executor {
                 self.solve_auflira_with_assumptions(&base_assertions, assumptions)
             }
             LogicCategory::QfFp => {
-                self.solve_fp_with_scoped_assumptions(&base_assertions, assumptions)
+                self.solve_fp_with_scoped_assumptions(&base_assertions, assumptions, publication)
             }
             LogicCategory::QfBvfp => {
-                self.solve_bvfp_with_scoped_assumptions(&base_assertions, assumptions)
+                self.solve_bvfp_with_scoped_assumptions(&base_assertions, assumptions, publication)
             }
             LogicCategory::QfAbvfp => {
-                self.solve_abvfp_with_scoped_assumptions(&base_assertions, assumptions)
+                self.solve_abvfp_with_scoped_assumptions(&base_assertions, assumptions, publication)
             }
             LogicCategory::QfBv => self.solve_with_assumptions_for_theory(
                 &base_assertions,
@@ -1069,7 +1231,27 @@ impl Executor {
                 assumptions,
                 TheoryKind::AufBv,
             ),
-            LogicCategory::QfBvLia => self.solve_bv_lia_bridge_with_assumptions(assumptions),
+            LogicCategory::QfBvLia => {
+                let direct = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
+                if direct.is_unknown() {
+                    // The direct bridge sees assumptions separately. A forced
+                    // Boolean definition can therefore hide the top-level
+                    // arithmetic facts needed by an exact bounded bridge.
+                    // Retry the identical conjunction through ordinary
+                    // preprocessing on query-local lanes. The existing scoped
+                    // helper preserves authored assumption authority, the live
+                    // deadline, and final model/proof validation; its temporary
+                    // units never enter the session's persistent encoders.
+                    self.solve_scoped_assumptions_with_publication(
+                        &base_assertions,
+                        assumptions,
+                        Self::solve_current_assertions_with_quantifier_support,
+                        publication,
+                    )
+                } else {
+                    Ok(direct)
+                }
+            }
             LogicCategory::QfBvLiaIndep => {
                 self.solve_bv_lia_indep_with_assumptions(&base_assertions, assumptions)
             }
@@ -1127,10 +1309,11 @@ impl Executor {
                     TheoryKind::AufLra,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -1143,10 +1326,11 @@ impl Executor {
                     TheoryKind::UfLra,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -1160,7 +1344,7 @@ impl Executor {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }
-            LogicCategory::QfDt => {
+            LogicCategory::QfDt => 'dt_fd: {
                 // Fast direct theory-assumption route first; on Unknown retry
                 // through the scoped-assumption fallback (mirrors the QfNia
                 // arm above). Named-core mode (produce-unsat-cores) redirects
@@ -1173,6 +1357,13 @@ impl Executor {
                 // re-validated, conservative all-assumptions core on UNSAT
                 // (reduction 0, error-free). Retrying an Unknown can only
                 // improve completeness, never flip a decided verdict.
+                // The finite-domain lane decides what its gate admits first
+                // (#dt-fd-session, `dt_finite/assuming.rs`).
+                if let Some(decided) =
+                    self.try_dt_finite_domain_assuming(&base_assertions, assumptions)?
+                {
+                    break 'dt_fd Ok(decided);
+                }
                 let direct = self.solve_with_assumptions_for_theory(
                     &base_assertions,
                     assumptions,
@@ -1187,10 +1378,11 @@ impl Executor {
                     if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace qfdt-assuming direct=unknown retry=scoped");
                     }
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -1226,7 +1418,7 @@ impl Executor {
                 None,
                 DtSolverDispatch::Theory(TheoryKind::AufBv),
             ),
-            LogicCategory::DtAx => {
+            LogicCategory::DtAx => 'dt_fd: {
                 // Same Unknown-retry contract as the QfDt arm above: the
                 // 20230720-blocksworld QF_DT instances (recursive Tower +
                 // 21-ctor enum) classify as DtAx and, in named-core mode,
@@ -1235,6 +1427,13 @@ impl Executor {
                 // pipeline decides. Retrying through the scoped fallback
                 // turns those into answered verdicts (conservative
                 // all-assumptions core on UNSAT — reduction 0, error-free).
+                // The finite-domain lane decides what its gate admits first
+                // (#dt-fd-session, `dt_finite/assuming.rs`).
+                if let Some(decided) =
+                    self.try_dt_finite_domain_assuming(&base_assertions, assumptions)?
+                {
+                    break 'dt_fd Ok(decided);
+                }
                 let direct = self.dt_combined_check_sat_assuming(
                     &base_assertions,
                     assumptions,
@@ -1250,10 +1449,11 @@ impl Executor {
                     if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace dtax-assuming direct=unknown retry=scoped");
                     }
-                    self.solve_scoped_assumptions(
+                    self.solve_scoped_assumptions_with_publication(
                         &base_assertions,
                         assumptions,
                         Self::solve_current_assertions_with_quantifier_support,
+                        publication,
                     )
                 } else {
                     Ok(direct)
@@ -1298,24 +1498,15 @@ impl Executor {
                 Ok(SolveResult::Unknown)
             }
             LogicCategory::Other => {
-                // Match plain check-sat: recognized-but-declined combination
-                // logics return the standard SMT-LIB `unknown`, including when
-                // their dedicated live-content validator rejected an
-                // assumption-only coupling.
-                let declared = self.ctx.logic().unwrap_or("");
-                if FAIL_CLOSED_COMBINED.contains(&declared)
-                    || (features.has_fpa && self.ctx.datatype_iter().next().is_some())
-                {
-                    self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                    Ok(SolveResult::Unknown)
-                } else {
-                    Err(ExecutorError::UnsupportedLogic(
-                        self.ctx.logic().unwrap_or("<unspecified>").to_string(),
-                    ))
-                }
+                // Match plain check-sat: a theory mix with no combined
+                // decision procedure returns the standard SMT-LIB `unknown`,
+                // never an error (see the plain path's `Other` arm).
+                let _ = features;
+                Ok(self.refuse_theory_mix_without_a_lane())
             }
         }?;
         let result = self.fail_close_incomplete_finite_array_sat(Ok(result))?;
+        let result = self.refuse_unsat_held_by_evaluation_stop(result);
 
         let result = if result == SolveResult::Sat {
             // Direct queries emit here. A named-core redirect nested under
@@ -1327,7 +1518,12 @@ impl Executor {
         };
 
         if result == SolveResult::Sat {
-            let public_roots = self.independent_gate_query_roots();
+            let public_roots = match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => {
+                    return Ok(SolveResult::Unknown);
+                }
+            };
             debug_assert!(
                 self.last_model.is_some()
                     || (publication == AssumptionSatPublication::DeferToPlainCheckSat
@@ -1354,9 +1550,12 @@ impl Executor {
                 || self.skip_model_eval
                 || (publication == AssumptionSatPublication::DeferToPlainCheckSat
                     && (self.last_model.is_some()
-                        || self.has_current_pending_certificate_model_transport(
-                            &self.independent_gate_query_roots(),
-                        )))
+                        || self.has_current_pending_certificate_model_transport(&match self
+                            .independent_gate_query_roots()
+                        {
+                            Ok(roots) => roots,
+                            Err(_) => return Ok(SolveResult::Unknown),
+                        },)))
                 || (self.ctx.assertions.is_empty() && assumptions.is_empty()),
             "BUG: check_sat_assuming returned SAT without any model validation path — \
              last_model_validated={}, skip_model_eval={}, assertions={}, assumptions={}",
@@ -1386,6 +1585,21 @@ impl Executor {
     /// SAT selector provenance of the assumptions that triggered them, so we
     /// report all active assumptions as the core rather than a potentially
     /// unsound subset.
+    ///
+    /// The solve runs in an isolated incremental window. The merged vector is
+    /// an ordinary assertion set to every lane below, and the lanes that keep
+    /// a persistent SAT solver (`solve_propositional`, `solve_nia`,
+    /// `solve_nra`, the BV lane) encode what they are handed into it at the
+    /// current scope depth — at depth 0 as a PERMANENT unit. Once the universal
+    /// is handled by instantiation, a ground remainder of free Boolean
+    /// assumptions is exactly such a propositional solve: `(check-sat-assuming
+    /// (g1))` left `g1` asserted for good, and the next query refuted
+    /// `(not g1)` (D10(b), `--z3-mode` wrong UNSAT). The window hands those
+    /// lanes a fresh state and restores the outer one afterwards, so the
+    /// assumptions live exactly as long as this query. It isolates in every
+    /// mode: `solve_without_persistent_encoding` isolates only in incremental
+    /// mode, and the D10(b) witness (two `check-sat-assuming`, no `push`) is
+    /// not incremental.
     fn solve_quantified_assumptions(
         &mut self,
         base_assertions: &[TermId],
@@ -1395,9 +1609,10 @@ impl Executor {
         let mut combined_assertions = base_assertions.to_vec();
         combined_assertions.extend(assumptions.iter().copied());
 
-        let original_assertions = std::mem::replace(&mut self.ctx.assertions, combined_assertions);
-        let solve_result = self.solve_current_assertions_with_quantifier_support();
-        self.ctx.assertions = original_assertions;
+        let solve_result = self
+            .with_isolated_incremental_state(Some(combined_assertions), |exec| {
+                exec.solve_current_assertions_with_quantifier_support()
+            });
 
         match solve_result? {
             SolveResult::Sat => {
@@ -1427,24 +1642,42 @@ impl Executor {
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
-        self.solve_scoped_assumptions(base_assertions, assumptions, Self::solve_fp)
+        self.solve_scoped_assumptions_with_publication(
+            base_assertions,
+            assumptions,
+            Self::solve_fp,
+            publication,
+        )
     }
 
     fn solve_bvfp_with_scoped_assumptions(
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
-        self.solve_scoped_assumptions(base_assertions, assumptions, Self::solve_bvfp)
+        self.solve_scoped_assumptions_with_publication(
+            base_assertions,
+            assumptions,
+            Self::solve_bvfp,
+            publication,
+        )
     }
 
     fn solve_abvfp_with_scoped_assumptions(
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],
+        publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
-        self.solve_scoped_assumptions(base_assertions, assumptions, Self::solve_abvfp)
+        self.solve_scoped_assumptions_with_publication(
+            base_assertions,
+            assumptions,
+            Self::solve_abvfp,
+            publication,
+        )
     }
 
     /// FAIL-CLOSED re-verification of minimized DT assumption cores
@@ -1510,16 +1743,54 @@ impl Executor {
     /// `pub(in crate::executor)`: also the subset-solve engine of the
     /// unsat-core minimization pass (#uc-core-minimize, core_minimize.rs)
     /// for verdicts obtained through the scoped-plain rescue.
+    ///
+    /// The merged vector is an ordinary assertion set to every lane below, and
+    /// the lanes that keep a persistent SAT solver (`solve_nia`, `solve_nra`,
+    /// the LRA and propositional lanes, the BV lane) encode what they are
+    /// handed into the SESSION's state at the current depth — at depth 0 a
+    /// PERMANENT unit. So `(assert (is_int r0)) (check-sat-assuming (p1))
+    /// (check-sat-assuming ((not p1)))` answered the second query under `p1`,
+    /// and `(assert (>= (* y y x) 3)) (check-sat-assuming ((= (mod x 6) 6)))
+    /// (check-sat)` the plain query under the unsatisfiable assumption
+    /// (D10(a), `--z3-mode` wrong UNSAT; the default posture's certification
+    /// rejected the refutation). The solve now runs on lanes that are never
+    /// the session's own (`solve_scoped_window`), in EVERY session. A warm
+    /// retry of an undecided window on the session's own lanes (a private
+    /// scope inside a user scope, discarded lanes at depth 0) was measured and
+    /// withdrawn: the window's residue left later queries `incomplete`, and a
+    /// churning retry spent the query's whole time budget (2026-09-29
+    /// scope-leak fix-up report).
     pub(in crate::executor) fn solve_scoped_assumptions(
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],
         solve: fn(&mut Self) -> Result<SolveResult>,
     ) -> Result<SolveResult> {
+        // Legacy callers own their assumption validation here. In particular,
+        // core-subset probes and the finite-DT assumption helper keep this
+        // behavior; no deferred policy is inferred from session flags.
+        self.solve_scoped_assumptions_with_publication(
+            base_assertions,
+            assumptions,
+            solve,
+            AssumptionSatPublication::EmitHere,
+        )
+    }
+
+    /// Solve the exact scoped conjunction, respecting the caller that owns
+    /// publication. Only the private named-core plain-check caller can select
+    /// deferred publication; an inner SAT is then a proposal for the restored
+    /// outer SAT funnel, with no validation claim or public certificate.
+    fn solve_scoped_assumptions_with_publication(
+        &mut self,
+        base_assertions: &[TermId],
+        assumptions: &[TermId],
+        solve: fn(&mut Self) -> Result<SolveResult>,
+        publication: AssumptionSatPublication,
+    ) -> Result<SolveResult> {
         let mut combined_assertions = base_assertions.to_vec();
         combined_assertions.extend(assumptions.iter().copied());
 
-        let original_assertions = std::mem::replace(&mut self.ctx.assertions, combined_assertions);
         // Belt for R1: this route merges query-local ASSUMPTIONS into the
         // assertion vector. The persistent FP lane would encode each one into
         // `encoded_assertions` and install its activation unit at the current
@@ -1528,6 +1799,8 @@ impl Executor {
         // wrong SAT as soon as a negated assumption is retained). The primary
         // dispatch already declines to arm while `last_assumptions` is set;
         // this makes the sub-solve stateless no matter how it was reached.
+        // (`solve_scoped_window` below does not cover the FP lane, so this
+        // belt stays.)
         self.fp_persistent_armed = false;
         // The scoped route merges the assumptions INTO `ctx.assertions`, so
         // the inner solve sees the complete problem exactly as a plain
@@ -1537,15 +1810,62 @@ impl Executor {
         // here — their bail exists because they read only `ctx.assertions`,
         // which on THIS route is the full conjunction. Restored afterward
         // for `get-unsat-assumptions`.
-        let saved_assumptions = self.last_assumptions.take();
-        let solve_result = solve(self);
-        self.last_assumptions = saved_assumptions;
+        // Proof authority and model DATA both retain the actual original
+        // assumption window while solver lanes see the lowered assertions.
+        let saved_authority = self.install_scoped_assumption_authority(assumptions);
+        let saved_window = self
+            .model_construction_assumptions
+            .replace(OriginalModelAssumptions(self.last_assumptions.take()));
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!("c phase-trace scoped-assumptions window=fresh-lanes every-session");
+        }
+        let original_assertions = std::mem::replace(&mut self.ctx.assertions, combined_assertions);
+        let solve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.solve_scoped_window(solve)
+        }));
         self.ctx.assertions = original_assertions;
+        let original = self.model_construction_assumptions.take();
+        self.model_construction_assumptions = saved_window;
+        let Some(original) = original else {
+            self.proof_problem_assertion_provenance = saved_authority;
+            return Err(ExecutorError::ModelValidation(
+                crate::executor_types::ModelValidationError::incomplete(
+                    ay_core::VerificationBoundary::SmtAssumption,
+                    "scoped query lost its original assumption window",
+                ),
+            ));
+        };
+        self.last_assumptions = original.0;
+        // Restore original proof authority after the separate assumption slot
+        // is live again, and before propagating an error or unwind.
+        if matches!(&solve_result, Ok(Ok(_))) {
+            self.reroot_proof_authority(saved_authority.as_ref());
+        } else {
+            self.proof_problem_assertion_provenance = saved_authority;
+        }
+        let solve_result = solve_result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
         match solve_result? {
             SolveResult::Sat => {
                 self.last_result = Some(SolveResult::Sat);
-                self.finalize_sat_assumption_validation(assumptions)
+                match publication {
+                    AssumptionSatPublication::EmitHere => {
+                        self.finalize_sat_assumption_validation(assumptions)
+                    }
+                    AssumptionSatPublication::DeferToPlainCheckSat => {
+                        // Keep the former finalizer's stop boundary. A stop is
+                        // terminal even though ordinary validation belongs to
+                        // the caller after it restores the original roots.
+                        if self.publish_evaluation_stop() {
+                            return Ok(SolveResult::Unknown);
+                        }
+                        // Do not complete, evaluate, fabricate or certify this
+                        // candidate in the stripped base/assumption view.
+                        self.last_model_validated = false;
+                        self.last_sat_certificate = None;
+                        Ok(SolveResult::Sat)
+                    }
+                }
             }
             SolveResult::Unsat(_) => {
                 self.last_assumption_core = Some(assumptions.to_vec());
@@ -1561,8 +1881,14 @@ impl Executor {
         result: SolveResult,
         publication: AssumptionSatPublication,
     ) -> SolveResult {
+        let result = self.refuse_unsat_held_by_evaluation_stop(result);
         if result.is_sat() {
-            let public_roots = self.independent_gate_query_roots();
+            let public_roots = match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => {
+                    return SolveResult::Unknown;
+                }
+            };
             debug_assert!(
                 self.last_model.is_some()
                     || (publication == AssumptionSatPublication::DeferToPlainCheckSat
@@ -1583,34 +1909,13 @@ impl Executor {
                 "BUG: UNSAT assumption core contains terms not in the original assumptions"
             );
         }
-        // SOUNDNESS (QF_LRA false-UNSAT, multi-path): the check-sat-assuming
-        // path does NOT route through solve_lra_incremental, so it bypasses the
-        // plain-check-sat disequality/distinct re-verify guard. A differential
-        // fuzz vs z3 found QF_LRA false-UNSATs here on `distinct`-involving
-        // formulas (AY unsat where z3 sat). Mirror the plain-path defense as a
-        // uniform fail-closed gate: for QF_LRA/LRA, when the result is UNSAT and
-        // the active assertions contain a fragile construct (distinct,
-        // (not (= ..)), ite, or — the constructs implicated in the QF_LRA DPLL(T)
-        // false-UNSATs), downgrade the suspect UNSAT to a sound `unknown`. Pure-
-        // conjunctive-linear QF_LRA (k-induction hybrid_networks: no ite/or/
-        // distinct) never trips this, so its completeness/throughput is
-        // unaffected; only the fragile-construct cases (the buggy ones) fail
-        // closed. The gate is UNCONDITIONAL: the former
-        // AY_NO_LRA_CSA_UNSAT_GUARD=1 kill switch is removed — no environment
-        // variable may turn off a soundness guard.
-        // The scan MUST cover the assumption literals as well as
-        // `ctx.assertions`: with `:produce-unsat-cores`, named assertions are
-        // moved out of the base assertion set into the assumption set for the
-        // duration of the check (by the plain-check-sat named-core redirect
-        // and by `check_sat_assuming_with_named_cores`), and user assumption
-        // literals feed the same fragile solving path — scanning the stripped
-        // base alone would let a suspect UNSAT through this fail-close gate
-        // whenever the only fragile construct lives in a named assertion or
-        // an assumption literal.
-        if result.is_unsat()
-            && self.logic().is_some_and(|l| l == "QF_LRA" || l == "LRA")
-            && self.lra_roots_contain_disequality(assumptions)
-        {
+        // SOUNDNESS (QF_LRA false-UNSAT, multi-path): a disequality/ite/or
+        // bearing QF_LRA/LRA assumption UNSAT publishes only with an
+        // independent checked certificate; otherwise it fails closed to
+        // `unknown`. The scan covers the assumption literals as well as
+        // `ctx.assertions` (named assertions live in the assumption set under
+        // `:produce-unsat-cores`). See `fragile_lra_gate.rs`.
+        if result.is_unsat() && self.fragile_lra_assumption_unsat_uncertified(assumptions) {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             let result = self.finalize_assumption_unknown(publication);
             if publication == AssumptionSatPublication::EmitHere {
@@ -1750,3 +2055,7 @@ mod solve_session_reset_tests {
 include!("check_sat_assuming/nested_recheck_authority_tests.rs");
 #[cfg(test)]
 mod nested_publication_tests;
+
+#[cfg(test)]
+#[path = "check_sat_assuming/scoped_publication_tests.rs"]
+mod scoped_publication_tests;

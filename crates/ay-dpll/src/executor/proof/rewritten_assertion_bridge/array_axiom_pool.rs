@@ -154,7 +154,7 @@ impl Executor {
             premises: vec![ProofId(0), ProofId(1)],
             args: Vec::new(),
         });
-        ay_proof::check_proof_strict(&probe, &self.ctx.terms).is_ok()
+        self.check_proof_strict_until_stopped(&probe).is_ok()
     }
 
     /// Guard 7: whether the `ArraySelectStore { index_eq: true }` leaf for
@@ -184,6 +184,6 @@ impl Executor {
             premises: vec![ProofId(0), ProofId(1)],
             args: Vec::new(),
         });
-        ay_proof::check_proof_strict(&probe, &self.ctx.terms).is_ok()
+        self.check_proof_strict_until_stopped(&probe).is_ok()
     }
 }

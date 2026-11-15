@@ -1,0 +1,48 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): a top-level rule executed while an order
+* definition had its own constraint database installed.
+*
+* `pre_order`/`def_order` and `spec` return `true` from
+* `Checkable::swaps_database`, so from here to the matching `end` the checker
+* runs against a fresh, EMPTY sub-database and the formula's is parked in the
+* `OrderContext`. The only positional gate `execute_rule` had refused a rule
+* that is not `is_subproof_friendly`, and only when the innermost subcontext
+* answered `Subcontext::is_subproof()` -- false for exactly the four
+* subcontexts an order definition opens. The version 3.0 parser covered the
+* gap with its `Scope` ladder; the version 2.0 parser dispatches every line
+* through one flat match with no scope state at all, so any rule could be
+* written here.
+*
+* `sol` validates its assignment with `utils::check_solution`, which iterates
+* the INSTALLED database -- empty -- so it passed vacuously and set
+* `best_valid_objective_value`, which is the whole of the evidence a
+* `conclusion SAT` without a hint rests on. The formula is unsatisfiable by
+* inspection: `x1 = 1` falsifies `1 ~x1 >= 1` and `x1 = 0` falsifies
+* `1 x1 >= 1`. This used to print `s VERIFIED SATISFIABLE` at exit 0 under
+* default flags, from the same binary that verifies its true UNSAT proof in
+* correct/version2/order_definition_sol_outside.
+f 2
+pre_order simple
+    sol x1
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+output NONE
+conclusion SAT
+end pseudo-Boolean proof

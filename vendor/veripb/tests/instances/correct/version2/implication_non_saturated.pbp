@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 2.0
+f 1
+ia 5 x1 4 x2 4 x3 >= 3 ; 1
+e 5 x1 4 x2 4 x3 >= 3 ; -1
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

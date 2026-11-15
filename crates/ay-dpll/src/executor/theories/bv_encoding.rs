@@ -14,7 +14,6 @@
 //! - Fresh (non-incremental): pushes binary `CnfClause`s into `all_clauses`
 //! - Persistent (incremental): adds global `SatLiteral` clauses to the SAT solver
 
-use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 // #8529: Use deterministic hash maps in all builds.
@@ -26,72 +25,10 @@ use ay_sat::Solver as SatSolver;
 
 use super::debug_linking_enabled;
 
-/// Offset a DIMACS-style CNF literal by `var_offset`.
-///
-/// Positive literals are shifted up, negative literals are shifted down,
-/// preserving sign semantics. Both BV solve paths use this to translate
-/// bitblasted variables past the Tseitin range.
-#[inline]
-pub(in crate::executor::theories) fn offset_cnf_lit(lit: i32, var_offset: i32) -> i32 {
-    if lit > 0 {
-        lit + var_offset
-    } else {
-        lit - var_offset
-    }
-}
-
-/// Offset all literals in `clauses` by `var_offset` and push into `all_clauses`.
-pub(in crate::executor::theories) fn offset_and_push_clauses(
-    clauses: impl IntoIterator<Item = CnfClause>,
-    var_offset: i32,
-    all_clauses: &mut Vec<CnfClause>,
-) {
-    for clause in clauses {
-        let offset_lits: Vec<i32> = clause
-            .literals()
-            .iter()
-            .map(|&lit| offset_cnf_lit(lit, var_offset))
-            .collect();
-        all_clauses.push(CnfClause::new(offset_lits));
-    }
-}
-
-/// Add `clauses` to the persistent SAT solver without changing variable IDs.
-pub(in crate::executor::theories) fn add_clauses_global<T>(
-    solver: &mut SatSolver,
-    clauses: impl IntoIterator<Item = T>,
-) where
-    T: Borrow<CnfClause>,
-{
-    for clause in clauses {
-        let lits = clause
-            .borrow()
-            .literals()
-            .iter()
-            .map(|&lit| crate::cnf_lit_to_sat(lit))
-            .collect();
-        solver.add_clause_global(lits);
-    }
-}
-
-/// Add `clauses` to the persistent SAT solver after offsetting each literal.
-pub(in crate::executor::theories) fn add_offset_clauses_global<T>(
-    solver: &mut SatSolver,
-    clauses: impl IntoIterator<Item = T>,
-    var_offset: i32,
-) where
-    T: Borrow<CnfClause>,
-{
-    for clause in clauses {
-        let lits = clause
-            .borrow()
-            .literals()
-            .iter()
-            .map(|&lit| crate::cnf_lit_to_sat(offset_cnf_lit(lit, var_offset)))
-            .collect();
-        solver.add_clause_global(lits);
-    }
-}
+mod cnf_offset;
+pub(in crate::executor::theories) use cnf_offset::{
+    add_clauses_global, add_offset_clauses_global, offset_and_push_clauses, offset_cnf_lit,
+};
 
 /// Shared result of BV predicate/Bool linking.
 pub(in crate::executor::theories) struct BvLinkingBatch {
@@ -372,14 +309,42 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
         collect_bv_eqs(terms, assertion, &mut asserted_bv_eqs);
     }
 
+    // Positions in `bv_eq_terms` of the equalities each term is an argument
+    // of. For an asserted `a = b` only the equalities mentioning `a` or `b`
+    // can produce a clause, so the scan below visits exactly those, in
+    // `bv_eq_terms` order: the clauses and their order are unchanged. Scanning
+    // every equality for every asserted one was quadratic, and polled no stop:
+    // on UFBVLIA Schett `ebso-157` the `--z3-mode` run was inside this loop
+    // 9-12 s into a `-T:10` run (sampled) and ended in the watchdog's hard exit.
+    let mut positions_by_arg: HashMap<TermId, Vec<usize>> = HashMap::default();
+    for (position, (eq_term, _)) in bv_eq_terms.iter().enumerate() {
+        if let TermData::App(_, ref args) = terms.get(*eq_term) {
+            for &arg in args.iter() {
+                let positions = positions_by_arg.entry(arg).or_default();
+                if positions.last() != Some(&position) {
+                    positions.push(position);
+                }
+            }
+        }
+    }
     let mut clauses = Vec::new();
     let mut newly_emitted_pairs = Vec::new();
     let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
+    let mut candidates: Vec<usize> = Vec::new();
     for &(var_a, var_b) in &asserted_bv_eqs {
         let Some(&(_, hyp_lit)) = var_eq_index.get(&(var_a, var_b)) else {
             continue;
         };
-        for (eq_term, eq_lit) in &bv_eq_terms {
+        candidates.clear();
+        for var in [var_a, var_b] {
+            if let Some(positions) = positions_by_arg.get(&var) {
+                candidates.extend_from_slice(positions);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for &position in &candidates {
+            let (eq_term, eq_lit) = &bv_eq_terms[position];
             if let TermData::App(_, ref eq_args) = terms.get(*eq_term) {
                 let other_c = if eq_args[0] == var_a {
                     Some(eq_args[1])

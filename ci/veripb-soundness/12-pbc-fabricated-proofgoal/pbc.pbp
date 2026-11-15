@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+pbc >= 1 : subproof
+proofgoal 1
+rup >= 1 ;
+qed;
+qed;
+output NONE;
+conclusion UNSAT ;
+end pseudo-Boolean proof;

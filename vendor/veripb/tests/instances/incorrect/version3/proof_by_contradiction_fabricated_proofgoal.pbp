@@ -1,0 +1,23 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): the same defect as
+% proof_by_contradiction_proofgoal_not_contradiction, aimed at a SATISFIABLE
+% formula instead of a tautology. `x1 = 1, x2 = 0` satisfies both constraints
+% -- see the companion proof_by_contradiction_fabricated_proofgoal under
+% correct/version3, which certifies exactly that -- yet this used to verify as
+% `s VERIFIED UNSATISFIABLE`.
+%
+% `proofgoal 1` inside the `pbc` was answered with a goal invented from
+% database constraint 1, whose discharge is free, and discharging it set
+% `contradiction_proven`, so the `pbc` added `+1 ~x1 >= 1` without ever showing
+% a contradiction from `1 x1 >= 1`. With `~x1` in the database the following
+% `rup >= 1` then closed the proof.
+f 2;
+pbc +1 ~x1 >= 1 : subproof
+    proofgoal 1
+        pol -1 1 +;
+    qed;
+qed;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

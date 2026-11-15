@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+f 4;
+strengthening_to_core on;
+pol 3 1 * 4 1 * +;
+red 1 x3 >= 1 : x3 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

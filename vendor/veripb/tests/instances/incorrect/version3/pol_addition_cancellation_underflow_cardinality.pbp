@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% The same underflow through `Cardinality::add`. The formula is trivially true, so the
+% derived constraint cannot be a contradiction under any reading.
+f 1 ;
+pol 1 ~x1 + ;
+output NONE;
+conclusion UNSAT : 2 ;
+end pseudo-Boolean proof;

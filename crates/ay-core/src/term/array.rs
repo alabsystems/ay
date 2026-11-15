@@ -6,6 +6,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod select_walk_tests;
+
 enum StoreIndexRewrite {
     Keep,
     SwapDistinct,
@@ -15,106 +18,114 @@ impl TermStore {
     // ==================== Array Operations ====================
 
     /// Create array select with read-over-write simplification: (select a i)
-    pub fn mk_select(&mut self, array: TermId, index: TermId) -> TermId {
-        // Get the element sort from the array sort
-        let elem_sort = match self.sort(array).array_element() {
-            Some(elem_sort) => {
-                debug_assert!(
-                    self.sort(array).array_index() == Some(self.sort(index)),
-                    "BUG: mk_select index sort mismatch: expected {:?}, got {:?}",
-                    self.sort(array).array_index(),
-                    self.sort(index)
-                );
-                elem_sort.clone()
+    pub fn mk_select(&mut self, mut array: TermId, index: TermId) -> TermId {
+        // Walk only the concrete, distinct-index store tail. Every visited
+        // array repeats the original sort checks and rewrite precedence.
+        // In particular, malformed raw inner nodes must not inherit the
+        // outer node's sort. Array-map recursion below is unchanged.
+        loop {
+            // Get the element sort from the array sort
+            let elem_sort = match self.sort(array).array_element() {
+                Some(elem_sort) => {
+                    debug_assert!(
+                        self.sort(array).array_index() == Some(self.sort(index)),
+                        "BUG: mk_select index sort mismatch: expected {:?}, got {:?}",
+                        self.sort(array).array_index(),
+                        self.sort(index)
+                    );
+                    elem_sort.clone()
+                }
+                None => {
+                    // Sort mismatch: caller passed a non-Array term.
+                    // CHC solver paths (algebraic invariant validation, portfolio
+                    // query-only verification) can hit this when back-translated
+                    // model variables have degraded sorts. Return a dummy select
+                    // term so catch_ay_panics / SMT Unknown handles it gracefully.
+                    return self.intern(
+                        TermData::App(Symbol::named("select"), vec![array, index]),
+                        Sort::Bool,
+                    );
+                }
+            };
+
+            // Read-over-const-array simplification: select(const-array(v), i) → v
+            if let Some(default_value) = self.get_const_array(array) {
+                return default_value;
             }
-            None => {
-                // Sort mismatch: caller passed a non-Array term.
-                // CHC solver paths (algebraic invariant validation, portfolio
-                // query-only verification) can hit this when back-translated
-                // model variables have degraded sorts. Return a dummy select
-                // term so catch_ay_panics / SMT Unknown handles it gracefully.
+
+            // Read-over-lambda-array simplification (beta reduction):
+            // select(lambda(x) body, idx) → body[x/idx]
+            //
+            // Z3 ref: array_rewriter.cpp lambda reduction, theory_array_full.cpp:572
+            if let Some((var_term, body)) = self.get_lambda_array(array) {
+                return self.substitute_var(body, var_term, index);
+            }
+
+            // Read-over-as-array simplification:
+            // select(as-array(f), i) → f(i)
+            //
+            // This implements the select-as-array axiom at the term rewriting level.
+            // Z3 ref: theory_array_full.cpp:637-666 (instantiate_select_as_array_axiom)
+            if let Some(func_name) = self.get_as_array_func(array) {
+                let func_name = func_name.to_string();
                 return self.intern(
-                    TermData::App(Symbol::named("select"), vec![array, index]),
-                    Sort::Bool,
+                    TermData::App(Symbol::named(&func_name), vec![index]),
+                    elem_sort,
                 );
             }
-        };
 
-        // Read-over-const-array simplification: select(const-array(v), i) → v
-        if let Some(default_value) = self.get_const_array(array) {
-            return default_value;
-        }
+            // Read-over-map simplification:
+            // select(map[f](a1,...,an), i) → f(select(a1,i),...,select(an,i))
+            //
+            // This implements the select-map axiom at the term rewriting level,
+            // following Z3's approach in array_rewriter.cpp:296-306.
+            // The rewrite eagerly unfolds map applications during term construction,
+            // exposing the underlying function application to the EUF/theory solvers.
+            if let Some((func_name, map_args)) = self.get_array_map(array) {
+                let func_name = func_name.to_string();
+                let map_args = map_args.to_vec();
+                let selects: Vec<TermId> = map_args
+                    .iter()
+                    .map(|&arr| self.mk_select(arr, index))
+                    .collect();
+                return self.intern(TermData::App(Symbol::named(&func_name), selects), elem_sort);
+            }
 
-        // Read-over-lambda-array simplification (beta reduction):
-        // select(lambda(x) body, idx) → body[x/idx]
-        //
-        // Z3 ref: array_rewriter.cpp lambda reduction, theory_array_full.cpp:572
-        if let Some((var_term, body)) = self.get_lambda_array(array) {
-            return self.substitute_var(body, var_term, index);
-        }
-
-        // Read-over-as-array simplification:
-        // select(as-array(f), i) → f(i)
-        //
-        // This implements the select-as-array axiom at the term rewriting level.
-        // Z3 ref: theory_array_full.cpp:637-666 (instantiate_select_as_array_axiom)
-        if let Some(func_name) = self.get_as_array_func(array) {
-            let func_name = func_name.to_string();
-            return self.intern(
-                TermData::App(Symbol::named(&func_name), vec![index]),
-                elem_sort,
-            );
-        }
-
-        // Read-over-map simplification:
-        // select(map[f](a1,...,an), i) → f(select(a1,i),...,select(an,i))
-        //
-        // This implements the select-map axiom at the term rewriting level,
-        // following Z3's approach in array_rewriter.cpp:296-306.
-        // The rewrite eagerly unfolds map applications during term construction,
-        // exposing the underlying function application to the EUF/theory solvers.
-        if let Some((func_name, map_args)) = self.get_array_map(array) {
-            let func_name = func_name.to_string();
-            let map_args = map_args.to_vec();
-            let selects: Vec<TermId> = map_args
-                .iter()
-                .map(|&arr| self.mk_select(arr, index))
-                .collect();
-            return self.intern(TermData::App(Symbol::named(&func_name), selects), elem_sort);
-        }
-
-        // Read-over-write simplification: select(store(a, i, v), i) → v
-        if let TermData::App(Symbol::Named(name), args) = self.get(array) {
-            if name == "store" {
-                if let &[inner_array, store_index, store_value] = args.as_slice() {
-                    // If indices are identical, return the stored value
-                    if store_index == index {
-                        return store_value;
-                    }
-
-                    // If both indices are constants and different, look through
-                    if let (Some(idx1), Some(idx2)) =
-                        (self.get_int(index), self.get_int(store_index))
-                    {
-                        if idx1 != idx2 {
-                            return self.mk_select(inner_array, index);
+            // Read-over-write simplification: select(store(a, i, v), i) → v
+            if let TermData::App(Symbol::Named(name), args) = self.get(array) {
+                if name == "store" {
+                    if let &[inner_array, store_index, store_value] = args.as_slice() {
+                        // If indices are identical, return the stored value
+                        if store_index == index {
+                            return store_value;
                         }
-                    }
-                    if let (Some((val1, _)), Some((val2, _))) =
-                        (self.get_bitvec(index), self.get_bitvec(store_index))
-                    {
-                        if val1 != val2 {
-                            return self.mk_select(inner_array, index);
+
+                        // If both indices are constants and different, look through
+                        if let (Some(idx1), Some(idx2)) =
+                            (self.get_int(index), self.get_int(store_index))
+                        {
+                            if idx1 != idx2 {
+                                array = inner_array;
+                                continue;
+                            }
+                        }
+                        if let (Some((val1, _)), Some((val2, _))) =
+                            (self.get_bitvec(index), self.get_bitvec(store_index))
+                        {
+                            if val1 != val2 {
+                                array = inner_array;
+                                continue;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        self.intern(
-            TermData::App(Symbol::named("select"), vec![array, index]),
-            elem_sort,
-        )
+            return self.intern(
+                TermData::App(Symbol::named("select"), vec![array, index]),
+                elem_sort,
+            );
+        }
     }
 
     /// Create an array store (write) operation: (store a i v)

@@ -26,10 +26,11 @@ fn rq(n: i64, d: i64) -> Anum {
 }
 
 /// `sqrt(d)`: the positive root of `x^2 - d`, isolated in `(0, d + 1)`.
+/// `-d` and `d + 1` are formed over `BigInt`, so no `i64` can overflow them.
 fn sqrt(d: i64) -> Anum {
-    let p = vec![BigInt::from(-d), BigInt::zero(), BigInt::one()];
-    let iv =
-        BqInterval::new(Bq::zero(), Bq::from_int(BigInt::from(d + 1))).expect("bracket is ordered");
+    let d = BigInt::from(d);
+    let p = vec![-d.clone(), BigInt::zero(), BigInt::one()];
+    let iv = BqInterval::new(Bq::zero(), Bq::from_int(d + 1)).expect("bracket is ordered");
     Anum::from_poly_interval(&p, &iv).expect("x^2 - d has one root in (0, d+1)")
 }
 
@@ -138,7 +139,7 @@ fn ialg_disjoint_algebraic_intersection_is_empty() {
 // ====== justifications ======
 
 #[test]
-fn ialg_intersection_keeps_both_justifications() {
+fn ialg_intersection_keeps_both_justifications() -> Result<(), Box<dyn std::error::Error>> {
     let ja = Just::of(7).expect("nonzero");
     let jb = Just::of(-9).expect("nonzero");
     let a = DecidedInterval::from_bounds(fin(ri(0)), false, fin(ri(10)), false, ja)
@@ -153,8 +154,13 @@ fn ialg_intersection_keeps_both_justifications() {
     let sb = IntervalSet::normalize(vec![b]).expect("ok");
     let inter = sa.intersect(&sb).expect("decided");
     assert_eq!(inter.len(), 1);
-    assert_eq!(inter.intervals()[0].just().lits(), &[-9, 7]);
+    let first = inter
+        .intervals()
+        .first()
+        .ok_or("intersection has no interval")?;
+    assert_eq!(first.just().lits(), &[-9, 7]);
     assert_eq!(inter.justification().expect("ok").lits(), &[-9, 7]);
+    Ok(())
 }
 
 #[test]

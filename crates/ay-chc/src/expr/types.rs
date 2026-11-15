@@ -9,6 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+pub use super::datatype_identity::{ChcDtConstructors, ChcDtId};
 use crate::PredicateId;
 
 /// A selector (field) in a datatype constructor.
@@ -38,10 +39,13 @@ pub enum ChcSort {
     /// Uninterpreted sort
     Uninterpreted(String),
     /// Algebraic datatype with constructor/selector/tester metadata.
-    /// `Arc` avoids cloning the metadata on every sort copy.
+    ///
+    /// The constructors are hash-consed and identified by content
+    /// ([`ChcDtConstructors`]): a copy shares them, and `Eq`, `Hash` and `Ord`
+    /// cost the name plus `O(1)`, however deeply other datatypes nest inside.
     Datatype {
         name: String,
-        constructors: Arc<Vec<ChcDtConstructor>>,
+        constructors: ChcDtConstructors,
     },
 }
 
@@ -54,6 +58,25 @@ impl fmt::Display for ChcSort {
             Self::BitVec(w) => write!(f, "(_ BitVec {w})"),
             Self::Array(k, v) => write!(f, "(Array {k} {v})"),
             Self::Uninterpreted(name) | Self::Datatype { name, .. } => write!(f, "{name}"),
+        }
+    }
+}
+
+impl ChcSort {
+    /// Short symbol-safe tag used by [`ChcVar::sort_qualified_name`]: `Bool`,
+    /// `Int`, `Real`, `BV<w>`, and a letters/digits/underscore rendering of
+    /// compound sorts (`ArrayIntInt`).
+    pub fn qualifier_tag(&self) -> String {
+        match self {
+            Self::Bool => "Bool".to_string(),
+            Self::Int => "Int".to_string(),
+            Self::Real => "Real".to_string(),
+            Self::BitVec(w) => format!("BV{w}"),
+            other => other
+                .to_string()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect(),
         }
     }
 }
@@ -89,6 +112,14 @@ impl ChcVar {
             name: name.into(),
             sort,
         }
+    }
+
+    /// `name!<tag>` — the sort-qualified spelling a text script uses when
+    /// two same-named variables of different sorts share one query (Rung 0,
+    /// see `crate::smt::sort_unique`). `!` is a legal SMT-LIB simple-symbol
+    /// character, so the name round-trips through `get-model` unchanged.
+    pub fn sort_qualified_name(&self) -> String {
+        format!("{}!{}", self.name, self.sort.qualifier_tag())
     }
 
     /// Check if this is a primed variable (ends with ')
@@ -258,14 +289,13 @@ impl ChcOp {
 
 /// CHC expression
 ///
-/// `PartialEq`/`Eq` are implemented manually (see below) with an `Arc::ptr_eq`
-/// short-circuit for the hash-cons fast core; `Hash`/`Ord` stay derived and
-/// structural so the trait laws hold by construction.
-// Structural derived `Hash` is consistent with the manual `PartialEq`/`Eq`
-// (whose `Arc::ptr_eq` short-circuit only agrees faster with structural equality);
-// the trait laws hold by construction, so the derive/manual-eq pair is intentional.
-#[allow(clippy::derived_hash_with_manual_eq)]
-#[derive(Debug, Clone, Hash, PartialOrd, Ord)]
+/// `PartialEq`/`Eq` and `Hash` are implemented manually (`expr/structural.rs`); `Ord`
+/// stays derived and structural. All three are pure functions of structure,
+/// so `a == b ⟹ hash(a) == hash(b)` and `a == b ⟺ cmp(a, b) == Equal` hold.
+/// The manual impls exist because children are shared `Arc`s: an expression
+/// is a DAG whose tree expansion can be exponentially larger, and a walk per
+/// incoming edge (what the derives do) costs the tree size (WP-F F0a).
+#[derive(Debug, Clone, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum ChcExpr {
     /// Boolean constant
@@ -304,58 +334,7 @@ pub enum ChcExpr {
     /// Constant array: all elements have the same value.
     /// Fields: (key_sort, value_expr).
     ConstArray(ChcSort, Arc<Self>),
-}
-
-impl PartialEq for ChcExpr {
-    /// Structural equality with an `Arc::ptr_eq` fast path on children
-    /// (#9077, fast-core P1).
-    ///
-    /// This returns *exactly* the same result as the previously-derived
-    /// structural `PartialEq` — for every child pair `(x, y)` it evaluates
-    /// `Arc::ptr_eq(x, y) || x == y`, and `ptr_eq ⟹ same allocation ⟹
-    /// structurally equal`, so the disjunction equals structural equality at
-    /// every node (the Decoupling Theorem in
-    /// the development design notes). Interning makes
-    /// the `ptr_eq` branch fire on shared subterms (O(1) instead of O(tree));
-    /// correctness never depends on interning, because the structural fallback
-    /// is always taken otherwise. `Hash`/`Ord` remain derived & structural, so
-    /// `a == b ⟹ hash(a) == hash(b)` and `a == b ⟺ cmp(a, b) == Equal` hold.
-    ///
-    /// NOTE: `Real(n, d)` compares structurally (numerator AND denominator),
-    /// identical to the derive — `1/2` and `2/4` are NOT equal here.
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Real(an, ad), Self::Real(bn, bd)) => an == bn && ad == bd,
-            (Self::BitVec(av, aw), Self::BitVec(bv, bw)) => av == bv && aw == bw,
-            (Self::Var(a), Self::Var(b)) => a == b,
-            (Self::Op(ao, aa), Self::Op(bo, ba)) => ao == bo && children_eq(aa, ba),
-            (Self::PredicateApp(an, ai, aa), Self::PredicateApp(bn, bi, ba)) => {
-                ai == bi && an == bn && children_eq(aa, ba)
-            }
-            (Self::FuncApp(an, asort, aa), Self::FuncApp(bn, bsort, ba)) => {
-                an == bn && asort == bsort && children_eq(aa, ba)
-            }
-            (Self::ConstArrayMarker(a), Self::ConstArrayMarker(b)) => a == b,
-            (Self::IsTesterMarker(a), Self::IsTesterMarker(b)) => a == b,
-            (Self::ConstArray(asort, av), Self::ConstArray(bsort, bv)) => {
-                asort == bsort && (Arc::ptr_eq(av, bv) || av == bv)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for ChcExpr {}
-
-/// Compare child slices with a per-element `Arc::ptr_eq` short-circuit before
-/// the structural recursion. Same result as `aa == ba` on the slices.
-#[inline]
-fn children_eq(aa: &[Arc<ChcExpr>], ba: &[Arc<ChcExpr>]) -> bool {
-    aa.len() == ba.len()
-        && aa
-            .iter()
-            .zip(ba.iter())
-            .all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+    /// Single-index array lambda, represented by closed code and explicit captures.
+    /// Boxed to preserve the common expression's 128-byte FP adapter budget.
+    ArrayLambda(Box<super::ChcArrayLambda>),
 }

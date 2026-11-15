@@ -78,7 +78,9 @@ Choosing the DIMACS convention yourself
 
 Signals
 
-  SIGTERM   Cooperative: ay prints the unknown verdict, then exits 124
+  SIGTERM   Cooperative: ay answers the query in flight unknown, with the
+            reason canceled (a deadline's is timeout), then exits 124 --
+            or 0 when an earlier query's sat or unsat is already on stdout
   SIGINT    The solve is killed outright; no verdict, and your shell
   SIGHUP    reports the kill (137) rather than an ay exit code
 

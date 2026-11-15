@@ -3,12 +3,14 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated euf integration tests for ay-dpll.
-//! Groups 13 test modules into a single binary to reduce link time.
+//! Groups 16 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
 mod common;
 
+#[path = "group_euf/bool_constant_argument_congruence.rs"]
+mod bool_constant_argument_congruence;
 #[path = "group_euf/euf_bool_alias_6869.rs"]
 mod euf_bool_alias_6869;
 #[path = "group_euf/euf_diseq_orientation_6152.rs"]

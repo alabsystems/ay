@@ -60,7 +60,10 @@ fn add_canonical_text_payload(bytes: &mut usize, text: &str) -> bool {
         .is_some_and(|amount| add_canonical_payload(bytes, amount))
 }
 
-fn canonical_constant_payload_is_bounded(constant: &Constant, bytes: &mut usize) -> bool {
+pub(super) fn canonical_constant_payload_is_bounded(
+    constant: &Constant,
+    bytes: &mut usize,
+) -> bool {
     let payload = match constant {
         Constant::Bool(_) => 5,
         Constant::Int(value) => match usize::try_from(value.bits()) {
@@ -155,7 +158,10 @@ fn canonical_sort_payload_is_bounded(root: &Sort, bytes: &mut usize) -> bool {
     true
 }
 
-fn canonical_symbol_payload_bound(symbol: &Symbol, bytes: &mut usize) -> CanonicalRenderBound {
+pub(super) fn canonical_symbol_payload_bound(
+    symbol: &Symbol,
+    bytes: &mut usize,
+) -> CanonicalRenderBound {
     match symbol {
         // Constant-array rendering recursively formats a sort as well as its
         // child. This narrow arithmetic lane does not admit that unmetered
@@ -242,6 +248,14 @@ pub(super) fn canonical_term_is_bounded_for_authored_assume(
     terms: &TermStore,
     root: TermId,
 ) -> CanonicalRenderBound {
+    canonical_term_is_bounded_with_depth(terms, root, MAX_EQUIVALENCE_DEPTH)
+}
+
+pub(super) fn canonical_term_is_bounded_with_depth(
+    terms: &TermStore,
+    root: TermId,
+    max_depth: usize,
+) -> CanonicalRenderBound {
     let mut stack = vec![(root, 0usize)];
     let mut nodes = 0usize;
     let mut bytes = 0usize;
@@ -250,7 +264,7 @@ pub(super) fn canonical_term_is_bounded_for_authored_assume(
     // rendering bounds.
     let mut unsupported_shape = false;
     while let Some((term, depth)) = stack.pop() {
-        if depth > MAX_EQUIVALENCE_DEPTH {
+        if depth > max_depth {
             return CanonicalRenderBound::ExceedsBound;
         }
         let Some(next_nodes) = nodes.checked_add(1) else {
@@ -366,6 +380,49 @@ pub(super) fn canonical_term_is_bounded_for_authored_assume(
     } else {
         CanonicalRenderBound::Bounded
     }
+}
+
+/// Conservative canonical allocation charge, measured from borrowed payloads.
+/// Admission first proves the immutable tree fits all existing structural
+/// bounds; this second, bounded walk retains their byte model without rendering.
+pub(super) fn canonical_rendering_work_upper_bound(terms: &TermStore, root: TermId) -> Option<u64> {
+    if !canonical_term_is_bounded_for_authored_assume(terms, root).is_bounded() {
+        return None;
+    }
+    let mut stack = vec![root];
+    let mut bytes = 0usize;
+    let mut nodes = 0usize;
+    while let Some(term) = stack.pop() {
+        nodes = nodes.checked_add(1)?;
+        if nodes > MAX_CANONICAL_RENDER_NODES || !add_canonical_payload(&mut bytes, 32) {
+            return None;
+        }
+        let mut push = |children: &[TermId]| {
+            if nodes
+                .checked_add(stack.len())
+                .and_then(|scheduled| scheduled.checked_add(children.len()))
+                .is_none_or(|scheduled| scheduled > MAX_CANONICAL_RENDER_NODES)
+            {
+                return false;
+            }
+            stack.extend(children.iter().copied());
+            true
+        };
+        let admitted = match terms.get(term) {
+            TermData::Var(name, _) => add_canonical_text_payload(&mut bytes, name),
+            TermData::Const(value) => canonical_constant_payload_is_bounded(value, &mut bytes),
+            TermData::App(symbol, children) => {
+                canonical_symbol_payload_bound(symbol, &mut bytes).is_bounded() && push(children)
+            }
+            TermData::Not(child) => push(std::slice::from_ref(child)),
+            TermData::Ite(condition, yes, no) => push(&[*condition, *yes, *no]),
+            _ => false,
+        };
+        if !admitted {
+            return None;
+        }
+    }
+    u64::try_from(bytes).ok()
 }
 
 pub(super) fn account_authored_assume_emission(

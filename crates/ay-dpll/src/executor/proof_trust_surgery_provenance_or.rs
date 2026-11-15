@@ -180,6 +180,13 @@ pub(super) struct ProvenanceOrConflictPlan {
 /// independently verified two-row `la_generic` lemma, every other disjunct is
 /// byte-identical between source and target, and the surviving unit is
 /// re-packed into the exact target `or` by `or_neg` + `contraction`.
+///
+/// The target comes in two spellings of the same fold (see
+/// [`Executor::false_disjunct_target`]): POSITIONAL, where each folded
+/// disjunct is still present as `false`, and CANONICAL, where `mk_or` dropped
+/// them -- the target is then the survivors' `or`, or the sole survivor
+/// itself (`kept == [goal]`), which the `or` decomposition plus resolution
+/// already concludes with no re-packing.
 pub(super) struct ProvenanceOrFalseDisjunctPlan {
     pub(super) goal: TermId,
     pub(super) orig: TermId,
@@ -402,12 +409,8 @@ impl Executor {
     }
 
     /// Recognize a provenance-authenticated `or` whose only rewrite is one or
-    /// more disjuncts folded to the literal `false` (see
-    /// [`ProvenanceOrFalseDisjunctPlan`]). Fail-closed: unique authored
-    /// provenance, positional pairing only, refuting equalities must be
-    /// authored originals atom-disjoint from every resolution pivot, and each
-    /// two-row lemma is verified by the independent Farkas checker with the
-    /// exact coefficients the emitter prints.
+    /// more disjuncts folded to the literal `false`, in the POSITIONAL
+    /// spelling (see [`Self::plan_folded_disjunct`]).
     fn plan_provenance_or_false_disjunct(
         &mut self,
         clause: &[TermId],
@@ -415,20 +418,48 @@ impl Executor {
         source_index: &OriginalSourceIndex,
         planning: &mut SurgeryPlanningBudget,
     ) -> Option<ProvenanceOrFalseDisjunctPlan> {
+        self.plan_folded_disjunct(clause, originals, source_index, planning, false)
+    }
+
+    /// LAST-RESORT recognition of the same fold in its CANONICAL spelling
+    /// (#false-disjunct-canonical, see [`Self::false_disjunct_target`]).
+    /// `plan_live_trust_leaves` consults it only after every other trust-leaf
+    /// planner has declined, so a leaf another planner already derives is
+    /// never re-planned here.
+    pub(super) fn plan_canonical_false_disjunct(
+        &mut self,
+        clause: &[TermId],
+        originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
+    ) -> Option<ProvenanceOrPlan> {
+        self.plan_folded_disjunct(clause, originals, source_index, planning, true)
+            .map(ProvenanceOrPlan::FalseDisjunct)
+    }
+
+    /// Shared recognizer for both spellings of a false-disjunct fold (see
+    /// [`ProvenanceOrFalseDisjunctPlan`]); `want_canonical` selects which one.
+    /// Fail-closed: unique authored provenance, positional pairing for the
+    /// positional spelling and exact membership pairing for the canonical one
+    /// (see [`Self::pair_folded_disjuncts`]), refuting equalities must be
+    /// authored originals atom-disjoint from every resolution pivot, and each
+    /// two-row lemma is verified by the independent Farkas checker with the
+    /// exact coefficients the emitter prints.
+    fn plan_folded_disjunct(
+        &mut self,
+        clause: &[TermId],
+        originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
+        want_canonical: bool,
+    ) -> Option<ProvenanceOrFalseDisjunctPlan> {
         let [goal] = clause else { return None };
         let goal = *goal;
-        let TermData::App(Symbol::Named(op), target_disjuncts) = self.ctx.terms.get(goal).clone()
-        else {
-            return None;
-        };
-        if op != "or"
-            || !(2..=MAX_PROVENANCE_REPAIR_TERMS).contains(&target_disjuncts.len())
-            || source_index.contains(goal)
-        {
+        if source_index.contains(goal) {
             return None;
         }
-        let false_term = self.ctx.terms.false_term();
-        if !target_disjuncts.contains(&false_term) {
+        let (target_disjuncts, canonical) = self.false_disjunct_target(goal)?;
+        if canonical != want_canonical {
             return None;
         }
         let source_sets = self
@@ -454,8 +485,15 @@ impl Executor {
             else {
                 continue;
             };
+            // Positional: one target slot per source disjunct. Canonical:
+            // strictly fewer target literals (every folded one was dropped).
+            let arity_matches = if canonical {
+                disjuncts.len() > target_disjuncts.len()
+            } else {
+                disjuncts.len() == target_disjuncts.len()
+            };
             if source_op == "or"
-                && disjuncts.len() == target_disjuncts.len()
+                && arity_matches
                 && surface_or_authenticates(&mut self.ctx, parsed, &disjuncts)
             {
                 candidates.push((source, disjuncts));
@@ -469,24 +507,14 @@ impl Executor {
         {
             return None;
         }
-        let mut eliminations = Vec::new();
-        let mut kept = Vec::new();
-        for (&source_lit, &target_lit) in source_disjuncts.iter().zip(&target_disjuncts) {
-            if source_lit == target_lit {
-                kept.push(source_lit);
-                continue;
-            }
-            if target_lit != false_term {
-                return None;
-            }
-            let elimination = self.plan_false_disjunct_elimination(
-                source_lit,
-                originals,
-                source_index,
-                planning,
-            )?;
-            eliminations.push(elimination);
-        }
+        let (kept, eliminations) = self.pair_folded_disjuncts(
+            &source_disjuncts,
+            &target_disjuncts,
+            canonical,
+            originals,
+            source_index,
+            planning,
+        )?;
         if eliminations.is_empty() || kept.is_empty() {
             return None;
         }
@@ -507,6 +535,77 @@ impl Executor {
             eliminations,
             authored_sources,
         })
+    }
+
+    /// The literals a folded target spells, and whether it uses the CANONICAL
+    /// spelling (#false-disjunct-canonical). A raw rebuild keeps every folded
+    /// disjunct in place as the literal `false` (positional pairing).
+    /// `64d468871 fix(dpll): preserve scalar array proof authority through
+    /// replay` rebuilds substituted Boolean connectives through `mk_or` (so the
+    /// recorded image matches the propagation replay's canonical spelling),
+    /// which DROPS every `false` disjunct -- and also sorts and deduplicates --
+    /// and hands a sole survivor back bare. Measured on
+    /// `dt_uf_bridge_congruence::inc_some_list_dual_vocab_obligation_is_unsat`:
+    /// the ground-core probe's only unrecognized trust leaf became
+    /// `(not (is-Nil self_current))`, the canonical image of authored
+    /// `(or (= 1 aux) (not (is-Nil self_current)))` under `aux := 0`, where it
+    /// had been `(or false (not ((_ is Nil) self_current)))`; the probe could
+    /// not certify its UNSAT and the obligation published `unknown`.
+    fn false_disjunct_target(&self, goal: TermId) -> Option<(Vec<TermId>, bool)> {
+        let false_term = self.ctx.terms.false_term();
+        let (targets, canonical) = match self.ctx.terms.get(goal) {
+            TermData::App(Symbol::Named(op), args) if op == "or" => {
+                (args.clone(), !args.contains(&false_term))
+            }
+            _ => (vec![goal], true),
+        };
+        let min_len = if canonical { 1 } else { 2 };
+        (min_len..=MAX_PROVENANCE_REPAIR_TERMS)
+            .contains(&targets.len())
+            .then_some((targets, canonical))
+    }
+
+    /// Pair every source disjunct with the target: KEPT when the target states
+    /// it verbatim, otherwise a folded disjunct that one authored equality must
+    /// refute. Positional pairing requires the folded slot to read `false`;
+    /// canonical pairing is by membership (`mk_or` sorts) and requires every
+    /// target literal to be kept exactly once, so nothing the target states is
+    /// left underived and nothing it dropped is left unrefuted. The caller has
+    /// already required unique source atoms.
+    fn pair_folded_disjuncts(
+        &mut self,
+        source_disjuncts: &[TermId],
+        target_disjuncts: &[TermId],
+        canonical: bool,
+        originals: &[(TermId, FrontendTerm)],
+        source_index: &OriginalSourceIndex,
+        planning: &mut SurgeryPlanningBudget,
+    ) -> Option<(Vec<TermId>, Vec<FalseDisjunctElimination>)> {
+        let false_term = self.ctx.terms.false_term();
+        let mut kept = Vec::new();
+        let mut eliminations = Vec::new();
+        for (position, &source_lit) in source_disjuncts.iter().enumerate() {
+            let is_kept = if canonical {
+                target_disjuncts.contains(&source_lit)
+            } else {
+                let target_lit = *target_disjuncts.get(position)?;
+                if source_lit != target_lit && target_lit != false_term {
+                    return None;
+                }
+                source_lit == target_lit
+            };
+            if is_kept {
+                kept.push(source_lit);
+                continue;
+            }
+            eliminations.push(self.plan_false_disjunct_elimination(
+                source_lit,
+                originals,
+                source_index,
+                planning,
+            )?);
+        }
+        (!canonical || kept.len() == target_disjuncts.len()).then_some((kept, eliminations))
     }
 
     /// One folded disjunct's refutation: the first authored binary equality

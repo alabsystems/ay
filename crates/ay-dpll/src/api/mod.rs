@@ -55,6 +55,9 @@
 
 mod bitvectors;
 mod compat_ext;
+mod complex;
+mod de_bruijn;
+mod finite_field;
 mod floating_point;
 mod floating_point_conv;
 mod fpa_introspect;
@@ -63,6 +66,7 @@ mod model_parse;
 mod model_parse_compound;
 pub(crate) mod proofs;
 mod rec_defs;
+mod sequence_power;
 mod sequences;
 pub(crate) mod solving;
 mod string_bv_bridge;
@@ -80,6 +84,7 @@ pub(crate) const MAX_API_BITVECTOR_WIDTH: u32 = 1 << 20;
 mod tests;
 
 // Re-export FP/BV bridge classification constants (#8332)
+pub use de_bruijn::de_bruijn_index;
 pub use floating_point_conv::fp_class;
 pub use fpa_introspect::{FpCategory, FpNumeral};
 // Check-time recursive-definition expansion (Z3_add_rec_def semantics).
@@ -90,13 +95,23 @@ pub use rec_defs::{
 // Re-export all public types for backwards compatibility
 pub use introspect::TermKind;
 pub use proofs::{
-    ExactSmtlibQueryBinding, FarkasCertificate, ProofAcceptanceError, ProofAcceptanceMode,
-    StrictProofVerdict, UnsatProofArtifact,
+    AletheDialect, CarcaraSurface, CleanOnlySpelling, ExactSmtlibQueryBinding, FarkasCertificate,
+    ProofAcceptanceError, ProofAcceptanceMode, StrictProofVerdict, StrictVerdictStop,
+    UnsatProofArtifact,
 };
+#[cfg(feature = "z3-compat-internals")]
+#[doc(hidden)]
+pub use proofs::{
+    NativeClauseEvent, NativeClauseOrigin, NativeClauseTrail, NativeProofApplication,
+    NativeProofDag, NativeProofInputBinding, NativeProofTrackingCache,
+};
+pub(crate) use solving::PreparedTactic;
 pub use solving::{
     ApplyResult, Goal, ParsedPublicFormulaMetadata, ParsedPublicTermMetadata, ParsedSmtlib2Batch,
-    ParsedSmtlib2Formula, PatchStrength, PatchSuggestion, SolverScope, Tactic, TacticFailure,
-    TacticSolver,
+    ParsedSmtlib2Formula, PatchStrength, PatchSuggestion, PolynomialParameters, SimplifyParameters,
+    SolverScope, Tactic, TacticDecision, TacticExecutionKind, TacticFailure, TacticInstance,
+    TacticModelConverter, TacticOperation, TacticParameterValue, TacticParameters, TacticSolver,
+    TacticSubgoal,
 };
 pub use types::*;
 // Re-export proof types used in public API signatures
@@ -104,12 +119,24 @@ pub use ay_proof::{PartialProofCheck, ProofCheckError, ProofQuality};
 // Re-export the offline proof-bundle API (genuinely-external re-check): consumers
 // can re-validate an exported `SerializableProofBundle` with no solver run.
 pub use ay_proof::{
-    re_check_bundle_strict, render_term_canonical, BundleReCheck, SerializableProofBundle,
-    PROOF_BUNDLE_SCHEMA,
+    re_check_bundle_strict, re_check_bundle_strict_with_cancellation,
+    re_check_bundle_strict_with_resource_control,
+    re_check_retained_bundle_strict_with_resource_control,
+    read_retained_proof_bundle_with_resource_control,
+    read_retained_proof_bundle_with_resource_control_and_diagnostics, render_term_canonical,
+    BundleReCheck, RetainedProofBundle, RetainedProofTransportLimits, RetainedReadDiagnostics,
+    RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal, RetainedReadStage,
+    RetainedReadTerminal, SerializableProofBundle, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+    MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
+    PROOF_BUNDLE_SCHEMA, RETAINED_PROOF_BUNDLE_SCHEMA,
 };
+
+#[cfg(test)]
+mod offline_bundle_cancellation_tests;
 // Re-export Sort types from ay_core (#1437 - Sort type consolidation)
 pub use ay_core::{
-    ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, Sort, TermId,
+    ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, FiniteFieldSort, Sort,
+    TermId,
 };
 // Re-export deprecated term introspection types for backwards compatibility
 #[allow(deprecated)]
@@ -189,6 +216,7 @@ pub struct Solver {
     term_arena: TermArenaStamp,
     /// Variable names for model extraction
     var_names: HashMap<TermId, String>,
+    adopted_tactic_declarations: Vec<(TermId, ay_frontend::DeclarationId)>,
     /// Exact native declaration identity -> variable term.
     ///
     /// This reverse index makes idempotent declarations and adapter-identity
@@ -196,6 +224,9 @@ pub struct Solver {
     var_terms_by_name: HashMap<String, TermId>,
     /// Variable sorts for model extraction
     var_sorts: HashMap<TermId, Sort>,
+    /// Declared constant -> the fresh twin its binder occurrences are renamed
+    /// to (`terms/binder_separation.rs`), scoped to the term-arena generation.
+    binder_twins: terms::BinderTwins,
     /// Last assumptions from check_sat_assuming (TermId -> Term mapping)
     last_assumptions: Option<HashMap<TermId, Term>>,
     /// Interrupt flag for cancelling solve from another thread
@@ -217,6 +248,8 @@ pub struct Solver {
     /// Typed payload for an artifact-export failure flattened by an infallible
     /// `check_sat*` compatibility entrypoint.
     last_artifact_export_failure: Option<String>,
+    /// Original checked-extraction error retained across compatibility publication.
+    last_model_extraction_failure: Option<ay_core::original_query::QueryError>,
     /// Per-instance term memory limit in bytes (None = no limit).
     /// Unlike `memory_limit` (process RSS), this caps term allocation for
     /// THIS solver only, preventing cross-instance budget interference (#6563).
@@ -228,6 +261,11 @@ pub struct Solver {
     /// Soft constraints for MaxSMT solving (#8300).
     /// Populated by `assert_soft()`, consumed by `check_sat_max()`.
     soft_constraints: Vec<maxsmt::SoftConstraint>,
+    /// Unified declaration order of API-registered arithmetic objectives and
+    /// soft groups, mirroring the frontend's `ObjectiveStep` sequence for
+    /// parsed scripts. Installed into the executor context (with the API
+    /// soft set) for one joint optimization query, then restored.
+    optimization_sequence: Vec<ay_frontend::ObjectiveStep>,
     /// Test-only release-soundness hook: corrupt one executor-installed native
     /// soft after execution so the transaction authentication check is exercised.
     #[cfg(test)]
@@ -408,6 +446,56 @@ impl Solver {
         stacker::maybe_grow(
             crate::executor::EXECUTOR_STACK_RED_ZONE,
             crate::executor::EXECUTOR_STACK_SIZE,
+            || Self::try_new_with_config_stack_guarded(logic.as_str(), config),
+        )
+    }
+
+    /// Create a solver under an SMT-LIB logic NAME rather than a [`Logic`]
+    /// capability variant.
+    ///
+    /// [`Logic`] is a capability enum: each variant names a solver
+    /// configuration AY implements, so the attested SMT-LIB names that have no
+    /// variant (`FP`, `BVFP`, `ANIA`, `ABVFP`, `UFBVFP`, …) cannot be spelled
+    /// through [`Solver::try_new`] at all. Mapping them onto [`Logic::All`]
+    /// keeps the right CAPABILITY and throws away the NAME, which is not
+    /// decoration: `Executor::detect_logic_category` routes a MAPPED declared
+    /// logic straight to its category, and only `ALL`/unset falls back to
+    /// CONTENT detection — which runs after quantifier preprocessing, over
+    /// whatever ground assertions survive it. `∀q:Float64. fp.isNaN(q)` leaves
+    /// none, so under `ALL` the content is zero assertions, the inferred logic
+    /// is `QF_UF`, and the FP theory never runs. `ay-bindings`'
+    /// `execute_direct::logic::Declaration` carries the measurement.
+    ///
+    /// `logic` goes through the frontend exactly as `(set-logic <name>)` in a
+    /// script does — including that an unrecognised token is STORED rather than
+    /// refused, the same leniency the command path has. Callers wanting a name
+    /// whitelist apply it themselves, as `execute_direct`'s `parse_logic` does.
+    /// As with [`Solver::try_new`], installing the logic does NOT count as a
+    /// command-stream `(set-logic ...)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the frontend's own `set-logic` validation (sort-parameter
+    /// conflicts against the already-declared symbols).
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_new_with_smtlib_logic(logic: &str) -> Result<Self, SolverError> {
+        Self::try_new_with_smtlib_logic_and_config(logic, SolverConfig::default())
+    }
+
+    /// [`Solver::try_new_with_smtlib_logic`] with an explicit [`SolverConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frontend does not accept `logic` as a
+    /// `set-logic` token.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_new_with_smtlib_logic_and_config(
+        logic: &str,
+        config: SolverConfig,
+    ) -> Result<Self, SolverError> {
+        stacker::maybe_grow(
+            crate::executor::EXECUTOR_STACK_RED_ZONE,
+            crate::executor::EXECUTOR_STACK_SIZE,
             || Self::try_new_with_config_stack_guarded(logic, config),
         )
     }
@@ -416,7 +504,7 @@ impl Solver {
     /// stack guard above so the by-value construction frames land on the
     /// grown segment.
     fn try_new_with_config_stack_guarded(
-        logic: Logic,
+        logic: &str,
         config: SolverConfig,
     ) -> Result<Self, SolverError> {
         // Box while still on the grown segment: the ~56 KB `Executor` value
@@ -429,11 +517,11 @@ impl Solver {
         // of any script this solver later parses — z3 accepts that, because for
         // it "already been set" is parser state and `SolverFor` is not part of
         // the stream.
-        executor.set_initial_logic(logic.as_str())?;
+        executor.set_initial_logic(logic)?;
         let native_replay_events = vec![NativeReplayEvent::new(
             0,
             NativeReplayEventKind::SetLogic {
-                logic: logic.as_str().to_string(),
+                logic: logic.to_string(),
             },
             0,
         )];
@@ -442,8 +530,10 @@ impl Solver {
             executor,
             term_arena: TermArenaStamp::fresh(),
             var_names: HashMap::default(),
+            adopted_tactic_declarations: Vec::new(),
             var_terms_by_name: HashMap::default(),
             var_sorts: HashMap::default(),
+            binder_twins: terms::BinderTwins::default(),
             last_assumptions: None,
             interrupt: Arc::new(AtomicBool::new(false)),
             timeout: config.timeout,
@@ -454,9 +544,11 @@ impl Solver {
             last_unknown_reason: None,
             last_executor_error: None,
             last_artifact_export_failure: None,
+            last_model_extraction_failure: None,
             term_memory_limit: config.term_memory_limit,
             core_tracker: CoreEvolutionTracker::new(),
             soft_constraints: Vec::new(),
+            optimization_sequence: Vec::new(),
             #[cfg(test)]
             corrupt_native_soft_transaction: false,
             #[cfg(test)]
@@ -840,3 +932,7 @@ impl Solver {
         }
     }
 }
+
+#[cfg(feature = "z3-compat-internals")]
+#[doc(hidden)]
+pub use ay_sat::ClauseEventCapture;

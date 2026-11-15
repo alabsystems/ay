@@ -1,0 +1,5 @@
+(set-logic QF_ABV)
+(declare-const m (Array (_ BitVec 8) (_ BitVec 8)))
+(declare-const i (_ BitVec 8))
+(assert (= (bvmul (select m i) (select m i)) #x02))
+(check-sat)

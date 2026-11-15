@@ -14,11 +14,16 @@
 //! - `result_mapping`: CEGQI/E-matching result interpretation and assertion restore.
 //! - `cegqi_refinement`: multi-round arithmetic refinement and neighbor enumeration.
 //! - `dispatch`: logic-category re-solve dispatch and interleaved E-matching.
+mod and_roots;
 mod cegqi_refinement;
+mod conjunctive_closure;
+mod demand_lane_frame;
 mod dispatch;
+pub(in crate::executor) mod ematching_budget;
 mod entailed_consts;
 mod exact_array_negation;
 pub(crate) mod family_classifier;
+mod guard_seed;
 mod preprocess;
 mod quantifier_result;
 mod relevance_admit;
@@ -32,13 +37,16 @@ pub(in crate::executor) mod result_mapping;
 
 use ay_core::{Sort, TermData, TermId, TermStore};
 
+pub(in crate::executor) use and_roots::flatten_quantified_and_roots;
+pub(crate) use conjunctive_closure::MatchedInstanceRecords;
 pub(in crate::executor) use exact_array_negation::ExactArrayNegationEvidence;
 pub(in crate::executor) use family_classifier::write_family_class_statistics;
+pub(in crate::executor) use guard_seed::guard_seed_instances_enabled;
 use quantifier_result::FiniteExpansionRecord;
 pub(in crate::executor) use quantifier_result::{
     ExactFiniteExpansionEvidence, QuantifierProcessingResult,
 };
-pub(in crate::executor) use result_mapping::CegqiUfRecompletionGrant;
+pub(in crate::executor) use result_mapping::{CeFreeResolveStash, CegqiUfRecompletionGrant};
 pub(in crate::executor) use unsupported_arith::unsupported_int_div_mod_mentions_ce_var;
 
 use super::Executor;
@@ -59,10 +67,20 @@ use crate::quantifier_manager::QuantifierManager;
 /// unsound — the ground solver may satisfy a narrow set of E-matched instances
 /// while missing semantically required ones (Z3 #6303 / ay #8729).
 ///
-/// Matches the "unsupported" sorts in
-/// [`super::super::mbqi::Executor::synthesize_mbqi_candidates`] — Array, FP,
-/// Seq, Datatype, RegLan.
-fn is_mbqi_unsafe_binder_sort(sort: &Sort) -> bool {
+/// NOT the same thing as "MBQI has no candidate for the sort". `Array` and
+/// `FloatingPoint` both DO have candidates in
+/// [`super::super::mbqi::Executor::synthesize_mbqi_candidates`] — a const-array
+/// over the element default, and the IEEE specials plus `1.0` — and they stay
+/// listed here anyway, deliberately. A candidate list is a REFUTATION device:
+/// instantiating `∀x. P(x)` at a closed value gives a consequence, so it can
+/// convert a withheld `Sat` into a genuine `Unsat`. Publishing `Sat` is the
+/// opposite direction and needs EXHAUSTIVENESS over the carrier, which no
+/// finite candidate list over `Array` or an FP format supplies. Removing a sort
+/// from this list is therefore never justified by adding candidates for it; it
+/// would reintroduce the Z3 #6303 / ay #8729 wrong-SAT.
+///
+/// `Seq`, `RegLan` and `Datatype` have no candidates at all.
+pub(super) fn is_mbqi_unsafe_binder_sort(sort: &Sort) -> bool {
     matches!(
         sort,
         Sort::Array(_)
@@ -377,6 +395,19 @@ impl Executor {
         // threaded — preserving the "true in every model of the CURRENT problem"
         // invariant. Empty when no unconditional-Forall instances are produced.
         self.active_support_axioms.clear();
+        // #quantifier-proxy-abstraction: the proxy map and the
+        // over-approximation marker are per-check-sat state. Clearing them here
+        // means a proxy minted for an earlier query can never be read back, and
+        // a stale `true` can never fail-close a later solve that abstracted
+        // nothing. Both stay empty/false on every problem the pass declines,
+        // which is what keeps the kill switch's OFF position byte-identical.
+        self.quantifier_proxies.clear();
+        self.quantifier_guarded_abstraction_snapshot.clear();
+        self.quantifier_abstraction_active = false;
+        self.guarded_instance_clauses.clear();
+        self.guarded_instance_records.clear();
+        self.guarded_existential_duals.clear();
+        self.guarded_nested_universals.clear();
         // The conflict-verification verdict memo (#4535) is keyed against the
         // support set — rebuild of the support set invalidates it.
         self.conflict_semantic_verify_memo.clear();
@@ -436,6 +467,9 @@ impl Executor {
         if let Some(rewritten) = self.begin_quantifier_synthesis_or_exact_array_negation() {
             return rewritten;
         }
+
+        // 1a2. (#defn-fold-under-forall) BEFORE the original_assertions snapshot.
+        self.fold_ground_definitions_into_universals();
 
         // 1b. (#p2-nested-forall) Merge directly nested same-polarity binder
         // towers (`∀x.∀y.B ⇒ ∀x,y.B`, alpha-renamed) BEFORE the
@@ -502,9 +536,9 @@ impl Executor {
         self.propagate_bridge_ground_values();
 
         // (#quant-diagonal) Add diagonal (all-bound-vars-equal) instances of multi-var
-        // same-sort universals, so the EPR/UF self-pair refutation (Class B false-SAT,
-        // e.g. `(X0:=d, X1:=d)`) is not missed by trigger-only e-matching. Cheap
-        // (k per forall, not k^n).
+        // same-sort universals in EPR/UF shape, so the self-pair refutation (Class B
+        // false-SAT, e.g. `(X0:=d, X1:=d)`) is not missed by trigger-only e-matching.
+        // Cheap (k per forall, not k^n).
         //
         // (#p2-diag-position) SOUNDNESS: candidates come from the polarity-aware
         // `collect_entailed_foralls` — ONLY universals entailed as NNF conjuncts
@@ -524,6 +558,12 @@ impl Executor {
             preprocess::collect_entailed_foralls(&mut self.ctx.terms, a, true, &mut diag_quants);
         }
         self.add_diagonal_forall_instances(&diag_quants);
+
+        // (#nra-guard-seed-instances) Instances of every entailed single-binder
+        // `Real` universal at the closed terms its body's comparison atoms
+        // bound the binder by. Consequences only (an instance of an entailed
+        // universal holds in every model); see `guard_seed`.
+        let guard_seed_instances = self.add_guard_bound_seed_instances();
 
         let still_has_quantifiers = self
             .ctx
@@ -642,10 +682,11 @@ impl Executor {
         //     14.7s -> 90s TIMEOUT and pp 4.4s -> 10-12s even though `unlocks` was
         //     false for both. Deferring it behind `unlocks` keeps every non-firing
         //     problem byte-identical to baseline.
+        let mut derived_expansion_evidence: Option<ExactFiniteExpansionEvidence> = None;
         {
             let snap = self.ctx.assertions.clone();
             // 1. Derive entailed constants (read-only, solve-free).
-            let consts = entailed_consts::derive_entailed_int_consts(&self.ctx.terms, &snap);
+            let consts = entailed_consts::derive_entailed_consts(&self.ctx.terms, &snap);
             // 2. Would any of them actually unlock a bounded-Int forall? (read-only)
             let unlocks = !consts.is_empty()
                 && crate::skolemize::derived_bound_unlocks_expansion(
@@ -675,8 +716,55 @@ impl Executor {
                     // must never be visible to a nested sub-solve: those run on a
                     // SUBSET of the assertions, which need not entail these constants,
                     // so folding them in there would not be equals-for-equals.
-                    let _derived_scope = crate::skolemize::scoped_derived_consts(consts);
-                    let _ = self.expand_finite_domains();
+                    let derived_records = {
+                        let _derived_scope = crate::skolemize::scoped_derived_consts(consts);
+                        self.expand_finite_domains()
+                    };
+                    // (#derived-expansion-evidence) KEEP this expansion's
+                    // lineage. Discarding it made the one expansion that can
+                    // ground a derived-bound problem invisible to SAT
+                    // publication: the `still_has_quantifiers` check above had
+                    // already run and fallen through, so the only site that
+                    // builds `ExactFiniteExpansionEvidence` was behind us, the
+                    // evidence stayed `None`, and the mapper never even
+                    // consulted its recognizer -- a ground solve that returned
+                    // `Sat` was published as `Unknown(QuantifierUnhandled)`.
+                    //
+                    // The evidence rides the ORDINARY result. Returning
+                    // `fully_expanded` early instead was measured to skip the
+                    // MBQI / constant-interpretation seeding below, which
+                    // publishes the COMPLETE witness some queries need: the
+                    // captured `full4` seed lost a scalar value outright.
+                    // `rescue_unknown_with_finite_expansion` consumes this
+                    // after every other route has had its turn, so the grant
+                    // can only turn a refusal into a verdict.
+                    //
+                    // Records are PRODUCER PROVENANCE, never authority. The
+                    // mapper still replays the canonical expander on every
+                    // authored quantified root, still demands a one-to-one
+                    // record match and byte-identical replacement terms, and
+                    // still validates the retained model against the whole
+                    // expanded vector before any grant is issued.
+                    if !derived_records.is_empty()
+                        && !self
+                            .ctx
+                            .assertions
+                            .iter()
+                            .any(|&a| contains_quantifier(&self.ctx.terms, a))
+                    {
+                        let mut records = finite_expansion_records.clone();
+                        for record in derived_records {
+                            records.retain(|kept: &FiniteExpansionRecord| {
+                                kept.original != record.original
+                                    || kept.assertion_index != record.assertion_index
+                            });
+                            records.push(record);
+                        }
+                        derived_expansion_evidence = Some(ExactFiniteExpansionEvidence {
+                            expanded_assertions: self.ctx.assertions.clone().into_boxed_slice(),
+                            records: records.into_boxed_slice(),
+                        });
+                    }
                 }
             }
         }
@@ -739,11 +827,45 @@ impl Executor {
         }
         // 9. CEGQI setup for unhandled quantifiers + FlattenAnd + strip quantifiers.
         self.set_active_solve_phase("quantifier-cegqi-setup", "cegqi");
+        // (#quantifier-guarded-enumerative) The structural trigger, read HERE
+        // because this is the first point that can see both halves of it: the
+        // E-matching rounds of step 4 have run, and the enumerative lane of
+        // step 9 has not. `instances_created` is the step-4 count only — the
+        // post-CEGQI round below has not run yet — which is exactly the
+        // quantity the gate is about: what the matcher had produced BEFORE the
+        // lane decided whether to enumerate.
+        let enumerative_admission = if ematching.instances_created == 0 {
+            crate::quant_unit_authority::EnumerativeAdmission::OnlyRoute
+        } else {
+            crate::quant_unit_authority::EnumerativeAdmission::MatcherProduced
+        };
         let cegqi = self.setup_cegqi_for_unhandled(
             &quantifiers,
             ematching.has_uninstantiated,
             &ematching.uninstantiated_quantifiers,
+            enumerative_admission,
         );
+
+        // 9b. (#quantifier-guarded-instances) Assert the E-matched instances of
+        // universals the assertion set does NOT entail, each as the GUARDED
+        // clause `(or (not qproxy) body[t̄])`. This runs HERE, after step 9,
+        // because that is the first point at which the proxy exists: the
+        // abstraction is the last statement of `flatten_and_strip_quantifiers`,
+        // and the instances themselves were computed back in step 4 when the
+        // quantifiers were still present. Nothing is pushed when the switch is
+        // off, when the abstraction declined the problem, or for a quantifier
+        // that got no proxy, so the assertion vector is byte-identical to
+        // baseline on every such solve.
+        let guarded_added =
+            self.add_guarded_instance_clauses(&ematching.guarded_instantiations) > 0;
+        // 9c. (#quantifier-guarded-enumerative) The same clause shape for the
+        // TRIGGERLESS universals the enumerative lane refuses to conjoin. Same
+        // fail-closed pass, so a record whose quantifier got no proxy, whose
+        // exact substitution is unsupported, or whose instance still carries a
+        // quantifier is dropped rather than asserted.
+        let guarded_added = self.add_guarded_instance_clauses(&cegqi.guarded_enumerative_records)
+            > 0
+            || guarded_added;
 
         // 10. Post-CEGQI E-matching pass (#7979): enumerative instantiation and
         // CEGQI may have introduced new ground terms (e.g., f(6)) that trigger
@@ -774,7 +896,27 @@ impl Executor {
             } else {
                 (false, None)
             };
-        let ematching_added = ematching_added || post_cegqi_added;
+        // A guarded clause is an added instantiation for the purpose of the
+        // "did instantiation contribute?" signal: the refutation may rest on
+        // it. It is NOT an added support axiom, and nothing else about it is
+        // treated like an unconditional instance.
+        // 10b. The post-CEGQI round runs AFTER the abstraction, so its guarded
+        // records can be turned into clauses by the same fail-closed pass; the
+        // new ground terms CEGQI minted are exactly what that round exists to
+        // match against.
+        let post_cegqi_guarded = post_cegqi_ematching
+            .as_ref()
+            .map_or(0, |summary| summary.guarded_instantiations.len());
+        let guarded_added = if post_cegqi_guarded > 0 {
+            let records = post_cegqi_ematching
+                .as_ref()
+                .map(|summary| summary.guarded_instantiations.clone())
+                .unwrap_or_default();
+            self.add_guarded_instance_clauses(&records) > 0 || guarded_added
+        } else {
+            guarded_added
+        };
+        let ematching_added = ematching_added || post_cegqi_added || guarded_added;
         // Track actual E-matching provenance rather than inferring it from
         // `quantifiers - uninstantiated_quantifiers`. `collect_quantifiers`
         // performs NNF conversion and may mint a logically equivalent
@@ -810,6 +952,53 @@ impl Executor {
                 .as_ref()
                 .map_or(0, |e| e.instances_created);
 
+        // (#derived-expansion-evidence) The step-5 derived-bound expansion made
+        // this problem GROUND. Publish it as such, so the binders it discharged
+        // are not still counted as unhandled and a ground solve that answered
+        // `Sat` is not published as `unknown`.
+        //
+        // The UF condition is what keeps this safe for MODEL COMPLETENESS, and
+        // it is the real distinction, not a heuristic. Taking this exit ends
+        // the pipeline here, which is the only way the model the ground solve
+        // produced for the expanded vector is the one that survives to be
+        // validated -- but it also skips the mapper's constant-interpretation
+        // phase. That phase matters exactly when a discharged binder
+        // CONSTRAINED A DECLARED FUNCTION: the expansion then pins that
+        // function only at the points it enumerated, and the published witness
+        // must still be total, which is what the seeding builds (measured: the
+        // captured `full4` seed otherwise loses a scalar value outright). When
+        // no authored quantified root applies an uninterpreted function, the
+        // ground replacement determines everything the model must say, and
+        // there is no completion left to skip.
+        //
+        // Records are PRODUCER PROVENANCE, never authority. The mapper still
+        // replays the canonical expander on every authored quantified root,
+        // demands a one-to-one record match and byte-identical replacements,
+        // and validates the retained model against the whole expanded vector
+        // plus every authored ground sibling before any grant is issued.
+        if let Some(evidence) = derived_expansion_evidence {
+            let authored = original_assertions.clone().unwrap_or_default();
+            let constrains_declared_function = authored.iter().any(|&root| {
+                contains_quantifier(&self.ctx.terms, root)
+                    && self.contains_uninterpreted_function_app(root)
+                    && self.quantified_root_applies_declared_function(root)
+            });
+            if !authored.is_empty()
+                && !constrains_declared_function
+                && !self
+                    .ctx
+                    .assertions
+                    .iter()
+                    .any(|&a| contains_quantifier(&self.ctx.terms, a))
+            {
+                return QuantifierProcessingResult::fully_expanded(
+                    authored,
+                    evidence.expanded_assertions.to_vec(),
+                    evidence.records.to_vec(),
+                );
+            }
+        }
+
         QuantifierProcessingResult {
             has_uninstantiated_quantifiers: has_uninstantiated,
             reached_instantiation_limit: reached_limit,
@@ -835,7 +1024,76 @@ impl Executor {
             // The accepted atoms need not admit one shared interpretation (for
             // example `f(x)=0 /\ x=f(x)`), and a first E-match is not coverage.
             quantifiers_supported_by_uf_completion,
+            // Filled in by the check-sat driver from the exact pre-dispatch
+            // vector; nothing here may snapshot yet because the pre-dispatch
+            // soundness passes have not run.
+            cegqi_ce_free_snapshot: None,
+            guard_seed_instances,
+            guard_seed_presolve_refuted: false,
         }
+    }
+}
+
+impl Executor {
+    /// Whether `root` applies a symbol whose interpretation the published model
+    /// must supply independently — a genuinely DECLARED function, as opposed to
+    /// a datatype projection.
+    ///
+    /// `contains_uninterpreted_function_app` already excludes the theory
+    /// operators, but it counts a datatype CONSTRUCTOR, SELECTOR or TESTER as
+    /// uninterpreted. Those need no separate interpretation: a selector's value
+    /// is fixed by the datatype value it reads, and a tester by that value's
+    /// constructor, so an expansion that determines the datatype terms
+    /// determines them too. Only a declared function left applied at points the
+    /// expansion did not enumerate needs the constant-interpretation seeding
+    /// this predicate protects.
+    fn quantified_root_applies_declared_function(&self, root: TermId) -> bool {
+        let mut stack = vec![root];
+        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::App(symbol, args) => {
+                    if !args.is_empty() {
+                        let name = symbol.name();
+                        // `const-array` is an ARRAY-theory constructor that
+                        // `contains_uninterpreted_function_app`'s operator list
+                        // happens not to name; it needs no interpretation of
+                        // its own any more than a datatype projection does.
+                        let theory_or_datatype = name == "const-array"
+                            || self.ctx.is_constructor(name).is_some()
+                            || name.starts_with("is-")
+                            || self.ctx.terms.name_is_registered_selector(name);
+                        if !theory_or_datatype
+                            && self.contains_uninterpreted_function_app(term)
+                            && args
+                                .iter()
+                                .all(|&arg| !self.contains_uninterpreted_function_app(arg))
+                        {
+                            return true;
+                        }
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, th, el) => {
+                    stack.push(*c);
+                    stack.push(*th);
+                    stack.push(*el);
+                }
+                TermData::Let(bindings, body) => {
+                    stack.push(*body);
+                    for (_, value) in bindings {
+                        stack.push(*value);
+                    }
+                }
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+                _ => {}
+            }
+        }
+        false
     }
 }
 

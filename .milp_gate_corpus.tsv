@@ -1,0 +1,51 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# THE MILP GATE CORPUS MANIFEST. Written by `scripts/milp_gate_corpus.py
+# --manifest`, checked by `--verify`, and used by `--build` to reconstruct
+# ~/ay-bench/milp-gate/instances from upstream.
+#
+# `sha256` is of the UNCOMPRESSED .mps -- the bytes the solver parses and the
+# bytes `.milp_node_baseline.toml`'s node counts were measured on. Upstream
+# serves .mps.gz; gzip metadata is not reproducible, so the compressed digest is
+# deliberately NOT what is pinned here.
+#
+# source: miplib2017-webdata  https://miplib.zib.de/WebData/instances/<name>.mps.gz
+#         miplib3             https://miplib2010.zib.de/miplib3/miplib3/<name>.mps.gz
+#
+# air03, air05, mod010 and nw04 exist in BOTH archives with DIFFERENT bytes. The
+# webdata copy is the measured one; sourcing them from miplib3 would silently
+# change the models and therefore every pinned node count on them.
+#
+# name	sha256	bytes	source	roles
+air03	801237b546a49a28caa8347e3924436a258fc353332cb37a1d23e325289fb5bf	3614127	miplib2017-webdata	node-gate+corpus-guard
+air05	1dcbb9e423a0235d9d890896756a840d3c0a32a8ec057f2127b807ca5a97f5d7	2151564	miplib2017-webdata	corpus-guard
+blend2	48c009606d5e949baa8e5e060c8b0cafd3eb96f9d615d98fff0d626d5b6e503f	63421	miplib2017-webdata	node-gate+corpus-guard
+dcmulti	a5f5147f5450d1b954e2299569f340191529bd07bdb349996dbe21576f1e7665	76205	miplib2017-webdata	node-gate+corpus-guard
+enigma	bbc4a1a6e9ab30d2615b5e0391f0df1782d29b0a125eb38ef852e8dda6ebc323	14814	miplib3	node-gate
+flugpl	a1f0cb79a95639450dd984473a00efca24365457153d7fcb859c6581ddab4c2c	4161	miplib2017-webdata	corpus-guard
+gen	1b79cfbb4eda374ddd784369aa12c93a33f22b07d3abb5b496e5b018745abf13	125423	miplib2017-webdata	corpus-guard
+gt2	3ddd85dc12f8460a92b36b1424a00b563170d56ee615340dec037d7a875e9050	23771	miplib2017-webdata	node-gate+corpus-guard
+khb05250	261c4498faab02e5de68aca63b08a17b7243985e2a979c9d505dba4fa0c86555	135500	miplib2017-webdata	corpus-guard
+lseu	00416576ed4adac15b62b1982cb7be9d7dcb2d6505067dd8396183ff1eac3dab	17486	miplib3	node-gate
+markshare1	7084187bf6377b664fd78949e597783872b5a40e8b2c2d3e6dec310678f46242	12546	miplib2017-webdata	corpus-guard
+markshare2	35013a309b073f42e163e01a485909055b52a5d816fdd18345576473f8ed1458	17207	miplib2017-webdata	corpus-guard
+mas74	181f02fd634306ad6431f21d5e8115f3e8112f2e7d2bebed1690475b49acc4af	64163	miplib2017-webdata	node-gate-flaky+corpus-guard
+mas76	114b73dbe17c1d1b4d37a09311424571781225e01edfbec1c6acb320214593f6	62523	miplib2017-webdata	node-gate+corpus-guard
+misc03	caba4f42b1827e41cdd62c6548435cc786b9f9092f984f170cab8df939a84acb	73967	miplib3	node-gate
+misc07	20cb89af2d0ca7ded2dad43817e620893c6b189bd66018d2be3317ba596aa615	286262	miplib2017-webdata	node-gate-flaky+corpus-guard
+mod008	5a08fe11b87bfe51f55e5537f5e8d0ad0e5fecbc57710a5b58c48a5f10a8e993	61979	miplib3	node-gate
+mod010	0a2a0888816fd25e31ff4512ca8974272dacf387854cd450e94946332d89325d	544964	miplib2017-webdata	node-gate+corpus-guard
+nw04	45d11d3c719d94e8c6c4958d0a5d4095a0efc46cc6de36258f384a3d98e51a16	25948238	miplib2017-webdata	node-gate-flaky
+p0033	8ccff819023237c79ef32e238a5da9348725ce9a4425d48888baf3a0b3b42628	6555	miplib3	node-gate
+p0201	f9bd3802c05f506cdba111051baaff6a62288c00f4292b02722303663e8e2392	78610	miplib2017-webdata	node-gate+corpus-guard
+p0282	3bf907c6aa3cbf80de7c48ca8e71dc29f5d70f6e5fffb716502bfc5c513196a1	91571	miplib3	node-gate
+p0548	81fa3fb1e071cac0b72649c38196c18bca7ff6d7f2f6639776dcb0daf6bcab15	94620	miplib3	node-gate
+p2756	0ed6b86a8baa033c9a3e46c66eee74dd670585eb3d096ea590c3646f8b4b47c8	488938	miplib3	node-gate-flaky
+pk1	13851ed426a2dfd7c6af7b021236553c391d77a675ab9223dd9135d3351c2e66	31982	miplib2017-webdata	node-gate+corpus-guard
+qiu	86990b99a5c702a14b2ac2ea4f46eaa88027f150d6d3e6ec8c8edc3b8c88d58a	137711	miplib2017-webdata	node-gate-flaky+corpus-guard
+qnet1	eaa0737929f199b168bd30510dd7ab59ed2ef6fb04d5ac05ea105ceacc5dfc73	198064	miplib2017-webdata	node-gate+corpus-guard
+rout	ed73ef89a0faffea96a1ef085eb1f64c1116517abd6daaa1b99d3f4cd91eee95	94010	miplib2017-webdata	node-gate+corpus-guard
+stein27	b8889994eda0853d71bad6ba9bf45755d4e59f33a13a3f43008e1ba681738c5b	19465	miplib3	node-gate
+stein45	0b119c8a2426cd9701a954127748bf8ae2bbe0fd669577ecb4715d8ffb81c85a	50421	miplib3	node-gate

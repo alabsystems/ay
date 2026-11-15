@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% The positive half of the slack-overflow pair, and the control that pins causation to the
+% WRAP rather than to the magnitude of the numbers. These degrees are ONE larger than the
+% ones in `incorrect/version3/rup_propagation_slack_overflow_formula_borne.opb`, which puts
+% the slack at exactly i64::MAX: no overflow, so the propagator never claimed these rows
+% propagate, and the false `rup >= 1 ;` was rejected even before the fix. Here the same
+% formula is proved SATISFIABLE, which it is — every assignment is a model.
+f 2 ;
+sol ~x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

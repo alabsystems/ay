@@ -20,6 +20,23 @@ const BV_DISCOVERY_SMT_TIMEOUT_SECS: u64 = 1;
 const BV_DISCOVERY_BUDGET_SECS: u64 = 3;
 
 impl PdrSolver {
+    /// Whether the #5877 discovery budget (3 s total, 1 s per SMT query)
+    /// applies to this problem.
+    ///
+    /// The pass was written for BV-native problems and its budget was keyed
+    /// off `!problem_is_pure_lia`. But `problem_is_pure_lia` counts `Real`
+    /// state as linear arithmetic (see `core/classify.rs::sort_is_pure_lia`),
+    /// so the Bool+Real transition systems of CHC-COMP LRA-Lin took the
+    /// `extract_int_bound_candidates` branch below with NO deadline and NO
+    /// per-query cap: O(n^2) Bool-pair clauses x ~3 s per self-inductiveness
+    /// query on `om1_with_relays_agreement` consumed the whole engine window
+    /// before the IC3 loop ever ran. Real state is as wide and as expensive as
+    /// the BV state this budget protects against, so it is budgeted the same
+    /// way. Pure Bool/Int problems keep full discovery (unchanged).
+    fn bv_range_discovery_is_budgeted(&self) -> bool {
+        !self.problem_is_pure_lia || self.problem.has_real_sorts()
+    }
+
     /// Discover range invariants via joint fixpoint on BV or BvToInt-relaxed problems.
     ///
     /// Generates candidate invariants (BV comparisons for BV-native, Int bounds for
@@ -32,7 +49,8 @@ impl PdrSolver {
         // CDCL routinely exceeds 2s but resolves within 5s. Without this, all
         // discovery candidates are rejected as "not self-inductive" due to
         // Unknown (timeout) being treated as failure.
-        let _bv_discovery_timeout = if !self.problem_is_pure_lia {
+        let budgeted = self.bv_range_discovery_is_budgeted();
+        let _bv_discovery_timeout = if budgeted {
             Some(
                 self.smt
                     .scoped_check_timeout(Some(std::time::Duration::from_secs(
@@ -55,7 +73,7 @@ impl PdrSolver {
         // routinely needs 10-20ms, and 82+ candidates need testing. Increased to
         // 2s to allow the joint fixpoint to complete at least one round while
         // leaving time for blocking phase.
-        let bv_discovery_deadline = if !self.problem_is_pure_lia {
+        let bv_discovery_deadline = if budgeted {
             Some(
                 ay_core::time::Instant::now()
                     + std::time::Duration::from_secs(BV_DISCOVERY_BUDGET_SECS),

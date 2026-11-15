@@ -138,6 +138,14 @@ fn indexed_parser_rejects_invalid_or_missing_indices() {
 }
 
 #[test]
+fn zero_index_ieee_bv_head_parses() {
+    // `(_ fp.to_ieee_bv)` is SMT-LIB's one zero-index indexed head;
+    // every other index-free head stays a parse error (previous test).
+    let input = "(assert (= ((_ to_fp 11 53) ((_ fp.to_ieee_bv) x)) x))";
+    assert!(parse(input).is_ok(), "rejected {input}");
+}
+
+#[test]
 fn quoted_numeric_indices_do_not_become_numeric_tokens() {
     for input in [
         "(assert (= (_ bv0 |8|) #x00))",

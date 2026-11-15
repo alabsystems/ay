@@ -71,7 +71,9 @@ impl LiaSolver<'_> {
                     let sc = (coeff * &lcm_den).to_integer();
                     let abs_sc = sc.abs();
 
-                    if let Some((lb, ub)) = self.lra.get_var_bounds(*var) {
+                    // JUSTIFIED bounds only (#nia-sign-cut-soundness): an
+                    // NIA pin must not be folded into the residue constant.
+                    if let Some((lb, ub)) = self.justified_var_bounds(*var) {
                         let is_fixed = lb.is_some() && ub.is_some() && lb == ub;
                         let is_int = self.lra.is_int_var(*var, &self.integer_vars);
 

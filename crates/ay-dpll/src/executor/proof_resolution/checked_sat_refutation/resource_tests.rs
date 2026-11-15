@@ -187,23 +187,50 @@ fn generic_premise_requires_exact_positive_semantic_memo_entry() {
     };
 
     let key = vec![TheoryLit::new(proposition, false)];
-    let mut rejected_memo = ConflictSemanticVerifyMemo::default();
-    rejected_memo.insert(key.clone(), false);
+    // Neither a rejection nor an optimistic acceptance (the fail-closed
+    // search gate's "could not decide, let it be learned") is authority.
+    for verdict in [
+        ConflictSemanticVerdict::Rejected,
+        ConflictSemanticVerdict::AcceptedUnchecked,
+    ] {
+        let mut memo = ConflictSemanticVerifyMemo::default();
+        memo.insert(key.clone(), verdict);
+        let error = SemanticallyCompletedPremiseClauses::complete(
+            authenticate(),
+            &memo,
+            &terms,
+            &mut CheckedRefutationMeter::unbounded(),
+        )
+        .expect_err("only an exact re-derivation is premise authority");
+        assert!(
+            matches!(
+                error,
+                CheckedSatRefutationError::DeferredGenericNotSemanticallyVerified { step }
+                    if step == generic
+            ),
+            "{verdict:?}: {error:?}"
+        );
+    }
+
+    // A re-derivation by a combiner carrying the array theory re-ran the
+    // producer's own inference (2026-09-23 hunt D4, storeeq_41_0293).
+    let mut array_memo = ConflictSemanticVerifyMemo::default();
+    array_memo.insert(key.clone(), ConflictSemanticVerdict::ReprovedByArrayTheory);
     let error = SemanticallyCompletedPremiseClauses::complete(
         authenticate(),
-        &rejected_memo,
+        &array_memo,
         &terms,
         &mut CheckedRefutationMeter::unbounded(),
     )
-    .expect_err("a memoized semantic rejection is not premise authority");
+    .expect_err("an array-theory re-run is not an independent check");
     assert!(matches!(
         error,
-        CheckedSatRefutationError::DeferredGenericNotSemanticallyVerified { step }
+        CheckedSatRefutationError::DeferredGenericReprovedOnlyByArrayTheory { step }
             if step == generic
     ));
 
     let mut accepted_memo = ConflictSemanticVerifyMemo::default();
-    accepted_memo.insert(key, true);
+    accepted_memo.insert(key, ConflictSemanticVerdict::Reproved);
     let completed = SemanticallyCompletedPremiseClauses::complete(
         authenticate(),
         &accepted_memo,
@@ -212,6 +239,9 @@ fn generic_premise_requires_exact_positive_semantic_memo_entry() {
     )
     .expect("the exact current semantic verifier verdict discharges the obligation");
     assert_eq!(completed.clause(generic), Some([proposition].as_slice()));
+    // P4 (2026-10-02): that discharge is AY's own theory code re-deriving the
+    // lemma, so the refutation that uses it is labelled E1, not E2.
+    assert_eq!(completed.re_derived_premise_count(), 1);
 }
 
 #[test]
@@ -266,6 +296,7 @@ fn mismatched_same_id_trace_and_fragment_are_rejected() {
         &mut CheckedRefutationMeter::unbounded(),
     )
     .expect("trace B fragment has no deferred Generic premise");
+    assert_eq!(authenticated_b.re_derived_premise_count(), 0);
 
     let error = verify_exact_composition(
         &validated_a,
@@ -296,6 +327,15 @@ fn checked_sidecar_is_independent_of_an_unrequested_alethe_presentation() {
     assert!(!accepted.last_command_unsat_was_strictly_verified());
     assert!(accepted.last_command_unsat_was_independently_verified());
     assert!(!accepted.last_command_unsat_was_exact_semantically_verified());
+    assert!(!accepted.last_command_unsat_was_corroborated());
+    // Every premise of this refutation is strictly authenticated, so it is
+    // checked evidence; a `Generic` premise AY re-derived would make it E1.
+    assert_eq!(
+        accepted
+            .last_command_unsat_evidence()
+            .map(|evidence| evidence.level()),
+        Some(crate::executor::UnsatEvidenceLevel::E2)
+    );
 
     let (mut malformed, _, _) = contradictory_unit_executor();
     malformed.last_proof = Some(Proof::new());

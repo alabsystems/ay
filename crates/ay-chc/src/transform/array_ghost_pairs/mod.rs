@@ -84,6 +84,9 @@ mod candidate_support;
 mod candidate_usage;
 mod certify;
 mod ghost_tuple_flow;
+mod record_projection;
+mod source_observations;
+pub(crate) mod source_premises;
 
 use crate::{
     ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause,
@@ -101,7 +104,8 @@ use super::{
 
 pub(crate) use candidate_houdini::{try_query_anchored_and_seal, QueryAnchoredSeal};
 pub(crate) use certify::{
-    ghost_pair_replay_obligations, recheck_ghost_pair_certificate, GhostPairCertificate,
+    ghost_pair_replay_obligations, recheck_ghost_pair_certificate, try_quantified_source,
+    GhostPairCertificate, QuantifiedSourceCertificate,
 };
 
 /// Maximum ghost slots (index/value pairs) added to a single predicate.
@@ -682,10 +686,54 @@ impl ArrayGhostPairTransformer {
     }
 
     fn rewrite_clause(&self, clause: &HornClause, spec: &GhostPairSpec) -> Option<HornClause> {
+        self.rewrite_source_clause(clause, spec, &[], std::iter::empty(), None)
+    }
+
+    fn rewrite_source_clause<'a>(
+        &self,
+        clause: &HornClause,
+        spec: &GhostPairSpec,
+        premises: &[crate::quantified::UniversalPremise],
+        global_function_names: impl IntoIterator<Item = &'a str>,
+        control: Option<&source_premises::SourceControl<'_>>,
+    ) -> Option<HornClause> {
+        let poll = || match control {
+            Some(control) => control.poll(),
+            None => Some(()),
+        };
+        poll()?;
+        // Discover false-query probes from the same exact read-over-write
+        // view as candidate synthesis. Otherwise select(store(a, i, v), j)
+        // would observe the write index i rather than the needed read j.
+        // Normalize once per clause, not once per body atom/array. Unsupported
+        // or over-budget normalization retains the legacy discovery expression;
+        // a real source stop remains terminal. No raw constraint is rewritten.
+        let mut normalization_remaining = crate::expr::MAX_PREPROCESSING_NODES;
+        let normalized_query = if matches!(clause.head, ClauseHead::False) {
+            clause.body.constraint.as_ref().and_then(|constraint| {
+                candidate::read_over_write::normalize(
+                    constraint,
+                    &mut normalization_remaining,
+                    &mut || poll().is_none(),
+                )
+            })
+        } else {
+            None
+        };
+        poll()?;
+        let query_constraint = normalized_query
+            .as_deref()
+            .or(clause.body.constraint.as_ref());
         let cands = collect_index_terms(clause, INDEX_TERM_CAP);
         let clause_vars = certify::exact_clause_vars(clause)?;
         let mut used: FxHashSet<String> = clause_vars.into_iter().map(|var| var.name).collect();
         reserve_clause_function_names(clause, &mut used)?;
+        // The quantified caller supplies the complete, precharged inventory:
+        // matrix-only and unused globals cannot become fresh probe binders.
+        used.extend(global_function_names.into_iter().map(str::to_owned));
+        if !premises.is_empty() {
+            source_premises::reserve_names(premises, &mut used, control?)?;
+        }
 
         // Head: append fresh, implicitly-universal ghost probes. Head
         // arguments stay variables (`idx_s`, `val_s`); the semantic coupling
@@ -705,6 +753,7 @@ impl ArrayGhostPairTransformer {
                         fresh_idx.iter().cloned().map(ChcExpr::var).collect();
                     let mut new_args = args.clone();
                     for (s, idx_expr) in fresh_exprs.iter().enumerate() {
+                        poll()?;
                         let array_pos = pred_spec.array_position_of_slot(s, spec.n)?;
                         let array = args.get(array_pos)?.clone();
                         let ChcSort::Array(key_sort, value_sort) = array.sort() else {
@@ -740,6 +789,7 @@ impl ArrayGhostPairTransformer {
         // are plain SMT conjuncts with no linearity constraint.
         let mut new_body_preds: Vec<(PredicateId, Vec<ChcExpr>)> = Vec::new();
         for (pred_id, args) in &clause.body.predicates {
+            poll()?;
             match spec.preds.get(pred_id) {
                 Some(pred_spec) => {
                     let tuple = ghost_tuple_flow::preferred_body_ghost_indices(
@@ -749,6 +799,7 @@ impl ArrayGhostPairTransformer {
                         args,
                         &fresh_exprs,
                         &cands,
+                        query_constraint,
                     )?;
                     new_body_preds.push((*pred_id, spec.extend_args(*pred_id, args, &tuple)?));
                 }
@@ -756,6 +807,13 @@ impl ArrayGhostPairTransformer {
             }
         }
 
+        if let Some(control) = control {
+            let mut terms = fresh_exprs;
+            terms.extend(cands);
+            coupling.extend(source_premises::instances(premises, &terms, control)?);
+        } else if !premises.is_empty() {
+            return None;
+        }
         let new_constraint = if coupling.is_empty() {
             clause.body.constraint.clone()
         } else {
@@ -768,6 +826,7 @@ impl ArrayGhostPairTransformer {
         let mut new_clause =
             HornClause::new(ClauseBody::new(new_body_preds, new_constraint), new_head);
         new_clause.action_id = clause.action_id;
+        poll()?;
         Some(new_clause)
     }
 }

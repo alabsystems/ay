@@ -60,7 +60,7 @@ impl TheorySolver for DtSolver<'_> {
     }
 
     fn check(&mut self) -> TheoryResult {
-        self.check_count += 1;
+        self.check_count = self.check_count.saturating_add(1);
         tracing::debug!(
             constructors = self.term_constructors.len(),
             eq_lits = self.asserted_eq_lits.len(),
@@ -92,7 +92,7 @@ impl TheorySolver for DtSolver<'_> {
         // → f1(s) = f1(t)). Subsequent checks need the updated classes (#5082).
         if let Some(conflict) = self.check_injectivity_conflicts() {
             tracing::debug!("DT check: injectivity conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
@@ -101,28 +101,28 @@ impl TheorySolver for DtSolver<'_> {
         // DT solver must reject this directly (no arithmetic partner) (#dt-congruence).
         if let Some(conflict) = self.check_constant_clash() {
             tracing::debug!("DT check: constant clash conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
         // Check for constructor clashes (including those exposed by injectivity merges).
         if let Some(conflict) = self.check_clash() {
             tracing::debug!("DT check: constructor clash conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
         // Check tester results against constructors in equivalence classes (#5082).
         if let Some(conflict) = self.check_tester_conflicts() {
             tracing::debug!("DT check: tester-constructor conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
         // Check for implied equality vs asserted disequality conflicts.
         if let Some(conflict) = self.check_disequality_conflicts() {
             tracing::debug!("DT check: disequality conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
@@ -151,7 +151,7 @@ impl TheorySolver for DtSolver<'_> {
         // finite algebraic datatypes (SMT-LIB). See the development design notes
         if let Some(conflict) = self.occurs_check() {
             tracing::debug!("DT check: acyclicity conflict");
-            self.conflict_count += 1;
+            self.conflict_count = self.conflict_count.saturating_add(1);
             return TheoryResult::Unsat(conflict);
         }
 
@@ -167,7 +167,7 @@ impl TheorySolver for DtSolver<'_> {
         // decidable problems.
         self.pending_split_atom = self.find_case_split();
         if self.pending_split_atom.is_some() {
-            self.split_count += 1;
+            self.split_count = self.split_count.saturating_add(1);
             tracing::debug!("DT check: sat (with pending case split)");
         } else {
             tracing::debug!("DT check: sat");
@@ -177,7 +177,7 @@ impl TheorySolver for DtSolver<'_> {
 
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
         let props = std::mem::take(&mut self.pending);
-        self.propagation_count += props.len() as u64;
+        self.propagation_count = self.propagation_count.saturating_add(props.len() as u64);
         props
     }
 

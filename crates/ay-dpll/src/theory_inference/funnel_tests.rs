@@ -4,6 +4,8 @@
 use super::funnel::DatatypeRegistryData;
 use super::*;
 
+#[path = "funnel_cut_chain_tests.rs"]
+mod cut_chain;
 #[path = "funnel_guarded_split_tests.rs"]
 mod guarded_split;
 use num_bigint::BigInt;

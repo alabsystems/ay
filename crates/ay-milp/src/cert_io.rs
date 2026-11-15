@@ -79,7 +79,9 @@ use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 use sha2::{Digest, Sha256};
 
-use crate::cert::{BoundSide, FactRef, FarkasCertificate, Multiplier, OptimalityCertificate};
+use crate::cert::{
+    BoundSide, CertificateError, FactRef, FarkasCertificate, Multiplier, OptimalityCertificate,
+};
 use crate::hybrid_integer_lift::{
     decode_hybrid_integer_lift_infeasibility_certificate_json,
     encode_hybrid_integer_lift_infeasibility_certificate_json,
@@ -91,7 +93,7 @@ use crate::hybrid_pb_lp::{
     verify_hybrid_pb_lp_infeasibility_certificate,
 };
 use crate::model::{exact, Col, ColKind, Model, Row, Sense};
-use crate::opt_cert::{verify_optimality_tree_bound, MilpOptimalityCertificate, OptTreeNode};
+use crate::opt_cert::{MilpOptimalityCertificate, OptTreeNode};
 use crate::outcome::{Outcome, UnknownReason};
 use crate::presolve::implied_free::{
     validate_certificate_payload_caps, AffineAggregationAnalysis, AffineAggregationCaps,
@@ -111,8 +113,87 @@ use crate::{
 
 /// The format version this build emits and the only one it reads.
 pub const AYC_VERSION: u32 = 1;
-const MAX_AYC_INPUT_BYTES: usize = 512 * 1024 * 1024;
-const MAX_AYC_INPUT_LINES: usize = 8_000_000;
+
+/// The largest `.ayc` text [`parse`] will read, in bytes.
+///
+/// PUBLIC BECAUSE THE EMITTER HAS TO SEE IT. Until 2026-08-28 these caps lived
+/// only on the reading side and `emission_main.rs` had no idea they existed, so
+/// this build could write an artifact its own `verify` refused to read. See
+/// [`parser_cap_excess`]. An input over either cap is
+/// [`CertIoError::InputTooLarge`], which the checker reports as `Unverified`,
+/// never `Refuted`, whatever the cap values.
+///
+/// The caps exist so a hostile or runaway file must not be able to exhaust
+/// memory before a single obligation has been checked.
+///
+/// # These were raised, and the raise made the checker STRICTLY safer
+///
+/// The old pair — 512 MiB and 8,000,000 lines — was chosen when the `opttree`
+/// block was PARSED into an `OptTreeNode`. Under that reader the caps did not
+/// bound memory at all: 8M multiplier records become ~880 MB of object graph on
+/// top of the file and its line index, and the caps say nothing about that term.
+/// The block is now STREAMED (see [`Certificate::opt_tree_body`]), so the
+/// resident cost of reading a certificate is the file, its line index at 16
+/// bytes per line, and ONE captured block body:
+///
+/// ```text
+///   old caps, object-parsed opttree:  512 MiB + 128 MiB + ~880 MB  ~= 1.5 GB
+///   new caps, streamed opttree:      1024 MiB + 512 MiB + 1024 MiB  = 2.5 GiB
+/// ```
+///
+/// — a bound that now actually holds, against one that a leaf-dense file could
+/// walk straight past. Both sit under this box's `phys/16` = 3,072 MiB
+/// governor; the new one does so as an arithmetic consequence of the caps
+/// rather than by luck.
+///
+/// # Why they had to move at all: a MEASURED artifact that did not fit
+///
+/// `khb05250`'s completed optimality tree is **655,330,144 bytes** in
+/// **23,024,720 records** (17,124 leaves, 1,350 columns). Under the old caps
+/// that file is refused at the door ("exceeds the 512 MiB parser cap"; `exit
+/// 20` before `InputTooLarge`, `exit 10` after) — so the feature could emit a
+/// proof it could not check. The margins
+/// here are 1.6x on bytes and 1.4x on lines against that measurement.
+pub const MAX_AYC_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+/// The largest `.ayc` line count [`parse`] will read. See [`MAX_AYC_INPUT_BYTES`].
+pub const MAX_AYC_INPUT_LINES: usize = 32_000_000;
+
+/// `None` when `text` is inside both parser caps; otherwise a human-readable
+/// description of every cap it blows, for a caller that is about to WRITE it.
+///
+/// This exists so the emitter can say so at emission time. It is deliberately
+/// NOT a veto: refusing to write a certificate because this build cannot read
+/// it back would destroy evidence a different reader (or a later build with a
+/// higher cap) can still use, and destroying evidence to make a tool tidier is
+/// a loss, not a fix. The honest posture is: write it, and say plainly that
+/// `ay-milp verify` will not re-read it.
+#[must_use]
+pub fn parser_cap_excess(text: &str) -> Option<String> {
+    let bytes = text.len();
+    let mut over: Vec<String> = Vec::new();
+    if bytes > MAX_AYC_INPUT_BYTES {
+        over.push(format!(
+            "{bytes} bytes exceeds the {MAX_AYC_INPUT_BYTES}-byte parser cap"
+        ));
+    }
+    // A line needs at least its own newline, so `lines <= bytes + 1` and a text
+    // shorter than the line cap cannot blow it. Skipping the scan below that
+    // keeps this free on every ordinary certificate; the one that matters here
+    // is 655 MB, where an O(n) pass is noise against writing the file.
+    if bytes >= MAX_AYC_INPUT_LINES {
+        let lines = text.bytes().filter(|&b| b == b'\n').count() + 1;
+        if lines > MAX_AYC_INPUT_LINES {
+            over.push(format!(
+                "{lines} lines exceeds the {MAX_AYC_INPUT_LINES}-line parser cap"
+            ));
+        }
+    }
+    if over.is_empty() {
+        None
+    } else {
+        Some(over.join("; "))
+    }
+}
 
 /// How a claim is backed.
 ///
@@ -277,9 +358,13 @@ use wire::*;
 pub use checking::{CheckReport, CheckStatus, ClaimReport, ClaimStanding};
 pub use checking_main::check;
 pub(crate) use digest::canonical_digest_bytes_bounded;
+// THE WIRE WRITERS, shared with the STREAMING producer in `opt_cert` so the two
+// cannot drift: one serialiser, two call sites.
 pub use digest::{canonical_digest, canonical_model_v1, sha256_hex};
 pub use emission::EmitCtx;
+pub(crate) use emission_basic::{write_opt_tree_leaf, write_opt_tree_split};
 pub use emission_main::emit;
+pub(crate) use parse_opt_tree::{verify_opt_tree_body, OptTreeStreamError};
 pub use parsing::{CertIoError, Certificate, Header, ParsedClaim, RootDualBoundRecord};
 pub use parsing_main::parse;
 

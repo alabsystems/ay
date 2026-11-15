@@ -112,39 +112,43 @@ fn diagnose_sat_without_expected_evidence_exits_zero() {
                 (check-sat)\n";
     let (path, _cleanup) = write_temp_smt2(smt2);
 
-    let output = Command::new(ay_path)
-        .arg("diagnose")
-        .arg("--reference")
-        .arg("none")
-        .arg(&path)
-        .output_timeout(Duration::from_secs(55))
-        .expect("failed to run ay diagnose");
+    // Exercise the real short-lived explanation child across repeated births.
+    for _ in 0..16 {
+        let output = Command::new(ay_path)
+            .arg("diagnose")
+            .arg("--reference")
+            .arg("none")
+            .arg(&path)
+            .output_timeout(Duration::from_secs(55))
+            .expect("failed to run ay diagnose");
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "expected exit 0 for unscored case; got {:?}. stderr=\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "expected exit 0 for unscored case; got {:?}. stderr=\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ay binary:"),
-        "expected ay binary path in report; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("ay build:"),
-        "expected ay build summary in report; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("ay verdict:      sat"),
-        "expected 'ay verdict:      sat' in report; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("=== Explanation (SAT) ==="),
-        "expected --explain block even when no disagreement; got:\n{stdout}"
-    );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ay binary:"),
+            "expected ay binary path in report; got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("ay build:"),
+            "expected ay build summary in report; got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("ay verdict:      sat"),
+            "expected 'ay verdict:      sat' in report; got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("=== Explanation (SAT) ==="),
+            "expected --explain block even when no disagreement; got:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// JSON output must be machine-readable and include the key diagnostic fields.
@@ -199,7 +203,10 @@ fn diagnose_json_output_contains_expected_keys() {
         .contains("evidence conflict"));
     assert!(parsed["explain_output"]
         .as_str()
-        .unwrap()
+        .unwrap_or_else(|| panic!(
+            "missing explanation:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
         .contains("Constraint verification"));
 }
 

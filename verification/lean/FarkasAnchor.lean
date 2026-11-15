@@ -23,8 +23,9 @@ agreement only and does not ship a general soundness theorem for the procedure.
 ## The JSON -> Lean mapping (from the emitted fixtures)
 
 The explicit generator
-`cargo run -p ay-pb --features dev-tools --bin ay-pb-dev -- farkas-anchor
-verification/lean/farkas_anchor` drives a real on-disk `.opb` through AY's
+`targo --unverified run -p ay-pb --features dev-tools --bin ay-pb-dev --
+farkas-anchor verification/lean/farkas_anchor` (`cargo run` with the same
+arguments without the Trust toolchain) drives a real on-disk `.opb` through AY's
 certificate path, validates both checker verdicts, stages both payloads, and
 atomically replaces each `SCertZ` fixture (serde, BigInt as decimal strings) at
 `farkas_anchor/{valid,tampered}_cert.json`. The mapping is direct:

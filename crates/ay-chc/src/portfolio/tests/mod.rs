@@ -8,7 +8,7 @@
 use super::engines::translate_trl_singleloop_safe_model;
 use super::schedule::{
     FORCE_SOLVER_THREAD_SPAWN_FAILURE, PARALLEL_TEST_DISABLE_LANE_TIMER,
-    PARALLEL_TEST_PREPARE_DELAY,
+    PARALLEL_TEST_PREPARE_DELAY, VERDICT_REAP_BOUND,
 };
 use super::*;
 use crate::bmc::BmcConfig;
@@ -34,12 +34,18 @@ use std::thread;
 use std::time::Duration;
 
 mod bv_regression;
+mod cancel_latency;
+mod confirmed_unsafe_trace;
+mod engine_memory;
 mod engine_specific;
 mod lemma_transfer;
+mod memory_ownership;
+mod mode_deadlines;
 mod panic_and_spawn;
 mod solving;
 mod trivial_solver;
 mod validation;
+mod witnessless_unsafe;
 
 fn create_safe_problem() -> ChcProblem {
     // Safe: x = 0 => Inv(x), Inv(x) /\ x < 5 => Inv(x+1), Inv(x) /\ x >= 10 => false

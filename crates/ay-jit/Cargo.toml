@@ -15,14 +15,65 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 ay-core.workspace = true
 #
-# The external-codegen pin must be an epoch whose OWN external-codegen-ir requirement is a
-# revision on a external-codegen-ir branch. external-codegen 62deb853 required external-codegen-ir
-# 2275429170, which sits on NO branch of the external-codegen-ir remote (that remote has
-# exactly one branch, main, and it does not contain it), so resolving this
-# manifest split the lock across two external-codegen-ir revisions and made the
-# superproject's `fast.dependency-constellation` gate refuse the constellation.
-# external-codegen 56b9dec4 is the revision the Trust superproject itself pins and
-# requires external-codegen-ir 4803c40d — the same revision ay-jit names directly below.
+# The external-codegen pin must be an epoch whose OWN external-codegen-ir requirement is the
+# SAME revision ay-jit names directly below, or the lock carries two external-codegen-ir
+# graphs, so the `external_codegen_ir::Module` values built here would be a different
+# type from the one `external_codegen_codegen` consumes. external-codegen 62deb853 once required
+# external-codegen-ir 2275429170, a revision on NO branch of the external-codegen-ir remote, which
+# also made the superproject's `fast.dependency-constellation` gate refuse the
+# constellation.
+#
+# The pin must ALSO be admissible by the Trust superproject's
+# `fast.dependency-constellation` push gate: every external-codegen git rev in this
+# lock must EQUAL or be an ANCESTOR of trust's `first-party/external-codegen` gitlink
+# (scripts/check_dependency_cycle_anchor.py, verify_local_objects). That
+# gitlink, not external-codegen `main`, is the terminal this pin is judged against.
+#
+# The 2026-10-21 cohort is external-codegen-ir main 89c68b72 (schema 9dddb1520520) with
+# ExternalCodegen main 6423cf3e8, whose own workspace manifest requires that exact IR
+# revision, and Clean d0bf4d54 (the CLEAN_REVISION external-codegen-ir 89c68b72 records)
+# through both: the next Trust lattice train's R and G. It replaces the D1b
+# cohort below, which this manifest still declared on main after the
+# 2026-10-19 pin (external-codegen-ir 6382da38, ExternalCodegen e5560e8db) was adopted with an
+# -s ours merge; every new rev descends from the old one.
+#
+# The 2026-10-13 cohort was the D1b cohort (Trust's D1b train pins external-codegen-ir
+# 3d315a17 and a ExternalCodegen gitlink, e7acae8b1, that contains cd7a0e01):
+# external-codegen-ir 3d315a17 (binary v59/v60: the effect summary and world epochs, the typed signature
+# ABI `FuncTy.abi`; and D1b, under which a construction door refuses instead
+# of panicking: `Module::add_func_type` returns `Result`, `add_function` is
+# gone for `try_add_function`) with ExternalCodegen cd7a0e01, whose own workspace
+# manifest requires that exact IR revision, and Clean 1ad47bdd, the Clean
+# revision both pin through external-codegen-ir-build / external-codegen-verify. It replaces the
+# 2026-10-08 cohort external-codegen-ir 588390da / ExternalCodegen d7dc0695 (Clean 01ffe310); all
+# three new revs descend from the old ones. ay-jit's emitters take the
+# refusing doors with `?` into `JitError::ExternalCodegenIrRefused`, or decline with
+# `None` where the emitter's contract already returns `Option`; no emitter
+# writes an ABI record (`abi: None`).
+# Never move this IR row past the CG epoch's
+# own requirement: two external-codegen-ir graphs in the lock make the
+# `external_codegen_ir::Module` built here a different type from the one
+# `external_codegen_codegen` consumes (E0308 at every `compile_module_to_jit` call).
+# The Trust superproject must retain this CG commit as an ancestor of its CG
+# gitlink. These pins do not establish whole-workspace Trust verification.
+# Advance the matching three CG manifest rows (this one and the two in
+# crates/ay-sat/Cargo.toml) together with this IR row and the root lock.
+# ay-jit emits `Function.body_gate = None` (introduced in v41, unchanged
+# through v60) on purpose; see the module docs of `src/external_codegen_ir_emit.rs`
+# before changing that. v46's new IR constructs (rotate / copysign / bit
+# intrinsics, MemCopy / MemSet, typed spec carrier), v47-v49's
+# (`Inst::Drop`, weak `Inst::CmpXchg`, `Constant::Uninit`), v50's
+# (`Inst::ArraySplat`, `Constant::Splat`), v51-v57's (the INST wire batch
+# `Inst::MakeAggregate` / `MemCopy` / `MemSet` tags, kinded and sited
+# `Inst::Assert`, `Inst::AssertInvoke`, the cannot-unwind calls, drop glue
+# and `Inst::DropInvoke`, `Inst::InvokeIndirect`, templates), v58's and
+# v59-v60's are not emitted here (external-codegen-ir raises the wire version only for
+# a module that carries one). ay-jit builds every module with `Module::new` over integer,
+# `Bool`, vector and pointer types and function signatures only: no
+# `StructDef` or `EnumDef`, so there is no `TypeOrigin` key to stamp, and
+# no closure type, so there is no `closure_layouts` row to declare. A future
+# emitter that adds either must name the source entity it is the image of (or
+# leave `origin` `None`) and declare a coherent frame; it must not invent one.
 
 [features]
 

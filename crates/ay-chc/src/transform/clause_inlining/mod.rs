@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod back_translator;
 mod clause_ops;
 mod multi_def;
+mod survivor_model;
 
 pub(crate) use back_translator::accept_profile_enabled;
 use back_translator::InliningBackTranslator;

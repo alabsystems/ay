@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_ABV)
+(declare-const value (_ BitVec 8))
+(declare-const slot_addr (_ BitVec 8))
+(assert (not (= value (select (store ((as const (Array (_ BitVec 8) (_ BitVec 8))) (_ bv0 8)) slot_addr value) slot_addr))))
+(check-sat)
+(exit)

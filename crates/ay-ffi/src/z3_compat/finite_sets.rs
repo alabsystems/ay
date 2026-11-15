@@ -18,10 +18,10 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    alloc_sort, apply_surface_replacements, cache_func_decl_with_params, checked_ast_to_term,
-    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_surface_text_base, lookup_ast_sort,
-    record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_func_decl, Z3_sort,
-    Z3_INVALID_ARG, Z3_SORT_ERROR, Z3_UNKNOWN_SORT,
+    alloc_sort, apply_surface_replacements, cache_func_decl_with_params, checked_ast_to_pub,
+    engine_ast, engine_pub, ffi_guard_int, ffi_guard_mk, ffi_guard_ptr, ffi_surface_text_base,
+    latest_pub_id, mk_ast, pub_id_to_ast, public_sort, stated_sort, PubTerm, Z3Context, Z3_ast,
+    Z3_context, Z3_func_decl, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR, Z3_UNKNOWN_SORT,
 };
 
 /// Public finite-set application kind retained over an engine lowering.
@@ -297,12 +297,12 @@ fn reachable_finite_set_terms(ctx: &Z3Context, roots: &[Term]) -> HashSet<Term> 
             continue;
         }
         pending.extend(ctx.solver.term_children(term));
-        if let Some(application) = ctx.finite_set_apps.get(&term) {
+        if let Some(application) = finite_set_app_of_term(ctx, term) {
             pending.extend(
                 application
                     .args
                     .iter()
-                    .filter_map(|&ast| checked_ast_to_term(ctx, ast)),
+                    .filter_map(|&ast| checked_ast_to_pub(ctx, ast).map(|arg| arg.term)),
             );
         }
     }
@@ -314,10 +314,10 @@ pub(crate) fn finite_set_decision_gate(ctx: &Z3Context, roots: &[Term]) -> Finit
     let reachable = reachable_finite_set_terms(ctx, roots);
     let mut gate = FiniteSetDecisionGate::default();
     for term in reachable {
-        if ctx.finite_set_apps.contains_key(&term)
-            || lookup_ast_sort(ctx, term_to_ast(ctx, term))
-                .is_some_and(|sort| sort_mentions_finite_set(ctx, sort))
-        {
+        if engine_pub(ctx, term).is_some_and(|node| {
+            ctx.finite_set_apps.contains_key(&node.id)
+                || stated_sort(ctx, node).is_some_and(|sort| sort_mentions_finite_set(ctx, sort))
+        }) {
             gate.uses_finite_set = true;
         }
         if let Some(provenance) = ctx.finite_set_term_provenance.get(&term) {
@@ -387,12 +387,6 @@ fn sort_error(ctx: &mut Z3Context, operation: &str, message: impl Into<String>) 
     0
 }
 
-pub(crate) fn public_ast_sort(ctx: &Z3Context, ast: Z3_ast, term: Term) -> Sort {
-    lookup_ast_sort(ctx, ast)
-        .cloned()
-        .unwrap_or_else(|| ctx.solver.sort_of(term))
-}
-
 /// The one typed declaration parameter on Z3 5.0.0's polymorphic
 /// `set.empty` declaration is its instantiated FiniteSet range sort.
 pub(crate) fn finite_set_empty_decl_parameter(
@@ -410,11 +404,12 @@ fn validate_finite_set(
     operation: &str,
     ast: Z3_ast,
 ) -> Option<(Term, Sort, Sort)> {
-    let Some(term) = checked_ast_to_term(ctx, ast) else {
+    let Some(decoded) = checked_ast_to_pub(ctx, ast) else {
         invalid_ast(ctx, operation, "null, foreign, or invalid finite-set AST");
         return None;
     };
-    let Some(public) = lookup_ast_sort(ctx, ast).cloned() else {
+    let term = decoded.term;
+    let Some(public) = stated_sort(ctx, decoded).cloned() else {
         sort_error(ctx, operation, "expression has no public finite-set sort");
         return None;
     };
@@ -448,8 +443,9 @@ fn record_application(
         args: args.clone(),
         range: range.clone(),
     };
-    if let Some(&term) = ctx.finite_set_app_cache.get(&key) {
-        return term_to_ast(ctx, term);
+    if let Some(&id) = ctx.finite_set_app_cache.get(&key) {
+        let ast = pub_id_to_ast(ctx, id);
+        return checked_ast_to_pub(ctx, ast).map_or(0, |_| ast);
     }
 
     // A distinct witness preserves Z3 application identity even when AY
@@ -458,39 +454,44 @@ fn record_application(
     let witness = ctx.solver.fresh_var("finite_set_app", witness_sort);
     let definition = ctx.solver.eq(witness, backing);
     record_reachable_finite_set_axiom(ctx, witness, definition);
+    let ast = mk_ast(ctx, witness, range.clone());
+    let Some(node) = checked_ast_to_pub(ctx, ast) else {
+        return 0;
+    };
     ctx.finite_set_apps.insert(
-        witness,
+        node.id,
         FiniteSetApp {
             op,
             args,
             domain,
-            range: range.clone(),
+            range,
         },
     );
-    ctx.finite_set_app_backings.insert(witness, backing);
-    ctx.finite_set_app_cache.insert(key, witness);
-    let ast = term_to_ast(ctx, witness);
-    record_ast_sort(ctx, ast, range);
+    ctx.finite_set_app_cache.insert(key, node.id);
     ast
 }
 
-pub(crate) fn finite_set_app_for_ast(ctx: &Z3Context, ast: Z3_ast) -> Option<&FiniteSetApp> {
-    checked_ast_to_term(ctx, ast).and_then(|term| ctx.finite_set_apps.get(&term))
+/// The finite-set application a decoded AST is, if any.
+pub(crate) fn finite_set_app_for(ctx: &Z3Context, decoded: PubTerm) -> Option<&FiniteSetApp> {
+    ctx.finite_set_apps.get(&decoded.id)
 }
 
-pub(crate) fn finite_set_decl_for_ast(ctx: &mut Z3Context, ast: Z3_ast) -> Option<Z3_func_decl> {
-    let app = finite_set_app_for_ast(ctx, ast)?.clone();
-    let handle = cache_func_decl_with_params(
+/// The finite-set application an engine term reads as (its witness), if any.
+fn finite_set_app_of_term(ctx: &Z3Context, term: Term) -> Option<&FiniteSetApp> {
+    latest_pub_id(ctx, term).and_then(|id| ctx.finite_set_apps.get(&id))
+}
+
+fn finite_set_app_for_ast(ctx: &Z3Context, ast: Z3_ast) -> Option<&FiniteSetApp> {
+    checked_ast_to_pub(ctx, ast).and_then(|decoded| finite_set_app_for(ctx, decoded))
+}
+
+pub(crate) fn finite_set_decl_for(ctx: &mut Z3Context, decoded: PubTerm) -> Option<Z3_func_decl> {
+    let app = finite_set_app_for(ctx, decoded)?.clone();
+    Some(super::cache_func_decl_with_finite_set_op(
         ctx,
         ay_dpll::api::FuncDecl::new(app.op.name().to_string(), app.domain, app.range),
-        Vec::new(),
-    );
-    // SAFETY: the cache helper just allocated this handle in `ctx`'s arena,
-    // and no alias to it has escaped this function yet.
-    unsafe {
-        (*handle).finite_set_op = Some(app.op);
-    }
-    Some(handle)
+        app.op,
+    ))
 }
 
 /// Retain exact FiniteSet surface identity for one parsed occurrence.
@@ -511,10 +512,10 @@ pub(crate) fn retain_parsed_finite_set_application(
     let arg_asts = args
         .iter()
         .copied()
-        .map(|arg| term_to_ast(ctx, arg))
+        .map(|arg| engine_ast(ctx, arg))
         .collect();
     let ast = record_application(ctx, backing, op, arg_asts, domain, range);
-    checked_ast_to_term(ctx, ast)
+    checked_ast_to_pub(ctx, ast).map(|retained| retained.term)
 }
 
 /// Parsed formula roots after restoring Z3 5.0.0 public FiniteSet identity.
@@ -610,8 +611,8 @@ fn retain_parsed_public_term(
         }
     };
 
-    let ast = term_to_ast(ctx, retained);
-    record_ast_sort(ctx, ast, public_sort.clone());
+    // Stated so the retained term reads at its public sort.
+    let _retained_ast = mk_ast(ctx, retained, public_sort.clone());
     if !node.public_bound_sorts.is_empty() {
         let public_bounds = node
             .public_bound_sorts
@@ -721,9 +722,8 @@ fn render_finite_set_ast_raw(ctx: &Z3Context, ast: Z3_ast) -> Option<String> {
         .iter()
         .map(|&arg| {
             render_finite_set_ast_raw(ctx, arg).or_else(|| {
-                let term = checked_ast_to_term(ctx, arg)?;
-                ctx.solver
-                    .format_term_checked(term)
+                let term = checked_ast_to_pub(ctx, arg)?.term;
+                super::finite_field::format_public_term_in_context(ctx, term)
                     .map(|text| ffi_surface_text_base(ctx, &text))
             })
         })
@@ -740,9 +740,12 @@ fn render_finite_set_ast_raw(ctx: &Z3Context, ast: Z3_ast) -> Option<String> {
 /// they occur below a generic AST such as `ite`, `=`, or an Array term.
 pub(crate) fn finite_set_surface_replacements(ctx: &Z3Context) -> HashMap<String, String> {
     let mut replacements = HashMap::new();
-    for &term in ctx.finite_set_apps.keys() {
-        let ast = term_to_ast(ctx, term);
-        let Some(internal) = ctx.solver.format_term_checked(term) else {
+    for &id in ctx.finite_set_apps.keys() {
+        let ast = pub_id_to_ast(ctx, id);
+        let Some(term) = checked_ast_to_pub(ctx, ast).map(|witness| witness.term) else {
+            continue;
+        };
+        let Some(internal) = super::finite_field::format_public_term_in_context(ctx, term) else {
             continue;
         };
         let Some(public) = render_finite_set_ast_raw(ctx, ast) else {
@@ -855,7 +858,7 @@ pub unsafe extern "C" fn Z3_get_finite_set_sort_basis(c: Z3_context, s: Z3_sort)
 pub unsafe extern "C" fn Z3_mk_finite_set_empty(c: Z3_context, set_sort: Z3_sort) -> Z3_ast {
     // SAFETY: guarded and sort-authenticated before dereference.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_empty", |ctx| {
             let Some(set_sort) = require_sort_handle(ctx, set_sort, "Z3_mk_finite_set_empty")
             else {
                 return 0;
@@ -887,11 +890,12 @@ pub unsafe extern "C" fn Z3_mk_finite_set_empty(c: Z3_context, set_sort: Z3_sort
 pub unsafe extern "C" fn Z3_mk_finite_set_singleton(c: Z3_context, elem: Z3_ast) -> Z3_ast {
     // SAFETY: the guard authenticates the context and the AST is checked before use.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(elem_term) = checked_ast_to_term(ctx, elem) else {
+        ffi_guard_mk(c, "Z3_mk_finite_set_singleton", |ctx| {
+            let Some(element) = checked_ast_to_pub(ctx, elem) else {
                 return invalid_ast(ctx, "Z3_mk_finite_set_singleton", "invalid element AST");
             };
-            let basis = public_ast_sort(ctx, elem, elem_term);
+            let elem_term = element.term;
+            let basis = public_sort(ctx, element);
             let engine_basis = finite_set_engine_public_sort(ctx, &basis);
             if ctx.solver.sort_of(elem_term) != engine_basis {
                 return sort_error(
@@ -969,7 +973,7 @@ fn finite_set_binary(
 pub unsafe extern "C" fn Z3_mk_finite_set_union(c: Z3_context, s1: Z3_ast, s2: Z3_ast) -> Z3_ast {
     // SAFETY: the helper validates every AST and sort.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_union", |ctx| {
             finite_set_binary(ctx, "Z3_mk_finite_set_union", s1, s2, FiniteSetOp::Union)
         })
     }
@@ -987,7 +991,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_intersect(
 ) -> Z3_ast {
     // SAFETY: the helper validates every AST and sort.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_intersect", |ctx| {
             finite_set_binary(
                 ctx,
                 "Z3_mk_finite_set_intersect",
@@ -1011,7 +1015,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_difference(
 ) -> Z3_ast {
     // SAFETY: the helper validates every AST and sort.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_difference", |ctx| {
             finite_set_binary(
                 ctx,
                 "Z3_mk_finite_set_difference",
@@ -1035,16 +1039,17 @@ pub unsafe extern "C" fn Z3_mk_finite_set_member(
 ) -> Z3_ast {
     // SAFETY: guarded; every AST is authenticated before use.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(elem_term) = checked_ast_to_term(ctx, elem) else {
+        ffi_guard_mk(c, "Z3_mk_finite_set_member", |ctx| {
+            let Some(element) = checked_ast_to_pub(ctx, elem) else {
                 return invalid_ast(ctx, "Z3_mk_finite_set_member", "invalid element AST");
             };
+            let elem_term = element.term;
             let Some((set_term, set_sort, basis)) =
                 validate_finite_set(ctx, "Z3_mk_finite_set_member", set)
             else {
                 return 0;
             };
-            if public_ast_sort(ctx, elem, elem_term) != basis {
+            if public_sort(ctx, element) != basis {
                 return sort_error(
                     ctx,
                     "Z3_mk_finite_set_member",
@@ -1072,7 +1077,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_member(
 pub unsafe extern "C" fn Z3_mk_finite_set_subset(c: Z3_context, s1: Z3_ast, s2: Z3_ast) -> Z3_ast {
     // SAFETY: guarded; every AST is authenticated before use.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_subset", |ctx| {
             let Some((left, public, basis)) =
                 validate_finite_set(ctx, "Z3_mk_finite_set_subset", s1)
             else {
@@ -1137,8 +1142,12 @@ pub unsafe extern "C" fn Z3_mk_finite_set_subset(c: Z3_context, s1: Z3_ast, s2: 
                 Sort::Bool,
             );
             if has_finite_set_binder {
-                if let Some(term) = checked_ast_to_term(ctx, result) {
-                    activate_finite_set_quantifier_gate(ctx, term, "Z3_mk_finite_set_subset");
+                if let Some(retained) = checked_ast_to_pub(ctx, result) {
+                    activate_finite_set_quantifier_gate(
+                        ctx,
+                        retained.term,
+                        "Z3_mk_finite_set_subset",
+                    );
                 }
             }
             result
@@ -1158,7 +1167,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_subset(c: Z3_context, s1: Z3_ast, s2: 
 pub unsafe extern "C" fn Z3_mk_finite_set_size(c: Z3_context, set: Z3_ast) -> Z3_ast {
     // SAFETY: guarded; the set AST is authenticated before use.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_size", |ctx| {
             let Some((set_term, set_sort, _basis)) =
                 validate_finite_set(ctx, "Z3_mk_finite_set_size", set)
             else {
@@ -1179,14 +1188,14 @@ pub unsafe extern "C" fn Z3_mk_finite_set_size(c: Z3_context, set: Z3_ast) -> Z3
                     args,
                     ..
                 }) => {
-                    let Some(low) = checked_ast_to_term(ctx, args[0]) else {
+                    let Some(low) = checked_ast_to_pub(ctx, args[0]).map(|low| low.term) else {
                         return invalid_ast(
                             ctx,
                             "Z3_mk_finite_set_size",
                             "invalid range lower bound",
                         );
                     };
-                    let Some(high) = checked_ast_to_term(ctx, args[1]) else {
+                    let Some(high) = checked_ast_to_pub(ctx, args[1]).map(|high| high.term) else {
                         return invalid_ast(
                             ctx,
                             "Z3_mk_finite_set_size",
@@ -1217,10 +1226,9 @@ pub unsafe extern "C" fn Z3_mk_finite_set_size(c: Z3_context, set: Z3_ast) -> Z3
                 vec![set_sort],
                 Sort::Int,
             );
-            if let (Some(owner), Some(axiom)) =
-                (checked_ast_to_term(ctx, result), cardinality_axiom)
+            if let (Some(owner), Some(axiom)) = (checked_ast_to_pub(ctx, result), cardinality_axiom)
             {
-                record_reachable_finite_set_axiom(ctx, owner, axiom);
+                record_reachable_finite_set_axiom(ctx, owner.term, axiom);
             }
             result
         })
@@ -1232,11 +1240,12 @@ fn array_public_signature(
     operation: &str,
     ast: Z3_ast,
 ) -> Option<(Term, Sort, Sort)> {
-    let Some(term) = checked_ast_to_term(ctx, ast) else {
+    let Some(decoded) = checked_ast_to_pub(ctx, ast) else {
         invalid_ast(ctx, operation, "invalid array AST");
         return None;
     };
-    let public = public_ast_sort(ctx, ast, term);
+    let term = decoded.term;
+    let public = public_sort(ctx, decoded);
     let Sort::Array(array) = public else {
         sort_error(ctx, operation, "expected an array/function argument");
         return None;
@@ -1255,7 +1264,7 @@ fn array_public_signature(
 pub unsafe extern "C" fn Z3_mk_finite_set_map(c: Z3_context, f: Z3_ast, set: Z3_ast) -> Z3_ast {
     // SAFETY: guarded; every AST and sort is validated before construction.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_map", |ctx| {
             let Some((f_term, domain, image)) =
                 array_public_signature(ctx, "Z3_mk_finite_set_map", f)
             else {
@@ -1291,7 +1300,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_map(c: Z3_context, f: Z3_ast, set: Z3_
                     args,
                     ..
                 }) => {
-                    let Some(element) = checked_ast_to_term(ctx, args[0]) else {
+                    let Some(element) = checked_ast_to_pub(ctx, args[0]).map(|e| e.term) else {
                         return invalid_ast(
                             ctx,
                             "Z3_mk_finite_set_map",
@@ -1337,8 +1346,8 @@ pub unsafe extern "C" fn Z3_mk_finite_set_map(c: Z3_context, f: Z3_ast, set: Z3_
                 output,
             );
             if has_finite_set_binder {
-                if let Some(term) = checked_ast_to_term(ctx, result) {
-                    activate_finite_set_quantifier_gate(ctx, term, "Z3_mk_finite_set_map");
+                if let Some(retained) = checked_ast_to_pub(ctx, result) {
+                    activate_finite_set_quantifier_gate(ctx, retained.term, "Z3_mk_finite_set_map");
                 }
             }
             result
@@ -1360,7 +1369,7 @@ pub unsafe extern "C" fn Z3_mk_finite_set_filter(
 ) -> Z3_ast {
     // SAFETY: guarded; every AST and sort is validated before construction.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_finite_set_filter", |ctx| {
             let Some((predicate_term, domain, range)) =
                 array_public_signature(ctx, "Z3_mk_finite_set_filter", predicate)
             else {
@@ -1401,8 +1410,12 @@ pub unsafe extern "C" fn Z3_mk_finite_set_filter(
                 set_sort,
             );
             if has_finite_set_binder {
-                if let Some(term) = checked_ast_to_term(ctx, result) {
-                    activate_finite_set_quantifier_gate(ctx, term, "Z3_mk_finite_set_filter");
+                if let Some(retained) = checked_ast_to_pub(ctx, result) {
+                    activate_finite_set_quantifier_gate(
+                        ctx,
+                        retained.term,
+                        "Z3_mk_finite_set_filter",
+                    );
                 }
             }
             result
@@ -1425,16 +1438,15 @@ pub unsafe extern "C" fn Z3_mk_finite_set_range(
 ) -> Z3_ast {
     // SAFETY: guarded; both ASTs and their sorts are validated.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(low_term) = checked_ast_to_term(ctx, low) else {
+        ffi_guard_mk(c, "Z3_mk_finite_set_range", |ctx| {
+            let Some(low_node) = checked_ast_to_pub(ctx, low) else {
                 return invalid_ast(ctx, "Z3_mk_finite_set_range", "invalid low endpoint");
             };
-            let Some(high_term) = checked_ast_to_term(ctx, high) else {
+            let Some(high_node) = checked_ast_to_pub(ctx, high) else {
                 return invalid_ast(ctx, "Z3_mk_finite_set_range", "invalid high endpoint");
             };
-            if public_ast_sort(ctx, low, low_term) != Sort::Int
-                || public_ast_sort(ctx, high, high_term) != Sort::Int
-            {
+            let (low_term, high_term) = (low_node.term, high_node.term);
+            if public_sort(ctx, low_node) != Sort::Int || public_sort(ctx, high_node) != Sort::Int {
                 return sort_error(ctx, "Z3_mk_finite_set_range", "both endpoints must be Int");
             }
             let x = ctx.solver.fresh_var("finite_set_range_x", Sort::Int);

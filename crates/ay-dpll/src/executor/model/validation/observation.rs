@@ -28,59 +28,6 @@ impl Executor {
         }
     }
 
-    fn is_direct_array_observation_assertion(&self, term: TermId) -> bool {
-        fn is_select(terms: &ay_core::TermStore, term: TermId) -> bool {
-            matches!(terms.get(term), TermData::App(sym, _) if sym.name() == "select")
-        }
-
-        let inner = self.strip_top_array_observation_not(term);
-        let TermData::App(sym, args) = self.ctx.terms.get(inner) else {
-            return false;
-        };
-        match sym.name() {
-            "=" if args.len() == 2 => args.iter().any(|&arg| is_select(&self.ctx.terms, arg)),
-            "distinct" if args.len() >= 2 => {
-                args.iter().any(|&arg| is_select(&self.ctx.terms, arg))
-            }
-            _ => false,
-        }
-    }
-
-    /// True when the (possibly negated) top-level assertion is a direct
-    /// equality/disequality whose operands are all array-theory shaped — i.e.
-    /// an array variable, a `store`/`const-array` chain, or a `select`.
-    ///
-    /// These "array definition/observation" atoms are exactly the assertions a
-    /// partial array-model reconstruction can render `Bool(false)` even when the
-    /// formula is genuinely SAT (the array solver has already checked ROW/store
-    /// consistency internally). Delegating their false evaluation back to the
-    /// array theory is therefore acceptable.
-    ///
-    /// Anything more complex (e.g. a top-level boolean `(or ...)`/`(and ...)`
-    /// formula that merely mentions arrays) is NOT covered: a concrete
-    /// `Bool(false)` there is a full-formula refutation of the candidate model
-    /// and must fail closed rather than be trusted, so a genuinely-UNSAT
-    /// formula with a spurious array model cannot escape as SAT.
-    fn is_array_definition_or_observation_atom(&self, term: TermId) -> bool {
-        fn is_array_shaped(executor: &Executor, t: TermId) -> bool {
-            match executor.ctx.terms.get(t) {
-                TermData::Var(_, _) => matches!(executor.ctx.terms.sort(t), Sort::Array(_)),
-                TermData::App(sym, _) => matches!(sym.name(), "store" | "const-array" | "select"),
-                _ => false,
-            }
-        }
-
-        let inner = self.strip_top_array_observation_not(term);
-        let TermData::App(sym, args) = self.ctx.terms.get(inner) else {
-            return false;
-        };
-        match sym.name() {
-            "=" if args.len() == 2 => args.iter().all(|&arg| is_array_shaped(self, arg)),
-            "distinct" if args.len() >= 2 => args.iter().all(|&arg| is_array_shaped(self, arg)),
-            _ => false,
-        }
-    }
-
     fn direct_array_observation_has_concrete_value(&self, term: TermId) -> bool {
         let inner = self.strip_top_array_observation_not(term);
         let TermData::App(sym, args) = self.ctx.terms.get(inner) else {
@@ -93,6 +40,39 @@ impl Executor {
     }
 
     pub(in crate::executor::model) fn validate_term_observation(
+        &self,
+        model: &Model,
+        term: TermId,
+        index: usize,
+        flags: u8,
+        has_array_assertions: bool,
+        target: ValidationTarget,
+    ) -> ValidationObservation {
+        if let Some(origin) = self.evaluation_stop_origin() {
+            return ValidationObservation::incomplete(
+                target,
+                format!("evaluation stopped: {origin:?}"),
+            );
+        }
+        let observation = self.validate_term_observation_inner(
+            model,
+            term,
+            index,
+            flags,
+            has_array_assertions,
+            target,
+        );
+        // Unknown from a stopped evaluator is not permission to delegate to
+        // the candidate's LRA/SAT interpretation or report a false assertion.
+        match self.evaluation_stop_origin() {
+            Some(origin) => {
+                ValidationObservation::incomplete(target, format!("evaluation stopped: {origin:?}"))
+            }
+            None => observation,
+        }
+    }
+
+    fn validate_term_observation_inner(
         &self,
         model: &Model,
         term: TermId,
@@ -744,15 +724,33 @@ impl Executor {
             EvalValue::Bool(true) => ValidationObservation::independent(target, false),
             EvalValue::Bool(false) => {
                 if flags & TERM_FLAG_ARRAY != 0 {
-                    let bv_backed = model.bv_model.is_some();
-                    if bv_backed {
-                        let is_direct_observation =
-                            self.is_direct_array_observation_assertion(term);
-                        let bv_solver_covered_assertion =
-                            self.model_validation_delegated_assertions.contains(&term);
-                        if !is_direct_observation && bv_solver_covered_assertion {
-                            return ValidationObservation::delegated();
-                        }
+                    // NO bit-blast delegation for an array assertion
+                    // (#bv-array-delegation), here or in the Unknown arm.
+                    // `model_validation_delegated_assertions` records that the
+                    // assertion's bit-blast literal is TRUE in the SAT
+                    // assignment (`bv_assertion_covered`). That certifies the
+                    // SAT solver's own assignment, in which every `select` is a
+                    // fresh bit-vector tied to the others only by the array
+                    // lemmas that were instantiated and an array equality is a
+                    // bare Boolean. The emitted model is rebuilt afterwards
+                    // (select scan, definitions, completion, defaults), and
+                    // the cells it prints that no select read (unread indices,
+                    // defaults, arrays of arrays, which get no select-derived
+                    // value at all) were never seen by the SAT solver. So
+                    // coverage is no evidence about the assertion under THIS
+                    // model, the same reason #bv-ite-bool-model removed the
+                    // non-array override below. Measured: with no array
+                    // withheld, three covered assertions over `m`, `n`, `m0`
+                    // evaluated Unknown, were counted verified, and the printed
+                    // model falsified `(= (select (select m0 x) #x5) (select u
+                    // #x5))` (z3 rejects it). Acceptance used to hinge on the
+                    // `arrays-read-conflict-uneval` oracle, armed only while
+                    // some array is withheld; it no longer does. An assertion
+                    // the evaluator cannot decide still reaches the
+                    // independent gate through the array handoff in
+                    // `finalize_sat_model_validation`, which evaluates it on
+                    // the arrays `(get-model)` prints (#gate-exact-leaf-memo).
+                    if model.bv_model.is_some() {
                         return ValidationObservation::incomplete(
                             target,
                             format!(
@@ -763,50 +761,26 @@ impl Executor {
                             ),
                         );
                     }
-                    // Array-theory-backed AUFLIA/QF_AX models can evaluate
-                    // explicit store-chain definition assertions to false when
-                    // the extracted array model is partial, even though the
-                    // array solver has already checked ROW/store consistency.
-                    // Mirror the Unknown path below and count this as delegated
-                    // theory evidence instead of circular SAT-fallback (#8785).
-                    //
-                    // SOUNDNESS: only delegate (or SAT-fallback) for array
-                    // definition/observation ATOMS — `(= array-shaped
-                    // array-shaped)` and friends — the class whose false
-                    // evaluation is plausibly a partial-extraction artifact of a
-                    // genuinely-SAT model. A concrete `Bool(false)` on a richer
-                    // boolean formula that merely mentions arrays is a
-                    // full-formula refutation of the candidate model; delegating
-                    // it back to the array theory would let a spurious model
-                    // (e.g. store-congruence over arithmetic indices, where z3
-                    // says UNSAT) escape as SAT. Such formulas fall through to
-                    // the fail-closed `incomplete` below (SAT -> Unknown).
-                    let array_eval_artifact_candidate =
-                        self.is_array_definition_or_observation_atom(term);
-                    if array_eval_artifact_candidate
-                        && model.array_model.is_some()
-                        && !self.direct_array_observation_has_concrete_value(term)
-                        // SOUNDNESS (#as-array-ext): see Unknown-path note below.
-                        && !self.equality_has_function_backed_array_operand(term)
-                    {
-                        return ValidationObservation::delegated();
-                    }
-                    // Non-BV path: accept SAT-fallback for array assertions
-                    // where the model evaluator may be incomplete.
-                    if array_eval_artifact_candidate
-                        && matches!(target, ValidationTarget::GroundAssertion)
-                        && self.sat_term_assigned_true(model, term)
-                    {
-                        return ValidationObservation::fallback(format!(
-                            "{}: {} used SAT-fallback for array validation (eval=false)",
-                            target.entry(index),
-                            term_str(),
-                        ));
-                    }
+                    // The array-theory lane (QF_AX, AUFLIA) and a model with no
+                    // array model at all: no delegation and no SAT-fallback
+                    // either (#bv-array-delegation). #8785 counted a store-chain
+                    // definition the partial extracted array model falsifies as
+                    // delegated theory evidence, because the array solver had
+                    // checked ROW/store consistency. Like bit-blast coverage,
+                    // that check is about the solver's own assignment and says
+                    // nothing about the arrays the model prints, and the
+                    // SAT-fallback that followed was the SAT solver's own truth
+                    // value. A definition falsified only because the extraction
+                    // is partial is exactly what the independent gate decides:
+                    // it resolves the defined array from its definition and
+                    // evaluates every assertion on the values `(get-model)`
+                    // prints. For a ground assertion this Incomplete reaches it
+                    // through the array handoff in `finalize_sat_model_validation`.
                     return ValidationObservation::incomplete(
                         target,
                         format!(
-                            "{}: {} array {} evaluates to false",
+                            "{}: {} array {} evaluates to false; \
+                             fail-closed pending independent array model validation",
                             target.entry(index),
                             term_str(),
                             target.kind_name(),
@@ -895,15 +869,11 @@ impl Executor {
                         return ValidationObservation::delegated();
                     }
                     if flags & TERM_FLAG_ARRAY != 0 {
-                        let bv_backed = model.bv_model.is_some();
-                        if bv_backed {
-                            let is_direct_observation =
-                                self.is_direct_array_observation_assertion(term);
-                            let bv_solver_covered_assertion =
-                                self.model_validation_delegated_assertions.contains(&term);
-                            if !is_direct_observation && bv_solver_covered_assertion {
-                                return ValidationObservation::delegated();
-                            }
+                        // NO bit-blast delegation (#bv-array-delegation, see
+                        // the Bool(false) arm): Unknown means the emitted
+                        // model lacks a value this assertion needs, and the
+                        // printer would supply one that nothing checked.
+                        if model.bv_model.is_some() {
                             return ValidationObservation::incomplete(
                                 target,
                                 format!(
@@ -921,8 +891,15 @@ impl Executor {
                         // The model evaluator may return Unknown for
                         // select/store chains when no arithmetic model is
                         // available (QF_AX with Int-indexed arrays creates
-                        // no LIA solver). Accept via delegated verification
-                        // since the theory solver already validated (#6820).
+                        // no LIA solver). Delegated here (#6820), but that
+                        // consistency is about the solvers' own assignment,
+                        // NOT the arrays the model prints (#bv-array-delegation):
+                        // it only lets the candidate reach publication. There
+                        // the independent gate (`apply_independent_model_gate`)
+                        // evaluates every assertion on the values
+                        // `(get-model)` prints, and refuses on false or
+                        // Unknown. That gate is the authority for this
+                        // assertion, not this delegation.
                         let array_theory_backed = model.array_model.is_some();
                         if array_theory_backed
                             && !self.direct_array_observation_has_concrete_value(term)
@@ -1064,8 +1041,10 @@ impl Executor {
             | EvalValue::Algebraic(_)
             | EvalValue::BitVec { .. }
             | EvalValue::Fp(_)
+            | EvalValue::FiniteField { .. }
             | EvalValue::String(_)
-            | EvalValue::Seq(_) => ValidationObservation::violated(
+            | EvalValue::Seq(_)
+            | EvalValue::Complex { .. } => ValidationObservation::violated(
                 target,
                 format!(
                     "{} has non-Boolean value: {}",
@@ -2081,6 +2060,12 @@ impl Executor {
         &self,
         assumptions: &[TermId],
     ) -> Result<(), ModelValidationError> {
+        if let Some(origin) = self.evaluation_stop_origin() {
+            return Err(ModelValidationError::incomplete(
+                VerificationBoundary::SmtAssumption,
+                format!("evaluation stopped: {origin:?}"),
+            ));
+        }
         let model = match (&self.last_result, &self.last_model) {
             (Some(SolveResult::Sat), Some(m)) => m,
             (Some(SolveResult::Sat), None) => {
@@ -2106,14 +2091,30 @@ impl Executor {
         let term_flags = self.precompute_term_flags();
 
         for (i, &assumption) in assumptions.iter().enumerate() {
-            let observation = self.validate_term_observation(
-                model,
-                assumption,
-                i,
-                term_flags[assumption.index()],
-                false,
-                ValidationTarget::Assumption,
-            );
+            // A published finite-domain lane model is one total model the
+            // independent gate confirmed on `base ∧ assumptions`; an
+            // assumption it values true holds in the published model even
+            // where the per-term evaluator has no value for a selector it
+            // never exported (#dt-fd-session).
+            let observation =
+                if self.dt_fd_ground_value(model, assumption).as_deref() == Some("true") {
+                    ValidationObservation::independent(ValidationTarget::Assumption, true)
+                } else {
+                    self.validate_term_observation(
+                        model,
+                        assumption,
+                        i,
+                        term_flags[assumption.index()],
+                        false,
+                        ValidationTarget::Assumption,
+                    )
+                };
+            if let Some(origin) = self.evaluation_stop_origin() {
+                return Err(ModelValidationError::incomplete(
+                    VerificationBoundary::SmtAssumption,
+                    format!("evaluation stopped: {origin:?}"),
+                ));
+            }
             Self::apply_assumption_observation(
                 &mut accepted_assumptions,
                 &mut skipped_internal,

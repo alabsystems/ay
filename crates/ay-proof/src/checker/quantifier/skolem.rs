@@ -16,51 +16,52 @@ pub(super) struct WitnessAuthorityCheck<'a> {
 
 pub(super) fn validate_witness_authority(
     terms: &TermStore,
-    step: ProofId,
+    _step: ProofId,
     witness: TermId,
     check: WitnessAuthorityCheck<'_>,
+    meter: &mut QuantifierMeter<'_, '_>,
 ) -> Result<(), ProofCheckError> {
-    let TermData::Var(witness_name, _) = terms.get(witness) else {
-        return Err(invalid(step, "witness must be an atomic fresh constant"));
+    let TermData::Var(witness_name, _) = meter.term(terms, witness)? else {
+        return Err(meter.invalid("witness must be an atomic fresh constant")?);
     };
-    if matches!(check.authority, SkolemWitnessAuthority::TermStoreRegistry)
-        && !terms.is_skolem_symbol(witness_name)
-    {
-        return Err(invalid(
-            step,
-            "witness is not registered as a Skolem symbol",
-        ));
+    if matches!(check.authority, SkolemWitnessAuthority::TermStoreRegistry) {
+        meter.lookup(witness_name, registry_cardinality_bound(terms)?)?;
+        if !terms.is_skolem_symbol(witness_name) {
+            return Err(meter.invalid("witness is not registered as a Skolem symbol")?);
+        }
     }
     if check.source_is_exists {
         if !matches!(check.authority, SkolemWitnessAuthority::TermStoreRegistry) {
-            return Err(invalid(
-                step,
-                "sko_ex requires the live Skolem-registry authority",
-            ));
+            return Err(meter.invalid("sko_ex requires the live Skolem-registry authority")?);
         }
+        meter.lookup("", registry_cardinality_bound(terms)?)?;
         let Some(choice) = terms.skolem_choice(witness) else {
-            return Err(invalid(
-                step,
-                "sko_ex witness has no registered choice definition",
-            ));
+            return Err(meter.invalid("sko_ex witness has no registered choice definition")?);
         };
+        meter.name(&choice.binder)?;
+        meter.name(check.binder)?;
         if choice.binder != check.binder
-            || &choice.sort != check.binder_sort
+            || !meter.sort_equal(&choice.sort, check.binder_sort)?
             || choice.body != check.body
         {
-            return Err(invalid(
-                step,
-                "registered choice does not match the existential source",
-            ));
+            return Err(meter.invalid("registered choice does not match the existential source")?);
         }
     }
-    if terms.sort(witness) != check.binder_sort {
-        return Err(invalid(
-            step,
-            "witness sort does not match the forall binding",
-        ));
+    let witness_sort = meter.sort(terms, witness)?;
+    if !meter.sort_equal(witness_sort, check.binder_sort)? {
+        return Err(meter.invalid("witness sort does not match the forall binding")?);
     }
     Ok(())
+}
+
+fn registry_cardinality_bound(terms: &TermStore) -> Result<usize, ProofCheckError> {
+    // Both registries start empty. Every fresh key bumps this non-wrapping
+    // counter; Clone copies it with the registries, and rollback/compaction
+    // only prune/remap keys. Thus each completed store API state has registry
+    // cardinality <= generation, even for ghost names absent from the arena.
+    // Other metadata changes only make this read-only upper bound looser.
+    usize::try_from(terms.checker_visible_metadata_generation())
+        .map_err(|_| ProofCheckError::ResourceLimit)
 }
 
 pub(super) struct FreshSubstitutionCheck<'a> {
@@ -73,48 +74,26 @@ pub(super) struct FreshSubstitutionCheck<'a> {
 
 pub(super) fn validate_fresh_substitution(
     terms: &TermStore,
-    step: ProofId,
+    _step: ProofId,
     check: FreshSubstitutionCheck<'_>,
-    work: &mut usize,
+    meter: &mut QuantifierMeter<'_, '_>,
 ) -> Result<(), ProofCheckError> {
-    match term_contains(terms, check.quantified, check.witness, work) {
-        Some(true) => {
-            return Err(invalid(
-                step,
-                "fresh witness occurs in the quantified source",
-            ));
-        }
-        None => {
-            return Err(invalid(
-                step,
-                format!(
-                    "fresh-witness source scan exceeds {SKOLEM_TERM_WORK_LIMIT} distinct terms"
-                ),
-            ));
-        }
-        Some(false) => {}
+    if scans::term_contains(terms, check.quantified, check.witness, meter)? {
+        return Err(meter.invalid("fresh witness occurs in the quantified source")?);
     }
-    if terms.sort(check.instance) != &Sort::Bool {
-        return Err(invalid(step, "instantiated body must be Boolean"));
+    let instance_sort = meter.sort(terms, check.instance)?;
+    if !meter.sort_equal(instance_sort, &Sort::Bool)? {
+        return Err(meter.invalid("instantiated body must be Boolean")?);
     }
-    match matches_single_substitution(
+    if !matches_single_substitution(
         terms,
         check.body,
         check.instance,
         check.binder,
         check.witness,
-        work,
-    ) {
-        Some(true) => Ok(()),
-        Some(false) => Err(invalid(
-            step,
-            "right side is not the exact registered-witness substitution",
-        )),
-        None => Err(invalid(
-            step,
-            format!(
-                "registered-witness substitution check exceeds {SKOLEM_TERM_WORK_LIMIT} distinct term pairs"
-            ),
-        )),
+        meter,
+    )? {
+        return Err(meter.invalid("right side is not the exact registered-witness substitution")?);
     }
+    Ok(())
 }

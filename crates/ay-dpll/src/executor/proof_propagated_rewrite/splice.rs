@@ -88,7 +88,8 @@ fn append_original_step(proof: &mut Proof, step: ProofStep, id_map: &[ProofId]) 
 /// The planner's output: one SHARED chain serving every non-constant
 /// candidate (inserted once, at the first shared conclusion's position),
 /// plus per-candidate solo chains for Boolean-constant targets (#4751
-/// shared-plan lane).
+/// shared-plan lane) and for targets only the constant-array read leg
+/// derives (`PlanCx::const_array_reads`).
 pub(super) struct PlannedPropagationChains {
     pub(super) shared_chain: Proof,
     /// Assume index → conclusion id WITHIN `shared_chain`.

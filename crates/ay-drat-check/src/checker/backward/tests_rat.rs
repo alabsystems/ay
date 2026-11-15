@@ -275,7 +275,10 @@ fn test_backward_rat_deps_direct() {
     // Resolvent: (d v b) — and (b) is RUP (assume ~b: C0→a, C1→conflict).
     //
     // We need var 3 capacity.
-    checker.inner.ensure_capacity(3);
+    assert!(
+        checker.inner.ensure_capacity(3).is_ok(),
+        "var 3 is inside the dense envelope"
+    );
     while checker.active.len() < checker.inner.clauses.len() {
         checker.active.push(false);
     }

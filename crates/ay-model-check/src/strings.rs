@@ -192,21 +192,22 @@ pub fn eval(name: &str, args: &[ModelValue]) -> Result<ModelValue, String> {
         ("str.to_code", [s]) => {
             let p = points(as_str(s)?);
             Ok(ModelValue::Int(match p.as_slice() {
-                [c] => BigInt::from(u32::from(*c)),
+                [c] => BigInt::from(ay_core::smtlib_code_point(*c)),
                 _ => BigInt::from(-1),
             }))
         }
         ("str.from_code", [n]) => {
             let n = as_int(n)?;
-            let Some(code) = n.to_u32().filter(|c| *c <= MAX_CODE_POINT) else {
-                return Ok(ModelValue::Str(String::new()));
-            };
-            match char::from_u32(code) {
+            // Every code point up to the maximum is a character, the
+            // surrogates included; AY stores a surrogate in its carrier
+            // (`ay_core::smtlib_char`).
+            match n
+                .to_u32()
+                .filter(|c| *c <= MAX_CODE_POINT)
+                .and_then(ay_core::smtlib_char)
+            {
                 Some(c) => Ok(ModelValue::Str(c.to_string())),
-                // A surrogate is in the SMT-LIB alphabet but cannot live in a
-                // Rust `String`. Refusing keeps the gate from silently
-                // substituting a different character.
-                None => Err("code point is not representable".to_string()),
+                None => Ok(ModelValue::Str(String::new())),
             }
         }
         ("str.is_digit", [s]) => {
@@ -215,15 +216,16 @@ pub fn eval(name: &str, args: &[ModelValue]) -> Result<ModelValue, String> {
                 matches!(p.as_slice(), [c] if c.is_ascii_digit()),
             ))
         }
-        // Lexicographic by code point.
+        // Lexicographic by code point — not by `char`, whose order puts a
+        // surrogate's carrier above U+2FFFF (`ay_core::smtlib_char`).
         ("str.<" | "str.<=", [_, _, ..]) => {
             let mut all = Vec::with_capacity(args.len());
             for a in args {
-                all.push(points(as_str(a)?));
+                all.push(as_str(a)?);
             }
             let strict = name == "str.<";
             Ok(ModelValue::Bool(all.windows(2).all(|pair| {
-                let ordering = pair[0].cmp(&pair[1]);
+                let ordering = ay_core::smtlib_str_cmp(pair[0], pair[1]);
                 if strict {
                     ordering == core::cmp::Ordering::Less
                 } else {

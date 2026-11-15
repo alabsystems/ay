@@ -9,7 +9,7 @@
 // `wasm32-unknown-unknown`) and drives genuine solves through it — there is no
 // native dylib and no faked result anywhere in this file.
 //
-// Build the module with:
+// Build the module with (STOCK EXCEPTION: Trust seal 9192 has no wasm32-unknown-unknown std (2026-09-28: E0463)):
 //   cargo build --release --target wasm32-unknown-unknown \
 //       -p ay-ffi --lib --no-default-features
 //   -> target/wasm32-unknown-unknown/release/ay_ffi.wasm

@@ -208,12 +208,11 @@ impl Solver {
             // detection without the full scoring overhead).
             sub_solver.cold.next_lookahead_conflict = u64::MAX;
 
-            // Share interrupt handle so the parent's timeout propagates to
+            // Share the stop so the parent's timeout propagates to
             // sub-solvers. Without this, the sub-solver runs indefinitely
             // and AY never returns a result (#8134).
-            if let Some(ref handle) = self.cold.interrupt {
-                sub_solver.set_interrupt(handle.clone());
-            }
+            sub_solver.set_interrupt_handle(self.cold.interrupt.clone());
+            sub_solver.set_deadline_interrupt_handle(self.cold.deadline_interrupt.clone());
 
             for clause in &clause_data {
                 // Find which component this clause belongs to.

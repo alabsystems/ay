@@ -39,6 +39,7 @@ use crate::cancellation::CancellationToken;
 use crate::engine_config::ChcEngineConfig;
 use crate::engine_result::{build_single_pred_model, skeleton_counterexample, ChcEngineResult};
 use crate::interpolant_validation::validate_inductive_invariant;
+use crate::interpolation::stats::{self, EngineTag, ExitReason};
 use crate::single_loop::SingleLoopTransformation;
 use crate::smt::SmtResult;
 use crate::transition_system::TransitionSystem;
@@ -66,6 +67,13 @@ impl PdkindSolver {
     /// `PdkindInvariant` formula for SingleLoop back-translation before
     /// converting to `InvariantModel`.
     pub(crate) fn solve_raw(&self) -> RawPdkindResult {
+        let exit = PdkindExit::default();
+        let result = self.solve_raw_loop(&exit);
+        exit.record(&result, &self.config.base);
+        result
+    }
+
+    fn solve_raw_loop(&self, exit: &PdkindExit) -> RawPdkindResult {
         if self.config.base.is_cancelled() {
             if self.config.base.verbose {
                 safe_eprintln!("PDKIND: Cancelled before initialization");
@@ -149,6 +157,7 @@ impl PdkindSolver {
                         iteration
                     );
                 }
+                exit.detail.set("frame_empty");
                 return RawPdkindResult::Unknown;
             }
 
@@ -161,6 +170,7 @@ impl PdkindSolver {
             }
 
             let k = n + 1;
+            exit.k.set(k);
 
             if self.config.base.verbose {
                 safe_eprintln!(
@@ -195,6 +205,7 @@ impl PdkindSolver {
             );
 
             if result.is_unknown {
+                exit.detail.set("push_unknown");
                 return RawPdkindResult::Unknown;
             }
 
@@ -401,6 +412,7 @@ impl PdkindSolver {
                             obligation_timeout_secs,
                         );
                         if result_ni.is_unknown {
+                            exit.detail.set("push_unknown_non_incremental");
                             return RawPdkindResult::Unknown;
                         }
                         if result_ni.is_invalid {
@@ -468,6 +480,7 @@ impl PdkindSolver {
                 if self.config.base.verbose {
                     safe_eprintln!("PDKIND: Exceeded max_n={}", self.config.max_n);
                 }
+                exit.detail.set("max_n");
                 return RawPdkindResult::Unknown;
             }
         }
@@ -478,6 +491,41 @@ impl PdkindSolver {
                 self.config.max_iterations
             );
         }
+        exit.detail.set("max_iterations");
         RawPdkindResult::Unknown
+    }
+}
+
+/// Where PDKIND's main loop ended, for its `[D-EXIT]` line (Workstream D
+/// telemetry; printed only under `--chc-proof-itp-stats`).
+#[derive(Default)]
+struct PdkindExit {
+    k: std::cell::Cell<usize>,
+    detail: std::cell::Cell<&'static str>,
+}
+
+impl PdkindExit {
+    fn record(&self, result: &RawPdkindResult, base: &crate::engine_config::ChcEngineConfig) {
+        let k = self.k.get();
+        let detail = self.detail.get();
+        let token_cancelled = base
+            .cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        let reason = match result {
+            RawPdkindResult::Safe(_) => ExitReason::Safe,
+            RawPdkindResult::Unsafe(_) => ExitReason::Unsafe,
+            RawPdkindResult::Unknown if token_cancelled => ExitReason::Cancelled,
+            RawPdkindResult::Unknown => match detail {
+                "push_unknown" | "push_unknown_non_incremental" => ExitReason::BaseUnknown,
+                "max_n" | "max_iterations" => ExitReason::MaxK,
+                _ => ExitReason::Other,
+            },
+        };
+        if detail.is_empty() {
+            stats::record_engine_exit(EngineTag::Pdkind, reason, k);
+        } else {
+            stats::record_engine_exit_detail(EngineTag::Pdkind, reason, k, &format!("at={detail}"));
+        }
     }
 }

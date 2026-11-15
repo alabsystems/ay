@@ -46,8 +46,13 @@ impl NraSolver<'_> {
         }
         self.refresh_fixed_factor_values();
 
+        // A saturated scope counter could not be unwound by
+        // `undo_tentative_patch`; refuse before opening the scope.
+        let Some(depth) = self.tentative_depth.checked_add(1) else {
+            return TheoryResult::Unknown;
+        };
         self.lra.push();
-        self.tentative_depth += 1;
+        self.tentative_depth = depth;
 
         // These reasons authenticate only lemmas entailed by the complete NRA
         // assertion conjunction plus registered monomial semantics. The pin

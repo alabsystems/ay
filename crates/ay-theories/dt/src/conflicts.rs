@@ -284,7 +284,7 @@ impl DtSolver<'_> {
 
             let mut changed = false;
             'pairs: for i in 0..ctor_data.len() {
-                for j in (i + 1)..ctor_data.len() {
+                for j in i.saturating_add(1)..ctor_data.len() {
                     let (ti, ci, ai) = (&ctor_data[i].0, &ctor_data[i].1, &ctor_data[i].2);
                     let (tj, cj, aj) = (&ctor_data[j].0, &ctor_data[j].1, &ctor_data[j].2);
                     if ci != cj || ai.len() != aj.len() {

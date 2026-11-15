@@ -119,6 +119,12 @@ pub(in crate::executor) struct ProjectionUfModel {
 }
 
 impl ProjectionUfModel {
+    /// Narrow complete-array arming declines all projection-bearing models.
+    /// This borrowed presence check cannot allocate a signature-error payload.
+    pub(super) fn has_interpretations(&self) -> bool {
+        !self.by_symbol.is_empty()
+    }
+
     /// Copy the exact definitions exposed by a semantically checked result.
     ///
     /// Candidate data cannot cross this boundary without first becoming the
@@ -264,6 +270,31 @@ impl ProjectionUfModel {
                 observed_argument_sorts,
                 observed_result_sort: result_sort.clone(),
             });
+        }
+        Ok(Some(interpretation.projected_argument))
+    }
+
+    /// Borrowed shape check for an admitted native reader. Unlike the rich
+    /// diagnostic API this does not clone either conflicting signature.
+    pub(super) fn projected_argument_for_application_borrowed(
+        &self,
+        symbol: &Symbol,
+        terms: &TermStore,
+        arguments: &[TermId],
+        result_sort: &Sort,
+    ) -> Result<Option<usize>, ()> {
+        let Some(interpretation) = self.by_symbol.get(symbol) else {
+            return Ok(None);
+        };
+        if &interpretation.result_sort != result_sort
+            || interpretation.argument_sorts.len() != arguments.len()
+            || !interpretation
+                .argument_sorts
+                .iter()
+                .zip(arguments)
+                .all(|(expected, argument)| expected == terms.sort(*argument))
+        {
+            return Err(());
         }
         Ok(Some(interpretation.projected_argument))
     }

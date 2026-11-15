@@ -24,7 +24,8 @@ use std::collections::VecDeque;
 
 use crate::ematching::{
     perform_ematching_with_generations, DeferredInstantiation, DemandGate, DemandStats,
-    EMatchingConfig, EMatchingResult, GenerationTracker, ParkedInstance, PersistentMatchState,
+    EMatchingConfig, EMatchingResult, ForallInstantiationProvenance, GenerationTracker,
+    ParkedInstance, PersistentMatchState,
 };
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{TermId, TermStore};
@@ -194,8 +195,8 @@ impl QuantifierManager {
     /// (quantifier, binding) produced in a PRIOR check-sat — whose instance
     /// `restore_assertions` has since retracted — is re-instantiable in this
     /// check-sat. Called at the TOP of `run_ematching_rounds`, before the round
-    /// loop. The index and assertion eqclasses are monotone-safe and are NOT
-    /// reset here.
+    /// loop. The index and assertion eqclasses ARE reset here, because restored
+    /// assertions may have retracted their contributing terms and equalities.
     ///
     /// The baseline is the deepest live scope snapshot's `seen_order_len` (so an
     /// epoch starting inside a pushed scope never forgets that scope's parents),
@@ -251,6 +252,30 @@ impl QuantifierManager {
         euf_model: Option<&EufModel>,
         should_stop: &dyn Fn() -> bool,
     ) -> EMatchingResult {
+        self.run_ematching_round_with_match_roots(
+            terms,
+            assertions,
+            &[],
+            &[],
+            euf_model,
+            should_stop,
+        )
+    }
+
+    /// [`Self::run_ematching_round`] with extra match-only roots: ground terms a
+    /// trigger may bind to that are not assertions, and with guarded-only
+    /// quantifiers: closed universals no assertion carries, whose instances
+    /// are only ever guarded records (see
+    /// [`crate::ematching::perform_ematching_with_generations`]).
+    pub(crate) fn run_ematching_round_with_match_roots(
+        &mut self,
+        terms: &mut TermStore,
+        assertions: &[TermId],
+        match_only_roots: &[TermId],
+        guarded_quantifiers: &[TermId],
+        euf_model: Option<&EufModel>,
+        should_stop: &dyn Fn() -> bool,
+    ) -> EMatchingResult {
         self.round += 1;
 
         // M2+M3 demand lane (SHADOW-ONLY): build the per-round frontier gate ONLY
@@ -279,6 +304,8 @@ impl QuantifierManager {
         let result = perform_ematching_with_generations(
             terms,
             assertions,
+            match_only_roots,
+            guarded_quantifiers,
             &self.config,
             // Clone the tracker so we can update it after
             self.generation_tracker.clone(),
@@ -354,6 +381,19 @@ impl QuantifierManager {
         self.demand.dt_resume_depth = warm_start_depth;
     }
 
+    /// Hand over this manager's demand lane and leave an inert one in its
+    /// place. With [`Self::demand_restore`] it scopes the lane to the
+    /// quantifier solve that armed it (`Executor::with_demand_lane_frame`).
+    pub(crate) fn demand_take(&mut self) -> DemandLaneState {
+        std::mem::take(&mut self.demand)
+    }
+
+    /// Put back a lane that [`Self::demand_take`] handed over, replacing the
+    /// one the solve in between left behind.
+    pub(crate) fn demand_restore(&mut self, lane: DemandLaneState) {
+        self.demand = lane;
+    }
+
     /// Whether the demand lane is armed for this solve.
     pub(crate) fn demand_active(&self) -> bool {
         self.demand.active
@@ -387,9 +427,12 @@ impl QuantifierManager {
     /// EVERY parked instance whose generation `<= F` (never suppressed by any
     /// model filter — a model may only ORDER, never drop, per the
     /// parking-fixpoint trap), instantiate + generation-tag each, and return the
-    /// ground instance TermIds for the caller to assert. Instances still over the
-    /// new frontier stay parked.
-    pub(crate) fn demand_flush_under_frontier(&mut self, terms: &mut TermStore) -> Vec<TermId> {
+    /// ground instances, each with its quantifier and binding, for the caller
+    /// to assert. Instances still over the new frontier stay parked.
+    pub(crate) fn demand_flush_under_frontier(
+        &mut self,
+        terms: &mut TermStore,
+    ) -> Vec<ForallInstantiationProvenance> {
         self.demand.frontier = self.demand.frontier.saturating_add(1);
         self.demand.flushes += 1;
         let f = self.demand.frontier;
@@ -398,7 +441,11 @@ impl QuantifierManager {
         while let Some(p) = self.demand.parked.pop_front() {
             if p.generation <= f {
                 if let Some(inst) = p.instantiate_and_tag(terms, &mut self.generation_tracker) {
-                    out.push(inst);
+                    out.push(ForallInstantiationProvenance {
+                        quantifier: p.quantifier,
+                        binding: p.binding,
+                        instance: inst,
+                    });
                     self.demand.total_flushed += 1;
                 }
             } else {
@@ -412,8 +459,8 @@ impl QuantifierManager {
     /// LAW #2 — FENCE drain (M4-hardened: direct parked-queue drain). Before any
     /// Sat/Unknown conclusion with parked instances remaining, drain the ENTIRE
     /// parked queue directly (regardless of frontier — bypassing model-admission
-    /// ORDERING), instantiate + generation-tag each, and return the ground instance
-    /// TermIds for the caller to assert.
+    /// ORDERING), instantiate + generation-tag each, and return the ground
+    /// instances, each with its quantifier and binding, for the caller to assert.
     ///
     /// M4 (direct parked-queue drain, three disciplines):
     ///  1. BYPASS MODEL-ADMISSION ORDERING: the whole queue is drained
@@ -435,7 +482,10 @@ impl QuantifierManager {
     /// verbatim re-assert, so the per-quantifier / max-total caps that gate the
     /// matcher do not apply; the fence is a FRESH, unbudgeted grant of every parked
     /// instance.
-    pub(crate) fn demand_fence_drain(&mut self, terms: &mut TermStore) -> Vec<TermId> {
+    pub(crate) fn demand_fence_drain(
+        &mut self,
+        terms: &mut TermStore,
+    ) -> Vec<ForallInstantiationProvenance> {
         if self.demand.parked.is_empty() {
             return Vec::new();
         }
@@ -443,7 +493,11 @@ impl QuantifierManager {
         let mut out = Vec::new();
         while let Some(p) = self.demand.parked.pop_front() {
             if let Some(inst) = p.instantiate_and_tag(terms, &mut self.generation_tracker) {
-                out.push(inst);
+                out.push(ForallInstantiationProvenance {
+                    quantifier: p.quantifier,
+                    binding: p.binding,
+                    instance: inst,
+                });
                 self.demand.total_flushed += 1;
             }
         }
@@ -682,6 +736,7 @@ impl QuantifierManager {
             var_names,
             generation,
             head,
+            unconditional: false,
         });
         self.demand.total_parked += 1;
     }

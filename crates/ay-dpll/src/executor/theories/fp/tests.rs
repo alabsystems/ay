@@ -140,12 +140,15 @@ fn qf_abvfp_flattened_final_window_runs_finite_closure() {
 #[test]
 #[timeout(60_000)]
 fn qf_abvfp_incomplete_final_finite_array_closure_preserves_unsat() {
+    // The arrays are compared NEGATIVELY: a positive `(= a b)` over two
+    // otherwise unused arrays is an unread-array definition that the lane now
+    // drops exactly, leaving no array for the closure this test exhausts.
     let input = r#"
 (set-logic QF_ABVFP)
 (declare-const a (Array (_ BitVec 1) (_ BitVec 1)))
 (declare-const b (Array (_ BitVec 1) (_ BitVec 1)))
 (declare-const p Bool)
-(assert (= a b))
+(assert (not (= a b)))
 (assert p)
 (assert (not p))
 "#;
@@ -493,9 +496,10 @@ fn fp_fma_rne_cancellation_is_positive_zero() {
 
 // SOUNDNESS regression (symbolic RoundingMode). A symbolic rounding mode used
 // as the mode operand of a rounded FP op used to be silently evaluated as RNE
-// (`get_rounding_mode` defaults any non-literal mode to RNE), dropping the
-// constraint on the mode and producing wrong verdicts in BOTH directions. The
-// fix fails closed to `unknown` when the mode operand is not a concrete literal.
+// (the bit-blaster's mode decoder defaulted any non-literal mode to RNE),
+// dropping the constraint on the mode and producing wrong verdicts in BOTH
+// directions. A symbolic mode is now three bits of the circuit
+// (ay-theories/fp/src/rm.rs); a mode it cannot encode fails closed.
 //
 // Tie values used below (Float32, ulp(1.0) = 2^-23):
 //   A = 1 + 1/4 ulp = 33554433/33554432: RNE/RTZ/RTN/RNA -> 1.0, RTP -> 1.0+ulp
@@ -506,11 +510,8 @@ fn fp_fma_rne_cancellation_is_positive_zero() {
 // UNSAT (z3 agrees). The buggy engine dropped the pin, rounded `rm` as RNE, and
 // answered `sat`. AY must NEVER report `sat`.
 //
-// Built directly against the term store because AY's frontend represents a
-// declared `RoundingMode` constant and an `RTP` literal with mismatched sorts,
-// so `(assert (= rm RTP))` trips a frontend debug-assert in debug builds (an
-// unrelated, pre-existing limitation). Here `rm` and `RTP` share a sort so the
-// pin is well-formed, isolating the FP-theory soundness behavior under test.
+// Built directly against the term store with genuine typed mode literals and
+// a symbolic mode of the same sort, isolating FP-theory pinning behavior.
 #[test]
 #[timeout(60_000)]
 fn fp_symbolic_rounding_mode_rtp_wrong_sat_is_not_sat() {
@@ -519,15 +520,20 @@ fn fp_symbolic_rounding_mode_rtp_wrong_sat_is_not_sat() {
     let fp32 = Sort::FloatingPoint(8, 24);
     let x = exec.ctx.terms.mk_var("x", fp32.clone());
     // Symbolic rounding mode: a variable whose name is not a literal mode.
-    let rm = exec.ctx.terms.mk_var("rm", Sort::Bool);
-    let rtp = exec
+    let rm = exec
         .ctx
         .terms
-        .mk_app(Symbol::named("RTP"), Vec::new(), Sort::Bool);
-    let rne = exec
-        .ctx
-        .terms
-        .mk_app(Symbol::named("RNE"), Vec::new(), Sort::Bool);
+        .mk_var("rm", Sort::Uninterpreted("RoundingMode".into()));
+    let rtp = exec.ctx.terms.mk_app(
+        Symbol::named("RTP"),
+        Vec::new(),
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
+    let rne = exec.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        Vec::new(),
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let a = exec.ctx.terms.mk_rational(BigRational::new(
         BigInt::from(33554433),
         BigInt::from(33554432),
@@ -556,8 +562,10 @@ fn fp_symbolic_rounding_mode_rtp_wrong_sat_is_not_sat() {
         SolveResult::Sat,
         "WRONG-SAT: symbolic rm=RTP dropped, rounded as RNE",
     );
-    // Fix B (fail-closed) result:
-    assert_eq!(result, SolveResult::Unknown);
+    assert!(
+        result.is_unsat(),
+        "the correctly typed RTP pin must refute the equality"
+    );
 }
 
 // Direction 2 (was wrong-UNSAT). A single symbolic `rm` feeds two `to_fp`s on
@@ -585,10 +593,10 @@ fn fp_symbolic_rounding_mode_free_rm_wrong_unsat_is_not_unsat() {
         vec!["unsat"],
         "WRONG-UNSAT: symbolic rm dropped, rounded as RNE",
     );
-    // #P0.2 Pass C (symbolic-RM finite-domain enumeration, rm_expand.rs):
-    // the declared `rm` case-splits over the 5 modes and the RTZ/RTN branches
-    // are satisfiable, so this now DECIDES `sat` exactly like z3 (previously
-    // the fail-closed `unknown`).
+    // The declared `rm` is three bits in the bit-blasted circuit
+    // (ay-theories/fp/src/rm.rs); under RTZ/RTN both conversions agree, so
+    // this DECIDES `sat` exactly like z3 (previously the fail-closed
+    // `unknown`, then a 5-way case split).
     assert_eq!(results, vec!["sat"]);
 }
 
@@ -626,7 +634,7 @@ fn fp_literal_rounding_mode_controls_still_decided() {
 // literal: only the nullary RNE/RNA/RTP/RTN/RTZ constants are concrete. This
 // malformed non-nullary application exercises the internal trust boundary
 // directly; accepting it would silently discard its argument in
-// `get_rounding_mode` and treat it as RNE.
+// the mode decoder and treat it as RNE.
 #[test]
 #[timeout(60_000)]
 fn fp_non_nullary_rounding_mode_name_fails_closed() {
@@ -1005,14 +1013,16 @@ fn raw_bv_distinct_to_ubv_roundtrip_guard_unsat_8870() {
     let zero = exec.ctx.terms.mk_bitvec(BigInt::from(0), 1);
     let guard = exec.ctx.terms.mk_bvule(a, zero);
 
-    let rne = exec
-        .ctx
-        .terms
-        .mk_app(Symbol::named("RNE"), Vec::new(), Sort::Bool);
-    let rtz = exec
-        .ctx
-        .terms
-        .mk_app(Symbol::named("RTZ"), Vec::new(), Sort::Bool);
+    let rne = exec.ctx.terms.mk_app(
+        Symbol::named("RNE"),
+        Vec::new(),
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
+    let rtz = exec.ctx.terms.mk_app(
+        Symbol::named("RTZ"),
+        Vec::new(),
+        Sort::Uninterpreted("RoundingMode".into()),
+    );
     let to_fp = exec.ctx.terms.mk_app(
         Symbol::indexed("to_fp", vec![5, 11]),
         vec![rne, a],

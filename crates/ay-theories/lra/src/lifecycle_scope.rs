@@ -34,6 +34,11 @@ impl LraSolver {
 
     pub(crate) fn push_inner(&mut self) {
         trace!(target: "ay::lra", depth = self.scopes.len() + 1, "push");
+        // #lra-scope-trail: atoms asserted since the last check are applied
+        // NOW, so their bound-trail entries sit below the marks recorded
+        // next — in the scope of their assertion. See
+        // `apply_pending_atoms_before_push` for the contract and the bug.
+        self.apply_pending_atoms_before_push();
         self.scopes
             .push((self.trail.len(), self.asserted_trail.len()));
         // #inc-implied-trail: lockstep with `scopes`.
@@ -130,8 +135,56 @@ impl LraSolver {
         // for the legitimate case and additionally preserves the outer-scope
         // survivors that the truncation used to drop.
         if self.disequality_trail_scopes.pop().is_some() {
-            self.disequality_trail
-                .retain(|(term, _expr, value)| self.asserted.get(term) == Some(value));
+            // An entry can die only when its atom was unasserted by the
+            // rewind above or its asserted value flipped in place since
+            // the last scan (`asserted_value_flips`): `asserted` loses
+            // keys nowhere else in a pop, entries are pushed only for
+            // currently-asserted atoms, and resets/restore bump the flip
+            // counter to force a rescan. When neither happened the
+            // retain is a no-op, so skip the O(trail) scan outright —
+            // paid on every backtrack, it was a top stack on Certora
+            // 11775. With unasserts but no flips, liveness is exactly
+            // "term not unasserted", tested against the small sorted
+            // unasserted set instead of the full asserted map.
+            let flips_changed = self.asserted_value_flips != self.diseq_retain_flip_snapshot;
+            if !unasserted_atoms.is_empty() || flips_changed {
+                #[cfg(debug_assertions)]
+                let before: Vec<(TermId, bool)> = self
+                    .disequality_trail
+                    .iter()
+                    .map(|(term, _expr, value)| (*term, *value))
+                    .collect();
+                self.diseq_retain_scans += 1;
+                if flips_changed {
+                    self.disequality_trail
+                        .retain(|(term, _expr, value)| self.asserted.get(term) == Some(value));
+                } else {
+                    unasserted_atoms.sort_unstable_by_key(|term| term.0);
+                    unasserted_atoms.dedup();
+                    self.disequality_trail.retain(|(term, _expr, _value)| {
+                        unasserted_atoms
+                            .binary_search_by_key(&term.0, |dead| dead.0)
+                            .is_err()
+                    });
+                }
+                self.diseq_retain_flip_snapshot = self.asserted_value_flips;
+                #[cfg(debug_assertions)]
+                {
+                    let expected: Vec<(TermId, bool)> = before
+                        .into_iter()
+                        .filter(|(term, value)| self.asserted.get(term) == Some(value))
+                        .collect();
+                    let actual: Vec<(TermId, bool)> = self
+                        .disequality_trail
+                        .iter()
+                        .map(|(term, _expr, value)| (*term, *value))
+                        .collect();
+                    debug_assert_eq!(
+                        actual, expected,
+                        "optimized disequality retain diverged from the full predicate"
+                    );
+                }
+            }
         }
         if let Some(shared_diseq_mark) = self.shared_disequality_trail_scopes.pop() {
             self.shared_disequality_trail.truncate(shared_diseq_mark);
@@ -314,19 +367,35 @@ impl LraSolver {
             self.bump_heap_epoch();
             self.heap_stale = true;
         }
-        self.trivial_conflict = None;
+        // #lra-scope-trail: a trivial conflict recorded inside a popped scope
+        // goes with it; one recorded in a surviving scope — a constant
+        // contradiction applied at push time in the scope of its assertion —
+        // stays pending for the next check, exactly like a trailed bound.
+        if self.trivial_conflict_scope > self.scopes.len() {
+            self.trivial_conflict = None;
+        }
         self.injected_to_int_axioms.clear();
-        self.last_check_trail_pos = self.asserted_trail.len();
+        // #lra-scope-trail: clamp the check cursor to the rewound trail — never
+        // advance it. Atoms below the mark that are still pending (a constant
+        // contradiction `process_check_atoms` stopped at, an unsupported atom
+        // #9217 keeps re-scanning) must stay in front of the next check;
+        // advancing the cursor to the trail length silently dropped them, so
+        // `true = false` asserted at scope 1 was forgotten by a pop of scope
+        // 2 and a later check answered `Sat`. Re-scanning is cheap: atoms
+        // whose bounds are in place are skipped through `bound_atoms`.
+        self.last_check_trail_pos = self.last_check_trail_pos.min(self.asserted_trail.len());
         self.bounds_tightened_since_simplex = true;
         // #8187: pop() invalidates any previous simplex result — the
         // soundness gate flag is re-initialized on each check entry, so
         // clear it here for hygiene only.
         self.post_simplex_bounds_added = false;
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // #inc-guard-memo: lifecycle reset — values/bounds may be rewritten
         // below, so the guard's clean memo no longer holds. Also breaks the
         // tracked-only chain (#inc-guard-chain) until a full verification.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         self.bcp_implied_dry_streak = 0;
         self.bcp_cascade_dry_streak = 0;
@@ -337,9 +406,9 @@ impl LraSolver {
         // resets these at the start of solve_feasibility(), clearing them here
         // prevents stale state from affecting other code paths.
         self.bland_mode = false;
-        self.basis_repeat_count = 0;
+        self.pivots_before_bland = 0;
         if let Some(prev) = self.last_simplex_feasible_scopes.pop() {
-            self.last_simplex_feasible = prev;
+            self.set_last_simplex_feasible(prev);
         }
         if let Some(mark) = self.persistent_unsupported_scope_marks.pop() {
             self.rewind_persistent_unsupported_atoms(mark);

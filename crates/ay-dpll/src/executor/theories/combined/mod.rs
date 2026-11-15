@@ -10,19 +10,26 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 mod arrays_to_lia;
 mod bounded_bv_lia;
+pub(in crate::executor) mod bv_lia_aux_vars;
+mod bv_lia_indep_agreement;
+mod guarded_mask_residue;
+mod int_blast;
 mod lira;
+mod restored_uf;
 
 use crate::combined_solvers::combiner::{
-    CrossTheoryEqualityReplay, EufArrayNotifyReplayState, TheoryCombiner,
+    CombinerTermCacheCarry, CrossTheoryEqualityReplay, EufArrayNotifyReplayState, TheoryCombiner,
 };
 use crate::combined_solvers::{UfNiaSolver, UfNraSolver};
-use crate::executor::model::{EvalValue, Model};
+use crate::executor::model::{EvalValue, Model, ValidationStats};
 use crate::executor::theories::solve_harness::{ProofProblemAssertionProvenance, TheoryModels};
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::incremental_state::IncrementalTheoryState;
 use ay_arrays::{ArrayPropagatedEqualityReplay, ExactSelectModelEqKey};
 use ay_core::{Constant, Sort, Symbol, TermData, TermId, TermStore};
 use ay_lia::LiaModel;
+use bv_lia_aux_vars::{mint_bv_lia_aux_var, BvLiaAuxVar};
+use bv_lia_indep_agreement::IndepMerge;
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
@@ -106,6 +113,7 @@ fn a2_shadow_run_round<'store>(
     deadline: Option<ay_core::time::Instant>,
     rescue_counter: &crate::executor::theories::split_incremental::SharedRescuePairCounter,
     fresh_result: &ay_core::TheoryResult,
+    should_stop: &dyn Fn() -> bool,
     lits: &[(TermId, bool)],
     atoms: &HashSet<TermId>,
     lemmas: &[ay_core::TheoryLemma],
@@ -170,6 +178,17 @@ fn a2_shadow_run_round<'store>(
         ay_core::TheorySolver::assert_literal(shadow, term, value);
     }
     let shadow_result = ay_core::TheorySolver::check(shadow);
+    // Mirror the authoritative post-add replay protocol before comparing.
+    // This is a write-only shadow over an exact cloned term store; the actual
+    // SAT owner supplied these same current installed clauses. A returned
+    // NeedLemmas or an issued-ID namespace alone licenses no acknowledgment.
+    let shadow_result =
+        crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+            shadow,
+            shadow_result,
+            lemmas,
+            should_stop,
+        );
     *engaged += 1;
 
     let fresh_tag = a2_shadow_verdict_tag(fresh_result);
@@ -806,13 +825,15 @@ fn uflia_fused_detour_enabled() -> bool {
 /// repairs are model-repair-only; the fail-closed validation gate re-checks
 /// every assertion afterwards.
 fn extract_uflia_theory_models(
-    terms: &TermStore,
-    live_assertions: &[TermId],
+    exec: &Executor,
     original_assertions: &[TermId],
     var_subst: &crate::preprocess::VariableSubstitution,
     theory: &mut TheoryCombiner<'_>,
 ) -> TheoryModels {
-    let mut model_roots: Vec<TermId> = live_assertions
+    let terms = &exec.ctx.terms;
+    let mut model_roots: Vec<TermId> = exec
+        .ctx
+        .assertions
         .iter()
         .copied()
         .chain(original_assertions.iter().copied())
@@ -822,7 +843,7 @@ fn extract_uflia_theory_models(
     let lia_model_value_terms = uflia_lia_model_value_terms(terms, &model_roots);
     let fixup_protected = collect_active_arith_diseq_vars(terms, model_roots.iter().copied());
     theory.scope_euf_model_to_roots(&model_roots);
-    let (mut euf, lia) = theory.extract_euf_lia_models_with_lia_value_filter_and_fixup(
+    let (mut euf, mut lia) = theory.extract_euf_lia_models_with_lia_value_filter_and_fixup(
         &model_roots,
         |term| lia_model_value_terms.contains(&term),
         |terms, euf_model, lia| {
@@ -860,6 +881,12 @@ fn extract_uflia_theory_models(
     // model; validation re-checks every assertion, so it can never admit a
     // false `sat`. Fixes verification-consumer bug/682 + final_borrows.
     super::lia::recover_uninterpreted_equalities_from_assertions(terms, &model_roots, &mut euf);
+    // Restore current/root applications omitted by row-key deduplication. All
+    // candidate writes are staged; failure leaves the previous model intact.
+    // The existing original-root completion/validation/publication gates remain
+    // mandatory. Model-only congruence never enters the live proof e-graph.
+    restored_uf::recover(exec, theory, &model_roots, &mut euf, &mut lia);
+
     TheoryModels {
         euf: Some(euf),
         lia,
@@ -1190,6 +1217,23 @@ fn bv_leaf_pinned_nat(terms: &TermStore, roots: &[TermId], v: TermId) -> Option<
     None
 }
 
+/// Whether a passing `validate_model` run is INDEPENDENT evidence: every
+/// assertion was concretely re-evaluated to `true` from the model, none was
+/// accepted on SAT-fallback, theory delegation or a skip. The BV<->LIA bridge
+/// promotes SAT on nothing weaker (#int2bv-invalid-model): the AUFLIA lane
+/// behind it has no theory for the BitVec operators, so any non-independent
+/// acceptance would launder the solver's own assignment into evidence.
+fn bridge_validation_is_independent(stats: &ValidationStats) -> bool {
+    stats.sat_fallback_count == 0
+        && stats.delegated_checks == 0
+        && stats.skipped_internal == 0
+        && stats.skipped_quantifier == 0
+        && stats.skipped_datatype == 0
+        && stats.skipped_dtbv == 0
+        && stats.skipped_arith_array_mix == 0
+        && stats.checked == stats.total
+}
+
 fn push_bv2nat_range(terms: &mut TermStore, out: &mut Vec<TermId>, bv: TermId, nat: TermId) {
     let Some(width) = bv_width(terms, bv) else {
         return;
@@ -1325,10 +1369,7 @@ fn push_bv2nat_congruence(
         return;
     }
     let modulus = terms.mk_int(BigInt::one() << width);
-    let k = terms.mk_fresh_var(
-        &format!("__ay_bv_lia_cong_k{}_w{}", source.0, width),
-        Sort::Int,
-    );
+    let k = mint_bv_lia_aux_var(terms, BvLiaAuxVar::CongruenceSlack, Sort::Int);
     // nat = source - 2^w * k
     let scaled_k = terms.mk_mul(vec![modulus, k]);
     let rhs = terms.mk_sub(vec![source, scaled_k]);
@@ -1863,6 +1904,41 @@ fn int_const_value(terms: &TermStore, term: TermId) -> Option<BigInt> {
     match terms.get(term) {
         TermData::Const(Constant::Int(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+/// The residues `x mod 2^w` over every Int `x` in `[lower, upper]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Int2BvResidueRange {
+    /// Every residue in `[0, 2^w)` is reachable (or the interval is empty,
+    /// which the Int side refutes on its own): nothing to assert.
+    Unconstrained,
+    /// Exactly the residues in `[lo, hi]`, `lo <= hi`.
+    Interval(BigInt, BigInt),
+    /// The interval wraps once: exactly the residues in `[lo, 2^w)` and in
+    /// `[0, hi]`, with a real gap between them (`hi + 1 < lo`).
+    Wrapped(BigInt, BigInt),
+}
+
+/// The residue range `int2bv_w` maps `[lower, upper]` onto. Floor division
+/// splits each bound into its period `k` and its residue `r` (`x = k*2^w + r`,
+/// `0 <= r < 2^w`, for negative `x` too). Inside one period the map is the
+/// order-preserving shift `x - k*2^w`; across one period boundary it is two
+/// pieces; across two or more it is onto.
+fn int2bv_residue_range(lower: &BigInt, upper: &BigInt, width: u32) -> Int2BvResidueRange {
+    use num_integer::Integer;
+    if width == 0 || lower > upper {
+        return Int2BvResidueRange::Unconstrained;
+    }
+    let modulus = BigInt::one() << width;
+    let (lo_period, lo_res) = lower.div_mod_floor(&modulus);
+    let (hi_period, hi_res) = upper.div_mod_floor(&modulus);
+    if lo_period == hi_period {
+        Int2BvResidueRange::Interval(lo_res, hi_res)
+    } else if hi_period == lo_period + BigInt::one() && &hi_res + BigInt::one() < lo_res {
+        Int2BvResidueRange::Wrapped(lo_res, hi_res)
+    } else {
+        Int2BvResidueRange::Unconstrained
     }
 }
 
@@ -2527,10 +2603,7 @@ impl<'a> BvLiaBitblastTranslator<'a> {
             return existing;
         }
 
-        let var = self.terms.mk_fresh_var(
-            &format!("__ay_bv_lia_i{}_w{}", term.0, width),
-            Sort::bitvec(width),
-        );
+        let var = mint_bv_lia_aux_var(self.terms, BvLiaAuxVar::ResidueVector, Sort::bitvec(width));
         self.int_residue_vars.insert((term, width), var);
         self.push_range_assertions(term, width, var);
         self.push_residue_congruence(term, width, var);
@@ -2567,10 +2640,7 @@ impl<'a> BvLiaBitblastTranslator<'a> {
         self.range_assertions.push(hi);
         // bv2nat(bv_var) = int_term - 2^w * k   (k fresh, unconstrained)
         let modulus = self.terms.mk_int(BigInt::one() << width);
-        let k = self.terms.mk_fresh_var(
-            &format!("__ay_bv_lia_cong_k{}_w{}", int_term.0, width),
-            Sort::Int,
-        );
+        let k = mint_bv_lia_aux_var(self.terms, BvLiaAuxVar::CongruenceSlack, Sort::Int);
         let scaled_k = self.terms.mk_mul(vec![modulus, k]);
         let rhs = self.terms.mk_sub(vec![int_term, scaled_k]);
         let cong = self.terms.mk_eq(nat, rhs);
@@ -2594,20 +2664,46 @@ impl<'a> BvLiaBitblastTranslator<'a> {
         self.range_assertions.push(signed_cong);
     }
 
+    /// Assert the values the residue `bv_var = int2bv_w(int_term)` can take,
+    /// as far as the top-level Int bounds on `int_term` determine them.
+    ///
+    /// The residue is `int_term mod 2^w`, so an Int bound constrains it only
+    /// through [`int2bv_residue_range`]: BOTH bounds must be known, and the
+    /// residue interval is exact only while `[lower, upper]` stays inside one
+    /// period of `2^w` (one wrap gives a two-piece range). A one-sided bound
+    /// constrains nothing — `x <= 5` admits every negative `x`, and
+    /// `int2bv_8(-1) = #xff`. Copying such a bound onto the residue is what
+    /// let the bit-blast probe "prove" `bv2nat(int2bv_8 x) <= 5` from `x <= 5`
+    /// and publish `unsat` on a satisfiable query.
     fn push_range_assertions(&mut self, int_term: TermId, width: u32, bv_var: TermId) {
+        let (Some(lower), Some(upper)) = (
+            self.facts.lower_bound(int_term),
+            self.facts.upper_bound(int_term),
+        ) else {
+            return;
+        };
         let max = (BigInt::one() << width) - BigInt::one();
-        if let Some(lower) = self.facts.lower_bound(int_term) {
-            if !lower.is_negative() && !lower.is_zero() && lower <= &max {
-                let lower_bv = self.terms.mk_bitvec(lower.clone(), width);
-                self.range_assertions
-                    .push(self.terms.mk_bvuge(bv_var, lower_bv));
+        match int2bv_residue_range(lower, upper, width) {
+            Int2BvResidueRange::Unconstrained => {}
+            Int2BvResidueRange::Interval(lo, hi) => {
+                if lo.is_positive() {
+                    let lo_bv = self.terms.mk_bitvec(lo, width);
+                    self.range_assertions
+                        .push(self.terms.mk_bvuge(bv_var, lo_bv));
+                }
+                if hi < max {
+                    let hi_bv = self.terms.mk_bitvec(hi, width);
+                    self.range_assertions
+                        .push(self.terms.mk_bvule(bv_var, hi_bv));
+                }
             }
-        }
-        if let Some(upper) = self.facts.upper_bound(int_term) {
-            if !upper.is_negative() && upper < &max {
-                let upper_bv = self.terms.mk_bitvec(upper.clone(), width);
+            Int2BvResidueRange::Wrapped(lo, hi) => {
+                let lo_bv = self.terms.mk_bitvec(lo, width);
+                let hi_bv = self.terms.mk_bitvec(hi, width);
+                let at_or_above = self.terms.mk_bvuge(bv_var, lo_bv);
+                let at_or_below = self.terms.mk_bvule(bv_var, hi_bv);
                 self.range_assertions
-                    .push(self.terms.mk_bvule(bv_var, upper_bv));
+                    .push(self.terms.mk_or(vec![at_or_above, at_or_below]));
             }
         }
     }
@@ -4230,10 +4326,15 @@ impl Executor {
                     let lhs = Self::eval_bv_lia_int_term(terms, args[0], values)?;
                     let rhs = Self::eval_bv_lia_int_term(terms, args[1], values)?;
                     if rhs.is_zero() {
-                        None
-                    } else {
-                        Some(lhs / rhs)
+                        return None;
                     }
+                    // SMT-LIB `div` is the Euclidean quotient (its remainder is
+                    // never negative); `BigInt` division truncates toward zero.
+                    let mut rem = &lhs % &rhs;
+                    if rem.is_negative() {
+                        rem += rhs.abs();
+                    }
+                    Some((lhs - rem) / rhs)
                 }
                 "mod" => {
                     if args.len() != 2 {
@@ -4678,10 +4779,11 @@ impl Executor {
                 self.ctx.terms.mk_eq(nat, int_arg)
             } else {
                 // Euclidean form: e = bv2nat(int2bv(W, e)) + 2^W * k.
-                let k = self
-                    .ctx
-                    .terms
-                    .mk_fresh_var(&format!("__ay_bv_lia_q{}_w{}", int_arg.0, width), Sort::Int);
+                let k = mint_bv_lia_aux_var(
+                    &mut self.ctx.terms,
+                    BvLiaAuxVar::EuclideanQuotient,
+                    Sort::Int,
+                );
                 let modulus_t = self.ctx.terms.mk_int(modulus);
                 let scaled = self.ctx.terms.mk_mul(vec![modulus_t, k]);
                 let rhs = self.ctx.terms.mk_add(vec![nat, scaled]);
@@ -5141,8 +5243,71 @@ impl Executor {
         &mut self,
         extra_roots: &[TermId],
     ) -> Result<SolveResult> {
+        // (#proof-capability) Under proof production the outer dense-array
+        // pass did not run, so a pinned cell read `(select A k)` with a
+        // top-level fact `(= (select A k) v)` still sits inside the bit-vector
+        // sums this lane decomposes over `bv2nat`. Fold it for THIS lane only,
+        // on a window installed here and restored below, with the propagation
+        // provenance the proof replay reads; the authored roots never move.
+        // Byte-identical when nothing folds and on every no-proof solve.
+        let folded = if self.is_producing_proofs() {
+            self.pinned_bv_array_read_fold_window()
+        } else {
+            None
+        };
+        let Some((window, records)) = folded else {
+            return self.solve_bv_lia_bridge_with_extra_roots_in_window(extra_roots);
+        };
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/bvlia-bridge pinned-read fold window: {} rewrites, {} entries",
+                records.rewrites.len(),
+                records.entries.len()
+            );
+        }
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, window);
+        self.merge_propagation_records(records);
+        let result = self.solve_bv_lia_bridge_with_extra_roots_in_window(extra_roots);
+        self.ctx.assertions = saved_assertions;
+        result
+    }
+
+    /// A PUBLIC root elaborated to the canonical `false`: the root alone
+    /// refutes the query, the bounded lane declined it (its bundle cannot
+    /// assume that root), and the bridge's search-based probes below have
+    /// nothing to add — measured, they ran a split-conjunct session row whose
+    /// violation folds to `false` into its whole timeout. Decide the query's
+    /// own roots with AUFLIA, where the folded root closes at once and its
+    /// authored surface is certified by the ordinary reconstruction. Anything
+    /// but UNSAT stays `Unknown`: this path adds no SAT authority.
+    fn solve_bv_lia_folded_false_root(&mut self, extra_roots: &[TermId]) -> Result<SolveResult> {
+        let result = if extra_roots.is_empty() {
+            self.solve_auf_lia()
+        } else {
+            let scoped_assertions = self.ctx.assertions.clone();
+            self.solve_auf_lia_with_assumptions(&scoped_assertions, extra_roots)
+        };
+        if self.ite_uf_definition_recovery.ready() {
+            return Ok(SolveResult::Unknown);
+        }
+        match result? {
+            SolveResult::Unsat(_) => Ok(self.bv_lia_unsat_candidate(extra_roots)),
+            _ => {
+                self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                Ok(SolveResult::Unknown)
+            }
+        }
+    }
+
+    fn solve_bv_lia_bridge_with_extra_roots_in_window(
+        &mut self,
+        extra_roots: &[TermId],
+    ) -> Result<SolveResult> {
         if let Some(result) = self.try_solve_via_bounded_bv_lia(extra_roots) {
             return Ok(result);
+        }
+        if self.public_roots_hold_unauthored_false(extra_roots) {
+            return self.solve_bv_lia_folded_false_root(extra_roots);
         }
 
         let mut roots = self.ctx.assertions.clone();
@@ -5198,6 +5363,13 @@ impl Executor {
         // additive, definitional — see the method doc.
         let bv2nat_const_pin_assertions = self.collect_bv2nat_const_pin_assertions(&roots);
         bridge_assertions.extend(bv2nat_const_pin_assertions);
+        // Guarded mask residue (#guarded-mask-residue): `(= m c) ==>
+        // bv2nat(bvand(v, int2bv_w(m))) = v mod 2^k` for a low-bit mask
+        // `c = 2^k - 1` that the formula pins only under a guard, the identity
+        // `mk_bv2nat` folds for a literal mask. Sound, additive, definitional
+        // — see `guarded_mask_residue.rs`.
+        let guarded_mask_residue_assertions = self.collect_guarded_mask_residue_assertions(&roots);
+        bridge_assertions.extend(guarded_mask_residue_assertions);
         // bvadd/bvsub modular bridge (#overflow-mod): relate bv2nat of a wrapping
         // add/sub to bv2nat of its operands via a two-branch carry/borrow
         // disjunction + result range, so no-wrap add/sub obligations become
@@ -5215,6 +5387,9 @@ impl Executor {
         if bridge_assertions.is_empty() {
             if self.bv_lia_bridge_relaxation_is_unsat(&roots)? {
                 return Ok(self.bv_lia_unsat_candidate(extra_roots));
+            }
+            if let Some(decided) = self.bv_lia_bridge_int_blast_decision(&roots, extra_roots)? {
+                return Ok(decided);
             }
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             return Ok(SolveResult::Unknown);
@@ -5331,12 +5506,21 @@ impl Executor {
                     // (e.g. the wrapping-overflow counterexample at a = 2^W - k).
                     return Ok(SolveResult::Sat);
                 }
+                // The AUFLIA candidate did not validate: it is SPURIOUS, not a
+                // witness. Decide the query exactly instead of giving up
+                // (#int2bv-invalid-model, `int_blast.rs`).
+                if let Some(decided) = self.bv_lia_bridge_int_blast_decision(&roots, extra_roots)? {
+                    return Ok(decided);
+                }
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }
             SolveResult::Unknown => {
                 if self.bv_lia_bridge_relaxation_is_unsat(&roots)? {
                     return Ok(self.bv_lia_unsat_candidate(extra_roots));
+                }
+                if let Some(decided) = self.bv_lia_bridge_int_blast_decision(&roots, extra_roots)? {
+                    return Ok(decided);
                 }
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
@@ -5361,6 +5545,9 @@ impl Executor {
     /// SAT into Unknown, never the reverse), and it never touches the UNSAT
     /// derivation. Combined with the structural guard (b), only a bridge-only,
     /// model-validating query promotes — and the promoted model is realizable.
+    /// The validation must be INDEPENDENT for every root
+    /// ([`bridge_validation_is_independent`]): a SAT-fallback, delegated or
+    /// skipped root is no evidence here.
     fn bridge_sat_model_validates(&mut self, roots: &[TermId]) -> bool {
         if self.last_model.is_none() {
             return false;
@@ -5368,10 +5555,38 @@ impl Executor {
         let saved_result = self.last_result.clone();
         let saved_assertions = std::mem::replace(&mut self.ctx.assertions, roots.to_vec());
         self.last_result = Some(SolveResult::Sat);
-        let validated = self.validate_model().is_ok();
+        // INDEPENDENT evidence only (#int2bv-invalid-model). `validate_model`
+        // accepts an assertion on SAT-fallback, theory delegation or a skip
+        // when the evaluator cannot decide it; on this promotion path there is
+        // no theory behind the BitVec operators (AUFLIA saw them as
+        // uninterpreted), so any such acceptance is circular. Measured: the
+        // AUFLIA candidate for `v3 = bv2nat(bvshl #x1 (int2bv 64 v0))`,
+        // `v3 = 1` evaluated the definition to Bool(false), was DELEGATED,
+        // promoted to `sat`, and only the downstream independent gate caught
+        // it. Promote only when every original root re-evaluated to `true`.
+        let validated = self
+            .validate_model()
+            .is_ok_and(|stats| bridge_validation_is_independent(&stats));
         self.ctx.assertions = saved_assertions;
         self.last_result = saved_result;
         validated
+    }
+
+    /// Exact fallback for the bridge (`int_blast.rs`, #int2bv-invalid-model):
+    /// decide `roots` by bounded Int→BV blasting once the AUFLIA lane has said
+    /// SAT-but-spurious or Unknown. `None` keeps the caller's verdict. An
+    /// UNSAT under assumptions records the assumption core like every other
+    /// bridge UNSAT promotion.
+    fn bv_lia_bridge_int_blast_decision(
+        &mut self,
+        roots: &[TermId],
+        extra_roots: &[TermId],
+    ) -> Result<Option<SolveResult>> {
+        let decided = self.solve_bv_lia_by_int_blast(roots)?;
+        if decided.as_ref().is_some_and(SolveResult::is_unsat) && !extra_roots.is_empty() {
+            self.last_assumption_core = Some(extra_roots.to_vec());
+        }
+        Ok(decided)
     }
 
     /// SAT-model promotion when NOT every BitVec var is bridge-only
@@ -5551,6 +5766,9 @@ impl Executor {
             }
             state.persistent_sat = Some(sat);
         }
+        if let Some(sat) = state.persistent_sat.as_mut() {
+            sat.set_clause_event_capture(self.clause_event_capture);
+        }
     }
 
     /// Solve using combined EUF + LRA theory with disequality split support (#6129).
@@ -5645,7 +5863,7 @@ impl Executor {
                 persistent_sat_field: persistent_sat,
                 create_theory: UfNraSolver::new(&this.ctx.terms),
                 extract_models: |theory| {
-                    let (euf, lra) = theory.extract_models();
+                    let (euf, lra) = theory.extract_models(&this.ctx.assertions);
                     TheoryModels {
                         euf: Some(euf),
                         lra: Some(lra),
@@ -5888,6 +6106,9 @@ impl Executor {
         self.split_eager_relevancy_hard = false;
         self.split_lazy_relevancy_hard = false;
         self.split_lazy_detour_conflict_budget = None;
+        // Term-level caches carried from each round's combiner into the next,
+        // across every arm of this solve (see `solve_auf_lia`); result-neutral.
+        let mut uflia_term_caches = CombinerTermCacheCarry::default();
         let result =
             self.with_deferred_postprocessing(preprocessed_assertions, proof_provenance, |this| {
                 this.configure_sat_search_tuning(100.0, 1.1, 0.01);
@@ -5983,8 +6204,7 @@ impl Executor {
                             tc
                         },
                         extract_models: |theory| extract_uflia_theory_models(
-                            &$exec.ctx.terms,
-                            &$exec.ctx.assertions,
+                            $exec,
                             &original_assertions,
                             &var_subst,
                             theory,
@@ -5993,8 +6213,10 @@ impl Executor {
                         pre_theory_import: |theory, lc, hc, ds| {
                             theory.import_learned_state(std::mem::take(lc), std::mem::take(hc));
                             theory.import_dioph_state(std::mem::take(ds));
+                            theory.import_term_cache_carry(std::mem::take(&mut uflia_term_caches));
                         },
                         post_theory_export: |theory| {
+                            uflia_term_caches.absorb(theory.export_term_cache_carry());
                             let (lc, hc) = theory
                                 .take_learned_state()
                                 .unwrap_or_else(|| (Vec::new(), empty_hash_set()));
@@ -6118,8 +6340,9 @@ impl Executor {
                         };
                     // Snapshot the persistent solver's deterministic budgets:
                     // the detour caps must not leak into the eager resume or
-                    // a later lane sharing the solver (the eager-persistent
-                    // arm does not re-install budgets per round).
+                    // a later lane sharing the solver that does not re-arm
+                    // its own (the split-loop arms, eager-persistent included,
+                    // re-install theirs every round).
                     let _uflia_saved_budgets = this
                         .incr_theory_state
                         .as_ref()
@@ -6207,8 +6430,7 @@ impl Executor {
                                     tc
                                 },
                                 extract_models: |theory| extract_uflia_theory_models(
-                                    &$exec.ctx.terms,
-                                    &$exec.ctx.assertions,
+                                    $exec,
                                     &original_assertions,
                                     &var_subst,
                                     theory,
@@ -6217,8 +6439,10 @@ impl Executor {
                                 pre_theory_import: |theory, lc, hc, ds| {
                                     theory.import_learned_state(std::mem::take(lc), std::mem::take(hc));
                                     theory.import_dioph_state(std::mem::take(ds));
+                                    theory.import_term_cache_carry(std::mem::take(&mut uflia_term_caches));
                                 },
                                 post_theory_export: |theory| {
+                                    uflia_term_caches.absorb(theory.export_term_cache_carry());
                                     let (lc, hc) = theory
                                         .take_learned_state()
                                         .unwrap_or_else(|| (Vec::new(), empty_hash_set()));
@@ -6621,8 +6845,10 @@ impl Executor {
                     theory
                 },
                 extract_models: |theory| {
-                    let (euf, lia) = theory.extract_models();
+                    let boolean_leaves = theory.boolean_witness().collect();
+                    let (euf, lia) = theory.extract_models(&this.ctx.assertions);
                     TheoryModels {
+                        boolean_leaves,
                         euf: Some(euf),
                         lia,
                         ..TheoryModels::default()
@@ -7365,10 +7591,17 @@ impl Executor {
             // enough (a sibling attempt guarded that way and its probe fired
             // with `strings` and `bv` live).
             //
-            // SAT ONLY. An `unsat` from this lane would be a NEW refutation
-            // resting on the symbolic division axioms; that deserves its own
-            // measured campaign, so it falls through to today's `unknown`.
-            // The `Sat` still faces the unmodified mandatory gate.
+            // SAT, and since #auflia-symbolic-div-unsat UNSAT too. The `Sat`
+            // still faces the unmodified mandatory gate. An `unsat` rests on
+            // the symbolic division axioms, which are the exact SMT-LIB
+            // semantics with `d = 0` left free, and on EUF+NIA over the same
+            // window: the verdict `solve_uf_lia` has always published from this
+            // same call on the array-free UF+LIA route. The theory guard below
+            // keeps every other theory out, so nothing is reinterpreted, and
+            // the rescue depth keeps the nested lanes from re-entering. Verus
+            // reaches this lane with the instances of its `EucDiv`/`EucMod`
+            // definitions, so a symbolic divisor in a quantified query was
+            // never refuted (Verus fix queue, row D2).
             let nia_routable = !post_preprocess_features.has_arrays
                 && !post_preprocess_features.has_real
                 && !post_preprocess_features.has_bv
@@ -7393,6 +7626,9 @@ impl Executor {
                 self.mod_div_or_branch_rescue_depth -= 1;
                 if matches!(nia, Ok(ref r) if r.is_sat()) {
                     return Ok(SolveResult::Sat);
+                }
+                if matches!(nia, Ok(SolveResult::Unsat(_))) {
+                    return nia;
                 }
                 self.ctx.assertions = saved_assertions;
                 self.last_model = saved_model;
@@ -7431,6 +7667,9 @@ impl Executor {
         let mut persistent_array_equality_replays: Vec<ArrayPropagatedEqualityReplay> = Vec::new();
         let mut persistent_cross_theory_equality_replays: Vec<CrossTheoryEqualityReplay> =
             Vec::new();
+        // Term-level caches (LIA linear forms, interface tracking plans) carried
+        // round to round so each fresh combiner starts warm; result-neutral.
+        let mut persistent_term_caches = CombinerTermCacheCarry::default();
         #[cfg(debug_assertions)]
         let mut a2_shadow_engaged_rounds: u64 = 0;
         #[cfg(debug_assertions)]
@@ -7471,6 +7710,10 @@ impl Executor {
                 let a2_shadow_interrupt = this.solve_interrupt.clone();
                 #[cfg(debug_assertions)]
                 let a2_shadow_deadline = this.solve_deadline.get();
+                // The original live cancellation window is observed, not
+                // copied into a new allowance or a fixed expiry snapshot.
+                #[cfg(debug_assertions)]
+                let a2_shadow_should_stop = this.make_should_stop();
                 // Private rescue counter — NEVER the authoritative shared one, so
                 // the shadow cannot influence the fresh path's rescue budget.
                 #[cfg(debug_assertions)]
@@ -7629,8 +7872,10 @@ impl Executor {
                         theory.import_euf_array_notify_replay_state(
                             &persistent_euf_array_notify_edges,
                         );
+                        theory.import_term_cache_carry(std::mem::take(&mut persistent_term_caches));
                     },
                     post_theory_export: |theory| {
+                        persistent_term_caches.absorb(theory.export_term_cache_carry());
                         persistent_array_interface_eqs =
                             theory.export_array_requested_interface_eqs();
                         persistent_array_model_eqs = theory.export_array_requested_model_eqs();
@@ -7681,6 +7926,7 @@ impl Executor {
                                 a2_shadow_deadline,
                                 &a2_shadow_rescue_counter,
                                 shadow_result,
+                                &a2_shadow_should_stop,
                                 shadow_lits,
                                 shadow_atoms,
                                 shadow_lemmas,
@@ -7693,7 +7939,13 @@ impl Executor {
                                 &mut a2_shadow_first_divergence,
                             );
                         }
-                    }
+                    },
+                    // Replay-ledger retention of primary split conflicts is
+                    // load-bearing on this lane (twelve-read fixture:
+                    // destructive rebuilds forget deletable lemmas
+                    // mid-attempt). Opt-in per lane; see
+                    // DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111.
+                    retain_primary_conflicts: true
                 )
             });
 
@@ -7841,6 +8093,8 @@ impl Executor {
                 crate::executor::theories::split_incremental::RescuePairCounter::new(),
             ));
         let rescue_pair_counter_for_theory = rescue_pair_counter;
+        // Term-level caches carried round to round (see solve_auf_lia).
+        let mut persistent_term_caches = CombinerTermCacheCarry::default();
         self.with_deferred_postprocessing(final_assertions, proof_provenance, |this| {
             this.configure_sat_search_tuning(100.0, 1.5, 0.02);
             solve_incremental_assume_split_loop_pipeline!(this,
@@ -7958,8 +8212,10 @@ impl Executor {
                 pre_theory_import: |theory, lc, hc, ds| {
                     theory.import_learned_state(std::mem::take(lc), std::mem::take(hc));
                     theory.import_dioph_state(std::mem::take(ds));
+                    theory.import_term_cache_carry(std::mem::take(&mut persistent_term_caches));
                 },
                 post_theory_export: |theory| {
+                    persistent_term_caches.absorb(theory.export_term_cache_carry());
                     let (lc, hc) = theory
                         .take_learned_state()
                         .unwrap_or_else(|| (Vec::new(), empty_hash_set()));
@@ -8028,6 +8284,8 @@ impl Executor {
                 crate::executor::theories::split_incremental::RescuePairCounter::new(),
             ));
         let rescue_pair_counter_for_theory = rescue_pair_counter;
+        // Term-level caches carried round to round (see solve_auf_lia).
+        let mut persistent_term_caches = CombinerTermCacheCarry::default();
         self.with_deferred_postprocessing(assertions, proof_provenance, |this| {
             this.configure_sat_search_tuning(100.0, 1.1, 0.01);
             solve_incremental_split_loop_pipeline!(this,
@@ -8061,8 +8319,11 @@ impl Executor {
                     }
                 },
                 max_splits: MAX_SPLITS_LRA,
-                pre_theory_import: |_theory, _lc, _hc, _ds| {},
-                post_theory_export: |_theory| {
+                pre_theory_import: |theory, _lc, _hc, _ds| {
+                    theory.import_term_cache_carry(std::mem::take(&mut persistent_term_caches));
+                },
+                post_theory_export: |theory| {
+                    persistent_term_caches.absorb(theory.export_term_cache_carry());
                     (Vec::new(), empty_hash_set(), ay_lia::DiophState::default())
                 },
                 pre_iter_check: |_s| {
@@ -8086,9 +8347,13 @@ impl Executor {
     ///
     /// Cross-check logic on BV-SAT:
     /// - AUFLIA-UNSAT => return UNSAT (Int constraints violated, #7077)
-    /// - AUFLIA-SAT => return SAT (both theories agree)
-    /// - AUFLIA-Unknown => return SAT (BV model validated; AUFLIA is incomplete
-    ///   for BV operations like extract/concat, #5356)
+    /// - AUFLIA-SAT => the lanes' witnesses are merged and made to agree
+    ///   (`bv_lia_indep_agreement`)
+    /// - AUFLIA-Unknown => the same agreement step, with no AUFLIA witness: the
+    ///   BV witness is published when the independent gate's evaluator does not
+    ///   refute it (AUFLIA is incomplete for BV operations like extract/concat,
+    ///   #5356), else AUFLIA is re-decided under its BitVec predicates
+    ///   (#bv-lia-indep-unknown-agreement)
     pub(in crate::executor) fn solve_bv_lia_indep(&mut self) -> Result<SolveResult> {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
@@ -8151,24 +8416,27 @@ impl Executor {
                     SolveResult::Sat => {
                         // AUFLIA agrees. Restore the BV model (validated by the
                         // BV solver), grafting the arithmetic components the BV
-                        // lane never produces (#bv-lia-indep-model-graft).
+                        // lane never produces (#bv-lia-indep-model-graft); when
+                        // the lanes took different branches, make them agree.
                         let roots = self.ctx.assertions.clone();
-                        self.restore_indep_bv_model_with_arith_graft(
-                            bv_model,
-                            bv_model_validated,
-                            &roots,
-                        );
-                        Ok(SolveResult::Sat)
+                        self.finish_indep_bv_lia_sat(bv_model, bv_model_validated, &roots, &[])
                     }
                     SolveResult::Unknown => {
                         if self.last_unknown_is_unsupported_arithmetic() {
                             Ok(SolveResult::Unknown)
                         } else {
-                            // AUFLIA can't decide because of BV operations like
-                            // extract/concat. Restore the validated BV model.
-                            self.last_model = bv_model;
-                            self.last_model_validated = bv_model_validated;
-                            Ok(SolveResult::Sat)
+                            // AUFLIA could not confirm a witness (BV operations
+                            // like extract/concat, or a witness its own
+                            // validation refused). The BV witness values no Int
+                            // term, so it leaves only through the agreement
+                            // step (#bv-lia-indep-unknown-agreement).
+                            let roots = self.ctx.assertions.clone();
+                            self.finish_indep_bv_lia_after_unknown(
+                                bv_model,
+                                bv_model_validated,
+                                &roots,
+                                &[],
+                            )
                         }
                     }
                 }
@@ -8258,7 +8526,8 @@ impl Executor {
             Ok(result) => result,
             Err(ExecutorError::ModelValidation(_)) => {
                 // BV-SAT with failed model validation. Cross-check with AUFLIA (#7077, #5356).
-                return match self.solve_auf_lia_with_assumptions(assertions, assumptions)? {
+                let r = self.solve_auf_lia_with_assumptions(assertions, assumptions)?;
+                return match r {
                     SolveResult::Unsat(proof) => Ok(SolveResult::Unsat(proof)),
                     SolveResult::Sat => Ok(SolveResult::Sat),
                     SolveResult::Unknown => {
@@ -8279,25 +8548,25 @@ impl Executor {
                 // Save BV model before AUFLIA overwrites it.
                 let bv_model = self.last_model.clone();
                 let bv_model_validated = self.last_model_validated;
-                match self.solve_auf_lia_with_assumptions(assertions, assumptions)? {
+                let auflia_r = self.solve_auf_lia_with_assumptions(assertions, assumptions)?;
+                match auflia_r {
                     SolveResult::Unsat(proof) => Ok(SolveResult::Unsat(proof)),
-                    SolveResult::Sat => {
-                        let mut roots = assertions.to_vec();
-                        roots.extend_from_slice(assumptions);
-                        self.restore_indep_bv_model_with_arith_graft(
-                            bv_model,
-                            bv_model_validated,
-                            &roots,
-                        );
-                        Ok(SolveResult::Sat)
-                    }
+                    SolveResult::Sat => self.finish_indep_bv_lia_sat(
+                        bv_model,
+                        bv_model_validated,
+                        assertions,
+                        assumptions,
+                    ),
                     SolveResult::Unknown => {
                         if self.last_unknown_is_unsupported_arithmetic() {
                             Ok(SolveResult::Unknown)
                         } else {
-                            self.last_model = bv_model;
-                            self.last_model_validated = bv_model_validated;
-                            Ok(SolveResult::Sat)
+                            self.finish_indep_bv_lia_after_unknown(
+                                bv_model,
+                                bv_model_validated,
+                                assertions,
+                                assumptions,
+                            )
                         }
                     }
                 }
@@ -8307,89 +8576,264 @@ impl Executor {
         }
     }
 
-    /// Restore the saved BV-lane model after a SAT AUFLIA cross-check, grafting
-    /// (FILL-ONLY) the theory components the BV lane never produces from the
-    /// AUFLIA model that is currently installed in `last_model`
-    /// (#bv-lia-indep-model-graft).
+    /// Restore the saved BV-lane model after a SAT AUFLIA cross-check, merging
+    /// into it what the BV lane structurally cannot know from the AUFLIA model
+    /// that is currently installed in `last_model`
+    /// (#bv-lia-indep-model-graft, #bv-lia-indep-final-assignment-reconcile).
     ///
     /// In the `_BV_LIA_INDEP` category the two lanes solve DISJOINT theory
     /// slices of the same assertion set: the BV lane bitblasts the BitVec
-    /// atoms and treats arithmetic atoms as opaque Booleans (its model carries
-    /// NO Int/Real assignment), while the AUFLIA lane decides the arithmetic
-    /// (its model carries no bit-accurate BV assignment). The old blind
-    /// restore kept only the BV model, so a declared Int constant pinned by an
-    /// arithmetic assertion (`(= len 3)`) evaluated from the 0-defaulted
-    /// completion instead — the final model validation then correctly refuted
-    /// the witness and the pipeline fail-closed a genuine SAT to Unknown
-    /// (verifier slice/collection VCs: `len == N` frame facts alongside pure-BV
-    /// element constraints).
+    /// atoms and treats everything else as opaque Booleans (its model carries
+    /// NO Int/Real assignment, and its values for Bool variables, array reads
+    /// and arithmetic atoms are free choices), while the AUFLIA lane decides
+    /// the arithmetic, the arrays and the propositional skeleton (its model
+    /// carries no bit-accurate BV assignment). The old blind restore kept only
+    /// the BV model, so a declared Int constant pinned by an arithmetic
+    /// assertion (`(= len 3)`) evaluated from the 0-defaulted completion
+    /// instead — the final model validation then correctly refuted the
+    /// witness and the pipeline fail-closed a genuine SAT to Unknown
+    /// (verifier slice/collection VCs: `len == N` frame facts alongside
+    /// pure-BV element constraints).
     ///
-    /// Fill-only means a component the BV model ALREADY has always wins; the
-    /// graft only adds what the BV lane structurally cannot know. Soundness is
-    /// unchanged either way: the merged witness still faces the same strict,
-    /// fail-closed model validation as before, so a graft that does not fit
-    /// (e.g. a cross-theory Boolean-skeleton disagreement between the lanes)
-    /// degrades to exactly the previous Unknown — never a wrong verdict. The
-    /// merge also invalidates the saved validation evidence (the witness
-    /// changed), forcing that re-validation.
+    /// The merge is tried as a LADDER of candidates, most complete first. A
+    /// candidate under which a root evaluates to a definite `false` is
+    /// dropped outright; among the rest the first one the ordinary model
+    /// validation accepts INDEPENDENTLY for every root is kept; and when no
+    /// candidate earns that, step (2) — the PREVIOUS merge policy — is
+    /// installed, so a solve the reconciliation cannot improve publishes
+    /// exactly the witness the commit before it published:
     ///
-    /// STRICTLY ARITHMETIC-ONLY: the AUFLIA lane's `euf_model`/`array_model`
-    /// are NOT grafted even when the BV model lacks those components. The BV
-    /// lane carries its array/UF content as term-level bit assignments with
-    /// `array_model: None`, so "fill-only at the component level" is not
-    /// fill-only at the VALUE level there — a grafted AUFLIA array component
-    /// would materialize printed cells from the AUFLIA lane's opaque tokens
-    /// while validation evaluates the same reads from the BV lane's term
-    /// values, printing a witness inconsistent with the one validated (the
-    /// mv-printer/census divergence class). `lia_model`/`lra_model` cannot
-    /// collide this way: the BV lane never assigns an Int/Real-sorted term.
+    /// 1. arithmetic graft + final-assignment reconciliation: the AUFLIA
+    ///    `lia_model`/`lra_model` are filled in (fill-only: a component the
+    ///    BV model already has always wins), and every atom the BV lane never
+    ///    bit-blasted — Bool variables, Bool-element array reads, arithmetic
+    ///    atoms, array/UF equalities — takes the AUFLIA lane's FINAL value,
+    ///    with Bool-element BitVec-indexed cells pinned accordingly (see
+    ///    `model/bv_lia_indep_reconcile.rs`). This is the witness the AUFLIA
+    ///    lane actually declared consistent, restricted to the atoms it owns;
+    /// 2. arithmetic graft alone (the previous merge policy): the BV lane's
+    ///    Boolean skeleton with the AUFLIA arithmetic. Reached when the lanes'
+    ///    index identifications disagree in a way step 1 cannot resolve, or
+    ///    when the validation oracle refuses step 1's witness and accepts
+    ///    this one, so nothing that merged before stops merging;
+    /// 3. the old blind restore: the two lanes satisfied a MIXED disjunction
+    ///    through DIFFERENT branches in a way neither candidate reconciles.
     ///
-    /// SELF-CHECKED: the two lanes may satisfy a MIXED disjunction through
-    /// DIFFERENT branches (`(or (and (= x 0) bv0) (and (= x 1) bv1))` — the
-    /// BV lane commits its bits to branch 0, AUFLIA picks x = 1), in which
-    /// case the merge is definitively refutable even though each lane's model
-    /// is fine. Grafting there would REGRESS a case the old blind restore
-    /// solved (the 0-default completion happened to land on the BV lane's
-    /// branch). So the merge is kept only when NO root evaluates to a
-    /// definite `false` under it; otherwise the old restore runs unchanged.
-    /// An undecided (unassigned-leaf) evaluation is not a rejection — the
-    /// completion + strict validation passes downstream keep deciding those
-    /// exactly as before, fail-closed.
+    /// STRICTLY VALUE-LEVEL for arrays: the AUFLIA lane's `euf_model`/
+    /// `array_model` components are NOT grafted even when the BV model lacks
+    /// them. The BV lane carries its array/UF content as term-level bit
+    /// assignments, so a grafted AUFLIA array component would materialize
+    /// printed cells from the AUFLIA lane's opaque tokens while validation
+    /// evaluates the same reads from the BV lane's term values, printing a
+    /// witness inconsistent with the one validated (the mv-printer/census
+    /// divergence class). Step 1 instead re-values the BV lane's OWN cells
+    /// and atoms in place, so printer and validators keep reading one model.
+    ///
+    /// Soundness is unchanged by any step: the kept witness still faces the
+    /// same strict, fail-closed model validation as before, so a merge that
+    /// does not fit degrades to exactly the previous Unknown — never a wrong
+    /// verdict. A merge also invalidates the saved validation evidence (the
+    /// witness changed), forcing that re-validation.
     fn restore_indep_bv_model_with_arith_graft(
         &mut self,
         bv_model: Option<Model>,
         bv_model_validated: bool,
         roots: &[TermId],
-    ) {
+    ) -> IndepMerge {
         let auflia_model = self.last_model.take();
-        let mut merged = bv_model.clone();
+        if let (Some(bv), Some(auflia)) = (bv_model.as_ref(), auflia_model.as_ref()) {
+            let mut previous_policy: Option<Model> = None;
+            let mut graft_refuted = false;
+            for reconcile_final_assignment in [true, false] {
+                let mut merged = bv.clone();
+                let mut changed = self.graft_arithmetic_components(&mut merged, auflia, roots);
+                if reconcile_final_assignment {
+                    changed |= self.reconcile_bv_lane_model_with_final_assignment(
+                        &mut merged,
+                        auflia,
+                        roots,
+                    );
+                }
+                if !changed {
+                    break;
+                }
+                let refuted = roots.iter().any(|&root| {
+                    matches!(self.evaluate_term(&merged, root), EvalValue::Bool(false))
+                });
+                crate::executor::model::eval_memo_clear();
+                if refuted {
+                    // Cross-lane branch disagreement at this step: try the
+                    // next, less complete candidate.
+                    graft_refuted |= !reconcile_final_assignment;
+                    continue;
+                }
+                if !reconcile_final_assignment {
+                    // Step (2) IS the previous merge policy, so it is
+                    // installed whether or not the oracle likes it — asking
+                    // would cost a full validation pass and could not change
+                    // the outcome. Only the reconciled candidate has to earn
+                    // its place.
+                    previous_policy = Some(merged);
+                    break;
+                }
+                // NOT-REFUTED IS NOT GOOD ENOUGH for preferring the
+                // reconciled candidate over the previous merge policy. The
+                // check above is the executor's own evaluator, which answers
+                // `Unknown` for exactly the array reads the reconciliation
+                // re-values — so a candidate the strict model-validation
+                // oracle and the independent gate go on to REFUSE looks
+                // identical here to one they accept, and the ladder never
+                // falls through to step (2). Measured on
+                // `sfz/q/quant/quant_0346_plain.smt2`,
+                // `quant_0165_named.smt2` and `quant_0183_named.smt2`: base
+                // answers `sat`, the reconciled candidate is not refuted, and
+                // the verdict degrades to `unknown (incomplete)` on
+                // "arrays rejected assertion N". So ask the ordinary
+                // validation, INDEPENDENTLY for every root (a SAT-fallback,
+                // delegated or skipped root is no evidence — the same rule
+                // `bridge_sat_model_validates` applies), and keep the first
+                // candidate that earns it. When NO candidate earns it the
+                // lane installs the PREVIOUS MERGE POLICY's witness — step
+                // (2), the arithmetic graft alone — so a solve the
+                // reconciliation cannot improve lands on exactly the model
+                // the commit before it published, and this lane can no longer
+                // cost a verdict. Installing the reconciled witness there
+                // instead is what lost `sfz/q/abv2/abv_0198_named.smt2`,
+                // `abv_0475_named.smt2`, `sfz/q/quant/quant_0335_csa.smt2`
+                // and `quant_0361_named.smt2`: unvalidated, it reached the
+                // downstream gate and was refused where the graft-only
+                // witness would have been accepted.
+                if !self.candidate_model_validates(&merged, roots) {
+                    continue;
+                }
+                self.last_model = Some(merged);
+                // A mutated witness invalidates prior validation evidence;
+                // the finalize pass re-validates it fail-closed.
+                self.last_model_validated = false;
+                return IndepMerge::Installed;
+            }
+            if let Some(merged) = previous_policy {
+                self.last_model = Some(merged);
+                self.last_model_validated = false;
+                return IndepMerge::Installed;
+            }
+            if graft_refuted {
+                // The BV lane's Boolean skeleton falsifies a root under the
+                // AUFLIA arithmetic: the lanes satisfied a mixed disjunction
+                // through different branches. Installing the BV model now
+                // would hand the gate a witness this ladder just refuted;
+                // the caller makes the lanes agree instead.
+                return IndepMerge::LanesDisagree;
+            }
+        }
+        // Nothing to merge: the old restore.
+        self.last_model = bv_model;
+        self.last_model_validated = bv_model_validated;
+        IndepMerge::Installed
+    }
+
+    /// Whether `candidate` passes the ordinary fail-closed model validation
+    /// over `roots`, INDEPENDENTLY for every root, with the executor's
+    /// model/result/assertion state saved and restored around the check (the
+    /// pattern [`Self::bridge_sat_model_validates`] already uses).
+    ///
+    /// Consulted by the `_BV_LIA_INDEP` merge ladder to choose between its
+    /// candidates. It only ORDERS candidates the ladder was already free to
+    /// install — it never publishes a verdict, and the chosen witness still
+    /// faces the same unchanged validation downstream.
+    fn candidate_model_validates(&mut self, candidate: &Model, roots: &[TermId]) -> bool {
+        let saved_model = self.last_model.take();
+        let saved_validated = self.last_model_validated;
+        let saved_result = self.last_result.clone();
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, roots.to_vec());
+        self.last_model = Some(candidate.clone());
+        self.last_result = Some(SolveResult::Sat);
+        let validated = self
+            .validate_model()
+            .is_ok_and(|stats| bridge_validation_is_independent(&stats));
+        crate::executor::model::eval_memo_clear();
+        self.ctx.assertions = saved_assertions;
+        self.last_result = saved_result;
+        self.last_model = saved_model;
+        self.last_model_validated = saved_validated;
+        validated
+    }
+
+    /// Fill-only arithmetic graft (#bv-lia-indep-model-graft): the AUFLIA
+    /// lane's `lia_model`/`lra_model` are added to the BV-lane model when it
+    /// has none (the BV lane never assigns an Int/Real-sorted term, so these
+    /// components cannot collide with anything it carries). Returns whether
+    /// anything was grafted.
+    fn graft_arithmetic_components(
+        &self,
+        merged: &mut Model,
+        auflia: &Model,
+        roots: &[TermId],
+    ) -> bool {
         let mut grafted = false;
-        if let (Some(m), Some(a)) = (merged.as_mut(), auflia_model) {
-            if m.lia_model.is_none() && a.lia_model.is_some() {
-                m.lia_model = a.lia_model.clone();
-                grafted = true;
+        if merged.lia_model.is_none() && auflia.lia_model.is_some() {
+            merged.lia_model = auflia.lia_model.clone();
+            grafted = true;
+        }
+        if merged.lra_model.is_none() && auflia.lra_model.is_some() {
+            merged.lra_model = auflia.lra_model.clone();
+            grafted = true;
+        }
+        // An Int/Real variable the AUFLIA lane values OUTSIDE its LIA/LRA
+        // component — eliminated by its preprocessing (`len -> 1`, recovered
+        // into the EUF term values or the completion slot), or carried only
+        // as an EUF class value — is filled from the AUFLIA lane's own
+        // evaluation of that variable. Fill-only: a value the merged model
+        // already resolves is never touched, and the BV lane never assigns
+        // an Int/Real-sorted term.
+        let mut arith_vars: Vec<TermId> = Vec::new();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = roots.to_vec();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
             }
-            if m.lra_model.is_none() && a.lra_model.is_some() {
-                m.lra_model = a.lra_model.clone();
-                grafted = true;
+            if matches!(self.ctx.terms.get(t), TermData::Var(_, _))
+                && matches!(self.ctx.terms.sort(t), Sort::Int | Sort::Real)
+            {
+                arith_vars.push(t);
+            }
+            stack.extend(self.ctx.terms.children(t));
+        }
+        arith_vars.sort_unstable();
+        for var in arith_vars {
+            let sort = self.ctx.terms.sort(var).clone();
+            if !matches!(self.evaluate_term(merged, var), EvalValue::Unknown) {
+                continue;
+            }
+            let EvalValue::Rational(value) = self.evaluate_term(auflia, var) else {
+                continue;
+            };
+            match sort {
+                Sort::Int if value.is_integer() => {
+                    merged
+                        .lia_model
+                        .get_or_insert_with(|| ay_lia::LiaModel {
+                            values: Default::default(),
+                        })
+                        .values
+                        .insert(var, value.to_integer());
+                    grafted = true;
+                }
+                Sort::Real => {
+                    merged
+                        .lra_model
+                        .get_or_insert_with(|| ay_lra::LraModel {
+                            values: Default::default(),
+                        })
+                        .values
+                        .insert(var, value);
+                    grafted = true;
+                }
+                _ => {}
             }
         }
-        if grafted {
-            let merged_ref = merged.as_ref().expect("grafted implies a model");
-            let refuted = roots.iter().any(|&root| {
-                matches!(self.evaluate_term(merged_ref, root), EvalValue::Bool(false))
-            });
-            if refuted {
-                // Cross-lane branch disagreement: keep the old behavior.
-                self.last_model = bv_model;
-                self.last_model_validated = bv_model_validated;
-                return;
-            }
-        }
-        self.last_model = merged;
-        // A mutated witness invalidates prior validation evidence; the
-        // finalize pass re-validates it fail-closed.
-        self.last_model_validated = bv_model_validated && !grafted;
+        grafted
     }
 }
 
@@ -8679,5 +9123,225 @@ mod bridge_guard_tests {
         let b = t.mk_var("b", Sort::Int);
         let eq = t.mk_eq(a, b);
         assert!(all_bitvec_vars_are_bridge_only(&t, &[eq]));
+    }
+}
+
+#[cfg(test)]
+mod int2bv_residue_range_tests {
+    //! D5 (2026-09-23 hunt): the bit-blast probe's residue var for
+    //! `int2bv_w(x)` was given `x`'s top-level Int bounds as BV bounds, one
+    //! side at a time. `x <= 5` became `(bvule r #x05)` although `x = -1`
+    //! gives `r = #xff`, so the probe "proved" `bv2nat(int2bv_8 x) <= 5` and
+    //! the bridge published `unsat` on a satisfiable query. The residue range
+    //! is now derived from both bounds by `int2bv_residue_range`; these tests
+    //! check it against the definition `int2bv_w(x) = x mod 2^w`.
+    use super::*;
+
+    fn residue_allowed(range: &Int2BvResidueRange, residue: i64) -> bool {
+        let residue = BigInt::from(residue);
+        match range {
+            Int2BvResidueRange::Unconstrained => true,
+            Int2BvResidueRange::Interval(lo, hi) => lo <= &residue && &residue <= hi,
+            Int2BvResidueRange::Wrapped(lo, hi) => &residue >= lo || &residue <= hi,
+        }
+    }
+
+    /// Exhaustive over widths 1..=5 and every interval inside [-80, 80],
+    /// one-sided and two-sided, straddling zero and every multiple of 2^w:
+    /// the claimed residues are EXACTLY `{x mod 2^w : lower <= x <= upper}`.
+    #[test]
+    fn residue_range_is_exactly_the_image_of_every_small_interval() {
+        for width in 1..=5u32 {
+            let modulus = 1i64 << width;
+            for lower in -80i64..=80 {
+                for upper in lower..=80 {
+                    let range =
+                        int2bv_residue_range(&BigInt::from(lower), &BigInt::from(upper), width);
+                    let mut reached = vec![false; modulus as usize];
+                    for x in lower..=upper {
+                        reached[x.rem_euclid(modulus) as usize] = true;
+                    }
+                    for (residue, &hit) in reached.iter().enumerate() {
+                        assert_eq!(
+                            residue_allowed(&range, residue as i64),
+                            hit,
+                            "width {width}, x in [{lower}, {upper}]: residue {residue} \
+                             reachable={hit}, claimed {range:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same definition at 64 bits, where the bounds are far from the
+    /// machine words: periods either side of zero and of 2^64.
+    #[test]
+    fn residue_range_at_64_bits_matches_the_definition() {
+        let m = BigInt::one() << 64u32;
+        let max = &m - BigInt::one();
+        let big = |v: i64| BigInt::from(v);
+        assert_eq!(
+            int2bv_residue_range(&big(3), &big(9), 64),
+            Int2BvResidueRange::Interval(big(3), big(9))
+        );
+        assert_eq!(
+            int2bv_residue_range(&(&m + big(3)), &(&m + big(9)), 64),
+            Int2BvResidueRange::Interval(big(3), big(9))
+        );
+        assert_eq!(
+            int2bv_residue_range(&big(-3), &big(5), 64),
+            Int2BvResidueRange::Wrapped(&m - big(3), big(5))
+        );
+        assert_eq!(
+            int2bv_residue_range(&(&m - big(2)), &(&m + big(1)), 64),
+            Int2BvResidueRange::Wrapped(&max - big(1), big(1))
+        );
+        assert_eq!(
+            int2bv_residue_range(&big(-1), &(&m + big(1)), 64),
+            Int2BvResidueRange::Unconstrained
+        );
+        assert_eq!(
+            int2bv_residue_range(&big(-3), &(&m - big(4)), 64),
+            Int2BvResidueRange::Unconstrained
+        );
+    }
+
+    /// Build the probe's residue var for `int2bv_8(x)` under `facts` and
+    /// return the range assertions `push_range_assertions` minted for it.
+    fn residue_range_assertions(facts_src: &[(&str, i64)]) -> (TermStore, TermId, Vec<TermId>) {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let mut roots = Vec::new();
+        for &(op, c) in facts_src {
+            let c = terms.mk_int(BigInt::from(c));
+            roots.push(match op {
+                "<=" => terms.mk_le(x, c),
+                ">=" => terms.mk_ge(x, c),
+                _ => unreachable!("test facts are <= / >="),
+            });
+        }
+        let facts = collect_int_facts(&terms, &roots);
+        let (var, assertions) = {
+            let mut translator = BvLiaBitblastTranslator::new(&mut terms, &facts);
+            let var = translator.int_residue_var(x, 8);
+            (var, translator.into_range_assertions())
+        };
+        (terms, var, assertions)
+    }
+
+    fn bv8(terms: &mut TermStore, value: u32) -> TermId {
+        terms.mk_bitvec(BigInt::from(value), 8)
+    }
+
+    /// The hunt witnesses: `x <= 5`, `x >= 250` and `-3 <= x <= 5` do not
+    /// bound `int2bv_8(x)` to `[0, 5]` / `[250, 255]`.
+    #[test]
+    fn one_sided_int_bounds_do_not_bound_the_residue() {
+        for facts in [vec![("<=", 5)], vec![(">=", 250)]] {
+            let (mut terms, var, assertions) = residue_range_assertions(&facts);
+            let five = bv8(&mut terms, 5);
+            let upper = terms.mk_bvule(var, five);
+            let two_fifty = bv8(&mut terms, 250);
+            let lower = terms.mk_bvuge(var, two_fifty);
+            assert!(
+                !assertions.contains(&upper) && !assertions.contains(&lower),
+                "{facts:?} alone bounds nothing: int2bv_8 is onto for x <= 5 and for x >= 250"
+            );
+        }
+
+        let (mut terms, var, assertions) = residue_range_assertions(&[(">=", -3), ("<=", 5)]);
+        let five = bv8(&mut terms, 5);
+        let upper = terms.mk_bvule(var, five);
+        assert!(!assertions.contains(&upper), "x = -1 gives #xff");
+        let two_fifty_three = bv8(&mut terms, 253);
+        let high_piece = terms.mk_bvuge(var, two_fifty_three);
+        let low_piece = terms.mk_bvule(var, five);
+        let wrapped = terms.mk_or(vec![high_piece, low_piece]);
+        assert!(
+            assertions.contains(&wrapped),
+            "[-3, 5] wraps once: the residue is in [253, 255] or [0, 5]"
+        );
+
+        let (mut terms, var, assertions) = residue_range_assertions(&[(">=", 2), ("<=", 5)]);
+        let two = bv8(&mut terms, 2);
+        let five = bv8(&mut terms, 5);
+        let lower = terms.mk_bvuge(var, two);
+        let upper = terms.mk_bvule(var, five);
+        assert!(
+            assertions.contains(&lower) && assertions.contains(&upper),
+            "[2, 5] lies in one period: the residue is exactly [2, 5]"
+        );
+    }
+
+    /// End to end on the prover that published the wrong refutation:
+    /// `x <= 5 /\ bv2nat(int2bv_8 x) > 5` is satisfiable (`x = -1`), so no
+    /// upper bound on `bv2nat(int2bv_8 x)` below 255 may be "proven".
+    #[test]
+    fn bitblast_probe_proves_no_residue_bound_from_a_one_sided_int_bound() {
+        let mut exec = Executor::new();
+        let x = exec.ctx.terms.mk_var("x", Sort::Int);
+        let five = exec.ctx.terms.mk_int(BigInt::from(5));
+        let at_most_five = exec.ctx.terms.mk_le(x, five);
+        let residue = exec.ctx.terms.mk_int2bv(8, x);
+        let nat = exec.ctx.terms.mk_bv2nat(residue);
+        let above_five = exec.ctx.terms.mk_gt(nat, five);
+        let proven = exec
+            .collect_bitblast_proven_bv_lia_bounds(&[at_most_five, above_five])
+            .expect("the probe runs");
+        assert!(
+            proven.is_empty(),
+            "bv2nat(int2bv_8 x) <= 5 does not follow from x <= 5; proven: {proven:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bv_lia_int_eval_tests {
+    //! The enumeration prover publishes `bv2nat(B) = t` as a fact when every
+    //! enumerated value agrees, so its Int evaluator must follow SMT-LIB `div`
+    //! and `mod` exactly, and leave a zero divisor unevaluated.
+    use super::*;
+
+    fn eval(terms: &TermStore, term: TermId) -> Option<BigInt> {
+        Executor::eval_bv_lia_int_term(terms, term, &HashMap::default())
+    }
+
+    #[test]
+    fn div_and_mod_follow_smtlib_euclidean_semantics() {
+        let mut terms = TermStore::new();
+        for (a, b, quotient, remainder) in [
+            (7, 2, 3, 1),
+            (-7, 2, -4, 1),
+            (7, -2, -3, 1),
+            (-7, -2, 4, 1),
+            (-6, 3, -2, 0),
+        ] {
+            let lhs = terms.mk_int(BigInt::from(a));
+            let rhs = terms.mk_int(BigInt::from(b));
+            let div = terms.mk_app(Symbol::named("div"), vec![lhs, rhs], Sort::Int);
+            let modulo = terms.mk_app(Symbol::named("mod"), vec![lhs, rhs], Sort::Int);
+            assert_eq!(
+                eval(&terms, div),
+                Some(BigInt::from(quotient)),
+                "(div {a} {b})"
+            );
+            assert_eq!(
+                eval(&terms, modulo),
+                Some(BigInt::from(remainder)),
+                "(mod {a} {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_divisor_is_not_evaluated() {
+        let mut terms = TermStore::new();
+        let lhs = terms.mk_int(BigInt::from(-7));
+        let zero = terms.mk_int(BigInt::from(0));
+        let div = terms.mk_app(Symbol::named("div"), vec![lhs, zero], Sort::Int);
+        let modulo = terms.mk_app(Symbol::named("mod"), vec![lhs, zero], Sort::Int);
+        assert_eq!(eval(&terms, div), None);
+        assert_eq!(eval(&terms, modulo), None);
     }
 }

@@ -9,7 +9,11 @@ use super::*;
 #[path = "store_permutation/transposition.rs"]
 mod transposition;
 
-use transposition::write_store_transposition;
+use std::fmt::Write as _;
+use transposition::{write_store_transposition, PermutationText};
+
+#[path = "store_permutation/assume_equivalence.rs"]
+mod assume_equivalence;
 
 type PrintedEntry = (String, String);
 type DisequalityMap = HashMap<(String, String), (String, String, String)>;
@@ -61,8 +65,10 @@ impl AlethePrinter<'_> {
             output.push_str(&format!("(assume {id}.a{position} (not {literal}))\n"));
         }
 
-        let segments = write_swap_segments(&mut output, id, &printed, &swaps)?;
-        let chain_step = compose_segments(&mut output, id, &printed, &segments)?;
+        let prefix = id.to_string();
+        let false_fact = format!("{id}.nf");
+        let segments = write_swap_segments(&mut output, &prefix, &false_fact, &printed, &swaps)?;
+        let chain_step = compose_segments(&mut output, &prefix, &printed, &segments)?;
         write_clause_discharge(&mut output, self, id, clause, &printed, &chain_step)?;
         output.pop();
         Some(output)
@@ -153,42 +159,59 @@ fn collect_printed_disequalities(
     Some(disequalities)
 }
 
-fn write_swap_segments(
-    output: &mut String,
-    id: ProofId,
+fn write_swap_segments<W: PermutationText>(
+    output: &mut W,
+    id: &str,
+    false_fact: &str,
     printed: &PrintedPermutation,
     swaps: &[usize],
 ) -> Option<Vec<Segment>> {
+    let clone_bytes = printed.left.iter().try_fold(0usize, |n, (a, b)| {
+        n.checked_add(a.len())?.checked_add(b.len())
+    })?;
+    output.admit_copy(
+        clone_bytes.checked_add(
+            printed
+                .left
+                .len()
+                .checked_mul(std::mem::size_of::<PrintedEntry>())?,
+        )?,
+    )?;
     let mut current = printed.left.clone();
-    let mut segments = Vec::new();
+    output.admit_copy(swaps.len().checked_mul(std::mem::size_of::<Segment>())?)?;
+    let mut segments = Vec::with_capacity(swaps.len());
     for (nth, &at) in swaps.iter().enumerate() {
-        let rest = store_chain_text(&printed.base, &current[at + 2..]);
-        let outer = current[at].clone();
-        let inner = current[at + 1].clone();
+        let rest = admitted_store_chain_text(output, &printed.base, &current[at + 2..])?;
+        let outer = &current[at];
+        let inner = &current[at + 1];
+        output.admit_copy(outer.0.len().checked_add(inner.0.len())?)?;
         let key = unordered_printed_pair(&outer.0, &inner.0);
-        let (premise, diseq_lhs, diseq_rhs) = printed.disequalities.get(&key)?.clone();
-        let tag = format!("{id}.k{nth}");
+        let (premise, diseq_lhs, diseq_rhs) = printed.disequalities.get(&key)?;
+        let tag = output.term(format_args!("{id}.k{nth}"))?;
         let (mut before, mut after) = write_store_transposition(
             output,
             &tag,
             &rest,
-            &outer,
-            &inner,
+            outer,
+            inner,
             &printed.index_sort,
             &premise,
             (&diseq_lhs, &diseq_rhs),
-            id,
+            false_fact,
         )?;
+        output.admit_copy(tag.len())?;
         let mut lifted = tag.clone();
         for depth in (0..at).rev() {
             let (index, value) = &current[depth];
-            let next_before = format!("(store {before} {index} {value})");
-            let next_after = format!("(store {after} {index} {value})");
-            let step = format!("{tag}.l{depth}");
-            output.push_str(&format!(
+            let next_before = output.term(format_args!("(store {before} {index} {value})"))?;
+            let next_after = output.term(format_args!("(store {after} {index} {value})"))?;
+            let step = output.term(format_args!("{tag}.l{depth}"))?;
+            write!(
+                output,
                 "(step {step} (cl (= {next_before} {next_after})) \
                  :rule cong :premises ({lifted}))\n"
-            ));
+            )
+            .ok()?;
             lifted = step;
             before = next_before;
             after = next_after;
@@ -199,22 +222,27 @@ fn write_swap_segments(
     (current == printed.right).then_some(segments)
 }
 
-fn compose_segments(
-    output: &mut String,
-    id: ProofId,
+fn compose_segments<W: PermutationText>(
+    output: &mut W,
+    id: &str,
     printed: &PrintedPermutation,
     segments: &[Segment],
 ) -> Option<String> {
-    let mut chain_step = segments.first()?.0.clone();
-    let mut chain_end = segments[0].2.clone();
+    let first = segments.first()?;
+    output.admit_copy(first.0.len().checked_add(first.2.len())?)?;
+    let mut chain_step = first.0.clone();
+    let mut chain_end = first.2.clone();
     for (nth, (step, _, after)) in segments.iter().enumerate().skip(1) {
-        let composed = format!("{id}.tr{nth}");
-        output.push_str(&format!(
+        let composed = output.term(format_args!("{id}.tr{nth}"))?;
+        write!(
+            output,
             "(step {composed} (cl (= {} {after})) \
              :rule trans :premises ({chain_step} {step}))\n",
             printed.left_text
-        ));
+        )
+        .ok()?;
         chain_step = composed;
+        output.admit_copy(after.len())?;
         chain_end = after.clone();
     }
     (chain_end == printed.right_text && segments[0].1 == printed.left_text).then_some(chain_step)
@@ -328,4 +356,17 @@ fn adjacent_transposition_schedule(
         }
     }
     (current == right).then_some(swaps)
+}
+
+fn admitted_store_chain_text<W: PermutationText>(
+    output: &mut W,
+    base: &str,
+    entries: &[PrintedEntry],
+) -> Option<String> {
+    output.admit_copy(base.len())?;
+    let mut text = base.to_string();
+    for (index, value) in entries.iter().rev() {
+        text = output.term(format_args!("(store {text} {index} {value})"))?;
+    }
+    Some(text)
 }

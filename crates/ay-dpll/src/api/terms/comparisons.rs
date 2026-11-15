@@ -23,7 +23,14 @@ impl Solver {
         let a_id = self.resolve_term("eq", a)?;
         let b_id = self.resolve_term("eq", b)?;
         self.expect_same_sort("eq", a, b)?;
-        let result = self.terms_mut().mk_eq(a_id, b_id);
+        // A datatype-sorted equality folds through constructor injectivity
+        // and distinctness exactly as a surface `=` elaborates (so a native
+        // `(= (succ (succ l)) (succ l))` is the term its retained source
+        // reconstructs); every other equality is interned structurally.
+        let result = self
+            .executor
+            .context_mut_internal()
+            .mk_elaborated_eq(a_id, b_id);
         Ok(self.wrap_term(result))
     }
 

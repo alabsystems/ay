@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+f 5;
+pol 3 1 * 4 1 * + s;
+e +1 x3 >= 1 : 6;
+ia 1 x1 +1 x3 >= 1 : 6;
+e 1 x1 +1 x3 >= 1 : 7;
+% quickfix, we might not keep supporting the r rule
+% p 1 2 3 r
+pol 1;
+e 1 x1 +1 x2 >= 1 : 8;
+pol 8 7 +;
+e +2 x1 +1 x2 +1 x3 >= 2 : 9;
+pol 5 2 * 9 2 * +;
+e >= 2 : 10;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

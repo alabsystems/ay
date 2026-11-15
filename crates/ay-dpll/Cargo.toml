@@ -34,6 +34,7 @@ ay-sat.workspace = true
 ay-euf.workspace = true
 ay-arrays.workspace = true
 ay-lra = { workspace = true, default-features = false }
+ay-cdclt.workspace = true
 ay-lia.workspace = true
 ay-nia.workspace = true
 ay-nra.workspace = true
@@ -65,9 +66,13 @@ ay-jit = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
+# Determinism seams for the counted-search regression and the explicit
+# resource_clock_qualification benchmark; development targets only.
+ay-core = { workspace = true, features = ["determinism-seams"] }
 ay-test-support.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+ay-criterion-main.workspace = true
 ntest = "0.9"
 anyhow = "1.0"
 wait-timeout = "0.2.1"
@@ -78,4 +83,8 @@ rand_chacha.workspace = true
 
 [[bench]]
 name = "incremental_bench"
+harness = false
+
+[[bench]]
+name = "resource_clock_qualification"
 harness = false

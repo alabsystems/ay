@@ -1,0 +1,19 @@
+pseudo-Boolean proof version 3.0
+% The RUP half of the coefficient-tier coverage, and the one the shipped corpus
+% otherwise leaves untested: a propagation whose slack arithmetic runs entirely
+% above i64. `2^64 x1 >= 2^64` propagates x1 (slack without x1 is 0, far below
+% the degree) and the unit `~x1 >= 1` then conflicts, so `rup >= 1` derives the
+% contradiction and the formula really is unsatisfiable.
+%
+% The kernel's NARROW instantiation cannot hold 2^64 and stands down; the bridge
+% replays the same certificate at the unbounded instantiation, where slackTerms
+% and slackWithout are exact. That is the arithmetic the wrapped-watcher-slack
+% wrong verdict (defect 10) lived in at the i128 tier, so this instance exists
+% to keep the wide RUP path from going dead: if it ever stops being replayed,
+% tests/kernel_verify_expected.txt gains a skip and drops the composed verdict.
+% Do not "simplify" the coefficient: the instance is worthless below 2^63.
+f 2;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

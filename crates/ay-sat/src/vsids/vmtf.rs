@@ -187,6 +187,47 @@ impl VSIDS {
         Some(Variable(idx))
     }
 
+    /// Domain-restricted VMTF pick: walk the queue from the front (most
+    /// recently bumped) and return the first unassigned, non-eliminated
+    /// variable inside `in_domain`.
+    ///
+    /// Read-only (no cursor update): the relevancy-frontier caller runs this
+    /// per decision while the queue is live, and the expected walk is short
+    /// (frontier density over the queue). The caller must not use this while
+    /// `vmtf_is_deferred()` — the linked list is stale then (stable-mode
+    /// bumps only refreshed `bump_order`); it falls back to a members scan.
+    /// Queue order is bump recency, including rephase shuffles and burials —
+    /// the same order the unrestricted VMTF pick follows.
+    pub(crate) fn pick_vmtf_in_domain(
+        &self,
+        vals: &[i8],
+        var_states: &[crate::solver::lifecycle::VarState],
+        in_domain: &[bool],
+    ) -> Option<Variable> {
+        let has_eliminated = !var_states.is_empty();
+        let mut idx = self.vmtf_last;
+        // The queue holds each variable at most once; the bound only guards
+        // against a corrupted cycle turning into an infinite walk.
+        let mut steps = self.vmtf_prev.len() + 1;
+        while idx != INVALID_VAR {
+            if steps == 0 {
+                debug_assert!(false, "BUG: VMTF queue walk exceeded queue length");
+                return None;
+            }
+            steps -= 1;
+            let i = idx as usize;
+            if i < in_domain.len()
+                && in_domain[i]
+                && vals[i * 2] == 0
+                && !(has_eliminated && i < var_states.len() && var_states[i].is_removed())
+            {
+                return Some(Variable(idx));
+            }
+            idx = self.vmtf_prev[i];
+        }
+        None
+    }
+
     /// Fisher-Yates shuffle of VMTF queue for focused-mode rephasing.
     pub(crate) fn shuffle_queue(&mut self, rephase_count: u64) {
         let mut vars: Vec<u32> = Vec::new();
@@ -373,5 +414,84 @@ impl VSIDS {
         self.vmtf_next[idx as usize] = first;
         self.vmtf_prev[first as usize] = idx;
         self.vmtf_first = idx;
+    }
+}
+
+impl VSIDS {
+    /// Rebuild the VMTF linked list from bump_order values.
+    ///
+    /// Called before arena compaction or when switching from stable to focused
+    /// mode, to restore VMTF list consistency after deferred stable-mode bumps.
+    /// Cost: O(n log n) for the sort, but runs infrequently.
+    pub(crate) fn rebuild_vmtf_from_bump_order(&mut self, vals: &[i8]) {
+        if !self.vmtf_deferred {
+            return;
+        }
+        let n = self.activities.len();
+        if n == 0 {
+            self.vmtf_deferred = false;
+            return;
+        }
+
+        // Sort variables by ascending bump_order (oldest first -> newest last).
+        let mut vars_by_order: Vec<u32> = (0..n as u32).collect();
+        vars_by_order.sort_unstable_by_key(|&v| self.bump_order[v as usize]);
+
+        // Rebuild doubly-linked list.
+        self.vmtf_first = INVALID_VAR;
+        self.vmtf_last = INVALID_VAR;
+        self.vmtf_prev.fill(INVALID_VAR);
+        self.vmtf_next.fill(INVALID_VAR);
+
+        for (i, &var) in vars_by_order.iter().enumerate() {
+            if i == 0 {
+                self.vmtf_first = var;
+                self.vmtf_prev[var as usize] = INVALID_VAR;
+            } else {
+                let prev = vars_by_order[i - 1];
+                self.vmtf_prev[var as usize] = prev;
+                self.vmtf_next[prev as usize] = var;
+            }
+            self.vmtf_next[var as usize] = INVALID_VAR;
+        }
+        if let Some(&last) = vars_by_order.last() {
+            self.vmtf_last = last;
+        }
+
+        // Reset unassigned cursor to the most recently bumped unassigned variable.
+        self.vmtf_unassigned = INVALID_VAR;
+        self.vmtf_unassigned_bumped = 0;
+        // Walk from newest (vmtf_last) to oldest to find highest-bumped unassigned.
+        let mut cur = self.vmtf_last;
+        while cur != INVALID_VAR {
+            if vals[cur as usize * 2] == 0 && !self.buried[cur as usize] {
+                self.vmtf_unassigned = cur;
+                self.vmtf_unassigned_bumped = self.bump_order[cur as usize];
+                break;
+            }
+            cur = self.vmtf_prev[cur as usize];
+        }
+
+        self.vmtf_deferred = false;
+
+        #[cfg(debug_assertions)]
+        self.debug_assert_vmtf_consistent();
+    }
+
+    /// `--sat-queue-freeze-kissat`: whether stable bumps leave the queue alone.
+    pub(crate) fn queue_frozen_in_stable(&self) -> bool {
+        self.queue_freeze
+    }
+
+    /// Kissat `kissat_reset_search_of_queue` (queue.c:13-20), run on entry to
+    /// focused mode under `--sat-queue-freeze-kissat`: the queue is the one
+    /// the last focused phase left, and the search restarts from its end.
+    pub(crate) fn reset_vmtf_search_to_last(&mut self) {
+        self.vmtf_unassigned = self.vmtf_last;
+        self.vmtf_unassigned_bumped = if self.vmtf_last == INVALID_VAR {
+            0
+        } else {
+            self.bump_order[self.vmtf_last as usize]
+        };
     }
 }

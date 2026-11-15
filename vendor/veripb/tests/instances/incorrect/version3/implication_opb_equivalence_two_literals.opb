@@ -1,0 +1,4 @@
+* #variable= 3 #constraint= 2
+* An equivalence reifies a single literal, since the reverse direction of a conjunction is one
+* constraint per literal.
+z1 z2 <==> 1 x1 >= 1 ;

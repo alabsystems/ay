@@ -1,0 +1,4 @@
+c Byte-identical literal text to split.wcnf's two hard clauses, in plain DIMACS CNF.
+p cnf 1 2
+1 0
+-01 0

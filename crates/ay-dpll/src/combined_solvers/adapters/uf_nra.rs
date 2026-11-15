@@ -9,13 +9,13 @@ use ay_nra::NraSolver;
 
 use crate::combined_solvers::check_loops::{
     assert_fixpoint_convergence, debug_nelson_oppen, defer_non_local_result,
-    discover_model_equality, forward_non_sat, propagate_all_to, propagate_equalities_to,
-    triage_lra_result_deferred,
+    discover_model_equality, forward_non_sat, propagate_all_to_dedup, triage_lra_result_deferred,
+    ForwardedPairs,
 };
 use crate::combined_solvers::interface_bridge::{
     evaluate_real_arith_term_with_reasons, lra_get_real_value_with_reasons, InterfaceBridge,
 };
-use crate::combined_solvers::models::euf_with_int_values;
+use crate::combined_solvers::models::{euf_with_int_values, merge_lra_values};
 use crate::term_helpers::{involves_real_arithmetic, is_uf_real_equality};
 
 /// Combined EUF + NRA theory solver
@@ -59,9 +59,35 @@ impl<'a> UfNraSolver<'a> {
         }
     }
 
-    /// Extract both EUF and NRA (LRA-compatible) models for model generation
-    pub(crate) fn extract_models(&mut self) -> (EufModel, LraModel) {
-        (euf_with_int_values(&mut self.euf), self.nra.extract_model())
+    /// Extract both EUF and NRA (LRA-compatible) models for model generation.
+    ///
+    /// The EUF model is scoped to `model_roots`, the window this solve decided
+    /// — see `UfNiaSolver::extract_models` (#ufnia-model-scope): an unscoped
+    /// EUF model also tables the orphan applications an incremental session
+    /// leaves in the `TermStore`, which the Nelson-Oppen loop never related to
+    /// the arithmetic values of their arguments.
+    pub(crate) fn extract_models(&mut self, model_roots: &[TermId]) -> (EufModel, LraModel) {
+        self.euf.scope_model_to_roots(model_roots);
+        let mut euf_model = euf_with_int_values(&mut self.euf);
+        let lra_model = self.nra.extract_model();
+        // The arith side is authoritative for Real-sorted terms (mirror
+        // UfNiaSolver's merge_lia_values).
+        merge_lra_values(&mut euf_model, &lra_model, self.terms);
+        // Real terms the arith side never registered — e.g. `(g a a)`
+        // occurring only inside a Bool predicate `(m (g a a))` — have no
+        // committed value in either model (EUF fabricates Int/BV lanes
+        // but no Real lane), so the independent model gate could not
+        // confirm and the lane answered `unknown` on trivially
+        // satisfiable QF_UFNRA goals. Complete them class-consistently
+        // from EUF, seeded by the merged arith values so a class with an
+        // arith-committed member inherits that member's value; entries
+        // already present are never overwritten.
+        let real_values = self.euf.extract_real_term_values(&euf_model.term_values);
+        self.euf.clear_model_scope();
+        for (term, value) in real_values {
+            euf_model.term_values.entry(term).or_insert(value);
+        }
+        (euf_model, lra_model)
     }
 
     pub(crate) fn replay_learned_cuts(&mut self) {
@@ -147,6 +173,12 @@ impl TheorySolver for UfNraSolver<'_> {
         let max_iters = crate::theory_debug_flags::max_fixpoint_rounds()
             .unwrap_or(MAX_ITERATIONS)
             .min(MAX_ITERATIONS);
+        // Pairs already forwarded this check, per direction: the NRA's
+        // tentative-patch pops restore LRA's exported-pair set, so
+        // without dedup the same pairs recount as new every iteration
+        // and the fixpoint starves (see ForwardedPairs).
+        let mut fwd_nra_to_euf = ForwardedPairs::default();
+        let mut fwd_euf_to_nra = ForwardedPairs::default();
         // #8469: Configure EUF with shared arith terms for unified diseq propagation.
         self.euf
             .set_shared_arith_terms(self.interface.sorted_arith_terms());
@@ -158,15 +190,16 @@ impl TheorySolver for UfNraSolver<'_> {
             if let Some(early) = nra_early {
                 return early;
             }
-            let nra_eq_count = match propagate_equalities_to(
+            let nra_eq_count = match propagate_all_to_dedup(
                 &mut self.nra,
                 &mut self.euf,
+                &mut fwd_nra_to_euf,
                 debug,
                 "UFNRA-NRA",
                 iteration,
             ) {
-                Ok(n) => n,
-                Err(conflict) => return conflict,
+                Ok(counts) => counts.equalities,
+                Err(conflict) => return *conflict,
             };
             let (interface_eq_count, bridge_speculative) = self.propagate_interface_bridge(debug);
             let has_new_equalities = nra_eq_count > 0 || interface_eq_count > 0;
@@ -174,12 +207,17 @@ impl TheorySolver for UfNraSolver<'_> {
                 return result;
             }
             // #8469: Unified equality + disequality propagation from EUF to NRA.
-            let euf_counts =
-                match propagate_all_to(&mut self.euf, &mut self.nra, debug, "UFNRA-EUF", iteration)
-                {
-                    Ok(c) => c,
-                    Err(conflict) => return conflict,
-                };
+            let euf_counts = match propagate_all_to_dedup(
+                &mut self.euf,
+                &mut self.nra,
+                &mut fwd_euf_to_nra,
+                debug,
+                "UFNRA-EUF",
+                iteration,
+            ) {
+                Ok(c) => c,
+                Err(conflict) => return *conflict,
+            };
 
             if !has_new_equalities && euf_counts.equalities == 0 && euf_counts.disequalities == 0 {
                 // Model equality discovery for non-convex theory combination (#4906).
@@ -352,12 +390,32 @@ impl TheorySolver for UfNraSolver<'_> {
         true
     }
 
+    fn collect_statistics(&self) -> Vec<(&'static str, u64)> {
+        // Forward both sub-solvers' per-theory statistics, mirroring
+        // `TheoryCombiner::collect_statistics`. Without this the NRA
+        // counters (`nra_icp_*`, `nra_checks`, inner `lra_*`) never
+        // reach the statistics channel on the QF_UFNRA route, which is
+        // how the sqrtStep cost attribution first went wrong.
+        let mut stats = TheorySolver::collect_statistics(&self.euf);
+        stats.extend(TheorySolver::collect_statistics(&self.nra));
+        stats
+    }
+
     fn supports_theory_aware_branching(&self) -> bool {
         self.nra.supports_theory_aware_branching()
     }
 
     fn suggest_phase(&self, atom: TermId) -> Option<bool> {
         self.nra.suggest_phase(atom)
+    }
+
+    fn phase_hint_epoch(&self) -> Option<u64> {
+        // `suggest_phase` above is a pure delegate, so the nonlinear solver's
+        // epoch (size-gated there, value-exact by `LraSolver::phase_state_epoch`)
+        // covers every suggestion this adapter emits (#nonlinear-phase-hints).
+        // Without this forwarding the SAT seeder's epoch skip was dead on the
+        // UF+NRA lane.
+        self.nra.phase_hint_epoch()
     }
 
     fn sort_atom_index(&mut self) {

@@ -1786,7 +1786,10 @@ fn test_mixed_int_real_disjoint_split() {
 /// session poison" divergence (z3 answers sat here).
 #[test]
 fn test_reset_clears_error_poison() {
+    // Reset starts a new session, including options. Request the model in that
+    // new session rather than relying on the helper's pre-reset request.
     let input = "(assert (> nonexistent_symbol 0))\n(check-sat)\n(reset)\n\
+                 (set-option :produce-models true)\n\
                  (declare-const a Int)\n(assert (= a 5))\n(check-sat)\n(get-value (a))\n";
     let out = run_ay_stdin(input);
     let results = check_sat_results(&out);

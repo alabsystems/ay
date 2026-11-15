@@ -1260,5 +1260,6 @@ fn test_negated_exists_diagonal_still_refutes() {
     );
 }
 
+mod diagonal_scope;
 mod negated_exists_sat;
 include!("unknown_and_misc/no_mbqi_rewrite_transfer.rs");

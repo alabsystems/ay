@@ -64,3 +64,4 @@ git clone --depth 1 https://github.com/ufmg-smite/carcara
 | `chc-solvers/` | Dockerfile for LoAT + UltimateTreeAutomizer |
 | `loat-chc-comp-2025/` | Reference-only LoAT CHC-COMP 2025 portfolio wrapper |
 | `isafol/` | Optional local Isabelle/AFP checkout; expected to stay untracked/ignored in normal repo work |
+| `${XDG_CACHE_HOME:-~/.cache}/ay-z3/<archive sha256>/` | The reference z3 binary (the differential gate's oracle): the upstream release asset pinned in `ci/z3.pin`, provisioned read-only by `python3 scripts/_z3_reference.py --provision`, outside `reference/`. A hand-unpacked `reference/z3/<ver>/` is used only through `--z3`, and admitted only when its bytes are a pin row; `reference/z3/5.0.0/` is not |

@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+red -1 x0_0 -1 x1_0 -1 x2_0 -1 x3_0 -1 x4_0 -1 x5_0 -1 x6_0 -1 x7_0 -1 x8_0 -1 x9_0 >= -1 ; 
+output NONE ;
+conclusion NONE ;
+end pseudo-Boolean proof ;

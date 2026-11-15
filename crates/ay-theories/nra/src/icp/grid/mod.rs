@@ -47,8 +47,10 @@ fn ordered_variables(vars: &[TermId], root: &VarBox) -> Vec<TermId> {
     order.sort_by(|a, b| {
         let width_a = root.get(a).and_then(interval_width);
         let width_b = root.get(b).and_then(interval_width);
-        match (width_a, width_b) {
-            (Some(a), Some(b)) => a.cmp(&b),
+        // Compare through references: moving the widths out of the tuple
+        // leaves a drop that switches on the niche-encoded discriminant.
+        match (width_a.as_ref(), width_b.as_ref()) {
+            (Some(a), Some(b)) => a.cmp(b),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
@@ -70,7 +72,7 @@ impl NraSolver<'_> {
                 break;
             }
             if let Some(probe) = traversal.probe {
-                probe.level_reset(traversal.probe_level_base + level);
+                probe.level_reset(traversal.probe_level_base.saturating_add(level));
             }
             let search = GridSearch {
                 constraints: traversal.constraints,

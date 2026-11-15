@@ -6,67 +6,28 @@
 // Benchmark corpus Alethe external validation
 // ============================================================================
 
-/// Per-benchmark timeout for solving and independent oracle classification.
+/// Per-row wall budget for AY's solve. The independent Z3 oracle has its own
+/// limit, `ORACLE_TIMEOUT_SECS`: it measures a row's status, not AY's speed.
 const PER_BENCHMARK_TIMEOUT_SECS: u64 = 10;
 
-/// Files whose names contain `false_unsat` (plus the historical Hamiltonian
-/// canary) are SAT regression inputs, not UNSAT proof obligations.  They were
-/// previously counted as generic "skips", which blurred the denominator of
-/// the external-proof gate.  Every row is checked against Z3 below.
-const ORACLE_SAT_CORPUS_ROWS: &[&str] = &[
-    "QF_LIA_false_unsat_20var_bb",
-    "QF_LIA_false_unsat_disjunction_6205",
-    "QF_LIA_false_unsat_implication_6206",
-    "QF_LIA_false_unsat_step2_6207",
-    "QF_LIA_mini_hamiltonian_unsat",
-    "regression_false_unsat_cegqi_entailed_inner_forall",
-    "regression_false_unsat_cegqi_entailed_inner_forall_nnf",
-    "regression_false_unsat_cegqi_entailed_inner_forall_or_not",
-    "regression_false_unsat_cegqi_entailed_inner_forall_witness",
-];
-
-/// Independently oracle-confirmed UNSAT rows whose exact proof surfaces are
-/// not yet supported.  These are NOT counted as proof parity.  The gate below
-/// requires AY to return fail-closed `unknown` for every one; SAT, timeout,
-/// execution failure, or an unchecked proof is a hard failure.
-const ORACLE_UNSAT_UNSUPPORTED_ROWS: &[&str] = &[
-    "QF_ABV_csplit_repro_100selects_unsat",
-    "QF_LIA_ring_2exp16_5vars_cascade_unsat",
-    "QF_LIA_ring_2exp16_5vars_cascade_v2_unsat",
-];
-
-/// The six exact semantic-publication regressions that motivated the checked
-/// divisibility wire lowering and authored-surface repair. They are named here
-/// so none can silently slide back into an oracle-backed UNKNOWN bucket.
-const REQUIRED_DIVISIBILITY_PUBLICATION_ROWS: &[&str] = &[
-    "QF_LIA_ring_2exp12_3vars_deep_unsat",
-    "QF_LIA_ring_2exp4_3vars_0ite_unsat",
-    "QF_LIA_ring_2exp8_3vars_crt_unsat",
-    "QF_LIA_ring_2exp8_4vars_carry_unsat",
-    "QF_LIA_ring_2exp8_5vars_modular_unsat",
-    "QF_UFLIA_unsat_congruence_to_lia",
-];
-
-/// Rows discharged by the checked lattice lowering itself. The two remaining
-/// required rows exercise authored-root surface preservation in addition to
-/// this arithmetic wire certificate and stay in the six-row gate above.
-const CHECKED_DIVISIBILITY_WIRE_ROWS: &[&str] = &[
-    "QF_LIA_ring_2exp12_3vars_deep_unsat",
-    "QF_LIA_ring_2exp4_3vars_0ite_unsat",
-    "QF_LIA_ring_2exp8_4vars_carry_unsat",
-    "QF_LIA_ring_2exp8_5vars_modular_unsat",
-];
+// The row-classification lists live in `corpus_rows.rs`.
 
 struct CorpusVerificationSummary {
+    /// Carcara `valid` with no allowance: the only external verification.
     verified: usize,
     verified_labels: Vec<String>,
     rejected_labels: Vec<String>,
     oracle_sat_labels: Vec<String>,
     unsupported_unsat_labels: Vec<String>,
+    export_refused_labels: Vec<String>,
+    /// Carcara `holey` (label, unchecked steps): published, NOT verified.
+    holey_labels: Vec<(String, usize)>,
 }
 
 enum CorpusSolve {
     CertifiedProof(String),
+    /// `unsat`, but `get-proof` answered with an explicit refusal.
+    ExportRefused,
     Sat,
     Unknown,
 }
@@ -128,76 +89,22 @@ fn solve_corpus_with_timeout(content: &str, label: &str) -> CorpusSolve {
 
     let proof = outputs.last().cloned().expect("checked output length");
     assert!(!proof.trim().is_empty(), "{label}: empty proof output");
-    assert!(
-        proof.contains("(assume ") || proof.contains("(step "),
-        "{label}: proof lacks Alethe commands"
-    );
+    if !(proof.contains("(assume ") || proof.contains("(step ")) {
+        // Only the exact refusal form is a classifiable outcome; any other
+        // command-free output is a malformed proof.
+        assert!(
+            ORACLE_UNSAT_EXPORT_REFUSED_ROWS.contains(&label)
+                && proof.contains("(error \"UNVERIFIABLE PROOF:"),
+            "{label}: proof lacks Alethe commands: {}",
+            proof
+                .lines()
+                .find(|line| line.starts_with("(error"))
+                .unwrap_or("")
+        );
+        return CorpusSolve::ExportRefused;
+    }
 
     CorpusSolve::CertifiedProof(proof)
-}
-
-#[cfg(test)]
-fn z3_oracle_status(path: &Path, label: &str) -> String {
-    let z3 = std::env::var_os("Z3_PATH").unwrap_or_else(|| "z3".into());
-    let mut command = std::process::Command::new(z3);
-    command.arg(format!("-T:{PER_BENCHMARK_TIMEOUT_SECS}"));
-    let output = if label == "regression_false_unsat_cegqi_entailed_inner_forall_witness" {
-        // Z3 4.8.12 accepts constant arrays only under its `ALL` parser
-        // profile. Keep AY's exact AUFLIA regression unchanged, but broaden
-        // only the oracle's syntax profile in memory; `set-logic` does not
-        // change the formula asserted below it. Exact-prefix matching makes a
-        // fixture edit fail closed instead of silently transforming new input.
-        let source = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("{label}: read oracle input: {e}"));
-        let body = source
-            .strip_prefix("(set-logic AUFLIA)\n")
-            .unwrap_or_else(|| panic!("{label}: guarded Z3 logic-profile prefix changed"));
-        let oracle_source = format!("(set-logic ALL)\n{body}");
-        let mut child = command
-            .arg("-in")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{label}: Z3 is required to classify non-proof corpus rows independently: {e}"
-                )
-            });
-        std::io::Write::write_all(
-            child.stdin.as_mut().expect("piped Z3 stdin must exist"),
-            oracle_source.as_bytes(),
-        )
-        .unwrap_or_else(|e| panic!("{label}: write guarded oracle input: {e}"));
-        child
-            .wait_with_output()
-            .unwrap_or_else(|e| panic!("{label}: collect Z3 oracle result: {e}"))
-    } else {
-        command.arg(path).output().unwrap_or_else(|e| {
-            panic!("{label}: Z3 is required to classify non-proof corpus rows independently: {e}")
-        })
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "{label}: Z3 oracle failed: status={:?}; stdout={}; stderr={}",
-        output.status.code(),
-        stdout.trim(),
-        stderr.trim(),
-    );
-    let output_lines: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    assert!(
-        matches!(output_lines.as_slice(), [status] if matches!(status.as_str(), "sat" | "unsat" | "unknown")),
-        "{label}: Z3 oracle must emit exactly one terminal status: {output_lines:?}; stderr={}",
-        stderr.trim(),
-    );
-    output_lines[0].clone()
 }
 
 /// Collect all `*unsat*.smt2` files from `benchmarks/smt/` subdirectories.
@@ -249,6 +156,8 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
         rejected_labels: Vec::new(),
         oracle_sat_labels: Vec::new(),
         unsupported_unsat_labels: Vec::new(),
+        export_refused_labels: Vec::new(),
+        holey_labels: Vec::new(),
     };
 
     for path in smt2_files {
@@ -257,13 +166,37 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
 
         match solve_corpus_with_timeout(&content, &label) {
-            CorpusSolve::CertifiedProof(proof)
-                if run_carcara(carcara, &label, &content, &proof) =>
-            {
-                summary.verified += 1;
-                summary.verified_labels.push(label);
+            CorpusSolve::CertifiedProof(proof) => {
+                match carcara_verdict_without_allowances(carcara, &label, &content, &proof) {
+                    CarcaraVerdict::Valid => {
+                        summary.verified += 1;
+                        summary.verified_labels.push(label);
+                    }
+                    // Every step re-derived except disclosed holes: published
+                    // but NOT verified, so the refutation needs Z3's `unsat`.
+                    CarcaraVerdict::Holey => {
+                        let unchecked = unchecked_proof_steps(&proof);
+                        for step in &unchecked {
+                            eprintln!("  HOLEY {label}: {step}");
+                        }
+                        assert_eq!(
+                            z3_oracle_status(path, &label),
+                            "unsat",
+                            "{label}: independent oracle disagrees with a holey UNSAT proof"
+                        );
+                        summary.holey_labels.push((label, unchecked.len()));
+                    }
+                    CarcaraVerdict::Invalid => summary.rejected_labels.push(label),
+                }
             }
-            CorpusSolve::CertifiedProof(_) => summary.rejected_labels.push(label),
+            CorpusSolve::ExportRefused => {
+                assert_eq!(
+                    z3_oracle_status(path, &label),
+                    "unsat",
+                    "{label}: independent oracle disagrees with export-refused UNSAT classification"
+                );
+                summary.export_refused_labels.push(label);
+            }
             CorpusSolve::Sat => {
                 assert!(
                     ORACLE_SAT_CORPUS_ROWS.contains(&label.as_str()),
@@ -300,6 +233,7 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
         }
     }
 
+    report_z3_oracle(&summary);
     summary
 }
 
@@ -308,36 +242,33 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
     let rejected = summary.rejected_labels.len();
     let oracle_sat = summary.oracle_sat_labels.len();
     let unsupported = summary.unsupported_unsat_labels.len();
+    let export_refused = summary.export_refused_labels.len();
     let verified = summary.verified;
+    let holey = summary.holey_labels.len();
 
     eprintln!(
-        "Carcara corpus: {verified} proofs verified, {rejected} rejected, \
-         {unsupported} oracle-UNSAT fail-closed unsupported, {oracle_sat} oracle-SAT non-obligations"
+        "Carcara corpus: {verified} proofs verified (`valid`), {holey} published holey \
+         (NOT verified), {rejected} rejected, {unsupported} oracle-UNSAT fail-closed \
+         unsupported, {export_refused} oracle-UNSAT export-refused, {oracle_sat} oracle-SAT \
+         non-obligations"
     );
     for label in &summary.rejected_labels {
         eprintln!("  REJECTED: {label}");
     }
+    for (label, holes) in &summary.holey_labels {
+        eprintln!("  HOLEY (oracle UNSAT, {holes} unchecked step(s), NOT verified): {label}");
+    }
     for label in &summary.unsupported_unsat_labels {
         eprintln!("  UNSUPPORTED (oracle UNSAT, AY UNKNOWN): {label}");
+    }
+    for label in &summary.export_refused_labels {
+        eprintln!("  EXPORT REFUSED (oracle UNSAT, AY UNSAT, no document): {label}");
     }
     for label in &summary.oracle_sat_labels {
         eprintln!("  NOT A PROOF OBLIGATION (oracle SAT): {label}");
     }
 
-    let actual_certified: BTreeSet<&str> =
-        summary.verified_labels.iter().map(String::as_str).collect();
-    let required_certified: BTreeSet<&str> = REQUIRED_DIVISIBILITY_PUBLICATION_ROWS
-        .iter()
-        .copied()
-        .collect();
-    assert!(
-        required_certified.is_subset(&actual_certified),
-        "required semantic-publication rows were not externally certified: {:?}",
-        required_certified
-            .difference(&actual_certified)
-            .copied()
-            .collect::<Vec<_>>()
-    );
+    assert_published_rows(summary);
     assert_eq!(
         rejected, 0,
         "Carcara must not reject any UNSAT benchmark proof: {:?}",
@@ -364,10 +295,59 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
         actual_unsupported, expected_unsupported,
         "oracle-UNSAT unsupported corpus classification drifted"
     );
+    let actual_export_refused: BTreeSet<&str> = summary
+        .export_refused_labels
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_export_refused: BTreeSet<&str> =
+        ORACLE_UNSAT_EXPORT_REFUSED_ROWS.iter().copied().collect();
     assert_eq!(
-        verified + unsupported + oracle_sat,
+        actual_export_refused, expected_export_refused,
+        "oracle-UNSAT export-refused corpus classification drifted"
+    );
+    assert_eq!(
+        verified + holey + unsupported + export_refused + oracle_sat,
         total,
         "every corpus row must be externally proof-verified or independently oracle-classified"
+    );
+}
+
+/// The published-row checks: the exact holey set (label and unchecked-step
+/// count), and every required publication row verified or exactly holey.
+#[cfg(test)]
+fn assert_published_rows(summary: &CorpusVerificationSummary) {
+    let actual_holey: BTreeSet<(&str, usize)> = summary
+        .holey_labels
+        .iter()
+        .map(|(label, holes)| (label.as_str(), *holes))
+        .collect();
+    let expected_holey: BTreeSet<(&str, usize)> =
+        ORACLE_UNSAT_HOLEY_PROOF_ROWS.iter().copied().collect();
+    assert_eq!(
+        actual_holey, expected_holey,
+        "holey-proof corpus classification drifted (label, unchecked steps): a `valid` row \
+         leaves ORACLE_UNSAT_HOLEY_PROOF_ROWS; a new or changed hole is recorded there with \
+         its measured reason, never counted as verified"
+    );
+    let actual_published: BTreeSet<&str> = summary
+        .verified_labels
+        .iter()
+        .map(String::as_str)
+        .chain(actual_holey.iter().map(|(label, _)| *label))
+        .collect();
+    let required: BTreeSet<&str> = REQUIRED_DIVISIBILITY_PUBLICATION_ROWS
+        .iter()
+        .copied()
+        .collect();
+    assert!(
+        required.is_subset(&actual_published),
+        "required semantic-publication rows were neither Carcara-verified nor exactly listed \
+         holey: {:?}",
+        required
+            .difference(&actual_published)
+            .copied()
+            .collect::<Vec<_>>()
     );
 }
 
@@ -375,12 +355,13 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
 ///
 /// Solves each benchmark with proof generation, validates with Carcara.
 /// Oracle-SAT filename matches are excluded from the proof denominator. Every
-/// oracle-UNSAT row must either have a Carcara-verified proof or return exact
-/// fail-closed UNKNOWN under the explicit unsupported list; there is no generic
-/// skip path. This is the authoritative external publication gate and is
-/// deliberately non-optional: unlike ancillary checker tests, a missing or
-/// misconfigured Carcara executable fails the test instead of silently
-/// returning.
+/// oracle-UNSAT row must either have a Carcara-verified (`valid`, no allowance)
+/// proof, publish exactly its listed `holey` proof (never counted verified),
+/// have exactly its listed export refusal, or return exact fail-closed UNKNOWN
+/// under the explicit unsupported list; there is no generic skip path. This is
+/// the authoritative external publication gate and is deliberately
+/// non-optional: unlike ancillary checker tests, a missing or misconfigured
+/// Carcara executable fails the test instead of silently returning.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]
@@ -398,9 +379,18 @@ fn test_carcara_external_unsat_benchmark_corpus() {
     assert_corpus_expectations(total, &summary);
 }
 
-/// Focused real-checker gate for the four exact corpus rows whose complete
-/// documents are discharged by the checked integer-lattice lowering. This is
-/// intentionally mandatory for the same reason as the canonical corpus gate.
+/// Focused real-checker gate for the four lattice-lowering corpus rows. This
+/// is intentionally mandatory for the same reason as the canonical corpus gate.
+///
+/// CONTRACT CORRECTED 2026-09-23. It claimed all four documents were
+/// completely discharged; that was only ever read through an exit-code runner
+/// that accepted `holey`. Two are Carcara `valid` with no allowance; the other
+/// two carry one multi-equality lattice `hole` each, measured at `b39a5c9c8`
+/// (where this gate was written), `8d9e105fa` and `69efb137d`. Each row is now held to
+/// its exact verdict, which is strictly more than the old gate checked.
+///
+/// 2026-09-26: the all-equality lattice lowering retired both holes, so all
+/// four rows are held to Carcara `valid` (none is listed holey any more).
 #[test]
 #[cfg_attr(debug_assertions, timeout(120_000))]
 #[cfg_attr(not(debug_assertions), timeout(60_000))]
@@ -423,14 +413,40 @@ fn test_carcara_checked_divisibility_wire_rows() {
         .collect();
     assert_eq!(actual, expected, "focused Carcara row set drifted");
 
+    // A focused row is Carcara `valid` unless it is exactly listed holey.
+    let (expected_holey, expected_valid): (BTreeSet<String>, BTreeSet<String>) = expected
+        .iter()
+        .cloned()
+        .partition(|label| listed_holey_row(label).is_some());
     let summary = run_unsat_benchmark_corpus(&carcara, &smt2_files);
-    assert_eq!(summary.verified, expected.len());
-    assert!(summary.rejected_labels.is_empty());
+    assert!(
+        summary.rejected_labels.is_empty(),
+        "{:?}",
+        summary.rejected_labels
+    );
     assert!(summary.unsupported_unsat_labels.is_empty());
     assert!(summary.oracle_sat_labels.is_empty());
+    assert_eq!(summary.verified, expected_valid.len());
     assert_eq!(
         summary.verified_labels.into_iter().collect::<BTreeSet<_>>(),
-        expected
+        expected_valid,
+        "focused rows Carcara verified (`valid`, no allowance)"
+    );
+    for (label, holes) in &summary.holey_labels {
+        assert_eq!(
+            Some(*holes),
+            listed_holey_row(label),
+            "{label}: unchecked steps"
+        );
+    }
+    assert_eq!(
+        summary
+            .holey_labels
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<BTreeSet<_>>(),
+        expected_holey,
+        "focused rows published holey (NOT verified)"
     );
 }
 

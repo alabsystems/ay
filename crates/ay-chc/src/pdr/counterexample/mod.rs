@@ -33,6 +33,10 @@ pub struct Counterexample {
     /// clause list before believing it, so carrying a stale or transform-space
     /// derivation here can only produce a rejection.
     pub(crate) ground_derivation: Option<crate::ground_derivation::GroundDerivation>,
+    /// Complete shared values and retained original owner; attachment is not
+    /// authority. Every accepting consumer replays its original clauses.
+    pub(crate) compact_derivation:
+        Option<std::sync::Arc<crate::ground_derivation::compact::CompactEvidence>>,
 }
 
 impl Counterexample {
@@ -41,6 +45,7 @@ impl Counterexample {
         Self {
             steps,
             witness: None,
+            compact_derivation: None,
             ground_derivation: None,
         }
     }
@@ -50,6 +55,7 @@ impl Counterexample {
         Self {
             steps,
             witness: Some(witness),
+            compact_derivation: None,
             ground_derivation: None,
         }
     }
@@ -73,6 +79,7 @@ impl Counterexample {
         mut self,
         derivation: crate::ground_derivation::GroundDerivation,
     ) -> Self {
+        self.compact_derivation = None;
         self.ground_derivation = Some(derivation);
         self
     }
@@ -84,6 +91,9 @@ impl Counterexample {
     /// 2. The counterexample trace as concrete variable assignments at each step
     /// 3. If a derivation witness is present, the derivation DAG with state formulas
     pub fn to_certificate(&self, problem: &crate::ChcProblem) -> String {
+        if self.compact_evidence().is_some() {
+            return self.compact_certificate();
+        }
         use std::fmt::Write;
 
         let mut out = String::new();
@@ -154,18 +164,20 @@ impl Counterexample {
     /// The emitted SMT-LIB query is expected to be SAT: it conjoins the original
     /// init/transition/query unrolling with the concrete assignments printed in
     /// the unsafe certificate. Unsupported trace shapes return an error so callers
-    /// can keep the evidence path fail-closed.
+    /// can keep the evidence path fail-closed, and so does a trace whose pins
+    /// AY's own ground evaluation already refutes: an expected-SAT obligation
+    /// that is `false` under its own concrete values is never exported. Nor is
+    /// one whose steps contradict the counterexample's own validated ground
+    /// derivation: a different length (a trace that stops short of the query)
+    /// or a pinned value the derivation does not derive (`derivation_trace`).
     pub fn trace_validity_replay_obligations(
         &self,
         problem: &ChcProblem,
     ) -> ChcResult<Vec<ChcReplayObligation>> {
-        let TraceValidity {
-            depth,
-            formula: obligation_formula,
-            env: _,
-        } = self.build_trace_validity(problem)?;
-        let name = format!("trace-validity-depth-{depth}");
-        let smtlib = render_trace_validity_replay_obligation(problem, &name, &obligation_formula)?;
+        let trace = self.build_trace_validity(problem)?;
+        self.refuse_unbacked_trace_validity(problem, &trace)?;
+        let name = format!("trace-validity-depth-{}", trace.depth);
+        let smtlib = render_trace_validity_replay_obligation(problem, &name, &trace.formula)?;
         Ok(vec![ChcReplayObligation {
             name,
             kind: ChcReplayObligationKind::TraceValidity,
@@ -182,7 +194,7 @@ impl Counterexample {
     /// concrete reachable state values — so there is no UNSAT proof to re-check
     /// with carcara/Alethe (carcara is N/A for a sat witness). The sound,
     /// self-contained check is DETERMINISTIC GROUND EVALUATION against the
-    /// problem's own clauses, in two forms, strongest first:
+    /// problem's own clauses, in three forms, strongest first:
     ///
     /// 1. **Ground-derivation validation.** When the counterexample carries a
     ///    fully-concrete [`GroundDerivation`](crate::ground_derivation) of
@@ -196,7 +208,10 @@ impl Counterexample {
     ///    transferred by the derivation merely being attached — a stale or
     ///    transform-space derivation simply fails to validate and we fall
     ///    through.
-    /// 2. **Transition-trace ground evaluation.** Otherwise fall back to the
+    /// 2. **Witness-derived ground derivation.** Otherwise re-shape the
+    ///    [`DerivationWitness`] into a ground derivation and validate it the
+    ///    same way: how a PDR counterexample is confirmed (`witness_ground`).
+    /// 3. **Transition-trace ground evaluation.** Otherwise fall back to the
     ///    single-predicate transition-system path: bind every state variable at
     ///    every step to its concrete trace value and evaluate
     ///    `init(0) ∧ k_transition(depth) ∧ query(depth)` (the very formula the
@@ -210,15 +225,21 @@ impl Counterexample {
     ///   concrete `false` (a corrupted or spurious trace). The caller must NOT
     ///   ship `unsat`.
     /// - `Err(_)`    — the counterexample could not be ground-checked (no
-    ///   validating derivation AND the transition trace could not be fully
-    ///   ground-evaluated: an unpinned auxiliary variable, an unsupported state
-    ///   sort, or a multi-predicate system with no attached derivation). The
+    ///   attached or witness-derived derivation validates AND the transition
+    ///   trace could not be fully ground-evaluated: an unpinned auxiliary
+    ///   variable, an unsupported state sort, or a multi-predicate system). The
     ///   caller fail-closes to `unknown`, the sound direction (BLOCKED-L-style
     ///   completeness hit).
     ///
     /// This mirrors the SAFE-side `--strict-proofs` checked-replay gate: no
     /// external checker (z3/golem/carcara) is ever consulted.
     pub fn ground_checks_unsafe(&self, problem: &ChcProblem) -> ChcResult<bool> {
+        if self.compact_evidence().is_some() {
+            return Ok(crate::compact_datatype_route::acceptance::confirm(
+                problem, self, None, None, None,
+            )
+            .is_some());
+        }
         // Strongest form: a carried ground derivation, RE-VALIDATED here against
         // `problem` (never trusted for being attached). A validating derivation
         // is a complete, decided proof that `false` is derivable — strictly
@@ -232,6 +253,9 @@ impl Counterexample {
             // Attached derivation did not validate against this problem
             // (stale / transform-space); fall through to the trace path rather
             // than reject outright — the trace evaluation is independently sound.
+        }
+        if self.witness_ground_derivation_validates(problem) {
+            return Ok(true);
         }
         self.trace_validity_ground_evaluates(problem)
     }
@@ -337,16 +361,19 @@ impl Counterexample {
             depth,
             formula: ChcExpr::and_all(conjuncts),
             env,
+            ts,
         })
     }
 }
 
 /// The trace-validity obligation formula plus the concrete environment the
-/// trace pins. See [`Counterexample::build_trace_validity`].
+/// trace pins, and the transition system it unrolls. See
+/// [`Counterexample::build_trace_validity`].
 struct TraceValidity {
     depth: usize,
     formula: ChcExpr,
     env: FxHashMap<String, SmtValue>,
+    ts: TransitionSystem,
 }
 
 fn trace_assignment_candidates(
@@ -712,6 +739,11 @@ impl WitnessBuilder {
         }
     }
 }
+
+mod compact;
+mod derivation_trace;
+mod unsplit;
+mod witness_ground;
 
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]

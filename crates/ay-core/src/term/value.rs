@@ -317,6 +317,13 @@ pub enum Constant {
     },
     /// String constant
     String(String),
+    /// Canonical prime-field residue, with its nominal field retained.
+    FiniteField {
+        /// Canonical representative in `0..field.modulus()`.
+        value: u32,
+        /// Checked prime field.
+        field: crate::FiniteFieldSort,
+    },
 }
 
 /// Wrapper for BigRational to implement Eq and Hash

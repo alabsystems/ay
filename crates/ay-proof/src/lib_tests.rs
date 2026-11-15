@@ -17,12 +17,18 @@ mod alethe_printer_int_bound_lattice_tests;
 mod alethe_printer_int_cut_lattice_tests;
 #[path = "alethe_printer_linear_identity_tests.rs"]
 mod alethe_printer_linear_identity_tests;
+#[path = "alethe_printer_printed_rule_gate_tests.rs"]
+mod alethe_printer_printed_rule_gate_tests;
 #[path = "alethe_printer_reordering_tests.rs"]
 mod alethe_printer_reordering_tests;
 #[path = "alethe_printer_resolution_args_tests.rs"]
 mod alethe_printer_resolution_args_tests;
 #[path = "alethe_printer_surface_and_pos_tests.rs"]
 mod alethe_printer_surface_and_pos_tests;
+#[path = "alethe_printer_surface_cong_authored_equality_tests.rs"]
+mod alethe_printer_surface_cong_authored_equality_tests;
+#[path = "alethe_printer_surface_cong_bv_literal_premise_tests.rs"]
+mod alethe_printer_surface_cong_bv_literal_premise_tests;
 #[path = "alethe_printer_surface_symm_tests.rs"]
 mod alethe_printer_surface_symm_tests;
 #[path = "arith_eq_triangle_permutation_tests.rs"]
@@ -360,6 +366,86 @@ fn bv_bitblast_constant_disequality_exports_checked_evaluate() {
     }
 }
 
+/// The JOINT guarded collapse (`executor/proof/bv_identity_promotion/
+/// guarded.rs`) refutes the conjunction of the authored assertions with one
+/// coarse `BvBitBlast` lemma over `(cl (not (and (= t c) (= t d))))`. Two
+/// disagreeing constants are the whole of that refutation, so the clause must
+/// lower to `and_pos` + `eq_transitive` + `evaluate` — never fall through to
+/// the last-resort whole-conjunction bit-blast, whose `@bbterm` table is one
+/// `define-fun` per bit of a fact that is one comparison.
+#[test]
+fn bv_bitblast_shared_endpoint_constant_conflict_exports_checked_evaluate() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{Symbol, TheoryLemmaKind};
+    use num_bigint::BigInt;
+
+    let mut terms = TermStore::new();
+    let bv8 = Sort::bitvec(8);
+    let t = terms.mk_var("t", bv8.clone());
+    let u = terms.mk_var("u", bv8);
+    let five = terms.mk_bitvec(BigInt::from(5), 8);
+    let six = terms.mk_bitvec(BigInt::from(6), 8);
+    let t_is_five = terms.mk_app(Symbol::named("="), [t, five], Sort::Bool);
+    // The REVERSED orientation must work too: carcara's `eq_transitive` chain
+    // builder does not care which side of each equality the shared term is on.
+    let six_is_t = terms.mk_app(Symbol::named("="), [six, t], Sort::Bool);
+    let conflict = terms.mk_app(Symbol::named("and"), [t_is_five, six_is_t], Sort::Bool);
+    let literal = terms.mk_not_raw(conflict);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("bv", vec![literal], TheoryLemmaKind::BvBitBlast);
+    let output = export_alethe(&proof, &terms);
+    for rule in [
+        ":rule and_pos",
+        ":rule eq_transitive",
+        ":rule evaluate",
+        ":rule equiv_pos2",
+    ] {
+        assert!(output.contains(rule), "missing {rule}:\n{output}");
+    }
+    assert!(!output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule bv_bitblast"), "{output}");
+    assert!(
+        !output.contains("@bbterm"),
+        "the named shape must not fall through to the complete blast:\n{output}"
+    );
+
+    // NEGATIVE, both directions of the pair search. Neither conjunction is
+    // contradictory, so no refutation of it exists and the lane must decline;
+    // the honest `hole` is what is left once every other lowering has too.
+    let u_is_six = terms.mk_app(Symbol::named("="), [u, six], Sort::Bool);
+    let near_misses = [
+        // The same term pinned to the SAME constant twice.
+        terms.mk_app(Symbol::named("and"), [t_is_five, t_is_five], Sort::Bool),
+        // Two different terms, each pinned to its own constant.
+        terms.mk_app(Symbol::named("and"), [t_is_five, u_is_six], Sort::Bool),
+    ];
+    for conjunction in near_misses {
+        let literal = terms.mk_not_raw(conjunction);
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![literal], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule hole"), "{output}");
+        assert!(!output.contains(":rule evaluate"), "{output}");
+    }
+
+    // The lowering reads the BYTES the external checker parses. `and_pos`
+    // indexes the printed conjunction, so an override that re-spells the root
+    // must decline rather than emit an index into a different term.
+    let step = ProofStep::TheoryLemma {
+        theory: "bv".to_string(),
+        clause: vec![literal],
+        farkas: None,
+        kind: TheoryLemmaKind::BvBitBlast,
+        lia: None,
+    };
+    let mut overrides = DetHashMap::default();
+    overrides.insert(conflict, "(and p q)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+    let output = printer.format_step(&step, ProofId(0)).unwrap();
+    assert!(!output.contains(":rule evaluate"), "{output}");
+}
+
 #[test]
 fn alethe_reserved_variable_names_are_quoted_in_declarations_and_farkas_rows() {
     use ay_core::{FarkasAnnotation, TheoryLemmaKind};
@@ -387,26 +473,64 @@ fn alethe_reserved_variable_names_are_quoted_in_declarations_and_farkas_rows() {
     assert!(!output.contains(":rule hole"), "{output}");
 }
 
+/// D7 (2026-09-22): a Z3-escaped symbol or a sort outside pinned Carcara's
+/// grammar RENDERS — the document stands on the strict checker's verdict —
+/// and `carcara_proof_surface` discloses the gap, naming the offender, to the
+/// consumers that claim an external check. Before D7 the printer refused
+/// these outright, which withdrew every Seq-carrying artifact from consumers
+/// that never claimed a Carcara check.
 #[test]
-fn carcara_surface_preflight_rejects_unrepresentable_names_and_sorts() {
+fn carcara_surface_discloses_unrepresentable_names_and_sorts_instead_of_refusing() {
     for name in ["a|b", "a\\b"] {
         let mut terms = TermStore::new();
         let atom = terms.mk_var(name, Sort::Bool);
         let proof = Proof::from_steps(vec![ProofStep::Assume(atom)]);
-        assert!(matches!(
-            try_export_alethe(&proof, &terms),
-            Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
-        ));
+        let output = try_export_alethe(&proof, &terms)
+            .unwrap_or_else(|error| panic!("`{name}` must render, got {error}"));
+        assert!(!output.contains("UNVERIFIABLE PROOF"), "{output}");
+        let surface = carcara_proof_surface(&proof, &terms, None);
+        assert!(
+            surface
+                .unsupported_reason()
+                .is_some_and(|reason| reason.contains(&format!("symbol `{name}`"))),
+            "`{name}` must be disclosed as unsupported by pinned Carcara, got {surface}"
+        );
+        assert!(!carcara_proof_surface_is_supported(&proof, &terms, None));
     }
 
+    for (label, sort, expected) in [
+        ("fp", Sort::FloatingPoint(8, 24), "(_ FloatingPoint 8 24)"),
+        ("seq", Sort::Seq(Box::new(Sort::Int)), "(Seq Int)"),
+        ("char", Sort::Char, "Char"),
+    ] {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var(&format!("{label}_surface"), sort);
+        let equality = terms.mk_app(Symbol::named("="), [x, x], Sort::Bool);
+        let proof = Proof::from_steps(vec![ProofStep::Assume(equality)]);
+        let output = try_export_alethe(&proof, &terms)
+            .unwrap_or_else(|error| panic!("{label}: the document must render, got {error}"));
+        assert!(!output.contains("UNVERIFIABLE PROOF"), "{output}");
+        let surface = carcara_proof_surface(&proof, &terms, None);
+        assert!(
+            surface
+                .unsupported_reason()
+                .is_some_and(|reason| reason.contains(&format!("sort {expected} "))),
+            "{label}: the sort must be disclosed as unsupported by pinned Carcara, got {surface}"
+        );
+        assert!(!carcara_proof_surface_is_supported(&proof, &terms, None));
+    }
+
+    // Positive control: the disclosure is a verdict, not a label.
     let mut terms = TermStore::new();
-    let fp = terms.mk_var("fp_surface", Sort::FloatingPoint(8, 24));
-    let equality = terms.mk_app(Symbol::named("="), [fp, fp], Sort::Bool);
+    let x = terms.mk_var("plain_surface", Sort::Int);
+    let equality = terms.mk_app(Symbol::named("="), [x, x], Sort::Bool);
     let proof = Proof::from_steps(vec![ProofStep::Assume(equality)]);
-    assert!(matches!(
-        try_export_alethe(&proof, &terms),
-        Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
-    ));
+    assert_eq!(
+        carcara_proof_surface(&proof, &terms, None),
+        CarcaraSurface::Supported
+    );
+    assert!(carcara_proof_surface_is_supported(&proof, &terms, None));
+    assert_eq!(CarcaraSurface::Supported.to_string(), "supported");
 }
 
 /// `promote_bv_identity_collapse` reconstructs an authored bit-vector identity
@@ -494,6 +618,27 @@ fn bv_bitblast_double_negation_exports_nested_per_operator_bitblast() {
     }
 }
 
+/// Exporter coverage is broader than the native producer's word carrier.
+/// The old 257-bit refusal now has a complete, independently replayable
+/// word-to-bit route; the actual over-limit control remains below.
+#[test]
+fn bv_bitblast_export_accepts_wide_idempotency_within_its_word_bound() {
+    use ay_core::{Symbol, TheoryLemmaKind};
+    for width in [257, 1024] {
+        let mut terms = TermStore::new();
+        let sort = Sort::bitvec(width);
+        let word = terms.mk_var("wide", sort.clone());
+        let gate = terms.mk_app(Symbol::named("bvand"), [word, word], sort);
+        let equality = terms.mk_app(Symbol::named("="), [gate, word], Sort::Bool);
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![equality], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(output.contains(":rule bitblast_and"));
+        assert!(!output.contains(":rule hole"));
+        assert!(!output.contains(":rule trust"));
+    }
+}
+
 /// Both bit-vector lowerings must decline — keeping the honest `hole` — on
 /// every clause AY may carry under the same coarse kind that is NOT an
 /// instance of the Carcara rules they emit.
@@ -512,17 +657,16 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
     let and_aa = terms.mk_app(Symbol::named("bvand"), [a, a], bv8.clone());
     let or_aa = terms.mk_app(Symbol::named("bvor"), [a, a], bv8.clone());
     let and_ab = terms.mk_app(Symbol::named("bvand"), [a, b], bv8.clone());
-    let xor_aa = terms.mk_app(Symbol::named("bvxor"), [a, a], bv8.clone());
     let not_a = terms.mk_app(Symbol::named("bvnot"), [a], bv8.clone());
     let not_not_a = terms.mk_app(Symbol::named("bvnot"), [not_a], bv8.clone());
     let neg_a = terms.mk_app(Symbol::named("bvneg"), [a], bv8.clone());
     let not_neg_a = terms.mk_app(Symbol::named("bvnot"), [neg_a], bv8.clone());
-    let zero = terms.mk_bitvec(BigInt::from(0), 8);
     let add_a_one = terms.mk_app(Symbol::named("bvadd"), [a, one], bv8.clone());
-    // A width the per-bit expansion refuses to unroll.
-    let bv65 = Sort::bitvec(65);
-    let wide = terms.mk_var("wide", bv65.clone());
-    let and_wide = terms.mk_app(Symbol::named("bvand"), [wide, wide], bv65);
+    // A width the per-bit expansion refuses to unroll: past the complete
+    // blast's 1024-bit source-word bound and every narrower lowering's.
+    let unsupported_width = Sort::bitvec(1025);
+    let wide = terms.mk_var("wide", unsupported_width.clone());
+    let and_wide = terms.mk_app(Symbol::named("bvand"), [wide, wide], unsupported_width);
 
     let equal_constants = terms.mk_app(Symbol::named("="), [five, five], Sort::Bool);
     let non_constant = terms.mk_app(Symbol::named("="), [add_a_one, five], Sort::Bool);
@@ -535,9 +679,6 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
         terms.mk_app(Symbol::named("="), [and_ab, a], Sort::Bool),
         // Right side is not the repeated operand.
         terms.mk_app(Symbol::named("="), [or_aa, b], Sort::Bool),
-        // `bvxor` self-cancellation needs `(xor p p) = false`, which no
-        // Carcara rule proves in one step.
-        terms.mk_app(Symbol::named("="), [xor_aa, zero], Sort::Bool),
         // Over the per-bit unrolling cap.
         terms.mk_app(Symbol::named("="), [and_wide, wide], Sort::Bool),
         // A SINGLE `bvnot` is not a double negation.
@@ -556,7 +697,7 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
         assert!(!output.contains(":rule bitblast_"), "{output}");
     }
 
-    // A two-literal clause is not a unit lemma in either lane.
+    // A non-unit clause with unsupported addition still has no whole lowering.
     let idempotency = terms.mk_app(Symbol::named("="), [and_aa, a], Sort::Bool);
     let mut proof = Proof::new();
     proof.add_theory_lemma_with_kind(
@@ -592,6 +733,28 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
         assert!(output.contains(":rule hole"), "{output}");
         assert!(!output.contains(":rule evaluate"), "{output}");
         assert!(!output.contains(":rule bitblast_"), "{output}");
+    }
+}
+
+#[test]
+fn bv_bitblast_width_65_idempotency_is_checked() {
+    let mut terms = TermStore::new();
+    let supported_wide = terms.mk_var("supported_wide", Sort::bitvec(65));
+    let repeated_wide = terms.mk_app(
+        Symbol::named("bvand"),
+        [supported_wide, supported_wide],
+        Sort::bitvec(65),
+    );
+    for literal in [terms.mk_app(
+        Symbol::named("="),
+        [repeated_wide, supported_wide],
+        Sort::Bool,
+    )] {
+        let mut proof = Proof::new();
+        proof.add_theory_lemma_with_kind("bv", vec![literal], TheoryLemmaKind::BvBitBlast);
+        let output = export_alethe(&proof, &terms);
+        assert!(!output.contains(":rule hole"), "{output}");
+        assert!(output.contains(":rule bitblast_"), "{output}");
     }
 }
 
@@ -1865,6 +2028,53 @@ fn test_cong_with_surface_order_reversal_uses_canonical_bridge() {
     );
 }
 
+/// A STRICT authored comparison reverses only through `(not (<= ..))`:
+/// `comp_simplify` rewrites `(> x k)` to `(not (<= x k))`, never to
+/// `(< k x)`, so a single-step bridge is rejected by the external checker.
+#[test]
+fn test_cong_bridge_reverses_a_strict_comparison_through_its_negated_form() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let k = terms.mk_var("k", Sort::Int);
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let lower_x = terms.mk_app(Symbol::named("<"), [k, x], Sort::Bool);
+    let lower_y = terms.mk_app(Symbol::named("<"), [k, y], Sort::Bool);
+    let comparison_eq = terms.mk_app(Symbol::named("="), [lower_x, lower_y], Sort::Bool);
+
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(eq_xy, None);
+    proof.add_rule_step(AletheRule::Cong, vec![comparison_eq], vec![premise], vec![]);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(lower_x, "(> x k)".to_string());
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        Some(&overrides),
+    )
+    .expect("exact strict order reversal has a certified congruence bridge");
+
+    assert!(
+        output.contains(
+            "(step t1.norm.s0 (cl (= (> x k) (not (<= x k)))) :rule comp_simplify)\n\
+             (step t1.norm.s1 (cl (= (not (<= x k)) (< k x))) :rule comp_simplify)\n\
+             (step t1.norm (cl (= (> x k) (< k x))) :rule trans :premises (t1.norm.s0 t1.norm.s1))\n\
+             (step t1.cong (cl (= (< k x) (< k y))) :rule cong :premises (t0))\n\
+             (step t1 (cl (= (> x k) (< k y))) :rule trans :premises (t1.norm t1.cong))"
+        ),
+        "{output}"
+    );
+    assert!(
+        !output.contains("(cl (= (> x k) (< k x))) :rule comp_simplify"),
+        "{output}"
+    );
+}
+
 /// The congruence bridge must not infer an equivalence for a merely similar
 /// override: strict `>` is not the same comparison as canonical `<=`.
 #[test]
@@ -1974,8 +2184,11 @@ fn test_surface_distinct_resolution_mismatch_fails_closed() {
     let equality_assume = proof.add_assume(equality, None);
     proof.add_resolution(Vec::new(), equality, distinct_assume, equality_assume);
 
+    // An operand no checked step reconciles with `x`. `(ite true x w)` was
+    // this example until the Boolean-fold leaf derived it with
+    // `ite_simplify`; the arithmetic identity `(+ x 0)` is no fold.
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
-    overrides.insert(disequality, "(distinct (ite true x w) y)".to_string());
+    overrides.insert(disequality, "(distinct (+ x 0) y)".to_string());
     let error = try_export_alethe_with_problem_scope_and_overrides(
         &proof,
         &terms,
@@ -2217,10 +2430,16 @@ fn test_array_packed_conditional_row1_bridges_decimal_store_value() {
     )
     .expect("packed conditional ROW1 preserves its unit or-term");
 
+    // A positive equality is not a `la_generic` disequality: pinned carcara
+    // refuses `(cl (= 1.5 (/ 3.0 2.0))) :rule la_generic :args (1)` outright
+    // ("is not a valid disequality operation", measured 2026-09-13) and
+    // accepts the same clause under `poly_simp`, the rule for a polynomial
+    // identity between two spellings of one constant.
     assert!(
-        output.contains("(step t0.val (cl (= 1.5 (/ 3.0 2.0))) :rule la_generic :args (1))"),
+        output.contains("(step t0.val (cl (= 1.5 (/ 3.0 2.0))) :rule poly_simp)"),
         "{output}"
     );
+    assert!(!output.contains("la_generic"), "{output}");
     assert!(
         output.contains(
             "(step t0.flat (cl (not (= i 0)) \
@@ -2720,7 +2939,16 @@ fn distinct_symbols_at_distinct_sorts_still_export() {
     let h1 = proof.add_assume(eq_a, None);
     let h2 = proof.add_assume(eq_b, None);
     let h3 = proof.add_assume(eq_again, None);
-    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2, h3], Vec::new());
+    // `(cl (= p q))` rather than the empty clause: three positive unit
+    // premises with distinct atoms do not resolve to `(cl)`, and both pinned
+    // carcara and the printed-text judgement refuse that step. The test is
+    // about DECLARATION collection, which this terminal exercises identically.
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        vec![eq_a],
+        vec![h1, h2, h3],
+        Vec::new(),
+    );
 
     let output = try_export_alethe(&proof, &terms).expect("no name clash — must export");
     assert!(output.contains("(declare-fun p () A)"), "{output}");
@@ -2962,7 +3190,11 @@ fn test_flat_reordered_and_gate_is_reslotted_to_the_printed_index() {
 }
 
 /// The flat re-slot declines on a DUPLICATED printed spelling — ambiguity
-/// must never pick an index — and the step still fails loud downstream.
+/// must never pick an index — and the step then declines to the honest `hole`
+/// over its own clause. Until 2026-09-17 it refused the WHOLE EXPORT; see
+/// `test_or_pos_gate_arity_mismatch_declines_to_a_hole` for the measurement
+/// that changed it. The assertion this test exists for is unchanged: no
+/// `and_pos` naming an index the printed shape does not support ever ships.
 #[test]
 fn test_flat_reslot_declines_on_duplicate_printed_operand() {
     use ay_core::kani_compat::DetHashMap;
@@ -2986,13 +3218,14 @@ fn test_flat_reslot_declines_on_duplicate_printed_operand() {
         premises: vec![],
         args: vec![and_term],
     };
-    let err = printer
+    let printed = printer
         .format_step(&step, ProofId(1))
-        .expect_err("a duplicated printed operand must not be re-slotted");
-    assert!(
-        format!("{err}").contains("and_pos"),
-        "unexpected error: {err}"
+        .expect("the step declines to a hole; the document is still published");
+    assert_eq!(
+        printed,
+        "(step t1 (cl (or (not p) (not q) (not r)) p) :rule hole)"
     );
+    assert!(!printed.contains(":rule and_pos"), "{printed}");
 }
 
 /// D1b: a printed NESTED binary `or` gate over a flattened internal or-term.
@@ -3029,12 +3262,14 @@ fn test_nested_binary_or_gate_is_decomposed_per_printed_node() {
     );
 }
 
-/// FAIL LOUD. When the printed shape holds neither the conjunct nor a
-/// navigable path to it, no `:args (i)` is safe: the step must NOT ship. A
-/// wrong proof is worse than no proof, so the printer raises and the caller's
-/// unverifiable-proof path fires.
+/// DECLINE. When the printed shape holds neither the conjunct nor a navigable
+/// path to it, no `:args (i)` is safe: the step must NOT ship as `and_pos`.
+/// A wrong proof is worse than no proof — and so is no document, so the
+/// printer emits the honest `hole` over this step's own clause rather than
+/// raising and taking the whole export with it (2026-09-17; see
+/// `test_or_pos_gate_arity_mismatch_declines_to_a_hole`).
 #[test]
-fn test_unnavigable_and_pos_gate_fails_loud_instead_of_shipping_a_wrong_index() {
+fn test_unnavigable_and_pos_gate_declines_to_a_hole_instead_of_a_wrong_index() {
     use ay_core::kani_compat::DetHashMap;
     use ay_core::{ProofId, ProofStep};
 
@@ -3058,20 +3293,33 @@ fn test_unnavigable_and_pos_gate_fails_loud_instead_of_shipping_a_wrong_index() 
         premises: vec![],
         args: vec![and_term],
     };
-    let err = printer
+    let printed = printer
         .format_step(&step, ProofId(1))
-        .expect_err("an unnavigable and_pos gate must not ship");
-    assert!(
-        format!("{err}").contains("and_pos"),
-        "unexpected error: {err}"
+        .expect("the step declines to a hole; the document is still published");
+    assert_eq!(
+        printed,
+        "(step t1 (cl (or (not p) (not qq) (not r)) qq) :rule hole)"
     );
+    assert!(!printed.contains(":rule and_pos"), "{printed}");
 }
 
 /// The same guard on the `or_pos` side, which previously had none at all: a
-/// printed gate whose arity cannot reproduce the traced clause tail raises
-/// instead of emitting the arity error carcara reports as `invalid`.
+/// printed gate whose arity cannot reproduce the traced clause tail declines
+/// to the honest `hole` instead of emitting the arity error carcara reports as
+/// `invalid` — and instead of refusing the whole export, which is what this
+/// test asserted until 2026-09-17. MEASURED that day on main `a3772363b3`:
+/// QF_UF `QG-classification/qg5/iso_icl1206` reaches this guard at `t405`
+/// (printed arity 2, clause tail 5) and main emits NO certificate and moves
+/// `unsat` to `unknown` under `--strict-proofs`, where main one day older
+/// (`7c84c9044d`) publishes a 14.8 MB document the pinned checker calls
+/// `holey` with zero refused steps.
+///
+/// THE HOLE IS EARNED, not automatic: every printed disjunct of the gate
+/// (`a`, `b`) is a literal of the clause, so `(cl (not (or a b)) a b c)` is a
+/// tautology over its own printed text and the hole claims nothing false. The
+/// two tests below it are the same guard on clauses where that is NOT true.
 #[test]
-fn test_or_pos_gate_arity_mismatch_fails_loud() {
+fn test_or_pos_gate_arity_mismatch_declines_to_a_certified_hole() {
     use ay_core::kani_compat::DetHashMap;
     use ay_core::{ProofId, ProofStep};
 
@@ -3094,13 +3342,190 @@ fn test_or_pos_gate_arity_mismatch_fails_loud() {
         premises: vec![],
         args: vec![or_term],
     };
+    let printed = printer
+        .format_step(&step, ProofId(1))
+        .expect("the step declines to a hole; the document is still published");
+    assert_eq!(printed, "(step t1 (cl (not (or a b)) a b c) :rule hole)");
+    assert!(!printed.contains(":rule or_pos"), "{printed}");
+}
+
+/// THE FLOOR'S OWN FLOOR, arm 1: a printed gate that still quotes a disjunct
+/// the traced clause has PRUNED.
+///
+/// `(cl (not (or a b c)) a b)` is not a tautology — set `c` true and `a`, `b`
+/// false — so holing it publishes a FALSE claim under a rule the pinned
+/// checker does not look at. MEASURED 2026-09-17 on main `3b89e303c5`: this
+/// fixture emitted exactly that hole, and a hand-built document whose only
+/// unchecked step is that clause refutes a SATISFIABLE problem with pinned
+/// carcara answering `holey`, exit 0. The document is declined instead.
+#[test]
+fn test_or_pos_gate_declines_the_document_when_the_hole_would_be_a_false_clause() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let b = terms.mk_var("b".to_string(), Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(or_term, "(or a b c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, b],
+        premises: vec![],
+        args: vec![or_term],
+    };
     let err = printer
         .format_step(&step, ProofId(1))
-        .expect_err("an or_pos gate whose printed arity is wrong must not ship");
-    assert!(
-        format!("{err}").contains("or_pos"),
-        "unexpected error: {err}"
+        .expect_err("a hole whose printed clause is false must not be published");
+    let message = format!("{err}");
+    assert!(message.contains("or_pos"), "{message}");
+    assert!(message.contains("not a tautology"), "{message}");
+}
+
+/// THE FLOOR'S OWN FLOOR, arm 2: the RESPELLING class, which is the defect
+/// `alethe_printer_printed_rule_gate_tests.rs` exists to refuse for every other
+/// premise-free rule.
+///
+/// A surface override moves the gate's printed source to a term with no
+/// relation to the clause tail. `ite_pos2`, `equiv_pos1/2` and `and_neg` refuse
+/// this shape through `SurfaceTautology::NoMatch`; `or_pos` reaches
+/// `unrepairable_gate_reason` FIRST, so between 2026-09-17's floor and this
+/// commit it alone published `(step t1 (cl (not (= p q)) a b) :rule hole)` —
+/// false whenever `p` and `q` agree and `a`, `b` do not hold.
+#[test]
+fn test_or_pos_gate_respelled_to_an_unrelated_term_declines_the_document() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let b = terms.mk_var("b".to_string(), Sort::Bool);
+    let or_term = terms.mk_or(vec![a, b]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(or_term, "(= p q)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, b],
+        premises: vec![],
+        args: vec![or_term],
+    };
+    let err = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a respelled gate must not be laundered into a hole");
+    let message = format!("{err}");
+    assert!(message.contains("or_pos"), "{message}");
+    assert!(message.contains("not a tautology"), "{message}");
+}
+
+/// ONE TERM, TWO SPELLINGS, IN ONE STEP — and the certified bridge that keeps
+/// the document.
+///
+/// The surface-override ledger maps a TERM to a spelling, and a COMPOSITE entry
+/// carries its own spelling of every subterm. When the entry for the `(or ...)`
+/// gate survives and the entry for one of its operands does not, that operand
+/// prints one way inside the gate and the other way as a clause literal. That
+/// is not a wrong derivation — `=` is symmetric and both spellings denote the
+/// one `TermId` — but the DEFAULT `or_pos` rendering is refused by the pinned
+/// checker, and until this bridge existed the printer either dropped the whole
+/// certificate over it or holed the step (QF_UF `iso_icl1206`, upstream
+/// `c187eb99df`).
+///
+/// The repair states the two orientations equivalent with `eq_symmetric` and
+/// turns that equivalence into the implication the final resolution consumes
+/// with `equiv_pos2`. Both are premise-free tautologies over the PRINTED text,
+/// so nothing is claimed from a term identity the checker cannot see — and the
+/// step is CERTIFIED, not holed, which is strictly more evidence than the
+/// printed-clause floor alone would leave.
+#[test]
+fn test_or_pos_nested_gate_bridges_a_printed_equality_orientation() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let c = terms.mk_var("c".to_string(), Sort::Bool);
+    let x = terms.mk_var("x".to_string(), Sort::Int);
+    let y = terms.mk_var("y".to_string(), Sort::Int);
+    let equality = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let or_term = terms.mk_or(vec![a, equality, c]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // Re-nested gate AND the other orientation of the equality leaf — exactly
+    // what a composite override whose leaf entry was dropped produces.
+    overrides.insert(or_term, "(or (or a (= y x)) c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, equality, c],
+        premises: vec![],
+        args: vec![or_term],
+    };
+    let printed = printer.format_step(&step, ProofId(1)).unwrap();
+    assert_eq!(
+        printed,
+        "(step t1.g0 (cl (not (or (or a (= y x)) c)) (or a (= y x)) c) :rule or_pos)\n\
+         (step t1.g1 (cl (not (or a (= y x))) a (= y x)) :rule or_pos)\n\
+         (step t1.s0 (cl (= (= y x) (= x y))) :rule eq_symmetric)\n\
+         (step t1.s0p (cl (not (= (= y x) (= x y))) (not (= y x)) (= x y)) :rule equiv_pos2)\n\
+         (step t1 (cl (not (or (or a (= y x)) c)) a (= x y) c) \
+          :rule resolution :premises (t1.g0 t1.g1 t1.s0 t1.s0p))"
     );
+    assert!(!printed.contains(":rule hole"), "{printed}");
+}
+
+/// MUTATION DIFFERENTIAL for the bridge above, and the composition's whole
+/// point: a printed leaf that is NOT the other orientation of its traced
+/// literal is a DIFFERENT statement, so the bridge declines AND the printed
+/// clause `(cl (not (or (or a (= y z)) c)) a (= x y) c)` is FALSE — set
+/// `(= y z)` true and `(= x y)`, `a`, `c` false. Neither a relabelled rule nor
+/// a hole may carry it, so the document is declined.
+///
+/// This test asserted a loud refusal, 2026-09-17's floor turned it into a
+/// published hole (measured: it is one of the three false-clause holes that
+/// pass found on main), and the printed-clause certificate restores the refusal
+/// for exactly the clauses that need it.
+#[test]
+fn test_or_pos_nested_gate_declines_when_a_non_flip_leaf_would_publish_a_false_clause() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ProofId, ProofStep};
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a".to_string(), Sort::Bool);
+    let c = terms.mk_var("c".to_string(), Sort::Bool);
+    let x = terms.mk_var("x".to_string(), Sort::Int);
+    let y = terms.mk_var("y".to_string(), Sort::Int);
+    let equality = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let or_term = terms.mk_or(vec![a, equality, c]);
+    let not_or = terms.mk_not_raw(or_term);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    // `(= y z)` is a different statement, not the same one written backwards.
+    overrides.insert(or_term, "(or (or a (= y z)) c)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let step = ProofStep::Step {
+        rule: AletheRule::OrPos(0),
+        clause: vec![not_or, a, equality, c],
+        premises: vec![],
+        args: vec![or_term],
+    };
+    let err = printer
+        .format_step(&step, ProofId(1))
+        .expect_err("a leaf that is not an orientation flip must not be bridged or holed");
+    let message = format!("{err}");
+    assert!(message.contains("or_pos"), "{message}");
+    assert!(message.contains("not a tautology"), "{message}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3628,12 +4053,18 @@ fn an_already_ordered_or_step_is_left_byte_identical() {
 }
 
 /// Fail-closed direction: a clause that is NOT a permutation of the premise's
-/// disjuncts must be rendered exactly as it was, not force-fitted.
+/// disjuncts is never force-fitted.
 ///
 /// Re-slotting here would silently replace a literal, which is a wrong proof
-/// rather than a rejected one.
+/// rather than a rejected one. Until 2026-09-16 the step was instead rendered
+/// exactly as traced — `(cl c a) :rule or` over the premise `(or a b)` — which
+/// the pinned checker refuses ("expected terms to be equal: 'a' and 'c'",
+/// MEASURED), so the document was wrong rather than rejected either way.
+/// `judge_printed_premise_rules` now declines it to the honest hole over its own clause:
+/// the literal is still not replaced, and the claim is withdrawn instead of
+/// shipped.
 #[test]
-fn a_non_permuted_or_clause_is_not_re_slotted() {
+fn a_non_permuted_or_clause_is_declined_to_a_hole() {
     let mut terms = TermStore::new();
     let a = terms.mk_var("a", Sort::Bool);
     let b = terms.mk_var("b", Sort::Bool);
@@ -3649,8 +4080,11 @@ fn a_non_permuted_or_clause_is_not_re_slotted() {
         try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[or_term, c], None)
             .expect("export must succeed");
     assert!(
-        output.contains("(step t1 (cl c a) :rule or :premises (t0))"),
-        "a clause with an unmatched literal must be left alone: {output}"
+        output.contains(&format!(
+            "(step t1 (cl c a) :rule {})",
+            ay_core::UNPROVED_STEP_RULE
+        )),
+        "a clause with an unmatched literal must decline, not re-slot: {output}"
     );
 }
 

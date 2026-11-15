@@ -77,16 +77,24 @@ impl<'a> Lexer<'a> {
         self.input.get(self.pos).copied()
     }
 
+    /// The byte after the current one, if any.
+    fn peek_second(&self) -> Option<u8> {
+        self.input.get(self.pos.checked_add(1)?).copied()
+    }
+
     fn advance(&mut self) -> Option<u8> {
         let ch = self.input.get(self.pos).copied()?;
-        self.pos += 1;
+        // `pos` indexed a byte, so it is below `input.len()` and the successor
+        // cannot overflow; the checked form states that without a panic edge.
+        self.pos = self.pos.checked_add(1)?;
+        // Line and column are diagnostic positions: saturate rather than wrap.
         if ch == b'\n' {
-            self.line += 1;
+            self.line = self.line.saturating_add(1);
             self.col = 1;
         } else if ch & 0b1100_0000 != 0b1000_0000 {
             // Count UTF-8 scalar values, not continuation bytes, so columns
             // remain meaningful after the Unicode allowed in string literals.
-            self.col += 1;
+            self.col = self.col.saturating_add(1);
         }
         Some(ch)
     }
@@ -151,25 +159,10 @@ impl<'a> Lexer<'a> {
                         // Unknown escapes are preserved verbatim. Decode the
                         // complete UTF-8 scalar rather than treating its first
                         // byte as a Latin-1 character.
-                        let char_start = self.pos - 1;
-                        let rest =
-                            std::str::from_utf8(&self.input[char_start..]).map_err(|_| {
-                                ParseError::UnexpectedToken {
-                                    line: self.line,
-                                    col: self.col.saturating_sub(1),
-                                    expected: "valid UTF-8 escaped character".to_string(),
-                                    found: "invalid UTF-8".to_string(),
-                                }
-                            })?;
-                        let ch = rest
-                            .chars()
-                            .next()
-                            .ok_or_else(|| ParseError::UnexpectedEof {
-                                expected: "escaped string character".to_string(),
-                            })?;
-                        for _ in 1..ch.len_utf8() {
-                            self.advance();
-                        }
+                        let ch = self.finish_utf8_scalar(
+                            "escaped string character",
+                            "valid UTF-8 escaped character",
+                        )?;
                         s.push('\\');
                         s.push(ch);
                     }
@@ -184,24 +177,8 @@ impl<'a> Lexer<'a> {
                     // `input` originated as `&str`, so the byte just consumed
                     // starts a valid UTF-8 scalar. Decode the complete scalar
                     // instead of treating each UTF-8 byte as a Latin-1 char.
-                    let char_start = self.pos - 1;
-                    let rest = std::str::from_utf8(&self.input[char_start..]).map_err(|_| {
-                        ParseError::UnexpectedToken {
-                            line: self.line,
-                            col: self.col.saturating_sub(1),
-                            expected: "valid UTF-8 string character".to_string(),
-                            found: "invalid UTF-8".to_string(),
-                        }
-                    })?;
-                    let ch = rest
-                        .chars()
-                        .next()
-                        .ok_or_else(|| ParseError::UnexpectedEof {
-                            expected: "string character".to_string(),
-                        })?;
-                    for _ in 1..ch.len_utf8() {
-                        self.advance();
-                    }
+                    let ch = self
+                        .finish_utf8_scalar("string character", "valid UTF-8 string character")?;
                     s.push(ch);
                 }
                 None => {
@@ -211,6 +188,42 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    /// Decode the whole UTF-8 scalar whose first byte `advance` just consumed
+    /// (it sits at `pos - 1`), consume its remaining bytes, and return it. The
+    /// two texts name what the caller was reading, for the EOF and the
+    /// invalid-UTF-8 errors.
+    fn finish_utf8_scalar(
+        &mut self,
+        eof_expected: &str,
+        utf8_expected: &str,
+    ) -> Result<char, ParseError> {
+        let Some(tail) = self
+            .pos
+            .checked_sub(1)
+            .and_then(|char_start| self.input.get(char_start..))
+        else {
+            return Err(ParseError::UnexpectedEof {
+                expected: eof_expected.to_string(),
+            });
+        };
+        let rest = std::str::from_utf8(tail).map_err(|_| ParseError::UnexpectedToken {
+            line: self.line,
+            col: self.col.saturating_sub(1),
+            expected: utf8_expected.to_string(),
+            found: "invalid UTF-8".to_string(),
+        })?;
+        let ch = rest
+            .chars()
+            .next()
+            .ok_or_else(|| ParseError::UnexpectedEof {
+                expected: eof_expected.to_string(),
+            })?;
+        for _ in 1..ch.len_utf8() {
+            self.advance();
+        }
+        Ok(ch)
     }
 
     fn read_punctuation(&mut self, ch: u8) -> Result<Option<Token>, ParseError> {
@@ -280,7 +293,15 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_ident_or_keyword(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos - 1; // first char already consumed
+        // The caller already consumed the first character, at `pos - 1`.
+        let Some(start) = self.pos.checked_sub(1) else {
+            return Err(ParseError::UnexpectedToken {
+                line: self.line,
+                col: self.col,
+                expected: "identifier".to_string(),
+                found: "no consumed identifier character".to_string(),
+            });
+        };
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == b'_' {
                 self.advance();
@@ -288,13 +309,19 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let word = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
-            ParseError::UnexpectedToken {
+        let Some(word_bytes) = self.input.get(start..self.pos) else {
+            return Err(ParseError::UnexpectedToken {
                 line: self.line,
                 col: self.col,
-                expected: "valid UTF-8 identifier".to_string(),
-                found: "invalid UTF-8".to_string(),
-            }
+                expected: "identifier".to_string(),
+                found: "identifier span outside the input".to_string(),
+            });
+        };
+        let word = std::str::from_utf8(word_bytes).map_err(|_| ParseError::UnexpectedToken {
+            line: self.line,
+            col: self.col,
+            expected: "valid UTF-8 identifier".to_string(),
+            found: "invalid UTF-8".to_string(),
         })?;
         Ok(match word {
             "array" => Token::Array,
@@ -343,7 +370,7 @@ impl<'a> Lexer<'a> {
 
         // Numbers (including negative)
         let is_negative_num =
-            ch == b'-' && self.input.get(self.pos + 1).is_some_and(u8::is_ascii_digit);
+            ch == b'-' && self.peek_second().is_some_and(|next| next.is_ascii_digit());
         if ch.is_ascii_digit() || is_negative_num {
             let tok = self.read_number()?;
             return Ok(self.located(tok, line, col));

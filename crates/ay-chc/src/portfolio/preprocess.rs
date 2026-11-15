@@ -38,11 +38,8 @@ pub(crate) fn sort_contains_recursive_bv(sort: &ChcSort) -> bool {
         ChcSort::Array(key, value) => {
             sort_contains_recursive_bv(key.as_ref()) || sort_contains_recursive_bv(value.as_ref())
         }
-        ChcSort::Datatype { constructors, .. } => constructors.iter().any(|ctor| {
-            ctor.selectors
-                .iter()
-                .any(|sel| sort_contains_recursive_bv(&sel.sort))
-        }),
+        // Decided once per definition at interning, not by walking it.
+        ChcSort::Datatype { constructors, .. } => constructors.contains_bitvec(),
         ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::Uninterpreted(_) => false,
     }
 }
@@ -118,69 +115,6 @@ fn condense_share_env_key() -> String {
     }
 }
 
-/// Cheap pre-filter fingerprint. Deliberately shallow (counts, names,
-/// arities): the authoritative check is `problems_structurally_equal`.
-fn condense_share_fingerprint(problem: &ChcProblem) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    problem.predicates().len().hash(&mut h);
-    for pred in problem.predicates() {
-        pred.name.hash(&mut h);
-        pred.arg_sorts.hash(&mut h);
-    }
-    problem.clauses().len().hash(&mut h);
-    for clause in problem.clauses() {
-        for (pid, args) in &clause.body.predicates {
-            pid.hash(&mut h);
-            args.len().hash(&mut h);
-        }
-        clause.body.constraint.is_some().hash(&mut h);
-        match &clause.head {
-            ClauseHead::Predicate(pid, args) => {
-                1u8.hash(&mut h);
-                pid.hash(&mut h);
-                args.len().hash(&mut h);
-            }
-            ClauseHead::False => 0u8.hash(&mut h),
-            // `ClauseHead` is non_exhaustive: unknown future variants hash
-            // conservatively (still disambiguated by the equality check).
-            #[allow(unreachable_patterns)]
-            _ => 2u8.hash(&mut h),
-        }
-        clause.action_id.hash(&mut h);
-    }
-    problem.is_fixedpoint_format().hash(&mut h);
-    h.finish()
-}
-
-/// Full structural equality between two problems (authoritative cache check).
-/// `ChcExpr::eq` short-circuits on shared `Arc` children, so comparing clones
-/// of one problem never walks constraint trees.
-fn problems_structurally_equal(a: &ChcProblem, b: &ChcProblem) -> bool {
-    a.predicates().len() == b.predicates().len()
-        && a.clauses().len() == b.clauses().len()
-        && a.is_fixedpoint_format() == b.is_fixedpoint_format()
-        && a.has_query_evidence() == b.has_query_evidence()
-        && a.action_names() == b.action_names()
-        && a.datatype_defs() == b.datatype_defs()
-        && a.predicates()
-            .iter()
-            .zip(b.predicates())
-            .all(|(p, q)| p.name == q.name && p.arg_sorts == q.arg_sorts)
-        && a.clauses().iter().zip(b.clauses()).all(|(c, d)| {
-            c.action_id == d.action_id
-                && c.body.predicates == d.body.predicates
-                && c.body.constraint == d.body.constraint
-                && match (&c.head, &d.head) {
-                    (ClauseHead::False, ClauseHead::False) => true,
-                    (ClauseHead::Predicate(pi, pa), ClauseHead::Predicate(qi, qa)) => {
-                        pi == qi && pa == qa
-                    }
-                    _ => false,
-                }
-        })
-}
-
 /// Back-translator wrapper sharing one condense-stage translator across the
 /// preprocessing pipelines of a single solve. All trait methods take `&self`
 /// and the wrapped translators are logically read-only; the mutex only
@@ -243,7 +177,7 @@ fn condense_stage(problem: ChcProblem, verbose: bool) -> TransformationResult {
         return condense_stage_uncached(problem, verbose);
     }
 
-    let fingerprint = condense_share_fingerprint(&problem);
+    let fingerprint = problem.shallow_fingerprint();
     let env_key = condense_share_env_key();
     let cache = CONDENSE_SHARE.get_or_init(|| Mutex::new(Vec::new()));
     {
@@ -253,7 +187,7 @@ fn condense_stage(problem: ChcProblem, verbose: bool) -> TransformationResult {
         if let Some(entry) = entries.iter().find(|e| {
             e.fingerprint == fingerprint
                 && e.env_key == env_key
-                && problems_structurally_equal(&e.original, &problem)
+                && e.original.structurally_equal(&problem)
         }) {
             CONDENSE_SHARE_HITS.fetch_add(1, Ordering::Relaxed);
             if verbose {
@@ -1399,11 +1333,10 @@ mod tests {
     #[test]
     fn test_sort_contains_recursive_bv_inside_dt() {
         use crate::{ChcDtConstructor, ChcDtSelector};
-        use std::sync::Arc;
 
         let dt_sort = ChcSort::Datatype {
             name: "OptionBV8".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 ChcDtConstructor {
                     name: "None".to_string(),
                     selectors: vec![],
@@ -1427,11 +1360,10 @@ mod tests {
     #[test]
     fn test_sort_contains_recursive_bv_pure_int_dt() {
         use crate::{ChcDtConstructor, ChcDtSelector};
-        use std::sync::Arc;
 
         let dt_sort = ChcSort::Datatype {
             name: "Pair".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mk".to_string(),
                 selectors: vec![
                     ChcDtSelector {

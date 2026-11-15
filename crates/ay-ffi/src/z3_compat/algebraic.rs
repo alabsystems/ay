@@ -129,8 +129,7 @@ pub(crate) fn scalar_to_ast(ctx: &mut Z3Context, s: RealScalar) -> Z3_ast {
         Some(RealScalar::Rational(r)) => {
             let term = ctx.solver.rational_const_bigint(r.numer(), r.denom());
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, Sort::Real);
-            ast
+            record_ast_sort(ctx, ast, Sort::Real)
         }
         Some(alg) => {
             let Some(ast) = encode_indexed_ast(ctx, ALGEBRAIC_AST_TAG, ctx.algebraic_values.len())
@@ -907,11 +906,12 @@ pub unsafe extern "C" fn Z3_algebraic_roots(
             let mut from: Vec<Term> = Vec::new();
             let mut to: Vec<Term> = Vec::new();
             for (name, var_term) in &decls {
-                if let Some(idx) = name
-                    .strip_prefix("__db")
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    if idx < n_usize {
+                if let Some(idx) = ay_dpll::api::de_bruijn_index(name) {
+                    // One variable per index and sort: only the one at the
+                    // argument's sort is that parameter.
+                    if idx < n_usize
+                        && ctx.solver.term_sort(*var_term) == ctx.solver.term_sort(arg_terms[idx])
+                    {
                         from.push(*var_term);
                         to.push(arg_terms[idx]);
                     }
@@ -1038,11 +1038,12 @@ pub unsafe extern "C" fn Z3_algebraic_eval(
             let mut from: Vec<Term> = Vec::new();
             let mut to: Vec<Term> = Vec::new();
             for (name, var_term) in &decls {
-                if let Some(idx) = name
-                    .strip_prefix("__db")
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    if idx < n_usize {
+                if let Some(idx) = ay_dpll::api::de_bruijn_index(name) {
+                    // One variable per index and sort: only the one at the
+                    // argument's sort is that parameter.
+                    if idx < n_usize
+                        && ctx.solver.term_sort(*var_term) == ctx.solver.term_sort(arg_terms[idx])
+                    {
                         from.push(*var_term);
                         to.push(arg_terms[idx]);
                     }
@@ -1101,8 +1102,7 @@ pub unsafe extern "C" fn Z3_algebraic_get_poly(c: Z3_context, a: Z3_ast) -> Z3_a
                 .map(|c0| {
                     let term = ctx.solver.int_const_bigint(c0);
                     let ast = term_to_ast(ctx, term);
-                    record_ast_sort(ctx, ast, Sort::Int);
-                    ast
+                    record_ast_sort(ctx, ast, Sort::Int)
                 })
                 .collect();
             cache_ast_vector(ctx, asts)
@@ -1254,8 +1254,7 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
                 .map(|v| {
                     let term = ctx.solver.rational_const_bigint(v.numer(), v.denom());
                     let ast = term_to_ast(ctx, term);
-                    record_ast_sort(ctx, ast, Sort::Real);
-                    ast
+                    record_ast_sort(ctx, ast, Sort::Real)
                 })
                 .collect();
             cache_ast_vector(ctx, asts)

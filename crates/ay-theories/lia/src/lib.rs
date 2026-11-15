@@ -47,7 +47,9 @@ mod branching;
 mod check;
 mod cuts;
 mod dioph;
+mod dioph_bcp;
 mod dioph_bridge;
+mod dioph_cache;
 mod dioph_joint_case_split;
 mod dioph_joint_case_split_support;
 mod dioph_substitution;
@@ -59,22 +61,32 @@ mod gcd_tableau;
 mod hnf;
 pub mod instrument;
 mod intsat_bridge;
+mod justified_bounds;
+mod lattice_refute;
+mod lattice_refute_bridge;
 mod linear_cache;
 mod linear_collect;
+mod lra_view;
 mod modular;
 mod modular_bounds;
 mod nelson_oppen;
 mod parsing;
 mod poly_residual;
+mod sent_equality_closure;
 mod solver_support;
 mod state;
 mod theory_impl;
 mod two_var;
+pub use lra_view::{LraSolverMut, LraSolverView};
+
 mod types;
 
 pub use check::{
-    reset_probe_subset_hint, restore_probe_state, save_probe_state, ProbeStateSnapshot,
+    probe_state_for_tests, reset_probe_subset_hint, restore_probe_state, save_probe_state,
+    ProbeStateSnapshot,
 };
+pub use linear_cache::LiaLinearParseCache;
+use sent_equality_closure::SentEqualityClosure;
 pub(crate) use types::{
     gcd_of_abs, lia_debug_flags, positive_mod, AlgebraicDetectStamp, CutScopeState,
     DirectEnumResult, EnumMatrix, EnumRrefCache, EnumRrefOutcome, IneqOp, LinearCoeffs,
@@ -101,17 +113,41 @@ impl<'a> LiaSolver<'a> {
     /// M-A2 lazy-persistent-combiner: rebind the borrowed term store to a
     /// SUPERSET (append-extended) store (ARRAY-PROCEDURE-CLOSER-BLUEPRINT §5 A2).
     ///
-    /// SOUNDNESS: `terms` is the only `&'a`-bound field; all else is owned and
-    /// `TermId`-keyed. The inner `LraSolver` reads terms through a re-pointable
-    /// raw pointer (`set_terms`), which we also re-point here so it tracks the
-    /// same store. Because the store is append-only, every previously-resolved
+    /// SOUNDNESS: term-store access goes only through the inner LRA pointer.
+    /// The retained lifetime borrow also binds that pointer's backing store;
+    /// rebinding retains the borrow while pointing LRA at the same store. Because the store is append-only, every previously-resolved
     /// `TermId` maps to identical `TermData`/`Sort` in `new_terms`, so every
     /// cache stays valid. Only sound when `new_terms` is a superset of the
     /// store this solver was built on. Debug-only (shadow arm).
     #[cfg(debug_assertions)]
     pub fn rebind_terms(&mut self, new_terms: &'a TermStore) {
-        self.terms = new_terms;
-        self.lra.set_terms(new_terms);
+        self.set_terms(new_terms);
+    }
+
+    /// The term store, read through the inner LRA solver's
+    /// `terms_ptr` bracket (see `LraSolver::terms()` for the
+    /// contract; panics outside a set/unset bracket). Delegating
+    /// keeps this crate free of its own raw-pointer field, so the
+    /// crate-level `forbid(unsafe_code)` stands.
+    #[inline]
+    #[allow(clippy::needless_lifetimes)]
+    pub(crate) fn terms<'t>(&self) -> &'t TermStore {
+        self.lra.terms()
+    }
+
+    /// Point the inner LRA relaxation (and thereby `terms()`) at
+    /// `terms`, opening its read bracket (mirrors
+    /// `LraSolver::set_terms`). The new store must satisfy the solver's
+    /// retained borrow and preserve every cached TermId (same store or superset).
+    pub fn set_terms(&mut self, terms: &'a TermStore) {
+        self.lra.set_terms(terms);
+    }
+
+    /// Close the inner read bracket so the solver may outlive (or
+    /// be moved across) term-store mutation (mirrors
+    /// `LraSolver::unset_terms`).
+    pub fn unset_terms(&mut self) {
+        self.lra.unset_terms();
     }
 
     /// Create a new LIA solver
@@ -120,7 +156,7 @@ impl<'a> LiaSolver<'a> {
         let mut lra = LraSolver::new(terms);
         lra.set_integer_mode(true);
         LiaSolver {
-            terms,
+            terms_borrow: std::marker::PhantomData,
             lra,
             integer_vars: HashSet::default(),
             sorted_integer_vars: Vec::new(),
@@ -133,8 +169,9 @@ impl<'a> LiaSolver<'a> {
             asserted: Vec::new(),
             const_bool_conflicts: Vec::new(),
             in_search_phase: false,
-            dioph_bcp_unproductive_streak: 0,
+            dioph_bcp: dioph_bcp::BcpDiophState::default(),
             scopes: Vec::new(),
+            tentative_scope_marks: Vec::new(),
             cut_scopes: Vec::new(),
             cut_state_scopes: Vec::new(),
             gomory_iterations: 0,
@@ -148,11 +185,14 @@ impl<'a> LiaSolver<'a> {
             learned_cuts: Vec::new(),
             dioph_equality_key: Vec::new(),
             dioph_needs_full_check: false,
+            lattice_budget: (0, 0),
+            lattice_closure: true,
             dioph_needs_revalidation: false,
             dioph_safe_dependent_vars: HashSet::default(),
             dioph_cached_substitutions: Vec::new(),
             dioph_cached_modular_gcds: Vec::new(),
             dioph_cached_reasons: Vec::new(),
+            dioph_cached_fold_reasons: Vec::new(),
             dioph_modified_bounds: false,
             dioph_bound_term_ids: HashSet::default(),
             pending_equalities: Vec::new(),
@@ -175,6 +215,7 @@ impl<'a> LiaSolver<'a> {
             timeout_callback: None,
             deadline: None,
             direct_enum_witness: None,
+            fd_search_stats: types::FdSearchStats::default(),
             enum_rref_cache: None,
             // #6359: Use process-level cached env vars (OnceLock) to avoid
             // syscalls on every DPLL(T) iteration.
@@ -198,6 +239,7 @@ impl<'a> LiaSolver<'a> {
             check_count: 0,
             conflict_count: 0,
             propagation_count: 0,
+            unjustified_conflicts_dropped: 0,
             affine_min_core_attempts: 0,
             affine_min_core_successes: 0,
             // Persistent buffers for augment_farkas (#8599)
@@ -230,7 +272,7 @@ impl<'a> LiaSolver<'a> {
         if !visited.insert(term) {
             return;
         }
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => {
                 // Track integer constants for Nelson-Oppen propagation (#3581).
                 // These allow propagate_equalities to pair derived tight bounds
@@ -239,7 +281,7 @@ impl<'a> LiaSolver<'a> {
             }
             TermData::Var(_, _) => {
                 // Check the sort of this term to see if it's an integer
-                if matches!(self.terms.sort(term), Sort::Int) {
+                if matches!(self.terms().sort(term), Sort::Int) {
                     // The enclosing literal/equality may (re)tighten this
                     // var's LRA bounds — mark for the next bounds scan (#C4).
                     self.mark_int_bound_dirty(term);
@@ -258,7 +300,7 @@ impl<'a> LiaSolver<'a> {
                 // atomic variables, so they must be tracked as integer vars for:
                 // - direct enumeration (must not treat them as 0)
                 // - integrality checks / branch-and-bound
-                if matches!(self.terms.sort(term), Sort::Int) {
+                if matches!(self.terms().sort(term), Sort::Int) {
                     let is_atomic_var = match sym.name() {
                         // Linear arithmetic ops are decomposed into their arguments.
                         "+" | "-" => false,
@@ -269,7 +311,7 @@ impl<'a> LiaSolver<'a> {
                                 .iter()
                                 .filter(|&&arg| {
                                     !matches!(
-                                        self.terms.get(arg),
+                                        self.terms().get(arg),
                                         TermData::Const(Constant::Int(_) | Constant::Rational(_))
                                     )
                                 })
@@ -326,11 +368,30 @@ impl<'a> LiaSolver<'a> {
     ///
     /// Returns None if the last check was not SAT or if integer constraints
     /// are not satisfied.
+    /// Terms whose model value LIA is the authority for when a sibling LRA
+    /// also carries them: every term of a CROSS-THEORY equality LIA was told
+    /// about (`assert_shared_equality`; the equality is a hard constraint the
+    /// LRA relaxation of a sibling solver may never have received, since
+    /// Int-only equalities are routed to LIA alone). See
+    /// `reconcile_lia_lra_values` (#reconcile-lia-authority).
+    ///
+    /// A direct-enumeration witness is NOT authoritative as a whole: it was
+    /// verified against LIA's own literals only, and a mixed atom such as
+    /// `(<= x i)` with a Real `x` is the sibling LRA's. Making every witness
+    /// term authoritative patched LRA's `i = 2` to the witness's `i = 0` under
+    /// `x = 2.0` (QF_LIRA `(<= x i) (< i 3) (>= x 2.0)`, and opt_epsilon's
+    /// m15/adv3 objectives), and the model gate refused `(<= x i)`. The case it
+    /// was added for (`(and (< b a) (= y x) p)`, the Real side's unconstrained
+    /// `a = b = 0` over the witness) is the adopt check's in
+    /// `reconcile_lia_lra_values`: an LRA value that falsifies one of LIA's
+    /// asserted literals (`model_falsifies_asserted`) is not adopted.
+    #[must_use]
+    pub fn model_authoritative_terms(&self) -> HashSet<TermId> {
+        self.shared_equality_terms()
+    }
+
     /// Terms that appear in a CROSS-THEORY equality LIA was told about
-    /// (`assert_shared_equality`). LIA is the authority for these: the
-    /// equality is a hard constraint the LRA relaxation of a sibling solver
-    /// may never have received (Int-only equalities are routed to LIA
-    /// alone). See `reconcile_lia_lra_values` (#reconcile-lia-authority).
+    /// (`assert_shared_equality`); see [`Self::model_authoritative_terms`].
     #[must_use]
     pub fn shared_equality_terms(&self) -> HashSet<TermId> {
         let mut out: HashSet<TermId> = HashSet::default();
@@ -341,14 +402,51 @@ impl<'a> LiaSolver<'a> {
         out
     }
 
+    /// The reason literals of every cross-theory fact this solver holds — the
+    /// EUF shared equalities (rows of the tableau) and disequalities it was
+    /// given, plus every cross-theory reason its LRA holds a bound on — in
+    /// receipt order, deduplicated (#nonlinear-shared-reasons).
+    ///
+    /// The LIA state is the asserted atoms plus these facts (plus definitional
+    /// axioms and the enclosing procedure's own hypotheses). A caller that
+    /// refutes that state as a whole and explains it with its asserted atoms
+    /// must cite these too, or the conflict is not a theorem: the NIA check
+    /// loop returned a z3-satisfiable 17-atom set on QF_UFNIA `euf_div_010`
+    /// because the refutation used `f(a) = f(b)` held here as a row.
+    #[must_use]
+    pub fn shared_constraint_reasons(&self) -> Vec<TheoryLit> {
+        let mut seen: HashSet<TheoryLit> = HashSet::default();
+        let held = self
+            .shared_equalities
+            .iter()
+            .chain(&self.shared_disequalities);
+        let own = held.flat_map(|(_, _, reasons)| reasons.iter().copied());
+        own.chain(self.lra.shared_constraint_reasons())
+            .filter(|lit| !lit.term.is_sentinel() && seen.insert(*lit))
+            .collect()
+    }
+
     /// Extract an integer model for the current satisfiable state, preferring
     /// a direct enumeration witness when one was found.
     pub fn extract_model(&self) -> Option<LiaModel> {
-        let debug = self.debug_lia;
-
         if let Some(model) = &self.direct_enum_witness {
             return Some(model.clone());
         }
+        self.extract_tableau_model()
+    }
+
+    /// Extract an integer model from the CURRENT simplex tableau point,
+    /// ignoring any direct-enumeration witness (#nia-sign-cut-soundness).
+    ///
+    /// The two can differ: a direct-enumeration `Sat` leaves the tableau where
+    /// the simplex left it, and the NIA verifies its monomials against the
+    /// tableau point (`NiaSolver::var_value` reads `lra.get_value`). When that
+    /// verified point is integral it is the model the NIA vouches for, and
+    /// serving the (linear-only) witness instead made the executor's model
+    /// gate reject a genuine `sat`. Returns `None` when some integer variable
+    /// is non-integral at the tableau point.
+    pub fn extract_tableau_model(&self) -> Option<LiaModel> {
+        let debug = self.debug_lia;
 
         let lra_model = self.lra.extract_model();
         let mut values = HashMap::default();
@@ -404,9 +502,12 @@ impl<'a> LiaSolver<'a> {
         Some(LiaModel { values })
     }
 
-    /// Get the underlying LRA solver
-    pub fn lra_solver(&self) -> &LraSolver {
-        &self.lra
+    /// Borrow LRA arithmetic/model queries without exposing its raw pointer API.
+    pub fn lra_solver(&self) -> LraSolverView<'_> {
+        LraSolverView {
+            inner: &self.lra,
+            terms_borrow: std::marker::PhantomData,
+        }
     }
 
     /// Collect bound conflicts from the underlying LRA relaxation.
@@ -417,11 +518,11 @@ impl<'a> LiaSolver<'a> {
     /// Get mutable access to the underlying LRA solver
     ///
     /// Used by NIA to add tangent plane constraints directly.
-    pub fn lra_solver_mut(&mut self) -> &mut LraSolver {
+    pub fn lra_solver_mut(&mut self) -> LraSolverMut<'_, 'a> {
         // External `&mut` access can tighten arbitrary bounds (e.g. NIA
         // tangent planes) — conservatively rescan everything (#C4).
         self.mark_int_bounds_all_dirty();
-        &mut self.lra
+        LraSolverMut { owner: self }
     }
 
     /// Count integer variables that are currently fixed (lower bound == upper bound).
@@ -430,9 +531,13 @@ impl<'a> LiaSolver<'a> {
     /// has fixed new variables, which signals that re-running the Dioph solver
     /// may discover new substitutions (Z3's continue_with_check pattern).
     fn count_fixed_integer_vars(&self) -> usize {
+        // Borrowed bounds: `get_bounds` clones each `Bound` (reason/scale
+        // vectors included), and this scan runs over every integer var on
+        // every check that reaches the Dioph tightening loop -- it was a
+        // top stack on Certora QF_UFDTNIA. Only the bound values are read.
         let mut count = 0;
         for &term_id in &self.integer_vars {
-            if let Some((Some(lb), Some(ub))) = self.lra.get_bounds(term_id) {
+            if let Some((Some(lb), Some(ub))) = self.lra.get_bounds_ref(term_id) {
                 if lb.value == ub.value {
                     count += 1;
                 }
@@ -456,10 +561,21 @@ impl<'a> LiaSolver<'a> {
     /// where pinning a concrete Diophantine witness is provably sound: when the
     /// only arithmetic atom in the system is one equality over exactly the free
     /// variables, no other constraint can rule the witness out.
+    /// Ungated phase-suggestion epoch of the inner LRA solver
+    /// (#combiner-suggest-memo). `TheorySolver::phase_hint_epoch`
+    /// size-gates itself to preserve the historical seeder
+    /// trajectory on small instances; this accessor exposes the raw
+    /// epoch so a consumer can memoize `suggest_phase` VALUES (which
+    /// preserves every seeder write and hence the trajectory) even
+    /// where the write-skipping epoch gate stays closed.
+    pub fn phase_epoch_unchecked(&self) -> u64 {
+        TheorySolver::phase_hint_epoch(&self.lra).unwrap_or(0)
+    }
+
     pub(crate) fn count_arith_atoms(&self) -> usize {
         let mut count = 0;
         for &(literal, _value) in &self.asserted {
-            if let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) {
+            if let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) {
                 if matches!(name.as_str(), "=" | "<=" | ">=" | "<" | ">") && args.len() == 2 {
                     count += 1;
                 }
@@ -478,9 +594,6 @@ impl<'a> LiaSolver<'a> {
         &self.assertion_view().equality_key
     }
 }
-
-#[cfg(kani)]
-mod verification;
 
 #[cfg(test)]
 mod dioph_conflict_tests;

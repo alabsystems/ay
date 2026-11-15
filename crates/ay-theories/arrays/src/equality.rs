@@ -395,10 +395,12 @@ impl ArraySolver<'_> {
             self.affine_cache.varmap_ids.borrow_mut().insert(term, id);
             id
         };
-        match (id, parsed) {
-            (Some(id), Some(form)) => Some((id, form)),
-            _ => None,
-        }
+        // `zip` rather than a match on the `(id, parsed)` tuple: the same
+        // "both present" result, but the match moved `form` out of the tuple
+        // in one arm only, and the drop where the arms rejoin switched on the
+        // partially moved field's niche discriminant with an `unreachable`
+        // arm the verifier refuted.
+        id.zip(parsed)
     }
 
     /// Detect tautological disequalities from affine offset structure:
@@ -470,6 +472,14 @@ impl ArraySolver<'_> {
         #[cfg(debug_assertions)]
         Self::debug_assert_affine_intern(id1, id2, lhs.as_ref(), rhs.as_ref());
         result
+    }
+
+    /// The key `equal_by_affine_form` compares: two terms are affine-equal
+    /// exactly when both have a key and the keys are equal. Lets a caller
+    /// group many terms by affine form instead of comparing them pairwise.
+    pub(crate) fn affine_form_key(&self, term: TermId) -> Option<(u32, BigInt)> {
+        self.affine_canonical(term)
+            .map(|(id, form)| (id, form.1.clone()))
     }
 
     /// Parse `term` into an affine form over OPAQUE Int leaves (#7956
@@ -671,7 +681,13 @@ impl ArraySolver<'_> {
         pos.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0 .0.cmp(&b.0 .0)));
         neg.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0 .0.cmp(&b.0 .0)));
         let mut reasons: Vec<TheoryLit> = Vec::new();
-        let mut used = vec![false; neg.len()];
+        // One match flag per candidate, reserved fallibly: without room for
+        // them no match is claimed.
+        let mut used = Vec::new();
+        used.try_reserve_exact(neg.len()).ok()?;
+        for _ in 0..neg.len() {
+            used.push(false);
+        }
         for (a, coeff_a) in &pos {
             let mut matched = false;
             for (j, (b, coeff_b)) in neg.iter().enumerate() {
@@ -755,28 +771,19 @@ impl ArraySolver<'_> {
     /// `R`-related (over-approximation); the consumers re-check index equality
     /// per candidate pair, so the produced conflicts are byte-identical.
     pub(crate) fn index_conflict_partition(&self, indices: &[TermId]) -> HashMap<TermId, TermId> {
-        fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
-        fn uf_union(parent: &mut [usize], a: usize, b: usize) {
-            let ra = uf_find(parent, a);
-            let rb = uf_find(parent, b);
-            if ra != rb {
-                // Attach to the smaller root for deterministic forests.
-                if ra < rb {
-                    parent[rb] = ra;
-                } else {
-                    parent[ra] = rb;
-                }
-            }
-        }
+        // Path-halving union-find. Lives in `crate::index_forest` so every
+        // index read from the forest is an explicit, stated bounds check.
+        use crate::index_forest::{find as uf_find, is_forest, union as uf_union};
 
+        // One forest slot per input index, `parent[i] = i`. Reserved fallibly
+        // and filled by push rather than collected from `0..n`: a failed
+        // reservation only means the pushes grow the vector as they go.
         let n = indices.len();
-        let mut parent: Vec<usize> = (0..n).collect();
+        let mut parent: Vec<usize> = Vec::new();
+        let _ = parent.try_reserve_exact(n);
+        for i in 0..n {
+            parent.push(i);
+        }
 
         // Grouping (1): equivalence-class representative.
         {
@@ -822,6 +829,9 @@ impl ArraySolver<'_> {
                 }
             }
         }
+
+        // The whole-forest check runs ONCE, after the writes; never per lookup.
+        debug_assert!(is_forest(&parent));
 
         // Materialise `index -> block representative` (min TermId per block).
         let mut root_min: HashMap<usize, TermId> = HashMap::default();

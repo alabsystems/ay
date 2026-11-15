@@ -46,6 +46,39 @@ impl LemmaPool {
         self.lemmas.len()
     }
 
+    /// `seeds` ahead of `rest` (CH4b): the seeds take the highest priority in
+    /// [`Self::to_hint_vec`] (a frame above everything in `rest`), and a
+    /// lemma already in `rest` is not duplicated. `None` when both are absent.
+    pub(crate) fn seeds_then(seeds: Option<LemmaPool>, rest: Option<&LemmaPool>) -> Option<Self> {
+        let top = rest
+            .and_then(|pool| pool.lemmas.iter().map(|l| l.source_frame).max())
+            .unwrap_or(0)
+            .saturating_add(1);
+        match (seeds, rest) {
+            (None, None) => None,
+            (None, Some(rest)) => Some(rest.clone()),
+            (Some(seeds), rest) => {
+                let mut merged = LemmaPool::new();
+                for mut lemma in seeds.lemmas {
+                    lemma.source_frame = top;
+                    merged.lemmas.push(lemma);
+                }
+                if let Some(rest) = rest {
+                    for lemma in &rest.lemmas {
+                        if !merged
+                            .lemmas
+                            .iter()
+                            .any(|l| l.predicate == lemma.predicate && l.formula == lemma.formula)
+                        {
+                            merged.lemmas.push(lemma.clone());
+                        }
+                    }
+                }
+                Some(merged)
+            }
+        }
+    }
+
     /// Convert to `LemmaHint` entries for injection into `PdrConfig::user_hints`.
     ///
     /// Higher-frame lemmas get lower priority values (higher priority) since
@@ -80,6 +113,38 @@ mod tests {
 
     fn pred(id: u32) -> PredicateId {
         PredicateId(id)
+    }
+
+    #[test]
+    fn seeds_then_puts_seeds_first_with_top_priority_and_dedups() {
+        let lemma = |value: i64, frame: usize| SharedLemma {
+            formula: ChcExpr::int(value),
+            predicate: pred(0),
+            source_frame: frame,
+        };
+        let mut rest = LemmaPool::new();
+        rest.lemmas.extend([lemma(1, 4), lemma(2, 1)]);
+        let mut seeds = LemmaPool::new();
+        seeds.lemmas.extend([lemma(9, 0), lemma(2, 0)]);
+        let merged = LemmaPool::seeds_then(Some(seeds), Some(&rest)).expect("merged pool");
+        let values: Vec<_> = merged.lemmas.iter().map(|l| l.formula.clone()).collect();
+        // seeds first; lemma 2 already seeded, so rest contributes only 1.
+        assert_eq!(
+            values,
+            vec![ChcExpr::int(9), ChcExpr::int(2), ChcExpr::int(1)]
+        );
+        let hints = merged.to_hint_vec();
+        assert_eq!(
+            hints[0].priority, 0,
+            "a seed outranks every transferred lemma"
+        );
+        assert_eq!(hints[1].priority, 0);
+        assert!(hints[2].priority > 0);
+        assert!(LemmaPool::seeds_then(None, None).is_none());
+        assert_eq!(
+            LemmaPool::seeds_then(None, Some(&rest)).map(|p| p.len()),
+            Some(2)
+        );
     }
 
     #[test]

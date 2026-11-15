@@ -13,8 +13,7 @@ use super::bv_cache::{
 use super::check_sat::{
     bv_bitblast_count_for_tests, bv_new_clause_count_for_tests, cached_bv_clause_count_for_tests,
     clear_bitblast_max_total_bits_override_for_tests, max_bv_width, reset_reuse_counters_for_tests,
-    set_bitblast_dynamic_abort_override_for_tests, set_bitblast_max_total_bits_override_for_tests,
-    total_bv_bits,
+    set_bitblast_max_total_bits_override_for_tests, total_bv_bits,
 };
 use super::context::{SmtContext, MAX_PERSISTENT_CACHE_ENTRIES};
 use super::types::SmtResult;
@@ -826,36 +825,18 @@ fn test_check_sat_i128_max_witness_stays_int() {
 // BVs, NOT one wide BV) and prove the gate bounds it.
 // ---------------------------------------------------------------------------
 
-/// FAITHFUL oracle for the real grind, updated for the DYNAMIC abort
-/// (model-checker-consumer #46). Builds a query with MANY (2000) DISTINCT 256-bit BV
-/// comparisons over 2000 distinct BV variables — each term far below the
-/// 16_384 per-term width guard (so that guard is INERT, just as in the real
-/// 0-refuse-hit run), but the blast mints entries past the 500k cache cap.
-///
-/// Three arms:
-///   * LEGACY (dynamic abort force-OFF + static budget disabled): the un-gated
-///     blast overflows the PersistentBvCache — peak entries EXCEED the cap and
-///     the cap-clear fires. This is the PROOF the reproduction still matches
-///     the real mechanism (many moderate BVs → cache overflow).
-///   * DYNAMIC (dynamic abort force-ON + static budget disabled): even with
-///     every static budget out of the way, the INTERNAL blast ABORTS the
-///     moment its minted entries reach the cap (no capture, no cap-clear);
-///     `check_sat`'s executor-fallback slice then decides the query on the
-///     ay-dpll lane — which never touches the PersistentBvCache — so the
-///     result may legitimately be a verified Sat, with the cache bounded.
-///   * DEFAULTS: the counted total (~1.02M) is under the high pre-gate
-///     (20x base), so the query is admitted; same contained outcome.
-///     (Static counts cannot distinguish this accumulation from a legitimate
-///     BMC-unrolled CHC of the same counted size; the blast itself can.)
+/// Retention capacity must not refuse a large, otherwise supported query.
+/// The exact boundary is exercised without preprocessing in
+/// `bitblast::transient_cache_tests`; this checks the public SMT entrypoint.
 #[test]
 #[serial]
 fn test_check_sat_many_moderate_bv_accumulation_gated_bitblast_total() {
+    let _scope = super::ScopedNoProgressBreaker::new();
     const N: usize = 2000; // 2000 distinct 256-bit comparisons over 2000 distinct vars
     const W: u32 = 256; // the WIDEST real BV width — no single term trips the width guard
 
     // Defensive: clear any override a prior (panicking) serial test may have left.
     clear_bitblast_max_total_bits_override_for_tests();
-    set_bitblast_dynamic_abort_override_for_tests(0);
 
     let conjuncts: Vec<ChcExpr> = (0..N)
         .map(|i| {
@@ -872,107 +853,21 @@ fn test_check_sat_many_moderate_bv_accumulation_gated_bitblast_total() {
         "reproduction must have NO single wide term; max width = {}",
         max_bv_width(&query),
     );
-    // The counted total exceeds the cache cap (and the base budget), but stays
-    // under the 20x pre-gate — i.e. it lands in exactly the band where static
-    // prediction is ambiguous and the dynamic abort must decide.
+    // The counted total exceeds the retention cap but stays under the
+    // separate static query envelope, which this repair does not change.
     let total_bits = total_bv_bits(&query);
     assert!(
         total_bits > MAX_PERSISTENT_CACHE_ENTRIES as u64,
         "cumulative BV bits {total_bits} must exceed the {MAX_PERSISTENT_CACHE_ENTRIES} cache cap",
     );
 
-    // ---- LEGACY: dynamic abort off + static budget disabled → thrash --------
-    set_bitblast_max_total_bits_override_for_tests(u64::MAX);
-    set_bitblast_dynamic_abort_override_for_tests(2); // force-off
     reset_reuse_counters_for_tests();
     reset_bv_cache_peak_for_tests();
-    let legacy = {
-        let mut ctx = SmtContext::new();
-        ctx.check_sat(&query)
-    };
-    let peak_legacy = bv_cache_peak_entries_for_tests();
-    let cap_clears_legacy = bv_cache_cap_clear_count_for_tests();
-    // Print only the result discriminant — the full Sat model is 2000 vars wide.
-    eprintln!(
-        "[bitblast-total LEGACY ] result_is_sat={} peak_entries={peak_legacy} \
-         cap_clears={cap_clears_legacy} total_bits={total_bits} (cap={MAX_PERSISTENT_CACHE_ENTRIES})",
-        matches!(legacy, SmtResult::Sat(_)),
-    );
-    // PROOF the repro is FAITHFUL: many moderate BVs overflow the cache past its
-    // cap and the cap-clear thrash fires. If this fails, the mechanism is NOT
-    // many-moderate-BV accumulation and the guards would be inert — STOP.
-    assert!(
-        peak_legacy > MAX_PERSISTENT_CACHE_ENTRIES,
-        "LEGACY: peak entries {peak_legacy} must EXCEED the {MAX_PERSISTENT_CACHE_ENTRIES} cap \
-         (the cache-overflow thrash) — many moderate BVs must accumulate past the cap",
-    );
-    assert!(
-        cap_clears_legacy > 0,
-        "LEGACY: cap-clear must fire (cache overflowed and cleared); got {cap_clears_legacy}",
-    );
-
-    // ---- DYNAMIC: abort force-on, static budget still disabled --------------
-    set_bitblast_dynamic_abort_override_for_tests(1); // force-on
-    reset_reuse_counters_for_tests();
-    reset_bv_cache_peak_for_tests();
-    let dynamic = {
-        let mut ctx = SmtContext::new();
-        ctx.check_sat(&query)
-    };
-    let peak_dynamic = bv_cache_peak_entries_for_tests();
-    let cap_clears_dynamic = bv_cache_cap_clear_count_for_tests();
-    eprintln!(
-        "[bitblast-total DYNAMIC] result_is_sat={} peak_entries={peak_dynamic} \
-         cap_clears={cap_clears_dynamic}",
-        matches!(dynamic, SmtResult::Sat(_)),
-    );
-    // The internal blast aborted; the executor-fallback slice may legitimately
-    // DECIDE the query (this one is trivially Sat). What must never happen:
-    // a false Unsat, or the PersistentBvCache thrash.
-    assert!(
-        !matches!(dynamic, SmtResult::Unsat),
-        "DYNAMIC: a satisfiable query must never come back Unsat; got {dynamic:?}",
-    );
-    // An aborted blast never reaches capture: no cap-clear, no captured peak.
-    assert_eq!(
-        cap_clears_dynamic, 0,
-        "DYNAMIC: cap-clear must NOT fire — the internal blast aborts before capture",
-    );
-    assert!(
-        peak_dynamic < MAX_PERSISTENT_CACHE_ENTRIES,
-        "DYNAMIC: captured entries must stay under the cap; peak={peak_dynamic}",
-    );
-
-    // ---- DEFAULTS: pre-gate admits, dynamic abort contains -------------------
-    clear_bitblast_max_total_bits_override_for_tests();
-    set_bitblast_dynamic_abort_override_for_tests(0); // env/default path (on)
-    reset_reuse_counters_for_tests();
-    reset_bv_cache_peak_for_tests();
-    let after = {
-        let mut ctx = SmtContext::new();
-        ctx.check_sat(&query)
-    };
-    let peak_after = bv_cache_peak_entries_for_tests();
-    let cap_clears_after = bv_cache_cap_clear_count_for_tests();
-    eprintln!(
-        "[bitblast-total DEFAULT] result_is_sat={} peak_entries={peak_after} \
-         cap_clears={cap_clears_after}",
-        matches!(after, SmtResult::Sat(_)),
-    );
-    // Same contract as the DYNAMIC arm: the query may be decided on the
-    // executor lane, but a false Unsat and the cache thrash are forbidden.
-    assert!(
-        !matches!(after, SmtResult::Unsat),
-        "DEFAULT: a satisfiable query must never come back Unsat; got {after:?}",
-    );
-    assert_eq!(
-        cap_clears_after, 0,
-        "DEFAULT: cap-clear must NOT fire once the internal blast aborts",
-    );
-    assert!(
-        peak_after < MAX_PERSISTENT_CACHE_ENTRIES,
-        "DEFAULT: cache entries must stay under the cap; peak={peak_after}",
-    );
+    let mut ctx = SmtContext::new();
+    assert!(matches!(ctx.check_sat(&query), SmtResult::Sat(_)));
+    assert_eq!(bv_cache_cap_clear_count_for_tests(), 0);
+    assert!(bv_cache_peak_entries_for_tests() <= MAX_PERSISTENT_CACHE_ENTRIES);
+    assert!(!super::no_progress_breaker_tripped());
 }
 
 /// Regression: a MODERATE number of 256-bit BV comparisons whose cumulative bits
@@ -1208,3 +1103,118 @@ fn test_bv_cache_reuse_keeps_circuit_and_subterm_bits() {
 
 include!("tests_check_sat/pdr_no_progress.rs");
 include!("tests_check_sat/bv_range_facts.rs");
+
+/// Regression (2026-09-23, `LIA_finite_domain_deadline_2026-09-23.md`): a
+/// theory-UNSAT query with Boolean structure livelocked in the DPLL(T) loop.
+/// The #5384 UNSAT replay re-added only the initial CNF, not the Farkas
+/// blocking clauses the loop had learned from LIA, so its fresh solver was
+/// SAT, replaced the main solver, and the same models and lemmas recurred
+/// forever (3 h 40 min observed, ~2 400 cycles per second). The replay now
+/// re-adds every loop-added clause: the query must come back Unsat, quickly,
+/// and without a single recovery.
+///
+/// Shape: `x_i ≠ 1` as `(x_i ≤ 0 ∨ x_i ≥ 2)` gives the SAT layer disjunctions
+/// to decide (and clauses to learn); `x_i ≥ 1` and `Σ x_i = n` force every
+/// `x_i = 1`, so every Boolean assignment is refuted by a LIA conflict and
+/// the UNSAT exists only modulo those lemmas.
+#[test]
+#[serial]
+fn theory_unsat_with_boolean_structure_does_not_livelock_in_unsat_replay() {
+    reset_reuse_counters_for_tests();
+    let n = 5usize;
+    let xs: Vec<ChcVar> = (0..n)
+        .map(|i| ChcVar::new(format!("x{i}"), ChcSort::Int))
+        .collect();
+    let v = |x: &ChcVar| ChcExpr::var(x.clone());
+    let mut conjuncts = Vec::new();
+    for x in &xs {
+        conjuncts.push(ChcExpr::or(
+            ChcExpr::le(v(x), ChcExpr::int(0)),
+            ChcExpr::ge(v(x), ChcExpr::int(2)),
+        ));
+        conjuncts.push(ChcExpr::ge(v(x), ChcExpr::int(1)));
+    }
+    let sum = xs
+        .iter()
+        .skip(1)
+        .fold(v(&xs[0]), |acc, x| ChcExpr::add(acc, v(x)));
+    conjuncts.push(ChcExpr::eq(sum, ChcExpr::int(n as i64)));
+    let expr = ChcExpr::and_all(conjuncts);
+
+    let start = std::time::Instant::now();
+    let result =
+        SmtContext::new().check_sat_with_timeout(&expr, std::time::Duration::from_secs(20));
+    let elapsed = start.elapsed();
+    let (replays, recoveries) = super::check_sat::unsat_replay_counters_for_tests();
+
+    assert!(
+        matches!(
+            result,
+            SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_)
+        ),
+        "expected Unsat, got {result:?} after {elapsed:?} (replays={replays}, recoveries={recoveries})"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "UNSAT took {elapsed:?} (replays={replays}, recoveries={recoveries})"
+    );
+    assert_eq!(
+        recoveries, 0,
+        "the replay re-adds the loop's lemmas, so it confirms the UNSAT instead of discarding it \
+         (replays={replays})"
+    );
+}
+
+/// Regression (2026-09-23, adversarial review of f8a77d505 — SOUNDNESS): the
+/// `violated_constraint` block of the theory loop's `Sat` arm is the negation
+/// of the whole current assignment, added because the loop's model
+/// re-evaluation recomputes `*`/`div`/`mod` from argument values while ay-lia
+/// carries those terms as opaque columns. It is not a lemma: here LIA answers
+/// x = y = 0 with the product column at 7, the re-evaluation says `0 >= 7`
+/// is false, the only Boolean assignment is blocked, and the SAT layer is UNSAT
+/// under its assumptions. Before this fix that UNSAT was returned as such
+/// (no learned clauses → no replay), and with the lemma-replaying f8a77d505 a
+/// replay that re-added the block would have confirmed it. The block is now
+/// kept out of the replay, so the replay is SAT and the loop answers Unknown.
+/// A `Sat` (a lane that reads the opaque column from the theory model, or the
+/// executor fallback) is equally acceptable; `Unsat` never is — the queries are
+/// satisfiable (x = 1, y = 7, any z ∉ {1}).
+#[test]
+#[serial]
+fn opaque_product_model_block_never_confirms_unsat() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let y = ChcVar::new("y", ChcSort::Int);
+    let z = ChcVar::new("z", ChcSort::Int);
+    let v = |x: &ChcVar| ChcExpr::var(x.clone());
+    let base = vec![
+        ChcExpr::ge(ChcExpr::mul(v(&x), v(&y)), ChcExpr::int(7)),
+        ChcExpr::ge(v(&x), ChcExpr::int(0)),
+        ChcExpr::ge(v(&y), ChcExpr::int(0)),
+    ];
+    // Same, plus a disjunction so the SAT layer has decisions to make (and
+    // clauses to learn): the block is then added once per Boolean model.
+    let mut with_structure = base.clone();
+    with_structure.push(ChcExpr::or(
+        ChcExpr::le(v(&z), ChcExpr::int(0)),
+        ChcExpr::ge(v(&z), ChcExpr::int(2)),
+    ));
+    for (what, conjuncts) in [("ground", base), ("with a disjunction", with_structure)] {
+        reset_reuse_counters_for_tests();
+        let expr = ChcExpr::and_all(conjuncts);
+        let result =
+            SmtContext::new().check_sat_with_timeout(&expr, std::time::Duration::from_secs(20));
+        let (replays, recoveries) = super::check_sat::unsat_replay_counters_for_tests();
+        assert!(
+            !matches!(
+                result,
+                SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_)
+            ),
+            "{what}: satisfiable (x = 1, y = 7) but got {result:?} \
+             (replays={replays}, recoveries={recoveries})"
+        );
+        assert_eq!(
+            recoveries, 0,
+            "{what}: a model block must never be laundered into a recovery (replays={replays})"
+        );
+    }
+}

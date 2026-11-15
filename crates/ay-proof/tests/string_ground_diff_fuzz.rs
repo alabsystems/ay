@@ -52,7 +52,7 @@
 
 #![allow(clippy::print_stdout)]
 
-use ay_core::{Sort, Symbol, TermId, TermStore};
+use ay_core::{smtlib_code_point, Sort, Symbol, TermId, TermStore};
 use ay_proof::recognize_string_ground_eval;
 use ay_strings::we_regex::WeRegex;
 use num_bigint::BigInt;
@@ -101,7 +101,23 @@ fn env_u64(key: &str, default: u64) -> u64 {
 /// Subject/literal alphabet. Deliberately mixes ASCII letters, digits, the NUL
 /// code point, a Latin-1 code point and a high BMP code point so char-index vs.
 /// byte-index confusions in any implementation show up as a disagreement.
-const ALPHABET: &[char] = &['a', 'b', 'c', '0', '9', '\u{0}', '\u{e9}', '\u{2fff}'];
+/// `'\u{10d800}'` is the carrier AY stores for the SURROGATE code point U+D800
+/// (`ay_core::smtlib_char`): as a `char` it sorts above U+2FFFF, but its code
+/// point lies between U+D7FF and U+E000, which every `str.<` and `re.range`
+/// implementation must honour.
+const ALPHABET: &[char] = &[
+    'a',
+    'b',
+    'c',
+    '0',
+    '9',
+    '\u{0}',
+    '\u{e9}',
+    '\u{2fff}',
+    '\u{d7ff}',
+    '\u{10d800}',
+    '\u{e000}',
+];
 
 // ---------------------------------------------------------------------------
 // Three-valued probe of the checker
@@ -470,11 +486,12 @@ fn spec_matrix(re: &Re, s: &[char]) -> Mat {
         // EMPTY language otherwise (including `l > u`).
         Re::Range(lo, hi) => {
             let mut m = Mat::empty(n);
-            let l: Vec<char> = lo.chars().collect();
-            let u: Vec<char> = hi.chars().collect();
+            let l: Vec<u32> = lo.chars().map(smtlib_code_point).collect();
+            let u: Vec<u32> = hi.chars().map(smtlib_code_point).collect();
             if l.len() == 1 && u.len() == 1 && l[0] <= u[0] {
                 for i in 0..n {
-                    if l[0] <= s[i] && s[i] <= u[0] {
+                    let c = smtlib_code_point(s[i]);
+                    if l[0] <= c && c <= u[0] {
                         m.set(i, i + 1, true);
                     }
                 }
@@ -768,7 +785,7 @@ fn regex_membership_differential_fuzz() {
 fn spec_lt(a: &[char], b: &[char]) -> bool {
     for (x, y) in a.iter().zip(b.iter()) {
         if x != y {
-            return x < y;
+            return smtlib_code_point(*x) < smtlib_code_point(*y);
         }
     }
     a.len() < b.len()
@@ -901,7 +918,7 @@ fn spec_op(op: &Op) -> SpecVal {
         Op::ToCode(s) => {
             let c: Vec<char> = s.chars().collect();
             SpecVal::I(if c.len() == 1 {
-                BigInt::from(c[0] as u32)
+                BigInt::from(smtlib_code_point(c[0]))
             } else {
                 BigInt::from(-1)
             })
@@ -911,13 +928,13 @@ fn spec_op(op: &Op) -> SpecVal {
         Op::FromCode(n) => {
             let v = to_i64_opt(n);
             match v {
-                Some(v) if (0..=196_607).contains(&v) => match char::from_u32(v as u32) {
-                    Some(c) => SpecVal::S(vec![c]),
-                    // Surrogate code points are inside the SMT-LIB alphabet but
-                    // are NOT representable in AY's `String`; no implementation
-                    // can answer, so this case is skipped by the generator.
-                    None => SpecVal::Undefined,
-                },
+                // Surrogates included: AY stores one in its carrier `char`.
+                Some(v) if (0..=196_607).contains(&v) => {
+                    match u32::try_from(v).ok().and_then(ay_core::smtlib_char) {
+                        Some(c) => SpecVal::S(vec![c]),
+                        None => SpecVal::Undefined,
+                    }
+                }
                 _ => SpecVal::S(Vec::new()),
             }
         }
@@ -1543,16 +1560,38 @@ fn out_of_alphabet_code_point_is_not_certified() {
     }
 }
 
-/// `str.from_code` of a SURROGATE code point: inside the SMT-LIB alphabet, but
-/// not representable in AY's `String`. The checker must fail closed (the solver
-/// answers `""`, which the standard does not license).
+/// `str.from_code` of a SURROGATE code point (D8, 2026-09-23 hunt): inside the
+/// SMT-LIB alphabet, so it is the ONE-character string holding the surrogate's
+/// carrier (`ay_core::smtlib_char`). The checker, the solver's shared folding
+/// and the spec must all say so — the solver used to answer `""`, which the
+/// standard does not license, and refuted the satisfiable
+/// `(= (str.len (str.from_code 55296)) 1)`.
 #[test]
-fn surrogate_from_code_is_not_certified() {
+fn surrogate_from_code_is_one_character() {
+    let carrier = ay_core::smtlib_char(0xD800).expect("surrogates are SMT-LIB characters");
+    assert_eq!(
+        ay_strings::eval::eval_str_from_code(&BigInt::from(0xD800)),
+        carrier.to_string()
+    );
     let mut terms = TermStore::new();
     let hygiene = hygiene_false_literal(&mut terms);
     let term = op_term(&mut terms, &Op::FromCode(BigInt::from(0xD800)));
+    assert_eq!(
+        probe_value(&mut terms, term, &SpecVal::S(vec![carrier]), hygiene),
+        Tri::True
+    );
     for cand in [SpecVal::S(Vec::new()), SpecVal::S(vec!['a'])] {
         let v = probe_value(&mut terms, term, &cand, hygiene);
-        assert_eq!(v, Tri::Unknown, "checker must fail closed on {cand:?}");
+        assert_eq!(v, Tri::False, "checker must refute {cand:?}");
     }
+    let to_code = op_term(&mut terms, &Op::ToCode(carrier.to_string()));
+    assert_eq!(
+        probe_value(
+            &mut terms,
+            to_code,
+            &SpecVal::I(BigInt::from(0xD800)),
+            hygiene
+        ),
+        Tri::True
+    );
 }

@@ -8,6 +8,8 @@
 //! into focused sibling modules.
 
 mod admission;
+#[cfg(test)]
+pub(in crate::pdr::solver) use admission::ill_typed_candidates_rejected;
 mod entry_domain;
 mod init_blocking;
 mod predecessor_strengthening;
@@ -18,16 +20,63 @@ use crate::pdr::config::InitIntBounds;
 use crate::pdr::frame::Lemma;
 use crate::pdr::solver::PdrSolver;
 use crate::smt::SmtResult;
-use crate::{ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
+use crate::{ChcExpr, ChcOp, ChcSort, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 impl PdrSolver {
-    pub(in crate::pdr::solver) fn rename_fact_variables(
-        fact_constraint: &ChcExpr,
-        fact_head_args: &[ChcExpr],
+    /// The source-name census of this problem (`fact_names::SourceNames`),
+    /// or `None` when the solve is cancelled mid-census.
+    ///
+    /// Computed once per solver (`source_names_cache`): the problem is
+    /// immutable after construction and the callers sit in per-query,
+    /// per-(query, fact) and per-clause loops (`strengthen`, `init_safe`,
+    /// acyclic safety, backward-chain safety, ITE blocking, the IUC frame).
+    /// A census cut short by cancellation is returned as `None` and NOT cached,
+    /// so `None` never outlives the cancellation it reports.
+    pub(in crate::pdr::solver) fn source_names(
+        &self,
+    ) -> Option<std::rc::Rc<crate::pdr::solver::fact_names::SourceNames>> {
+        if let Some(names) = self.source_names_cache.get() {
+            return Some(std::rc::Rc::clone(names));
+        }
+        let mut open = || !self.is_cancelled();
+        let names = std::rc::Rc::new(crate::pdr::solver::fact_names::SourceNames::collect(
+            &self.problem,
+            &mut open,
+        )?);
+        // `set` only fails if another call filled the cell meanwhile; either
+        // value is the same census of the same immutable problem.
+        let _ = self.source_names_cache.set(std::rc::Rc::clone(&names));
+        Some(names)
+    }
+
+    /// One clause renamed apart from every other clause of the problem.
+    ///
+    /// Clause variables are scoped per clause, but the parser keeps the
+    /// user's names: a fact, a step and a query clause routinely reuse a
+    /// letter for unrelated things (VMT/lustre: the fact's init-state `I1` is
+    /// the step's post-state `I1`). A query that conjoins formulas from two
+    /// clauses — a fact with a step (level-1 blocking, the IUC frame, ITE
+    /// blocking), a fact with a query (init-safe, acyclic safety,
+    /// backward-chain safety), a fact-derived must-summary with any clause it
+    /// is later applied to, a query-derived root POB with a fact at level 0 —
+    /// must rename one side apart first, or the shared name equates the two
+    /// variables: the query is over-constrained and its UNSAT answers can be
+    /// spurious. Names are allocated by `SourceNames::rename` (fresh against
+    /// every source name, `{prefix}{name}[_k]`; `query_roots` are the other
+    /// formulas of the query, checked for collisions). `None` (a stopped,
+    /// captured or incomplete rename) must never discharge an obligation:
+    /// callers fall back to their conservative answer.
+    pub(in crate::pdr::solver) fn rename_clause_apart<'a>(
+        &self,
+        names: &crate::pdr::solver::fact_names::SourceNames,
         prefix: &str,
-    ) -> (ChcExpr, Vec<ChcExpr>) {
-        predicate_context::rename_fact_variables(fact_constraint, fact_head_args, prefix)
+        constraint: &ChcExpr,
+        args: &[ChcExpr],
+        query_roots: impl IntoIterator<Item = &'a ChcExpr>,
+    ) -> Option<(ChcExpr, Vec<ChcExpr>)> {
+        let mut open = || !self.is_cancelled();
+        names.rename(constraint, args, prefix, query_roots, &mut open)
     }
 
     pub(in crate::pdr::solver) fn predicate_has_facts(&self, pred: PredicateId) -> bool {

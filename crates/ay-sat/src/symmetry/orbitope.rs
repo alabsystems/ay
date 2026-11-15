@@ -55,6 +55,7 @@
 //! The units are **not** RUP, so they are gated to non-proof runs by the caller
 //! until they are emitted with their σ-witness on the SR route.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Literal, Variable};
@@ -300,6 +301,36 @@ pub(crate) struct OrbitopeStats {
     pub(crate) verified_swaps: u64,
     /// Adjacent row transpositions that failed the gate.
     pub(crate) rejected_swaps: u64,
+    /// Detection stopped at the caller's stop predicate and returned nothing.
+    pub(crate) interrupted: bool,
+}
+
+/// Units of detection work (clause visits, set lookups) between two samples of
+/// the stop predicate: about a millisecond, far inside the watchdog's 2 s grace.
+const STOP_POLL_WORK: u64 = 1 << 16;
+
+/// Samples a stop predicate once per [`STOP_POLL_WORK`] units of work. Once it
+/// fires it stays fired, so a non-monotonic predicate is sampled only until then.
+struct StopPoll<'a> {
+    should_stop: &'a dyn Fn() -> bool,
+    work: Cell<u64>,
+    fired: Cell<bool>,
+}
+
+impl StopPoll<'_> {
+    fn tick(&self, units: usize) -> bool {
+        if self.fired.get() {
+            return true;
+        }
+        let work = self.work.get().saturating_add(units as u64);
+        if work < STOP_POLL_WORK {
+            self.work.set(work);
+            return false;
+        }
+        self.work.set(0);
+        self.fired.set((self.should_stop)());
+        self.fired.get()
+    }
 }
 
 /// Whether to admit ALO-only columns by synthesizing the missing at-most-one
@@ -327,6 +358,67 @@ fn alo_only_columns_enabled() -> bool {
     !ay_core::sat_ab_switches().no_orbitope_alo_columns
 }
 
+/// Greedy prefix-attachment column order over `pool`, keeping `seed` verbatim as
+/// the head: repeatedly take the column with the most at-most-one edges into the
+/// chosen prefix, breaking ties by total degree and then by the lower index. With
+/// an empty seed this is the original ordering pass, tie-breaking included. `None`
+/// when the stop fired: this is detection's expensive pass, about
+/// `columns^2 x width x degree` set lookups.
+fn greedy_order(
+    seed: &[usize],
+    pool: &[usize],
+    entries: &[Vec<Vec<Variable>>],
+    amo: &BTreeMap<Variable, BTreeSet<Variable>>,
+    poll: &StopPoll<'_>,
+) -> Option<Vec<usize>> {
+    let degree = |col: usize| -> usize {
+        entries
+            .iter()
+            .flat_map(|row| row[col].iter())
+            .map(|v| amo.get(v).map_or(0, BTreeSet::len))
+            .sum()
+    };
+    let mut order: Vec<usize> = seed.to_vec();
+    let mut remaining: Vec<usize> = pool.iter().copied().filter(|c| !seed.contains(c)).collect();
+    let mut prefix: BTreeSet<Variable> = order
+        .iter()
+        .flat_map(|&c| entries.iter().flat_map(move |row| row[c].iter().copied()))
+        .collect();
+    if order.is_empty() {
+        if let Some(&first) = remaining.iter().max_by_key(|&&c| degree(c)) {
+            remaining.retain(|&c| c != first);
+            prefix.extend(entries.iter().flat_map(|row| row[first].iter().copied()));
+            order.push(first);
+        }
+    }
+    while !remaining.is_empty() {
+        // The key is unique per column (`Reverse(c)`), so the
+        // strict maximum is the column `max_by_key` would pick.
+        let mut best: Option<((usize, usize, std::cmp::Reverse<usize>), usize)> = None;
+        for &c in &remaining {
+            let (mut into, mut scanned) = (0usize, 0usize);
+            for v in entries.iter().flat_map(|row| row[c].iter()) {
+                if let Some(ns) = amo.get(v) {
+                    into += ns.iter().filter(|n| prefix.contains(n)).count();
+                    scanned += ns.len();
+                }
+            }
+            if poll.tick(scanned) {
+                return None;
+            }
+            let key = (into, degree(c), std::cmp::Reverse(c));
+            if best.is_none_or(|(top, _)| key > top) {
+                best = Some((key, c));
+            }
+        }
+        let (_, pick) = best.expect("non-empty");
+        remaining.retain(|&c| c != pick);
+        prefix.extend(entries.iter().flat_map(|row| row[pick].iter().copied()));
+        order.push(pick);
+    }
+    Some(order)
+}
+
 /// Find row-interchangeable at-most-one matrices inside `clauses`.
 ///
 /// Returns at most one matrix today (the largest width class); the signature is
@@ -336,14 +428,41 @@ pub(crate) fn detect_row_amo_matrices(
     clauses: &[Vec<Literal>],
     limits: OrbitopeLimits,
 ) -> (Vec<RowAmoMatrix>, OrbitopeStats) {
+    detect_row_amo_matrices_until(clauses, limits, &|| false)
+}
+
+/// [`detect_row_amo_matrices`] that samples `should_stop` throughout, so the
+/// solve's deadline or interrupt ends detection within milliseconds. A stopped
+/// run returns no matrix and sets [`OrbitopeStats::interrupted`]; detection
+/// only reads `clauses`, so nothing partial is left behind. Unstopped, its
+/// result is the same as [`detect_row_amo_matrices`].
+pub(crate) fn detect_row_amo_matrices_until(
+    clauses: &[Vec<Literal>],
+    limits: OrbitopeLimits,
+    should_stop: &dyn Fn() -> bool,
+) -> (Vec<RowAmoMatrix>, OrbitopeStats) {
     let mut stats = OrbitopeStats::default();
     if clauses.len() > limits.max_clauses {
         return (Vec::new(), stats);
+    }
+    let poll = StopPoll {
+        should_stop,
+        work: Cell::new(0),
+        fired: Cell::new(false),
+    };
+    macro_rules! stop_after {
+        ($units:expr) => {
+            if poll.tick($units) {
+                stats.interrupted = true;
+                return (Vec::new(), stats);
+            }
+        };
     }
 
     // At-most-one edges: `(¬a ∨ ¬b)` over two distinct variables.
     let mut amo: BTreeMap<Variable, BTreeSet<Variable>> = BTreeMap::new();
     for clause in clauses {
+        stop_after!(1);
         if clause.len() == 2 && clause.iter().all(|l| !l.is_positive()) {
             let (a, b) = (clause[0].variable(), clause[1].variable());
             if a != b {
@@ -373,6 +492,7 @@ pub(crate) fn detect_row_amo_matrices(
     // positive occurrences and require exactly one.
     let mut pos_occ: BTreeMap<Variable, usize> = BTreeMap::new();
     for clause in clauses {
+        stop_after!(clause.len());
         for lit in clause {
             if lit.is_positive() {
                 *pos_occ.entry(lit.variable()).or_default() += 1;
@@ -381,6 +501,7 @@ pub(crate) fn detect_row_amo_matrices(
     }
     let mut columns: Vec<Vec<Variable>> = Vec::new();
     for clause in clauses {
+        stop_after!(clause.len() * clause.len());
         if clause.len() < 2 || !clause.iter().all(|l| l.is_positive()) {
             continue;
         }
@@ -456,6 +577,7 @@ pub(crate) fn detect_row_amo_matrices(
         component.insert(start, id);
         while let Some((u, u_col)) = stack.pop() {
             members.push(u);
+            stop_after!(amo.get(&u).map_or(1, BTreeSet::len));
             if let Some(neighbours) = amo.get(&u) {
                 for &w in neighbours {
                     let Some(&w_col) = col_of.get(&w) else {
@@ -539,56 +661,11 @@ pub(crate) fn detect_row_amo_matrices(
     //    greedy produced — an ordering that already works is never regressed.
     let ncols = entries.first().map_or(0, Vec::len);
     if ncols > 1 {
-        // Greedy prefix-attachment order over `pool`, keeping `seed` verbatim
-        // as the head. With an empty seed this is the original ordering pass,
-        // tie-breaking included.
-        let greedy_order =
-            |seed: &[usize], pool: &[usize], entries: &[Vec<Vec<Variable>>]| -> Vec<usize> {
-                let degree = |col: usize| -> usize {
-                    entries
-                        .iter()
-                        .flat_map(|row| row[col].iter())
-                        .map(|v| amo.get(v).map_or(0, BTreeSet::len))
-                        .sum()
-                };
-                let mut order: Vec<usize> = seed.to_vec();
-                let mut remaining: Vec<usize> =
-                    pool.iter().copied().filter(|c| !seed.contains(c)).collect();
-                let mut prefix: BTreeSet<Variable> = order
-                    .iter()
-                    .flat_map(|&c| entries.iter().flat_map(move |row| row[c].iter().copied()))
-                    .collect();
-                if order.is_empty() {
-                    if let Some(&first) = remaining.iter().max_by_key(|&&c| degree(c)) {
-                        remaining.retain(|&c| c != first);
-                        prefix.extend(entries.iter().flat_map(|row| row[first].iter().copied()));
-                        order.push(first);
-                    }
-                }
-                while !remaining.is_empty() {
-                    let pick = *remaining
-                        .iter()
-                        .max_by_key(|&&c| {
-                            let into: usize = entries
-                                .iter()
-                                .flat_map(|row| row[c].iter())
-                                .map(|v| {
-                                    amo.get(v).map_or(0, |ns| {
-                                        ns.iter().filter(|n| prefix.contains(n)).count()
-                                    })
-                                })
-                                .sum();
-                            (into, degree(c), std::cmp::Reverse(c))
-                        })
-                        .expect("non-empty");
-                    remaining.retain(|&c| c != pick);
-                    prefix.extend(entries.iter().flat_map(|row| row[pick].iter().copied()));
-                    order.push(pick);
-                }
-                order
-            };
         let all: Vec<usize> = (0..ncols).collect();
-        let mut order = greedy_order(&[], &all, &entries);
+        let Some(mut order) = greedy_order(&[], &all, &entries, &amo, &poll) else {
+            stats.interrupted = true;
+            return (Vec::new(), stats);
+        };
 
         // True clique seeding. Skipped above the size cap, where the quadratic
         // bitset would stop being cheap — the greedy order stands on its own.
@@ -601,6 +678,7 @@ pub(crate) fn detect_row_amo_matrices(
             let mut adj = vec![0u64; ncols * words];
             for (&v, &cv) in &col_of {
                 if let Some(ns) = amo.get(&v) {
+                    stop_after!(ns.len());
                     for n in ns {
                         if let Some(&cn) = col_of.get(n) {
                             if cn != cv {
@@ -678,8 +756,13 @@ pub(crate) fn detect_row_amo_matrices(
                 }
             }
             if best.len() > greedy_clique {
-                let head = greedy_order(&[], &best, &entries);
-                order = greedy_order(&head, &all, &entries);
+                let reordered = greedy_order(&[], &best, &entries, &amo, &poll)
+                    .and_then(|head| greedy_order(&head, &all, &entries, &amo, &poll));
+                let Some(reordered) = reordered else {
+                    stats.interrupted = true;
+                    return (Vec::new(), stats);
+                };
+                order = reordered;
             }
         }
         for row in &mut entries {
@@ -697,6 +780,7 @@ pub(crate) fn detect_row_amo_matrices(
             .iter()
             .flat_map(|row| row[col].iter().copied())
             .collect();
+        stop_after!(colvars.len() * colvars.len());
         for (i, &a) in colvars.iter().enumerate() {
             for &b in &colvars[i + 1..] {
                 if !mutex(a, b) {
@@ -732,13 +816,20 @@ pub(crate) fn detect_row_amo_matrices(
     // adjacent transpositions, the whole verification sweep costs one pass over
     // the matrix variables' occurrence lists rather than `rows` passes over the
     // formula.
-    let formula_counts = super::build_formula_counts(clauses);
-    let keys: Vec<Vec<u32>> = clauses
-        .iter()
-        .map(|c| super::canonical_clause_key(c))
-        .collect();
+    // `super::build_formula_counts`, built from the keys and polled.
+    let mut keys: Vec<Vec<u32>> = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        stop_after!(clause.len());
+        keys.push(super::canonical_clause_key(clause));
+    }
+    let mut formula_counts: BTreeMap<Vec<u32>, u32> = BTreeMap::new();
+    for key in &keys {
+        stop_after!(key.len());
+        *formula_counts.entry(key.clone()).or_insert(0) += 1;
+    }
     let mut occurrences: BTreeMap<Variable, Vec<usize>> = BTreeMap::new();
     for (idx, clause) in clauses.iter().enumerate() {
+        stop_after!(clause.len());
         for lit in clause {
             let var = lit.variable();
             if col_of.contains_key(&var) {
@@ -758,7 +849,9 @@ pub(crate) fn detect_row_amo_matrices(
         stamp += 1;
         let mut preserved = true;
         'swap: for var in perm.keys() {
-            for &idx in occurrences.get(var).map_or(&[][..], Vec::as_slice) {
+            let occ = occurrences.get(var).map_or(&[][..], Vec::as_slice);
+            stop_after!(occ.len());
+            for &idx in occ {
                 if seen_stamp[idx] == stamp {
                     continue;
                 }
@@ -1151,5 +1244,162 @@ mod tests {
         let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
         assert!(matrices.is_empty());
         assert_eq!(stats.eo_groups, 0);
+    }
+
+    /// A 6-colouring of a 40%-dense graph on 120 vertices: enough column
+    /// ordering work for dozens of stop samples.
+    fn dense_colouring() -> Vec<Vec<Literal>> {
+        let edges: Vec<(i32, i32)> = (0..120)
+            .flat_map(|u| ((u + 1)..120).map(move |v| (u, v)))
+            .filter(|&(u, v)| (u * 7 + v * 13) % 5 < 2)
+            .collect();
+        colouring(120, 6, &edges)
+    }
+
+    #[test]
+    fn a_stop_that_never_fires_finds_the_matrix() {
+        let clauses = dense_colouring();
+        let (matrices, stats) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
+        assert_eq!(matrices.len(), 1, "the dense colouring has a matrix");
+        assert!(!stats.interrupted);
+    }
+
+    /// The column order before the stop polls (2026-09-15): `max_by_key`, which
+    /// keeps the last maximum. The oracle for the polled loop in `greedy_order`.
+    fn greedy_order_oracle(
+        seed: &[usize],
+        pool: &[usize],
+        entries: &[Vec<Vec<Variable>>],
+        amo: &BTreeMap<Variable, BTreeSet<Variable>>,
+    ) -> Vec<usize> {
+        let degree = |col: usize| -> usize {
+            let cells = entries.iter().flat_map(|row| row[col].iter());
+            cells.map(|v| amo.get(v).map_or(0, BTreeSet::len)).sum()
+        };
+        let mut order: Vec<usize> = seed.to_vec();
+        let mut remaining: Vec<usize> =
+            pool.iter().copied().filter(|c| !seed.contains(c)).collect();
+        let cells = |c: usize| entries.iter().flat_map(move |row| row[c].iter().copied());
+        let mut prefix: BTreeSet<Variable> = order.iter().flat_map(|&c| cells(c)).collect();
+        if order.is_empty() {
+            if let Some(&first) = remaining.iter().max_by_key(|&&c| degree(c)) {
+                remaining.retain(|&c| c != first);
+                prefix.extend(cells(first));
+                order.push(first);
+            }
+        }
+        while !remaining.is_empty() {
+            let into = |c: usize| -> usize {
+                let counts = cells(c).map(|v| {
+                    amo.get(&v)
+                        .map_or(0, |ns| ns.iter().filter(|n| prefix.contains(n)).count())
+                });
+                counts.sum()
+            };
+            let pick = *remaining
+                .iter()
+                .max_by_key(|&&c| (into(c), degree(c), std::cmp::Reverse(c)))
+                .expect("non-empty");
+            remaining.retain(|&c| c != pick);
+            prefix.extend(cells(pick));
+            order.push(pick);
+        }
+        order
+    }
+
+    /// The matrix cells and at-most-one map of a `colours`-colouring of an
+    /// `n`-vertex graph, with the per-vertex at-most-one pairs when `amo_rows`.
+    fn colouring_parts(
+        n: u32,
+        colours: u32,
+        edges: &[(u32, u32)],
+        amo_rows: bool,
+    ) -> (
+        Vec<Vec<Vec<Variable>>>,
+        BTreeMap<Variable, BTreeSet<Variable>>,
+    ) {
+        let x = |v: u32, c: u32| Variable(colours * v + c);
+        let entries = (0..colours)
+            .map(|c| (0..n).map(|v| vec![x(v, c)]).collect())
+            .collect();
+        let mut amo: BTreeMap<Variable, BTreeSet<Variable>> = BTreeMap::new();
+        let mut join = |a: Variable, b: Variable| {
+            amo.entry(a).or_default().insert(b);
+            amo.entry(b).or_default().insert(a);
+        };
+        for &(u, v) in edges {
+            for c in 0..colours {
+                join(x(u, c), x(v, c));
+            }
+        }
+        if amo_rows {
+            for v in 0..n {
+                for c in 0..colours {
+                    for d in (c + 1)..colours {
+                        join(x(v, c), x(v, d));
+                    }
+                }
+            }
+        }
+        (entries, amo)
+    }
+
+    #[test]
+    fn the_polled_column_order_matches_the_original_on_tie_heavy_graphs() {
+        let cycle: Vec<(u32, u32)> = (0..30).map(|v| (v, (v + 1) % 30)).collect();
+        let bipartite: Vec<(u32, u32)> = (0..12)
+            .flat_map(|u| (12..24).map(move |v| (u, v)))
+            .collect();
+        let dense: Vec<(u32, u32)> = (0..40)
+            .flat_map(|u| ((u + 1)..40).map(move |v| (u, v)))
+            .filter(|&(u, v)| (u * 7 + v * 13) % 5 < 2)
+            .collect();
+        // A K5 behind a hub with leaves: the clique re-seed shape.
+        let mut hub: Vec<(u32, u32)> = (0..5)
+            .flat_map(|u| ((u + 1)..5).map(move |v| (u, v)))
+            .collect();
+        hub.extend((5..12).map(|leaf| (12, leaf)));
+        hub.push((12, 0));
+        let never = StopPoll {
+            should_stop: &|| false,
+            work: Cell::new(0),
+            fired: Cell::new(false),
+        };
+        for (n, colours, edges) in [
+            (30, 3, &cycle),
+            (24, 4, &bipartite),
+            (40, 5, &dense),
+            (13, 3, &hub),
+        ] {
+            for amo_rows in [false, true] {
+                let (entries, amo) = colouring_parts(n, colours, edges, amo_rows);
+                let all: Vec<usize> = (0..n as usize).collect();
+                for seed in [vec![], vec![n as usize / 2], vec![3, 1]] {
+                    assert_eq!(
+                        greedy_order(&seed, &all, &entries, &amo, &never),
+                        Some(greedy_order_oracle(&seed, &all, &entries, &amo)),
+                        "n {n}, colours {colours}, amo_rows {amo_rows}, seed {seed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detection_stops_cleanly_when_the_stop_fires() {
+        let clauses = dense_colouring();
+        for fire_at in [1, 2, 5] {
+            let samples = Cell::new(0u32);
+            let stop = || {
+                samples.set(samples.get() + 1);
+                samples.get() >= fire_at
+            };
+            let (matrices, stats) =
+                detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &stop);
+            assert!(matrices.is_empty(), "stopped at sample {fire_at}");
+            assert!(stats.interrupted, "stopped at sample {fire_at}");
+            assert_eq!(samples.get(), fire_at, "no sample after the stop fired");
+        }
     }
 }

@@ -116,14 +116,29 @@ fn trace(label: &str, slice: Option<std::time::Duration>, elapsed_ms: u128, outc
     if !ay_core::misc_cli_flags().cert_debug {
         return;
     }
-    match slice {
-        Some(slice) => eprintln!(
-            "c [cert/budget] {label} slice={}ms elapsed={elapsed_ms}ms -> {outcome}",
-            slice.as_millis()
-        ),
-        None => {
-            eprintln!("c [cert/budget] {label} slice=unbounded elapsed={elapsed_ms}ms -> {outcome}")
-        }
+    let slice = slice.map_or_else(
+        || "unbounded".to_string(),
+        |slice| format!("{}ms", slice.as_millis()),
+    );
+    cert_debug_line(format_args!(
+        "c [cert/budget] {label} slice={slice} elapsed={elapsed_ms}ms -> {outcome}"
+    ));
+}
+
+/// Writes one `--cert-debug` line to stderr, and nothing when the flag is off.
+///
+/// The `c [cert/...]` traces of the OPT-LIN certificate chain and of the
+/// frontend phases in front of it (the scheduled rungs' `c [cert/budget]` above,
+/// the floor rungs' `c [cert/floor]`, the `c [cert/phase]` lines of
+/// `ay_pb::opt_fallback`) reach stderr through this one edge, so the trace has
+/// one switch and one writer. It writes with `safe_eprintln!`: a diagnostic
+/// never panics the solve it describes.
+///
+/// Diagnostics only: nothing a caller passes here may decide a route, a budget
+/// or a verdict.
+pub fn cert_debug_line(line: std::fmt::Arguments<'_>) {
+    if ay_core::misc_cli_flags().cert_debug {
+        ay_core::safe_eprintln!("{line}");
     }
 }
 

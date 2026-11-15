@@ -337,7 +337,7 @@ fn a_zero_weight_cycle_of_strict_bounds_is_unsat() {
         AssertOutcome::Conflict(tags) => {
             assert_eq!(tags, vec![0, 1], "both strict edges must be in the cycle");
         }
-        AssertOutcome::Consistent => {
+        AssertOutcome::Consistent | AssertOutcome::Refused => {
             panic!("x < y together with y < x must be UNSAT — ε was ignored");
         }
     }

@@ -30,8 +30,11 @@ fn expression_shape(root: &BvExpr) -> (usize, usize) {
             | BvExpr::Shl(lhs, rhs)
             | BvExpr::Lshr(lhs, rhs)
             | BvExpr::Ashr(lhs, rhs)
+            | BvExpr::Ult(lhs, rhs)
             | BvExpr::Eq(lhs, rhs)
-            | BvExpr::Mul(lhs, rhs) => {
+            | BvExpr::Mul(lhs, rhs)
+            | BvExpr::UDiv(lhs, rhs)
+            | BvExpr::URem(lhs, rhs) => {
                 stack.push((rhs, depth + 1));
                 stack.push((lhs, depth + 1));
             }
@@ -57,7 +60,18 @@ fn proof_producing_limits_keep_finite_internal_resource_envelope() {
         PROOF_PRODUCING_REPLAY_BYTES_PER_LEMMA
     );
     assert_eq!(limits.max_resolution_steps, 250_000);
-    assert_eq!(PROOF_PRODUCING_DEADLINE, Duration::from_secs(3));
+    assert_eq!(
+        limits.resolution.max_conflicts,
+        Some(producer_limits::PRODUCER_MAX_CONFLICTS)
+    );
+    assert_eq!(
+        limits.resolution.max_proof_output_bytes,
+        producer_limits::PRODUCER_MAX_PROOF_OUTPUT_BYTES
+    );
+    assert_eq!(
+        producer_limits::PRODUCER_HANG_GUARD,
+        Duration::from_secs(300)
+    );
     assert_eq!(PROOF_PRODUCING_REPLAY_BYTES_PER_LEMMA, 128 * 1024 * 1024);
     assert!(limits.resolution.deadline.is_some());
     assert_eq!(
@@ -82,7 +96,10 @@ fn width32_add_associativity_crosses_public_literal_cap_but_fits_internal() {
     const WIDTH: u32 = 32;
     let mut terms = TermStore::new();
     let sort = Sort::bitvec(WIDTH);
-    let a = terms.mk_var("assoc_a", sort.clone());
+    // The extracted source word keeps this test on actual adder/SAT replay,
+    // rather than the new affine full-cancellation polynomial bridge.
+    let wide_a = terms.mk_var("assoc_a", Sort::bitvec(64));
+    let a = terms.mk_bvextract(31, 0, wide_a);
     let b = terms.mk_var("assoc_b", sort.clone());
     let c = terms.mk_var("assoc_c", sort);
     let ab = terms.mk_bvadd(vec![a, b]);
@@ -203,4 +220,132 @@ fn satisfiable_and_replay_failures_are_never_capability_declines() {
         reason: "proof resource `expression nodes` exceeds limit 4096".to_string(),
     };
     assert!(exhausted.is_capability_decline());
+}
+
+/// One set of counted caps serves the strict checker and the authentication
+/// lanes; the wall clock only stops them. Without a caller deadline both end at
+/// the hang guard; with one, the authentication envelope ends at it (the
+/// solve's own budget), never at a local wall of its own.
+#[test]
+fn both_envelopes_are_the_counted_caps_with_only_an_outer_stop() {
+    let before = Instant::now();
+    let (strict, guard) = strict_producer_limits();
+    assert!(guard >= before + producer_limits::PRODUCER_HANG_GUARD);
+    assert_eq!(strict.resolution.deadline, Some(guard));
+    assert_eq!(strict.resolution.validation.deadline, Some(guard));
+
+    let (unbounded, unbounded_deadline) = proof_producing_limits(None);
+    assert!(unbounded_deadline >= before + producer_limits::PRODUCER_HANG_GUARD);
+
+    let caller = Instant::now() + Duration::from_millis(1_500);
+    let (mut bounded, bounded_deadline) = proof_producing_limits(Some(caller));
+    assert_eq!(
+        bounded_deadline, caller,
+        "the caller's deadline, not a local wall"
+    );
+    assert_eq!(bounded.resolution.deadline, Some(caller));
+
+    let far = Instant::now() + Duration::from_secs(3_600);
+    let (_, clamped) = proof_producing_limits(Some(far));
+    assert!(
+        clamped < far,
+        "a caller deadline past the guard is clamped to it"
+    );
+
+    // Apart from where the wall stops them, the three are one envelope.
+    let mut unbounded = unbounded;
+    for envelope in [&mut bounded, &mut unbounded] {
+        envelope.resolution.deadline = Some(guard);
+        envelope.resolution.validation.deadline = Some(guard);
+        assert_eq!(format!("{strict:?}"), format!("{envelope:?}"));
+    }
+}
+
+/// Exhausting a counted cap is a counted refusal, never a deadline: under the
+/// strict envelope, with its hang guard minutes away, 7-bit multiplication
+/// distributivity (about 80,000 conflicts to refute) stops at a 1,000-conflict
+/// budget with the conflict cap named. `validate` turns every such refusal into
+/// a rejected lemma, as the gate-budget tests in `theory_forgery_tests` pin.
+#[test]
+fn strict_envelope_exhaustion_is_a_counted_refusal() {
+    const WIDTH: u32 = 7;
+    let [a, b, c] = ["dist_a", "dist_b", "dist_c"].map(|name| BvExpr::leaf(name, WIDTH));
+    let lhs = BvExpr::mul(a.clone(), BvExpr::add(b.clone(), c.clone()));
+    let rhs = BvExpr::add(BvExpr::mul(a.clone(), b), BvExpr::mul(a, c));
+    let (mut limits, _) = strict_producer_limits();
+    limits.resolution.max_conflicts = Some(1_000);
+    let error = crate::bv_blast_solver::validate_bv_expr_compact(
+        &lhs,
+        &rhs,
+        &limits,
+        &proof_replay_limits(&limits),
+        &mut || true,
+    )
+    .expect_err("a refutation beyond the conflict budget must not be accepted");
+    assert!(
+        matches!(
+            error,
+            BvExprExportError::ResourceLimit {
+                resource: "resolution conflicts",
+                limit: 1_000,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+/// The counted caps accept what the retired three-second wall accepted.
+/// 7-bit multiplication distributivity refutes in about 80,800 conflicts and
+/// an 11.9 MB proof; the wall accepted it in 1.6 s (release, 2026-09-24), and
+/// the 64,000-conflict cap this envelope briefly carried refused it. Through
+/// the whole strict checker the production envelope accepts it, and the same
+/// envelope with only the old conflict cap refuses it on that cap, so the
+/// acceptance is the cap's doing.
+#[test]
+fn strict_checker_accepts_what_the_retired_wall_accepted() {
+    const WIDTH: u32 = 7;
+    let mut terms = TermStore::new();
+    let sort = Sort::bitvec(WIDTH);
+    let [x, y, z] = ["wall_x", "wall_y", "wall_z"].map(|name| terms.mk_var(name, sort.clone()));
+    let mut op = |name: &str, args: Vec<TermId>| {
+        terms.mk_app(Symbol::named(name), args, Sort::bitvec(WIDTH))
+    };
+    let sum = op("bvadd", vec![y, z]);
+    let lhs = op("bvmul", vec![x, sum]);
+    let (xy, xz) = (op("bvmul", vec![x, y]), op("bvmul", vec![x, z]));
+    let rhs = op("bvadd", vec![xy, xz]);
+    let identity = terms.mk_app(Symbol::named("="), vec![lhs, rhs], Sort::Bool);
+    let negation = terms.mk_not_raw(identity);
+    let mut proof = Proof::new();
+    let assumption = proof.add_assume(negation, None);
+    let lemma = proof.add_theory_lemma_with_kind("BV", vec![identity], TheoryLemmaKind::BvBitBlast);
+    proof.add_resolution(vec![], identity, assumption, lemma);
+    crate::check_proof_strict(&proof, &terms)
+        .expect("the production strict envelope must accept 7-bit distributivity");
+
+    let [a, b, c] = ["wall_a", "wall_b", "wall_c"].map(|name| BvExpr::leaf(name, WIDTH));
+    let lhs = BvExpr::mul(a.clone(), BvExpr::add(b.clone(), c.clone()));
+    let rhs = BvExpr::add(BvExpr::mul(a.clone(), b), BvExpr::mul(a, c));
+    let (mut limits, _) = strict_producer_limits();
+    limits.resolution.max_conflicts = Some(64_000);
+    let error = crate::bv_blast_solver::validate_bv_expr_compact(
+        &lhs,
+        &rhs,
+        &limits,
+        &proof_replay_limits(&limits),
+        &mut || true,
+    )
+    .expect_err("the retired 64,000-conflict cap refused this lemma");
+    assert!(
+        matches!(
+            error,
+            BvExprExportError::ResourceLimit {
+                resource: "resolution conflicts",
+                limit: 64_000,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }

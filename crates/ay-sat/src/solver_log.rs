@@ -9,7 +9,7 @@
 //!
 //! Enable at compile time via custom cfg:
 //! ```bash
-//! RUSTFLAGS='--cfg ay_logging' cargo test -p ay-sat
+//! cargo test -p ay-sat --config 'target."cfg(all())".rustflags=["--cfg", "ay_logging"]'
 //! ```
 //!
 //! At runtime, set `AY_LOG=1` to activate output (the compile-time gate must

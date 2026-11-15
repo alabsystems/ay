@@ -13,9 +13,9 @@ impl Executor {
     ///
     /// Quantifier-result restoration invokes this only after ordinary model
     /// validation checked the ground siblings but skipped a quantifier. The
-    /// bridge admits only a provably vacuous binder or a closed, fixed-sort
-    /// existential prefix; it cannot become generic post-hoc SAT authority for
-    /// live model-dependent quantifiers. Every admitted leaf must return
+    /// bridge admits a provably vacuous binder, a closed, fixed-sort existential
+    /// prefix, or a separately authenticated complete-array BV64 universal.
+    /// Arming is not post-hoc SAT authority. Every quantified leaf must return
     /// [`QuantifiedModelCheck::Confirmed`]. A refutation, deferral,
     /// indeterminate result, missing model, recursion, or exhausted deadline
     /// preserves the existing fail-closed `Unknown` path.
@@ -52,7 +52,11 @@ impl Executor {
                     TermData::App(sym, _) if sym.name() == "and"
                 );
                 if !is_and_node && contains_quantifier(&self.ctx.terms, conjunct) {
-                    has_armed_leaf |= self.quantified_gate_restoration_candidate(conjunct);
+                    has_armed_leaf |= self.quantified_gate_restoration_candidate(conjunct)
+                        || self.complete_array_restoration_candidate(conjunct);
+                    if !has_armed_leaf {
+                        has_armed_leaf |= self.complete_array_fill_restoration_candidate(conjunct);
+                    }
                     if !candidates.contains(&conjunct) {
                         candidates.push(conjunct);
                     }

@@ -141,6 +141,7 @@ impl ImplicationPolicy {
 pub(super) struct PropagationRequest<'a> {
     pub(super) model: &'a Model,
     pub(super) mode: SearchMode,
+    pub(super) activation: super::early_propagation::Activation,
     pub(super) symmetry: Option<&'a crate::symmetry::Symmetry>,
     pub(super) root_lower: &'a [f64],
     pub(super) root_upper: &'a [f64],
@@ -158,6 +159,7 @@ pub(super) struct PropagationState {
     pub(super) implication_policy: ImplicationPolicy,
     pub(super) column_rows: Vec<Vec<u32>>,
     pub(super) pruned: usize,
+    pub(super) early: super::early_propagation::EarlyPropagation,
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +173,7 @@ pub(super) fn propagation_state(request: PropagationRequest<'_>) -> PropagationS
     let PropagationRequest {
         model,
         mode,
+        activation,
         symmetry,
         root_lower,
         root_upper,
@@ -196,7 +199,7 @@ pub(super) fn propagation_state(request: PropagationRequest<'_>) -> PropagationS
     };
     configure_propagation_caps(model, mode, regime);
     let column_rows = if enabled || implication_policy.enabled() {
-        column_rows(model)
+        super::early_propagation::column_rows(model)
     } else {
         Vec::new()
     };
@@ -211,6 +214,13 @@ pub(super) fn propagation_state(request: PropagationRequest<'_>) -> PropagationS
         implication_policy,
         column_rows,
         pruned: 0,
+        early: super::early_propagation::EarlyPropagation::new(
+            model,
+            mode,
+            enabled,
+            default_class,
+            activation,
+        ),
     }
 }
 
@@ -247,18 +257,6 @@ fn configure_propagation_caps(model: &Model, mode: SearchMode, regime: Propagati
         (PROP_MAX_SWEEPS, PROP_MAX_QUEUE)
     };
     set_prop_caps(sweeps, queue);
-}
-
-/// Build adjacency once; every later node retains these row/column identities.
-fn column_rows(model: &Model) -> Vec<Vec<u32>> {
-    let mut result = vec![Vec::new(); model.num_cols()];
-    for row in 0..model.num_rows() {
-        let (coefficients, _, _) = model.row(Row(row as u32));
-        for &(column, _) in coefficients {
-            result[column as usize].push(row as u32);
-        }
-    }
-    result
 }
 
 #[derive(Clone, Copy)]
@@ -366,7 +364,7 @@ pub(super) fn fixed_charge_state(request: FixedChargeRequest<'_>) -> FixedCharge
 fn fixed_charge_adjacency(request: &FixedChargeRequest<'_>) -> Vec<Vec<u32>> {
     let owned;
     let column_rows = if request.column_rows.is_empty() {
-        owned = column_rows(request.model);
+        owned = super::early_propagation::column_rows(request.model);
         &owned
     } else {
         request.column_rows

@@ -14,12 +14,19 @@
 use ay_core::{Sort, Symbol, TermData, TermId};
 
 use super::{
-    balanced_bool_expr, BvExpr, ProofProducingExpr, ProofProducingLowerer,
+    balanced_bool_expr_controlled, BvExpr, ProofProducingExpr, ProofProducingLowerer,
     MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH,
 };
 
 mod budget;
 mod lowering;
+#[cfg(test)]
+mod small_index_reads_tests;
+mod sparse;
+pub(super) use sparse::SparseAddressMemo;
+pub(super) use sparse::SparseBaseRead;
+#[cfg(test)]
+mod sparse_tests;
 
 /// Full-domain enumeration is exponential in an index width. Eight bits keeps
 /// each individual domain at 256 points while the independent aggregate cell,
@@ -35,6 +42,23 @@ pub(super) const MAX_EXACT_FINITE_ARRAY_SCALAR_CELLS: usize = 4_096;
 /// Deterministic scalarization-work envelope, separate from the downstream
 /// bit-blast/SAT/replay limits.
 const MAX_EXACT_FINITE_ARRAY_WORK: usize = 100_000;
+
+/// How a scalar read of an array whose BitVec index is at most
+/// [`MAX_EXACT_FINITE_ARRAY_INDEX_WIDTH`] bits wide is lowered. (Wider
+/// indices always take the store-chain lane in `sparse.rs`.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SmallIndexReads {
+    /// Scalarize the array over its complete index domain: exact, including
+    /// congruence between reads of one base array at aliasing indices.
+    #[default]
+    CompleteDomain,
+    /// Read through the store chain as for a wide index: a constant default
+    /// and every write are exact, but reads of a declared base array become
+    /// independent leaves, which only enlarges the model set. For a caller
+    /// that retries a query whose complete-domain lowering exhausted a
+    /// counted cap; see `proof_producing_control::refute_ordinary_clause`.
+    StoreChain,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FiniteIndexSort {
@@ -330,7 +354,7 @@ fn finish_finite_shape(
     })
 }
 
-impl ProofProducingLowerer<'_> {
+impl ProofProducingLowerer<'_, '_> {
     pub(super) fn lower_exact_finite_array_node(
         &mut self,
         term: TermId,
@@ -383,6 +407,10 @@ impl ProofProducingLowerer<'_> {
             return Err("canonical `select` requires exactly two arguments".to_string());
         };
         self.require_term_shape(result_term, expected_result, "select result")?;
+        if let Some(result) = self.lower_sparse_array_select(result_term, *array_term, *index_term)
+        {
+            return result;
+        }
         let array_shape = self.term_shape(*array_term)?;
         if !array_shape.is_array() {
             return Err("`select` first argument is not an array".to_string());
@@ -427,9 +455,13 @@ impl ProofProducingLowerer<'_> {
         let mut equalities = Vec::new();
         self.reserve_cells(&mut equalities, lhs.cells.len(), "array equality")?;
         for (left, right) in lhs.cells.into_iter().zip(rhs.cells) {
+            self.poll_lowering()?;
             equalities.push(BvExpr::eq(left, right));
         }
-        let equality = balanced_bool_expr(equalities, true, BvExpr::and).inspect_err(|_| {
+        let equality = balanced_bool_expr_controlled(equalities, true, BvExpr::and, &mut || {
+            self.poll_lowering()
+        })
+        .inspect_err(|_| {
             self.resource_exhausted = true;
         })?;
         self.used_exact_finite_arrays = true;

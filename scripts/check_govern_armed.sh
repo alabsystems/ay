@@ -29,9 +29,13 @@ EXEMPT=()
 
 # macOS ships bash 3.2, which has no `mapfile`. Read into a temp file instead --
 # a gate that only runs on a newer bash is a gate that does not run here.
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. "$ROOT/scripts/lib/cargo_frontend.sh"
 rows_file="$(mktemp)"
 trap 'rm -f "$rows_file"' EXIT
-cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+ay_cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
 import json, sys, os
 m = json.load(sys.stdin)
 root = os.getcwd() + "/"

@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the oversized-divisor fallback of `n` (normalized-form MIR) used to
+% hard-code the quotient ceil(A/d) to 1. For A <= 0 the quotient is 0, so MIR of the
+% trivially true `2 x1 >= -1` yielded `2 x1 >= 9223372036854775807` instead of `2 x1 >= 0`.
+f 1 ;
+pol 1 9223372036854775808 n x1 w ;
+output NONE;
+conclusion UNSAT : 2 ;
+end pseudo-Boolean proof;

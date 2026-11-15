@@ -1,0 +1,31 @@
+pseudo-Boolean proof version 2.0
+* Positive control for `SubproofContext::contradiction_proven`, the flag that
+* lets a discharged proofgoal stand in for the contradiction a proof by
+* contradiction owes. This is the one situation it exists for: a version 2.0
+* `red` with an EMPTY witness, whose goal `#1` is the added constraint itself,
+* so the counterexample premise the proofgoal introduces IS the negated
+* constraint already in the database.
+*
+* The formula is unsatisfiable but not by unit propagation, so the top-level
+* RUP check `finalize` would otherwise fall back on CANNOT close this subproof
+* -- the cutting-planes derivation lives inside the proofgoal, whose
+* constraints are deleted at its `end`. Acceptance therefore depends on the
+* flag being set, which pins the fix in
+* `rules::proofgoal::discharges_pbc_contradiction` from the weak side: it must
+* still recognise goal `#1`.
+*
+* incorrect/version2/redundance_empty_witness_database_proofgoal_contradiction
+* is the same proof discharging a DATABASE goal instead, which buys nothing and
+* must be rejected.
+f 4
+red >= 1 ; ; begin
+	proofgoal #1
+		p 1 2 + s
+		p 3 4 + s
+		p -1 -2 +
+	end -1
+end
+u >= 1 ;
+output NONE
+conclusion UNSAT : -1
+end pseudo-Boolean proof

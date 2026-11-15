@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+f 3;
+pol 1 2 + 3 + 2 d;
+core id -1;
+red 3 ~y1 1 ~x1 1 ~x2 1 ~x3 >= 3 : y1 0;
+red 1 y1 1 x1 1 x2 1 x3 >= 1 : y1 1;
+core id -1;
+pol 4 2 * 5 + 3 d;
+core id -1;
+obju new 1 y1 2 ;
+soli x1 ~x2 ~x3;
+e 1 ~y1 >= 2 : -1;
+output NONE;
+conclusion BOUNDS 2 2;
+end pseudo-Boolean proof;

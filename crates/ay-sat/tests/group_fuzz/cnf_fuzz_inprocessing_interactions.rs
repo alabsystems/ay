@@ -13,8 +13,18 @@
 
 #![allow(clippy::panic)]
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
 use ay_sat::{Literal, SatResult, Solver, Variable};
-use ntest::timeout;
+
+/// Per-test wall-clock limit (the former `#[timeout(300_000)]`).
+const FUZZ_TIMEOUT: Duration = Duration::from_millis(300_000);
+/// Upper bound on a generated formula's clause count; the entry points use
+/// at most 80.
+const MAX_FUZZ_CLAUSES: usize = 1 << 16;
+/// Upper bound on a generated clause's length; the generator draws 2-5.
+const MAX_FUZZ_CLAUSE_LEN: usize = 5;
 
 // ---------------------------------------------------------------------------
 // SplitMix64 PRNG for deterministic formula generation
@@ -35,12 +45,20 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    fn next_bounded(&mut self, bound: u64) -> u64 {
-        self.next() % bound
+    fn next_bounded(&mut self, bound: u64) -> Result<u64, String> {
+        self.next()
+            .checked_rem(bound)
+            .ok_or_else(|| "next_bounded: bound must be nonzero".to_string())
     }
 
-    fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
-        lo + self.next_bounded(hi - lo + 1)
+    fn next_range(&mut self, lo: u64, hi: u64) -> Result<u64, String> {
+        let span = hi
+            .checked_sub(lo)
+            .and_then(|width| width.checked_add(1))
+            .ok_or_else(|| format!("next_range: invalid range {lo}..={hi}"))?;
+        let offset = self.next_bounded(span)?;
+        lo.checked_add(offset)
+            .ok_or_else(|| format!("next_range: {lo} + {offset} overflows"))
     }
 }
 
@@ -51,15 +69,29 @@ impl Rng {
 /// Generate a random CNF formula with mixed clause lengths (2-5 literals).
 /// This is the key trigger: mixed lengths create BVE resolvents of varying
 /// sizes that interact differently with subsumption and other techniques.
-fn generate_mixed_cnf(rng: &mut Rng, num_vars: u32, num_clauses: usize) -> Vec<Vec<Literal>> {
+fn generate_mixed_cnf(
+    rng: &mut Rng,
+    num_vars: u32,
+    num_clauses: usize,
+) -> Result<Vec<Vec<Literal>>, String> {
+    if num_clauses > MAX_FUZZ_CLAUSES {
+        return Err(format!(
+            "generate_mixed_cnf: {num_clauses} clauses exceeds the {MAX_FUZZ_CLAUSES} bound"
+        ));
+    }
     let mut clauses = Vec::with_capacity(num_clauses);
     for _ in 0..num_clauses {
         // Mixed clause lengths: 2-5 literals
-        let clause_len = rng.next_range(2, 5) as usize;
+        let clause_len = rng.next_range(2, 5)? as usize;
+        if clause_len > MAX_FUZZ_CLAUSE_LEN {
+            return Err(format!(
+                "generate_mixed_cnf: clause length {clause_len} exceeds {MAX_FUZZ_CLAUSE_LEN}"
+            ));
+        }
         let mut clause = Vec::with_capacity(clause_len);
         for _ in 0..clause_len {
-            let var = rng.next_bounded(u64::from(num_vars)) as u32;
-            let positive = rng.next_bounded(2) == 0;
+            let var = rng.next_bounded(u64::from(num_vars))? as u32;
+            let positive = rng.next_bounded(2)? == 0;
             let lit = if positive {
                 Literal::positive(Variable::new(var))
             } else {
@@ -77,7 +109,7 @@ fn generate_mixed_cnf(rng: &mut Rng, num_vars: u32, num_clauses: usize) -> Vec<V
             clauses.push(clause);
         }
     }
-    clauses
+    Ok(clauses)
 }
 
 // ---------------------------------------------------------------------------
@@ -165,15 +197,15 @@ fn fuzz_mixed_clause_inprocessing(
     max_vars: u64,
     min_clauses: u64,
     max_clauses: u64,
-) {
+) -> Result<(), String> {
     let mut rng = Rng::new(seed);
     let mut sat_count = 0usize;
     let mut unsat_count = 0usize;
 
     for i in 0..count {
-        let num_vars = rng.next_range(min_vars, max_vars) as u32;
-        let num_clauses = rng.next_range(min_clauses, max_clauses) as usize;
-        let clauses = generate_mixed_cnf(&mut rng, num_vars, num_clauses);
+        let num_vars = rng.next_range(min_vars, max_vars)? as u32;
+        let num_clauses = rng.next_range(min_clauses, max_clauses)? as usize;
+        let clauses = generate_mixed_cnf(&mut rng, num_vars, num_clauses)?;
         let nv = num_vars as usize;
 
         // Config A: all inprocessing enabled
@@ -186,32 +218,36 @@ fn fuzz_mixed_clause_inprocessing(
 
         // Verify SAT models
         if let SatResult::Sat(ref model) = result_all {
-            assert!(
-                verify_model(&clauses, model),
-                "SOUNDNESS BUG: all-inprocessing config model is invalid \
-                 [seed={seed}, formula={i}, vars={num_vars}, clauses={num_clauses}]"
-            );
+            if !verify_model(&clauses, model) {
+                return Err(format!(
+                    "SOUNDNESS BUG: all-inprocessing config model is invalid \
+                     [seed={seed}, formula={i}, vars={num_vars}, clauses={num_clauses}]"
+                ));
+            }
         }
         if let SatResult::Sat(ref model) = result_base {
-            assert!(
-                verify_model(&clauses, model),
-                "SOUNDNESS BUG: baseline config model is invalid \
-                 [seed={seed}, formula={i}, vars={num_vars}, clauses={num_clauses}]"
-            );
+            if !verify_model(&clauses, model) {
+                return Err(format!(
+                    "SOUNDNESS BUG: baseline config model is invalid \
+                     [seed={seed}, formula={i}, vars={num_vars}, clauses={num_clauses}]"
+                ));
+            }
         }
 
         // Differential comparison
-        if verdict_all != Verdict::Unknown && verdict_base != Verdict::Unknown {
-            assert_eq!(
-                verdict_all, verdict_base,
+        if verdict_all != Verdict::Unknown
+            && verdict_base != Verdict::Unknown
+            && verdict_all != verdict_base
+        {
+            return Err(format!(
                 "DISAGREEMENT: all-inprocessing={verdict_all:?} vs baseline={verdict_base:?} \
                  [seed={seed}, formula={i}, vars={num_vars}, clauses={num_clauses}]"
-            );
+            ));
         }
 
         match verdict_all {
-            Verdict::Sat => sat_count += 1,
-            Verdict::Unsat => unsat_count += 1,
+            Verdict::Sat => sat_count = sat_count.saturating_add(1),
+            Verdict::Unsat => unsat_count = unsat_count.saturating_add(1),
             Verdict::Unknown => {}
         }
     }
@@ -220,6 +256,45 @@ fn fuzz_mixed_clause_inprocessing(
         "cnf-fuzz mixed-clause inprocessing (seed={seed:#x}): {count} formulas, \
          {sat_count} SAT, {unsat_count} UNSAT"
     );
+    Ok(())
+}
+
+/// Render a caught panic payload as text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Run `body` on its own thread and fail if it errors, panics, or takes
+/// longer than `limit`. This is the `ntest::timeout` harness with every
+/// failure returned as an error instead of re-raised as a panic.
+fn run_with_timeout<F>(limit: Duration, body: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let started = Instant::now();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new().spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        // Send fails only if the receiver already timed out; that is expected.
+        let _ = sender.send(outcome);
+    })?;
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(result)) => result.map_err(Into::into),
+        Ok(Err(payload)) => Err(format!("panicked: {}", panic_message(payload.as_ref())).into()),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "timeout: the function call took {} ms. Max time {} ms",
+            started.elapsed().as_millis(),
+            limit.as_millis()
+        )
+        .into()),
+        Err(RecvTimeoutError::Disconnected) => Err("thread disconnected unexpectedly".into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,16 +312,18 @@ fn fuzz_mixed_clause_inprocessing(
 /// complementary edges at all emission sites (solver/inprocessing/congruence/
 /// mod.rs, proof_ladder.rs) and in forward subsumption's UF build.
 #[test]
-#[timeout(300_000)]
-fn cnf_fuzz_inprocessing_mixed_small() {
-    fuzz_mixed_clause_inprocessing(0xDEAD_8483_0001, 1000, 5, 15, 10, 40);
+fn cnf_fuzz_inprocessing_mixed_small() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_timeout(FUZZ_TIMEOUT, || {
+        fuzz_mixed_clause_inprocessing(0xDEAD_8483_0001, 1000, 5, 15, 10, 40)
+    })
 }
 
 /// Medium mixed-clause formulas: 10-25 vars, 20-60 clauses, 1000 instances.
 #[test]
-#[timeout(300_000)]
-fn cnf_fuzz_inprocessing_mixed_medium() {
-    fuzz_mixed_clause_inprocessing(0xDEAD_8483_0002, 1000, 10, 25, 20, 60);
+fn cnf_fuzz_inprocessing_mixed_medium() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_timeout(FUZZ_TIMEOUT, || {
+        fuzz_mixed_clause_inprocessing(0xDEAD_8483_0002, 1000, 10, 25, 20, 60)
+    })
 }
 
 /// Dense mixed-clause formulas: 8-12 vars, 30-80 clauses, 1000 instances.
@@ -254,15 +331,17 @@ fn cnf_fuzz_inprocessing_mixed_medium() {
 /// Also a regression witness for the congruence complementary-edge ICE —
 /// see `cnf_fuzz_inprocessing_mixed_small` (wf_ff5991a1 Defect 1).
 #[test]
-#[timeout(300_000)]
-fn cnf_fuzz_inprocessing_mixed_dense() {
-    fuzz_mixed_clause_inprocessing(0xDEAD_8483_0003, 1000, 8, 12, 30, 80);
+fn cnf_fuzz_inprocessing_mixed_dense() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_timeout(FUZZ_TIMEOUT, || {
+        fuzz_mixed_clause_inprocessing(0xDEAD_8483_0003, 1000, 8, 12, 30, 80)
+    })
 }
 
 /// Sparse mixed-clause formulas: 15-30 vars, 10-30 clauses, 1000 instances.
 /// Low clause/variable ratio produces mostly SAT, testing reconstruction.
 #[test]
-#[timeout(300_000)]
-fn cnf_fuzz_inprocessing_mixed_sparse() {
-    fuzz_mixed_clause_inprocessing(0xDEAD_8483_0004, 1000, 15, 30, 10, 30);
+fn cnf_fuzz_inprocessing_mixed_sparse() -> Result<(), Box<dyn std::error::Error>> {
+    run_with_timeout(FUZZ_TIMEOUT, || {
+        fuzz_mixed_clause_inprocessing(0xDEAD_8483_0004, 1000, 15, 30, 10, 30)
+    })
 }

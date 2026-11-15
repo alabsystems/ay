@@ -35,7 +35,7 @@ impl DratChecker {
     /// during conflict analysis — these are candidates for clause reduction
     /// (drat-trim.c:174-179).
     pub(super) fn check_rup_with_deps(&mut self, clause: &[Literal]) -> RupDepsResult {
-        self.stats.checks += 1;
+        self.stats.checks = self.stats.checks.saturating_add(1);
         self.bcp_conflict_cidx = None;
         if self.inconsistent {
             return RupDepsResult {
@@ -159,8 +159,13 @@ impl DratChecker {
             .iter()
             .copied()
             .filter(|&pos| {
-                let vi = clause[pos].variable().index();
-                vi >= self.conflict_marked.len() || !self.conflict_marked[vi]
+                // Every position came from enumerating `clause`, so the
+                // literal is always present; a missing one is kept (never
+                // reported as reducible).
+                clause.get(pos).is_some_and(|lit| {
+                    let vi = lit.variable().index();
+                    self.conflict_marked.get(vi) != Some(&true)
+                })
             })
             .collect();
 

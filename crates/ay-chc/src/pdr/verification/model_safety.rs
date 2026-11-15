@@ -26,8 +26,7 @@ impl PdrSolver {
         budget_start: Option<ay_core::time::Instant>,
         budget: Option<std::time::Duration>,
         query_clause_info: &mut Vec<QueryClauseInfo>,
-        concrete_budget: std::time::Duration,
-        concrete_elapsed: &mut std::time::Duration,
+        concrete: &mut concrete::ConcreteBudget,
         concrete_unsat_count: &mut u64,
     ) -> Option<(PredicateId, ChcExpr, PredicateId, ChcExpr)> {
         if self.config.verbose {
@@ -51,8 +50,17 @@ impl PdrSolver {
             .map(|(pred, args)| (*pred, args.clone()));
         query_clause_info.push((pred_info, invariant_body, bad_state));
 
+        // `body` with every top-level definition substituted away
+        // (`ChcExpr::eliminate_top_level_definitions`; its `unsat` is
+        // `body`'s). A model that pins a clause-local array to a store chain
+        // keeps the raw body in the array theory, where each check goes to the
+        // executor and, in the default proof-carrying posture, is slow or
+        // `unknown`. A SAT model names the eliminated variables again from
+        // the trail, and the fallbacks below keep checking the raw `body`.
+        let (simplified_body, eliminated) = body.eliminate_top_level_definitions_with_trail();
         // Fast-path: a syntactic contradiction implies UNSAT (safe to skip SMT).
-        if cube::is_trivial_contradiction(body) {
+        if cube::is_trivial_contradiction(body) || cube::is_trivial_contradiction(&simplified_body)
+        {
             if self.config.verbose {
                 safe_eprintln!(
                     "PDR: verify_model: clause {} is trivially UNSAT (contradiction)",
@@ -86,16 +94,31 @@ impl PdrSolver {
         // Use a short timeout by default to avoid getting stuck on mod-heavy queries.
         // If we get `Unknown` on a mod-free query, retry once with a longer timeout;
         // this avoids spurious verification failures on hard-but-linear queries.
-        let mut result = self.smt.check_sat_with_timeout(body, verify_step_timeout);
+        let mut result = self
+            .smt
+            .check_sat_with_timeout(&simplified_body, verify_step_timeout);
         if matches!(result, SmtResult::Unknown)
-            && !Self::contains_mod_or_div(body)
-            && !body.contains_array_ops()
+            && !Self::contains_mod_or_div(&simplified_body)
+            && !simplified_body.contains_array_ops()
         {
             self.smt.reset();
             result = self.smt.check_sat_with_timeout(
-                body,
+                &simplified_body,
                 self.current_verify_retry_timeout(budget_start, budget),
             );
+        }
+        if let SmtResult::Sat(candidate) = result {
+            result = self.confirm_original_validation_sat(
+                body,
+                &eliminated,
+                candidate,
+                verify_timeout,
+                budget_start,
+                budget,
+            );
+            if matches!(result, SmtResult::Unknown) {
+                return Some(Self::unconfirmed_model());
+            }
         }
         match result {
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
@@ -110,30 +133,35 @@ impl PdrSolver {
                 // (shared counter already >10 from transition clauses) skipped
                 // the query-clause check, letting an SMT false-UNSAT through
                 // as a false Safe. Query clauses are one per model
-                // verification and the check is bounded by `concrete_budget`.
+                // verification and the check is bounded by `concrete`.
                 *concrete_unsat_count += 1;
-                if *concrete_elapsed < concrete_budget {
-                    let check_start = ay_core::time::Instant::now();
-                    if let Some(cex_model) =
-                        concrete::transition_check(body, &ChcExpr::Bool(true), body)
-                    {
-                        tracing::warn!(
-                            clause_idx,
-                            ?cex_model,
-                            "verify_model: query clause SMT said UNSAT but concrete check found SAT (#5803)"
-                        );
-                        return Some((
-                            PredicateId::new(0),
-                            ChcExpr::Bool(false),
-                            PredicateId::new(0),
-                            ChcExpr::Bool(false),
-                        ));
+                if concrete.has_room() {
+                    match concrete.check(body, body) {
+                        concrete::ConcreteAnswer::Witness(cex_model) => {
+                            tracing::warn!(
+                                clause_idx,
+                                ?cex_model,
+                                "verify_model: query clause SMT said UNSAT but concrete check found SAT (#5803)"
+                            );
+                            return Some((
+                                PredicateId::new(0),
+                                ChcExpr::Bool(false),
+                                PredicateId::new(0),
+                                ChcExpr::Bool(false),
+                            ));
+                        }
+                        // The solve is over: no acceptance on an unfinished check.
+                        concrete::ConcreteAnswer::Interrupted => {
+                            return Some(Self::unconfirmed_model())
+                        }
+                        concrete::ConcreteAnswer::NoWitness => {}
                     }
-                    *concrete_elapsed += check_start.elapsed();
                 }
             }
             SmtResult::Sat(m) => {
+                // Refutation was confirmed on the original body above.
                 let mut m = m;
+                ChcExpr::extend_model_by_definitions(&eliminated, &mut m);
                 if m.is_empty() {
                     Self::extract_equalities_from_formula(body, &mut m);
                 }
@@ -329,3 +357,7 @@ impl PdrSolver {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "model_safety/definition_tests.rs"]
+mod definition_tests;

@@ -72,6 +72,11 @@ use num_traits::{One, Signed, Zero};
 /// Red zone size for `stacker::maybe_grow` in DAG recursion (#8414).
 const DV_STACK_RED_ZONE: usize = 32 * 1024;
 
+/// `TermStore::mk_internal_symbol`'s purpose for the difference variables:
+/// they are spelled `__ay_eqdv!{n}`, `n` the store's variable counter, which
+/// the arena prune's allow-list relies on (`is_counter_only_internal_name`).
+pub(crate) const EQ_DIFF_VARIABLE_PURPOSE: &str = "eqdv";
+
 /// Stack segment size allocated by stacker for DAG recursion.
 const DV_STACK_SIZE: usize = 1024 * 1024;
 
@@ -346,7 +351,7 @@ impl EqDiffVar {
                     if dvar_order.len() >= MAX_DIFF_VARS {
                         continue;
                     }
-                    let name = terms.mk_internal_symbol("eqdv");
+                    let name = terms.mk_internal_symbol(EQ_DIFF_VARIABLE_PURPOSE);
                     let d = terms.mk_var(name, Sort::Int);
                     dvar_of.insert(key.clone(), d);
                     dvar_order.push((key.clone(), d));

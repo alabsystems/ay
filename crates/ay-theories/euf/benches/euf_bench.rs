@@ -12,9 +12,10 @@
 use ay_core::term::{Symbol, TermId, TermStore};
 use ay_core::Sort;
 use ay_core::TheorySolver;
+use ay_criterion_main::criterion_main;
 use ay_euf::EufSolver;
 use ay_test_support::env::lock_env;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 
 struct EufBenchProblem {
     terms: TermStore,

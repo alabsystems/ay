@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% The same underflow one width up, in `GeneralPBConstraint::<i128>::add`: the defect is a
+% property of the narrow-width code, not an `i64` edge case, so widening moves the
+% threshold rather than closing the hole. The formula is trivially true.
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

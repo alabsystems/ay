@@ -69,8 +69,17 @@ impl LratChecker {
             // Use deleted_originals (not total deleted) for coverage check.
             // Derived-clause deletions must NOT count toward original coverage.
             // CaDiCaL lratchecker.cpp:797-811 tracks originals separately.
-            let accounted = self.stats.finalized + self.stats.deleted_originals;
-            if accounted != self.stats.originals {
+            // A sum that overflows u64 exceeds every possible `originals`,
+            // so it is a mismatch exactly as the unbounded sum would be.
+            let accounted = self
+                .stats
+                .finalized
+                .checked_add(self.stats.deleted_originals);
+            if accounted != Some(self.stats.originals) {
+                let accounted = match accounted {
+                    Some(sum) => sum.to_string(),
+                    None => "more than u64::MAX".to_string(),
+                };
                 let _ = writeln!(
                     std::io::stderr(),
                     "LRAT conclude_unsat: finalization check failed: \

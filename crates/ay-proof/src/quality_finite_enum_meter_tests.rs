@@ -127,6 +127,7 @@ fn argument_free_unit_tail_gets_linear_charge_but_annotated_tail_does_not() {
         work: 1024,
         bytes: 4096,
         unfolded_work: 8192,
+        fp_assignments: 0,
         order_assignments: 0,
     };
 
@@ -152,6 +153,7 @@ fn datatype_enum_charge_covers_registry_scans_and_hash_scratch() {
         work: 101,
         bytes: 2048,
         unfolded_work: 73,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let datatype_registry = RegistryPayloadStats {
@@ -254,6 +256,7 @@ fn farkas_without_a_progress_meter_keeps_the_static_polynomial_byte_charge() {
         work: 1_321,
         bytes: 24_786,
         unfolded_work: 100,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (work, bytes) = semantic_validator_charge(&step, payload, SemanticChargeClass::General)

@@ -1,0 +1,8 @@
+(set-logic QF_BV)
+(declare-const acc (_ BitVec 64))
+(declare-const a2 (_ BitVec 64))
+(declare-const a1 (_ BitVec 64))
+(declare-const a0 (_ BitVec 64))
+(assert (not (= (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvadd (bvmul (_ bv2 64) a1) (bvmul (_ bv4 64) a2)) a0) a0) a0) a1) a2) acc) (bvadd (bvadd (bvadd (bvmul (_ bv3 64) a0) (bvmul (_ bv3 64) a1)) (bvmul (_ bv5 64) a2)) acc))))
+(check-sat)
+(exit)

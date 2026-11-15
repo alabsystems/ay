@@ -155,9 +155,10 @@ fn z3_500_zero_argument_arithmetic_apps_are_rejected() {
             "(assert (= (-) 0))",
             "(assert (= (*) 1))",
         ] {
+            // It does not parse, as in z3.
             let input = format!("{logic_prefix}{assertion}");
             assert!(
-                elaboration_rejects(&input),
+                parse(&input).is_err(),
                 "zero-argument arithmetic must be rejected: {input}"
             );
         }

@@ -360,6 +360,16 @@ pub(crate) fn curated_smt_statistics(
         &format!("{:.3}", elapsed.as_secs_f64()),
     );
     curated_row(&mut out, ":time", &format!("{:.2}", stats.time_seconds));
+    // z3's work meter. `-st` is z3's spelling, and z3 prints four resource rows
+    // on every run: `:time` (above), `:memory` and `:max-memory` (below), and
+    // this one — the only one not read off a clock or the allocator, so the
+    // only one that reproduces across hosts. It is a meter, not a budget:
+    // `rlimit=` is accepted as a no-op (`is_allowlisted_z3_param`), so nothing
+    // is enforced against it. Selected, not invented: the full block prints it
+    // unconditionally. The Meridian mockup (58f2aaa13) moved it to the z3-mode
+    // `-st` block its PR4 was to add; until a z3-shaped block ships, this row
+    // is what keeps z3's resource keys on `-st`.
+    curated_row(&mut out, ":rlimit-count", &stats.rlimit_count.to_string());
 
     group(&mut out, "search");
     for (key, value) in [
@@ -413,6 +423,14 @@ pub(crate) fn curated_smt_statistics(
         // disagree on a key's spelling or on the order they appear in.
         for (key, value) in stats.guarded_quantifier_counters() {
             curated_row(&mut out, key, &value.to_string());
+        }
+    }
+
+    let routes = route_rows::quantified_route_rows(stats);
+    if !routes.is_empty() {
+        group(&mut out, "quantified routes");
+        for (key, value) in routes {
+            curated_row(&mut out, &key, &value);
         }
     }
 
@@ -475,6 +493,8 @@ pub(crate) fn curated_smt_statistics(
     out.push(')');
     out
 }
+
+mod route_rows;
 
 #[cfg(test)]
 mod tests;

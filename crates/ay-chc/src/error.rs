@@ -38,6 +38,9 @@ pub enum ChcError {
     #[error("timeout after {0} iterations")]
     Timeout(usize),
 
+    #[error("term-memory budget exhausted")]
+    TermMemoryBudgetExhausted,
+
     #[error("internal error: {0}")]
     Internal(String),
 

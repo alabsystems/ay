@@ -11,6 +11,52 @@ use crate::pdr::{CexVerificationResult, PdrConfig, PdrSolver};
 use crate::{ClauseBody, ClauseHead, HornClause};
 use ntest::timeout;
 
+mod direct_memory;
+mod head_only_vars;
+mod model_checker_consumer_acyclic;
+
+/// Inside a CHC proof run under an effort BMC does not run (P4a slice 8): its
+/// executor batches charge the run nothing and its budgets are wall clocks.
+/// It answers `unknown` and the run counts the closed route; a replay is
+/// refused before the process-wide memo is read. Outside one it decides.
+#[test]
+fn bmc_is_closed_inside_a_run_under_an_effort() {
+    let problem = ChcParser::parse(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int) (xp Int)) (=> (and (Inv x) (= xp (+ x 1))) (Inv xp))))
+(assert (forall ((x Int)) (=> (and (Inv x) (>= x 3)) false)))
+(check-sat)
+"#,
+    )
+    .expect("counter fixture parses");
+    let config = BmcConfig::with_engine_config(6, false, None);
+    let meter = crate::run_meter::RunMeter::open(Some(1 << 40), None);
+    assert!(matches!(
+        BmcSolver::new(problem.clone(), config.clone()).solve(),
+        ChcEngineResult::Unknown
+    ));
+    assert!(BmcSolver::replay_confirm_unsafe_on_problem(
+        &problem,
+        4,
+        std::time::Duration::from_secs(5),
+        None,
+        false,
+    )
+    .is_none());
+    let work = meter.close().expect("the run is metered");
+    assert_eq!(
+        (work.closed_route_checks, work.ticks),
+        (2, 0),
+        "both refused before any work"
+    );
+    assert!(matches!(
+        BmcSolver::new(problem, config).solve(),
+        ChcEngineResult::Unsafe(_)
+    ));
+}
+
 #[test]
 fn incremental_bmc_script_declares_problem_ufs_under_compatible_logic() {
     let problem = ChcParser::parse(
@@ -34,6 +80,42 @@ fn incremental_bmc_script_declares_problem_ufs_under_compatible_logic() {
         "the persistent session must declare source UFs before any unrolled assertion: {}",
         segments[0]
     );
+}
+
+/// A transition whose tree expansion is huge but whose DAG is small (nested
+/// `let`s, each binding used three times) is printed with `let` bindings, so
+/// the persistent session's script stays linear in the DAG. The tree text of
+/// this fixture is 3^14 occurrences (megabytes); the LRA-Lin memouts printed
+/// gigabytes per depth this way.
+#[test]
+fn incremental_bmc_script_prints_a_dag_transition_linearly() {
+    let mut body = String::from("(= xp a14)");
+    for level in (1..=14).rev() {
+        let prev = level - 1;
+        body = format!("(let ((a{level} (ite (> a{prev} 0.0) a{prev} (- a{prev})))) {body})");
+    }
+    let script = format!(
+        r#"(set-logic HORN)
+(declare-fun Inv (Real) Bool)
+(assert (Inv 0.0))
+(assert (forall ((x Real) (xp Real))
+  (=> (and (Inv x) (let ((a0 (+ x 1.0))) {body})) (Inv xp))))
+(assert (forall ((x Real)) (=> (and (Inv x) (> x 10.0)) false)))
+(check-sat)
+"#
+    );
+    let problem = ChcParser::parse(&script).expect("let-nested transition fixture parses");
+
+    let segments = BmcSolver::ts_incremental_script_segments_for_test(problem, 1)
+        .expect("fixture lowers to an incremental transition system");
+    let transition = &segments[2];
+    assert!(
+        transition.len() < 64 * 1024,
+        "the transition is printed as a DAG ({} bytes)",
+        transition.len()
+    );
+    assert!(transition.contains("(let ("), "shared nodes are let-bound");
+    ay_frontend::parse(&segments.concat()).expect("the session script parses");
 }
 
 fn create_large_acyclic_int_chain_for_exact_first_9004(pred_count: usize) -> ChcProblem {
@@ -1257,6 +1339,77 @@ fn test_bmc_default_max_depth_200() {
     );
 }
 
+/// Pin conservative BMC constructor defaults: bounded exhaustion is `Unknown`
+/// unless callers explicitly opt into the acyclic-safe mode.
+///
+/// Ported from the pre-publication history (a300268979, 2026-05-17).
+#[test]
+fn test_bmc_constructors_keep_acyclic_safe_opt_in() {
+    let default = BmcConfig::default();
+    assert!(
+        !default.acyclic_safe,
+        "BmcConfig::default must not claim Safe after bounded exhaustion"
+    );
+    assert!(
+        !default.proof_cross_check,
+        "BmcConfig::default must not enable proof cross-check mode"
+    );
+
+    let with_engine = BmcConfig::with_engine_config(7, true, None);
+    assert!(
+        !with_engine.acyclic_safe,
+        "with_engine_config must preserve the conservative bounded-exhaustion default"
+    );
+    assert!(
+        !with_engine.proof_cross_check,
+        "with_engine_config must not enable proof cross-check mode"
+    );
+
+    let hwmcc = BmcConfig::hwmcc();
+    assert!(
+        !hwmcc.acyclic_safe,
+        "hwmcc preset must not opt into acyclic-safe exhaustion"
+    );
+    assert!(
+        !hwmcc.proof_cross_check,
+        "hwmcc preset must not enable proof cross-check mode"
+    );
+
+    let deep_bug_finding = BmcConfig::deep_bug_finding();
+    assert!(
+        !deep_bug_finding.acyclic_safe,
+        "deep bug finding must remain counterexample search only"
+    );
+    assert!(
+        !deep_bug_finding.enable_k_induction,
+        "deep bug finding must not prove Safe via k-induction"
+    );
+    assert!(
+        !deep_bug_finding.proof_cross_check,
+        "deep bug finding must not enable proof cross-check mode"
+    );
+
+    let cross_check = BmcConfig::cross_check();
+    assert!(
+        !cross_check.acyclic_safe,
+        "proof cross-check must not report Safe from bounded exhaustion"
+    );
+    assert!(
+        !cross_check.enable_k_induction,
+        "proof cross-check must remain pure counterexample search"
+    );
+    assert!(
+        cross_check.proof_cross_check,
+        "cross_check constructor should keep proof cross-check mode enabled"
+    );
+
+    let opted_in = BmcConfig::default().with_acyclic_safe(true);
+    assert!(
+        opted_in.acyclic_safe,
+        "with_acyclic_safe(true) is the explicit opt-in for bounded Safe"
+    );
+}
+
 /// Test HWMCC preset configuration (#7969).
 #[test]
 fn test_bmc_hwmcc_config() {
@@ -2364,6 +2517,88 @@ fn test_replay_confirm_unsafe_on_problem_rejects_safe() {
     );
 }
 
+/// The single-executor frame schedule completes every level below the
+/// checked depth and asserts only the query predicates' slice of the checked
+/// level; the other slice follows one depth later, also across adaptive skips.
+#[test]
+fn single_executor_frames_defer_non_query_slices_by_one_depth() {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
+    let end_query = problem.declare_predicate("END_QUERY", vec![]);
+    let query = HornClause::new(
+        ClauseBody::new(vec![(end_query, vec![])], None),
+        ClauseHead::False,
+    );
+    let mut frames = SingleExecutorFrames::new(&[&query]);
+    assert!(frames.includes(FrameSlice::QueryPredicates, end_query));
+    assert!(!frames.includes(FrameSlice::QueryPredicates, inv));
+    assert!(frames.includes(FrameSlice::OtherPredicates, inv));
+    assert!(!frames.includes(FrameSlice::OtherPredicates, end_query));
+    assert!(frames.includes(FrameSlice::All, inv) && frames.includes(FrameSlice::All, end_query));
+
+    assert_eq!(frames.plan(1), vec![(1, FrameSlice::QueryPredicates)]);
+    frames.advance(1);
+    assert_eq!(
+        frames.plan(2),
+        vec![
+            (1, FrameSlice::OtherPredicates),
+            (2, FrameSlice::QueryPredicates)
+        ]
+    );
+    frames.advance(2);
+    // Adaptive stepping from depth 2 straight to depth 5.
+    assert_eq!(
+        frames.plan(5),
+        vec![
+            (2, FrameSlice::OtherPredicates),
+            (3, FrameSlice::All),
+            (4, FrameSlice::All),
+            (5, FrameSlice::QueryPredicates),
+        ]
+    );
+    frames.advance(5);
+    assert_eq!(
+        frames.plan(6),
+        vec![
+            (5, FrameSlice::OtherPredicates),
+            (6, FrameSlice::QueryPredicates)
+        ]
+    );
+}
+
+/// heap__swaparray_000 (official verdict false) is violated by its fact alone,
+/// but the nullary `END_QUERY => false` query puts that witness at BMC depth
+/// 1. The replay must confirm it inside the production 10s replay budget.
+/// Asserting the whole level-1 frame too (the in-place swap store chains of
+/// all three transitions, unreachable from the depth-1 query) made the
+/// executor spend the whole budget and answer unknown, so every witness-free
+/// Unsafe on this instance -- PDR's init-violation counterexamples from the
+/// ghost-pair route and the non-inlined PDR stage -- burned 10s and was
+/// rejected, starving the cyclic-array BMC lane of its budget.
+#[test]
+#[timeout(120000)]
+fn test_replay_confirm_unsafe_heap_swaparray_depth_one_witness_skips_dead_frame() {
+    let problem = ChcParser::parse(include_str!(
+        "../../tests/fixtures/chc_comp/llreve/heap__swaparray_000.smt2"
+    ))
+    .expect("parse heap__swaparray_000");
+    let cex = BmcSolver::replay_confirm_unsafe_on_problem(
+        &problem,
+        2,
+        std::time::Duration::from_secs(10),
+        None,
+        false,
+    )
+    .expect("the depth-1 END_QUERY witness must replay-confirm within the 10s replay budget");
+    let witness = cex
+        .witness
+        .expect("a confirmed replay carries its verified witness");
+    assert!(
+        witness.entries.len() >= 2,
+        "witness must derive INV_MAIN_42 from the fact and END_QUERY from it: {witness:?}"
+    );
+}
+
 /// inc-9 replay verifier: nonlinear problems are out of scope and rejected.
 #[test]
 #[timeout(60000)]
@@ -2416,6 +2651,7 @@ fn test_verify_without_witness_multipred_replay_valid_and_unknown_not_spurious()
             .map(|p| CounterexampleStep::new(*p, FxHashMap::default()))
             .collect(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -2479,6 +2715,7 @@ fn test_verify_without_witness_disable_cex_replay_returns_unknown() {
             CounterexampleStep::new(preds[1], FxHashMap::default()),
         ],
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
     assert_eq!(
@@ -2670,6 +2907,63 @@ fn bounded_tree_refutation_no_false_unsafe_on_safe() {
         !matches!(r, ChcEngineResult::Unsafe(_)),
         "must not fabricate Unsafe on a SAFE problem, got {r:?}"
     );
+}
+
+#[test]
+fn committed_node_alias_cleanup_keeps_active_constraints_and_array_contents() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::BitVec(8)), Box::new(ChcSort::BitVec(8)));
+    let mut links: Vec<ChcExpr> = (0..1024)
+        .map(|index| {
+            ChcExpr::eq(
+                ChcExpr::var(ChcVar::new(format!("unused_{index}"), array_sort.clone())),
+                ChcExpr::var(ChcVar::new(
+                    format!("__tree_n{index}_a0"),
+                    array_sort.clone(),
+                )),
+            )
+        })
+        .collect();
+    let state = ChcExpr::var(ChcVar::new("__tree_n1024_a0", array_sort.clone()));
+    let incoming = ChcExpr::var(ChcVar::new("active", array_sort));
+    let value = ChcExpr::ConstArray(
+        ChcSort::BitVec(8),
+        std::sync::Arc::new(ChcExpr::BitVec(5, 8)),
+    );
+    // The second active definition conflicts syntactically with the first.
+    // Both must survive, while unrelated inactive aliases disappear.
+    links.push(ChcExpr::eq(incoming.clone(), state.clone()));
+    links.push(ChcExpr::eq(state, value));
+    for expected in [5, 6] {
+        let mut problem = links.clone();
+        problem.push(ChcExpr::eq(
+            ChcExpr::Op(
+                ChcOp::Select,
+                vec![
+                    std::sync::Arc::new(incoming.clone()),
+                    std::sync::Arc::new(ChcExpr::BitVec(32, 8)),
+                ],
+            ),
+            ChcExpr::BitVec(expected, 8),
+        ));
+        let (normalized, _) = BmcSolver::eliminate_dt_bmc_intermediate_defs(&problem);
+        assert!(
+            normalized.collect_conjuncts_nontrivial().len() < 16,
+            "inactive alias residue must not consume the ground-fold/model budget"
+        );
+        let mut smt = crate::smt::SmtContext::new();
+        let result = smt.check_sat_with_timeout(&normalized, std::time::Duration::from_secs(2));
+        if expected == 5 {
+            assert!(
+                matches!(result, SmtResult::Sat(_)),
+                "the unobserved array default remains five: {result:?}"
+            );
+        } else {
+            assert!(
+                result.is_unsat(),
+                "the active array equality cannot be deleted: {result:?}"
+            );
+        }
+    }
 }
 
 // Datatype refutation isolation pin. The built-in Nat instance exercises the
@@ -4289,6 +4583,7 @@ fn solve_multi_lane_level_bmc(multi_query: bool) -> ChcEngineResult {
     let solver = BmcSolver::new(
         create_multi_lane_query_problem(multi_query),
         BmcConfig {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig::default(),
             max_depth: 6,
             acyclic_safe: false,
@@ -4298,7 +4593,11 @@ fn solve_multi_lane_level_bmc(multi_query: bool) -> ChcEngineResult {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         },
     );
@@ -4339,6 +4638,7 @@ fn test_level_bmc_multi_lane_unsafe_derivation_ground_validates() {
     let solver = BmcSolver::new(
         problem.clone(),
         BmcConfig {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig::default(),
             max_depth: 6,
             acyclic_safe: false,
@@ -4348,7 +4648,11 @@ fn test_level_bmc_multi_lane_unsafe_derivation_ground_validates() {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         },
     );
@@ -4442,6 +4746,7 @@ fn test_level_bmc_safe_multi_lane_queries_never_unsafe() {
     let solver = BmcSolver::new(
         create_safe_multi_lane_query_problem(),
         BmcConfig {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig::default(),
             max_depth: 6,
             acyclic_safe: false,
@@ -4451,7 +4756,11 @@ fn test_level_bmc_safe_multi_lane_queries_never_unsafe() {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         },
     );
@@ -4476,6 +4785,7 @@ fn test_level_bmc_safe_multi_lane_queries_never_unsafe() {
 /// Level-BMC configuration mirroring the model-checker-consumer driver's scalarized probe.
 fn residual_level_bmc_config() -> BmcConfig {
     BmcConfig {
+        smt_lane: crate::smt::SmtLane::Verification,
         base: ChcEngineConfig::default(),
         max_depth: 6,
         acyclic_safe: false,
@@ -4485,7 +4795,11 @@ fn residual_level_bmc_config() -> BmcConfig {
         enable_k_induction: false,
         enable_adaptive_stepping: false,
         proof_cross_check: false,
+        memory_budget: None,
         ts_probe_clamp: None,
+        soft_time_budget: None,
+        probe_extension_deadline: None,
+        resume_frontier: None,
         sweep_past_spurious_sat: true,
     }
 }
@@ -4825,10 +5139,10 @@ fn repeated_body_predicate_scan_distinguishes_duplicate_and_distinct() {
     };
 
     let repeated = BmcSolver::new(build_problem(true), BmcConfig::default());
-    assert_eq!(repeated.has_repeated_body_predicate(), Some(true));
+    assert_eq!(repeated.level_flat_may_alias_ancestry(), Some(true));
 
     let distinct = BmcSolver::new(build_problem(false), BmcConfig::default());
-    assert_eq!(distinct.has_repeated_body_predicate(), Some(false));
+    assert_eq!(distinct.level_flat_may_alias_ancestry(), Some(false));
 }
 
 #[test]
@@ -4848,7 +5162,7 @@ fn repeated_body_predicate_scan_stops_fail_closed() {
     expired
         .solve_deadline
         .set(Some(ay_core::time::Instant::now()));
-    assert_eq!(expired.has_repeated_body_predicate(), None);
+    assert_eq!(expired.level_flat_may_alias_ancestry(), None);
     assert!(matches!(
         expired.resolve_unrepresentable_safe(ChcEngineResult::Safe(InvariantModel::default())),
         ChcEngineResult::Unknown
@@ -4861,7 +5175,7 @@ fn repeated_body_predicate_scan_stops_fail_closed() {
         BmcConfig::default().with_cancellation(cancellation.clone()),
     );
     cancellation.cancel();
-    assert_eq!(cancelled.has_repeated_body_predicate(), None);
+    assert_eq!(cancelled.level_flat_may_alias_ancestry(), None);
     assert!(matches!(
         cancelled.resolve_unrepresentable_safe(ChcEngineResult::Safe(InvariantModel::default())),
         ChcEngineResult::Unknown
@@ -4895,8 +5209,8 @@ fn repeated_body_predicate_never_reports_safe() {
 
 /// The fail-closed guard must not fire on bodies it does not apply to.
 ///
-/// Distinct body predicates share no level argument, so the level-flat encoding
-/// represents them exactly and `acyclic_safe` exhaustion stays sound.
+/// These distinct body predicates also have disjoint ancestry, so their
+/// level arguments stay independent and `acyclic_safe` exhaustion stays sound.
 #[test]
 fn distinct_body_predicates_still_reach_safe() {
     let smt = r#"
@@ -4918,7 +5232,7 @@ fn distinct_body_predicates_still_reach_safe() {
     let result = solver.solve();
     assert!(
         matches!(result, ChcEngineResult::Safe(_)),
-        "distinct body predicates are encoded exactly; this must stay Safe, got {result:?}"
+        "these disjoint predicate cones must stay Safe, got {result:?}"
     );
 }
 
@@ -4989,6 +5303,76 @@ fn tree_refutation_handles_multi_premise_query() {
     assert!(
         matches!(result, ChcEngineResult::Unsafe(_)),
         "the derivation-tree lane must refute a multi-premise query, got {result:?}"
+    );
+}
+
+/// Lever L2 (`LRA_L2_bmc_real_lane_2026-09-24.md`, `DPLL_LRA_perf_2026-09-23.md`
+/// §2.3-§2.5): T6's BMC counterexample-search policy
+/// (`BmcSolver::configure_cex_search_executor`) — BCP-time LRA implied bounds
+/// off plus forbidding the #9505 every-decision theory-branching mode — was
+/// tuned entirely on Int/Bool transition systems
+/// (`BMC_T6_model_search_2026-09-19.md`: DRAGON/FIREFLY/MESI/peterson/metros,
+/// all QF_LIA). The same lanes also run on pure-Real (QF_LRA) transition
+/// systems, where the corpus knob A/B found leaving the every-decision mode
+/// off actively hurts (theory propagations fall to about a third and several
+/// LRA-Lin BMC/IMC queries that solve under the default posture go
+/// `unknown`). Pin the resulting scoping directly against the executor's own
+/// getters, on both sides, so a future edit to `configure_cex_search_executor`
+/// cannot silently widen or narrow it.
+#[test]
+fn cex_search_executor_policy_is_real_vs_int_scoped() {
+    let int_smt = r#"
+(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (Inv 0))
+(assert (forall ((x Int)) (=> (Inv x) (Inv (+ x 1)))))
+(assert (forall ((x Int)) (=> (and (Inv x) (> x 10)) false)))
+(check-sat)
+"#;
+    let real_smt = r#"
+(set-logic HORN)
+(declare-fun Inv (Real) Bool)
+(assert (Inv 0.0))
+(assert (forall ((x Real)) (=> (Inv x) (Inv (+ x 1.0)))))
+(assert (forall ((x Real)) (=> (and (Inv x) (> x 10.0)) false)))
+(check-sat)
+"#;
+
+    let int_problem =
+        crate::parser::ChcParser::parse(int_smt).expect("Int TS fixture should parse");
+    assert!(!int_problem.has_real_sorts(), "fixture sanity: Int problem");
+    let int_solver = BmcSolver::new(int_problem, BmcConfig::default());
+    let mut int_exec = crate::smt::executor_adapter::new_search_executor();
+    int_solver.configure_cex_search_executor(&mut int_exec);
+    assert!(
+        int_exec.no_lra_bcp_implied_bounds(),
+        "Int/Bool BMC lanes must keep T6's BCP-implied-bounds-off policy"
+    );
+    assert!(
+        int_exec.no_theory_every_decision(),
+        "Int/Bool BMC lanes must keep T6's every-decision opt-out"
+    );
+
+    let real_problem =
+        crate::parser::ChcParser::parse(real_smt).expect("Real TS fixture should parse");
+    assert!(
+        real_problem.has_real_sorts(),
+        "fixture sanity: Real problem"
+    );
+    let real_solver = BmcSolver::new(real_problem, BmcConfig::default());
+    let mut real_exec = crate::smt::executor_adapter::new_search_executor();
+    real_solver.configure_cex_search_executor(&mut real_exec);
+    assert!(
+        !real_exec.no_lra_bcp_implied_bounds(),
+        "L2: Real-sorted BMC transition systems must keep the executor default \
+         (BCP-time implied bounds ON) -- T6 was tuned on Int, and the corpus \
+         A/B found this posture hurts pure-Real BMC/IMC queries"
+    );
+    assert!(
+        !real_exec.no_theory_every_decision(),
+        "L2: Real-sorted BMC transition systems must keep the #9505 \
+         every-decision mode available -- turning it off cut propagations to \
+         about a third and cost several LRA-Lin BMC/IMC queries their solve"
     );
 }
 

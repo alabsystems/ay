@@ -57,6 +57,22 @@ const SOLVER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// the 3s margin between the 27s solve budget and 30s wall-clock limit).
 const PARALLEL_TIMEOUT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+/// Cap on the EAGER validation slice granted to a witness-less Unsafe cex the
+/// moment it arrives in the parallel receive loop (see
+/// [`PortfolioSolver::witnessless_eager_validation_slice`]). Matches the
+/// witness-free replay's own `REPLAY_BUDGET`, so a replay that needs its full
+/// allowance can still get it when the window is wide.
+const WITNESSLESS_EAGER_VALIDATION_CAP: Duration = Duration::from_secs(10);
+/// Below this much slice the eager attempt is not worth the context switch:
+/// the cex goes straight to the reserve drain.
+const WITNESSLESS_EAGER_VALIDATION_MIN: Duration = Duration::from_millis(50);
+/// Bounds of the tail of the parallel window reserved for validating deferred
+/// witness-less Unsafe cexs BEFORE the authoritative boundary
+/// ([`PortfolioSolver::witnessless_validation_reserve`]).
+const WITNESSLESS_VALIDATION_RESERVE_MIN: Duration = Duration::from_millis(500);
+const WITNESSLESS_VALIDATION_RESERVE_MAX: Duration = Duration::from_secs(5);
+const WITNESSLESS_VALIDATION_RESERVE_FRACTION: f64 = 0.10;
+
 /// Grace period for sequential engine timeouts (#7899).
 ///
 /// When a sequential engine's budget expires, the engine is cooperatively
@@ -170,9 +186,12 @@ enum ParallelSpawnOutcome {
 
 /// Panic-safe ownership of every worker spawned by one parallel invocation.
 ///
-/// Explicit scheduler exits call [`Self::reap`]. If validation or reporting
-/// unwinds first, Drop still cancels and joins every worker, preserving the
-/// no-hidden-overlap contract for embedding callers that catch AY panics.
+/// Scheduler exits without a verdict call [`Self::reap`] (synchronous join);
+/// exits with a validated verdict call [`Self::reap_after_verdict`] (join
+/// within a bound, then detach cancelled stragglers). If validation or
+/// reporting unwinds first, Drop still cancels and joins every worker,
+/// preserving the no-hidden-overlap contract for embedding callers that catch
+/// AY panics.
 struct ParallelWorkerGroup {
     handles: Option<Vec<(usize, thread::JoinHandle<()>)>>,
     cancellation: crate::cancellation::CancellationToken,
@@ -224,7 +243,75 @@ impl ParallelWorkerGroup {
             PortfolioSolver::reap_parallel_workers(handles, self.verbose, reason);
         }
     }
+
+    /// Reap after a VALIDATED definitive result: join every cancelled worker
+    /// that exits within `bound`, then detach the rest and return.
+    ///
+    /// The verdict is final once `accept_or_reject` has accepted it; a loser
+    /// that keeps computing after cancellation must not hold it back. Before
+    /// this bound, `metros_4_e2_968_e3_931` (LIA-Lin) had IMC's Safe accepted
+    /// at 25 s while the synchronous join waited on PDKind (21 s of post-cancel
+    /// interpolation) and CEGAR (never exited before the 62 s hard exit), so
+    /// the run printed `unknown`. A detached worker observes its cancelled
+    /// token (every SMT check on its lane answers `Unknown`,
+    /// `ScopedLaneCancellation`), its channel sender has no receiver, and it
+    /// owns only clones of the problem and configuration; its only effect is
+    /// the resources it holds until it notices the cancellation. Engines that
+    /// honour cancellation exit well within `bound` and are still joined.
+    fn reap_after_verdict(
+        &mut self,
+        reason: &'static str,
+        bound: Duration,
+        engine_names: &[&'static str],
+    ) {
+        let Some(mut handles) = self.handles.take() else {
+            return;
+        };
+        let started = ay_core::time::Instant::now();
+        let give_up_at = started + bound;
+        loop {
+            let mut position = 0;
+            while position < handles.len() {
+                if handles[position].1.is_finished() {
+                    let (idx, handle) = handles.swap_remove(position);
+                    PortfolioSolver::reap_parallel_workers(
+                        vec![(idx, handle)],
+                        self.verbose,
+                        reason,
+                    );
+                } else {
+                    position += 1;
+                }
+            }
+            let now = ay_core::time::Instant::now();
+            if handles.is_empty() || now >= give_up_at {
+                break;
+            }
+            thread::sleep(
+                give_up_at
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(2)),
+            );
+        }
+        for (idx, handle) in handles {
+            if self.verbose {
+                safe_eprintln!(
+                    "Portfolio: Engine {} ({}) detached after {}: still running {:?} after cancellation",
+                    idx,
+                    engine_names.get(idx).copied().unwrap_or("?"),
+                    reason,
+                    started.elapsed()
+                );
+            }
+            // Dropping the handle detaches the cancelled worker.
+            drop(handle);
+        }
+    }
 }
+
+/// Longest a validated definitive result waits for its cancelled siblings
+/// before they are detached ([`ParallelWorkerGroup::reap_after_verdict`]).
+pub(crate) const VERDICT_REAP_BOUND: Duration = Duration::from_millis(500);
 
 impl Drop for ParallelWorkerGroup {
     fn drop(&mut self) {
@@ -238,6 +325,15 @@ std::thread_local! {
     pub(super) static FORCE_SOLVER_THREAD_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
     pub(super) static PARALLEL_TEST_PREPARE_DELAY: Cell<Option<(usize, Duration)>> = const { Cell::new(None) };
     pub(super) static PARALLEL_TEST_DISABLE_LANE_TIMER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Whether `payload` is the lane memory guard's forced unwind
+/// (`expr::LANE_MEMORY_UNWIND`): an engine stopped for exceeding its memory
+/// share, not an engine bug.
+fn is_lane_memory_unwind(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload
+        .downcast_ref::<&'static str>()
+        .is_some_and(|message| *message == crate::expr::LANE_MEMORY_UNWIND)
 }
 
 /// Extract a human-readable message from a panic payload.
@@ -296,12 +392,16 @@ impl PortfolioSolver {
         }
     }
 
-    /// Cancelled parallel workers must be gone before a portfolio returns.
+    /// Cancelled parallel workers must be gone before a portfolio returns
+    /// without a verdict.
     ///
     /// This is intentionally a synchronous fail-closed barrier. A worker that
     /// ignores cooperative cancellation is an engine bug; detaching it would
     /// let its solver state and process-global accounting overlap a successor
-    /// query, multiplying the embedding caller's resource envelope.
+    /// query, multiplying the embedding caller's resource envelope. A
+    /// VALIDATED verdict is the one exception: it is not held hostage by such
+    /// a bug beyond [`VERDICT_REAP_BOUND`]
+    /// ([`ParallelWorkerGroup::reap_after_verdict`]).
     fn reap_parallel_workers(
         handles: Vec<(usize, thread::JoinHandle<()>)>,
         verbose: bool,
@@ -371,6 +471,7 @@ impl PortfolioSolver {
         let _term_budget_guard =
             crate::smt::SmtContext::scoped_thread_term_memory_budget(term_memory_budget);
         let engine_name = engine_config.name();
+        let _census_label = crate::smt::lane::ScopedEngineLabel::set(engine_name);
         let panic_result = engine_config.unknown_result();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -379,6 +480,12 @@ impl PortfolioSolver {
 
         match result {
             Ok(engine_result) => engine_result,
+            Err(payload) if is_lane_memory_unwind(&*payload) => {
+                // Not a bug: the lane memory guard unwound this engine at an
+                // expression walk once it was past its hard memory share
+                // (`engine_memory.rs`). The lane's own message follows.
+                panic_result
+            }
             Err(payload) => {
                 let bt = std::backtrace::Backtrace::force_capture();
                 safe_eprintln!(
@@ -391,6 +498,15 @@ impl PortfolioSolver {
                 panic_result
             }
         }
+    }
+
+    /// Memory shares for one parallel lane (WP-F, `engine_memory.rs`).
+    fn lane_memory_limits(&self) -> Option<super::engine_memory::LaneMemoryLimits> {
+        #[cfg(test)]
+        if let Some(limits) = self.engine_memory_limits_override {
+            return Some(limits);
+        }
+        super::engine_memory::LaneMemoryLimits::from_process_limit()
     }
 
     /// Maximum workers that a bounded parallel portfolio may run at once.
@@ -448,8 +564,12 @@ impl PortfolioSolver {
         // winner/deadline/external parent. Its timer can release this slot
         // without cancelling sibling engines.
         let token = inputs.cancellation.child();
+        // Set by every scheduler-side cancel of the worker group (winner,
+        // boundary, OOM, external): the executor interrupt of this lane.
+        let group_interrupt = inputs.cancellation.interrupt_flag();
         let engine_name = engine_config.name();
         let term_memory_budget = inputs.term_memory_budget;
+        let lane_memory_limits = self.lane_memory_limits();
         #[cfg(test)]
         let parallel_test_engine = self.sequential_test_engine.clone();
         #[cfg(test)]
@@ -476,8 +596,20 @@ impl PortfolioSolver {
 
         match Self::spawn_solver_thread(move || {
             let engine_start = ay_core::time::Instant::now();
+            // This lane's own memory share (WP-F): exceeding it cancels this
+            // lane alone instead of the whole portfolio.
+            let memory_lane = super::engine_memory::EngineMemoryLane::enter(
+                engine_name,
+                lane_memory_limits,
+                &token,
+            );
             let mut config = engine_config;
             let _engine_deadline = crate::smt::ScopedSolveDeadline::new(engine_deadline);
+            // Every SMT check on this lane treats its cancellation as an
+            // expired deadline, so a cancelled loser stops inside its current
+            // check instead of at its next loop-head poll.
+            let _lane_cancellation =
+                crate::smt::ScopedLaneCancellation::install(token.clone(), Some(group_interrupt));
             let _engine_timeout = engine_timeout_deadline.map(|deadline| {
                 token
                     .cancel_after(deadline.saturating_duration_since(ay_core::time::Instant::now()))
@@ -516,6 +648,21 @@ impl PortfolioSolver {
                 }
             };
             let engine_elapsed = engine_start.elapsed();
+            if let Some(lane) = memory_lane.as_ref().filter(|lane| lane.tripped()) {
+                safe_eprintln!(
+                    "Portfolio: Engine {} ({}) {} (peak {} MiB); \
+                     cancelled alone, the other engines continue",
+                    idx,
+                    engine_name,
+                    if lane.shed() {
+                        "was shed by the memory governor"
+                    } else {
+                        "exceeded its memory share"
+                    },
+                    lane.peak_mib()
+                );
+            }
+            drop(memory_lane);
             // Completion, not channel delivery, owns the timeout boundary.
             let completed_at = ay_core::time::Instant::now();
             #[cfg(test)]
@@ -627,10 +774,8 @@ impl PortfolioSolver {
         &self,
         mut report: Option<&mut super::types::BudgetReport>,
     ) -> PortfolioResult {
-        // Reset global term memory counter for this solve invocation (#2769).
-        // Each engine creates its own TermStore; the global counter tracks aggregate
-        // allocation so engines can detect OOM conditions cooperatively.
-        ay_core::TermStore::reset_global_term_bytes();
+        // Live TermStores own process-wide accounting. Starting this portfolio
+        // must not erase allocations held by another lane or embedding caller.
         let start_time = ay_core::time::Instant::now();
         // The constructor boundary starts before preprocessing. Never reopen a
         // fresh full parallel timeout after that earlier work consumed time.
@@ -638,17 +783,20 @@ impl PortfolioSolver {
             .config
             .parallel_timeout
             .map(|timeout| start_time + timeout);
-        let parallel_deadline = match (configured_deadline, self.construction_deadline) {
-            (Some(configured), Some(construction)) => Some(configured.min(construction)),
-            (Some(configured), None) => Some(configured),
-            (None, construction) => construction,
-        };
+        let parallel_deadline = [
+            configured_deadline,
+            self.parallel_deadline,
+            self.construction_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let parallel_budget = parallel_deadline.map_or(Duration::from_secs(u64::MAX), |deadline| {
             deadline.saturating_duration_since(start_time)
         });
         let worker_limit = self.parallel_worker_limit();
-        // Only concurrently live engines divide the portfolio term budget.
-        ay_core::TermStore::set_engine_count(worker_limit);
+        // Snapshot this schedule's share without changing sibling portfolios'
+        // worker counts or already-installed budgets.
         let term_memory_budget = self.config.per_engine_term_budget(worker_limit);
 
         let engine_problem = self.engine_problem().clone();
@@ -695,6 +843,8 @@ impl PortfolioSolver {
             .iter()
             .map(|e| e.engine_type())
             .collect();
+        let engine_names: Vec<&'static str> =
+            self.config.engines.iter().map(|e| e.name()).collect();
 
         let planned_budgets = if parallel_deadline.is_some() {
             Self::parallel_engine_budgets(parallel_budget, &self.config, worker_limit)
@@ -777,6 +927,39 @@ impl PortfolioSolver {
                 break;
             }
 
+            // Reserve drain: deferred witness-less Unsafe cexs are validated
+            // INSIDE the authoritative window, in its reserved tail, not at the
+            // boundary. At the boundary the enclosing solve/SMT deadlines have
+            // expired (every replay query answers Unknown in microseconds) and
+            // the adaptive layer's whole-run gate discards any candidate
+            // accepted late, so a loop-exit validation cannot succeed by
+            // construction. The reserve is carved out of the SAME window: the
+            // receive wait below wakes early when a stash is pending.
+            if !deferred_witnessless.is_empty() {
+                if let Some(deadline) = parallel_deadline {
+                    let now = ay_core::time::Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    if remaining <= Self::witnessless_validation_reserve(parallel_budget) {
+                        if self.config.verbose {
+                            safe_eprintln!(
+                                "Portfolio: reserve drain — validating {} deferred witness-less Unsafe cex(s) with {:?} left",
+                                deferred_witnessless.len(),
+                                remaining
+                            );
+                        }
+                        if let Some(accepted) = self.accept_first_deferred_witnessless_bounded(
+                            std::mem::take(&mut deferred_witnessless),
+                            Some(remaining),
+                            report.as_deref_mut(),
+                        ) {
+                            cancellation_token.cancel();
+                            accepted_deferred = Some(accepted);
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Calculate remaining time against the single absolute boundary.
             let recv_result = if let Some(deadline) = parallel_deadline {
                 let now = ay_core::time::Instant::now();
@@ -809,7 +992,16 @@ impl PortfolioSolver {
                     timed_out = true;
                     break;
                 }
-                rx.recv_timeout(remaining)
+                // With a stash pending, wake at the start of the reserve tail
+                // so the drain above runs while the window is still open.
+                let wait = if deferred_witnessless.is_empty() {
+                    remaining
+                } else {
+                    remaining
+                        .saturating_sub(Self::witnessless_validation_reserve(parallel_budget))
+                        .max(Duration::from_millis(1))
+                };
+                rx.recv_timeout(wait)
             } else {
                 // No timeout - blocking recv
                 rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -872,56 +1064,102 @@ impl PortfolioSolver {
                         continue;
                     }
 
-                    // Defer WITNESS-LESS Unsafe cexs: stash them and keep
-                    // receiving so a cheap WITNESSED Unsafe (or a Safe result)
-                    // buffered behind them validates and wins inline first,
-                    // instead of a ~10s witness-less array cross-check
-                    // monopolizing this loop and starving the genuine Unsafe.
-                    // The stash is drained through accept_or_reject at the
-                    // loop's natural/timeout exit (validation reordered, never
-                    // skipped) if nothing cheaper was accepted.
-                    if matches!(
-                        &portfolio_result,
-                        PortfolioResult::Unsafe(cex) if cex.witness.is_none()
-                    ) {
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "Portfolio: Engine {} ({}) witness-less Unsafe deferred to avoid starving a witnessed result",
-                                idx, engine_name
-                            );
+                    // WITNESS-LESS Unsafe cexs get a BOUNDED EAGER validation:
+                    // `min(remaining/4, 10s)` inline, right now. The original
+                    // unconditional deferral (validate only at the loop's exit)
+                    // protected a cheap WITNESSED Unsafe buffered behind a
+                    // ~10s witness-less array cross-check from starving — but
+                    // it also parked every correct witness-less refutation
+                    // until the authoritative deadline, where the expired
+                    // solve/SMT deadlines zero the replay ("verification
+                    // inconclusive") and `enforce_deterministic_deadline`
+                    // discards anything validated late. Measured on CHC-COMP
+                    // LRA-Lin `kbfiltr_simpl2`: five engines answered Unsafe
+                    // at 2-8 s of a 60 s window; all five were rejected in
+                    // the same millisecond at 60.0 s.
+                    //
+                    // The slice keeps the starvation guarantee: the loop is
+                    // blocked for at most a quarter of what is left (capped),
+                    // and a replay that is merely INCONCLUSIVE inside the
+                    // slice is stashed for the pre-deadline reserve drain
+                    // (validation reordered, never skipped). Windows too
+                    // narrow for a meaningful attempt go straight to the
+                    // stash.
+                    let witnessless_eager_budget = match &portfolio_result {
+                        PortfolioResult::Unsafe(cex) if cex.witness.is_none() => {
+                            let slice = Self::witnessless_eager_validation_slice(parallel_deadline);
+                            if slice < WITNESSLESS_EAGER_VALIDATION_MIN {
+                                if self.config.verbose {
+                                    safe_eprintln!(
+                                        "Portfolio: Engine {} ({}) witness-less Unsafe deferred to the reserve drain ({:?} left)",
+                                        idx, engine_name, slice
+                                    );
+                                }
+                                deferred_witnessless.push((
+                                    idx,
+                                    portfolio_result,
+                                    needs_validation,
+                                    engine_name,
+                                    engine_elapsed,
+                                ));
+                                continue;
+                            }
+                            if self.config.verbose {
+                                safe_eprintln!(
+                                    "Portfolio: Engine {} ({}) witness-less Unsafe validated eagerly (slice {:?})",
+                                    idx, engine_name, slice
+                                );
+                            }
+                            Some(slice)
                         }
-                        deferred_witnessless.push((
-                            idx,
-                            portfolio_result,
-                            needs_validation,
-                            engine_name,
-                            engine_elapsed,
-                        ));
-                        continue;
-                    }
+                        _ => None,
+                    };
 
                     if matches!(
                         &portfolio_result,
                         PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)
                     ) {
-                        match self.accept_or_reject(
-                            portfolio_result,
-                            needs_validation,
-                            engine_name,
-                            idx,
-                        ) {
+                        // Keep a copy of a witness-less cex so an INCONCLUSIVE
+                        // eager slice can hand it to the reserve drain.
+                        let deferred_copy =
+                            witnessless_eager_budget.map(|_| portfolio_result.clone());
+                        let (decision, inconclusive) = match witnessless_eager_budget {
+                            Some(budget) => self.accept_or_reject_bounded(
+                                portfolio_result,
+                                needs_validation,
+                                engine_name,
+                                idx,
+                                budget,
+                            ),
+                            None => (
+                                self.accept_or_reject(
+                                    portfolio_result,
+                                    needs_validation,
+                                    engine_name,
+                                    idx,
+                                ),
+                                false,
+                            ),
+                        };
+                        match decision {
                             AcceptDecision::Accept(accepted) => {
                                 cancellation_token.cancel();
                                 if self.config.verbose {
                                     safe_eprintln!("Portfolio: Engine {} returned definitive result, cancelling others", idx);
                                 }
 
-                                // No losing worker may outlive the invocation.
-                                workers.reap("definitive winner");
+                                // The accepted verdict is final: join the
+                                // losers that exit promptly, detach the rest.
+                                workers.reap_after_verdict(
+                                    "definitive winner",
+                                    Self::verdict_reap_bound(parallel_deadline),
+                                    &engine_names,
+                                );
 
                                 // Reporting: drain results published before each
-                                // synchronously-reaped worker exited, then mark
-                                // any unreported engine as superseded.
+                                // reaped worker exited, then mark any unreported
+                                // (detached or never launched) engine as
+                                // superseded.
                                 if let Some(r) = report.as_deref_mut() {
                                     while let Ok((other_idx, _, other_elapsed, completed_at)) =
                                         rx.try_recv()
@@ -971,6 +1209,22 @@ impl PortfolioSolver {
                                 return accepted;
                             }
                             AcceptDecision::Reject => {
+                                // An eager slice that ran out before deciding
+                                // is not a verdict on the cex: park it for the
+                                // pre-deadline reserve drain (validation
+                                // reordered, never skipped).
+                                if inconclusive {
+                                    if let Some(copy) = deferred_copy {
+                                        deferred_witnessless.push((
+                                            idx,
+                                            copy,
+                                            needs_validation,
+                                            engine_name,
+                                            engine_elapsed,
+                                        ));
+                                        continue;
+                                    }
+                                }
                                 // Match sequential-report semantics: a raw
                                 // definitive candidate that fails the mandatory
                                 // acceptance pipeline did not complete the
@@ -1003,6 +1257,14 @@ impl PortfolioSolver {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // An early wake for the reserve drain is not the boundary:
+                    // go back to the loop top, which runs the drain and then
+                    // keeps receiving until the real deadline.
+                    if parallel_deadline
+                        .is_some_and(|deadline| ay_core::time::Instant::now() < deadline)
+                    {
+                        continue;
+                    }
                     // Cancel worker children first; validation observes the
                     // separate external-parent token and remains available for
                     // candidates received before the timeout boundary.
@@ -1075,7 +1337,11 @@ impl PortfolioSolver {
                     safe_eprintln!("Portfolio: Accepted definitive result during {}", reason);
                 }
 
-                workers.reap("timeout grace result");
+                workers.reap_after_verdict(
+                    "timeout grace result",
+                    Self::verdict_reap_bound(parallel_deadline),
+                    &engine_names,
+                );
 
                 // Reporting: after every worker is gone, retain its actual
                 // completion duration when it published one. These losing
@@ -1129,10 +1395,12 @@ impl PortfolioSolver {
             }
         }
 
-        // Always cross a synchronous reaping barrier, including timeout/OOM.
-        // The portfolio may overrun its cooperative wall boundary if an engine
-        // is slow to cancel, but it fails closed and never hides overlap from a
-        // following model-checking obligation.
+        // Without a verdict, always cross a synchronous reaping barrier,
+        // including timeout/OOM. The portfolio may overrun its cooperative wall
+        // boundary if an engine is slow to cancel, but it fails closed and
+        // never hides overlap from a following model-checking obligation. A
+        // validated deferred witness-less Unsafe is a verdict: it is returned
+        // after the bounded reap, like an inline winner.
         let reap_reason = if timed_out {
             "timeout"
         } else if memory_exceeded {
@@ -1142,7 +1410,20 @@ impl PortfolioSolver {
         } else {
             "normal completion"
         };
-        workers.reap(reap_reason);
+        // A portfolio cancelled because a ladder race it runs in is already
+        // decided elsewhere (`adaptive_ladder_race::race_settled`) is, for the
+        // same reason, not held back by a cancelled engine that is slow to exit.
+        if accepted_deferred.is_some()
+            || (externally_cancelled && crate::adaptive_ladder_race::race_settled())
+        {
+            workers.reap_after_verdict(
+                reap_reason,
+                Self::verdict_reap_bound(parallel_deadline),
+                &engine_names,
+            );
+        } else {
+            workers.reap(reap_reason);
+        }
 
         // Only report final worker durations after the lifecycle barrier. Drain
         // every publication made while joining; a result that completed after
@@ -1214,10 +1495,81 @@ impl PortfolioSolver {
     fn accept_first_deferred_witnessless(
         &self,
         deferred: Vec<(usize, PortfolioResult, bool, &'static str, Duration)>,
+        report: Option<&mut super::types::BudgetReport>,
+    ) -> Option<PortfolioResult> {
+        self.accept_first_deferred_witnessless_bounded(deferred, None, report)
+    }
+
+    /// How long a validated verdict waits for cancelled siblings:
+    /// [`VERDICT_REAP_BOUND`], never past the parallel window.
+    fn verdict_reap_bound(parallel_deadline: Option<ay_core::time::Instant>) -> Duration {
+        parallel_deadline.map_or(VERDICT_REAP_BOUND, |deadline| {
+            deadline
+                .saturating_duration_since(ay_core::time::Instant::now())
+                .min(VERDICT_REAP_BOUND)
+        })
+    }
+
+    /// Eager validation slice for a witness-less Unsafe cex that has just
+    /// arrived: a quarter of what is left of the parallel window, capped at
+    /// [`WITNESSLESS_EAGER_VALIDATION_CAP`] (unbounded windows get the cap).
+    /// The quarter keeps the loop responsive to a cheaper witnessed result
+    /// buffered behind it; the cap bounds the array cross-check / BMC replay
+    /// the original deferral was protecting against.
+    pub(super) fn witnessless_eager_validation_slice(
+        parallel_deadline: Option<ay_core::time::Instant>,
+    ) -> Duration {
+        match parallel_deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(ay_core::time::Instant::now())
+                .checked_div(4)
+                .unwrap_or(Duration::ZERO)
+                .min(WITNESSLESS_EAGER_VALIDATION_CAP),
+            None => WITNESSLESS_EAGER_VALIDATION_CAP,
+        }
+    }
+
+    /// Tail of the parallel window reserved for validating deferred
+    /// witness-less Unsafe cexs while the window is still open: 10 % of the
+    /// budget, clamped to [500 ms, 5 s]. Validation at the boundary itself
+    /// cannot succeed (expired enclosing deadlines zero every replay query and
+    /// the adaptive layer discards late candidates), so the reserve is the
+    /// only place a deferred refutation can still be published.
+    fn witnessless_validation_reserve(parallel_budget: Duration) -> Duration {
+        parallel_budget
+            .mul_f64(WITNESSLESS_VALIDATION_RESERVE_FRACTION)
+            .clamp(
+                WITNESSLESS_VALIDATION_RESERVE_MIN,
+                WITNESSLESS_VALIDATION_RESERVE_MAX,
+            )
+    }
+
+    /// [`accept_first_deferred_witnessless`](Self::accept_first_deferred_witnessless)
+    /// with an optional per-candidate validation budget (the reserve drain
+    /// passes the time left in the window). The stash is walked in arrival
+    /// order; an inconclusive bounded replay is dropped like a rejection —
+    /// there is no later opportunity inside the window.
+    fn accept_first_deferred_witnessless_bounded(
+        &self,
+        deferred: Vec<(usize, PortfolioResult, bool, &'static str, Duration)>,
+        budget: Option<Duration>,
         mut report: Option<&mut super::types::BudgetReport>,
     ) -> Option<PortfolioResult> {
         for (idx, result, needs_validation, engine_name, _elapsed) in deferred {
-            match self.accept_or_reject(result, needs_validation, engine_name, idx) {
+            let decision = match budget {
+                Some(budget) => {
+                    self.accept_or_reject_bounded(
+                        result,
+                        needs_validation,
+                        engine_name,
+                        idx,
+                        budget,
+                    )
+                    .0
+                }
+                None => self.accept_or_reject(result, needs_validation, engine_name, idx),
+            };
+            match decision {
                 AcceptDecision::Accept(accepted) => return Some(accepted),
                 AcceptDecision::Reject => {
                     if let Some(r) = report.as_deref_mut() {
@@ -1646,10 +1998,8 @@ impl PortfolioSolver {
         &self,
         mut report: Option<&mut super::types::BudgetReport>,
     ) -> PortfolioResult {
-        // Reset global term memory counter for this solve invocation (#2769).
-        ay_core::TermStore::reset_global_term_bytes();
-        // Set engine count for per-engine memory budgeting (#8600).
-        ay_core::TermStore::set_engine_count(1);
+        // Preserve every live store's accounting and derive this schedule's
+        // single-worker share without mutating process-global engine counts.
         let term_memory_budget = self.config.per_engine_term_budget(1);
 
         let engine_problem = self.engine_problem().clone();

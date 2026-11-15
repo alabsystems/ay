@@ -16,7 +16,9 @@
 //! the candidate with a separate symbolic certificate.
 
 pub mod cooper;
+pub(crate) mod eq_qe;
 pub mod isint;
+pub(crate) mod linrat;
 pub mod lw;
 
 pub use cooper::{eliminate_exists, QeResult};

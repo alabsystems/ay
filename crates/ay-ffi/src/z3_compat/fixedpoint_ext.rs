@@ -62,12 +62,13 @@ use ay_dpll::api::{Solver, Sort, Term, TermKind};
 use super::fixedpoint::build_lemma_hint;
 use super::statistics::StatEntry;
 use super::{
-    apply_supported_params, cache_ast_vector, cache_string, ffi_count_within_limit, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ffi_read_bounded_text,
-    record_ast_sort, require_term_ast, term_to_ast, ParamDescr, ParamDescrsHandle, StatsHandle,
-    Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_fixedpoint_query, Z3_func_decl,
-    Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR,
-    Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING, Z3_PK_UINT, Z3_SORT_ERROR,
+    apply_supported_params, cache_ast_vector, cache_string, ffi_count_within_limit,
+    ffi_guard_const_ptr, ffi_guard_produced, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_read_bounded_text, record_ast_sort, require_term_ast, term_to_ast, ParamDescr,
+    ParamDescrsHandle, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint,
+    Z3_fixedpoint_query, Z3_func_decl, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
+    Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL,
+    Z3_PK_STRING, Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -370,19 +371,10 @@ pub unsafe extern "C" fn Z3_fixedpoint_add_fact(
 // SMT-LIB2 / fixedpoint-script parsing.
 // ============================================================================
 
-/// Parse a fixedpoint-rule file and add its rules to the context, returning the
-/// queries found in the file.
-///
-/// The file is read from disk (a read failure sets `Z3_FILE_ACCESS_ERROR`,
-/// mirroring `Z3_optimize_from_file`).
-///
-/// DIVERGENCE: the fixedpoint-script parser shared with
-/// `Z3_fixedpoint_from_string` is not yet available (that entry point is
-/// scheduled for a later batch that adds the required engine method). Rather than
-/// fabricate parsed rules/queries — which would silently corrupt the CHC problem
-/// and hence every later verdict — this performs the real file read but then sets
-/// `Z3_EXCEPTION` and returns an EMPTY (never null) query vector, adding no rules.
-/// It upgrades to a full parse once `Z3_fixedpoint_from_string` lands.
+/// Read a fixedpoint-rule file and add its rules, returning the queries
+/// found. Shares the script parser with `Z3_fixedpoint_from_string`
+/// (see `fixedpoint_ext2` for the dialect contract); an unreadable file
+/// or a parse failure sets `Z3_PARSER_ERROR` and returns null, as in z3.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `f` a valid fixedpoint handle; `s` a
@@ -414,25 +406,31 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_file(
                 ctx.error_msg = Some("Z3_fixedpoint_from_file: null/invalid path".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             };
-            // The dialect is unsupported, so verify access without allocating
-            // and reading an arbitrarily large source that will be rejected.
-            let _file = match std::fs::File::open(path) {
-                Ok(file) => file,
+            let source = match super::ffi_read_bounded_parser_file(path) {
+                Ok(source) => source,
                 Err(e) => {
-                    ctx.last_error = Z3_FILE_ACCESS_ERROR;
+                    ctx.last_error = super::Z3_PARSER_ERROR;
                     ctx.error_msg = Some(format!("Z3_fixedpoint_from_file: {e}"));
-                    return cache_ast_vector(ctx, Vec::new());
+                    return std::ptr::null_mut();
                 }
             };
-            // DIVERGENCE: parser pending with Z3_fixedpoint_from_string — honest
-            // empty result rather than fabricated rules/queries.
-            ctx.last_error = Z3_EXCEPTION;
-            ctx.error_msg = Some(
-                "Z3_fixedpoint_from_file: fixedpoint-script parsing is not yet supported \
-                 (pending Z3_fixedpoint_from_string); the file was opened but no rules were added"
-                    .to_string(),
-            );
-            cache_ast_vector(ctx, Vec::new())
+            let handle = &mut *f;
+            match super::fixedpoint_ext2::fixedpoint_parse_script(
+                ctx,
+                handle,
+                &source,
+                "Z3_fixedpoint_from_file",
+            ) {
+                Ok(queries) => {
+                    ctx.last_error = Z3_OK;
+                    cache_ast_vector(ctx, queries)
+                }
+                Err(message) => {
+                    ctx.last_error = super::Z3_PARSER_ERROR;
+                    ctx.error_msg = Some(message);
+                    std::ptr::null_mut()
+                }
+            }
         })
     }
 }
@@ -615,7 +613,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
     // SAFETY: `ffi_guard_ast` handles null `c` and catches panics; `d` is a
     // separate live allocation, null-checked below.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let refuse = |ctx: &mut Z3Context, msg: &str| {
                 ctx.last_error = Z3_INVALID_USAGE;
                 ctx.error_msg = Some(format!("Z3_fixedpoint_get_cover_delta: {msg}"));
@@ -638,7 +636,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
                 // fabrication: `true` is the honest "no lemmas at this frame".
                 let t = ctx.solver.bool_const(true);
                 let ast = term_to_ast(ctx, t);
-                record_ast_sort(ctx, ast, Sort::Bool);
+                let ast = record_ast_sort(ctx, ast, Sort::Bool);
                 ctx.last_error = Z3_OK;
                 return ast;
             }
@@ -675,7 +673,9 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
                         "an argument sort is outside the back-translatable fragment",
                     );
                 };
-                let db = ctx.solver.declare_const(&format!("__db{i}"), sort);
+                let Ok(db) = ctx.solver.try_de_bruijn_var(i, sort) else {
+                    return refuse(ctx, "an argument variable cannot be declared at its sort");
+                };
                 var_map.insert(v.name.clone(), db);
             }
             let Some(term) = chc_expr_to_term(&mut ctx.solver, &var_map, &formula) else {
@@ -685,7 +685,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
                 );
             };
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, Sort::Bool);
+            let ast = record_ast_sort(ctx, ast, Sort::Bool);
             ctx.last_error = Z3_OK;
             ast
         })
@@ -710,7 +710,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_reachable(
 ) -> Z3_ast {
     // SAFETY: `ffi_guard_ast` handles null `c` and catches panics.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             ctx.last_error = Z3_INVALID_USAGE;
             ctx.error_msg = Some(
                 "Z3_fixedpoint_get_reachable: AY computes an over-approximation invariant, not \
@@ -805,10 +805,7 @@ unsafe fn register_db_property_hint(
     let Some(property_term) = require_term_ast(ctx, property, who, "property") else {
         return;
     };
-    let positions = |name: &str| -> Option<usize> {
-        name.strip_prefix("__db")
-            .and_then(|s| s.parse::<usize>().ok())
-    };
+    let positions = |name: &str| -> Option<usize> { ay_dpll::api::de_bruijn_index(name) };
     let hint = build_lemma_hint(
         &ctx.solver,
         &handle.relations,

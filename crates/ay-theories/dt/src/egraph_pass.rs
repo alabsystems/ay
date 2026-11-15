@@ -215,8 +215,19 @@ impl DtEgraphPass {
                         stack.push((px, py));
                     }
                 }
-                // Var vs App: a nullary constructor vs an application — the
-                // constructor names necessarily differ (arities differ).
+                // Var vs App: the SAME nullary constructor can reach the
+                // e-graph both as the `Var` the frontend binds it to and as a
+                // 0-ary application of its name (the finite-enum Skolem
+                // coverage in `ay-dpll` spells it `(S)`). Both denote one
+                // value; treating them as different fabricated a ground-diseq
+                // lemma (a wrong UNSAT on `(exists ((c E)) (= c S))` under
+                // UFDTLIA). Any other Var/App pair has different arities.
+                (TermData::Var(nx, _), TermData::App(Symbol::Named(ny), ay))
+                | (TermData::App(Symbol::Named(ny), ay), TermData::Var(nx, _)) => {
+                    if nx != ny.as_str() || !ay.is_empty() {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }
@@ -538,14 +549,15 @@ impl DtEgraphPass {
             }
             let mut frames: Vec<(u32, usize)> = vec![(start, 0)];
             color.insert(start, 1);
-            while let Some(&(root, edge_idx)) = frames.last() {
+            while let Some(frame) = frames.last_mut() {
+                let (root, edge_idx) = *frame;
                 let next = adj.get(&root).and_then(|es| es.get(edge_idx).copied());
                 let Some(target) = next else {
                     color.insert(root, 2);
                     frames.pop();
                     continue;
                 };
-                frames.last_mut().expect("nonempty: just read").1 += 1;
+                frame.1 = edge_idx.saturating_add(1); // indexes `es`: never saturates
                 match color.get(&target) {
                     Some(1) => return true, // back edge: cycle re-derived
                     Some(_) => {}
@@ -732,6 +744,51 @@ mod tests {
         assert!(
             matches!(pass2.check(&terms2, &mut euf2), DtPassOutcome::Ok),
             "equal ground terms must not be flagged"
+        );
+    }
+
+    /// Rule 1b: a nullary constructor reached both as its bound `Var` and as
+    /// a 0-ary application of its name is ONE ground value. Merging the two
+    /// (`x = zero`, `x = zero()`) is no conflict; flagging it fabricated the
+    /// clash lemma behind a wrong UNSAT on `(exists ((c E)) (= c S))` under
+    /// UFDTLIA. A 0-ary application of a DIFFERENT constructor still clashes.
+    #[test]
+    fn nullary_constructor_var_and_app_spellings_are_one_value() {
+        let mut terms = TermStore::new();
+        let nat = Sort::Uninterpreted("nat".to_string());
+        let zero_var = terms.mk_var("zero", nat.clone());
+        let zero_app = terms.mk_app(Symbol::named("zero"), Vec::<TermId>::new(), nat.clone());
+        let x = terms.mk_var("x", nat.clone());
+        let eq_var = terms.mk_eq(x, zero_var);
+        let eq_app = terms.mk_eq(x, zero_app);
+        let mut pass = DtEgraphPass::new();
+        pass.register_datatype("nat", &["succ".to_string(), "zero".to_string()]);
+        let mut euf = EufSolver::new(&terms);
+        euf.assert_literal(eq_var, true);
+        euf.assert_literal(eq_app, true);
+        let _ = euf.check();
+        assert!(
+            matches!(pass.check(&terms, &mut euf), DtPassOutcome::Ok),
+            "the Var and 0-ary App spellings of one nullary constructor must not clash"
+        );
+
+        // Control: a different nullary constructor in App spelling clashes.
+        let mut terms2 = TermStore::new();
+        let unit = Sort::Uninterpreted("two".to_string());
+        let a_var = terms2.mk_var("a", unit.clone());
+        let b_app = terms2.mk_app(Symbol::named("b"), Vec::<TermId>::new(), unit.clone());
+        let y = terms2.mk_var("y", unit.clone());
+        let eq_a = terms2.mk_eq(y, a_var);
+        let eq_b = terms2.mk_eq(y, b_app);
+        let mut pass2 = DtEgraphPass::new();
+        pass2.register_datatype("two", &["a".to_string(), "b".to_string()]);
+        let mut euf2 = EufSolver::new(&terms2);
+        euf2.assert_literal(eq_a, true);
+        euf2.assert_literal(eq_b, true);
+        let _ = euf2.check();
+        assert!(
+            matches!(pass2.check(&terms2, &mut euf2), DtPassOutcome::Lemmas(_)),
+            "distinct nullary constructors merged into one class must still conflict"
         );
     }
 

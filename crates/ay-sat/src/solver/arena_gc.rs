@@ -362,6 +362,11 @@ impl Solver {
 
         // 13. Shrink watch list capacities.
         self.watches.shrink_capacity();
+
+        // 14. The clause DB's bytes just shrank, so the byte trigger's
+        // reference must not stay above them (the compaction `reduce_db`
+        // defers runs after it recorded the reference).
+        self.lower_clause_db_bytes_after_reduction();
     }
 
     /// Refresh blocker literals in all watch lists to match current watched

@@ -257,6 +257,12 @@ fn build_verification_summary(executor: &Executor, result: &SolveResult) -> Veri
             && executor.last_command_unsat_was_independently_verified(),
         unsat_exact_semantically_verified: result.is_unsat()
             && executor.last_command_unsat_was_exact_semantically_verified(),
+        unsat_corroborated: result.is_unsat() && executor.last_command_unsat_was_corroborated(),
+        unsat_evidence_level: result
+            .is_unsat()
+            .then(|| executor.last_command_unsat_evidence())
+            .flatten()
+            .map(|evidence| evidence.level()),
         unsat_proof_checker_failures: statistics.get_int("proof_checker_failures").unwrap_or(0),
         sat_independent_checks: independent,
         sat_delegated_checks: delegated,
@@ -307,7 +313,8 @@ fn accepted_definite_result(run: &CrossCheckRun) -> Option<SolveResult> {
         SolveResult::Unsat(_)
             if run.verification.unsat_proof_strictly_verified
                 || run.verification.unsat_independently_verified
-                || run.verification.unsat_exact_semantically_verified =>
+                || run.verification.unsat_exact_semantically_verified
+                || run.verification.unsat_corroborated =>
         {
             Some(run.result.clone())
         }
@@ -341,6 +348,7 @@ fn is_follow_up_query(command: &Command) -> bool {
             | Command::Echo(_)
             | Command::Display(..)
             | Command::Simplify(_)
+            | Command::SimplifyWithParams(..)
             | Command::GetAbduct(_, _)
     )
 }
@@ -365,7 +373,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Exit => "exit",
         Command::Echo(_) => "echo",
         Command::Display(..) => "display",
-        Command::Simplify(_) => "simplify",
+        Command::Simplify(_) | Command::SimplifyWithParams(..) => "simplify",
         Command::GetAbduct(_, _) => "get-abduct",
         _ => "unsupported-query",
     }

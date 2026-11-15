@@ -1,0 +1,2 @@
+* #variable= 10 #constraint= 1
+1 x10 >= 1 ;

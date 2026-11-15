@@ -21,5 +21,7 @@ mod bv_modulo_acyclic_safety;
 mod bv_mux_complement_soundness_7986;
 #[path = "group_bv/bv_wrap_offset_overflow_soundness.rs"]
 mod bv_wrap_offset_overflow_soundness;
+#[path = "group_bv/model_checker_consumer_cyclic_arrays.rs"]
+mod model_checker_consumer_cyclic_arrays;
 #[path = "group_bv/preprocessing_bv_soundness_6781.rs"]
 mod preprocessing_bv_soundness_6781;

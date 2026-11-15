@@ -389,8 +389,9 @@ fn test_forced_or_arm_store_chain_definition_is_recovered_8512() {
 
 /// #8512-forced-or, the soundness half: with TWO arms the model leaves live,
 /// the disjunction forces neither, so the nested definition must NOT be adopted
-/// — the model is free to satisfy the other arm. The variable keeps its partial
-/// interpretation and stays read-conflicted.
+/// — the model is free to satisfy the other arm. The variable keeps the
+/// interpretation its reads give it (none here) and is not withheld: the
+/// independent gate judges whatever it publishes (`live_definitions.rs`).
 #[test]
 fn test_two_live_or_arms_leave_store_chain_definition_unadopted_8512() {
     let mut terms = TermStore::new();
@@ -426,8 +427,8 @@ fn test_two_live_or_arms_leave_store_chain_definition_unadopted_8512() {
     );
 
     assert!(
-        array_model.read_conflicted.contains(&mem),
-        "an unforced nested definition must leave mem withheld, not adopted"
+        !array_model.read_conflicted.contains(&mem),
+        "an unforced nested definition leaves mem unadopted, not withheld"
     );
     assert!(
         array_model
@@ -547,4 +548,219 @@ fn test_definitely_false_arm_short_circuits_past_an_unevaluable_conjunct_8512() 
         "expected store at #x00000003 -> #xaa, got {:?}",
         interp.stores
     );
+}
+
+/// Ite-lifted tag idiom (dwp QF_ABV): the frontend rewrites
+/// `(= t (ite (= mem (store ...)) #b1 #b0))` into
+/// `(ite (= mem (store ...)) (= t #b1) (= t #b0))`, so the store-chain
+/// definition sits in the CONDITION of a Bool ite. When the model
+/// makes that condition true, collection must treat the condition
+/// itself as a definition carrier — recursing only into the taken
+/// branch leaves `mem` read-conflicted and every array assertion
+/// unevaluable (`arrays-read-conflict-uneval` on genuine sats such
+/// as `try3_true_functions_dwp_hostname.get_quoting_style`).
+#[test]
+fn test_ite_lifted_condition_store_chain_recovery() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort);
+    let t = terms.mk_var("t", Sort::bitvec(1));
+
+    let idx = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let store = terms.mk_store(base, idx, value);
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    let one = terms.mk_bitvec(BigInt::from(1u8), 1);
+    let zero = terms.mk_bitvec(BigInt::from(0u8), 1);
+    let t_is_one = terms.mk_eq_coerce(t, one);
+    let t_is_zero = terms.mk_eq_coerce(t, zero);
+    // The lifted form: definition in condition position.
+    let lifted = terms.mk_ite_raw(def, t_is_one, t_is_zero);
+    let tag = terms.mk_ite_raw(lifted, one, zero);
+    let asserted = terms.mk_bvand(vec![tag, t]);
+    let assertion = terms.mk_eq_coerce(one, asserted);
+
+    let mut values = HashMap::default();
+    values.insert(t, BigInt::from(1u8));
+    let mut bool_overrides = HashMap::default();
+    bool_overrides.insert(def, true);
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides,
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+
+    assert!(
+        !array_model.read_conflicted.contains(&mem),
+        "a model-true ite condition carrying the definition must un-withhold mem"
+    );
+    let interp = array_model
+        .array_values
+        .get(&mem)
+        .expect("the lifted condition's store chain should populate mem");
+    assert!(
+        interp
+            .stores
+            .iter()
+            .any(|(i, v)| i == "#x00000003" && v == "#xaa"),
+        "expected store at #x00000003 -> #xaa, got {:?}",
+        interp.stores
+    );
+}
+
+/// A nested store-chain definition the model FALSIFIES constrains
+/// nothing: the variable is a plain free array in this model, so its
+/// select-derived interpretation is legitimately total and must not
+/// be withheld as read-conflicted. (The dwp/flanagansaxe tag idiom
+/// takes this branch whenever its guard tag is `#b0`; poisoning the
+/// variable withheld every array assertion as unevaluable and
+/// degraded genuine sats to `unknown`.) An UNDECIDED one is not
+/// adopted either, and since ee9635a4e it is not withheld: the
+/// independent gate alone accepts array models (#bv-array-delegation).
+#[test]
+fn test_model_falsified_nested_definition_is_not_read_conflicted() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort);
+    let t = terms.mk_var("t", Sort::bitvec(1));
+
+    let idx = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let store = terms.mk_store(base, idx, value);
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    let one = terms.mk_bitvec(BigInt::from(1u8), 1);
+    let zero = terms.mk_bitvec(BigInt::from(0u8), 1);
+    let def_as_bv = terms.mk_ite(def, one, zero);
+    let guard = terms.mk_eq_coerce(t, def_as_bv);
+    let guard_as_bv = terms.mk_ite(guard, one, zero);
+    let assertion = terms.mk_eq_coerce(one, guard_as_bv);
+
+    // Model takes the falsifying branch: t = 0 and the definition
+    // equality itself is false.
+    let mut values = HashMap::default();
+    values.insert(t, BigInt::from(0u8));
+    let mut bool_overrides = HashMap::default();
+    bool_overrides.insert(def, false);
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides,
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+    assert!(
+        !array_model.read_conflicted.contains(&mem),
+        "a model-falsified nested definition must not poison mem"
+    );
+    let adopted = |array_model: &ArrayModel| {
+        array_model.array_values.get(&mem).is_some_and(|interp| {
+            interp
+                .stores
+                .iter()
+                .any(|(i, v)| i == "#x00000003" && v == "#xaa")
+        })
+    };
+    assert!(
+        !adopted(&array_model),
+        "a falsified definition is not adopted"
+    );
+
+    // Control: same shape with the definition undecided under the model
+    // (no values at all): nothing is adopted, and nothing withheld.
+    let bv_model = BvModel {
+        values: HashMap::default(),
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+    assert!(
+        !adopted(&array_model),
+        "an undecided nested definition is not adopted"
+    );
+    assert!(
+        !array_model.read_conflicted.contains(&mem),
+        "an undecided nested definition is not withheld (ee9635a4e)"
+    );
+}
+
+/// Store-chain definitions form dependency chains (mem generations).
+/// Collection order follows the assertions, so a dependent definition
+/// (`m3 = store(m2, ...)`) may be visited before its base's own
+/// definition (`m2 = store(m1, ...)`); building must iterate to a
+/// fixpoint instead of failing the dependent on its still-unbuilt
+/// base (the remaining `arrays-read-conflict-uneval` witnesses in the
+/// dwp family are exactly multi-generation chains).
+#[test]
+fn test_store_chain_generations_build_in_dependency_order() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let m1 = terms.mk_var("m1", array_sort.clone());
+    let m2 = terms.mk_var("m2", array_sort.clone());
+    let m3 = terms.mk_var("m3", array_sort);
+
+    let idx3 = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let idx5 = terms.mk_bitvec(BigInt::from(5u8), 32);
+    let vaa = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let vbb = terms.mk_bitvec(BigInt::from(0xbbu8), 8);
+    let store2 = terms.mk_store(m1, idx3, vaa);
+    let def2 = terms.mk_eq_coerce_no_ite_expand(m2, store2);
+    let store3 = terms.mk_store(m2, idx5, vbb);
+    let def3 = terms.mk_eq_coerce_no_ite_expand(m3, store3);
+
+    let bv_model = BvModel {
+        values: HashMap::default(),
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+    // Dependent definition asserted FIRST.
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[def3, def2],
+        &Default::default(),
+    );
+
+    let interp3 = array_model
+        .array_values
+        .get(&m3)
+        .expect("m3 must build once its base generation resolves");
+    assert!(
+        interp3
+            .stores
+            .iter()
+            .any(|(i, v)| i == "#x00000005" && v == "#xbb"),
+        "m3 carries its own store: {:?}",
+        interp3.stores
+    );
+    assert!(
+        interp3
+            .stores
+            .iter()
+            .any(|(i, v)| i == "#x00000003" && v == "#xaa"),
+        "m3 inherits m2's store through the generation chain: {:?}",
+        interp3.stores
+    );
+    assert!(!array_model.read_conflicted.contains(&m3));
+    assert!(!array_model.read_conflicted.contains(&m2));
 }

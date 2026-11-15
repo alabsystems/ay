@@ -36,6 +36,7 @@ pub mod algebraic;
 mod anum;
 mod check_loop;
 pub(crate) mod feasible_set;
+mod full_conflict;
 mod grounding;
 // Conflict explanation: an empty feasible set becomes a learned clause that is
 // valid in the theory and false under the current assignment — z3's
@@ -82,6 +83,7 @@ mod polymanager;
 pub mod rcf_api;
 mod sign;
 mod sos;
+mod sos_candidate;
 // Fraction-free subresultant / PSC-chain substrate for CAD projection.
 // Deliberately not wired into a solve path yet: it cannot change a verdict.
 #[allow(dead_code)]
@@ -94,10 +96,11 @@ mod univariate;
 // Deliberately NOT wired into any solve path yet: it cannot change a verdict.
 #[allow(dead_code)]
 mod upoly;
-mod verification;
 
 #[cfg(test)]
 mod av_probe;
+#[cfg(test)]
+mod check_stop_tests;
 #[cfg(test)]
 mod interval_fixture_tests;
 #[cfg(test)]
@@ -107,19 +110,18 @@ mod reset_tests;
 #[cfg(test)]
 mod scaled_product_tests;
 #[cfg(test)]
+mod shared_reason_tests;
+#[cfg(test)]
 mod theory_tests;
 #[cfg(test)]
 mod upoly_tests;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
-#[cfg(not(kani))]
 type HashSet<T> = hashbrown::HashSet<T>;
-use num_rational::BigRational;
-#[cfg(kani)]
-type HashSet<T> = ay_core::kani_compat::DetHashSet<T>;
 use ay_core::term::{Constant, Symbol, TermData, TermId, TermStore};
 use ay_core::{TheoryLit, TheoryPropagation, TheoryResult, TheorySolver};
+use num_rational::BigRational;
 
 use feasible_set::FeasibleSet;
 use monomial::Monomial;
@@ -168,6 +170,7 @@ fn maybe_grow_nra_stack<R>(f: impl FnOnce() -> R) -> R {
 
 pub use algebraic::{RealAlgebraic, RealAlgebraicValue, RealScalar};
 pub use ay_lra::LraModel;
+pub use sos_candidate::{find_sos_refutation_candidate, SosCandidateError};
 /// Measurement harness for the fraction-free subresultant substrate; see
 /// [`subresultant::diag_subresultant_incumbent_versus_fraction_free`]. Exposed
 /// for `examples/subresultant_measurement.rs` so the measurement is a runnable
@@ -199,6 +202,8 @@ type LinearizationRowKey = (TermId, Vec<(u32, BigRational)>, BigRational, bool);
 pub struct NraSolver<'a> {
     /// Reference to the term store
     terms: &'a TermStore,
+    /// Wall-clock deadline of the enclosing solve ([`NraSolver::set_deadline`]).
+    deadline: Option<ay_core::time::Instant>,
     /// Underlying LRA solver for linear constraints
     pub(crate) lra: ay_lra::LraSolver,
     /// Representative product for each sorted variable multiset.
@@ -288,6 +293,12 @@ pub struct NraSolver<'a> {
     /// Tracks which atoms from `registered_atoms` already have truth values.
     pub(crate) asserted_atom_set: HashSet<TermId>,
 
+    /// Every theory atom the DPLL layer has registered (`register_atom`), i.e.
+    /// the instance's SAT-visible arithmetic vocabulary. Sizes the phase-hint
+    /// epoch gate (#nonlinear-phase-hints); nothing else reads it. Cleared by
+    /// `reset`, which the eager lanes call before re-registering.
+    pub(crate) sat_atoms: HashSet<TermId>,
+
     /// Exact ALGEBRAIC model witnesses, set by the exact decision procedures on
     /// the SAME `check()` that returns [`TheoryResult::Sat`] when
     /// satisfiability was proven by a Sturm / IVT real-root certificate whose
@@ -309,13 +320,13 @@ pub struct NraSolver<'a> {
     pub(crate) algebraic_model: Vec<(TermId, RealAlgebraicValue)>,
 
     /// Set by the NRA check loop when the most recent UNSAT verdict carries a
-    /// replayable rational Positivstellensatz / SOS certificate of infeasibility
-    /// (see [`sos`]). This is the algebraic proof that replaces the audited
-    /// `:rule trust` hole for the theory conflict; it is `None` when the
-    /// (sound but incomplete) degree-2 search declines, in which case the
-    /// interval-exhaustion UNSAT keeps its trust fallback. Reset to `None` at the
-    /// start of every check. Any stored certificate has already passed the
-    /// independent checker.
+    /// privately replayable rational Positivstellensatz / SOS certificate
+    /// (see [`sos`]). The bounded degree-2/degree-4 search may decline; its
+    /// Alethe rendering still contains a `hole`, not a public proof rule.
+    /// Evidence belongs to the checked assertion/scope snapshot, so assertions,
+    /// shared relations, push/pop, reset, and a new check invalidate it.
+    /// No certificate from a retracted scope may describe a later query.
+    /// Any stored certificate has already passed the private checker.
     pub(crate) last_unsat_certificate: Option<sos::SosCertificate>,
 
     /// SOLVE-WIDE node budget for the ICP dyadic grid search
@@ -370,6 +381,17 @@ pub struct NraSolver<'a> {
     /// INSTANCE, not a solve. Cost-only, never soundness — exhaustion declines
     /// the pass and leaves the verdict at the `unknown` it would otherwise be.
     pub(crate) grid_exact_budget: std::cell::Cell<usize>,
+
+    /// ICP attribution counters, surfaced via `collect_statistics` as
+    /// `nra_icp_*`. `Cell`s for the same reason as [`Self::grid_budget`]:
+    /// the ICP entry points take `&self`. Cost accounting only; the one
+    /// verdict-visible use is the wide-box main-tree budget cap in
+    /// `try_icp_branch_and_prune`, which can only turn a would-be
+    /// budget-exhausted `Unknown` into an earlier `Unknown`.
+    pub(crate) icp_call_count: std::cell::Cell<u64>,
+    pub(crate) icp_main_box_count: std::cell::Cell<u64>,
+    pub(crate) icp_pin_box_count: std::cell::Cell<u64>,
+    pub(crate) icp_wide_tree_cap_count: std::cell::Cell<u64>,
 }
 
 impl<'a> NraSolver<'a> {
@@ -381,6 +403,7 @@ impl<'a> NraSolver<'a> {
         lra.set_combined_theory_mode(true);
         Self {
             terms,
+            deadline: None,
             lra,
             monomials: HashMap::default(),
             scaled_aliases: Vec::new(),
@@ -412,11 +435,33 @@ impl<'a> NraSolver<'a> {
             fixed_lin_emitted: HashSet::default(),
             registered_atoms: Vec::new(),
             asserted_atom_set: HashSet::default(),
+            sat_atoms: HashSet::default(),
             algebraic_model: Vec::new(),
             last_unsat_certificate: None,
             grid_budget: std::cell::Cell::new(icp::GRID_SOLVE_NODES),
             grid_exact_budget: std::cell::Cell::new(icp::GRID_EXACT_SOLVE_NODES),
+            icp_call_count: std::cell::Cell::new(0),
+            icp_main_box_count: std::cell::Cell::new(0),
+            icp_pin_box_count: std::cell::Cell::new(0),
+            icp_wide_tree_cap_count: std::cell::Cell::new(0),
         }
+    }
+
+    /// Install the wall-clock deadline of the enclosing solve, on this solver
+    /// and its inner LRA solver. The refinement loop answers `Unknown` once it
+    /// has passed: each round re-solves an LRA problem whose rationals can grow
+    /// without bound, so the iteration cap alone let one theory check run far
+    /// past the caller's timeout (measured through the Z3 C API: `y / x > x,
+    /// y = 1` with a 3 s timeout never returned).
+    pub fn set_deadline(&mut self, deadline: ay_core::time::Instant) {
+        self.deadline = Some(deadline);
+        self.lra.set_deadline(deadline);
+    }
+
+    /// Whether the installed deadline has passed.
+    pub(crate) fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
     }
 
     /// Exact algebraic model witnesses from the most recent `check()`, when it
@@ -431,19 +476,19 @@ impl<'a> NraSolver<'a> {
         &self.algebraic_model
     }
 
-    /// True iff the most recent `check()` returned UNSAT with a replayable
-    /// rational Positivstellensatz / SOS certificate attached (see [`sos`]). When
-    /// true, [`NraSolver::render_sos_unsat_certificate`] yields an independently
-    /// checkable algebraic proof of infeasibility that can replace the audited
-    /// `:rule trust` hole for that theory conflict in the certificate stream.
+    /// True iff the most recent `check()` returned UNSAT with an internally
+    /// checked rational Positivstellensatz / SOS witness attached (see [`sos`]).
+    /// The witness is checked against the original polynomial constraints.
+    /// Its public Alethe rendering still emits `:rule hole`; mere presence
+    /// grants neither strict proof acceptance nor portable replay authority.
     pub fn took_sos_unsat_certificate(&self) -> bool {
         self.last_unsat_certificate.is_some()
     }
 
-    /// Render the last UNSAT's Positivstellensatz certificate as an Alethe-style
-    /// proof step (empty clause, `:rule nra_positivstellensatz`), or `None` if
-    /// the last UNSAT had no certificate (interval-exhaustion with the trust
-    /// fallback). Variable names are resolved from the term store.
+    /// Render the last UNSAT's Positivstellensatz data as comments followed by
+    /// an Alethe `:rule hole`, or `None` if no witness was retained. The native
+    /// algebraic identity is not an implemented Alethe inference rule. Variable
+    /// names are resolved from the term store; this is not a replay-reader API.
     pub fn render_sos_unsat_certificate(&self, step: &str) -> Option<String> {
         let cert = self.last_unsat_certificate.as_ref()?;
         Some(cert.render_alethe(step, |t| match self.terms.get(t) {
@@ -455,6 +500,17 @@ impl<'a> NraSolver<'a> {
     /// Get the value of a variable from the current LRA model
     pub(crate) fn var_value(&self, var: TermId) -> Option<BigRational> {
         self.lra.get_value(var)
+    }
+
+    /// [`Self::var_value`] sharing one materialisation delta across a
+    /// read-only evaluation pass (identical values; see
+    /// `term_value_sharing_delta` in check_loop).
+    pub(crate) fn var_value_sharing_delta(
+        &self,
+        var: TermId,
+        delta: &mut Option<BigRational>,
+    ) -> Option<BigRational> {
+        self.lra.get_value_sharing_delta(var, delta)
     }
 
     /// Iterate every tracked product, including differently-scaled aliases.

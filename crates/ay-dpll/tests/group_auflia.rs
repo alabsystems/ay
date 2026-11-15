@@ -23,6 +23,8 @@ mod auflia_ematching_regression_7979;
 mod auflia_incremental_push_pop;
 #[path = "group_auflia/auflia_ite_sum_index_reconcile_w1b.rs"]
 mod auflia_ite_sum_index_reconcile_w1b;
+#[path = "group_auflia/auflia_l0gc_queued_conflict_hang_chc26.rs"]
+mod auflia_l0gc_queued_conflict_hang_chc26;
 #[path = "group_auflia/auflia_lia_edge_cases_6661.rs"]
 mod auflia_lia_edge_cases_6661;
 #[path = "group_auflia/auflia_model_extraction.rs"]
@@ -55,10 +57,16 @@ mod auflia_verification_consumer_array_quantifier_6920;
 mod auflia_verification_consumer_ext_eq_7956;
 #[path = "group_auflia/auflia_verification_consumer_regression_7883.rs"]
 mod auflia_verification_consumer_regression_7883;
+#[path = "group_auflia/auflira_arithmetic_ite.rs"]
+mod auflira_arithmetic_ite;
+#[path = "group_auflia/auflira_bool_argument_values.rs"]
+mod auflira_bool_argument_values;
 #[path = "group_auflia/auflira_bridged_conflict_verifier_6853.rs"]
 mod auflira_bridged_conflict_verifier_6853;
 #[path = "group_auflia/auflira_cross_sort_soundness.rs"]
 mod auflira_cross_sort_soundness;
+#[path = "group_auflia/auflira_root_congruence.rs"]
+mod auflira_root_congruence;
 #[path = "group_auflia/const_array_definition_validation_sat.rs"]
 mod const_array_definition_validation_sat;
 #[path = "group_auflia/dt_uflia_array_free_routing_chc25.rs"]

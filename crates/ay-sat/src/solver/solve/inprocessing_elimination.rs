@@ -31,6 +31,13 @@ impl Solver {
                 skip_expensive_equivalence_passes,
             );
         }
+        // `--sat-large-inproc` relaxes `skip_expensive_equivalence_passes` for
+        // the Kissat-style equivalence passes only; factoring, dedup, SBVA,
+        // BCE, CCE and conditioning keep the 200K-variable / 3M-clause gate.
+        let skip_elim = skip_expensive_equivalence_passes
+            || (ay_core::sat_ab_switches().large_inproc == Some(true)
+                && (self.size_gate_vars() > PREPROCESS_EXPENSIVE_MAX_VARS
+                    || self.arena.active_clause_count() > PREPROCESS_EXPENSIVE_MAX_CLAUSES));
 
         // Post-collapse BVE eligibility re-derivation (--sat-no-bve-post-collapse,
         // default ON since 2026-07-10 wf_55735963; =0 kill-switch): on the
@@ -69,23 +76,46 @@ impl Solver {
         // candidates → repeat. Without interleaving, each technique reaches
         // only a local fixpoint within its own round.
         // Density-based BVE skip for very large dense formulas (#8136).
-        let active_cls_for_bve = self.arena.active_clause_count();
-        let active_vars_for_bve = self
-            .num_vars
-            .saturating_sub(self.var_lifecycle.count_removed());
-        let bve_density = if active_vars_for_bve > 0 {
-            active_cls_for_bve as f64 / active_vars_for_bve as f64
-        } else {
-            0.0
-        };
+        //
+        // This density is the DATABASE's: active clauses, learned ones
+        // included, over structural variables. It rises with the learned
+        // database, so on a formula of density 50 to 90 the factor-dense band
+        // (`FACTOR_DENSE_MIN_DENSITY`, 90) opens a few thousand conflicts in,
+        // and with BVE armed the dense skip closes it. That is measured
+        // behaviour, not the front-half schedule's reading (irredundant
+        // clauses): rpoc_xits_09 (123c397f; 1,430 variables, 87,044 clauses,
+        // density 61) is UNSAT in 27 s because the band opens and factors 716
+        // groups once, and unanswered at 300 s on the formula's density, where
+        // the band never opens (bisected by m100 to 9fd0f4c09, reproduced here,
+        // 2026-09-20). On stable-400 the same opening costs 3.7x the
+        // propagations per conflict, and neither reading answers it at 300 s.
+        // `--sat-elim-density-irredundant true` reads the formula's density
+        // instead, for the A/B that would settle the 50-90 band.
+        let (active_cls_for_bve, bve_density) =
+            if ay_core::sat_ab_switches().elim_density_irredundant == Some(true) {
+                let (irredundant, _, density) = self.elimination_formula_density();
+                (irredundant, density)
+            } else {
+                let active = self.arena.active_clause_count();
+                let vars = self
+                    .num_vars
+                    .saturating_sub(self.var_lifecycle.count_removed());
+                let density = if vars > 0 {
+                    active as f64 / vars as f64
+                } else {
+                    0.0
+                };
+                (active, density)
+            };
         // Dense-skip elimination lift (kill-switch AY_AB_DENSE_SKIP_LIFT=0):
         // raised clause arm (2M -> 3M) for the BVE dense skip only;
         // decompose/congruence gates keep the original predicate (see
         // skip_dense_formula_elim for the d421913d measurement).
-        let skip_bve_dense = config_preprocess_policy::PreprocessPolicy::skip_dense_formula_elim(
-            active_cls_for_bve,
-            bve_density,
-        );
+        let skip_bve_dense = !bve_dense_gate_lifted(&ay_core::sat_ab_switches())
+            && config_preprocess_policy::PreprocessPolicy::skip_dense_formula_elim(
+                active_cls_for_bve,
+                bve_density,
+            );
         // Proportional BVE+transred time guard (#8078): skip BVE and transred
         // when their cumulative time exceeds 15% of total search time.
         // CaDiCaL bounds inprocessing via tick-proportional effort; AY's occ
@@ -103,7 +133,26 @@ impl Solver {
         // consume 1-3s on medium formulas like mp1-klieber.
         let bve_wall_budget_exceeded =
             self.inproc_round_over_budget(round_start, round_start_ticks);
-        let should_bve = self.should_bve();
+        let bve_skip = self.bve_skip_reason();
+        if let Some(reason) = bve_skip {
+            self.cold.bve_skip_counts[reason.index()] += 1;
+        }
+        let should_bve = bve_skip.is_none();
+        if should_bve {
+            for (slot, gate) in [
+                skip_gate_dependent_passes,
+                skip_bve_dense,
+                skip_inproc_proportional,
+                bve_wall_budget_exceeded,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if gate {
+                    self.cold.bve_gate_skip_counts[slot] += 1;
+                }
+            }
+        }
         if should_bve
             && !skip_gate_dependent_passes
             && !skip_bve_dense
@@ -173,7 +222,11 @@ impl Solver {
             // cost is not tick-metered, so a wall-clock fallback is needed.
             let elim_wall_start = ay_core::time::Instant::now();
             for elim_round in 0..ELIM_INTERLEAVE_ROUNDS {
+                let eliminated_before = self.inproc.bve.stats().vars_eliminated;
                 // BVE can derive UNSAT directly (empty resolvent).
+                // Counted like the other passes: `sat.inproc_bve_attempts`
+                // read 0 against 13 runs on schooltt-5-3 (2026-09-21).
+                self.stats.record_inprocessing_attempt(DiagnosticPass::BVE);
                 if self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::BVE, Self::bve) {
                     elim_derived_unsat = true;
                     break;
@@ -202,11 +255,23 @@ impl Solver {
                 if self.is_interrupted() {
                     break;
                 }
+                // `--sat-eliminate-cadence-kissat`: Kissat runs a second round
+                // only when the first eliminated something, and at most two
+                // (eliminate.c:496-521, `eliminaterounds` 2).
+                if self.cold.eliminate_cadence_kissat
+                    && (elim_round >= 1
+                        || self.inproc.bve.stats().vars_eliminated == eliminated_before)
+                {
+                    break;
+                }
 
                 // (#8448) Wall-clock guard: stop the BVE cascade after 2s.
                 // The first round captures the primary benefit; subsequent
                 // rounds have diminishing returns but fixed overhead cost.
-                if elim_wall_start.elapsed().as_secs() >= 2 {
+                // Off under `--sat-deterministic-inproc`: ELIM_INTERLEAVE_ROUNDS,
+                // the per-call BVE effort and the no-new-candidates exit bound
+                // the cascade instead.
+                if !self.deterministic_inproc() && elim_wall_start.elapsed().as_secs() >= 2 {
                     break;
                 }
 
@@ -401,7 +466,9 @@ impl Solver {
         if let Some(reason) = factor_skip {
             self.cold.factor_skip_counts[reason.index()] += 1;
         }
-        if factor_skip.is_none() && (!skip_expensive_equivalence_passes || factor_dense) {
+        // `--sat-factor-large` (factor_large.rs) opens this gate in its band.
+        let factor_large = self.factor_large_unlock_active();
+        if factor_skip.is_none() && (!skip_elim || factor_dense || factor_large) {
             self.jit_invalidate_for_structural_pass(); // factor: structural (#8128)
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::Factor, Self::factorize);
             passes_run.push("factor");
@@ -412,7 +479,7 @@ impl Solver {
             if self.propagate_check_unsat() {
                 return true;
             }
-        } else if factor_skip.is_none() && skip_expensive_equivalence_passes {
+        } else if factor_skip.is_none() && skip_elim && !factor_large {
             self.inproc_ctrl
                 .factor
                 .reschedule(self.num_conflicts, FACTOR_INTERVAL);
@@ -422,10 +489,7 @@ impl Solver {
         // Guard with skip_expensive_equivalence_passes (#8084): when factor is
         // skipped, no new divider clauses are produced. The O(2*num_vars) scan
         // with per-literal HashMap allocations is wasted on large formulas.
-        if self.inproc_ctrl.decompose.enabled
-            && !skip_expensive_equivalence_passes
-            && self.deduplicate_binary_clauses()
-        {
+        if self.inproc_ctrl.decompose.enabled && !skip_elim && self.deduplicate_binary_clauses() {
             return true;
         }
 
@@ -435,7 +499,8 @@ impl Solver {
         // using fresh extension variables. Complementary to factor: factor
         // handles single-literal differences, SBVA handles multi-literal
         // shared subsets.
-        if self.should_sbva() && !skip_expensive_equivalence_passes {
+        let kissat_passes = ay_core::sat_ab_switches().inproc_passes_kissat == Some(true);
+        if self.should_sbva() && !skip_elim && !kissat_passes {
             self.jit_invalidate_for_structural_pass();
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::Sbva, Self::sbva);
             passes_run.push("sbva");
@@ -445,7 +510,7 @@ impl Solver {
             if self.propagate_check_unsat() {
                 return true;
             }
-        } else if self.should_sbva() && skip_expensive_equivalence_passes {
+        } else if self.should_sbva() && skip_elim {
             self.inproc_ctrl
                 .sbva
                 .reschedule(self.num_conflicts, SBVA_INTERVAL);
@@ -457,11 +522,7 @@ impl Solver {
         // Gate: BCE builds occurrence lists O(clauses) before the effort limit.
         // On large residuals (>3M clauses), this setup cost dominates (#7135).
         let should_bce = self.should_bce();
-        if should_bce
-            && !bce_ran_in_elim_phase
-            && !self.cold.has_been_incremental
-            && !skip_expensive_equivalence_passes
-        {
+        if should_bce && !bce_ran_in_elim_phase && !self.cold.has_been_incremental && !skip_elim {
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::BCE, Self::bce);
             passes_run.push("bce");
             // BISECT: validate watches after standalone bce
@@ -469,7 +530,7 @@ impl Solver {
             self.bisect_validate_watches("after standalone-bce");
         } else if should_bce
             && !bce_ran_in_elim_phase
-            && (self.cold.has_been_incremental || skip_expensive_equivalence_passes)
+            && (self.cold.has_been_incremental || skip_elim)
         {
             self.inproc_ctrl
                 .bce
@@ -484,11 +545,7 @@ impl Solver {
         // Guard: CCE builds occurrence lists O(clauses) before the effort limit,
         // same as BCE. Skip on large residuals (#8084).
         let should_cce = self.should_cce();
-        if should_cce
-            && !cce_ran_in_elim_phase
-            && !self.cold.has_been_incremental
-            && !skip_expensive_equivalence_passes
-        {
+        if should_cce && !cce_ran_in_elim_phase && !self.cold.has_been_incremental && !skip_elim {
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::CCE, Self::cce);
             passes_run.push("cce");
             // BISECT: validate watches after standalone cce
@@ -496,7 +553,7 @@ impl Solver {
             self.bisect_validate_watches("after standalone-cce");
         } else if should_cce
             && !cce_ran_in_elim_phase
-            && (self.cold.has_been_incremental || skip_expensive_equivalence_passes)
+            && (self.cold.has_been_incremental || skip_elim)
         {
             self.inproc_ctrl
                 .cce
@@ -515,13 +572,13 @@ impl Solver {
         // Guard: conditioning builds a total assignment over all vars and iterates
         // all clauses. On large residuals, this is O(clauses) before the check.
         // Matches preprocessing guard (config_preprocess.rs:416).
-        if self.should_condition() && !skip_expensive_equivalence_passes {
+        if self.should_condition() && !skip_elim {
             self.run_timed_diagnostic_inprocessing_pass(DiagnosticPass::Condition, Self::condition);
             passes_run.push("condition");
             // BISECT: validate watches after condition
             #[cfg(debug_assertions)]
             self.bisect_validate_watches("after condition");
-        } else if self.should_condition() && skip_expensive_equivalence_passes {
+        } else if self.should_condition() && skip_elim {
             self.inproc_ctrl
                 .condition
                 .reschedule(self.num_conflicts, CONDITION_INTERVAL);
@@ -571,8 +628,12 @@ impl Solver {
         // the collapsed residual too. Cost stays bounded by the
         // sweep_wall_budget_exceeded round guard below; the unlock is inert
         // when the knob is off or the collapse merged nothing.
-        let skip_sweep = self.num_vars > PREPROCESS_EXPENSIVE_MAX_VARS
-            && !self.bve_post_collapse_unlock_active();
+        let skip_sweep = if ay_core::sat_ab_switches().large_inproc == Some(true) {
+            self.arena.active_clause_count() > LARGE_INPROC_MAX_CLAUSES
+        } else {
+            self.size_gate_vars() > PREPROCESS_EXPENSIVE_MAX_VARS
+                && !self.bve_post_collapse_unlock_active()
+        };
         // Wall-clock guard (#8448): skip sweep if this inprocessing round
         // has already consumed the budget. Sweep's kitten sub-solver can
         // consume 300-1400ms per round on medium formulas.
@@ -620,7 +681,15 @@ impl Solver {
         // after BVE/substitution creates holes in variable-indexed arrays.
         // Guards: level 0, non-incremental, no proof output, sufficient inactives.
         if self.compacting() {
-            self.compact();
+            // `--sat-compact-fixed`: a complete root simplification first, so
+            // that root-fixed variables can be dropped too (compact_fixed.rs).
+            if self.compact_fixed_active() {
+                if self.compact_with_fixed() {
+                    return true;
+                }
+            } else {
+                self.compact();
+            }
             passes_run.push("compact");
             // BISECT: validate watches after compact
             #[cfg(debug_assertions)]
@@ -810,6 +879,12 @@ impl Solver {
     }
 
     fn bve_transred_proportional_guard_exceeded(&self) -> bool {
+        // A share of wall time, so off under `--sat-deterministic-inproc`: the
+        // same answer every run gets without `--progress`, which alone arms
+        // `solve_start_time`.
+        if self.deterministic_inproc() {
+            return false;
+        }
         // Indices follow INPROCESS_TIMING_LABELS: 6 = BVE, 12 = transred.
         let bve_transred_ns =
             self.stats.inprocessing_time_ns[6] + self.stats.inprocessing_time_ns[12];
@@ -819,6 +894,24 @@ impl Solver {
             .map(|t| t.elapsed().as_nanos() as u64)
             .unwrap_or(0);
         search_elapsed_ns > 2_000_000_000 && bve_transred_ns * 100 / search_elapsed_ns.max(1) > 15
+    }
+
+    /// The formula's live density: irredundant clauses over structural
+    /// variables (the front-half schedule's quantity). The density switches
+    /// (`--sat-factor-max-density`, `--sat-sbva-max-density`,
+    /// `--sat-elim-density-irredundant`) read it; the elimination-phase gates
+    /// read the database's density by default (see the site above).
+    pub(in crate::solver) fn elimination_formula_density(&self) -> (usize, usize, f64) {
+        let irredundant = self.arena.irredundant_count();
+        let structural_vars = self
+            .num_vars
+            .saturating_sub(self.var_lifecycle.count_removed());
+        let density = if structural_vars > 0 {
+            irredundant as f64 / structural_vars as f64
+        } else {
+            0.0
+        };
+        (irredundant, structural_vars, density)
     }
 
     fn reschedule_bve_after_productive_circuit_factor(&mut self, factor_count_before: u64) {
@@ -850,7 +943,11 @@ impl Solver {
         factor_count_before: u64,
         gate_stats: &GateStats,
     ) -> bool {
-        if self.proof_manager.is_some() || self.cold.lrat_enabled {
+        // proof-posture-parity (site D, 2026-09-10): this is a scheduling
+        // decision — reopen BVE right after a productive circuit factoring —
+        // and BVE is proof-capable on the DRAT/VeriPB surface, so the proof
+        // posture takes it too. LRAT keeps it closed (BVE is clamped there).
+        if self.cold.lrat_enabled {
             return false;
         }
         if !self.inproc_ctrl.bve.enabled || self.cold.has_been_incremental {
@@ -870,12 +967,34 @@ impl Solver {
     }
 }
 
+/// `--sat-bve-dense-by-effort` with `--sat-bve-kissat-schedule`: the
+/// inprocessing BVE density gate gives way to Kissat's effort bound (a tenth
+/// of the search ticks since the last elimination), which caps the cost the
+/// gate exists to cap. Either switch alone leaves the gate in force.
+fn bve_dense_gate_lifted(switches: &ay_core::SatAbSwitches) -> bool {
+    switches.bve_dense_by_effort == Some(true) && switches.bve_kissat_schedule == Some(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         ProofOutput, SolverVariant, VariantInput, VariantProofMode::Lrat, VariantRouteProfile,
     };
+
+    #[test]
+    fn the_dense_gate_lifts_only_with_both_switches() {
+        let with = |dense: Option<bool>, schedule: Option<bool>| ay_core::SatAbSwitches {
+            bve_dense_by_effort: dense,
+            bve_kissat_schedule: schedule,
+            ..Default::default()
+        };
+        assert!(bve_dense_gate_lifted(&with(Some(true), Some(true))));
+        assert!(!bve_dense_gate_lifted(&with(Some(true), None)));
+        assert!(!bve_dense_gate_lifted(&with(None, Some(true))));
+        assert!(!bve_dense_gate_lifted(&with(Some(false), Some(true))));
+        assert!(!bve_dense_gate_lifted(&ay_core::SatAbSwitches::default()));
+    }
 
     fn official_main_lrat_solver() -> Solver {
         let input = VariantInput::new(16, 32, Lrat)
@@ -886,6 +1005,63 @@ mod tests {
         let mut solver = Solver::with_proof_output(16, proof);
         config.apply_to_solver(&mut solver);
         solver
+    }
+
+    /// `elimination_formula_density` is the formula's: 20 variables and 200
+    /// irredundant clauses read 10.0 whether or not 2,000 learned clauses sit
+    /// beside them. The elimination gates read the database's density by
+    /// default (on stable-400-12 that opens the factor-dense band on a
+    /// density-77 formula once the learned database has grown, and it is what
+    /// answers rpoc_xits_09); `--sat-elim-density-irredundant true` gives
+    /// them this reading.
+    #[test]
+    fn the_elimination_density_ignores_learned_clauses() {
+        let mut solver = Solver::new(20);
+        for i in 0..200u32 {
+            let a = Variable(i % 20);
+            let b = Variable((i * 7 + 1) % 20);
+            let c = Variable((i * 13 + 2) % 20);
+            let clause = if a == b || b == c || a == c {
+                vec![
+                    Literal::positive(a),
+                    Literal::negative(Variable((i + 3) % 20)),
+                    Literal::positive(Variable((i + 5) % 20)),
+                ]
+            } else {
+                vec![
+                    Literal::positive(a),
+                    Literal::negative(b),
+                    Literal::positive(c),
+                ]
+            };
+            solver.add_clause(clause);
+        }
+        let (irredundant, vars, density) = solver.elimination_formula_density();
+        assert_eq!((irredundant, vars), (200, 20));
+        assert!((density - 10.0).abs() < 1e-9, "{density}");
+        for i in 0..2000u32 {
+            // The four variables must be DISTINCT: `add_learned_clause`
+            // debug-asserts that a learned clause carries no duplicate
+            // literal, and the previous index expressions collided (at i=2
+            // they produced `positive(2)` twice). The offset bands 0, 1..=4,
+            // 6..=9 and 12..=15 are disjoint and never wrap past 20, so no
+            // pair can repeat or be complementary.
+            let a = i % 20;
+            let b = (a + 1 + (i / 20) % 4) % 20;
+            let c = (a + 6 + (i / 80) % 4) % 20;
+            let d = (a + 12 + (i / 320) % 4) % 20;
+            let lits = vec![
+                Literal::positive(Variable(a)),
+                Literal::negative(Variable(b)),
+                Literal::positive(Variable(c)),
+                Literal::negative(Variable(d)),
+            ];
+            solver.add_learned_clause(lits, 3, &[]);
+        }
+        assert!(solver.arena.active_clause_count() > 2000);
+        let (irredundant_after, vars_after, density_after) = solver.elimination_formula_density();
+        assert_eq!((irredundant_after, vars_after), (irredundant, vars));
+        assert!((density_after - density).abs() < 1e-9, "{density_after}");
     }
 
     fn due_bve_elimination_solver(num_vars: usize) -> Solver {
@@ -998,7 +1174,7 @@ mod tests {
         solver.cold.lrat_enabled = true;
         assert!(
             !solver.should_reschedule_bve_after_productive_circuit_factor(1, &circuit_gates),
-            "LRAT/proof mode must keep factor-to-BVE reopening closed"
+            "LRAT mode must keep factor-to-BVE reopening closed"
         );
     }
 

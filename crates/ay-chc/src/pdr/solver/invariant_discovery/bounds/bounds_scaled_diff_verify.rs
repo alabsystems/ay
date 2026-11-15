@@ -13,39 +13,40 @@ use super::*;
 impl PdrSolver {
     /// Extract multiplication coefficients from an expression.
     /// E.g., `(* 5 C)` yields 5, `(* (- 1) B)` yields -1.
+    ///
+    /// Every caller keeps only the first occurrence of a coefficient, so the
+    /// walk visits each distinct (shared) sub-term once, in the tree walk's
+    /// order: the tree walk it replaces was exponential in the nesting of
+    /// shared sub-terms (startup discovery on a shared `let` chain).
     pub(in crate::pdr::solver) fn collect_mul_coefficients(
         expr: &ChcExpr,
         coefficients: &mut Vec<i128>,
     ) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| {
+            let ChcExpr::Op(op, args) = node else {
+                return crate::expr::dag::Step::Skip;
+            };
+            if *op == ChcOp::Mul && args.len() == 2 {
                 match (args[0].as_ref(), args[1].as_ref()) {
                     (ChcExpr::Int(k), ChcExpr::Var(_)) | (ChcExpr::Var(_), ChcExpr::Int(k)) => {
                         coefficients.push(*k);
                     }
                     _ => {}
                 }
-                for a in args {
-                    Self::collect_mul_coefficients(a, coefficients);
-                }
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_mul_coefficients(a, coefficients);
-                }
-            }
-            _ => {}
+            crate::expr::dag::Step::Descend
         });
     }
 
     /// Extract equality constants from a constraint expression.
     /// E.g., `(= 10 v_0)` yields 10, `(and (= 10 v_0) (= 20 v_1))` yields 10, 20.
-    /// Used to derive scale factors from init values (#5480).
+    /// Used to derive scale factors from init values (#5480). One visit per
+    /// distinct sub-term, like `collect_mul_coefficients`.
     pub(in crate::pdr::solver) fn collect_equality_constants(
         expr: &ChcExpr,
         constants: &mut Vec<i128>,
     ) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
             ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
                 match (args[0].as_ref(), args[1].as_ref()) {
                     (ChcExpr::Int(k), ChcExpr::Var(_)) | (ChcExpr::Var(_), ChcExpr::Int(k)) => {
@@ -53,13 +54,10 @@ impl PdrSolver {
                     }
                     _ => {}
                 }
+                crate::expr::dag::Step::Skip
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_equality_constants(a, constants);
-                }
-            }
-            _ => {}
+            ChcExpr::Op(..) => crate::expr::dag::Step::Descend,
+            _ => crate::expr::dag::Step::Skip,
         });
     }
 

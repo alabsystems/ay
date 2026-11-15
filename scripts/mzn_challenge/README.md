@@ -32,7 +32,7 @@ proved optimality, else 0.5); equal quality splits by whole-second time
 ## Usage
 ```sh
 bash scripts/mzn_challenge/setup.sh                       # one-time
-cargo build --release -p ay --features cli --bin ay
+targo --unverified build --release -p ay --features cli --bin ay
 python3 scripts/mzn_challenge/run.py 1200000 free 6       # full 1200s budget
 python3 scripts/mzn_challenge/score_ay.py \
     benchmarks/minizinc/challenge-2025/runs/ay-free-1200s.json free
@@ -48,5 +48,4 @@ Because AY ships no MiniZinc globals library, every model flattens with the
 `std` library, which **decomposes all global constraints** into primitives —
 so AY's native propagators (alldifferent-AC, cumulative, disjunctive, table,
 circuit) are never exercised, and large instances explode (ihtc-kletzander:
-5.3M reified constraints). Closing this is the #1 lever. See
-the development design notes.
+5.3M reified constraints). Closing this is the #1 lever.

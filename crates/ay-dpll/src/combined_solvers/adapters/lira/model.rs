@@ -48,7 +48,8 @@ impl LiraSolver<'_> {
             let patched_lra_terms = reconcile_lia_lra_values(
                 &mut lia_model,
                 &mut lra_model,
-                &self.lia.shared_equality_terms(),
+                &self.lia.model_authoritative_terms(),
+                &|model| self.lia.model_falsifies_asserted(model),
             );
             if !patched_lra_terms.is_empty() {
                 let patched_var_ids: HashSet<u32> = patched_lra_terms

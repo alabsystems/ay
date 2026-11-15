@@ -364,4 +364,21 @@ fn test_unwrap_fp_special_panic_on_mismatch() {
     ModelValue::Int(BigInt::from(0)).unwrap_fp_special();
 }
 
+/// A string value prints each character's SMT-LIB CODE POINT, so a surrogate,
+/// stored in its carrier `char` (`ay_core::smtlib_char`), prints as the
+/// surrogate it carries — the spelling that parses back to the same value
+/// (2026-09-23 fp-strings verifier, mutant M32: the carrier's own scalar
+/// value printed `\u{10d800}`, a different, out-of-alphabet character).
+#[test]
+fn test_display_string_prints_a_surrogate_by_code_point() {
+    let carrier = |code: u32| ay_core::smtlib_char(code).expect("in the SMT-LIB alphabet");
+    let value: String = ['a', carrier(0xD800), carrier(0xDFFF), '\u{e000}']
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ModelValue::String(value).to_string(),
+        r#""a\u{d800}\u{dfff}\u{e000}""#
+    );
+}
+
 mod symbolic_values;

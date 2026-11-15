@@ -355,22 +355,28 @@ impl BVE {
             return EliminationResult::not_eliminated(var);
         }
 
-        // SOUNDNESS GUARD (pure-gate clamp, inc1). Gate-restricted elimination
-        // both (a) skips non-gate × non-gate resolvent pairs and (b) pushes ONLY
-        // the gate-defining clauses as reconstruction witnesses (#8482). Both are
-        // unsound when the gate does not COMPLETELY define `x`: a deleted,
-        // non-witnessed non-gate clause `(¬x ∨ C)` can be falsified when model
-        // reconstruction flips the pivot per the gate, even though the simplified
-        // DB stayed equisatisfiable (the braun/barrel FINALIZE_SAT_FAIL). AY
-        // extracts gates without `elim_propagate`, so structural completeness
-        // checks are unreliable. Conservative, provably-correct rule
-        // (`gate_restriction_is_sound`): use gate restriction ONLY for pure-gate
-        // variables (every live clause with the pivot IS a gate clause);
-        // otherwise nullify the gate and fall back to FULL resolution + full
-        // witnessing, which is unconditionally equisat- and reconstruction-
-        // preserving.
+        // SOUNDNESS GUARD. Gate-restricted elimination both (a) skips non-gate
+        // × non-gate resolvent pairs and (b) pushes ONLY the gate-defining
+        // clauses as reconstruction witnesses (#8482). Both are unsound when
+        // the gate does not COMPLETELY define `x` (the braun/barrel
+        // FINALIZE_SAT_FAIL), and (a) also when unresolved gate pairs are not
+        // tautological, so the extractor's word is not taken:
+        // `gate_restriction_is_sound` proves both conditions for this
+        // candidate, or the gate is nullified and elimination falls back to
+        // FULL resolution + full witnessing, which is unconditionally equisat-
+        // and reconstruction-preserving.
         let gate_defining_clauses = match gate_defining_clauses {
-            Some(defining) if !self.gate_restriction_is_sound(var, clauses, defining) => None,
+            Some(defining)
+                if !self.gate_restriction_is_sound(
+                    var,
+                    clauses,
+                    defining,
+                    resolve_gate_pairs,
+                    vals,
+                ) =>
+            {
+                None
+            }
             other => other,
         };
         // `resolve_gate_pairs` only has meaning when a gate is present; once the
@@ -669,178 +675,56 @@ impl BVE {
         }
     }
 
-    /// Decide whether gate-restricted resolution + gate-only witnessing is sound
-    /// (equisatisfiability- AND reconstruction-preserving) for `var` (inc1).
-    ///
-    /// Gate-restricted elimination skips non-gate × non-gate resolvent pairs and
-    /// witnesses ONLY the gate-defining clauses (#8482). Reconstruction flips the
-    /// pivot to satisfy its gate-only witnesses; a deleted, non-witnessed non-gate
-    /// clause `(¬x ∨ C)` can then be falsified even though the simplified DB was
-    /// equisatisfiable (braun-9/13 + barrel6 FINALIZE_SAT_FAIL). AY's
-    /// `vals`-based gate extraction can return a structurally-complete "gate" that
-    /// still fails to subsume an extra non-gate constraint, so structural checks
-    /// are insufficient.
-    ///
-    /// Conservative, provably-correct rule: only use gate restriction when EVERY
-    /// live clause containing the pivot is a gate-defining clause (a "pure-gate"
-    /// variable). Then there are no non-gate clauses to drop, gate-only witnessing
-    /// equals full witnessing, and restricted resolution equals full resolution —
-    /// all trivially sound. Otherwise the caller nullifies the gate and falls back
-    /// to full resolution + full witnessing (unconditionally equisat-preserving),
-    /// sacrificing gate aggressiveness on mixed variables for guaranteed soundness.
+    /// Whether gate-restricted resolution with gate-only witnesses is sound for
+    /// `var`: proved per candidate by `gate_complete` (the gate pairs resolve
+    /// tautologically or are resolved, and, unless every live clause of `var`
+    /// is a gate clause, the gate completely defines `var`). Otherwise the
+    /// caller nullifies the gate and falls back to full resolution with every
+    /// clause witnessed. Until 2026-09-24 only pure-gate variables qualified,
+    /// which left gate-based elimination all but unused (sbdp4_138_2: Kissat
+    /// eliminated 931 variables by gates, AY refused 472 of them).
     fn gate_restriction_is_sound(
-        &self,
-        var: Variable,
-        clauses: &ClauseArena,
-        defining: &[usize],
-    ) -> bool {
-        let live = |idx: usize| idx < clauses.len() && !clauses.is_dead(idx);
-        // Pure-gate test: every live clause containing the pivot (either polarity)
-        // must be a gate-defining clause. A single non-gate clause makes gate-only
-        // witnessing unsound for reconstruction → fall back to full resolution.
-        for &lit in &[Literal::positive(var), Literal::negative(var)] {
-            for &idx in self.occ.get(lit) {
-                if live(idx) && !defining.contains(&idx) {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Finalize a variable elimination using pre-computed resolution results.
-    ///
-    /// This is the GPU-accelerated path (#8349): the resolution phase was
-    /// performed on the GPU, producing `resolvents`, `strengthened`, and
-    /// `satisfied_parents`. This method performs the remaining steps:
-    /// witness entry collection, reconstruction completeness guard, 10%
-    /// growth backstop, and variable elimination marking.
-    ///
-    /// The logic mirrors `try_eliminate_with_gate_with_marks` lines 374-548,
-    /// factored out to avoid duplication between CPU and GPU paths.
-    #[cfg(feature = "gpu")]
-    pub(crate) fn finalize_elimination_from_resolution(
         &mut self,
         var: Variable,
         clauses: &ClauseArena,
-        can_eliminate: bool,
-        resolvents: Vec<(Vec<Literal>, usize, usize, Vec<usize>)>,
-        strengthened: Vec<super::ClauseStrengthening>,
-        satisfied_parents: Vec<usize>,
-        resolution_attempts: u64,
-    ) -> EliminationResult {
-        let var_idx = var.index();
-
-        if var_idx < self.eliminated.len() && self.eliminated[var_idx] {
-            return EliminationResult::not_eliminated(var);
+        defining: &[usize],
+        resolve_gate_pairs: bool,
+        vals: &[i8],
+    ) -> bool {
+        let live = |idx: usize| idx < clauses.len() && !clauses.is_dead(idx);
+        let pure = [Literal::positive(var), Literal::negative(var)]
+            .iter()
+            .all(|&lit| {
+                self.occ
+                    .get(lit)
+                    .iter()
+                    .all(|&idx| !live(idx) || defining.contains(&idx))
+            });
+        if !pure && ay_core::sat_ab_switches().bve_gate_complete != Some(true) {
+            return false;
         }
-
-        if !can_eliminate {
-            let mut result = EliminationResult::not_eliminated(var);
-            result.resolution_attempts = resolution_attempts;
-            return result;
-        }
-
-        let pos_lit = Literal::positive(var);
-        let neg_lit = Literal::negative(var);
-
-        let mut to_delete = Vec::new();
-        let mut witness_entries = Vec::new();
-        let mut seen = HashSet::default();
-
-        // #8397 (CPU parity with try_eliminate_with_gate_with_marks):
-        // root-satisfied parents are deleted but must NOT be pushed as
-        // reconstruction witnesses. Their resolvents were never generated,
-        // so a witness entry could flip the pivot based on a clause whose
-        // satisfaction is not guaranteed after multi-variable
-        // reconstruction (#8356).
-        let satisfied_set: Option<HashSet<usize>> = if satisfied_parents.is_empty() {
-            None
-        } else {
-            Some(satisfied_parents.iter().copied().collect())
+        use super::gate_complete::GateVerdict;
+        let verdict = super::gate_complete::gate_restriction_is_sound(
+            var,
+            clauses,
+            defining,
+            resolve_gate_pairs,
+            vals,
+            pure,
+        );
+        let slot = match verdict {
+            GateVerdict::Sound => {
+                if !pure {
+                    self.stats.gates_proved_mixed += 1;
+                }
+                return true;
+            }
+            GateVerdict::Shape => 0,
+            GateVerdict::Pairs => 1,
+            GateVerdict::Incomplete => 2,
+            GateVerdict::Budget => 3,
         };
-
-        for &(witness, occs) in &[
-            (pos_lit, self.occ.get(pos_lit)),
-            (neg_lit, self.occ.get(neg_lit)),
-        ] {
-            for &c_idx in occs {
-                if c_idx >= clauses.len() || clauses.is_dead(c_idx) || !seen.insert(c_idx) {
-                    continue;
-                }
-                to_delete.push(c_idx);
-                if satisfied_set
-                    .as_ref()
-                    .is_some_and(|set| set.contains(&c_idx))
-                {
-                    continue;
-                }
-                witness_entries.push(WitnessEntry {
-                    clause_idx: c_idx,
-                    witness,
-                });
-            }
-        }
-
-        // Reconstruction completeness guard (#8179), with the #8397
-        // exception: a polarity whose clauses are ALL root-satisfied is
-        // effectively pure on the other side and remains eliminable
-        // (CPU parity with try_eliminate_with_gate_with_marks).
-        {
-            let has_pos = witness_entries.iter().any(|e| e.witness == pos_lit);
-            let has_neg = witness_entries.iter().any(|e| e.witness == neg_lit);
-            if !has_pos || !has_neg {
-                let missing_lit = if !has_pos { pos_lit } else { neg_lit };
-                let missing_count = to_delete
-                    .iter()
-                    .filter(|&&idx| clauses.literals(idx).contains(&missing_lit))
-                    .count();
-                let missing_satisfied_count = to_delete
-                    .iter()
-                    .filter(|&&idx| {
-                        clauses.literals(idx).contains(&missing_lit)
-                            && satisfied_set.as_ref().is_some_and(|set| set.contains(&idx))
-                    })
-                    .count();
-                let missing_all_satisfied =
-                    missing_count > 0 && missing_count == missing_satisfied_count;
-                if !missing_all_satisfied {
-                    let mut result = EliminationResult::not_eliminated(var);
-                    result.resolution_attempts = resolution_attempts;
-                    return result;
-                }
-            }
-        }
-
-        // 10% growth backstop.
-        let active_before = clauses.active_clause_count();
-        if active_before >= 100 && resolvents.len() > to_delete.len() {
-            let growth = resolvents.len() - to_delete.len();
-            if growth.saturating_mul(10) > active_before {
-                let mut result = EliminationResult::not_eliminated(var);
-                result.resolution_attempts = resolution_attempts;
-                return result;
-            }
-        }
-
-        // Mark variable as eliminated.
-        if var_idx < self.eliminated.len() {
-            self.eliminated[var_idx] = true;
-        }
-
-        self.stats.vars_eliminated += 1;
-        self.stats.clauses_removed += to_delete.len() as u64;
-        self.stats.resolvents_added += resolvents.len() as u64;
-
-        EliminationResult {
-            variable: var,
-            to_delete,
-            witness_entries,
-            resolvents,
-            strengthened,
-            satisfied_parents,
-            eliminated: true,
-            resolution_attempts,
-        }
+        self.stats.gates_unproved[slot] += 1;
+        false
     }
 }

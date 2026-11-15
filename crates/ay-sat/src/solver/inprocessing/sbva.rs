@@ -19,6 +19,18 @@ impl Solver {
     /// per idle call, up to SBVA_MAX_INTERVAL. Productive calls reset
     /// to base interval.
     pub(in crate::solver) fn sbva(&mut self) {
+        // `--sat-sbva-max-density`: no SBVA on a formula denser than this.
+        // Default 12 since 2026-09-22 (see SBVA_DEFAULT_MAX_DENSITY); the
+        // switch still overrides it, and a value above any real density is
+        // the opt-out.
+        let max_density = ay_core::sat_ab_switches()
+            .sbva_max_density
+            .unwrap_or(SBVA_DEFAULT_MAX_DENSITY);
+        let (_, _, density) = self.elimination_formula_density();
+        if density > max_density {
+            self.cold.sbva_density_skips += 1;
+            return;
+        }
         let productive = self.sbva_body();
         if productive {
             self.inproc_ctrl
@@ -168,10 +180,12 @@ impl Solver {
                     &[],
                     ProofAddKind::TrustedTransform,
                 );
+                // The DRAT and VeriPB writers return id 0: delete by literals
+                // there too, so the proof-only blocked clause does not stay in
+                // the checker's database (2026-09-17 audit).
                 let blocked_id = self
                     .proof_emit_add(&app.blocked_clause, &[], ProofAddKind::TrustedTransform)
-                    .ok()
-                    .filter(|&id| id != 0);
+                    .ok();
                 for tail in &app.tail_clauses {
                     let _ = self.proof_emit_add(tail, &[], ProofAddKind::TrustedTransform);
                 }
@@ -180,7 +194,20 @@ impl Solver {
                 }
             }
 
-            // Add new clauses to clause DB (no proof emit -- already done above).
+            // proof-posture-parity (site F, 2026-09-10): mutate the LIVE clause
+            // database in the same order as the non-proof path below — delete
+            // originals first, then add the new clauses — so both postures leave
+            // identical arena positions and watch lists. The proof stream
+            // already carries every add above; live insertion emits nothing.
+            self.ensure_reason_clause_marks_current();
+            for &clause_idx in &result.to_delete {
+                // Notify BVE occ lists of irredundant clause removal (#8096).
+                if !self.arena.is_learned(clause_idx) {
+                    let old_lits = self.arena.literals(clause_idx).to_vec();
+                    self.note_irredundant_clause_removed_for_bve(clause_idx, &old_lits);
+                }
+                self.delete_clause_checked(clause_idx, ReasonPolicy::Skip);
+            }
             for mut lits in std::mem::take(&mut result.new_clauses) {
                 let add_result = self.add_clause_watched(&mut lits);
                 // Notify BVE occ lists of new irredundant clause (#8096).
@@ -195,17 +222,6 @@ impl Solver {
                 if self.has_empty_clause {
                     return;
                 }
-            }
-
-            // Delete originals from clause DB.
-            self.ensure_reason_clause_marks_current();
-            for &clause_idx in &result.to_delete {
-                // Notify BVE occ lists of irredundant clause removal (#8096).
-                if !self.arena.is_learned(clause_idx) {
-                    let old_lits = self.arena.literals(clause_idx).to_vec();
-                    self.note_irredundant_clause_removed_for_bve(clause_idx, &old_lits);
-                }
-                self.delete_clause_checked(clause_idx, ReasonPolicy::Skip);
             }
         } else {
             // Non-proof path: delete originals first, then add new clauses.

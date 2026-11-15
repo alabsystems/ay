@@ -46,6 +46,7 @@ use crate::executor_types::{Result, SolveResult, UnknownReason};
 use super::completion::CheckedProjectionOutputCompletion;
 
 mod finite_model_owner;
+mod store_chain_class_candidate;
 
 /// Unforgeable witness that a `Sat` verdict passed one complete checked
 /// emission lane.
@@ -123,12 +124,79 @@ impl SatCertificate {
     }
 }
 
-#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SatOwnerTransition {
+    CurrentQuery,
+    RestoredOptimization,
+}
+
+/// Affine accounting handoff for the optimization witness in this funnel.
+/// Only the native publication path can construct it, before validation of
+/// the full scoped obligations and after their checked restoration.
+pub(super) struct ScopedOptimizationModel<'a> {
+    model: &'a mut super::Model,
+    roots: &'a [TermId],
+}
+
+impl<'a> ScopedOptimizationModel<'a> {
+    pub(super) fn into_parts(self) -> (&'a mut super::Model, &'a [TermId]) {
+        (self.model, self.roots)
+    }
+}
+
 impl Executor {
+    fn retain_scoped_optimization_owner(&mut self, roots: &[TermId]) -> bool {
+        let Some(mut model) = self.last_model.take() else {
+            // Vacuous completion can still construct a genuine new model.
+            return true;
+        };
+        let retained = super::construction_owner::reconstruct_scoped_optimization_model_owner(
+            self,
+            ScopedOptimizationModel {
+                model: &mut model,
+                roots,
+            },
+        )
+        .is_some();
+        self.last_model = Some(model);
+        retained
+    }
+
+    #[cfg(test)]
     pub(in crate::executor) fn plant_stale_sat_certificate_for_test(&mut self) {
         self.last_sat_certificate = Some(SatCertificate(SatCertificateKind::ValidatedModel));
     }
 }
+
+/// `model_check_gate.result` value written by the ordinary model-validation
+/// funnel's independent gate ([`Executor::apply_independent_model_gate`]).
+///
+/// Declared here because it is also the required prefix of every constructive
+/// lane's value below. The gate itself keeps writing this literal from its own
+/// module, so no run that already reported it changes value.
+const CONFIRMED_SAT_INDEPENDENT_GATE: &str = "confirmed-sat";
+
+/// `model_check_gate.result` value for the constructive quantified-projection
+/// lane ([`Executor::emit_checked_projection_sat`]).
+///
+/// The confirming authority is `ay_model_check::check_projection_implication`:
+/// a solver-independent proof kernel in the same crate that backs the ordinary
+/// gate (it depends only on `ay-core` and exact arithmetic, never on `ay-dpll`
+/// or any theory engine). It treats the candidate projections and the choice of
+/// conclusion as untrusted input, and accepts only when the sole authored
+/// `forall` body normalizes to `true` under them.
+const CONFIRMED_SAT_CHECKED_PROJECTION: &str = "confirmed-sat-checked-projection";
+
+/// `model_check_gate.result` value for the exact integer-existential theorem
+/// lane ([`Executor::emit_checked_exact_exists_sat`]).
+///
+/// The confirming authority is the sealed checker in
+/// [`exact_exists_bounds`](crate::executor::exact_exists_bounds), which reparses
+/// the authored root from scratch, trusts no Cooper/QE-light candidate or its
+/// sampled self-check, and proves the formula true for every valuation of its
+/// free integer constants — so the emitted canonical default model is a witness
+/// by that theorem.
+const CONFIRMED_SAT_CHECKED_EXACT_EXISTS: &str = "confirmed-sat-checked-exact-exists";
 
 impl Executor {
     /// Record one SAT-gate timing span in milliseconds (float stats print with
@@ -136,6 +204,40 @@ impl Executor {
     fn record_gate_span_ms(&mut self, stat_name: &str, started_at: Instant) {
         self.last_statistics
             .set_float(stat_name, started_at.elapsed().as_secs_f64() * 1e3);
+    }
+
+    /// Publish the SAT-evidence signal naming the authority that confirmed one
+    /// minted `Sat`.
+    ///
+    /// `model_check_gate.result` is the single key an operator or an evidence
+    /// census reads to learn WHETHER a published `sat` was independently
+    /// confirmed, and BY WHICH authority. The ordinary funnel writes the bare
+    /// [`CONFIRMED_SAT_INDEPENDENT_GATE`] value from inside
+    /// [`Executor::apply_independent_model_gate`].
+    ///
+    /// The two constructive lanes in this module never reach that gate: they
+    /// decide the authored query outright, before ordinary search runs, and
+    /// `ay_model_check`'s compositional evaluator reports `CannotConfirm` on any
+    /// quantifier, so it could not confirm their witnesses even if it did run.
+    /// Their confirmation is a different, independently checked proof — not the
+    /// absence of one — so each records its own value here rather than going
+    /// unsignalled. Leaving the key unset published a `sat` an evidence census
+    /// could not tell apart from an unconfirmed one.
+    ///
+    /// Every value shares the `confirmed-sat` prefix, so one census test counts
+    /// all confirmed SAT, while the suffix keeps the authorities distinct: no
+    /// lane is ever relabelled as the compositional gate's own verdict.
+    ///
+    /// Call only from a mint site, after every fail-closed check has passed and
+    /// immediately before the private certificate is constructed. A rejected or
+    /// externally stopped lane must never reach it.
+    fn record_confirmed_sat_authority(&mut self, authority: &str) {
+        debug_assert!(
+            authority.starts_with(CONFIRMED_SAT_INDEPENDENT_GATE),
+            "a SAT-evidence authority value must carry the confirmed-sat prefix",
+        );
+        self.last_statistics
+            .set_string("model_check_gate.result", authority);
     }
 
     /// Emit SAT from the exact unit-difference existential theorem.
@@ -169,7 +271,12 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
 
-        let model = self.completed_default_model();
+        let mut model = self.completed_default_model();
+        if !self.bind_model_construction_owner(&mut model) {
+            return Ok(self.reject_checked_exact_exists_sat(
+                "exact-exists model construction owner was unavailable",
+            ));
+        }
         if !evidence.is_current(self) {
             return Ok(self.reject_checked_exact_exists_sat(
                 "exact-exists SAT evidence became stale during model construction",
@@ -185,6 +292,7 @@ impl Executor {
         self.last_model_validated = true;
         self.last_statistics
             .set_int("model_validation.checked_exact_exists_certificate", 1);
+        self.record_confirmed_sat_authority(CONFIRMED_SAT_CHECKED_EXACT_EXISTS);
         self.last_result = Some(SolveResult::Sat);
         self.last_sat_certificate = Some(SatCertificate(SatCertificateKind::CheckedExactExists(
             Box::new(evidence),
@@ -195,7 +303,7 @@ impl Executor {
     fn reject_checked_exact_exists_sat(&mut self, detail: &str) -> SolveResult {
         self.last_sat_certificate = None;
         self.last_model_validated = false;
-        self.last_model = None;
+        self.withdraw_rejected_model();
         self.last_statistics
             .set_int("model_validation.checked_exact_exists_rejected", 1);
         self.downgrade_sat_after_gate(detail);
@@ -244,11 +352,18 @@ impl Executor {
         // after proof-quality stats were populated. Counting only.
         self.publish_strict_check_counters();
         self.last_command_unsat_admission = None;
+        self.last_command_unsat_evidence = None;
         if result.is_unsat() {
             self.last_sat_certificate = None;
             if let Some(certificate) = self.take_unsat_certificate() {
                 let admission = certificate.command_admission();
                 self.last_command_unsat_admission = Some(admission);
+                // P4 (2026-10-02): the label is read off the certificate that
+                // was consumed, so a nested probe's corroboration reaches the
+                // published `c ay.proof.corroboration` line too.
+                let evidence = certificate.evidence();
+                self.last_command_unsat_evidence = Some(evidence);
+                self.last_unsat_corroboration.set(evidence.corroboration());
                 // #proof-capability B3 — record the raw-admission class where
                 // operators will look for it. Emitted ONLY for the
                 // competition carve-out: certified-mode statistics stay
@@ -373,6 +488,12 @@ impl Executor {
             }
         }
 
+        if !self.bind_current_candidate_construction_owner() {
+            return Ok(self.reject_checked_projection_sat(
+                "projection model construction owner was unavailable",
+            ));
+        }
+
         let installed_matches = self
             .last_model
             .as_ref()
@@ -395,6 +516,7 @@ impl Executor {
         self.last_model_validated = true;
         self.last_statistics
             .set_int("model_validation.checked_projection_certificate", 1);
+        self.record_confirmed_sat_authority(CONFIRMED_SAT_CHECKED_PROJECTION);
         self.record_gate_span_ms("phase.sat_gate.checked_projection.ms", started_at);
         self.last_result = Some(SolveResult::Sat);
         self.last_sat_certificate = Some(SatCertificate(SatCertificateKind::CheckedProjection));
@@ -463,15 +585,38 @@ impl Executor {
     /// It mints a [`SatCertificate`] into `last_sat_certificate` iff the funnel
     /// emits `Sat`, and clears it otherwise. `roots` are the extra constraint
     /// roots for unconstrained-output completion: `&[]` for plain check-sat,
-    /// the assumptions for check-sat-assuming.
-    pub(in crate::executor) fn emit_sat_verdict(
+    /// the assumptions for check-sat-assuming. One candidate model per call;
+    /// [`Executor::emit_sat_verdict`] is the entry point (it may offer a
+    /// second array candidate, `store_chain_class_candidate.rs`).
+    fn emit_sat_verdict_once(
         &mut self,
         proposed: SolveResult,
         roots: &[TermId],
+        owner_transition: SatOwnerTransition,
     ) -> Result<SolveResult> {
+        self.trace_unknown_funnel("sat-emission-enter", None, Some(&proposed), false);
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         // Revoke first, mint last. In particular, a `?` error from any
         // validation gate must not leave the preceding solve's token live.
         self.last_sat_certificate = None;
+        // Optimization's value/soft partition pins are extra validation
+        // obligations. They must not become the public get-model query.
+        let restored_optimization = if owner_transition == SatOwnerTransition::RestoredOptimization
+        {
+            let Ok(public_roots) = self.independent_gate_query_roots() else {
+                self.publish_evaluation_stop();
+                return Ok(SolveResult::Unknown);
+            };
+            Some((
+                public_roots,
+                self.ctx.source_context_stamp(),
+                self.query_authority_epoch.clone(),
+            ))
+        } else {
+            None
+        };
         // Assumptions are first-class validation obligations, not merely model-
         // completion roots. Install one scoped combined assertion set so EVERY
         // completion pass and gate below checks the exact public formula
@@ -491,6 +636,7 @@ impl Executor {
             ))
         };
 
+        let proposed_sat = proposed == SolveResult::Sat;
         let emitted = (|| -> Result<SolveResult> {
             if proposed != SolveResult::Sat {
                 self.last_sat_certificate = None;
@@ -503,6 +649,21 @@ impl Executor {
             // SAT minting funnel as the final non-bypassable backstop.
             if self.revoke_provisional_sat_if_finite_array_incomplete(true) {
                 return Ok(SolveResult::Unknown);
+            }
+
+            if restored_optimization.is_some() {
+                let Ok(validation_roots) = self.independent_gate_query_roots() else {
+                    self.publish_evaluation_stop();
+                    return Ok(SolveResult::Unknown);
+                };
+                if !self.retain_scoped_optimization_owner(&validation_roots) {
+                    if !self.publish_evaluation_stop() {
+                        self.reject_unadmitted_sat_publication(
+                            "optimization witness lost its original construction owner",
+                        );
+                    }
+                    return Ok(SolveResult::Unknown);
+                }
             }
 
             // Stage finite-FP's checked witness before classification and
@@ -678,6 +839,13 @@ impl Executor {
                     self.last_result = Some(SolveResult::Unknown);
                     return Ok(SolveResult::Unknown);
                 }
+                if !self.bind_current_candidate_construction_owner() {
+                    self.downgrade_sat_after_gate(
+                        "vacuous candidate construction owner was unavailable",
+                    );
+                    self.last_result = Some(SolveResult::Unknown);
+                    return Ok(SolveResult::Unknown);
+                }
                 self.last_model_validated = true;
                 self.last_sat_certificate =
                     Some(SatCertificate(SatCertificateKind::ValidatedModel));
@@ -743,6 +911,20 @@ impl Executor {
                 self.refine_nra_algebraic_model_for_print();
             }
             self.record_gate_span_ms("phase.sat_gate.completion.ms", span);
+            self.trace_unknown_funnel("sat-completion-return", None, None, false);
+
+            // All semantic completion above remains unchanged. Bind accounting
+            // to the actual final candidate before read-only strict gates. This
+            // does not mutate checked semantic model epochs or mint authority.
+            if (certificate_model_lane || self.last_model_validated)
+                && !self.bind_current_candidate_construction_owner()
+            {
+                self.downgrade_sat_after_gate(
+                    "final candidate construction owner was unavailable or stale",
+                );
+                self.last_result = Some(SolveResult::Unknown);
+                return Ok(SolveResult::Unknown);
+            }
 
             // (1) STRICT gate. When the model was not already validated in-loop, run
             // the full validation pipeline; otherwise the global strict
@@ -768,6 +950,7 @@ impl Executor {
                 }
             };
             self.record_gate_span_ms("phase.sat_gate.strict.ms", span);
+            self.trace_unknown_funnel("sat-strict-return", None, Some(&gated), false);
 
             if certificate_model_lane && gated != SolveResult::Sat {
                 self.finite_table_cert_witness_state = None;
@@ -787,12 +970,19 @@ impl Executor {
             // sibling. Deferred or indeterminate checks fail closed here.
             let span = Instant::now();
             let gated = self.apply_quantified_model_failclosed_gate(gated);
+            // (2b) A confirmed quantified model is total over the constants
+            // the quantifier preprocessing removed (completion defaulted them
+            // before the gates); a constant the confirmed model still leaves
+            // open gets its default and the model is gated again.
+            let gated = self.complete_partial_quantified_model(gated)?;
+            let gated = self.refuse_partial_quantified_model(gated);
             self.record_gate_span_ms("phase.sat_gate.quantified.ms", span);
+            self.trace_unknown_funnel("sat-quantified-return", None, Some(&gated), false);
 
-            // The independent and authoritative passes are read-only over the
-            // now-final witness unless they reject it. Share only solver-side
-            // leaf-evaluation and view caches across those two passes; their
-            // independent compositional evaluator remains separate.
+            // Share solver-side leaf-evaluation and view caches across these
+            // passes. Installing a residual array completion invalidates both
+            // caches before full-root replay; independent compositional
+            // evaluators remain separate from the solver-side caches.
             let _gate_eval_memo = super::EvalMemoSession::new();
             let _gate_view_caches = super::independent_gate::GateViewCacheSession::new();
             // (3) INDEPENDENT, fail-closed model-check gate (soundness kernel):
@@ -801,12 +991,14 @@ impl Executor {
             let span = Instant::now();
             let gated = self.apply_independent_model_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.independent.ms", span);
+            self.trace_unknown_funnel("sat-independent-return", None, Some(&gated), false);
             // (4) AUTHORITATIVE-FAILCLOSED defense in depth. The universal gate
             // above already rejects CannotConfirm; this preserves the narrower
             // ground-theory classifier and its regression diagnostics.
             let span = Instant::now();
             let gated = self.apply_authoritative_failclosed_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.authoritative.ms", span);
+            self.trace_unknown_funnel("sat-authoritative-return", None, Some(&gated), false);
             // (4b) NON-STRING-SEQUENCE FAIL-CLOSED gate: AY's symbolic non-string
             // sequence theory ((Seq Int)/(Seq Bool)/(Seq (_ BitVec n))/(Seq Real))
             // is systemically unsound on the sat side — many `seq.*` ops return a
@@ -817,8 +1009,19 @@ impl Executor {
             // subterm, so this leaves them (and every non-sequence theory)
             // untouched. Runs while the gate caches are still live.
             let span = Instant::now();
-            let mut gated = self.apply_nonstring_seq_failclosed_gate(gated);
+            let gated = self.apply_nonstring_seq_failclosed_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.nonstring_seq.ms", span);
+            // (4c) NATIVE-MAP FAIL-CLOSED gate: a native-map problem outside the
+            // faithfully encoded fragment (an empty map or constructor used as a
+            // value, `map.subset` beyond reflexivity, a domain carried for a map
+            // term that is not a declared constant, a constant array at a map
+            // sort) has an elaborated formula
+            // weaker than its source, which no model check can see through, so
+            // its `sat` fails CLOSED to Unknown. See `native_map_gate.rs`.
+            let span = Instant::now();
+            let mut gated = self.apply_native_map_failclosed_gate(gated);
+            self.record_gate_span_ms("phase.sat_gate.native_map.ms", span);
+            self.trace_unknown_funnel("sat-native-map-return", None, Some(&gated), false);
             drop(_gate_view_caches);
             drop(_gate_eval_memo);
             self.record_gate_span_ms("phase.sat_gate.total.ms", funnel_started_at);
@@ -844,6 +1047,7 @@ impl Executor {
                 gated = SolveResult::Unknown;
             }
 
+            self.trace_unknown_funnel("sat-output-functions-return", None, Some(&gated), false);
             // The model-free theorem is what justified replacing an arbitrary
             // predecessor candidate with the canonical witness. Recheck its
             // immutable query/source/root identity after output completion and
@@ -868,6 +1072,7 @@ impl Executor {
             // failed. Treating the flag as evidence would certify exactly those
             // known-unvalidated public results.
             let mut gated = self.apply_sat_validation_postcondition(gated, roots);
+            self.trace_unknown_funnel("sat-postcondition-return", None, Some(&gated), false);
 
             // Recheck the original immutable authority immediately before
             // minting. Any model replacement/mutation, root slot reuse,
@@ -913,6 +1118,21 @@ impl Executor {
                 }
             }
 
+            if self.publish_evaluation_stop() {
+                return Ok(SolveResult::Unknown);
+            }
+            if gated == SolveResult::Sat
+                && !self
+                    .last_model
+                    .as_ref()
+                    .is_some_and(|model| model.validate_construction_owner(self))
+            {
+                self.downgrade_sat_after_gate(
+                    "validated candidate lacked a current original construction owner",
+                );
+                self.last_result = Some(SolveResult::Unknown);
+                return Ok(SolveResult::Unknown);
+            }
             if gated == SolveResult::Sat {
                 self.last_sat_certificate =
                     Some(SatCertificate(SatCertificateKind::ValidatedModel));
@@ -923,6 +1143,12 @@ impl Executor {
             Ok(gated)
         })();
 
+        self.trace_unknown_funnel(
+            "sat-emission-closure-return",
+            None,
+            emitted.as_ref().ok(),
+            emitted.is_err(),
+        );
         // One cleanup boundary for every fail-closed exit, including errors and
         // early affine-model failures. No routing bit or typed query grant from
         // a rejected candidate may survive to a later publication attempt.
@@ -931,6 +1157,9 @@ impl Executor {
             self.last_model_validated = false;
             if emitted.is_err() {
                 self.last_model = None;
+            } else if proposed_sat {
+                // A gate refused the proposed model but left it in place.
+                self.record_rejected_model();
             }
             self.clear_quantified_sat_authority();
         }
@@ -946,7 +1175,39 @@ impl Executor {
             self.qfax_refinement_clause = qfax_refinement;
             self.last_rejected_array_assertion = rejected_array_assertion;
         }
-        emitted
+        // Restore the borrowed assertion/retry scope before canonical refusal;
+        // no restored scope can turn a retained stop into a SAT capability.
+        let finished = if self.publish_evaluation_stop() {
+            Ok(SolveResult::Unknown)
+        } else if matches!(emitted, Ok(SolveResult::Sat))
+            && restored_optimization
+                .as_ref()
+                .is_some_and(|(roots, source, epoch)| {
+                    *source != self.ctx.source_context_stamp()
+                        || !epoch.is_same_epoch(&self.query_authority_epoch)
+                        || !self.retain_scoped_optimization_owner(roots)
+                        || !self
+                            .last_model
+                            .as_ref()
+                            .is_some_and(|model| model.validate_construction_owner(self))
+                })
+        {
+            if !self.publish_evaluation_stop() {
+                self.reject_unadmitted_sat_publication(
+                    "validated optimum lost its restored public model scope",
+                );
+            }
+            Ok(SolveResult::Unknown)
+        } else {
+            emitted
+        };
+        self.trace_unknown_funnel(
+            "sat-emission-finish",
+            None,
+            finished.as_ref().ok(),
+            finished.is_err(),
+        );
+        finished
     }
 
     /// Apply the strict oracle without exposing an affine theorem model to any
@@ -956,6 +1217,9 @@ impl Executor {
     /// validation bit is revoked here and is restored only after the untouched
     /// model passes the complete public gate stack.
     fn apply_strict_gate_to_affine_certificate_model(&mut self) -> SolveResult {
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         if !matches!(self.last_result, Some(SolveResult::Sat))
             || !self.last_model_validated
             || self.last_model.is_none()
@@ -983,6 +1247,9 @@ impl Executor {
         result: SolveResult,
         roots: &[TermId],
     ) -> SolveResult {
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         let has_obligations = !self.ctx.assertions.is_empty() || !roots.is_empty();
         let has_validated_model = self.last_model_validated && self.last_model.is_some();
         if result != SolveResult::Sat || !has_obligations || has_validated_model {
@@ -992,7 +1259,7 @@ impl Executor {
         self.last_statistics.model_validation_failures += 1;
         self.last_statistics
             .set_int("model_validation.sat_emission_postcondition", 1);
-        self.last_model = None;
+        self.withdraw_rejected_model();
         self.last_model_validated = false;
         self.last_unknown_reason = Some(UnknownReason::Incomplete);
         self.last_result = Some(SolveResult::Unknown);

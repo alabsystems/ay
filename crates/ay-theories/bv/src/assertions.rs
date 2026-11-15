@@ -15,6 +15,10 @@ impl BvSolver<'_> {
     /// This processes a single assertion term and generates CNF clauses
     /// for all BV constraints it contains. The assertion is assumed to be true.
     pub fn bitblast_assertion(&mut self, term: TermId) {
+        if !self.encoding_complete() {
+            return ();
+        }
+
         self.process_assertion(term, true);
     }
 
@@ -23,36 +27,36 @@ impl BvSolver<'_> {
     /// This is the main entry point for eager bit-blasting. It processes
     /// all assertions and returns the resulting CNF clauses.
     ///
-    /// When an interrupt flag is set via [`BvSolver::set_interrupt`], the loop
-    /// checks for interruption every 64 assertions (#8609). If interrupted,
-    /// returns the clauses generated so far (partial result). The caller
-    /// should check [`BvSolver::is_interrupted`] after this returns to detect
-    /// early termination and return `Unknown`.
-    ///
-    /// The same 64-assertion cadence also polls the process memory ceiling via
-    /// [`ay_sys::process_memory_exceeded`]. Eager bit-blasting of a formula over
-    /// a byte-addressed `(Array BV64 BV8)` heap can balloon to hundreds of
-    /// thousands of CNF variables — enough to blow the `-memory` budget and get
-    /// the process OOM-killed mid-blast (a documented worse-than-hang failure).
-    /// Breaking out here lets the caller surface a graceful `Unknown` instead.
-    /// Like the interrupt path this only ever yields `Unknown` (a partial CNF
-    /// is never reported as SAT/UNSAT), so it is sound by the same argument the
-    /// codebase already makes for the process-memory ceiling.
+    /// Entry, word/row and bounded gate polls observe the original check.
+    /// Any observed refusal is sticky and returns NO clauses. Callers must
+    /// also require [`BvSolver::encoding_complete`] before result publication.
     pub fn bitblast_all(&mut self, assertions: &[TermId]) -> Vec<CnfClause> {
-        for (i, &term) in assertions.iter().enumerate() {
-            // Cooperative interrupt / memory check every 64 assertions (#8609).
-            // BV bitblasting can process thousands of assertions for complex
-            // formulas. Without this check, set_timeout() and interrupt() are
-            // not respected until the entire bitblasting phase completes, and a
-            // memory-exploding eager blast OOM-kills the process before any
-            // ceiling is observed.
-            if i & 63 == 63 && (self.is_interrupted() || ay_sys::process_memory_exceeded()) {
-                break;
+        if !self.encoding_complete() {
+            self.clauses.clear();
+            return Vec::new();
+        }
+        self.count_offset_equalities(assertions);
+        for &term in assertions {
+            if !self.encoding_complete() {
+                self.clauses.clear();
+                return Vec::new();
             }
             self.bitblast_assertion(term);
         }
-
+        if !self.encoding_complete() {
+            self.clauses.clear();
+            return Vec::new();
+        }
         self.take_clauses()
+    }
+
+    /// The first known raw-interrupt/process-memory cause observed by this
+    /// encoding owner, including before or inside [`Self::bitblast_all`].
+    /// Readings may since have cleared; the cause and refusal stay recorded.
+    /// Opaque callbacks and other owner refusals have no `BlastCut` variant:
+    /// `None` is NOT evidence of completion; check [`Self::encoding_complete`].
+    pub fn blast_cut(&self) -> Option<BlastCut> {
+        self.encoding.blast_cut()
     }
 
     /// Bit-blast a BV predicate term and return its CNF variable
@@ -63,12 +67,16 @@ impl BvSolver<'_> {
     ///
     /// Returns `Some(lit)` for BV predicates (equality, comparisons), `None` otherwise.
     pub fn bitblast_predicate(&mut self, term: TermId) -> Option<CnfLit> {
+        if !self.encoding_complete() {
+            return None;
+        }
+
         // Check cache first
         if let Some(&lit) = self.predicate_to_var.get(&term) {
             return Some(lit);
         }
 
-        let data = self.terms.get(term).clone();
+        let data = self.counted_term_data(term)?;
 
         let result = match data {
             TermData::App(ref sym, ref args) if args.len() == 2 => {
@@ -81,9 +89,7 @@ impl BvSolver<'_> {
                         let a_sort = self.terms.sort(args[0]);
                         let b_sort = self.terms.sort(args[1]);
                         if matches!(a_sort, Sort::BitVec(_)) && a_sort == b_sort {
-                            let a = self.get_bits(args[0]);
-                            let b = self.get_bits(args[1]);
-                            Some(self.bitblast_eq(&a, &b))
+                            Some(self.bitblast_term_eq(args[0], args[1]))
                         } else {
                             None
                         }
@@ -119,8 +125,14 @@ impl BvSolver<'_> {
             _ => None,
         };
 
+        if !self.encoding_complete() {
+            return None;
+        }
         // Cache the result
         if let Some(lit) = result {
+            if !counted::memory::map(&mut self.predicate_to_var, &self.encoding) {
+                return None;
+            }
             self.predicate_to_var.insert(term, lit);
         }
 
@@ -131,6 +143,9 @@ impl BvSolver<'_> {
     /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#4602).
     pub(crate) fn process_assertion(&mut self, term: TermId, value: bool) {
         stacker::maybe_grow(BV_STACK_RED_ZONE, BV_STACK_SIZE, || {
+            if !self.encoding_complete() {
+                return;
+            }
             let data = self.terms.get(term).clone();
 
             match data {
@@ -146,7 +161,11 @@ impl BvSolver<'_> {
                     // Use bitblast_bool on the term itself so the ITE is inserted into
                     // bool_to_var for potential Tseitin-BV connection.
                     let ite_lit = self.bitblast_bool(term);
-                    self.add_clause(CnfClause::unit(if value { ite_lit } else { -ite_lit }));
+                    self.add_clause(CnfClause::unit(if value {
+                        ite_lit
+                    } else {
+                        neg_lit(ite_lit)
+                    }));
                 }
                 TermData::App(ref sym, ref args) if sym.name() == "and" && value => {
                     // (and P1 P2 ... Pn) = true: recursively assert all Pi = true (#1536)
@@ -157,7 +176,7 @@ impl BvSolver<'_> {
                 TermData::App(ref sym, _) if sym.name() == "and" && !value => {
                     // (and P1 P2 ... Pn) = false: convert to CNF via bitblast_bool (#1536)
                     let lit = self.bitblast_bool(term);
-                    self.add_clause(CnfClause::unit(-lit));
+                    self.add_clause(CnfClause::unit(neg_lit(lit)));
                 }
                 TermData::App(ref sym, ref args) if sym.name() == "or" && !value => {
                     // (or P1 P2 ... Pn) = false: recursively assert all Pi = false (#1536)
@@ -175,7 +194,7 @@ impl BvSolver<'_> {
                     // bvule, bvugt, bvuge, bvslt, bvsle, bvsgt, bvsge). It handles
                     // cache lookup/insertion and returns None for non-BV operations.
                     if let Some(lit) = self.bitblast_predicate(term) {
-                        self.add_clause(CnfClause::unit(if value { lit } else { -lit }));
+                        self.add_clause(CnfClause::unit(if value { lit } else { neg_lit(lit) }));
                     }
                 }
                 _ => {}

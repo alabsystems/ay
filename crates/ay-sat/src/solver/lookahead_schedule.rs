@@ -29,6 +29,9 @@ impl Solver {
     ///    slow EMA, indicating the solver is "stuck" learning poor clauses
     #[inline]
     pub(in crate::solver) fn should_run_lookahead(&self) -> bool {
+        if ay_core::sat_ab_switches().inproc_passes_kissat == Some(true) {
+            return false;
+        }
         if self.decision_level != 0 {
             return false;
         }

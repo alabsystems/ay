@@ -84,6 +84,9 @@ fn require_carcara_or_skip() -> Option<PathBuf> {
 }
 
 fn assert_carcara_valid(carcara: &Path, proof: &str) {
+    if let Err(misjudged) = ay_core::pinned_carcara::pinned_carcara_can_judge(PROBLEM, proof) {
+        panic!("conjunctive transfer: {misjudged}\n{proof}");
+    }
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stem = format!(
         "ay_conjunctive_transfer_{}_{}",
@@ -121,6 +124,22 @@ fn assert_carcara_valid(carcara: &Path, proof: &str) {
         output.status.code(),
         stdout.trim(),
         stderr.trim(),
+    );
+}
+
+/// NEGATIVE CONTROL: the runner refuses, before the checker runs (so with or
+/// without carcara installed), a proof resting on an `evaluate` step pinned
+/// carcara misjudges (`ay_core::pinned_carcara::FALSE_VALID_CONTROL_PROOF`).
+/// Carcara prints `valid` for that proof against its own problem, not against
+/// this runner's fixed `PROBLEM`, so this shows only that the refusal comes
+/// first; the plan test below refuses a twin of its real document that
+/// carcara does accept.
+#[test]
+#[should_panic(expected = "is not evidence")]
+fn the_conjunctive_transfer_runner_refuses_a_document_pinned_carcara_misjudges() {
+    assert_carcara_valid(
+        Path::new("carcara"),
+        ay_core::pinned_carcara::FALSE_VALID_CONTROL_PROOF,
     );
 }
 
@@ -209,4 +228,19 @@ fn conjunctive_transfer_plan_emits_trust_free_carcara_proof() {
         return;
     };
     assert_carcara_valid(&carcara, &rendered);
+    // NEGATIVE CONTROL on this real document: the same refutation carrying
+    // one false `evaluate` step (`FALSE_VALID_CONTROL_STEP`), which pinned
+    // carcara still answers `valid` for, is refused before the checker runs.
+    let twin = format!(
+        "{}\n{}",
+        rendered.trim_end(),
+        ay_core::pinned_carcara::FALSE_VALID_CONTROL_STEP
+    );
+    let refusal = std::panic::catch_unwind(|| assert_carcara_valid(&carcara, &twin))
+        .expect_err("a document carrying a false `evaluate` step counted as valid");
+    let message = refusal
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(message.contains("is not evidence"), "{message}");
 }

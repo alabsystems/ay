@@ -1,0 +1,3 @@
+* #variable= 2 #constraint= 2
+* A reified equality is split into two constraints and hence can not be labelled.
+@lab z1 ==> 1 x1 = 1 ;

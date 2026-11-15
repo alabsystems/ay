@@ -62,6 +62,17 @@ fn extract_bitvec_from_sat_model(
     Some(SmtValue::bitvec_from_biguint(value, width))
 }
 
+/// The `ChcSort` of a scalar term sort (`None` for arrays / datatypes / other).
+fn chc_scalar_sort(sort: &Sort) -> Option<crate::ChcSort> {
+    Some(match sort {
+        Sort::Bool => crate::ChcSort::Bool,
+        Sort::Int => crate::ChcSort::Int,
+        Sort::Real => crate::ChcSort::Real,
+        Sort::BitVec(bv) => crate::ChcSort::BitVec(bv.width),
+        _ => return None,
+    })
+}
+
 /// Result of value extraction from a theory-SAT assignment.
 pub(super) enum ExtractResult {
     /// Values were extracted successfully.
@@ -123,6 +134,33 @@ pub(super) fn extract_theory_sat_values(
         None
     };
 
+    // Sort-unique model keys (Rung 0, see `crate::smt::sort_unique`): var_map
+    // keys are `name_sort`, so two entries can share one ORIGINAL name
+    // (`J:Int` and `J:Bool` in one query) while the model is keyed by name.
+    // The plain name goes to the smallest-ranked sort and `name!<tag>` to the
+    // others; `lookup_model_value` (the strict evaluator) reads the qualified
+    // entry whenever the plain one has the wrong sort, so validation is exact.
+    let mut scalar_sorts_by_name: FxHashMap<&str, Vec<crate::ChcSort>> = FxHashMap::default();
+    for (qualified_name, &term_id) in var_map {
+        let name = var_original_names
+            .get(qualified_name)
+            .map(String::as_str)
+            .unwrap_or(qualified_name);
+        if let Some(sort) = chc_scalar_sort(&terms.sort(term_id)) {
+            scalar_sorts_by_name.entry(name).or_default().push(sort);
+        }
+    }
+    let plain_name_winner = |name: &str| -> Option<crate::ChcSort> {
+        let sorts = scalar_sorts_by_name.get(name)?;
+        if sorts.len() < 2 {
+            return None;
+        }
+        sorts
+            .iter()
+            .min_by_key(|s| (crate::smt::sort_unique::sort_rank(s), (*s).clone()))
+            .cloned()
+    };
+
     for (qualified_name, &term_id) in var_map {
         // #6100: var_map keys are sort-qualified; emit
         // original CHC names in the model for downstream
@@ -131,12 +169,21 @@ pub(super) fn extract_theory_sat_values(
             .get(qualified_name)
             .map(String::as_str)
             .unwrap_or(qualified_name);
+        let key: String = match (
+            plain_name_winner(name),
+            chc_scalar_sort(&terms.sort(term_id)),
+        ) {
+            (Some(winner), Some(sort)) if winner != sort => {
+                crate::ChcVar::new(name, sort).sort_qualified_name()
+            }
+            _ => name.to_owned(),
+        };
         match terms.sort(term_id) {
             Sort::Bool => {
                 if let Some(&cnf_var) = term_to_var.get(&term_id) {
                     let sat_var = ay_sat::Variable::new(cnf_var - 1);
                     if let Some(value) = sat_model.get(sat_var.index()) {
-                        values.insert(name.to_owned(), SmtValue::Bool(*value));
+                        values.insert(key.clone(), SmtValue::Bool(*value));
                     }
                 }
             }
@@ -148,7 +195,7 @@ pub(super) fn extract_theory_sat_values(
                         // canonical SmtValue::BigInt instead of skipping them
                         // (#3827 used to skip, which demoted verified Sat
                         // verdicts to Unknown via the missing-var gate).
-                        values.insert(name.to_owned(), SmtValue::int_from_bigint(v.clone()));
+                        values.insert(key.clone(), SmtValue::int_from_bigint(v.clone()));
                         continue;
                     }
                 }
@@ -158,10 +205,7 @@ pub(super) fn extract_theory_sat_values(
                 if let Some(v) = lia.lra_solver().get_value(term_id) {
                     if v.denom().is_one() {
                         // Phase-2 BigInt escape (see LIA lane above).
-                        values.insert(
-                            name.to_owned(),
-                            SmtValue::int_from_bigint(v.numer().clone()),
-                        );
+                        values.insert(key.clone(), SmtValue::int_from_bigint(v.numer().clone()));
                     } else {
                         return ExtractResult::Overflow;
                     }
@@ -178,13 +222,13 @@ pub(super) fn extract_theory_sat_values(
                     ) else {
                         return ExtractResult::Overflow;
                     };
-                    values.insert(name.to_owned(), value);
+                    values.insert(key.clone(), value);
                 }
             }
             Sort::Real => {
                 // Extract rational value from the LRA solver.
                 if let Some(v) = lia.lra_solver().get_value(term_id) {
-                    values.insert(name.to_owned(), SmtValue::Real(v.clone()));
+                    values.insert(key.clone(), SmtValue::Real(v.clone()));
                 }
             }
             Sort::Array(arr_sort) if has_array_ops => {
@@ -201,7 +245,7 @@ pub(super) fn extract_theory_sat_values(
                 ) else {
                     return ExtractResult::Overflow;
                 };
-                values.insert(name.to_owned(), smt_val);
+                values.insert(key.clone(), smt_val);
             }
             _ => {}
         }

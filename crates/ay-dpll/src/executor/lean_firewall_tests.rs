@@ -3413,6 +3413,47 @@ fn emits_lia_linear_conflict_from_parsed() {
     assert!(emit_lia_firewall_lean_from_parsed(&prop, &[], &context).is_none());
 }
 
+/// Lean's `Int.ediv a 0 = 0` and `Int.emod a 0 = a` are not SMT-LIB facts, so
+/// a literal-zero divisor declines; the twin with divisor 2 still emits.
+#[test]
+fn lia_firewall_declines_zero_divisor_div_and_mod() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let context = cbr_typed_context(Sort::Int);
+    for op in ["div", "mod"] {
+        // SMT-LIB: satisfiable with the zero-divisor application chosen freely.
+        let zero_divisor = vec![
+            app("=", vec![app(op, vec![sym("x"), num("0")]), num("5")]),
+            app("<", vec![sym("x"), num("0")]),
+        ];
+        assert!(
+            emit_lia_firewall_lean_from_parsed(&zero_divisor, &[], &context).is_none(),
+            "({op} x 0) has no value in SMT-LIB and must not be rendered"
+        );
+        let negated_zero = vec![
+            app(
+                "=",
+                vec![app(op, vec![sym("x"), app("-", vec![num("0")])]), num("5")],
+            ),
+            app("<", vec![sym("x"), num("0")]),
+        ];
+        assert!(
+            emit_lia_firewall_lean_from_parsed(&negated_zero, &[], &context).is_none(),
+            "({op} x (- 0)) has a zero divisor too"
+        );
+        // Divisor 2: `x < 0` forces `(div x 2) < 0` and `(mod x 2) <= 1`.
+        let nonzero_divisor = vec![
+            app("=", vec![app(op, vec![sym("x"), num("2")]), num("5")]),
+            app("<", vec![sym("x"), num("0")]),
+        ];
+        let lean = emit_lia_firewall_lean_from_parsed(&nonzero_divisor, &[], &context)
+            .unwrap_or_else(|| panic!("({op} x 2) is in the LIA fragment"));
+        assert!(lean.contains(if op == "div" { "Int.ediv" } else { "Int.emod" }));
+    }
+}
+
 #[test]
 fn lia_firewall_requires_unique_int_constants_but_keeps_signed_literals() {
     use ay_frontend::command::{Constant as PConst, Term as PTerm};
@@ -3448,16 +3489,25 @@ fn lia_firewall_requires_unique_int_constants_but_keeps_signed_literals() {
         "surface overloads have no identity in ParsedTerm and must be declined"
     );
 
-    // ay's parsed AST can preserve a signed literal as numeric symbol text.
-    // It remains an Int literal and needs no declaration in Context.
+    // The parser reads an unquoted `-1` as the signed numeral `-1`. It is an
+    // Int literal and needs no declaration in Context.
     let int_context = cbr_typed_context(Sort::Int);
     let signed_literal_conflict = vec![
+        app(">=", vec![sym("x"), num("0")]),
+        app(">", vec![app("*", vec![num("-1"), sym("x")]), num("0")]),
+    ];
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&signed_literal_conflict, &[], &int_context).is_some(),
+        "signed numerals must remain supported"
+    );
+    // A SYMBOL spelled `-1` is the quoted `|-1|`, never the number, as in z3.
+    let quoted_symbol = vec![
         app(">=", vec![sym("x"), num("0")]),
         app(">", vec![app("*", vec![sym("-1"), sym("x")]), num("0")]),
     ];
     assert!(
-        emit_lia_firewall_lean_from_parsed(&signed_literal_conflict, &[], &int_context).is_some(),
-        "numeric-text signed literals must remain supported"
+        emit_lia_firewall_lean_from_parsed(&quoted_symbol, &[], &int_context).is_none(),
+        "a symbol named -1 is not the number -1"
     );
 }
 
@@ -3547,6 +3597,27 @@ fn lia_firewall_declines_nonconstant_or_ambiguous_numeric_symbol_declaration() {
 }
 
 // ==== APPENDED TESTS: euf_uflia ====
+/// A SYMBOL spelled `-1` is the quoted `|-1|`, never the number: the parser
+/// reads only the unquoted `-1` as the signed numeral (z3 5.1.0 agrees).
+#[test]
+fn euf_lia_congruence_never_reads_a_symbol_named_like_a_number() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let int_context = cbr_typed_context(Sort::Int);
+    let quoted_symbol = vec![
+        app("=", vec![app("*", vec![sym("-1"), sym("a")]), num("0")]),
+        app("=", vec![sym("b"), num("0")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&quoted_symbol, &int_context).is_none(),
+        "a symbol named -1 is not the number -1"
+    );
+}
+
 #[test]
 fn emits_euf_lia_congruence_from_parsed_assertions() {
     use ay_frontend::command::{Constant as PConst, Term as PTerm};
@@ -3597,17 +3668,17 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
     ];
     assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed3, &int_context).is_some());
 
-    // Numeric-text signed literals are emitted by ay's lenient parsed surface
-    // for some inputs. Preserve them as literals in both LIA terms and UF values.
+    // The parser reads an unquoted `-1` as the signed numeral `-1`: a literal
+    // in both LIA terms and UF values.
     let signed_literals = vec![
-        app("=", vec![app("*", vec![sym("-1"), sym("a")]), num("0")]),
+        app("=", vec![app("*", vec![num("-1"), sym("a")]), num("0")]),
         app("=", vec![sym("b"), num("0")]),
-        app("=", vec![app("f", vec![sym("a")]), sym("-1")]),
+        app("=", vec![app("f", vec![sym("a")]), num("-1")]),
         app("=", vec![app("f", vec![sym("b")]), num("0")]),
     ];
     assert!(
         emit_euf_lia_congruence_firewall_lean_from_parsed(&signed_literals, &int_context).is_some(),
-        "numeric-text signed literals must remain supported"
+        "signed numerals must remain supported"
     );
 
     // NEGATIVE (no implied equality): a and b unconstrained, f(a)=10, f(b)=20 --
@@ -3825,7 +3896,7 @@ fn euf_lia_firewall_checks_i64_normalization_bounds_and_pins() {
     // The normal form fits, but bound extraction must decline exactly.
     let mut bound_overflow = vec![app(
         ">",
-        vec![app("+", vec![sym("a"), sym(&min)]), num("0")],
+        vec![app("+", vec![sym("a"), num(&min)]), num("0")],
     )];
     bound_overflow.extend(uf_values());
     assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&bound_overflow, &context).is_none());
@@ -3833,7 +3904,7 @@ fn euf_lia_firewall_checks_i64_normalization_bounds_and_pins() {
     // `a + MIN = 0` would pin a to 2^63, outside the analysis domain.
     let mut pin_out_of_range = vec![app(
         "=",
-        vec![app("+", vec![sym("a"), sym(&min)]), num("0")],
+        vec![app("+", vec![sym("a"), num(&min)]), num("0")],
     )];
     pin_out_of_range.extend(uf_values());
     assert!(
@@ -3847,7 +3918,7 @@ fn euf_lia_firewall_checks_i64_normalization_bounds_and_pins() {
         app(
             "=",
             vec![
-                app("+", vec![app("*", vec![sym("-1"), sym(name)]), sym(&min)]),
+                app("+", vec![app("*", vec![num("-1"), sym(name)]), num(&min)]),
                 num("0"),
             ],
         )
@@ -5161,7 +5232,7 @@ fn emits_seq_at_pinned_from_parsed_assertions() {
                 sym("s1"),
                 app(
                     "seq.++",
-                    vec![unit(num("3")), unit(sym("-2")), unit(num("3"))],
+                    vec![unit(num("3")), unit(num("-2")), unit(num("3"))],
                 ),
             ],
         ),
@@ -5208,10 +5279,16 @@ fn emits_seq_at_pinned_from_parsed_assertions() {
 fn emits_seq_suffixof_from_parsed_assertions() {
     // seq_falsesat_suffixof_elem_mismatch.smt2: v1=[1], v2=[-1,-1],
     // (seq.suffixof v2 (seq.++ v3 v1)) — [-1,-1] ends in -1, v3++[1] ends in 1.
-    use ay_frontend::command::Term as PTerm;
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
     let sym = |s: &str| PTerm::Symbol(s.to_string());
     let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
-    let unit = |v: &str| app("seq.unit", vec![sym(v)]);
+    // The parser reads `1` and the unquoted `-1` as numerals.
+    let unit = |v: &str| {
+        app(
+            "seq.unit",
+            vec![PTerm::Const(PConst::Numeral(v.to_string()))],
+        )
+    };
 
     let parsed = vec![
         app("=", vec![sym("v1"), unit("1")]),
@@ -5339,7 +5416,7 @@ fn emits_seq_nth_ground_lia_from_parsed_assertions() {
                 app(
                     ">=",
                     vec![
-                        app("-", vec![sym("-3"), num("4")]),
+                        app("-", vec![num("-3"), num("4")]),
                         app("seq.nth", vec![sym("v2"), sym("v10")]),
                     ],
                 ),
@@ -5368,7 +5445,7 @@ fn emits_seq_nth_ground_lia_from_parsed_assertions() {
             ">=",
             vec![
                 app("seq.nth", vec![sym("v2"), sym("v10")]),
-                app("-", vec![sym("-3"), num("4")]),
+                app("-", vec![num("-3"), num("4")]),
             ],
         ),
     ];
@@ -5398,7 +5475,7 @@ fn emits_seq_at_ite_from_parsed_assertions() {
     };
 
     // Abstract OOB condition (never evaluated).
-    let cond = app("seq.nth", vec![unit(sym("v5")), sym("-3")]);
+    let cond = app("seq.nth", vec![unit(sym("v5")), num("-3")]);
     let parsed = vec![
         app(
             "=",

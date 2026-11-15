@@ -18,6 +18,7 @@ impl Model {
             term_to_var: HashMap::default(),
             bool_overrides: HashMap::default(),
             euf_model: None,
+            materialized_scalar_functions: HashMap::default(),
             array_model: None,
             lra_model: None,
             lia_model: None,
@@ -30,10 +31,65 @@ impl Model {
             certified_const_interps: CertifiedConstInterpModel::default(),
             formula_neutral_function_defaults: FormulaNeutralFunctionDefaults::default(),
             completed_values: HashMap::default(),
+            field_assignments: Default::default(),
             dt_ground: HashMap::default(),
             dt_pins: HashMap::default(),
             dt_array_field_classes: Vec::new(),
+            residual_arrays: None,
+            functional_arrays: None,
+            _scalar_candidate_memory: None,
+            construction_owner: None,
         }
+    }
+
+    /// This model cut down to the terms of a store it shares a prefix with.
+    ///
+    /// A disposable probe solves in a CLONE of the caller's term store: ids
+    /// below `shared_len` name the same terms in both stores, while an id at
+    /// or beyond it is one of the probe's own terms and would name an
+    /// unrelated term once the caller's store grows. The result keeps the SAT
+    /// assignment and the entries of shared terms only, and no certified or
+    /// seal state. `None` when the model holds a theory sub-model this cannot
+    /// cut entry by entry; the caller then declines rather than publish a
+    /// probe-local id.
+    pub(in crate::executor) fn restricted_to_shared_terms(
+        mut self,
+        shared_len: usize,
+    ) -> Option<Self> {
+        if self.euf_model.is_some()
+            || self.has_field_assignments()
+            || !self.materialized_scalar_functions.is_empty()
+            || self.array_model.is_some()
+            || self.lra_model.is_some()
+            || self.lia_model.is_some()
+            || self.fp_model.is_some()
+            || self.string_model.is_some()
+            || self.seq_model.is_some()
+            || self.residual_arrays.is_some()
+            || self.functional_arrays.is_some()
+            || !self.dt_ground.is_empty()
+            || !self.dt_pins.is_empty()
+            || !self.dt_array_field_classes.is_empty()
+        {
+            return None;
+        }
+        let shared = |term: &TermId| (term.0 as usize) < shared_len;
+        let mut restricted = Model::empty();
+        restricted.sat_model = std::mem::take(&mut self.sat_model);
+        restricted.term_to_var = std::mem::take(&mut self.term_to_var);
+        restricted.term_to_var.retain(|term, _| shared(term));
+        restricted.bool_overrides = std::mem::take(&mut self.bool_overrides);
+        restricted.bool_overrides.retain(|term, _| shared(term));
+        restricted.completed_values = std::mem::take(&mut self.completed_values);
+        restricted.completed_values.retain(|term, _| shared(term));
+        restricted._scalar_candidate_memory = self._scalar_candidate_memory.take();
+        restricted.bv_model = self.bv_model.take().map(|mut bv| {
+            bv.values.retain(|term, _| shared(term));
+            bv.term_to_bits.retain(|term, _| shared(term));
+            bv.bool_overrides.retain(|term, _| shared(term));
+            bv
+        });
+        Some(restricted)
     }
 
     /// Atomically install the exact constant-function interpretation proved by
@@ -49,7 +105,10 @@ impl Model {
     pub(in crate::executor) fn install_certified_const_interps(
         &mut self,
         ctx: &ay_frontend::Context,
-        entries: Vec<(ay_frontend::CheckedProjectionBinding, TermId)>,
+        entries: Vec<(
+            ay_frontend::CheckedProjectionBinding,
+            CertifiedConstInterpWitness,
+        )>,
     ) -> Option<()> {
         if entries.is_empty() {
             return None;
@@ -57,12 +116,34 @@ impl Model {
 
         let mut seen = HashSet::default();
         let mut checked = Vec::with_capacity(entries.len());
-        for (binding, value) in entries {
+        for (binding, witness) in entries {
             let Symbol::Named(name) = binding.symbol() else {
                 return None;
             };
-            let value_graph =
-                StampedClosedValueGraph::capture(&ctx.terms, value, binding.result_sort())?;
+            let body = match witness {
+                CertifiedConstInterpWitness::Constant(value) => {
+                    let value_graph =
+                        StampedClosedValueGraph::capture(&ctx.terms, value, binding.result_sort())?;
+                    CertifiedConstInterpBody::Constant { value, value_graph }
+                }
+                // SYMBOLIC DEFAULT. Admitted only at the exact shape the
+                // certificate can publish AND both readers can evaluate: an
+                // `Int` result over `Int` parameters, with one coefficient per
+                // declared parameter and at least one parameter. Everything
+                // else fails closed here rather than at a reader.
+                CertifiedConstInterpWitness::LinearInt(linear) => {
+                    if linear.arity() != binding.parameter_sorts().len()
+                        || binding.result_sort() != &Sort::Int
+                        || !binding
+                            .parameter_sorts()
+                            .iter()
+                            .all(|sort| sort == &Sort::Int)
+                    {
+                        return None;
+                    }
+                    CertifiedConstInterpBody::LinearInt(linear)
+                }
+            };
             let declaration_term = if binding.parameter_sorts().is_empty() {
                 let mut matching = ctx.symbol_iter().filter_map(|(surface_name, info)| {
                     (ctx.symbol_identity_name(surface_name, info) == name.as_str()
@@ -108,8 +189,7 @@ impl Model {
             }
             checked.push(CertifiedConstInterpEntry {
                 binding,
-                value,
-                value_graph,
+                body,
                 declaration_term,
             });
         }
@@ -124,6 +204,7 @@ impl Model {
                 self.completed_values.remove(&term);
             }
             if let Symbol::Named(name) = entry.symbol() {
+                self.materialized_scalar_functions.remove(name.as_str());
                 if let Some(euf) = self.euf_model.as_mut() {
                     euf.function_tables.remove(name.as_str());
                 }
@@ -134,19 +215,26 @@ impl Model {
         Some(())
     }
 
-    /// Return the exact constant value for a certified application.
+    /// Read the certified interpretation AT a specific application.
     ///
     /// `Ok(None)` means this package does not own `symbol`. Once it does own
     /// the symbol, stale declaration/value identity or a signature mismatch is
     /// an error rather than permission to fall through to an unrelated raw EUF
     /// table.
+    ///
+    /// A CONSTANT body answers with its published term, exactly as before. A
+    /// SYMBOLIC body answers with the body and this application's argument
+    /// TERMS: the value exists only once those arguments are evaluated, and
+    /// which evaluator does that is the caller's business (the ordinary
+    /// evaluator uses its own; the independent gate uses ITS own, which is
+    /// what keeps the gate independent).
     pub(in crate::executor) fn certified_const_interp_for_application(
         &self,
         ctx: &ay_frontend::Context,
         symbol: &Symbol,
         arguments: &[TermId],
         result_sort: &Sort,
-    ) -> std::result::Result<Option<TermId>, CertifiedConstInterpReadError> {
+    ) -> std::result::Result<Option<CertifiedConstInterpRead>, CertifiedConstInterpReadError> {
         // Currentness belongs to the package, not only to an exact-symbol
         // hit. A declaration popped from scope can later be redeclared with
         // the same surface spelling and signature but a fresh private core
@@ -182,7 +270,15 @@ impl Model {
         {
             return Err(CertifiedConstInterpReadError::SignatureConflict);
         }
-        Ok(Some(entry.value()))
+        Ok(Some(match entry.body() {
+            CertifiedConstInterpBody::Constant { value, .. } => {
+                CertifiedConstInterpRead::Constant(*value)
+            }
+            CertifiedConstInterpBody::LinearInt(linear) => CertifiedConstInterpRead::LinearInt {
+                body: linear.clone(),
+                arguments: arguments.to_vec(),
+            },
+        }))
     }
 
     /// Whether every model-owned constant interpretation still names the exact
@@ -255,6 +351,11 @@ impl Model {
 
         if !checked.is_empty() || !self.formula_neutral_function_defaults.entries.is_empty() {
             self.revoke_all_quantified_model_seals();
+            for entry in &checked {
+                if let Symbol::Named(name) = entry.symbol() {
+                    self.materialized_scalar_functions.remove(name.as_str());
+                }
+            }
             self.formula_neutral_function_defaults.entries = Arc::from(checked.into_boxed_slice());
             eval_memo_clear();
         }
@@ -291,7 +392,7 @@ impl Model {
         {
             return Err(FormulaNeutralFunctionDefaultReadError::SignatureConflict);
         }
-        Ok(Some(entry.value().clone()))
+        Ok(Some(super::evaluation_copies::copy(entry.value())))
     }
 
     pub(in crate::executor) fn formula_neutral_function_defaults_are_current(

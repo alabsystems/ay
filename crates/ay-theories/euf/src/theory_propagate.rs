@@ -121,7 +121,7 @@ impl EufSolver<'_> {
             return false;
         }
         const WARMUP: u64 = 512;
-        self.lazy_emit_counter += 1;
+        self.lazy_emit_counter = self.lazy_emit_counter.saturating_add(1);
         let n = self.lazy_emit_counter;
         if n <= WARMUP || n.is_multiple_of(64) {
             return false;
@@ -455,7 +455,7 @@ impl EufSolver<'_> {
         let adaptive = self.cong_neg_adaptive
             && (self.func_apps.len() >= CONG_NEG_SIZE_GATE || !self.cong_neg_ever_fired);
         if adaptive && self.cong_neg_suspended {
-            self.cong_neg_probe_skip += 1;
+            self.cong_neg_probe_skip = self.cong_neg_probe_skip.saturating_add(1);
             if self.cong_neg_probe_skip < CONG_NEG_REPROBE {
                 self.scratch_cong_neg_memo.insert(key, None);
                 return None;
@@ -582,7 +582,13 @@ impl EufSolver<'_> {
             overlay.iter().find(|&&(k, _)| k == r).map(|&(_, g)| g)
         }
         fn ov_mapped(overlay: &[(u32, u32)], canon: &[u32], r: u32) -> u32 {
-            ov_gid(overlay, r).map_or(r, |g| canon[g as usize])
+            // A group id always indexes `canon` (both grow together); one that
+            // did not would name no simulated class, so `r` stays unmapped.
+            if let Some(g) = ov_gid(overlay, r) {
+                canon.get(g as usize).copied().unwrap_or(r)
+            } else {
+                r
+            }
         }
         // Simulated-class member keys for the diseq probe: a disequality
         // between two simulated classes can be registered in
@@ -932,7 +938,8 @@ impl EufSolver<'_> {
                     visit.push((next, head, ei, fwd));
                 }
             }
-            head += 1;
+            // `head < visit.len()`, so this never saturates.
+            head = head.saturating_add(1);
         }
         None
     }
@@ -1029,7 +1036,11 @@ impl EufSolver<'_> {
         };
         let mut cur = s;
         for (ei, fwd) in path {
-            let e = edges[ei];
+            // `sim_path` only yields indices of `edges`; one that is not would
+            // leave no valid chain, which refuses the propagation (sound).
+            let Some(&e) = edges.get(ei) else {
+                return false;
+            };
             let (e_in, e_out) = if fwd { (e.a, e.b) } else { (e.b, e.a) };
             // Live chain to the edge's entry endpoint (same live class).
             if cur != TermId(e_in) {
@@ -1513,9 +1524,37 @@ impl EufSolver<'_> {
                     // already-indexed pair; record the previous witness so pop()
                     // restores the exact scope-entry mapping (its witness must
                     // reference a surviving disequality).
+                    //
+                    // #euf-inc-diseq-undo-absorbed: the overwrite is not the
+                    // whole mutation. This literal ALSO left `pending_neg_eqs`
+                    // and its only home is now a key it does NOT own — the
+                    // resident witness does. That key is shared only because
+                    // both literals' endpoint classes are currently merged, and
+                    // a pop can SPLIT them: after the split this literal's
+                    // `(min_rep,max_rep)` is a DIFFERENT pair, which no undo
+                    // record re-establishes, so the restored index silently
+                    // loses a live disequality (measured on the `min-pred` DT+LIA
+                    // cycle: `diseq_pair_index` came back from an incremental pop
+                    // with 9 of the 10 pairs an assigns rebuild derives, missing
+                    // exactly the absorbed one). The brand-new case below already
+                    // treats "moved out of the pending queue" as needing a
+                    // re-queue; an ABSORBED literal is that same move, so it gets
+                    // the same record. Pushed AFTER the `DiseqSet`, so the
+                    // reverse replay in `pop()` runs `DiseqUnsync` first (drop the
+                    // key, re-queue this literal if its assignment survived) and
+                    // then `DiseqSet` (restore the resident witness under that
+                    // key) — the net state is exactly the pre-sync one. The
+                    // re-queue makes pop()'s completeness guard observe a
+                    // non-empty pending set and take the sound from-scratch
+                    // rebuild for that pop, which is the same conservative price
+                    // the deferred-sync case already pays.
                     if diseq_undo {
                         self.undo_trail
                             .push(UndoRecord::DiseqSet { key, entry: old });
+                        self.undo_trail.push(UndoRecord::DiseqUnsync {
+                            key,
+                            entry: (a, b, lit_term),
+                        });
                     }
                     continue; // redundant witness for an already-indexed pair
                 }
@@ -1881,7 +1920,7 @@ impl EufSolver<'_> {
             if self.lazy_emit_gate() {
                 self.lazy_neg_witness
                     .insert(term_id, (diseq_a, diseq_b, diseq_term));
-                self.lazy_emitted_count += 1;
+                self.lazy_emitted_count = self.lazy_emitted_count.saturating_add(1);
                 propagations.push(TheoryPropagation::lazy(
                     TheoryLit::new(term_id, false),
                     EUF_LAZY_MAGIC | EUF_LAZY_KIND_NEG,
@@ -1992,7 +2031,7 @@ impl EufSolver<'_> {
             return None;
         }
         let reject = |this: &mut Self| {
-            this.lazy_explain_rejected_count += 1;
+            this.lazy_explain_rejected_count = this.lazy_explain_rejected_count.saturating_add(1);
             None
         };
         let Some((lhs, rhs)) = self.decode_eq(lit) else {
@@ -2097,7 +2136,7 @@ impl EufSolver<'_> {
             return reject(self);
         }
 
-        self.lazy_explained_count += 1;
+        self.lazy_explained_count = self.lazy_explained_count.saturating_add(1);
         Some(reasons)
     }
 

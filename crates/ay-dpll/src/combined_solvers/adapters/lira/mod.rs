@@ -39,8 +39,8 @@ use crate::term_helpers::{involves_int_arithmetic, involves_real_arithmetic};
 
 /// Combined LIA + LRA theory solver for QF_LIRA.
 pub(crate) struct LiraSolver<'a> {
-    /// Reference to term store for inspecting literal sorts
-    pub(super) terms: &'a TermStore,
+    // The borrowed LIA owner retains the store lifetime for both sub-solvers.
+    // Raw LRA reads remain inside that bound set/unset bracket.
     /// LIA solver for integer arithmetic
     pub(super) lia: LiaSolver<'a>,
     /// LRA solver for real arithmetic
@@ -106,6 +106,28 @@ enum ForwardedIntBoundTrailEntry {
 }
 
 impl<'a> LiraSolver<'a> {
+    /// The term store, read through the inner LRA solver's bracket
+    /// (panics outside a set/unset bracket; see `LraSolver::terms()`).
+    #[inline]
+    pub(super) fn terms(&self) -> &TermStore {
+        self.lra.terms()
+    }
+
+    /// Point both sub-solvers at `terms`, opening their read
+    /// brackets (persistent-arm lifecycle; mirrors
+    /// `LraSolver::set_terms`).
+    pub(crate) fn set_terms(&mut self, terms: &'a TermStore) {
+        self.lia.set_terms(terms);
+        self.lra.set_terms(terms);
+    }
+
+    /// Close both sub-solvers' read brackets (persistent-arm
+    /// lifecycle; mirrors `LraSolver::unset_terms`).
+    pub(crate) fn unset_terms(&mut self) {
+        self.lia.unset_terms();
+        self.lra.unset_terms();
+    }
+
     /// Create a new combined LIA+LRA solver
     pub(crate) fn new(terms: &'a TermStore) -> Self {
         let mut lia = LiaSolver::new(terms);
@@ -113,7 +135,6 @@ impl<'a> LiraSolver<'a> {
         let mut lra = LraSolver::new(terms);
         lra.set_combined_theory_mode(true);
         Self {
-            terms,
             lia,
             lra,
             propagated_cross_sort: HashMap::default(),
@@ -132,24 +153,24 @@ impl<'a> LiraSolver<'a> {
     /// equality between a non-constant Int-sorted term and an Int constant,
     /// return the non-constant side (#to-real-only-int-integrality).
     fn int_bound_atom_subject(&self, literal: TermId) -> Option<TermId> {
-        let atom = match self.terms.get(literal) {
+        let atom = match self.terms().get(literal) {
             TermData::Not(inner) => *inner,
             _ => literal,
         };
-        let TermData::App(ay_core::term::Symbol::Named(name), args) = self.terms.get(atom) else {
+        let TermData::App(ay_core::term::Symbol::Named(name), args) = self.terms().get(atom) else {
             return None;
         };
         if !matches!(name.as_str(), "<" | "<=" | ">" | ">=" | "=") || args.len() != 2 {
             return None;
         }
         let is_int_const =
-            |t: TermId| matches!(self.terms.get(t), TermData::Const(Constant::Int(_)));
+            |t: TermId| matches!(self.terms().get(t), TermData::Const(Constant::Int(_)));
         let subject = match (is_int_const(args[0]), is_int_const(args[1])) {
             (true, false) => args[1],
             (false, true) => args[0],
             _ => return None,
         };
-        matches!(self.terms.sort(subject), ay_core::Sort::Int).then_some(subject)
+        matches!(self.terms().sort(subject), ay_core::Sort::Int).then_some(subject)
     }
 
     /// Forward single-variable Int bound literals over Real-shared Int terms
@@ -247,13 +268,13 @@ impl<'a> LiraSolver<'a> {
                 continue;
             }
 
-            if matches!(self.terms.sort(term), ay_core::Sort::Int)
-                && !matches!(self.terms.get(term), TermData::Const(Constant::Int(_)))
+            if matches!(self.terms().sort(term), ay_core::Sort::Int)
+                && !matches!(self.terms().get(term), TermData::Const(Constant::Int(_)))
             {
                 self.record_asserted_real_int_term(term);
             }
 
-            stack.extend(self.terms.children(term));
+            stack.extend(self.terms().children(term));
         }
     }
 
@@ -288,8 +309,8 @@ impl TheorySolver for LiraSolver<'_> {
 
     fn assert_literal(&mut self, literal: TermId, value: bool) {
         // Route to LIA if it involves Int arithmetic
-        let is_int = involves_int_arithmetic(self.terms, literal);
-        let is_real = involves_real_arithmetic(self.terms, literal);
+        let is_int = involves_int_arithmetic(self.terms(), literal);
+        let is_real = involves_real_arithmetic(self.terms(), literal);
         if is_int {
             self.lia.assert_literal(literal, value);
             // #to-real-only-int-integrality: record single-variable bound
@@ -560,6 +581,28 @@ impl TheorySolver for LiraSolver<'_> {
         );
         self.lia.soft_reset();
         self.lra.soft_reset();
+        self.propagated_cross_sort.clear();
+        self.cross_sort_trail.clear();
+        self.asserted_real_int_terms.clear();
+        self.asserted_real_int_term_trail.clear();
+        self.clear_int_bound_forwarding();
+    }
+
+    fn soft_reset_warm(&mut self) {
+        // No scope-depth assert (unlike soft_reset): the eager-persistent
+        // arm warm-resets at iteration boundaries while the SAT extension
+        // still holds decision-level theory scopes. Warm reset collapses
+        // them wholesale — every scope-structured collection below is
+        // cleared outright and both sub-solvers clear their own scope
+        // stacks (`LraSolver::soft_reset_warm` clears `scopes`; LIA's
+        // `clear_assertions` does the same) — so depth returns to 0 and
+        // the next iteration's extension replays the trail from scratch.
+        self.scope_depth = 0;
+        // Cross-sort state is assertion-derived and clears exactly as
+        // in soft_reset; only the two simplexes keep their warm start
+        // (values + basis) for the persistent-theory arm.
+        self.lia.soft_reset_warm();
+        self.lra.soft_reset_warm();
         self.propagated_cross_sort.clear();
         self.cross_sort_trail.clear();
         self.asserted_real_int_terms.clear();

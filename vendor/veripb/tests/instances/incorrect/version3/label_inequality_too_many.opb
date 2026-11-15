@@ -1,0 +1,3 @@
+* #variable= 1 #constraint= 1
+* An inequality stands for one constraint, so it can not carry two labels.
+@one @two 1 x1 >= 1 ;

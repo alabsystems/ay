@@ -13,6 +13,7 @@
 //! BMC unrolling: at each step k, check if the property can be violated.
 
 use ntest::timeout;
+use std::time::Duration;
 
 fn results(output: &str) -> Vec<&str> {
     output
@@ -249,16 +250,40 @@ fn test_bmc_with_mod_50_steps_all_unsat() {
     }
 }
 
+/// CPU the 100-step `mod` script may spend on the solving thread.
+///
+/// Each of its 34 `unsat` answers past the bound builds the mandatory
+/// certificate, whose substitution bridge spends its whole planner node budget
+/// on this script (the plan never closes), so that budget, not the search, is
+/// most of the work. Measured on the solving thread: 8.1 s on an idle X925
+/// core (taskset -c 5) and 15.1 s on an A725 (taskset -c 0), 15.2 s there
+/// with two or five busy loops sharing the core (45.9 s and 91.8 s of wall),
+/// against 45.1 s and 84 s while the planner re-ran a strict ground
+/// evaluation per authored side at every node. 30 s keeps 2x over the
+/// slowest core and fails the recomputing planner on every core; thread CPU
+/// is what contention does not inflate.
+const MOD_100_STEPS_CPU_BOUND: Duration = Duration::from_secs(30);
+
 /// BMC with mod constraints: mixed results.
 /// Counter goes 1..100, bound 50. Property: x >= 50 AND (mod x 3) = 0.
 /// x = 50 is not divisible by 3, x = 51 is (51/3=17). So first sat at step 50 (x_51=51).
 /// But in scoped push/pop, each check is independent — x_{k+1} = k+1 is fixed,
 /// so sat when k+1 >= 50 AND (k+1) mod 3 = 0.
+///
+/// The verdicts do not depend on time. The wall cap is a hang guard only,
+/// far above the slowest loaded core; [`MOD_100_STEPS_CPU_BOUND`] bounds the
+/// work on the solving thread's own CPU.
 #[test]
-#[timeout(60_000)]
+#[timeout(300_000)]
 fn test_bmc_with_mod_100_steps_mixed() {
     let smt = generate_bmc_with_mod(100, 50);
+    let cpu = ay_sys::thread_clock::ThreadCpuClock::current();
+    let cpu_before = cpu.and_then(|clock| clock.elapsed());
     let output = crate::common::solve(&smt);
+    let spent = cpu
+        .and_then(|clock| clock.elapsed())
+        .zip(cpu_before)
+        .map(|(after, before)| after.saturating_sub(before));
     let res = results(&output);
     assert_eq!(res.len(), 100, "expected 100 check-sat results");
     for (i, &r) in res.iter().enumerate() {
@@ -274,6 +299,13 @@ fn test_bmc_with_mod_100_steps_mixed() {
             "step {i}: x_{} = {x_next}, bound=50, mod3={}, expected {expected} got {r}",
             i + 1,
             x_next % 3
+        );
+    }
+    if let Some(spent) = spent {
+        assert!(
+            spent < MOD_100_STEPS_CPU_BOUND,
+            "the 100-step mod script spent {spent:?} of the solving thread's CPU, over \
+             {MOD_100_STEPS_CPU_BOUND:?}"
         );
     }
 }

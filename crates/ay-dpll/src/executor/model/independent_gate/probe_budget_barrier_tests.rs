@@ -228,3 +228,96 @@ fn a_gate_arm_leaves_the_caller_half_its_remaining_deadline() {
         "the arm window must end strictly before the caller's own deadline"
     );
 }
+
+/// AN EXPIRED CALLER DEADLINE FAILS CLOSED, NEVER OPEN.
+///
+/// `probe_budget.rs` claims that an exhausted envelope "takes the gate's
+/// existing `gate budget exhausted` fail-closed path". This pins that path end
+/// to end on a real publication-gate call: with the caller's deadline already
+/// in the past, the arm is granted nothing, the candidate loop's
+/// `solve_deadline.expired()` check fires before any conjunct is checked, and
+/// the `Sat` is downgraded to `Unknown` with its witness withdrawn. The model
+/// here (`c = 7`) SATISFIES the quantified assertion, so a gate that skipped
+/// the check on timeout would publish `confirmed` / `Sat` for a witness it
+/// never checked.
+#[test]
+fn an_expired_caller_deadline_makes_the_publication_gate_fail_closed_not_confirm() {
+    let mut exec = loaded(
+        r#"
+            (set-logic UFLIA)
+            (declare-fun c () Int)
+            (assert (forall ((x Int)) (=> (>= x 0) (>= (+ x c) 0))))
+        "#,
+    );
+    exec.set_produce_proofs(true);
+    let c = exec.ctx.terms.mk_var("c", Sort::Int);
+    exec.last_model = Some(synthetic_lia_model(&[(c, 7)]));
+    let expired = ay_core::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("one second must fit before the current instant");
+    exec.set_deadline(Some(expired));
+
+    let gated = exec.apply_quantified_model_failclosed_gate(SolveResult::Sat);
+    assert_eq!(
+        gated,
+        SolveResult::Unknown,
+        "an exhausted wall clock must fail CLOSED; accepting an unchecked \
+         quantified model on timeout is the soundness hole this gate exists for"
+    );
+    assert_eq!(
+        exec.last_statistics
+            .get_string("model_check_gate.quantified"),
+        Some("fail-closed"),
+    );
+    assert_eq!(
+        exec.last_statistics
+            .get_string("model_check_gate.quantified_reason"),
+        Some("gate budget exhausted"),
+        "the decline must come from the envelope's exhausted path, not from \
+         some other indeterminate route"
+    );
+    assert!(
+        exec.last_model.is_none(),
+        "a fail-closed downgrade must withdraw the unchecked witness"
+    );
+}
+
+/// THE SAME PATH WITH NO CALLER DEADLINE: AN EXHAUSTED ENVELOPE.
+///
+/// `open_arm` on a spent envelope grants a zero-length window whose deadline is
+/// the instant the arm opened, and `SolveDeadline::expired` is `now >= deadline`,
+/// so the candidate loop sees an expired deadline on its first check. The
+/// query-owned envelope alone, with no `-T` anywhere, must fail the gate closed
+/// the same way.
+#[test]
+fn an_exhausted_gate_envelope_makes_the_publication_gate_fail_closed_not_confirm() {
+    let mut exec = loaded(
+        r#"
+            (set-logic UFLIA)
+            (declare-fun c () Int)
+            (assert (forall ((x Int)) (=> (>= x 0) (>= (+ x c) 0))))
+        "#,
+    );
+    exec.begin_external_decision_query(false);
+    exec.set_produce_proofs(true);
+    let c = exec.ctx.terms.mk_var("c", Sort::Int);
+    exec.last_model = Some(synthetic_lia_model(&[(c, 7)]));
+    assert!(
+        exec.solve_deadline.get().is_none(),
+        "the fixture must carry no caller deadline"
+    );
+    exec.quantified_gate_probe_budget.set_remaining_ms(0);
+
+    let gated = exec.apply_quantified_model_failclosed_gate(SolveResult::Sat);
+    assert_eq!(
+        gated,
+        SolveResult::Unknown,
+        "an exhausted gate envelope must fail CLOSED, not skip the check"
+    );
+    assert_eq!(
+        exec.last_statistics
+            .get_string("model_check_gate.quantified_reason"),
+        Some("gate budget exhausted"),
+    );
+    assert!(exec.last_model.is_none());
+}

@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% The positive direction of wipe_level_never_established: a `wiplvl` of a level
+% that `setlvl` established, with a constraint filed at it, must still verify.
+f 1;
+setlvl 7;
+pol 1 1 +;
+wiplvl 7;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

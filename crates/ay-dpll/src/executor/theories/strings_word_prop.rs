@@ -402,11 +402,9 @@ where
     {
         return PropOutcome::Limited;
     }
-    // Outside Kani, deterministic maps are hashbrown containers and expose
-    // fallible capacity reservation. Kani aliases them to BTreeMap, whose
-    // model has no reserve API. One equation can force at most one new value,
+    // Deterministic maps are hashbrown containers and expose fallible
+    // capacity reservation. One equation can force at most one new value,
     // so this bounded capacity covers every subsequent insertion.
-    #[cfg(not(kani))]
     if env.try_reserve(equations.len()).is_err() {
         return PropOutcome::Limited;
     }
@@ -556,14 +554,12 @@ impl Executor {
             if polarity {
                 // One set entry plus the ordered output-list entry.
                 budget.charge_elements(2)?;
-                #[cfg(not(kani))]
                 true_set.try_reserve(1).ok()?;
                 true_list.try_reserve(1).ok()?;
                 true_set.insert(term);
                 true_list.push(term);
             } else {
                 budget.charge_elements(1)?;
-                #[cfg(not(kani))]
                 false_set.try_reserve(1).ok()?;
                 false_set.insert(term);
             }

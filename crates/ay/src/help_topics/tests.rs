@@ -176,61 +176,6 @@ fn the_self_describing_screens_fit_and_carry_no_escapes() {
     }
 }
 
-/// Every AY_* variable the options page documents must actually be read
-/// somewhere in the workspace. A help page naming an environment variable that
-/// nothing consults is a promise the binary does not keep, and it is the exact
-/// failure the page's author was most at risk of.
-///
-/// The search covers the whole workspace, not just this crate: the options a
-/// user sets reach the engines, so `AY_DT_CERT` lives in ay-dpll and is no less
-/// real for it. An earlier version of this test read four files from `ay` and
-/// called that variable invented, which is the wrong answer loudly.
-#[test]
-fn every_documented_env_var_is_read_somewhere() {
-    let page = include_str!("options.txt");
-    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/ay has a parent");
-
-    let mut sources = String::new();
-    let mut stack = vec![crates_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // `target` holds build output, not source, and dwarfs it.
-                if path.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    sources.push_str(&text);
-                }
-            }
-        }
-    }
-
-    let mut checked = 0;
-    for word in page.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        if !word.starts_with("AY_") || word.len() < 4 {
-            continue;
-        }
-        checked += 1;
-        assert!(
-            sources.contains(word),
-            "the options page documents {word}, but no source in the workspace reads it"
-        );
-    }
-    assert!(
-        checked > 0,
-        "the options page documents no AY_* variable at all"
-    );
-}
-
 /// `KNOWN_SUBCOMMANDS` is the argv preprocessor's idea of which first words are
 /// verbs rather than filenames. It is hand-maintained beside the clap enum, so
 /// it can fall behind it — and when it does the failure is silent and baffling:

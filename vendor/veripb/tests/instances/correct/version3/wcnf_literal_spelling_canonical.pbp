@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% Positive direction of `wcnf_literal_spelling_alias`: `1` and `01` denote the
+% same variable, as the DIMACS reading and `proof_format_overview.md` require,
+% so `h 1 0` and `h -01 0` are contradictory and the empty constraint is RUP.
+% This pins the canonicalized reading rather than merely a ban on non-canonical
+% spellings, and it makes the WCNF front end agree with the CNF one.
+f 2;
+rup >= 1;
+output NONE;
+conclusion BOUNDS INF INF;
+end pseudo-Boolean proof;

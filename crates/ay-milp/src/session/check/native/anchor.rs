@@ -45,7 +45,13 @@ pub(super) fn solve(
     request: Request<'_, '_, '_, '_>,
 ) -> Result<Outcome, MilpError> {
     let plan = anchor_plan(session);
-    let mut raw = run_tree(session, &request, &plan.opts)?;
+    let cut_capture = crate::integer_cut_capture::NativeCutCapture::new(&session.model);
+    let mut tree_opts = plan.opts.clone();
+    tree_opts.cut_capture = Some(cut_capture.clone());
+    let mut raw = run_tree(session, &request, &tree_opts)?;
+    let cut_batch = cut_capture.take();
+    session.harvested_cuts = cut_batch.cuts;
+    session.cut_harvest_summary = cut_batch.summary;
     session.capture_affine_certificate(&raw);
     capture_parity_certificate(session, &raw);
     #[cfg(feature = "smt")]

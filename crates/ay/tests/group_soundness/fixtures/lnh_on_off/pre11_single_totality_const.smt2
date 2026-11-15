@@ -1,0 +1,11 @@
+; z3 5.1.0: sat
+(set-logic QF_DT)
+(declare-datatypes ((E 0) (L 0)) (((A) (B) (C) (D) (E5) (E6) (E7) (E8) (E9) (E10)) ((cons (hd E) (tl L)) (nil))))
+(declare-const e0 E)
+(declare-const e1 E)
+(set-info :status sat)
+(declare-const x L)
+(assert (or (= A e0) (= B e0) (= C e0) (= D e0) (= E5 e0) (= E6 e0) (= E7 e0) (= E8 e0) (= E9 e0) (= E10 e0)))
+(assert ((_ is E7) e0))
+(assert ((_ is cons) x))
+(check-sat)

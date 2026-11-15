@@ -4,8 +4,9 @@
 
 use super::*;
 
-#[test]
-fn test_preprocess_skips_expensive_equivalence_passes_on_large_formula() {
+/// A formula one variable above the expensive-pass size gate, with every
+/// equivalence pass on and factor primed past its delay guard.
+fn large_formula_with_equivalence_passes_on() -> Solver {
     let mut solver = Solver::new(PREPROCESS_EXPENSIVE_MAX_VARS + 1);
     add_duplicate_and_gate_formula(&mut solver);
     solver.set_gate_enabled(true);
@@ -32,6 +33,18 @@ fn test_preprocess_skips_expensive_equivalence_passes_on_large_formula() {
 
     solver.initialize_watches();
     assert!(solver.process_initial_clauses().is_none());
+    solver
+}
+
+#[test]
+fn test_preprocess_skips_expensive_equivalence_passes_on_large_formula() {
+    // `--sat-factor-large` (on by default since 2026-09-18) opens the factor
+    // step on exactly this band; `false` keeps the size gate this test pins.
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        factor_large: Some(false),
+        ..Default::default()
+    });
+    let mut solver = large_formula_with_equivalence_passes_on();
 
     let congr_rounds_before = solver.congruence_stats().rounds;
     let decompose_rounds_before = solver.decompose_stats().rounds;
@@ -72,6 +85,25 @@ fn test_preprocess_skips_expensive_equivalence_passes_on_large_formula() {
         solver.sweep_stats().rounds,
         sweep_rounds_before,
         "preprocess should skip sweep on large formulas"
+    );
+}
+
+#[test]
+fn test_preprocess_factors_a_large_formula_in_the_band_by_default() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
+    let mut solver = large_formula_with_equivalence_passes_on();
+    let factor_rounds_before = solver.factor_stats().rounds;
+    let congr_rounds_before = solver.congruence_stats().rounds;
+    assert!(!solver.preprocess());
+    assert_eq!(
+        solver.factor_stats().rounds,
+        factor_rounds_before + 1,
+        "--sat-factor-large opens the factor step on the refused band by default"
+    );
+    assert_eq!(
+        solver.congruence_stats().rounds,
+        congr_rounds_before,
+        "the other expensive passes keep their size gate"
     );
 }
 

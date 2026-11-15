@@ -40,6 +40,8 @@ fn tagged_ast_id(a: Z3_ast) -> Option<c_uint> {
     match a & super::HANDLE_TAG_MASK {
         super::SORT_AST_TAG => Some(0x8000_0000 | (a & !super::HANDLE_TAG_MASK) as c_uint),
         super::FUNC_DECL_AST_TAG => Some(0xC000_0000 | (a & !super::HANDLE_TAG_MASK) as c_uint),
+        super::OO_AST_TAG => Some(0x4000_0000 | (a & !super::HANDLE_TAG_MASK) as c_uint),
+        super::PROOF_AST_TAG => Some(0x2000_0000 | (a & !super::HANDLE_TAG_MASK) as c_uint),
         _ => None,
     }
 }
@@ -130,7 +132,9 @@ pub unsafe extern "C" fn Z3_is_eq_func_decl(
         ffi_guard_int(c, 0, |_ctx| {
             let d1 = &(*f1).decl;
             let d2 = &(*f2).decl;
-            i32::from(d1 == d2)
+            // The decls of two literals share name and signature (`Int`, no
+            // domain); only the literal tells them apart.
+            i32::from(d1 == d2 && (*f1).value == (*f2).value)
         }) != 0
     }
 }

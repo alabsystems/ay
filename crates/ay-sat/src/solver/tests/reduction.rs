@@ -1417,6 +1417,266 @@ fn test_should_reduce_db_learned_limit_uses_active_redundant_count() {
     );
 }
 
+/// After a reduction the size cap does not fire again until the learned count
+/// has grown past what that reduction left behind (plus at least 256): a
+/// reduction that could delete nothing must not re-fire on the next conflict.
+/// Binary learned clauses used in analysis stay out of the used-glue
+/// histogram unless the old accounting is switched back on; large learned
+/// clauses are counted either way.
+#[test]
+fn test_tier_histogram_skips_binary_learned_clauses() {
+    let lit = |v: u32| Literal::positive(Variable(v));
+    let mut solver = Solver::new(6);
+    for v in 0..5 {
+        solver.enqueue(lit(v), None);
+    }
+    let binary = solver.add_clause_db(&[lit(0), lit(1)], true);
+    let ternary = solver.add_clause_db(&[lit(2), lit(3), lit(4)], true);
+    let mode = usize::from(solver.stable_mode);
+    let before = solver.tiers.tier_bump_total[mode];
+    solver.bump_clause(ClauseRef(binary as u32));
+    assert_eq!(
+        solver.tiers.tier_bump_total[mode], before,
+        "a binary learned clause is not counted"
+    );
+    solver.bump_clause(ClauseRef(ternary as u32));
+    assert_eq!(
+        solver.tiers.tier_bump_total[mode],
+        before + 1,
+        "a large learned clause is counted"
+    );
+    solver.set_tier_histogram_binaries(true);
+    solver.bump_clause(ClauseRef(binary as u32));
+    assert_eq!(
+        solver.tiers.tier_bump_total[mode],
+        before + 2,
+        "the old accounting counts binaries again"
+    );
+}
+
+/// With the switch on, a learned binary clause is never a reduction
+/// candidate: under cap pressure the ternaries are reduced and the binary
+/// stays, counted in `learned_reduction_binary_kept`.
+#[test]
+fn test_keep_learned_binaries_leaves_them_out_of_reduction() {
+    let lit = |v: u32| Literal::positive(Variable(v));
+    let mut solver = Solver::new(12);
+    let binary = solver.add_clause_db(&[lit(0), lit(1)], true);
+    solver.arena.set_lbd(binary, 2);
+    let mut ternaries = Vec::new();
+    for v in (2..11).step_by(3) {
+        let idx = solver.add_clause_db(&[lit(v), lit(v + 1), lit(v + 2)], true);
+        solver.arena.set_lbd(idx, 9);
+        ternaries.push(idx);
+    }
+    let hyper = solver.add_clause_db(&[lit(0), lit(2)], true);
+    solver.arena.set_lbd(hyper, 2);
+    solver.arena.set_hyper(hyper, true);
+    solver.set_keep_learned_binaries(true);
+    solver.set_max_learned_clauses(Some(0));
+    solver.reduce_db();
+    assert!(
+        solver.arena.is_active(binary),
+        "the learned binary is not reduced"
+    );
+    assert_eq!(
+        solver.stats.learned_reduction_binary_kept, 1,
+        "the hyper binary is not counted as kept"
+    );
+    assert!(
+        ternaries.iter().any(|&idx| !solver.arena.is_active(idx)),
+        "the ternaries are still reduced under cap pressure"
+    );
+}
+
+/// The trail-support guards apply under jump reasons (literal-encoded binary
+/// reasons the marks cannot name) or when forced; otherwise a learned binary
+/// with a literal decided above the root is not blanket-protected.
+#[test]
+fn test_trail_support_guard_applies_only_under_jump_reasons() {
+    let lit = |v: u32| Literal::positive(Variable(v));
+    let mut solver = Solver::new(4);
+    let binary = solver.add_clause_db(&[lit(0), lit(1)], true);
+    solver.decide(lit(0));
+    assert!(solver.decision_level > 0);
+    solver.cold.jump_reasons_enabled = false;
+    assert!(
+        !solver.binary_clause_may_support_the_trail(binary),
+        "with clause-referenced reasons the marks are exact; no blanket guard"
+    );
+    solver.cold.jump_reasons_enabled = true;
+    assert!(
+        solver.binary_clause_may_support_the_trail(binary),
+        "under jump reasons the guard applies"
+    );
+    solver.cold.jump_reasons_enabled = false;
+    solver.set_blanket_trail_protection(true);
+    assert!(
+        solver.binary_clause_may_support_the_trail(binary),
+        "the switch forces the guard everywhere"
+    );
+}
+
+#[test]
+fn test_learned_cap_waits_for_growth_after_a_reduction() {
+    let mut solver = Solver::new(8);
+    add_tier2_learned_unit_clauses(&mut solver, 6);
+    solver.cold.next_reduce_db = u64::MAX;
+    solver.set_max_learned_clauses(Some(4));
+    assert!(solver.should_reduce_db(), "over the cap, floor 0: due");
+    solver.cold.learned_cap_retrigger_floor = 7;
+    assert!(
+        !solver.should_reduce_db(),
+        "over the cap but below the retrigger floor: not due"
+    );
+    solver.cold.learned_cap_retrigger_floor = 6;
+    assert!(solver.should_reduce_db(), "at the floor: due again");
+    solver.reduce_db();
+    let remaining = solver.arena.redundant_count();
+    assert!(
+        solver.cold.learned_cap_retrigger_floor >= remaining + 256,
+        "a reduction raises the floor past what it left: floor {} remaining {remaining}",
+        solver.cold.learned_cap_retrigger_floor
+    );
+    assert!(
+        !solver.learned_clause_limit_exceeded(),
+        "right after a reduction the cap trigger sleeps"
+    );
+}
+
+#[test]
+fn test_byte_trigger_waits_for_learned_growth_after_a_reduction() {
+    let mut solver = Solver::new(8);
+    add_tier2_learned_unit_clauses(&mut solver, 6);
+    solver.cold.next_reduce_db = u64::MAX;
+    // Every clause-DB byte is over this limit, the irredundant ones too.
+    solver.set_max_clause_db_bytes(Some(0));
+    assert!(
+        solver.should_reduce_db(),
+        "over the byte limit, floor 0: due"
+    );
+    solver.cold.learned_cap_retrigger_floor = 7;
+    assert!(
+        !solver.should_reduce_db(),
+        "over the byte limit but below the retrigger floor: not due"
+    );
+    solver.cold.learned_cap_retrigger_floor = 6;
+    assert!(solver.should_reduce_db(), "at the floor: due again");
+    solver.reduce_db();
+    assert!(solver.clause_db_memory_bytes() > 0);
+    assert!(
+        !solver.should_reduce_db(),
+        "right after a reduction the byte trigger sleeps, though the DB is still over the limit"
+    );
+}
+
+/// The learned-count floor counts clauses, not bytes: past it, the byte
+/// trigger still fires once the DB has grown a tenth of its limit, at least
+/// 1 MiB, past what the last reduction left, so long learned clauses cannot
+/// carry the DB far past its limit.
+#[test]
+fn test_byte_trigger_fires_on_byte_growth_below_the_count_floor() {
+    use super::super::reduction_triggers::CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH;
+    let mut solver = Solver::new(64);
+    // An irredundant DB over twice the minimum growth, so growth past it is
+    // representable below the current size.
+    let mut k = 0u32;
+    while solver.clause_db_memory_bytes() <= 2 * CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH {
+        solver.add_clause_db(
+            &[
+                Literal::positive(Variable(k % 64)),
+                Literal::negative(Variable((k / 64) % 64)),
+                Literal::positive(Variable((k / 4096) % 64)),
+            ],
+            false,
+        );
+        k += 1;
+    }
+    solver.cold.next_reduce_db = u64::MAX;
+    solver.set_max_clause_db_bytes(Some(0));
+    solver.cold.learned_cap_retrigger_floor = usize::MAX;
+    let bytes = solver.clause_db_memory_bytes();
+    solver.cold.clause_db_bytes_after_reduction = bytes;
+    assert!(
+        !solver.should_reduce_db(),
+        "no growth since the reduction and below the count floor: not due"
+    );
+    solver.cold.clause_db_bytes_after_reduction = bytes - CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH;
+    assert!(
+        !solver.should_reduce_db(),
+        "grown exactly the minimum: not yet due"
+    );
+    solver.cold.clause_db_bytes_after_reduction = bytes - CLAUSE_DB_BYTE_RETRIGGER_MIN_GROWTH - 1;
+    assert!(
+        solver.should_reduce_db(),
+        "grown past the minimum below the count floor: due"
+    );
+}
+
+/// `pigeons` pigeons in `pigeons - 1` holes: UNSAT, and far more than a
+/// few thousand conflicts from a refutation at ten pigeons.
+fn pigeonhole_clauses(pigeons: u32) -> (usize, Vec<Vec<Literal>>) {
+    let holes = pigeons - 1;
+    let var = |pigeon: u32, hole: u32| Variable(pigeon * holes + hole);
+    let mut clauses: Vec<Vec<Literal>> = (0..pigeons)
+        .map(|pigeon| {
+            (0..holes)
+                .map(|hole| Literal::positive(var(pigeon, hole)))
+                .collect()
+        })
+        .collect();
+    for hole in 0..holes {
+        for first in 0..pigeons {
+            for second in first + 1..pigeons {
+                clauses.push(vec![
+                    Literal::negative(var(first, hole)),
+                    Literal::negative(var(second, hole)),
+                ]);
+            }
+        }
+    }
+    ((pigeons * holes) as usize, clauses)
+}
+
+/// A byte limit no reduction can meet (the irredundant clauses alone are
+/// over it) reduced at every conflict, so the 100 conflicts between two
+/// polls of the solve's stop held 100 reductions, each a pass over the
+/// whole clause DB. The stop here fires on its 51st poll, a count, not a
+/// time; the search reaches it through its conflict and decision polls.
+/// Without the byte trigger's retrigger floor the solve makes one
+/// reduction per conflict: about 100 per poll, where at most one is allowed.
+#[test]
+fn test_unmeetable_byte_limit_leaves_at_most_one_reduction_per_stop_poll() {
+    let (num_vars, clauses) = pigeonhole_clauses(10);
+    let mut solver = Solver::new(num_vars);
+    for clause in clauses {
+        solver.add_clause(clause);
+    }
+    solver.set_preprocess_enabled(false);
+    solver.disable_all_inprocessing();
+    solver.set_max_clause_db_bytes(Some(1));
+    let polls = std::cell::Cell::new(0_u64);
+    let result = solver
+        .solve_interruptible(|| {
+            polls.set(polls.get() + 1);
+            polls.get() > 50
+        })
+        .into_inner();
+    assert!(matches!(result, SatResult::Unknown), "stopped: {result:?}");
+    assert_eq!(polls.get(), 51, "nothing polls the stop after it fired");
+    let conflicts = solver.num_conflicts();
+    let reductions = solver.num_reductions();
+    assert!(
+        conflicts >= 1_000,
+        "the stop came from the search's polls: {conflicts} conflicts"
+    );
+    assert!(
+        reductions <= polls.get(),
+        "{reductions} reductions in {conflicts} conflicts across {} polls",
+        polls.get()
+    );
+}
+
 #[test]
 fn test_reduce_db_explicit_learned_pressure_ignores_deleted_slots() {
     let mut solver = Solver::new(8);
@@ -2319,4 +2579,42 @@ fn clause_db_budget_floors_at_the_loaded_formula_plus_headroom() {
         solver.clause_db_memory_bytes() < installed,
         "the solver must not start out already over its own ceiling"
     );
+}
+
+/// `--sat-reduce-kissat-recompute`: every reduction recomputes the current
+/// mode's tier limits first (Kissat `reduce.c:159`), where the default
+/// recomputes on CaDiCaL's backoff schedule only.
+#[test]
+fn test_reduce_kissat_recompute_retiers_at_every_reduction() {
+    let run = |on: bool| {
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            reduce_kissat_recompute: Some(on),
+            ..Default::default()
+        });
+        let mut solver = Solver::new(80);
+        let _fixture = add_mixed_reduction_fixture(&mut solver);
+        solver.num_conflicts = 1 << 20;
+        solver.tiers.next_recompute_tier = u64::MAX;
+        let before = solver.tiers.tier_recomputed;
+        solver.reduce_db();
+        solver.reduce_db();
+        solver.tiers.tier_recomputed - before
+    };
+    assert_eq!(run(true), 2, "one recompute per reduction");
+    assert_eq!(run(false), 0, "the default waits for its schedule");
+}
+
+/// `--sat-reduce-protect-kissat`: no permanent glue-1 protection outside IC3
+/// mode (Kissat keeps glue-1 clauses only while used, reduce.c:76-79).
+#[test]
+fn test_reduce_protect_kissat_drops_the_permanent_glue1_protection() {
+    let protect = |kissat: bool| {
+        let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            reduce_protect_kissat: Some(kissat),
+            ..Default::default()
+        });
+        Solver::new(4).reduce_permanent_protect_lbd()
+    };
+    assert_eq!(protect(true), 0);
+    assert_eq!(protect(false), 1);
 }

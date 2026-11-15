@@ -31,7 +31,7 @@ fn f32_fields(v: f32) -> FpFields {
     FpFields {
         sign: bits >> 31 == 1,
         exponent: u64::from((bits >> 23) & 0xff),
-        significand: u64::from(bits & 0x007f_ffff),
+        significand: u128::from(bits & 0x007f_ffff),
     }
 }
 
@@ -80,6 +80,9 @@ fn exact_f32(bits: u32) -> BigRational {
 // ---------------------------------------------------------------------------
 
 include!("ieee_tests/rounding_boundaries.rs");
+
+#[path = "ieee_tests/binary128.rs"]
+mod binary128;
 
 /// `floor_log2` starts from a bit-length estimate; the correction must reach
 /// the exact answer from EITHER side, not just the side that estimate lands on.
@@ -157,7 +160,7 @@ fn double_precision_matches_hardware() {
             FpFields {
                 sign: bits >> 63 == 1,
                 exponent: (bits >> 52) & 0x7ff,
-                significand: bits & 0x000f_ffff_ffff_ffff,
+                significand: u128::from(bits & 0x000f_ffff_ffff_ffff),
             },
             "value {n}/{d}"
         );
@@ -392,7 +395,7 @@ fn sqrt_refuses_what_it_cannot_round() {
         None
     );
     assert_eq!(
-        super::sqrt_rational(&int(4), 8, 113, RoundingMode::NearestTiesToEven),
+        super::sqrt_rational(&int(4), 8, 130, RoundingMode::NearestTiesToEven),
         None
     );
 }
@@ -409,7 +412,7 @@ fn double_precision_square_roots_match_hardware() {
             FpFields {
                 sign: bits >> 63 == 1,
                 exponent: (bits >> 52) & 0x7ff,
-                significand: bits & 0x000f_ffff_ffff_ffff,
+                significand: u128::from(bits & 0x000f_ffff_ffff_ffff),
             },
             "sqrt({v})"
         );

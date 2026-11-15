@@ -1,0 +1,12 @@
+; z3 5.1.0: sat sat
+(set-logic QF_UFDT)
+(declare-sort U 0)
+(declare-datatypes ((N 0)) (((z) (s (p N)))))
+(declare-const n N)
+(declare-const e U) (declare-const c0 U) (declare-const c1 U) (declare-const c2 U) (declare-const c3 U) (declare-const c4 U)
+(push 1)
+(assert (= n z))
+(assert (or (= e c0) (= e c1) (= e c2) (= e c3) (= e c4)))
+(check-sat)
+(assert (not (= e c0)))
+(check-sat)

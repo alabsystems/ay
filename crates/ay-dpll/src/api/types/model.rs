@@ -20,6 +20,7 @@ pub struct Model {
     pub(crate) bv_values: HashMap<String, (BigInt, u32)>,
     pub(crate) string_values: HashMap<String, String>,
     pub(crate) fp_values: HashMap<String, ModelValue>,
+    pub(crate) field_values: HashMap<String, ModelValue>,
     pub(crate) seq_values: HashMap<String, ModelValue>,
     pub(crate) array_values: HashMap<String, ModelValue>,
     pub(crate) datatype_values: HashMap<String, ModelValue>,
@@ -42,11 +43,57 @@ impl Model {
             bv_values: HashMap::default(),
             string_values: HashMap::default(),
             fp_values: HashMap::default(),
+            field_values: HashMap::default(),
             seq_values: HashMap::default(),
             array_values: HashMap::default(),
             datatype_values: HashMap::default(),
             uninterpreted_values: HashMap::default(),
         }
+    }
+
+    /// Keep only the assignments whose name satisfies `keep`.
+    ///
+    /// Restriction never changes a retained value, so a restricted model still
+    /// satisfies every formula that mentions only retained names. The Z3 C API
+    /// uses this to publish, for one solver handle, exactly the symbols of that
+    /// handle's goal: the engine that produced the model is shared by every
+    /// handle of a context and prints every symbol declared on it.
+    pub fn retain_names(&mut self, keep: impl Fn(&str) -> bool) {
+        self.int_values.retain(|name, _| keep(name));
+        self.real_values.retain(|name, _| keep(name));
+        self.bool_values.retain(|name, _| keep(name));
+        self.bv_values.retain(|name, _| keep(name));
+        self.string_values.retain(|name, _| keep(name));
+        self.fp_values.retain(|name, _| keep(name));
+        self.field_values.retain(|name, _| keep(name));
+        self.seq_values.retain(|name, _| keep(name));
+        self.array_values.retain(|name, _| keep(name));
+        self.datatype_values.retain(|name, _| keep(name));
+        self.uninterpreted_values.retain(|name, _| keep(name));
+    }
+
+    /// Rename assignments: `rename(name)` is the new name, or `None` to keep
+    /// it. Values are unchanged. The Z3 C API uses this to carry a model into
+    /// another context, whose declarations have identities of their own.
+    pub fn rename_names(&mut self, rename: impl Fn(&str) -> Option<String>) {
+        fn renamed<V>(map: &mut HashMap<String, V>, rename: &impl Fn(&str) -> Option<String>) {
+            let old = std::mem::take(map);
+            for (name, value) in old {
+                let name = rename(&name).unwrap_or(name);
+                map.insert(name, value);
+            }
+        }
+        renamed(&mut self.int_values, &rename);
+        renamed(&mut self.real_values, &rename);
+        renamed(&mut self.bool_values, &rename);
+        renamed(&mut self.bv_values, &rename);
+        renamed(&mut self.string_values, &rename);
+        renamed(&mut self.fp_values, &rename);
+        renamed(&mut self.field_values, &rename);
+        renamed(&mut self.seq_values, &rename);
+        renamed(&mut self.array_values, &rename);
+        renamed(&mut self.datatype_values, &rename);
+        renamed(&mut self.uninterpreted_values, &rename);
     }
 
     /// Integer variable's exact arbitrary-precision value.
@@ -101,6 +148,11 @@ impl Model {
         self.fp_values.get(name)
     }
 
+    /// Prime-field variable's exact value, including field identity.
+    pub fn finite_field_val(&self, name: &str) -> Option<&ModelValue> {
+        self.field_values.get(name)
+    }
+
     /// Sequence variable's value as a [`ModelValue`].
     pub fn seq_val(&self, name: &str) -> Option<&ModelValue> {
         self.seq_values.get(name)
@@ -151,6 +203,11 @@ impl Model {
     /// Returns an iterator over all floating-point variable names and values
     pub fn iter_fps(&self) -> impl Iterator<Item = (&str, &ModelValue)> {
         self.fp_values.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Iterate exact prime-field model values.
+    pub fn iter_finite_fields(&self) -> impl Iterator<Item = (&str, &ModelValue)> {
+        self.field_values.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Returns an iterator over all sequence variable names and values
@@ -204,6 +261,10 @@ impl Model {
                     .map(|(name, value)| (name, ModelValue::String(value.to_string()))),
             )
             .chain(self.iter_fps().map(|(name, value)| (name, value.clone())))
+            .chain(
+                self.iter_finite_fields()
+                    .map(|(name, value)| (name, value.clone())),
+            )
             .chain(self.iter_seqs().map(|(name, value)| (name, value.clone())))
             .chain(
                 self.iter_arrays()
@@ -238,6 +299,7 @@ impl Model {
             .chain(self.bv_values.keys().map(String::as_str))
             .chain(self.string_values.keys().map(String::as_str))
             .chain(self.fp_values.keys().map(String::as_str))
+            .chain(self.field_values.keys().map(String::as_str))
             .chain(self.seq_values.keys().map(String::as_str))
             .chain(self.array_values.keys().map(String::as_str))
             .chain(self.datatype_values.keys().map(String::as_str))
@@ -252,6 +314,7 @@ impl Model {
             && self.bv_values.is_empty()
             && self.string_values.is_empty()
             && self.fp_values.is_empty()
+            && self.field_values.is_empty()
             && self.seq_values.is_empty()
             && self.array_values.is_empty()
             && self.datatype_values.is_empty()
@@ -281,6 +344,9 @@ impl Model {
         if let Some(v) = self.string_values.get(name) {
             return Some(ModelValue::String(v.clone()));
         }
+        if let Some(v) = self.field_values.get(name) {
+            return Some(v.clone());
+        }
         if let Some(v) = self.fp_values.get(name) {
             return Some(v.clone());
         }
@@ -308,6 +374,7 @@ impl Model {
             + self.bv_values.len()
             + self.string_values.len()
             + self.fp_values.len()
+            + self.field_values.len()
             + self.seq_values.len()
             + self.array_values.len()
             + self.datatype_values.len()

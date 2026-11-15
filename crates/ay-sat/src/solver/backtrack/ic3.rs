@@ -34,33 +34,30 @@ impl Solver {
     /// REQUIRES: ic3_mode is set, chrono_enabled is false
     /// ENSURES: same postconditions as backtrack()
     pub(in crate::solver) fn backtrack_ic3(&mut self, target_level: u32) {
+        match self.backtrack_ic3_admitted(target_level, &mut admission::Ordinary) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn backtrack_ic3_admitted<P: admission::Policy>(
+        &mut self,
+        target_level: u32,
+        policy: &mut P,
+    ) -> Result<(), P::Error> {
         self.debug_assert_ic3_backtrack_preconditions(target_level);
+
+        policy.prepare(self, target_level, admission::Lane::Ic3)?;
 
         // No target/best phase updates: IC3 uses forced phases.
 
         if self.decision_level <= target_level {
-            return;
+            return Ok(());
         }
 
-        // #relevancy-frontier-incremental: the incremental relevancy frontier
-        // folds a PREFIX of the trail into its counters. Backtracking both
-        // unassigns literals and COMPACTS the trail (chrono keeps out-of-order
-        // lower-level literals), so this pass does two things for it: fold out
-        // every literal that was folded in and is now unassigned, and count how
-        // many folded literals SURVIVE. Compaction preserves trail order, so
-        // the survivors are exactly the new folded prefix.
-        //
-        // `begin_unassign_fold` — NOT a bare `synced_len` read — is what opens
-        // the fold: the frontier's occurrence lists are keyed by arena WORD
-        // OFFSET, and an epoch-bumping clause-DB mutation (reduce_db deletion,
-        // `replace` strengthening, and above all `compact_arena_locality`,
-        // which rewrites the arena SHORTER with every offset moved) can land
-        // between the query that synced the cache and this backtrack. It
-        // re-checks the epoch and the arena watermarks exactly as `sync` does
-        // and returns `None` — having dropped the cache, so the next query
-        // rebuilds — rather than let the fold walk offsets that no longer
-        // denote the clauses they were recorded for. `None` is also the usual
-        // case (relevancy is off by default), and costs one load.
+        // Same epoch-gated prefix fold as backtrack_core: stale arena offsets
+        // invalidate the cache before any unassignment. Compaction keeps the
+        // folded survivors in order; they form the next synced prefix.
         let frontier_open = self.relevancy_frontier.begin_unassign_fold(
             self.arena.formula_epoch(),
             self.arena.len(),
@@ -118,8 +115,9 @@ impl Solver {
         // rebuild erases it first. This runs between the fold and any rebuild.
         #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
         if frontier_folded {
-            self.debug_assert_relevancy_frontier_exact_after_fold();
+            policy.check_frontier(self);
         }
+        Ok(())
     }
 
     /// Compact the trail in place, unassigning everything above

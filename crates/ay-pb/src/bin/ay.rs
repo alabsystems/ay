@@ -54,8 +54,9 @@ const NONLINEAR_OPT_FRONTEND_TIMEOUT_RESERVE_MS: u64 = 600;
 // certification reserve is applied inside `ay_pb::opt_fallback`, with the search
 // it reserves against, so neither frontend can compute a different one.
 use ay_pb::proof::{
-    compute_cert_opt_budget_split, extend_native_deadline, native_cap_expired,
-    proof_slice_cut_note, CertOptBudgetPolicy, OPT_CERT_NATIVE_SLICE_DIV,
+    compute_cert_opt_budget_split, extend_native_deadline, instance_is_huge, native_cap_expired,
+    proof_slice_cut_note, CertOptBudgetPolicy, ProofSliceOrigin, ProofSliceProvenance,
+    OPT_CERT_NATIVE_SLICE_DIV,
 };
 
 /// Minimum tail worth re-entering the native phase for. This one IS local: the
@@ -2179,17 +2180,43 @@ fn solve_decision_with_proof(
 ) -> Result<PbSolveOutcome, String> {
     let temp_proof_path = prepare_proof_temp(proof_path)?;
     let split_enabled = dec_cert_portfolio_enabled() && timeout_dur.is_some();
-    let mut native_slice = Duration::ZERO;
+    // The slice AND where its length came from, recorded together: the
+    // diagnostic below must state the provenance this run actually had rather
+    // than assume the default divisor (which is how it came to print
+    // "60000 ms / 6" over a 5121 ms slice on a huge instance). This path applies
+    // `OPT_CERT_NATIVE_SLICE_DIV` unconditionally — there is no huge-instance
+    // branch here — so the divisor reported is the divisor used.
+    let mut native_slice = ProofSliceProvenance {
+        slice: Duration::ZERO,
+        origin: ProofSliceOrigin::Divisor {
+            div: OPT_CERT_NATIVE_SLICE_DIV,
+            huge: false,
+        },
+        grace_extended_from: None,
+    };
     let native_deadline: Option<Instant> = if split_enabled {
         let remaining = timeout_dur
             .map(|timeout| timeout.saturating_sub(start.elapsed()))
             .unwrap_or(Duration::ZERO);
-        let slice = if let Some(cap_ms) = cert_native_cap_ms_override() {
-            Duration::from_millis(cap_ms)
+        let (slice, origin) = if let Some(cap_ms) = cert_native_cap_ms_override() {
+            (
+                Duration::from_millis(cap_ms),
+                ProofSliceOrigin::CapOverride { cap_ms },
+            )
         } else {
-            remaining / OPT_CERT_NATIVE_SLICE_DIV
+            (
+                remaining / OPT_CERT_NATIVE_SLICE_DIV,
+                ProofSliceOrigin::Divisor {
+                    div: OPT_CERT_NATIVE_SLICE_DIV,
+                    huge: false,
+                },
+            )
         };
-        native_slice = slice;
+        native_slice = ProofSliceProvenance {
+            slice,
+            origin,
+            grace_extended_from: None,
+        };
         Some(Instant::now() + slice)
     } else {
         None
@@ -2645,16 +2672,17 @@ fn solve_optimization_with_proof<W: Write>(
     let temp_proof_path = prepare_proof_temp(proof_path)?;
     // This binary's two flags are POLICY, handed to the one shared computation
     // rather than forked into a second copy of it.
-    let split = compute_cert_opt_budget_split(
-        instance,
-        objective,
-        timeout_dur,
-        start,
-        CertOptBudgetPolicy {
-            enabled: opt_cert_portfolio_enabled(),
-            native_cap_ms: cert_native_cap_ms_override(),
-        },
-    );
+    let cert_budget_policy = CertOptBudgetPolicy {
+        enabled: opt_cert_portfolio_enabled(),
+        native_cap_ms: cert_native_cap_ms_override(),
+    };
+    let split =
+        compute_cert_opt_budget_split(instance, objective, timeout_dur, start, cert_budget_policy);
+    // The provenance of the slice, derived from the SAME policy and the SAME
+    // size test the split itself used, so the diagnostic below cannot name a
+    // divisor this run did not apply.
+    let slice_origin =
+        ProofSliceOrigin::from_policy(cert_budget_policy, instance_is_huge(instance));
     let native_deadline = Cell::new(split.native_deadline);
     let result = (|| {
         // PHASE N1: native proof-logging CDCL, capped at the split's slice
@@ -2662,6 +2690,13 @@ fn solve_optimization_with_proof<W: Write>(
         // today's behavior). The cap is a pure extra disjunct in the interrupt
         // predicates: it can only convert a would-be proof into a feasible
         // exit, never fabricate one.
+        //
+        // DO NOT swap this for the dense tap the way the decision path's N1/N2
+        // were unified. This is the OPTIMIZATION solver, and every one of its
+        // proof steps gates on `self.proof_writer.is_some()` and never on the
+        // tap (`solver/cdcl.rs`), so a tap-backed solver here would leave
+        // `can_conclude_opt_proof` false and emit NOTHING. It fails closed, but
+        // silently — the swap has to be made in the solver first.
         let proof_file = File::create(&temp_proof_path)
             .map_err(|e| format!("failed to create '{}': {e}", temp_proof_path.display()))?;
         let mut solver = PbCdclSolver::with_proof_writer_interruptible(
@@ -2703,6 +2738,14 @@ fn solve_optimization_with_proof<W: Write>(
         });
         let mut helper_applications = solver.native_code_helper_applications();
         let solution = pb_cdcl_optimization_result_to_solution(result, instance.num_vars);
+        // NATIVE-PHASE ACCOUNTING, `--cert-debug` only; one spelling, shared
+        // with `crates/ay/src/cmd_pb.rs` (see `trace_native_cdcl_phase`).
+        ay_pb::opt_fallback::trace_native_cdcl_phase(
+            start,
+            &solution,
+            &temp_proof_path,
+            solver.opt_lower_bound_deferred(),
+        );
         if matches!(
             solution.status,
             PbStatus::OptimumFound | PbStatus::Satisfiable
@@ -2737,14 +2780,24 @@ fn solve_optimization_with_proof<W: Write>(
             // VISIBILITY GUARD — see the decision path for the full argument.
             // This is the arm the budget-indexed PB-certificate census measures,
             // so an OPT-LIN row that misses because the SLICE (budget/6, ceiling
-            // budget/3) ran out rather than because the declared budget did must
+            // budget/3; /12 and /6 on a huge instance) ran out rather than because the declared budget did must
             // say so on its own line. Diagnostic only.
             // The LIVE deadline, not `split.native_deadline`: an improvement
             // grace may have extended it, and the note must report the slice
-            // the phase actually got, not the one it was first handed.
+            // the phase actually got, not the one it was first handed — and it
+            // must ATTRIBUTE the extension rather than bill the extra time to
+            // the divisor.
             if let Some(note) = native_deadline.get().and_then(|dl| {
+                let handed = split
+                    .native_deadline
+                    .map(|first| first.saturating_duration_since(start));
+                let slice = dl.saturating_duration_since(start);
                 proof_slice_cut_note(
-                    dl.saturating_duration_since(start),
+                    ProofSliceProvenance {
+                        slice,
+                        origin: slice_origin,
+                        grace_extended_from: handed.filter(|first| *first < slice),
+                    },
                     Some(dl),
                     timeout_dur,
                     start,

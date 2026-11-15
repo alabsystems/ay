@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+f 5;
+setlvl 2;
+pol 3 1 * 4 1 * + s;
+e 1 x1 +1 x3 >= 1 : 6;
+wiplvl 2;
+setlvl 1;
+pol 3 1 * 4 1 * + s;
+setlvl 0;
+pol 1 2 + 7 +;
+wiplvl 1;
+% access to constraint 6 should fail as it is supposed to be deleted.
+e 1 x1 +1 x3 >= 1 : 6;
+e +2 x1 +2 x2 +2 x3 >= 3 : 8;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

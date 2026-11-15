@@ -59,7 +59,7 @@ fn debug_channel_active_from_env(ch: DebugChannel) -> bool {
     static ENV_CONFIG: OnceLock<DebugConfig> = OnceLock::new();
     let config = ENV_CONFIG.get_or_init(|| {
         let mut channels = Vec::new();
-        let theory_umbrella = false; // B24: umbrella env retired; per-channel flags remain.
+        let theory_umbrella = false; // Umbrella env retired; per-channel flags remain.
                                      // Check each channel's env var
         for &candidate in ALL_DEBUG_CHANNELS {
             let env_name = debug_channel_env_name(candidate);
@@ -69,7 +69,7 @@ fn debug_channel_active_from_env(ch: DebugChannel) -> bool {
                 channels.push(candidate);
             }
         }
-        // B72: the pre-`AY_DEBUG_*` legacy alias for `EufFallback` is retired
+        // The pre-`AY_DEBUG_*` legacy alias for `EufFallback` is retired
         // (never set); the channel itself remains reachable per the scan above.
         if theory_umbrella {
             channels.push(DebugChannel::Theory);
@@ -686,7 +686,7 @@ pub fn theory_disable_flags() -> &'static TheoryDisableFlags {
 /// implemented the suggestion since #8445 but neither adapter ever forwarded
 /// it (git-verified never-wired, not deliberate), so the default preserves the
 /// historical byte-identical trajectory on every lane. Carried by
-/// `--uflia-arith-decisions` (B72); both forwarding sites gate on this one
+/// `--uflia-arith-decisions`; both forwarding sites gate on this one
 /// function.
 #[inline]
 pub fn uflia_arith_decisions_enabled() -> bool {
@@ -729,29 +729,20 @@ static GLOBAL_SAT_DEBUG_ENV_FLAGS: OnceLock<SatDebugEnvFlags> = OnceLock::new();
 /// Initialize SAT debug env flags from environment variables.
 fn init_sat_debug_env_from_env() -> SatDebugEnvFlags {
     SatDebugEnvFlags {
-        // B72: --trace-ext-conflict is the carrier; the never-set env fallback
-        // is deleted.
         trace_ext_conflict: false,
-        // B16: --bve-limit / --bve-max-rounds are CLI-only now (the ay bin
-        // installs them explicitly); the never-set env fallbacks are deleted.
         bve_limit: None,
-        // B72: --bve-trace is the carrier; env fallback deleted.
         bve_trace: false,
         bve_max_rounds: None,
-        // B45: --log / --clause-provenance are CLI-only now (the ay bin
-        // installs them explicitly); the never-set env fallbacks are deleted.
         log_enabled: false,
-        // B72: --dump-conflicts is the carrier; env fallback deleted.
         dump_conflicts: false,
         clause_provenance: false,
-        // B72: --debug-transred-clause is the carrier; env fallback deleted.
         debug_transred_clause: None,
     }
 }
 
 /// Returns a reference to the global SAT debug env flags.
 ///
-/// On first call, initializes from `AY_*` env vars for backward compat.
+/// Without a prior `set_global_sat_debug_env_flags`, the first call installs the defaults.
 #[inline]
 pub fn sat_debug_env_flags() -> &'static SatDebugEnvFlags {
     GLOBAL_SAT_DEBUG_ENV_FLAGS.get_or_init(init_sat_debug_env_from_env)
@@ -788,7 +779,7 @@ pub struct TraceConfig {
     pub trace_file_path: Option<String>,
     /// `--solution-file`
     pub solution_file_path: Option<String>,
-    /// Adaptive-portfolio decision log path (CLI-carried; B24: env retired)
+    /// Adaptive-portfolio decision log path (CLI-carried; env retired)
     pub decision_log_path: Option<String>,
     /// Canonical pure-QF_BV CNF export path (`--dump-bv-cnf` / `AY_DUMP_BV_CNF`).
     ///
@@ -831,23 +822,14 @@ static GLOBAL_TRACE_CONFIG: OnceLock<TraceConfig> = OnceLock::new();
 ///
 /// Initialize trace config from environment variables.
 fn init_trace_config_from_env() -> TraceConfig {
-    // B21/B24: --diagnostic-file is the carrier; both env arms (explicit
-    // path, auto temp path) are retired.
     let diagnostic_path = None;
     TraceConfig {
         diagnostic_path,
-        // B21: --decision-trace is the carrier; the env fallback is retired.
         decision_trace_path: None,
-        // B24: --replay-trace is the carrier; env fallback retired.
         replay_trace_path: None,
-        // B72: --trace-file is the carrier; the env fallback (and the stale
-        // subprocess-IPC note — no setter survives anywhere) is deleted.
         trace_file_path: None,
-        // B45: --solution-file is the carrier; env fallback retired.
         solution_file_path: None,
-        // B24: the CLI carrier is the path source; env fallback retired.
         decision_log_path: None,
-        // B58: --dump-bv-cnf is the carrier; the env fallback is retired.
         dump_bv_cnf_path: None,
         // DRAT-for-BV is a CLI-only coupling to `--dump-bv-cnf`; no env alias.
         bv_drat_path: None,
@@ -855,16 +837,14 @@ fn init_trace_config_from_env() -> TraceConfig {
         // Self-cert temp paths are CLI-only (`--self-check`); never env-driven.
         bv_drat_self_cert_cnf_path: None,
         bv_drat_self_cert_drat_path: None,
-        // B72: --kind-dump-dir is the carrier; env fallback deleted.
         kind_dump_dir: None,
-        // B21: --dump-encoding is the carrier; the env fallback is retired.
         dump_encoding_path: None,
     }
 }
 
 /// Returns a reference to the global trace config.
 ///
-/// On first call, initializes from `AY_*` env vars for backward compat.
+/// Without a prior `set_global_trace_config`, the first call installs the defaults.
 #[inline]
 pub fn trace_config() -> &'static TraceConfig {
     GLOBAL_TRACE_CONFIG.get_or_init(init_trace_config_from_env)
@@ -933,7 +913,7 @@ pub fn trace_file_available() -> bool {
 pub struct ChcDebugEnvFlags {
     /// AY_IUC_TRACE — enable IUC interpolation tracing
     pub iuc_trace: bool,
-    /// Hard diagnostic for zero-Farkas fallbacks (B24: env spelling retired)
+    /// Hard diagnostic for zero-Farkas fallbacks (env spelling retired)
     pub iuc_require_farkas: bool,
 }
 
@@ -943,16 +923,14 @@ static GLOBAL_CHC_DEBUG_ENV_FLAGS: OnceLock<ChcDebugEnvFlags> = OnceLock::new();
 /// Initialize CHC debug env flags from environment variables.
 fn init_chc_debug_env_from_env() -> ChcDebugEnvFlags {
     ChcDebugEnvFlags {
-        // B72: --iuc-trace is the carrier; env fallback deleted.
         iuc_trace: false,
-        // B24: the hard-diagnostic env is retired (never set).
         iuc_require_farkas: false,
     }
 }
 
 /// Returns a reference to the global CHC debug env flags.
 ///
-/// On first call, initializes from `AY_IUC_*` env vars for backward compat.
+/// Without a prior `set_global_chc_debug_env_flags`, the first call installs the defaults.
 #[inline]
 pub fn chc_debug_env_flags() -> &'static ChcDebugEnvFlags {
     GLOBAL_CHC_DEBUG_ENV_FLAGS.get_or_init(init_chc_debug_env_from_env)
@@ -998,265 +976,272 @@ pub struct MiscCliFlags {
     pub dpll_diagnostic_enabled: bool,
     /// `--dpll-trace-file=FILE` — explicit DPLL(T) trace JSONL path.
     pub dpll_trace_file: Option<String>,
-    /// `--maxsat-no-tot-eqs` — drop totalizer output equalities (A/B; B17).
+    /// `--maxsat-no-tot-eqs` — drop totalizer output equalities (A/B).
     pub maxsat_no_tot_eqs: bool,
     /// `--maxsat-no-bce-revert` — keep the preprocessed engine after a
-    /// mostly-risky BCE reduction (A/B; B17).
+    /// mostly-risky BCE reduction (A/B).
     pub maxsat_no_bce_revert: bool,
-    /// `--maxsat-no-am1-maxcover` — restore the shared-only AM1 cover (B32).
+    /// `--maxsat-no-am1-maxcover` — restore the shared-only AM1 cover.
     pub maxsat_no_am1_maxcover: bool,
-    /// `--maxsat-bce` — arm the opt-in one-shot BCE preprocessing lane (B32;
-    /// stays default OFF like the retired env spelling).
+    /// `--maxsat-bce` — arm the opt-in one-shot BCE preprocessing lane
+    /// (stays default OFF like the retired env spelling).
     pub maxsat_bce: bool,
-    /// `--maxsat-no-bmo` — disable BMO stratified descent (B32).
+    /// `--maxsat-no-bmo` — disable BMO stratified descent.
     pub maxsat_no_bmo: bool,
-    /// `--maxsat-no-cold-descent` — disable the cold-descent gate (B32).
+    /// `--maxsat-no-cold-descent` — disable the cold-descent gate.
     pub maxsat_no_cold_descent: bool,
-    /// `--maxsat-no-descent-residual` — disable residual-descent reuse (B32).
+    /// `--maxsat-no-descent-residual` — disable residual-descent reuse.
     pub maxsat_no_descent_residual: bool,
-    /// `--maxsat-no-dpw` — never select the DPW encoding (B32).
+    /// `--maxsat-no-dpw` — never select the DPW encoding.
     pub maxsat_no_dpw: bool,
     /// `--maxsat-no-early-descent` — disable the early stratified descent
-    /// slice (B32).
+    /// slice.
     pub maxsat_no_early_descent: bool,
-    /// `--maxsat-no-preproc` — disable one-shot maxsat preprocessing (B32).
+    /// `--maxsat-no-preproc` — disable one-shot maxsat preprocessing.
     pub maxsat_no_preproc: bool,
-    /// `--maxsat-no-milp-race` — disable the MILP race lane (B32; the race
+    /// `--maxsat-no-milp-race` — disable the MILP race lane (the race
     /// is correct-by-default, opting out is for contention-free benching).
     pub maxsat_no_milp_race: bool,
     /// `--no-inc-linear-parse` — restore parse-every-line incremental input
-    /// handling (B32).
+    /// handling.
     pub no_inc_linear_parse: bool,
-    /// `--no-milp-fastpath` — disable the QF_LRA MILP fastpath route (B32).
+    /// `--no-milp-fastpath` — disable the QF_LRA MILP fastpath route.
     pub no_milp_fastpath: bool,
     /// `--sat-relevancy <0|1|2>` — force the relevancy brancher off/on
     /// (`2` also turns on the engage marker); unset lets the caller decide
-    /// (B36; was --sat-relevancy).
+    /// (was --sat-relevancy).
     pub sat_relevancy: Option<u8>,
     /// `--fc-global-budget <N>` — explicit FC global pair budget; unset arms
-    /// the many-array autoscale (B36).
+    /// the many-array autoscale.
     pub fc_global_budget: Option<usize>,
-    /// `--maxsat-debug` — MILP-race gate diagnostics (B41).
+    /// `--maxsat-debug` — MILP-race gate diagnostics.
     pub maxsat_debug: bool,
     /// `--proof-self-check <1|2>` — proof self-check mode, warn | strict
-    /// (B41; `None` = off).
+    /// (`None` = off).
     pub proof_self_check: Option<u8>,
-    /// `--chc-checked-replay <secs>` — opt-in CHECKED replay budget (B41).
+    /// `--chc-checked-replay <secs>` — opt-in CHECKED replay budget.
     pub chc_checked_replay_secs: Option<u64>,
-    /// `--xor-allow-large` — lift the XOR-extension clause cap (B41).
+    /// `--xor-allow-large` — lift the XOR-extension clause cap.
     pub xor_allow_large: bool,
-    /// `--xor-allow-residual` — allow residual-dominated XOR routing (B41).
+    /// `--xor-allow-residual` — allow residual-dominated XOR routing.
     pub xor_allow_residual: bool,
     /// `--xor-allow-unadmitted` — take the XOR theory route even when almost
     /// none of the detected rows got a Gaussian matrix (#xor-route-entry
     /// kill switch; restores the pre-fix behaviour byte-for-byte).
     pub xor_allow_unadmitted: bool,
-    /// `--phase-trace` — dpll phase trace lines (B42 diagnostic).
+    /// `--phase-trace` — dpll phase trace lines (diagnostic).
     pub phase_trace: bool,
-    /// `--debug-cert` — certificate-path diagnostics (B42).
+    /// `--debug-cert` — certificate-path diagnostics.
     pub debug_cert: bool,
-    /// `--debug-qmg` — quantified-model-gate diagnostics (B42).
+    /// `--debug-qmg` — quantified-model-gate diagnostics.
     pub debug_qmg: bool,
-    /// `--model-reject-dump` — dump rejected models (B42).
+    /// `--model-reject-dump` — dump rejected models.
     pub model_reject_dump: bool,
-    /// `--debug-strict-oracle` — strict-oracle diagnostics (B42).
+    /// `--debug-strict-oracle` — strict-oracle diagnostics.
     pub debug_strict_oracle: bool,
-    /// `--g3-gate-dump` — G3 gate dump (B42).
+    /// `--g3-gate-dump` — G3 gate dump.
     pub g3_gate_dump: bool,
-    /// `--quiet-soundness-gate` — suppress soundness-gate chatter (B42).
+    /// `--quiet-soundness-gate` — suppress soundness-gate chatter.
     pub quiet_soundness_gate: bool,
-    /// `--rup-fallback-trace` — RUP fallback trace (B42).
+    /// `--rup-fallback-trace` — RUP fallback trace.
     pub rup_fallback_trace: bool,
-    /// `--lra-inc-engine-stats` — inc-engine persistence stats (B42).
+    /// `--lra-inc-engine-stats` — inc-engine persistence stats.
     pub lra_inc_engine_stats: bool,
-    /// `--lra-inc-engine-reverify` — from-scratch disagreement backstop
-    /// (B42).
+    /// `--lra-inc-engine-reverify` — from-scratch disagreement
+    /// backstop.
     pub lra_inc_engine_reverify: bool,
     /// `--debug-no-terms i,j` — suppress listed term ids in combiner-check
-    /// dumps (B42).
+    /// dumps.
     pub debug_no_terms: Option<String>,
-    /// `--proof-introspect <path>` — append proof introspection to a file
-    /// (B42).
+    /// `--proof-introspect <path>` — append proof introspection to a
+    /// file.
     pub proof_introspect: Option<String>,
-    /// `--proof-introspect-probe <path>` — probe-derivation dump (B42).
+    /// `--proof-introspect-probe <path>` — probe-derivation dump.
     pub proof_introspect_probe: Option<String>,
-    /// `--str-w4-work <n>` — W4 work cap (`0` = unbounded; B42).
+    /// `--probe-sat-variable <n>` — observe one zero-based SAT variable's
+    /// existing BV provenance under `--probe-cert-reject`; never registers it.
+    pub probe_sat_variable: Option<u32>,
+    /// `--str-w4-work <n>` — W4 work cap (`0` = unbounded).
     pub str_w4_work: Option<u64>,
     /// `--fmq-lane-budget-ms <n>` — override the finite-model MBQI lane's
-    /// per-invocation wall cap (B43 A/B; `None` = the shipped sizing).
+    /// per-invocation wall cap (A/B; `None` = the shipped sizing).
     pub fmq_lane_budget_ms: Option<u64>,
     /// `--fmq-probe-ms <n>` — override the finite-model MBQI lane's
-    /// per-sub-solve ceiling (B43 A/B; `None` = the shipped constant).
+    /// per-sub-solve ceiling (A/B; `None` = the shipped constant).
     pub fmq_probe_ms: Option<u64>,
     /// `--fmq-seed-ms <n>` — override the finite-model MBQI lane's session
-    /// decline seed (B43 A/B; `None` = the shipped constant).
+    /// decline seed (A/B; `None` = the shipped constant).
     pub fmq_seed_ms: Option<u64>,
-    /// `--sat-ab-subst-stats` — congruence/substitution stats dumps (B43).
+    /// `--sat-ab-subst-stats` — congruence/substitution stats dumps.
     pub ab_subst_stats: bool,
-    /// `--sat-ab-subst-dump-merges` — merge/unit provenance dump (B43).
+    /// `--sat-ab-subst-dump-merges` — merge/unit provenance dump.
     pub ab_subst_dump_merges: bool,
-    /// `--sat-ab-subst-dump-gates` — gate-extraction dump (B43).
+    /// `--sat-ab-subst-dump-gates` — gate-extraction dump.
     pub ab_subst_dump_gates: bool,
-    /// `--sat-ab-subst-dump-edges` — congruence edge dump (B43).
+    /// `--sat-ab-subst-dump-edges` — congruence edge dump.
     pub ab_subst_dump_edges: bool,
-    /// `--sat-ab-dump-db` — dump the live clause DB at congruence entry
-    /// (B43).
+    /// `--sat-ab-dump-db` — dump the live clause DB at congruence
+    /// entry.
     pub ab_dump_db: bool,
-    /// `--sat-factor-probe` — factor candidate-schedule report (B43).
+    /// `--sat-factor-probe` — factor candidate-schedule report.
     pub factor_probe: bool,
-    /// `--sat-probe-trace-dup` — duplicate-push probe in the clause trace
-    /// (B43).
+    /// `--sat-probe-trace-dup` — duplicate-push probe in the clause
+    /// trace.
     pub probe_trace_dup: bool,
-    /// `--sat-l0-unsat-trace` — level-0 core-failsafe trace (B43).
+    /// `--sat-l0-unsat-trace` — level-0 core-failsafe trace.
     pub sat_l0_unsat_trace: bool,
-    /// `--sat-symmetry-trace` — symmetry pipeline trace (B43).
+    /// `--sat-symmetry-trace` — symmetry pipeline trace.
     pub sat_symmetry_trace: bool,
-    /// `--sat-mem-probe` — per-engine construction footprint report (B43).
+    /// `--sat-mem-probe` — per-engine construction footprint report, and the
+    /// solver's memory by structure after parsing and after preprocessing.
     pub sat_mem_probe: bool,
+    /// `--sat-bve-trace <LEVEL>` — BVE decision trace to stderr: 1 one line
+    /// per resolved candidate, 2 also the clauses of every refusal.
+    pub sat_bve_trace: u8,
     /// `--sat-ab-triage-clause d1,d2,...` — soundness-triage target clause
-    /// in DIMACS lits (B43).
+    /// in DIMACS lits.
     pub ab_triage_clause: Option<String>,
     /// `--sat-ab-triage-var <dimacs var>` — report every assignment of the
-    /// variable (B43).
+    /// variable.
     pub ab_triage_var: Option<u64>,
-    /// `--sat-ab-triage-probe d1,d2,...` — RUP-probe triage target (B43).
+    /// `--sat-ab-triage-probe d1,d2,...` — RUP-probe triage target.
     pub ab_triage_probe: Option<String>,
-    /// `--chc-accept-profile` — clause-inlining accept profile (B44).
+    /// `--chc-accept-profile` — clause-inlining accept profile.
     pub chc_accept_profile: bool,
-    /// `--chc-cata-trace` — catamorphism abstraction trace (B44).
+    /// `--chc-cata-trace` — catamorphism abstraction trace.
     pub chc_cata_trace: bool,
-    /// `--chc-houdini-debug` — Houdini lane diagnostics (B44).
+    /// `--chc-houdini-debug` — Houdini lane diagnostics.
     pub chc_houdini_debug: bool,
-    /// `--chc-imc-stats` — IMC lane statistics (B44).
+    /// `--chc-imc-stats` — IMC lane statistics.
     pub chc_imc_stats: bool,
-    /// `--chc-proof-itp-stats` — proof-backed interpolation stats (B44).
+    /// `--chc-proof-itp-stats` — proof-backed interpolation stats.
     pub chc_proof_itp_stats: bool,
-    /// `--chc-ice-dt-trace` — ICE datatype learner trace (B44).
+    /// `--chc-ice-dt-trace` — ICE datatype learner trace.
     pub chc_ice_dt_trace: bool,
-    /// `--chc-dt-bmc-trace` — datatype-BMC trace (B44).
+    /// `--chc-dt-bmc-trace` — datatype-BMC trace.
     pub chc_dt_bmc_trace: bool,
-    /// `--chc-v2-debug` — BV dual-lane v2 diagnostics (B44).
+    /// `--chc-v2-debug` — BV dual-lane v2 diagnostics.
     pub chc_v2_debug: bool,
-    /// `--chc-ground-bt-debug` — ground backtranslation diagnostics (B44).
+    /// `--chc-ground-bt-debug` — ground backtranslation diagnostics.
     pub chc_ground_bt_debug: bool,
-    /// `--chc-bmc-nested-debug` — nested-BMC diagnostics (B44).
+    /// `--chc-bmc-nested-debug` — nested-BMC diagnostics.
     pub chc_bmc_nested_debug: bool,
-    /// `--chc-debug-marker-dag-verify` — marker-DAG verbose verification
-    /// (B44).
+    /// `--chc-debug-marker-dag-verify` — marker-DAG verbose
+    /// verification.
     pub chc_debug_marker_dag_verify: bool,
-    /// `--chc-array-frontier-telemetry` — array-content frontier telemetry
-    /// (B44).
+    /// `--chc-array-frontier-telemetry` — array-content frontier
+    /// telemetry.
     pub chc_array_frontier_telemetry: bool,
-    /// `--chc-cata-dump-abstract <dir>` — dump abstract LIA problems (B44).
+    /// `--chc-cata-dump-abstract <dir>` — dump abstract LIA problems.
     pub chc_cata_dump_abstract: Option<String>,
-    /// `--chc-cata-dump-obligations <dir>` — dump undischarged obligations
-    /// (B44).
+    /// `--chc-cata-dump-obligations <dir>` — dump undischarged
+    /// obligations.
     pub chc_cata_dump_obligations: Option<String>,
-    /// `--chc-dump-scalarized <dir>` — dump scalarized problems (B44).
+    /// `--chc-dump-scalarized <dir>` — dump scalarized problems.
     pub chc_dump_scalarized: Option<String>,
     /// `--chc-dump-failed-replay-obligation <dir>` — write failing replay
-    /// obligations as runnable scripts (B44).
+    /// obligations as runnable scripts.
     pub chc_dump_failed_replay_obligation: Option<String>,
-    /// `--chc-checksat-dump <dir>` — capture timeout-class check scripts
-    /// (B44).
+    /// `--chc-checksat-dump <dir>` — capture timeout-class check
+    /// scripts.
     pub chc_checksat_dump: Option<String>,
-    /// `--chc-pdr-dump <dir>` — dump PDR executor queries (B44).
+    /// `--chc-pdr-dump <dir>` — dump PDR executor queries.
     pub chc_pdr_dump: Option<String>,
-    /// `--chc-proof-itp-dump <dir>` — dump proof-solve scripts (B44).
+    /// `--chc-proof-itp-dump <dir>` — dump proof-solve scripts.
     pub chc_proof_itp_dump: Option<String>,
-    /// `--chc-checksat-trace <level>` — check-sat trace verbosity (B44).
+    /// `--chc-checksat-trace <level>` — check-sat trace verbosity.
     pub chc_checksat_trace: Option<u8>,
-    /// `--euf-gap-stats` — EUF propagation-gap profiling (B45).
+    /// `--euf-gap-stats` — EUF propagation-gap profiling.
     pub euf_gap_stats: bool,
-    /// `--lia-instrument` — LIA instrumentation reporter (B45).
+    /// `--lia-instrument` — LIA instrumentation reporter.
     pub lia_instrument: bool,
     /// `--probe-stats-every <n>` — LIA probe-stats report interval
-    /// (default 1000; B45).
+    /// (default 1000).
     pub probe_stats_every: Option<u64>,
-    /// `--str-nf-closures i,j,...` — explicit string NF closure subset
-    /// (B45).
+    /// `--str-nf-closures i,j,...` — explicit string NF closure
+    /// subset.
     pub str_nf_closures: Option<String>,
-    /// `--trace-cegqi-attr` — CEGQI attribution trace (B59).
+    /// `--trace-cegqi-attr` — CEGQI attribution trace.
     pub trace_cegqi_attr: bool,
-    /// `--debug-read-pin` — read-pin diagnostics (B59).
+    /// `--debug-read-pin` — read-pin diagnostics.
     pub debug_read_pin: bool,
-    /// `--f1-diag` — F1 combiner diagnostics (B59).
+    /// `--f1-diag` — F1 combiner diagnostics.
     pub f1_diag: bool,
-    /// `--census-trace` — DT model census trace (B59).
+    /// `--census-trace` — DT model census trace.
     pub census_trace: bool,
-    /// `--debug-pigeonhole` — pigeonhole-core diagnostics (B59).
+    /// `--debug-pigeonhole` — pigeonhole-core diagnostics.
     pub debug_pigeonhole: bool,
-    /// `--cert-debug` — PB certificate diagnostics (B59).
+    /// `--cert-debug` — PB certificate diagnostics.
     pub cert_debug: bool,
-    /// `--count-debug` — model-counting diagnostics (B59).
+    /// `--count-debug` — model-counting diagnostics.
     pub count_debug: bool,
-    /// `--tseitin-trace` — Tseitin derivation trace (B60).
+    /// `--tseitin-trace` — Tseitin derivation trace.
     pub tseitin_trace: bool,
-    /// `--debug-subst` — LIA substitution diagnostics (B60).
+    /// `--debug-subst` — LIA substitution diagnostics.
     pub debug_subst: bool,
-    /// `--debug-split-exit` — pipeline split-exit diagnostics (B60).
+    /// `--debug-split-exit` — pipeline split-exit diagnostics.
     pub debug_split_exit: bool,
-    /// `--debug-class-merge` — combiner class-merge diagnostics (B60).
+    /// `--debug-class-merge` — combiner class-merge diagnostics.
     pub debug_class_merge: bool,
-    /// `--milp-fastpath-debug` — MILP fastpath diagnostics (B60).
+    /// `--milp-fastpath-debug` — MILP fastpath diagnostics.
     pub milp_fastpath_debug: bool,
-    /// `--demand-debug` — quantifier demand diagnostics (B60).
+    /// `--demand-debug` — quantifier demand diagnostics.
     pub demand_debug: bool,
-    /// `--prop-debug` — extension propagation diagnostics (B60).
+    /// `--prop-debug` — extension propagation diagnostics.
     pub prop_debug: bool,
-    /// `--quant-stats` — quantifier statistics (B60).
+    /// `--quant-stats` — quantifier statistics.
     pub quant_stats: bool,
-    /// `--debug-fixup` — combined-theory fixup diagnostics (B60).
+    /// `--debug-fixup` — combined-theory fixup diagnostics.
     pub debug_fixup: bool,
-    /// `--debug-cegar` — CEGAR escalation diagnostics (B60).
+    /// `--debug-cegar` — CEGAR escalation diagnostics.
     pub debug_cegar: bool,
-    /// `--str-prepass-stats` — string prepass statistics (B60).
+    /// `--str-prepass-stats` — string prepass statistics.
     pub str_prepass_stats: bool,
-    /// `--milp-lane-trace` — PB portfolio MILP-lane trace (B62).
+    /// `--milp-lane-trace` — PB portfolio MILP-lane trace.
     pub milp_lane_trace: bool,
-    /// `--verify-mixed-strings-stats` (B63).
+    /// `--verify-mixed-strings-stats`.
     pub verify_mixed_strings_stats: bool,
-    /// `--a5-uf-eq-defer` — A5 UF equality deferral arm (B63).
+    /// `--a5-uf-eq-defer` — A5 UF equality deferral arm.
     pub a5_uf_eq_defer: bool,
-    /// `--spike-dump` — interpolation-spike dump (B63).
+    /// `--spike-dump` — interpolation-spike dump.
     pub spike_dump: bool,
-    /// `--spike-verbose` — interpolation-spike verbosity (B63).
+    /// `--spike-verbose` — interpolation-spike verbosity.
     pub spike_verbose: bool,
-    /// `--qfax-combiner-route` — QF_AX combiner route arm (B63).
+    /// `--qfax-combiner-route` — QF_AX combiner route arm.
     pub qfax_combiner_route: bool,
-    /// `--qfax-cegar` — QF_AX CEGAR arm (B63).
+    /// `--qfax-cegar` — QF_AX CEGAR arm.
     pub qfax_cegar: bool,
-    /// `--qfax-lanes-debug` — QF_AX lane diagnostics (B63).
+    /// `--qfax-lanes-debug` — QF_AX lane diagnostics.
     pub qfax_lanes_debug: bool,
-    /// `--probe-strict-check` — strict-check progress probe (B63).
+    /// `--probe-strict-check` — strict-check progress probe.
     pub probe_strict_check: bool,
-    /// `--probe-cert-reject` — certificate-reject probe (B63).
+    /// `--probe-cert-reject` — certificate-reject probe.
     pub probe_cert_reject: bool,
-    /// `--uflia-witness-debug` (B63).
+    /// `--uflia-witness-debug`.
     pub uflia_witness_debug: bool,
-    /// `--pb-sym-debug` — PB symmetry diagnostics (B63).
+    /// `--pb-sym-debug` — PB symmetry diagnostics.
     pub pb_sym_debug: bool,
-    /// `--pb-farkas-cert` — PB Farkas certificate arm (B63).
+    /// `--pb-farkas-cert` — PB Farkas certificate arm.
     pub pb_farkas_cert: bool,
-    /// `--qfax-neg-eq-witness` — QF_AX negative-equality witness arm (B63).
+    /// `--qfax-neg-eq-witness` — QF_AX negative-equality witness arm.
     pub qfax_neg_eq_witness: bool,
-    /// `--qfax-neg-chain-gate` — QF_AX negative-chain gate arm (B63).
+    /// `--qfax-neg-chain-gate` — QF_AX negative-chain gate arm.
     pub qfax_neg_chain_gate: bool,
-    /// `--vsids-decay <f>` — VSIDS decay override in (0, 1) (B64).
+    /// `--vsids-decay <f>` — VSIDS decay override in (0, 1).
     pub vsids_decay: Option<f64>,
-    /// `--inprobe-mult <f>` — inprocessing probe interval multiplier (B64).
+    /// `--inprobe-mult <f>` — inprocessing probe interval multiplier.
     pub inprobe_mult: Option<f64>,
-    /// `--factor-elim-bound <n>` — factor elimination bound force (B64).
+    /// `--factor-elim-bound <n>` — factor elimination bound force.
     pub factor_elim_bound: Option<i64>,
-    /// `--pb-sls-endgame-threshold <n>` — SLS endgame threshold (B64).
+    /// `--pb-sls-endgame-threshold <n>` — SLS endgame threshold.
     pub pb_sls_endgame_threshold: Option<usize>,
-    /// `--dump-query-dir <dir>` — dump embedded-consumer queries (B64).
+    /// `--dump-query-dir <dir>` — dump embedded-consumer queries.
     pub dump_query_dir: Option<String>,
-    /// `--keep-alethe-artifacts` — keep carcara harness artifacts (B64).
+    /// `--keep-alethe-artifacts` — keep carcara harness artifacts.
     pub keep_alethe_artifacts: bool,
-    /// `--no-quant-unit-authority` — disable P3a derivation authority (B66).
+    /// `--no-quant-unit-authority` — disable P3a derivation authority.
     pub no_quant_unit_authority: bool,
-    /// `--no-consequence-replay` — disable authored consequence replay (B66).
+    /// `--no-consequence-replay` — disable authored consequence replay.
     pub no_consequence_replay: bool,
     /// `--no-quantified-shedding-yield` — restore proof shedding on QUANTIFIED
     /// public queries (#quantified-shedding-yield). Default off, i.e. shedding
@@ -1270,6 +1255,103 @@ pub struct MiscCliFlags {
     /// (#inc-fparith-negated-exists-inst). UNSAT-only; disabling restores the
     /// baseline fail-closed `unknown` byte-for-byte.
     pub no_negated_exists_ground_inst: bool,
+    /// `--no-qlra-cegqi` — disable the nested-CEGQI quantified-LRA lane
+    /// (#qlra-nested-cegqi). The lane is a probe, never a pre-empt; disabling
+    /// it restores the legacy quantifier path byte-for-byte.
+    pub no_qlra_cegqi: bool,
+    /// `--no-eq-qe-lane` — disable the SAT-only equality-QE lane (#eq-qe-lane).
+    pub no_eq_qe_lane: bool,
+    /// `--no-qsat` — disable the QSAT route (roadmap component QS) for
+    /// quantified linear arithmetic; the nested-CEGQI lane and the deep-QE
+    /// `Unknown` retry it replaces run again.
+    pub no_qsat: bool,
+    /// `--no-qlra-nested` — disable the nested-CEGQI search (Fig. 8
+    /// recursion, #qlra-nested-cegqi) for quantified-LRA problems the depth-1
+    /// lane declines. The search is ON by default: its `unsat` publishes only
+    /// through the M3a expansion certificate (strict installation boundary)
+    /// and its `sat` only through the quantified model gate (M3b
+    /// confirm-only expansion route); disabling it restores the depth-1-only
+    /// lane.
+    pub no_qlra_nested: bool,
+    /// `--no-authored-skeleton-refutation` — disable the authored
+    /// BOOLEAN-SKELETON refutation artifact-firewall translation
+    /// (#authored-skeleton-refutation). UNSAT-only; disabling restores the
+    /// baseline fail-closed `unknown` byte-for-byte.
+    pub no_authored_skeleton_refutation: bool,
+    /// `--no-authored-fold-identity` — disable the authored fold-identity
+    /// refutation (#authored-fold-identity): the derivation recorded for a
+    /// preprocessor fold-to-`false` whose argument is a normalization
+    /// identity between two operands of an authored disequality, or a
+    /// conjunct and its negation. UNSAT-only; disabling restores the
+    /// bare-hole erasure byte-for-byte.
+    pub no_authored_fold_identity: bool,
+    /// `--no-probe-ite-lift-promoter` — disable the consequence-replay
+    /// LIFTED-ASSERTION trust-leaf promoter (#probe-ite-lift-promoter).
+    /// UNSAT-only; disabling restores the baseline byte-for-byte: a probe
+    /// whose only residual trust leaf is the arithmetic-ITE lift of one of
+    /// its own assertions declines its strict check exactly as before.
+    pub no_probe_ite_lift_promoter: bool,
+    /// `--no-alpha-quantifier-sharing` — disable ALPHA-EQUIVALENCE sharing of
+    /// authored quantifiers (#alpha-quantifier-sharing). With it set, every
+    /// quantifier occurrence keeps the globally unique binder names the
+    /// elaborator mints for it, so two syntactically identical authored
+    /// assertions elaborate to different terms exactly as before.
+    pub no_alpha_quantifier_sharing: bool,
+    /// `--no-quantifier-proxy-abstraction` — disable the quantifier proxy
+    /// abstraction (#quantifier-proxy-abstraction). With it set,
+    /// `flatten_and_strip_quantifiers` DELETES every assertion that mentions a
+    /// quantifier, exactly as before the stage landed, so the ground solver
+    /// loses the ground disjuncts of a disjunct-position `forall` goal.
+    /// Disabling restores the baseline assertion vector byte-for-byte.
+    pub no_quantifier_proxy_abstraction: bool,
+    /// `--no-skolem-guarded-proxy-instances` — disable the Skolem-witness
+    /// guarded instantiation of proxied quantifiers
+    /// (#skolem-guarded-proxy-instances). UNSAT-only: with it set no guarded
+    /// clause is built and the abstracted assertion vector is byte-for-byte
+    /// what `purify_quantifier_atoms` left behind.
+    pub no_skolem_guarded_proxy_instances: bool,
+    /// `--no-quantifier-guarded-instances` — disable GUARDED instance clauses
+    /// from the E-matcher (#quantifier-guarded-instances). With it set, the
+    /// matcher takes the same `continue` it took before the stage landed for
+    /// every `forall` the assertion set does not entail, so no
+    /// `(or (not qproxy) body[t])` clause is ever built. Disabling restores the
+    /// baseline assertion vector byte-for-byte.
+    pub no_quantifier_guarded_instances: bool,
+    /// `--quantifier-guarded-enumerative` — force guarded instance clauses
+    /// from the triggerless ENUMERATIVE lane on for EVERY solve
+    /// (#quantifier-guarded-enumerative), overriding the structural trigger.
+    ///
+    /// The lane's default is neither "on" nor "off": it fires when the
+    /// E-matcher produced no instance in the solve, which is the measured
+    /// separator between the family it helps and the family it hurts (see
+    /// `quant_unit_authority::quantifier_guarded_enumerative_enabled`). This
+    /// flag removes that condition, which is the arm the corpus-wide
+    /// always-on measurement used and the way to reproduce it.
+    pub quantifier_guarded_enumerative: bool,
+    /// `--no-quantifier-guarded-enumerative` — kill switch for the same lane.
+    /// With it set no enumerative guarded clause is built whatever the
+    /// structure says, restoring the pre-gate assertion vector byte-for-byte.
+    /// It also outranks `--quantifier-guarded-enumerative`.
+    pub no_quantifier_guarded_enumerative: bool,
+    /// `--no-quantifier-ce-free-resolve` — kill switch for the counterexample-free
+    /// consequence re-solve (#quantifier-ce-free-resolve): stage 4
+    /// of the quantifier-instantiation plan. With it set, a CEGQI-forall
+    /// refutation the disambiguation apparatus cannot attribute fails closed
+    /// exactly as before the stage landed: no guard literal is minted, no
+    /// re-solve runs, and the published `unknown` is byte-identical.
+    pub no_quantifier_ce_free_resolve: bool,
+    /// `--no-quantifier-guard-seeds` — kill switch for the guard-bound seed
+    /// instances of entailed single-binder `Real` universals
+    /// (#nra-guard-seed-instances). With it set no seed instance is asserted
+    /// and the quantifier pipeline's assertion vector is byte-identical to the
+    /// pre-pass one. For A/B measurement.
+    pub no_quantifier_guard_seeds: bool,
+    /// `--no-ground-first` — kill switch for ground-first scheduling of
+    /// quantified check-sat (#qe-ground-first): the query without its
+    /// top-level universal axioms is no longer decided before the quantifier
+    /// pipeline, which then runs exactly as it did before the pass landed.
+    /// For A/B measurement and for guards pinning a lane the pass preempts.
+    pub no_ground_first: bool,
     /// `--no-ground-conflict-decomp` — disable the ground-conflict
     /// decomposition arms of the proof builder (#ground-conflict-decomp):
     /// the EUF-chain + Farkas-bridge split, and the array read-over-write
@@ -1285,111 +1367,142 @@ pub struct MiscCliFlags {
     /// separate builds cannot give honestly — and it is the operational escape
     /// hatch for a change whose failure mode is a silent wrong answer.
     pub no_fp_incremental: bool,
-    /// `--vacuous-marker-narrow` — staged marker narrowing (B66).
+    /// `--vacuous-marker-narrow` — staged marker narrowing.
     pub vacuous_marker_narrow: bool,
-    /// `--proj-axiom-budget <n>` — projection axiom cap (default 50000; B66).
+    /// `--proj-axiom-budget <n>` — projection axiom cap (default 50000).
     pub proj_axiom_budget: Option<usize>,
-    /// `--uflia-witness-complete` (B66).
+    /// `--uflia-witness-complete`.
     pub uflia_witness_complete: bool,
-    /// `--uflia-witness-parts fill|chain` (B66).
+    /// `--uflia-witness-parts fill|chain`.
     pub uflia_witness_parts: Option<String>,
-    /// `--uflia-fused-detour` (B66).
+    /// `--uflia-fused-detour`.
     pub uflia_fused_detour: bool,
-    /// `--verify-memo` (B66).
+    /// `--verify-memo`.
     pub verify_memo: bool,
-    /// `--pb-eqagg-debug` (B66).
+    /// `--pb-eqagg-debug`.
     pub pb_eqagg_debug: bool,
-    /// `--pb-bnb` — PB branch-and-bound upgrade arm (B66).
+    /// `--pb-bnb` — PB branch-and-bound upgrade arm.
     pub pb_bnb: bool,
-    /// `--no-pb-sls-feasfirst` — disable SLS feasibility-first (B66).
+    /// `--no-pb-sls-feasfirst` — disable SLS feasibility-first.
     pub no_pb_sls_feasfirst: bool,
-    /// `--pb-strict-optimum` (B66).
+    /// `--pb-strict-optimum`.
     pub pb_strict_optimum: bool,
-    /// `--pb-sls-unified` — re-enable the unified SLS loop (B66).
+    /// `--pb-sls-unified` — re-enable the unified SLS loop.
     pub pb_sls_unified: bool,
-    /// `--pb-proof-tap-soft-cap-mib <n>` (B66).
+    /// `--pb-proof-tap-soft-cap-mib <n>`.
     pub pb_proof_tap_soft_cap_mib: Option<u64>,
-    /// `--sls-planted` / `--sls-sweep` — SLS bench harness gates (B66).
+    /// `--sls-planted` / `--sls-sweep` — SLS bench harness gates.
     pub sls_planted: bool,
     /// See `sls_planted`.
     pub sls_sweep: bool,
-    /// `--oll-file <path>` — OLL reference-harness instance (B66).
+    /// `--oll-file <path>` — OLL reference-harness instance.
     pub oll_file: Option<String>,
-    /// `--oll-expect <n>` — OLL reference-harness expectation (B66).
+    /// `--oll-expect <n>` — OLL reference-harness expectation.
     pub oll_expect: Option<String>,
-    /// `--pb-debug-panic-on-incumbent` — fault-injection assert arm (B66).
+    /// `--pb-debug-panic-on-incumbent` — fault-injection assert arm.
     pub pb_debug_panic_on_incumbent: bool,
-    /// `--sat-prune-conflict-experiments <bool>` — tri-state force (B66).
+    /// `--sat-prune-conflict-experiments <bool>` — tri-state force.
     pub sat_prune_conflict_experiments: Option<bool>,
-    /// `--debug-lazy-sync` (B67).
+    /// `--debug-lazy-sync`.
     pub debug_lazy_sync: bool,
-    /// `--debug-fc-sync` (B67).
+    /// `--debug-fc-sync`.
     pub debug_fc_sync: bool,
-    /// `--lra-warm-stats` (B67).
+    /// `--lra-warm-stats`.
     pub lra_warm_stats: bool,
-    /// `--fuzz-verbose` (B67).
+    /// `--fuzz-verbose`.
     pub fuzz_verbose: bool,
-    /// `--certora-trace` (B67).
+    /// `--certora-trace`.
     pub certora_trace: bool,
-    /// `--debug-abv-finite-array` (B67).
+    /// `--debug-abv-finite-array`.
     pub debug_abv_finite_array: bool,
-    /// `--debug-abv-packed-lookup` (B67).
+    /// `--debug-abv-packed-lookup`.
     pub debug_abv_packed_lookup: bool,
-    /// `--debug-ladder` (B67).
+    /// `--debug-ladder`.
     pub debug_ladder: bool,
-    /// `--debug-wgr` (B67).
+    /// `--debug-wgr`.
     pub debug_wgr: bool,
-    /// `--debug-completion-merge` (B67).
+    /// `--debug-completion-merge`.
     pub debug_completion_merge: bool,
-    /// `--debug-arith-oracle` (B67).
+    /// `--debug-arith-oracle`.
     pub debug_arith_oracle: bool,
-    /// `--debug-unwitnessed` (B67).
+    /// `--debug-unwitnessed`.
     pub debug_unwitnessed: bool,
-    /// `--cut-trace` — PB cutting-planes trace (B67).
+    /// `--cut-trace` — PB cutting-planes trace.
     pub cut_trace: bool,
-    /// `--dump-render` — BV blast-lean render dump (B67).
+    /// `--dump-render` — BV blast-lean render dump.
     pub dump_render: bool,
-    /// `--chc-array-tree-refutation` (B68; opt-in arm).
+    /// `--chc-array-tree-refutation` (opt-in arm).
     pub chc_array_tree_refutation: bool,
-    /// `--chc-dont-care-filter` (B68).
+    /// `--chc-dont-care-filter`.
     pub chc_dont_care_filter: bool,
-    /// `--chc-intern` (B68).
+    /// `--chc-intern`.
     pub chc_intern: bool,
-    /// `--chc-array-inv` (B68).
+    /// `--chc-session <0|1|2>` — the `HornSmt` persistent session for the CHC
+    /// engines' Search-lane queries (CHC-COMP 2026 Rung 1). 0 = off (default
+    /// until Rung 4), 1 = session with legacy fall-through on
+    /// unsupported/incomplete queries, 2 = session only.
+    pub chc_session: Option<u8>,
+    /// `--chc-session-strict <l2|full>` — `HornSmt` session harness posture.
+    /// `full` panics on any non-Budget Unknown, any audit disagreement and
+    /// any routing under verification mode; `l2` panics only on the lock-L2
+    /// tripwire (`constructions_in_verification`). Unset = no panics.
+    pub chc_session_strict: Option<String>,
+    /// `--chc-session-audit <n>` — every N-th `HornSmt` session UNSAT is
+    /// re-solved on a fresh `Verification`-lane context; a disagreement is
+    /// counted and the query answers `Unknown`. Unset/0 = off.
+    pub chc_session_audit: Option<u64>,
+    /// `--chc-session-stats` — print the `HornSmt` session's process totals
+    /// (`[CHC-SESSION] ...`) to stderr at the end of the CLI run.
+    pub chc_session_stats: bool,
+    /// `--chc-session-coverage` — emit the Rung-4 `[CHC-SESSION-COVERAGE]`
+    /// census lines.
+    pub chc_session_coverage: bool,
+    /// `--chc-session-trace` — one `[CHC-SESSION-DEMOTION]` stderr line per
+    /// query the router's strict evaluation demoted from the session's Sat.
+    pub chc_session_trace: bool,
+    /// `--chc-session-dump <dir>` — record every routed `HornSmt` session
+    /// query as a self-contained SMT-LIB script plus an `index.tsv` (design
+    /// §10.1).
+    pub chc_session_dump: Option<String>,
+    /// `--chc-session-dump-max <n>` — cap the number of script files
+    /// `--chc-session-dump` writes (default 5000; index rows keep flowing
+    /// past the cap).
+    pub chc_session_dump_max: Option<u64>,
+    /// `--chc-array-inv`.
     pub chc_array_inv: bool,
-    /// `--chc-dt-recursive-prefix` (B68; experimental scalar-prefix depth).
+    /// `--chc-dt-recursive-prefix` (experimental scalar-prefix depth).
     pub chc_dt_recursive_prefix: bool,
-    /// `--interface-diet on|shadow` (B69; unset = off).
+    /// `--interface-diet on|shadow` (unset = off).
     pub interface_diet: Option<String>,
-    /// `--bv-preprocess quick|full` (B69; unset = no preprocessing).
+    /// `--bv-preprocess quick|full` (unset = no preprocessing).
     pub bv_preprocess: Option<String>,
-    /// `--fc-cegar-iters <n>` (B69; default 16).
+    /// `--fc-cegar-iters <n>` (default 16).
     pub fc_cegar_iters: Option<u32>,
-    /// `--int-pigeonhole-enrich-k <n>` (B69; default unbounded).
+    /// `--int-pigeonhole-enrich-k <n>` (default unbounded).
     pub int_pigeonhole_enrich_k: Option<usize>,
-    /// `--ext-row-seed` (B69).
+    /// `--ext-row-seed`.
     pub ext_row_seed: bool,
-    /// `--debug-row-seed` (B69).
+    /// `--debug-row-seed`.
     pub debug_row_seed: bool,
-    /// `--dpll-mint-theory-vars` (B69; opt-in).
+    /// `--dpll-mint-theory-vars` (opt-in).
     pub dpll_mint_theory_vars: bool,
-    /// `--dpll-ite-lift` (B69).
+    /// `--dpll-ite-lift`.
     pub dpll_ite_lift: bool,
-    /// `--euf-bool-arg-repair` (B69).
+    /// `--euf-bool-arg-repair`.
     pub euf_bool_arg_repair: bool,
-    /// `--lra-warm-theory` (B69).
+    /// `--lra-warm-theory`.
     pub lra_warm_theory: bool,
-    /// `--force-array-euf` (B69).
+    /// `--force-array-euf`.
     pub force_array_euf: bool,
-    /// `--ab-maxsat-core-clause` (B70; A/B arm).
+    /// `--ab-maxsat-core-clause` (A/B arm).
     pub ab_maxsat_core_clause: bool,
-    /// `--ab-maxsat-descent-organic-slice` (B70).
+    /// `--ab-maxsat-descent-organic-slice`.
     pub ab_maxsat_descent_organic_slice: bool,
-    /// `--ab-maxsat-kick-gap-abs` (B70).
+    /// `--ab-maxsat-kick-gap-abs`.
     pub ab_maxsat_kick_gap_abs: bool,
-    /// `--ab-maxsat-descent-kick-scale` (B70).
+    /// `--ab-maxsat-descent-kick-scale`.
     pub ab_maxsat_descent_kick_scale: bool,
-    /// `--uflia-arith-decisions` (B72): forward UFLIA arith decision hints to
+    /// `--uflia-arith-decisions`: forward UFLIA arith decision hints to
     /// the arith adapters (default off preserves the historical trajectory).
     pub uflia_arith_decisions: bool,
     /// `--no-skolem-witness-sat` — kill switch for the skolem-witness SAT
@@ -1399,64 +1512,131 @@ pub struct MiscCliFlags {
     /// singleton carrier mint in the EPR singleton SAT chain
     /// (#eu-carrier-mint).
     pub no_singleton_carrier_mint: bool,
-    /// `--lra-float-layer` (B73): opt in to the LRA float pre-solve layer.
+    /// `--lra-float-layer`: opt in to the LRA float pre-solve layer.
     pub lra_float_layer: bool,
-    /// `--str-nf` (B73): string-theory normal-form debug gate.
+    /// `--str-nf`: string-theory normal-form debug gate.
     pub str_nf: bool,
-    /// `--debug-euf-init` (B73): EUF e-graph construction tracing.
+    /// `--debug-euf-init`: EUF e-graph construction tracing.
     pub debug_euf_init: bool,
-    /// `--euf-cong-undo-debug` (B73): EUF congruence-undo tracing.
+    /// `--euf-cong-undo-debug`: EUF congruence-undo tracing.
     pub euf_cong_undo_debug: bool,
-    /// `--euf-diseq-undo-debug` (B73): EUF disequality-undo tracing.
+    /// `--euf-diseq-undo-debug`: EUF disequality-undo tracing.
     pub euf_diseq_undo_debug: bool,
-    /// `--probe-prescreen` (B73): arm the LIA probe batch prescreen.
+    /// `--probe-prescreen`: arm the LIA probe batch prescreen.
     pub probe_prescreen: bool,
-    /// `--lia-probe-qx` (B73): probe minimization mode
+    /// `--lia-probe-qx`: probe minimization mode
     /// (`quickxplain` | `gallop`; default scan).
     pub lia_probe_qx: Option<String>,
-    /// `--probe-stats` (B73): LIA probe statistics to stderr.
+    /// `--probe-stats`: LIA probe statistics to stderr.
     pub probe_stats: bool,
-    /// `--debug-fixed-eqs` (B73): LIA fixed-equality tracing.
+    /// `--debug-fixed-eqs`: LIA fixed-equality tracing.
     pub debug_fixed_eqs: bool,
-    /// `--algebraic-stats` (B73): Nelson-Oppen algebraic statistics.
+    /// `--algebraic-stats`: Nelson-Oppen algebraic statistics.
     pub algebraic_stats: bool,
-    /// `--debug-arr-extract` (B73): array model extraction tracing.
+    /// `--debug-arr-extract`: array model extraction tracing.
     pub debug_arr_extract: bool,
-    /// `--weq5-shadow-dump` (B73): weak-equivalence shadow differential dump.
+    /// `--weq5-shadow-dump`: weak-equivalence shadow differential dump.
     pub weq5_shadow_dump: bool,
-    /// `--ic3-lane-debug` (B74): TRUST ic3-lane stderr tracing.
+    /// `--ic3-lane-debug`: TRUST ic3-lane stderr tracing.
     pub ic3_lane_debug: bool,
-    /// `--ic3-lane-dump` (B74): append ic3-lane traffic to this path.
+    /// `--ic3-lane-dump`: append ic3-lane traffic to this path.
     pub ic3_lane_dump: Option<String>,
-    /// `--ic3-lane-noslice` (B74): disable the COI slice (A/B; slice is sound).
+    /// `--ic3-lane-noslice`: disable the COI slice (A/B; slice is sound).
     pub ic3_lane_noslice: bool,
-    /// `--reve-debug` (B74): REVE invariant-sampling stderr tracing.
+    /// `--reve-debug`: REVE invariant-sampling stderr tracing.
     pub reve_debug: bool,
-    /// `--max-propagate-rounds` (B74): extension spin guard override (default 50M).
+    /// `--max-propagate-rounds`: extension spin guard override (default 50M).
     pub max_propagate_rounds: Option<u64>,
-    /// `--lra-cond-trail` (B75): experimental LRA conditional bound trail.
+    /// `--lra-cond-trail`: experimental LRA conditional bound trail.
     pub lra_cond_trail: bool,
-    /// `--euf-inc-neg-pop` (B77): opt-in; 2026-08-20 A/B was not a win.
+    /// `--lra-unit-pivot-pref` (#lra-unit-pivot-pref): experimental simplex
+    /// entering-variable tie-break preferring ±1 coefficients. Changes pivot
+    /// paths (models/certificates), never verdicts; default OFF until a
+    /// corpus diff clears it.
+    pub lra_unit_pivot_pref: bool,
+    /// `--euf-inc-neg-pop`: opt-in; 2026-08-20 A/B was not a win.
     /// (+2/314 limit-edge runs; median unchanged; see the dated EUF A/B report.)
     pub euf_inc_neg_pop: bool,
-    /// `--nra-diag` (B77): NRA ICP diagnostics.
+    /// `--nra-diag`: NRA ICP diagnostics.
     pub nra_diag: bool,
-    /// `--nra-grid-probe` (B77): NRA ICP grid probe diagnostics.
+    /// `--nra-grid-probe`: NRA ICP grid probe diagnostics.
     pub nra_grid_probe: bool,
-    /// `--nra-witness <ASSIGNMENTS>` (B77): inline rationals such as `x=1/2,y=-3`.
+    /// `--nra-witness <ASSIGNMENTS>`: inline rationals such as `x=1/2,y=-3`.
     pub nra_witness: Option<String>,
-    /// `--quant-relevance <bool>` (B79): e-matching relevance admission layer
+    /// `--quant-relevance <bool>`: e-matching relevance admission layer
     /// (measured 2026-08-19: real flood control, no verdict conversions yet —
     /// default OFF; see ematching/relevance.rs).
     pub quant_relevance: Option<bool>,
-    /// `--quant-relevance-k <n>` (B79): per-round admission budget.
+    /// `--quant-relevance-k <n>`: per-round admission budget.
     pub quant_relevance_k: Option<usize>,
-    /// `--quant-relevance-min <n>` (B79): flood threshold.
+    /// `--quant-relevance-min <n>`: flood threshold.
     pub quant_relevance_min: Option<usize>,
-    /// `--quant-relevance-model <bool>` (B79): model-signal ranking.
+    /// `--quant-relevance-model <bool>`: model-signal ranking.
     pub quant_relevance_model: Option<bool>,
-    /// `--quant-relevance-debug` (B79): per-round admission trace.
+    /// `--quant-relevance-debug`: per-round admission trace.
     pub quant_relevance_debug: bool,
+    /// The proof-cycle-shedding posture the CLI's own executor EFFECTIVELY
+    /// runs with (T8, the development design notes): `--competition` /
+    /// `AY_COMPETITION`, `--no-proof` or `--z3-mode` selected shedding AND no
+    /// proof or certificate demand is in scope (`--proof`, `--strict-proofs`,
+    /// `--self-check`, `--verify-firewall`, `--emit-firewall-lean`,
+    /// `--verify-proof`, `--chc-checked-replay`). Library engines that build
+    /// executors for their own SEARCH queries — the CHC engines' SMT queries,
+    /// whose verdicts only guide the search and are re-verified at the CHC
+    /// level before anything is printed — read it so their per-query posture
+    /// matches the CLI executor's (`Executor::set_competition_mode`) instead
+    /// of paying the certified cycle on verdicts nothing publishes. `false`
+    /// for a plain solve, for every certificate-demanding lane, and for every
+    /// library consumer that never installs CLI flags.
+    pub search_executor_sheds_proof_cycle: bool,
+    /// `--z3-mode`: stderr stays as empty as z3's, so the library's own
+    /// stderr diagnostics (`MODEL-UNCONFIRMED`, the partial-model note, the
+    /// `[AY SOUNDNESS GATE]` banner) are not written. No verdict or search
+    /// changes.
+    pub z3_transcript: bool,
+    /// `--engine=shadow` — measurement only (design `cdclt-engine.md` §10.1):
+    /// after each top-level QF_LRA / QF_RDL / QF_IDL / QF_LIA check-sat, run the
+    /// CDCL(T) kernel (`ay-cdclt`) on the lane's dispatch window with its own
+    /// budget and record both verdicts. The kernel's answer is never printed.
+    pub engine_shadow: bool,
+    /// `--engine-shadow-log=FILE` — append one JSON row per shadowed
+    /// check-sat to FILE.
+    pub engine_shadow_log: Option<String>,
+    /// `--engine=shadow:theory-branching` — the shadow kernel with
+    /// theory-aware branching on (design §3.8, measured off by default).
+    pub engine_shadow_theory_branching: bool,
+    /// `--engine=shadow:simplex` — the shadow kernel without its
+    /// difference-logic sub-module: every arithmetic check runs the simplex
+    /// (the control arm for measuring that sub-module).
+    pub engine_shadow_simplex_only: bool,
+    /// `--engine=shadow:lia-bcp-implied` — the shadow kernel's integer
+    /// simplex derives implied bounds during BCP-time checks too (the
+    /// control arm; off by default).
+    pub engine_shadow_lia_bcp_implied: bool,
+    /// `--engine=shadow:sat-default` — the shadow kernel with its own search
+    /// profile (ay-sat's default, KC25) instead of the lane-parity profile
+    /// the shadow uses to compare the kernel with the lanes.
+    pub engine_shadow_sat_default: bool,
+    /// `--engine=shadow:hub-relevancy` — the shadow kernel runs its relevancy
+    /// service (KC21) and hands the search only relevant hub propagations.
+    pub engine_shadow_hub_relevancy: bool,
+    /// The kernel's own budget per shadowed check-sat, in milliseconds: the
+    /// CLI's `--timeout`, so the kernel gets what the lane got.
+    pub engine_shadow_budget_ms: Option<u64>,
+    /// `--engine-shadow-proofs=DIR` — the shadow kernel records its proof
+    /// while it searches (design D3): it runs on the authored assertions, and
+    /// every `unsat` answer's refutation is assembled, checked by AY's strict
+    /// checker and written to DIR as an Alethe document. Measurement only.
+    pub engine_shadow_proofs: Option<String>,
+    /// `--engine-shadow-authored` — the shadow kernel runs on the authored
+    /// assertions (as `--engine-shadow-proofs` does) without recording: the
+    /// control that prices the recording. Measurement only.
+    pub engine_shadow_authored: bool,
+    /// `--engine=lane` — measurement only: every family keeps its lane, as
+    /// before the kernel took QF_LRA in the `--z3-mode` posture
+    /// (`executor/engine_route.rs`). `--engine=shadow` implies it, since the
+    /// shadow compares the kernel with the lane.
+    pub engine_lanes: bool,
 }
 
 /// Global miscellaneous CLI flags, initialized once per process.
@@ -1467,10 +1647,8 @@ static GLOBAL_MISC_CLI_FLAGS: OnceLock<MiscCliFlags> = OnceLock::new();
 /// Used as the back-compat fallback when the CLI has not called
 /// [`set_global_misc_cli_flags`] (e.g., library consumers, older callers).
 fn init_misc_cli_flags_from_env() -> MiscCliFlags {
-    // B24: --dpll-diagnostic-file is the carrier; env fallback retired.
     let dpll_diagnostic_file = None;
-    let dpll_diagnostic_enabled = false; // B24: --dpll-diagnostic is the carrier; env retired.
-                                         // B72: --dpll-trace-file is the carrier; env fallback deleted.
+    let dpll_diagnostic_enabled = false;
     let dpll_trace_file = None;
     MiscCliFlags {
         dump_auflia_assertions: false,
@@ -1482,7 +1660,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         dpll_diagnostic_file,
         dpll_diagnostic_enabled,
         dpll_trace_file,
-        // B17/B32: CLI-only; retired A/B env spellings are intentionally ignored.
+        // CLI-only; retired A/B env spellings are intentionally ignored.
         maxsat_no_tot_eqs: false,
         maxsat_no_bce_revert: false,
         maxsat_no_am1_maxcover: false,
@@ -1504,8 +1682,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         xor_allow_large: false,
         xor_allow_residual: false,
         xor_allow_unadmitted: false,
-        // B74: --phase-trace is the carrier; the env fallback (added against
-        // a family pattern B72 deleted) is retired with the rest of it.
         phase_trace: false,
         debug_cert: false,
         debug_qmg: false,
@@ -1519,6 +1695,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         debug_no_terms: None,
         proof_introspect: None,
         proof_introspect_probe: None,
+        probe_sat_variable: None,
         str_w4_work: None,
         fmq_lane_budget_ms: None,
         fmq_probe_ms: None,
@@ -1533,6 +1710,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         sat_l0_unsat_trace: false,
         sat_symmetry_trace: false,
         sat_mem_probe: false,
+        sat_bve_trace: 0,
         ab_triage_clause: None,
         ab_triage_var: None,
         ab_triage_probe: None,
@@ -1560,7 +1738,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         lia_instrument: false,
         probe_stats_every: None,
         str_nf_closures: None,
-        // B74: --trace-cegqi-attr is the carrier; env fallback retired.
         trace_cegqi_attr: false,
         debug_read_pin: false,
         f1_diag: false,
@@ -1587,8 +1764,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         qfax_combiner_route: false,
         qfax_cegar: false,
         qfax_lanes_debug: false,
-        // B74: --probe-strict-check is the carrier; env fallback retired
-        // (test runs install the typed carrier via `misc_test_override`).
+        // Test runs install --probe-strict-check via `misc_test_override`.
         probe_strict_check: false,
         probe_cert_reject: false,
         uflia_witness_debug: false,
@@ -1606,6 +1782,22 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         no_consequence_replay: false,
         no_quantified_shedding_yield: false,
         no_negated_exists_ground_inst: false,
+        no_qlra_cegqi: false,
+        no_eq_qe_lane: false,
+        no_qsat: false,
+        no_qlra_nested: false,
+        no_authored_skeleton_refutation: false,
+        no_authored_fold_identity: false,
+        no_probe_ite_lift_promoter: false,
+        no_alpha_quantifier_sharing: false,
+        no_quantifier_proxy_abstraction: false,
+        no_skolem_guarded_proxy_instances: false,
+        no_quantifier_guarded_instances: false,
+        quantifier_guarded_enumerative: false,
+        no_quantifier_guarded_enumerative: false,
+        no_quantifier_ce_free_resolve: false,
+        no_quantifier_guard_seeds: false,
+        no_ground_first: false,
         no_ground_conflict_decomp: false,
         no_fp_incremental: false,
         vacuous_marker_narrow: false,
@@ -1643,6 +1835,14 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         chc_array_tree_refutation: false,
         chc_dont_care_filter: false,
         chc_intern: false,
+        chc_session: None,
+        chc_session_strict: None,
+        chc_session_audit: None,
+        chc_session_stats: false,
+        chc_session_coverage: false,
+        chc_session_trace: false,
+        chc_session_dump: None,
+        chc_session_dump_max: None,
         chc_array_inv: false,
         chc_dt_recursive_prefix: false,
         interface_diet: None,
@@ -1660,11 +1860,10 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         ab_maxsat_descent_organic_slice: false,
         ab_maxsat_kick_gap_abs: false,
         ab_maxsat_descent_kick_scale: false,
-        // B72: --uflia-arith-decisions is the carrier; no env fallback.
         uflia_arith_decisions: false,
         no_skolem_witness_sat: false,
         no_singleton_carrier_mint: false,
-        // B73: the theory-crate diagnostics are CLI-carried; no env fallbacks.
+        // The theory-crate diagnostics are CLI-carried; no env fallbacks.
         lra_float_layer: false,
         str_nf: false,
         debug_euf_init: false,
@@ -1677,15 +1876,15 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         algebraic_stats: false,
         debug_arr_extract: false,
         weq5_shadow_dump: false,
-        // B74: the chc/dpll research diagnostics are CLI-carried.
+        // The chc/dpll research diagnostics are CLI-carried.
         ic3_lane_debug: false,
         ic3_lane_dump: None,
         ic3_lane_noslice: false,
         reve_debug: false,
         max_propagate_rounds: None,
-        // B75: --lra-cond-trail is the carrier; no env fallback.
         lra_cond_trail: false,
-        // B77: the reintroduced euf/nra experiment + diagnostics reads.
+        lra_unit_pivot_pref: false,
+        // The euf/nra experiment and diagnostic flags.
         euf_inc_neg_pop: false,
         nra_diag: false,
         nra_grid_probe: false,
@@ -1695,12 +1894,25 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         quant_relevance_min: None,
         quant_relevance_model: None,
         quant_relevance_debug: false,
+        search_executor_sheds_proof_cycle: false,
+        z3_transcript: false,
+        engine_shadow: false,
+        engine_shadow_log: None,
+        engine_shadow_budget_ms: None,
+        engine_shadow_theory_branching: false,
+        engine_shadow_simplex_only: false,
+        engine_shadow_lia_bcp_implied: false,
+        engine_shadow_sat_default: false,
+        engine_shadow_hub_relevancy: false,
+        engine_shadow_proofs: None,
+        engine_shadow_authored: false,
+        engine_lanes: false,
     }
 }
 
 /// Returns a reference to the global miscellaneous CLI flags.
 ///
-/// On first call, initializes from `AY_*` env vars for backward compat.
+/// Without a prior `set_global_misc_cli_flags`, the first call uses defaults + `AY_SAT_VARIANT`.
 #[inline]
 pub fn misc_cli_flags() -> &'static MiscCliFlags {
     if let Some(overridden) = misc_test_override::MISC_TEST_OVERRIDE.with(std::cell::Cell::get) {
@@ -1709,7 +1921,19 @@ pub fn misc_cli_flags() -> &'static MiscCliFlags {
     GLOBAL_MISC_CLI_FLAGS.get_or_init(init_misc_cli_flags_from_env)
 }
 
-/// In-process per-test override seam for [`misc_cli_flags`] (B41; the same
+/// Read already captured process configuration without initializing it.
+///
+/// Bounded query constructors use this to refuse before a first-use environment
+/// read could allocate unmetered input. The command layer may capture these
+/// flags with `misc_cli_flags` or a setter before it creates a query owner.
+#[inline]
+pub fn captured_misc_cli_flags() -> Option<&'static MiscCliFlags> {
+    misc_test_override::MISC_TEST_OVERRIDE
+        .with(std::cell::Cell::get)
+        .or_else(|| GLOBAL_MISC_CLI_FLAGS.get())
+}
+
+/// In-process per-test override seam for [`misc_cli_flags`] (the same
 /// shape as `ay_pb_core::ab_switches::TestOverride`, but cross-crate — the
 /// steering tests live in consumer crates, so `cfg(test)` here cannot serve
 /// them). Not a public API.

@@ -68,9 +68,9 @@ pub fn tseitin(graph: &Graph, parities: &[bool]) -> Cnf {
     let get_edge_var = |u: usize, v: usize| -> Var { edge_to_var[&(u.min(v), u.max(v))] };
 
     // Estimate clause count (each vertex with k neighbors contributes 2^{k-1} clauses)
-    let mut total_clauses = 0;
+    let mut total_clauses: usize = 0;
     for (v, &parity) in parities.iter().enumerate() {
-        total_clauses += xor_clause_count(graph.degree(v), parity);
+        total_clauses = total_clauses.saturating_add(xor_clause_count(graph.degree(v), parity));
     }
 
     let mut cnf = Cnf::new_with_capacity(num_edge_vars as u32, total_clauses);
@@ -109,12 +109,13 @@ pub fn graph_coloring(graph: &Graph, k: usize) -> Cnf {
     let var = |vertex: usize, color: usize| -> Var { Var::new((vertex * k + color) as u32) };
 
     let edges: Vec<_> = graph.edges().collect();
-    let clause_count = n + edges.len() * k;
-    let mut cnf = Cnf::new_with_capacity((n * k) as u32, clause_count);
+    // Capacity estimate only.
+    let clause_count = n.saturating_add(edges.len().saturating_mul(k));
+    let mut cnf = Cnf::new_with_capacity(declared_var_count(n, k, 1), clause_count);
 
     // At-least-one: each vertex has some color
     for v in 0..n {
-        let clause: Vec<Lit> = (0..k).map(|c| Lit::positive(var(v, c))).collect();
+        let clause = positive_clause(k, |c| var(v, c));
         cnf.add_clause(&clause);
     }
 
@@ -148,12 +149,12 @@ pub fn clique_coloring(graph: &Graph, k: usize) -> Cnf {
     let clique_var = |v: usize, i: usize| -> Var { Var::new((v * k + i) as u32) };
     let color_var = |v: usize, c: usize| -> Var { Var::new((n * k + v * k + c) as u32) };
 
-    let mut cnf = Cnf::new_with_capacity((2 * n * k) as u32, 0);
+    let mut cnf = Cnf::new_with_capacity(declared_var_count(n, k, 2), 0);
 
     // CLIQUE PART
     // Each position i in the clique is filled by some vertex
     for i in 0..k {
-        let clause: Vec<Lit> = (0..n).map(|v| Lit::positive(clique_var(v, i))).collect();
+        let clause = positive_clause(n, |v| clique_var(v, i));
         cnf.add_clause(&clause);
     }
 
@@ -188,7 +189,7 @@ pub fn clique_coloring(graph: &Graph, k: usize) -> Cnf {
     // COLORING PART (complement graph)
     // Each vertex has some color
     for v in 0..n {
-        let clause: Vec<Lit> = (0..k).map(|c| Lit::positive(color_var(v, c))).collect();
+        let clause = positive_clause(k, |c| color_var(v, c));
         cnf.add_clause(&clause);
     }
 
@@ -207,6 +208,24 @@ pub fn clique_coloring(graph: &Graph, k: usize) -> Cnf {
     }
 
     cnf
+}
+
+/// Declared variable count `blocks * n * k`, saturating at `u32::MAX` when
+/// the product does not fit the CNF header's variable range.
+fn declared_var_count(n: usize, k: usize, blocks: usize) -> u32 {
+    let count = blocks.saturating_mul(n).saturating_mul(k);
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The all-positive clause `var(0) or ... or var(width - 1)`.
+fn positive_clause(width: usize, var: impl Fn(usize) -> Var) -> Vec<Lit> {
+    let mut clause = Vec::new();
+    // A failed reservation only forgoes the pre-sizing.
+    let _ = clause.try_reserve_exact(width);
+    for idx in 0..width {
+        clause.push(Lit::positive(var(idx)));
+    }
+    clause
 }
 
 #[cfg(test)]

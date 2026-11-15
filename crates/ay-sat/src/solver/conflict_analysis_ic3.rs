@@ -29,6 +29,9 @@
 
 use super::*;
 
+mod counted;
+mod resolution;
+
 impl Solver {
     /// IC3-optimized 1UIP conflict analysis (#8569 Gap 5).
     ///
@@ -46,165 +49,11 @@ impl Solver {
         conflict_ref: ClauseRef,
     ) -> Option<ConflictResult> {
         self.conflict.clear(&mut self.var_data);
-
-        debug_assert!(
-            self.decision_level > 0,
-            "BUG: IC3 conflict analysis called at decision level 0"
-        );
-
-        let mut counter: u32 = 0;
-        let mut p: Option<Literal> = None;
-        let mut index = self.trail.len();
-
-        let mut current_clause_offset = conflict_ref.0 as usize;
-        let mut current_clause_len = self.arena.len_of(current_clause_offset);
-
-        loop {
-            let clause_len = current_clause_len;
-
-            // Process literals in the current clause (conflict or reason).
-            // Pure 1UIP: no OTFS accounting, no tick accounting, no clause bumping.
-            for i in 0..clause_len {
-                let lit = self.arena.literal_at(current_clause_offset, i);
-                if let Some(p_lit) = p {
-                    if lit == p_lit {
-                        continue;
-                    }
-                }
-
-                let var_idx = lit.variable().index();
-                let var_level = self.var_data[var_idx].level;
-
-                if !self.conflict.is_seen(var_idx, &self.var_data) {
-                    self.conflict.mark_seen(var_idx, &mut self.var_data);
-
-                    debug_assert!(
-                        var_level <= self.decision_level,
-                        "BUG: IC3 analyzed literal var={} at level {} exceeds decision level {}",
-                        var_idx,
-                        var_level,
-                        self.decision_level,
-                    );
-
-                    if var_level > 0 {
-                        self.track_level_seen(var_level, var_idx);
-                    }
-
-                    if var_level == self.decision_level {
-                        counter += 1;
-                    } else if var_level > 0 {
-                        self.conflict.add_to_learned(lit);
-                    }
-                    // Level-0 literals: no LRAT collection needed (disabled).
-                }
-            }
-
-            // Backward scan for the next seen literal at the current level.
-            let trail_len = self.trail.len();
-            if index > trail_len {
-                index = trail_len;
-            }
-            if index == 0 {
-                self.stats.trail_exhaustion_bailouts += 1;
-                self.conflict.clear(&mut self.var_data);
-                self.clear_level_seen();
-                return None;
-            }
-            loop {
-                index -= 1;
-                let trail_lit = self.trail[index];
-                let var_idx = trail_lit.variable().index();
-                if self.conflict.is_seen(var_idx, &self.var_data)
-                    && self.var_data[var_idx].level == self.decision_level
-                {
-                    p = Some(trail_lit);
-                    break;
-                }
-                if index == 0 {
-                    self.stats.trail_exhaustion_bailouts += 1;
-                    self.conflict.clear(&mut self.var_data);
-                    self.clear_level_seen();
-                    return None;
-                }
-            }
-
-            debug_assert!(
-                counter > 0,
-                "BUG: IC3 analysis counter underflow before resolving {p:?} \
-                 (counter={counter}, decision_level={})",
-                self.decision_level,
-            );
-            if counter == 0 {
-                // Release-mode guard: prevent u32 underflow.
-                self.stats.trail_exhaustion_bailouts += 1;
-                self.conflict.clear(&mut self.var_data);
-                self.clear_level_seen();
-                return None;
-            }
-            counter -= 1;
-
-            if counter == 0 {
-                break; // Found 1UIP
-            }
-
-            // Resolve with the reason clause of the current literal.
-            let p_var = p
-                .expect("IC3 conflict analysis: p set for reason lookup")
-                .variable();
-
-            let reason_kind = self.var_reason_kind(p_var.index());
-            match reason_kind {
-                ReasonKind::Decision => {
-                    self.conflict.add_to_learned(
-                        p.expect("IC3 conflict analysis: p for decision").negated(),
-                    );
-                    current_clause_len = 0;
-                    continue;
-                }
-                ReasonKind::BinaryLiteral(reason_lit) => {
-                    // Binary literal reason: resolve inline without arena access.
-                    let var_idx = reason_lit.variable().index();
-                    let var_level = self.var_data[var_idx].level;
-
-                    if !self.conflict.is_seen(var_idx, &self.var_data) {
-                        self.conflict.mark_seen(var_idx, &mut self.var_data);
-
-                        if var_level > 0 {
-                            self.track_level_seen(var_level, var_idx);
-                        }
-
-                        if var_level == self.decision_level {
-                            counter += 1;
-                        } else if var_level > 0 {
-                            self.conflict.add_to_learned(reason_lit);
-                        }
-                    }
-
-                    current_clause_len = 0;
-                    continue;
-                }
-                ReasonKind::LazyTheory(_lazy_idx) => {
-                    // Should not occur in IC3 mode (no theory extension).
-                    debug_assert!(
-                        false,
-                        "BUG: LazyTheory reason in IC3 conflict analysis (var={}, lazy_idx={})",
-                        p.map_or(0, |l| l.variable().index()),
-                        _lazy_idx,
-                    );
-                    self.conflict
-                        .add_to_learned(p.expect("IC3: p for lazy decision").negated());
-                    current_clause_len = 0;
-                    continue;
-                }
-                ReasonKind::Clause(reason_ref) => {
-                    // No bump_clause, no mark_streaming_core, no tick accounting.
-                    current_clause_offset = reason_ref.0 as usize;
-                    current_clause_len = self.arena.len_of(current_clause_offset);
-                }
-            }
-        }
-
-        let uip = p.expect("IC3 conflict analysis: 1UIP found").negated();
+        let uip = match self.resolve_ic3_first_uip(conflict_ref, &resolution::Ordinary) {
+            Ok(Some(uip)) => uip,
+            Ok(None) => return None,
+            Err(never) => match never {},
+        };
         Some(self.finalize_conflict_analysis_ic3(uip))
     }
 
@@ -416,6 +265,11 @@ impl Solver {
                 // NO_REASON with level > 0 means this was a decision.
                 // Decisions in learned clauses are valid (they become the
                 // UIP or are below the backtrack level).
+                continue;
+            }
+            if self.var_data[vi].is_lazy_theory_reason() {
+                // Lazy theory reason (#8467): `reason` is a lazy-table index,
+                // not an arena offset, so there is no clause to inspect.
                 continue;
             }
             if is_binary_literal_reason(reason) {

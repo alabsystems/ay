@@ -53,7 +53,7 @@ impl DratChecker {
         if self.inconsistent {
             return;
         }
-        self.stats.additions += 1;
+        self.stats.additions = self.stats.additions.saturating_add(1);
         self.add_clause_internal(clause);
     }
 

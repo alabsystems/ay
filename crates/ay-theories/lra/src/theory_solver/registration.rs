@@ -127,6 +127,7 @@ impl LraSolver {
                 self.var_to_atoms.entry(v).or_default().push(term);
             }
             self.registered_atoms.insert(term);
+            self.note_phase_state_change(); // `suggest_phase` now evaluates this atom (#nonlinear-phase-hints)
             self.decision_index_note_registered(term, info.is_eq, info.is_distinct);
             return;
         }
@@ -150,6 +151,7 @@ impl LraSolver {
                 self.unassigned_atom_count[vi] += 1;
             }
             self.registered_atoms.insert(term);
+            self.note_phase_state_change(); // `suggest_phase` now evaluates this atom (#nonlinear-phase-hints)
             self.decision_index_note_registered(term, info.is_eq, info.is_distinct);
             return;
         }
@@ -211,7 +213,9 @@ impl LraSolver {
                 );
             }
             self.atom_index.entry(var).or_default().push(atom_ref);
+            self.atom_index_atom_count += 1;
             self.registered_atoms.insert(term);
+            self.note_phase_state_change(); // `suggest_phase` now evaluates this atom (#nonlinear-phase-hints)
             self.decision_index_note_registered(term, info.is_eq, info.is_distinct);
             // #8352: Invalidate JIT propagators — new atom changes the atom_index.
             self.theory_prop_jit_compiled = false;
@@ -257,6 +261,7 @@ impl LraSolver {
             }
             self.unassigned_atom_count[si] += 1;
             self.atom_index.entry(slack).or_default().push(atom_ref);
+            self.atom_index_atom_count += 1;
             let compound_ref = CompoundAtomRef {
                 term,
                 slack,
@@ -287,6 +292,7 @@ impl LraSolver {
             // generic reverse map is kept as a fallback/recount structure.
             self.var_to_atoms.entry(slack).or_default().push(term);
             self.registered_atoms.insert(term);
+            self.note_phase_state_change(); // `suggest_phase` now evaluates this atom (#nonlinear-phase-hints)
             self.decision_index_note_registered(term, info.is_eq, info.is_distinct);
             // #8352: Invalidate JIT propagators — new atom changes the atom_index.
             self.theory_prop_jit_compiled = false;
@@ -366,6 +372,7 @@ impl LraSolver {
                 );
             }
             self.atom_index.entry(var).or_default().push(atom_ref);
+            self.atom_index_atom_count += 1;
             self.theory_prop_jit_compiled = false;
         } else if info.expr.coeffs.len() > 1 {
             // Compound atom
@@ -397,6 +404,7 @@ impl LraSolver {
             }
             self.unassigned_atom_count[si] += 1;
             self.atom_index.entry(slack).or_default().push(atom_ref);
+            self.atom_index_atom_count += 1;
             let compound_ref = CompoundAtomRef {
                 term,
                 slack,
@@ -435,10 +443,7 @@ impl LraSolver {
         }
         // Only decrement unassigned count if this is a new assertion (not re-assertion).
         // Use entry API to avoid double HashMap lookup (#perf).
-        #[cfg(not(kani))]
         use hashbrown::hash_map::Entry;
-        #[cfg(kani)]
-        use std::collections::btree_map::Entry;
         let is_new = match self.asserted.entry(term) {
             Entry::Vacant(e) => {
                 e.insert(val);
@@ -453,6 +458,7 @@ impl LraSolver {
                 let old_val = *e.get();
                 if old_val != val {
                     e.insert(val);
+                    self.asserted_value_flips = self.asserted_value_flips.wrapping_add(1);
                 }
                 false
             }
@@ -489,7 +495,7 @@ impl LraSolver {
         // dirty is NOT set. This is the fast path for same-value
         // re-assertions that are already fully processed.
         if !is_new && self.bound_atoms.contains(&(term, val)) {
-            self.stats.assert_dirty_skips += 1;
+            self.stats.assert_dirty_skips = self.stats.assert_dirty_skips.saturating_add(1);
         }
         // Decrement unassigned atom count for ALL variables in this atom (#4919 Phase D).
         // Matches the register_atom increment which counts all atoms (single + compound).
@@ -498,21 +504,16 @@ impl LraSolver {
             if let Some(Some(info)) = self.atom_cache.get(&term) {
                 if !info.is_eq && !info.is_distinct {
                     for &(v, _) in &info.expr.coeffs {
-                        let vi = v as usize;
-                        if vi < self.unassigned_atom_count.len()
-                            && self.unassigned_atom_count[vi] > 0
-                        {
-                            self.unassigned_atom_count[vi] -= 1;
+                        // Counts stop at zero; an untracked variable is skipped.
+                        if let Some(count) = self.unassigned_atom_count.get_mut(v as usize) {
+                            *count = count.saturating_sub(1);
                         }
                     }
                     // Also decrement slack's count for compound atoms (#4919).
                     // Precomputed compound_slack avoids per-assertion Vec alloc + sort.
                     if let Some(slack) = info.compound_slack {
-                        let si = slack as usize;
-                        if si < self.unassigned_atom_count.len()
-                            && self.unassigned_atom_count[si] > 0
-                        {
-                            self.unassigned_atom_count[si] -= 1;
+                        if let Some(count) = self.unassigned_atom_count.get_mut(slack as usize) {
+                            *count = count.saturating_sub(1);
                         }
                     }
                 }

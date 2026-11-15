@@ -10,6 +10,8 @@ use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+mod bounded;
+
 /// Unified proof output that can be DRAT, LRAT or VeriPB format.
 ///
 /// This enum allows the solver to write proofs in any of them while maintaining
@@ -43,6 +45,27 @@ impl ProofOutput {
     /// Create a new VeriPB proof output. VeriPB has no binary encoding.
     pub fn veripb(writer: impl Write + Send + 'static) -> Self {
         Self::Veripb(VeripbWriter::new(BoxedWriter::new(writer)))
+    }
+
+    /// Tell a VeriPB output the formula's clause-line count (see
+    /// `VeripbWriter::set_original_constraints`); other formats ignore it.
+    pub fn set_veripb_original_clauses(&mut self, num_original_clauses: u64) {
+        if let Self::Veripb(writer) = self {
+            writer.set_original_constraints(num_original_clauses);
+        }
+    }
+
+    /// A VeriPB proof output that knows the formula's clause count, so its
+    /// derived constraints are deleted by id (`del id <n> ;`) rather than by
+    /// repeating the clause (`del spec`).
+    pub fn veripb_with_original_clauses(
+        writer: impl Write + Send + 'static,
+        num_original_clauses: u64,
+    ) -> Self {
+        Self::Veripb(VeripbWriter::with_original_constraints(
+            BoxedWriter::new(writer),
+            num_original_clauses,
+        ))
     }
 
     /// Create a new DRAT binary proof output
@@ -84,6 +107,76 @@ impl ProofOutput {
     /// Check if this is an LRAT proof
     pub fn is_lrat(&self) -> bool {
         matches!(self, Self::Lrat(_))
+    }
+
+    /// `--sat-veripb-hints`: record formula clause `id` for hint lookup (see
+    /// `VeripbWriter::note_original`); other formats ignore it.
+    pub fn veripb_note_original(&mut self, clause: &[Literal], id: u64) {
+        if let Self::Veripb(writer) = self {
+            writer.note_original(clause, id);
+        }
+    }
+
+    /// VeriPB `red` steps written with a CakePB anchor (see
+    /// `VeripbWriter::anchored_reds`); 0 for other formats.
+    pub fn veripb_anchored_reds(&self) -> u64 {
+        match self {
+            Self::Veripb(writer) => writer.anchored_reds(),
+            Self::Drat(_) | Self::Lrat(_) => 0,
+        }
+    }
+
+    /// VeriPB collection steps for fresh variables (see
+    /// `VeripbWriter::fresh_collections`); 0 for other formats.
+    pub fn veripb_fresh_collections(&self) -> u64 {
+        match self {
+            Self::Veripb(writer) => writer.fresh_collections(),
+            Self::Drat(_) | Self::Lrat(_) => 0,
+        }
+    }
+
+    /// The VeriPB id of a live constraint with content `clause`, if certain
+    /// (see `VeripbWriter::constraint_id`); `None` for other formats.
+    pub fn veripb_constraint_id(&mut self, clause: &[Literal]) -> Option<u64> {
+        match self {
+            Self::Veripb(writer) => writer.constraint_id(clause),
+            Self::Drat(_) | Self::Lrat(_) => None,
+        }
+    }
+
+    /// [`Self::veripb_constraint_id`] by the clause's content key
+    /// (`VeripbWriter::constraint_id_by_key`).
+    pub fn veripb_constraint_id_by_key(&self, key: u64) -> Option<u64> {
+        match self {
+            Self::Veripb(writer) => writer.constraint_id_by_key(key),
+            Self::Drat(_) | Self::Lrat(_) => None,
+        }
+    }
+
+    /// Annotated RUP on a VeriPB output (`VeripbWriter::add_rup`). It is a
+    /// VeriPB rule only: any other format refuses it rather than write a step
+    /// without the hints it would need.
+    pub fn add_veripb_rup(&mut self, clause: &[Literal], hints: &[u64]) -> io::Result<()> {
+        match self {
+            Self::Veripb(writer) => writer.add_rup(clause, hints),
+            Self::Drat(_) | Self::Lrat(_) => {
+                Err(io::Error::other("annotated RUP is a VeriPB proof step"))
+            }
+        }
+    }
+
+    /// A fresh variable's clauses (x ∨ f_j) through one pseudo-Boolean
+    /// definition (`VeripbWriter::add_conjunction_dividers`); `Ok(false)`,
+    /// nothing written, on any other format.
+    pub fn add_veripb_conjunction_dividers(
+        &mut self,
+        fresh: Literal,
+        factors: &[Literal],
+    ) -> io::Result<bool> {
+        match self {
+            Self::Veripb(writer) => writer.add_conjunction_dividers(fresh, factors),
+            Self::Drat(_) | Self::Lrat(_) => Ok(false),
+        }
     }
 
     /// Check if this is a VeriPB proof.
@@ -202,17 +295,7 @@ impl ProofOutput {
         clause: &[Literal],
         hints: &[u64],
     ) -> io::Result<u64> {
-        match self {
-            Self::Drat(writer) => {
-                writer.add(clause)?;
-                Ok(0)
-            }
-            Self::Veripb(writer) => {
-                writer.add(clause)?;
-                Ok(0)
-            }
-            Self::Lrat(writer) => writer.add_bounded_prevalidated_rup(clause, hints),
-        }
+        self.add_bounded_prevalidated_rup_with_cancellation(clause, hints, &|| true)
     }
 
     /// Emit a pre-assigned bounded-producer positive-RUP addition.
@@ -222,12 +305,12 @@ impl ProofOutput {
         clause: &[Literal],
         hints: &[i64],
     ) -> io::Result<()> {
-        match self {
-            Self::Drat(_) | Self::Veripb(_) => Ok(()),
-            Self::Lrat(writer) => {
-                writer.add_with_id_bounded_prevalidated_rup(clause_id, clause, hints)
-            }
-        }
+        self.add_with_id_bounded_prevalidated_rup_with_cancellation(
+            clause_id,
+            clause,
+            hints,
+            &|| true,
+        )
     }
 
     /// Add a clause with a pre-assigned ID using already-validated signed LRAT
@@ -297,11 +380,7 @@ impl ProofOutput {
 
     /// Flush the proof writer
     pub fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Drat(w) => w.flush(),
-            Self::Veripb(w) => w.flush(),
-            Self::Lrat(w) => w.flush(),
-        }
+        self.flush_with_cancellation(&|| true)
     }
 
     /// Get the number of clauses successfully added
@@ -334,6 +413,16 @@ impl ProofOutput {
         }
     }
 
+    /// The first write or flush failure the proof sink reported (its OS error
+    /// text names the cause, for example a full disk), if any.
+    pub(crate) fn first_io_error(&self) -> Option<&super::ProofWriteError> {
+        match self {
+            Self::Drat(w) => w.get_ref().first_error(),
+            Self::Veripb(w) => w.get_ref().first_error(),
+            Self::Lrat(w) => w.get_ref().first_error(),
+        }
+    }
+
     /// Typed failure from bounded LRAT storage outside the byte writer.
     pub(crate) fn lrat_bounded_resource_failure(&self) -> Option<LratBoundedResourceFailure> {
         match self {
@@ -347,11 +436,7 @@ impl ProofOutput {
     /// Returns an error if any I/O failure occurred during proof writing,
     /// or if LRAT finalization (flushing pending deletions) fails.
     pub fn into_inner(self) -> io::Result<BoxedWriter> {
-        match self {
-            Self::Drat(w) => w.into_inner(),
-            Self::Veripb(w) => w.into_inner(),
-            Self::Lrat(w) => w.into_inner(),
-        }
+        self.into_inner_with_cancellation(&|| true)
     }
 
     /// Extract proof bytes as `Vec<u8>`, consuming the `ProofOutput`.

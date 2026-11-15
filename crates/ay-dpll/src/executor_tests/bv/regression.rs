@@ -941,7 +941,8 @@ fn test_non_bv_congruence_bail_degrades_sat_to_unknown_item4() {
 
     // Forced bail: the CDCL SAT must be degraded to Unknown fail-closed.
     let mut bailed_exec = Executor::new();
-    bailed_exec.test_force_non_bv_congruence_bail = true;
+    bailed_exec.test_force_non_bv_congruence_bail =
+        Some(crate::executor::theories::TestCongruenceBail::CountCap);
     let bailed_outputs = bailed_exec.execute_all(&commands).unwrap();
     assert_eq!(
         bailed_outputs,
@@ -968,7 +969,8 @@ fn test_non_bv_congruence_bail_keeps_unsat_reportable_item4() {
     "#;
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
-    exec.test_force_non_bv_congruence_bail = true;
+    exec.test_force_non_bv_congruence_bail =
+        Some(crate::executor::theories::TestCongruenceBail::CountCap);
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(
         outputs,
@@ -1043,4 +1045,83 @@ fn test_non_bv_congruence_prefilter_preserves_sat_large_group_item4() {
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs, vec!["sat"]);
+}
+
+/// Encodability pre-skip (#certora-dt-congruence-intern): congruence
+/// over a Datatype-sorted argument must still refute when the
+/// argument equality is an authored, consumed atom (the encodable
+/// arm of the pre-skip).
+#[test]
+fn test_non_bv_congruence_preskip_keeps_consumed_dt_arg_congruence() {
+    let input = r#"
+        (set-logic QF_UFBVDT)
+        (declare-datatypes ((D 0)) (((C (f (_ BitVec 8))))))
+        (declare-sort U 0)
+        (declare-fun h (D) U)
+        (declare-fun a () D)
+        (declare-fun b () D)
+        (declare-fun t1 () D)
+        (declare-fun t2 () D)
+        (declare-fun t3 () D)
+        (declare-fun t4 () D)
+        (declare-fun t5 () D)
+        (declare-fun t6 () D)
+        (declare-fun t7 () D)
+        (declare-fun t8 () D)
+        (assert (= a b))
+        (assert (distinct (h a) (h b)))
+        (assert (distinct (h t1) (h t2)))
+        (assert (distinct (h t3) (h t4)))
+        (assert (distinct (h t5) (h t6)))
+        (assert (distinct (h t7) (h t8)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(
+        outputs,
+        vec!["unsat"],
+        "pre-skip must keep congruence for DT args with a consumed equality atom"
+    );
+}
+
+/// SAT twin: without the authored argument equality the instance is
+/// satisfiable; the pre-skip may only skip unencodable pairs, never
+/// manufacture a refutation. (`sat` or fail-closed `unknown` are
+/// both acceptable here — the DT model gate already returned
+/// `unknown` on this shape before the pre-skip; a wrong `unsat`
+/// is the failure this pins.)
+#[test]
+fn test_non_bv_congruence_preskip_preserves_sat_dt_args() {
+    let input = r#"
+        (set-logic QF_UFBVDT)
+        (declare-datatypes ((D 0)) (((C (f (_ BitVec 8))))))
+        (declare-sort U 0)
+        (declare-fun h (D) U)
+        (declare-fun a () D)
+        (declare-fun b () D)
+        (declare-fun t1 () D)
+        (declare-fun t2 () D)
+        (declare-fun t3 () D)
+        (declare-fun t4 () D)
+        (declare-fun t5 () D)
+        (declare-fun t6 () D)
+        (declare-fun t7 () D)
+        (declare-fun t8 () D)
+        (assert (distinct (h a) (h b)))
+        (assert (distinct (h t1) (h t2)))
+        (assert (distinct (h t3) (h t4)))
+        (assert (distinct (h t5) (h t6)))
+        (assert (distinct (h t7) (h t8)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs,
+        vec!["unsat"],
+        "pre-skip must never manufacture a refutation on a satisfiable instance"
+    );
 }

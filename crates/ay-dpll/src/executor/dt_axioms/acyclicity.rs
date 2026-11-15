@@ -92,7 +92,11 @@ impl Executor {
             None
         };
 
+        let live = self.dt_live_term_mask(term_len, []);
         for idx in 0..term_len {
+            if !live[idx] {
+                continue;
+            }
             let term = TermId::new(idx as u32);
 
             // Check if this is a constructor application

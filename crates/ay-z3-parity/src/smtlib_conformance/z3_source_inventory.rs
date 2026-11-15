@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Closed, source-authenticated inventory of the Z3 5.1.0 CLI overlay.
+//! Closed, source-authenticated inventory of the Z3 5.3.3 CLI overlay.
 //!
-//! The full source tree is retained as bounded metadata, not as 2,756 copied
+//! The full source tree is retained as bounded metadata, not as 3,661 copied
 //! blobs.  Only the UTF-8 files that define the shell, SMT2 command registry,
 //! and registry-generation mechanisms are retained verbatim.  Live registries
 //! are read from the exact profile-pinned executable under the repository OOM
@@ -12,56 +12,51 @@
 use super::*;
 use sha1::Sha1;
 
-pub(super) const VALIDATOR_ID: &str = "builtin.z3-source-inventory.v1";
-pub(super) const REFERENCE_VALIDATOR_ID: &str = "builtin.z3-reference-inventory.v1";
+pub(super) const VALIDATOR_ID: &str = "builtin.z3-source-inventory-5.3.3.v1";
+pub(super) const REFERENCE_VALIDATOR_ID: &str = "builtin.z3-reference-inventory-5.3.3.v1";
 
-const SNAPSHOT_SCHEMA: &str = "ay-z3-source-metadata-snapshot/v1";
-const SNAPSHOT_ID: &str = "z3-5.1.0-source-tree";
-const SNAPSHOT_SELECTION: &str = "all 2,756 tracked files as path/git-blob/size metadata, the 43 UTF-8 C-API/shell/SMT2/registry/operator source blobs, and the pinned whole-tree registration-keyword scan over src and scripts";
+const SNAPSHOT_SCHEMA: &str = "ay-z3-source-metadata-snapshot/v2";
+const SNAPSHOT_ID: &str = "z3-5.3.3-source-tree";
+const SNAPSHOT_SELECTION: &str = "all 3,661 tracked files as path/git-blob/size metadata, the 61 core UTF-8 public-header/shell/SMT2/registry/operator source blobs plus every native tactic/probe/simplifier registration source file, and the pinned whole-tree registration-keyword scan over src and scripts; unresolved registration candidates remain explicit failures";
 const SNAPSHOT_DIGEST_KIND: &str = "sorted-path-git-blob-size-manifest/v1";
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
-const EXPECTED_TREE_FILES: usize = 2_756;
+const EXPECTED_TREE_FILES: usize = 3_661;
 const EXPECTED_TREE_SHA256: &str =
-    "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b";
-pub(super) const EXPECTED_OBSERVABLE_ITEMS: usize = 1_518;
+    "a48aaa79d461d07f90ffbf4323a7c3b674457145fde1cd5ecf312bbd46343967";
+pub(super) const EXPECTED_OBSERVABLE_ITEMS: usize = 1_635;
 pub(super) const EXPECTED_OBSERVABLE_SHA256: &str =
-    "8a8d7ad916bca1530c39f7507adce5b4e7e279852d3c2de7c8802c9e85cace77";
+    "f5017ff3d0457bff6fc4b74d51024ffa073f06100e79829111ce7a5875b9a464";
 const EXPECTED_PROCESS_CASES: usize = 8;
-const REGISTRATION_SCAN_PATTERN: &str = r"tactic|probe|simplif|install_cmd|register_cmd|cmd_context|REG_PARAMS|gparams|parameter|IN_[A-Z_]+|is_option|strcmp\([^[:cntrl:]]*-|extension";
-const EXPECTED_REGISTRATION_SCAN_LINES: usize = 12_681;
-const EXPECTED_REGISTRATION_SCAN_SHA256: &str =
-    "761e4140c263159e0e79589fa9f63ae0b19992a10b9eab1cfbfcd481cdb20bdb";
-const EXPECTED_REGISTRATION_CLASSIFICATION_SHA256: &str =
-    "4f31f4e821b78256a856d20e8f9209fe90d7dd287646dd6580c077c5f89815ed";
-const EXPECTED_REGISTRATION_CLASSIFICATION_COUNTS: [(&str, usize); 16] = [
-    ("nonobservable.build-metadata", 296),
-    ("nonobservable.comment-or-documentation", 1_880),
-    ("nonobservable.foreign-api-binding-or-implementation", 2_331),
-    ("nonobservable.generator-or-maintenance-tool", 212),
-    (
-        "nonobservable.internal-declaration-or-schema-plumbing",
-        1_911,
-    ),
-    ("nonobservable.internal-implementation-reference", 5_573),
-    ("nonobservable.internal-test-only", 155),
-    ("observable.cli-option-dispatch", 4),
-    ("observable.command-registry-anchor", 30),
-    ("observable.filename-extension-dispatch", 2),
-    ("observable.input-mode-dispatch", 31),
-    ("observable.parameter-module-registry-anchor", 2),
-    ("observable.parameter-schema-anchor", 69),
-    ("observable.probe-registration", 42),
-    ("observable.simplifier-registration", 29),
-    ("observable.tactic-registration", 114),
+const DISCOVERY_INVOCATIONS: [(&str, &[&str], &[u8]); EXPECTED_PROCESS_CASES] = [
+    ("version", &["-version"], b""),
+    ("cli-help", &["-h"], b""),
+    ("command-help", &["-in"], b"(help)\n(exit)\n"),
+    ("tactics", &["-tactics", "-in"], b""),
+    ("probes", &["-probes", "-in"], b""),
+    ("simplifiers", &["-simplifiers", "-in"], b""),
+    ("parameters", &["-p", "-in"], b""),
+    ("parameter-descriptions", &["-pd", "-in"], b""),
 ];
-
-const SELECTED_SOURCE_PATHS: [&str; 43] = [
+const REGISTRATION_SCAN_PATTERN: &str = r"Z3_ADD_(TACTIC|PROBE|SIMPLIFIER)|tactic|probe|simplif|install_cmd|register_cmd|register_plugin|builtin_name|get_op_names|get_sort_names|m_names\[|m_sigs\[|cmd_context|REG_PARAMS|gparams|parameter|IN_[A-Z_]+|is_option|strcmp\([^[:cntrl:]]*-|extension";
+const EXPECTED_REGISTRATION_SCAN_LINES: usize = 14_468;
+const EXPECTED_REGISTRATION_SCAN_SHA256: &str =
+    "52f8670a49419bdc4848d4943167ffeb6381e33751e2023c0d31f2c4c04513b3";
+const SELECTED_SOURCE_PATHS: [&str; 61] = [
     "scripts/VERSION.txt",
     "scripts/mk_genfile_common.py",
-    "scripts/mk_install_tactic_cpp.py",
+    "src/api/c++/z3++.h",
+    "src/api/z3.h",
+    "src/api/z3_algebraic.h",
     "src/api/z3_api.h",
+    "src/api/z3_ast_containers.h",
+    "src/api/z3_fixedpoint.h",
+    "src/api/z3_fpa.h",
     "src/api/z3_macros.h",
+    "src/api/z3_optimization.h",
+    "src/api/z3_polynomial.h",
+    "src/api/z3_rcf.h",
     "src/api/z3_replayer.cpp",
+    "src/api/z3_spacer.h",
     "src/ast/arith_decl_plugin.cpp",
     "src/ast/array_decl_plugin.cpp",
     "src/ast/ast.cpp",
@@ -69,11 +64,14 @@ const SELECTED_SOURCE_PATHS: [&str; 43] = [
     "src/ast/char_decl_plugin.cpp",
     "src/ast/datatype_decl_plugin.cpp",
     "src/ast/dl_decl_plugin.cpp",
+    "src/ast/ff_decl_plugin.cpp",
     "src/ast/finite_set_decl_plugin.cpp",
     "src/ast/fpa_decl_plugin.cpp",
     "src/ast/pb_decl_plugin.cpp",
     "src/ast/recfun_decl_plugin.cpp",
+    "src/ast/reg_decl_plugins.cpp",
     "src/ast/seq_decl_plugin.cpp",
+    "src/ast/simplifiers/dependent_expr_state.h",
     "src/ast/special_relations_decl_plugin.cpp",
     "src/cmd_context/basic_cmds.cpp",
     "src/cmd_context/cmd_context.cpp",
@@ -85,6 +83,8 @@ const SELECTED_SOURCE_PATHS: [&str; 43] = [
     "src/cmd_context/simplifier_cmds.cpp",
     "src/cmd_context/simplify_cmd.cpp",
     "src/cmd_context/tactic_cmds.cpp",
+    "src/cmd_context/tactic_manager.cpp",
+    "src/cmd_context/tactic_manager.h",
     "src/muz/fp/dl_cmds.cpp",
     "src/opt/opt_cmds.cpp",
     "src/parsers/smt2/smt2parser.cpp",
@@ -97,7 +97,11 @@ const SELECTED_SOURCE_PATHS: [&str; 43] = [
     "src/smt/smt_setup.cpp",
     "src/solver/smt_logics.cpp",
     "src/solver/smt_logics.h",
+    "src/tactic/probe.h",
+    "src/tactic/tactic.h",
     "src/util/gparams.cpp",
+    "src/util/gparams.h",
+    "src/util/params.h",
     "src/util/z3_version.h.in",
 ];
 
@@ -123,24 +127,24 @@ const EXTENSION_MODES: [(&str, &str); 16] = [
 const CATEGORY_COUNTS: [(&str, usize); 17] = [
     ("cli-help-option", 27),
     ("cli-option", 33),
-    ("declaration-builtin", 323),
+    ("declaration-builtin", 342),
     ("filename-extension", 16),
     ("global-parameter", 25),
     ("input-mode", 9),
-    ("logic-recognizer-literal", 24),
-    ("logic-strategy-alias", 33),
-    ("module-parameter", 663),
-    ("parameter-module", 22),
+    ("logic-recognizer-literal", 27),
+    ("logic-strategy-alias", 35),
+    ("module-parameter", 738),
+    ("parameter-module", 23),
     ("probe", 42),
-    ("simplifier", 36),
-    ("smt-command", 94),
+    ("simplifier", 44),
+    ("smt-command", 98),
     ("smt-info-key", 11),
     ("smt-option-key", 20),
     ("smt-parser-token", 22),
-    ("tactic", 118),
+    ("tactic", 123),
 ];
 
-const DECLARATION_PLUGIN_PATHS: [&str; 13] = [
+const DECLARATION_PLUGIN_PATHS: [&str; 14] = [
     "src/ast/arith_decl_plugin.cpp",
     "src/ast/array_decl_plugin.cpp",
     "src/ast/ast.cpp",
@@ -148,6 +152,7 @@ const DECLARATION_PLUGIN_PATHS: [&str; 13] = [
     "src/ast/char_decl_plugin.cpp",
     "src/ast/datatype_decl_plugin.cpp",
     "src/ast/dl_decl_plugin.cpp",
+    "src/ast/ff_decl_plugin.cpp",
     "src/ast/finite_set_decl_plugin.cpp",
     "src/ast/fpa_decl_plugin.cpp",
     "src/ast/pb_decl_plugin.cpp",
@@ -213,6 +218,7 @@ struct Z3RegistrationScan {
 struct RegistrationClassificationSummary {
     counts: BTreeMap<&'static str, usize>,
     content_sha256: String,
+    unresolved: Vec<(String, usize, String)>,
 }
 
 impl RegistrationClassificationSummary {
@@ -248,6 +254,105 @@ pub(super) struct ObservableTranscripts<'a> {
     pub(super) parameter_descriptions: &'a str,
 }
 
+const DISCOVERY_BASELINE: &str = include_str!("../../data/z3-5.3.3/discovery.json");
+const DISCOVERY_BASELINE_SHA256: &str =
+    "c6c4d6e9025cb63aa47886a157bd89b1f54bf9ac6cf1d965e657cc8ca3dbcb56";
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryBaseline {
+    schema: String,
+    source_revision: String,
+    reference_platform: String,
+    reference_sha256: String,
+    timeout_seconds: u64,
+    memory_limit_mb: u64,
+    per_file_limit_bytes: u64,
+    outputs: BTreeMap<String, DiscoveryOutput>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryOutput {
+    exit_code: i32,
+    stdout_sha256: String,
+    stdout: String,
+    stderr: String,
+}
+
+fn discovery_baseline(profile: &Profile) -> Result<DiscoveryBaseline, String> {
+    if sha256_bytes(DISCOVERY_BASELINE.as_bytes()) != DISCOVERY_BASELINE_SHA256 {
+        return Err("current Z3 discovery baseline bytes drifted".to_string());
+    }
+    let baseline: DiscoveryBaseline =
+        serde_json::from_str(DISCOVERY_BASELINE).map_err(|error| error.to_string())?;
+    validate_discovery_baseline(&baseline, profile)?;
+    Ok(baseline)
+}
+
+fn validate_discovery_baseline(
+    baseline: &DiscoveryBaseline,
+    profile: &Profile,
+) -> Result<(), String> {
+    let expected_ids = DISCOVERY_INVOCATIONS
+        .iter()
+        .map(|(id, _, _)| (*id).to_string())
+        .collect::<BTreeSet<_>>();
+    if baseline.schema != "ay-z3-discovery-baseline/v1"
+        || baseline.source_revision != profile.z3_overlay.source_commit
+        || baseline.reference_platform != "macos-aarch64"
+        || baseline.reference_sha256
+            != "9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4"
+        || baseline.timeout_seconds != 5
+        || baseline.memory_limit_mb != 256
+        || baseline.per_file_limit_bytes != 1_048_576
+        || baseline.outputs.keys().cloned().collect::<BTreeSet<_>>() != expected_ids
+    {
+        return Err("current Z3 discovery baseline identity or population drifted".to_string());
+    }
+    for (id, output) in &baseline.outputs {
+        if output.exit_code != 0
+            || !output.stderr.is_empty()
+            || sha256_bytes(output.stdout.as_bytes()) != output.stdout_sha256
+        {
+            return Err(format!(
+                "current Z3 discovery baseline output is unauthenticated: {id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Known source/live owners from the independently authenticated current Z3
+/// reference. This does not assert that every broad-scan candidate is audited,
+/// or that any owner has behavioral parity in AY.
+pub(super) fn authenticated_observable_catalog(
+    snapshot: &Z3SourceSnapshot,
+) -> Result<Vec<ObservableItem>, String> {
+    let profile = canonical_profile()?;
+    validate_snapshot(snapshot, &profile)?;
+    let baseline = discovery_baseline(&profile)?;
+    let output = |id: &str| -> Result<&str, String> {
+        baseline
+            .outputs
+            .get(id)
+            .map(|row| row.stdout.as_str())
+            .ok_or_else(|| format!("missing current Z3 discovery baseline {id}"))
+    };
+    extract_observable_items_from_transcripts(
+        snapshot,
+        ObservableTranscripts {
+            cli_help: output("cli-help")?,
+            command_help: output("command-help")?,
+            tactics: output("tactics")?,
+            probes: output("probes")?,
+            simplifiers: output("simplifiers")?,
+            parameters: output("parameters")?,
+            parameter_descriptions: output("parameter-descriptions")?,
+        },
+    )
+}
+
 #[derive(Debug)]
 struct LiveCapture {
     id: &'static str,
@@ -261,35 +366,13 @@ struct LiveCapture {
 }
 
 impl LiveCapture {
-    fn require_pass(&self) -> Result<(), String> {
-        if self.outcome != ValidatorCaseOutcome::Pass {
-            return Err(format!(
-                "pinned Z3 registry process {} did not complete cleanly: {:?}",
-                self.id, self.outcome
-            ));
-        }
-        Ok(())
-    }
-
     fn into_case(self) -> ValidatorCase {
         let input_sha256 = invocation_sha256(&self.invocation, &self.input);
         ValidatorCase {
             id: format!("live.{}", self.id),
             input_sha256,
-            expected: format!(
-                "authenticated Z3 5.1.0 invocation {:?} exits 0 with complete UTF-8 stdout and empty stderr",
-                self.invocation
-            ),
-            observed: format!(
-                "status={:?};stdin-complete={};timeout={};memout={};stdout-truncated={};stderr-truncated={};stderr-empty={}",
-                self.exit_code,
-                self.process.stdin_complete,
-                self.process.timed_out,
-                self.process.memout,
-                self.process.stdout_truncated,
-                self.process.stderr_truncated,
-                self.stderr.is_empty()
-            ),
+            expected: live_expectation(&self.invocation),
+            observed: live_observation(self.exit_code, &self.process, self.stderr.is_empty()),
             stdout: Some(self.stdout),
             stderr: Some(self.stderr),
             exit_code: self.exit_code,
@@ -297,6 +380,105 @@ impl LiveCapture {
             outcome: self.outcome,
         }
     }
+}
+
+fn live_expectation(invocation: &str) -> String {
+    format!("authenticated Z3 5.3.3 invocation {invocation:?} exits 0 with complete UTF-8 stdout and empty stderr matching the exact pinned discovery transcript")
+}
+
+fn live_observation(
+    exit_code: Option<i32>,
+    process: &ProcessObservation,
+    stderr_empty: bool,
+) -> String {
+    format!(
+        "status={exit_code:?};stdin-complete={};timeout={};memout={};stdout-truncated={};stderr-truncated={};stderr-empty={stderr_empty}",
+        process.stdin_complete, process.timed_out, process.memout, process.stdout_truncated, process.stderr_truncated
+    )
+}
+
+fn recorded_live_outcome(
+    row: &ValidatorCase,
+    baseline: &DiscoveryOutput,
+) -> Result<ValidatorCaseOutcome, String> {
+    let process = row
+        .process
+        .as_ref()
+        .ok_or("live discovery row has no process observation")?;
+    let stdout = row
+        .stdout
+        .as_deref()
+        .ok_or("live discovery row has no stdout")?;
+    let stderr = row
+        .stderr
+        .as_deref()
+        .ok_or("live discovery row has no stderr")?;
+    Ok(if process.memout {
+        ValidatorCaseOutcome::Memout
+    } else if process.timed_out {
+        ValidatorCaseOutcome::Timeout
+    } else if !process.stdin_complete || process.stdout_truncated || process.stderr_truncated {
+        ValidatorCaseOutcome::Fail
+    } else if row.exit_code != Some(0) {
+        ValidatorCaseOutcome::Crash
+    } else if !stderr.is_empty() || stdout != baseline.stdout {
+        ValidatorCaseOutcome::Fail
+    } else {
+        ValidatorCaseOutcome::Pass
+    })
+}
+
+fn validate_live_rows(rows: &[ValidatorCase], profile: &Profile) -> Result<(), String> {
+    let baseline = discovery_baseline(profile)?;
+    let actual = rows
+        .iter()
+        .filter(|row| row.id.starts_with("live."))
+        .collect::<Vec<_>>();
+    if actual.len() != DISCOVERY_INVOCATIONS.len() {
+        return Err("Z3 source receipt has an incomplete live discovery population".to_string());
+    }
+    for (id, args, input) in DISCOVERY_INVOCATIONS {
+        let case_id = format!("live.{id}");
+        let mut matches = actual.iter().copied().filter(|row| row.id == case_id);
+        let row = matches
+            .next()
+            .ok_or_else(|| format!("Z3 source receipt is missing {case_id}"))?;
+        if matches.next().is_some() {
+            return Err(format!("Z3 source receipt duplicates {case_id}"));
+        }
+        let invocation = args.join(" ");
+        // Authenticate what was invoked before comparing any claimed result.
+        if row.input_sha256 != invocation_sha256(&invocation, input)
+            || row.expected != live_expectation(&invocation)
+        {
+            return Err(format!(
+                "Z3 source receipt invocation binding drifted: {case_id}"
+            ));
+        }
+        let process = row
+            .process
+            .as_ref()
+            .ok_or("live discovery row has no process observation")?;
+        let stderr = row
+            .stderr
+            .as_deref()
+            .ok_or("live discovery row has no stderr")?;
+        if row.observed != live_observation(row.exit_code, process, stderr.is_empty())
+            || row.outcome
+                != recorded_live_outcome(
+                    row,
+                    baseline
+                        .outputs
+                        .get(id)
+                        .ok_or("missing pinned live discovery output")?,
+                )?
+        {
+            return Err(format!(
+                "Z3 source receipt live outcome differs from authenticated capture: {case_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -331,7 +513,7 @@ pub(super) fn snapshot(args: &[String]) -> Result<i32, String> {
     }
     let checkout = checkout.ok_or("z3-source-snapshot needs a Git checkout")?;
     let output = output.ok_or("z3-source-snapshot requires --out <path>")?;
-    let snapshot = create_snapshot(&checkout, &canonical_profile())?;
+    let snapshot = create_snapshot(&checkout, &canonical_profile()?)?;
     let bytes = pretty_json(&snapshot)?;
     atomic_write_new(&output, &bytes)?;
     println!(
@@ -452,7 +634,7 @@ pub(super) fn run_reference(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.1.0 inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
+        "attach to overlay.z3-5.3.3 inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     if !report.complete {
         println!(
@@ -534,7 +716,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         profile_id: PROFILE_ID.to_string(),
         profile_sha256: canonical_profile_sha256()?,
         dimension_id: dimension.id.clone(),
-        requirement_ids: vec!["overlay.z3-5.1.0.source-inventory".to_string()],
+        requirement_ids: vec!["overlay.z3-5.3.3.source-inventory".to_string()],
         inventory_sha256: dimension.inventory.sha256.clone(),
         validator: ValidatorIdentity {
             id: VALIDATOR_ID.to_string(),
@@ -561,7 +743,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
     atomic_write_new(&receipt_path, &bytes)?;
     let receipt_sha = sha256_bytes(&bytes);
     println!(
-        "z3-source-inventory={} source-files={} commands=94 tactics=118 probes=42 simplifiers=36 parameters=688 observable-items={} receipt={} sha256={}",
+        "z3-source-inventory={} source-files={} commands=98 tactics=123 probes=42 simplifiers=44 parameters=763 observable-items={} receipt={} sha256={}",
         if receipt.result == ValidatorResult::Pass { "PASS" } else { "FAIL" },
         EXPECTED_TREE_FILES,
         EXPECTED_OBSERVABLE_ITEMS,
@@ -569,7 +751,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.1.0.source-inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
+        "attach to overlay.z3-5.3.3.source-inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     if !report.complete {
         println!(
@@ -585,8 +767,8 @@ pub(super) fn validate_and_replay(
     context: EvidenceContext<'_>,
 ) -> Result<(), String> {
     if receipt.validator.kind != ValidatorKind::Z3Differential
-        || context.dimension.id != "overlay.z3-5.1.0"
-        || receipt.requirement_ids != ["overlay.z3-5.1.0.source-inventory".to_string()]
+        || context.dimension.id != "overlay.z3-5.3.3"
+        || receipt.requirement_ids != ["overlay.z3-5.3.3.source-inventory".to_string()]
         || !receipt.exhaustive
         || receipt.subject.ay_executable_sha256.is_some()
         || receipt.subject.ay_shared_library_sha256.is_some()
@@ -606,19 +788,33 @@ pub(super) fn validate_and_replay(
     if input.id != SNAPSHOT_ID || input.cohort != SourceCohort::Z3Source {
         return Err(format!("{VALIDATOR_ID} has a foreign source snapshot"));
     }
-    let expected_cases = EXPECTED_TREE_FILES
-        + SELECTED_SOURCE_PATHS.len()
-        + 1
-        + EXPECTED_OBSERVABLE_ITEMS
-        + EXPECTED_PROCESS_CASES;
+    let snapshot = load_bound_snapshot(input, context.manifest_dir, &canonical_profile()?)?;
+    let mut expected_rows = source_cases(&snapshot)?;
+    expected_rows.extend(observable_cases(&authenticated_observable_catalog(
+        &snapshot,
+    )?));
+    let expected_cases = expected_rows.len() + EXPECTED_PROCESS_CASES;
     if receipt.case_results.len() != expected_cases {
         return Err(format!(
             "{VALIDATOR_ID} detailed inventory is not exact: expected {expected_cases}, got {}",
             receipt.case_results.len()
         ));
     }
+    for expected in expected_rows {
+        if receipt
+            .case_results
+            .iter()
+            .find(|row| row.id == expected.id)
+            != Some(&expected)
+        {
+            return Err(format!(
+                "{VALIDATOR_ID} authenticated source/catalog row drifted: {}",
+                expected.id
+            ));
+        }
+    }
+    validate_live_rows(&receipt.case_results, &context.contract.profile)?;
     if context.mode.replays_registered_validators() {
-        let snapshot = load_bound_snapshot(input, context.manifest_dir, &canonical_profile())?;
         let envelope = receipt
             .resource_envelope
             .as_deref()
@@ -651,7 +847,7 @@ pub(super) fn validate_reference_and_replay(
         .map(|requirement| requirement.id.clone())
         .collect::<Vec<_>>();
     if receipt.validator.kind != ValidatorKind::ReferenceExtractor
-        || context.dimension.id != "overlay.z3-5.1.0"
+        || context.dimension.id != "overlay.z3-5.3.3"
         || receipt.requirement_ids != expected_ids
         || !receipt.exhaustive
         || receipt.subject.ay_executable_sha256.is_some()
@@ -676,9 +872,9 @@ pub(super) fn validate_reference_and_replay(
             "{REFERENCE_VALIDATOR_ID} has a foreign source snapshot"
         ));
     }
-    let snapshot = load_bound_snapshot(input, context.manifest_dir, &canonical_profile())?;
+    let snapshot = load_bound_snapshot(input, context.manifest_dir, &canonical_profile()?)?;
     let expected = reference_inventory_cases(&snapshot)?;
-    if receipt.result != ValidatorResult::Pass
+    if receipt.result != overall_validator_result(&expected)
         || receipt.case_results != expected
         || receipt.cases != case_counts_from_rows(&expected)?
     {
@@ -698,7 +894,7 @@ fn overlay_dimension(contract: &Contract) -> Result<&Dimension, String> {
     contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.3.3")
         .ok_or("closed Z3 overlay dimension is missing".to_string())
 }
 
@@ -710,7 +906,15 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
         )
     })?;
     let target = &profile.z3_overlay;
-    let head = git_text(&checkout, &["rev-parse", "HEAD"], "Z3 source HEAD")?;
+    let resources =
+        PlannedResources::plan(&locate_repo_root()?, 1, "Z3 source snapshot acquisition")
+            .map_err(|error| error.to_string())?;
+    let head = git_text(
+        &resources,
+        &checkout,
+        &["rev-parse", "HEAD"],
+        "Z3 source HEAD",
+    )?;
     if head.trim() != target.source_commit {
         return Err(format!(
             "Z3 checkout HEAD is {}, expected {}",
@@ -719,7 +923,12 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
         ));
     }
     let tag_object = format!("{}^{{commit}}", target.source_tag);
-    let tag = git_text(&checkout, &["rev-parse", &tag_object], "Z3 source tag")?;
+    let tag = git_text(
+        &resources,
+        &checkout,
+        &["rev-parse", &tag_object],
+        "Z3 source tag",
+    )?;
     if tag.trim() != target.source_commit {
         return Err(format!(
             "Z3 tag {} resolves to {}, expected {}",
@@ -729,6 +938,7 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
         ));
     }
     let dirty = git_bytes(
+        &resources,
         &checkout,
         &["status", "--porcelain", "--untracked-files=no"],
         "Z3 tracked worktree status",
@@ -737,6 +947,7 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
         return Err("Z3 source checkout has modified tracked files".to_string());
     }
     let tree_bytes = git_bytes(
+        &resources,
         &checkout,
         &["ls-tree", "-r", "-l", "-z", &target.source_commit],
         "Z3 source tree",
@@ -763,7 +974,12 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
             .get(path)
             .ok_or_else(|| format!("pinned Z3 source tree is missing selected file {path}"))?;
         let object = format!("{}:{path}", target.source_commit);
-        let bytes = git_bytes(&checkout, &["show", &object], "selected Z3 source blob")?;
+        let bytes = git_bytes(
+            &resources,
+            &checkout,
+            &["show", &object],
+            "selected Z3 source blob",
+        )?;
         if bytes.len() != entry.size || git_blob_sha1(&bytes) != entry.git_blob {
             return Err(format!(
                 "selected Z3 source blob {path} does not match its tree entry"
@@ -783,23 +999,41 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
     // the retained registry-owner files.  The deliberately broad vocabulary
     // captures registration mechanisms and their nearby declarations.  The
     // exact output digest is profile data; adding or moving any candidate site
-    // forces an explicit inventory update instead of silently escaping the 23
-    // selected-file extractor.
-    let registration_scan_bytes = git_bytes(
-        &checkout,
-        &[
-            "grep",
-            "-n",
-            "-I",
-            "-E",
-            REGISTRATION_SCAN_PATTERN,
-            &target.source_commit,
-            "--",
-            "src",
-            "scripts",
-        ],
-        "whole-tree Z3 registration scan",
-    )?;
+    // forces an explicit inventory update instead of escaping the retained
+    // source-owner extractor.
+    // Bound each capture without truncating the full scan. Git orders files
+    // lexically; disjoint first-level scopes preserve that order when joined.
+    let mut scopes = BTreeSet::from(["scripts".to_string()]);
+    for entry in &tree {
+        if let Some(rest) = entry.path.strip_prefix("src/") {
+            scopes.insert(format!(
+                "src/{}",
+                rest.split('/').next().ok_or("empty source path")?
+            ));
+        }
+    }
+    let mut registration_scan_bytes = Vec::new();
+    for scope in scopes {
+        let bytes = git_bytes(
+            &resources,
+            &checkout,
+            &[
+                "grep",
+                "-n",
+                "-I",
+                "-E",
+                REGISTRATION_SCAN_PATTERN,
+                &target.source_commit,
+                "--",
+                &scope,
+            ],
+            "bounded whole-tree Z3 registration scan",
+        )?;
+        if registration_scan_bytes.len().saturating_add(bytes.len()) > MAX_SNAPSHOT_BYTES as usize {
+            return Err("Z3 registration scan exceeds its fixed byte limit".to_string());
+        }
+        registration_scan_bytes.extend(bytes);
+    }
     let registration_scan_content = String::from_utf8(registration_scan_bytes)
         .map_err(|_| "whole-tree Z3 registration scan is not UTF-8".to_string())?;
     let registration_scan = Z3RegistrationScan {
@@ -809,6 +1043,35 @@ fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapsho
         content_sha256: sha256_bytes(registration_scan_content.as_bytes()),
         content: registration_scan_content,
     };
+    for path in native_registration_paths(&registration_scan, profile)? {
+        if selected_files.iter().any(|file| file.path == path) {
+            continue;
+        }
+        let entry = by_path
+            .get(path.as_str())
+            .ok_or("native registration source is absent from tree")?;
+        let object = format!("{}:{path}", target.source_commit);
+        let bytes = git_bytes(
+            &resources,
+            &checkout,
+            &["show", &object],
+            "native registration source",
+        )?;
+        if bytes.len() != entry.size || git_blob_sha1(&bytes) != entry.git_blob {
+            return Err(format!(
+                "native registration source {path} differs from its Git object"
+            ));
+        }
+        selected_files.push(Z3SelectedFile {
+            path,
+            git_blob: entry.git_blob.clone(),
+            size: entry.size,
+            content_sha256: sha256_bytes(&bytes),
+            content: String::from_utf8(bytes)
+                .map_err(|_| "native registration source is not UTF-8")?,
+        });
+    }
+    selected_files.sort_by(|left, right| left.path.cmp(&right.path));
     let snapshot = Z3SourceSnapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
         profile_id: PROFILE_ID.to_string(),
@@ -864,7 +1127,15 @@ fn validate_snapshot(snapshot: &Z3SourceSnapshot, profile: &Profile) -> Result<(
     if tree_manifest_sha256(&snapshot.tree) != EXPECTED_TREE_SHA256 {
         return Err("Z3 source snapshot tree-manifest digest mismatch".to_string());
     }
-    if snapshot.selected_files.len() != SELECTED_SOURCE_PATHS.len() {
+    let mut selected_paths = SELECTED_SOURCE_PATHS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    selected_paths.extend(native_registration_paths(
+        &snapshot.registration_scan,
+        profile,
+    )?);
+    if snapshot.selected_files.len() != selected_paths.len() {
         return Err("Z3 source snapshot selected-file count mismatch".to_string());
     }
     let by_path = snapshot
@@ -872,7 +1143,7 @@ fn validate_snapshot(snapshot: &Z3SourceSnapshot, profile: &Profile) -> Result<(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    for (file, expected_path) in snapshot.selected_files.iter().zip(SELECTED_SOURCE_PATHS) {
+    for (file, expected_path) in snapshot.selected_files.iter().zip(selected_paths) {
         if file.path != expected_path {
             return Err("Z3 source snapshot selected paths are not exact and sorted".to_string());
         }
@@ -932,18 +1203,8 @@ fn validate_snapshot(snapshot: &Z3SourceSnapshot, profile: &Profile) -> Result<(
             ));
         }
     }
-    let classification = classify_registration_scan(scan, profile)?;
-    let expected_counts = EXPECTED_REGISTRATION_CLASSIFICATION_COUNTS
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    if classification.counts != expected_counts
-        || classification.content_sha256 != EXPECTED_REGISTRATION_CLASSIFICATION_SHA256
-    {
-        return Err(format!(
-            "Z3 registration scan classification drifted: counts={:?}/{expected_counts:?} sha256={}/{EXPECTED_REGISTRATION_CLASSIFICATION_SHA256}",
-            classification.counts, classification.content_sha256
-        ));
-    }
+    classify_registration_scan(scan, profile)?;
+    validate_declaration_plugin_owners(snapshot)?;
     Ok(())
 }
 
@@ -981,11 +1242,20 @@ fn contains_uppercase_input_token(text: &str) -> bool {
 }
 
 fn has_registration_scan_lexeme(text: &str) -> bool {
-    text.contains("tactic")
+    text.contains("Z3_ADD_TACTIC")
+        || text.contains("Z3_ADD_PROBE")
+        || text.contains("Z3_ADD_SIMPLIFIER")
+        || text.contains("tactic")
         || text.contains("probe")
         || text.contains("simplif")
         || text.contains("install_cmd")
         || text.contains("register_cmd")
+        || text.contains("register_plugin")
+        || text.contains("builtin_name")
+        || text.contains("get_op_names")
+        || text.contains("get_sort_names")
+        || text.contains("m_names[")
+        || text.contains("m_sigs[")
         || text.contains("cmd_context")
         || text.contains("REG_PARAMS")
         || text.contains("gparams")
@@ -994,6 +1264,129 @@ fn has_registration_scan_lexeme(text: &str) -> bool {
         || text.contains("is_option")
         || (text.contains("strcmp(") && text.contains('-'))
         || text.contains("extension")
+}
+
+fn native_registration_paths(
+    scan: &Z3RegistrationScan,
+    profile: &Profile,
+) -> Result<BTreeSet<String>, String> {
+    let prefix = format!("{}:", profile.z3_overlay.source_commit);
+    let mut paths = BTreeSet::new();
+    for line in scan.content.lines() {
+        let (path, _, text) = parse_registration_scan_row(line, &prefix)?;
+        if ["Z3_ADD_TACTIC", "Z3_ADD_PROBE", "Z3_ADD_SIMPLIFIER"]
+            .iter()
+            .any(|token| text.contains(token))
+        {
+            paths.insert(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn registration_literal(input: &str) -> Result<(String, &str), String> {
+    let input = input
+        .trim_start()
+        .strip_prefix('"')
+        .ok_or("native registry name or description is not a string literal")?;
+    let mut value = String::new();
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '"' => return Ok((value, &input[index + 1..])),
+            '\\' => {
+                let (_, escaped) = chars.next().ok_or("unterminated native registry escape")?;
+                value.push(match escaped {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    't' => '\t',
+                    _ => return Err("unclassified native registry string escape".to_string()),
+                });
+            }
+            ch => value.push(ch),
+        }
+    }
+    Err("unterminated native registry string".to_string())
+}
+
+fn native_registration_catalog(
+    snapshot: &Z3SourceSnapshot,
+    token: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut registrations = BTreeMap::new();
+    for file in &snapshot.selected_files {
+        let mut offset = 0;
+        for line in file.content.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(token) {
+                let start = offset + line.len() - trimmed.len() + token.len();
+                let rest = file.content[start..]
+                    .trim_start()
+                    .strip_prefix('(')
+                    .ok_or("native registration has no arguments")?;
+                let (_, rest) = rest
+                    .split_once(',')
+                    .ok_or("native registration has no tag separator")?;
+                let (name, rest) = registration_literal(rest)?;
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix(',')
+                    .ok_or("native registration has no description separator")?;
+                let (description, rest) = registration_literal(rest)?;
+                if !rest.trim_start().starts_with(',') {
+                    return Err(
+                        "native registry has an unclassified concatenated description".to_string(),
+                    );
+                }
+                if registrations
+                    .insert(name.clone(), format!("{name} {description}"))
+                    .is_some()
+                {
+                    return Err(format!("duplicate native registration {name}"));
+                }
+            }
+            offset += line.len();
+        }
+    }
+    Ok(registrations)
+}
+
+fn validate_declaration_plugin_owners(snapshot: &Z3SourceSnapshot) -> Result<(), String> {
+    let expected = [
+        "arith",
+        "array",
+        "bv",
+        "char",
+        "datatype",
+        "datalog_relation",
+        "ff",
+        "finite_set",
+        "fpa",
+        "pb",
+        "recfun",
+        "seq",
+        "specrels",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    for path in [
+        "src/ast/reg_decl_plugins.cpp",
+        "src/cmd_context/cmd_context.cpp",
+    ] {
+        let actual = extract_delimited(
+            source_text(snapshot, path)?,
+            "register_plugin(symbol(\"",
+            "\"",
+        );
+        if actual != expected {
+            return Err(format!(
+                "Z3 declaration-plugin registration owners drifted in {path}: {actual:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn known_registration_path(path: &str) -> bool {
@@ -1035,6 +1428,8 @@ fn known_registration_extension(path: &str) -> bool {
         extension,
         "cpp"
             | "h"
+            | "hpp"
+            | "json"
             | "py"
             | "ts"
             | "txt"
@@ -1067,35 +1462,20 @@ fn registration_disposition(path: &str, text: &str) -> Result<&'static str, Stri
     }
     let trimmed = text.trim_start();
     if trimmed.starts_with("//")
-        || trimmed.starts_with("/*")
-        || trimmed.starts_with('*')
-        || trimmed.starts_with('#')
+        || (trimmed.starts_with("/*")
+            && trimmed
+                .split_once("*/")
+                .is_none_or(|(_, remainder)| remainder.trim().is_empty()))
     {
-        return Ok("nonobservable.comment-or-documentation");
+        return Ok("nonobservable.comment-start");
     }
-    if path.starts_with("scripts/") {
-        return Ok("nonobservable.generator-or-maintenance-tool");
-    }
-    if path.starts_with("src/api/") {
-        return Ok("nonobservable.foreign-api-binding-or-implementation");
-    }
-    if path.starts_with("src/test/") {
-        return Ok("nonobservable.internal-test-only");
-    }
-    if path.ends_with("CMakeLists.txt")
-        || Path::new(path)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("yml"))
-    {
-        return Ok("nonobservable.build-metadata");
-    }
-    if text.contains("ADD_TACTIC(\"") {
+    if text.trim_start().starts_with("Z3_ADD_TACTIC(") {
         return Ok("observable.tactic-registration");
     }
-    if text.contains("ADD_PROBE(\"") {
+    if text.trim_start().starts_with("Z3_ADD_PROBE(") {
         return Ok("observable.probe-registration");
     }
-    if text.contains("ADD_SIMPLIFIER(\"") {
+    if text.trim_start().starts_with("Z3_ADD_SIMPLIFIER(") {
         return Ok("observable.simplifier-registration");
     }
     if path == "src/shell/main.cpp" && text.contains("strcmp(opt_name, \"") {
@@ -1125,14 +1505,13 @@ fn registration_disposition(path: &str, text: &str) -> Result<&'static str, Stri
     {
         return Ok("observable.command-registry-anchor");
     }
-    if Path::new(path).extension().is_some_and(|extension| {
-        ["h", "def", "pyg", "in"]
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-    }) {
-        return Ok("nonobservable.internal-declaration-or-schema-plumbing");
+    if text.contains("register_plugin(") || text.contains("builtin_name(") {
+        return Ok("observable.declaration-plugin-registry-anchor");
     }
-    Ok("nonobservable.internal-implementation-reference")
+    // An implementation-looking path or an incidental identifier is not an
+    // ownership argument. Keep every remaining matched source location as an
+    // unresolved obligation instead of excluding it from the CLI surface.
+    Ok("unresolved.registration-candidate")
 }
 
 fn classify_registration_scan(
@@ -1143,10 +1522,14 @@ fn classify_registration_scan(
     let mut counts = BTreeMap::<&'static str, usize>::new();
     let mut hasher = Sha256::new();
     let mut classified = 0usize;
+    let mut unresolved = Vec::new();
     for line in scan.content.lines() {
         let (path, line_number, text) = parse_registration_scan_row(line, &prefix)?;
         let disposition = registration_disposition(path, text)?;
         *counts.entry(disposition).or_default() += 1;
+        if disposition == "unresolved.registration-candidate" {
+            unresolved.push((path.to_string(), line_number, text.to_string()));
+        }
         hasher.update(path.as_bytes());
         hasher.update(b"\t");
         hasher.update(line_number.to_string().as_bytes());
@@ -1164,6 +1547,7 @@ fn classify_registration_scan(
     Ok(RegistrationClassificationSummary {
         counts,
         content_sha256: format!("{:x}", hasher.finalize()),
+        unresolved,
     })
 }
 
@@ -1229,11 +1613,11 @@ fn execute(
     }
     validate_snapshot(snapshot, &contract.profile)?;
     let target = &contract.profile.z3_overlay;
-    let source_z3 = PathBuf::from(&target.reference_executable.path);
+    let source_z3 = reference_artifact_path(&target.reference_executable.path)?;
     let staged_z3 = stage_authenticated_executable(
         &source_z3,
         &target.reference_executable.sha256,
-        "Z3 5.1.0 executable",
+        "Z3 5.3.3 executable",
     )?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
@@ -1254,59 +1638,38 @@ fn execute(
         ));
     }
 
+    let baseline = discovery_baseline(&contract.profile)?;
     let mut captures = Vec::with_capacity(EXPECTED_PROCESS_CASES);
-    captures.push(run_capture(
-        &resources,
-        &staged_z3.path,
-        "version",
-        &["-version"],
-        b"",
-        timeout,
-    )?);
-    captures.push(run_capture(
-        &resources,
-        &staged_z3.path,
-        "cli-help",
-        &["-h"],
-        b"",
-        timeout,
-    )?);
-    captures.push(run_capture(
-        &resources,
-        &staged_z3.path,
-        "command-help",
-        &["-in"],
-        b"(help)\n(exit)\n",
-        timeout,
-    )?);
-    for (id, flag) in [
-        ("tactics", "-tactics"),
-        ("probes", "-probes"),
-        ("simplifiers", "-simplifiers"),
-        ("parameters", "-p"),
-        ("parameter-descriptions", "-pd"),
-    ] {
-        captures.push(run_capture(
-            &resources,
-            &staged_z3.path,
-            id,
-            &[flag, "-in"],
-            b"",
-            timeout,
-        )?);
-    }
-    for capture in &captures {
-        capture.require_pass()?;
-    }
-    if captures[0].stdout != format!("{}\n", target.reference_executable.version_output) {
-        return Err("authenticated Z3 executable version output drifted".to_string());
+    for (id, args, input) in DISCOVERY_INVOCATIONS {
+        let mut capture = run_capture(&resources, &staged_z3.path, id, args, input, timeout)?;
+        if capture.outcome == ValidatorCaseOutcome::Pass
+            && capture.stdout
+                != baseline
+                    .outputs
+                    .get(id)
+                    .ok_or("missing pinned discovery output")?
+                    .stdout
+        {
+            capture.outcome = ValidatorCaseOutcome::Fail;
+        }
+        captures.push(capture);
     }
     let post_sha = sha256_file(&staged_z3.path, "staged Z3 after source inventory")?;
     if post_sha != target.reference_executable.sha256 {
         return Err("authenticated Z3 bytes changed during registry discovery".to_string());
     }
 
-    let observable = extract_observable_items(snapshot, &captures)?;
+    let observable = if captures
+        .iter()
+        .all(|capture| capture.outcome == ValidatorCaseOutcome::Pass)
+    {
+        extract_observable_items(snapshot, &captures)?
+    } else {
+        // Preserve a complete expected source/catalog population when a live
+        // process fails. Its explicit failed capture prevents closure; do not
+        // misrepresent a partial transcript as a smaller valid registry.
+        authenticated_observable_catalog(snapshot)?
+    };
     let mut rows = source_cases(snapshot)?;
     rows.extend(observable_cases(&observable));
     rows.extend(captures.into_iter().map(LiveCapture::into_case));
@@ -1331,12 +1694,12 @@ fn run_capture(
 ) -> Result<LiveCapture, String> {
     let invocation = args.join(" ");
     let output = resources
-        .run_external_transcript(
+        .run_external_transcript_scrubbed(
             executable,
             args.iter().copied(),
             input,
             timeout,
-            &format!("Z3 5.1.0 source inventory: {id}"),
+            &format!("Z3 5.3.3 source inventory: {id}"),
         )
         .map_err(|error| error.to_string())?;
     let stdout_utf8 = String::from_utf8(output.stdout);
@@ -1470,32 +1833,15 @@ pub(super) fn extract_observable_items_from_transcripts(
         insert_item(&mut items, "input-mode", mode, mode)?;
     }
 
-    let mut source_extensions = extract_delimited(main, "strcmp(ext, \"", "\"");
-    let tptp_start = main
-        .find("static char const* tptp_extensions[]")
-        .ok_or("Z3 shell has no TPTP extension registry")?;
-    let tptp_end = main[tptp_start..]
-        .find("};")
-        .map(|offset| tptp_start + offset)
-        .ok_or("Z3 shell TPTP extension registry is unterminated")?;
-    source_extensions.extend(extract_quoted_strings(&main[tptp_start..tptp_end]));
-    let expected_extensions = EXTENSION_MODES
-        .iter()
-        .map(|(extension, _)| (*extension).to_string())
-        .collect::<BTreeSet<_>>();
-    if source_extensions != expected_extensions {
-        return Err(format!(
-            "Z3 filename-extension inventory drifted: expected {expected_extensions:?}, got {source_extensions:?}"
-        ));
-    }
+    validate_filename_extensions(main)?;
     for (extension, mode) in EXTENSION_MODES {
         insert_item(&mut items, "filename-extension", extension, mode)?;
     }
 
     let registry_commands = parse_command_help(transcripts.command_help)?;
-    if registry_commands.len() != 86 {
+    if registry_commands.len() != 90 {
         return Err(format!(
-            "Z3 live SMT2 command registry drifted: expected 86, got {}",
+            "Z3 live SMT2 command registry drifted: expected 90, got {}",
             registry_commands.len()
         ));
     }
@@ -1511,9 +1857,9 @@ pub(super) fn extract_observable_items_from_transcripts(
         .chain(native_commands.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
-    if command_names.len() != 94 {
+    if command_names.len() != 98 {
         return Err(format!(
-            "Z3 accepted SMT2 command union drifted: expected 94, got {}",
+            "Z3 accepted SMT2 command union drifted: expected 98, got {}",
             command_names.len()
         ));
     }
@@ -1612,9 +1958,9 @@ pub(super) fn extract_observable_items_from_transcripts(
             }
         }
     }
-    if logic_literals.len() != 24 {
+    if logic_literals.len() != 27 {
         return Err(format!(
-            "Z3 source logic-recognizer literal inventory drifted: expected 24, got {}",
+            "Z3 source logic-recognizer literal inventory drifted: expected 27, got {}",
             logic_literals.len()
         ));
     }
@@ -1633,9 +1979,9 @@ pub(super) fn extract_observable_items_from_transcripts(
     let setup_path = "src/smt/smt_setup.cpp";
     let strategy_aliases =
         extract_delimited(source_text(snapshot, setup_path)?, "m_logic == \"", "\"");
-    if strategy_aliases.len() != 33 {
+    if strategy_aliases.len() != 35 {
         return Err(format!(
-            "Z3 source logic-strategy alias inventory drifted: expected 33, got {}",
+            "Z3 source logic-strategy alias inventory drifted: expected 35, got {}",
             strategy_aliases.len()
         ));
     }
@@ -1654,9 +2000,9 @@ pub(super) fn extract_observable_items_from_transcripts(
             declaration_builtins.entry(symbol).or_default().insert(path);
         }
     }
-    if declaration_builtins.len() != 323 {
+    if declaration_builtins.len() != 342 {
         return Err(format!(
-            "Z3 declaration-plugin builtin inventory drifted: expected 323, got {}",
+            "Z3 declaration-plugin builtin inventory drifted: expected 342, got {}",
             declaration_builtins.len()
         ));
     }
@@ -1672,12 +2018,23 @@ pub(super) fn extract_observable_items_from_transcripts(
         )?;
     }
 
-    for (registry_output, category, expected) in [
-        (transcripts.tactics, "tactic", 118usize),
-        (transcripts.probes, "probe", 42usize),
-        (transcripts.simplifiers, "simplifier", 37usize),
+    for (registry_output, category, token, expected) in [
+        (transcripts.tactics, "tactic", "Z3_ADD_TACTIC", 123usize),
+        (transcripts.probes, "probe", "Z3_ADD_PROBE", 42usize),
+        (
+            transcripts.simplifiers,
+            "simplifier",
+            "Z3_ADD_SIMPLIFIER",
+            44usize,
+        ),
     ] {
         let registry = parse_dash_registry(registry_output)?;
+        let registrations = native_registration_catalog(snapshot, token)?;
+        if registrations != registry {
+            return Err(format!(
+                "Z3 {category} native source registrations differ from its live catalog"
+            ));
+        }
         if registry.len() != expected {
             return Err(format!(
                 "Z3 {category} registry drifted: expected {expected}, got {}",
@@ -1758,6 +2115,74 @@ fn insert_item(
         .is_some()
     {
         return Err(format!("duplicate Z3 observable item {category}.{name}"));
+    }
+    Ok(())
+}
+
+fn source_string_array(source: &str, name: &str) -> Result<BTreeSet<String>, String> {
+    let anchor = format!("{name}[]");
+    let mut anchors = source.match_indices(&anchor);
+    let (start, _) = anchors
+        .next()
+        .ok_or_else(|| format!("Z3 shell has no {name} registry"))?;
+    if anchors.next().is_some() {
+        return Err(format!(
+            "Z3 shell has ambiguous {name} registry declarations"
+        ));
+    }
+    let remaining = &source[start + anchor.len()..];
+    let body = remaining
+        .trim_start()
+        .strip_prefix('=')
+        .map(str::trim_start)
+        .and_then(|text| text.strip_prefix('{'))
+        .ok_or_else(|| format!("Z3 shell {name} registry has no array initializer"))?;
+    let (body, _) = body
+        .split_once("};")
+        .ok_or_else(|| format!("Z3 shell {name} registry is unterminated"))?;
+    let mut values = BTreeSet::new();
+    for item in body
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let value = item
+            .strip_prefix('"')
+            .and_then(|text| text.strip_suffix('"'))
+            .filter(|text| {
+                !text.is_empty()
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            })
+            .ok_or_else(|| {
+                format!("Z3 shell {name} registry has an unclassified extension {item:?}")
+            })?;
+        if !values.insert(value.to_string()) {
+            return Err(format!(
+                "Z3 shell {name} registry repeats extension {value}"
+            ));
+        }
+    }
+    Ok(values)
+}
+
+fn validate_filename_extensions(main: &str) -> Result<(), String> {
+    let mut actual = extract_delimited(main, "strcmp(ext, \"", "\"");
+    // DRAT is selected while parsing input arguments, before the later
+    // extension switch. The advertised .smt alias enters through the known
+    // filename array and uses the default SMT-LIB input kind.
+    actual.extend(extract_delimited(main, "strcmp(arg_ext, \"", "\""));
+    actual.extend(source_string_array(main, "known_input_extensions")?);
+    actual.extend(source_string_array(main, "tptp_extensions")?);
+    let expected = EXTENSION_MODES
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "Z3 filename-extension inventory drifted: expected {expected:?}, got {actual:?}"
+        ));
     }
     Ok(())
 }
@@ -2186,7 +2611,7 @@ pub(super) fn observable_manifest_sha256(items: &[ObservableItem]) -> String {
 }
 
 fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<ValidatorCase>, String> {
-    validate_snapshot(snapshot, &canonical_profile())?;
+    validate_snapshot(snapshot, &canonical_profile()?)?;
     let tree_entry = |path: &str| {
         snapshot
             .tree
@@ -2224,7 +2649,12 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
     };
 
     let abi = tree_entry("src/api/z3_api.h")?;
-    let abi_source_digest = selected_manifest(&["src/api/z3_api.h", "src/api/z3_macros.h"])?;
+    let public_headers = SELECTED_SOURCE_PATHS
+        .iter()
+        .copied()
+        .filter(|path| path.starts_with("src/api/") && path.ends_with(".h"))
+        .collect::<Vec<_>>();
+    let abi_source_digest = selected_manifest(&public_headers)?;
     let behavior_paths = [
         "src/cmd_context/cmd_context.cpp",
         "src/cmd_context/simplifier_cmds.cpp",
@@ -2236,13 +2666,18 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
     ];
     let behavior_digest = selected_manifest(&behavior_paths)?;
     let version = source_text(snapshot, "scripts/VERSION.txt")?.trim();
-    if version != "5.1.0.0" {
+    if version != "5.3.3.0" {
         return Err(format!(
-            "pinned Z3 VERSION.txt is {version:?}, expected \"5.1.0.0\""
+            "pinned Z3 VERSION.txt is {version:?}, expected \"5.3.3.0\""
         ));
     }
     let identity_digest = selected_manifest(&["scripts/VERSION.txt", "src/util/z3_version.h.in"])?;
-    let selected_source_digest = selected_manifest(&SELECTED_SOURCE_PATHS)?;
+    let all_selected_paths = snapshot
+        .selected_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    let selected_source_digest = selected_manifest(&all_selected_paths)?;
     let source_digest = sha256_bytes(
         format!(
             "tree={EXPECTED_TREE_SHA256}\nselected={selected_source_digest}\nregistration-scan={}\n",
@@ -2250,10 +2685,12 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
         )
         .as_bytes(),
     );
+    let classification =
+        classify_registration_scan(&snapshot.registration_scan, &canonical_profile()?)?;
 
     let mut rows = vec![
         pass(
-            "overlay.z3-5.1.0.behavioral-transcripts",
+            "overlay.z3-5.3.3.behavioral-transcripts",
             behavior_digest.clone(),
             "pinned shell, parser, command, tactic, simplifier, and parameter source owners define the behavioral transcript row",
             format!(
@@ -2262,34 +2699,45 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
             ),
         ),
         pass(
-            "overlay.z3-5.1.0.c-abi",
+            "overlay.z3-5.3.3.c-abi",
             abi_source_digest.clone(),
-            "the exact pinned Z3 5.1.0 z3_api.h and z3_macros.h source objects own the C ABI row",
+            "the exact pinned Z3 5.3.3 public C/C++ header graph owns the ABI source row; semantic coverage remains separate",
             format!(
                 "path={:?};git-blob={};size={};api-source-manifest-sha256={abi_source_digest}",
                 abi.path, abi.git_blob, abi.size,
             ),
         ),
         pass(
-            "overlay.z3-5.1.0.source-inventory",
+            "overlay.z3-5.3.3.source-inventory",
             source_digest.clone(),
             "the complete source-tree manifest and retained registry-owner blobs define the observable overlay inventory row",
             format!(
                 "tree-files={EXPECTED_TREE_FILES};tree-sha256={EXPECTED_TREE_SHA256};selected-files={};selected-source-manifest-sha256={selected_source_digest};registration-sites={};registration-scan-sha256={}",
-                SELECTED_SOURCE_PATHS.len(),
+                snapshot.selected_files.len(),
                 snapshot.registration_scan.line_count,
                 snapshot.registration_scan.content_sha256
             ),
         ),
         pass(
-            "overlay.z3-5.1.0.target-identity",
+            "overlay.z3-5.3.3.target-identity",
             identity_digest.clone(),
-            "the pinned VERSION.txt and generated version-header template define the Z3 5.1.0 target-identity row",
+            "the pinned VERSION.txt and generated version-header template define the Z3 5.3.3 target-identity row",
             format!(
                 "version={version};selected-source-manifest-sha256={identity_digest}"
             ),
         ),
     ];
+    if !classification.unresolved.is_empty() {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == "overlay.z3-5.3.3.source-inventory")
+            .ok_or("source inventory reference row is missing")?;
+        row.outcome = ValidatorCaseOutcome::Fail;
+        row.observed.push_str(&format!(
+            ";unresolved-registration-candidates={}",
+            classification.unresolved.len()
+        ));
+    }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(rows)
 }
@@ -2304,7 +2752,7 @@ fn source_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<ValidatorCase>, Strin
                 &sha256_bytes(entry.path.as_bytes())[..12]
             ),
             input_sha256: sha256_bytes(manifest.as_bytes()),
-            expected: "exact tracked path, Git blob object, and byte-size row in the pinned 2,756-file source manifest".to_string(),
+            expected: "exact tracked path, Git blob object, and byte-size row in the pinned 3,661-file source manifest".to_string(),
             observed: format!(
                 "path={:?};git-blob={};size={}",
                 entry.path, entry.git_blob, entry.size
@@ -2337,11 +2785,11 @@ fn source_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<ValidatorCase>, Strin
         });
     }
     let classification =
-        classify_registration_scan(&snapshot.registration_scan, &canonical_profile())?;
+        classify_registration_scan(&snapshot.registration_scan, &canonical_profile()?)?;
     rows.push(ValidatorCase {
         id: "source-registration-scan.classified".to_string(),
         input_sha256: classification.content_sha256.clone(),
-        expected: "every row in the broad pinned registration scan receives exactly one closed observable-owner or explicit non-observable disposition; unknown path and lexical classes abort validation".to_string(),
+        expected: "every row in the broad pinned registration scan has an explicit audited owner or exclusion; unresolved candidates prevent source closure".to_string(),
         observed: format!(
             "scopes=src,scripts;matches={};raw-sha256={};classification-counts={};classification-sha256={}",
             snapshot.registration_scan.line_count,
@@ -2353,9 +2801,34 @@ fn source_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<ValidatorCase>, Strin
         stderr: None,
         exit_code: None,
         process: None,
-        outcome: ValidatorCaseOutcome::Pass,
+        outcome: if classification.unresolved.is_empty() { ValidatorCaseOutcome::Pass } else { ValidatorCaseOutcome::Fail },
     });
+    rows.extend(
+        classification
+            .unresolved
+            .iter()
+            .enumerate()
+            .map(|(index, (path, line, text))| {
+                unresolved_registration_case(index, path, *line, text)
+            }),
+    );
     Ok(rows)
+}
+
+fn unresolved_registration_case(
+    index: usize,
+    path: &str,
+    line: usize,
+    text: &str,
+) -> ValidatorCase {
+    ValidatorCase {
+        id: format!("source-registration-unresolved.{index:05}.{}", &sha256_bytes(path.as_bytes())[..12]),
+        input_sha256: sha256_bytes(format!("{path}:{line}:{text}\n").as_bytes()),
+        expected: "establish a source-backed observable owner or an explicit exclusion before claiming complete CLI source coverage".to_string(),
+        observed: format!("path={path:?};line={line};source={text:?};ownership=unresolved"),
+        stdout: None, stderr: None, exit_code: None, process: None,
+        outcome: ValidatorCaseOutcome::Fail,
+    }
 }
 
 fn observable_cases(items: &[ObservableItem]) -> Vec<ValidatorCase> {
@@ -2371,7 +2844,7 @@ fn observable_cases(items: &[ObservableItem]) -> Vec<ValidatorCase> {
                     &sha256_bytes(item.name.as_bytes())[..12]
                 ),
                 input_sha256: sha256_bytes(canonical.as_bytes()),
-                expected: "exact sorted observable Z3 5.1.0 source/live-registry inventory item"
+                expected: "exact sorted observable Z3 5.3.3 source/live-registry inventory item"
                     .to_string(),
                 observed: format!(
                     "category={:?};name={:?};detail={:?}",
@@ -2455,24 +2928,51 @@ fn validate_git_object_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn git_text(checkout: &Path, args: &[&str], label: &str) -> Result<String, String> {
-    String::from_utf8(git_bytes(checkout, args, label)?)
+fn git_text(
+    resources: &PlannedResources,
+    checkout: &Path,
+    args: &[&str],
+    label: &str,
+) -> Result<String, String> {
+    String::from_utf8(git_bytes(resources, checkout, args, label)?)
         .map_err(|_| format!("git {label} output is not UTF-8"))
 }
 
-fn git_bytes(checkout: &Path, args: &[&str], label: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(checkout)
-        .args(args)
-        .output()
-        .map_err(|error| format!("running git for {label}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {label} failed with status {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+fn git_bytes(
+    resources: &PlannedResources,
+    checkout: &Path,
+    args: &[&str],
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut command = vec![
+        std::ffi::OsString::from("-c"),
+        "core.hooksPath=/dev/null".into(),
+        "-C".into(),
+        checkout.as_os_str().to_owned(),
+    ];
+    command.extend(args.iter().map(std::ffi::OsString::from));
+    let output = resources
+        .run_external_transcript_scrubbed_with_file_limit(
+            "git",
+            &command,
+            b"",
+            Duration::from_secs(30),
+            label,
+            MAX_SNAPSHOT_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+    let no_matches = args.first() == Some(&"grep")
+        && output.status.and_then(|status| status.code()) == Some(1)
+        && output.stdout.is_empty();
+    if !output.stdin_complete
+        || output.timed_out
+        || output.memout
+        || output.stdout_truncated
+        || output.stderr_truncated
+        || !output.stderr.is_empty()
+        || (!output.status.is_some_and(|status| status.success()) && !no_matches)
+    {
+        return Err(format!("bounded git {label} failed: status={:?}; timeout={}; memout={}; stdout_truncated={}; stderr_truncated={}; stderr={}", output.status.and_then(|status| status.code()), output.timed_out, output.memout, output.stdout_truncated, output.stderr_truncated, String::from_utf8_lossy(&output.stderr)));
     }
     Ok(output.stdout)
 }
@@ -2508,6 +3008,307 @@ fn existing_relative_file(base: &Path, path: &Path, label: &str) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filename_extensions_include_argument_dispatch_and_known_filename_aliases() {
+        // The three separate forms in pinned src/shell/main.cpp: the late
+        // input-kind switch, early DRAT argument handling, and filename arrays.
+        let source = r#"
+static char const* tptp_extensions[] = {"p", "tptp", "fof", "cnf", "tff", "thf"};
+static char const * known_input_extensions[] = {
+    "smt2", "smt", "dimacs", "cnf", "wcnf", "opb", "lp", "log", "drat", "p"
+};
+if (arg_ext && strcmp(arg_ext, "drat") == 0) { g_input_kind = IN_DRAT; }
+g_input_kind = IN_SMTLIB_2;
+if (strcmp(ext, "datalog") == 0 || strcmp(ext, "dl") == 0) {}
+else if (strcmp(ext, "dimacs") == 0 || strcmp(ext, "cnf") == 0) {}
+else if (strcmp(ext, "wcnf") == 0) {}
+else if (strcmp(ext, "opb") == 0) {}
+else if (strcmp(ext, "lp") == 0) {}
+else if (strcmp(ext, "log") == 0) {}
+else if (strcmp(ext, "smt2") == 0) {}
+"#;
+        validate_filename_extensions(source).unwrap();
+        assert!(validate_filename_extensions(&source.replace("\"smt\", ", "")).is_err());
+        assert!(validate_filename_extensions(
+            &source.replace("\"smt\",", "\"smt\", \"invented\",")
+        )
+        .is_err());
+        assert!(source_string_array(
+            &source.replace("\"smt\",", "SOME_DYNAMIC_EXTENSION,"),
+            "known_input_extensions"
+        )
+        .is_err());
+        assert_eq!(
+            extract_delimited(source, "strcmp(arg_ext, \"", "\""),
+            BTreeSet::from(["drat".to_string()])
+        );
+    }
+
+    #[test]
+    fn source_indentation_remains_hash_bound_and_has_a_valid_receipt_row() {
+        let source = "\tregister_candidate(\"parameter\");";
+        let row = unresolved_registration_case(0, "src/util/example.cpp", 7, source);
+        assert_eq!(
+            row.input_sha256,
+            sha256_bytes(format!("src/util/example.cpp:7:{source}\n").as_bytes())
+        );
+        assert_eq!(row.outcome, ValidatorCaseOutcome::Fail);
+        let rows = vec![row];
+        validate_case_results(&rows, &case_counts_from_rows(&rows).unwrap()).unwrap();
+        let changed = unresolved_registration_case(0, "src/util/example.cpp", 7, source.trim());
+        assert_ne!(rows[0].input_sha256, changed.input_sha256);
+    }
+
+    fn exact_live_rows() -> (Profile, Vec<ValidatorCase>) {
+        let profile = canonical_profile().unwrap();
+        let baseline = discovery_baseline(&profile).unwrap();
+        let rows = DISCOVERY_INVOCATIONS
+            .into_iter()
+            .map(|(id, args, input)| {
+                LiveCapture {
+                    id,
+                    invocation: args.join(" "),
+                    input: input.to_vec(),
+                    stdout: baseline.outputs[id].stdout.clone(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    process: ProcessObservation {
+                        stdin_complete: true,
+                        timed_out: false,
+                        memout: false,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    },
+                    outcome: ValidatorCaseOutcome::Pass,
+                }
+                .into_case()
+            })
+            .collect();
+        (profile, rows)
+    }
+
+    #[test]
+    fn live_receipt_population_and_invocations_are_authenticated_before_results() {
+        let (profile, rows) = exact_live_rows();
+        validate_live_rows(&rows, &profile).unwrap();
+        let mut changed = rows.clone();
+        changed[0].id = "live.invented".to_string();
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        let mut changed = rows.clone();
+        changed[2].input_sha256 = sha256_bytes(b"different invocation");
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        let mut changed = rows.clone();
+        changed[2].expected.push_str(" altered command");
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        assert!(validate_live_rows(&rows[..7], &profile).is_err());
+        let mut duplicated = rows;
+        duplicated[1] = duplicated[0].clone();
+        assert!(validate_live_rows(&duplicated, &profile).is_err());
+    }
+
+    #[test]
+    fn changed_live_transcripts_cannot_keep_a_pass_but_can_record_failure() {
+        let (profile, rows) = exact_live_rows();
+        let mut changed = rows.clone();
+        changed[3]
+            .stdout
+            .as_mut()
+            .unwrap()
+            .push_str("- invented invented tactic\n");
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        changed[3].outcome = ValidatorCaseOutcome::Fail;
+        validate_live_rows(&changed, &profile)
+            .expect("retained nonmatching output is failed evidence");
+        let mut changed = rows;
+        changed[4].stderr = Some("native process failure\n".to_string());
+        changed[4].observed = live_observation(
+            changed[4].exit_code,
+            changed[4].process.as_ref().unwrap(),
+            false,
+        );
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        changed[4].outcome = ValidatorCaseOutcome::Fail;
+        validate_live_rows(&changed, &profile)
+            .expect("retained diagnostic remains failed evidence");
+    }
+
+    #[test]
+    fn interrupted_or_internally_inconsistent_live_rows_never_gain_pass() {
+        let (profile, rows) = exact_live_rows();
+        let mut changed = rows.clone();
+        changed[5].process.as_mut().unwrap().timed_out = true;
+        changed[5].observed = live_observation(
+            changed[5].exit_code,
+            changed[5].process.as_ref().unwrap(),
+            true,
+        );
+        assert!(validate_live_rows(&changed, &profile).is_err());
+        changed[5].outcome = ValidatorCaseOutcome::Timeout;
+        validate_live_rows(&changed, &profile).expect("explicit timeout is valid failed evidence");
+        let mut changed = rows;
+        changed[0].observed.push_str(";stderr-empty=false");
+        assert!(validate_live_rows(&changed, &profile).is_err());
+    }
+
+    fn partial_source_fixture(content: String) -> Z3SourceSnapshot {
+        let profile = canonical_profile().unwrap();
+        Z3SourceSnapshot {
+            schema: SNAPSHOT_SCHEMA.to_string(),
+            profile_id: PROFILE_ID.to_string(),
+            source: expected_snapshot_source(&profile),
+            tree: Vec::new(),
+            selected_files: Vec::new(),
+            registration_scan: Z3RegistrationScan {
+                pattern: REGISTRATION_SCAN_PATTERN.to_string(),
+                scopes: vec!["src".to_string(), "scripts".to_string()],
+                line_count: content.lines().count(),
+                content_sha256: sha256_bytes(content.as_bytes()),
+                content,
+            },
+        }
+    }
+
+    #[test]
+    fn current_discovery_baseline_is_bound_and_rejects_changed_output() {
+        let profile = canonical_profile().unwrap();
+        let baseline = discovery_baseline(&profile).unwrap();
+        for (id, count) in [("tactics", 123), ("probes", 42), ("simplifiers", 44)] {
+            assert_eq!(
+                parse_dash_registry(&baseline.outputs[id].stdout)
+                    .unwrap()
+                    .len(),
+                count
+            );
+        }
+        let parameters = parse_parameters(&baseline.outputs["parameters"].stdout).unwrap();
+        assert_eq!(
+            parameters
+                .keys()
+                .filter(|(category, _)| category == "module-parameter")
+                .count(),
+            738
+        );
+        assert_eq!(
+            parameters
+                .keys()
+                .filter(|(category, _)| category == "global-parameter")
+                .count(),
+            25
+        );
+        let mut changed = baseline.clone();
+        changed
+            .outputs
+            .get_mut("tactics")
+            .unwrap()
+            .stdout
+            .push_str("- invented invented tactic\n");
+        assert!(validate_discovery_baseline(&changed, &profile).is_err());
+        let mut changed = baseline;
+        changed.outputs.remove("command-help");
+        assert!(validate_discovery_baseline(&changed, &profile).is_err());
+    }
+
+    #[test]
+    fn unproven_registration_candidates_are_failed_evidence_not_exclusions() {
+        let profile = canonical_profile().unwrap();
+        let snapshot = partial_source_fixture(format!(
+            "{}:src/tactic/example.cpp:7:void install_mysterious_tactic();\n",
+            profile.z3_overlay.source_commit
+        ));
+        let rows = source_cases(&snapshot).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row.outcome == ValidatorCaseOutcome::Fail));
+        assert!(rows
+            .iter()
+            .any(|row| row.id.starts_with("source-registration-unresolved.")
+                && row.observed.contains("ownership=unresolved")));
+        assert_eq!(
+            registration_disposition("src/api/api.cpp", "void register_mysterious_tactic();")
+                .unwrap(),
+            "unresolved.registration-candidate"
+        );
+        assert_eq!(
+            registration_disposition("src/test/example.cpp", "void register_mysterious_tactic();")
+                .unwrap(),
+            "unresolved.registration-candidate"
+        );
+        assert_eq!(
+            registration_disposition("src/tactic/example.h", "#define hidden_tactic make_tactic")
+                .unwrap(),
+            "unresolved.registration-candidate"
+        );
+    }
+
+    #[test]
+    fn declaration_registration_closure_requires_finite_field_owner() {
+        let mut snapshot = partial_source_fixture(String::new());
+        let families = [
+            "arith",
+            "array",
+            "bv",
+            "char",
+            "datatype",
+            "datalog_relation",
+            "ff",
+            "finite_set",
+            "fpa",
+            "pb",
+            "recfun",
+            "seq",
+            "specrels",
+        ];
+        let content = families
+            .iter()
+            .map(|name| format!("register_plugin(symbol(\"{name}\"), plugin);\n"))
+            .collect::<String>();
+        for path in [
+            "src/ast/reg_decl_plugins.cpp",
+            "src/cmd_context/cmd_context.cpp",
+        ] {
+            snapshot.selected_files.push(Z3SelectedFile {
+                path: path.to_string(),
+                git_blob: git_blob_sha1(content.as_bytes()),
+                size: content.len(),
+                content_sha256: sha256_bytes(content.as_bytes()),
+                content: content.clone(),
+            });
+        }
+        validate_declaration_plugin_owners(&snapshot).unwrap();
+        snapshot.selected_files[0].content =
+            content.replace("register_plugin(symbol(\"ff\"), plugin);\n", "");
+        assert!(validate_declaration_plugin_owners(&snapshot).is_err());
+        snapshot.selected_files[0].content =
+            format!("{content}register_plugin(symbol(\"new_family\"), plugin);\n");
+        assert!(validate_declaration_plugin_owners(&snapshot).is_err());
+    }
+
+    #[test]
+    fn native_registration_parser_owns_multiline_literals_and_rejects_duplicates() {
+        let mut snapshot = partial_source_fixture(String::new());
+        let content = "Z3_ADD_TACTIC(\n  current, \"current\",\n  \"current registration.\", make_current(m, p));\n";
+        snapshot.selected_files.push(Z3SelectedFile {
+            path: "src/tactic/current.h".to_string(),
+            git_blob: git_blob_sha1(content.as_bytes()),
+            size: content.len(),
+            content_sha256: sha256_bytes(content.as_bytes()),
+            content: content.to_string(),
+        });
+        assert_eq!(
+            native_registration_catalog(&snapshot, "Z3_ADD_TACTIC").unwrap(),
+            BTreeMap::from([(
+                "current".to_string(),
+                "current current registration.".to_string()
+            )])
+        );
+        snapshot.selected_files[0].content.push_str(content);
+        assert!(native_registration_catalog(&snapshot, "Z3_ADD_TACTIC").is_err());
+        snapshot.selected_files[0].content =
+            "Z3_ADD_TACTIC(current, dynamic_name, \"description\", make_current());".to_string();
+        assert!(native_registration_catalog(&snapshot, "Z3_ADD_TACTIC").is_err());
+    }
 
     #[test]
     fn full_tree_manifest_algorithm_is_frozen() {
@@ -2665,17 +3466,7 @@ op_names.push_back(builtin_name("equiv", OP_EQ));
     }
 
     #[test]
-    fn registration_classifier_counts_are_closed_and_one_of() {
-        assert_eq!(
-            EXPECTED_REGISTRATION_CLASSIFICATION_COUNTS
-                .iter()
-                .map(|(_, count)| count)
-                .sum::<usize>(),
-            EXPECTED_REGISTRATION_SCAN_LINES
-        );
-        assert!(EXPECTED_REGISTRATION_CLASSIFICATION_COUNTS
-            .windows(2)
-            .all(|window| window[0].0 < window[1].0));
+    fn registration_classifier_keeps_explicit_registration_owners() {
         assert_eq!(
             registration_disposition(
                 "src/shell/main.cpp",
@@ -2687,7 +3478,7 @@ op_names.push_back(builtin_name("equiv", OP_EQ));
         assert_eq!(
             registration_disposition(
                 "src/tactic/example.h",
-                "ADD_TACTIC(\"example\", \"example tactic\", \"mk_example()\")"
+                "Z3_ADD_TACTIC(example, \"example\", \"example tactic\", mk_example())"
             )
             .unwrap(),
             "observable.tactic-registration"
@@ -2702,5 +3493,13 @@ op_names.push_back(builtin_name("equiv", OP_EQ));
         );
         assert!(registration_disposition("src/tactic/example.cpp", "ordinary source row").is_err());
         assert!(registration_disposition("src/tactic/example.unknown", "tactic").is_err());
+        assert_eq!(
+            registration_disposition(
+                "src/tactic/example.cpp",
+                "/* note */ install_hidden_tactic();"
+            )
+            .unwrap(),
+            "unresolved.registration-candidate"
+        );
     }
 }

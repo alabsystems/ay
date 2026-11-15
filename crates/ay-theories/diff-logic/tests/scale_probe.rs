@@ -14,8 +14,11 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
+    /// Uniform-ish in `-span..=span` for `0 <= span < 2^62`. Modular RNG
+    /// arithmetic: wrapping is the intended semantics.
     fn signed(&mut self, span: i64) -> i64 {
-        (self.next() % (2 * span as u64 + 1)) as i64 - span
+        let width = (span as u64).wrapping_mul(2).wrapping_add(1);
+        ((self.next() % width.max(1)) as i64).wrapping_sub(span)
     }
 }
 
@@ -50,11 +53,12 @@ fn scale_probe_at_skdmxa2_size() {
     }
 
     let t0 = Instant::now();
-    let (mut ok, mut conflicts) = (0usize, 0usize);
+    let (mut ok, mut conflicts, mut refused) = (0usize, 0usize, 0usize);
     for &id in &ids {
         match g.assert_edge(id) {
             AssertOutcome::Consistent => ok += 1,
             AssertOutcome::Conflict(_) => conflicts += 1,
+            AssertOutcome::Refused => refused = refused.saturating_add(1),
         }
     }
     let bulk = t0.elapsed();
@@ -81,7 +85,7 @@ fn scale_probe_at_skdmxa2_size() {
 
     eprintln!("  n={n}  edges={m}");
     eprintln!(
-        "  bulk assert     : {ok} ok / {conflicts} conflicts in {bulk:?}  ({:.2} us/assert)",
+        "  bulk assert     : {ok} ok / {conflicts} conflicts / {refused} refused in {bulk:?}  ({:.2} us/assert)",
         bulk.as_secs_f64() * 1e6 / m as f64
     );
     eprintln!(

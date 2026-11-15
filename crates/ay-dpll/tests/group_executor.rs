@@ -27,6 +27,8 @@ mod executor_array_row_case_split_certified;
 mod executor_eq_diamond20;
 #[path = "group_executor/executor_regression_1708_order_dependent.rs"]
 mod executor_regression_1708_order_dependent;
+#[path = "group_executor/executor_regression_false_lemma_direct_decline.rs"]
+mod executor_regression_false_lemma_direct_decline;
 #[path = "group_executor/executor_simple_processors_006_002_0008.rs"]
 mod executor_simple_processors_006_002_0008;
 #[path = "group_executor/expression_split_1915.rs"]
@@ -39,3 +41,5 @@ mod shared_disequality_split_6148;
 mod split_loop_timing_6503;
 #[path = "group_executor/split_loop_timing_accumulation_6503.rs"]
 mod split_loop_timing_accumulation_6503;
+#[path = "group_executor/z3_5_strict_shape_scan.rs"]
+mod z3_5_strict_shape_scan;

@@ -24,6 +24,17 @@ pub(super) fn add_discovered_invariant_algebraic(
     add_discovered_invariant_impl(solver, pred, formula, level, true)
 }
 
+/// Process-wide count of ill-typed invariant candidates turned away at
+/// admission. Expected 0 once every producer is sort-aware; a non-zero value
+/// names a new producer to fix (see `pdr::typed_subst_tests`).
+static ILL_TYPED_CANDIDATES_REJECTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn ill_typed_candidates_rejected() -> usize {
+    ILL_TYPED_CANDIDATES_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) fn add_discovered_invariant_impl(
     solver: &mut PdrSolver,
     pred: PredicateId,
@@ -32,6 +43,26 @@ pub(super) fn add_discovered_invariant_impl(
     algebraically_verified: bool,
 ) -> bool {
     let lia_farkas_template = start_lia_farkas_template_admission(solver, &formula);
+
+    // Well-typedness gate (PDR_typed_subst_2026-09-19): a candidate with an
+    // ill-typed atom (arithmetic comparison over Bool operands, mixed-sort
+    // equality, ...) can never be an invariant of a well-typed problem, and
+    // every SMT query built from it is refused by both bridge lanes — the
+    // entry / self-inductiveness checks below would re-issue the refusal on
+    // every clause. Reject at the door, whatever discovery routine built it.
+    if let Some(reason) =
+        crate::smt::executor_sort_guard::unsupported_executor_expr_reason(&formula)
+    {
+        ILL_TYPED_CANDIDATES_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if solver.config.verbose {
+            safe_eprintln!(
+                "PDR: Rejecting ill-typed invariant candidate for pred {} ({reason}): {}",
+                pred.index(),
+                formula
+            );
+        }
+        return finish_lia_farkas_template_admission(solver, lia_farkas_template, false, true);
+    }
 
     if formula.contains_array_ops() && !formula.is_bool_sorted_top_level() {
         return finish_lia_farkas_template_admission(solver, lia_farkas_template, false, true);

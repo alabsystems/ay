@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const init (_ BitVec 64))
+(declare-const step (_ BitVec 64))
+(assert (not (= (bvadd (bvmul (_ bv4 64) step) init) (bvadd (bvadd (bvadd (bvadd init step) step) step) step))))
+(check-sat)
+(exit)

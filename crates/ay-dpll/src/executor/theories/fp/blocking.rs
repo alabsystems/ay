@@ -212,3 +212,33 @@ pub(super) fn choose_blocking_clause(
         )
     }
 }
+
+/// Widen a refinement block by the decided rounding modes the mixed
+/// subproblem read: the block then excludes the site values only TOGETHER with
+/// those modes, since the subproblem was UNSAT under both (see
+/// `collect_child_mode_dependencies`). Without modes the block is unchanged.
+pub(super) fn block_decided_modes(
+    blocking: CnfClause,
+    modes: &[ay_core::TermId],
+    rm_terms: &HashMap<ay_core::TermId, ay_fp::RmBits>,
+    sat_model: &[bool],
+    var_offset: i32,
+) -> CnfClause {
+    let mut lits = blocking.literals().to_vec();
+    let before = lits.len();
+    for bits in modes.iter().filter_map(|mode| rm_terms.get(mode)) {
+        for bit in bits.bits() {
+            let lit = offset_cnf_lit(bit, var_offset);
+            lits.push(if read_cnf_bit(sat_model, bit, var_offset) {
+                -lit
+            } else {
+                lit
+            });
+        }
+    }
+    if lits.len() == before {
+        blocking
+    } else {
+        CnfClause::new(lits)
+    }
+}

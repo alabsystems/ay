@@ -157,10 +157,14 @@ impl LraSolver {
             return;
         }
 
-        let eq_term = self.shared_disequality_equality_term(lhs, rhs, reason);
+        // A reason may be a negated INDEX equality rather than this numeric
+        // equality. Splitting that reason would order unrelated terms (even
+        // datatype constructors). Only the actual pair can guard its split;
+        // when absent, the existing model-equality handoff creates that atom.
+        let eq_term = self.terms().find_eq(lhs, rhs);
         if eq_term.is_none() && debug {
             safe_eprintln!(
-                "[LRA N-O] WARNING: shared disequality has no negated equality in reason ({} lits, all true)",
+                "[LRA N-O] Shared disequality has no equality atom for its actual operands ({} reason lits)",
                 reason.len()
             );
         }
@@ -191,20 +195,40 @@ impl LraSolver {
         self.dirty = true;
     }
 
-    // Prefer the explicit negated equality that conditions the split clause.
-    // Tight-bound propagation can legitimately provide positive reasons only;
-    // in that case find_eq is the existing sound fallback (#6131, #8516).
-    fn shared_disequality_equality_term(
-        &self,
-        lhs: TermId,
-        rhs: TermId,
-        reason: &[TheoryLit],
-    ) -> Option<TermId> {
-        reason
-            .iter()
-            .find(|lit| !lit.value)
-            .map(|lit| lit.term)
-            .or_else(|| self.terms().find_eq(lhs, rhs))
+    /// The reason literals of every cross-theory fact this solver currently
+    /// holds as a bound or a row — EUF shared equalities and disequalities
+    /// (`assert_shared_equality` / `assert_shared_disequality`, directly or
+    /// forwarded by an enclosing LIA) and cross-sort bounds
+    /// (`assert_tight_bound` / `assert_cross_sort_bounds`) — in the order they
+    /// were received, deduplicated, with their current polarity
+    /// (#nonlinear-shared-reasons).
+    ///
+    /// A procedure that refutes this solver's state AS A WHOLE and explains the
+    /// refutation with its own asserted atoms must cite these as well: the
+    /// state is the asserted atoms PLUS these facts, and a conflict that drops
+    /// them is not a theorem (QF_UFNIA `euf_div_010`: the 17-atom set the NIA
+    /// returned is satisfiable; the refutation leaned on the EUF equality
+    /// `f(a) = f(b)` held as a row). Every literal returned is live: the set is
+    /// scoped by `push`/`pop` exactly like the stale-reason guard that reads it.
+    ///
+    /// Nothing is filtered. A reason that is not a Boolean atom — the
+    /// arithmetic `lhs` a reasonless shared equality is installed with, or a
+    /// term that reached EUF as the reason of a tight-bound equality — is
+    /// returned as recorded: a conflict that names it cannot be mapped to a
+    /// clause, and the DPLL layer fails closed on it (`unknown`). Dropping it
+    /// instead would publish a conflict that rests on a fact nobody can name.
+    pub fn shared_constraint_reasons(&self) -> Vec<TheoryLit> {
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut out = Vec::new();
+        for &(term, _) in &self.cross_theory_asserted_trail {
+            if !seen.insert(term) {
+                continue;
+            }
+            if let Some(&value) = self.cross_theory_asserted.get(&term) {
+                out.push(TheoryLit::new(term, value));
+            }
+        }
+        out
     }
 
     // Keep the first conflict, but retain the complete explanation. The lhs
@@ -217,6 +241,8 @@ impl LraSolver {
                 reason.to_vec()
             };
             self.trivial_conflict = Some(conflict_lits);
+            // #lra-scope-trail: the conflict lives in the current scope.
+            self.trivial_conflict_scope = self.scopes.len();
         }
     }
 }

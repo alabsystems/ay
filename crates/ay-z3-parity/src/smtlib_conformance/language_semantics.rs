@@ -905,10 +905,10 @@ fn authenticate_rules(
             file.path,
             file.git_blob,
             file.content_sha256,
-            byte_offset,
-            rule.anchor.len(),
+            file.original_offset(byte_offset)?,
+            file.original_bytes(rule.anchor)?.len(),
             line_number,
-            sha256_bytes(containing_line.as_bytes()),
+            sha256_bytes(&file.original_bytes(containing_line)?),
             rule.anchor
         );
         bound.push(BoundRule {
@@ -1297,7 +1297,7 @@ fn validate_and_replay(
         let source = reference_inventory::load_bound_language_source(
             input,
             context.manifest_dir,
-            &canonical_profile(),
+            &canonical_profile()?,
         )?;
         let catalog = case_catalog(flavor, context.dimension, &source.files)?;
         validate_receipt_rows(flavor, receipt, &catalog)?;

@@ -1,0 +1,16 @@
+pseudo-Boolean proof version 3.0
+% Regression test, mirror image of pol_div_oversized_divisor_cardinality: `GeneralPBConstraint`'s
+% oversized-divisor fallbacks did not narrow the divisor, they clamped the quotient to
+% `A.is_positive()`. `d` not fitting `N` only gives `d >= N::MAX + 1`, and the degree reaches
+% `N::MIN`, so at `A = N::MIN, d = N::MAX + 1` the quotient is `-1` and the clamp stored the
+% strictly stronger `0`. That direction stayed sound only because every surviving coefficient is
+% `1` there -- but it is not the constraint `d`/`c` define, and `--kernel-verify` rejected these
+% valid proofs over it. Line 2 is normalized form (`d`), line 4 is variable form (`c`).
+f 1 ;
+pol 1 9223372036854775807 - 1 - 9223372036854775808 d ;
+e 1 x1 1 x2 >= -1 : 2 ;
+pol x1 x1 + 2 * ~x1 ~x1 + 9223372036854775806 - + 9223372036854775808 c ;
+e 1 x1 >= -1 : 3 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

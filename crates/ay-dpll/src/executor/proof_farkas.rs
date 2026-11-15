@@ -63,7 +63,8 @@ fn collect_equality_assertions(
 /// `LraFarkas` (from the theory solver) but lack Farkas coefficients are not
 /// promoted — they need a separate reconstruction pass.
 ///
-/// For each qualifying lemma: tries LRA solver first, then equality synthesis.
+/// Existing linear certificates are classified without changing their evidence.
+/// For each missing certificate: tries LRA solver first, then equality synthesis.
 pub(crate) fn reconstruct_missing_farkas_coefficients(
     terms: &mut TermStore,
     proof: &mut Proof,
@@ -82,34 +83,46 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
     // `try_lra_farkas_reconstruction -> LraSolver::register_atom`, is the entire
     // residual post-verdict cost of that obligation once the checker walks are
     // bounded.
+    //
+    // It is polled before EVERY reconstruction attempt, each retry against an
+    // equality assertion included: one attempt is a whole LRA solve, so a
+    // poll costs nothing beside it, and the retries are where the work
+    // multiplies (#r30-4a-nested-assembly-count: step (4a)'s nested assembly
+    // of `finstore_7373_0110` ran 7738 attempts in 3.0 s). The proof assembly
+    // charges each poll to its count (`proof/assembly_observations.rs`), so a
+    // poll per attempt is what lets that count end the pass at an attempt.
     should_stop: &dyn Fn() -> bool,
 ) {
     let true_id = terms.true_term();
     let equality_assertions =
         collect_equality_assertions(terms, proof, assertions, hidden_equality_assertions);
 
-    // Poll the caller's controls every `STOP_POLL_LEMMAS` candidate lemmas: one
-    // reconstruction attempt is a whole LRA solve, so this bounds detection
-    // latency to a few attempts without adding a poll to a hot inner loop.
-    const STOP_POLL_LEMMAS: usize = 16;
-    let mut examined: usize = 0;
-    for step in &mut proof.steps {
+    'lemmas: for step in &mut proof.steps {
         let ProofStep::TheoryLemma {
             kind,
             clause,
             farkas,
+            lia,
             ..
         } = step
         else {
             continue;
         };
-        if farkas.is_some() {
+        if let Some(annotation) = farkas.as_ref() {
+            // A retained integer certificate may already prove a linear
+            // contradiction. Classify that exact evidence before skipping
+            // reconstruction: the LRA wire path independently replays authored
+            // spellings, while generic LIA deliberately requires the same atom.
+            // Keep integer-specific payloads and non-linear evidence unchanged.
+            if matches!(kind, TheoryLemmaKind::LiaGeneric)
+                && lia.is_none()
+                && !should_stop()
+                && ay_proof::la_generic_farkas_lowering_supported(terms, clause, annotation, None)
+            {
+                *kind = TheoryLemmaKind::LraFarkas;
+            }
             continue;
         }
-        if examined.is_multiple_of(STOP_POLL_LEMMAS) && should_stop() {
-            break;
-        }
-        examined += 1;
         // Skip non-arithmetic theory lemma kinds that can never produce
         // Farkas coefficients (BV bit-blasting, pure EUF congruence).
         if matches!(
@@ -134,6 +147,9 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
             continue;
         }
 
+        if should_stop() {
+            break;
+        }
         if try_lra_farkas_reconstruction(terms, clause, farkas, kind) {
             continue;
         }
@@ -152,6 +168,9 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
         if !simplified_positions.is_empty() {
             let original_clause = clause.clone();
             for &eq_term in &equality_assertions {
+                if should_stop() {
+                    break 'lemmas;
+                }
                 // Create Not(eq_term) in the term store (#6757). The
                 // negation may not exist yet because the clause was built
                 // with Not(true) when EUF simplified the equality.
@@ -370,3 +389,7 @@ pub(crate) fn try_lra_farkas_reconstruction(
     };
     true
 }
+
+#[cfg(test)]
+#[path = "proof_farkas_classification_tests.rs"]
+mod classification_tests;

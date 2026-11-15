@@ -15,6 +15,8 @@ use crate::executor_types::Result;
 use crate::executor_types::SolveResult;
 
 #[cfg(test)]
+mod relaxation_first_tests;
+#[cfg(test)]
 mod scaled_product_tests;
 #[allow(clippy::panic)]
 #[cfg(test)]
@@ -28,7 +30,15 @@ impl Executor {
 
         solve_incremental_theory_pipeline!(self,
             tag: "NRA",
-            create_theory: NraSolver::new(&self.ctx.terms),
+            create_theory: {
+                // Install the solve deadline so a refinement loop over
+                // exploding rationals honours the caller's timeout.
+                let mut theory = NraSolver::new(&self.ctx.terms);
+                if let Some(deadline) = self.solve_deadline.get() {
+                    theory.set_deadline(deadline);
+                }
+                theory
+            },
             extract_models: |theory| TheoryModels {
                 lra: Some(theory.extract_model()),
                 // Propagate the exact ALGEBRAIC witnesses from the Sturm/IVT

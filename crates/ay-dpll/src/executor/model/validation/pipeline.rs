@@ -14,8 +14,9 @@ use ay_core::{TermId, VerificationBoundary, VerificationEvidenceKind, Verificati
 use super::{
     check_definitive_false, dt_axiom_bool, SkeletonVerificationResult, ValidationAttempt,
     ValidationObservation, ValidationSkipKind, ValidationStats, ValidationTarget, TERM_FLAG_ARRAY,
-    TERM_FLAG_DATATYPE,
+    TERM_FLAG_DATATYPE, TERM_FLAG_INTERNAL, TERM_FLAG_QUANTIFIER,
 };
+use crate::executor::model::independent_gate::QuantifierSkipEvidence;
 use crate::executor::model::{debug_model, Executor};
 use crate::executor_types::{ModelValidationError, Result, SolveResult, UnknownReason};
 use crate::features::StaticFeatures;
@@ -30,6 +31,36 @@ enum QfaxCellTerm {
     BaseRead { index: TermId },
 }
 
+/// #w6-carrier-immutable: whether `term`'s EUF value IS the carrier of an
+/// installed exact datatype-array class (the W6 inventory,
+/// `Model::dt_array_field_classes`) of `term`'s own sort.
+///
+/// Those carriers are the identity the W6 reauthentication binds to:
+/// `authenticated_datatype_array_field_classes` rejects the WHOLE inventory as
+/// soon as one closed member's `euf.term_values` entry differs from its class
+/// carrier, and the independent gate then has no authority left to pin any
+/// value of that sort (`datatype_leaf_value` -> `exact_datatype_cell_value_for_term`
+/// is the only resolver for an array-field datatype). Evaluators never need the
+/// carrier rewritten: `apply_exact_datatype_cell_completions` already pins every
+/// member's constructor tree in `dt_pins`, which `evaluate_term` consults before
+/// the EUF table.
+fn euf_value_is_w6_carrier(
+    terms: &ay_core::term::TermStore,
+    model: &crate::executor::model::Model,
+    term: TermId,
+) -> bool {
+    model
+        .euf_model
+        .as_ref()
+        .and_then(|euf| euf.term_values.get(&term))
+        .is_some_and(|carrier| {
+            model
+                .dt_array_field_classes
+                .iter()
+                .any(|class| class.carrier == *carrier && class.cell_sort == *terms.sort(term))
+        })
+}
+
 fn failed_assertion_contains_array(
     terms: &ay_core::term::TermStore,
     failed_assertion: Option<TermId>,
@@ -38,11 +69,66 @@ fn failed_assertion_contains_array(
         .is_some_and(|assertion| StaticFeatures::collect(terms, &[assertion]).has_arrays)
 }
 
+/// Which non-confirmation is being narrated.
+///
+/// The tier is named from the CALL SITE, never from the mode: reading it off
+/// `--self-check` is what made the line lie. Neither call site publishes the
+/// candidate it narrates — every caller of
+/// `record_model_validation_unknown_diagnostic` and of
+/// `reject_uncertified_verdict_for_publication` returns
+/// `SolveResult::Unknown` in every mode — so both print `withheld`. They stay
+/// distinct so a future call site that did ship its candidate would have to
+/// add a tier and state that, rather than inherit a mode-derived label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::executor) enum UnconfirmedTier {
+    /// A candidate model (or refutation) AY's own validator would not
+    /// confirm. The candidate is discarded; the solve answers `Unknown` or a
+    /// retry builds and validates a different candidate.
+    ModelValidation,
+    /// The UNSAT publication funnel refused the verdict. It is withheld.
+    WithheldVerdict,
+}
+
+/// The tier token printed on the `MODEL-UNCONFIRMED` line.
+///
+/// Pure so the mapping can be pinned without a solve. Both tiers read
+/// `withheld` in every mode: each call site discards the candidate it
+/// narrates and returns `Unknown` (see `record_unconfirmed_diagnostic`). A
+/// verdict the line could call `published` would have to come from a caller
+/// that ships the rejected candidate, and none exists.
+#[must_use]
+pub(in crate::executor) const fn unconfirmed_tier_label(tier: UnconfirmedTier) -> &'static str {
+    match tier {
+        UnconfirmedTier::WithheldVerdict | UnconfirmedTier::ModelValidation => {
+            "UNCONFIRMED/withheld"
+        }
+    }
+}
+
 impl Executor {
     pub(in crate::executor) fn record_model_validation_unknown_diagnostic(
         &mut self,
         detail: impl Into<String>,
     ) {
+        self.record_unconfirmed_diagnostic(UnconfirmedTier::ModelValidation, detail);
+    }
+
+    /// Narrate a verdict the publication funnel REFUSED.
+    ///
+    /// Same ledger, same `SELF-CHECK-REJECTED` token, same loudness — only the
+    /// tier differs, and it must, because this verdict is already gone. See
+    /// [`UnconfirmedTier`].
+    pub(in crate::executor) fn record_withheld_verdict_unknown_diagnostic(
+        &mut self,
+        detail: impl Into<String>,
+    ) {
+        self.record_unconfirmed_diagnostic(UnconfirmedTier::WithheldVerdict, detail);
+    }
+
+    fn record_unconfirmed_diagnostic(&mut self, tier: UnconfirmedTier, detail: impl Into<String>) {
+        if self.publish_evaluation_stop() {
+            return;
+        }
         let detail = detail.into();
         if ay_core::misc_cli_flags().debug_read_pin {
             eprintln!("[validation-unknown] {detail}");
@@ -81,14 +167,24 @@ impl Executor {
         // (`report_caught_invalid_model`, independent_gate.rs). This line must
         // not be confusable with it.
         //
-        // Mode still matters within this tier: under `--self-check` the
-        // non-confirmation WITHHELD the verdict, while in default mode the
-        // completeness-favoring path may publish it anyway.
-        let tier = if self.self_check {
-            "UNCONFIRMED/withheld"
-        } else {
-            "UNCONFIRMED/published"
-        };
+        // Mode does NOT decide the tier, in EITHER tier. Every caller of
+        // `record_model_validation_unknown_diagnostic` discards its candidate and
+        // returns `Unknown` right after it, in every mode (26 call sites, audited
+        // at the merge of origin/main); every caller of
+        // `reject_uncertified_verdict_for_publication` does the same. Outside
+        // `--self-check` the model-validation line used to say
+        // `UNCONFIRMED/published`, and storecomm_invalid_t1_pp_sf_ni_00030_008
+        // then read as a rejected model published as `sat`; that `sat` is the
+        // combiner re-solve's own, validated model (`#qfax-isolated-lane-retry`),
+        // exactly as under `--self-check`, which always printed `withheld`.
+        //
+        // The funnel half bit a consumer (measured 2026-09-18 on a
+        // deductive-checks-shaped query, `Box`/`Unbox` over a `Pair` datatype): default
+        // rigor printed `[UNCONFIRMED/published] … computed UNSAT rejected by
+        // mandatory strict certification` and then answered `unknown`. The
+        // tier is named from the CALL SITE (see `UnconfirmedTier`), and neither
+        // call site ever publishes the candidate it narrates.
+        let tier = unconfirmed_tier_label(tier);
         // Not while corroborating someone else's verdict. The deferred-trust
         // discharge re-solves the problem in a fresh `Executor` to confirm the
         // OUTER refutation; that probe reaches this same funnel and, when its
@@ -100,11 +196,21 @@ impl Executor {
         // publishes a certified `unsat`, yet this line still claimed the
         // verdict was unconfirmed. The statistics below stay: they live on the
         // probe's own executor and never reach the user.
-        if !crate::executor::unsat_cert::inside_trust_discharge_solve() {
-            ay_core::safe_eprintln!(
-                "c !! MODEL-UNCONFIRMED [{tier}] (not a refutation — see \
-                 [AY SOUNDNESS GATE] for caught invalid models) {detail}"
-            );
+        //
+        // BOTH nested lanes, not just the discharge. The closed-sentence
+        // certificate's negation refutations are the second fresh-`Executor`
+        // probe that reaches this funnel, and
+        // `inside_nested_certification_solve`'s own doc already says a refusal
+        // recorded under either one describes the probe rather than the
+        // caller's query — the guard just never read it. A probe that fails
+        // its own certification while the OUTER certification succeeds is the
+        // same false alarm in either lane. Nor under `--z3-mode`, whose stderr
+        // stays empty as z3's does; `(get-info :all-statistics)` keeps the line.
+        if !crate::executor::unsat_cert::inside_nested_certification_solve() {
+            self.stderr_diagnostics.record_model_unconfirmed(&detail);
+            if !ay_core::misc_cli_flags().z3_transcript {
+                super::super::stderr_diagnostics::print_model_unconfirmed_capped(tier, &detail);
+            }
         }
         self.last_statistics
             .set_string("unknown.phase", "model-validation");
@@ -278,6 +384,26 @@ impl Executor {
     }
 
     fn validate_model_attempt(&self) -> ValidationAttempt {
+        if let Some(error) = self.evaluation_stop_validation_error() {
+            return ValidationAttempt::failure(None, error);
+        }
+        let attempt = self.validate_model_attempt_inner();
+        match self.evaluation_stop_validation_error() {
+            Some(error) => ValidationAttempt::failure(attempt.stats, error),
+            None => attempt,
+        }
+    }
+
+    fn evaluation_stop_validation_error(&self) -> Option<ModelValidationError> {
+        self.evaluation_stop_origin().map(|origin| {
+            ModelValidationError::incomplete(
+                VerificationBoundary::SmtGroundAssertion,
+                format!("evaluation stopped: {origin:?}"),
+            )
+        })
+    }
+
+    fn validate_model_attempt_inner(&self) -> ValidationAttempt {
         let debug = debug_model();
         let model = match (&self.last_result, &self.last_model) {
             (Some(SolveResult::Sat), Some(m)) => m,
@@ -360,6 +486,9 @@ impl Executor {
                 has_array_assertions,
                 ValidationTarget::GroundAssertion,
             );
+            if let Some(error) = self.evaluation_stop_validation_error() {
+                return ValidationAttempt::failure(Some(stats), error);
+            }
             if debug {
                 tracing::debug!(
                     assertion_index = i,
@@ -375,8 +504,8 @@ impl Executor {
                     ValidationObservation::Skip(_) | ValidationObservation::Fallback(_)
                 ) {
                     safe_eprintln!(
-                        "[model-validation] non-independent assertion_index={i} obs={observation:?} term={}",
-                        self.format_term(assertion)
+                        "[model-validation] non-independent assertion_index={i} obs={observation:?} term={} candidate={model:?}",
+                        self.format_term(assertion),
                     );
                 }
             }
@@ -653,6 +782,34 @@ impl Executor {
         certified
     }
 
+    /// What does the independent model checker say, EXACTLY, about the
+    /// quantified assertions this pipeline SKIPPED?
+    ///
+    /// The skipped set is re-derived from the same two inputs the observation
+    /// pipeline uses — `flatten_assertion_conjunctions` and
+    /// `precompute_term_flags` — with the same predicate
+    /// (`validate_term_observation`: internal wins, quantifier next). That
+    /// re-derivation is then CHECKED against the count the pipeline actually
+    /// recorded: if the two disagree the predicate has moved, this set is not
+    /// evidence about the assertions that were skipped, and nothing is
+    /// credited. A drifted guard that silently credits the wrong terms is worse
+    /// than no guard, so the mismatch fails closed rather than approximating.
+    fn self_check_quantifier_skip_evidence(&self, recorded_skips: usize) -> QuantifierSkipEvidence {
+        let flags = self.precompute_term_flags();
+        let skipped: Vec<TermId> = self
+            .flatten_assertion_conjunctions()
+            .into_iter()
+            .filter(|assertion| {
+                let f = flags[assertion.index()];
+                f & TERM_FLAG_INTERNAL == 0 && f & TERM_FLAG_QUANTIFIER != 0
+            })
+            .collect();
+        if skipped.len() != recorded_skips {
+            return QuantifierSkipEvidence::Indeterminate;
+        }
+        self.independent_quantifier_skip_evidence(&skipped)
+    }
+
     /// Close the authored window under the definitions of variables the emitted
     /// model leaves unvalued (see `self_check_authored_model_certified`).
     ///
@@ -816,6 +973,17 @@ impl Executor {
     /// Returns `None` when no oracle fires, meaning the normal
     /// observation pipeline may proceed.
     pub(in crate::executor) fn verify_model_strict(&self) -> Option<(usize, &'static str, TermId)> {
+        if self.evaluation_stop_origin().is_some() {
+            return None;
+        }
+        let violation = self.verify_model_strict_inner();
+        self.evaluation_stop_origin()
+            .is_none()
+            .then_some(violation)
+            .flatten()
+    }
+
+    fn verify_model_strict_inner(&self) -> Option<(usize, &'static str, TermId)> {
         let model = match (&self.last_result, &self.last_model) {
             (Some(SolveResult::Sat), Some(m)) => m,
             _ => return None,
@@ -829,6 +997,9 @@ impl Executor {
         // here keeps the gate sound regardless of the upstream order.
         let flat = self.flatten_assertion_conjunctions();
         for (i, &assertion) in flat.iter().enumerate() {
+            if self.evaluation_stop_origin().is_some() {
+                return None;
+            }
             if let Some(name) = check_definitive_false(self, model, assertion) {
                 return Some((i, name, assertion));
             }
@@ -889,7 +1060,7 @@ impl Executor {
         if model
             .array_model
             .as_ref()
-            .is_some_and(|am| !am.read_conflicted.is_empty())
+            .is_some_and(|am| am.has_withheld_arrays())
         {
             use crate::executor::model::EvalValue;
             // A top-level NEGATED array equality is deliberately excluded: an
@@ -1521,6 +1692,27 @@ impl Executor {
                 }
             }
             let is_int_idx = matches!(self.ctx.terms.sort(idx_vars[0]), ay_core::Sort::Int);
+            // Int ELEMENT values must be concrete numerals, mirroring the
+            // Int-index atoms above: the abstract `@ay!wit!xval!` tokens are
+            // only readable by the independent gate at uninterpreted element
+            // sorts, so an `(Array Int Int)` storeinv witness installed with
+            // tokens leaves both bases unpinnable (`cannot-confirm`) even
+            // though the union-find classes are a valid explicit model.
+            // One fresh numeral per class preserves exactly the class
+            // equality/disequality structure; every gate re-checks the
+            // completed model, so a collision with a committed value can
+            // only keep the fail-closed outcome.
+            let is_int_elem = matches!(
+                self.ctx.terms.sort(base_l),
+                ay_core::Sort::Array(arr) if matches!(arr.element_sort, ay_core::Sort::Int)
+            );
+            let elem_token = |class: usize| -> String {
+                if is_int_elem {
+                    format!("{}", 8_000_001 + class as i64)
+                } else {
+                    format!("@ay!wit!xval!{class}")
+                }
+            };
             let mut success = false;
             let mut cnt_bail = 0usize;
             let mut cnt_nosep = 0usize;
@@ -1719,8 +1911,8 @@ impl Executor {
                 for (aid, a) in seen_atoms.clone().iter().enumerate() {
                     let cl = find(&mut uf, aid);
                     let cr = find(&mut uf, n_atoms + aid);
-                    interp_l.push((a.clone(), format!("@ay!wit!xval!{cl}")));
-                    interp_r.push((a.clone(), format!("@ay!wit!xval!{cr}")));
+                    interp_l.push((a.clone(), elem_token(cl)));
+                    interp_r.push((a.clone(), elem_token(cr)));
                 }
                 // Install: index valuations + both base interps.
                 self.stash_unrepaired_candidate_once();
@@ -1757,7 +1949,11 @@ impl Executor {
                             // directly there, so the chain equality forces
                             // a1[y] == a2[y] for every untracked y — the
                             // bases must share ONE default.
-                            e.default = Some("@ay!wit!xval!default".to_string());
+                            e.default = Some(if is_int_elem {
+                                "8000000".to_string()
+                            } else {
+                                "@ay!wit!xval!default".to_string()
+                            });
                         }
                         // Drop STALE alias interps for non-base array terms
                         // (intermediate ?v chains): the independent checker
@@ -2216,7 +2412,8 @@ impl Executor {
     /// #qfax-cegar: derive a sound blocking clause from an arrays rejection.
     pub(in crate::executor) fn derive_qfax_refinement_clause(&mut self, violated: TermId) {
         use ay_core::term::TermData;
-        if self.qfax_refinement_clause.is_some()
+        if self.evaluation_stop_origin().is_some()
+            || self.qfax_refinement_clause.is_some()
             || self.last_model.is_none()
             || self.ctx.terms.entry_stamp(violated).is_none()
         {
@@ -2285,6 +2482,9 @@ impl Executor {
         let Some(literals) = self.qfax_blocking_literals(dependencies) else {
             return;
         };
+        if self.evaluation_stop_origin().is_some() {
+            return;
+        }
         if ay_core::misc_cli_flags().debug_cegar {
             eprintln!(
                 "[qfax-cegar] blocking clause with {} literals",
@@ -2685,9 +2885,9 @@ impl Executor {
             let Some(model) = self.last_model.as_mut() else {
                 return 0;
             };
-            // Sentinel keys (e.g. the per-model repair marker at
-            // `u32::MAX - 7`) live in `term_values` but are not real terms —
-            // keep only ids the term store can resolve.
+            // Keep only ids the term store can resolve (defensive: the
+            // per-model repair marker that once lived here as a sentinel key
+            // is now `EufModel::array_read_pins_repaired`).
             let n_terms = self.ctx.terms.len() as u32;
             let candidates: Vec<TermId> = model
                 .euf_model
@@ -2929,13 +3129,22 @@ impl Executor {
         &mut self,
         rejection: (usize, &'static str, TermId),
     ) -> Option<(usize, &'static str, TermId)> {
+        if self.evaluation_stop_origin().is_some() {
+            return Some(rejection);
+        }
         let Some(unrepaired) = self.unrepaired_model_candidate.take() else {
             return Some(rejection);
         };
         let repaired = self.last_model.replace(unrepaired);
         crate::executor::model::eval_memo_clear();
         self.last_model_validated = false;
-        match self.verify_model_strict_with_scoped_authority() {
+        let verdict = self.verify_model_strict_with_scoped_authority();
+        if self.evaluation_stop_origin().is_some() {
+            self.last_model = repaired;
+            crate::executor::model::eval_memo_clear();
+            return Some(rejection);
+        }
+        match verdict {
             None => {
                 self.last_rejected_array_assertion = None;
                 let n = self
@@ -2962,6 +3171,90 @@ impl Executor {
         }
     }
 
+    fn repair_asserted_array_read_pins_with_datatype_completion(&mut self) {
+        self.repair_asserted_array_read_pins();
+        // Read-pin repair may publish structured datatype leaves late. Finish
+        // their observed projections before any strict or independent gate,
+        // including when the existing repair body took an early return.
+        if !matches!(self.last_result, Some(SolveResult::Sat)) {
+            return;
+        }
+        let Some(mut model) = self.last_model.take() else {
+            return;
+        };
+        let completed = self.complete_structured_datatype_values(&mut model, &[]);
+        self.last_model = Some(model);
+        if completed > 0 {
+            self.last_model_validated = false;
+            self.revoke_cegqi_uf_recompletion_authority();
+        }
+    }
+
+    /// Whether assertion `r` is a read pin `(= v (select ..))` (either
+    /// orientation) for one side `v` of the equality term `eq_term`
+    /// (#qfax-sf-witness-target force condition).
+    fn rejected_is_pin_for(&self, r: TermId, eq_term: TermId) -> bool {
+        use ay_core::term::TermData;
+        let TermData::App(rs, ra) = self.ctx.terms.get(r) else {
+            return false;
+        };
+        if rs.name() != "=" || ra.len() != 2 {
+            return false;
+        }
+        let TermData::App(es, ea) = self.ctx.terms.get(eq_term) else {
+            return false;
+        };
+        if es.name() != "=" || ea.len() != 2 {
+            return false;
+        }
+        [(ra[0], ra[1]), (ra[1], ra[0])].iter().any(|&(v, sel)| {
+            (v == ea[0] || v == ea[1])
+                && matches!(self.ctx.terms.get(v), TermData::Var(_, _))
+                && matches!(
+                    self.ctx.terms.get(sel),
+                    TermData::App(ss, sa) if ss.name() == "select" && sa.len() == 2
+                )
+        })
+    }
+
+    /// Whether either side of the equality `eq_term` is a variable
+    /// whose asserted select definition in `defs` is currently
+    /// falsified (both sides concretely evaluate to different atoms).
+    /// For pin-form witness targets the candidate's distinct pin
+    /// VALUES alone must not skip the install: alias reconciliation
+    /// re-derives them from the interps and can re-equalize them
+    /// (#qfax-sf-witness-target).
+    fn pin_side_falsified(
+        &self,
+        eq_term: TermId,
+        defs: &ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> bool {
+        use ay_core::term::TermData;
+        let Some(model) = self.last_model.as_ref() else {
+            return false;
+        };
+        let TermData::App(es, ea) = self.ctx.terms.get(eq_term) else {
+            return false;
+        };
+        if es.name() != "=" || ea.len() != 2 {
+            return false;
+        }
+        [ea[0], ea[1]].iter().any(|&v| {
+            let Some(&def) = defs.get(&v) else {
+                return false;
+            };
+            if !matches!(
+                self.ctx.terms.get(def),
+                TermData::App(ds, da) if ds.name() == "select" && da.len() == 2
+            ) {
+                return false;
+            }
+            let lhs = self.eval_value_to_model_atom(&self.evaluate_term(model, v));
+            let rhs = self.eval_value_to_model_atom(&self.evaluate_term(model, def));
+            matches!((lhs, rhs), (Some(a), Some(b)) if a != b)
+        })
+    }
+
     fn repair_asserted_array_read_pins(&mut self) {
         use ay_core::term::TermData;
         if !matches!(self.last_result, Some(SolveResult::Sat)) || self.last_model.is_none() {
@@ -2977,13 +3270,13 @@ impl Executor {
         if let Some(model) = self.last_model.as_mut() {
             model.revoke_all_quantified_model_seals();
         }
-        // Single-shot PER MODEL (a sentinel in the model itself): re-running
-        // after intervening completion passes mixes repair rounds, but a
-        // per-executor flag goes stale across the inner/outer solves of
-        // rescue routes (observed on QF_AX: an inner probe consumed the shot
-        // and the final model never got repaired). The marker travels with
-        // the model, so a NEW model always gets exactly one repair.
-        const REPAIR_MARKER: TermId = TermId(u32::MAX - 7);
+        // Single-shot PER MODEL (a marker in the model itself,
+        // `EufModel::array_read_pins_repaired`): re-running after intervening
+        // completion passes mixes repair rounds, but a per-executor flag goes
+        // stale across the inner/outer solves of rescue routes (observed on
+        // QF_AX: an inner probe consumed the shot and the final model never
+        // got repaired). The marker travels with the model, so a NEW model
+        // always gets exactly one repair.
         let stale_marker = {
             let Some(model) = self.last_model.as_ref() else {
                 return;
@@ -2991,7 +3284,7 @@ impl Executor {
             if model
                 .euf_model
                 .as_ref()
-                .is_some_and(|e| e.term_values.contains_key(&REPAIR_MARKER))
+                .is_some_and(|e| e.array_read_pins_repaired)
             {
                 // Marker present — but the euf_model can be REUSED across
                 // inner solves, carrying the marker onto a NEW model whose
@@ -3033,14 +3326,13 @@ impl Executor {
         if stale_marker {
             if let Some(model) = self.last_model.as_mut() {
                 if let Some(euf) = model.euf_model.as_mut() {
-                    euf.term_values.remove(&REPAIR_MARKER);
+                    euf.array_read_pins_repaired = false;
                 }
             }
         }
         if let Some(model) = self.last_model.as_mut() {
             if let Some(euf) = model.euf_model.as_mut() {
-                euf.term_values
-                    .insert(REPAIR_MARKER, "repaired".to_string());
+                euf.array_read_pins_repaired = true;
             } else {
                 return; // no EUF model: nothing the repair could fix anyway
             }
@@ -3088,6 +3380,18 @@ impl Executor {
             // fail-closed afterwards.
             {
                 let mut diseq_shifts: Vec<(TermId, i64)> = Vec::new();
+                // #qf-auflia-diseq-shift-overlay: values of shifts already
+                // collected THIS round. The scan below reads model values
+                // from the pre-shift snapshot, so without the overlay a var
+                // already moved to a fresh sentinel still "collides" at its
+                // old value and its disequality partners get shifted too —
+                // on storecomm n=3 that needlessly separated i3 from i2,
+                // forcing both chain reads at j onto one write term with
+                // conflicting pin demands (both dropped, gate rejects).
+                let mut pending_shifts: ay_core::kani_compat::DetHashMap<
+                    TermId,
+                    num_bigint::BigInt,
+                > = ay_core::kani_compat::DetHashMap::default();
                 // The collision test MUST use the value semantics the strict
                 // oracle itself uses (`evaluate_term`: LIA/LRA slot, merged
                 // EUF string/int value, completion slot). The former two-slot
@@ -3134,8 +3438,14 @@ impl Executor {
                         continue;
                     }
                     let model = self.last_model.as_ref().expect("checked above");
-                    let vx = int_val(self, model, x);
-                    let vy = int_val(self, model, y);
+                    let vx = pending_shifts
+                        .get(&x)
+                        .cloned()
+                        .or_else(|| int_val(self, model, x));
+                    let vy = pending_shifts
+                        .get(&y)
+                        .cloned()
+                        .or_else(|| int_val(self, model, y));
                     // Which side may move:
                     //  * both concrete and distinct — satisfied: never touch;
                     //  * both concrete and equal — a genuine collision, the
@@ -3228,6 +3538,7 @@ impl Executor {
                         continue;
                     };
                     diseq_shifts.push((target, shift_to));
+                    pending_shifts.insert(target, num_bigint::BigInt::from(shift_to));
                     next_fresh += 1;
                     shifted_vars.insert(target);
                 }
@@ -3422,7 +3733,12 @@ impl Executor {
                     let mut cur = *arr;
                     let mut routed = false;
                     // Follow alias definitions / syntactic stores downward.
-                    for _depth in 0..16 {
+                    // Depth budget matches the sibling chain walks (256):
+                    // CVC store-chain files alias one store per definition
+                    // over ~50 links, and stopping mid-chain lands the pin
+                    // on an alias whose interp is dropped below, so the
+                    // gate still reads the base default (storecomm t3 sf).
+                    for _depth in 0..256 {
                         let chain = match self.ctx.terms.get(cur) {
                             TermData::App(s2, _) if s2.name() == "store" => cur,
                             TermData::Var(_, _) => {
@@ -3485,6 +3801,36 @@ impl Executor {
                 }
                 term_demands.retain(|(t, _)| !bad.contains(t));
             }
+            // #w6-carrier-immutable: a pinned select that currently carries an
+            // installed W6 class carrier keeps it. The pin atom is the
+            // EVALUATOR's spelling -- for an array-field datatype that is the
+            // rendered constructor tree `dt_pins` holds, e.g.
+            // `(PbTerm_PbTerm #x0.. ((as const (Array (_ BitVec 64) PbLit)) ..))`
+            // for the carrier `@PbTerm!0` -- so this refresh re-spells the SAME
+            // value and, in doing so, breaks the carrier identity the W6
+            // reauthentication checks. Measured on
+            // `datatype_valued_uf_disequality_with_assumption_binding_is_sat`
+            // (aufbv_uninterpreted_element_model): the pushed solve's model
+            // passed every strict oracle and then failed the independent gate
+            // with `model does not pin this leaf: __seed_terms : PbTerm`,
+            // because this write (and the alias reconcile below) turned both
+            // class members' `@PbTerm!0` into the rendered tree; with exactly
+            // those two writes suppressed the test passes end to end. A
+            // disagreeing pin is not repaired here either: rewriting a closed
+            // member's carrier can only make the inventory fail closed, never
+            // make it confirm, and any other term carrying an installed carrier
+            // is already pinned through `dt_pins`
+            // (`apply_exact_datatype_cell_completions`), so leaving it to the
+            // gates loses nothing.
+            let w6_carrier_sels: ay_core::kani_compat::DetHashSet<TermId> =
+                match self.last_model.as_ref() {
+                    Some(model) => repairs
+                        .iter()
+                        .map(|&(_, _, sel, _)| sel)
+                        .filter(|&sel| euf_value_is_w6_carrier(&self.ctx.terms, model, sel))
+                        .collect(),
+                    None => ay_core::kani_compat::DetHashSet::default(),
+                };
             self.stash_unrepaired_candidate_once();
             let model = self.last_model.as_mut().expect("checked above");
             // Harmonize pinned vars AND write-term demands everywhere.
@@ -3533,7 +3879,10 @@ impl Executor {
             for (_, _, sel, pin_atom) in &repairs {
                 let sel_is_int = matches!(self.ctx.terms.sort(*sel), ay_core::Sort::Int);
                 if let Some(euf) = model.euf_model.as_mut() {
-                    euf.term_values.insert(*sel, pin_atom.clone());
+                    // #w6-carrier-immutable: see `w6_carrier_sels` above.
+                    if !w6_carrier_sels.contains(sel) {
+                        euf.term_values.insert(*sel, pin_atom.clone());
+                    }
                     if sel_is_int {
                         if let Ok(v) = pin_atom.parse::<num_bigint::BigInt>() {
                             euf.int_values.insert(*sel, v);
@@ -3643,6 +3992,57 @@ impl Executor {
                     targets.push((*inner, args[0], args[1], None));
                 }
             }
+            // Skolemized-flattened (sf) shape (#qfax-sf-witness-target):
+            // the swap_invalid sf files assert the read disequality
+            // between two pin variables, `(not (= e1 e2))` with asserted
+            // pins `(= e1 (select A k))` and `(= e2 (select B k))` over a
+            // shared index term. Recognize it as the same target: the
+            // witness install (distinct indices, distinct base cells,
+            // k at the separating index) plus alias reconciliation
+            // below re-derives every pin value from the final interps.
+            {
+                let mut pin_reads: std::collections::HashMap<TermId, (TermId, TermId)> =
+                    std::collections::HashMap::new();
+                for assertion in self.ctx.assertions.clone() {
+                    let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
+                        continue;
+                    };
+                    if sym.name() != "=" || args.len() != 2 {
+                        continue;
+                    }
+                    for (v, sel) in [(args[0], args[1]), (args[1], args[0])] {
+                        if !matches!(self.ctx.terms.get(v), TermData::Var(_, _)) {
+                            continue;
+                        }
+                        let TermData::App(ss, sa) = self.ctx.terms.get(sel) else {
+                            continue;
+                        };
+                        if ss.name() == "select" && sa.len() == 2 {
+                            pin_reads.insert(v, (sa[0], sa[1]));
+                        }
+                    }
+                }
+                if !pin_reads.is_empty() {
+                    for assertion in self.ctx.assertions.clone() {
+                        let TermData::Not(inner) = self.ctx.terms.get(assertion) else {
+                            continue;
+                        };
+                        let TermData::App(sym, args) = self.ctx.terms.get(*inner) else {
+                            continue;
+                        };
+                        if sym.name() != "=" || args.len() != 2 {
+                            continue;
+                        }
+                        if let (Some(&(arr_a, idx_a)), Some(&(arr_b, idx_b))) =
+                            (pin_reads.get(&args[0]), pin_reads.get(&args[1]))
+                        {
+                            if idx_a == idx_b {
+                                targets.push((*inner, arr_a, arr_b, Some(idx_a)));
+                            }
+                        }
+                    }
+                }
+            }
             let mut fresh_idx: i64 = 3_000_001;
             let mut fresh_val: i64 = 5_000_001;
             if ay_core::misc_cli_flags().debug_read_pin {
@@ -3662,7 +4062,14 @@ impl Executor {
                             self.ctx.terms.get(r),
                             TermData::Not(i) if *i == eq_term
                         )
-                });
+                        // #qfax-sf-witness-target: for the pin-variable
+                        // form the oracle rejects the PIN assertion
+                        // `(= e (select A k))`, not the disequality —
+                        // and the diseq-shifted pin values make the
+                        // disequality evaluate false, which would skip
+                        // the install that makes the pin true.
+                        || self.rejected_is_pin_for(r, eq_term)
+                }) || self.pin_side_falsified(eq_term, &wdefs);
                 if ay_core::misc_cli_flags().debug_read_pin {
                     eprintln!(
                         "[witness-dbg] target eq={} force={} stored={:?}",
@@ -3931,86 +4338,132 @@ impl Executor {
         // completion). Resolve each alias through the FINAL interps (chasing
         // defs) and update its value; gates re-validate everything after.
         if total_applied > 0 || total_shifted > 0 {
-            let mut updates: Vec<(TermId, String)> = Vec::new();
-            if let Some((model, am)) = self
-                .last_model
-                .as_ref()
-                .and_then(|model| model.array_model.as_ref().map(|arrays| (model, arrays)))
-            {
-                for (&v, &d) in wdefs.iter() {
-                    let TermData::App(ds, da) = self.ctx.terms.get(d) else {
-                        continue;
-                    };
-                    if ds.name() != "select" || da.len() != 2 {
-                        continue;
-                    }
-                    // Chase the select's array to a base with an interp.
-                    let mut arr = da[0];
-                    let mut hops = 0usize;
-                    let mut writes: Vec<(TermId, TermId)> = Vec::new();
-                    loop {
-                        hops += 1;
-                        if hops > 256 {
-                            break;
+            // Fixpoint rounds (#qfax-sf-witness-target): swap value
+            // pins form a cascade — resolving one alias changes the
+            // store values the next alias reads — so one pass leaves
+            // outer pins (the final reads) reconciled against STALE
+            // inner values and the two final reads come out equal.
+            // Iterate collect+apply until no alias value changes;
+            // definition chasing is acyclic (stores only descend), so
+            // this terminates at cascade depth, well under the cap.
+            for _alias_round in 0..64 {
+                let mut updates: Vec<(TermId, String)> = Vec::new();
+                if let Some((model, am)) = self
+                    .last_model
+                    .as_ref()
+                    .and_then(|model| model.array_model.as_ref().map(|arrays| (model, arrays)))
+                {
+                    for (&v, &d) in wdefs.iter() {
+                        let TermData::App(ds, da) = self.ctx.terms.get(d) else {
+                            continue;
+                        };
+                        if ds.name() != "select" || da.len() != 2 {
+                            continue;
                         }
-                        match self.ctx.terms.get(arr) {
-                            TermData::App(s2, a2) if s2.name() == "store" && a2.len() == 3 => {
-                                writes.push((a2[1], a2[2]));
-                                arr = a2[0];
+                        // Chase the select's array to a base with an interp.
+                        let mut arr = da[0];
+                        let mut hops = 0usize;
+                        let mut writes: Vec<(TermId, TermId)> = Vec::new();
+                        loop {
+                            hops += 1;
+                            if hops > 256 {
+                                break;
                             }
-                            TermData::Var(_, _) if !am.array_values.contains_key(&arr) => {
-                                match wdefs.get(&arr) {
-                                    Some(&dd) => arr = dd,
-                                    None => break,
+                            match self.ctx.terms.get(arr) {
+                                TermData::App(s2, a2) if s2.name() == "store" && a2.len() == 3 => {
+                                    writes.push((a2[1], a2[2]));
+                                    arr = a2[0];
                                 }
+                                TermData::Var(_, _) if !am.array_values.contains_key(&arr) => {
+                                    match wdefs.get(&arr) {
+                                        Some(&dd) => arr = dd,
+                                        None => break,
+                                    }
+                                }
+                                _ => break,
                             }
-                            _ => break,
                         }
-                    }
-                    let Some(interp) = am.array_values.get(&arr) else {
-                        continue;
-                    };
-                    let Some(at) = self.eval_value_to_model_atom(&self.evaluate_term(model, da[1]))
-                    else {
-                        continue;
-                    };
-                    // Effective cell: innermost-out write match, else interp.
-                    let mut val: Option<String> = None;
-                    for &(wi, wv) in &writes {
-                        let Some(wa) =
-                            self.eval_value_to_model_atom(&self.evaluate_term(model, wi))
+                        let Some(interp) = am.array_values.get(&arr) else {
+                            continue;
+                        };
+                        let Some(at) =
+                            self.eval_value_to_model_atom(&self.evaluate_term(model, da[1]))
                         else {
                             continue;
                         };
-                        if wa == at {
-                            val = self.eval_value_to_model_atom(&self.evaluate_term(model, wv));
-                            break;
+                        // Effective cell: innermost-out write match, else interp.
+                        let mut val: Option<String> = None;
+                        for &(wi, wv) in &writes {
+                            let Some(wa) =
+                                self.eval_value_to_model_atom(&self.evaluate_term(model, wi))
+                            else {
+                                continue;
+                            };
+                            if wa == at {
+                                val = self.eval_value_to_model_atom(&self.evaluate_term(model, wv));
+                                break;
+                            }
+                        }
+                        let val = val.or_else(|| {
+                            interp
+                                .stores
+                                .iter()
+                                .find(|(k, _)| *k == at)
+                                .map(|(_, x)| x.clone())
+                                .or_else(|| interp.default.clone())
+                        });
+                        if let Some(val) = val {
+                            // Fixpoint stability filter: only genuinely
+                            // changing aliases keep the rounds going.
+                            let current =
+                                model.euf_model.as_ref().and_then(|e| e.term_values.get(&v));
+                            if current != Some(&val) {
+                                updates.push((v, val));
+                            }
                         }
                     }
-                    let val = val.or_else(|| {
-                        interp
-                            .stores
-                            .iter()
-                            .find(|(k, _)| *k == at)
-                            .map(|(_, x)| x.clone())
-                            .or_else(|| interp.default.clone())
-                    });
-                    if let Some(val) = val {
-                        updates.push((v, val));
-                    }
                 }
-            }
-            if !updates.is_empty() {
-                if let Some(model) = self.last_model.as_mut() {
-                    if let Some(euf) = model.euf_model.as_mut() {
+                // #w6-carrier-immutable (alias half): the cell read back here is the
+                // pin the repair just installed, i.e. the evaluator's rendered
+                // spelling again, so an alias variable that carries an installed W6
+                // class carrier keeps it for the same reason as the select refresh
+                // above (measured: the second of the two carrier rewrites that
+                // voided the W6 inventory was this update of `__seed_terms`).
+                if let Some(model) = self.last_model.as_ref() {
+                    updates.retain(|&(v, _)| !euf_value_is_w6_carrier(&self.ctx.terms, model, v));
+                }
+                if updates.is_empty() {
+                    break;
+                }
+                if !updates.is_empty() {
+                    if let Some(model) = self.last_model.as_mut() {
                         for (v, val) in updates {
-                            euf.term_values.insert(v, val);
+                            // #qfax-sf-witness-target: Int aliases must move
+                            // in every view the gates read — term_values
+                            // alone left `lia.values`/`int_values` at the
+                            // pre-witness value, so the arrays oracle kept
+                            // rejecting the base pin `(= e_670 (select a1
+                            // i5))` against the freshly installed base cell
+                            // on swap_invalid sf.
+                            let parsed = if matches!(self.ctx.terms.sort(v), ay_core::Sort::Int) {
+                                val.parse::<num_bigint::BigInt>().ok()
+                            } else {
+                                None
+                            };
+                            if let Some(euf) = model.euf_model.as_mut() {
+                                euf.term_values.insert(v, val);
+                                if let Some(iv) = parsed.clone() {
+                                    euf.int_values.insert(v, iv);
+                                }
+                            }
+                            if let (Some(lia), Some(iv)) = (model.lia_model.as_mut(), parsed) {
+                                lia.values.insert(v, iv);
+                            }
                         }
                     }
                 }
             }
         }
-
         // #A1-repair-resync, final pass: a model can arrive here ALREADY
         // desynced (stale substituted vars / incongruent root reads from the
         // extraction+completion pipeline) with nothing for the pin loop to
@@ -4185,6 +4638,9 @@ impl Executor {
     /// oracle and every `ModelViolates` / `CannotConfirm` result remains
     /// fail-closed.
     fn strict_coverage_gap_has_full_independent_authority(&self, oracle: &str) -> bool {
+        if self.evaluation_stop_origin().is_some() {
+            return false;
+        }
         let reauthenticated_w6 = (oracle == "datatype")
             .then(|| {
                 self.last_model
@@ -4200,13 +4656,21 @@ impl Executor {
             return false;
         }
         let verdict = self.confirm_sat_with_fully_evaluated_independent_gate();
-        matches!(verdict, ay_model_check::GateVerdict::ConfirmedSat)
+        self.evaluation_stop_origin().is_none()
+            && matches!(verdict, ay_model_check::GateVerdict::ConfirmedSat)
     }
 
     /// Run the strict oracle and apply every scoped independent-authority
     /// exception in one place, so all SAT-validation funnels have identical
-    /// fail-closed policy.
-    fn verify_model_strict_with_scoped_authority(&self) -> Option<(usize, &'static str, TermId)> {
+    /// fail-closed policy. Model completion's gap re-check
+    /// (`completed_gap_model_accepted`) uses it too, so a completed gap is
+    /// never held to a stricter policy than the final model it joins.
+    pub(in crate::executor) fn verify_model_strict_with_scoped_authority(
+        &self,
+    ) -> Option<(usize, &'static str, TermId)> {
+        if self.evaluation_stop_origin().is_some() {
+            return None;
+        }
         match self.verify_model_strict() {
             Some((_, oracle, _))
                 if self.strict_coverage_gap_has_full_independent_authority(oracle) =>
@@ -4242,11 +4706,26 @@ impl Executor {
         &mut self,
         result: SolveResult,
     ) -> SolveResult {
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
+        let result = self.apply_strict_model_gate_inner(result);
+        if self.publish_evaluation_stop() {
+            SolveResult::Unknown
+        } else {
+            result
+        }
+    }
+
+    fn apply_strict_model_gate_inner(&mut self, result: SolveResult) -> SolveResult {
         if result != SolveResult::Sat {
             return result;
         }
         self.repair_asserted_bool_leaf_polarities();
         self.complete_opaque_array_defaults_gate_verified();
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         // #uflia-witness-complete (1a-i): fill absent / out-of-range
         // asserted-bound Int leaves BEFORE the read-pin repair measures any
         // collision, so the range-blind diseq shift is never even reached for
@@ -4255,7 +4734,7 @@ impl Executor {
         // #repair-fallback-unrepaired: open the stash window (see
         // `strict_verdict_after_unrepaired_fallback`).
         self.unrepaired_model_candidate = None;
-        self.repair_asserted_array_read_pins();
+        self.repair_asserted_array_read_pins_with_datatype_completion();
         // #uflia-witness-complete (1b), mirroring the finalize site: an
         // IN-LOOP-validated model reaches the funnel through THIS entry, so
         // the free-UF-point completion must run here too or the class is never
@@ -4266,15 +4745,24 @@ impl Executor {
         // certificate can be minted from stale evidence. Env-gated; default
         // off is a no-op.
         self.uflia_complete_free_uf_chain_witness();
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         // Central strict-coverage policy (also on the finalize entries): the
         // existing `datatype-field` array gap and the total-construction
         // `datatype` gap may defer only to their scoped independent authority.
         // The latter requires the fully-evaluated gate; see the centralized
         // helper for the exact fail-closed contract.
         let mut strict = self.verify_model_strict_with_scoped_authority();
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         if let Some((_, oracle, assertion)) = strict {
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
+                if self.publish_evaluation_stop() {
+                    return SolveResult::Unknown;
+                }
                 self.last_rejected_array_assertion = Some(assertion);
                 // #qfax-rejected-target retry: this cycle's repair ran before
                 // the rejection named its assertion. Clear the per-model
@@ -4292,12 +4780,15 @@ impl Executor {
                     self.qfax_retry_done = true;
                     if let Some(model) = self.last_model.as_mut() {
                         if let Some(euf) = model.euf_model.as_mut() {
-                            euf.term_values.remove(&TermId(u32::MAX - 7));
+                            euf.array_read_pins_repaired = false;
                         }
                     }
-                    self.repair_asserted_array_read_pins();
+                    self.repair_asserted_array_read_pins_with_datatype_completion();
                     strict = self.verify_model_strict_with_scoped_authority();
                     self.qfax_retry_done = false;
+                    if self.publish_evaluation_stop() {
+                        return SolveResult::Unknown;
+                    }
                     if strict.is_none() {
                         self.last_rejected_array_assertion = None;
                     }
@@ -4310,15 +4801,10 @@ impl Executor {
             strict = self.strict_verdict_after_unrepaired_fallback(rejection);
         }
         self.unrepaired_model_candidate = None;
+        if self.publish_evaluation_stop() {
+            return SolveResult::Unknown;
+        }
         if let Some((idx, oracle, assertion)) = strict {
-            self.note_exact_ite_uf_definition_model_rejection(oracle);
-            self.last_statistics.model_validation_failures += 1;
-            self.last_statistics
-                .set_int("model_validation.strict.assertion_index", idx as u64);
-            self.last_statistics
-                .set_string("model_validation.strict.oracle", oracle);
-            self.last_statistics
-                .set_string("model_validation.strict.term", self.format_term(assertion));
             // LOUD, always-visible alarm + falsifying assignment (stderr +
             // trace): the strict definitive-false oracle caught a model that
             // falsifies an assertion. Emitted while `last_model` is still live.
@@ -4331,6 +4817,17 @@ impl Executor {
                 eprintln!("[reject-site] apply_strict_model_gate oracle={oracle} idx={idx}");
             }
             self.report_caught_invalid_model(assertion, &term);
+            if self.publish_evaluation_stop() {
+                return SolveResult::Unknown;
+            }
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
+            self.last_statistics.model_validation_failures += 1;
+            self.last_statistics
+                .set_int("model_validation.strict.assertion_index", idx as u64);
+            self.last_statistics
+                .set_string("model_validation.strict.oracle", oracle);
+            self.last_statistics
+                .set_string("model_validation.strict.term", term);
             tracing::warn!(
                 assertion_index = idx,
                 oracle,
@@ -4352,7 +4849,7 @@ impl Executor {
             if self.qfax_isolated_lane {
                 self.qfax_isolated_model_rejected = true;
             }
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(format!(
@@ -4371,7 +4868,9 @@ impl Executor {
     /// fails closed rather than silently changing the witness after its
     /// quantified theorem was proved.
     pub(in crate::executor) fn exact_certificate_model_passes_strict_read_only(&self) -> bool {
-        self.verify_model_strict().is_none()
+        self.evaluation_stop_origin().is_none()
+            && self.verify_model_strict().is_none()
+            && self.evaluation_stop_origin().is_none()
     }
 
     /// Find a top-level asserted array disequality — `(not (= A B))` over
@@ -4760,6 +5259,133 @@ impl Executor {
     }
 
     pub(in crate::executor) fn finalize_sat_model_validation(&mut self) -> Result<SolveResult> {
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
+        // Some theory lanes finalize in-loop, before the outer SAT funnel.
+        // Offer the same class-reconciled array candidate here as well: an
+        // initial rejection must not discard it before the funnel can see it.
+        // Both candidates traverse the entire unchanged validation pipeline;
+        // the outer publication gates still decide whether SAT can be emitted.
+        let candidate = self.take_store_chain_class_candidate();
+        let datatype_array_candidate = self.prepare_exact_datatype_array_rebuild();
+        let mut result = self.finalize_sat_model_validation_inner();
+        if matches!(result, Ok(SolveResult::Sat)) {
+            // The independent publication gate can still reject this first
+            // witness. Preserve its alternative for that later boundary.
+            if let Some(values) = candidate
+                .as_ref()
+                .and_then(|model| model.array_model.as_ref())
+                .map(|arrays| arrays.array_values.clone())
+            {
+                if let Some(arrays) = self
+                    .last_model
+                    .as_mut()
+                    .and_then(|model| model.array_model.as_mut())
+                {
+                    arrays.store_chain_class_candidate = Some(values);
+                }
+            }
+        }
+        if matches!(result, Ok(SolveResult::Unknown))
+            && !self.publish_evaluation_stop()
+            && !self.solve_deadline.expired()
+        {
+            if let Some(candidate) = candidate {
+                self.record_rejected_model();
+                let first_reason = self.last_unknown_reason.take();
+                self.last_model = Some(candidate);
+                self.last_model_validated = false;
+                self.last_result = Some(SolveResult::Sat);
+                super::super::eval_memo_clear();
+                self.last_statistics
+                    .set_int("model_validation.store_chain_class_candidate", 1);
+                result = self.finalize_sat_model_validation_inner();
+                if matches!(result, Ok(SolveResult::Sat)) {
+                    self.last_unknown_reason = None;
+                    for key in [
+                        "unknown.reason",
+                        "unknown.phase",
+                        "unknown.cost_center",
+                        "unknown.detail",
+                    ] {
+                        self.last_statistics.extra.remove(key);
+                    }
+                    self.last_statistics
+                        .set_int("model_validation.store_chain_class_candidate", 2);
+                } else if self.last_unknown_reason.is_none() {
+                    self.last_unknown_reason = first_reason;
+                }
+            }
+        }
+        if matches!(result, Ok(SolveResult::Unknown))
+            && !self.publish_evaluation_stop()
+            && !self.solve_deadline.expired()
+        {
+            if let Some(candidate) = datatype_array_candidate {
+                self.record_rejected_model();
+                let rejected = self.last_model.take();
+                let first_reason = self.last_unknown_reason.take();
+                self.last_model = Some(candidate);
+                self.last_model_validated = false;
+                self.last_result = Some(SolveResult::Sat);
+                super::super::eval_memo_clear();
+                super::super::independent_gate::invalidate_functional_model_caches();
+                self.last_statistics
+                    .set_int("model_validation.exact_datatype_array_rebuild", 1);
+                let retry = self.finalize_sat_model_validation_inner();
+                let independently_gated = if matches!(retry, Ok(SolveResult::Sat)) {
+                    self.apply_independent_model_gate(SolveResult::Sat)
+                } else {
+                    SolveResult::Unknown
+                };
+                let fully_evaluated = (independently_gated == SolveResult::Sat)
+                    .then(|| self.confirm_sat_with_fully_evaluated_independent_gate());
+                if matches!(retry, Ok(SolveResult::Sat))
+                    && matches!(
+                        fully_evaluated,
+                        Some(ay_model_check::GateVerdict::ConfirmedSat)
+                    )
+                    && !self.publish_evaluation_stop()
+                {
+                    self.last_unknown_reason = None;
+                    for key in [
+                        "unknown.reason",
+                        "unknown.phase",
+                        "unknown.cost_center",
+                        "unknown.detail",
+                    ] {
+                        self.last_statistics.extra.remove(key);
+                    }
+                    self.last_statistics
+                        .set_int("model_validation.exact_datatype_array_rebuild", 2);
+                    result = retry;
+                } else {
+                    self.record_rejected_model();
+                    self.last_model = rejected;
+                    super::super::eval_memo_clear();
+                    super::super::independent_gate::invalidate_functional_model_caches();
+                    self.last_model_validated = false;
+                    self.last_result = Some(SolveResult::Unknown);
+                    if self.evaluation_stop_origin().is_none() && !self.solve_deadline.expired() {
+                        self.last_unknown_reason = first_reason;
+                    }
+                }
+            }
+        }
+        if matches!(result, Ok(SolveResult::Unknown)) {
+            // Several checks answer `unknown` and leave the rejected model in
+            // `last_model`; the others withdrew it already.
+            self.record_rejected_model();
+        }
+        if self.publish_evaluation_stop() {
+            Ok(SolveResult::Unknown)
+        } else {
+            result
+        }
+    }
+
+    fn finalize_sat_model_validation_inner(&mut self) -> Result<SolveResult> {
         // Skips accrued BEFORE this finalization (nested/deferred probe solves,
         // or a previous check-sat in the same incremental session) say nothing
         // about the model being finalized here — see the mixed Seq+datatype
@@ -4802,8 +5428,14 @@ impl Executor {
         // `unknown` rather than shipping a wrong `sat`.
         let assumption_roots = self.last_assumptions.clone().unwrap_or_default();
         self.complete_model_for_validation(&assumption_roots);
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         self.materialize_symbolic_array_defaults();
         self.repair_asserted_bool_leaf_polarities();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
 
         // String GAP completion (gate-verified, retracting). The strings solver
         // validates HERE (in-loop) and downgrades a genuine SAT to Unknown when
@@ -4817,6 +5449,9 @@ impl Executor {
         // and never a sat→unknown regression (#str-gap).
         self.complete_string_gaps_gate_verified();
         self.complete_opaque_array_defaults_gate_verified();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
 
         // Enum model repair (#enum-model-repair): map surplus EUF elements of
         // a finite all-nullary (enum) datatype sort onto constructor slots
@@ -4829,6 +5464,9 @@ impl Executor {
         // acceptance, so a bad repair degrades exactly as before (never a
         // wrong SAT). See `repair_enum_model_overpopulation`.
         self.repair_enum_model_overpopulation();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
 
         // Finite-enum CARDINALITY gate (DEFAULT mode, degrade-only).
         //
@@ -4863,7 +5501,7 @@ impl Executor {
                 inhabitants = k,
                 "SAT model over-populates a finite enum sort, degrading to Unknown"
             );
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(format!(
@@ -4884,7 +5522,7 @@ impl Executor {
         // #repair-fallback-unrepaired: open the stash window (see
         // `strict_verdict_after_unrepaired_fallback`).
         self.unrepaired_model_candidate = None;
-        self.repair_asserted_array_read_pins();
+        self.repair_asserted_array_read_pins_with_datatype_completion();
         // #uflia-witness-complete (1b): UNDER-COMPLETED UF TABLE. A falsified
         // UF-chain equality whose chain argument lands on a function point the
         // formula constrains NOWHERE ELSE is a model-EXTRACTION gap, not a bad
@@ -4901,6 +5539,9 @@ impl Executor {
         // the same scoped helper as the other SAT funnels. All non-confirming
         // independent verdicts remain strict failures.
         let strict_verdict = self.verify_model_strict_with_scoped_authority();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         // #qfax-rejected-target retry: this cycle's repair ran before
         // the rejection named its assertion. Clear the per-model marker,
         // re-run repair once (the bypass now forces completion for the
@@ -4923,16 +5564,22 @@ impl Executor {
                 if oracle.starts_with("arrays") && !self.qfax_retry_done =>
             {
                 self.derive_qfax_refinement_clause(assertion);
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 self.last_rejected_array_assertion = Some(assertion);
                 self.qfax_retry_done = true;
                 if let Some(model) = self.last_model.as_mut() {
                     if let Some(euf) = model.euf_model.as_mut() {
-                        euf.term_values.remove(&TermId(u32::MAX - 7));
+                        euf.array_read_pins_repaired = false;
                     }
                 }
-                self.repair_asserted_array_read_pins();
+                self.repair_asserted_array_read_pins_with_datatype_completion();
                 let reverdict = self.verify_model_strict_with_scoped_authority();
                 self.qfax_retry_done = false;
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 if reverdict.is_none() {
                     self.last_rejected_array_assertion = None;
                     if matches!(
@@ -4955,12 +5602,27 @@ impl Executor {
             None => None,
         };
         self.unrepaired_model_candidate = None;
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         if let Some((idx, oracle, assertion)) = strict_verdict {
-            self.note_exact_ite_uf_definition_model_rejection(oracle);
+            // The optional falsifying assignment can itself stop evaluation.
+            // Finish it before classifying a failure or arming repair retries.
+            if ay_core::misc_cli_flags().model_reject_dump {
+                let dump_term = self.format_term(assertion);
+                self.report_caught_invalid_model(assertion, &dump_term);
+            }
+            if self.publish_evaluation_stop() {
+                return Ok(SolveResult::Unknown);
+            }
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 self.last_rejected_array_assertion = Some(assertion);
             }
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
             self.last_statistics.model_validation_failures += 1;
             self.last_statistics
                 .set_int("model_validation.strict.assertion_index", idx as u64);
@@ -4968,27 +5630,19 @@ impl Executor {
                 .set_string("model_validation.strict.oracle", oracle);
             self.last_statistics
                 .set_string("model_validation.strict.term", self.format_term(assertion));
+            if debug_model() {
+                eprintln!(
+                    "[model] strict {oracle} rejected assertion {idx}: {}",
+                    self.format_term(assertion)
+                );
+                eprintln!("[model] rejected candidate: {:?}", self.last_model);
+            }
             if ay_core::misc_cli_flags().phase_trace {
                 let t = self.format_term(assertion);
                 let t = if t.len() > 400 { &t[..400] } else { &t[..] };
                 eprintln!(
                     "c phase-trace model-gate definitive-false-oracle idx={idx} oracle={oracle} term={t}"
                 );
-            }
-            // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`; default off is
-            // byte-identical — a single `var_os` probe and no I/O). Unlike
-            // `apply_strict_model_gate`, this DEFERRED-validation rejection site
-            // is silent: it records the violated assertion in the statistics but
-            // never prints the concrete values the extracted model gave that
-            // assertion's leaves. A model-rejection census therefore cannot tell
-            // an out-of-range extracted value from a genuinely-bad search point.
-            // Reuse the existing loud-alarm formatter (falsifying assignment
-            // included) so both strict sites report the same evidence shape.
-            // WRITE-ONLY: nothing in any verdict path reads this, and the
-            // degrade below is unchanged.
-            if ay_core::misc_cli_flags().model_reject_dump {
-                let dump_term = self.format_term(assertion);
-                self.report_caught_invalid_model(assertion, &dump_term);
             }
             // Futile-deepening backstop (#dt-array-degrade-backstop, extended):
             // a datatype-field oracle rejection on a datatype-carrying-array
@@ -5026,8 +5680,10 @@ impl Executor {
             // distills, this degrade is byte-for-byte unchanged. SOUND: the
             // lemma is an array-theory tautology, so installing it is
             // verdict-preserving.
-            if self.problem_has_array()
-                && self.cegar_rounds_remaining > 0
+            if match self.problem_has_array() {
+                Ok(has_array) => has_array,
+                Err(_) => return Ok(SolveResult::Unknown),
+            } && self.cegar_rounds_remaining > 0
                 && self.cegar_pending_lemma.is_none()
             {
                 if let Some(model) = self.last_model.take() {
@@ -5046,6 +5702,10 @@ impl Executor {
                         };
                         self.strict_oracle_select_congruence_lemma(&model, eq)
                     });
+                    self.last_model = Some(model);
+                    if self.publish_evaluation_stop() {
+                        return Ok(SolveResult::Unknown);
+                    }
                     if let Some(lemma) = lemma {
                         if !self.cegar_emitted_lemmas.contains(&lemma) {
                             if ay_core::misc_cli_flags().phase_trace {
@@ -5054,7 +5714,6 @@ impl Executor {
                             self.cegar_pending_lemma = Some(lemma);
                         }
                     }
-                    self.last_model = Some(model);
                 }
             }
             // #abv-subst-model-retry: see `apply_strict_model_gate`.
@@ -5103,7 +5762,7 @@ impl Executor {
                     }
                 }
             }
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(format!(
@@ -5225,7 +5884,7 @@ impl Executor {
                      (constructor injectivity through array equality is unmodeled); \
                      degrading to Unknown"
                 );
-                self.last_model = None;
+                self.withdraw_rejected_model();
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.last_result = Some(SolveResult::Unknown);
                 self.record_model_validation_unknown_diagnostic(
@@ -5251,9 +5910,18 @@ impl Executor {
         // select-congruent on its read cells and passes untouched, so
         // completeness is preserved. Degrade-only: never turns a verdict into
         // `unsat` or a wrong `sat`.
-        if self.problem_has_array() {
+        if match self.problem_has_array() {
+            Ok(has_array) => has_array,
+            Err(_) => return Ok(SolveResult::Unknown),
+        } {
             if let Some(model) = self.last_model.take() {
-                if self.array_select_congruence_violated(&model) {
+                if match self.array_select_congruence_violated(&model) {
+                    Ok(violated) => violated,
+                    Err(_) => {
+                        self.last_model = Some(model);
+                        return Ok(SolveResult::Unknown);
+                    }
+                } {
                     if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace model-gate array-select-congruence-degrade");
                     }
@@ -5279,7 +5947,7 @@ impl Executor {
                          derived-equal index (eager encoding gap); degrading to \
                          Unknown"
                     );
-                    self.last_model = None;
+                    self.keep_rejected_model(model);
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     self.last_result = Some(SolveResult::Unknown);
                     self.record_model_validation_unknown_diagnostic(
@@ -5351,10 +6019,13 @@ impl Executor {
         // #repair-fallback-unrepaired: open the stash window (see
         // `strict_verdict_after_unrepaired_fallback`).
         self.unrepaired_model_candidate = None;
-        self.repair_asserted_array_read_pins();
+        self.repair_asserted_array_read_pins_with_datatype_completion();
         // Third strict-gate site in finalize: use the same centralized,
         // fail-closed coverage policy as both earlier funnels and their retries.
         let strict3 = self.verify_model_strict_with_scoped_authority();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         // #qfax-rejected-target retry (site 2): same contract as the first
         // strict-gate site above — a successful repair+re-verify may only
         // short-circuit to `Sat` on an independent-gate `ConfirmedSat` (which
@@ -5366,16 +6037,22 @@ impl Executor {
                 if oracle.starts_with("arrays") && !self.qfax_retry_done =>
             {
                 self.derive_qfax_refinement_clause(assertion);
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 self.last_rejected_array_assertion = Some(assertion);
                 self.qfax_retry_done = true;
                 if let Some(model) = self.last_model.as_mut() {
                     if let Some(euf) = model.euf_model.as_mut() {
-                        euf.term_values.remove(&TermId(u32::MAX - 7));
+                        euf.array_read_pins_repaired = false;
                     }
                 }
-                self.repair_asserted_array_read_pins();
+                self.repair_asserted_array_read_pins_with_datatype_completion();
                 let reverdict = self.verify_model_strict_with_scoped_authority();
                 self.qfax_retry_done = false;
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 if reverdict.is_none() {
                     self.last_rejected_array_assertion = None;
                     if matches!(
@@ -5398,12 +6075,18 @@ impl Executor {
             None => None,
         };
         self.unrepaired_model_candidate = None;
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         if let Some((idx, oracle, assertion)) = strict3 {
-            self.note_exact_ite_uf_definition_model_rejection(oracle);
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 self.last_rejected_array_assertion = Some(assertion);
             }
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
             self.last_statistics.model_validation_failures += 1;
             self.last_statistics
                 .set_int("model_validation.strict.assertion_index", idx as u64);
@@ -5429,7 +6112,7 @@ impl Executor {
             if self.qfax_isolated_lane {
                 self.qfax_isolated_model_rejected = true;
             }
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(format!(
@@ -5528,7 +6211,7 @@ impl Executor {
                     assertion = %self.format_term(assertion),
                     "mod/div bypass SAT degraded to Unknown: assertion evaluates definitively false under model"
                 );
-                self.last_model = None;
+                self.withdraw_rejected_model();
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.last_result = Some(SolveResult::Unknown);
                 self.record_model_validation_unknown_diagnostic(
@@ -5631,7 +6314,7 @@ impl Executor {
                 "SAT degraded to Unknown: could not materialize a valid string witness \
                  (under-constrained string variable, #str-witness)"
             );
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(
@@ -5669,7 +6352,7 @@ impl Executor {
                 "SAT degraded to Unknown: could not materialize a finite-set carrier of the \
                  required cardinality (#set-card-model-witness)"
             );
-            self.last_model = None;
+            self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
             self.record_model_validation_unknown_diagnostic(
@@ -5703,6 +6386,9 @@ impl Executor {
         }
 
         let attempt = self.validate_model_attempt();
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         // Preserve exact failure provenance before consuming the attempt. The
         // independent-array handoff below is deliberately available only when
         // the assertion that defeated the canonical evaluator itself contains
@@ -5751,14 +6437,87 @@ impl Executor {
                 // `self_check_authored_model_certified`.
                 let authored_certified =
                     self.self_check && incomplete > 0 && self.self_check_authored_model_certified();
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 if authored_certified {
                     self.last_statistics
                         .set_int("self_check.authored_certified", 1);
                 }
-                if self.self_check && incomplete > 0 && !authored_certified {
+                // (#selfcert-quantified) A quantified assertion this pipeline
+                // SKIPPED is not thereby unverified. The skip is real — a SAT
+                // assignment to the quantifier's Boolean proxy proves nothing
+                // about its domain — but the funnel carries a gate that decides
+                // exactly these assertions, and it runs LATER in
+                // `emit_sat_verdict` than this ledger. So a query whose only
+                // incompleteness was a quantified assertion the independent
+                // model checker evaluates to a definite `true` was downgraded
+                // here, before the gate that confirms it ever ran.
+                //
+                // Credit is POSITIVE-ONLY and per assertion: an exact
+                // `Bool(true)` from the independent checker, the strongest of
+                // the quantified gate's own routes. `Bool(false)`, unevaluable
+                // and capped all count for nothing, so an undecidable
+                // quantifier still degrades `Sat -> Unknown` here. And nothing
+                // downstream is relaxed: `apply_quantified_model_failclosed_gate`
+                // and the independent gate still run with unchanged authority,
+                // so this can only stop a PREMATURE downgrade — never publish a
+                // `sat` a later gate would have refused.
+                let quantifier_evidence = if self.self_check
+                    && incomplete > 0
+                    && !authored_certified
+                    && stats.skipped_quantifier > 0
+                {
+                    self.self_check_quantifier_skip_evidence(stats.skipped_quantifier)
+                } else {
+                    QuantifierSkipEvidence::Indeterminate
+                };
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
+                // An exact independent `false` is a CAUGHT INVALID CANDIDATE,
+                // not an incompleteness. Filing it under the ledger's
+                // "unverified" count reached the right verdict for the wrong
+                // reason and left the falsifying model installed, where every
+                // sibling gate in this funnel clears it
+                // (`downgrade_sat_after_gate`). Classify it the way the
+                // quantified gate classifies the same evidence.
+                if let QuantifierSkipEvidence::Refuted(assertion) = quantifier_evidence {
+                    let term = self.format_term(assertion);
+                    self.report_caught_invalid_model(assertion, &term);
+                    if self.publish_evaluation_stop() {
+                        return Ok(SolveResult::Unknown);
+                    }
+                    self.last_statistics.model_validation_failures += 1;
+                    self.last_statistics
+                        .set_string("model_check_gate.quantified", "refuted");
+                    self.last_statistics
+                        .set_string("model_check_gate.quantified_assertion", term.clone());
+                    self.withdraw_rejected_model();
+                    self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                    self.last_result = Some(SolveResult::Unknown);
+                    self.record_model_validation_unknown_diagnostic(format!(
+                        "self-check: quantified assertion is falsified by the emitted \
+                         model: {term}"
+                    ));
+                    return Ok(SolveResult::Unknown);
+                }
+                let quantified_certified = match quantifier_evidence {
+                    QuantifierSkipEvidence::Confirmed(n) => n,
+                    _ => 0,
+                };
+                if quantified_certified > 0 {
+                    self.last_statistics.set_int(
+                        "self_check.quantified_independently_confirmed",
+                        quantified_certified,
+                    );
+                }
+                let incomplete_uncredited = incomplete.saturating_sub(quantified_certified);
+                if self.self_check && incomplete_uncredited > 0 && !authored_certified {
                     self.last_statistics.model_validation_failures += 1;
                     tracing::warn!(
-                        incomplete,
+                        incomplete = incomplete_uncredited,
+                        quantified_certified,
                         checked = stats.checked,
                         total = stats.total,
                         "self-check: SAT not independently certified, degrading to Unknown"
@@ -5767,7 +6526,7 @@ impl Executor {
                     self.last_result = Some(SolveResult::Unknown);
                     self.record_model_validation_unknown_diagnostic(format!(
                         "self-check: model could not be independently certified \
-                         ({incomplete} of {} assertion(s) unverified)",
+                         ({incomplete_uncredited} of {} assertion(s) unverified)",
                         stats.total
                     ));
                     return Ok(SolveResult::Unknown);
@@ -5840,10 +6599,7 @@ impl Executor {
                     == VerificationBoundary::SmtGroundAssertion
                     && failed_assertion_has_datatype;
                 if (array_ground_gap || dt_ground_gap)
-                    && matches!(
-                        self.confirm_sat_with_independent_gate(),
-                        ay_model_check::GateVerdict::ConfirmedSat
-                    )
+                    && self.independent_handoff_confirms(array_ground_gap)
                 {
                     let total = self.flatten_assertion_conjunctions().len();
                     let stats = ValidationStats {
@@ -5877,6 +6633,9 @@ impl Executor {
                 // attach the export and re-run finalization once. Sound: the
                 // retry can only end in the SAME fail-closed arms; it merely
                 // lets the independent gate see the values the printer emits.
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 if dt_ground_gap {
                     self.dt_validation_wants_egraph = true;
                 }
@@ -5915,6 +6674,9 @@ impl Executor {
                     self.last_model_validated = true;
                     return Ok(SolveResult::Sat);
                 }
+                if self.publish_evaluation_stop() {
+                    return Ok(SolveResult::Unknown);
+                }
                 // #8373: Degrade Violated to Unknown instead of hard error.
                 //
                 // When the theory solver says SAT but the model violates an
@@ -5929,7 +6691,7 @@ impl Executor {
                 // validation should produce Unknown, not an error.
                 self.last_statistics.model_validation_failures += 1;
                 tracing::warn!(error = %e, "model validation violated, degrading to Unknown (#8373)");
-                self.last_model = None;
+                self.withdraw_rejected_model();
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.last_result = Some(SolveResult::Unknown);
                 self.record_model_validation_unknown_diagnostic(format!(
@@ -5957,10 +6719,33 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
     ) -> Result<SolveResult> {
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
         // Same fill-only model completion as finalize_sat_model_validation
         // so assumption evaluation sees a total model (see completion.rs).
         self.complete_model_for_validation(assumptions);
-        match self.validate_sat_assumptions(assumptions) {
+        let validation = self.validate_sat_assumptions(assumptions);
+        match &validation {
+            Ok(()) => self.trace_unknown_funnel(
+                "assumption-validation-verified",
+                None,
+                Some(&SolveResult::Sat),
+                false,
+            ),
+            Err(error) => self.trace_unknown_funnel_failure(
+                if error.is_incomplete() {
+                    "assumption-validation-incomplete"
+                } else {
+                    "assumption-validation-violated"
+                },
+                error.failure(),
+            ),
+        }
+        if self.publish_evaluation_stop() {
+            return Ok(SolveResult::Unknown);
+        }
+        match validation {
             Ok(()) => Ok(SolveResult::Sat),
             Err(e @ ModelValidationError::Incomplete(_)) => {
                 tracing::debug!(error = %e, "assumption validation incomplete, degrading to Unknown");
@@ -5991,8 +6776,13 @@ impl Executor {
     }
 }
 
+mod independent_handoff;
+
 #[cfg(test)]
 mod scoped_authority_tests;
+
+#[cfg(test)]
+mod evaluation_stop_tests;
 
 #[cfg(test)]
 mod failed_assertion_provenance_tests {
@@ -6078,5 +6868,41 @@ mod failed_assertion_provenance_tests {
             "an unrelated array must not authorize handoff of a scalar failure"
         );
         assert!(!failed_assertion_contains_array(&terms, None));
+    }
+}
+
+#[cfg(test)]
+mod unconfirmed_tier_tests {
+    use super::{unconfirmed_tier_label, UnconfirmedTier};
+
+    /// A publication-funnel refusal is WITHHELD.
+    ///
+    /// The tier is the only thing on that transcript line that speaks about
+    /// the verdict, and `reject_uncertified_verdict_for_publication` returns
+    /// `Unknown` unconditionally — so reading the tier off `--self-check`
+    /// made the default-mode line contradict the answer printed two lines
+    /// below it. The label takes no mode, so it cannot depend on one.
+    #[test]
+    fn a_withheld_verdict_never_reads_published() {
+        assert_eq!(
+            unconfirmed_tier_label(UnconfirmedTier::WithheldVerdict),
+            "UNCONFIRMED/withheld"
+        );
+    }
+
+    /// A model-validation non-confirmation is WITHHELD too.
+    ///
+    /// Every caller of `record_model_validation_unknown_diagnostic` discards
+    /// the candidate and returns `Unknown`. The old default-mode label
+    /// `published` made storecomm_invalid_t1_pp_sf_ni_00030_008 read as a
+    /// rejected model published as `sat`; the `sat` it prints is a retry's
+    /// own validated model. The end-to-end pin, in both modes, is
+    /// `group_cli::unconfirmed_diagnostic_scope::a_rejected_candidate_is_never_reported_as_published`.
+    #[test]
+    fn a_rejected_model_candidate_never_reads_published() {
+        assert_eq!(
+            unconfirmed_tier_label(UnconfirmedTier::ModelValidation),
+            "UNCONFIRMED/withheld"
+        );
     }
 }

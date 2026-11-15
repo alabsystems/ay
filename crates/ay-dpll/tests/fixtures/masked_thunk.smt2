@@ -1,0 +1,8 @@
+(set-option :timeout 60000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const D (_ BitVec 64))
+(declare-const thunk_off (_ BitVec 64))
+(assert (not (= (bvadd D thunk_off) (bvadd (bvadd (bvand (_ bv18446744073709547520 64) D) (bvand (_ bv4095 64) D)) thunk_off))))
+(check-sat)
+(exit)

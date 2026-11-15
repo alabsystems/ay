@@ -16,6 +16,60 @@ pub(super) struct MeteredLinearExpr {
 }
 
 impl MeteredLinearExpr {
+    pub(super) fn canonicalize_variables(
+        &mut self,
+        congruence: &super::congruence::Congruence,
+        meter: &mut ProgressMeter<'_>,
+    ) -> Result<(), FarkasValidationError> {
+        // Fund cleanup of the owned input even if a later operation refuses.
+        // Coefficients move rather than being cloned; collision sums use the
+        // same exact rational primitive as the existing strict linear path.
+        meter.charge(self.coeffs.len(), size_of::<Vec<(TermId, BigRational)>>())?;
+        for (_, coefficient) in &self.coeffs {
+            meter.charge_rational_drop(coefficient)?;
+        }
+        let old = std::mem::take(&mut self.coeffs);
+        meter.reserve_vec(&mut self.coeffs, old.len())?;
+        for (term, coefficient) in old {
+            let representative = congruence.representative(term, meter)?;
+            meter.charge(sorted_search_work(self.coeffs.len()), 0)?;
+            match self
+                .coeffs
+                .binary_search_by_key(&representative, |(term, _)| *term)
+            {
+                Ok(index) => {
+                    let sum = meter.add(&self.coeffs[index].1, &coefficient)?;
+                    // Sum may be dropped here, on a future merge, or in the
+                    // final plan. Account before installing it in local state.
+                    meter.charge_rational_drop(&sum)?;
+                    if sum.is_zero() {
+                        let moves = self
+                            .coeffs
+                            .len()
+                            .checked_sub(index)
+                            .ok_or(FarkasValidationError::ResourceLimit)?;
+                        meter.charge(moves, 0)?;
+                        let _ = self.coeffs.remove(index);
+                    } else {
+                        meter.charge(1, 0)?;
+                        self.coeffs[index].1 = sum;
+                    }
+                }
+                Err(index) => {
+                    let moves = self
+                        .coeffs
+                        .len()
+                        .checked_sub(index)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(FarkasValidationError::ResourceLimit)?;
+                    meter.charge(moves, 0)?;
+                    self.coeffs.insert(index, (representative, coefficient));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn zero(meter: &mut ProgressMeter<'_>) -> Result<Self, FarkasValidationError> {
         Ok(Self {
             coeffs: Vec::new(),
@@ -40,6 +94,20 @@ impl MeteredLinearExpr {
         meter.reserve_vec(&mut coeffs, 1)?;
         meter.charge(1, 0)?;
         coeffs.push((term, coefficient));
+        Ok(Self { coeffs, constant })
+    }
+
+    pub(super) fn clone_metered(
+        &self,
+        meter: &mut ProgressMeter<'_>,
+    ) -> Result<Self, FarkasValidationError> {
+        let constant = meter.clone_rational(&self.constant)?;
+        let mut coeffs = Vec::new();
+        meter.reserve_vec(&mut coeffs, self.coeffs.len())?;
+        for (term, coefficient) in &self.coeffs {
+            meter.charge(1, 0)?;
+            coeffs.push((*term, meter.clone_rational(coefficient)?));
+        }
         Ok(Self { coeffs, constant })
     }
 
@@ -227,6 +295,9 @@ pub(super) fn parse_linear_expr(
     meter: &mut ProgressMeter<'_>,
 ) -> Result<MeteredLinearExpr, FarkasValidationError> {
     meter.charge(1, 0)?;
+    if term.index() >= terms.len() {
+        return Err(FarkasValidationError::NonArithmeticLiteral { term });
+    }
     match terms.get(term) {
         TermData::Const(Constant::Int(value)) => Ok(MeteredLinearExpr::constant(
             meter.rational_from_bigint(value)?,

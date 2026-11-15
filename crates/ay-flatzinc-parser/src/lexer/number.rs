@@ -43,7 +43,8 @@ impl Lexer<'_> {
         let digits_start = self.pos;
         while self.peek().is_some_and(|ch| match radix {
             16 => ch.is_ascii_hexdigit(),
-            8 => matches!(ch, b'0'..=b'7'),
+            // Octal digits are exactly the ASCII digits below `8`.
+            8 => ch.is_ascii_digit() && ch < b'8',
             _ => false,
         }) {
             self.advance();
@@ -85,8 +86,8 @@ impl Lexer<'_> {
         while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
             self.advance();
         }
-        let has_fraction = self.peek() == Some(b'.')
-            && self.input.get(self.pos + 1).is_some_and(u8::is_ascii_digit);
+        let has_fraction =
+            self.peek() == Some(b'.') && self.peek_second().is_some_and(|ch| ch.is_ascii_digit());
         if has_fraction {
             self.advance();
             while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
@@ -106,7 +107,15 @@ impl Lexer<'_> {
             }
         }
 
-        let literal = std::str::from_utf8(&self.input[start..self.pos]);
+        // `start` is where `read_number` began, never past the bytes consumed
+        // since; the checked slice states that without a panic edge.
+        let Some(literal_bytes) = self.input.get(start..self.pos) else {
+            return Err(ParseError::InvalidInt {
+                line,
+                value: "numeric literal span outside the input".to_string(),
+            });
+        };
+        let literal = std::str::from_utf8(literal_bytes);
         if has_fraction || has_exponent {
             let value = literal.map_err(|_| ParseError::InvalidFloat {
                 line,

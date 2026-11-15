@@ -40,7 +40,9 @@ fn expression_limits(depth: usize) -> BvExprProofLimits {
         ..ResolutionProofLimits::default()
     };
     BvExprProofLimits {
+        sweep: false,
         max_expr_nodes: 4096,
+        max_expr_occurrences: 100_000,
         max_expr_depth: depth,
         max_leaf_name_bytes: 1024 * 1024,
         max_internal_width: 128,
@@ -82,7 +84,11 @@ fn clean_mul_widening_readout(width: u32) -> (BvExpr, BvExpr) {
     let b = BvExpr::leaf("B0", width);
     let product = BvExpr::mul(a, b);
     (
-        BvExpr::extract(BvExpr::zero_ext(product.clone(), width), width - 1, 0),
+        BvExpr::extract(
+            BvExpr::zero_ext(product.clone(), width),
+            width.saturating_sub(1),
+            0,
+        ),
         product,
     )
 }

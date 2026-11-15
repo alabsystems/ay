@@ -15,4 +15,6 @@ mod exit_value;
 mod parity;
 
 #[cfg(test)]
+mod parity_admission_tests;
+#[cfg(test)]
 mod tests;

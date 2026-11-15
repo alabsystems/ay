@@ -213,7 +213,7 @@ impl CongruenceClosure {
                         gate_alive[gi] = false;
                         let unit_lit = if parity_flip { out } else { out ^ 1 };
                         // Parity-certified XOR collapse (machine-checked-exact
-                        // polarity, ay-sat-verified). #7137-relax.
+                        // polarity, ay-sat-congruence-core). #7137-relax.
                         if Self::record_unit(
                             unit_lit,
                             unit_vals,

@@ -24,6 +24,10 @@
 //! Glucose-style LBD-EMA restart policy.
 
 use super::super::*;
+use crate::solver::candidate::IncrementalCompletion;
+
+mod deadline;
+use deadline::DeadlinePoll;
 
 /// `y` raised to the Luby-sequence exponent for the 0-based restart counter
 /// `x` (counter value `x` is position `i = x + 1` of the published sequence).
@@ -99,37 +103,98 @@ impl Solver {
     ///
     /// Returns solver-origin data under the restricted semantics above, not a checked proof.
     pub fn solve_incremental_ic3(&mut self, assumptions: &[Literal]) -> SolverAssumeResult {
-        let result = self.solve_incremental_ic3_raw(assumptions);
+        self.solve_incremental_ic3_interruptible(assumptions, || false)
+    }
+
+    /// The same incremental IC3 algorithm with a borrowed original-owner stop.
+    ///
+    /// The callback uses interior mutability if it debits work. A refusal is
+    /// sticky for this query; a fresh call does not inherit that local latch.
+    /// Entry, post-setup, sampled search (at most 256 driver iterations) and
+    /// post-GC admission polls only decline a verdict. Opaque propagation and
+    /// cleanup remain cooperative; this does not certify proofs or bound RSS.
+    pub fn solve_incremental_ic3_interruptible<F>(
+        &mut self,
+        assumptions: &[Literal],
+        should_stop: F,
+    ) -> SolverAssumeResult
+    where
+        F: Fn() -> bool,
+    {
+        let stopped = std::cell::Cell::new(false);
+        let stop = || {
+            if stopped.replace(true) {
+                return true;
+            }
+            if should_stop() {
+                true
+            } else {
+                stopped.set(false);
+                false
+            }
+        };
+        let mut result =
+            self.solve_incremental_ic3_raw(assumptions, &stop, IncrementalCompletion::Checked);
 
         // Enforce learned clause cap after each solve (#8672).
         // The cap check is amortized (runs every IC3_LEARNED_CAP_CHECK_INTERVAL
         // solves) and protects against unbounded clause growth across 10K+
         // queries. This complements ic3_between_solve_gc (which fires during
         // reset_search_state) with a tighter, hard-cap policy.
-        if self.cold.ic3_mode {
-            if self.decision_level > 0 {
-                self.backtrack_ic3(0);
-            }
-            self.ic3_enforce_learned_cap();
+        // A terminal counted refusal cannot authorize an unmetered cleanup
+        // backtrack. The trail is already consistent (before or after the
+        // atomic transaction), and the same sticky owner forbids reuse.
+        if self.cold.ic3_mode && self.counted_stop_reason().is_none() {
+            let reset = if self.decision_level > 0 {
+                self.backtrack_ic3_counted(0)
+            } else {
+                Ok(())
+            };
+            if let Err(reason) = reset {
+                drop(result);
+                result = self.declare_assume_unknown_with_reason(reason);
+            } else {
+                self.ic3_enforce_learned_cap();
 
-            // Memory-proportional reduce (#8673): complements the count-based
-            // cap with an arena memory check. Many medium-length clauses can
-            // stay under the count cap while consuming significant arena memory.
-            // This fires when arena words exceed IC3_MEMORY_PRESSURE_ARENA_FACTOR
-            // times the baseline captured at IC3 mode entry.
-            self.ic3_memory_pressure_reduce();
+                // Memory-proportional reduce (#8673): complements the count-based
+                // cap with an arena memory check. Many medium-length clauses can
+                // stay under the count cap while consuming significant arena memory.
+                // This fires when arena words exceed IC3_MEMORY_PRESSURE_ARENA_FACTOR
+                // times the baseline captured at IC3 mode entry.
+                self.ic3_memory_pressure_reduce();
+            }
         }
 
-        SolverAssumeResult::from_solver_result(result)
+        let result = self.finish_ic3_query_controlled(result, &stop);
+        drop(should_stop);
+        SolverAssumeResult::from_solver_result(self.finish_counted_assume(result))
     }
 
     /// Raw IC3 incremental solve returning `AssumeResult`.
-    fn solve_incremental_ic3_raw(&mut self, assumptions: &[Literal]) -> AssumeResult {
+    pub(in crate::solver) fn solve_incremental_ic3_raw<F>(
+        &mut self,
+        assumptions: &[Literal],
+        should_stop: &F,
+        completion: IncrementalCompletion<'_>,
+    ) -> AssumeResult
+    where
+        F: Fn() -> bool + ?Sized,
+    {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
+        if completion.is_candidate()
+            && (!assumptions.is_empty()
+                || self.active_domain.is_some()
+                || !self.cold.scope_selectors.is_empty())
+        {
+            return self.declare_assume_unknown_with_reason(SatUnknownReason::UnsupportedConfig);
+        }
         // #8754: finalize_sat_fail_count is STICKY across solve() calls.
 
-        if let Some(reason) = self.solve_stop_reason(&|| false) {
+        if let Some(reason) = self
+            .counted_step_stop_reason()
+            .or_else(|| self.solve_stop_reason(should_stop))
+        {
             return self.declare_assume_unknown_with_reason(reason);
         }
 
@@ -188,16 +253,38 @@ impl Solver {
         if self.can_use_incremental_reset() {
             self.stats.assumption_cache_hits += 1;
             self.reset_search_state_incremental();
+            if self.original_ledger_replay_failed() {
+                return self.declare_assume_unknown_with_reason(
+                    SatUnknownReason::ProofFinalizationFailure,
+                );
+            }
         } else {
             self.stats.assumption_cache_misses += 1;
             self.reset_search_state();
+            if self.original_ledger_replay_failed() {
+                return self.declare_assume_unknown_with_reason(
+                    SatUnknownReason::ProofFinalizationFailure,
+                );
+            }
 
             // Full reset path: must reinitialize watches and process unit clauses.
             self.initialize_watches();
+            if let Some(reason) = self.solve_stop_reason(should_stop) {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
             if let Some(conflict_ref) = self.process_initial_clauses() {
                 self.record_level0_conflict_chain(conflict_ref);
                 return self.declare_unsat_assume(vec![]);
             }
+        }
+
+        // Initial clause/watch work is opaque, but an overrun cannot enter
+        // search or publish a result. The outer wrapper also checks cleanup.
+        if let Some(reason) = self.solve_stop_reason(should_stop) {
+            return self.declare_assume_unknown_with_reason(reason);
+        }
+        if let Some(reason) = completion.resource_stop(self) {
+            return self.declare_assume_unknown_with_reason(reason);
         }
 
         debug_assert_eq!(self.decision_level, 0);
@@ -243,15 +330,18 @@ impl Solver {
         // In IC3 mode this remains bounded: `set_ic3_mode()` leaves only BVE
         // enabled, and `run_incremental_inprocessing()` runs BVE only when
         // `has_scoped_bve()` is true.
-        if self.has_scoped_bve()
-            && self.inprocessing_gates_pass()
-            && self.run_incremental_inprocessing()
-        {
-            return self.declare_unsat_assume(vec![]);
+        if self.has_scoped_bve() && self.inprocessing_gates_pass() {
+            if let Some(outcome) = self.run_incremental_inprocessing_round_until(Some(should_stop))
+            {
+                return outcome;
+            }
         }
 
         // Handle empty formula.
         if self.arena.is_empty() {
+            if completion.is_candidate() {
+                return completion.current(self);
+            }
             return self.ic3_handle_empty_formula(assumptions);
         }
 
@@ -319,12 +409,19 @@ impl Solver {
         let mut restarts_this_query: u32 = 0;
         let mut conflicts_since_query_restart: u64 = 0;
         let mut restart_budget = (luby(2.0, restarts_this_query) * IC3_RESTART_BASE) as u64;
+        let mut deadline_poll = DeadlinePoll::new();
 
         loop {
+            if let Some(reason) = completion.resource_stop(self) {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
+            if let Some(reason) = self.counted_step_stop_reason() {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
             // Parity with the general assumption driver: honor the external
             // interrupt handle and the process-memory gate on every
             // iteration, including conflict-free SAT descents.
-            if let Some(reason) = self.active_interrupt_reason() {
+            if let Some(reason) = deadline_poll.check_controlled(self, should_stop) {
                 return self.declare_assume_unknown_with_reason(reason);
             }
             // Learned level-0 units and incrementally added clauses can
@@ -335,7 +432,11 @@ impl Solver {
                 return self.declare_unsat_assume(failed_assumptions);
             }
 
-            if let Some(conflict_ref) = self.search_propagate() {
+            let propagation = match self.search_propagate_counted() {
+                Ok(conflict) => conflict,
+                Err(reason) => return self.declare_assume_unknown_with_reason(reason),
+            };
+            if let Some(conflict_ref) = propagation {
                 // ── Conflict ──
                 if self.decision_level == 0 {
                     // Independent of every decision: UNSAT at the root.
@@ -500,7 +601,9 @@ impl Solver {
                     } else {
                         // Unassigned: the assumption is the next decision.
                         assumption_idx += 1;
-                        self.decide(assump_lit);
+                        if let Err(reason) = self.decide_counted(assump_lit) {
+                            return self.declare_assume_unknown_with_reason(reason);
+                        }
                     }
                     continue;
                 }
@@ -521,7 +624,9 @@ impl Solver {
 
                         let prefix = num_assumptions as u32;
                         if self.decision_level > prefix {
-                            self.backtrack_ic3(prefix);
+                            if let Err(reason) = self.backtrack_ic3_counted(prefix) {
+                                return self.declare_assume_unknown_with_reason(reason);
+                            }
                             self.cold.restarts += 1;
                         }
                         self.conflicts_since_restart = 0;
@@ -546,7 +651,9 @@ impl Solver {
                     if num_assumptions == 0 {
                         // No assumption prefix to preserve: full restart.
                         if self.decision_level > 0 {
-                            self.backtrack(0);
+                            if let Err(reason) = self.backtrack_counted(0) {
+                                return self.declare_assume_unknown_with_reason(reason);
+                            }
                             self.cold.restarts += 1;
                             self.bucket_queue_on_restart();
                         }
@@ -564,9 +671,14 @@ impl Solver {
 
                 // Free decision by the activity heuristic with saved phases
                 // (domain-restricted when a domain is active).
-                if let Some(var) = self.pick_next_decision_variable() {
-                    let lit = self.pick_phase(var);
-                    self.decide(lit);
+                let selected = match self.pick_next_decision_literal_counted() {
+                    Ok(selected) => selected,
+                    Err(reason) => return self.declare_assume_unknown_with_reason(reason),
+                };
+                if let Some(lit) = selected {
+                    if let Err(reason) = self.decide_counted(lit) {
+                        return self.declare_assume_unknown_with_reason(reason);
+                    }
 
                     // SAT-leaning runs can make many decisions between
                     // conflicts; keep the external interrupt honored on
@@ -575,6 +687,9 @@ impl Solver {
                         return self.declare_assume_unknown_with_reason(reason);
                     }
                 } else {
+                    if completion.is_candidate() {
+                        return completion.current(self);
+                    }
                     // No unassigned decision variable remains (within the
                     // domain, when one is active): the query is SAT.
                     if self.active_domain.is_some() {
@@ -591,7 +706,7 @@ impl Solver {
                         }
                         return AssumeResult::Sat(self.get_model());
                     }
-                    return self.declare_assume_sat_from_current_assignment();
+                    return completion.current(self);
                 }
             }
         }

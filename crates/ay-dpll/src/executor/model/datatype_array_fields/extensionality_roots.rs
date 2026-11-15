@@ -7,6 +7,12 @@
 use super::super::dt_construct_budget::MAX_OPAQUE_DT_COLLECTION_ROOTS;
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ExtensionalityEvidencePurpose {
+    RequestedWitnesses,
+    CommittedDemand,
+}
+
 impl Executor {
     /// Recover only direct, generation-site-authenticated outer-array witness
     /// literals whose cells are exact single-constructor datatypes carrying an
@@ -29,6 +35,33 @@ impl Executor {
         &self,
         model: &Model,
     ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
+        self.datatype_array_extensionality_evidence(
+            model,
+            ExtensionalityEvidencePurpose::RequestedWitnesses,
+        )
+    }
+
+    /// Select only witnesses demanded by this candidate's committed SAT
+    /// assignment from the eager, syntactic emission over-approximation.
+    /// An unassigned or true equality grants neither roots nor cells. This is
+    /// not a truth/default for that equality and is not W6 authority; every
+    /// included witness still needs complete generation-site and polarity
+    /// authentication, and every original model obligation remains required.
+    pub(in crate::executor::model) fn collect_demanded_datatype_array_extensionality(
+        &self,
+        model: &Model,
+    ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
+        self.datatype_array_extensionality_evidence(
+            model,
+            ExtensionalityEvidencePurpose::CommittedDemand,
+        )
+    }
+
+    fn datatype_array_extensionality_evidence(
+        &self,
+        model: &Model,
+        purpose: ExtensionalityEvidencePurpose,
+    ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
         if self.array_ext_shadow.emitted.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
             return None;
         }
@@ -50,7 +83,15 @@ impl Executor {
                 Ok(None) => continue,
                 Err(()) => return None,
             };
-            if self.committed_sat_bool(model, entry.eq_term) != Some(false)
+            let equality = self.committed_sat_bool(model, entry.eq_term);
+            if matches!(purpose, ExtensionalityEvidencePurpose::CommittedDemand)
+                && equality != Some(false)
+            {
+                // Shape and birth validation precede selection, including for
+                // an unselected row. Missing assignments supply no evidence.
+                continue;
+            }
+            if equality != Some(false)
                 || self.committed_sat_bool(model, entry.not_sel_eq) != Some(true)
                 || self.committed_sat_bool(model, cell_equality) != Some(false)
             {

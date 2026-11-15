@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use ay_core::{Sort, TermId};
+use ay_core::{Sort, Symbol, TermId};
 use num_bigint::BigInt;
 
 use super::{Context, ElaborateError, Result};
@@ -58,6 +58,18 @@ impl Context {
         arg_ids: &[TermId],
     ) -> Result<Option<TermId>> {
         match name {
+            "mkbv" => {
+                let width = u32::try_from(arg_ids.len()).map_err(|_| {
+                    ElaborateError::InvalidConstant("mkbv result width overflows".to_string())
+                })?;
+                let sort = Self::checked_bitvector_sort(width)?;
+                self.expect_bool_operands(name, arg_ids)?;
+                Ok(Some(self.terms.mk_app_structural(
+                    Symbol::named(name),
+                    arg_ids,
+                    sort,
+                )))
+            }
             "bvadd" | "bvmul" | "bvand" | "bvor" | "bvxor" | "concat" => {
                 if arg_ids.len() < 2 {
                     return Err(ElaborateError::InvalidConstant(format!(
@@ -120,6 +132,18 @@ impl Context {
             "bvnot" | "bvneg" | "bv2nat" | "bv2int" | "ubv_to_int" | "sbv_to_int" => {
                 self.expect_exact_arity(name, arg_ids, 1)?;
                 self.expect_bv_operand_width(name, arg_ids[0])?;
+                if matches!(name, "ubv_to_int" | "sbv_to_int") {
+                    // SMT-LIB 2.7 names z3 5 reads and z3 4.12.5 does not:
+                    // z3 mode rejects them, which against either version only
+                    // drops an assertion.
+                    if self.z3_mode {
+                        let sort = self.terms.sort(arg_ids[0]).to_string();
+                        return Err(ElaborateError::IllSorted(format!(
+                            "unknown constant {name} ({sort}) "
+                        )));
+                    }
+                    self.note_construct_z3_may_reject();
+                }
                 Ok(Some(match name {
                     "bvnot" => self.terms.mk_bvnot(arg_ids[0]),
                     "bvneg" => self.terms.mk_bvneg(arg_ids[0]),

@@ -12,6 +12,10 @@ use crate::proof_manager::PlannedForwardAddReject;
 
 const FACTOR_CANDIDATE_FILTER_ROUNDS: usize = 2;
 
+/// Synthetic ER source id for clauses without an id on the no-proof route
+/// (`clause_ids_disabled`): unique per arena index, far above any real id.
+const FACTOR_SYNTHETIC_SOURCE_ID_BASE: u64 = 1 << 62;
+
 /// Candidate scheduling rounds per factorize call. After the priority-queue
 /// schedule drains, the schedule is rebuilt from the CURRENT occurrence state
 /// and drained again (only when the previous round applied at least one
@@ -145,11 +149,27 @@ impl Solver {
     }
 
     fn factor_er_source_id(&self, clause_idx: usize) -> Result<u64, FactorLratTransactionReject> {
-        let clause_id = if clause_idx < self.cold.clause_ids.len() {
+        let mut clause_id = if clause_idx < self.cold.clause_ids.len() {
             self.clause_id(ClauseRef(clause_idx as u32))
         } else {
             0
         };
+        // The no-proof streaming route disables clause ids (`clause_ids` is
+        // never written there), and the ER definition this id feeds is only
+        // read by the proof exports — but the preflight used to demand a
+        // nonzero id anyway, so on that route every factoring pass was
+        // rejected whole (qwh.60.1728: 0 factorings against 32,854 under the
+        // proof posture, where the ids exist). With no proof surface at all,
+        // a clause without an id gets a synthetic one that is unique per
+        // arena index and cannot collide with a real id.
+        if clause_id == 0
+            && self.cold.clause_ids_disabled
+            && self.proof_manager.is_none()
+            && !self.cold.lrat_enabled
+            && clause_idx < self.arena.len()
+        {
+            clause_id = FACTOR_SYNTHETIC_SOURCE_ID_BASE + clause_idx as u64;
+        }
         // is_garbage_any (husk adjudication): reject garbage-kept husks as ER
         // sources, mirroring factor_lrat_source_id above.
         if clause_idx >= self.arena.len()
@@ -538,6 +558,15 @@ impl Solver {
     /// interval grows 1.5× per idle call, up to FACTOR_MAX_INTERVAL.
     /// Productive calls reset to base interval.
     pub(in crate::solver) fn factorize(&mut self) {
+        // `--sat-factor-max-density`: no factoring on a formula denser than
+        // the switch says (the A/B arm for the dense band; see the switch).
+        if let Some(max_density) = ay_core::sat_ab_switches().factor_max_density {
+            let (_, _, density) = self.elimination_formula_density();
+            if density > max_density {
+                self.cold.factor_density_skips += 1;
+                return;
+            }
+        }
         let outcome = self.factorize_body();
         if outcome == FactorizeOutcome::RejectedLratPreflight {
             return;
@@ -608,7 +637,8 @@ impl Solver {
         let ticks_now = self.search_ticks[0] + self.search_ticks[1];
         let ticks_delta = ticks_now.saturating_sub(self.cold.last_factor_ticks);
         let mut effort = ticks_delta * FACTOR_EFFORT_PERMILLE / 1000;
-        if self.cold.factor_rounds == 0 {
+        let init_call = self.cold.factor_rounds == 0;
+        if init_call {
             // #factor-dense-init: the first factoring call gets an init bonus
             // so it can drain the candidate schedule instead of stalling on
             // the (near-zero during preprocess) proportional budget. In the
@@ -698,6 +728,20 @@ impl Solver {
         let mut factored_since_schedule = false;
 
         loop {
+            // The pass honors the solve's own stop (the deadline, an interrupt
+            // including the memory trip wire, a proof write failure) between
+            // applications. Each application is applied whole, so a stop here
+            // leaves the clause DB and the proof consistent; the solve then
+            // ends through its normal stop path. Lever 3 opened this pass on
+            // formulas where its first call runs about 40 s (k275, 2026-09-16),
+            // and a budget-bounded pass that cannot see the deadline would
+            // turn a solve into a kill, as lever 2's detection could
+            // (b565d76c0).
+            if let Some(reason) = self.solve_stop_reason(&|| false) {
+                self.cold.factor_stops += 1;
+                tracing::debug!("[factorize] stopped: {reason:?}");
+                break;
+            }
             // CaDiCaL factor.cpp:118: capture the current BVE elimination
             // bound. Factoring only fires when clause reduction exceeds this
             // bound, ensuring BVE cannot profitably undo the factoring.
@@ -728,7 +772,12 @@ impl Solver {
             let er_definitions = if result.factored_count > 0 {
                 match self.preflight_factor_er_definitions(&result) {
                     Ok(definitions) => definitions,
-                    Err(_) => {
+                    Err(reject) => {
+                        self.inproc.factor_engine.probe_note(format_args!(
+                            "preflight rejected the pass: {reject:?} (applications {}, self_subsuming {})",
+                            result.applications.len(),
+                            result.self_subsuming.len()
+                        ));
                         self.inproc
                             .factor_engine
                             .record_lrat_preflight_er_obligation_missing();
@@ -780,8 +829,8 @@ impl Solver {
                 None
             };
             let factor_state_before_apply = if drat_proof && result.factored_count > 0 {
+                self.begin_factor_candidate_marks_undo();
                 Some((
-                    self.cold.factor_candidate_marks.clone(),
                     self.cold.factor_rounds,
                     self.cold.factor_factored_total,
                     self.cold.factor_extension_vars_total,
@@ -913,16 +962,17 @@ impl Solver {
                 &er_definitions,
                 &mut added_clauses,
             ) {
-                if let Some((marks, rounds, factored_total, extension_vars_total)) =
+                if let Some((rounds, factored_total, extension_vars_total)) =
                     factor_state_before_apply
                 {
-                    self.cold.factor_candidate_marks = marks;
+                    self.end_factor_candidate_marks_undo(true);
                     self.cold.factor_rounds = rounds;
                     self.cold.factor_factored_total = factored_total;
                     self.cold.factor_extension_vars_total = extension_vars_total;
                 }
                 return FactorizeOutcome::RejectedLratPreflight;
             }
+            self.end_factor_candidate_marks_undo(false);
             if self.has_empty_clause {
                 break;
             }
@@ -978,6 +1028,13 @@ impl Solver {
         }
 
         self.cold.last_factor_ticks = self.search_ticks[0] + self.search_ticks[1];
+        if init_call {
+            self.cold.factor_init_calls += 1;
+            self.cold.factor_init_ticks = effort.saturating_sub(remaining_effort);
+            if !any_completed {
+                self.cold.factor_init_undrained += 1;
+            }
+        }
 
         tracing::debug!(
             "[factorize] budget={} consumed={} completed={} factored_total={}",
@@ -1180,6 +1237,18 @@ impl Solver {
         Some(emitted)
     }
 
+    fn emit_factor_dividers(
+        &mut self,
+        dividers: &[Vec<Literal>],
+        lrat_plan: Option<&FactorLratTransactionPlan>,
+        planned_add_pos: &mut usize,
+    ) -> bool {
+        dividers.iter().all(|div| {
+            self.emit_factor_planned_proof_add(div, lrat_plan, planned_add_pos)
+                .is_some()
+        })
+    }
+
     fn emit_factor_planned_signed_lrat_add(
         &mut self,
         clause: &[Literal],
@@ -1284,13 +1353,19 @@ impl Solver {
                         check_proof_clause(quot, "quotient");
                     }
                 }
-                for div in &app.divider_clauses {
-                    if self
-                        .emit_factor_planned_proof_add(div, lrat_plan, &mut planned_add_pos)
-                        .is_none()
-                    {
-                        return false;
-                    }
+                // `--sat-veripb-hints`: the blocked clause first, then the
+                // dividers through one definition of the fresh variable
+                // instead of one `red` each (veripb_define.rs).
+                let define =
+                    lrat_plan.is_none() && self.veripb_dividers_definable(&app.divider_clauses);
+                if !define
+                    && !self.emit_factor_dividers(
+                        &app.divider_clauses,
+                        lrat_plan,
+                        &mut planned_add_pos,
+                    )
+                {
+                    return false;
                 }
                 let Some(blocked_emitted) =
                     (if let (Some(plan), Some(sidecars)) = (lrat_plan, lrat_sidecars) {
@@ -1312,7 +1387,29 @@ impl Solver {
                 else {
                     return false;
                 };
-                let blocked_id = (blocked_emitted != 0).then_some(blocked_emitted);
+                if define {
+                    let Ok(defined) = self.proof_emit_veripb_dividers(&app.divider_clauses) else {
+                        return false;
+                    };
+                    // Undefined: one by one after the blocked clause, whose
+                    // image under each divider's witness the divider implies.
+                    if !defined
+                        && !self.emit_factor_dividers(
+                            &app.divider_clauses,
+                            lrat_plan,
+                            &mut planned_add_pos,
+                        )
+                    {
+                        return false;
+                    }
+                }
+                // Delete the proof-only blocked clause on every surface: the
+                // DRAT and VeriPB writers return id 0 for an addition, and the
+                // `!= 0` gate that stood here left the clause in the checker's
+                // database for the rest of the proof (an obligation on every
+                // later RAT step whose pivot's negation it holds; 2026-09-17
+                // audit). Deletion goes by literals there; LRAT uses the id.
+                let blocked_id = Some(blocked_emitted);
                 for (quot_idx, quot) in app.quotient_clauses.iter().enumerate() {
                     if let (Some(plan), Some(sidecars)) = (lrat_plan, lrat_sidecars) {
                         let Some(sidecar) = sidecars.get(app_idx) else {
@@ -1336,11 +1433,18 @@ impl Solver {
                         {
                             return false;
                         }
-                    } else if self
-                        .emit_factor_planned_proof_add(quot, lrat_plan, &mut planned_add_pos)
-                        .is_none()
-                    {
-                        return false;
+                    } else {
+                        // `--sat-veripb-hints`: a quotient (¬x ∨ Q) is RUP from the
+                        // blocked clause and the factored clauses (f ∨ Q), still
+                        // live; as a plain `red` it cost the checker one proof
+                        // goal per divider (veripb_derived.rs).
+                        self.veripb_note_factor_quotient(quot, &app.blocked_clause, &app.factors);
+                        if self
+                            .emit_factor_planned_proof_add(quot, lrat_plan, &mut planned_add_pos)
+                            .is_none()
+                        {
+                            return false;
+                        }
                     }
                 }
                 if let Some(blocked_id) = blocked_id {
@@ -1351,7 +1455,10 @@ impl Solver {
             // Self-subsuming proof emissions: resolvents are RUP
             // (derivable from the two complementary parent clauses).
             for app in &result.self_subsuming {
-                for resolvent in &app.resolvents {
+                for (resolvent, &(lhs, rhs)) in app.resolvents.iter().zip(&app.proof_pairs) {
+                    // `--sat-veripb-hints`: the two complementary parents.
+                    self.veripb_note_antecedent_ref(ClauseRef(lhs as u32));
+                    self.veripb_note_antecedent_ref(ClauseRef(rhs as u32));
                     if self
                         .emit_factor_planned_proof_add(resolvent, lrat_plan, &mut planned_add_pos)
                         .is_none()
@@ -1383,84 +1490,18 @@ impl Solver {
             self.install_factor_extension_vars(result);
             self.record_factor_er_definitions(er_definitions);
 
-            // Add new clauses to clause DB (no proof emit — already done above).
-            // LRAT plans reserve proof IDs in emission order. Install live factor
-            // clauses in that same order so later BVE preflight can cite them.
-            let mut live_add_pos = 0usize;
-            for app in &result.applications {
-                for div in &app.divider_clauses {
-                    let mut lits = div.clone();
-                    let expected_id =
-                        lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
-                    live_add_pos += 1;
-                    let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
-                    // Notify BVE occ lists of new irredundant clause (#8096).
-                    match add_result {
-                        AddResult::Added(cref) | AddResult::Unit(cref) => {
-                            let ci = cref.0 as usize;
-                            let new_lits = self.arena.literals(ci).to_vec();
-                            self.note_irredundant_clause_added_for_bve(ci, &new_lits);
-                            added_out.push(ci);
-                        }
-                        AddResult::Empty => {}
-                    }
-                    if self.has_empty_clause {
-                        return true;
-                    }
-                }
-                for quot in &app.quotient_clauses {
-                    let mut lits = quot.clone();
-                    let expected_id =
-                        lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
-                    live_add_pos += 1;
-                    let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
-                    // Notify BVE occ lists of new irredundant clause (#8096).
-                    match add_result {
-                        AddResult::Added(cref) | AddResult::Unit(cref) => {
-                            let ci = cref.0 as usize;
-                            let new_lits = self.arena.literals(ci).to_vec();
-                            self.note_irredundant_clause_added_for_bve(ci, &new_lits);
-                            added_out.push(ci);
-                        }
-                        AddResult::Empty => {}
-                    }
-                    if self.has_empty_clause {
-                        return true;
-                    }
-                }
-            }
-            for app in &result.self_subsuming {
-                for resolvent in &app.resolvents {
-                    let mut lits = resolvent.clone();
-                    let expected_id =
-                        lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
-                    live_add_pos += 1;
-                    let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
-                    // Notify BVE occ lists of new irredundant clause (#8096).
-                    match add_result {
-                        AddResult::Added(cref) | AddResult::Unit(cref) => {
-                            let ci = cref.0 as usize;
-                            let new_lits = self.arena.literals(ci).to_vec();
-                            self.note_irredundant_clause_added_for_bve(ci, &new_lits);
-                            added_out.push(ci);
-                        }
-                        AddResult::Empty => {}
-                    }
-                    if self.has_empty_clause {
-                        return true;
-                    }
-                }
-            }
-            if let Some(plan) = lrat_plan {
-                debug_assert_eq!(live_add_pos, plan.live_add_ids.len());
-                if let Some(&last_id) = plan.planned_add_ids.last() {
-                    if self.cold.next_clause_id <= last_id {
-                        self.cold.next_clause_id = last_id + 1;
-                    }
-                }
-            }
-            result.new_clauses.clear();
-
+            // proof-posture-parity (site F, 2026-09-10): mutate the LIVE clause
+            // database in the same order as the no-proof branch below — delete
+            // the source clauses first, then append the new clauses in the
+            // engine's discovery order — so both postures leave identical arena
+            // positions and watch lists (the old add-then-delete order left the
+            // same clauses at different slots, which showed up as a 22-29 tick
+            // drift in the next vivification pass and diverged every budget
+            // after it). The PROOF stream keeps its checker order: every add
+            // was emitted above, the source deletes follow here; live insertion
+            // emits no proof lines. The strict-LRAT transaction path keeps its
+            // grouped order because its reserved ids are planned that way (the
+            // LRAT route clamps factoring anyway).
             // Delete originals from clause DB.
             self.ensure_reason_clause_marks_current();
             let mut source_delete_pos = 0usize;
@@ -1485,6 +1526,101 @@ impl Solver {
             if let Some(plan) = lrat_plan {
                 if source_delete_pos != plan.source_delete_ids.len() {
                     return false;
+                }
+            }
+            if lrat_plan.is_some() {
+                // Add new clauses to clause DB (no proof emit — already done above).
+                // LRAT plans reserve proof IDs in emission order. Install live factor
+                // clauses in that same order so later BVE preflight can cite them.
+                let mut live_add_pos = 0usize;
+                for app in &result.applications {
+                    for div in &app.divider_clauses {
+                        let mut lits = div.clone();
+                        let expected_id =
+                            lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
+                        live_add_pos += 1;
+                        let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
+                        // Notify BVE occ lists of new irredundant clause (#8096).
+                        match add_result {
+                            AddResult::Added(cref) | AddResult::Unit(cref) => {
+                                let ci = cref.0 as usize;
+                                let new_lits = self.arena.literals(ci).to_vec();
+                                self.note_irredundant_clause_added_for_bve(ci, &new_lits);
+                                added_out.push(ci);
+                            }
+                            AddResult::Empty => {}
+                        }
+                        if self.has_empty_clause {
+                            return true;
+                        }
+                    }
+                    for quot in &app.quotient_clauses {
+                        let mut lits = quot.clone();
+                        let expected_id =
+                            lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
+                        live_add_pos += 1;
+                        let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
+                        // Notify BVE occ lists of new irredundant clause (#8096).
+                        match add_result {
+                            AddResult::Added(cref) | AddResult::Unit(cref) => {
+                                let ci = cref.0 as usize;
+                                let new_lits = self.arena.literals(ci).to_vec();
+                                self.note_irredundant_clause_added_for_bve(ci, &new_lits);
+                                added_out.push(ci);
+                            }
+                            AddResult::Empty => {}
+                        }
+                        if self.has_empty_clause {
+                            return true;
+                        }
+                    }
+                }
+                for app in &result.self_subsuming {
+                    for resolvent in &app.resolvents {
+                        let mut lits = resolvent.clone();
+                        let expected_id =
+                            lrat_plan.and_then(|plan| plan.live_add_ids.get(live_add_pos).copied());
+                        live_add_pos += 1;
+                        let add_result = self.add_factor_live_lrat_clause(&mut lits, expected_id);
+                        // Notify BVE occ lists of new irredundant clause (#8096).
+                        match add_result {
+                            AddResult::Added(cref) | AddResult::Unit(cref) => {
+                                let ci = cref.0 as usize;
+                                let new_lits = self.arena.literals(ci).to_vec();
+                                self.note_irredundant_clause_added_for_bve(ci, &new_lits);
+                                added_out.push(ci);
+                            }
+                            AddResult::Empty => {}
+                        }
+                        if self.has_empty_clause {
+                            return true;
+                        }
+                    }
+                }
+                if let Some(plan) = lrat_plan {
+                    debug_assert_eq!(live_add_pos, plan.live_add_ids.len());
+                    if let Some(&last_id) = plan.planned_add_ids.last() {
+                        if self.cold.next_clause_id <= last_id {
+                            self.cold.next_clause_id = last_id + 1;
+                        }
+                    }
+                }
+                result.new_clauses.clear();
+            } else {
+                for mut lits in std::mem::take(&mut result.new_clauses) {
+                    let add_result = self.add_clause_watched(&mut lits);
+                    match add_result {
+                        AddResult::Added(cref) | AddResult::Unit(cref) => {
+                            let ci = cref.0 as usize;
+                            let new_lits = self.arena.literals(ci).to_vec();
+                            self.note_irredundant_clause_added_for_bve(ci, &new_lits);
+                            added_out.push(ci);
+                        }
+                        AddResult::Empty => {}
+                    }
+                    if self.has_empty_clause {
+                        return true;
+                    }
                 }
             }
         } else {

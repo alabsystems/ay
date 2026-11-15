@@ -17,13 +17,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::rust_frontend::RustFrontend;
+
+mod catalogs;
+mod reference;
+
 const COMPAT_DOC: &str = "the development design notes";
 const CLI_REFERENCE: &str = "the development design notes";
 const COMPATIBILITY_INVENTORY_JSON: &str = include_str!("../z3-compatibility.json");
 const COMPATIBILITY_INVENTORY_SCHEMA: &str = "ay-z3-compatibility-inventory/v1";
 const WORKSPACE_MARKER: &str = "crates/ay/Cargo.toml";
 const DEFAULT_REFERENCE_CACHE: &str = "tests/z3-audit/reference-cache.json";
-const REFERENCE_CACHE_SCHEMA: &str = "ay-z3-audit-reference-cache/v1";
+const REFERENCE_CACHE_SCHEMA: &str = "ay-z3-audit-reference-cache/v2";
 const SURFACE_EVIDENCE_SCHEMA: &str = "ay-z3-audit-replacement-surface-evidence/v1";
 const SURFACE_EVIDENCE_KEY: &str = "replacement_surface_evidence";
 const BASIC_SMT_TRANSCRIPT_ID: &str = "basic_qf_lia_model_transcript";
@@ -163,10 +168,6 @@ pub(crate) struct Z3AuditArgs {
     #[arg(long, value_enum, default_value_t = Z3AuditScope::FullReplacement)]
     scope: Z3AuditScope,
 
-    /// Deprecated compatibility flag; the repository reality gate runs by default.
-    #[arg(long)]
-    run_doc_reality: bool,
-
     /// Deprecated compatibility flag; the Z3 CLI regression test runs by default.
     #[arg(long)]
     run_cli_tests: bool,
@@ -179,7 +180,7 @@ pub(crate) struct Z3AuditArgs {
     #[arg(long)]
     run_alethe_replay: bool,
 
-    /// Suppress default repository/Cargo/proof commands unless a specific --run-* flag is set.
+    /// Suppress default repository/Rust/proof commands unless a specific --run-* flag is set.
     #[arg(long)]
     inventory_only: bool,
 
@@ -206,6 +207,9 @@ pub(crate) struct Z3AuditArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckStatus {
     Pass,
+    NotRun,
+    Missing,
+    Stale,
     Fail,
     FailTimeout,
     FailUnknown,
@@ -237,6 +241,9 @@ impl CheckStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "pass",
+            Self::NotRun => "not_run",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
             Self::Fail => "fail",
             Self::FailTimeout => "fail_timeout",
             Self::FailUnknown => "fail_unknown",
@@ -249,12 +256,18 @@ impl CheckStatus {
     }
 
     fn is_failure(self) -> bool {
-        !self.is_pass()
+        matches!(
+            self,
+            Self::Fail | Self::FailTimeout | Self::FailUnknown | Self::FailError
+        )
     }
 
     fn parse(value: &str) -> Result<Self> {
         match value {
             "pass" => Ok(Self::Pass),
+            "not_run" => Ok(Self::NotRun),
+            "missing" => Ok(Self::Missing),
+            "stale" => Ok(Self::Stale),
             "fail" => Ok(Self::Fail),
             "fail_timeout" => Ok(Self::FailTimeout),
             "fail_unknown" => Ok(Self::FailUnknown),
@@ -269,6 +282,7 @@ struct AuditCheck {
     status: CheckStatus,
     finding: String,
     command: Option<String>,
+    details: Option<Value>,
 }
 
 impl AuditCheck {
@@ -278,6 +292,7 @@ impl AuditCheck {
             status: CheckStatus::Pass,
             finding: finding.into(),
             command: None,
+            details: None,
         }
     }
 
@@ -287,11 +302,22 @@ impl AuditCheck {
             status: CheckStatus::Fail,
             finding: finding.into(),
             command: None,
+            details: None,
         }
     }
 
     fn with_command(mut self, command: impl Into<String>) -> Self {
         self.command = Some(command.into());
+        self
+    }
+
+    fn with_status(mut self, status: CheckStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
         self
     }
 
@@ -301,6 +327,7 @@ impl AuditCheck {
             "status": self.status.as_str(),
             "finding": self.finding,
             "command": self.command,
+            "details": self.details,
         })
     }
 }
@@ -375,6 +402,22 @@ struct ProofInventoryRow {
 }
 
 impl ProofInventoryRow {
+    fn with_status(mut self, status: CheckStatus) -> Self {
+        self.status = status;
+        self
+    }
+    fn not_run(
+        id: &'static str,
+        surface: &'static str,
+        current: impl Into<String>,
+        goal: impl Into<String>,
+        command: impl Into<String>,
+        finding: impl Into<String>,
+    ) -> Self {
+        let mut row = Self::fail(id, surface, current, goal, command, finding);
+        row.status = CheckStatus::NotRun;
+        row
+    }
     fn fail(
         id: &'static str,
         surface: &'static str,
@@ -389,7 +432,7 @@ impl ProofInventoryRow {
             status: CheckStatus::Fail,
             current: current.into(),
             goal: goal.into(),
-            command: command.into(),
+            command: render_guidance_command(&command.into()),
             finding: finding.into(),
         }
     }
@@ -408,7 +451,7 @@ impl ProofInventoryRow {
             status: CheckStatus::Pass,
             current: current.into(),
             goal: goal.into(),
-            command: command.into(),
+            command: render_guidance_command(&command.into()),
             finding: finding.into(),
         }
     }
@@ -482,20 +525,20 @@ const BROADER_SURFACE_SPECS: &[SurfaceSpec] = &[
         surface: "Public source build",
         goal: "1/1 fresh unauthenticated release build packet with command, environment, ay --version, and artifact provenance",
         missing: "fresh public-clone release build evidence accepted by this audit",
-        command: "cargo build --release --locked && ./target/release/ay --version",
+        command: "cargo build --release --locked -p ay --features cli,bench --bin ay && ./target/release/ay --version",
     },
     SurfaceSpec {
         id: "smtlib_input",
         surface: "SMT-LIB input",
         goal: "1/1 current-code differential packet with per-logic solved/unknown/timeout/error/disagreement counts, 0 wrong answers, and reference_solved_missing=0",
         missing: "per-logic ay bench harvest plus ay bench verify evidence packet",
-        command: "cargo build --release --locked -p ay --features bench --bin ay && ./target/release/ay bench run smt-local-suite smt-smtcomp-qf-lia smt-smtcomp-qf-lra smt-smtcomp-qf-bv smt-smtcomp-qf-abv smt-smtcomp-qf-uf smt-smtcomp-qf-alia smt-smtcomp-qf-auflia --ay ./target/release/ay --timeout 30 --reference-solver z3",
+        command: "cargo build --release --locked -p ay --features cli,bench --bin ay && ./target/release/ay bench run smt-local-suite smt-smtcomp-qf-lia smt-smtcomp-qf-lra smt-smtcomp-qf-bv smt-smtcomp-qf-abv smt-smtcomp-qf-uf smt-smtcomp-qf-alia smt-smtcomp-qf-auflia --ay ./target/release/ay --timeout 30 --reference-solver z3",
     },
     SurfaceSpec {
         id: "dimacs_cnf_input",
         surface: "DIMACS CNF input",
         goal: "1/1 current SAT-COMP-shaped packet with solved count, PAR-2, model/proof validity, 0 wrong answers, and 0 reference-only solves",
-        missing: "clean SAT-COMP-shaped scoreboard packet from scripts/run_satcomp_matrix.sh",
+        missing: "clean SAT-COMP-shaped scoreboard packet from ay submission preflight sat-matrix run",
         command: concat!(
             // The proof format MUST match what the SAT profile matrix declares
             // (`requirements.unsat_proof.format`), or the generator fails
@@ -506,10 +549,10 @@ const BROADER_SURFACE_SPECS: &[SurfaceSpec] = &[
             "competition/prepare_sat26_submission.sh --variant default --track main --ai-class regular ",
             "--proof-format veripb --stage-binary ./target/release/ay ",
             "--allow-local-runsh-preflight-binary --output \"$PWD/target/sat26-submission\" && ",
-            "scripts/run_satcomp_matrix.sh --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf ",
+            "ay submission preflight sat-matrix run --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf ",
             "--expected sat --family canary --category sanity ",
             "--submission-root \"$PWD/target/sat26-submission\" --variants default --timeout-sec 30 ",
-            "--proof-checker auto --reference-solver cadical=reference/cadical/build/cadical ",
+            "--proof-checker auto ",
             "--output the development design notes --soundness --fail-on-wrong",
         ),
     },
@@ -525,7 +568,7 @@ const BROADER_SURFACE_SPECS: &[SurfaceSpec] = &[
         surface: "Models",
         goal: "1/1 model-validation packet with invalid_model_count=0 for every claimed SAT/model surface",
         missing: "model validation evidence with invalid-model counts promoted to hard failures",
-        command: "ay gate solver && bash scripts/soundness_gate.sh",
+        command: "ay gate land --no-push",
     },
     SurfaceSpec {
         id: "rust_embedding",
@@ -635,9 +678,11 @@ pub(crate) fn run(args: &Z3AuditArgs) -> Result<i32> {
         &reference_cache_path,
     ));
 
+    if args.scope == Z3AuditScope::FullReplacement {
+        checks.extend(catalogs::measure(&repo_root, &ay, &args.z3));
+    }
     let launch_rows = &compatibility_inventory.cli_subset;
     let broader_rows = &compatibility_inventory.full_replacement;
-    let run_doc_reality = !args.inventory_only || args.run_doc_reality;
     let run_cli_tests = !args.inventory_only || args.run_cli_tests;
     let run_proof_tests = !args.inventory_only || args.run_proof_tests;
     let run_alethe_replay = !args.inventory_only || args.run_alethe_replay;
@@ -654,23 +699,6 @@ pub(crate) fn run(args: &Z3AuditArgs) -> Result<i32> {
         run_proof_tests,
         run_alethe_replay,
     );
-
-    if run_doc_reality {
-        checks.push(run_repo_command(
-            "doc_reality",
-            &repo_root,
-            "bash scripts/check_doc_reality.sh",
-            "bash",
-            &["scripts/check_doc_reality.sh"],
-        ));
-    } else {
-        checks.push(inventory_suppressed_check(
-            "doc_reality",
-            args.scope,
-            "0/1 documentation reality gate executed by this audit",
-            "inventory-only suppressed: bash scripts/check_doc_reality.sh",
-        ));
-    }
 
     if run_cli_tests {
         checks.push(run_repo_command(
@@ -762,12 +790,33 @@ pub(crate) fn run(args: &Z3AuditArgs) -> Result<i32> {
         .count();
     let raw_failed = failed_checks + failed_surfaces;
     let failed = raw_failed;
-    let verdict = if failed == 0 { "pass" } else { "fail" };
-    let full_replacement_ready = full_replacement_ready(args.scope, failed, &surfaces);
+    let unresolved = checks
+        .iter()
+        .map(|row| row.status)
+        .chain(surfaces.iter().map(|row| row.status))
+        .chain(proof_inventory.iter().map(|row| row.status))
+        .filter(|status| !status.is_pass() && !status.is_failure())
+        .count();
+    let verdict = if failed != 0 {
+        "fail"
+    } else if unresolved != 0 {
+        "incomplete"
+    } else {
+        "pass"
+    };
+    let full_replacement_ready = full_replacement_ready(args.scope, failed + unresolved, &surfaces);
     let scoped_cli_ready = checks
         .iter()
-        .filter(|check| check.id != "broader_replacement_rows")
-        .all(|check| !check.status.is_failure())
+        .filter(|check| {
+            !matches!(
+                check.id,
+                "broader_replacement_rows"
+                    | "current_reference_catalog"
+                    | "current_parameter_catalog"
+                    | "current_tactic_catalog"
+            )
+        })
+        .all(|check| check.status.is_pass())
         && surfaces
             .iter()
             .find(|surface| surface.id == "z3_style_cli_subset")
@@ -816,6 +865,10 @@ pub(crate) fn run(args: &Z3AuditArgs) -> Result<i32> {
             "surface_failed": failed_surfaces,
             "check_passed": passed_checks,
             "check_failed": failed_checks,
+            "unresolved": unresolved,
+            "check_not_run": checks.iter().filter(|row| row.status == CheckStatus::NotRun).count(),
+            "check_missing": checks.iter().filter(|row| row.status == CheckStatus::Missing).count(),
+            "check_stale": checks.iter().filter(|row| row.status == CheckStatus::Stale).count(),
             "proof_passed": passed_proof_rows,
             "proof_failed": failed_proof_rows,
             "surfaces": surfaces.iter().map(AuditSurface::to_json).collect::<Vec<_>>(),
@@ -828,7 +881,7 @@ pub(crate) fn run(args: &Z3AuditArgs) -> Result<i32> {
             .with_context(|| format!("write {}", path.display()))?;
     }
 
-    Ok(if failed == 0 { 0 } else { 1 })
+    Ok(if failed == 0 && unresolved == 0 { 0 } else { 1 })
 }
 
 fn resolve_repo_root(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -865,7 +918,7 @@ fn check_tool_version(id: &'static str, program: &str, args: &[&str]) -> AuditCh
         .chain(args.iter().map(|arg| (*arg).to_string()))
         .collect::<Vec<_>>()
         .join(" ");
-    match ProcessCommand::new(program).args(args).output() {
+    match catalogs::bounded(std::ffi::OsStr::new(program), args) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -918,10 +971,25 @@ fn check_reference_cache(
                 path.display()
             ),
         )
+        .with_status(reference_cache_absence(path, error))
         .with_command(format!(
             "ay z3-audit --generate-reference-cache {} --z3 <z3>",
             path.display()
         )),
+    }
+}
+
+fn reference_cache_absence(path: &Path, error: Option<&str>) -> CheckStatus {
+    if !path.exists() {
+        CheckStatus::Missing
+    } else if error.is_some_and(|e| {
+        e.starts_with("schema mismatch:")
+            || e.contains("does not match current ci/z3.pin")
+            || e.contains("lacks current pinned identity")
+    }) {
+        CheckStatus::Stale
+    } else {
+        CheckStatus::FailError
     }
 }
 
@@ -959,7 +1027,7 @@ fn check_cached_z3_version(
         Some(cache) => AuditCheck::pass(
             "z3_version",
             format!(
-                "cached baseline generated from {}; no live Z3 execution is required for this audit",
+                "current ci/z3.pin-bound cached baseline generated from {}; no live Z3 execution is required for this audit",
                 cache.z3_version
             ),
         )
@@ -974,6 +1042,7 @@ fn check_cached_z3_version(
                 error.unwrap_or("unknown cache load error")
             ),
         )
+        .with_status(reference_cache_absence(path, error))
         .with_command(format!(
             "ay z3-audit --generate-reference-cache {} --z3 {z3}",
             path.display()
@@ -1208,13 +1277,21 @@ fn inventory_suppressed_check(
     current: &'static str,
     command: &'static str,
 ) -> AuditCheck {
-    if scope == Z3AuditScope::FullReplacement {
-        AuditCheck::fail(id, format!("{current}; {command}"))
-    } else {
-        AuditCheck::pass(
-            id,
-            format!("{current}; outside scoped cli-subset requirement; {command}"),
-        )
+    let command = rendered_repo_command(
+        "cargo",
+        command
+            .strip_prefix("inventory-only suppressed: ")
+            .unwrap_or(command),
+    );
+    AuditCheck {
+        id,
+        status: CheckStatus::NotRun,
+        finding: format!(
+            "{current}; execution suppressed by inventory-only; scope={}",
+            scope.as_str()
+        ),
+        command: Some(command),
+        details: None,
     }
 }
 
@@ -1650,7 +1727,7 @@ fn broader_surface(
                 evidence.missing.clone()
             },
             command: Some(if evidence.command.is_empty() {
-                spec.command.to_string()
+                rendered_repo_command("cargo", spec.command)
             } else {
                 evidence.command.clone()
             }),
@@ -1688,7 +1765,7 @@ fn broader_surface(
         }),
         goal: spec.goal.to_string(),
         missing,
-        command: Some(spec.command.to_string()),
+        command: Some(rendered_repo_command("cargo", spec.command)),
         source: None,
         source_status,
     }
@@ -1716,12 +1793,12 @@ fn c_api_ffi_surface(
             missing: if check.status == CheckStatus::Pass {
                 "none".to_string()
             } else {
-                format!("ay-ffi smoke failed: {}", check.finding)
+                format!("ay-ffi smoke {}: {}", check.status.as_str(), check.finding)
             },
             command: check
                 .command
                 .clone()
-                .or_else(|| Some(spec.command.to_string())),
+                .or_else(|| Some(rendered_repo_command("cargo", spec.command))),
             source: Some(
                 evidence
                     .map(|row| {
@@ -1762,12 +1839,16 @@ fn models_surface(
             missing: if check.status == CheckStatus::Pass {
                 "none".to_string()
             } else {
-                format!("default CLI SMT model validation failed: {}", check.finding)
+                format!(
+                    "default CLI SMT model validation {}: {}",
+                    check.status.as_str(),
+                    check.finding
+                )
             },
             command: check
                 .command
                 .clone()
-                .or_else(|| Some(spec.command.to_string())),
+                .or_else(|| Some(rendered_repo_command("cargo", spec.command))),
             source: Some(
                 evidence
                     .map(|row| {
@@ -1806,24 +1887,26 @@ fn unsat_proof_surface(
         .collect::<Vec<_>>();
     let status = if ready {
         CheckStatus::Pass
-    } else {
+    } else if proof_inventory.iter().any(|row| row.status.is_failure()) {
         CheckStatus::Fail
+    } else {
+        CheckStatus::NotRun
     };
     AuditSurface {
         id: "unsat_proofs",
         surface: "UNSAT proofs".to_string(),
         status,
         current: format!(
-            "{checked}/{total} proof/certificate rows pass in this audit; {}/{} fail",
-            total.saturating_sub(checked),
-            total
+            "{checked}/{total} proof/certificate rows pass in this audit; {} failed; {} not run/missing/stale",
+            proof_inventory.iter().filter(|row| row.status.is_failure()).count(),
+            proof_inventory.iter().filter(|row| !row.status.is_pass() && !row.status.is_failure()).count()
         ),
         goal: format!("{total}/{total} proof/certificate rows pass in the default CLI audit"),
         missing: if failed_rows.is_empty() {
             "none".to_string()
         } else {
             format!(
-                "failed rows: {}",
+                "unmet rows: {}",
                 if failed_rows.is_empty() {
                     "none".to_string()
                 } else {
@@ -1852,7 +1935,7 @@ fn build_proof_inventory(
         ay_sat_lrat_text_packet_row(run_proof_tests, repo_root),
         lrat_binary_external_row(run_proof_tests, repo_root),
         cli_post_solve_proof_row(run_proof_tests, repo_root),
-        alethe_replay_row(args, repo_root, ay, run_alethe_replay),
+        alethe_replay::alethe_replay_row(args, repo_root, ay, run_alethe_replay),
         lean_replay_row(args, repo_root, ay, run_proof_tests),
         chc_certificate_replay_row(
             args,
@@ -1879,10 +1962,10 @@ fn dimacs_drat_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
             "no genuine drat-trim found in DRAT_TRIM, PATH, or standard local tool paths \
              (a candidate must report `s VERIFIED` on a valid refutation and `s NOT VERIFIED` \
              on a bogus one; the checked-in bin/drat-trim exit-0 shim is intentionally not honored)",
-        );
+        ).with_status(CheckStatus::Missing);
     }
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "dimacs_drat_external",
             "DIMACS DRAT external replay",
             "0/1 external DRAT replay command run by this audit",
@@ -1909,7 +1992,7 @@ fn dimacs_drat_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
 fn ay_sat_lrat_text_packet_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
     let command = "cargo test -p ay-sat --test integration test_lrat";
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "ay_sat_lrat_text_packet",
             "ay-sat LRAT text corpus replay",
             "0/1 LRAT text corpus replay run by this audit",
@@ -1938,7 +2021,7 @@ fn lrat_binary_external_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
         rendered_repo_command("cargo", test_command)
     );
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "lrat_binary_external",
             "Binary LRAT external replay",
             "0/2 binary LRAT checker build and external replay run by this audit",
@@ -2003,7 +2086,7 @@ fn lrat_binary_external_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
 fn cli_post_solve_proof_row(run: bool, repo_root: &Path) -> ProofInventoryRow {
     let command = "cargo test -p ay --features=\"cli\" --test group_cli verify_proof_8771";
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "cli_drat_lrat_post_solve",
             "CLI DRAT/LRAT post-solve replay",
             "0/1 targeted CLI proof replay test run by this audit",
@@ -2067,118 +2150,6 @@ fn proof_command_row(
     }
 }
 
-fn alethe_replay_row(
-    args: &Z3AuditArgs,
-    repo_root: &Path,
-    ay: &Path,
-    run: bool,
-) -> ProofInventoryRow {
-    let command = format!(
-        "{} solve --proof <work-dir>/smt-alethe-proof.alethe {} && {} check <work-dir>/smt-alethe-proof.alethe {}",
-        ay.display(),
-        args.alethe_problem.display(),
-        args.alethe_checker,
-        args.alethe_problem.display()
-    );
-    if !run {
-        return ProofInventoryRow::fail(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "0/1 external Alethe replay command run by this audit",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            "inventory-only mode suppressed execution; default z3-audit emits and externally replays this Alethe proof; --run-alethe-replay re-enables this row with --inventory-only",
-        );
-    }
-
-    let work_dir = resolve_work_dir(repo_root, args.proof_work_dir.as_deref());
-    let problem = resolve_repo_path(repo_root, &args.alethe_problem);
-    let proof = work_dir.join("smt-alethe-proof.alethe");
-    if let Err(error) = fs::create_dir_all(&work_dir) {
-        return ProofInventoryRow::fail(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "0/1 proof work directory created",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            format!("failed to create {}: {error}", work_dir.display()),
-        );
-    }
-
-    let proof_arg = proof.to_string_lossy().into_owned();
-    let problem_arg = problem.to_string_lossy().into_owned();
-    let emit = match run_command_capture(
-        repo_root,
-        ay,
-        &["solve", "--proof", &proof_arg, &problem_arg],
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            return ProofInventoryRow::fail(
-                "smt_alethe_external_replay",
-                "SMT Alethe external replay",
-                "0/1 SMT Alethe proof emitted",
-                "1/1 SMT Alethe proof emitted and accepted by an external checker",
-                command,
-                format!("failed to run proof emission command: {error}"),
-            );
-        }
-    };
-    if !emit.status.success() || !proof.is_file() {
-        return ProofInventoryRow::fail(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "0/1 SMT Alethe proof emitted",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            format!(
-                "proof emission failed: status={:?} proof_exists={} stdout_tail={:?} stderr_tail={:?}",
-                emit.status.code(),
-                proof.is_file(),
-                tail_text(&String::from_utf8_lossy(&emit.stdout)),
-                tail_text(&String::from_utf8_lossy(&emit.stderr))
-            ),
-        );
-    }
-
-    let replay = run_command_capture(
-        repo_root,
-        Path::new(&args.alethe_checker),
-        &["check", &proof_arg, &problem_arg],
-    );
-    match replay {
-        Ok(replay) if replay.status.success() => ProofInventoryRow::pass(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "1/1 SMT Alethe proof emitted and externally replayed",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            format!("external replay passed; proof={}", proof.display()),
-        ),
-        Ok(replay) => ProofInventoryRow::fail(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "0/1 SMT Alethe proof externally replayed",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            format!(
-                "external replay failed: status={:?} stdout_tail={:?} stderr_tail={:?}",
-                replay.status.code(),
-                tail_text(&String::from_utf8_lossy(&replay.stdout)),
-                tail_text(&String::from_utf8_lossy(&replay.stderr))
-            ),
-        ),
-        Err(error) => ProofInventoryRow::fail(
-            "smt_alethe_external_replay",
-            "SMT Alethe external replay",
-            "0/1 SMT Alethe proof externally replayed",
-            "1/1 SMT Alethe proof emitted and accepted by an external checker",
-            command,
-            format!("failed to run external checker: {error}"),
-        ),
-    }
-}
-
 fn lean_replay_row(
     args: &Z3AuditArgs,
     repo_root: &Path,
@@ -2190,7 +2161,7 @@ fn lean_replay_row(
         ay.display()
     );
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "lean_replay",
             "Lean4 proof replay",
             "0/1 Lean proof replay run by this audit",
@@ -2208,7 +2179,8 @@ fn lean_replay_row(
             "1/1 Lean4 proof emitted and accepted by Lean",
             command,
             "lean was not found on PATH",
-        );
+        )
+        .with_status(CheckStatus::Missing);
     };
 
     let work_dir = resolve_work_dir(repo_root, args.proof_work_dir.as_deref()).join("lean");
@@ -2316,7 +2288,7 @@ fn chc_certificate_replay_row(
         reference_cache_path.display()
     );
     if !run {
-        return ProofInventoryRow::fail(
+        return ProofInventoryRow::not_run(
             "chc_certificate_replay",
             "CHC certificate replay",
             "0/1 CHC certificate replay run by this audit",
@@ -2889,6 +2861,30 @@ fn validate_chc_manifest_file(
     })
 }
 
+/// The Z3 command as the committed reference cache records it.
+///
+/// A spelling that is not an absolute path (`z3`, a repo-relative path) is kept
+/// as given. An absolute path is machine-specific: the default oracle is the
+/// checked copy under the user's home cache, and that path committed to
+/// tests/z3-audit/reference-cache.json fails the publication forbidden-content
+/// guard and blocks the whole public export, as the `ay` path below once did.
+/// It is recorded repo-relative when it lies inside the repository and by its
+/// file name otherwise. Which executable ran is `z3_identity` (the pin and the
+/// SHA-256 of the bytes), never this spelling.
+fn recorded_z3_command(repo_root: &Path, z3: &str) -> String {
+    let path = Path::new(z3);
+    if !path.is_absolute() {
+        return z3.to_string();
+    }
+    match path.strip_prefix(repo_root) {
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "z3".to_string()),
+    }
+}
+
 fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Value> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2896,25 +2892,10 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
     let generated_at_unix_seconds = now.as_secs();
     let run_id = format!("{}-{}", std::process::id(), now.as_nanos());
 
-    let z3_version_output = ProcessCommand::new(z3)
-        .arg("--version")
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("run {z3} --version"))?;
-    if !z3_version_output.status.success() {
-        anyhow::bail!(
-            "Z3 version command failed: status={:?} stdout_tail={:?} stderr_tail={:?}",
-            z3_version_output.status.code(),
-            tail_text(&String::from_utf8_lossy(&z3_version_output.stdout)),
-            tail_text(&String::from_utf8_lossy(&z3_version_output.stderr))
-        );
-    }
-    let z3_version_stdout = String::from_utf8_lossy(&z3_version_output.stdout);
-    let z3_version_stderr = String::from_utf8_lossy(&z3_version_output.stderr);
-    let z3_version = first_non_empty_line(&z3_version_stdout)
-        .or_else(|| first_non_empty_line(&z3_version_stderr))
-        .unwrap_or("z3 --version produced no text")
-        .to_string();
+    // Only the current pin's exact executable bytes may produce new evidence.
+    // Retain a checked private copy throughout this run, not a mutable PATH.
+    let oracle = reference::Snapshot::capture(repo_root, z3)?;
+    let z3_version = oracle.banner().to_string();
 
     let ay_version_output =
         run_command_capture(repo_root, ay, &["--version"]).context("run ay --version")?;
@@ -2926,11 +2907,16 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
         .to_string();
 
     let z3_transcript = run_program_stdin(
-        std::ffi::OsStr::new(z3),
+        oracle.path().as_os_str(),
         &["-in"],
         BASIC_SMT_TRANSCRIPT_INPUT,
     )
-    .with_context(|| format!("run {z3} -in for {BASIC_SMT_TRANSCRIPT_ID}"))?;
+    .with_context(|| {
+        format!(
+            "run {} -in for {BASIC_SMT_TRANSCRIPT_ID}",
+            oracle.path().display()
+        )
+    })?;
     if !z3_transcript.status.success() {
         anyhow::bail!(
             "Z3 transcript baseline failed: status={:?} stdout_tail={:?} stderr_tail={:?}",
@@ -2975,12 +2961,17 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
         .context("authenticate same-run CHC evidence manifest for reference cache")?;
     let authenticated_obligations = emitted.obligations;
 
-    let z3_path = Path::new(z3);
     let mut obligations = Vec::new();
     for obligation in &authenticated_obligations {
         let replay =
-            run_command_capture_with_stdin(repo_root, z3_path, &["-in"], &obligation.bytes)
-                .with_context(|| format!("run {z3} -in for {}", obligation.path.display()))?;
+            run_command_capture_with_stdin(repo_root, oracle.path(), &["-in"], &obligation.bytes)
+                .with_context(|| {
+                format!(
+                    "run {} -in for {}",
+                    oracle.path().display(),
+                    obligation.path.display()
+                )
+            })?;
         let stdout = String::from_utf8_lossy(&replay.stdout).to_string();
         let stderr = String::from_utf8_lossy(&replay.stderr).to_string();
         let stdout_first_line = first_non_empty_line(&stdout).unwrap_or("").to_string();
@@ -3011,8 +3002,9 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
         "schema": REFERENCE_CACHE_SCHEMA,
         "generated_at_unix_seconds": generated_at_unix_seconds,
         "generator": {
-            "z3_command": z3,
+            "z3_command": recorded_z3_command(repo_root, z3),
             "z3_version": z3_version,
+            "z3_identity": oracle.identity,
             // Repo-relative, never absolute. This value is committed to
             // tests/z3-audit/reference-cache.json, and an absolute path here is
             // machine-specific (/Users/<name>/ay/target/debug/ay), which the
@@ -3093,7 +3085,7 @@ fn surface_evidence_value(
         "current": current.into(),
         "goal": goal.into(),
         "missing": missing.into(),
-        "command": command.into(),
+        "command": render_guidance_command(&command.into()),
         "source": source.into(),
     })
 }
@@ -3741,7 +3733,12 @@ fn models_surface_evidence(repo_root: &Path) -> Value {
             "full model-validation packet for every claimed SMT-LIB model surface is missing or failing".to_string()
         },
         spec.command,
-        model_sources(repo_root, &scoreboard_path, &model_check_path, &model_packets),
+        model_sources(
+            repo_root,
+            &scoreboard_path,
+            &model_check_path,
+            &model_packets,
+        ),
     )
 }
 
@@ -4789,6 +4786,9 @@ fn check_status_count_summary(counts: &BTreeMap<&'static str, u64>) -> String {
         CheckStatus::FailTimeout,
         CheckStatus::FailUnknown,
         CheckStatus::FailError,
+        CheckStatus::NotRun,
+        CheckStatus::Missing,
+        CheckStatus::Stale,
     ]
     .into_iter()
     .map(|status| {
@@ -4955,11 +4955,16 @@ fn load_reference_cache(repo_root: &Path, path: &Path) -> Result<ReferenceCache>
         .with_context(|| format!("parse JSON {}", resolved.display()))?;
     let schema = string_field(&value, "schema")?;
     if schema != REFERENCE_CACHE_SCHEMA {
-        anyhow::bail!("schema mismatch: expected {REFERENCE_CACHE_SCHEMA}, got {schema}");
+        anyhow::bail!("schema mismatch: expected {REFERENCE_CACHE_SCHEMA}, got {schema}; regenerate the reference cache against current ci/z3.pin");
     }
 
     let generator = field(&value, "generator")?;
     let z3_version = string_field(generator, "z3_version")?;
+    reference::Pin::load(repo_root)?.validate_cache(
+        field(generator, "z3_identity")
+            .context("reference cache lacks pinned identity; regenerate it")?,
+        &z3_version,
+    )?;
 
     let basic = field(&value, "basic_smt_transcript")?;
     let basic_id = string_field(basic, "id")?;
@@ -5154,8 +5159,7 @@ fn optional_i32_field(value: &Value, key: &str) -> Result<Option<i32>> {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(sha256_hex(&bytes))
+    crate::cmd_corpus::local_sha256(path)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -5268,7 +5272,7 @@ struct ToolStatus {
     name: &'static str,
     purpose: &'static str,
     path: Option<PathBuf>,
-    /// `Some(true/false)` when a genuineness control was run (drat-trim);
+    /// `Some(true/false)` when a genuineness control was run (drat-trim, z3);
     /// `None` when only presence was checked.
     genuine: Option<bool>,
     install_hint: &'static str,
@@ -5288,18 +5292,24 @@ impl ToolStatus {
 }
 
 /// Inventory the external checkers/solvers a full-replacement self-audit needs,
-/// so an external reviewer can immediately see what to install. `drat-trim` is
-/// genuineness-checked (a no-op mock is reported as absent); the rest are
+/// so an external reviewer can immediately see what to install. `drat-trim` and
+/// `z3` are genuineness-checked (a no-op mock, a reroute stub or an impostor is
+/// reported as absent); the rest are
 /// presence-only here because their proof/surface rows already validate them by
 /// actually emitting and replaying real artifacts.
 fn external_tool_inventory(repo_root: &Path, z3: &str, alethe_checker: &str) -> Vec<ToolStatus> {
     let drat = find_drat_trim();
+    // Identity-checked and reached by path, past reroute stubs: a file named z3
+    // on PATH is not evidence of z3.
+    let z3 = ay_sys::z3_oracle::resolve_z3_spelling(std::ffi::OsStr::new(z3))
+        .ok()
+        .map(|oracle| oracle.path().to_path_buf());
     vec![
         ToolStatus {
             name: "z3",
             purpose: "reference baselines + SMT-LIB/CHC differential",
-            path: find_on_path(z3),
-            genuine: None,
+            genuine: Some(z3.is_some()),
+            path: z3,
             install_hint: "package manager (e.g. `brew install z3`) or build Z3Prover/z3",
         },
         ToolStatus {
@@ -5314,7 +5324,7 @@ fn external_tool_inventory(repo_root: &Path, z3: &str, alethe_checker: &str) -> 
             purpose: "SMT Alethe proof replay",
             path: find_on_path(alethe_checker),
             genuine: None,
-            install_hint: "`cargo install --git https://github.com/ufmg-smite/carcara.git` (installs the `carcara` binary)",
+            install_hint: "`targo --unverified install --git https://github.com/ufmg-smite/carcara.git` (installs the `carcara` binary)",
         },
         ToolStatus {
             name: "lean",
@@ -5353,19 +5363,33 @@ fn run_command_capture_with_stdin(
     args: &[&str],
     input: &[u8],
 ) -> io::Result<Output> {
-    let mut child = ProcessCommand::new(program)
-        .args(args)
-        .current_dir(repo_root)
+    let mut command = ProcessCommand::new(program);
+    command.args(args).current_dir(repo_root);
+    capture_with_stdin(command, input)
+}
+
+/// Run `command` with `input` on its stdin and its stdout and stderr captured.
+///
+/// The input is written from its own thread while the output drains, so
+/// neither side can fill a pipe and wait on the other. A child that exits, or
+/// closes its stdin, before reading all of it is a `BrokenPipe` error from the
+/// writer, never a SIGPIPE: `ay` runs with SIGPIPE at its default (terminate)
+/// disposition, so the write goes through `ChildPipeWriter`. Every path reaps
+/// the child.
+fn capture_with_stdin(mut command: ProcessCommand, input: &[u8]) -> io::Result<Output> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            format!("failed to capture stdin for {}", program.display()),
-        )
-    })?;
+    let mut stdin = match ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child) {
+        Ok(stdin) => stdin,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || stdin.write_all(input));
@@ -5393,8 +5417,8 @@ fn run_builtin_smokes(
             reference_cache_error,
             reference_cache_path,
         ),
-        check_ay_param_discovery(ay),
-        check_ay_tactic_catalog(ay),
+        catalogs::discovery(ay, catalogs::Catalog::Parameters),
+        catalogs::discovery(ay, catalogs::Catalog::Tactics),
     ]
 }
 
@@ -5415,6 +5439,10 @@ fn compare_basic_smt_transcript(
                     reference_cache_error.unwrap_or("unknown cache load error")
                 ),
             )
+            .with_status(reference_cache_absence(
+                reference_cache_path,
+                reference_cache_error,
+            ))
             .with_command(format!(
                 "ay z3-audit --generate-reference-cache {} --z3 <z3>",
                 reference_cache_path.display()
@@ -5475,87 +5503,10 @@ fn compare_basic_smt_transcript(
     }
 }
 
-fn check_ay_param_discovery(ay: &Path) -> AuditCheck {
-    let command = format!("{} -p", ay.display());
-    match ProcessCommand::new(ay).arg("-p").output() {
-        Ok(output)
-            if output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("Global parameters")
-                && String::from_utf8_lossy(&output.stdout).contains("timeout (unsigned int)")
-                && String::from_utf8_lossy(&output.stdout).lines().count() == 715
-                && output.stderr.is_empty() =>
-        {
-            AuditCheck::pass(
-                "z3_param_discovery_smoke",
-                "ay -p exposes the complete Z3 5.1.0 parameter database without stderr noise",
-            )
-            .with_command(command)
-        }
-        Ok(output) => AuditCheck::fail(
-            "z3_param_discovery_smoke",
-            format!(
-                "unexpected ay -p result: status={:?} stdout={:?} stderr={:?}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )
-        .with_command(command),
-        Err(error) => AuditCheck::fail(
-            "z3_param_discovery_smoke",
-            format!("failed to run ay -p: {error}"),
-        )
-        .with_command(command),
-    }
-}
-
-fn check_ay_tactic_catalog(ay: &Path) -> AuditCheck {
-    let command = format!("{} -tactics -in", ay.display());
-    match run_program_stdin(ay.as_os_str(), &["-tactics", "-in"], "") {
-        Ok(output)
-            if output.status.success()
-                && output.stderr.is_empty()
-                && String::from_utf8_lossy(&output.stdout).lines().count() == 118
-                && String::from_utf8_lossy(&output.stdout).contains("- ctx-solver-simplify ") =>
-        {
-            AuditCheck::pass(
-                "z3_tactic_catalog_smoke",
-                "ay exposes the closed 118-entry Z3 5.0.0 tactic catalog",
-            )
-            .with_command(command)
-        }
-        Ok(output) => AuditCheck::fail(
-            "z3_tactic_catalog_smoke",
-            format!(
-                "unexpected -tactics result: status={:?} stdout={:?} stderr={:?}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )
-        .with_command(command),
-        Err(error) => AuditCheck::fail(
-            "z3_tactic_catalog_smoke",
-            format!("failed to run ay -tactics: {error}"),
-        )
-        .with_command(command),
-    }
-}
-
 fn run_program_stdin(program: &std::ffi::OsStr, args: &[&str], input: &str) -> io::Result<Output> {
-    let mut child = ProcessCommand::new(program)
-        .args(args)
-        .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .expect("piped stdin")
-        .write_all(input.as_bytes())?;
-    child.wait_with_output()
+    let mut command = ProcessCommand::new(program);
+    command.args(args).env("AY_INTERNAL_PROVENANCE_CHILD", "1");
+    capture_with_stdin(command, input.as_bytes())
 }
 
 fn run_repo_command(
@@ -5566,11 +5517,14 @@ fn run_repo_command(
     args: &[&str],
 ) -> AuditCheck {
     let displayed_command = rendered_repo_command(program, rendered);
-    let mut command = ProcessCommand::new(program);
-    command.args(args).current_dir(repo_root);
-    if program == "cargo" {
-        command.env("CARGO_SKIP_CACHE", "1");
-    }
+    let mut command = if program == "cargo" {
+        admitted_rust_command(args)
+    } else {
+        let mut command = ProcessCommand::new(program);
+        command.args(args);
+        command
+    };
+    command.current_dir(repo_root);
 
     match command.output() {
         Ok(output) if output.status.success() => {
@@ -5591,25 +5545,36 @@ fn run_repo_command(
     }
 }
 
+/// The same canonical original build admission used by native landing. A
+/// missing owner is a spawn failure, never permission to run unbudgeted.
+fn admitted_rust_command(args: &[&str]) -> ProcessCommand {
+    let frontend = RustFrontend::current();
+    let mut command = ProcessCommand::new("build-slot");
+    command
+        .arg("--")
+        .arg(frontend.program())
+        .args(frontend.args(args))
+        .env("CARGO_SKIP_CACHE", "1");
+    command
+}
+
 fn run_smt_model_validation_smoke(repo_root: &Path) -> AuditCheck {
     let rendered = rendered_repo_command(
         "cargo",
         "cargo test -p ay-dpll --test group_theory_misc sat_validates_model -- --nocapture",
     );
-    let output = ProcessCommand::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "ay-dpll",
-            "--test",
-            "group_theory_misc",
-            "sat_validates_model",
-            "--",
-            "--nocapture",
-        ])
-        .env("CARGO_SKIP_CACHE", "1")
-        .current_dir(repo_root)
-        .output();
+    let output = admitted_rust_command(&[
+        "test",
+        "-p",
+        "ay-dpll",
+        "--test",
+        "group_theory_misc",
+        "sat_validates_model",
+        "--",
+        "--nocapture",
+    ])
+    .current_dir(repo_root)
+    .output();
     let Ok(output) = output else {
         return AuditCheck::fail(
             SMT_MODEL_VALIDATION_SMOKE_ID,
@@ -5660,11 +5625,43 @@ fn strip_shell_quotes(token: &str) -> String {
 }
 
 fn rendered_repo_command(program: &str, rendered: &str) -> String {
-    if program == "cargo" && !rendered.starts_with("CARGO_SKIP_CACHE=") {
-        format!("CARGO_SKIP_CACHE=1 {rendered}")
-    } else {
-        rendered.to_string()
+    rendered_repo_command_with(RustFrontend::current(), program, rendered)
+}
+
+fn render_guidance_command(rendered: &str) -> String {
+    rendered
+        .split(" && ")
+        .map(|part| {
+            let bare = part.strip_prefix("CARGO_SKIP_CACHE=1 ").unwrap_or(part);
+            if bare.starts_with("cargo ") {
+                rendered_repo_command("cargo", bare)
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+/// The shell-copyable form of a repository command. A `cargo` command is
+/// respelled for `frontend` (each `&&`-joined part) and forced to run live.
+fn rendered_repo_command_with(frontend: RustFrontend, program: &str, rendered: &str) -> String {
+    if program != "cargo" {
+        return rendered.to_string();
     }
+    rendered
+        .split(" && ")
+        .map(|part| {
+            let bare = part.strip_prefix("CARGO_SKIP_CACHE=1 ").unwrap_or(part);
+            let translated = frontend.render(bare);
+            if bare.starts_with("cargo ") {
+                format!("CARGO_SKIP_CACHE=1 build-slot -- {translated}")
+            } else {
+                format!("CARGO_SKIP_CACHE=1 {translated}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 fn command_output_text(output: &Output) -> String {
@@ -5819,10 +5816,31 @@ fn print_human_summary(
     println!(
         "surfaces_passed={passed_surfaces} surfaces_failed={failed_surfaces} checks_passed={passed_checks} checks_failed={failed_checks} proof_rows_passed={passed_proof_rows} proof_rows_failed={failed_proof_rows}"
     );
+    println!(
+        "checks_not_run={} checks_missing={} checks_stale={} proof_rows_not_run={}",
+        checks
+            .iter()
+            .filter(|row| row.status == CheckStatus::NotRun)
+            .count(),
+        checks
+            .iter()
+            .filter(|row| row.status == CheckStatus::Missing)
+            .count(),
+        checks
+            .iter()
+            .filter(|row| row.status == CheckStatus::Stale)
+            .count(),
+        proof_inventory
+            .iter()
+            .filter(|row| row.status == CheckStatus::NotRun)
+            .count()
+    );
     if !full_replacement_ready && verdict == "fail" {
         println!(
             "truth=FAIL means at least one required full-replacement capability or evidence row is not Ready."
         );
+    } else if verdict == "incomplete" {
+        println!("truth=INCOMPLETE means required evidence was not run, is missing, or is stale; it is neither a successful check nor an observed check failure.");
     } else if !full_replacement_ready {
         println!(
             "truth=PASS means the audited rows are internally consistent; broad Z3 replacement remains false until every required surface is Ready."
@@ -5897,5 +5915,8 @@ fn print_human_summary(
     }
 }
 
+mod alethe_replay;
+#[cfg(test)]
+mod child_pipe_tests;
 #[cfg(test)]
 mod tests;

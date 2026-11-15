@@ -42,20 +42,28 @@ mod arithmetic_core;
 mod bitblast;
 mod bv_circuits;
 mod bv_division;
+mod closed_data;
+mod construction;
 mod constructors;
 mod conversion;
 mod decompose;
 mod div_pow2;
+pub mod exact;
+mod exponent_widths;
 mod fma;
 mod gates;
 mod integral;
 mod model_value;
 mod model_value_convert;
+mod rem_mulmod;
+pub mod rewriter;
+mod rm;
 mod round_const;
 mod rounding;
 mod special_ops;
 mod standalone;
 mod theory_impl;
+mod truncating_dispatch;
 
 #[cfg(test)]
 mod tests_basic;
@@ -66,12 +74,20 @@ mod tests_model_value;
 #[cfg(test)]
 mod tests_rounding_decision;
 #[cfg(test)]
+mod tests_small_formats;
+#[cfg(test)]
 mod tests_support;
-#[cfg(kani)]
-mod verification;
+#[cfg(test)]
+mod tests_wide_conversion;
 
-pub use model_value::FpModelValue;
-pub use round_const::round_rational_to_ieee_bits;
+pub use construction::{
+    FpBuildError, FpBuildProgress, FpBuildStage, FpBuiltEncoding, FpConstruction,
+};
+pub use model_value::{FpFields, FpModelValue};
+pub use rm::{RmBits, RmOperand, RM_ORDER};
+pub use round_const::{
+    round_rational_to_ieee_bits, MAX_ENCODING_EXPONENT_BITS, MAX_ENCODING_SIGNIFICAND_BITS,
+};
 pub use standalone::FpSolverStandalone;
 
 // #8529: Use deterministic hash maps in all builds.
@@ -170,13 +186,13 @@ impl FpPrecision {
     }
 
     /// Get bias for exponent (`2^(eb-1) - 1`).
-    pub fn bias(&self) -> u32 {
-        (1 << (self.exponent_bits() - 1)) - 1
+    pub fn bias(&self) -> u64 {
+        (1u64 << (self.exponent_bits() - 1)) - 1
     }
 
     /// Get max exponent value (`all 1s = 2^eb - 1`).
-    pub fn max_exponent(&self) -> u32 {
-        (1 << self.exponent_bits()) - 1
+    pub fn max_exponent(&self) -> u64 {
+        (1u64 << self.exponent_bits()) - 1
     }
 
     /// Create from exponent and significand bit counts.
@@ -212,10 +228,13 @@ impl FpDecomposed {
 }
 
 /// Model extracted from FP solver with variable assignments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FpModel {
     /// Variable assignments: `term_id -> concrete FP value`.
     pub values: HashMap<TermId, FpModelValue>,
+    /// The mode of every symbolic rounding-mode constant (a declared
+    /// `RoundingMode` constant the bit-blaster gave three bits).
+    pub rm_values: HashMap<TermId, RoundingMode>,
 }
 
 /// Floating-point theory solver using bit-blasting.
@@ -244,6 +263,8 @@ pub struct FpSolver<'a> {
     cached_true: Option<CnfLit>,
     /// Tseitin term-to-variable mapping (optional).
     term_to_cnf: Option<BTreeMap<TermId, u32>>,
+    /// Fresh-only authority; never imported or exported in encoding caches.
+    condition_namespace: closed_data::ConditionNamespace,
     /// Pending condition links for ITE conditions that need Tseitin linking.
     pending_condition_links: Vec<(u32, u32)>,
     /// Consistent CNF literal per free Boolean input that occurs only below
@@ -257,7 +278,8 @@ pub struct FpSolver<'a> {
     /// `fp.to_{s,u}bv` conversion sites whose result is unspecified on
     /// NaN/Inf/out-of-range. Used to Ackermannize the unspecified value so that
     /// it stays free (any BV) yet congruent: equal FP inputs of the same
-    /// signedness/width must produce equal results (#bug13 / ay#8870).
+    /// signedness/width/format under the same rounding mode must produce equal
+    /// results (#bug13 / ay#8870; D7).
     to_bv_unspec_sites: Vec<ToBvUnspecSite>,
     /// The single fixed-but-unspecified IEEE NaN encoding per FP format,
     /// keyed by `(exponent_bits, stored_significand_bits)`.
@@ -268,6 +290,10 @@ pub struct FpSolver<'a> {
     /// bitvector. Sharing one cached encoding per format delivers exactly
     /// that (see `bitblast_to_ieee_bv`).
     ieee_nan_encodings: HashMap<(usize, usize), Vec<CnfLit>>,
+    /// The three bits of every symbolic rounding-mode term encoded so far, one
+    /// set per term so that every occurrence of a mode is the same mode (see
+    /// `rm.rs`).
+    rm_terms: HashMap<TermId, RmBits>,
 }
 
 /// A recorded `fp.to_{s,u}bv` site for congruence Ackermannization.
@@ -281,6 +307,9 @@ pub struct FpSolver<'a> {
 pub struct ToBvUnspecSite {
     /// Decomposed FP input to the conversion.
     input: FpDecomposed,
+    /// The conversion's rounding mode: the unspecified value is a function of
+    /// `(rm, input)`, so only sites with equal modes are related.
+    rm: RmOperand,
     /// The fresh "unspecified" output bits used for NaN/Inf/out-of-range.
     unspec: Vec<CnfLit>,
     /// Whether this is a signed (`fp.to_sbv`) conversion.
@@ -318,6 +347,8 @@ pub struct FpEncodingCache {
     pub to_bv_unspec_sites: Vec<ToBvUnspecSite>,
     /// The single fixed-but-unspecified NaN encoding per FP format.
     pub ieee_nan_encodings: HashMap<(usize, usize), Vec<CnfLit>>,
+    /// The bits of every symbolic rounding-mode term (see `rm.rs`).
+    pub rm_terms: HashMap<TermId, RmBits>,
 }
 
 impl Default for FpEncodingCache {
@@ -332,6 +363,7 @@ impl Default for FpEncodingCache {
             bool_input_lits: HashMap::default(),
             to_bv_unspec_sites: Vec::new(),
             ieee_nan_encodings: HashMap::default(),
+            rm_terms: HashMap::default(),
         }
     }
 }
@@ -353,11 +385,13 @@ impl<'a> FpSolver<'a> {
             cached_false: None,
             cached_true: None,
             term_to_cnf: None,
+            condition_namespace: closed_data::ConditionNamespace::External,
             pending_condition_links: Vec::new(),
             bool_input_lits: HashMap::default(),
             has_encoding_gap: false,
             to_bv_unspec_sites: Vec::new(),
             ieee_nan_encodings: HashMap::default(),
+            rm_terms: HashMap::default(),
         }
     }
 
@@ -377,11 +411,13 @@ impl<'a> FpSolver<'a> {
             cached_false: None,
             cached_true: None,
             term_to_cnf: Some(tseitin.clone()),
+            condition_namespace: closed_data::ConditionNamespace::External,
             pending_condition_links: Vec::new(),
             bool_input_lits: HashMap::default(),
             has_encoding_gap: false,
             to_bv_unspec_sites: Vec::new(),
             ieee_nan_encodings: HashMap::default(),
+            rm_terms: HashMap::default(),
         }
     }
 
@@ -415,6 +451,7 @@ impl<'a> FpSolver<'a> {
             bool_input_lits,
             to_bv_unspec_sites,
             ieee_nan_encodings,
+            rm_terms,
         } = cache;
         self.term_to_fp = term_to_fp;
         self.bv_term_bits = bv_term_bits;
@@ -426,6 +463,7 @@ impl<'a> FpSolver<'a> {
         self.bool_input_lits = bool_input_lits;
         self.to_bv_unspec_sites = to_bv_unspec_sites;
         self.ieee_nan_encodings = ieee_nan_encodings;
+        self.rm_terms = rm_terms;
     }
 
     /// Snapshot every cache field that names a CNF variable.
@@ -441,6 +479,7 @@ impl<'a> FpSolver<'a> {
             bool_input_lits: self.bool_input_lits.clone(),
             to_bv_unspec_sites: self.to_bv_unspec_sites.clone(),
             ieee_nan_encodings: self.ieee_nan_encodings.clone(),
+            rm_terms: self.rm_terms.clone(),
         }
     }
 
@@ -535,6 +574,7 @@ impl<'a> FpSolver<'a> {
     }
 
     /// Constrain a decomposed FP to a constant bit pattern.
+    #[cfg(test)]
     pub(crate) fn constrain_constant(
         &mut self,
         fp: &FpDecomposed,

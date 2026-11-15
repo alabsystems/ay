@@ -3,7 +3,8 @@
 // Author: Andrew Yates
 
 use super::context::ExecutionContext;
-use super::translate::{bridge_datatype, translate_expr};
+use super::datatypes;
+use super::translate::translate_expr;
 use super::translate_bridge;
 use super::ExecuteError;
 use crate::constraint::Constraint;
@@ -42,9 +43,7 @@ pub(super) fn execute_constraint(
 
         Constraint::Assert { expr, label: _ } => {
             let term = translate_expr(ctx, expr)?;
-            ctx.solver
-                .try_assert_term(term)
-                .map_err(|e| ExecuteError::ConstraintExecution(e.to_string()))?;
+            super::assertion_source::assert_with_source(ctx, term, expr)?;
             Ok(())
         }
 
@@ -52,6 +51,7 @@ pub(super) fn execute_constraint(
             ctx.solver
                 .try_push()
                 .map_err(|e| ExecuteError::ConstraintExecution(e.to_string()))?;
+            ctx.translation_memo.push();
             Ok(())
         }
 
@@ -60,6 +60,7 @@ pub(super) fn execute_constraint(
                 ctx.solver
                     .try_pop()
                     .map_err(|e| ExecuteError::ConstraintExecution(e.to_string()))?;
+                ctx.translation_memo.pop();
             }
             Ok(())
         }
@@ -107,14 +108,7 @@ pub(super) fn execute_constraint(
 
         Constraint::DeclareVar { name, sort } => translate_bridge::declare_var(ctx, name, sort),
 
-        Constraint::DeclareDatatype(dt) => {
-            let core_dt = bridge_datatype(dt)?;
-            ctx.solver
-                .try_declare_datatype(&core_dt)
-                .map_err(|e| ExecuteError::ConstraintExecution(e.to_string()))?;
-            ctx.declared_datatypes.insert(dt.name.clone(), core_dt);
-            Ok(())
-        }
+        Constraint::DeclareDatatype(dt) => datatypes::declare_datatype(ctx, dt),
 
         // CHC commands should be filtered by needs_fallback().
         // If they slip through, return an execution error instead of panicking.

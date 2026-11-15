@@ -104,10 +104,20 @@ fn mk_and(terms: &mut TermStore, args: Vec<TermId>) -> TermId {
     terms.mk_app(Symbol::named("and"), args, Sort::Bool)
 }
 
-fn bool_vars(terms: &mut TermStore, count: usize) -> Vec<TermId> {
-    (0..count)
+type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Largest pool `bool_vars` will build; every caller asks for far fewer.
+const MAX_BOOL_VARS: usize = 1 << 16;
+
+fn bool_vars(terms: &mut TermStore, count: usize) -> TestResult<Vec<TermId>> {
+    if count > MAX_BOOL_VARS {
+        return Err(
+            format!("bool_vars: {count} exceeds the {MAX_BOOL_VARS}-variable bound").into(),
+        );
+    }
+    Ok((0..count)
         .map(|i| terms.mk_var(format!("p{i}"), Sort::Bool))
-        .collect()
+        .collect())
 }
 
 /// Every packed shape, its duals, and a spread of near-misses, in one pool.
@@ -115,8 +125,8 @@ fn bool_vars(terms: &mut TermStore, count: usize) -> Vec<TermId> {
 /// Each entry is a candidate UNIT term. `agree_with_reference` asserts the
 /// indexed recognizer and the pre-rewrite oracle return the SAME verdict for
 /// every one of them, so an accept can neither be gained nor lost.
-fn candidate_units(terms: &mut TermStore) -> Vec<TermId> {
-    let vars = bool_vars(terms, 6);
+fn candidate_units(terms: &mut TermStore) -> TestResult<Vec<TermId>> {
+    let vars = bool_vars(terms, 6)?;
     let (p, q, r, s, t, u) = (vars[0], vars[1], vars[2], vars[3], vars[4], vars[5]);
     let not_p = terms.mk_not_raw(p);
     let not_q = terms.mk_not_raw(q);
@@ -192,13 +202,13 @@ fn candidate_units(terms: &mut TermStore) -> Vec<TermId> {
     push(terms, vec![p, p, not_p]);
     push(terms, vec![not_and_pq, p, p]);
     push(terms, vec![and_pq, not_p, not_p, not_q]);
-    units
+    Ok(units)
 }
 
 #[test]
-fn indexed_recognizer_agrees_with_the_prerewrite_predicate() {
+fn indexed_recognizer_agrees_with_the_prerewrite_predicate() -> TestResult<()> {
     let mut terms = TermStore::new();
-    let units = candidate_units(&mut terms);
+    let units = candidate_units(&mut terms)?;
     assert!(units.len() >= 30, "the pool must actually cover the shapes");
     let mut accepted = 0_usize;
     for unit in units {
@@ -214,6 +224,7 @@ fn indexed_recognizer_agrees_with_the_prerewrite_predicate() {
         accepted > 0,
         "the pool must contain accepted shapes, else agreement is vacuous"
     );
+    Ok(())
 }
 
 /// A non-`or` root, a one-disjunct `or`, and a non-Bool disjunct are all
@@ -246,10 +257,10 @@ fn non_packed_roots_are_rejected_without_indexing() {
 /// verdict is unchanged at a width the old scan could not be charged for
 /// linearly; it deliberately does not assert a wall-clock bound.
 #[test]
-fn wide_packed_units_are_recognized_at_scale() {
+fn wide_packed_units_are_recognized_at_scale() -> TestResult<()> {
     const WIDTH: usize = 4_000;
     let mut terms = TermStore::new();
-    let vars = bool_vars(&mut terms, WIDTH);
+    let vars = bool_vars(&mut terms, WIDTH)?;
     let disjunction = mk_or(&mut terms, vars.clone());
     let negated = terms.mk_not_raw(disjunction);
     let mut args = vars.clone();
@@ -267,4 +278,5 @@ fn wide_packed_units_are_recognized_at_scale() {
         is_packed_clausification_tautology(&terms, near_miss),
         reference_is_packed_clausification_tautology(&terms, near_miss)
     );
+    Ok(())
 }

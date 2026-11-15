@@ -64,9 +64,8 @@ size_bytes = 180741
 # `20190906-CLEARSY` (1012 .smt2 files, ~48 MB uncompressed). Upstream origin:
 # the SMT-LIB incremental benchmarks (https://smtlib.cs.uiowa.edu/benchmarks.shtml,
 # incremental/QF_UF/20190906-CLEARSY). The archive has the single root
-# `20190906-CLEARSY` so the on-disk layout stays `incremental/QF_UF/...`, which
-# scripts/clearsy_repair_differential.sh resolves as
-# ROOT=benchmarks/smt-lib-incremental + the upstream-relative path.
+# `20190906-CLEARSY` so the on-disk layout stays `incremental/QF_UF/...` under
+# benchmarks/smt-lib-incremental, mirroring the upstream-relative path.
 name = "smt-lib-incremental-qf-uf-clearsy"
 extract_to = "benchmarks/smt-lib-incremental/incremental/QF_UF/20190906-CLEARSY"
 asset = "smt-lib-incremental-qf-uf-clearsy-v1.tar.zst"
@@ -135,13 +134,19 @@ manifest = "benchmarks/sat/satcomp2026-main/SC2026.pinned.csv"
 
 [[corpus]]
 name = "satcomp-2026-main-official"
-groups = ["competition-2025-2026"]
 source = "gbd"
 extract_to = "benchmarks/sat/satcomp2026-main/official"
 # The 400 instances SAT-COMP 2026 actually scored, taken from the `instanceid`
 # column of the organizers' official results export. Provisioned (and each file
 # bound to its official instanceid by recomputing GBD's identity hash) via
 # scripts/sat_bench/fetch_satcomp2026_official.py.
+# Deliberately in no group. `competition-2025-2026` is the campaign set that
+# benchmarks/competition-assets-2025-2026.toml must reference exactly
+# (`ay corpus campaign-audit`), and every referenced GBD asset must parse as
+# `hash`-keyed rows bound to a SHA-256-pinned upstream selection. This manifest
+# is keyed by `instanceid` and derived from scores.csv, so `ay corpus` cannot
+# read it yet; in the group it failed that audit and aborted
+# `ay corpus plan --group competition-2025-2026`.
 manifest = "benchmarks/sat/satcomp2026-main/SC2026.official.csv"
 
 [[corpus]]

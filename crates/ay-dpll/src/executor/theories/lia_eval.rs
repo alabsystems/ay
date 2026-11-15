@@ -1383,9 +1383,9 @@ pub(in crate::executor) fn reconcile_lia_select_congruence(
             .term_values
             .iter()
             .filter_map(|(&t, s)| {
-                // Sentinel keys (e.g. the per-model repair marker at
-                // `u32::MAX - 7`) live in `term_values` but are not real
-                // terms — keep only ids the term store can resolve.
+                // Keep only ids the term store can resolve (defensive: the
+                // per-model repair marker that once lived here as a sentinel
+                // key is now `EufModel::array_read_pins_repaired`).
                 if t.0 >= n_terms {
                     return None;
                 }
@@ -1674,8 +1674,7 @@ mod tests {
         // Pick the first and last keys in the map's actual iteration order so
         // the old one-pass-removal behavior deterministically evaluated the
         // dependent from a stale intermediate before repairing that
-        // intermediate.  Keeping all keys in the map preserves that order for
-        // both the normal deterministic hash map and Kani's BTreeMap alias.
+        // intermediate.  Keeping all keys in the map preserves that order.
         let mut substitutions: HashMap<TermId, TermId> =
             keys.iter().copied().map(|key| (key, zero)).collect();
         let order: Vec<TermId> = substitutions.keys().copied().collect();

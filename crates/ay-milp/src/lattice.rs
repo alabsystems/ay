@@ -64,7 +64,6 @@ use std::ffi::OsStr;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::thread::ScopedJoinHandle;
 use std::time::Instant;
 
 use crate::cert_io::{ledger as replay_ledger, ReplayClaim};
@@ -81,6 +80,11 @@ use crate::outcome::Outcome;
 /// prunes it. That is a legitimate thing to trust and an illegitimate thing to
 /// hide, so it is written into the certificate.
 const TCB: &str = "crates/ay-milp/src/lattice.rs";
+
+#[cfg(test)]
+thread_local! {
+    static LAST_BUILD_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
 
 /// Hard cap on the enumeration so a mis-fire can never run away: past this the
 /// device aborts to `None` and the normal search takes over. markshare1's
@@ -688,6 +692,8 @@ fn try_prove_configured(
     deadline: Instant,
     schedule: LatticeSchedule,
 ) -> Option<Outcome> {
+    let _compute =
+        ay_sys::compute_budget::ComputeScope::enter_until(|| Instant::now() >= deadline).ok()??;
     let (threads, forced_beta) = match schedule {
         LatticeSchedule::Disabled => return None,
         LatticeSchedule::Threads(threads) => (threads.max(1), bkz_beta_override()),
@@ -702,14 +708,13 @@ fn try_prove_configured(
             ms.m, ms.n
         );
     }
-    // Never starve the normal search: the device may run at most HALF the
-    // remaining budget, then aborts to `None` and hands the model back. On
-    // markshare1 this is moot (the proof lands in ~1.4s); it only bites a
-    // hypothetical hard market-split (optimum ≥ 2, or a large ball) that the
-    // normal search would then get a fair share of the clock to attempt.
-    let now = Instant::now();
-    let sub_deadline = now + deadline.saturating_duration_since(now).mul_f64(0.5);
-    let eng = Engine::build(&ms, sub_deadline, trace, threads, forced_beta)?;
+    // Keep the caller's absolute deadline. A fractional slice discarded a
+    // markshare1 proof that completed in 2.238s under a long limit, although
+    // the short caller had granted 3s: the device was stopped at <=1.5s and
+    // normal search returned only Feasible. Existing size, node, frontier and
+    // BKZ caps still bound the device; an early decline leaves the remaining
+    // caller budget to normal search. No phase renews that budget.
+    let eng = Engine::build(&ms, deadline, trace, threads, forced_beta)?;
     // REPLAY CLAIMS MUST NOT OUTLIVE A DECLINE. `prove` can file a sweep claim
     // and then still hand the model back (a witness hunt that finds nothing, an
     // overflow in the reconstruction). A claim left in the ledger would then
@@ -844,13 +849,35 @@ const BOX_PRUNE_OFF_ENV: &str = "AY_MILP_NO_BOXPRUNE";
 /// records `(level, y[level..dim])` — the exact subtree root that was cut — so
 /// a test can verify against exhaustive ground truth that the cut subtree
 /// really contained no box point of the face. Shared (not thread-local) so the
-/// parallel workers are covered too.
+/// parallel workers are covered too, and keyed by the token the arming test
+/// put on its engine's `BoxPrune` (`BOX_PRUNE_PROBE_ARMED`): a fire of any
+/// other engine is not this face's, and is never recorded. (Unkeyed, a test
+/// that drives the device without the probe guard, such as a real-dispatch
+/// control, put its fires in an armed log while it ran beside an adversarial
+/// test, which then reported an UNSOUND PRUNE of a face the fire never
+/// belonged to.)
 #[cfg(test)]
 static BOX_PRUNE_FIRE_LOG: Mutex<Option<Vec<(usize, Vec<i64>)>>> = Mutex::new(None);
 
+/// The token of the tables the probe is armed for; 0 while it is not armed.
+/// Read and written only under `BOX_PRUNE_FIRE_LOG`'s lock.
 #[cfg(test)]
-fn box_prune_probe_record(level: usize, suffix: &[i64]) {
+static BOX_PRUNE_PROBE_ARMED: AtomicU64 = AtomicU64::new(0);
+
+/// The next probe token; 0 is never handed out, so a production-built
+/// `BoxPrune` (token 0) records nothing.
+#[cfg(test)]
+static BOX_PRUNE_PROBE_NEXT: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+fn box_prune_probe_record(token: u64, level: usize, suffix: &[i64]) {
+    if token == 0 {
+        return;
+    }
     if let Ok(mut guard) = BOX_PRUNE_FIRE_LOG.lock() {
+        if BOX_PRUNE_PROBE_ARMED.load(Ordering::Relaxed) != token {
+            return;
+        }
         if let Some(log) = guard.as_mut() {
             log.push((level, suffix.to_vec()));
         }
@@ -861,18 +888,32 @@ fn box_prune_probe_record(level: usize, suffix: &[i64]) {
 #[cfg(test)]
 static BOX_PRUNE_PROBE_GUARD: Mutex<()> = Mutex::new(());
 
+/// Arm the probe for `eng`'s installed box-prune tables only: they get a fresh
+/// token, and the log keeps only fires carrying it. Returns the token, for
+/// `box_prune_probe_rearm` while a state still borrows the engine.
 #[cfg(test)]
-fn box_prune_probe_arm() {
-    *BOX_PRUNE_FIRE_LOG.lock().unwrap() = Some(Vec::new());
+fn box_prune_probe_arm(eng: &mut Engine) -> u64 {
+    let token = BOX_PRUNE_PROBE_NEXT.fetch_add(1, Ordering::Relaxed);
+    if let Some(bp) = eng.box_prune.as_mut() {
+        bp.probe_token = token;
+    }
+    box_prune_probe_rearm(token);
+    token
+}
+
+/// Arm (again) an empty log for tables that already carry `token`.
+#[cfg(test)]
+fn box_prune_probe_rearm(token: u64) {
+    let mut guard = BOX_PRUNE_FIRE_LOG.lock().unwrap();
+    BOX_PRUNE_PROBE_ARMED.store(token, Ordering::Relaxed);
+    *guard = Some(Vec::new());
 }
 
 #[cfg(test)]
 fn box_prune_probe_take() -> Vec<(usize, Vec<i64>)> {
-    BOX_PRUNE_FIRE_LOG
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap_or_default()
+    let mut guard = BOX_PRUNE_FIRE_LOG.lock().unwrap();
+    BOX_PRUNE_PROBE_ARMED.store(0, Ordering::Relaxed);
+    guard.take().unwrap_or_default()
 }
 
 /// Largest observed `|cflat[0][k] − x_k|` at a COMPLETE leaf, where `x_k` is
@@ -958,6 +999,11 @@ struct BoxPrune {
     /// `(dim + 8)·f64::EPSILON`, the linear rounding coefficient of the
     /// envelope, precomputed.
     eps_coeff: f64,
+    /// The adversarial probe's token (test builds only): nonzero only on
+    /// tables a test armed with `box_prune_probe_arm`, so the probe's fire log
+    /// and its margin and leaf statistics see that engine's fires alone.
+    #[cfg(test)]
+    probe_token: u64,
 }
 
 /// The reduced kernel lattice + exact GSO, shared across every face.
@@ -1166,6 +1212,8 @@ fn box_prune_tables(
         up_f,
         bound_absmax,
         eps_coeff: (dim as f64 + 8.0) * f64::EPSILON,
+        #[cfg(test)]
+        probe_token: 0,
     })
 }
 
@@ -1433,6 +1481,8 @@ impl Engine {
         threads: usize,
         forced_beta: Option<usize>,
     ) -> Option<Engine> {
+        #[cfg(test)]
+        LAST_BUILD_DEADLINE.with(|observed| observed.set(Some(deadline)));
         let (n, m) = (ms.n, ms.m);
         // A as BigInt (m × n).
         let abig: Vec<Vec<BigInt>> =
@@ -1951,73 +2001,76 @@ impl Engine {
         // Nondeterministic schedules may publish any exact witness. The typed
         // deterministic contract never reaches this path.
         let best: Mutex<Option<(usize, Vec<i64>)>> = Mutex::new(None);
-        let nthreads = self.threads.min(items.len()).max(1);
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(nthreads);
-            for worker in 0..nthreads {
-                let name = format!("ay-lattice-{worker}");
-                match std::thread::Builder::new()
-                    .name(name)
-                    .spawn_scoped(scope, || {
-                        loop {
-                            if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
+        let Ok(Some(mut budget)) =
+            crate::compute::Workers::acquire(self.threads.min(items.len()).max(1), || {
+                Instant::now() >= self.deadline
+            })
+        else {
+            return EnumResult::Aborted;
+        };
+        let nthreads = budget.count();
+        if budget
+            .run(
+                vec![(); nthreads],
+                "ay-lattice",
+                None,
+                |_| {
+                    loop {
+                        if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let Some(idx) = next_work_index(&next_idx, items.len()) else {
+                            break;
+                        };
+                        let item = &items[idx];
+                        let mut st = self.fresh_state(xd, tg.clone(), radius, Some(&shared_nodes));
+                        for (offset, &value) in item.y_upper.iter().enumerate() {
+                            st.y[stop_level + 1 + offset] = value;
+                        }
+                        for (column, &interval) in item.partial_row.iter().enumerate() {
+                            st.partial[stop_level][column] = interval;
+                        }
+                        st.seed_box_row(stop_level, &item.c_row);
+                        st.cancel = Some(&found);
+                        let hit = st.rec(stop_level, item.dist, item.box_g, item.box_h);
+                        match hit {
+                            Some(y) => {
+                                let Ok(mut guard) = best.lock() else {
+                                    aborted.store(true, Ordering::Release);
+                                    break;
+                                };
+                                match guard.as_ref() {
+                                    Some((best_index, _)) if *best_index <= idx => {}
+                                    _ => *guard = Some((idx, y)),
+                                }
+                                found.store(true, Ordering::Release);
                                 break;
                             }
-                            let Some(idx) = next_work_index(&next_idx, items.len()) else {
-                                break;
-                            };
-                            let item = &items[idx];
-                            let mut st =
-                                self.fresh_state(xd, tg.clone(), radius, Some(&shared_nodes));
-                            for (offset, &value) in item.y_upper.iter().enumerate() {
-                                st.y[stop_level + 1 + offset] = value;
-                            }
-                            for (column, &interval) in item.partial_row.iter().enumerate() {
-                                st.partial[stop_level][column] = interval;
-                            }
-                            st.seed_box_row(stop_level, &item.c_row);
-                            st.cancel = Some(&found);
-                            let hit = st.rec(stop_level, item.dist, item.box_g, item.box_h);
-                            match hit {
-                                Some(y) => {
-                                    let Ok(mut guard) = best.lock() else {
-                                        aborted.store(true, Ordering::Release);
-                                        break;
-                                    };
-                                    match guard.as_ref() {
-                                        Some((best_index, _)) if *best_index <= idx => {}
-                                        _ => *guard = Some((idx, y)),
-                                    }
-                                    found.store(true, Ordering::Release);
+                            None => {
+                                if st.cancelled {
+                                    // A confirmed witness exists elsewhere;
+                                    // this partial subtree need not finish.
                                     break;
                                 }
-                                None => {
-                                    if st.cancelled {
-                                        // A confirmed witness exists elsewhere;
-                                        // this partial subtree need not finish.
-                                        break;
-                                    }
-                                    if st.aborted {
-                                        aborted.store(true, Ordering::Release);
-                                        break;
-                                    }
-                                    // Subtree fully swept, empty: pull the next
-                                    // complete work item.
+                                if st.aborted {
+                                    aborted.store(true, Ordering::Release);
+                                    break;
                                 }
+                                // Subtree fully swept, empty: pull the next
+                                // complete work item.
                             }
                         }
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        aborted.store(true, Ordering::Release);
-                        break;
                     }
-                }
-            }
-            for handle in handles {
-                join_lattice_worker(handle, &aborted);
-            }
-        });
+                },
+                |failure| {
+                    let _ = failure;
+                    aborted.store(true, Ordering::Release);
+                },
+            )
+            .is_err()
+        {
+            return EnumResult::Aborted;
+        }
 
         let witness = match best.into_inner() {
             Ok(best) => best.map(|(_, y)| y),
@@ -2265,80 +2318,84 @@ impl Engine {
         // choice is sound; nondeterministic schedules may publish any of them
         // — the typed deterministic contract never reaches this path).
         let best: Mutex<Option<(usize, usize, Vec<i64>)>> = Mutex::new(None);
-        let nthreads = self.threads.min(order.len()).max(1);
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(nthreads);
-            for worker in 0..nthreads {
-                let name = format!("ay-lattice-hunt-{worker}");
-                match std::thread::Builder::new()
-                    .name(name)
-                    .spawn_scoped(scope, || {
-                        loop {
-                            if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
+        let Ok(Some(mut budget)) =
+            crate::compute::Workers::acquire(self.threads.min(order.len()).max(1), || {
+                Instant::now() >= self.deadline
+            })
+        else {
+            return FaceSweep::Aborted;
+        };
+        let nthreads = budget.count();
+        if budget
+            .run(
+                vec![(); nthreads],
+                "ay-lattice-hunt",
+                None,
+                |_| {
+                    loop {
+                        if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let Some(idx) = next_work_index(&next_idx, order.len()) else {
+                            break;
+                        };
+                        let (pi, ii) = order[idx];
+                        let p = &preps[pi];
+                        let item = &p.items[ii];
+                        let mut st = self.fresh_state(
+                            &faces[p.pos].1,
+                            p.tg.clone(),
+                            p.radius,
+                            Some(&p.shared),
+                        );
+                        for (offset, &value) in item.y_upper.iter().enumerate() {
+                            st.y[p.stop_level + 1 + offset] = value;
+                        }
+                        for (column, &interval) in item.partial_row.iter().enumerate() {
+                            st.partial[p.stop_level][column] = interval;
+                        }
+                        st.seed_box_row(p.stop_level, &item.c_row);
+                        st.cancel = Some(&found);
+                        let hit = st.rec(p.stop_level, item.dist, item.box_g, item.box_h);
+                        match hit {
+                            Some(y) => {
+                                let Ok(mut guard) = best.lock() else {
+                                    aborted.store(true, Ordering::Release);
+                                    break;
+                                };
+                                match guard.as_ref() {
+                                    Some((best_index, _, _)) if *best_index <= idx => {}
+                                    _ => *guard = Some((idx, p.pos, y)),
+                                }
+                                found.store(true, Ordering::Release);
                                 break;
                             }
-                            let Some(idx) = next_work_index(&next_idx, order.len()) else {
-                                break;
-                            };
-                            let (pi, ii) = order[idx];
-                            let p = &preps[pi];
-                            let item = &p.items[ii];
-                            let mut st = self.fresh_state(
-                                &faces[p.pos].1,
-                                p.tg.clone(),
-                                p.radius,
-                                Some(&p.shared),
-                            );
-                            for (offset, &value) in item.y_upper.iter().enumerate() {
-                                st.y[p.stop_level + 1 + offset] = value;
-                            }
-                            for (column, &interval) in item.partial_row.iter().enumerate() {
-                                st.partial[p.stop_level][column] = interval;
-                            }
-                            st.seed_box_row(p.stop_level, &item.c_row);
-                            st.cancel = Some(&found);
-                            let hit = st.rec(p.stop_level, item.dist, item.box_g, item.box_h);
-                            match hit {
-                                Some(y) => {
-                                    let Ok(mut guard) = best.lock() else {
-                                        aborted.store(true, Ordering::Release);
-                                        break;
-                                    };
-                                    match guard.as_ref() {
-                                        Some((best_index, _, _)) if *best_index <= idx => {}
-                                        _ => *guard = Some((idx, p.pos, y)),
-                                    }
-                                    found.store(true, Ordering::Release);
+                            None => {
+                                if st.cancelled {
+                                    // A confirmed witness exists elsewhere;
+                                    // this partial subtree need not finish.
+                                    // NOT an abort.
                                     break;
                                 }
-                                None => {
-                                    if st.cancelled {
-                                        // A confirmed witness exists elsewhere;
-                                        // this partial subtree need not finish.
-                                        // NOT an abort.
-                                        break;
-                                    }
-                                    if st.aborted {
-                                        aborted.store(true, Ordering::Release);
-                                        break;
-                                    }
-                                    // Subtree fully swept, empty: pull the next
-                                    // complete work item.
+                                if st.aborted {
+                                    aborted.store(true, Ordering::Release);
+                                    break;
                                 }
+                                // Subtree fully swept, empty: pull the next
+                                // complete work item.
                             }
                         }
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        aborted.store(true, Ordering::Release);
-                        break;
                     }
-                }
-            }
-            for handle in handles {
-                join_lattice_worker(handle, &aborted);
-            }
-        });
+                },
+                |failure| {
+                    let _ = failure;
+                    aborted.store(true, Ordering::Release);
+                },
+            )
+            .is_err()
+        {
+            return FaceSweep::Aborted;
+        }
 
         let witness = match best.into_inner() {
             Ok(best) => best,
@@ -2615,12 +2672,6 @@ fn reserve_shared_nodes(shared: &AtomicU64, budget: u64) -> Option<u64> {
             Ok(_) => return Some(updated - current),
             Err(observed) => current = observed,
         }
-    }
-}
-
-fn join_lattice_worker(handle: ScopedJoinHandle<'_, ()>, aborted: &AtomicBool) {
-    if handle.join().is_err() {
-        aborted.store(true, Ordering::Release);
     }
 }
 
@@ -2958,7 +3009,7 @@ impl EnumState<'_> {
         // would mean the floating-point derivation is load-bearing; a large
         // minimum means every real fire is decided far outside any rounding.
         #[cfg(test)]
-        if fire && eps.is_finite() {
+        if fire && eps.is_finite() && bp.probe_token != 0 {
             let mut best = f64::INFINITY;
             for k in 0..n {
                 let raw = (dst[k] - up_f[k]).max(lo_f[k] - dst[k]);
@@ -3110,7 +3161,7 @@ impl EnumState<'_> {
                     let (g, h, fire) = self.box_step(bp, level, diff, d.lo, box_g, box_h);
                     if fire {
                         #[cfg(test)]
-                        box_prune_probe_record(level, &self.y[level..eng.dim]);
+                        box_prune_probe_record(bp.probe_token, level, &self.y[level..eng.dim]);
                         continue;
                     }
                     (g, h)
@@ -3119,7 +3170,7 @@ impl EnumState<'_> {
             };
             if level == 0 {
                 #[cfg(test)]
-                if self.box_on {
+                if boxp.is_some_and(|bp| bp.probe_token != 0) {
                     let mut worst = 0.0f64;
                     for k in 0..eng.n {
                         let mut xk = self.xd[k];
@@ -4133,6 +4184,33 @@ fn block_svp(
     block_svp_parallel(mu, norm, j, k, pruned, cap, deadline, threads)
 }
 
+/// A deadline stops the whole frontier; an individual node cap does not.
+fn next_live_svp_item(
+    next: &AtomicUsize,
+    len: usize,
+    stopped: impl FnOnce() -> bool,
+) -> Option<usize> {
+    if stopped() {
+        None
+    } else {
+        next_work_index(next, len)
+    }
+}
+
+/// Do not begin preparation after expiry, or use an indivisible preparation
+/// that crossed it. The caller must stop its frontier on `None`.
+fn prepare_live_svp<T>(stopped: impl Fn() -> bool, prepare: impl FnOnce() -> T) -> Option<T> {
+    if stopped() {
+        return None;
+    }
+    let prepared = prepare();
+    if stopped() {
+        None
+    } else {
+        Some(prepared)
+    }
+}
+
 /// Parallel block-SVP: enumerate the top levels of the projected block at the
 /// FIXED radius `‖b*_j‖²` into a frontier of independent subtrees, then hand
 /// the subtrees to scoped workers via an atomic work-index (the same pattern as
@@ -4205,55 +4283,71 @@ fn block_svp_parallel(
     let next_idx = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, f64, Vec<i64>)>> = Mutex::new(Vec::new());
     let spawn_failed = AtomicBool::new(false);
-    let nthreads = threads.min(items.len()).max(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(nthreads);
-        for worker in 0..nthreads {
-            let name = format!("ay-bkz-svp-{worker}");
-            match std::thread::Builder::new()
-                .name(name)
-                .spawn_scoped(scope, || {
-                    while let Some(idx) = next_work_index(&next_idx, items.len()) {
-                        let (x_suffix, dist) = &items[idx];
-                        let mut e = BlockEnum {
-                            d,
-                            mu,
-                            j,
-                            best: radius,
-                            nloc: nloc.clone(),
-                            prune: &prune,
-                            cap,
-                            best_x: None,
-                            x: vec![0i64; d],
-                            nodes: 0,
-                            deadline,
-                            aborted: false,
-                        };
-                        let base = stop_level as usize + 1;
-                        e.x[base..d].copy_from_slice(x_suffix);
-                        e.rec(stop_level, *dist);
-                        if let Some(bx) = e.best_x {
-                            if let Ok(mut guard) = results.lock() {
-                                guard.push((idx, e.best, bx));
-                            }
-                            // An aborted item (deadline / node cap) simply contributes
-                            // whatever it found — reduction quality only, same as the
-                            // serial path returning its best-so-far on abort.
+    let Ok(Some(mut budget)) =
+        crate::compute::Workers::acquire(threads.min(items.len()).max(1), || {
+            Instant::now() >= deadline
+        })
+    else {
+        return None;
+    };
+    let nthreads = budget.count();
+    if budget
+        .run(
+            vec![(); nthreads],
+            "ay-bkz-svp",
+            None,
+            |_| {
+                while let Some(idx) =
+                    next_live_svp_item(&next_idx, items.len(), || Instant::now() >= deadline)
+                {
+                    let (x_suffix, dist) = &items[idx];
+                    let Some(local_norms) =
+                        prepare_live_svp(|| Instant::now() >= deadline, || nloc.clone())
+                    else {
+                        break;
+                    };
+                    let Some(x) = prepare_live_svp(|| Instant::now() >= deadline, || vec![0i64; d])
+                    else {
+                        break;
+                    };
+                    let mut e = BlockEnum {
+                        d,
+                        mu,
+                        j,
+                        best: radius,
+                        nloc: local_norms,
+                        prune: &prune,
+                        cap,
+                        best_x: None,
+                        x,
+                        nodes: 0,
+                        deadline,
+                        aborted: false,
+                    };
+                    let base = stop_level as usize + 1;
+                    e.x[base..d].copy_from_slice(x_suffix);
+                    e.rec(stop_level, *dist);
+                    if let Some(bx) = e.best_x {
+                        if let Ok(mut guard) = results.lock() {
+                            guard.push((idx, e.best, bx));
                         }
+                        // An aborted item (deadline / node cap) simply contributes
+                        // whatever it found — reduction quality only, same as the
+                        // serial path returning its best-so-far on abort.
                     }
-                }) {
-                Ok(handle) => handles.push(handle),
-                Err(_) => {
-                    spawn_failed.store(true, Ordering::Release);
-                    break;
                 }
-            }
-        }
-        for handle in handles {
-            // A panicked SVP worker forfeits only its advisory result.
-            let _ = handle.join();
-        }
-    });
+            },
+            |failure| {
+                let _ = failure;
+                if matches!(failure, crate::compute::Failure::Spawn) {
+                    spawn_failed.store(true, Ordering::Release);
+                };
+            },
+        )
+        .is_err()
+    {
+        return None;
+    }
     if spawn_failed.load(Ordering::Acquire) {
         // Spawn failure is a resource-exhaustion signal; decline the
         // (advisory) improvement outright rather than trust a degraded run.
@@ -5211,6 +5305,8 @@ fn reformulate_kernel_inner(
         return None;
     }
     let deadline = Instant::now() + std::time::Duration::from_secs(KERNEL_REFORM_SECS);
+    let _compute =
+        ay_sys::compute_budget::ComputeScope::enter_until(|| Instant::now() >= deadline).ok()??;
     let nc = model.num_cols();
     let nr = model.num_rows();
     if nc == 0 || nr == 0 {
@@ -5895,6 +5991,63 @@ mod tests {
     }
 
     #[test]
+    fn svp_deadline_stops_frontier_preparation_without_stopping_on_item_caps() {
+        let next = AtomicUsize::new(0);
+        let expired = std::cell::Cell::new(false);
+        let preparations = std::cell::Cell::new(0);
+        let first = next_live_svp_item(&next, 100, || expired.get()).expect("first item");
+        assert_eq!(first, 0);
+        assert!(prepare_live_svp(
+            || expired.get(),
+            || {
+                preparations.set(preparations.get() + 1);
+                expired.set(true); // deterministic expiry during indivisible clone
+                vec![1u64; 4]
+            }
+        )
+        .is_none());
+        assert!(prepare_live_svp(
+            || expired.get(),
+            || {
+                preparations.set(preparations.get() + 1);
+                vec![0u64; 4]
+            }
+        )
+        .is_none());
+        assert!(next_live_svp_item(&next, 100, || expired.get()).is_none());
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            1,
+            "remaining frontier was not claimed"
+        );
+        assert_eq!(preparations.get(), 1, "no post-deadline clone/allocation");
+
+        // An item-local cap may abort that item, but is not deadline expiry.
+        let next = AtomicUsize::new(0);
+        let mut visited = 0;
+        while next_live_svp_item(&next, 3, || false).is_some() {
+            let mut item = BlockEnum {
+                d: 1,
+                mu: &[vec![0.0]],
+                j: 0,
+                best: 1.0,
+                nloc: vec![1.0],
+                prune: &[1.0],
+                cap: 0,
+                best_x: None,
+                x: vec![0],
+                nodes: 0,
+                deadline: Instant::now() + std::time::Duration::from_secs(10),
+                aborted: false,
+            };
+            item.rec(0, 0.0);
+            assert!(item.aborted);
+            visited += 1;
+        }
+        assert_eq!(visited, 3, "item caps preserve subsequent frontier work");
+    }
+
+    #[test]
     fn parallel_combiner_prefers_witness_then_abort_then_empty() {
         let witness = vec![1, -2, 3];
         assert_eq!(
@@ -5908,13 +6061,19 @@ mod tests {
     #[test]
     fn scoped_worker_panic_is_joined_as_an_abort() {
         let aborted = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            let handle = std::thread::Builder::new()
-                .name("ay-lattice-panic-test".to_owned())
-                .spawn_scoped(scope, || panic!("injected lattice worker panic"))
-                .expect("test worker must spawn");
-            join_lattice_worker(handle, &aborted);
-        });
+        let mut workers = crate::compute::Workers::acquire(1, || false)
+            .expect("budget")
+            .expect("caller");
+        let run = workers
+            .run(
+                vec![()],
+                "ay-lattice-panic-test",
+                None,
+                |()| panic!("injected lattice worker panic"),
+                |_| aborted.store(true, Ordering::Release),
+            )
+            .expect("run");
+        assert_eq!(run.panics, 1);
         assert!(aborted.load(Ordering::Acquire));
     }
 
@@ -6426,6 +6585,59 @@ mod tests {
     }
 
     #[test]
+    fn configured_proof_preserves_absolute_deadline_and_exact_witness() {
+        let cases = [
+            (vec![vec![1, 1, 1, 1], vec![0, 1, 2, 3]], vec![2, 6], 1),
+            (vec![vec![1, 1, 0, 0], vec![0, 0, 1, 1]], vec![1, 1], 0),
+        ];
+        for (a, b, optimum) in cases {
+            let model = market_split(&a, &b);
+            let absolute_end = deadline();
+            LAST_BUILD_DEADLINE.with(|observed| observed.set(None));
+            let result = try_prove_configured(&model, absolute_end, LatticeSchedule::Threads(1));
+            assert_eq!(
+                LAST_BUILD_DEADLINE.with(std::cell::Cell::get),
+                Some(absolute_end),
+                "the real engine must receive the caller's unchanged absolute deadline"
+            );
+            match result {
+                Some(Outcome::Optimal {
+                    value,
+                    model_values,
+                    ..
+                }) => {
+                    assert_eq!(value, BigRational::from_integer(BigInt::from(optimum)));
+                    assert!(model.check_point(&model_values).is_ok());
+                }
+                other => panic!("expected Optimal {optimum}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn configured_proof_refuses_expired_deadline_before_engine_preparation() {
+        let model = market_split(&[vec![1, 1, 1, 1], vec![0, 1, 2, 3]], &[2, 6]);
+        let expired = Instant::now();
+        LAST_BUILD_DEADLINE.with(|observed| observed.set(None));
+        assert!(replay_ledger::take().is_empty());
+        assert!(try_prove_configured(&model, expired, LatticeSchedule::Threads(1)).is_none());
+        assert_eq!(
+            LAST_BUILD_DEADLINE.with(std::cell::Cell::get),
+            None,
+            "an expired caller must not construct the lattice engine"
+        );
+        assert!(
+            replay_ledger::take().is_empty(),
+            "a decline files no proof claim"
+        );
+
+        LAST_BUILD_DEADLINE.with(|observed| observed.set(None));
+        assert!(try_prove_configured(&model, deadline(), LatticeSchedule::Disabled).is_none());
+        assert_eq!(LAST_BUILD_DEADLINE.with(std::cell::Cell::get), None);
+        assert!(replay_ledger::take().is_empty());
+    }
+
+    #[test]
     fn optimum_one_when_zero_face_is_empty() {
         // Row0: Σx = 2 (exactly two ones); Row1: 0·x0+1·x1+2·x2+3·x3 = 6.
         // No two-subset reaches 6 (max 5) ⟹ objective-0 face EMPTY. But b−e_1
@@ -6784,6 +6996,42 @@ mod tests {
     /// `b−e_0` are both empty here; only `b−e_1` carries a 0/1 point) is
     /// found by both paths and both produce a `check_point`-verified
     /// Optimal 1.
+    #[test]
+    fn held_bank_spares_preserve_checked_face_witness() {
+        if !ay_test_support::isolated_test::run_alone(
+            module_path!(),
+            "held_bank_spares_preserve_checked_face_witness",
+        )
+        .expect("fresh process")
+        {
+            return;
+        }
+        let caller = ay_sys::compute_budget::ComputeScope::enter().expect("actual caller");
+        let mut held = Vec::new();
+        while let Some(extra) = caller.try_extra().expect("actual spare") {
+            held.push(extra);
+        }
+        let m = market_split(&[vec![1, 1, 1, 1], vec![0, 1, 2, 3]], &[2, 6]);
+        let ms = detect(&m).expect("market split");
+        let eng = Engine::build(&ms, deadline(), false, 8, None).expect("engine");
+        match eng.prove(&m, &ms) {
+            Some(Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            }) => {
+                assert_eq!(value, BigRational::from_integer(BigInt::from(1)));
+                m.check_point(&model_values)
+                    .expect("exact original-model witness");
+            }
+            other => panic!("caller-only face hunt lost its witness: {other:?}"),
+        }
+        assert!(caller
+            .try_extra()
+            .expect("original spares still held")
+            .is_none());
+    }
+
     #[test]
     fn concurrent_face_hunt_matches_sequential_ladder() {
         let a = vec![vec![1, 1, 1, 1], vec![0, 1, 2, 3]];
@@ -7417,6 +7665,7 @@ mod tests {
             up_f: bp.up_f.clone(),
             bound_absmax: bp.bound_absmax,
             eps_coeff: bp.eps_coeff,
+            probe_token: bp.probe_token,
         }
     }
 
@@ -7821,7 +8070,7 @@ mod tests {
                     continue;
                 };
                 eng.box_prune = Some(clone_box_prune(&tables));
-                box_prune_probe_arm();
+                box_prune_probe_arm(&mut eng);
                 let pruned = eng.enumerate_serial(&xd);
                 let fires = box_prune_probe_take();
                 eng.box_prune = None;
@@ -7918,7 +8167,7 @@ mod tests {
                     continue;
                 };
                 eng.box_prune = Some(clone_box_prune(&tables));
-                box_prune_probe_arm();
+                box_prune_probe_arm(&mut eng);
                 let pruned = eng.enumerate_serial(&xd);
                 let fires = box_prune_probe_take();
                 eng.box_prune = None;
@@ -7977,6 +8226,7 @@ mod tests {
                 continue;
             };
             eng.box_prune = Some(clone_box_prune(&tables));
+            let probe = box_prune_probe_arm(&mut eng);
             let half: Vec<i64> = ms.a.iter().map(|row| row.iter().sum::<i64>() / 2).collect();
             let targets: Vec<Vec<i64>> = (-2i64..=2)
                 .map(|s| half.iter().map(|&v| v + s).collect())
@@ -8002,7 +8252,7 @@ mod tests {
                         continue;
                     }
                     items_total += items.len();
-                    box_prune_probe_arm();
+                    box_prune_probe_rearm(probe);
                     let mut witness = None;
                     let mut aborted = false;
                     for item in &items {
@@ -8256,7 +8506,7 @@ mod tests {
                         continue;
                     };
                     eng.box_prune = Some(clone_box_prune(&tables));
-                    box_prune_probe_arm();
+                    box_prune_probe_arm(&mut eng);
                     let r = eng.enumerate_serial(&xd);
                     let fires = box_prune_probe_take();
                     eng.box_prune = None;
@@ -8326,7 +8576,7 @@ mod tests {
                 "planted point is not on the coset lattice (case {case})"
             );
             maxdim = maxdim.max(eng.dim);
-            box_prune_probe_arm();
+            box_prune_probe_arm(&mut eng);
             let ser = eng.enumerate_serial(&xd);
             fires += box_prune_probe_take().len();
             let par = eng.enumerate_parallel(&xd);
@@ -8504,7 +8754,7 @@ mod tests {
                     over_2p53 += 1;
                 }
                 eng.box_prune = Some(clone_box_prune(&tables));
-                box_prune_probe_arm();
+                box_prune_probe_arm(&mut eng);
                 let pruned = eng.enumerate_serial(&xd);
                 fires += box_prune_probe_take().len();
                 eng.box_prune = None;

@@ -9,6 +9,7 @@
 //   - Graceful RUP failure handling for inprocessing clauses (#7929)
 
 mod convert;
+mod counted;
 #[cfg(test)]
 mod tests;
 
@@ -57,19 +58,7 @@ pub(crate) struct ForwardChecker {
 
 impl ForwardChecker {
     pub(crate) fn new(num_vars: usize) -> Self {
-        Self {
-            // check_rat=false: ForwardChecker is DRUP-only (no RAT support).
-            inner: ay_drat_check::checker::DratChecker::new(num_vars, false),
-            #[cfg(debug_assertions)]
-            scope_stack: Vec::new(),
-            derived_count: 0,
-            sample_period: 0,
-            rup_failures: 0,
-            #[cfg(test)]
-            sampled_checks: 0,
-            #[cfg(test)]
-            sampled_skips: 0,
-        }
+        Self::new_sampled(num_vars, 0)
     }
 
     /// Create a sampled forward checker (#5625).
@@ -78,8 +67,16 @@ impl ForwardChecker {
     /// verification. Non-sampled clauses are added to the checker DB as
     /// trusted (no BCP cost) to maintain state consistency.
     pub(crate) fn new_sampled(num_vars: usize, sample_period: u64) -> Self {
+        // DRUP-only: the ordinary and admitted paths share every default.
+        Self::from_inner(
+            ay_drat_check::checker::DratChecker::new(num_vars, false),
+            sample_period,
+        )
+    }
+
+    fn from_inner(inner: ay_drat_check::checker::DratChecker, sample_period: u64) -> Self {
         Self {
-            inner: ay_drat_check::checker::DratChecker::new(num_vars, false),
+            inner,
             #[cfg(debug_assertions)]
             scope_stack: Vec::new(),
             derived_count: 0,

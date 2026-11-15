@@ -316,8 +316,7 @@ fn main() {
     // same nonzero range as no flag at all (41..79 on both sides), while
     // `--no-tall-lu` -- a REAL carrier, on this same harness and binary --
     // drives it to 0 in 3 reps of 3. The echo must not claim control it does
-    // not have, and `tests/knob_census.rs::every_harness_declared_flag_is_
-    // dispositioned` now refuses any successor flag that is not written down.
+    // not have.
     let lu = flags.has("lu");
     eprintln!(
         "=== lu={} timeout={secs}s mode={mode} ===",

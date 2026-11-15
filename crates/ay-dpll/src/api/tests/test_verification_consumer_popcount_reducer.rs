@@ -2,7 +2,10 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use crate::api::{Logic, SolveResult, Solver, Sort, Term, UnknownReason};
+use crate::api::{
+    re_check_bundle_strict, Logic, ProofAcceptanceError, ProofAcceptanceMode, SolveResult, Solver,
+    Sort, StrictProofVerdict, Term,
+};
 use std::time::Duration;
 
 fn count8_log_body(solver: &mut Solver, n: Term) -> Term {
@@ -247,29 +250,69 @@ fn test_verification_consumer_count8_transparent_logic_fn_vc_must_not_be_wrong_s
     }
 }
 
-#[test]
-fn test_verification_consumer_count8_strict_wire_mode_fails_closed_on_native_only_proof() {
-    let mut solver = verification_consumer_count8_vc_solver();
-    solver
-        .try_set_option(":check-proofs-strict", "true")
-        .expect("enable strict Alethe proof mode");
+fn assert_strict_native_popcount_bundle(solver: &Solver) {
+    assert!(solver.executor.has_strict_native_bv_lia_bundle_state());
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("exact-source native popcount bundle");
+    let checked = re_check_bundle_strict(&bundle).expect("independent bundle replay");
+    assert!(checked.quality.is_complete());
+    assert!(!checked.assume_terms.is_empty());
+    // The exact source keeps every root, while canonical proof construction
+    // drops true roots and duplicates after transparent-definition adoption.
+    assert!(checked
+        .assume_terms
+        .iter()
+        .all(|root| bundle.obligation_assertions.contains(root)));
 
-    assert_eq!(solver.check_sat(), SolveResult::Unknown);
-    assert_eq!(solver.unknown_reason(), Some(UnknownReason::ProofTrusted));
-    assert!(
-        solver.last_proof().is_none(),
-        "BvLiaTautology is a known Alethe wire hole and must not be exported in strict mode"
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("native popcount artifact");
+    assert!(matches!(
+        &artifact.strict_verdict,
+        StrictProofVerdict::Verified(quality) if quality.is_complete()
+    ));
+    assert_eq!(artifact.alethe.matches(":rule hole").count(), 1);
+    assert!(!artifact.alethe.contains(":rule trust"));
+    assert!(!artifact.alethe.contains(":rule bv_lia_tautology"));
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(())
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::RestrictedRuleSubset),
+        Err(ProofAcceptanceError::NotRestrictedRuleSubset)
     );
 }
 
 #[test]
-fn test_verification_consumer_count8_internal_origin_cannot_borrow_authored_recovery() {
+fn test_verification_consumer_count8_strict_native_bundle_retains_honest_wire_hole() {
     let mut solver = verification_consumer_count8_vc_solver();
-    assert_eq!(solver.check_sat_internal_query(), SolveResult::Unknown);
+    solver.set_produce_proofs(true);
+    solver
+        .try_set_option(":check-proofs-strict", "true")
+        .expect("enable strict native proof mode");
+
+    // Exact source authentication and independent native bundle replay now
+    // certify this VC even though its Alethe rendering remains unsupported.
+    assert_eq!(solver.check_sat(), SolveResult::unsat());
+    assert_strict_native_popcount_bundle(&solver);
+}
+
+#[test]
+fn test_verification_consumer_count8_internal_origin_uses_independent_native_bundle() {
+    let mut solver = verification_consumer_count8_vc_solver();
+    solver.set_produce_proofs(true);
+    solver
+        .try_set_option(":check-proofs-strict", "true")
+        .expect("enable strict native proof mode");
+
+    assert_eq!(solver.check_sat_internal_query(), SolveResult::unsat());
     assert!(
-        solver.executor.retained_internal_proof_for_test().is_none(),
-        "a generic/internal query cannot borrow the authored-plain recovery seam"
+        !solver.executor.last_check_saw_authored_query_authority(),
+        "the separate native theorem must not manufacture an authored-query permit"
     );
+    assert_strict_native_popcount_bundle(&solver);
 }
 
 // --- Adversarial soundness guards for the UF-completion SAT path

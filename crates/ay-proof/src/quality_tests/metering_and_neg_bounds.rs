@@ -192,6 +192,7 @@ fn the_metering_still_refuses_an_oversized_and_neg_proof() {
         work: 20_000,
         bytes: 0,
         unfolded_work: 20_000,
+        fp_assignments: 0,
         order_assignments: 0,
     });
     assert!(

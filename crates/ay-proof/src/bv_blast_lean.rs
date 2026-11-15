@@ -41,32 +41,36 @@ use crate::bv_blast_export::{BitLemmaKind, BvBlastProof, ClauseProvenance, Lit};
 use std::collections::BTreeMap;
 
 /// Evaluate a gate over concrete input bits. Mirrors `bv_blast_export::gate_eval`
-/// exactly; used to compute the inhabitation witness (`wα`).
-fn eval_gate(kind: BitLemmaKind, ins: &[bool]) -> bool {
-    match kind {
-        BitLemmaKind::And2 => ins[0] && ins[1],
-        BitLemmaKind::Or2 => ins[0] || ins[1],
-        BitLemmaKind::Xor2 => ins[0] ^ ins[1],
-        BitLemmaKind::Xor3 => ins[0] ^ ins[1] ^ ins[2],
-        BitLemmaKind::FullAdderCarry => (ins[0] && ins[1]) || (ins[2] && (ins[0] ^ ins[1])),
-        BitLemmaKind::Not => !ins[0],
-        BitLemmaKind::ConstTrue => true,
-        BitLemmaKind::ConstFalse => false,
-        BitLemmaKind::XnorEq => !(ins[0] ^ ins[1]),
-    }
+/// exactly; used to compute the inhabitation witness (`wα`). Returns `None` only
+/// on an arity mismatch (`ins.len() != kind.arity()`), as `gate_eval` does.
+fn eval_gate(kind: BitLemmaKind, ins: &[bool]) -> Option<bool> {
+    Some(match (kind, ins) {
+        (BitLemmaKind::And2, &[a, b]) => a && b,
+        (BitLemmaKind::Or2, &[a, b]) => a || b,
+        (BitLemmaKind::Xor2, &[a, b]) => a ^ b,
+        (BitLemmaKind::Xor3, &[a, b, c]) => a ^ b ^ c,
+        (BitLemmaKind::FullAdderCarry, &[a, b, c]) => (a && b) || (c && (a ^ b)),
+        (BitLemmaKind::Not, &[a]) => !a,
+        (BitLemmaKind::ConstTrue, &[]) => true,
+        (BitLemmaKind::ConstFalse, &[]) => false,
+        (BitLemmaKind::XnorEq, &[a, b]) => !(a ^ b),
+        _ => return None,
+    })
 }
 
 /// Firewall atom for a 0-based bit-blast variable id (1-based, so literals can be
 /// signed without colliding with `0`).
 fn atom(var: u32) -> i64 {
-    i64::from(var) + 1
+    // `var <= u32::MAX`, so the sum is at most 2^32 and never saturates.
+    i64::from(var).saturating_add(1)
 }
 
 /// Render a literal as a signed firewall atom.
 fn lit_to_int(l: Lit) -> i64 {
     let a = atom(l.var);
     if l.neg {
-        -a
+        // `a` is in `1..=2^32`, so the negation never saturates.
+        a.saturating_neg()
     } else {
         a
     }
@@ -90,25 +94,29 @@ fn av(prefix: &str, var: u32) -> String {
 
 /// The `gateEval` expression for a gate kind over its input variables, as a Lean
 /// `Bool` term (each input rendered as `<prefix><atom>`). Mirrors
-/// `bv_blast_export::gate_eval` exactly.
-fn gate_eval_lean(kind: BitLemmaKind, ins: &[u32], prefix: &str) -> String {
-    let a = |i: usize| av(prefix, ins[i]);
-    match kind {
-        BitLemmaKind::And2 => format!("({} && {})", a(0), a(1)),
-        BitLemmaKind::Or2 => format!("({} || {})", a(0), a(1)),
-        BitLemmaKind::Xor2 => format!("(Bool.xor {} {})", a(0), a(1)),
-        BitLemmaKind::Xor3 => format!("(Bool.xor (Bool.xor {} {}) {})", a(0), a(1), a(2)),
-        BitLemmaKind::FullAdderCarry => format!(
+/// `bv_blast_export::gate_eval` exactly, including its `None` on an arity
+/// mismatch (`ins.len() != kind.arity()`).
+fn gate_eval_lean(kind: BitLemmaKind, ins: &[u32], prefix: &str) -> Option<String> {
+    let a = |v: u32| av(prefix, v);
+    Some(match (kind, ins) {
+        (BitLemmaKind::And2, &[x, y]) => format!("({} && {})", a(x), a(y)),
+        (BitLemmaKind::Or2, &[x, y]) => format!("({} || {})", a(x), a(y)),
+        (BitLemmaKind::Xor2, &[x, y]) => format!("(Bool.xor {} {})", a(x), a(y)),
+        (BitLemmaKind::Xor3, &[x, y, z]) => {
+            format!("(Bool.xor (Bool.xor {} {}) {})", a(x), a(y), a(z))
+        }
+        (BitLemmaKind::FullAdderCarry, &[x, y, z]) => format!(
             "(({a0} && {a1}) || ({a2} && Bool.xor {a0} {a1}))",
-            a0 = a(0),
-            a1 = a(1),
-            a2 = a(2)
+            a0 = a(x),
+            a1 = a(y),
+            a2 = a(z)
         ),
-        BitLemmaKind::Not => format!("(!{})", a(0)),
-        BitLemmaKind::ConstTrue => "true".to_string(),
-        BitLemmaKind::ConstFalse => "false".to_string(),
-        BitLemmaKind::XnorEq => format!("(!(Bool.xor {} {}))", a(0), a(1)),
-    }
+        (BitLemmaKind::Not, &[x]) => format!("(!{})", a(x)),
+        (BitLemmaKind::ConstTrue, &[]) => "true".to_string(),
+        (BitLemmaKind::ConstFalse, &[]) => "false".to_string(),
+        (BitLemmaKind::XnorEq, &[x, y]) => format!("(!(Bool.xor {} {}))", a(x), a(y)),
+        _ => return None,
+    })
 }
 
 /// Render a [`BvBlastProof`] as a self-contained verified-firewall Lean module.
@@ -139,12 +147,19 @@ pub fn render_bv_blast_proof_lean(proof: &BvBlastProof, module: &str) -> String 
     out.push_str("structure Val where\n");
     out.push_str("  α : Nat → Bool\n");
     for lem in &proof.bit_lemmas {
-        out.push_str(&format!(
-            "  respects_{} : α {} = {}\n",
-            lem.id,
-            atom(lem.out),
-            gate_eval_lean(lem.kind, &lem.ins, "α ")
-        ));
+        match gate_eval_lean(lem.kind, &lem.ins, "α ") {
+            Some(eval) => out.push_str(&format!(
+                "  respects_{} : α {} = {}\n",
+                lem.id,
+                atom(lem.out),
+                eval
+            )),
+            // A gate whose input count does not match its kind has no gate
+            // semantics. Its respect is `False`, so `Val` is uninhabited and
+            // `val_inhabited`'s `decide` fails: the file fails to kernel-check
+            // rather than asserting a relation over inputs that are not there.
+            None => out.push_str(&format!("  respects_{} : False\n", lem.id)),
+        }
     }
     out.push('\n');
 
@@ -172,7 +187,11 @@ pub fn render_bv_blast_proof_lean(proof: &BvBlastProof, module: &str) -> String 
                 .iter()
                 .map(|&i| witness.get(&i).copied().unwrap_or(false))
                 .collect();
-            let v = eval_gate(lem.kind, &ins);
+            // An arity-mismatched gate constrains nothing here; its `False`
+            // respect already makes the file fail closed.
+            let Some(v) = eval_gate(lem.kind, &ins) else {
+                continue;
+            };
             if witness.insert(lem.out, v) != Some(v) {
                 changed = true;
             }
@@ -200,7 +219,7 @@ pub fn render_bv_blast_proof_lean(proof: &BvBlastProof, module: &str) -> String 
     let mut original: Vec<String> = Vec::new();
     let mut lemmas: Vec<String> = Vec::new();
     for cl in &proof.clauses {
-        let cid = i64::from(cl.id) + 1;
+        let cid = i64::from(cl.id).saturating_add(1);
         let entry = format!("({}, {})", cid, clause_to_lean(&cl.lits));
         match cl.provenance {
             ClauseProvenance::Disequality => original.push(entry),
@@ -222,12 +241,13 @@ pub fn render_bv_blast_proof_lean(proof: &BvBlastProof, module: &str) -> String 
     out.push_str("def proof : List (Cid × Clause × List Int) := [\n");
     let nsteps = proof.refutation.steps.len();
     for (i, step) in proof.refutation.steps.iter().enumerate() {
-        let cid = i64::from(step.id) + 1;
+        let cid = i64::from(step.id).saturating_add(1);
         let clause = clause_to_lean(&step.clause);
         let hints: Vec<String> = step
             .premises
             .iter()
-            .map(|p| (i64::from(*p) + 1).to_string())
+            // `u32` ids: `+ 1` is at most 2^32 and never saturates.
+            .map(|p| i64::from(*p).saturating_add(1).to_string())
             .collect();
         let comma = if i + 1 < nsteps { "," } else { "" };
         out.push_str(&format!(
@@ -719,5 +739,74 @@ mod fail_closed {
             "witness assigns α1 = false (ConstFalse)"
         );
         assert!(lean.contains("theorem val_inhabited : Nonempty Val"));
+    }
+}
+
+#[cfg(test)]
+mod arity_fail_closed {
+    use super::*;
+    use crate::bv_blast_export::BvBlastValidateError;
+
+    /// Regression: an `And2` gate carrying ONE input used to panic the public
+    /// renderer (`ins[1]` out of bounds). Native validation rejects it; the
+    /// renderer must instead emit a file that fails to kernel-check, by giving
+    /// that gate an uninhabitable `False` respect.
+    #[test]
+    fn short_arity_gate_renders_a_false_respect() -> Result<(), Box<dyn std::error::Error>> {
+        let mut proof = tests::accepted_and1_proof();
+        let Some(lemma) = proof
+            .bit_lemmas
+            .iter_mut()
+            .find(|l| l.kind == BitLemmaKind::And2)
+        else {
+            return Err("the accepted AND fixture must carry an And2 gate".into());
+        };
+        lemma.ins.truncate(1);
+        let short_id = lemma.id;
+        if !matches!(
+            proof.validate(),
+            Err(BvBlastValidateError::BadLemmaArity { .. })
+        ) {
+            return Err("native validation must reject the short-arity gate".into());
+        }
+        let lean = render_bv_blast_proof_lean(&proof, "ShortArity");
+        let expected = format!("respects_{short_id} : False\n");
+        if !lean.contains(&expected) {
+            return Err(format!("missing fail-closed respect {expected:?}").into());
+        }
+        if !lean.contains("theorem val_inhabited : Nonempty Val") {
+            return Err("the inhabitation witness must still be emitted".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eval_gate_refuses_every_arity_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let kinds = [
+            BitLemmaKind::And2,
+            BitLemmaKind::Or2,
+            BitLemmaKind::Xor2,
+            BitLemmaKind::Xor3,
+            BitLemmaKind::FullAdderCarry,
+            BitLemmaKind::Not,
+            BitLemmaKind::ConstTrue,
+            BitLemmaKind::ConstFalse,
+            BitLemmaKind::XnorEq,
+        ];
+        let bits = [true, false, true, false];
+        for kind in kinds {
+            for len in 0..=bits.len() {
+                let ins = bits.get(..len).ok_or("prefix within the fixture")?;
+                let vars: Vec<u32> = (0..u32::try_from(len)?).collect();
+                let matches = len == kind.arity();
+                if eval_gate(kind, ins).is_some() != matches {
+                    return Err(format!("eval_gate({kind:?}, len {len}) arity verdict").into());
+                }
+                if gate_eval_lean(kind, &vars, "α ").is_some() != matches {
+                    return Err(format!("gate_eval_lean({kind:?}, len {len}) arity verdict").into());
+                }
+            }
+        }
+        Ok(())
     }
 }

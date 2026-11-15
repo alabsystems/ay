@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% The sibling of `cnf_variable_space_too_large`, reached through the DECLARED
+% count instead of a literal, and deliberately WITHOUT the
+% `lenient-header-counts` marker: this file's header is entirely consistent with
+% its contents (one clause, and the one variable it uses is well below the
+% declared 4294967300), so the strict header check has nothing to complain
+% about and waves it straight through to the variable-name table.
+%
+% That is why the dense bound has to apply to the declared count too and not
+% only to the literals: `src/lib.rs` builds `x1..xN` from this number one
+% `format!` at a time, so the header alone was enough to make the run allocate
+% for four billion variables. Before the bound this input did not terminate.
+f 1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

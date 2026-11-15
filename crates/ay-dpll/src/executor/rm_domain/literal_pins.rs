@@ -24,17 +24,17 @@ use super::{is_rm_sort, rm_literal_mode, RM_COVERAGE_MAX_TERMS};
 /// all-literal RM atom is deliberately left alone — see
 /// [`RmLiteralAtoms`] for the measurements that license that.
 ///
-/// SORT-GUARDED. [`rm_literal_mode`] recognizes a term by NAME, and the ten
-/// mode spellings are frontend-sealed but not unforgeable through a raw
-/// `TermStore`. Requiring the RoundingMode sort as well keeps this off any
-/// equality that merely borrows a mode's name at another sort. Mirrors
+/// Both the equality head and its literals retain their typed builtin
+/// identities. Free variables and registered user heads grant no pin. Mirrors
 /// `unsat_cert/rm_domain_expansion.rs::rm_literal_equality_value`.
 pub(super) fn rm_literal_disequality_operands(
     terms: &TermStore,
     symbol: &Symbol,
     args: &[TermId],
 ) -> Option<(TermId, TermId)> {
-    if symbol.name() != "=" || args.len() != 2 {
+    if !matches!(symbol, Symbol::Named(name) if name == "=" && !terms.is_declared_function(name))
+        || args.len() != 2
+    {
         return None;
     }
     if !is_rm_sort(terms.sort(args[0])) || !is_rm_sort(terms.sort(args[1])) {

@@ -1,0 +1,4 @@
+c ONE-KNOB CONTROL: byte-identical to split.wcnf except `-01` -> `-1`.
+h 1 0
+h -1 0
+5 2 0

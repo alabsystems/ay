@@ -195,12 +195,9 @@ impl TermStore {
 
         // Distribute negation over addition: -(a + b) → (-a) + (-b)
         // This enables coefficient collection on the result
-        if let TermData::App(Symbol::Named(name), args) = self.get(arg) {
+        if let TermData::App(Symbol::Named(name), _) = self.get(arg) {
             if name == "+" {
-                let args_clone = args.clone();
-                let negated_args: Vec<TermId> =
-                    args_clone.iter().map(|&a| self.mk_neg(a)).collect();
-                return self.mk_add(negated_args);
+                return self.mk_neg_add_dag(arg);
             }
         }
 
@@ -224,6 +221,45 @@ impl TermStore {
         }
 
         self.intern(TermData::App(Symbol::named("-"), vec![arg]), sort)
+    }
+
+    /// Postorder negation of a shared addition DAG. Each `+` node is rebuilt
+    /// once, in the same left-to-right child order as the former recursive
+    /// constructor; repeated edges reuse its already-interned result. The
+    /// explicit stack also handles a deep raw unary-`+` chain.
+    fn mk_neg_add_dag(&mut self, root: TermId) -> TermId {
+        let mut completed: crate::kani_compat::DetHashMap<TermId, TermId> =
+            crate::kani_compat::det_hash_map_new();
+        let mut pending = vec![(root, false)];
+        while let Some((node, expanded)) = pending.pop() {
+            if completed.contains_key(&node) {
+                continue;
+            }
+            let TermData::App(Symbol::Named(name), args) = self.get(node) else {
+                completed.insert(node, self.mk_neg(node));
+                continue;
+            };
+            if name != "+" {
+                completed.insert(node, self.mk_neg(node));
+                continue;
+            }
+            let children = args.clone();
+            if !expanded {
+                pending.push((node, true));
+                for &child in children.iter().rev() {
+                    if !completed.contains_key(&child) {
+                        pending.push((child, false));
+                    }
+                }
+                continue;
+            }
+            // The expanded frame is popped only after every child frame has
+            // completed, including duplicate/shared edges. Thus all lookups
+            // here and the final root lookup are present in `completed`.
+            let negated_args: Vec<TermId> = children.iter().map(|child| completed[child]).collect();
+            completed.insert(node, self.mk_add(negated_args));
+        }
+        completed[&root]
     }
 
     /// Create addition with constant folding

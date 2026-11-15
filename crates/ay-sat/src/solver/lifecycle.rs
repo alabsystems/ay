@@ -88,9 +88,20 @@ pub(crate) struct VarLifecycle {
 impl VarLifecycle {
     /// Create a lifecycle tracker for `num_vars` variables, all initially Active.
     pub(crate) fn new(num_vars: usize) -> Self {
-        Self {
-            states: vec![VarState::Active; num_vars],
+        match Self::build_admitted(num_vars, &super::construction::Ordinary) {
+            Ok(state) => state,
+            Err(never) => match never {},
         }
+    }
+
+    pub(super) fn build_admitted<A: super::construction::Construction>(
+        num_vars: usize,
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        Ok(Self {
+            states: a.filled(num_vars, VarState::Active)?,
+        })
     }
 
     /// Returns `true` if the variable has been removed by inprocessing.

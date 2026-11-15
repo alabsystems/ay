@@ -13,6 +13,8 @@ use crate::error::{BenchError, Result, WithContext};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod evidence;
+
 // ===================================================================
 // Competition constants
 // ===================================================================
@@ -79,17 +81,15 @@ pub struct ResultItem {
     pub time_sec: Option<f64>,
     /// CPU time in seconds (optional; falls back to wall time)
     pub cpu_time_sec: Option<f64>,
-    /// Exit code (deserialized for schema fidelity; not used in scoring).
-    #[allow(dead_code)] // serde: deserialized from JSON but not read in code
+    /// Observed process exit, when available.
     #[serde(alias = "ay_exit_code")]
     pub exit_code: Option<i32>,
-    /// Correctness flag (deserialized for schema fidelity; not used in scoring).
-    #[allow(dead_code)] // serde: deserialized from JSON but not read in code
+    /// Checked correctness: None means not checked, never checked success.
     pub correct: Option<bool>,
 }
 
 /// Top-level results JSON structure.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct ResultsFile {
     pub items: Option<Vec<ResultItem>>,
     pub benchmarks: Option<Vec<ResultItem>>,
@@ -97,6 +97,73 @@ pub struct ResultsFile {
     pub metrics: Option<serde_json::Value>,
     #[allow(dead_code)] // serde: deserialized from JSON but not read in code
     pub settings: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ResultsFile {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        evidence::deserialize(deserializer)
+    }
+}
+
+pub(crate) fn native_scoring_items(
+    results: &crate::native::NativeResults,
+) -> Result<Vec<ResultItem>> {
+    evidence::native_items(results)
+}
+
+/// Observed correctness accounting, separate from the solved denominator.
+#[derive(Debug, Default, Serialize)]
+pub struct VerificationCounts {
+    pub checked: usize,
+    pub wrong: usize,
+    pub not_checked: usize,
+    pub non_definitive: usize,
+}
+
+fn valid_process(item: &ResultItem) -> bool {
+    match item.exit_code {
+        None | Some(0) => true,
+        Some(10) => item
+            .result
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("sat")),
+        Some(20) => item
+            .result
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("unsat")),
+        _ => false,
+    }
+}
+
+fn definitive_item(item: &ResultItem) -> bool {
+    valid_process(item) && is_definitive(actual_of(item))
+}
+
+fn wrong_item(item: &ResultItem) -> bool {
+    definitive_item(item)
+        && (item.correct == Some(false)
+            || item.expected.as_deref().is_some_and(|expected| {
+                is_definitive(expected) && !verdicts_match(expected, actual_of(item))
+            }))
+}
+
+pub(crate) fn verification_counts(items: &[ResultItem]) -> VerificationCounts {
+    let mut out = VerificationCounts::default();
+    for item in items {
+        if !definitive_item(item) {
+            out.non_definitive += 1;
+        } else if wrong_item(item) {
+            out.wrong += 1;
+        } else if item.correct == Some(true) || item.expected.as_deref().is_some_and(is_definitive)
+        {
+            out.checked += 1;
+        } else {
+            out.not_checked += 1;
+        }
+    }
+    out
 }
 
 impl ResultsFile {
@@ -158,6 +225,7 @@ fn verdicts_match(expected: &str, actual: &str) -> bool {
 
 #[derive(Debug, Serialize)]
 pub struct SatScore {
+    pub verification: VerificationCounts,
     pub par2_total: f64,
     pub par2_avg: f64,
     pub solved: u32,
@@ -189,38 +257,35 @@ pub fn score_sat(items: &[ResultItem], timeout_sec: f64) -> SatScore {
 
     for item in items {
         let actual = actual_of(item);
-        let definitive = is_definitive(actual);
-        let is_wrong = definitive
-            && item
-                .expected
-                .as_deref()
-                .is_some_and(|exp| !verdicts_match(exp, actual));
+        let definitive = definitive_item(item);
+        let is_wrong = wrong_item(item);
 
         if is_wrong {
-            wrong += 1;
+            wrong = wrong.saturating_add(1);
             wrong_answers.push(WrongAnswer {
                 name: name_of(item).to_string(),
                 expected: item.expected.clone().unwrap_or_default(),
                 actual: actual.to_string(),
             });
             par2_total += 2.0 * timeout_sec;
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         } else if definitive {
             par2_total += wall_time_of(item);
-            solved += 1;
+            solved = solved.saturating_add(1);
             if is_sat(actual) {
-                solved_sat += 1;
+                solved_sat = solved_sat.saturating_add(1);
             } else {
-                solved_unsat += 1;
+                solved_unsat = solved_unsat.saturating_add(1);
             }
         } else {
             par2_total += 2.0 * timeout_sec;
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         }
     }
 
     let total = items.len() as u32;
     SatScore {
+        verification: verification_counts(items),
         par2_total: round3(par2_total),
         par2_avg: if total > 0 {
             round3(par2_total / total as f64)
@@ -261,6 +326,7 @@ pub fn score_sat(items: &[ResultItem], timeout_sec: f64) -> SatScore {
 
 #[derive(Debug, Serialize)]
 pub struct SmtScore {
+    pub verification: VerificationCounts,
     pub division: String,
     pub errors: u32,
     pub solved: u32,
@@ -286,15 +352,11 @@ pub fn score_smt(items: &[ResultItem], timeout_sec: f64, division: &str) -> SmtS
 
     for item in items {
         let actual = actual_of(item);
-        let definitive = is_definitive(actual);
-        let is_wrong = definitive
-            && item
-                .expected
-                .as_deref()
-                .is_some_and(|exp| !verdicts_match(exp, actual));
+        let definitive = definitive_item(item);
+        let is_wrong = wrong_item(item);
 
         if is_wrong {
-            errors += 1;
+            errors = errors.saturating_add(1);
             wrong_answers.push(WrongAnswer {
                 name: name_of(item).to_string(),
                 expected: item.expected.clone().unwrap_or_default(),
@@ -305,7 +367,7 @@ pub fn score_smt(items: &[ResultItem], timeout_sec: f64, division: &str) -> SmtS
 
         if !definitive {
             if actual.eq_ignore_ascii_case("timeout") {
-                timeout_count += 1;
+                timeout_count = timeout_count.saturating_add(1);
             }
             continue;
         }
@@ -316,17 +378,18 @@ pub fn score_smt(items: &[ResultItem], timeout_sec: f64, division: &str) -> SmtS
             continue;
         }
 
-        solved += 1;
+        solved = solved.saturating_add(1);
         wall_time += wall_time_of(item);
         cpu_time += cpu;
         if is_sat(actual) {
-            solved_sat += 1;
+            solved_sat = solved_sat.saturating_add(1);
         } else {
-            solved_unsat += 1;
+            solved_unsat = solved_unsat.saturating_add(1);
         }
     }
 
     SmtScore {
+        verification: verification_counts(items),
         division: division.to_string(),
         errors,
         solved,
@@ -363,6 +426,7 @@ pub fn compare_smt(a: &SmtScore, b: &SmtScore) -> std::cmp::Ordering {
 
 #[derive(Debug, Serialize)]
 pub struct ChcScore {
+    pub verification: VerificationCounts,
     pub track: String,
     pub solved: u32,
     pub solved_sat: u32,
@@ -386,35 +450,32 @@ pub fn score_chc(items: &[ResultItem], timeout_sec: f64, track: &str) -> ChcScor
 
     for item in items {
         let actual = actual_of(item);
-        let definitive = is_definitive(actual);
-        let is_wrong = definitive
-            && item
-                .expected
-                .as_deref()
-                .is_some_and(|exp| !verdicts_match(exp, actual));
+        let definitive = definitive_item(item);
+        let is_wrong = wrong_item(item);
 
         if is_wrong {
-            wrong += 1;
+            wrong = wrong.saturating_add(1);
             wrong_answers.push(WrongAnswer {
                 name: name_of(item).to_string(),
                 expected: item.expected.clone().unwrap_or_default(),
                 actual: actual.to_string(),
             });
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         } else if definitive {
-            solved += 1;
+            solved = solved.saturating_add(1);
             cpu_time += cpu_time_of(item);
             if is_sat(actual) {
-                solved_sat += 1;
+                solved_sat = solved_sat.saturating_add(1);
             } else {
-                solved_unsat += 1;
+                solved_unsat = solved_unsat.saturating_add(1);
             }
         } else {
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         }
     }
 
     ChcScore {
+        verification: verification_counts(items),
         track: track.to_string(),
         solved,
         solved_sat,
@@ -448,6 +509,7 @@ pub fn compare_chc(a: &ChcScore, b: &ChcScore) -> std::cmp::Ordering {
 
 #[derive(Debug, Serialize)]
 pub struct HwmccScore {
+    pub verification: VerificationCounts,
     pub track: String,
     pub solved: u32,
     pub solved_sat: u32,
@@ -471,35 +533,32 @@ pub fn score_hwmcc(items: &[ResultItem], timeout_sec: f64, track: &str) -> Hwmcc
 
     for item in items {
         let actual = actual_of(item);
-        let definitive = is_definitive(actual);
-        let is_wrong = definitive
-            && item
-                .expected
-                .as_deref()
-                .is_some_and(|exp| !verdicts_match(exp, actual));
+        let definitive = definitive_item(item);
+        let is_wrong = wrong_item(item);
 
         if is_wrong {
-            wrong += 1;
+            wrong = wrong.saturating_add(1);
             wrong_answers.push(WrongAnswer {
                 name: name_of(item).to_string(),
                 expected: item.expected.clone().unwrap_or_default(),
                 actual: actual.to_string(),
             });
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         } else if definitive {
-            solved += 1;
+            solved = solved.saturating_add(1);
             cpu_time += cpu_time_of(item);
             if is_sat(actual) {
-                solved_sat += 1;
+                solved_sat = solved_sat.saturating_add(1);
             } else {
-                solved_unsat += 1;
+                solved_unsat = solved_unsat.saturating_add(1);
             }
         } else {
-            unsolved += 1;
+            unsolved = unsolved.saturating_add(1);
         }
     }
 
     HwmccScore {
+        verification: verification_counts(items),
         track: track.to_string(),
         solved,
         solved_sat,

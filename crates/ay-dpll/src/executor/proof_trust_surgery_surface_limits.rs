@@ -8,17 +8,19 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::TermData;
 use ay_core::{AletheRule, Proof, ProofStep, TermId, TheoryLemmaKind};
-use ay_frontend::command::{
-    Constant as FrontendConstant, Index as FrontendIndex, MatchPattern as FrontendMatchPattern,
-    QualifiedIdentifier as FrontendQualifiedIdentifier, Sort as FrontendSort, Term as FrontendTerm,
-};
-use ay_frontend::SExpr;
+use ay_frontend::command::Term as FrontendTerm;
 
 pub(in crate::executor) use super::source_work::{ProofSourcePass, ProofSourceWorkEnvelope};
 
 #[path = "proof_trust_surgery_surface_payload.rs"]
 mod payload;
-pub(in crate::executor) use payload::render_roots_have_bounded_payload;
+pub(in crate::executor) use payload::{
+    expanded_render_work_bound, render_roots_have_bounded_payload,
+};
+
+#[path = "proof_trust_surgery_surface_limits_nodes.rs"]
+mod nodes;
+use nodes::SurfaceNode;
 
 #[cfg(test)]
 #[path = "proof_trust_surgery_surface_limits_tests.rs"]
@@ -28,6 +30,62 @@ const MAX_SURFACE_NODES: usize = 8_192;
 pub(super) const MAX_SURFACE_DEPTH: usize = 256;
 pub(super) const MAX_REQUIREMENT_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const MAX_AGGREGATE_SOURCE_WORK: usize = 32 * 1024 * 1024;
+/// Node ceiling of a [`SurfaceWorkModel::Traversal`] root: one allocation per
+/// node for each clone a traversal makes, the same ceiling the ground BV
+/// rebuild (`proof_trust_surgery_surface_ground.rs`) puts on its node visits.
+const MAX_TRAVERSAL_NODES: usize = 1 << 20;
+
+/// What a proof-source pass does with each parsed root, which decides what its
+/// work on that root costs.
+///
+/// The two differ by the depth factor, and it is the whole difference: a
+/// recursive collector that renders (or re-elaborates) EVERY subtree pays for
+/// each token once per ancestor, while a pass that clones, pattern-matches or
+/// rebuilds the tree node by node pays for it once. Pricing a traversal as a
+/// per-subtree rendering refused whole proofs for work that never runs:
+/// external-codegen's 90 KB `V8I16MaskExtract` obligation (8,511 nodes, depth 40)
+/// priced 10.2 MB against the 8 MB per-root rendering bound, so the assembly
+/// gate poisoned the proof, while its whole certified proof — assembly, the
+/// strict check and the Alethe render — ran in 0.7 s and 43 MB with that gate
+/// out of the way (measured 2026-09-29). Every per-subtree pass keeps its own
+/// check at its own site, so admitting the root to a traversal authorizes no
+/// per-subtree work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::executor) enum SurfaceWorkModel {
+    /// Renders or re-elaborates every subtree: each node's bytes are charged
+    /// `depth + 1` times, at most [`MAX_SURFACE_NODES`] nodes, and the whole
+    /// root within [`MAX_REQUIREMENT_BYTES`].
+    PerSubtree,
+    /// Visits each node once: each node's bytes are charged once, at most
+    /// [`MAX_TRAVERSAL_NODES`] nodes, and the whole root within
+    /// [`MAX_AGGREGATE_SOURCE_WORK`] — one root may not cost more than the
+    /// query's entire source envelope.
+    Traversal,
+}
+
+impl SurfaceWorkModel {
+    const fn max_nodes(self) -> usize {
+        match self {
+            Self::PerSubtree => MAX_SURFACE_NODES,
+            Self::Traversal => MAX_TRAVERSAL_NODES,
+        }
+    }
+
+    const fn max_root_work(self) -> usize {
+        match self {
+            Self::PerSubtree => MAX_REQUIREMENT_BYTES,
+            Self::Traversal => MAX_AGGREGATE_SOURCE_WORK,
+        }
+    }
+
+    /// How many times a node at `depth` is paid for.
+    const fn renderings(self, depth: usize) -> usize {
+        match self {
+            Self::PerSubtree => depth.saturating_add(1),
+            Self::Traversal => 1,
+        }
+    }
+}
 
 /// Return child arity without cloning the term's child vector.
 pub(in crate::executor) fn term_child_count(
@@ -45,240 +103,106 @@ pub(in crate::executor) fn term_child_count(
     })
 }
 
-fn constant_bytes(constant: &FrontendConstant) -> Option<usize> {
-    Some(match constant {
-        FrontendConstant::True => 4,
-        FrontendConstant::False => 5,
-        FrontendConstant::Numeral(value)
-        | FrontendConstant::Decimal(value)
-        | FrontendConstant::Hexadecimal(value)
-        | FrontendConstant::Binary(value) => value.len(),
-        FrontendConstant::String(value) => value.len().checked_add(2)?,
-        _ => return None,
-    })
+/// Which bound `surface_source_work` tripped, when it tripped one.
+///
+/// #unbounded-population. The estimator answered a bare `None` and the decline
+/// it feeds (`authored-source-root-unbounded`) could not say whether the root
+/// was WIDE, DEEP, of a shape the estimator does not price, or merely heavy in
+/// bytes. Those want different remedies, so the refusal names itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceSourceRefusal {
+    /// More than `MAX_SURFACE_NODES` parsed nodes.
+    Nodes,
+    /// Deeper than `MAX_SURFACE_DEPTH`.
+    Depth,
+    /// A constructor the estimator does not price (or a byte count that
+    /// overflowed, which no real source reaches).
+    Shape,
+    /// The rendering requirement — every node's bytes times its `depth + 1`,
+    /// times four — exceeded `MAX_REQUIREMENT_BYTES`.
+    Bytes,
 }
 
-fn indices_bytes(indices: &[FrontendIndex]) -> Option<usize> {
-    indices.iter().try_fold(0usize, |bytes, index| {
-        bytes.checked_add(index.text().len().saturating_add(1))
-    })
-}
-
-fn qualified_identifier_bytes(identifier: &FrontendQualifiedIdentifier) -> Option<usize> {
-    match identifier {
-        FrontendQualifiedIdentifier::Symbol(name) => Some(name.len()),
-        FrontendQualifiedIdentifier::Indexed(name, indices) => name
-            .len()
-            .checked_add(indices_bytes(indices)?)
-            .and_then(|bytes| bytes.checked_add(4)),
-        _ => None,
+impl SurfaceSourceRefusal {
+    /// The fixed name this refusal carries on the disclosure line.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Nodes => "nodes",
+            Self::Depth => "depth",
+            Self::Shape => "shape",
+            Self::Bytes => "bytes",
+        }
     }
 }
 
 /// Estimate the bounded aggregate work of rendering every surface subtree.
 pub(in crate::executor) fn surface_source_work(root: &FrontendTerm) -> Option<usize> {
-    enum SurfaceNode<'a> {
-        Term(&'a FrontendTerm, usize),
-        Sort(&'a FrontendSort, usize),
-        SExpr(&'a SExpr, usize),
-    }
+    surface_source_work_probe(root).ok()
+}
 
+/// [`surface_source_work`], naming the bound it tripped when it declines.
+pub(in crate::executor) fn surface_source_work_probe(
+    root: &FrontendTerm,
+) -> Result<usize, SurfaceSourceRefusal> {
+    surface_source_work_probe_as(root, SurfaceWorkModel::PerSubtree)
+}
+
+/// The work `model` costs on `root`, naming the bound it tripped when it
+/// declines.
+pub(in crate::executor) fn surface_source_work_probe_as(
+    root: &FrontendTerm,
+    model: SurfaceWorkModel,
+) -> Result<usize, SurfaceSourceRefusal> {
     let mut pending = vec![SurfaceNode::Term(root, 0usize)];
     let mut visited = 0usize;
-    let mut source_bytes = 0usize;
-    let mut max_depth = 0usize;
+    let mut rendered_bytes = 0usize;
     while let Some(node) = pending.pop() {
         visited += 1;
-        let depth = match &node {
-            SurfaceNode::Term(_, depth)
-            | SurfaceNode::Sort(_, depth)
-            | SurfaceNode::SExpr(_, depth) => *depth,
-        };
-        if visited > MAX_SURFACE_NODES || depth > MAX_SURFACE_DEPTH {
-            return None;
+        let depth = node.depth();
+        if visited > model.max_nodes() {
+            return Err(SurfaceSourceRefusal::Nodes);
         }
-        max_depth = max_depth.max(depth);
-        let local_bytes = match node {
-            SurfaceNode::Term(term, depth) => match term {
-                FrontendTerm::Const(constant) => constant_bytes(constant),
-                FrontendTerm::Symbol(symbol) => Some(symbol.len()),
-                FrontendTerm::App(operator, args) | FrontendTerm::IndexedApp(operator, _, args) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(args.len())
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    for child in args {
-                        pending.push(SurfaceNode::Term(child, depth + 1));
-                    }
-                    let head_bytes = match term {
-                        FrontendTerm::IndexedApp(_, indices, _) => indices_bytes(indices)
-                            .and_then(|bytes| operator.len().checked_add(bytes))
-                            .and_then(|bytes| bytes.checked_add(4)),
-                        _ => Some(operator.len()),
-                    };
-                    head_bytes.and_then(|bytes| bytes.checked_add(args.len().saturating_add(2)))
-                }
-                FrontendTerm::QualifiedApp(identifier, sort, args) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(args.len())
-                        .saturating_add(1)
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    for child in args {
-                        pending.push(SurfaceNode::Term(child, depth + 1));
-                    }
-                    pending.push(SurfaceNode::Sort(sort, depth + 1));
-                    qualified_identifier_bytes(identifier)
-                        .and_then(|bytes| bytes.checked_add(args.len().saturating_add(7)))
-                }
-                FrontendTerm::Let(bindings, body) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(bindings.len())
-                        .saturating_add(1)
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    pending.push(SurfaceNode::Term(body, depth + 1));
-                    let mut bytes = 7usize;
-                    for (name, value) in bindings {
-                        pending.push(SurfaceNode::Term(value, depth + 1));
-                        bytes = bytes.checked_add(name.len().saturating_add(3))?;
-                    }
-                    Some(bytes)
-                }
-                FrontendTerm::Forall(bindings, body)
-                | FrontendTerm::Exists(bindings, body)
-                | FrontendTerm::Lambda(bindings, body) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(bindings.len())
-                        .saturating_add(1)
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    pending.push(SurfaceNode::Term(body, depth + 1));
-                    let mut bytes = 10usize;
-                    for (name, sort) in bindings {
-                        pending.push(SurfaceNode::Sort(sort, depth + 1));
-                        bytes = bytes.checked_add(name.len().saturating_add(3))?;
-                    }
-                    Some(bytes)
-                }
-                FrontendTerm::Match(scrutinee, cases) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(cases.len())
-                        .saturating_add(1)
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    pending.push(SurfaceNode::Term(scrutinee, depth + 1));
-                    let mut bytes = 10usize;
-                    for (pattern, body) in cases {
-                        pending.push(SurfaceNode::Term(body, depth + 1));
-                        let pattern_bytes = match pattern {
-                            FrontendMatchPattern::Symbol(name) => Some(name.len()),
-                            FrontendMatchPattern::Constructor(name, variables) => variables
-                                .iter()
-                                .try_fold(name.len().saturating_add(2), |bytes, variable| {
-                                    bytes.checked_add(variable.len().saturating_add(1))
-                                }),
-                            _ => None,
-                        };
-                        bytes = pattern_bytes.and_then(|pattern_bytes| {
-                            bytes.checked_add(pattern_bytes.saturating_add(3))
-                        })?;
-                    }
-                    Some(bytes)
-                }
-                // Collectors strip annotations before rendering, but every
-                // parsed-source snapshot still clones their complete payload.
-                FrontendTerm::Annotated(body, annotations) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(annotations.len())
-                        .saturating_add(1)
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    pending.push(SurfaceNode::Term(body, depth + 1));
-                    let mut bytes = 0usize;
-                    for (name, value) in annotations {
-                        pending.push(SurfaceNode::SExpr(value, depth + 1));
-                        bytes = bytes.checked_add(name.len().saturating_add(1))?;
-                    }
-                    Some(bytes)
-                }
-                _ => None,
-            },
-            SurfaceNode::Sort(sort, depth) => match sort {
-                FrontendSort::Simple(name) => Some(name.len()),
-                FrontendSort::Parameterized(name, parameters) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(parameters.len())
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    for parameter in parameters {
-                        pending.push(SurfaceNode::Sort(parameter, depth + 1));
-                    }
-                    name.len().checked_add(parameters.len().saturating_add(2))
-                }
-                FrontendSort::Indexed(name, indices) => indices_bytes(indices)
-                    .and_then(|bytes| name.len().checked_add(bytes))
-                    .and_then(|bytes| bytes.checked_add(4)),
-                _ => None,
-            },
-            SurfaceNode::SExpr(sexpr, depth) => match sexpr {
-                SExpr::Symbol(value)
-                | SExpr::Keyword(value)
-                | SExpr::Numeral(value)
-                | SExpr::Decimal(value)
-                | SExpr::Hexadecimal(value)
-                | SExpr::Binary(value) => Some(value.len()),
-                SExpr::String(value) => value.len().checked_mul(2).and_then(|n| n.checked_add(2)),
-                SExpr::True => Some(4),
-                SExpr::False => Some(5),
-                SExpr::List(items) => {
-                    if visited
-                        .saturating_add(pending.len())
-                        .saturating_add(items.len())
-                        > MAX_SURFACE_NODES
-                    {
-                        return None;
-                    }
-                    for item in items {
-                        pending.push(SurfaceNode::SExpr(item, depth + 1));
-                    }
-                    Some(items.len().saturating_add(2))
-                }
-                _ => None,
-            },
+        if depth > MAX_SURFACE_DEPTH {
+            return Err(SurfaceSourceRefusal::Depth);
+        }
+        let visit = nodes::Visit {
+            visited,
+            max_nodes: model.max_nodes(),
         };
-        let local_bytes = local_bytes?;
-        let next = source_bytes.checked_add(local_bytes)?;
-        source_bytes = next;
+        let local_bytes = match node {
+            SurfaceNode::Term(term, depth) => {
+                nodes::surface_term_bytes(term, depth, visit, &mut pending)?
+            }
+            SurfaceNode::Sort(sort, depth) => {
+                nodes::surface_sort_bytes(sort, depth, visit, &mut pending)?
+            }
+            SurfaceNode::SExpr(sexpr, depth) => {
+                nodes::surface_sexpr_bytes(sexpr, depth, visit, &mut pending)?
+            }
+        };
+        // Under `PerSubtree`, every token occurs in the rendering of each of
+        // its ancestors and of its own node: `depth + 1` renderings. Charged
+        // per node at its own depth — multiplying ALL bytes by the deepest
+        // branch refused external-codegen's 34 KB `i64` round-trip obligations (depth
+        // 75, 6.5k nodes; 1257/1260) for work they never reach (measured
+        // 2026-09-29). Under `Traversal` it is visited once.
+        let charged = local_bytes
+            .ok_or(SurfaceSourceRefusal::Shape)?
+            .checked_mul(model.renderings(depth))
+            .ok_or(SurfaceSourceRefusal::Shape)?;
+        rendered_bytes = rendered_bytes
+            .checked_add(charged)
+            .ok_or(SurfaceSourceRefusal::Shape)?;
     }
-    // Every token can occur in each formatted ancestor, and both the ordinary
-    // and deep collectors may render it. The factor of four also covers
-    // quoting/parenthesis expansion without constructing those strings.
-    source_bytes
-        .checked_mul(max_depth.saturating_add(1))
-        .and_then(|bytes| bytes.checked_mul(4))
-        .filter(|&bytes| bytes <= MAX_REQUIREMENT_BYTES)
+    // Both the ordinary and deep collectors may render every subtree; the
+    // factor of four also covers quoting/parenthesis expansion without
+    // constructing those strings. A traversal keeps the same factor, so its
+    // charge is exactly what a per-subtree pass would pay at depth zero.
+    rendered_bytes
+        .checked_mul(4)
+        .filter(|&bytes| bytes <= model.max_root_work())
+        .ok_or(SurfaceSourceRefusal::Bytes)
 }
 
 /// Bound recursive collectors before they allocate one rendering per surface
@@ -295,8 +219,16 @@ pub(in crate::executor) fn surface_source_is_bounded(root: &FrontendTerm) -> boo
 pub(in crate::executor) fn surface_pass_work<'a>(
     roots: impl IntoIterator<Item = &'a FrontendTerm>,
 ) -> Option<usize> {
+    surface_pass_work_as(roots, SurfaceWorkModel::PerSubtree)
+}
+
+/// [`surface_pass_work`] for a pass whose work on each root is `model`.
+pub(in crate::executor) fn surface_pass_work_as<'a>(
+    roots: impl IntoIterator<Item = &'a FrontendTerm>,
+    model: SurfaceWorkModel,
+) -> Option<usize> {
     roots.into_iter().try_fold(0usize, |used, root| {
-        used.checked_add(surface_source_work(root)?.max(1))
+        used.checked_add(surface_source_work_probe_as(root, model).ok()?.max(1))
             .filter(|&next| next <= MAX_AGGREGATE_SOURCE_WORK)
     })
 }
@@ -313,7 +245,7 @@ pub(in crate::executor) fn surface_sources_have_bounded_work<'a>(
 /// Validate the complete root-to-leaf depth of every term the recursive
 /// Alethe formatter will visit. Heights are memoized exactly, so a shared DAG
 /// tail first seen below a shallow root cannot hide a deeper later path.
-pub(super) fn render_roots_have_bounded_depth(
+pub(in crate::executor) fn render_roots_have_bounded_depth(
     terms: &ay_core::TermStore,
     roots: &[TermId],
     max_terms: usize,

@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+mod sticky;
+use sticky::StickyUpstream;
+
 /// A thread-safe cancellation token for cooperative engine cancellation.
 ///
 /// Engines check this token periodically in their main loops and return early
@@ -50,6 +53,9 @@ pub struct CancellationToken {
     /// the shared parent still propagates into every lane. Usually empty, so
     /// `is_cancelled` stays a single atomic load in the common case.
     upstream: Vec<Arc<AtomicBool>>,
+    /// Attempt-local observations inherited by every descendant. Ordinary
+    /// tokens have none; only `sticky_child` introduces a new observation.
+    sticky_upstream: Vec<Arc<StickyUpstream>>,
 }
 
 impl Default for CancellationToken {
@@ -64,6 +70,7 @@ impl CancellationToken {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             upstream: Vec::new(),
+            sticky_upstream: Vec::new(),
         }
     }
 
@@ -74,7 +81,8 @@ impl CancellationToken {
     /// this token's own flag or any linked upstream (parent) flag is set.
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.sticky_upstream.iter().any(|link| link.is_cancelled())
+            || self.cancelled.load(Ordering::Relaxed)
             || self
                 .upstream
                 .iter()
@@ -90,11 +98,20 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 
+    /// The flag that [`Self::cancel`] on THIS token sets (not the upstream
+    /// flags it merely observes), for solvers that poll a bare interrupt
+    /// handle (`ay_dpll::Executor::set_interrupt`). Holders must only read it.
+    pub(crate) fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     /// Reset the token to non-cancelled state.
     ///
     /// This is useful for reusing tokens across multiple solving attempts.
     /// Only this token's own flag is reset; a cancelled upstream (parent)
     /// flag cannot be cleared from a child.
+    /// Observations inherited from [`Self::sticky_child`] are never reset;
+    /// start a new attempt from the original parent to obtain a fresh latch.
     pub fn reset(&self) {
         self.cancelled.store(false, Ordering::Relaxed);
     }
@@ -115,6 +132,7 @@ impl CancellationToken {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             upstream,
+            sticky_upstream: self.sticky_upstream.clone(),
         }
     }
 
@@ -126,12 +144,31 @@ impl CancellationToken {
     /// handing the token to a solver. Self-links and duplicate links are
     /// ignored.
     pub fn link_upstream(&mut self, parent: &CancellationToken) {
+        for observation in &parent.sticky_upstream {
+            if !self
+                .sticky_upstream
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, observation))
+            {
+                self.sticky_upstream.push(Arc::clone(observation));
+            }
+        }
         for flag in std::iter::once(&parent.cancelled).chain(parent.upstream.iter()) {
             if !Arc::ptr_eq(&self.cancelled, flag)
                 && !self.upstream.iter().any(|f| Arc::ptr_eq(f, flag))
             {
                 self.upstream.push(Arc::clone(flag));
             }
+        }
+    }
+
+    /// Link an original raw observer without changing either flag or reset.
+    /// Link BEFORE sticky_child so native descendants share its observation.
+    pub(crate) fn link_interrupt_flag(&mut self, flag: &Arc<AtomicBool>) {
+        if !Arc::ptr_eq(&self.cancelled, flag)
+            && !self.upstream.iter().any(|old| Arc::ptr_eq(old, flag))
+        {
+            self.upstream.push(Arc::clone(flag));
         }
     }
 

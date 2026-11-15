@@ -8,8 +8,9 @@
 //   Z3_solver_add_simplifier.
 //
 // A simplifier is a preprocessing transformer attached to a solver so the solver
-// runs it before each check-sat. The registry check freezes the exact 37 names
-// and order reported by Z3 5.0.0. The core semantic check builds a simplifier
+// runs it before each check-sat. Registry checks validate actual enumeration
+// and constructibility without freezing an older release's size or order.
+// The core semantic check builds a simplifier
 // (`solve-eqs` and_then `propagate-values`), ATTACH it to a solver, assert a
 // formula, and confirm the verdict is PRESERVED — it equals both (a) the verdict
 // of a plain solver without the simplifier and (b) what libz3 returns for the
@@ -30,6 +31,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_pass = 0;
@@ -66,46 +68,6 @@ static void err_handler(Z3_context c, unsigned int e) { (void)c; (void)e; }
 #endif
 
 static Z3_context C;
-
-static const char *z3_5_simplifiers[] = {
-    "bit2int",
-    "bit-blast",
-    "bv1-blast",
-    "cheap-fourier-motzkin",
-    "elim-term-ite",
-    "max-bv-sharing",
-    "pull-nested-quantifiers",
-    "push-app-ite-conservative",
-    "push-app-ite",
-    "ng-push-app-ite-conservative",
-    "ng-push-app-ite",
-    "randomizer",
-    "refine-injectivity",
-    "simplify",
-    "qe-light",
-    "card2bv",
-    "factor",
-    "propagate-ineqs",
-    "propagate-bv-bounds",
-    "bv-divrem-bounds",
-    "bv-slice",
-    "bvarray2uf",
-    "blast-term-ite",
-    "cofactor-term-ite",
-    "demodulator",
-    "der",
-    "distribute-forall",
-    "dom-simplify",
-    "elim-unconstrained",
-    "elim-predicates",
-    "fold-unfold",
-    "injectivity",
-    "propagate-values",
-    "reduce-args",
-    "solve-eqs",
-    "special-relations",
-    "euf-completion",
-};
 
 // inc_ref a freshly built simplifier (libz3 requires it; ay's inc_ref is a no-op).
 static Z3_simplifier S(Z3_simplifier s) { Z3_simplifier_inc_ref(C, s); return s; }
@@ -147,12 +109,211 @@ static int solve_with_simplifier(Z3_simplifier comp, int sat) {
     Z3_solver s = Z3_solver_add_simplifier(C, base, comp);
     Z3_solver_inc_ref(C, s);
     assert_lia(s, sat);
+    Z3_ast_vector original = Z3_solver_get_assertions(C, s);
+    Z3_ast_vector_inc_ref(C, original);
     int r = Z3_solver_check(C, s);
+    if (r == Z3_L_TRUE) {
+        Z3_model model = Z3_solver_get_model(C, s);
+        CHECK_B(model != NULL, 1, "attached simplifier returns a model");
+        if (model) {
+            Z3_model_inc_ref(C, model);
+            for (unsigned i = 0; i < Z3_ast_vector_size(C, original); ++i) {
+                Z3_ast value = NULL;
+                int evaluated = Z3_model_eval(C, model,
+                    Z3_ast_vector_get(C, original, i), 1, &value);
+                CHECK_B(evaluated, 1, "original LIA assertion evaluates");
+                if (evaluated)
+                    CHECK_I(Z3_get_bool_value(C, value), Z3_L_TRUE,
+                            "simplifier model satisfies original LIA input");
+            }
+            Z3_model_dec_ref(C, model);
+        }
+    }
+    Z3_ast_vector_dec_ref(C, original);
     return r;
+}
+
+// Public symbol spelling is DATA, even when it resembles an internal binder.
+// A converted model must both evaluate the source constant and print its name.
+static void converted_scalar_public_spelling(Z3_simplifier comp) {
+    Z3_solver base = Z3_mk_solver(C);
+    Z3_solver_inc_ref(C, base);
+    Z3_solver s = Z3_solver_add_simplifier(C, base, comp);
+    CHECK_B(s != NULL, 1, "public-name converted solver");
+    if (!s) return;
+    Z3_solver_inc_ref(C, s);
+    Z3_sort ints = Z3_mk_int_sort(C);
+    Z3_ast x = Z3_mk_const(C, Z3_mk_string_symbol(C, "__db0"), ints);
+    Z3_ast three = Z3_mk_int(C, 3, ints);
+    Z3_solver_assert(C, s, Z3_mk_eq(C, x, three));
+    CHECK_I(Z3_solver_check(C, s), Z3_L_TRUE, "public-name converted SAT");
+    Z3_model model = Z3_solver_get_model(C, s);
+    CHECK_B(model != NULL, 1, "public-name reconstructed model");
+    if (model) {
+        Z3_model_inc_ref(C, model);
+        Z3_ast value = NULL;
+        CHECK_B(Z3_model_eval(C, model, x, 0, &value), 1, "public-name source value");
+        if (value) CHECK_B(Z3_is_eq_ast(C, value, three), 1, "public-name value is three");
+        const char *text = Z3_model_to_string(C, model);
+        CHECK_B(text && strstr(text, "__db0"), 1, "model preserves authored public name");
+        CHECK_B(text && !strstr(text, "(:var "), 1, "free name is not a bound-variable term");
+        Z3_model_dec_ref(C, model);
+    }
+    Z3_solver_dec_ref(C, s);
+    Z3_solver_dec_ref(C, base);
+}
+
+// Solver adapters must consume real reconstructed models. ff2bv exercises
+// exact auxiliary adoption; ff-sat exercises the independently checked witness.
+static void converted_field_solver_witnesses(void) {
+    const char *tactics[] = {"ff2bv", "ff-sat"};
+    const char *inputs[] = {
+        "(declare-const by_bv (_ FiniteField 7)) (assert (= by_bv #f3m7))",
+        "(declare-const by_sat (_ FiniteField 7)) (assert (= by_sat #f3m7))"
+    };
+    for (unsigned i = 0; i < 2; ++i) {
+        Z3_tactic tactic = Z3_mk_tactic(C, tactics[i]);
+        CHECK_B(tactic != NULL, 1, "field tactic exists");
+        if (!tactic) continue;
+        Z3_tactic_inc_ref(C, tactic);
+        Z3_solver s = Z3_mk_solver_from_tactic(C, tactic);
+        CHECK_B(s != NULL, 1, "field tactic creates solver");
+        if (!s) { Z3_tactic_dec_ref(C, tactic); continue; }
+        Z3_solver_inc_ref(C, s);
+        Z3_solver_from_string(C, s, inputs[i]);
+        CHECK_I(Z3_get_error_code(C), Z3_OK, "field source parsed");
+        Z3_ast_vector roots = Z3_solver_get_assertions(C, s);
+        Z3_ast_vector_inc_ref(C, roots);
+        CHECK_I(Z3_solver_check(C, s), Z3_L_TRUE, "field wrapper SAT");
+        Z3_model model = Z3_solver_get_model(C, s);
+        CHECK_B(model != NULL, 1, "field wrapper reconstructed model");
+        if (model) {
+            Z3_model_inc_ref(C, model);
+            CHECK_I(Z3_model_get_num_consts(C, model), 1,
+                    "generated representatives do not leak into source model");
+            for (unsigned j = 0; j < Z3_ast_vector_size(C, roots); ++j) {
+                Z3_ast value = NULL;
+                CHECK_B(Z3_model_eval(C, model, Z3_ast_vector_get(C, roots, j), 0, &value),
+                        1, "field original root evaluated");
+                if (value) CHECK_I(Z3_get_bool_value(C, value), Z3_L_TRUE,
+                                   "field model satisfies actual source root");
+            }
+            if (Z3_model_get_num_consts(C, model) == 1) {
+                Z3_func_decl decl = Z3_model_get_const_decl(C, model, 0);
+                Z3_ast member = Z3_mk_app(C, decl, 0, NULL);
+                Z3_ast expected = Z3_mk_numeral(C, "3", Z3_get_range(C, decl));
+                Z3_ast value = NULL;
+                CHECK_B(Z3_model_eval(C, model, member, 0, &value), 1, "source field member read");
+                if (value) CHECK_B(Z3_is_eq_ast(C, value, expected), 1,
+                                   "source member is actual residue three");
+            }
+            Z3_model_dec_ref(C, model);
+        }
+        Z3_ast_vector_dec_ref(C, roots);
+        Z3_solver_dec_ref(C, s);
+        Z3_tactic_dec_ref(C, tactic);
+    }
+}
+
+static unsigned occurrences(Z3_ast root, Z3_ast variable) {
+    if (Z3_is_eq_ast(C, root, variable)) return 1;
+    if (Z3_get_ast_kind(C, root) != Z3_APP_AST) return 0;
+    Z3_app app = Z3_to_app(C, root);
+    unsigned result = 0;
+    for (unsigned i = 0; i < Z3_get_app_num_args(C, app); ++i)
+        result += occurrences(Z3_get_app_arg(C, app, i), variable);
+    return result;
+}
+
+static void field_simplifier_semantics(void) {
+    Z3_simplifier simp = S(Z3_mk_simplifier(C, "ff-simplify"));
+    CHECK_B(simp != NULL, 1, "native field simplifier exists");
+    if (!simp) return;
+    Z3_solver base = Z3_mk_solver(C);
+    Z3_solver_inc_ref(C, base);
+    Z3_solver solver = Z3_solver_add_simplifier(C, base, simp);
+    CHECK_B(solver != NULL, 1, "field simplifier attaches");
+    if (!solver) return;
+    Z3_solver_inc_ref(C, solver);
+    Z3_sort field = Z3_mk_finite_field_sort(C, "7");
+    Z3_ast x = Z3_mk_const(C, Z3_mk_string_symbol(C, "simp_field_x"), field);
+    Z3_ast y = Z3_mk_const(C, Z3_mk_string_symbol(C, "simp_field_y"), field);
+    Z3_ast three = Z3_mk_numeral(C, "3", field);
+    Z3_ast two = Z3_mk_numeral(C, "2", field);
+    Z3_ast six = Z3_mk_numeral(C, "6", field);
+    Z3_ast args[2] = {x, y};
+    Z3_ast original[2] = {Z3_mk_eq(C, x, three),
+        Z3_mk_eq(C, Z3_mk_ff_add(C, 2, args), two)};
+    Z3_solver_assert(C, solver, original[0]);
+    Z3_solver_assert(C, solver, original[1]);
+    CHECK_I(Z3_solver_check(C, solver), Z3_L_TRUE, "field simplifier SAT");
+    Z3_ast_vector assertions = Z3_solver_get_assertions(C, solver);
+    unsigned uses = 0;
+    for (unsigned i = 0; i < Z3_ast_vector_size(C, assertions); ++i)
+        uses += occurrences(Z3_ast_vector_get(C, assertions, i), x);
+    // Propagation must do real work, but its output order and exact normal
+    // form are deliberately unrestricted. Retaining x=3 is valid; upstream
+    // may instead eliminate it and reconstruct x in the model.
+    CHECK_B(uses < occurrences(original[0], x) + occurrences(original[1], x),
+            1, "field definition propagated into arithmetic");
+    Z3_model model = Z3_solver_get_model(C, solver);
+    CHECK_B(model != NULL, 1, "field simplifier model exists");
+    if (model) {
+        Z3_model_inc_ref(C, model);
+        for (unsigned i = 0; i < 2; ++i) {
+            Z3_ast value = NULL;
+            int evaluated = Z3_model_eval(C, model, original[i], 1, &value);
+            CHECK_B(evaluated, 1, "original field assertion evaluates");
+            if (evaluated)
+                CHECK_I(Z3_get_bool_value(C, value), Z3_L_TRUE,
+                        "returned model satisfies original assertion");
+        }
+        Z3_model_dec_ref(C, model);
+    }
+    Z3_solver_push(C, solver);
+    Z3_solver_assert(C, solver, Z3_mk_not(C, Z3_mk_eq(C, y, six)));
+    CHECK_I(Z3_solver_check(C, solver), Z3_L_FALSE, "field push contradiction");
+    Z3_solver_pop(C, solver, 1);
+    CHECK_I(Z3_solver_check(C, solver), Z3_L_TRUE, "field pop restores SAT");
+    CHECK_I(Z3_ast_vector_size(C, Z3_solver_get_assertions(C, base)), 0,
+            "attachment leaves source solver empty");
+    Z3_solver_dec_ref(C, solver);
+    Z3_solver_dec_ref(C, base);
+}
+
+static void attachment_source_contract(Z3_simplifier simp) {
+    Z3_solver source = Z3_mk_solver(C);
+    Z3_solver_inc_ref(C, source);
+    Z3_ast p = Z3_mk_const(C, Z3_mk_string_symbol(C, "attachment_p"),
+                          Z3_mk_bool_sort(C));
+    Z3_solver_assert(C, source, p);
+    CHECK_B(Z3_solver_add_simplifier(C, source, simp) == NULL, 1,
+            "populated source rejects attachment");
+    CHECK_I(Z3_get_error_code(C), Z3_INVALID_ARG, "populated source error");
+    CHECK_I(Z3_solver_check(C, source), Z3_L_TRUE,
+            "rejected attachment preserves source");
+    Z3_solver_dec_ref(C, source);
+
+    source = Z3_mk_solver(C);
+    Z3_solver_inc_ref(C, source);
+    Z3_solver_push(C, source);
+    Z3_solver attached = Z3_solver_add_simplifier(C, source, simp);
+    CHECK_B(attached != NULL, 1, "empty scoped source can be copied");
+    if (attached) {
+        Z3_solver_inc_ref(C, attached);
+        CHECK_I(Z3_solver_get_num_scopes(C, attached), 0,
+                "new simplifier solver starts without scopes");
+        Z3_solver_dec_ref(C, attached);
+    }
+    CHECK_I(Z3_solver_get_num_scopes(C, source), 1,
+            "attachment preserves source scope");
+    Z3_solver_pop(C, source, 1);
+    Z3_solver_dec_ref(C, source);
 }
 
 int main(void) {
     setbuf(stdout, NULL);
+    printf("simplifier consumer library: %s\n", Z3_get_full_version());
     Z3_config cfg = Z3_mk_config();
     C = Z3_mk_context(cfg);
     Z3_del_config(cfg);
@@ -183,6 +344,8 @@ int main(void) {
     Z3_simplifier pv = S(Z3_mk_simplifier(C, "propagate-values"));
     Z3_simplifier comp = S(Z3_simplifier_and_then(C, se, pv));
     CHECK_B(comp != NULL, 1, "and_then(solve-eqs, propagate-values) non-null");
+    converted_scalar_public_spelling(comp);
+    converted_field_solver_witnesses();
     Z3_string help = Z3_simplifier_get_help(C, comp);
     CHECK_B(help != NULL, 1, "get_help(comp) non-null");
 
@@ -214,22 +377,31 @@ int main(void) {
     CHECK_I(solve_with_simplifier(simp, 1), Z3_L_TRUE, "simplify preserves SAT");
     CHECK_I(solve_with_simplifier(simp, 0), Z3_L_FALSE, "simplify preserves UNSAT");
 
-    // ---- Exact Z3 5.0.0 registry: 37 names, same order, all constructible ----
+    field_simplifier_semantics();
+    attachment_source_contract(simp);
+
+    // ---- Actual registry: unique, described and constructible entries ----
     unsigned int num_simplifiers = Z3_get_num_simplifiers(C);
-    CHECK_I(num_simplifiers, 37, "Z3 5.0.0 simplifier count");
-    for (unsigned int i = 0; i < 37; i++) {
+    CHECK_B(num_simplifiers > 0, 1, "simplifier enumeration is nonempty");
+    for (unsigned int i = 0; i < num_simplifiers; i++) {
         Z3_string got = Z3_get_simplifier_name(C, i);
         CHECK_B(got != NULL, 1, "enumerated simplifier name non-null");
-        if (got != NULL) {
-            CHECK_B(strcmp(got, z3_5_simplifiers[i]) == 0, 1,
-                    "enumerated simplifier matches Z3 5.0.0 order");
-        }
-        Z3_simplifier entry = Z3_mk_simplifier(C, z3_5_simplifiers[i]);
-        CHECK_B(entry != NULL, 1, "enumerated Z3 5.0.0 simplifier builds");
-        Z3_string entry_descr =
-            Z3_simplifier_get_descr(C, z3_5_simplifiers[i]);
+        if (got == NULL) break;
+        // Z3 may reuse its returned string buffer on the next API call.
+        // Retain the observed name before querying other entries or metadata.
+        char *name = malloc(strlen(got) + 1);
+        CHECK_B(name != NULL, 1, "enumerated name retained");
+        if (name == NULL) break;
+        strcpy(name, got);
+        for (unsigned int j = 0; j < i; ++j)
+            CHECK_B(strcmp(name, Z3_get_simplifier_name(C, j)) != 0, 1,
+                    "enumerated simplifier names are unique");
+        Z3_simplifier entry = Z3_mk_simplifier(C, name);
+        CHECK_B(entry != NULL, 1, "enumerated simplifier builds");
+        Z3_string entry_descr = Z3_simplifier_get_descr(C, name);
         CHECK_B(entry_descr != NULL && entry_descr[0] != '\0', 1,
                 "enumerated simplifier has description");
+        free(name);
     }
 
 #ifndef AY_TWIN_USE_Z3

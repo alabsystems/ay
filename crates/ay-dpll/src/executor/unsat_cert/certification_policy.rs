@@ -65,16 +65,18 @@ impl Executor {
         });
     }
 
-    /// Attribute step (4)'s final accepting/declining nested solve.
+    /// Attribute the final accepting/declining nested solve of step (4) or,
+    /// per `arm`, step (4a).
     pub(super) fn probe_reconfirmation_outcome(
         &self,
+        arm: &str,
         nested: &Executor,
         verdict: &Result<SolveResult>,
         problem: &[TermId],
     ) {
         probe_cert_reject(|| {
             format!(
-                "RECONFIRM(4): verdict={:?} unknown_origin={:?} unknown_reason={:?} \
+                "{arm}: verdict={:?} unknown_origin={:?} unknown_reason={:?} \
                  last_proof={} tracker_steps={} problem_terms={}",
                 verdict.as_ref().map(ToString::to_string),
                 nested.last_unknown_origin,
@@ -90,7 +92,7 @@ impl Executor {
         if !matches!(verdict, Ok(result) if result.is_unsat()) {
             probe_cert_reject(|| {
                 format!(
-                    "RECONFIRM(4) DECLINED scope: {}",
+                    "{arm} DECLINED scope: {}",
                     self.bounded_cert_reject_probe_terms(problem)
                 )
             });

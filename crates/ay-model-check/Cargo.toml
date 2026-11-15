@@ -12,8 +12,9 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-# INDEPENDENCE INVARIANT: this crate depends ONLY on ay-core (term/sort types)
-# and exact-arithmetic numeric crates. It must NOT depend on ay-dpll or any
+# INDEPENDENCE INVARIANT: this crate depends ONLY on ay-core (term/sort types),
+# exact-arithmetic numeric crates, and error formatting. It must NOT depend on
+# ay-dpll or any
 # solver/theory crate. The whole point is a second, simple, separately-auditable
 # evaluator that the (untrusted) search engine cannot influence.
 ay-core.workspace = true
@@ -21,6 +22,7 @@ num-bigint.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

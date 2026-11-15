@@ -17,11 +17,71 @@
 //!   (the negation is SAT), matching z3 — the FFI never fakes algebraic
 //!   identities that FP does not obey.
 //! - HONEST ERRORS: a non-FP sort handed to an FP constructor returns the null
-//!   AST and sets `Z3_SORT_ERROR`; an unsupported numeral precision sets
-//!   `Z3_INVALID_ARG`. No fabricated terms.
+//!   AST and sets `Z3_SORT_ERROR`. Custom admitted precisions are supported.
 
 use super::super::*;
+use super::f64_to_fp_bits;
 use std::ptr::null_mut;
+
+#[test]
+fn custom_numerals_round_once_at_boundaries() {
+    use num_bigint::BigInt;
+    let cases = [
+        (1.0, 48u32),
+        (1.03125, 48),    // halfway, even lower significand
+        (1.09375, 50),    // halfway, even upper significand
+        (1.0 / 128.0, 0), // halfway below the smallest subnormal
+        (3.0 / 128.0, 2), // subnormal halfway rounds up to even
+        (15.5, 111),      // largest finite value
+        (15.75, 112),     // rounding carry overflows to infinity
+        (-0.0, 128),
+        (f64::INFINITY, 112),
+        (f64::NEG_INFINITY, 240),
+    ];
+    for (value, bits) in cases {
+        assert_eq!(f64_to_fp_bits(value, 3, 5), Some(BigInt::from(bits)));
+    }
+    assert_eq!(
+        f64_to_fp_bits(1.0, 15, 113),
+        Some(BigInt::from(16383u32) << 112usize)
+    );
+    assert_eq!(
+        f64_to_fp_bits(f64::from_bits(1), 15, 113),
+        Some(BigInt::from(16383u32 - 1074) << 112usize)
+    );
+    // Wider than u128, so the constructor must retain the BigInt encoding.
+    assert_eq!(
+        f64_to_fp_bits(1.0, 11, 200),
+        Some(BigInt::from(1023u32) << 199usize)
+    );
+    assert!(f64_to_fp_bits(1.0, 1, 5).is_none());
+}
+
+#[test]
+fn custom_and_wide_numerals_construct_through_c_api() {
+    // SAFETY: all handles are owned by this context and used on this thread.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        for (eb, sb) in [(3, 5), (15, 113), (11, 200)] {
+            let sort = Z3_mk_fpa_sort(ctx, eb, sb);
+            assert!(!sort.is_null());
+            for value in [1.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let ast = Z3_mk_fpa_numeral_double(ctx, value, sort);
+                assert_ne!(ast, 0, "format ({eb}, {sb}), value {value}");
+                assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+            }
+            assert_ne!(Z3_mk_fpa_numeral_int(ctx, 1, sort), 0);
+            assert_ne!(Z3_mk_numeral(ctx, c"1/3".as_ptr(), sort), 0);
+        }
+        let small = Z3_mk_fpa_sort(ctx, 3, 5);
+        let third = Z3_mk_numeral(ctx, c"1/3".as_ptr(), small);
+        let rounded_third = Z3_mk_fpa_numeral_double(ctx, 21.0 / 64.0, small);
+        assert!(Z3_is_eq_ast(ctx, third, rounded_third));
+        Z3_del_context(ctx);
+    }
+}
 
 /// Float32 sort helper.
 ///
@@ -72,11 +132,22 @@ fn test_fpa_sorts() {
         let rm_sort = Z3_mk_fpa_rounding_mode_sort(ctx);
         assert!(!rm_sort.is_null());
 
+        for ebits in [32, 63] {
+            let wide = Z3_mk_fpa_sort(ctx, ebits, 3);
+            assert!(!wide.is_null(), "admitted exponent width {ebits}");
+            assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+            let one = Z3_mk_fpa_numeral_double(ctx, 1.0, wide);
+            assert_ne!(one, 0, "exact numeral at exponent width {ebits}");
+            assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+            let bias: num_bigint::BigInt = (num_bigint::BigInt::from(1) << (ebits - 1)) - 1;
+            assert_eq!(f64_to_fp_bits(1.0, ebits, 3), Some(bias << 2));
+        }
+
         // Degenerate widths are rejected honestly.
         let bad = Z3_mk_fpa_sort(ctx, 1, 1);
         assert!(bad.is_null());
         assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
-        let too_wide = Z3_mk_fpa_sort(ctx, 32, 24);
+        let too_wide = Z3_mk_fpa_sort(ctx, 64, 24);
         assert!(too_wide.is_null());
         assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
 
@@ -328,15 +399,12 @@ fn test_fpa_honest_errors() {
         assert_eq!(bad_add, 0, "fp.add on Int operands must return null");
         assert_eq!(Z3_get_error_code(ctx), Z3_SORT_ERROR);
 
-        // numeral_double on an unsupported (3,5) precision => null + Z3_INVALID_ARG.
+        // Custom precisions use exact rounding rather than rejecting the format.
         let weird = Z3_mk_fpa_sort(ctx, 3, 5);
         assert!(!weird.is_null());
-        let bad_num = Z3_mk_fpa_numeral_double(ctx, 1.0, weird);
-        assert_eq!(
-            bad_num, 0,
-            "numeral on unsupported precision must return null"
-        );
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+        let custom_num = Z3_mk_fpa_numeral_double(ctx, 1.0, weird);
+        assert_ne!(custom_num, 0);
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
 
         // A null sort is likewise rejected.
         let bad_null = Z3_mk_fpa_nan(ctx, null_mut());

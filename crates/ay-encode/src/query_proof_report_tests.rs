@@ -285,11 +285,25 @@ fn obligation_identity_is_stable_and_constructor_rejects_omission_or_reordering(
         .collect();
     let (source_sha256, source_bytes) = source_identity(&problem);
     let source_input = problem.normalized_input();
-    let identity = obligation_set_sha256(&source_sha256, source_bytes, &[], false, &ids);
+    let identity = obligation_set_sha256(
+        ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+        &source_sha256,
+        source_bytes,
+        &[],
+        false,
+        &ids,
+    );
 
     assert_eq!(
         identity,
-        obligation_set_sha256(&source_sha256, source_bytes, &[], false, &ids)
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            false,
+            &ids
+        )
     );
     assert_eq!(identity.len(), 64);
     assert!(identity
@@ -300,24 +314,64 @@ fn obligation_identity_is_stable_and_constructor_rejects_omission_or_reordering(
     reversed.reverse();
     assert_ne!(
         identity,
-        obligation_set_sha256(&source_sha256, source_bytes, &[], false, &reversed),
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            false,
+            &reversed
+        ),
         "row order is proof-relevant"
     );
     assert_ne!(
         identity,
-        obligation_set_sha256(&source_sha256, source_bytes, &[], false, &ids[..1]),
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            false,
+            &ids[..1]
+        ),
         "row omission is proof-relevant"
     );
     let duplicate_ids = vec![ids[0].clone(), ids[0].clone()];
     assert_ne!(
         identity,
-        obligation_set_sha256(&source_sha256, source_bytes, &[], false, &duplicate_ids),
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            false,
+            &duplicate_ids
+        ),
         "row duplication is proof-relevant"
     );
     assert_ne!(
         identity,
-        obligation_set_sha256(&"0".repeat(64), source_bytes, &[], false, &ids),
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &"0".repeat(64),
+            source_bytes,
+            &[],
+            false,
+            &ids
+        ),
         "aggregate source identity is proof-relevant"
+    );
+    assert_ne!(
+        identity,
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            false,
+            &ids
+        ),
+        "aggregate source schema is proof-relevant"
     );
     let mut pruned_problem = ChcProblem::new();
     pruned_problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
@@ -326,6 +380,7 @@ fn obligation_identity_is_stable_and_constructor_rejects_omission_or_reordering(
     assert_ne!(
         identity,
         obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
             &source_sha256,
             source_bytes,
             &pruned_problem.pruned_false_query_ids(),
@@ -336,7 +391,14 @@ fn obligation_identity_is_stable_and_constructor_rejects_omission_or_reordering(
     );
     assert_ne!(
         identity,
-        obligation_set_sha256(&source_sha256, source_bytes, &[], true, &ids),
+        obligation_set_sha256(
+            ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
+            &source_sha256,
+            source_bytes,
+            &[],
+            true,
+            &ids
+        ),
         "source over-approximation state is proof-relevant"
     );
 

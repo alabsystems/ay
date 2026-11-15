@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% The same slack overflow reached straight from the formula: both rows have a left-hand
+% side in {0,2} and a hugely negative right-hand side, so both are trivially true and
+% EVERY assignment is a model. Unfixed, the wrapped slack made row 1 assert x1 and row 2
+% assert ~x1, so the trail was in conflict before the proof started and `rup >= 1 ;`
+% derived the empty contradiction.
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

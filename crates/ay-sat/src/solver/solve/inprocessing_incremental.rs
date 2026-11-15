@@ -57,14 +57,22 @@ impl Solver {
     /// via `restore_scoped_bve_eliminations()`. This unlocks BVE for IC3/PDR
     /// workloads that do thousands of tiny incremental solves.
     ///
+    /// The round also polls `should_stop`, the solve's stop
+    /// (`inprocessing_stop_requested`), on entry and between its passes; a
+    /// stop it sees is left for `run_incremental_inprocessing_round_until`.
+    ///
     /// Returns `true` if UNSAT was derived at decision level 0.
-    pub(in crate::solver) fn run_incremental_inprocessing(&mut self) -> bool {
+    pub(in crate::solver) fn run_incremental_inprocessing(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+    ) -> bool {
         // ── Preconditions ────────────────────────────────────────────────
         // #array-deadline-forward: the whole-solve deadline is honored here
         // too — incremental inprocessing runs BEFORE the CDCL loop's
         // `should_stop` polls can fire, and its passes can be expensive on a
-        // grown clause DB.
-        if self.is_interrupted() || self.solve_deadline_expired() {
+        // grown clause DB. The stop is polled first, so a stop that fires
+        // past the deadline ends the solve as `DeadlineExceeded`.
+        if self.inprocessing_stop_requested(should_stop) || self.solve_deadline_expired() {
             return false;
         }
         debug_assert_eq!(
@@ -99,7 +107,7 @@ impl Solver {
         if self.collect_level0_garbage() {
             return true;
         }
-        if self.is_interrupted() || self.solve_deadline_expired() {
+        if self.inprocessing_stop_requested(should_stop) || self.solve_deadline_expired() {
             return false;
         }
         if self.propagate_check_unsat() {
@@ -122,6 +130,8 @@ impl Solver {
         // to recompile afterwards (#8202).
 
         let round_start = ay_core::time::Instant::now();
+        let round_start_work = self.pass_work_baseline();
+        let pass_work_baseline = self.cold.inproc_pass_work_te;
         let pass_time_baseline: [u64; solver_stats::INPROCESS_TIMING_LABELS.len()] =
             self.stats.inprocessing_time_ns;
         let clauses_before = self.num_clauses();
@@ -146,7 +156,7 @@ impl Solver {
             }
         }
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -246,7 +256,7 @@ impl Solver {
             }
         }
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -268,7 +278,7 @@ impl Solver {
             }
         }
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -338,11 +348,12 @@ impl Solver {
             self.pending_garbage_count,
         );
 
-        // Proof I/O error check.
+        // LRAT structural check. A latched proof WRITE failure (disk full) is
+        // not a bug: solve_stop_reason ends the solve with ProofWriteFailure.
         if let Some(ref manager) = self.proof_manager {
             assert!(
-                !manager.has_inprocessing_boundary_error(),
-                "BUG: proof I/O error detected at incremental inprocessing boundary"
+                self.proof_output_failed() || !manager.has_inprocessing_boundary_error(),
+                "BUG: LRAT structural proof failure at incremental inprocessing boundary"
             );
         }
 
@@ -373,8 +384,13 @@ impl Solver {
             "incremental inprocessing: round complete (#8208)"
         );
 
-        // Update inprocessing overhead for adaptive tick scaling (#8099).
-        self.cold.last_inprocessing_overhead_ms = overhead_ns as f64 / 1_000_000.0;
+        // Update inprocessing overhead for adaptive tick scaling (#8099),
+        // counted work under `--sat-deterministic-inproc` (det_work.rs).
+        self.cold.last_inprocessing_overhead_ms = if self.deterministic_inproc() {
+            self.counted_round_overhead_ms(round_start_work, pass_work_baseline)
+        } else {
+            overhead_ns as f64 / 1_000_000.0
+        };
 
         // Update scheduling: advance conflict limit so we don't immediately
         // re-fire on the next solve_with_assumptions() call.

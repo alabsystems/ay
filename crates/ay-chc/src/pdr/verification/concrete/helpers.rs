@@ -6,18 +6,106 @@
 //! exhaustive enumeration, expression hashing, bounds extraction, and
 //! constant extraction.
 
+use super::budget::ResolvedStop;
 use super::ConcreteCheckRange;
 use crate::expr::evaluate_expr;
 use crate::smt::SmtValue;
 use crate::{ChcExpr, ChcOp};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
+use ay_core::time::Instant;
+
+/// Evaluates the query on concrete assignments, until an anchored search's
+/// allowance (when set) passes or the check's resolved [`super::ConcreteStop`]
+/// fires, both polled before every evaluation. Until then it is exactly
+/// `evaluate_expr(query, a) == Some(Bool(true))` on every assignment it is
+/// given.
+pub(super) struct Probe<'q> {
+    query: &'q ChcExpr,
+    allowance: Option<Instant>,
+    stop: ResolvedStop,
+    clock: bool,
+    cut: Option<Cut>,
+    #[cfg(test)]
+    evaluated: u64,
+}
+
+/// Why a probe stopped evaluating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The anchored search's allowance passed: the centred window's `None`.
+    Allowance,
+    /// The check's stop fired: no answer.
+    Interrupted,
+}
+
+impl<'q> Probe<'q> {
+    pub(super) fn new(query: &'q ChcExpr, allowance: Option<Instant>, stop: ResolvedStop) -> Self {
+        Self {
+            query,
+            allowance,
+            clock: allowance.is_some() || stop.needs_clock(),
+            stop,
+            cut: None,
+            #[cfg(test)]
+            evaluated: 0,
+        }
+    }
+
+    pub(super) fn query(&self) -> &'q ChcExpr {
+        self.query
+    }
+
+    /// True when `assignment` makes the query true under the exact evaluator.
+    /// Once the stop fires or the allowance passes it evaluates nothing more
+    /// and answers false, and [`Self::stopped`] holds from then on.
+    pub(super) fn holds(&mut self, assignment: &FxHashMap<String, SmtValue>) -> bool {
+        if self.cut.is_some() {
+            return false;
+        }
+        let now = self.clock.then(Instant::now);
+        if self.stop.fired(now) {
+            self.cut = Some(Cut::Interrupted);
+            return false;
+        }
+        if self
+            .allowance
+            .zip(now)
+            .is_some_and(|(deadline, now)| now >= deadline)
+        {
+            self.cut = Some(Cut::Allowance);
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.evaluated += 1;
+        }
+        evaluate_expr(self.query, assignment) == Some(SmtValue::Bool(true))
+    }
+
+    /// True once the allowance or the stop ended the search: the caller
+    /// stops too.
+    pub(super) fn stopped(&self) -> bool {
+        self.cut.is_some()
+    }
+
+    /// True when the check's stop ended the search.
+    pub(super) fn interrupted(&self) -> bool {
+        self.cut == Some(Cut::Interrupted)
+    }
+
+    /// The evaluations performed so far.
+    #[cfg(test)]
+    pub(super) fn evaluated(&self) -> u64 {
+        self.evaluated
+    }
+}
 
 /// Sample boundary-value combinations up to a limit (odometer iteration).
 pub(super) fn sample_boundary_combinations(
     ranges: &[ConcreteCheckRange],
     boundary_values: &[Vec<SmtValue>],
     assignment: &mut FxHashMap<String, SmtValue>,
-    query: &ChcExpr,
+    probe: &mut Probe<'_>,
     max_combos: usize,
     samples_checked: &mut usize,
 ) -> Option<FxHashMap<String, SmtValue>> {
@@ -42,11 +130,11 @@ pub(super) fn sample_boundary_combinations(
         }
         *samples_checked += 1;
 
-        if all_assigned
-            && assignment.len() == n
-            && evaluate_expr(query, assignment) == Some(SmtValue::Bool(true))
-        {
+        if all_assigned && assignment.len() == n && probe.holds(assignment) {
             return Some(assignment.clone());
+        }
+        if probe.stopped() {
+            break;
         }
 
         // Odometer increment
@@ -265,18 +353,20 @@ pub(super) fn extract_int_constants(expr: &ChcExpr) -> Vec<i64> {
     constants
 }
 
-/// Recursively enumerate Int and BV assignments and check the formula.
+/// Recursively enumerate Int and BV assignments and check the formula, until
+/// the probe stops (its allowance passes or its stop fires).
 pub(super) fn enumerate_and_check_generic(
     ranges: &[ConcreteCheckRange],
     idx: usize,
     assignment: &mut FxHashMap<String, SmtValue>,
-    query: &ChcExpr,
+    probe: &mut Probe<'_>,
 ) -> Option<FxHashMap<String, SmtValue>> {
     if idx >= ranges.len() {
         // All variables assigned — evaluate the formula
-        match evaluate_expr(query, assignment) {
-            Some(SmtValue::Bool(true)) => Some(assignment.clone()),
-            _ => None,
+        if probe.holds(assignment) {
+            Some(assignment.clone())
+        } else {
+            None
         }
     } else {
         match &ranges[idx] {
@@ -284,9 +374,12 @@ pub(super) fn enumerate_and_check_generic(
                 for val in *lo..=*hi {
                     assignment.insert(name.clone(), SmtValue::Int(i128::from(val)));
                     if let Some(cex) =
-                        enumerate_and_check_generic(ranges, idx + 1, assignment, query)
+                        enumerate_and_check_generic(ranges, idx + 1, assignment, probe)
                     {
                         return Some(cex);
+                    }
+                    if probe.stopped() {
+                        return None;
                     }
                 }
                 assignment.remove(name);
@@ -300,9 +393,12 @@ pub(super) fn enumerate_and_check_generic(
                         SmtValue::bitvec_from_biguint(num_bigint::BigUint::from(val), *width),
                     );
                     if let Some(cex) =
-                        enumerate_and_check_generic(ranges, idx + 1, assignment, query)
+                        enumerate_and_check_generic(ranges, idx + 1, assignment, probe)
                     {
                         return Some(cex);
+                    }
+                    if probe.stopped() {
+                        return None;
                     }
                 }
                 assignment.remove(name);

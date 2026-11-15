@@ -9,8 +9,8 @@ use ay_core::{Sort, TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
-use super::pattern::BoundVarScopeMemo;
-use super::{instantiate_body, TermIndex};
+use super::instantiate_body;
+use super::occurrences::GroundOccurrences;
 
 /// Enumerative instantiation fallback for triggerless quantifiers.
 ///
@@ -46,6 +46,7 @@ pub(crate) fn enumerative_instantiation(
     assertions: &[TermId],
     quantifier: TermId,
     max_instantiations: usize,
+    round: &mut GroundTermsRound,
 ) -> Vec<(Vec<TermId>, TermId)> {
     // A no_mbqi ("E-matching only") quantifier — the Hilbert-`choose` combined
     // axiom — must never be enumeratively (synthesis) instantiated: enumeration
@@ -68,7 +69,7 @@ pub(crate) fn enumerative_instantiation(
     // Collect ground terms by sort from the assertion set.
     // A ground term is any term that is not under a quantifier binding scope
     // and has no free bound variables.
-    let ground_by_sort = collect_ground_terms_by_sort(terms, assertions);
+    let ground_by_sort = round.by_sort(terms, assertions).clone();
     let needs_interpreted_arithmetic_basis = contains_fixed_interpreted_arithmetic(terms, body);
 
     // For each bound variable, find ground terms of the matching sort.
@@ -205,38 +206,28 @@ pub(crate) fn contains_fixed_interpreted_arithmetic(terms: &TermStore, root: Ter
 /// - Declared variables (constants in SMT-LIB terms)
 /// - Function applications that are fully ground
 ///
-/// Skips terms under quantifier binders (those are not ground).
+/// An asserted occurrence is ground when none of its variables are bound by
+/// its enclosing quantifiers. Free subterms inside a quantifier still count;
+/// constructing an unasserted quantifier cannot suppress a free occurrence.
 /// Public for MBQI (#5971).
 pub(crate) fn collect_ground_terms_by_sort(
     terms: &TermStore,
     assertions: &[TermId],
 ) -> HashMap<Sort, Vec<TermId>> {
+    let mut occurrences = GroundOccurrences::default();
+    occurrences.visit_assertions(terms, assertions);
     let mut result: HashMap<Sort, Vec<TermId>> = HashMap::default();
-    let mut visited: HashSet<TermId> = HashSet::default();
-    // Collect bound var IDs (same as TermIndex) to skip non-ground terms
-    let mut bound_var_ids: HashSet<u32> = HashSet::default();
-    let mut bound_names: HashSet<String> = HashSet::default();
-    // One memo for the whole `0..terms.len()` loop, paired with `bound_var_ids`
-    // (see `BoundVarScopeMemo`). Without it this loop costs the SUM OF SUBTREE
-    // SIZES of the whole store and is ~99% of the wall clock on SPARK VCs.
-    // The root SET is deliberately unchanged: restricting it to the ids
-    // reachable from `assertions` would drop bound-var classifications coming
-    // from store-resident-but-unasserted quantifiers, and so would change which
-    // terms count as ground.
-    let mut bound_var_memo = BoundVarScopeMemo::default();
-    for idx in 0..terms.len() {
-        let term_id = TermId(idx as u32);
-        TermIndex::collect_bound_var_ids(
-            terms,
-            term_id,
-            &mut bound_var_ids,
-            &mut bound_names,
-            &mut bound_var_memo,
-        );
-    }
-
-    for &assertion in assertions {
-        collect_ground_terms_recursive(terms, assertion, &bound_var_ids, &mut visited, &mut result);
+    for &id in &occurrences.ground_ids {
+        let term = TermId(id);
+        if matches!(
+            terms.get(term),
+            TermData::Const(_) | TermData::Var(_, _) | TermData::App(_, _)
+        ) {
+            let sort = terms.sort(term);
+            if !matches!(sort, Sort::Bool) {
+                result.entry(sort.clone()).or_default().push(term);
+            }
+        }
     }
 
     // Deduplicate within each sort
@@ -248,85 +239,48 @@ pub(crate) fn collect_ground_terms_by_sort(
     result
 }
 
-/// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#8414).
-fn collect_ground_terms_recursive(
-    terms: &TermStore,
-    term: TermId,
-    bound_var_ids: &HashSet<u32>,
-    visited: &mut HashSet<TermId>,
-    result: &mut HashMap<Sort, Vec<TermId>>,
-) {
-    stacker::maybe_grow(
-        super::EMATCH_STACK_RED_ZONE,
-        super::EMATCH_STACK_SIZE,
-        || {
-            if !visited.insert(term) {
-                return;
-            }
+/// The ground terms of one enumerative instantiation round's seed, shared
+/// across the round's quantifiers.
+///
+/// A round instantiates every quantifier over the same seed assertion
+/// snapshot (#7883), so every quantifier reads the same map; computing it
+/// once per round, not once per quantifier, keeps a round from costing
+/// (quantifiers x asserted DAG). The map depends only on the seed's roots and
+/// the immutable hash-consed terms below them, so a cached map is exactly the
+/// one a fresh [`collect_ground_terms_by_sort`] would build. A call with a
+/// different seed, or after the store shrank (compaction renumbers terms),
+/// recomputes.
+#[derive(Default)]
+pub(crate) struct GroundTermsRound {
+    seed: Vec<TermId>,
+    store_len: usize,
+    by_sort: Option<HashMap<Sort, Vec<TermId>>>,
+}
 
-            match terms.get(term) {
-                TermData::Const(_) => {
-                    let sort = terms.sort(term).clone();
-                    // Only collect non-Bool constants (Bool constants are trivial)
-                    if !matches!(sort, Sort::Bool) {
-                        result.entry(sort).or_default().push(term);
-                    }
-                }
-                TermData::Var(_, _)
-                    // Only collect if this is a free variable (declared constant), not quantifier-bound
-                    if !bound_var_ids.contains(&term.0) => {
-                        let sort = terms.sort(term).clone();
-                        if !matches!(sort, Sort::Bool) {
-                            result.entry(sort).or_default().push(term);
-                        }
-                    }
-                TermData::App(_, args) => {
-                    // Collect this App term if it's ground (no bound vars inside)
-                    let is_ground = !args
-                        .iter()
-                        .any(|&arg| term_contains_bound_var(terms, arg, bound_var_ids));
-                    if is_ground {
-                        let sort = terms.sort(term).clone();
-                        if !matches!(sort, Sort::Bool) {
-                            result.entry(sort).or_default().push(term);
-                        }
-                    }
-                    // Recurse into children regardless (to find nested ground terms)
-                    for &arg in args {
-                        collect_ground_terms_recursive(terms, arg, bound_var_ids, visited, result);
-                    }
-                }
-                TermData::Not(inner) => {
-                    collect_ground_terms_recursive(terms, *inner, bound_var_ids, visited, result);
-                }
-                TermData::Ite(c, t, e) => {
-                    collect_ground_terms_recursive(terms, *c, bound_var_ids, visited, result);
-                    collect_ground_terms_recursive(terms, *t, bound_var_ids, visited, result);
-                    collect_ground_terms_recursive(terms, *e, bound_var_ids, visited, result);
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, val) in bindings {
-                        collect_ground_terms_recursive(terms, *val, bound_var_ids, visited, result);
-                    }
-                    collect_ground_terms_recursive(terms, *body, bound_var_ids, visited, result);
-                }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    // #3441: Descend into quantifier bodies to find free ground terms.
-                    // Free variables inside quantifiers (e.g., `x` in `forall a. NOT(= a x)`)
-                    // are legitimate ground terms for enumerative instantiation. The bound
-                    // variable check (bound_var_ids) and the is_ground check in App handling
-                    // ensure quantifier-bound variables are excluded.
-                    collect_ground_terms_recursive(terms, *body, bound_var_ids, visited, result);
-                }
-                // Future TermData variants: skip (nothing to collect).
-                _ => {}
-            }
-        },
-    ) // stacker::maybe_grow
+impl GroundTermsRound {
+    /// The ground terms of `assertions`, by sort.
+    pub(crate) fn by_sort(
+        &mut self,
+        terms: &TermStore,
+        assertions: &[TermId],
+    ) -> &HashMap<Sort, Vec<TermId>> {
+        let stale = self.seed.as_slice() != assertions || terms.len() < self.store_len;
+        if stale || self.by_sort.is_none() {
+            self.seed = assertions.to_vec();
+            self.by_sort = None;
+        }
+        self.store_len = terms.len();
+        self.by_sort
+            .get_or_insert_with(|| collect_ground_terms_by_sort(terms, assertions))
+    }
 }
 
 /// Check if a term contains any quantifier-bound variable.
-fn term_contains_bound_var(terms: &TermStore, term: TermId, bound_var_ids: &HashSet<u32>) -> bool {
+pub(super) fn term_contains_bound_var(
+    terms: &TermStore,
+    term: TermId,
+    bound_var_ids: &HashSet<u32>,
+) -> bool {
     match terms.get(term) {
         TermData::Var(_, _) => bound_var_ids.contains(&term.0),
         TermData::Const(_) => false,
@@ -364,86 +318,13 @@ fn term_contains_bound_var(terms: &TermStore, term: TermId, bound_var_ids: &Hash
 /// `false`), see `skolemize::finite_domain`.
 ///
 /// Bool literals are excluded (already covered by the base domain), as is any
-/// term containing a quantifier-bound variable (same discipline as
+/// argument occurrence containing an in-scope bound variable (same discipline as
 /// [`collect_ground_terms_by_sort`]). Result is sorted/deduped for
 /// determinism.
 pub(crate) fn collect_bool_uf_arg_terms(terms: &TermStore, assertions: &[TermId]) -> Vec<TermId> {
-    let mut bound_var_ids: HashSet<u32> = HashSet::default();
-    let mut bound_names: HashSet<String> = HashSet::default();
-    // One memo for the whole root loop (paired with `bound_var_ids`).
-    let mut bound_var_memo = BoundVarScopeMemo::default();
-    for idx in 0..terms.len() {
-        let term_id = TermId(idx as u32);
-        TermIndex::collect_bound_var_ids(
-            terms,
-            term_id,
-            &mut bound_var_ids,
-            &mut bound_names,
-            &mut bound_var_memo,
-        );
-    }
-    let mut visited: HashSet<TermId> = HashSet::default();
-    let mut out: Vec<TermId> = Vec::new();
-    for &a in assertions {
-        collect_bool_uf_args_recursive(terms, a, &bound_var_ids, &mut visited, &mut out);
-    }
+    let mut occurrences = GroundOccurrences::default();
+    occurrences.visit_assertions(terms, assertions);
+    let mut out: Vec<TermId> = occurrences.bool_uf_args.into_iter().map(TermId).collect();
     out.sort_unstable_by_key(|t| t.0);
-    out.dedup();
     out
-}
-
-/// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#8414).
-fn collect_bool_uf_args_recursive(
-    terms: &TermStore,
-    term: TermId,
-    bound_var_ids: &HashSet<u32>,
-    visited: &mut HashSet<TermId>,
-    out: &mut Vec<TermId>,
-) {
-    stacker::maybe_grow(
-        super::EMATCH_STACK_RED_ZONE,
-        super::EMATCH_STACK_SIZE,
-        || {
-            if !visited.insert(term) {
-                return;
-            }
-            match terms.get(term) {
-                TermData::App(sym, args) => {
-                    let uf = !crate::features::is_builtin_symbol_name(sym.name());
-                    for &arg in args {
-                        if uf
-                            && matches!(terms.sort(arg), Sort::Bool)
-                            && !matches!(terms.get(arg), TermData::Const(_))
-                            && !term_contains_bound_var(terms, arg, bound_var_ids)
-                        {
-                            out.push(arg);
-                        }
-                        collect_bool_uf_args_recursive(terms, arg, bound_var_ids, visited, out);
-                    }
-                }
-                TermData::Not(inner) => {
-                    collect_bool_uf_args_recursive(terms, *inner, bound_var_ids, visited, out);
-                }
-                TermData::Ite(c, t, e) => {
-                    collect_bool_uf_args_recursive(terms, *c, bound_var_ids, visited, out);
-                    collect_bool_uf_args_recursive(terms, *t, bound_var_ids, visited, out);
-                    collect_bool_uf_args_recursive(terms, *e, bound_var_ids, visited, out);
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, val) in bindings {
-                        collect_bool_uf_args_recursive(terms, *val, bound_var_ids, visited, out);
-                    }
-                    collect_bool_uf_args_recursive(terms, *body, bound_var_ids, visited, out);
-                }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    // Same as collect_ground_terms_recursive (#3441): a UF app
-                    // under a binder can still carry a GROUND Bool argument
-                    // (the bound-var check above excludes non-ground ones).
-                    collect_bool_uf_args_recursive(terms, *body, bound_var_ids, visited, out);
-                }
-                // Const / Var leaves and future variants: nothing to collect.
-                _ => {}
-            }
-        },
-    )
 }

@@ -17,28 +17,46 @@ const MAX_TYPED_ARRAY_TOTAL_WORK: usize = 4 * MAX_RENDERED_DT_BYTES;
 /// Shared allocation/work envelope for one typed-array reconstruction pass.
 pub(in crate::executor::model) struct TypedArrayParseBudget {
     work: usize,
+    aggregate: Option<super::super::recovery_admission::RecoveryAdmission>,
 }
 
 impl TypedArrayParseBudget {
     pub(in crate::executor::model) fn new() -> Self {
-        Self { work: 0 }
+        Self {
+            work: 0,
+            aggregate: super::super::recovery_admission::RecoveryAdmission::current(),
+        }
     }
 
     pub(in crate::executor::model) fn charge_text(&mut self, text: &str) -> bool {
-        rendered_sexp_within_limits(text) && self.charge(text.len())
+        self.charge(text.len()) && rendered_sexp_within_limits(text)
     }
 
     pub(in crate::executor::model) fn charge_value(&mut self, value: &ModelValue) -> bool {
-        model_value_work(value).is_some_and(|amount| self.charge(amount))
+        let admitted = model_value_work(value).is_some_and(|amount| self.charge(amount));
+        if !admitted {
+            super::super::recovery_admission::refuse_current();
+        }
+        admitted
     }
 
     fn charge(&mut self, amount: usize) -> bool {
+        if self
+            .aggregate
+            .as_ref()
+            .is_some_and(|budget| !budget.pay(amount, amount))
+        {
+            return false;
+        }
         match self.work.checked_add(amount) {
             Some(next) if next <= MAX_TYPED_ARRAY_TOTAL_WORK => {
                 self.work = next;
                 true
             }
-            _ => false,
+            _ => {
+                super::super::recovery_admission::refuse_current();
+                false
+            }
         }
     }
 }

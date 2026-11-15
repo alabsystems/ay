@@ -104,7 +104,7 @@ impl VerifiedCounterexample {
     /// Wrap a validated counterexample.
     ///
     /// Only callable within ay-chc. All callers MUST verify the counterexample
-    /// through verify_counterexample() before calling this.
+    /// via `PdrSolver::confirm_counterexample` and wrap the one it returns.
     pub(crate) fn from_validated(cex: Counterexample) -> Self {
         Self { cex }
     }
@@ -734,6 +734,7 @@ pub(crate) fn skeleton_counterexample(problem: &ChcProblem, depth: usize) -> Cou
     Counterexample {
         steps,
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     }
 }
@@ -900,5 +901,71 @@ mod tests {
             result.unknown_reason(),
             Some(VerifiedUnknownReason::BmcExhaustedSearch)
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Trust superproject b62 lineage (ay-chc Unknown-cause split, 1198f48100):
+    // additive coverage for behaviour this branch already implements. Carried when
+    // the lineage was merged into main; every production symbol these exercise was
+    // already here, so these only pin it.
+    // ---------------------------------------------------------------------------
+
+    /// A candidate `Safe` refused by an acceptance gate is a boundary rejection,
+    /// not a give-up: it must not be reported as the generic catch-all.
+    ///
+    /// The verdict itself is unchanged — this arm produced `Unknown` before and
+    /// produces `Unknown` now.
+    #[test]
+    fn rejected_safe_evidence_reports_candidate_not_admitted() {
+        let result = VerifiedChcResult::from_validated(
+            ChcEngineResult::Safe(InvariantModel::new()),
+            ValidationEvidence::PreprocessedQueryOnlyDischarge { query_count: 1 },
+        );
+
+        assert!(
+            result.is_unknown(),
+            "unvalidated Safe evidence must fail closed"
+        );
+        assert_eq!(
+            result.unknown_reason(),
+            Some(VerifiedUnknownReason::CandidateNotAdmitted)
+        );
+        assert_eq!(
+            result.to_string(),
+            "unknown (a candidate verdict was produced but the verified-result boundary did not \
+             admit it)"
+        );
+    }
+
+    /// `Inconclusive` stays the honest catch-all: an `Unknown` arriving with no
+    /// distinguishing evidence must NOT be relabelled into a specific reason.
+    #[test]
+    fn unattributed_unknown_stays_inconclusive() {
+        let result = VerifiedChcResult::from_validated(
+            ChcEngineResult::Unknown,
+            ValidationEvidence::FullVerification,
+        );
+
+        assert_eq!(
+            result.unknown_reason(),
+            Some(VerifiedUnknownReason::Inconclusive)
+        );
+        assert_eq!(result.to_string(), "unknown (inconclusive)");
+    }
+
+    /// The shared boundary-rejection constructor carries the specific reason and
+    /// no BMC depth metadata (no bounded search happened).
+    #[test]
+    fn unknown_candidate_not_admitted_helper_carries_the_specific_reason() {
+        let result = VerifiedChcResult::unknown_candidate_not_admitted();
+
+        assert!(result.is_unknown());
+        assert_eq!(
+            result.unknown_reason(),
+            Some(VerifiedUnknownReason::CandidateNotAdmitted)
+        );
+        let marker = result.unknown_marker().expect("Unknown carries a marker");
+        assert_eq!(marker.bmc_max_depth(), None);
+        assert_eq!(marker.bmc_depth_reached(), None);
     }
 }

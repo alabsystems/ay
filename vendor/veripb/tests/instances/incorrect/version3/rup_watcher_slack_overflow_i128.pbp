@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the same wrapped watcher slack at the i128 width, which `--kernel-verify`
+% does not model. `i128::MAX ~x1 >= -1` is trivially true but its slack `i128::MAX + 1`
+% wrapped to i128::MIN, so ~x1 was reported as an assignment-independent propagation and
+% conflicted with the unit `1 x1 >= 1`. The formula is satisfiable (x1 true).
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

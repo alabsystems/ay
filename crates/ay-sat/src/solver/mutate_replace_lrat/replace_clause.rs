@@ -5,6 +5,7 @@
 use super::*;
 
 impl Solver {
+    #[track_caller]
     pub(in crate::solver) fn replace_clause_impl(
         &mut self,
         clause_idx: usize,

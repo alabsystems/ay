@@ -2,8 +2,8 @@
 
 Shared engine-dispatch primitives for AY portfolios.
 
-Today both `ay-chc` and `ay-sat` carry their own classifier / selector /
-scheduler / bandit code. This crate is the shared home for those pieces and
+`ay-chc` already uses part of this crate; `ay-sat` still carries its own
+selector and bandit code. This crate is the shared home for those pieces and
 for future solver portfolio integrations.
 
 ## What's in the box (Phase 1)
@@ -20,9 +20,13 @@ for future solver portfolio integrations.
 
 ## What's **not** in the box yet
 
-* No migration of the existing `ay-chc` / `ay-sat` portfolios (Phases 2 & 3).
+* `ay-chc` is a partial consumer: it implements `EngineId` for its engine
+  enum and routes sequential equal-share budgets through
+  `FixedOrderSchedule::equal_share`. Its features, selector, weighted
+  allocation and bandit steps are not migrated.
+* `ay-sat` is not migrated.
 * No stochastic-bandit algorithms (`UCB1`, Thompson sampling) — the SAT
-  portfolio keeps its own `BranchSelectorUCB1` until Phase 3.
+  solver's UCB1 branch-heuristic selector lives in ay-sat's `mab` module.
 * No persistence / serde for bandit state — downstream crates can add
   feature-gated serde on top if needed.
 
@@ -106,7 +110,7 @@ let _ = distribution;
 ## Testing
 
 ```bash
-cargo test -p ay-dispatch
+targo --unverified test -p ay-dispatch
 ```
 
 ## Stability

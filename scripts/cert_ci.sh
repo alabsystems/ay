@@ -47,22 +47,68 @@ for _required in VERIPB_REPO VERIPB_COMMIT VERIPB_PATCH VERIPB_PATCH_SHA256 \
     [ -n "$_value" ] || { echo "ERROR: $PIN_FILE does not set $_required" >&2; exit 2; }
 done
 
+# The shared cache root, and the pin's own integrity.
+#
+# VERIPB_PATCH_SHA256 is not merely a checksum of a committed file: its first
+# twelve hex digits are half the cache id, so a patch file that does not match
+# the pin would make the probe below resolve a build belonging to a DIFFERENT
+# pin. It used to be verified only on the branch that BUILDS; the probe reads
+# the id whether or not anything is built, so the check is hoisted to run
+# always.
+#
+# ABSENT is not MISMATCHED. The public snapshot ships the pin but not the
+# patch file (a private fork's delta; publish/DECISIONS.md, 2026-09-25). With
+# no file there is no second identity to disagree with the pin, so the cache
+# probe below still resolves only a build keyed by VERIPB_PATCH_SHA256, and the
+# self-test battery and the soundness fixtures vet whatever is resolved, as they
+# do on every run. What an absent patch cannot do is BUILD: that branch refuses
+# as SETUP. A file that is present and does not match stays a hard error.
+CACHE="${VERIPB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb}"
+PATCH_ABSENT=0
+if [ ! -e "$REPO/$VERIPB_PATCH" ]; then
+    PATCH_ABSENT=1
+    echo "NOTE: $VERIPB_PATCH is not in this tree; the pin's sha256 is the identity."
+    echo "      A checker must be supplied or already cached; it is vetted below."
+fi
+actual_patch_sha=$(sha256_file "$REPO/$VERIPB_PATCH" 2>/dev/null || true)
+if [ "$PATCH_ABSENT" = 0 ] && [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
+    echo "ERROR: $VERIPB_PATCH does not match VERIPB_PATCH_SHA256 in $PIN_FILE" >&2
+    echo "       pin:  $VERIPB_PATCH_SHA256" >&2
+    echo "       file: ${actual_patch_sha:-<unreadable>}" >&2
+    exit 2
+fi
+
 BIN=${AY_PB_BIN:-"$REPO/target/release/ay-pb"}
-[ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN (cargo build -p ay-pb --release)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN (targo --unverified build -p ay-pb --release)" >&2; exit 2; }
 
 VERIPB=${VERIPB_BIN:-${AY_PB26_VERIPB_BIN:-${VERIPB:-}}}
 if [ -n "$VERIPB" ] && [ ! -x "$VERIPB" ]; then
     echo "ERROR: VERIPB_BIN/AY_PB26_VERIPB_BIN/VERIPB names '$VERIPB', which is not executable" >&2
     exit 2
 fi
-if [ -z "$VERIPB" ] && command -v veripb >/dev/null 2>&1; then
-    VERIPB=$(command -v veripb)
-fi
 if [ -z "$VERIPB" ]; then
+    # IDENTITY FIRST. `veripb` on PATH, /tmp/veripb-3 and ~/.cargo/bin record no
+    # commit and no patch; a pinned cache directory records both. Ranking is NOT
+    # what makes this script sound -- veripb_require_self_test and
+    # veripb_require_soundness below run over whatever is resolved, from any
+    # source, and that is the property the Rust resolver was brought into line
+    # with on 2026-09-22. But preferring an unidentifiable binary over the build
+    # this very script produces is backwards, and leaving the top-ranked
+    # identity-free candidates while dropping the bottom-ranked one is not a fix.
+    #
+    # The glob accepts a keyed directory built by ANY compiler: the same rule as
+    # the Rust resolver's is_pinned_cache_dir, and it needs no rustc to evaluate
+    # (the compiler is in the key so that two of them do not share one target
+    # dir -- E0514 -- and a finished binary runs the same either way).
+    _cci_id="$CACHE/$(veripb_legacy_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256")"
     for candidate in \
+        "$_cci_id"-rustc*/target/release/veripb \
+        "$_cci_id/target/release/veripb" \
+        "$(command -v veripb 2>/dev/null || true)" \
         /tmp/veripb-3/bin/veripb \
         "$HOME/.cargo/bin/veripb"
     do
+        [ -n "$candidate" ] || continue
         [ -x "$candidate" ] || continue
         VERIPB=$candidate
         break
@@ -78,21 +124,25 @@ if [ -z "$VERIPB" ]; then
     # `s VERIFIED UNSATISFIABLE` for satisfiable formulas (see
     # ci/veripb-soundness/03 and 04), so the gate would have certified AY's
     # answers against a checker known to give wrong verdicts.
-    CACHE="${VERIPB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb}"
-    actual_patch_sha=$(sha256_file "$REPO/$VERIPB_PATCH" 2>/dev/null || true)
-    if [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
-        echo "ERROR: $VERIPB_PATCH does not match VERIPB_PATCH_SHA256 in $PIN_FILE" >&2
-        echo "       pin:  $VERIPB_PATCH_SHA256" >&2
-        echo "       file: ${actual_patch_sha:-<unreadable>}" >&2
-        exit 2
-    fi
+    # (The patch sha was verified against the pin at startup, above: the cache
+    # id derived below is built from it.)
     # The key covers the commit, the patch, AND the compiler (one authority:
     # scripts/lib/veripb_build_id.sh, shared with pb_certified_gate.sh — this
     # script previously computed an unkeyed <commit>-<patch12> id, so the same
     # pinned checker lived at a different path depending on which entry point
-    # built it). The compiler is resolved by the lib ($RUSTC, rustc on PATH,
-    # then the compiler_consumer sysroot) and passed to cargo explicitly so the compiler
-    # named in the key is the one that actually builds.
+    # built it). The compiler is resolved by the lib ($RUSTC, the compiler_consumer
+    # sysroot, then rustc on PATH) and passed explicitly to the build frontend
+    # (veripb_cargo: targo --unverified with the Trust toolchain, plain cargo
+    # without it) so the compiler named in the key is the one that builds.
+    # Every keyed or legacy build of this pin was already tried above, so with
+    # no patch file there is nothing left to reuse and nothing to build from.
+    if [ "$PATCH_ABSENT" = 1 ]; then
+        echo "SETUP: no VeriPB checker was resolved, and $VERIPB_PATCH is not in" >&2
+        echo "       this tree, so the pinned checker cannot be built here. Supply" >&2
+        echo "       one with VERIPB_BIN=/path/to/veripb; it must pass the self-test" >&2
+        echo "       battery and refuse all twenty-two soundness fixtures." >&2
+        exit 2
+    fi
     AY_VERIPB_RUSTC=$(veripb_rustc_path) || exit 2
     BUILD_ID=$(veripb_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256") || exit 2
     BUILD_DIR="$CACHE/$BUILD_ID"
@@ -120,7 +170,9 @@ if [ -z "$VERIPB" ]; then
                 exit 2
             }
             git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
-            (cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet)
+            # This target is relative to the keyed cache after cd, independent
+            # of the caller's AY Cargo target and of a relative VERIPB_CACHE.
+            (cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" veripb_cargo build --release --quiet --target-dir target)
         fi
     fi
 fi

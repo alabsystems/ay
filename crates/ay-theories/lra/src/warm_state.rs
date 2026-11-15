@@ -169,8 +169,9 @@ impl LraSolver {
     #[inline]
     pub(crate) fn warm_mark_nonbasic_dirty(&mut self, var: u32) {
         let vi = var as usize;
-        if vi >= self.warm.nonbasic_stamp.len() {
-            self.warm.nonbasic_stamp.resize(vi + 1, 0);
+        // One dedup stamp per variable id: grow to cover `vi`.
+        while self.warm.nonbasic_stamp.len() <= vi {
+            self.warm.nonbasic_stamp.push(0);
         }
         if self.warm.nonbasic_stamp[vi] == self.warm.nonbasic_epoch {
             return;
@@ -190,8 +191,9 @@ impl LraSolver {
         if vi >= self.vars.len() {
             return;
         }
-        if vi >= self.warm.delta_stamp.len() {
-            self.warm.delta_stamp.resize(vi + 1, 0);
+        // One stamp per variable (`vi < vars.len()` above): grow to cover `vi`.
+        while self.warm.delta_stamp.len() <= vi {
+            self.warm.delta_stamp.push(0);
         }
         if self.warm.delta_stamp[vi] == self.warm.delta_epoch {
             return;
@@ -226,6 +228,7 @@ impl LraSolver {
         // Values are about to change wholesale: the guard memo and the
         // tightened-list chain no longer describe the assignment.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         let mut delta = std::mem::take(&mut self.warm.delta);
         for (var, old_val) in delta.drain(..) {

@@ -74,6 +74,9 @@ fn run_verify(
         .arg(instance)
         .arg(solution_path)
         .env("PATH", path)
+        // The oracle is resolved from PATH alone here; an ambient Z3_PATH
+        // would bypass the hermetic PATH each test builds.
+        .env_remove("Z3_PATH")
         .output()
         .expect("run ay-pb verifier")
 }
@@ -174,17 +177,68 @@ fn default_auto_mode_is_unverified_when_z3_is_absent() {
     assert_summary(&output, 1, "s VERIFICATION UNVERIFIED");
 }
 
+/// A fake z3 that proves its identity the way real z3 does (a `Z3 version`
+/// banner for `--version`, an error for `--z3-mode`) and then answers
+/// `answer` with `exit_code`.
 #[cfg(unix)]
 fn install_fake_z3(directory: &TestDirectory, answer: &str, exit_code: u8) {
+    install_z3_script(
+        directory,
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'Z3 version 4.16.0 - 64 bit\\n'; exit 0;;\n  \
+             --z3-mode) printf 'Error: invalid command line option: --z3-mode\\n'; exit 109;;\n\
+             esac\n/bin/cat >/dev/null\nprintf '{answer}\\n'\nexit {exit_code}\n"
+        ),
+    );
+}
+
+#[cfg(unix)]
+fn install_z3_script(directory: &TestDirectory, script: &str) {
     use std::os::unix::fs::PermissionsExt;
 
     let z3 = directory.path.join("z3");
-    let script =
-        format!("#!/bin/sh\n/bin/cat >/dev/null\nprintf '{answer}\\n'\nexit {exit_code}\n");
     fs::write(&z3, script).expect("write fake z3");
     let mut permissions = fs::metadata(&z3).expect("stat fake z3").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(z3, permissions).expect("make fake z3 executable");
+}
+
+/// A program named `z3` that answers `unsat` to everything but never proves
+/// it is z3 must not confirm an optimum, and neither may an AY drop-in that
+/// prints z3's banner under `--z3-mode`.
+#[cfg(unix)]
+#[test]
+fn a_z3_that_does_not_prove_its_identity_cannot_confirm_an_optimum() {
+    let directory = TestDirectory::new();
+    let instance = directory.write("instance.opb", INSTANCE);
+    let solution = "o 2\ns OPTIMUM FOUND\nv x1 x2 -x3\n";
+    for (name, script) in [
+        (
+            "no-banner",
+            "#!/bin/sh\n/bin/cat >/dev/null\nprintf 'unsat\\n'\nexit 0\n",
+        ),
+        (
+            "impostor",
+            "#!/bin/sh\ncase \"$1\" in\n  --version|--z3-mode) printf 'Z3 version 5.1.0 - 64 bit\\n'; exit 0;;\n\
+             esac\n/bin/cat >/dev/null\nprintf 'unsat\\n'\nexit 0\n",
+        ),
+    ] {
+        install_z3_script(&directory, script);
+        let output = run_verify(
+            &directory,
+            &instance,
+            &format!("{name}.out"),
+            solution,
+            &["--require-z3"],
+            &directory.path,
+        );
+        assert_summary(&output, 1, "s VERIFICATION UNVERIFIED");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("no usable z3"),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -12,7 +12,8 @@
 //!   `--strict-proofs`, `--self-check` CLI sessions),
 //! - in-script `(set-option :produce-proofs true)`,
 //! - the `(set-option :check-proofs-strict true)` context option,
-//! - `set_self_check(true)`.
+//! - `set_self_check(true)`,
+//! - `ProofChecked` and `FullyVerified` verification levels.
 //!
 //! Publication semantics (#proof-capability B3): while shedding is active,
 //! UNSAT publishes through the `CompetitionRaw` admission lane — the exact
@@ -142,12 +143,16 @@ fn self_check_overrides_shedding() {
     assert!(exec.proof_tracker.is_enabled());
 }
 
-/// The parsed-assertion retention re-arm is gated exactly like the tracker:
-/// a shedding session keeps retention OFF (the CLI turns it off at session
-/// start), while the certified default re-arms it at the public-solve
-/// boundary.
+/// Parsed-assertion retention is session configuration, in both postures: a
+/// public solve never re-arms it (the CLI turns it off at session start), and
+/// only an explicit proof demand switches it on.
+///
+/// The certified default used to re-arm retention at the public-solve
+/// boundary. That could not reach the query being solved and changed every
+/// later one, which then certified through different lanes than the first
+/// (`session_proof_configuration_tests`).
 #[test]
-fn retention_rearm_is_gated_with_the_tracker() {
+fn retention_is_never_rearmed_by_a_public_solve() {
     const SCRIPT: &str = r"
         (set-logic QF_UF)
         (declare-const p Bool)
@@ -156,15 +161,15 @@ fn retention_rearm_is_gated_with_the_tracker() {
         (check-sat)
     ";
 
-    // Certified default: the first check-sat's begin_public_solve re-arms
-    // retention, so the later assert retains its parsed surface form.
+    // Certified default: the first check-sat leaves the host's retention off,
+    // so the later assert is decided like the first query of the session.
     let mut exec = Executor::new();
     exec.set_retain_parsed_assertions(false);
     run(&mut exec, SCRIPT);
     assert_eq!(
         exec.context().assertions_parsed().len(),
-        1,
-        "certified default must re-arm retention at the public-solve boundary"
+        0,
+        "a public solve must not re-arm retention in the certified default"
     );
 
     // Competition shedding: no re-arm, the parsed stack stays empty.
@@ -179,8 +184,8 @@ fn retention_rearm_is_gated_with_the_tracker() {
     );
 
     // In-script :produce-proofs true restores retention mid-session even in
-    // competition mode (frontend flips it at set-option time; the certified
-    // re-arm keeps it on for every later solve).
+    // competition mode: the frontend flips it at set-option time, and it stays
+    // on until `(reset)` discards the option.
     let mut exec = Executor::new();
     exec.set_competition_mode(true);
     exec.set_retain_parsed_assertions(false);
@@ -272,6 +277,12 @@ fn shedding_publishes_raw_admitted_unsat_with_recorded_class() {
     assert!(!exec.last_command_unsat_was_strictly_verified());
     assert!(!exec.last_command_unsat_was_independently_verified());
     assert!(!exec.last_command_unsat_was_exact_semantically_verified());
+    assert!(!exec.last_command_unsat_was_corroborated());
+    assert_eq!(
+        exec.last_command_unsat_evidence()
+            .map(|evidence| evidence.level()),
+        Some(crate::executor::UnsatEvidenceLevel::E0)
+    );
 }
 
 /// #proof-capability B3 every-UNSAT-admits matrix: in shedding mode EVERY
@@ -483,3 +494,6 @@ fn shed_mode_public_solve_leaves_no_proof_source_provenance() {
 }
 
 include!("competition_mode_tests/quantified_trace_arming.rs");
+
+#[path = "competition_mode_tests/verification_policy.rs"]
+mod verification_policy;

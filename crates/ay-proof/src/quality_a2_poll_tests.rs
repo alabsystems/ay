@@ -4,70 +4,8 @@
 use super::*;
 use ay_core::kani_compat::DetHashMap;
 
-#[test]
-fn cost_memo_fill_polls_cancellation_without_extra_debit() {
-    let mut terms = TermStore::new();
-    let mut root = terms.mk_var("memo_poll_root", Sort::Bool);
-    for _ in 0..TERM_COST_MEMO_POLL_INTERVAL {
-        root = terms.mk_app(Symbol::named("memo_poll_f"), [root], Sort::Bool);
-    }
-
-    let mut memo = TermCostMemo::default();
-    let mut polls = 0_usize;
-    let mut cancel_at_poll = |work: usize, bytes: usize| {
-        assert_eq!((work, bytes), (0, 0), "memo polls must not alter debits");
-        polls += 1;
-        false
-    };
-    let result = unfolded_work_memoized(&mut memo, &terms, &[root], &mut cancel_at_poll);
-
-    assert_eq!(result, Err(ProofCheckError::ResourceLimit));
-    assert_eq!(polls, 1, "the first bounded memo-fill poll must cancel");
-}
-
-#[test]
-fn warm_cost_memo_root_scan_still_polls_cancellation() {
-    let mut terms = TermStore::new();
-    let roots: Vec<_> = (0..TERM_COST_MEMO_POLL_INTERVAL)
-        .map(|index| terms.mk_var(format!("memo_poll_{index}"), Sort::Bool))
-        .collect();
-    let mut memo = TermCostMemo::default();
-    let mut unbounded = |_: usize, _: usize| true;
-    unfolded_work_memoized(&mut memo, &terms, &roots, &mut unbounded)
-        .expect("cold memo fill succeeds");
-
-    let mut polls = 0_usize;
-    let mut cancel_at_poll = |work: usize, bytes: usize| {
-        assert_eq!((work, bytes), (0, 0), "memo polls must not alter debits");
-        polls += 1;
-        false
-    };
-    let result = unfolded_work_memoized(&mut memo, &terms, &roots, &mut cancel_at_poll);
-
-    assert_eq!(result, Err(ProofCheckError::ResourceLimit));
-    assert_eq!(polls, 1, "warm-root scan must remain cancellable");
-}
-
-#[test]
-fn cold_cost_memo_high_fanout_copy_still_polls_cancellation() {
-    let mut terms = TermStore::new();
-    let children: Vec<_> = (0..TERM_COST_MEMO_POLL_INTERVAL)
-        .map(|index| terms.mk_var(format!("memo_child_{index}"), Sort::Bool))
-        .collect();
-    let root = terms.mk_app(Symbol::named("memo_high_fanout"), &children, Sort::Bool);
-
-    let mut memo = TermCostMemo::default();
-    let mut polls = 0_usize;
-    let mut cancel_at_poll = |work: usize, bytes: usize| {
-        assert_eq!((work, bytes), (0, 0), "memo polls must not alter debits");
-        polls += 1;
-        false
-    };
-    let result = unfolded_work_memoized(&mut memo, &terms, &[root], &mut cancel_at_poll);
-
-    assert_eq!(result, Err(ProofCheckError::ResourceLimit));
-    assert_eq!(polls, 1, "high-fanout child copying must be cancellable");
-}
+#[path = "quality_a2_poll_tests/memo_progress.rs"]
+mod memo_progress;
 
 // ---------------------------------------------------------------------------
 // A2 resource-parity pin (the development design notes).
@@ -80,6 +18,9 @@ fn cold_cost_memo_high_fanout_copy_still_polls_cancellation() {
 // `PayloadStats.{work,bytes,unfolded_work}` — not merely equal totals across
 // the proof — because those per-step stats feed the pre-charges that bound
 // the unmetered semantic validators.
+// The memo's own traversal/storage now adds positive caller debits SEPARATELY
+// from those invariant semantic payload stats; it must not be counted twice
+// or make a warm cache shrink the per-step semantic reserve.
 // ---------------------------------------------------------------------------
 
 fn reference_meter_reachable_terms(
@@ -405,9 +346,19 @@ fn a2_per_step_payload_stats_are_byte_identical_to_the_unmemoized_metering() {
         let mut unbounded = |_: usize, _: usize| true;
         let reference = reference_meter_step_term_payload(step, &terms, &derived, &mut unbounded)
             .expect("reference metering fits usize");
-        let mut unbounded = |_: usize, _: usize| true;
-        let memoized = meter_step_term_payload(step, &terms, &derived, &mut memo, &mut unbounded)
+        let mut actual_debits = (0, 0);
+        let mut measured = |work, bytes| {
+            actual_debits.0 += work;
+            actual_debits.1 += bytes;
+            true
+        };
+        let memoized = meter_step_term_payload(step, &terms, &derived, &mut memo, &mut measured)
             .expect("memoized metering fits usize");
+        assert!(
+            actual_debits.0 > reference.work,
+            "memo bookkeeping is not free"
+        );
+        assert!(actual_debits.1 >= reference.bytes);
         assert_eq!(
             memoized.work, reference.work,
             "step {index}: PayloadStats.work must be byte-identical to the unmemoized metering"
@@ -434,25 +385,50 @@ fn a2_per_step_payload_stats_are_byte_identical_to_the_unmemoized_metering() {
     // Re-metering a step with the fully warm memo must STILL charge the full
     // per-step payload — per-step charges are independent of memo state. This
     // is precisely where the rejected shared-visited design collapsed.
-    let mut unbounded = |_: usize, _: usize| true;
-    let warm = meter_step_term_payload(&steps[0], &terms, &derived, &mut memo, &mut unbounded)
+    let mut warm_debits = (0, 0);
+    let mut measured = |work, bytes| {
+        warm_debits.0 += work;
+        warm_debits.1 += bytes;
+        true
+    };
+    let warm = meter_step_term_payload(&steps[0], &terms, &derived, &mut memo, &mut measured)
         .expect("warm-memo metering fits usize");
     assert_eq!(warm.work, reference_stats[0].work);
     assert_eq!(warm.bytes, reference_stats[0].bytes);
     assert_eq!(warm.unfolded_work, reference_stats[0].unfolded_work);
+    assert!(
+        warm_debits.0 > warm.work,
+        "warm memo lookups and sums remain paid"
+    );
+    assert_eq!(
+        warm_debits.1, warm.bytes,
+        "warm memo requires no new storage"
+    );
 
-    // Budget-decline parity with a warm memo: a budget one unit short of the
-    // step's total work must refuse the step in BOTH implementations. The
-    // rejected design validated here because the warm walk charged almost
-    // nothing.
-    let cap = reference_stats[0].work - 1;
+    assert_declines_below_payload_bound(
+        &steps[0],
+        &terms,
+        &derived,
+        &mut memo,
+        reference_stats[0].work,
+    );
+}
+
+fn assert_declines_below_payload_bound(
+    step: &ProofStep,
+    terms: &TermStore,
+    derived: &[Option<Vec<TermId>>],
+    memo: &mut TermCostMemo,
+    payload_work: usize,
+) {
+    // A warm memo must never erase the per-step semantic payload reserve.
+    let cap = payload_work - 1;
     let mut used = 0_usize;
     let mut capped = move |work: usize, _bytes: usize| {
         used = used.saturating_add(work);
         used <= cap
     };
-    let reference_declined =
-        reference_meter_step_term_payload(&steps[0], &terms, &derived, &mut capped);
+    let reference_declined = reference_meter_step_term_payload(step, terms, derived, &mut capped);
     assert!(
         matches!(reference_declined, Err(ProofCheckError::ResourceLimit)),
         "reference must decline one work unit short"
@@ -462,8 +438,7 @@ fn a2_per_step_payload_stats_are_byte_identical_to_the_unmemoized_metering() {
         used = used.saturating_add(work);
         used <= cap
     };
-    let memoized_declined =
-        meter_step_term_payload(&steps[0], &terms, &derived, &mut memo, &mut capped);
+    let memoized_declined = meter_step_term_payload(step, terms, derived, memo, &mut capped);
     assert!(
         matches!(memoized_declined, Err(ProofCheckError::ResourceLimit)),
         "memoized metering must decline one work unit short even with a warm memo"

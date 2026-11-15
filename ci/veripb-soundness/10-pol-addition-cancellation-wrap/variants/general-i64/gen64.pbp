@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

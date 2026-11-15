@@ -1,0 +1,5 @@
+(set-logic ALL)
+(set-option :rewriter.max_power_expansion 2)
+(simplify (str.power "ab" 3))
+(set-option :REWRITER.MAX-POWER-EXPANSION 4)
+(simplify (str.power "ab" 3))

@@ -124,9 +124,7 @@ pub const ROUTED: &[Routed] = &[
 /// experiment an operator would try, and it silently does nothing.
 ///
 /// Deciding which is which is a change per call site, each needing its own
-/// measurement. What is cheap and immediate is to stop the set growing in
-/// silence: `zero_ignored_sites_are_declared` in `tests/env_ledger.rs` fails on a
-/// fifteenth undeclared one.
+/// measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZeroIgnored {
     /// The environment variable.
@@ -137,8 +135,7 @@ pub struct ZeroIgnored {
 
 /// Knobs where `=0` falls through to the compiled default.
 ///
-/// Sorted, and exhaustive over `src/` — the test derives the set from the source
-/// and requires exact agreement, so this cannot drift the way `read_sites` did.
+/// Sorted.
 pub const ZERO_IGNORED: &[ZeroIgnored] = &[];
 
 /// A `Product`-bucket knob that a CLI flag now supersedes.
@@ -182,6 +179,53 @@ pub const DEPRECATED: &[Deprecation] = &[
     // through EnvAudit's unknown-name warning, the stronger signal.)
 ];
 
+/// Environment names this REPOSITORY owns that this crate does not read.
+///
+/// # Why the audit needs this at all
+///
+/// The audit's refusal asserts that a set name is read by nothing. That claim
+/// was FALSE for a whole class of names, and a red test is what proved it: this
+/// repository's own shell tooling shares the prefix. `scripts/dev-cargo.sh`
+/// execs the cargo that one of these names selects, so every developer and every
+/// harness that goes through the wrapper exports it, `cargo test` inherits it,
+/// and so does every `ay-milp` the test suite spawns — where the audit
+/// classified it `unknown` and refused to run. That took out
+/// `tests/cert_io.rs::cli_full_accepts_certified_nonzero_objective_infeasibility`,
+/// which is the same shape of product failure as the governor exclusion in
+/// [`env_audit`]: a guard that will not let the repository run its own binary.
+///
+/// The guard itself is right and stays exactly as strict. What was wrong is its
+/// premise — this crate's ledger is not an inventory of the world, so a name
+/// outside it is only a probable typo once the names with a KNOWN owner
+/// elsewhere have been taken out.
+///
+/// # DERIVED, NOT DECLARED
+///
+/// `tooling_env_names_are_derived_from_the_repository` in
+/// `tests/env_ledger_tooling.rs` rebuilds this set from the files git tracks
+/// under `scripts/`, `publish/` and `competition/` and requires exact
+/// agreement, so it cannot go stale the way a hand-typed column did. The
+/// names live in a sibling TEXT file rather than in Rust, like
+/// `tests/retired_env_names.txt`.
+const TOOLING_ENV_NAMES: &str = include_str!("../tooling_env_names.txt");
+
+/// The inventory, one name per line, `#` comments and blank lines skipped.
+pub fn tooling_env_names() -> impl Iterator<Item = &'static str> {
+    TOOLING_ENV_NAMES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// Is `name` owned by this repository's tooling rather than by this crate?
+///
+/// A `true` here is not "this is fine, carry on": it is "this crate is not the
+/// component that can judge it". The owner named in [`TOOLING_ENV_NAMES`] is.
+#[must_use]
+pub fn is_repo_tooling_env(name: &str) -> bool {
+    tooling_env_names().any(|known| known == name)
+}
+
 /// Scan the process environment for `AY_*` names and classify them.
 ///
 /// This reads the environment, so it is a CLI-startup operation, not something
@@ -206,14 +250,17 @@ pub fn env_audit() -> EnvAudit {
         //
         // Referenced through ay-sys's own constant rather than spelled out, for
         // two reasons. The exclusion cannot drift from its owner if the name
-        // changes. And no `AY_*` LITERAL enters this crate's sources — which
-        // matters, because `tests/env_ledger.rs` scans the source TEXT,
-        // comments included, so writing the name here in prose would itself
-        // trip `every_ay_env_name_in_source_is_in_the_ledger`. (It did, on the
-        // first attempt.) The ledger stays exactly as strict as it was:
-        // `the_ledger_does_not_invent_names` rightly forbids an entry for a name
-        // this crate does not read, and this one genuinely belongs to ay-sys.
+        // changes. And no `AY_*` LITERAL enters this crate's sources: the name
+        // genuinely belongs to ay-sys, so this crate's ledger has no entry for it.
         if k == ay_sys::govern::ARMED_ENV || k == ay_sys::govern::ROOT_PID_ENV {
+            continue;
+        }
+        // A NAME THIS REPOSITORY OWNS SOMEWHERE ELSE. Same failure as the
+        // governor exclusion above, one layer out: the wrapper that execs cargo
+        // is selected by one of these, so a developer's shell exports it and
+        // every child of `cargo test` inherits it. Reporting it as a name
+        // nothing reads was simply untrue, and it killed the run.
+        if is_repo_tooling_env(&k) {
             continue;
         }
         match KNOBS.iter().find(|kn| kn.name == k) {

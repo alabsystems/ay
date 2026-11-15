@@ -7,9 +7,10 @@
 //! Compares XOR-aware solving vs plain SAT solving on cryptographic benchmarks.
 //! Requires benchmark files in `benchmarks/sat/crypto/`.
 
+use ay_criterion_main::criterion_main;
 use ay_sat::{parse_dimacs, Solver};
 use ay_xor::solve_with_xor_detection;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 use std::fs;
 use std::path::PathBuf;
 

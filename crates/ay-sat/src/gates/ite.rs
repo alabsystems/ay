@@ -27,13 +27,37 @@ impl GateExtractor {
             && Self::ternary_occ(ternary_count, lit.negated()) >= 2
     }
 
+    /// Find an ITE gate with output `pivot`, adding the clause visits of the
+    /// base-pair scan to `ite_scan_visits` (`take_ite_scan_visits`).
     pub(super) fn find_ite_gate_db(
+        &mut self,
+        pivot: Variable,
+        clauses: &ClauseArena,
+        pos_occs: &[usize],
+        neg_occs: &[usize],
+        ternary_count: &[u32],
+    ) -> Option<Gate> {
+        let mut visits = 0u64;
+        let gate = self.find_ite_gate_db_counted(
+            pivot,
+            clauses,
+            pos_occs,
+            neg_occs,
+            ternary_count,
+            &mut visits,
+        );
+        self.ite_scan_visits = self.ite_scan_visits.saturating_add(visits);
+        gate
+    }
+
+    fn find_ite_gate_db_counted(
         &self,
         pivot: Variable,
         clauses: &ClauseArena,
         pos_occs: &[usize],
         neg_occs: &[usize],
         ternary_count: &[u32],
+        visits: &mut u64,
     ) -> Option<Gate> {
         let pivot_pos = Literal::positive(pivot);
         let pivot_neg = Literal::negative(pivot);
@@ -57,6 +81,7 @@ impl GateExtractor {
         // Two positive ternaries define candidates for (cond, then, else):
         //   (pivot ∨ cond ∨ ¬else), (pivot ∨ ¬cond ∨ ¬then)
         for (i, &ci) in pos_occs.iter().enumerate() {
+            *visits += 1;
             if ci >= clauses.len() || clauses.is_empty_clause(ci) {
                 continue;
             }
@@ -85,6 +110,7 @@ impl GateExtractor {
             }
 
             for &cj in &pos_occs[i + 1..] {
+                *visits += 1;
                 if cj >= clauses.len() || clauses.is_empty_clause(cj) {
                     continue;
                 }
@@ -123,6 +149,7 @@ impl GateExtractor {
                     let mut neg_idx_then = None;
 
                     for &nk in neg_occs {
+                        *visits += 1;
                         if nk >= clauses.len() || clauses.is_empty_clause(nk) {
                             continue;
                         }

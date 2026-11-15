@@ -10,11 +10,11 @@
 
 use std::ffi::c_uint;
 
-use ay_dpll::api::Sort;
+use ay_dpll::api::{Sort, Term};
 
 use super::{
-    ffi_guard_ast, lookup_ast_sort, record_ast_sort, require_term_ast_or_return, term_to_ast,
-    Z3Context, Z3_ast, Z3_context, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
+    checked_ast_to_pub, engine_ast, ffi_guard_mk, mk_ast, require_ast_or_return, stated_sort,
+    PubTerm, Z3Context, Z3_ast, Z3_context, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
 };
 
 fn accept_bv_width(ctx: &mut Z3Context, operation: &str, width: u32) -> bool {
@@ -29,12 +29,23 @@ fn accept_bv_width(ctx: &mut Z3Context, operation: &str, width: u32) -> bool {
 }
 
 fn require_bv_operand_width(ctx: &mut Z3Context, operation: &str, operand: Z3_ast) -> Option<u32> {
-    if let Some(Sort::BitVec(bv)) = lookup_ast_sort(ctx, operand) {
+    let stated = checked_ast_to_pub(ctx, operand).and_then(|decoded| stated_sort(ctx, decoded));
+    if let Some(Sort::BitVec(bv)) = stated {
         return Some(bv.width);
     }
     ctx.last_error = Z3_INVALID_ARG;
     ctx.error_msg = Some(format!("{operation}: operand is not a bit-vector"));
     None
+}
+
+/// The AST of `t` at the sort stated for the operand `like` (the result of a
+/// width-preserving operation has its operand's sort), or at the engine's
+/// sort when none was stated.
+fn same_sort_ast(ctx: &mut Z3Context, t: Term, like: PubTerm) -> Z3_ast {
+    match stated_sort(ctx, like).cloned() {
+        Some(sort) => mk_ast(ctx, t, sort),
+        None => engine_ast(ctx, t),
+    }
 }
 
 // ---- BV binary operations ----
@@ -51,17 +62,11 @@ macro_rules! bv_binary_op {
             // null). `ffi_guard_ast` handles the null case internally and catches any
             // unwinding panic so it cannot cross the FFI boundary.
             unsafe {
-                ffi_guard_ast(c, |ctx| {
-                    let t1_term =
-                        require_term_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
-                    let t2_term =
-                        require_term_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
-                    let t = ctx.solver.$method(t1_term, t2_term);
-                    let a = term_to_ast(ctx, t);
-                    if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                        record_ast_sort(ctx, a, sort);
-                    }
-                    a
+                ffi_guard_mk(c, stringify!($name), |ctx| {
+                    let a1 = require_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
+                    let a2 = require_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
+                    let t = ctx.solver.$method(a1.term, a2.term);
+                    same_sort_ast(ctx, t, a1)
                 })
             }
         }
@@ -96,16 +101,12 @@ pub unsafe extern "C" fn Z3_mk_bvnand(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnand", "left operand", 0);
-            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvnand", "right operand", 0);
-            let and_t = ctx.solver.bvand(t1_term, t2_term);
+        ffi_guard_mk(c, "Z3_mk_bvnand", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvnand", "left operand", 0);
+            let a2 = require_ast_or_return!(ctx, t2, "Z3_mk_bvnand", "right operand", 0);
+            let and_t = ctx.solver.bvand(a1.term, a2.term);
             let t = ctx.solver.bvnot(and_t);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -121,16 +122,12 @@ pub unsafe extern "C" fn Z3_mk_bvnor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnor", "left operand", 0);
-            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvnor", "right operand", 0);
-            let or_t = ctx.solver.bvor(t1_term, t2_term);
+        ffi_guard_mk(c, "Z3_mk_bvnor", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvnor", "left operand", 0);
+            let a2 = require_ast_or_return!(ctx, t2, "Z3_mk_bvnor", "right operand", 0);
+            let or_t = ctx.solver.bvor(a1.term, a2.term);
             let t = ctx.solver.bvnot(or_t);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -146,16 +143,12 @@ pub unsafe extern "C" fn Z3_mk_bvxnor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvxnor", "left operand", 0);
-            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvxnor", "right operand", 0);
-            let xor_t = ctx.solver.bvxor(t1_term, t2_term);
+        ffi_guard_mk(c, "Z3_mk_bvxnor", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvxnor", "left operand", 0);
+            let a2 = require_ast_or_return!(ctx, t2, "Z3_mk_bvxnor", "right operand", 0);
+            let xor_t = ctx.solver.bvxor(a1.term, a2.term);
             let t = ctx.solver.bvnot(xor_t);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -174,15 +167,11 @@ macro_rules! bv_compare_op {
             // null). `ffi_guard_ast` handles the null case internally and catches any
             // unwinding panic so it cannot cross the FFI boundary.
             unsafe {
-                ffi_guard_ast(c, |ctx| {
-                    let t1 =
-                        require_term_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
-                    let t2 =
-                        require_term_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
-                    let t = ctx.solver.$method(t1, t2);
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::Bool);
-                    a
+                ffi_guard_mk(c, stringify!($name), |ctx| {
+                    let a1 = require_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
+                    let a2 = require_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
+                    let t = ctx.solver.$method(a1.term, a2.term);
+                    mk_ast(ctx, t, Sort::Bool)
                 })
             }
         }
@@ -211,14 +200,10 @@ pub unsafe extern "C" fn Z3_mk_bvnot(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnot", "operand", 0);
-            let t = ctx.solver.bvnot(t1_term);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+        ffi_guard_mk(c, "Z3_mk_bvnot", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvnot", "operand", 0);
+            let t = ctx.solver.bvnot(a1.term);
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -234,14 +219,10 @@ pub unsafe extern "C" fn Z3_mk_bvneg(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvneg", "operand", 0);
-            let t = ctx.solver.bvneg(t1_term);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+        ffi_guard_mk(c, "Z3_mk_bvneg", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvneg", "operand", 0);
+            let t = ctx.solver.bvneg(a1.term);
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -259,7 +240,7 @@ pub unsafe extern "C" fn Z3_mk_concat(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_concat", |ctx| {
             let Some(left_width) = require_bv_operand_width(ctx, "Z3_mk_concat", t1) else {
                 return 0;
             };
@@ -274,12 +255,10 @@ pub unsafe extern "C" fn Z3_mk_concat(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
             if !accept_bv_width(ctx, "Z3_mk_concat", result_width) {
                 return 0;
             }
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_concat", "left operand", 0);
-            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_concat", "right operand", 0);
-            let t = ctx.solver.bvconcat(t1_term, t2_term);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(result_width));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_concat", "left operand", 0);
+            let a2 = require_ast_or_return!(ctx, t2, "Z3_mk_concat", "right operand", 0);
+            let t = ctx.solver.bvconcat(a1.term, a2.term);
+            mk_ast(ctx, t, Sort::bitvec(result_width))
         })
     }
 }
@@ -300,7 +279,7 @@ pub unsafe extern "C" fn Z3_mk_extract(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_extract", |ctx| {
             if high < low {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(format!(
@@ -326,11 +305,9 @@ pub unsafe extern "C" fn Z3_mk_extract(
             if !accept_bv_width(ctx, "Z3_mk_extract", width) {
                 return 0;
             }
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_extract", "operand", 0);
-            let t = ctx.solver.bvextract(t1, high, low);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(width));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_extract", "operand", 0);
+            let t = ctx.solver.bvextract(a1.term, high, low);
+            mk_ast(ctx, t, Sort::bitvec(width))
         })
     }
 }
@@ -346,7 +323,7 @@ pub unsafe extern "C" fn Z3_mk_sign_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_sign_ext", |ctx| {
             let Some(operand_width) = require_bv_operand_width(ctx, "Z3_mk_sign_ext", t1) else {
                 return 0;
             };
@@ -358,11 +335,9 @@ pub unsafe extern "C" fn Z3_mk_sign_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
             if !accept_bv_width(ctx, "Z3_mk_sign_ext", result_width) {
                 return 0;
             }
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_sign_ext", "operand", 0);
-            let t = ctx.solver.bvsignext(t1, i);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(result_width));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_sign_ext", "operand", 0);
+            let t = ctx.solver.bvsignext(a1.term, i);
+            mk_ast(ctx, t, Sort::bitvec(result_width))
         })
     }
 }
@@ -378,7 +353,7 @@ pub unsafe extern "C" fn Z3_mk_zero_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_zero_ext", |ctx| {
             let Some(operand_width) = require_bv_operand_width(ctx, "Z3_mk_zero_ext", t1) else {
                 return 0;
             };
@@ -390,11 +365,9 @@ pub unsafe extern "C" fn Z3_mk_zero_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
             if !accept_bv_width(ctx, "Z3_mk_zero_ext", result_width) {
                 return 0;
             }
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_zero_ext", "operand", 0);
-            let t = ctx.solver.bvzeroext(t1, i);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(result_width));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_zero_ext", "operand", 0);
+            let t = ctx.solver.bvzeroext(a1.term, i);
+            mk_ast(ctx, t, Sort::bitvec(result_width))
         })
     }
 }
@@ -410,7 +383,7 @@ pub unsafe extern "C" fn Z3_mk_repeat(c: Z3_context, i: c_uint, t1: Z3_ast) -> Z
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_repeat", |ctx| {
             let Some(operand_width) = require_bv_operand_width(ctx, "Z3_mk_repeat", t1) else {
                 return 0;
             };
@@ -422,11 +395,9 @@ pub unsafe extern "C" fn Z3_mk_repeat(c: Z3_context, i: c_uint, t1: Z3_ast) -> Z
             if !accept_bv_width(ctx, "Z3_mk_repeat", result_width) {
                 return 0;
             }
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_repeat", "operand", 0);
-            let t = ctx.solver.bvrepeat(t1, i);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(result_width));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_repeat", "operand", 0);
+            let t = ctx.solver.bvrepeat(a1.term, i);
+            mk_ast(ctx, t, Sort::bitvec(result_width))
         })
     }
 }
@@ -442,14 +413,10 @@ pub unsafe extern "C" fn Z3_mk_rotate_left(c: Z3_context, i: c_uint, t1: Z3_ast)
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_rotate_left", "operand", 0);
-            let t = ctx.solver.bvrotl(t1_term, i);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+        ffi_guard_mk(c, "Z3_mk_rotate_left", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_rotate_left", "operand", 0);
+            let t = ctx.solver.bvrotl(a1.term, i);
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -465,14 +432,10 @@ pub unsafe extern "C" fn Z3_mk_rotate_right(c: Z3_context, i: c_uint, t1: Z3_ast
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_rotate_right", "operand", 0);
-            let t = ctx.solver.bvrotr(t1_term, i);
-            let a = term_to_ast(ctx, t);
-            if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
-                record_ast_sort(ctx, a, sort);
-            }
-            a
+        ffi_guard_mk(c, "Z3_mk_rotate_right", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_rotate_right", "operand", 0);
+            let t = ctx.solver.bvrotr(a1.term, i);
+            same_sort_ast(ctx, t, a1)
         })
     }
 }
@@ -490,16 +453,14 @@ pub unsafe extern "C" fn Z3_mk_bvcomp(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvcomp", "left operand", 0);
-            let t2 = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvcomp", "right operand", 0);
-            let eq_term = ctx.solver.eq(t1, t2);
+        ffi_guard_mk(c, "Z3_mk_bvcomp", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvcomp", "left operand", 0);
+            let a2 = require_ast_or_return!(ctx, t2, "Z3_mk_bvcomp", "right operand", 0);
+            let eq_term = ctx.solver.eq(a1.term, a2.term);
             let one = ctx.solver.bv_const(1, 1);
             let zero = ctx.solver.bv_const(0, 1);
             let t = ctx.solver.ite(eq_term, one, zero);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(1));
-            a
+            mk_ast(ctx, t, Sort::bitvec(1))
         })
     }
 }
@@ -519,16 +480,14 @@ pub unsafe extern "C" fn Z3_mk_bv2int(c: Z3_context, t1: Z3_ast, is_signed: bool
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_bv2int", "operand", 0);
+        ffi_guard_mk(c, "Z3_mk_bv2int", |ctx| {
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_bv2int", "operand", 0);
             let t = if is_signed {
-                ctx.solver.bv2int_signed(t1)
+                ctx.solver.bv2int_signed(a1.term)
             } else {
-                ctx.solver.bv2int(t1)
+                ctx.solver.bv2int(a1.term)
             };
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Int);
-            a
+            mk_ast(ctx, t, Sort::Int)
         })
     }
 }
@@ -544,15 +503,13 @@ pub unsafe extern "C" fn Z3_mk_int2bv(c: Z3_context, n: c_uint, t1: Z3_ast) -> Z
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_int2bv", |ctx| {
             if !accept_bv_width(ctx, "Z3_mk_int2bv", n) {
                 return 0;
             }
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_int2bv", "operand", 0);
-            let t = ctx.solver.int2bv(t1, n);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(n));
-            a
+            let a1 = require_ast_or_return!(ctx, t1, "Z3_mk_int2bv", "operand", 0);
+            let t = ctx.solver.int2bv(a1.term, n);
+            mk_ast(ctx, t, Sort::bitvec(n))
         })
     }
 }

@@ -69,6 +69,9 @@ impl Executor {
     /// or_neg + resolution      |- (cl goal .. goal)      ; one per kept disjunct
     /// contraction              |- (cl goal)
     /// ```
+    ///
+    /// A canonical sole survivor (`kept == [goal]`, #false-disjunct-canonical)
+    /// stops after the eliminations: `(cl kept..)` already IS `(cl goal)`.
     fn emit_provenance_or_false_disjunct(
         &mut self,
         proof: &mut Proof,
@@ -98,6 +101,12 @@ impl Executor {
         }
         if remaining != plan.kept {
             return None;
+        }
+        // #false-disjunct-canonical: `mk_or` returned the sole survivor bare,
+        // so the resolution chain above already concludes `(cl goal)`; an
+        // `or_neg` link would need `goal` to be an `or` over itself.
+        if plan.kept.as_slice() == [plan.goal] {
+            return Some(current);
         }
         for &target in &plan.kept {
             let blocker = complement_of(&mut self.ctx.terms, target);

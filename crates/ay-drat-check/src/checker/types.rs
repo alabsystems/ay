@@ -68,4 +68,14 @@ pub enum ConcludeFailure {
     /// proof obligation, so that state cannot authorize an UNSAT conclusion.
     #[error("checker state was changed through the unchecked diagnostic adapter")]
     UncheckedAdapterMutation,
+    /// A clause mentioning a variable outside the dense checker envelope
+    /// (`MAX_DENSE_VARS`) could not be stored, so the checked database is
+    /// missing part of the formula or derivation.
+    #[error("a clause mentions a variable outside the dense checker envelope")]
+    VariableOutOfRange,
+    /// The allocator refused the dense checker arrays for a variable inside
+    /// the envelope (or for the requested universe), so a clause could not
+    /// be stored and the checked database is incomplete.
+    #[error("the allocator refused the dense checker arrays, so a clause could not be stored")]
+    DenseAllocationFailed,
 }

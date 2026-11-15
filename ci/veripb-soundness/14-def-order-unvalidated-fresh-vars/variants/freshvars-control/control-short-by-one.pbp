@@ -1,0 +1,48 @@
+pseudo-Boolean proof version 3.0
+% The middle of the arity sweep: `fresh_right w1;` -- one fresh variable for a two-variable
+% order. The `izip!` truncated to length one, so `u2`/`v2` stayed unsubstituted while `u1`/`v1`
+% were handled. That is enough to make the transitivity proofgoals differ from their premises,
+% so this shape was refused by the unfixed checker as well; the arity check now refuses it for
+% the right reason instead of by accident.
+f 3;
+
+def_order bogus
+    vars
+        left u1 u2;
+        right v1 v2;
+        aux;
+    end;
+
+    def
+        1 u1 1 u2 1 v1 1 ~v2 >= 1;
+        1 u1 1 ~u2 1 ~v1 1 ~v2 >= 1;
+        1 ~u1 1 ~u2 1 ~v1 1 v2 >= 1;
+        1 ~u1 1 u2 1 v1 1 v2 >= 1;
+    end;
+
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+        qed;
+    end;
+end;
+
+load_order bogus x1 x2;
+
+dom >= 1 : x1 -> x2 x2 -> ~x1 : subproof
+    proofgoal #5
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 -3 + s;
+        pol -3 -2 + s;
+        pol -1 -2 +;
+    qed : -1;
+qed;
+
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

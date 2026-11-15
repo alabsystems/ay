@@ -342,10 +342,16 @@ mod assurance_cli_tests {
         assert!(help.contains("Rigor (--rigor <LEVEL>"));
         assert!(help.contains("fast       just the answer, like z3"));
         assert!(help.contains("certified  fail-closed"));
-        // The plain-file posture is documented right under the ladder.
+        // A single CHC engine bug published a wrong SAFE under this claim.
+        assert!(!help.contains("never publishes a wrong"));
+        assert!(help.contains("Every level runs AY's always-on self-checks where they apply"));
+        // The plain-file posture is documented right under the ladder: proofs
+        // and certificates are the default, with a named z3-exact escape hatch.
         assert!(
-            help.contains("A plain `ay FILE.smt2` (no --rigor, no proof flag) has z3's posture")
+            help.contains("Batteries are ON by default: a plain `ay FILE.smt2` records a proof")
         );
+        assert!(help.contains("For z3-exact behaviour"));
+        assert!(help.contains("pass --z3-mode"));
 
         let proof_conflict = Cli::try_parse_from([
             "ay",

@@ -62,6 +62,9 @@ fn sort_dt(sort: &Sort, resolve: &DtResolve<'_>) -> Option<DatatypeSort> {
 /// name is not misread).
 fn constructor_name(terms: &TermStore, term: TermId, resolve: &DtResolve<'_>) -> Option<String> {
     if let TermData::App(Symbol::Named(name), _) = terms.get(term) {
+        if terms.is_declared_function(name) {
+            return None;
+        }
         if let Some(dt) = sort_dt(terms.sort(term), resolve) {
             if dt.constructors.iter().any(|c| c.name == *name) {
                 return Some(name.to_string());
@@ -76,9 +79,15 @@ fn constructor_name(terms: &TermStore, term: TermId, resolve: &DtResolve<'_>) ->
 /// term unchanged when the head is not a selector of the argument's constructor.
 fn reduce_selector_chain(terms: &TermStore, term: TermId, resolve: &DtResolve<'_>) -> TermId {
     if let TermData::App(Symbol::Named(sel), args) = terms.get(term) {
+        if terms.is_declared_function(sel) {
+            return term;
+        }
         if args.len() == 1 {
             let reduced_arg = reduce_selector_chain(terms, args[0], resolve);
             if let TermData::App(Symbol::Named(ctor), cargs) = terms.get(reduced_arg) {
+                if terms.is_declared_function(ctor) {
+                    return term;
+                }
                 if let Some(dt) = sort_dt(terms.sort(reduced_arg), resolve) {
                     if let Some(c) = dt.constructors.iter().find(|c| c.name == *ctor) {
                         if let Some(idx) = c.fields.iter().position(|f| f.name == *sel) {
@@ -229,6 +238,13 @@ fn dt_axiom_bool_inner(
     if depth == 0 {
         return None;
     }
+    // Exact eta is proved independently of model values. Embedded metadata
+    // stays borrowed; named carriers keep their existing resolver path.
+    let stopped = || false;
+    let mut eta = crate::dt_eta::Budget::new(4096, &stopped);
+    if crate::dt_eta::is_constructor_eta(terms, term, &crate::dt_eta::Embedded, &mut eta) {
+        return Some(true);
+    }
     match terms.get(term) {
         TermData::Const(Constant::Bool(b)) => Some(*b),
         TermData::Not(inner) => dt_axiom_bool_inner(terms, *inner, depth - 1, resolve).map(|b| !b),
@@ -243,6 +259,7 @@ fn dt_axiom_bool_inner(
                 _ => None,
             },
         },
+        TermData::App(Symbol::Named(name), _) if terms.is_declared_function(name) => None,
         TermData::App(Symbol::Named(name), args) => match name.as_str() {
             "not" if args.len() == 1 => {
                 dt_axiom_bool_inner(terms, args[0], depth - 1, resolve).map(|b| !b)
@@ -445,8 +462,8 @@ fn cong_eq(terms: &TermStore, x: TermId, y: TermId, a: TermId, b: TermId, depth:
 /// reads a model and can only ever prove a genuine congruence lemma true.
 fn read_over_eq_congruence(terms: &TermStore, term: TermId) -> bool {
     let get_eq = |t: TermId| -> Option<(TermId, TermId)> {
-        if let TermData::App(sym, args) = terms.get(t) {
-            if sym.name() == "=" && args.len() == 2 {
+        if let TermData::App(Symbol::Named(name), args) = terms.get(t) {
+            if name == "=" && !terms.is_declared_function(name) && args.len() == 2 {
                 return Some((args[0], args[1]));
             }
         }
@@ -455,13 +472,19 @@ fn read_over_eq_congruence(terms: &TermStore, term: TermId) -> bool {
     let strip_not = |t: TermId| -> Option<TermId> {
         match terms.get(t) {
             TermData::Not(inner) => Some(*inner),
-            TermData::App(sym, args) if sym.name() == "not" && args.len() == 2 - 1 => Some(args[0]),
+            TermData::App(Symbol::Named(name), args)
+                if name == "not" && !terms.is_declared_function(name) && args.len() == 1 =>
+            {
+                Some(args[0])
+            }
             _ => None,
         }
     };
     // Candidate (antecedent-eq, consequent-eq) pairs from `or`/`=>` shapes.
     let cands: Vec<(TermId, TermId)> = match terms.get(term) {
-        TermData::App(sym, args) if sym.name() == "or" && args.len() == 2 => {
+        TermData::App(Symbol::Named(name), args)
+            if name == "or" && !terms.is_declared_function(name) && args.len() == 2 =>
+        {
             let (d0, d1) = (args[0], args[1]);
             let mut v = Vec::new();
             if let Some(inner) = strip_not(d0) {
@@ -472,7 +495,9 @@ fn read_over_eq_congruence(terms: &TermStore, term: TermId) -> bool {
             }
             v
         }
-        TermData::App(sym, args) if sym.name() == "=>" && args.len() == 2 => {
+        TermData::App(Symbol::Named(name), args)
+            if name == "=>" && !terms.is_declared_function(name) && args.len() == 2 =>
+        {
             vec![(args[0], args[1])]
         }
         _ => Vec::new(),
@@ -536,6 +561,11 @@ mod norm {
         // Only Bool-sorted assertions can be tautologies.
         if *terms.sort(term) != Sort::Bool {
             return false;
+        }
+        let stopped = || false;
+        let mut eta = crate::dt_eta::Budget::new(4096, &stopped);
+        if crate::dt_eta::is_constructor_eta(terms, term, &crate::dt_eta::Embedded, &mut eta) {
+            return true;
         }
         matches!(nb(terms, term, resolve, DEPTH), Some(NB::T))
     }
@@ -655,6 +685,9 @@ mod norm {
     ) -> Option<(String, ay_core::DatatypeSort, Vec<TermId>)> {
         // Handle both `App(name, args)` (incl. nullary) forms.
         if let TermData::App(Symbol::Named(name), args) = terms.get(t) {
+            if terms.is_declared_function(name) {
+                return None;
+            }
             if let Some(dt) = sort_dt(terms.sort(t), resolve) {
                 if let Some(c) = dt.constructors.iter().find(|c| c.name == *name) {
                     if c.fields.len() == args.len() {
@@ -668,6 +701,9 @@ mod norm {
         // genuine constructor term (no separate declaration shadows it), so treat
         // it as the 0-ary application.
         if let TermData::Var(name, _) = terms.get(t) {
+            if terms.is_declared_function(name) {
+                return None;
+            }
             if let Some(dt) = sort_dt(terms.sort(t), resolve) {
                 if let Some(c) = dt.constructors.iter().find(|c| c.name == *name) {
                     if c.fields.is_empty() {
@@ -685,6 +721,9 @@ mod norm {
             return t;
         }
         if let TermData::App(Symbol::Named(sel), args) = terms.get(t) {
+            if terms.is_declared_function(sel) {
+                return t;
+            }
             if args.len() == 1 {
                 let ra = reduce(terms, args[0], resolve, depth - 1);
                 if let Some((cname, dt, cargs)) = ctor_app(terms, ra, resolve) {
@@ -762,6 +801,12 @@ mod norm {
         resolve: &DtResolve<'_>,
         depth: u32,
     ) -> Option<NB> {
+        if terms.is_declared_function(name) {
+            // An ordinary predicate remains one atom. This preserves valid
+            // Boolean tautologies involving UFs without assigning it builtin
+            // truth or datatype-member semantics from its spelling.
+            return Some(NB::Atom(format!("A:{}", tkey(terms, t, resolve, depth))));
+        }
         match name {
             "not" if args.len() == 1 => Some(mk_not(nb(terms, args[0], resolve, depth - 1)?)),
             "and" => {

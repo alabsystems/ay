@@ -110,7 +110,7 @@ fn the_order_is_multiplicative_which_is_what_makes_exact_div_terminate() {
 }
 
 #[test]
-fn canonical_form_makes_equality_structural() {
+fn canonical_form_makes_equality_structural() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Ctx::new();
     let a = c.t(3, 1, 1, 0);
     let b = c.t(-3, 1, 1, 0);
@@ -132,7 +132,9 @@ fn canonical_form_makes_equality_structural() {
     assert_eq!(p1, p2, "like terms must be merged into one canonical form");
     assert_eq!(p1.len(), 2);
     // Descending order: y (higher variable) leads.
-    assert_eq!(c.m.mono_pows(p1.terms()[0].0), &[(1, 1)]);
+    let (leading, _) = p1.terms().first().ok_or("p1 has no terms")?;
+    assert_eq!(c.m.mono_pows(*leading), &[(1, 1)]);
+    Ok(())
 }
 
 #[test]
@@ -405,7 +407,7 @@ fn gcd_of_a_built_product_recovers_the_common_factor() {
 }
 
 #[test]
-fn gcd_is_normalized_to_a_positive_leading_coefficient() {
+fn gcd_is_normalized_to_a_positive_leading_coefficient() -> Result<(), Box<dyn std::error::Error>> {
     let mut c = Ctx::new();
     let g = {
         let a = c.t(-1, 1, 1, 0);
@@ -417,12 +419,14 @@ fn gcd_is_normalized_to_a_positive_leading_coefficient() {
     let u = c.mul(&g, &f1);
     let v = c.mul(&g, &f2);
     let got = c.m.gcd(&u, &v).unwrap();
+    let (_, leading) = got.terms().first().ok_or("the gcd has no terms")?;
     assert!(
-        !got.terms()[0].1.is_negative(),
+        !leading.is_negative(),
         "the unit ambiguity must be pinned down"
     );
     let neg = c.m.neg(&got);
     assert!(got == g || neg == g);
+    Ok(())
 }
 
 #[test]
@@ -780,7 +784,8 @@ fn every_declared_modulus_is_a_prime_below_2_pow_31() {
             return false;
         }
         let mut d = 2u64;
-        while d * d <= n {
+        // An overflowing square exceeds every `n`, so it ends the scan.
+        while d.checked_mul(d).is_some_and(|square| square <= n) {
             if n.is_multiple_of(d) {
                 return false;
             }

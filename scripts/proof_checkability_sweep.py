@@ -29,6 +29,9 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import _z3_oracle  # noqa: E402
+
 AY_BIN = ROOT / "target/release/ay"
 LEAN_DIR = ROOT / "verification/lean"
 
@@ -73,9 +76,13 @@ def get_status_field(f):
 
 
 def z3_verdict(f, timeout_s=15):
-    if not shutil.which("z3"):
+    # Only a z3 that proved it is z3, run by its path (scripts/_z3_oracle.py):
+    # `shutil.which("z3")` accepts a refusing reroute stub, whose silence read
+    # as "z3-noverdict" on every file.
+    oracle = _z3_oracle.find_z3()
+    if oracle is None:
         return None
-    rc, out, err = run(["z3", "-T:%d" % timeout_s, str(f)], timeout_s + 5)
+    rc, out, err = run([oracle.path, "-T:%d" % timeout_s, str(f)], timeout_s + 5)
     if rc is None:
         return "z3-timeout"
     # A parse/unsupported-syntax error invalidates any trailing sat/unsat line
@@ -229,6 +236,10 @@ def main():
     if args.limit:
         files = files[: args.limit]
 
+    if not args.no_z3:
+        oracle = _z3_oracle.find_z3()
+        print(f"z3 oracle: {oracle.identity() if oracle else 'none usable (z3 column skipped)'}",
+              file=sys.stderr)
     results = sweep(files, timeout_s=args.timeout, do_z3=not args.no_z3)
 
     total = len(results)

@@ -111,16 +111,19 @@ impl Executor {
                         );
                         authored_root.is_some_and(|root| {
                             self.rebuild_complementary_and_collapse(proof, root, operands.len())
-                        }) || match expanded_let_provenance {
-                            None => self.rebuild_linear_and_collapse(
-                                proof,
-                                operands,
-                                LinearAndSourceProvenance::IndexedApplication,
-                            ),
-                            Some(provenance) => {
-                                self.rebuild_linear_and_collapse(proof, operands, provenance)
+                        }) || (expanded_let_provenance.is_none()
+                            && (self.rebuild_constant_false_and_collapse(proof, operands)
+                                || self.rebuild_transported_and_collapse(proof, operands)))
+                            || match expanded_let_provenance {
+                                None => self.rebuild_linear_and_collapse(
+                                    proof,
+                                    operands,
+                                    LinearAndSourceProvenance::IndexedApplication,
+                                ),
+                                Some(provenance) => {
+                                    self.rebuild_linear_and_collapse(proof, operands, provenance)
+                                }
                             }
-                        }
                     }
                     _ => false,
                 };

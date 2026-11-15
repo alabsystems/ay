@@ -14,7 +14,7 @@ use crate::{ChcDtConstructor, ChcDtSelector, ChcSort};
 fn pair_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -34,7 +34,7 @@ fn pair_sort() -> ChcSort {
 fn option_int_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "OptionInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None".to_string(),
                 selectors: vec![],
@@ -53,7 +53,7 @@ fn option_int_sort() -> ChcSort {
 fn option_pair_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "OptionPair".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "NonePair".to_string(),
                 selectors: vec![],
@@ -72,7 +72,7 @@ fn option_pair_sort() -> ChcSort {
 fn result8_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Result8".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "Ok".to_string(),
                 selectors: vec![ChcDtSelector {
@@ -94,7 +94,7 @@ fn result8_sort() -> ChcSort {
 fn state_with_result8_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "StateResult8".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkStateResult8".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -114,7 +114,7 @@ fn recursive_list_sort() -> ChcSort {
     let backedge = ChcSort::Uninterpreted("listOfInt".to_string());
     let shallow = ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "conslistOfInt".to_string(),
                 selectors: vec![
@@ -136,7 +136,7 @@ fn recursive_list_sort() -> ChcSort {
     };
     ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "conslistOfInt".to_string(),
                 selectors: vec![
@@ -626,7 +626,7 @@ fn test_dt_flattener_preserves_non_dt_args() {
 fn nested_sort() -> (ChcSort, ChcSort) {
     let inner_sort = ChcSort::Datatype {
         name: "Inner".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkInner".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "ix".to_string(),
@@ -636,7 +636,7 @@ fn nested_sort() -> (ChcSort, ChcSort) {
     };
     let outer_sort = ChcSort::Datatype {
         name: "Outer".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkOuter".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -877,7 +877,7 @@ fn test_dt_disequality_flattened() {
 fn test_dt_flattener_bv_field_sorts_preserved() {
     let dt_sort = ChcSort::Datatype {
         name: "OptionBV8".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None".to_string(),
                 selectors: vec![],
@@ -933,7 +933,7 @@ fn test_dt_flattener_bv_field_sorts_preserved() {
 fn test_dt_flattener_none_bv_padding_is_sort_correct() {
     let dt_sort = ChcSort::Datatype {
         name: "OptionBV8".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None".to_string(),
                 selectors: vec![],
@@ -1007,7 +1007,7 @@ fn test_selector_extraction_flattens_nested_multi_ctor_payload_components() {
 fn test_dt_flattener_nested_bv_struct() {
     let inner_sort = ChcSort::Datatype {
         name: "BvPair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkBvPair".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1023,7 +1023,7 @@ fn test_dt_flattener_nested_bv_struct() {
     };
     let outer_sort = ChcSort::Datatype {
         name: "Wrapper".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "wrap".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1151,7 +1151,7 @@ fn dt_flattener_transform_memory_persists_flattening_map_facts() {
 fn balance_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Balance".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkBalance".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1171,7 +1171,7 @@ fn solidity_state_sort() -> ChcSort {
     let balances_sort = ChcSort::Array(Box::new(ChcSort::BitVec(160)), Box::new(balance_sort()));
     ChcSort::Datatype {
         name: "State".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkState".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "balances".to_string(),
@@ -1188,7 +1188,7 @@ fn int_array_sort() -> ChcSort {
 fn lia_array_state_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "LiaArrayState".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkLiaArrayState".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1385,7 +1385,7 @@ fn backtranslator_reconstructs_composed_projection_array_selector_formula() {
 fn lia_entry_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "LiaEntry".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkLiaEntry".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1405,7 +1405,7 @@ fn lia_entry_state_sort() -> ChcSort {
     let entries_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(lia_entry_sort()));
     ChcSort::Datatype {
         name: "LiaEntryState".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkLiaEntryState".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "entries".to_string(),
@@ -1584,7 +1584,7 @@ fn backtranslator_reconstructs_multi_ctor_payload_formula() {
 fn either_int_bool_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "EitherIntBool".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "Left".to_string(),
                 selectors: vec![ChcDtSelector {
@@ -1779,7 +1779,7 @@ fn test_wrong_variant_selector_on_ctor_app_is_congruent_free_var() {
 fn nested_cf_sorts() -> (ChcSort, ChcSort) {
     let inner = ChcSort::Datatype {
         name: "InnerCF".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "IC".to_string(),
                 selectors: vec![ChcDtSelector {
@@ -1798,7 +1798,7 @@ fn nested_cf_sorts() -> (ChcSort, ChcSort) {
     };
     let outer = ChcSort::Datatype {
         name: "OuterCF".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "OC".to_string(),
                 selectors: vec![ChcDtSelector {

@@ -6,6 +6,7 @@
 
 use super::*;
 
+pub(super) mod admission;
 mod ic3;
 
 impl Solver {
@@ -22,7 +23,7 @@ impl Solver {
     ///          no variable assigned at level > target_level,
     ///          qhead <= trail.len(), no_conflict_until <= trail.len()
     pub(super) fn backtrack(&mut self, target_level: u32) {
-        self.backtrack_core(target_level, true);
+        self.backtrack_ordinary(target_level, true);
     }
 
     /// Backtrack to the given level without updating phase saving.
@@ -32,7 +33,17 @@ impl Solver {
     /// - Phase saving (no `self.phase[...] = ...`)
     /// - Target/best phase updates
     pub(super) fn backtrack_without_phase_saving(&mut self, target_level: u32) {
-        self.backtrack_core(target_level, false);
+        self.backtrack_ordinary(target_level, false);
+    }
+
+    /// Backtrack out of a probe (probing, in-tree probing, transitive
+    /// reduction): phase saving and the target/best update are skipped under
+    /// `--sat-probe-phases-kissat`, as Kissat skips them while probing.
+    pub(super) fn backtrack_probe(&mut self, target_level: u32) {
+        let switches = ay_core::sat_ab_switches();
+        let save = switches.probe_phases_kissat != Some(true)
+            && switches.inproc_passes_kissat != Some(true);
+        self.backtrack_ordinary(target_level, save);
     }
 
     /// Core backtracking: compact the trail, unassign variables above target_level.
@@ -48,7 +59,19 @@ impl Solver {
     /// during unassignment. If the lambda clause is unit at the target level
     /// (all other literals falsified at levels <= target), the variable is
     /// reimplied at the lower assertion level instead of being unassigned.
-    fn backtrack_core(&mut self, target_level: u32, save_phases: bool) {
+    fn backtrack_ordinary(&mut self, target_level: u32, save_phases: bool) {
+        match self.backtrack_core(target_level, save_phases, &mut admission::Ordinary) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    fn backtrack_core<P: admission::Policy>(
+        &mut self,
+        target_level: u32,
+        save_phases: bool,
+        policy: &mut P,
+    ) -> Result<(), P::Error> {
         // REQUIRES: target_level <= decision_level (callers must not request
         // backtrack to a level above the current one).
         debug_assert!(
@@ -57,12 +80,18 @@ impl Solver {
             self.decision_level
         );
 
+        policy.prepare(
+            self,
+            target_level,
+            admission::Lane::Standard { save_phases },
+        )?;
+
         if save_phases {
             self.update_target_and_best_phases();
         }
 
         if self.decision_level <= target_level {
-            return;
+            return Ok(());
         }
 
         // #relevancy-frontier-incremental: the incremental relevancy frontier
@@ -100,11 +129,14 @@ impl Solver {
         let mut frontier =
             (frontier_synced > 0).then(|| std::mem::take(&mut self.relevancy_frontier));
 
-        let assigned_limit = if target_level == 0 {
-            0
-        } else {
-            self.trail_lim[target_level as usize - 1]
-        };
+        // CaDiCaL backtrack.cpp: the scan starts at control[new_level+1].trail,
+        // the first literal ABOVE the target level. Every trail position below
+        // it was pushed at a decision level <= target_level, so it is kept in
+        // place (write_pos == read_pos, trail_pos unchanged). Starting one
+        // level lower rescanned the whole target level on every backtrack and
+        // the whole root trail on every restart: 10,449 of the self samples
+        // on as-p61 (13,756 root-fixed variables) against 8,475 in BCP.
+        let assigned_limit = self.trail_lim[target_level as usize];
         frontier_kept = frontier_synced.min(assigned_limit);
         // CaDiCaL backtrack.cpp:52: assigned_limit within trail bounds
         debug_assert!(
@@ -410,8 +442,9 @@ impl Solver {
         // rebuild erases it first. This runs between the fold and any rebuild.
         #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
         if frontier_folded {
-            self.debug_assert_relevancy_frontier_exact_after_fold();
+            policy.check_frontier(self);
         }
+        Ok(())
     }
 
     /// ENSURES: backtrack postconditions (TLA+ TypeInvariant mirror).

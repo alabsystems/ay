@@ -219,6 +219,7 @@ impl ExactSubstituter<'_> {
         }
 
         let built = match expression {
+            ChcExpr::ArrayLambda(_) => return None,
             ChcExpr::Var(variable) => {
                 let position = *self.formal_positions.get(variable)?;
                 if matches!(
@@ -348,6 +349,7 @@ fn count_supported_actual(
         height: 1,
     };
     let children: &[Arc<ChcExpr>] = match expression {
+        ChcExpr::ArrayLambda(_) => return None,
         ChcExpr::Bool(_)
         | ChcExpr::Int(_)
         | ChcExpr::BitVec(_, _)

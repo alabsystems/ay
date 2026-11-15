@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 2.0
+* Positive companion to incorrect/version2/strengthening_to_core_bare_red_derived: the second
+* witness touches a different variable, so the obligation the first `red` now leaves behind is
+* dischargeable and the proof must still verify.
+f 1
+strengthening_to_core on
+red 1 y1 >= 1 ; y1 -> 1
+red 1 y2 >= 1 ; y2 -> 1
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

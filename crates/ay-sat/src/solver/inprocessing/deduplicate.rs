@@ -51,6 +51,9 @@ impl Solver {
         if !self.enter_inprocessing() || self.has_empty_clause {
             return self.has_empty_clause;
         }
+        // Counted work under `--sat-deterministic-inproc`: one pass over every
+        // watch list (det_work.rs).
+        self.charge_inproc_scan(self.watch_scan_te());
         // Deduplication deletes binary clauses — maintained incrementally via
         // per-clause note_irredundant_clause_removed_for_bve calls (#8096).
 
@@ -80,10 +83,10 @@ impl Solver {
                 }
 
                 let clause_idx = watch_list.clause_ref(wi).0 as usize;
-                if !self.arena.is_active(clause_idx) {
-                    continue;
-                }
-                if self.arena.is_pending_garbage(clause_idx) {
+                // Only live binaries: a garbage-kept binary can keep a watch
+                // after eager subsumption, and keeping it as the "duplicate"
+                // would delete its live twin (decompose/scc.rs).
+                if !self.arena.is_active(clause_idx) || self.arena.is_garbage_any(clause_idx) {
                     continue;
                 }
 
@@ -207,6 +210,9 @@ impl Solver {
                 }
                 (h, ProofAddKind::Derived)
             };
+            // `--sat-veripb-hints`: the two binaries it resolves.
+            self.veripb_note_antecedent_ref(ClauseRef(c0 as u32));
+            self.veripb_note_antecedent_ref(ClauseRef(c1 as u32));
             let _ = self.proof_emit_unit(unit, &hints, kind);
             self.enqueue(unit, None);
             enqueued_unit = true;

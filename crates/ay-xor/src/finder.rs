@@ -18,6 +18,24 @@ const MAX_XOR_SIZE: usize = 8;
 /// Unit clauses (size 1) are already handled efficiently by the SAT solver.
 const MIN_XOR_SIZE: usize = 2;
 
+/// Wall-clock guard on XOR detection over very large clause databases
+/// (#8078).
+const XOR_FIND_TIME_BUDGET_MS: u128 = 3000;
+
+/// The same guard under `--sat-deterministic-inproc`, as a clause count: the
+/// scan stops at a clause index instead of an elapsed time, at the same
+/// 8192-clause cadence.
+const XOR_FIND_CLAUSE_BUDGET: usize = 15_000_000;
+
+/// Whether XOR detection has spent its budget after `scanned` clauses.
+fn xor_find_budget_exhausted(find_start: std::time::Instant, scanned: usize) -> bool {
+    if ay_sat::deterministic_inproc_enabled() {
+        scanned >= XOR_FIND_CLAUSE_BUDGET
+    } else {
+        find_start.elapsed().as_millis() >= XOR_FIND_TIME_BUDGET_MS
+    }
+}
+
 /// Binary clause metadata used to recover near-complete ternary XORs.
 #[derive(Debug, Clone, Copy)]
 struct BinaryClauseSupport {
@@ -305,15 +323,11 @@ impl XorFinder {
         // Wall-clock guard (#8078): abort XOR detection on very large clause
         // databases to prevent preprocessing hangs.
         let find_start = std::time::Instant::now();
-        const XOR_FIND_TIME_BUDGET_MS: u128 = 3000;
 
         // Process each clause
         for (idx, clause) in clauses.iter().enumerate() {
             // Wall-clock check every 8192 clauses to limit overhead.
-            if idx & 0x1FFF == 0
-                && idx > 0
-                && find_start.elapsed().as_millis() >= XOR_FIND_TIME_BUDGET_MS
-            {
+            if idx & 0x1FFF == 0 && idx > 0 && xor_find_budget_exhausted(find_start, idx) {
                 break;
             }
             self.process_clause_with_index(clause, idx);
@@ -338,15 +352,11 @@ impl XorFinder {
         // Wall-clock guard (#8078): abort XOR detection on very large clause
         // databases to prevent preprocessing hangs.
         let find_start = std::time::Instant::now();
-        const XOR_FIND_TIME_BUDGET_MS: u128 = 3000;
 
         // Process each clause with its index
         for (idx, clause) in clauses.iter().enumerate() {
             // Wall-clock check every 8192 clauses to limit overhead.
-            if idx & 0x1FFF == 0
-                && idx > 0
-                && find_start.elapsed().as_millis() >= XOR_FIND_TIME_BUDGET_MS
-            {
+            if idx & 0x1FFF == 0 && idx > 0 && xor_find_budget_exhausted(find_start, idx) {
                 break;
             }
             self.process_clause_with_index(clause, idx);
@@ -371,13 +381,9 @@ impl XorFinder {
         self.candidates.clear();
 
         let find_start = std::time::Instant::now();
-        const XOR_FIND_TIME_BUDGET_MS: u128 = 3000;
 
         for (idx, clause) in clauses.iter().enumerate() {
-            if idx & 0x1FFF == 0
-                && idx > 0
-                && find_start.elapsed().as_millis() >= XOR_FIND_TIME_BUDGET_MS
-            {
+            if idx & 0x1FFF == 0 && idx > 0 && xor_find_budget_exhausted(find_start, idx) {
                 break;
             }
             self.process_clause_with_index(clause, idx);

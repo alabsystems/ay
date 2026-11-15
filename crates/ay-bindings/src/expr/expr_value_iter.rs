@@ -154,10 +154,21 @@ impl ExprValue {
             | ExprValue::FpGt(a, b)
             | ExprValue::FpGe(a, b)
             | ExprValue::FpRem(a, b)
+            | ExprValue::FpTruncatingRem(a, b)
             | ExprValue::FpMin(a, b)
             | ExprValue::FpMax(a, b) => vec![a, b],
 
             ExprValue::Select { array, index } => vec![array, index],
+
+            ExprValue::ArrayRangeCopy {
+                dst,
+                src,
+                lo,
+                hi,
+                src_start,
+            } => {
+                vec![dst, src, lo, hi, src_start]
+            }
 
             // Binary with rounding mode (rm is not an Expr)
             ExprValue::FpAdd(_, a, b)
@@ -353,10 +364,21 @@ impl ExprValue {
             | ExprValue::FpGt(a, b)
             | ExprValue::FpGe(a, b)
             | ExprValue::FpRem(a, b)
+            | ExprValue::FpTruncatingRem(a, b)
             | ExprValue::FpMin(a, b)
             | ExprValue::FpMax(a, b) => vec![a, b],
 
             ExprValue::Select { array, index } => vec![array, index],
+
+            ExprValue::ArrayRangeCopy {
+                dst,
+                src,
+                lo,
+                hi,
+                src_start,
+            } => {
+                vec![dst, src, lo, hi, src_start]
+            }
 
             // Binary with rounding mode (rm is not an Expr)
             ExprValue::FpAdd(_, a, b)
@@ -506,6 +528,7 @@ impl ExprValue {
             | ExprValue::RealGe(_, _)
             | ExprValue::Select { .. }
             | ExprValue::Store { .. }
+            | ExprValue::ArrayRangeCopy { .. }
             | ExprValue::ConstArray { .. }
             | ExprValue::DatatypeConstructor { .. }
             | ExprValue::DatatypeSelector { .. }
@@ -524,6 +547,7 @@ impl ExprValue {
             | ExprValue::FpFma(_, _, _, _)
             | ExprValue::FpSqrt(_, _)
             | ExprValue::FpRem(_, _)
+            | ExprValue::FpTruncatingRem(_, _)
             | ExprValue::FpRoundToIntegral(_, _)
             | ExprValue::FpMin(_, _)
             | ExprValue::FpMax(_, _)

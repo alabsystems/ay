@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+% `1 x2 >= i64::MIN` is trivially true, so `rup` accepts it honestly. The formula propagates
+% `x2` to TRUE at level zero, and substituting that assignment lowered the degree with an
+% unchecked `-=`: the true `i64::MIN - 1` wrapped to `i64::MAX` over an empty left-hand side,
+% i.e. into the empty contradiction. `implies()` short-circuits on a contradicting source, so
+% the `red` step's proof goals were all auto-discharged as `DBImpliesSubstituted` and
+% `1 ~x1 >= 1` entered the database with no proof. Adding it to constraint 1 gives the empty
+% contradiction, and the satisfiable formula is reported UNSAT.
+f 2;
+rup 1 x2 >= -9223372036854775808 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

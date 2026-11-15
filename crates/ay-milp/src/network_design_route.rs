@@ -1075,7 +1075,12 @@ pub fn verify_infeasibility_certificate(
     verify_infeasibility_certificate_with_deadline(model, certificate, None)
 }
 
-fn verify_infeasibility_certificate_with_deadline(
+/// Rebuild and replay the network projection under the caller's existing
+/// absolute deadline. Expiry is a replay error and never proof authority.
+///
+/// # Errors
+/// Returns an error for expiry, an unsupported model, or rejected proof.
+pub fn verify_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &NetworkDesignInfeasibilityCertificate,
     deadline: Option<Instant>,

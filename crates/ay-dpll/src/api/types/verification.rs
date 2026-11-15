@@ -274,15 +274,26 @@ pub struct VerificationSummary {
     /// recorded failures alone does not establish this claim.
     pub unsat_proof_strictly_verified: bool,
     /// True when strict proof checking declined a trust-family step, but a
-    /// sealed independent SAT-refutation or complete trust-discharge lane
-    /// established the exact authored query. This never means that the original
-    /// proof itself passed strict checking.
+    /// sealed independent SAT-refutation lane established the exact authored
+    /// query. This never means that the original proof itself passed strict
+    /// checking. A `discharged-trust` admission is NOT this class (evidence
+    /// policy P4, 2026-10-02); it is [`Self::unsat_corroborated`].
     pub unsat_independently_verified: bool,
     /// True only when the exact-query UNSAT result consumed the narrow,
     /// independently checked integer-existential semantic certificate. This is
     /// deliberately disjoint from `unsat_proof_strictly_verified` and does not
     /// claim that an external proof artifact exists.
     pub unsat_exact_semantically_verified: bool,
+    /// True when the UNSAT result was admitted as `discharged-trust`: its
+    /// unproved steps were corroborated by AY re-running its own code (a
+    /// standalone-tautology re-check or a fresh re-solve). Evidence E1 — a
+    /// reproduction, not an independent check. Disjoint from the three
+    /// classes above.
+    pub unsat_corroborated: bool,
+    /// The evidence level of the published UNSAT (`None` for any other
+    /// result): E2 checked, E1 re-derived or corroborated by AY's own code,
+    /// E0 raw.
+    pub unsat_evidence_level: Option<crate::executor::UnsatEvidenceLevel>,
     /// Number of internal proof-checker failures recorded for the solve call.
     pub unsat_proof_checker_failures: u64,
     /// Number of assertions independently verified by the model evaluator.

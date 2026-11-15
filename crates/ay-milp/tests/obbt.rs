@@ -5,8 +5,8 @@
 //! OBBT driver tests (P3): productivity, soundness (the tightened box never
 //! excludes a feasible point), determinism, and fail-closed behaviour. The
 //! pure-exact-rim soundness twin lives in `tests/obbt_exact.rs` (it forces
-//! the float advice lane off via `the no-float knob`, a process-global switch
-//! that must own its own test binary). See `crates/ay-milp/design/P3-SPEC.md`.
+//! the float advice lane off through each session's typed engine options).
+//! See `crates/ay-milp/design/P3-SPEC.md`.
 
 use ay_milp::{Col, LpSession, Model, ObbtOpts, Outcome, Sense, SolveOpts};
 use num_traits::ToPrimitive;

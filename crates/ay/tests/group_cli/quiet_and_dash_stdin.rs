@@ -9,28 +9,22 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::spawn::{OutputTimeout, DEFAULT_CHILD_TIMEOUT};
 
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn write_temp_cnf(contents: &str) -> (PathBuf, CleanupGuard) {
-    static FILE_ID: AtomicUsize = AtomicUsize::new(0);
-    let file_id = FILE_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ay_quiet_dash_{}_{}.cnf",
-        std::process::id(),
-        file_id
-    ));
-    std::fs::write(&path, contents).expect("write temp CNF");
-    (path.clone(), CleanupGuard(path))
+/// Write `contents` as `input.cnf` in a fresh directory of its own.
+///
+/// A default solve of `X.cnf` synthesizes `X.cnf.drat` and settles its
+/// `X.cnf.drat.ay-status` marker even on SAT, and a later run never overwrites
+/// either (449fd06aa): it warns and publishes no proof. Two runs compared
+/// byte-for-byte must therefore not share an input path, or the second one's
+/// stderr carries the first one's leftovers. The directory also collects every
+/// sidecar, so dropping it leaves nothing behind.
+fn write_isolated_cnf(contents: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("create isolated CNF directory");
+    let path = dir.path().join("input.cnf");
+    std::fs::write(&path, contents).expect("write isolated CNF");
+    (dir, path)
 }
 
 // Trivially satisfiable one-variable CNF.
@@ -61,19 +55,22 @@ fn dash_file_reads_formula_from_stdin() {
 
 #[test]
 fn quiet_suppresses_commentary_but_not_stdout_or_exit_code() {
-    let (cnf_path, _guard) = write_temp_cnf(SAT_CNF);
+    // Same formula, separate paths: each run starts from a clean default-proof
+    // namespace, so the two stderrs differ only by what `-q` suppresses.
+    let (_plain_dir, plain_cnf) = write_isolated_cnf(SAT_CNF);
+    let (_quiet_dir, quiet_cnf) = write_isolated_cnf(SAT_CNF);
     let ay_path = env!("CARGO_BIN_EXE_ay");
 
     let plain = Command::new(ay_path)
         .arg("solve")
-        .arg(&cnf_path)
+        .arg(&plain_cnf)
         .output_timeout(DEFAULT_CHILD_TIMEOUT)
         .expect("spawn ay solve FILE");
 
     let quiet = Command::new(ay_path)
         .arg("solve")
         .arg("-q")
-        .arg(&cnf_path)
+        .arg(&quiet_cnf)
         .output_timeout(DEFAULT_CHILD_TIMEOUT)
         .expect("spawn ay solve -q FILE");
 

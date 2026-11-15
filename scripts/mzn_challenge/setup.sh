@@ -15,10 +15,15 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 command -v minizinc >/dev/null || { echo "installing minizinc..."; brew install minizinc; }
 command -v gtimeout >/dev/null || { echo "installing coreutils (gtimeout)..."; brew install coreutils; }
-command -v cargo >/dev/null || { echo "ERROR: cargo is required"; exit 1; }
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. "$REPO/scripts/lib/cargo_frontend.sh"
+command -v targo >/dev/null || command -v cargo >/dev/null \
+  || { echo "ERROR: cargo (or the Trust toolchain's targo) is required"; exit 1; }
 
 # `ay corpus` performs pinned size/SHA verification and transactional install.
-(cd "$REPO" && cargo build --release -p ay --features cli --bin ay)
+(cd "$REPO" && ay_cargo build --release -p ay --features cli --bin ay)
 (cd "$REPO" && "$AY_BIN" corpus download \
   minizinc-challenge-2025 minizinc-challenge-2025-results)
 (cd "$REPO" && "$AY_BIN" corpus verify \

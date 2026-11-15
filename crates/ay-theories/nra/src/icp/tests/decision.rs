@@ -155,6 +155,7 @@ fn icp_algebraic_certificate_refuses_unparsed_atoms() {
         ParseCoverage::Complete,
         SearchAuthority::Exhaustive,
         MAX_BOXES,
+        &solver.icp_main_box_count,
     );
     let got = match result {
         UniResult::Sat(_) => "Sat",
@@ -165,6 +166,65 @@ fn icp_algebraic_certificate_refuses_unparsed_atoms() {
     assert_eq!(
         got, "Unknown",
         "an algebraic certificate must not ignore an unparsed asserted atom"
+    );
+}
+
+/// A root box whose widest variable needs hundreds of bisections to
+/// reach `MIN_WIDTH` (the QF_UFNRA sqrtStep shape: `x` in
+/// `[1, ~2^199]`) cannot be exhaustively refuted within the box
+/// budget; the main tree must be capped to a shallow-contraction
+/// probe instead of spending the full budget descending one path.
+/// The unparsed division atom makes the coverage partial, so the
+/// tree has refutation-only authority and must answer `Unknown`
+/// for this satisfiable system.
+#[test]
+fn icp_wide_box_caps_main_tree_budget() {
+    use ay_core::term::TermStore;
+    use ay_core::Sort;
+    use ay_core::TheorySolver;
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let c1 = terms.mk_rational(rat(1));
+    let huge = terms.mk_rational(BigRational::from_integer(BigInt::one() << 220));
+    let c1000 = terms.mk_rational(rat(1000));
+    let ysq = terms.mk_mul(vec![y, y]);
+    let a1 = terms.mk_ge(x, c1);
+    let a2 = terms.mk_le(x, huge);
+    let a3 = terms.mk_eq(ysq, x);
+    let quot = terms.mk_div(x, y);
+    let a4 = terms.mk_gt(quot, c1000);
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(a1, true);
+    solver.assert_literal(a2, true);
+    solver.assert_literal(a3, true);
+    solver.assert_literal(a4, true);
+    assert!(
+        solver.atom_to_multi(a4, true).is_none(),
+        "x / y > 1000 must remain outside the multivariate fragment"
+    );
+
+    let result = solver.try_icp_branch_and_prune();
+    assert!(
+        matches!(result, UniResult::Unknown),
+        "partial coverage plus an unrefutable-wide box must stay Unknown"
+    );
+    let stats = solver.collect_statistics();
+    let stat = |name: &str| {
+        stats
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| *value)
+    };
+    assert_eq!(
+        stat("nra_icp_wide_tree_caps"),
+        Some(1),
+        "the wide root box must engage the reduced main-tree budget"
+    );
+    let main_boxes = stat("nra_icp_main_boxes").unwrap_or(u64::MAX);
+    assert!(
+        main_boxes <= 129,
+        "wide-box main tree must stay within the capped budget, got {main_boxes}"
     );
 }
 

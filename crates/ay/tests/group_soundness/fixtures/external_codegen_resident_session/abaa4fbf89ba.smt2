@@ -1,0 +1,8 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const ld_v96_o0 (_ BitVec 64))
+(declare-const ld_v96_o16 (_ BitVec 64))
+(declare-const ld_v96_o24 (_ BitVec 64))
+(assert (not (= (ite (and (bvuge (bvadd ld_v96_o16 (bvand ld_v96_o0 (_ bv4294967295 64))) ld_v96_o16) (bvult (bvadd ld_v96_o16 (bvand ld_v96_o0 (_ bv4294967295 64))) ld_v96_o24)) (bvor (bvshl (bvlshr ld_v96_o0 (_ bv32 64)) (_ bv32 64)) (bvlshr ld_v96_o0 (_ bv32 64))) ld_v96_o0) (ite (and (bvuge (bvadd ld_v96_o16 (bvand ld_v96_o0 (_ bv4294967295 64))) ld_v96_o16) (bvult (bvadd ld_v96_o16 (bvand ld_v96_o0 (_ bv4294967295 64))) ld_v96_o24)) (bvor (bvshl (bvlshr ld_v96_o0 (_ bv32 64)) (_ bv32 64)) (bvlshr ld_v96_o0 (_ bv32 64))) ld_v96_o0))))
+(check-sat)

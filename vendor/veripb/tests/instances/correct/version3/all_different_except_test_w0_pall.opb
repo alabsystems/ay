@@ -1,0 +1,4 @@
+* #variable= 2 #constraint= 2
+preserved: i[_1][b0] i[_1][b1] ;
+@i[_1][lb] 1 i[_1][b0] 2 i[_1][b1] >= 0 ;
+@i[_1][ub] -1 i[_1][b0] -2 i[_1][b1] >= -3 ;

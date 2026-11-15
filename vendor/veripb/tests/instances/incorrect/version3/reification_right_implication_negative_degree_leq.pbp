@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% The `<=` half of `reification_right_implication_negative_degree`: the big-M
+% coefficient there is `sum - degree`, and `x2 x3 ==> 1 x1 <= 5` (a tautology,
+% since x1 is 0/1) was stored as the real constraint `1 ~x1 4 x2 4 x3 >= 4`.
+f 1 ;
+e x2 x3 ==> 1 x1 <= 5 : 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 4;
+pbc 1 ~x3 1 x4 1 x5 1 x6 >= 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

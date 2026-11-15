@@ -23,6 +23,7 @@ struct DerivedConversionState {
     widening_byte_slack: usize,
     reconstruction_row_bound: usize,
     root_state: Option<RootPropagation>,
+    compaction_scratch: Option<CompactionScratch>,
 }
 
 fn convert_derived_clauses(
@@ -51,6 +52,7 @@ fn convert_derived_clauses(
         widening_byte_slack: inputs.shape.widening_byte_slack,
         reconstruction_row_bound,
         root_state: None,
+        compaction_scratch: None,
     };
     for (entry_index, entry) in inputs.entries.iter().enumerate() {
         meter.charge(1)?;
@@ -164,17 +166,32 @@ fn repair_derived_hints(
     candidate_capacity: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
-    let compacted = compact_rup_hint_candidates(
-        inputs.original_clauses,
-        &state.steps,
-        entry.clause,
-        inputs.unit_premises,
-        candidates,
-        candidate_capacity,
-        inputs.num_vars,
-        inputs.shape.synthesis_scratch_bytes,
-        meter,
-    )?;
+    // This owner never escapes one conversion/variable namespace. Moving it
+    // into the row means an error or unwind cannot return dirty scratch for
+    // another row or a fallback lane.
+    let (compacted, scratch) = meter.in_phase(ConversionPhase::Compaction, |meter| {
+        let scratch = match state.compaction_scratch.take() {
+            Some(scratch) => scratch,
+            None => CompactionScratch::new(
+                inputs.num_vars,
+                inputs.shape.compaction_scratch_bytes,
+                meter,
+            )?,
+        };
+        compact_rup_hint_candidates(
+            inputs.original_clauses,
+            &state.steps,
+            entry.clause,
+            inputs.unit_premises,
+            candidates,
+            candidate_capacity,
+            scratch,
+            inputs.shape.synthesis_scratch_bytes,
+            inputs.shape.candidate_scheduler_bytes,
+            meter,
+        )
+    })?;
+    state.compaction_scratch = Some(scratch);
     if compacted.is_some() {
         return Ok(compacted);
     }
@@ -191,39 +208,51 @@ fn repair_derived_hints(
             .min(admitted_row_hints.saturating_add(slack_hints)),
     );
     if state.root_state.is_none() {
-        state.root_state = Some(compute_root_propagation(
-            inputs.original_clauses,
-            inputs.unit_premises,
-            inputs.num_vars,
-            meter,
-        )?);
+        state.root_state = Some(meter.in_phase(ConversionPhase::RootSetup, |meter| {
+            compute_root_propagation(
+                inputs.original_clauses,
+                inputs.unit_premises,
+                inputs.num_vars,
+                inputs.shape.root_index_scratch_bytes,
+                meter,
+            )
+        })?);
     }
     let rooted = match state.root_state.as_mut() {
-        Some(root) => compact_rup_hint_candidates_rooted(
-            root,
-            inputs.original_clauses,
-            &state.steps,
-            entry.clause,
-            candidates,
-            synthesis_cap,
-            meter,
-        )?,
+        Some(root) => meter.in_phase(ConversionPhase::RootedRepair, |meter| {
+            compact_rup_hint_candidates_rooted(
+                root,
+                inputs.original_clauses,
+                &state.steps,
+                entry.clause,
+                candidates,
+                synthesis_cap,
+                inputs
+                    .shape
+                    .max_row_hints
+                    .max(state.reconstruction_row_bound),
+                inputs.shape.candidate_scheduler_bytes,
+                meter,
+            )
+        })?,
         None => None,
     };
     if rooted.is_some() {
         return Ok(rooted);
     }
-    synthesize_rup_hints(
-        inputs.original_clauses,
-        &state.steps,
-        entry.clause,
-        inputs.unit_premises,
-        inputs.num_vars,
-        synthesis_cap,
-        candidate_capacity,
-        inputs.shape.synthesis_scratch_bytes,
-        meter,
-    )
+    meter.in_phase(ConversionPhase::Synthesis, |meter| {
+        synthesize_rup_hints(
+            inputs.original_clauses,
+            &state.steps,
+            entry.clause,
+            inputs.unit_premises,
+            inputs.num_vars,
+            synthesis_cap,
+            candidate_capacity,
+            inputs.shape.synthesis_scratch_bytes,
+            meter,
+        )
+    })
 }
 
 fn retain_repaired_hints(
@@ -261,14 +290,16 @@ fn append_synthesized_terminal(
     state: &mut DerivedConversionState,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<(), ClauseTraceResolutionError> {
-    let rup_hints = synthesize_terminal_empty_hints(
-        inputs.original_clauses,
-        &state.steps,
-        inputs.unit_premises,
-        inputs.num_vars,
-        inputs.shape.synthesis_scratch_bytes,
-        meter,
-    )?;
+    let rup_hints = meter.in_phase(ConversionPhase::Synthesis, |meter| {
+        synthesize_terminal_empty_hints(
+            inputs.original_clauses,
+            &state.steps,
+            inputs.unit_premises,
+            inputs.num_vars,
+            inputs.shape.synthesis_scratch_bytes,
+            meter,
+        )
+    })?;
     let canonical_id = state.next_canonical_id;
     state.steps.push(RupStep {
         id: canonical_id,

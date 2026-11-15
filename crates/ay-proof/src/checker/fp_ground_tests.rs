@@ -30,18 +30,105 @@ fn f16_bits(bits: u64) -> Fp {
 }
 
 fn raw_bits(value: &Fp) -> u64 {
+    assert_eq!(value.significand_high, 0, "narrow hardware comparison");
     (u64::from(value.sign) << (value.eb + value.sb - 1))
         | (value.exponent << (value.sb - 1))
-        | value.significand
+        | u64::try_from(value.significand).expect("narrow test encoding")
 }
 
 fn rational(numerator: i64, denominator: i64) -> BigRational {
     BigRational::new(BigInt::from(numerator), BigInt::from(denominator))
 }
 
+#[test]
+fn binary128_rounding_retains_high_fraction_bits_and_exact_ties() {
+    let high = (1u128 << 111) | 1;
+    let value = Fp::checked(false, 16383, high, 15, 113).unwrap();
+    let next = Fp::checked(false, 16383, high + 1, 15, 113).unwrap();
+    assert_eq!(value.cmp_real(&next), Some(std::cmp::Ordering::Less));
+    assert_eq!(
+        value.negated().cmp_real(&next.negated()),
+        Some(std::cmp::Ordering::Greater)
+    );
+    let doubled = round_rational(
+        &(value.to_rational().unwrap() * rational(2, 1)),
+        false,
+        15,
+        113,
+        Rm::Rne,
+    )
+    .unwrap();
+    assert_eq!(doubled, Fp::checked(false, 16384, high, 15, 113).unwrap());
+    let tie = BigRational::one() + scale_by_pow2(&BigRational::one(), -113).unwrap();
+    for (mode, fraction) in [
+        (Rm::Rne, 0),
+        (Rm::Rna, 1),
+        (Rm::Rtp, 1),
+        (Rm::Rtn, 0),
+        (Rm::Rtz, 0),
+    ] {
+        assert_eq!(
+            round_rational(&tie, false, 15, 113, mode).unwrap(),
+            Fp::checked(false, 16383, fraction, 15, 113).unwrap()
+        );
+    }
+    assert!(Fp::checked(false, 1, 0, 2, 257).is_none());
+    assert!(Fp::checked(false, 1, 1u128 << 127, 2, 128).is_none());
+    assert!(Fp::from_bits(&(BigInt::one() << 128), 15, 113).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Rounding kernel
 // ---------------------------------------------------------------------------
+
+#[test]
+fn precision256_retains_both_fraction_limbs_and_exact_rounding_ties() {
+    let high = (1u128 << 126) | 1;
+    let value = Fp::checked_wide(false, 1023, (high, 1), 11, 256).unwrap();
+    let next = Fp::checked_wide(false, 1023, (high, 2), 11, 256).unwrap();
+    assert_eq!(value.cmp_real(&next), Some(std::cmp::Ordering::Less));
+    assert_eq!(
+        value.negated().cmp_real(&next.negated()),
+        Some(std::cmp::Ordering::Greater)
+    );
+    let doubled = round_rational(
+        &(value.to_rational().unwrap() * rational(2, 1)),
+        false,
+        11,
+        256,
+        Rm::Rne,
+    )
+    .unwrap();
+    assert_eq!(
+        doubled,
+        Fp::checked_wide(false, 1024, (high, 1), 11, 256).unwrap()
+    );
+    let tie = BigRational::one() + scale_by_pow2(&BigRational::one(), -256).unwrap();
+    for (mode, low) in [
+        (Rm::Rne, 0),
+        (Rm::Rna, 1),
+        (Rm::Rtp, 1),
+        (Rm::Rtn, 0),
+        (Rm::Rtz, 0),
+    ] {
+        assert_eq!(
+            round_rational(&tie, false, 11, 256, mode).unwrap(),
+            Fp::checked_wide(false, 1023, (0, low), 11, 256).unwrap()
+        );
+    }
+    let carry_tie = Fp::checked_wide(false, 1023, (1, u128::MAX), 11, 256)
+        .unwrap()
+        .to_rational()
+        .unwrap()
+        + scale_by_pow2(&BigRational::one(), -256).unwrap();
+    assert_eq!(
+        round_rational(&carry_tie, false, 11, 256, Rm::Rne).unwrap(),
+        Fp::checked_wide(false, 1023, (2, 0), 11, 256).unwrap()
+    );
+    assert!(Fp::checked_wide(false, 1, (1u128 << 127, 0), 11, 256).is_none());
+    assert!(Fp::checked_wide(false, 1, (1, 0), 11, 129).is_none());
+    assert!(Fp::checked_wide(false, 1, (0, u128::MAX), 11, 129).is_some());
+}
 
 #[test]
 fn rounds_one_third_to_float32_rne() {
@@ -438,6 +525,80 @@ fn rne_float64_arithmetic_matches_the_hardware_unit() {
 // Clause-level validation
 // ---------------------------------------------------------------------------
 
+#[test]
+fn fp_ground_registered_arithmetic_is_not_an_interpreted_builtin() {
+    let mut terms = TermStore::new();
+    let mode = rounding_mode(&mut terms, "RNE");
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let sum = terms.mk_app(Symbol::named("fp.add"), [mode, zero, zero], fp_sort(F32));
+    let claim = predicate(&mut terms, "=", vec![sum, zero]);
+    assert!(recognize_fp_ground_eval(&terms, &[claim]));
+    // An actual user function of this spelling can return one on these
+    // arguments. Its declaration does not inherit IEEE addition semantics.
+    terms.register_declared_function("fp.add");
+    assert!(!recognize_fp_ground_eval(&terms, &[claim]));
+}
+
+#[test]
+fn fp_ground_registered_arithmetic_does_not_inherit_commutativity() {
+    let mut terms = TermStore::new();
+    let mode = rounding_mode(&mut terms, "RNE");
+    let x = terms.mk_var("registered_fp_x", fp_sort(F32));
+    let y = terms.mk_var("registered_fp_y", fp_sort(F32));
+    let left = terms.mk_app(Symbol::named("fp.add"), [mode, x, y], fp_sort(F32));
+    let right = terms.mk_app(Symbol::named("fp.add"), [mode, y, x], fp_sort(F32));
+    let claim = predicate(&mut terms, "=", vec![left, right]);
+    assert!(recognize_fp_ground_eval(&terms, &[claim]));
+    terms.register_declared_function("fp.add");
+    assert!(!recognize_fp_ground_eval(&terms, &[claim]));
+}
+
+#[test]
+fn fp_ground_registered_equality_cannot_license_variable_binding() {
+    let mut terms = TermStore::new();
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let x = terms.mk_var("registered_equality_x", fp_sort(F32));
+    let equality = predicate(&mut terms, "=", vec![x, zero]);
+    let not_equality = terms.mk_not_raw(equality);
+    let is_zero = predicate(&mut terms, "fp.isZero", vec![x]);
+    // Keep the consequent first: a fabricated binding must not make it true
+    // before evaluation ever reaches the opaque equality in the second arm.
+    let clause = [is_zero, not_equality];
+    assert!(recognize_fp_ground_eval(&terms, &clause));
+    terms.register_declared_function("=");
+    assert!(!recognize_fp_ground_eval(&terms, &clause));
+}
+
+#[test]
+fn fp_ground_registered_ieee_equality_has_no_shared_operand_conflict_schema() {
+    let mut terms = TermStore::new();
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let one = fp_triple(&mut terms, 0, 127, 0, F32);
+    let x = terms.mk_var("registered_ieee_x", fp_sort(F32));
+    let zero_claim = predicate(&mut terms, "fp.eq", vec![x, zero]);
+    let one_claim = predicate(&mut terms, "fp.eq", vec![x, one]);
+    let clause = [terms.mk_not_raw(zero_claim), terms.mk_not_raw(one_claim)];
+    assert!(recognize_fp_ground_eval(&terms, &clause));
+    terms.register_declared_function("fp.eq");
+    assert!(!recognize_fp_ground_eval(&terms, &clause));
+}
+
+#[test]
+fn fp_ground_registered_indexed_conversion_is_opaque() {
+    let mut terms = TermStore::new();
+    let bits = terms.mk_bitvec(0.into(), F32.0 + F32.1);
+    let value = terms.mk_app(
+        Symbol::indexed("to_fp", vec![F32.0, F32.1]),
+        [bits],
+        fp_sort(F32),
+    );
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let claim = predicate(&mut terms, "=", vec![value, zero]);
+    assert!(recognize_fp_ground_eval(&terms, &[claim]));
+    terms.register_declared_function("to_fp");
+    assert!(!recognize_fp_ground_eval(&terms, &[claim]));
+}
+
 fn fp_sort(format: (u32, u32)) -> Sort {
     Sort::FloatingPoint(format.0, format.1)
 }
@@ -462,12 +623,12 @@ fn fp_triple(
     terms: &mut TermStore,
     sign: u64,
     exponent: u64,
-    significand: u64,
+    significand: impl Into<BigInt>,
     format: (u32, u32),
 ) -> TermId {
     let sign = terms.mk_bitvec(BigInt::from(sign), 1);
     let exponent = terms.mk_bitvec(BigInt::from(exponent), format.0);
-    let significand = terms.mk_bitvec(BigInt::from(significand), format.1 - 1);
+    let significand = terms.mk_bitvec(significand.into(), format.1 - 1);
     terms.mk_app(
         Symbol::named("fp"),
         vec![sign, exponent, significand],
@@ -484,6 +645,33 @@ fn binary_fp(terms: &mut TermStore, name: &str, args: Vec<TermId>, format: (u32,
 }
 
 #[test]
+fn integral_and_remainder_proofs_reject_false_claims_and_malformed_sorts() {
+    let mut terms = TermStore::new();
+    let mode = rounding_mode(&mut terms, "RNE");
+    let bad_mode = terms.mk_app(Symbol::named("RNE"), [], Sort::Bool);
+    let zero = fp_literal(&mut terms, "+zero", F32);
+    let infinity = fp_literal(&mut terms, "+oo", F32);
+    for (name, args, bad_args) in [
+        ("fp.roundToIntegral", vec![mode, zero], vec![bad_mode, zero]),
+        ("fp.rem", vec![zero, infinity], vec![zero, mode]),
+    ] {
+        let valid = binary_fp(&mut terms, name, args.clone(), F32);
+        let claim = predicate(&mut terms, "fp.eq", vec![valid, zero]);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[claim]).is_ok());
+        let false_claim = terms.mk_not_raw(claim);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[false_claim]).is_err());
+        for sort in [Sort::Bool, fp_sort(F16)] {
+            let invalid = terms.mk_app(Symbol::named(name), args.clone(), sort);
+            let forged = predicate(&mut terms, "fp.eq", vec![invalid, zero]);
+            assert!(validate_fp_ground_eval(&terms, ProofId(0), &[forged]).is_err());
+        }
+        let invalid = binary_fp(&mut terms, name, bad_args, F32);
+        let forged = predicate(&mut terms, "fp.eq", vec![invalid, zero]);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[forged]).is_err());
+    }
+}
+
+#[test]
 fn accepts_the_ground_add_identity_and_rejects_its_negation() {
     let mut terms = TermStore::new();
     let rne = rounding_mode(&mut terms, "RNE");
@@ -497,6 +685,27 @@ fn accepts_the_ground_add_identity_and_rejects_its_negation() {
     let negated = terms.mk_not(claim);
     assert!(!recognize_fp_ground_eval(&terms, &[negated]));
     assert!(validate_fp_ground_eval(&terms, ProofId(0), &[negated]).is_err());
+}
+
+#[test]
+fn wide_ground_add_accepts_exact_fields_and_rejects_a_dropped_fraction_bit() {
+    for (eb, sb) in [(15, 113), (2, 127), (11, 256)] {
+        let mut terms = TermStore::new();
+        let format = (eb, sb);
+        let fraction: BigInt = (BigInt::one() << (sb - 2)) + 1;
+        let bias = (1u64 << (eb - 1)) - 1;
+        let x = fp_triple(&mut terms, 0, bias, fraction.clone(), format);
+        let expected = fp_triple(&mut terms, 0, bias + 1, fraction.clone(), format);
+        let wrong = fp_triple(&mut terms, 0, bias + 1, fraction - 1, format);
+        let rne = rounding_mode(&mut terms, "RNE");
+        let sum = binary_fp(&mut terms, "fp.add", vec![rne, x, x], format);
+        let valid = predicate(&mut terms, "fp.eq", vec![sum, expected]);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[valid]).is_ok());
+        let invalid = predicate(&mut terms, "fp.eq", vec![sum, wrong]);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[invalid]).is_err());
+        let negated = terms.mk_not(valid);
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[negated]).is_err());
+    }
 }
 
 #[test]
@@ -525,6 +734,57 @@ fn indexed_named_fp_builtins_fail_closed() {
     assert!(!recognize_fp_ground_eval(&terms, &forged_binding));
     validate_fp_ground_eval(&terms, ProofId(0), &forged_binding)
         .expect_err("an indexed identifier named `=` must not authorize an FP binding");
+}
+
+#[test]
+fn shared_operand_fp_eq_conflicts_require_builtin_identity_and_typed_signature() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("shared_fp_x", fp_sort(F16));
+    let zero = fp_literal(&mut terms, "+zero", F16);
+    let one = fp_triple(&mut terms, 0, 15, 0, F16);
+    for (symbol, result_sort) in [
+        (Symbol::indexed("fp.eq", vec![0]), Sort::Bool),
+        (Symbol::named("fp.eq"), Sort::Int),
+    ] {
+        let left = terms.mk_app(symbol.clone(), vec![x, zero], result_sort.clone());
+        let right = terms.mk_app(symbol, vec![x, one], result_sort);
+        let clause = if terms.sort(left) == &Sort::Bool {
+            [terms.mk_not_raw(left), terms.mk_not_raw(right)]
+        } else {
+            // The raw App form lets the checker receive malformed source
+            // without violating mk_not_raw's Bool constructor precondition.
+            [
+                predicate(&mut terms, "not", vec![left]),
+                predicate(&mut terms, "not", vec![right]),
+            ]
+        };
+        assert!(!recognize_fp_ground_eval(&terms, &clause));
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &clause).is_err());
+    }
+    let narrow_zero = fp_literal(&mut terms, "+zero", F32);
+    let narrow_one = fp_triple(&mut terms, 0, 127, 0, F32);
+    for malformed in [false, true] {
+        let (left_constant, right_constant) = if malformed {
+            // Lie about the declared format of actual fp constructors.
+            let TermData::App(symbol, args) = terms.get(narrow_one).clone() else {
+                unreachable!()
+            };
+            let forged_one = terms.mk_app(symbol, args, fp_sort(F16));
+            (zero, forged_one)
+        } else {
+            (narrow_zero, narrow_one)
+        };
+        let left = predicate(&mut terms, "fp.eq", vec![x, left_constant]);
+        let right = predicate(&mut terms, "fp.eq", vec![x, right_constant]);
+        let clause = [terms.mk_not_raw(left), terms.mk_not_raw(right)];
+        assert!(!recognize_fp_ground_eval(&terms, &clause));
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &clause).is_err());
+    }
+    let left = predicate(&mut terms, "fp.eq", vec![x, zero]);
+    let right = predicate(&mut terms, "fp.eq", vec![x, one]);
+    let valid = [terms.mk_not_raw(left), terms.mk_not_raw(right)];
+    assert!(recognize_fp_ground_eval(&terms, &valid));
+    validate_fp_ground_eval(&terms, ProofId(0), &valid).unwrap();
 }
 
 #[test]
@@ -712,15 +972,18 @@ fn rejects_a_non_boolean_literal() {
 }
 
 #[test]
-fn rejects_an_unimplemented_operator() {
-    // `fp.roundToIntegral` is deliberately absent from the kernel, so even a
-    // genuinely valid clause over it fails closed.
+fn refuses_to_choose_an_unspecified_minimum_signed_zero() {
+    // SMT-LIB leaves the sign of min(+zero, -zero) unspecified. Neither
+    // structural sign claim may be promoted into a universally valid lemma.
     let mut terms = TermStore::new();
-    let rne = rounding_mode(&mut terms, "RNE");
     let zero = fp_literal(&mut terms, "+zero", F32);
-    let rounded = binary_fp(&mut terms, "fp.roundToIntegral", vec![rne, zero], F32);
-    let claim = predicate(&mut terms, "fp.eq", vec![rounded, zero]);
-    assert!(!recognize_fp_ground_eval(&terms, &[claim]));
+    let negative = fp_literal(&mut terms, "-zero", F32);
+    let minimum = binary_fp(&mut terms, "fp.min", vec![zero, negative], F32);
+    for expected in [zero, negative] {
+        let claim = predicate(&mut terms, "=", vec![minimum, expected]);
+        assert!(!recognize_fp_ground_eval(&terms, &[claim]));
+        assert!(validate_fp_ground_eval(&terms, ProofId(0), &[claim]).is_err());
+    }
 }
 
 #[test]

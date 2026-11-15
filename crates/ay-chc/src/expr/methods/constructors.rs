@@ -4,11 +4,8 @@
 
 //! ChcExpr constructors, sort computation, and structural hashing.
 
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
-use ay_core::kani_compat::DetHashSet as FxHashSet;
 use rustc_hash::FxHasher;
 
 // Fast-core P1: wrap child expressions via the interning helper (interns leaves
@@ -17,15 +14,9 @@ use crate::expr::intern::arc as mk_arc;
 
 use super::{extract_int_constant, ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
 
+mod flatten;
+mod pending;
 mod sort;
-
-/// Conjuncts processed between two `should_stop` polls in
-/// [`ChcExpr::and_all_checked`].
-///
-/// A power of two well above the cost of one `Instant::now()` (tens of ns) so
-/// the poll is noise, yet small enough that a tripped deadline is observed
-/// within a few hundred microseconds of hash-consing.
-const AND_ALL_POLL_STRIDE: u32 = 512;
 
 impl ChcExpr {
     // Convenience constructors
@@ -275,117 +266,6 @@ impl ChcExpr {
     pub fn and_all(conjuncts: impl IntoIterator<Item = Self>) -> Self {
         Self::and_all_checked(conjuncts, || false)
             .expect("and_all_checked never stops when the predicate is always false")
-    }
-
-    /// [`Self::and_all`], interruptible on a caller-supplied stop predicate.
-    ///
-    /// The flattening loop below is the hot spot when a synthesis stage builds
-    /// one very large conjunction: every conjunct is deep-hashed into `seen`,
-    /// so the loop can run for seconds while the *outer* iteration count stays
-    /// at one. A caller under a deadline therefore cannot bound this work by
-    /// polling between calls — it has to poll inside.
-    ///
-    /// `should_stop` is consulted every [`AND_ALL_POLL_STRIDE`] conjuncts, which
-    /// keeps the clock read off the per-conjunct path while bounding overshoot
-    /// to one stride's worth of hash-consing. Returning `None` means the stop
-    /// predicate tripped: the partial conjunction is DISCARDED rather than
-    /// returned, so no caller can mistake a truncated (weaker) formula for the
-    /// conjunction it asked for.
-    pub(crate) fn and_all_checked<F: FnMut() -> bool>(
-        conjuncts: impl IntoIterator<Item = Self>,
-        mut should_stop: F,
-    ) -> Option<Self> {
-        let mut out: Vec<Arc<Self>> = Vec::new();
-        let mut seen: FxHashSet<Arc<Self>> = FxHashSet::default();
-        let mut pending: VecDeque<Self> = conjuncts.into_iter().collect();
-        let mut since_poll: u32 = 0;
-
-        while let Some(expr) = pending.pop_front() {
-            since_poll += 1;
-            if since_poll >= AND_ALL_POLL_STRIDE {
-                since_poll = 0;
-                if should_stop() {
-                    return None;
-                }
-            }
-            match expr {
-                Self::Bool(true) => {}
-                Self::Bool(false) => return Some(Self::Bool(false)),
-                Self::Op(ChcOp::And, ref args) => {
-                    // Maintain left-to-right order while flattening deeply nested And trees.
-                    for arg in args.iter().rev() {
-                        pending.push_front(arg.as_ref().clone());
-                    }
-                }
-                other => {
-                    // Exact duplicate conjuncts are idempotent. Compiler-
-                    // generated CHCs often repeat identical array bounds many
-                    // times after inlining; retaining one copy avoids sending
-                    // a much larger but equivalent formula to every engine.
-                    let arc = mk_arc(other);
-                    if seen.insert(arc.clone()) {
-                        out.push(arc);
-                    }
-                }
-            }
-        }
-
-        Some(match out.len() {
-            0 => Self::Bool(true),
-            1 => (*out.pop().expect("len==1")).clone(),
-            _ => Self::Op(ChcOp::And, out),
-        })
-    }
-
-    /// Build an n-ary disjunction from an iterator with constant folding.
-    ///
-    /// - Returns `false` for empty input
-    /// - Skips `false` literals
-    /// - Short-circuits on `true` literals
-    /// - Recursively flattens nested `Or` operations
-    ///
-    /// This is the canonical version used throughout CHC solving.
-    pub fn or_all(disjuncts: impl IntoIterator<Item = Self>) -> Self {
-        let mut out: Vec<Arc<Self>> = Vec::new();
-        let mut seen: FxHashSet<Arc<Self>> = FxHashSet::default();
-        let mut pending: VecDeque<Self> = disjuncts.into_iter().collect();
-
-        while let Some(expr) = pending.pop_front() {
-            match expr {
-                Self::Bool(false) => {}
-                Self::Bool(true) => return Self::Bool(true),
-                Self::Op(ChcOp::Or, ref args) => {
-                    // Maintain left-to-right order while flattening deeply nested Or trees.
-                    for arg in args.iter().rev() {
-                        pending.push_front(arg.as_ref().clone());
-                    }
-                }
-                other => {
-                    // #5877: Deduplicate repeated disjuncts. Interpolation
-                    // produces massive Or expressions with identical repeated
-                    // literals (e.g., `(<= x -1)` appearing 11 times).
-                    //
-                    // #9076 soundness: dedup by EXACT identity, not by hash
-                    // alone. The previous `FxHashSet<u64>` of the disjunct's
-                    // hash silently DROPPED a structurally-distinct disjunct on
-                    // any 64-bit hash collision — weakening the Or, a latent
-                    // unsound (unsat->sat) path. `FxHashSet<Arc<Self>>` hashes
-                    // for bucketing then confirms with structural Eq, so a
-                    // collision can never drop a distinct literal. The Arc clone
-                    // is a refcount bump.
-                    let arc = mk_arc(other);
-                    if seen.insert(arc.clone()) {
-                        out.push(arc);
-                    }
-                }
-            }
-        }
-
-        match out.len() {
-            0 => Self::Bool(false),
-            1 => (*out.pop().expect("len==1")).clone(),
-            _ => Self::Op(ChcOp::Or, out),
-        }
     }
 
     pub fn implies(a: Self, b: Self) -> Self {

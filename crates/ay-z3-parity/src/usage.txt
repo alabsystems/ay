@@ -51,7 +51,7 @@ USAGE:
       timing and a hard-kill timebox. Emits a per-division table, a JSON
       certificate (--json-out) and a markdown report (--report) with an
       auto-populated "where z3 wins" section. Exit non-zero iff any
-      sat-vs-unsat DISAGREE. Requested jobs are capped by `_oom_guard.py`;
+      sat-vs-unsat DISAGREE. Native resource planning caps requested jobs;
       the exact enforced memory/core/timeout envelope is persisted.
 
   ay-z3-parity scoreboard <corpus-root> --ay <path> [--ay-cli <path>]
@@ -92,7 +92,7 @@ USAGE:
       and FFI build identities prove the same source revision. Exit non-zero
       (with a prominent WARNING) iff any DISAGREE or any self-check-vs-eval
       contradiction.
-      Requested jobs are capped by `_oom_guard.py`; the exact enforced
+      Native resource planning caps requested jobs; the exact enforced
       memory/core/timeout envelope is persisted in the certificate.
 
   ay-z3-parity behavior [--ay <path>] [--z3 <path>] [--json]
@@ -103,14 +103,22 @@ USAGE:
       verdict). Prints the honest residue where libz3 is more capable.
       Exit non-zero iff any pair of produced values/verdicts CONFLICTS.
 
-  ay-z3-parity smtlib-conformance <profile|init|run|check|receipt-check> ...
-      Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.1.0 conformance
+  ay-z3-parity qualify <new-output-directory> --ay-executable PATH --ay-shared-library PATH
+      Provision authenticated dependencies, run every registered conformance
+      validator and repeated full-corpus performance measurements. --plan shows
+      all work without running it. Missing coverage fails closed.
+
+  ay-z3-parity smtlib-conformance <command> ...
+      Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.3.3 conformance
       contract. The contract has closed dimensions for grammar, commands,
       theories, logics, typing/scope, command state, SAT models, UNSAT proofs,
       unknown policy, the Z3 overlay, corpus closure, and gate integrity.
       `check` is completion-gated by default and exits 0 only when every source
       inventory is closed and every requirement has exhaustive, hash-bound
       passing evidence. `--audit-only` is the explicit weaker status mode.
+      `qualify-check QUALIFICATION.json` replays a unified qualification run.
+      Current ABI, behavioral and stock Python consumers each expose their
+      own execution and replay commands; missing semantics remain explicit.
       See `smtlib-conformance --help` for the evidence protocol.
 
 DEFAULTS:

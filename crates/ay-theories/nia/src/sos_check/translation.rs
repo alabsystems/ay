@@ -10,10 +10,10 @@ use ay_core::Sort;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
-use super::{SosFragment, MAX_SOS_VARS};
+use super::{CachedSosAtom, SosFragment, MAX_SOS_VARS};
 use crate::sos::budget::{
     checked_poly_add, checked_poly_mul, checked_poly_neg, checked_poly_sub, rational_fits,
-    SosPolynomialBudget, MAX_SOS_ASSERTED_LITERALS, MAX_SOS_COEFFICIENT_BITS,
+    SosPolynomialBudget, SosProgress, MAX_SOS_ASSERTED_LITERALS, MAX_SOS_COEFFICIENT_BITS,
     MAX_SOS_TOTAL_POLY_TERMS,
 };
 use crate::sos::{MultiConstraint, MultiPoly, Rel};
@@ -34,18 +34,45 @@ impl NiaSolver<'_> {
     ///
     /// Out-of-fragment atoms (unrecognized comparisons, `/`, `mod`, …) are
     /// skipped. Resource exhaustion is distinct: it declines the whole attempt.
+    #[cfg(test)]
     pub(super) fn build_sos_fragment(&self) -> SosFragment {
-        if self.asserted.len() > MAX_SOS_ASSERTED_LITERALS {
+        self.build_sos_fragment_with_progress(&SosProgress::new(&|| true))
+    }
+
+    pub(super) fn build_sos_fragment_with_progress(
+        &self,
+        progress: &SosProgress<'_>,
+    ) -> SosFragment {
+        if !progress.poll() || self.asserted.len() > MAX_SOS_ASSERTED_LITERALS {
             return SosFragment::Exhausted;
         }
-        let mut budget = SosTranslationBudget::default();
+        // Incremental build: replay the cached prefix (translations are
+        // pure in the asserted set), then translate only newly appended
+        // atoms, resuming the cumulative budget from the tip snapshot.
+        let mut cache = self.sos_fragment_cache.borrow_mut();
+        let prefix_ok = cache.entries.len() <= self.asserted.len()
+            && match cache.tip_asserted {
+                None => cache.entries.is_empty(),
+                Some(tip) => {
+                    !cache.entries.is_empty()
+                        && self.asserted.get(cache.entries.len() - 1) == Some(&tip)
+                }
+            };
+        if !prefix_ok {
+            *cache = Default::default();
+        }
         let mut constraints = Vec::new();
         let mut retained_terms = 0usize;
-        for &(atom, value) in &self.asserted {
-            match self.atom_to_multi(atom, value, &mut budget) {
-                Some(NiaMultiAtom::ConstFalse) => return SosFragment::ConstFalse,
-                Some(NiaMultiAtom::ConstTrue) => {}
-                Some(NiaMultiAtom::Constraint(constraint)) => {
+        for (entry, _, _) in &cache.entries {
+            match entry {
+                CachedSosAtom::ConstFalse => {
+                    return if progress.poll() {
+                        SosFragment::ConstFalse
+                    } else {
+                        SosFragment::Exhausted
+                    };
+                }
+                CachedSosAtom::Constraint(constraint) => {
                     let Some(total) = retained_terms.checked_add(constraint.poly.terms.len())
                     else {
                         return SosFragment::Exhausted;
@@ -54,19 +81,86 @@ impl NiaSolver<'_> {
                         return SosFragment::Exhausted;
                     }
                     retained_terms = total;
-                    constraints.push(constraint);
+                    constraints.push(constraint.clone());
                 }
-                // Dropping an unsupported conjunct weakens the system and is
-                // therefore sound for this UNSAT-only lane.
-                None => {}
-            }
-            if budget.exhausted {
-                return SosFragment::Exhausted;
+                CachedSosAtom::ConstTrue | CachedSosAtom::Unsupported => {}
             }
         }
+        if cache.exhausted {
+            return SosFragment::Exhausted;
+        }
+        let tip_counts = cache
+            .entries
+            .last()
+            .map_or((0, 0, 0), |(_, counts, _)| *counts);
+        let mut budget = SosTranslationBudget::with_progress_and_counts(progress, tip_counts);
+        for idx in cache.entries.len()..self.asserted.len() {
+            let (atom, value) = self.asserted[idx];
+            if !progress.poll() {
+                return SosFragment::Exhausted;
+            }
+            match self.atom_to_multi(atom, value, &mut budget) {
+                Some(NiaMultiAtom::ConstFalse) => {
+                    cache.entries.push((
+                        CachedSosAtom::ConstFalse,
+                        budget.counts(),
+                        retained_terms,
+                    ));
+                    cache.tip_asserted = Some((atom, value));
+                    return if progress.poll() {
+                        SosFragment::ConstFalse
+                    } else {
+                        SosFragment::Exhausted
+                    };
+                }
+                outcome => {
+                    if budget.exhausted {
+                        // Persist only a deterministic (budget) exhaustion:
+                        // a progress refusal must not be cached, and the
+                        // partially translated atom is not recorded.
+                        if progress.poll() {
+                            cache.exhausted = true;
+                        }
+                        return SosFragment::Exhausted;
+                    }
+                    let (cached, constraint) = match outcome {
+                        Some(NiaMultiAtom::ConstTrue) => (CachedSosAtom::ConstTrue, None),
+                        Some(NiaMultiAtom::Constraint(constraint)) => (
+                            CachedSosAtom::Constraint(constraint.clone()),
+                            Some(constraint),
+                        ),
+                        Some(NiaMultiAtom::ConstFalse) => unreachable!(),
+                        // Dropping an unsupported conjunct weakens the system
+                        // and is therefore sound for this UNSAT-only lane.
+                        None => (CachedSosAtom::Unsupported, None),
+                    };
+                    if let Some(constraint) = &constraint {
+                        let Some(total) = retained_terms.checked_add(constraint.poly.terms.len())
+                        else {
+                            return SosFragment::Exhausted;
+                        };
+                        retained_terms = total;
+                    }
+                    cache
+                        .entries
+                        .push((cached, budget.counts(), retained_terms));
+                    cache.tip_asserted = Some((atom, value));
+                    if retained_terms > MAX_SOS_TOTAL_POLY_TERMS {
+                        return SosFragment::Exhausted;
+                    }
+                    if let Some(constraint) = constraint {
+                        constraints.push(constraint);
+                    }
+                }
+            }
+        }
+        drop(cache);
         let mut vars = Vec::with_capacity(MAX_SOS_VARS);
         let mut seen = HashSet::default();
         for constraint in &constraints {
+            if !progress.poll() {
+                return SosFragment::Exhausted;
+            }
             for &variable in constraint
                 .poly
                 .terms
@@ -82,6 +176,9 @@ impl NiaSolver<'_> {
             }
         }
         vars.sort_unstable_by_key(|term| term.0);
+        if !progress.poll() {
+            return SosFragment::Exhausted;
+        }
         SosFragment::System { constraints, vars }
     }
 
@@ -89,7 +186,7 @@ impl NiaSolver<'_> {
         &self,
         atom: TermId,
         value: bool,
-        budget: &mut SosTranslationBudget,
+        budget: &mut SosTranslationBudget<'_>,
     ) -> Option<NiaMultiAtom> {
         let (base_relation, lhs, rhs) = self.comparison_parts(atom)?;
         let relation = if value {
@@ -146,7 +243,7 @@ impl NiaSolver<'_> {
         &self,
         term: TermId,
         depth: usize,
-        budget: &mut SosTranslationBudget,
+        budget: &mut SosTranslationBudget<'_>,
     ) -> Option<MultiPoly> {
         if !budget.visit_term(depth) || !is_arithmetic_sort(self.terms.sort(term)) {
             return None;
@@ -218,18 +315,35 @@ fn is_arithmetic_sort(sort: &Sort) -> bool {
 /// Translation-local work meter. `exhausted` distinguishes an unsupported
 /// operator (safe weakening) from a resource give-up (whole attempt declines).
 #[derive(Debug, Default)]
-struct SosTranslationBudget {
-    polynomial: SosPolynomialBudget,
+struct SosTranslationBudget<'a> {
+    polynomial: SosPolynomialBudget<'a>,
     exhausted: bool,
 }
 
-impl SosTranslationBudget {
+impl<'a> SosTranslationBudget<'a> {
+    /// Resume from a previous build's cumulative counts (incremental
+    /// fragment extension; see `SosFragmentCache`).
+    fn with_progress_and_counts(
+        progress: &'a SosProgress<'_>,
+        counts: (usize, usize, usize),
+    ) -> Self {
+        Self {
+            polynomial: SosPolynomialBudget::with_progress_and_counts(progress, counts),
+            exhausted: false,
+        }
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        self.polynomial.counts()
+    }
+
     fn visit_term(&mut self, depth: usize) -> bool {
         let accepted = self.polynomial.visit_term(depth);
         self.admit(accepted)
     }
 
     fn admit(&mut self, accepted: bool) -> bool {
+        let accepted = accepted && self.polynomial.poll_charged();
         if !accepted {
             self.exhausted = true;
         }

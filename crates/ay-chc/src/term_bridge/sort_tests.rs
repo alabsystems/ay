@@ -1,10 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{chc_sort_to_core, core_sort_to_chc_lossy, core_sort_to_chc_strict};
+use super::{
+    chc_sort_to_core, core_sort_decodes_strict, core_sort_to_chc_lossy, core_sort_to_chc_strict,
+};
 use crate::expr::{ChcDtConstructor, ChcDtSelector, ChcSort};
 use ay_core::Sort;
-use std::sync::Arc;
 
 #[test]
 fn lossy_core_sort_conversion_preserves_legacy_fallbacks() {
@@ -37,7 +38,7 @@ fn chc_to_core_roundtrip_on_supported_sorts() {
 fn recursive_datatype_canonicalizes_self_reference_to_same_core_sort() {
     let shallow_list = ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "conslistOfInt".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -53,7 +54,7 @@ fn recursive_datatype_canonicalizes_self_reference_to_same_core_sort() {
     };
     let expanded_list = ChcSort::Datatype {
         name: "listOfInt".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "conslistOfInt".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -72,4 +73,37 @@ fn recursive_datatype_canonicalizes_self_reference_to_same_core_sort() {
         chc_sort_to_core(&expanded_list),
         chc_sort_to_core(&shallow_list)
     );
+}
+
+#[test]
+fn strict_decodability_predicate_agrees_with_strict_conversion() {
+    let datatype = chc_sort_to_core(&ChcSort::Datatype {
+        name: "Pair".to_string(),
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
+            name: "mk".to_string(),
+            selectors: vec![ChcDtSelector {
+                name: "fst".to_string(),
+                sort: ChcSort::BitVec(8),
+            }],
+        }]),
+    });
+    for sort in [
+        Sort::Bool,
+        Sort::Int,
+        Sort::Real,
+        Sort::bitvec(16),
+        Sort::String,
+        Sort::FloatingPoint(8, 24),
+        Sort::array(Sort::Int, Sort::bitvec(8)),
+        Sort::array(Sort::Int, Sort::String),
+        Sort::array(Sort::String, Sort::Int),
+        datatype.clone(),
+        Sort::array(Sort::Int, datatype),
+    ] {
+        assert_eq!(
+            core_sort_decodes_strict(&sort),
+            core_sort_to_chc_strict(&sort).is_some(),
+            "{sort:?}"
+        );
+    }
 }

@@ -7,7 +7,6 @@ use super::*;
 mod bound_propagations;
 mod direct_bound_propagations;
 pub(crate) mod jit_compile;
-pub(crate) mod jit_update_contract;
 mod solver_hooks;
 mod var_atoms;
 

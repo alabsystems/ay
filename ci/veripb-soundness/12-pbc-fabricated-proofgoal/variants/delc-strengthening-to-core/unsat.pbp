@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% The truth, from the same binary on the same formula: `x1 >= 1` and `~x1 >= 1` propagate to
+% conflict, so the empty constraint is RUP in one line.
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : -1 ;
+end pseudo-Boolean proof;

@@ -20,13 +20,18 @@
 //! 3. Propagate blocked clauses forward
 //! 4. Check for fixpoint (F_i = F_{i+1} → invariant found)
 
+use std::cell::Cell;
 use std::collections::BinaryHeap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::cube::{Cube, Ic3Frame, Ic3Obligation, PriorityObligation};
 use super::stats::Ic3Stats;
 use super::transition_system::BitLevelTransitionSystem;
 use ay_sat::{AssumeResult, Literal, Variable};
+
+mod query;
+use query::QueryStopped;
 
 /// Result of IC3 model checking.
 #[derive(Debug)]
@@ -87,10 +92,15 @@ pub(crate) struct Ic3Solver {
     pub(super) ctg_depth: usize,
     /// Verbose tracing output.
     verbose: bool,
-    /// Optional hard wall-clock deadline. Checked only at solve/block loop
-    /// heads; on expiry `solve()` returns [`Ic3Result::Unknown`] -- never a
-    /// truncated `Safe`/`Unsafe`. `None` = no time bound (previous behavior).
+    /// Original absolute deadline, also forwarded to every SAT query. Search,
+    /// query and final admission polls are cooperative: individual propagation,
+    /// cloning and cleanup operations remain opaque. None keeps the legacy limit.
     deadline: Option<ay_core::time::Instant>,
+    /// Any inconclusive SAT query terminates this attempt, even if its external
+    /// interrupt is later reset. No missing model/core is evidence of UNSAT.
+    query_stopped: Cell<bool>,
+    /// Borrowed original owner, shared by all queries and admission polls.
+    resource_poll: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Ic3Solver {
@@ -156,33 +166,62 @@ impl Ic3Solver {
             ctg_depth: 0,
             verbose,
             deadline: None,
+            query_stopped: Cell::new(false),
+            resource_poll: None,
         }
     }
 
-    /// Attach an optional hard wall-clock deadline (builder style, so existing
+    /// Attach an optional absolute deadline (builder style, so existing
     /// `Ic3Solver::new(..)` call sites are unaffected). On expiry the solver
     /// returns [`Ic3Result::Unknown`]; it never truncates the search into a
     /// `Safe`/`Unsafe` verdict.
     #[must_use]
     pub(crate) fn with_deadline(mut self, deadline: Option<ay_core::time::Instant>) -> Self {
         self.deadline = deadline;
+        self.init_solver.set_solve_deadline(deadline);
+        self.solver.set_solve_deadline(deadline);
         self
     }
 
-    /// True once the configured deadline has passed. Checked only at loop heads
-    /// (see [`Ic3Solver::solve`] and `block_all_bad`), where returning `Unknown`
-    /// cannot corrupt a verdict: `Safe` is only produced after a completed
-    /// `propagate()` fixpoint and `Unsafe` only from a verified Init-reaching cube.
+    /// Attach one original-owner poll without changing deadlines or SAT policy.
+    pub(crate) fn with_resource_poll(mut self, poll: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.resource_poll = Some(poll);
+        self
+    }
+
+    /// Latch deadline expiry or any inconclusive SAT query. No later query or
+    /// final result can revive this IC3 attempt by resetting an external flag.
     #[inline]
-    fn resource_exhausted(&self) -> bool {
-        self.deadline
-            .is_some_and(|d| ay_core::time::Instant::now() >= d)
+    pub(super) fn resource_exhausted(&self) -> bool {
+        if self.query_stopped.get() {
+            return true;
+        }
+        if self.resource_poll.as_ref().is_some_and(|poll| !poll())
+            || self
+                .deadline
+                .is_some_and(|d| ay_core::time::Instant::now() >= d)
+        {
+            self.query_stopped.set(true);
+        }
+        self.query_stopped.get()
     }
 
     /// Run the IC3 algorithm to check if any bad state is reachable.
     pub(crate) fn solve(&mut self) -> Ic3Result {
+        let result = self.solve_inner();
+        self.admit_result(result)
+    }
+
+    fn solve_inner(&mut self) -> Ic3Result {
+        if self.resource_exhausted() {
+            return Ic3Result::Unknown;
+        }
         // Step 1: Check Init ∧ Bad — immediate counterexample?
-        if self.init_intersects_bad() {
+        let initial_bad = match self.init_intersects_bad() {
+            Ok(found) => found,
+            Err(QueryStopped) => return Ic3Result::Unknown,
+        };
+        if initial_bad {
             let bad_cube = Cube::new(self.ts.bad_literals.clone());
             self.stats.cex_traces += 1;
             self.collect_domain_bcp_stats();
@@ -222,6 +261,10 @@ impl Ic3Solver {
                         return Ic3Result::Safe {
                             invariant_level: level,
                         };
+                    }
+                    if self.resource_exhausted() {
+                        self.collect_domain_bcp_stats();
+                        return Ic3Result::Unknown;
                     }
                     // No fixpoint yet; add a new frame and continue.
                     self.new_frame();
@@ -276,11 +319,13 @@ impl Ic3Solver {
     }
 
     /// Check if Init ∧ Bad is satisfiable.
-    fn init_intersects_bad(&mut self) -> bool {
+    fn init_intersects_bad(&mut self) -> Result<bool, QueryStopped> {
         let assumptions: Vec<Literal> = self.ts.bad_literals.clone();
         self.stats.sat_calls += 1;
-        let result = self.init_solver.solve_incremental_ic3(&assumptions);
-        result.is_sat()
+        Ok(matches!(
+            self.init_query(&assumptions)?,
+            AssumeResult::Sat(_)
+        ))
     }
 
     /// Try to block all bad cubes reachable at the frontier frame.
@@ -292,7 +337,12 @@ impl Ic3Solver {
         let mut obligations: BinaryHeap<PriorityObligation> = BinaryHeap::new();
 
         // Find bad cubes in the frontier frame.
-        while let Some(bad_cube) = self.get_bad_cube(k) {
+        loop {
+            let bad_cube = match self.get_bad_cube(k) {
+                Ok(Some(cube)) => cube,
+                Ok(None) => break,
+                Err(QueryStopped) => return BlockResult::Unknown,
+            };
             if self.resource_exhausted() {
                 return BlockResult::Unknown;
             }
@@ -318,14 +368,14 @@ impl Ic3Solver {
                     // this strengthens F_0 with `¬cube` so we will not waste
                     // work re-deriving the same non-initial cube.
                     self.stats.sat_calls += 1;
-                    let init_result = self.init_solver.solve_incremental_ic3(&ob.cube.literals);
-                    match init_result.into_inner() {
-                        AssumeResult::Sat(_) => {
+                    let init_result = self.init_query(&ob.cube.literals);
+                    match init_result {
+                        Ok(AssumeResult::Sat(_)) => {
                             // Real counterexample: cube is in Init.
                             let trace = self.reconstruct_trace(&ob);
                             return BlockResult::Counterexample(trace);
                         }
-                        AssumeResult::Unsat(..) => {
+                        Ok(AssumeResult::Unsat(..)) => {
                             // Cube does not satisfy Init. Block at level 0.
                             let clause = ob.cube.to_clause();
                             self.add_blocked_clause_to_frames(&clause, 0);
@@ -334,7 +384,7 @@ impl Ic3Solver {
                             // from the heap (do NOT re-enqueue this one).
                             continue;
                         }
-                        AssumeResult::Unknown | _ => {
+                        _ => {
                             // Cannot determine -- propagate Unknown.
                             return BlockResult::Unknown;
                         }
@@ -344,6 +394,9 @@ impl Ic3Solver {
                 // Try to block this cube at its level.
                 match self.try_block_cube(&ob.cube, ob.level) {
                     TryBlockResult::Blocked(generalized) => {
+                        if self.resource_exhausted() {
+                            return BlockResult::Unknown;
+                        }
                         // Cube (generalized) is blocked at ob.level.
                         // Add the blocking clause to frames 1..=ob.level.
                         let clause = generalized.to_clause();
@@ -397,7 +450,7 @@ impl Ic3Solver {
     ///
     /// Domain-restricted (#8443): sets SAT domain to frame activation + bad
     /// literals + COI before the query, then clears it after.
-    fn get_bad_cube(&mut self, level: usize) -> Option<Cube> {
+    fn get_bad_cube(&mut self, level: usize) -> Result<Option<Cube>, QueryStopped> {
         let mut assumptions = Vec::new();
 
         // Activate frame constraints for this level AND all higher levels
@@ -432,15 +485,17 @@ impl Ic3Solver {
         self.solver.set_domain(&domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&assumptions);
+        let result = self.transition_query(&assumptions);
         self.solver.clear_domain();
+        let result = self.after_query_cleanup(result);
 
-        match result.into_inner() {
+        match result? {
             AssumeResult::Sat(model) => {
                 let state_cube = self.ts.extract_state_cube(&model);
-                Some(Cube::new(state_cube))
+                Ok(Some(Cube::new(state_cube)))
             }
-            _ => None,
+            AssumeResult::Unsat(..) => Ok(None),
+            _ => Err(QueryStopped),
         }
     }
 
@@ -479,21 +534,26 @@ impl Ic3Solver {
         self.solver.set_domain(&domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&assumptions);
+        let result = self.transition_query(&assumptions);
         self.solver.clear_domain();
+        let result = self.after_query_cleanup(result);
 
-        match result.into_inner() {
-            AssumeResult::Unsat(..) => {
+        match result {
+            Ok(AssumeResult::Unsat(..)) => {
                 // Cube is inductive relative to F_{level-1}. Generalize it.
                 let generalized = self.generalize_cube(cube, level);
-                TryBlockResult::Blocked(generalized)
+                if self.resource_exhausted() {
+                    TryBlockResult::Unknown
+                } else {
+                    TryBlockResult::Blocked(generalized)
+                }
             }
-            AssumeResult::Sat(model) => {
+            Ok(AssumeResult::Sat(model)) => {
                 // Found a predecessor: extract state from the model.
                 let pred_lits = self.ts.extract_state_cube(&model);
                 TryBlockResult::Predecessor(Cube::new(pred_lits))
             }
-            AssumeResult::Unknown | _ => {
+            _ => {
                 // Soundness: we cannot conclude the cube is blocked, nor do
                 // we have a model from which to extract a predecessor.
                 // Propagate Unknown upward — fabricating the cube as its own
@@ -521,6 +581,9 @@ impl Ic3Solver {
     /// `propagate_to_next_level`) and prevents the O(lemmas * depth) memory
     /// growth that the pre-#8672 duplicated-storage implementation caused.
     pub(super) fn add_blocked_clause_to_frames(&mut self, clause: &[Literal], level: usize) {
+        if self.resource_exhausted() {
+            return;
+        }
         // NOTE: level == 0 is permitted (#fix-init-check). A cube reaching
         // level 0 in `block_all_bad` that does NOT satisfy Init must still be
         // blocked at frame 0 so the obligation loop does not re-derive it.
@@ -631,7 +694,7 @@ impl Ic3Solver {
         assumptions: &[Literal],
         constraints: &[Vec<Literal>],
         domain: &[Variable],
-    ) -> ay_sat::SolverAssumeResult {
+    ) -> Result<AssumeResult, QueryStopped> {
         // Push a scope to isolate temporary clauses.
         self.solver.push();
 
@@ -655,13 +718,13 @@ impl Ic3Solver {
         self.solver.set_domain(domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&full_assumptions);
+        let result = self.transition_query(&full_assumptions);
 
         // Clear domain and pop scope to remove temporary clauses.
         self.solver.clear_domain();
         let _ = self.solver.pop();
 
-        result
+        self.after_query_cleanup(result)
     }
 
     /// Access the stats for reporting.

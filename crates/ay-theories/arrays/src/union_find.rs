@@ -25,7 +25,7 @@
 use super::*;
 
 /// Justification for one proof-forest edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub(crate) enum EqJustification {
     /// A SAT-visible equality atom asserted true.
     Asserted {
@@ -42,6 +42,30 @@ pub(crate) enum EqJustification {
         /// edges are connectivity-only, like `WeakEdgeKind::StrongUnreasoned`).
         has_reasons: bool,
     },
+}
+
+// Written out rather than derived: the derived form compares discriminants
+// first and then reaches an `unreachable` arm for mismatched variants, which a
+// per-function verifier cannot connect to the discriminant test. This match is
+// the same structural equality with every arm total.
+impl PartialEq for EqJustification {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Asserted { eq_term: a }, Self::Asserted { eq_term: b }) => a == b,
+            (
+                Self::External {
+                    key: key_a,
+                    has_reasons: reasons_a,
+                },
+                Self::External {
+                    key: key_b,
+                    has_reasons: reasons_b,
+                },
+            ) => key_a == key_b && reasons_a == reasons_b,
+            (Self::Asserted { .. }, Self::External { .. })
+            | (Self::External { .. }, Self::Asserted { .. }) => false,
+        }
+    }
 }
 
 impl EqJustification {
@@ -144,9 +168,16 @@ impl ArrayUnionFind {
         // Union by rank; ties keep the first argument's root (deterministic:
         // all writer sites feed edges in a deterministic order).
         let (parent_root, child_root) = if rank_a >= rank_b { (ra, rb) } else { (rb, ra) };
-        let parent_rank_bumped = rank_a == rank_b;
-        if parent_rank_bumped {
-            *self.rank.get_mut(&parent_root).expect("node ensured") += 1;
+        // Union by rank keeps every rank below log2(node count), so the bump
+        // never saturates in practice; recording whether it actually happened
+        // keeps `pop_scope`'s inverse exact even at the type's ceiling.
+        let mut parent_rank_bumped = false;
+        if rank_a == rank_b {
+            let rank = self.rank.get_mut(&parent_root).expect("node ensured");
+            if let Some(bumped) = rank.checked_add(1) {
+                *rank = bumped;
+                parent_rank_bumped = true;
+            }
         }
         self.parent.insert(child_root, parent_root);
         self.edge.insert(child_root, EqEdge { a, b, just });
@@ -253,7 +284,7 @@ impl ArrayUnionFind {
         // Defensive fuel: the walk provably terminates (every sub-pair lives
         // in a strictly older frozen subtree), but an off-by-one here must
         // degrade to the BFS fallback, never hang the solver.
-        let mut fuel = 8 * (self.undo.len() + 8);
+        let mut fuel = self.undo.len().saturating_add(8).saturating_mul(8);
         while let Some((u, v)) = pending.pop() {
             if u == v {
                 continue;
@@ -277,7 +308,7 @@ impl ArrayUnionFind {
                 v_cursor = p;
             };
             let lca_pos = u_chain.iter().position(|&n| n == lca)?;
-            let u_hops = &u_chain[..lca_pos];
+            let u_hops = u_chain.get(..lca_pos)?;
 
             // Cross the union edges from a start node up to the LCA. Each hop
             // child `n` carries the edge that absorbed n's class; one endpoint
@@ -368,16 +399,21 @@ impl ArrayUnionFind {
             self.parent.insert(child_root, child_root);
             self.edge.remove(&child_root);
             if parent_rank_bumped {
-                *self
+                // `union` recorded a bump only after raising the rank by one,
+                // so the rank is at least 1 here.
+                let rank = self
                     .rank
                     .get_mut(&parent_root)
-                    .expect("parent existed at union") -= 1;
+                    .expect("parent existed at union");
+                *rank = rank.saturating_sub(1);
             }
             let parent_members = self
                 .class_list
                 .get_mut(&parent_root)
                 .expect("parent existed at union");
-            let split_at = parent_members.len() - child_class_len;
+            // Undo is LIFO: the `child_class_len` members `union` appended are
+            // still the parent list's tail, so the list is at least that long.
+            let split_at = parent_members.len().saturating_sub(child_class_len);
             let restored = parent_members.split_off(split_at);
             self.class_list.insert(child_root, restored);
             self.merge_log.pop();

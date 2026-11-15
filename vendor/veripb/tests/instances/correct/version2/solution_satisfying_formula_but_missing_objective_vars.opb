@@ -1,0 +1,137 @@
+* #variable= 16 #constraint= 73
+min: 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2  ;
+-8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 >= -5 ;
+8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 >= -4 ;
+1 i1_a_b0 2 i1_a_b1 4 i1_a_b2 >= 2 ;
+-1 i1_a_b0 -2 i1_a_b1 -4 i1_a_b2 >= -5 ;
+1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 >= 3 ;
+-1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 >= -6 ;
+1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 >= 3 ;
+-1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 >= -5 ;
+1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 >= 2 ;
+-1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 >= -5 ;
+* constraint ArrayMinMax result compared to value
+-1 i1_a_b0 -2 i1_a_b1 -4 i1_a_b2 1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 >= 0 ;
+* constraint ArrayMinMax result compared to value
+-1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 >= 0 ;
+* constraint ? ?
+1 i1_a_b0 2 i1_a_b1 4 i1_a_b2 3 ~i1_a_g3 >= 3 ;
+* constraint ? ?
+-1 i1_a_b0 -2 i1_a_b1 -4 i1_a_b2 5 i1_a_g3 >= -2 ;
+* constraint ? ?
+1 i1_a_b0 2 i1_a_b1 4 i1_a_b2 4 ~i1_a_g4 >= 4 ;
+* constraint ? ?
+-1 i1_a_b0 -2 i1_a_b1 -4 i1_a_b2 4 i1_a_g4 >= -3 ;
+* constraint ? ?
+1 i1_a_g3 1 ~i1_a_g4 2 ~i1_a_e3 >= 2 ;
+* constraint ? ?
+1 ~i1_a_g3 1 i1_a_g4 1 i1_a_e3 >= 1 ;
+* constraint ? ?
+1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 4 ~i2_b_g4 >= 4 ;
+* constraint ? ?
+-1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 4 i2_b_g4 >= -3 ;
+* constraint ? ?
+1 ~i2_b_g4 1 ~i2_b_e3 >= 1 ;
+* constraint ? ?
+1 i2_b_g4 1 i2_b_e3 >= 1 ;
+* constraint ? ?
+1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 4 ~i3_c_g4 >= 4 ;
+* constraint ? ?
+-1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 4 i3_c_g4 >= -3 ;
+* constraint ? ?
+1 ~i3_c_g4 1 ~i3_c_e3 >= 1 ;
+* constraint ? ?
+1 i3_c_g4 1 i3_c_e3 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e3 1 i2_b_e3 1 ~i3_c_e3 >= 1 ;
+* constraint ? ?
+1 i1_a_b0 2 i1_a_b1 4 i1_a_b2 5 ~i1_a_g5 >= 5 ;
+* constraint ? ?
+-1 i1_a_b0 -2 i1_a_b1 -4 i1_a_b2 3 i1_a_g5 >= -4 ;
+* constraint ? ?
+1 i1_a_g4 1 ~i1_a_g5 2 ~i1_a_e4 >= 2 ;
+* constraint ? ?
+1 ~i1_a_g4 1 i1_a_g5 1 i1_a_e4 >= 1 ;
+* constraint ? ?
+1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 5 ~i2_b_g5 >= 5 ;
+* constraint ? ?
+-1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 3 i2_b_g5 >= -4 ;
+* constraint ? ?
+1 i2_b_g4 1 ~i2_b_g5 2 ~i2_b_e4 >= 2 ;
+* constraint ? ?
+1 ~i2_b_g4 1 i2_b_g5 1 i2_b_e4 >= 1 ;
+* constraint ? ?
+1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 5 ~i3_c_g5 >= 5 ;
+* constraint ? ?
+-1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 3 i3_c_g5 >= -4 ;
+* constraint ? ?
+1 i3_c_g4 1 ~i3_c_g5 2 ~i3_c_e4 >= 2 ;
+* constraint ? ?
+1 ~i3_c_g4 1 i3_c_g5 1 i3_c_e4 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e4 1 i2_b_e4 1 ~i3_c_e4 >= 1 ;
+* constraint ? ?
+1 i1_a_g5 1 ~i1_a_e5 >= 1 ;
+* constraint ? ?
+1 ~i1_a_g5 1 i1_a_e5 >= 1 ;
+* constraint ? ?
+1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 6 ~i2_b_g6 >= 6 ;
+* constraint ? ?
+-1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 2 i2_b_g6 >= -5 ;
+* constraint ? ?
+1 i2_b_g5 1 ~i2_b_g6 2 ~i2_b_e5 >= 2 ;
+* constraint ? ?
+1 ~i2_b_g5 1 i2_b_g6 1 i2_b_e5 >= 1 ;
+* constraint ? ?
+1 i3_c_g5 1 ~i3_c_e5 >= 1 ;
+* constraint ? ?
+1 ~i3_c_g5 1 i3_c_e5 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e5 1 i2_b_e5 1 ~i3_c_e5 >= 1 ;
+* constraint ArrayMinMax result compared to value
+1 i1_a_b0 2 i1_a_b1 4 i1_a_b2 -1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 >= 0 ;
+* constraint ArrayMinMax result compared to value
+1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 -1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 >= 0 ;
+* constraint ? ?
+1 ~i1_a_g3 1 ~i1_a_e2 >= 1 ;
+* constraint ? ?
+1 i1_a_g3 1 i1_a_e2 >= 1 ;
+* constraint ? ?
+1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 3 ~i4_d_g3 >= 3 ;
+* constraint ? ?
+-1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 5 i4_d_g3 >= -2 ;
+* constraint ? ?
+1 ~i4_d_g3 1 ~i4_d_e2 >= 1 ;
+* constraint ? ?
+1 i4_d_g3 1 i4_d_e2 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e2 1 ~i4_d_e2 >= 1 ;
+* constraint ? ?
+1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 4 ~i4_d_g4 >= 4 ;
+* constraint ? ?
+-1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 4 i4_d_g4 >= -3 ;
+* constraint ? ?
+1 i4_d_g3 1 ~i4_d_g4 2 ~i4_d_e3 >= 2 ;
+* constraint ? ?
+1 ~i4_d_g3 1 i4_d_g4 1 i4_d_e3 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e3 1 i2_b_e3 1 ~i4_d_e3 >= 1 ;
+* constraint ? ?
+1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 5 ~i4_d_g5 >= 5 ;
+* constraint ? ?
+-1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 3 i4_d_g5 >= -4 ;
+* constraint ? ?
+1 i4_d_g4 1 ~i4_d_g5 2 ~i4_d_e4 >= 2 ;
+* constraint ? ?
+1 ~i4_d_g4 1 i4_d_g5 1 i4_d_e4 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e4 1 i2_b_e4 1 ~i4_d_e4 >= 1 ;
+* constraint ? ?
+1 i4_d_g5 1 ~i4_d_e5 >= 1 ;
+* constraint ? ?
+1 ~i4_d_g5 1 i4_d_e5 >= 1 ;
+* constraint ArrayMinMax result is in vars
+1 i1_a_e5 1 i2_b_e5 1 ~i4_d_e5 >= 1 ;
+* constraint LinearEqualityIff unconditional sum
+-1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 >= 0 ;
+1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 -1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 >= 0 ;

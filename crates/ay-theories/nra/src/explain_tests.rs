@@ -316,6 +316,17 @@ fn test_falsified_under_trail() {
     assert!(!clause_is_falsified(&[0], &[1]), "0 is not a literal");
 }
 
+/// `i32::MIN` has no negation. Wrapping negation made it its own complement, so
+/// a trail holding it "falsified" a clause of it (and a debug build panicked).
+#[test]
+fn test_unnegatable_literal_is_never_falsified() {
+    assert!(
+        !clause_is_falsified(&[i32::MIN], &[i32::MIN]),
+        "i32::MIN is not the negation of itself"
+    );
+    assert!(!clause_is_falsified(&[-1, i32::MIN], &[1, i32::MIN]));
+}
+
 // ===========================================================================
 // The producer
 // ===========================================================================
@@ -440,14 +451,19 @@ fn test_over_ceiling_declines() {
 // ===========================================================================
 
 #[test]
-fn test_sample_points_count_and_order() {
+fn test_sample_points_count_and_order() -> Result<(), Box<dyn std::error::Error>> {
     let roots = vec![
         Anum::rational(rat(-1)),
         Anum::rational(rat(0)),
         Anum::rational(rat(1)),
     ];
     let s = sample_points(&roots).expect("built");
-    assert_eq!(s.len(), 2 * roots.len() + 1);
+    let expected = roots
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or("sample point count fits usize")?;
+    assert_eq!(s.len(), expected);
     for w in s.windows(2) {
         assert_eq!(
             w[0].cmp_anum(&w[1]),
@@ -455,6 +471,7 @@ fn test_sample_points_count_and_order() {
             "sample points must strictly ascend"
         );
     }
+    Ok(())
 }
 
 #[test]

@@ -186,7 +186,13 @@ fn test_no_promote_under_bvadd() {
     );
 }
 
-/// `k` under `concat`: must NOT promote.
+/// `k` under `concat`: the AUFLIA candidate must NOT promote (the guard is
+/// unchanged), but the query is trivially satisfiable and the bounded
+/// Int→BV blaster (#int2bv-invalid-model, `int_blast.rs`) now DECIDES it:
+/// the published witness (k = #x00, L = 0) is re-validated against the
+/// original roots before it is announced. Like the `extract` row below, the
+/// former `unknown` was never the true answer — only the guard declining a
+/// model it could not realize.
 #[test]
 #[timeout(60_000)]
 fn test_no_promote_under_concat() {
@@ -199,8 +205,8 @@ fn test_no_promote_under_concat() {
     "#;
     assert_eq!(
         verdict(smt),
-        "unknown",
-        "concat under bv2nat: must NOT promote"
+        "sat",
+        "concat under bv2nat: decided exactly by the Int->BV blaster (SAT)"
     );
 }
 
@@ -230,7 +236,11 @@ fn test_no_promote_under_extract() {
     );
 }
 
-/// `k` equated to another BV (`k = m`, a BitVec `=`): must NOT promote.
+/// `k` equated to another BV (`k = m`, a BitVec `=`): an un-bridged
+/// occurrence, so the AUFLIA candidate must NOT promote (unchanged). The
+/// query is trivially satisfiable, and the bounded Int→BV blaster
+/// (#int2bv-invalid-model, `int_blast.rs`) decides it exactly; the published
+/// witness (k = m = #x00, L = 0) is re-validated against the original roots.
 #[test]
 #[timeout(60_000)]
 fn test_no_promote_bv_equality() {
@@ -245,8 +255,8 @@ fn test_no_promote_bv_equality() {
     "#;
     assert_eq!(
         verdict(smt),
-        "unknown",
-        "k = m (BitVec equality) is an un-bridged occurrence: must NOT promote"
+        "sat",
+        "k = m (BitVec equality): decided exactly by the Int->BV blaster (SAT)"
     );
 }
 

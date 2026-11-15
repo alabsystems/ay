@@ -5,6 +5,8 @@
 use super::*;
 use crate::clause::compute_clause_signature;
 
+#[path = "compact_tests/fixed.rs"]
+mod fixed;
 #[path = "compact_tests/state_mapping.rs"]
 mod state_mapping;
 
@@ -373,4 +375,32 @@ fn compact_multiple_eliminated_vars_stale_clauses() {
         compute_clause_signature(lits),
         "compaction must refresh signatures after in-place literal remapping"
     );
+}
+
+/// The progressive elimination bound lives on the BVE engine, which
+/// compaction recreates: it must survive, or every in-search phase after a
+/// compaction restarts at bound 0 and never reaches 4, 8, 16 (2026-09-19).
+#[test]
+fn compact_keeps_the_bve_growth_bound_and_mode() {
+    let mut solver: Solver = Solver::new(4);
+    solver.var_lifecycle.mark_eliminated(1);
+    solver.inproc.bve.reset_growth_bound_for_inprocessing();
+    for _ in 0..3 {
+        solver.inproc.bve.increment_growth_bound(); // 0 -> 1 -> 2 -> 4
+    }
+    assert_eq!(solver.inproc.bve.growth_bound(), 4);
+    assert!(!solver.inproc.bve.is_fastelim_mode());
+    solver.compact();
+    assert_eq!(
+        solver.num_vars, 3,
+        "the eliminated variable is compacted away"
+    );
+    assert_eq!(
+        solver.inproc.bve.growth_bound(),
+        4,
+        "the bound survives compaction"
+    );
+    assert!(!solver.inproc.bve.is_fastelim_mode());
+    solver.inproc.bve.increment_growth_bound();
+    assert_eq!(solver.inproc.bve.growth_bound(), 8);
 }

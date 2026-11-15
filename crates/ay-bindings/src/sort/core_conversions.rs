@@ -76,6 +76,11 @@ impl From<&Sort> for ay_core::Sort {
             SortInner::String => ay_core::Sort::String,
             SortInner::FloatingPoint(eb, sb) => ay_core::Sort::FloatingPoint(*eb, *sb),
             SortInner::Uninterpreted(name) => ay_core::Sort::Uninterpreted(name.clone()),
+            // ay-core names a datatype at term level by its declared name (the
+            // SMT-LIB elaborator's convention, see `as_term_sort`); a recursive
+            // field reference is that same name inside its own declaration.
+            // Callers that lower into a solver refuse dangling refs first.
+            SortInner::DatatypeRef(name) => ay_core::Sort::Uninterpreted(name.clone()),
             SortInner::RegLan => ay_core::Sort::RegLan,
             SortInner::Seq(elem) => ay_core::Sort::seq(ay_core::Sort::from(elem.as_ref())),
         }

@@ -9,6 +9,8 @@
 //! methods.
 
 use super::super::*;
+use super::assumption_unsat_proof::AssumptionUnsatScope;
+use super::ProofProgress;
 use crate::fmla_runtime_ledger::{
     validate_external_checker_verdict_artifact_file, ExternalProofCheckerVerdictArtifactRef,
     FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
@@ -21,6 +23,8 @@ use crate::solver::backward_proof::{BackwardProofFailure, BackwardProofResult};
 use crate::solver_log::solver_log;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+mod terminal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::solver) enum UnsatProofFinalizationError {
@@ -54,8 +58,9 @@ impl UnsatProofFinalizationError {
 impl Solver {
     /// Finalize UNSAT proof by writing the empty clause
     ///
-    /// This method centralizes UNSAT proof finalization. All UNSAT return sites
-    /// MUST call this method before returning `SatResult::Unsat(_)`.
+    /// This method centralizes base-formula UNSAT proof finalization. A
+    /// query-relative refutation under assumptions or a temporary constraint
+    /// must use conditional finalization instead of closing the base stream.
     ///
     /// # DRAT/LRAT format
     ///
@@ -71,6 +76,25 @@ impl Solver {
     /// This is the UNSAT counterpart to [`declare_sat_from_current_assignment`].
     #[inline]
     pub(in crate::solver) fn declare_unsat(&mut self) -> SatResult {
+        self.declare_unsat_with_proof_progress(None)
+    }
+
+    pub(super) fn declare_unsat_with_proof_progress(
+        &mut self,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult {
+        if let Some(reason) = self.counted_step_stop_reason() {
+            return self.declare_unknown_with_reason(reason);
+        }
+        // Under `--sat-deterministic-inproc` an UNSAT reached after the solve
+        // deadline or an interrupt is not published: passes cut short by a
+        // stop carry on, so its proof would depend on when the stop came.
+        // Stops never clear, so any earlier cut is still visible here.
+        if self.deterministic_inproc() {
+            if let Some(reason) = self.solve_stop_reason(&|| false) {
+                return self.declare_unknown_with_reason(reason);
+            }
+        }
         // Oversized-clause poison: a clause exceeding the arena's 16-bit length
         // field was stored truncated (a sound STRENGTHENING — see
         // `ClauseArena::add`). A truncated CNF clause has FEWER disjuncts, so the
@@ -113,6 +137,9 @@ impl Solver {
             );
             return self.declare_unknown_with_reason(SatUnknownReason::Unspecified);
         }
+        if !self.poll_unsat_proof_progress(proof_progress) {
+            return self.declare_unknown_with_reason(self.bounded_proof_unknown_reason());
+        }
         if self.cold.trace_ext_conflict {
             eprintln!(
                 "[DECLARE_UNSAT] conflicts={} decisions={} dl={} has_empty_clause={} trail_len={}",
@@ -139,52 +166,20 @@ impl Solver {
 
         // Run backward LRAT reconstruction BEFORE finalize_unsat_proof so we
         // can capture the result for the proof certificate.
-        let backward_result = self.run_backward_proof_reconstruction();
+        let backward_result = self.run_backward_proof_reconstruction_with_progress(proof_progress);
         if self.cold.backward_proof_failure.is_some()
             || (self.cold.backward_proof_limits.is_some() && !self.cold.empty_clause_in_proof)
         {
-            return self.declare_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure);
+            return self.declare_unknown_with_reason(self.bounded_proof_unknown_reason());
         }
-        if let Err(error) = self.finalize_unsat_proof() {
-            return self.declare_proof_finalization_unknown(error);
+        match self.finish_unsat_declaration_admitted(
+            backward_result,
+            proof_progress,
+            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
-        self.tla_trace_step(CdclTraceState::Unsat, Some(CdclTraceAction::DeclareUnsat));
-
-        let proof_steps = self
-            .proof_manager
-            .as_ref()
-            .map_or(0, ProofManager::added_count);
-        solver_log!(
-            self,
-            "UNSAT: {} conflicts, {} decisions, {} proof steps",
-            self.num_conflicts,
-            self.num_decisions,
-            proof_steps
-        );
-        tracing::info!(
-            num_conflicts = self.num_conflicts,
-            num_decisions = self.num_decisions,
-            proof_steps,
-            "solve: unsat"
-        );
-        self.emit_diagnostic_unsat_summary();
-
-        // Build proof certificate from backward reconstruction result.
-        let mut certificate = match backward_result {
-            Some(backward) => ProofCertificate::from_backward_reconstruction(backward),
-            None => ProofCertificate::empty(),
-        };
-
-        // Finalize streaming support: mark level-0 antecedents that conflict
-        // analysis never sees (#8250). Then attach it to the certificate.
-        if self.cold.retain_unsat_certificate {
-            self.finalize_streaming_core();
-            if let Some(core) = self.extract_streaming_core() {
-                certificate.set_streaming_support(core);
-            }
-        }
-
-        SatResult::Unsat(certificate)
     }
 
     /// Run backward LRAT proof reconstruction (#8105, primary path).
@@ -199,10 +194,19 @@ impl Solver {
     /// (IDs are reserved but not written), and this method writes the actual
     /// LRAT addition lines with proper hints.
     fn run_backward_proof_reconstruction(&mut self) -> Option<BackwardProofResult> {
+        self.run_backward_proof_reconstruction_with_progress(None)
+    }
+
+    fn run_backward_proof_reconstruction_with_progress(
+        &mut self,
+        proof_progress: ProofProgress<'_>,
+    ) -> Option<BackwardProofResult> {
         if !self.cold.lrat_enabled || !self.cold.unsat_certificate_enabled {
             return None;
         }
         if let Some(limits) = self.cold.backward_proof_limits.clone() {
+            let always_continue = || true;
+            let keep_going = proof_progress.unwrap_or(&always_continue);
             // An input-time contradiction can already be a complete,
             // authenticated proof. If no deferred learned ID exists, there is
             // nothing to reconstruct; avoid even allocating the visited map so
@@ -217,10 +221,16 @@ impl Solver {
                 return None;
             }
 
-            let mut backward = match self.reconstruct_lrat_backward_bounded(&limits) {
+            let mut backward = match self
+                .reconstruct_lrat_backward_bounded_with_cancellation(&limits, keep_going)
+            {
                 Ok(backward) => backward,
                 Err(failure) => {
                     self.cold.backward_proof_failure = Some(failure);
+                    if failure == BackwardProofFailure::Cancelled {
+                        self.cold.empty_clause_in_proof = false;
+                        self.cold.empty_clause_lrat_id = None;
+                    }
                     return None;
                 }
             };
@@ -246,12 +256,13 @@ impl Solver {
                 });
             if existing_terminal_is_authoritative {
                 if let Some(ref mut manager) = self.proof_manager {
-                    if let Err(error) = manager.finish_bounded_backward_emission(limits.deadline) {
+                    if let Err(error) = manager.finish_bounded_backward_emission_with_cancellation(
+                        limits.deadline,
+                        keep_going,
+                    ) {
                         self.cold.empty_clause_in_proof = false;
                         self.cold.empty_clause_lrat_id = None;
-                        if error.kind() == std::io::ErrorKind::TimedOut {
-                            self.cold.backward_proof_failure = Some(BackwardProofFailure::Deadline);
-                        }
+                        self.record_bounded_emission_failure(&error);
                     }
                 }
                 return None;
@@ -267,13 +278,14 @@ impl Solver {
             let mut emission_failure = None;
             if let Some(ref mut manager) = self.proof_manager {
                 for step in backward.steps.drain(..) {
-                    if let Err(error) = manager.emit_bounded_backward_rup_step(
+                    if let Err(error) = manager.emit_bounded_backward_rup_step_with_cancellation(
                         step.clause_id,
                         &step.literals,
                         &step.hints,
                         limits.deadline,
+                        keep_going,
                     ) {
-                        emission_failure = Some(error.kind());
+                        emission_failure = Some(error);
                         break;
                     }
                 }
@@ -281,15 +293,16 @@ impl Solver {
                 // reachable step was emitted coherently. On failure retain
                 // them so structural finalization also fails closed.
                 if emission_failure.is_none() {
-                    if let Err(error) = manager.finish_bounded_backward_emission(limits.deadline) {
-                        emission_failure = Some(error.kind());
+                    if let Err(error) = manager.finish_bounded_backward_emission_with_cancellation(
+                        limits.deadline,
+                        keep_going,
+                    ) {
+                        emission_failure = Some(error);
                     }
                 }
             }
-            if let Some(kind) = emission_failure {
-                if kind == std::io::ErrorKind::TimedOut {
-                    self.cold.backward_proof_failure = Some(BackwardProofFailure::Deadline);
-                }
+            if let Some(error) = emission_failure {
+                self.record_bounded_emission_failure(&error);
                 // Writer/storage failures are latched by the bounded proof
                 // buffer's shared typed handle. Other structural failures are
                 // retained by ProofManager; the cleared terminal marker makes
@@ -301,13 +314,14 @@ impl Solver {
             // positive-RUP funnel. This avoids the generic hint filtering and
             // allocation path and establishes terminal flags only after the
             // writer's added-count has advanced.
-            if let Err(error) = self.mark_empty_clause_with_bounded_prevalidated_hints(
-                &backward.empty_hints,
-                limits.deadline,
-            ) {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    self.cold.backward_proof_failure = Some(BackwardProofFailure::Deadline);
-                }
+            if let Err(error) = self
+                .mark_empty_clause_with_bounded_prevalidated_hints_and_cancellation(
+                    &backward.empty_hints,
+                    limits.deadline,
+                    keep_going,
+                )
+            {
+                self.record_bounded_emission_failure(&error);
                 return None;
             }
             return None;
@@ -346,6 +360,13 @@ impl Solver {
     /// use `Solver::with_proof()` and verify with drat-trim.
     pub(in crate::solver) fn finalize_unsat_proof(
         &mut self,
+    ) -> Result<(), UnsatProofFinalizationError> {
+        self.finalize_unsat_proof_with_progress(None)
+    }
+
+    fn finalize_unsat_proof_with_progress(
+        &mut self,
+        proof_progress: ProofProgress<'_>,
     ) -> Result<(), UnsatProofFinalizationError> {
         // Backward proof reconstruction is now run in declare_unsat() before
         // this method, so the backward result can be captured for the proof
@@ -394,7 +415,11 @@ impl Solver {
                         vec![empty_id]
                     } else {
                         self.ensure_level0_unit_proof_ids();
-                        self.build_finalize_empty_clause_hints()
+                        self.build_finalize_empty_clause_hints().ok_or(
+                            UnsatProofFinalizationError::InvalidLratChain(
+                                "incomplete terminal resolution chain",
+                            ),
+                        )?
                     }
                 } else {
                     Vec::new()
@@ -409,7 +434,16 @@ impl Solver {
             }
         }
         if let Some(ref mut manager) = self.proof_manager {
-            if let Err(error) = manager.flush() {
+            let flushed = match proof_progress {
+                Some(keep_going) => manager.flush_with_cancellation(keep_going),
+                None => manager.flush(),
+            };
+            if let Err(error) = flushed {
+                if crate::proof::is_bounded_emission_cancelled(&error) {
+                    self.cold.backward_proof_failure = Some(BackwardProofFailure::Cancelled);
+                    self.cold.empty_clause_in_proof = false;
+                    self.cold.empty_clause_lrat_id = None;
+                }
                 tracing::error!(
                     error = %error,
                     "UNSAT proof finalization failed while flushing proof output"
@@ -509,7 +543,22 @@ impl Solver {
             "declare_unsat: downgrading UNSAT to Unknown after proof finalization failure"
         );
         self.cold.last_unknown_detail = Some(detail);
-        self.declare_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure)
+        self.declare_unknown_with_reason(self.proof_finalization_unknown_reason(&error))
+    }
+
+    /// A finalization that failed because the proof writer latched a write
+    /// failure is reported as [`SatUnknownReason::ProofWriteFailure`], naming
+    /// the OS error; every other failure stays
+    /// [`SatUnknownReason::ProofFinalizationFailure`].
+    fn proof_finalization_unknown_reason(
+        &self,
+        error: &UnsatProofFinalizationError,
+    ) -> SatUnknownReason {
+        if matches!(error, UnsatProofFinalizationError::ProofIo) && self.proof_output_failed() {
+            SatUnknownReason::ProofWriteFailure
+        } else {
+            SatUnknownReason::ProofFinalizationFailure
+        }
     }
 
     fn declare_assume_proof_finalization_unknown(
@@ -522,7 +571,7 @@ impl Solver {
             "declare_unsat_assume: downgrading UNSAT to Unknown after proof finalization failure"
         );
         self.cold.last_unknown_detail = Some(detail);
-        self.declare_assume_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure)
+        self.declare_assume_unknown_with_reason(self.proof_finalization_unknown_reason(&error))
     }
 
     /// Build LRAT hints for the empty clause when `finalize_unsat_proof`
@@ -530,9 +579,9 @@ impl Solver {
     ///
     /// Strategy: find a clause in the arena that is falsified under the current
     /// level-0 assignment and use `collect_resolution_chain` to build the full
-    /// derivation chain. If no falsified clause is found (shouldn't happen for
-    /// a genuine UNSAT), fall back to collecting all level-0 unit proof IDs.
-    pub(in crate::solver) fn build_finalize_empty_clause_hints(&mut self) -> Vec<u64> {
+    /// derivation chain. Missing dependencies or a missing falsified seed are
+    /// refusals, not permission to emit a partial list of root-unit hints.
+    pub(in crate::solver) fn build_finalize_empty_clause_hints(&mut self) -> Option<Vec<u64>> {
         use crate::watched::ClauseRef;
 
         // Strategy 1: find a falsified clause and build resolution chain.
@@ -552,24 +601,13 @@ impl Solver {
             // call for non-root trails, but the method definition was never
             // committed. Fall through to collect_resolution_chain for all
             // cases until the missing method is implemented (#7175).
-            let chain = self.collect_resolution_chain(seed, None, &det_hash_set_new());
-            return Self::lrat_reverse_hints(&chain);
-        }
-
-        // Strategy 2: collect all level-0 unit proof IDs.
-        // Every level-0 trail variable with a unit_proof_id contributes a hint.
-        let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
-        let mut hints = Vec::new();
-        for i in 0..level0_end {
-            let lit = self.trail[i];
-            let vi = lit.variable().index();
-            if let Some(id) = self.visible_unit_proof_id_for_lit(lit) {
-                hints.push(id);
-            } else if let Some(id) = self.level0_var_proof_id(vi) {
-                hints.push(id);
+            let chain = self.collect_complete_resolution_chain(seed, None, &det_hash_set_new())?;
+            if chain.iter().any(|&id| !self.lrat_hint_id_visible(id)) {
+                return None;
             }
+            return Some(Self::lrat_reverse_hints(&chain));
         }
-        hints
+        None
     }
 
     /// Declare UNSAT for assumption-based solving, returning the given unsat core.
@@ -579,6 +617,10 @@ impl Solver {
     /// construction when LRAT proof output is enabled (#8209).
     #[inline]
     pub(in crate::solver) fn declare_unsat_assume(&mut self, core: Vec<Literal>) -> AssumeResult {
+        if let Some(reason) = self.counted_step_stop_reason() {
+            drop(core);
+            return self.declare_assume_unknown_with_reason(reason);
+        }
         // #8754: FINALIZE_SAT_FAIL poison — downgrade UNSAT to Unknown if we
         // saw an invalid SAT model earlier in this solve call. Mirror logic
         // in declare_unsat() for the assumption-path.
@@ -643,14 +685,9 @@ impl Solver {
         //
         // WHAT BREAKS THE ARGUMENT — re-verify by hand if any of these change:
         //   1. A `declare_unsat_assume(...)` call with a non-`vec![]` argument added
-        //      OUTSIDE those two functions. `core_subset_audit_containment_guard` in
-        //      this file's `tests` module re-derives (a) from source on every run and
-        //      fails if this happens, so it cannot rot silently.
+        //      OUTSIDE those two functions.
         //   2. Moving, conditionalizing, or duplicating either `prev_assumptions`
         //      refresh so some path reaches a non-empty-core call site without it.
-        //      The guard checks the refresh is unique and lexically above every such
-        //      call site in the same function; it does NOT prove unconditionality —
-        //      that half of (b) is eyeball-verified and must be re-read.
         //   3. Re-entrant solving. `solve_with_assumptions_impl` takes a
         //      caller-supplied `theory_check: &mut dyn FnMut(&mut Self)`, which hands
         //      out `&mut Solver`. A callback that ran a nested solve would overwrite
@@ -689,7 +726,29 @@ impl Solver {
             }
         }
 
+        // A native owner refusal cannot admit even a conditional prefix.
+        // Keep the existing deadline/interrupt identity; no callback or timer
+        // is stored here and no new budget is created.
+        if self.assumption_unsat_scope() == AssumptionUnsatScope::ConditionalQuery {
+            if let Some(reason) = self.solve_stop_reason(&|| false) {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
+        }
         self.maybe_append_authorized_fmla_learned_lrat_materialization();
+
+        if self.assumption_unsat_scope() == AssumptionUnsatScope::ConditionalQuery {
+            if let Err(error) = self.finalize_conditional_unsat_proof() {
+                return self.declare_assume_proof_finalization_unknown(error);
+            }
+            // Flush is cooperative/opaque. A stop raised during its normal
+            // return vetoes the verdict, without hiding an actual writer Err.
+            if let Some(reason) = self.solve_stop_reason(&|| false) {
+                return self.declare_assume_unknown_with_reason(reason);
+            }
+            self.tla_trace_step(CdclTraceState::Unsat, Some(CdclTraceAction::DeclareUnsat));
+            self.emit_diagnostic_unsat_summary();
+            return self.finish_counted_assume(AssumeResult::Unsat(core, None));
+        }
 
         // Run backward LRAT reconstruction BEFORE finalize_unsat_proof (same
         // ordering as declare_unsat) so the proof certificate captures the full
@@ -721,7 +780,7 @@ impl Solver {
             }
             cert
         });
-        AssumeResult::Unsat(core, certificate)
+        self.finish_counted_assume(AssumeResult::Unsat(core, certificate))
     }
 
     /// Finalize streaming original-clause support with level-0 antecedents (#8250).
@@ -740,86 +799,11 @@ impl Solver {
     /// `level0_proof_id`, since these represent original clauses whose
     /// arena reference was cleared after propagation.
     pub(in crate::solver) fn finalize_streaming_core(&mut self) {
-        let num_originals = self.cold.streaming_core_num_originals;
-        if num_originals == 0 || self.cold.streaming_core.is_none() {
-            return;
-        }
-
-        // Phase 1: Collect original clause IDs to mark (avoids borrow conflicts).
-        let mut ids_to_mark: Vec<u64> = Vec::new();
-
-        // Mark any falsified original clause.
-        // live_indices (husk adjudication): skip garbage-kept husks, and keep
-        // scanning past falsified clauses without a usable original ID
-        // (cid==0 husks previously hit the unconditional `break`, silently
-        // emptying the streaming-support seed).
-        for offset in self.arena.live_indices() {
-            let lits = self.arena.literals(offset);
-            if lits.is_empty() {
-                continue;
-            }
-            if lits.iter().all(|lit| self.lit_val(*lit) < 0) {
-                let cid = if offset < self.cold.clause_ids.len() {
-                    self.cold.clause_ids[offset]
-                } else {
-                    0
-                };
-                if cid > 0 && cid <= num_originals && self.is_original_clause_id(cid) {
-                    ids_to_mark.push(cid);
-                    // Only need first falsified original clause.
-                    break;
-                }
-            }
-        }
-
-        // Mark original clauses referenced by level-0 trail variable reasons.
-        let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
-        for i in 0..level0_end {
-            let var_idx = self.trail[i].variable().index();
-            if var_idx >= self.var_data.len() || self.var_data[var_idx].level != 0 {
-                continue;
-            }
-
-            // Check arena reason.
-            // #8467: lazy theory reasons are table indexes, not arena offsets —
-            // indexing clause_ids with one would mark an unrelated original.
-            let reason_raw = self.var_data[var_idx].reason;
-            if is_clause_reason(reason_raw) && !self.var_data[var_idx].is_lazy_theory_reason() {
-                let reason_offset = reason_raw as usize;
-                let reason_id = if reason_offset < self.cold.clause_ids.len() {
-                    self.cold.clause_ids[reason_offset]
-                } else {
-                    0
-                };
-                if reason_id > 0
-                    && reason_id <= num_originals
-                    && self.is_original_clause_id(reason_id)
-                {
-                    ids_to_mark.push(reason_id);
-                }
-            }
-
-            // Check signed unit proof IDs (for clauses whose arena reference was cleared).
-            let lit = self.trail[i];
-            if let Some(pid) = self.visible_unit_proof_id_for_lit(lit) {
-                if pid > 0 && pid <= num_originals && self.is_original_clause_id(pid) {
-                    ids_to_mark.push(pid);
-                }
-            }
-
-            // Check signed level0_proof_id fallback.
-            if let Some(pid) = self.level0_var_proof_id_for_lit(lit) {
-                if pid > 0 && pid <= num_originals && self.is_original_clause_id(pid) {
-                    ids_to_mark.push(pid);
-                }
-            }
-        }
-
-        // Phase 2: Apply marks to the bitmap.
-        if let Some(ref mut bitmap) = self.cold.streaming_core {
-            for cid in ids_to_mark {
-                bitmap[(cid - 1) as usize] = true;
-            }
+        match self.finalize_streaming_core_admitted(
+            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+        ) {
+            Ok(()) => (),
+            Err(never) => match never {},
         }
     }
 
@@ -1030,22 +1014,11 @@ impl Solver {
     /// Cost: O(num_originals) scan of the bitmap. For typical formulas this is
     /// negligible compared to the solve time.
     pub(in crate::solver) fn extract_streaming_core(&self) -> Option<Vec<u64>> {
-        let bitmap = self.cold.streaming_core.as_ref()?;
-        let core: Vec<u64> = bitmap
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &marked)| {
-                if marked {
-                    Some((i as u64) + 1) // Convert 0-based index to 1-based clause ID
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if core.is_empty() {
-            None
-        } else {
-            Some(core)
+        match self.extract_streaming_core_admitted(
+            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+        ) {
+            Ok(core) => core,
+            Err(never) => match never {},
         }
     }
 }
@@ -1249,308 +1222,8 @@ mod tests {
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
     }
 
-    // ── #core-subset-audit ────────────────────────────────────────────────
-    //
-    // `declare_unsat_assume` downgrades an UNSAT verdict whose core is not a
-    // subset of `cold.prev_assumptions`. That is only sound because every call
-    // site passing a non-empty core sits inside a function that refreshed
-    // `prev_assumptions` from this query's own assumptions first. The guard
-    // below re-derives that containment property from the source on every run,
-    // so the argument written up in `declare_unsat_assume` cannot silently rot.
-
-    /// A `declare_unsat_assume(<arg>)` call site found in the crate source.
-    #[derive(Debug)]
-    struct DeclareUnsatAssumeCall {
-        /// Path relative to `crates/ay-sat/src`, always `/`-separated.
-        rel_path: String,
-        /// 1-based line number.
-        line: usize,
-        /// Whitespace-stripped source text of the first argument.
-        arg: String,
-    }
-
-    fn ay_sat_src_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-    }
-
-    fn ay_sat_rust_sources() -> Vec<std::path::PathBuf> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("read ay-sat src dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&ay_sat_src_root(), &mut out);
-        out.sort();
-        out
-    }
-
-    // The scanner searches this very crate, so its own needles must never
-    // appear verbatim in the source or it would match itself. Assemble them
-    // from fragments; do not collapse these back into single literals.
-    fn call_needle() -> String {
-        format!("declare_unsat_{}", "assume(")
-    }
-
-    fn definition_needle() -> String {
-        format!("fn declare_unsat_{}", "assume(")
-    }
-
-    fn refresh_needle() -> String {
-        format!("self.cold.{}", "prev_assumptions.clear();")
-    }
-
-    /// Line ranges (1-based, inclusive) of top-level `#[cfg(test)]` modules.
-    /// Call sites inside them are exempt: test code sets `prev_assumptions`
-    /// explicitly and is not a production path into the audit.
-    fn cfg_test_module_ranges(src: &str) -> Vec<(usize, usize)> {
-        let lines: Vec<&str> = src.lines().collect();
-        let mut ranges = Vec::new();
-        let mut idx = 0;
-        while idx < lines.len() {
-            if lines[idx] == "#[cfg(test)]" {
-                let mut header = idx + 1;
-                while header < lines.len() && lines[header].starts_with("#[") {
-                    header += 1;
-                }
-                let is_module = header < lines.len()
-                    && !lines[header].starts_with(' ')
-                    && lines[header].contains("mod ")
-                    && lines[header].ends_with('{');
-                if is_module {
-                    let mut end = header + 1;
-                    while end < lines.len() && lines[end] != "}" {
-                        end += 1;
-                    }
-                    ranges.push((idx + 1, end + 1));
-                    idx = end + 1;
-                    continue;
-                }
-            }
-            idx += 1;
-        }
-        ranges
-    }
-
-    /// Every `declare_unsat_assume(...)` call site in `ay-sat` production code,
-    /// excluding the definition, comment mentions, and `#[cfg(test)]` modules.
-    /// A call whose argument is split across lines yields an empty `arg`, which
-    /// the guard treats as non-`vec![]` — conservative in the direction that
-    /// fails rather than passes.
-    fn declare_unsat_assume_calls() -> Vec<DeclareUnsatAssumeCall> {
-        let needle = call_needle();
-        let definition = definition_needle();
-        let root = ay_sat_src_root();
-        let mut calls = Vec::new();
-        for path in ay_sat_rust_sources() {
-            let src = std::fs::read_to_string(&path).expect("read rust source");
-            let test_ranges = cfg_test_module_ranges(&src);
-            let rel_path = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            for (idx, line) in src.lines().enumerate() {
-                if line.trim_start().starts_with("//") || line.contains(&definition) {
-                    continue;
-                }
-                let line_no = idx + 1;
-                if test_ranges
-                    .iter()
-                    .any(|(start, end)| line_no >= *start && line_no <= *end)
-                {
-                    continue;
-                }
-                let Some(pos) = line.find(&needle) else {
-                    continue;
-                };
-                let after = &line[pos + needle.len()..];
-                let end = after.find(')').unwrap_or(after.len());
-                calls.push(DeclareUnsatAssumeCall {
-                    rel_path: rel_path.clone(),
-                    line: idx + 1,
-                    arg: after[..end].split_whitespace().collect::<String>(),
-                });
-            }
-        }
-        calls
-    }
-
-    /// True if `line` starts a method at `impl`-block indentation (4 spaces).
-    fn is_impl_method_start(line: &str) -> bool {
-        let Some(rest) = line.strip_prefix("    ") else {
-            return false;
-        };
-        if rest.starts_with(' ') {
-            return false; // nested deeper than the impl block
-        }
-        let mut rest = rest;
-        if let Some(after_pub) = rest.strip_prefix("pub") {
-            let after_pub = after_pub.trim_start();
-            rest = match after_pub.strip_prefix('(') {
-                Some(restriction) => match restriction.find(')') {
-                    Some(close) => restriction[close + 1..].trim_start(),
-                    None => return false,
-                },
-                None => after_pub,
-            };
-        }
-        for keyword in ["default ", "const ", "async ", "unsafe ", "extern "] {
-            rest = rest.strip_prefix(keyword).unwrap_or(rest).trim_start();
-        }
-        rest.starts_with("fn ")
-    }
-
-    /// 1-based inclusive line range of the unique method whose signature line
-    /// contains `signature`. The end is the line before the next method in the
-    /// same `impl` block (or EOF), so the range can overshoot the body by the
-    /// next method's doc comment — harmless, since comments are not call sites.
-    fn impl_method_line_range(src: &str, signature: &str) -> (usize, usize) {
-        let lines: Vec<&str> = src.lines().collect();
-        let starts: Vec<usize> = (0..lines.len())
-            .filter(|&idx| is_impl_method_start(lines[idx]))
-            .collect();
-        let matching: Vec<usize> = starts
-            .iter()
-            .copied()
-            .filter(|&idx| lines[idx].contains(signature))
-            .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "expected exactly one method signature containing {signature:?}, got lines {:?}",
-            matching.iter().map(|idx| idx + 1).collect::<Vec<_>>(),
-        );
-        let start = matching[0];
-        let end = starts
-            .iter()
-            .copied()
-            .find(|&idx| idx > start)
-            .unwrap_or(lines.len());
-        (start + 1, end)
-    }
-
-    /// 1-based line of the unique `prev_assumptions` refresh inside `range`.
-    fn unique_prev_assumptions_refresh(src: &str, range: (usize, usize)) -> usize {
-        let needle = refresh_needle();
-        let hits: Vec<usize> = src
-            .lines()
-            .enumerate()
-            .map(|(idx, line)| (idx + 1, line))
-            .filter(|(line_no, line)| {
-                *line_no >= range.0
-                    && *line_no <= range.1
-                    && line.contains(&needle)
-                    && !line.trim_start().starts_with("//")
-            })
-            .map(|(line_no, _)| line_no)
-            .collect();
-        assert_eq!(
-            hits.len(),
-            1,
-            "expected exactly one `prev_assumptions` refresh in lines {range:?}, found {hits:?}"
-        );
-        hits[0]
-    }
-
-    /// Guards the containment property that licenses the enforcing
-    /// `#core-subset-audit` in `declare_unsat_assume`: every call passing a
-    /// NON-EMPTY core must lie inside `solve_with_assumptions_impl` or
-    /// `solve_incremental_ic3_raw`, after that function's unconditional
-    /// `cold.prev_assumptions` refresh. If this fails, do not "fix" the test —
-    /// either restore containment or the audit must go back to observe-only.
-    #[test]
-    fn core_subset_audit_containment_guard() {
-        let root = ay_sat_src_root();
-        let assumptions_src = std::fs::read_to_string(root.join("solver/assumptions.rs"))
-            .expect("read solver/assumptions.rs");
-        let ic3_src =
-            std::fs::read_to_string(root.join("solver/solve/ic3.rs")).expect("read solve/ic3.rs");
-
-        let assume_range =
-            impl_method_line_range(&assumptions_src, "fn solve_with_assumptions_impl");
-        let ic3_range = impl_method_line_range(&ic3_src, "fn solve_incremental_ic3_raw");
-        let assume_refresh = unique_prev_assumptions_refresh(&assumptions_src, assume_range);
-        let ic3_refresh = unique_prev_assumptions_refresh(&ic3_src, ic3_range);
-
-        // Nothing else in the crate may rewrite the audit's reference set.
-        let refresh = refresh_needle();
-        let total_refreshes: usize = ay_sat_rust_sources()
-            .iter()
-            .map(|path| {
-                std::fs::read_to_string(path)
-                    .expect("read rust source")
-                    .matches(refresh.as_str())
-                    .count()
-            })
-            .sum();
-        assert_eq!(
-            total_refreshes, 2,
-            "`cold.prev_assumptions` is now refreshed somewhere beyond \
-             solve_with_assumptions_impl and solve_incremental_ic3_raw; re-check the \
-             #core-subset-audit containment argument in declare_unsat_assume"
-        );
-
-        let windows = [
-            ("solver/assumptions.rs", assume_range, assume_refresh),
-            ("solver/solve/ic3.rs", ic3_range, ic3_refresh),
-        ];
-
-        let calls = declare_unsat_assume_calls();
-        assert!(
-            calls.len() > 10,
-            "source scan found only {} declare_unsat_assume call sites; the scanner is \
-             probably broken rather than the invariant",
-            calls.len()
-        );
-
-        let mut nonempty = 0usize;
-        let mut violations = Vec::new();
-        for call in &calls {
-            if call.arg == "vec![]" {
-                continue;
-            }
-            nonempty += 1;
-            let contained = windows.iter().any(|(file, (start, end), refresh)| {
-                call.rel_path == *file
-                    && call.line >= *start
-                    && call.line <= *end
-                    && call.line > *refresh
-            });
-            if !contained {
-                violations.push(format!(
-                    "{}:{} passes `{}`",
-                    call.rel_path, call.line, call.arg
-                ));
-            }
-        }
-
-        assert!(
-            nonempty >= 12,
-            "expected at least the 12 known non-empty-core call sites to still exist, \
-             found {nonempty}; the scanner is probably broken"
-        );
-        assert!(
-            violations.is_empty(),
-            "#core-subset-audit CONTAINMENT BROKEN: declare_unsat_assume is called with a \
-             non-empty core outside solve_with_assumptions_impl \
-             (solver/assumptions.rs:{}-{}, refresh at :{}) and solve_incremental_ic3_raw \
-             (solver/solve/ic3.rs:{}-{}, refresh at :{}). Such a call site can observe a \
-             STALE cold.prev_assumptions, which would make the enforcing audit downgrade \
-             CORRECT UNSAT answers to Unknown. Offenders: {violations:?}",
-            assume_range.0,
-            assume_range.1,
-            assume_refresh,
-            ic3_range.0,
-            ic3_range.1,
-            ic3_refresh,
-        );
-    }
+    // ── #core-subset-audit: `declare_unsat_assume` downgrades an UNSAT whose
+    // core is not a subset of this query's `cold.prev_assumptions`.
 
     #[test]
     fn core_subset_audit_downgrades_stray_core_literal() {

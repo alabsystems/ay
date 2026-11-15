@@ -105,19 +105,25 @@ pub(crate) fn rigorous_lower_bound(model: &Model, obj: &[f64], y: &[f64]) -> Opt
     rigorous_lower_bound_impl(model, obj, y, None)
 }
 
-/// Test adapter for [`rigorous_lower_bound`] under an explicit
-/// structural-column box.
+/// [`rigorous_lower_bound`] under an explicit structural-column box.
 ///
-/// This exercises the same outward-rounded weak-duality calculation while
-/// replacing only the structural bounds used for the reduced-cost corner. Row
-/// bounds and every matrix coefficient still come from `model`. Production
-/// target-FSB scoring uses the full computational box through
-/// [`crate::bab::safe_bound`], whose one-sided-logical clamp matches the native
-/// branch-and-bound path.
+/// The same outward-rounded weak-duality calculation, with only the structural
+/// bounds used for the reduced-cost corner replaced. Row bounds and every
+/// matrix coefficient still come from `model`.
+///
+/// SOUND ONLY when the box contains every feasible point of the LP — the
+/// argument prices each column at the corner of ITS box, so a box that cut off
+/// a feasible point could price below it. The production caller is
+/// [`crate::LpSession`], which passes the rows' implied box
+/// ([`crate::presolve::implied_box_f64`]: an exact consequence of the rows,
+/// rounded outward), never a guess. That box is what lets a FREE column be
+/// priced at all: a free column meeting a nonzero float reduced cost has no
+/// finite corner in the declared box, so the plain tier declines and the
+/// query falls to the exact rim. (Target-FSB scoring uses the full
+/// computational box through [`crate::bab::safe_bound`] instead.)
 ///
 /// # Panics
 /// Panics unless all four vectors have the model's corresponding arity.
-#[cfg(test)]
 pub(crate) fn rigorous_lower_bound_with_box(
     model: &Model,
     obj: &[f64],
@@ -410,5 +416,37 @@ mod tests {
         }
         assert!(checked >= 10, "corruption coverage: {checked}");
         let _ = Sense::Minimize;
+    }
+}
+
+#[cfg(test)]
+mod implied_box_pricing_tests {
+    use super::{rigorous_lower_bound, rigorous_lower_bound_with_box};
+    use crate::model::Model;
+    use crate::presolve::implied_box_f64;
+
+    /// `y` free with `y − 2x = 0`, `x ∈ [−1, 1]`: `min y = −2`. A float dual one
+    /// ulp off the exact `1` leaves `y` with a nonzero reduced cost, and a free
+    /// column with a nonzero reduced cost has no finite price — the plain tier
+    /// declines. The rows imply `y ∈ [−2, 2]`, and over that box the same dual
+    /// prices to a rigorous bound within a few ulps of the optimum.
+    #[test]
+    fn implied_box_prices_a_free_column_the_plain_tier_declines() {
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(y, 1.0), (x, -2.0)]);
+        let obj = [0.0, 1.0];
+        let dual = [1.0 + f64::EPSILON];
+        assert!(
+            rigorous_lower_bound(&m, &obj, &dual).is_none(),
+            "a free column with a nonzero reduced cost has no finite price"
+        );
+        let (lower, upper) = implied_box_f64(&m, None).expect("the rows imply a box");
+        assert_eq!((lower[y.index()], upper[y.index()]), (-2.0, 2.0));
+        let b = rigorous_lower_bound_with_box(&m, &obj, &dual, &lower, &upper)
+            .expect("priced over the implied box");
+        assert!(b <= -2.0, "rigorous: {b} must not exceed the optimum -2");
+        assert!(b > -2.0 - 1e-9, "tight: {b}");
     }
 }

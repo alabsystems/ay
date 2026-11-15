@@ -33,9 +33,8 @@ const RL_WORK_CAP: u64 = 20_000;
 /// Whether the relax-and-lift family is armed. DEFAULT OFF — see the measurement note on
 /// [`separate_relax_lift`].
 ///
-/// CACHED, and registered in [`prime_env`], because `the_live_env_read_surface_does_not_grow`
-/// ratchets on uncached `getenv` calls reachable from the solve path: a lazy read races a
-/// concurrent `set_var`, which is why `set_var` is `unsafe` in edition 2024. Caching is safe for
+/// CACHED, and registered in [`prime_env`], because an uncached `getenv` reachable from the
+/// solve path races a concurrent `set_var`, which is why `set_var` is `unsafe` in edition 2024. Caching is safe for
 /// THIS name specifically — it is a family gate, not an arm selector, and nothing flips it inside
 /// one process (the family's own tests call [`separate_relax_lift`] directly and never touch the
 /// gate), so there is no `OnceLock`-latching hazard of the kind the ledger's arm-selector list

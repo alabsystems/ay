@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% The FORMULA file is malformed, so the reader rejects it before any
+% rule runs. Upstream ships this as a plain incorrect instance; this
+% checker additionally requires an incorrect instance to say WHERE it is
+% refused, so a proof that merely stopped parsing is never mistaken for
+% evidence of a checking defect.
+f 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

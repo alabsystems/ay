@@ -76,6 +76,36 @@ fn residual_free_dt_array_alias_only_materializes_and_replays() {
 }
 
 #[test]
+fn residual_array_defaults_replay_complete_fp_fields_without_widening_the_carrier() {
+    for (eb, sb, supported) in [
+        (15, 129, true),
+        (64, 129, true),
+        (64, 130, true),
+        (8, 200, true),
+        (1, 200, false),
+    ] {
+        let mut terms = TermStore::new();
+        let record = Sort::Datatype(DatatypeSort::new(
+            "WideRecord",
+            vec![DatatypeConstructor::new(
+                "wide_record",
+                vec![DatatypeField::new("bits", Sort::FloatingPoint(eb, sb))],
+            )],
+        ));
+        let array_sort = Sort::array(Sort::Int, record);
+        let a = terms.mk_var("a", array_sort.clone());
+        let b = terms.mk_var("b", array_sort);
+        let alias = app(&mut terms, "=", &[a, b], Sort::Bool);
+        let result = verdict(&terms, &StubModel::new(), &[alias]);
+        if supported {
+            assert_confirmed(&result);
+        } else {
+            assert_cannot(&result);
+        }
+    }
+}
+
+#[test]
 fn residual_field_witness_selects_a_fitting_constructor() {
     // The canonical DEFAULT may use `empty`, but the explicit cell constrained
     // through selector `f` must use `full` and synthesize only its unconstrained
@@ -267,7 +297,17 @@ fn residual_classifier_width_budget_fails_closed_before_argument_snapshot() {
 #[test]
 fn residual_alias_edge_budget_fails_closed_without_truncation() {
     let mut ts = TermStore::new();
-    let array_sort = Sort::array(Sort::Int, struct_sort());
+    // Isolate the edge cap from the shared metadata-work cap. The two-field
+    // struct_sort costs 33 units per alias and exhausts 16,384 before 512 edges.
+    // This one-field schema costs 21 per alias: 10,752 at the edge boundary.
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "S",
+        vec![DatatypeConstructor::new(
+            "c",
+            vec![DatatypeField::new("f", Sort::Bool)],
+        )],
+    ));
+    let array_sort = Sort::array(Sort::Int, datatype);
     let left = ts.mk_var("left", array_sort.clone());
     let right = ts.mk_var("right", array_sort);
     let alias = app(&mut ts, "=", &[left, right], Sort::Bool);
@@ -282,13 +322,29 @@ fn residual_alias_edge_budget_fails_closed_without_truncation() {
 #[test]
 fn residual_member_budget_fails_closed_without_partial_classes() {
     let mut ts = TermStore::new();
-    let array_sort = Sort::array(Sort::Int, struct_sort());
+    // Keep every member in its own class, but isolate the member cap from
+    // repeated selector metadata census. The former two-field selector reads
+    // exhausted classifier work before materializing 256 independent arrays.
+    // Whole reads of S=c(f:Bool) cost 36 classifier units and 27 witness units
+    // per class: 9,216 and 6,912 at 256, below the unchanged 16,384/8,192 caps.
+    // The required c(true) cell differs from the synthesized c(false) default,
+    // so success still needs a real store in every array and full fresh replay.
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "S",
+        vec![DatatypeConstructor::new(
+            "c",
+            vec![DatatypeField::new("f", Sort::Bool)],
+        )],
+    ));
+    let array_sort = Sort::array(Sort::Int, datatype.clone());
     let index = ts.mk_int(int(0));
-    let five = ts.mk_int(int(5));
+    let truth = ts.mk_bool(true);
+    let element = app(&mut ts, "c", &[truth], datatype.clone());
     let mut assertions = Vec::new();
     for member in 0..=residual::MAX_WITNESS_MEMBERS {
         let array = ts.mk_var(format!("array_{member}"), array_sort.clone());
-        assertions.push(field_read_eq(&mut ts, "f", array, index, five));
+        let selected = app(&mut ts, "select", &[array, index], datatype.clone());
+        assertions.push(app(&mut ts, "=", &[element, selected], Sort::Bool));
     }
 
     assert_confirmed(&verdict(

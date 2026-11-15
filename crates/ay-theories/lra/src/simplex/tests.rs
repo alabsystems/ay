@@ -7,6 +7,11 @@ use ay_core::term::{TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::{BigRational, Rational64};
 
+#[path = "tests/anti_cycling.rs"]
+mod anti_cycling;
+#[path = "tests/update_amount.rs"]
+mod update_amount;
+
 fn int(value: i64) -> BigRational {
     BigRational::from(BigInt::from(value))
 }

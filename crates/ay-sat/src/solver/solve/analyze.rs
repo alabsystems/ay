@@ -10,6 +10,9 @@
 use super::super::*;
 use crate::solver_log::solver_log;
 
+pub(in crate::solver) mod admitted;
+mod dispatch;
+
 impl Solver {
     /// Shared conflict-analysis skeleton used by all CDCL loops.
     ///
@@ -63,92 +66,12 @@ impl Solver {
     {
         let prune_conflict_experiments = self.should_prune_conflict_analysis_experiments();
 
-        // A global unit clause is a root fact regardless of where its
-        // conflicting assignment was made. This path is especially important
-        // for unit theory axioms queued by add_theory_lemma: callers may ignore
-        // the returned ClauseRef, and the clause has no watches that could
-        // rediscover it after a fallback backtrack. Handle it before the
-        // chrono/non-chrono split so both modes install the unit at level 0
-        // (#1696).
-        if self.arena.len_of(conflict_ref.index()) == 1 {
-            before_backtrack(self, 0);
-            self.backtrack(0);
-            if !self.install_theory_unit_at_root(conflict_ref) {
-                self.record_level0_conflict_chain(conflict_ref);
-                return;
-            }
-            self.stats.forced_backtracks += 1;
+        if !self.conflict_dispatch_ordinary(conflict_ref, &mut before_backtrack) {
             return;
         }
 
-        // CaDiCaL analyze.cpp:962-1018: when chronological backtracking is
-        // enabled, find the actual conflict level (max level in conflict clause)
-        // and backtrack to it before analysis. This ensures decision_level
-        // equals the true conflict level so 1UIP analysis counts current-level
-        // literals correctly. Without this, assignment_level() corrections make
-        // some conflict-clause literals appear below decision_level.
-        if self.chrono_enabled {
-            let (conflict_level, forced) = self.find_conflict_level(conflict_ref);
-
-            // CaDiCaL analyze.cpp:977-1004: "forced" path — single literal at
-            // the highest level. Use conflict clause as driving clause directly,
-            // skip 1UIP analysis entirely (SAT'18 paper Alg.1 lines 4-6).
-            if let Some(forced_lit) = forced {
-                if conflict_level > 0 {
-                    let bt_level = conflict_level - 1;
-                    before_backtrack(self, bt_level);
-                    self.backtrack(bt_level);
-                    if bt_level == 0
-                        && !self
-                            .var_lifecycle
-                            .is_inactive(forced_lit.variable().index())
-                    {
-                        self.fixed_count += 1;
-                        self.var_lifecycle.mark_fixed(forced_lit.variable().index());
-                        self.l0_gc_dirty[forced_lit.variable().index()] = true;
-                    }
-                    // After backtrack, forced_lit is unassigned while all other
-                    // conflict clause literals remain false. The clause becomes
-                    // unit, propagating forced_lit = true (CaDiCaL analyze.cpp:998).
-                    // CaDiCaL forced path (analyze.cpp:988-1004): no bump_clause,
-                    // no vsids.decay(), no reduce_db. The conflict was not analyzed,
-                    // so bumping/decay provides no useful search guidance.
-                    self.enqueue(forced_lit, Some(conflict_ref));
-                    self.stats.forced_backtracks += 1;
-                    return;
-                }
-            }
-
-            // Backtrack to conflict_level so decision_level == conflict_level
-            // for correct 1UIP analysis (CaDiCaL analyze.cpp:1017).
-            if conflict_level < self.decision_level {
-                before_backtrack(self, conflict_level);
-                self.backtrack(conflict_level);
-            }
-
-            // CaDiCaL analyze.cpp:1022-1028: after backtracking to
-            // conflict_level, if we're now at level 0, learn the empty
-            // clause (UNSAT) and return. analyze_conflict requires
-            // decision_level > 0. With assignment_level corrections, all
-            // conflict clause literals can be at level 0 even when the
-            // conflict was detected at a higher decision_level (#6993).
-            if self.decision_level == 0 {
-                self.record_level0_conflict_chain(conflict_ref);
-                return;
-            }
-        }
-
-        // Trail exhaustion guard (#8479): analyze_conflict returns None when
-        // the backward trail scan fails to find a current-level seen literal.
-        // Backtrack to level 0 and continue — no incorrect clause is learned.
-        let Some(result) = self.analyze_conflict(conflict_ref) else {
-            before_backtrack(self, 0);
-            self.backtrack(0);
-            if self.active_branch_heuristic == BranchHeuristic::Evsids {
-                self.vsids.decay();
-            } else if self.active_branch_heuristic == BranchHeuristic::Chb {
-                self.vsids.decay_evsids_dormant();
-            }
+        let Some(mut result) = self.analyze_conflict(conflict_ref) else {
+            self.conflict_bailout_ordinary(&mut before_backtrack);
             return;
         };
 
@@ -219,13 +142,7 @@ impl Solver {
         // every variable fixed at level 0, not just during probe/sweep.
         // This ensures collect_level0_garbage() fires after CDCL unit learning,
         // cleaning stale false/true literals before the next inprocessing round.
-        if actual_backtrack_level == 0 && !self.var_lifecycle.is_inactive(uip.variable().index()) {
-            self.fixed_count += 1;
-            // CaDiCaL: mark_fixed() in flags.cpp:5-32. Fixed variables are
-            // permanently assigned and can never be reactivated or eliminated.
-            self.var_lifecycle.mark_fixed(uip.variable().index());
-            self.l0_gc_dirty[uip.variable().index()] = true;
-        }
+        self.fix_learned_uip_at_root(uip, actual_backtrack_level);
         debug_assert!(
             !self.var_is_assigned(uip.variable().index()),
             "BUG: UIP {uip:?} still assigned after backtrack to level {actual_backtrack_level} ({context})",
@@ -274,23 +191,22 @@ impl Solver {
                 );
                 Some(post_ref.0 as usize)
             } else {
-                self.set_diagnostic_pass(DiagnosticPass::Learning);
-                let learned_ref = self.add_conflict_learned_clause(
-                    result.learned_clause,
-                    result.lbd,
-                    result.resolution_chain,
-                );
-                self.clear_diagnostic_pass();
-                self.update_lbd_ema(result.lbd);
-                self.enqueue(uip, Some(learned_ref));
+                let learned_off = match self.learn_asserting_clause_admitted(
+                    &mut result,
+                    actual_backtrack_level,
+                    &admitted::Ordinary,
+                ) {
+                    Ok(offset) => offset,
+                    Err(never) => match never {},
+                };
                 solver_log!(
                     self,
                     "backtrack to level {} learn clause {} assert {}",
                     actual_backtrack_level,
-                    learned_ref.0,
+                    learned_off,
                     uip.to_dimacs()
                 );
-                Some(learned_ref.0 as usize)
+                Some(learned_off)
             }
         };
 
@@ -325,6 +241,12 @@ impl Solver {
         // conflicts, not reduction rounds. No-op unless the arm is armed.
         self.two_stage_periodic_decay_if_due();
         if self.should_reduce_db() {
+            // The reduction may first backjump to level 0 (out-of-order
+            // units): the hook hears of it like any other backjump, so an
+            // extension pops its scopes and the assumption loop re-assumes.
+            if self.reduce_db_backjumps_to_root() {
+                before_backtrack(self, 0);
+            }
             self.reduce_db();
         }
 

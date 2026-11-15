@@ -34,7 +34,10 @@ use crate::executor_types::{ExecutorError, Result};
 
 use super::Executor;
 mod array_reconcile;
+mod bv_lia_indep_reconcile;
+mod certified_array_read;
 mod completion;
+pub(in crate::executor) use completion::CandidateOwner;
 mod datatype_array_fields;
 mod datatype_cell_authority;
 mod datatype_opaque_scope;
@@ -48,9 +51,12 @@ mod eval_arith;
 mod eval_array;
 mod eval_bv;
 mod eval_bv_structural;
+mod eval_complex;
+mod eval_dt_constructor;
 mod eval_fp;
 mod eval_parse;
 mod eval_seq;
+mod eval_seq_power;
 mod eval_string;
 mod eval_uf;
 mod eval_var;
@@ -58,28 +64,39 @@ mod eval_var;
 // raw grammar, unparseable by a compiler without the extension and unhideable by
 // any `cfg`, since cfg-stripping runs after parsing — cannot take the rest of the
 // module down with it. `gate_decision_stock.rs` is the same decision without the
-// clause; `tests/smt_model_gate_conformance.rs` pins the two together.
+// clause; `tests/gate_decision.rs` checks the truth table of whichever one a build compiles.
 #[path = "gate_decision_stock.rs"]
 mod gate_decision;
 mod independent_gate;
 pub(in crate::executor) use independent_gate::probe_budget::QuantifiedGateProbeBudget;
 pub(in crate::executor) use independent_gate::QuantifiedModelConfirmation;
+pub(super) mod evaluation_copies;
 mod ite_fixup;
 mod ite_fixup_limits;
+pub(in crate::executor) mod lane_ground_model;
 mod minimize;
+mod native_map_gate;
 mod nra_refine;
 mod output;
 mod output_format;
 mod output_objectives;
 mod projection_uf;
+mod public_uf_observation;
+mod recovery_admission;
 mod rendered_dt_guard;
 mod rendered_dt_limits;
+mod residual_completion;
+mod residual_output;
+mod rm_concrete;
 pub(crate) mod sat_emit;
 mod set_materialize;
+pub(in crate::executor) mod stderr_diagnostics;
 mod string_materialize;
 pub(in crate::executor) mod string_witness;
 pub(in crate::executor) mod uflia_witness;
+pub(in crate::executor) mod unknown_candidate;
 mod validation;
+mod wrong_ctor_get_value;
 
 /// Whether term evaluation is currently running under a datatype-materializer
 /// pin set or lexical scoped binding.  Exact source-semantic certificates must
@@ -190,6 +207,12 @@ pub(in crate::executor) use div_witness::{
 ///     (previously only the search loop polled the flag; model evaluation
 ///     ran to completion no matter what).
 mod eval_guard;
+mod evaluation_control;
+pub(crate) use evaluation_control::EvaluationReadScope;
+pub(in crate::executor) use evaluation_control::{
+    EvaluationArena, EvaluationAttempt, EvaluationControl, EvaluationReadControls,
+    NativeBvRefutationScope,
+};
 
 /// Invalidate the `evaluate_term` result cache after a model mutation
 /// (`#eval-memo`). Free function so mutation sites that hold only `&mut Model`
@@ -218,10 +241,15 @@ use certificate_data::{
     QuantifiedGrantModelSeal, StampedCertificatePin, StampedClosedValueGraph,
 };
 pub(in crate::executor) use certificate_data::{
-    CegqiUfModelEpoch, CertifiedConstInterpEntry, CertifiedConstInterpReadError,
-    FormulaNeutralFunctionDefaultEntry, FormulaNeutralFunctionDefaultReadError,
+    CegqiUfModelEpoch, CertifiedConstInterpBody, CertifiedConstInterpEntry,
+    CertifiedConstInterpRead, CertifiedConstInterpReadError, CertifiedConstInterpWitness,
+    FormulaNeutralFunctionDefaultEntry, FormulaNeutralFunctionDefaultReadError, LinearIntBody,
     QuantifiedConfirmationModelEpoch, QuantifiedGrantModelEpoch,
 };
+
+/// Model-owned scalar UF interpretations retained across internal transports.
+pub(super) type MaterializedScalarFunctions =
+    HashMap<String, minimize::function_rows::MaterializedScalarFunction>;
 
 /// A satisfying model from check-sat
 #[derive(Debug, Clone)]
@@ -248,6 +276,9 @@ pub(super) struct Model {
     pub(super) bool_overrides: HashMap<TermId, bool>,
     /// Optional EUF model (for QF_UF and related logics)
     pub(super) euf_model: Option<EufModel>,
+    /// Exact printed scalar UF interpretations frozen before model cosmetics.
+    /// These are model data, shared by public reads and the independent gate.
+    pub(super) materialized_scalar_functions: MaterializedScalarFunctions,
     /// Optional array model (for QF_AX and related logics)
     pub(super) array_model: Option<ArrayModel>,
     /// Optional LRA model (for QF_LRA and related logics)
@@ -288,6 +319,8 @@ pub(super) struct Model {
     /// the LAST resort — a theory-model value always wins — which keeps the
     /// slot fill-only at the evaluation level.
     pub(super) completed_values: HashMap<TermId, EvalValue>,
+    /// Immutable canonical field-leaf DATA, sharing original admitted storage.
+    field_assignments: field_assignments::FieldAssignments,
     /// Total ground datatype values shared by all validators and printers
     /// after model construction (`#dt-total-model`).
     pub(super) dt_ground: HashMap<TermId, ay_model_check::ModelValue>,
@@ -296,9 +329,29 @@ pub(super) struct Model {
     pub(super) dt_pins: HashMap<TermId, EvalValue>,
     /// Current exact array-field evidence; every consumer must revalidate it.
     pub(in crate::executor::model) dt_array_field_classes: datatype_array_fields::ArrayFieldClasses,
+    /// Exact residual array data, shared by independent replay and public reads.
+    /// Installation invalidates old model-relative proofs; this is not a seal.
+    residual_arrays: Option<residual_completion::ResidualArrayModel>,
+    /// Complete captured functional array data. This grants no SAT authority.
+    functional_arrays: Option<functional_arrays::FunctionalArrayModel>,
+    /// Conservative DATA charge for directly constructed scalar candidates.
+    /// Carries no execution callback or SAT authority across public reads.
+    _scalar_candidate_memory: Option<std::sync::Arc<evaluation_copies::RetainedEvaluationMemory>>,
+    construction_owner: Option<std::sync::Arc<construction_owner::ModelConstructionOwner>>,
 }
 
+mod construction_owner;
+pub(in crate::executor) use construction_owner::{
+    reconstruct_checked_cegqi_model_owner, reconstruct_checked_dt_model_owner,
+    reconstruct_checked_finite_model_owner, reconstruct_checked_ground_model_owner,
+};
+mod functional_arrays;
+
+mod field_assignments;
+mod literal_fp_candidate;
 mod model_base;
+pub(in crate::executor) use field_assignments::FieldScalar;
+mod model_check_total_uf;
 mod model_quantified;
 mod model_total_uf;
 
@@ -311,6 +364,11 @@ pub(crate) enum EvalValue {
     Element(String),
     /// Rational/integer value (BigRational can represent both)
     Rational(BigRational),
+    /// Exact builtin Complex carrier; each component is a Real value.
+    Complex {
+        real: Box<Self>,
+        imaginary: Box<Self>,
+    },
     /// Bitvector value with width
     BitVec {
         /// The numeric value of the bitvector
@@ -320,6 +378,11 @@ pub(crate) enum EvalValue {
     },
     /// IEEE 754 floating-point value (as SMT-LIB string)
     Fp(FpModelValue),
+    /// Canonical residue and checked prime field.
+    FiniteField {
+        value: u32,
+        field: ay_core::FiniteFieldSort,
+    },
     /// String value
     String(String),
     /// Sequence value (parametric: elements can be any EvalValue)
@@ -337,8 +400,22 @@ impl PartialEq for EvalValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Bool(a), Self::Bool(b)) => a == b,
+            (
+                Self::FiniteField { value: a, field: p },
+                Self::FiniteField { value: b, field: q },
+            ) => a == b && p == q,
             (Self::Element(a), Self::Element(b)) => a == b,
             (Self::Rational(a), Self::Rational(b)) => a == b,
+            (
+                Self::Complex {
+                    real: ar,
+                    imaginary: ai,
+                },
+                Self::Complex {
+                    real: br,
+                    imaginary: bi,
+                },
+            ) => ar == br && ai == bi,
             (
                 Self::BitVec {
                     value: v1,
@@ -524,15 +601,44 @@ impl Executor {
     /// value, by consulting the TOP-LEVEL assertions for an equality pinning it
     /// to a leaf (`Var`/`Const`) term (#aufbv-nonbv-elem).
     ///
-    /// Returns the leaf side's evaluated value when some asserted
-    /// `(= leaf select)` / `(= select leaf)` exists, else `Unknown`. Restricting
-    /// the partner to a `Var`/`Const` keeps the lookup non-recursive (it never
-    /// re-enters `evaluate_select`) and matches the head-anchoring equalities the
-    /// VC encoder emits for slice reads. Every element of `ctx.assertions` is
-    /// conjoined and therefore true in the model, so the value returned is the
-    /// solver's committed interpretation — the subsequent full model validation
-    /// re-checks it, so this can never fabricate a wrong SAT.
+    /// Returns the leaf side's evaluated value when every asserted
+    /// `(= leaf select)` / `(= select leaf)` that HAS a value agrees on that
+    /// value, and `Unknown` otherwise. Restricting the partner to a `Var`/`Const`
+    /// keeps the lookup non-recursive (it never re-enters `evaluate_select`) and
+    /// matches the head-anchoring equalities the VC encoder emits for slice
+    /// reads. Every element of `ctx.assertions` is conjoined and therefore true
+    /// in the model, so the value returned is the solver's committed
+    /// interpretation — the subsequent full model validation re-checks it, so
+    /// this can never fabricate a wrong SAT.
+    ///
+    /// TWO FAIL-CLOSED BOUNDARIES, both measured 2026-09-14 against the
+    /// `completion/datatype_arrays` phase-boundary battery:
+    ///
+    ///  * UNANIMITY. This used to return the FIRST partner that had a value. A
+    ///    candidate asserting `(= r x)` and `(= r y)` with `x != y` in the model
+    ///    is internally inconsistent, and answering `x` publishes a definite
+    ///    element for a read the candidate commits two ways. Disagreement — and
+    ///    an undecidable comparison — now yields `Unknown`.
+    ///  * OWNERSHIP. A select whose ELEMENT sort the equality-carrier completion
+    ///    pass completes (`completion::carrier_sort_key`: uninterpreted sorts
+    ///    under a BV-backed model, and sequences) is not this function's to
+    ///    answer. That pass is strictly stronger on the same evidence — it
+    ///    merges the whole equality class (SAT-committed atoms, not only
+    ///    top-level ones), REFUSES a class carrying two different committed
+    ///    anchors (`blocked_class`), and writes the element into `euf_model`
+    ///    where every later consumer reads it. Answering ahead of it also
+    ///    SUPPRESSES it: the completion snapshot files a term this function
+    ///    valued under `resolved_elem`, never `unknown_idx`, so no carrier entry
+    ///    is ever materialized for the read. Bool-element reads — the
+    ///    `#aufbv-nonbv-elem` case this function was written for — are not
+    ///    carrier sorts and still route here.
     fn resolve_select_via_asserted_equality(&self, model: &Model, select_id: TermId) -> EvalValue {
+        if completion::carrier_sort_key(self.ctx.terms.sort(select_id), model.bv_model.is_some())
+            .is_some()
+        {
+            return EvalValue::Unknown;
+        }
+        let mut resolved: Option<EvalValue> = None;
         for &assertion in &self.ctx.assertions {
             let TermData::App(sym, eq_args) = self.ctx.terms.get(assertion) else {
                 continue;
@@ -561,11 +667,21 @@ impl Executor {
                 continue;
             }
             let value = self.evaluate_term(model, partner);
-            if !matches!(value, EvalValue::Unknown) {
-                return value;
+            if matches!(value, EvalValue::Unknown) {
+                continue;
+            }
+            match resolved.as_ref() {
+                None => resolved = Some(value),
+                // Two asserted anchors for one read. `Some(false)` is a
+                // contradiction in the candidate and `None` an undecidable
+                // comparison; neither licenses publishing either value.
+                Some(previous) => match Self::eval_values_equal_exact(previous, &value) {
+                    Some(true) => {}
+                    _ => return EvalValue::Unknown,
+                },
             }
         }
-        EvalValue::Unknown
+        resolved.unwrap_or(EvalValue::Unknown)
     }
 
     /// Evaluate a term under the current model, recursively handling composite terms.
@@ -574,11 +690,74 @@ impl Executor {
     /// and looks up values for variables and function applications.
     /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#4602).
     pub(super) fn evaluate_term(&self, model: &Model, term_id: TermId) -> EvalValue {
+        // Source/query changes must be observed even when this frame could
+        // otherwise return an ambient memoized value for an owned model.
+        if eval_guard::depth() == 0
+            && (model
+                .construction_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.validate_data_source(self))
+                || model.validate_functional_array_source(self).is_err())
+        {
+            return EvalValue::Unknown;
+        }
+        let _field_read = if eval_guard::depth() == 0
+            && model.has_field_assignments()
+            && !evaluation_copies::active()
+        {
+            match model.read_field_assignments(self) {
+                Ok(read) => read,
+                Err(origin) => {
+                    self.record_evaluation_stop(origin);
+                    return EvalValue::Unknown;
+                }
+            }
+        } else {
+            None
+        };
+        self.evaluate_term_source_validated(model, term_id)
+    }
+
+    // Only a validated immutable read witness or the ordinary source-checked
+    // recursive entry calls this. No TLS flag grants a source-validation bypass.
+    pub(super) fn evaluate_term_source_validated(
+        &self,
+        model: &Model,
+        term_id: TermId,
+    ) -> EvalValue {
+        let _copies = evaluation_copies::retain();
+        if !evaluation_copies::validate(self)
+            || !evaluation_copies::pay(1, 2 * std::mem::size_of::<EvalValue>())
+            || !evaluation_copies::validate(self)
+            || self.evaluation_stop_origin().is_some()
+            || (eval_guard::depth() == 0 && self.poll_evaluation_stop().is_err())
+        {
+            return EvalValue::Unknown;
+        }
+        let value = self.evaluate_term_unstopped(model, term_id);
+        if !evaluation_copies::validate(self) || self.evaluation_stop_origin().is_some() {
+            EvalValue::Unknown
+        } else {
+            value
+        }
+    }
+
+    fn evaluate_term_unstopped(&self, model: &Model, term_id: TermId) -> EvalValue {
         // W4's search budget is cooperative inside evaluation, not merely at
         // the outer hill-climb. Once spent, even a cached value must not let a
         // partial atom sweep masquerade as a complete score.
         if self.w4_budget_exhausted() {
             return EvalValue::Unknown;
+        }
+        // Typed residual completions precede every old scalar pin/cache. Their
+        // independent evaluator computes fresh reads from the retained array,
+        // not from stale selector/select don't-cares in the raw model.
+        match self.completed_model_value(model, term_id) {
+            Ok(Some(value)) => {
+                return self.completed_scalar_value(&value, self.ctx.terms.sort(term_id));
+            }
+            Ok(None) => {}
+            Err(()) => return EvalValue::Unknown,
         }
         // A checked projection is a total symbolic interpretation. Resolve it
         // before every TermId-keyed source (datatype override/pin, result memo,
@@ -592,6 +771,11 @@ impl Executor {
             Ok(Some(projected_term)) => return self.evaluate_term(model, projected_term),
             Ok(None) => {}
             Err(_) => return EvalValue::Unknown,
+        }
+        // A certified array owns each read of its retained value. Consult it
+        // before term-only pins/memo; an owned Unknown is terminal.
+        if let Some(value) = self.certified_const_array_read(model, term_id) {
+            return value;
         }
         // Datatype-field re-evaluation override (#dt-field-soundness). When the
         // materialized datatype re-evaluator (`dt_mat_eval`) is active it pins every
@@ -648,8 +832,7 @@ impl Executor {
         }
         // Periodic external-stop poll: lets an interrupt/deadline terminate
         // long evaluation passes instead of running them to completion.
-        if eval_guard::should_poll_stop() && self.external_stop_reason().is_some() {
-            eval_guard::note_stop();
+        if eval_guard::should_poll_stop() && self.poll_evaluation_stop().is_err() {
             return EvalValue::Unknown;
         }
         // Depth-scoped memo admission (#eval-lowlink): open a fresh
@@ -662,6 +845,7 @@ impl Executor {
         let v = self.evaluate_term_inner(model, term_id);
         let frame_min = eval_guard::min_reentry();
         if !self.w4_budget_exhausted()
+            && self.evaluation_stop_origin().is_none()
             && frame_min >= eval_guard::depth()
             && eval_guard::stop_poison() == stop_before
             && eval_guard::work_budget_poison() == work_budget_before
@@ -670,6 +854,28 @@ impl Executor {
         }
         eval_guard::fold_min(parent_min);
         v
+    }
+
+    /// Exact equality of two GROUND RegLan terms, decided by language.
+    ///
+    /// `EvalValue` has no RegLan carrier (completion's `"re.none"` element
+    /// is a display default, not a language), so the value-comparison arms
+    /// below can only answer `Unknown` for a regex equality — which the
+    /// ground-assertion gate then reports as unconfirmable. When both
+    /// operands translate exactly to `WeRegex` (ground leaves only), the
+    /// derivative-pair decision in `ay_strings` settles the equality in
+    /// either direction. `None` (untranslatable or capped) leaves the
+    /// existing fail-closed `Unknown` behaviour untouched.
+    fn eval_ground_reglan_equality(&self, lhs: TermId, rhs: TermId) -> Option<bool> {
+        if !matches!(self.ctx.terms.sort(lhs), Sort::RegLan)
+            || !matches!(self.ctx.terms.sort(rhs), Sort::RegLan)
+        {
+            return None;
+        }
+        let limits = ay_strings::term_regex::TranslateLimits::for_ground_eval();
+        let left = ay_strings::term_regex::translate(&self.ctx.terms, lhs, &limits)?;
+        let right = ay_strings::term_regex::translate(&self.ctx.terms, rhs, &limits)?;
+        ay_strings::we_regex::languages_equal(&left, &right)
     }
 
     /// Uncached body of [`Self::evaluate_term`]. Recursive calls go back through
@@ -688,7 +894,7 @@ impl Executor {
                 && !dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id)
             {
                 if let Some(pin) = model.dt_pins.get(&term_id) {
-                    return pin.clone();
+                    return evaluation_copies::copy(pin);
                 }
             }
             // CONSTANT-INTERPRETATION CERTIFICATE WITNESS pins. When the
@@ -707,8 +913,33 @@ impl Executor {
             // of scalar literals and const-arrays, so recursion cannot return
             // to the interpreted head.
             match self.const_interp_witness_value(model, term_id) {
-                Ok(Some(value)) if value != term_id => {
+                Ok(Some(CertifiedConstInterpRead::Constant(value))) if value != term_id => {
                     return self.evaluate_term(model, value);
+                }
+                // SYMBOLIC DEFAULT. `I(f)` is `lambda x-bar. k + sum c_i x_i`,
+                // so the value at THIS application is the body evaluated at
+                // the evaluated arguments — a beta-reduction, not a lookup.
+                // Recursion terminates: the arguments are strict subterms, and
+                // the body mentions no head at all.
+                Ok(Some(CertifiedConstInterpRead::LinearInt { body, arguments })) => {
+                    let mut argument_values = Vec::with_capacity(arguments.len());
+                    for argument in arguments {
+                        // Fail closed on anything that is not an exact
+                        // integer: publishing a rounded or fabricated point
+                        // would contradict the interpretation the certificate
+                        // proved.
+                        let EvalValue::Rational(value) = self.evaluate_term(model, argument) else {
+                            return EvalValue::Unknown;
+                        };
+                        if !value.is_integer() {
+                            return EvalValue::Unknown;
+                        }
+                        argument_values.push(value.to_integer());
+                    }
+                    return match body.evaluate(&argument_values) {
+                        Some(value) => EvalValue::Rational(BigRational::from(value)),
+                        None => EvalValue::Unknown,
+                    };
                 }
                 Ok(Some(_)) | Err(_) => return EvalValue::Unknown,
                 Ok(None) => {}
@@ -727,19 +958,50 @@ impl Executor {
             }
             let term = self.ctx.terms.get(term_id);
             let sort = self.ctx.terms.sort(term_id);
+            if let TermData::App(_, arguments) = term {
+                if !evaluation_copies::cells(arguments.len()) {
+                    return EvalValue::Unknown;
+                }
+            }
 
             match term {
                 // Constants evaluate to themselves
                 TermData::Const(Constant::Bool(b)) => EvalValue::Bool(*b),
                 TermData::Const(Constant::Int(n)) => {
+                    if !evaluation_copies::integer(n) {
+                        return EvalValue::Unknown;
+                    }
                     EvalValue::Rational(BigRational::from(n.clone()))
                 }
-                TermData::Const(Constant::Rational(r)) => EvalValue::Rational(r.0.clone()),
-                TermData::Const(Constant::BitVec { value, width }) => EvalValue::BitVec {
-                    value: value.clone(),
-                    width: *width,
-                },
-                TermData::Const(Constant::String(s)) => EvalValue::String(s.clone()),
+                TermData::Const(Constant::Rational(r)) => {
+                    if !evaluation_copies::rational(&r.0) {
+                        return EvalValue::Unknown;
+                    }
+                    EvalValue::Rational(r.0.clone())
+                }
+                TermData::Const(Constant::BitVec { value, width }) => {
+                    if !evaluation_copies::integer(value) {
+                        return EvalValue::Unknown;
+                    }
+                    EvalValue::BitVec {
+                        value: value.clone(),
+                        width: *width,
+                    }
+                }
+                TermData::Const(Constant::String(s)) => {
+                    if !evaluation_copies::string(s) {
+                        return EvalValue::Unknown;
+                    }
+                    EvalValue::String(s.clone())
+                }
+                TermData::Const(Constant::FiniteField { value, field })
+                    if *value < field.modulus() =>
+                {
+                    EvalValue::FiniteField {
+                        value: *value,
+                        field: *field,
+                    }
+                }
 
                 // Variables: look up in appropriate model (eval_var.rs)
                 TermData::Var(_, _) => self.evaluate_var(model, term_id, sort),
@@ -760,17 +1022,20 @@ impl Executor {
                 // Function applications
                 TermData::App(sym, args) => {
                     let name = sym.name();
+                    if matches!(name, "ff.add" | "ff.mul" | "ff.neg" | "ff.bitsum") {
+                        return self.evaluate_field_application(model, term_id, name, args);
+                    }
                     // RoundingMode literal constants (#P0.2 symbolic
                     // RoundingMode): evaluate to the mode's long-name Element
                     // so `(= rm RTZ)` compares against the same spelling the
                     // EUF extraction / FP enumeration pin symbolic RM terms
                     // to (`roundTowardZero` — the value z3 prints).
-                    if args.is_empty() && crate::executor::rm_domain::is_rm_sort(sort) {
-                        if let Some(mode) = ay_fp::RoundingMode::from_name(name) {
-                            return EvalValue::Element(
-                                crate::executor::rm_domain::rm_long_name(mode).to_string(),
-                            );
-                        }
+                    if let Some(mode) =
+                        crate::executor::rm_domain::rm_literal_mode(&self.ctx.terms, term_id)
+                    {
+                        return EvalValue::Element(
+                            crate::executor::rm_domain::rm_long_name(mode).to_string(),
+                        );
                     }
                     match name {
                         "and" => {
@@ -814,6 +1079,13 @@ impl Executor {
                         "=" => {
                             // Equality: both arguments must evaluate to same value
                             if args.len() == 2 {
+                                // Ground RegLan equality has no value carrier;
+                                // decide it by language before value comparison.
+                                if let Some(equal) =
+                                    self.eval_ground_reglan_equality(args[0], args[1])
+                                {
+                                    return EvalValue::Bool(equal);
+                                }
                                 let v1 = self.evaluate_term(model, args[0]);
                                 let v2 = self.evaluate_term(model, args[1]);
                                 let eq_result = match (&v1, &v2) {
@@ -830,6 +1102,10 @@ impl Executor {
                                     // certificates; an undecidable comparison
                                     // fails closed to Unknown.
                                     (EvalValue::Algebraic(a), EvalValue::Algebraic(b)) => {
+                                        if evaluation_copies::active() {
+                                            return evaluation_copies::equal(&v1, &v2)
+                                                .map_or(EvalValue::Unknown, EvalValue::Bool);
+                                        }
                                         match a.eq_value(b) {
                                             Some(eq) => EvalValue::Bool(eq),
                                             None => EvalValue::Unknown,
@@ -837,6 +1113,9 @@ impl Executor {
                                     }
                                     (EvalValue::Algebraic(a), EvalValue::Rational(r))
                                     | (EvalValue::Rational(r), EvalValue::Algebraic(a)) => {
+                                        if evaluation_copies::active() {
+                                            return EvalValue::Unknown;
+                                        }
                                         match a.cmp_rational(r) {
                                             Some(ord) => {
                                                 EvalValue::Bool(ord == std::cmp::Ordering::Equal)
@@ -854,6 +1133,11 @@ impl Executor {
                                             width: w2,
                                         },
                                     ) => {
+                                        if !evaluation_copies::integer(v1)
+                                            || !evaluation_copies::integer(v2)
+                                        {
+                                            return EvalValue::Unknown;
+                                        }
                                         let n1 = Self::normalize_bv_value(v1.clone(), *w1);
                                         let n2 = Self::normalize_bv_value(v2.clone(), *w2);
                                         EvalValue::Bool(n1 == n2 && w1 == w2)
@@ -861,7 +1145,8 @@ impl Executor {
                                     (EvalValue::String(s1), EvalValue::String(s2)) => {
                                         EvalValue::Bool(s1 == s2)
                                     }
-                                    (EvalValue::Seq(_), EvalValue::Seq(_)) => {
+                                    (EvalValue::Seq(_), EvalValue::Seq(_))
+                                    | (EvalValue::Complex { .. }, EvalValue::Complex { .. }) => {
                                         match Self::eval_values_equal_exact(&v1, &v2) {
                                             Some(equal) => EvalValue::Bool(equal),
                                             None => EvalValue::Unknown,
@@ -870,7 +1155,19 @@ impl Executor {
                                     // FP structural equality for SMT-LIB `=`:
                                     // NaN == NaN (reflexive), +0 != -0 (distinct bit patterns).
                                     // This differs from `fp.eq` (IEEE 754) which has NaN != NaN, +0 == -0.
+                                    (
+                                        EvalValue::FiniteField { value: a, field: p },
+                                        EvalValue::FiniteField { value: b, field: q },
+                                    ) => EvalValue::Bool(a == b && p == q),
                                     (EvalValue::Fp(ref a), EvalValue::Fp(ref b)) => {
+                                        if evaluation_copies::active() {
+                                            return recovery_admission::admitted_fp_equal(
+                                                a,
+                                                b,
+                                                evaluation_copies::pay,
+                                            )
+                                            .map_or(EvalValue::Unknown, EvalValue::Bool);
+                                        }
                                         EvalValue::Bool(a.structural_eq(b))
                                     }
                                     // Cross-type: Rational vs BitVec (#5356).
@@ -888,6 +1185,11 @@ impl Executor {
                                         EvalValue::Rational(r),
                                     ) => {
                                         if r.is_integer() {
+                                            if !evaluation_copies::rational(r)
+                                                || !evaluation_copies::integer(bv)
+                                            {
+                                                return EvalValue::Unknown;
+                                            }
                                             let int_val = r.to_integer();
                                             let bv_normalized =
                                                 Self::normalize_bv_value(bv.clone(), *width);
@@ -988,6 +1290,33 @@ impl Executor {
                             }
                         }
                         "distinct" => {
+                            // Ground RegLan distinct has no value carrier;
+                            // decide pairwise by language when every pair
+                            // is decidable, else fall through to Unknown.
+                            if args.len() >= 2
+                                && args.len() <= 8
+                                && matches!(self.ctx.terms.sort(args[0]), Sort::RegLan)
+                            {
+                                let mut decided: Option<bool> = Some(true);
+                                'pairs: for i in 0..args.len() {
+                                    for j in (i + 1)..args.len() {
+                                        match self.eval_ground_reglan_equality(args[i], args[j]) {
+                                            Some(true) => {
+                                                decided = Some(false);
+                                                break 'pairs;
+                                            }
+                                            Some(false) => {}
+                                            None => {
+                                                decided = None;
+                                                break 'pairs;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(distinct) = decided {
+                                    return EvalValue::Bool(distinct);
+                                }
+                            }
                             // All arguments must have different values
                             let values: Vec<EvalValue> =
                                 args.iter().map(|&a| self.evaluate_term(model, a)).collect();
@@ -996,6 +1325,10 @@ impl Executor {
                             if values.iter().any(|v| matches!(v, EvalValue::Unknown)) {
                                 return EvalValue::Unknown;
                             }
+                            if evaluation_copies::active() {
+                                return Self::eval_values_distinct_exact(&values)
+                                    .map_or(EvalValue::Unknown, EvalValue::Bool);
+                            }
 
                             // Algebraic and sequence values need exact,
                             // tri-state pairwise comparison.  A sequence may
@@ -1003,10 +1336,14 @@ impl Executor {
                             // whose refinement cap was reached; formatting it
                             // as a debug string would turn that lack of evidence
                             // into a spurious proof of disequality.
-                            if values
-                                .iter()
-                                .any(|v| matches!(v, EvalValue::Algebraic(_) | EvalValue::Seq(_)))
-                            {
+                            if values.iter().any(|v| {
+                                matches!(
+                                    v,
+                                    EvalValue::Algebraic(_)
+                                        | EvalValue::Seq(_)
+                                        | EvalValue::Complex { .. }
+                                )
+                            }) {
                                 return match Self::eval_values_distinct_exact(&values) {
                                     Some(distinct) => EvalValue::Bool(distinct),
                                     None => EvalValue::Unknown,
@@ -1018,6 +1355,9 @@ impl Executor {
                             for v in &values {
                                 let key = match v {
                                     EvalValue::Bool(b) => format!("bool:{b}"),
+                                    EvalValue::FiniteField { value, field } => {
+                                        format!("ff:{}:{value}", field.modulus())
+                                    }
                                     EvalValue::Element(e) => format!("elem:{e}"),
                                     EvalValue::Rational(r) => format!("rat:{r}"),
                                     EvalValue::BitVec { value, width } => {
@@ -1029,7 +1369,9 @@ impl Executor {
                                     }
                                     EvalValue::String(s) => format!("str:{s}"),
                                     EvalValue::Seq(elems) => format!("seq:{elems:?}"),
-                                    EvalValue::Algebraic(_) | EvalValue::Unknown => unreachable!(),
+                                    EvalValue::Algebraic(_)
+                                    | EvalValue::Unknown
+                                    | EvalValue::Complex { .. } => unreachable!(),
                                 };
                                 if seen.contains(&key) {
                                     return EvalValue::Bool(false);
@@ -1093,6 +1435,12 @@ impl Executor {
                         "select" if args.len() == 2 => {
                             let result = self.evaluate_select(model, args[0], args[1]);
                             if matches!(result, EvalValue::Unknown) {
+                                // This model selected complete snapshot arrays.
+                                // A refused structural read cannot be replaced
+                                // by an independent SAT/BV per-read commitment.
+                                if model.functional_arrays.is_some() {
+                                    return EvalValue::Unknown;
+                                }
                                 // The remaining select sources are ambient
                                 // commitments keyed only by this TermId. They
                                 // are not values for a beta-reduced occurrence
@@ -1125,6 +1473,9 @@ impl Executor {
                                 {
                                     if let Some(ref euf_model) = model.euf_model {
                                         if let Some(elem) = euf_model.term_values.get(&term_id) {
+                                            if !evaluation_copies::string(elem) {
+                                                return EvalValue::Unknown;
+                                            }
                                             return EvalValue::Element(elem.clone());
                                         }
                                     }
@@ -1142,6 +1493,9 @@ impl Executor {
                                 if matches!(sort, Sort::Int) {
                                     if let Some(ref lia_model) = model.lia_model {
                                         if let Some(val) = lia_model.values.get(&term_id) {
+                                            if !evaluation_copies::integer(val) {
+                                                return EvalValue::Unknown;
+                                            }
                                             return EvalValue::Rational(BigRational::from(
                                                 val.clone(),
                                             ));
@@ -1149,6 +1503,9 @@ impl Executor {
                                     }
                                     if let Some(ref lra_model) = model.lra_model {
                                         if let Some(val) = lra_model.values.get(&term_id) {
+                                            if !evaluation_copies::rational(val) {
+                                                return EvalValue::Unknown;
+                                            }
                                             return EvalValue::Rational(val.clone());
                                         }
                                     }
@@ -1156,6 +1513,9 @@ impl Executor {
                                 if matches!(sort, Sort::Real) {
                                     if let Some(ref lra_model) = model.lra_model {
                                         if let Some(val) = lra_model.values.get(&term_id) {
+                                            if !evaluation_copies::rational(val) {
+                                                return EvalValue::Unknown;
+                                            }
                                             return EvalValue::Rational(val.clone());
                                         }
                                     }
@@ -1255,6 +1615,10 @@ impl Executor {
                         | "str.to_code" | "str.from_code" | "str.is_digit" | "str.to_lower"
                         | "str.to_upper" | "str.in_re" | "str.replace_re"
                         | "str.replace_re_all" => self.evaluate_str_app(model, name, args),
+                        "seq.power" => self.evaluate_seq_power(model, args),
+                        "complex.make" | "complex.real" | "complex.imag" => {
+                            self.evaluate_complex_app(model, term_id, name, args)
+                        }
                         // Sequence operations — delegated to eval_seq.rs
                         "seq.unit" | "seq.empty" | "seq.++" | "seq.len" | "seq.nth"
                         | "seq.extract" | "seq.contains" | "seq.prefixof" | "seq.suffixof"

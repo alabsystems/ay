@@ -1,0 +1,23 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: lenient-header-counts
+% The positive companion of
+% `incorrect/version3/cnf_under_declared_variable_index`: what
+% `--lenient-header-counts` exists for must keep working.
+%
+% This file's `p cnf 1 1` header is wrong about both counts -- it declares one
+% variable and one clause where the file has two clauses over variable 5 -- and
+% that is precisely the case the flag is for: a DIMACS file whose padded or
+% stale header disagrees with its contents is still a formula, and a proof
+% against it is still checkable. The formula is `(x5) AND (~x5)`, which really
+% is unsatisfiable, so this proof must verify.
+%
+% It is also the exact spelling that used to read out of bounds while returning
+% the right verdict by accident, which is why it is pinned as an accept rather
+% than left to the reproducer that shows the wrong one: sizing the variable
+% space from the file's contents has to keep this verifying, and has to do so
+% without the debug assertion in `Assignment::get_lit_value_unchecked` firing.
+f 2;
+rup >= 1;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

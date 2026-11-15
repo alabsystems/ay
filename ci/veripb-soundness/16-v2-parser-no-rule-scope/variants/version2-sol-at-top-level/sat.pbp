@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+* POSITIVE CONTROL for defect 15. The same `sol` rule, in the same proof format, at the
+* TOP LEVEL where it belongs. Teaching the version 2.0 parser where rules may appear must
+* not make it forget where they may.
+f 1
+sol x1 x2
+output NONE
+conclusion SAT
+end pseudo-Boolean proof

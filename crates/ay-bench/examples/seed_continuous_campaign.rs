@@ -191,7 +191,7 @@ fn ensure_distinct_paths(args: &Args) -> Result<()> {
         ("--ay-output", &args.ay_output),
     ];
     for (index, (left_name, left_path)) in paths.iter().enumerate() {
-        for (right_name, right_path) in paths.iter().skip(index + 1) {
+        for (right_name, right_path) in paths.iter().skip(index.saturating_add(1)) {
             if left_path == right_path {
                 return Err(ToolError::new(format!(
                     "{left_name} and {right_name} must name different paths"

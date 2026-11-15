@@ -11,8 +11,7 @@ grant. Checkout metadata for anything cloned under `reference/` lives in
 The crates below study these upstream projects at the algorithm or
 interface level. Within the `crates/` tree, no upstream code is copied
 wholesale; the relation is one of reference and (in the Z3 case) wire
-compatibility. Wholesale copies of upstream tools live only under
-`third_party/` (next section).
+compatibility. Vendored components are recorded in the sections below.
 
 - **Z3** (MIT) — consulted for EUF explanation/proof structures, PDR pieces in
   the spirit of Spacer, arithmetic compatibility behavior, and a Z3-compatible
@@ -78,10 +77,59 @@ built and run as external checker binaries.
   kept only for comparison. Upstream LoAT licensing governs it; see the local
   README and the upstream distribution. It is not relicensed by AY and is not
   part of any published Cargo package.
+- **Verus** (MIT, "Copyright (c) 2021 The Verus Contributors") — the SMT-LIB
+  reproducers in the development design notes are
+  queries that Verus generated for its own test suite, or hand reductions of
+  them, and embed Verus's AIR prelude text. They are diagnosis inputs kept for
+  comparison against z3, not part of any published Cargo package. Verus's MIT
+  notice is reproduced beside them in `LICENSE-VERUS.txt`.
 - **TLA+ / TLC** (`tla2tools.jar`) — an optional external tool. Supply it
   through `TLC_BIN` or `TLA2TOOLS_JAR`; it is not vendored here.
 - **DRAT/LRAT proof checkers** — used externally to cross-check emitted proofs
   during testing. They are not part of the published Cargo packages.
+
+## Test Material Copied From Upstream
+
+- **VeriPB** (MIT OR Apache-2.0, at the recipient's option; used here under
+  MIT) — the checker-soundness fixtures in `ci/veripb-soundness/` are AY's own,
+  but a few of their files come from VeriPB's test suite
+  (`tests/instances/`) at the commit pinned in `ci/veripb.pin`. The three
+  positive controls the fixture README names are VeriPB's own tests:
+  `20-output-guarantee-solx-unguarded/variants/redundance-export-valid/`
+  (`decision_output`),
+  `21-sol-then-obji-evades-equienum/variants/equioptimal-with-soli/`
+  (`optimization_output_opposing_lits_objective`), and
+  `15-order-aux-var-not-private/variants/aux-vars-in-scope-valid/valid.pbp`,
+  which is `dominance_with_aux_vars.pbp` with a header comment and one `rup`
+  step added and its `conclusion NONE` changed to `conclusion UNSAT`. Some
+  one- to three-line OPB formulas elsewhere in that directory are also
+  byte-identical to upstream instances. VeriPB's MIT notice, which covers them:
+
+  > MIT License
+  >
+  > Copyright (c) 2022-2025 Andy Oertel
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy
+  > of this software and associated documentation files (the "Software"), to deal
+  > in the Software without restriction, including without limitation the rights
+  > to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  > copies of the Software, and to permit persons to whom the Software is
+  > furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all
+  > copies or substantial portions of the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  > IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  > FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
+
+  The VeriPB checker itself is not vendored: it is built from upstream at the
+  pinned commit, and the reviewed patch applied on top of it is kept in the
+  development tree only.
 
 ## Where The References Live In Source
 
@@ -115,3 +163,12 @@ origin:
 LoAT material is treated strictly as reference. AY source may cite LoAT for
 algorithm behavior or for its papers, but does not claim Apache relicensing of
 any LoAT code.
+
+
+## Integrated VeriPB checker
+
+`vendor/veripb` contains the VeriPB checking libraries by Andy Oertel and
+contributors, plus maintained ALab fixes. It is licensed under MIT OR
+Apache-2.0; both original license texts are retained in that directory.
+The upstream is <https://gitlab.com/MIAOresearch/software/VeriPB>. AY maintains
+this cohort as integrated functionality; it is not a separate ALab product.

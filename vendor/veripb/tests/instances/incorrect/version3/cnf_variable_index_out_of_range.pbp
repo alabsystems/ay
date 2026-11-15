@@ -1,0 +1,18 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% INTEGRATION-TEST: lenient-header-counts
+% Regression test: `Lit` packs `(var_idx << 1) ^ is_negated` into a `usize`, so
+% the DIMACS literal -9223372036854775807 has the packed value `usize::MAX` --
+% which is exactly the `Lit::new_undef()` value that `from_unnormalized_lits`
+% used as its "no previous literal" sentinel. The literal was read as a
+% duplicate of nothing and dropped, so this unit clause was stored as the empty
+% clause, i.e. a contradiction, and `rup >= 1` verified UNSAT for a formula
+% that is satisfiable (x1 true, the second variable false). The CNF parser is
+% the only place a variable index comes from untrusted text, and the range
+% check there is unconditional -- `--lenient-header-counts` must not turn it
+% off, which is why this instance carries that flag and must still be rejected.
+f 2;
+rup >= 1;
+output NONE;
+conclusion UNSAT : 3;
+end pseudo-Boolean proof;

@@ -2,9 +2,46 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use super::retry_allowance::RetryAllowance;
 use super::*;
 
 impl Executor {
+    /// The retries of [`Self::cegar_refine_solve`]: what runs when the first
+    /// pass and its CEGAR rounds, which spent `spent` units of search work
+    /// (`ay_core::resource::thread_work_units`), left `result`.
+    ///
+    /// A retry that solves the same problem again may spend search work in
+    /// proportion to `spent` ([`RetryAllowance`]).
+    ///
+    /// A refutation whose expansion certificate is already built and
+    /// parked waits only for the authored problem obligation the trace-armed
+    /// retry installs: that retry re-enters the lane through its memo and
+    /// installs the parked candidate through the unchanged strict boundary,
+    /// so it goes FIRST, and without a ceiling: its refutation is already
+    /// built. The deep-QE retry still runs after it on an `Unknown`. Same
+    /// two attempts, same gates, only the order differs.
+    pub(super) fn unknown_retries(
+        &mut self,
+        result: SolveResult,
+        authored: &[TermId],
+        spent: u64,
+    ) -> Result<SolveResult> {
+        let allowance = RetryAllowance::after_work_of(spent);
+        if self.qlra_expansion_candidate_parked() {
+            let result = self.quantified_trace_arming_unknown_retry(
+                result,
+                authored,
+                RetryAllowance::UNBOUNDED,
+            )?;
+            return self.deep_qe_unknown_retry(result, authored, allowance);
+        }
+        let result = self.deep_qe_unknown_retry(result, authored, allowance)?;
+        // #quantified-trace-arming runs LAST in the `Unknown` cascade: it is the
+        // most expensive fallback (a full second solve with the recorder on) and
+        // the cheapest ones should get their chance first.
+        self.quantified_trace_arming_unknown_retry(result, authored, allowance)
+    }
+
     /// #qe-prepass: re-solve an `Unknown` quantified query with the deep-QE
     /// pre-pass armed.
     ///
@@ -58,11 +95,14 @@ impl Executor {
     ///
     /// Caller contract: `ctx.assertions` must already be restored to the
     /// authored snapshot, which is also passed as `authored` so the retry can
-    /// restore it again on every exit path.
+    /// restore it again on every exit path. `allowance` bounds the retry only
+    /// when its pre-pass rewrites nothing, i.e. when it solves the first
+    /// pass's problem again (`deep_qe_prepass_will_rewrite`).
     pub(super) fn deep_qe_unknown_retry(
         &mut self,
         result: SolveResult,
         authored: &[TermId],
+        allowance: RetryAllowance,
     ) -> Result<SolveResult> {
         if !matches!(result, SolveResult::Unknown) {
             return Ok(result);
@@ -72,14 +112,30 @@ impl Executor {
         if self.deep_qe_retry_armed {
             return Ok(result);
         }
-        // A caller that asked for a proof ARTIFACT keeps the exact quantified
-        // source: the instantiation lanes must be able to derive their ground
-        // instances from the authored `forall` with `forall_inst`, and a QE
-        // replacement has no such derivation. `cegar_refine_solve` already
-        // returns before reaching here in that mode; stating the condition in
-        // the lane that depends on it keeps the guarantee local, so moving that
-        // early return cannot silently opt proof mode into a rewrite.
-        if self.is_producing_proofs() {
+        // The QSAT route decides this fragment; eliminating its quantifiers
+        // again by DNF-materializing QE is what it replaces.
+        if self.qsat_route_applied() {
+            return Ok(result);
+        }
+        // A caller that DEMANDED a checked proof artifact keeps the exact
+        // quantified source: the instantiation lanes must be able to derive
+        // their ground instances from the authored `forall` with `forall_inst`,
+        // and a QE replacement has no such derivation. `cegar_refine_solve`
+        // already returns before reaching here in that mode; stating the
+        // condition in the lane that depends on it keeps the guarantee local,
+        // so moving that early return cannot silently opt proof mode into a
+        // rewrite.
+        //
+        // `checked_certificate_demanded`, NOT `is_producing_proofs` (the same
+        // narrowing as the CEGAR loop): the latter is also true for the
+        // best-effort sidecar of EVERY default-posture CLI solve, which killed
+        // this lane there (LOIS `incremental0`: 68/112 vs 96/112 under
+        // `--no-proof`). The retry only replaces an `Unknown`, and its verdict
+        // clears the same funnel as under `--no-proof`; a residue refutation
+        // has no authored scope and is withheld (pinned by
+        // `deep_qe_retry_wrong_elimination_never_publishes_unsat`).
+        if self.checked_certificate_demanded() {
+            self.prepass_reachability.deep_qe_demand_stand_downs += 1;
             return Ok(result);
         }
         // Nothing for the pre-pass to eliminate, so nothing to gain: never pay
@@ -126,20 +182,80 @@ impl Executor {
         ) {
             return Ok(result);
         }
+        let allowance = self.deep_qe_retry_allowance(authored, allowance);
         self.prepass_reachability.deep_qe_unknown_retries += 1;
-        self.deep_qe_retry_armed = true;
-        let retry = self.check_sat_internal();
-        self.deep_qe_retry_armed = false;
-        self.ctx.assertions = authored.to_vec();
-        match retry {
+        match self.retry_within(allowance, |exec| exec.deep_qe_retry_solve(authored)) {
             // A definite verdict has passed the same mandatory certification as
             // any other; adopt it together with the artifacts it published.
             Ok(definite @ (SolveResult::Sat | SolveResult::Unsat(_))) => Ok(definite),
-            // The retry failed closed. Its `Unknown` is the published state, so
-            // return it rather than the pre-retry value: both are `Unknown`, and
-            // `Unknown` has already revoked every artifact either solve emitted.
+            // The retry failed closed, or ran out of its allowance and left
+            // the `Unknown` that stood before it (`retry_within`). Either way
+            // the published state is an `Unknown`, which has already revoked
+            // every artifact either solve emitted.
             Ok(unknown) => Ok(unknown),
             Err(err) => Err(err),
+        }
+    }
+
+    /// The allowance of the deep-QE retry: unbounded when its in-solve
+    /// pre-pass will rewrite an assertion, so that it solves a different
+    /// problem than the pass before it, and `re_solve` otherwise.
+    ///
+    /// The probe above cannot tell: it runs on the authored vector, while the
+    /// in-solve pre-pass runs right after `simplify_vacuous_quantifiers`,
+    /// which has already collapsed every quantifier whose body mentions none
+    /// of its binders, in the first pass as well. On the authored vector the
+    /// eliminators "eliminate" exactly those (a library that declares
+    /// `(forall (..) (! true :pattern (..)))` is enough), the probe reports a
+    /// change, and the retry then solves the first pass's problem again.
+    ///
+    /// That second solve is kept: it starts from the terms the first one
+    /// left and sometimes refutes what the first left satisfiable. But it is
+    /// a re-solve, and gets a re-solve's allowance, when this says no.
+    fn deep_qe_retry_allowance(
+        &mut self,
+        authored: &[TermId],
+        re_solve: RetryAllowance,
+    ) -> RetryAllowance {
+        if self.deep_qe_prepass_will_rewrite(authored) {
+            RetryAllowance::UNBOUNDED
+        } else {
+            re_solve
+        }
+    }
+
+    /// Whether the in-solve pre-pass will rewrite an assertion of `authored`
+    /// once `simplify_vacuous_quantifiers` has run on it.
+    fn deep_qe_prepass_will_rewrite(&mut self, authored: &[TermId]) -> bool {
+        let mut seen_by_prepass = self.without_vacuous_quantifiers(authored);
+        crate::executor::qe_prepass::deep_qe(
+            &mut self.ctx.terms,
+            &mut seen_by_prepass,
+            self.solve_interrupt.as_deref(),
+        )
+    }
+
+    /// The deep-QE retry's re-solve, armed for exactly one pass.
+    ///
+    /// Same containment as the trace retry below: a panic inside the re-solve
+    /// must not leave the one-shot latch armed (nothing else clears it, so
+    /// every later query would skip this lane) or the rewritten assertions
+    /// installed. Disarm and restore on both exits, then let the panic continue
+    /// to the caller's containment.
+    fn deep_qe_retry_solve(&mut self, authored: &[TermId]) -> Result<SolveResult> {
+        self.deep_qe_retry_armed = true;
+        let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self.test_panic_in_deep_qe_retry {
+                panic!("test hook: panic inside the deep-QE retry");
+            }
+            self.check_sat_internal()
+        }));
+        self.deep_qe_retry_armed = false;
+        self.ctx.assertions = authored.to_vec();
+        match retry {
+            Ok(retry) => retry,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 
@@ -181,10 +297,13 @@ impl Executor {
     ///
     /// Caller contract matches `deep_qe_unknown_retry`: `ctx.assertions` is the
     /// authored snapshot, also passed as `authored` so every exit restores it.
+    /// The armed pass solves the same problem as the shed one, so `allowance`
+    /// always bounds it.
     pub(super) fn quantified_trace_arming_unknown_retry(
         &mut self,
         result: SolveResult,
         authored: &[TermId],
+        allowance: RetryAllowance,
     ) -> Result<SolveResult> {
         if !matches!(result, SolveResult::Unknown) {
             return Ok(result);
@@ -217,21 +336,52 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(result);
         }
-        self.quantified_trace_retry_armed = true;
-        self.arm_quantified_trace_for_retry();
-        let retry = self.check_sat_internal();
-        self.quantified_trace_retry_armed = false;
-        self.disarm_quantified_trace_after_retry();
-        self.ctx.assertions = authored.to_vec();
-        match retry {
+        let retried = self.retry_within(allowance, |exec| {
+            exec.quantified_trace_retry_solve(authored)
+        });
+        match retried {
             // A definite verdict has passed the same mandatory certification as
             // any other; adopt it together with the artifacts it published.
             Ok(definite @ (SolveResult::Sat | SolveResult::Unsat(_))) => Ok(definite),
-            // The retry failed closed. Its `Unknown` is the published state, so
-            // return it rather than the pre-retry value: both are `Unknown`, and
-            // `Unknown` has already revoked every artifact either solve emitted.
+            // The retry failed closed, or ran out of its allowance and left
+            // the `Unknown` that stood before it (`retry_within`). Either way
+            // the published state is an `Unknown`, which has already revoked
+            // every artifact either solve emitted.
             Ok(unknown) => Ok(unknown),
             Err(err) => Err(err),
         }
     }
+
+    /// The trace-armed retry's re-solve, armed for exactly one pass.
+    ///
+    /// PANIC-SAFE hand-back. The retry borrows session proof configuration
+    /// (recorder enabled, parsed retention, reconstruction budget) that
+    /// `(reset)` carries over as host configuration and that no later
+    /// `begin_public_solve` restores. A panic inside the retry used to
+    /// unwind past the disarm, so the borrowed posture outlived the query
+    /// — and, through `HostConfiguration`, the next `(reset)` too. The
+    /// disarm and the authored-assertion restore run on BOTH exits; the
+    /// panic then continues to the caller's containment unchanged.
+    fn quantified_trace_retry_solve(&mut self, authored: &[TermId]) -> Result<SolveResult> {
+        self.quantified_trace_retry_armed = true;
+        let borrowed = self.arm_quantified_trace_for_retry();
+        let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self.test_panic_in_quantified_trace_retry {
+                panic!("test hook: panic inside the quantified trace retry");
+            }
+            self.check_sat_internal()
+        }));
+        self.quantified_trace_retry_armed = false;
+        self.disarm_quantified_trace_after_retry(borrowed);
+        self.ctx.assertions = authored.to_vec();
+        match retry {
+            Ok(retry) => retry,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "deep_qe_retry_tests.rs"]
+mod deep_qe_retry_tests;

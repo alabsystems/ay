@@ -114,9 +114,12 @@ impl PdrSolver {
     /// returning the variable side paired with the constant.
     ///
     /// Recurses through all operators, so a branch guard survives being buried
-    /// under the `and` that the case-split front end builds.
-    fn collect_constant_equality_atoms(expr: &ChcExpr, out: &mut Vec<(ChcExpr, i128)>) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
+    /// under the `and` that the case-split front end builds. The caller keeps
+    /// only the first occurrence of a guard, so each distinct (shared)
+    /// sub-term is visited once, in the tree walk's order: the tree walk was
+    /// exponential in the nesting of shared sub-terms.
+    pub(super) fn collect_constant_equality_atoms(expr: &ChcExpr, out: &mut Vec<(ChcExpr, i128)>) {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
             ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
                 match (args[0].as_ref(), args[1].as_ref()) {
                     (v @ ChcExpr::Var(_), ChcExpr::Int(k))
@@ -125,13 +128,10 @@ impl PdrSolver {
                     }
                     _ => {}
                 }
+                crate::expr::dag::Step::Skip
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_constant_equality_atoms(a, out);
-                }
-            }
-            _ => {}
+            ChcExpr::Op(..) => crate::expr::dag::Step::Descend,
+            _ => crate::expr::dag::Step::Skip,
         });
     }
 

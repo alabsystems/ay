@@ -21,7 +21,7 @@
 //! - HONEST no-ops: `set_initial_value` / `register_model_eh` do not crash.
 
 use super::super::*;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_uint, CStr, CString};
 
 /// Build a fresh (non-RC) context.
 ///
@@ -188,13 +188,120 @@ fn assert_and_track_unsat_core() {
         // The tracked constraints ARE enforced, so the verdict is correctly UNSAT.
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_FALSE);
         let core = Z3_optimize_get_unsat_core(c, o);
-        // HONEST DIVERGENCE: AY's Optimize cannot extract a participating-only
-        // core (no assumption threading), so rather than an over-approximate core
-        // that could report NON-participating literals (a wrong value), it returns
-        // an EMPTY core. libz3 returns the participating {p1,p2} here. See the
-        // capture_check_diagnostics doc + ay_z3_compat.h.
-        assert_eq!(Z3_ast_vector_size(c, core), 0);
+        // Both literals take part (libz3: {p1, p2}); an empty core would claim
+        // the untracked hard constraints alone are unsatisfiable.
+        assert_eq!(Z3_ast_vector_size(c, core), 2);
+        let mut members = [Z3_ast_vector_get(c, core, 0), Z3_ast_vector_get(c, core, 1)];
+        members.sort_unstable();
+        let mut expected = [p1, p2];
+        expected.sort_unstable();
+        assert_eq!(members, expected);
 
+        Z3_del_context(c);
+    }
+}
+
+/// The tracking literals of the last optimize core, in order.
+unsafe fn core_of(c: Z3_context, o: Z3_optimize) -> Vec<Z3_ast> {
+    // SAFETY: `c`/`o` are live; the vector is read within its context.
+    unsafe {
+        let core = Z3_optimize_get_unsat_core(c, o);
+        (0..Z3_ast_vector_size(c, core))
+            .map(|i| Z3_ast_vector_get(c, core, i))
+            .collect()
+    }
+}
+
+/// The O1 problem in `c`: `(xi > 0, p1)`, `(xi != 1, p2)`, `(xi < 0, p3)`.
+unsafe fn o1_tracked(c: Z3_context) -> [(Z3_ast, Z3_ast); 3] {
+    // SAFETY: `c` is live; every handle is built in it.
+    unsafe {
+        let x = int_var(c, "xi");
+        let int_sort = Z3_mk_int_sort(c);
+        let zero = Z3_mk_int(c, 0, int_sort);
+        let one = Z3_mk_int(c, 1, int_sort);
+        [
+            (Z3_mk_gt(c, x, zero), bool_var(c, "p1")),
+            (Z3_mk_not(c, Z3_mk_eq(c, x, one)), bool_var(c, "p2")),
+            (Z3_mk_lt(c, x, zero), bool_var(c, "p3")),
+        ]
+    }
+}
+
+/// Critic probe O1 (z3py `Optimize.assert_and_track` doctest shape): z3 says
+/// unsat with core `[p1, p3]`. AY used to return an EMPTY core, which claims
+/// the untracked assertions alone (here: none) are unsat. The core must hold
+/// p1 and p3 and be unsat together with the tracked implications.
+#[test]
+fn optimize_core_is_never_empty_when_tracking_literals_conflict() {
+    // SAFETY: single-threaded FFI test; each context's handles stay in it.
+    unsafe {
+        let c = mk_ctx();
+        let o = Z3_mk_optimize(c);
+        let tracked = o1_tracked(c);
+        for (formula, p) in tracked {
+            Z3_optimize_assert_and_track(c, o, formula, p);
+        }
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_FALSE);
+        let core = core_of(c, o);
+        let in_core = tracked.map(|(_, p)| core.contains(&p));
+        assert!(in_core[0] && in_core[2], "{in_core:?}");
+        assert_eq!(core.len(), in_core.iter().filter(|&&hit| hit).count());
+
+        // The core is a real core: with the tracked implications it is unsat
+        // (checked by a plain solver in a second context).
+        let check = mk_ctx();
+        let s = Z3_mk_solver(check);
+        let mirror = o1_tracked(check);
+        for (formula, p) in mirror {
+            Z3_solver_assert(check, s, Z3_mk_implies(check, p, formula));
+        }
+        let assumptions: Vec<Z3_ast> = mirror
+            .iter()
+            .zip(in_core)
+            .filter_map(|(&(_, p), hit)| hit.then_some(p))
+            .collect();
+        let n = assumptions.len() as c_uint;
+        assert_eq!(
+            Z3_solver_check_assumptions(check, s, n, assumptions.as_ptr()),
+            Z3_L_FALSE
+        );
+        Z3_del_context(check);
+        Z3_del_context(c);
+    }
+}
+
+/// z3 assumes each tracking literal at every check, so tracking `x >= 0` with
+/// `p` while asserting `not p` is unsat with core `[p]`. AY asserted only the
+/// formula and answered sat.
+#[test]
+fn optimize_tracking_literal_holds_like_a_z3_assumption() {
+    // SAFETY: single-threaded FFI test.
+    unsafe {
+        let c = mk_ctx();
+        let o = Z3_mk_optimize(c);
+        let x = int_var(c, "x");
+        let zero = Z3_mk_int(c, 0, Z3_mk_int_sort(c));
+        let p = bool_var(c, "p");
+        Z3_optimize_assert(c, o, Z3_mk_not(c, p));
+        Z3_optimize_assert_and_track(c, o, Z3_mk_ge(c, x, zero), p);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_FALSE);
+        assert_eq!(core_of(c, o), vec![p]);
+
+        // In a fresh scope without `not p`, the model makes `p` true (z3: the
+        // assumption holds in the model).
+        let c2 = mk_ctx();
+        let o2 = Z3_mk_optimize(c2);
+        let p2 = bool_var(c2, "p");
+        let y = int_var(c2, "y");
+        let y_ge_0 = Z3_mk_ge(c2, y, Z3_mk_int(c2, 0, Z3_mk_int_sort(c2)));
+        Z3_optimize_assert_and_track(c2, o2, y_ge_0, p2);
+        assert_eq!(Z3_optimize_check(c2, o2, 0, ptr::null()), Z3_L_TRUE);
+        let m = Z3_optimize_get_model(c2, o2);
+        let mut value: Z3_ast = 0;
+        assert!(Z3_model_eval(c2, m, p2, true, &raw mut value));
+        assert_eq!(Z3_get_bool_value(c2, value), Z3_L_TRUE);
+        Z3_del_context(c2);
         Z3_del_context(c);
     }
 }
@@ -254,55 +361,37 @@ fn from_string_minimize() {
 }
 
 #[test]
-fn assumptions_are_rejected() {
+fn assumptions_hold_for_one_check() {
     // SAFETY: single-threaded FFI test.
     unsafe {
         let c = mk_ctx();
         let o = Z3_mk_optimize(c);
         let x = int_var(c, "x");
         let zero = Z3_mk_int(c, 0, Z3_mk_int_sort(c));
+        let five = Z3_mk_int(c, 5, Z3_mk_int_sort(c));
         let ten = Z3_mk_int(c, 10, Z3_mk_int_sort(c));
         let a = Z3_mk_ge(c, x, zero);
         Z3_optimize_assert(c, o, a);
         Z3_optimize_assert(c, o, Z3_mk_lt(c, x, ten));
         let objective = Z3_optimize_maximize(c, o, x);
-
-        // Establish real outcome artefacts before exercising the early reject.
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
-        assert!(!Z3_optimize_get_model(c, o).is_null());
         assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(9));
 
-        let assumptions = [a];
-        // num_assumptions > 0 is honestly rejected and retires the preceding
-        // admitted model/objective rather than exposing them as this query's.
-        assert_eq!(Z3_optimize_check(c, o, 1, assumptions.as_ptr()), Z3_L_UNDEF);
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+        // z3 assumes check-time assumptions for that check only.
+        let below_five = Z3_mk_lt(c, x, five);
+        assert_eq!(Z3_optimize_check(c, o, 1, [below_five].as_ptr()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(4));
+        let negative = Z3_mk_lt(c, x, zero);
+        assert_eq!(Z3_optimize_check(c, o, 1, [negative].as_ptr()), Z3_L_FALSE);
+        let core = Z3_optimize_get_unsat_core(c, o);
+        assert_eq!(Z3_ast_vector_size(c, core), 1);
         assert!(Z3_optimize_get_model(c, o).is_null());
-        assert_eq!(Z3_optimize_get_upper(c, o, objective), 0);
 
-        // The raw count/pointer contract is also covered explicitly. Optimize
-        // rejects every non-empty check-time assumption set, including a null
-        // array, without dereferencing it or resurrecting stale artifacts.
+        // A null array for a positive count is rejected without a dereference.
         assert_eq!(Z3_optimize_check(c, o, 1, ptr::null()), Z3_L_UNDEF);
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
-        assert!(Z3_optimize_get_model(c, o).is_null());
-        assert_eq!(Z3_optimize_get_upper(c, o, objective), 0);
 
-        // This was a rejected query, not a partial mutation, so the handle is
-        // still reusable. A subsequent configuration change retires UNKNOWN
-        // diagnostics and leaves result accessors empty until a fresh check.
-        let params = Z3_mk_params(c);
-        Z3_params_set_uint(c, params, Z3_mk_string_symbol(c, c"timeout".as_ptr()), 0);
-        Z3_optimize_set_params(c, o, params);
-        assert_eq!(Z3_get_error_code(c), Z3_OK);
-        assert_eq!(
-            Z3_ast_vector_size(c, Z3_optimize_get_upper_as_vector(c, o, objective)),
-            0
-        );
-        assert_eq!(Z3_ast_vector_size(c, Z3_optimize_get_unsat_core(c, o)), 0);
-        let reason = CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o)).to_string_lossy();
-        assert!(reason.is_empty(), "{reason}");
-
+        // The assumptions were not kept.
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
         assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(9));
@@ -403,34 +492,103 @@ fn transitive_closure_downgrade_revokes_backend_sat_outcomes() {
 }
 
 #[test]
-fn optimize_has_exclusive_decision_engine_ownership() {
+fn optimize_and_solver_handles_share_one_context() {
     // SAFETY: single-threaded FFI test.
     unsafe {
+        // z3py's default context mixes Solver and Optimize freely (measured:
+        // `Z3_mk_optimize` used to fail once a Solver existed). A Solver check
+        // resets the shared engine; the Optimize handle replays its state.
         let c = mk_ctx();
         let o = Z3_mk_optimize(c);
         assert!(!o.is_null());
+        // A second Optimize handle shares the context too (z3 allows any
+        // number); it replays its own state, so it leaves `o`'s alone.
+        let o2 = Z3_mk_optimize(c);
+        assert!(!o2.is_null());
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        let x = int_var(c, "x");
+        let int_sort = Z3_mk_int_sort(c);
+        let k = |v: i32| Z3_mk_int(c, v, int_sort);
+        Z3_optimize_assert(c, o, Z3_mk_ge(c, x, k(0)));
+        Z3_optimize_push(c, o);
+        Z3_optimize_assert(c, o, Z3_mk_le(c, x, k(10)));
+        let objective = Z3_optimize_maximize(c, o, x);
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
 
-        // A second eager Optimize would silently share the first one's engine.
-        assert!(Z3_mk_optimize(c).is_null());
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
-        // A replaying solver on the same context could wipe that eager state.
-        assert!(Z3_mk_solver(c).is_null());
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        let s = Z3_mk_solver(c);
+        assert!(!s.is_null(), "a Solver may join an Optimize context");
+        Z3_solver_assert(c, s, Z3_mk_eq(c, x, k(-5)));
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+
+        // The Optimize problem is unchanged by the Solver's goal x = -5.
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(10));
+        // The optimum survives a later Solver check on the same context.
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(10));
+        // Scopes replay too: popping the bound leaves x unbounded above.
+        Z3_optimize_pop(c, o);
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_eq!(Z3_ast_vector_size(c, Z3_optimize_get_assertions(c, o)), 1);
+        Z3_optimize_assert(c, o, Z3_mk_le(c, x, k(3)));
+        let objective = Z3_optimize_maximize(c, o, x);
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(3));
+        // And the Solver never sees the Optimize constraints.
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        // Parsed Optimize content is recorded on the handle like asserted
+        // content (`parse_binding`), so it replays beside Solver handles.
+        Z3_optimize_from_string(c, o, c"(assert true)".as_ptr());
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(3));
         // Fixedpoint is intentionally compatible: it solves in its own CHC
         // engine and only reads the context term arena.
         assert!(!Z3_mk_fixedpoint(c).is_null());
         Z3_del_context(c);
 
+        // Solver first, then Optimize.
         let c = mk_ctx();
-        assert!(!Z3_mk_solver(c).is_null());
-        assert!(Z3_mk_optimize(c).is_null());
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        let s = Z3_mk_solver(c);
+        assert!(!s.is_null());
+        let o = Z3_mk_optimize(c);
+        assert!(!o.is_null());
+        let y = int_var(c, "y");
+        let int_sort = Z3_mk_int_sort(c);
+        Z3_solver_assert(c, s, Z3_mk_gt(c, y, Z3_mk_int(c, 100, int_sort)));
+        Z3_optimize_assert(c, o, Z3_mk_le(c, y, Z3_mk_int(c, 7, int_sort)));
+        let objective = Z3_optimize_maximize(c, o, y);
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(7));
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        Z3_del_context(c);
+
+        // Parsed Optimize content is recorded on the handle, so a Solver may
+        // join afterwards and the Optimize replays its parsed problem.
+        let c = mk_ctx();
+        let o = Z3_mk_optimize(c);
+        Z3_optimize_from_string(
+            c,
+            o,
+            c"(declare-const z Int)(maximize z)(assert (< z 4))".as_ptr(),
+        );
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        let s = Z3_mk_solver(c);
+        assert!(!s.is_null());
+        let z = int_var(c, "z");
+        Z3_solver_assert(c, s, Z3_mk_gt(c, z, Z3_mk_int(c, 100, Z3_mk_int_sort(c))));
+        assert_eq!(Z3_solver_check(c, s), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, 0)), Some(3));
         Z3_del_context(c);
     }
 }
 
 #[test]
-fn global_parser_cannot_mutate_an_optimize_owned_engine() {
+fn global_parser_leaves_an_optimize_problem_intact() {
     // SAFETY: single-threaded FFI test.
     unsafe {
         let c = mk_ctx();
@@ -449,15 +607,15 @@ fn global_parser_cannot_mutate_an_optimize_owned_engine() {
             ptr::null(),
             ptr::null(),
         );
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
-        // Successful accessor calls reset the context error, so inspect the
-        // parser error before asking for the returned vector's size.
-        assert_eq!(Z3_ast_vector_size(c, parsed), 0);
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_eq!(Z3_ast_vector_size(c, parsed), 1);
+        // The parsed `false` is returned to the caller, never added to the
+        // Optimize problem.
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         Z3_del_context(c);
 
         // A semantic global parse claims the ordinary solver family even when
-        // no explicit solver handle has been created.
+        // no explicit solver handle has been created; Optimize may still join.
         let c = mk_ctx();
         let script =
             CString::new("(assert true)").expect("SMT-LIB script must not contain an interior NUL");
@@ -472,14 +630,13 @@ fn global_parser_cannot_mutate_an_optimize_owned_engine() {
             ptr::null(),
         );
         assert_eq!(Z3_get_error_code(c), Z3_OK);
-        assert!(Z3_mk_optimize(c).is_null());
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        assert!(!Z3_mk_optimize(c).is_null());
         Z3_del_context(c);
     }
 }
 
 #[test]
-fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
+fn optimize_parse_late_error_rolls_back_and_leaves_the_handle_usable() {
     // SAFETY: single-threaded FFI test.
     unsafe {
         let c = mk_ctx();
@@ -495,10 +652,11 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
 
         let hard_before = Z3_ast_vector_size(c, Z3_optimize_get_assertions(c, o));
         let objectives_before = Z3_ast_vector_size(c, Z3_optimize_get_objectives(c, o));
-        let parsed_softs_before = (*c).solver.num_parsed_soft_constraints();
 
         // The last command is well-formed syntax but semantically invalid, so
-        // all preceding commands have already executed when it fails.
+        // all preceding commands have already executed when it fails. The
+        // bound parse runs inside a scope that is popped, so nothing of the
+        // text remains: z3's parser error, and the handle as it was.
         let script = CString::new(
             "(declare-const y Int)\n\
              (assert (>= y 0))\n\
@@ -508,7 +666,7 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
         )
         .expect("optimization script must not contain an interior NUL");
         Z3_optimize_from_string(c, o, script.as_ptr());
-        assert_eq!(Z3_get_error_code(c), Z3_EXCEPTION);
+        assert_eq!(Z3_get_error_code(c), Z3_PARSER_ERROR);
         assert_eq!(
             Z3_ast_vector_size(c, Z3_optimize_get_assertions(c, o)),
             hard_before
@@ -517,20 +675,8 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
             Z3_ast_vector_size(c, Z3_optimize_get_objectives(c, o)),
             objectives_before
         );
-        assert_eq!(
-            (*c).solver.num_parsed_soft_constraints(),
-            parsed_softs_before
-        );
-        assert!(Z3_optimize_get_model(c, o).is_null());
-        assert_eq!(Z3_optimize_get_upper(c, o, objective), 0);
-
-        // Unscoped options could have executed before the late failure, so the
-        // handle is terminally UNKNOWN rather than risking a partially changed
-        // optimization on a later check.
-        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_UNDEF);
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
-        let reason = CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o)).to_string_lossy();
-        assert!(reason.contains("parse execution failed"), "{reason}");
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(9));
         Z3_del_context(c);
     }
 }
@@ -551,16 +697,16 @@ fn optimize_parse_rejects_context_poison_and_open_user_scope() {
         );
         Z3_del_context(c);
 
-        // A hidden successful parse scope may not be opened above a user
-        // scope. Rejecting it preserves the marker/engine stack alignment.
+        // A bound parse inside a user scope records its formulas at that
+        // scope, as `Z3_optimize_assert` does, and the pop removes them.
         let c = mk_ctx();
         let o = Z3_mk_optimize(c);
         Z3_optimize_assert(c, o, Z3_mk_true(c));
         Z3_optimize_push(c, o);
-        Z3_optimize_assert(c, o, Z3_mk_false(c));
-        Z3_optimize_from_string(c, o, c"(assert true)".as_ptr());
-        assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
+        Z3_optimize_from_string(c, o, c"(assert false)".as_ptr());
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert_eq!((*o).scope_markers.len(), 1);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_FALSE);
         Z3_optimize_pop(c, o);
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
@@ -661,12 +807,12 @@ fn optimize_translate_is_exclusive_and_preserves_soft_groups() {
         let rendered = CStr::from_ptr(Z3_optimize_to_string(target, translated)).to_string_lossy();
         assert!(rendered.contains(":id group_a"), "{rendered}");
         // `:id` is semantically a grouped objective. AY preserves it through
-        // translation, but the current flat MaxSMT result cannot represent
-        // group semantics and therefore honestly refuses to solve it.
+        // translation; one group is one MaxSMT objective, which it solves.
         assert_eq!(
             Z3_optimize_check(target, translated, 0, ptr::null()),
-            Z3_L_UNDEF
+            Z3_L_TRUE
         );
+        assert!(!Z3_optimize_get_model(target, translated).is_null());
 
         // Arithmetic objectives are rejected before claiming or mutating the
         // target, because they are not represented on OptimizeHandle yet.
@@ -743,5 +889,64 @@ fn honest_noops_do_not_crash() {
         // register_model_eh: documented no-op (no callback hook).
         Z3_optimize_register_model_eh(c, o, ptr::null_mut(), ptr::null_mut(), None);
         Z3_del_context(c);
+    }
+}
+
+/// An unbounded objective reports z3's objective-infinity AST from
+/// `get_lower`/`get_upper` (measured libz3 5.1.0): `oo` / `-oo`
+/// rendered `oo` / `(* (- 1) oo)` in libz3, app-kind, Int-sorted, not a
+/// numeral, and equal across both accessors and repeated calls.
+/// It is z3's `oo` constant term (DR-60): term building accepts it
+/// as an ordinary Int constant, as libz3 does.
+#[test]
+fn unbounded_objective_reports_oo_ast() {
+    // SAFETY: test-scope unsafe block; all handles are created here
+    // and freed by `Z3_del_context`.
+    unsafe {
+        // AY's API multiplication normalizes `-1 * t` to its negation
+        // node, so `-oo` renders `(- oo)` where libz3 renders
+        // `(* (- 1) oo)` — the same rendering AY gives any negated
+        // product built through the C API.
+        for (minimize, want) in [(false, "oo"), (true, "(- oo)")] {
+            let c = mk_ctx();
+            let real_sort = Z3_mk_real_sort(c);
+            let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"x".as_ptr()), real_sort);
+            let o = Z3_mk_optimize(c);
+            if minimize {
+                Z3_optimize_minimize(c, o, x);
+            } else {
+                Z3_optimize_maximize(c, o, x);
+            }
+            assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
+            let lo = Z3_optimize_get_lower(c, o, 0);
+            let up = Z3_optimize_get_upper(c, o, 0);
+            assert_ne!(lo, 0);
+            assert_eq!(lo, up, "both bounds are the optimum itself");
+            let text = CStr::from_ptr(Z3_ast_to_string(c, lo))
+                .to_str()
+                .expect("utf8");
+            assert_eq!(text, want);
+            assert_eq!(Z3_get_ast_kind(c, lo), Z3_APP_AST);
+            assert!(!Z3_is_numeral_ast(c, lo));
+            let sort = Z3_get_sort(c, lo);
+            assert!(!sort.is_null());
+            let sort_text = CStr::from_ptr(Z3_sort_to_string(c, sort))
+                .to_str()
+                .expect("utf8");
+            assert_eq!(sort_text, "Int");
+            // Term building accepts `oo` as an ordinary Int constant
+            // (libz3: `Z3_mk_add(oo, 1)` succeeds, rendering
+            // `(+ oo 1)`); it is a free Int to every decision
+            // procedure, so no verdict can rest on it (DR-60).
+            let one = Z3_mk_numeral(c, c"1".as_ptr(), Z3_mk_int_sort(c));
+            let args = [lo, one];
+            let sum = Z3_mk_add(c, 2, args.as_ptr());
+            assert_ne!(sum, 0);
+            let sum_text = CStr::from_ptr(Z3_ast_to_string(c, sum))
+                .to_str()
+                .expect("utf8");
+            assert!(sum_text.contains("oo"), "sum over oo: {sum_text}");
+            Z3_del_context(c);
+        }
     }
 }

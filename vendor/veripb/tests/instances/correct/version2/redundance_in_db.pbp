@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 2.0
+f 3
+red 1 ~x3 1 x4 >= 1 ;
+e 1 ~x3 1 x4 >= 1 ; -1
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

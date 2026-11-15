@@ -55,12 +55,20 @@ fn a_pre_charge_sized_source_stack_no_longer_vetoes_proof_production() {
     );
 }
 
+/// Rows x width of a stack whose single build traversal does not fit the
+/// envelope: 640 rows of ~14.7 KB each, at the traversal's factor of four,
+/// is ~37.6 MiB against 32 MiB. (400 rows used to suffice when the build
+/// pass was priced as a per-subtree rendering.)
+const OVERSIZED_ROWS: usize = 640;
+const OVERSIZED_WIDTH: usize = 700;
+
 /// The same predicate still refuses a stack whose SINGLE pass cannot be
-/// rendered inside the envelope — the ceiling did not move, only the
+/// afforded inside the envelope — the ceiling did not move, only the
 /// pre-charge went away.
 #[test]
 fn a_genuinely_oversized_source_stack_still_installs_the_poison() {
-    let commands = parse(&pre_charge_refused_script(400, 700)).expect("script parses");
+    let commands =
+        parse(&pre_charge_refused_script(OVERSIZED_ROWS, OVERSIZED_WIDTH)).expect("script parses");
     let mut exec = Executor::new();
     exec.execute_all(&commands).expect("script executes");
 
@@ -92,9 +100,10 @@ fn a_genuinely_oversized_source_stack_still_installs_the_poison() {
 /// produced the same anonymous `(step t0 (cl) :rule hole)`.
 #[test]
 fn the_source_decline_names_which_bound_refused() {
-    // 400 rows x 700 leaves: every row is individually renderable (well under
-    // MAX_SURFACE_NODES), the stack as a whole is not affordable.
-    let commands = parse(&pre_charge_refused_script(400, 700)).expect("script parses");
+    // Every row is individually traversable, the stack as a whole is not
+    // affordable.
+    let commands =
+        parse(&pre_charge_refused_script(OVERSIZED_ROWS, OVERSIZED_WIDTH)).expect("script parses");
     let mut exec = Executor::new();
     exec.execute_all(&commands).expect("script executes");
     assert_eq!(
@@ -103,16 +112,64 @@ fn the_source_decline_names_which_bound_refused() {
         "bounded roots that do not fit the envelope are an aggregate-budget refusal",
     );
 
-    // One row of 20,000 leaves: a single root past MAX_SURFACE_NODES, which no
-    // budget can rescue. This is the QF_DT `barrett-jsat/typed` class — the
-    // measured population is one authored assertion of 11,054 to 128,309 nodes.
-    let commands = parse(&pre_charge_refused_script(1, 20_000)).expect("script parses");
+    // One root deeper than MAX_SURFACE_DEPTH, which no budget can rescue:
+    // even the build pass's single traversal refuses it.
+    let commands = parse(&deep_not_chain_script(300)).expect("script parses");
     let mut exec = Executor::new();
     exec.execute_all(&commands).expect("script executes");
     assert_eq!(
         exec.proof_source_decline(),
         Some(ProofDeclineMechanism::AuthoredSourceRootUnbounded),
-        "a root past the per-root surface bound is not an aggregate-budget refusal",
+        "a root past the traversal's per-root bound is not an aggregate-budget refusal",
+    );
+}
+
+/// One authored assertion that is a `not` chain `depth` deep.
+fn deep_not_chain_script(depth: usize) -> String {
+    let mut script = String::from("(set-logic QF_UF)\n(declare-fun deep_leaf () Bool)\n(assert ");
+    for _ in 0..depth {
+        script.push_str("(not ");
+    }
+    script.push_str("deep_leaf");
+    for _ in 0..depth {
+        script.push(')');
+    }
+    script.push_str(")\n");
+    script
+}
+
+/// The build pass is ONE traversal and is priced as one. A root that only a
+/// per-subtree renderer cannot afford — here 20,000 leaves under one `and`,
+/// past `MAX_SURFACE_NODES` — used to be refused the WHOLE proof
+/// (`authored-source-root-unbounded`, the one-line trust poison) before any
+/// reconstruction ran. That is the QF_DT `barrett-jsat/typed` class (one
+/// authored assertion of 11,054 to 128,309 nodes) and external-codegen's large
+/// packed-vector and half-precision obligations (8,511 to 133,990 nodes).
+/// The per-subtree bound still holds, at the sites that render per subtree.
+#[test]
+fn a_root_only_per_subtree_renderers_refuse_is_admitted_to_the_build() {
+    use crate::executor::proof_repair::proof_trust_surgery_surface_audit::{
+        surface_source_is_bounded, surface_source_work_probe_as, SurfaceWorkModel,
+    };
+
+    let commands = parse(&pre_charge_refused_script(1, 20_000)).expect("script parses");
+    let mut exec = Executor::new();
+    exec.execute_all(&commands).expect("script executes");
+    let root = &exec.ctx.assertions_parsed()[0];
+    assert!(
+        !surface_source_is_bounded(root),
+        "fixture must be past the per-subtree rendering bound",
+    );
+    assert!(surface_source_work_probe_as(root, SurfaceWorkModel::Traversal).is_ok());
+    let before = exec.proof_source_work.remaining_for_test();
+    assert_eq!(
+        exec.proof_source_decline(),
+        None,
+        "the build pass's single traversal of a 20,001-node root is affordable",
+    );
+    assert!(
+        exec.proof_source_work.remaining_for_test() < before,
+        "and it is charged for that traversal",
     );
 }
 
@@ -122,16 +179,22 @@ fn the_source_decline_names_which_bound_refused() {
 #[test]
 fn a_refused_pass_debits_nothing_and_the_ceiling_still_binds() {
     use crate::executor::proof_repair::proof_trust_surgery_surface_audit::{
-        surface_pass_work, ProofSourcePass,
+        surface_pass_work, surface_pass_work_as, ProofSourcePass, SurfaceWorkModel,
     };
 
     let commands = parse(&pre_charge_refused_script(25, 700)).expect("script parses");
     let mut exec = Executor::new();
     exec.execute_all(&commands).expect("script executes");
     let single = surface_pass_work(exec.ctx.assertions_parsed()).expect("roots are bounded");
+    let traversal = surface_pass_work_as(exec.ctx.assertions_parsed(), SurfaceWorkModel::Traversal)
+        .expect("roots are traversable");
+    assert!(
+        traversal < single,
+        "one traversal costs less than rendering every subtree"
+    );
 
     // A pass that cannot be afforded leaves the envelope untouched.
-    exec.proof_source_work.set_remaining_for_test(single - 1);
+    exec.proof_source_work.set_remaining_for_test(traversal - 1);
     assert!(
         !exec.proof_source_work.spend(
             ProofSourcePass::UnsatProofBuild,
@@ -141,9 +204,18 @@ fn a_refused_pass_debits_nothing_and_the_ceiling_still_binds() {
     );
     assert_eq!(
         exec.proof_source_work.remaining_for_test(),
-        single - 1,
+        traversal - 1,
         "a refusal must debit nothing",
     );
+    exec.proof_source_work.set_remaining_for_test(traversal);
+    assert!(
+        exec.proof_source_work.spend(
+            ProofSourcePass::UnsatProofBuild,
+            exec.ctx.assertions_parsed()
+        ),
+        "the build pass is admitted at exactly its traversal cost",
+    );
+    assert_eq!(exec.proof_source_work.remaining_for_test(), 0);
 
     // The conjunct-eval rebuild is metered like every other pass: FOUR
     // source-scale traversals (deep clone, raw re-intern, override-aware
@@ -168,4 +240,53 @@ fn a_refused_pass_debits_nothing_and_the_ceiling_still_binds() {
         "and is admitted at exactly its cost",
     );
     assert_eq!(exec.proof_source_work.remaining_for_test(), 0);
+}
+
+/// A balanced `bvadd` tree over `leaves` alternating 8-bit leaves.
+fn balanced_bvadd(leaves: usize) -> String {
+    if leaves == 1 {
+        return "wide_bv_x".to_string();
+    }
+    let left = leaves / 2;
+    format!(
+        "(bvadd {} {})",
+        balanced_bvadd(left),
+        balanced_bvadd(leaves - left).replacen("wide_bv_x", "wide_bv_y", 1)
+    )
+}
+
+/// END TO END: a refuted QF_BV obligation whose single authored assertion is
+/// past the per-subtree rendering bound (16,383 nodes of bit-vector
+/// arithmetic, the shape of external-codegen's packed-vector obligations) now gets its
+/// strict-checkable proof. It used to get the one-line trust poison
+/// (`authored-source-root-unbounded`) before any reconstruction ran.
+#[test]
+fn a_wide_bv_obligation_past_the_per_subtree_bound_gets_a_strict_proof() {
+    use crate::executor::proof_repair::proof_trust_surgery_surface_audit::surface_source_is_bounded;
+
+    let side = balanced_bvadd(8_192);
+    let script = format!(
+        "(set-option :produce-proofs true)\n(set-logic QF_BV)\n\
+         (declare-const wide_bv_x (_ BitVec 8))\n(declare-const wide_bv_y (_ BitVec 8))\n\
+         (assert (not (= {side} {side})))\n(check-sat)\n"
+    );
+    let commands = parse(&script).expect("script parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("script executes");
+    assert_eq!(outputs, vec!["unsat"]);
+    assert!(
+        !surface_source_is_bounded(&exec.ctx.assertions_parsed()[0]),
+        "fixture must be past the per-subtree rendering bound",
+    );
+    assert_ne!(
+        exec.last_proof_decline(),
+        Some(ProofDeclineMechanism::AuthoredSourceRootUnbounded),
+    );
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)
+        .expect("the proof must pass the strict checker");
+    assert_eq!(quality.trust_count, 0);
+    let text = exec.get_proof();
+    assert!(!text.contains(":rule trust"), "no trust step:\n{text}");
+    assert!(!text.contains(":rule hole"), "no hole step:\n{text}");
 }

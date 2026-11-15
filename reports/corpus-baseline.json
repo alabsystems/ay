@@ -1,0 +1,234 @@
+{
+  "head": "f4f3d585eb",
+  "limit": 120.0,
+  "provenance_overrides": {},
+  "results": {
+    "air03": {
+      "harness_wall": 4.25,
+      "limit": 120.0,
+      "nodes": 3,
+      "obj": 340160.0,
+      "status": "OPTIMAL",
+      "wall": 4.188,
+      "work": 27925
+    },
+    "blend2": {
+      "harness_wall": 0.947,
+      "limit": 120.0,
+      "nodes": 3882,
+      "obj": 7.598985,
+      "status": "OPTIMAL",
+      "wall": 0.94,
+      "work": 103867
+    },
+    "dcmulti": {
+      "harness_wall": 0.271,
+      "limit": 120.0,
+      "nodes": 761,
+      "obj": 188182.0,
+      "short": {
+        "harness_wall": 0.272,
+        "limit": 3.0,
+        "nodes": 761,
+        "obj": 188182.0,
+        "status": "OPTIMAL",
+        "wall": 0.265,
+        "work": 26307
+      },
+      "status": "OPTIMAL",
+      "wall": 0.264,
+      "work": 26307
+    },
+    "flugpl": {
+      "harness_wall": 0.023,
+      "limit": 120.0,
+      "nodes": 1592,
+      "obj": 1201500.0,
+      "short": {
+        "harness_wall": 0.024,
+        "limit": 3.0,
+        "nodes": 1592,
+        "obj": 1201500.0,
+        "status": "OPTIMAL",
+        "wall": 0.018,
+        "work": 5016
+      },
+      "status": "OPTIMAL",
+      "wall": 0.018,
+      "work": 5016
+    },
+    "gen": {
+      "harness_wall": 0.467,
+      "limit": 120.0,
+      "nodes": 9,
+      "obj": 112313.362718,
+      "short": {
+        "harness_wall": 0.468,
+        "limit": 3.0,
+        "nodes": 9,
+        "obj": 112313.362718,
+        "status": "OPTIMAL",
+        "wall": 0.459,
+        "work": 26562
+      },
+      "status": "OPTIMAL",
+      "wall": 0.459,
+      "work": 26562
+    },
+    "gt2": {
+      "harness_wall": 0.155,
+      "limit": 120.0,
+      "nodes": 4954,
+      "obj": 21166.0,
+      "short": {
+        "harness_wall": 0.155,
+        "limit": 3.0,
+        "nodes": 4954,
+        "obj": 21166.0,
+        "status": "OPTIMAL",
+        "wall": 0.15,
+        "work": 45889
+      },
+      "status": "OPTIMAL",
+      "wall": 0.15,
+      "work": 45889
+    },
+    "khb05250": {
+      "harness_wall": 0.225,
+      "limit": 120.0,
+      "nodes": 15,
+      "obj": 106940226.0,
+      "short": {
+        "harness_wall": 0.231,
+        "limit": 3.0,
+        "nodes": 15,
+        "obj": 106940226.0,
+        "status": "OPTIMAL",
+        "wall": 0.223,
+        "work": 10003
+      },
+      "status": "OPTIMAL",
+      "wall": 0.217,
+      "work": 10003
+    },
+    "markshare1": {
+      "harness_wall": 0.901,
+      "limit": 120.0,
+      "nodes": 0,
+      "obj": 1.0,
+      "short": {
+        "harness_wall": 0.936,
+        "limit": 3.0,
+        "nodes": 0,
+        "obj": 1.0,
+        "status": "OPTIMAL",
+        "wall": 0.931,
+        "work": 20
+      },
+      "status": "OPTIMAL",
+      "wall": 0.896,
+      "work": 20
+    },
+    "markshare2": {
+      "harness_wall": 2.881,
+      "limit": 120.0,
+      "nodes": 0,
+      "obj": 1.0,
+      "status": "OPTIMAL",
+      "wall": 2.876,
+      "work": 21
+    },
+    "mas76": {
+      "harness_wall": 6.763,
+      "limit": 120.0,
+      "nodes": 273252,
+      "obj": 40005.054142,
+      "status": "OPTIMAL",
+      "wall": 6.755,
+      "work": 2839237
+    },
+    "misc07": {
+      "harness_wall": 5.394,
+      "limit": 120.0,
+      "nodes": 6343,
+      "obj": 2810.0,
+      "status": "OPTIMAL",
+      "wall": 5.385,
+      "work": 376978
+    },
+    "mod010": {
+      "harness_wall": 1.4,
+      "limit": 120.0,
+      "nodes": 2381,
+      "obj": 6548.0,
+      "status": "OPTIMAL",
+      "wall": 1.386,
+      "work": 48811
+    },
+    "p0201": {
+      "harness_wall": 0.295,
+      "limit": 120.0,
+      "nodes": 110,
+      "obj": 7615.0,
+      "short": {
+        "harness_wall": 0.295,
+        "limit": 3.0,
+        "nodes": 110,
+        "obj": 7615.0,
+        "status": "OPTIMAL",
+        "wall": 0.288,
+        "work": 36047
+      },
+      "status": "OPTIMAL",
+      "wall": 0.288,
+      "work": 36047
+    },
+    "pk1": {
+      "harness_wall": 11.698,
+      "limit": 120.0,
+      "nodes": 274435,
+      "obj": 11.0,
+      "status": "OPTIMAL",
+      "wall": 11.693,
+      "work": 3341823
+    },
+    "qiu": {
+      "harness_wall": 29.838,
+      "limit": 120.0,
+      "nodes": 2831,
+      "obj": -132.873136947,
+      "status": "OPTIMAL",
+      "wall": 29.828,
+      "work": 432332
+    },
+    "qnet1": {
+      "harness_wall": 4.606,
+      "limit": 120.0,
+      "nodes": 522,
+      "obj": 16029.692681,
+      "status": "OPTIMAL",
+      "wall": 4.595,
+      "work": 106935
+    },
+    "rout": {
+      "harness_wall": 0.388,
+      "limit": 120.0,
+      "nodes": 0,
+      "obj": 1077.56,
+      "short": {
+        "harness_wall": 0.379,
+        "limit": 3.0,
+        "nodes": 0,
+        "obj": 1077.56,
+        "status": "OPTIMAL",
+        "wall": 0.371,
+        "work": 0
+      },
+      "status": "OPTIMAL",
+      "wall": 0.376,
+      "work": 0
+    }
+  },
+  "short_limit": 3.0,
+  "when": "2026-10-18T02:02:38Z"
+}

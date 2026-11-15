@@ -127,7 +127,10 @@ fn qe_route_grounds_alternating_lia_before_instantiation() {
 /// is unreachable. Measured on `LRA/scholl-smt08/RND/RND_3_13.smt2`: with
 /// `AY_QE_DIAG` instrumentation the default-rigor run emitted ZERO lane traces,
 /// while `--rigor fast` entered the retry, eliminated every binder, and reduced
-/// the whole assertion to the constant `true`.
+/// the whole assertion to the constant `true`. (Since #qlra-deepqe-retry the
+/// deep-QE retry's guard is `checked_certificate_demanded()`, so it is live
+/// under the best-effort sidecar; it still stands down under the explicit
+/// `:produce-proofs` demand this test uses.)
 ///
 /// The posture has to be established EXPLICITLY. An earlier revision of this
 /// test used a bare `Executor::new()` and asserted `!is_producing_proofs()`,

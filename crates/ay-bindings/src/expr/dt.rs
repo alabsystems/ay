@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 use super::{Expr, ExprValue};
 
+mod check;
+mod select;
+
+pub(crate) use check::{authenticate_definitions, same_sorts, Definitions, Unregistered};
+
 impl Expr {
     // ===== Datatype Operations =====
 
@@ -38,8 +43,6 @@ impl Expr {
     /// );
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::requires(result_sort.is_datatype()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_datatype()))]
     pub fn datatype_constructor(
         datatype_name: impl Into<String>,
         constructor_name: impl Into<String>,
@@ -47,7 +50,7 @@ impl Expr {
         result_sort: Sort,
     ) -> Self {
         Self::try_datatype_constructor(datatype_name, constructor_name, args, result_sort)
-            .expect("datatype_constructor requires Datatype sort")
+            .expect("datatype_constructor requires a matching datatype constructor signature")
     }
 
     /// Select a field from a datatype expression.
@@ -70,7 +73,6 @@ impl Expr {
     /// let x = point_expr.field_select("Point", "x", Sort::bv32());
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::requires(self.sort.is_datatype()))]
     pub fn field_select(
         self,
         datatype_name: impl Into<String>,
@@ -78,7 +80,7 @@ impl Expr {
         result_sort: Sort,
     ) -> Self {
         self.try_field_select(datatype_name, selector_name, result_sort)
-            .expect("field_select requires Datatype sort")
+            .expect("field_select requires a matching datatype selector signature")
     }
 
     /// Test if an expression matches a specific constructor.
@@ -101,8 +103,6 @@ impl Expr {
     /// let option_expr = Expr::var("opt", option_sort);
     /// let is_some = option_expr.is_constructor("Option", "Some");
     /// ```
-    #[cfg_attr(kani, kani::requires(self.sort.is_datatype()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn is_constructor(
         self,
@@ -110,12 +110,17 @@ impl Expr {
         constructor_name: impl Into<String>,
     ) -> Self {
         self.try_is_constructor(datatype_name, constructor_name)
-            .expect("is_constructor requires Datatype sort")
+            .expect("is_constructor requires a declared datatype constructor")
     }
 
     // ===== Datatype try_* variants (#5818) =====
 
-    /// Fallible datatype constructor — returns `Err` if `result_sort` is not a Datatype.
+    /// Fallible datatype constructor.
+    ///
+    /// Checks the datatype/constructor names, exact arity, and every argument's
+    /// recorded sort against the declaration. Ambiguous declarations and checks
+    /// exceeding a private finite metadata budget return `SortError`. This is a
+    /// signature check, not validation of arbitrary argument expression bodies.
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_datatype_constructor(
         datatype_name: impl Into<String>,
@@ -123,24 +128,31 @@ impl Expr {
         args: Vec<Self>,
         result_sort: Sort,
     ) -> Result<Self, crate::SortError> {
-        if !result_sort.is_datatype() {
-            return Err(crate::SortError::Mismatch {
-                operation: "datatype_constructor",
-                expected: "Datatype sort",
-                actual: result_sort.to_string(),
-            });
-        }
+        let datatype_name = datatype_name.into();
+        let constructor_name = constructor_name.into();
+        check::Check::new("datatype_constructor").constructor(
+            &result_sort,
+            &datatype_name,
+            &constructor_name,
+            &args,
+        )?;
         Ok(Self {
             sort: result_sort,
             value: Arc::new(ExprValue::DatatypeConstructor {
-                datatype_name: datatype_name.into(),
-                constructor_name: constructor_name.into(),
+                datatype_name,
+                constructor_name,
                 args,
             }),
         })
     }
 
-    /// Fallible field select — returns `Err` if `self` is not a Datatype sort.
+    /// Fallible field select with bounded signature validation before folding.
+    ///
+    /// Struct constructor projections preserve the original field expression.
+    /// Struct ITE projections check both branches before distribution; shared or
+    /// equal scalar leaves can collapse, while separately built equal compound
+    /// terms may remain an equivalent ITE. Enum selectors are not folded: their
+    /// result signature is checked, preserving wrong-variant partial semantics.
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_field_select(
         self,
@@ -148,110 +160,39 @@ impl Expr {
         selector_name: impl Into<String>,
         result_sort: Sort,
     ) -> Result<Self, crate::SortError> {
-        if !self.sort.is_datatype() {
-            return Err(crate::SortError::unary(
-                "field_select",
-                "Datatype sort",
-                &self.sort,
-            ));
-        }
-        let selector_name = selector_name.into();
-        let datatype_name = datatype_name.into();
-        // Both folds below apply ONLY to SINGLE-CONSTRUCTOR datatypes (structs:
-        // `Parser`, `Vec`, `ArrayVec`, slices). For a single-ctor sort the field
-        // name → positional index is unambiguous and the field sort is the same in
-        // every value of the sort, so the rewrites are well-typed. MULTI-ctor enums
-        // (`Result`/`Option`) need a downcast and can give a DIFFERENT field sort
-        // per variant (e.g. `Ok(bv16)` vs `Err(TryFromIntError)`), so distributing
-        // a selector over an `ite(Ok, Err)` would build an ill-sorted `ite` — leave
-        // those to the normal selector/downcast path. (#layerb-selector-fold)
-        let single_ctor = self
-            .sort
-            .datatype_sort()
-            .is_some_and(|dt| dt.constructors.len() == 1);
-        if single_ctor {
-            // (1) Distribute selector through `ite`: `(sel (ite c X Y)) =
-            // (ite c (sel X) (sel Y))`, collapsing when both reads agree. SOUND by
-            // congruence. A SYMBOLIC state-machine post-state is an `ite`-tree of
-            // constructor reconstructions; without this the read sees an `Ite`, not
-            // a constructor, so the keystone fold never fires. Pushing the read to
-            // the leaves lets each leaf's constructor fold extract the field, and
-            // because most transitions leave most fields untouched the per-field
-            // results are equal and collapse to one term (e.g. `osc_data`'s
-            // `fld_len` is `0` in every branch → folds to the literal `0`).
-            if let ExprValue::Ite {
-                cond,
-                then_expr,
-                else_expr,
-            } = self.value.as_ref()
-            {
-                let c = cond.clone();
-                let t = then_expr.clone().try_field_select(
-                    datatype_name.as_str(),
-                    selector_name.as_str(),
-                    result_sort.clone(),
-                )?;
-                let e = else_expr.clone().try_field_select(
-                    datatype_name.as_str(),
-                    selector_name.as_str(),
-                    result_sort,
-                )?;
-                if t == e {
-                    return Ok(t);
-                }
-                return Self::try_ite(c, t, e);
-            }
-            // (2) Constant-fold selector-over-constructor: `(sel_i (mk a_0 .. a_n))
-            // = a_i`. SOUND by the datatype axiom. Propagates known field values —
-            // crucially an empty `Vec::new()`/`ArrayVec::new()` stores a literal `0`
-            // in its `fld_len` slot, so without this fold every `.len()`/
-            // `.as_slice()` read re-symbolises it and a concretely-empty
-            // collection's slice ops are modelled over a symbolic length, diverging.
-            // Fails OPEN on any name/arity mismatch → selector node, never wrong.
-            if let ExprValue::DatatypeConstructor { args, .. } = self.value.as_ref() {
-                if let Some(dt) = self.sort.datatype_sort() {
-                    if let Some(ctor) = dt.constructors.first() {
-                        if let Some(idx) = ctor.fields.iter().position(|f| f.name == selector_name)
-                        {
-                            if let Some(arg) = args.get(idx) {
-                                return Ok(arg.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            sort: result_sort,
-            value: Arc::new(ExprValue::DatatypeSelector {
-                datatype_name: datatype_name.into(),
-                selector_name,
-                expr: self,
-            }),
-        })
+        select::select(
+            self,
+            datatype_name.into(),
+            selector_name.into(),
+            result_sort,
+            &mut check::Check::new("field_select"),
+        )
     }
 
-    /// Fallible constructor tester — returns `Err` if `self` is not a Datatype sort.
+    /// Fallible constructor tester: authenticate the datatype and declared
+    /// constructor, including immediate raw constructor/ITE source signatures.
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_is_constructor(
         self,
         datatype_name: impl Into<String>,
         constructor_name: impl Into<String>,
     ) -> Result<Self, crate::SortError> {
-        if !self.sort.is_datatype() {
-            return Err(crate::SortError::unary(
-                "is_constructor",
-                "Datatype sort",
-                &self.sort,
-            ));
-        }
+        let datatype_name = datatype_name.into();
+        let constructor_name = constructor_name.into();
+        let mut check = check::Check::new("is_constructor");
+        let dt = check.datatype(&self.sort, &datatype_name)?;
+        check.named_constructor(dt, &constructor_name)?;
+        select::authenticate_source(&self, &mut check)?;
         Ok(Self {
             sort: Sort::bool(),
             value: Arc::new(ExprValue::DatatypeTester {
-                datatype_name: datatype_name.into(),
-                constructor_name: constructor_name.into(),
+                datatype_name,
+                constructor_name,
                 expr: self,
             }),
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

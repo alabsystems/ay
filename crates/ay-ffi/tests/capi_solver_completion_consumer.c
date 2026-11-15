@@ -86,8 +86,260 @@ static int vec_any_substr(Z3_context c, Z3_ast_vector v, const char *needle) {
     return 0;
 }
 
-int main(void) {
+static void check_native_proof_applications(void) {
+    Z3_config cfg = Z3_mk_config();
+    Z3_set_param_value(cfg, "proof", "true");
+    Z3_context c = Z3_mk_context_rc(cfg);
+    Z3_del_config(cfg);
+    Z3_set_error_handler(c, NULL);
+    Z3_solver solver = Z3_mk_solver(c);
+    Z3_solver_inc_ref(c, solver);
+    Z3_ast falsity = Z3_mk_false(c);
+    Z3_inc_ref(c, falsity);
+    Z3_solver_assert(c, solver, falsity);
+    CHECK_U(Z3_solver_check(c, solver), Z3_L_FALSE, "proof: genuine unsat");
+    Z3_ast proof = Z3_solver_get_proof(c, solver);
+    CHECK_B(proof != NULL, 1, "proof: available");
+    if (!proof) { Z3_del_context(c); return; }
+    Z3_inc_ref(c, proof);
+    CHECK_U(Z3_get_ast_kind(c, proof), Z3_APP_AST, "proof: application kind");
+    CHECK_B(Z3_is_app(c, proof), 1, "proof: is app");
+    Z3_app app = Z3_to_app(c, proof);
+    CHECK_B((Z3_ast)app == proof, 1, "proof: to-app identity");
+    if (!app) { Z3_del_context(c); return; }
+    CHECK_U(Z3_get_app_num_args(c, app), 1, "proof: asserted arity");
+    CHECK_B(Z3_is_eq_ast(c, Z3_get_app_arg(c, app, 0), falsity), 1, "proof: real false argument");
+    Z3_func_decl rule = Z3_get_app_decl(c, app);
+    CHECK_U(Z3_get_decl_kind(c, rule), Z3_OP_PR_ASSERTED, "proof: actual asserted rule");
+    CHECK_B(strcmp(Z3_get_symbol_string(c, Z3_get_decl_name(c, rule)), "asserted") == 0, 1, "proof: rule name");
+    Z3_sort proof_sort = Z3_get_sort(c, proof);
+    CHECK_U(Z3_get_sort_kind(c, proof_sort), Z3_UNKNOWN_SORT, "proof: native proof sort");
+    CHECK_B(strcmp(Z3_sort_to_string(c, proof_sort), "Proof") == 0, 1, "proof: sort name");
+    CHECK_B(Z3_is_eq_sort(c, proof_sort, Z3_get_range(c, rule)), 1, "proof: rule range");
+    CHECK_U(Z3_get_sort_kind(c, Z3_get_domain(c, rule, 0)), Z3_BOOL_SORT, "proof: asserted domain");
+    CHECK_B(Z3_is_eq_ast(c, proof, Z3_solver_get_proof(c, solver)), 1, "proof: hash-consed retrieval");
+    CHECK_B(strcmp(Z3_ast_to_string(c, proof), "(asserted false)") == 0, 1, "proof: structural rendering");
+    Z3_solver_reset(c, solver);
+    Z3_solver_assert(c, solver, Z3_mk_true(c));
+    CHECK_U(Z3_solver_check(c, solver), Z3_L_TRUE, "proof: later sat");
+    CHECK_U(Z3_get_app_num_args(c, app), 1, "proof: retained after solver reset");
+    const char *eval = Z3_eval_smtlib2_string(c,
+        "(set-option :produce-proofs true)(assert false)(check-sat)(get-proof)(reset)");
+    CHECK_B(eval != NULL && strstr(eval, "unsat") != NULL, 1, "proof: real eval proof stays separate");
+    CHECK_U(Z3_get_app_num_args(c, app), 1, "proof: retained after command reset");
+    Z3_solver_reset(c, solver);
+    Z3_ast atom = bool_var(c, "proof_atom");
+    Z3_inc_ref(c, atom);
+    Z3_ast negated = Z3_mk_not(c, atom);
+    Z3_inc_ref(c, negated);
+    Z3_solver_assert(c, solver, atom);
+    Z3_solver_assert(c, solver, negated);
+    CHECK_U(Z3_solver_check(c, solver), Z3_L_FALSE, "proof: contradictory literals unsat");
+    Z3_ast resolution = Z3_solver_get_proof(c, solver);
+    CHECK_B(resolution != NULL, 1, "proof: contradictory literals proof available");
+    CHECK_U(Z3_get_ast_kind(c, resolution), Z3_APP_AST, "proof: unit resolution application");
+    if (Z3_get_ast_kind(c, resolution) == Z3_APP_AST) {
+        Z3_app root = Z3_to_app(c, resolution);
+        CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, root)), Z3_OP_PR_UNIT_RESOLUTION, "proof: unit resolution rule");
+        CHECK_U(Z3_get_app_num_args(c, root), 3, "proof: two premises and conclusion");
+        CHECK_B(Z3_is_eq_ast(c, Z3_get_app_arg(c, root, 2), falsity), 1, "proof: resolution concludes false");
+        Z3_ast literals[2];
+        for (unsigned i = 0; i < 2; i++) {
+            Z3_app premise = Z3_to_app(c, Z3_get_app_arg(c, root, i));
+            CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, premise)), Z3_OP_PR_ASSERTED, "proof: genuine asserted premise");
+            CHECK_U(Z3_get_app_num_args(c, premise), 1, "proof: asserted premise arity");
+            literals[i] = Z3_get_app_arg(c, premise, 0);
+        }
+        CHECK_B((Z3_is_eq_ast(c, literals[0], atom) && Z3_is_eq_ast(c, literals[1], negated)) ||
+                (Z3_is_eq_ast(c, literals[0], negated) && Z3_is_eq_ast(c, literals[1], atom)),
+                1, "proof: both actual complementary assertions");
+    }
+    Z3_dec_ref(c, negated);
+    Z3_dec_ref(c, atom);
+#ifndef AY_TWIN_USE_Z3
+    Z3_ast parent_integer = int_var(c, "bridge_atom");
+    Z3_inc_ref(c, parent_integer);
+    const char *bridged = Z3_eval_smtlib2_string(c,
+        "(set-option :produce-proofs true)(declare-const bridge_atom Bool)"
+        "(push 1)(assert bridge_atom)(check-sat-assuming ((not bridge_atom)))"
+        "(get-proof)(pop 1)(check-sat)(reset)");
+    CHECK_B(bridged != NULL && strstr(bridged, "(unit-resolution") != NULL,
+            1, "proof: eval proof structurally imported");
+    CHECK_B(bridged != NULL && strstr(bridged, "(asserted bridge_atom)") != NULL &&
+            strstr(bridged, "(asserted (not bridge_atom))") != NULL,
+            1, "proof: imported actual eval premises");
+    CHECK_B(bridged != NULL && strncmp(bridged, "unsat\n", 6) == 0 &&
+            strstr(bridged, "\nsat\n") != NULL, 1, "proof: scoped eval assumptions restored");
+    CHECK_U(Z3_get_sort_kind(c, Z3_get_sort(c, parent_integer)), Z3_INT_SORT,
+            "proof: source reset preserves distinct parent arena");
+    CHECK_U(Z3_get_app_num_args(c, app), 1, "proof: eval import preserves existing proof");
+    Z3_dec_ref(c, parent_integer);
+#endif
+#ifndef AY_TWIN_USE_Z3
+    Z3_ast forged = Z3_mk_app(c, rule, 1, &falsity);
+    CHECK_B(forged == NULL, 1, "proof: cannot forge a derivation");
+    CHECK_U(Z3_get_error_code(c), Z3_INVALID_USAGE, "proof: forgery rejected");
+    CHECK_B(Z3_get_app_arg(c, app, 1) == NULL, 1, "proof: argument bounds");
+    CHECK_U(Z3_get_error_code(c), Z3_IOB, "proof: argument bounds error");
+    Z3_context foreign = Z3_mk_context(NULL);
+    Z3_set_error_handler(foreign, NULL);
+    CHECK_B(Z3_get_app_decl(foreign, (Z3_app)proof) == NULL, 1, "proof: foreign context rejected");
+    CHECK_U(Z3_get_error_code(foreign), Z3_INVALID_ARG, "proof: foreign rejection error");
+    Z3_del_context(foreign);
+#endif
+    Z3_dec_ref(c, proof);
+    Z3_dec_ref(c, falsity);
+    Z3_solver_dec_ref(c, solver);
+    Z3_del_context(c);
+}
+
+#ifndef AY_TWIN_USE_Z3
+struct proof_checker_state {
+    unsigned calls;
+    int tracked;
+    int resolution;
+    int null_report;
+    int unregister;
+    Z3_ast retained;
+    Z3_ast_vector retained_inputs;
+};
+
+static Z3_string client_proof_checker(void *user, Z3_context c, Z3_ast proof, Z3_ast_vector inputs) {
+    struct proof_checker_state *state = user;
+    state->calls++;
+    CHECK_U(Z3_get_ast_kind(c, proof), Z3_APP_AST, "callback: real proof application");
+    Z3_app app = Z3_to_app(c, proof);
+    Z3_func_decl rule = Z3_get_app_decl(c, app);
+    CHECK_U(Z3_get_decl_kind(c, rule), state->tracked ? Z3_OP_PR_MODUS_PONENS :
+            (state->resolution ? Z3_OP_PR_UNIT_RESOLUTION : Z3_OP_PR_ASSERTED),
+            "callback: actual proof rule");
+    CHECK_U(Z3_ast_vector_size(c, inputs), state->tracked || state->resolution ? 2 : 1, "callback: exact active input count");
+    if (state->tracked) {
+        Z3_ast guard = Z3_ast_vector_get(c, inputs, 0);
+        Z3_ast label = Z3_ast_vector_get(c, inputs, 1);
+        CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, guard))), Z3_OP_IMPLIES,
+                "callback: guarded tracked assertion");
+        CHECK_U(Z3_get_app_num_args(c, Z3_to_app(c, guard)), 2, "callback: guard arity");
+        CHECK_B(Z3_is_eq_ast(c, Z3_get_app_arg(c, Z3_to_app(c, guard), 0), label), 1,
+                "callback: exact tracking literal identity");
+        CHECK_U(Z3_get_bool_value(c, Z3_get_app_arg(c, Z3_to_app(c, guard), 1)), Z3_L_FALSE,
+                "callback: original false assertion");
+        const char *label_text = Z3_ast_to_string(c, label);
+        CHECK_B(label_text != NULL && strcmp(label_text, "tracked_false") == 0, 1, "callback: tracking name");
+        CHECK_U(Z3_get_app_num_args(c, app), 3, "callback: real modus ponens arity");
+        for (unsigned i = 0; i < 2; i++) {
+            Z3_app premise = Z3_to_app(c, Z3_get_app_arg(c, app, i));
+            CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, premise)), Z3_OP_PR_ASSERTED,
+                    "callback: tracked asserted premise");
+            CHECK_B(Z3_is_eq_ast(c, Z3_get_app_arg(c, premise, 0), i == 0 ? label : guard), 1,
+                    "callback: premise is exact vector input");
+        }
+        CHECK_U(Z3_get_bool_value(c, Z3_get_app_arg(c, app, 2)), Z3_L_FALSE,
+                "callback: tracked proof concludes false");
+    }
+    if (state->resolution) {
+        CHECK_U(Z3_get_app_num_args(c, app), 3, "callback: actual assumption resolution");
+        Z3_ast first = Z3_get_app_arg(c, Z3_to_app(c, Z3_get_app_arg(c, app, 0)), 0);
+        Z3_ast second = Z3_get_app_arg(c, Z3_to_app(c, Z3_get_app_arg(c, app, 1)), 0);
+        Z3_ast input0 = Z3_ast_vector_get(c, inputs, 0);
+        Z3_ast input1 = Z3_ast_vector_get(c, inputs, 1);
+        CHECK_B((Z3_is_eq_ast(c, first, input0) && Z3_is_eq_ast(c, second, input1)) ||
+                (Z3_is_eq_ast(c, first, input1) && Z3_is_eq_ast(c, second, input0)),
+                1, "callback: assertion and current check assumption bound");
+        CHECK_U(Z3_get_bool_value(c, Z3_get_app_arg(c, app, 2)), Z3_L_FALSE,
+                "callback: assumption proof concludes false");
+    }
+    // Reentrant ordinary AST construction/vector use must not alias a live
+    // Rust context borrow in the evaluator.
+    Z3_ast constructed = Z3_mk_not(c, Z3_mk_false(c));
+    CHECK_U(Z3_get_bool_value(c, constructed), Z3_L_TRUE, "callback: construct AST in same context");
+    if (!state->retained) {
+        state->retained = proof;
+        state->retained_inputs = inputs;
+        Z3_inc_ref(c, proof);
+        Z3_ast_vector_inc_ref(c, inputs);
+    }
+    if (state->unregister) { Z3_set_proof_check_callback(c, NULL, NULL); }
+    return state->null_report ? NULL : "client checked";
+}
+
+static void check_eval_proof_callback(void) {
+    Z3_config cfg = Z3_mk_config();
+    Z3_set_param_value(cfg, "proof", "true");
+    Z3_context c = Z3_mk_context_rc(cfg);
+    Z3_del_config(cfg);
+    Z3_set_error_handler(c, NULL);
+    struct proof_checker_state state = {0};
+    state.tracked = 1;
+    state.unregister = 1;
+    Z3_set_proof_check_callback(c, &state, client_proof_checker);
+    Z3_solver solver = Z3_mk_solver(c);
+    Z3_solver_assert(c, solver, Z3_mk_false(c));
+    CHECK_U(Z3_solver_check(c, solver), Z3_L_FALSE, "callback: ordinary C unsat");
+    CHECK_U(state.calls, 0, "callback: ordinary check does not invoke checker");
+    const char *reply = Z3_eval_smtlib2_string(c,
+        "(set-option :produce-unsat-cores true)(assert (! false :named tracked_false))"
+        "(check-sat)(check-sat)(reset)");
+    CHECK_U(state.calls, 1, "callback: self-unregister takes effect before next check");
+    CHECK_B(reply != NULL && strstr(reply, "unsat\nclient checked\nunsat\n") != NULL,
+            1, "callback: copied report and unchanged verdicts");
+    CHECK_U(Z3_get_error_code(c), Z3_OK, "callback: successful evaluation");
+    CHECK_U(Z3_get_ast_kind(c, state.retained), Z3_APP_AST, "callback: retained proof survives reset");
+    CHECK_U(Z3_ast_vector_size(c, state.retained_inputs), 2, "callback: retained inputs survive reset");
+    state.tracked = 0;
+    state.unregister = 0;
+    Z3_set_proof_check_callback(c, &state, client_proof_checker);
+    reply = Z3_eval_smtlib2_string(c, "(reset)(set-option :produce-proofs true)(assert false)(check-sat-using smt)");
+    CHECK_U(state.calls, 2, "callback: registration survives reset and tactic check");
+    CHECK_B(reply != NULL && strstr(reply, "client checked") != NULL, 1, "callback: report after reset");
+    state.resolution = 1;
+    reply = Z3_eval_smtlib2_string(c,
+        "(reset)(set-option :produce-proofs true)(declare-const callback_atom Bool)"
+        "(assert callback_atom)(check-sat-assuming ((not callback_atom)))");
+    CHECK_U(state.calls, 3, "callback: check-sat-assuming invokes checker");
+    CHECK_B(reply != NULL && strstr(reply, "client checked") != NULL, 1, "callback: assumption report");
+    state.resolution = 0;
+    state.null_report = 1;
+    reply = Z3_eval_smtlib2_string(c, "(reset)(set-option :produce-proofs true)(assert false)(check-sat)");
+    CHECK_B(reply != NULL && strstr(reply, "unsat") != NULL && strstr(reply, "returned null") != NULL,
+            1, "callback: null report is command error, retains verdict");
+    CHECK_U(Z3_get_error_code(c), Z3_PARSER_ERROR, "callback: null report error code");
+    Z3_set_proof_check_callback(c, NULL, NULL);
+    Z3_dec_ref(c, state.retained);
+    Z3_ast_vector_dec_ref(c, state.retained_inputs);
+    Z3_del_context(c);
+
+    c = Z3_mk_context(NULL);
+    Z3_set_error_handler(c, NULL);
+    memset(&state, 0, sizeof(state));
+    Z3_set_proof_check_callback(c, &state, client_proof_checker);
+    reply = Z3_eval_smtlib2_string(c, "(assert false)(set-option :produce-proofs true)(check-sat)");
+    CHECK_U(state.calls, 0, "callback: cannot enable proofs after assertions");
+    CHECK_B(reply != NULL && strstr(reply, "proof production before assertions") != NULL,
+            1, "callback: unavailable proof data is command error");
+    CHECK_U(Z3_get_error_code(c), Z3_PARSER_ERROR, "callback: unavailable proof error code");
+    reply = Z3_eval_smtlib2_string(c,
+        "(reset)(set-option :produce-proofs true)(set-option :produce-unsat-cores true)"
+        "(assert (! (! false :named inner_label) :named outer_label))(check-sat)");
+    CHECK_U(state.calls, 0, "callback: ambiguous named binding never invokes client");
+    CHECK_B(reply != NULL && strstr(reply, "unsat") != NULL &&
+            strstr(reply, "premise binding") != NULL,
+            1, "callback: unsupported binding is explicit command error");
+    CHECK_U(Z3_get_error_code(c), Z3_PARSER_ERROR, "callback: unsupported binding error code");
+    Z3_del_context(c);
+}
+#endif
+
+int main(int argc, char **argv) {
     setbuf(stdout, NULL);
+    check_native_proof_applications();
+#ifndef AY_TWIN_USE_Z3
+    check_eval_proof_callback();
+#endif
+    if (argc == 2 && strcmp(argv[1], "proof-dag") == 0) {
+        printf("native proof application checks: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     Z3_config cfg = Z3_mk_config();
     Z3_context c = Z3_mk_context(cfg);
     Z3_del_config(cfg);

@@ -190,28 +190,60 @@ fn native_datatype_builders_use_reincarnated_member_core_identities() {
     let mut solver = Solver::new(Logic::All);
     let one = solver.int_const(1);
 
+    // A selector or tester over a LITERAL constructor application folds away
+    // (to the stored field / a Boolean constant) exactly as its surface
+    // spelling elaborates, so the member's core identity is only observable on
+    // an OPAQUE scrutinee. Each incarnation therefore gets its own constant.
+    let true_term = solver.bool_const(true);
+
     solver.push();
     solver
         .parse_smtlib2(declaration)
         .expect("declare first scoped datatype");
+    let old_opaque = solver.declare_const("scoped-native-opaque", Sort::Datatype(datatype.clone()));
     let old_ctor = solver.datatype_constructor(&datatype, "ScopedNativeC", &[one]);
-    let old_selector = solver.datatype_selector("scoped-native-field", old_ctor, Sort::Int);
-    let old_tester = solver.datatype_tester("ScopedNativeC", old_ctor);
+    assert_eq!(
+        solver.datatype_selector("scoped-native-field", old_ctor, Sort::Int),
+        one,
+        "selector over its own constructor folds to the stored field"
+    );
+    assert_eq!(
+        solver.datatype_tester("ScopedNativeC", old_ctor),
+        true_term,
+        "tester over its own constructor folds to `true`"
+    );
+    let old_selector = solver.datatype_selector("scoped-native-field", old_opaque, Sort::Int);
+    let old_tester = solver.datatype_tester("ScopedNativeC", old_opaque);
     solver.pop();
 
     solver
         .parse_smtlib2(declaration)
         .expect("declare reincarnated datatype");
+    let new_opaque =
+        solver.declare_const("scoped-native-opaque-2", Sort::Datatype(datatype.clone()));
     let new_ctor = solver.datatype_constructor(&datatype, "ScopedNativeC", &[one]);
-    let new_selector = solver.datatype_selector("scoped-native-field", new_ctor, Sort::Int);
-    let new_tester = solver.datatype_tester("ScopedNativeC", new_ctor);
+    let new_selector = solver.datatype_selector("scoped-native-field", new_opaque, Sort::Int);
+    let new_tester = solver.datatype_tester("ScopedNativeC", new_opaque);
+
+    // The applied symbol is the member's CORE name, so comparing it isolates
+    // member identity from the (necessarily distinct) scrutinee constants.
+    let applied_core = |solver: &Solver, term: Term, what: &str| match solver.terms().get(term.id())
+    {
+        TermData::App(symbol, _) => symbol.to_string(),
+        other => panic!("{what} must stay an application over an opaque scrutinee, got {other:?}"),
+    };
 
     assert_ne!(old_ctor, new_ctor, "constructor core identity was reused");
     assert_ne!(
-        old_selector, new_selector,
+        applied_core(&solver, old_selector, "selector"),
+        applied_core(&solver, new_selector, "selector"),
         "selector core identity was reused"
     );
-    assert_ne!(old_tester, new_tester, "tester core identity was reused");
+    assert_ne!(
+        applied_core(&solver, old_tester, "tester"),
+        applied_core(&solver, new_tester, "tester"),
+        "tester core identity was reused"
+    );
     assert!(matches!(
         solver.try_datatype_selector("scoped-native-field", old_ctor, Sort::Int),
         Err(SolverError::SortMismatch { .. })
@@ -278,4 +310,31 @@ fn retained_datatype_terms_keep_exact_axioms_across_redeclaration() {
     sat_control.assert_term(old_fact);
     sat_control.assert_term(new_fact);
     assert_eq!(sat_control.check_sat(), SolveResult::Sat);
+}
+
+/// `Solver::declare_const`'s `# Panics` section lists reserved names beside
+/// declaration collisions, because the panicking wrapper takes exactly the
+/// refusals `try_declare_const` returns. Pin one name from each reserved class
+/// the doc names: a builtin theory operator, a declaration-activated collection
+/// operator and the internal `__ay_` namespace.
+#[test]
+fn test_declare_const_refuses_each_documented_reserved_class() {
+    for name in ["fp", "int2bv", "set.subset", "__ay_documented"] {
+        let mut solver = Solver::new(Logic::QfLia);
+        let error = solver
+            .try_declare_const(name, Sort::Int)
+            .expect_err("a reserved name must be refused");
+        assert!(
+            error.to_string().contains("reserved"),
+            "try_declare_const({name}) must name the reservation, got: {error}"
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut solver = Solver::new(Logic::QfLia);
+            let _ = solver.declare_const(name, Sort::Int);
+        }));
+        assert!(
+            panicked.is_err(),
+            "declare_const({name}) must panic, as its # Panics section documents"
+        );
+    }
 }

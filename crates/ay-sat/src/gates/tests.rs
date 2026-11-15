@@ -43,6 +43,36 @@ fn test_find_gate_for_congruence_detects_ite_gate() {
     assert_eq!(extractor.stats().ite_gates, 1);
 }
 
+/// The ITE base-pair scan counts its clause visits for
+/// `--sat-deterministic-inproc`, which charges them against gate extraction's
+/// counted budget: here one base clause, one pair and the two negative
+/// occurrences it scans. Taking the count resets it.
+#[test]
+fn test_ite_scan_visits_are_counted_and_taken_once() {
+    let mut clauses = ClauseArena::new();
+    let c0 = clauses.add(&[lit(0, true), lit(1, true), lit(3, false)], false);
+    let c1 = clauses.add(&[lit(0, true), lit(1, false), lit(2, false)], false);
+    let c2 = clauses.add(&[lit(0, false), lit(1, true), lit(3, true)], false);
+    let c3 = clauses.add(&[lit(0, false), lit(1, false), lit(2, true)], false);
+    let mut extractor = GateExtractor::new(4);
+    let mut marks = LitMarks::new(4);
+
+    let gate = extractor.find_gate_for_congruence_with_marks(
+        Variable(0),
+        &clauses,
+        &[c0, c1],
+        &[c2, c3],
+        false,
+        &[],
+        &mut marks,
+    );
+
+    assert_eq!(gate.map(|gate| gate.gate_type), Some(GateType::Ite));
+    let visits = extractor.take_ite_scan_visits();
+    assert!(visits >= 4, "the ITE scan counted {visits} clause visits");
+    assert_eq!(extractor.take_ite_scan_visits(), 0);
+}
+
 #[test]
 fn test_find_gate_for_bve_with_vals_recovers_effective_and_gate() {
     // y ↔ (a ∧ b) with extra literals that are currently falsified.
@@ -319,10 +349,18 @@ fn test_find_extraction_for_bve_with_marks_returns_failed_literal_for_one_sided_
         )
         .expect("semantic extraction should detect a one-sided failed literal");
 
-    assert_eq!(
-        extraction,
-        BveExtraction::FailedLiteral { unit: lit(0, true) }
-    );
+    match extraction {
+        BveExtraction::FailedLiteral { unit, core_lemmas } => {
+            assert_eq!(unit, lit(0, true));
+            // (x1) and (~x1) refute each other: the core's one lemma is the
+            // empty clause, or the unit is RUP on its own.
+            assert!(
+                core_lemmas.iter().all(|lemma| lemma.len() <= 1),
+                "{core_lemmas:?}"
+            );
+        }
+        other => panic!("expected a failed literal, got {other:?}"),
+    }
 }
 
 #[test]

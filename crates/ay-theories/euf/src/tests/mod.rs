@@ -15,8 +15,11 @@ use serial_test::serial;
 
 mod congruence;
 mod disequality;
+mod disequality_batch;
 mod forgone_cost;
 mod infrastructure;
+mod negated_ite_reasons;
+mod reflexive_distinct;
 mod soundness;
 
 fn has_discovered_equality(equalities: &[DiscoveredEquality], a: TermId, b: TermId) -> bool {

@@ -33,7 +33,20 @@ fn test_failed_equality_farkas_promotion_stays_trusted_8866() {
     );
     assert!(farkas.is_none());
 
-    proof.add_rule_step(AletheRule::ThResolution, vec![], vec![lemma_id], vec![]);
+    // The two units the lemma's clause actually needs. A `th_resolution` from
+    // that one two-literal premise ALONE to the empty clause, which this
+    // fixture used to build, is not a resolution at all: pinned carcara refuses
+    // it and so does the printer's printed-text judgement. The subject here is
+    // the terminal-trust report over an unsynthesizable Farkas lemma, and it is
+    // unchanged — every assertion below is the same one.
+    let x_unit = proof.add_assume(x_eq_one, None);
+    let y_unit = proof.add_assume(y_eq_two, None);
+    proof.add_rule_step(
+        AletheRule::ThResolution,
+        vec![],
+        vec![lemma_id, x_unit, y_unit],
+        vec![],
+    );
     let report = ay_proof::terminal_trust_report(&proof);
     assert_eq!(report.trust_theory_lemma_on_path, 1);
     assert!(report.has_terminal_trust());

@@ -19,6 +19,11 @@
 
 use super::*;
 
+/// Maximum `propagate_var_atoms` calls served by the interpreted path
+/// while the JIT tables are stale before a recompile is forced (see
+/// `jit_recompile_due`).
+pub(crate) const JIT_STALE_PROPAGATE_CAP: u32 = 256;
+
 /// FNV-1a mixing step for the atom-index fingerprint.
 #[inline]
 fn fnv_mix(h: &mut u64, v: u64) {
@@ -53,7 +58,7 @@ impl LraSolver {
                 fnv_mix(&mut h, denom as u64);
                 fnv_mix(&mut h, u64::from(atom_ref.is_upper));
                 fnv_mix(&mut h, u64::from(atom_ref.strict));
-                count += 1;
+                count = count.saturating_add(1);
             }
             combined = combined.wrapping_add(h);
         }
@@ -74,6 +79,7 @@ impl LraSolver {
     /// index, the atom-index fingerprint matches and the rebuild is skipped
     /// entirely — no table rebuild, no native re-emission.
     pub(crate) fn compile_theory_propagation_jit(&mut self) {
+        self.jit_stale_propagate_calls = 0;
         let fingerprint = self.atom_index_jit_fingerprint();
         // JIT persistence (Fix A1) is always on: the former
         // `AY_LRA_JIT_PERSIST` kill-switch is removed (on was the default).
@@ -112,6 +118,34 @@ impl LraSolver {
     #[allow(dead_code)]
     pub(crate) fn compile_theory_prop_jit(&mut self) {
         self.compile_theory_propagation_jit();
+    }
+
+    /// Whether the lazy recompile in `propagate_var_atoms` is due.
+    ///
+    /// Every atom registration flips `theory_prop_jit_compiled` to false, and
+    /// a full recompile is O(atoms) table rebuild plus native re-emission —
+    /// quadratic over searches that keep registering atoms (Certora
+    /// QF_UFDTLIA spent ~65% of its time recompiling). Amortize on growth:
+    /// recompile once the live atom count has grown by
+    /// `max(64, compiled/2)` since the last compile, so recompiles are
+    /// O(log N) over growth to N. But bound the interpreted window too:
+    /// while stale, `propagate_var_atoms` serves the BigRational path
+    /// (stale tables must not be read positionally against the live index),
+    /// and on propagation-heavy searches that path is slower than the
+    /// recompile it defers — measured as decided-file losses on QF_LRA
+    /// sc/startup without the cap. So staleness also expires after
+    /// `JIT_STALE_PROPAGATE_CAP` propagation calls, counted in
+    /// `propagate_var_atoms` and reset by every compile.
+    pub(crate) fn jit_recompile_due(&self) -> bool {
+        let compiled = u64::from(self.theory_prop_jit.total_atoms());
+        if compiled == 0 {
+            return true;
+        }
+        if self.jit_stale_propagate_calls >= JIT_STALE_PROPAGATE_CAP {
+            return true;
+        }
+        let current = self.atom_index_atom_count;
+        current < compiled || current >= compiled.saturating_add((compiled / 2).max(64))
     }
 
     /// Convert a `Bound` to a `SmallBound` if the bound value is `Rational::Small`.
@@ -280,7 +314,12 @@ fn rational_to_i64(r: &Rational) -> (bool, i64, i64) {
             );
             match (n_opt, d_opt) {
                 (Some(n), Some(d)) if d > 0 => (true, n, d),
-                (Some(n), Some(d)) if d < 0 => (true, -n, -d),
+                // A sign flip that does not fit in i64 (`i64::MIN`) leaves the
+                // atom to the exact path, like any other non-i64 bound.
+                (Some(n), Some(d)) if d < 0 => match (n.checked_neg(), d.checked_neg()) {
+                    (Some(n), Some(d)) => (true, n, d),
+                    _ => (false, 0, 1),
+                },
                 _ => (false, 0, 1),
             }
         }

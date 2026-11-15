@@ -34,8 +34,7 @@ fn bounded_bv_clause_splitting_config(timeout: Duration) -> PdrConfig {
 ///
 /// The end-to-end capability gap for proving this benchmark Safe is still open
 /// on committed HEAD. Lower-level clause-splitting coverage lives in
-/// `pdr/solver/core.rs`, `proof_interpolation/tests.rs`, and
-/// `blocking/tests/source_regression_tests.rs`; this integration test keeps the
+/// `pdr/solver/core.rs` and `proof_interpolation/tests.rs`; this integration test keeps the
 /// full benchmark fixture in-tree and locks the structural shape those tests
 /// depend on.
 #[test]

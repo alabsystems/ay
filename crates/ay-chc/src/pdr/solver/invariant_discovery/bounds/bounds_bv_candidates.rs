@@ -53,7 +53,13 @@ impl PdrSolver {
             let Some(constraint) = &clause.body.constraint else {
                 continue;
             };
-            self.collect_bv_comparison_atoms(constraint, &var_map, &mut candidates, &mut seen);
+            self.collect_bv_comparison_atoms(
+                constraint,
+                &var_map,
+                &mut candidates,
+                &mut seen,
+                &mut FxHashSet::default(),
+            );
         }
 
         let mut bv_constants = FxHashSet::default();
@@ -146,6 +152,7 @@ impl PdrSolver {
                     &var_map,
                     &mut clause_comparisons,
                     &mut seen,
+                    &mut FxHashSet::default(),
                 );
             }
 
@@ -202,17 +209,23 @@ impl PdrSolver {
         var_map
     }
 
+    /// `walked`: sub-formulas of `expr` already visited; a repeat adds nothing
+    /// `seen` accepts (the tree walk was exponential in shared nesting).
     fn collect_bv_comparison_atoms(
         &self,
         expr: &ChcExpr,
         var_map: &FxHashMap<String, ChcVar>,
         candidates: &mut Vec<ChcExpr>,
         seen: &mut FxHashSet<String>,
+        walked: &mut FxHashSet<*const ChcExpr>,
     ) {
+        if !walked.insert(std::ptr::from_ref(expr)) {
+            return;
+        }
         match expr {
             ChcExpr::Op(ChcOp::And, args) | ChcExpr::Op(ChcOp::Or, args) => {
                 for arg in args {
-                    self.collect_bv_comparison_atoms(arg, var_map, candidates, seen);
+                    self.collect_bv_comparison_atoms(arg, var_map, candidates, seen, walked);
                 }
             }
             ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
@@ -223,7 +236,7 @@ impl PdrSolver {
                         candidates.push(negated);
                     }
                 }
-                self.collect_bv_comparison_atoms(&args[0], var_map, candidates, seen);
+                self.collect_bv_comparison_atoms(&args[0], var_map, candidates, seen, walked);
             }
             ChcExpr::Op(ChcOp::BvSLe | ChcOp::BvSGe | ChcOp::BvULe | ChcOp::BvUGe, _) => {
                 if let Some(candidate) = self.try_extract_bv_comparison(expr, var_map) {

@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% The other direction of `pol_lower_rhs_cardinality_escalation`: naming the
+% stale degree of the first lowering must be rejected. Before the fix the
+% second `-` was a no-op and constraint 3 was byte-identical to constraint 2.
+f 1 ;
+pol 1 9223372036854775807 - ;
+pol 2 9223372036854775807 - ;
+e 1 x1 1 x2 >= -9223372036854775806 : 3 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

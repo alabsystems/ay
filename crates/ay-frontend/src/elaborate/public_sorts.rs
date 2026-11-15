@@ -20,6 +20,8 @@ use crate::sexp::{SExpr, PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 
 use super::{Context, ElaborateError, Result, SymbolInfo};
 
+mod let_chains;
+
 /// A public SMT-LIB sort before implementation lowering.
 ///
 /// `FiniteSet` is deliberately not represented by [`Sort`]: the engine lowers
@@ -242,6 +244,42 @@ impl PublicTermInfo {
     }
 }
 
+/// Memo for one Z3 5 strict retention-shape scan over one parsed tree.
+///
+/// [`Context::validate_strict_finite_set_retention_shape`] asks
+/// [`Context::parsed_term_contains_finite_set_occurrence`] at every `let`,
+/// `match` and binder node, and that scan asks [`Context::public_term_info`]
+/// at every node of its subtree. Without a memo an assertion of `d` nested
+/// `let`s over `n` nodes costs `O(n · d²)` before any solving starts: a
+/// 121 KB QF_UFIDL assertion with 554 nested `let`s and no set anywhere ran
+/// past a 12 s deadline in `--z3-mode` while the default posture decided it
+/// in 0.4 s.
+///
+/// Entries are keyed by parsed-node address, so a memo is valid only for the
+/// lifetime of the one tree borrowed for its scan and must never outlive it
+/// (a later tree can reuse the addresses). Within one tree every node is
+/// evaluated under exactly one binder environment — the shape validator, the
+/// occurrence scan and [`Context::public_term_info_dispatch`] all build it
+/// positionally from the same enclosing `let`/binder nodes — so a memoised
+/// result is the result the recomputation would have returned, and a scan
+/// with the memo fires on exactly the inputs, with exactly the diagnostics,
+/// that the unmemoised scan did. Errors are never memoised.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StrictShapeScan {
+    /// `public_term_info` of every non-leaf node visited so far.
+    term_info: HashMap<usize, PublicTermInfo>,
+    /// `parsed_term_contains_finite_set_occurrence` of every non-leaf node
+    /// scanned so far.
+    occurrence: HashMap<usize, bool>,
+}
+
+/// Memo key for a parsed node, or `None` for a leaf whose recomputation is
+/// cheaper than an entry.
+fn strict_shape_memo_key(term: &ParsedTerm) -> Option<usize> {
+    (!matches!(term, ParsedTerm::Const(_) | ParsedTerm::Symbol(_)))
+        .then(|| std::ptr::from_ref(term).addr())
+}
+
 impl Context {
     /// Per-assertion finite-set provenance, aligned with [`Self::assertions`].
     #[must_use]
@@ -454,7 +492,13 @@ impl Context {
             self.finite_set_typing_mode,
             super::FiniteSetTypingMode::Z3_5Strict
         ) {
-            self.validate_strict_finite_set_retention_shape(term, &HashMap::default())?;
+            // One memo per scanned tree: `term` is borrowed and unchanged for
+            // the whole walk, so node addresses identify nodes (see
+            // `StrictShapeScan`).
+            let outer = self.strict_shape_scan.replace(StrictShapeScan::default());
+            let shape = self.validate_strict_finite_set_retention_shape(term, &HashMap::default());
+            self.strict_shape_scan = outer;
+            shape?;
         }
         let root = if info.metadata.uses_finite_set || has_shared_set_occurrence(term) {
             Some(self.build_public_term_metadata(
@@ -488,18 +532,7 @@ impl Context {
         env: &HashMap<String, PublicSort>,
     ) -> Result<()> {
         stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || match term {
-            ParsedTerm::Let(bindings, body) => {
-                if self.parsed_term_contains_finite_set_occurrence(term, env)? {
-                    return Err(unretained_finite_set_shape("let"));
-                }
-                let mut body_env = env.clone();
-                for (name, value) in bindings {
-                    self.validate_strict_finite_set_retention_shape(value, env)?;
-                    let value_sort = self.public_term_info(value, env)?.sort;
-                    body_env.insert(name.clone(), value_sort);
-                }
-                self.validate_strict_finite_set_retention_shape(body, &body_env)
-            }
+            ParsedTerm::Let(_, _) => self.validate_strict_let_chain_retention_shape(term, env),
             ParsedTerm::Forall(bindings, body)
             | ParsedTerm::Exists(bindings, body)
             | ParsedTerm::Lambda(bindings, body) => {
@@ -572,6 +605,24 @@ impl Context {
         term: &ParsedTerm,
         env: &HashMap<String, PublicSort>,
     ) -> Result<bool> {
+        let memo_key = strict_shape_memo_key(term);
+        if let Some((scan, key)) = self.strict_shape_scan.as_ref().zip(memo_key) {
+            if let Some(&found) = scan.occurrence.get(&key) {
+                return Ok(found);
+            }
+        }
+        let found = self.parsed_term_contains_finite_set_occurrence_uncached(term, env)?;
+        if let Some((scan, key)) = self.strict_shape_scan.as_mut().zip(memo_key) {
+            scan.occurrence.insert(key, found);
+        }
+        Ok(found)
+    }
+
+    fn parsed_term_contains_finite_set_occurrence_uncached(
+        &mut self,
+        term: &ParsedTerm,
+        env: &HashMap<String, PublicSort>,
+    ) -> Result<bool> {
         stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
             let info = self.public_term_info(term, env)?;
             if info.sort.contains_finite_set() || info.metadata.uses_finite_set {
@@ -589,15 +640,7 @@ impl Context {
                     Ok(false)
                 }
                 ParsedTerm::Let(bindings, body) => {
-                    let mut body_env = env.clone();
-                    for (name, value) in bindings {
-                        if self.parsed_term_contains_finite_set_occurrence(value, env)? {
-                            return Ok(true);
-                        }
-                        let value_sort = self.public_term_info(value, env)?.sort;
-                        body_env.insert(name.clone(), value_sort);
-                    }
-                    self.parsed_term_contains_finite_set_occurrence(body, &body_env)
+                    self.let_chain_contains_finite_set_occurrence(bindings, body, env)
                 }
                 ParsedTerm::Forall(bindings, body)
                 | ParsedTerm::Exists(bindings, body)
@@ -649,7 +692,12 @@ impl Context {
             .map(|(name, _)| name)
             .zip(public_arguments)
             .collect();
-        self.parsed_term_contains_finite_set_occurrence(&body, &env)
+        // `body` is a clone whose node addresses die with this call: scan it
+        // under its own memo, never the enclosing tree's.
+        let outer = self.strict_shape_scan.replace(StrictShapeScan::default());
+        let found = self.parsed_term_contains_finite_set_occurrence(&body, &env);
+        self.strict_shape_scan = outer;
+        found
     }
 
     fn build_public_term_metadata(
@@ -801,9 +849,19 @@ impl Context {
         term: &ParsedTerm,
         env: &HashMap<String, PublicSort>,
     ) -> Result<PublicTermInfo> {
-        stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+        let memo_key = strict_shape_memo_key(term);
+        if let Some((scan, key)) = self.strict_shape_scan.as_ref().zip(memo_key) {
+            if let Some(info) = scan.term_info.get(&key) {
+                return Ok(info.clone());
+            }
+        }
+        let info = stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
             self.public_term_info_dispatch(term, env)
-        })
+        })?;
+        if let Some((scan, key)) = self.strict_shape_scan.as_mut().zip(memo_key) {
+            scan.term_info.insert(key, info.clone());
+        }
+        Ok(info)
     }
 
     fn public_term_info_dispatch(
@@ -816,15 +874,20 @@ impl Context {
                 ParsedConstant::True | ParsedConstant::False => PublicSort::Core(Sort::Bool),
                 ParsedConstant::Numeral(_) => PublicSort::Core(Sort::Int),
                 ParsedConstant::Decimal(_) => PublicSort::Core(Sort::Real),
-                ParsedConstant::Hexadecimal(value) => {
-                    PublicSort::Core(Sort::bitvec((value.len() * 4) as u32))
+                ParsedConstant::Hexadecimal(value) => PublicSort::Core(Sort::bitvec(
+                    (value.trim_start_matches("#x").len() * 4) as u32,
+                )),
+                ParsedConstant::Binary(value) => {
+                    PublicSort::Core(Sort::bitvec(value.trim_start_matches("#b").len() as u32))
                 }
-                ParsedConstant::Binary(value) => PublicSort::Core(Sort::bitvec(value.len() as u32)),
                 ParsedConstant::String(_) => PublicSort::Core(Sort::String),
             })),
             ParsedTerm::Symbol(name) => {
                 if let Some(sort) = env.get(name) {
                     return Ok(PublicTermInfo::plain(sort.clone()));
+                }
+                if let Some(sort) = self.pending_label_sort(name) {
+                    return Ok(PublicTermInfo::plain(PublicSort::Core(sort)));
                 }
                 if let Some(info) = self.symbols.get(name) {
                     let mut metadata = FiniteSetTermMetadata::default();
@@ -1061,20 +1124,7 @@ impl Context {
                     metadata,
                 })
             }
-            ParsedTerm::Let(bindings, body) => {
-                let mut values = Vec::with_capacity(bindings.len());
-                let mut metadata = FiniteSetTermMetadata::default();
-                for (name, value) in bindings {
-                    let info = self.public_term_info(value, env)?;
-                    metadata.merge(info.metadata);
-                    values.push((name.clone(), info.sort));
-                }
-                let mut body_env = env.clone();
-                body_env.extend(values);
-                let mut result = self.public_term_info(body, &body_env)?;
-                result.metadata.merge(metadata);
-                Ok(result)
-            }
+            ParsedTerm::Let(bindings, body) => self.public_let_chain_info(bindings, body, env),
             ParsedTerm::Forall(bindings, body) | ParsedTerm::Exists(bindings, body) => {
                 let mut body_env = env.clone();
                 let mut metadata = FiniteSetTermMetadata::default();
@@ -1335,8 +1385,13 @@ impl Context {
                 require_public_int(name, &sorts[2])?;
                 sorts[0].clone()
             }
-            "seq.at" if sorts.len() == 2 => {
+            "seq.at" | "seq.power" if sorts.len() == 2 => {
                 require_sequence_operand(name, &sorts[0])?;
+                require_public_int(name, &sorts[1])?;
+                sorts[0].clone()
+            }
+            "str.power" if sorts.len() == 2 => {
+                require_compatible(name, &PublicSort::Core(Sort::String), &sorts[0])?;
                 require_public_int(name, &sorts[1])?;
                 sorts[0].clone()
             }
@@ -1428,6 +1483,11 @@ impl Context {
             | "is_int" => PublicSort::Core(Sort::Bool),
             "to_real" if sorts.len() == 1 => PublicSort::Core(Sort::Real),
             "to_int" if sorts.len() == 1 => PublicSort::Core(Sort::Int),
+            "ff.add" | "ff.mul" | "ff.neg" | "ff.bitsum" => {
+                sorts.first().cloned().unwrap_or(PublicSort::Unknown)
+            }
+            "complex.make" => PublicSort::Core(Sort::Complex),
+            "complex.real" | "complex.imag" => PublicSort::Core(Sort::Real),
             "+" | "-" | "*" | "min" | "max" if !sorts.is_empty() => joined_numeric_sort(&sorts),
             "~" if sorts.len() == 1 => {
                 if self.int_real_coercions() && matches!(&sorts[0], PublicSort::Core(Sort::Bool)) {
@@ -1435,6 +1495,12 @@ impl Context {
                 } else {
                     joined_numeric_sort(&sorts)
                 }
+            }
+            "/" if sorts
+                .iter()
+                .any(|sort| matches!(sort, PublicSort::Core(Sort::Complex))) =>
+            {
+                PublicSort::Core(Sort::Complex)
             }
             "/" if sorts.len() >= 2 => PublicSort::Core(Sort::Real),
             "div" | "mod" | "rem" if !sorts.is_empty() => PublicSort::Core(Sort::Int),
@@ -1651,6 +1717,11 @@ fn public_engine_subst(subst: &HashMap<String, PublicSort>) -> Result<HashMap<St
 }
 
 fn symbol_literal_sort(name: &str) -> PublicSort {
+    if let Some((_, p)) = name.strip_prefix("#f").and_then(|n| n.split_once('m')) {
+        if let Some(f) = p.parse().ok().and_then(ay_core::FiniteFieldSort::new) {
+            return PublicSort::Core(Sort::FiniteField(f));
+        }
+    }
     if name.starts_with('-') {
         if name.contains('.') {
             return PublicSort::Core(Sort::Real);
@@ -1804,6 +1875,10 @@ fn joined_sort(left: &PublicSort, right: &PublicSort) -> Option<PublicSort> {
         return None;
     }
     match (left, right) {
+        (PublicSort::Core(Sort::Complex), PublicSort::Core(Sort::Int | Sort::Real))
+        | (PublicSort::Core(Sort::Int | Sort::Real), PublicSort::Core(Sort::Complex)) => {
+            Some(PublicSort::Core(Sort::Complex))
+        }
         (PublicSort::Core(Sort::Int), PublicSort::Core(Sort::Real))
         | (PublicSort::Core(Sort::Real), PublicSort::Core(Sort::Int)) => {
             Some(PublicSort::Core(Sort::Real))
@@ -1821,6 +1896,12 @@ fn joined_sort(left: &PublicSort, right: &PublicSort) -> Option<PublicSort> {
 }
 
 fn joined_numeric_sort(sorts: &[PublicSort]) -> PublicSort {
+    if sorts
+        .iter()
+        .any(|sort| matches!(sort, PublicSort::Core(Sort::Complex)))
+    {
+        return PublicSort::Core(Sort::Complex);
+    }
     if sorts
         .iter()
         .any(|sort| matches!(sort, PublicSort::Core(Sort::Real)))

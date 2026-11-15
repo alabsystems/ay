@@ -358,7 +358,7 @@ mod rm_literal_atom_probe {
         executor.bind_unsat_query_assumptions(&[]);
         let outcome = executor
             .checked_isolated_solve(image.clone(), CheckedIsolatedMode::ExactUnsat, 5_000)
-            .map(|(_, kind)| kind);
+            .map(|(_, kind, _, _)| kind);
         assert!(
             matches!(outcome, Some(CheckedGroundKind::Unsat)),
             "the exact-UNSAT probe must refute the branch, got {outcome:?}"
@@ -374,7 +374,7 @@ mod rm_literal_atom_probe {
         executor.bind_unsat_query_assumptions(&[]);
         let outcome = executor
             .checked_isolated_solve(image.clone(), CheckedIsolatedMode::GroundDecision, 5_000)
-            .map(|(_, kind)| kind);
+            .map(|(_, kind, _, _)| kind);
         assert!(
             matches!(outcome, Some(CheckedGroundKind::Unsat)),
             "the ground-decision probe must refute the branch, got {outcome:?}"

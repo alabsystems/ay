@@ -20,6 +20,7 @@ use ay_sat::{Literal, Variable};
 use super::{HintDerivationError, SatProofManager};
 
 mod entrypoints;
+mod failed_literal_probe;
 
 /// One processed clause-trace entry: its raw SAT literals and the proof node
 /// that proves it. Trace clause ids can be reused across entries (proof-writer
@@ -571,7 +572,7 @@ impl SatProofManager<'_> {
     ///   implies_pos: (cl (not (=> a b)) (not a) b)
     ///   implies_neg1: (cl (=> a b) a)             implies_neg2: (cl (=> a b) (not b))
     ///   equiv_pos1: (cl (not (= a b)) a (not b))  equiv_pos2: (cl (not (= a b)) (not a) b)
-    ///   equiv_neg1: (cl (= a b) a b)              equiv_neg2: (cl (= a b) (not a) (not b))
+    ///   equiv_neg1: (cl (= a b) (not a) (not b))  equiv_neg2: (cl (= a b) a b)
     ///   ite_pos1: (cl (not (ite c t e)) c e)      ite_pos2: (cl (not (ite c t e)) (not c) t)
     ///   ite_neg1: (cl (ite c t e) c (not e))      ite_neg2: (cl (ite c t e) (not c) (not t))
     ///   true:  (cl true)                          false: (cl (not false))
@@ -718,7 +719,7 @@ impl SatProofManager<'_> {
                         let na = neg(terms, a);
                         vec![not_source, na, b]
                     }
-                    AletheRule::EquivNeg1 => vec![source, a, b],
+                    AletheRule::EquivNeg2 => vec![source, a, b],
                     _ => {
                         let (na, nb) = (neg(terms, a), neg(terms, b));
                         vec![source, na, nb]
@@ -953,6 +954,7 @@ impl SatProofManager<'_> {
         let steps_snapshot = proof.steps.len();
         let versions_snapshot = clause_versions.len();
         let mut added_keys: Vec<Vec<TermId>> = Vec::new();
+        let mut materialized_keys: Vec<Vec<TermId>> = Vec::new();
 
         let mut atom_to_var: HashMap<TermId, u32> = HashMap::default();
         for (&var, &term) in self.var_to_term.iter() {
@@ -966,6 +968,14 @@ impl SatProofManager<'_> {
         };
         for full in &lemma_clauses {
             let annotation = lemma_proofs.get(full)?;
+            // A `Generic` annotation carries no checker-replayable
+            // authority: materializing it as a leaf could only contaminate
+            // an otherwise certified derivation with a trust step the
+            // strict checker rejects anyway. Skip it — the search simply
+            // runs without that clause and fails closed if it needed it.
+            if annotation.kind == TheoryLemmaKind::Generic {
+                continue;
+            }
             let mut full_sat: Vec<Literal> = Vec::with_capacity(full.len());
             let mut mapped = true;
             for &lit_term in full {
@@ -994,6 +1004,9 @@ impl SatProofManager<'_> {
                 continue;
             }
             let key = Self::normalize_clause(full);
+            if self.materialized_lemma_versions.contains(&key) {
+                continue;
+            }
             let track_key = !existing_clause_map.contains_key(&key);
             let lemma_proof = Self::add_original_clause_step(
                 self.terms,
@@ -1004,8 +1017,10 @@ impl SatProofManager<'_> {
                 Some(annotation),
             );
             if track_key {
-                added_keys.push(key);
+                added_keys.push(key.clone());
             }
+            self.materialized_lemma_versions.insert(key.clone());
+            materialized_keys.push(key);
             clause_versions.push((full_sat, lemma_proof));
         }
 
@@ -1029,6 +1044,9 @@ impl SatProofManager<'_> {
             clause_versions.truncate(versions_snapshot);
             for key in added_keys {
                 existing_clause_map.remove(&key);
+            }
+            for key in materialized_keys {
+                self.materialized_lemma_versions.remove(&key);
             }
             return None;
         };
@@ -1975,8 +1993,32 @@ impl SatProofManager<'_> {
         clause_versions: &[SatClauseVersion],
         proof: &mut Proof,
     ) -> Option<ProofId> {
+        self.derive_target_via_bounded_dpll_theory(clause_versions, &[], proof)
+    }
+
+    /// [`Self::derive_empty_via_bounded_dpll_theory`] for a NON-EMPTY target
+    /// clause (#probe-ite-lift-promoter): the search runs under the
+    /// assumptions `¬target` and the clause it returns is exactly `target`.
+    ///
+    /// Same closer, same fail-closed contract, one difference: the derived
+    /// SAT clause must be `target` as a SET — a strict subclause (the search
+    /// refuted the database without some assumption) is declined rather than
+    /// weakened, so the caller receives exactly the clause it asked for or
+    /// nothing. An empty target is the plain refutation above.
+    pub(super) fn derive_target_via_bounded_dpll_theory(
+        &mut self,
+        clause_versions: &[SatClauseVersion],
+        target_sat: &[Literal],
+        proof: &mut Proof,
+    ) -> Option<ProofId> {
         if clause_versions.is_empty() || clause_versions.len() > MAX_RUP_WIDENING_VERSIONS {
             return None;
+        }
+        // A tautological target is not refutation-derivable.
+        for (index, &lit) in target_sat.iter().enumerate() {
+            if target_sat[index + 1..].contains(&lit.negated()) {
+                return None;
+            }
         }
 
         // Honest closers only: exclude versions proved by a Trust step.
@@ -2045,7 +2087,7 @@ impl SatProofManager<'_> {
 
         let steps_snapshot = proof.steps.len();
         let mut engine = RupEngine::default();
-        let mut assumps: Vec<Literal> = Vec::new();
+        let mut assumps: Vec<Literal> = target_sat.iter().map(|lit| lit.negated()).collect();
         let mut nodes = 0usize;
         let mut theory_checks = 0usize;
         match self.dpll_refute(
@@ -2056,11 +2098,16 @@ impl SatProofManager<'_> {
             &mut nodes,
             &mut theory_checks,
         ) {
-            Some((proof_id, derived_sat)) if derived_sat.is_empty() => {
+            Some((proof_id, derived_sat))
+                if derived_sat.len() == target_sat.len()
+                    && derived_sat.iter().all(|lit| target_sat.contains(lit))
+                    && target_sat.iter().all(|lit| derived_sat.contains(lit)) =>
+            {
                 tracing::debug!(
                     nodes,
                     theory_checks,
-                    "bounded DPLL(T) closed the empty clause with certified theory leaves"
+                    target = target_sat.len(),
+                    "bounded DPLL(T) closed the target clause with certified theory leaves"
                 );
                 Some(proof_id)
             }
@@ -2169,7 +2216,7 @@ impl SatProofManager<'_> {
     /// is a subclause of the target (and the chain is tautology-free at the
     /// SAT level because all intermediate resolvents are falsified under a
     /// consistent assignment).
-    fn derive_clause_via_rup_replay(
+    pub(super) fn derive_clause_via_rup_replay(
         &mut self,
         target_clause: &[TermId],
         target_sat_clause: &[Literal],

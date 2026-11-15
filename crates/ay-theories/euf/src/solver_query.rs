@@ -161,13 +161,52 @@ impl EufSolver<'_> {
 
     /// Track function application value when processing (= func_app constant).
     pub(crate) fn try_track_func_app_value(&mut self, eq_term: TermId) {
-        // `mem::take`/restore lets the shared body read `&self` while writing
-        // the (moved-out, hence local) destination map — negligible cost (a
-        // 3-word Vec/Map header move), and it keeps this logic in ONE place
-        // shared with the in-place `resync_func_app_values_from_assigns` loop.
-        let mut out = std::mem::take(&mut self.func_app_values);
-        self.track_func_app_value_into(eq_term, &mut out);
-        self.func_app_values = out;
+        // Fast paths first (#euf-funcapp-classify-memo): no theory func
+        // apps, or a memoized non-func-app classification, cost one
+        // hash lookup and never touch the value/provider maps. The
+        // moved-out-map shared body remains for the resync loop.
+        if !self.has_theory_func_apps {
+            return;
+        }
+        let classification = match self.func_app_eq_memo.get(&eq_term) {
+            Some(&cached) => cached,
+            None => {
+                let fresh = self.classify_func_app_eq(eq_term);
+                self.func_app_eq_memo.insert(eq_term, fresh);
+                fresh
+            }
+        };
+        if let Some((func_app, partner)) = classification {
+            if !self.func_app_values.contains_key(&func_app) {
+                self.func_app_values.insert(func_app, partner);
+                self.func_app_value_providers.insert(func_app, eq_term);
+            }
+        }
+    }
+
+    /// Pure term-shape classification behind `func_app_eq_memo`: if
+    /// `eq_term` is `(= func_app const/var)` in either orientation,
+    /// return `(func_app, partner)`.
+    fn classify_func_app_eq(&self, eq_term: TermId) -> Option<(TermId, TermId)> {
+        let (lhs, rhs) = self.decode_eq(eq_term)?;
+        // The partner may be a CONSTANT or a VARIABLE (#uf-app-value-seq):
+        // the map records "this app equals this term in the model", and the
+        // evaluator resolves the partner itself — a variable partner is
+        // exactly the verification-consumer `(= (buckets old_self) (logic_field_buckets
+        // old_self))` shape. Sound: the equality is ASSERTED TRUE, so any
+        // model must interpret the two sides identically; recording it only
+        // ADDS a resolution the evaluator otherwise lacks (Unknown). A
+        // partner that cycles back through the same app is broken by the
+        // evaluator's re-entrancy guard (fail-closed Unknown).
+        let partner_ok =
+            |t: TermId| self.is_constant(t) || matches!(self.terms.get(t), TermData::Var(..));
+        if self.is_theory_func_app(lhs) && partner_ok(rhs) {
+            Some((lhs, rhs))
+        } else if self.is_theory_func_app(rhs) && partner_ok(lhs) {
+            Some((rhs, lhs))
+        } else {
+            None
+        }
     }
 
     /// Shared body of func-app-value tracking: if `eq_term` is an asserted-true
@@ -179,6 +218,8 @@ impl EufSolver<'_> {
         &self,
         eq_term: TermId,
         out: &mut HashMap<TermId, TermId>,
+        providers: &mut HashMap<TermId, TermId>,
+        memo: &mut HashMap<TermId, Option<(TermId, TermId)>>,
     ) {
         // Fast out for pure QF_UF (and any instance with no Int/Real/BV func
         // apps): `func_app_values` can never be populated, so the per-assignment
@@ -188,31 +229,19 @@ impl EufSolver<'_> {
         if !self.has_theory_func_apps {
             return;
         }
-        if let Some((lhs, rhs)) = self.decode_eq(eq_term) {
-            // Check both directions: (= func_app value) and (= value func_app).
-            // The partner may be a CONSTANT or a VARIABLE (#uf-app-value-seq):
-            // the map records "this app equals this term in the model", and the
-            // evaluator resolves the partner itself — a variable partner is
-            // exactly the verification-consumer `(= (buckets old_self) (logic_field_buckets
-            // old_self))` shape. Sound: the equality is ASSERTED TRUE, so any
-            // model must interpret the two sides identically; recording it only
-            // ADDS a resolution the evaluator otherwise lacks (Unknown). A
-            // partner that cycles back through the same app is broken by the
-            // evaluator's re-entrancy guard (fail-closed Unknown).
-            let partner_ok = |this: &Self, t: TermId| {
-                this.is_constant(t) || matches!(this.terms.get(t), TermData::Var(..))
-            };
-            let (func_app, constant) = if self.is_theory_func_app(lhs) && partner_ok(self, rhs) {
-                (lhs, rhs)
-            } else if self.is_theory_func_app(rhs) && partner_ok(self, lhs) {
-                (rhs, lhs)
-            } else {
-                return;
-            };
-
+        let classification = match memo.get(&eq_term) {
+            Some(&cached) => cached,
+            None => {
+                let fresh = self.classify_func_app_eq(eq_term);
+                memo.insert(eq_term, fresh);
+                fresh
+            }
+        };
+        if let Some((func_app, constant)) = classification {
             // Only record if we don't already have a value for this func_app
             if !out.contains_key(&func_app) {
                 out.insert(func_app, constant);
+                providers.insert(func_app, eq_term);
             }
         }
     }
@@ -225,6 +254,7 @@ impl EufSolver<'_> {
         // populated, so the whole scan is dead work — clear and return.
         if !self.has_theory_func_apps {
             self.func_app_values.clear();
+            self.func_app_value_providers.clear();
             return;
         }
         // Iterate the assignments IN PLACE instead of materializing every
@@ -241,12 +271,40 @@ impl EufSolver<'_> {
         // iteration order) — byte-identical to the previous rebuild.
         let mut out = std::mem::take(&mut self.func_app_values);
         out.clear();
+        let mut providers = std::mem::take(&mut self.func_app_value_providers);
+        providers.clear();
+        // The memo is NOT cleared: classifications are pure term shape.
+        let mut memo = std::mem::take(&mut self.func_app_eq_memo);
         for (&term, &value) in &self.assigns {
             if value {
-                self.track_func_app_value_into(term, &mut out);
+                self.track_func_app_value_into(term, &mut out, &mut providers, &mut memo);
             }
         }
         self.func_app_values = out;
+        self.func_app_value_providers = providers;
+        self.func_app_eq_memo = memo;
+    }
+
+    /// Cheap pop() maintenance for tracked func-app values
+    /// (#euf-funcapp-provider): entries whose provider equality is
+    /// still asserted-true are exactly what the full rescan would
+    /// rebuild (first-wins per app, providers recorded on insert),
+    /// so they survive untouched. Only when a provider was popped
+    /// can another asserted equality become the app's first provider
+    /// — then fall back to the full rescan. Cost per pop drops from
+    /// O(|assigns|) to O(|tracked apps|).
+    pub(crate) fn prune_func_app_values_after_pop(&mut self) {
+        if !self.has_theory_func_apps || self.func_app_value_providers.is_empty() {
+            self.resync_func_app_values_from_assigns();
+            return;
+        }
+        let dropped = self
+            .func_app_value_providers
+            .iter()
+            .any(|(_, eq)| self.assigns.get(eq) != Some(&true));
+        if dropped {
+            self.resync_func_app_values_from_assigns();
+        }
     }
 
     /// Helper to create a canonical edge key (smaller id first)

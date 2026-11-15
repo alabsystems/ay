@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Provision the ACTUAL SAT-COMP 2026 Main-track instance set.
 
-Why this exists separately from `fetch_satcomp_main.py`
--------------------------------------------------------
+Why this exists separately from `ay corpus download satcomp-2026-main`
+----------------------------------------------------------------------
 The in-repo manifests `benchmarks/sat/satcomp2026-main/SC2026.pinned.csv` and
 `selected_benchmarks.csv` are NOT the competition set. Measured 2026-07-28
 against the official per-instance results:

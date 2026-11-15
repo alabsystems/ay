@@ -508,6 +508,7 @@ pub(crate) fn compute_interpolant_from_smt_farkas_history(
     shared_vars: &FxHashSet<String>,
     verbose: bool,
 ) -> Option<ChcExpr> {
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
     compute_interpolant_candidate_from_smt_farkas_history(
         smt,
         a_constraints,

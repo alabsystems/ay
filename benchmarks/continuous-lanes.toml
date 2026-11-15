@@ -1,45 +1,8 @@
-# Executable lanes for the continuous benchmark service.
-#
-# Official competition/track coverage lives in continuous-2025-2026.toml.
-# This file contains only locally executable ay-bench adapters.  The service
-# runs all `canary` lanes each cycle, then one `rolling` lane, preserving the
-# resource envelope and scorecard emitted by the native Rust runner.
+# Executable benchmark lanes consumed by native `ay bench campaign`.
+# Official competition coverage lives in continuous-2025-2026.toml.
+# Resource envelopes and scorecards are owned by the Rust benchmark runner.
 
 schema_version = 1
-interval_hours = 4
-
-[retention]
-# Keep about four months of six-times-daily raw development evidence. Runs
-# requested with --official are never pruned by this policy.
-max_runs = 720
-
-[git]
-remote = "origin"
-base_branch = "main"
-# Operational progress is published outside refs/heads. No branch is exempt:
-# every remote head is classified and integrated or rejected on every cycle.
-exclude = []
-
-[build]
-timeout_sec = 3600
-commands = [
-  ["{cargo}", "fmt", "--check", "--all"],
-  ["python3", "-m", "unittest", "scripts.tests.test_continuous_benchmark", "scripts.tests.test_sat_soundness_gate_resources"],
-  ["python3", "scripts/continuous_benchmark.py", "--repo", ".", "audit"],
-  ["systemd-analyze", "verify", "deploy/systemd/ay-continuous-benchmark.service", "deploy/systemd/ay-continuous-benchmark.timer"],
-  ["{cargo}", "check", "--workspace", "--all-targets"],
-  ["{cargo}", "test", "-p", "ay-bench"],
-  ["{cargo}", "test", "-p", "ay-sat"],
-  ["{cargo}", "test", "-p", "ay-dpll"],
-  ["{cargo}", "test", "-p", "ay-chc"],
-  ["{cargo}", "test", "-p", "ay-milp"],
-  ["{cargo}", "test", "-p", "ay", "--bin", "ay", "cmd_corpus", "--features", "bench"],
-  ["{cargo}", "build", "--release", "-p", "ay", "--features", "bench"],
-  ["{ay}", "bench", "compare", "campaign-check"],
-  ["{ay}", "corpus", "campaign-audit"],
-  ["bash", "scripts/ci/sat_soundness_gate.sh", "{ay}", "drat", "10"],
-  ["bash", "scripts/ci/smt_soundness_gate.sh", "{target}/release/libay_ffi.so", "{target}/release/ay-z3-parity", "5"],
-]
 
 [[lane]]
 id = "sat-par2-canary"

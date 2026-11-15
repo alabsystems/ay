@@ -21,6 +21,7 @@
 //! overflowing instances return honest `Unknown`; the API never labels the
 //! executor's count/greedy fallback as an optimum.
 
+use ay_core::time::Instant;
 use ay_frontend::SoftAssertion;
 
 use crate::api::types::maxsmt::{MaxSmtResult, SoftConstraint};
@@ -74,12 +75,34 @@ impl Solver {
         self.expect_bool("assert_soft", term)?;
         self.executor.note_api_optimization_mutation();
         let idx = self.soft_constraints.len();
+        let group = group.map(String::from);
+        // First appearance of a group label joins the unified declaration
+        // order (matching parsed `(assert-soft ... :id ...)` sequencing).
+        if !self
+            .optimization_sequence
+            .iter()
+            .any(|step| matches!(step, ay_frontend::ObjectiveStep::SoftGroup(id) if *id == group))
+        {
+            self.optimization_sequence
+                .push(ay_frontend::ObjectiveStep::SoftGroup(group.clone()));
+        }
         self.soft_constraints.push(SoftConstraint {
             term,
             weight,
-            group: group.map(String::from),
+            group,
         });
         Ok(idx)
+    }
+
+    /// Whether any API-level soft constraint carries a group (`:id`) label.
+    /// Grouped sets need the executor's grouped engines (via
+    /// [`optimize_check`](Self::optimize_check)); the flat
+    /// [`check_sat_max`](Self::check_sat_max) result cannot represent them.
+    #[must_use]
+    pub fn has_grouped_soft_constraints(&self) -> bool {
+        self.soft_constraints
+            .iter()
+            .any(|soft| soft.group.is_some())
     }
 
     /// Return the number of registered API-level soft constraints.
@@ -182,8 +205,8 @@ impl Solver {
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         self.reject_composite_bv_cnf_export("check_sat_max")?;
 
-        let controls = self.native_publication_controls();
-        if self.preflight_check(controls).is_some() {
+        let controls = self.native_maxsmt_publication_controls_at(Instant::now());
+        if self.preflight_check(&controls).is_some() {
             return Ok(MaxSmtResult::unknown());
         }
 
@@ -237,7 +260,7 @@ impl Solver {
             .replace_soft_constraints(native_softs);
         #[cfg(test)]
         let configured_term_memory_limit = self.term_memory_limit;
-        self.install_solve_controls(controls);
+        let deadline_scope = self.install_solve_controls(&controls);
         let execution = self.executor.execute_native_maxsmt_check_sat();
         let outcome = (|| -> Result<MaxSmtResult, SolverError> {
             #[cfg(test)]
@@ -300,7 +323,7 @@ impl Solver {
             // admission but before this native boundary.
             let result = self.decline_maxsmt_definite_on_external_stop(result);
             if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-                self.classify_unknown_reason(controls);
+                self.classify_unknown_reason(&controls);
             }
 
             if result.is_unsat() {
@@ -375,7 +398,7 @@ impl Solver {
                 violated_softs,
             ))
         })();
-        self.restore_solve_controls(controls);
+        self.restore_solve_controls(&controls, deadline_scope);
         #[cfg(test)]
         {
             self.term_memory_limit = configured_term_memory_limit;
@@ -416,6 +439,7 @@ impl Solver {
         self.last_unknown_reason = Some(UnknownReason::InternalError);
         self.last_executor_error = Some(detail);
         self.last_artifact_export_failure = None;
+        self.last_model_extraction_failure = None;
         MaxSmtResult::unknown()
     }
 

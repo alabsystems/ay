@@ -27,7 +27,21 @@ mod equality;
 mod equality_query;
 mod final_check;
 mod incremental;
+mod row2_applied;
+// Index-forest union-find for the conflict partition (`union_find` below is
+// the solver's own, unrelated, module).
+mod controlled_model;
+/// Original-owner native array-read derivations, not a solver verdict.
+pub mod counted_reads;
+mod index_forest;
 mod model;
+mod pending_definition;
+pub use controlled_model::ArrayModelConstruction;
+pub use pending_definition::PendingArrayDefinition;
+mod const_array_classes;
+/// Original-ledger controlled ordered model-cell DATA.
+pub mod indexed_model_cells;
+mod model_store_chain_classes;
 mod propagation;
 mod store_chain;
 mod union_find;
@@ -36,6 +50,8 @@ mod weak_lemmas;
 
 pub(crate) use bridge::SelectResolution;
 pub use bridge::UndecidedIndexPair;
+
+use incremental::CacheRebuildStats;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -103,8 +119,8 @@ impl<T: Copy + Eq + std::hash::Hash> DedupQueue<T> {
         self.seen.clear();
     }
 
-    /// Used by the Kani verification harness and tests.
-    #[cfg_attr(not(any(test, kani)), allow(dead_code))]
+    /// Used by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -114,7 +130,7 @@ impl<T: Copy + Eq + std::hash::Hash> DedupQueue<T> {
     }
 
     /// O(1) queued-membership test (test observability).
-    #[cfg_attr(not(any(test, kani)), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contains(&self, item: &T) -> bool {
         self.seen.contains(item)
     }
@@ -132,7 +148,7 @@ use ay_core::{
 };
 
 /// Interpretation of a single array in the model
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArrayInterpretation {
     /// Default value for all indices (if this is a const-array or has a known default)
     pub default: Option<String>,
@@ -154,14 +170,38 @@ pub struct ArrayInterpretation {
 pub struct ArrayModel {
     /// Maps array term IDs to their interpretations
     pub array_values: HashMap<TermId, ArrayInterpretation>,
-    /// Arrays whose extraction DROPPED a cell because two committed reads of
-    /// one (base, index-value) cell disagreed
-    /// (#select-read-conflict-fail-closed). Such an interpretation is
+    /// Protected extraction failures, including a DROPPED cell because two
+    /// committed reads of one (base, index-value) cell disagreed and failures
+    /// whose exact recovery provenance could not be retained. Such an interpretation is
     /// deliberately PARTIAL at the dropped cell; model completion must NOT
     /// total it — a fabricated default at the conflicted cell is exactly the
     /// wrong value the validators and the independent model-check gate would
     /// then refute a genuine `Sat` against.
     pub read_conflicted: HashSet<TermId>,
+    /// Birth-stamped substitution definitions awaiting a complete RHS value.
+    /// Readers must use [`Self::is_withheld`] rather than treating an old
+    /// decoupled entry as a value while this separate reason is present.
+    pub pending_definitions: HashMap<TermId, PendingArrayDefinition>,
+    /// Derived dependency quarantine for still-pending definitions. Completion
+    /// recomputes this set from its current graph; it is never a dropped-read
+    /// conflict, and must not be promoted into `read_conflicted` on a retry.
+    pub pending_definition_dependents: HashSet<TermId>,
+    /// A SECOND candidate for `array_values`, set only when it differs: every
+    /// equivalence class that holds a store chain given one value
+    /// (`reconcile_store_chain_classes`). The executor's SAT funnel tries it
+    /// only after the gates refused the model built from `array_values`
+    /// (#store-chain-class-candidate); either way every published model passes
+    /// the same gates. Consumers other than that funnel ignore it.
+    pub store_chain_class_candidate: Option<HashMap<TermId, ArrayInterpretation>>,
+    /// Array variables whose `array_values` entry was BUILT from a
+    /// model-true store-chain definition (every index/value operand
+    /// resolved), rather than reconstructed from committed select bits.
+    /// For such a variable the definition is the authority: a direct
+    /// select's bit-blasted bits may be unconstrained junk (the BV
+    /// encoding links a defined array to its chain only at finitely
+    /// many extensionality indices), so evaluators must not let an
+    /// exact-select disagreement veto the built interpretation.
+    pub definition_authoritative: HashSet<TermId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -303,6 +343,7 @@ impl ExactSelectModelEqObligation {
 /// another context. A thread-local (not a solver field) keeps `&self` query
 /// paths free of borrow conflicts with the `&mut self` scan loop.
 pub(crate) mod eq_paths_cache {
+    use super::store_chain::StoreChainCollection;
     use super::SelectResolution;
     use ay_core::kani_compat::DetHashMap as HashMap;
     use ay_core::{TermId, TheoryLit};
@@ -314,8 +355,24 @@ pub(crate) mod eq_paths_cache {
     /// `(resolution, reasons)`.
     pub(crate) type ResolveBaseMemo = (SelectResolution, Vec<TheoryLit>);
     type PairReason = Option<Vec<TheoryLit>>;
+    /// Class-pair distinctness witness (#arrays-distinct-witness-cache):
+    /// `(lhs_rep, rhs_rep, middle_reasons)` — one disequality witness
+    /// between two equivalence classes (a false eq atom, external
+    /// diseq reasons, or empty for a constant mismatch), with reps
+    /// oriented to the key's ordered class pair. `explain_distinct`
+    /// searches O(|C1|×|C2|) rep pairs per term pair; the witness is a
+    /// pure function of the class pair, and a full explanation for any
+    /// members is path(t1→lhs_rep) + middle + path(t2→rhs_rep).
+    pub(crate) type DistinctWitness = Option<(TermId, TermId, Vec<TheoryLit>)>;
     type AssertedPredecessors = HashMap<TermId, (TermId, TermId)>;
     type SharedAssertedPredecessors = Rc<AssertedPredecessors>;
+    /// Reason-carrying-edge BFS predecessor forest:
+    /// `node -> (parent, edge reasons)`. Same FIFO/first-visit order
+    /// as `equality_reason_paths_from_uncached`, so a reconstructed
+    /// path is byte-identical, but building it costs one small entry
+    /// per node instead of a full path Vec per node.
+    pub(crate) type ReasonPredecessors = HashMap<TermId, (TermId, Rc<[TheoryLit]>)>;
+    pub(crate) type SharedReasonPredecessors = Rc<ReasonPredecessors>;
 
     /// Memoized payload of `find_store_through_eq_with_mode`:
     /// `(base, index, value, eq_terms, reasons)`.
@@ -330,6 +387,11 @@ pub(crate) mod eq_paths_cache {
     struct Tables {
         paths: HashMap<TermId, Rc<PathMap>>,
         distinct: HashMap<(TermId, TermId), PairReason>,
+        distinct_witness: HashMap<(TermId, TermId), DistinctWitness>,
+        /// `known_distinct_via_equiv_classes` memoized by ordered class
+        /// representative pair: the O(|C1|×|C2|) cross-product is a pure
+        /// function of the two classes, diseq_set and term constants.
+        known_distinct_class: HashMap<(TermId, TermId), bool>,
         equal: HashMap<(TermId, TermId), PairReason>,
         /// Whole-output memo of `select_conflict_candidate_pairs()` (D1,
         /// SELECT-PAIRS blueprint): the generator is a pure function of
@@ -362,6 +424,15 @@ pub(crate) mod eq_paths_cache {
         /// (`lhs`/`rhs`) pairs in the cross-chain O(eq_pairs × indices) loop and
         /// the main per-select scan within one propagation call.
         resolve_base: HashMap<(TermId, TermId), Rc<ResolveBaseMemo>>,
+        /// Per-array memo of `collect_effective_stores` (the partial effective
+        /// store map used by effective-store decomposition and
+        /// store-permutation detection). A pure function of `store_cache`,
+        /// the asserted equality edges, `assigns` and the provable-distinctness
+        /// facts, all frozen for the window, so a hit is byte-identical. The
+        /// effective-store section and the store-permutation section of one
+        /// propagation call both walk the sides of every true array equality;
+        /// this makes the second walk a lookup.
+        effective_stores: HashMap<TermId, Option<Rc<StoreChainCollection>>>,
         /// Whole-output memo of `select_alias_diseq_candidate_pairs()`
         /// (#7956): pure function of `diseq_set` / `select_cache` / `eq_adj` /
         /// `assigns` / shadow union-find, all frozen in the window; the
@@ -375,6 +446,11 @@ pub(crate) mod eq_paths_cache {
         /// this forest is byte-identical to the legacy per-goal early-exit
         /// BFS (`asserted_equality_path_bfs`). Frozen-graph window only.
         asserted_prev: HashMap<TermId, SharedAssertedPredecessors>,
+        /// Per-start reason-carrying BFS predecessor forests
+        /// (#arrays-distinct-witness-cache): lets the distinct-witness
+        /// compose step fetch one start→rep path without materializing
+        /// the whole per-node path map.
+        reason_prev: HashMap<TermId, SharedReasonPredecessors>,
     }
 
     thread_local! {
@@ -409,6 +485,52 @@ pub(crate) mod eq_paths_cache {
         CACHE.with(|c| {
             if let Some(t) = c.borrow_mut().as_mut() {
                 t.distinct.insert((a, b), reason.clone());
+            }
+        });
+    }
+
+    /// Result of a distinct-witness cache lookup.
+    pub(crate) enum WitnessLookup {
+        /// No window active, or class pair not memoized yet.
+        Cold,
+        /// Class pair memoized with no witness.
+        NoWitness,
+        /// Class pair memoized with a witness.
+        Witness(TermId, TermId, Vec<TheoryLit>),
+    }
+
+    pub(crate) fn get_distinct_witness(a: TermId, b: TermId) -> WitnessLookup {
+        CACHE.with(|c| {
+            match c
+                .borrow()
+                .as_ref()
+                .and_then(|t| t.distinct_witness.get(&(a, b)).cloned())
+            {
+                None => WitnessLookup::Cold,
+                Some(None) => WitnessLookup::NoWitness,
+                Some(Some((lhs, rhs, middle))) => WitnessLookup::Witness(lhs, rhs, middle),
+            }
+        })
+    }
+    pub(crate) fn put_distinct_witness(a: TermId, b: TermId, witness: &DistinctWitness) {
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow_mut().as_mut() {
+                t.distinct_witness.insert((a, b), witness.clone());
+            }
+        });
+    }
+
+    pub(crate) fn get_known_distinct_class(a: TermId, b: TermId) -> Option<bool> {
+        CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|t| t.known_distinct_class.get(&(a, b)).copied())
+        })
+    }
+    pub(crate) fn put_known_distinct_class(a: TermId, b: TermId, known: bool) {
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow_mut().as_mut() {
+                t.known_distinct_class.insert((a, b), known);
             }
         });
     }
@@ -452,6 +574,23 @@ pub(crate) mod eq_paths_cache {
                 .as_ref()
                 .map(|t| t.asserted_prev.get(&start).cloned())
         })
+    }
+    /// Warm forest for `start`, or `None` when cold / no window
+    /// (callers compute locally; `put_reason_prev` is a no-op outside
+    /// a window).
+    pub(crate) fn get_reason_prev(start: TermId) -> Option<SharedReasonPredecessors> {
+        CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|t| t.reason_prev.get(&start).cloned())
+        })
+    }
+    pub(crate) fn put_reason_prev(start: TermId, prev: &SharedReasonPredecessors) {
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow_mut().as_mut() {
+                t.reason_prev.insert(start, prev.clone());
+            }
+        });
     }
     pub(crate) fn put_asserted_prev(start: TermId, prev: &SharedAssertedPredecessors) {
         CACHE.with(|c| {
@@ -503,6 +642,24 @@ pub(crate) mod eq_paths_cache {
                 .and_then(|t| t.resolve_base.get(&(array, index)).cloned())
         })
     }
+    /// `Some(Some(chain))`/`Some(None)` on a warm hit (found / no chain),
+    /// `None` when the window is inactive or cold for `array`.
+    #[allow(clippy::option_option)]
+    pub(crate) fn get_effective_stores(array: TermId) -> Option<Option<Rc<StoreChainCollection>>> {
+        CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|t| t.effective_stores.get(&array).cloned())
+        })
+    }
+    pub(crate) fn put_effective_stores(array: TermId, payload: &Option<Rc<StoreChainCollection>>) {
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow_mut().as_mut() {
+                t.effective_stores.insert(array, payload.clone());
+            }
+        });
+    }
+
     pub(crate) fn put_resolve_base(array: TermId, index: TermId, payload: &Rc<ResolveBaseMemo>) {
         CACHE.with(|c| {
             if let Some(t) = c.borrow_mut().as_mut() {
@@ -680,9 +837,18 @@ pub struct ArraySolver<'a> {
     /// Marks into `array_var_merge_log` at each `push()`, so `pop()` undoes
     /// exactly the merges recorded in the scope being left.
     array_var_merge_scopes: Vec<usize>,
-    /// Deduplicates repeated ROW2 registrations by `(store_term, select_index)`.
+    /// Index of currently queued direct-store ROW2 work by store/index.
     axiom_fingerprints: HashSet<(TermId, TermId)>,
-    /// Exact ROW2 fingerprint indices recorded per store term.
+    /// Exact read obligations currently pending or blocked. An alias
+    /// explanation may change after backtracking: this is queue membership,
+    /// never evidence that one previously emitted guarded clause covers it.
+    row2_down_work: HashSet<(TermId, TermId)>,
+    /// One last-derived exact clause per current obligation. These records
+    /// never acknowledge themselves; only an actual SAT callback does.
+    row2_last_clause: HashMap<(TermId, TermId), Arc<[TheoryLit]>>,
+    /// Shared acknowledgment for exact clauses still named by current work.
+    row2_clause_acknowledged: HashMap<Arc<[TheoryLit]>, bool>,
+    /// Exact indices of currently queued direct-store ROW2 work.
     ///
     /// Unlike Z3's enode-root fingerprints, these remain exact `TermId`s so a
     /// fingerprint inserted under a branch-local equality does not suppress a
@@ -807,6 +973,12 @@ pub struct ArraySolver<'a> {
     /// per-call sort (ascending eq term id), so propagation order — and
     /// thus determinism (#3060) — is unchanged.
     eq_select_entries_sorted: Vec<(TermId, TermId, TermId)>,
+    /// Element sorts present in `select_cache` when
+    /// `eq_select_entries_sorted` was last built. The entry filter is a
+    /// pure function of this set plus `equality_cache`, so when the set
+    /// is unchanged new entries can be appended without a rebuild
+    /// (#arrays-eq-entries-append).
+    eq_select_entries_sorts: Vec<Sort>,
     /// Monotonic version of every input `propagate_impl()` reads: bumped on
     /// assignment changes, eq-graph changes, external (dis)equality
     /// injection, and cache rebuilds. See `bump_propagate_state_version`.
@@ -868,6 +1040,9 @@ pub struct ArraySolver<'a> {
     propagation_count: u64,
     /// ROW2 scan diagnostics: scans executed (version fast-path missed).
     scan_count: u64,
+    /// Structural-rebuild diagnostics (#array-scope-watermark); see
+    /// [`CacheRebuildStats`].
+    cache_rebuild: CacheRebuildStats,
     /// ROW2 scan diagnostics: entries re-derived across all scans.
     scan_entry_visits: u64,
     /// ROW2 scan diagnostics: inner view-triple iterations across all scans.
@@ -948,6 +1123,9 @@ pub struct ArraySolver<'a> {
     /// state, the method short-circuits to an empty result because no new
     /// equalities can be discovered (#6546).
     prop_eq_snapshot: Option<(u64, usize, usize, usize, usize, usize)>,
+    /// The snapshot at the last FULL scan, never invalidated: measures what
+    /// changed between consecutive scans (`arrays_prop_eq_delta_*`).
+    prop_eq_last_scan_snapshot: Option<(u64, usize, usize, usize, usize, usize)>,
     /// Snapshot of `(eq_adj_version, diseq_set.len(), select_cache.len(),
     /// store_cache.len(), requested_model_eqs.len(), requested_interface_eqs.len())`
     /// at the last `final_check()` call that returned `Sat` (all sub-checks passed).
@@ -1092,6 +1270,9 @@ impl<'a> ArraySolver<'a> {
             array_var_merge_undo: Vec::new(),
             array_var_merge_scopes: Vec::new(),
             axiom_fingerprints: HashSet::default(),
+            row2_down_work: HashSet::default(),
+            row2_last_clause: HashMap::default(),
+            row2_clause_acknowledged: HashMap::default(),
             row2_fingerprint_indices: HashMap::default(),
             pending_axioms: Vec::new(),
             blocked_axioms: Vec::new(),
@@ -1112,6 +1293,7 @@ impl<'a> ArraySolver<'a> {
             sent_equality_replays: HashSet::default(),
             sent_equality_replay_log: Vec::new(),
             eq_select_entries_sorted: Vec::new(),
+            eq_select_entries_sorts: Vec::new(),
             propagate_state_version: 0,
             last_full_scan_version: None,
             eq_pair_index: HashMap::default(),
@@ -1130,6 +1312,7 @@ impl<'a> ArraySolver<'a> {
             sent_propagations: HashSet::default(),
             check_count: 0,
             scan_count: 0,
+            cache_rebuild: CacheRebuildStats::default(),
             scan_entry_visits: 0,
             scan_view_iters: 0,
             row2_all_dirty: true,
@@ -1155,6 +1338,7 @@ impl<'a> ArraySolver<'a> {
             #[cfg(test)]
             assign_index_rebuilds: 0,
             prop_eq_snapshot: None,
+            prop_eq_last_scan_snapshot: None,
             final_check_snapshot: None,
             final_check_call_count: 0,
             affine_cache: Rc::new(AffineCache::default()),
@@ -1232,6 +1416,3 @@ impl<'a> ArraySolver<'a> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

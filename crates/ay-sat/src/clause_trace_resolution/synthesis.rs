@@ -54,6 +54,7 @@ fn synthesize_rup_hints(
         &mut assign,
         &mut reason,
         &mut order,
+        &mut in_cone,
         meter,
     )?
     else {
@@ -149,10 +150,10 @@ fn finish_synthesized_chain(
 /// Compact the producer's ordered hint candidates into a checked positive-RUP
 /// chain under exact fixed premises.
 ///
-/// Candidate ids remain untrusted. Named prior clauses are rescanned to a
-/// deterministic fixpoint under fixed premises plus the negated target:
-/// satisfied, open, and non-unit rows contribute no inference; unit rows are
-/// retained once and propagated; the first conflict completes the chain. A
+/// Candidate ids remain untrusted. Under fixed premises plus the negated
+/// target, a metered cost bound selects full scans or occurrence-scheduled
+/// rescans after the first sweep, preserving deterministic rounds. Satisfied
+/// rows retire; units propagate once; the first conflict completes the chain. A
 /// returned chain is never larger than the source candidate list and is still
 /// replayed by the ordinary independent DAG validator before acceptance.
 fn compact_rup_hint_candidates(
@@ -162,77 +163,41 @@ fn compact_rup_hint_candidates(
     fixed_unit_premises: &[Literal],
     candidate_hints: &[u64],
     candidate_hint_capacity: usize,
-    num_vars: usize,
+    mut scratch: CompactionScratch,
     admitted_scratch_bytes: usize,
+    admitted_scheduler_bytes: usize,
     meter: &mut ConversionMeter<'_>,
-) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
+) -> Result<(Option<Vec<u64>>, CompactionScratch), ResolutionValidationError> {
+    meter.check_controls()?;
     let CompactionState {
-        mut assign,
         mut hints,
         mut recorded,
     } = prepare_compaction_state(
         candidate_hints,
         candidate_hint_capacity,
-        num_vars,
         admitted_scratch_bytes,
         meter,
     )?;
 
-    if seed_synthesis_assignment(
-        &mut assign,
-        fixed_unit_premises,
-        target_clause,
-        num_vars,
-        meter,
-    )? {
-        return Ok(Some(hints));
-    }
-
-    loop {
-        let mut propagated = false;
-        for (candidate_index, &id) in candidate_hints.iter().enumerate() {
-            if candidate_index % CONTROL_POLL_INTERVAL == 0 {
-                meter.check_controls()?;
-            }
-            meter.charge(1)?;
-            if recorded[candidate_index] != 0 {
-                continue;
-            }
-            let canonical_index = id
-                .checked_sub(1)
-                .and_then(|value| usize::try_from(value).ok());
-            let clause = canonical_index.and_then(|index| {
-                if let Some((stored_id, clause)) = original_clauses.get(index) {
-                    (*stored_id == id).then_some(clause.as_slice())
-                } else {
-                    let derived_index = index.checked_sub(original_clauses.len())?;
-                    let step = derived.get(derived_index)?;
-                    (step.id == id).then_some(step.clause.as_slice())
-                }
-            });
-            let Some(clause) = clause else {
-                return Ok(None);
-            };
-            match scan_terminal_hint_clause(clause, &assign, meter)? {
-                TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
-                TerminalHintScan::Unit(literal) => {
-                    hints.push(id);
-                    meter.charge(1)?;
-                    recorded[candidate_index] = 1;
-                    assign[literal.variable().index()] = Some(literal.is_positive());
-                    propagated = true;
-                }
-                TerminalHintScan::Conflict => {
-                    hints.push(id);
-                    meter.charge(1)?;
-                    return Ok(Some(hints));
-                }
-            }
-        }
-        if !propagated {
-            return Ok(None);
-        }
-    }
+    let result = if scratch.seed(fixed_unit_premises, target_clause, meter)? {
+        Some(hints)
+    } else {
+        compact_seeded_candidates(
+            original_clauses,
+            derived,
+            candidate_hints,
+            &mut scratch,
+            &mut hints,
+            &mut recorded,
+            admitted_scheduler_bytes,
+            meter,
+        )?
+        .then_some(hints)
+    };
+    // Every ordinary return restores the assignment. Errors (including reset
+    // refusal) and unwinds drop the moved owner instead of returning it.
+    scratch.clear(meter)?;
+    Ok((result, scratch))
 }
 
 struct SynthesisState {
@@ -368,8 +333,14 @@ fn sweep_synthesis_database(
     assign: &mut [Option<bool>],
     reason: &mut [u64],
     order: &mut Vec<u32>,
+    in_cone: &mut [u8],
     meter: &mut ConversionMeter<'_>,
 ) -> Result<Option<u64>, ResolutionValidationError> {
+    // The cone markers are zero on entry and not needed until this sweep ends.
+    // Errors drop the caller's one-shot owner; only a completely cleared normal
+    // return can reach finish_synthesized_chain.
+    let mut retired =
+        SynthesisRetirement::new(in_cone, original_clauses.len(), derived.len(), meter)?;
     let conflict_id = 'sweep: loop {
         meter.check_controls()?;
         let mut propagated = false;
@@ -377,9 +348,13 @@ fn sweep_synthesis_database(
             .iter()
             .map(|(id, clause)| (*id, clause.as_slice()))
             .chain(derived.iter().map(|step| (step.id, step.clause.as_slice())));
-        for (id, clause) in clauses {
+        for (position, (id, clause)) in clauses.enumerate() {
+            if retired.contains(position, meter)? {
+                continue;
+            }
             match scan_terminal_hint_clause(clause, assign, meter)? {
-                TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
+                TerminalHintScan::Satisfied => retired.mark(position, meter)?,
+                TerminalHintScan::Open => {}
                 TerminalHintScan::Unit(literal) => {
                     // Unit scans only return an unassigned literal. Recording
                     // the reason id before installing the assignment keeps
@@ -389,20 +364,23 @@ fn sweep_synthesis_database(
                     reason[variable] = id;
                     order.push(variable as u32);
                     assign[variable] = Some(literal.is_positive());
+                    retired.mark(position, meter)?;
                     propagated = true;
                 }
-                TerminalHintScan::Conflict => break 'sweep id,
+                TerminalHintScan::Conflict => break 'sweep Some(id),
             }
         }
         if !propagated {
-            return Ok(None);
+            break None;
         }
     };
-    Ok(Some(conflict_id))
+    retired.clear(meter)?;
+    Ok(conflict_id)
 }
 
+include!("synthesis_retirement.rs");
+
 struct CompactionState {
-    assign: Vec<Option<bool>>,
     hints: Vec<u64>,
     recorded: Vec<u8>,
 }
@@ -410,23 +388,9 @@ struct CompactionState {
 fn prepare_compaction_state(
     candidate_hints: &[u64],
     candidate_hint_capacity: usize,
-    num_vars: usize,
     admitted_scratch_bytes: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<CompactionState, ResolutionValidationError> {
-    let mut assign = Vec::new();
-    reserve_exact(
-        &mut assign,
-        num_vars,
-        ResolutionValidationResource::AssignmentScratch,
-        meter,
-    )?;
-    while assign.len() < num_vars {
-        let chunk = (num_vars - assign.len()).min(CONTROL_POLL_INTERVAL);
-        meter.charge(chunk)?;
-        assign.resize(assign.len() + chunk, None);
-        meter.check_controls()?;
-    }
     let mut hints = Vec::new();
     reserve_exact(
         &mut hints,
@@ -447,7 +411,7 @@ fn prepare_compaction_state(
         meter.check_controls()?;
     }
     let actual_scratch_bytes = synthesis_scratch_bytes_from_capacities(
-        assign.capacity(),
+        0,
         candidate_hint_capacity,
         hints.capacity(),
         recorded.capacity(),
@@ -458,9 +422,5 @@ fn prepare_compaction_state(
         actual_scratch_bytes,
         admitted_scratch_bytes,
     )?;
-    Ok(CompactionState {
-        assign,
-        hints,
-        recorded,
-    })
+    Ok(CompactionState { hints, recorded })
 }

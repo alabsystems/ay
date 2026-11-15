@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Positive direction of `reification_leq_degree_overflow`: `L <== (... <= d)`
+% stores `d + 1` as both the big-M coefficient and the degree, at every width.
+% Constraint 1 is the i64 boundary that used to wrap, constraint 2 its
+% neighbour that was always right, constraint 3 the same boundary at i128.
+f 3 ;
+e x1 <== <= 9223372036854775807 : 1 ;
+e x1 <== <= 9223372036854775806 : 2 ;
+e x1 <== <= 170141183460469231731687303715884105727 : 3 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

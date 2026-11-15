@@ -25,8 +25,15 @@
 //! SOUNDNESS CONTRACT: completion only ADDS values for variables that have
 //! none — it never overwrites a solver-assigned value (fill-only, gated by
 //! an `evaluate_term(var) == Unknown` check that mirrors exactly what
-//! validation will later see). The completed values are candidates only:
-//! full model validation still runs afterwards and decides acceptance. A
+//! validation will later see). One exception: in a BV-lane model, an Int
+//! value that contradicts a unique SAT-true nested equality pin is replaced
+//! by that pin (the arithmetic lane that produced the stale value never saw
+//! which disjunct holds), under a retract guard that keeps the pin only
+//! when it makes no assertion newly definitively false — lanes where Int
+//! atoms stay opaque assign them arbitrarily, so there the pin is not
+//! forced. The replacement is still only a candidate for validation below.
+//! The completed values are candidates only: full model validation still
+//! runs afterwards and decides acceptance. A
 //! wrong default makes an assertion evaluate to definitively-false, which
 //! the strict gate / observation pipeline rejects, degrading to Unknown
 //! exactly as before — so no wrong-sat can be introduced by this pass.
@@ -48,11 +55,35 @@ use super::datatype_array_fields::DatatypeArrayConstructionAuthorization;
 use super::datatype_cell_authority::ExactDatatypeCellCompletions;
 use super::dt_construct_budget::MAX_OPAQUE_DT_COLLECTION_ROOTS;
 use super::{string_witness, EvalValue, Model};
+use crate::executor::lnh_symmetry::is_genuinely_uninterpreted_sort;
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
 
+enum ArrayCompletionGraphPurpose {
+    CompletionCandidates,
+    DependencyQuarantine,
+}
+
+mod bitvec_classes;
+pub(in crate::executor) use bitvec_classes::CandidateOwner;
+mod carrier_definitions;
+mod congruent_array_literals;
 mod const_interp;
+mod datatype_array_candidate;
 mod datatype_arrays;
+mod euf_datatype_aliases;
+#[cfg(test)]
+mod gap_acceptance_tests;
+#[cfg(test)]
+mod ground_resolve_memo_tests;
+mod ground_resolve_sub_solve;
+mod nested_cell_merge;
+mod pending_arrays;
+mod preprocess_eliminated;
+mod select_congruence;
+mod seq_witness;
+mod structured_datatypes;
+mod uf_congruence;
 
 /// Bound on graph, declaration, and commit work for checked-projection output completion.
 ///
@@ -87,7 +118,7 @@ fn checked_datatype_root_augmentation(
 /// Uninterpreted carriers are admitted only when their caller has established
 /// authority; sequence carriers always use their complete sort as the domain
 /// key so different element sorts cannot share a class namespace.
-fn carrier_sort_key(sort: &Sort, allow_uninterpreted: bool) -> Option<String> {
+pub(super) fn carrier_sort_key(sort: &Sort, allow_uninterpreted: bool) -> Option<String> {
     match sort {
         Sort::Uninterpreted(name) if allow_uninterpreted => Some(name.clone()),
         // This is an INTERNAL EufModel namespace, not an SMT-LIB sort
@@ -201,6 +232,42 @@ enum ExistingArrayCellPolicy {
     DefinitionalChain,
 }
 
+// Existing completion callers retain their own established accounting. The
+// native field dispatcher supplies its original attempt's progress explicitly.
+enum OutputCompletionProgress<'a> {
+    Existing,
+    Original(&'a mut dyn FnMut(usize, usize) -> bool),
+}
+impl OutputCompletionProgress<'_> {
+    fn pay(&mut self, work: usize, bytes: usize) -> bool {
+        match self {
+            Self::Existing => true,
+            Self::Original(pay) => pay(work, bytes),
+        }
+    }
+    fn cells(&mut self, count: usize, width: usize) -> bool {
+        if count == 0 {
+            return self.pay(0, 0);
+        }
+        let Some(bytes) = count
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_add(4096))
+        else {
+            return false;
+        };
+        self.pay(count, bytes)
+    }
+    fn sort(&mut self, sort: &Sort) -> bool {
+        match self {
+            Self::Existing => true,
+            Self::Original(pay) => {
+                ay_core::TermStore::inspect_sort_with_progress(sort, *pay).is_ok()
+            }
+        }
+    }
+}
+
 impl Executor {
     /// Complete the last SAT model so it is total over the original free
     /// variables (Bool/Int/Real/BitVec sorts), then leave acceptance to
@@ -226,6 +293,14 @@ impl Executor {
         let Some(mut model) = self.last_model.take() else {
             return;
         };
+        // Before any phase copies a class element: a RoundingMode value is one
+        // of the five modes (`rm_concrete.rs`). Evidence was revoked above.
+        self.concretize_rounding_mode_values(&mut model);
+        // Preserve extractor-observed enum cells before any completion phase
+        // can fill their constructor-named aliases from an unrelated default.
+        if self.canonicalize_enum_indexed_cells(&mut model, None) {
+            super::eval_memo_clear();
+        }
 
         // Memoize `evaluate_term` across this completion pass. The model mutates
         // here (defaulting/recovery), but every mutation runs through
@@ -251,6 +326,27 @@ impl Executor {
             .collect();
         let substituted: HashSet<TermId> = substitutions.iter().map(|&(from, _)| from).collect();
 
+        // Phase 0.5 (#uninterpreted-bitvec-class-values): on a route that
+        // decided BitVec terms as uninterpreted (no BV model), a BitVec
+        // variable takes its EUF class value where every atom mentioning it
+        // confirms that value (`completion/bitvec_classes.rs`), before phase 1
+        // would default it to 0 against a committed disequality.
+        //
+        // Equality classes offer candidates, never evaluation or SAT authority.
+        // A refused original owner ends this pass before later defaulting can
+        // obscure it; the finalizer publishes the retained typed stop.
+        let bv_class_valued = match self.complete_uninterpreted_bitvec_values(
+            &mut model,
+            extra_roots,
+            &substituted,
+        ) {
+            Ok(count) => count,
+            Err(_) => {
+                self.last_model = Some(model);
+                return;
+            }
+        };
+
         // Phase 1: default truly-free original variables that are missing a
         // value. Substitution keys are skipped — they are DEFINED by their
         // RHS and get their value in phase 2; defaulting them could
@@ -259,6 +355,42 @@ impl Executor {
         for var in self.collect_assertion_free_vars() {
             if substituted.contains(&var) {
                 continue;
+            }
+            // BV-lane merge reconcile: when the deciding lane solved the
+            // formula bit-blasted, an Int variable can carry an arithmetic
+            // lane's value that contradicts the SAT assignment's own
+            // satisfied disjunct (the arithmetic lane never sees which
+            // disjunct holds). A unique SAT-true nested equality pin for
+            // the variable then wins over both a missing value and a
+            // disagreeing lane value — but only under the retract guard
+            // below, because lanes where Int atoms stay opaque assign
+            // them arbitrarily. This is the one place completion replaces
+            // a present value; the completed model is still only a
+            // candidate — final validation decides acceptance exactly as
+            // for defaults.
+            if model.bv_model.is_some() && matches!(self.ctx.terms.sort(var), Sort::Int) {
+                if let Some(pin) = self.derive_int_from_true_equality_atom(&model, var) {
+                    if self.evaluate_term(&model, var) == pin {
+                        continue;
+                    }
+                    // Not every BV-carrying lane encodes Int atoms: in a
+                    // lane where they are opaque Bool atoms, the SAT
+                    // assignment to the atom is arbitrary and the pin is
+                    // NOT forced. Keep the pin only when it does not make
+                    // any assertion newly definitively false; retract to
+                    // the pre-pin model otherwise (status quo ante).
+                    let false_before = self.count_definitively_false_assertions(&model);
+                    let saved = model.clone();
+                    if Self::insert_completed_value(&self.ctx.terms, &mut model, var, &pin) {
+                        if self.count_definitively_false_assertions(&model) > false_before {
+                            model = saved;
+                            super::eval_memo_clear();
+                        } else {
+                            defaulted += 1;
+                            continue;
+                        }
+                    }
+                }
             }
             if !matches!(self.evaluate_term(&model, var), EvalValue::Unknown) {
                 continue;
@@ -354,6 +486,10 @@ impl Executor {
         // OUTER check-sat level, where `ctx.assertions` is the original set
         // the validation gates read (#no-fabricated-model-values).
 
+        if bv_class_valued > 0 {
+            self.last_statistics
+                .set_int("model_completion.bv_class_values", bv_class_valued as u64);
+        }
         if defaulted > 0 || recovered > 0 || late_defaulted > 0 {
             tracing::debug!(
                 defaulted,
@@ -377,13 +513,12 @@ impl Executor {
         // uninterpreted (free) sort, or a bare uninterpreted variable / UF
         // application, gets NO element value. Likewise, a sequence encoded as
         // an equality-only carrier can have no concrete SeqModel payload even
-        // though the SAT model commits its equality atoms. In either case an
-        // equality over the missing carrier evaluates to Unknown and the
-        // validator fails closed — returning Unknown for a genuinely SAT
-        // query. This phase assigns each SAT-committed equality class a
-        // distinct, model-resident element so exact validation can decide
-        // equality-only uses. Sequence builtins still require a concrete
-        // SeqModel value and remain fail-closed.
+        // though the SAT model commits its equality atoms. An equality over a
+        // missing carrier evaluates to Unknown and the validator fails closed,
+        // so this phase gives each SAT-committed class a distinct element.
+        // Phase 3a (seq_witness.rs) builds a joint positional sequence witness
+        // first; it replaces Phase 3's sequence values only if gates refute them.
+        let positional_seq = self.positional_seq_candidate(&model, pre_dt_roots);
         self.complete_uninterpreted_sort_model(
             &mut model,
             pre_dt_roots,
@@ -421,7 +556,8 @@ impl Executor {
             .authored_datatype_array_construction_cells()
             .unwrap_or_default();
         let mut extensionality_cells = Vec::new();
-        let extensional_dt_roots = match self.authenticated_datatype_array_extensionality(&model) {
+        let extensional_dt_roots = match self.collect_demanded_datatype_array_extensionality(&model)
+        {
             Some(evidence) if !evidence.roots.is_empty() => {
                 checked_datatype_root_augmentation(pre_dt_roots, &evidence.roots).map(|roots| {
                     // Authorization accompanies only the exact generated roots
@@ -443,6 +579,23 @@ impl Executor {
         if dt_constructed > 0 {
             self.last_statistics
                 .set_int("model_completion.dt_constructed", dt_constructed as u64);
+        }
+
+        // Recover opaque datatype leaves from complete constructors in their
+        // current EUF class after total construction's destructive clear, and
+        // before array completion renders those leaves into its cells.
+        let aliases = self.complete_euf_datatype_constructor_aliases(&mut model, dt_roots);
+        if aliases > 0 {
+            self.last_statistics
+                .set_int("model_completion.dt_euf_aliases", aliases as u64);
+        }
+
+        let recovered_pending = self.recover_pending_datatype_array_aliases(&mut model, dt_roots);
+        if recovered_pending > 0 {
+            self.last_statistics.set_int(
+                "model_completion.pending_array_aliases",
+                recovered_pending as u64,
+            );
         }
 
         // Phase 6: make assertion-relevant array interpretations total in the
@@ -519,6 +672,12 @@ impl Executor {
             );
         }
 
+        self.adopt_positional_seq_candidate(&mut model, positional_seq, pre_dt_roots);
+        // A complete compact function is one new MODEL CHOICE, not SAT
+        // authority. Ordinary primary and independent original-root gates
+        // below must freshly replay every assertion against these captures.
+        self.install_functional_array_candidate(&mut model);
+        self.complete_congruent_array_literals(&mut model);
         self.last_model = Some(model);
     }
 
@@ -600,7 +759,7 @@ impl Executor {
                 || model
                     .array_model
                     .as_ref()
-                    .is_some_and(|arrays| arrays.read_conflicted.contains(&array))
+                    .is_some_and(|arrays| arrays.is_withheld(&array))
             {
                 continue;
             }
@@ -626,7 +785,22 @@ impl Executor {
             .array_model
             .as_ref()
             .map_or_else(HashSet::default, |arrays| arrays.read_conflicted.clone());
-        let mut tainted = Self::propagate_array_completion_taint(&edges, &conflict_seeds);
+        let mut protected = self.propagate_array_completion_taint(&edges, &conflict_seeds, true);
+        let pending = self.pending_array_dependency_mask(model, &edges);
+        let mask_changed = model.array_model.as_mut().is_some_and(|arrays| {
+            if arrays.pending_definition_dependents == pending {
+                return false;
+            }
+            arrays.pending_definition_dependents = pending.clone();
+            true
+        });
+        if mask_changed {
+            model_changed = true;
+            model.revoke_all_quantified_model_seals();
+            self.dt_egraph_assignment.replace(None);
+            super::eval_memo_clear();
+        }
+        let mut tainted: HashSet<_> = protected.iter().chain(&pending).copied().collect();
 
         // A direct select that occurs in an active assertion/assumption is a
         // required observation.  If it is still unknown before completion,
@@ -679,7 +853,8 @@ impl Executor {
                 _ => None,
             })
             .collect();
-        let incomplete = Self::propagate_array_completion_taint(&edges, &incomplete_read_arrays);
+        let incomplete =
+            self.propagate_array_completion_taint(&edges, &incomplete_read_arrays, false);
 
         // Build in a shadow model.  Definition fixpoint passes may depend on an
         // interpretation derived in an earlier pass, but no speculative value
@@ -890,10 +1065,12 @@ impl Executor {
         }
 
         if !discovered_conflicts.is_empty() {
-            tainted = Self::propagate_array_completion_taint(&edges, &discovered_conflicts)
-                .into_iter()
-                .chain(tainted)
-                .collect();
+            protected.extend(self.propagate_array_completion_taint(
+                &edges,
+                &discovered_conflicts,
+                false,
+            ));
+            tainted.extend(protected.iter().copied());
         }
 
         let mut completed = 0usize;
@@ -901,7 +1078,7 @@ impl Executor {
         ordered_candidates.sort_by_key(|(term, _)| term.index());
         if !tainted.is_empty() || !ordered_candidates.is_empty() {
             let arrays = model.array_model.get_or_insert_with(Default::default);
-            for term in &tainted {
+            for term in &protected {
                 if arrays.read_conflicted.insert(*term) {
                     model_changed = true;
                 }
@@ -1414,6 +1591,17 @@ impl Executor {
                         *authority = value;
                         continue;
                     }
+                    // An array-valued cell merges as an interpretation does,
+                    // under the same default policy, not as text
+                    // (`executor_format/array_cell.rs`).
+                    if matches!(array_sort.element_sort, Sort::Array(_)) {
+                        if let Some(merged) =
+                            Self::merge_nested_cell(authority, &value, default_policy)
+                        {
+                            *authority = merged;
+                            continue;
+                        }
+                    }
                     return Err(());
                 }
                 Some(_) => {}
@@ -1539,6 +1727,14 @@ impl Executor {
         if opaque_app_definitions.is_empty() {
             return;
         }
+        // Private pending-definition recovery does not own opaque UF argument
+        // congruence or its arithmetic evaluation. Keep that existing producer
+        // outside this narrow metered transaction; ordinary completion retains
+        // its full route below.
+        if super::recovery_admission::RecoveryAdmission::current_for(self).is_some() {
+            super::recovery_admission::refuse_current();
+            return;
+        }
         let group_key = |term: TermId| -> Option<(String, usize, Sort)> {
             let TermData::App(symbol, args) = self.ctx.terms.get(term) else {
                 return None;
@@ -1618,7 +1814,10 @@ impl Executor {
     /// Collect only hard query structure: top-level conjunction equalities are
     /// alias/definition edges; equalities under disjunction, negation, or ITE
     /// are never treated as model authority.  Structural `store(result, base)`
-    /// edges are unconditional term semantics and always propagate taint.
+    /// edges are unconditional term semantics and always propagate taint from
+    /// the BASE to the store RESULT; whether they also propagate RESULT to
+    /// BASE depends on the seed's meaning -- see
+    /// [`Self::propagate_array_completion_taint`].
     pub(super) fn collect_array_completion_graph(
         &self,
         model: &Model,
@@ -1630,6 +1829,64 @@ impl Executor {
         Vec<(TermId, TermId)>,
         HashSet<TermId>,
     ) {
+        self.collect_array_completion_graph_for(
+            model,
+            extra_roots,
+            ArrayCompletionGraphPurpose::CompletionCandidates,
+        )
+    }
+
+    /// Dependency DATA only: retain every hard equality, structural store and
+    /// recorded replacement edge without requesting opaque-UF candidate
+    /// definitions. Possible opaque congruence adds quarantine edges, never
+    /// equality or interpretation authority.
+    fn collect_pending_array_dependency_edges(
+        &self,
+        model: &Model,
+        extra_roots: &[TermId],
+    ) -> Vec<(TermId, TermId)> {
+        self.collect_array_completion_graph_for(
+            model,
+            extra_roots,
+            ArrayCompletionGraphPurpose::DependencyQuarantine,
+        )
+        .1
+    }
+
+    fn collect_array_completion_graph_for(
+        &self,
+        model: &Model,
+        extra_roots: &[TermId],
+        purpose: ArrayCompletionGraphPurpose,
+    ) -> (
+        Vec<TermId>,
+        Vec<(TermId, TermId)>,
+        Vec<(TermId, TermId)>,
+        Vec<(TermId, TermId)>,
+        HashSet<TermId>,
+    ) {
+        if super::recovery_admission::RecoveryAdmission::current_for(self).is_some() {
+            let amount = self.ctx.assertions.len().checked_add(extra_roots.len());
+            let bytes = amount.and_then(|n| n.checked_mul(2 * std::mem::size_of::<TermId>()));
+            if !amount
+                .zip(bytes)
+                .is_some_and(|(work, bytes)| super::recovery_admission::pay_for(self, work, bytes))
+                || !super::recovery_admission::pay_for(
+                    self,
+                    self.recorded_var_substitutions.allocation_size(),
+                    0,
+                )
+            {
+                super::recovery_admission::refuse_current();
+                return (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    HashSet::default(),
+                );
+            }
+        }
         let mut relevant = HashSet::default();
         let mut edges = Vec::new();
         let mut aliases = Vec::new();
@@ -1646,10 +1903,32 @@ impl Executor {
 
         let mut hard = roots.clone();
         while let Some(term) = hard.pop() {
+            if !super::recovery_admission::pay_for(self, 1, 0) {
+                return (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    HashSet::default(),
+                );
+            }
             let TermData::App(symbol, args) = self.ctx.terms.get(term) else {
                 continue;
             };
             if symbol.name() == "and" {
+                if !super::recovery_admission::pay_for(
+                    self,
+                    args.len(),
+                    args.len().saturating_mul(std::mem::size_of::<TermId>()),
+                ) {
+                    return (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        HashSet::default(),
+                    );
+                }
                 hard.extend(args.iter().copied());
                 continue;
             }
@@ -1703,6 +1982,15 @@ impl Executor {
         let mut seen = HashSet::default();
         let mut stack = roots;
         while let Some(term) = stack.pop() {
+            if !super::recovery_admission::pay_for(self, 1, 0) {
+                return (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    HashSet::default(),
+                );
+            }
             if !seen.insert(term) {
                 continue;
             }
@@ -1714,6 +2002,19 @@ impl Executor {
             }
             match self.ctx.terms.get(term) {
                 TermData::App(symbol, args) => {
+                    if !super::recovery_admission::pay_for(
+                        self,
+                        args.len(),
+                        args.len().saturating_mul(std::mem::size_of::<TermId>()),
+                    ) {
+                        return (
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            HashSet::default(),
+                        );
+                    }
                     if symbol.name() == "select"
                         && args.len() == 2
                         && matches!(self.ctx.terms.sort(args[0]), Sort::Array(_))
@@ -1743,7 +2044,7 @@ impl Executor {
 
         if let Some(arrays) = model.array_model.as_ref() {
             relevant.extend(arrays.array_values.keys().copied());
-            relevant.extend(arrays.read_conflicted.iter().copied());
+            relevant.extend(arrays.withheld_arrays().copied());
         }
         // User-declared 0-arity arrays are output-relevant even when the
         // formula never reads them.  Symbol metadata distinguishes these free
@@ -1778,12 +2079,48 @@ impl Executor {
             }
         }
 
-        self.admit_unconstrained_opaque_app_definitions(
-            model,
-            &opaque_app_definitions,
-            &opaque_array_apps,
-            &mut definitions,
-        );
+        match purpose {
+            ArrayCompletionGraphPurpose::CompletionCandidates => {
+                self.admit_unconstrained_opaque_app_definitions(
+                    model,
+                    &opaque_app_definitions,
+                    &opaque_array_apps,
+                    &mut definitions,
+                );
+            }
+            ArrayCompletionGraphPurpose::DependencyQuarantine => {
+                // This route owns no argument-model comparison. Treat every
+                // same-name/arity opaque application as potentially congruent,
+                // even if overloading or known-unequal arguments could later
+                // distinguish it. Over-withholding is safe; the edges are
+                // consumed only by the pending-reason mask.
+                let mut representatives: HashMap<(&str, usize), TermId> = HashMap::default();
+                for &app in &opaque_array_apps {
+                    let TermData::App(symbol, args) = self.ctx.terms.get(app) else {
+                        continue;
+                    };
+                    if !super::recovery_admission::pay_for(
+                        self,
+                        symbol.name().len().saturating_add(1),
+                        128,
+                    ) {
+                        return (
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            HashSet::default(),
+                        );
+                    }
+                    let key = (symbol.name(), args.len());
+                    if let Some(&previous) = representatives.get(&key) {
+                        edges.push((previous, app));
+                    } else {
+                        representatives.insert(key, app);
+                    }
+                }
+            }
+        }
 
         edges.sort_by_key(|(lhs, rhs)| (lhs.index(), rhs.index()));
         edges.dedup();
@@ -1800,13 +2137,62 @@ impl Executor {
         )
     }
 
+    /// `store_edges_directed` orients the STRUCTURAL `store(result, base)`
+    /// edge base -> result and drops result -> base. It is correct ONLY for
+    /// `read_conflicted` seeds, whose meaning is "extraction dropped a
+    /// disputed cell on THIS term". Extraction attributes every select-derived
+    /// conflict to the peeled BASE variable, never to a store application
+    /// (`ay-theories/arrays/src/model.rs:227`), so a conflicted store RESULT
+    /// says nothing about its base: it is unresolvable exactly when its stored
+    /// VALUE or INDEX is -- `(store a x (f (select a x)))`, whose cell
+    /// `build_store_chain_interp` declines rather than read from possibly-dead
+    /// interior bits (`bv_model.rs:1633`, #store-chain-dead-node) -- while the
+    /// base stays independently reconstructed from its own committed reads.
+    /// Propagating result -> base wrote that innocent base into
+    /// `read_conflicted`, `array_from_model` refused it, the gate could not
+    /// evaluate the defining store expression, and a trivially satisfiable
+    /// query came back `unknown: model does not pin this leaf`. cb3abb55f
+    /// named exactly this damage ("spread `read_conflicted` from `arr` to the
+    /// innocent store BASE `a`") and removed one TRIGGER for it; this removes
+    /// the propagation itself. The orientation is already the house style one
+    /// layer down: `bv_model.rs:1179-1189` propagates base -> result only
+    /// ("A refused base poisons dependent definitions transitively"), and
+    /// every `bv_model` `read_conflicted` seed is inserted on the DEFINED var.
+    ///
+    /// It stays FALSE for the `incomplete_read_arrays` and
+    /// `discovered_conflicts` closures. Those seeds CAN be a store
+    /// APPLICATION -- `required_reads` admits any `select` whose first
+    /// argument is array-sorted, so `(select (store a x v) i)` seeds the STORE
+    /// term -- and `select(store(a,x,v), i) = select(a,i)` for `i != x`, so
+    /// there the result -> base direction is a real entailment: dropping it
+    /// would let the base take a fabricated `CompleteDefault` and manufacture
+    /// the value at a constrained cell, which the component-wide comment above
+    /// `incomplete_read_arrays` forbids. Neither closure is reached by the
+    /// query this repairs (measured: only the `conflict_seeds` call fires).
+    ///
+    /// Equality/alias edges are always undirected: two asserted-equal arrays
+    /// really are each other's evidence. Because `mk_eq` canonicalises operand
+    /// order by `TermId` and a hash-consed store's id always exceeds its own
+    /// base's, the predicate tests `args[0] == rhs` rather than merely "lhs is
+    /// a store", so an EQUALITY edge incident on the same store term is left
+    /// alone.
     fn propagate_array_completion_taint(
+        &self,
         edges: &[(TermId, TermId)],
         seeds: &HashSet<TermId>,
+        store_edges_directed: bool,
     ) -> HashSet<TermId> {
         let mut adjacency: HashMap<TermId, Vec<TermId>> = HashMap::default();
         for &(lhs, rhs) in edges {
-            adjacency.entry(lhs).or_default().push(rhs);
+            let structural_store = store_edges_directed
+                && matches!(
+                    self.ctx.terms.get(lhs),
+                    TermData::App(symbol, args)
+                        if symbol.name() == "store" && args.len() == 3 && args[0] == rhs
+                );
+            if !structural_store {
+                adjacency.entry(lhs).or_default().push(rhs);
+            }
             adjacency.entry(rhs).or_default().push(lhs);
         }
         let mut tainted = seeds.clone();
@@ -1916,6 +2302,7 @@ impl Executor {
         // to Unknown (#aufbv-uninterp-elem, assumption roots).
         let mut stack: Vec<TermId> = self.ctx.assertions.clone();
         stack.extend_from_slice(extra_roots);
+        let mut datatype_definitions = Vec::new();
         if let Some(authored) = self.self_check_authored_assertions.as_ref() {
             stack.extend_from_slice(authored);
         }
@@ -1925,6 +2312,14 @@ impl Executor {
             }
             if carrier_sort_key(self.ctx.terms.sort(tid), carrier_allowed(tid)).is_some() {
                 carrier_terms.push(tid);
+                if let Some(to) = self.datatype_carrier_definition(
+                    tid,
+                    allow_uninterpreted,
+                    authenticated_datatype_terms,
+                ) {
+                    datatype_definitions.push((tid, to));
+                    stack.push(to);
+                }
             }
             match self.ctx.terms.get(tid) {
                 TermData::App(sym, args) => {
@@ -1949,6 +2344,59 @@ impl Executor {
                 _ => {}
             }
         }
+        // 1b. The SOLVE's own uninterpreted-sort equality atoms. Preprocessing
+        //     can rewrite the assertions the SAT problem holds — variable
+        //     substitution turns `(= (f x) c0)` into `(= (f c0) c0)` once
+        //     `x = c0` eliminates `x` — so the atoms the SAT model commits are
+        //     not all reachable from the restored authored assertions above.
+        //     Without them the class of `(f x)` carried no commitment at all
+        //     and received a fresh element of its own, so
+        //     `(or (= (f x) c0) (= (f x) c1))` evaluated to false on a
+        //     satisfiable QF_UFBV problem (2026-10-09 audit lv9/lv10). Their
+        //     operands join the carriers; step 3 merges the atoms the model
+        //     assigns true and step 3b closes the classes under congruence.
+        //     Genuinely uninterpreted sorts only: a datatype is `Uninterpreted`
+        //     in the term store too, but on the eager DT+BV lane the solve's
+        //     datatype-sorted atoms outside the authored roots (ite-lifted
+        //     constructor biconditionals, atoms over extensionality
+        //     witnesses) are opaque Booleans whose SAT values no theory
+        //     constrains; merging on them gave two distinct constructor values
+        //     one element (ay-chc nested-vec counterexample, 2026-10-14).
+        //     Atoms of a genuinely uninterpreted sort over datatype selector or
+        //     ite terms are still admitted, a measured trade-off (they keep
+        //     vg_sat, a datatype with two distinct declare-sort tags, sat).
+        if allow_uninterpreted {
+            let mut committed_atoms: Vec<TermId> = model.term_to_var.keys().copied().collect();
+            committed_atoms.sort_by_key(|t| t.index());
+            for atom in committed_atoms {
+                // An atom reachable from the roots is already gathered.
+                if seen.contains(&atom) {
+                    continue;
+                }
+                let TermData::App(sym, args) = self.ctx.terms.get(atom) else {
+                    continue;
+                };
+                if sym.name() != "=" || args.len() != 2 {
+                    continue;
+                }
+                let (lhs, rhs) = (args[0], args[1]);
+                let lhs_sort = self.ctx.terms.sort(lhs);
+                if !is_genuinely_uninterpreted_sort(&self.ctx, lhs_sort)
+                    || lhs_sort != self.ctx.terms.sort(rhs)
+                    || carrier_sort_key(lhs_sort, carrier_allowed(lhs)).is_none()
+                    || carrier_sort_key(lhs_sort, carrier_allowed(rhs)).is_none()
+                {
+                    continue;
+                }
+                seen.insert(atom);
+                for operand in [lhs, rhs] {
+                    if seen.insert(operand) {
+                        carrier_terms.push(operand);
+                    }
+                }
+                eq_atoms.push((atom, lhs, rhs));
+            }
+        }
         if carrier_terms.is_empty() {
             return;
         }
@@ -1956,27 +2404,7 @@ impl Executor {
         let sequence_carrier_idx: HashSet<usize> = carrier_terms
             .iter()
             .enumerate()
-            .filter_map(|(idx, &term)| {
-                let opaque = match self.ctx.terms.get(term) {
-                    // Declared constants are opaque carrier leaves. Internal
-                    // variables can also be model points, but only when the
-                    // declaration registry owns their identity.
-                    TermData::Var(name, _) => self.ctx.symbol_info_by_identity(name).is_some(),
-                    // Use the shared authoritative builtin classifier and the
-                    // declaration registry. Native theory applications may
-                    // anchor a class through evaluation but can never receive
-                    // a completion value; only registered declared UFs can.
-                    TermData::App(sym, args) => {
-                        !args.is_empty()
-                            && !crate::features::is_builtin_symbol_name(sym.name())
-                            && self.ctx.symbol_info_by_identity(sym.name()).is_some()
-                            && !self.ctx.is_defined_fun(sym.name())
-                            && self.ctx.adopted_macro_interp(sym.name()).is_none()
-                    }
-                    _ => false,
-                };
-                (matches!(self.ctx.terms.sort(term), Sort::Seq(_)) && opaque).then_some(idx)
-            })
+            .filter_map(|(idx, &term)| self.is_opaque_seq_carrier(term).then_some(idx))
             .collect();
 
         // 2. Snapshot how each carrier term currently resolves. An existing
@@ -1991,6 +2419,13 @@ impl Executor {
         let mut resolved_seq: HashMap<usize, Vec<EvalValue>> = HashMap::default();
         let mut opaque_seq_class: HashMap<usize, String> = HashMap::default();
         let mut unknown_idx: Vec<usize> = Vec::new();
+        let mut defined_datatypes = HashSet::default();
+        for &(from, to) in &datatype_definitions {
+            let current = self.evaluate_term(model, from);
+            if matches!(current, EvalValue::Unknown) || current == self.evaluate_term(model, to) {
+                defined_datatypes.extend([from, to]);
+            }
+        }
         for (i, &t) in carrier_terms.iter().enumerate() {
             if let Some(elem) = model
                 .euf_model
@@ -2003,6 +2438,17 @@ impl Executor {
                     resolved_elem.insert(i, elem.clone());
                     continue;
                 }
+            }
+            // Both ends of an agreeing recorded datatype definition need raw
+            // class entries, including a replacement constructor already
+            // evaluatable as a concrete value. That value is not a class
+            // label: the later synthesized e-graph finds the constructor only
+            // through its own entry. Existing raw entries above remain
+            // authoritative; known concrete disagreements stay on the old
+            // conflict path without granting a definition-induced class link.
+            if defined_datatypes.contains(&t) {
+                unknown_idx.push(i);
+                continue;
             }
             match self.evaluate_term(model, t) {
                 EvalValue::Element(e) => {
@@ -2059,6 +2505,11 @@ impl Executor {
                 parent[ra] = rb;
             }
         };
+        for &(from, to) in &datatype_definitions {
+            if let (Some(&from), Some(&to)) = (index_of.get(&from), index_of.get(&to)) {
+                union(&mut parent, from, to);
+            }
+        }
         // A top-level assertion is true in every model; an `extra_roots`
         // assumption is enforced true for this `check_sat_assuming`, so a
         // positive `=` atom appearing as one merges its operands' classes (the
@@ -2086,6 +2537,12 @@ impl Executor {
             }
         }
 
+        // Reads of one array at model-equal indices are one element
+        // (#carrier-select-congruence, `completion/select_congruence.rs`).
+        for (first, read) in self.select_congruent_carrier_pairs(model, &carrier_terms) {
+            union(&mut parent, first, read);
+        }
+
         // EUF may already have assigned the same internal class label to two
         // sequence terms (notably congruent UF applications) even when there is
         // no surviving equality atom between their exact TermIds. Preserve
@@ -2098,6 +2555,23 @@ impl Executor {
             } else {
                 first_seq_class_member.insert((sort_key, class.clone()), idx);
             }
+        }
+
+        // 3b. Congruence closure over uninterpreted-sort carriers: two
+        //     applications of one declared function whose arguments are equal
+        //     in the model are one element. An argument that is itself a
+        //     carrier is equal through its class (or a shared committed
+        //     element); any other argument through its evaluated value. This
+        //     is what lets `(f x)` share the committed class of `(f c0)` once
+        //     `x` and `c0` are one class (step 1b).
+        if allow_uninterpreted {
+            self.close_carrier_classes_under_congruence(
+                model,
+                &carrier_terms,
+                &index_of,
+                &resolved_elem,
+                &mut parent,
+            );
         }
 
         // 4a. Canonical element per uninterpreted-sort class: preserve the
@@ -2310,6 +2784,8 @@ impl Executor {
         let mut synthesized_uninterpreted = 0usize;
         let mut synthesized_sequence = 0usize;
         if !new_values.is_empty() {
+            model.revoke_all_quantified_model_seals();
+            self.dt_egraph_assignment.replace(None);
             let euf_model = model.euf_model.get_or_insert_with(Default::default);
             for (t, sort_name, elem) in new_values {
                 if euf_model.term_values.contains_key(&t) {
@@ -2846,27 +3322,25 @@ impl Executor {
             freezes.push(freeze);
         }
 
-        let mut sub = Executor::new();
-        sub.ctx = self.ctx.clone();
-        sub.ctx.assertions = residual;
-        sub.ctx.assertions.extend(freezes);
-        sub.final_lia_resolve_disabled = true;
-        sub.set_deadline(Some(Instant::now() + Duration::from_millis(150)));
-
-        if !matches!(sub.check_sat(), Ok(result) if result.is_sat()) {
+        let Some(sub) = self.solve_ground_resolve_residual(residual, freezes) else {
             return 0;
-        }
+        };
         let Some(sub_model) = sub.last_model.as_ref() else {
             return 0;
         };
+        let sub_values: Vec<EvalValue> = super::with_isolated_eval_memo(|| {
+            targets
+                .iter()
+                .map(|&t| sub.evaluate_term(sub_model, t))
+                .collect()
+        });
 
         let snapshot = model.clone();
         let mut filled = 0usize;
-        for &target in &targets {
+        for (&target, value) in targets.iter().zip(sub_values) {
             if !matches!(self.evaluate_term(model, target), EvalValue::Unknown) {
                 continue;
             }
-            let value = sub.evaluate_term(sub_model, target);
             if !matches!(value, EvalValue::Rational(_)) {
                 continue;
             }
@@ -3043,9 +3517,21 @@ impl Executor {
         value: &EvalValue,
     ) -> bool {
         let well_sorted = match (terms.sort(var), value) {
+            (Sort::FiniteField(expected), EvalValue::FiniteField { value, field }) => {
+                expected == field && *value < field.modulus()
+            }
             (Sort::Bool, EvalValue::Bool(_)) => true,
             (Sort::Int, EvalValue::Rational(r)) => r.is_integer(),
             (Sort::Real, EvalValue::Rational(_)) => true,
+            (Sort::Complex, EvalValue::Complex { real, imaginary }) => {
+                matches!(
+                    real.as_ref(),
+                    EvalValue::Rational(_) | EvalValue::Algebraic(_)
+                ) && matches!(
+                    imaginary.as_ref(),
+                    EvalValue::Rational(_) | EvalValue::Algebraic(_)
+                )
+            }
             (Sort::BitVec(w), EvalValue::BitVec { width, .. }) => *width == w.width,
             (Sort::String, EvalValue::String(_))
             | (Sort::Seq(_), EvalValue::Seq(_))
@@ -3110,7 +3596,9 @@ impl Executor {
             // by `evaluate_var` only after every theory lookup missed).
             (Sort::String, EvalValue::String(_))
             | (Sort::Seq(_), EvalValue::Seq(_))
+            | (Sort::FiniteField(_), EvalValue::FiniteField { .. })
             | (Sort::RegLan, EvalValue::Element(_))
+            | (Sort::Complex, EvalValue::Complex { .. })
             | (Sort::Uninterpreted(_), EvalValue::Element(_)) => {
                 model.completed_values.insert(var, value.clone());
                 true
@@ -3149,7 +3637,28 @@ impl Executor {
         // certificate producer, rather than relying on each caller to remember
         // an ad-hoc cache clear.
         super::with_isolated_eval_memo(|| {
-            self.complete_quantified_output_model_before_seal_isolated(model, exact_roots)
+            self.complete_quantified_output_model_before_seal_isolated(
+                model,
+                exact_roots,
+                &mut OutputCompletionProgress::Existing,
+            )
+        })
+    }
+
+    /// The field producer retains the same completion semantics while paying
+    /// traversal and copies from its original attempt, before their allocation.
+    pub(in crate::executor) fn complete_field_output_model_before_seal(
+        &mut self,
+        model: &mut Model,
+        exact_roots: &[TermId],
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> bool {
+        super::with_isolated_eval_memo(|| {
+            self.complete_quantified_output_model_before_seal_isolated(
+                model,
+                exact_roots,
+                &mut OutputCompletionProgress::Original(progress),
+            )
         })
     }
 
@@ -3157,7 +3666,23 @@ impl Executor {
         &mut self,
         model: &mut Model,
         exact_roots: &[TermId],
+        progress: &mut OutputCompletionProgress<'_>,
     ) -> bool {
+        // Field proposals contain only scalar assignments; their immutable
+        // package is shared by Model clones. Price the legacy scalar map
+        // copies too, until that proposal has been frozen into the package.
+        let Some(assignments) = model
+            .completed_values
+            .len()
+            .checked_add(model.bool_overrides.len())
+        else {
+            return false;
+        };
+        if !progress.cells(assignments, std::mem::size_of::<(TermId, EvalValue)>())
+            || !progress.cells(exact_roots.len(), std::mem::size_of::<TermEntryStamp>())
+        {
+            return false;
+        }
         // Work on an unsealed semantic clone, publishing only after every check succeeds.
         // A false return leaves the caller's producer model byte-for-byte untouched.
         let mut completed = model.clone();
@@ -3169,13 +3694,19 @@ impl Executor {
         else {
             return false;
         };
-        let roots_are_current = |executor: &Executor| {
-            executor.ctx.source_context_stamp() == source_stamp
-                && root_entries.iter().copied().map(Some).eq(exact_roots
-                    .iter()
-                    .map(|&root| executor.ctx.terms.entry_stamp(root)))
-        };
-        if !roots_are_current(self)
+        let roots_are_current =
+            |executor: &Executor, progress: &mut OutputCompletionProgress<'_>| {
+                if executor.ctx.source_context_stamp() != source_stamp {
+                    return false;
+                }
+                for (&stamp, &root) in root_entries.iter().zip(exact_roots) {
+                    if !progress.pay(1, 0) || executor.ctx.terms.entry_stamp(root) != Some(stamp) {
+                        return false;
+                    }
+                }
+                true
+            };
+        if !roots_are_current(self, progress)
             || completed
                 .euf_model
                 .as_ref()
@@ -3189,8 +3720,22 @@ impl Executor {
         let mut seen = HashSet::default();
         let mut occurring_constants = HashSet::default();
         let mut occurring_functions = HashSet::default();
+        if !progress.cells(exact_roots.len(), std::mem::size_of::<TermId>()) {
+            return false;
+        }
         let mut stack = exact_roots.to_vec();
         while let Some(term) = stack.pop() {
+            if !progress.pay(1, 0) {
+                return false;
+            }
+            if seen.len() == seen.capacity()
+                && !progress.cells(
+                    seen.capacity().saturating_mul(2).max(8),
+                    std::mem::size_of::<TermId>(),
+                )
+            {
+                return false;
+            }
             if self.ctx.terms.entry_stamp(term).is_none() {
                 return false;
             }
@@ -3199,24 +3744,71 @@ impl Executor {
             }
             match self.ctx.terms.get(term) {
                 TermData::Var(_, _) => {
+                    if !progress.cells(1, std::mem::size_of::<TermId>()) {
+                        return false;
+                    }
                     occurring_constants.insert(term);
                 }
                 TermData::App(symbol, arguments) if !arguments.is_empty() => {
+                    if !progress.pay(symbol.name().len(), symbol.name().len())
+                        || !progress.cells(1, std::mem::size_of::<Symbol>())
+                    {
+                        return false;
+                    }
                     occurring_functions.insert(symbol.clone());
                 }
                 _ => {}
+            }
+            let children = match self.ctx.terms.get(term) {
+                TermData::App(_, args) => args.len(),
+                TermData::Not(_) => 1,
+                TermData::Ite(..) => 3,
+                _ => 0,
+            };
+            if !progress.cells(children, std::mem::size_of::<TermId>()) {
+                return false;
             }
             stack.extend(self.ctx.terms.children(term));
         }
         // Plan immutably. Which declarations may be completed at all is the
         // shared decision of `is_ordinary_free_primary_declaration`; what
         // follows is only this pass's extra, formula-neutral restriction.
+        if !progress.cells(
+            self.recorded_var_substitutions.len(),
+            std::mem::size_of::<TermId>(),
+        ) {
+            return false;
+        }
         let substituted: HashSet<TermId> =
             self.recorded_var_substitutions.keys().copied().collect();
         let mut constant_defaults = Vec::new();
+        let mut array_defaults = Vec::new();
         let mut function_defaults = Vec::new();
         for (surface_name, info) in self.ctx.symbol_iter() {
+            if !progress.pay(surface_name.len().saturating_add(1), 0) {
+                return false;
+            }
+            // Copy-safety inspection is needed for actual signature/array
+            // copies, not for an empty Seq default's borrowed deep sort.
+            if !info.arg_sorts.is_empty()
+                || matches!(&info.sort, Sort::Array(_) | Sort::Uninterpreted(_))
+            {
+                if !progress.sort(&info.sort) {
+                    return false;
+                }
+            }
+            for sort in &info.arg_sorts {
+                if !progress.sort(sort) {
+                    return false;
+                }
+            }
+            if !progress.cells(1, std::mem::size_of::<(TermId, EvalValue)>()) {
+                return false;
+            }
             let identity = self.ctx.symbol_identity_name(surface_name, info);
+            if !progress.pay(identity.len(), identity.len()) {
+                return false;
+            }
             let symbol = Symbol::named(identity);
             if !self.is_ordinary_free_primary_declaration(surface_name, info) {
                 continue;
@@ -3225,7 +3817,12 @@ impl Executor {
                 let Some(term) = info.term else {
                     return false;
                 };
-                if occurring_constants.contains(&term)
+                // A constant the quantifier preprocessing removed from every
+                // assertion is not constrained by the formula the theorem was
+                // proved over, however the authored roots spell it (B3).
+                let constrained = occurring_constants.contains(&term)
+                    && !self.is_preprocess_eliminated_constant(term, &[]);
+                if constrained
                     || substituted.contains(&term)
                     || !matches!(self.evaluate_term(&completed, term), EvalValue::Unknown)
                 {
@@ -3233,6 +3830,10 @@ impl Executor {
                 }
                 if let Some(default) = self.unconstrained_default_value(&info.sort) {
                     constant_defaults.push((term, default));
+                } else if let Some(array) =
+                    self.unmentioned_array_default(&completed, term, &info.sort)
+                {
+                    array_defaults.push((term, array));
                 }
                 continue;
             }
@@ -3271,12 +3872,39 @@ impl Executor {
             };
             function_defaults.push((binding, default));
         }
+        let levels = (usize::BITS - constant_defaults.len().leading_zeros()) as usize + 1;
+        let Some(sort_work) = constant_defaults.len().checked_mul(levels) else {
+            return false;
+        };
+        if !progress.pay(sort_work, 0) {
+            return false;
+        }
+        let levels = (usize::BITS - function_defaults.len().leading_zeros()) as usize + 1;
+        let mut names = 0usize;
+        for (binding, _) in &function_defaults {
+            if !progress.pay(1, 0) {
+                return false;
+            }
+            let Some(total) = names.checked_add(binding.symbol().name().len().saturating_add(1))
+            else {
+                return false;
+            };
+            names = total;
+        }
+        let Some(sort_work) = names.checked_mul(levels) else {
+            return false;
+        };
+        if !progress.pay(sort_work, 0)
+            || !progress.cells(function_defaults.len(), std::mem::size_of::<usize>())
+        {
+            return false;
+        }
         constant_defaults.sort_by_key(|(term, _)| term.index());
         constant_defaults.dedup_by_key(|(term, _)| *term);
         function_defaults
             .sort_by(|(left, _), (right, _)| left.symbol().name().cmp(right.symbol().name()));
 
-        if !roots_are_current(self) {
+        if !roots_are_current(self, progress) {
             return false;
         }
         let functions_filled = function_defaults.len();
@@ -3288,12 +3916,31 @@ impl Executor {
         }
         let mut constants_filled = 0usize;
         for (term, default) in constant_defaults {
+            if !progress.pay(1, 0) {
+                return false;
+            }
             if !Self::insert_completed_value(&self.ctx.terms, &mut completed, term, &default) {
                 return false;
             }
             constants_filled += 1;
         }
-        if !roots_are_current(self) {
+        let levels = (usize::BITS - array_defaults.len().leading_zeros()) as usize + 1;
+        let Some(sort_work) = array_defaults.len().checked_mul(levels) else {
+            return false;
+        };
+        if !progress.pay(sort_work, 0) {
+            return false;
+        }
+        array_defaults.sort_by_key(|(term, _)| term.index());
+        for (term, array) in array_defaults {
+            if !progress.pay(1, 0) {
+                return false;
+            }
+            let arrays = completed.array_model.get_or_insert_with(Default::default);
+            arrays.array_values.insert(term, array);
+            constants_filled += 1;
+        }
+        if !roots_are_current(self, progress) {
             return false;
         }
         *model = completed;
@@ -3737,6 +4384,12 @@ impl Executor {
             }
             return;
         }
+        // A RoundingMode value is one of the five modes, never a minted EUF
+        // element (`rm_concrete.rs`). An in-loop validated model has not seen
+        // the chosen modes: the outer funnel must validate it anew.
+        if self.concretize_rounding_mode_values(&mut model) {
+            self.last_model_validated = false;
+        }
         let occurring = self.collect_occurring_vars(extra_roots);
         let substituted: HashSet<TermId> =
             self.recorded_var_substitutions.keys().copied().collect();
@@ -3794,6 +4447,17 @@ impl Executor {
             self.last_statistics
                 .set_int("model_completion.constrained_gaps", filled_gaps as u64);
         }
+        // Gaps only a quantified assertion mentions: defaulted here, checked
+        // by the quantified gate below (B3).
+        let quantified_only =
+            self.complete_quantified_only_gaps(&mut model, &gap_vars, extra_roots);
+        if quantified_only > 0 {
+            self.last_model_validated = false;
+            self.last_statistics.set_int(
+                "model_completion.quantified_only_defaults",
+                quantified_only as u64,
+            );
+        }
 
         let repaired_defaults = self.complete_opaque_array_default_disequalities(&mut model);
         if repaired_defaults > 0 {
@@ -3820,7 +4484,7 @@ impl Executor {
         if arrays_changed {
             self.last_model_validated = false;
         }
-        if filled_gaps > 0 || repaired_defaults > 0 || arrays_changed {
+        if filled_gaps > 0 || quantified_only > 0 || repaired_defaults > 0 || arrays_changed {
             model.revoke_cegqi_uf_recompletion();
             self.cegqi_uf_recompletion_grant = None;
         }
@@ -4374,12 +5038,17 @@ impl Executor {
                 }
                 if value.is_none() {
                     value = match *sort {
-                        Sort::Int => self
-                            .extract_int_from_assertion_bounds(var)
-                            .map(|v| EvalValue::Rational(BigRational::from(v))),
+                        Sort::Int => {
+                            self.derive_int_from_true_equality_atom(model, var)
+                                .or_else(|| {
+                                    self.extract_int_from_assertion_bounds(var)
+                                        .map(|v| EvalValue::Rational(BigRational::from(v)))
+                                })
+                        }
                         Sort::Real => self
                             .extract_real_from_assertion_bounds(var)
                             .map(EvalValue::Rational),
+                        Sort::Complex => self.complex_completion_candidate(model, var),
                         // A Seq gap with `(seq.len s) = N` / `(seq.nth s i)`
                         // constraints: derive the witness those constraints
                         // pin (unconstrained cells complete to the element
@@ -4410,6 +5079,115 @@ impl Executor {
             // and use the canonical sort default directly.
             GapStrategy::SortDefault => self.unconstrained_default_value(sort),
         }
+    }
+
+    /// Count assertions that evaluate to definitively `Bool(false)` under
+    /// the primary evaluator. Used as the retract criterion for reconciled
+    /// pins: a candidate that increases this count is worse than the model
+    /// it would replace, whatever the lane-local authority claimed.
+    fn count_definitively_false_assertions(&self, model: &Model) -> usize {
+        self.ctx
+            .assertions
+            .iter()
+            .filter(|&&assertion| {
+                matches!(self.evaluate_term(model, assertion), EvalValue::Bool(false))
+            })
+            .count()
+    }
+
+    /// Derive an Int gap value from a SAT-true equality atom nested anywhere
+    /// in the assertions — typically a pin inside the satisfied disjunct of
+    /// a case-split transition. The lane that produced the model may solve
+    /// the formula bit-blasted (BV lane) and never value the Int variable
+    /// itself; top-level extraction (`extract_value_from_asserted_equalities`)
+    /// cannot see nested pins, so the gap would otherwise take the sort
+    /// default and falsify the very disjunct the SAT assignment satisfied.
+    ///
+    /// The equality atom must itself evaluate `Bool(true)` under the model
+    /// (its Tseitin/`bool_overrides` assignment, independent of the missing
+    /// variable value), its other side must evaluate to a concrete integer,
+    /// and every such true pin for this variable must agree on one value.
+    /// Returns `None` on no pin, disagreement, or scan-budget exhaustion.
+    /// The result is a completion CANDIDATE like every derived value here:
+    /// callers gate-check the completed model and retract on refutation, so
+    /// a wrong pin can never ship — it degrades to Unknown as before.
+    fn derive_int_from_true_equality_atom(&self, model: &Model, var: TermId) -> Option<EvalValue> {
+        // A substitution key is DEFINED by its RHS and completed by the
+        // substitution fixpoint; never pin one here (#substitution-key-skip).
+        if self.recorded_var_substitutions.contains_key(&var) {
+            return None;
+        }
+        // Cheap prefilter: pins only hide where Bool structure nests them.
+        // With only atomic assertions, top-level recovery already owns every
+        // pin, so skip the DAG walk entirely.
+        let has_compound_assertion =
+            self.ctx
+                .assertions
+                .iter()
+                .any(|&assertion| match self.ctx.terms.get(assertion) {
+                    TermData::App(sym, _) => {
+                        matches!(sym.name(), "or" | "and" | "=>" | "xor" | "ite")
+                    }
+                    TermData::Not(_) | TermData::Ite(..) => true,
+                    _ => false,
+                });
+        if !has_compound_assertion {
+            return None;
+        }
+        const MAX_VISITED: usize = 65_536;
+        let mut value: Option<num_bigint::BigInt> = None;
+        let mut visited = 0usize;
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = self.ctx.assertions.to_vec();
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            visited += 1;
+            if visited > MAX_VISITED {
+                return None;
+            }
+            let eq_sides = match self.ctx.terms.get(term) {
+                TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
+                    Some((args[0], args[1]))
+                }
+                _ => None,
+            };
+            if let Some((lhs, rhs)) = eq_sides {
+                let other = if lhs == var {
+                    Some(rhs)
+                } else if rhs == var {
+                    Some(lhs)
+                } else {
+                    None
+                };
+                if let Some(other) = other {
+                    // Atom truth comes from the SAT assignment itself
+                    // (`bool_overrides` / Tseitin model), NEVER from evaluating
+                    // the equality under the current variable values: the
+                    // whole point is that a lane-merged value may already
+                    // disagree with the assignment that satisfied the
+                    // disjunct, and evaluating would read that wrong value.
+                    let atom_true =
+                        model.bool_overrides.get(&term).copied().or_else(|| {
+                            self.term_value(&model.sat_model, &model.term_to_var, term)
+                        }) == Some(true);
+                    if atom_true {
+                        if let EvalValue::Rational(r) = self.evaluate_term(model, other) {
+                            if r.is_integer() {
+                                match &value {
+                                    None => value = Some(r.numer().clone()),
+                                    Some(existing) if *existing == *r.numer() => {}
+                                    Some(_) => return None,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            stack.extend(self.ctx.terms.children(term));
+        }
+        value.map(|v| EvalValue::Rational(BigRational::from(v)))
     }
 
     /// W3 (default ON, `--dpll-no-str-witness` kill switch): PER-VARIABLE retracting
@@ -4677,22 +5455,49 @@ impl Executor {
         ALPHABET[ord % ALPHABET.len()] as char
     }
 
-    /// Whether the strict oracles AND the independent model-check gate accept
-    /// the just-completed `model` as a valid SAT witness. Installs the model
-    /// temporarily (both checks read `last_result`/`last_model`) and restores.
+    /// Whether the SAT funnel would accept the just-completed `model`: its
+    /// strict policy, its select-congruence gate, and the independent
+    /// model-check gate. Installs the model temporarily (the checks read
+    /// `last_result`/`last_model`) and restores it.
+    ///
+    /// Every mutation here revokes `last_model_validated`, so
+    /// `finalize_sat_model_validation` re-judges the completed model, and a
+    /// retraction only returns to the snapshot it would judge otherwise. This
+    /// check must therefore be the funnel's own, neither stricter nor weaker.
+    /// * Strict: `verify_model_strict_with_scoped_authority`, as in the funnel.
+    ///   The raw oracle was stricter. An array completion had itself tainted
+    ///   (`read_conflicted`) left an authored assertion unevaluable, so
+    ///   `arrays-read-conflict-uneval` refused every candidate whatever it
+    ///   held. The funnel then waived the same verdict on the fully evaluated
+    ///   independent gate and published the retracted snapshot: `sat` with
+    ///   "model value for array a is not available" (QF_AUFBV `tN_t9101_074`).
+    /// * Select-congruence: the funnel degrades a model whose own reads
+    ///   disagree at one evaluated cell, even when every authored assertion
+    ///   holds. A candidate built for a read term such as `(select m0 (ite p x
+    ///   y))`, with `x = y` and `m0[y][0] = 3` asserted, can give that cell 0.
+    ///   Accepting it degraded `sat` to `unknown` (QF_AUFBV `qC_q8003_070`,
+    ///   `qC_q8003_191`); retracting it keeps the snapshot the funnel accepts.
     fn completed_gap_model_accepted(&mut self, model: &mut Model) -> bool {
         use ay_model_check::GateVerdict;
         self.last_model = Some(std::mem::replace(model, Model::empty()));
         let prev_result = self.last_result.clone();
         self.last_result = Some(SolveResult::Sat);
-        let strict_reject = self.verify_model_strict().is_some();
+        let strict_reject = self.verify_model_strict_with_scoped_authority().is_some();
         let gate_confirmed = matches!(
             self.confirm_sat_with_independent_gate(),
             GateVerdict::ConfirmedSat
         );
+        let roots_available = self.problem_has_array();
+        let congruence_violated = !strict_reject
+            && gate_confirmed
+            && roots_available.as_ref().copied().unwrap_or(true)
+            && self.last_model.as_ref().is_some_and(|installed| {
+                self.array_select_congruence_violated(installed)
+                    .unwrap_or(true)
+            });
         self.last_result = prev_result;
         *model = self.last_model.take().expect("installed above");
-        !strict_reject && gate_confirmed
+        roots_available.is_ok() && !strict_reject && gate_confirmed && !congruence_violated
     }
 
     /// The canonical completion default for an UNCONSTRAINED variable of a
@@ -4709,8 +5514,16 @@ impl Executor {
         sort: &Sort,
     ) -> Option<EvalValue> {
         match sort {
+            Sort::FiniteField(field) => Some(EvalValue::FiniteField {
+                value: 0,
+                field: *field,
+            }),
             Sort::Bool => Some(EvalValue::Bool(false)),
             Sort::Int | Sort::Real => Some(EvalValue::Rational(BigRational::zero())),
+            Sort::Complex => Some(EvalValue::Complex {
+                real: Box::new(EvalValue::Rational(BigRational::zero())),
+                imaginary: Box::new(EvalValue::Rational(BigRational::zero())),
+            }),
             Sort::BitVec(bv) => Some(EvalValue::BitVec {
                 value: BigInt::zero(),
                 width: bv.width,
@@ -4819,7 +5632,10 @@ impl Executor {
     /// bindings. Used as the conservative "possibly constrained" set for the
     /// unconstrained-constant sweep: a variable occurring anywhere in an
     /// assertion is never defaulted by that sweep.
-    fn collect_occurring_vars(&self, extra_roots: &[TermId]) -> HashSet<TermId> {
+    pub(in crate::executor) fn collect_occurring_vars(
+        &self,
+        extra_roots: &[TermId],
+    ) -> HashSet<TermId> {
         let terms = &self.ctx.terms;
         let mut seen: HashSet<TermId> = HashSet::default();
         let mut vars: HashSet<TermId> = HashSet::default();

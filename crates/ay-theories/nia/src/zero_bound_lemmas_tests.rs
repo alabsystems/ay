@@ -483,3 +483,285 @@ fn box_product_upper_exact_corner_not_over_tightened() {
          over-tighten the box cut; got {result:?}"
     );
 }
+
+/// Zero product: `x >= 2, x*y = 0, y >= 1` is UNSAT — a zero product with
+/// a factor bounded away from zero forces the other factor to zero.
+#[test]
+fn zero_product_forces_other_factor_zero_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let two = terms.mk_int(BigInt::from(2));
+    let x_ge2 = terms.mk_ge(x, two);
+    let prod_zero = terms.mk_eq(xy, zero);
+    let y_ge1 = terms.mk_ge(y, one);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_ge2, true);
+    solver.assert_literal(prod_zero, true);
+    solver.assert_literal(y_ge1, true);
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "x>=2, x*y=0, y>=1 must be UNSAT via the zero-product lemma, got {result:?}"
+    );
+}
+
+/// Zero product, negative side: `x <= -2, x*y = 0, y <= -1` is UNSAT.
+#[test]
+fn zero_product_negative_factor_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let neg_one = terms.mk_int(BigInt::from(-1));
+    let neg_two = terms.mk_int(BigInt::from(-2));
+    let x_le = terms.mk_le(x, neg_two);
+    let prod_zero = terms.mk_eq(xy, zero);
+    let y_le = terms.mk_le(y, neg_one);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_le, true);
+    solver.assert_literal(prod_zero, true);
+    solver.assert_literal(y_le, true);
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "x<=-2, x*y=0, y<=-1 must be UNSAT via the zero-product lemma, got {result:?}"
+    );
+}
+
+/// SOUNDNESS: `x >= 0, x*y = 0, y >= 1` is SAT (witness x = 0) — the lemma
+/// must require the factor to be bounded AWAY from zero, not merely signed.
+#[test]
+fn zero_product_signed_factor_not_over_strengthened() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let x_nonneg = terms.mk_ge(x, zero);
+    let prod_zero = terms.mk_eq(xy, zero);
+    let y_ge1 = terms.mk_ge(y, one);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_nonneg, true);
+    solver.assert_literal(prod_zero, true);
+    solver.assert_literal(y_ge1, true);
+
+    let result = solver.check();
+    assert!(
+        !is_unsat(&result),
+        "x>=0, x*y=0, y>=1 is satisfied by x=0 — an UNSAT would prove the \
+         false theorem that a signed factor cannot be zero; got {result:?}"
+    );
+}
+
+/// Chained zero product: `x >= 2, x*y = 0, y = z*z, z >= 1` is UNSAT —
+/// the zero-product step forces `y = 0`, contradicting `y = z*z >= 1`.
+#[test]
+fn zero_product_chained_through_square_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zz = terms.mk_mul(vec![z, z]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let two = terms.mk_int(BigInt::from(2));
+    let x_ge2 = terms.mk_ge(x, two);
+    let prod_zero = terms.mk_eq(xy, zero);
+    let y_eq_zz = terms.mk_eq(y, zz);
+    let z_ge1 = terms.mk_ge(z, one);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_ge2, true);
+    solver.assert_literal(prod_zero, true);
+    solver.assert_literal(y_eq_zz, true);
+    solver.assert_literal(z_ge1, true);
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "x>=2, x*y=0, y=z*z, z>=1 must be UNSAT via chained zero-product, got {result:?}"
+    );
+}
+
+/// Nested zero product: `x >= 2, x*(z*z) = 0, z >= 1` is UNSAT — the
+/// zero-product step on the binary outer monomial `[x, z*z]` forces the
+/// sub-monomial `z*z = 0`, contradicting `z >= 1`.
+#[test]
+fn zero_product_nested_square_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let zz = terms.mk_mul(vec![z, z]);
+    let xzz = terms.mk_mul(vec![x, zz]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let two = terms.mk_int(BigInt::from(2));
+    let x_ge2 = terms.mk_ge(x, two);
+    let prod_zero = terms.mk_eq(xzz, zero);
+    let z_ge1 = terms.mk_ge(z, one);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_ge2, true);
+    solver.assert_literal(prod_zero, true);
+    solver.assert_literal(z_ge1, true);
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "x>=2, x*(z*z)=0, z>=1 must be UNSAT via nested zero-product, got {result:?}"
+    );
+}
+
+/// Nonzero chain: `ai >= 0`, `ai*a(i+1) >= 1` for each link, finally
+/// `a_last * b = 0` with `b >= 1` is UNSAT (bounded enumeration decides
+/// it at theory level; the pipeline shape is pinned separately below).
+#[test]
+fn nonzero_chain_decided_unsat() {
+    let n = 60;
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let a: Vec<TermId> = (0..n)
+        .map(|i| terms.mk_var(format!("a{i}"), Sort::Int))
+        .collect();
+    let b = terms.mk_var("b", Sort::Int);
+
+    let mut atoms: Vec<TermId> = a.iter().map(|&ai| terms.mk_ge(ai, zero)).collect();
+    for w in a.windows(2) {
+        let prod = terms.mk_mul(vec![w[0], w[1]]);
+        atoms.push(terms.mk_ge(prod, one));
+    }
+    let last_prod = terms.mk_mul(vec![a[n - 1], b]);
+    atoms.push(terms.mk_eq(last_prod, zero));
+    atoms.push(terms.mk_ge(b, one));
+    let mut solver = NiaSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "nonzero chain must be UNSAT, got {result:?}"
+    );
+}
+
+/// SOUNDNESS: the same chain with `b >= 0` is SAT (all ai = 1, b = 0).
+#[test]
+fn nonzero_chain_sat_twin_not_over_strengthened() {
+    let n = 60;
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let a: Vec<TermId> = (0..n)
+        .map(|i| terms.mk_var(format!("a{i}"), Sort::Int))
+        .collect();
+    let b = terms.mk_var("b", Sort::Int);
+
+    let mut atoms: Vec<TermId> = a.iter().map(|&ai| terms.mk_ge(ai, zero)).collect();
+    for w in a.windows(2) {
+        let prod = terms.mk_mul(vec![w[0], w[1]]);
+        atoms.push(terms.mk_ge(prod, one));
+    }
+    let last_prod = terms.mk_mul(vec![a[n - 1], b]);
+    atoms.push(terms.mk_eq(last_prod, zero));
+    atoms.push(terms.mk_ge(b, zero));
+    let mut solver = NiaSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+
+    let result = solver.check();
+    assert!(
+        !is_unsat(&result),
+        "chain with b>=0 is satisfied by ai=1, b=0; got {result:?}"
+    );
+}
+
+/// Pipeline shape of the nonzero chain: root assertions installed (as the
+/// executor does) plus a solve deadline. The SAT-only local-search lane
+/// must not burn its shared wall budget ahead of bounded enumeration on
+/// an UNSAT instance enumeration decides immediately — the sliced
+/// first offer keeps the whole check far below the deadline.
+#[test]
+fn nonzero_chain_with_roots_decides_before_sls_budget() {
+    let n = 60;
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let a: Vec<TermId> = (0..n)
+        .map(|i| terms.mk_var(format!("a{i}"), Sort::Int))
+        .collect();
+    let b = terms.mk_var("b", Sort::Int);
+    let mut atoms: Vec<TermId> = a.iter().map(|&ai| terms.mk_ge(ai, zero)).collect();
+    for w in a.windows(2) {
+        let prod = terms.mk_mul(vec![w[0], w[1]]);
+        atoms.push(terms.mk_ge(prod, one));
+    }
+    let last_prod = terms.mk_mul(vec![a[n - 1], b]);
+    atoms.push(terms.mk_eq(last_prod, zero));
+    atoms.push(terms.mk_ge(b, one));
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.set_root_assertions(atoms.clone());
+    let deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(20);
+    solver.set_deadline(deadline);
+    solver.set_local_search_deadline(
+        ay_core::time::Instant::now() + std::time::Duration::from_secs(12),
+    );
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+
+    let start = ay_core::time::Instant::now();
+    let result = solver.check();
+    let elapsed = start.elapsed();
+    assert!(
+        is_unsat(&result),
+        "chain with roots installed must be UNSAT, got {result:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "check must decide via enumeration without burning the SLS budget, took {elapsed:?}"
+    );
+}
+
+/// Quotient bounds: `x = 3`-pinned via bounds, `x*y <= 7`, `y >= 3` is
+/// UNSAT because the fixed factor propagates `y <= 7/3` through the product.
+#[test]
+fn fixed_factor_quotient_bound_unsat() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let three = terms.mk_int(BigInt::from(3));
+    let seven = terms.mk_int(BigInt::from(7));
+    let x_ge = terms.mk_ge(x, three);
+    let x_le = terms.mk_le(x, three);
+    let prod_le = terms.mk_le(xy, seven);
+    let y_ge = terms.mk_ge(y, three);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(x_ge, true);
+    solver.assert_literal(x_le, true);
+    solver.assert_literal(prod_le, true);
+    solver.assert_literal(y_ge, true);
+
+    let result = solver.check();
+    assert!(
+        is_unsat(&result),
+        "x=3, x*y<=7, y>=3 must be UNSAT via the quotient bound, got {result:?}"
+    );
+}

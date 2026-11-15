@@ -7,6 +7,9 @@ use crate::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::sync::Arc;
 
+#[path = "model_extract_tests/datatypes.rs"]
+mod datatypes;
+
 #[test]
 fn test_get_term_value_ite_uses_then_branch_when_condition_true() {
     let mut ctx = SmtContext::new();
@@ -281,7 +284,7 @@ fn test_term_to_chc_expr_preserves_datatype_sort_metadata() {
     let mut ctx = SmtContext::new();
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkPair".to_string(),
             selectors: vec![
                 ChcDtSelector {

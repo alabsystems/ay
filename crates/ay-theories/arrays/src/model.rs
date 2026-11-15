@@ -240,6 +240,8 @@ impl ArraySolver<'_> {
             }
         }
 
+        self.complete_equal_model_carriers(&mut model, term_values);
+
         // #7435: Propagate interpretations across EUF equivalence classes.
         // When UF establishes equality between array terms (e.g.,
         // seq_array(seq_empty) = const_array(0)), terms in the same class
@@ -281,7 +283,26 @@ impl ArraySolver<'_> {
                 }
             }
 
+            // #store-chain-class-candidate: the class reconciliation builds a
+            // SECOND candidate instead of editing the first. It honours every
+            // TRUE store-chain equality the solver holds, including the ones
+            // only the eager fixpoint's own lemmas mention, whose written
+            // indices the lazy search never related; so on some assignments it
+            // repairs the model the equality needs (the hunt's d4b_free_bases
+            // witness, fresh finstore) and on others it writes cells an input
+            // assertion then contradicts (fresh incr2_2809_0051's second query:
+            // `c` took cells of `(store a k 5)`, falsifying
+            // `(= (as const 1) (store c k 1))`, while the model without it was
+            // valid). The executor's SAT funnel tries this candidate only after
+            // the gates refused the first one, so neither construction can cost
+            // a verdict the other one earns.
+            let mut reconciled = model.clone();
+            self.reconcile_store_chain_classes(&mut reconciled, term_values);
+            self.fill_missing_array_defaults(&mut reconciled);
             self.fill_missing_array_defaults(&mut model);
+            if reconciled.array_values != model.array_values {
+                model.store_chain_class_candidate = Some(reconciled.array_values);
+            }
         }
 
         if ay_core::misc_cli_flags().debug_arr_extract {
@@ -293,9 +314,77 @@ impl ArraySolver<'_> {
                     t.0, i.default, i.stores
                 );
             }
+            if let Some(candidate) = &model.store_chain_class_candidate {
+                let mut rows: Vec<_> = candidate.iter().collect();
+                rows.sort_by_key(|(t, _)| t.0);
+                for (t, i) in rows {
+                    eprintln!(
+                        "[arr-extract] CLASS-CANDIDATE arr={} default={:?} stores={:?}",
+                        t.0, i.default, i.stores
+                    );
+                }
+            }
         }
 
         model
+    }
+
+    /// Recover observations for array applications merged by EUF rather than
+    /// by an explicit array equality. This changes only the candidate model;
+    /// carrier names never become assertions or solver equality edges.
+    fn complete_equal_model_carriers(
+        &self,
+        model: &mut ArrayModel,
+        term_values: &HashMap<TermId, String>,
+    ) {
+        let mut classes: HashMap<(Sort, String), Vec<TermId>> = HashMap::default();
+        // Rewritten-away applications can remain in the original roots while
+        // being absent from the active array cache. Their final EUF valuation,
+        // rather than cache membership, determines which views need completion.
+        for (&array, carrier) in term_values {
+            if array.index() >= self.terms.len()
+                || !matches!(self.terms.sort(array), Sort::Array(_))
+                || carrier.is_empty()
+            {
+                continue;
+            }
+            classes
+                .entry((self.terms.sort(array).clone(), carrier.clone()))
+                .or_default()
+                .push(array);
+        }
+        for members in classes.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            if members
+                .iter()
+                .any(|member| model.read_conflicted.contains(member))
+            {
+                model.read_conflicted.extend(members.iter().copied());
+                continue;
+            }
+            let best = members
+                .iter()
+                .filter_map(|member| model.array_values.get(member).map(|value| (*member, value)))
+                .max_by_key(|(member, value)| {
+                    (
+                        usize::from(value.default.is_some()),
+                        value.stores.len(),
+                        std::cmp::Reverse(member.index()),
+                    )
+                })
+                .map(|(_, value)| value.clone());
+            let Some(best) = best else { continue };
+            for &member in members {
+                // Preserve existing observations and constructor semantics.
+                // Conflicting interpretations still reach the normal gates.
+                model
+                    .array_values
+                    .entry(member)
+                    .or_insert_with(|| best.clone());
+            }
+        }
     }
 
     /// Give every array interpretation that still lacks an `else` value one the
@@ -396,6 +485,51 @@ impl ArraySolver<'_> {
                     continue;
                 };
                 if let Some(interp) = model.array_values.get_mut(&term) {
+                    if interp.default.is_none() {
+                        interp.default = Some(value);
+                        changed = true;
+                    }
+                }
+            }
+
+            // STORE CHAIN, the other direction: `b` has the same `else` value
+            // as `store(b, i, v)`, since the two agree everywhere but `i`. A
+            // base the solver only observed through reads (`select`-derived
+            // cells, no default) otherwise gets its `else` value invented by
+            // the renderer even though an equality on one of its store parents
+            // already fixed it: `(= (store (const x) 2 ..) (store (store a0 ..)
+            // ..))` pins every unwritten cell of `a0` to `x`, and printing
+            // `a0` with some other else value falsifies the asserted equality
+            // (2026-09-23 hunt storeeq41 files, gate `model-violates`). Taken
+            // only when every store parent that carries a default agrees.
+            let mut from_parents: HashMap<TermId, Option<String>> = HashMap::default();
+            for (&store, &(base, _, _)) in &self.store_cache {
+                let Some(value) = model
+                    .array_values
+                    .get(&store)
+                    .and_then(|interp| interp.default.clone())
+                else {
+                    continue;
+                };
+                if !model
+                    .array_values
+                    .get(&base)
+                    .is_some_and(|interp| interp.default.is_none())
+                {
+                    continue;
+                }
+                from_parents
+                    .entry(base)
+                    .and_modify(|agreed| {
+                        if agreed.as_ref() != Some(&value) {
+                            *agreed = None;
+                        }
+                    })
+                    .or_insert(Some(value));
+            }
+            for (base, value) in from_parents {
+                let Some(value) = value else { continue };
+                if let Some(interp) = model.array_values.get_mut(&base) {
                     if interp.default.is_none() {
                         interp.default = Some(value);
                         changed = true;

@@ -69,7 +69,7 @@ use ay_chc::{
 use ay_dpll::api::{Solver, Sort, Term, TermKind};
 
 use super::{
-    cache_string, ffi_count_within_limit, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
+    cache_string, ffi_count_within_limit, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_produced,
     ffi_guard_ptr, ffi_guard_void, finite_set_decision_gate, record_ast_sort,
     require_term_ast_or_return, term_to_ast, FixedpointHandle, FixedpointLemmaHint,
     RegisteredRelation, Z3_ast, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol,
@@ -380,7 +380,9 @@ pub unsafe extern "C" fn Z3_fixedpoint_to_string(
             }
             for &rule in &handle.rules {
                 out.push_str("(rule ");
-                let rendered = ctx.solver.format_term(rule);
+                let Some(rendered) = super::finite_field::format_public_term(ctx, rule) else {
+                    return ptr::null();
+                };
                 out.push_str(&super::ffi_surface_text(ctx, &rendered));
                 out.push_str(")\n");
             }
@@ -393,7 +395,9 @@ pub unsafe extern "C" fn Z3_fixedpoint_to_string(
                     ptr::null()
                 );
                 out.push_str("(query ");
-                let rendered = ctx.solver.format_term(query);
+                let Some(rendered) = super::finite_field::format_public_term(ctx, query) else {
+                    return ptr::null();
+                };
                 out.push_str(&super::ffi_surface_text(ctx, &rendered));
                 out.push_str(")\n");
             }
@@ -418,7 +422,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_answer(c: Z3_context, d: Z3_fixedpoin
     }
     // SAFETY: see ffi_guard_ast; `d` is kept alive by the context arena.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let handle = &*d;
             let value = match handle.last_status {
                 Z3_L_TRUE => true,
@@ -427,8 +431,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_answer(c: Z3_context, d: Z3_fixedpoin
             };
             let term = ctx.solver.bool_const(value);
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, Sort::Bool);
-            ast
+            record_ast_sort(ctx, ast, Sort::Bool)
         })
     }
 }

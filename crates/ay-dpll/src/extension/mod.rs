@@ -273,7 +273,16 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
             // High ratio = SAT is wandering, theory should guide every decision.
             // Low ratio = conflict-driven learning is productive, let VSIDS
             // dominate.
-            decisions > 100
+            //
+            // `theory_every_decision_enabled` is the per-executor opt-out
+            // (CHC BMC cex lane): on wide lustre unrollings the wandering
+            // ratio trips immediately (hundreds of decisions per conflict
+            // with direct-only propagation) and the every-decision
+            // round-robin then enumerates theory-atom assignments the LP model
+            // happens to be consistent with, 10-100x more decisions than the
+            // 1-in-2 gating (BMC_T6_model_search_2026-09-19 §4).
+            self.theory_every_decision_enabled
+                && decisions > 100
                 && decisions
                     .checked_div(conflicts)
                     .is_none_or(|ratio| ratio > 10)
@@ -608,6 +617,11 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         if !phase_hint::phase_epoch_skip_disabled() {
             if let Some(epoch) = self.theory.phase_hint_epoch() {
                 if self.last_seed_epoch.get() == Some(epoch) {
+                    // #nonlinear-phase-hints: the theory promised that an
+                    // unchanged epoch means unchanged suggestions. Debug
+                    // builds hold it to that on every skip.
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_epoch_skip_is_value_exact(epoch);
                     return;
                 }
                 self.last_seed_epoch.set(Some(epoch));
@@ -634,6 +648,8 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        self.debug_record_seed_hints();
     }
 
     fn explain_lazy_reason(
@@ -685,6 +701,38 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
             .iter()
             .filter_map(|term| self.term_to_var.get(term).map(|&v| Variable::new(v)))
             .collect()
+    }
+}
+
+/// #nonlinear-phase-hints: debug-build canary for the phase-epoch skip. A
+/// theory that reports `phase_hint_epoch` promises that an unchanged epoch
+/// means an unchanged `suggest_phase` for every atom; the two methods below
+/// record every suggestion at a full seed and re-derive every one on a skip.
+#[cfg(debug_assertions)]
+impl<T: TheorySolver> TheoryExtension<'_, T> {
+    fn debug_record_seed_hints(&self) {
+        let mut hints = self.last_seed_hints.borrow_mut();
+        hints.clear();
+        hints.extend(
+            self.seed_index
+                .iter()
+                .map(|&(_, atom)| self.theory.suggest_phase(atom)),
+        );
+    }
+
+    fn debug_assert_epoch_skip_is_value_exact(&self, epoch: u64) {
+        let hints = self.last_seed_hints.borrow();
+        if hints.len() != self.seed_index.len() {
+            return; // no full seed recorded yet for this index
+        }
+        for (&(_, atom), &recorded) in self.seed_index.iter().zip(hints.iter()) {
+            let now = self.theory.suggest_phase(atom);
+            assert_eq!(
+                now, recorded,
+                "phase-hint epoch {epoch} unchanged but suggest_phase({atom:?}) moved: \
+                 the theory's epoch does not cover something suggest_phase reads"
+            );
+        }
     }
 }
 

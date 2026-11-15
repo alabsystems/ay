@@ -1,8 +1,10 @@
-"""Focused resource-envelope tests for PB, rewrite-oracle, and SAT drivers."""
+"""Shared isolation tests and resource-envelope tests for rewrite/SAT drivers."""
 
 import importlib.util
+import io
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -18,7 +20,6 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import _oom_guard as oom_guard  # noqa: E402
-import pb_sweep  # noqa: E402
 import rewrite_oracle_check  # noqa: E402
 
 if not hasattr(os, "killpg"):
@@ -139,18 +140,46 @@ class CgroupDiscoveryTest(unittest.TestCase):
         self.assertEqual(found, 1)
 
 
+def _read_ready_pid(stream, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    received = b""
+    while b"\n" not in received:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+            raise AssertionError("guarded child did not publish complete readiness")
+        chunk = os.read(stream.fileno(), 64)
+        if not chunk:
+            raise AssertionError("guarded child closed stdout before readiness")
+        received += chunk
+        if len(received) > 64:
+            raise AssertionError("guarded child readiness exceeded its bound")
+    text, _, extra = received.partition(b"\n")
+    if extra or not text.isdigit() or int(text) <= 1:
+        raise AssertionError("guarded child published invalid readiness")
+    return int(text)
+
+
+def _pipe_reaches_eof(stream, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+            return False
+        if not os.read(stream.fileno(), 4096):
+            return True
+
+
 class GuardCancellationTest(unittest.TestCase):
     def test_ancestor_walk_reaches_direct_parent(self):
         self.assertIn(os.getppid(), oom_guard._ancestor_pids())
 
     def test_run_cli_kills_child_group_when_wrapper_receives_sigterm(self):
-        with tempfile.TemporaryDirectory() as directory:
-            pid_file = Path(directory, "child.pid")
-            child_code = (
-                "import os,time\n"
-                f"open({str(pid_file)!r},'w').write(str(os.getpid()))\n"
-                "time.sleep(60)\n"
-            )
+        child_code = (
+            "import os,time\n"
+            "print(os.getpid(), flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        with tempfile.TemporaryFile() as wrapper_stderr:
             wrapper = subprocess.Popen(
                 [
                     sys.executable,
@@ -163,28 +192,126 @@ class GuardCancellationTest(unittest.TestCase):
                     "-c",
                     child_code,
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=wrapper_stderr,
             )
-            for _ in range(200):
-                if pid_file.exists():
-                    break
-                time.sleep(0.01)
-            self.assertTrue(pid_file.exists(), "guarded child did not start")
-            child_pid = int(pid_file.read_text())
-            wrapper.send_signal(signal.SIGTERM)
-            self.assertEqual(wrapper.wait(timeout=10), 128 + signal.SIGTERM)
-            for _ in range(200):
-                stat_path = Path(f"/proc/{child_pid}/stat")
+            child_pid = child_identity = None
+            try:
+                child_pid = _read_ready_pid(wrapper.stdout, 2)
+                child_identity = oom_guard._watch_process_identity(child_pid)
+                self.assertIsNotNone(child_identity, "guarded child birth unavailable")
+                self.assertEqual(oom_guard._safe_getpgid(child_pid), child_pid)
+                wrapper.send_signal(signal.SIGTERM)
+                self.assertEqual(wrapper.wait(timeout=10), 128 + signal.SIGTERM)
+                # This known child holds stdout throughout its sleep. EOF proves
+                # exit on POSIX hosts without treating an absent /proc as death.
+                self.assertTrue(
+                    _pipe_reaches_eof(wrapper.stdout, 2),
+                    "guarded child survived wrapper cancellation",
+                )
+            finally:
+                primary_error = sys.exc_info()[1]
                 try:
-                    stat = stat_path.read_text()
-                    zombie = stat.rsplit(")", 1)[1].strip().startswith("Z")
-                except OSError:
-                    zombie = True
-                if zombie:
-                    break
-                time.sleep(0.01)
-            self.assertTrue(zombie, "guarded child survived wrapper cancellation")
+                    try:
+                        if wrapper.poll() is None:
+                            wrapper.terminate()
+                        try:
+                            wrapper.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            wrapper.kill()
+                            wrapper.wait(timeout=10)
+                    finally:
+                        try:
+                            if child_identity is not None:
+                                oom_guard._terminate_process_group_if_authenticated(
+                                    wrapper, child_pid, child_identity
+                                )
+                        finally:
+                            self.assertTrue(
+                                _pipe_reaches_eof(wrapper.stdout, 2),
+                                "guarded child cleanup did not reach EOF",
+                            )
+                except BaseException as cleanup_error:
+                    if primary_error is not None:
+                        raise cleanup_error from primary_error
+                    raise
+                finally:
+                    wrapper.stdout.close()
+                    if primary_error is not None or sys.exc_info()[1] is not None:
+                        try:
+                            wrapper_stderr.seek(0)
+                            captured = wrapper_stderr.read(65537)
+                            print(
+                                f"guarded wrapper returncode={wrapper.returncode}; "
+                                f"wrapper_reaped={wrapper.returncode is not None}; "
+                                f"stderr_first_65536_bytes={captured[:65536]!r}; "
+                                f"truncated={len(captured) > 65536}",
+                                file=sys.stderr,
+                            )
+                        except (OSError, ValueError):
+                            # Reporting must not replace the original failure.
+                            pass
+
+
+class GuardFailureDiagnosticsTest(unittest.TestCase):
+    def _failed_wrapper(self, payload, *, fail_cleanup=False):
+        real_popen = subprocess.Popen
+        children = []
+
+        def spawn_failure(argv, **kwargs):
+            self.assertEqual(argv[1], str(SCRIPTS / "_oom_guard.py"))
+            child = real_popen(
+                [sys.executable, "-c",
+                 f"import sys; sys.stderr.buffer.write({payload!r}); sys.exit(23)"],
+                **kwargs,
+            )
+            children.append(child)
+            try:
+                child.wait(timeout=10)
+            except BaseException:
+                child.kill()
+                child.wait(timeout=10)
+                raise
+            return child
+
+        captured = io.StringIO()
+        expected = ("guarded child cleanup did not reach EOF" if fail_cleanup
+                    else "guarded child closed stdout before readiness")
+        case = GuardCancellationTest(
+            "test_run_cli_kills_child_group_when_wrapper_receives_sigterm"
+        )
+        with mock.patch.object(subprocess, "Popen", side_effect=spawn_failure), \
+             mock.patch.object(sys, "stderr", captured):
+            if fail_cleanup:
+                with mock.patch(__name__ + "._pipe_reaches_eof", return_value=False):
+                    with self.assertRaisesRegex(AssertionError, expected) as caught:
+                        case.test_run_cli_kills_child_group_when_wrapper_receives_sigterm()
+            else:
+                with self.assertRaisesRegex(AssertionError, expected) as caught:
+                    case.test_run_cli_kills_child_group_when_wrapper_receives_sigterm()
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].returncode, 23)
+        output = captured.getvalue()
+        self.assertIn("returncode=23", output)
+        self.assertIn("wrapper_reaped=True", output)
+        return output, caught.exception
+
+    def test_readiness_failure_retains_raw_stderr_after_reaping(self):
+        output, _ = self._failed_wrapper(b"guard refused: \xff\n")
+        self.assertIn("guard refused: \\xff", output)
+        self.assertIn("truncated=False", output)
+
+    def test_cleanup_failure_preserves_cause_and_stderr(self):
+        output, error = self._failed_wrapper(b"guard cleanup diagnostic\n",
+                                             fail_cleanup=True)
+        self.assertIn("guard cleanup diagnostic", output)
+        self.assertIsInstance(error.__cause__, AssertionError)
+        self.assertIn("closed stdout before readiness", str(error.__cause__))
+
+    def test_failure_stderr_capture_is_bounded(self):
+        output, _ = self._failed_wrapper(b"A" * 65537)
+        self.assertIn("truncated=True", output)
+        self.assertLess(len(output), 66000)
 
 
 class DirectRunnerEnvelopeTest(unittest.TestCase):
@@ -194,28 +321,6 @@ class DirectRunnerEnvelopeTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def test_pb_runner_applies_env_and_records_envelope(self):
-        with tempfile.TemporaryDirectory() as directory:
-            solver = self._solver(
-                directory,
-                "test \"$MEMLIMIT\" = 4096 || exit 91\n"
-                "test \"$NBCORE\" = 2 || exit 92\n"
-                "printf 's SATISFIABLE\\n'\n",
-            )
-            instance = Path(directory, "case.opb")
-            instance.write_text("* #variable= 0 #constraint= 0\n")
-            envelope = {"memlimit_mb_per_child": 4096, "nbcore_per_child": 2}
-            result = pb_sweep.run_one(
-                "reference",
-                str(solver),
-                str(instance),
-                2.0,
-                env=dict(os.environ, MEMLIMIT="4096", NBCORE="2"),
-                memlimit_mb=4096,
-                resource_envelope=envelope,
-            )
-        self.assertEqual(result["status"], "sat", result)
-        self.assertEqual(result["resource_envelope"], envelope)
 
     def test_rewrite_runner_applies_memory_and_core_envelope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -260,39 +365,6 @@ class PersistedEnvelopeTest(unittest.TestCase):
         jobs=1, memlimit_mb=3072, nbcore=2, headroom_mb=1024
     )
 
-    def test_pb_main_makes_plan_authoritative_and_persists_it(self):
-        with tempfile.TemporaryDirectory() as directory:
-            corpus = Path(directory, "corpus")
-            corpus.mkdir()
-            Path(corpus, "case.opb").write_text(
-                "* #variable= 0 #constraint= 0\n"
-            )
-            output = Path(directory, "result.json")
-            argv = [
-                "pb_sweep.py",
-                "--dir",
-                str(corpus),
-                "--workers",
-                "3",
-                "--mem-mb",
-                "2048",
-                "--out",
-                str(output),
-            ]
-            fake = {"solver": "ay", "file": "case.opb", "status": "sat",
-                    "obj": None, "time": 0.1}
-            with mock.patch.object(sys, "argv", argv), \
-                 mock.patch.object(pb_sweep, "warn_concurrent_build"), \
-                 mock.patch.object(pb_sweep, "plan_solver_resources",
-                                   return_value=self.PLAN), \
-                 mock.patch.object(pb_sweep, "run_one", return_value=fake) as run:
-                pb_sweep.main()
-            payload = json.loads(output.read_text())
-            kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs["env"]["MEMLIMIT"], "2048")
-        self.assertEqual(kwargs["env"]["NBCORE"], "2")
-        self.assertEqual(payload["resource_plan"]["workers"], 1)
-        self.assertEqual(payload["resource_plan"]["memlimit_mb_per_child"], 2048)
 
     def test_rewrite_main_persists_plan_and_results(self):
         with tempfile.TemporaryDirectory() as directory:

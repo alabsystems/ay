@@ -20,17 +20,41 @@ impl ModResidueHintProvider {
 
     pub(super) fn extract_mod_terms(expr: &ChcExpr) -> Vec<(ChcExpr, i128)> {
         let mut terms = Vec::new();
-        Self::extract_mod_terms_recursive(expr, &mut terms);
+        Self::extract_mod_terms_recursive(expr, &mut terms, &mut Default::default());
         terms
     }
 
+    /// `(dividend, divisor)` pairs, which the caller sorts and deduplicates:
+    /// each distinct (shared) sub-term is visited once (the tree walk this
+    /// replaced was exponential in the nesting of shared sub-terms).
     pub(super) fn extract_divisibility_terms(expr: &ChcExpr) -> Vec<(ChcExpr, i128)> {
-        let mut terms = Vec::new();
-        Self::extract_divisibility_terms_recursive(expr, &mut terms);
-        terms
+        let mut out = Vec::new();
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
+            ChcExpr::Op(ChcOp::Mul, args) => {
+                if let Some((coeff, scaled_expr)) = Self::const_coeff_times_expr(args) {
+                    Self::extract_divisibility_from_scaled_expr(&scaled_expr, coeff, &mut out);
+                }
+                crate::expr::dag::Step::Descend
+            }
+            ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::FuncApp(..) => {
+                crate::expr::dag::Step::Descend
+            }
+            _ => crate::expr::dag::Step::Skip,
+        });
+        out
     }
 
-    fn extract_mod_terms_recursive(expr: &ChcExpr, out: &mut Vec<(ChcExpr, i128)>) {
+    /// `walked`: sub-terms already visited. A repeat visit would only append
+    /// pairs the caller's dedup drops (the tree walk was exponential in the
+    /// nesting of shared sub-terms); a `mod` searches its dividend only.
+    fn extract_mod_terms_recursive(
+        expr: &ChcExpr,
+        out: &mut Vec<(ChcExpr, i128)>,
+        walked: &mut ay_core::kani_compat::DetHashSet<*const ChcExpr>,
+    ) {
+        if !walked.insert(std::ptr::from_ref(expr)) {
+            return;
+        }
         crate::expr::maybe_grow_expr_stack(|| match expr {
             ChcExpr::Op(ChcOp::Mod, args) if args.len() == 2 => {
                 if let ChcExpr::Int(k) = args[1].as_ref() {
@@ -39,40 +63,16 @@ impl ModResidueHintProvider {
                         Self::extract_vars_from_dividend(&args[0], *k, out);
                     }
                 }
-                Self::extract_mod_terms_recursive(&args[0], out);
+                Self::extract_mod_terms_recursive(&args[0], out, walked);
             }
             ChcExpr::Op(_, args) => {
                 for arg in args {
-                    Self::extract_mod_terms_recursive(arg, out);
+                    Self::extract_mod_terms_recursive(arg, out, walked);
                 }
             }
             ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
                 for arg in args {
-                    Self::extract_mod_terms_recursive(arg, out);
-                }
-            }
-            _ => {}
-        });
-    }
-
-    fn extract_divisibility_terms_recursive(expr: &ChcExpr, out: &mut Vec<(ChcExpr, i128)>) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Op(ChcOp::Mul, args) => {
-                if let Some((coeff, scaled_expr)) = Self::const_coeff_times_expr(args) {
-                    Self::extract_divisibility_from_scaled_expr(&scaled_expr, coeff, out);
-                }
-                for arg in args {
-                    Self::extract_divisibility_terms_recursive(arg, out);
-                }
-            }
-            ChcExpr::Op(_, args) => {
-                for arg in args {
-                    Self::extract_divisibility_terms_recursive(arg, out);
-                }
-            }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                for arg in args {
-                    Self::extract_divisibility_terms_recursive(arg, out);
+                    Self::extract_mod_terms_recursive(arg, out, walked);
                 }
             }
             _ => {}

@@ -65,7 +65,26 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCH = Path(os.environ.get("AY_BENCH_ROOT", ROOT / "benchmarks/smtlib-all"))
 
 AY = os.environ.get("AY_BIN", str(ROOT / "target/release/ay"))
-Z3 = os.environ.get("Z3_BIN", "z3")
+
+sys.path.insert(0, str(ROOT / "scripts"))
+import _z3_oracle  # noqa: E402
+
+
+def _resolve_z3():
+    """z3 is the FIRST adjudication oracle, and it must be z3. $Z3_BIN is an
+    explicit choice; without it the z3 oracle is resolved by scripts/_z3_oracle.py
+    (Z3_PATH, else the first z3 on PATH that proves it is z3, past reroute
+    stubs). A bare `z3` used to reach whatever answered to the name: under a
+    reroute stub that refuses, every z3 verdict read as "none" and the sweep
+    lost an oracle without saying so. Returns (oracle, None) or (None, why)."""
+    try:
+        return _z3_oracle.resolve_z3_spelling(os.environ.get("Z3_BIN", "z3")), None
+    except _z3_oracle.Z3Unavailable as error:
+        return None, str(error)
+
+
+Z3_ORACLE, Z3_UNAVAILABLE = _resolve_z3()
+Z3 = Z3_ORACLE.path if Z3_ORACLE else None
 
 
 def _resolve_cvc5():
@@ -259,7 +278,11 @@ def main():
 
     print(f"AY      : {AY}")
     print(f"corpus  : {BENCH}")
-    print(f"z3      : {shutil.which(Z3) or Z3}")
+    if Z3_ORACLE is None:
+        print(f"{RED}REFUSING{OFF}: no usable z3 oracle ({Z3_UNAVAILABLE}); install z3, "
+              f"or set Z3_BIN / Z3_PATH to its path.", file=sys.stderr)
+        return 2
+    print(f"z3      : {Z3_ORACLE.identity()}")
     # A degraded oracle set must be impossible to miss. Adjudication with one
     # oracle is strictly weaker, and the banner below used to claim "z3 + cvc5"
     # unconditionally while cvc5 was absent.

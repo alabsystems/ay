@@ -1,0 +1,22 @@
+; Copyright 2026 Andrew Yates
+; SPDX-License-Identifier: Apache-2.0
+; SB200 remainder: ties-to-even, low bits, subnormals and signed zero.
+(set-logic QF_FP)
+(set-info :status sat)
+(define-fun one () (_ FloatingPoint 8 200) ((_ to_fp 8 200) RNE 1.0))
+(define-fun two () (_ FloatingPoint 8 200) ((_ to_fp 8 200) RNE 2.0))
+(declare-const dividend (_ FloatingPoint 8 200))
+(assert (= dividend ((_ to_fp 8 200) RNE 3.0)))
+(assert (= (fp.rem dividend two) (fp.neg one)))
+(assert (= (fp.rem ((_ to_fp 8 200) RNE 5.0) two) one))
+(assert (= (fp.rem (fp.neg dividend) two) one))
+(assert (= (fp.rem (fp #b0 #x7f (_ bv1 199)) one)
+           (fp #b0 #x00 (_ bv85070591730234615865843651857942052864 199))))
+(assert (= (fp.rem (fp #b0 #x00 (_ bv3 199)) (fp #b0 #x00 (_ bv2 199)))
+           (fp #b1 #x00 (_ bv1 199))))
+(assert (= (fp.rem (fp.neg two) one) (_ -zero 8 200)))
+(assert (= (fp.rem dividend (_ -oo 8 200)) dividend))
+(assert (fp.isNaN (fp.rem dividend (_ +zero 8 200))))
+(assert (fp.isNaN (fp.rem (_ +oo 8 200) one)))
+(assert (fp.isNaN (fp.rem (_ NaN 8 200) one)))
+(check-sat)

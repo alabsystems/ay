@@ -98,10 +98,29 @@ fn check_uflia_authored_assume_bridge(carcara: &Path) {
         !uflia_proof.contains(":rule hole") && !uflia_proof.contains(":rule trust"),
         "UFLIA publication must be fully checked:\n{uflia_proof}"
     );
-    let comparison_bridge = "(step t5.n (cl (= (>= (f b) 0) (<= 0 (f b)))) :rule comp_simplify)";
+    // The congruence producer may precede or follow the original assumes.
+    // Discover the unique authored comparison, then keep every tamper bound
+    // to that same emitted assumption/bridge rather than a historical step ID.
+    let comparison_assumptions: Vec<&str> = uflia_proof
+        .lines()
+        .filter_map(|line| {
+            let (id, formula) = line.strip_prefix("(assume ")?.split_once(' ')?;
+            (formula == "(>= (f b) 0))").then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        comparison_assumptions.len(),
+        1,
+        "the authored comparison must be assumed exactly once:\n{uflia_proof}"
+    );
+    let unit = comparison_assumptions[0]
+        .strip_suffix(".a")
+        .expect("the authored comparison has a derived canonical unit");
+    let authored_comparison = format!("(assume {unit}.a (>= (f b) 0))");
+    let comparison_bridge =
+        format!("(step {unit}.n (cl (= (>= (f b) 0) (<= 0 (f b)))) :rule comp_simplify)");
     assert!(
-        uflia_proof.contains("(assume t5.a (>= (f b) 0))")
-            && uflia_proof.contains(comparison_bridge),
+        uflia_proof.contains(&authored_comparison) && uflia_proof.contains(&comparison_bridge),
         "UFLIA assumption must retain and certify the exact authored orientation:\n{uflia_proof}"
     );
     let asserted = extract_asserted_terms(&uflia_problem);
@@ -118,8 +137,8 @@ fn check_uflia_authored_assume_bridge(carcara: &Path) {
     );
 
     let changed_uflia_proof = uflia_proof.replacen(
-        "(assume t5.a (>= (f b) 0))",
-        "(assume t5.a (>= (f b) 1))",
+        &authored_comparison,
+        &format!("(assume {unit}.a (>= (f b) 1))"),
         1,
     );
     assert_ne!(
@@ -146,8 +165,8 @@ fn check_uflia_authored_assume_bridge(carcara: &Path) {
     );
 
     let rule_tamper = uflia_proof.replacen(
-        comparison_bridge,
-        "(step t5.n (cl (= (>= (f b) 0) (<= 0 (f b)))) :rule refl)",
+        &comparison_bridge,
+        &format!("(step {unit}.n (cl (= (>= (f b) 0) (<= 0 (f b)))) :rule refl)"),
         1,
     );
     assert_ne!(
@@ -161,8 +180,8 @@ fn check_uflia_authored_assume_bridge(carcara: &Path) {
     );
 
     let premise_tamper = uflia_proof.replacen(
-        ":premises (t5.e t5.n t5.a))",
-        ":premises (t5.e t5.n t5.n))",
+        &format!(":premises ({unit}.e {unit}.n {unit}.a))"),
+        &format!(":premises ({unit}.e {unit}.n {unit}.n))"),
         1,
     );
     assert_ne!(
@@ -176,8 +195,8 @@ fn check_uflia_authored_assume_bridge(carcara: &Path) {
     );
 
     let conclusion_tamper = uflia_proof.replacen(
-        "(step t5 (cl (<= 0 (f b)))",
-        "(step t5 (cl (<= 1 (f b)))",
+        &format!("(step {unit} (cl (<= 0 (f b)))"),
+        &format!("(step {unit} (cl (<= 1 (f b)))"),
         1,
     );
     assert_ne!(

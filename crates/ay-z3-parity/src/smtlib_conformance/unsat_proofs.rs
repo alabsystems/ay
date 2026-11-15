@@ -14,14 +14,14 @@ pub(super) const VALIDATOR_ID: &str = "builtin.unsat-proofs.v1";
 
 const DIMENSION_ID: &str = "results.unsat-proofs";
 const REQUIREMENT_ID: &str = "results.unsat-proofs.independent-replay";
-const CARCARA_ID: &str = "carcara.1.1.0-9a352ee";
+pub(super) const CARCARA_ID: &str = "carcara.1.1.0-9a352ee";
 const CARCARA_ROLE: &str = "independent strict Alethe proof parser and semantic checker";
 // Resolved at runtime: $CARCARA_PATH, else ~/.cargo/bin/carcara. A literal
 // developer home path here is forbidden content for the public export.
 const CARCARA_DEFAULT_RELATIVE: &str = ".cargo/bin/carcara";
-const CARCARA_VERSION_OUTPUT: &str = "carcara 1.1.0 [git master 9a352ee]";
-const CARCARA_SHA256: &str = "edd0457d7eb71132ac505297ad493c3b0b3a52e9938108d9b365157277bd2bdf";
-const CARCARA_ARTIFACT_FILE: &str = "carcara-1.1.0-9a352ee-edd0457d7eb71132.bin";
+pub(super) const CARCARA_VERSION_OUTPUT: &str = "carcara 1.1.0 [git master 9a352ee]";
+pub(super) const CARCARA_SHA256: &str =
+    "edd0457d7eb71132ac505297ad493c3b0b3a52e9938108d9b365157277bd2bdf";
 const MAX_RETAINED_PROOF_BYTES: u64 = 1024 * 1024;
 
 const FOREIGN_PROBLEM: &str = "(set-logic QF_UF)\n\
@@ -343,14 +343,14 @@ pub(super) fn validate_and_replay(
     let tool = &receipt.auxiliary_tools[0];
     if tool.id != CARCARA_ID
         || tool.role != CARCARA_ROLE
-        || tool.artifact.sha256 != CARCARA_SHA256
-        || tool.version_output != CARCARA_VERSION_OUTPUT
+        || checker_cohort::version_for_sha(&tool.artifact.sha256)
+            != Some(tool.version_output.as_str())
     {
         return Err(format!(
             "{VALIDATOR_ID} is not bound to the exact pinned Carcara checker"
         ));
     }
-    validate_receipt_rows(&receipt.case_results)?;
+    validate_receipt_rows(&receipt.case_results, &tool.artifact.sha256)?;
 
     if context.mode.replays_registered_validators() {
         let envelope = receipt
@@ -379,8 +379,8 @@ pub(super) fn validate_and_replay(
         if receipt.result != live.result
             || receipt.cases != live.cases
             || receipt.case_results != live.case_results
-            || live.carcara_sha256 != CARCARA_SHA256
-            || live.carcara_version != CARCARA_VERSION_OUTPUT
+            || live.carcara_sha256 != tool.artifact.sha256
+            || live.carcara_version != tool.version_output
         {
             return Err(format!(
                 "{VALIDATOR_ID} receipt does not match a fresh authenticated AY/Carcara replay"
@@ -391,19 +391,14 @@ pub(super) fn validate_and_replay(
 }
 
 fn retain_carcara(source: &Path, base: &Path, receipt_path: &Path) -> Result<Artifact, String> {
-    let source_sha = sha256_file(source, "pinned Carcara executable")?;
-    if source_sha != CARCARA_SHA256 {
-        return Err(format!(
-            "Carcara binary hash mismatch at {}: expected {CARCARA_SHA256}, got {source_sha}",
-            source.display()
-        ));
-    }
+    let identity = checker_cohort::authenticate(source)?;
+    let source_sha = identity.sha256;
     let bytes = read_bounded_bytes(source, 16 * 1024 * 1024, "pinned Carcara executable", true)?;
     let parent = receipt_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let retained = parent.join(CARCARA_ARTIFACT_FILE);
+    let retained = parent.join(format!("carcara-1.1.0-9a352ee-{source_sha}.bin"));
     match fs::symlink_metadata(&retained) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -413,7 +408,7 @@ fn retain_carcara(source: &Path, base: &Path, receipt_path: &Path) -> Result<Art
                 ));
             }
             let actual = sha256_file(&retained, "retained Carcara artifact")?;
-            if actual != CARCARA_SHA256 {
+            if actual != source_sha {
                 return Err(format!(
                     "retained Carcara artifact hash mismatch at {}",
                     retained.display()
@@ -445,7 +440,7 @@ fn retain_carcara(source: &Path, base: &Path, receipt_path: &Path) -> Result<Art
     let relative = future_relative_output(base, &retained)?;
     Ok(Artifact {
         path: relative,
-        sha256: CARCARA_SHA256.to_string(),
+        sha256: source_sha,
     })
 }
 
@@ -465,8 +460,12 @@ fn execute(
         .as_ref()
         .ok_or("unsat-proofs requires subject.ay_executable")?;
     let staged_ay = stage_authenticated_executable(ay_source, &subject.sha256, "AY executable")?;
-    let staged_carcara =
-        stage_authenticated_executable(carcara_source, CARCARA_SHA256, "Carcara executable")?;
+    let checker_identity = checker_cohort::authenticate(carcara_source)?;
+    let staged_carcara = stage_authenticated_executable(
+        carcara_source,
+        &checker_identity.sha256,
+        "Carcara executable",
+    )?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
         &repo_root,
@@ -493,7 +492,7 @@ fn execute(
         .tempdir()
         .map_err(|error| format!("creating UNSAT proof gate directory: {error}"))?;
     let version_output = resources
-        .run_external_transcript(
+        .run_external_transcript_scrubbed(
             &staged_carcara.path,
             ["--version"],
             b"",
@@ -501,7 +500,11 @@ fn execute(
             "UNSAT proof gate: Carcara identity",
         )
         .map_err(|error| error.to_string())?;
-    let mut rows = vec![version_row(capture(version_output))];
+    let mut rows = vec![version_row(
+        capture(version_output),
+        &checker_identity.sha256,
+        checker_identity.expected_version,
+    )];
     let mut first_proof: Option<Vec<u8>> = None;
 
     for fixture in FIXTURES {
@@ -525,6 +528,21 @@ fn execute(
         &resources,
         timeout,
     )?);
+    let diagnostic_paths = current_abi::StagingPaths::new(&[
+        (work.path(), "@UNSAT_FIXTURES@"),
+        (
+            staged_ay.path.parent().ok_or("AY staging root missing")?,
+            "@UNSAT_AY@",
+        ),
+        (
+            staged_carcara
+                .path
+                .parent()
+                .ok_or("Carcara staging root missing")?,
+            "@UNSAT_CARCARA@",
+        ),
+    ])?;
+    normalize_diagnostic_rows(&mut rows, &diagnostic_paths)?;
     rows.sort_by(|left, right| left.id.cmp(&right.id));
     if rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>() != expected_case_ids() {
         return Err("internal UNSAT-proof case inventory drift".to_string());
@@ -534,7 +552,7 @@ fn execute(
         return Err("authenticated AY bytes changed during UNSAT proof gate".to_string());
     }
     let carcara_after = sha256_file(&staged_carcara.path, "staged Carcara after proof gate")?;
-    if carcara_after != CARCARA_SHA256 {
+    if carcara_after != checker_identity.sha256 {
         return Err("authenticated Carcara bytes changed during UNSAT proof gate".to_string());
     }
     let cases = case_counts_from_rows(&rows)?;
@@ -542,12 +560,63 @@ fn execute(
     Ok(Execution {
         ay_sha256: subject.sha256.clone(),
         carcara_sha256: carcara_after,
-        carcara_version: CARCARA_VERSION_OUTPUT.to_string(),
+        carcara_version: checker_identity.expected_version.to_string(),
         resource_envelope,
         result,
         cases,
         case_results: rows,
     })
+}
+
+/// Verdicts and strictness are computed from original outputs before this is
+/// called. Retain nonempty diagnostics and all semantic values, replacing
+/// only known owned locations so replay need not reproduce a random tempdir.
+/// Alethe bytes and all proof/problem bindings are deliberately untouched.
+fn normalize_diagnostic_rows(
+    rows: &mut [ValidatorCase],
+    paths: &current_abi::StagingPaths,
+) -> Result<(), String> {
+    for row in rows {
+        if row.id.starts_with("fixture.") && row.id.ends_with(".proof") {
+            continue;
+        }
+        let normalized_control_prefix = if matches!(
+            row.id.as_str(),
+            "control.corrupt-proof" | "control.foreign-problem"
+        ) {
+            row.stderr
+                .as_ref()
+                .map(|stderr| {
+                    let suffix = format!(";stderr-sha256={}", sha256_bytes(stderr.as_bytes()));
+                    row.observed
+                        .strip_suffix(&suffix)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            "negative-control diagnostic digest does not bind original stderr"
+                                .to_string()
+                        })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(stdout) = &mut row.stdout {
+            *stdout = paths.normalize(stdout);
+        }
+        if let Some(stderr) = &mut row.stderr {
+            *stderr = paths.normalize(stderr);
+        }
+        row.observed = if let Some(prefix) = normalized_control_prefix {
+            format!(
+                "{};stderr-sha256={}",
+                paths.normalize(&prefix),
+                sha256_bytes(row.stderr.as_deref().unwrap_or_default().as_bytes())
+            )
+        } else {
+            paths.normalize(&row.observed)
+        };
+    }
+    Ok(())
 }
 
 fn execute_fixture(
@@ -578,12 +647,13 @@ fn execute_fixture(
         problem_path.as_os_str().to_owned(),
     ];
     let output = resources
-        .run_external_transcript(
+        .run_external_transcript_scrubbed_with_file_limit(
             ay,
             &ay_args,
             b"",
             timeout,
             &format!("UNSAT proof gate: AY fixture {}", fixture.id),
+            MAX_RETAINED_PROOF_BYTES,
         )
         .map_err(|error| error.to_string())?;
     let captured = capture(output);
@@ -632,7 +702,7 @@ fn run_carcara(
         problem.as_os_str().to_owned(),
     ];
     resources
-        .run_external_transcript(carcara, &args, b"", timeout, label)
+        .run_external_transcript_scrubbed(carcara, &args, b"", timeout, label)
         .map_err(|error| error.to_string())
 }
 
@@ -755,8 +825,8 @@ fn process_failure(capture: &CapturedProcess) -> Option<ValidatorCaseOutcome> {
     }
 }
 
-fn version_row(capture: CapturedProcess) -> ValidatorCase {
-    let expected_stdout = format!("{CARCARA_VERSION_OUTPUT}\n");
+fn version_row(capture: CapturedProcess, checker_sha: &str, version: &str) -> ValidatorCase {
+    let expected_stdout = format!("{version}\n");
     let outcome = process_failure(&capture).unwrap_or_else(|| {
         if capture.success && capture.stdout == expected_stdout && capture.stderr.is_empty() {
             ValidatorCaseOutcome::Pass
@@ -766,9 +836,9 @@ fn version_row(capture: CapturedProcess) -> ValidatorCase {
     });
     ValidatorCase {
         id: "carcara.identity".to_string(),
-        input_sha256: checker_identity_input_sha(),
+        input_sha256: checker_identity_input_sha(checker_sha, version),
         expected: format!(
-            "authenticated checker sha256={CARCARA_SHA256}; --version stdout={CARCARA_VERSION_OUTPUT:?}; stderr-empty; exit=0"
+            "authenticated checker sha256={checker_sha}; --version stdout={version:?}; stderr-empty; exit=0"
         ),
         observed: process_observed(&capture),
         stdout: Some(capture.stdout),
@@ -900,10 +970,33 @@ fn analyze_proof(proof: &[u8]) -> Result<ProofAnalysis, String> {
     })
 }
 
+/// `Ok` when pinned Carcara's verdict on the pair can count at all: no
+/// `evaluate` or `aci_simp` step it misjudges and no binder it misreads
+/// (`ay_core::pinned_carcara`, the scan every Carcara gate shares). On such a
+/// pair its `valid` is not evidence, so the fixture fails. A proof that is not
+/// UTF-8 cannot be scanned and fails closed.
+pub(super) fn pinned_carcara_can_judge(problem: &str, proof: &[u8]) -> Result<(), String> {
+    let proof = std::str::from_utf8(proof).map_err(|_| "proof-not-utf8".to_string())?;
+    ay_core::pinned_carcara::pinned_carcara_can_judge(problem, proof).map_err(|misjudged| {
+        format!(
+            "pinned-carcara-misjudged-aci-simp-steps={};\
+             pinned-carcara-misjudged-evaluate-steps={};pinned-carcara-misread-binders={}",
+            misjudged.aci_simp_steps.len(),
+            misjudged.evaluate_steps.len(),
+            misjudged.binders.len()
+        )
+    })
+}
+
 fn checker_fixture_row(fixture: Fixture, proof: &[u8], capture: CapturedProcess) -> ValidatorCase {
     let proof_sha = sha256_bytes(proof);
+    let judgeable = pinned_carcara_can_judge(fixture.problem, proof);
     let outcome = process_failure(&capture).unwrap_or_else(|| {
-        if capture.success && capture.stdout == "valid\n" && capture.stderr.is_empty() {
+        if capture.success
+            && capture.stdout == "valid\n"
+            && capture.stderr.is_empty()
+            && judgeable.is_ok()
+        {
             ValidatorCaseOutcome::Pass
         } else {
             ValidatorCaseOutcome::Fail
@@ -912,12 +1005,13 @@ fn checker_fixture_row(fixture: Fixture, proof: &[u8], capture: CapturedProcess)
     ValidatorCase {
         id: format!("fixture.{}.carcara", fixture.id),
         input_sha256: checker_binding_sha(fixture.problem.as_bytes(), &proof_sha),
-        expected: "pinned Carcara check --strict-parsing --expand-let-bindings over exact proof and exact authored problem; stdout=valid; stderr-empty; exit=0; no allowed or ignored rules".to_string(),
+        expected: "pinned Carcara check --strict-parsing --expand-let-bindings over exact proof and exact authored problem; stdout=valid; stderr-empty; exit=0; no allowed or ignored rules; no evaluate step or binder pinned Carcara misjudges".to_string(),
         observed: format!(
-            "{};problem-sha256={};proof-sha256={proof_sha};strict-verdict={}",
+            "{};problem-sha256={};proof-sha256={proof_sha};strict-verdict={}{}",
             process_observed(&capture),
             sha256_bytes(fixture.problem.as_bytes()),
-            capture.stdout.trim_end()
+            capture.stdout.trim_end(),
+            judgeable.err().map(|refusal| format!(";{refusal}")).unwrap_or_default()
         ),
         stdout: Some(capture.stdout),
         stderr: Some(capture.stderr),
@@ -1034,12 +1128,10 @@ fn corrupt_first_rule(proof: &[u8]) -> Result<Vec<u8>, String> {
     Ok(corrupted.into_bytes())
 }
 
-fn checker_identity_input_sha() -> String {
+fn checker_identity_input_sha(checker_sha: &str, version: &str) -> String {
     sha256_bytes(
-        format!(
-            "{VALIDATOR_ID}\nchecker={CARCARA_SHA256}\nargv=--version\nexpected={CARCARA_VERSION_OUTPUT}\n"
-        )
-        .as_bytes(),
+        format!("{VALIDATOR_ID}\nchecker={checker_sha}\nargv=--version\nexpected={version}\n")
+            .as_bytes(),
     )
 }
 
@@ -1056,7 +1148,7 @@ fn proof_binding_sha(problem: &[u8], proof_sha: &str) -> String {
 fn checker_binding_sha(problem: &[u8], proof_sha: &str) -> String {
     sha256_bytes(
         format!(
-            "{VALIDATOR_ID}\nchecker-sha256={CARCARA_SHA256}\nargv=check --strict-parsing --expand-let-bindings -- PROOF PROBLEM\nproblem-sha256={}\nproof-sha256={proof_sha}\n",
+            "{VALIDATOR_ID}\nchecker-source=9a352eea6c935ad35cb8ec22e521a7620ec5d474\nargv=check --strict-parsing --expand-let-bindings -- PROOF PROBLEM\nproblem-sha256={}\nproof-sha256={proof_sha}\n",
             sha256_bytes(problem)
         )
         .as_bytes(),
@@ -1082,7 +1174,9 @@ fn expected_case_ids() -> Vec<String> {
     ids
 }
 
-fn validate_receipt_rows(rows: &[ValidatorCase]) -> Result<(), String> {
+fn validate_receipt_rows(rows: &[ValidatorCase], checker_sha: &str) -> Result<(), String> {
+    let version = checker_cohort::version_for_sha(checker_sha)
+        .ok_or("unqualified checker in proof receipt")?;
     let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
     if ids != expected_case_ids() {
         return Err(format!(
@@ -1090,8 +1184,8 @@ fn validate_receipt_rows(rows: &[ValidatorCase]) -> Result<(), String> {
         ));
     }
     let identity = row(rows, "carcara.identity")?;
-    let expected_version_stdout = format!("{CARCARA_VERSION_OUTPUT}\n");
-    if identity.input_sha256 != checker_identity_input_sha()
+    let expected_version_stdout = format!("{version}\n");
+    if identity.input_sha256 != checker_identity_input_sha(checker_sha, version)
         || (identity.outcome == ValidatorCaseOutcome::Pass
             && (identity.exit_code != Some(0)
                 || identity.stdout.as_deref() != Some(expected_version_stdout.as_str())
@@ -1144,12 +1238,18 @@ fn validate_receipt_rows(rows: &[ValidatorCase]) -> Result<(), String> {
             ));
         }
         let checker = row(rows, &format!("fixture.{}.carcara", fixture.id))?;
+        // A `valid` counts only over retained proof bytes the shared scan finds
+        // clean; with no retained proof there is nothing to scan, so it fails.
+        let judgeable = proof_row.stdout.as_deref().is_some_and(|proof| {
+            pinned_carcara_can_judge(fixture.problem, proof.as_bytes()).is_ok()
+        });
         if checker.input_sha256 != checker_binding_sha(fixture.problem.as_bytes(), &proof_sha)
             || (checker.outcome == ValidatorCaseOutcome::Pass
                 && (checker.exit_code != Some(0)
                     || checker.stdout.as_deref() != Some("valid\n")
                     || checker.stderr.as_deref() != Some("")
-                    || checker.process.is_none()))
+                    || checker.process.is_none()
+                    || !judgeable))
         {
             return Err(format!(
                 "{VALIDATOR_ID} fixture {} has invalid independent replay evidence",
@@ -1208,8 +1308,121 @@ fn proof_dimension(contract: &Contract) -> Result<&Dimension, String> {
 }
 
 #[cfg(test)]
+mod pinned_carcara_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_capture(stdout: &str, stderr: String, exit_code: i32) -> CapturedProcess {
+        CapturedProcess {
+            stdout: stdout.to_string(),
+            stderr,
+            stdout_valid: true,
+            stderr_valid: true,
+            exit_code: Some(exit_code),
+            success: exit_code == 0,
+            process: ProcessObservation {
+                stdin_complete: true,
+                timed_out: false,
+                memout: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn owned_proof_path_diagnostics_replay_without_hiding_stderr_failure() {
+        fn row(directory: &Path, steps: usize) -> ValidatorCase {
+            let fixture = FIXTURES[0];
+            let capture = completed_capture(
+                fixture.expected_stdout,
+                format!(
+                    "c ay.proof.certificate path={} unproved_steps={steps}\n",
+                    directory.join("fixture.alethe").display()
+                ),
+                0,
+            );
+            let mut rows = vec![ay_fixture_row(
+                fixture,
+                &capture,
+                Some(b"(step t0 (cl) :rule false)\n"),
+            )];
+            let paths = current_abi::StagingPaths::new(&[(directory, "@UNSAT_FIXTURES@")])
+                .expect("owned paths");
+            normalize_diagnostic_rows(&mut rows, &paths).expect("normalize diagnostic");
+            rows.remove(0)
+        }
+        let first_directory = tempfile::tempdir().expect("first fixture directory");
+        let second_directory = tempfile::tempdir().expect("second fixture directory");
+        let first = row(first_directory.path(), 0);
+        let second = row(second_directory.path(), 0);
+        assert_eq!(first, second);
+        assert_eq!(first.outcome, ValidatorCaseOutcome::Fail);
+        assert!(first.observed.contains("stderr-empty=false"));
+        assert!(first
+            .stderr
+            .as_deref()
+            .is_some_and(|stderr| stderr.contains("@UNSAT_FIXTURES@/fixture.alethe")));
+        assert_ne!(first, row(second_directory.path(), 1));
+    }
+
+    #[test]
+    fn normalized_control_diagnostic_hash_remains_bound_to_retained_stderr() {
+        fn row(directory: &Path, reason: &str) -> ValidatorCase {
+            let capture = completed_capture(
+                "invalid\n",
+                format!("{}: {reason}\n", directory.join("control.alethe").display()),
+                1,
+            );
+            let mut rows = vec![rejection_control_row(
+                "control.corrupt-proof",
+                FIXTURES[0].problem.as_bytes(),
+                b"(step t0 (cl) :rule __ay_corrupted_rule__)\n",
+                capture,
+                "reject corrupted rule",
+            )];
+            let paths = current_abi::StagingPaths::new(&[(directory, "@UNSAT_FIXTURES@")])
+                .expect("owned paths");
+            normalize_diagnostic_rows(&mut rows, &paths).expect("normalize diagnostic");
+            rows.remove(0)
+        }
+        let first_directory = tempfile::tempdir().expect("first fixture directory");
+        let second_directory = tempfile::tempdir().expect("second fixture directory");
+        let first = row(first_directory.path(), "unknown rule");
+        assert_eq!(first, row(second_directory.path(), "unknown rule"));
+        assert_eq!(first.outcome, ValidatorCaseOutcome::Pass);
+        let stderr = first.stderr.as_deref().expect("retained diagnostic");
+        assert!(first.observed.ends_with(&format!(
+            ";stderr-sha256={}",
+            sha256_bytes(stderr.as_bytes())
+        )));
+        assert_ne!(first, row(second_directory.path(), "unknown term"));
+
+        let paths = current_abi::StagingPaths::new(&[(first_directory.path(), "@UNSAT_FIXTURES@")])
+            .expect("owned paths");
+        let mut tampered = vec![first];
+        tampered[0].stderr = Some("altered diagnostic".to_string());
+        assert!(normalize_diagnostic_rows(&mut tampered, &paths).is_err());
+    }
+
+    #[test]
+    fn diagnostic_normalization_leaves_exact_proof_and_binding_untouched() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let proof = format!(
+            "; literal {}\n(step t0 (cl) :rule false)\n",
+            directory.path().join("artifact").display()
+        );
+        let capture = completed_capture(FIXTURES[0].expected_stdout, String::new(), 0);
+        let original = proof_fixture_row(FIXTURES[0], &capture, Some(proof.as_bytes()));
+        let mut rows = vec![original.clone()];
+        let paths = current_abi::StagingPaths::new(&[(directory.path(), "@UNSAT_FIXTURES@")])
+            .expect("owned paths");
+        normalize_diagnostic_rows(&mut rows, &paths).expect("normalize diagnostics");
+        assert_eq!(rows, vec![original]);
+        assert_eq!(rows[0].stdout.as_deref(), Some(proof.as_str()));
+    }
 
     #[test]
     fn case_inventory_is_closed_and_sorted() {

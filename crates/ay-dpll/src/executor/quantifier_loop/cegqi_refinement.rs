@@ -123,6 +123,12 @@ impl Executor {
 
             match self.solve_for_category(category) {
                 Ok(SolveResult::Unsat(_)) => {
+                    // (#quantifier-ce-free-resolve) Record that a live
+                    // refinement refutation is being handed to the
+                    // disambiguation apparatus; if it fails closed, the
+                    // stage-4 hook in `classify_quantifier_result` may
+                    // re-solve the CE-free vector.
+                    self.cegqi_refinement_round_refuted = true;
                     // The pre-instantiation snapshot (threaded from
                     // `classify_quantifier_result`'s `refinement_assertions`)
                     // enables the quantified-CE-lemma decider legs inside
@@ -306,6 +312,13 @@ impl Executor {
         if expected != instance || contains_quantifier(&self.ctx.terms, instance) {
             return false;
         }
+        // (#negated-exists-cegqi-witness-hints) The validated binder values
+        // are the closed terms that refuted the CE lemma; keep them so the
+        // artifact firewall's negated-exists lane can propose them on the
+        // AUTHORED dual, whose body the NNF-minted `quantifier` here is not.
+        for ((_, sort), &value) in vars.iter().zip(&binding) {
+            self.note_cegqi_witness_hint(sort, value);
+        }
 
         // Public quantified solves require a strict proof.  Keep the exact
         // simultaneous substitution as the solver-visible assertion in that
@@ -337,6 +350,24 @@ impl Executor {
         };
         self.push_active_support_axiom(solver_instance);
         added
+    }
+
+    /// Remember one validated CEGQI binder value as a witness hint for the
+    /// current check-sat (#negated-exists-cegqi-witness-hints). Bounded and
+    /// deduplicated; a full ledger silently drops later values, which can only
+    /// cost the consuming lane a candidate.
+    pub(super) fn note_cegqi_witness_hint(&mut self, sort: &Sort, value: TermId) {
+        /// Hints retained per check-sat, across every refinement round.
+        const MAX_CEGQI_WITNESS_HINTS: usize = 64;
+        if self.cegqi_witness_hints.len() >= MAX_CEGQI_WITNESS_HINTS
+            || self
+                .cegqi_witness_hints
+                .iter()
+                .any(|(_, hint)| *hint == value)
+        {
+            return;
+        }
+        self.cegqi_witness_hints.push((sort.clone(), value));
     }
 
     /// Neighbor enumeration fallback for CEGQI: try instantiating with values
@@ -424,6 +455,8 @@ impl Executor {
                 let re_result = self.solve_for_category(category);
                 match re_result {
                     Ok(SolveResult::Unsat(_)) => {
+                        // (#quantifier-ce-free-resolve) As in the loop above.
+                        self.cegqi_refinement_round_refuted = true;
                         // Snapshot threaded through — decider legs enabled; see
                         // the identical note in the refinement loop above.
                         return Some(self.disambiguate_cegqi_unsat(

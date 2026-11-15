@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod scope;
+
 impl Executor {
     /// Authenticate the source-closed proof premise inventory for one exact
     /// plain public query.
@@ -88,12 +90,15 @@ impl Executor {
     /// Consume the one-shot capability for the immediately preceding verdict.
     pub(crate) fn take_unsat_certificate(&mut self) -> Option<UnsatCertificate> {
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
         let certificate = self.last_unsat_certificate.take()?;
         let epoch = self.unsat_query_epoch.as_ref()?;
         let bound_assumptions = epoch.assumptions.as_deref()?;
         let current = match &certificate.0 {
             UnsatCertificateKind::StrictProof(scope)
-            | UnsatCertificateKind::DischargedTrust(scope) => scope.is_current(self),
+            | UnsatCertificateKind::DischargedTrust(scope, _) => scope.is_current(self),
+            UnsatCertificateKind::StrictNativeBvLiaBundle(checked) => checked.is_current(self),
+            UnsatCertificateKind::StrictNativeNraSosBundle(checked) => checked.is_current(self),
             UnsatCertificateKind::CheckedSatRefutation { checked, scope } => {
                 // Three admissible shapes, strictest first:
                 // 1. the solver solved with exactly the bound assumptions;
@@ -166,7 +171,8 @@ impl Executor {
             | UnsatCertificateKind::CheckedExactClosedSentence(_)
             | UnsatCertificateKind::CheckedExactForallUfGround(_)
             | UnsatCertificateKind::CheckedExactFiniteExpansion(_)
-            | UnsatCertificateKind::CheckedExactRmDomainExpansion(_) => {
+            | UnsatCertificateKind::CheckedExactRmDomainExpansion(_)
+            | UnsatCertificateKind::CheckedExactAuthoredSubset(_) => {
                 certificate.checked_exact_semantic_is_current(self)
             }
             // #proof-capability B3 — the raw token dies the instant any proof

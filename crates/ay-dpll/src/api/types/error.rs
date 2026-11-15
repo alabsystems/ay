@@ -24,6 +24,17 @@ impl std::fmt::Display for DisplaySorts<'_> {
     }
 }
 
+/// Negative local tactic limit, not a new budget or a model/proof permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TacticLimitKind {
+    #[error("local tactic deadline exceeded")]
+    Deadline,
+    #[error("local tactic rewrite work exceeded")]
+    Work,
+    #[error("local tactic memory checkpoint exceeded")]
+    Memory,
+}
+
 /// Error type for Solver API operations
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -150,6 +161,10 @@ pub enum SolverError {
     /// bit-vector goal). The message is the Z3-style failure reason.
     #[error("tactic failed: {0}")]
     TacticFailed(String),
+    /// A recoverable tactic-local limit. Original attempt refusal has priority
+    /// at publication; no authority or counter is reset by this error.
+    #[error("tactic failed: {0}")]
+    TacticLimit(TacticLimitKind),
 }
 
 impl From<ExecutorError> for SolverError {

@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+f 2;
+rup 1 x2 >= -9223372036854775808 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

@@ -46,7 +46,7 @@ fn f32_bits(bits: u32) -> ModelValue {
     ModelValue::FloatingPoint {
         sign: bits >> 31 == 1,
         exponent: u64::from((bits >> 23) & 0xff),
-        significand: u64::from(bits & 0x007f_ffff),
+        significand: u128::from(bits & 0x007f_ffff),
         exponent_bits: 8,
         significand_bits: 24,
     }
@@ -57,7 +57,7 @@ fn f64_bits(bits: u64) -> ModelValue {
     ModelValue::FloatingPoint {
         sign: bits >> 63 == 1,
         exponent: (bits >> 52) & 0x7ff,
-        significand: bits & 0x000f_ffff_ffff_ffff,
+        significand: u128::from(bits & 0x000f_ffff_ffff_ffff),
         exponent_bits: 11,
         significand_bits: 53,
     }
@@ -116,6 +116,9 @@ fn to_f32(x: &BigRational, rm: RoundingMode) -> u32 {
 // -- rounding a Real into Float32 -----------------------------------------
 
 include!("fp_tests/standard_rounding_and_arithmetic.rs");
+
+#[path = "fp_tests/binary128.rs"]
+mod binary128;
 
 /// SMT-LIB `=` on floating-point is element identity: every NaN encoding of a
 /// format denotes the ONE NaN element, while the signed zeros and the signed

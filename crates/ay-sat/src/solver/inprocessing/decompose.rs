@@ -957,7 +957,7 @@ impl Solver {
         // exclusively. Building them cost 100+s of memset on 07cea7a6
         // (275K equivalences, 1.57M lits) — see Decompose::run.
         let result = self.inproc.decompose_engine.run(
-            &self.watches,
+            crate::decompose::BinaryGraph::new(&self.watches, &self.arena),
             self.num_vars,
             &self.vals,
             &self.cold.freeze_counts,
@@ -1242,13 +1242,14 @@ impl Solver {
 
         // Collect unit proof IDs; store in unit_proof_id afterward (#4636).
         let mut unit_pids: Vec<(Literal, u64)> = Vec::new();
-        // Phase 1 / Phase H (#4606): emit all additions while original formula
-        // is intact. In LRAT mode (with successful Phase G), collect equivalence
-        // binary IDs + unit IDs + original clause ID as hints.
-        // CaDiCaL: decompose.cpp:491-576.
-        // Also emit SCC units here (before deletions) so the forward checker
-        // can still find the original binary clauses forming the SCC cycle
-        // for RUP verification (#4966).
+        let veripb_next = self.veripb_decompose_hops(&result.reprs); // veripb_derived.rs
+                                                                     // Phase 1 / Phase H (#4606): emit all additions while original formula
+                                                                     // is intact. In LRAT mode (with successful Phase G), collect equivalence
+                                                                     // binary IDs + unit IDs + original clause ID as hints.
+                                                                     // CaDiCaL: decompose.cpp:491-576.
+                                                                     // Also emit SCC units here (before deletions) so the forward checker
+                                                                     // can still find the original binary clauses forming the SCC cycle
+                                                                     // for RUP verification (#4966).
         for (mutation, &cid) in rewrite.actions.iter().zip(mutation_ids.iter()) {
             match mutation {
                 crate::decompose::ClauseMutation::Replaced {
@@ -1273,6 +1274,7 @@ impl Solver {
                     } else {
                         ProofAddKind::Derived
                     };
+                    self.veripb_note_substitution(old, &result.reprs, &veripb_next);
                     let new_id = self.proof_emit_add(new, &hints, kind).unwrap_or(0);
                     // Update clause_ids so deduplication/later deletions use the
                     // new proof ID, not the stale original that Phase 2 will delete.
@@ -1298,6 +1300,7 @@ impl Solver {
                     } else {
                         ProofAddKind::Derived
                     };
+                    self.veripb_note_substitution(old, &result.reprs, &veripb_next);
                     let pid = self.proof_emit_unit(*unit, &hints, kind);
                     if pid != 0 {
                         unit_pids.push((*unit, pid));
@@ -1960,7 +1963,7 @@ impl Solver {
         // need_chains = true: the LRAT preflight consumes the equivalence
         // chains for its dry-run sidecars (decompose_lrat_chain_source_ids).
         let result = self.inproc.decompose_engine.run(
-            &self.watches,
+            crate::decompose::BinaryGraph::new(&self.watches, &self.arena),
             self.num_vars,
             &self.vals,
             &self.cold.freeze_counts,

@@ -7,11 +7,20 @@
 use ay_core::term::{Symbol, TermData};
 use ay_core::{TermId, TermStore};
 
+use super::derived_arena::compact_derived_arena;
 use super::{CheckedGroundKind, CheckedGroundScope, CheckedIsolatedMode};
 use crate::ematching::contains_quantifier;
-use crate::executor::unsat_cert::{probe_cert_reject, UnsatCertificate};
-use crate::executor::{Executor, NATIVE_API_ASSERTION_PLACEHOLDER};
+use crate::executor::unsat_cert::{probe_cert_reject, ProbeUnsatAuthority, UnsatCertificate};
+use crate::executor::{Executor, UnsatEvidence, NATIVE_API_ASSERTION_PLACEHOLDER};
 use crate::executor_types::SolveResult;
+use counter_names::is_counter_only_internal_name;
+#[cfg(test)]
+use counter_names::{
+    ARRAY_EXT_WITNESS_SPELLING, EQ_DIFF_VARIABLE_SPELLING, PRIVATE_DECLARATION_IDENTITY_PREFIX,
+};
+
+#[path = "checked_isolated_counter_names.rs"]
+mod counter_names;
 
 fn report_unsat_decline(token: Option<&UnsatCertificate>, published: bool, checked: bool) {
     if published && checked {
@@ -24,6 +33,7 @@ fn report_unsat_decline(token: Option<&UnsatCertificate>, published: bool, check
             None => "none",
             Some(certificate) if certificate.strict_proof_verified() => "strict-proof",
             Some(certificate) if certificate.independently_verified() => "independently-checked",
+            Some(certificate) if certificate.rests_on_corroboration() => "discharged-trust",
             Some(certificate) if certificate.exact_semantic_verified() => "exact-semantic",
             Some(_) => "competition-raw",
         };
@@ -34,13 +44,11 @@ fn report_unsat_decline(token: Option<&UnsatCertificate>, published: bool, check
     });
 }
 
-/// AY's marker for an INTERNALLY MINTED symbol. The frontend rejects it in user
-/// input (`is_reserved_symbol`), so a symbol spelled with this prefix was
-/// minted by AY itself during some solve.
+/// AY's marker for an INTERNALLY MINTED symbol. The frontend rejects it in user input
+/// (`is_reserved_symbol`), so a symbol spelled with this prefix was minted by AY itself during some solve.
 const INTERNAL_SYMBOL_MARKER: &str = "__ay_";
 
-/// Whether `terms` holds an AY-internal symbol whose NAME may carry a
-/// `TermId`.
+/// Whether `terms` holds an AY-internal symbol whose NAME may carry a `TermId`.
 ///
 /// # The hazard
 ///
@@ -59,11 +67,13 @@ const INTERNAL_SYMBOL_MARKER: &str = "__ay_";
 ///  * `__ay_ite_def_{ite}` — `ay_core::term::ite_lifting`, decoded by
 ///    `executor::proof::ite_definition_leaf`;
 ///  * `__ay_arrflat!{array}_t{index}` — `executor::theories::fp::flatten_reads`;
-///  * `__ay_bv_lia_cong_k{source}_w{width}` — `executor::theories::combined`;
 ///  * `__ay_native_replay_unauthenticated_{term}` — `api::solving::native_replay`;
 ///  * the `<prefix><label>!{map}` map-domain carriers in
 ///    `ay_frontend::elaborate::app::map`, which says outright that the id is
 ///    parsed back and that `__ay_` is reserved so nothing can collide with it.
+///
+/// The BV-LIA bridge's auxiliary variables spelled ids as well, never read
+/// back; they now spell a counter (`theories::combined::bv_lia_aux_vars`).
 ///
 /// MEASURED, not theorised. Without this veto the `__ay_zerodiv_*` case is a
 /// live panic: `ufbv_fixpoint_premise_forced_unsat::
@@ -75,7 +85,7 @@ const INTERNAL_SYMBOL_MARKER: &str = "__ay_";
 /// (measured: zero dangling children, zero out-of-range roots) — the dangling
 /// id is the one that travelled as a string.
 ///
-/// # Why this test and not a list of those six prefixes
+/// # Why this test and not a list of those prefixes
 ///
 /// A prefix list is only as good as the next mint that forgets to join it, and
 /// a missed entry does not produce a slow probe — it produces a wrong term
@@ -87,10 +97,13 @@ const INTERNAL_SYMBOL_MARKER: &str = "__ay_";
 /// digits are a plain counter rather than an id (`__ay_sk_x!3`); that costs
 /// speed and nothing else. Digit-FREE internal names (`__ay_dt_depth_List`, the
 /// only one the `inc_some_list` probe carries) cannot be spelling an id and
-/// stay prunable.
-fn carries_name_encoded_term_ids(terms: &TermStore) -> bool {
+/// stay prunable, and so do the exact counter-only spellings of
+/// [`is_counter_only_internal_name`].
+pub(in crate::executor) fn carries_name_encoded_term_ids(terms: &TermStore) -> bool {
     let name_encodes_a_term_id = |name: &str| {
-        name.starts_with(INTERNAL_SYMBOL_MARKER) && name.bytes().any(|byte| byte.is_ascii_digit())
+        name.starts_with(INTERNAL_SYMBOL_MARKER)
+            && name.bytes().any(|byte| byte.is_ascii_digit())
+            && !is_counter_only_internal_name(name)
     };
     (0..terms.len()).any(|index| {
         let Ok(raw) = u32::try_from(index) else {
@@ -181,7 +194,10 @@ impl Executor {
     ///
     /// Split out of [`Self::checked_isolated_solve`] so the pruned build below
     /// has an exact, unpruned twin to fall back to.
-    fn isolated_probe_context(&self, assertions: &[TermId]) -> Option<ay_frontend::Context> {
+    pub(in crate::executor) fn isolated_probe_context(
+        &self,
+        assertions: &[TermId],
+    ) -> Option<ay_frontend::Context> {
         let mut probe_ctx = self.ctx.clone();
         // Strip the outer query before installing exact roots. The nested
         // proof/source epoch must authenticate this obligation, not objectives,
@@ -264,24 +280,23 @@ impl Executor {
     /// unpruned clone the probe had before this existed and runs that, so a
     /// query shape whose arena cannot be rebuilt is merely as slow as it
     /// always was.
-    fn pruned_isolated_probe_context(&self, assertions: &[TermId]) -> Option<ay_frontend::Context> {
+    pub(in crate::executor) fn pruned_isolated_probe_context(
+        &self,
+        assertions: &[TermId],
+    ) -> Option<ay_frontend::Context> {
         let mut probe_ctx = self.isolated_probe_context(assertions)?;
         let before = probe_ctx.terms.len();
-        if carries_name_encoded_term_ids(&probe_ctx.terms) {
-            probe_cert_reject(|| {
-                format!(
+        let pruned = compact_derived_arena(&mut probe_ctx);
+        if pruned != Some(false) {
+            probe_cert_reject(|| match pruned {
+                None => format!(
                     "checked-isolated probe arena NOT pruned at {before} terms: \
                      an AY-internal symbol name may spell a TermId"
-                )
-            });
-            return Some(probe_ctx);
-        }
-        if probe_ctx.compact_terms_for_derived_query() {
-            probe_cert_reject(|| {
-                format!(
+                ),
+                _ => format!(
                     "checked-isolated probe arena: {before} -> {} terms",
                     probe_ctx.terms.len()
-                )
+                ),
             });
             return Some(probe_ctx);
         }
@@ -362,12 +377,11 @@ impl Executor {
         assertions: Vec<TermId>,
         mode: CheckedIsolatedMode,
         budget_ms: u64,
-    ) -> Option<(CheckedGroundScope, CheckedGroundKind)> {
+    ) -> Option<super::CheckedIsolatedOutcome> {
         let has_quantifier = assertions
             .iter()
             .any(|&term| contains_quantifier(&self.ctx.terms, term));
-        let fragment_mismatch =
-            matches!(mode, CheckedIsolatedMode::GroundDecision) && has_quantifier;
+        let fragment_mismatch = mode.is_ground_decision() && has_quantifier;
         if fragment_mismatch || self.should_abort_theory_loop() || !self.qpf_probe_preflight() {
             return None;
         }
@@ -376,19 +390,30 @@ impl Executor {
         let mut probe = self.qpf_probe_executor(probe_ctx, budget_ms);
         probe.original_problem_had_quantifiers = has_quantifier;
         probe.incremental_mode = false;
-        // Prevent exact-UNSAT rescue lanes from recursively validating
-        // themselves; ordinary preprocessing/refinement remains enabled.
-        if matches!(mode, CheckedIsolatedMode::ExactUnsat) {
+        probe.force_strengthenings_off();
+        // Evidence policy P1 above (`strengthening.rs`); and keep exact-UNSAT rescue
+        // lanes from recursively validating themselves (preprocessing stays on).
+        if !mode.is_ground_decision() {
             probe.in_alternation_validation = true;
             probe.in_nested_array_residue_probe = true;
+        }
+        // A model-check probe inherits a shedding posture and so does no
+        // proof work either (see `admits_shed_raw_unsat`; D3/P2).
+        let enclosing_sheds = self.competition_shedding_active();
+        let enclosing_accepts_trust = self.accepts_discharged_trust_grant();
+        if mode.admits_shed_raw_unsat(enclosing_sheds) {
+            probe.set_competition_mode(true);
         }
         probe.begin_public_solve(false);
         probe.bind_unsat_query_assumptions(&[]);
 
         let raw = probe.check_sat();
         probe_cert_reject(|| format!("checked-isolated raw result: {raw:?}"));
+        // The authority class and evidence (P4) an UNSAT was admitted on: a sealing
+        // consumer may not present a `discharged-trust` admission as checked.
+        let mut admission = (ProbeUnsatAuthority::Checked, UnsatEvidence::CHECKED);
         let outcome = match raw.ok()? {
-            SolveResult::Sat if matches!(mode, CheckedIsolatedMode::GroundDecision) => probe
+            SolveResult::Sat if mode.is_ground_decision() => probe
                 .take_sat_certificate()
                 .is_some_and(|certificate| certificate.confirms_sat_emission())
                 .then_some(CheckedGroundKind::Sat),
@@ -397,10 +422,13 @@ impl Executor {
                 let certified = probe.certify_unsat_for_publication(result, &[]);
                 let published = certified.is_unsat();
                 let token = probe.take_unsat_certificate();
-                let checked = token
-                    .as_ref()
-                    .is_some_and(|certificate| certificate.confirms_checked_unsat_emission());
+                let checked = token.as_ref().is_some_and(|certificate| {
+                    mode.admits_unsat(certificate, enclosing_sheds, enclosing_accepts_trust)
+                });
                 report_unsat_decline(token.as_ref(), published, checked);
+                if let Some(certificate) = token.as_ref() {
+                    admission = (certificate.probe_authority(), certificate.evidence());
+                }
                 (published && checked).then_some(CheckedGroundKind::Unsat)
             }
             SolveResult::Unknown => None,
@@ -420,10 +448,17 @@ impl Executor {
             });
             return None;
         }
-        Some((scope, outcome?))
+        Some((scope, outcome?, admission.0, admission.1))
     }
 }
+
+#[path = "checked_isolated_mode.rs"]
+mod checked_isolated_mode;
 
 #[cfg(test)]
 #[path = "checked_isolated_solve_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "checked_isolated_solve_counter_name_tests.rs"]
+mod counter_name_tests;

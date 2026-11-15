@@ -23,6 +23,8 @@
 use std::process::Command;
 
 mod death_pipe;
+/// Native birth-identified process-group census for owned child supervision.
+pub mod process_group;
 pub use death_pipe::{
     adopt_inherited_death_pipe, arm_parent_death_signal, configure_child_death_pipe,
     wait_for_parent_death, DeathPipe, DeathPipeReader, DeathPipeWriter, ParentDeath,
@@ -327,6 +329,59 @@ pub fn die_with_signal(sig: i32) -> ! {
     std::process::abort();
 }
 
+/// Die from `SIGABRT` with the same wait status as `std::process::abort()` (the
+/// gate's `rust_oom`/`abort()` fault), but on macOS WITHOUT the `.ips` crash report
+/// a plain `abort()` in a forked child files on every test run.
+///
+/// macOS: libsystem_kernel's `abort_with_reason` (xnu `sys/reason.h`, not in the public
+/// SDK) with `OS_REASON_FLAG_NO_CRASH_REPORT`; measured, ReportCrash logs no corpse for
+/// the child. It is resolved with `dlsym` when the fault fires, so it is not a load-time
+/// import of every macOS `ay`; if it does not resolve, this falls back to
+/// `std::process::abort()`, which dies the same way but files a report. Inferred from
+/// xnu source, not measured: `proc_prepareexit` skips the `EXC_CRASH`/corpse
+/// notification for that flag, and nulling the task's `EXC_CRASH` port instead would
+/// not do (`exception_triage` falls through to the host-level port). Other unix: `abort()`.
+pub fn abort_without_crash_report() -> ! {
+    #[cfg(target_os = "macos")]
+    if let Some(abort_with_reason) = resolve_abort_with_reason() {
+        const OS_REASON_TEST: u32 = 5;
+        const OS_REASON_FLAG_NO_CRASH_REPORT: u64 = 0x1;
+        // SAFETY: `signal` takes a valid signal number; the `SIG_DFL` reset makes the
+        // SIGABRT terminate even if a handler or `SIG_IGN` was inherited (per
+        // libsyscall source the wrapper would otherwise fall back to SIGKILL, which
+        // the parent does not count as a crash). `abort_with_reason` takes integers
+        // and a NUL-terminated static string and does not return. Test-only path.
+        unsafe {
+            libc::signal(libc::SIGABRT, libc::SIG_DFL);
+            abort_with_reason(
+                OS_REASON_TEST,
+                0,
+                c"ay crash-injection gate: deliberate solve-child abort".as_ptr(),
+                OS_REASON_FLAG_NO_CRASH_REPORT,
+            );
+        }
+    }
+    std::process::abort();
+}
+
+/// xnu `sys/reason.h`: `abort_with_reason(namespace, code, reason string, flags)`.
+#[cfg(target_os = "macos")]
+type AbortWithReason = unsafe extern "C" fn(u32, u64, *const libc::c_char, u64);
+
+/// `abort_with_reason` from the loaded images, or `None` if libsystem lacks it.
+#[cfg(target_os = "macos")]
+fn resolve_abort_with_reason() -> Option<AbortWithReason> {
+    // SAFETY: `dlsym` only reads the `RTLD_DEFAULT` pseudo-handle and a
+    // NUL-terminated static name; it returns null or an exported address.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"abort_with_reason".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null result is libsystem_kernel's exported `abort_with_reason`,
+    // whose C signature (above) is exactly `AbortWithReason`.
+    Some(unsafe { std::mem::transmute::<*mut libc::c_void, AbortWithReason>(symbol) })
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -421,6 +476,12 @@ mod macos_tests {
         let mut child = guarded.0.take().expect("guard owns child");
         let status = child.wait().expect("owned Child reaps observed exit");
         assert_eq!(status.code(), Some(7));
+    }
+
+    /// Resolve, never call: a miss would fall back to `abort()` and file reports.
+    #[test]
+    fn abort_with_reason_resolves_at_call_time() {
+        assert!(resolve_abort_with_reason().is_some());
     }
 }
 

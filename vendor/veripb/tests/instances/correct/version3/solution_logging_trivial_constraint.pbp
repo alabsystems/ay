@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 4 ;
+sol x1 ;
+output NONE;
+conclusion SAT;
+end pseudo-Boolean proof ;

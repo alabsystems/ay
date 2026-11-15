@@ -383,7 +383,7 @@ fn run_seed(
         }
     }
 
-    // Optional z3 cross-check (heavy run only; z3 resolved by caller).
+    // Optional z3 cross-check (heavy run only; an identity-checked z3 path).
     if let Some(z3_bin) = z3 {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("ay-qflia-fuzz-{seed}.smt2"));

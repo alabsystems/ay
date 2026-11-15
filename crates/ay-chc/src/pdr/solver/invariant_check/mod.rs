@@ -9,6 +9,10 @@ use super::{
     FxHashMap, HornClause, InvariantModel, Lemma, PdrSolver, PredicateId, RelationType, SmtResult,
 };
 
+#[cfg(test)]
+mod alias_tests;
+#[cfg(test)]
+mod backward_chain_lemma_tests;
 mod candidate_repair;
 mod classify;
 mod houdini_prune;

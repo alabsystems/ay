@@ -1329,7 +1329,7 @@ fn soundness_differential_dillig_style() {
 fn solidity_balance_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Balance".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkBalance".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1348,7 +1348,7 @@ fn solidity_balance_sort() -> ChcSort {
 fn solidity_state_sort(balance_sort: ChcSort) -> ChcSort {
     ChcSort::Datatype {
         name: "State".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkState".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "balances".to_string(),

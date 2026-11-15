@@ -24,29 +24,41 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::corpus::optional_corpus_file;
 use crate::spawn::{OutputTimeout, DEFAULT_CHILD_TIMEOUT};
 
 fn ay_bin() -> String {
     env!("CARGO_BIN_EXE_ay").to_string()
 }
 
-fn qf_lra_false_unsat_path() -> String {
-    format!(
-        "{}/../../benchmarks/smtcomp/QF_LRA/rand_70_300_1155482584_11.lp.smt2",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
+const QF_LRA_FALSE_UNSAT: &str = "benchmarks/smtcomp/QF_LRA/rand_70_300_1155482584_11.lp.smt2";
 
-/// #8759: strict-proof mode downgrades the `rand_70_300_*_11` false UNSAT
-/// to `unknown` with the `(incomplete proof-trusted)` reason.
+/// #8759: strict-proof mode never publishes `unsat` on the `rand_70_300_*_11`
+/// SAT instance (z3: `sat`).
+///
+/// DECISION (2026-09-24): this test used to also require the historical false
+/// UNSAT to still be produced internally so that strict mode could catch it
+/// (`unknown` with `(incomplete proof-trusted)`). That false UNSAT is gone: at
+/// d14c2313e AY answers `unknown` at a 300 s budget in default, `--no-proof`
+/// and `--strict-proofs` modes alike, and z3 answers `sat`. The test ran only
+/// on hosts holding the gitignored corpus until bedafe466, so the change went
+/// unseen. A guard that needs a soundness bug to persist is obsolete; the
+/// soundness invariant (never `unsat` here) is kept unchanged, `sat` (the
+/// right answer) and `unknown` are accepted, and the strict-proof
+/// `(incomplete proof-trusted)` downgrade itself stays pinned by
+/// `strict_proof_terminal_trust_library_gate.rs` (ay-dpll) and
+/// `provenance_assume_gate_leak2.rs`.
 #[test]
 #[timeout(120_000)]
 fn strict_proofs_downgrades_rand_70_300_11_false_unsat() {
-    let benchmark = qf_lra_false_unsat_path();
-    if !std::path::Path::new(&benchmark).is_file() {
-        eprintln!("SKIP: optional QF_LRA benchmark not found: {benchmark}");
+    // Gitignored corpus: absent means skip (announced), or a failure under
+    // `AY_REQUIRE_CORPUS=1` — never a pass that checked something.
+    let Some(benchmark) = optional_corpus_file(
+        "strict_proofs_downgrades_rand_70_300_11_false_unsat",
+        QF_LRA_FALSE_UNSAT,
+    ) else {
         return;
-    }
+    };
     let output = Command::new(ay_bin())
         .arg("--strict-proofs")
         .arg("-t:60000")
@@ -63,57 +75,103 @@ fn strict_proofs_downgrades_rand_70_300_11_false_unsat() {
         "Soundness regression (#8759): strict-proof mode must not accept the \
          known false-UNSAT instance rand_70_300_*_11.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert_eq!(
-        first_line, "unknown",
-        "Expected strict-proof downgrade to `unknown`; got {first_line:?}.\nstdout:\n{stdout}"
-    );
     assert!(
-        stderr.contains("(:reason-unknown (incomplete proof-trusted))"),
-        "Expected `(:reason-unknown (incomplete proof-trusted))` on stderr \
-         after strict-proof downgrade (#8759). stderr was:\n{stderr}"
+        first_line == "sat" || first_line == "unknown",
+        "Expected `sat` or `unknown` on the SAT instance; got {first_line:?}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
 /// FP forward-error UNSATs are in the strict proof subset: the refutation
 /// closes through the typed `fp_forward_error` theory lemma (independently
-/// re-derived by `ay-proof`'s analytic checker), not `:rule trust`, so
-/// `--strict-proofs` must keep the verdict `unsat` (it previously downgraded
-/// to `unknown (incomplete proof-trusted)`).
+/// re-derived by `ay-proof`'s analytic checker), not `:rule trust`.
+///
+/// Owner decision D7 (31c874c43, 2026-09-22; the refusal first landed with
+/// c93a232b2) makes every consumer that CLAIMS an external re-check refuse a
+/// certificate pinned Carcara 1.1.0 cannot parse, and names `--strict-proofs`
+/// as one: `(_ FloatingPoint 11 53)` is outside that checker's sort grammar,
+/// so the verdict is withheld as `(incomplete proof-trusted)` WITH the surface
+/// as its stated cause. The library twin is
+/// `strict_proof_terminal_trust_library_gate::strict_proofs_refusal_names_the_unsupported_carcara_surface`.
+///
+/// What this test still guards (#8759's FP half, 361e3038f): the forward-error
+/// lemma must stay trust-free. The plain run must publish `unsat` admitted by
+/// AY's strict checker (`unsat_admission=strict-proof`), and the strict-proofs
+/// refusal must cite ONLY the unsupported surface. A lemma regressed to
+/// `:rule trust` changes the admission and adds "a trust or hole step reaches
+/// the empty clause" to the refusal, and fails here.
 #[test]
 #[timeout(60_000)]
-fn strict_proofs_preserves_fp_forward_error_unsat() {
+fn strict_proofs_refuses_fp_forward_error_unsat_for_its_surface_only() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("fp_forward_error_guard_claim.smt2");
-    let mut f = std::fs::File::create(&path).expect("create tmp smt2");
-    writeln!(
-        f,
-        "(set-logic QF_FPLRA)\n\
-         (declare-const x Float64)\n\
-         (declare-const y Float64)\n\
-         (assert (and (fp.isNormal x) (<= (fp.to_real (fp.abs x)) 1.0)))\n\
-         (assert (and (fp.isNormal y) (<= (fp.to_real (fp.abs y)) 1.0)))\n\
-         (assert (>= (- (fp.to_real (fp.add RNE x y))\n\
-                        (+ (fp.to_real x) (fp.to_real y)))\n\
-                     0.3))\n\
-         (check-sat)\n\
-         (exit)"
-    )
-    .expect("write tmp smt2");
-    drop(f);
+    // One file per run: a file-input `unsat` writes `<file>.alethe` beside it,
+    // and a second run must not collide with the first run's certificate.
+    let solve = |name: &str, flag: Option<&str>| {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).expect("create tmp smt2");
+        writeln!(
+            f,
+            "(set-logic QF_FPLRA)\n\
+             (declare-const x Float64)\n\
+             (declare-const y Float64)\n\
+             (assert (and (fp.isNormal x) (<= (fp.to_real (fp.abs x)) 1.0)))\n\
+             (assert (and (fp.isNormal y) (<= (fp.to_real (fp.abs y)) 1.0)))\n\
+             (assert (>= (- (fp.to_real (fp.add RNE x y))\n\
+                            (+ (fp.to_real x) (fp.to_real y)))\n\
+                         0.3))\n\
+             (check-sat)\n\
+             (exit)"
+        )
+        .expect("write tmp smt2");
+        drop(f);
+        let mut cmd = Command::new(ay_bin());
+        if let Some(flag) = flag {
+            cmd.arg(flag);
+        }
+        let output = cmd
+            .arg("-t:30000")
+            .arg(&path)
+            .output_timeout(DEFAULT_CHILD_TIMEOUT)
+            .expect("failed to spawn ay");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let first_line = stdout.trim().lines().next().unwrap_or("").to_string();
+        (first_line, stdout, stderr)
+    };
 
-    let output = Command::new(ay_bin())
-        .arg("--strict-proofs")
-        .arg("-t:30000")
-        .arg(&path)
-        .output_timeout(DEFAULT_CHILD_TIMEOUT)
-        .expect("failed to spawn ay");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_line = stdout.trim().lines().next().unwrap_or("").to_string();
+    // The refutation itself: published, and admitted by AY's own strict
+    // checker, which re-derived the forward-error lemma.
+    let (plain, plain_stdout, plain_stderr) = solve("fp_forward_error_plain.smt2", None);
     assert_eq!(
-        first_line, "unsat",
-        "strict-proof mode must accept the independently checked forward-error \
-         refutation: got {first_line:?}.\nstdout:\n{stdout}"
+        plain, "unsat",
+        "the forward-error refutation must publish in plain mode: got {plain:?}.\n\
+         stdout:\n{plain_stdout}\nstderr:\n{plain_stderr}"
+    );
+    assert!(
+        plain_stderr.contains("unsat_admission=strict-proof"),
+        "AY's strict checker must admit the forward-error refutation (a lemma regressed to \
+         `:rule trust` changes the admission).\nstderr:\n{plain_stderr}"
+    );
+
+    // Strict proofs: refused for the unsupported external surface, and for
+    // nothing else (D7).
+    let (strict, strict_stdout, stderr) =
+        solve("fp_forward_error_strict.smt2", Some("--strict-proofs"));
+    assert_eq!(
+        strict, "unknown",
+        "D7: --strict-proofs withholds an FP certificate pinned Carcara cannot parse: got \
+         {strict:?}.\nstdout:\n{strict_stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("(:reason-unknown (incomplete proof-trusted))")
+            && stderr.contains("external-recheck surface is unsupported")
+            && stderr.contains("FloatingPoint"),
+        "the refusal must carry the typed reason and name the unsupported FloatingPoint \
+         surface.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("a trust or hole step reaches the empty clause"),
+        "the forward-error refutation must be trust-free: the only refusal cause is the \
+         surface.\nstderr:\n{stderr}"
     );
 }
 

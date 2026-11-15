@@ -41,6 +41,14 @@ pub(crate) enum VivifyTier {
 pub struct VivifyStats {
     /// Number of clauses examined
     pub clauses_examined: u64,
+    /// Per tier (learned core, learned tier 2, learned other, irredundant):
+    /// clauses examined and clauses vivified (strengthened, satisfied or
+    /// subsumed), Kissat's `tried` / `vivified` per `vivify-tier*` phase.
+    pub tier_examined: [u64; 4],
+    pub tier_vivified: [u64; 4],
+    /// Generations: times a tier had no untried clause left and was
+    /// re-flagged whole (`--sat-inproc-nlogn-schedule`, `VIVIFY_TRIED_BIT`).
+    pub generations: u64,
     /// Number of clauses strengthened
     pub clauses_strengthened: u64,
     /// Number of clauses deleted because a conflict clause directly subsumed them
@@ -48,6 +56,9 @@ pub struct VivifyStats {
     /// Number of clauses deleted because a reason clause during backward
     /// analysis subsumed them (CaDiCaL vivify_analyze subsumption path)
     pub analysis_subsumed: u64,
+    /// Irredundant clauses deleted as asymmetric tautologies found on the
+    /// conflict path (`--sat-vivify-asym-kissat`)
+    pub asym_deleted: u64,
     /// Total literals removed
     pub literals_removed: u64,
     /// Number of clauses found to be satisfied

@@ -848,12 +848,13 @@ fn free_var_names(terms: &TermStore, t: TermId, out: &mut Vec<String>) {
 /// discrepancy, None if z3 is unavailable.
 fn z3_equiv_check(terms: &TermStore, var_name: &str, body: TermId, result: TermId) -> Option<bool> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    // z3 availability probe.
-    if Command::new("z3").arg("--version").output().is_err() {
-        return None;
-    }
+    // The oracle is identity-checked and reached by path, not by name: a
+    // binary named `z3` that is not z3 answers neither `sat` nor `unsat`, and
+    // the caller below would then report a CORRECT elimination as "not
+    // equivalent". See `ay_test_support::z3`.
+    let z3 = ay_test_support::z3::optional_z3("ay-dpll qe::cooper::tests::z3_cross_check_suite")?;
 
     // Free vars = all vars in body/result except the eliminated one.
     let mut names = Vec::new();
@@ -875,7 +876,8 @@ fn z3_equiv_check(terms: &TermStore, var_name: &str, body: TermId, result: TermI
     // Direction 2: O ∧ ¬(∃x.φ) must be UNSAT  (proves O ⇒ ∃x.φ).
     let run = |assertion: &str| -> Option<String> {
         let script = format!("(set-logic LIA)\n{decls}(assert {assertion})\n(check-sat)\n");
-        let mut child = Command::new("z3")
+        let mut child = z3
+            .command()
             .args(["-in", "-smt2"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -884,7 +886,18 @@ fn z3_equiv_check(terms: &TermStore, var_name: &str, body: TermId, result: TermI
             .ok()?;
         child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
         let out = child.wait_with_output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        // A non-answer is ABSENCE, never disagreement. z3 exits 0 and prints a
+        // verdict line; anything else (crash, refusal, silence) must fall
+        // through to the skip path rather than be compared against "unsat" and
+        // reported as an equivalence failure in AY's quantifier elimination.
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stdout.is_empty() {
+            return None;
+        }
+        Some(stdout)
     };
 
     let dir1 = run(&format!("(and {exists_phi} (not {o}))"))?;
@@ -1049,7 +1062,7 @@ fn z3_cross_check_suite() {
 
     if !z3_available {
         eprintln!(
-            "z3_cross_check_suite: z3 binary not found on PATH — SKIPPING z3 cross-check \
+            "z3_cross_check_suite: no z3 answered (none usable, or a non-answer) — SKIPPING z3 cross-check \
              (in-fragment correctness still covered by the internal self-check + brute-force grid tests)."
         );
         return;

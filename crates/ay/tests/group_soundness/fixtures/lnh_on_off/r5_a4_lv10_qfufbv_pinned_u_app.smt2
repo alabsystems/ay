@@ -1,0 +1,10 @@
+; z3 5.1.0: sat
+(set-logic QF_UFBV)
+(declare-sort U 0)
+(declare-const c0 U)
+(declare-const c1 U)
+(declare-const x U)
+(declare-fun f (U) U)
+(assert (= x c0))
+(assert (or (= (f x) c0) (= (f x) c1)))
+(check-sat)

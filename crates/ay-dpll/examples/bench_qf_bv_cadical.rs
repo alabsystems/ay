@@ -9,7 +9,7 @@
 //! - CaDiCaL on the same CNF (written to a temp DIMACS file)
 //!
 //! Usage:
-//!   cargo run --release -p ay-dpll --example bench_qf_bv_cadical -- [benchmark_dir] [limit] [cadical_path]
+//!   targo --unverified run --release -p ay-dpll --example bench_qf_bv_cadical -- [benchmark_dir] [limit] [cadical_path]
 //!
 //! Defaults:
 //!   benchmark_dir = benchmarks/smt/QF_BV
@@ -62,7 +62,10 @@ fn write_dimacs(path: &Path, num_vars: u32, clauses: &[CnfClause]) -> std::io::R
 }
 
 /// Build the QF_BV CNF encoding used by `Executor::solve_bv` (non-incremental).
-fn build_qf_bv_cnf(terms: &TermStore, assertions: &[TermId]) -> (u32, Vec<CnfClause>) {
+fn build_qf_bv_cnf(
+    terms: &TermStore,
+    assertions: &[TermId],
+) -> anyhow::Result<(u32, Vec<CnfClause>)> {
     // Boolean structure.
     let tseitin = Tseitin::new(terms);
     let tseitin_result = tseitin.transform_all(assertions);
@@ -70,6 +73,10 @@ fn build_qf_bv_cnf(terms: &TermStore, assertions: &[TermId]) -> (u32, Vec<CnfCla
     // BV constraints.
     let mut bv_solver = BvSolver::new(terms);
     let bv_clauses = bv_solver.bitblast_all(assertions);
+    anyhow::ensure!(
+        bv_solver.encoding_complete(),
+        "BV encoding stopped; no equivalent CNF"
+    );
 
     let mut all_clauses = tseitin_result.clauses.clone();
     let var_offset = tseitin_result.num_vars as i32;
@@ -121,7 +128,11 @@ fn build_qf_bv_cnf(terms: &TermStore, assertions: &[TermId]) -> (u32, Vec<CnfCla
     }
 
     let total_vars = tseitin_result.num_vars + bv_solver.num_vars();
-    (total_vars, all_clauses)
+    anyhow::ensure!(
+        bv_solver.encoding_complete(),
+        "BV encoding stopped; no equivalent CNF"
+    );
+    Ok((total_vars, all_clauses))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -207,7 +218,7 @@ fn main() -> anyhow::Result<()> {
 
         let cnf_start = Instant::now();
         let (num_vars, clauses) =
-            build_qf_bv_cnf(&exec.context().terms, &exec.context().assertions);
+            build_qf_bv_cnf(&exec.context().terms, &exec.context().assertions)?;
         let cnf_time = cnf_start.elapsed();
         total_cnf += cnf_time;
 

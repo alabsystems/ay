@@ -352,24 +352,36 @@ impl FactorExtensionLratTransaction {
             return None;
         }
 
-        let mut quotient_tails = Vec::with_capacity(dry_run.quotient_clauses.len());
+        let mut quotient_tails = Vec::new();
+        quotient_tails
+            .try_reserve_exact(dry_run.quotient_clauses.len())
+            .ok()?;
         for quotient in &dry_run.quotient_clauses {
-            if quotient.first().copied() != Some(fresh_neg) {
+            let (&head, tail) = quotient.split_first()?;
+            if head != fresh_neg {
                 return None;
             }
-            quotient_tails.push(quotient[1..].to_vec());
+            quotient_tails.push(tail.to_vec());
         }
 
         let factor_count = dry_run.factors.len();
-        let divider_clause_ids = dry_run.planned_add_ids[..factor_count].to_vec();
-        let blocked_clause_id = dry_run.planned_add_ids[factor_count];
-        let quotient_clause_ids = dry_run.planned_add_ids[factor_count + 1..].to_vec();
+        let divider_clause_ids = dry_run.planned_add_ids.get(..factor_count)?.to_vec();
+        let blocked_clause_id = *dry_run.planned_add_ids.get(factor_count)?;
+        let quotient_clause_ids = dry_run
+            .planned_add_ids
+            .get(factor_count.checked_add(1)?..)?
+            .to_vec();
         let blocked_signed_lrat_hints = negative_lrat_hints_for_ids(&divider_clause_ids)?;
         let quotient_lrat_hints = factor_quotient_lrat_hints(
             &dry_run.source_clause_ids_quotient_major,
             factor_count,
             blocked_clause_id,
         )?;
+
+        // Every divider clause is RAT on the fresh literal.
+        let mut divider_rat_pivots = Vec::new();
+        divider_rat_pivots.try_reserve_exact(factor_count).ok()?;
+        divider_rat_pivots.extend(std::iter::repeat_n(dry_run.fresh_lit, factor_count));
 
         let transaction = Self {
             source_dimacs_uri: dry_run.source_dimacs_uri,
@@ -385,7 +397,7 @@ impl FactorExtensionLratTransaction {
             source_clause_ids_quotient_major: dry_run.source_clause_ids_quotient_major,
             source_clause_lits_quotient_major: dry_run.source_clause_lits_quotient_major,
             divider_clause_ids,
-            divider_rat_pivots: vec![dry_run.fresh_lit; factor_count],
+            divider_rat_pivots,
             blocked_clause_id,
             blocked_signed_lrat_hints,
             quotient_clause_ids,
@@ -422,7 +434,10 @@ impl FactorExtensionLratTransaction {
             return false;
         }
 
-        let source_count = self.factors.len() * self.quotient_tails.len();
+        // No clause list can hold an overflowing product of two lengths.
+        let Some(source_count) = self.factors.len().checked_mul(self.quotient_tails.len()) else {
+            return false;
+        };
         if self.source_clause_ids_quotient_major.len() != source_count
             || self.source_clause_lits_quotient_major.len() != source_count
             || self.source_delete_ids != self.source_clause_ids_quotient_major
@@ -476,6 +491,12 @@ impl FactorExtensionLratTransaction {
             }
         }
 
+        self.quotient_rows_match_their_sources()
+    }
+
+    /// Each quotient's LRAT hints are its sources' ids then the blocked clause,
+    /// and each source clause is exactly `factor ∨ tail` for its factor.
+    fn quotient_rows_match_their_sources(&self) -> bool {
         for (quotient_idx, tail) in self.quotient_tails.iter().enumerate() {
             let source_start = quotient_idx * self.factors.len();
             let source_end = source_start + self.factors.len();
@@ -636,7 +657,7 @@ impl FactorExtensionLratTransaction {
         );
         obligation.extra.insert(
             "factor.blocked_clause_lits".to_string(),
-            join_i64s(&factor_blocked_clause(self.fresh_lit, &self.factors)),
+            join_i64s(&factor_blocked_clause(self.fresh_lit, &self.factors)?),
         );
         obligation.extra.insert(
             "factor.blocked_signed_lrat_hints".to_string(),
@@ -651,7 +672,7 @@ impl FactorExtensionLratTransaction {
             join_i64_groups(&factor_quotient_clauses(
                 self.fresh_lit,
                 &self.quotient_tails,
-            )),
+            )?),
         );
         obligation.extra.insert(
             "factor.quotient_lrat_hints".to_string(),
@@ -1014,7 +1035,9 @@ fn goal_kind_name(goal_kind: ObligationGoalKind) -> &'static str {
 
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut out = String::new();
+    // A failed reservation only forgoes the pre-sizing.
+    let _ = out.try_reserve_exact(bytes.len().saturating_mul(2));
     for &byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
@@ -1047,7 +1070,7 @@ fn clause_well_formed_dimacs(lits: &[i64]) -> bool {
             return false;
         }
         for &prev in &lits[..idx] {
-            if prev == lit || prev == -lit {
+            if prev == lit || prev.checked_neg() == Some(lit) {
                 return false;
             }
         }
@@ -1077,7 +1100,8 @@ fn negative_hints_match_ids(hints: &[i64], ids: &[u64]) -> bool {
 }
 
 fn negative_lrat_hints_for_ids(ids: &[u64]) -> Option<Vec<i64>> {
-    let mut hints = Vec::with_capacity(ids.len());
+    let mut hints = Vec::new();
+    hints.try_reserve_exact(ids.len()).ok()?;
     for &id in ids {
         hints.push(i64::try_from(id).ok()?.checked_neg()?);
     }
@@ -1109,23 +1133,32 @@ fn factor_divider_clauses(fresh_lit: i64, factors: &[i64]) -> Vec<Vec<i64>> {
         .collect()
 }
 
-fn factor_blocked_clause(fresh_lit: i64, factors: &[i64]) -> Vec<i64> {
-    let mut blocked = Vec::with_capacity(factors.len() + 1);
-    blocked.push(-fresh_lit);
-    blocked.extend(factors.iter().map(|&factor| -factor));
+/// `None` when a literal has no negation (`i64::MIN`).
+fn factor_blocked_clause(fresh_lit: i64, factors: &[i64]) -> Option<Vec<i64>> {
+    let mut blocked = Vec::new();
     blocked
+        .try_reserve_exact(factors.len().checked_add(1)?)
+        .ok()?;
+    blocked.push(fresh_lit.checked_neg()?);
+    for &factor in factors {
+        blocked.push(factor.checked_neg()?);
+    }
+    Some(blocked)
 }
 
-fn factor_quotient_clauses(fresh_lit: i64, quotient_tails: &[Vec<i64>]) -> Vec<Vec<i64>> {
-    quotient_tails
-        .iter()
-        .map(|tail| {
-            let mut clause = Vec::with_capacity(tail.len() + 1);
-            clause.push(-fresh_lit);
-            clause.extend_from_slice(tail);
-            clause
-        })
-        .collect()
+/// `None` when `fresh_lit` has no negation (`i64::MIN`).
+fn factor_quotient_clauses(fresh_lit: i64, quotient_tails: &[Vec<i64>]) -> Option<Vec<Vec<i64>>> {
+    let fresh_neg = fresh_lit.checked_neg()?;
+    let mut clauses = Vec::new();
+    clauses.try_reserve_exact(quotient_tails.len()).ok()?;
+    for tail in quotient_tails {
+        let mut clause = Vec::new();
+        clause.try_reserve_exact(tail.len().checked_add(1)?).ok()?;
+        clause.push(fresh_neg);
+        clause.extend_from_slice(tail);
+        clauses.push(clause);
+    }
+    Some(clauses)
 }
 
 fn factor_transaction_max_width(transaction: &FactorExtensionLratTransaction) -> Option<u64> {
@@ -1135,15 +1168,13 @@ fn factor_transaction_max_width(transaction: &FactorExtensionLratTransaction) ->
         .map(Vec::len)
         .max()
         .unwrap_or(0);
-    let quotient_width = transaction
-        .quotient_tails
-        .iter()
-        .map(|tail| tail.len() + 1)
-        .max()
-        .unwrap_or(0);
+    let mut quotient_width = 0;
+    for tail in &transaction.quotient_tails {
+        quotient_width = quotient_width.max(tail.len().checked_add(1)?);
+    }
     let width = source_width
         .max(quotient_width)
-        .max(transaction.factors.len() + 1);
+        .max(transaction.factors.len().checked_add(1)?);
     (width != 0).then_some(width as u64)
 }
 
@@ -1323,8 +1354,9 @@ mod tests {
             "p cnf 4 4\n-1 2 0\n-2 3 0\n-3 1 0\n3 4 0\n".to_string()
         }
 
-        fn planned_lrat_prefix(&self) -> String {
-            format!(
+        fn planned_lrat_prefix(&self) -> Option<String> {
+            let next_clause_id = self.rewritten_clause_id.checked_add(1)?;
+            Some(format!(
                 "{} -3 1 0 {} 0\n{} 3 -1 0 {} {} 0\n{} 1 4 0 {} {} 0\n{} d {} {} 0\n",
                 self.lit_to_repr_binary_id,
                 self.edge_clause_ids[2],
@@ -1334,10 +1366,10 @@ mod tests {
                 self.rewritten_clause_id,
                 self.lit_to_repr_binary_id,
                 self.original_clause_id,
-                self.rewritten_clause_id + 1,
+                next_clause_id,
                 self.lit_to_repr_binary_id,
                 self.repr_to_lit_binary_id
-            )
+            ))
         }
 
         fn slice(&self) -> EquivalenceSubstitutionLratSlice {
@@ -1392,28 +1424,39 @@ mod tests {
     }
 
     impl MinimalCliqueFactorFixture {
-        fn source_clause_lits_quotient_major(&self) -> Vec<Vec<i64>> {
-            self.quotient_tails
-                .iter()
-                .flat_map(|tail| {
-                    self.factors.iter().map(move |&factor| {
-                        let mut clause = Vec::with_capacity(tail.len() + 1);
-                        clause.push(factor);
-                        clause.extend_from_slice(tail);
-                        clause
-                    })
-                })
-                .collect()
+        fn source_clause_lits_quotient_major(&self) -> Option<Vec<Vec<i64>>> {
+            let mut clauses = Vec::new();
+            for tail in &self.quotient_tails {
+                for &factor in &self.factors {
+                    let mut clause = Vec::new();
+                    clause.try_reserve_exact(tail.len().checked_add(1)?).ok()?;
+                    clause.push(factor);
+                    clause.extend_from_slice(tail);
+                    clauses.push(clause);
+                }
+            }
+            Some(clauses)
         }
 
-        fn source_clause_ids_quotient_major(&self) -> Vec<u64> {
-            (0..self.source_clause_lits_quotient_major().len())
-                .map(|idx| self.first_source_clause_id + idx as u64)
-                .collect()
+        /// `count` consecutive IDs starting at `first`.
+        fn consecutive_ids(first: u64, count: usize) -> Option<Vec<u64>> {
+            let mut ids = Vec::new();
+            ids.try_reserve_exact(count).ok()?;
+            for idx in 0..count {
+                ids.push(first.checked_add(u64::try_from(idx).ok()?)?);
+            }
+            Some(ids)
         }
 
-        fn source_dimacs(&self) -> String {
-            let clauses = self.source_clause_lits_quotient_major();
+        fn source_clause_ids_quotient_major(&self) -> Option<Vec<u64>> {
+            Self::consecutive_ids(
+                self.first_source_clause_id,
+                self.source_clause_lits_quotient_major()?.len(),
+            )
+        }
+
+        fn source_dimacs(&self) -> Option<String> {
+            let clauses = self.source_clause_lits_quotient_major()?;
             let mut dimacs = format!("p cnf {} {}\n", self.num_vars, clauses.len());
             for clause in clauses {
                 for lit in clause {
@@ -1421,19 +1464,21 @@ mod tests {
                 }
                 dimacs.push_str("0\n");
             }
-            dimacs
+            Some(dimacs)
         }
 
-        fn planned_add_ids(&self) -> Vec<u64> {
-            let add_count = self.factors.len() + 1 + self.quotient_tails.len();
-            (0..add_count)
-                .map(|idx| self.first_planned_add_id + idx as u64)
-                .collect()
+        fn planned_add_ids(&self) -> Option<Vec<u64>> {
+            let add_count = self
+                .factors
+                .len()
+                .checked_add(1)?
+                .checked_add(self.quotient_tails.len())?;
+            Self::consecutive_ids(self.first_planned_add_id, add_count)
         }
 
-        fn dry_run(&self) -> FactorExtensionLratDryRun {
-            let source_clause_ids = self.source_clause_ids_quotient_major();
-            FactorExtensionLratDryRun {
+        fn dry_run(&self) -> Option<FactorExtensionLratDryRun> {
+            let source_clause_ids = self.source_clause_ids_quotient_major()?;
+            Some(FactorExtensionLratDryRun {
                 source_dimacs_uri: "inline:minimal-clique-factor-2x3.cnf".to_string(),
                 lrat_proof_uri: "target/minimal-clique-factor/proof.lrat".to_string(),
                 transform_transaction_uri:
@@ -1444,13 +1489,13 @@ mod tests {
                 num_clauses: source_clause_ids.len() as u64,
                 fresh_lit: self.fresh_lit,
                 factors: self.factors.clone(),
-                quotient_clauses: factor_quotient_clauses(self.fresh_lit, &self.quotient_tails),
+                quotient_clauses: factor_quotient_clauses(self.fresh_lit, &self.quotient_tails)?,
                 source_clause_ids_quotient_major: source_clause_ids.clone(),
-                source_clause_lits_quotient_major: self.source_clause_lits_quotient_major(),
-                planned_add_ids: self.planned_add_ids(),
+                source_clause_lits_quotient_major: self.source_clause_lits_quotient_major()?,
+                planned_add_ids: self.planned_add_ids()?,
                 source_delete_ids_quotient_major: source_clause_ids,
                 producer_revision: Some("ay-test-rev".to_string()),
-            }
+            })
         }
     }
 
@@ -1585,14 +1630,17 @@ mod tests {
     }
 
     #[test]
-    fn decompose_minimal_equivalence_chain_fixture_records_obligation_shape() {
+    fn decompose_minimal_equivalence_chain_fixture_records_obligation_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let fixture = minimal_equivalence_chain_fixture();
         assert_eq!(
             fixture.source_dimacs(),
             "p cnf 4 4\n-1 2 0\n-2 3 0\n-3 1 0\n3 4 0\n"
         );
         assert_eq!(
-            fixture.planned_lrat_prefix(),
+            fixture
+                .planned_lrat_prefix()
+                .ok_or("fixture clause IDs fit u64")?,
             "5 -3 1 0 3 0\n6 3 -1 0 1 2 0\n7 1 4 0 5 4 0\n8 d 5 6 0\n"
         );
 
@@ -1646,6 +1694,7 @@ mod tests {
         assert_eq!(obligation.extra["decompose.level0_unit_ids"], "");
         assert!(obligation.trust_policy.require_external_checker);
         assert!(obligation.fingerprint_is_current());
+        Ok(())
     }
 
     #[test]
@@ -1789,10 +1838,13 @@ mod tests {
     }
 
     #[test]
-    fn factor_extension_lrat_dry_run_matches_minimal_clique_factor_fixture() {
+    fn factor_extension_lrat_dry_run_matches_minimal_clique_factor_fixture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let fixture = minimal_clique_factor_fixture();
         assert_eq!(
-            fixture.source_dimacs(),
+            fixture
+                .source_dimacs()
+                .ok_or("fixture source clauses build")?,
             concat!(
                 "p cnf 5 6\n",
                 "1 3 4 0\n",
@@ -1804,10 +1856,12 @@ mod tests {
             )
         );
 
-        let dry_run = fixture.dry_run();
+        let dry_run = fixture.dry_run().ok_or("fixture dry-run builds")?;
         assert_eq!(
             dry_run.source_clause_lits_quotient_major,
-            fixture.source_clause_lits_quotient_major()
+            fixture
+                .source_clause_lits_quotient_major()
+                .ok_or("fixture source clauses build")?
         );
         assert_eq!(
             dry_run.quotient_clauses,
@@ -1864,6 +1918,7 @@ mod tests {
             "21,22,33;23,24,33;25,26,33"
         );
         assert!(obligation.fingerprint_is_current());
+        Ok(())
     }
 
     #[test]
@@ -1872,6 +1927,25 @@ mod tests {
         dry_run.planned_add_ids = vec![11, 12, 14, 15, 16];
 
         assert!(dry_run.into_transaction().is_none());
+    }
+
+    #[test]
+    fn factor_clause_builders_decline_an_unnegatable_literal() -> Result<(), String> {
+        if factor_blocked_clause(6, &[1, 2]) != Some(vec![-6, -1, -2]) {
+            return Err("blocked clause negates every literal".to_string());
+        }
+        if factor_blocked_clause(i64::MIN, &[1]).is_some()
+            || factor_blocked_clause(6, &[1, i64::MIN]).is_some()
+        {
+            return Err("i64::MIN has no negation".to_string());
+        }
+        if factor_quotient_clauses(6, &[vec![3, 4]]) != Some(vec![vec![-6, 3, 4]]) {
+            return Err("quotient clause leads with the negated fresh literal".to_string());
+        }
+        if factor_quotient_clauses(i64::MIN, &[vec![3]]).is_some() {
+            return Err("i64::MIN has no negation".to_string());
+        }
+        Ok(())
     }
 
     #[test]

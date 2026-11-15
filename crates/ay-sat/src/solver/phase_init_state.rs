@@ -38,16 +38,27 @@ pub(crate) struct PhaseInitState {
 impl PhaseInitState {
     /// Create the walk/warmup state for `num_vars` variables.
     pub(crate) fn new(num_vars: usize) -> Self {
-        Self {
+        match Self::build_admitted(num_vars, &super::construction::Ordinary) {
+            Ok(state) => state,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn build_admitted<A: super::construction::Construction>(
+        num_vars: usize,
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        Ok(Self {
             walk_stats: WalkStats::default(),
             walk_enabled: true,
             startup_walk_enabled: true,
             walk_limit: WALK_DEFAULT_LIMIT,
             walk_last_ticks: 0,
-            walk_prev_phase: vec![false; num_vars],
+            walk_prev_phase: a.filled(num_vars, false)?,
             warmup_stats: WarmupStats::default(),
             warmup_enabled: true,
             startup_warmup_enabled: true,
-        }
+        })
     }
 }

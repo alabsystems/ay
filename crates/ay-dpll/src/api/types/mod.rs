@@ -9,6 +9,7 @@
 
 pub(crate) mod annotated_core;
 mod capabilities;
+mod complete_value;
 mod cross_check;
 mod error;
 mod explanation;
@@ -25,7 +26,11 @@ mod model_value_display;
 mod native_replay;
 mod objective;
 mod results;
+mod scalar_function;
 mod verification;
+
+// Complete-value transport is additive data, not a capability-route change.
+pub use complete_value::CompleteModelValue;
 
 // Re-export all public types to preserve the existing `types::*` surface.
 pub use annotated_core::{
@@ -164,7 +169,7 @@ pub use capabilities::{
     AY_SYMBOLIC_EXECUTION_ROUTE_SELECTED_SOLVER_PATH_KIND,
 };
 pub use cross_check::{CrossCheckDisagreement, CrossCheckReport, CrossCheckRun, CrossCheckVariant};
-pub use error::SolverError;
+pub use error::{SolverError, TacticLimitKind};
 pub use explanation::{
     CoreConstraintExplanation, ExplanationKind, ExplanationReport, ModelAssignmentExplanation,
     SatExplanation, UnknownExplanation, UnsatCoreSource, UnsatExplanation,
@@ -174,7 +179,10 @@ pub(crate) use handles::{
 };
 pub use handles::{FuncDecl, Term};
 pub use incremental::{CoreEvolutionTracker, IncrementalCoreEvolution};
-pub use interpolant::{InterpolantResult, InterpolantStrength, PathInterpolantResult};
+pub use interpolant::{
+    InterpolantFailure, InterpolantMode, InterpolantResult, InterpolantStrength,
+    PathInterpolantResult,
+};
 pub use logic::{split_leading_set_logic, Logic, SortExt};
 pub use maxsmt::{MaxSmtResult, MaxSmtStatus};
 pub use model::{Model, VerifiedModel};
@@ -188,7 +196,7 @@ pub use model_blocking::{
     AY_MODEL_BLOCKING_CLAUSE_SCHEMA_VERSION,
 };
 pub use model_provenance::{AssignmentReason, ModelProvenance, VariableProvenance};
-pub use model_value::{FpSpecialKind, ModelValue};
+pub use model_value::{FpSpecialKind, ModelValue, TypedModelValueDecodeError};
 pub(crate) use native_replay::NativeReplayAdmissionToken;
 pub use native_replay::{
     NativeReplayArtifact, NativeReplayAssertion, NativeReplayCheckedReplaySummary,
@@ -201,6 +209,7 @@ pub use native_replay::{
 };
 pub use objective::ObjectiveValue;
 pub use results::{ConsumerAcceptanceError, SmtProofCertificate, SolveResult, VerifiedSolveResult};
+pub use scalar_function::{ScalarFunctionModel, ScalarFunctionModelDecodeError};
 pub use verification::{
     raw_smt_solve_profile_summary_from_process, raw_smt_solve_profile_summary_from_typed_details,
     raw_smt_solve_profile_summary_from_typed_summary, validate_raw_smt_solve_profile_summary,

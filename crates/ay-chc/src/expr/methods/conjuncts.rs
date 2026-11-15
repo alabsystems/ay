@@ -82,22 +82,58 @@ impl ChcExpr {
 
     /// Collect conjuncts into an existing vector (avoids allocation when appending).
     pub(crate) fn collect_conjuncts_into(&self, result: &mut Vec<Self>) {
-        fn collect_into(expr: &ChcExpr, out: &mut Vec<ChcExpr>, depth: usize) {
+        let _ = self.collect_conjuncts_into_checked(result, &mut || false);
+    }
+
+    /// Preserve the canonical order and depth fallback, returning no partial
+    /// conjunction when cancellation is observed.
+    pub(crate) fn collect_conjuncts_checked(
+        &self,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Option<Vec<Self>> {
+        let mut result = Vec::new();
+        self.collect_conjuncts_into_checked(&mut result, &mut should_stop)?;
+        Some(result)
+    }
+
+    fn collect_conjuncts_into_checked(
+        &self,
+        result: &mut Vec<Self>,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Option<()> {
+        fn collect_into(
+            expr: &ChcExpr,
+            out: &mut Vec<ChcExpr>,
+            depth: usize,
+            stop: &mut dyn FnMut() -> bool,
+        ) -> Option<()> {
+            if stop() {
+                return None;
+            }
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 out.push(expr.clone());
-                return;
+                return Some(());
             }
             maybe_grow_expr_stack(|| match expr {
                 ChcExpr::Op(ChcOp::And, args) => {
                     for arg in args {
-                        collect_into(arg.as_ref(), out, depth + 1);
+                        collect_into(arg.as_ref(), out, depth + 1, stop)?;
                     }
+                    Some(())
                 }
-                other => out.push(other.clone()),
-            });
+                other => {
+                    out.push(other.clone());
+                    Some(())
+                }
+            })
         }
 
-        collect_into(self, result, 0);
+        collect_into(self, result, 0, should_stop)?;
+        if should_stop() {
+            None
+        } else {
+            Some(())
+        }
     }
 
     /// Like [`collect_conjuncts`] but filters out trivial `Bool(true)` conjuncts.
@@ -118,28 +154,43 @@ impl ChcExpr {
 
     /// Like `collect_conjuncts` but returns borrowed references (no cloning).
     pub fn conjuncts(&self) -> Vec<&Self> {
-        let mut result = Vec::new();
-        self.conjuncts_into(&mut result);
-        result
+        self.conjuncts_checked(|| false).unwrap_or_default()
     }
 
-    /// Collect borrowed conjunct references into an existing vector.
-    fn conjuncts_into<'a>(&'a self, result: &mut Vec<&'a Self>) {
-        fn collect_refs<'a>(expr: &'a ChcExpr, out: &mut Vec<&'a ChcExpr>, depth: usize) {
+    /// Borrowed equivalent of the canonical collector, including its depth
+    /// fallback. A cancelled traversal never exposes its partial vector.
+    pub(crate) fn conjuncts_checked(&self, mut stop: impl FnMut() -> bool) -> Option<Vec<&Self>> {
+        fn collect_refs<'a>(
+            expr: &'a ChcExpr,
+            out: &mut Vec<&'a ChcExpr>,
+            depth: usize,
+            stop: &mut dyn FnMut() -> bool,
+        ) -> Option<()> {
+            if stop() {
+                return None;
+            }
             if depth >= MAX_EXPR_RECURSION_DEPTH {
                 out.push(expr);
-                return;
+                return Some(());
             }
-            maybe_grow_expr_stack(|| match expr {
-                ChcExpr::Op(ChcOp::And, args) => {
-                    for arg in args {
-                        collect_refs(arg.as_ref(), out, depth + 1);
+            maybe_grow_expr_stack(|| {
+                match expr {
+                    ChcExpr::Op(ChcOp::And, args) => {
+                        for arg in args {
+                            collect_refs(arg, out, depth + 1, stop)?;
+                        }
                     }
+                    other => out.push(other),
                 }
-                other => out.push(other),
-            });
+                Some(())
+            })
         }
-
-        collect_refs(self, result, 0);
+        let mut result = Vec::new();
+        collect_refs(self, &mut result, 0, &mut stop)?;
+        if stop() {
+            None
+        } else {
+            Some(result)
+        }
     }
 }

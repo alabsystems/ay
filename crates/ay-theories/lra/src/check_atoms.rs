@@ -10,6 +10,22 @@
 
 use super::*;
 
+/// Which pass of `process_check_atoms_inner` is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomPass {
+    /// The full `check`: generous cascade budget, plus the second pass that
+    /// re-collects the disequalities of previously processed atoms.
+    Full,
+    /// BCP-time `check_during_propagate`: capped cascades, no second pass.
+    Bcp,
+    /// #lra-scope-trail: `push` applying the atoms asserted since the last
+    /// check so that their bound-trail entries are recorded in the scope of
+    /// their ASSERTION (the scope being closed), not in the scope of the
+    /// first later check. Bounds only — no cascade, no second pass; the next
+    /// check runs the simplex and everything downstream.
+    PushFlush,
+}
+
 /// Result of processing newly-asserted atoms in check().
 pub(crate) struct CheckAtomStats {
     /// Disequality atoms collected for post-simplex checking.
@@ -35,7 +51,52 @@ impl LraSolver {
         &mut self,
         debug: bool,
     ) -> Result<CheckAtomStats, Box<TheoryResult>> {
-        self.process_check_atoms_inner(debug, false)
+        self.process_check_atoms_inner(debug, AtomPass::Full)
+    }
+
+    /// #lra-scope-trail: apply the bounds of every atom asserted since the
+    /// last check BEFORE a `push` records its marks.
+    ///
+    /// `assert_literal` only records an atom; its bound is written lazily by
+    /// the next check, and the bound-trail entry lands in whatever scope is
+    /// current at that check. A consumer that asserts at scope k, pushes, and
+    /// first checks at scope k+n (the HornSmt session bridge feeding an
+    /// assumption prefix; ay-dpll's eager extension when BCP batching defers
+    /// the check of a level past the next decision) therefore had the bound
+    /// trailed at k+n: the first pop back below k+n restored the bound while
+    /// the atom stayed in `asserted` and `bound_atoms`, so it was never
+    /// re-applied and later checks answered `Sat` with models violating a
+    /// still-asserted atom. Applying the pending atoms here puts their trail
+    /// entries in the scope of the assertion, where `pop_inner` undoes them
+    /// exactly when that scope is popped — the `TheorySolver::push` contract
+    /// regardless of the consumer's check cadence.
+    ///
+    /// A constant contradiction met on the way (`true` asserted false) is
+    /// left for the next check to report: `process_check_atoms_inner`
+    /// returns before advancing `last_check_trail_pos`, so that check meets
+    /// it first, before the bound of any later atom is applied; and every
+    /// later atom sits above it in `asserted_trail`, so any pop that removes
+    /// the contradiction removes them too. A constant-expression conflict
+    /// (`0 >= 1`) is recorded in `trivial_conflict` at the current depth and
+    /// survives the pops of deeper scopes (`trivial_conflict_scope`).
+    ///
+    /// No-op — one length comparison — when the consumer checked before
+    /// pushing, which is the eager DPLL(T) cadence.
+    pub(crate) fn apply_pending_atoms_before_push(&mut self) {
+        if self.last_check_trail_pos >= self.asserted_trail.len() {
+            return;
+        }
+        self.stats.scope_push_flushes += 1;
+        let debug = self.debug_lra;
+        if debug {
+            safe_eprintln!(
+                "[LRA] #lra-scope-trail: applying {} pending atom(s) before push to depth {}",
+                self.asserted_trail.len() - self.last_check_trail_pos,
+                self.scopes.len() + 1,
+            );
+        }
+        // The Err case is the constant-Bool contradiction; see above.
+        let _ = self.process_check_atoms_inner(debug, AtomPass::PushFlush);
     }
 
     /// BCP-time variant: skip re-collecting previously asserted disequalities.
@@ -56,14 +117,15 @@ impl LraSolver {
                 skipped_count: 0,
             });
         }
-        self.process_check_atoms_inner(debug, true)
+        self.process_check_atoms_inner(debug, AtomPass::Bcp)
     }
 
     fn process_check_atoms_inner(
         &mut self,
         debug: bool,
-        bcp_mode: bool,
+        pass: AtomPass,
     ) -> Result<CheckAtomStats, Box<TheoryResult>> {
+        let bcp_mode = pass != AtomPass::Full;
         let new_start = self.last_check_trail_pos;
         let trail_len = self.asserted_trail.len();
 
@@ -79,7 +141,10 @@ impl LraSolver {
         // Budget: 32 for small problems (< 200 rows), 16 for medium (200-499),
         // 0 for large (500+, already skipped). This replaces the per-atom cap
         // while preserving the same maximum cascade depth for single-atom checks.
-        let cascade_budget_max: u32 = if bcp_mode {
+        let cascade_budget_max: u32 = if pass == AtomPass::PushFlush {
+            // #lra-scope-trail: bounds only; the next check cascades.
+            0
+        } else if bcp_mode {
             if self.max_row_width > 50 || self.rows.len() >= 500 {
                 0
             } else if self.rows.len() < 200 {
@@ -200,6 +265,9 @@ impl LraSolver {
                             // that the expression is correct, register it for
                             // sound bound propagation.
                             self.atom_cache.insert(term, reparsed.clone());
+                            // The fallback in `suggest_phase` evaluates this
+                            // expression (#nonlinear-phase-hints).
+                            self.note_phase_state_change();
                             if let Some(ref resolved_info) = reparsed {
                                 self.register_atom_index_for_resolved_atom(term, resolved_info);
                             }
@@ -234,6 +302,9 @@ impl LraSolver {
                     });
                     self.current_parsing_atom = None;
                     self.atom_cache.insert(term, parsed.clone());
+                    // A newly parsed atom is now evaluable by `suggest_phase`'s
+                    // fallback (#nonlinear-phase-hints).
+                    self.note_phase_state_change();
                     parsed
                 }
             };
@@ -419,39 +490,54 @@ impl LraSolver {
                     }
                     // Equality: expr = 0 means expr <= 0 AND expr >= 0
                     // Use the actual assertion value for reason_value (important for `distinct` negations)
-                    if !expr.is_constant() {
-                        self.assert_bound_for_atom(
-                            expr.clone(),
-                            zero.clone(),
-                            BoundType::Upper,
-                            false,
-                            term,
-                            value,
-                            (term, value),
-                        );
-                        self.assert_bound_for_atom(
-                            expr,
-                            zero,
-                            BoundType::Lower,
-                            false,
-                            term,
-                            value,
-                            (term, value),
-                        );
-                    }
+                    //
+                    // A CONSTANT equality (`x + 7 = x` cancels to `7 = 0`) goes
+                    // through the same two bound assertions: `assert_bounds`
+                    // decides a constant comparison immediately and records a
+                    // `trivial_conflict` blaming this atom when it is violated.
+                    // It used to be skipped here, so an asserted `7 = 0` was
+                    // silently accepted and the theory answered Sat (found by
+                    // the CHC-COMP 2026 Rung 1 `HornSmt` push/pop fuzz; the
+                    // strict model verifier demoted every such Sat to Unknown).
+                    self.assert_bound_for_atom(
+                        expr.clone(),
+                        zero.clone(),
+                        BoundType::Upper,
+                        false,
+                        term,
+                        value,
+                        (term, value),
+                    );
+                    self.assert_bound_for_atom(
+                        expr,
+                        zero,
+                        BoundType::Lower,
+                        false,
+                        term,
+                        value,
+                        (term, value),
+                    );
                     self.bound_atoms.insert((term, value));
                 } else {
                     // Disequality: x != c can't be directly encoded in simplex.
                     // We'll check these after simplex to see if any are violated by the model.
                     // Store (term, expr, asserted_value) for post-simplex checking: if expr evaluates to 0
                     // in the model, the disequality is violated.
-                    // NOTE: Disequalities are NOT cached in bound_atoms because they must be
-                    // re-checked against the current model on every check() call.
+                    // The model re-check on every full check() reads
+                    // `disequality_trail` (second pass below), not this
+                    // first pass, so the atom IS recorded in `bound_atoms`:
+                    // a re-scan of the trail from a cursor left behind (an
+                    // unsupported atom #9217, a constant contradiction —
+                    // #lra-scope-trail keeps such a cursor across pops) must
+                    // not push a second copy. `pop_inner` drops the
+                    // `bound_atoms` entry with the atom, and the #8765 retain
+                    // keeps the trail entry exactly while the atom is asserted.
                     if debug {
                         safe_eprintln!("[LRA] Disequality atom {:?}: will check model later", term);
                     }
                     self.disequality_trail.push((term, expr.clone(), value));
                     disequalities.push((term, expr, value));
+                    self.bound_atoms.insert((term, value));
                 }
             } else if value {
                 // Positive assertion: expr <= 0 or expr < 0
@@ -721,6 +807,7 @@ impl LraSolver {
         // kept (they additionally feed compound wakeups and offset-equality
         // discovery).
         let skip_implied = self.no_implied_bounds
+            || (bcp_mode && self.no_bcp_implied_bounds)
             || (bcp_mode && self.no_theory_propagation && self.no_bound_refinement)
             || (bcp_mode
                 && !need_simplex

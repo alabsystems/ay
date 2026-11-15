@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the WCNF parser took a literal's variable identity from its
+% spelling (`"x" + lex.slice()`), not its value, so `1`, `01`, `001` and `+1`
+% interned four different variables. The hard clause `x1` and the soft clause
+% `~x1` were read as constraints on unrelated variables, silently relaxing the
+% formula: the solution `x1 ~x01` was accepted and `BOUNDS 0 0` verified, while
+% the real instance forces x1 and pays the soft clause's weight of 1.
+f 1;
+sol x1 ~x01;
+output NONE;
+conclusion BOUNDS 0 0;
+end pseudo-Boolean proof;

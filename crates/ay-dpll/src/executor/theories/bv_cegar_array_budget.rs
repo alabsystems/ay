@@ -20,6 +20,7 @@ pub(super) fn pair_cost(
     idx_b_bits: &BvBits,
     sel_a_bits: &BvBits,
     sel_b_bits: &BvBits,
+    stored_idx_bits: &[BvBits],
 ) -> Option<(usize, usize)> {
     if idx_a_bits.is_empty()
         || idx_a_bits.len() != idx_b_bits.len()
@@ -27,6 +28,22 @@ pub(super) fn pair_cost(
         || sel_a_bits.len() != sel_b_bits.len()
     {
         return None;
+    }
+    // Each avoided stored index pays its own diff/eq definition:
+    // `d` differing bits -> d+1 fresh vars, 5d+1 clauses.
+    let mut variables = 0usize;
+    let mut clauses = 0usize;
+    for stored in stored_idx_bits {
+        if stored.len() != idx_a_bits.len() {
+            return None;
+        }
+        let d = idx_a_bits
+            .iter()
+            .zip(stored.iter())
+            .filter(|(left, right)| left != right)
+            .count();
+        variables = variables.checked_add(d.checked_add(1)?)?;
+        clauses = clauses.checked_add(d.checked_mul(5)?.checked_add(1)?)?;
     }
     let diff_bits = idx_a_bits
         .iter()
@@ -38,14 +55,12 @@ pub(super) fn pair_cost(
         .zip(sel_b_bits.iter())
         .filter(|(left, right)| left != right)
         .count();
+    clauses = clauses.checked_add(unequal_value_bits.checked_mul(2)?)?;
     if diff_bits == 0 {
-        return Some((0, unequal_value_bits.checked_mul(2)?));
+        return Some((variables, clauses));
     }
-    let variables = diff_bits.checked_add(1)?;
-    let clauses = diff_bits
-        .checked_mul(5)?
-        .checked_add(1)?
-        .checked_add(unequal_value_bits.checked_mul(2)?)?;
+    variables = variables.checked_add(diff_bits.checked_add(1)?)?;
+    clauses = clauses.checked_add(diff_bits.checked_mul(5)?.checked_add(1)?)?;
     Some((variables, clauses))
 }
 
@@ -63,7 +78,7 @@ mod tests {
         let index = bits(&[1, 2]);
         let left = bits(&[3, 4, 5]);
         let right = bits(&[3, -4, 6]);
-        assert_eq!(pair_cost(&index, &index, &left, &right), Some((0, 4)));
+        assert_eq!(pair_cost(&index, &index, &left, &right, &[]), Some((0, 4)));
     }
 
     #[test]
@@ -73,23 +88,44 @@ mod tests {
         let left_value = bits(&[4, 5]);
         let right_value = bits(&[-4, 5]);
         assert_eq!(
-            pair_cost(&left_index, &right_index, &left_value, &right_value),
+            pair_cost(&left_index, &right_index, &left_value, &right_value, &[]),
             Some((3, 13))
+        );
+    }
+
+    #[test]
+    fn counts_stored_diseq_definitions() {
+        // Identical select indices: stored definitions still cost
+        // (d differing bits -> d+1 vars, 5d+1 clauses each).
+        let index = bits(&[1, 2]);
+        let left = bits(&[3]);
+        let right = bits(&[-3]);
+        let stored = vec![bits(&[1, -2]), bits(&[9, 10])];
+        // stored[0]: d=1 -> (2, 6); stored[1]: d=2 -> (3, 11);
+        // value implications: 2. Total (5, 19).
+        assert_eq!(
+            pair_cost(&index, &index, &left, &right, &stored),
+            Some((5, 19))
+        );
+        // Width-mismatched stored bits are rejected.
+        assert_eq!(
+            pair_cost(&index, &index, &left, &right, &[bits(&[1])]),
+            None
         );
     }
 
     #[test]
     fn rejects_zero_or_mismatched_widths() {
         assert_eq!(
-            pair_cost(&bits(&[]), &bits(&[]), &bits(&[1]), &bits(&[2])),
+            pair_cost(&bits(&[]), &bits(&[]), &bits(&[1]), &bits(&[2]), &[]),
             None
         );
         assert_eq!(
-            pair_cost(&bits(&[1]), &bits(&[1, 2]), &bits(&[3]), &bits(&[4])),
+            pair_cost(&bits(&[1]), &bits(&[1, 2]), &bits(&[3]), &bits(&[4]), &[]),
             None
         );
         assert_eq!(
-            pair_cost(&bits(&[1]), &bits(&[2]), &bits(&[3]), &bits(&[4, 5])),
+            pair_cost(&bits(&[1]), &bits(&[2]), &bits(&[3]), &bits(&[4, 5]), &[]),
             None
         );
     }

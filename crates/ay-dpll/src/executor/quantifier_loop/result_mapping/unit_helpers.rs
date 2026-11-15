@@ -37,6 +37,61 @@ fn unit_value(
     None
 }
 
+/// The arguments of the application `(name args)` that stay in conjunctive
+/// position (at polarity `positive`) for the walk in
+/// `conjunctive_quantifiers_modulo_units`, taken modulo the unit facts `unit`.
+fn conjunctive_app_children(
+    terms: &ay_core::TermStore,
+    name: &str,
+    positive: bool,
+    args: &[TermId],
+    unit: &dyn Fn(&ay_core::TermStore, TermId) -> Option<bool>,
+) -> Vec<TermId> {
+    // `(and ...)` in positive position and `(or ...)` under a negation (De
+    // Morgan -> conjunction) both keep a conjunctive context for their
+    // arguments. Everything else (positive `or`, function applications, `=>`,
+    // `ite`) breaks conjunctive descent — quantifiers below are not top-level
+    // conjuncts...
+    if (name == "and" && positive) || (name == "or" && !positive) {
+        return args.to_vec();
+    }
+    if name == "=>" && positive && args.len() == 2 {
+        // ...EXCEPT modulo top-level unit facts (#unit-conjunctive). `(=> a b)`:
+        // if `a` is a unit fact, `b` is a top-level consequence, so descend
+        // conjunctively. If `b` is already true (or `a` already false), the
+        // implication is satisfied and constrains nothing — it cannot put any
+        // forall of its own into a disjunctive obligation, so descend into
+        // neither side.
+        let (a, b) = (args[0], args[1]);
+        let a_unit = unit(terms, a);
+        let b_unit = unit(terms, b);
+        if b_unit == Some(true) || a_unit == Some(false) {
+            // satisfied by a unit fact — contributes nothing
+            return Vec::new();
+        }
+        return if a_unit == Some(true) {
+            vec![b]
+        } else {
+            Vec::new()
+        };
+    }
+    if name == "or" && positive {
+        // Unit propagation through a positive `or`: if every disjunct but one is
+        // falsified by a unit fact, the survivor is a top-level consequence.
+        if !args.iter().any(|&x| unit(terms, x) == Some(true)) {
+            let live: Vec<TermId> = args
+                .iter()
+                .copied()
+                .filter(|&x| unit(terms, x) != Some(false))
+                .collect();
+            if live.len() == 1 {
+                return live;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Rebuild an evaluated scalar as a constant of exactly `sort`.
 ///
 /// `EvalValue::Rational` represents both SMT `Int` and `Real` values, so the

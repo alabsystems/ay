@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% The ground truth for `incorrect/version3/rup_propagation_slack_overflow_formula_borne`:
+% the SAME formula, proved SATISFIABLE with a logged model. Both rows have a left-hand side
+% in {0,2} and a hugely negative right-hand side, so every assignment is a model.
+%
+% Keeping the pair means one binary answers both verdicts on one formula, so the false
+% `s VERIFIED UNSATISFIABLE` needs no external oracle to be recognised as false. This half
+% must keep verifying after the fix: a "fix" that made the propagator refuse these rows
+% outright would pass the negative test and fail here.
+f 2 ;
+sol ~x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

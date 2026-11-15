@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+f 0;
+red 1 x1 >= 1 : x1 1;
+rup 1 x1 >= 1 ;
+del spec 1 x1 >= 1 ;
+del id 1;
+is_deleted 1 x1 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const sp_val (_ BitVec 64))
+(declare-const frame_size (_ BitVec 64))
+(assert (and (= (bvand (_ bv31 64) frame_size) (_ bv0 64)) (and (= (bvand (_ bv31 64) sp_val) (_ bv0 64)) (not (= (_ bv0 64) (bvand (_ bv31 64) (bvsub sp_val frame_size)))))))
+(check-sat)
+(exit)

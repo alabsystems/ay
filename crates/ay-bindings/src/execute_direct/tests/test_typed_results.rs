@@ -156,3 +156,26 @@ fn test_execute_typed_get_value_returns_model_values_6311() {
         other => panic!("Expected typed Counterexample (SAT), got: {:?}", other),
     }
 }
+
+/// A SAT model whose Int value is negative must come back as a typed
+/// counterexample. The native printer used to write `-7` (not an SMT-LIB
+/// numeral), the strict decoder refused it, and the result became Unknown.
+#[test]
+fn test_execute_typed_negative_int_counterexample() {
+    let mut program = AYProgram::new();
+    program.set_logic("QF_LIA");
+    let x = program.declare_const("x", Sort::int());
+    program.assert(x.clone().int_lt(Expr::int(-6)));
+    program.assert(x.clone().int_gt(Expr::int(-8)));
+    program.check_sat();
+
+    match execute_typed(&program).unwrap() {
+        ExecuteTypedResult::Counterexample(counterexample) => {
+            assert_eq!(
+                counterexample.model.get("x"),
+                Some(&ModelValue::Int(BigInt::from(-7)))
+            );
+        }
+        other => panic!("expected typed Counterexample with x = -7, got {other:?}"),
+    }
+}

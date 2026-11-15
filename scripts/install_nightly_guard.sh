@@ -43,6 +43,16 @@ case "${1:-install}" in
     exit 0 ;;
 esac
 
+# launchd starts the guard with this PATH alone. Where the Trust toolchain is
+# installed its directory leads, or scripts/lib/cargo_frontend.sh finds no targo
+# and falls back to plain `cargo`, which on an ALab host is not Rust (owner
+# ruling 2026-09-23: Rust there is spelled targo).
+GUARD_PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if targo --unverified --version >/dev/null 2>&1; then
+  targo_bin=$(command -v targo)
+  GUARD_PATH="${targo_bin:h}:$GUARD_PATH"
+fi
+
 mkdir -p "$HOME/Library/LaunchAgents" "$REPO/reports/nightly"
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -59,7 +69,7 @@ cat > "$PLIST" <<PLISTEOF
   <dict>
     <key>AY_REPO</key><string>$REPO</string>
     <key>AY_CORPUS</key><string>$CORPUS</string>
-    <key>PATH</key><string>$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>$GUARD_PATH</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>17</integer></dict>

@@ -5,9 +5,44 @@
 use super::*;
 
 mod arithmetic;
+mod arithmetic_mul_dag;
+mod arithmetic_neg_dag;
 mod bitvector_array;
 mod boolean;
-mod memory_limit;
+
+/// The process-wide stamp source hands out each identity once, in increasing
+/// order, even across concurrent callers: `fetch_update` is the closure-CAS loop
+/// that makes the increment atomic with its overflow check.
+#[test]
+fn fresh_term_entry_stamps_are_unique_and_increasing() {
+    let first = fresh_term_entry_stamp();
+    let second = fresh_term_entry_stamp();
+    assert!(
+        second.0 > first.0,
+        "stamps must increase: {first:?} then {second:?}"
+    );
+
+    let mut stamps: Vec<u64> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..256)
+                        .map(|_| fresh_term_entry_stamp().0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("stamp worker"))
+            .collect()
+    });
+    let issued = stamps.len();
+    stamps.sort_unstable();
+    stamps.dedup();
+    assert_eq!(stamps.len(), issued, "a stamp was issued twice");
+    assert!(stamps[0] > second.0, "stamps must not move backwards");
+}
 
 #[test]
 fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
@@ -348,6 +383,49 @@ fn test_bitvec_constants() {
 
     assert_eq!(bv1, bv2);
     assert_ne!(bv1, bv3); // Different width
+
+    // Canonical identities must agree across the in-range and modulo paths.
+    for (input, width, residue) in [
+        (-129, 8, 127),
+        (-1, 8, 255),
+        (256, 8, 0),
+        (511, 8, 255),
+        (0, 0, 0),
+        (17, 0, 0),
+    ] {
+        let actual = store.mk_bitvec(BigInt::from(input), width);
+        let expected = store.mk_bitvec(BigInt::from(residue), width);
+        assert_eq!(actual, expected);
+        assert_eq!(store.sort(actual), &Sort::bitvec(width));
+    }
+}
+
+#[test]
+fn sparse_wide_bitvec_constants_preserve_data_and_interning() {
+    let mut store = TermStore::new();
+    // A practical sparse width, not a giant baseline allocation or timing test.
+    let width = 1 << 20;
+    let value = BigInt::from(17);
+    let first = store.mk_bitvec(value.clone(), width);
+    let before = store.len();
+    let second = store.mk_bitvec(value.clone(), width);
+    assert_eq!(first, second);
+    assert_eq!(store.len(), before);
+    assert_eq!(store.sort(first), &Sort::bitvec(width));
+    assert!(
+        matches!(store.get(first),TermData::Const(Constant::BitVec{value:actual,width:actual_width}) if actual == &value && *actual_width == width)
+    );
+    let limit = 64 * 1024;
+    assert!(
+        !store.instance_memory_exceeded(limit),
+        "a sparse value must fit the existing instance budget"
+    );
+    let occupied = BigInt::one() << (width - 1);
+    let _ = store.mk_bitvec(occupied, width);
+    assert!(
+        store.instance_memory_exceeded(limit),
+        "an occupied million-bit payload must still exceed the same budget"
+    );
 }
 
 #[test]
@@ -1577,4 +1655,59 @@ fn test_mk_eq_coerce_reflexive_int_real() {
     // to_real(x) = to_real(x) should be true (reflexive)
     let eq = store.mk_eq_coerce(to_real_x, to_real_x);
     assert_eq!(eq, store.true_term());
+}
+
+#[test]
+fn a_declared_carriers_selector_folds_through_the_registered_field_order() {
+    // A `declare-datatype` carrier is a `Sort::Uninterpreted` identity, not a
+    // `Sort::Datatype`, so it brings no constructor table with it. Before the
+    // field order was registered, `try_fold_datatype_selector` had no way to
+    // resolve an index and declined on every parsed input, leaving each
+    // `sel(C(t..))` an opaque fresh array base.
+    let mut store = TermStore::new();
+    let carrier = Sort::Uninterpreted("Rec".into());
+    let len = store.mk_bitvec(BigInt::from(7), 64);
+    let data = store.mk_var("d", Sort::array(Sort::bitvec(64), Sort::bitvec(8)));
+    let rec = store.mk_app(Symbol::named("mkRec"), vec![len, data], carrier.clone());
+
+    // Unregistered: no fold, and nothing is invented.
+    assert_eq!(store.try_fold_datatype_selector("fld_len", rec), None);
+    assert_eq!(store.try_fold_datatype_selector("fld_data", rec), None);
+
+    store.register_constructor_fields("mkRec", vec!["fld_len".into(), "fld_data".into()]);
+    assert_eq!(
+        store.constructor_field_names("mkRec"),
+        Some(["fld_len".to_string(), "fld_data".to_string()].as_slice())
+    );
+
+    // Registered: each selector folds to its own positional argument.
+    assert_eq!(store.try_fold_datatype_selector("fld_len", rec), Some(len));
+    assert_eq!(
+        store.try_fold_datatype_selector("fld_data", rec),
+        Some(data)
+    );
+    // An unknown field name still declines rather than guessing a position.
+    assert_eq!(store.try_fold_datatype_selector("fld_missing", rec), None);
+    // So does a selector of a constructor that was never registered.
+    let other = store.mk_app(Symbol::named("mkOther"), vec![len], carrier);
+    assert_eq!(store.try_fold_datatype_selector("fld_len", other), None);
+}
+
+#[test]
+fn a_registered_selector_distributes_through_ite_to_both_constructor_leaves() {
+    let mut store = TermStore::new();
+    let carrier = Sort::Uninterpreted("Rec".into());
+    store.register_constructor_fields("mkRec", vec!["fld_len".into()]);
+    let seven = store.mk_bitvec(BigInt::from(7), 64);
+    let nine = store.mk_bitvec(BigInt::from(9), 64);
+    let left = store.mk_app(Symbol::named("mkRec"), vec![seven], carrier.clone());
+    let right = store.mk_app(Symbol::named("mkRec"), vec![nine], carrier);
+    let cond = store.mk_var("c", Sort::Bool);
+    let choice = store.mk_ite(cond, left, right);
+
+    let folded = store
+        .try_fold_datatype_selector("fld_len", choice)
+        .expect("both leaves own the field, so the selector distributes");
+    let expected = store.mk_ite(cond, seven, nine);
+    assert_eq!(folded, expected);
 }

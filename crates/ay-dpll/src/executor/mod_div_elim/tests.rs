@@ -685,3 +685,113 @@ fn test_eliminate_zero_divisor_rem_distinct_from_mod() {
     assert!(!term_mentions_rem(&terms, result.rewritten[0]));
     assert!(result.introduced_unconstrained_div_mod);
 }
+
+// ===== (#nia-symbolic-division-lemmas) =====
+
+/// Whether `target` occurs anywhere under `root`.
+fn term_mentions(terms: &TermStore, root: TermId, target: TermId) -> bool {
+    let mut stack = vec![root];
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(t) = stack.pop() {
+        if t == target {
+            return true;
+        }
+        if !seen.insert(t) {
+            continue;
+        }
+        match terms.get(t) {
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, th, el) => stack.extend([*c, *th, *el]),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `(div d d)` is defined by `d = 0 \/ (q = 1 /\ r = 0)` alone: the exact form
+/// is guarded by the zero divisor, where SMT-LIB leaves the quotient free, and
+/// it replaces the Euclidean definition, so the product `d*q` is gone.
+#[test]
+fn test_symbolic_self_division_pins_quotient_to_one() {
+    let mut terms = setup_term_store();
+    let d = terms.mk_fresh_var("d", Sort::Int);
+    let div_dd = terms.mk_intdiv(d, d);
+    let result = eliminate_int_mod_div(&mut terms, &[div_dd]);
+    let q = result.rewritten[0];
+    let one = terms.mk_int(BigInt::from(1));
+    let zero = terms.mk_int(BigInt::from(0));
+    let q_is_one = terms.mk_eq(q, one);
+    let d_is_zero = terms.mk_eq(d, zero);
+    let d_times_q = terms.mk_mul(vec![d, q]);
+    assert_eq!(result.constraints.len(), 1);
+    let c = result.constraints[0];
+    assert!(
+        term_mentions(&terms, c, q_is_one) && term_mentions(&terms, c, d_is_zero),
+        "expected `d = 0 \\/ (q = 1 /\\ r = 0)`"
+    );
+    assert!(!term_mentions(&terms, c, d_times_q));
+}
+
+/// `(mod (* x y) y)` is defined by `y = 0 \/ (q = x /\ r = 0)` alone.
+#[test]
+fn test_symbolic_division_of_a_multiple_pins_the_cofactor() {
+    let mut terms = setup_term_store();
+    let x = terms.mk_fresh_var("x", Sort::Int);
+    let y = terms.mk_fresh_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let mod_expr = terms.mk_mod(xy, y);
+    let result = eliminate_int_mod_div(&mut terms, &[mod_expr]);
+    let r = result.rewritten[0];
+    let zero = terms.mk_int(BigInt::from(0));
+    let r_is_zero = terms.mk_eq(r, zero);
+    let y_is_zero = terms.mk_eq(y, zero);
+    assert_eq!(result.constraints.len(), 1);
+    let c = result.constraints[0];
+    assert!(
+        term_mentions(&terms, c, r_is_zero) && term_mentions(&terms, c, y_is_zero),
+        "expected `y = 0 \\/ (q = x /\\ r = 0)`"
+    );
+    assert!(
+        term_mentions(&terms, c, x),
+        "the quotient is the cofactor x"
+    );
+}
+
+/// `(div 0 y)` is defined by `y = 0 \/ (q = 0 /\ r = 0)` alone.
+#[test]
+fn test_symbolic_division_of_zero_pins_quotient_to_zero() {
+    let mut terms = setup_term_store();
+    let y = terms.mk_fresh_var("y", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let div_expr = terms.mk_intdiv(zero, y);
+    let result = eliminate_int_mod_div(&mut terms, &[div_expr]);
+    let q = result.rewritten[0];
+    let q_is_zero = terms.mk_eq(q, zero);
+    let y_is_zero = terms.mk_eq(y, zero);
+    assert_eq!(result.constraints.len(), 1);
+    let c = result.constraints[0];
+    assert!(term_mentions(&terms, c, q_is_zero) && term_mentions(&terms, c, y_is_zero));
+}
+
+/// A constant divisor takes the constant path and gets no symbolic lemma.
+#[test]
+fn test_constant_divisor_gets_no_symbolic_division_lemmas() {
+    let mut terms = setup_term_store();
+    let x = terms.mk_fresh_var("x", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let div_expr = terms.mk_intdiv(x, three);
+    let result = eliminate_int_mod_div(&mut terms, &[div_expr]);
+    assert_eq!(result.constraints.len(), 3);
+}
+
+/// A symbolic division whose operands fix nothing gets its definition alone.
+#[test]
+fn test_general_symbolic_division_gets_no_exact_lemma() {
+    let mut terms = setup_term_store();
+    let x = terms.mk_fresh_var("x", Sort::Int);
+    let y = terms.mk_fresh_var("y", Sort::Int);
+    let div_expr = terms.mk_intdiv(x, y);
+    let result = eliminate_int_mod_div(&mut terms, &[div_expr]);
+    assert_eq!(result.constraints.len(), 1);
+}

@@ -48,6 +48,21 @@ pub(super) fn probe_permille() -> Option<u64> {
     *V.get_or_init(|| parse_pos_u64("AY_XP_PROBE_PERMILLE"))
 }
 
+/// The variable count above which `--sat-giant-inproc-permille` applies.
+pub(super) const GIANT_INPROC_MIN_VARS: usize = 1_000_000;
+
+/// `--sat-giant-inproc-permille N` on a formula above `GIANT_INPROC_MIN_VARS`
+/// variables: the vivification permille `N` and the probe permille `N / 4`
+/// (at least 1). `None` when the switch is unset or the formula is smaller.
+pub(crate) fn giant_inproc_permille(num_vars: usize) -> Option<(u64, u64)> {
+    if num_vars <= GIANT_INPROC_MIN_VARS {
+        return None;
+    }
+    ay_core::sat_ab_switches()
+        .giant_inproc_permille
+        .map(|n| (n.max(1), (n / 4).max(1)))
+}
+
 /// `AY_XP_PROBE_MIN` — override the probe tick-budget floor
 /// (shipping default `PROBE_MIN_EFFORT=10_000`). `None` => use the constant.
 pub(super) fn probe_min_effort() -> Option<u64> {

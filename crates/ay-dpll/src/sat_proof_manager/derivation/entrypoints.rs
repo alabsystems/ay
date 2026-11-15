@@ -27,6 +27,27 @@ impl SatProofManager<'_> {
         self.derive_empty_via_bounded_dpll_theory(clause_versions, proof)
     }
 
+    /// [`Self::close_empty_over_seeded_clauses`] for a NON-EMPTY target
+    /// clause (#probe-ite-lift-promoter): the same bounded DPLL(T) closer,
+    /// run under the assumptions `¬target`, returning a proof of EXACTLY
+    /// `target` (as a set of SAT literals) or `None`.
+    ///
+    /// The consequence-replay lifted-assertion promoter uses this to derive
+    /// the unit `(cl G)` — the arithmetic-ITE-lifted form of a probe
+    /// assertion — over a database it seeded entirely from checker-validated
+    /// steps (Tseitin tautologies, `ite_intro` branch equalities, EUF
+    /// congruence transfers, Farkas-verified constant evaluations). Every
+    /// emitted step is an ordinary `Resolution` over those leaves; the theory
+    /// oracle only ever adds solver-certified `la_generic` lemmas.
+    pub(crate) fn close_target_over_seeded_clauses(
+        &mut self,
+        clause_versions: &[(Vec<Literal>, ProofId)],
+        target_sat: &[Literal],
+        proof: &mut Proof,
+    ) -> Option<ProofId> {
+        self.derive_target_via_bounded_dpll_theory(clause_versions, target_sat, proof)
+    }
+
     /// Derive a learned clause from its resolution hints.
     ///
     /// Primary strategy (#rank-4 increment 1): RUP/LRAT-style unit-propagation

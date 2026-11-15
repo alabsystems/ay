@@ -10,7 +10,7 @@
 
 use ay_core::{CnfClause, CnfLit};
 
-use super::{FpDecomposed, FpPrecision, FpSolver, RoundingMode};
+use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand, RoundingMode};
 
 impl FpSolver<'_> {
     // ========== IEEE 754 unpack ==========
@@ -20,7 +20,10 @@ impl FpSolver<'_> {
     /// Following Z3's fpa2bv_converter::unpack:
     /// - `sig` has `sbits` bits (hidden bit prepended)
     /// - `exp` has `ebits` bits (unbiased, two's complement)
-    /// - `lz` has `ebits` bits (leading zero count, only nonzero for subnormals when normalize=true)
+    /// - `lz` has `unpack_lz_width(ebits, sbits)` bits (leading zero count,
+    ///   only nonzero for subnormals when normalize=true): z3's `ebits`, or
+    ///   wider when a subnormal's up to `sbits - 1` leading zeros do not fit
+    ///   them. A caller extends it by `width - lz.len()`.
     pub(crate) fn unpack(
         &mut self,
         fp: &FpDecomposed,
@@ -54,12 +57,16 @@ impl FpSolver<'_> {
         let one_bv = self.const_bv(1, eb);
         let denormal_exp = self.bv_sub(&one_bv, &bias_bv);
 
-        // Leading zeros (only for subnormals when normalizing)
-        let zero_lz = self.const_bv(0, eb);
+        // Leading zeros (only for subnormals when normalizing), in a width
+        // that holds a subnormal's up to `sb - 1`: `eb` bits wrapped it from
+        // `(2,5)` on (`sb > 2^eb`), and every normalising operation computed
+        // with the wrapped count.
+        let lz_w = Self::unpack_lz_width(eb, sb);
+        let zero_lz = self.const_bv(0, lz_w);
 
         let (final_sig, final_exp, final_lz) = if normalize {
             // Count leading zeros in denormal significand
-            let lz_d = self.bv_leading_zeros(&denormal_sig, eb);
+            let lz_d = self.bv_leading_zeros(&denormal_sig, lz_w);
 
             // sig_is_zero: significand is all zero (denormal zero)
             let sig_is_zero = self.make_all_zero(&fp.significand);
@@ -68,14 +75,10 @@ impl FpSolver<'_> {
             let lz_or_zero = self.make_ite_bits(-sig_is_zero, &lz_d, &zero_lz);
             let lz = self.make_ite_bits(is_normal_val, &zero_lz, &lz_or_zero);
 
-            // Shift denormal sig left by lz to normalize it
-            // Need shift amount in sb bits for the barrel shifter
-            let shift_bits = if eb <= sb {
-                self.zero_extend(&lz_or_zero, sb - eb)
-            } else {
-                // Cap shift at sb
-                lz_or_zero[..sb].to_vec()
-            };
+            // Shift denormal sig left by lz to normalize it. The barrel
+            // shifter takes the amount in `sb` bits; the count is below `sb`,
+            // so resizing it is exact.
+            let shift_bits = self.resize_unsigned(&lz_or_zero, sb);
             let shifted_sig = self.bv_shl(&denormal_sig, &shift_bits);
 
             let sig = self.make_ite_bits(is_normal_val, &normal_sig, &shifted_sig);
@@ -95,9 +98,24 @@ impl FpSolver<'_> {
 
     /// Make rounding decision: returns a CnfLit that is true iff we should increment.
     ///
-    /// Following Z3's mk_rounding_decision.
+    /// Following Z3's mk_rounding_decision; a symbolic mode selects among the
+    /// five modes' decisions.
     /// Inputs are single bits: sign, last (LSB of kept part), round, sticky.
     pub(crate) fn make_rounding_decision(
+        &mut self,
+        rm: RmOperand,
+        sgn: CnfLit,
+        last: CnfLit,
+        round: CnfLit,
+        sticky: CnfLit,
+    ) -> CnfLit {
+        self.rm_select(rm, |solver, mode| {
+            solver.literal_rounding_decision(mode, sgn, last, round, sticky)
+        })
+    }
+
+    /// The increment under one literal mode.
+    fn literal_rounding_decision(
         &mut self,
         rm: RoundingMode,
         sgn: CnfLit,
@@ -138,7 +156,8 @@ impl FpSolver<'_> {
     /// Following Z3's fpa2bv_converter::round.
     ///
     /// sig: sbits+4 bits = [sticky, round, last, mantissa..., hidden, overflow]
-    /// exp: ebits+2 bits (signed, unbiased, with overflow headroom)
+    /// exp: at least ebits+2 bits (signed, unbiased, with overflow headroom;
+    ///      see `exponent_widths.rs`)
     ///
     /// Bit layout of sig (LSB first):
     ///   sig[0] = sticky, sig[1] = round, sig[2] = last (LSB of kept significand)
@@ -149,7 +168,7 @@ impl FpSolver<'_> {
     pub(crate) fn fp_round(
         &mut self,
         precision: FpPrecision,
-        rm: RoundingMode,
+        rm: RmOperand,
         sgn: CnfLit,
         sig: &[CnfLit],
         exp: &[CnfLit],
@@ -159,7 +178,14 @@ impl FpSolver<'_> {
         let bias = u64::from(precision.bias());
 
         debug_assert_eq!(sig.len(), sb + 4, "sig must be sbits+4 wide");
-        debug_assert_eq!(exp.len(), eb + 2, "exp must be ebits+2 wide");
+        // `exp` is signed and at least `eb + 2` wide. `eb + 2` is z3's choice
+        // and holds every exponent an operation of an ordinary format
+        // produces; an operation whose intermediate exponents need more (a
+        // small `eb` with a wide `sb`, e.g. `fp.fma` in `(2,3)`) passes a wider
+        // one, and every constant and comparison below is taken at that width.
+        // At exactly `eb + 2` the encoding is unchanged.
+        let w = exp.len();
+        debug_assert!(w >= eb + 2, "exp must be at least ebits+2 wide");
 
         // Phase 1: Overflow detection (OVF1)
         // Following Z3's fpa2bv_converter::round.
@@ -176,15 +202,21 @@ impl FpSolver<'_> {
         //     correct overflow result (infinity vs max finite per RM).
         let e_max_biased = (1u64 << eb) - 2; // max normal biased exponent
         let e_max_unbiased = e_max_biased - bias; // max unbiased exponent
-        let e_max_bv = self.const_bv(e_max_unbiased, eb + 2);
+        let e_max_bv = self.const_bv(e_max_unbiased, w);
 
-        // Condition (a): top 3 bits pattern
-        let exp_top = exp[eb + 1]; // sign bit of the (eb+2)-wide signed exp
-        let exp_second = exp[eb];
-        let exp_third = exp[eb - 1];
-        let not_top = -exp_top;
-        let second_or_third = self.make_or(exp_second, exp_third);
-        let e_top_three = self.make_and(not_top, second_or_third);
+        // Condition (a): exp > e_max. At `eb + 2` bits this is the top-three
+        // pattern (non-negative, and bit `eb` or `eb - 1` set: exp >= 2^(eb-1)
+        // = e_max + 1); at a wider width it is the signed comparison itself.
+        let e_top_three = if w == eb + 2 {
+            let exp_top = exp[eb + 1]; // sign bit of the (eb+2)-wide signed exp
+            let exp_second = exp[eb];
+            let exp_third = exp[eb - 1];
+            let not_top = -exp_top;
+            let second_or_third = self.make_or(exp_second, exp_third);
+            self.make_and(not_top, second_or_third)
+        } else {
+            self.bv_slt(&e_max_bv, exp)
+        };
 
         // Condition (b): exp == e_max AND sig MSB set
         let exp_eq_emax = self.make_bits_equal(&e_max_bv, exp);
@@ -194,19 +226,19 @@ impl FpSolver<'_> {
         let ovf1_exp = self.make_or(e_top_three, emax_and_sigmsb);
 
         // Phase 2: Leading zero count of sig
-        let lz = self.bv_leading_zeros(sig, eb + 2);
+        let lz = self.bv_leading_zeros(sig, w);
 
         // Phase 3: TINY detection (underflow to subnormal)
         // e_min = 1 - bias (unbiased)
         let e_min_val = 1i64 - bias as i64;
-        let e_min_bv = self.const_bv(e_min_val as u64, eb + 2);
+        let e_min_bv = self.const_bv_signed(e_min_val, w);
         // t = exp + 1 - lz - e_min
-        let one_bv = self.const_bv(1, eb + 2);
+        let one_bv = self.const_bv(1, w);
         let exp_plus_1 = self.bv_add(exp, &one_bv);
         let t = self.bv_sub(&exp_plus_1, &lz);
         let t = self.bv_sub(&t, &e_min_bv);
         // TINY iff t < 0 (signed)
-        let zero_bv = self.const_bv(0, eb + 2);
+        let zero_bv = self.const_bv(0, w);
         let tiny = self.bv_slt(&t, &zero_bv);
 
         // Phase 4: Compute normalization shift (sigma) and result exponent (beta)
@@ -228,17 +260,19 @@ impl FpSolver<'_> {
 
         // Right shift case: shift_amount = -sigma (capped at sb+2)
         let neg_sigma = self.bv_neg(&sigma);
-        let cap = self.const_bv((sb + 2) as u64, eb + 2);
+        let cap = self.const_bv((sb + 2) as u64, w);
         let neg_sigma_too_large = self.bv_slt(&cap, &neg_sigma);
         let capped_neg_sigma = self.make_ite_bits(neg_sigma_too_large, &cap, &neg_sigma);
 
         // Extend shift amount to match sig_ext width for barrel shifter
         let shift_width = 2 * sig_size;
-        let shift_for_right = self.zero_extend(&capped_neg_sigma, shift_width - (eb + 2));
+        // `capped_neg_sigma <= sb + 2` and a left shift's `sigma <= sb + 4` both
+        // fit `shift_width` bits, so resizing is exact at any `w`.
+        let shift_for_right = self.resize_unsigned(&capped_neg_sigma, shift_width);
         let rs_sig = self.bv_lshr(&sig_ext, &shift_for_right);
 
         // Left shift case
-        let shift_for_left = self.zero_extend(&sigma, shift_width - (eb + 2));
+        let shift_for_left = self.resize_unsigned(&sigma, shift_width);
         let ls_sig = self.bv_shl(&sig_ext, &shift_for_left);
 
         // Select based on sigma sign
@@ -292,12 +326,12 @@ impl FpSolver<'_> {
         debug_assert_eq!(post_sig.len(), sb);
 
         // Increment exponent if sig overflowed
-        let one_exp = self.const_bv(1, eb + 2);
+        let one_exp = self.const_bv(1, w);
         let exp_plus_one = self.bv_add(&norm_exp, &one_exp);
         let post_exp = self.make_ite_bits(sig_ovf, &exp_plus_one, &norm_exp);
 
         // Phase 9: Bias the exponent
-        let bias_bv = self.const_bv(bias, eb + 2);
+        let bias_bv = self.const_bv(bias, w);
         let biased_exp_full = self.bv_add(&post_exp, &bias_bv);
         let biased_exp: Vec<CnfLit> = biased_exp_full[..eb].to_vec(); // truncate to eb bits
 
@@ -318,24 +352,37 @@ impl FpSolver<'_> {
         let max_sig: Vec<CnfLit> = (0..sb - 1).map(|_| self.const_true()).collect();
 
         let (ovf_exp, ovf_sig) = match rm {
-            RoundingMode::RNE | RoundingMode::RNA => {
+            RmOperand::Literal(RoundingMode::RNE | RoundingMode::RNA) => {
                 // Always infinity on overflow
                 (inf_exp, inf_sig)
             }
-            RoundingMode::RTZ => {
+            RmOperand::Literal(RoundingMode::RTZ) => {
                 // Always max finite on overflow
                 (max_exp, max_sig)
             }
-            RoundingMode::RTP => {
+            RmOperand::Literal(RoundingMode::RTP) => {
                 // Positive -> inf, Negative -> max finite
                 let exp_sel = self.make_ite_bits(sgn, &max_exp, &inf_exp);
                 let sig_sel = self.make_ite_bits(sgn, &max_sig, &inf_sig);
                 (exp_sel, sig_sel)
             }
-            RoundingMode::RTN => {
+            RmOperand::Literal(RoundingMode::RTN) => {
                 // Positive -> max finite, Negative -> inf
                 let exp_sel = self.make_ite_bits(sgn, &inf_exp, &max_exp);
                 let sig_sel = self.make_ite_bits(sgn, &inf_sig, &max_sig);
+                (exp_sel, sig_sel)
+            }
+            RmOperand::Symbolic(_) => {
+                // Infinity for the nearest modes and toward the sign's own
+                // infinity, the largest finite value otherwise.
+                let to_inf = self.rm_select(rm, |solver, mode| match mode {
+                    RoundingMode::RNE | RoundingMode::RNA => solver.const_true(),
+                    RoundingMode::RTZ => solver.const_false(),
+                    RoundingMode::RTP => -sgn,
+                    RoundingMode::RTN => sgn,
+                });
+                let exp_sel = self.make_ite_bits(to_inf, &inf_exp, &max_exp);
+                let sig_sel = self.make_ite_bits(to_inf, &inf_sig, &max_sig);
                 (exp_sel, sig_sel)
             }
         };

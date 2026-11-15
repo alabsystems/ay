@@ -150,7 +150,10 @@ impl Solver {
 
         // Clear has_empty_clause only if it was set *inside* the scope being
         // popped (or deeper). Base-level empty clauses (depth 0) are permanent
-        // UNSAT and must survive every pop.
+        // UNSAT and must survive every pop. `lower_empty_clause_flag` also
+        // resets the recorded depth and forces the next solve to rebuild its
+        // search state, so a refutation that did not depend on this scope is
+        // derived again rather than lost with the retracted flag.
         let mut retracted_empty_clause = false;
         if self.has_empty_clause
             && self.cold.empty_clause_scope_depth > self.cold.scope_selectors.len()
@@ -159,8 +162,7 @@ impl Solver {
             if let Some(ec_id) = self.cold.empty_clause_lrat_id.take() {
                 let _ = self.proof_emit_delete(&[], ec_id);
             }
-            self.has_empty_clause = false;
-            self.cold.empty_clause_in_proof = false;
+            self.lower_empty_clause_flag();
             retracted_empty_clause = true;
         }
 
@@ -212,6 +214,7 @@ impl Solver {
         // remain in the live arena until the next rebuild, but the rebuild
         // will correctly reconstruct from the trimmed ledger.
         self.cold.original_ledger.pop_scope();
+        self.refresh_ledger_original_retention();
         // Keep incremental_original_boundary in sync with ledger size so that
         // reset_search_state does not attempt to re-add already-present clauses.
         //
@@ -941,6 +944,45 @@ impl Solver {
         self.cold.unguarded_theory_conflict_lemmas = on;
     }
 
+    /// Opt this solver into replay-ledger retention of the split-loop
+    /// primary between-solves theory conflict (see the cold-field doc
+    /// for the measured lane split). Default off.
+    pub fn set_retain_primary_theory_conflicts(&mut self, on: bool) {
+        self.cold.retain_primary_theory_conflicts = on;
+    }
+
+    /// Whether primary split-loop conflicts are retained as
+    /// replay-ledger originals on this solver.
+    pub fn retain_primary_theory_conflicts(&self) -> bool {
+        self.cold.retain_primary_theory_conflicts
+    }
+
+    /// Arm (or, with `None`, disarm) escalated retention for this solve
+    /// entry: the first `after` primary split-loop conflicts route to
+    /// the deletable tier, then retention flips on for the rest of the
+    /// entry. Zeroes the routed counter; does not clear a retention
+    /// flag already set via `set_retain_primary_theory_conflicts`.
+    /// Callers set this on every lazy split-loop entry because the
+    /// persistent solver is shared across lanes.
+    pub fn set_retain_primary_escalation(&mut self, after: Option<u64>) {
+        self.cold.retain_primary_after = after;
+        self.cold.primary_theory_conflicts_routed = 0;
+    }
+
+    /// Record one routed primary split-loop theory conflict and report
+    /// whether it (and, stickily, every later one this entry) must be
+    /// retained as a replay-ledger original. With no escalation armed
+    /// this is exactly `retain_primary_theory_conflicts()`.
+    pub fn note_primary_theory_conflict(&mut self) -> bool {
+        self.cold.primary_theory_conflicts_routed += 1;
+        if let Some(after) = self.cold.retain_primary_after {
+            if self.cold.primary_theory_conflicts_routed > after {
+                self.cold.retain_primary_theory_conflicts = true;
+            }
+        }
+        self.cold.retain_primary_theory_conflicts
+    }
+
     /// Set the constraint activation variable for lightweight IC3 constraints (#8662).
     ///
     /// GipSAT pattern (rIC3 gipsat/mod.rs:192-223): a single Boolean variable
@@ -1024,12 +1066,13 @@ impl Solver {
         // defer arena addition. Constrained clauses need immediate arena
         // placement so we can track their offset for O(constraint_count)
         // cleanup.
-        self.cold.original_ledger.push_clause(&guarded);
+        let clause_id =
+            self.register_ledger_original(&guarded, original_clause_ids::OriginalLifetime::Scoped);
         self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         self.cold.uniform_formula_cache = None;
 
         // Add directly to arena (bypass deferred path).
-        let arena_offset = self.add_clause_db(&guarded, false);
+        let arena_offset = self.add_registered_original_clause_db(&guarded, clause_id);
 
         // Track the offset for O(constraint_count) cleanup (#8687).
         self.cold.ic3_constrained_offsets.push(arena_offset);
@@ -1195,6 +1238,7 @@ impl Solver {
             }
 
             self.stats.clear_bcp_learned_1963_blocker_cert(offset);
+            self.record_clause_retirement(offset);
             self.arena.delete(offset);
             self.cold.clause_db_changes += 1;
             deleted += 1;
@@ -1395,10 +1439,10 @@ impl Solver {
                     let lit = self.arena.literal(clause_idx, i);
                     let vi = lit.variable().index();
                     if vi < self.num_vars
-                        && self.var_data[vi].reason == cref.0
+                        && self.var_data[vi].has_clause_reason(cref)
                         && self.var_data[vi].level == 0
                     {
-                        self.var_data[vi].reason = NO_REASON;
+                        self.var_data[vi].clear_reason();
                         cleared_any = true;
                     }
                 }
@@ -1458,12 +1502,15 @@ impl Solver {
             // Their LRAT IDs are intentionally retained in known_lrat_ids so
             // that derivation chains referencing them remain valid.
             self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
+            self.record_clause_retirement(clause_idx);
             self.arena.delete(clause_idx);
             self.cold.clause_db_changes += 1;
             reclaimed += 1;
         }
 
         self.cold.scoped_clauses_reclaimed += reclaimed;
+        // Learned clauses derived under the scope went with it.
+        self.lower_reduction_retrigger_points();
     }
 
     /// Delete learned clauses whose recorded learn-time scope depth exceeds
@@ -1549,10 +1596,10 @@ impl Solver {
                     let lit = self.arena.literal(clause_idx, i);
                     let vi = lit.variable().index();
                     if vi < self.num_vars
-                        && self.var_data[vi].reason == cref.0
+                        && self.var_data[vi].has_clause_reason(cref)
                         && self.var_data[vi].level == 0
                     {
-                        self.var_data[vi].reason = NO_REASON;
+                        self.var_data[vi].clear_reason();
                         cleared_any = true;
                     }
                 }
@@ -1585,6 +1632,7 @@ impl Solver {
             }
 
             self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
+            self.record_clause_retirement(clause_idx);
             self.arena.delete(clause_idx);
             self.cold.clause_db_changes += 1;
             reclaimed += 1;
@@ -1593,5 +1641,41 @@ impl Solver {
         if reclaimed > 0 {
             self.stats.leaked_learned_clauses_gc_removed += reclaimed;
         }
+    }
+}
+
+#[cfg(test)]
+mod retain_escalation_tests {
+    use super::super::Solver;
+
+    #[test]
+    fn escalation_flips_only_past_budget_and_rearms_clean() {
+        let mut solver = Solver::new(0);
+        // Disarmed: routing reports the plain flag (default off).
+        assert!(!solver.note_primary_theory_conflict());
+        assert!(!solver.retain_primary_theory_conflicts());
+
+        // Budget 2: conflicts 1..=2 deletable, 3+ retained (sticky).
+        solver.set_retain_primary_escalation(Some(2));
+        assert!(!solver.note_primary_theory_conflict());
+        assert!(!solver.note_primary_theory_conflict());
+        assert!(solver.note_primary_theory_conflict());
+        assert!(solver.note_primary_theory_conflict());
+        assert!(solver.retain_primary_theory_conflicts());
+
+        // Re-arming zeroes the counter but does not clear a set flag;
+        // the lane-level entry reset owns the flag itself.
+        solver.set_retain_primary_escalation(Some(2));
+        assert!(solver.note_primary_theory_conflict());
+        solver.set_retain_primary_theory_conflicts(false);
+        solver.set_retain_primary_escalation(Some(1));
+        assert!(!solver.note_primary_theory_conflict());
+        assert!(solver.note_primary_theory_conflict());
+
+        // An explicit opt-in (AUFLIA shape) wins regardless of budget.
+        let mut opted = Solver::new(0);
+        opted.set_retain_primary_theory_conflicts(true);
+        opted.set_retain_primary_escalation(Some(100));
+        assert!(opted.note_primary_theory_conflict());
     }
 }

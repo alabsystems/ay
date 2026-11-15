@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% `output EQUIOPTIMAL` stays available after `solx`, but its `FOR obj < ...`
+% qualifier has to name the value below which nothing was removed. The excluded
+% x1=0 class contains a solution of objective 0, so the honest qualifier is
+% `FOR obj < 0` — it used to print `FOR obj < 100`, the logged representative's
+% value, which is false: restricted to obj < 100 the input still has a solution
+% while the output formula has none. The verdict string itself is pinned in
+% `tests/solution_logging_verdicts.rs`.
+f 1;
+solx ~x1 x2;
+output EQUIOPTIMAL FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

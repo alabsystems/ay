@@ -34,6 +34,27 @@
 
 use super::*;
 
+/// Complement of a CNF literal: `neg_lit(lit) == -lit` for every literal.
+///
+/// CNF literals are DIMACS `±var` with `var` in `1..=i32::MAX`, a domain on
+/// which negation never overflows, so `wrapping_neg` is total and identical to
+/// `-lit` there. This is the same form as ay-core's own literal complement
+/// (`Tseitin::negate`, crates/ay-core/src/tseitin/mod.rs). `i32::MIN` is not a
+/// literal of any variable; it is the one value `wrapping_neg` maps to itself.
+#[inline]
+const fn neg_lit(lit: CnfLit) -> CnfLit {
+    lit.wrapping_neg()
+}
+
+/// An empty literal vector pre-sized for `capacity` literals. The reservation
+/// is only a sizing hint, so it is made fallibly: a refused one forgoes it and
+/// `push` grows the vector itself.
+fn lits_with_capacity(capacity: usize) -> Vec<CnfLit> {
+    let mut lits = Vec::new();
+    let _ = lits.try_reserve_exact(capacity);
+    lits
+}
+
 impl DelayedBvState {
     /// Check multiplication zero axiom. Returns clauses in BV literal space.
     pub(super) fn check_mul_zero(
@@ -60,7 +81,7 @@ impl DelayedBvState {
                         lits.push(bit); // arg bit must be true
                     }
                     for &bit in &op.result_bits {
-                        lits.push(-bit); // result bit must be false
+                        lits.push(neg_lit(bit)); // result bit must be false
                     }
                     return Some(vec![CnfClause::new(lits)]);
                 }
@@ -84,17 +105,18 @@ impl DelayedBvState {
         var_offset: i32,
     ) -> Option<Vec<CnfClause>> {
         let op = &self.delayed_ops[op_idx];
-        if op.args.len() != 2 {
-            return None;
-        }
+        let (arg0, arg1) = match op.args.as_slice() {
+            [arg0, arg1] => (arg0, arg1),
+            _ => return None,
+        };
         let one = num_bigint::BigInt::from(1);
 
-        for i in 0..2 {
-            if let Some(bits) = self.term_to_bits.get(&op.args[i]) {
+        // Each argument in turn, paired with the other one.
+        for (arg, other) in [(arg0, arg1), (arg1, arg0)] {
+            if let Some(bits) = self.term_to_bits.get(arg) {
                 let arg_val = self.eval_bits(bits, model, var_offset);
                 if arg_val == one {
-                    let other_idx = 1 - i;
-                    if let Some(other_bits) = self.term_to_bits.get(&op.args[other_idx]) {
+                    if let Some(other_bits) = self.term_to_bits.get(other) {
                         let other_val = self.eval_bits(other_bits, model, var_offset);
                         let result_val = self.eval_bits(&op.result_bits, model, var_offset);
 
@@ -105,9 +127,12 @@ impl DelayedBvState {
                         // Antecedent: negate "arg == 1" => bit[0]=false OR bit[1]=true OR ...
                         // "arg == 1" means bit[0]=true and all higher bits false.
                         // Negation: bit[0]=false (push -bits[0]) OR any higher bit true (push bits[j]).
-                        let mut antecedent: Vec<CnfLit> = Vec::with_capacity(bits.len());
-                        antecedent.push(-bits[0]); // bit 0 must be true, negated
-                        for &b in &bits[1..] {
+                        // `arg_val == 1` means `bits` has a true bit 0, so it is
+                        // never empty here.
+                        let (&bit0, higher) = bits.split_first()?;
+                        let mut antecedent = lits_with_capacity(bits.len());
+                        antecedent.push(neg_lit(bit0)); // bit 0 must be true, negated
+                        for &b in higher {
                             antecedent.push(b); // higher bits must be false, positive = negated
                         }
 
@@ -115,12 +140,12 @@ impl DelayedBvState {
                         let mut clauses = Vec::new();
                         for (&r, &o) in op.result_bits.iter().zip(other_bits.iter()) {
                             let mut c1 = antecedent.clone();
-                            c1.push(-r);
+                            c1.push(neg_lit(r));
                             c1.push(o);
                             clauses.push(CnfClause::new(c1));
                             let mut c2 = antecedent.clone();
                             c2.push(r);
-                            c2.push(-o);
+                            c2.push(neg_lit(o));
                             clauses.push(CnfClause::new(c2));
                         }
                         return Some(clauses);
@@ -145,14 +170,16 @@ impl DelayedBvState {
         var_offset: i32,
     ) -> Option<Vec<CnfClause>> {
         let op = &self.delayed_ops[op_idx];
-        if op.args.len() != 2 {
-            return None;
-        }
+        let (arg0, arg1) = match op.args.as_slice() {
+            [arg0, arg1] => (arg0, arg1),
+            _ => return None,
+        };
 
         let width = op.result_bits.len();
 
-        for i in 0..2 {
-            let arg_bits = self.term_to_bits.get(&op.args[i])?;
+        // Each argument in turn, paired with the other one.
+        for (arg, other) in [(arg0, arg1), (arg1, arg0)] {
+            let arg_bits = self.term_to_bits.get(arg)?;
             let arg_val = self.eval_bits(arg_bits, model, var_offset);
 
             // Check if arg_val is a power of 2
@@ -165,10 +192,14 @@ impl DelayedBvState {
                 continue;
             }
 
-            // arg_val == 2^k. Find k.
-            let k = arg_val.bits() as usize - 1;
-            let other_idx = 1 - i;
-            let other_bits = self.term_to_bits.get(&op.args[other_idx])?;
+            // arg_val == 2^k. Find k: a positive value has at least one bit.
+            let Some(k) = usize::try_from(arg_val.bits())
+                .ok()
+                .and_then(|bits| bits.checked_sub(1))
+            else {
+                continue;
+            };
+            let other_bits = self.term_to_bits.get(other)?;
 
             // Compute expected: other << k, truncated to width
             let result_val = self.eval_bits(&op.result_bits, model, var_offset);
@@ -184,10 +215,10 @@ impl DelayedBvState {
             // (arg != 2^k) OR (result[j] <=> other[j-k] for j>=k, result[j]=0 for j<k)
             //
             // Antecedent: negate "arg == 2^k" -> at least one bit differs
-            let mut antecedent: Vec<CnfLit> = Vec::with_capacity(arg_bits.len());
+            let mut antecedent = lits_with_capacity(arg_bits.len());
             for (bit_idx, &bit) in arg_bits.iter().enumerate() {
                 if bit_idx == k {
-                    antecedent.push(-bit); // bit k must be true, negated
+                    antecedent.push(neg_lit(bit)); // bit k must be true, negated
                 } else {
                     antecedent.push(bit); // other bits must be false, negated
                 }
@@ -198,24 +229,24 @@ impl DelayedBvState {
                 if j < k {
                     // result[j] must be 0 (shifted out)
                     let mut c = antecedent.clone();
-                    c.push(-op.result_bits[j]);
+                    c.push(neg_lit(op.result_bits[j]));
                     clauses.push(CnfClause::new(c));
                 } else {
                     let src = j - k;
                     if src < other_bits.len() {
                         // result[j] <=> other[src]
                         let mut c1 = antecedent.clone();
-                        c1.push(-op.result_bits[j]);
+                        c1.push(neg_lit(op.result_bits[j]));
                         c1.push(other_bits[src]);
                         clauses.push(CnfClause::new(c1));
                         let mut c2 = antecedent.clone();
                         c2.push(op.result_bits[j]);
-                        c2.push(-other_bits[src]);
+                        c2.push(neg_lit(other_bits[src]));
                         clauses.push(CnfClause::new(c2));
                     } else {
                         // src out of range: result[j] must be 0
                         let mut c = antecedent.clone();
-                        c.push(-op.result_bits[j]);
+                        c.push(neg_lit(op.result_bits[j]));
                         clauses.push(CnfClause::new(c));
                     }
                 }
@@ -254,11 +285,11 @@ impl DelayedBvState {
                     let mut lits: Vec<CnfLit> = Vec::new();
                     for &bit in &op.result_bits {
                         let val = self.eval_lit(bit, model, var_offset);
-                        lits.push(if val { -bit } else { bit });
+                        lits.push(if val { neg_lit(bit) } else { bit });
                     }
                     for &bit in bits {
                         let val = self.eval_lit(bit, model, var_offset);
-                        lits.push(if val { -bit } else { bit });
+                        lits.push(if val { neg_lit(bit) } else { bit });
                     }
                     return Some(vec![CnfClause::new(lits)]);
                 }
@@ -295,20 +326,23 @@ impl DelayedBvState {
 
         // Implicational clauses: (divisor != 1) OR (result[j] <=> dividend[j])
         // Antecedent negated: bit[0]=0 OR bit[1]=1 OR ... OR consequent
-        let mut antecedent: Vec<CnfLit> = Vec::with_capacity(divisor_bits.len());
-        antecedent.push(-divisor_bits[0]); // bit 0 must be true (negated)
-        for &b in &divisor_bits[1..] {
+        // `divisor_val == 1` means `divisor_bits` has a true bit 0, so it is
+        // never empty here.
+        let (&bit0, higher) = divisor_bits.split_first()?;
+        let mut antecedent = lits_with_capacity(divisor_bits.len());
+        antecedent.push(neg_lit(bit0)); // bit 0 must be true (negated)
+        for &b in higher {
             antecedent.push(b); // higher bits must be false (positive = negated false)
         }
         let mut clauses = Vec::new();
         for (&res_bit, &div_bit) in op.result_bits.iter().zip(dividend_bits.iter()) {
             let mut c1 = antecedent.clone();
-            c1.push(-res_bit);
+            c1.push(neg_lit(res_bit));
             c1.push(div_bit);
             clauses.push(CnfClause::new(c1));
             let mut c2 = antecedent.clone();
             c2.push(res_bit);
-            c2.push(-div_bit);
+            c2.push(neg_lit(div_bit));
             clauses.push(CnfClause::new(c2));
         }
         Some(clauses)
@@ -339,15 +373,18 @@ impl DelayedBvState {
         }
 
         // Implicational clauses: (divisor != 1) OR (result[j] = false)
-        let mut antecedent: Vec<CnfLit> = Vec::with_capacity(divisor_bits.len());
-        antecedent.push(-divisor_bits[0]);
-        for &b in &divisor_bits[1..] {
+        // `divisor_val == 1` means `divisor_bits` has a true bit 0, so it is
+        // never empty here.
+        let (&bit0, higher) = divisor_bits.split_first()?;
+        let mut antecedent = lits_with_capacity(divisor_bits.len());
+        antecedent.push(neg_lit(bit0));
+        for &b in higher {
             antecedent.push(b);
         }
         let mut clauses = Vec::new();
         for &r_bit in &op.result_bits {
             let mut c = antecedent.clone();
-            c.push(-r_bit); // result bit must be false
+            c.push(neg_lit(r_bit)); // result bit must be false
             clauses.push(CnfClause::new(c));
         }
         Some(clauses)
@@ -419,12 +456,12 @@ impl DelayedBvState {
         let mut clauses = Vec::new();
         for (&res_bit, &div_bit) in op.result_bits.iter().zip(dividend_bits.iter()) {
             let mut c1: Vec<CnfLit> = divisor_bits.clone();
-            c1.push(-res_bit);
+            c1.push(neg_lit(res_bit));
             c1.push(div_bit);
             clauses.push(CnfClause::new(c1));
             let mut c2: Vec<CnfLit> = divisor_bits.clone();
             c2.push(res_bit);
-            c2.push(-div_bit);
+            c2.push(neg_lit(div_bit));
             clauses.push(CnfClause::new(c2));
         }
         Some(clauses)
@@ -465,12 +502,12 @@ impl DelayedBvState {
         let mut divisor_block: Vec<CnfLit> = Vec::new();
         for &bit in divisor_bits.iter() {
             let val = self.eval_lit(bit, model, var_offset);
-            divisor_block.push(if val { -bit } else { bit });
+            divisor_block.push(if val { neg_lit(bit) } else { bit });
         }
         let mut clauses = Vec::new();
         for &r_bit in &op.result_bits {
             let mut c = divisor_block.clone();
-            c.push(-r_bit); // result bit must be false (zero)
+            c.push(neg_lit(r_bit)); // result bit must be false (zero)
             clauses.push(CnfClause::new(c));
         }
         Some(clauses)
@@ -503,16 +540,16 @@ impl DelayedBvState {
         }
 
         // Implicational clauses: (some divisor bit true) OR (result[j] <=> dividend[j])
-        let width = op.result_bits.len().min(dividend_bits.len());
+        // `zip` stops at the shorter of the two, the common width.
         let mut clauses = Vec::new();
-        for (&rb, &db) in op.result_bits[..width].iter().zip(&dividend_bits[..width]) {
+        for (&rb, &db) in op.result_bits.iter().zip(dividend_bits.iter()) {
             let mut c1 = divisor_bits.clone();
-            c1.push(-rb);
+            c1.push(neg_lit(rb));
             c1.push(db);
             clauses.push(CnfClause::new(c1));
             let mut c2 = divisor_bits.clone();
             c2.push(rb);
-            c2.push(-db);
+            c2.push(neg_lit(db));
             clauses.push(CnfClause::new(c2));
         }
         Some(clauses)
@@ -554,15 +591,15 @@ impl DelayedBvState {
         let mut lits: Vec<CnfLit> = Vec::new();
         for &bit in a_bits {
             let val = self.eval_lit(bit, model, var_offset);
-            lits.push(if val { -bit } else { bit });
+            lits.push(if val { neg_lit(bit) } else { bit });
         }
         for &bit in b_bits {
             let val = self.eval_lit(bit, model, var_offset);
-            lits.push(if val { -bit } else { bit });
+            lits.push(if val { neg_lit(bit) } else { bit });
         }
         for &bit in &op.result_bits {
             let val = self.eval_lit(bit, model, var_offset);
-            lits.push(if val { -bit } else { bit });
+            lits.push(if val { neg_lit(bit) } else { bit });
         }
         Some(vec![CnfClause::new(lits)])
     }
@@ -591,8 +628,10 @@ impl DelayedBvState {
         let a_bits = self.term_to_bits.get(&op.args[0])?;
         let a_val = self.eval_bits(a_bits, model, var_offset);
 
-        // Check sign of a: if MSB is set, a is negative
-        let half = num_bigint::BigInt::from(1) << (width - 1);
+        // Check sign of a: if MSB is set, a is negative. A BV result has at
+        // least one bit, so the MSB index exists for every real operation.
+        let msb_idx = width.checked_sub(1)?;
+        let half = num_bigint::BigInt::from(1) << msb_idx;
         let a_is_negative = a_val >= half;
         let expected = if a_is_negative {
             // a negative => result = 1
@@ -610,12 +649,12 @@ impl DelayedBvState {
         // MSB literal of operand a — used as sign antecedent in each clause.
         // The clause must be conditioned on the sign of a because the expected
         // result differs between positive and negative operands (#8371).
-        let a_msb = a_bits[width as usize - 1];
+        let a_msb = *a_bits.get(usize::try_from(msb_idx).ok()?)?;
         // Antecedent literal: negate the current sign so the clause fires only
         // when a has the same sign as in this model evaluation.
         // If a is negative (MSB=true), add -a_msb (clause fires when MSB is true).
         // If a is non-negative (MSB=false), add a_msb (clause fires when MSB is false).
-        let sign_antecedent = if a_is_negative { -a_msb } else { a_msb };
+        let sign_antecedent = if a_is_negative { neg_lit(a_msb) } else { a_msb };
 
         // Block: (some divisor bit true) OR (sign mismatch) OR (result matches expected)
         // For each result bit, constrain to expected value
@@ -627,7 +666,7 @@ impl DelayedBvState {
             if expected_bit == num_bigint::BigInt::from(1) {
                 c.push(r_bit); // result bit must be true
             } else {
-                c.push(-r_bit); // result bit must be false
+                c.push(neg_lit(r_bit)); // result bit must be false
             }
             clauses.push(CnfClause::new(c));
         }
@@ -663,16 +702,16 @@ impl DelayedBvState {
         }
 
         // Implicational clauses: (some divisor bit true) OR (result[j] <=> dividend[j])
-        let width = op.result_bits.len().min(dividend_bits.len());
+        // `zip` stops at the shorter of the two, the common width.
         let mut clauses = Vec::new();
-        for (&rb, &db) in op.result_bits[..width].iter().zip(&dividend_bits[..width]) {
+        for (&rb, &db) in op.result_bits.iter().zip(dividend_bits.iter()) {
             let mut c1 = divisor_bits.clone();
-            c1.push(-rb);
+            c1.push(neg_lit(rb));
             c1.push(db);
             clauses.push(CnfClause::new(c1));
             let mut c2 = divisor_bits.clone();
             c2.push(rb);
-            c2.push(-db);
+            c2.push(neg_lit(db));
             clauses.push(CnfClause::new(c2));
         }
         Some(clauses)
@@ -687,17 +726,18 @@ impl DelayedBvState {
         var_offset: i32,
     ) -> Option<Vec<CnfClause>> {
         let op = &self.delayed_ops[op_idx];
-        if op.args.len() != 2 {
-            return None;
-        }
+        let (arg0, arg1) = match op.args.as_slice() {
+            [arg0, arg1] => (arg0, arg1),
+            _ => return None,
+        };
         let zero = num_bigint::BigInt::from(0);
 
-        for i in 0..2 {
-            if let Some(bits) = self.term_to_bits.get(&op.args[i]) {
+        // Each argument in turn, paired with the other one.
+        for (arg, other) in [(arg0, arg1), (arg1, arg0)] {
+            if let Some(bits) = self.term_to_bits.get(arg) {
                 let arg_val = self.eval_bits(bits, model, var_offset);
                 if arg_val == zero {
-                    let other_idx = 1 - i;
-                    if let Some(other_bits) = self.term_to_bits.get(&op.args[other_idx]) {
+                    if let Some(other_bits) = self.term_to_bits.get(other) {
                         let other_val = self.eval_bits(other_bits, model, var_offset);
                         let result_val = self.eval_bits(&op.result_bits, model, var_offset);
 
@@ -710,16 +750,16 @@ impl DelayedBvState {
                         for &b in bits.iter() {
                             antecedent.push(b); // positive = "some bit is true"
                         }
-                        let width = op.result_bits.len().min(other_bits.len());
+                        // `zip` stops at the shorter of the two, the common width.
                         let mut clauses = Vec::new();
-                        for (&rb, &ob) in op.result_bits[..width].iter().zip(&other_bits[..width]) {
+                        for (&rb, &ob) in op.result_bits.iter().zip(other_bits.iter()) {
                             let mut c1 = antecedent.clone();
-                            c1.push(-rb);
+                            c1.push(neg_lit(rb));
                             c1.push(ob);
                             clauses.push(CnfClause::new(c1));
                             let mut c2 = antecedent.clone();
                             c2.push(rb);
-                            c2.push(-ob);
+                            c2.push(neg_lit(ob));
                             clauses.push(CnfClause::new(c2));
                         }
                         return Some(clauses);

@@ -24,6 +24,15 @@ fn solve(script: &str) -> Executor {
     exec
 }
 
+/// The parsed surface of one term.
+fn parse_term(text: &str) -> ay_frontend::command::Term {
+    let commands = parse(&format!("(assert {text})")).expect("term parses");
+    let [ay_frontend::Command::Assert(term)] = commands.as_slice() else {
+        panic!("one assert");
+    };
+    term.clone()
+}
+
 /// The one-line `(step t0 (cl) :rule hole)` document: no premises, no
 /// derivation, nothing said about the input.
 fn is_argument_free(proof: &Proof) -> bool {
@@ -167,10 +176,10 @@ fn a_nested_conjunct_is_projected_through_the_and_tree() {
 /// FAIL-CLOSED, and the reason this gate exists at all.
 ///
 /// The author writes `(leaf zero)` and also writes an `ite` that FOLDS to
-/// `(leaf zero)`. Both spellings share one hash-consed `TermId`, so the
-/// printer's surface-override table renders BOTH with the `ite` spelling, and
-/// the rebuilt premise no longer prints as anything in the problem file.
-/// Measured with carcara on the artifact this produced before the gate:
+/// `(leaf zero)`. Both spellings share one hash-consed `TermId`, so an
+/// override recording the `ite` spelling against that id renders BOTH with
+/// it, and the rebuilt premise no longer prints as anything in the problem
+/// file. Measured with carcara on the artifact this produced before the gate:
 ///
 /// ```text
 /// [ERROR] checking failed on step 't0' with rule 'assume': could not match
@@ -181,11 +190,26 @@ fn a_nested_conjunct_is_projected_through_the_and_tree() {
 /// `invalid` is strictly worse than the one-line hole it replaced — a wrong
 /// proof is worse than no proof — so a premise that does not print back as the
 /// author's own assertion must decline.
+///
+/// The surface-override collector no longer records that entry itself (an
+/// `ite` folded onto its own branch is `override_folds_onto_own_operand`), so
+/// the hijacking entry is PLANTED here: the gate must hold whatever the
+/// collector does.
 #[test]
 fn a_premise_that_does_not_print_as_authored_is_declined() {
     let mut exec = solve(&format!(
         "{DT_PRELUDE}(assert (and (not (= (ite ((_ is cons) null) (car null) (leaf zero)) (leaf zero))) (not ((_ is cons) (cons (leaf x1) null)))))\n(check-sat)\n"
     ));
+    let leaf_zero = exec
+        .ctx
+        .elaborate_surface_subterm(&parse_term("(leaf zero)"))
+        .expect("(leaf zero) elaborates");
+    let mut overrides = exec.last_proof_term_overrides.clone().unwrap_or_default();
+    overrides.insert(
+        leaf_zero,
+        "(ite ((_ is cons) null) (car null) (leaf zero))".to_string(),
+    );
+    exec.last_proof_term_overrides = Some(overrides);
     let mut probe = Proof::new();
     probe.add_rule_step(AletheRule::Hole, Vec::new(), Vec::new(), Vec::new());
     assert!(
@@ -195,6 +219,30 @@ fn a_premise_that_does_not_print_as_authored_is_declined() {
     assert!(
         is_argument_free(&probe),
         "declining must leave the proof byte-identical",
+    );
+}
+
+/// Positive twin: with no hijacking entry the same root prints as authored,
+/// so its argument is recorded — the authored assertion is the one premise
+/// and the unchanged strict checker accepts the derivation whole.
+#[test]
+fn a_fold_onto_an_ite_branch_no_longer_hides_the_authored_premise() {
+    let exec = solve(&format!(
+        "{DT_PRELUDE}(assert (and (not (= (ite ((_ is cons) null) (car null) (leaf zero)) (leaf zero))) (not ((_ is cons) (cons (leaf x1) null)))))\n(check-sat)\n"
+    ));
+    assert!(exec.last_result_is_unsat(), "the instance is unsat");
+    let proof = exec.last_proof.as_ref().expect("a proof is retained");
+    assert!(!is_argument_free(proof), "the argument must be recorded");
+    let premise = sole_assume(&exec.ctx.terms, proof);
+    assert_eq!(
+        ay_proof::format_term_alethe(&exec.ctx.terms, premise),
+        "(and (not (= (ite ((_ is cons) null) (car null) (leaf zero)) (leaf zero))) \
+         (not ((_ is cons) (cons (leaf x1) null))))",
+    );
+    assert!(
+        exec.check_proof_strict_with_datatypes(proof)
+            .is_ok_and(|quality| quality.is_complete()),
+        "the recorded argument must be a complete strict derivation",
     );
 }
 

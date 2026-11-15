@@ -9,6 +9,8 @@
 
 use super::*;
 
+pub(super) mod known_string;
+
 impl CoreSolver {
     /// Get the string constant value for a component (owned copy).
     pub(super) fn component_constant_owned(

@@ -1,0 +1,29 @@
+[package]
+name = "veripb-core-proved"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Soundness-critical kernel of the VeriPB checker, written on the Trust two-language spec surface (Rust contracts discharged by Clean theorems)."
+
+[features]
+default = []
+# Only compiler_consumer can parse `src/trust_surface.rs` (it contains a `clean { ... }`
+# parser island and first-class `ensures ... by ...` clauses). Builds without
+# this feature never read the file, because `#[cfg(feature = ...)]` on a `mod`
+# declaration suppresses module loading entirely.
+trust-surface = []
+
+[dependencies]
+# The ONE dependency, and only so the kernel can be instantiated at the `Int`
+# the Clean development is stated over -- see the crate docs, "On the one
+# dependency". It is the same integer type `veripb-formula` already uses, so
+# this adds no package to the workspace lockfile and no algorithm to the
+# trust surface.
+malachite-bigint = "0.10.0"
+
+[lib]
+name = "veripb_core_proved"
+path = "src/lib.rs"

@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% The other direction of `pol_lower_rhs_clause_escalation`: naming the stale,
+% un-lowered degree must be rejected. Before the fix the dropped-temporary
+% escalation left `1 x1 1 x2 >= 1` on the stack and this `e` was accepted.
+f 1 ;
+pol 1 18446744073709551616 - ;
+e 1 x1 1 x2 >= 1 : 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

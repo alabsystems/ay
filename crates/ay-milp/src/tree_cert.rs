@@ -2095,6 +2095,190 @@ mod tests {
         );
     }
 
+    /// FAIL-CLOSED on garbage advice. The exactifier is fed a ray by a float
+    /// solver; a NaN or infinite entry, an all-zero ray, or a ray of the
+    /// wrong length must yield NO certificate on a model that is genuinely
+    /// infeasible — never a combination that verifies by accident of how the
+    /// garbage was skipped. The positive control shows the same model IS
+    /// certifiable from a sane ray, so the declines are about the ray.
+    /// (Salvaged from the retired `milp-for-ny` branch's `ns.rs`, whose
+    /// `farkas_ray_fails_closed` covered these shapes; main had no such test.)
+    #[test]
+    fn garbage_rays_are_declined_on_an_infeasible_model() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        // `x >= 2` against the box `x <= 1`: one row, one column fact.
+        model.add_row(2.0, f64::INFINITY, &[(x, 1.0)]);
+        let ok = exact_farkas_from_float_ray(&model, &[1.0]).expect("positive control");
+        ok.verify(&model).expect("the control certificate verifies");
+
+        assert!(
+            exact_farkas_from_float_ray(&model, &[f64::NAN]).is_none(),
+            "NaN ray"
+        );
+        assert!(
+            exact_farkas_from_float_ray(&model, &[f64::INFINITY]).is_none(),
+            "infinite ray"
+        );
+        assert!(
+            exact_farkas_from_float_ray(&model, &[0.0]).is_none(),
+            "all-zero ray"
+        );
+        assert!(
+            exact_farkas_from_float_ray(&model, &[]).is_none(),
+            "too-short ray"
+        );
+        assert!(
+            exact_farkas_from_float_ray(&model, &[1.0, 1.0]).is_none(),
+            "too-long ray"
+        );
+    }
+
+    use crate::cert::{BoundSide, FactRef, FarkasCertificate};
+    use crate::model::Col;
+
+    /// A tiny deterministic xorshift for the randomized exactifier checks.
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + (self.next() % ((hi - lo + 1) as u64)) as i64
+        }
+    }
+
+    /// Small random LPs over boxed and occasionally free columns, with a
+    /// crossed-bound "poison" row on roughly a third of them so that a fair
+    /// share come out infeasible.
+    fn random_small_lp(rng: &mut Xs) -> Model {
+        let mut model = Model::new();
+        let n = rng.int(2, 5) as usize;
+        let cols: Vec<Col> = (0..n)
+            .map(|_| {
+                if rng.int(0, 5) == 0 {
+                    model.add_col(f64::NEG_INFINITY, f64::INFINITY)
+                } else {
+                    let lb = rng.int(-3, 1) as f64;
+                    model.add_col(lb, lb + rng.int(0, 4) as f64)
+                }
+            })
+            .collect();
+        let rows = rng.int(1, 5);
+        for _ in 0..rows {
+            let coeffs: Vec<(Col, f64)> = cols
+                .iter()
+                .filter_map(|&c| {
+                    let a = rng.int(-3, 3);
+                    (a != 0).then_some((c, a as f64))
+                })
+                .collect();
+            if coeffs.is_empty() {
+                continue;
+            }
+            let lb = rng.int(-6, 4) as f64;
+            let (lb, ub) = match rng.int(0, 2) {
+                0 => (lb, f64::INFINITY),
+                1 => (f64::NEG_INFINITY, lb),
+                _ => (lb, lb + rng.int(0, 3) as f64),
+            };
+            model.add_row(lb, ub, &coeffs);
+        }
+        if rng.int(0, 2) == 0 {
+            // Poison: demand a large activity that the boxes cannot reach.
+            let coeffs: Vec<(Col, f64)> = cols.iter().map(|&c| (c, 1.0)).collect();
+            model.add_row(40.0, f64::INFINITY, &coeffs);
+        }
+        model
+    }
+
+    /// The exact rim's own Farkas multipliers, rounded to f64 and re-oriented
+    /// as a signed row ray (lower-side facts positive, upper-side negative).
+    fn float_ray_of(cert: &FarkasCertificate, rows: usize) -> Vec<f64> {
+        use num_traits::ToPrimitive;
+        let mut ray = vec![0.0; rows];
+        for m in &cert.multipliers {
+            if let FactRef::RowBound { row, side } = m.fact {
+                let c = m.coeff.to_f64().unwrap_or(f64::NAN);
+                ray[row.index()] += match side {
+                    BoundSide::Lower => c,
+                    BoundSide::Upper => -c,
+                };
+            }
+        }
+        ray
+    }
+
+    /// RANDOMIZED, both directions. (1) On LPs the exact rim proves
+    /// infeasible, the float image of the rim's own ray must reconstruct an
+    /// exact certificate for most instances — the exactifier's job is exactly
+    /// that reconstruction, and a floor guards against silently declining
+    /// everything. (2) On LPs the exact rim proves feasible, NO ray — a
+    /// constant one or a random one — may ever produce a certificate. Every
+    /// certificate returned verifies against the model by construction, so (2)
+    /// is the property the whole route rests on. (Salvaged from the retired
+    /// `milp-for-ny` branch's `ns.rs`, which carried both properties as
+    /// `farkas_ray_certifies_infeasible_lps` / `farkas_ray_none_on_feasible_lps`;
+    /// main had only hand cases.)
+    #[test]
+    fn randomized_rim_rays_reconstruct_and_feasible_lps_never_certify() {
+        use crate::exact::{Budget, ExactLp, LpFeasibility};
+        let budget = Budget {
+            deadline: None,
+            max_iters: 100_000,
+        };
+        let mut rng = Xs(0x0C0F_FEE0_0C0F_FEE1);
+        let (mut infeasible, mut reconstructed, mut feasible) = (0usize, 0usize, 0usize);
+        for _ in 0..160 {
+            let model = random_small_lp(&mut rng);
+            let rows = model.num_rows();
+            let mut lp = ExactLp::new(&model);
+            match lp.make_feasible(&budget) {
+                LpFeasibility::Infeasible(cert) => {
+                    cert.verify(&model)
+                        .expect("the rim's own certificate verifies");
+                    infeasible += 1;
+                    let ray = float_ray_of(&cert, rows);
+                    if let Some(rebuilt) = exact_farkas_from_float_ray(&model, &ray) {
+                        rebuilt
+                            .verify(&model)
+                            .expect("a reconstructed certificate verifies");
+                        reconstructed += 1;
+                    }
+                }
+                LpFeasibility::Feasible => {
+                    feasible += 1;
+                    let ones = vec![1.0; rows];
+                    assert!(
+                        exact_farkas_from_float_ray(&model, &ones).is_none(),
+                        "a feasible LP certified empty from a constant ray"
+                    );
+                    let ray: Vec<f64> = (0..rows).map(|_| rng.int(-3, 3) as f64 * 0.5).collect();
+                    assert!(
+                        exact_farkas_from_float_ray(&model, &ray).is_none(),
+                        "a feasible LP certified empty from a random ray"
+                    );
+                }
+                LpFeasibility::Unknown(_) => {}
+            }
+        }
+        println!(
+            "exactifier ledger: {infeasible} infeasible ({reconstructed} reconstructed from the rim ray), {feasible} feasible"
+        );
+        assert!(
+            infeasible >= 20,
+            "coverage: only {infeasible} infeasible LPs"
+        );
+        assert!(feasible >= 20, "coverage: only {feasible} feasible LPs");
+        assert!(
+            reconstructed * 5 >= infeasible * 4,
+            "the exactifier reconstructed only {reconstructed}/{infeasible} rim rays"
+        );
+    }
+
     /// FAIL-CLOSED, the other way. Elimination pivots only on rows with BOTH
     /// bounds finite, because such a row can cite a fact whichever way its
     /// multiplier's sign lands. With no such row touching the free column there

@@ -746,7 +746,12 @@ impl Executor {
             theory.mark_reduced(tid);
         }
         let mut dpll = if proof_enabled {
-            DpllT::from_tseitin_with_proof(&self.ctx.terms, &tseitin_result, theory)
+            DpllT::from_tseitin_with_clause_capture(
+                &self.ctx.terms,
+                &tseitin_result,
+                theory,
+                self.clause_event_capture,
+            )
         } else {
             DpllT::from_tseitin(&self.ctx.terms, &tseitin_result, theory)
         };
@@ -757,6 +762,8 @@ impl Executor {
             dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
         }
         self.apply_random_seed_to_dpll(&mut dpll);
+        dpll.sat_solver_mut()
+            .set_clause_event_capture(self.clause_event_capture);
         self.apply_progress_to_dpll(&mut dpll);
         dpll.set_max_learned_clauses(self.learned_clause_limit);
         dpll.set_max_clause_db_bytes(self.clause_db_bytes_limit);
@@ -938,6 +945,8 @@ impl Executor {
                     // first lemma iteration; subsequent iterations already have
                     // it disabled in the preserved SAT solver.
                     if string_lemma_requests == 1 {
+                        dpll.sat_solver_mut()
+                            .set_clause_event_capture(self.clause_event_capture);
                         self.apply_progress_to_dpll(&mut dpll);
                         dpll.set_max_learned_clauses(self.learned_clause_limit);
                         dpll.set_max_clause_db_bytes(self.clause_db_bytes_limit);

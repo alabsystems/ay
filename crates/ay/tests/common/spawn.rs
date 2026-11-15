@@ -59,23 +59,39 @@ fn run(cmd: &mut Command, stdin: Option<Vec<u8>>, timeout: Duration) -> io::Resu
         cmd.process_group(0); // child pgid = child pid; stable std API
     }
     let mut child = cmd.spawn()?;
+    let mut stdin_h = None;
     if let Some(bytes) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin was piped");
-        thread::spawn(move || {
+        let mut pipe = match ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child) {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                kill_group(&mut child);
+                return Err(error);
+            }
+        };
+        stdin_h = Some(thread::spawn(move || {
             let _ = pipe.write_all(&bytes); // EPIPE ok: child may exit first
-        });
+        }));
     }
+    let join_stdin = || {
+        if let Some(writer) = stdin_h {
+            writer.join().expect("stdin writer thread");
+        }
+    };
     let out_h = drain(child.stdout.take());
     let err_h = drain(child.stderr.take());
     let waited = child.wait_timeout(timeout);
     match waited {
-        Ok(Some(status)) => Ok(Output {
-            status,
-            stdout: out_h.join().expect("stdout drain thread"),
-            stderr: err_h.join().expect("stderr drain thread"),
-        }),
+        Ok(Some(status)) => {
+            join_stdin();
+            Ok(Output {
+                status,
+                stdout: out_h.join().expect("stdout drain thread"),
+                stderr: err_h.join().expect("stderr drain thread"),
+            })
+        }
         Ok(None) => {
             kill_group(&mut child);
+            join_stdin();
             let stderr = err_h.join().expect("stderr drain thread");
             let stdout = out_h.join().expect("stdout drain thread");
             Err(io::Error::new(
@@ -91,6 +107,7 @@ fn run(cmd: &mut Command, stdin: Option<Vec<u8>>, timeout: Duration) -> io::Resu
         }
         Err(e) => {
             kill_group(&mut child);
+            join_stdin();
             let _ = out_h.join();
             let _ = err_h.join();
             Err(e)

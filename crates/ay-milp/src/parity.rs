@@ -127,6 +127,35 @@ pub fn verify_parity_infeasibility_certificate(
     model: &Model,
     certificate: &ParityInfeasibilityCertificate,
 ) -> Result<(), String> {
+    verify_parity_infeasibility_certificate_with_deadline(model, certificate, None)
+}
+
+/// Replay a source-row parity contradiction under the caller's existing
+/// absolute deadline. Polling covers row, coefficient and final-column scans;
+/// it is cooperative and grants no additional time allowance.
+///
+/// # Errors
+/// Returns an error on expiry or on the same malformed source/proof conditions
+/// as [`verify_parity_infeasibility_certificate`]. No failed replay is a proof.
+pub fn verify_parity_infeasibility_certificate_with_deadline(
+    model: &Model,
+    certificate: &ParityInfeasibilityCertificate,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    verify_parity_infeasibility_certificate_with_budget(model, certificate, Deadline::new(deadline))
+}
+
+fn verify_parity_infeasibility_certificate_with_budget(
+    model: &Model,
+    certificate: &ParityInfeasibilityCertificate,
+    deadline: Deadline<'_>,
+) -> Result<(), String> {
+    let check = || {
+        deadline
+            .check()
+            .map_err(|_| "parity proof replay deadline expired".to_owned())
+    };
+    check()?;
     if certificate.rows.is_empty() {
         return Err("parity certificate selects no source rows".to_owned());
     }
@@ -134,7 +163,10 @@ pub fn verify_parity_infeasibility_certificate(
     let mut coefficient_parity = vec![false; model.num_cols()];
     let mut rhs_parity = false;
 
-    for &row_u32 in &certificate.rows {
+    for (index, &row_u32) in certificate.rows.iter().enumerate() {
+        if index & 63 == 0 {
+            check()?;
+        }
         let row_index = row_u32 as usize;
         if previous.is_some_and(|prior| prior >= row_u32) {
             return Err("parity certificate rows are not strictly increasing".to_owned());
@@ -161,7 +193,10 @@ pub fn verify_parity_infeasibility_certificate(
         }
         rhs_parity ^= lower.to_integer().bit(0);
 
-        for &(column, coefficient_float) in coefficients {
+        for (index, &(column, coefficient_float)) in coefficients.iter().enumerate() {
+            if index & 63 == 0 {
+                check()?;
+            }
             let column_index = column as usize;
             if !model.col_kind(Col(column)).is_integral() {
                 return Err(format!(
@@ -178,14 +213,20 @@ pub fn verify_parity_infeasibility_certificate(
         }
     }
 
-    if coefficient_parity.iter().any(|&odd| odd) {
-        return Err(
-            "selected parity rows do not sum to even coefficients for every column".to_owned(),
-        );
+    for (index, &odd) in coefficient_parity.iter().enumerate() {
+        if index & 63 == 0 {
+            check()?;
+        }
+        if odd {
+            return Err(
+                "selected parity rows do not sum to even coefficients for every column".to_owned(),
+            );
+        }
     }
     if !rhs_parity {
         return Err("selected parity rows do not sum to an odd right-hand side".to_owned());
     }
+    check()?;
     Ok(())
 }
 
@@ -702,8 +743,16 @@ fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcom
             .map(|row| u32::try_from(row).map_err(|_| ParityAbort::Declined))
             .collect::<ParityResult<Vec<_>>>()?;
         let certificate = ParityInfeasibilityCertificate::from_rows(rows);
-        verify_parity_infeasibility_certificate(model, &certificate)
-            .map_err(|_| ParityAbort::Declined)?;
+        verify_parity_infeasibility_certificate_with_budget(model, &certificate, deadline)
+            .map_err(|_| {
+                // Preserve expiry as the native cause even before the outer
+                // post-decline guard maps exhausted work to Unknown::Timeout.
+                if deadline.check().is_err() {
+                    ParityAbort::Timeout
+                } else {
+                    ParityAbort::Declined
+                }
+            })?;
         deadline.check()?;
         publish_infeasibility_certificate(certificate);
         return Ok(Outcome::Infeasible {
@@ -994,6 +1043,91 @@ mod tests {
         assert_eq!(certificate.rows(), &[0, 1]);
         verify_parity_infeasibility_certificate(&m, &certificate)
             .expect("freshly generated GF(2) contradiction must replay");
+    }
+
+    #[test]
+    fn native_inconsistency_retains_timeout_at_every_replay_boundary() {
+        let model = parity_model(&[vec![1], vec![1]], &[0, -1]);
+        let polls_left = Cell::new(usize::MAX);
+        clear_pending_infeasibility_certificate();
+        assert!(matches!(
+            try_solve_inner(&model, Deadline::with_poll_budget(&polls_left)),
+            Ok(Outcome::Infeasible { .. })
+        ));
+        assert!(take_pending_infeasibility_certificate().is_some());
+        let successful_polls = usize::MAX - polls_left.get();
+        assert!(successful_polls > 0);
+
+        // Exhaust every actual checkpoint before publication. Measuring the
+        // successful run avoids pinning a historical poll count. In particular
+        // this includes expiry inside final replay, where losing the typed
+        // cause used to turn the inner Timeout into Declined.
+        for budget in 0..successful_polls {
+            let inner_polls = Cell::new(budget);
+            clear_pending_infeasibility_certificate();
+            assert!(
+                matches!(
+                    try_solve_inner(&model, Deadline::with_poll_budget(&inner_polls)),
+                    Err(ParityAbort::Timeout)
+                ),
+                "inner expiry lost its cause at budget {budget}"
+            );
+            assert!(take_pending_infeasibility_certificate().is_none());
+
+            let outer_polls = Cell::new(budget);
+            assert!(
+                matches!(
+                    try_solve_with_deadline(&model, Deadline::with_poll_budget(&outer_polls)),
+                    Some(Outcome::Unknown {
+                        reason: UnknownReason::Timeout
+                    })
+                ),
+                "outer expiry must remain Unknown::Timeout at budget {budget}"
+            );
+            assert!(take_pending_infeasibility_certificate().is_none());
+        }
+    }
+
+    #[test]
+    fn parity_replay_deadline_covers_each_large_scan() {
+        // Each source has a valid exact parity contradiction. A deterministic
+        // budget expires during the wide scan, not just at the API boundary.
+        let mut wide_terms = Model::new();
+        let terms: Vec<_> = (0..2048)
+            .map(|_| (wide_terms.add_binary_col(), 2.0))
+            .collect();
+        wide_terms.add_row(1.0, 1.0, &terms);
+        let single = ParityInfeasibilityCertificate::from_rows(vec![0]);
+
+        let mut wide_columns = Model::new();
+        for _ in 0..2048 {
+            wide_columns.add_binary_col();
+        }
+        wide_columns.add_row(1.0, 1.0, &[]);
+
+        let mut many_rows = Model::new();
+        for _ in 0..2047 {
+            many_rows.add_row(0.0, 0.0, &[]);
+        }
+        many_rows.add_row(1.0, 1.0, &[]);
+        let all_rows = ParityInfeasibilityCertificate::from_rows((0..2048).collect());
+
+        for (model, proof) in [
+            (&wide_terms, &single),
+            (&wide_columns, &single),
+            (&many_rows, &all_rows),
+        ] {
+            verify_parity_infeasibility_certificate(model, proof)
+                .expect("exact parity contradiction");
+            let polls = Cell::new(8);
+            let error = verify_parity_infeasibility_certificate_with_budget(
+                model,
+                proof,
+                Deadline::with_poll_budget(&polls),
+            )
+            .expect_err("in-loop expiry must refuse valid proof authority");
+            assert_eq!(error, "parity proof replay deadline expired");
+        }
     }
 
     #[test]

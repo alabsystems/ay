@@ -18,6 +18,18 @@ use num_rational::BigRational;
 use std::cell::Cell;
 use std::collections::HashMap;
 
+mod binary128;
+mod complex;
+mod fp_arithmetic_exact;
+mod fp_exact;
+mod fp_ieee_exact;
+mod fp_round_integral_exact;
+mod fp_to_bv_exact;
+mod fp_to_bv_unspecified;
+mod fp_to_fp_exact;
+mod fp_to_real_exact;
+mod sequence_power;
+
 /// A trivial stub model: a fixed map from leaf `TermId` to value.
 struct StubModel {
     leaves: HashMap<TermId, ModelValue>,
@@ -1578,6 +1590,10 @@ fn field_read_eq(
 }
 
 include!("tests/datatype_array_residuals.rs");
+#[path = "tests/residual_nested_arrays.rs"]
+mod residual_nested_arrays;
+#[path = "tests/residual_nested_selectors.rs"]
+mod residual_nested_selectors;
 
 // --- seq.last_indexof / seq.replace_all value-level parity (#p0.1-seq) ------
 //
@@ -1718,3 +1734,5 @@ fn replace_re_verdict(
 // ── the shape the group_strings regression exercised: a union pattern ──
 
 include!("tests/regex_replacement.rs");
+
+include!("tests/finite_quantifiers.rs");

@@ -79,7 +79,7 @@ impl Executor {
     fn strict_gate_is_required(plans: &SurgeryPlans) -> bool {
         let has_or_permutation = plans.assume_plans.values().any(|plan| {
             matches!(plan, AssumePlan::AndDistinct { units, .. }
-                if units.iter().any(|unit| matches!(unit.kind, AndDistinctKind::OrPerm { .. })))
+                if units.iter().any(|unit| matches!(unit.kind, AndDistinctKind::OrPerm { .. } | AndDistinctKind::EqFlip | AndDistinctKind::Transport(_))))
         });
         !plans.euf_lemmas.is_empty()
             || has_or_permutation

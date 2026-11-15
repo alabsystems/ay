@@ -29,9 +29,19 @@ pub fn parse(text: &str) -> Result<Certificate, CertIoError> {
     Ok(state.certificate)
 }
 
+/// Refuse an input this build will not read, WITHOUT calling it malformed.
+///
+/// Both caps return [`CertIoError::InputTooLarge`], which the checker maps to
+/// `Unverified` rather than `Refuted`. Nothing has been parsed at this point,
+/// so there is nothing to refute; the honest report is "this checker did not
+/// read it". See the variant's own doc comment for the defect this closes.
 fn preflight_input(text: &str) -> Result<(), CertIoError> {
     if text.len() > MAX_AYC_INPUT_BYTES {
-        return Err(malformed(0, "AYC input exceeds the 512 MiB parser cap"));
+        return Err(CertIoError::InputTooLarge {
+            what: "AYC input exceeds the 1 GiB parser cap".into(),
+            limit: MAX_AYC_INPUT_BYTES,
+            actual: text.len(),
+        });
     }
     let line_count = text.bytes().try_fold(1usize, |count, byte| {
         if byte == b'\n' {
@@ -42,10 +52,11 @@ fn preflight_input(text: &str) -> Result<(), CertIoError> {
     });
     let line_count = line_count.ok_or_else(|| malformed(0, "AYC line count overflows usize"))?;
     if line_count > MAX_AYC_INPUT_LINES {
-        return Err(malformed(
-            0,
-            "AYC input exceeds the 8,000,000-line parser cap",
-        ));
+        return Err(CertIoError::InputTooLarge {
+            what: "AYC input exceeds the 32,000,000-line parser cap".into(),
+            limit: MAX_AYC_INPUT_LINES,
+            actual: line_count,
+        });
     }
     Ok(())
 }

@@ -257,3 +257,41 @@ fn incremental_frontier_survives_arena_compaction_between_sync_and_backtrack() {
         ),
     }
 }
+
+/// The frontier `members` list (the VMTF picker's iteration domain) must be
+/// exactly the set of `buf`-true variables after a full search — decisions,
+/// backtracks, learned appends, deletions and rebuilds all toggle membership
+/// through the same five sites.
+#[test]
+fn frontier_members_match_buf_after_search() {
+    let num_vars = 60;
+    let clauses = random_3sat(num_vars, 260, 41);
+    let mut solver = Solver::new(num_vars);
+    solver.set_relevancy_branching(true);
+    solver.set_relevancy_hard(true);
+    for clause in &clauses {
+        solver.add_clause(clause.clone());
+    }
+    let _ = solver.solve().into_inner();
+    assert!(solver.relevancy_decisions() > 0, "frontier never engaged");
+
+    let mut frontier = std::mem::take(&mut solver.relevancy_frontier);
+    frontier.sync(&solver);
+    let mut from_members: Vec<u32> = frontier.members().to_vec();
+    from_members.sort_unstable();
+    from_members.dedup();
+    assert_eq!(
+        from_members.len(),
+        frontier.members().len(),
+        "members list contains duplicates"
+    );
+    let from_buf: Vec<u32> = frontier
+        .buf()
+        .iter()
+        .enumerate()
+        .filter(|(_, &on)| on)
+        .map(|(v, _)| v as u32)
+        .collect();
+    assert_eq!(from_members, from_buf, "members list != buf membership set");
+    solver.relevancy_frontier = frontier;
+}

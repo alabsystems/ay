@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod authored_source;
 pub mod command;
 pub(crate) mod elaborate;
 pub(crate) mod lexer;
@@ -41,15 +42,21 @@ pub use command::{
     SUPPORTED_TACTIC_NAMES,
 };
 pub use elaborate::{
-    internal_namespace_of, is_canonical_theory_operator_identity, is_internal_namespace_name,
-    is_reserved_op_name, is_reserved_symbol, is_source_reserved_symbol, AuthoredAssertionRef,
+    internal_namespace_of, is_builtin_operator_name, is_canonical_theory_operator_identity,
+    is_internal_namespace_name, is_reserved_op_name, is_reserved_symbol, is_source_reserved_symbol,
+    script_requests_strict_proofs, term_has_named_label, AuthoredAssertionRef,
     CheckedProjectionBinding, CheckedProjectionBindings, CommandResult, Context, DeclarationId,
-    DeclarationKind, ElaborateError, FiniteSetOp, FiniteSetTermMetadata, FiniteSetTypingMode,
-    InternalLogicBorrow, InternalNamespace, InternalNamespaceMinter, InternalNamespaceScope,
-    IntroKind, Objective, ObjectiveDirection, OptionValue, ProjectionBindingRejection,
-    ProjectionBindingRequest, PublicAssertionMetadata, PublicSort, PublicSymbolSignature,
-    PublicTermMetadata, SoftAssertion, SourceContextStamp, SymbolInfo, INTERNAL_NAMESPACES,
+    DeclarationKind, DefinitionalAdoptionSnapshot, ElaborateError, FiniteSetOp,
+    FiniteSetTermMetadata, FiniteSetTypingMode, InternalLogicBorrow, InternalNamespace,
+    InternalNamespaceMinter, InternalNamespaceScope, IntroKind, LabelFailure,
+    NativeAssertionSurfaces, Objective, ObjectiveDirection, ObjectiveStep, OptionValue,
+    ParsedRetention, ProjectionBindingRejection, ProjectionBindingRequest, PublicAssertionMetadata,
+    PublicSort, PublicSymbolSignature, PublicTermMetadata, SharedSurfaceElaboration,
+    SharedSurfaceLimits, SoftAssertion, SourceContextStamp, SymbolInfo,
+    CHECK_SAT_ADOPTION_MAX_RETAINED_NODES, INTERNAL_NAMESPACES,
 };
-pub use parser::{parse, CommandStream, CommandStreamItem};
+pub use parser::{
+    parse, CommandStream, CommandStreamItem, RawCommandCursor, RawCommandError, RawCommandFrame,
+};
 pub use sexp::{ParseError, SExpr};
 pub use stats::{collect_formula_stats, FormulaStats};

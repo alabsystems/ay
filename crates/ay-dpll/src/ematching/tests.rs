@@ -9,6 +9,8 @@ use num_bigint::BigInt;
 
 use crate::ematching::pattern::{EMatchArg, EMatchPattern};
 
+mod ground_occurrences;
+
 #[test]
 fn test_contains_quantifier_no_quantifiers() {
     let mut terms = TermStore::new();
@@ -539,6 +541,8 @@ fn test_generation_tracking_prevents_deep_chains() {
     let result = perform_ematching_with_generations(
         &mut terms,
         &assertions,
+        &[],
+        &[],
         &config,
         tracker,
         None,
@@ -596,6 +600,8 @@ fn test_generation_increments_on_instantiation() {
     let result = perform_ematching_with_generations(
         &mut terms,
         &assertions,
+        &[],
+        &[],
         &config,
         tracker,
         None,
@@ -1091,6 +1097,8 @@ fn test_euf_model_augments_equality_classes() {
     let result_with = perform_ematching_with_generations(
         &mut terms,
         &assertions,
+        &[],
+        &[],
         &EMatchingConfig::default(),
         GenerationTracker::new(),
         Some(&euf_model),
@@ -1979,6 +1987,8 @@ fn exists_is_surfaced_but_never_instantiated() {
     let result = perform_ematching_with_generations(
         &mut terms,
         &assertions,
+        &[],
+        &[],
         &config,
         GenerationTracker::new(),
         None,
@@ -2230,6 +2240,149 @@ fn nested_binder_outer_only_let_alias_remains_a_trigger() {
 }
 
 // ===========================================================================
+// (#unit-bool-eq) UnitFacts is closed under asserted Boolean equalities.
+// ===========================================================================
+
+/// Verus's fuel shape: `(fuel_bool_default f)` is asserted, the first
+/// E-matching round conjoins `(= (fuel_bool f) (fuel_bool_default f))`, and the
+/// definition sits under `(=> (fuel_bool f) (forall ...))`. The guard becomes a
+/// unit only through the equality, and only then is the definition entailed.
+#[test]
+fn a_guard_equal_to_a_unit_is_a_unit() {
+    let mut terms = TermStore::new();
+    let fuel = terms.mk_var("ube_fuel", Sort::Int);
+    let guard = terms.mk_app(Symbol::named("ube_fuel_bool"), [fuel], Sort::Bool);
+    let default = terms.mk_app(Symbol::named("ube_fuel_bool_default"), [fuel], Sort::Bool);
+    let link = terms.mk_app(Symbol::named("="), [guard, default], Sort::Bool);
+    let x = terms.mk_var("ube_x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("ube_p"), [x], Sort::Bool);
+    let forall = terms.mk_forall(vec![("ube_x".to_string(), Sort::Int)], body);
+    let guarded = terms.mk_app(Symbol::named("=>"), [guard, forall], Sort::Bool);
+
+    let assertions = vec![default, link, guarded];
+    let units = UnitFacts::from_assertions(&terms, &assertions);
+    assert_eq!(units.value(&terms, guard), Some(true));
+    let entailed = entailed_forall_set(&mut terms, &assertions);
+    assert!(
+        entailed.contains(&forall),
+        "the guard is a unit through the equality, so the guarded universal \
+         is entailed; got {entailed:?}"
+    );
+
+    // Without the unit on the other side nothing is derived.
+    let assertions = vec![link, guarded];
+    let units = UnitFacts::from_assertions(&terms, &assertions);
+    assert_eq!(units.value(&terms, guard), None);
+    assert!(entailed_forall_set(&mut terms, &assertions).is_empty());
+}
+
+/// A false equality flips the value, values chain through several equalities,
+/// and a value already known is never overwritten.
+#[test]
+fn bool_equalities_propagate_through_chains_and_disequalities() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("ube_p", Sort::Bool);
+    let q = terms.mk_var("ube_q", Sort::Bool);
+    let r = terms.mk_var("ube_r", Sort::Bool);
+    let s = terms.mk_var("ube_s", Sort::Bool);
+    let pq = terms.mk_app(Symbol::named("="), [p, q], Sort::Bool);
+    let qr = terms.mk_app(Symbol::named("="), [q, r], Sort::Bool);
+    let rs = terms.mk_app(Symbol::named("="), [r, s], Sort::Bool);
+    let not_rs = terms.mk_not(rs);
+
+    // p = q, q = r, r != s, s: so r is false, q is false, p is false.
+    let units = UnitFacts::from_assertions(&terms, &[pq, qr, not_rs, s]);
+    assert_eq!(units.value(&terms, s), Some(true));
+    assert_eq!(units.value(&terms, r), Some(false));
+    assert_eq!(units.value(&terms, q), Some(false));
+    assert_eq!(units.value(&terms, p), Some(false));
+
+    // An asserted value wins over the one the equality would give; the
+    // (inconsistent) problem keeps both facts as asserted.
+    let not_p = terms.mk_not(p);
+    let units = UnitFacts::from_assertions(&terms, &[pq, q, not_p]);
+    assert_eq!(units.value(&terms, p), Some(false));
+    assert_eq!(units.value(&terms, q), Some(true));
+}
+
+/// Only Boolean equalities propagate: an integer equality says nothing about
+/// truth values.
+#[test]
+fn integer_equalities_do_not_propagate_truth() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("ube_a", Sort::Int);
+    let b = terms.mk_var("ube_b", Sort::Int);
+    let ab = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+    let units = UnitFacts::from_assertions(&terms, &[ab]);
+    assert_eq!(units.value(&terms, ab), Some(true));
+    assert_eq!(units.value(&terms, a), None);
+}
+
+// ===========================================================================
+// (#unit-bcp) UnitFacts propagates through asserted implications and clauses.
+// ===========================================================================
+
+/// Verus's broadcast groups: the group's default is asserted, an asserted
+/// implication gives each member's default, and the prelude equality carries a
+/// member's default to its fuel guard (#unit-bool-eq).
+#[test]
+fn unit_facts_propagate_through_asserted_implications() {
+    let mut terms = TermStore::new();
+    let group = terms.mk_var("ubcp_group", Sort::Bool);
+    let member = terms.mk_var("ubcp_member", Sort::Bool);
+    let other = terms.mk_var("ubcp_other", Sort::Bool);
+    let guard = terms.mk_var("ubcp_guard", Sort::Bool);
+    let members = terms.mk_and(vec![member, other]);
+    let implication = terms.mk_app(Symbol::named("=>"), [group, members], Sort::Bool);
+    let link = terms.mk_app(Symbol::named("="), [guard, member], Sort::Bool);
+
+    let units = UnitFacts::from_assertions(&terms, &[implication, group, link]);
+    assert_eq!(units.value(&terms, member), Some(true));
+    assert_eq!(units.value(&terms, other), Some(true));
+    assert_eq!(units.value(&terms, guard), Some(true));
+
+    // Without the premise nothing follows.
+    let units = UnitFacts::from_assertions(&terms, &[implication, link]);
+    assert_eq!(units.value(&terms, member), None);
+    assert_eq!(units.value(&terms, guard), None);
+
+    // A false premise satisfies the implication and asserts nothing.
+    let not_group = terms.mk_not(group);
+    let units = UnitFacts::from_assertions(&terms, &[implication, not_group]);
+    assert_eq!(units.value(&terms, member), None);
+}
+
+/// A clause `(or (not a) (not b) c)` with `a` and `b` true facts asserts `c`
+/// (#unit-bcp-forward), and a clause with an undecided premise asserts nothing.
+/// The contrapositive is not taken: `(or a c)` with `a` false asserts nothing,
+/// so a universal behind a chain of negated facts stays off the entailed set.
+#[test]
+fn unit_facts_propagate_through_asserted_clauses() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("ubcp_a", Sort::Bool);
+    let b = terms.mk_var("ubcp_b", Sort::Bool);
+    let c = terms.mk_var("ubcp_c", Sort::Bool);
+    let not_a = terms.mk_not(a);
+    let not_b = terms.mk_not(b);
+    let horn = terms.mk_or(vec![not_a, not_b, c]);
+
+    let units = UnitFacts::from_assertions(&terms, &[horn, a, b]);
+    assert_eq!(units.value(&terms, c), Some(true));
+
+    let units = UnitFacts::from_assertions(&terms, &[horn, a]);
+    assert_eq!(units.value(&terms, c), None);
+
+    // A clause already satisfied by a fact asserts nothing about the others.
+    let units = UnitFacts::from_assertions(&terms, &[horn, not_a, b]);
+    assert_eq!(units.value(&terms, c), None);
+
+    // No modus tollens: `(or a c)` with `a` false leaves `c` undecided.
+    let clause = terms.mk_or(vec![a, c]);
+    let units = UnitFacts::from_assertions(&terms, &[clause, not_a]);
+    assert_eq!(units.value(&terms, c), None);
+}
+
+// ===========================================================================
 // (#unit-and-harvest) UnitFacts descends through an asserted `and`.
 // ===========================================================================
 
@@ -2367,8 +2520,8 @@ fn memoized_bound_var_walk_matches_the_unmemoized_walk() {
     let outer2 = terms.mk_forall(vec![("bvm_y".to_string(), Sort::Int)], let_term);
     let _root = terms.mk_and(vec![forall, outer2, eq1]);
 
-    // Every id in the store is a root, exactly as `collect_ground_terms_by_sort`
-    // uses it — and the memo is shared across the whole loop, as it is there.
+    // Exercise every id as a root for the historical binder-ID walk. Production
+    // collectors now visit only asserted roots with occurrence-scoped groundness.
     let mut memo_ids: HashSet<u32> = HashSet::default();
     let mut memo_names: HashSet<String> = HashSet::default();
     let mut memo = BoundVarScopeMemo::default();
@@ -2623,3 +2776,4 @@ fn unit_facts_bound_key_is_per_subject() {
 }
 
 include!("tests/exact_substitution.rs");
+include!("tests/match_only_roots.rs");

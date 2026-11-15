@@ -13,7 +13,28 @@ use crate::executor::Executor;
 
 #[path = "strict_check_progress/meter.rs"]
 mod meter;
-use self::meter::{describe_stop_signal, executor_stopped, StrictCheckMeter};
+use self::meter::{describe_stop_signal, executor_stopped, typed_stop_signal, StrictCheckMeter};
+
+#[path = "strict_check_progress/poll.rs"]
+mod poll;
+use poll::strided_memory_poll;
+
+#[path = "strict_check_progress/solve_stop.rs"]
+mod solve_stop;
+
+#[path = "strict_check_progress/caller.rs"]
+mod caller;
+pub(super) use caller::check_with_caller_progress;
+
+#[path = "strict_check_progress/bounded.rs"]
+mod bounded;
+pub(in crate::executor::proof) use bounded::check_bounded_with_executor_progress;
+
+#[path = "strict_check_progress/gate.rs"]
+mod gate;
+pub(in crate::executor) use gate::{
+    check_proof_gate_under_controls, check_proof_gate_with_executor_progress,
+};
 
 /// Ordinary proof/context validation reserve, excluding the separately bounded
 /// expensive BV-family semantic replay.
@@ -66,8 +87,9 @@ fn probe_strict_check_refusal(message: impl FnOnce() -> String) {
     }
 }
 
-/// Charges between cancellation polls. See the note in
-/// [`check_with_executor_progress`] for why the poll is not on every charge.
+/// Maximum callback interval between operating-system memory observations.
+/// Interrupt and deadline controls are checked on every callback (the
+/// deadline through a `DeadlinePoll`, `make_strict_check_stop`).
 const STOP_POLL_INTERVAL: u64 = 1_024;
 
 /// Whether the executor's stop signals (interrupt / solve deadline / memory)
@@ -78,10 +100,10 @@ const STOP_POLL_INTERVAL: u64 = 1_024;
 /// stopping caller must observe the same `Cancelled` outcome a real walk
 /// would produce (the walk's first-charge poll cancels it immediately), and a
 /// cancellation must keep its calibrated downstream meaning — revert, nothing
-/// learned, nothing latched. Answering from the cache while stopping would
+/// learned about the document, and retain the observed owner stop. Answering from the cache while stopping would
 /// let cached knowledge change WHAT a dying solve decides.
 pub(in crate::executor) fn executor_stop_signals_asserted(executor: &Executor) -> bool {
-    let should_stop = executor.make_should_stop();
+    let should_stop = executor.make_strict_check_stop();
     executor_stopped(executor, &should_stop)
 }
 
@@ -158,68 +180,55 @@ pub(super) fn check_with_executor_progress_reporting_work(
     datatype_member_signatures: &[DatatypeMemberSignature],
     problem_assertions: Option<&[TermId]>,
 ) -> (Result<ProofQuality, ProofCheckError>, usize) {
-    let should_stop = executor.make_should_stop();
-    let mut meter = StrictCheckMeter::production();
-    // The WORK/BYTE budget is charged on EVERY call (exact, fail-closed). The
-    // cancellation/memory poll `executor_stopped` is NOT: its
-    // `process_memory_exceeded` performs a `task_info` mach syscall per call, and
-    // a large strict check emits millions of charges — that per-charge syscall
-    // dominated certification wall time. Poll it only every
-    // `STOP_POLL_INTERVAL` charges AND on every zero-delta charge (the explicit
-    // post-validator checkpoints), which bounds interrupt/deadline/memory
-    // detection latency to a tiny slice of metered work while removing ~all the
-    // syscalls. Soundness is unaffected: the strict check's own footprint is
-    // bounded by the per-call BYTE budget (`MAX_CHECK_BYTES`); this poll is a
-    // secondary backstop, and the work budget still fails closed every call.
-    let outcome = {
-        let mut ops: u64 = 0;
-        let mut progress = |work_delta: usize, byte_delta: usize| {
-            ops = ops.wrapping_add(1);
-            // Poll on the FIRST charge (so an already-active interrupt / passed
-            // deadline / breached memory limit is honored immediately), on every
-            // zero-delta charge (the explicit post-validator checkpoints), and every
-            // STOP_POLL_INTERVAL charges thereafter (bounding mid-check detection
-            // latency to a tiny slice of metered work).
-            let poll_stop = ops == 1
-                || (work_delta == 0 && byte_delta == 0)
-                || ops.is_multiple_of(STOP_POLL_INTERVAL);
-            if poll_stop {
-                meter.charge_while_running(
-                    work_delta,
-                    byte_delta,
-                    || executor_stopped(executor, &should_stop),
-                    || describe_stop_signal(executor),
-                )
-            } else {
-                meter.charge_while_running(
-                    work_delta,
-                    byte_delta,
-                    || false,
-                    || "unpolled".to_string(),
-                )
-            }
-        };
-        ay_proof::check_proof_strict_with_typed_context_and_progress(
+    let should_stop = executor.make_strict_check_stop();
+    check_strict_under_controls(
+        executor,
+        StrictWalk {
             proof,
-            &executor.ctx.terms,
             datatype_decls,
             selector_decls,
             datatype_member_signatures,
             problem_assertions,
-            &mut progress,
-        )
-    };
-    // The progress closure's scope has ended, so name WHICH meter limb refused.
-    // The checker only sees a `bool`; this is the one place that knows both.
-    let outcome = match outcome {
-        Err(ProofCheckError::ResourceLimit)
-            if meter.refusal == Some(StrictCheckRefusal::Cancelled) =>
-        {
-            Err(ProofCheckError::Cancelled)
-        }
-        other => other,
-    };
-    (outcome, meter.work())
+        },
+        &should_stop,
+    )
+}
+
+/// The strict walk's document and context, as the checker reads them.
+pub(super) struct StrictWalk<'a> {
+    pub(super) proof: &'a Proof,
+    pub(super) datatype_decls: Option<&'a [(String, Vec<String>)]>,
+    pub(super) selector_decls: Option<&'a [(String, Vec<String>)]>,
+    pub(super) datatype_member_signatures: &'a [DatatypeMemberSignature],
+    pub(super) problem_assertions: Option<&'a [TermId]>,
+}
+
+/// [`check_with_executor_progress_reporting_work`] with the cheap stop
+/// control lifted out, so a test can raise it at an exact callback.
+///
+/// #completed-check-accepted — the stop is honoured when the walk is admitted
+/// and at every callback the checker makes before or during its steps, and
+/// NEVER after the final step. This wrapper used to add one more full stop
+/// poll after a successful walk; with the checker's own trailing polls it
+/// turned walks that had validated every step into `Cancelled` whenever the
+/// deadline landed after the last step, so the verdict on a finished
+/// validation depended on the clock. A completed validation is a fact about
+/// the document and is returned as one. What stays final is a refusal the
+/// walk itself observed ([`StrictCheckMeter::settle`]).
+fn check_strict_under_controls(
+    executor: &Executor,
+    walk: StrictWalk<'_>,
+    should_stop: &dyn Fn() -> bool,
+) -> (Result<ProofQuality, ProofCheckError>, usize) {
+    check_with_caller_progress(executor, walk, should_stop, &mut |_, _| true)
+}
+
+/// Keep a cancelled walk's typed stop on the executor, so publication reports
+/// the stop even after its signal has cleared (P4a.1).
+fn record_walk_stop(executor: &Executor, meter: &StrictCheckMeter) {
+    if let Some(stop) = meter.stop {
+        executor.note_certification_stop(stop);
+    }
 }
 
 /// Run the DIAGNOSTIC (non-strict) whole-proof walk under the same
@@ -274,53 +283,74 @@ fn check_partial_with_executor_progress_and_meter(
     executor: &Executor,
     proof: &Proof,
     want_quality: WantQuality,
-    mut meter: StrictCheckMeter,
+    meter: StrictCheckMeter,
 ) -> MeteredPartialCheck {
-    let should_stop = executor.make_should_stop();
+    let should_stop = executor.make_strict_check_stop();
+    check_partial_under_controls(executor, proof, want_quality, meter, &should_stop)
+}
+
+/// The diagnostic walk under explicit controls. Like the strict gate
+/// (#completed-check-accepted), the stop is polled when the walk is admitted
+/// and at the checker's own callbacks, never after a walk that validated every
+/// step: the partial checker makes no callback after its final step, and the
+/// post-walk poll this wrapper used to add is gone. The admission poll keeps
+/// a caller that is ALREADY stopping from starting a walk whose steps might
+/// never call back (`ProofStep::Resolution` is validated unmetered).
+#[cfg(feature = "proof-checker")]
+fn check_partial_under_controls(
+    executor: &Executor,
+    proof: &Proof,
+    want_quality: WantQuality,
+    mut meter: StrictCheckMeter,
+    should_stop: &dyn Fn() -> bool,
+) -> MeteredPartialCheck {
+    let stopped = strided_memory_poll(&should_stop, executor.memory_limit());
     let (summary, quality, error) = {
-        let mut ops: u64 = 0;
         let mut progress = |work_delta: usize, byte_delta: usize| {
-            ops = ops.wrapping_add(1);
-            let poll_stop = ops == 1
-                || (work_delta == 0 && byte_delta == 0)
-                || ops.is_multiple_of(STOP_POLL_INTERVAL);
-            if poll_stop {
-                meter.charge_while_running(
-                    work_delta,
-                    byte_delta,
-                    || executor_stopped(executor, &should_stop),
-                    || describe_stop_signal(executor),
-                )
-            } else {
-                meter.charge_while_running(
-                    work_delta,
-                    byte_delta,
-                    || false,
-                    || "unpolled".to_string(),
-                )
-            }
+            meter.charge_while_running(
+                work_delta,
+                byte_delta,
+                || stopped.poll(),
+                || describe_stop_signal(executor),
+                || {
+                    Some(
+                        stopped
+                            .reason()
+                            .unwrap_or_else(|| typed_stop_signal(executor)),
+                    )
+                },
+            )
         };
-        match want_quality {
-            WantQuality::Yes => ay_proof::check_proof_partial_with_quality_and_progress(
-                proof,
-                &executor.ctx.terms,
-                &mut progress,
-            ),
-            // #diagnostic-envelope AMENDMENT. The fused quality walk ends with
-            // `quantifier::validate_sko_forall_uniqueness`, an UNMETERED
-            // whole-proof Skolem traversal that legacy `check_proof_partial`
-            // never ran. The two callers that discard the quality must not pay
-            // for it -- one of them is the hottest walk in this whole lane --
-            // so they take the quality-free metered entry point, which is
-            // `check_proof_partial` plus a meter and nothing else.
-            WantQuality::No => {
-                let (summary, error) = ay_proof::check_proof_partial_with_progress(
+        if progress(0, 0) {
+            match want_quality {
+                WantQuality::Yes => ay_proof::check_proof_partial_with_quality_and_progress(
                     proof,
                     &executor.ctx.terms,
                     &mut progress,
-                );
-                (summary, None, error)
+                ),
+                // #diagnostic-envelope AMENDMENT. The fused quality walk ends
+                // with `quantifier::validate_sko_forall_uniqueness`, an
+                // UNMETERED whole-proof Skolem traversal that legacy
+                // `check_proof_partial` never ran. The two callers that discard
+                // the quality must not pay for it -- one of them is the hottest
+                // walk in this whole lane -- so they take the quality-free
+                // metered entry point, which is `check_proof_partial` plus a
+                // meter and nothing else.
+                WantQuality::No => {
+                    let (summary, error) = ay_proof::check_proof_partial_with_progress(
+                        proof,
+                        &executor.ctx.terms,
+                        &mut progress,
+                    );
+                    (summary, None, error)
+                }
             }
+        } else {
+            let summary = PartialProofCheck {
+                total_steps: proof.steps.len() as u32,
+                ..Default::default()
+            };
+            (summary, None, Some(ProofCheckError::ResourceLimit))
         }
     };
     // NAME the refusing party, do not merely name the error. `ResourceLimit`
@@ -329,12 +359,9 @@ fn check_partial_with_executor_progress_and_meter(
     // reachable before this envelope existed. `meter.refusal` is the only thing
     // that knows the difference, and its scope has just ended.
     let envelope_refusal = meter.refusal;
-    let error = match (error, envelope_refusal) {
-        (Some(ProofCheckError::ResourceLimit), Some(StrictCheckRefusal::Cancelled)) => {
-            Some(ProofCheckError::Cancelled)
-        }
-        (other, _) => other,
-    };
+    record_walk_stop(executor, &meter);
+    let error = meter.settle(error.map_or(Ok(()), Err)).err();
+    let quality = quality.filter(|_| error.is_none());
     MeteredPartialCheck {
         summary,
         quality,
@@ -416,80 +443,18 @@ impl MeteredPartialCheck {
     }
 }
 
-/// Run the whole-proof REVERT GATE (`ay_proof::check_proof`) under the
-/// executor's envelope.
-///
-/// #diagnostic-envelope — `Executor::split_euf_congruence_lemmas`,
-/// `split_shadowed_store_equality_lemmas`, the rewritten-assertion bridge and
-/// the congruence-explanation rebuild all use the same idiom: rebuild part of a
-/// proof, re-check the WHOLE proof, and put the original back if the check
-/// fails. On a triangular resolution proof that whole-proof re-check is the
-/// dominant cost of the solve, and it ran with no meter and no cancellation
-/// poll at all.
-///
-/// A refused/cancelled check returns `Err`, which is precisely the branch those
-/// gates already take to discard their surgery and restore the original proof.
-pub(in crate::executor) fn check_proof_gate_with_executor_progress(
-    executor: &Executor,
-    proof: &Proof,
-) -> Result<(), ProofCheckError> {
-    let should_stop = executor.make_should_stop();
-    check_proof_gate_under_controls(
-        proof,
-        &executor.ctx.terms,
-        &should_stop,
-        executor.memory_limit(),
-    )
-}
-
-/// As [`check_proof_gate_with_executor_progress`], for the surgery passes that
-/// already hold `&mut ctx.terms` and therefore cannot also borrow the executor.
-/// The caller lifts the two controls out first (`make_should_stop()`,
-/// `memory_limit()`); both are owned values, so no borrow conflict remains.
-pub(in crate::executor) fn check_proof_gate_under_controls(
-    proof: &Proof,
-    terms: &ay_core::TermStore,
-    should_stop: &dyn Fn() -> bool,
-    memory_limit: Option<usize>,
-) -> Result<(), ProofCheckError> {
-    let stopped = || {
-        should_stop()
-            || crate::memory::memory_exceeded(memory_limit)
-            || ay_sys::process_memory_exceeded()
-    };
-    let mut meter = StrictCheckMeter::production();
-    let outcome = {
-        let mut ops: u64 = 0;
-        let mut progress = |work_delta: usize, byte_delta: usize| {
-            ops = ops.wrapping_add(1);
-            let poll_stop = ops == 1
-                || (work_delta == 0 && byte_delta == 0)
-                || ops.is_multiple_of(STOP_POLL_INTERVAL);
-            if poll_stop {
-                meter.charge_while_running(work_delta, byte_delta, &stopped, || {
-                    "interrupt, solve deadline, or memory limit".to_string()
-                })
-            } else {
-                meter.charge_while_running(
-                    work_delta,
-                    byte_delta,
-                    || false,
-                    || "unpolled".to_string(),
-                )
-            }
-        };
-        ay_proof::check_proof_with_progress(proof, terms, &mut progress)
-    };
-    match outcome {
-        Err(ProofCheckError::ResourceLimit)
-            if meter.refusal == Some(StrictCheckRefusal::Cancelled) =>
-        {
-            Err(ProofCheckError::Cancelled)
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
 #[path = "strict_check_progress/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "strict_check_progress/solve_stop_tests.rs"]
+mod solve_stop_tests;
+
+#[cfg(all(test, feature = "proof-checker"))]
+#[path = "strict_check_progress/completion_tests.rs"]
+mod completion_tests;
+
+#[cfg(all(test, feature = "proof-checker"))]
+#[path = "strict_check_progress/original_owner_tests.rs"]
+mod original_owner_tests;

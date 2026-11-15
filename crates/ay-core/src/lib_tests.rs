@@ -104,3 +104,57 @@ fn test_is_theory_atom_non_bool_is_not_atom() {
         "Int-sorted term is not a theory atom"
     );
 }
+
+#[test]
+fn tight_bound_equalities_emit_anchor_star_per_sort() {
+    // Anchor-star emission: a same-value group must produce a spanning
+    // star (first same-sort term as anchor), not all pairs. Four Int
+    // vars + one Real var pinned to 7 yield exactly three Int edges,
+    // each touching the anchor; the Real var is never paired (cross-sort
+    // guard) and forms its own singleton anchor. A second call with the
+    // same propagated set emits nothing.
+    let mut terms = TermStore::new();
+    let mk = |terms: &mut TermStore, name: &str, sort: Sort| terms.mk_var(name, sort);
+    let a = mk(&mut terms, "a", Sort::Int);
+    let b = mk(&mut terms, "b", Sort::Int);
+    let c = mk(&mut terms, "c", Sort::Int);
+    let d = mk(&mut terms, "d", Sort::Int);
+    let r = mk(&mut terms, "r", Sort::Real);
+    // One pinning literal per var so reason composition is observable.
+    let lit = |terms: &mut TermStore, v: TermId| {
+        let seven = terms.mk_int(7.into());
+        terms.mk_app(Symbol::named(">="), vec![v, seven], Sort::Bool)
+    };
+    let (la, lb, lc, ld, lr) = (
+        lit(&mut terms, a),
+        lit(&mut terms, b),
+        lit(&mut terms, c),
+        lit(&mut terms, d),
+        lit(&mut terms, r),
+    );
+    let seven = num_rational::BigRational::from_integer(7.into());
+    let triples = vec![
+        (a, seven.clone(), vec![TheoryLit::new(la, true)]),
+        (b, seven.clone(), vec![TheoryLit::new(lb, true)]),
+        (r, seven.clone(), vec![TheoryLit::new(lr, true)]),
+        (c, seven.clone(), vec![TheoryLit::new(lc, true)]),
+        (d, seven.clone(), vec![TheoryLit::new(ld, true)]),
+    ];
+    let mut propagated = kani_compat::DetHashSet::default();
+    let eqs = propagate_tight_bound_equalities(&terms, triples.clone(), &mut propagated);
+    assert_eq!(eqs.len(), 3, "star over 4 Int vars has 3 edges: {eqs:?}");
+    for eq in &eqs {
+        assert!(
+            eq.lhs == a || eq.rhs == a,
+            "every star edge touches the anchor: {eq:?}"
+        );
+        assert_ne!(eq.lhs, r, "Real var must not be paired cross-sort");
+        assert_ne!(eq.rhs, r, "Real var must not be paired cross-sort");
+        assert!(
+            eq.reason.contains(&TheoryLit::new(la, true)),
+            "anchor reasons ride every edge: {eq:?}"
+        );
+    }
+    let again = propagate_tight_bound_equalities(&terms, triples, &mut propagated);
+    assert!(again.is_empty(), "dedup: second call emits nothing");
+}

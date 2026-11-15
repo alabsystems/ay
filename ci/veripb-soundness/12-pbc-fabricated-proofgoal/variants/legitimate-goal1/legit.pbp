@@ -1,0 +1,21 @@
+pseudo-Boolean proof version 2.0
+* NOT a forgery. This is the ONE shape in which a contradiction derived inside a proofgoal
+* scope legitimately discharges the enclosing proof-by-contradiction subproof, and it is the
+* guard against over-fixing: it must keep being ACCEPTED, before and after.
+*
+* `red` with an empty witness is a proof by contradiction, and its goal `#1` is `C|<empty>`,
+* which is `C` itself -- so the premise the goal scope adds is `~C`, the very constraint the
+* subproof already carries. A contradiction there really is a contradiction from `~C`.
+*
+* Deleting the `contradiction_proven` promotion outright (rather than restricting it to this
+* goal) would reject this proof. That is why the fix records WHICH goal may be promoted rather
+* than removing the mechanism.
+f 1
+red 1 x1 >= 1 ; ; begin
+    proofgoal #1
+        u >= 1 ;
+    end
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

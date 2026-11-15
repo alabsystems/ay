@@ -168,7 +168,7 @@ fn problem_contains_recursive_bv_sorts(problem: &ChcProblem) -> bool {
 
 impl Transformer for BvToIntAbstractor {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
-        if !problem_contains_recursive_bv_sorts(&problem) {
+        if !problem_contains_recursive_bv_sorts(&problem) || problem.has_array_lambda() {
             return TransformationResult {
                 problem,
                 back_translator: Box::new(IdentityBackTranslator),
@@ -550,6 +550,15 @@ fn concretize_inv(inv: &InvariantModel, map: &BvIntMap) -> InvariantModel {
 /// arithmetic would reintroduce modular wrapping and change the witness.
 fn int_to_bv_formula(expr: &ChcExpr, sort_env: &FxHashMap<ChcVar, ChcSort>) -> ChcExpr {
     match expr {
+        ChcExpr::ArrayLambda(lambda) => ChcExpr::ArrayLambda(
+            lambda.with_captures(
+                lambda
+                    .captures()
+                    .iter()
+                    .map(|value| Arc::new(int_to_bv_formula(value, sort_env)))
+                    .collect(),
+            ),
+        ),
         // Variables: update sort from environment.
         ChcExpr::Var(v) => {
             if let Some(new_sort) = sort_env.get(v) {

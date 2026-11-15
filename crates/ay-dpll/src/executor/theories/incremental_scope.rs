@@ -10,9 +10,11 @@
 //! theory-specific logic (#6731).
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use crate::executor_types::{Result, SolveResult};
 use crate::incremental_state::IncrementalTheoryState;
+use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::TermId;
 
 use super::super::Executor;
@@ -22,6 +24,67 @@ mod proof_checkpoint;
 pub(in crate::executor) use proof_checkpoint::ProofCheckpointBudget;
 
 impl Executor {
+    /// Run one solve entry with the scope-tracked roots' push depths captured.
+    ///
+    /// The persistent incremental SAT solver activates each assertion root it
+    /// encodes at a push depth, and a depth-0 activation is permanent. The
+    /// depth used to be read positionally off whatever vector sat in
+    /// `ctx.assertions` at encode time, against the frames' assertion COUNTS —
+    /// but nearly every route encodes a working window it installed there
+    /// (`solve_nia` installs symbolic-div/mod elimination and variable
+    /// substitution output, other routes their own rewrites), whose positions
+    /// have nothing to do with the frames. A scoped `(= x 0)` substituted into
+    /// the base `(> (* x y) 3)` gave `false` at position 0, activated at depth
+    /// 0: after `(pop 1)` every later check answered `unsat` (D10(c): the
+    /// symbolic-division witness `dzincr_31_00040`, and plain QF_NIA push/pop).
+    ///
+    /// The frames describe `ctx.assertions` exactly when a query starts, before
+    /// any route touches it, so the outermost entry captures the depth of every
+    /// root here and every encode inside the query reads the capture
+    /// ([`Self::activation_root_depths`]). A term that is not a root —
+    /// a rewrite, a merged assumption, a probe's extra — is then activated at
+    /// the current depth (or at its derived-assertion provenance depth), which
+    /// is always sound; only roots earn a shallower, longer-lived activation.
+    /// Nested entries keep the outer capture. The derived-assertion provenance
+    /// of the previous query is dropped at the same boundary: it described
+    /// that query's roots, not this one's; so are the lanes a scoped window
+    /// of the query was solved on (`solve_scoped_window`).
+    pub(in crate::executor) fn with_scope_root_depths<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if self.scope_root_depths.is_some() {
+            return f(self);
+        }
+        // The query boundary is also where LNH symmetry breaking starts the
+        // query's record and learns whether the query is the caller's
+        // (`lnh_symmetry`, C4).
+        self.lnh_carried_by_query = false;
+        let _lnh_owner = self.lnh_claim_query_ownership();
+        let depths = Arc::new(self.ctx.active_assertion_min_scope_depths());
+        #[cfg(test)]
+        root_depth_tests::record_first_capture(&depths);
+        self.scope_root_depths = Some(depths);
+        self.scoped_window_lanes = None;
+        if let Some(state) = self.incr_theory_state.as_mut() {
+            state.lia_derived_assertions.clear();
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+        self.scope_root_depths = None;
+        self.scoped_window_lanes = None;
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    /// Push depth of every scope-tracked root of the current query (see
+    /// [`Self::with_scope_root_depths`]); empty outside a captured query, so
+    /// that nothing is mistaken for a root.
+    pub(crate) fn activation_root_depths(&self) -> Arc<HashMap<TermId, usize>> {
+        self.scope_root_depths.clone().unwrap_or_default()
+    }
+
     /// Run a closure with a fresh `IncrementalTheoryState`, restoring the
     /// original state afterward.
     ///
@@ -207,6 +270,10 @@ impl Executor {
 #[cfg(test)]
 #[path = "incremental_scope_budget_tests.rs"]
 mod checkpoint_budget_tests;
+
+#[cfg(test)]
+#[path = "incremental_scope_root_depth_tests.rs"]
+mod root_depth_tests;
 
 #[cfg(test)]
 mod tests {

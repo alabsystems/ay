@@ -7,6 +7,7 @@
 use super::super::*;
 use crate::kani_compat::DetHashSet as HashSet;
 
+mod frozen_probe;
 mod proof_ladder;
 mod rup_probing;
 
@@ -121,6 +122,8 @@ impl Solver {
         // LRAT override handled centrally by inproc_ctrl.with_proof_overrides() (#4557).
 
         self.inproc.congruence.ensure_num_vars(self.num_vars);
+        let counted = self.deterministic_inproc();
+        self.inproc.congruence.set_deterministic(counted);
 
         // V5 lifecycle guard (#3906 wave-2 D6): build a frozen bitmask instead
         // of cloning the full Vec<u32> freeze_counts (#5079 Finding 3). A variable
@@ -175,6 +178,15 @@ impl Solver {
             // binary from the active DB instead of leaving behind an
             // unprovable reason clause.
             let htr_hints = self.collect_rup_binary_lrat_hints(lit0, lit1);
+            // `--sat-veripb-hints`: the binary's RUP probe reads the ternary
+            // and binary it resolves off the trail (veripb_ready.rs), without
+            // steering the search: it moves no watch, saves no phase and
+            // charges no tick (`frozen_rup_probe`).
+            if !self.cold.lrat_enabled && self.veripb_hints_active() {
+                if let Some(ids) = self.veripb_hints_by_probe(&[lit0, lit1]) {
+                    self.veripb_ready_hints(&[lit0, lit1], &ids);
+                }
+            }
             if self.cold.lrat_enabled && htr_hints.is_empty() {
                 // Mark watched literals dirty for targeted flush (#8101).
                 let clen = self.arena.len_of(off_header);
@@ -201,8 +213,7 @@ impl Solver {
                 .unwrap_or(0);
             // Register proof ID so later deletions emit correct LRAT ID (#5005).
             if self.cold.lrat_enabled && proof_id != 0 {
-                self.cold.clause_ids_grow_for(clause_idx);
-                self.cold.clause_ids[clause_idx] = proof_id;
+                self.cold.record_clause_id(clause_idx, proof_id);
             }
             let cref = ClauseRef(clause_idx as u32);
             let mut watched_lits = [lit0, lit1];
@@ -288,8 +299,11 @@ impl Solver {
                 // chains), but AY's post-hoc RUP check can reject some edges
                 // from ambiguous XOR/ITE extraction.
                 if !self.cold.lrat_enabled {
-                    let fwd_rup = self.is_rup_binary_under_negation(lhs.negated(), rhs);
-                    let bwd_rup = self.is_rup_binary_under_negation(lhs, rhs.negated());
+                    // Off LRAT the edge hints are annotated-RUP ids (VeriPB).
+                    let (fwd_rup, fwd_ids) =
+                        self.rup_binary_with_veripb_hints(lhs.negated(), rhs, &[]);
+                    let (bwd_rup, bwd_ids) =
+                        self.rup_binary_with_veripb_hints(lhs, rhs.negated(), &[]);
                     if !fwd_rup || !bwd_rup {
                         self.inproc.congruence.stats_mut().non_rup_equivalences += 1;
                         rup_mask.push(false);
@@ -297,7 +311,7 @@ impl Solver {
                         continue;
                     }
                     rup_mask.push(true);
-                    edge_hints.push((Vec::new(), Vec::new()));
+                    edge_hints.push((fwd_ids.unwrap_or_default(), bwd_ids.unwrap_or_default()));
                 } else {
                     let fwd_hints = self.collect_rup_binary_lrat_hints(lhs.negated(), rhs);
                     let bwd_hints = self.collect_rup_binary_lrat_hints(lhs, rhs.negated());
@@ -468,7 +482,7 @@ impl Solver {
         // #7137-relax: machine-checked-parity trust. When
         // --sat-congruence-parity-trust, accept XOR full-collapse (arity-0)
         // units whose emitted polarity is the deductive-checks-discharged EXACT parity
-        // (the development proof harness::xor_collapse_parity_verified — proven the
+        // (ay_sat_congruence_core::xor_collapse_parity — proven the
         // imperative `parity_flip` XOR-accumulator equals the GF(2) mod-2
         // popcount, order-independent, single-flip-sensitive) even when AY's
         // post-hoc RUP cannot reconstruct the (ambiguous) XOR chain. Such units
@@ -477,7 +491,12 @@ impl Solver {
         // root cause). Default-off; RUP stays the backstop for everything else,
         // so asconhash-style wrong units (and any non-XOR non-RUP unit) are
         // still rejected.
-        let parity_trust = ay_core::sat_ab_switches().congruence_parity_trust;
+        // The trust arm bypasses the RUP gate, so under a proof surface every
+        // unit it admits is a bare `red` step the checker cannot autoprove
+        // (rejected on 25 of 25 miters in the 2026-09-17 audit): the arm is
+        // honoured only when no proof is written.
+        let parity_trust =
+            ay_core::sat_ab_switches().congruence_parity_trust && self.proof_manager.is_none();
         let parity_certified: HashSet<Literal> = if parity_trust {
             result.parity_certified_units.iter().copied().collect()
         } else {
@@ -641,8 +660,24 @@ impl Solver {
         fwd_hints: &[u64],
         bwd_hints: &[u64],
     ) {
-        let id_fwd = self.proof_emit_add(&[lhs.negated(), rhs], fwd_hints, ProofAddKind::Derived);
-        let id_bwd = self.proof_emit_add(&[lhs, rhs.negated()], bwd_hints, ProofAddKind::Derived);
+        // Off LRAT the hints are annotated-RUP ids read at the edge's probe.
+        let lrat = self.cold.lrat_enabled;
+        if !lrat {
+            self.veripb_ready_hints(&[lhs.negated(), rhs], fwd_hints);
+        }
+        let id_fwd = self.proof_emit_add(
+            &[lhs.negated(), rhs],
+            if lrat { fwd_hints } else { &[] },
+            ProofAddKind::Derived,
+        );
+        if !lrat {
+            self.veripb_ready_hints(&[lhs, rhs.negated()], bwd_hints);
+        }
+        let id_bwd = self.proof_emit_add(
+            &[lhs, rhs.negated()],
+            if lrat { bwd_hints } else { &[] },
+            ProofAddKind::Derived,
+        );
 
         let proof_ids = [id_fwd.unwrap_or(0), id_bwd.unwrap_or(0)];
         for (i, lits) in [[lhs.negated(), rhs], [lhs, rhs.negated()]]
@@ -657,7 +692,6 @@ impl Solver {
             // bve_marked and marks JIT dirty vars (#8202).
             self.note_irredundant_clause_added_for_bve(idx, &lits);
             {
-                self.cold.clause_ids_grow_for(idx);
                 let cid = if proof_ids[i] != 0 {
                     proof_ids[i]
                 } else {
@@ -665,7 +699,7 @@ impl Solver {
                     self.cold.next_clause_id += 1;
                     id
                 };
-                self.cold.clause_ids[idx] = cid;
+                self.cold.record_clause_id(idx, cid);
             }
             let cref = ClauseRef(idx as u32);
             let mut watched_lits = lits;
@@ -686,8 +720,11 @@ impl Solver {
             .map(|m| m.proof_adds_written())
             .unwrap_or(0);
         eprintln!(
-            "DBDUMP begin tag={tag} proof_adds={offset} pass={:?} decision_level={}",
-            self.cold.diagnostic_pass, self.decision_level
+            "DBDUMP begin tag={tag} proof_adds={offset} pass={:?} decision_level={}\n\
+             DBDUMP writer (the pass tag can be absent):\n{}",
+            self.cold.diagnostic_pass,
+            self.decision_level,
+            std::backtrace::Backtrace::force_capture()
         );
         let trail_snapshot: Vec<Literal> = self.trail().to_vec();
         for lit in trail_snapshot {

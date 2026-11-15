@@ -10,6 +10,29 @@ use ay_lra::LraModel;
 
 use crate::executor_format::{format_bigint, format_rational};
 
+/// LIA owns both integer views, including commitment of speculative EUF values.
+fn lia_values_are_merged(euf_model: &EufModel, lia_model: &LiaModel) -> bool {
+    lia_model.values.iter().all(|(term, value)| {
+        euf_model.int_values.get(term) == Some(value)
+            && euf_model.term_values.get(term) == Some(&format_bigint(value))
+            && !euf_model.speculative_int_terms.contains(term)
+    })
+}
+
+/// LRA owns only Real-sorted terms. Its registration map may also carry
+/// numerical defaults for Int, Bool or Array terms; those are not merge inputs.
+/// Check identities and values rather than comparing unrelated map sizes.
+pub(super) fn real_values_are_merged(
+    euf_model: &EufModel,
+    lra_model: &LraModel,
+    terms: &TermStore,
+) -> bool {
+    lra_model.values.iter().all(|(term, value)| {
+        !matches!(terms.sort(*term), Sort::Real)
+            || euf_model.term_values.get(term) == Some(&format_rational(value))
+    })
+}
+
 /// Extract an EUF model and extend it with Int term values from equivalence classes.
 pub(super) fn euf_with_int_values(euf: &mut EufSolver<'_>) -> EufModel {
     let mut euf_model = euf.extract_model();
@@ -82,20 +105,26 @@ pub(super) fn merge_lia_values(euf_model: &mut EufModel, lia_model: Option<&LiaM
             int_size_before,
             euf_model.int_values.len()
         );
+        debug_assert!(
+            lia_values_are_merged(euf_model, lia_model),
+            "BUG: LIA merge did not commit every exact integer key in both EUF views"
+        );
     }
 }
 
 /// Merge LRA values into an EUF model for Real-sorted terms.
 ///
 /// LRA is authoritative for Real-sorted terms, same rationale as `merge_lia_values`.
-/// Int-sorted terms are skipped: their values come from LIA, and LRA's unconstrained
-/// defaults would overwrite correct LIA values with unparseable Real literals (#6291).
+/// Every other sort is skipped. Int-sorted terms take their values from LIA, and
+/// LRA's unconstrained defaults would overwrite correct LIA values with
+/// unparseable Real literals (#6291). A term of a non-arithmetic sort that LRA
+/// happens to hold a value for is not a number at all: a RoundingMode constant
+/// whose class names `roundTowardZero` printed as `|0.0|` (2026-09-30 FP
+/// verify 2, `preexisting_rm_value_0_0.smt2`).
 pub(super) fn merge_lra_values(euf_model: &mut EufModel, lra_model: &LraModel, terms: &TermStore) {
     let size_before = euf_model.term_values.len();
     for (&term_id, val) in &lra_model.values {
-        // Int-sorted terms belong to LIA. Overwriting with LRA's default
-        // produces a Real literal ("0.0") that fails Int parsing (#6291).
-        if matches!(*terms.sort(term_id), Sort::Int) {
+        if !matches!(*terms.sort(term_id), Sort::Real) {
             continue;
         }
         euf_model.term_values.insert(term_id, format_rational(val));
@@ -107,6 +136,10 @@ pub(super) fn merge_lra_values(euf_model: &mut EufModel, lra_model: &LraModel, t
         size_before,
         euf_model.term_values.len()
     );
+    debug_assert!(
+        real_values_are_merged(euf_model, lra_model, terms),
+        "BUG: LRA merge did not preserve every exact Real key and value in EUF"
+    );
 }
 
 /// Reconcile shared Int terms that appear in both LIA and LRA models.
@@ -116,10 +149,18 @@ pub(super) fn merge_lra_values(euf_model: &mut EufModel, lra_model: &LraModel, t
 /// it and update LIA so model validation sees one coherent assignment. If LRA's
 /// value is non-integral, keep the existing LIA-to-LRA patching behavior used by
 /// `to_int` floor repairs.
+///
+/// LRA's integral value is adopted only when it falsifies none of LIA's own
+/// asserted literals (`lia_falsified`): an Int term the Real side also carries
+/// (e.g. through a forwarded bound) can sit at an integral relaxation value
+/// that an Int-only atom excludes. Measured (QF_AUFLIRA, an unused Real
+/// declared): `(and (= (select A 1) 7) (< a 4))` published `a = 4` over LIA's
+/// `a = 0`, and the model gate refused `a < 4`.
 pub(super) fn reconcile_lia_lra_values(
     lia_model: &mut Option<LiaModel>,
     lra_model: &mut LraModel,
     lia_authoritative: &ay_core::kani_compat::DetHashSet<ay_core::TermId>,
+    lia_falsified: &dyn Fn(&LiaModel) -> bool,
 ) -> Vec<ay_core::TermId> {
     let Some(lia) = lia_model.as_mut() else {
         return Vec::new();
@@ -153,9 +194,17 @@ pub(super) fn reconcile_lia_lra_values(
         // independent gate then correctly refuted — degrading a genuine sat
         // to unknown (auflira_cross_sort). For any term LIA constrains via a
         // shared equality, LIA is authoritative: patch LRA instead.
-        if lra_val.is_integer() && !lia_authoritative.contains(&term) {
-            lia.values.insert(term, lra_val.to_integer());
-        } else {
+        let adopt_lra = lra_val.is_integer() && !lia_authoritative.contains(&term) && {
+            let previous = lia.values.insert(term, lra_val.to_integer());
+            let falsified = lia_falsified(lia);
+            if falsified {
+                if let Some(previous) = previous {
+                    lia.values.insert(term, previous);
+                }
+            }
+            !falsified
+        };
+        if !adopt_lra {
             lra_model.values.insert(term, lia_rational);
             patched_lra_terms.push(term);
         }
@@ -177,8 +226,9 @@ pub(super) fn extract_array_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ay_core::TermId;
+    use ay_core::{ArraySort, TermId};
     use num_bigint::BigInt;
+    use num_rational::BigRational;
 
     #[test]
     fn merge_lia_values_overwrites_both_euf_integer_views() {
@@ -186,6 +236,7 @@ mod tests {
         let mut euf = EufModel::default();
         euf.int_values.insert(term, BigInt::from(0));
         euf.term_values.insert(term, "0".to_string());
+        euf.speculative_int_terms.insert(term);
         let mut lia = LiaModel {
             values: Default::default(),
         };
@@ -195,5 +246,125 @@ mod tests {
 
         assert_eq!(euf.int_values.get(&term), Some(&BigInt::from(7)));
         assert_eq!(euf.term_values.get(&term).map(String::as_str), Some("7"));
+        assert!(!euf.speculative_int_terms.contains(&term));
+    }
+
+    #[test]
+    fn integer_coverage_rejects_wrong_keys_views_and_speculative_values() {
+        let term = TermId(0);
+        let other = TermId(1);
+        let lia = LiaModel {
+            values: [(term, BigInt::from(7))].into_iter().collect(),
+        };
+        let mut euf = EufModel::default();
+        euf.int_values.insert(other, BigInt::from(7));
+        euf.term_values.insert(other, "7".into());
+        assert!(!lia_values_are_merged(&euf, &lia));
+
+        euf.int_values.insert(term, BigInt::from(7));
+        euf.term_values.insert(term, "0".into());
+        assert!(!lia_values_are_merged(&euf, &lia));
+        euf.int_values.insert(term, BigInt::from(0));
+        euf.term_values.insert(term, "7".into());
+        assert!(!lia_values_are_merged(&euf, &lia));
+        euf.int_values.insert(term, BigInt::from(7));
+        euf.speculative_int_terms.insert(term);
+        assert!(!lia_values_are_merged(&euf, &lia));
+        euf.speculative_int_terms.remove(&term);
+        assert!(lia_values_are_merged(&euf, &lia));
+    }
+
+    #[test]
+    fn real_merge_preserves_integer_bool_and_array_ownership_without_padding() {
+        let mut terms = TermStore::new();
+        let real = terms.mk_var("r", Sort::Real);
+        let integer = terms.mk_var("i", Sort::Int);
+        let boolean = terms.mk_var("p", Sort::Bool);
+        let array = terms.mk_var(
+            "a",
+            Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Real))),
+        );
+        let index = terms.mk_int(3.into());
+        let store = terms.mk_store(array, index, real);
+        let mut euf = EufModel::default();
+        let lia = LiaModel {
+            values: [(integer, BigInt::from(7))].into_iter().collect(),
+        };
+        merge_lia_values(&mut euf, Some(&lia));
+        euf.term_values.insert(boolean, "true".into());
+        euf.term_values.insert(array, "a!0".into());
+        euf.term_values.insert(real, "0.0".into());
+        let value = BigRational::new(3.into(), 2.into());
+        let lra = LraModel {
+            values: [
+                (real, value.clone()),
+                (integer, BigRational::from_integer(0.into())),
+                (boolean, BigRational::from_integer(0.into())),
+                (array, BigRational::from_integer(0.into())),
+                (store, BigRational::from_integer(0.into())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        merge_lra_values(&mut euf, &lra, &terms);
+
+        assert_eq!(euf.term_values.get(&real), Some(&format_rational(&value)));
+        assert!(lia_values_are_merged(&euf, &lia));
+        assert_eq!(
+            euf.term_values.get(&boolean).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(euf.term_values.get(&array).map(String::as_str), Some("a!0"));
+        assert!(!euf.term_values.contains_key(&store));
+        assert!(!euf.int_values.contains_key(&real));
+        assert!(euf.term_values.len() < lra.values.len());
+        assert!(real_values_are_merged(&euf, &lra, &terms));
+    }
+
+    #[test]
+    fn real_coverage_rejects_missing_or_wrong_values_despite_sufficient_map_size() {
+        let mut terms = TermStore::new();
+        let real = terms.mk_var("r", Sort::Real);
+        let other = terms.mk_var("other", Sort::Real);
+        let value = BigRational::new(3.into(), 2.into());
+        let lra = LraModel {
+            values: [(real, value.clone())].into_iter().collect(),
+        };
+        let mut euf = EufModel::default();
+        euf.term_values.insert(other, format_rational(&value));
+        assert_eq!(euf.term_values.len(), lra.values.len());
+        assert!(!real_values_are_merged(&euf, &lra, &terms));
+        euf.term_values.insert(real, "0.0".into());
+        assert!(!real_values_are_merged(&euf, &lra, &terms));
+        euf.term_values.insert(real, format_rational(&value));
+        assert!(real_values_are_merged(&euf, &lra, &terms));
+    }
+
+    #[test]
+    fn lra_merge_checks_real_values_without_overwriting_other_sorts() {
+        let mut terms = TermStore::new();
+        let real = terms.mk_var("r", Sort::Real);
+        let integer = terms.mk_var("i", Sort::Int);
+        let opaque = terms.mk_var("b", Sort::Bool);
+        let mut euf = EufModel::default();
+        euf.term_values.insert(integer, "7".to_string());
+        euf.term_values.insert(opaque, "true".to_string());
+        let mut lra = LraModel {
+            values: Default::default(),
+        };
+        for term in [real, integer, opaque] {
+            lra.values
+                .insert(term, num_rational::BigRational::from_integer(3.into()));
+        }
+        assert!(!real_values_are_merged(&euf, &lra, &terms));
+        merge_lra_values(&mut euf, &lra, &terms);
+        assert!(real_values_are_merged(&euf, &lra, &terms));
+        assert_eq!(euf.term_values[&integer], "7");
+        assert_eq!(euf.term_values[&opaque], "true");
+        euf.term_values.insert(real, "4.0".to_string());
+        assert!(!real_values_are_merged(&euf, &lra, &terms));
+        euf.term_values.remove(&real);
+        assert!(!real_values_are_merged(&euf, &lra, &terms));
     }
 }

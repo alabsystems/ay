@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+f 4;
+red 1 ~x5 1 x1 >= 1 : x5 0 ;
+core id -1;
+red 1 x5 1 ~x1 >= 1 : x5 1 ;
+core id -1;
+preserved_add x5 : 1 x1 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

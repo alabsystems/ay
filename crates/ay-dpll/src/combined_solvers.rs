@@ -88,11 +88,12 @@ mod euf_array_replay;
 mod interface_bridge;
 mod interface_bridge_eval;
 mod models;
+mod prepared_models;
 pub(crate) mod theory_stats;
 
 pub(crate) use adapters::{
-    AufLiraSolver, LiraSolver, StringsLiaSolver, UfMapLiaSolver, UfMultisetLiaSolver, UfNiaSolver,
-    UfNraSolver, UfSeqLiaSolver, UfSeqSolver, UfSetLiaSolver,
+    AufLiraSolver, LiraSolver, SplitLoopReads, StringsLiaSolver, UfMapLiaSolver,
+    UfMultisetLiaSolver, UfNiaSolver, UfNraSolver, UfSeqLiaSolver, UfSeqSolver, UfSetLiaSolver,
 };
 pub use combiner::TheoryCombiner;
 

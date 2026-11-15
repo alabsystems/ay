@@ -1,0 +1,13 @@
+; z3 5.1.0: sat sat
+(set-logic QF_UFBV)
+(declare-sort U 0)
+(declare-fun h (U) (_ BitVec 4))
+(declare-const c0 U) (declare-const c1 U) (declare-const c2 U) (declare-const c3 U) (declare-const c4 U)
+(declare-const e U)
+(push 1)
+(assert (bvugt (h e) #x1))
+(assert (distinct c0 c1 c2 c3 c4))
+(assert (or (= e c0) (= e c1) (= e c2) (= e c3) (= e c4)))
+(check-sat)
+(assert (not (= e c0)))
+(check-sat)

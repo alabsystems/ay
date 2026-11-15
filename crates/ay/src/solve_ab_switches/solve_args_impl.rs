@@ -72,6 +72,7 @@ impl SolveArgs {
             debug_no_terms: self.ab_switches.debug_no_terms.clone(),
             proof_introspect: self.ab_switches.proof_introspect.clone(),
             proof_introspect_probe: self.ab_switches.proof_introspect_probe.clone(),
+            probe_sat_variable: self.ab_switches.probe_sat_variable,
             str_w4_work: self.ab_switches.str_w4_work,
             fmq_lane_budget_ms: self.ab_switches.fmq_lane_budget_ms,
             fmq_probe_ms: self.ab_switches.fmq_probe_ms,
@@ -86,6 +87,7 @@ impl SolveArgs {
             sat_l0_unsat_trace: self.ab_switches.sat_l0_unsat_trace,
             sat_symmetry_trace: self.ab_switches.sat_symmetry_trace,
             sat_mem_probe: self.ab_switches.sat_mem_probe,
+            sat_bve_trace: self.ab_switches.sat_bve_trace,
             ab_triage_clause: self.ab_switches.sat_ab_triage_clause.clone(),
             ab_triage_var: self.ab_switches.sat_ab_triage_var,
             ab_triage_probe: self.ab_switches.sat_ab_triage_probe.clone(),
@@ -161,6 +163,22 @@ impl SolveArgs {
             no_consequence_replay: self.ab_switches.no_consequence_replay,
             no_quantified_shedding_yield: self.ab_switches.no_quantified_shedding_yield,
             no_negated_exists_ground_inst: self.ab_switches.no_negated_exists_ground_inst,
+            no_qlra_cegqi: self.ab_switches.no_qlra_cegqi,
+            no_eq_qe_lane: self.ab_switches.no_eq_qe_lane,
+            no_qsat: self.ab_switches.no_qsat,
+            no_qlra_nested: self.ab_switches.no_qlra_nested,
+            no_authored_skeleton_refutation: self.ab_switches.no_authored_skeleton_refutation,
+            no_authored_fold_identity: self.ab_switches.no_authored_fold_identity,
+            no_probe_ite_lift_promoter: self.ab_switches.no_probe_ite_lift_promoter,
+            no_alpha_quantifier_sharing: self.ab_switches.no_alpha_quantifier_sharing,
+            no_quantifier_proxy_abstraction: self.ab_switches.no_quantifier_proxy_abstraction,
+            no_skolem_guarded_proxy_instances: self.ab_switches.no_skolem_guarded_proxy_instances,
+            no_quantifier_guarded_instances: self.ab_switches.no_quantifier_guarded_instances,
+            quantifier_guarded_enumerative: self.ab_switches.quantifier_guarded_enumerative,
+            no_quantifier_guarded_enumerative: self.ab_switches.no_quantifier_guarded_enumerative,
+            no_quantifier_ce_free_resolve: self.ab_switches.no_quantifier_ce_free_resolve,
+            no_quantifier_guard_seeds: self.ab_switches.no_quantifier_guard_seeds,
+            no_ground_first: self.ab_switches.no_ground_first,
             no_ground_conflict_decomp: self.ab_switches.no_ground_conflict_decomp,
             no_fp_incremental: self.ab_switches.no_fp_incremental,
             vacuous_marker_narrow: self.ab_switches.vacuous_marker_narrow,
@@ -198,6 +216,14 @@ impl SolveArgs {
             chc_array_tree_refutation: self.ab_switches.chc_array_tree_refutation,
             chc_dont_care_filter: self.ab_switches.chc_dont_care_filter,
             chc_intern: self.ab_switches.chc_intern,
+            chc_session: self.ab_switches.chc_session,
+            chc_session_strict: self.ab_switches.chc_session_strict.clone(),
+            chc_session_audit: self.ab_switches.chc_session_audit,
+            chc_session_stats: self.ab_switches.chc_session_stats,
+            chc_session_coverage: self.ab_switches.chc_session_coverage,
+            chc_session_trace: self.ab_switches.chc_session_trace,
+            chc_session_dump: self.ab_switches.chc_session_dump.clone(),
+            chc_session_dump_max: self.ab_switches.chc_session_dump_max,
             chc_array_inv: self.ab_switches.chc_array_inv,
             chc_dt_recursive_prefix: self.ab_switches.chc_dt_recursive_prefix,
             interface_diet: self.ab_switches.interface_diet.clone(),
@@ -234,6 +260,7 @@ impl SolveArgs {
             reve_debug: self.ab_switches.reve_debug,
             max_propagate_rounds: self.ab_switches.max_propagate_rounds,
             lra_cond_trail: self.ab_switches.lra_cond_trail,
+            lra_unit_pivot_pref: self.ab_switches.lra_unit_pivot_pref,
             euf_inc_neg_pop: self.ab_switches.euf_inc_neg_pop,
             nra_diag: self.ab_switches.nra_diag,
             nra_grid_probe: self.ab_switches.nra_grid_probe,
@@ -243,8 +270,45 @@ impl SolveArgs {
             quant_relevance_min: self.ab_switches.quant_relevance_min,
             quant_relevance_model: self.ab_switches.quant_relevance_model,
             quant_relevance_debug: self.ab_switches.quant_relevance_debug,
+            search_executor_sheds_proof_cycle:
+                crate::competition_mode::search_executor_sheds_proof_cycle(self),
+            z3_transcript: self.z3_mode,
+            engine_shadow: self
+                .ab_switches
+                .engine
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("shadow")),
+            engine_shadow_theory_branching: self.ab_switches.engine.as_deref()
+                == Some("shadow:theory-branching"),
+            engine_shadow_simplex_only: self.ab_switches.engine.as_deref()
+                == Some("shadow:simplex"),
+            engine_shadow_lia_bcp_implied: self.ab_switches.engine.as_deref()
+                == Some("shadow:lia-bcp-implied"),
+            engine_shadow_sat_default: self.ab_switches.engine.as_deref()
+                == Some("shadow:sat-default"),
+            engine_shadow_hub_relevancy: self.ab_switches.engine.as_deref()
+                == Some("shadow:hub-relevancy"),
+            engine_shadow_log: self.ab_switches.engine_shadow_log.clone(),
+            engine_shadow_budget_ms: self.timeout,
+            engine_shadow_proofs: self.ab_switches.engine_shadow_proofs.clone(),
+            engine_shadow_authored: self.ab_switches.engine_shadow_authored,
+            engine_lanes: self.ab_switches.engine.as_deref() == Some("lane"),
         };
         let _ = ay_core::set_global_misc_cli_flags(flags);
+        // `--engine=own:<families>` (measurement only): the kernel owns exactly
+        // these families, each with its lane as the fallback.
+        if let Some(families) = self
+            .ab_switches
+            .engine
+            .as_deref()
+            .and_then(|mode| mode.strip_prefix("own:"))
+        {
+            let owned = families
+                .split(',')
+                .filter_map(ay_dpll::executor::KernelFamily::from_name)
+                .collect();
+            let _ = ay_dpll::executor::set_kernel_owned_families(owned);
+        }
     }
 
     /// Install the SAT A/B opt-outs once before any solve (B26).
@@ -278,6 +342,7 @@ impl SolveArgs {
             signed_symmetry: f.sat_signed_symmetry,
             composite_symmetry: f.sat_composite_symmetry,
             symmetry_hhw: f.sat_symmetry_hhw,
+            symmetry_fix_and_cut: f.sat_symmetry_fix_and_cut,
             bve_sparse_max_vars: f.sat_bve_sparse_max_vars,
             bve_sparse_max_density: f.sat_bve_sparse_max_density,
             deterministic_inproc: f.sat_deterministic_inproc,
@@ -340,6 +405,93 @@ impl SolveArgs {
             memory_aware_clause_db: f.sat_memory_aware_clause_db,
             congruence_exact_gate_table: f.sat_congruence_exact_gate_table,
             congruence_bounded_occs: f.sat_congruence_bounded_occs,
+            eager_subsume_unlink_binaries: f.sat_eager_subsume_unlink_binaries,
+            conflict_cap: f.sat_conflict_cap,
+            proof_min_free_bytes: f.sat_proof_min_free_bytes,
+            proof_cap_bytes: f.sat_proof_cap_bytes,
+            symmetry_large_caps: f.sat_symmetry_large_caps,
+            factor_large: f.sat_factor_large,
+            subst_auto_giant_proof: f.sat_subst_auto_giant_proof,
+            bve_ext_cooccur: f.sat_bve_ext_cooccur,
+            bve_bound_progress: f.sat_bve_bound_progress,
+            giant_band_max_vars: f.sat_giant_band_max_vars,
+            giant_inproc_permille: f.sat_giant_inproc_permille,
+            chrono: f.sat_chrono,
+            chrono_reuse_trail: f.sat_chrono_reuse_trail,
+            factor_max_density: f.sat_factor_max_density,
+            sbva_max_density: f.sat_sbva_max_density,
+            elim_density_irredundant: f.sat_elim_density_irredundant,
+            inproc_nlogn_schedule: f.sat_inproc_nlogn_schedule,
+            reduce_low_permille: f.sat_reduce_low_permille,
+            stacked_backbone: f.sat_stacked_backbone,
+            vivify_generations: f.sat_vivify_generations,
+            sweep_passes: f.sat_sweep_passes,
+            tier_histogram_binaries: f.sat_tier_histogram_binaries,
+            keep_learned_binaries: f.sat_keep_learned_binaries,
+            blanket_trail_protection: f.sat_blanket_trail_protection,
+            branch_mab: f.sat_branch_mab,
+            bve_kissat_schedule: f.sat_bve_kissat_schedule,
+            bve_post_factor_band: f.sat_bve_post_factor_band,
+            bve_dense_by_effort: f.sat_bve_dense_by_effort,
+            bump_binary_reasons: f.sat_bump_binary_reasons,
+            veripb_hints: f.sat_veripb_hints,
+            bve_gate_complete: f.sat_bve_gate_complete,
+            stable_ema: f.sat_stable_ema,
+            reduce_kissat_tiers: f.sat_reduce_kissat_tiers,
+            very_large_band: f.sat_very_large_band,
+            reduce_large_cap: f.sat_reduce_large_cap,
+            live_size_gates: f.sat_live_size_gates,
+            stable_lock_at: f.sat_stable_lock_at,
+            stable_lock_ungated: f.sat_stable_lock_ungated,
+            stable_lock_revert_two_stage: f.sat_stable_lock_revert_two_stage,
+            stable_lock_two_stage: f.sat_stable_lock_two_stage,
+            stable_lock_second_gate: f.sat_stable_lock_second_gate,
+            indep_enum_max_secs: f.sat_indep_enum_max_secs,
+            transred_propagation_effort: f.sat_transred_propagation_effort,
+            reorder_kissat: f.sat_reorder_kissat,
+            rephase_shuffle: f.sat_rephase_shuffle,
+            bcp_move_on_true: f.sat_bcp_move_on_true,
+            target_kissat: f.sat_target_kissat,
+            walk_kissat: f.sat_walk_kissat,
+            jump_reasons_kissat: f.sat_jump_reasons_kissat,
+            rephase_kissat: f.sat_rephase_kissat,
+            bump_reasons_kissat: f.sat_bump_reasons_kissat,
+            mode_length_kissat: f.sat_mode_length_kissat,
+            large_inproc: f.sat_large_inproc,
+            probe_phases_kissat: f.sat_probe_phases_kissat,
+            indep_enum_and: f.sat_indep_enum_and,
+            reduce_kissat_recompute: f.sat_reduce_kissat_recompute,
+            target_kissat_pop: f.sat_target_kissat_pop,
+            restart_gate_kissat: f.sat_restart_gate_kissat,
+            initial_phase_kissat: f.sat_initial_phase_kissat,
+            reduce_schedule_kissat: f.sat_reduce_schedule_kissat,
+            best_stable_kissat: f.sat_best_stable_kissat,
+            restart_fixpoint_kissat: f.sat_restart_fixpoint_kissat,
+            mode_delta_kissat: f.sat_mode_delta_kissat,
+            inproc_passes_kissat: f.sat_inproc_passes_kissat,
+            backbone_binary_kissat: f.sat_backbone_binary_kissat,
+            randec_kissat: f.sat_randec_kissat,
+            preprocess_kissat: f.sat_preprocess_kissat,
+            subst_kissat: f.sat_subst_kissat,
+            queue_freeze_kissat: f.sat_queue_freeze_kissat,
+            analysis_ticks_kissat: f.sat_analysis_ticks_kissat,
+            two_stage_warm_scores_kissat: f.sat_two_stage_warm_scores_kissat,
+            vivify_kissat: f.sat_vivify_kissat,
+            eliminate_cadence_kissat: f.sat_eliminate_cadence_kissat,
+            binary_irredundant_kissat: f.sat_binary_irredundant_kissat,
+            probe_round_kissat: f.sat_probe_round_kissat,
+            reduce_protect_kissat: f.sat_reduce_protect_kissat,
+            subsume_kissat: f.sat_subsume_kissat,
+            learned_order_kissat: f.sat_learned_order_kissat,
+            factor_schedule_kissat: f.sat_factor_schedule_kissat,
+            reluctant_cap_kissat: f.sat_reluctant_cap_kissat,
+            reorder_weights_kissat: f.sat_reorder_weights_kissat,
+            shrink_bump_uip_kissat: f.sat_shrink_bump_uip_kissat,
+            shrink_removable_kissat: f.sat_shrink_removable_kissat,
+            sweep_env_kissat: f.sat_sweep_env_kissat,
+            compact_fixed: f.sat_compact_fixed,
+            vivify_asym_kissat: f.sat_vivify_asym_kissat,
+            vivify_order_kissat: f.sat_vivify_order_kissat,
         };
         if switches != ay_core::SatAbSwitches::default() {
             let _ = ay_core::set_global_sat_ab_switches(switches);
@@ -448,6 +600,17 @@ impl SolveArgs {
             cata_route: !flags.chc_no_cata,
             cata_v2: !flags.chc_no_cata_v2,
             condense: !flags.chc_no_condense,
+            search_solve_eqs: !flags.chc_no_search_solve_eqs,
+            spacer_rung: flags
+                .chc_spacer_rung
+                .unwrap_or(ay_chc::ab_switches::ChcAbSwitches::default().spacer_rung),
+            spacer_free_pob: flags.chc_spacer_free_pob.map(|v| v != 0),
+            spacer_core_lemma: flags.chc_spacer_core_lemma.map(|v| v != 0),
+            spacer_ind_gen: flags.chc_spacer_ind_gen.map(|v| v != 0),
+            spacer_confirm_cores: flags.chc_spacer_confirm_cores.map(|v| v != 0),
+            spacer_lift_caps: flags.chc_spacer_lift_caps.map(|v| v != 0),
+            spacer_session: flags.chc_spacer_session.map(|v| v != 0),
+            spacer_nonlinear: flags.chc_spacer_nonlinear.map(|v| v != 0),
         };
         if switches != ay_chc::ab_switches::ChcAbSwitches::default() {
             let _ = ay_chc::ab_switches::set(switches);

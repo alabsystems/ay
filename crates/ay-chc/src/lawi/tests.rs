@@ -375,12 +375,88 @@ fn lawi_solver_unsafe_unbounded_increment() {
     // x=0, x → x+1, x>=1 → false.
     // System is unsafe: x reaches 1 after one step.
     let problem = unbounded_increment_unsafe();
-    let mut solver = LawiSolver::new(problem, LawiConfig::default());
+    let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
     let result = solver.solve();
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("unbounded increment with x>=1 query should be Unsafe, got {result:?}");
+    };
+    assert_ground_evidence(&problem, &cex);
+}
+
+/// The path model is carried as a ground derivation that validates on the
+/// solved problem, plus a derivation witness.
+fn assert_ground_evidence(problem: &ChcProblem, cex: &crate::pdr::Counterexample) {
+    let derivation = cex
+        .ground_derivation
+        .as_ref()
+        .expect("LAWI Unsafe carries its path model as a ground derivation");
+    crate::ground_derivation::validate_ground_derivation(problem, derivation)
+        .expect("the carried derivation validates on the solved problem");
     assert!(
-        matches!(result, ChcEngineResult::Unsafe(_)),
-        "unbounded increment with x>=1 query should be Unsafe, got {result:?}",
+        cex.witness.is_some(),
+        "Int path yields a derivation witness"
     );
+}
+
+#[test]
+fn lawi_unsafe_follows_the_fired_branch_clause() {
+    // Only the `Inv(x) /\ x = 0 => Inv(1)` branch (clause 2) reaches the
+    // query; the derivation must name it, not the `Inv(0)` self-loop.
+    let problem = branching_edge_problem();
+    let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+    let result = solver.solve();
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("branching problem is unsafe, got {result:?}");
+    };
+    assert_ground_evidence(&problem, &cex);
+    let derivation = cex.ground_derivation.as_ref().expect("derivation");
+    assert!(derivation.steps.iter().any(|step| step.clause_index == 2));
+}
+
+#[test]
+fn lawi_unsafe_real_system_with_nondeterministic_local() {
+    // P(0); P(x) /\ 0 <= d <= 1/2 /\ y = x + d => P(y); P(x) /\ x >= 1 => false.
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Real]);
+    let x = ChcVar::new("x", ChcSort::Real);
+    let y = ChcVar::new("y", ChcSort::Real);
+    let d = ChcVar::new("d", ChcSort::Real);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(p, vec![ChcExpr::Real(0, 1)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::and_all(vec![
+                ChcExpr::le(ChcExpr::Real(0, 1), ChcExpr::var(d.clone())),
+                ChcExpr::le(ChcExpr::var(d.clone()), ChcExpr::Real(1, 2)),
+                ChcExpr::eq(
+                    ChcExpr::var(y.clone()),
+                    ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::var(d)),
+                ),
+            ])),
+        ),
+        ClauseHead::Predicate(p, vec![ChcExpr::var(y)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::ge(ChcExpr::var(x), ChcExpr::Real(1, 1))),
+        ),
+        ClauseHead::False,
+    ));
+    let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+    let result = solver.solve();
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("drifting Real counter reaches 1, got {result:?}");
+    };
+    let derivation = cex
+        .ground_derivation
+        .as_ref()
+        .expect("Real path model is carried as a ground derivation");
+    crate::ground_derivation::validate_ground_derivation(&problem, derivation)
+        .expect("validates on the solved problem");
 }
 
 #[test]

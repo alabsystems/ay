@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% The `+` sibling of `wcnf_literal_spelling_alias`, and the nastier case: the
+% proof never names the ghost variable `x+1` at all, the solution-hint growing
+% supplies it. The two hard clauses are x1 and ~x1 over one variable, so the
+% instance is infeasible and no solution may be logged.
+f 2;
+sol ~x1;
+output NONE;
+conclusion BOUNDS 0 0;
+end pseudo-Boolean proof;

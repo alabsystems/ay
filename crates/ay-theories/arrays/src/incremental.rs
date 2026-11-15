@@ -13,6 +13,31 @@ use super::*;
 
 const FINGERPRINT_SOFT_CAP: usize = 16_384;
 
+/// Structural-rebuild diagnostics for the array lane (#array-scope-watermark),
+/// surfaced on the `--stats-full` channel as `arrays_*`.
+///
+/// `scope_grew` is the OLD wipe trigger and `scope_grew_below_watermark` the
+/// NEW one (see [`ArraySolver::register_scope_atom`]), so ONE binary reports
+/// both arms of that decision; `populate_term_registrations` is the direct cost
+/// of a wipe, because a wipe restarts the ascending registration scan at 0.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CacheRebuildStats {
+    /// Calls to `populate_caches()`.
+    pub(crate) populate_calls: u64,
+    /// Of those, the ones that found `dirty` set and so wiped and rebuilt
+    /// every structural cache.
+    pub(crate) full_rebuilds: u64,
+    /// Terms handed to `register_term()` by the ascending
+    /// `populated_terms..terms.len()` scan, summed over all calls.
+    pub(crate) term_registrations: u64,
+    /// `register_scope_atom()` calls whose atom pulled at least one NEW term
+    /// into the registered-atom scope.
+    pub(crate) scope_grew: u64,
+    /// Of those, the ones that pulled in a term BELOW the `populated_terms`
+    /// watermark — the only ones that actually require a wipe.
+    pub(crate) scope_grew_below_watermark: u64,
+}
+
 impl ArraySolver<'_> {
     /// Restrict cache population to terms reachable from registered atoms.
     ///
@@ -24,23 +49,51 @@ impl ArraySolver<'_> {
     }
 
     pub(crate) fn register_scope_atom(&mut self, atom: TermId) {
+        // #array-scope-watermark: read the incremental watermark BEFORE the
+        // scope mutation. `populate_caches()` registers terms by an ascending
+        // `populated_terms..terms.len()` scan filtered by `term_in_scope`, so a
+        // term that enters the scope AT OR ABOVE the watermark is picked up by
+        // the very next scan with no rebuild. Only a term that enters the scope
+        // BELOW the watermark was already passed over by an earlier scan and is
+        // therefore unreachable without a wipe.
+        let watermark = self.populated_terms;
         let Some(scope) = self.registered_term_scope.as_mut() else {
             return;
         };
 
         let mut stack = vec![atom];
         let mut grew = false;
+        let mut grew_below_watermark = false;
         while let Some(term) = stack.pop() {
             if !scope.insert(term) {
                 continue;
             }
             grew = true;
+            grew_below_watermark |= term.index() < watermark;
             for child in self.terms.children(term) {
                 stack.push(child);
             }
         }
 
-        if grew && self.populated_terms != 0 {
+        if grew {
+            self.cache_rebuild.scope_grew = self.cache_rebuild.scope_grew.saturating_add(1);
+        }
+        if grew_below_watermark {
+            self.cache_rebuild.scope_grew_below_watermark = self
+                .cache_rebuild
+                .scope_grew_below_watermark
+                .saturating_add(1);
+        }
+
+        // The old condition was `grew && populated_terms != 0`, which wiped
+        // every structural cache whenever ANY new term entered the scope. On
+        // the array combiner lane that is the dominant per-round cost: the
+        // Nelson-Oppen loop keeps minting fresh atoms (model equalities, split
+        // atoms, lemma terms) whose sub-terms are all NEW and therefore all at
+        // or above the watermark, so the wipe re-registered the entire term
+        // store to discover nothing. `grew_below_watermark` implies `grew` and
+        // `watermark != 0`, so this is a strict narrowing of the old trigger.
+        if grew_below_watermark {
             self.dirty = true;
         }
     }
@@ -73,7 +126,14 @@ impl ArraySolver<'_> {
         // is not touched by a structural rebuild. Keep the two stacks the same
         // depth so later `pop()`s stay aligned: every currently-open scope now
         // marks position 0 in the freshly-emptied log.
-        self.array_var_merge_scopes = vec![0; self.scopes.len()];
+        let open_scopes = self.scopes.len();
+        let mut merge_scopes = Vec::new();
+        // Capacity hint only: if it fails, the pushes grow the vector.
+        let _ = merge_scopes.try_reserve_exact(open_scopes);
+        for _ in 0..open_scopes {
+            merge_scopes.push(0);
+        }
+        self.array_var_merge_scopes = merge_scopes;
         // The affine normal-form / interning memo (`affine_cache`) is a pure
         // function of the immutable `TermStore` term DAG — it carries no
         // structural-cache lengths, assignments, or lemma reasons — so a
@@ -84,13 +144,14 @@ impl ArraySolver<'_> {
         // clear + repopulation could reach the same lengths with different
         // content, so drop it explicitly (M1 weak-equivalence campaign).
         *self.weak_equiv_cache.borrow_mut() = None;
-        // axiom_fingerprints / row2_fingerprint_indices are NOT cleared here.
-        // They track which exact `(store, select_index)` pairs have already had
-        // ROW2 work queued. Since the resulting SAT clauses are permanent
-        // (survive push/pop), re-queuing the same exact axiom after a dirty
-        // rebuild causes infinite NeedLemmas cycling in the DPLL(T) refinement
-        // loop (#6703). Cleared indirectly via reset().
+        // Queue indexes are not permanent clause-completion authority. A
+        // cache rebuild clears the work itself, so retire its indexes too.
         self.pending_axioms.clear();
+        self.row2_down_work.clear();
+        self.row2_last_clause.clear();
+        self.row2_clause_acknowledged.clear();
+        self.axiom_fingerprints.clear();
+        self.row2_fingerprint_indices.clear();
         self.blocked_axioms.clear();
         self.blocked_axiom_term_gen = 0;
         self.pending_const_reads.clear();
@@ -128,6 +189,11 @@ impl ArraySolver<'_> {
         // by replaying the queue-population half of registration with
         // `structural == false`, so `array_vars` is read but not re-mutated.
         self.pending_axioms.clear();
+        self.row2_down_work.clear();
+        self.row2_last_clause.clear();
+        self.row2_clause_acknowledged.clear();
+        self.axiom_fingerprints.clear();
+        self.row2_fingerprint_indices.clear();
         self.blocked_axioms.clear();
         self.blocked_axiom_term_gen = 0;
         self.pending_const_reads.clear();
@@ -204,21 +270,61 @@ impl ArraySolver<'_> {
         false
     }
 
-    pub(crate) fn queue_row2_down_axiom(&mut self, store: TermId, select: TermId) {
-        let Some(&(_, select_index)) = self.select_cache.get(&select) else {
-            return;
+    pub(crate) fn row2_down_work_seen(&self, store: TermId, select: TermId) -> bool {
+        let Some(&(array, index)) = self.select_cache.get(&select) else {
+            return false;
         };
-        if self.row2_fingerprint_seen(store, select_index) {
-            return;
-        }
+        self.row2_down_work.contains(&(store, select))
+            || (array == store && self.row2_fingerprint_seen(store, index))
+    }
 
-        self.axiom_fingerprints.insert((store, select_index));
-        self.row2_fingerprint_indices
-            .entry(store)
-            .or_default()
-            .push(select_index);
+    pub(crate) fn queue_row2_down_axiom(&mut self, store: TermId, select: TermId) -> bool {
+        let Some(&(array, select_index)) = self.select_cache.get(&select) else {
+            return false;
+        };
+        if self.row2_down_work_seen(store, select) {
+            return false;
+        }
+        if array == store {
+            // This is the direct read's unconditional ROW2 identity. Keep the
+            // existing index-equivalence dedup for this syntactic store read.
+            self.axiom_fingerprints.insert((store, select_index));
+            self.row2_fingerprint_indices
+                .entry(store)
+                .or_default()
+                .push(select_index);
+        }
+        // A pair denotes tracked work, never a permanently completed clause.
+        // Distinct alias/read guards therefore never collide on store/index.
+        self.row2_down_work.insert((store, select));
         self.pending_axioms
             .push(PendingAxiom::Row2Down { store, select });
+        true
+    }
+
+    /// Rebuild every queue index from actual pending/blocked obligations.
+    /// Exact applied clauses, not these indexes, license emission suppression.
+    pub(crate) fn rebuild_row2_down_work(&mut self) {
+        self.row2_down_work.clear();
+        self.axiom_fingerprints.clear();
+        self.row2_fingerprint_indices.clear();
+        for axiom in self.pending_axioms.iter().chain(&self.blocked_axioms) {
+            let PendingAxiom::Row2Down { store, select } = *axiom;
+            let Some(&(array, index)) = self.select_cache.get(&select) else {
+                continue;
+            };
+            if !self.store_cache.contains_key(&store) {
+                continue;
+            }
+            self.row2_down_work.insert((store, select));
+            if array == store && self.axiom_fingerprints.insert((store, index)) {
+                self.row2_fingerprint_indices
+                    .entry(store)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        self.retain_row2_clause_work();
     }
 
     pub(crate) fn wake_blocked_row2_down_axioms(&mut self) {
@@ -625,8 +731,15 @@ impl ArraySolver<'_> {
                 // generation through equality aliases (#8598).
                 name if name.starts_with("as-array[") && name.ends_with(']') && args.is_empty() => {
                     if insert_structural {
-                        let func_name = name[9..name.len() - 1].to_string();
-                        self.as_array_cache.insert(term_id, func_name);
+                        // The arm's guard already checked both affixes; the
+                        // strip form names the inner function without a
+                        // hand-computed slice bound.
+                        if let Some(func_name) = name
+                            .strip_prefix("as-array[")
+                            .and_then(|rest| rest.strip_suffix(']'))
+                        {
+                            self.as_array_cache.insert(term_id, func_name.to_string());
+                        }
                         self.var_layer_terms.push(term_id);
                     }
                     // Register as an array var so it participates in
@@ -660,8 +773,13 @@ impl ArraySolver<'_> {
                 // Detect map[f](...) terms by the "map[" prefix convention.
                 name if name.starts_with("map[") && name.ends_with(']') && !args.is_empty() => {
                     if insert_structural {
-                        let func_name = name[4..name.len() - 1].to_string();
-                        self.map_cache.insert(term_id, (func_name, args.clone()));
+                        if let Some(func_name) = name
+                            .strip_prefix("map[")
+                            .and_then(|rest| rest.strip_suffix(']'))
+                        {
+                            self.map_cache
+                                .insert(term_id, (func_name.to_string(), args.clone()));
+                        }
                         self.var_layer_terms.push(term_id);
                     }
                     // Register the map term as an array term in array_vars
@@ -824,22 +942,30 @@ impl ArraySolver<'_> {
             let expected_data = expected.get(term);
             let actual_data = actual.get(term);
             let expected_stores = expected_data.map_or(&[][..], |data| {
-                &data.stores_as_result[..data.stores_as_result.len().min(16)]
+                data.stores_as_result
+                    .get(..16)
+                    .unwrap_or(&data.stores_as_result)
             });
             let actual_stores = actual_data.map_or(&[][..], |data| {
-                &data.stores_as_result[..data.stores_as_result.len().min(16)]
+                data.stores_as_result
+                    .get(..16)
+                    .unwrap_or(&data.stores_as_result)
             });
             let expected_selects = expected_data.map_or(&[][..], |data| {
-                &data.parent_selects[..data.parent_selects.len().min(16)]
+                data.parent_selects
+                    .get(..16)
+                    .unwrap_or(&data.parent_selects)
             });
             let actual_selects = actual_data.map_or(&[][..], |data| {
-                &data.parent_selects[..data.parent_selects.len().min(16)]
+                data.parent_selects
+                    .get(..16)
+                    .unwrap_or(&data.parent_selects)
             });
             let expected_parents = expected_data.map_or(&[][..], |data| {
-                &data.parent_stores[..data.parent_stores.len().min(16)]
+                data.parent_stores.get(..16).unwrap_or(&data.parent_stores)
             });
             let actual_parents = actual_data.map_or(&[][..], |data| {
-                &data.parent_stores[..data.parent_stores.len().min(16)]
+                data.parent_stores.get(..16).unwrap_or(&data.parent_stores)
             });
             eprintln!(
                 "arrays: key={term} expected lens=({},{},{}) prefix=({expected_stores:?},{expected_selects:?},{expected_parents:?}) prop={} actual lens=({},{},{}) prefix=({actual_stores:?},{actual_selects:?},{actual_parents:?}) prop={}",
@@ -1093,8 +1219,11 @@ impl ArraySolver<'_> {
 
     /// Populate caches by incrementally scanning new terms.
     pub(crate) fn populate_caches(&mut self) {
+        self.cache_rebuild.populate_calls += 1;
+        let watermark_before = self.populated_terms;
         let was_dirty = self.dirty;
         if self.dirty {
+            self.cache_rebuild.full_rebuilds += 1;
             self.clear_term_caches();
             self.dirty = false;
         }
@@ -1102,6 +1231,8 @@ impl ArraySolver<'_> {
         let registered_new_terms = self.populated_terms < self.terms.len();
         let mut array_merge_replay_needed = false;
         if registered_new_terms {
+            self.cache_rebuild.term_registrations +=
+                (self.terms.len() - self.populated_terms) as u64;
             for idx in self.populated_terms..self.terms.len() {
                 let term_id = TermId(idx as u32);
                 if self.term_in_scope(term_id) {
@@ -1140,13 +1271,11 @@ impl ArraySolver<'_> {
         );
 
         // GC dead fingerprints after a dirty rebuild. When caches are rebuilt
-        // from scratch after pop(), fingerprints referencing store terms or
-        // select indices that no longer exist in the live caches are dead
-        // weight. Removing them bounds fingerprint growth to O(live_stores *
-        // live_indices) instead of accumulating across all historical scopes.
+        // from scratch, queue indexes can only refer to current live work.
+        // Rebuilding the indexes also retires dead store/select references.
         // This is safe because the corresponding SAT clauses reference terms
-        // that the solver no longer tracks — re-queuing cannot happen since
-        // queue_row2_down_axiom() only fires for terms in store_cache/select_cache.
+        // that the solver no longer tracks. Indexes are rebuilt only from
+        // current pending/blocked work with live store and select caches.
         if was_dirty {
             self.gc_dead_fingerprints();
         }
@@ -1155,7 +1284,9 @@ impl ArraySolver<'_> {
         // Even without a dirty rebuild, fingerprints can grow monotonically
         // between pop() calls on array-heavy benchmarks. Running GC based
         // on size bounds growth to O(live_stores * live_indices + SOFT_CAP).
-        if self.axiom_fingerprints.len() > FINGERPRINT_SOFT_CAP {
+        if self.axiom_fingerprints.len() > FINGERPRINT_SOFT_CAP
+            || self.row2_down_work.len() > FINGERPRINT_SOFT_CAP
+        {
             self.gc_dead_fingerprints();
             // If still over cap after removing dead entries, the live set is
             // genuinely large. Accept it — re-queuing protection is more
@@ -1177,20 +1308,73 @@ impl ArraySolver<'_> {
                 .keys()
                 .map(|&sel| self.terms.sort(sel))
                 .collect();
-            let mut entries: Vec<(TermId, TermId, TermId)> = self
-                .equality_cache
-                .iter()
-                .filter(|&(_, &(lhs, _))| select_sorts.contains(self.terms.sort(lhs)))
-                .map(|(&term, &(lhs, rhs))| (term, lhs, rhs))
-                .collect();
-            entries.sort_unstable_by_key(|&(term, _, _)| term.0);
-            self.eq_select_entries_sorted = entries;
-            // Any rebuild invalidates the propagate no-change fast path.
-            self.bump_propagate_state_version();
-            // ROW2 dirty-entry scan: entry indices changed shape and the
-            // structural probe universe (eq_pair_index/select/store caches)
-            // may have grown — watch state is index-based and now stale.
-            self.row2_invalidate_entries();
+            // Append-only fast path (#arrays-eq-entries-append): when the
+            // caches were not wiped and the select-sort filter is
+            // unchanged, previously built entries stay valid in place —
+            // new equality atoms all carry ids at or above the pre-scan
+            // watermark (registration is the ascending scan above; a
+            // below-watermark scope entry would have set `dirty`), so
+            // appending them preserves the ascending order and every
+            // existing ROW2 watch index. The full rebuild below ran on
+            // EVERY new-term batch and invalidated all ROW2 watches,
+            // forcing a full rescan per BCP round on lemma-heavy search
+            // (QF_AX swap family: 10k populate calls against a 20k-term
+            // store). The debug oracle at the top of this fn still
+            // byte-compares the result against a full rebuild.
+            let sorts_unchanged = !was_dirty
+                && select_sorts.len() == self.eq_select_entries_sorts.len()
+                && self
+                    .eq_select_entries_sorts
+                    .iter()
+                    .all(|s| select_sorts.contains(s));
+            if sorts_unchanged {
+                let mut new_entries: Vec<(TermId, TermId, TermId)> = self
+                    .equality_cache
+                    .iter()
+                    .filter(|&(&term, &(lhs, _))| {
+                        (term.0 as usize) >= watermark_before
+                            && select_sorts.contains(self.terms.sort(lhs))
+                    })
+                    .map(|(&term, &(lhs, rhs))| (term, lhs, rhs))
+                    .collect();
+                new_entries.sort_unstable_by_key(|&(term, _, _)| term.0);
+                let start = self.eq_select_entries_sorted.len();
+                self.eq_select_entries_sorted.extend(new_entries);
+                if self.row2_entry_is_dirty.len() != start || self.row2_entry_watches.len() != start
+                {
+                    // Watch vectors not yet sized to the entry list (no
+                    // propagate scan since the last full rebuild): align
+                    // them and let the next scan run full.
+                    self.row2_entry_is_dirty
+                        .resize(self.eq_select_entries_sorted.len(), true);
+                    self.row2_entry_watches
+                        .resize_with(self.eq_select_entries_sorted.len(), Vec::new);
+                    self.row2_all_dirty = true;
+                } else {
+                    for i in start..self.eq_select_entries_sorted.len() {
+                        self.row2_entry_is_dirty.push(true);
+                        self.row2_entry_watches.push(Vec::new());
+                        self.row2_dirty_entries.push(i as u32);
+                    }
+                }
+                self.bump_propagate_state_version();
+            } else {
+                let mut entries: Vec<(TermId, TermId, TermId)> = self
+                    .equality_cache
+                    .iter()
+                    .filter(|&(_, &(lhs, _))| select_sorts.contains(self.terms.sort(lhs)))
+                    .map(|(&term, &(lhs, rhs))| (term, lhs, rhs))
+                    .collect();
+                entries.sort_unstable_by_key(|&(term, _, _)| term.0);
+                self.eq_select_entries_sorted = entries;
+                self.eq_select_entries_sorts = select_sorts.into_iter().cloned().collect();
+                // Any rebuild invalidates the propagate no-change fast path.
+                self.bump_propagate_state_version();
+                // ROW2 dirty-entry scan: entry indices changed shape and the
+                // structural probe universe (eq_pair_index/select/store caches)
+                // may have grown — watch state is index-based and now stale.
+                self.row2_invalidate_entries();
+            }
         }
 
         // Debug-build cache-consistency validation. Run it only when this call
@@ -1353,54 +1537,31 @@ impl ArraySolver<'_> {
         }
     }
 
-    /// Remove fingerprint entries for store terms no longer in `store_cache`.
-    ///
-    /// After a dirty cache rebuild (triggered by `pop()`), the term caches are
-    /// repopulated from the current term store. Any `(store, select_index)` pair
-    /// in `axiom_fingerprints` where `store` is not in `store_cache` is dead —
-    /// no ROW2 axiom can reference that store, and the fingerprint just wastes
-    /// memory. Similarly, entries in `row2_fingerprint_indices` keyed by dead
-    /// stores are removed.
-    ///
-    /// We also remove fingerprint entries where all referenced select indices
-    /// are dead (no longer appear as indices in any live select). This handles
-    /// the case where the store survives but the index terms were temporary.
+    /// Reconcile queue indexes with pending/blocked work in the live caches.
+    /// This retires dead direct-store index entries and exact alias/read keys;
+    /// spare storage for each view is released when that view shrinks enough.
     fn gc_dead_fingerprints(&mut self) {
         let pre_fp = self.axiom_fingerprints.len();
         let pre_idx = self.row2_fingerprint_indices.len();
-
-        if pre_fp == 0 && pre_idx == 0 {
+        let pre_work = self.row2_down_work.len();
+        if pre_fp == 0 && pre_idx == 0 && pre_work == 0 {
             return;
         }
-
-        // Build set of live select indices for secondary GC pass.
-        let live_select_indices: HashSet<TermId> =
-            self.select_cache.values().map(|&(_, idx)| idx).collect();
-
-        // GC axiom_fingerprints: remove entries where store is dead OR
-        // the select_index is dead (not in any live select).
-        self.axiom_fingerprints.retain(|&(store, select_index)| {
-            self.store_cache.contains_key(&store) && live_select_indices.contains(&select_index)
-        });
-
-        // GC row2_fingerprint_indices: remove dead store keys entirely,
-        // and for live stores, remove dead select indices.
-        self.row2_fingerprint_indices.retain(|store, indices| {
-            if !self.store_cache.contains_key(store) {
-                return false;
-            }
-            indices.retain(|idx| live_select_indices.contains(idx));
-            !indices.is_empty()
-        });
-
-        // Shrink allocations if GC removed significant entries.
+        // One rebuild applies the live store/select check and reconstructs
+        // both direct-index views from actual pending/blocked work.
+        self.rebuild_row2_down_work();
         let removed_fp = pre_fp.saturating_sub(self.axiom_fingerprints.len());
         let removed_idx = pre_idx.saturating_sub(self.row2_fingerprint_indices.len());
+        let removed_work = pre_work.saturating_sub(self.row2_down_work.len());
         if removed_fp > 64 || removed_idx > 16 {
             self.axiom_fingerprints.shrink_to_fit();
             self.row2_fingerprint_indices.shrink_to_fit();
         }
-
-        self.fingerprint_gc_removed += (removed_fp + removed_idx) as u64;
+        if removed_work > 64 {
+            self.row2_down_work.shrink_to_fit();
+        }
+        self.fingerprint_gc_removed = self
+            .fingerprint_gc_removed
+            .saturating_add(removed_fp.saturating_add(removed_idx) as u64);
     }
 }

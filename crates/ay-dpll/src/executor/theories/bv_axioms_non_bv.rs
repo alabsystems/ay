@@ -13,9 +13,9 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, Symbol, TermData, TermId};
-use std::sync::atomic::Ordering;
 
 use super::super::Executor;
+use super::CongruenceBail;
 
 /// Result of attempting to build argument-difference SAT variables (#5457).
 enum ArgDiffResult {
@@ -32,13 +32,15 @@ enum ArgDiffResult {
 pub(in crate::executor) struct NonBvCongruenceOutcome {
     /// Fresh SAT variables allocated.
     pub(in crate::executor) num_vars: u32,
-    /// True when the all-pairs loop stopped early on interrupt / deadline /
-    /// memory pressure. PARTIAL congruence axioms are SOUND FOR UNSAT ONLY
-    /// (they are a subset of the full axiomatization): the caller MUST
-    /// degrade any subsequent CDCL SAT to Unknown while this flag is set —
-    /// a model found under the bailed axiomatization may violate an
-    /// unemitted congruence constraint (wrong-SAT class, 2026-06-20 hunt).
-    pub(in crate::executor) bailed: bool,
+    /// Set when the all-pairs loop stopped early, with the stop its poll saw
+    /// (interrupt / deadline / memory pressure). PARTIAL congruence axioms
+    /// are SOUND FOR UNSAT ONLY (they are a subset of the full
+    /// axiomatization): the caller MUST degrade any subsequent CDCL SAT to
+    /// Unknown while this is set — a model found under the bailed
+    /// axiomatization may violate an unemitted congruence constraint
+    /// (wrong-SAT class, 2026-06-20 hunt) — and publishes that Unknown as
+    /// the stop, never as `incomplete` ([`CongruenceBail`]).
+    pub(in crate::executor) bail: Option<CongruenceBail>,
 }
 
 /// Poll cadence for the pair-loop interrupt check: every 1024 pairs.
@@ -73,10 +75,10 @@ impl Executor {
         extra_terms: &[TermId],
     ) -> NonBvCongruenceOutcome {
         #[cfg(test)]
-        if self.test_force_non_bv_congruence_bail {
+        if let Some(bail) = self.test_non_bv_congruence_bail_now() {
             return NonBvCongruenceOutcome {
                 num_vars: 0,
-                bailed: true,
+                bail: Some(bail),
             };
         }
 
@@ -134,7 +136,7 @@ impl Executor {
 
         let bv_offset = tseitin_result.num_vars;
         let mut next_var = var_offset + 1;
-        let mut bailed = false;
+        let mut bail = None;
         let mut pair_index: u64 = 0;
 
         'groups: for (_key, applications) in &uf_apps {
@@ -153,11 +155,11 @@ impl Executor {
                     // `all_clauses` (sound for UNSAT); the caller degrades
                     // SAT to Unknown via the returned flag.
                     pair_index += 1;
-                    if pair_index & CONGRUENCE_POLL_MASK == 0
-                        && self.non_bv_congruence_interrupted()
-                    {
-                        bailed = true;
-                        break 'groups;
+                    if pair_index & CONGRUENCE_POLL_MASK == 0 {
+                        if let Some(origin) = self.encoding_phase_stop() {
+                            bail = Some(CongruenceBail::Stop(origin));
+                            break 'groups;
+                        }
                     }
 
                     let (term1, args1) = &applications[i];
@@ -245,6 +247,48 @@ impl Executor {
                     if self.ctx.terms.sort(*term1) != self.ctx.terms.sort(*term2) {
                         continue;
                     }
+                    // Encodability pre-skip (#certora-dt-congruence-intern):
+                    // if some differing argument pair cannot encode a
+                    // difference, `build_arg_diff_vars` below returns
+                    // Unencodable and every section of this pair is
+                    // skipped — but only after the probe terms
+                    // (mk_eq/mk_not/mk_distinct over the results and each
+                    // argument pair) have been interned. Decide the same
+                    // question from existing maps first, interning
+                    // nothing: BV bits of equal nonzero width, a Bool
+                    // pair with BV-side literals, a consumed authored
+                    // equality/distinct atom over the pair, or an
+                    // already-interned equality atom carrying a Tseitin
+                    // variable. On Certora DT+BV instances the pair loop
+                    // runs over hundreds of datatype tester/selector
+                    // applications whose DT arguments are almost all
+                    // unencodable (measured: 839k pairs, millions of
+                    // probe interns, >1 GB allocator ceiling on a 17 KB
+                    // input z3 decides in <0.1 s). Skipping here is the
+                    // existing Unencodable outcome reached without the
+                    // interns; the residual gap — a Datatype/Real
+                    // `mk_eq` structural rewrite that itself carries a
+                    // Tseitin variable while no authored atom exists —
+                    // loses only optional congruence clauses, the same
+                    // completeness-only class as the Unencodable skip.
+                    let args_encodable = args1.iter().zip(args2.iter()).all(|(a1, a2)| {
+                        a1 == a2
+                            || (self.ctx.terms.sort(*a1) == self.ctx.terms.sort(*a2)
+                                && ((term_bits.get(a1).is_some_and(|b| !b.is_empty())
+                                    && term_bits.get(a2).is_some_and(|b| !b.is_empty())
+                                    && term_bits[a1].len() == term_bits[a2].len())
+                                    || (matches!(self.ctx.terms.sort(*a1), Sort::Bool)
+                                        && bool_to_var.contains_key(a1)
+                                        && bool_to_var.contains_key(a2))
+                                    || consumed_pairs.contains(&ordered(*a1, *a2))
+                                    || self.ctx.terms.find_eq(*a1, *a2).is_some_and(|eq| {
+                                        tseitin_result.var_for_term(eq).is_some()
+                                    })))
+                    });
+                    if !args_encodable {
+                        continue;
+                    }
+
                     // Hoisted pre-filter (item 4 Stage 2): reject
                     // consumer-less pairs BEFORE interning the three probe
                     // terms. Small groups and Real-/Datatype-sorted pairs
@@ -455,19 +499,8 @@ impl Executor {
 
         NonBvCongruenceOutcome {
             num_vars: next_var.saturating_sub(var_offset + 1),
-            bailed,
+            bail,
         }
-    }
-
-    /// Pair-loop poll for [`Self::generate_non_bv_euf_congruence`]:
-    /// API interrupt flag, live solve deadline, or process memory ceiling.
-    fn non_bv_congruence_interrupted(&self) -> bool {
-        if let Some(flag) = self.solve_interrupt.as_ref() {
-            if flag.load(Ordering::Relaxed) {
-                return true;
-            }
-        }
-        self.solve_deadline.expired() || ay_sys::process_memory_exceeded()
     }
 
     /// Build argument-difference SAT variables for a pair of UF applications.

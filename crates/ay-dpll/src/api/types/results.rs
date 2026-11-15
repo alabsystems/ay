@@ -7,7 +7,7 @@
 use ay_sat::proof_certificate::ProofCertificate;
 use ay_sat::SatResult;
 
-use crate::executor::{SatCertificate, UnsatCertificate};
+use crate::executor::{SatCertificate, UnsatCertificate, UnsatEvidenceLevel};
 
 /// SMT-level proof certificate wrapping the SAT-level [`ProofCertificate`].
 ///
@@ -235,12 +235,19 @@ pub struct VerifiedSolveResult {
     /// Records the strict checker claim separately for diagnostics. This bit
     /// can be set only by consuming the strict exact-query token.
     unsat_strictly_verified: bool,
-    /// Records an independently checked SAT-refutation or fully discharged
-    /// trust-family proof separately from literal strict-checker acceptance.
+    /// Records an independently checked SAT-refutation separately from
+    /// literal strict-checker acceptance.
     unsat_independently_verified: bool,
     /// Records the narrow exact semantic theorem lane separately from strict
     /// proof checking. This is never inferred from an empty proof payload.
     unsat_exact_semantically_verified: bool,
+    /// Records a `discharged-trust` admission (directly or through an exact
+    /// theorem sealing one): the refutation's holes were corroborated by AY
+    /// re-running its own code, evidence E1. Disjoint from the three classes
+    /// above (evidence policy P4, 2026-10-02).
+    unsat_corroborated: bool,
+    /// The evidence level of a certified UNSAT; `None` for every other result.
+    unsat_evidence_level: Option<UnsatEvidenceLevel>,
 }
 
 impl VerifiedSolveResult {
@@ -255,6 +262,8 @@ impl VerifiedSolveResult {
             unsat_strictly_verified: false,
             unsat_independently_verified: false,
             unsat_exact_semantically_verified: false,
+            unsat_corroborated: false,
+            unsat_evidence_level: None,
         }
     }
 
@@ -270,8 +279,7 @@ impl VerifiedSolveResult {
     /// token deliberately carries ZERO classes — it is scope-authenticated but
     /// backed by no checked refutation — and it cannot reach this constructor
     /// today: `api::Solver` exposes no competition setter, so the executor a
-    /// native solve drives never sheds (pinned by the
-    /// `native_api_surface_has_no_competition_exposure` census). Should a
+    /// native solve drives never sheds. Should a
     /// future change expose competition mode on the native API boundary, a
     /// zero-class token must NOT yield a certified result: this constructor
     /// fails closed to the non-verified `Unknown` classification (no definite
@@ -286,9 +294,11 @@ impl VerifiedSolveResult {
         let unsat_strictly_verified = certificate.strict_proof_verified();
         let unsat_independently_verified = certificate.independently_verified();
         let unsat_exact_semantically_verified = certificate.exact_semantic_verified();
+        let unsat_corroborated = certificate.rests_on_corroboration();
         let verification_classes = usize::from(unsat_strictly_verified)
             + usize::from(unsat_independently_verified)
-            + usize::from(unsat_exact_semantically_verified);
+            + usize::from(unsat_exact_semantically_verified)
+            + usize::from(unsat_corroborated);
         if verification_classes == 0 {
             // A zero-class token is the shed-mode raw admission (or a future
             // kind that likewise declines every verification probe). It is
@@ -305,6 +315,8 @@ impl VerifiedSolveResult {
             unsat_strictly_verified,
             unsat_independently_verified,
             unsat_exact_semantically_verified,
+            unsat_corroborated,
+            unsat_evidence_level: Some(certificate.evidence().level()),
         }
     }
 
@@ -319,6 +331,8 @@ impl VerifiedSolveResult {
             unsat_strictly_verified: false,
             unsat_independently_verified: false,
             unsat_exact_semantically_verified: false,
+            unsat_corroborated: false,
+            unsat_evidence_level: None,
         }
     }
 
@@ -345,6 +359,8 @@ impl VerifiedSolveResult {
             unsat_strictly_verified: false,
             unsat_independently_verified: false,
             unsat_exact_semantically_verified: false,
+            unsat_corroborated: false,
+            unsat_evidence_level: None,
         }
     }
 
@@ -391,12 +407,33 @@ impl VerifiedSolveResult {
     }
 
     /// Whether this UNSAT result was established by an independently checked
-    /// SAT-level refutation or by complete discharge of the proof's trust-family
-    /// steps, after the ordinary strict checker declined that proof.
+    /// SAT-level refutation after the ordinary strict checker declined the
+    /// proof. A `discharged-trust` admission is not one: see
+    /// [`Self::was_unsat_corroborated`]. This names the admission CLASS; a
+    /// replayed refutation one of whose `Generic` theory premises only AY's own
+    /// semantic-conflict verifier re-derived is still this class, but its
+    /// evidence is E1, which [`Self::unsat_evidence_level`] reports.
     #[inline]
     #[must_use]
     pub fn was_unsat_independently_verified(&self) -> bool {
         self.unsat_independently_verified
+    }
+
+    /// Whether this UNSAT result was admitted as `discharged-trust`: the
+    /// refutation's unproved steps were corroborated by AY re-running its own
+    /// code (a standalone-tautology re-check or a fresh re-solve), evidence
+    /// E1 — a reproduction, not an independent check.
+    #[inline]
+    #[must_use]
+    pub fn was_unsat_corroborated(&self) -> bool {
+        self.unsat_corroborated
+    }
+
+    /// The evidence level of a certified UNSAT result, `None` otherwise.
+    #[inline]
+    #[must_use]
+    pub fn unsat_evidence_level(&self) -> Option<UnsatEvidenceLevel> {
+        self.unsat_evidence_level
     }
 
     /// Whether this UNSAT result was established by the narrow, independently

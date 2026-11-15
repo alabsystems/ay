@@ -1,0 +1,38 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: lenient-header-counts
+% Regression test: the DIMACS CNF parser returned the variable count the `p cnf`
+% header DECLARES rather than the size of the variable space the file uses.
+% `src/lib.rs` sizes the variable-name table from that number (`x1..xN`), the
+% checker sizes its propagation `Assignment` from the table, and
+% `Assignment::{get,set}_lit_value_unchecked` then index a literal read straight
+% from the file with `get_unchecked`. Here the header declares one variable and
+% the file names variable 5, so every read of that literal was out of bounds --
+% undefined behaviour on the accept/reject path -- and, separately, the proof's
+% own `x5` interned as a different variable altogether, because the name table
+% had no slot at index 5.
+%
+% The formula is `(x5)`, whose only solution sets x5 true. This proof logs the
+% falsifying solution `~x5` and concludes SAT from it, so it must be rejected.
+% Before the fix this tree's release build printed `s VERIFIED SATISFIABLE` and
+% exited 0. Being undefined behaviour, the outcome was not even stable: the
+% byte-identical upstream parser at `4bb10c2c` rejects the same input, and the
+% `p cnf 1 2 / 5 0 / -5 0` spelling returns the right verdict by accident. The
+% companion `correct/version3/cnf_under_declared_counts_lenient` is that second
+% spelling, and pins that it still verifies.
+%
+% The instance carries `lenient-header-counts` because the strict header check
+% is what keeps this out of reach under default flags; the sizing fix is
+% independent of that flag, as it must be.
+%
+% It deliberately does NOT carry the wrong-verdict header marker that
+% `tests/defect_table.rs` requires a numbered README row for (the exact phrase
+% is spelled in that test), even though this tree did print a wrong verdict for
+% it. The table's claim is that every
+% numbered defect reproduces against a clean build of upstream `4bb10c2c`, and
+% this one cannot make that claim: the behaviour is undefined, so the verdict
+% is a property of the build rather than of the source. It is written up in
+% full in README.md's `--lenient-header-counts` bullet instead.
+sol ~x5;
+output NONE;
+conclusion SAT : ~x5;
+end pseudo-Boolean proof;

@@ -39,6 +39,11 @@ impl<T: TheorySolver> DpllT<'_, T> {
                     .as_ref()
                     .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                     || ctrl_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    // Portfolio lane memory share: cancels only the lane's own
+                    // token, which the interrupt handle does not observe.
+                    || ay_sys::current_memory_group_soft_tripped()
+                    // A counted work grant stops this loop like a deadline.
+                    || ay_core::resource::work_grant_spent()
             }
         };
         loop {
@@ -51,6 +56,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 return Ok(AssumeResult::Unknown);
             }
             self.timings.round_trips += 1;
+            ay_core::resource::work().note_round_trip();
             let round = self.timings.round_trips;
 
             let sat_start = Instant::now();

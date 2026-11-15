@@ -5,7 +5,8 @@
 #
 # The wheel BUNDLES the AY C ABI shared library (libay_ffi.{dylib,so}) inside
 # the `ayz3/` package directory. The bundling happens in setup.py's custom
-# build_py step, which runs `cargo build -p ay-ffi --release` and copies the
+# build_py step, which runs `targo --unverified build -p ay-ffi --release` (Trust
+# toolchain on PATH) or `cargo build -p ay-ffi --release` and copies the
 # cdylib into the package before the wheel is assembled. See setup.py.
 #
 # Build a wheel for the current platform with:   python -m build --wheel
@@ -41,7 +42,7 @@ dependencies = []
 [project.optional-dependencies]
 # Match the recorded reference version named in this repository's differential
 # tests. The ordinary ayz3 wheel remains dependency-free.
-dev = ["pytest>=8", "z3-solver==5.1.0.0"]
+dev = ["pytest>=8", "z3-solver==5.3.3.0"]
 
 [project.urls]
 Homepage = "https://github.com/alabsystems/ay"

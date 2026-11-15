@@ -1,0 +1,48 @@
+pseudo-Boolean proof version 3.0
+% A checked deletion MAY carry a witness while an order is loaded, and this
+% instance pins that. `proof_format_overview.md` used to say the substitution
+% has to be empty whenever an order is loaded or strengthening-to-core is on;
+% only the strengthening-to-core half is a real side condition, because there
+% `DeletionChecker` generates no substituted proofgoals at all. Under a loaded
+% order it generates them, including the order's own goals: `delc` calls
+% `ActiveOrder::get_proofgoals` exactly as `red` does, so the witness owes
+% `O(z|w, z)` -- it may not worsen the order. Banning the witness here would
+% reject sound proofs; the twin instance
+% `incorrect/version3/checked_deletion_witness_worsens_order.pbp` is the same
+% proof with a witness that does worsen the order, and is refused.
+%
+% The order is `v1 >= u1`, so a witness may only lower x1. `x1 -> 0 x2 -> 1`
+% lowers it, and every goal holds: from `1 x3 >= 1` and the negation of the
+% deleted `1 x1 1 x2 >= 1` (i.e. x1 = x2 = 0), the witnessed assignment
+% (0, 1, 1) satisfies both original constraints and the order goal
+% `-0 + x1 >= 0` is trivially true.
+f 2;
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux;
+    end;
+    def
+        -1 u1 1 v1 >= 0;
+    end;
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+            proofgoal #1
+                pol -2 -3 + -1 +;
+            qed : -1;
+        qed;
+    end;
+end;
+load_order simple x1;
+% Put something in the derived set, so that a failed checked deletion could not
+% quietly fall back to unchecked deletion: the acceptance below is the checked
+% path and nothing else.
+pol 1 2 +;
+delc 1 : x1 -> 0 x2 -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

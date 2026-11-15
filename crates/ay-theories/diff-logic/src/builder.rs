@@ -29,8 +29,11 @@ pub enum BuildResult<W> {
     /// edge list; use [`crate::graph::DiffGraph`] directly if you need the edge
     /// detail. Here it is reported as the count for convenience.
     Unsat { cycle_len: usize },
-    /// At least one atom was not a pure difference-logic atom; the system was
-    /// rejected (fail-closed) and nothing was decided.
+    /// At least one atom was not a pure difference-logic atom, or the system
+    /// is beyond the engine's limits (a variable index too large for the
+    /// implicit zero variable to follow it, or [`crate::graph::VAR_LIMIT`] or
+    /// more vertices); the system was rejected (fail-closed) and nothing was
+    /// decided.
     Rejected,
 }
 
@@ -43,15 +46,27 @@ fn max_var<W>(atoms: &[DiffAtom<W>]) -> Option<usize> {
         .max()
 }
 
+/// The implicit zero variable (`max + 1`, or `0` when no atom names a
+/// variable) and the vertex count (`zero_var + 1`), or `None` when the largest
+/// variable index leaves no room for them.
+fn zero_var_and_count<W>(atoms: &[DiffAtom<W>]) -> Option<(usize, usize)> {
+    let zero_var = match max_var(atoms) {
+        Some(m) => m.checked_add(1)?,
+        None => 0,
+    };
+    let n_vars = zero_var.checked_add(1)?;
+    Some((zero_var, n_vars))
+}
+
 /// Build and check an integer / IDL system. Variables are `0..=max`; the zero
 /// variable is `max+1` internally.
 pub fn solve_int_atoms<W>(atoms: &[DiffAtom<W>]) -> BuildResult<W>
 where
     W: IntWeight + Negate,
 {
-    let max = max_var(atoms);
-    let zero_var = max.map_or(0, |m| m + 1);
-    let n_vars = zero_var + 1;
+    let Some((zero_var, n_vars)) = zero_var_and_count(atoms) else {
+        return BuildResult::Rejected;
+    };
     let mut g = DiffGraph::<W>::new(n_vars);
 
     for a in atoms {
@@ -75,18 +90,25 @@ where
 {
     match g.check() {
         DiffResult::Sat { model } => {
-            // Shift so zero_var reads 0, then drop it.
-            let shift = model[zero_var].clone();
-            let neg_shift = shift.negate();
-            let real: Vec<W> = model[..zero_var]
-                .iter()
-                .map(|v| v.add(&neg_shift))
-                .collect();
+            // Shift so zero_var reads 0, then drop it. The model has one entry
+            // per vertex and zero_var is the last vertex, so both reads exist;
+            // a model without them is refused rather than trusted.
+            let (Some(shift), Some(real_part)) = (model.get(zero_var), model.get(..zero_var))
+            else {
+                return BuildResult::Rejected;
+            };
+            // A shift with no negation in the weight's width (`i64::MIN`)
+            // cannot be subtracted: refuse rather than report a wrong model.
+            let Some(neg_shift) = shift.negate() else {
+                return BuildResult::Rejected;
+            };
+            let real: Vec<W> = real_part.iter().map(|v| v.add(&neg_shift)).collect();
             BuildResult::Sat { model: real }
         }
         DiffResult::Unsat { cycle } => BuildResult::Unsat {
             cycle_len: cycle.len(),
         },
+        DiffResult::Refused => BuildResult::Rejected,
     }
 }
 
@@ -96,9 +118,9 @@ where
 /// potentials are realized into concrete rationals using a safe `δ` chosen by
 /// [`pick_delta_from_slacks`].
 pub fn solve_rational_atoms(atoms: &[DiffAtom<BigRational>]) -> BuildResult<BigRational> {
-    let max = max_var(atoms);
-    let zero_var = max.map_or(0, |m| m + 1);
-    let n_vars = zero_var + 1;
+    let Some((zero_var, n_vars)) = zero_var_and_count(atoms) else {
+        return BuildResult::Rejected;
+    };
     let mut g = DiffGraph::<RStar>::new(n_vars);
 
     for a in atoms {
@@ -117,25 +139,34 @@ pub fn solve_rational_atoms(atoms: &[DiffAtom<BigRational>]) -> BuildResult<BigR
             // Choose δ from the *actual constraint slacks* so realizing ε := δ
             // keeps every (possibly strict) constraint satisfied. For edge
             // from→to : w the slack is dist[from] + w − dist[to], an R*-nonneg
-            // value (g, k); see pick_delta_from_slacks.
-            let slacks: Vec<(BigRational, i64)> = g
-                .edges()
-                .iter()
-                .map(|e| {
-                    let s = Weight::add(&model[e.from], &e.weight);
-                    // s − model[e.to]
-                    (&s.q - &model[e.to].q, s.eps - model[e.to].eps)
-                })
-                .collect();
+            // value (g, k); see pick_delta_from_slacks. An endpoint missing
+            // from the model, or an ε-count difference outside i64, is refused
+            // rather than realized with a wrong δ.
+            let mut slacks: Vec<(BigRational, i64)> = Vec::new();
+            for e in g.edges() {
+                let (Some(from), Some(to)) = (model.get(e.from), model.get(e.to)) else {
+                    return BuildResult::Rejected;
+                };
+                let s = Weight::add(from, &e.weight);
+                // s − model[e.to]
+                let Some(eps) = s.eps.checked_sub(to.eps) else {
+                    return BuildResult::Rejected;
+                };
+                slacks.push((&s.q - &to.q, eps));
+            }
             let delta = pick_delta_from_slacks(&slacks);
             let realized: Vec<BigRational> = model.iter().map(|r| r.realize_with(&delta)).collect();
-            let shift = realized[zero_var].clone();
-            let real: Vec<BigRational> = realized[..zero_var].iter().map(|v| v - &shift).collect();
+            let (Some(shift), Some(real_part)) = (realized.get(zero_var), realized.get(..zero_var))
+            else {
+                return BuildResult::Rejected;
+            };
+            let real: Vec<BigRational> = real_part.iter().map(|v| v - shift).collect();
             BuildResult::Sat { model: real }
         }
         DiffResult::Unsat { cycle } => BuildResult::Unsat {
             cycle_len: cycle.len(),
         },
+        DiffResult::Refused => BuildResult::Rejected,
     }
 }
 
@@ -210,5 +241,28 @@ mod tests {
             solve_rational_atoms(&atoms),
             BuildResult::Unsat { .. }
         ));
+    }
+
+    #[test]
+    fn variable_index_with_no_room_for_the_zero_variable_is_rejected() {
+        // `max + 1` (the zero variable) or `zero_var + 1` (the vertex count)
+        // overflowed here; the system is now rejected, not decided.
+        for v in [usize::MAX, usize::MAX - 1] {
+            let int = vec![DiffAtom::diff(v, 0, Op::Le, 1i64)];
+            assert!(matches!(solve_int_atoms(&int), BuildResult::Rejected));
+            let rat = vec![ratom(v, 0, Op::Le, 1, 1)];
+            assert!(matches!(solve_rational_atoms(&rat), BuildResult::Rejected));
+        }
+    }
+
+    #[test]
+    fn system_at_the_vertex_limit_is_rejected() {
+        // Variable `VAR_LIMIT` makes the zero variable `VAR_LIMIT + 1` and the
+        // vertex count `VAR_LIMIT + 2`: refused by the graph, rejected here.
+        let v = crate::graph::VAR_LIMIT;
+        let int = vec![DiffAtom::diff(v, 0, Op::Le, 1i64)];
+        assert!(matches!(solve_int_atoms(&int), BuildResult::Rejected));
+        let rat = vec![ratom(v, 0, Op::Le, 1, 1)];
+        assert!(matches!(solve_rational_atoms(&rat), BuildResult::Rejected));
     }
 }

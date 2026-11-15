@@ -68,6 +68,7 @@ fn parse(smt: &str) -> ay_chc::ChcProblem {
 
 #[test]
 fn g2_to_pdr_config_matches_production_profile() {
+    assert_eq!(EncodeConfig::new().pdr_max_frames, None);
     // The timeout maps onto `solve_timeout`; every other technique toggle must
     // match `PdrConfig::production(false)` (NOT `default()`), which is the
     // behavior-preservation requirement.
@@ -105,6 +106,32 @@ fn g2_to_pdr_config_matches_production_profile() {
         cfg.max_frames, default.max_frames,
         "to_pdr_config must NOT be the default profile"
     );
+}
+
+#[test]
+fn pdr_frame_cap_forwards_exact_values_and_survives_clone() {
+    let timeout = Duration::from_secs(7);
+    let base = EncodeConfig::new()
+        .with_proof_mode(ProofMode::Strict)
+        .with_timeout(timeout)
+        .with_memory_budget(1234)
+        .with_effort(17);
+    let original = base.to_pdr_config();
+    for frames in [0, 1, 1234, usize::MAX] {
+        let config = base.clone().with_pdr_max_frames(frames);
+        let converted = config.clone().to_pdr_config();
+        assert_eq!(config.pdr_max_frames, Some(frames));
+        assert_eq!(converted.max_frames, frames);
+        assert_eq!(converted.max_iterations, original.max_iterations);
+        assert_eq!(converted.max_obligations, original.max_obligations);
+        assert_eq!(converted.solve_timeout, Some(timeout));
+        assert_eq!(converted.memory_budget(), Some(1234));
+        assert_eq!(converted.effort, Some(17));
+    }
+    assert_eq!(base.pdr_max_frames, None);
+    let mut cleared = base.clone().with_pdr_max_frames(1);
+    cleared.pdr_max_frames = None;
+    assert_eq!(cleared.to_pdr_config().max_frames, original.max_frames);
 }
 
 // --- G1: strict-validation knob on the adaptive/portfolio path ---------------
@@ -551,6 +578,80 @@ fn solve_with_proof_certificate_is_bound_and_coherent() {
 }
 
 #[test]
+fn a_proof_run_passes_its_metered_work_through() {
+    let config = EncodeConfig::new()
+        .with_proof_mode(ProofMode::Strict)
+        .with_timeout(Duration::from_secs(30));
+    let run = solve_with_proof(parse(SAFE_CHC), &config).expect("solve_with_proof should run");
+    let work = *run.work().expect("a proof run is metered");
+    assert!(
+        work.smt_entries > 0,
+        "PDR checks this cyclic fixture: {work:?}"
+    );
+    assert!(
+        work.ticks
+            >= work.sat_ticks
+                + work.smt_entries
+                + work.theory_rounds
+                + work.pdr_iterations
+                + work.obligations,
+        "its ticks hold its own charges (equal to them before GuardTree S6, \
+         which adds the ticks of executor sub-checks): {work:?}"
+    );
+    assert!(
+        matches!(
+            run.verdict(),
+            AyVerdict::Proved {
+                certificate: Some(_),
+                ..
+            }
+        ),
+        "the run's verdict is `solve`'s Strict verdict, certificate included"
+    );
+    let report = solve_with_proof_report(parse(SAFE_CHC), &config).expect("report run");
+    assert!(report.proof_run().work().is_some());
+}
+
+#[test]
+fn an_effort_reaches_the_proof_run_and_the_portfolio_refuses_it() {
+    let config = EncodeConfig::new().with_timeout(Duration::from_secs(30));
+    assert_eq!(config.to_pdr_config().effort, None, "no effort by default");
+    let config = config
+        .with_effort(1_000_000_000)
+        .with_proof_mode(ProofMode::Strict);
+    assert_eq!(config.to_pdr_config().effort, Some(1_000_000_000));
+    let run = solve_with_proof(parse(SAFE_CHC), &config).expect("solve_with_proof should run");
+    let work = *run.work().expect("a proof run is metered");
+    assert_eq!(
+        (work.effort, work.stop),
+        (Some(1_000_000_000), None),
+        "the run decided within its budget: {work:?}"
+    );
+    assert!(run.accepted_as_proof(), "{work:?}");
+    let tight = config.clone().with_effort(1);
+    let run = solve_with_proof(parse(SAFE_CHC), &tight).expect("solve_with_proof should run");
+    let work = *run.work().expect("a proof run is metered");
+    assert_eq!(
+        work.stop,
+        Some(ay_core::resource::Exhausted::Rlimit),
+        "one tick stops the run on its count: {work:?}"
+    );
+    assert!(!run.accepted_as_proof());
+    let portfolio = config.with_proof_mode(ProofMode::None);
+    assert!(
+        matches!(
+            solve(parse(SAFE_CHC), &portfolio),
+            Err(crate::EncodeError::Unimplemented(_))
+        ),
+        "the portfolio has no count to honour an effort with"
+    );
+    assert!(matches!(
+        solve_with_proof_report(parse(SAFE_CHC), &portfolio),
+        Err(crate::EncodeError::Unimplemented(_))
+    ));
+}
+
+#[test]
 fn unknown_reason_normalization_remains_one_to_one() {
     use ay_chc::VerifiedUnknownReason;
 
@@ -581,5 +682,54 @@ fn unknown_reason_normalization_remains_one_to_one() {
         ),
     ] {
         assert_eq!(UnknownReason::from(source), expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust superproject b62 lineage (ay-chc Unknown-cause split, 1198f48100):
+// additive coverage for behaviour this branch already implements. Carried when
+// the lineage was merged into main; every production symbol these exercise was
+// already here, so these only pin it.
+// ---------------------------------------------------------------------------
+/// `UnknownReason` is documented as a 1:1 normalization of
+/// `ay_chc::VerifiedUnknownReason`. The wildcard arm in the `From` impl exists
+/// only for reasons a FUTURE ay-chc adds; every reason that exists today must
+/// have an explicit arm, or the frontends silently see `Inconclusive` and the
+/// split is lost at the crate boundary.
+#[test]
+fn unknown_reason_normalization_is_one_to_one() {
+    use ay_chc::VerifiedUnknownReason;
+
+    for (ay_reason, expected) in [
+        (
+            VerifiedUnknownReason::Inconclusive,
+            UnknownReason::Inconclusive,
+        ),
+        (
+            VerifiedUnknownReason::BmcExhaustedSearch,
+            UnknownReason::BmcExhaustedSearch,
+        ),
+        (
+            VerifiedUnknownReason::BmcBudgetExhausted,
+            UnknownReason::BmcBudgetExhausted,
+        ),
+        (
+            VerifiedUnknownReason::NotApplicable,
+            UnknownReason::NotApplicable,
+        ),
+        (
+            VerifiedUnknownReason::OverApproximatedRefutation,
+            UnknownReason::OverApproximatedRefutation,
+        ),
+        (
+            VerifiedUnknownReason::CandidateNotAdmitted,
+            UnknownReason::CandidateNotAdmitted,
+        ),
+    ] {
+        assert_eq!(
+            UnknownReason::from(ay_reason),
+            expected,
+            "{ay_reason:?} must normalize to its own bucket, not the catch-all"
+        );
     }
 }

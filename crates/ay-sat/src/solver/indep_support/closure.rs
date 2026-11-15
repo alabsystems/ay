@@ -11,19 +11,14 @@
 use super::*;
 
 impl Solver {
-    /// The support proper. `None` = no restriction (bailed, unverified, or
-    /// not a meaningful reduction). Immutable on search state.
-    pub(in crate::solver) fn compute_indep_support(&mut self) -> Option<Vec<u32>> {
+    /// Classify variables at the root: `(fixed, decidable)`. Root-fixed
+    /// variables are constants for the rest of the solve; eliminated
+    /// variables are neither (they are reconstructed only after SAT, so no
+    /// definition depending on one can fire under BCP during search).
+    pub(in crate::solver) fn classify_root_vars(&self) -> (Vec<bool>, Vec<bool>) {
         let num_vars = self.num_vars;
-
-        // Root-fixed variables are constants for the rest of the solve: they
-        // never need a decision and they are legitimate inputs to a
-        // definition. Eliminated variables are NOT available during search
-        // (they are reconstructed only after SAT), so a definition that
-        // depends on one cannot fire under BCP — those are excluded below.
         let mut fixed = vec![false; num_vars];
         let mut decidable = vec![false; num_vars];
-        let mut decidable_count = 0usize;
         for idx in 0..num_vars {
             if self.var_lifecycle.is_removed(idx) {
                 continue;
@@ -33,8 +28,16 @@ impl Solver {
                 continue;
             }
             decidable[idx] = true;
-            decidable_count += 1;
         }
+        (fixed, decidable)
+    }
+
+    /// The support proper. `None` = no restriction (bailed, unverified, or
+    /// not a meaningful reduction). Immutable on search state.
+    pub(in crate::solver) fn compute_indep_support(&mut self) -> Option<Vec<u32>> {
+        let num_vars = self.num_vars;
+        let (fixed, decidable) = self.classify_root_vars();
+        let decidable_count = decidable.iter().filter(|&&d| d).count();
         self.stats.indep_support_decidable_vars = decidable_count as u64;
         if decidable_count == 0 {
             return None;
@@ -42,7 +45,7 @@ impl Solver {
 
         let graph = self.collect_definitions(num_vars, &decidable, &fixed)?;
         self.stats.indep_support_gates = graph.defs.len() as u64;
-        if graph.defs.is_empty() {
+        if graph.defs.is_empty() && graph.ge_exprs.is_empty() {
             return None;
         }
 
@@ -60,15 +63,27 @@ impl Solver {
                 best = Some(support);
             }
         }
-        let support = best?;
 
         // Completeness check for THIS gate set: replay the definitions from
         // the support exactly as BCP would and require every decidable
         // variable to come out. A support that does not close is refused.
-        if !Self::verify_closure(num_vars, &graph, &support, &decidable, &fixed) {
-            self.stats.indep_support_closure_rejected += 1;
-            return None;
+        // The GE candidate (below) is verified against the definitions plus
+        // its basis expressions, which are functional determinations of the
+        // same shape (pivot := XOR of free inputs).
+        let mut candidates: Vec<Vec<u32>> = Vec::new();
+        if let Some(greedy) = best {
+            if Self::verify_closure(num_vars, &graph, &greedy, &decidable, &fixed) {
+                candidates.push(greedy);
+            } else {
+                self.stats.indep_support_closure_rejected += 1;
+            }
         }
+        if !graph.ge_exprs.is_empty() {
+            if let Some(ge) = Self::ge_candidate(num_vars, &graph, &decidable, &fixed) {
+                candidates.push(ge);
+            }
+        }
+        let support = candidates.into_iter().min_by_key(Vec::len)?;
 
         // Restriction policy: small in absolute terms AND a real reduction.
         if support.is_empty()
@@ -90,9 +105,18 @@ impl Solver {
         fixed: &[bool],
     ) -> Option<DefinitionGraph> {
         let gates = self.recover_gates(num_vars)?;
-        Some(Self::reduce_to_definitions(
-            &gates, num_vars, decidable, fixed,
-        ))
+        // GE basis over the same gates, before reduction drops the signs
+        // the equations are read from (`ge.rs` module docs).
+        let basis = ge::build_ge_basis(&gates, decidable, fixed, |v| {
+            self.lit_value(Literal::positive(Variable(v)))
+        });
+        let mut graph = Self::reduce_to_definitions(&gates, num_vars, decidable, fixed);
+        if let Some(basis) = basis {
+            self.stats.indep_support_ge_free_vars = basis.free.len() as u64;
+            graph.ge_free = basis.free;
+            graph.ge_exprs = basis.exprs;
+        }
+        Some(graph)
     }
 
     /// Run both gate extractors over the irredundant clause database.
@@ -102,6 +126,12 @@ impl Solver {
         let mut marks = LitMarks::new(num_vars.max(1));
         let mut effort_spent = 0u64;
         let extract_start = ay_core::time::Instant::now();
+        // Under `--sat-deterministic-inproc` the 2 s wall is counted work: the
+        // XOR group pass is bounded by its effort budget, and the per-pivot
+        // loop by `det_work`, which adds the clause visits of the unfiltered
+        // ITE base-pair scan that `effort_spent` does not charge.
+        let det = self.deterministic_inproc();
+        let mut det_work = 0u64;
         let frozen = vec![false; num_vars];
 
         // Clause-driven XOR group pass: one gate per group variable as
@@ -113,7 +143,11 @@ impl Solver {
             &mut effort_spent,
             INDEP_SUPPORT_EXTRACT_EFFORT,
             extract_start,
-            INDEP_SUPPORT_EXTRACT_BUDGET_MS,
+            if det {
+                u128::MAX
+            } else {
+                INDEP_SUPPORT_EXTRACT_BUDGET_MS
+            },
             &mut gates,
         );
 
@@ -125,17 +159,24 @@ impl Solver {
             }
             if var_idx & 0x3FF == 0
                 && var_idx > 0
-                && extract_start.elapsed().as_millis() >= INDEP_SUPPORT_EXTRACT_BUDGET_MS
+                && if det {
+                    det_work >= crate::determinism::GATE_EXTRACT_DET_WORK_BUDGET
+                } else {
+                    extract_start.elapsed().as_millis() >= INDEP_SUPPORT_EXTRACT_BUDGET_MS
+                }
             {
                 break;
             }
-            let pos = &occ.ranges[var_idx * 2];
-            let neg = &occ.ranges[var_idx * 2 + 1];
+            // `occ.ranges` holds `2 * num_vars` slots (`build_occurrences`),
+            // so both lookups succeed; an unmappable slot bails like a budget.
+            let pos_slot = var_idx.checked_mul(2)?;
+            let pos = occ.ranges.get(pos_slot)?;
+            let neg = occ.ranges.get(pos_slot.checked_add(1)?)?;
             if pos.is_empty() || neg.is_empty() {
                 continue;
             }
             effort_spent += (pos.len() + neg.len()) as u64;
-            if let Some(gate) = extractor.find_gate_for_congruence_with_marks(
+            let found = extractor.find_gate_for_congruence_with_marks(
                 Variable(var_idx as u32),
                 &self.arena,
                 &occ.pos[pos.clone()],
@@ -143,7 +184,13 @@ impl Solver {
                 false, // XOR handled by the clause-driven group pass
                 &[],
                 &mut marks,
-            ) {
+            );
+            if det {
+                det_work = det_work
+                    .saturating_add((pos.len() + neg.len()) as u64)
+                    .saturating_add(extractor.take_ite_scan_visits());
+            }
+            if let Some(gate) = found {
                 gates.push(gate);
             }
         }
@@ -162,25 +209,39 @@ impl Solver {
         decidable: &[bool],
         fixed: &[bool],
     ) -> DefinitionGraph {
-        let mut defs: Vec<Definition> = Vec::with_capacity(gates.len());
+        // Capacity is a hint (bounded by a fallible reservation): if it is
+        // refused, `push` grows the vector on demand.
+        let mut defs: Vec<Definition> = Vec::new();
+        let _ = defs.try_reserve(gates.len());
         let mut as_lhs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         let mut rhs_count: Vec<u32> = vec![0; num_vars];
         let mut seen_epoch: Vec<u32> = vec![0; num_vars];
         let mut epoch = 0u32;
         for gate in gates {
             let out = gate.output.index();
-            if out >= num_vars || !decidable[out] {
+            if out >= num_vars || decidable.get(out) != Some(&true) {
                 // A fixed or eliminated output needs no definition; a fixed
                 // one is already known, an eliminated one is not decided.
                 continue;
             }
-            epoch += 1;
-            let mut inputs: Vec<u32> = Vec::with_capacity(gate.inputs.len());
+            // Past u32::MAX gates, restart the epochs from a cleared stamp
+            // array: the stamps stay exact instead of colliding.
+            epoch = match epoch.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    seen_epoch.fill(0);
+                    1
+                }
+            };
+            let mut inputs: Vec<u32> = Vec::new();
+            let _ = inputs.try_reserve(gate.inputs.len());
             let mut usable = true;
             seen_epoch[out] = epoch; // self-reference guard: v ∉ inputs(v)
             for lit in &gate.inputs {
                 let iv = lit.variable().index();
-                if iv >= num_vars || (!decidable[iv] && !fixed[iv]) {
+                if iv >= num_vars
+                    || (decidable.get(iv) != Some(&true) && fixed.get(iv) != Some(&true))
+                {
                     // Eliminated input: the defining clauses no longer
                     // constrain the output during search.
                     usable = false;
@@ -214,6 +275,8 @@ impl Solver {
             defs,
             as_lhs,
             rhs_count,
+            ge_free: Vec::new(),
+            ge_exprs: Vec::new(),
         }
     }
 
@@ -232,26 +295,32 @@ impl Solver {
                 if v >= num_vars {
                     continue;
                 }
-                let slot = v * 2 + usize::from(!lit.is_positive());
-                counts[slot] += 1;
+                let slot = v
+                    .checked_mul(2)?
+                    .checked_add(usize::from(!lit.is_positive()))?;
+                let count = counts.get_mut(slot)?;
+                *count = count.checked_add(1)?;
                 if !lit.is_positive() {
-                    total_neg += 1;
+                    total_neg = total_neg.checked_add(1)?;
                 } else {
-                    total_pos += 1;
+                    total_pos = total_pos.checked_add(1)?;
                 }
             }
         }
-        let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(num_lits);
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        ranges.try_reserve_exact(num_lits).ok()?;
         let mut pos_at = 0usize;
         let mut neg_at = 0usize;
         for slot in 0..num_lits {
             let n = counts[slot] as usize;
             if slot % 2 == 0 {
-                ranges.push(pos_at..pos_at + n);
-                pos_at += n;
+                let end = pos_at.checked_add(n)?;
+                ranges.push(pos_at..end);
+                pos_at = end;
             } else {
-                ranges.push(neg_at..neg_at + n);
-                neg_at += n;
+                let end = neg_at.checked_add(n)?;
+                ranges.push(neg_at..end);
+                neg_at = end;
             }
         }
         debug_assert_eq!(pos_at, total_pos);
@@ -268,9 +337,11 @@ impl Solver {
                 if v >= num_vars {
                     continue;
                 }
-                let slot = v * 2 + usize::from(!lit.is_positive());
+                let slot = v
+                    .checked_mul(2)?
+                    .checked_add(usize::from(!lit.is_positive()))?;
                 let at = fill[slot];
-                fill[slot] = at + 1;
+                fill[slot] = at.checked_add(1)?;
                 if !lit.is_positive() {
                     neg_flat[at] = off;
                 } else {
@@ -293,12 +364,13 @@ impl Solver {
         decidable: &[bool],
     ) -> Vec<Vec<u32>> {
         let live: Vec<u32> = (0..num_vars)
-            .filter(|&v| decidable[v])
+            .filter(|&v| decidable.get(v) == Some(&true))
             .map(|v| v as u32)
             .collect();
+        // A sort key: a u32 count plus a list length never reaches u64::MAX.
         let incidence = |v: u32| -> u64 {
             let i = v as usize;
-            u64::from(graph.rhs_count[i]) + graph.as_lhs[i].len() as u64
+            u64::from(graph.rhs_count[i]).saturating_add(graph.as_lhs[i].len() as u64)
         };
 
         // Reverse-topological for a circuit CNF emitted in evaluation order:
@@ -338,11 +410,10 @@ impl Solver {
                 let def = &graph.defs[def_idx as usize];
                 // Every input must still be available as a source: either a
                 // root constant, or still a member of the candidate set.
-                if def
-                    .inputs
-                    .iter()
-                    .all(|&u| fixed[u as usize] || in_set[u as usize])
-                {
+                if def.inputs.iter().all(|&u| {
+                    // An input outside the vectors is never available.
+                    fixed.get(u as usize) == Some(&true) || in_set.get(u as usize) == Some(&true)
+                }) {
                     in_set[vi] = false;
                     break;
                 }
@@ -362,12 +433,79 @@ impl Solver {
         decidable: &[bool],
         fixed: &[bool],
     ) -> bool {
+        match Self::closure_known(num_vars, &graph.defs, &[], support, decidable, fixed) {
+            Some(known) => (0..num_vars)
+                .all(|v| decidable.get(v) != Some(&true) || known.get(v) == Some(&true)),
+            None => false,
+        }
+    }
+
+    /// The GE candidate support (DR-AY-SAT-GE-SUPPORT-20261111): the basis
+    /// free variables, plus every decidable variable the composed closure
+    /// (gate definitions + basis expressions) does not determine from them.
+    /// Verified against the same composed closure before it may compete
+    /// with the greedy support on size.
+    fn ge_candidate(
+        num_vars: usize,
+        graph: &DefinitionGraph,
+        decidable: &[bool],
+        fixed: &[bool],
+    ) -> Option<Vec<u32>> {
+        let known = Self::closure_known(
+            num_vars,
+            &graph.defs,
+            &graph.ge_exprs,
+            &graph.ge_free,
+            decidable,
+            fixed,
+        )?;
+        let mut candidate: Vec<u32> = graph.ge_free.clone();
+        for v in 0..num_vars {
+            if decidable.get(v) == Some(&true) && known.get(v) != Some(&true) {
+                candidate.push(v as u32);
+            }
+        }
+        candidate.sort_unstable();
+        candidate.dedup();
+        let verified = Self::closure_known(
+            num_vars,
+            &graph.defs,
+            &graph.ge_exprs,
+            &candidate,
+            decidable,
+            fixed,
+        )?;
+        if (0..num_vars).all(|v| decidable.get(v) != Some(&true) || verified.get(v) == Some(&true))
+        {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// Worklist closure over `defs` chained with `extra` definitions,
+    /// seeded by `support` plus root constants. Returns the known-variable
+    /// set, or `None` when a reservation fails (refuse, never guess).
+    fn closure_known(
+        num_vars: usize,
+        defs: &[Definition],
+        extra: &[Definition],
+        support: &[u32],
+        decidable: &[bool],
+        fixed: &[bool],
+    ) -> Option<Vec<bool>> {
         // Per-definition count of inputs not yet known.
-        let mut remaining: Vec<u32> = Vec::with_capacity(graph.defs.len());
+        // An unreservable definition count refuses the support (sound: the
+        // caller then applies no restriction).
+        let all: Vec<&Definition> = defs.iter().chain(extra.iter()).collect();
+        let mut remaining: Vec<u32> = Vec::new();
+        if remaining.try_reserve_exact(all.len()).is_err() {
+            return None;
+        }
         let mut known = vec![false; num_vars];
         let mut queue: Vec<u32> = Vec::new();
         for v in 0..num_vars {
-            if fixed[v] || !decidable[v] {
+            if fixed.get(v) == Some(&true) || decidable.get(v) != Some(&true) {
                 // Root constants are known; eliminated variables are not
                 // decided and carry no obligation.
                 known[v] = true;
@@ -380,7 +518,7 @@ impl Solver {
         }
         // `as_rhs` CSR built lazily here (only the verifier needs it).
         let mut rhs_head: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
-        for (def_idx, def) in graph.defs.iter().enumerate() {
+        for (def_idx, def) in all.iter().enumerate() {
             let unknown = def.inputs.iter().filter(|&&u| !known[u as usize]).count() as u32;
             remaining.push(unknown);
             for &u in &def.inputs {
@@ -399,7 +537,7 @@ impl Solver {
                 let d = def_idx as usize;
                 remaining[d] = remaining[d].saturating_sub(1);
                 if remaining[d] == 0 {
-                    let out = graph.defs[d].output as usize;
+                    let out = all[d].output as usize;
                     if !known[out] {
                         known[out] = true;
                         queue.push(out as u32);
@@ -407,6 +545,6 @@ impl Solver {
                 }
             }
         }
-        (0..num_vars).all(|v| !decidable[v] || known[v])
+        Some(known)
     }
 }

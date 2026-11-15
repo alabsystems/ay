@@ -162,13 +162,13 @@ fn test_fp_special_constants_reject_zero_precision() {
 fn test_fp_builders_reject_unrepresentable_or_unbounded_precision() {
     let mut solver = Solver::try_new(Logic::QfBvfp).unwrap();
     for result in [
-        solver.try_fp_plus_infinity(32, 24),
+        solver.try_fp_plus_infinity(64, 24),
         solver.try_fp_nan(8, (1 << 20) + 1),
     ] {
         assert!(matches!(result, Err(SolverError::InvalidArgument { .. })));
     }
 
-    let malformed = solver.declare_const("bad", Sort::FloatingPoint(32, 24));
+    let malformed = solver.declare_const("bad", Sort::FloatingPoint(64, 24));
     assert!(matches!(
         solver.try_fp_to_ieee_bv(malformed),
         Err(SolverError::InvalidArgument { .. })

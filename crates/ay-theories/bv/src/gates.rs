@@ -8,30 +8,19 @@ use super::*;
 
 mod simplification;
 
-impl BvSolver<'_> {
-    pub(super) fn const_bits(&mut self, value: u64, width: usize) -> BvBits {
-        let mut bits = Vec::with_capacity(width);
-        for i in 0..width {
-            // `value` is a `u64`, but BV widths can exceed 64. Treat higher bits as 0.
-            let bit_set = if i < u64::BITS as usize {
-                (value >> i) & 1 == 1
-            } else {
-                false
-            };
-            let var = if bit_set {
-                // Use negation of cached false literal so that `is_known_true`
-                // recognizes constant-true bits flowing through gates.
-                // This enables constant propagation in AND/OR/XOR/MUX gates
-                // when one input comes from a BV constant. (#7974)
-                -self.fresh_false()
-            } else {
-                self.fresh_false()
-            };
-            bits.push(var);
-        }
-        bits
-    }
+/// Complement of a CNF literal: `neg_lit(lit) == -lit` for every literal.
+///
+/// CNF literals are DIMACS `±var` with `var` in `1..=i32::MAX`, a domain on
+/// which negation never overflows, so `wrapping_neg` is total and identical to
+/// `-lit` there. This is the same form as ay-core's own literal complement
+/// (`Tseitin::negate`, crates/ay-core/src/tseitin/mod.rs). `i32::MIN` is not a
+/// literal of any variable; it is the one value `wrapping_neg` maps to itself.
+#[inline]
+const fn neg_lit(lit: CnfLit) -> CnfLit {
+    lit.wrapping_neg()
+}
 
+impl BvSolver<'_> {
     /// Create AND gate: out = a AND b
     ///
     /// Uses structural hashing to avoid duplicate gates. (#1774)
@@ -40,7 +29,14 @@ impl BvSolver<'_> {
     /// This is critical for QF_ABV where BV constants produce many
     /// known-constant bits flowing through arithmetic circuits.
     pub(super) fn mk_and(&mut self, mut a: CnfLit, mut b: CnfLit) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
+        }
+
         loop {
+            if !self.encoding_step() {
+                return 0;
+            }
             if let Some(lit) = self.simplify_and_level1(a, b) {
                 return lit;
             }
@@ -55,31 +51,31 @@ impl BvSolver<'_> {
             let (z, w) = b_children.unwrap_or((0, 0));
 
             // Level 2: contradiction, subsumption, idempotence, resolution.
-            if !a_is_neg && a_is_and && (x == -b || y == -b) {
+            if !a_is_neg && a_is_and && (x == neg_lit(b) || y == neg_lit(b)) {
                 return self.fresh_false();
             }
-            if !b_is_neg && b_is_and && (z == -a || w == -a) {
+            if !b_is_neg && b_is_and && (z == neg_lit(a) || w == neg_lit(a)) {
                 return self.fresh_false();
             }
             if !a_is_neg
                 && !b_is_neg
                 && a_is_and
                 && b_is_and
-                && (x == -z || x == -w || y == -z || y == -w)
+                && (x == neg_lit(z) || x == neg_lit(w) || y == neg_lit(z) || y == neg_lit(w))
             {
                 return self.fresh_false();
             }
-            if a_is_neg && a_is_and && (x == -b || y == -b) {
+            if a_is_neg && a_is_and && (x == neg_lit(b) || y == neg_lit(b)) {
                 return b;
             }
-            if b_is_neg && b_is_and && (z == -a || w == -a) {
+            if b_is_neg && b_is_and && (z == neg_lit(a) || w == neg_lit(a)) {
                 return a;
             }
             if a_is_neg
                 && !b_is_neg
                 && a_is_and
                 && b_is_and
-                && (x == -z || x == -w || y == -z || y == -w)
+                && (x == neg_lit(z) || x == neg_lit(w) || y == neg_lit(z) || y == neg_lit(w))
             {
                 return b;
             }
@@ -87,7 +83,7 @@ impl BvSolver<'_> {
                 && !a_is_neg
                 && b_is_and
                 && a_is_and
-                && (z == -x || z == -y || w == -x || w == -y)
+                && (z == neg_lit(x) || z == neg_lit(y) || w == neg_lit(x) || w == neg_lit(y))
             {
                 return a;
             }
@@ -98,52 +94,52 @@ impl BvSolver<'_> {
                 return b;
             }
             if a_is_neg && b_is_neg && a_is_and && b_is_and {
-                if (x == z && y == -w) || (x == w && y == -z) {
-                    return -x;
+                if (x == z && y == neg_lit(w)) || (x == w && y == neg_lit(z)) {
+                    return neg_lit(x);
                 }
-                if (w == y && z == -x) || (w == x && z == -y) {
-                    return -w;
+                if (w == y && z == neg_lit(x)) || (w == x && z == neg_lit(y)) {
+                    return neg_lit(w);
                 }
             }
 
             // Level 3: substitution rules rewrite one operand and retry.
             if a_is_neg && a_is_and {
                 if x == b {
-                    a = -y;
+                    a = neg_lit(y);
                     continue;
                 }
                 if y == b {
-                    a = -x;
+                    a = neg_lit(x);
                     continue;
                 }
             }
             if b_is_neg && b_is_and {
                 if z == a {
-                    b = -w;
+                    b = neg_lit(w);
                     continue;
                 }
                 if w == a {
-                    b = -z;
+                    b = neg_lit(z);
                     continue;
                 }
             }
             if a_is_neg && !b_is_neg && a_is_and && b_is_and {
                 if x == z || x == w {
-                    a = -y;
+                    a = neg_lit(y);
                     continue;
                 }
                 if y == z || y == w {
-                    a = -x;
+                    a = neg_lit(x);
                     continue;
                 }
             }
             if b_is_neg && !a_is_neg && b_is_and && a_is_and {
                 if z == x || z == y {
-                    b = -w;
+                    b = neg_lit(w);
                     continue;
                 }
                 if w == x || w == y {
-                    b = -z;
+                    b = neg_lit(z);
                     continue;
                 }
             }
@@ -175,13 +171,20 @@ impl BvSolver<'_> {
         // out => a: (-out OR a)
         // out => b: (-out OR b)
         // a AND b => out: (-a OR -b OR out)
-        self.add_clause(CnfClause::binary(-out, a));
-        self.add_clause(CnfClause::binary(-out, b));
-        self.add_clause(CnfClause::new(vec![-a, -b, out]));
+        self.emit_clause(&[neg_lit(out), a]);
+        self.emit_clause(&[neg_lit(out), b]);
+        self.emit_clause(&[neg_lit(a), neg_lit(b), out]);
 
         // Cache the result
-        self.and_cache.insert(key, out);
-        self.and_children.insert(out, key);
+        if !self.encoding.was_stopped() && counted::memory::map(&mut self.and_cache, &self.encoding)
+        {
+            self.and_cache.insert(key, out);
+        }
+        if !self.encoding.was_stopped()
+            && counted::memory::map(&mut self.and_children, &self.encoding)
+        {
+            self.and_children.insert(out, key);
+        }
         out
     }
 
@@ -193,13 +196,17 @@ impl BvSolver<'_> {
     /// Non-trivial ORs lower through De Morgan so OR-derived structure feeds
     /// the same two-level AIG simplifier and AND cache as native AND gates.
     pub(super) fn mk_or(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
+        }
+
         // Trivial simplifications
         // a OR a = a
         if a == b {
             return a;
         }
         // a OR NOT(a) = true
-        if a == -b {
+        if a == neg_lit(b) {
             return self.fresh_true();
         }
         // Constant propagation: false OR b = b, true OR b = true
@@ -224,8 +231,11 @@ impl BvSolver<'_> {
             return cached;
         }
 
-        let out = -self.mk_and(-a, -b);
-        self.or_cache.insert(key, out);
+        let out = neg_lit(self.mk_and(neg_lit(a), neg_lit(b)));
+        if !self.encoding.was_stopped() && counted::memory::map(&mut self.or_cache, &self.encoding)
+        {
+            self.or_cache.insert(key, out);
+        }
         out
     }
 
@@ -234,13 +244,17 @@ impl BvSolver<'_> {
     /// Uses structural hashing to avoid duplicate gates. (#1774)
     /// Constant propagation: false XOR b = b, true XOR b = NOT(b).
     pub(super) fn mk_xor(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
+        }
+
         // Trivial simplifications
         // a XOR a = false
         if a == b {
             return self.fresh_false();
         }
         // a XOR NOT(a) = true
-        if a == -b {
+        if a == neg_lit(b) {
             return self.fresh_true();
         }
         // Constant propagation: false XOR b = b, true XOR b = NOT(b)
@@ -251,10 +265,10 @@ impl BvSolver<'_> {
             return a;
         }
         if self.is_known_true(a) {
-            return -b; // true XOR b = NOT(b)
+            return neg_lit(b); // true XOR b = NOT(b)
         }
         if self.is_known_true(b) {
-            return -a; // a XOR true = NOT(a)
+            return neg_lit(a); // a XOR true = NOT(a)
         }
 
         if let Some(lit) = self.simplify_xor_split_ands(a, b) {
@@ -286,36 +300,54 @@ impl BvSolver<'_> {
         // (-a OR b OR out)
         // (a OR -b OR out)
         // (a OR b OR -out)
-        self.add_clause(CnfClause::new(vec![-a, -b, -out]));
-        self.add_clause(CnfClause::new(vec![-a, b, out]));
-        self.add_clause(CnfClause::new(vec![a, -b, out]));
-        self.add_clause(CnfClause::new(vec![a, b, -out]));
+        self.emit_clause(&[neg_lit(a), neg_lit(b), neg_lit(out)]);
+        self.emit_clause(&[neg_lit(a), b, out]);
+        self.emit_clause(&[a, neg_lit(b), out]);
+        self.emit_clause(&[a, b, neg_lit(out)]);
 
         // Cache the result
-        self.xor_cache.insert(key, out);
+        if !self.encoding.was_stopped() && counted::memory::map(&mut self.xor_cache, &self.encoding)
+        {
+            self.xor_cache.insert(key, out);
+        }
         if self.capture_gate_provenance {
-            self.xor_children.insert(out, key);
+            if !self.encoding.was_stopped()
+                && counted::memory::map(&mut self.xor_children, &self.encoding)
+            {
+                self.xor_children.insert(out, key);
+            }
         }
         out
     }
 
     /// Create XNOR gate: out = a XNOR b = NOT(a XOR b)
     pub(super) fn mk_xnor(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
+        }
+
         let xor = self.mk_xor(a, b);
-        -xor
+        neg_lit(xor)
     }
 
     /// Create AND of many literals
     pub(super) fn mk_and_many(&mut self, lits: &[CnfLit]) -> CnfLit {
-        if lits.is_empty() {
-            return self.fresh_true();
-        }
-        if lits.len() == 1 {
-            return lits[0];
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
         }
 
-        let mut result = lits[0];
-        for &lit in &lits[1..] {
+        let Some((&first, rest)) = lits.split_first() else {
+            return self.fresh_true();
+        };
+        if rest.is_empty() {
+            return first;
+        }
+
+        let mut result = first;
+        for &lit in rest {
+            if !self.encoding_step() {
+                return 0;
+            }
             result = self.mk_and(result, lit);
         }
         result
@@ -323,11 +355,20 @@ impl BvSolver<'_> {
 
     /// Create MUX: if sel then a else b (bitwise)
     pub(super) fn bitwise_mux(&mut self, a: &BvBits, b: &BvBits, sel: CnfLit) -> BvBits {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
         assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b.iter())
-            .map(|(&ai, &bi)| self.mk_mux(ai, bi, sel))
-            .collect()
+        let Some(mut result) = self.counted_bits(a.len()) else {
+            return Vec::new();
+        };
+        for (&ai, &bi) in a.iter().zip(b.iter()) {
+            if !self.encoding_step() {
+                return Vec::new();
+            }
+            result.push(self.mk_mux(ai, bi, sel));
+        }
+        result
     }
 
     /// Create MUX: if sel then a else b
@@ -336,6 +377,10 @@ impl BvSolver<'_> {
     /// Constant propagation: known selector, equal inputs, and known data
     /// inputs are resolved without allocating a fresh variable.
     pub(super) fn mk_mux(&mut self, a: CnfLit, b: CnfLit, sel: CnfLit) -> CnfLit {
+        if !self.encoding_step() {
+            return 0; // Private stopped unwind, never exported as a gate.
+        }
+
         // Known selector: sel=true => a, sel=false => b
         if self.is_known_true(sel) {
             return a;
@@ -350,7 +395,7 @@ impl BvSolver<'_> {
         // Branches are complements: (ite sel a (NOT a)) ≡ (sel ↔ a) ≡ XNOR(sel, a)
         // Since b = ¬a, we must use `a` (not `b`) for the XNOR.
         // Using `b` would compute XNOR(sel, ¬a) = ¬(sel ↔ a), which is inverted.
-        if a == -b {
+        if a == neg_lit(b) {
             return self.mk_xnor(sel, a);
         }
 
@@ -367,10 +412,10 @@ impl BvSolver<'_> {
             return self.mk_or(sel, b);
         }
         if self.is_known_false(a) {
-            return self.mk_and(-sel, b);
+            return self.mk_and(neg_lit(sel), b);
         }
         if self.is_known_true(b) {
-            return self.mk_or(-sel, a);
+            return self.mk_or(neg_lit(sel), a);
         }
         if self.is_known_false(b) {
             return self.mk_and(sel, a);
@@ -389,15 +434,22 @@ impl BvSolver<'_> {
         // (-sel OR a OR -out)  -- sel=1, a=0 => out=0
         // (sel OR -b OR out)   -- sel=0, b=1 => out=1
         // (sel OR b OR -out)   -- sel=0, b=0 => out=0
-        self.add_clause(CnfClause::new(vec![-sel, -a, out]));
-        self.add_clause(CnfClause::new(vec![-sel, a, -out]));
-        self.add_clause(CnfClause::new(vec![sel, -b, out]));
-        self.add_clause(CnfClause::new(vec![sel, b, -out]));
+        self.emit_clause(&[neg_lit(sel), neg_lit(a), out]);
+        self.emit_clause(&[neg_lit(sel), a, neg_lit(out)]);
+        self.emit_clause(&[sel, neg_lit(b), out]);
+        self.emit_clause(&[sel, b, neg_lit(out)]);
 
         // Cache the result
-        self.mux_cache.insert(key, out);
+        if !self.encoding.was_stopped() && counted::memory::map(&mut self.mux_cache, &self.encoding)
+        {
+            self.mux_cache.insert(key, out);
+        }
         if self.capture_gate_provenance {
-            self.mux_children.insert(out, key);
+            if !self.encoding.was_stopped()
+                && counted::memory::map(&mut self.mux_children, &self.encoding)
+            {
+                self.mux_children.insert(out, key);
+            }
         }
         out
     }

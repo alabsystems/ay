@@ -11,6 +11,8 @@
 //! Used by clause shrinking to find the next shrinkable literal without
 //! linear trail scanning.
 
+mod counted;
+
 /// Radix priority queue with monotone-increasing pop order.
 #[derive(Clone)]
 pub(crate) struct Reap {

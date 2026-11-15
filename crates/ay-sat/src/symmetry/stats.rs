@@ -31,7 +31,7 @@ pub(crate) struct SymmetryStats {
     /// `last_skipped_reason` is a single slot overwritten by whichever route
     /// runs last, so on a run that tries several routes it reports the last
     /// one's outcome as the run's. That made every route's reachability
-    /// unverifiable — see the development design notes. A subsystem that tries N
+    /// unverifiable. A subsystem that tries N
     /// strategies must report N outcomes.
     pub(crate) routes: Vec<(&'static str, String)>,
     pub(crate) runs: u64,
@@ -44,6 +44,19 @@ pub(crate) struct SymmetryStats {
     pub(crate) groups_over_budget: u64,
     /// Largest refined colour class.
     pub(crate) largest_group: u64,
+    /// The Schreier–Sims chain over the composite generators: generators,
+    /// base length, and orbits of size at least two (symmetry fixing, step 2).
+    pub(crate) chain_generators: u64,
+    pub(crate) chain_base_len: u64,
+    pub(crate) chain_orbits: u64,
+    /// Fix-and-cut (step 3): WLOG units, orbit binaries, base points walked,
+    /// work spent, and whether the walk's budget stopped it.
+    pub(crate) fixcut_fixings: u64,
+    pub(crate) fixcut_cuts: u64,
+    pub(crate) fixcut_levels: u64,
+    pub(crate) fixcut_work: u64,
+    pub(crate) fixcut_budget_hit: u64,
+    pub(crate) fixcut_rounds: u64,
     pub(crate) last_skipped_reason: Option<SymmetrySkipReason>,
 }
 
@@ -72,6 +85,24 @@ pub struct SymmetryReport {
     pub groups_over_budget: u64,
     /// Largest refined colour class.
     pub largest_group: u64,
+    /// Generators the chain (and the flip group) was built from.
+    pub chain_generators: u64,
+    /// Base length of the Schreier–Sims chain.
+    pub chain_base_len: u64,
+    /// Orbits of size at least two under the whole group (composite route).
+    pub chain_orbits: u64,
+    /// Fix-and-cut: WLOG units derived (fixings and their consequences).
+    pub fixcut_fixings: u64,
+    /// Fix-and-cut: orbit-cut binaries derived.
+    pub fixcut_cuts: u64,
+    /// Fix-and-cut: base points walked.
+    pub fixcut_levels: u64,
+    /// Fix-and-cut: work spent by the walk and the chain.
+    pub fixcut_work: u64,
+    /// Fix-and-cut: 1 when the walk's budget stopped it.
+    pub fixcut_budget_hit: u64,
+    /// Fix-and-cut: detection rounds run.
+    pub fixcut_rounds: u64,
     /// Stable tag for why the last run emitted nothing, or `None` when it did
     /// reach clause emission.
     pub skipped: Option<&'static str>,
@@ -102,6 +133,15 @@ impl SymmetryStats {
             groups_nontrivial: self.groups_nontrivial,
             groups_over_budget: self.groups_over_budget,
             largest_group: self.largest_group,
+            chain_generators: self.chain_generators,
+            chain_base_len: self.chain_base_len,
+            chain_orbits: self.chain_orbits,
+            fixcut_fixings: self.fixcut_fixings,
+            fixcut_cuts: self.fixcut_cuts,
+            fixcut_levels: self.fixcut_levels,
+            fixcut_work: self.fixcut_work,
+            fixcut_budget_hit: self.fixcut_budget_hit,
+            fixcut_rounds: self.fixcut_rounds,
             skipped: self.last_skipped_reason.map(SymmetrySkipReason::tag),
             routes: self.routes.clone(),
         }

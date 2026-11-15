@@ -71,7 +71,9 @@ fn is_valid_interpolant_deadline(
 
 /// True when the caller's deadline has expired (strategy loops bail).
 fn deadline_expired(deadline: Option<ay_core::time::Instant>) -> bool {
-    deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
+    // A cancelled portfolio lane is past every deadline (`ScopedLaneCancellation`).
+    crate::smt::deadline::lane_cancelled()
+        || deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
 }
 
 /// Negate a comparison expression: `<=` → `>`, `>=` → `<`, `<` → `>=`, `>` → `<=`.
@@ -197,6 +199,7 @@ pub(crate) fn compute_interpolant_until(
     shared_vars: &FxHashSet<String>,
     deadline: Option<ay_core::time::Instant>,
 ) -> Option<ChcExpr> {
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
     // Parse A-constraints as linear inequalities.
     // Equalities are split into both directions (a-b<=0 AND b-a<=0) to
     // enable FM elimination and conjunctive interpolants (Part of #966).

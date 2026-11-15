@@ -95,6 +95,9 @@ pub(in crate::pdr) struct PdrCacheStore {
     /// Cumulative frame constraint: `(level, pred) -> (revision_sum, formula)`.
     /// Uses `RefCell` because callers need `&self` access.
     pub cumulative_constraint_cache: RefCell<FxHashMap<(usize, PredicateId), (u64, ChcExpr)>>,
+    /// Delta frame hypothesis `frame_hyp(k, pred)` (Workstream B, `DESIGN` §3.5):
+    /// `(k, pred) -> (revision_sum over j ≥ k, formula)`.
+    pub frame_hyp_cache: RefCell<FxHashMap<(usize, PredicateId), (u64, ChcExpr)>>,
     /// Per-predicate Entry-CEGAR refinement budget.
     pub entry_cegar_budget: FxHashMap<PredicateId, usize>,
     /// Disequality values per `(pred, var, level)` for enumeration detection.
@@ -137,6 +140,7 @@ impl PdrCacheStore {
             inductive_blocking_cache: FxHashMap::default(),
             init_only_value_cache: FxHashMap::default(),
             cumulative_constraint_cache: RefCell::new(FxHashMap::default()),
+            frame_hyp_cache: RefCell::new(FxHashMap::default()),
             entry_cegar_budget: FxHashMap::default(),
             diseq_values: FxHashMap::default(),
             spurious_cex_weakness: FxHashMap::default(),
@@ -162,6 +166,7 @@ impl PdrCacheStore {
         self.inductive_blocking_cache.clear();
         self.init_only_value_cache.clear();
         self.cumulative_constraint_cache.borrow_mut().clear();
+        self.frame_hyp_cache.borrow_mut().clear();
         self.spurious_cex_weakness.clear();
         self.blocked_states_for_convex.clear();
         self.diseq_values.clear();

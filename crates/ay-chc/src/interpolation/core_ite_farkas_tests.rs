@@ -92,8 +92,8 @@ fn test_collect_ite_conditions_basic() {
             ChcExpr::Int(0).into(),
         ],
     );
-    let mut conditions = Vec::new();
-    collect_ite_conditions(&ite, &mut conditions);
+    let conditions = collect_ite_conditions(std::iter::once(&ite), MAX_ITE_CONDITIONS)
+        .expect("one condition is within the cap");
     assert_eq!(conditions.len(), 1);
     assert_eq!(conditions[0], ChcExpr::var(c));
 }
@@ -133,4 +133,82 @@ fn test_substitute_ite_condition_false() {
     );
     let result = substitute_ite_condition(&ite, &c_cond, false);
     assert_eq!(result, ChcExpr::Int(0));
+}
+
+/// `ite(c, e, e + 1)` nested `depth` times over one shared `e`: a DAG of
+/// `O(depth)` nodes whose tree expansion has `2^depth` leaves.
+fn shared_ite_tower(depth: usize, conds: &[ChcExpr]) -> ChcExpr {
+    let mut expr = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    for level in 0..depth {
+        let shared: Arc<ChcExpr> = expr.into();
+        let plus_one = ChcExpr::add(shared.as_ref().clone(), ChcExpr::Int(1));
+        expr = ChcExpr::Op(
+            ChcOp::Ite,
+            vec![
+                conds[level % conds.len()].clone().into(),
+                shared,
+                plus_one.into(),
+            ],
+        );
+    }
+    expr
+}
+
+/// Reference: the former recursive tree walk plus first-occurrence dedup.
+fn tree_conditions(expr: &ChcExpr, out: &mut Vec<ChcExpr>) {
+    if let ChcExpr::Op(op, args) = expr {
+        if *op == ChcOp::Ite && args.len() == 3 && !out.contains(args[0].as_ref()) {
+            out.push(args[0].as_ref().clone());
+        }
+        for arg in args {
+            tree_conditions(arg, out);
+        }
+    }
+}
+
+/// On a 2^120-leaf shared tower with two conditions, collection and case
+/// substitution finish in DAG time (the tree walk would never return).
+#[test]
+fn ite_walks_run_in_dag_time_on_shared_towers() {
+    let conds: Vec<ChcExpr> = ["c0", "c1"]
+        .iter()
+        .map(|n| ChcExpr::var(ChcVar::new(*n, ChcSort::Bool)))
+        .collect();
+    let tower = shared_ite_tower(120, &conds);
+    let collected = collect_ite_conditions(std::iter::once(&tower), MAX_ITE_CONDITIONS)
+        .expect("two conditions are within the cap");
+    assert_eq!(collected, vec![conds[1].clone(), conds[0].clone()]);
+    let all_true = substitute_ite_condition(
+        &substitute_ite_condition(&tower, &conds[0], true),
+        &conds[1],
+        true,
+    );
+    assert_eq!(all_true, ChcExpr::var(ChcVar::new("x", ChcSort::Int)));
+}
+
+/// The DAG-time collection returns exactly the tree walk's deduplicated
+/// conditions, and gives up (`None`) exactly when they exceed the cap.
+#[test]
+fn ite_condition_collection_matches_the_tree_walk() {
+    let conds: Vec<ChcExpr> = (0..9)
+        .map(|i| {
+            ChcExpr::ge(
+                ChcExpr::var(ChcVar::new(&format!("v{i}"), ChcSort::Int)),
+                ChcExpr::Int(i),
+            )
+        })
+        .collect();
+    for count in 1..=conds.len() {
+        for depth in [count, count + 3, 2 * count + 1] {
+            let tower = shared_ite_tower(depth, &conds[..count]);
+            let mut expected = Vec::new();
+            tree_conditions(&tower, &mut expected);
+            let got = collect_ite_conditions(std::iter::once(&tower), MAX_ITE_CONDITIONS);
+            if expected.len() > MAX_ITE_CONDITIONS {
+                assert!(got.is_none(), "count={count} depth={depth}");
+            } else {
+                assert_eq!(got.as_ref(), Some(&expected), "count={count} depth={depth}");
+            }
+        }
+    }
 }

@@ -1,0 +1,75 @@
+pseudo-Boolean proof version 2.0
+* A version 2.0 order whose `aux` list is NOT empty, which is the one
+* combination the corpus never had: the four version-2 instances with an order
+* all write `aux` with nothing after it, and every order that does have
+* auxiliary variables is written in version 3.0.
+*
+* The two features had never met, and they do not fit together. The version-3
+* grammar reads the `aux`, `fresh_aux_1` and `fresh_aux_2` lists with
+* `is_var_allowed = false`, so every name in them has to be an
+* `AuxiliaryVariable` token -- `$`-prefixed. The version-2 grammar has no `$`
+* at all: `legacy_v2::tokens::VariableToken` and `LiteralToken`, and the OPB
+* and DIMACS formula parsers, all take names from
+* `[a-zA-Z_][_a-zA-Z0-9\-^\[\]{}]+`. `-e` always emits version 3.0. So this
+* proof used to verify at exit 0, elaborate at exit 0, and produce a version-3
+* proof that does not parse:
+*
+*     Expected an auxiliary variable or `;` but found `q1` at line 7 col 7.
+*
+* The elaborator now renames each such variable to `$` + its name, in the
+* variable-name table rather than at the point of writing, so that *every*
+* occurrence moves together: there is one source of names, so there is no
+* write site to miss. This instance is laid out to make that reach visible --
+* `q1` appears in the `aux` list, in the `spec` constraint, in that `red`'s
+* witness, and in the `def` constraint, and the transitivity block adds
+* `fresh_aux_1` and `fresh_aux_2`, which the version-3 grammar constrains the
+* same way. All of them come out `$`-prefixed, and the elaborated proof
+* re-checks with the same verdict.
+f 1
+pre_order simple
+    vars
+        left u1
+        right v1
+        * the auxiliary variable, unspellable as `$q1` in this dialect
+        aux q1
+    end
+
+    * a specification for `q1`, which puts the renamed name in a constraint
+    * and in a witness as well as in the `aux` list above
+    spec
+        red 1 ~q1 >= 1 ; q1 -> 0 ; begin
+        end
+    end
+
+    * `q1` in the definition too, so the rename has to reach `def`
+    def
+        1 ~u1 1 v1 1 q1 >= 1 ;
+    end
+
+    transitivity
+        vars
+            fresh_right w1
+            fresh_aux_1 b1
+            fresh_aux_2 c1
+        end
+        proof
+            * 4: 1 ~u1 1 v1 1 q1 >= 1   (the definition, on u,v)
+            * 5: 1 ~v1 1 w1 1 b1 >= 1   (the definition, on v,w)
+            * 1,2,3: the specification, on q1, b1 and c1
+            * 6: the negated goal, 1 u1 1 ~w1 1 ~c1 >= 3
+            proofgoal #1
+                p 4 1 + 5 + 2 + 6 +
+            end -1
+        end
+    end
+end
+
+* reflexivity is auto-proven: the definition under `v1 -> u1` is
+* `1 ~u1 1 u1 1 q1 >= 1`, a tautology.
+
+load_order simple x1
+p 1 1 +
+load_order
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

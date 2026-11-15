@@ -1,0 +1,8 @@
+(set-option :timeout 60000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const a (_ BitVec 64))
+(declare-const b (_ BitVec 64))
+(assert (not (= (concat (ite (not (= (bvsub ((_ sign_extend 1) a) ((_ sign_extend 1) b)) ((_ sign_extend 1) (bvsub a b)))) (_ bv1 1) (_ bv0 1)) (bvsub a b)) (concat (ite (and (not (= ((_ extract 63 63) a) ((_ extract 63 63) b))) (not (= ((_ extract 63 63) a) ((_ extract 63 63) (bvsub a b))))) (_ bv1 1) (_ bv0 1)) (bvsub a b)))))
+(check-sat)
+(exit)

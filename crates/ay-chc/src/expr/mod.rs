@@ -8,22 +8,33 @@
 // Implementing std::ops traits would be semantically incorrect.
 #![allow(clippy::should_implement_trait)]
 
+mod array_lambda;
+pub(crate) mod dag;
+mod datatype_identity;
 mod eliminate;
+mod eliminate_dag;
 pub(crate) mod evaluate;
 pub(crate) mod intern;
 pub(crate) mod jit_bridge;
 mod methods;
 mod normalize;
+pub(crate) mod rewrite_budget;
 mod simplify;
+mod structural;
 mod types;
 
-pub use types::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcOp, ChcSort, ChcVar};
+pub use array_lambda::ChcArrayLambda;
+pub use types::{
+    ChcDtConstructor, ChcDtConstructors, ChcDtId, ChcDtSelector, ChcExpr, ChcOp, ChcSort, ChcVar,
+};
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod expr_tests;
 
-pub(crate) use evaluate::{eval_array_select, eval_int_big, evaluate_expr, smt_values_equal};
+pub(crate) use evaluate::{
+    eval_array_select, eval_int_big, evaluate_expr, lookup_model_value, smt_values_equal,
+};
 pub(crate) use methods::ExprFeatures;
 
 #[cfg(test)]
@@ -272,24 +283,51 @@ pub(crate) const MAX_EXPR_RECURSION_DEPTH: usize = 500;
 /// frames reuses segments and allocates far less than `depth * EXPR_STACK_SIZE`.
 ///
 /// The depth counter is incremented per call for `ExprDepthGuard::check()`.
+///
+/// Also the lane memory guard's unwind point (WP-F): on an engine lane whose
+/// memory group is past its hard share, every expression walk step panics
+/// with [`LANE_MEMORY_UNWIND`]; the lane's `catch_unwind` turns that into
+/// `Unknown` for this engine only. One relaxed load when no lane ever crossed
+/// its hard share.
 #[inline]
 pub(crate) fn maybe_grow_expr_stack<T>(f: impl FnOnce() -> T) -> T {
-    EXPR_DEPTH.with(|d| {
-        let depth = d.get();
-        d.set(depth.saturating_add(1));
-        let result = stacker::maybe_grow(EXPR_STACK_RED_ZONE, EXPR_STACK_SIZE, f);
-        d.set(depth);
-        result
-    })
+    if ay_sys::current_memory_group_over_hard_limit() && !std::thread::panicking() {
+        std::panic::panic_any(LANE_MEMORY_UNWIND);
+    }
+    /// Restores the depth on every exit, including an unwind (the lane memory
+    /// guard's, or an engine panic caught by the portfolio), so a thread's
+    /// depth counter never drifts across a caught unwind.
+    struct RestoreDepth(usize);
+    impl Drop for RestoreDepth {
+        fn drop(&mut self) {
+            let depth = self.0;
+            let _ = EXPR_DEPTH.try_with(|d| d.set(depth));
+        }
+    }
+    let depth = EXPR_DEPTH.with(std::cell::Cell::get);
+    let _restore = RestoreDepth(depth);
+    EXPR_DEPTH.with(|d| d.set(depth.saturating_add(1)));
+    stacker::maybe_grow(EXPR_STACK_RED_ZONE, EXPR_STACK_SIZE, f)
 }
 
 thread_local! {
     static EXPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Panic payload of the lane memory guard's forced unwind (see
+/// [`maybe_grow_expr_stack`]).
+pub(crate) const LANE_MEMORY_UNWIND: &str =
+    "engine lane exceeded its hard memory share; unwinding this lane only";
+
 /// Current expression recursion depth (for testing).
 #[cfg(test)]
 fn expr_depth() -> usize {
+    EXPR_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Current `maybe_grow_expr_stack` nesting depth — what `ExprDepthGuard`
+/// compares against `MAX_EXPR_RECURSION_DEPTH`.
+pub(crate) fn current_expr_depth() -> usize {
     EXPR_DEPTH.with(std::cell::Cell::get)
 }
 

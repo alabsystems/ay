@@ -244,9 +244,17 @@ fn code_conversions() {
         "",
         "past the alphabet"
     );
-    // A surrogate is IN the SMT-LIB alphabet but has no Rust `char`; refusing
-    // beats substituting a different character.
-    assert!(eval("str.from_code", &[i(0xd800)]).is_err());
+    // A surrogate is IN the SMT-LIB alphabet: one character, stored in its
+    // carrier `char` (`ay_core::smtlib_char`), whose code point reads back.
+    let surrogate = str_of("str.from_code", &[i(0xd800)]);
+    assert_eq!(surrogate.chars().count(), 1);
+    assert_eq!(int_of("str.to_code", &[s(&surrogate)]), 0xd800);
+    // `str.<` is code-point order: U+D7FF < U+D800 < U+E000, whatever the
+    // carrier's own `char` order says.
+    assert!(bool_of(
+        "str.<",
+        &[s("\u{d7ff}"), s(&surrogate), s("\u{e000}")]
+    ));
     assert!(bool_of("str.is_digit", &[s("7")]));
     assert!(!bool_of("str.is_digit", &[s("77")]));
     assert!(!bool_of("str.is_digit", &[s("a")]));

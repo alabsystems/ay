@@ -13,6 +13,11 @@
 //! called from `shrink_and_minimize_clause()` in shrink.cpp:462-486.
 
 mod minimize_dfs;
+mod pinned_retry;
+pub(in crate::solver) mod root;
+
+#[cfg(test)]
+mod rescan_tests;
 
 use super::*;
 
@@ -256,15 +261,9 @@ impl Solver {
         // O(|pinned| + new entries) instead of O(suffix after the oldest pin).
         let mut pinned = std::mem::take(&mut self.cold.lrat_level0_unit_materialize_pinned);
         let retry_len = pinned.partition_point(|&p| p < start);
-        // #A2b charge parity (same principle as the A2 v2 memoization): the
-        // pre-#A5 scalar cursor would have restarted this scan at the oldest
-        // pending slot. The waste charge below must fire at the same calls
-        // with the same magnitudes as before, so budgeted (synthesized-
-        // default) runs exhaust at the same point they always did.
-        let legacy_start = pinned.first().copied().unwrap_or(start).min(level0_end);
+        let visited_entries = retry_len + (level0_end - start);
         self.stats.lrat_materialize_minimize_calls += 1;
-        self.stats.lrat_materialize_minimize_root_trail_entries +=
-            (retry_len + (level0_end - start)) as u64;
+        self.stats.lrat_materialize_minimize_root_trail_entries += visited_entries as u64;
         let mut hints = std::mem::take(&mut self.cold.lrat_materialize_hints_buf);
         // Surviving pins are compacted in place: the write index never
         // overtakes the retry read index, and slots at or past `retry_len`
@@ -280,12 +279,19 @@ impl Solver {
                 kept += 1;
             }};
         }
-        for slot in 0..retry_len + (level0_end - start) {
+        let retry_writes_no_proof = self.level0_retry_writes_no_proof();
+        for slot in 0..visited_entries {
             let i = if slot < retry_len {
                 pinned[slot]
             } else {
                 start + (slot - retry_len)
             };
+            if slot < retry_len && retry_writes_no_proof {
+                if self.retry_pinned_level0_unit_without_proof(i) {
+                    keep_pinned!(i);
+                }
+                continue;
+            }
             let unit_lit = self.trail[i];
             let var_idx = unit_lit.variable().index();
             if var_idx >= self.num_vars
@@ -380,16 +386,14 @@ impl Solver {
         hints.clear();
         self.cold.lrat_materialize_hints_buf = hints;
         pinned.truncate(kept);
-        // #A2b: charge only WASTED rescan work. Pre-#A5 the condition was
-        // "the cursor failed to advance past its restart slot" — i.e. the
-        // entry at `legacy_start` failed again — and the charge was the span
-        // that scan re-walked. #A5 no longer re-walks that span, but the
-        // charge is kept at parity (see `legacy_start` above).
-        let repinned_at_legacy_start = pinned.first() == Some(&legacy_start);
         self.cold.lrat_level0_unit_materialize_pinned = pinned;
         self.cold.lrat_level0_unit_materialize_cursor = level0_end;
-        if repinned_at_legacy_start && level0_end > legacy_start {
-            self.charge_proof_bookkeeping((level0_end - legacy_start) as u64);
+        // Charge the entries actually visited, not the suffix after the oldest
+        // pin that A5 no longer traverses. This is scan work, not retained
+        // storage: literal/hint copies keep their separate trace-add charges.
+        // Keep the existing post-pass debit and restore scratch before refusal.
+        if visited_entries != 0 {
+            self.charge_proof_bookkeeping(visited_entries as u64);
         }
     }
 
@@ -454,7 +458,10 @@ impl Solver {
     /// Uses `level0_unit_chain_proof_id` which does NOT fall back to
     /// multi-literal reason clause IDs in LRAT mode (#7108).
     pub(super) fn materialize_level0_unit_proofs(&mut self) {
-        let _ = self.materialize_level0_unit_proofs_impl(false);
+        match self.materialize_level0_unit_proofs_impl(false, &root::Ordinary) {
+            Ok(_) => {}
+            Err(never) => match never {},
+        }
     }
 
     /// Interruptible form for callers that can atomically decline the pending
@@ -462,12 +469,20 @@ impl Solver {
     /// all-or-complete behavior so a deadline cannot silently leave their
     /// proof row half prepared.
     pub(super) fn materialize_level0_unit_proofs_interruptible(&mut self) -> bool {
-        self.materialize_level0_unit_proofs_impl(true)
+        match self.materialize_level0_unit_proofs_impl(true, &root::Ordinary) {
+            Ok(complete) => complete,
+            Err(never) => match never {},
+        }
     }
 
-    fn materialize_level0_unit_proofs_impl(&mut self, honor_stop: bool) -> bool {
+    pub(in crate::solver) fn materialize_level0_unit_proofs_impl<P: root::Policy>(
+        &mut self,
+        honor_stop: bool,
+        p: &P,
+    ) -> Result<bool, P::Error> {
+        p.enter(self)?;
         if !self.cold.lrat_enabled {
-            return true;
+            return Ok(true);
         }
 
         let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
@@ -476,31 +491,36 @@ impl Solver {
             .lrat_level0_unit_materialize_cursor
             .min(level0_end);
         // #A2b search-time construction budget (see
-        // `materialize_level0_minimize_unit_proofs` for the waste-only
+        // `materialize_level0_minimize_unit_proofs` for the actual-scan
         // charging rationale). This is the safe degrade point (root level,
         // between clause operations): once the budget is exhausted, drop to
         // no-proof search entirely.
         if self.cold.proof_bookkeeping_budget == Some(0) {
             self.degrade_proof_bookkeeping_after_exhaustion();
-            return true;
+            return Ok(true);
         }
+        p.work(1)?;
         self.stats.lrat_materialize_calls += 1;
-        // #A5 (cursor, pinned) de-pinning + #A2b charge parity: see
-        // `materialize_level0_minimize_unit_proofs` for both rationales.
-        let mut pinned = std::mem::take(&mut self.cold.lrat_level0_unit_materialize_pinned);
+        // Retry only pinned entries, then visit the fresh suffix. Account
+        // entries below as they are entered, after the interruption fence.
+        let mut scratch = root::Scratch::new(self, p.owner());
+        let solver = &mut *scratch.solver;
+        let pinned = &mut scratch.pinned;
+        let hints = &mut scratch.hints;
+        p.work(pinned.len())?;
         let retry_len = pinned.partition_point(|&p| p < start);
-        let legacy_start = pinned.first().copied().unwrap_or(start).min(level0_end);
-        self.stats.lrat_materialize_root_trail_entries += (retry_len + (level0_end - start)) as u64;
-        let mut hints = std::mem::take(&mut self.cold.lrat_materialize_hints_buf);
+        let mut visited_entries = 0usize;
         // Surviving pins are compacted in place: the write index never
         // overtakes the retry read index, and slots at or past `retry_len`
         // are stale (at or past `start`) and dropped by the final truncate.
         let mut kept = 0usize;
         macro_rules! keep_pinned {
             ($i:expr) => {{
+                p.work(2)?;
                 if kept < pinned.len() {
                     pinned[kept] = $i;
                 } else {
+                    p.reserve(pinned, 1)?;
                     pinned.push($i);
                 }
                 kept += 1;
@@ -512,7 +532,9 @@ impl Solver {
         // first unattempted fresh slot.
         let mut next_cursor = level0_end;
         let mut deadline_truncated = false;
+        let retry_writes_no_proof = solver.level0_retry_writes_no_proof();
         for slot in 0..retry_len + (level0_end - start) {
+            p.work(48)?;
             let from_retry = slot < retry_len;
             let i = if from_retry {
                 pinned[slot]
@@ -527,9 +549,10 @@ impl Solver {
             // via the cursor), and let the surrounding solve publish Unknown.
             if honor_stop
                 && slot.is_multiple_of(64)
-                && (self.solve_deadline_expired() || self.is_interrupted())
+                && (solver.solve_deadline_expired() || solver.is_interrupted())
             {
                 if from_retry {
+                    p.work(retry_len - slot)?;
                     pinned.copy_within(slot..retry_len, kept);
                     kept += retry_len - slot;
                     next_cursor = start;
@@ -539,36 +562,44 @@ impl Solver {
                 deadline_truncated = true;
                 break;
             }
-            let unit_lit = self.trail[i];
+            visited_entries += 1;
+            if from_retry && retry_writes_no_proof {
+                if solver.retry_pinned_level0_unit_without_proof(i) {
+                    keep_pinned!(i);
+                }
+                continue;
+            }
+            let unit_lit = solver.trail[i];
             let var_idx = unit_lit.variable().index();
-            if var_idx >= self.num_vars
-                || self.var_data[var_idx].level != 0
-                || self.level0_var_proof_id(var_idx).is_some()
+            if var_idx >= solver.num_vars
+                || solver.var_data[var_idx].level != 0
+                || solver.level0_var_proof_id(var_idx).is_some()
             {
                 continue;
             }
 
-            let Some(reason_ref) = self.var_reason(var_idx) else {
+            let Some(reason_ref) = solver.var_reason(var_idx) else {
                 // No reason: original decision or unit input clause.
                 // unit_proof_id should already be set by add_clause for unit
                 // inputs. If it's not, there's nothing we can do here.
                 continue;
             };
             let clause_idx = reason_ref.0 as usize;
-            if clause_idx >= self.arena.len() {
+            if clause_idx >= solver.arena.len() {
                 keep_pinned!(i);
                 continue;
             }
-            let clause_len = self.arena.len_of(clause_idx);
-            if !(0..clause_len).any(|j| self.arena.literal(clause_idx, j) == unit_lit) {
-                self.stats.lrat_materialize_incomplete_chains += 1;
+            let clause_len = solver.arena.len_of(clause_idx);
+            p.work(clause_len)?;
+            if !(0..clause_len).any(|j| solver.arena.literal(clause_idx, j) == unit_lit) {
+                solver.stats.lrat_materialize_incomplete_chains += 1;
                 keep_pinned!(i);
                 continue;
             }
 
-            let reason_id = self.clause_id(reason_ref);
-            if reason_id == 0 || !self.lrat_hint_id_visible(reason_id) {
-                self.stats.lrat_materialize_incomplete_chains += 1;
+            let reason_id = solver.clause_id(reason_ref);
+            if reason_id == 0 || !solver.lrat_hint_id_visible(reason_id) {
+                solver.stats.lrat_materialize_incomplete_chains += 1;
                 keep_pinned!(i);
                 continue;
             }
@@ -578,23 +609,30 @@ impl Solver {
             // don't go through proof_emit_unit, so unit_proof_id was never set.
             // Set it directly from the reason clause's proof ID.
             if clause_len <= 1 {
-                self.record_level0_proof_id_for_lit(unit_lit, reason_id);
-                self.record_unit_proof_id_for_lit(unit_lit, reason_id);
+                p.record(solver, unit_lit)?;
+                solver.record_level0_proof_id_for_lit(unit_lit, reason_id);
+                p.record(solver, unit_lit)?;
+                solver.record_unit_proof_id_for_lit(unit_lit, reason_id);
                 continue;
             }
 
+            p.work(hints.len())?;
             hints.clear();
             if hints.capacity() < clause_len {
-                hints.reserve(clause_len - hints.capacity());
+                let additional = clause_len - hints.capacity();
+                p.reserve(hints, additional)?;
+                hints.reserve(additional);
             }
             let mut complete = true;
             for j in 0..clause_len {
+                p.work(24)?;
                 if honor_stop
                     && j.is_multiple_of(64)
-                    && (self.solve_deadline_expired() || self.is_interrupted())
+                    && (solver.solve_deadline_expired() || solver.is_interrupted())
                 {
                     if from_retry {
                         keep_pinned!(i);
+                        p.work(retry_len - slot - 1)?;
                         pinned.copy_within(slot + 1..retry_len, kept);
                         kept += retry_len - slot - 1;
                         next_cursor = start;
@@ -605,16 +643,19 @@ impl Solver {
                     complete = false;
                     break;
                 }
-                let other_lit = self.arena.literal(clause_idx, j);
+                let other_lit = solver.arena.literal(clause_idx, j);
                 let other_var = other_lit.variable().index();
                 if other_var == var_idx {
                     continue;
                 }
-                let Some(pid) = self.level0_unit_chain_proof_id_for_lit(other_lit.negated()) else {
+                let Some(pid) = solver.level0_unit_chain_proof_id_for_lit(other_lit.negated())
+                else {
                     complete = false;
                     break;
                 };
+                p.work(hints.len())?;
                 if !hints.contains(&pid) {
+                    p.reserve(hints, 1)?;
                     hints.push(pid);
                 }
             }
@@ -623,75 +664,86 @@ impl Solver {
                 break;
             }
             if !complete {
-                let hidden_already_materialized = self
+                let hidden_already_materialized = solver
                     .cold
                     .level0_proof_id
                     .get(var_idx)
                     .copied()
-                    .zip(self.cold.level0_proof_sign.get(var_idx).copied())
+                    .zip(solver.cold.level0_proof_sign.get(var_idx).copied())
                     .is_some_and(|(id, sign)| {
-                        id != 0 && sign == unit_lit.sign_i8() && !self.lrat_hint_id_visible(id)
+                        id != 0 && sign == unit_lit.sign_i8() && !solver.lrat_hint_id_visible(id)
                     })
-                    || self
+                    || solver
                         .unit_proof_id
                         .get(var_idx)
                         .copied()
-                        .zip(self.unit_proof_sign.get(var_idx).copied())
+                        .zip(solver.unit_proof_sign.get(var_idx).copied())
                         .is_some_and(|(id, sign)| {
-                            id != 0 && sign == unit_lit.sign_i8() && !self.lrat_hint_id_visible(id)
+                            id != 0
+                                && sign == unit_lit.sign_i8()
+                                && !solver.lrat_hint_id_visible(id)
                         });
                 if hidden_already_materialized {
-                    self.stats.lrat_materialize_incomplete_chains += 1;
+                    solver.stats.lrat_materialize_incomplete_chains += 1;
                     keep_pinned!(i);
                     continue;
                 }
-                self.stats.lrat_materialize_incomplete_chains += 1;
+                solver.stats.lrat_materialize_incomplete_chains += 1;
                 // Fallback: emit as TrustedTransform so the variable has a
                 // proof ID. Without this, collect_level0_unit_chain_filtered
                 // silently drops the variable, causing incomplete LRAT chains
                 // for learned clauses that depend on it (#7108 Fix E).
-                let tt_id = self
+                p.work(32)?;
+                let tt_id = solver
                     .proof_emit_add(&[unit_lit], &[], ProofAddKind::TrustedTransform)
                     .unwrap_or(0);
                 if tt_id != 0 {
-                    self.stats.lrat_materialize_hidden_trusted_units += 1;
-                    self.record_level0_proof_id_for_lit(unit_lit, tt_id);
-                    self.record_unit_proof_id_for_lit(unit_lit, tt_id);
+                    solver.stats.lrat_materialize_hidden_trusted_units += 1;
+                    p.record(solver, unit_lit)?;
+                    solver.record_level0_proof_id_for_lit(unit_lit, tt_id);
+                    p.record(solver, unit_lit)?;
+                    solver.record_unit_proof_id_for_lit(unit_lit, tt_id);
                 }
                 keep_pinned!(i);
                 continue;
             }
 
+            p.reserve(hints, 1)?;
             hints.push(reason_id);
             let hint_count = hints.len() as u64;
 
-            let unit_id = self
+            p.work(32)?;
+            let unit_id = solver
                 .proof_emit_add(&[unit_lit], &hints, ProofAddKind::Derived)
                 .unwrap_or(0);
             if unit_id != 0 {
-                self.trace_materialized_level0_unit(unit_id, unit_lit, &hints);
-                self.stats.lrat_materialize_emitted_unit_lines += 1;
-                self.stats.lrat_materialize_unit_hints += hint_count;
-                self.stats.lrat_materialize_unit_max_hints =
-                    self.stats.lrat_materialize_unit_max_hints.max(hint_count);
-                self.record_level0_proof_id_for_lit(unit_lit, unit_id);
-                self.record_unit_proof_id_for_lit(unit_lit, unit_id);
+                solver.trace_materialized_level0_unit(unit_id, unit_lit, &hints);
+                solver.stats.lrat_materialize_emitted_unit_lines += 1;
+                solver.stats.lrat_materialize_unit_hints += hint_count;
+                solver.stats.lrat_materialize_unit_max_hints =
+                    solver.stats.lrat_materialize_unit_max_hints.max(hint_count);
+                p.record(solver, unit_lit)?;
+                solver.record_level0_proof_id_for_lit(unit_lit, unit_id);
+                p.record(solver, unit_lit)?;
+                solver.record_unit_proof_id_for_lit(unit_lit, unit_id);
             } else {
                 keep_pinned!(i);
             }
         }
-        hints.clear();
-        self.cold.lrat_materialize_hints_buf = hints;
-        pinned.truncate(kept);
-        // #A2b: charge only wasted (still-pinned) rescan work at parity with
-        // the pre-#A5 scalar cursor; see
-        // `materialize_level0_minimize_unit_proofs`.
-        let repinned_at_legacy_start = pinned.first() == Some(&legacy_start);
-        self.cold.lrat_level0_unit_materialize_pinned = pinned;
-        self.cold.lrat_level0_unit_materialize_cursor = next_cursor;
-        if !deadline_truncated && repinned_at_legacy_start && level0_end > legacy_start {
-            self.charge_proof_bookkeeping((level0_end - legacy_start) as u64);
+        p.work(hints.len().saturating_add(pinned.len()).saturating_add(8))?;
+        scratch.kept = kept;
+        scratch.cursor = next_cursor;
+        solver.stats.lrat_materialize_root_trail_entries += visited_entries as u64;
+        // A truncated pass still performed its visited prefix, but neither
+        // cancellation nor an old pin licenses charging an unvisited suffix.
+        // Trace-copy charges and the irreversible exhaustion latch are unchanged.
+        if visited_entries != 0 {
+            solver.charge_proof_bookkeeping(visited_entries as u64);
         }
-        !deadline_truncated
+        p.work(0)?;
+        scratch.complete = true;
+        drop(scratch);
+        p.work(0)?;
+        Ok(!deadline_truncated)
     }
 }

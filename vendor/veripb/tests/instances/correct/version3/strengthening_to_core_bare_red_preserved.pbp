@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to incorrect/version3/strengthening_to_core_bare_red_derived: a bare `red`
+% under strengthening-to-core now stores into the core set, so the next `red` really does have
+% to preserve it. Here the second witness only touches `y2`, the obligation `1 y1 >= 1` is
+% discharged straight from the database, and the proof must still verify -- if the fix ever
+% over-rejects, this is what breaks.
+f 1;
+strengthening_to_core on;
+red 1 y1 >= 1 : y1 -> 1 ;
+red 1 y2 >= 1 : y2 -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

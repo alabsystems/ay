@@ -596,14 +596,29 @@ mod tests {
             .map(origin_fixture)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(fixtures.len(), UnknownOrigin::ALL.len());
+        // a208f658d gave the #8759 strict-proof gate (`TerminalTrust`) a natural
+        // producer; every other origin is fault-injected at its publication.
+        let natural = UnknownOrigin::ALL
+            .into_iter()
+            .filter(|origin| trigger_kind(*origin) == "natural-public-query")
+            .collect::<Vec<_>>();
         assert_eq!(
-            UnknownOrigin::ALL
-                .iter()
-                .copied()
-                .filter(|origin| trigger_kind(*origin) == "natural-public-query")
-                .count(),
-            3
+            natural,
+            [
+                UnknownOrigin::SolveDeadline,
+                UnknownOrigin::MemoryBudget,
+                UnknownOrigin::InterruptFlag,
+                UnknownOrigin::TerminalTrust,
+            ]
         );
+        for origin in UnknownOrigin::ALL {
+            assert_eq!(
+                origin_fixture(origin).starts_with("natural."),
+                natural.contains(&origin),
+                "origin={} fixture and trigger kind disagree",
+                origin.code()
+            );
+        }
         assert_eq!(
             UnknownOrigin::ALL.map(UnknownOrigin::reason),
             UnknownReason::ALL

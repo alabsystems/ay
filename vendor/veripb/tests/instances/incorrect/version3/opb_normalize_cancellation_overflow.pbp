@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Regression test: normalizing `1 x1 1 ~x1 >= i64::MIN` cancels the two terms and lowers
+% the degree by one, which used to wrap to 9223372036854775807 and stored the trivially
+% true input constraint as the empty contradiction. The formula is satisfiable.
+f 1 ;
+output NONE;
+conclusion UNSAT : 1 ;
+end pseudo-Boolean proof;

@@ -59,7 +59,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Constant, Proof, ProofId, ProofStep, Sort, TermData, TermId, TermStore};
 
-use crate::api::proofs::TrustClauseDischargeControls;
+use crate::api::proofs::{EffortShare, TrustClauseDischargeControls};
 use crate::api::{FuncDecl, Logic, Solver, Term};
 
 /// Verdict for a single proof step examined by the array checker.
@@ -223,9 +223,10 @@ fn check_array_clause_impl(
     clause: &[TermId],
     controls: Option<&TrustClauseDischargeControls>,
 ) -> ArrayStepVerdict {
-    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    // A clause is step (3)'s: its solve draws from the certification pool.
+    let share = EffortShare::Pool;
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
@@ -238,19 +239,19 @@ fn check_array_clause_impl(
     // A single-element clause may itself be an `(or ...)` term: flatten it so we
     // negate the actual disjunction rather than a structurally-nested literal.
     let literals = flatten_clause(terms, clause);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.live_until(terms, deadline) {
+    if let Some(controls) = controls {
+        if controls.stop_requested(terms) {
             return resource_unchecked();
         }
     }
 
     let mut solver = Solver::new(Logic::QfAx);
-    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        if !controls.start_native_solver(&mut solver, deadline) {
+    if let Some(controls) = controls {
+        if !controls.start_native_solver(&mut solver) {
             return resource_unchecked();
         }
     }
-    let mut translator = Translator::new(controls.zip(controlled_deadline));
+    let mut translator = Translator::new(controls);
 
     // Assert the negation of each literal of the clause. `¬(l1 ∨ ... ∨ ln)` is
     // `¬l1 ∧ ... ∧ ¬ln`.
@@ -273,15 +274,15 @@ fn check_array_clause_impl(
         }
         let negated = solver.not(translated);
         solver.assert_term(negated);
-        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-            if !controls.native_solver_live(&solver, deadline) {
+        if let Some(controls) = controls {
+            if !controls.native_solver_live(&solver) {
                 return resource_unchecked();
             }
         }
     }
 
-    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
-        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+    let result = if let Some(controls) = controls {
+        let Some(result) = controls.check_native_solver(&mut solver, share) else {
             return resource_unchecked();
         };
         result
@@ -339,11 +340,11 @@ struct Translator<'a> {
     /// Counter for unique leaf-constant names.
     next_id: u32,
     /// Mandatory-publication envelope, polled at every recursive node.
-    controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>,
+    controls: Option<&'a TrustClauseDischargeControls>,
 }
 
 impl<'a> Translator<'a> {
-    fn new(controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>) -> Self {
+    fn new(controls: Option<&'a TrustClauseDischargeControls>) -> Self {
         Self {
             memo: HashMap::default(),
             funcs: HashMap::default(),
@@ -368,7 +369,7 @@ impl<'a> Translator<'a> {
     ) -> Result<Term, String> {
         if self
             .controls
-            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+            .is_some_and(|controls| !controls.native_solver_live(solver))
         {
             return Err("proof-discharge resource envelope expired or was exceeded".to_string());
         }
@@ -378,7 +379,7 @@ impl<'a> Translator<'a> {
         let result = self.translate_uncached(solver, terms, tid)?;
         if self
             .controls
-            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+            .is_some_and(|controls| !controls.native_solver_live(solver))
         {
             return Err("proof-discharge resource envelope expired or was exceeded".to_string());
         }

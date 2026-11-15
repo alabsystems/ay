@@ -134,6 +134,8 @@ impl Executor {
             let smt_key = key.replace('_', "-");
             entries.push((smt_key, formatted_value));
         }
+        // Kept outside `last_statistics`, which a later phase can replace.
+        entries.extend(self.stderr_diagnostics.statistics_entries());
 
         // Sort alphabetically by key
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -162,7 +164,14 @@ impl Executor {
             Some(OptionValue::Numeral(n)) => format!("(:{key} {n})"),
             #[allow(unreachable_patterns)]
             Some(_) => format!("(:{key} unsupported)"),
-            None => format!("(error \"unknown option: {keyword}\")"),
+            None => match key
+                .strip_prefix("rewriter.")
+                .and_then(crate::api::PolynomialParameters::default_value)
+            {
+                Some(crate::api::TacticParameterValue::Bool(value)) => format!("(:{key} {value})"),
+                Some(crate::api::TacticParameterValue::UInt(value)) => format!("(:{key} {value})"),
+                _ => format!("(error \"unknown option: {keyword}\")"),
+            },
         }
     }
 
@@ -285,7 +294,14 @@ impl Executor {
             ));
         }
         out.push_str("(check-sat)\n");
-        out
+        if assertions
+            .iter()
+            .any(|&a| self.ctx.terms.finite_field_presence(a) != Some(false))
+        {
+            self.checked_evaluation_output(|| out)
+        } else {
+            out
+        }
     }
 
     /// Serialize the exact assertion surface paired with an exported Alethe
@@ -381,6 +397,22 @@ impl Executor {
     /// its live assertions on the per-solver handle, not on the executor's
     /// internal stack (which is only populated transiently at check time).
     pub(crate) fn assertions_sexpr_for(&self, assertions: &[TermId]) -> String {
+        let text = self.assertions_sexpr_in_namespace(assertions, &mut |_| false);
+        if assertions
+            .iter()
+            .any(|&a| self.ctx.terms.finite_field_presence(a) != Some(false))
+        {
+            self.checked_evaluation_output(|| text)
+        } else {
+            text
+        }
+    }
+
+    pub(crate) fn assertions_sexpr_in_namespace(
+        &self,
+        assertions: &[TermId],
+        occupied: &mut dyn FnMut(&str) -> bool,
+    ) -> String {
         let mut out = String::new();
         let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Z3 declares every symbol — including 0-arity constants — with
@@ -410,7 +442,10 @@ impl Executor {
             out.push_str(&decl);
         }
         for &a in assertions {
-            out.push_str(&format!("(assert {})\n", self.format_term(a)));
+            out.push_str(&format!(
+                "(assert {})\n",
+                self.format_term_in_namespace(a, occupied)
+            ));
         }
         out
     }
@@ -621,141 +656,366 @@ impl Executor {
 
     /// Simplify a term and return its SMT-LIB representation
     ///
-    /// The term is already simplified during elaboration (by the TermStore),
-    /// so this just formats the already-simplified term.
-    pub(super) fn simplify(&self, term_id: TermId) -> String {
-        self.format_term(term_id)
+    /// Eager arithmetic elaboration is retained; sequence powers stay intact
+    /// until this request's configured, original-owned sequence rewrite.
+    pub(super) fn simplify(
+        &mut self,
+        term_id: TermId,
+        parameters: &[(String, ay_frontend::sexp::SExpr)],
+    ) -> String {
+        let maximum = match self.ctx.get_option("rewriter.max_power_expansion") {
+            None => 2,
+            Some(OptionValue::Numeral(n)) => match n.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return "(error \"max_power_expansion requires an unsigned 32-bit value\")"
+                        .into()
+                }
+            },
+            Some(_) => {
+                return "(error \"max_power_expansion requires an unsigned 32-bit value\")".into()
+            }
+        };
+        let _read = self.begin_external_evaluation_read();
+        let scope = match self.capture_tactic_construction() {
+            Ok(scope) => scope,
+            Err(_) => return "(error \"simplify original owner refused\")".into(),
+        };
+        let mut polynomial = crate::api::PolynomialParameters::default();
+        let mut limits = crate::api::TacticParameters::default();
+        for (name, value) in parameters {
+            if scope.admission().admit(name.len(), 0).is_err() || !scope.validate(self) {
+                return "(error \"simplify parameter owner refused\")".into();
+            }
+            let value = match value {
+                ay_frontend::sexp::SExpr::True => crate::api::TacticParameterValue::Bool(true),
+                ay_frontend::sexp::SExpr::False => crate::api::TacticParameterValue::Bool(false),
+                ay_frontend::sexp::SExpr::Numeral(n) => {
+                    if scope.admission().admit(n.len(), 0).is_err() || !scope.validate(self) {
+                        return "(error \"simplify parameter owner refused\")".into();
+                    }
+                    match n.parse::<u32>() {
+                        Ok(n) => crate::api::TacticParameterValue::UInt(n),
+                        Err(_) => return "(error \"invalid simplify parameter value\")".into(),
+                    }
+                }
+                _ => return "(error \"invalid simplify parameter type\")".into(),
+            };
+            let name = name.trim_start_matches(':');
+            let accepted = if crate::api::PolynomialParameters::recognizes(name) {
+                polynomial.set(name, value)
+            } else {
+                limits.set(name, value)
+            };
+            if accepted.is_err() {
+                return "(error \"unsupported simplify parameter\")".into();
+            }
+        }
+        polynomial = polynomial.for_smt_command();
+        let mut global = crate::api::PolynomialParameters::default();
+        for (key, name) in [
+            ("rewriter.som", "som"),
+            ("rewriter.som_blowup", "som_blowup"),
+            ("rewriter.flat", "flat"),
+            ("rewriter.expand_power", "expand_power"),
+            ("rewriter.mul_to_power", "mul_to_power"),
+            ("rewriter.max_degree", "max_degree"),
+            ("rewriter.sort_sums", "sort_sums"),
+            ("rewriter.push_to_real", "push_to_real"),
+        ] {
+            if scope.admission().admit(key.len(), 0).is_err() || !scope.validate(self) {
+                return "(error \"simplify global parameter owner refused\")".into();
+            }
+            let value = match self.ctx.get_option(key) {
+                None => continue,
+                Some(OptionValue::Bool(v)) => crate::api::TacticParameterValue::Bool(*v),
+                Some(OptionValue::Numeral(n)) => {
+                    if scope.admission().admit(n.len(), 0).is_err() || !scope.validate(self) {
+                        return "(error \"simplify global parameter owner refused\")".into();
+                    }
+                    match n.parse::<u32>() {
+                        Ok(n) => crate::api::TacticParameterValue::UInt(n),
+                        Err(_) => return "(error \"invalid rewriter parameter\")".into(),
+                    }
+                }
+                Some(_) => return "(error \"invalid rewriter parameter type\")".into(),
+            };
+            if global.set(name, value).is_err() {
+                return "(error \"invalid rewriter parameter type\")".into();
+            }
+        }
+        polynomial = polynomial.over(global);
+        let output = match crate::api::Tactic::simplify_sequence_term(
+            &mut self.ctx.terms,
+            term_id,
+            maximum,
+            polynomial,
+            limits,
+            scope.admission(),
+        ) {
+            Ok(term) if scope.validate(self) => term,
+            _ => return "(error \"simplify original owner or source refused\")".into(),
+        };
+        match self.format_term_admitted(output, scope.admission()) {
+            Ok(text) if scope.validate(self) => text,
+            _ => "(error \"simplify output admission refused\")".into(),
+        }
+    }
+
+    /// Numeral spellings may be shadowed by declarations, as in pinned Z3.
+    /// Keep exported assertion text faithful to the actual constant node.
+    pub(crate) fn format_field_literal_checked(
+        &self,
+        value: u32,
+        field: ay_core::FiniteFieldSort,
+    ) -> Option<String> {
+        self.format_field_literal_in_namespace_checked(value, field, |_| false)
+    }
+
+    pub(crate) fn format_field_literal_in_namespace_checked(
+        &self,
+        value: u32,
+        field: ay_core::FiniteFieldSort,
+        occupied: impl FnMut(&str) -> bool,
+    ) -> Option<String> {
+        let result = crate::executor_format::format_field_literal_in_namespace(
+            &self.ctx,
+            value,
+            field,
+            || self.poll_evaluation_stop().is_ok(),
+            occupied,
+        );
+        if result.is_none() {
+            self.record_evaluation_stop(
+                crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
+            );
+        }
+        result
+    }
+    pub(in crate::executor) fn format_field_literal(
+        &self,
+        value: u32,
+        field: ay_core::FiniteFieldSort,
+    ) -> String {
+        self.format_field_literal_checked(value, field)
+            .unwrap_or_default()
+    }
+
+    // Legacy internal String renderers are enclosed by checked_evaluation_output.
+    // Preserve refusal in the existing attempt ledger, never as a fake numeral.
+    pub(in crate::executor) fn default_value_surface(&self, sort: &Sort) -> String {
+        match crate::executor_format::format_default_value_surface_with_poll(
+            &self.ctx,
+            sort,
+            &mut || self.poll_evaluation_stop().is_ok(),
+        ) {
+            Some(text) => text,
+            None => {
+                self.record_evaluation_stop(
+                    crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
+                );
+                String::new()
+            }
+        }
     }
 
     /// Format a term for SMT-LIB output (reconstructs the expression)
     pub(crate) fn format_term(&self, term_id: TermId) -> String {
-        let term = self.ctx.terms.get(term_id);
-        match term {
-            // Un-mangle instance-specific datatype member names (e.g.
-            // `osome@Opt!{Int}` -> `osome`) for user-facing `(get-value ...)`/`eval`
-            // echo; non-datatype symbols are returned unchanged.
-            TermData::Var(name, _) => {
-                self.format_declared_symbol_identity(name, self.ctx.terms.sort(term_id))
+        self.format_term_in_namespace(term_id, &mut |_| false)
+    }
+
+    pub(crate) fn format_term_in_namespace(
+        &self,
+        term_id: TermId,
+        occupied: &mut dyn FnMut(&str) -> bool,
+    ) -> String {
+        self.format_term_owned(term_id, occupied, None)
+    }
+
+    /// The same native formatter, with allocation/copy admission at each
+    /// expanded output node. No text is published on refusal.
+    pub(crate) fn format_term_admitted(
+        &self,
+        term_id: TermId,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> std::result::Result<String, ay_core::term::CountedTermError> {
+        let value = self.format_term_owned(term_id, &mut |_| false, Some(owner));
+        owner.check()?;
+        Ok(value)
+    }
+
+    fn format_term_owned(
+        &self,
+        term_id: TermId,
+        occupied: &mut dyn FnMut(&str) -> bool,
+        owner: ay_core::render_admission::Owner<'_>,
+    ) -> String {
+        ay_core::render_admission::stacked(owner, String::new, || {
+            self.format_term_body(term_id, occupied, owner)
+        })
+    }
+
+    fn format_term_body(
+        &self,
+        term_id: TermId,
+        occupied: &mut dyn FnMut(&str) -> bool,
+        owner: ay_core::render_admission::Owner<'_>,
+    ) -> String {
+        use crate::executor_format::{
+            format_bigint_owned, format_bitvec_owned, format_rational_owned,
+            format_sort_surface_owned, format_symbol_owned,
+        };
+        use ay_core::render_admission as output;
+        if !output::pay(owner, 1, 0) {
+            return String::new();
+        }
+        if term_id.index() >= self.ctx.terms.len() {
+            if owner.is_none() {
+                unreachable!("invalid native formatting term id {term_id:?}");
             }
-            TermData::Const(Constant::Bool(true)) => "true".to_string(),
-            TermData::Const(Constant::Bool(false)) => "false".to_string(),
-            TermData::Const(Constant::Int(n)) => format_bigint(n),
-            TermData::Const(Constant::Rational(r)) => format_rational(&r.0),
-            TermData::Const(Constant::String(s)) => string_literal(s),
-            // A BV numeral's printed form encodes its width, so this MUST go
-            // through the canonical printer: `#x` is well-formed only at widths
-            // that are a multiple of 4. Open-coding hex here (with a
-            // `div_ceil(4)` digit count) printed e.g. a `(_ BitVec 5)` value 17
-            // as `#x11`, which reparses as `(_ BitVec 8)`. This is the printer
-            // behind the Z3-compat C API's `Z3_ast_to_string`.
-            TermData::Const(Constant::BitVec { value, width }) => {
-                crate::executor_format::format_bitvec(value, *width)
-            }
-            TermData::Not(inner) => format!("(not {})", self.format_term(*inner)),
-            TermData::Ite(cond, then_br, else_br) => format!(
-                "(ite {} {} {})",
-                self.format_term(*cond),
-                self.format_term(*then_br),
-                self.format_term(*else_br)
+            output::invalid(owner);
+            return String::new();
+        }
+        match self.ctx.terms.get(term_id) {
+            TermData::Var(name, _) => self.format_declared_symbol_identity_owned(
+                name,
+                self.ctx.terms.sort(term_id),
+                owner,
             ),
-            TermData::App(sym, args) => {
-                // Constant arrays have a named internal application node so
-                // the array theory can match them structurally.  SMT-LIB's
-                // portable surface form is a qualified `const` identifier,
-                // not `(const-array value)` and never a declared user
-                // function.  Include the result sort to make the index sort
-                // explicit and keep dumps accepted by AY and external SMT-LIB
-                // consumers.
-                if let (Symbol::Named(n), [value]) = (sym, args.as_slice()) {
-                    if n == "const-array" && matches!(self.ctx.terms.sort(term_id), Sort::Array(_))
-                    {
-                        return format!(
-                            "((as const {}) {})",
-                            format_sort_surface(&self.ctx, self.ctx.terms.sort(term_id)),
-                            self.format_term(*value)
+            TermData::Const(Constant::Bool(value)) => {
+                output::text(owner, if *value { "true" } else { "false" })
+            }
+            TermData::Const(Constant::Int(value)) => format_bigint_owned(value, owner),
+            TermData::Const(Constant::Rational(value)) => format_rational_owned(&value.0, owner),
+            TermData::Const(Constant::String(value)) => output::string_literal(owner, value),
+            TermData::Const(Constant::FiniteField { value, field }) => {
+                let result = crate::executor_format::format_field_literal_owned(
+                    &self.ctx,
+                    *value,
+                    *field,
+                    owner,
+                    || self.poll_evaluation_stop().is_ok(),
+                    &mut *occupied,
+                );
+                match result {
+                    Some(value) => value,
+                    None => {
+                        self.record_evaluation_stop(
+                            crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
                         );
+                        String::new()
                     }
                 }
-                // Lambda arrays are stored internally as
-                // `App("lambda-array", [var, body])`; print the SMT-LIB/z3
-                // standard binder shape `(lambda ((x S)) body)` (multi-arg
-                // lambdas are curried, so they print as nested binders).
-                if let (Symbol::Named(n), [var, body]) = (sym, args.as_slice()) {
-                    if n == "lambda-array" {
-                        if let TermData::Var(vname, _) = self.ctx.terms.get(*var) {
-                            return format!(
-                                "(lambda (({} {})) {})",
-                                quote_symbol(vname),
-                                format_sort_surface(&self.ctx, self.ctx.terms.sort(*var)),
-                                self.format_term(*body)
+            }
+            TermData::Const(Constant::BitVec { value, width }) => {
+                format_bitvec_owned(value, *width, owner)
+            }
+            TermData::Not(inner) => {
+                let inner = self.format_term_owned(*inner, occupied, owner);
+                output::format(owner, format_args!("(not {inner})"))
+            }
+            TermData::Ite(condition, yes, no) => {
+                let condition = self.format_term_owned(*condition, occupied, owner);
+                let yes = self.format_term_owned(*yes, occupied, owner);
+                let no = self.format_term_owned(*no, occupied, owner);
+                output::format(owner, format_args!("(ite {condition} {yes} {no})"))
+            }
+            TermData::App(symbol, args) => {
+                if let (Symbol::Named(name), [value]) = (symbol, args.as_slice()) {
+                    if name == "const-array"
+                        && matches!(self.ctx.terms.sort(term_id), Sort::Array(_))
+                    {
+                        let sort = format_sort_surface_owned(
+                            &self.ctx,
+                            self.ctx.terms.sort(term_id),
+                            owner,
+                        );
+                        let value = self.format_term_owned(*value, occupied, owner);
+                        return output::format(owner, format_args!("((as const {sort}) {value})"));
+                    }
+                }
+                if let (Symbol::Named(name), [variable, body]) = (symbol, args.as_slice()) {
+                    if name == "lambda-array" {
+                        if let TermData::Var(name, _) = self.ctx.terms.get(*variable) {
+                            let name = output::quote(owner, name);
+                            let sort = format_sort_surface_owned(
+                                &self.ctx,
+                                self.ctx.terms.sort(*variable),
+                                owner,
+                            );
+                            let body = self.format_term_owned(*body, occupied, owner);
+                            return output::format(
+                                owner,
+                                format_args!("(lambda (({name} {sort})) {body})"),
                             );
                         }
                     }
                 }
-                let name = match sym {
-                    Symbol::Named(n) => {
-                        self.format_declared_symbol_identity(n, self.ctx.terms.sort(term_id))
-                    }
-                    _ => format_symbol(sym),
+                let name = match symbol {
+                    Symbol::Named(name) => self.format_declared_symbol_identity_owned(
+                        name,
+                        self.ctx.terms.sort(term_id),
+                        owner,
+                    ),
+                    _ => format_symbol_owned(symbol, owner),
                 };
                 if args.is_empty() {
-                    name
-                } else {
-                    let args_str: Vec<String> = args.iter().map(|&a| self.format_term(a)).collect();
-                    format!("({} {})", name, args_str.join(" "))
+                    return name;
                 }
+                let mut values = Vec::new();
+                if !output::reserve(&mut values, args.len(), owner) {
+                    return String::new();
+                }
+                for &arg in args {
+                    values.push(self.format_term_owned(arg, occupied, owner));
+                    if !output::pay(owner, 0, 0) {
+                        return String::new();
+                    }
+                }
+                let joined = output::join(owner, &values, " ");
+                output::format(owner, format_args!("({name} {joined})"))
             }
             TermData::Let(bindings, body) => {
-                // Let bindings should normally be expanded, but format just in case
-                let bindings_str: Vec<String> = bindings
-                    .iter()
-                    .map(|(name, term)| {
-                        format!("({} {})", quote_symbol(name), self.format_term(*term))
-                    })
-                    .collect();
-                format!(
-                    "(let ({}) {})",
-                    bindings_str.join(" "),
-                    self.format_term(*body)
-                )
+                let mut values = Vec::new();
+                if !output::reserve(&mut values, bindings.len(), owner) {
+                    return String::new();
+                }
+                for (name, term) in bindings {
+                    let name = output::quote(owner, name);
+                    let term = self.format_term_owned(*term, occupied, owner);
+                    values.push(output::format(owner, format_args!("({name} {term})")));
+                }
+                let joined = output::join(owner, &values, " ");
+                let body = self.format_term_owned(*body, occupied, owner);
+                output::format(owner, format_args!("(let ({joined}) {body})"))
             }
-            TermData::Forall(vars, body, _triggers) => {
-                let vars_str: Vec<String> = vars
-                    .iter()
-                    .map(|(name, sort)| {
-                        format!(
-                            "({} {})",
-                            quote_symbol(name),
-                            format_sort_surface(&self.ctx, sort)
-                        )
-                    })
-                    .collect();
-                format!(
-                    "(forall ({}) {})",
-                    vars_str.join(" "),
-                    self.format_term(*body)
-                )
+            TermData::Forall(variables, body, _) | TermData::Exists(variables, body, _) => {
+                let quantifier = if matches!(self.ctx.terms.get(term_id), TermData::Forall(..)) {
+                    "forall"
+                } else {
+                    "exists"
+                };
+                let mut values = Vec::new();
+                if !output::reserve(&mut values, variables.len(), owner) {
+                    return String::new();
+                }
+                for (name, sort) in variables {
+                    let name = output::quote(owner, name);
+                    let sort = format_sort_surface_owned(&self.ctx, sort, owner);
+                    values.push(output::format(owner, format_args!("({name} {sort})")));
+                }
+                let joined = output::join(owner, &values, " ");
+                let body = self.format_term_owned(*body, occupied, owner);
+                output::format(owner, format_args!("({quantifier} ({joined}) {body})"))
             }
-            TermData::Exists(vars, body, _triggers) => {
-                let vars_str: Vec<String> = vars
-                    .iter()
-                    .map(|(name, sort)| {
-                        format!(
-                            "({} {})",
-                            quote_symbol(name),
-                            format_sort_surface(&self.ctx, sort)
-                        )
-                    })
-                    .collect();
-                format!(
-                    "(exists ({}) {})",
-                    vars_str.join(" "),
-                    self.format_term(*body)
-                )
+            other => {
+                if owner.is_some() {
+                    output::invalid(owner);
+                    String::new()
+                } else {
+                    unreachable!("unhandled TermData variant in format_term(): {other:?}")
+                }
             }
-            // All current TermData variants are handled above.
-            // This arm is required by #[non_exhaustive] and catches future variants.
-            other => unreachable!("unhandled TermData variant in format_term(): {other:?}"),
         }
     }
 
@@ -1355,11 +1615,13 @@ impl Executor {
                 // (deterministic: core order is solver-derived, itself
                 // deterministic).
                 let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
-                return core_terms
+                let mut entries: Vec<(Option<String>, TermId)> = core_terms
                     .iter()
                     .filter(|&&tid| seen.insert(tid))
                     .map(|&tid| (name_of(tid), tid))
                     .collect();
+                self.append_adopted_definition_labels(&mut entries);
+                return entries;
             }
         }
 
@@ -1431,6 +1693,34 @@ impl Executor {
                 format!("({})", parts.join(" "))
             }
             _ => "(error \"unsat core is not available, last result was not unsat\")".to_string(),
+        }
+    }
+
+    /// #defmacro-named-preuse: a harvested core over assertions in which an
+    /// adopted definitional macro was expanded is a core of the AUTHORED
+    /// problem only together with the definition (the definition's own
+    /// assertion re-elaborated to a tautology, so the harvest never names
+    /// it). Append every live adopted definition's `:named` label that is
+    /// still a named assertion. Over-approximating a core is legal;
+    /// dropping the definition would print a set that is satisfiable on its
+    /// own. Only harvested cores reach here — the padded superset already
+    /// carries every named assertion.
+    fn append_adopted_definition_labels(&self, entries: &mut Vec<(Option<String>, TermId)>) {
+        let labels: Vec<String> = self
+            .ctx
+            .adopted_definition_labels()
+            .map(str::to_string)
+            .collect();
+        for label in labels {
+            if entries
+                .iter()
+                .any(|(name, _)| name.as_deref() == Some(label.as_str()))
+            {
+                continue;
+            }
+            if let Some(tid) = self.named_assertion_term_id(&label) {
+                entries.push((Some(label), tid));
+            }
         }
     }
 
@@ -1621,15 +1911,23 @@ impl Executor {
     /// overloaded identifier must carry its result-sort ascription so replay
     /// resolves the same full signature instead of depending on declaration
     /// order (or becoming ambiguous for equal domains).
-    fn format_declared_symbol_identity(&self, identity: &str, result_sort: &Sort) -> String {
+    fn format_declared_symbol_identity_owned(
+        &self,
+        identity: &str,
+        result_sort: &Sort,
+        owner: ay_core::render_admission::Owner<'_>,
+    ) -> String {
+        use ay_core::render_admission as output;
+        if !output::pay(owner, identity.len().saturating_add(1), 0) {
+            return String::new();
+        }
         if let Some(surface_name) = self.ctx.overloaded_surface_name(identity) {
-            format!(
-                "(as {} {})",
-                quote_symbol(surface_name),
-                format_sort_surface(&self.ctx, result_sort)
-            )
+            let name = output::quote(owner, surface_name);
+            let sort =
+                crate::executor_format::format_sort_surface_owned(&self.ctx, result_sort, owner);
+            output::format(owner, format_args!("(as {name} {sort})"))
         } else {
-            quote_symbol(self.ctx.output_symbol_name(identity))
+            output::quote(owner, self.ctx.output_symbol_name(identity))
         }
     }
 }

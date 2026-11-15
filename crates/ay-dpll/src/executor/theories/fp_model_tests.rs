@@ -18,7 +18,14 @@ fn test_extract_fp_model_positive_zero() {
     // All bits false => sign=0, exp=0, sig=0 => +zero
     let sat_model = vec![false; num_vars as usize];
 
-    let fp_model = Executor::extract_fp_model_from_bits(&sat_model, &term_to_fp, 0, &terms);
+    let fp_model = Executor::extract_fp_model_from_bits(
+        &sat_model,
+        &term_to_fp,
+        &HashMap::default(),
+        0,
+        &terms,
+    )
+    .unwrap();
 
     assert_eq!(fp_model.values.len(), 1);
     let val = fp_model.values.get(&x).unwrap();
@@ -38,9 +45,19 @@ fn test_extract_fp_model_nan() {
     // All bits true => sign=1, exp=all-ones, sig=all-ones => NaN
     let sat_model = vec![true; num_vars as usize];
 
-    let fp_model = Executor::extract_fp_model_from_bits(&sat_model, &term_to_fp, 0, &terms);
+    let fp_model = Executor::extract_fp_model_from_bits(
+        &sat_model,
+        &term_to_fp,
+        &HashMap::default(),
+        0,
+        &terms,
+    )
+    .unwrap();
 
     assert_eq!(fp_model.values.len(), 1);
     let val = fp_model.values.get(&x).unwrap();
     assert_eq!(val.to_smtlib(), "(_ NaN 8 24)");
 }
+
+#[path = "fp_model_tests/wide.rs"]
+mod wide;

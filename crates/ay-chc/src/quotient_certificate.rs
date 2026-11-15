@@ -1771,6 +1771,7 @@ fn expr_is_lia_bool_atom(expr: &ChcExpr) -> bool {
 
 fn expr_is_lia_int_term(expr: &ChcExpr) -> bool {
     match expr {
+        ChcExpr::ArrayLambda(_) => false,
         ChcExpr::Int(_) => true,
         ChcExpr::Real(_, _)
         | ChcExpr::BitVec(_, _)

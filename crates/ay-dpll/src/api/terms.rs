@@ -9,6 +9,8 @@
 
 mod arithmetic;
 mod arrays;
+mod binder_rename;
+mod binder_separation;
 mod boolean;
 mod comparisons;
 mod compat;
@@ -21,6 +23,7 @@ mod function_definitions;
 mod quantifiers;
 mod variables;
 
+pub(super) use binder_separation::BinderTwins;
 #[allow(deprecated)]
 pub use compat::AstKind;
 

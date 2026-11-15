@@ -36,11 +36,13 @@ fn test_auflia_assume_store_select_sat_canary_6731() {
         (declare-const i Int)
         (assert (= (store a i 42) b))
         (check-sat-assuming ((= (select b i) 42)))
+        (check-sat-assuming ((= (select b i) 42)))
     "#;
     let outputs = crate::common::solve_vec(smt);
     assert_eq!(
-        outputs[0], "sat",
-        "#6731 canary: QF_AUFLIA check-sat-assuming store/select must return sat, got {outputs:?}"
+        outputs,
+        vec!["sat".to_string(), "sat".to_string()],
+        "#6731 canary: both QF_AUFLIA assumption checks must return sat, got {outputs:?}"
     );
 }
 

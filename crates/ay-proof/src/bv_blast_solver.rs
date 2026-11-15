@@ -46,9 +46,9 @@
 //!   bit-blast fragment refutes by pure RUP, so none of those are needed here.
 
 use crate::bv_blast_export::{
-    blast_shift, build_gate, push_gate_cnf, BitLemma, BitLemmaKind, BvBlastProof, BvOp, Clause,
-    ClauseProvenance, GateCache, Lit, OperandRef, Refutation, ResRule, ResolutionStep,
-    SliceObligation, VarRole, VarTable, FORMAT_VERSION,
+    blast_shift_with_cancellation, build_gate, push_gate_cnf, BitLemma, BitLemmaKind, BvBlastProof,
+    BvOp, Clause, ClauseProvenance, GateCache, Lit, OperandRef, Refutation, ResRule,
+    ResolutionStep, SliceObligation, VarRole, VarTable, FORMAT_VERSION,
 };
 use ay_core::time::Instant;
 use ay_sat::{
@@ -56,11 +56,44 @@ use ay_sat::{
     ResolutionProofResource, ResolutionValidationError, ResolutionValidationResource, RupStep,
     SatUnknownReason, Variable,
 };
-use std::{collections::BTreeSet, hash::Hash, mem::size_of, time::Duration};
+use std::{mem::size_of, time::Duration};
+
+mod cancellation;
+pub(crate) mod cnf;
+mod compact;
+mod divide;
+mod expr_api;
+mod node_memo;
+mod preflight_sharing;
+pub(crate) mod retained;
+mod sweep;
+mod unsigned_compare;
+pub(crate) use compact::{note_uncounted_failure, validate_bv_expr_compact};
+
+#[cfg(test)]
+mod cancellation_tests;
+
+mod constant_bitwise;
+#[cfg(test)]
+mod constant_shift_tests;
+#[cfg(test)]
+mod product_prefix_tests;
+mod topology_bound;
+
+fn poll_export(keep_going: &mut dyn FnMut() -> bool) -> Result<(), BvExprExportError> {
+    if keep_going() {
+        Ok(())
+    } else {
+        Err(BvExprExportError::Cancelled)
+    }
+}
 
 /// Errors from [`export_bv_blast_proof_solved`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BvSolvedExportError {
+    /// The caller refused further work; no partial refutation is returned.
+    #[error("proof production cancelled")]
+    Cancelled,
     /// The width is zero or exceeds the supported solver-backed range.
     #[error("unsupported width {got} (supported: 1..={max})")]
     UnsupportedWidth {
@@ -309,604 +342,8 @@ pub fn export_bv_blast_proof_solved(
 
 // ───────────────────────── RUP → pairwise resolution ─────────────────────────
 
-/// Expand the solver's RUP DAG into a [`Refutation`] of binary resolutions.
-///
-/// Premise-id namespace (matching [`BvBlastProof::validate`]): ids `0..nclauses`
-/// name input clauses; ids `>= nclauses` name resolution steps, in order. We map
-/// each LRAT id (originals `1..=nclauses`, derived `> nclauses`) onto that space.
-fn expand_dag_to_resolution(
-    dag: &ResolutionDag,
-    clauses: &[Clause],
-    limits: Option<RupExpansionLimits>,
-) -> Result<Refutation, BvSolvedExportError> {
-    let nclauses = clauses.len() as u32;
-
-    let mut state = RupExpansionState {
-        steps: Vec::new(),
-        next_step_id: nclauses,
-        meter: limits.map(RupExpansionMeter::new),
-    };
-    state.check_deadline()?;
-
-    // Both LRAT maps retain one entry per original or derived clause. Reserve
-    // their complete bounded capacity before inserting anything, so HashMap
-    // growth cannot escape the public byte envelope midway through expansion.
-    let map_entries = dag
-        .original_clauses
-        .len()
-        .checked_add(dag.derived.len())
-        .ok_or_else(|| state.accounting_overflow("RUP expansion bytes"))?;
-    let step_capacity = if let Some(limits) = limits {
-        let mut total_hints = 0_usize;
-        for rup in &dag.derived {
-            state.charge_work(1)?;
-            total_hints = total_hints
-                .checked_add(rup.rup_hints.len())
-                .ok_or_else(|| state.accounting_overflow("RUP expansion bytes"))?;
-        }
-        total_hints.min(limits.max_steps)
-    } else {
-        0
-    };
-    reserve_rup_map::<u64, u32>(&mut state, map_entries)?;
-    reserve_rup_map::<u64, Vec<Lit>>(&mut state, map_entries)?;
-    state.reserve_steps(step_capacity)?;
-
-    // LRAT id → BvBlast premise id (the id usable as a ResolutionStep premise).
-    // Originals: LRAT id `k` (1-based) → clause index `k-1`.
-    // Derived: filled in as we emit the *final* step that produces each derived
-    // clause (the last pairwise step of its RUP expansion).
-    let mut lrat_to_premise: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    try_reserve_rup_map(&mut lrat_to_premise, map_entries, &state)?;
-    for (lrat_id, _lits) in &dag.original_clauses {
-        state.charge_work(1)?;
-        lrat_to_premise.insert(*lrat_id, (*lrat_id - 1) as u32);
-    }
-    // Original clause literals by LRAT id, for RUP replay.
-    let mut lits_by_lrat: std::collections::HashMap<u64, Vec<Lit>> =
-        std::collections::HashMap::new();
-    try_reserve_rup_map(&mut lits_by_lrat, map_entries, &state)?;
-    for (lrat_id, lits) in &dag.original_clauses {
-        let copy = copy_sat_lits_bounded(lits, &mut state)?;
-        lits_by_lrat.insert(*lrat_id, copy);
-    }
-
-    for rup in &dag.derived {
-        state.check_deadline()?;
-        let target = copy_sat_lits_bounded(&rup.clause, &mut state)?;
-        let final_premise_id =
-            expand_one_rup_step(rup, &target, &lits_by_lrat, &lrat_to_premise, &mut state)?;
-        // Register this derived clause so later steps can cite it.
-        lrat_to_premise.insert(rup.id, final_premise_id);
-        lits_by_lrat.insert(rup.id, target);
-    }
-
-    state.check_deadline()?;
-    Ok(Refutation { steps: state.steps })
-}
-
-/// Mutable output and accounting shared by each RUP expansion.
-struct RupExpansionState {
-    steps: Vec<ResolutionStep>,
-    next_step_id: u32,
-    meter: Option<RupExpansionMeter>,
-}
-
-impl RupExpansionState {
-    fn check_deadline(&self) -> Result<(), BvSolvedExportError> {
-        if self
-            .meter
-            .as_ref()
-            .is_some_and(|meter| Instant::now() >= meter.limits.deadline)
-        {
-            Err(BvSolvedExportError::ResourceLimit {
-                resource: "RUP expansion deadline",
-                limit: 0,
-                actual: 1,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    fn accounting_overflow(&self, resource: &'static str) -> BvSolvedExportError {
-        BvSolvedExportError::ResourceLimit {
-            resource,
-            limit: self.meter.as_ref().map_or(usize::MAX, |meter| {
-                if resource == "expanded literals" {
-                    meter.limits.max_literals
-                } else if resource == "RUP expansion work" {
-                    meter.limits.max_work
-                } else {
-                    meter.limits.max_bytes
-                }
-            }),
-            actual: usize::MAX,
-        }
-    }
-
-    fn charge_work(&mut self, amount: usize) -> Result<(), BvSolvedExportError> {
-        let Some(meter) = self.meter.as_mut() else {
-            return Ok(());
-        };
-        meter.work = meter
-            .work
-            .checked_add(amount)
-            .ok_or(BvSolvedExportError::ResourceLimit {
-                resource: "RUP expansion work",
-                limit: meter.limits.max_work,
-                actual: usize::MAX,
-            })?;
-        if meter.work > meter.limits.max_work {
-            return Err(BvSolvedExportError::ResourceLimit {
-                resource: "RUP expansion work",
-                limit: meter.limits.max_work,
-                actual: meter.work,
-            });
-        }
-        if meter.work >= meter.next_deadline_check {
-            if Instant::now() >= meter.limits.deadline {
-                return Err(BvSolvedExportError::ResourceLimit {
-                    resource: "RUP expansion deadline",
-                    limit: 0,
-                    actual: 1,
-                });
-            }
-            meter.next_deadline_check = meter.work.saturating_add(1_024);
-        }
-        Ok(())
-    }
-
-    fn charge_literals(&mut self, amount: usize) -> Result<(), BvSolvedExportError> {
-        let Some(meter) = self.meter.as_mut() else {
-            return Ok(());
-        };
-        meter.literals =
-            meter
-                .literals
-                .checked_add(amount)
-                .ok_or(BvSolvedExportError::ResourceLimit {
-                    resource: "expanded literals",
-                    limit: meter.limits.max_literals,
-                    actual: usize::MAX,
-                })?;
-        if meter.literals > meter.limits.max_literals {
-            return Err(BvSolvedExportError::ResourceLimit {
-                resource: "expanded literals",
-                limit: meter.limits.max_literals,
-                actual: meter.literals,
-            });
-        }
-        Ok(())
-    }
-
-    fn charge_bytes(&mut self, amount: usize) -> Result<(), BvSolvedExportError> {
-        let Some(meter) = self.meter.as_mut() else {
-            return Ok(());
-        };
-        meter.bytes =
-            meter
-                .bytes
-                .checked_add(amount)
-                .ok_or(BvSolvedExportError::ResourceLimit {
-                    resource: "RUP expansion bytes",
-                    limit: meter.limits.max_bytes,
-                    actual: usize::MAX,
-                })?;
-        if meter.bytes > meter.limits.max_bytes {
-            return Err(BvSolvedExportError::ResourceLimit {
-                resource: "RUP expansion bytes",
-                limit: meter.limits.max_bytes,
-                actual: meter.bytes,
-            });
-        }
-        Ok(())
-    }
-
-    fn reserve_steps(&mut self, capacity: usize) -> Result<(), BvSolvedExportError> {
-        if self.meter.is_none() {
-            return Ok(());
-        }
-        let bytes = capacity
-            .checked_mul(size_of::<ResolutionStep>())
-            .ok_or_else(|| self.accounting_overflow("RUP expansion bytes"))?;
-        self.charge_bytes(bytes)?;
-        self.steps
-            .try_reserve_exact(capacity)
-            .map_err(|_| BvSolvedExportError::ResourceLimit {
-                resource: "RUP expansion bytes",
-                limit: self
-                    .meter
-                    .as_ref()
-                    .map_or(usize::MAX, |meter| meter.limits.max_bytes),
-                actual: self
-                    .meter
-                    .as_ref()
-                    .map_or(usize::MAX, |meter| meter.limits.max_bytes.saturating_add(1)),
-            })
-    }
-
-    fn push_step(&mut self, step: ResolutionStep) -> Result<(), BvSolvedExportError> {
-        if let Some(limits) = self.meter.as_ref().map(|meter| meter.limits) {
-            if self.steps.len() >= limits.max_steps {
-                return Err(BvSolvedExportError::ResourceLimit {
-                    resource: "expanded resolution steps",
-                    limit: limits.max_steps,
-                    actual: self.steps.len().saturating_add(1),
-                });
-            }
-        }
-        self.steps.push(step);
-        Ok(())
-    }
-}
-
-struct RupExpansionMeter {
-    limits: RupExpansionLimits,
-    literals: usize,
-    work: usize,
-    bytes: usize,
-    next_deadline_check: usize,
-}
-
-impl RupExpansionMeter {
-    fn new(limits: RupExpansionLimits) -> Self {
-        Self {
-            limits,
-            literals: 0,
-            work: 0,
-            bytes: 0,
-            next_deadline_check: 0,
-        }
-    }
-}
-
-fn reserve_rup_map<K, V>(
-    state: &mut RupExpansionState,
-    entries: usize,
-) -> Result<(), BvSolvedExportError> {
-    // Hash tables need control bytes and spare capacity in addition to their
-    // key/value payload. A 2x record charge is a conservative pre-allocation
-    // envelope for the standard library's <= 7/8 load factor.
-    let bytes = entries
-        .checked_mul(size_of::<(K, V)>())
-        .and_then(|bytes| bytes.checked_mul(2))
-        .ok_or_else(|| state.accounting_overflow("RUP expansion bytes"))?;
-    state.charge_bytes(bytes)
-}
-
-fn try_reserve_rup_map<K, V>(
-    map: &mut std::collections::HashMap<K, V>,
-    entries: usize,
-    state: &RupExpansionState,
-) -> Result<(), BvSolvedExportError>
-where
-    K: Eq + Hash,
-{
-    if state.meter.is_none() {
-        return Ok(());
-    }
-    map.try_reserve(entries)
-        .map_err(|_| BvSolvedExportError::ResourceLimit {
-            resource: "RUP expansion bytes",
-            limit: state
-                .meter
-                .as_ref()
-                .map_or(usize::MAX, |meter| meter.limits.max_bytes),
-            actual: state
-                .meter
-                .as_ref()
-                .map_or(usize::MAX, |meter| meter.limits.max_bytes.saturating_add(1)),
-        })
-}
-
-fn reserve_rup_vec<T>(
-    len: usize,
-    state: &mut RupExpansionState,
-    literal_slots: usize,
-) -> Result<Vec<T>, BvSolvedExportError> {
-    if state.meter.is_none() {
-        return Ok(Vec::with_capacity(len));
-    }
-    state.charge_literals(literal_slots)?;
-    let bytes = len
-        .checked_mul(size_of::<T>())
-        .ok_or_else(|| state.accounting_overflow("RUP expansion bytes"))?;
-    state.charge_bytes(bytes)?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(len)
-        .map_err(|_| BvSolvedExportError::ResourceLimit {
-            resource: "RUP expansion bytes",
-            limit: state
-                .meter
-                .as_ref()
-                .map_or(usize::MAX, |meter| meter.limits.max_bytes),
-            actual: state
-                .meter
-                .as_ref()
-                .map_or(usize::MAX, |meter| meter.limits.max_bytes.saturating_add(1)),
-        })?;
-    Ok(out)
-}
-
-fn copy_sat_lits_bounded(
-    source: &[Literal],
-    state: &mut RupExpansionState,
-) -> Result<Vec<Lit>, BvSolvedExportError> {
-    let mut out = reserve_rup_vec(source.len(), state, source.len())?;
-    for lit in source {
-        state.charge_work(1)?;
-        out.push(lit_from_sat(lit));
-    }
-    Ok(out)
-}
-
-fn copy_lits_bounded(
-    source: &[Lit],
-    state: &mut RupExpansionState,
-) -> Result<Vec<Lit>, BvSolvedExportError> {
-    let mut out = reserve_rup_vec(source.len(), state, source.len())?;
-    for &lit in source {
-        state.charge_work(1)?;
-        out.push(lit);
-    }
-    Ok(out)
-}
-
-/// Expand a single RUP step into binary resolutions and return the BvBlast
-/// premise-id of the step that yields (a clause set-equal to) `target`.
-///
-/// Algorithm (standard RUP → resolution by reverse propagation):
-///  1. Replay RUP: assume `¬target`, walk `rup_hints` in order; each hint is
-///     unit and propagates one literal, the last hint conflicts. Record, per
-///     hint, the unit literal it propagated.
-///  2. Walk the *used* hints in reverse, starting from the conflicting clause,
-///     resolving on each recorded unit literal whenever the running resolvent
-///     contains its negation. Each resolution is one emitted [`ResolutionStep`].
-fn expand_one_rup_step(
-    rup: &RupStep,
-    target: &[Lit],
-    lits_by_lrat: &std::collections::HashMap<u64, Vec<Lit>>,
-    lrat_to_premise: &std::collections::HashMap<u64, u32>,
-    state: &mut RupExpansionState,
-) -> Result<u32, BvSolvedExportError> {
-    state.check_deadline()?;
-    // ── 1. RUP replay to discover per-hint unit literals. ──
-    // Trail value: var → assigned bool. Assume ¬target.
-    let mut assign: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
-    let assignment_entries = target
-        .len()
-        .checked_add(rup.rup_hints.len())
-        .ok_or_else(|| state.accounting_overflow("RUP expansion bytes"))?;
-    reserve_rup_map::<u32, bool>(state, assignment_entries)?;
-    try_reserve_rup_map(&mut assign, assignment_entries, state)?;
-    for l in target {
-        state.charge_work(1)?;
-        // ¬l is forced true under the assumption.
-        assign.insert(l.var, l.neg); // if l = +v then ¬l forces v=false; if l=¬v forces v=true
-    }
-    // For each hint, the unit literal it adds (None for the final conflict).
-    let mut hint_units: Vec<Option<Lit>> =
-        reserve_rup_vec(rup.rup_hints.len(), state, rup.rup_hints.len())?;
-    let mut conflict_at: Option<usize> = None;
-    for (i, &h) in rup.rup_hints.iter().enumerate() {
-        state.charge_work(1)?;
-        let clause = lits_by_lrat
-            .get(&h)
-            .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-        let mut unassigned_count = 0_usize;
-        let mut unassigned_lit = None;
-        let mut satisfied = false;
-        for &lit in clause {
-            state.charge_work(1)?;
-            match assign.get(&lit.var) {
-                Some(&val) => {
-                    // literal true iff (val == !lit.neg) i.e. var assigned to lit's polarity
-                    let lit_true = val != lit.neg;
-                    if lit_true {
-                        satisfied = true;
-                        break;
-                    }
-                    // else falsified, skip
-                }
-                None => {
-                    unassigned_count = unassigned_count.saturating_add(1);
-                    unassigned_lit = Some(lit);
-                }
-            }
-        }
-        if satisfied {
-            // Already-true hint: contributes nothing; record as no-op.
-            hint_units.push(None);
-            continue;
-        }
-        match unassigned_count {
-            0 => {
-                // Conflict: all literals falsified.
-                hint_units.push(None);
-                conflict_at = Some(i);
-                break;
-            }
-            1 => {
-                let u =
-                    unassigned_lit.ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-                // propagate: assign var so that u becomes true.
-                assign.insert(u.var, !u.neg);
-                hint_units.push(Some(u));
-            }
-            _ => {
-                // Non-unit hint under RUP: the proof is not a clean unit chain.
-                return Err(BvSolvedExportError::RupExpansionFailed { id: rup.id });
-            }
-        }
-    }
-    let conflict_idx = conflict_at.ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-
-    // ── 2. Reverse-resolve from the conflicting clause. ──
-    let conflict_hint = rup.rup_hints[conflict_idx];
-    let conflict_clause = lits_by_lrat
-        .get(&conflict_hint)
-        .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-    let mut resolvent = copy_lits_bounded(conflict_clause, state)?;
-    let mut last_premise: u32 = *lrat_to_premise
-        .get(&conflict_hint)
-        .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-
-    // Walk hints before the conflict, in reverse, resolving on their unit vars.
-    for j in (0..conflict_idx).rev() {
-        state.charge_work(1)?;
-        let Some(unit) = hint_units[j] else {
-            continue; // no-op / satisfied hint contributes nothing
-        };
-        // Resolve only if the resolvent currently contains ¬unit (the pivot).
-        if !contains_lit_bounded(&resolvent, unit.negated(), state)? {
-            continue;
-        }
-        let hint_id = rup.rup_hints[j];
-        let hint_clause = lits_by_lrat
-            .get(&hint_id)
-            .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-        let pivot = unit.var;
-        let new_resolvent = resolve_pair(&resolvent, hint_clause, pivot, state)?
-            .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-        let hint_premise = *lrat_to_premise
-            .get(&hint_id)
-            .ok_or(BvSolvedExportError::RupExpansionFailed { id: rup.id })?;
-        let step_id = state.next_step_id;
-        state.next_step_id =
-            state
-                .next_step_id
-                .checked_add(1)
-                .ok_or(BvSolvedExportError::ResourceLimit {
-                    resource: "resolution step id space",
-                    limit: u32::MAX as usize,
-                    actual: usize::MAX,
-                })?;
-        let step_clause = copy_lits_bounded(&new_resolvent, state)?;
-        state.push_step(ResolutionStep {
-            id: step_id,
-            clause: step_clause,
-            rule: ResRule::Resolution,
-            premises: [last_premise, hint_premise],
-            pivot,
-        })?;
-        resolvent = new_resolvent;
-        last_premise = step_id;
-    }
-
-    // The reverse-resolution resolvent must be set-equal to the target clause.
-    if !clause_set_eq(&resolvent, target, state)? {
-        return Err(BvSolvedExportError::RupExpansionFailed { id: rup.id });
-    }
-
-    // If the RUP chain produced the target in zero resolutions (a single
-    // conflicting clause that already equals the target — e.g. a unit derived
-    // directly), `last_premise` already names a clause set-equal to target, but
-    // it may be an *original clause* id rather than a fresh step. The downstream
-    // validator needs the derived clause to be citable; if no step was emitted,
-    // emit a trivial identity is impossible (resolution needs two premises), so
-    // require at least one resolution. For our bit-blast obligations every
-    // derived clause needs >= 1 resolution, so this is satisfied; guard anyway.
-    Ok(last_premise)
-}
-
-/// Binary resolution of `a` and `b` on `pivot`, deduplicated; `None` if `pivot`
-/// is not a clean opposite-polarity pivot or the resolvent is tautological.
-fn resolve_pair(
-    a: &[Lit],
-    b: &[Lit],
-    pivot: u32,
-    state: &mut RupExpansionState,
-) -> Result<Option<Vec<Lit>>, BvSolvedExportError> {
-    if state.meter.is_none() {
-        let a_pos = a.contains(&Lit::pos(pivot));
-        let a_neg = a.contains(&Lit::neg(pivot));
-        let b_pos = b.contains(&Lit::pos(pivot));
-        let b_neg = b.contains(&Lit::neg(pivot));
-        let valid = (a_pos && b_neg && !a_neg && !b_pos) || (a_neg && b_pos && !a_pos && !b_neg);
-        if !valid {
-            return Ok(None);
-        }
-        let mut out: Vec<Lit> = Vec::new();
-        let mut seen: BTreeSet<Lit> = BTreeSet::new();
-        for &lit in a.iter().chain(b.iter()) {
-            if lit.var == pivot {
-                continue;
-            }
-            if seen.contains(&lit.negated()) {
-                return Ok(None);
-            }
-            if seen.insert(lit) {
-                out.push(lit);
-            }
-        }
-        return Ok(Some(out));
-    }
-
-    let a_pos = contains_lit_bounded(a, Lit::pos(pivot), state)?;
-    let a_neg = contains_lit_bounded(a, Lit::neg(pivot), state)?;
-    let b_pos = contains_lit_bounded(b, Lit::pos(pivot), state)?;
-    let b_neg = contains_lit_bounded(b, Lit::neg(pivot), state)?;
-    let valid = (a_pos && b_neg && !a_neg && !b_pos) || (a_neg && b_pos && !a_pos && !b_neg);
-    if !valid {
-        return Ok(None);
-    }
-    let capacity = a
-        .len()
-        .checked_add(b.len())
-        .ok_or_else(|| state.accounting_overflow("expanded literals"))?;
-    let mut out: Vec<Lit> = reserve_rup_vec(capacity, state, capacity)?;
-    for &l in a.iter().chain(b.iter()) {
-        state.charge_work(1)?;
-        if l.var == pivot {
-            continue;
-        }
-        if contains_lit_bounded(&out, l.negated(), state)? {
-            return Ok(None); // tautology
-        }
-        if !contains_lit_bounded(&out, l, state)? {
-            out.push(l);
-        }
-    }
-    Ok(Some(out))
-}
-
-fn contains_lit_bounded(
-    clause: &[Lit],
-    needle: Lit,
-    state: &mut RupExpansionState,
-) -> Result<bool, BvSolvedExportError> {
-    for &lit in clause {
-        state.charge_work(1)?;
-        if lit == needle {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn clause_set_eq(
-    a: &[Lit],
-    b: &[Lit],
-    state: &mut RupExpansionState,
-) -> Result<bool, BvSolvedExportError> {
-    if state.meter.is_none() {
-        let sa: BTreeSet<Lit> = a.iter().copied().collect();
-        let sb: BTreeSet<Lit> = b.iter().copied().collect();
-        return Ok(sa == sb);
-    }
-    for &lit in a {
-        if !contains_lit_bounded(b, lit, state)? {
-            return Ok(false);
-        }
-    }
-    for &lit in b {
-        if !contains_lit_bounded(a, lit, state)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
+use rup_expansion::{expand_dag_to_resolution, expand_dag_to_resolution_with_cancellation};
+mod rup_expansion;
 
 // ───────────────────────── bit-blast helpers (per-side) ──────────────────────
 
@@ -962,6 +399,35 @@ fn blast_side_roles(
     clauses: &mut Vec<Clause>,
     scratch: &mut GateScratch,
 ) -> Vec<u32> {
+    match blast_side_roles_with_cancellation(
+        op,
+        x_bits,
+        y_bits,
+        side,
+        vars,
+        bit_lemmas,
+        clauses,
+        scratch,
+        &mut || true,
+    ) {
+        Ok(bits) => bits,
+        Err(_) => unreachable!("always-accepting gate construction cannot be cancelled"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blast_side_roles_with_cancellation(
+    op: BvOp,
+    x_bits: &[u32],
+    y_bits: &[u32],
+    side: Side,
+    vars: &mut VarTable,
+    bit_lemmas: &mut Vec<BitLemma>,
+    clauses: &mut Vec<Clause>,
+    scratch: &mut GateScratch,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<Vec<u32>, BvExprExportError> {
+    poll_export(keep_going)?;
     let n = x_bits.len();
     let cache = &mut scratch.cache;
 
@@ -983,17 +449,20 @@ fn blast_side_roles(
     if let Some(gate) = bitwise_gate {
         return (0..n)
             .map(|bit| {
-                build_gate(
-                    gate,
-                    vec![x_bits[bit], y_bits[bit]],
-                    side.out_role(bit as u32),
-                    vars,
-                    bit_lemmas,
-                    clauses,
-                    cache,
-                )
+                poll_export(keep_going)?;
+                Ok({
+                    build_gate(
+                        gate,
+                        vec![x_bits[bit], y_bits[bit]],
+                        side.out_role(bit as u32),
+                        vars,
+                        bit_lemmas,
+                        clauses,
+                        cache,
+                    )
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, BvExprExportError>>();
     }
 
     // Arithmetic ripple-carry (Add / Sub): Sub complements `y` and carries in 1.
@@ -1002,17 +471,20 @@ fn blast_side_roles(
             .iter()
             .enumerate()
             .map(|(bit, &y)| {
-                build_gate(
-                    BitLemmaKind::Not,
-                    vec![y],
-                    side.not_b_role(bit as u32),
-                    vars,
-                    bit_lemmas,
-                    clauses,
-                    cache,
-                )
+                poll_export(keep_going)?;
+                Ok({
+                    build_gate(
+                        BitLemmaKind::Not,
+                        vec![y],
+                        side.not_b_role(bit as u32),
+                        vars,
+                        bit_lemmas,
+                        clauses,
+                        cache,
+                    )
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, BvExprExportError>>()?;
         let t = build_gate(
             BitLemmaKind::ConstTrue,
             vec![],
@@ -1033,12 +505,18 @@ fn blast_side_roles(
             clauses,
             cache,
         );
-        (y_bits.to_vec(), f)
+        let mut copied = Vec::with_capacity(y_bits.len());
+        for &bit in y_bits {
+            poll_export(keep_going)?;
+            copied.push(bit);
+        }
+        (copied, f)
     };
 
     let mut out = Vec::with_capacity(n);
     let mut carry = cin;
     for bit in 0..n {
+        poll_export(keep_going)?;
         let a = x_bits[bit];
         let b2 = op2_bits[bit];
         let o = build_gate(
@@ -1063,7 +541,8 @@ fn blast_side_roles(
         }
         out.push(o);
     }
-    out
+    poll_export(keep_going)?;
+    Ok(out)
 }
 
 // ───────────────────────── lit conversions ──────────────────────
@@ -1217,6 +696,8 @@ pub enum BvExpr {
     /// compare decomposition needs, and the `N == V` flag-equality inside the
     /// signed-lt overflow term.
     Eq(Box<BvExpr>, Box<BvExpr>),
+    /// Unsigned less-than, lowered to a shared prefix of existing Boolean gates.
+    Ult(Box<BvExpr>, Box<BvExpr>),
     /// The final CARRY-OUT bit of a ripple-carry add/sub of `lhs` and `rhs`.
     /// `is_sub == false`: carry-out of `lhs + rhs` (carry-in 0).
     /// `is_sub == true`: carry-out of `lhs - rhs = lhs + ~rhs + 1` (carry-in 1).
@@ -1256,6 +737,12 @@ pub enum BvExpr {
     /// real: `Mul` is genuinely distinct from `Add` (e.g. `a*b != a+b`), so a
     /// multiply lowered/emitted as an add is refuted, never silently proved.
     Mul(Box<BvExpr>, Box<BvExpr>),
+    /// `bvudiv(lhs, rhs)` with SMT-LIB's zero divisor (all ones): the quotient
+    /// of a restoring divider over existing gates (`divide.rs`).
+    UDiv(Box<BvExpr>, Box<BvExpr>),
+    /// `bvurem(lhs, rhs)` with SMT-LIB's zero divisor (`lhs`): the remainder
+    /// of the same divider.
+    URem(Box<BvExpr>, Box<BvExpr>),
 }
 
 // The `add`/`sub`/`mul`/`shl`/`not` constructors are named after the SMT-LIB
@@ -1263,162 +750,12 @@ pub enum BvExpr {
 // and return a `BvExpr` node, so they cannot and should not implement the
 // same-named `std::ops` traits.
 #[allow(clippy::should_implement_trait)]
-impl BvExpr {
-    /// Convenience: a named leaf.
-    #[must_use]
-    pub fn leaf(name: &str, width: u32) -> Self {
-        Self::Leaf {
-            name: name.to_string(),
-            width,
-        }
-    }
-    /// Convenience: `bvadd(lhs, rhs)`. Restored after the workspace-quality
-    /// audit removed it as workspace-unused: downstream consumers (proof-replay-consumer's
-    /// pcay reconstruction, trust-router's ay_certify, external-codegen-bridge's
-    /// verify_output) construct these shapes at many call sites — the boxed
-    /// variant spelling is an implementation detail, not the API.
-    #[must_use]
-    pub fn add(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::Add(Box::new(lhs), Box::new(rhs))
-    }
-    /// Convenience: `bvsub(lhs, rhs)`.
-    #[must_use]
-    pub fn sub(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::Sub(Box::new(lhs), Box::new(rhs))
-    }
-    /// Convenience: `bvmul(lhs, rhs)`.
-    #[must_use]
-    pub fn mul(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::Mul(Box::new(lhs), Box::new(rhs))
-    }
-    /// Convenience: `bvshl(value, amount)`.
-    #[must_use]
-    pub fn shl(value: BvExpr, amount: BvExpr) -> Self {
-        Self::Shl(Box::new(value), Box::new(amount))
-    }
-    /// Convenience: `bvnot(inner)`.
-    #[must_use]
-    pub fn not(inner: BvExpr) -> Self {
-        Self::Not(Box::new(inner))
-    }
-    /// Convenience: `(_ zero_extend added)`.
-    #[must_use]
-    pub fn zero_ext(inner: BvExpr, added: u32) -> Self {
-        Self::ZeroExt(Box::new(inner), added)
-    }
-    /// Convenience: `(_ extract high low)`.
-    #[must_use]
-    pub fn extract(inner: BvExpr, high: u32, low: u32) -> Self {
-        Self::Extract {
-            inner: Box::new(inner),
-            high,
-            low,
-        }
-    }
-    /// Convenience: `bvor`.
-    #[must_use]
-    pub fn or(l: BvExpr, r: BvExpr) -> Self {
-        Self::Or(Box::new(l), Box::new(r))
-    }
-    /// Convenience: `bvand`.
-    #[must_use]
-    pub fn and(l: BvExpr, r: BvExpr) -> Self {
-        Self::And(Box::new(l), Box::new(r))
-    }
-    /// Convenience: `bvxor`.
-    #[must_use]
-    pub fn xor(l: BvExpr, r: BvExpr) -> Self {
-        Self::Xor(Box::new(l), Box::new(r))
-    }
-    /// Convenience: a fixed bit-vector constant of the given width.
-    #[must_use]
-    pub fn const_val(value: u128, width: u32) -> Self {
-        Self::Const { value, width }
-    }
-    /// Convenience: `(_ sign_extend added)`.
-    #[must_use]
-    pub fn sign_ext(inner: BvExpr, added: u32) -> Self {
-        Self::SignExt(Box::new(inner), added)
-    }
-    /// Convenience: `bvlshr`.
-    #[must_use]
-    pub fn lshr(value: BvExpr, amount: BvExpr) -> Self {
-        Self::Lshr(Box::new(value), Box::new(amount))
-    }
-    /// Convenience: `bvashr`.
-    #[must_use]
-    pub fn ashr(value: BvExpr, amount: BvExpr) -> Self {
-        Self::Ashr(Box::new(value), Box::new(amount))
-    }
-    /// Convenience: bit-vector equality (`= lhs rhs`) reduced to a 1-bit predicate.
-    #[must_use]
-    pub fn eq(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::Eq(Box::new(lhs), Box::new(rhs))
-    }
-    /// Convenience: carry-out of the ripple-carry add (`is_sub == false`).
-    #[must_use]
-    pub fn carry_out_add(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::CarryOut {
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            is_sub: false,
-        }
-    }
-    /// Convenience: carry-out of the ripple-carry subtract (`a + ~b + 1`).
-    /// `unsigned_lt(a, b) = NOT(carry_out_sub(a, b))`.
-    #[must_use]
-    pub fn carry_out_sub(lhs: BvExpr, rhs: BvExpr) -> Self {
-        Self::CarryOut {
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-            is_sub: true,
-        }
-    }
-}
-
-/// Convenience: `bvadd` (also callable as `BvExpr::add(l, r)`).
-impl std::ops::Add for BvExpr {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self::Add(Box::new(self), Box::new(rhs))
-    }
-}
-
-/// Convenience: `bvsub` (also callable as `BvExpr::sub(l, r)`).
-impl std::ops::Sub for BvExpr {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self::Sub(Box::new(self), Box::new(rhs))
-    }
-}
-
-/// Convenience: `bvmul` (also callable as `BvExpr::mul(l, r)`).
-impl std::ops::Mul for BvExpr {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        Self::Mul(Box::new(self), Box::new(rhs))
-    }
-}
-
-/// Convenience: `bvshl` (also callable as `BvExpr::shl(value, amount)`).
-impl std::ops::Shl for BvExpr {
-    type Output = Self;
-    fn shl(self, amount: Self) -> Self {
-        Self::Shl(Box::new(self), Box::new(amount))
-    }
-}
-
-/// Convenience: `bvnot`, per-bit NOT (also callable as `BvExpr::not(inner)`).
-impl std::ops::Not for BvExpr {
-    type Output = Self;
-    fn not(self) -> Self {
-        Self::Not(Box::new(self))
-    }
-}
-
 /// Errors from [`export_bv_blast_proof_expr`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BvExprExportError {
+    /// The caller refused further work; this is not a satisfiability verdict.
+    #[error("proof production cancelled")]
+    Cancelled,
     /// The two sides of the equality bit-blast to different widths, so a per-bit
     /// equality is not well-formed.
     #[error("width mismatch: lhs is {lhs} bits, rhs is {rhs} bits")]
@@ -1572,7 +909,13 @@ impl BvExprProofBudget {
 /// deadline in `resolution`.
 #[derive(Clone, Debug)]
 pub(crate) struct BvExprProofLimits {
+    /// Maximum DISTINCT expression nodes (structurally identical subtrees are
+    /// one node). The encoder blasts each distinct node once, so this, not the
+    /// occurrence count, measures encoding work.
     pub(crate) max_expr_nodes: usize,
+    /// Maximum source OCCURRENCES: the tree walk of the preflight, and the
+    /// constant-time memo lookup the encoder makes at a repeated occurrence.
+    pub(crate) max_expr_occurrences: usize,
     pub(crate) max_expr_depth: usize,
     pub(crate) max_leaf_name_bytes: usize,
     /// Maximum width of any internal expression node. This may exceed the
@@ -1586,9 +929,18 @@ pub(crate) struct BvExprProofLimits {
     pub(crate) max_expansion_work: usize,
     pub(crate) max_expansion_bytes: usize,
     pub(crate) resolution: ResolutionProofLimits,
+    /// Past a counted search or proof-size cap, try a swept refutation inside
+    /// the same envelope (`sweep.rs`). Only the strict checker's lemma
+    /// validation sets it, and only for a clause over no array.
+    pub(crate) sweep: bool,
 }
 
 const BOUNDED_MAX_EXPR_NODES: usize = 4096;
+/// Occurrences of the conservative preset. An occurrence costs one preflight
+/// visit, one occurrence-table entry (charged to the construction bytes) and,
+/// when it repeats a node, one memo lookup in the encoder; all gate
+/// construction is charged per DISTINCT node against `BOUNDED_MAX_EXPR_NODES`.
+const BOUNDED_MAX_EXPR_OCCURRENCES: usize = 100_000;
 const BOUNDED_MAX_EXPR_DEPTH: usize = 512;
 const BOUNDED_MAX_LEAF_NAME_BYTES: usize = 1024 * 1024;
 const BOUNDED_MAX_INTERNAL_WIDTH: u32 = 128;
@@ -1641,6 +993,7 @@ impl BvExprProofLimits {
 
         Self {
             max_expr_nodes: BOUNDED_MAX_EXPR_NODES,
+            max_expr_occurrences: BOUNDED_MAX_EXPR_OCCURRENCES,
             max_expr_depth: BOUNDED_MAX_EXPR_DEPTH,
             max_leaf_name_bytes: BOUNDED_MAX_LEAF_NAME_BYTES,
             max_internal_width: BOUNDED_MAX_INTERNAL_WIDTH,
@@ -1651,6 +1004,7 @@ impl BvExprProofLimits {
             max_expansion_work: BOUNDED_MAX_EXPANSION_WORK,
             max_expansion_bytes: BOUNDED_MAX_EXPANSION_BYTES,
             resolution,
+            sweep: false,
         }
     }
 }
@@ -1658,9 +1012,10 @@ impl BvExprProofLimits {
 /// Scratch state shared across the bit-blast of BOTH sides of the equality: one
 /// gate cache (so common sub-terms fuse) and an interning table mapping each named
 /// leaf to its (allocated-once) input bit vars.
-struct ExprBlaster {
+struct ExprBlaster<'a> {
     cache: GateCache,
     deadline: Option<Instant>,
+    keep_going: &'a mut dyn FnMut() -> bool,
     /// Leaf name → input bit vars (LSB-first). First-seen order also assigns the
     /// `InputLeaf { leaf }` index.
     leaves: std::collections::HashMap<String, Vec<u32>>,
@@ -1668,20 +1023,33 @@ struct ExprBlaster {
     zero_bit: Option<u32>,
     /// A cached `ConstTrue` one bit (used by `Const` 1 bits), built once.
     one_bit: Option<u32>,
+    /// The preflight's occurrence table: source address -> interned node.
+    /// Empty on the unbounded path, which therefore blasts every occurrence.
+    shared: std::collections::HashMap<usize, u32>,
+    /// Output bits of every interned node already blasted.
+    blasted: std::collections::HashMap<u32, Vec<u32>>,
+    /// Occurrences actually blasted (not answered from `blasted`).
+    #[cfg(test)]
+    node_blasts: usize,
 }
 
-impl ExprBlaster {
-    fn new(deadline: Option<Instant>) -> Self {
+impl<'a> ExprBlaster<'a> {
+    fn new(deadline: Option<Instant>, keep_going: &'a mut dyn FnMut() -> bool) -> Self {
         Self {
             cache: GateCache::default(),
             deadline,
+            keep_going,
             leaves: std::collections::HashMap::new(),
             zero_bit: None,
             one_bit: None,
+            shared: std::collections::HashMap::new(),
+            blasted: std::collections::HashMap::new(),
+            #[cfg(test)]
+            node_blasts: 0,
         }
     }
 
-    fn check_deadline(&self) -> Result<(), BvExprExportError> {
+    fn check_deadline(&mut self) -> Result<(), BvExprExportError> {
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -1692,7 +1060,7 @@ impl ExprBlaster {
                 actual: 1,
             })
         } else {
-            Ok(())
+            poll_export(self.keep_going)
         }
     }
 
@@ -1717,7 +1085,10 @@ impl ExprBlaster {
                     limit: bits.len(),
                     actual: bits.len().saturating_add(1),
                 })?;
-            copy.extend_from_slice(bits);
+            for &bit in bits {
+                poll_export(self.keep_going)?;
+                copy.push(bit);
+            }
             return Ok(copy);
         }
         let leaf_idx =
@@ -1744,6 +1115,7 @@ impl ExprBlaster {
                 actual: width.saturating_add(1),
             })?;
         for bit in 0..width {
+            poll_export(self.keep_going)?;
             bits.push(vars.alloc(VarRole::InputLeaf {
                 leaf: leaf_idx,
                 bit: bit as u32,
@@ -1757,7 +1129,10 @@ impl ExprBlaster {
                 limit: width,
                 actual: width.saturating_add(1),
             })?;
-        retained.extend_from_slice(&bits);
+        for &bit in &bits {
+            poll_export(self.keep_going)?;
+            retained.push(bit);
+        }
         self.leaves.insert(owned_name, retained);
         Ok(bits)
     }
@@ -1808,17 +1183,18 @@ impl ExprBlaster {
         o
     }
 
-    /// Bit-blast `expr` into its output bit vars (LSB-first). Gates flow through the
-    /// shared cache, so structurally-identical sub-terms (even across the two sides
-    /// of the equality) reuse one set of output vars.
-    fn blast(
+    /// One occurrence's bits, built from its operands' (possibly shared) bits.
+    fn blast_node(
         &mut self,
         expr: &BvExpr,
         vars: &mut VarTable,
         bit_lemmas: &mut Vec<BitLemma>,
         clauses: &mut Vec<Clause>,
     ) -> Result<Vec<u32>, BvExprExportError> {
-        self.check_deadline()?;
+        #[cfg(test)]
+        {
+            self.node_blasts += 1;
+        }
         match expr {
             BvExpr::Leaf { name, width } => {
                 if *width == 0 {
@@ -1848,7 +1224,7 @@ impl ExprBlaster {
                 let mut scratch = GateScratch {
                     cache: std::mem::take(&mut self.cache),
                 };
-                let out = blast_side_roles(
+                let out = blast_side_roles_with_cancellation(
                     op,
                     &lb,
                     &rb,
@@ -1857,15 +1233,20 @@ impl ExprBlaster {
                     bit_lemmas,
                     clauses,
                     &mut scratch,
+                    self.keep_going,
                 );
                 self.cache = scratch.cache;
+                let out = out?;
                 self.check_deadline()?;
                 Ok(out)
             }
             BvExpr::ZeroExt(inner, added) => {
                 let mut bits = self.blast(inner, vars, bit_lemmas, clauses)?;
                 let z = self.zero(vars, bit_lemmas, clauses);
-                bits.extend(std::iter::repeat_n(z, *added as usize));
+                for _ in 0..*added {
+                    self.check_deadline()?;
+                    bits.push(z);
+                }
                 Ok(bits)
             }
             BvExpr::Extract { inner, high, low } => {
@@ -1876,7 +1257,12 @@ impl ExprBlaster {
                         bits.len()
                     )));
                 }
-                Ok(bits[(*low as usize)..=(*high as usize)].to_vec())
+                let mut selected = Vec::with_capacity((high - low + 1) as usize);
+                for &bit in &bits[(*low as usize)..=(*high as usize)] {
+                    self.check_deadline()?;
+                    selected.push(bit);
+                }
+                Ok(selected)
             }
             BvExpr::Or(l, r) | BvExpr::And(l, r) | BvExpr::Xor(l, r) => {
                 let lb = self.blast(l, vars, bit_lemmas, clauses)?;
@@ -1887,14 +1273,9 @@ impl ExprBlaster {
                         rhs: rb.len() as u32,
                     });
                 }
-                // Per-bit bitwise gate, NO carry chain — the same gate-fidelity the
-                // operand-swap path's `BvOp::{Or,And,Xor}` uses. Built through THIS
-                // blaster's shared cache, so an identity wrapper `Or(Const{0}, x)`
-                // whose RHS sub-tree also appears bare on the other side of the
-                // equality fuses its inputs, and `Or(0, x)` collapses to the same
-                // output bits as a bare `x` only insofar as the solver proves it (no
-                // structural shortcut: each per-bit gate is a real gate the solver
-                // reasons about).
+                // Both operands have been completely validated and constructed.
+                // Known constant bits can select the exact existing wire; every
+                // remaining bit uses the independently replayed Boolean gate.
                 let kind = match expr {
                     BvExpr::Or(..) => BitLemmaKind::Or2,
                     BvExpr::And(..) => BitLemmaKind::And2,
@@ -1903,17 +1284,23 @@ impl ExprBlaster {
                 };
                 Ok((0..lb.len())
                     .map(|bit| {
-                        build_gate(
-                            kind,
-                            vec![lb[bit], rb[bit]],
-                            VarRole::Aux { bit: bit as u32 },
-                            vars,
-                            bit_lemmas,
-                            clauses,
-                            &mut self.cache,
-                        )
+                        self.check_deadline()?;
+                        if let Some(output) = self.constant_bitwise(kind, lb[bit], rb[bit]) {
+                            return Ok(output);
+                        }
+                        Ok({
+                            build_gate(
+                                kind,
+                                vec![lb[bit], rb[bit]],
+                                VarRole::Aux { bit: bit as u32 },
+                                vars,
+                                bit_lemmas,
+                                clauses,
+                                &mut self.cache,
+                            )
+                        })
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>, BvExprExportError>>()?)
             }
             BvExpr::Const { value, width } => {
                 if *width == 0 {
@@ -1935,14 +1322,17 @@ impl ExprBlaster {
                 // one `ConstFalse` var.
                 Ok((0..*width)
                     .map(|bit| {
-                        let set = (*value >> bit) & 1 == 1;
-                        if set {
-                            self.one(vars, bit_lemmas, clauses)
-                        } else {
-                            self.zero(vars, bit_lemmas, clauses)
-                        }
+                        self.check_deadline()?;
+                        Ok({
+                            let set = (*value >> bit) & 1 == 1;
+                            if set {
+                                self.one(vars, bit_lemmas, clauses)
+                            } else {
+                                self.zero(vars, bit_lemmas, clauses)
+                            }
+                        })
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>, BvExprExportError>>()?)
             }
             BvExpr::SignExt(inner, added) => {
                 let bits = self.blast(inner, vars, bit_lemmas, clauses)?;
@@ -1957,7 +1347,10 @@ impl ExprBlaster {
                 // kernel re-checks this with the SAME gate vocabulary.
                 let sign = *bits.last().expect("non-empty checked above");
                 let mut out = bits;
-                out.extend(std::iter::repeat_n(sign, *added as usize));
+                for _ in 0..*added {
+                    self.check_deadline()?;
+                    out.push(sign);
+                }
                 Ok(out)
             }
             BvExpr::Shl(value, amount)
@@ -1977,11 +1370,40 @@ impl ExprBlaster {
                     // The match guard restricts this arm to {Shl, Lshr, Ashr}.
                     _ => BvOp::Ashr,
                 };
+                if let BvExpr::Const { value: amount, .. } = amount.as_ref() {
+                    // Both operands have already been fully validated and
+                    // blasted. A literal amount needs only exact bit wiring,
+                    // including the SMT over-shift result, not a barrel mux.
+                    let zero = self.zero(vars, bit_lemmas, clauses);
+                    let sign = vb[vb.len() - 1];
+                    let amount = usize::try_from(*amount).unwrap_or(vb.len()).min(vb.len());
+                    let out = crate::bv_blast_export::shift_const_rewire(
+                        op,
+                        &vb,
+                        amount,
+                        zero,
+                        sign,
+                        self.keep_going,
+                    )
+                    .map_err(|()| BvExprExportError::Cancelled)?;
+                    self.check_deadline()?;
+                    return Ok(out);
+                }
                 // Reuse the operand-swap path's barrel-shifter blaster, but through
                 // THIS blaster's shared cache (so structurally-identical shifts on
                 // the two sides of the equality fuse to one set of output vars).
                 // Every gate `blast_shift` emits is an existing `BitLemmaKind`.
-                let out = blast_shift(op, &vb, &ab, vars, bit_lemmas, clauses, &mut self.cache);
+                let out = blast_shift_with_cancellation(
+                    op,
+                    &vb,
+                    &ab,
+                    vars,
+                    bit_lemmas,
+                    clauses,
+                    &mut self.cache,
+                    self.keep_going,
+                )
+                .map_err(|()| BvExprExportError::Cancelled)?;
                 self.check_deadline()?;
                 Ok(out)
             }
@@ -1992,18 +1414,22 @@ impl ExprBlaster {
                 Ok(bits
                     .into_iter()
                     .map(|b| {
-                        build_gate(
-                            BitLemmaKind::Not,
-                            vec![b],
-                            VarRole::Aux { bit: 0 },
-                            vars,
-                            bit_lemmas,
-                            clauses,
-                            &mut self.cache,
-                        )
+                        self.check_deadline()?;
+                        Ok({
+                            build_gate(
+                                BitLemmaKind::Not,
+                                vec![b],
+                                VarRole::Aux { bit: 0 },
+                                vars,
+                                bit_lemmas,
+                                clauses,
+                                &mut self.cache,
+                            )
+                        })
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>, BvExprExportError>>()?)
             }
+            BvExpr::Ult(l, r) => self.blast_unsigned_compare(l, r, vars, bit_lemmas, clauses),
             BvExpr::Eq(l, r) => {
                 // Bit-vector equality -> a SINGLE-bit predicate. Per-bit `XnorEq`
                 // (each `e_i <=> l_i == r_i`) AND-reduced to one bit by a chain of
@@ -2025,17 +1451,20 @@ impl ExprBlaster {
                 // Per-bit XNOR (bit-equality) vars.
                 let bit_eqs: Vec<u32> = (0..lb.len())
                     .map(|bit| {
-                        build_gate(
-                            BitLemmaKind::XnorEq,
-                            vec![lb[bit], rb[bit]],
-                            VarRole::Aux { bit: bit as u32 },
-                            vars,
-                            bit_lemmas,
-                            clauses,
-                            &mut self.cache,
-                        )
+                        self.check_deadline()?;
+                        Ok({
+                            build_gate(
+                                BitLemmaKind::XnorEq,
+                                vec![lb[bit], rb[bit]],
+                                VarRole::Aux { bit: bit as u32 },
+                                vars,
+                                bit_lemmas,
+                                clauses,
+                                &mut self.cache,
+                            )
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, BvExprExportError>>()?;
                 // AND-reduce the per-bit equalities into one predicate bit.
                 let mut acc = bit_eqs[0];
                 for &e in &bit_eqs[1..] {
@@ -2079,17 +1508,20 @@ impl ExprBlaster {
                     let notb: Vec<u32> = bb
                         .iter()
                         .map(|&b| {
-                            build_gate(
-                                BitLemmaKind::Not,
-                                vec![b],
-                                VarRole::Aux { bit: 0 },
-                                vars,
-                                bit_lemmas,
-                                clauses,
-                                &mut self.cache,
-                            )
+                            self.check_deadline()?;
+                            Ok({
+                                build_gate(
+                                    BitLemmaKind::Not,
+                                    vec![b],
+                                    VarRole::Aux { bit: 0 },
+                                    vars,
+                                    bit_lemmas,
+                                    clauses,
+                                    &mut self.cache,
+                                )
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, BvExprExportError>>()?;
                     let t = self.one(vars, bit_lemmas, clauses);
                     (notb, t)
                 } else {
@@ -2112,6 +1544,14 @@ impl ExprBlaster {
                 }
                 // A 1-bit-wide result (LSB = the final carry-out).
                 Ok(vec![carry])
+            }
+            BvExpr::UDiv(l, r) | BvExpr::URem(l, r) => {
+                let (quotient, remainder) = self.blast_division(l, r, vars, bit_lemmas, clauses)?;
+                Ok(if matches!(expr, BvExpr::UDiv(..)) {
+                    quotient
+                } else {
+                    remainder
+                })
             }
             BvExpr::Mul(l, r) => {
                 // Shift-and-add ARRAY multiplier, truncated to the low `n` bits
@@ -2146,17 +1586,20 @@ impl ExprBlaster {
                 // Row 0 (no shift) initializes the accumulator: acc[i] = a[i] ∧ b[0].
                 let mut acc: Vec<u32> = (0..n)
                     .map(|i| {
-                        build_gate(
-                            BitLemmaKind::And2,
-                            vec![ab[i], bb[0]],
-                            VarRole::Aux { bit: i as u32 },
-                            vars,
-                            bit_lemmas,
-                            clauses,
-                            &mut self.cache,
-                        )
+                        self.check_deadline()?;
+                        Ok({
+                            build_gate(
+                                BitLemmaKind::And2,
+                                vec![ab[i], bb[0]],
+                                VarRole::Aux { bit: i as u32 },
+                                vars,
+                                bit_lemmas,
+                                clauses,
+                                &mut self.cache,
+                            )
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, BvExprExportError>>()?;
 
                 // Add each remaining shifted partial-product row into `acc`.
                 for (j, &b_j) in bb.iter().enumerate().take(n).skip(1) {
@@ -2166,22 +1609,25 @@ impl ExprBlaster {
                     // positions that land within the retained low `n` bits.
                     let row: Vec<u32> = (0..n)
                         .map(|pos| {
-                            if pos < j {
-                                zero
-                            } else {
-                                let i = pos - j;
-                                build_gate(
-                                    BitLemmaKind::And2,
-                                    vec![ab[i], b_j],
-                                    VarRole::Aux { bit: pos as u32 },
-                                    vars,
-                                    bit_lemmas,
-                                    clauses,
-                                    &mut self.cache,
-                                )
-                            }
+                            self.check_deadline()?;
+                            Ok({
+                                if pos < j {
+                                    zero
+                                } else {
+                                    let i = pos - j;
+                                    build_gate(
+                                        BitLemmaKind::And2,
+                                        vec![ab[i], b_j],
+                                        VarRole::Aux { bit: pos as u32 },
+                                        vars,
+                                        bit_lemmas,
+                                        clauses,
+                                        &mut self.cache,
+                                    )
+                                }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, BvExprExportError>>()?;
 
                     // Ripple-carry add `row` into `acc` (truncated to `n` bits,
                     // carry-out of the MSB discarded). Same `Xor3`/`FullAdderCarry`
@@ -2190,6 +1636,13 @@ impl ExprBlaster {
                     let mut next = Vec::with_capacity(n);
                     for bit in 0..n {
                         self.check_deadline()?;
+                        // The shifted row is zero below j and no carry can
+                        // enter those positions. Preserve the exact lower
+                        // product prefix across multiplication widths.
+                        if bit < j {
+                            next.push(acc[bit]);
+                            continue;
+                        }
                         let sum = build_gate(
                             BitLemmaKind::Xor3,
                             vec![acc[bit], row[bit], carry],
@@ -2223,18 +1676,36 @@ impl ExprBlaster {
 
 #[derive(Default)]
 struct BvExprPreflight {
+    /// Distinct (interned) nodes, charged against `max_expr_nodes`.
     nodes: usize,
+    /// Source occurrences, charged against `max_expr_occurrences`.
+    occurrences: usize,
     leaf_name_bytes: usize,
     leaf_widths: std::collections::HashMap<String, u32>,
     estimated_gate_work: usize,
+    /// Output bits of every distinct node, the memo's retained payload.
+    output_bits: usize,
     top_width: usize,
+    sharing: preflight_sharing::Sharing,
+    last_node: u32,
 }
 
+#[cfg(test)]
 fn preflight_bv_expr(
     expr: &BvExpr,
     limits: &BvExprProofLimits,
     state: &mut BvExprPreflight,
     depth: usize,
+) -> Result<u32, BvExprExportError> {
+    preflight_bv_expr_with_cancellation(expr, limits, state, depth, &mut || true)
+}
+
+fn preflight_bv_expr_with_cancellation(
+    expr: &BvExpr,
+    limits: &BvExprProofLimits,
+    state: &mut BvExprPreflight,
+    depth: usize,
+    keep_going: &mut dyn FnMut() -> bool,
 ) -> Result<u32, BvExprExportError> {
     if limits
         .resolution
@@ -2247,6 +1718,7 @@ fn preflight_bv_expr(
             actual: 1,
         });
     }
+    poll_export(keep_going)?;
     if depth > limits.max_expr_depth {
         return Err(BvExprExportError::ResourceLimit {
             resource: "expression depth",
@@ -2255,10 +1727,10 @@ fn preflight_bv_expr(
         });
     }
     charge_bv_expr_resource(
-        "expression nodes",
-        &mut state.nodes,
+        "expression occurrences",
+        &mut state.occurrences,
         1,
-        limits.max_expr_nodes,
+        limits.max_expr_occurrences,
     )?;
     if let BvExpr::Leaf { name, .. } = expr {
         // Counting repeated references is intentionally conservative and avoids
@@ -2299,17 +1771,27 @@ fn preflight_bv_expr(
         }
     }
 
-    let mut child = |inner: &BvExpr| preflight_bv_expr(inner, limits, state, depth + 1);
+    let mut children = [u32::MAX; 2];
+    let mut next_child = 0;
+    let mut child = |inner: &BvExpr| {
+        let width =
+            preflight_bv_expr_with_cancellation(inner, limits, state, depth + 1, keep_going)?;
+        children[next_child] = state.last_node;
+        next_child += 1;
+        Ok::<_, BvExprExportError>(width)
+    };
+    // `local_work` bounds the variables this node can ALLOCATE, before any
+    // cache credit (`topology_bound`): leaf inputs and gate outputs alike.
     let (width, local_work) = match expr {
-        BvExpr::Leaf { width, .. } | BvExpr::Const { width, .. } => {
-            (*width, usize::try_from(*width).unwrap_or(usize::MAX))
-        }
+        BvExpr::Leaf { width, .. } => (*width, topology_bound::leaf(*width as usize)),
+        BvExpr::Const { width, .. } => (*width, topology_bound::constant(*width as usize)),
         BvExpr::ZeroExt(inner, added) | BvExpr::SignExt(inner, added) => {
             let inner_width = child(inner)?;
             let width = inner_width.checked_add(*added).ok_or_else(|| {
                 BvExprExportError::Malformed("bit-vector extension width overflow".to_string())
             })?;
-            (width, usize::try_from(width).unwrap_or(usize::MAX))
+            let zero_padded = matches!(expr, BvExpr::ZeroExt(..));
+            (width, topology_bound::extension(zero_padded))
         }
         BvExpr::Extract { inner, high, low } => {
             let inner_width = child(inner)?;
@@ -2318,38 +1800,56 @@ fn preflight_bv_expr(
                     "extract [{high}:{low}] out of bounds for {inner_width}-bit operand"
                 )));
             }
-            let width = high - low + 1;
-            (width, usize::try_from(width).unwrap_or(usize::MAX))
+            (high - low + 1, topology_bound::EXTRACT)
         }
         BvExpr::Not(inner) => {
             let width = child(inner)?;
-            (width, 2_usize.saturating_mul(width as usize))
+            (width, topology_bound::bitwise(width as usize))
         }
         BvExpr::Add(lhs, rhs) | BvExpr::Sub(lhs, rhs) => {
             let lhs_width = child(lhs)?;
             let rhs_width = child(rhs)?;
             require_bv_expr_width_match(lhs_width, rhs_width)?;
-            (lhs_width, 8_usize.saturating_mul(lhs_width as usize))
+            (lhs_width, topology_bound::ripple(lhs_width as usize))
         }
         BvExpr::Or(lhs, rhs) | BvExpr::And(lhs, rhs) | BvExpr::Xor(lhs, rhs) => {
             let lhs_width = child(lhs)?;
             let rhs_width = child(rhs)?;
             require_bv_expr_width_match(lhs_width, rhs_width)?;
-            (lhs_width, 4_usize.saturating_mul(lhs_width as usize))
+            (lhs_width, topology_bound::bitwise(lhs_width as usize))
+        }
+        BvExpr::Ult(lhs, rhs) => {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            (1, topology_bound::compare(lhs_width as usize))
         }
         BvExpr::Eq(lhs, rhs) => {
             let lhs_width = child(lhs)?;
             let rhs_width = child(rhs)?;
             require_bv_expr_width_match(lhs_width, rhs_width)?;
-            (1, 4_usize.saturating_mul(lhs_width as usize))
+            (1, topology_bound::equality(lhs_width as usize))
         }
         BvExpr::CarryOut { lhs, rhs, .. } => {
             let lhs_width = child(lhs)?;
             let rhs_width = child(rhs)?;
             require_bv_expr_width_match(lhs_width, rhs_width)?;
-            (1, 8_usize.saturating_mul(lhs_width as usize))
+            (1, topology_bound::ripple(lhs_width as usize))
+        }
+        BvExpr::Shl(lhs, rhs) | BvExpr::Lshr(lhs, rhs) | BvExpr::Ashr(lhs, rhs)
+            if matches!(rhs.as_ref(), BvExpr::Const { .. }) =>
+        {
+            let lhs_width = child(lhs)?;
+            let rhs_width = child(rhs)?;
+            require_bv_expr_width_match(lhs_width, rhs_width)?;
+            // Literal shifts only rewire width bits and may add one zero
+            // gate. Their operands are charged separately above. The actual
+            // emitted-gate limit remains enforced after construction.
+            (lhs_width, topology_bound::LITERAL_SHIFT)
         }
         BvExpr::Mul(lhs, rhs)
+        | BvExpr::UDiv(lhs, rhs)
+        | BvExpr::URem(lhs, rhs)
         | BvExpr::Shl(lhs, rhs)
         | BvExpr::Lshr(lhs, rhs)
         | BvExpr::Ashr(lhs, rhs) => {
@@ -2357,11 +1857,13 @@ fn preflight_bv_expr(
             let rhs_width = child(rhs)?;
             require_bv_expr_width_match(lhs_width, rhs_width)?;
             let width = lhs_width as usize;
-            // Both the truncated array multiplier and variable barrel shifter
-            // are O(width^2) in the supported range. The factor 16 strictly
-            // dominates their current gate topologies and leaves headroom for
-            // saturation/comparison gates without relying on cache sharing.
-            let work = 16_usize.saturating_mul(width).saturating_mul(width);
+            // Count the actual construction topology without cache credit.
+            // The existing gate, memory, deadline and replay limits still apply.
+            let work = match expr {
+                BvExpr::Mul(..) => topology_bound::multiply(width),
+                BvExpr::UDiv(..) | BvExpr::URem(..) => topology_bound::divide(width),
+                _ => topology_bound::shift(width),
+            };
             (lhs_width, work)
         }
     };
@@ -2372,12 +1874,27 @@ fn preflight_bv_expr(
             max: limits.max_internal_width,
         });
     }
-    charge_bv_expr_resource(
-        "estimated bit-blast gates",
-        &mut state.estimated_gate_work,
-        local_work,
-        limits.max_estimated_gate_work,
-    )?;
+    let (node, fresh) =
+        state
+            .sharing
+            .intern(expr, width, children, limits.max_construction_bytes)?;
+    state.last_node = node;
+    if fresh {
+        charge_bv_expr_resource(
+            "expression nodes",
+            &mut state.nodes,
+            1,
+            limits.max_expr_nodes,
+        )?;
+        charge_bv_expr_resource(
+            "estimated bit-blast gates",
+            &mut state.estimated_gate_work,
+            local_work,
+            limits.max_estimated_gate_work,
+        )?;
+        // The memo stores every distinct node's output bits (`node_memo`).
+        state.output_bits = state.output_bits.saturating_add(width as usize);
+    }
     Ok(width)
 }
 
@@ -2495,6 +2012,11 @@ fn reserve_bv_expr_construction(
                 .and_then(|bits| bytes.checked_add(bits))
         })
         .and_then(|bytes| bytes.checked_add(preflight.leaf_name_bytes))
+        .and_then(|bytes| bytes.checked_add(preflight.sharing.bytes()))
+        .and_then(|bytes| {
+            node_memo::reserved_bytes(preflight.nodes, preflight.output_bits)
+                .and_then(|memo| bytes.checked_add(memo))
+        })
         .unwrap_or(usize::MAX);
     if requested > limits.max_construction_bytes {
         return Err(BvExprExportError::ResourceLimit {
@@ -2526,20 +2048,35 @@ fn reserve_bv_expr_construction(
         .leaves
         .try_reserve(leaf_capacity)
         .map_err(|_| allocation_failed())?;
+    blaster
+        .blasted
+        .try_reserve(preflight.nodes)
+        .map_err(|_| allocation_failed())?;
     blaster.check_deadline()
 }
 
+#[cfg(test)]
 fn materialize_sat_clauses_bounded(
     clauses: &[Clause],
     limits: &ResolutionProofLimits,
 ) -> Result<Vec<Vec<Literal>>, BvExprExportError> {
+    materialize_sat_clauses_with_cancellation(clauses, limits, &mut || true)
+}
+
+fn materialize_sat_clauses_with_cancellation(
+    clauses: &[Clause],
+    limits: &ResolutionProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<Vec<Vec<Literal>>, BvExprExportError> {
     let deadline = limits.deadline;
     check_sat_materialization_deadline(deadline)?;
+    poll_export(keep_going)?;
     let mut literals = 0_usize;
     for (index, clause) in clauses.iter().enumerate() {
         if index & 0x3ff == 0 {
             check_sat_materialization_deadline(deadline)?;
         }
+        poll_export(keep_going)?;
         if clause.lits.len() > limits.max_input_clause_literals {
             return Err(BvExprExportError::ResourceLimit {
                 resource: "SAT input clause literals",
@@ -2593,6 +2130,7 @@ fn materialize_sat_clauses_bounded(
         if index & 0x3ff == 0 {
             check_sat_materialization_deadline(deadline)?;
         }
+        poll_export(keep_going)?;
         let mut copy = Vec::new();
         copy.try_reserve_exact(clause.lits.len()).map_err(|_| {
             BvExprExportError::ResourceLimit {
@@ -2609,9 +2147,13 @@ fn materialize_sat_clauses_bounded(
                 actual,
             });
         }
-        copy.extend(clause.lits.iter().map(lit_to_sat));
+        for literal in &clause.lits {
+            poll_export(keep_going)?;
+            copy.push(lit_to_sat(literal));
+        }
         out.push(copy);
     }
+    poll_export(keep_going)?;
     Ok(out)
 }
 
@@ -2650,7 +2192,7 @@ pub fn export_bv_blast_proof_expr(
     lhs: &BvExpr,
     rhs: &BvExpr,
 ) -> Result<BvBlastProof, BvExprExportError> {
-    export_bv_blast_proof_expr_impl(lhs, rhs, None)
+    export_bv_blast_proof_expr_impl(lhs, rhs, None, &mut || true)
 }
 
 /// Build a zero-trust [`BvBlastProof`] under a conservative finite budget.
@@ -2687,6 +2229,38 @@ pub(crate) fn export_bv_blast_proof_expr_with_limits(
     rhs: &BvExpr,
     limits: &BvExprProofLimits,
 ) -> Result<BvBlastProof, BvExprExportError> {
+    export_bv_blast_proof_expr_with_limits_and_cancellation(lhs, rhs, limits, &mut || true)
+}
+
+/// Thread one caller-owned refusal through bounded expression and proof work.
+/// Existing deadlines and numerical limits remain independently enforced.
+pub(crate) fn export_bv_blast_proof_expr_with_limits_and_cancellation(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    limits: &BvExprProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<BvBlastProof, BvExprExportError> {
+    cancellation::run(keep_going, |keep_going| {
+        export_bv_blast_proof_expr_controlled(lhs, rhs, limits, keep_going)
+    })
+}
+
+fn export_bv_blast_proof_expr_controlled(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    limits: &BvExprProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<BvBlastProof, BvExprExportError> {
+    let preflight = preflight_bv_equality(lhs, rhs, limits, keep_going)?;
+    export_bv_blast_proof_expr_impl(lhs, rhs, Some((limits, preflight)), keep_going)
+}
+
+fn preflight_bv_equality(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    limits: &BvExprProofLimits,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<BvExprPreflight, BvExprExportError> {
     if limits.resolution.deadline.is_none() {
         return Err(BvExprExportError::ResourceLimit {
             resource: "absolute proof deadline",
@@ -2695,8 +2269,10 @@ pub(crate) fn export_bv_blast_proof_expr_with_limits(
         });
     }
     let mut preflight = BvExprPreflight::default();
-    let lhs_width = preflight_bv_expr(lhs, limits, &mut preflight, 1)?;
-    let rhs_width = preflight_bv_expr(rhs, limits, &mut preflight, 1)?;
+    let lhs_width =
+        preflight_bv_expr_with_cancellation(lhs, limits, &mut preflight, 1, keep_going)?;
+    let rhs_width =
+        preflight_bv_expr_with_cancellation(rhs, limits, &mut preflight, 1, keep_going)?;
     require_bv_expr_width_match(lhs_width, rhs_width)?;
     preflight.top_width = lhs_width as usize;
     charge_bv_expr_resource(
@@ -2705,157 +2281,63 @@ pub(crate) fn export_bv_blast_proof_expr_with_limits(
         preflight.top_width,
         limits.max_estimated_gate_work,
     )?;
-    export_bv_blast_proof_expr_impl(lhs, rhs, Some((limits, preflight)))
+    Ok(preflight)
 }
 
 fn export_bv_blast_proof_expr_impl(
     lhs: &BvExpr,
     rhs: &BvExpr,
     bounded: Option<(&BvExprProofLimits, BvExprPreflight)>,
+    keep_going: &mut dyn FnMut() -> bool,
 ) -> Result<BvBlastProof, BvExprExportError> {
     let limits = bounded.as_ref().map(|(limits, _)| *limits);
-    let mut vars = VarTable::default();
-    let mut bit_lemmas: Vec<BitLemma> = Vec::new();
-    let mut clauses: Vec<Clause> = Vec::new();
+    build_bv_expr_refutation(lhs, rhs, bounded, keep_going)?.expand(limits, keep_going)
+}
 
-    let mut blaster = ExprBlaster::new(limits.and_then(|limits| limits.resolution.deadline));
-    if let Some((limits, preflight)) = bounded {
-        reserve_bv_expr_construction(
-            &mut vars,
-            &mut bit_lemmas,
-            &mut clauses,
-            &mut blaster,
-            limits,
-            preflight,
-        )?;
-    }
-    let lhs_bits = blaster.blast(lhs, &mut vars, &mut bit_lemmas, &mut clauses)?;
-    let rhs_bits = blaster.blast(rhs, &mut vars, &mut bit_lemmas, &mut clauses)?;
+fn build_bv_expr_refutation(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    bounded: Option<(&BvExprProofLimits, BvExprPreflight)>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<compact::ExprRefutation, BvExprExportError> {
+    build_bv_expr_refutation_reporting(lhs, rhs, bounded, keep_going).map(|(proof, _)| proof)
+}
 
-    if lhs_bits.len() != rhs_bits.len() {
-        return Err(BvExprExportError::WidthMismatch {
-            lhs: lhs_bits.len() as u32,
-            rhs: rhs_bits.len() as u32,
-        });
-    }
-    let width = lhs_bits.len() as u32;
-    if width == 0 || width > SOLVED_MAX_WIDTH {
-        return Err(BvExprExportError::UnsupportedWidth {
-            got: width,
-            max: SOLVED_MAX_WIDTH,
-        });
-    }
-
-    // Per-bit equality vars e_i = XnorEq(lhs_i, rhs_i) + Tseitin CNF.
-    let mut eq_vars: Vec<u32> = Vec::with_capacity(width as usize);
-    for (bit, (&l, &r)) in lhs_bits.iter().zip(rhs_bits.iter()).enumerate() {
-        blaster.check_deadline()?;
-        let e = vars.alloc(VarRole::BitEq { bit: bit as u32 });
-        eq_vars.push(e);
-        let lemma_id = bit_lemmas.len() as u32;
-        let ins = vec![l, r];
-        bit_lemmas.push(BitLemma {
-            id: lemma_id,
-            kind: BitLemmaKind::XnorEq,
-            out: e,
-            ins: ins.clone(),
-        });
-        push_gate_cnf(&mut clauses, BitLemmaKind::XnorEq, e, &ins, lemma_id);
-    }
-
-    // Disequality clause from not(lhs == rhs): at least one bit differs.
-    let diseq_id = clauses.len() as u32;
-    clauses.push(Clause {
-        id: diseq_id,
-        lits: eq_vars.iter().map(|&e| Lit::neg(e)).collect(),
-        provenance: ClauseProvenance::Disequality,
-    });
-
-    if let Some(limits) = limits {
-        blaster.check_deadline()?;
-        if bit_lemmas.len() > limits.max_estimated_gate_work {
-            return Err(BvExprExportError::ResourceLimit {
-                resource: "actual bit-blast gates",
-                limit: limits.max_estimated_gate_work,
-                actual: bit_lemmas.len(),
-            });
-        }
-        if vars.len() > limits.resolution.max_num_vars {
-            return Err(BvExprExportError::ResourceLimit {
-                resource: "actual bit-blast variables",
-                limit: limits.resolution.max_num_vars,
-                actual: vars.len(),
-            });
-        }
-        if clauses.len() > limits.resolution.max_input_clauses {
-            return Err(BvExprExportError::ResourceLimit {
-                resource: "actual bit-blast clauses",
-                limit: limits.resolution.max_input_clauses,
-                actual: clauses.len(),
-            });
-        }
-        let mut actual_literals = 0_usize;
-        for (index, clause) in clauses.iter().enumerate() {
-            if index & 0x3ff == 0 {
-                blaster.check_deadline()?;
-            }
-            if clause.lits.len() > limits.resolution.max_input_clause_literals {
-                return Err(BvExprExportError::ResourceLimit {
-                    resource: "actual bit-blast clause literals",
-                    limit: limits.resolution.max_input_clause_literals,
-                    actual: clause.lits.len(),
-                });
-            }
-            actual_literals = actual_literals.checked_add(clause.lits.len()).ok_or(
-                BvExprExportError::ResourceLimit {
-                    resource: "actual bit-blast literals",
-                    limit: limits.resolution.max_input_literals,
-                    actual: usize::MAX,
-                },
-            )?;
-        }
-        if actual_literals > limits.resolution.max_input_literals {
-            return Err(BvExprExportError::ResourceLimit {
-                resource: "actual bit-blast literals",
-                limit: limits.resolution.max_input_literals,
-                actual: actual_literals,
-            });
-        }
-        blaster.check_deadline()?;
-    }
-
-    // The cache and transient output vectors are not part of the surfaced
-    // certificate. Release them before duplicating the CNF into ay-sat's
-    // literal type so the two bounded representations do not retain scratch
-    // alongside one another.
-    drop(lhs_bits);
-    drop(rhs_bits);
-    drop(eq_vars);
-    drop(blaster);
+// The optional count is ONLY the bounded producer's independent DAG replay;
+// it does not count SAT search or construction. Unbounded compatibility calls
+// return None, as does a sweep whose local validation work is not reported.
+// Neither can stand in for a measured zero-work validation.
+fn build_bv_expr_refutation_reporting(
+    lhs: &BvExpr,
+    rhs: &BvExpr,
+    bounded: Option<(&BvExprProofLimits, BvExprPreflight)>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(compact::ExprRefutation, Option<u64>), BvExprExportError> {
+    #[cfg(test)]
+    retained::producer_test_counter::record();
+    let limits = bounded.as_ref().map(|(limits, _)| *limits);
+    let cnf = cnf::build(lhs, rhs, bounded, keep_going)?;
 
     // Hand the CNF to ay-sat and surface the actual refutation (never fabricated).
-    let num_vars = vars.len();
+    let num_vars = cnf.vars.len();
     let sat_clauses: Vec<Vec<Literal>> = match limits {
-        Some(limits) => materialize_sat_clauses_bounded(&clauses, &limits.resolution)?,
-        None => clauses
+        Some(limits) => {
+            materialize_sat_clauses_with_cancellation(&cnf.clauses, &limits.resolution, keep_going)?
+        }
+        None => cnf
+            .clauses
             .iter()
             .map(|clause| clause.lits.iter().map(lit_to_sat).collect())
             .collect(),
     };
 
-    let dag = if let Some(limits) = limits {
-        match ay_sat::prove_unsat_resolution_dag_with_limits(
-            num_vars,
-            &sat_clauses,
-            &limits.resolution,
-        ) {
-            Ok(dag) => dag,
-            Err(ResolutionProofError::Satisfiable) => return Err(BvExprExportError::NoRefutation),
-            Err(other) => return Err(map_bounded_resolution_error(other, &limits.resolution)),
-        }
+    let (dag, validation_work) = if let Some(limits) = limits {
+        // Preserve the counted sweep, but never mistake its unreported local
+        // validation work for a measured zero. Metered capture refuses None.
+        sweep::bounded_refutation(&cnf, &sat_clauses, limits, keep_going)?
     } else {
         match ay_sat::prove_unsat_resolution_dag(num_vars, &sat_clauses) {
-            Ok(dag) => dag,
+            Ok(dag) => (dag, None),
             Err(ResolutionDagError::Satisfiable) => return Err(BvExprExportError::NoRefutation),
             Err(ResolutionDagError::Unknown) => return Err(BvExprExportError::SolverUnknown),
             Err(other) => {
@@ -2866,62 +2348,28 @@ fn export_bv_blast_proof_expr_impl(
         }
     };
 
-    let expansion_limits = limits.map(|limits| RupExpansionLimits {
-        max_steps: limits.max_resolution_steps,
-        max_literals: limits.max_expanded_literals,
-        max_work: limits.max_expansion_work,
-        max_bytes: limits.max_expansion_bytes,
-        // The bounded entry point already rejects a missing deadline.
-        deadline: limits
-            .resolution
-            .deadline
-            .expect("bounded proof limits require an absolute deadline"),
-    });
-    let refutation = expand_dag_to_resolution(&dag, &clauses, expansion_limits).map_err(
-        |error| match error {
-            BvSolvedExportError::ResourceLimit {
-                resource,
-                limit,
-                actual,
-            } => BvExprExportError::ResourceLimit {
-                resource,
-                limit,
-                actual,
-            },
-            other => BvExprExportError::RefutationNotSurfaceable(other.to_string()),
-        },
-    )?;
-    if let Some(limits) = limits {
-        if refutation.steps.len() > limits.max_resolution_steps {
-            return Err(BvExprExportError::ResourceLimit {
-                resource: "expanded resolution steps",
-                limit: limits.max_resolution_steps,
-                actual: refutation.steps.len(),
-            });
-        }
-    }
+    let proof = cnf.into_graph();
+    // Release retained SAT/codec scratch before the final caller boundary.
+    // Individual destructors remain opaque, but cannot run after admission.
+    drop(sat_clauses);
+    finish_expr_export(limits, keep_going)?;
+    Ok((
+        compact::ExprRefutation { graph: proof, dag },
+        validation_work,
+    ))
+}
 
-    // Lineage record. The proof's soundness rests ENTIRELY on vars/lemmas/clauses/
-    // refutation (all re-checked by `validate()` and the downstream proof consumer); the
-    // `obligation` field is human/debug provenance only. We record a representative
-    // `SliceObligation` (width + the leaf op) so the format stays unchanged — it is
-    // NOT load-bearing and NOT consulted by `validate()`.
-    let obligation_record = SliceObligation {
-        width,
-        op: BvOp::Add,
-        lhs_args: [OperandRef::A, OperandRef::B],
-        rhs_args: [OperandRef::A, OperandRef::B],
-    };
+fn finish_expr_export(
+    limits: Option<&BvExprProofLimits>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(), BvExprExportError> {
+    check_expr_export_deadline(limits)?;
+    poll_export(keep_going)?;
+    // An accepting callback may itself consume the remaining wall budget.
+    check_expr_export_deadline(limits)
+}
 
-    let proof = BvBlastProof {
-        format_version: FORMAT_VERSION,
-        obligation: obligation_record,
-        asserted_smt: "(not (= <lhs-expr> <rhs-expr>))".to_string(),
-        vars,
-        bit_lemmas,
-        clauses,
-        refutation,
-    };
+fn check_expr_export_deadline(limits: Option<&BvExprProofLimits>) -> Result<(), BvExprExportError> {
     if limits.is_some_and(|limits| {
         limits
             .resolution
@@ -2934,7 +2382,7 @@ fn export_bv_blast_proof_expr_impl(
             actual: 1,
         });
     }
-    Ok(proof)
+    Ok(())
 }
 
 fn bounded_amount(value: u128) -> usize {
@@ -3028,6 +2476,10 @@ fn validation_resource_limit(
 fn resource_failure(resource: &'static str, limit: usize, overflow: bool) -> BvExprExportError {
     // For allocation failure, `limit + 1` is a stable exhaustion sentinel; it
     // does not claim the allocator reached the configured logical byte cap.
+    // Nor is it the input's verdict, so no memo may keep it.
+    if !overflow {
+        note_uncounted_failure();
+    }
     BvExprExportError::ResourceLimit {
         resource,
         limit,
@@ -3044,6 +2496,7 @@ fn map_bounded_resolution_error(
     limits: &ResolutionProofLimits,
 ) -> BvExprExportError {
     match error {
+        ResolutionProofError::Cancelled => BvExprExportError::Cancelled,
         ResolutionProofError::Satisfiable => BvExprExportError::NoRefutation,
         ResolutionProofError::SolverUnknown {
             reason: Some(SatUnknownReason::DeadlineExceeded),
@@ -3106,8 +2559,8 @@ fn map_bounded_resolution_error(
                 validation_resource_limit(limits, resource),
                 false,
             ),
-            invalid @ ResolutionValidationError::Invalid(_)
-            | invalid @ ResolutionValidationError::Cancelled => bounded_resolution_failure(invalid),
+            ResolutionValidationError::Cancelled => BvExprExportError::Cancelled,
+            invalid @ ResolutionValidationError::Invalid(_) => bounded_resolution_failure(invalid),
         },
         ResolutionProofError::AccountingOverflow { resource } => resource_failure(
             resolution_resource_name(resource),

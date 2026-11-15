@@ -104,8 +104,8 @@ pub use ay_dpll::api::SortExt;
 pub use ay_dpll::{CounterexampleStyle, StatValue, Statistics, UnknownReason};
 // Re-export proof certificate types for UNSAT result consumers (#4521)
 pub use ay_dpll::api::{
-    FarkasCertificate, ProofAcceptanceError, ProofAcceptanceMode, ProofCheckError, ProofQuality,
-    StrictProofVerdict, UnsatProofArtifact,
+    CarcaraSurface, FarkasCertificate, ProofAcceptanceError, ProofAcceptanceMode, ProofCheckError,
+    ProofQuality, StrictProofVerdict, StrictVerdictStop, UnsatProofArtifact,
 };
 // Re-export the offline proof-bundle API (genuinely-external re-check).
 pub use ay_dpll::api::{
@@ -410,8 +410,9 @@ pub mod api {
 
     // Proof certificate types for UNSAT consumers (#4521)
     pub use crate::{
-        FarkasCertificate, PartialProofCheck, ProofAcceptanceError, ProofAcceptanceMode,
-        ProofCheckError, ProofQuality, StrictProofVerdict, UnsatProofArtifact,
+        CarcaraSurface, FarkasCertificate, PartialProofCheck, ProofAcceptanceError,
+        ProofAcceptanceMode, ProofCheckError, ProofQuality, StrictProofVerdict, StrictVerdictStop,
+        UnsatProofArtifact,
     };
     // Solver capability descriptor for downstream routing (#9701/#4445)
     pub use crate::{
@@ -599,6 +600,24 @@ pub mod api {
 /// and may change between minor versions.
 pub mod chc {
 
+    /// Durable, source-bound ground evidence and its fresh consumer boundary.
+    pub use ay_chc::{
+        validate_chc_ground_derivation_artifact, validate_chc_ground_derivation_artifact_v2,
+        validate_chc_ground_derivation_artifact_v2_with_progress,
+        validate_chc_ground_derivation_artifact_with_progress, ChcGroundDerivationArtifactError,
+        ChcGroundDerivationArtifactErrorReason, ChcReplayPayloadFormat,
+        ChcValidatedGroundDerivation, CHC_GROUND_DERIVATION_ARTIFACT_ROLE,
+        CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA, CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE,
+        CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA,
+    };
+
+    /// Quantified source/evidence stays distinct from ordinary QF proof artifacts.
+    pub use ay_chc::quantified::{
+        QuantifiedChcCounterexample, QuantifiedChcProblem, QuantifiedChcQueryId,
+        QuantifiedChcQueryObligation, QuantifiedChcResult, QuantifiedChcSafety,
+        QuantifiedHornClause, UniversalPremise,
+    };
+
     pub use ay_chc::{
         // Core data model
         bmc_unsafe_trace_assignment_completeness,
@@ -638,6 +657,8 @@ pub mod chc {
         ChcCheckedReplaySummaryError,
         // DT problem construction
         ChcDtConstructor,
+        ChcDtConstructors,
+        ChcDtId,
         ChcDtSelector,
         ChcEngineResult,
         ChcError,
@@ -739,6 +760,7 @@ pub mod chc {
         CHC_PROOF_TRANSCRIPT_SCHEMA,
         CHC_REPLAY_EVIDENCE_SCHEMA,
         MAX_BITVECTOR_WIDTH,
+        NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA,
         NORMALIZED_CHC_INPUT_SCHEMA,
     };
 }
@@ -875,6 +897,22 @@ pub mod proof_internals {
 /// (terminal-trust check, #8759). The low-level exporter preserves proof steps
 /// that are explicitly marked `:rule trust`; export success alone is therefore
 /// not a certification claim.
+///
+/// ## The external-recheck surface is disclosed, not a reason to refuse
+///
+/// Pinned Carcara parses neither AY's `Seq`, `FloatingPoint` and `Char` sorts
+/// nor symbols spelled with the AY/Z3 `\|`/`\\` escape extension. Such a
+/// document still RENDERS what AY's strict checker accepted (owner decision
+/// D7, 2026-09-22): [`UnsatProofArtifact::carcara_surface`] carries
+/// `supported` or `unsupported(reason)` — or `clean-dialect`, a step only
+/// Clean's vendored Carcara checks, or `without-let-expansion`, a `:rule let`
+/// step pinned Carcara checks only in its canonical invocation
+/// `carcara check -- PROOF PROBLEM` — and the CLI's `c ay.proof.certificate`
+/// line carries `carcara_surface=` beside `ay_self_checkable=`. A consumer
+/// that CLAIMS an external check — `--strict-proofs`, `--self-check`, a Carcara
+/// cross-check — refuses an unsupported surface with that reason, fail-closed;
+/// a consumer that claims none takes the artifact at the strict-checker class
+/// and never promotes it past it.
 ///
 /// ## Why emit a proof artifact?
 ///
@@ -1065,8 +1103,9 @@ pub mod prelude {
 
     // Proof certificate types for UNSAT consumers (#4521)
     pub use crate::{
-        FarkasCertificate, PartialProofCheck, ProofAcceptanceError, ProofAcceptanceMode,
-        ProofCheckError, ProofQuality, StrictProofVerdict, UnsatProofArtifact,
+        CarcaraSurface, FarkasCertificate, PartialProofCheck, ProofAcceptanceError,
+        ProofAcceptanceMode, ProofCheckError, ProofQuality, StrictProofVerdict, StrictVerdictStop,
+        UnsatProofArtifact,
     };
     // Phase 5 explainability types (#8153) + Phase 6 incremental (#8154, #8306)
     pub use crate::{

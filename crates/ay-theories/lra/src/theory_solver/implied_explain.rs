@@ -123,7 +123,9 @@ impl LraSolver {
                 if let Some(b) = direct {
                     if Self::bound_decides_atom(&b.value, b.strict, need_upper, atom, polarity) {
                         if let Some(reasons) = self.asserted_direct_reasons(b) {
-                            return Some((reasons, ImpliedReasonBasis::DirectBound));
+                            if !Self::cites_atom(&reasons, atom_term) {
+                                return Some((reasons, ImpliedReasonBasis::DirectBound));
+                            }
                         }
                     }
                 }
@@ -143,7 +145,7 @@ impl LraSolver {
                     if let Some(reasons) =
                         self.make_eager_implied_propagation_reasons(vi, need_upper)
                     {
-                        if !reasons.is_empty() {
+                        if !reasons.is_empty() && !Self::cites_atom(&reasons, atom_term) {
                             return Some((reasons, ImpliedReasonBasis::Chain));
                         }
                     }
@@ -155,6 +157,7 @@ impl LraSolver {
                         self.derive_bound_from_row_direct_only(var, need_upper, ib.row_idx)
                     {
                         if !reasons.is_empty()
+                            && !Self::cites_atom(&reasons, atom_term)
                             && Self::bound_decides_atom(&value, strict, need_upper, atom, polarity)
                         {
                             return Some((reasons, ImpliedReasonBasis::SingleRow));
@@ -165,7 +168,22 @@ impl LraSolver {
         }
         // Strategy 3: the direct-only interval of the atom's own expression.
         self.explain_by_direct_interval(atom_term, polarity)
+            .filter(|reasons| !Self::cites_atom(reasons, atom_term))
             .map(|reasons| (reasons, ImpliedReasonBasis::Interval))
+    }
+
+    /// Whether `reasons` cite the propagated atom itself.
+    ///
+    /// Once the SAT core assigns the propagated literal the theory asserts it,
+    /// and an implied atom is usually TIGHTER than the direct bounds it was
+    /// derived without, so its own bound becomes `var`'s direct bound
+    /// (strategy 0) or an antecedent's (strategy 1). An explanation through it
+    /// is circular, `explain_propagation` rejects it, and the SAT core demotes
+    /// the literal to a decision: every conflict analysis that resolves it
+    /// fails closed and learns nothing. Such a result must not end the search;
+    /// a later strategy re-derives the bound from the other row variables.
+    fn cites_atom(reasons: &[TheoryLit], atom_term: TermId) -> bool {
+        reasons.iter().any(|r| r.term == atom_term)
     }
 
     /// Strategy 3: the direct-only interval of the atom's own expression
@@ -216,10 +234,22 @@ impl LraSolver {
     /// Telemetry: count which strategy explained a delivered propagation.
     pub(crate) fn note_implied_reason_basis(&mut self, basis: ImpliedReasonBasis) {
         match basis {
-            ImpliedReasonBasis::DirectBound => self.stats.implied_reason_direct_count += 1,
-            ImpliedReasonBasis::Chain => self.stats.implied_reason_chain_count += 1,
-            ImpliedReasonBasis::SingleRow => self.stats.implied_reason_row_count += 1,
-            ImpliedReasonBasis::Interval => self.stats.implied_reason_interval_count += 1,
+            ImpliedReasonBasis::DirectBound => {
+                self.stats.implied_reason_direct_count =
+                    self.stats.implied_reason_direct_count.saturating_add(1)
+            }
+            ImpliedReasonBasis::Chain => {
+                self.stats.implied_reason_chain_count =
+                    self.stats.implied_reason_chain_count.saturating_add(1)
+            }
+            ImpliedReasonBasis::SingleRow => {
+                self.stats.implied_reason_row_count =
+                    self.stats.implied_reason_row_count.saturating_add(1)
+            }
+            ImpliedReasonBasis::Interval => {
+                self.stats.implied_reason_interval_count =
+                    self.stats.implied_reason_interval_count.saturating_add(1)
+            }
         }
     }
 }

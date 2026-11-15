@@ -1,0 +1,16 @@
+; A free rounding-mode variable can take RTP; it has no RNE half-ulp bound.
+; The exact positive error is 3 / 2^54. Expected: sat.
+(set-logic QF_FP)
+(declare-const mode RoundingMode)
+(declare-const x (_ FloatingPoint 11 53))
+(declare-const y (_ FloatingPoint 11 53))
+(assert (= mode RTP))
+(assert (= x ((_ to_fp 11 53) RNE 1)))
+(assert (= y ((_ to_fp 11 53) RNE (/ 1 18014398509481984))))
+(assert (fp.isNormal x))
+(assert (fp.isNormal y))
+(assert (<= (fp.to_real (fp.abs x)) 1))
+(assert (<= (fp.to_real (fp.abs y)) 1))
+(assert (>= (- (fp.to_real (fp.add mode x y)) (+ (fp.to_real x) (fp.to_real y))) (/ 3 18014398509481984)))
+(check-sat)
+(get-value ((- (fp.to_real (fp.add mode x y)) (+ (fp.to_real x) (fp.to_real y)))))

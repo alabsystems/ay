@@ -64,7 +64,7 @@ fn test_drat_overrides_clamp_proof_incomplete_transforms() {
     );
     assert!(ctrl.factor.enabled); // DRAT divider+blocked+quotient (#4242)
     assert!(ctrl.sbva.enabled);
-    assert!(!ctrl.sweep.enabled); // #8011: sweep equivalences are not RUP/RAT-derivable in DRAT mode
+    assert!(ctrl.sweep.enabled); // DRAT-open since proof-posture-parity site S (e367fd456)
     assert!(ctrl.gate.enabled);
 }
 
@@ -179,7 +179,7 @@ fn test_pass_descriptors_cover_controls() {
     }));
     assert!(descriptors.iter().any(|pass| {
         pass.name == "sweep"
-            && pass.proof_support == InprocessingProofSupport::None
+            && pass.proof_support == InprocessingProofSupport::DratOnly
             && pass.state_effect == "sat-sweep-equivalences"
     }));
     assert!(descriptors.iter().any(|pass| {
@@ -239,13 +239,15 @@ fn test_compatibility_policy_enforces_proof_support_without_mutating_controls() 
         reason_for(&drat_ledger, "congruence"),
         InprocessingPolicyReason::DisabledByFeature
     );
+    // Sweep is proof-logged on DRAT since site S (e367fd456); LRAT still
+    // clamps it (asserted below).
     assert_eq!(
         decision_for(&drat_ledger, "sweep"),
-        InprocessingPolicyDecision::Disable
+        InprocessingPolicyDecision::Run
     );
     assert_eq!(
         reason_for(&drat_ledger, "sweep"),
-        InprocessingPolicyReason::DisabledByProofMode
+        InprocessingPolicyReason::Enabled
     );
 
     let lrat_ledger = ctrl.compatibility_policy_ledger(InprocessingPolicyMode::LratProof);
@@ -260,6 +262,10 @@ fn test_compatibility_policy_enforces_proof_support_without_mutating_controls() 
     assert_eq!(
         decision_for(&lrat_ledger, "sbva"),
         InprocessingPolicyDecision::Disable
+    );
+    assert_eq!(
+        reason_for(&lrat_ledger, "sweep"),
+        InprocessingPolicyReason::DisabledByProofMode
     );
 }
 

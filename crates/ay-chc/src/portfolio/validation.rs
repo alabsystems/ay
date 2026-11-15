@@ -12,12 +12,27 @@ use super::types::EngineResult;
 use super::{PortfolioResult, PortfolioSolver};
 use crate::pdr::{
     CexVerificationResult, Counterexample, InvariantModel, PdrConfig, PdrSolver,
-    PredicateInterpretation,
+    PredicateInterpretation, SpacerLane,
 };
 use crate::transform::{accept_profile_enabled, BackTranslator};
 use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::time::Duration;
+
+#[cfg(test)]
+#[path = "validation/nullary_query_tests.rs"]
+mod nullary_query_tests;
+
+#[cfg(test)]
+#[path = "validation/predicate_free_tests.rs"]
+mod predicate_free_tests;
+
+#[path = "validation/exact_rewrites.rs"]
+mod exact_rewrites;
+
+#[cfg(test)]
+#[path = "validation/exact_rewrites_tests.rs"]
+mod exact_rewrites_tests;
 
 /// Hard timeout for validation sub-solvers (#8630).
 ///
@@ -29,6 +44,27 @@ use std::time::Duration;
 /// This is a safety cap; the cooperative cancellation token (from the
 /// portfolio) normally stops them earlier.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why an Unsafe candidate was NOT accepted by counterexample validation.
+///
+/// `inconclusive` separates "the replay could not decide inside its budget"
+/// (a retry with a larger budget may still validate it) from a DEFINITIVE
+/// rejection (spurious, untranslatable, sort-mismatched). The distinction only
+/// ever *delays* a rejection; it never admits an unvalidated counterexample.
+#[derive(Debug, Clone)]
+pub(super) struct UnsafeRejection {
+    pub(super) reason: String,
+    pub(super) inconclusive: bool,
+}
+
+impl UnsafeRejection {
+    fn definitive(reason: String) -> Self {
+        Self {
+            reason,
+            inconclusive: false,
+        }
+    }
+}
 
 /// Back-translate a counterexample and replace transformed ground evidence.
 ///
@@ -122,6 +158,14 @@ pub(super) enum SafePrecheckResult {
     Invalid(String),
 }
 
+/// Per-clause budget of [`ValidationBudget::PerRuleExtended`].
+pub(crate) const PER_RULE_EXTENDED_BUDGET: Duration = Duration::from_secs(6);
+
+/// A failed `PerRule` validation that took at least this long used its
+/// budget on some clause (undecided rather than refuted) and gets one
+/// [`ValidationBudget::PerRuleExtended`] re-run.
+pub(crate) const PER_RULE_RETRY_MIN_ELAPSED: Duration = Duration::from_secs(2);
+
 /// Budget for Safe model verification.
 ///
 /// Replaces raw `Duration` in `validate_safe_with_budget` to make the intent
@@ -143,6 +187,12 @@ pub(crate) enum ValidationBudget {
     /// consume the shared budget, causing valid models to be rejected.
     /// Part of #5653: tiered verification design Phase 1.
     PerRule,
+
+    /// [`Self::PerRule`] with a longer per-clause budget: the one re-run of a
+    /// Safe candidate whose `PerRule` validation failed after using its
+    /// budget (an undecided clause, not a quick refutation). Same checks,
+    /// same strictness; only the time per clause differs.
+    PerRuleExtended,
 }
 
 impl ValidationBudget {
@@ -161,6 +211,7 @@ impl ValidationBudget {
                 }
             }
             Self::PerRule => Duration::from_secs(2), // per-rule budget (reverted from 5s #5970 D2)
+            Self::PerRuleExtended => PER_RULE_EXTENDED_BUDGET,
         }
     }
 }
@@ -216,7 +267,29 @@ impl PortfolioSolver {
         mode: ValidationBudget,
     ) -> Result<InvariantModel, String> {
         let translated_model = self.back_translate_safe_model(model)?;
-        self.validate_safe_with_mode_pre_translated(translated_model, mode)
+        let candidate = translated_model.clone();
+        let validated = self.validate_safe_with_mode_pre_translated(translated_model, mode);
+        if validated.is_err() {
+            self.record_rejected_safe_candidate(candidate);
+        }
+        validated
+    }
+
+    /// Keep a rejected Safe candidate (already back-translated) for callers
+    /// that seed later PDR runs on the same problem (CH4b). Bounded: the
+    /// first few rejected candidates are the useful ones.
+    fn record_rejected_safe_candidate(&self, candidate: InvariantModel) {
+        const MAX_REJECTED_SAFE_CANDIDATES: usize = 4;
+        if candidate.is_empty() {
+            return;
+        }
+        let mut kept = self
+            .rejected_safe_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.len() < MAX_REJECTED_SAFE_CANDIDATES {
+            kept.push(candidate);
+        }
     }
 
     /// Back-translate an engine-space Safe model to the ORIGINAL problem
@@ -313,8 +386,11 @@ impl PortfolioSolver {
         mode: ValidationBudget,
     ) -> Result<InvariantModel, String> {
         let profile = accept_profile_enabled();
-        if translated_model.is_empty() && self.original_problem.predicates().is_empty() {
-            // Truly predicate-free problem: no interpretations are required.
+        if translated_model.is_empty()
+            && self.original_problem.predicates().is_empty()
+            && self.original_problem.clauses().is_empty()
+        {
+            // Only a vacuous problem needs neither interpretations nor clause checking.
             return Ok(translated_model);
         }
 
@@ -328,6 +404,13 @@ impl PortfolioSolver {
             cancellation_token: Some(self.cancellation_token.clone()),
             solve_timeout: Some(VALIDATION_TIMEOUT),
             disable_array_scalarization: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
+            // Solve-time rewrites (exact OR/ITE case splits, nullary-query
+            // expansion) are used only when they check exactly the original
+            // obligations for this model; expansion would otherwise erase a
+            // submitted query-predicate interpretation (f40f8c9d8).
+            preserve_original_clauses: !self.solve_time_rewrites_exact_for_model(&translated_model),
             ..PdrConfig::default()
         };
         let mut verifier = PdrSolver::new(self.original_problem.clone(), config);
@@ -348,6 +431,9 @@ impl PortfolioSolver {
         // the invariant excludes bad states without requiring 1-inductiveness. (#5211, #5825)
         let t_verify = ay_core::time::Instant::now();
         let verified = match mode {
+            ValidationBudget::PerRuleExtended => {
+                verifier.verify_model_per_rule(&translated_model, PER_RULE_EXTENDED_BUDGET)
+            }
             ValidationBudget::PerRule => {
                 // #5653 Phase 1: Per-rule independent validation.
                 // Each clause gets its own 2s budget instead of sharing 1.5s
@@ -498,39 +584,36 @@ impl PortfolioSolver {
         None
     }
 
-    /// Query-only pre-check that translates the model itself. Used by the
-    /// algebraic-model debug assertion; the acceptance pipeline uses
-    /// [`validate_safe_query_only_pre_translated`] with a shared translation.
+    /// Query-only pre-check that translates an engine-space model itself.
+    /// The acceptance pipeline uses [`validate_safe_query_only_pre_translated`]
+    /// with a shared translation.
     pub(super) fn validate_safe_query_only(&self, model: &InvariantModel) -> SafePrecheckResult {
         let translated_model = self.back_translator.translate_validity(model.clone());
-        if translated_model.is_empty() {
-            if self.original_problem.predicates().is_empty() {
-                return SafePrecheckResult::Valid;
-            }
-            return SafePrecheckResult::Invalid(
-                "Empty Safe model after back-translation (query-only check)".into(),
-            );
-        }
         self.validate_safe_query_only_pre_translated(&translated_model)
     }
 
     /// Query-only pre-check on an ALREADY-TRANSLATED Safe model.
     ///
-    /// The model MUST come from [`back_translate_safe_model`]; the acceptance
-    /// pipeline shares one translation between this pre-check and full
-    /// validation.
+    /// The model must use the original problem's signatures: either from
+    /// [`back_translate_safe_model`] or directly synthesized and checked on
+    /// the original problem. The acceptance pipeline shares one translation
+    /// between this pre-check and full validation.
     pub(super) fn validate_safe_query_only_pre_translated(
         &self,
         translated_model: &InvariantModel,
     ) -> SafePrecheckResult {
         let profile = accept_profile_enabled();
         if translated_model.is_empty() {
-            if self.original_problem.predicates().is_empty() {
+            if self.original_problem.predicates().is_empty()
+                && self.original_problem.clauses().is_empty()
+            {
                 return SafePrecheckResult::Valid;
             }
-            return SafePrecheckResult::Invalid(
-                "Empty Safe model after back-translation (query-only check)".into(),
-            );
+            if !self.original_problem.predicates().is_empty() {
+                return SafePrecheckResult::Invalid(
+                    "Empty Safe model after back-translation (query-only check)".into(),
+                );
+            }
         }
         if let Some(reason) = self.tautological_negated_query_reason(translated_model) {
             return SafePrecheckResult::ExactNegatedQuery(reason);
@@ -543,6 +626,11 @@ impl PortfolioSolver {
             cancellation_token: Some(self.cancellation_token.clone()),
             solve_timeout: Some(VALIDATION_TIMEOUT),
             disable_array_scalarization: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
+            // Check the caller's query, not an expanded predecessor query
+            // that omits the submitted error-predicate interpretation.
+            preserve_original_clauses: true,
             ..PdrConfig::default()
         };
         let mut verifier = PdrSolver::new(self.original_problem.clone(), config);
@@ -586,8 +674,9 @@ impl PortfolioSolver {
     }
 
     /// Like [`validate_unsafe`](Self::validate_unsafe), but on success returns
-    /// the back-translated counterexample that actually passed verification
-    /// against the ORIGINAL problem.
+    /// the counterexample that actually passed verification against the
+    /// ORIGINAL problem: the back-translation, the bounded replay's own when
+    /// only the replay passed, or the trace of its validated ground derivation.
     ///
     /// Mirror of Fix B1 for Unsafe results: engines run on the preprocessed
     /// problem, so their counterexamples carry engine-space predicate ids and
@@ -602,6 +691,49 @@ impl PortfolioSolver {
         cex: &crate::pdr::Counterexample,
     ) -> Result<crate::pdr::Counterexample, String> {
         self.validate_unsafe_translating_with_timeout(cex, VALIDATION_TIMEOUT)
+            .map_err(|rejection| rejection.reason)
+    }
+
+    /// Bounded variant of [`validate_unsafe_translating`](Self::validate_unsafe_translating)
+    /// for the parallel receive loop's EAGER validation of witness-less Unsafe
+    /// results.
+    ///
+    /// Every SMT query issued by the replay (the transition-system reachability
+    /// encoding, the BMC replay, the array cross-check) is clamped to `budget`
+    /// through a tightening [`crate::smt::ScopedSmtDeadline`], and the verifier
+    /// gets `budget` as its solve timeout. The caller learns whether a rejection
+    /// was DEFINITIVE (spurious, untranslatable, sort-mismatched) or merely
+    /// INCONCLUSIVE inside the slice (`UnsafeRejection::inconclusive`), so an
+    /// inconclusive one can be re-tried later with a larger budget instead of
+    /// being dropped. Validation is never skipped or weakened: the same
+    /// `verify_counterexample` pipeline runs, only its wall-clock allowance
+    /// changes.
+    pub(super) fn validate_unsafe_translating_bounded(
+        &self,
+        cex: &crate::pdr::Counterexample,
+        budget: Duration,
+    ) -> Result<crate::pdr::Counterexample, UnsafeRejection> {
+        if budget.is_zero() {
+            return Err(UnsafeRejection {
+                reason: "no validation budget left in this slice".to_string(),
+                inconclusive: true,
+            });
+        }
+        let _slice = crate::smt::ScopedSmtDeadline::install(budget);
+        self.validate_unsafe_translating_with_timeout(cex, budget)
+    }
+
+    /// Dispatch between the standard (`VALIDATION_TIMEOUT`-capped) and the
+    /// bounded-slice Unsafe validation, for the shared acceptance pipeline.
+    pub(super) fn validate_unsafe_translating_optionally_bounded(
+        &self,
+        cex: &crate::pdr::Counterexample,
+        budget: Option<Duration>,
+    ) -> Result<crate::pdr::Counterexample, UnsafeRejection> {
+        match budget {
+            Some(budget) => self.validate_unsafe_translating_bounded(cex, budget),
+            None => self.validate_unsafe_translating_with_timeout(cex, VALIDATION_TIMEOUT),
+        }
     }
 
     fn validate_unsafe_with_timeout(
@@ -611,7 +743,7 @@ impl PortfolioSolver {
     ) -> ValidationResult {
         match self.validate_unsafe_translating_with_timeout(cex, validation_timeout) {
             Ok(_) => ValidationResult::Valid,
-            Err(reason) => ValidationResult::Invalid(reason),
+            Err(rejection) => ValidationResult::Invalid(rejection.reason),
         }
     }
 
@@ -619,12 +751,12 @@ impl PortfolioSolver {
         &self,
         cex: &crate::pdr::Counterexample,
         validation_timeout: Duration,
-    ) -> Result<crate::pdr::Counterexample, String> {
+    ) -> Result<crate::pdr::Counterexample, UnsafeRejection> {
         if !self.transform_memory.unsafe_backtranslation_complete() {
-            return Err(format!(
+            return Err(UnsafeRejection::definitive(format!(
                 "Transform stack cannot reconstruct original Unsafe witnesses; {}",
                 self.transform_memory_diagnostic()
-            ));
+            )));
         }
         let translated_cex = backtranslate_counterexample_with_ground_evidence(
             self.back_translator.as_ref(),
@@ -659,9 +791,11 @@ impl PortfolioSolver {
                                         arg_sort
                                     );
                                 }
-                                return Err("BV-to-Int counterexample has Int-domain values for \
+                                return Err(UnsafeRejection::definitive(
+                                    "BV-to-Int counterexample has Int-domain values for \
                                      BV-sorted predicate arguments (spurious)"
-                                    .into());
+                                        .to_string(),
+                                ));
                             }
                         }
                     }
@@ -680,22 +814,30 @@ impl PortfolioSolver {
             solve_timeout: Some(validation_timeout),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
             ..PdrConfig::default()
         };
         let mut verifier = PdrSolver::new(self.original_problem.clone(), config);
         verifier.set_validation_deadline(validation_timeout);
 
-        match verifier.verify_counterexample(&translated_cex) {
-            CexVerificationResult::Valid => Ok(translated_cex),
-            CexVerificationResult::Spurious => Err("Counterexample is spurious (Unsat)".into()),
-            CexVerificationResult::Unknown => {
+        match verifier.confirm_counterexample(translated_cex) {
+            Ok(confirmed) => Ok(confirmed),
+            Err(CexVerificationResult::Spurious) => Err(UnsafeRejection::definitive(
+                "Counterexample is spurious (Unsat)".to_string(),
+            )),
+            Err(_) => {
                 // SOUNDNESS FIX (#1288): Inconclusive verification cannot be trusted
-                Err("Counterexample verification inconclusive (Unknown)".into())
+                Err(UnsafeRejection {
+                    reason: "Counterexample verification inconclusive (Unknown)".to_string(),
+                    inconclusive: true,
+                })
             }
         }
     }
 
-    /// Re-validate a counterexample before wrapping it in `VerifiedChcResult`.
+    /// Re-validate a counterexample before wrapping it in `VerifiedChcResult`;
+    /// returns the one that passed (to wrap), see [`Self::validate_unsafe_translating`].
     ///
     /// This is used at the public verified-result boundary. Both acceptance-time
     /// and verified-result-time validation are now always-on (#8585).
@@ -703,18 +845,18 @@ impl PortfolioSolver {
         &self,
         cex: &crate::pdr::Counterexample,
         remaining_budget: Option<Duration>,
-    ) -> bool {
+    ) -> Option<crate::pdr::Counterexample> {
+        // INV-S2 (#horn-smt-session §7.2).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         if remaining_budget.is_some_and(|budget| budget.is_zero()) {
-            return false;
+            return None;
         }
 
         let validation_timeout = remaining_budget
             .map(|budget| budget.min(VALIDATION_TIMEOUT))
             .unwrap_or(VALIDATION_TIMEOUT);
-        matches!(
-            self.validate_unsafe_with_timeout(cex, validation_timeout),
-            ValidationResult::Valid
-        )
+        self.validate_unsafe_translating_with_timeout(cex, validation_timeout)
+            .ok()
     }
 
     /// Validate a result from any engine.

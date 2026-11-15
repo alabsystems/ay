@@ -11,14 +11,18 @@ use crate::literal::Literal;
 
 impl Sweeper {
     /// Build a lit_map from collected equivalences using union-find.
+    ///
+    /// Returns the map and, when some literal lands in one class with its
+    /// negation, that literal instead of a map (the equivalences are jointly
+    /// contradictory: see `SweepOutcome::contradiction`).
     pub(super) fn build_lit_map_from_equivalences(
         &mut self,
         equivalences: &[(u32, u32)],
         frozen: &[u32],
         num_lits: usize,
-    ) -> Vec<Literal> {
+    ) -> (Vec<Literal>, Option<u32>) {
         if equivalences.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
 
         // Union-find: parent[lit] = parent literal.
@@ -70,6 +74,16 @@ impl Sweeper {
             }
         }
 
+        // A literal in one class with its negation: the equivalences, each
+        // implied by the formula, are jointly contradictory, so the formula
+        // is UNSAT. The map must not be used (both polarities of the class
+        // would map to one literal); the caller derives the empty clause.
+        for i in (0..num_lits).step_by(2) {
+            if find(&mut parent, i as u32) == find(&mut parent, (i as u32) ^ 1) {
+                return (Vec::new(), Some(i as u32));
+            }
+        }
+
         #[cfg(debug_assertions)]
         {
             for i in (0..num_lits).step_by(2) {
@@ -82,17 +96,6 @@ impl Sweeper {
                     i / 2,
                     pos_repr,
                     neg_repr
-                );
-            }
-
-            for i in 0..num_lits {
-                let repr = find(&mut parent, i as u32);
-                let neg_repr = find(&mut parent, (i as u32) ^ 1);
-                debug_assert_ne!(
-                    repr,
-                    neg_repr,
-                    "BUG: variable {} maps to same representative as its negation",
-                    i / 2
                 );
             }
         }
@@ -115,9 +118,9 @@ impl Sweeper {
         }
 
         if !any_non_identity {
-            return Vec::new(); // No equivalences → return empty map
+            return (Vec::new(), None); // No equivalences → return empty map
         }
-        lit_map
+        (lit_map, None)
     }
 
     /// Count clause rewriting stats without modifying the arena.

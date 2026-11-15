@@ -6,8 +6,56 @@
 
 use super::AYProgram;
 use crate::constraint::Constraint;
+use crate::sort::{DatatypeSort, Sort, SortInner};
 
 impl AYProgram {
+    /// The registered datatype definitions, each after the registered
+    /// definitions its fields nest (through arrays and sequences), so that
+    /// re-emitting them declares every name before its first use.
+    fn datatype_declarations_in_dependency_order(&self) -> Vec<DatatypeSort> {
+        let mut ordered = Vec::with_capacity(self.declared_datatypes.len());
+        let mut emitted = std::collections::BTreeSet::new();
+        for definition in self.declared_datatypes.values() {
+            let mut stack = vec![(definition, false)];
+            while let Some((definition, fields_done)) = stack.pop() {
+                let Some(dt) = definition.datatype_sort() else {
+                    continue;
+                };
+                if emitted.contains(&dt.name) {
+                    continue;
+                }
+                if fields_done {
+                    emitted.insert(dt.name.clone());
+                    ordered.push(dt.clone());
+                    continue;
+                }
+                stack.push((definition, true));
+                let mut fields: Vec<&Sort> = dt
+                    .constructors
+                    .iter()
+                    .flat_map(|ctor| &ctor.fields)
+                    .map(|field| &field.sort)
+                    .collect();
+                while let Some(sort) = fields.pop() {
+                    match sort.inner() {
+                        SortInner::Datatype(nested) => {
+                            if let Some(registered) = self.declared_datatypes.get(&nested.name) {
+                                stack.push((registered, false));
+                            }
+                        }
+                        SortInner::Array(array) => {
+                            fields.push(&array.index_sort);
+                            fields.push(&array.element_sort);
+                        }
+                        SortInner::Seq(element) => fields.push(element),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ordered
+    }
+
     /// Get program-level solver options (used by execute_direct).
     #[must_use]
     pub fn options(&self) -> &[(String, String)] {
@@ -34,9 +82,10 @@ impl AYProgram {
     pub fn clear_commands(&mut self) {
         self.commands.clear();
         self.context_level = 0;
-        // Re-add datatype declarations first (other declarations may reference these sorts)
-        for dt in self.declared_datatypes.values() {
-            self.commands.push(Constraint::declare_datatype(dt.clone()));
+        // Re-add datatype declarations first (other declarations may reference
+        // these sorts), each after the definitions its fields nest.
+        for dt in self.datatype_declarations_in_dependency_order() {
+            self.commands.push(Constraint::declare_datatype(dt));
         }
         // Re-add constant declarations
         for (name, sort) in &self.declared_vars {

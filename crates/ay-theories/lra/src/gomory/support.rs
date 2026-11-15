@@ -92,23 +92,31 @@ impl LraSolver {
     /// fall in the first half of the sorted list. This prevents Gomory cut
     /// cycling while still favoring the best-scoring candidates.
     ///
+    /// Returns `None` only for an empty pool (the caller loops while the pool
+    /// is non-empty, so it never asks).
+    ///
     /// Reference: Z3 `gomory.cpp:408-422`.
     pub(super) fn cubic_bias_pick(
         candidates: &mut Vec<GomoryCandidate>,
         rng: &mut u32,
-    ) -> GomoryCandidate {
+    ) -> Option<GomoryCandidate> {
         debug_assert!(!candidates.is_empty());
         let n = candidates.len();
-        if n == 1 {
-            return candidates.remove(0);
+        let last = n.checked_sub(1)?;
+        if last == 0 {
+            return candidates.pop();
         }
         // Cubic-bias: cube the uniform ratio to compress toward index 0.
         let raw = Self::xorshift32(rng);
         let ratio = f64::from(raw) / f64::from(u32::MAX);
         let cubed = ratio * ratio * ratio;
         let k = (cubed * n as f64) as usize;
-        let k = k.min(n - 1);
-        candidates.remove(k)
+        let k = k.min(last);
+        if k < candidates.len() {
+            Some(candidates.remove(k))
+        } else {
+            None
+        }
     }
 
     /// Xorshift32 PRNG. Fast, minimal state, good enough for selection bias.
@@ -126,14 +134,16 @@ impl LraSolver {
             // Exact equality: simplex maintains non-basic variables exactly
             // at bounds in exact arithmetic (BigRational). Z3 also uses
             // exact equality (gomory.cpp via int_solver::at_lower).
-            return info.value.rational() == lower.value.to_big();
+            // Rational part only (the infinitesimal is ignored, as before);
+            // `Rational == Rational` is allocation-free.
+            return info.value.x() == &lower.value;
         }
         false
     }
 
     pub(super) fn is_at_upper_bound(info: &VarInfo) -> bool {
         if let Some(ref upper) = info.upper {
-            return info.value.rational() == upper.value.to_big();
+            return info.value.x() == &upper.value;
         }
         false
     }
@@ -152,46 +162,61 @@ impl LraSolver {
     /// NRA/NIA callers pass a real `reason` term for linearization lemmas;
     /// these are unconditionally valid and are kept.
     pub fn add_gomory_cut(&mut self, cut: &GomoryCut, reason: TermId) {
+        // Thin adapter: convert the BigRational cut ONCE and share the body
+        // with the `Rational`-typed entry below (#bound-churn).
+        let coeffs: Vec<(u32, Rational)> = cut
+            .coeffs
+            .iter()
+            .map(|(v, c)| (*v, Rational::from_big(c.clone())))
+            .collect();
+        self.add_cut_rat(
+            coeffs,
+            Rational::from_big(cut.bound.clone()),
+            cut.is_lower,
+            &cut.reasons,
+            reason,
+        );
+    }
+
+    /// `Rational`-typed cut entry: `sum coeffs {>=,<=} bound` with the same
+    /// reason/sentinel semantics as [`Self::add_gomory_cut`] (which is now an
+    /// adapter over this). Callers whose coefficients are already `Rational`
+    /// (the NIA factor split's pins and exact product linearizations, all
+    /// integers) use it directly so no `BigRational` is ever built.
+    ///
+    /// The `reasons.is_empty() && reason.is_sentinel()` skip (#4919) and the
+    /// `assert_bound` vs `assert_bound_with_reasons` split are preserved
+    /// verbatim.
+    pub fn add_cut_rat(
+        &mut self,
+        coeffs: Vec<(u32, Rational)>,
+        bound: Rational,
+        is_lower: bool,
+        reasons: &[(TermId, bool)],
+        reason: TermId,
+    ) {
         // Skip cuts with no reasons AND sentinel-only fallback — they have
         // no transitive justification (#4919).
-        if cut.reasons.is_empty() && reason.is_sentinel() {
+        if reasons.is_empty() && reason.is_sentinel() {
             return;
         }
 
         let expr = LinearExpr {
-            coeffs: cut
-                .coeffs
-                .iter()
-                .map(|(v, c)| (*v, Rational::from_big(c.clone())))
-                .collect(),
+            coeffs,
             constant: Rational::zero(),
         };
 
-        let bound_type = if cut.is_lower {
+        let bound_type = if is_lower {
             BoundType::Lower
         } else {
             BoundType::Upper
         };
 
-        if cut.reasons.is_empty() {
+        if reasons.is_empty() {
             // NRA/NIA lemma: use the provided reason term directly.
-            self.assert_bound(
-                expr,
-                Rational::from_big(cut.bound.clone()),
-                bound_type,
-                false,
-                reason,
-                true,
-            );
+            self.assert_bound(expr, bound, bound_type, false, reason, true);
         } else {
-            self.assert_bound_with_reasons(
-                expr,
-                Rational::from_big(cut.bound.clone()),
-                bound_type,
-                false,
-                &cut.reasons,
-                None,
-            );
+            self.assert_bound_with_reasons(expr, bound, bound_type, false, reasons, None);
         }
         self.dirty = true;
     }

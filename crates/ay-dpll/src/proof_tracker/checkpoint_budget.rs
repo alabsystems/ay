@@ -233,12 +233,6 @@ fn map_storage<K, V>(
     footprint.charge(bytes)
 }
 
-#[cfg(kani)]
-fn map_slots<K, V>(map: &HashMap<K, V>) -> usize {
-    map.len()
-}
-
-#[cfg(not(kani))]
 fn map_slots<K, V>(map: &HashMap<K, V>) -> usize {
     // hashbrown's `capacity` determines the clean table's bucket allocation,
     // but deletions can leave tombstones and make it understate that storage.
@@ -431,7 +425,8 @@ fn alethe_rule_payload(
         | AletheRule::Drup
         | AletheRule::Trust
         | AletheRule::Evaluate
-        | AletheRule::QntNegExists => {}
+        | AletheRule::QntNegExists
+        | AletheRule::QntJoin => {}
         _ => return Err(CheckpointCloneError::UnsupportedPayload),
     }
     Ok(())

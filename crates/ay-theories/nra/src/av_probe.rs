@@ -52,16 +52,19 @@ fn bq_i(n: i64) -> Bq {
     Bq::from_int(BigInt::from(n))
 }
 
-/// The unique root of `coeffs` in `(lo, hi)`, as an `Anum`.
-fn alg(coeffs: &[i64], lo: i64, hi: i64) -> Anum {
-    let c: Vec<BigInt> = coeffs.iter().map(|&v| BigInt::from(v)).collect();
-    let iv = BqInterval::new(bq_i(lo), bq_i(hi)).expect("ordered bracket");
-    Anum::from_poly_interval(&c, &iv).expect("isolating bracket")
+/// The unique root of the exact coefficients `c` in `(lo, hi)`, as an `Anum`.
+/// Callers build the coefficients over `BigInt`, so no `i64` product or sum
+/// can overflow.
+fn alg(c: &[BigInt], lo: Bq, hi: Bq) -> Anum {
+    let iv = BqInterval::new(lo, hi).expect("ordered bracket");
+    Anum::from_poly_interval(c, &iv).expect("isolating bracket")
 }
 
 /// sqrt(d) as a root of `x^2 - d`.
 fn sq(d: i64) -> Anum {
-    alg(&[-d, 0, 1], 0, d + 1)
+    let d = BigInt::from(d);
+    let hi = Bq::from_int(&d + 1);
+    alg(&[-d, BigInt::zero(), BigInt::one()], bq_i(0), hi)
 }
 /// sqrt(d) as a root of the REDUCIBLE `(x^2 - d)(x^2 - e)` — the SAME real
 /// value through a DIFFERENT defining polynomial. The bracket must isolate
@@ -69,7 +72,15 @@ fn sq(d: i64) -> Anum {
 /// explicitly rather than guessed.
 fn sq_via(d: i64, e: i64, lo: i64, hi: i64) -> Anum {
     // (x^2-d)(x^2-e) = x^4 - (d+e)x^2 + d*e
-    alg(&[d * e, 0, -(d + e), 0, 1], lo, hi)
+    let (d, e) = (BigInt::from(d), BigInt::from(e));
+    let c = [
+        &d * &e,
+        BigInt::zero(),
+        -(&d + &e),
+        BigInt::zero(),
+        BigInt::one(),
+    ];
+    alg(&c, bq_i(lo), bq_i(hi))
 }
 
 fn end(a: &Anum) -> AEnd {
@@ -197,15 +208,12 @@ fn av_liveness_at_the_ceilings() {
     let n = 256usize;
     let mut ivs = Vec::with_capacity(n);
     for i in (0..n).rev() {
-        let base = 4 * i as i64;
+        // Exact over BigInt: no `i64` product or sum can overflow.
+        let base = BigInt::from(i) * BigInt::from(4u8);
         // roots of (x - base)^2 - 2  ->  base +- sqrt(2)
-        let c = vec![
-            BigInt::from(base * base - 2),
-            BigInt::from(-2 * base),
-            BigInt::one(),
-        ];
-        let lo_iv = BqInterval::new(bq_i(base - 2), bq_i(base)).unwrap();
-        let hi_iv = BqInterval::new(bq_i(base), bq_i(base + 2)).unwrap();
+        let c = vec![&base * &base - 2, &base * -2, BigInt::one()];
+        let lo_iv = BqInterval::new(Bq::from_int(&base - 2), Bq::from_int(base.clone())).unwrap();
+        let hi_iv = BqInterval::new(Bq::from_int(base.clone()), Bq::from_int(&base + 2)).unwrap();
         let lo = Anum::from_poly_interval(&c, &lo_iv).unwrap();
         let hi = Anum::from_poly_interval(&c, &hi_iv).unwrap();
         ivs.push(nonempty(DecidedInterval::from_bounds(

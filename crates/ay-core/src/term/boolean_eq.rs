@@ -284,6 +284,16 @@ impl TermStore {
             return self.true_term();
         }
 
+        if let Some(result) = self.fold_complex_equality(lhs, rhs) {
+            return result;
+        }
+
+        if self.sort(lhs) == &Sort::String {
+            if let Some(result) = self.fold_sequence_power_equality(lhs, rhs) {
+                return result;
+            }
+        }
+
         // Constant folding: different constants are not equal
         // (Note: since we intern constants, if lhs != rhs and both are constants,
         // they must be different values)

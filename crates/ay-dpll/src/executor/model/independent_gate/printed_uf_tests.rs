@@ -152,19 +152,25 @@ fn g3_pin_agreeing_with_printed_table_confirms() {
 /// this patch — confirms this hybrid and ships a `sat` whose own printed
 /// witness a validator refutes (the counterexample in
 /// the development design notes). The reconciled
-/// gate must REFUSE (`CannotConfirm`: the two sources disagree, so there is
-/// no single interpretation to certify).
+/// gate must REFUSE, and it does so by evaluating the PUBLISHED value: the
+/// printed `g(a) = @U!2` falsifies `(= (g a) b)`, so the witness the user
+/// would receive is refuted (`ModelViolates`).
+///
+/// It used to refuse with `CannotConfirm` by treating the disagreement as an
+/// absent value. For an array-valued application that absence was not final:
+/// the evaluator's select fallback then read the per-read pin — the very
+/// value the reconciliation refused — and confirmed a model whose printed
+/// `g` falsifies an assertion (2026-09-23 hunt M2). Answering from the
+/// printed body closes that path for every result sort.
 #[test]
 fn g3_pin_disagreeing_with_printed_table_is_refused() {
     let exec = g3_pin_vs_printed_gate("@U!2");
     match exec.confirm_sat_with_independent_gate() {
-        GateVerdict::CannotConfirm { reason } => assert!(
-            reason.contains("model commits no value for this application of `g`"),
-            "the refusal must come from the reconciled UF read, got: {reason}"
-        ),
+        GateVerdict::ModelViolates { .. } => {}
         other => panic!(
             "#g3-gate-reads-printed-uf: a pin that disagrees with the published \
-                 interpretation at the same point must fail closed, got {other:?}"
+                 interpretation at the same point must be refuted on the published \
+                 value, got {other:?}"
         ),
     }
 }
@@ -211,4 +217,154 @@ fn datatype_printed_uf_rows_preserve_constructor_identity_and_fail_closed() {
             "opaque, wrong-arity, or foreign constructor `{malformed}` must fail closed"
         );
     }
+}
+
+/// COHERENCE: a branching-datatype printed body that is now readable
+/// must be evaluated as published — a per-application pin that
+/// disagrees with it cannot confirm the hybrid. This is the datatype
+/// twin of `g3_pin_disagreeing_with_printed_table_is_refused`, reduced
+/// from Certora `65782_..._6_QF_UFDTBV`: before branching trees were
+/// readable, the gate confirmed that file's witness from pins while
+/// its printed body falsified an assertion at the constructed point
+/// (independently validated with z3 against the printed body). Both
+/// cases solve the same query for a genuine lane model, then vary
+/// only the printed `else` value of `g`'s table.
+#[cfg(test)]
+fn branching_printed_body_gate(tampered_else: Option<&str>) -> Executor {
+    let commands = parse(
+        "(set-logic QF_UFDTLIA) \
+         (declare-datatypes ((Tree 0)) \
+          (((node (left Tree) (right Tree) (value Int)) \
+            (wrap (child Tree)) \
+            (leaf (payload Int))))) \
+         (declare-fun g (Tree) Int) \
+         (assert (= (g (node (leaf 0) (wrap (leaf 0)) 4)) 10001)) \
+         (check-sat)",
+    )
+    .expect("valid SMT-LIB test input");
+    let mut exec = Executor::new();
+    let output = exec.execute_all(&commands).expect("commands must execute");
+    assert!(
+        output.iter().any(|line| line.trim() == "sat"),
+        "fixture query must solve sat first: {output:?}"
+    );
+    if let Some(else_value) = tampered_else {
+        let model = exec.last_model.as_mut().expect("sat model installed");
+        let euf = model
+            .euf_model
+            .as_mut()
+            .expect("lane model must carry an EUF table for g");
+        let rows = euf
+            .function_tables
+            .get_mut("g")
+            .expect("genuine table for g must exist");
+        let last = rows.last_mut().expect("table must have an else row");
+        last.1 = else_value.to_string();
+    }
+    exec
+}
+
+#[test]
+fn branching_printed_body_agreeing_with_pin_confirms() {
+    let exec = branching_printed_body_gate(None);
+    assert!(
+        matches!(
+            exec.confirm_sat_with_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ),
+        "the genuine coherent branching witness must confirm"
+    );
+}
+
+#[test]
+fn branching_printed_body_disagreeing_with_pin_is_refuted() {
+    use num_traits::ToPrimitive;
+
+    let exec = branching_printed_body_gate(Some("7"));
+    let model = exec.last_model.as_ref().expect("sat model installed");
+    let view = IndependentModelView::new(&exec, model);
+    let interp = view
+        .printed_uf_interpretation("g")
+        .expect("tampered branching table must stay readable");
+    assert!(
+        matches!(interp.else_value, ModelValue::Int(ref value) if value.to_i64() == Some(7)),
+        "tampered else must reach the gate, got {:?}",
+        interp.else_value
+    );
+    assert!(
+        matches!(
+            exec.confirm_sat_with_independent_gate(),
+            GateVerdict::ModelViolates { .. }
+        ),
+        "the tampered published body answers 7 at the constructed point, \
+         so the pin's 10001 must not confirm the hybrid witness"
+    );
+}
+
+/// A branching recursive datatype is outside the linear exact-array-cell
+/// fragment, but a printed UF row still contains one concrete, bounded
+/// constructor tree. The gate must parse that exact tree rather than drop the
+/// published interpretation and then evaluate the nested application through
+/// an incoherent pin. Reduced from Certora 39657's `x188` witness shape,
+/// where the independent gate falsified `(= x58 (x217 (x46 x58)))` even
+/// though the rewritten `x46` and `x217` tables composed to `10001`.
+#[test]
+fn datatype_printed_uf_rows_parse_branching_recursive_tree() {
+    use num_traits::ToPrimitive;
+
+    let exec = loaded(
+        "(declare-datatypes ((Tree 0)) \
+         (((node (left Tree) (right Tree) (value Int)) \
+           (wrap (child Tree)) \
+           (leaf (payload Int)))))",
+    );
+    let model = Model::empty();
+    let view = IndependentModelView::new(&exec, &model);
+    let tree_sort = Sort::Uninterpreted("Tree".to_string());
+    let rows = vec![
+        (vec!["(leaf 0)".to_string()], "0".to_string()),
+        (
+            vec!["(node (leaf 0) (wrap (leaf 0)) 4)".to_string()],
+            "10001".to_string(),
+        ),
+        (vec!["(leaf 1)".to_string()], "(- 1)".to_string()),
+    ];
+
+    let parsed = view
+        .read_printed_uf_rows(std::slice::from_ref(&tree_sort), &Sort::Int, &rows)
+        .expect("bounded recursive constructor trees in printed UF rows must parse");
+    assert!(matches!(
+        parsed.rows.as_slice(),
+        [
+            (leaf_point, ModelValue::Int(leaf_value)),
+            (node_point, ModelValue::Int(node_value))
+        ] if leaf_value.to_i64() == Some(0)
+            && node_value.to_i64() == Some(10001)
+            && matches!(
+                leaf_point.as_slice(),
+                [ModelValue::Datatype { ctor, args }]
+                    if ctor == "leaf"
+                        && matches!(args.as_slice(), [ModelValue::Int(payload)] if payload.to_i64() == Some(0))
+            )
+            && matches!(
+                node_point.as_slice(),
+                [ModelValue::Datatype { ctor, args }]
+                    if ctor == "node"
+                        && matches!(
+                            args.as_slice(),
+                            [
+                                ModelValue::Datatype { ctor: left, .. },
+                                ModelValue::Datatype { ctor: right, args: right_args },
+                                ModelValue::Int(payload)
+                            ] if left == "leaf"
+                                && right == "wrap"
+                                && matches!(
+                                    right_args.as_slice(),
+                                    [ModelValue::Datatype { ctor: wrapped, .. }] if wrapped == "leaf"
+                                )
+                                && payload.to_i64() == Some(4)
+                        )
+            )
+    ));
+    assert!(matches!(parsed.else_value, ModelValue::Int(ref value) if value.to_i64() == Some(-1)));
 }

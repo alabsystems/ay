@@ -641,8 +641,19 @@ fn supplied_smt_evidence_keeps_legacy_trace_replay_when_ground_is_available() {
 (check-sat)
 "#,
     );
+    // Route through the exact executor lane, the one model-checker-consumer's BMC shortcut
+    // and the adaptive front probe use (both set a per-depth timeout). Without
+    // one, `concrete_scalar_bmc_applicable` hands this cyclic Int fixture to
+    // the concrete scalar lane, whose SMT-replayed Unsafe has never carried a
+    // ground derivation (unchanged since 3304604e8), so the "ground is
+    // available" precondition below could not hold.
     let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
-        .solve_bmc_only(BmcConfig::default().with_max_depth(2));
+        .solve_bmc_only(
+            BmcConfig::default()
+                .with_max_depth(2)
+                .with_time_budget(REPLAY_TEST_BUDGET)
+                .with_per_depth_timeout(REPLAY_TEST_BUDGET),
+        );
     let VerifiedChcResult::Unsafe(verified) = &result else {
         panic!("reachable fixture must produce Unsafe");
     };
@@ -823,15 +834,17 @@ fn checked_replay_rejects_model_that_does_not_discharge_safety() {
     let error = run
         .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect_err("non-discharging model must fail the checked replay");
-    // A safety obligation is an UNSAT obligation now discharged by the native
-    // strict bundle self-check. A bogus model makes it replay SAT, so no UNSAT
-    // certificate is produced and the pass fails closed to metadata-only.
+    // A safety obligation is an UNSAT obligation now discharged by the
+    // retained native solve (`strict_bundle::discharge_retained`). A bogus
+    // model makes it replay SAT, so no bound UNSAT proof is minted and the
+    // pass fails closed to metadata-only, for that cause and no other.
     assert!(
         error
             .to_string()
-            .contains("did not produce a native strict UNSAT certificate"),
+            .contains("retained obligation did not establish UNSAT"),
         "failure should name the non-discharging strict obligation: {error}"
     );
+    assert!(!error.to_string().contains("interrupted"), "{error}");
 
     let metadata = run.metadata();
     assert!(!metadata.trust_full_verifier_admissible());

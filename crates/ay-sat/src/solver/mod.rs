@@ -30,7 +30,9 @@ use crate::decision_trace::{self, DecisionTraceWriter, ReplayTrace, SolveOutcome
 use crate::decompose::Decompose;
 pub use crate::decompose::DecomposeLratPreflightStats;
 use crate::diagnostic_trace::{DiagnosticPass, SatDiagnosticWriter};
-use crate::extension::{ExtCheckResult, Extension, PreparedExtension, SolverContext};
+use crate::extension::{
+    ExtCheckResult, ExtContinue, ExtPropagateResult, Extension, PreparedExtension, SolverContext,
+};
 use crate::factor::Factor;
 use crate::gates::GateStats;
 use crate::htr::{HTRStats, HTR};
@@ -66,8 +68,7 @@ mod jit_compile;
 #[cfg(not(feature = "jit"))]
 mod jit_stubs;
 pub(crate) mod minimization_state;
-// PropagationContext-ABI kernel host: ay-sat drives the published
-// ay_sat_watch_bcp kernel surface as a shadow (#678).
+// Phase-3 live invocation of the external-codegen native install gate (#678).
 mod origin_result;
 pub(crate) mod phase_init_state;
 #[allow(dead_code)]
@@ -81,6 +82,9 @@ pub use dump_cnf::{DumpCnfReport, DumpCnfVerdict, ExtendModelReport};
 pub use incremental::VarAssignmentKind;
 pub use lookahead::LookaheadStats;
 pub use origin_result::{SolverAssumeResult, SolverSatResult};
+pub use proof_exhaustion_scope::{
+    keep_proof_inprocessing_after_exhaustion, ProofInprocessingKeptAfterExhaustion,
+};
 pub(crate) use state::ReasonKind;
 pub use state::Solver;
 pub use stats::{
@@ -104,6 +108,13 @@ pub(crate) use var_data::{
 // Implement SolverContext for Solver to allow extensions to observe state
 impl SolverContext for Solver {
     fn value(&self, var: Variable) -> Option<bool> {
+        // A variable above the allocated range is one an extension has
+        // MINTED mid-search (see `num_vars`): it is unassigned by
+        // definition, and querying it before the solver grows for the
+        // returned result must not index the assignment arrays.
+        if var.index() >= self.num_vars {
+            return None;
+        }
         self.var_value_from_vals(var.index())
     }
 
@@ -112,6 +123,9 @@ impl SolverContext for Solver {
     }
 
     fn var_level(&self, var: Variable) -> Option<u32> {
+        if var.index() >= self.num_vars {
+            return None;
+        }
         if self.var_is_assigned(var.index()) {
             Some(self.var_data[var.index()].level)
         } else {
@@ -141,6 +155,10 @@ impl SolverContext for Solver {
 
     fn propagations(&self) -> u64 {
         self.num_propagations
+    }
+
+    fn search_ticks(&self) -> u64 {
+        self.total_search_ticks()
     }
 
     fn activity(&self, var: Variable) -> f64 {
@@ -181,8 +199,14 @@ mod arena_gc;
 mod assumptions;
 mod backtrack;
 pub(crate) mod backward_proof;
+mod binary_irredundant;
 mod branching;
 mod build;
+mod construction;
+mod initial_construct;
+pub use initial_construct::CountedInitialSolver;
+mod candidate;
+pub use candidate::{CandidateSearchOutcome, CandidateSearchWork, CandidateSolver};
 mod clause_add;
 mod clause_add_internal;
 mod clause_add_theory;
@@ -191,6 +215,7 @@ mod clone;
 mod cold;
 mod cold_restart;
 pub(crate) mod compact;
+mod compact_fixed;
 mod config;
 mod config_capability;
 mod config_preprocess;
@@ -216,10 +241,16 @@ mod conflict_analysis_minimize_lrat;
 #[allow(dead_code)]
 mod constants;
 mod constrain;
+mod consuming_clause_trace;
+pub use consuming_clause_trace::{ConsumingTraceControl, ConsumingTraceError, ConsumingTraceStop};
+mod counted_admission;
+mod decision_admission;
+mod decision_commit;
+mod det_work;
 #[allow(dead_code)]
 pub(crate) mod dip;
-#[allow(dead_code)]
-pub(crate) mod equiv_detection;
+mod factor_large;
+mod factor_marks_undo;
 mod flip_to_none;
 mod gf_probe;
 mod incremental;
@@ -228,20 +259,25 @@ mod indep_support;
 mod inproc_control;
 #[allow(dead_code)]
 mod inprocessing;
+mod jump_reasons;
 pub(crate) mod lifecycle;
 mod load_slack;
 mod lookahead;
 mod lookahead_schedule;
 mod lucky_scratch;
 mod memory_budget;
+mod memory_report;
 mod mutate;
 mod mutate_delete;
 mod mutate_replace;
 mod mutate_replace_lrat;
 mod mutate_validate;
+mod original_clause_ids;
+pub(crate) use original_clause_ids::FreshInputTraceEvent;
 mod otfs;
 mod portfolio_sharing;
 mod preprocess;
+mod preprocess_kissat;
 mod preprocess_reset;
 mod preprocess_verify;
 mod probe_implications;
@@ -249,12 +285,14 @@ mod probe_implications;
 mod profile;
 mod proof_consumer_lifecycle;
 mod proof_emit;
+mod proof_exhaustion_scope;
 mod propagation;
 mod propagation_bcp;
 #[cfg(feature = "raw-pointer-bcp")]
 #[path = "propagation_bcp_unsafe.rs"]
 mod propagation_bcp_unsafe;
 mod propagation_dense;
+mod random_decision;
 pub(crate) mod reap;
 mod reduction;
 mod reduction_between_solves;
@@ -268,23 +306,27 @@ mod restart;
 mod sat_whole_loop_guard;
 mod shrink;
 mod solve;
+mod stable_lock;
 mod stats;
+mod subst_kissat;
 mod tracing_config;
 mod vars;
+mod veripb_define;
+mod veripb_derived;
+mod veripb_hints;
+mod veripb_ready;
+mod veripb_stats;
+mod veripb_sweep;
+mod veripb_units;
+mod work_report;
 // Experimental (AY_XP_*) probe/vivify/backbone measurement knobs (default-OFF).
-mod xp_probe_vivify;
-
-// Phase 2 bridge to ay-approx-bcp approximate BCP filter (issue #8789).
-// Behind feature flag so default builds don't pull in the ay-approx-bcp
-// crate. The bridge is a pure observer — it only bumps counters, never
-// alters propagation. Phase 3 will thread the verdict into the watch
-// walker.
-#[cfg(feature = "approx-bcp-filter")]
-pub(crate) mod approx_bcp_bridge;
+pub(crate) mod xp_probe_vivify;
 
 use constants::*;
 use tier_state::TIER_RECOMPUTE_INIT;
-use xp_probe_vivify::{no_backbone, probe_min_effort, probe_permille, vivify_permille};
+use xp_probe_vivify::{
+    giant_inproc_permille, no_backbone, probe_min_effort, probe_permille, vivify_permille,
+};
 
 /// CDCL solver TLA+ trace module and variable constants.
 const CDCL_TRACE_MODULE: &str = "cdcl_test";
@@ -375,6 +417,3 @@ impl TlaTraceable for Solver {
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

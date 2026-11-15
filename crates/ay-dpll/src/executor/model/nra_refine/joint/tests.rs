@@ -9,7 +9,7 @@ use ay_nra::{RealAlgebraicValue, RealScalar};
 use num_bigint::BigInt;
 use num_traits::One;
 
-fn ratio(n: i64, d: i64) -> BigRational {
+pub(super) fn ratio(n: i64, d: i64) -> BigRational {
     BigRational::new(BigInt::from(n), BigInt::from(d))
 }
 
@@ -99,7 +99,7 @@ fn seed_values_include_the_models_own_rationals() {
 // ---------------- end-to-end joint refinement ----------------
 
 /// The positive or negative root of `x^2 - c` as an exact algebraic value.
-fn sqrt_value(c: BigRational, sign: i32) -> RealAlgebraicValue {
+pub(super) fn sqrt_value(c: BigRational, sign: i32) -> RealAlgebraicValue {
     ay_nra::rcf_api::real_roots(&[-c, BigRational::zero(), BigRational::one()])
         .expect("x^2 - c root isolation")
         .into_iter()
@@ -111,14 +111,14 @@ fn sqrt_value(c: BigRational, sign: i32) -> RealAlgebraicValue {
         .expect("x^2 - c has an irrational root of that sign")
 }
 
-fn run_script(input: &str) -> (Executor, Vec<String>) {
+pub(super) fn run_script(input: &str) -> (Executor, Vec<String>) {
     let commands = parse(input).expect("script parses");
     let mut exec = Executor::new();
     let out = exec.execute_all(&commands).expect("script executes");
     (exec, out)
 }
 
-fn rational_of(exec: &Executor, var: TermId) -> BigRational {
+pub(super) fn rational_of(exec: &Executor, var: TermId) -> BigRational {
     exec.last_model
         .as_ref()
         .and_then(|m| m.lra_model.as_ref())

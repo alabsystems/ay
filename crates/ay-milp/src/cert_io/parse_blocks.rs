@@ -39,9 +39,16 @@ pub(super) fn parse_core_block(
             state.certificate.tree = Some(MilpInfeasibilityCertificate { root });
             *line = next;
         }
+        // CAPTURED, NOT PARSED. The block is handed to the checker as its own
+        // records and verified one leaf at a time; see
+        // `Certificate::opt_tree_body` for the measurement that made building
+        // the tree here a ceiling on what could be checked at all. The capture
+        // itself validates nothing beyond the block's extent — every grammar
+        // and coverage obligation is `verify_opt_tree_body`'s, and it fails
+        // closed on anything it cannot read.
         "opttree" => {
-            let (root, next) = parse_opt_tree(lines, *line + 1)?;
-            state.certificate.opt_tree = Some(root);
+            let (body, next) = capture_opt_tree_body(lines, *line + 1)?;
+            state.certificate.opt_tree_body = Some(body);
             *line = next;
         }
         "affine-aggregation" => parse_unique_affine(lines, line, &mut state.certificate)?,

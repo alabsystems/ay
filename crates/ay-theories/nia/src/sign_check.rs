@@ -95,12 +95,7 @@ impl NiaSolver<'_> {
                     if self.debug {
                         safe_eprintln!("[NIA] Sign conflict: factor_signs={:?}, expected_prod={}, constraint={:?}", factor_signs, expected_sign, constraint);
                     }
-                    return Some(
-                        self.asserted
-                            .iter()
-                            .map(|(term, val)| TheoryLit::new(*term, *val))
-                            .collect(),
-                    );
+                    return Some(self.full_conflict_lits());
                 }
             }
         }

@@ -34,8 +34,7 @@ pub(in crate::executor) fn collect_root_surface_term_override(
     {
         return;
     }
-    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
-    let surface = format_frontend_term(&echo);
+    let surface = authored_root_surface(ctx, parsed);
     // An atom's IDENTITY spelling (`p` recorded for the variable `p`) is
     // byte-identical to what the printer emits with no override at all, so it
     // carries no information — but a plain `insert` still lets it CLOBBER a
@@ -58,6 +57,18 @@ pub(in crate::executor) fn collect_root_surface_term_override(
         return;
     }
     overrides.insert(canonical, surface);
+}
+
+/// The printed spelling [`collect_root_surface_term_override`] records for a
+/// whole authored assertion: annotations stripped, Real-context numerals
+/// realified.
+pub(in crate::executor) fn authored_root_surface(
+    ctx: &mut Context,
+    parsed: &FrontendTerm,
+) -> String {
+    let parsed = strip_frontend_annotations(parsed);
+    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
+    format_frontend_term(&echo)
 }
 
 /// `true` when `surface` is exactly how the Alethe printer renders the atomic
@@ -145,7 +156,145 @@ pub(super) fn override_would_hijack_atom(
         parsed,
         FrontendTerm::App(..) | FrontendTerm::IndexedApp(..) | FrontendTerm::QualifiedApp(..)
     );
-    composite && parsed_term_mentions_identifier(parsed)
+    // A ground expression that merely EVALUATES to a constant (`(<= 0 2)`
+    // for `true`, `(div (- 4 (mod 4 2)) 2)` for `2`) is a different term, not
+    // another spelling of the same value the way `(- 1)` spells `-1` or
+    // `(/ 1 2)` spells `1/2`. A constant is shared by every subterm that
+    // folds to it, so such an entry re-spells unrelated occurrences (an
+    // `(assume (and .. (<= 0 2) .. (not true)))` conjunct then prints as
+    // `(not (<= 0 2))`).
+    let constant = matches!(terms.get(canonical), TermData::Const(_));
+    composite
+        && ((constant && !is_numeric_literal_spelling(parsed))
+            || parsed_term_mentions_identifier(parsed))
+}
+
+/// `true` when spelling the `forall_inst` instance `instance` from the
+/// authored body of `parsed_forall` would REWRITE an atom
+/// ([`override_would_hijack_atom`]): the store folded the instance to a
+/// variable or constant, while the authored body is composite.
+///
+/// The instance of `(forall ((q Bool)) (and q q))` at `false` is the SHARED
+/// `false` term; recording `(and false false)` against it would re-spell every
+/// `false` in the document, the `false` axiom first. The same holds for
+/// `(= q true)` and `(not (not q))`, and for a variable fold result such as
+/// `p` for `(and p x)` at `true`. Declining the entry is fail-closed: the
+/// instance prints canonically and the printer's own `forall_inst` judgement
+/// reads the bytes that ship.
+pub(in crate::executor) fn forall_instance_would_hijack_atom(
+    terms: &TermStore,
+    instance: TermId,
+    parsed_forall: &FrontendTerm,
+) -> bool {
+    let FrontendTerm::Forall(_, body) = strip_frontend_annotations(parsed_forall) else {
+        return false;
+    };
+    override_would_hijack_atom(terms, instance, strip_frontend_annotations(body))
+}
+
+/// `n`, `(- n)`, `(/ n m)` and `(- (/ n m))` over numeral or decimal
+/// literals: the only SMT-LIB spellings of an arithmetic constant.
+fn is_numeric_literal_spelling(term: &FrontendTerm) -> bool {
+    match strip_frontend_annotations(term) {
+        FrontendTerm::Const(_) => true,
+        FrontendTerm::App(op, args) if op == "-" && args.len() == 1 => {
+            is_numeric_literal_spelling(&args[0])
+        }
+        FrontendTerm::App(op, args) if op == "/" && args.len() == 2 => args
+            .iter()
+            .all(|arg| matches!(strip_frontend_annotations(arg), FrontendTerm::Const(_))),
+        _ => false,
+    }
+}
+
+/// `true` when `parsed` names a nullary `define-fun` the proof exporter
+/// hands the printer as a definition premise.
+///
+/// Such a spelling may head an `assume`, where the printer bridges it to the
+/// canonical term through `(= name body)`, but never a DESCENDANT override:
+/// that entry re-spells its `TermId` at every occurrence, and pinned carcara
+/// 1.1.0, run without `--apply-function-defs`, reads the name as an opaque
+/// constant, so every step over that occurrence disagrees with the expanded
+/// term AY checked. MEASURED on `(define-fun m () Bool (< x 3))`, `(assert m)`,
+/// `(assert (or r (not m)))`, `(assert (not r))`: the descendant entry
+/// `(not (< x 3))` -> `(not m)` survived after both roots were bridged, and
+/// before those bridges existed the same entry published a `trust_free=yes`
+/// document carcara refused at an `equiv_neg2` over `(not m)` and
+/// `(not (< x 3))`.
+pub(super) fn names_nullary_macro(ctx: &Context, parsed: &FrontendTerm) -> bool {
+    let mut stack: Vec<&FrontendTerm> = vec![parsed];
+    while let Some(term) = stack.pop() {
+        match strip_frontend_annotations(term) {
+            FrontendTerm::Symbol(name) => {
+                if ctx.source_nullary_definition_for_proof(name).is_some() {
+                    return true;
+                }
+            }
+            FrontendTerm::App(_, args)
+            | FrontendTerm::IndexedApp(_, _, args)
+            | FrontendTerm::QualifiedApp(_, _, args) => stack.extend(args.iter()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a DESCENDANT subterm `child`, authored as `parsed`, records its
+/// spelling: not a fold onto an atom ([`override_would_hijack_atom`]), not a
+/// fold onto one of its own operands ([`override_folds_onto_own_operand`]),
+/// not already spelled, and naming no nullary macro ([`names_nullary_macro`]).
+pub(super) fn records_descendant_spelling(
+    ctx: &mut Context,
+    child: TermId,
+    parsed: &FrontendTerm,
+    overrides: &HashMap<TermId, String>,
+) -> bool {
+    !override_would_hijack_atom(&ctx.terms, child, parsed)
+        && !overrides.contains_key(&child)
+        && !names_nullary_macro(ctx, parsed)
+        && !override_folds_onto_own_operand(ctx, child, parsed)
+}
+
+/// `true` when elaboration folded the authored application `parsed` onto
+/// (the canonical form of) ONE OF ITS OWN OPERANDS: `(and true X)`,
+/// `(or false X)`, `(and X X)`, `(ite c X X)` all intern as the term `X`
+/// already is.
+///
+/// This is the composite twin of [`override_would_hijack_atom`], which only
+/// sees a fold whose result is a variable or constant. The override map is
+/// keyed by canonical `TermId` and consulted at EVERY print site, so
+/// recording `(and true X)` against `X` re-spells every occurrence of `X` —
+/// including the one inside the recorded spelling's own operand. Measured
+/// (Trust's in-process ay lane, 2026-10-06) on
+/// `(assert (and (<= a b) (and true (not (<= a b)))))`: the descendant entry
+/// `(not (<= a b))` -> `(and true (not (<= a b)))` made the raw re-interned
+/// root print as `(and (<= a b) (and true (and true (not (<= a b)))))`, so the
+/// fold-to-`false` complement rescue (`authored_fold_identity`) refused its
+/// own candidate at the "prints as authored" gate, the proof was erased to
+/// the bare hole, and mandatory strict certification turned a correct
+/// `unsat` into `unknown (incomplete self-check-rejected)`.
+///
+/// Refusing the entry is fail-closed: a dropped override only makes `X` print
+/// in its canonical form — which is what the proof's own steps mention —
+/// never changes what any step claims. A genuine re-spelling
+/// (`(>= x 0)` on `(<= 0 x)`) keeps its entry: no operand of it elaborates to
+/// the whole canonical term.
+pub(super) fn override_folds_onto_own_operand(
+    ctx: &mut Context,
+    canonical: TermId,
+    parsed: &FrontendTerm,
+) -> bool {
+    let operands: &[FrontendTerm] = match strip_frontend_annotations(parsed) {
+        FrontendTerm::App(_, args)
+        | FrontendTerm::IndexedApp(_, _, args)
+        | FrontendTerm::QualifiedApp(_, _, args) => args,
+        _ => return false,
+    };
+    operands.iter().any(|operand| {
+        let operand = strip_frontend_annotations(operand);
+        super::parsed_term_is_binder_free(operand)
+            && ctx.elaborate_surface_subterm(operand) == Some(canonical)
+    })
 }
 
 /// `true` when the parsed source term mentions any identifier (a bare
@@ -167,3 +316,7 @@ fn parsed_term_mentions_identifier(term: &FrontendTerm) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "atom_override_tests.rs"]
+mod tests;

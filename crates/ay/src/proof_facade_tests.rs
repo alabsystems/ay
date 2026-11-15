@@ -6,6 +6,7 @@
 fn proof_types_accessible_through_facade() {
     let _: fn() -> crate::ProofAcceptanceMode = || crate::ProofAcceptanceMode::Strict;
     let _: fn() -> Option<crate::StrictProofVerdict> = || None;
+    let _: fn() -> Option<crate::StrictVerdictStop> = || None;
     let _: fn() -> Result<(), crate::ProofAcceptanceError> = || Ok(());
     let _: fn() -> Option<crate::ProofQuality> = || None;
     let _: fn() -> Option<crate::PartialProofCheck> = || None;
@@ -29,6 +30,7 @@ fn checked_native_replay_proof_api_is_accessible_through_facade() {
 fn proof_types_accessible_through_api_module() {
     let _: fn() -> crate::api::ProofAcceptanceMode = || crate::api::ProofAcceptanceMode::Strict;
     let _: fn() -> Option<crate::api::StrictProofVerdict> = || None;
+    let _: fn() -> Option<crate::api::StrictVerdictStop> = || None;
     let _: fn() -> Result<(), crate::api::ProofAcceptanceError> = || Ok(());
     let _: fn() -> Option<crate::api::ProofQuality> = || None;
     let _: fn() -> Option<crate::api::PartialProofCheck> = || None;
@@ -41,6 +43,7 @@ fn proof_types_accessible_through_prelude() {
     let _: fn() -> crate::prelude::ProofAcceptanceMode =
         || crate::prelude::ProofAcceptanceMode::Strict;
     let _: fn() -> Option<crate::prelude::StrictProofVerdict> = || None;
+    let _: fn() -> Option<crate::prelude::StrictVerdictStop> = || None;
     let _: fn() -> Result<(), crate::prelude::ProofAcceptanceError> = || Ok(());
     let _: fn() -> Option<crate::prelude::ProofQuality> = || None;
     let _: fn() -> Option<crate::prelude::PartialProofCheck> = || None;

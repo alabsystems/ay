@@ -17,6 +17,9 @@
 /// 2. set_terms()/unset_terms() bracket each iteration's term access
 /// 3. No structural snapshot needed (theory persists)
 /// 4. Theory is NOT dropped before split atom creation — only unset_terms()
+/// 5. A round whose own decision slice ran out resumes or continues the same
+///    SAT search (#8256, #8399); every bound is a count, armed per round
+///    (`pipeline_fns::eager_persistent_rounds`, P4a)
 macro_rules! pipeline_incremental_split_eager_persistent_arm {
     ($self:ident,
         tag: $tag:expr,
@@ -31,10 +34,7 @@ macro_rules! pipeline_incremental_split_eager_persistent_arm {
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
         use ay_sat::{Literal as SatLiteral, SatResult, Variable as SatVariable};
@@ -61,44 +61,57 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // self.incr_theory_state. make_should_stop() only borrows &self and
         // returns an owned closure that captures Arc-cloned interrupt flag +
         // copied deadline, freeing self for mutable use below.
-        let _islp_base_should_stop = $self.make_should_stop();
+        let _islp_should_stop = $self.make_should_stop();
 
-        // #8256: Per-iteration wall-clock budget for the persistent split-loop.
-        // The SAT solver polls should_stop every 100 conflicts and every 1000
-        // decisions. We use a wall-clock timer to limit each iteration's runtime,
-        // preventing the SAT solver from getting stuck indefinitely on iteration 0
-        // for complex QF_LRA formulas (e.g., simple_startup, labyrinth).
-        //
-        // Wall-clock approach is necessary because theory-heavy formulas have
-        // very low conflict rates (expensive simplex calls dominate), making
-        // conflict-based budgets ineffective.
-        //
-        // Grace period: iteration 0 gets a 5s grace period before the budget
-        // kicks in. This allows benchmarks that AY can solve within 5s (like
-        // sc-8.induction2/3) to finish without interruption. After the grace
-        // period, iterations get 500ms + 200ms * iter, capped at 30s.
-        let _islp_iter_deadline = std::cell::Cell::new(ay_core::time::Instant::now());
-        let _islp_budget_exhausted = std::cell::Cell::new(false);
-        let _islp_should_stop = || {
-            if _islp_base_should_stop() {
-                return true;
-            }
-            if ay_core::time::Instant::now() >= _islp_iter_deadline.get() {
-                _islp_budget_exhausted.set(true);
-                return true;
-            }
-            false
-        };
+        // #8256 / P4a: the rounds run on COUNTS
+        // (`pipeline_fns::eager_persistent_rounds`). Each round's SAT solve is
+        // bounded by its search's `:rlimit` conflict allowance and decision
+        // companion (armed as every other split-loop arm arms them), and every
+        // round after the first by its own decision slice, the former
+        // per-iteration wall window (120 s / 30 s / 15 s / 500 ms + 200 ms per
+        // iteration) converted at a measured decision rate: decisions, because
+        // theory-heavy formulas make few conflicts (expensive simplex calls
+        // dominate). When only the round's slice stopped the solve the next
+        // round resumes or continues the search; when the search's allowance
+        // did, the arm publishes `unknown` (resourceout). The arm reads no
+        // clock: the SAT solve's stop poll is the backstop (interrupt and
+        // solve deadline), whose firing is published as that stop. (ay-sat's
+        // wall-capped inprocessing and lookahead, on unless
+        // `--sat-deterministic-inproc`, are its own residual: they can move
+        // where the counts stop a search, never end one; see
+        // `eager_persistent_rounds`.)
+        let _islp_conflict_allowance = $crate::pipeline_fns::effective_conflict_allowance(
+            $self.resource_limit,
+            $self.ground_budget_enabled,
+        );
+        let _islp_decision_allowance = $crate::pipeline_fns::effective_decision_allowance(
+            $self.decision_limit,
+            $self.ground_budget_enabled,
+        );
+        // What the current search may still spend; refilled when a round starts
+        // a new search (anything but continuing a budget-sliced one).
+        let mut _islp_search =
+            $crate::pipeline_fns::eager_persistent_rounds::SearchAllowance::default();
+        // Set by the budget-exhausted path: the next round continues the same
+        // search (resume, continue, or the stall escalation's full re-solve).
+        let mut _islp_continues_search = false;
+        // Exported as `dpll.eager_persistent.searches` (fresh allowances
+        // drawn) and `dpll.eager_persistent.slice_stops` (rounds their own
+        // slice stopped), the counts only this arm keeps.
+        let mut _islp_searches: u64 = 0;
+        let mut _islp_slice_stops: u64 = 0;
 
         // #8256: Track whether the previous iteration was budget-exhausted.
         // When true, the next SAT solve uses continue_solving_with_extension()
         // or resume_solving_with_extension() to preserve state. Reset to false
         // when splits or refinements are added (which change the clause set).
         let mut _islp_use_continue_solving = false;
-        // #8256: Track whether to use the zero-overhead resume path.
-        // resume_solving re-enters the CDCL loop without trail reset, learned
-        // clause flush, or VSIDS rebuild — O(1) per budget-exhausted iteration
-        // vs O(trail + learned) for continue_solving. Used for the first
+        // #8256: Track whether to use the low-overhead resume path.
+        // resume_solving re-enters the CDCL loop without learned clause flush
+        // or VSIDS rebuild, after a restart (P4a: the trail above level 0 is
+        // backtracked, since a stop can leave a found conflict unanalysed on
+        // it) — O(trail) per budget-exhausted iteration vs O(trail + learned)
+        // plus a learned-clause flush for continue_solving. Used for the first
         // budget-exhausted continuation; falls back to continue_solving when
         // stall detection triggers (preserving the sc-8 non-convergence fix).
         let mut _islp_use_resume_solving = false;
@@ -217,9 +230,23 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
         // Local variable maps grow as splits are added
         let mut local_term_to_var: HashMap<TermId, u32> = base_term_to_var;
-        let mut local_next_var: u32 = u32::try_from(solver.user_num_vars() + solver.scope_depth())
-            .expect("SAT solver variable count does not fit in u32");
+        // Seed from the solver's TOTAL variable count, never
+        // `user_num_vars() + scope_depth()`: that sum omits the DEAD scope
+        // selectors a persistent solver accumulates across pop(), and handing
+        // one of those (forced TRUE at level 0) to a split atom produced a
+        // false UNSAT — see `split_incremental::fresh_sat_var_floor`.
+        let mut local_next_var: u32 =
+            $crate::executor::theories::split_incremental::fresh_sat_var_floor(&solver);
         let base_active_atom_set: HashSet<TermId> = base_active_atoms.iter().copied().collect();
+        // #inc-dead-atoms: withhold atoms outside the active assertions' encoded cone.
+        let mut _islp_dead = $crate::incremental_state::DeadAtomFilter::for_check_sat(
+            $self.lra_persist_sat_active,
+            &$self.ctx.terms, &$self.ctx.assertions,
+            &state.$encoded_field,
+            &local_var_to_term, &local_term_to_var,
+            &base_active_atom_set,
+        );
+        state.dead_atom_stats.withheld += _islp_dead.withheld() as u64;
         let mut _islp_added_split_clauses: HashSet<
             $crate::executor::theories::split_incremental::SplitClauseKey,
         > = HashSet::default();
@@ -330,6 +357,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             local_var_to_term.values().copied(),
             proof_enabled,
         );
+        // #inc-dead-atoms: record atoms re-mapped onto EXISTING vars (revival).
+        _islp_negations.set_track_atom_reuse(_islp_dead.is_on());
 
         // #8008: Bound axiom injection for the eager-persistent arm.
         // Generates transitivity binary clauses (e.g., x >= 5 => x >= 3)
@@ -353,6 +382,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // extension only needs to build bitsets and register atoms.
         let _islp_bound_axioms_pre_injected = true;
 
+        // Exact positive installation evidence for this current SAT scope.
+        // No historical state/cache entry is treated as an installed clause.
+        let mut _islp_installed_theory_lemmas: Vec<ay_core::TheoryLemma> = Vec::new();
         let _islp_result: $crate::executor_types::Result<SolveResult> = 'split_loop: {
             if _islp_scope_depth_unsupported {
                 tracing::warn!(
@@ -389,11 +421,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 state.round_trips += 1;
                 _islp_timing.dpll.round_trips += 1;
+                ay_core::resource::work().note_round_trip();
 
-                // #8256: Consume the continue/resume flags BEFORE setting the
-                // budget, since the budget depends on the mode. Flags were set
-                // by the previous iteration if budget was exhausted. Reset AFTER
-                // consuming so that iterations with splits/refinements use full solve.
+                // #8256: Consume the continue/resume flags BEFORE choosing the
+                // round's slice, since the slice depends on the mode. Flags were
+                // set by the previous iteration if its slice was exhausted. Reset
+                // AFTER consuming so that iterations with splits/refinements use
+                // full solve.
                 // #lra-inc-engine INV-3: under active scope selectors the
                 // continue/resume entrypoints are assumptionless — force full
                 // scope-composed solves (see _islp_persist_scoped above).
@@ -404,49 +438,32 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 _islp_use_continue_solving = false;
                 _islp_use_resume_solving = false;
 
-                // #8256: Set per-iteration wall-clock deadline.
-                //
-                // The budget system exists to let the split loop add
-                // splits/refinements when the SAT solver returns Unknown.
-                // However, for pure QF_LRA benchmarks without ITEs or
-                // disequalities, there are NO splits to add — the solver
-                // must converge in a single continuous run.
-                //
-                // Budget strategy:
-                //   Iteration 0: long budget (120s or global timeout).
-                //     This allows the solver to converge without interruption
-                //     on pure QF_LRA benchmarks. Z3 solves simple_startup_10nodes
-                //     in 1.3s and labyrinth-18 in 11.3s. AY needs ~10-20x more
-                //     decisions due to lower propagation quality, so 120s covers
-                //     the gap with margin. The global timeout (if set) still
-                //     applies via should_stop.
-                //   Resume iterations (budget-exhausted, no splits): 30s.
-                //     After iter 0's budget expires, subsequent budget-exhausted
-                //     continuations use resume_solving (O(1) overhead) and get
-                //     a generous 30s budget. The split loop overhead per resume
-                //     iteration is near-zero.
-                //   Split/refinement iterations: 500ms + 200ms * iter, capped at 30s.
-                //     After new clauses are added, the solver needs to re-explore
-                //     with the new constraints. Shorter budgets are appropriate.
-                _islp_budget_exhausted.set(false);
-                let _iter_budget_ms = if _iteration == 0 {
-                    // Long budget for initial solve. The global timeout
-                    // (via should_stop) still provides the hard cap.
-                    120_000u64
-                } else if _islp_use_resume_this_iter {
-                    // Resume after budget exhaustion with no new clauses:
-                    // give the solver a long continuation window.
-                    30_000u64
-                } else if _islp_use_continue_this_iter {
-                    // Continue with trail reset (stall fallback):
-                    // moderate budget for the fresh search.
-                    15_000u64
-                } else {
-                    // After splits/refinements: incremental budget.
-                    std::cmp::min(500u64 + (_iteration as u64) * 200, 30_000u64)
-                };
-                _islp_iter_deadline.set(
-                    ay_core::time::Instant::now() + std::time::Duration::from_millis(_iter_budget_ms)
+                // P4a: the round's counted budgets (see the setup above).
+                // Iteration 0 has no slice of its own, only its search's
+                // allowance: a pure QF_LRA formula with no splits to add must
+                // converge in one continuous run. Later rounds get the former
+                // window as decisions: resume 30 s, continue 15 s, otherwise
+                // 500 ms + 200 ms per iteration up to 30 s. A round that does
+                // not continue a sliced search starts a new search with a fresh
+                // allowance, as the plain eager arm re-arms every round.
+                let _islp_entry = $crate::pipeline_fns::eager_persistent_rounds::RoundEntry::of(
+                    _islp_use_resume_this_iter,
+                    _islp_use_continue_this_iter,
+                );
+                if !_islp_continues_search {
+                    _islp_search =
+                        $crate::pipeline_fns::eager_persistent_rounds::SearchAllowance::fresh(
+                            _islp_conflict_allowance,
+                            _islp_decision_allowance,
+                            $crate::pipeline_fns::eager_persistent_rounds::SolverCounts::of(solver),
+                        );
+                    _islp_searches += 1;
+                }
+                _islp_continues_search = false;
+                let _islp_slice = $crate::pipeline_fns::eager_persistent_rounds::round_slice(
+                    _iteration,
+                    _islp_entry,
+                    ay_core::resource::round_seam::slice_divisor(),
                 );
 
                 // #6590: Set terms pointer for this iteration.
@@ -469,7 +486,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         vars = local_var_to_term.len(),
                         splits = _islp_added_split_clauses.len(),
                         continue_solving = _islp_use_continue_this_iter,
-                        budget_ms = _iter_budget_ms,
+                        slice_decisions = ?_islp_slice,
                         stall_count = _islp_continue_stall_count,
                         "#8256/#8399 persistent loop state"
                     );
@@ -479,7 +496,29 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 // (new split atoms added). On large formulas this saves O(n*log(n))
                 // sort + O(n) filter per iteration.
                 let _islp_current_var_count = local_var_to_term.len();
-                if _islp_current_var_count != _islp_cached_var_count {
+                if _islp_dead.is_on() {
+                    let _islp_revived = _islp_dead.revive(
+                        _iteration,
+                        _islp_negations.take_reused_atoms(),
+                        &mut state.dead_atom_stats,
+                    );
+                    if _islp_revived || _islp_current_var_count != _islp_cached_var_count {
+                        // Append-only, so the cached path's tail registration
+                        // sees each newly live atom; a revived atom keeps its
+                        // OLD var id, so force the theory-var bitset rescan.
+                        _islp_dead.append_live(
+                            &$self.ctx.terms,
+                            &local_var_to_term,
+                            &base_active_atom_set,
+                            &mut _islp_cached_active_atoms,
+                            &mut _islp_cached_active_atom_set,
+                        );
+                        if _islp_revived {
+                            _islp_cached_ext_data.last_full_rebuild_num_vars = 0;
+                        }
+                        _islp_cached_var_count = _islp_current_var_count;
+                    }
+                } else if _islp_current_var_count != _islp_cached_var_count {
                     _islp_cached_active_atoms =
                         $crate::iter_var_to_term_sorted(&local_var_to_term)
                             .map(|(_, term)| term)
@@ -520,6 +559,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 // #8399: Record conflict count before SAT solve for stall detection.
                 let _islp_pre_solve_conflicts = solver.num_conflicts();
 
+                // P4a: arm the round's deterministic budgets on the persistent
+                // solver (#8749 `:rlimit` + #ground-determinism defaults, and the
+                // round's decision slice). A budget stop comes back as
+                // `SatUnknownReason::ResourceBudget`, which the extension macro
+                // below maps and records through `collect_sat_stats!`.
+                let _islp_round = $crate::pipeline_fns::eager_persistent_rounds::arm_round(
+                    &_islp_search,
+                    _islp_slice,
+                    _islp_entry,
+                    $crate::pipeline_fns::eager_persistent_rounds::SolverCounts::of(solver),
+                );
+                solver.set_conflict_budget(_islp_round.conflict_target);
+                solver.set_decision_budget(_islp_round.decision_target);
+
                 let (sat_result, _ext_conflicts, _ext_propagations,
                      _ext_partial, pending_split, pending_refinements) =
                     pipeline_build_eager_extension!(
@@ -530,11 +583,33 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         _islp_added_refinement_clauses, _islp_added_axioms,
                         _islp_eager_stats, _islp_timing, state,
                         should_stop: _islp_should_stop,
+                        installed_theory_lemmas: _islp_installed_theory_lemmas,
                         cached_ext_data: _islp_cached_ext_data,
                         use_continue_solving: _islp_use_continue_this_iter,
                         use_resume_solving: _islp_use_resume_this_iter,
                         bound_axioms_pre_injected: _islp_bound_axioms_pre_injected
                     );
+                // Only the round’s own slice continues the search. Exhausting
+                // the search allowance is published as resourceout below.
+                let _islp_budget_exhausted = $crate::pipeline_fns::eager_persistent_rounds::settle_round(
+                    &mut _islp_search,
+                    &_islp_round,
+                    solver.last_unknown_reason(),
+                    $crate::pipeline_fns::eager_persistent_rounds::SolverCounts::of(solver),
+                );
+                if _islp_budget_exhausted {
+                    // The slice stop is internal slicing, never an answer: drop
+                    // the reason it recorded NOW, before any path below leaves
+                    // the round. A slice-stopped round can still carry a split,
+                    // a lemma, a model equality or a refinement, and every one of
+                    // those paths starts the next round, where a backstop that
+                    // fires before it (the loop-top check), the split cap or the
+                    // search's own end would otherwise find this round's
+                    // `resourceout` standing for a stop no allowance made.
+                    _islp_slice_stops += 1;
+                    $self.last_unknown_reason = None;
+                    $self.pending_sat_unknown_reason = None;
+                }
 
                 // #8727: Reset the model-equality round counter whenever the
                 // SAT solver learned at least one theory-conflict clause in
@@ -551,8 +626,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 let pending_split = match pending_split {
                     Some(ay_core::TheoryResult::NeedModelEquality(eq)) => {
                         theory.unset_terms();
-                        // #6851: Centralized round budget via ModelEqualityTracker.
-                        if _islp_model_eq_tracker.increment_round() {
+                        // #6851/#1145: a dispatch whose atom is not yet encoded
+                        // (or withheld) is finite progress and replenishes the
+                        // round budget; only a stale dispatch counts against it.
+                        // The atom is the one the encoder maps (#model-eq-encoded-atom).
+                        let _meq_is_new = $crate::pipeline_fns::model_equality_request_is_new(
+                            &mut $self.ctx.terms,
+                            eq.lhs,
+                            eq.rhs,
+                            |atom| local_term_to_var.contains_key(&atom) && !_islp_dead.is_dead(&atom),
+                        );
+                        if _meq_is_new {
+                            _islp_model_eq_tracker.note_new_equality();
+                        } else if _islp_model_eq_tracker.increment_round() {
                             $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                             $self.last_result = Some(SolveResult::Unknown);
                             break 'split_loop Ok(SolveResult::Unknown);
@@ -566,8 +652,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     }
                     Some(ay_core::TheoryResult::NeedModelEqualities(eqs)) => {
                         theory.unset_terms();
-                        // #6851: Centralized round budget via ModelEqualityTracker.
-                        if _islp_model_eq_tracker.increment_round() {
+                        // #6851/#1145: a batch with at least one not-yet-encoded
+                        // (or withheld) atom replenishes the round budget; only
+                        // an all-stale batch counts against it (#model-eq-encoded-atom).
+                        let _meq_has_new = eqs.iter().any(|eq| {
+                            $crate::pipeline_fns::model_equality_request_is_new(
+                                &mut $self.ctx.terms,
+                                eq.lhs,
+                                eq.rhs,
+                                |atom| local_term_to_var.contains_key(&atom) && !_islp_dead.is_dead(&atom),
+                            )
+                        });
+                        if _meq_has_new {
+                            _islp_model_eq_tracker.note_new_equality();
+                        } else if _islp_model_eq_tracker.increment_round() {
                             $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                             $self.last_result = Some(SolveResult::Unknown);
                             break 'split_loop Ok(SolveResult::Unknown);
@@ -642,6 +740,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 }
                             }
                         }
+                        _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
                         continue;
                     }
                     other => other,
@@ -681,6 +780,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             && pending_split.is_none()
                         {
                             let _fc_result = ay_core::TheorySolver::check(&mut theory);
+                            let _fc_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                                &mut theory, _fc_result, &_islp_installed_theory_lemmas, &_islp_should_stop,
+                            );
                             match _fc_result {
                                 ay_core::TheoryResult::Sat => {
                                     // Final check passed.
@@ -717,8 +819,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     // #7966: Suppress stale model equalities whose
                                     // atoms are already encoded in the SAT solver,
                                     // matching the extension-level filter in check.rs.
+                                    // #inc-dead-atoms: a withheld atom is not stale.
                                     let _fc_eq_stale = $self.ctx.terms.find_eq(eq.lhs, eq.rhs)
-                                        .is_some_and(|ea| local_term_to_var.contains_key(&ea));
+                                        .is_some_and(|ea| local_term_to_var.contains_key(&ea)
+                                            && !_islp_dead.is_dead(&ea));
                                     if _fc_eq_stale {
                                         tracing::debug!(
                                             lhs = ?eq.lhs, rhs = ?eq.rhs,
@@ -731,8 +835,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         theory.unset_terms();
-                                        // #6851: Centralized round budget via ModelEqualityTracker.
-                                        if _islp_model_eq_tracker.increment_round() {
+                                        // #6851/#1145: a request whose ENCODED atom is
+                                        // new replenishes the round budget; one whose
+                                        // atom is already mapped counts against it. The
+                                        // stale filter above reads `find_eq`, which can
+                                        // name a different term (#model-eq-encoded-atom).
+                                        if $crate::pipeline_fns::model_equality_request_is_new(
+                                            &mut $self.ctx.terms,
+                                            eq.lhs,
+                                            eq.rhs,
+                                            |atom| local_term_to_var.contains_key(&atom)
+                                                && !_islp_dead.is_dead(&atom),
+                                        ) {
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                             $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                             $self.last_result = Some(SolveResult::Unknown);
                                             break 'split_loop Ok(SolveResult::Unknown);
@@ -752,7 +868,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         .into_iter()
                                         .filter(|eq| {
                                             !$self.ctx.terms.find_eq(eq.lhs, eq.rhs)
-                                                .is_some_and(|ea| local_term_to_var.contains_key(&ea))
+                                                .is_some_and(|ea| local_term_to_var.contains_key(&ea)
+                                                    && !_islp_dead.is_dead(&ea))
                                         })
                                         .collect();
                                     if _fc_fresh_eqs.is_empty() {
@@ -766,8 +883,22 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         theory.unset_terms();
-                                        // #6851: Centralized round budget via ModelEqualityTracker.
-                                        if _islp_model_eq_tracker.increment_round() {
+                                        // #6851/#1145: a batch with a new ENCODED atom
+                                        // replenishes the round budget; one whose atoms
+                                        // are all mapped counts against it
+                                        // (#model-eq-encoded-atom, see above).
+                                        let _fc_has_new = _fc_fresh_eqs.iter().any(|eq| {
+                                            $crate::pipeline_fns::model_equality_request_is_new(
+                                                &mut $self.ctx.terms,
+                                                eq.lhs,
+                                                eq.rhs,
+                                                |atom| local_term_to_var.contains_key(&atom)
+                                                    && !_islp_dead.is_dead(&atom),
+                                            )
+                                        });
+                                        if _fc_has_new {
+                                            _islp_model_eq_tracker.note_new_equality();
+                                        } else if _islp_model_eq_tracker.increment_round() {
                                             $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                             $self.last_result = Some(SolveResult::Unknown);
                                             break 'split_loop Ok(SolveResult::Unknown);
@@ -848,6 +979,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             }
                                         }
                                     }
+                                    _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
                                     continue;
                                 }
                                 // #9224: Handle Unsat/UnsatWithFarkas from post-SAT final
@@ -1108,7 +1240,14 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         {
                             let _psm_extract_start = ay_core::time::Instant::now();
                             let $theory_var = &mut theory;
-                            let _psm_models = $extract;
+                            let _psm_models = match $crate::executor::theories::solve_harness::model_extraction_result($extract) {
+                                Ok(models) => models,
+                                Err(error) => {
+                                    _islp_timing.model_extract += _psm_extract_start.elapsed();
+                                    theory.unset_terms();
+                                    break 'split_loop Err($self.terminal_model_extraction_error(error));
+                                }
+                            };
                             _islp_timing.model_extract += _psm_extract_start.elapsed();
 
                             let _psm_fake_result = ay_core::TseitinResult::new(
@@ -1128,6 +1267,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 ay_sat::SatResult::Sat(model.clone()), &_psm_fake_result, _psm_models,
                             );
                             _islp_timing.store_model += _psm_store_start.elapsed();
+                            #[cfg(test)]
+                            let _psm_store_result =
+                                if $crate::executor::theories::lra::take_forced_loop_model_reject() {
+                                    Ok(SolveResult::Unknown)
+                                } else {
+                                    _psm_store_result
+                                };
 
                             // Check if model validation failed (SatResult::Sat converted
                             // to SolveResult::Unknown). This happens when the model is
@@ -1246,12 +1392,28 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     if !blocking_clause.is_empty() {
                                         let mut _islp_assignment_lits: Vec<ay_core::TheoryLit> =
                                             Vec::new();
+                                        // Bool-sorted uninterpreted constants of the
+                                        // assignment: not theory atoms (the re-check
+                                        // below ignores them), but the recovery
+                                        // re-solve must keep them, or its model
+                                        // leaves them at a completion default and
+                                        // fails validation against every original
+                                        // assertion that mentions one
+                                        // (DPLL_LRA_perf_2026-09-23 §1).
+                                        let mut _islp_bool_pins: Vec<ay_core::TheoryLit> =
+                                            Vec::new();
                                         for (&var_id, &term) in local_var_to_term.iter() {
-                                            if !ay_core::is_theory_atom(&$self.ctx.terms, term) {
+                                            let Some(&val) = model.get(var_id as usize) else {
                                                 continue;
-                                            }
-                                            if let Some(&val) = model.get(var_id as usize) {
+                                            };
+                                            if ay_core::is_theory_atom(&$self.ctx.terms, term) {
                                                 _islp_assignment_lits
+                                                    .push(ay_core::TheoryLit::new(term, val));
+                                            } else if $crate::executor::theories::lra::is_bool_constant(
+                                                &$self.ctx.terms,
+                                                term,
+                                            ) {
+                                                _islp_bool_pins
                                                     .push(ay_core::TheoryLit::new(term, val));
                                             }
                                         }
@@ -1282,6 +1444,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             // assignment's atom conjunction.
                                             match $self.lra_recover_assignment_verdict(
                                                 &_islp_assignment_lits,
+                                                &_islp_bool_pins,
                                             ) {
                                                 Ok(SolveResult::Sat) => {
                                                     tracing::warn!(
@@ -1456,9 +1619,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             continue;
                         }
 
-                        // #8256/#8399: If the Unknown was caused by conflict budget
-                        // exhaustion (not a real global interrupt), continue the
-                        // split-loop. The next iteration will use
+                        // #8256/#8399: If the Unknown was caused by the round's own
+                        // slice (not the search's allowance, not a real global
+                        // interrupt), continue the split-loop. The next iteration will use
                         // continue_solving_with_extension() to preserve VSIDS
                         // scores and learned clauses, giving the SAT solver a
                         // chance to converge with fresh theory guidance from the
@@ -1471,7 +1634,16 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         // the sc-8 non-convergence pattern where stale learned
                         // clauses lock the solver into revisiting the same
                         // search region indefinitely.
-                        if _islp_budget_exhausted.get() && !_islp_base_should_stop() {
+                        //
+                        // P4a: "budget exhausted" is the round's own decision
+                        // slice, never a clock; the backstop (`_islp_should_stop`)
+                        // ends the loop below as the stop it is.
+                        // The slice stop's reason was dropped when the round
+                        // settled, so a backstop that fired since ends below as
+                        // Incomplete, which the executor reports as the stop it
+                        // was.
+                        if _islp_budget_exhausted && !_islp_should_stop() {
+                            _islp_continues_search = true;
                             let _post_conflicts = solver.num_conflicts();
                             let _conflict_progress = _post_conflicts
                                 .saturating_sub(_islp_pre_solve_conflicts);
@@ -1583,7 +1755,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         pipeline_split_epilogue!(
             $self, _islp_timing, _islp_total_start,
             _islp_last_theory_stats, _islp_result,
-            eager: { pipeline_export_split_loop_eager_stats!($self, _islp_eager_stats); },
+            eager: {
+                pipeline_export_split_loop_eager_stats!($self, _islp_eager_stats);
+                $self.last_statistics.set_int("dpll.eager_persistent.searches", _islp_searches);
+                $self.last_statistics.set_int("dpll.eager_persistent.slice_stops", _islp_slice_stops);
+            },
             restore: {}
         )
     }};

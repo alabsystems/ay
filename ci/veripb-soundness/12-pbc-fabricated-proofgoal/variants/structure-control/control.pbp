@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% The one-knob control: `pbc.pbp` with the `proofgoal 1` / `qed;` wrapper removed and nothing
+% else changed. The subproof now owes what it always owed -- a contradiction from `~C` -- and
+% `rup >= 1 ;` cannot supply it, so the UNFIXED checker refuses this too. That is what pins the
+% forgery to the FABRICATED GOAL rather than to "`pbc` subproofs accept anything".
+f 1 ;
+pbc >= 1 : subproof
+rup >= 1 ;
+qed;
+output NONE;
+conclusion UNSAT ;
+end pseudo-Boolean proof;

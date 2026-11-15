@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `Cardinality::add` falls back to a general PB constraint when a summand
+% coefficient exceeds 2, and that fallback subtracted the merge cancellation from the
+% degree in i64 after checking only the unadjusted sum. The degree sum is i64::MIN + 2 and
+% the three merges cancel 3, so the true degree is i64::MIN - 1. The formula is satisfiable
+% (all three variables true).
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

@@ -482,7 +482,7 @@ fn minimization_stop_after_kept_candidate_restores_snapshot() {
     lia.values.insert(x, inflated.clone());
 
     let mut polls = 0usize;
-    exec.minimize_model_sat_preserving_with_stop(|_| {
+    exec.minimize_model_sat_preserving_with_stop(&mut unlimited(), |_| {
         polls += 1;
         // One successful pass (start + attempt), then one converged pass
         // (start + attempt), then the post-loop safety poll.
@@ -499,7 +499,7 @@ fn minimization_stop_after_kept_candidate_restores_snapshot() {
     // Control: without the injected stop, the same model is genuinely
     // shrinkable. This proves the stopped run reached a kept candidate rather
     // than passing vacuously because neither attempt could change.
-    exec.minimize_model_sat_preserving_with_stop(|_| false);
+    exec.minimize_model_sat_preserving_with_stop(&mut unlimited(), |_| false);
     let minimized = exec
         .last_model
         .as_ref()
@@ -512,4 +512,8 @@ fn minimization_stop_after_kept_candidate_restores_snapshot() {
             .is_some_and(|value| value < &inflated),
         "control run must shrink the variable"
     );
+}
+
+fn unlimited() -> MinimizationBudget {
+    MinimizationBudget::with_checks(usize::MAX)
 }

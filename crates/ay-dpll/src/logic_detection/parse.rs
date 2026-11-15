@@ -27,8 +27,8 @@ pub(crate) const FAIL_CLOSED_COMBINED: [&str; 4] =
 /// same content detection as the unset case, so no verdict depends on this
 /// predicate diverging from z3 on an unmeasured token.
 pub(crate) fn is_z3_recognized_logic(s: &str) -> bool {
-    const EXACT: [&str; 8] = [
-        "ALL", "HO_ALL", "HORN", "QF_FD", "FP", "QF_FP", "QF_S", "SMTFD",
+    const EXACT: [&str; 9] = [
+        "ALL", "HO_ALL", "HORN", "QF_FD", "FP", "QF_FP", "QF_FF", "QF_S", "SMTFD",
     ];
     if EXACT.contains(&s) {
         return true;

@@ -230,7 +230,7 @@ fn test_backward_rejects_invalid_empty_clause() {
 /// cause stack overflow. This test creates a linear chain of N clauses
 /// where each depends on the previous via unit propagation.
 #[test]
-fn test_backward_deep_dependency_chain() {
+fn test_backward_deep_dependency_chain() -> Result<(), Box<dyn std::error::Error>> {
     // Build a chain: {~(i-1), i} for i=1..N, with {0} as the root.
     // Each clause propagates variable i when i-1 is assigned.
     let n = 100;
@@ -240,7 +240,8 @@ fn test_backward_deep_dependency_chain() {
     clauses.push(vec![lit(0, true)]);
     // Chain: {~0, 1}, {~1, 2}, ..., {~(N-1), N}
     for i in 0..n {
-        clauses.push(vec![lit(i as u32, false), lit((i + 1) as u32, true)]);
+        let next = i.checked_add(1).ok_or("chain index overflows")?;
+        clauses.push(vec![lit(i as u32, false), lit(next as u32, true)]);
     }
     // Final contradicting clause: {~N}
     clauses.push(vec![lit(n as u32, false)]);
@@ -249,6 +250,7 @@ fn test_backward_deep_dependency_chain() {
     // No proof steps needed — BCP on originals reaches conflict.
     let result = checker.verify(&clauses, &[]);
     assert!(result.is_ok(), "chain of {n} implications should verify");
+    Ok(())
 }
 
 /// Algorithm audit: forward checker's visit_long maintains the 2WL invariant
@@ -273,22 +275,32 @@ fn test_forward_2wl_invariant_after_propagation() {
 /// Two clauses with the same XOR hash should both be findable in the
 /// hash table. This exercises the bucket chain traversal in find_clause_idx.
 #[test]
-fn test_hash_collision_clause_lookup() {
+fn test_hash_collision_clause_lookup() -> Result<(), Box<dyn std::error::Error>> {
     let mut checker = DratChecker::new(10, false);
     // Add many clauses to increase collision probability.
-    for i in 0..20 {
-        let v1 = i * 2;
-        let v2 = i * 2 + 1;
+    for i in 0u32..20 {
+        let v1 = i.checked_mul(2).ok_or("variable index overflows")?;
+        let v2 = v1.checked_add(1).ok_or("variable index overflows")?;
         checker.add_original(&[lit(v1, true), lit(v2, true)]);
     }
     // Delete specific clauses and verify the correct ones are removed.
     // The first clause {0, 1}:
     let initial_live = checker.live_clauses;
     checker.delete_clause(&[lit(0, true), lit(1, true)]);
-    assert_eq!(checker.live_clauses, initial_live - 1);
+    let expected_live = initial_live
+        .checked_sub(1)
+        .ok_or("no live clause before the deletion")?;
+    if checker.live_clauses != expected_live {
+        return Err(format!(
+            "live clauses after one deletion: {} (expected {expected_live})",
+            checker.live_clauses
+        )
+        .into());
+    }
     // Deleting the same clause again should be a miss.
     checker.delete_clause(&[lit(0, true), lit(1, true)]);
     assert_eq!(checker.stats.missed_deletes, 1);
+    Ok(())
 }
 
 /// Regression test: delete_clause must not corrupt the marks array.

@@ -29,7 +29,8 @@ fn subsets(pool_len: usize, max_len: usize, mut visit: impl FnMut(&[usize])) {
         }
         for index in start..pool_len {
             chosen.push(index);
-            rec(index + 1, pool_len, max_len, chosen, visit);
+            // `index < pool_len`, so this never saturates.
+            rec(index.saturating_add(1), pool_len, max_len, chosen, visit);
             chosen.pop();
         }
     }

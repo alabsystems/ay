@@ -240,6 +240,8 @@ impl PdrSolver {
                 "total_verification_unknowns": self.verification.total_unknowns,
                 "total_model_verification_failures": self.verification.total_model_failures,
                 "lia_farkas_route": self.lia_farkas_route_telemetry(),
+                // Workstream B board counters (§4.6); telemetry only.
+                "spacer": self.spacer_stats.json(),
             },
         });
         writer.write_step_with_telemetry(state, Some(action), Some(telemetry));
@@ -299,7 +301,50 @@ impl PdrSolver {
             "symbolic_scalarization_multi_cell_args": symbolic_scalarization_multi_cell_args,
             "array_scalarization_transform_memory": array_scalarization_transform_memory,
             "lia_farkas_route": self.lia_farkas_route_telemetry(),
+            "total_model_verification_failures": self.verification.total_model_failures,
+            "frames": self.frames.len(),
+            // Workstream B board counters (§4.6); telemetry only.
+            "spacer": self.spacer_stats.json(),
+            "spacer_lane": {
+                "rung": self.config.spacer.rung_label(),
+                "enabled": self.config.spacer.enabled,
+                "core": self.spacer_core,
+                "problem_is_linear": self.problem_is_linear,
+                "backend": format!("{:?}", self.oracle_backend),
+            },
         })
+    }
+
+    /// Per-lemma `LearnLemma` trace step with the board's per-lemma fields
+    /// (`DESIGN` §4.6): POB shape of the most recent POB, lemma size, level.
+    /// Called from `add_blocking_lemma` in place of the plain step when
+    /// tracing is on; no-op otherwise.
+    pub(in crate::pdr::solver) fn pdr_trace_learn_lemma(&self, lemma_lits: usize, level: usize) {
+        let Some(ref writer) = self.tracing.tla_trace else {
+            return;
+        };
+        let last = self.spacer_stats.last_pob;
+        let pin_density = if last.lits == 0 {
+            0.0
+        } else {
+            last.pins as f64 / last.lits as f64
+        };
+        let telemetry = serde_json::json!({
+            "spacer_lemma": {
+                "pobLits": last.lits,
+                "pobPoint": last.point,
+                "pinDensity": pin_density,
+                "pobCanon": last.canon,
+                "pobMentioned": last.mentioned,
+                "pobLevel": last.level,
+                "predicate": last.predicate,
+                "lemmaLits": lemma_lits,
+                "level": level,
+                "lemmaIndex": self.spacer_stats.lemmas,
+            }
+        });
+        let state = self.pdr_trace_snapshot("Running", None);
+        writer.write_step_with_telemetry(state, Some("LearnLemma"), Some(telemetry));
     }
 
     /// Strictly validate a Safe model before it leaves direct PDR.
@@ -332,7 +377,7 @@ impl PdrSolver {
         let verified = if self.array_scalarization_maps.is_empty() {
             let previous_strict_proofs = self.config.strict_proofs;
             self.config.strict_proofs = true;
-            let verified = self.verify_model_fresh(&model);
+            let verified = self.verify_model_at_safe_boundary(&model, self.solve_deadline);
             self.config.strict_proofs = previous_strict_proofs;
             verified
         } else {
@@ -352,7 +397,7 @@ impl PdrSolver {
                     .solve_timeout
                     .map(|timeout| ay_core::time::Instant::now() + timeout)
             });
-            verifier.verify_model_fresh(&model)
+            verifier.verify_model_at_safe_boundary(&model, verifier.solve_deadline)
         };
 
         if verified {
@@ -471,6 +516,21 @@ impl PdrSolver {
     /// interpolation stats, SAT-no-cube counts, and entry-inductiveness
     /// failure reasons for offline Unknown-outcome triage (#4697).
     pub(in crate::pdr::solver) fn finish_with_result_trace(&self, result: PdrResult) -> PdrResult {
+        crate::run_meter::note_frames(
+            self.frames.len(),
+            self.frames.iter().map(|f| f.lemmas.len()).sum(),
+        );
+        // Capture before translation; keep this owner through trace cleanup.
+        // Only Unsafe finalization is changed. Safe admission remains separate.
+        let owner = matches!(&result, PdrResult::Unsafe(_)).then(|| self.input_restatement_owner());
+        let _memory = owner.as_ref().map(|owner| owner.install_memory());
+        let (result, restatement_interrupted) = match (result, owner.as_ref()) {
+            (PdrResult::Unsafe(cex), Some(owner)) => match self.restate_cex_for_input(cex, owner) {
+                Ok(cex) => (PdrResult::Unsafe(cex), false),
+                Err(_) => (PdrResult::Unknown, true),
+            },
+            (other, _) => (other, false),
+        };
         let (result_str, action) = match &result {
             PdrResult::Safe(_) => ("Safe", "DeclareSafe"),
             PdrResult::Unsafe(_) => ("Unsafe", "DeclareUnsafe"),
@@ -495,8 +555,20 @@ impl PdrSolver {
                 self.telemetry.interpolation_stats.summary()
             );
         }
+        // Workstream B board summary (§4.6); one line, key=value pairs.
+        if self.config.verbose {
+            safe_eprintln!(
+                "{} frames={} rung={} core={} result={}",
+                self.spacer_stats.verbose_summary(),
+                self.frames.len(),
+                self.config.spacer.rung_label(),
+                self.spacer_core,
+                result_str
+            );
+        }
         // Export learned lemmas to the sequential lemma cache (#7919).
-        if matches!(result, PdrResult::Unknown) {
+        // A refused restatement never starts fresh lemma-cache work.
+        if !restatement_interrupted && matches!(result, PdrResult::Unknown) {
             if let Some(ref cache) = self.config.lemma_cache {
                 let pool = self.export_lemmas();
                 if !pool.is_empty() {
@@ -512,9 +584,16 @@ impl PdrSolver {
         }
 
         self.finish_pdr_tla_trace();
-        result
+        // Restore the temporary term cap before the original-owner landing.
+        drop(_memory);
+        match owner.as_ref() {
+            Some(owner) => owner.limit_after_cleanup(result),
+            None => result,
+        }
     }
 }
+
+mod refusal;
 
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]

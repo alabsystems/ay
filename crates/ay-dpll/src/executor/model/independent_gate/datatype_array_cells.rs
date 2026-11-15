@@ -38,6 +38,18 @@ pub(super) fn merge_exact_datatype_cell_value(
     spelling: &str,
     candidate: &ExactDatatypeCellValue,
 ) {
+    if super::super::recovery_admission::RecoveryAdmission::current().is_some() {
+        let mut source = super::super::rendered_dt_limits::SchemaSourceBudget::new();
+        if !source.charge_sort(sort)
+            || !super::super::recovery_admission::pay_current(
+                spelling.len().saturating_add(candidate.rendered.len()),
+                spelling.len().saturating_add(candidate.rendered.len()),
+            )
+            || !super::super::recovery_admission::pay_model_value_copy(&candidate.value)
+        {
+            return;
+        }
+    }
     let slot = values
         .entry(sort.clone())
         .or_default()
@@ -71,7 +83,11 @@ impl IndependentModelView<'_> {
             .get_or_init(|| self.build_exact_datatype_cell_values());
         let entries = values.get(sort)?;
         if let Some(entry) = entries.get(spelling) {
-            return entry.as_ref().map(|entry| entry.value.clone());
+            let entry = entry.as_ref()?;
+            if !super::super::recovery_admission::pay_model_value_copy(&entry.value) {
+                return None;
+            }
+            return Some(entry.value.clone());
         }
         if !self.exec.datatype_sort_carries_array_field(sort)
             || !self.datatype_guard().is_exact_array_cell(sort)
@@ -107,7 +123,11 @@ impl IndependentModelView<'_> {
                 best = Some(entry);
             }
         }
-        best.map(|entry| entry.value.clone())
+        let entry = best?;
+        if !super::super::recovery_admission::pay_model_value_copy(&entry.value) {
+            return None;
+        }
+        Some(entry.value.clone())
     }
 
     /// Resolve one live structured datatype occurrence through its current EUF
@@ -157,6 +177,9 @@ impl IndependentModelView<'_> {
             if *work > MAX_WORK {
                 return None;
             }
+            if !super::super::recovery_admission::pay_current(rendered.len(), rendered.len()) {
+                return None;
+            }
             let entry = ExactDatatypeCellValue {
                 rendered: rendered.clone(),
                 value: class.value,
@@ -200,6 +223,16 @@ impl IndependentModelView<'_> {
         let mut constructor_tokens = DetHashSet::default();
         for (_, constructors) in self.exec.ctx.datatype_iter() {
             for constructor in constructors {
+                if !super::super::recovery_admission::pay_current(
+                    constructor
+                        .len()
+                        .saturating_add(self.exec.dt_surface(constructor).len()),
+                    constructor
+                        .len()
+                        .saturating_add(self.exec.dt_surface(constructor).len()),
+                ) {
+                    return values;
+                }
                 constructor_tokens.insert(constructor.clone());
                 constructor_tokens.insert(self.exec.dt_surface(constructor).to_string());
             }
@@ -250,6 +283,11 @@ impl IndependentModelView<'_> {
                 return values;
             }
             work = next_work;
+            if !super::super::recovery_admission::pay_current(rendered.len(), rendered.len())
+                || !super::super::recovery_admission::pay_model_value_copy(value)
+            {
+                return values;
+            }
             let entry = ExactDatatypeCellValue {
                 rendered: rendered.clone(),
                 value: value.clone(),
@@ -298,9 +336,17 @@ impl IndependentModelView<'_> {
         const MAX_NODES: usize = 1_024;
         const MAX_DEPTH: usize = 32;
 
+        let aggregate = super::super::recovery_admission::RecoveryAdmission::current();
+        let mut source = super::super::rendered_dt_limits::SchemaSourceBudget::new();
+        if aggregate.is_some() && !source.charge_sort(root_sort) {
+            return false;
+        }
         let mut stack = vec![(root, root_sort.clone(), 0usize)];
         let mut nodes = 0usize;
         while let Some((value, sort, depth)) = stack.pop() {
+            if !super::super::recovery_admission::pay_current(1, 0) {
+                return false;
+            }
             if depth > MAX_DEPTH {
                 return false;
             }
@@ -328,6 +374,9 @@ impl IndependentModelView<'_> {
                         .checked_add(args.len())
                         .is_none_or(|pending| pending > MAX_NODES)
                 {
+                    return false;
+                }
+                if aggregate.is_some() && fields.iter().any(|(_, sort)| !source.charge_sort(sort)) {
                     return false;
                 }
                 stack.extend(
@@ -364,8 +413,17 @@ impl IndependentModelView<'_> {
                     {
                         return false;
                     }
+                    if aggregate.is_some() && !source.charge_sort(&array_sort.element_sort) {
+                        return false;
+                    }
                     stack.push((&array.default, array_sort.element_sort.clone(), depth + 1));
                     for (index, cell) in &array.store {
+                        if aggregate.is_some()
+                            && (!source.charge_sort(&array_sort.index_sort)
+                                || !source.charge_sort(&array_sort.element_sort))
+                        {
+                            return false;
+                        }
                         stack.push((index, array_sort.index_sort.clone(), depth + 1));
                         stack.push((cell, array_sort.element_sort.clone(), depth + 1));
                     }
@@ -375,6 +433,11 @@ impl IndependentModelView<'_> {
                         .len()
                         .checked_add(elements.len())
                         .is_none_or(|pending| pending > MAX_NODES)
+                    {
+                        return false;
+                    }
+                    if aggregate.is_some()
+                        && elements.iter().any(|_| !source.charge_sort(element_sort))
                     {
                         return false;
                     }

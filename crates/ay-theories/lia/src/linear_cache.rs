@@ -17,7 +17,7 @@
 //! approximated (plan §3.1).
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::*;
 
@@ -48,30 +48,105 @@ pub(crate) struct CachedLinear {
     pub(crate) other_gcd_gt1: bool,
 }
 
+/// `(lhs, rhs) → cached linear form` entries. `Arc` lets detached pure-value
+/// caches move between workers without changing a solver's TermStore borrow
+/// or the auto-traits that borrow requires.
+pub(crate) type LinearCacheEntries = HashMap<(TermId, TermId), Arc<CachedLinear>>;
+
 /// `(lhs, rhs) → cached linear form` for integer equality/atom parses.
-pub(crate) type LinearCacheMap = RefCell<HashMap<(TermId, TermId), Rc<CachedLinear>>>;
+pub(crate) type LinearCacheMap = RefCell<LinearCacheEntries>;
+
+/// `term → sorted (var, coeff) affine form` entries.
+pub(crate) type AffineCacheEntries =
+    HashMap<TermId, Arc<(Vec<(TermId, BigRational)>, BigRational)>>;
 
 /// `term → sorted (var, coeff) affine form` for `term_to_linear_coeffs`.
-pub(crate) type AffineCacheMap =
-    RefCell<HashMap<TermId, Rc<(Vec<(TermId, BigRational)>, BigRational)>>>;
+pub(crate) type AffineCacheMap = RefCell<AffineCacheEntries>;
 
 /// `(lhs, rhs) → (var_index_epoch, parsed dioph row)`. Entries are valid
 /// only while the epoch matches: the row stores *indices* into the
 /// `build_var_index` bijection, which changes whenever `integer_vars` does.
 pub(crate) type DiophParseCacheMap =
-    RefCell<HashMap<(TermId, TermId), (u64, Option<Rc<(Vec<(usize, BigInt)>, BigInt)>>)>>;
+    RefCell<HashMap<(TermId, TermId), (u64, Option<Arc<(Vec<(usize, BigInt)>, BigInt)>>)>>;
+
+/// The term-level parse caches of one `LiaSolver` (`linear_cache` and
+/// `affine_cache`), detached so a LATER solver over the same append-only
+/// `TermStore` can start warm instead of re-walking every atom's term DAG.
+///
+/// Carrying them changes cost, never a result:
+/// - every entry is a pure function of the immutable term DAG under its key
+///   (see the module docs);
+/// - `cached_linear` hands out the same `Arc` on a hit as on the miss that
+///   built it, and `parse_linear_expr_with_vars` rebuilds its map from the
+///   cached sorted coefficients either way;
+/// - `term_to_linear_coeffs` returns the same `(var, coeff)` set on a hit and
+///   on a miss, and its four callers (shared equality, lattice bridge,
+///   enumeration witness check, constant fold) only sum, sort, or test that
+///   set, so no caller can observe which map layout it received.
+///
+/// The stamp ties the entries to the store they were parsed from;
+/// [`LiaSolver::import_linear_parse_cache`] drops them unless that store is
+/// still an append-only prefix of the importer's (no rollback, compaction,
+/// clone or replacement in between), so a `TermId` is never read under a
+/// different denotation. The epoch-keyed `dioph_parse_cache` stays behind: its
+/// rows index a per-solver variable bijection.
+pub struct LiaLinearParseCache {
+    stamp: ay_core::term::TermStoreSnapshotStamp,
+    entries: LinearCacheEntries,
+    affine: AffineCacheEntries,
+}
 
 impl LiaSolver<'_> {
+    /// Move this solver's linear parse cache out (the solver keeps working
+    /// and simply re-parses on its next miss). `None` when nothing was parsed.
+    pub fn export_linear_parse_cache(&self) -> Option<LiaLinearParseCache> {
+        let entries = std::mem::take(&mut *self.linear_cache.borrow_mut());
+        let affine = std::mem::take(&mut *self.affine_cache.borrow_mut());
+        if entries.is_empty() && affine.is_empty() {
+            return None;
+        }
+        Some(LiaLinearParseCache {
+            stamp: self.terms().snapshot_stamp(),
+            entries,
+            affine,
+        })
+    }
+
+    /// Seed this solver's linear parse cache from an earlier solver's export.
+    /// Ignored (the solver parses cold, exactly as before) when the exporting
+    /// store is not an append-only prefix of this solver's store.
+    pub fn import_linear_parse_cache(&mut self, cache: LiaLinearParseCache) {
+        if !cache.stamp.is_append_only_prefix_of(self.terms()) {
+            return;
+        }
+        let mut own = self.linear_cache.borrow_mut();
+        if own.is_empty() {
+            *own = cache.entries;
+        } else {
+            for (key, entry) in cache.entries {
+                own.entry(key).or_insert(entry);
+            }
+        }
+        let mut own_affine = self.affine_cache.borrow_mut();
+        if own_affine.is_empty() {
+            *own_affine = cache.affine;
+        } else {
+            for (key, entry) in cache.affine {
+                own_affine.entry(key).or_insert(entry);
+            }
+        }
+    }
+
     /// Cached exact linear form of `lhs - rhs` plus derived
     /// assignment-independent facts. Parses on first access only.
-    pub(crate) fn cached_linear(&self, lhs: TermId, rhs: TermId) -> Rc<CachedLinear> {
+    pub(crate) fn cached_linear(&self, lhs: TermId, rhs: TermId) -> Arc<CachedLinear> {
         if let Some(hit) = self.linear_cache.borrow().get(&(lhs, rhs)) {
-            return Rc::clone(hit);
+            return Arc::clone(hit);
         }
-        let entry = Rc::new(self.build_cached_linear(lhs, rhs));
+        let entry = Arc::new(self.build_cached_linear(lhs, rhs));
         self.linear_cache
             .borrow_mut()
-            .insert((lhs, rhs), Rc::clone(&entry));
+            .insert((lhs, rhs), Arc::clone(&entry));
         entry
     }
 
@@ -84,15 +159,24 @@ impl LiaSolver<'_> {
         // `Σ(coeff·var) = constant` over integers, gcd(|coeffs|) must divide
         // the constant. `gcd == 0` (no vars / all-zero) is treated as a pass
         // exactly like the historical per-check `gcd_test` skip.
+        //
+        // Divisibility is an INTEGER argument: it holds only when every
+        // column takes integer values. A Real-sorted column (reachable when a
+        // caller hands this solver an unpreprocessed mixed atom) makes
+        // `2·r = 1` satisfiable, so such a row is never refuted here and
+        // contributes no residue below.
+        let integer_row = coeffs
+            .iter()
+            .all(|(term, _)| self.is_integer_valued_column(*term));
         let gcd = gcd_of_abs(coeffs.iter().map(|(_, c)| c.clone()));
-        let gcd_divides = gcd.is_zero() || (&constant % &gcd).is_zero();
+        let gcd_divides = !integer_row || gcd.is_zero() || (&constant % &gcd).is_zero();
 
         // Modular candidates (assignment-independent): for a variable with
         // coefficient ±1 whose other coefficients share other_gcd > 1,
         // `var ≡ ±constant (mod other_gcd)` (sign per the var's coefficient).
         let mut modular_candidates: Vec<(TermId, BigInt, BigInt)> = Vec::new();
         let mut has_unit_coeff_candidate = false;
-        for (var, coeff) in &coeffs {
+        for (var, coeff) in coeffs.iter().filter(|_| integer_row) {
             if coeff.abs() != BigInt::one() {
                 continue;
             }

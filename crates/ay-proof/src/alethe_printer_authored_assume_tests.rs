@@ -425,11 +425,12 @@ fn test_unsupported_authored_assume_probe_work_is_precharged() {
     let negative = proof.add_assume(not_x, None);
     proof.add_resolution(Vec::new(), x, positive, negative);
 
-    // This fold-shaped surface is outside the exact comparison/multiplication
-    // bridge schemas. The failed probe still parses and inspects input, so its
-    // bounded work must be charged before any proof step reaches the sink.
+    // This fold-shaped surface is outside every bridge schema (`(< 1 0)` is
+    // not the literal `false` that `or_simplify` drops). The failed probe
+    // still parses and inspects input, so its bounded work must be charged
+    // before any proof step reaches the sink.
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
-    overrides.insert(x, "(or x false)".to_string());
+    overrides.insert(x, "(or x (< 1 0))".to_string());
     let budget = 20;
     let err = try_export_alethe_with_problem_scope_overrides_and_budget(
         &proof,
@@ -556,7 +557,11 @@ fn consumed_unsupported_duplicate_never_enters_assume_only_confinement() {
     let negative = proof.add_assume(not_x, None);
     proof.add_resolution(Vec::new(), x, used, negative);
 
-    let source = "(or x false)";
+    // A spelling no checked bridge reaches. `(or x false)` was this example
+    // until the Boolean-fold leaf learned to derive it with `or_simplify`;
+    // `(< 1 0)` is not the literal `false` that rule drops, so it still folds
+    // nowhere.
+    let source = "(or x (< 1 0))";
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(x, source.to_string());
     let effective = effective_wire_term_overrides_for_proof(&proof, &terms, Some(&overrides))

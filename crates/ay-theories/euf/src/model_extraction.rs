@@ -92,7 +92,9 @@ impl EufSolver<'_> {
         // fails), and the executor's finite-domain coverage pass guarantees
         // every constrained RM term's class contains a literal. Runs before
         // the general pass so the literal name wins regardless of member
-        // visit order.
+        // visit order. A class without a literal (a term no assertion
+        // constrains) still gets a minted token below; the executor gives it
+        // a mode before any model is read (ay-dpll `model/rm_concrete.rs`).
         for &term_id in &model_terms {
             if !matches!(self.terms.sort(term_id), Sort::Uninterpreted(name) if name == "RoundingMode")
             {
@@ -222,7 +224,9 @@ impl EufSolver<'_> {
             let mut fabricated_reps: HashSet<u32> = HashSet::default();
             // Start counter from a value unlikely to collide with constants
             let mut used_values: HashSet<BigInt> = rep_const_val.values().cloned().collect();
-            let mut int_counter: i64 = 0;
+            // A BigInt counter: the fresh-value search has no overflow edge
+            // (it yields 0, 1, 2, .. exactly as the old i64 counter did).
+            let mut int_counter = BigInt::from(0u8);
 
             for &term_id in &model_terms {
                 if !matches!(self.terms.sort(term_id), Sort::Int) {
@@ -239,8 +243,8 @@ impl EufSolver<'_> {
                             fabricated_reps.insert(rep);
                             // Find a value not used by any constant
                             loop {
-                                let v = BigInt::from(int_counter);
-                                int_counter += 1;
+                                let v = int_counter.clone();
+                                int_counter += 1u8;
                                 if !used_values.contains(&v) {
                                     used_values.insert(v.clone());
                                     return v;
@@ -581,7 +585,9 @@ impl EufSolver<'_> {
             }
         }
 
-        let mut next_fresh: u64 = 0;
+        // A BigUint counter: the fresh-value search has no overflow edge (it
+        // yields "0", "1", "2", .. exactly as the old u64 counter did).
+        let mut next_fresh = num_bigint::BigUint::from(0u8);
         // #uflia-arith-arg-key: reps assigned a fresh counter (no class
         // constant) — their members are reported as speculative.
         let mut fabricated_reps: HashSet<u32> = HashSet::default();
@@ -592,7 +598,7 @@ impl EufSolver<'_> {
             fabricated_reps.insert(rep);
             loop {
                 let cand = next_fresh.to_string();
-                next_fresh += 1;
+                next_fresh += 1u8;
                 if used_values.insert(cand.clone()) {
                     rep_to_value.insert(rep, cand);
                     break;
@@ -617,5 +623,114 @@ impl EufSolver<'_> {
         }
 
         (term_values, speculative)
+    }
+
+    /// Extract SMT-LIB values for Real-sorted terms from the current EUF
+    /// equivalence classes — the Real mirror of
+    /// [`extract_int_term_values`](Self::extract_int_term_values).
+    ///
+    /// EUF fabricates no Real lane in `extract_model`, so a Real term the
+    /// arithmetic side never registered (e.g. `(g a a)` occurring only
+    /// inside a Bool predicate `(m (g a a))`) reaches model extraction
+    /// with no committed value anywhere, and the independent model gate
+    /// answers "model commits no value for this application" — degrading
+    /// genuine QF_UFNRA sats to `unknown`. Class-consistent completion is
+    /// sound for such terms: EUF constrains them only by (dis)equality,
+    /// so one distinct fresh value per unpinned class satisfies every
+    /// EUF constraint, and the gate re-checks all assertions afterward.
+    ///
+    /// Preference per class: a member's entry in `committed` (the
+    /// arithmetic side's already-merged formatted values win), then a
+    /// concrete class constant, then a fresh integer-valued real
+    /// distinct from every chosen or committed value.
+    pub fn extract_real_term_values(
+        &mut self,
+        committed: &HashMap<TermId, String>,
+    ) -> HashMap<TermId, String> {
+        self.rebuild_closure();
+        let model_terms = self.scoped_model_terms();
+
+        let mut rep_to_terms: BTreeMap<u32, Vec<TermId>> = BTreeMap::new();
+        for &term_id in &model_terms {
+            if self.terms.sort(term_id) != &Sort::Real {
+                continue;
+            }
+            let rep = self.uf.find(term_id.0);
+            rep_to_terms.entry(rep).or_default().push(term_id);
+        }
+
+        let format_real = |numer: &num_bigint::BigInt, denom: &num_bigint::BigInt| -> String {
+            let negative = numer.sign() == num_bigint::Sign::Minus;
+            if denom == &num_bigint::BigInt::from(1u8) {
+                if negative {
+                    format!("(- {}.0)", numer.magnitude())
+                } else {
+                    format!("{numer}.0")
+                }
+            } else if negative {
+                format!("(- (/ {} {}))", numer.magnitude(), denom)
+            } else {
+                format!("(/ {numer} {denom})")
+            }
+        };
+
+        let mut used_values: HashSet<String> = HashSet::default();
+        let mut rep_to_value: BTreeMap<u32, String> = BTreeMap::new();
+        for (&rep, terms) in &rep_to_terms {
+            let chosen = terms
+                .iter()
+                .find_map(|t| committed.get(t).cloned())
+                .or_else(|| {
+                    terms.iter().find_map(|&t| match self.terms.get(t) {
+                        TermData::Const(Constant::Rational(r)) => {
+                            Some(format_real(r.0.numer(), r.0.denom()))
+                        }
+                        TermData::Const(Constant::Int(n)) => {
+                            Some(format_real(n, &num_bigint::BigInt::from(1u8)))
+                        }
+                        _ => None,
+                    })
+                });
+            if let Some(v) = chosen {
+                used_values.insert(v.clone());
+                rep_to_value.insert(rep, v);
+            }
+        }
+        // Fresh values must also avoid committed values of Real terms in
+        // classes this pass did not choose for (defensive: every scoped
+        // Real term is in some class above, but keep the invariant local).
+        for &term_id in &model_terms {
+            if self.terms.sort(term_id) == &Sort::Real {
+                if let Some(v) = committed.get(&term_id) {
+                    used_values.insert(v.clone());
+                }
+            }
+        }
+
+        let mut next_fresh = num_bigint::BigUint::from(0u8);
+        for &rep in rep_to_terms.keys() {
+            if rep_to_value.contains_key(&rep) {
+                continue;
+            }
+            loop {
+                let cand = format!("{next_fresh}.0");
+                next_fresh += 1u8;
+                if used_values.insert(cand.clone()) {
+                    rep_to_value.insert(rep, cand);
+                    break;
+                }
+            }
+        }
+
+        let mut term_values: HashMap<TermId, String> = HashMap::default();
+        for (rep, terms) in rep_to_terms {
+            let Some(value) = rep_to_value.get(&rep) else {
+                continue;
+            };
+            for term in terms {
+                term_values.insert(term, value.clone());
+            }
+        }
+        term_values
     }
 }

@@ -793,9 +793,12 @@ fn test_bve_restricted_resolution_optionally_resolves_gate_pairs() {
         false,
     );
     assert!(without_gate_pairs.eliminated);
-    assert!(
-        without_gate_pairs.resolvents.is_empty(),
-        "restricted resolution should skip gate×gate pairs by default"
+    // Skipping the pair would drop (1 | 2): its resolvent is not tautological,
+    // so the gate is not proved sound and full resolution keeps it.
+    assert_eq!(
+        without_gate_pairs.resolvents.len(),
+        1,
+        "an unresolved non-tautological gate pair must not be skipped"
     );
 
     let mut bve_with_gate_pairs = BVE::new(3);
@@ -3221,108 +3224,3 @@ fn test_fastelim_bound_accepts_low_resolvent_variable() {
 // ---------------------------------------------------------------------------
 // GPU finalize path (#8349): satisfied-parent witness exclusion parity.
 // ---------------------------------------------------------------------------
-
-/// Satisfied parents must be deleted but NOT pushed as reconstruction
-/// witnesses (#8356/#8397) — GPU-path parity with the CPU path.
-#[cfg(feature = "gpu")]
-#[test]
-fn test_gpu_finalize_excludes_satisfied_parents_from_witnesses() {
-    let mut bve = BVE::new(5);
-
-    // c0 = {x0, x1}, c1 = {x0, x2} (root-satisfied parent), c2 = {~x0, x3}
-    let mut clauses = ClauseArena::new();
-    let c0 = clauses.add(&[lit(0, true), lit(1, true)], false);
-    let c1 = clauses.add(&[lit(0, true), lit(2, true)], false);
-    let c2 = clauses.add(&[lit(0, false), lit(3, true)], false);
-    bve.rebuild(&clauses);
-
-    // GPU resolution produced one resolvent from (c0, c2) and classified
-    // c1 as a root-satisfied parent (its resolvents were never generated).
-    let resolvents = vec![(vec![lit(1, true), lit(3, true)], c0, c2, Vec::new())];
-    let result = bve.finalize_elimination_from_resolution(
-        Variable(0),
-        &clauses,
-        true,
-        resolvents,
-        Vec::new(),
-        vec![c1],
-        2,
-    );
-
-    assert!(result.eliminated);
-    assert!(result.to_delete.contains(&c0));
-    assert!(
-        result.to_delete.contains(&c1),
-        "satisfied parent must still be deleted"
-    );
-    assert!(result.to_delete.contains(&c2));
-    assert!(
-        !result.witness_entries.iter().any(|e| e.clause_idx == c1),
-        "satisfied parent must NOT be a reconstruction witness (#8397)"
-    );
-    assert!(result.witness_entries.iter().any(|e| e.clause_idx == c0));
-    assert!(result.witness_entries.iter().any(|e| e.clause_idx == c2));
-}
-
-/// One-sided witnesses are allowed when the missing polarity consists
-/// entirely of root-satisfied parents (#8397 exception), matching the CPU
-/// path in try_eliminate_with_gate_with_marks.
-#[cfg(feature = "gpu")]
-#[test]
-fn test_gpu_finalize_allows_one_sided_when_missing_side_all_satisfied() {
-    let mut bve = BVE::new(5);
-
-    // c0 = {x0, x1} is the only positive clause and is root-satisfied.
-    let mut clauses = ClauseArena::new();
-    let c0 = clauses.add(&[lit(0, true), lit(1, true)], false);
-    let c1 = clauses.add(&[lit(0, false), lit(2, true)], false);
-    bve.rebuild(&clauses);
-
-    let result = bve.finalize_elimination_from_resolution(
-        Variable(0),
-        &clauses,
-        true,
-        Vec::new(),
-        Vec::new(),
-        vec![c0],
-        1,
-    );
-
-    assert!(
-        result.eliminated,
-        "missing polarity fully satisfied: elimination stays valid"
-    );
-    assert!(
-        !result.witness_entries.iter().any(|e| e.clause_idx == c0),
-        "satisfied parent must NOT be witnessed"
-    );
-    assert!(result.witness_entries.iter().any(|e| e.clause_idx == c1));
-}
-
-/// A genuinely one-sided variable (pure literal, no satisfied parents on
-/// the missing side) must still be rejected by the reconstruction
-/// completeness guard (#8179) on the GPU finalize path.
-#[cfg(feature = "gpu")]
-#[test]
-fn test_gpu_finalize_rejects_pure_literal_one_sided_witnesses() {
-    let mut bve = BVE::new(5);
-
-    let mut clauses = ClauseArena::new();
-    clauses.add(&[lit(0, true), lit(1, true)], false);
-    bve.rebuild(&clauses);
-
-    let result = bve.finalize_elimination_from_resolution(
-        Variable(0),
-        &clauses,
-        true,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        0,
-    );
-
-    assert!(
-        !result.eliminated,
-        "pure literal must be rejected by the completeness guard"
-    );
-}

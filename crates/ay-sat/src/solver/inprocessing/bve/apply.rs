@@ -283,7 +283,7 @@ impl Solver {
         for &old_lit in self.arena.literals(clause_idx) {
             let vi = old_lit.variable().index();
             if vi >= self.num_vars
-                || self.var_data[vi].reason != clause_ref.0
+                || !self.var_data[vi].has_clause_reason(clause_ref)
                 || self.var_data[vi].level != 0
             {
                 continue;
@@ -698,6 +698,14 @@ impl Solver {
             } else {
                 vec![]
             };
+            // `--sat-veripb-hints`: the other antecedent of the self-subsuming
+            // resolvent (the replacement names the strengthened clause itself).
+            let other_ante = if clause_idx == strengthening.pos_ante {
+                strengthening.neg_ante
+            } else {
+                strengthening.pos_ante
+            };
+            self.veripb_note_antecedent_ref(ClauseRef(other_ante as u32));
             match self.replace_clause_with_final_hints(
                 clause_idx,
                 &strengthening.new_lits,
@@ -901,6 +909,8 @@ impl Solver {
                 "BUG: BVE resolvent is a tautology (contains l and ~l)",
             );
 
+            self.veripb_note_antecedent_ref(ClauseRef(*pos_ante as u32));
+            self.veripb_note_antecedent_ref(ClauseRef(*neg_ante as u32));
             if let Ok(new_id) =
                 self.proof_emit_add_prechecked(resolvent, &hints, ProofAddKind::Derived)
             {

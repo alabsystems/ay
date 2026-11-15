@@ -46,6 +46,9 @@ impl Executor {
             || provenance.original_problem_assertions != epoch.assertions
             || self.last_unsat_certificate.is_some()
             || self.pending_nested_array_bool_bv_unsat.is_some()
+            || self.pending_bounded_bv_lia_unsat.is_some()
+            || self.last_strict_native_bv_lia_bundle.is_some()
+            || self.last_strict_native_nra_sos_bundle.is_some()
         {
             return None;
         }
@@ -71,6 +74,8 @@ impl Executor {
         self.proof_problem_assertion_provenance = None;
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
 
         let public_assumptions = parked.epoch.assumptions.as_deref();
         if !parked.epoch.is_current(self)
@@ -207,6 +212,7 @@ impl Executor {
         // without a certificate, so it is also the only mode that gains
         // nothing here.
         if self.strict_unsat_presentation_required() || !self.competition_shedding_active() {
+            self.refresh_authenticated_native_bv_refutation_after_named_core_redirect();
             self.refresh_authenticated_bv_lia_internal_certificate_for_publication();
         }
     }

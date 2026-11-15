@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+def_order forge
+	vars
+		left u1;
+		right v1;
+	end vars;
+	def
+		-1 u1 +1 v1 >= 0;
+	end def;
+sol x1;
+output NONE;
+conclusion SAT;
+end pseudo-Boolean proof;

@@ -164,8 +164,6 @@ Benchmarks run through the `bench` subcommand of the `ay` binary (the
 ay bench run --help
 ay bench run chccomp-2025-extra-small-lia
 ay bench run --domain chc
-ay bench campaign plan --profile reviewer-full
-ay bench campaign run --profile reviewer-full --require-installed
 ay bench list
 ```
 
@@ -173,10 +171,7 @@ Pass `--output <path>` (or `-o <path>`) to write a combined scorecard JSON;
 local evaluation result directories are not part of the published benchmark
 corpus.
 
-`ay bench campaign run` is the external-reviewer entry point: it attempts every
-eligible campaign lane and emits one explicit disposition for all 832 tracks.
 `ay bench run --all` means every locally registered executable eval, including
-development-only definitions, not all 832 catalog tracks. Unsupported formats
-remain explicit in the campaign crosswalk. Official organizer results are
-imported evidence; local runs are either same-host-calibrated or proxy runs
-unless exact machine, toolchain, checker, limits, and corpus gates all pass.
+development-only definitions. It does not establish coverage of every
+competition track or an official organizer result. Record the binary,
+corpus, limits, machine and checker results with any reported measurement.

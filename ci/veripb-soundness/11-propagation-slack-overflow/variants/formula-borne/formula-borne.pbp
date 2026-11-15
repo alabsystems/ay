@@ -1,0 +1,25 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. Both rows have a left-hand side in {0,2} and a hugely
+% NEGATIVE right-hand side, so both are trivially true and every assignment is
+% a model. `sat.pbp` in this directory makes the same checker say
+% `s VERIFIED SATISFIABLE` for this formula, with the model x1 = 0.
+%
+% Unfixed: `GeneralPBWatcher::{get_assignment_independent_propagations,
+% no_watches_required, is_propagating_independent_of_assignment}` compute the
+% slack as `coeff_sum - degree` in the row's OWN integer width. Here that is
+% 2 - (-9223372036854775806) = 9223372036854775808 = i64::MAX + 1, which wraps
+% to i64::MIN. Every coefficient is then "greater than the slack", so the
+% propagator reports that a trivially true row propagates ALL of its literals
+% unconditionally. Row 1 asserts x1, row 2 asserts ~x1, the trail is in
+% conflict before the proof starts, and RUP therefore derives ANYTHING --
+% including the empty contradiction on the next line.
+%
+% Control (this is what makes the diagnosis exact, not a guess): change both
+% degrees to -9223372036854775805. The slack is then exactly i64::MAX, no wrap
+% occurs, and the very same proof is REJECTED with `not implied by reverse unit
+% propagation`. One unit of magnitude is the whole difference.
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

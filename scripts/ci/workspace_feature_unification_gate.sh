@@ -9,12 +9,16 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. "$REPO_ROOT/scripts/lib/cargo_frontend.sh"
 TARGET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ay-feature-unification.XXXXXX")"
 trap 'rm -rf "$TARGET_DIR"' EXIT
 
 cd "$REPO_ROOT"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
-    cargo build --locked --release --target-dir "$TARGET_DIR" \
+    ay_cargo build --locked --release --target-dir "$TARGET_DIR" \
     -p ay -p ay-pb --features ay/cli
 
 test -x "$TARGET_DIR/release/ay"

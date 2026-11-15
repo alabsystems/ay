@@ -39,9 +39,13 @@ SEED="${2:-20260721}"
 SWEEP="${AY_SGF_SWEEP:-1}"
 
 cd "$(dirname "$0")/../.."
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. scripts/lib/cargo_frontend.sh
 
 echo "== building the harness (release: the lanes are compute-bound) =="
-cargo build --release -p ay-proof --tests
+ay_cargo build --release -p ay-proof --tests
 
 status=0
 for ((k = 0; k < SWEEP; k++)); do
@@ -49,7 +53,7 @@ for ((k = 0; k < SWEEP; k++)); do
   echo
   echo "== seed=${seed} cases-per-lane=${CASES} =="
   if AY_SGF_SEED="${seed}" AY_SGF_CASES="${CASES}" \
-    cargo test --release -p ay-proof --test string_ground_diff_fuzz -- \
+    ay_cargo test --release -p ay-proof --test string_ground_diff_fuzz -- \
       --nocapture --test-threads 3; then
     :
   else

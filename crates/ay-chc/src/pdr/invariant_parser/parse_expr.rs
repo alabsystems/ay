@@ -445,6 +445,7 @@ impl<'a> InvariantParser<'a> {
                     }
                 }
             }
+            Some('#') => self.parse_radix_literal(),
             Some(c) if c.is_ascii_digit() => {
                 let num = self.parse_numeral()?;
                 Ok(ChcExpr::int(num))

@@ -408,3 +408,31 @@ fn an_assertion_outside_the_handed_scope_is_never_assumed() {
     // refusal is about MEMBERSHIP and not about the proof's shape.
     assert_eq!(rerun(&mut exec, &mut proof), 1);
 }
+
+/// A fired stop plans nothing: the lane polls the assembly stop between
+/// leaves and roots, so a deadline inside a nested certification re-solve is
+/// observed here rather than by the CLI watchdog's hard exit (QF_BV Sage2
+/// `bench_17445`). The leaf stays the byte-identical `trust` step.
+#[test]
+fn a_fired_stop_plans_nothing_and_leaves_the_leaf() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut exec = solve(STORE_CHAIN);
+    let atom = rewritten_negation(&mut exec);
+    let mut proof = leaf_proof(&mut exec, atom, Vec::new(), Vec::new());
+    let before = shape(&proof);
+    exec.set_solve_controls(Some(Arc::new(AtomicBool::new(true))), None);
+    assert_eq!(
+        rerun(&mut exec, &mut proof),
+        0,
+        "a stopped lane plans nothing"
+    );
+    assert_eq!(shape(&proof), before, "the leaf is left as it was");
+    assert_eq!(premiseless_unit_trust_leaves(&proof), 1);
+
+    // The same leaf with the stop cleared is derived, so the stop is what
+    // declined it.
+    exec.set_solve_controls(Some(Arc::new(AtomicBool::new(false))), None);
+    assert_eq!(rerun(&mut exec, &mut proof), 1);
+}

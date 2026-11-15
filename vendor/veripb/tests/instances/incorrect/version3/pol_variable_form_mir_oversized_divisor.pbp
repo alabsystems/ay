@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Regression test: same hard-coded quotient in the oversized-divisor fallback of `m`
+% (variable-form MIR).
+f 1 ;
+pol 1 9223372036854775808 m x1 w ;
+output NONE;
+conclusion UNSAT : 2 ;
+end pseudo-Boolean proof;

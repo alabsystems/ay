@@ -26,6 +26,9 @@ serde_json = { workspace = true }
 # The `classify` subcommand (the in-process differential oracle extracted from
 # deductive-checks at R1 of the two-language design) drives ay as a LIBRARY — the one
 # lane in this tool that deliberately links ay instead of dlopening it.
+# The pinned-Carcara misjudgment scan (`ay_core::pinned_carcara`) the UNSAT
+# proof gate applies before it counts a Carcara `valid`.
+ay-core = { workspace = true }
 ay-dpll = { workspace = true }
 ay-frontend = { workspace = true }
 ay-bench = { workspace = true }
@@ -33,6 +36,11 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 tempfile = { workspace = true }
+tar = { workspace = true }
+zstd = "0.13.3"
+
+[dev-dependencies]
+ay-test-support.workspace = true
 
 [lints]
 workspace = true

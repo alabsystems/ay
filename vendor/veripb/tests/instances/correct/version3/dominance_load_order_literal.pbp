@@ -1,0 +1,31 @@
+pseudo-Boolean proof version 3.0
+
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux ;
+    end;
+
+    def
+        -1 u1 1 v1 >= 0 ;
+    end;
+
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+            proofgoal #1
+                pol 1 2 + 3 +;
+            qed : -1;
+        qed;
+    end;
+end;
+
+
+load_order simple ~x1;
+dom 1 x1 >= 1 : x1 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

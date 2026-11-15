@@ -30,6 +30,12 @@ use ay_frontend::Command;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+#[derive(Clone, Copy)]
+struct BackendResourceLimits {
+    deadline: ay_core::time::Instant,
+    term_memory_limit: Option<usize>,
+}
+
 /// Error type for persistent executor operations.
 #[derive(Debug, thiserror::Error)]
 enum PdrBackendError {
@@ -72,6 +78,13 @@ pub(crate) struct PdrExecutorBackend {
     declared_datatypes: FxHashMap<String, String>,
     /// Constructor surface names used while decoding datatype model values.
     declared_datatype_constructors: FxHashSet<String>,
+    /// Cooperative stop for a backend driven from a background thread
+    /// (`adaptive_query_flag_race`): forwarded to the executor's solve
+    /// interrupt and re-applied across `reset()`, which rebuilds the executor.
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    resource_limits: Option<BackendResourceLimits>,
+    resource_stopped: bool,
+    term_memory_limit: Option<usize>,
 }
 
 impl Default for PdrExecutorBackend {
@@ -84,7 +97,7 @@ impl PdrExecutorBackend {
     /// Create a new, uninitialized backend.
     pub(crate) fn new() -> Self {
         Self {
-            exec: Executor::new(),
+            exec: super::executor_adapter::new_search_executor(),
             logic: None,
             declared_vars: FxHashMap::default(),
             declared_functions: FxHashMap::default(),
@@ -93,6 +106,87 @@ impl PdrExecutorBackend {
             initialized: false,
             declared_datatypes: FxHashMap::default(),
             declared_datatype_constructors: FxHashSet::default(),
+            interrupt: None,
+            resource_limits: None,
+            resource_stopped: false,
+            term_memory_limit: super::SmtContext::current_thread_term_memory_budget(),
+        }
+    }
+
+    /// Install a cooperative interrupt: once `flag` is set the executor's
+    /// solve loop stops and the pending query reports Unknown (fail-closed,
+    /// like every other budget stop). Survives `reset()`.
+    pub(crate) fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.exec.set_interrupt(std::sync::Arc::clone(&flag));
+        self.interrupt = Some(flag);
+    }
+
+    /// Install an already-elapsing caller envelope for a background attempt.
+    /// Ordinary callers retain their existing policy. Limits only tighten and
+    /// survive resets; they bound executor terms, not all process allocations.
+    pub(crate) fn set_resource_limits(
+        &mut self,
+        deadline: ay_core::time::Instant,
+        term_memory_limit: Option<usize>,
+    ) -> bool {
+        let limits = BackendResourceLimits {
+            deadline: self
+                .resource_limits
+                .map_or(deadline, |old| old.deadline.min(deadline)),
+            term_memory_limit: term_memory_limit
+                .into_iter()
+                .chain(self.resource_limits.and_then(|old| old.term_memory_limit))
+                .chain(self.exec.term_memory_limit())
+                .min(),
+        };
+        self.resource_limits = Some(limits);
+        self.exec.set_deadline(Some(limits.deadline));
+        self.exec.set_term_memory_limit(limits.term_memory_limit);
+        self.resources_open()
+    }
+
+    /// Tighten the persistent store even if the unbounded search has no clock.
+    pub(crate) fn set_term_memory_limit(&mut self, requested: Option<usize>) {
+        self.term_memory_limit = requested
+            .into_iter()
+            .chain(self.term_memory_limit)
+            .chain(self.exec.term_memory_limit())
+            .chain(super::SmtContext::current_thread_term_memory_budget())
+            .min();
+        self.exec.set_term_memory_limit(self.term_memory_limit);
+    }
+
+    pub(crate) fn resources_open(&mut self) -> bool {
+        self.set_term_memory_limit(None);
+        self.record_resource_stop(self.exec.unknown_reason());
+        let memory = crate::bmc::memory::Budget::capture(self.term_memory_limit, None);
+        self.resource_stopped |= !memory.executor_open(&self.exec);
+        if let Some(limits) = self.resource_limits {
+            self.resource_stopped |= ay_core::time::Instant::now() >= limits.deadline
+                || self
+                    .interrupt
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                || ay_core::TermStore::global_memory_exceeded()
+                || limits.term_memory_limit.is_some_and(|limit| {
+                    limit == 0 || self.exec.terms().true_memory_bytes() > limit
+                });
+        }
+        !self.resource_stopped
+    }
+
+    fn record_resource_stop(&mut self, reason: Option<ay_dpll::UnknownReason>) {
+        // A shorter per-query Timeout is deliberately retryable inside the
+        // captured absolute deadline. Memory/caller interruption is terminal
+        // even if cleanup later clears the executor's result or live cause.
+        crate::smt::resource_observation::note_executor_refusal(reason);
+        if (self.resource_limits.is_some() || self.term_memory_limit.is_some())
+            && matches!(
+                reason,
+                Some(ay_dpll::UnknownReason::MemoryLimit | ay_dpll::UnknownReason::Interrupted)
+            )
+        {
+            self.resource_stopped = true;
         }
     }
 
@@ -138,6 +232,17 @@ impl PdrExecutorBackend {
         timeout: Duration,
         dv_off_first: bool,
     ) -> SmtResult {
+        if !self.resources_open() {
+            return SmtResult::Unknown;
+        }
+        // An executor context: its route is closed under an effort (P4a slice 8).
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err()
+            || crate::run_meter::close_route()
+        {
+            return SmtResult::Unknown;
+        }
+        let _census =
+            super::lane::CensusFrame::enter1(super::lane::SmtEntry::PdrExecutorBackend, None, expr);
         // This admission must precede retry feature scans and every recursive
         // div/mod or variable preprocessing helper.  It is iterative and
         // aggregate-capped; an oversized typed term is not allowed to reach a
@@ -152,13 +257,18 @@ impl PdrExecutorBackend {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.check_sat_with_retry(expr, timeout, dv_off_first)
         }));
-        match result {
+        let result = match result {
             Ok(r) => r,
             Err(_) => {
                 tracing::debug!("pdr_executor_backend: ay panic caught; resetting");
                 self.reset();
                 SmtResult::Unknown
             }
+        };
+        if self.resources_open() {
+            result
+        } else {
+            SmtResult::Unknown
         }
     }
 
@@ -184,6 +294,9 @@ impl PdrExecutorBackend {
         let attempt_start = ay_core::time::Instant::now();
         let (first, raw_unknown) =
             self.check_sat_inner(expr, timeout.saturating_sub(reserve), false);
+        if !self.resources_open() {
+            return SmtResult::Unknown;
+        }
         if !raw_unknown || reserve.is_zero() {
             return first;
         }
@@ -203,7 +316,22 @@ impl PdrExecutorBackend {
 
     /// Reset the backend to a fresh state. Called on errors.
     pub(crate) fn reset(&mut self) {
+        // Sample the old store before dropping it: an error-path reset must
+        // not erase a crossed caller cap and admit another attempt.
+        self.resources_open();
+        let interrupt = self.interrupt.take();
+        let limits = self.resource_limits;
+        let stopped = self.resource_stopped;
+        let term_memory = self.term_memory_limit;
         *self = Self::new();
+        self.resource_stopped = stopped;
+        self.set_term_memory_limit(term_memory);
+        if let Some(flag) = interrupt {
+            self.set_interrupt(flag);
+        }
+        if let Some(limits) = limits {
+            self.set_resource_limits(limits.deadline, limits.term_memory_limit);
+        }
     }
 
     /// Number of queries successfully processed.
@@ -281,7 +409,30 @@ impl PdrExecutorBackend {
                  (persistent name/sort cache is stale); resetting session"
             );
             self.reset();
+            if !self.resources_open() {
+                return (SmtResult::Unknown, false);
+            }
         }
+
+        // Step 1c (Rung 0): sort-unique names WITHIN the query. The session
+        // reset above handles a name changing sort ACROSS queries; a query that
+        // itself carries `J:Int` and `J:Bool` used to declare only the first
+        // (`declare_missing_vars` is keyed by name) and then assert a body
+        // typed with both -> frontend/type error -> Unknown. A name the session
+        // already declared keeps its sort; the other sort is qualified
+        // (`J!Bool`) in declarations and body. Validation stays on `expr`.
+        let sort_renaming =
+            super::sort_unique::SortUniqueRenaming::plan_with_reserved(&vars, |name| {
+                self.declared_vars.get(name).cloned()
+            });
+        let sort_renamed_expr;
+        let (solve_expr, vars) = match &sort_renaming {
+            Some(renaming) => {
+                sort_renamed_expr = renaming.apply(solve_expr);
+                (&sort_renamed_expr, renaming.renamed_vars(&vars))
+            }
+            None => (solve_expr, vars),
+        };
 
         // Step 2: Detect required logic.
         let required_logic = detect_logic(&vars, solve_expr).to_string();
@@ -300,6 +451,9 @@ impl PdrExecutorBackend {
                 self.logic.as_deref().unwrap_or("none")
             );
             self.reset();
+            if !self.resources_open() {
+                return (SmtResult::Unknown, false);
+            }
             if let Err(e) = self.initialize(&required_logic, timeout) {
                 tracing::debug!("pdr_executor_backend: reinit failed: {e}");
                 self.reset();
@@ -440,6 +594,9 @@ impl PdrExecutorBackend {
             // sub-query was certified. The declaration changes no gate and no
             // verdict today — it attributes this channel's certification cost
             // in `ay_dpll::CertificationAccounting`.
+            if !self.resources_open() {
+                return Ok(SmtResult::Unknown);
+            }
             let status = self
                 .exec
                 .execute(&Command::CheckSat)?
@@ -474,6 +631,12 @@ impl PdrExecutorBackend {
                 // it. Published stands on the measurement, not just on the missing
                 // audit -- the audit now exists and passes.
                 .ok_or(PdrBackendError::MissingResult)?;
+
+            // Read typed refusal before Pop invalidates the result and before
+            // model/cleanup work can hide a transient resource stop.
+            if !self.resources_open() {
+                return Ok(SmtResult::Unknown);
+            }
 
             match status.as_str() {
                 "sat" => {
@@ -699,6 +862,10 @@ impl PdrExecutorBackend {
 }
 
 #[cfg(test)]
+#[path = "pdr_executor_backend/memory_tests.rs"]
+mod memory_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ChcDtConstructor, ChcExpr, ChcOp, ChcSort, ChcVar};
@@ -713,6 +880,124 @@ mod tests {
 
     fn mk_int(v: i128) -> ChcExpr {
         ChcExpr::Int(v)
+    }
+
+    #[test]
+    fn reset_latches_exhausted_old_terms_before_replacing_the_store() {
+        let mut backend = PdrExecutorBackend::new();
+        let initial_bytes = backend.exec.terms().true_memory_bytes();
+        let deadline = ay_core::time::Instant::now() + Duration::from_secs(30);
+        assert!(backend.set_resource_limits(deadline, Some(initial_bytes)));
+        let _ = backend
+            .exec
+            .context_mut()
+            .terms
+            .mk_var("x".repeat(initial_bytes + 1), ay_core::Sort::Bool);
+        assert!(backend.exec.terms().true_memory_bytes() > initial_bytes);
+        assert!(
+            !backend.resource_stopped,
+            "reset must perform the first sample"
+        );
+        backend.reset();
+        assert!(backend.exec.terms().true_memory_bytes() <= initial_bytes);
+        assert!(
+            !backend.resources_open(),
+            "fresh store must not revive the attempt"
+        );
+        assert!(!backend.set_resource_limits(deadline, Some(usize::MAX)));
+    }
+
+    #[test]
+    fn recorded_caller_stops_are_sticky_but_inner_timeout_is_not_terminal() {
+        use ay_dpll::UnknownReason;
+        for reason in [
+            None,
+            Some(UnknownReason::Incomplete),
+            Some(UnknownReason::Timeout),
+            Some(UnknownReason::MemoryLimit),
+            Some(UnknownReason::Interrupted),
+        ] {
+            let terminal = matches!(
+                reason,
+                Some(UnknownReason::MemoryLimit | UnknownReason::Interrupted)
+            );
+            let mut ordinary = PdrExecutorBackend::new();
+            ordinary.record_resource_stop(reason);
+            assert!(
+                ordinary.resources_open(),
+                "ordinary backend policy must stay unchanged"
+            );
+            let mut bounded = PdrExecutorBackend::new();
+            let deadline = ay_core::time::Instant::now() + Duration::from_secs(30);
+            assert!(bounded.set_resource_limits(deadline, None));
+            bounded.record_resource_stop(reason);
+            assert_eq!(bounded.resources_open(), !terminal, "reason {reason:?}");
+            bounded.reset();
+            assert_eq!(bounded.resources_open(), !terminal, "reset: {reason:?}");
+        }
+    }
+
+    #[test]
+    fn actual_recorded_interrupt_survives_live_recovery_pop_and_reset() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut backend = PdrExecutorBackend::new();
+        backend.set_interrupt(Arc::clone(&flag));
+        let deadline = ay_core::time::Instant::now() + Duration::from_secs(30);
+        assert!(backend.set_resource_limits(deadline, None));
+        backend.exec.execute(&Command::Push(1)).unwrap();
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            backend.exec.execute(&Command::CheckSat).unwrap().as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            backend.exec.unknown_reason(),
+            Some(ay_dpll::UnknownReason::Interrupted)
+        );
+        flag.store(false, Ordering::Relaxed);
+        assert!(
+            !backend.resources_open(),
+            "typed result must survive a cleared live flag"
+        );
+        backend.exec.execute(&Command::Pop(1)).unwrap();
+        assert_eq!(backend.exec.unknown_reason(), None);
+        backend.reset();
+        assert!(!backend.resources_open());
+    }
+
+    #[test]
+    fn continuing_reset_paths_cannot_restart_setup_after_resource_refusal() {
+        for sort_conflict in [false, true] {
+            let mut backend = PdrExecutorBackend::new();
+            let bytes = backend.exec.terms().true_memory_bytes();
+            let deadline = ay_core::time::Instant::now() + Duration::from_secs(30);
+            assert!(backend.set_resource_limits(deadline, Some(bytes)));
+            let _ = backend
+                .exec
+                .context_mut()
+                .terms
+                .mk_var("x".repeat(bytes + 1), ay_core::Sort::Bool);
+            backend.initialized = true;
+            backend.logic = Some("QF_UF".to_string());
+            if sort_conflict {
+                backend.declared_vars.insert("x".to_string(), ChcSort::Bool);
+            }
+            // Enter the private continuation directly: the ordinary public
+            // entry would already reject this cap. This isolates both reset
+            // branches' obligation to stop before fresh setup or an SMT call.
+            let (result, retryable) =
+                backend.check_sat_inner(&mk_var("x"), Duration::from_secs(1), false);
+            assert!(matches!(result, SmtResult::Unknown));
+            assert!(!retryable);
+            assert!(backend.resource_stopped);
+            assert!(
+                !backend.initialized,
+                "reset continuation must not reinitialize"
+            );
+            assert!(backend.declared_vars.is_empty());
+            assert_eq!(backend.query_count(), 0);
+        }
     }
 
     #[test]
@@ -838,7 +1123,7 @@ mod tests {
         // classifier correctly suppresses them as datatype constructors.
         let color = ChcSort::Datatype {
             name: "PdrGroundColor".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 ChcDtConstructor {
                     name: "PdrGroundRed".to_string(),
                     selectors: vec![],

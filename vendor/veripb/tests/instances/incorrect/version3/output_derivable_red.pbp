@@ -1,0 +1,22 @@
+pseudo-Boolean proof version 3.0
+% `output DERIVABLE` claims every model of the input is a model of the output,
+% and `check_file` establishes that by matching the output against the CORE
+% set -- sound only while every core constraint is input-entailed.
+%
+% The guard covered `sol`/`soli`/`solx` logging and `soli`/`obji` objective
+% bounding. It did not cover `red`/`dom`, which store a constraint that is
+% satisfiability-preserving but NOT input-entailed by a licence having nothing
+% to do with solutions. This proof needs neither a solution nor an objective:
+%
+%   x1=0, x2=1 satisfies the input `x1 + x2 >= 1`
+%              and falsifies the output's `x1 >= 1`.
+%
+% Before the guard was widened this certified `s VERIFIED OUTPUT DERIVABLE` at
+% exit 0. Same failure mode as defects 15 and 20, at the third route their
+% fixes did not reach.
+f 1;
+red 1 x1 >= 1 : x1 1;
+core id -1;
+output DERIVABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -8,6 +8,8 @@
 //! Mirrors CaDiCaL's `heap<elim_more>` (elim.hpp:16) but as a min-heap.
 //! Supports O(1) `contains`, O(log n) `push`/`pop`/`update`.
 
+mod counted;
+
 use crate::literal::{Literal, Variable};
 use crate::occ_list::OccList;
 

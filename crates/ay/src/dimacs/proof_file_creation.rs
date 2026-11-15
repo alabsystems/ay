@@ -302,6 +302,18 @@ fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io:
     )
 }
 
+/// The two duplicates of a new generation's descriptor: the registry's, and
+/// the custody's own for exits that cannot take the registry's lock
+/// (proof_custody.rs).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn clone_owned_dimacs_proof_descriptors(file: &File) -> io::Result<(File, File)> {
+    #[cfg(test)]
+    if take_injected_dimacs_proof_create_failure(InjectedDimacsProofCreateFailure::Clone) {
+        return Err(io::Error::other("injected DIMACS proof clone failure"));
+    }
+    Ok((file.try_clone()?, file.try_clone()?))
+}
+
 /// Reserve a proof target for this process without following or truncating an
 /// existing object. Linux prefers an anonymous descriptor and falls back to a
 /// randomized mode-0600 sibling stage when the filesystem lacks `O_TMPFILE`.
@@ -314,6 +326,7 @@ fn create_owned_dimacs_proof_file_with_status(
     path: &str,
     status_reservation: &mut Option<DimacsProofStatusReservation>,
     invalidation: DimacsPublicationInvalidation,
+    fast_publication: bool,
 ) -> io::Result<File> {
     let resolved = match status_reservation.as_ref() {
         Some(reservation) => reservation.proof_path.clone(),
@@ -372,17 +385,8 @@ fn create_owned_dimacs_proof_file_with_status(
             return Err(dimacs_proof_setup_error(error, cleanup, staging_label));
         }
     };
-    #[cfg(test)]
-    let descriptor_result =
-        if take_injected_dimacs_proof_create_failure(InjectedDimacsProofCreateFailure::Clone) {
-            Err(io::Error::other("injected DIMACS proof clone failure"))
-        } else {
-            file.try_clone()
-        };
-    #[cfg(not(test))]
-    let descriptor_result = file.try_clone();
-    let descriptor = match descriptor_result {
-        Ok(descriptor) => descriptor,
+    let (descriptor, custody_descriptor) = match clone_owned_dimacs_proof_descriptors(&file) {
+        Ok(descriptors) => descriptors,
         Err(error) => {
             let cleanup = staging_path
                 .as_deref()
@@ -394,6 +398,13 @@ fn create_owned_dimacs_proof_file_with_status(
     // Armed BEFORE the registry publishes this generation, so no window exists
     // in which an abandoned staging file or status lock has no owner.
     arm_abandoned_dimacs_proof_sweep();
+    let custody = register_dimacs_proof_custody(
+        resolved.clone(),
+        staging_path.clone(),
+        identity,
+        custody_descriptor,
+        fast_publication,
+    );
     let write_failed = Arc::new(AtomicBool::new(false));
     owned.insert(
         resolved,
@@ -406,6 +417,7 @@ fn create_owned_dimacs_proof_file_with_status(
             published: None,
             status_reservation: status_reservation.take(),
             invalidation,
+            custody,
         },
     );
     Ok(file)
@@ -416,6 +428,7 @@ fn create_owned_dimacs_proof_file_with_status(
     _path: &str,
     _status_reservation: &mut Option<DimacsProofStatusReservation>,
     _invalidation: DimacsPublicationInvalidation,
+    _fast_publication: bool,
 ) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -429,6 +442,7 @@ fn create_owned_dimacs_proof_file(path: &str) -> io::Result<File> {
         path,
         &mut status_reservation,
         DimacsPublicationInvalidation::Proof { binary: false },
+        false,
     )
 }
 
@@ -442,6 +456,7 @@ fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> 
             DimacsPublicationInvalidation::Proof {
                 binary: proof.binary,
             },
+            dimacs_fast_publication(proof),
         );
     }
 
@@ -452,6 +467,7 @@ fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> 
         DimacsPublicationInvalidation::Proof {
             binary: proof.binary,
         },
+        false,
     ) {
         Ok(file) => Ok(file),
         Err(proof_error) => {

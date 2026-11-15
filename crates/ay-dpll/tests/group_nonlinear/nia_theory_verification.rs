@@ -392,7 +392,7 @@ fn nia_benchmark_pell_equation() {
 
 /// SMT-LIB style: Pythagorean triple x^2 + y^2 = z^2 with tight bounds.
 /// Known solution: x=3, y=4, z=5.
-// NIA-INCOMPLETE: solver returns unknown; lacks bounded nonlinear search.
+/// Initial box-product cuts must not skip the complete bounded search.
 #[test]
 #[timeout(10_000)]
 fn nia_benchmark_pythagorean_triple() {
@@ -411,11 +411,7 @@ fn nia_benchmark_pythagorean_triple() {
 (check-sat)
 "#;
     let result = crate::common::solve(smt);
-    let r = crate::common::sat_result(&result);
-    assert!(
-        matches!(r, Some("sat") | Some("unknown")),
-        "Pythagorean triple x^2+y^2=z^2 with bounds has solutions, got: {result}"
-    );
+    assert_eq!(crate::common::sat_result(&result), Some("sat"), "{result}");
 }
 
 // ============================================================================

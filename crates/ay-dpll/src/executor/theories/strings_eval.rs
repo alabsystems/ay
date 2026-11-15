@@ -652,16 +652,10 @@ pub(super) fn ground_eval_string_term(terms: &ay_core::TermStore, t: TermId) -> 
                     Some(n.to_string())
                 }
             }
+            // Surrogates included: one shared semantics (`ay_strings::eval`).
             "str.from_code" if args.len() == 1 => {
                 let n = ground_eval_int_term(terms, args[0])?;
-                let code: i64 = n.try_into().ok()?;
-                if !(0..=196_607).contains(&code) {
-                    Some(String::new())
-                } else {
-                    char::from_u32(code as u32)
-                        .map(|c| c.to_string())
-                        .or(Some(String::new()))
-                }
+                Some(ay_strings::eval::eval_str_from_code(&n))
             }
             "str.to_lower" if args.len() == 1 => {
                 let s = ground_eval_string_term(terms, args[0])?;
@@ -715,11 +709,7 @@ pub(super) fn ground_eval_int_term(terms: &ay_core::TermStore, t: TermId) -> Opt
         }
         TermData::App(Symbol::Named(name), args) if name == "str.to_code" && args.len() == 1 => {
             let s = ground_eval_string_term(terms, args[0])?;
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) if (c as u32) <= 196_607 => Some(BigInt::from(c as u32)),
-                _ => Some(BigInt::from(-1)),
-            }
+            Some(ay_strings::eval::eval_str_to_code(&s))
         }
         TermData::App(Symbol::Named(name), args) if name == "str.to_int" && args.len() == 1 => {
             let s = ground_eval_string_term(terms, args[0])?;

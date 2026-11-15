@@ -16,19 +16,31 @@
 
 use crate::clause::ClauseHead;
 use crate::expr::evaluate_expr;
+#[cfg(test)]
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::model::InvariantModel;
-use crate::pdr::{CexVerificationResult, Counterexample, CounterexampleStep, PdrConfig, PdrSolver};
+#[cfg(test)]
+use crate::pdr::CounterexampleStep;
+use crate::pdr::{CexVerificationResult, Counterexample, PdrConfig, PdrSolver};
 use crate::smt::executor_adapter::{
     collect_dt_declarations_for_expr, collect_uninterpreted_function_declarations, detect_logic,
     emit_declare_datatypes, emit_declare_uninterpreted_function, parse_model_into, quote_symbol,
     sort_to_smtlib,
 };
 use crate::smt::{SmtResult, SmtValue};
-use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, HornClause, PredicateId};
+use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
+
+mod control;
+mod grounded;
+mod names;
+use control::Control;
+use names::Names;
+#[cfg(test)]
+#[path = "adt_array_nullary/native_tests.rs"]
+mod native_tests;
 
 const MIN_SMT_BUDGET: Duration = Duration::from_millis(10);
 const MARKER_DAG_MAX_DEPTH: usize = 20;
@@ -79,33 +91,64 @@ pub(crate) fn try_build_counterexample(
     if budget < MIN_SMT_BUDGET {
         return Err(NullaryAdtArrayOutcome::NoBudget);
     }
+    let control = Control::capture(budget).ok_or(NullaryAdtArrayOutcome::NoBudget)?;
+    let _scope = control.enter();
+    try_build_counterexample_owned(problem, &control)
+}
+
+fn try_build_counterexample_owned(
+    problem: &ChcProblem,
+    control: &Control,
+) -> Result<NullaryAdtArrayCandidate, NullaryAdtArrayOutcome> {
+    Names::admit_source(problem, control).ok_or(NullaryAdtArrayOutcome::NoBudget)?;
 
     let Some((query_clause, predicate)) = nullary_false_query(problem) else {
-        return try_build_array_dag_query_counterexample(problem, budget);
+        return try_build_array_dag_query_counterexample(problem, control);
     };
 
     let mut saw_unknown = false;
     for (fact_clause, constraint) in nullary_adt_array_facts(problem, predicate) {
+        let budget = control
+            .remaining()
+            .ok_or(NullaryAdtArrayOutcome::NoBudget)?;
         let mut smt = problem.make_smt_context();
         match smt.check_sat_with_executor_fallback_timeout(constraint, budget) {
             SmtResult::Sat(model) => {
+                control.poll().ok_or(NullaryAdtArrayOutcome::NoBudget)?;
                 let instances = scalar_instances_from_model(constraint, &model)
                     .or_else(|| scalar_seed_instance(constraint))
                     .unwrap_or_default();
-                let cex = build_counterexample(predicate, fact_clause, query_clause, instances);
-                return Ok(NullaryAdtArrayCandidate {
-                    cex,
-                    source_clause: fact_clause,
-                    query_clause,
+                if let Some(cex) = grounded::from_fact(
+                    problem,
                     predicate,
-                });
+                    fact_clause,
+                    query_clause,
+                    instances,
+                    control,
+                ) {
+                    return Ok(NullaryAdtArrayCandidate {
+                        cex,
+                        source_clause: fact_clause,
+                        query_clause,
+                        predicate,
+                    });
+                }
             }
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {}
             SmtResult::Unknown => saw_unknown = true,
         }
 
-        if let Some(instances) = tricera_memtrack_instances(constraint) {
-            let cex = build_counterexample(predicate, fact_clause, query_clause, instances);
+        control.poll().ok_or(NullaryAdtArrayOutcome::NoBudget)?;
+        if let Some(cex) = tricera_memtrack_instances(constraint).and_then(|instances| {
+            grounded::from_fact(
+                problem,
+                predicate,
+                fact_clause,
+                query_clause,
+                instances,
+                control,
+            )
+        }) {
             return Ok(NullaryAdtArrayCandidate {
                 cex,
                 source_clause: fact_clause,
@@ -115,7 +158,7 @@ pub(crate) fn try_build_counterexample(
         }
     }
 
-    match try_build_marker_dag_counterexample(problem, predicate, query_clause, budget) {
+    match try_build_marker_dag_counterexample(problem, predicate, query_clause, control) {
         Ok(candidate) => return Ok(candidate),
         Err(NullaryAdtArrayOutcome::NotApplicable | NullaryAdtArrayOutcome::DagNotFound) => {}
         Err(outcome) => return Err(outcome),
@@ -130,19 +173,18 @@ pub(crate) fn try_build_counterexample(
 
 fn try_build_array_dag_query_counterexample(
     problem: &ChcProblem,
-    budget: Duration,
+    control: &Control,
 ) -> Result<NullaryAdtArrayCandidate, NullaryAdtArrayOutcome> {
     let Some((query_clause, predicate)) = array_dag_false_query(problem) else {
         return Err(NullaryAdtArrayOutcome::NotApplicable);
     };
 
-    try_build_marker_dag_counterexample(problem, predicate, query_clause, budget)
+    try_build_marker_dag_counterexample(problem, predicate, query_clause, control)
 }
 
 /// A derivation witness whose entries ALL record a trivially-`true` reachable
 /// state does not establish reachability. It is the vacuous form emitted by the
-/// nullary-ADT/array marker-dag prepass (`marker_dag_counterexample` stamps every
-/// entry `state: ChcExpr::Bool(true)`), and is the S4 false-UNSAFE root cause: the
+/// legacy nullary-ADT/array marker-dag prepass, and is the S4 false-UNSAFE root cause: the
 /// query-violation check then reduces to "is the query satisfiable in isolation"
 /// instead of "is it reachable under the real state", so a BV/array query that a
 /// `select`-over-`store` equality actually refutes is wrongly blessed as UNSAFE.
@@ -177,6 +219,10 @@ pub(crate) fn validate_counterexample(
     if witness_is_vacuous(cex) {
         return false;
     }
+    let Some(control) = Control::capture(budget) else {
+        return false;
+    };
+    let _scope = control.enter();
 
     let config = PdrConfig {
         verbose,
@@ -188,10 +234,11 @@ pub(crate) fn validate_counterexample(
     };
     let mut verifier = PdrSolver::new(problem.clone(), config);
     verifier.set_validation_deadline(budget);
-    matches!(
+    let accepted = matches!(
         verifier.verify_counterexample(cex),
         CexVerificationResult::Valid
-    )
+    );
+    accepted && control.poll().is_some()
 }
 
 #[derive(Clone)]
@@ -199,6 +246,7 @@ struct MarkerDagTree {
     predicate: PredicateId,
     clause_idx: usize,
     children: Vec<Self>,
+    size: usize,
 }
 
 struct MarkerDagNode {
@@ -211,7 +259,7 @@ fn try_build_marker_dag_counterexample(
     problem: &ChcProblem,
     predicate: PredicateId,
     query_clause: usize,
-    budget: Duration,
+    control: &Control,
 ) -> Result<NullaryAdtArrayCandidate, NullaryAdtArrayOutcome> {
     if !(problem.has_array_sorts() || problem.has_datatype_sorts()) {
         return Err(NullaryAdtArrayOutcome::NotApplicable);
@@ -228,19 +276,32 @@ fn try_build_marker_dag_counterexample(
         MARKER_DAG_MAX_DEPTH,
         &mut visiting,
         &mut trees,
+        control,
     );
+    control.poll().ok_or(NullaryAdtArrayOutcome::NoBudget)?;
     if trees.is_empty() {
         return Err(NullaryAdtArrayOutcome::DagNotFound);
     }
 
     let divisor = u32::try_from(trees.len().min(8)).unwrap_or(1);
+    let budget = control
+        .remaining()
+        .ok_or(NullaryAdtArrayOutcome::NoBudget)?;
     let per_tree_budget = (budget / divisor)
         .max(MIN_SMT_BUDGET)
         .min(Duration::from_millis(500));
     let mut saw_unknown = false;
 
     for tree in trees {
-        match solve_marker_dag_tree(problem, predicate, query_clause, &tree, per_tree_budget) {
+        control.poll().ok_or(NullaryAdtArrayOutcome::NoBudget)?;
+        match solve_marker_dag_tree(
+            problem,
+            predicate,
+            query_clause,
+            &tree,
+            per_tree_budget,
+            control,
+        ) {
             MarkerDagSolve::Candidate(candidate) => return Ok(candidate),
             MarkerDagSolve::Unsat => {}
             MarkerDagSolve::Unknown => saw_unknown = true,
@@ -260,7 +321,11 @@ fn collect_marker_dag_trees(
     remaining_depth: usize,
     visiting: &mut FxHashSet<PredicateId>,
     out: &mut Vec<MarkerDagTree>,
+    control: &Control,
 ) {
+    if control.admit(1, 128).is_none() {
+        return;
+    }
     if remaining_depth == 0 || out.len() >= MARKER_DAG_MAX_TREES || !visiting.insert(predicate) {
         return;
     }
@@ -283,6 +348,7 @@ fn collect_marker_dag_trees(
                 remaining_depth - 1,
                 visiting,
                 &mut options,
+                control,
             );
             if options.is_empty() {
                 applicable = false;
@@ -294,7 +360,15 @@ fn collect_marker_dag_trees(
             continue;
         }
 
-        push_marker_dag_combinations(predicate, clause_idx, &child_options, 0, Vec::new(), out);
+        push_marker_dag_combinations(
+            predicate,
+            clause_idx,
+            &child_options,
+            0,
+            Vec::new(),
+            out,
+            control,
+        );
     }
 
     visiting.remove(&predicate);
@@ -307,23 +381,57 @@ fn push_marker_dag_combinations(
     idx: usize,
     current: Vec<MarkerDagTree>,
     out: &mut Vec<MarkerDagTree>,
+    control: &Control,
 ) {
+    if control.admit(1, 128).is_none() {
+        return;
+    }
     if out.len() >= MARKER_DAG_MAX_TREES {
         return;
     }
     if idx == child_options.len() {
+        let Some(size) = current
+            .iter()
+            .try_fold(1usize, |size, child| size.checked_add(child.size))
+        else {
+            control.refuse::<()>();
+            return;
+        };
         out.push(MarkerDagTree {
             predicate,
             clause_idx,
             children: current,
+            size,
         });
         return;
     }
 
     for child in &child_options[idx] {
+        let Some(size) = current
+            .iter()
+            .try_fold(child.size, |size, item| size.checked_add(item.size))
+        else {
+            control.refuse::<()>();
+            return;
+        };
+        let Some(bytes) = size.checked_mul(128) else {
+            control.refuse::<()>();
+            return;
+        };
+        if control.admit(size, bytes).is_none() {
+            return;
+        }
         let mut next = current.clone();
         next.push(child.clone());
-        push_marker_dag_combinations(predicate, clause_idx, child_options, idx + 1, next, out);
+        push_marker_dag_combinations(
+            predicate,
+            clause_idx,
+            child_options,
+            idx + 1,
+            next,
+            out,
+            control,
+        );
         if out.len() >= MARKER_DAG_MAX_TREES {
             break;
         }
@@ -342,10 +450,21 @@ fn solve_marker_dag_tree(
     query_clause: usize,
     tree: &MarkerDagTree,
     budget: Duration,
+    control: &Control,
 ) -> MarkerDagSolve {
+    let Some(remaining) = control.remaining() else {
+        return MarkerDagSolve::Unknown;
+    };
+    let _tree_deadline = crate::smt::deadline::ScopedSmtDeadline::install(budget.min(remaining));
     let mut nodes = Vec::new();
-    let root = flatten_marker_dag_tree(tree, &mut nodes);
-    let Some(formula) = marker_dag_formula(problem, query_clause, &nodes, root) else {
+    let Some(root) = flatten_marker_dag_tree(tree, &mut nodes, control) else {
+        return MarkerDagSolve::Unknown;
+    };
+    let Some(names) = Names::capture(problem, &nodes, query_clause, control) else {
+        return MarkerDagSolve::Unknown;
+    };
+    let Some(formula) = marker_dag_formula(problem, query_clause, &nodes, root, &names, control)
+    else {
         return MarkerDagSolve::Unknown;
     };
     if collect_dt_declarations_for_expr(&[], &formula).is_err() {
@@ -361,26 +480,49 @@ fn solve_marker_dag_tree(
     // `Unknown -> marker_dag_seed_model` fabrication path) the model is only a
     // heuristic guess and must be positively re-confirmed before it can back a
     // counterexample.
-    let (model, smt_confirmed) =
-        match smt.check_sat_with_executor_fallback_timeout(&formula, budget) {
-            SmtResult::Sat(mut model) => {
-                fill_missing_seed(&mut model, marker_dag_seed_model(&formula));
-                (model, true)
+    let Some(budget) = tree_remaining(control) else {
+        return MarkerDagSolve::Unknown;
+    };
+    let (model, smt_confirmed) = match smt
+        .check_sat_with_executor_fallback_timeout(&formula, budget)
+    {
+        SmtResult::Sat(mut model) => {
+            if tree_remaining(control).is_none() {
+                return MarkerDagSolve::Unknown;
             }
-            SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
-                return MarkerDagSolve::Unsat;
-            }
-            SmtResult::Unknown => match marker_dag_raw_executor_model(&formula, budget) {
+            fill_missing_seed(&mut model, marker_dag_seed_model(&formula));
+            (model, true)
+        }
+        SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
+            return MarkerDagSolve::Unsat;
+        }
+        SmtResult::Unknown => {
+            let Some(remaining) = tree_remaining(control) else {
+                return MarkerDagSolve::Unknown;
+            };
+            match marker_dag_raw_executor_model(&formula, remaining) {
                 SmtResult::Sat(mut model) => {
+                    if tree_remaining(control).is_none() {
+                        return MarkerDagSolve::Unknown;
+                    }
                     fill_missing_seed(&mut model, marker_dag_seed_model(&formula));
                     (model, true)
                 }
                 SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
                     return MarkerDagSolve::Unsat;
                 }
-                SmtResult::Unknown => (marker_dag_seed_model(&formula), false),
-            },
-        };
+                SmtResult::Unknown => {
+                    if tree_remaining(control).is_none() {
+                        return MarkerDagSolve::Unknown;
+                    }
+                    (marker_dag_seed_model(&formula), false)
+                }
+            }
+        }
+    };
+    if tree_remaining(control).is_none() {
+        return MarkerDagSolve::Unknown;
+    }
 
     // SOUNDNESS GATE (Mem-track false-UNSAT fix): never emit a counterexample
     // from a model we have not confirmed against the reconstructed derivation
@@ -428,11 +570,12 @@ fn solve_marker_dag_tree(
         }
     }
 
-    let Some(cex) = marker_dag_counterexample(problem, query_clause, &nodes, root, &model) else {
+    let Some(cex) =
+        grounded::from_model(problem, query_clause, &nodes, root, &names, &model, control)
+    else {
         return MarkerDagSolve::Unknown;
     };
-    let verbose_validation = ay_core::misc_cli_flags().chc_debug_marker_dag_verify;
-    if !validate_counterexample(problem, &cex, budget, verbose_validation) {
+    if tree_remaining(control).is_none() {
         return MarkerDagSolve::Unknown;
     }
 
@@ -444,19 +587,31 @@ fn solve_marker_dag_tree(
     })
 }
 
-fn flatten_marker_dag_tree(tree: &MarkerDagTree, nodes: &mut Vec<MarkerDagNode>) -> usize {
+fn tree_remaining(control: &Control) -> Option<Duration> {
+    let original = control.remaining()?;
+    let remaining =
+        crate::smt::deadline::smt_deadline_remaining().map_or(original, |tree| tree.min(original));
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn flatten_marker_dag_tree(
+    tree: &MarkerDagTree,
+    nodes: &mut Vec<MarkerDagNode>,
+    control: &Control,
+) -> Option<usize> {
+    control.admit(tree.children.len().checked_add(1)?, 128)?;
     let children = tree
         .children
         .iter()
-        .map(|child| flatten_marker_dag_tree(child, nodes))
-        .collect();
+        .map(|child| flatten_marker_dag_tree(child, nodes, control))
+        .collect::<Option<Vec<_>>>()?;
     let id = nodes.len();
     nodes.push(MarkerDagNode {
         predicate: tree.predicate,
         clause_idx: tree.clause_idx,
         children,
     });
-    id
+    Some(id)
 }
 
 fn marker_dag_formula(
@@ -464,10 +619,13 @@ fn marker_dag_formula(
     query_clause: usize,
     nodes: &[MarkerDagNode],
     root: usize,
+    names: &Names,
+    control: &Control,
 ) -> Option<ChcExpr> {
     let mut conjuncts = Vec::new();
 
     for (node_id, node) in nodes.iter().enumerate() {
+        control.admit(1, 128)?;
         let clause = problem.clauses().get(node.clause_idx)?;
         let ClauseHead::Predicate(head_pred, _) = &clause.head else {
             return None;
@@ -476,7 +634,7 @@ fn marker_dag_formula(
             return None;
         }
 
-        let subst = marker_clause_subst(node_id, clause);
+        let subst = names.node(node_id)?;
         if let Some(constraint) = &clause.body.constraint {
             conjuncts.push(constraint.substitute_name_map(&subst).simplify_constants());
         }
@@ -491,8 +649,9 @@ fn marker_dag_formula(
             if child_head_pred != body_pred || child_head_args.len() != body_args.len() {
                 return None;
             }
-            let child_subst = marker_clause_subst(child_id, child_clause);
+            let child_subst = names.node(child_id)?;
             for (body_arg, child_head_arg) in body_args.iter().zip(child_head_args) {
+                control.admit(1, 256)?;
                 conjuncts.push(ChcExpr::eq(
                     body_arg.substitute_name_map(&subst).simplify_constants(),
                     child_head_arg
@@ -518,8 +677,8 @@ fn marker_dag_formula(
     if root_head_args.len() != query_args.len() {
         return None;
     }
-    let root_subst = marker_clause_subst(root, root_clause);
-    let query_subst = marker_query_subst(query);
+    let root_subst = names.node(root)?;
+    let query_subst = names.query();
     for (query_arg, root_head_arg) in query_args.iter().zip(root_head_args) {
         conjuncts.push(ChcExpr::eq(
             query_arg
@@ -538,77 +697,8 @@ fn marker_dag_formula(
         );
     }
 
+    control.poll()?;
     Some(ChcExpr::and_all(conjuncts))
-}
-
-fn marker_clause_var_map(node_id: usize, clause: &HornClause) -> FxHashMap<String, ChcVar> {
-    clause
-        .vars()
-        .into_iter()
-        .enumerate()
-        .map(|(var_idx, var)| {
-            let scoped = ChcVar::new(
-                format!("__ay_nullary_n{node_id}_v{var_idx}"),
-                var.sort.clone(),
-            );
-            (var.name, scoped)
-        })
-        .collect()
-}
-
-fn marker_clause_subst(node_id: usize, clause: &HornClause) -> FxHashMap<String, ChcExpr> {
-    marker_clause_var_map(node_id, clause)
-        .into_iter()
-        .map(|(name, var)| (name, ChcExpr::var(var)))
-        .collect()
-}
-
-fn marker_query_subst(query: &HornClause) -> FxHashMap<String, ChcExpr> {
-    query
-        .vars()
-        .into_iter()
-        .enumerate()
-        .map(|(var_idx, var)| {
-            let scoped = ChcVar::new(format!("__ay_nullary_q_v{var_idx}"), var.sort.clone());
-            (var.name, ChcExpr::var(scoped))
-        })
-        .collect()
-}
-
-fn marker_dag_counterexample(
-    problem: &ChcProblem,
-    query_clause: usize,
-    nodes: &[MarkerDagNode],
-    root: usize,
-    model: &FxHashMap<String, SmtValue>,
-) -> Option<Counterexample> {
-    let mut entries = Vec::with_capacity(nodes.len());
-    for (node_id, node) in nodes.iter().enumerate() {
-        let clause = problem.clauses().get(node.clause_idx)?;
-        let instances = marker_entry_instances(node_id, clause, model);
-        entries.push(DerivationWitnessEntry {
-            predicate: node.predicate,
-            level: 0,
-            state: ChcExpr::Bool(true),
-            incoming_clause: Some(node.clause_idx),
-            premises: node.children.clone(),
-            instances,
-        });
-    }
-
-    assign_marker_dag_levels(&mut entries, root);
-    let witness = DerivationWitness {
-        query_clause: Some(query_clause),
-        root,
-        entries,
-    };
-    Some(Counterexample::with_witness(
-        vec![
-            CounterexampleStep::new(nodes.get(root)?.predicate, FxHashMap::default())
-                .with_clause(nodes.get(root)?.clause_idx),
-        ],
-        witness,
-    ))
 }
 
 /// Fill only the entries that `model` does not already bind from `seed`.
@@ -1082,7 +1172,7 @@ fn marker_dag_raw_executor_model(formula: &ChcExpr, budget: Duration) -> SmtResu
     };
     let outputs = match ay_core::catch_ay_panics(
         AssertUnwindSafe(|| {
-            let mut exec = ay_dpll::Executor::new();
+            let mut exec = crate::smt::executor_adapter::new_search_executor();
             exec.execute_all(&commands).map_err(|_| ())
         }),
         |_| Err(()),
@@ -1108,50 +1198,6 @@ fn marker_dag_raw_executor_model(formula: &ChcExpr, budget: Duration) -> SmtResu
         "unsat" => SmtResult::Unsat,
         _ => SmtResult::Unknown,
     }
-}
-
-fn marker_entry_instances(
-    node_id: usize,
-    clause: &HornClause,
-    model: &FxHashMap<String, SmtValue>,
-) -> FxHashMap<String, SmtValue> {
-    let mut instances = FxHashMap::default();
-    for (original, scoped) in marker_clause_var_map(node_id, clause) {
-        if let Some(value) = marker_model_value_for_var(model, &scoped) {
-            instances.insert(original, value);
-        }
-    }
-    instances
-}
-
-fn marker_model_value_for_var(
-    model: &FxHashMap<String, SmtValue>,
-    var: &ChcVar,
-) -> Option<SmtValue> {
-    model
-        .get(&var.name)
-        .filter(|value| !matches!(value, SmtValue::Opaque(_)))
-        .filter(|value| {
-            smt_value_matches_sort_deep(value, &var.sort, DEFAULT_VALUE_RECURSION_LIMIT)
-        })
-        .cloned()
-        .or_else(|| default_smt_value_for_sort(&var.sort, DEFAULT_VALUE_RECURSION_LIMIT))
-}
-
-fn assign_marker_dag_levels(entries: &mut [DerivationWitnessEntry], root: usize) -> usize {
-    let premises = entries
-        .get(root)
-        .map(|entry| entry.premises.clone())
-        .unwrap_or_default();
-    let level = premises
-        .into_iter()
-        .map(|premise| assign_marker_dag_levels(entries, premise) + 1)
-        .max()
-        .unwrap_or(0);
-    if let Some(entry) = entries.get_mut(root) {
-        entry.level = level;
-    }
-    level
 }
 
 fn default_smt_value_for_sort(sort: &ChcSort, remaining_depth: usize) -> Option<SmtValue> {
@@ -1285,6 +1331,7 @@ fn constraint_contains_datatype_surface(expr: &ChcExpr) -> bool {
     expr.contains_dt_ops()
 }
 
+#[cfg(test)]
 fn build_counterexample(
     predicate: PredicateId,
     fact_clause: usize,
@@ -1437,6 +1484,7 @@ fn scalar_seed_instance(constraint: &ChcExpr) -> Option<FxHashMap<String, SmtVal
 
 fn scalar_literal_assignment(expr: &ChcExpr) -> Option<(ChcVar, SmtValue)> {
     match expr {
+        ChcExpr::ArrayLambda(_) => None,
         ChcExpr::Var(var) if matches!(var.sort, ChcSort::Bool) => {
             Some((var.clone(), SmtValue::Bool(true)))
         }
@@ -1599,22 +1647,24 @@ mod tests {
     #[test]
     fn target_like_nullary_adt_array_fact_candidate_is_rejected_as_vacuous() {
         let problem = ChcParser::parse(TARGET_LIKE).expect("target-like CHC parses");
-        let candidate = try_build_counterexample(&problem, Duration::from_secs(2))
-            .expect("ADT-array fact should produce a witness candidate");
+        let predicate = problem.clauses()[0].head.predicate_id().expect("fact head");
+        let constraint = problem.clauses()[0]
+            .body
+            .constraint
+            .as_ref()
+            .expect("fact constraint");
+        let instances = tricera_memtrack_instances(constraint).unwrap_or_default();
+        let candidate = build_counterexample(predicate, 0, 1, instances);
 
-        assert!(witness_is_vacuous(&candidate.cex));
+        assert!(witness_is_vacuous(&candidate));
         assert!(
-            !validate_counterexample(&problem, &candidate.cex, Duration::from_secs(5), false),
+            !validate_counterexample(&problem, &candidate, Duration::from_secs(5), false),
             "vacuous marker witness must fail closed in every mode"
         );
-        assert_eq!(candidate.source_clause, 0);
-        assert_eq!(candidate.query_clause, 1);
     }
 
-    /// With the vacuous-witness guard unconditional, the nullary prepass can
-    /// no longer bless TARGET_LIKE as Unsafe on its own; the adaptive route
-    /// must never claim Safe for it (Unknown is acceptable, a replay-validated
-    /// Unsafe from another engine is too).
+    /// The unsafe source can now be confirmed by complete ground evidence,
+    /// but never by a vacuous witness and never as Safe.
     #[test]
     fn adaptive_route_never_claims_safe_on_target_like_with_strict_validation() {
         let problem = ChcParser::parse(TARGET_LIKE).expect("target-like CHC parses");
@@ -1661,13 +1711,37 @@ mod tests {
 "#;
         let problem = ChcParser::parse(input).expect("marker DAG CHC parses");
 
-        // Marker-dag candidates carry vacuous (all-`true`-state) witnesses, and
-        // the unconditional vacuity guard in `validate_counterexample` now
-        // declines them inside `solve_marker_dag_tree`, so the route fails
-        // closed to DagUnknown instead of blessing an unreplayable witness.
-        assert!(matches!(
-            try_build_counterexample(&problem, Duration::from_secs(2)),
-            Err(NullaryAdtArrayOutcome::DagUnknown)
+        // Keep the exact old all-true witness shape as a negative control.
+        // A real ground derivation produced by the repaired route is separate
+        // evidence; no syntactic nontrue state is used to evade this guard.
+        let entries = problem
+            .clauses()
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, clause)| DerivationWitnessEntry {
+                predicate: clause.head.predicate_id().expect("marker head"),
+                level: index,
+                state: ChcExpr::Bool(true),
+                incoming_clause: Some(index),
+                premises: index.checked_sub(1).into_iter().collect(),
+                instances: FxHashMap::default(),
+            })
+            .collect();
+        let cex = Counterexample::with_witness(
+            Vec::new(),
+            DerivationWitness {
+                query_clause: Some(3),
+                root: 2,
+                entries,
+            },
+        );
+        assert!(witness_is_vacuous(&cex));
+        assert!(!validate_counterexample(
+            &problem,
+            &cex,
+            Duration::from_secs(2),
+            false
         ));
     }
 

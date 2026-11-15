@@ -466,6 +466,66 @@ fn test_poly_fingerprint_width_one_folds_even_coefficients_soundly() {
 }
 
 #[test]
+fn test_poly_compare_affine_offset_is_not_equal() {
+    // `x = x + 3` is false in Z/2^w for every x: the non-constant parts
+    // of the two fingerprints are identical and the constants differ,
+    // so the comparison must conclude NotEqual (fold `=` to false).
+    // This is the location-test shape left after variable substitution
+    // on instruction-selection dumps (Mulh_u32.0005): z3's rewriter
+    // folds these conditions and the ite trees collapse; without the
+    // negative direction AY bit-blasts them into a CDCL-hard goal.
+    let width = 32;
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::bitvec(width));
+    let b = terms.mk_var("b", Sort::bitvec(width));
+    let s = terms.mk_bvadd(vec![a, b]);
+    let three = terms.mk_bitvec(BigInt::from(3), width);
+    let s_plus_3 = terms.mk_bvadd(vec![s, three]);
+    assert_eq!(
+        NormalizeBvArith::modular_poly_compare(&terms, s, s_plus_3, width),
+        PolyRelation::NotEqual,
+    );
+    // Same-width wraparound twin: offset 0 is a genuine identity.
+    let zero = terms.mk_bitvec(BigInt::from(0), width);
+    let s_plus_0 = terms.mk_bvadd(vec![s, zero]);
+    assert_eq!(
+        NormalizeBvArith::modular_poly_compare(&terms, s, s_plus_0, width),
+        PolyRelation::Equal,
+    );
+    // Different cores: proves nothing either way (Unknown), even with
+    // different offsets — the fold must decline.
+    let one = terms.mk_bitvec(BigInt::from(1), width);
+    let two = terms.mk_bitvec(BigInt::from(2), width);
+    let a_plus_1 = terms.mk_bvadd(vec![a, one]);
+    let b_plus_2 = terms.mk_bvadd(vec![b, two]);
+    assert_eq!(
+        NormalizeBvArith::modular_poly_compare(&terms, a_plus_1, b_plus_2, width),
+        PolyRelation::Unknown,
+    );
+}
+
+#[test]
+fn test_normalize_folds_always_false_affine_equality() {
+    // End-to-end through the pass: an ite guarded by `x = x + 3` must
+    // normalize to its else-branch once the condition folds to false.
+    let width = 32;
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(width));
+    let three = terms.mk_bitvec(BigInt::from(3), width);
+    let x_plus_3 = terms.mk_bvadd(vec![x, three]);
+    let cond = terms.mk_eq(x, x_plus_3);
+    let one = terms.mk_bitvec(BigInt::from(1), width);
+    let two = terms.mk_bitvec(BigInt::from(2), width);
+    let ite = terms.mk_ite(cond, one, two);
+    let mut pass = NormalizeBvArith::new();
+    let normalized = pass.normalize(&mut terms, ite);
+    assert_eq!(
+        normalized, two,
+        "ite with always-false affine condition must fold to else-branch"
+    );
+}
+
+#[test]
 fn test_poly_fingerprint_declines_width_one_semantic_only_identity() {
     // x*x = x holds semantically at width 1 but the FORMAL polynomials
     // (x^2 vs x) differ, so the fold must decline — bit-blasting decides it.

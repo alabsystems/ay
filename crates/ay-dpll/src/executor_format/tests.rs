@@ -168,10 +168,11 @@ fn format_model_atom_quotes_uninterpreted_values() {
 #[test]
 fn format_default_value_produces_smt_lib_defaults() {
     let context = ay_frontend::Context::new();
-    let format = |sort: &Sort| format_default_value_surface(&context, sort);
+    let format = |sort: &Sort| format_default_value_surface(&context, sort).unwrap();
     assert_eq!(format(&Sort::Bool), "false");
     assert_eq!(format(&Sort::Int), "0");
     assert_eq!(format(&Sort::Real), "0.0");
+    assert_eq!(format(&Sort::Complex), "(complex.make 0.0 0.0)");
     assert_eq!(format(&Sort::String), "\"\"");
     assert_eq!(format(&Sort::RegLan), "re.none");
     // width%4==0 uses hex (#1793)
@@ -194,6 +195,19 @@ fn format_default_value_produces_smt_lib_defaults() {
         format(&Sort::array(Sort::Int, Sort::Bool)),
         "((as const (Array Int Bool)) false)"
     );
+}
+
+#[test]
+fn finite_field_output_cancellation_refuses_canonical_and_default_literals() {
+    let context = ay_frontend::Context::new();
+    let field = ay_core::FiniteFieldSort::new(7).unwrap();
+    assert!(format_field_literal_surface(&context, 1, field, || false).is_none());
+    assert!(format_default_value_surface_with_poll(
+        &context,
+        &Sort::array(Sort::Bool, Sort::FiniteField(field)),
+        &mut || false,
+    )
+    .is_none());
 }
 
 // NOTE: the former `format_value(sort, Option<bool>, ..)` — which fabricated a

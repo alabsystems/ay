@@ -34,7 +34,7 @@ use num_traits::Signed;
 
 use super::{
     alloc_sort, cache_ast_vector, cache_func_decl, cache_func_decl_with_symbol, cache_func_entry,
-    cache_func_interp, cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
+    cache_func_interp, cache_string, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_produced,
     ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, require_term_ast_or_return,
     term_to_ast, ModelHandle, ParamsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
     Z3_func_decl, Z3_func_entry, Z3_func_interp, Z3_model, Z3_params, Z3_sort, Z3_symbol,
@@ -42,15 +42,25 @@ use super::{
 
 // ---- Snapshot-model helpers ----
 
+mod floating_point;
+mod symbolic_else;
+mod value_folds;
+
 /// Sort implied by a scalar model value, if it is one.
 fn scalar_value_sort(val: &ModelValue) -> Option<Sort> {
     match val {
         ModelValue::Bool(_) => Some(Sort::Bool),
         ModelValue::Int(_) => Some(Sort::Int),
         ModelValue::Real(_) => Some(Sort::Real),
+        ModelValue::FiniteField { field, .. } => Some(Sort::FiniteField(*field)),
         ModelValue::BitVec { width, .. } => Some(Sort::bitvec(*width)),
         ModelValue::String(_) => Some(Sort::String),
+        ModelValue::FloatingPointExact(fields) => Some(Sort::FloatingPoint(
+            fields.exponent_bits(),
+            fields.significand_bits(),
+        )),
         ModelValue::FloatingPoint { eb, sb, .. }
+        | ModelValue::FloatingPointWide { eb, sb, .. }
         | ModelValue::FloatingPointSpecial { eb, sb, .. } => Some(Sort::FloatingPoint(*eb, *sb)),
         _ => None,
     }
@@ -72,7 +82,9 @@ fn infer_array_sort(default: &ModelValue, stores: &[(ModelValue, ModelValue)]) -
 ///
 /// Model entries are keyed by name; the declared sort is the authoritative
 /// sort for non-scalar entries (arrays, sequences, datatypes, uninterpreted).
-fn declared_sorts(solver: &Solver) -> StdHashMap<String, Sort> {
+type DeclaredSorts = ay_core::kani_compat::DetHashMap<String, Sort>;
+
+fn declared_sorts(solver: &Solver) -> DeclaredSorts {
     solver
         .declared_variables()
         .map(|(name, term)| (name.to_string(), solver.term_sort(term)))
@@ -82,7 +94,7 @@ fn declared_sorts(solver: &Solver) -> StdHashMap<String, Sort> {
 /// Resolve the sort for a named model entry: declared sort first, then the
 /// sort implied by the value, then a defensive fallback (so enumeration can
 /// never drop an entry and misalign `num_consts` with `get_const_decl`).
-fn resolve_entry_sort(declared: &StdHashMap<String, Sort>, name: &str, val: &ModelValue) -> Sort {
+fn resolve_entry_sort(declared: &DeclaredSorts, name: &str, val: &ModelValue) -> Sort {
     if let Some(sort) = declared.get(name) {
         return sort.clone();
     }
@@ -130,6 +142,9 @@ fn model_entries(solver: &Solver, model: &Model) -> Vec<(String, Sort)> {
     for (name, (_, width)) in model.iter_bvs() {
         entries.push((name.to_string(), Sort::bitvec(*width)));
     }
+    for (name, value) in model.iter_finite_fields() {
+        entries.push((name.to_string(), resolve_entry_sort(&declared, name, value)));
+    }
     for (name, _) in model.iter_strings() {
         entries.push((name.to_string(), Sort::String));
     }
@@ -160,14 +175,28 @@ fn model_entries(solver: &Solver, model: &Model) -> Vec<(String, Sort)> {
     entries
 }
 
-fn model_entry_display_name(ctx: &Z3Context, identity: &str) -> String {
-    let display = ctx
+pub(crate) fn model_entry_display_name(ctx: &Z3Context, identity: &str) -> String {
+    model_entry_display_name_owned(ctx, identity, None)
+}
+
+fn model_entry_display_name_owned(
+    ctx: &Z3Context,
+    identity: &str,
+    owner: ay_core::render_admission::Owner<'_>,
+) -> String {
+    let symbol = ctx
         .ffi_const_terms_by_identity
         .get(identity)
         .and_then(|term| ctx.ffi_const_metadata.get(term))
-        .map(|(_, symbol)| symbol.display_name())
-        .unwrap_or_else(|| identity.to_string());
-    ay_core::quote_symbol(&display)
+        .map(|(_, symbol)| symbol);
+    match symbol {
+        Some(super::SymbolKey::String(name)) => ay_core::render_admission::quote(owner, name),
+        Some(super::SymbolKey::Integer(value)) => {
+            let display = ay_core::render_admission::format(owner, format_args!("s!{value}"));
+            ay_core::render_admission::quote(owner, &display)
+        }
+        None => ay_core::render_admission::quote(owner, identity),
+    }
 }
 
 /// Convert a snapshot [`ModelValue`] into a value TERM of the given sort.
@@ -195,22 +224,18 @@ pub(crate) fn model_value_to_term(
             let denom = num_bigint::BigInt::from(1);
             Some(solver.rational_const_bigint(n, &denom))
         }
+        ModelValue::FiniteField { value, field }
+            if sort == &Sort::FiniteField(*field) && *value < field.modulus() =>
+        {
+            Some(solver.finite_field_const(&(*value).into(), *field))
+        }
         ModelValue::Int(n) => Some(solver.int_const_bigint(n)),
         ModelValue::Real(r) => Some(solver.rational_const_bigint(r.numer(), r.denom())),
         ModelValue::BitVec { value, width } => Some(solver.bv_const_bigint(value, *width)),
         ModelValue::String(s) => Some(solver.string_const(s)),
-        ModelValue::FloatingPoint {
-            sign,
-            exponent,
-            significand,
-            eb,
-            sb,
-        } => {
-            let sign_bv = solver.bv_const(i64::from(*sign), 1);
-            let exp_bv = solver.bv_const(*exponent as i64, *eb);
-            let sig_bv = solver.bv_const(*significand as i64, *sb - 1);
-            Some(solver.fp_from_bvs(sign_bv, exp_bv, sig_bv, *eb, *sb))
-        }
+        ModelValue::FloatingPoint { .. }
+        | ModelValue::FloatingPointWide { .. }
+        | ModelValue::FloatingPointExact(_) => floating_point::value_to_term(solver, val, sort),
         ModelValue::FloatingPointSpecial { kind, eb, sb } => match kind {
             FpSpecialKind::PosZero => Some(solver.fp_plus_zero(*eb, *sb)),
             FpSpecialKind::NegZero => Some(solver.fp_minus_zero(*eb, *sb)),
@@ -223,7 +248,28 @@ pub(crate) fn model_value_to_term(
             // An element of an uninterpreted sort is a constant of that sort
             // whose name is the element token (hash-consed: the same element
             // always resolves to the same term).
-            Sort::Uninterpreted(_) => Some(solver.declare_const(element, sort.clone())),
+            //
+            // A sort the API sees as uninterpreted may be a datatype a parsed
+            // text declared (its carrier name resolves to the datatype): the
+            // token is then that datatype's nullary constructor. Any other
+            // refusal leaves the value unrepresented rather than panicking
+            // across the FFI boundary (measured: a text-declared enum value
+            // `red` panicked in `declare_const`).
+            Sort::Uninterpreted(name) => match solver.try_declare_const(element, sort.clone()) {
+                Ok(term) => Some(term),
+                Err(_) => match solver.resolve_sort_name(name) {
+                    Some(datatype @ Sort::Datatype(_)) => {
+                        model_value_to_term(solver, val, &datatype)
+                    }
+                    _ => None,
+                },
+            },
+            // A type variable lowers to the uninterpreted sort of its name;
+            // its elements are that sort's (one term per element, whichever
+            // spelling of the sort asks first).
+            Sort::TypeVar(name) => solver
+                .try_declare_const(element, Sort::Uninterpreted(name.clone()))
+                .ok(),
             // A bare symbol at a DATATYPE sort is a nullary constructor (an enum
             // literal like `blue`). The model-text parser stores it in the model's
             // uninterpreted map because a lone symbol is syntactically
@@ -329,9 +375,14 @@ fn default_value_term(solver: &mut Solver, sort: &Sort) -> Option<Term> {
             let one = num_bigint::BigInt::from(1);
             Some(solver.rational_const_bigint(&zero, &one))
         }
+        Sort::FiniteField(field) => Some(solver.finite_field_const(&0.into(), *field)),
         Sort::BitVec(bv) => Some(solver.bv_const(0, bv.width)),
         Sort::String => Some(solver.string_const("")),
-        Sort::FloatingPoint(eb, sb) => Some(solver.fp_plus_zero(*eb, *sb)),
+        // z3 completes a floating-point constant with NaN (measured on 5.1:
+        // `m.eval(f, model_completion=True)` is `NaN`, an array of them
+        // `K(Int, NaN)`). The published-model backstop reads completion as z3
+        // does, so a model only `+zero` satisfies is not published.
+        Sort::FloatingPoint(eb, sb) => Some(solver.fp_nan(*eb, *sb)),
         Sort::Seq(element) => Some(solver.seq_empty((**element).clone())),
         Sort::Array(arr) => {
             let default = default_value_term(solver, &arr.element_sort)?;
@@ -339,17 +390,23 @@ fn default_value_term(solver: &mut Solver, sort: &Sort) -> Option<Term> {
         }
         // `RoundingMode` is a FIXED 5-element FP domain, not an open
         // uninterpreted universe: a `RoundingMode!val!0` fresh element is NOT a
-        // valid value of the sort (z3 rejects a model carrying it). Complete an
-        // unconstrained RM constant with a concrete IEEE-default mode, mirroring
-        // the SMT-LIB completion path (`completion.rs`
-        // `unconstrained_default_value`) which returns `roundNearestTiesToEven`
-        // (#P0.2 symbolic RoundingMode).
-        Sort::Uninterpreted(name) if name == "RoundingMode" => Some(solver.fp_rounding_mode("RNE")),
+        // valid value of the sort (z3 rejects a model carrying it). z3's API
+        // completes an unconstrained rounding-mode constant with
+        // `roundTowardZero` (measured on 5.1: `RTZ()`), and the published-model
+        // backstop must read completion as z3 does (#P0.2 symbolic
+        // RoundingMode).
+        Sort::Uninterpreted(name) if name == "RoundingMode" => Some(solver.fp_rounding_mode("RTZ")),
         // Z3 completes an uninterpreted-sort constant with a fresh universe
         // element (`S!val!0`); the same token is reused deterministically.
         Sort::Uninterpreted(name) => {
             let element = format!("{name}!val!0");
-            Some(solver.declare_const(&element, sort.clone()))
+            solver.try_declare_const(&element, sort.clone()).ok()
+        }
+        Sort::TypeVar(name) => {
+            let element = format!("{name}!val!0");
+            solver
+                .try_declare_const(&element, Sort::Uninterpreted(name.clone()))
+                .ok()
         }
         // Datatype / RegLan / future sorts: no faithful default — leave the
         // constant symbolic rather than invent a value.
@@ -363,24 +420,34 @@ fn default_value_term(solver: &mut Solver, sort: &Sort) -> Option<Term> {
 /// base under a store chain — because [`ModelValue`]'s own `Display` prints the
 /// bare default as the chain base, which is not well-formed SMT-LIB. Every
 /// other variant's `Display` is already SMT-LIB shaped.
-fn render_model_value_smtlib(val: &ModelValue, sort: &Sort) -> String {
-    match (val, sort) {
+fn render_model_value_smtlib(ctx: &Z3Context, val: &ModelValue, sort: &Sort) -> Option<String> {
+    Some(match (val, sort) {
+        (ModelValue::FiniteField { value, field }, Sort::FiniteField(expected))
+            if field == expected =>
+        {
+            return ctx
+                .solver
+                .format_finite_field_literal_with_bindings(*value, *field, |name| {
+                    ctx.ffi_used_decl_names.contains(name)
+                });
+        }
+        (ModelValue::FiniteField { .. }, _) => return None,
         (ModelValue::Array { default, stores }, Sort::Array(arr)) => {
             let mut text = format!(
                 "((as const {sort}) {})",
-                render_model_value_smtlib(default, &arr.element_sort)
+                render_model_value_smtlib(ctx, default, &arr.element_sort)?
             );
             for (index, value) in stores {
                 text = format!(
                     "(store {text} {} {})",
-                    render_model_value_smtlib(index, &arr.index_sort),
-                    render_model_value_smtlib(value, &arr.element_sort)
+                    render_model_value_smtlib(ctx, index, &arr.index_sort)?,
+                    render_model_value_smtlib(ctx, value, &arr.element_sort)?
                 );
             }
             text
         }
         _ => val.to_string(),
-    }
+    })
 }
 
 /// Collect every uninterpreted-sort ELEMENT constant appearing inside the
@@ -496,6 +563,112 @@ fn fold_element_predicates(
     solver.simplify(substituted)
 }
 
+/// A ground array value — a `store` chain over a `const-array` whose indices
+/// and values are all literal constants — as its default plus explicit points
+/// (the outermost store of an index wins). `None` for any other term.
+fn ground_array_value(solver: &Solver, term: Term) -> Option<(Term, StdHashMap<Term, Term>)> {
+    let mut points: StdHashMap<Term, Term> = StdHashMap::new();
+    let mut current = term;
+    loop {
+        let TermKind::App { name, num_args } = solver.term_kind(current) else {
+            return None;
+        };
+        let children = solver.term_children(current);
+        match (name.as_str(), num_args) {
+            ("const-array", 1) => {
+                let default = children[0];
+                return matches!(solver.term_kind(default), TermKind::Const)
+                    .then_some((default, points));
+            }
+            ("store", 3) => {
+                let (index, value) = (children[1], children[2]);
+                if !matches!(solver.term_kind(index), TermKind::Const)
+                    || !matches!(solver.term_kind(value), TermKind::Const)
+                {
+                    return None;
+                }
+                points.entry(index).or_insert(value);
+                current = children[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Decide `a = b` for two ground array values, when it is decided: literal
+/// constants are hash-consed, so two literals are equal iff they are the same
+/// term. Arrays with different defaults differ when the index sort is
+/// infinite (Int, Real); over a finite index sort explicit points could cover
+/// every index, so that case is left undecided.
+fn ground_array_values_equal(solver: &Solver, a: Term, b: Term) -> Option<bool> {
+    let (default_a, points_a) = ground_array_value(solver, a)?;
+    let (default_b, points_b) = ground_array_value(solver, b)?;
+    let read = |points: &StdHashMap<Term, Term>, default: Term, index: &Term| {
+        points.get(index).copied().unwrap_or(default)
+    };
+    let points_agree = points_a
+        .keys()
+        .chain(points_b.keys())
+        .all(|index| read(&points_a, default_a, index) == read(&points_b, default_b, index));
+    if default_a == default_b {
+        return Some(points_agree);
+    }
+    let Sort::Array(array) = solver.term_sort(a) else {
+        return None;
+    };
+    matches!(array.index_sort, Sort::Int | Sort::Real).then_some(false)
+}
+
+/// Fold `=` / `distinct` over ground array values (z3's evaluator decides
+/// `K(Int, 0) != K(Int, 1)` to `true`; the generic simplifier leaves it).
+fn fold_ground_array_equalities(solver: &mut Solver, root: Term) -> Term {
+    let mut stack = vec![root];
+    let mut seen: HashSet<Term> = HashSet::new();
+    let (mut from, mut to) = (Vec::new(), Vec::new());
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        let children = solver.term_children(term);
+        if let TermKind::App { name, num_args } = solver.term_kind(term) {
+            if (name == "=" || name == "distinct")
+                && num_args >= 2
+                && matches!(solver.term_sort(children[0]), Sort::Array(_))
+            {
+                let mut decided = Some(true);
+                'pairs: for (i, &left) in children.iter().enumerate() {
+                    for &right in &children[i + 1..] {
+                        match ground_array_values_equal(solver, left, right) {
+                            None => {
+                                decided = None;
+                                break 'pairs;
+                            }
+                            Some(equal) => {
+                                let holds = if name == "=" { equal } else { !equal };
+                                if !holds {
+                                    decided = Some(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(value) = decided {
+                    let literal = solver.bool_const(value);
+                    from.push(term);
+                    to.push(literal);
+                    continue;
+                }
+            }
+        }
+        stack.extend(children);
+    }
+    if from.is_empty() {
+        return root;
+    }
+    let substituted = solver.substitute(root, &from, &to);
+    solver.simplify(substituted)
+}
+
 // ---- Snapshot FUNCTION interpretations (arity > 0) ----
 
 /// A function interpretation captured from the engine's raw model text.
@@ -525,7 +698,22 @@ pub(crate) struct FuncInterp {
     /// Explicit rows: argument tuple → value.
     pub(crate) rows: Vec<(Vec<ModelValue>, ModelValue)>,
     /// Value for every argument tuple no row matches (the final `else`).
+    /// `ModelValue::Unknown` when the else is the symbolic `else_term`.
     pub(crate) else_value: ModelValue,
+    /// A symbolic else: private parameter variables (argument `i`; never
+    /// declared constants of the context) and the body over them (`x0 + 1`
+    /// for `forall y. f(y) = y + 1`; see `symbolic_else`). `None` for a
+    /// literal table.
+    pub(crate) else_term: Option<(Vec<Term>, Term)>,
+}
+
+/// Every function interpretation of `model_text`: the literal tables plus
+/// the symbolic ones (`symbolic_else`).
+pub(crate) fn model_func_interps(solver: &mut Solver, model_text: &str) -> Vec<FuncInterp> {
+    let mut interps = parse_func_interps(model_text);
+    let symbolic = symbolic_else::symbolic_func_interps(solver, model_text, &interps);
+    interps.extend(symbolic);
+    interps
 }
 
 /// Parse a sort S-expression from a model `define-fun` parameter/result.
@@ -581,14 +769,22 @@ fn parse_literal_sexpr(sexpr: &ay_frontend::SExpr) -> Option<ModelValue> {
             let denom = BigInt::from(10u32).pow(u32::try_from(frac_part.len()).ok()?);
             Some(ModelValue::Real(BigRational::new(numer, denom)))
         }
-        SExpr::Hexadecimal(hex) => Some(ModelValue::BitVec {
-            value: BigInt::parse_bytes(hex.as_bytes(), 16)?,
-            width: u32::try_from(hex.len()).ok()?.checked_mul(4)?,
-        }),
-        SExpr::Binary(bits) => Some(ModelValue::BitVec {
-            value: BigInt::parse_bytes(bits.as_bytes(), 2)?,
-            width: u32::try_from(bits.len()).ok()?,
-        }),
+        // The S-expression lexer keeps the `#x` / `#b` prefix in the token
+        // text; the digits (and so the width) are what follows it.
+        SExpr::Hexadecimal(token) => {
+            let hex = token.strip_prefix("#x").unwrap_or(token);
+            Some(ModelValue::BitVec {
+                value: BigInt::parse_bytes(hex.as_bytes(), 16)?,
+                width: u32::try_from(hex.len()).ok()?.checked_mul(4)?,
+            })
+        }
+        SExpr::Binary(token) => {
+            let bits = token.strip_prefix("#b").unwrap_or(token);
+            Some(ModelValue::BitVec {
+                value: BigInt::parse_bytes(bits.as_bytes(), 2)?,
+                width: u32::try_from(bits.len()).ok()?,
+            })
+        }
         SExpr::String(text) => Some(ModelValue::String(text.clone())),
         // A bare symbol in a value position is an uninterpreted-sort element
         // token (e.g. `@S!0`).
@@ -748,9 +944,146 @@ pub(crate) fn parse_func_interps(model_text: &str) -> Vec<FuncInterp> {
             result_sort,
             rows,
             else_value,
+            else_term: None,
         });
     }
     out
+}
+
+/// Name of a top-level `define-fun` item of a raw model text.
+fn define_fun_name(item: &ay_frontend::SExpr) -> Option<&str> {
+    use ay_frontend::SExpr;
+    let SExpr::List(parts) = item else {
+        return None;
+    };
+    match parts.as_slice() {
+        [SExpr::Symbol(kw), SExpr::Symbol(name), ..] if kw == "define-fun" => Some(name),
+        _ => None,
+    }
+}
+
+/// The engine's raw model text with every top-level `define-fun` whose name is
+/// not in `keep` removed. Other items (declarations of model universe
+/// elements) are kept. The text is returned verbatim when nothing is removed or
+/// when it does not parse (an unparsable text yields no function tables
+/// anyway); otherwise the kept items are re-rendered with the parser-faithful
+/// raw renderer.
+pub(crate) fn retain_model_text_symbols(
+    model_text: &str,
+    keep: &std::collections::BTreeSet<String>,
+) -> String {
+    use ay_frontend::SExpr;
+    let Ok(root) = ay_frontend::sexp::parse_sexp(model_text) else {
+        return model_text.to_string();
+    };
+    let SExpr::List(ref items) = root else {
+        return model_text.to_string();
+    };
+    let dropped = |item: &SExpr| define_fun_name(item).is_some_and(|name| !keep.contains(name));
+    if !items.iter().any(dropped) {
+        return model_text.to_string();
+    }
+    let kept: Vec<String> = items
+        .iter()
+        .filter(|&item| !dropped(item))
+        .map(SExpr::to_raw_string)
+        .collect();
+    format!("(\n  {}\n)", kept.join("\n  "))
+}
+
+/// Constants (`define-fun` with no parameters) of the raw model text that the
+/// parsed constants-only [`Model`] does not carry, with their printed value.
+///
+/// The parser drops a value it cannot represent (e.g. an irrational algebraic
+/// `(root-obj ...)`), so a non-empty result means the published model would
+/// silently lose an assignment the engine's validated model relies on.
+pub(crate) fn unrepresented_model_constants(
+    model_text: &str,
+    model: &Model,
+) -> Vec<(String, String)> {
+    use ay_frontend::SExpr;
+    let Ok(root) = ay_frontend::sexp::parse_sexp(model_text) else {
+        return Vec::new();
+    };
+    let SExpr::List(ref items) = root else {
+        return Vec::new();
+    };
+    let mut missing = Vec::new();
+    for item in items {
+        let SExpr::List(parts) = item else { continue };
+        let [SExpr::Symbol(kw), SExpr::Symbol(name), SExpr::List(params), _sort, body] =
+            parts.as_slice()
+        else {
+            continue;
+        };
+        if kw == "define-fun" && params.is_empty() && model.value_by_name(name).is_none() {
+            missing.push((name.clone(), body.to_raw_string()));
+        }
+    }
+    missing
+}
+
+/// Function `define-fun`s (arity > 0) of the raw model text that the parsed
+/// tables `interps` do not carry WHOLE, with their printed body.
+///
+/// A table is carried whole when [`parse_func_interps`] produced it (same name
+/// and arity) and every row argument, row value and the else value converts to
+/// a term at its declared sort — exactly what `Z3_model_get_func_interp` and
+/// `Z3_model_eval` will build from it. Anything else (a body that is not a
+/// literal table, e.g. `(+ x0 1)`; a value the reader cannot carry) would make
+/// the published function differ from the one the engine validated.
+pub(crate) fn unrepresented_function_tables(
+    solver: &mut Solver,
+    model_text: &str,
+    interps: &[FuncInterp],
+) -> Vec<(String, String)> {
+    use ay_frontend::SExpr;
+    let Ok(root) = ay_frontend::sexp::parse_sexp(model_text) else {
+        return vec![(
+            "<model>".to_string(),
+            "an unreadable model text".to_string(),
+        )];
+    };
+    let SExpr::List(ref items) = root else {
+        return vec![(
+            "<model>".to_string(),
+            "an unreadable model text".to_string(),
+        )];
+    };
+    let mut missing = Vec::new();
+    for item in items {
+        let SExpr::List(parts) = item else { continue };
+        let [SExpr::Symbol(kw), SExpr::Symbol(name), SExpr::List(params), _sort, body] =
+            parts.as_slice()
+        else {
+            continue;
+        };
+        if kw != "define-fun" || params.is_empty() {
+            continue;
+        }
+        let carried = interps
+            .iter()
+            .find(|fi| fi.name == *name && fi.param_sorts.len() == params.len())
+            .is_some_and(|fi| func_interp_converts(solver, fi));
+        if !carried {
+            missing.push((name.clone(), body.to_raw_string()));
+        }
+    }
+    missing
+}
+
+/// Every row and the else value of `fi` convert to terms at their sorts.
+fn func_interp_converts(solver: &mut Solver, fi: &FuncInterp) -> bool {
+    (fi.else_term.is_some()
+        || model_value_to_term(solver, &fi.else_value, &fi.result_sort).is_some())
+        && fi.rows.iter().all(|(args, value)| {
+            args.len() == fi.param_sorts.len()
+                && args
+                    .iter()
+                    .zip(&fi.param_sorts)
+                    .all(|(arg, sort)| model_value_to_term(solver, arg, sort).is_some())
+                && model_value_to_term(solver, value, &fi.result_sort).is_some()
+        })
 }
 
 /// Count the arity > 0 `define-fun`s in the raw model text — INCLUDING those
@@ -802,6 +1135,12 @@ fn parse_function_table_accepts_ascribed_uninterpreted_arguments() {
     assert_eq!(interps[0].else_value, ModelValue::Bool(false));
 }
 
+/// The free constants of `root` (outside every binder of the same name);
+/// `None` when the scopes cannot be separated (see `value_folds`).
+pub(crate) fn scoped_free_leaves(solver: &Solver, root: Term) -> Option<Vec<Term>> {
+    value_folds::scoped_leaves(solver, root).map(|leaves| leaves.free)
+}
+
 /// One round of resolving ground uninterpreted-function applications against
 /// the snapshot's function tables.
 ///
@@ -814,8 +1153,9 @@ fn resolve_uf_round(
     root: Term,
     interps: &[FuncInterp],
     elements: &StdHashMap<Term, String>,
+    scope: &UfScope<'_>,
 ) -> (Term, Vec<Term>) {
-    if interps.is_empty() {
+    if interps.is_empty() && scope.absent_functions.is_empty() {
         return (root, Vec::new());
     }
     let mut stack = vec![root];
@@ -832,9 +1172,16 @@ fn resolve_uf_round(
                 .iter()
                 .find(|fi| fi.name == name && fi.param_sorts.len() == num_args)
             {
-                let determined = children.iter().all(|&arg| {
-                    matches!(solver.term_kind(arg), TermKind::Const) || elements.contains_key(&arg)
-                });
+                // A table with no rows and a literal `else` is that constant
+                // everywhere, whatever the arguments (`fSeq(seq.unit 0)` under
+                // `fSeq = [else -> 1]`); otherwise a row lookup needs literal
+                // arguments.
+                let constant = interp.rows.is_empty() && interp.else_term.is_none();
+                let determined = constant
+                    || children.iter().all(|&arg| {
+                        matches!(solver.term_kind(arg), TermKind::Const)
+                            || elements.contains_key(&arg)
+                    });
                 if determined {
                     let result_sort = solver.term_sort(term);
                     if let Some(value_term) =
@@ -844,6 +1191,27 @@ fn resolve_uf_round(
                         to.push(value_term);
                         continue;
                     }
+                } else if children
+                    .iter()
+                    .any(|&arg| value_folds::mentions_any(solver, arg, scope.bound))
+                {
+                    // An application at a quantifier's variable is the table
+                    // itself, as a first-match `ite` over the rows.
+                    let result_sort = solver.term_sort(term);
+                    if let Some(table) = table_term(solver, interp, &children, &result_sort) {
+                        from.push(term);
+                        to.push(table);
+                        continue;
+                    }
+                }
+            } else if num_args > 0 && scope.absent_functions.contains(&name) {
+                // Model completion: z3 gives a function the model does not
+                // interpret its sort's default everywhere.
+                let result_sort = solver.term_sort(term);
+                if let Some(value_term) = default_value_term(solver, &result_sort) {
+                    from.push(term);
+                    to.push(value_term);
+                    continue;
                 }
             }
         }
@@ -854,6 +1222,45 @@ fn resolve_uf_round(
     }
     let substituted = solver.substitute(root, &from, &to);
     (solver.simplify(substituted), to)
+}
+
+/// What UF resolution may use besides the tables: the bound-variable
+/// occurrences of the evaluated term, and the caller's functions the model
+/// leaves uninterpreted (empty without model completion).
+struct UfScope<'a> {
+    bound: &'a HashSet<Term>,
+    absent_functions: HashSet<String>,
+}
+
+/// `interp` applied to arbitrary `args`: `ite(args = row₁, v₁, …, else)`.
+fn table_term(
+    solver: &mut Solver,
+    interp: &FuncInterp,
+    args: &[Term],
+    result_sort: &Sort,
+) -> Option<Term> {
+    let mut table = if interp.else_term.is_some() {
+        symbolic_else::instantiate_else(solver, interp, args)?
+    } else {
+        model_value_to_term(solver, &interp.else_value, result_sort)?
+    };
+    for (row_args, row_value) in interp.rows.iter().rev() {
+        if row_args.len() != args.len() {
+            return None;
+        }
+        let mut conditions = Vec::with_capacity(args.len());
+        for ((row_arg, param_sort), &arg) in row_args.iter().zip(&interp.param_sorts).zip(args) {
+            let row_term = model_value_to_term(solver, row_arg, param_sort)?;
+            conditions.push(solver.try_eq(arg, row_term).ok()?);
+        }
+        let condition = match conditions.as_slice() {
+            [single] => *single,
+            _ => solver.try_and_many(&conditions).ok()?,
+        };
+        let value = model_value_to_term(solver, row_value, result_sort)?;
+        table = solver.try_ite(condition, value, table).ok()?;
+    }
+    Some(table)
 }
 
 /// Match a determined argument tuple against a function table.
@@ -889,35 +1296,10 @@ fn lookup_uf_value(
             return model_value_to_term(solver, row_value, result_sort);
         }
     }
-    model_value_to_term(solver, &interp.else_value, result_sort)
-}
-
-/// Collect the distinct named-constant leaves of `term` (post-order over the
-/// hash-consed DAG, deduplicated).
-///
-/// Returns `None` if the term contains a binder (`forall`/`exists`/`let`):
-/// substituting under binders is not capture-safe, so `Z3_model_eval` refuses
-/// those terms honestly instead of risking a wrong evaluation.
-fn collect_named_leaves(solver: &Solver, root: Term) -> Option<Vec<Term>> {
-    let mut stack = vec![root];
-    let mut seen: HashSet<Term> = HashSet::new();
-    let mut leaves = Vec::new();
-    while let Some(term) = stack.pop() {
-        if !seen.insert(term) {
-            continue;
-        }
-        match solver.term_kind(term) {
-            TermKind::Forall | TermKind::Exists | TermKind::Let => return None,
-            TermKind::Var { .. } => leaves.push(term),
-            TermKind::Const => {}
-            TermKind::App { .. } | TermKind::Not | TermKind::Ite => {
-                stack.extend(solver.term_children(term));
-            }
-            // Future TermKind variants: treat as opaque (leave symbolic).
-            _ => {}
-        }
+    if interp.else_term.is_some() {
+        return symbolic_else::instantiate_else(solver, interp, args);
     }
-    Some(leaves)
+    model_value_to_term(solver, &interp.else_value, result_sort)
 }
 
 // ---- Model operations ----
@@ -961,7 +1343,444 @@ pub unsafe extern "C" fn Z3_model_get_num_consts(_c: Z3_context, m: Z3_model) ->
     }
 }
 
-/// Convert model to string.
+/// Use the existing typed model renderer for an owned reconstructed scalar
+/// model. Prepay decimal/binary text and formatting scratch before rendering;
+/// this operation does not create retained output-memory custody.
+pub(crate) fn render_converted_model_text(
+    ctx: &Z3Context,
+    model: Model,
+    decision: &ay_dpll::api::TacticDecision,
+) -> Option<(Model, String)> {
+    if !decision.validate(&ctx.solver) {
+        return None;
+    }
+    let declared = counted_declared_sorts(ctx, decision)?;
+    if !decision.validate(&ctx.solver) {
+        return None;
+    }
+    let handle = ModelHandle {
+        model,
+        func_interps: Vec::new(),
+        complete_functions: false,
+        user_const_interps: Vec::new(),
+        user_func_interps: Vec::new(),
+        rec_def_count: 0,
+        _ctx: ptr::null_mut(),
+    };
+    let admission = RendererAdmission { ctx, decision };
+    let owner = Some(&admission as &dyn ay_core::term::TermConstructionAdmission);
+    if scalar_model_surface(&handle, &declared, owner)? != ModelSurface::PublicScalar {
+        return None;
+    }
+    let text =
+        render_model_handle_with_sorts(ctx, &handle, &declared, ModelSurface::NativeScalar, owner)?;
+    if !decision.validate(&ctx.solver) {
+        return None;
+    }
+    Some((handle.model, text))
+}
+
+pub(crate) fn render_model_handle_text(ctx: &Z3Context, handle: &ModelHandle) -> Option<String> {
+    let declared = declared_sorts(&ctx.solver);
+    let surface = scalar_model_surface(handle, &declared, None)?;
+    render_model_handle_with_sorts(ctx, handle, &declared, surface, None)
+}
+
+struct RendererAdmission<'a> {
+    ctx: &'a Z3Context,
+    decision: &'a ay_dpll::api::TacticDecision,
+}
+impl ay_core::term::TermConstructionAdmission for RendererAdmission<'_> {
+    fn admit(
+        &self,
+        work: usize,
+        bytes: usize,
+    ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
+        let original = self.decision.admission();
+        // Enter the original guarded payment before invoking source polls;
+        // callback reentry must pass its existing no-reentry fence too.
+        original.admit(work, bytes)?;
+        if self.decision.validate(&self.ctx.solver) {
+            Ok(())
+        } else {
+            use ay_core::original_query::{
+                CountedAdmissionError, OriginalAdmissionError, QueryError,
+            };
+            Err(original.refuse(CountedAdmissionError::Original(
+                OriginalAdmissionError::Query(QueryError::Invalid(
+                    "tactic renderer source changed",
+                )),
+            )))
+        }
+    }
+    fn refuse(
+        &self,
+        error: ay_core::original_query::CountedAdmissionError,
+    ) -> ay_core::original_query::CountedAdmissionError {
+        self.decision.admission().refuse(error)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelSurface {
+    GeneralProjection,
+    PublicScalar,
+    NativeScalar,
+}
+
+fn scalar_model_surface(
+    handle: &ModelHandle,
+    declared: &DeclaredSorts,
+    owner: ay_core::render_admission::Owner<'_>,
+) -> Option<ModelSurface> {
+    let model = &handle.model;
+    if !handle.func_interps.is_empty()
+        || !handle.user_const_interps.is_empty()
+        || !handle.user_func_interps.is_empty()
+        || model.iter_strings().next().is_some()
+        || model.iter_fps().next().is_some()
+        || model.iter_arrays().next().is_some()
+        || model.iter_seqs().next().is_some()
+        || model.iter_datatypes().next().is_some()
+        || model.iter_uninterpreteds().next().is_some()
+    {
+        return Some(ModelSurface::GeneralProjection);
+    }
+    let supported = |name: &str, sort: Sort| -> Option<bool> {
+        if !ay_core::render_admission::pay(owner, name.len().checked_add(1)?, 0) {
+            return None;
+        }
+        Some(declared.get(name).is_none_or(|actual| actual == &sort))
+    };
+    for (name, _) in model.iter_bools() {
+        if !supported(name, Sort::Bool)? {
+            return Some(ModelSurface::GeneralProjection);
+        }
+    }
+    for (name, _) in model.iter_ints() {
+        if !supported(name, Sort::Int)? {
+            return Some(ModelSurface::GeneralProjection);
+        }
+    }
+    for (name, _) in model.iter_reals() {
+        if !supported(name, Sort::Real)? {
+            return Some(ModelSurface::GeneralProjection);
+        }
+    }
+    for (name, (_, width)) in model.iter_bvs() {
+        if *width == 0 || !supported(name, Sort::bitvec(*width))? {
+            return Some(ModelSurface::GeneralProjection);
+        }
+    }
+    for (name, value) in model.iter_finite_fields() {
+        let ModelValue::FiniteField { field, .. } = value else {
+            return Some(ModelSurface::GeneralProjection);
+        };
+        if !supported(name, Sort::FiniteField(*field))? {
+            return Some(ModelSurface::GeneralProjection);
+        }
+    }
+    Some(ModelSurface::PublicScalar)
+}
+
+fn counted_declared_sorts(
+    ctx: &Z3Context,
+    decision: &ay_dpll::api::TacticDecision,
+) -> Option<DeclaredSorts> {
+    let owner = decision.admission();
+    let mut result = DeclaredSorts::default();
+    if !decision.admit_declaration_scan(&ctx.solver) {
+        return None;
+    }
+    // This existing iterator borrows the native map without the sorted
+    // declared_variables() Vec. Lookup-map semantics do not depend on order.
+    for (name, term) in ctx.solver.declared_vars() {
+        owner.admit(name.len().checked_add(1)?, name.len()).ok()?;
+        if !decision.validate(&ctx.solver) {
+            return None;
+        }
+        if result.len() == result.capacity() {
+            for key in result.keys() {
+                owner.admit(key.len(), 0).ok()?;
+                if !decision.validate(&ctx.solver) {
+                    return None;
+                }
+            }
+        }
+        ay_core::term::reserve_map_counted(&mut result, 1, owner).ok()?;
+        if !decision.validate(&ctx.solver) {
+            return None;
+        }
+        ay_core::TermStore::inspect_sort_with_progress(
+            ctx.solver.var_sort(term)?,
+            &mut |work, bytes| owner.admit(work, bytes).is_ok() && decision.validate(&ctx.solver),
+        )
+        .ok()?;
+        if !decision.validate(&ctx.solver) {
+            return None;
+        }
+        result.insert(name.to_owned(), ctx.solver.var_sort(term)?.clone());
+    }
+    decision.validate(&ctx.solver).then_some(result)
+}
+
+#[cfg(test)]
+#[path = "model_params/owned_renderer_tests.rs"]
+mod owned_renderer_tests;
+
+fn render_model_handle_with_sorts(
+    ctx: &Z3Context,
+    handle: &ModelHandle,
+    declared: &DeclaredSorts,
+    surface: ModelSurface,
+    owner: ay_core::render_admission::Owner<'_>,
+) -> Option<String> {
+    if owner.is_some() && surface == ModelSurface::GeneralProjection {
+        return None;
+    }
+    let model = &handle.model;
+    // A recursive function is listed by the model but never printed
+    // (libz3 5.1.0: `fact` is in `m.decls()` and absent from
+    // `m.sexpr()`), so the text agrees with `Z3_model_get_func_interp`.
+    let recursive = |name: &str| ctx.rec_fun_defs.contains_key(name);
+    let mut parts = Vec::new();
+    macro_rules! text {
+        ($($args:tt)*) => { ay_core::render_admission::format(owner, format_args!($($args)*)) };
+    }
+    macro_rules! part {
+        ($value:expr) => {{
+            if !ay_core::render_admission::reserve(&mut parts, 1, owner) {
+                return None;
+            }
+            parts.push($value);
+        }};
+    }
+    macro_rules! display_name {
+        ($identity:expr) => {
+            match surface {
+                ModelSurface::NativeScalar => ay_core::render_admission::quote(owner, $identity),
+                _ => model_entry_display_name_owned(ctx, $identity, owner),
+            }
+        };
+    }
+    for (name, val) in model.iter_bools() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        part!(text!("(define-fun {display_name} () Bool {val})"));
+    }
+    for (name, val) in model.iter_ints() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        if let Some(owner) = owner {
+            let numeral = ay_dpll::format_bigint_with_admission(val, owner).ok()?;
+            part!(text!("(define-fun {display_name} () Int {numeral})"));
+            continue;
+        }
+        // A `Char` or finite-domain constant is an engine `Int`; its
+        // value is printed at its own sort, as libz3 5.1.0 prints
+        // `(define-fun c () Unicode (_ Char 104))` and
+        // `(define-fun x () S 1)`.
+        if let Some(text) = declared
+            .get(name)
+            .and_then(|sort| bounded_value_text(ctx, sort, val))
+        {
+            part!(text!("(define-fun {display_name} () {text})"));
+            continue;
+        }
+        if val.is_negative() {
+            let abs = val.abs();
+            part!(text!("(define-fun {display_name} () Int (- {abs}))"));
+        } else {
+            part!(text!("(define-fun {display_name} () Int {val})"));
+        }
+    }
+    for (name, val) in model.iter_reals() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        if let Some(owner) = owner {
+            let numeral = ay_dpll::format_rational_with_admission(val, owner).ok()?;
+            part!(text!("(define-fun {display_name} () Real {numeral})"));
+            continue;
+        }
+        if val.is_integer() {
+            let n = val.numer();
+            if n.is_negative() {
+                part!(text!("(define-fun {display_name} () Real (- {}))", n.abs()));
+            } else {
+                part!(text!("(define-fun {display_name} () Real {n}.0)"));
+            }
+        } else {
+            let n = val.numer();
+            let d = val.denom();
+            if n.is_negative() {
+                part!(text!(
+                    "(define-fun {display_name} () Real (- (/ {} {d})))",
+                    n.abs()
+                ));
+            } else {
+                part!(text!("(define-fun {display_name} () Real (/ {n} {d}))"));
+            }
+        }
+    }
+    for (name, (val, width)) in model.iter_bvs() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        // Canonical BV printer: `#x` only at multiple-of-4 widths, else
+        // `#b`. Open-coding hex here emitted `(_ BitVec 5) #x11`, whose
+        // numeral reparses as 8 bits and contradicts its own ascription.
+        let numeral = match owner {
+            Some(owner) => ay_dpll::format_bitvec_with_admission(val, *width, owner).ok()?,
+            None => ay_dpll::format_bitvec(val, *width),
+        };
+        part!(text!(
+            "(define-fun {display_name} () (_ BitVec {width}) {numeral})"
+        ));
+    }
+    for (name, val) in model.iter_strings() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        // Escape special characters for SMT-LIB string literal
+        let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
+        part!(text!("(define-fun {display_name} () String \"{escaped}\")"));
+    }
+    // Non-scalar entries: render with the entry's resolved sort and the
+    // value's SMT-LIB `Display` form (store chains for arrays, ctor
+    // applications for datatypes, element tokens for uninterpreted).
+    for (name, val) in model.iter_fps() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        let sort = resolve_entry_sort(&declared, name, val);
+        part!(text!("(define-fun {display_name} () {sort} {val})"));
+    }
+    for (name, val) in model.iter_seqs() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        let sort = resolve_entry_sort(&declared, name, val);
+        part!(text!("(define-fun {display_name} () {sort} {val})"));
+    }
+    for (name, val) in model.iter_arrays().chain(model.iter_finite_fields()) {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        let sort = resolve_entry_sort(&declared, name, val);
+        let rendered = match (owner, val) {
+            (Some(owner), ModelValue::FiniteField { value, field }) => {
+                ctx.solver.format_finite_field_literal_with_admission(
+                    *value,
+                    *field,
+                    |name| ctx.ffi_used_decl_names.contains(name),
+                    owner,
+                )?
+            }
+            _ => render_model_value_smtlib(ctx, val, &sort)?,
+        };
+        part!(text!("(define-fun {display_name} () {sort} {rendered})"));
+    }
+    for (name, val) in model.iter_datatypes() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        let sort = resolve_entry_sort(&declared, name, val);
+        part!(text!("(define-fun {display_name} () {sort} {val})"));
+    }
+    for (name, el) in model.iter_uninterpreteds() {
+        if recursive(name) {
+            continue;
+        }
+        let display_name = display_name!(name);
+        let sort = declared
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| Sort::Uninterpreted(el.to_string()));
+        part!(text!("(define-fun {display_name} () {sort} {el})"));
+    }
+    // Function interpretations (z3 prints them too: a model with only
+    // functions is not the empty string).
+    for fi in &handle.func_interps {
+        if recursive(&fi.name) {
+            continue;
+        }
+        let display_name = display_name!(&fi.name);
+        let params: Vec<String> = fi
+            .param_sorts
+            .iter()
+            .enumerate()
+            .map(|(i, sort)| text!("(x!{i} {sort})"))
+            .collect();
+        let mut body = match &fi.else_term {
+            Some((params, term)) => {
+                let mut text = super::finite_field::format_public_term_in_context(ctx, *term)?;
+                for (i, &param) in params.iter().enumerate().rev() {
+                    if let Some(name) = ctx.solver.var_name(param) {
+                        text = text
+                            .replace(&text!("|{name}|"), &text!("x!{i}"))
+                            .replace(&name, &text!("x!{i}"));
+                    }
+                }
+                text
+            }
+            None => render_model_value_smtlib(ctx, &fi.else_value, &fi.result_sort)?,
+        };
+        for (args, value) in fi.rows.iter().rev() {
+            let conditions: Vec<String> = args
+                .iter()
+                .zip(&fi.param_sorts)
+                .enumerate()
+                .map(|(i, (arg, sort))| {
+                    Some(text!(
+                        "(= x!{i} {})",
+                        render_model_value_smtlib(ctx, arg, sort)?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let condition = match conditions.as_slice() {
+                [single] => single.clone(),
+                _ => text!("(and {})", conditions.join(" ")),
+            };
+            let value = render_model_value_smtlib(ctx, value, &fi.result_sort)?;
+            body = text!("(ite {condition} {value} {body})");
+        }
+        part!(text!(
+            "(define-fun {display_name} ({}) {} {body})",
+            params.join(" "),
+            fi.result_sort
+        ));
+    }
+    let text = ay_core::render_admission::join(owner, &parts, "\n");
+    if owner.is_some_and(|owner| owner.check().is_err()) {
+        return None;
+    }
+    Some(match surface {
+        // Primitive sorts/literals have no retained AST identities to project.
+        // Native snapshots keep their exact keys; public names were already
+        // quoted above. A second projection would corrupt free '__db0' names.
+        ModelSurface::PublicScalar => text,
+        // Internal readers consume a model container, not a concatenation of
+        // top-level definitions. Keep native keys for their scope/membership
+        // checks instead of accidentally bypassing those checks on bare text.
+        ModelSurface::NativeScalar => text!("(model {text})"),
+        ModelSurface::GeneralProjection => super::ffi_surface_text(ctx, &text),
+    })
+}
+
+/// Convert model to string. Returns null with an error if a model value cannot
+/// be rendered within the output bounds without capturing a declaration.
 ///
 /// # Safety
 /// All pointers must be valid.
@@ -976,99 +1795,15 @@ pub unsafe extern "C" fn Z3_model_to_string(c: Z3_context, m: Z3_model) -> *cons
             if m.is_null() {
                 return cache_string(ctx, "(model)".to_string());
             }
-            let model = &(*m).model;
-            let mut parts = Vec::new();
-            for (name, val) in model.iter_bools() {
-                let display_name = model_entry_display_name(ctx, name);
-                parts.push(format!("(define-fun {display_name} () Bool {val})"));
-            }
-            for (name, val) in model.iter_ints() {
-                let display_name = model_entry_display_name(ctx, name);
-                if val.is_negative() {
-                    let abs = val.abs();
-                    parts.push(format!("(define-fun {display_name} () Int (- {abs}))"));
-                } else {
-                    parts.push(format!("(define-fun {display_name} () Int {val})"));
+            let output = render_model_handle_text(ctx, &*m);
+            match output {
+                Some(text) => cache_string(ctx, text),
+                None => {
+                    ctx.last_error = super::Z3_INVALID_ARG;
+                    ctx.error_msg = Some("model value rendering refused".into());
+                    ptr::null()
                 }
             }
-            for (name, val) in model.iter_reals() {
-                let display_name = model_entry_display_name(ctx, name);
-                if val.is_integer() {
-                    let n = val.numer();
-                    if n.is_negative() {
-                        parts.push(format!(
-                            "(define-fun {display_name} () Real (- {}))",
-                            n.abs()
-                        ));
-                    } else {
-                        parts.push(format!("(define-fun {display_name} () Real {n}.0)"));
-                    }
-                } else {
-                    let n = val.numer();
-                    let d = val.denom();
-                    if n.is_negative() {
-                        parts.push(format!(
-                            "(define-fun {display_name} () Real (- (/ {} {d})))",
-                            n.abs()
-                        ));
-                    } else {
-                        parts.push(format!("(define-fun {display_name} () Real (/ {n} {d}))"));
-                    }
-                }
-            }
-            for (name, (val, width)) in model.iter_bvs() {
-                let display_name = model_entry_display_name(ctx, name);
-                // Canonical BV printer: `#x` only at multiple-of-4 widths, else
-                // `#b`. Open-coding hex here emitted `(_ BitVec 5) #x11`, whose
-                // numeral reparses as 8 bits and contradicts its own ascription.
-                let numeral = ay_dpll::format_bitvec(val, *width);
-                parts.push(format!(
-                    "(define-fun {display_name} () (_ BitVec {width}) {numeral})"
-                ));
-            }
-            for (name, val) in model.iter_strings() {
-                let display_name = model_entry_display_name(ctx, name);
-                // Escape special characters for SMT-LIB string literal
-                let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
-                parts.push(format!(
-                    "(define-fun {display_name} () String \"{escaped}\")"
-                ));
-            }
-            // Non-scalar entries: render with the entry's resolved sort and the
-            // value's SMT-LIB `Display` form (store chains for arrays, ctor
-            // applications for datatypes, element tokens for uninterpreted).
-            let declared = declared_sorts(&ctx.solver);
-            for (name, val) in model.iter_fps() {
-                let display_name = model_entry_display_name(ctx, name);
-                let sort = resolve_entry_sort(&declared, name, val);
-                parts.push(format!("(define-fun {display_name} () {sort} {val})"));
-            }
-            for (name, val) in model.iter_seqs() {
-                let display_name = model_entry_display_name(ctx, name);
-                let sort = resolve_entry_sort(&declared, name, val);
-                parts.push(format!("(define-fun {display_name} () {sort} {val})"));
-            }
-            for (name, val) in model.iter_arrays() {
-                let display_name = model_entry_display_name(ctx, name);
-                let sort = resolve_entry_sort(&declared, name, val);
-                let rendered = render_model_value_smtlib(val, &sort);
-                parts.push(format!("(define-fun {display_name} () {sort} {rendered})"));
-            }
-            for (name, val) in model.iter_datatypes() {
-                let display_name = model_entry_display_name(ctx, name);
-                let sort = resolve_entry_sort(&declared, name, val);
-                parts.push(format!("(define-fun {display_name} () {sort} {val})"));
-            }
-            for (name, el) in model.iter_uninterpreteds() {
-                let display_name = model_entry_display_name(ctx, name);
-                let sort = declared
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| Sort::Uninterpreted(el.to_string()));
-                parts.push(format!("(define-fun {display_name} () {sort} {el})"));
-            }
-            let output = super::ffi_surface_text(ctx, &parts.join("\n"));
-            cache_string(ctx, output)
         })
     }
 }
@@ -1093,9 +1828,10 @@ pub unsafe extern "C" fn Z3_model_to_string(c: Z3_context, m: Z3_model) -> *cons
 /// every constant the model does not pin (`false`, `0`, `""`, `#x00..`,
 /// `seq.empty`, a constant array of defaults, `+zero`, `S!val!0`).
 ///
-/// Returns false (honest failure, no `*v` written) for null/invalid arguments
-/// and for binder-containing terms (`forall`/`exists`/`let`), where
-/// substitution would not be capture-safe.
+/// Returns false (honest failure, no `*v` written) for null/invalid arguments,
+/// for a `let`, and for a term where one constant occurs both free and bound
+/// (substitution would not be capture-safe). A quantifier's variables are
+/// left in place and its free constants are evaluated.
 ///
 /// # Safety
 /// All pointers must be valid.
@@ -1122,9 +1858,15 @@ pub unsafe extern "C" fn Z3_model_eval(
             else {
                 return 0;
             };
-            let result_sort = ctx.solver.term_sort(result_term);
+            let result_sort = eval_result_sort(ctx, t, term, result_term);
             let result_ast = term_to_ast(ctx, result_term);
-            record_ast_sort(ctx, result_ast, result_sort);
+            let result_ast = record_ast_sort(ctx, result_ast, result_sort);
+            // An input returned unchanged (an unassigned constant without model
+            // completion) is the same term in z3; anything else is the
+            // evaluator's own construction.
+            if result_term != term {
+                super::provenance::mark_produced_term(ctx, result_term);
+            }
             *v = result_ast;
             1
         }) != 0
@@ -1134,9 +1876,11 @@ pub unsafe extern "C" fn Z3_model_eval(
 /// The core of [`Z3_model_eval`]: evaluate `term` under the model snapshot
 /// `handle` (substitution of pinned constants, optional per-sort completion,
 /// universe-element / constructor folding, bounded UF-table resolution) and
-/// return the reduced term. `None` only for a binder-containing term (refused
-/// honestly for capture safety). A partially-reduced result is returned as-is
-/// (honest partial evaluation, never fabrication).
+/// return the reduced term. `None` for a `let`, a constant that occurs both
+/// free and bound (capture safety), or a recursive definition that cannot be
+/// expanded. A partially-reduced result is returned as-is (honest partial
+/// evaluation, never fabrication); with model completion a caller function the
+/// model does not interpret takes z3's default (`complete_functions`).
 ///
 /// Shared by `Z3_model_eval` and `Z3_model_extrapolate` (`misc_ext.rs`).
 pub(crate) fn eval_term_under_model(
@@ -1186,8 +1930,10 @@ pub(crate) fn eval_term_under_model(
         }
     };
 
-    // Binder-containing terms are refused honestly (capture safety).
-    let leaves = collect_named_leaves(&ctx.solver, term)?;
+    // Free constants are substituted; quantifiers' variables are not (a term
+    // where one constant occurs both free and bound is refused).
+    let scoped = value_folds::scoped_leaves(&ctx.solver, term)?;
+    let leaves = scoped.free;
 
     // Build the snapshot substitution: every pinned leaf goes to its
     // model value term; with completion, unpinned leaves go to Z3's
@@ -1223,8 +1969,12 @@ pub(crate) fn eval_term_under_model(
         }
     }
 
+    nullary_function_values(ctx, handle, term, model_completion, &mut from, &mut to);
     let substituted = ctx.solver.substitute(term, &from, &to);
-    let mut current = ctx.solver.simplify(substituted);
+    // A native `^` with a literal positive integer exponent folds like the
+    // engine reads it (z3: `2**3` evaluates to `8`), not as an opaque power.
+    let lowered = ctx.solver.lower_native_powers(substituted);
+    let mut current = ctx.solver.simplify(lowered);
     // Model-level knowledge the generic simplifier cannot apply:
     // equality over the model's uninterpreted-sort universe elements
     // is token identity.
@@ -1243,8 +1993,25 @@ pub(crate) fn eval_term_under_model(
     // snapshot's function tables. Each round can expose new ground
     // applications (f(g(1))), so iterate to a bounded fixpoint.
     let interps = &handle.func_interps;
+    let absent_functions: HashSet<String> = if model_completion && handle.complete_functions {
+        ctx.ffi_func_names
+            .values()
+            .filter(|name| {
+                !ctx.rec_fun_defs.contains_key(*name)
+                    && !interps.iter().any(|interp| &interp.name == *name)
+            })
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let uf_scope = UfScope {
+        bound: &scoped.bound,
+        absent_functions,
+    };
     for _ in 0..8 {
-        let (next, introduced) = resolve_uf_round(&mut ctx.solver, current, interps, &elements);
+        let (next, introduced) =
+            resolve_uf_round(&mut ctx.solver, current, interps, &elements, &uf_scope);
         if next == current {
             break;
         }
@@ -1253,7 +2020,110 @@ pub(crate) fn eval_term_under_model(
         }
         current = fold_element_predicates(&mut ctx.solver, next, &elements);
     }
+    current = fold_ground_array_equalities(&mut ctx.solver, current);
+    // The value folds z3's evaluator applies (`bv2nat`, `int2bv`, `^` over
+    // values; quantifiers over literal bodies), to a bounded fixpoint.
+    for _ in 0..4 {
+        let folded = value_folds::fold_values(&mut ctx.solver, current);
+        let next = ctx.solver.simplify(folded);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    // A Boolean the simplifier leaves over values (floating-point operations
+    // over literals, a bounded quantifier) is decided by AY's independent
+    // model checker when it is closed; it answers only an exact value.
+    if ctx.solver.bool_value(current).is_none() && ctx.solver.term_sort(current) == Sort::Bool {
+        if let Some(value) = ctx.solver.independent_closed_bool(current) {
+            current = ctx.solver.bool_const(value);
+        }
+    }
+    // A closed floating-point term over values (`fp.add(RNE, NaN, NaN)` of a
+    // completed constant) is reduced to its value, as z3's evaluator does.
+    if matches!(ctx.solver.term_sort(current), Sort::FloatingPoint(..)) {
+        if let Some(value) = ctx.solver.independent_closed_fp(current) {
+            current = value;
+        }
+    }
+    if matches!(ctx.solver.term_sort(current), Sort::FiniteField(_)) {
+        if let Some(value) = ctx.solver.independent_closed_finite_field(current) {
+            current = value;
+        }
+    }
     Some(current)
+}
+
+/// The values of the nullary FUNCTION applications in `term` (a
+/// `Z3_mk_func_decl` of arity 0 applied with `Z3_mk_app`, which the engine
+/// keeps as an application, not a constant): the model's value of the name,
+/// or with model completion z3's default for a caller function the model
+/// leaves out. Appended to the substitution `from -> to`.
+fn nullary_function_values(
+    ctx: &mut Z3Context,
+    handle: &ModelHandle,
+    term: Term,
+    model_completion: bool,
+    from: &mut Vec<Term>,
+    to: &mut Vec<Term>,
+) {
+    for (app, name) in value_folds::nullary_applications(&ctx.solver, term) {
+        let sort = ctx.solver.term_sort(app);
+        let value = match handle.model.value_by_name(&name) {
+            Some(value) => model_value_to_term(&mut ctx.solver, &value, &sort),
+            None if model_completion
+                && handle.complete_functions
+                && ctx.ffi_func_names.values().any(|caller| *caller == name) =>
+            {
+                default_value_term(&mut ctx.solver, &sort)
+            }
+            None => None,
+        };
+        if let Some(value) = value {
+            from.push(app);
+            to.push(value);
+        }
+    }
+}
+
+/// `<sort> <value>` for an in-range value of a `Char` (`Unicode (_ Char 104)`)
+/// or finite-domain (`S 1`) sort, z3's model text for them; `None` for any
+/// other sort or an out-of-range value.
+fn bounded_value_text(ctx: &Z3Context, sort: &Sort, value: &num_bigint::BigInt) -> Option<String> {
+    let hi = super::bounded_sort_hi(sort)?;
+    let code = i64::try_from(value)
+        .ok()
+        .filter(|code| (0..=hi).contains(code))?;
+    let sort_text = super::render_public_sort(ctx, sort);
+    Some(if sort.is_char() {
+        format!("{sort_text} (_ Char {code})")
+    } else {
+        format!("{sort_text} {code}")
+    })
+}
+
+/// The public sort an evaluation result carries: the input's `Char` or
+/// finite-domain sort when the result is the input itself or an in-range
+/// numeral of its `Int` carrier (`m.eval(c)` of a `Char` constant is a
+/// `Char` value, as in libz3 5.1.0), else the result term's own sort.
+fn eval_result_sort(ctx: &Z3Context, input: Z3_ast, input_term: Term, result: Term) -> Sort {
+    let own = ctx.solver.term_sort(result);
+    let Some(public) = super::lookup_ast_sort(ctx, input).cloned() else {
+        return own;
+    };
+    let Some(hi) = super::bounded_sort_hi(&public) else {
+        return own;
+    };
+    let in_range = ctx
+        .solver
+        .numeral_string(result)
+        .and_then(|text| text.parse::<i64>().ok())
+        .is_some_and(|code| (0..=hi).contains(&code));
+    if result == input_term || (own == Sort::Int && in_range) {
+        public
+    } else {
+        own
+    }
 }
 
 /// Get the i-th constant declaration from the model.
@@ -1287,13 +2157,18 @@ pub unsafe extern "C" fn Z3_model_get_const_decl(
             let entries = model_entries(&ctx.solver, model);
             match entries.get(i as usize) {
                 Some((name, sort)) => {
-                    let decl = FuncDecl::new(name.clone(), vec![], sort.clone());
                     if let Some(term) = ctx.ffi_const_terms_by_identity.get(name).copied() {
                         if let Some((_, symbol)) = ctx.ffi_const_metadata.get(&term).cloned() {
+                            // The constant's PUBLIC sort (a finite-domain or Char
+                            // constant is an Int in the model): applying the decl
+                            // must give back this constant, as in z3.
+                            let ast = term_to_ast(ctx, term);
+                            let public = super::public_ast_sort(ctx, ast, term);
+                            let decl = FuncDecl::new(name.clone(), vec![], public);
                             return cache_func_decl_with_symbol(ctx, decl, symbol);
                         }
                     }
-                    cache_func_decl(ctx, decl)
+                    cache_func_decl(ctx, FuncDecl::new(name.clone(), vec![], sort.clone()))
                 }
                 None => ptr::null_mut(),
             }
@@ -1325,7 +2200,7 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let model = &(*m).model;
             let decl = &(*d).decl;
             let name = decl.name().to_string();
@@ -1362,8 +2237,7 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
             match model_value_to_term(&mut ctx.solver, &val, &sort) {
                 Some(term) => {
                     let ast = term_to_ast(ctx, term);
-                    record_ast_sort(ctx, ast, sort);
-                    ast
+                    record_ast_sort(ctx, ast, sort)
                 }
                 // Value exists but cannot be faithfully represented as a term
                 // (e.g. an unparsed ArraySmtlib blob): honest not-found, never
@@ -1425,8 +2299,17 @@ pub unsafe extern "C" fn Z3_model_has_interp(_c: Z3_context, m: Z3_model, d: Z3_
             }
             // `value_by_name` searches EVERY sort map (including arrays,
             // datatypes and uninterpreted-sort constants), keeping this
-            // predicate aligned with the enumeration and interp lookups.
-            i32::from(model.value_by_name(name).is_some())
+            // predicate aligned with the enumeration and interp lookups. A
+            // function declaration has an interpretation when the snapshot
+            // carries its table (z3: `Z3_model_has_interp(m, f)` is true for
+            // an interpreted `f`; it reported false for every function).
+            let arity = decl.domain().len();
+            let has_table = arity > 0
+                && (*m)
+                    .func_interps
+                    .iter()
+                    .any(|fi| fi.name == name && fi.param_sorts.len() == arity);
+            i32::from(has_table || model.value_by_name(name).is_some())
         }) != 0
     }
 }
@@ -1448,11 +2331,14 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
     let arity = fi.param_sorts.len() as c_uint;
 
     // else value
-    let else_ast = match model_value_to_term(&mut ctx.solver, &fi.else_value, &fi.result_sort) {
+    let else_term = match &fi.else_term {
+        Some(_) => symbolic_else::else_body_over_bound_vars(&mut ctx.solver, fi),
+        None => model_value_to_term(&mut ctx.solver, &fi.else_value, &fi.result_sort),
+    };
+    let else_ast = match else_term {
         Some(term) => {
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, fi.result_sort.clone());
-            ast
+            record_ast_sort(ctx, ast, fi.result_sort.clone())
         }
         None => 0,
     };
@@ -1470,7 +2356,7 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
             match model_value_to_term(&mut ctx.solver, arg_val, param_sort) {
                 Some(term) => {
                     let ast = term_to_ast(ctx, term);
-                    record_ast_sort(ctx, ast, param_sort.clone());
+                    let ast = record_ast_sort(ctx, ast, param_sort.clone());
                     arg_asts.push(ast);
                 }
                 None => {
@@ -1485,8 +2371,7 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
         let value_ast = match model_value_to_term(&mut ctx.solver, row_value, &fi.result_sort) {
             Some(term) => {
                 let ast = term_to_ast(ctx, term);
-                record_ast_sort(ctx, ast, fi.result_sort.clone());
-                ast
+                record_ast_sort(ctx, ast, fi.result_sort.clone())
             }
             None => continue,
         };
@@ -1671,7 +2556,7 @@ pub unsafe extern "C" fn Z3_func_interp_get_else(c: Z3_context, f: Z3_func_inter
     }
     // SAFETY: `f` is dereferenced inside the guarded closure.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let ast = (*f).else_ast;
             if ast == 0 {
                 return 0;
@@ -1727,7 +2612,7 @@ pub unsafe extern "C" fn Z3_func_entry_get_value(c: Z3_context, e: Z3_func_entry
     }
     // SAFETY: `e` is dereferenced inside the guarded closure.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let ast = (*e).value;
             let _term = require_term_ast_or_return!(
                 ctx,
@@ -1775,7 +2660,7 @@ pub unsafe extern "C" fn Z3_func_entry_get_arg(
     }
     // SAFETY: `e` is dereferenced inside the guarded closure.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let args = &(*e).args;
             let Some(&ast) = args.get(i as usize) else {
                 return 0;
@@ -1823,7 +2708,29 @@ pub unsafe extern "C" fn Z3_model_translate(
             let src_model = &(*m).model;
             let src_interps = &(*m).func_interps;
             let model = src_model.clone();
-            let func_interps = src_interps.clone();
+            let same_context = ptr::eq(dst.cast_const(), ptr::from_ref::<Z3Context>(ctx));
+            // A symbolic else is a term of the SOURCE context's arena, which
+            // the copy cannot carry across. Dropping it left the function
+            // uninterpreted in the translated model (z3 carries `[else -> 1 +
+            // Var(0)]`, and `g(4)` evaluates to 5 there), so the translation
+            // is refused instead.
+            if let Some(symbolic) = src_interps
+                .iter()
+                .find(|fi| fi.else_term.is_some())
+                .filter(|_| !same_context)
+            {
+                ctx.last_error = super::Z3_INVALID_USAGE;
+                ctx.error_msg = Some(super::ffi_surface_text(
+                    ctx,
+                    &format!(
+                        "Z3_model_translate: the model interprets {} with a symbolic else \
+                         that cannot be carried to another context",
+                        symbolic.name
+                    ),
+                ));
+                return ptr::null_mut();
+            }
+            let func_interps: Vec<FuncInterp> = src_interps.clone();
             // User-provided const/func interps (Z3_add_*_interp) are NOT carried
             // across a model translation: the stored value ASTs / func-interp
             // handles live in the SOURCE context's arena and would dangle in the
@@ -1836,12 +2743,25 @@ pub unsafe extern "C" fn Z3_model_translate(
             } else {
                 (*dst).rec_fun_defs.len()
             };
+            // Across contexts every entry is renamed to the destination's
+            // declaration of the same name and signature (z3 translates the
+            // declarations; measured: `m.decls()` listed `!ay.z3-const!0`).
+            let mut model = model;
+            let mut func_interps = func_interps;
+            let mut renamed_all = true;
+            if !ptr::eq(dst.cast_const(), ptr::from_ref::<Z3Context>(ctx)) {
+                let dst_ctx = &mut *dst;
+                renamed_all = translate_model_names(ctx, dst_ctx, &mut model, &mut func_interps);
+            }
+            // Completion of absent functions needs every table.
+            let complete_functions = (*m).complete_functions && renamed_all;
             let handle = Box::into_raw(Box::new(ModelHandle {
                 model,
                 func_interps,
                 user_const_interps: Vec::new(),
                 user_func_interps: Vec::new(),
                 rec_def_count: dst_rec_def_count,
+                complete_functions,
                 _ctx: dst,
             }));
             if ptr::eq(dst.cast_const(), ptr::from_ref::<Z3Context>(ctx)) {
@@ -1853,6 +2773,73 @@ pub unsafe extern "C" fn Z3_model_translate(
             handle
         })
     }
+}
+
+/// Rename the entries of a model translated from `src` into `dst` to `dst`'s
+/// declarations of the same caller-visible name and signature; `false` when
+/// some entry has no such declaration (it keeps the source identity).
+fn translate_model_names(
+    src: &Z3Context,
+    dst: &mut Z3Context,
+    model: &mut Model,
+    func_interps: &mut [FuncInterp],
+) -> bool {
+    let mut renames: StdHashMap<String, String> = StdHashMap::new();
+    let mut all = true;
+    let names: Vec<String> = model.names().map(str::to_string).collect();
+    for name in names {
+        let Some(&term) = src.ffi_const_terms_by_identity.get(&name) else {
+            all = false;
+            continue;
+        };
+        let Some((_, symbol)) = src.ffi_const_metadata.get(&term) else {
+            all = false;
+            continue;
+        };
+        let sort = src.solver.term_sort(term);
+        // A datatype the target does not know yet is declared there, as z3's
+        // translation carries the sort (its constructors build the values).
+        if let Sort::Datatype(dt) = &sort {
+            if dst.solver.resolve_sort_name(&dt.name).is_none()
+                && dst.solver.try_declare_datatype(dt).is_err()
+            {
+                all = false;
+                continue;
+            }
+        }
+        let Some(target) = super::terms::ffi_api_constant(dst, symbol, &sort) else {
+            all = false;
+            continue;
+        };
+        match dst.ffi_const_metadata.get(&target) {
+            Some((identity, _)) => {
+                renames.insert(name, identity.clone());
+            }
+            None => all = false,
+        }
+    }
+    model.rename_names(|name| renames.get(name).cloned());
+    for interp in func_interps.iter_mut() {
+        let source = src
+            .ffi_func_decls
+            .iter()
+            .find_map(|((symbol, domain, range), decl)| {
+                (decl.name() == interp.name)
+                    .then(|| (symbol.clone(), domain.clone(), range.clone()))
+            });
+        let Some((symbol, domain, range)) = source else {
+            all = false;
+            continue;
+        };
+        match super::ffi_try_declare_function(dst, &symbol, &domain, &range) {
+            Ok(decl) => {
+                dst.ffi_used_decl_names.insert(symbol.display_name());
+                interp.name = decl.name().to_string();
+            }
+            Err(_) => all = false,
+        }
+    }
+    all
 }
 
 /// Reconstruct the finite universes of the uninterpreted sorts the model
@@ -1964,7 +2951,7 @@ pub unsafe extern "C" fn Z3_model_get_sort_universe(
                         let val = ModelValue::Uninterpreted(token);
                         if let Some(term) = model_value_to_term(&mut ctx.solver, &val, &sort) {
                             let ast = term_to_ast(ctx, term);
-                            record_ast_sort(ctx, ast, sort.clone());
+                            let ast = record_ast_sort(ctx, ast, sort.clone());
                             asts.push(ast);
                         }
                     }
@@ -1991,7 +2978,10 @@ pub unsafe extern "C" fn Z3_mk_params(c: Z3_context) -> Z3_params {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let handle = Box::into_raw(Box::new(ParamsHandle { params: Vec::new() }));
+            let handle = Box::into_raw(Box::new(ParamsHandle {
+                params: Vec::new(),
+                kinds: Vec::new(),
+            }));
             ctx.params_cache.push(handle);
             handle
         })
@@ -2030,6 +3020,7 @@ pub unsafe extern "C" fn Z3_params_set_bool(_c: Z3_context, p: Z3_params, k: Z3_
             let params = &mut (*p).params;
             let key = (*k).display_name();
             params.push((key, v.to_string()));
+            (*p).kinds.push(super::StoredParamKind::Bool);
         });
     }
 }
@@ -2052,6 +3043,7 @@ pub unsafe extern "C" fn Z3_params_set_uint(_c: Z3_context, p: Z3_params, k: Z3_
             let params = &mut (*p).params;
             let key = (*k).display_name();
             params.push((key, v.to_string()));
+            (*p).kinds.push(super::StoredParamKind::UInt);
         });
     }
 }
@@ -2079,6 +3071,7 @@ pub unsafe extern "C" fn Z3_params_set_double(
             let params = &mut (*p).params;
             let key = (*k).display_name();
             params.push((key, v.to_string()));
+            (*p).kinds.push(super::StoredParamKind::Double);
         });
     }
 }
@@ -2107,6 +3100,7 @@ pub unsafe extern "C" fn Z3_params_set_symbol(
             let key = (*k).display_name();
             let val = (*v).display_name();
             params.push((key, val));
+            (*p).kinds.push(super::StoredParamKind::Symbol);
         });
     }
 }

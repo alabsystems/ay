@@ -37,15 +37,27 @@ mod array_map_8533;
 mod array_model_store_chain_witness;
 #[path = "group_arrays/array_soundness_4304.rs"]
 mod array_soundness_4304;
+#[path = "group_arrays/authored_read_over_write_conflict_proof.rs"]
+mod authored_read_over_write_conflict_proof;
 #[path = "group_arrays/census_memo_consistency.rs"]
 mod census_memo_consistency;
 #[path = "group_arrays/const_array_card1_soundness.rs"]
 mod const_array_card1_soundness;
+#[path = "group_arrays/const_array_definition_read_certification.rs"]
+mod const_array_definition_read_certification;
 #[path = "group_arrays/default_lambda_wrong_sat.rs"]
 mod default_lambda_wrong_sat;
+#[path = "group_arrays/folded_bool_array_read_certification.rs"]
+mod folded_bool_array_read_certification;
 #[path = "group_arrays/qf_aufnia_nested_array_row_wrong_sat.rs"]
 mod qf_aufnia_nested_array_row_wrong_sat;
 #[path = "group_arrays/qf_ax_benchmark_suite.rs"]
 mod qf_ax_benchmark_suite;
+#[path = "group_arrays/row_chain_double_negated_conclusion.rs"]
+mod row_chain_double_negated_conclusion;
+#[path = "group_arrays/small_index_abv_row_certification.rs"]
+mod small_index_abv_row_certification;
 #[path = "group_arrays/store_chain_computed_value_dead_node.rs"]
 mod store_chain_computed_value_dead_node;
+#[path = "group_arrays/wasm_offset_proof.rs"]
+mod wasm_offset_proof;

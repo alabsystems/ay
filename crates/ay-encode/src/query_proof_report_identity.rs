@@ -6,10 +6,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use ay_chc::{
-    ChcProofArtifactDigest, ChcPrunedQueryObligationId, ChcQueryObligationId,
-    NORMALIZED_CHC_INPUT_SCHEMA,
-};
+use ay_chc::{ChcProofArtifactDigest, ChcPrunedQueryObligationId, ChcQueryObligationId};
 
 use super::CHC_QUERY_OBLIGATION_SET_SCHEMA;
 
@@ -56,6 +53,7 @@ pub(crate) fn source_order_is_complete<'a>(
 }
 
 pub(super) fn obligation_set_identity(
+    source_normalized_input_schema: &str,
     source_normalized_input_sha256: &str,
     source_normalized_input_bytes: u64,
     pruned_ids: &[ChcPrunedQueryObligationId],
@@ -67,7 +65,7 @@ pub(super) fn obligation_set_identity(
     identity.push('\n');
     identity.push_str(&format!(
         "source_schema={}\n",
-        serde_json::Value::String(NORMALIZED_CHC_INPUT_SCHEMA.to_string())
+        serde_json::Value::String(source_normalized_input_schema.to_string())
     ));
     identity.push_str(&format!("source_sha256={source_normalized_input_sha256}\n"));
     identity.push_str(&format!("source_bytes={source_normalized_input_bytes}\n"));
@@ -126,6 +124,7 @@ pub(super) fn obligation_set_identity(
 }
 
 pub(crate) fn obligation_set_sha256(
+    source_normalized_input_schema: &str,
     source_normalized_input_sha256: &str,
     source_normalized_input_bytes: u64,
     pruned_ids: &[ChcPrunedQueryObligationId],
@@ -133,6 +132,7 @@ pub(crate) fn obligation_set_sha256(
     ids: &[ChcQueryObligationId],
 ) -> String {
     obligation_set_identity(
+        source_normalized_input_schema,
         source_normalized_input_sha256,
         source_normalized_input_bytes,
         pruned_ids,

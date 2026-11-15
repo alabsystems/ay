@@ -18,16 +18,16 @@ impl DratChecker {
     /// Check if `clause` is RAT. Tries the first literal as pivot (standard),
     /// then falls back to all other literals if that fails (drat-trim parity).
     pub(super) fn check_rat_for_clause(&mut self, clause: &[Literal]) -> bool {
-        if clause.is_empty() {
+        let Some((&first, rest)) = clause.split_first() else {
             return false;
-        }
-        self.stats.rat_checks += 1;
+        };
+        self.stats.rat_checks = self.stats.rat_checks.saturating_add(1);
         // Try the first literal (the default pivot for most solvers).
-        if self.check_rat_with_pivot(clause, clause[0], None) {
+        if self.check_rat_with_pivot(clause, first, None) {
             return true;
         }
         // Pivot fallback: try remaining literals (drat-trim.c:662-683).
-        for &alt_pivot in &clause[1..] {
+        for &alt_pivot in rest {
             if self.check_rat_with_pivot(clause, alt_pivot, None) {
                 return true;
             }
@@ -78,17 +78,28 @@ impl DratChecker {
             .filter(|&lit| lit != pivot)
             .chain(db_clause.iter().copied().filter(|&lit| lit != neg_pivot))
         {
-            if marks[lit.negated().index()] {
+            // Only in-range indices are ever marked, so an index outside
+            // `marks` is unmarked.
+            if marks.get(lit.negated().index()).copied().unwrap_or(false) {
                 tautological = true;
                 break;
             }
-            if !marks[lit.index()] {
-                marks[lit.index()] = true;
-                buf.push(lit);
+            match marks.get_mut(lit.index()) {
+                Some(mark) => {
+                    if !*mark {
+                        *mark = true;
+                        buf.push(lit);
+                    }
+                }
+                // No mark slot to deduplicate with: keep the literal, since
+                // the resolvent must still contain it.
+                None => buf.push(lit),
             }
         }
         for &lit in buf.iter() {
-            marks[lit.index()] = false;
+            if let Some(mark) = marks.get_mut(lit.index()) {
+                *mark = false;
+            }
         }
         tautological
     }

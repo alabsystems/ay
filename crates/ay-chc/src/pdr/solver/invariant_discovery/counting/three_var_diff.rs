@@ -222,6 +222,16 @@ impl PdrSolver {
             }
         }
 
+        // A fact local (or a constituent of an expression head argument) has
+        // no meaning outside its fact clause: an inequality that still
+        // mentions one is not a predicate invariant, and as a lemma its free
+        // name would be captured by any same-named variable of the clause it
+        // is later applied to. Keep canonical-only inequalities.
+        inequalities.retain(|ineq| {
+            ineq.vars()
+                .iter()
+                .all(|v| canonical_vars.iter().any(|c| c.name == v.name))
+        });
         inequalities
     }
 

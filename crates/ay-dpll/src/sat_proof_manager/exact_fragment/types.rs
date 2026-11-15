@@ -50,6 +50,10 @@ impl ExactOriginalProofFragment {
         &self.proof
     }
 
+    pub(crate) fn into_proof(self) -> Proof {
+        self.proof
+    }
+
     pub(crate) fn binding(&self, trace_id: u64) -> Option<&ExactOriginalClauseBinding> {
         self.bindings.get(&trace_id)
     }
@@ -122,6 +126,9 @@ pub(crate) struct FragmentPropagationEnvironment {
     pub(crate) record_by_after: HashMap<TermId, (TermId, u32)>,
     /// expr -> (value, source assertion, stamp), first harvest wins.
     pub(crate) entry_by_expr: HashMap<TermId, (TermId, TermId, u32)>,
+    /// The planner's constant-array read leg (`PlanCx::with_const_array_reads`):
+    /// set by the seal for a query that declares no datatype.
+    pub(crate) const_array_reads: bool,
 }
 
 impl FragmentPropagationEnvironment {

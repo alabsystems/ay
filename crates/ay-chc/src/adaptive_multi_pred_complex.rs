@@ -33,6 +33,8 @@ use std::time::Duration;
 
 use crate::adaptive::{AdaptivePortfolio, StagedProbeBudgetProfile};
 use crate::adaptive_decision_log::DecisionEntry;
+use crate::adaptive_ladder_race::{LadderMember, LadderOutcome};
+use crate::engine_result::ValidationEvidence;
 
 #[derive(Clone)]
 struct LiaArrayWitnessValue {
@@ -773,6 +775,7 @@ impl AdaptivePortfolio {
         }
 
         let bmc_config = BmcConfig {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig {
                 verbose: self.config.verbose,
                 ..ChcEngineConfig::default()
@@ -785,7 +788,11 @@ impl AdaptivePortfolio {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         };
         let bmc_solver = crate::bmc::BmcSolver::new(self.problem.clone(), bmc_config);
@@ -930,7 +937,7 @@ impl AdaptivePortfolio {
                     );
                 }
                 // Child of the portfolio handle (item 5).
-                let cancel = self.cancellation_token.child();
+                let cancel = self.lane_token();
                 let bmc_probe_max_depth: usize = 22;
                 // Cancellation is only polled between depths; cap each depth so
                 // a late query cannot consume the whole ComplexLoop pre-pass.
@@ -1003,7 +1010,7 @@ impl AdaptivePortfolio {
             let pdr_probe_timeout_ms: u64 = 500;
             let probe_start = Instant::now();
             // Child of the portfolio handle (item 5).
-            let pdr_cancel = self.cancellation_token.child();
+            let pdr_cancel = self.lane_token();
             let pdr_probe_dur = Duration::from_millis(pdr_probe_timeout_ms);
             let _timeout_guard = pdr_cancel.cancel_after(pdr_probe_dur);
             let mut probe_config = PdrConfig {
@@ -1209,6 +1216,7 @@ impl AdaptivePortfolio {
         // #7897: Include phase-bounded BMC in the parallel portfolio as well.
         let bmc_engine = if let Some(depth) = features.phase_bounded_depth {
             EngineConfig::Bmc(BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -1221,7 +1229,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             })
         } else {
@@ -1433,6 +1445,7 @@ impl AdaptivePortfolio {
         let bmc = crate::bmc::BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -1445,7 +1458,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -1534,6 +1551,7 @@ impl AdaptivePortfolio {
         let bmc = crate::bmc::BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -1546,7 +1564,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -1726,133 +1748,179 @@ impl AdaptivePortfolio {
             return result;
         }
 
-        // Stage 0.27: relational-equality Houdini (gold safe-side build, I1) —
-        // certified relational invariants for reve-class BV problems the narrow
-        // certifier rejects. Re-verified per-rule before Safe; bounded budget.
-        if let Some(result) = self.try_relational_equality_houdini_lane(deadline) {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: MultiPredComplex relational Houdini (I1) solved the problem"
-                );
-            }
-            return result;
+        // Item #2 (PERF_vs_winners_2026-09-25): the Safe-only relational
+        // Houdini lanes (I1-I5), the BallRajamani refuter and the acyclic BMC
+        // probe run as concurrent ladder-race members next to the foreground
+        // (non-inlined PDR -> BV dual lane -> portfolio -> retry) instead of
+        // serially before it — incremental-2lists.40 spent 26 s of 28 s in
+        // them while the dual lane's word-level BMC refutes it in 0.8 s. When
+        // the BV dual lane applies, non-inlined PDR is a member too (the dual
+        // lane takes the whole remaining budget and does not consume its
+        // lemma pool; a portfolio after it still reads the pool the member
+        // exported). Every lane keeps its own validation; the first verdict
+        // wins and cancels the rest.
+        let dual_lane_applies = self.multi_pred_complex_dual_lane_applies();
+        let non_inlined = NonInlinedPdrExport::default();
+        let members = self.multi_pred_complex_ladder_members(
+            features,
+            deadline,
+            dual_lane_applies.then_some(&non_inlined),
+        );
+        let (result, _) = self.race_ladder("multi_pred_complex", members, || {
+            let result = if dual_lane_applies {
+                None
+            } else {
+                self.multi_pred_complex_non_inlined_pdr(features, deadline, &non_inlined)
+            };
+            let result = result.unwrap_or_else(|| {
+                self.multi_pred_complex_after_non_inlined_pdr(features, deadline, &non_inlined)
+            });
+            (result, ValidationEvidence::FullVerification)
+        });
+        result
+    }
+
+    /// The MultiPredComplex ladder's concurrent members; `non_inlined` makes
+    /// non-inlined PDR one of them, exporting into that slot.
+    fn multi_pred_complex_ladder_members<'a>(
+        &'a self,
+        features: &'a ProblemFeatures,
+        deadline: Option<Instant>,
+        non_inlined: Option<&'a NonInlinedPdrExport>,
+    ) -> Vec<LadderMember<'a>> {
+        let mut members = vec![
+            LadderMember::new("relational_equality_houdini", move || {
+                complex_member(self.try_relational_equality_houdini_lane(deadline))
+            }),
+            LadderMember::new("data_driven_houdini", move || {
+                complex_member(self.try_data_driven_houdini_lane())
+            }),
+            LadderMember::new("reve_accumulator_houdini", move || {
+                complex_member(self.try_reve_accumulator_invariant_lane())
+            }),
+            LadderMember::new("reve_coupling_houdini", move || {
+                complex_member(self.try_reve_coupling_houdini_lane())
+            }),
+            LadderMember::new("cyclic_consistency_invariant", move || {
+                complex_member(self.try_cyclic_consistency_invariant_lane())
+            }),
+            LadderMember::new("ball_rajamani_arrays_cex", move || {
+                complex_member(self.try_ball_rajamani_lia_arrays_counterexample_route(deadline))
+            }),
+            LadderMember::new("acyclic_bmc", move || {
+                complex_member(
+                    self.try_acyclic_bmc_probe(features, deadline)
+                        .map(|(result, _evidence)| result),
+                )
+            }),
+        ];
+        if let Some(export) = non_inlined {
+            members.push(LadderMember::new("non_inlined_pdr", move || {
+                complex_member(self.multi_pred_complex_non_inlined_pdr(features, deadline, export))
+            }));
         }
-
-        // Stage 0.28: data-driven affine-hull relational Houdini (gold safe-side
-        // build, I2) — synthesizes multi-variable linear invariants from the
-        // affine hull of sampled reachable states for reve/geometry BV problems
-        // I1's equality-only templates miss. Re-verified per-rule before Safe.
-        if let Some(result) = self.try_data_driven_houdini_lane() {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: MultiPredComplex data-driven Houdini (I2) solved the problem"
-                );
-            }
-            return result;
+        if self.nonlinear_lane_applies() {
+            members.push(LadderMember::new("nonlinear_spacer_pdr", move || {
+                complex_member(self.multi_pred_complex_nonlinear_lane_pdr(features, deadline))
+            }));
         }
+        members
+    }
 
-        // Stage 0.29: disjunctive reve-accumulator relational Houdini (gold
-        // safe-side build, I3) — synthesizes the two-branch (synced ∨ guarded-
-        // coupling) invariant that offset-counter accumulator loops need and
-        // which I1/I2's conjunctive-affine templates cannot express. Re-verified
-        // per-rule before Safe; bounded budget.
-        if let Some(result) = self.try_reve_accumulator_invariant_lane() {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: MultiPredComplex reve-accumulator Houdini (I3) solved the problem"
-                );
-            }
-            return result;
+    /// Whether the nonlinear Spacer lane would run on this (original)
+    /// problem: a hyperedge clause, the lane with `nonlinear` on, and no
+    /// arrays / bit-vectors / datatypes (the lane's bypass sorts).
+    fn nonlinear_lane_applies(&self) -> bool {
+        let lane = PdrConfig::default().spacer;
+        lane.enabled
+            && lane.nonlinear
+            && self
+                .problem
+                .clauses()
+                .iter()
+                .any(|c| c.body.predicates.len() > 1)
+            && !self.problem.has_array_sorts()
+            && !self.problem.has_bv_sorts()
+            && !self.problem.has_datatype_sorts()
+    }
+
+    /// Ladder member: the nonlinear Spacer lane (`SpacerLane::nonlinear`) on
+    /// the original problem for the whole remaining budget, racing the
+    /// legacy non-inlined PDR stage and the portfolio from t=0. Validated
+    /// like every PDR stage; `None` on Unknown.
+    fn multi_pred_complex_nonlinear_lane_pdr(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+    ) -> Option<PortfolioResult> {
+        if self.budget_exhausted(deadline) {
+            return None;
         }
-
-        // Stage 0.295: multi-guard relational-coupling Houdini (gold safe-side
-        // build, I4) — synthesizes the conjunctive-guard reve coupling
-        // `(a=d ∧ b=e) ⇒ (c=f)` that links corresponding arguments of two
-        // synchronized recursive copies. The reve mutual-recursion equivalence
-        // family (reve/001, 001b) needs this two-guard coupling on the arity-6
-        // product summary, which I1's single-guard template cannot represent.
-        // Re-verified per-rule before Safe; bounded budget.
-        if let Some(result) = self.try_reve_coupling_houdini_lane() {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: MultiPredComplex reve-coupling Houdini (I4) solved the problem"
-                );
-            }
-            return result;
+        let budget = self.remaining_budget(deadline);
+        tracing::info!(
+            predicates = self.problem.predicates().len(),
+            budget_secs = budget.map_or(f64::INFINITY, |b| b.as_secs_f64()),
+            "Adaptive: nonlinear Spacer lane PDR member"
+        );
+        let mut pdr_config = Self::multi_pred_pdr_config(PdrConfig {
+            verbose: self.config.verbose,
+            solve_timeout: budget,
+            max_escalation_level: if features.uses_datatypes { 0 } else { 3 },
+            ..PdrConfig::default()
+        })
+        .with_tla_trace_from_env();
+        self.apply_user_hints(&mut pdr_config);
+        let started = Instant::now();
+        let mut pdr = PdrSolver::new(self.problem.clone(), pdr_config);
+        pdr.enable_tla_trace_from_config();
+        let result = pdr.solve();
+        self.accumulate_stats(&pdr.extract_stats());
+        let validated = self.validate_adaptive_result(result);
+        self.decision_log.log_decision(DecisionEntry {
+            stage: "multi_pred_complex_nonlinear_lane_pdr",
+            gate_result: true,
+            gate_reason: format!("{} predicates", self.problem.predicates().len()),
+            budget_secs: budget.map_or(0.0, |b| b.as_secs_f64()),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            result: Self::result_to_str(&validated),
+            lemmas_learned: 0,
+            max_frame: 0,
+        });
+        if matches!(validated, PdrResult::Unknown) {
+            return None;
         }
+        tracing::info!("Adaptive: nonlinear Spacer lane PDR solved the problem");
+        Some(validated)
+    }
 
-        // Stage 0.296: compact cyclic-order consistency invariant (gold safe-side
-        // build, I5) — the computational-geometry BV "Consistency" family
-        // (point-location, graham-scan) whose orientation primitive
-        // (lturn/step_lturn/combined_lturn) is consistent under CYCLIC
-        // permutation of three orientation columns. Synthesizes a single
-        // closed-form strict cyclic-order predicate over those columns (the
-        // COMPACT form that verify_model_per_rule discharges in a few seconds at
-        // arity 11/12, vs. the reverted disjunction-of-rotated-polyhedra that
-        // took >100 s). Re-verified per-rule before Safe; bounded budget.
-        if let Some(result) = self.try_cyclic_consistency_invariant_lane() {
-            if self.config.verbose {
-                safe_eprintln!("Adaptive: MultiPredComplex cyclic-order consistency invariant (I5) solved the problem");
-            }
-            return result;
-        }
+    /// Whether the BV dual lane runs for this multi-predicate complex problem
+    /// (pure word-level BV; the dual lane is BV-scalar).
+    fn multi_pred_complex_dual_lane_applies(&self) -> bool {
+        self.problem.has_bv_sorts()
+            && !self.problem.has_array_sorts()
+            && !self.problem.has_datatype_sorts()
+    }
 
-        // Stage 0.3: narrow BallRajamani LIA-Arrays unsafe route. The witness
-        // is accepted only after the original CHC counterexample verifier
-        // returns `Valid`; any shape or validation miss falls through.
-        if let Some(result) = self.try_ball_rajamani_lia_arrays_counterexample_route(deadline) {
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: MultiPredComplex BallRajamani LIA-Arrays route validated Unsafe"
-                );
-            }
-            return result;
-        }
-
-        // Stage 0.5: Exact BMC probe for acyclic predicate DAGs.
-        // The helper routes through PortfolioSolver, preserving BMC empty-Safe
-        // rejection and counterexample validation instead of accepting raw
-        // acyclic_safe results.
-        if let Some((result, _evidence)) = self.try_acyclic_bmc_probe(features, deadline) {
-            if self.config.verbose {
-                safe_eprintln!("Adaptive: Acyclic BMC probe solved the complex problem");
-            }
-            return result;
-        }
-
-        // Cross-engine lemma transfer pool (#7919). Populated by non-inlined PDR
-        // when it returns Unknown, consumed by retry engines.
-        let mut transferred_pool: Option<LemmaPool> = None;
-        // Stage rotation (item 5): true when the non-inlined PDR stage gave up
-        // Stuck with zero frame growth — the same-family retry PDR probe on
-        // the same problem is then provably redundant and skipped.
-        let mut non_inlined_pdr_stuck_no_growth = false;
-
-        // Stage 0.5: Non-inlined PDR for multi-predicate problems (#1362).
+    /// Stage 0.5: non-inlined PDR for multi-predicate problems (#1362). A
+    /// verdict is returned; an Unknown exports its lemma pool and its stuck
+    /// signal into `export` for the portfolio and retry stages.
+    fn multi_pred_complex_non_inlined_pdr(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+        export: &NonInlinedPdrExport,
+    ) -> Option<PortfolioResult> {
         // Same rationale as solve_multi_pred_linear Stage 1.5: inlining destroys
         // per-predicate parity structure that PDR needs for modular invariants.
-        if self.problem.predicates().len() > 1 && !self.budget_exhausted(deadline) {
-            // Budget scaling (#1398): same formula as Stage 1.5.
-            let num_preds = self.problem.predicates().len() as u64;
-            let base_budget_secs = if num_preds >= 4 {
-                5 + 2 * num_preds.saturating_sub(3)
-            } else {
-                5
-            };
-            let max_budget = Duration::from_secs(base_budget_secs.min(15));
-            // #7457: Cap to 50% of remaining budget (same as Stage 1.5).
-            let remaining = self.remaining_budget(deadline).unwrap_or(max_budget);
-            // FIX #2d: when the stage-0.15 bit-blasted probes were
-            // size-skipped, the word-level non-inlined PDR is the engine
-            // best matched to the problem (bit-blasting is intractable by
-            // construction here) — give it the reclaimed window instead of
-            // the generic 15s cap: remaining/3 capped at 300s, so the
-            // dual-lane and portfolio still keep the majority.
-            let stage_budget = if self.bv_bitblast_probes_size_skipped() {
-                (remaining / 3).min(Duration::from_mins(5))
-            } else {
-                (remaining / 2).min(max_budget)
-            };
+        // CH4b: skipped when the collapse-first route found the problem
+        // collapses COMPLETELY to one linear predicate and fell through — the
+        // stage won no kind2 instance in 15 s (control) or 2.8 s (CH4), and
+        // the fallback portfolio on the collapsed problem gets its window.
+        if self.problem.predicates().len() > 1
+            && !self.budget_exhausted(deadline)
+            && !self.inherits_complete_collapse()
+        {
+            let stage_budget = self.multi_pred_complex_non_inlined_pdr_budget(deadline);
             if self.config.verbose {
                 safe_eprintln!(
                     "Adaptive: Trying non-inlined PDR ({} predicates, {:.1}s budget)",
@@ -1860,6 +1928,9 @@ impl AdaptivePortfolio {
                     stage_budget.as_secs_f64()
                 );
             }
+            // The legacy technique profile on nonlinear problems (CONST_guard2:
+            // Safe in 1 s here); the nonlinear Spacer lane races it as the
+            // `nonlinear_spacer_pdr` ladder member.
             let mut pdr_config = Self::multi_pred_pdr_config(PdrConfig {
                 verbose: self.config.verbose,
                 solve_timeout: Some(stage_budget),
@@ -1867,6 +1938,7 @@ impl AdaptivePortfolio {
                 max_escalation_level: if features.uses_datatypes { 0 } else { 3 },
                 ..PdrConfig::default()
             })
+            .without_nonlinear_lane()
             .with_tla_trace_from_env();
             // Item 5a: subsequent stages (dual-lane, portfolio, retry) exist,
             // so let this stage self-report hopeless stagnation and release
@@ -1881,7 +1953,7 @@ impl AdaptivePortfolio {
             // rotation (item 5).
             let stage_stats = pdr.extract_stats();
             self.accumulate_stats(&stage_stats);
-            non_inlined_pdr_stuck_no_growth = self.predecessor_stage_stuck_no_growth(&stage_stats);
+            export.set_stuck(self.predecessor_stage_stuck_no_growth(&stage_stats));
             let validated = self.validate_adaptive_result(result);
             if !matches!(validated, PdrResult::Unknown) {
                 if self.config.verbose {
@@ -1897,7 +1969,7 @@ impl AdaptivePortfolio {
                     lemmas_learned: 0,
                     max_frame: 0,
                 });
-                return validated;
+                return Some(validated);
             }
             // Export learned lemmas for cross-engine transfer (#7919).
             let pool = pdr.export_lemmas();
@@ -1908,7 +1980,7 @@ impl AdaptivePortfolio {
                 );
             }
             let pool_size = pool.len();
-            transferred_pool = Some(pool);
+            export.set_pool(pool);
             self.decision_log.log_decision(DecisionEntry {
                 stage: "multi_pred_complex_non_inlined_pdr",
                 gate_result: true,
@@ -1925,7 +1997,39 @@ impl AdaptivePortfolio {
                 );
             }
         }
+        None
+    }
 
+    /// Budget scaling (#1398, same formula as MultiPredLinear Stage 1.5),
+    /// capped to 50 % of what remains (#7457). FIX #2d: when the stage-0.15
+    /// bit-blasted probes were size-skipped, the word-level non-inlined PDR is
+    /// the engine best matched to the problem (bit-blasting is intractable by
+    /// construction there) and gets remaining/3 capped at 300 s instead.
+    fn multi_pred_complex_non_inlined_pdr_budget(&self, deadline: Option<Instant>) -> Duration {
+        let num_preds = self.problem.predicates().len() as u64;
+        let base_budget_secs = if num_preds >= 4 {
+            5 + 2 * num_preds.saturating_sub(3)
+        } else {
+            5
+        };
+        let max_budget = Duration::from_secs(base_budget_secs.min(15));
+        let remaining = self.remaining_budget(deadline).unwrap_or(max_budget);
+        if self.bv_bitblast_probes_size_skipped() {
+            (remaining / 3).min(Duration::from_mins(5))
+        } else {
+            (remaining / 2).min(max_budget)
+        }
+    }
+
+    /// Foreground tail after non-inlined PDR: the BV dual lane, the full
+    /// portfolio (seeded with the exported lemma pool) and the failure-guided
+    /// retry.
+    fn multi_pred_complex_after_non_inlined_pdr(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+        non_inlined: &NonInlinedPdrExport,
+    ) -> PortfolioResult {
         // Stage 0.9 (BV routing): pure word-level BV problems get the dedicated
         // BV dual-lane portfolio (Lane C = BV-native PDR/BMC at the full remaining
         // budget) before the generic portfolio. The generic roster bit-blasts BV
@@ -1936,11 +2040,7 @@ impl AdaptivePortfolio {
         // Unsafe by counterexample replay), so the 0-wrong invariant is preserved;
         // an unhandled shape returns Unknown and falls through to the generic
         // portfolio. Arrays/datatypes are excluded — the dual-lane is BV-scalar.
-        if self.problem.has_bv_sorts()
-            && !self.problem.has_array_sorts()
-            && !self.problem.has_datatype_sorts()
-            && !self.budget_exhausted(deadline)
-        {
+        if self.multi_pred_complex_dual_lane_applies() && !self.budget_exhausted(deadline) {
             if let Some(remaining) = self.remaining_budget(deadline) {
                 let bv_start = Instant::now();
                 let result = self.solve_bv_dual_lane(remaining);
@@ -1993,7 +2093,14 @@ impl AdaptivePortfolio {
         // This closes the gap where the complex path discarded non-inlined PDR
         // lemmas when entering the portfolio, unlike the linear path which
         // explicitly set lemma_hints on its PDR configs.
-        if let Some(ref pool) = transferred_pool {
+        // CH4b: seeds the collapse-first route learned on the collapsed problem
+        // (this portfolio's engine problem) go first, ahead of the pool above.
+        let transferred_pool = non_inlined.pool();
+        let stage1_pool = crate::lemma_pool::LemmaPool::seeds_then(
+            self.take_fallback_seed_pool(),
+            transferred_pool.as_ref(),
+        );
+        if let Some(ref pool) = stage1_pool {
             config.set_pdr_lemma_pool(pool);
             if self.config.verbose && !pool.is_empty() {
                 safe_eprintln!(
@@ -2043,7 +2150,7 @@ impl AdaptivePortfolio {
         // the non-inlined PDR stage already gave up Stuck with zero frame
         // growth on this very problem — the probe would replay the identical
         // stagnating search. Completeness-only (returns the portfolio Unknown).
-        if non_inlined_pdr_stuck_no_growth {
+        if non_inlined.stuck() {
             if self.config.verbose {
                 safe_eprintln!(
                     "Adaptive: Skipping failure-guided retry — non-inlined PDR was stuck with zero frame growth"
@@ -2157,6 +2264,48 @@ impl AdaptivePortfolio {
 
         // No retry possible, return original Unknown
         portfolio_result
+    }
+}
+
+/// Map a Safe/Unsafe-returning complex lane onto a ladder-race member result.
+fn complex_member(result: Option<PortfolioResult>) -> Option<LadderOutcome> {
+    result.map(|result| (result, ValidationEvidence::FullVerification))
+}
+
+/// What an Unknown non-inlined PDR stage hands the later stages (#7919 lemma
+/// transfer, item-5 stage rotation) — written by the stage, possibly on a
+/// ladder-race member thread, read by the foreground's portfolio and retry.
+#[derive(Default)]
+struct NonInlinedPdrExport {
+    pool: std::sync::Mutex<Option<LemmaPool>>,
+    stuck_no_growth: std::sync::atomic::AtomicBool,
+}
+
+impl NonInlinedPdrExport {
+    fn set_pool(&self, pool: LemmaPool) {
+        *self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pool);
+    }
+
+    fn pool(&self) -> Option<LemmaPool> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_stuck(&self, stuck: bool) {
+        self.stuck_no_growth
+            .store(stuck, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the stage gave up Stuck with zero frame growth: the
+    /// same-family retry PDR probe on the same problem is then redundant.
+    fn stuck(&self) -> bool {
+        self.stuck_no_growth
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2324,6 +2473,7 @@ mod tests {
             has_multiplication: false,
             has_mod_div: false,
             has_ite: false,
+            has_ite_in_predicate_args: false,
             self_loop_ratio: 1.0,
             max_predicate_arity: 1,
             is_entry_exit_only: false,
@@ -2464,93 +2614,6 @@ mod tests {
             AdaptivePortfolio::complex_loop_bmc_probe_skip_reason(&features, false, true),
             Some("deadline_exhausted"),
             "deadline exhaustion should be logged as the skip reason before structural gates"
-        );
-    }
-
-    #[test]
-    fn complex_loop_bmc_probe_has_total_and_per_depth_budget_caps() {
-        let src = include_str!("adaptive_multi_pred_complex.rs");
-        let fn_start = src
-            .find("pub(super) fn solve_complex_loop(")
-            .expect("adaptive_multi_pred_complex.rs should define solve_complex_loop");
-        let fn_body = &src[fn_start..];
-        let fn_end = fn_body
-            .find("pub(super) fn solve_multi_pred_complex(")
-            .expect("solve_multi_pred_complex should follow solve_complex_loop");
-        let fn_body = &fn_body[..fn_end];
-        let probe_start = fn_body
-            .find("Stage -2: Focused BMC probe")
-            .expect("solve_complex_loop should keep the focused BMC probe");
-        let probe_end = fn_body
-            .find("Stage -1: Fast PDR probe")
-            .expect("BMC probe should precede the PDR probe");
-        let probe = &fn_body[probe_start..probe_end];
-
-        assert!(
-            src.contains("features.phase_bounded_depth.is_none()"),
-            "ComplexLoop BMC preprobe helper should skip non-phase-bounded cases"
-        );
-        assert!(
-            probe.contains("complex_loop_bmc_probe_skip_reason"),
-            "ComplexLoop BMC preprobe should use the shared skip helper"
-        );
-        assert!(
-            src.contains("non_phase_bounded_tpa_pdr_priority"),
-            "ComplexLoop BMC skip reason should be decision-log visible"
-        );
-        assert!(
-            probe.contains("result: \"skipped\""),
-            "ComplexLoop BMC skip should be logged as skipped"
-        );
-        assert!(
-            probe.contains("let _timeout_guard = cancel.cancel_after(bmc_budget);"),
-            "ComplexLoop BMC probe should keep the external cancellation timer"
-        );
-        assert!(
-            probe.contains(
-                "Self::complex_loop_bmc_per_depth_budget(bmc_budget, bmc_probe_max_depth)"
-            ),
-            "ComplexLoop BMC probe should derive per-depth caps from the total probe budget"
-        );
-        assert!(
-            probe.contains("per_depth_timeout: Some(bmc_per_depth_budget),"),
-            "ComplexLoop BMC probe should pass the per-depth cap into BMC"
-        );
-        assert!(
-            probe.contains("time_budget: Some(bmc_budget),"),
-            "ComplexLoop BMC probe should pass the total cap into BMC"
-        );
-    }
-
-    #[test]
-    fn complex_loop_logs_downstream_tpa_pdr_reachability_before_portfolio() {
-        let src = include_str!("adaptive_multi_pred_complex.rs");
-        let fn_start = src
-            .find("pub(super) fn solve_complex_loop(")
-            .expect("adaptive_multi_pred_complex.rs should define solve_complex_loop");
-        let fn_body = &src[fn_start..];
-        let fn_end = fn_body
-            .find("pub(super) fn solve_multi_pred_complex(")
-            .expect("solve_multi_pred_complex should follow solve_complex_loop");
-        let fn_body = &fn_body[..fn_end];
-        let reach_log = fn_body
-            .find("stage: \"complex_loop_tpa_pdr_reached\"")
-            .expect("ComplexLoop should log whether the downstream PDR/TPA portfolio is reached");
-        let run_portfolio = fn_body
-            .find("let result = self.run_portfolio(config);")
-            .expect("ComplexLoop should run the final portfolio");
-
-        assert!(
-            reach_log < run_portfolio,
-            "downstream reachability should be logged before running the portfolio"
-        );
-        assert!(
-            fn_body.contains("downstream portfolio includes pdr_tpa_bmc"),
-            "reachability log should identify that PDR, TPA, and BMC are available downstream"
-        );
-        assert!(
-            fn_body.contains("EngineConfig::Tpa(TpaConfig") && fn_body.contains("bmc_engine,"),
-            "final ComplexLoop portfolio should keep TPA and BMC engines available"
         );
     }
 

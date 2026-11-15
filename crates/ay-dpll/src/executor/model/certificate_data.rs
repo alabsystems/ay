@@ -19,6 +19,12 @@ pub(super) struct CertifiedTotalUfInterpretation {
     /// explicit else branch; it never infers totality from raw EUF row order.
     pub(super) rendered_rows: Vec<(Vec<String>, String)>,
     pub(super) rendered_default: String,
+    /// Set only by the quantified model check's completion
+    /// (`install_model_check_total_uf`): keys and values may then be any
+    /// scalar kind (bit-vector, floating-point, rounding mode) and abstract
+    /// elements of a plain uninterpreted sort, all taken from the same staged
+    /// model the table is installed into.
+    pub(super) element_carriers: bool,
 }
 
 /// One ground value owned by the exact certificate model that established it.
@@ -45,11 +51,85 @@ pub(super) struct StampedCertificatePin {
 #[derive(Debug)]
 pub(in crate::executor) struct CertifiedConstInterpEntry {
     pub(super) binding: ay_frontend::CheckedProjectionBinding,
-    pub(super) value: TermId,
-    pub(super) value_graph: StampedClosedValueGraph,
+    pub(super) body: CertifiedConstInterpBody,
     /// Exact frontend term for a nullary declaration. Arity>0 heads have no
     /// standalone declaration term and store `None`.
     pub(super) declaration_term: Option<(TermId, TermEntryStamp)>,
+}
+
+/// The BODY of one certified interpretation `I(f) = lambda x-bar. body`.
+///
+/// The certificate's accepting step is the same for every variant — substitute
+/// `I` into every assertion and demand an INDEPENDENT solver `Unsat` on the
+/// negation — so the variant says only what SHAPE of function was certified,
+/// never how much it is trusted.
+#[derive(Debug, Clone)]
+pub(in crate::executor) enum CertifiedConstInterpBody {
+    /// `lambda x-bar. c` for a CLOSED constant `c` (a scalar literal, or a
+    /// recursively nested `const-array`). The historical and still by far the
+    /// commonest shape.
+    Constant {
+        value: TermId,
+        value_graph: StampedClosedValueGraph,
+    },
+    /// `lambda x-bar. k + sum_i c_i * x_i` over `Int` parameters with an `Int`
+    /// result — the SYMBOLIC default.
+    ///
+    /// The restriction to a linear body over the DECLARED PARAMETERS is
+    /// load-bearing, and it is a restriction on the SHAPE, not on the numbers:
+    /// a body may mention no uninterpreted head at all, so two certified
+    /// interpretations can never be circular, and an entry carries NO `TermId`
+    /// — only arbitrary-precision integers. That is why this variant needs no
+    /// stamp-currency treatment: there is no arena slot to go stale.
+    LinearInt(LinearIntBody),
+}
+
+/// `k + sum_i c_i * x_i` over the declared `Int` parameters of one head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::executor) struct LinearIntBody {
+    coefficients: Box<[BigInt]>,
+    constant: BigInt,
+}
+
+impl LinearIntBody {
+    /// `None` for a nullary head: a 0-ary linear body IS a constant, and it
+    /// must travel through [`CertifiedConstInterpBody::Constant`] so that the
+    /// nullary declaration-term identity check still applies to it.
+    pub(in crate::executor) fn new(coefficients: Vec<BigInt>, constant: BigInt) -> Option<Self> {
+        (!coefficients.is_empty()).then(|| Self {
+            coefficients: coefficients.into_boxed_slice(),
+            constant,
+        })
+    }
+
+    pub(in crate::executor) fn arity(&self) -> usize {
+        self.coefficients.len()
+    }
+
+    pub(in crate::executor) fn coefficients(&self) -> &[BigInt] {
+        &self.coefficients
+    }
+
+    pub(in crate::executor) fn constant(&self) -> &BigInt {
+        &self.constant
+    }
+
+    /// The body's value at an integer argument point.
+    ///
+    /// `None` on an arity mismatch — never a fabricated value. This is the
+    /// "evaluate the default term AT the argument point" operation both the
+    /// ordinary evaluator and the independent gate perform; the arithmetic is
+    /// arbitrary precision, so there is no overflow surface.
+    pub(in crate::executor) fn evaluate(&self, arguments: &[BigInt]) -> Option<BigInt> {
+        if arguments.len() != self.coefficients.len() {
+            return None;
+        }
+        let mut value = self.constant.clone();
+        for (coefficient, argument) in self.coefficients.iter().zip(arguments) {
+            value += coefficient * argument;
+        }
+        Some(value)
+    }
 }
 
 /// Exact live slots of one closed value admitted by a constant-interpretation
@@ -61,7 +141,7 @@ pub(in crate::executor) struct CertifiedConstInterpEntry {
 /// makes that restriction robust if a speculative term suffix is rolled back
 /// and its numeric slots are later reused.
 #[derive(Debug, Clone)]
-pub(super) struct StampedClosedValueGraph {
+pub(in crate::executor) struct StampedClosedValueGraph {
     pub(super) slots: Box<[(TermId, TermEntryStamp)]>,
 }
 
@@ -131,9 +211,23 @@ fn scalar_literal_has_exact_sort(constant: &Constant, sort: &Sort) -> bool {
 impl CertifiedConstInterpEntry {
     pub(super) fn is_current(&self, ctx: &ay_frontend::Context) -> bool {
         ctx.projection_binding_still_current(&self.binding)
-            && self
-                .value_graph
-                .is_current(&ctx.terms, self.value, self.binding.result_sort())
+            && match &self.body {
+                CertifiedConstInterpBody::Constant { value, value_graph } => {
+                    value_graph.is_current(&ctx.terms, *value, self.binding.result_sort())
+                }
+                // No arena slot to go stale; what CAN drift is the
+                // declaration's signature, and the linear body is only
+                // meaningful against the exact Int arity it was certified for.
+                CertifiedConstInterpBody::LinearInt(linear) => {
+                    linear.arity() == self.binding.parameter_sorts().len()
+                        && self.binding.result_sort() == &Sort::Int
+                        && self
+                            .binding
+                            .parameter_sorts()
+                            .iter()
+                            .all(|sort| sort == &Sort::Int)
+                }
+            }
             && match (
                 self.binding.parameter_sorts().is_empty(),
                 self.declaration_term,
@@ -167,8 +261,29 @@ impl CertifiedConstInterpEntry {
         self.binding.result_sort()
     }
 
-    pub(in crate::executor) fn value(&self) -> TermId {
-        self.value
+    pub(in crate::executor) fn body(&self) -> &CertifiedConstInterpBody {
+        &self.body
+    }
+
+    /// The closed constant this entry publishes, or `None` for a symbolic
+    /// body. Never a "best effort" value: a caller that cannot evaluate a
+    /// symbolic body at an argument point must fail closed, not substitute a
+    /// constant that was never certified.
+    pub(in crate::executor) fn constant_value(&self) -> Option<TermId> {
+        match &self.body {
+            CertifiedConstInterpBody::Constant { value, .. } => Some(*value),
+            CertifiedConstInterpBody::LinearInt(_) => None,
+        }
+    }
+
+    /// The exact stamped arena slots this entry retains. A symbolic body
+    /// retains none: it carries only integers, so there is nothing for a
+    /// reader's preflight to visit or for a slot reuse to invalidate.
+    pub(super) fn value_graph_slots(&self) -> &[(TermId, TermEntryStamp)] {
+        match &self.body {
+            CertifiedConstInterpBody::Constant { value_graph, .. } => &value_graph.slots,
+            CertifiedConstInterpBody::LinearInt(_) => &[],
+        }
     }
 
     pub(super) fn declaration_term(&self) -> Option<TermId> {
@@ -235,7 +350,14 @@ pub(super) fn eval_value_has_exact_sort(value: &EvalValue, sort: &Sort) -> bool 
         | (EvalValue::Element(_), Sort::Uninterpreted(_))
         | (EvalValue::Element(_), Sort::Datatype(_)) => true,
         (EvalValue::Rational(value), Sort::Int) => value.is_integer(),
+        (EvalValue::Complex { real, imaginary }, Sort::Complex) => {
+            eval_value_has_exact_sort(real, &Sort::Real)
+                && eval_value_has_exact_sort(imaginary, &Sort::Real)
+        }
         (EvalValue::BitVec { width, .. }, Sort::BitVec(sort)) => *width == sort.width,
+        (EvalValue::FiniteField { value, field }, Sort::FiniteField(expected)) => {
+            field == expected && *value < field.modulus()
+        }
         (EvalValue::Fp(value), Sort::FloatingPoint(eb, sb)) => {
             value.eb() == *eb && value.sb() == *sb
         }
@@ -253,6 +375,33 @@ pub(in crate::executor) enum FormulaNeutralFunctionDefaultReadError {
     StaleIdentity,
     #[error("formula-neutral function default application has a conflicting signature")]
     SignatureConflict,
+}
+
+/// What a certificate hands to [`Model::install_certified_const_interps`].
+///
+/// Producer-side only: installation is where a witness becomes an entry, and
+/// it is the single place the shape restrictions on a symbolic body are
+/// checked (Int result, Int parameters, one coefficient per parameter).
+#[derive(Debug, Clone)]
+pub(in crate::executor) enum CertifiedConstInterpWitness {
+    Constant(TermId),
+    LinearInt(LinearIntBody),
+}
+
+/// One read of a model-owned certified interpretation AT an application.
+///
+/// A constant answers with the term it publishes; a symbolic body answers with
+/// the body plus the application's argument terms, because the value only
+/// exists once those arguments are evaluated. The two are deliberately
+/// distinct variants rather than one "value" so no caller can silently treat a
+/// symbolic interpretation as if it were constant.
+#[derive(Debug, Clone)]
+pub(in crate::executor) enum CertifiedConstInterpRead {
+    Constant(TermId),
+    LinearInt {
+        body: LinearIntBody,
+        arguments: Vec<TermId>,
+    },
 }
 
 /// A fail-closed read of a model-owned certified constant interpretation.
@@ -383,6 +532,9 @@ impl Clone for QuantifiedGrantModelSeal {
 }
 
 impl QuantifiedGrantModelSeal {
+    pub(super) fn is_installed(&self) -> bool {
+        self.0.is_some()
+    }
     pub(super) fn install(&mut self, epoch: &QuantifiedGrantModelEpoch) {
         self.0 = Some(Arc::clone(&epoch.0));
     }
@@ -399,6 +551,9 @@ impl QuantifiedGrantModelSeal {
 }
 
 impl QuantifiedConfirmationModelSeal {
+    pub(super) fn is_installed(&self) -> bool {
+        self.0.is_some()
+    }
     pub(super) fn install(&mut self, epoch: &QuantifiedConfirmationModelEpoch) {
         self.0 = Some(Arc::clone(&epoch.0));
     }

@@ -19,7 +19,7 @@ pub(in super::super) fn interval_scale_points(iv: &Interval, want: usize) -> Vec
     }
 
     let width = hi - lo;
-    let need = BigRational::from_integer(BigInt::from(want as u64 + 1)) / &width;
+    let need = BigRational::from_integer(BigInt::from(want) + BigInt::one()) / &width;
     let mut scale_bits = 0usize;
     let mut scale = BigRational::one();
     let two = BigRational::from_integer(BigInt::from(2));
@@ -28,7 +28,11 @@ pub(in super::super) fn interval_scale_points(iv: &Interval, want: usize) -> Vec
             return Vec::new();
         }
         scale *= &two;
-        scale_bits += 1;
+        // `scale_bits < GRID_SCALE_MAX_BITS` here, so this never declines.
+        let Some(next_bits) = scale_bits.checked_add(1) else {
+            return Vec::new();
+        };
+        scale_bits = next_bits;
     }
 
     let first = (lo * &scale).floor().to_integer() + BigInt::one();
@@ -56,7 +60,11 @@ pub(in super::super) fn interval_scale_points(iv: &Interval, want: usize) -> Vec
 
     let last_index = &count - BigInt::one();
     let divisor = BigInt::from((want.saturating_sub(1)).max(1) as u64);
-    let mut points = Vec::with_capacity(want);
+    // Fallible reservation: a request that cannot be held proposes nothing.
+    let mut points = Vec::new();
+    if points.try_reserve_exact(want).is_err() {
+        return Vec::new();
+    }
     for i in 0..want {
         let index = (BigInt::from(i as u64) * &last_index) / &divisor;
         let candidate = point(&(&first + index));
@@ -73,7 +81,15 @@ pub(in super::super) fn coordinate_candidates(
     iv: &Interval,
     grid: &[BigRational],
 ) -> Vec<BigRational> {
-    let mut candidates = Vec::with_capacity(grid.len() + GRID_MIN_BRANCH);
+    // Fallible reservation: a coordinate whose candidates cannot be held
+    // proposes nothing (candidates are proposals only).
+    let mut candidates = Vec::new();
+    let Some(capacity) = grid.len().checked_add(GRID_MIN_BRANCH) else {
+        return Vec::new();
+    };
+    if candidates.try_reserve_exact(capacity).is_err() {
+        return Vec::new();
+    }
     for candidate in [nice_point_in_open(iv), interval_midpoint(iv)]
         .into_iter()
         .flatten()
@@ -87,8 +103,11 @@ pub(in super::super) fn coordinate_candidates(
             candidates.push(candidate.clone());
         }
     }
-    if candidates.len() < GRID_MIN_BRANCH {
-        for candidate in interval_scale_points(iv, GRID_MIN_BRANCH - candidates.len()) {
+    if let Some(missing) = GRID_MIN_BRANCH
+        .checked_sub(candidates.len())
+        .filter(|missing| *missing > 0)
+    {
+        for candidate in interval_scale_points(iv, missing) {
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);
             }

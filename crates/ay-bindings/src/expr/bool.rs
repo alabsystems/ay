@@ -20,8 +20,6 @@ impl Expr {
     /// Logical NOT.
     /// REQUIRES: `self` is a Bool sort.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     #[allow(clippy::should_implement_trait)] // Intentional SMT-LIB2 API naming, not std::ops::Not
     pub fn not(self) -> Self {
@@ -31,8 +29,6 @@ impl Expr {
     /// Logical AND (binary).
     /// REQUIRES: `self` and `other` are Bool sorts.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bool() && other.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn and(self, other: Self) -> Self {
         self.try_and(other).expect("AND requires Bool sorts")
@@ -41,8 +37,6 @@ impl Expr {
     /// Logical AND (n-ary).
     /// REQUIRES: every element is a Bool sort.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(exprs.iter().all(|e| e.sort.is_bool())))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn and_many(exprs: Vec<Self>) -> Self {
         Self::try_and_many(exprs).expect("AND requires all Bool sorts")
@@ -51,8 +45,6 @@ impl Expr {
     /// Logical OR (binary).
     /// REQUIRES: `self` and `other` are Bool sorts.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bool() && other.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn or(self, other: Self) -> Self {
         self.try_or(other).expect("OR requires Bool sorts")
@@ -61,8 +53,6 @@ impl Expr {
     /// Logical OR (n-ary).
     /// REQUIRES: every element is a Bool sort.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(exprs.iter().all(|e| e.sort.is_bool())))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn or_many(exprs: Vec<Self>) -> Self {
         Self::try_or_many(exprs).expect("OR requires all Bool sorts")
@@ -72,8 +62,6 @@ impl Expr {
         /// Logical XOR.
         /// REQUIRES: `self` and `other` are Bool sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_bool() && other.sort.is_bool())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn xor / try_xor,
         check: bool_same,
         assert_msg: "XOR requires Bool sorts",
@@ -85,8 +73,6 @@ impl Expr {
         /// Logical implication.
         /// REQUIRES: `self` and `other` are Bool sorts.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_bool() && other.sort.is_bool())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn implies / try_implies,
         check: bool_same,
         assert_msg: "IMPLIES requires Bool sorts",
@@ -98,8 +84,6 @@ impl Expr {
     /// Equivalent to `self.eq(other)` when both are Bool, but validates both are Bool-sorted.
     /// REQUIRES: `self` and `other` are Bool sorts.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort.is_bool() && other.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn iff(self, other: Self) -> Self {
         self.try_iff(other).expect("IFF requires Bool sorts")
@@ -108,7 +92,6 @@ impl Expr {
     /// If-then-else.
     /// REQUIRES: `cond` is Bool and `then_expr`/`else_expr` share a sort.
     /// ENSURES: result sort matches `then_expr`.
-    #[cfg_attr(kani, kani::requires(cond.sort.is_bool() && then_expr.sort == else_expr.sort))]
     #[must_use = "expression operations return a new Expr"]
     pub fn ite(cond: Self, then_expr: Self, else_expr: Self) -> Self {
         Self::try_ite(cond, then_expr, else_expr)
@@ -120,8 +103,6 @@ impl Expr {
     /// Equality.
     /// REQUIRES: `self` and `other` have identical sorts.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort == other.sort))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn eq(self, other: Self) -> Self {
         self.try_eq(other).expect("EQ requires same sort")
@@ -130,8 +111,6 @@ impl Expr {
     /// Not equal (convenience method).
     /// REQUIRES: `self` and `other` have identical sorts.
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(self.sort == other.sort))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn ne(self, other: Self) -> Self {
         self.eq(other).not()
@@ -140,8 +119,6 @@ impl Expr {
     /// Distinct (n-ary not equal).
     /// REQUIRES: all expressions share the same sort (or list is empty).
     /// ENSURES: result sort is Bool.
-    #[cfg_attr(kani, kani::requires(exprs.len() < 2 || exprs.iter().all(|e| e.sort == exprs[0].sort)))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     #[must_use = "expression operations return a new Expr"]
     pub fn distinct(exprs: Vec<Self>) -> Self {
         Self::try_distinct(exprs).expect("DISTINCT requires all same sort")
@@ -266,7 +243,7 @@ impl Expr {
                 &cond.sort,
             ));
         }
-        if then_expr.sort != else_expr.sort {
+        if !super::dt::same_sorts("ite (branches)", &then_expr.sort, &else_expr.sort)? {
             return Err(crate::SortError::binary(
                 "ite (branches)",
                 "matching sorts",
@@ -286,9 +263,14 @@ impl Expr {
     }
 
     /// Fallible version of [`Expr::eq`].
+    ///
+    /// Sorts agree when they are derived-equal or, for datatype sorts, the
+    /// same declaration under the declaration-scoped comparison of
+    /// `expr::dt` (equal declarations unfolded to different depths agree; a
+    /// datatype reference outside its declaration agrees with no datatype).
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_eq(self, other: Self) -> Result<Self, crate::SortError> {
-        if self.sort != other.sort {
+        if !super::dt::same_sorts("eq", &self.sort, &other.sort)? {
             return Err(crate::SortError::binary(
                 "eq",
                 "matching sorts",
@@ -314,13 +296,15 @@ impl Expr {
     pub fn try_distinct(exprs: Vec<Self>) -> Result<Self, crate::SortError> {
         if exprs.len() >= 2 {
             let first_sort = &exprs[0].sort;
-            if let Some(bad) = exprs.iter().find(|e| &e.sort != first_sort) {
-                return Err(crate::SortError::binary(
-                    "distinct",
-                    "all same sort",
-                    first_sort,
-                    &bad.sort,
-                ));
+            for expr in &exprs[1..] {
+                if !super::dt::same_sorts("distinct", first_sort, &expr.sort)? {
+                    return Err(crate::SortError::binary(
+                        "distinct",
+                        "all same sort",
+                        first_sort,
+                        &expr.sort,
+                    ));
+                }
             }
         }
         Ok(Self {

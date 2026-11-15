@@ -25,8 +25,10 @@ pub(crate) const DIAGNOSE_SAT_EXPECTATION_CONFLICT_SUMMARY: &str =
     preprocessing rule dropped a constraint (try `ay bisect --expected \
     unsat` to localize which --no-* flag changes AY's verdict); \
     (c) the model assignment is correct but `(get-model)` rendering is \
-    stale. Run `cargo build && ay <file>` — the debug build's verification \
-    pipeline re-checks conflicts and may panic with the exact site.";
+    stale. Build debug (`targo --unverified build`, or `cargo build` \
+    without the Trust toolchain) and run `./target/debug/ay <file>` — the \
+    debug build's verification pipeline re-checks conflicts and may panic \
+    with the exact site.";
 
 /// Detailed UNSAT/expected-SAT conflict guidance for internal builds.
 pub(crate) const DIAGNOSE_UNSAT_EXPECTATION_CONFLICT_SUMMARY: &str =
@@ -50,7 +52,8 @@ pub(crate) fn print_diagnose_next_steps(file: &Path, expected: &str) {
     println!("  3. Enable theory tracing:");
     println!("       ay solve --debug theory,verify {f} 2>&1 | less");
     println!("  4. Run debug build for full verification asserts:");
-    println!("       cargo build && ./target/debug/ay {f}");
+    let build = crate::rust_frontend::RustFrontend::current().render("cargo build");
+    println!("       {build} && ./target/debug/ay {f}");
 }
 
 #[derive(Args, Debug)]

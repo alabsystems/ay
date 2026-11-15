@@ -66,9 +66,21 @@ impl Solver {
     #[inline]
     #[cfg(test)]
     pub(super) fn forward_checker_derived_count(&self) -> Option<u64> {
-        self.cold.forward_checker
+        self.cold
+            .forward_checker
             .as_ref()
             .map(crate::forward_checker::ForwardChecker::derived_count)
+    }
+
+    /// Test helper: derived steps the forward checker could NOT verify by
+    /// RUP (it keeps them as trusted, so a proof would still be written).
+    #[inline]
+    #[cfg(test)]
+    pub(super) fn forward_checker_rup_failures(&self) -> Option<u64> {
+        self.cold
+            .forward_checker
+            .as_ref()
+            .map(crate::forward_checker::ForwardChecker::rup_failures)
     }
 
     /// Configure an online model witness for derived-clause validation.

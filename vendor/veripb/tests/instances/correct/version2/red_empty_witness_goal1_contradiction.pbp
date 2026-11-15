@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 2.0
+* The one shape for which a contradiction inside a proofgoal scope legitimately discharges the
+* enclosing proof-by-contradiction subproof, and which the fix for the fabricated-proofgoal
+* defect therefore has to keep ACCEPTING.
+*
+* `red` with an empty witness is a proof by contradiction, and its goal `#1` is `C|<empty> = C`,
+* so the premise the goal scope adds is `~C` -- the very constraint the subproof already carries.
+* A contradiction derived there really is a contradiction from `~C`.
+f 1
+red 1 x1 >= 1 ; ; begin
+    proofgoal #1
+        u >= 1 ;
+    end
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

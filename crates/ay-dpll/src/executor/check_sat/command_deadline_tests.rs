@@ -32,7 +32,7 @@ fn load_quantified_mix(exec: &mut Executor) {
 }
 
 #[test]
-fn control_lifetime_command_publication_preserves_one_nominal_deadline() {
+fn control_lifetime_command_publication_preserves_one_granted_deadline() {
     let mut exec = Executor::new();
     load_quantified_mix(&mut exec);
     // #honest-timeout: the quantified backstop is opt-in now, and this fixture
@@ -41,31 +41,26 @@ fn control_lifetime_command_publication_preserves_one_nominal_deadline() {
     exec.set_timeout(Some(Duration::from_secs(10)));
 
     let before_command = exec.install_command_publication_deadline();
-    assert_eq!(before_command, (None, None));
-    let nominal = exec
+    assert_eq!(before_command.previous(), (None, None));
+    let granted = exec
         .solve_deadline
         .get()
         .expect("the command scope must install its absolute deadline");
-    assert_eq!(exec.certification_deadline.get(), Some(nominal));
+    assert_eq!(exec.certification_deadline.get(), Some(granted));
 
-    // The nested solve may temporarily relax a quantified deadline, but must
-    // restore the exact command value before publication begins.
+    // A nested solve inherits the complete command allowance; it can neither
+    // compound it nor reinstall a shorter nominal wall before publication.
     let before_solve = exec.install_timeout_deadline_for_call();
-    assert_eq!(before_solve, Some(nominal));
-    assert!(
-        exec.solve_deadline
-            .get()
-            .is_some_and(|deadline| deadline > nominal),
-        "the fixture must exercise quantified deadline relaxation"
-    );
+    assert_eq!(before_solve.previous(), Some(granted));
+    assert_eq!(exec.solve_deadline.get(), Some(granted));
     exec.restore_timeout_deadline_after_call(before_solve);
     assert_eq!(
         exec.solve_deadline.get(),
-        Some(nominal),
-        "certification must inherit the original absolute deadline, not a renewed timeout"
+        Some(granted),
+        "certification must inherit the original allowance, not a renewed timeout"
     );
 
-    exec.restore_command_publication_deadline_after_call(before_command);
+    drop(before_command);
     assert_eq!(
         exec.solve_deadline.get(),
         None,
@@ -82,7 +77,10 @@ fn control_lifetime_command_publication_uses_tighter_relative_deadline() {
     exec.set_timeout(Some(Duration::from_secs(10)));
 
     let before_command = exec.install_command_publication_deadline();
-    assert_eq!(before_command, (Some(persistent), Some(persistent)));
+    assert_eq!(
+        before_command.previous(),
+        (Some(persistent), Some(persistent))
+    );
     let command_deadline = exec
         .solve_deadline
         .get()
@@ -97,7 +95,35 @@ fn control_lifetime_command_publication_uses_tighter_relative_deadline() {
         "certification must honor the complete command's tighter timeout"
     );
 
-    exec.restore_command_publication_deadline_after_call(before_command);
+    drop(before_command);
+    assert_eq!(exec.solve_deadline.get(), Some(persistent));
+    assert_eq!(exec.certification_deadline.get(), Some(persistent));
+}
+
+/// A command that unwinds restores its predecessor deadline exactly as one
+/// that returns: the CLI catches the panic and keeps the session going.
+#[test]
+fn control_lifetime_command_publication_restores_deadline_on_unwind() {
+    let mut exec = Executor::new();
+    let persistent = Instant::now() + Duration::from_mins(1);
+    exec.set_deadline(Some(persistent));
+    exec.set_timeout(Some(Duration::from_secs(2)));
+
+    let scope = exec.install_command_publication_deadline();
+    let command_deadline = exec
+        .solve_deadline
+        .get()
+        .expect("the command scope must install a deadline");
+    assert!(
+        command_deadline < persistent,
+        "the fixture must tighten the deadline"
+    );
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _scope = scope;
+        panic!("a solve that unwinds");
+    }));
+
+    assert!(unwound.is_err());
     assert_eq!(exec.solve_deadline.get(), Some(persistent));
     assert_eq!(exec.certification_deadline.get(), Some(persistent));
 }

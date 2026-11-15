@@ -56,7 +56,7 @@ impl LiaSolver<'_> {
                 continue;
             }
 
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 

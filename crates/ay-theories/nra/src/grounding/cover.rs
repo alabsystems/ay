@@ -8,11 +8,14 @@ use std::collections::VecDeque;
 
 use ay_core::term::TermId;
 
+/// At most three candidates exist: both bipartite sides and the greedy cover.
+const MAX_CANDIDATE_COVERS: usize = 3;
+
 /// Candidate pin sets, ordered as both bipartite sides followed by a general
 /// greedy cover.  Every returned cover leaves at most one unpinned factor in
 /// every monomial, counting multiplicity.
 pub(super) fn grounding_covers(monomials: &[Vec<TermId>]) -> Vec<Vec<TermId>> {
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(MAX_CANDIDATE_COVERS);
     if let Some((left, right)) = bipartite_sides(monomials) {
         candidates.push(left);
         candidates.push(right);
@@ -20,7 +23,7 @@ pub(super) fn grounding_covers(monomials: &[Vec<TermId>]) -> Vec<Vec<TermId>> {
     candidates.push(greedy_cover(monomials));
     candidates.retain(|cover| !cover.is_empty());
 
-    let mut unique = Vec::with_capacity(candidates.len());
+    let mut unique = Vec::with_capacity(MAX_CANDIDATE_COVERS);
     for cover in candidates {
         if !unique.contains(&cover) {
             unique.push(cover);
@@ -95,7 +98,8 @@ pub(super) fn greedy_cover(monomials: &[Vec<TermId>]) -> Vec<TermId> {
     let mut frequency = vec![0usize; variables.len()];
     for monomial in monomials {
         for variable in monomial {
-            frequency[index[variable]] += 1;
+            let count = &mut frequency[index[variable]];
+            *count = count.saturating_add(1);
         }
     }
 
@@ -133,7 +137,11 @@ pub(super) fn greedy_cover(monomials: &[Vec<TermId>]) -> Vec<TermId> {
             continue;
         }
         free.sort_by_key(|&slot| (std::cmp::Reverse(frequency[slot]), variables[slot]));
-        for &slot in &free[..free.len() - 1] {
+        // Pin every free factor except the least frequent one, which stays free.
+        let Some((_, pinned)) = free.split_last() else {
+            continue;
+        };
+        for &slot in pinned {
             in_cover[slot] = true;
         }
     }

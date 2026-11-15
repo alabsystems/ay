@@ -277,7 +277,11 @@ impl Executor {
             .take(proof.steps.len())
             .collect();
         let mut planned = 0usize;
+        let stop = self.make_proof_assembly_should_stop();
         for (index, atom) in leaves {
+            if stop() {
+                return 0;
+            }
             let bridge = (!pool.is_empty())
                 .then(|| ay_proof::plan_definitional_bridge(&mut self.ctx.terms, atom, &pool))
                 .flatten()
@@ -295,7 +299,7 @@ impl Executor {
             // step before any of them may enter the proof.
             let closed =
                 ay_proof::close_congruence_derivation(&mut self.ctx.terms, &bridge.derivation);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+            if self.check_proof_strict_until_stopped(&closed).is_err() {
                 continue;
             }
             let Some(fragment) = self.assemble_bridge_fragment(&bridge, &leaf_of, atom) else {
@@ -373,6 +377,25 @@ impl Executor {
                         args: args.clone(),
                     },
                 )
+                .is_none()
+            {
+                pool.push(definition);
+            }
+        }
+        // #divmod-def: each `divmod_def` binding, as the `fresh_def_eq` copy
+        // it is equivalent to (one symbol, the SAME definiens). Never past the
+        // cap below, so these can only add bridges, never empty the pool.
+        for (definiendum, definiens) in self.divmod_definition_bindings(proof) {
+            if pool.len() >= ay_proof::MAX_BRIDGE_CANDIDATES {
+                break;
+            }
+            let Some(definition) = self.ctx.terms.find_eq(definiendum, definiens) else {
+                continue;
+            };
+            let args = vec![definiendum];
+            let rule = AletheRule::FreshDefEq;
+            if leaf_of
+                .insert(definition, HypothesisLeaf::Definition { rule, args })
                 .is_none()
             {
                 pool.push(definition);

@@ -39,21 +39,23 @@
 // LRA completeness issues (#8255, #8256, #8257, #8452) but must NOT
 // reintroduce `unsat` — that is the soundness invariant guarded by
 // this test.
+//
+// Absence is not a verdict. This file used to answer a missing benchmark with
+// the string `unknown` — which the `assert_ne!(result, "unsat")` below
+// accepts, so on every host without the gitignored smtcomp corpus this guard
+// passed having run nothing. The benchmark is now vendored (6a14e726d,
+// force-added beside its simple_startup siblings), so it resolves through
+// `tracked_fixture`: a missing file is a broken tree and fails the test.
 
 use ntest::timeout;
 use std::process::Command;
 
+use crate::corpus::tracked_fixture;
+
+/// First stdout line of `ay` on the vendored QF_LRA benchmark.
 fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smtcomp/QF_LRA/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        smt_file
-    );
-    if !std::path::Path::new(&benchmark_path).is_file() {
-        eprintln!("SKIP: optional QF_LRA benchmark not found: {benchmark_path}");
-        return "unknown".to_string();
-    }
+    let benchmark_path = tracked_fixture(&format!("benchmarks/smtcomp/QF_LRA/{smt_file}"));
 
     let output = Command::new(ay_path)
         .arg(format!("-t:{timeout_ms}"))

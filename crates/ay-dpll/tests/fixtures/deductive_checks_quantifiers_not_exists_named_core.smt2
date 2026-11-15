@@ -1,0 +1,7 @@
+(set-option :produce-unsat-cores true)
+(set-logic ALL)
+(declare-const ground (_ BitVec 32))
+(assert (! (= ground #x0000012c) :named dn0))
+(assert (! true :named dn1))
+(assert (! (not (exists ((i_2 Int)) (and (<= 0 i_2) (< i_2 4294967296) (< 300 i_2)))) :named dn2))
+(check-sat)

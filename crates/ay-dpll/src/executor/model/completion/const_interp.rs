@@ -39,7 +39,7 @@ impl Executor {
     /// One predicate for both passes, so they can never drift on WHICH
     /// declarations may be touched. They differ only in WHEN occurrence
     /// withholds a default, which is the entire point of the split.
-    pub(super) fn is_ordinary_free_primary_declaration(
+    pub(in crate::executor) fn is_ordinary_free_primary_declaration(
         &self,
         surface_name: &str,
         info: &ay_frontend::SymbolInfo,

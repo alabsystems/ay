@@ -95,15 +95,15 @@ fn edge_connects(edges: &[(Literal, Literal)], lhs: Literal, rhs: Literal) -> bo
 
 /// Machine-checked-parity tie-in: the REAL `reduce_xor_input_pairs` accumulates
 /// exactly the GF(2) popcount-parity of its complementary-pair cancellations,
-/// matching the deductive-checks-discharged `xor_collapse_parity_verified` invariant
-/// (the development proof harness).
+/// matching the deductive-checks-discharged `xor_collapse_parity` invariant
+/// (crates/ay-sat-congruence-core/src/lib.rs).
 ///
 /// This is the differential test that ties the machine-checked parity FUNCTION
 /// to the actual runtime function: for every fully-collapsing XOR input multiset
 /// of arity 0..=5 (built from duplicate pairs `{x,x}` and complementary pairs
 /// `{x,¬x}` over distinct variables), the imperative `parity_flip` produced by
 /// the real reducer equals `(#complementary-pairs) % 2 == 1` — exactly the
-/// popcount-parity proven exact and order-independent in `ay-sat-verified`.
+/// popcount-parity proven exact and order-independent in `ay-sat-congruence-core`.
 #[test]
 fn reduce_xor_input_pairs_parity_matches_machine_checked_popcount() {
     // popcount-parity reference (mirrors the deductive-checks ground truth).

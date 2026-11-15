@@ -926,3 +926,85 @@ fn test_affine_zero_offset_not_distinct() {
     let x2 = store.mk_var("x", Sort::Int);
     assert!(!distinct_by_affine_offset(&store, lhs, x2));
 }
+
+/// #index-diseq-justified: a model-distinct index pair becomes a reason-carrying
+/// external disequality only when BOTH values are justified. `j` is pinned (its
+/// reason is a bound atom) and `i` is a bare model choice: before, the pair was
+/// asserted `i != j` under `j`'s reason alone -- a false theorem, since `i = 5`
+/// satisfies that reason -- and the array solver then treated `i` and `j` as
+/// provably distinct (the verifier's `variants2/d4b/d4b_029`: `unsat`, z3
+/// `sat`). Now the pair stays undecided and is split at the SAT level.
+#[test]
+fn test_index_pair_with_one_unjustified_value_is_split_not_asserted_distinct() {
+    let mut store = TermStore::new();
+    let arr_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = store.mk_var("a", arr_sort);
+    let i = store.mk_var("i", Sort::Int);
+    let j = store.mk_var("j", Sort::Int);
+    let v = store.mk_var("v", Sort::Int);
+    let zero = store.mk_int(BigInt::from(0));
+    let five = store.mk_int(BigInt::from(5));
+    let i_pin = store.mk_eq(i, zero);
+    let j_pin = store.mk_eq(j, five);
+    let stored = store.mk_store(a, i, v);
+    let _read = store.mk_select(stored, j);
+    let pair_is = |p: (TermId, TermId)| (p.0 == i && p.1 == j) || (p.0 == j && p.1 == i);
+    let requested = |r: &TheoryResult| match r {
+        TheoryResult::NeedModelEquality(req) => pair_is((req.lhs, req.rhs)),
+        TheoryResult::NeedModelEqualities(reqs) => {
+            reqs.iter().any(|req| pair_is((req.lhs, req.rhs)))
+        }
+        _ => false,
+    };
+
+    // `i` unjustified, `j` pinned: split, and no disequality recorded.
+    let mut arrays = ArraySolver::new(&store);
+    let mut euf = EufSolver::new(&store);
+    let value = |t: TermId| -> Option<(BigInt, Option<Vec<TheoryLit>>)> {
+        if t == i {
+            Some((BigInt::from(0), None))
+        } else if t == j {
+            Some((BigInt::from(5), Some(vec![TheoryLit::new(j_pin, true)])))
+        } else {
+            None
+        }
+    };
+    let result = propagate_array_index_info(&store, &mut arrays, &mut euf, value, true);
+    assert!(
+        result.as_ref().is_some_and(requested),
+        "i is unjustified: the pair must be split, got {result:?}"
+    );
+    assert!(
+        arrays
+            .undecided_index_pairs()
+            .iter()
+            .any(|p| pair_is((p.idx1, p.idx2))),
+        "no disequality may have been recorded for (i, j)"
+    );
+
+    // Control: both values justified -> a reason-carrying external
+    // disequality, and the pair is decided.
+    let mut arrays = ArraySolver::new(&store);
+    let mut euf = EufSolver::new(&store);
+    let value = |t: TermId| -> Option<(BigInt, Option<Vec<TheoryLit>>)> {
+        if t == i {
+            Some((BigInt::from(0), Some(vec![TheoryLit::new(i_pin, true)])))
+        } else if t == j {
+            Some((BigInt::from(5), Some(vec![TheoryLit::new(j_pin, true)])))
+        } else {
+            None
+        }
+    };
+    let result = propagate_array_index_info(&store, &mut arrays, &mut euf, value, true);
+    assert!(
+        !result.as_ref().is_some_and(requested),
+        "both values justified: no split for (i, j), got {result:?}"
+    );
+    assert!(
+        !arrays
+            .undecided_index_pairs()
+            .iter()
+            .any(|p| pair_is((p.idx1, p.idx2))),
+        "the justified disequality decides (i, j)"
+    );
+}

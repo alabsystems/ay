@@ -8,6 +8,7 @@ use ay_core::{ArraySort, Sort, TermId};
 use ay_model_check::{ArrayValue, ModelValue};
 
 use super::super::{charge_work, Model, TypedArrayParseBudget};
+use super::RenderedDatatypeGuard;
 use crate::executor::Executor;
 
 impl Executor {
@@ -26,7 +27,7 @@ impl Executor {
         let Some(interp) = arrays.array_values.get(&source) else {
             return false;
         };
-        !arrays.read_conflicted.contains(&source)
+        !arrays.is_withheld(&source)
             && interp
                 .index_sort
                 .as_ref()
@@ -43,12 +44,14 @@ impl Executor {
         model: &Model,
         source: TermId,
         sort: &ArraySort,
+        guard: &RenderedDatatypeGuard,
         work: &mut usize,
         parse_budget: &mut TypedArrayParseBudget,
     ) -> Option<ModelValue> {
+        self.poll_evaluation_stop().ok()?;
         let arrays = model.array_model.as_ref()?;
         let interp = arrays.array_values.get(&source)?;
-        if arrays.read_conflicted.contains(&source)
+        if arrays.is_withheld(&source)
             || interp
                 .index_sort
                 .as_ref()
@@ -61,15 +64,21 @@ impl Executor {
         {
             return None;
         }
-        let default =
-            self.typed_scalar_text(interp.default.as_deref()?, &sort.element_sort, parse_budget)?;
+        let default = self.typed_field_value_text(
+            interp.default.as_deref()?,
+            &sort.element_sort,
+            guard,
+            parse_budget,
+        )?;
         let mut stores = Vec::with_capacity(interp.stores.len());
         for (key, value) in interp.stores.iter().rev() {
+            self.poll_evaluation_stop().ok()?;
             stores.push((
-                self.typed_scalar_text(key, &sort.index_sort, parse_budget)?,
-                self.typed_scalar_text(value, &sort.element_sort, parse_budget)?,
+                self.typed_field_value_text(key, &sort.index_sort, guard, parse_budget)?,
+                self.typed_field_value_text(value, &sort.element_sort, guard, parse_budget)?,
             ));
         }
+        self.poll_evaluation_stop().ok()?;
         Some(ModelValue::Array(Box::new(ArrayValue {
             default,
             store: stores,

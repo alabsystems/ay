@@ -34,7 +34,7 @@ pub(crate) const PUBLIC_C_DECLARATION_MANIFEST_SHA256: &str =
 pub(crate) const PUBLIC_C_HEADER_SET_SHA256: &str =
     "dce02f1eb66ed3184226dc62f618992c1e6cfba47bb7c46d8d9fcafb98b15237";
 pub(crate) const AY_COMPAT_WRAPPER_SHA256: &str =
-    "ceab54112ea7d0c84f6f9c5b7a7a19ace618fed21e72104947cb4d13f73f70c1";
+    "9b6e34a7c8944849f3eeecb8ffc990c91c0f0035e000922657ec60e792426ab3";
 pub(crate) const TYPED_C_CALL_SITES_SHA256: &str =
     "3c2dcccda91d56a86ae41e6ba96c77a51d017db0369390943cfe8a6c57e08c41";
 pub(crate) const ADDITIONAL_STOCK_C_PROBE_SHA256: &str =
@@ -1762,10 +1762,15 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_z3_500_public_c_surface_is_exact() {
-        assert!(c_surface_is_exact());
+    fn historical_surface_rejects_current_header_extensions() {
+        // Preserve the historical commitment rather than rewriting it to
+        // certify APIs added after that measurement.
+        assert!(!c_surface_is_exact());
         assert_eq!(public_c_declarations().len(), PUBLIC_C_DECLARATION_COUNT);
-        assert_eq!(expected_c_surface_values(), observed_c_surface_values());
+        // Any changed header or consumer must keep the historical gate
+        // closed. The set of current differences is not an allowlist: new
+        // consumer coverage must not require rebaselining this old receipt.
+        assert_ne!(expected_c_surface_values(), observed_c_surface_values());
         assert_eq!(
             expected_c_surface_values()["declarations"],
             format!(

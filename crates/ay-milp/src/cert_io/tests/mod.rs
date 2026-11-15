@@ -123,6 +123,7 @@ fn emit_affine_fixture_with(
             block_angular_optimality_certificate: None,
             milp_optimality_tree_certificate: None,
             root_dual_bound_certificate: None,
+            milp_optimality_tree_block: None,
             sat_relu_infeasibility_certificate: None,
             parity_infeasibility_certificate: None,
             network_design_infeasibility_certificate: None,
@@ -165,10 +166,24 @@ fn tiny() -> (Model, String) {
 
 mod affine;
 mod affine_infeasible;
+mod input_caps;
 mod network;
+mod opt_tree_split;
 mod replay;
 mod sat_relu;
 mod wire;
+
+#[test]
+fn oversize_input_is_unverified_not_refuted() {
+    input_caps::oversize_input_is_unverified_not_refuted();
+    input_caps::a_genuinely_malformed_certificate_is_still_refuted();
+    input_caps::the_emitter_can_see_the_caps_the_parser_enforces();
+}
+
+#[test]
+fn every_opt_tree_split_refusal_names_its_record() {
+    opt_tree_split::every_split_refusal_names_its_record();
+}
 
 #[test]
 fn sat_relu_rup_parser_enforces_caps_before_body_allocation() {

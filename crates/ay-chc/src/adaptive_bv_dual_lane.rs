@@ -33,6 +33,9 @@ use crate::adaptive::{
 };
 use crate::adaptive_route_admission::admit_problem_clone_fanout;
 
+mod lane_reap;
+use lane_reap::join_bv_lanes;
+
 /// #8287 / FIX #2c: expanded-Bool state size above which bit-blasting lanes
 /// are intractable (state-space explosion; BvToBool has no cancellation check
 /// inside the transform). Shared by Lane A's skip and the MultiPredComplex
@@ -205,6 +208,7 @@ fn original_bv_bmc_sort_cost(sort: &ChcSort) -> Option<usize> {
 
 fn original_bv_bmc_expr_is_linear(expr: &ChcExpr) -> bool {
     match expr {
+        ChcExpr::ArrayLambda(_) => false,
         ChcExpr::Bool(_) | ChcExpr::Int(_) => true,
         ChcExpr::Real(_, _) => false,
         ChcExpr::BitVec(_, width) => *width <= 32,
@@ -4682,20 +4686,6 @@ fn reject_late_bv_lane_result(
     }
 }
 
-fn join_bv_lanes<I>(handles: I)
-where
-    I: IntoIterator<Item = std::thread::JoinHandle<()>>,
-{
-    for handle in handles {
-        // Rust cannot safely kill a thread. Every BV lane receives linked
-        // cooperative cancellation and the absolute deadline, then is always
-        // synchronously reaped. This may wait for a currently executing
-        // transform stage to reach its next cancellation boundary, but no
-        // solver worker can outlive this route invocation.
-        let _ = handle.join();
-    }
-}
-
 fn triangle_bv_eval_args(
     args: &[ChcExpr],
     model: &FxHashMap<String, SmtValue>,
@@ -6496,7 +6486,7 @@ impl AdaptivePortfolio {
         let route_started = Instant::now();
         let route_deadline =
             bv_lane_route_deadline(route_started, budget, self.enclosing_subsolve_deadline());
-        let route_cancellation = self.cancellation_token.child();
+        let route_cancellation = self.lane_token();
         let Some(budget) = bv_lane_remaining(route_deadline, &route_cancellation) else {
             return PortfolioResult::Unknown;
         };
@@ -7085,6 +7075,7 @@ impl AdaptivePortfolio {
                         let bmc = crate::bmc::BmcSolver::new(
                             problem_e.clone(),
                             BmcConfig {
+                                smt_lane: crate::smt::SmtLane::Verification,
                                 base: ChcEngineConfig {
                                     verbose,
                                     cancellation_token: Some(cancel_e.child()),
@@ -7097,7 +7088,11 @@ impl AdaptivePortfolio {
                                 acyclic_safe: false,
                                 prefer_exact_acyclic_first: false,
                                 proof_cross_check: false,
+                                memory_budget: None,
                                 ts_probe_clamp: None,
+                                soft_time_budget: None,
+                                probe_extension_deadline: None,
+                                resume_frontier: None,
                                 sweep_past_spurious_sat: true,
                             },
                         );
@@ -7374,14 +7369,14 @@ impl AdaptivePortfolio {
             }
         }
 
-        // Stop every losing lane, then synchronously reap all workers. A lane
-        // currently inside one transform stage may take until its next
-        // cooperative boundary, but it is never detached from this solve.
+        // Stop every losing lane, then reap all workers (`join_bv_lanes`:
+        // synchronously, unless a verdict is already held).
         route_cancellation.cancel();
         join_bv_lanes(
             [handle_a, handle_b, handle_c, handle_d, handle_e]
                 .into_iter()
                 .flatten(),
+            matches!(best, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)),
         );
 
         // Recheck after all joins. A candidate received before the deadline
@@ -7421,7 +7416,7 @@ impl AdaptivePortfolio {
         let route_started = Instant::now();
         let route_deadline =
             bv_lane_route_deadline(route_started, budget, self.enclosing_subsolve_deadline());
-        let route_cancellation = self.cancellation_token.child();
+        let route_cancellation = self.lane_token();
         let Some(budget) = bv_lane_remaining(route_deadline, &route_cancellation) else {
             return PortfolioResult::Unknown;
         };
@@ -7646,11 +7641,13 @@ impl AdaptivePortfolio {
             }
         }
 
-        // Stop the loser and reap both workers synchronously. Rust cannot kill
-        // a thread safely, so a bounded join window would only detach it and
-        // violate the route lifetime boundary.
+        // Stop the loser and reap both workers (`join_bv_lanes`: synchronously,
+        // unless a verdict is already held).
         route_cancellation.cancel();
-        join_bv_lanes([handle_n, handle_s].into_iter().flatten());
+        join_bv_lanes(
+            [handle_n, handle_s].into_iter().flatten(),
+            matches!(best, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)),
+        );
 
         // A candidate accepted before cancellation still cannot cross an
         // enclosing deadline while the losing worker is being reaped.
@@ -7791,27 +7788,6 @@ mod tests {
         .join()
         .expect("deadline observer worker should not panic");
         assert_eq!(observed, Some(deadline));
-    }
-
-    #[test]
-    fn bv_dual_lane_cancellation_is_linked_and_workers_are_reaped() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let route = crate::CancellationToken::new();
-        let worker_cancellation = route.child();
-        let finished = Arc::new(AtomicBool::new(false));
-        let worker_finished = finished.clone();
-        let handle = std::thread::spawn(move || {
-            while !worker_cancellation.is_cancelled() {
-                std::thread::yield_now();
-            }
-            worker_finished.store(true, Ordering::Release);
-        });
-
-        route.cancel();
-        join_bv_lanes([handle]);
-        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]

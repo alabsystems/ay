@@ -24,11 +24,13 @@
 //! - `reference/bitwuzla/src/preprocess/pass/`
 
 mod bit_blast;
-mod der;
 mod distribute_forall;
 mod eq_diffvar;
 mod flatten_and;
+pub(crate) mod fp_literal;
 mod guarded_eq_mining;
+mod guarded_store_definitions;
+pub(crate) use guarded_store_definitions::batch as guarded_store_batch;
 mod ite_equality;
 mod nnf;
 mod normalize_arith_som;
@@ -42,11 +44,13 @@ mod tseitin_cnf;
 mod variable_subst;
 
 pub(crate) use bit_blast::BitBlast;
-// Apply-surface only (z3's `der` / `distribute-forall` / `reduce-args`
-// tactics): plain structs, NOT `PreprocessingPass`, deliberately never enrolled
-// in the solve pipeline (so `check-sat`/`get-model` behavior is unchanged).
-pub(crate) use der::Der;
+// Apply-surface only (z3's `distribute-forall` / `reduce-args` tactics):
+// plain structs, NOT `PreprocessingPass`, deliberately never enrolled in the
+// solve pipeline (so `check-sat`/`get-model` behavior is unchanged). The `der`
+// tactic runs the quantifier pipeline's DER pass (`crate::simplifier`).
 pub(crate) use distribute_forall::DistributeForall;
+#[cfg(test)]
+pub(crate) use eq_diffvar::EQ_DIFF_VARIABLE_PURPOSE;
 pub(crate) use eq_diffvar::{AtomFold, EqDiffVar};
 pub(crate) use flatten_and::FlattenAnd;
 pub(crate) use guarded_eq_mining::GuardedEqMining;
@@ -59,8 +63,8 @@ pub(crate) use normalize_eq_bv_concat::NormalizeEqBvConcat;
 // `PreprocessingPass`, deliberately never enrolled in the solve pipeline.
 pub(crate) use propagate_ineqs::PropagateIneqs;
 pub(crate) use propagate_values::{
-    EqDiffVarAtomRecord, PropagateValues, PropagatedEntrySource, PropagatedRewriteRecord,
-    PropagationRecords,
+    ArrayUnitDerivation, EqDiffVarAtomRecord, PropagateValues, PropagatedEntrySource,
+    PropagatedRewriteRecord, PropagationRecords, RecordedVariableSubstitution,
 };
 pub(crate) use qe_light::QeLight;
 pub(crate) use reduce_args::ReduceArgs;
@@ -176,15 +180,45 @@ impl Preprocessor {
         Arc<Mutex<VariableSubstitution>>,
         Arc<Mutex<PropagateValues>>,
     ) {
+        Self::with_substitution_recording(None)
+    }
+
+    /// Early array/BV route: keep each real substitution round in the same
+    /// ordered ledger as PropagateValues, under the caller's shared envelope.
+    pub(crate) fn new_with_recorded_subst_and_propagation(
+        progress: Box<dyn FnMut(usize, usize) -> bool>,
+    ) -> (
+        Self,
+        Arc<Mutex<VariableSubstitution>>,
+        Arc<Mutex<PropagateValues>>,
+    ) {
+        Self::with_substitution_recording(Some(progress))
+    }
+
+    fn with_substitution_recording(
+        progress: Option<Box<dyn FnMut(usize, usize) -> bool>>,
+    ) -> (
+        Self,
+        Arc<Mutex<VariableSubstitution>>,
+        Arc<Mutex<PropagateValues>>,
+    ) {
         let var_subst = Arc::new(Mutex::new(VariableSubstitution::new()));
         let propagate_values = Arc::new(Mutex::new(PropagateValues::new()));
+        let substitution: Box<dyn PreprocessingPass> = match progress {
+            Some(progress) => Box::new(RecordedVariableSubstitution::new(
+                Arc::clone(&var_subst),
+                Arc::clone(&propagate_values),
+                progress,
+            )),
+            None => Box::new(SharedPass(Arc::clone(&var_subst))),
+        };
         let preprocessor = Self {
             passes: vec![
                 Box::new(NormalizeEqBvConcat::new()),
                 Box::new(FlattenAnd::new()),
                 Box::new(SharedPass(propagate_values.clone())),
                 Box::new(IteEquality::new()),
-                Box::new(SharedPass(var_subst.clone())),
+                substitution,
                 Box::new(NormalizeBvArith::new()),
             ],
             max_iterations: 100,

@@ -242,12 +242,73 @@ pub fn printed_la_generic_certificate_is_valid_bounded(
     else {
         return false;
     };
+    if some_signing_validates(&hypotheses, &existing, farkas, remaining_checks) {
+        return true;
+    }
+    integer_strengthened(terms, clause, &hypotheses).is_some_and(|strengthened| {
+        some_signing_validates(&strengthened, &existing, farkas, remaining_checks)
+    })
+}
+
+/// The pinned checker's `strengthen` step, restricted to where it is sound:
+/// a STRICT row `e > 0` whose literal compares two `Int`-sorted operands and
+/// whose printed linear form has integral coefficients and constant is an
+/// integer-valued `e`, so it becomes `e - 1 >= 0`. Carcara strengthens every
+/// row with an integral constant, with no sort check
+/// (`alethe_printer::la_generic_surface` replays that verbatim); this audit
+/// takes only the sound `Int` subset. Without it the audit refused the
+/// integer tightening bridge `(cl (<= a (+ b (- 1))) (not (< a b)))
+/// :args (1 1)` that pinned Carcara and AY's strict checker both accept.
+/// `None` when no row changes.
+fn integer_strengthened(
+    terms: &TermStore,
+    clause: &[TermId],
+    hypotheses: &[(super::Lin, bool, bool)],
+) -> Option<Vec<(super::Lin, bool, bool)>> {
+    let mut strengthened = hypotheses.to_vec();
+    let mut changed = false;
+    for (&literal, (expr, strict, equality)) in clause.iter().zip(strengthened.iter_mut()) {
+        let atom = match terms.get(literal) {
+            TermData::Not(inner) => *inner,
+            _ => literal,
+        };
+        let int_operands = matches!(
+            terms.get(atom),
+            TermData::App(_, args) if args.len() == 2
+                && args.iter().all(|&arg| *terms.sort(arg) == ay_core::Sort::Int)
+        );
+        if !*strict
+            || *equality
+            || !int_operands
+            || !expr.constant.is_integer()
+            || !expr
+                .coeffs
+                .values()
+                .all(num_rational::BigRational::is_integer)
+        {
+            continue;
+        }
+        expr.constant -= num_rational::BigRational::from_integer(1.into());
+        *strict = false;
+        changed = true;
+    }
+    changed.then_some(strengthened)
+}
+
+/// Whether the printed coefficients, or a re-signing of their equality rows,
+/// validate `hypotheses`, spending `remaining_checks` per attempt.
+fn some_signing_validates(
+    hypotheses: &[(super::Lin, bool, bool)],
+    existing: &[Rational64],
+    farkas: &FarkasAnnotation,
+    remaining_checks: &mut usize,
+) -> bool {
     let mut check = |coefficients: &[Rational64]| {
         let next = remaining_checks.checked_sub(hypotheses.len().max(1))?;
         *remaining_checks = next;
-        Some(coeffs_valid(&hypotheses, coefficients))
+        Some(coeffs_valid(hypotheses, coefficients))
     };
-    if check(&existing) == Some(true) {
+    if check(existing) == Some(true) {
         return true;
     }
     let equality_indices: Vec<usize> = hypotheses
@@ -557,5 +618,50 @@ mod tests {
             ),
             "bare `cl` tokenizes as Alethe syntax, not a term symbol"
         );
+    }
+
+    /// The integer tightening bridge a quantifier-instance chain emits when
+    /// preprocessing tightened `(< a b)` over `Int` into `(<= a (+ b (- 1)))`
+    /// (F03 in `ay`'s `provenance_assume_gate_leak2`). Pinned Carcara accepts
+    /// it only through its `strengthen` step; the rational sum of the two rows
+    /// is `0 > -1`, not a contradiction. The audit must accept it over `Int`
+    /// operands, and must still refuse the same shape over `Real`, where the
+    /// strengthening is unsound.
+    #[test]
+    fn integer_tightening_bridge_is_accepted_only_over_int() {
+        for (sort, accepted) in [(Sort::Int, true), (Sort::Real, false)] {
+            let mut terms = TermStore::new();
+            let a = terms.mk_var("tight_a", sort.clone());
+            let b = terms.mk_var("tight_b", sort.clone());
+            let one = if sort == Sort::Int {
+                terms.mk_int((-1).into())
+            } else {
+                terms.mk_rational(num_rational::BigRational::from_integer((-1).into()))
+            };
+            let b_minus_one = terms.mk_app(Symbol::named("+"), [b, one], sort.clone());
+            let target = terms.mk_app(Symbol::named("<="), [a, b_minus_one], Sort::Bool);
+            let strict = terms.mk_app(Symbol::named("<"), [a, b], Sort::Bool);
+            let not_strict = terms.mk_not_raw(strict);
+            let clause = [target, not_strict];
+            let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+            let mut rendered = HashMap::default();
+            for &literal in &clause {
+                rendered.insert(literal, crate::format_term_alethe(&terms, literal));
+            }
+            let mut checks = 100;
+            let mut parse_bytes = 1_000_000;
+            assert_eq!(
+                printed_la_generic_certificate_is_valid_bounded(
+                    &terms,
+                    &clause,
+                    &farkas,
+                    &rendered,
+                    &mut checks,
+                    &mut parse_bytes,
+                ),
+                accepted,
+                "{sort:?}: {rendered:?}"
+            );
+        }
     }
 }

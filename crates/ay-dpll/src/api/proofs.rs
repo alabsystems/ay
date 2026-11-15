@@ -16,21 +16,30 @@ use ay_proof::{
     check_proof_collecting_trust_with_typed_context, check_proof_partial, check_proof_with_quality,
     AlethePrintError, DatatypeMemberSignature, PartialProofCheck, ProofCheckError, ProofQuality,
 };
+pub use ay_proof::{AletheDialect, CarcaraSurface, CleanOnlySpelling};
 use num_rational::BigRational;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
-use crate::array_proof_check::{
-    check_array_clause, check_array_clause_with_controls, ArrayStepVerdict,
-};
+use crate::array_proof_check::{check_array_clause_with_controls, ArrayStepVerdict};
 use crate::bv_proof_check::{
-    check_bv_assertions_unsat, check_bv_assertions_unsat_with_controls, check_bv_clause,
-    check_bv_clause_with_controls, BvStepVerdict,
+    check_bv_assertions_unsat_with_controls, check_bv_clause_with_controls, BvStepVerdict,
 };
 
 mod artifact_types;
 pub use artifact_types::{FarkasCertificate, ProofAcceptanceMode};
+
+mod certification_effort;
+pub(crate) use certification_effort::{
+    certify_node, CertificationEffort, EffortShare, EnvelopeStop,
+    CLOSED_SENTENCE_REFUTATION_ROUND_TRIPS,
+};
+
+mod discharge_controls;
+#[cfg(test)]
+pub(crate) use discharge_controls::arm_one_poll_memory_stop_for_testing;
+pub(crate) use discharge_controls::TrustClauseDischargeControls;
+
+#[cfg(test)]
+mod consumer_subset_tests;
 
 mod exact_query;
 pub use exact_query::ExactSmtlibQueryBinding;
@@ -41,150 +50,19 @@ use bv_lia_source_replay::discharge_source_bv_lia;
 mod bv_int_bridge_schema;
 use bv_int_bridge_schema::discharge_bv_int_bridge_schema;
 
-/// Bail-point probe for [`discharge_trust_clause`], on the existing
-/// `--probe-cert-reject` channel.
+/// Bail-point probe for [`discharge_trust_clause_with_controls`], on the
+/// existing `--probe-cert-reject` channel.
 ///
 /// The per-clause discharge is a funnel of seven lanes that all return the same
 /// `None`, so a rejection reports which clause failed but never which lane
-/// declined it, nor whether a lane declined on evidence or on a budget — the
+/// declined it, nor whether a lane declined on evidence or on its count — the
 /// distinction this whole investigation turns on. The two nested-solve lanes
-/// therefore also report the wall budget they ACTUALLY spent, which is what
-/// showed their 1000 ms cutoff is never the operative bound (measured 2 ms and
-/// 4 ms; they decline on the depth-0 re-entrancy guard). Lazily formatted; an
-/// unset flag costs one field read.
+/// therefore also report the conflict grant they drew from the certification
+/// pool and the conflicts they spent (P4a.1: the count that replaced their
+/// one-second wall). Lazily formatted; an unset flag costs one field read.
 fn probe_discharge(message: impl FnOnce() -> String) {
     if ay_core::misc_cli_flags().probe_cert_reject {
         eprintln!("--probe-cert-reject: discharge_trust_clause {}", message());
-    }
-}
-
-/// Caller-owned resource envelope for the fresh executors used while
-/// discharging one deferred-trust clause.
-///
-/// The ordinary proof-export API has no active solve transaction. Its legacy
-/// specialized BV/array checks therefore remain unbounded, while its generic
-/// replay/probe lanes retain their existing local one-second cap. The mandatory
-/// UNSAT publication funnel supplies its live interrupt, absolute deadline, RSS
-/// ceiling, and per-executor term-store ceiling so a corroborating solve cannot
-/// silently escape the outer query's controls.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct TrustClauseDischargeControls {
-    pub(crate) interrupt: Option<Arc<AtomicBool>>,
-    pub(crate) deadline: Option<ay_core::time::Instant>,
-    pub(crate) memory_limit: Option<usize>,
-    pub(crate) term_memory_limit: Option<usize>,
-}
-
-impl TrustClauseDischargeControls {
-    fn exact_term_memory_exceeded(&self, terms: &ay_core::TermStore) -> bool {
-        self.term_memory_limit
-            .is_some_and(|limit| terms.true_memory_bytes() > limit)
-    }
-
-    fn stop_requested(&self, terms: &ay_core::TermStore) -> bool {
-        self.interrupt
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            || self
-                .deadline
-                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
-            || crate::memory::memory_exceeded(self.memory_limit)
-            || ay_sys::process_memory_exceeded()
-            || ay_core::TermStore::global_memory_exceeded()
-            || self
-                .term_memory_limit
-                .is_some_and(|limit| terms.instance_memory_exceeded(limit))
-    }
-
-    pub(crate) fn nested_deadline(&self) -> ay_core::time::Instant {
-        let local = ay_core::time::Instant::now() + Duration::from_secs(1);
-        self.deadline.map_or(local, |outer| outer.min(local))
-    }
-
-    fn accept_if_live(&self, terms: &ay_core::TermStore) -> Option<()> {
-        (!self.stop_requested(terms) && !self.exact_term_memory_exceeded(terms)).then_some(())
-    }
-
-    pub(crate) fn live_until(
-        &self,
-        terms: &ay_core::TermStore,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        ay_core::time::Instant::now() < deadline && !self.stop_requested(terms)
-    }
-
-    pub(crate) fn accept_until(
-        &self,
-        terms: &ay_core::TermStore,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        self.live_until(terms, deadline) && !self.exact_term_memory_exceeded(terms)
-    }
-
-    pub(crate) fn term_store_clone_fits(
-        &self,
-        terms: &ay_core::TermStore,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        self.accept_until(terms, deadline)
-            && crate::memory::probe_clone_fits(terms.true_memory_bytes(), self.memory_limit)
-    }
-
-    fn install_on(&self, executor: &mut crate::Executor, deadline: ay_core::time::Instant) -> bool {
-        executor.set_memory_limit(self.memory_limit);
-        executor.set_term_memory_limit(self.term_memory_limit);
-        executor.set_solve_controls(self.interrupt.clone(), Some(deadline));
-        self.accept_until(&executor.ctx.terms, deadline)
-    }
-
-    /// Install this publication envelope on a fresh native proof-checking
-    /// solver before translation allocates into its private term store.
-    pub(crate) fn start_native_solver(
-        &self,
-        solver: &mut super::Solver,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        solver.set_memory_limit(self.memory_limit);
-        solver.set_term_memory_limit(self.term_memory_limit);
-        self.native_solver_accepts(solver, deadline)
-    }
-
-    /// Poll both the caller controls and the fresh solver's own term store.
-    pub(crate) fn native_solver_live(
-        &self,
-        solver: &super::Solver,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        self.live_until(solver.terms(), deadline)
-    }
-
-    fn native_solver_accepts(
-        &self,
-        solver: &super::Solver,
-        deadline: ay_core::time::Instant,
-    ) -> bool {
-        self.accept_until(solver.terms(), deadline)
-    }
-
-    /// Run a fresh native internal query under the already-elapsing deadline.
-    /// `None` means the envelope fired before or after the checked result.
-    pub(crate) fn check_native_solver_until(
-        &self,
-        solver: &mut super::Solver,
-        deadline: ay_core::time::Instant,
-    ) -> Option<super::VerifiedSolveResult> {
-        if !self.native_solver_accepts(solver, deadline) {
-            return None;
-        }
-        let remaining = deadline.checked_duration_since(ay_core::time::Instant::now())?;
-        solver.set_timeout(Some(remaining));
-        let result = if let Some(interrupt) = self.interrupt.clone() {
-            solver.check_sat_interruptible_internal_query(move || interrupt.load(Ordering::Relaxed))
-        } else {
-            solver.check_sat_internal_query()
-        };
-        self.native_solver_accepts(solver, deadline)
-            .then_some(result)
     }
 }
 
@@ -201,6 +79,51 @@ pub enum StrictProofVerdict {
     Verified(ProofQuality),
     /// Strict proof validation rejected the artifact with a stable explanation.
     Rejected(String),
+    /// Strict validation was STOPPED before it could decide: the deferred-trust
+    /// discharge (or the strict walk itself) was ended by a stop, never by
+    /// evidence about the proof. The same proof may verify on a retry with
+    /// more memory, or without the interrupt. A consumer must treat it as "no
+    /// verdict", never as a rejection, and never as verified.
+    Stopped(StrictVerdictStop),
+}
+
+/// What stopped a [`StrictProofVerdict::Stopped`] verdict.
+///
+/// There is no timeout: the export path installs no clock of its own, and
+/// every fresh solve it runs is bounded by the solved query's own `:rlimit`
+/// (P4a.1). That certification count's refusal is a [`StrictProofVerdict::Rejected`]
+/// whose text says "certification effort exhausted". An independently installed
+/// original caller boundary (including its work count) can instead stop a walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StrictVerdictStop {
+    /// The solver's interrupt was raised (or, defensively, a wall-clock stop
+    /// fired inside a fresh solve; the export path installs none), or an
+    /// original caller boundary withdrew permission to continue.
+    Interrupted,
+    /// A memory ceiling stopped it. `term_store` when it was the term-store
+    /// ceiling, a count of term-store bytes, rather than a process or lane
+    /// memory reading.
+    MemoryLimit {
+        /// Whether the term-store ceiling (a count) stopped it.
+        term_store: bool,
+    },
+}
+
+impl StrictVerdictStop {
+    /// The export's name for an envelope stop.
+    pub(crate) fn of_envelope(stop: EnvelopeStop) -> Self {
+        match stop {
+            EnvelopeStop::Interrupt
+            | EnvelopeStop::Backstop
+            | EnvelopeStop::Caller
+            | EnvelopeStop::WorkLimit => Self::Interrupted,
+            EnvelopeStop::ProcessMemory | EnvelopeStop::LaneShare => {
+                Self::MemoryLimit { term_store: false }
+            }
+            EnvelopeStop::TermMemory => Self::MemoryLimit { term_store: true },
+        }
+    }
 }
 
 /// Error returned when an UNSAT proof artifact is not acceptable at a
@@ -217,6 +140,13 @@ pub enum ProofAcceptanceError {
     /// Strict validation succeeded, but the proof is outside the restricted rule subset.
     #[error("proof is not in the restricted-rule-subset strict subset")]
     NotRestrictedRuleSubset,
+    /// Strict validation was stopped before it decided
+    /// ([`StrictProofVerdict::Stopped`]): no verdict, not a rejection.
+    #[error("strict proof verification was stopped before it decided: {stop:?}")]
+    StrictStopped {
+        /// What stopped it.
+        stop: StrictVerdictStop,
+    },
 }
 
 /// A consumer-facing UNSAT proof artifact for downstream consumers.
@@ -249,8 +179,14 @@ pub struct UnsatProofArtifact {
     /// External-checker consumers must use this transport instead of
     /// reconstructing a problem from their own normalized formula. `None`
     /// means the current problem theory cannot yet be serialized without
-    /// losing semantic identity; it does not weaken the independent native
-    /// [`Self::strict_verdict`].
+    /// losing semantic identity, or that the caller asked for the artifact
+    /// without it because it already holds the problem
+    /// ([`super::Solver::export_last_unsat_artifact_without_problem_transport`])
+    /// AND the document is printed in that problem's own spelling. A document
+    /// the canonical-spelling rescue produced is checkable only against the
+    /// canonical problem, so it always carries it, whatever the caller asked
+    /// for; `Some` from the session export means exactly that. It does not
+    /// weaken the independent native [`Self::strict_verdict`].
     pub alethe_problem_smt2: Option<String>,
     /// Partial check result from the internal checker.
     pub partial_check: Option<PartialProofCheck>,
@@ -263,6 +199,8 @@ pub struct UnsatProofArtifact {
     /// 1. [`strict_verdict`](Self::strict_verdict) is [`StrictProofVerdict::Verified`]
     /// 2. Every `Step` rule is in the restricted rule whitelist
     /// 3. Every `TheoryLemma` kind is in the restricted-rule-subset subset (EUF only)
+    /// 4. Every other step is `Assume`, `Resolution`, or `Anchor`; native-only
+    ///    certificate variants such as `NraSos` are outside this subset
     pub restricted_rule_subset: bool,
     /// Serialized LRAT certificate for the SAT backbone proof, when available.
     ///
@@ -271,6 +209,46 @@ pub struct UnsatProofArtifact {
     pub lrat_certificate: Option<Vec<u8>>,
     /// Structured Farkas certificates extracted from arithmetic theory lemmas.
     pub farkas_certificates: Vec<FarkasCertificate>,
+    /// Whether pinned Carcara can check [`Self::alethe`] as rendered — the
+    /// external-recheck surface verdict (owner decision D7, 2026-09-22).
+    ///
+    /// `Supported` means the document can be handed to Carcara as-is.
+    /// `Unsupported { reason }` means it cannot — a `Seq`, `FloatingPoint` or
+    /// `Char` sort, or a symbol that needs the AY/Z3 escape extension — and
+    /// names the first offender. `CleanDialect { spelling }` means pinned
+    /// Carcara parses it but refuses a step spelled for Clean's vendored
+    /// Carcara (the default [`ay_proof::AletheDialect::Clean`]; see
+    /// [`super::Solver::set_alethe_dialect`]); before 2026-09-30 such a
+    /// document said `Supported`. `WithoutLetExpansion` means the document
+    /// eliminates a `let` of [`Self::alethe_problem_smt2`] with `:rule let`,
+    /// which pinned Carcara checks only in AY's canonical invocation
+    /// `carcara check -- PROOF PROBLEM`, never under `--expand-let-bindings`;
+    /// before 2026-09-30 it said `Supported`. The verdict is independent of
+    /// [`Self::strict_verdict`]: an `Unsupported` artifact is exactly as
+    /// strict-checked as a `Supported` one. A consumer that CLAIMS an external
+    /// Carcara check must refuse an `Unsupported` artifact with `reason`,
+    /// fail-closed; a consumer that claims none takes the artifact at the
+    /// strict-checker class and never promotes it past it. The type is
+    /// `#[non_exhaustive]`: treat a variant you do not know as unsupported.
+    pub carcara_surface: CarcaraSurface,
+}
+
+/// Whether an exported artifact carries its own problem transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProblemTransport {
+    /// Render `alethe_problem_smt2` from the proof's problem scope.
+    Rendered,
+    /// The caller holds the problem; leave `alethe_problem_smt2` as `None`.
+    Omitted,
+}
+
+impl ProblemTransport {
+    fn render(self, render: impl FnOnce() -> Option<String>) -> Option<String> {
+        match self {
+            Self::Rendered => render(),
+            Self::Omitted => None,
+        }
+    }
 }
 
 /// Internal evaluation of all three proof quality signals.
@@ -325,6 +303,10 @@ pub(super) fn strict_verdict_from_result(
 ///
 /// Acceptance here stays at the SmtBacked / strict-checked tier: `ay`'s checker
 /// is the trusted base. It does NOT claim kernel-`Certified`.
+///
+/// Every fresh solve below (the guard, each clause's lanes, the whole-problem
+/// fallback) runs on a share of `controls`' certification count, never on a
+/// clock (P4a.1).
 fn strict_verdict_with_deferred_trust(
     strict_quality: Result<ProofQuality, ProofCheckError>,
     diagnostic_quality: &ProofQuality,
@@ -332,6 +314,7 @@ fn strict_verdict_with_deferred_trust(
     terms: &ay_core::TermStore,
     assertions: &[ay_core::TermId],
     resolve_ctx: &ay_frontend::Context,
+    controls: &TrustClauseDischargeControls,
 ) -> StrictProofVerdict {
     // Fast path: the plain strict checker already accepted.
     let plain_err = match strict_quality {
@@ -361,7 +344,7 @@ fn strict_verdict_with_deferred_trust(
     // forged (term-less Tseitin aux var in the split path; theory-conflict Farkas gap).
     // SOUND: downgrade-only and gated on a DEFINITIVE SAT, so a genuine UNSAT (re-solves
     // to UNSAT or Unknown, never SAT) is never disturbed and no false verdict is created.
-    if executor_redecides_definitive_sat(resolve_ctx) {
+    if executor_redecides_definitive_sat(resolve_ctx, controls) {
         return StrictProofVerdict::Rejected(
             "forged UNSAT: a fresh Executor independently re-decides the problem \
              assertions as DEFINITIVE SAT, so the trust-fallback UNSAT proof is not \
@@ -408,9 +391,9 @@ fn strict_verdict_with_deferred_trust(
     // whose negation is UNSAT, or the terminal EMPTY trust clause re-solved against
     // the whole problem. When EVERY collected clause discharges standalone, the
     // proof's trust steps are each independently certified.
-    let all_standalone = collected
-        .iter()
-        .all(|(_, clause)| discharge_trust_clause(terms, clause, assertions).is_some());
+    let all_standalone = collected.iter().all(|(_, clause)| {
+        discharge_trust_clause_with_controls(terms, clause, assertions, controls).is_some()
+    });
     if all_standalone {
         return StrictProofVerdict::Verified(diagnostic_quality.clone());
     }
@@ -431,20 +414,45 @@ fn strict_verdict_with_deferred_trust(
     // is not evidence by itself: the fresh result is accepted only when its own
     // proof passes the plain strict checker, with no deferred-trust rescue. This
     // prevents the same unsound engine path from corroborating itself.
-    if executor_reconfirms_unsat(resolve_ctx) {
+    if executor_reconfirms_unsat(resolve_ctx, controls) {
         return StrictProofVerdict::Verified(diagnostic_quality.clone());
     }
-    match check_bv_assertions_unsat(terms, assertions) {
+    match check_bv_assertions_unsat_with_controls(
+        terms,
+        assertions,
+        controls,
+        EffortShare::Reconfirm,
+    ) {
         BvStepVerdict::Valid => StrictProofVerdict::Verified(diagnostic_quality.clone()),
         BvStepVerdict::Invalid { .. } | BvStepVerdict::Unchecked { .. } => {
-            StrictProofVerdict::Rejected(
-                "deferred-trust discharge failed: a collected trust clause is not a \
-                 standalone theory tautology AND the problem assertions could not be \
-                 independently re-solved as UNSAT"
-                    .to_string(),
-            )
+            let mut reason = "deferred-trust discharge failed: a collected trust clause is not \
+                              a standalone theory tautology AND the problem assertions could \
+                              not be independently re-solved as UNSAT"
+                .to_string();
+            if let Some(exhausted) = controls.effort.exhaustion() {
+                reason.push_str("; ");
+                reason.push_str(&exhausted);
+            }
+            StrictProofVerdict::Rejected(reason)
         }
     }
+}
+
+/// The verdict the export publishes once its discharge has returned: a stop
+/// any lane latched is the verdict, whatever the lanes said, and a rejection
+/// that a lane-local clock contributed to is that stop too. A stop only ever
+/// ends lanes, so it is never published as [`StrictProofVerdict::Rejected`].
+fn stopped_verdict(
+    verdict: StrictProofVerdict,
+    controls: &TrustClauseDischargeControls,
+) -> StrictProofVerdict {
+    let stop = match verdict {
+        StrictProofVerdict::Rejected(_) => controls.decline_stop(),
+        _ => controls.observed_stop(),
+    };
+    stop.map_or(verdict, |stop| {
+        StrictProofVerdict::Stopped(StrictVerdictStop::of_envelope(stop))
+    })
 }
 
 fn exact_datatype_member_signatures(
@@ -483,7 +491,14 @@ fn exact_datatype_member_signatures(
 /// proof accepted by the plain strict checker. Fresh search state alone is not
 /// independence: without the second condition, the same wrong-UNSAT path could
 /// simply repeat and certify itself.
-fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
+///
+/// It runs on step (4)'s share of the certification count, the whole
+/// allowance: the same bound the executor path's step (4) has, now inside the
+/// outer `:rlimit` instead of unbounded.
+fn executor_reconfirms_unsat(
+    resolve_ctx: &ay_frontend::Context,
+    controls: &TrustClauseDischargeControls,
+) -> bool {
     if resolve_ctx.assertions.is_empty() {
         return false;
     }
@@ -491,9 +506,28 @@ fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
     // logic, options incl. `:produce-proofs`) — the same setup the main solve used,
     // so the complete `check_sat` path re-decides. Executor::new()'s own SAT/theory
     // state is fresh; `check_sat` re-encodes the assertions from scratch.
-    let mut exec = crate::Executor::new();
+    let mut exec = checking_executor();
     exec.ctx = resolve_ctx.clone();
-    executor_reports_plain_strict_unsat(&mut exec)
+    if controls
+        .install_on(&mut exec, EffortShare::Reconfirm)
+        .is_none()
+    {
+        return false;
+    }
+    let accepted = executor_reports_plain_strict_unsat(&mut exec);
+    controls.settle_nested(&exec, EffortShare::Reconfirm);
+    accepted && controls.accept_fits(&exec.ctx.terms)
+}
+
+/// A fresh executor for a solve whose verdict is used to CHECK another one.
+///
+/// Evidence policy P1 (2026-10-02): such a solve never runs a
+/// satisfiability-preserving strengthening (`executor/strengthening.rs`),
+/// which would let it re-derive the very fact it is checking.
+fn checking_executor() -> crate::Executor {
+    let mut exec = crate::Executor::new();
+    exec.force_strengthenings_off();
+    exec
 }
 
 /// Re-solve one fresh executor obligation and accept UNSAT only with a plain
@@ -533,64 +567,76 @@ fn executor_reports_plain_strict_unsat(exec: &mut crate::Executor) -> bool {
 /// Farkas-recording gap) whose per-clause trust steps may each look like standalone
 /// theory tautologies (`all_standalone == true`) yet whose overall UNSAT is forged for
 /// a satisfiable problem.
-pub(crate) fn executor_redecides_definitive_sat(resolve_ctx: &ay_frontend::Context) -> bool {
+///
+/// It runs on the guard's share of the certification count (an eighth of the
+/// allowance) and its grant of split-loop round trips, as the executor path's
+/// guard does: it is downgrade-only, so a smaller share costs at most a
+/// downgrade.
+fn executor_redecides_definitive_sat(
+    resolve_ctx: &ay_frontend::Context,
+    controls: &TrustClauseDischargeControls,
+) -> bool {
     if resolve_ctx.assertions.is_empty() {
         // An empty assertion set is trivially SAT, but there is nothing to forge:
         // never treat it as a forged-UNSAT signal.
         return false;
     }
-    let mut exec = crate::Executor::new();
+    let mut exec = checking_executor();
     exec.ctx = resolve_ctx.clone();
-    matches!(exec.check_sat(), Ok(result) if result.is_sat())
+    // A derived query: the guard reads the verdict and nothing else, so the
+    // deletion minimizer's subset re-solves are pure waste here (see
+    // `Executor::new_derived_query_executor`; core tracking itself stays on
+    // because the named-core redirect is the faster engine on some shapes).
+    exec.core_shrinking_suppressed = true;
+    if controls.install_on(&mut exec, EffortShare::Guard).is_none() {
+        return false;
+    }
+    let decided_sat = matches!(
+        controls.in_round_trip_grant(EffortShare::Guard, || exec.check_sat()),
+        Ok(result) if result.is_sat()
+    );
+    controls.settle_nested(&exec, EffortShare::Guard);
+    decided_sat
 }
 
-/// Independently discharge a deferred trust step, accepting only a checked
-/// non-empty theory tautology or a fresh strict refutation of the exact
-/// authored assertions for a terminal empty clause. All unsupported,
-/// satisfiable, unknown, malformed, or resource-limited cases fail closed.
+/// Independently discharge a deferred trust step under the default envelope
+/// (the ground allowance, no backstop): the test entry point.
+#[cfg(test)]
 pub(crate) fn discharge_trust_clause(
     terms: &ay_core::TermStore,
     clause: &[ay_core::TermId],
     assertions: &[ay_core::TermId],
 ) -> Option<()> {
     let controls = TrustClauseDischargeControls::default();
-    discharge_trust_clause_impl(terms, clause, assertions, &controls, None)
+    discharge_trust_clause_with_controls(terms, clause, assertions, &controls)
 }
 
-/// [`discharge_trust_clause`] under an already-elapsing publication resource
-/// envelope. Any fired/exceeded control declines the clause (fail-closed).
+/// Independently discharge a deferred trust step, accepting only a checked
+/// non-empty theory tautology or a fresh strict refutation of the exact
+/// authored assertions for a terminal empty clause. All unsupported,
+/// satisfiable, unknown, malformed, or count-exhausted cases fail closed; a
+/// stop declines too and stays latched on `controls`, which is how the
+/// caller tells the two apart.
+///
+/// Every nested solve draws from `controls`' certification pool, in proof
+/// order, and nothing here reads a clock.
 pub(crate) fn discharge_trust_clause_with_controls(
     terms: &ay_core::TermStore,
     clause: &[ay_core::TermId],
     assertions: &[ay_core::TermId],
     controls: &TrustClauseDischargeControls,
 ) -> Option<()> {
-    discharge_trust_clause_impl(terms, clause, assertions, controls, Some(controls))
-}
-
-/// Shared discharge funnel. `specialized_controls == None` preserves the
-/// ordinary proof-export API's legacy unbounded BV/array solvers; mandatory
-/// publication passes the active envelope through those private solvers too.
-fn discharge_trust_clause_impl(
-    terms: &ay_core::TermStore,
-    clause: &[ay_core::TermId],
-    assertions: &[ay_core::TermId],
-    controls: &TrustClauseDischargeControls,
-    specialized_controls: Option<&TrustClauseDischargeControls>,
-) -> Option<()> {
     if controls.stop_requested(terms) {
         return None;
     }
     // Terminal empty trust clause → re-discharge the original problem assertions.
     if clause.is_empty() {
-        let verdict = specialized_controls.map_or_else(
-            || check_bv_assertions_unsat(terms, assertions),
-            |controls| check_bv_assertions_unsat_with_controls(terms, assertions, controls),
-        );
+        let verdict =
+            check_bv_assertions_unsat_with_controls(terms, assertions, controls, EffortShare::Pool);
         return match verdict {
             BvStepVerdict::Valid => {
                 probe_discharge(|| "ACCEPT empty-clause bv-assertions-unsat".to_string());
-                controls.accept_if_live(terms)
+                controls.accept_fits(terms).then_some(())
             }
             // SAT/Unknown/unmodellable: the UNSAT claim is not independently
             // reproducible. Never accept (fail closed).
@@ -600,15 +646,20 @@ fn discharge_trust_clause_impl(
             }
         };
     }
+    discharge_trust_clause_impl(terms, clause, assertions, controls)
+}
 
-    let bv_verdict = specialized_controls.map_or_else(
-        || check_bv_clause(terms, clause),
-        |controls| check_bv_clause_with_controls(terms, clause, controls),
-    );
-    match bv_verdict {
+/// The non-empty clause's funnel.
+fn discharge_trust_clause_impl(
+    terms: &ay_core::TermStore,
+    clause: &[ay_core::TermId],
+    assertions: &[ay_core::TermId],
+    controls: &TrustClauseDischargeControls,
+) -> Option<()> {
+    match check_bv_clause_with_controls(terms, clause, controls) {
         BvStepVerdict::Valid => {
             probe_discharge(|| "ACCEPT check_bv_clause".to_string());
-            return controls.accept_if_live(terms);
+            return controls.accept_fits(terms).then_some(());
         }
         // Invalid: ¬clause is SAT → NOT a BV tautology. Never accept.
         BvStepVerdict::Invalid { .. } => {
@@ -621,14 +672,10 @@ fn discharge_trust_clause_impl(
     if controls.stop_requested(terms) {
         return None;
     }
-    let array_verdict = specialized_controls.map_or_else(
-        || check_array_clause(terms, clause),
-        |controls| check_array_clause_with_controls(terms, clause, controls),
-    );
-    match array_verdict {
+    match check_array_clause_with_controls(terms, clause, controls) {
         ArrayStepVerdict::Valid => {
             probe_discharge(|| "ACCEPT check_array_clause".to_string());
-            return controls.accept_if_live(terms);
+            return controls.accept_fits(terms).then_some(());
         }
         // Invalid: an independent solve refuted it. Never accept.
         ArrayStepVerdict::Invalid { .. } => {
@@ -645,7 +692,7 @@ fn discharge_trust_clause_impl(
 
     if discharge_source_bv_lia(terms, clause, assertions, controls) {
         probe_discharge(|| "ACCEPT discharge_source_bv_lia".to_string());
-        return controls.accept_if_live(terms);
+        return controls.accept_fits(terms).then_some(());
     }
     if controls.stop_requested(terms) {
         return None;
@@ -666,21 +713,17 @@ fn discharge_trust_clause_impl(
     // variable exceeds finite enumeration"). Every remaining route is a nested
     // solve, and a nested solve cannot discharge its own trust steps (the
     // depth-0 guard in `discharge_trust_steps_for_certification`), so the whole
-    // family fell through to the wall-clock-budgeted whole-problem re-solve —
-    // publishing a correct UNSAT as `unsat` or `unknown` depending on machine
-    // load. Measured on the deductive-checks `i = i + 1usize` loop-counter obligation:
+    // family fell through to the whole-problem re-solve, which was then
+    // wall-clock-budgeted — publishing a correct UNSAT as `unsat` or `unknown`
+    // depending on machine load. Measured on the deductive-checks `i = i + 1usize` loop-counter obligation:
     // stage (3) accepted 0 times, stage (4) 28, and the depth guard rejected
     // 36. See `bv_int_bridge_schema` for the derivations and the narrowness
     // pins.
     if discharge_bv_int_bridge_schema(terms, clause, assertions) {
         probe_discharge(|| "ACCEPT discharge_bv_int_bridge_schema".to_string());
-        return controls.accept_if_live(terms);
+        return controls.accept_fits(terms).then_some(());
     }
-    if controls.stop_requested(terms) {
-        return None;
-    }
-    let arena_deadline = controls.nested_deadline();
-    if !controls.term_store_clone_fits(terms, arena_deadline) {
+    if !controls.clone_fits(terms) {
         return None;
     }
     let mut arena = terms.clone();
@@ -706,8 +749,8 @@ fn discharge_trust_clause_impl(
     // Try the context-aware obligation BEFORE the context-free generic probe.
     // Most emitted trust clauses are consequences of the authored problem, not
     // standalone tautologies. In particular, incremental LIA refutations used
-    // to spend the generic probe's full one-second budget at every depth before
-    // this stronger check succeeded in milliseconds. Since `P ∧ ¬C` UNSAT also
+    // to spend the generic probe's whole budget (then a one-second wall) at
+    // every depth before this stronger check succeeded in milliseconds. Since `P ∧ ¬C` UNSAT also
     // holds for every standalone tautology C, this ordering changes no
     // acceptance condition; the smaller context-free probe remains below as a
     // fallback when the larger problem is harder for the solver.
@@ -724,33 +767,20 @@ fn discharge_trust_clause_impl(
     //
     // The degenerate case is harmless: if `P` is itself unsat then it entails
     // every C, but that is exactly the verdict being certified. `Unsat` is the
-    // only accepting outcome; Sat, Unknown, and timeout all decline.
+    // only accepting outcome; Sat, Unknown, a spent grant and a stop all
+    // decline.
     if !assertions.is_empty() {
-        let deadline = controls.nested_deadline();
         let mut entail = ay_frontend::Context::new();
         entail.terms = arena;
         entail.assertions = assertions.to_vec();
         entail.assertions.extend_from_slice(&negated);
-        let mut exec = crate::Executor::new();
+        let mut exec = checking_executor();
         exec.ctx = entail;
-        if !controls.install_on(&mut exec, deadline) {
-            return None;
-        }
-        let started = std::time::Instant::now();
-        let accepted = executor_reports_plain_strict_unsat(&mut exec);
-        let elapsed = started.elapsed();
-        probe_discharge(|| {
-            format!(
-                "{} entailment-lane (1000ms wall budget) elapsed={}ms unknown.reason={:?}",
-                if accepted { "ACCEPT" } else { "DECLINE" },
-                elapsed.as_millis(),
-                exec.statistics().get_string("unknown.reason"),
-            )
-        });
-        if accepted && controls.accept_until(&exec.ctx.terms, deadline) {
+        let accepted = run_pool_lane(controls, &mut exec, "entailment-lane")?;
+        if accepted && controls.accept_fits(&exec.ctx.terms) {
             return Some(());
         }
-        if ay_core::time::Instant::now() >= deadline || controls.stop_requested(&exec.ctx.terms) {
+        if controls.stop_requested(&exec.ctx.terms) {
             return None;
         }
         arena = std::mem::take(&mut exec.ctx.terms);
@@ -779,29 +809,53 @@ fn discharge_trust_clause_impl(
     //
     // SOUND and fail-closed. A repeated raw `Unsat` is not accepting evidence;
     // the nested solve must also produce a plain-strict proof of `not C`'s
-    // inconsistency. `Sat`, `Unknown`, timeout, missing proof, or any trust/hole
-    // in that proof all decline.
+    // inconsistency. `Sat`, `Unknown`, a spent grant, a stop, missing proof, or
+    // any trust/hole in that proof all decline.
     let mut probe = ay_frontend::Context::new();
     probe.terms = arena;
     probe.assertions = negated;
-    let deadline = controls.nested_deadline();
-    let mut exec = crate::Executor::new();
+    let mut exec = checking_executor();
     exec.ctx = probe;
-    if !controls.install_on(&mut exec, deadline) {
+    let accepted = run_pool_lane(controls, &mut exec, "standalone-lane")?;
+    (accepted && controls.accept_fits(&exec.ctx.terms)).then_some(())
+}
+
+/// One nested-solve lane of the per-clause discharge on a draw from the
+/// certification pool and the lane's grant of split-loop round trips: arm
+/// `exec`, re-solve it, debit what it spent, latch its stop. `None`: nothing
+/// ran (the pool is spent or a stop fired first); otherwise whether the
+/// re-solve was a plain-strict `unsat`.
+fn run_pool_lane(
+    controls: &TrustClauseDischargeControls,
+    exec: &mut crate::Executor,
+    lane: &str,
+) -> Option<bool> {
+    let Some(grant) = controls.install_on(exec, EffortShare::Pool) else {
+        probe_discharge(|| {
+            format!(
+                "DECLINE {lane}: {}",
+                controls
+                    .effort
+                    .exhaustion()
+                    .unwrap_or_else(|| format!("stopped ({:?})", controls.observed_stop()))
+            )
+        });
         return None;
-    }
-    let started = std::time::Instant::now();
-    let accepted = executor_reports_plain_strict_unsat(&mut exec);
-    let elapsed = started.elapsed();
+    };
+    let accepted = controls.in_round_trip_grant(EffortShare::Pool, || {
+        executor_reports_plain_strict_unsat(exec)
+    });
+    controls.settle_nested(exec, EffortShare::Pool);
     probe_discharge(|| {
         format!(
-            "{} standalone-lane (1000ms wall budget) elapsed={}ms unknown.reason={:?}",
+            "{} {lane} grant={grant} conflicts={} pool_spent={} unknown.reason={:?}",
             if accepted { "ACCEPT" } else { "DECLINE" },
-            elapsed.as_millis(),
+            exec.statistics().conflicts,
+            controls.effort.spent(),
             exec.statistics().get_string("unknown.reason"),
         )
     });
-    (accepted && controls.accept_until(&exec.ctx.terms, deadline)).then_some(())
+    Some(accepted)
 }
 
 /// Evaluate the proof through all three validation levels in a single pass.
@@ -888,6 +942,7 @@ fn is_restricted_rule_subset_rule(rule: &AletheRule) -> bool {
 /// 1. `trust_count == 0` and `hole_count == 0`
 /// 2. Every `Step` rule is in the restricted rule whitelist
 /// 3. Every `TheoryLemma` kind is in the restricted-rule-subset subset (EUF only)
+/// 4. Other variants must be explicitly supported structural steps
 fn check_restricted_rule_subset(quality: &ProofQuality, proof: &ay_core::Proof) -> bool {
     use ay_core::TheoryLemmaKind;
 
@@ -895,29 +950,20 @@ fn check_restricted_rule_subset(quality: &ProofQuality, proof: &ay_core::Proof) 
         return false;
     }
 
-    for step in &proof.steps {
-        match step {
-            ProofStep::Step { rule, .. }
-                if !is_restricted_rule_subset_rule(rule) => {
-                    return false;
-                }
-            ProofStep::TheoryLemma { kind, .. }
-                // Only EUF theory lemmas are in the restricted-rule-subset first slice.
-                // Arithmetic (LraFarkas, LiaGeneric) and other theories are out
-                // of scope even when they don't export as `trust`.
-                if !matches!(
-                    kind,
-                    TheoryLemmaKind::EufTransitive
-                        | TheoryLemmaKind::EufCongruent
-                        | TheoryLemmaKind::EufCongruentPred
-                ) => {
-                    return false;
-                }
-            // Assume, Resolution, Anchor are always OK.
-            _ => {}
-        }
-    }
-    true
+    proof.steps.iter().all(|step| match step {
+        ProofStep::Assume(_) | ProofStep::Resolution { .. } | ProofStep::Anchor { .. } => true,
+        ProofStep::Step { rule, .. } => is_restricted_rule_subset_rule(rule),
+        // Native validity does not imply support in the consumer's rule subset.
+        ProofStep::TheoryLemma { kind, .. } => matches!(
+            kind,
+            TheoryLemmaKind::EufTransitive
+                | TheoryLemmaKind::EufCongruent
+                | TheoryLemmaKind::EufCongruentPred
+        ),
+        // In particular, NraSos is independently checked (and lowers to checked
+        // Alethe) but is no subset rule. Future native variants need admission.
+        _ => false,
+    })
 }
 
 fn extract_farkas_certificates(proof: &ay_core::Proof) -> Vec<FarkasCertificate> {
@@ -976,6 +1022,9 @@ impl UnsatProofArtifact {
                     reason: reason.clone(),
                 })
             }
+            (StrictProofVerdict::Stopped(stop), _) => {
+                Err(ProofAcceptanceError::StrictStopped { stop: *stop })
+            }
         }
     }
 }
@@ -991,65 +1040,108 @@ impl super::Solver {
     /// **and** every rule is in the restricted rule whitelist. The `quality` field
     /// remains the non-strict diagnostic summary.
     ///
+    /// The document renders what the strict checker accepted for EVERY sort
+    /// (owner decision D7, 2026-09-22). A `Seq`, `FloatingPoint` or `Char`
+    /// sort, or a symbol spelled with the AY/Z3 escape extension, is not a
+    /// reason for `None`: the artifact is published and
+    /// [`UnsatProofArtifact::carcara_surface`] discloses that pinned Carcara
+    /// cannot parse it, so only a consumer claiming an external check refuses
+    /// it. Before D7 such proofs vanished here and reached every consumer as
+    /// "UNSAT but no strict-checked proof artifact was produced".
+    ///
     /// Returns `None` if:
     /// - The last result was not UNSAT
     /// - Proof output was not requested for that solve
     /// - No proof was generated
     /// - A query-sealed proof has no current authenticated Alethe surface
     /// - Bounded Alethe rendering fails or exhausts its work budget
+    /// - Rendering fails only for the AUTHORED assertion spelling, and the
+    ///   canonical-spelling re-render that rescues that case would publish a
+    ///   `Rejected` strict verdict.
+    ///
+    /// What the canonical-spelling rescue widens is the DECISION to publish,
+    /// and only in one direction: it turns a `None` into an artifact whose
+    /// strict verdict this boundary would have accepted anyway had the
+    /// spelling been printable. It never turns a refused render into a refused
+    /// verdict on the record.
+    ///
+    /// It does not restore the authored spelling, and a rescued artifact is
+    /// not the document the authored spelling would have produced. Both halves
+    /// — `alethe` and `alethe_problem_smt2` — are re-rendered in the CANONICAL
+    /// spelling `check_proof_strict` validated, so they agree with each other
+    /// throughout; a consumer that diffs either against the submitted source
+    /// text will see the canonical form, not its own.
     #[must_use]
     pub fn export_last_unsat_artifact(&self) -> Option<UnsatProofArtifact> {
+        self.export_last_unsat_artifact_with(ProblemTransport::Rendered)
+    }
+
+    /// [`Self::export_last_unsat_artifact`] for a caller that already holds
+    /// the problem: `alethe_problem_smt2` is not rendered and is `None` —
+    /// unless the document had to be re-printed in the canonical spelling,
+    /// which the caller's transcript does not match; then the canonical
+    /// problem it does match is rendered (that path alone, so the cost is
+    /// paid only where the caller's own problem cannot serve).
+    ///
+    /// A push/pop session asserts every fact once and checks many queries
+    /// against its live stack. Rendering the whole live stack again for every
+    /// UNSAT would make the artifact stream cost the SUM of the rows' cones —
+    /// the quadratic term a session exists to remove. The caller identifies
+    /// the problem instead by its own transcript of the live assertions (and,
+    /// in `ay-bindings`' `ExecutionSession`, by the chain digest of that live
+    /// stack). Every other field, including the native strict verdict against
+    /// the live problem scope, is exactly what the rendering export returns.
+    #[must_use]
+    pub fn export_last_unsat_artifact_without_problem_transport(
+        &self,
+    ) -> Option<UnsatProofArtifact> {
+        self.export_last_unsat_artifact_with(ProblemTransport::Omitted)
+    }
+
+    fn export_last_unsat_artifact_with(
+        &self,
+        transport: ProblemTransport,
+    ) -> Option<UnsatProofArtifact> {
         let proof = self.executor.last_proof()?;
         let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
         let strict_quality = self.executor.check_proof_strict_with_datatypes(proof);
-        let ordinary_surface = self
+        let (alethe, alethe_problem_smt2, canonical_rescue, dialect) =
+            self.render_artifact_surface(transport, strict_quality.is_ok())?;
+        // D7: the surface verdict is read on the SAME proof and override table
+        // the document above was rendered with, so the disclosure describes
+        // the artifact's own bytes — the canonical document after a rescue,
+        // the authored one otherwise. A parseable document that kept a
+        // spelling only Clean's vendored Carcara accepts is `CleanDialect`,
+        // as the CLI's certificate line says `clean-dialect` for it, and one
+        // that eliminated a problem `let` with `:rule let` is
+        // `WithoutLetExpansion` (`without-let-expansion`).
+        let carcara_surface = self
             .executor
-            .try_export_last_proof_alethe_for_problem_scope()?;
-        let alethe_problem_smt2 = self.executor.try_export_last_proof_alethe_problem_smt2();
-        let alethe = match ordinary_surface {
-            Ok(alethe) => alethe,
-            Err(AlethePrintError::UnsupportedArrayExtensionality { id })
-                if strict_quality.is_ok() =>
-            {
-                self.executor
-                    .try_export_extensionality_artifact_surface(id)?
-                    .ok()?
-            }
-            Err(_) => return None,
-        };
+            .carcara_surface_for_last_export(canonical_rescue)?
+            .with_dialect_report(&dialect);
         let terms = self.executor.terms();
         let evaluation = evaluate_proof_artifact_boundary(proof, terms, strict_quality)?;
 
         let restricted_rule_subset_ok =
             check_restricted_rule_subset(&evaluation.diagnostic_quality, proof);
-        // Strict verdict with the deferred-trust rescue: a proof whose only
-        // strict failure is a `trust` step demoted from genuine BV/array theory
-        // reasoning is accepted IFF every such clause is independently
-        // re-discharged as a theory tautology (¬clause UNSAT). All other strict
-        // failures stay Rejected. Stays at the strict-checked (SmtBacked) tier.
-        let strict_verdict = if finite_enum {
-            match &evaluation.strict_quality {
-                Ok(quality) => StrictProofVerdict::Verified(quality.clone()),
-                Err(error) => StrictProofVerdict::Rejected(error.to_string()),
-            }
-        } else {
-            let problem_assertions = self.executor.problem_assertions_for_strict_proof();
-            let mut resolve_ctx = self.executor.context().clone();
-            resolve_ctx.assertions = problem_assertions;
-            let assertions = resolve_ctx.assertions.as_slice();
-            // Deferred-trust validation can run fresh solvers. Those are
-            // semantic checks of this already-produced proof, not new caller
-            // decisions, so they must preserve the sealed CNF byte-for-byte.
-            let _export_suppression = crate::Executor::suppress_bv_cnf_export_for_internal_checks();
-            strict_verdict_with_deferred_trust(
-                evaluation.strict_quality,
-                &evaluation.diagnostic_quality,
-                proof,
-                terms,
-                assertions,
-                &resolve_ctx,
-            )
-        };
+        let ProofArtifactEvaluation {
+            diagnostic_quality,
+            partial_check,
+            strict_quality,
+        } = evaluation;
+        let strict_verdict =
+            self.artifact_strict_verdict(finite_enum, strict_quality, &diagnostic_quality, proof);
+        // The canonical-spelling rescue above exists to keep a CHECKED
+        // refutation from being withdrawn over an unprintable authored
+        // spelling. It is not a second chance for a refutation the strict
+        // checker refused: before that rescue this boundary returned `None`
+        // for every print error, so publishing a `Rejected` artifact here
+        // would be new behaviour that the rescue never claimed, and a
+        // consumer that only inspects `alethe` would read a document it was
+        // previously never handed. Re-withdraw it, exactly as before.
+        if canonical_rescue && !matches!(&strict_verdict, StrictProofVerdict::Verified(_)) {
+            return None;
+        }
         let restricted_rule_subset =
             matches!(&strict_verdict, StrictProofVerdict::Verified(_)) && restricted_rule_subset_ok;
         let farkas_certificates = extract_farkas_certificates(proof);
@@ -1057,13 +1149,193 @@ impl super::Solver {
         Some(UnsatProofArtifact {
             alethe,
             alethe_problem_smt2,
-            quality: evaluation.diagnostic_quality,
-            partial_check: Some(evaluation.partial_check),
+            quality: diagnostic_quality,
+            partial_check: Some(partial_check),
             strict_verdict,
             restricted_rule_subset,
             lrat_certificate: self.executor.last_lrat_certificate().map(<[u8]>::to_vec),
             farkas_certificates,
+            carcara_surface,
         })
+    }
+
+    /// The Alethe document of the last UNSAT proof, its problem transport
+    /// (per `transport`), whether the canonical-spelling rescue produced it,
+    /// and the dialect report of exactly the published render.
+    fn render_artifact_surface(
+        &self,
+        transport: ProblemTransport,
+        strict_ok: bool,
+    ) -> Option<(String, Option<String>, bool, ay_proof::AletheDialectReport)> {
+        // Each render is captured on its own, so the dialect report describes
+        // exactly the document published, never a refused first attempt.
+        let (ordinary_surface, ordinary_dialect) = ay_proof::capture_alethe_dialect_report(|| {
+            self.executor
+                .try_export_last_proof_alethe_for_problem_scope()
+        });
+        Some(match ordinary_surface? {
+            Ok(alethe) => (
+                alethe,
+                transport.render(|| self.executor.try_export_last_proof_alethe_problem_smt2()),
+                false,
+                ordinary_dialect,
+            ),
+            Err(AlethePrintError::UnsupportedArrayExtensionality { id }) if strict_ok => {
+                let (surface, dialect) = ay_proof::capture_alethe_dialect_report(|| {
+                    self.executor.try_export_extensionality_artifact_surface(id)
+                });
+                (
+                    surface?.ok()?,
+                    transport.render(|| self.executor.try_export_last_proof_alethe_problem_smt2()),
+                    false,
+                    dialect,
+                )
+            }
+            // The printer refused ONE SPELLING, not the refutation. Authored
+            // source syntax is a presentation channel, and it can be one the
+            // printer has no bridge for: an authored `(bvadd #x08 #x08)` and the
+            // canonical `#b00010000` in congruent positions of one `cong` step, or an
+            // `(assert (and A B (or C (and false D))))` whose canonical term
+            // flattens to `(and A B C)` and leaves the proof's `and_pos` steps
+            // with no printable projection off the authored grouping. Either
+            // way the document is refused although `check_proof_strict`
+            // accepted the derivation, and withdrawing the artifact there
+            // reports a checked UNSAT as `Unknown` at every strict consumer.
+            //
+            // WHICH spellings lack a bridge is not a fixed set — it shrinks as
+            // bridges are added, and neither this arm nor the gate below
+            // depends on the membership of that set. What they depend on is
+            // that the set is non-empty and fail-closed, which is a property of
+            // the printer's posture, not of any one fixture.
+            //
+            // This boundary owns the PAIRED problem transport, so it can
+            // re-render both halves in the canonical spelling the strict
+            // checker validated and disclose a document that agrees with the
+            // problem shipped beside it. `(get-proof)` and file-backed proof
+            // output keep the loud refusal, because the problem file they are
+            // checked against is not AY's to re-render.
+            //
+            // Nothing is lowered. The canonical retry goes through the same
+            // fail-closed printer, so an override-independent refusal — a
+            // missing Farkas certificate, an unrepresentable Skolem step, a
+            // non-problem `assume` — still yields `None` here. MEASURED, that
+            // happens two ways and the `?` / `.ok()?` below treat them alike:
+            // the same error is raised again, OR the canonical exporter
+            // DECLINES the proof outright (`None`) because it has no canonical
+            // spelling to fall back to — a sealed finite-enum proof, whose
+            // surface overrides are its authority rather than a presentation
+            // preference, is the case that exists today.
+            //
+            // The arm is deliberately BROAD, and the retry — not the error
+            // type — is what separates an authored-spelling refusal from an
+            // override-independent one. `AlethePrintError` carries no
+            // provenance field, and every variant the authored channel can
+            // raise (`InvalidSurfaceStep`, `InvalidCongruenceStep`,
+            // `InvalidArrayStep`, `AmbiguousSymbolSort`,
+            // `UndeclarableProofSymbols`, `ResugaredWitnessPrintedRaw`) is
+            // also raised for causes that have nothing to do with it, so no
+            // variant list draws the line. Withholding the overrides and
+            // re-printing does: a refusal the spelling caused disappears, a
+            // refusal the derivation caused survives. `Some(Ok(_))` from the
+            // canonical exporter is the only outcome that means rescued.
+            //
+            // What the retry does NOT decide is the VERDICT, so `canonical_rescue`
+            // carries the fact of the rescue to the gate below: this arm must
+            // only ever turn a `None` into a strictly ACCEPTED artifact. What
+            // it then publishes is the CANONICAL document and the canonical
+            // problem transport, whatever `transport` asked for: a caller's
+            // own problem is the AUTHORED one, which the canonical `assume`s
+            // do not match (measured: 25 of 79 session rows were Carcara-valid
+            // only against the canonical problem the session export dropped).
+            Err(_) => {
+                let (surface, dialect) = ay_proof::capture_alethe_dialect_report(|| {
+                    self.executor
+                        .try_export_last_proof_alethe_for_problem_scope_canonical()
+                });
+                (
+                    surface?.ok()?,
+                    self.executor
+                        .try_export_last_proof_alethe_problem_smt2_canonical(),
+                    true,
+                    dialect,
+                )
+            }
+        })
+    }
+
+    /// Strict verdict with the deferred-trust rescue: a proof whose only
+    /// strict failure is a `trust` step demoted from genuine BV/array theory
+    /// reasoning is accepted IFF every such clause is independently
+    /// re-discharged as a theory tautology (¬clause UNSAT). All other strict
+    /// failures stay Rejected. Stays at the strict-checked (SmtBacked) tier.
+    fn artifact_strict_verdict(
+        &self,
+        finite_enum: bool,
+        strict_quality: Result<ProofQuality, ProofCheckError>,
+        diagnostic_quality: &ProofQuality,
+        proof: &ay_core::Proof,
+    ) -> StrictProofVerdict {
+        // A walk the strict checker's envelope CANCELLED reached no verdict:
+        // publish the stop it recorded, never a rejection.
+        if matches!(strict_quality, Err(ProofCheckError::Cancelled)) {
+            let stop = self.executor.certification_stop().map_or(
+                StrictVerdictStop::Interrupted,
+                StrictVerdictStop::of_envelope,
+            );
+            return StrictProofVerdict::Stopped(stop);
+        }
+        if finite_enum {
+            return match strict_quality {
+                Ok(quality) => StrictProofVerdict::Verified(quality),
+                Err(error) => StrictProofVerdict::Rejected(error.to_string()),
+            };
+        }
+        // The plain strict checker accepted: `strict_verdict_with_deferred_trust`
+        // returns this verdict before reading the context, so do not pay for
+        // cloning the whole frontend context (every term of the session) on
+        // the path every accepted artifact takes.
+        let error = match strict_quality {
+            Ok(quality) => return StrictProofVerdict::Verified(quality),
+            Err(error) => error,
+        };
+        let terms = self.executor.terms();
+        let problem_assertions = self.executor.problem_assertions_for_strict_proof();
+        let mut resolve_ctx = self.executor.context().clone();
+        resolve_ctx.assertions = problem_assertions;
+        let assertions = resolve_ctx.assertions.as_slice();
+        // Deferred-trust validation can run fresh solvers. Those are
+        // semantic checks of this already-produced proof, not new caller
+        // decisions, so they must preserve the sealed CNF byte-for-byte.
+        let _export_suppression = crate::Executor::suppress_bv_cnf_export_for_internal_checks();
+        let controls = self.artifact_discharge_controls();
+        let verdict = strict_verdict_with_deferred_trust(
+            Err(error),
+            diagnostic_quality,
+            proof,
+            terms,
+            assertions,
+            &resolve_ctx,
+            &controls,
+        );
+        stopped_verdict(verdict, &controls)
+    }
+
+    /// The envelope of the export's deferred-trust discharge: the solved
+    /// query's own `:rlimit` as its count, this solver's interrupt and memory
+    /// ceilings, and NO backstop. No solve is active here, so no clock is left
+    /// to stop it: every fresh solve it runs is bounded by the count alone.
+    fn artifact_discharge_controls(&self) -> TrustClauseDischargeControls {
+        let tighter = |left: Option<usize>, right: Option<usize>| match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (limit, None) | (None, limit) => limit,
+        };
+        TrustClauseDischargeControls::new(
+            Some(self.interrupt.clone()),
+            None,
+            tighter(self.executor.memory_limit(), self.memory_limit),
+            tighter(self.executor.term_memory_limit(), self.term_memory_limit),
+            CertificationEffort::for_query(&self.executor),
+        )
     }
 
     /// Export the last UNSAT proof as a portable, serializable bundle that can
@@ -1091,6 +1363,23 @@ impl super::Solver {
     #[must_use]
     pub fn export_last_unsat_bundle(&self) -> Option<ay_proof::SerializableProofBundle> {
         let proof = self.executor.last_proof()?;
+        if self.executor.has_strict_native_nra_sos_bundle_state() {
+            // A stale SOS seal is terminal, just like the BV/LIA seal below.
+            // Generic rebuilding must not renew expired exact-query evidence.
+            return self
+                .executor
+                .strict_native_nra_sos_bundle_for_proof(proof)
+                .cloned();
+        }
+        if self.executor.has_strict_native_bv_lia_bundle_state() {
+            // Presence selects the exact sealed W7 exporter. A stale state is
+            // terminal: falling through would let the generic builder mint a
+            // fresh bundle after the authenticated term snapshot changed.
+            return self
+                .executor
+                .strict_native_bv_lia_bundle_for_proof(proof)
+                .cloned();
+        }
         let terms = self.executor.terms();
         let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
         if finite_enum && !self.executor.last_proof_is_checked_finite_enum() {
@@ -1138,6 +1427,11 @@ impl super::Solver {
     /// obligation by itself; consumers must compare the embedded datatype
     /// tables and independently obtain and compare the complete free-symbol
     /// declaration context required by the bundle binding contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `term` is not a live handle of this solver. Use
+    /// [`Self::try_render_term_canonical`] for a fallible version.
     #[must_use]
     pub fn render_term_canonical(&self, term: super::Term) -> String {
         let term = self.require_term("render_term_canonical", term);
@@ -1202,148 +1496,30 @@ impl super::Solver {
 }
 
 #[cfg(test)]
-mod trust_clause_resource_control_tests {
-    use super::*;
+#[path = "proofs/discharge_controls_tests.rs"]
+mod discharge_controls_tests;
 
-    #[test]
-    fn nested_executor_inherits_live_publication_controls() {
-        let interrupt = Arc::new(AtomicBool::new(false));
-        let outer_deadline = ay_core::time::Instant::now() + Duration::from_secs(1);
-        let controls = TrustClauseDischargeControls {
-            interrupt: Some(Arc::clone(&interrupt)),
-            deadline: Some(outer_deadline),
-            memory_limit: Some(usize::MAX),
-            term_memory_limit: Some(usize::MAX),
-        };
-        let effective_deadline = controls.nested_deadline();
-        assert_eq!(effective_deadline, outer_deadline);
-
-        let mut executor = crate::Executor::new();
-        assert!(controls.install_on(&mut executor, effective_deadline));
-        assert_eq!(executor.current_solve_deadline(), Some(outer_deadline));
-        assert_eq!(executor.memory_limit(), Some(usize::MAX));
-        assert_eq!(executor.term_memory_limit(), Some(usize::MAX));
-
-        interrupt.store(true, Ordering::Relaxed);
-        assert!(executor.solve_interrupt_is_set());
-    }
-
-    #[test]
-    fn controlled_discharge_rejects_expired_or_exhausted_envelopes() {
-        let mut terms = ay_core::TermStore::new();
-        let tautology = terms.true_term();
-        let proposition = terms.mk_var("controlled_assertion_p", ay_core::Sort::Bool);
-        let not_proposition = terms.mk_not_raw(proposition);
-        let expired = ay_core::time::Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .expect("one millisecond must fit before the current instant");
-        let expired_controls = TrustClauseDischargeControls {
-            deadline: Some(expired),
-            ..TrustClauseDischargeControls::default()
-        };
-        assert!(
-            discharge_trust_clause_with_controls(&terms, &[tautology], &[], &expired_controls,)
-                .is_none()
-        );
-
-        let exhausted_controls = TrustClauseDischargeControls {
-            term_memory_limit: Some(0),
-            ..TrustClauseDischargeControls::default()
-        };
-        assert!(discharge_trust_clause_with_controls(
-            &terms,
-            &[tautology],
-            &[],
-            &exhausted_controls,
-        )
-        .is_none());
-
-        let live_child_controls = TrustClauseDischargeControls {
-            term_memory_limit: Some(usize::MAX),
-            ..TrustClauseDischargeControls::default()
-        };
-        assert_eq!(
-            check_bv_clause_with_controls(&terms, &[tautology], &live_child_controls),
-            BvStepVerdict::Valid
-        );
-        assert_eq!(
-            check_array_clause_with_controls(&terms, &[tautology], &live_child_controls),
-            ArrayStepVerdict::Valid
-        );
-        assert_eq!(
-            check_bv_assertions_unsat_with_controls(
-                &terms,
-                &[proposition, not_proposition],
-                &live_child_controls,
-            ),
-            BvStepVerdict::Valid
-        );
-
-        // Directly exercise each fresh specialized Solver under a ceiling far
-        // below its non-empty baseline store. This isolates child propagation
-        // from the later structural replay lanes in the full discharge funnel.
-        let child_exhausted_controls = TrustClauseDischargeControls {
-            term_memory_limit: Some(1),
-            ..TrustClauseDischargeControls::default()
-        };
-        let BvStepVerdict::Unchecked { reason } =
-            check_bv_clause_with_controls(&terms, &[tautology], &child_exhausted_controls)
-        else {
-            panic!("tiny child term limit must decline the BV checker");
-        };
-        assert!(reason.contains("resource envelope"));
-        let ArrayStepVerdict::Unchecked { reason } =
-            check_array_clause_with_controls(&terms, &[tautology], &child_exhausted_controls)
-        else {
-            panic!("tiny child term limit must decline the array checker");
-        };
-        assert!(reason.contains("resource envelope"));
-        let BvStepVerdict::Unchecked { reason } = check_bv_assertions_unsat_with_controls(
-            &terms,
-            &[proposition, not_proposition],
-            &child_exhausted_controls,
-        ) else {
-            panic!("tiny child term limit must decline the BV assertion checker");
-        };
-        assert!(reason.contains("resource envelope"));
-    }
-
-    #[test]
-    fn clone_preflight_uses_an_exact_term_store_census() {
-        let mut terms = ay_core::TermStore::new();
-        let baseline = terms.true_memory_bytes();
-        assert!(!terms.instance_memory_exceeded(baseline));
-        for index in 0..512 {
-            let _ = terms.mk_var(
-                format!("clone_preflight_exact_census_{index}"),
-                ay_core::Sort::Bool,
-            );
-            if terms.true_memory_bytes() > baseline {
-                break;
-            }
-        }
-        let growth = terms.true_memory_bytes().saturating_sub(baseline);
-        assert!(growth > 0, "fixture must grow the source term store");
-        assert!(
-            growth < 64 * 1024,
-            "fixture must remain inside the hot-path cache window"
-        );
-        assert!(
-            !terms.instance_memory_exceeded(baseline),
-            "cached hot-path census must still be stale for this regression"
-        );
-
-        let controls = TrustClauseDischargeControls {
-            term_memory_limit: Some(baseline),
-            ..TrustClauseDischargeControls::default()
-        };
-        assert!(!controls.term_store_clone_fits(
-            &terms,
-            ay_core::time::Instant::now() + Duration::from_secs(1),
-        ));
-    }
-}
+#[cfg(test)]
+#[path = "proofs/stopped_verdict_tests.rs"]
+mod stopped_verdict_tests;
 
 #[cfg(test)]
 #[path = "proofs/deferred_trust_source_replay_tests.rs"]
 mod deferred_trust_source_replay_tests;
+
+#[cfg(feature = "z3-compat-internals")]
+#[path = "proofs/dag_snapshot.rs"]
+mod dag_snapshot;
+#[cfg(test)]
+#[path = "proofs/round_trip_grant_tests.rs"]
+mod round_trip_grant_tests;
+#[cfg(feature = "z3-compat-internals")]
+pub use dag_snapshot::{
+    NativeProofApplication, NativeProofDag, NativeProofInputBinding, NativeProofTrackingCache,
+};
+
+#[cfg(feature = "z3-compat-internals")]
+#[path = "proofs/clause_trail.rs"]
+mod clause_trail;
+#[cfg(feature = "z3-compat-internals")]
+pub use clause_trail::{NativeClauseEvent, NativeClauseOrigin, NativeClauseTrail};

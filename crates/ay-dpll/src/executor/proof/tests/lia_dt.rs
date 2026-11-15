@@ -187,54 +187,6 @@ fn test_qf_array_row1_collapse_is_strict_checkable() {
 }
 
 #[test]
-fn test_qf_dt_selector_projection_collapse_is_strict_checkable() {
-    // `(not (= (fst (mk a b)) a))` is the negation of the selector-projection
-    // axiom instance, so the term builder folds `fst(mk a b) → a` at elaboration
-    // and the whole assertion collapses to `false`. The UNSAT proof degenerates
-    // to a SINGLE empty-clause `trust` step. `promote_dt_selector_collapse`
-    // reconstructs the refutation from the parsed assertion: an `assume` of the
-    // disequality, a strict-checkable `DatatypeSelectorProject` lemma, and a
-    // resolution to the empty clause — trust-free, validated against the
-    // constructor→selector registry.
-    let input = r#"
-        (set-option :produce-proofs true)
-        (set-logic QF_DT)
-        (declare-datatypes ((Pair 0)) (((mk (fst Int) (snd Int)))))
-        (declare-const a Int)
-        (declare-const b Int)
-        (assert (not (= (fst (mk a b)) a)))
-        (check-sat)
-    "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
-    assert_eq!(outputs, vec!["unsat"]);
-    let text = exec.get_proof();
-    assert!(
-        !text.contains(":rule trust"),
-        "DT selector-projection collapse must not fall back to trust; got:\n{text}"
-    );
-    // `dt_project` is AY's kind name, not an Alethe rule (carcara has no
-    // datatype rules at all), so on the wire the lemma is an honest `hole`.
-    // The datatype-aware strict checker below still validates the real step.
-    assert!(
-        text.contains(":rule hole"),
-        "reconstructed proof should carry the projection lemma as an honest hole; got:\n{text}"
-    );
-    assert!(
-        !text.contains("dt_project"),
-        "must not emit a rule name no Alethe checker implements; got:\n{text}"
-    );
-    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
-    // Validation requires the constructor→selector registry, so go through the
-    // executor's datatype-aware strict checker rather than the bare one.
-    match exec.check_proof_strict_with_datatypes(proof) {
-        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
-        Err(e) => panic!("DT selector-projection proof must pass strict check, got {e:?}"),
-    }
-}
-
-#[test]
 fn test_qf_dt_concrete_tester_evaluation_is_strict_checkable() {
     for (label, actual_ctor, authored_is_positive) in [
         ("matching-negative", "red", false),

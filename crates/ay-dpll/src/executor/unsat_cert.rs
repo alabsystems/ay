@@ -20,27 +20,57 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 mod assumption_source;
+mod authored_subset;
+use assumption_source::AuthoredAssumptionSurfaces;
 mod authored_hypothesis_scope;
 mod certification_policy;
 mod certification_source;
+mod finite_expansion_evidence;
+mod forged_guard_arena;
+mod ground_core_corroboration;
+mod native_nra_sos;
+mod pending_bounded_bv_lia;
 mod pending_nested_array;
 mod probe;
 mod query_epoch_access;
+mod redecision_counts;
 mod rm_domain_expansion;
+mod screened_reconfirmation;
+use screened_reconfirmation::ReconfirmationReading;
+mod trust_clause_entailment;
+pub(in crate::executor) use authored_subset::CheckedExactAuthoredSubsetUnsat;
 use certification_source::{CertificationSource, StrictProofPresentationFailure};
+pub(super) use native_nra_sos::{
+    PreparedStrictNativeNraSosBundle, StrictNativeNraSosBundleState, StrictNativeNraSosBundleUnsat,
+};
+pub(super) use pending_bounded_bv_lia::{
+    PendingBoundedBvLiaUnsat, PreparedStrictNativeBvLiaBundle, StrictNativeBvLiaBundleState,
+    StrictNativeBvLiaBundleUnsat,
+};
 pub(super) use pending_nested_array::PendingNestedArrayBoolBvUnsat;
 pub(in crate::executor) use probe::probe_cert_reject;
 pub(crate) use probe::probe_cert_reject_raw;
 pub(in crate::executor) use rm_domain_expansion::CheckedExactRmDomainExpansionUnsat;
+#[cfg(test)]
+#[path = "unsat_cert/forged_guard_round_trip_tests.rs"]
+mod forged_guard_round_trip_tests;
 #[path = "unsat_cert/internal_certificate_scope.rs"]
 mod internal_certificate_scope;
+#[cfg(test)]
+#[path = "unsat_cert/source_derived_finite_expansion_tests.rs"]
+mod source_derived_finite_expansion_tests;
 use super::cert_accounting;
 use super::{Executor, QuantifierDeadlinePolicy};
 use crate::executor::exact_exists_bounds::CheckedExactExistsUnsat;
 use crate::executor::exact_forall_exists::CheckedExactForallExistsUnsat;
 use crate::executor::proof_resolution::CheckedSatRefutation;
+use crate::executor::quantifier_loop::result_mapping::compact_derived_arena;
+use crate::executor::ProofDeclineMechanism;
 use crate::executor::QueryAuthorityEpoch;
+use crate::executor::{CorroborationSource, UnsatCorroboration, UnsatEvidence};
+use crate::executor::{SemanticTokenCensus, SemanticTokenSource};
 use crate::executor_types::{SolveResult, UnknownOrigin};
+use ay_frontend::command::{MatchPattern, Term as FrontendTerm};
 
 thread_local! {
     /// Re-entrancy depth for the deferred-trust discharge.
@@ -70,18 +100,58 @@ thread_local! {
 ///
 /// These are the executor's already-calibrated ground-search defaults, made
 /// explicit here so this mandatory accepting gate cannot be disabled by the
-/// process-wide ground-budget experiment knob. Exhaustion is fail-closed:
-/// the fresh solve reports `Unknown(ResourceLimit)` and no certificate is
-/// minted.
+/// process-wide ground-budget experiment knob, and the split-loop round trips
+/// the whole nested check may run: none for step (4)'s re-solve, a count for
+/// step (4a)'s question and a closed-sentence refutation
+/// (`api/proofs/certification_effort/redecision.rs`), and the proof-assembly
+/// observations it may make: an allowance for step (4a)'s question only
+/// (`redecision_counts`). Exhaustion is fail-closed: the fresh solve reports
+/// `Unknown`, or the re-decision whose allowance it spent declines, and no
+/// certificate is minted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshReconfirmationLimits {
     max_conflicts: u64,
     max_decisions: u64,
+    max_round_trips: Option<u64>,
+    max_assembly_observations: Option<u64>,
 }
 
+/// The factor pricing step (4)'s whole-problem re-solve above the ground
+/// conflict allowance (#neq-step4-reprice).
+///
+/// Step (4) re-decides the authored problem WITHOUT the first solve's
+/// strengthenings (evidence policy P1 strips them from the derived
+/// executor), so its search is deliberately handicapped relative to the
+/// solve whose allowance priced it before: the two searches are not the
+/// same search, and one count cannot price both. Calibration datum
+/// (release, QF_UF `NEQ004_size7`, the LNH symmetry-breaking family whose
+/// 6 trust clauses only this arm can discharge): the aided first solve
+/// spends 4,275 conflicts, the kernel's unaided search 183,844, and this
+/// lane's unaided search 844,828 — 2.1x the 400k ground allowance, so
+/// certification declined a correct `unsat` the search had already
+/// computed. Factor 4 grants 1.6M conflicts, 1.9x that datum, still a
+/// deterministic count derived from the query's own allowance (never a
+/// clock), and leaves the outer search, step (3)'s pool and the
+/// forged-UNSAT guard priced exactly as before. Decisions stay at the
+/// ground decision allowance (the datum spent 6.07M of 24M).
+const STEP4_RESOLVE_CONFLICT_FACTOR: u64 = 4;
+
 const WHOLE_PROBLEM_RECONFIRMATION_LIMITS: FreshReconfirmationLimits = FreshReconfirmationLimits {
+    max_conflicts: Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE * STEP4_RESOLVE_CONFLICT_FACTOR,
+    max_decisions: Executor::DEFAULT_GROUND_DECISION_ALLOWANCE,
+    max_round_trips: None,
+    max_assembly_observations: None,
+};
+
+const CLOSED_SENTENCE_REFUTATION_LIMITS: FreshReconfirmationLimits = FreshReconfirmationLimits {
+    // Pinned to the ground allowances, NOT spread from the step-(4)
+    // limits above: a closed-sentence refutation runs inside a search
+    // with its own round-trip calibration and does not inherit the
+    // step-(4) factor.
     max_conflicts: Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE,
     max_decisions: Executor::DEFAULT_GROUND_DECISION_ALLOWANCE,
+    max_round_trips: Some(crate::api::proofs::CLOSED_SENTENCE_REFUTATION_ROUND_TRIPS),
+    max_assembly_observations: None,
 };
 
 fn tighter_optional_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -103,6 +173,20 @@ pub(crate) fn inside_trust_discharge_solve() -> bool {
     TRUST_DISCHARGE_DEPTH.with(|depth| depth.get()) > 0
 }
 
+/// True while ANY nested certification sub-solve is in flight on this thread.
+///
+/// Both re-entrancy guards above run a fresh `Executor` over an internal
+/// obligation and reach the public publication funnel with it. A refusal
+/// recorded under either one describes that probe, not the caller's query.
+///
+/// That sentence is the reason the transcript guard reads THIS predicate and
+/// not `inside_trust_discharge_solve` alone: the closed-sentence refutation is
+/// the second nested lane, and its own non-certification used to be narrated
+/// on the user's stderr beside an outer verdict that certified fine.
+pub(crate) fn inside_nested_certification_solve() -> bool {
+    inside_trust_discharge_solve() || CLOSED_SENTENCE_REFUTATION_DEPTH.with(|depth| depth.get()) > 0
+}
+
 /// One-shot capability proving that a provisional UNSAT verdict passed one
 /// complete exact-query certification lane.
 ///
@@ -114,9 +198,69 @@ pub(crate) fn inside_trust_discharge_solve() -> bool {
 #[derive(Debug)]
 pub(crate) struct UnsatCertificate(UnsatCertificateKind);
 
+/// The authority class behind a disposable probe's published UNSAT, as seen
+/// by a certificate that seals the probe's refutation into one of its own.
+///
+/// A sealing certificate may be no stronger than what it seals. The two exact
+/// theorems that seal nested refutations record it per refutation: the
+/// RoundingMode domain expansion (`unsat_cert/rm_domain_expansion.rs`, one
+/// probe per branch) and the closed-sentence theorem (one re-solve per nested
+/// obligation, [`Executor::reconfirm_negation_refuted_for_closed_sentence`]).
+/// The class is transitive: a probe that published on one of those theorems
+/// carries the theorem's own class (see [`UnsatCertificate::probe_authority`]).
+///
+/// It is also what one checked reconfirmation
+/// ([`Executor::reconfirm_unsat_within`]) establishes, `None` when it
+/// declined. That primitive re-decides the problem in a FRESH executor under
+/// deterministic conflict/decision caps and strict-checks the nested proof:
+/// `Checked` when the plain strict checker accepted that proof;
+/// `DischargedTrust` when it rejected the proof ONLY for a trust-kind step or
+/// a metered envelope refusal (`is_deferred_discharge_rejection`) — the
+/// deferred-trust discharge's entry condition, an admission that strict
+/// proofs refuse for a directly published `unsat`
+/// (`decline_trust_bearing_unsat_under_strict_proofs`). Two rules follow for
+/// a consumer that turns the class into AUTHORITY (the closed-sentence
+/// certificates, SAT and UNSAT):
+///
+/// * it may not install a `DischargedTrust` grant while strict evidence is
+///   demanded ([`Executor::closed_sentence_refutation_grant`]), or a closed
+///   sentence publishes `sat` on the very refutation its negation is refused
+///   (#closed-sentence-cert, 2026-09-23);
+/// * where it does install one (default rigor), what it publishes is no
+///   stronger than `DischargedTrust`: the UNSAT theorem seals the class into
+///   the obligation and is admitted as `discharged-trust`, never as a checked
+///   semantic certificate (2026-09-23 fp-strings hunt, E1).
+///
+/// What a `strict-proof` probe is: AY's native strict checker accepted its
+/// retained derivation end to end. That checker refuses every `trust` and
+/// `hole` step and every premise outside the authored scope, so the derivation
+/// holds none. Its RENDERED Alethe document can still print a `hole`
+/// (`unproved_steps=1`): a step whose kind AY validated but no pinned external
+/// checker can spell, such as an `FpGroundEval` lemma checked by the exact
+/// IEEE-754 evaluator. That is a gap in the document, not in the derivation,
+/// and the class stays `Checked` (measured on the 2026-09-23 fp-strings
+/// verifier's E1 witnesses: every branch prints
+/// `c !! wire downgrade ... kind FpGroundEval prints as hole`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::executor) enum ProbeUnsatAuthority {
+    /// A strict proof, an independently re-checked refutation, or an exact
+    /// semantic theorem none of whose nested refutations is trust.
+    Checked,
+    /// `discharged-trust`: the refutation's holes were discharged by a
+    /// fresh-executor re-solve of the SAME code. Tier B — a disclosed hole,
+    /// not an independent check.
+    DischargedTrust,
+}
+
 #[derive(Debug)]
 enum UnsatCertificateKind {
     StrictProof(AuthenticatedUnsatScope),
+    /// Exact source-bound native BV/LIA bundle. Its canonical proof replays
+    /// strictly in AY, while the unsupported Alethe rule remains an honest
+    /// wire hole rather than being mislabeled as externally checked.
+    StrictNativeBvLiaBundle(StrictNativeBvLiaBundleUnsat),
+    /// Independently replayed exact-source polynomial proof; native-only.
+    StrictNativeNraSosBundle(StrictNativeNraSosBundleUnsat),
     CheckedSatRefutation {
         checked: CheckedSatRefutation,
         scope: AuthenticatedUnsatScope,
@@ -136,7 +280,9 @@ enum UnsatCertificateKind {
     /// still independently re-lowered, gate-CNF'd, RUP-refuted and replayed.
     CheckedUfLeafBoolBv(CheckedUfLeafBoolBvUnsat),
     CheckedBvLia(CheckedBvLiaUnsat),
-    DischargedTrust(AuthenticatedUnsatScope),
+    /// The refutation's deferred holes were discharged; the corroboration
+    /// names the arm that did it (evidence E1, never "independently verified").
+    DischargedTrust(AuthenticatedUnsatScope, UnsatCorroboration),
     CheckedExactExists(CheckedExactExistsUnsat),
     CheckedExactForallExists(CheckedExactForallExistsUnsat),
     CheckedExactClosedForall(CheckedExactClosedForallUnsat),
@@ -144,6 +290,9 @@ enum UnsatCertificateKind {
     CheckedExactForallUfGround(CheckedExactForallUfGroundUnsat),
     CheckedExactFiniteExpansion(CheckedExactFiniteExpansionUnsat),
     CheckedExactRmDomainExpansion(CheckedExactRmDomainExpansionUnsat),
+    /// #qe-ground-first: a checked refutation of a proper subset of the
+    /// authored roots (`unsat_cert/authored_subset.rs`).
+    CheckedExactAuthoredSubset(CheckedExactAuthoredSubsetUnsat),
     /// #proof-capability B3 — the competition-mode raw admission carve-out.
     ///
     /// The exact public-query scope is authenticated (same unweakened epoch,
@@ -158,6 +307,218 @@ enum UnsatCertificateKind {
     /// `exact_semantic_verified`) reports false for it, so diagnostics and
     /// cross-check policy can never relabel a raw admission as a checked one.
     CompetitionRaw(AuthenticatedUnsatScope),
+}
+
+impl UnsatCertificateKind {
+    /// #semantic-token census tag for the exact semantic-certificate family.
+    /// Every other kind never reaches the semantic mint and reads
+    /// `not-semantic`.
+    const fn census_kind_tag(&self) -> &'static str {
+        match self {
+            Self::CheckedExactExists(_) => "exists",
+            Self::CheckedExactForallExists(_) => "forall-exists",
+            Self::CheckedExactClosedForall(_) => "closed-forall",
+            Self::CheckedExactClosedSentence(_) => "closed-sentence",
+            Self::CheckedExactForallUfGround(_) => "forall-uf-ground",
+            Self::CheckedExactFiniteExpansion(_) => "finite-expansion",
+            Self::CheckedExactRmDomainExpansion(_) => "rm-domain-expansion",
+            Self::CheckedExactAuthoredSubset(_) => "authored-subset",
+            Self::StrictProof(_)
+            // Native bundles (upstream #proof-capability lanes) never reach the
+            // semantic mint either: they certify a re-checked native artifact,
+            // not an exact source-semantic theorem.
+            | Self::StrictNativeBvLiaBundle(_)
+            | Self::StrictNativeNraSosBundle(_)
+            | Self::CheckedSatRefutation { .. }
+            | Self::CheckedBoolBv(_)
+            | Self::CheckedUfLeafBoolBv(_)
+            | Self::CheckedBvLia(_)
+            | Self::DischargedTrust(..)
+            | Self::CompetitionRaw(_) => "not-semantic",
+        }
+    }
+}
+
+/// Node-count cap for the #semantic-token census walks. A census line is a
+/// diagnostic; a pathological root is reported as "at least this many", never
+/// walked in full.
+const SEMANTIC_TOKEN_CENSUS_NODE_CAP: u32 = 65_536;
+/// Rendered-surface cap (in chars) for the #semantic-token census line.
+const SEMANTIC_TOKEN_CENSUS_SURFACE_CAP: usize = 240;
+
+/// Tree-node count of a sealed root, capped.
+fn sealed_root_node_count(terms: &CoreTermStore, root: TermId) -> u32 {
+    let mut stack = vec![root];
+    let mut nodes: u32 = 0;
+    while let Some(term) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes >= SEMANTIC_TOKEN_CENSUS_NODE_CAP {
+            return nodes;
+        }
+        match terms.get(term) {
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => {
+                stack.push(*c);
+                stack.push(*t);
+                stack.push(*e);
+            }
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+            _ => {}
+        }
+    }
+    nodes
+}
+
+/// Head symbol of a sealed root.
+fn sealed_root_head(terms: &CoreTermStore, root: TermId) -> String {
+    match terms.get(root) {
+        TermData::Const(Constant::Bool(true)) => "true".to_string(),
+        TermData::Const(Constant::Bool(false)) => "false".to_string(),
+        TermData::Const(_) => "const".to_string(),
+        TermData::Var(..) => "var".to_string(),
+        TermData::App(symbol, _) => symbol.name().to_string(),
+        TermData::Not(_) => "not".to_string(),
+        TermData::Ite(..) => "ite".to_string(),
+        TermData::Forall(..) => "forall".to_string(),
+        TermData::Exists(..) => "exists".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// One line, bounded, for a census field.
+fn bounded_census_surface(surface: String) -> String {
+    let flat: String = surface
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    match flat.char_indices().nth(SEMANTIC_TOKEN_CENSUS_SURFACE_CAP) {
+        Some((cut, _)) => format!("{}…", &flat[..cut]),
+        None => flat,
+    }
+}
+
+/// Head symbol of a parsed (authored) assertion, looking through `!`
+/// annotations.
+fn parsed_assertion_head(term: &FrontendTerm) -> String {
+    match term {
+        FrontendTerm::Const(_) => "const".to_string(),
+        FrontendTerm::Symbol(name)
+        | FrontendTerm::App(name, _)
+        | FrontendTerm::IndexedApp(name, _, _) => name.clone(),
+        FrontendTerm::QualifiedApp(qualified, _, _) => {
+            qualified.as_symbol().unwrap_or("as").to_string()
+        }
+        FrontendTerm::Let(..) => "let".to_string(),
+        FrontendTerm::Forall(..) => "forall".to_string(),
+        FrontendTerm::Exists(..) => "exists".to_string(),
+        FrontendTerm::Lambda(..) => "lambda".to_string(),
+        FrontendTerm::Annotated(inner, _) => parsed_assertion_head(inner),
+        FrontendTerm::Match(..) => "match".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// What a walk over the parsed (authored) assertion found.
+struct ParsedAssertionWalk {
+    /// Distinct declared symbols mentioned outside any binder that shadows
+    /// them.
+    symbols: u32,
+    /// Tree nodes visited (capped).
+    nodes: u32,
+    /// Whether every node was modelled. A walk that met an unmodelled node or
+    /// the cap can under-count symbols, so its `symbols == 0` proves nothing.
+    complete: bool,
+}
+
+fn note_declared_mention(
+    mentioned: &mut HashSet<String>,
+    declared: &HashSet<String>,
+    name: &str,
+    bound: &[String],
+) {
+    if declared.contains(name) && !bound.iter().any(|b| b == name) {
+        mentioned.insert(name.to_string());
+    }
+}
+
+/// Count the declared symbols a parsed assertion mentions, carrying binder
+/// scope explicitly so a declared constant re-bound by a quantifier (the
+/// keymaera family declares `ts…` AND binds it) is not counted as free.
+fn parsed_assertion_walk(parsed: &FrontendTerm, declared: &HashSet<String>) -> ParsedAssertionWalk {
+    let mut mentioned: HashSet<String> = HashSet::default();
+    let mut nodes: u32 = 0;
+    let mut complete = true;
+    let mut stack: Vec<(&FrontendTerm, Vec<String>)> = vec![(parsed, Vec::new())];
+    while let Some((term, bound)) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes >= SEMANTIC_TOKEN_CENSUS_NODE_CAP {
+            complete = false;
+            break;
+        }
+        match term {
+            FrontendTerm::Const(_) => {}
+            FrontendTerm::Symbol(name) => {
+                note_declared_mention(&mut mentioned, declared, name, &bound);
+            }
+            FrontendTerm::App(name, args) | FrontendTerm::IndexedApp(name, _, args) => {
+                note_declared_mention(&mut mentioned, declared, name, &bound);
+                for arg in args {
+                    stack.push((arg, bound.clone()));
+                }
+            }
+            FrontendTerm::QualifiedApp(qualified, _, args) => {
+                if let Some(name) = qualified.as_symbol() {
+                    note_declared_mention(&mut mentioned, declared, name, &bound);
+                }
+                for arg in args {
+                    stack.push((arg, bound.clone()));
+                }
+            }
+            FrontendTerm::Let(bindings, body) => {
+                for (_, value) in bindings {
+                    stack.push((value, bound.clone()));
+                }
+                let mut inner = bound;
+                inner.extend(bindings.iter().map(|(name, _)| name.clone()));
+                stack.push((body, inner));
+            }
+            FrontendTerm::Forall(vars, body)
+            | FrontendTerm::Exists(vars, body)
+            | FrontendTerm::Lambda(vars, body) => {
+                let mut inner = bound;
+                inner.extend(vars.iter().map(|(name, _)| name.clone()));
+                stack.push((body, inner));
+            }
+            FrontendTerm::Annotated(body, _) => stack.push((body, bound)),
+            FrontendTerm::Match(scrutinee, cases) => {
+                stack.push((scrutinee, bound.clone()));
+                for (pattern, body) in cases {
+                    let mut inner = bound.clone();
+                    match pattern {
+                        MatchPattern::Symbol(name) => inner.push(name.clone()),
+                        MatchPattern::Constructor(_, fields) => {
+                            inner.extend(fields.iter().cloned());
+                        }
+                        _ => complete = false,
+                    }
+                    stack.push((body, inner));
+                }
+            }
+            _ => complete = false,
+        }
+    }
+    ParsedAssertionWalk {
+        symbols: u32::try_from(mentioned.len()).unwrap_or(u32::MAX),
+        nodes,
+        complete,
+    }
 }
 
 /// Sealed evidence that one authored top-level universal has an exact closed
@@ -202,12 +563,21 @@ pub(in crate::executor) struct CheckedExactClosedForallUnsat {
 ///
 /// `Ground*` steps are re-evaluated (empty model, isolated memo) on every
 /// currentness check.  `Nested*` steps record that the checked reconfirmation
-/// primitive ([`Executor::reconfirms_negation_refuted_for_closed_sentence`])
+/// primitive ([`Executor::reconfirm_negation_refuted_for_closed_sentence`])
 /// independently re-derived `unsat` for the pinned sentence (respectively its
 /// pinned fresh negation) at mint time; like the SAT-side general arm that
 /// uses the identical primitive, that confirmation is mint-time-only and the
 /// step stays valid only while every pinned term identity and the full term
 /// snapshot remain current.
+///
+/// A `Nested*` step also records WHICH authority the re-solve was accepted on
+/// ([`ProbeUnsatAuthority`]): a proof AY's strict checker accepted, or one it
+/// refused only at a trust or hole step — the deferred-discharge entry
+/// condition, which is a fresh-executor re-solve of the same code and nothing
+/// more. Such a step is sealed only where
+/// [`Executor::closed_sentence_refutation_grant`] admits it (default rigor),
+/// and a theorem with one is admitted as `discharged-trust`, never as a
+/// checked semantic certificate.
 #[derive(Debug)]
 enum ClosedSentenceObligationKind {
     /// `evaluate_term(empty model)` returned `Bool(true)` for the pinned term.
@@ -216,13 +586,29 @@ enum ClosedSentenceObligationKind {
     GroundFalse,
     /// The pinned sentence itself was refuted (`unsat`) by the checked
     /// reconfirmation primitive: the sentence is FALSE.
-    NestedRefuted,
+    NestedRefuted { authority: ProbeUnsatAuthority },
     /// The pinned sentence's fresh negation was refuted by the checked
     /// reconfirmation primitive: the sentence is VALID (hence TRUE).
     NestedNegationRefuted {
         negation: TermId,
         negation_entry: TermEntryStamp,
+        authority: ProbeUnsatAuthority,
     },
+}
+
+impl ClosedSentenceObligationKind {
+    /// Whether this step rests on a `discharged-trust` re-solve.
+    const fn is_trust(&self) -> bool {
+        matches!(
+            self,
+            Self::NestedRefuted {
+                authority: ProbeUnsatAuthority::DischargedTrust
+            } | Self::NestedNegationRefuted {
+                authority: ProbeUnsatAuthority::DischargedTrust,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -243,8 +629,13 @@ struct ClosedSentenceObligation {
 enum ClosedSentenceObligationKindDraft {
     GroundTrue,
     GroundFalse,
-    NestedRefuted,
-    NestedNegationRefuted { negation: TermId },
+    NestedRefuted {
+        authority: ProbeUnsatAuthority,
+    },
+    NestedNegationRefuted {
+        negation: TermId,
+        authority: ProbeUnsatAuthority,
+    },
 }
 
 /// Deterministic work allowances for one closed-sentence refutation attempt.
@@ -780,99 +1171,6 @@ fn exact_finite_expansion_interpreted_operators(
     Some(operators)
 }
 
-/// Validate the binder-sensitive part of the quantified body before invoking
-/// the production expander.
-///
-/// `subst_vars` indexes substitutions by core name.  A malformed low-level
-/// TermStore could otherwise give one binder name multiple Var identities or a
-/// Var of the wrong sort, causing the replay to replace a term that is not a
-/// well-sorted occurrence of that binder.  Normal elaboration prevents this;
-/// the certificate checker enforces it independently because low-level Context
-/// mutation is part of the repository's adversarial test model.
-fn exact_finite_binder_occurrences_are_well_sorted(
-    terms: &CoreTermStore,
-    body: TermId,
-    binders: &[(String, CoreSort)],
-) -> bool {
-    let mut binder_sorts: HashMap<&str, &CoreSort> = HashMap::default();
-    for (name, sort) in binders {
-        if name.is_empty()
-            || !matches!(sort, CoreSort::BitVec(width) if width.width > 0)
-            || binder_sorts.insert(name.as_str(), sort).is_some()
-        {
-            return false;
-        }
-    }
-
-    let mut remaining = EXACT_CLOSED_FORALL_WORK_LIMIT;
-    let mut matched_var_ids: HashMap<String, u32> = HashMap::default();
-    let mut seen = HashSet::default();
-    let mut stack = vec![body];
-    while let Some(term) = stack.pop() {
-        if remaining == 0 || terms.entry_stamp(term).is_none() {
-            return false;
-        }
-        remaining -= 1;
-        if !seen.insert(term) {
-            continue;
-        }
-        match terms.get(term) {
-            TermData::Const(constant) => {
-                let well_sorted = match (constant, terms.sort(term)) {
-                    (Constant::Bool(_), CoreSort::Bool)
-                    | (Constant::Int(_), CoreSort::Int)
-                    | (Constant::Rational(_), CoreSort::Real)
-                    | (Constant::String(_), CoreSort::String) => true,
-                    (
-                        Constant::BitVec { width, .. },
-                        CoreSort::BitVec(ay_core::BitVecSort { width: sort_width }),
-                    ) => width == sort_width && *width > 0,
-                    _ => false,
-                };
-                if !well_sorted {
-                    return false;
-                }
-            }
-            TermData::Var(name, id) => {
-                if let Some(expected_sort) = binder_sorts.get(name.as_str()) {
-                    if terms.sort(term) != *expected_sort {
-                        return false;
-                    }
-                    match matched_var_ids.get(name) {
-                        Some(seen_id) if seen_id != id => return false,
-                        Some(_) => {}
-                        None => {
-                            matched_var_ids.insert(name.clone(), *id);
-                        }
-                    }
-                }
-            }
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => {
-                if terms.sort(term) != &CoreSort::Bool || terms.sort(*inner) != &CoreSort::Bool {
-                    return false;
-                }
-                stack.push(*inner);
-            }
-            TermData::Ite(condition, then_term, else_term) => {
-                if terms.sort(*condition) != &CoreSort::Bool
-                    || terms.sort(*then_term) != terms.sort(*else_term)
-                    || terms.sort(term) != terms.sort(*then_term)
-                {
-                    return false;
-                }
-                stack.extend([*condition, *then_term, *else_term]);
-            }
-            // The ordinary expander has capture-aware Let support, but the
-            // exact source token intentionally keeps a smaller auditable
-            // fragment. Parsed lets are normally elaborated away already.
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return false,
-            _ => return false,
-        }
-    }
-    true
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExactFiniteExpansionContradiction {
     FalseConjunct(TermId),
@@ -1178,6 +1476,37 @@ impl CheckedExactClosedForallUnsat {
 }
 
 impl CheckedExactClosedSentenceUnsat {
+    /// Whether any nested obligation was refuted only on a `discharged-trust`
+    /// re-solve (see [`ClosedSentenceObligationKind`]).
+    ///
+    /// The theorem is then no stronger than that obligation. Measured on the
+    /// corpus: `AUFBVDTLIA ... BitsTricks.scala-7.smt2-3` published
+    /// `checked-exact-closed-sentence` ("an independently checked semantic
+    /// certificate") with `nested_negation_refuted=1`, while the re-solve
+    /// behind that obligation was accepted because its proof's strict check
+    /// failed only at a `trust` step (`--phase-trace`: "reconfirm ACCEPTED:
+    /// re-solve proof rejected only for a trust-kind step").
+    fn rests_on_discharged_trust(&self) -> bool {
+        self.obligations
+            .iter()
+            .any(|obligation| obligation.kind.is_trust())
+    }
+
+    /// The theorem's evidence: that of its weakest nested refutation. A
+    /// trust-kind re-solve is the nested obligation's only solve, so it ran
+    /// without nothing: `resolve disabled=none`. A re-solve whose proof AY's
+    /// strict checker accepted end to end is checked.
+    fn nested_evidence(&self) -> UnsatEvidence {
+        if self.rests_on_discharged_trust() {
+            UnsatEvidence::corroborated(
+                UnsatCorroboration::resolve(crate::executor::StrengtheningSet::EMPTY)
+                    .nested(CorroborationSource::NestedClosedSentence),
+            )
+        } else {
+            UnsatEvidence::CHECKED
+        }
+    }
+
     fn is_current(&self, executor: &Executor) -> bool {
         if crate::executor::model::scoped_term_evaluation_override_active()
             || !self
@@ -1238,10 +1567,11 @@ impl CheckedExactClosedSentenceUnsat {
                         return false;
                     }
                 }
-                ClosedSentenceObligationKind::NestedRefuted => {}
+                ClosedSentenceObligationKind::NestedRefuted { .. } => {}
                 ClosedSentenceObligationKind::NestedNegationRefuted {
                     negation,
                     negation_entry,
+                    ..
                 } => {
                     if executor.ctx.terms.entry_stamp(*negation) != Some(*negation_entry) {
                         return false;
@@ -1662,6 +1992,8 @@ impl CheckedBvLiaUnsat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CommandUnsatAdmission {
     StrictProof,
+    StrictNativeBvLiaBundle,
+    StrictNativeNraSosBundle,
     CheckedSatRefutation,
     CheckedBoolBv,
     CheckedUfLeafBoolBv,
@@ -1674,6 +2006,7 @@ pub(super) enum CommandUnsatAdmission {
     CheckedExactForallUfGround,
     CheckedExactFiniteExpansion,
     CheckedExactRmDomainExpansion,
+    CheckedExactAuthoredSubset,
     /// #proof-capability B3 — scope-authenticated raw admission under
     /// competition shedding. Deliberately absent from every
     /// `last_command_unsat_was_*_verified` class: it is an admission record,
@@ -1706,20 +2039,59 @@ impl UnsatCertificate {
             UnsatCertificateKind::CheckedExactRmDomainExpansion(evidence) => {
                 evidence.is_current(executor)
             }
+            UnsatCertificateKind::CheckedExactAuthoredSubset(evidence) => {
+                evidence.is_current(executor)
+            }
             UnsatCertificateKind::StrictProof(_)
+            | UnsatCertificateKind::StrictNativeBvLiaBundle(_)
+            | UnsatCertificateKind::StrictNativeNraSosBundle(_)
             | UnsatCertificateKind::CheckedSatRefutation { .. }
             | UnsatCertificateKind::CheckedBoolBv(_)
             | UnsatCertificateKind::CheckedUfLeafBoolBv(_)
             | UnsatCertificateKind::CheckedBvLia(_)
-            | UnsatCertificateKind::DischargedTrust(_)
+            | UnsatCertificateKind::DischargedTrust(..)
             | UnsatCertificateKind::CompetitionRaw(_) => false,
         }
     }
 
-    pub(crate) fn strict_proof_verified(&self) -> bool {
-        matches!(&self.0, UnsatCertificateKind::StrictProof(_))
+    /// Whether this token is the shed-mode raw admission (#proof-capability
+    /// B3): scope-authenticated, with no checked refutation behind it.
+    pub(crate) fn is_competition_raw(&self) -> bool {
+        matches!(&self.0, UnsatCertificateKind::CompetitionRaw(_))
     }
 
+    /// Whether AY's native strict checker accepted the exact retained proof.
+    ///
+    /// Native BV/LIA and SOS bundles do not imply Alethe support: their typed
+    /// lemmas remain honest external wire holes despite complete native replay.
+    pub(crate) fn strict_proof_verified(&self) -> bool {
+        matches!(
+            &self.0,
+            UnsatCertificateKind::StrictProof(_)
+                | UnsatCertificateKind::StrictNativeBvLiaBundle(_)
+                | UnsatCertificateKind::StrictNativeNraSosBundle(_)
+        )
+    }
+
+    fn strict_native_bundle_verified(&self, executor: &Executor) -> bool {
+        match &self.0 {
+            UnsatCertificateKind::StrictNativeBvLiaBundle(checked) => checked.is_current(executor),
+            UnsatCertificateKind::StrictNativeNraSosBundle(checked) => checked.is_current(executor),
+            _ => false,
+        }
+    }
+
+    /// Whether an independent replay checked the refutation: a SAT-level
+    /// resolution/RUP replay whose premises are authenticated against the
+    /// authored query (`checked-sat-refutation`, the Bool/BV and BV/LIA
+    /// lanes).
+    ///
+    /// NOT a `discharged-trust` admission, nor an exact theorem sealing one
+    /// (evidence policy P4, 2026-10-02): those rest on AY re-running its own
+    /// code ([`Self::rests_on_corroboration`]). A `checked-sat-refutation`
+    /// whose `Generic` premise AY's own verifier re-derived stays in this class
+    /// — its propositional refutation is independently replayed — and reports
+    /// evidence E1 through [`Self::evidence`].
     pub(crate) fn independently_verified(&self) -> bool {
         matches!(
             &self.0,
@@ -1727,8 +2099,54 @@ impl UnsatCertificate {
                 | UnsatCertificateKind::CheckedBoolBv(_)
                 | UnsatCertificateKind::CheckedUfLeafBoolBv(_)
                 | UnsatCertificateKind::CheckedBvLia(_)
-                | UnsatCertificateKind::DischargedTrust(_)
         )
+    }
+
+    /// Whether the refutation rests on a deferred-trust discharge — directly,
+    /// or as a nested refutation an exact theorem sealed. The default posture
+    /// admits it as `discharged-trust`, evidence E1: a corroborated
+    /// reproduction, not a check.
+    pub(crate) fn rests_on_corroboration(&self) -> bool {
+        matches!(&self.0, UnsatCertificateKind::DischargedTrust(..))
+            || self.is_exact_semantic_over_discharged_trust()
+    }
+
+    /// The evidence level of this refutation and, when it rests on one, the
+    /// corroboration that admitted it.
+    pub(crate) fn evidence(&self) -> UnsatEvidence {
+        match &self.0 {
+            UnsatCertificateKind::StrictProof(_)
+            | UnsatCertificateKind::StrictNativeBvLiaBundle(_)
+            | UnsatCertificateKind::StrictNativeNraSosBundle(_)
+            | UnsatCertificateKind::CheckedBoolBv(_)
+            | UnsatCertificateKind::CheckedUfLeafBoolBv(_)
+            | UnsatCertificateKind::CheckedBvLia(_)
+            | UnsatCertificateKind::CheckedExactExists(_)
+            | UnsatCertificateKind::CheckedExactForallExists(_)
+            | UnsatCertificateKind::CheckedExactClosedForall(_)
+            | UnsatCertificateKind::CheckedExactForallUfGround(_)
+            | UnsatCertificateKind::CheckedExactFiniteExpansion(_) => UnsatEvidence::CHECKED,
+            UnsatCertificateKind::CheckedSatRefutation { checked, .. } => {
+                if checked.rests_on_re_derived_premises() {
+                    UnsatEvidence::RE_DERIVED
+                } else {
+                    UnsatEvidence::CHECKED
+                }
+            }
+            UnsatCertificateKind::DischargedTrust(_, corroboration) => {
+                UnsatEvidence::corroborated(*corroboration)
+            }
+            UnsatCertificateKind::CheckedExactClosedSentence(evidence) => {
+                evidence.nested_evidence()
+            }
+            UnsatCertificateKind::CheckedExactRmDomainExpansion(evidence) => {
+                evidence.nested_evidence()
+            }
+            UnsatCertificateKind::CheckedExactAuthoredSubset(evidence) => {
+                evidence.nested_evidence()
+            }
+            UnsatCertificateKind::CompetitionRaw(_) => UnsatEvidence::RAW,
+        }
     }
 
     pub(crate) fn exact_semantic_verified(&self) -> bool {
@@ -1741,7 +2159,64 @@ impl UnsatCertificate {
                 | UnsatCertificateKind::CheckedExactForallUfGround(_)
                 | UnsatCertificateKind::CheckedExactFiniteExpansion(_)
                 | UnsatCertificateKind::CheckedExactRmDomainExpansion(_)
-        )
+                | UnsatCertificateKind::CheckedExactAuthoredSubset(_)
+        ) && !self.is_exact_semantic_over_discharged_trust()
+    }
+
+    /// An exact semantic theorem that seals at least one nested refutation
+    /// admitted only by `discharged-trust`.
+    ///
+    /// Two theorems seal nested refutations, and each records the class of
+    /// every one:
+    ///
+    /// * the RoundingMode expansion — a branch probe's published admission
+    ///   (see [`Self::probe_authority`]);
+    /// * the closed-sentence theorem — a nested obligation's re-solve, accepted
+    ///   on a strict-checked proof or only as the deferred-discharge entry
+    ///   condition (a proof refused at a trust or hole step).
+    ///
+    /// The theorem itself is exact (the full RoundingMode cross product; a
+    /// closed sentence's fixed truth value), but a refutation that rests on a
+    /// fresh-executor re-solve of the SAME code is a disclosed hole, not an
+    /// independent check. The composite is exactly as strong as its weakest
+    /// refutation, so it takes that class: never `exact_semantic_verified`,
+    /// and admitted as `discharged-trust`. Presenting it as a checked semantic
+    /// certificate is how nine D7 wrong answers (2026-09-23 hunt) were
+    /// published under `checked-exact-rm-domain-expansion`.
+    fn is_exact_semantic_over_discharged_trust(&self) -> bool {
+        match &self.0 {
+            UnsatCertificateKind::CheckedExactRmDomainExpansion(evidence) => {
+                evidence.rests_on_discharged_trust()
+            }
+            UnsatCertificateKind::CheckedExactClosedSentence(evidence) => {
+                evidence.rests_on_discharged_trust()
+            }
+            UnsatCertificateKind::CheckedExactAuthoredSubset(evidence) => {
+                evidence.rests_on_discharged_trust()
+            }
+            _ => false,
+        }
+    }
+
+    /// The authority class a disposable probe's published UNSAT carries into
+    /// a certificate that seals it (see [`ProbeUnsatAuthority`]).
+    ///
+    /// `discharged-trust`, and every exact theorem that itself seals a trust
+    /// refutation, reads as trust — so the class is transitive through a
+    /// probe that published on a sealing theorem. Everything else the
+    /// mandatory funnel confirms is checked: a `StrictProof` token's retained
+    /// derivation passed AY's strict checker, which refuses `trust`/`hole`
+    /// steps and premises outside the authored scope, whatever its RENDERED
+    /// document prints (a validated kind with no external spelling prints as
+    /// `hole`; see [`ProbeUnsatAuthority`]).
+    pub(in crate::executor) fn probe_authority(&self) -> ProbeUnsatAuthority {
+        match &self.0 {
+            UnsatCertificateKind::DischargedTrust(..) => ProbeUnsatAuthority::DischargedTrust,
+            _ if self.is_exact_semantic_over_discharged_trust() => {
+                ProbeUnsatAuthority::DischargedTrust
+            }
+            _ => ProbeUnsatAuthority::Checked,
+        }
     }
 
     /// Whether this token represents a checked exact-query refutation that may
@@ -1758,11 +2233,18 @@ impl UnsatCertificate {
         self.strict_proof_verified()
             || self.independently_verified()
             || self.exact_semantic_verified()
+            || self.rests_on_corroboration()
     }
 
     pub(super) fn command_admission(&self) -> CommandUnsatAdmission {
         match &self.0 {
             UnsatCertificateKind::StrictProof(_) => CommandUnsatAdmission::StrictProof,
+            UnsatCertificateKind::StrictNativeBvLiaBundle(_) => {
+                CommandUnsatAdmission::StrictNativeBvLiaBundle
+            }
+            UnsatCertificateKind::StrictNativeNraSosBundle(_) => {
+                CommandUnsatAdmission::StrictNativeNraSosBundle
+            }
             UnsatCertificateKind::CheckedSatRefutation { .. } => {
                 CommandUnsatAdmission::CheckedSatRefutation
             }
@@ -1771,7 +2253,7 @@ impl UnsatCertificate {
                 CommandUnsatAdmission::CheckedUfLeafBoolBv
             }
             UnsatCertificateKind::CheckedBvLia(_) => CommandUnsatAdmission::CheckedBvLia,
-            UnsatCertificateKind::DischargedTrust(_) => CommandUnsatAdmission::DischargedTrust,
+            UnsatCertificateKind::DischargedTrust(..) => CommandUnsatAdmission::DischargedTrust,
             UnsatCertificateKind::CheckedExactExists(_) => {
                 CommandUnsatAdmission::CheckedExactExists
             }
@@ -1780,6 +2262,15 @@ impl UnsatCertificate {
             }
             UnsatCertificateKind::CheckedExactClosedForall(_) => {
                 CommandUnsatAdmission::CheckedExactClosedForall
+            }
+            // Its weakest nested refutation sets the class: see
+            // `is_exact_semantic_over_discharged_trust`.
+            UnsatCertificateKind::CheckedExactClosedSentence(_)
+            | UnsatCertificateKind::CheckedExactRmDomainExpansion(_)
+            | UnsatCertificateKind::CheckedExactAuthoredSubset(_)
+                if self.is_exact_semantic_over_discharged_trust() =>
+            {
+                CommandUnsatAdmission::DischargedTrust
             }
             UnsatCertificateKind::CheckedExactClosedSentence(_) => {
                 CommandUnsatAdmission::CheckedExactClosedSentence
@@ -1792,6 +2283,9 @@ impl UnsatCertificate {
             }
             UnsatCertificateKind::CheckedExactRmDomainExpansion(_) => {
                 CommandUnsatAdmission::CheckedExactRmDomainExpansion
+            }
+            UnsatCertificateKind::CheckedExactAuthoredSubset(_) => {
+                CommandUnsatAdmission::CheckedExactAuthoredSubset
             }
             UnsatCertificateKind::CompetitionRaw(_) => CommandUnsatAdmission::CompetitionRaw,
         }
@@ -1817,6 +2311,9 @@ pub(super) struct UnsatQueryEpoch {
     /// This is never inferred by an internal TermId-only binder: arbitrary
     /// assumption terms may also elaborate to canonical false.
     literal_false_assumption_source: bool,
+    /// The caller's `check-sat-assuming` literals AS WRITTEN (see
+    /// [`AuthoredAssumptionSurfaces`]); never derived from `assumptions`.
+    authored_assumption_surfaces: AuthoredAssumptionSurfaces,
     /// Public proof output requested when this query began.
     proof_output_requested: bool,
     /// The solver-declared EXTENSION of this query's obligation.
@@ -1903,6 +2400,10 @@ impl UnsatQueryEpoch {
     }
 }
 
+/// The reason prefix of a deferred-trust discharge that failed at step (2):
+/// the strict collecting checker rejected a step that is NOT a trust step.
+const NON_TRUST_STEP_REJECTION: &str = "deferred-trust discharge rejected a NON-trust step";
+
 /// Typed failure from the mandatory UNSAT publication gate.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UnsatCertificationError {
@@ -1936,15 +2437,71 @@ pub(crate) enum UnsatCertificationError {
     /// The strict proof checker rejected the refutation.
     #[error("strict UNSAT proof validation failed: {reason}")]
     StrictProofRejected { reason: String },
+    /// A stop ended the deferred-trust discharge's lanes before they decided
+    /// (P4a.1). Published as the stop it was (`publish_envelope_stop`), never
+    /// as a rejection, and never retried.
+    #[error("UNSAT certification was stopped: {0}")]
+    Stopped(crate::api::proofs::EnvelopeStop),
 }
 
 impl Executor {
+    /// Stable tag naming the certification authority that admitted the most
+    /// recent text-command UNSAT, or `None` when none did.
+    ///
+    /// Disclosure only — no gate reads it. It exists because the CHECKABILITY
+    /// OF THE EMITTED DOCUMENT and the AUTHORITY BEHIND THE VERDICT are two
+    /// different questions, and the CLI could previously report only the
+    /// first. A `hole`-bearing Alethe artifact says nothing about which lane
+    /// certified the `unsat` beside it: `--rigor certified` accepts a checked
+    /// SAT-resolution sidecar, a native BV DRAT re-check, or one of the exact
+    /// source-semantic theorems, none of which is the Alethe presentation. Ask
+    /// this and print the answer rather than inferring the verdict's backing
+    /// from the artifact, which is how the disclosure came to claim
+    /// `--self-check` would answer `unknown` on verdicts it in fact publishes.
+    #[must_use]
+    pub fn last_command_unsat_admission_tag(&self) -> Option<&'static str> {
+        self.last_command_unsat_admission
+            .map(|admission| match admission {
+                CommandUnsatAdmission::StrictProof => "strict-proof",
+                CommandUnsatAdmission::StrictNativeBvLiaBundle => "strict-native-bv-lia-bundle",
+                CommandUnsatAdmission::StrictNativeNraSosBundle => "strict-native-nra-sos-bundle",
+                CommandUnsatAdmission::CheckedSatRefutation => "checked-sat-refutation",
+                CommandUnsatAdmission::CheckedBoolBv => "checked-bool-bv",
+                CommandUnsatAdmission::CheckedUfLeafBoolBv => "checked-uf-leaf-bool-bv",
+                CommandUnsatAdmission::CheckedBvLia => "checked-bv-lia",
+                CommandUnsatAdmission::DischargedTrust => "discharged-trust",
+                CommandUnsatAdmission::CheckedExactExists => "checked-exact-exists",
+                CommandUnsatAdmission::CheckedExactForallExists => "checked-exact-forall-exists",
+                CommandUnsatAdmission::CheckedExactClosedForall => "checked-exact-closed-forall",
+                CommandUnsatAdmission::CheckedExactClosedSentence => {
+                    "checked-exact-closed-sentence"
+                }
+                CommandUnsatAdmission::CheckedExactForallUfGround => {
+                    "checked-exact-forall-uf-ground"
+                }
+                CommandUnsatAdmission::CheckedExactFiniteExpansion => {
+                    "checked-exact-finite-expansion"
+                }
+                CommandUnsatAdmission::CheckedExactRmDomainExpansion => {
+                    "checked-exact-rm-domain-expansion"
+                }
+                CommandUnsatAdmission::CheckedExactAuthoredSubset => {
+                    "checked-exact-authored-subset"
+                }
+                CommandUnsatAdmission::CompetitionRaw => "competition-raw",
+            })
+    }
+
     /// Whether the most recent text-command UNSAT publication consumed an
     /// exact-query strict-proof certificate.
     pub(crate) fn last_command_unsat_was_strictly_verified(&self) -> bool {
         matches!(
             self.last_command_unsat_admission,
-            Some(CommandUnsatAdmission::StrictProof)
+            Some(
+                CommandUnsatAdmission::StrictProof
+                    | CommandUnsatAdmission::StrictNativeBvLiaBundle
+                    | CommandUnsatAdmission::StrictNativeNraSosBundle
+            )
         )
     }
 
@@ -1961,12 +2518,17 @@ impl Executor {
                     | CommandUnsatAdmission::CheckedExactForallUfGround
                     | CommandUnsatAdmission::CheckedExactFiniteExpansion
                     | CommandUnsatAdmission::CheckedExactRmDomainExpansion
+                    | CommandUnsatAdmission::CheckedExactAuthoredSubset
             )
         )
     }
 
     /// Whether the most recent text-command UNSAT publication consumed an
-    /// independently checked SAT-refutation or trust-discharge certificate.
+    /// independently checked SAT-refutation certificate.
+    ///
+    /// A `discharged-trust` admission is NOT one (evidence policy P4): its
+    /// corroboration is AY re-running its own code. See
+    /// [`Self::last_command_unsat_was_corroborated`].
     pub(crate) fn last_command_unsat_was_independently_verified(&self) -> bool {
         matches!(
             self.last_command_unsat_admission,
@@ -1975,9 +2537,21 @@ impl Executor {
                     | CommandUnsatAdmission::CheckedBoolBv
                     | CommandUnsatAdmission::CheckedUfLeafBoolBv
                     | CommandUnsatAdmission::CheckedBvLia
-                    | CommandUnsatAdmission::DischargedTrust
             )
         )
+    }
+
+    /// Whether the most recent text-command UNSAT publication was admitted as
+    /// `discharged-trust` (directly, or through an exact theorem sealing such
+    /// a refutation): evidence E1.
+    pub(crate) fn last_command_unsat_was_corroborated(&self) -> bool {
+        self.last_command_unsat_admission == Some(CommandUnsatAdmission::DischargedTrust)
+    }
+
+    /// The evidence behind the most recent text-command UNSAT publication.
+    #[must_use]
+    pub fn last_command_unsat_evidence(&self) -> Option<UnsatEvidence> {
+        self.last_command_unsat_evidence
     }
 
     /// Exact assumption-free public source/root scope shared by the sealed
@@ -2138,7 +2712,7 @@ impl Executor {
     ///
     /// SYMMETRY.  `try_valid_closed_sentence_sat_certificate` proves a closed,
     /// uninterpreted-symbol-free sentence VALID by refuting its negation with
-    /// [`Self::reconfirms_negation_refuted_for_closed_sentence`].  Before this
+    /// [`Self::reconfirm_negation_refuted_for_closed_sentence`].  Before this
     /// method there was no arm that, when the SENTENCE ITSELF is refuted by
     /// the same checked primitive, publishes UNSAT — nested-alternation
     /// closed sentences (`¬∃y.(range(y) ∧ ∀x.φ)`, `∀x.(guard → ∃y.ψ)`) were
@@ -2301,15 +2875,17 @@ impl Executor {
                     ClosedSentenceObligationKindDraft::GroundFalse => {
                         ClosedSentenceObligationKind::GroundFalse
                     }
-                    ClosedSentenceObligationKindDraft::NestedRefuted => {
-                        ClosedSentenceObligationKind::NestedRefuted
+                    ClosedSentenceObligationKindDraft::NestedRefuted { authority } => {
+                        ClosedSentenceObligationKind::NestedRefuted { authority }
                     }
-                    ClosedSentenceObligationKindDraft::NestedNegationRefuted { negation } => {
-                        ClosedSentenceObligationKind::NestedNegationRefuted {
-                            negation,
-                            negation_entry: self.ctx.terms.entry_stamp(negation)?,
-                        }
-                    }
+                    ClosedSentenceObligationKindDraft::NestedNegationRefuted {
+                        negation,
+                        authority,
+                    } => ClosedSentenceObligationKind::NestedNegationRefuted {
+                        negation,
+                        negation_entry: self.ctx.terms.entry_stamp(negation)?,
+                        authority,
+                    },
                 };
                 Some(SealedClosedSentenceObligation {
                     term: obligation.term,
@@ -2517,22 +3093,30 @@ impl Executor {
         }
         if negate {
             let negation = self.ctx.terms.mk_not(sentence);
-            if self.reconfirms_negation_refuted_for_closed_sentence(&[negation]) {
-                out.push(ClosedSentenceObligation {
-                    term: sentence,
-                    kind: ClosedSentenceObligationKindDraft::NestedNegationRefuted { negation },
-                });
-                return true;
-            }
-            false
-        } else if self.reconfirms_negation_refuted_for_closed_sentence(&[sentence]) {
+            let Some(authority) = self.closed_sentence_refutation_grant(
+                self.reconfirm_negation_refuted_for_closed_sentence(&[negation]),
+            ) else {
+                return false;
+            };
             out.push(ClosedSentenceObligation {
                 term: sentence,
-                kind: ClosedSentenceObligationKindDraft::NestedRefuted,
+                kind: ClosedSentenceObligationKindDraft::NestedNegationRefuted {
+                    negation,
+                    authority,
+                },
             });
             true
         } else {
-            false
+            let Some(authority) = self.closed_sentence_refutation_grant(
+                self.reconfirm_negation_refuted_for_closed_sentence(&[sentence]),
+            ) else {
+                return false;
+            };
+            out.push(ClosedSentenceObligation {
+                term: sentence,
+                kind: ClosedSentenceObligationKindDraft::NestedRefuted { authority },
+            });
+            true
         }
     }
 
@@ -2789,105 +3373,88 @@ impl Executor {
         None
     }
 
-    /// Independently re-expand the immutable public roots and prove a narrow
-    /// ground contradiction in the complete replacement vector.
-    ///
-    /// This constructor is intentionally BV-forall-only.  Wide binders are
-    /// accepted only when the canonical expander itself proves a bounded guard;
-    /// small binders use its exhaustive finite carrier.  Every other quantified
-    /// shape, nested quantifier, assumption-bearing query, stale source/root
-    /// epoch, incomplete expansion, or non-elementary ground conflict declines.
-    pub(in crate::executor) fn try_authorize_current_query_exact_finite_expansion_unsat(
-        &mut self,
-    ) -> Option<CheckedExactFiniteExpansionUnsat> {
-        if crate::executor::model::scoped_term_evaluation_override_active()
-            || !self.exact_plain_hard_unsat_scope_is_current()
-            || self.should_abort_theory_loop()
-            || self.strict_unsat_presentation_required()
-        {
-            return None;
-        }
-        // Public-root replay must be independent of producer-local derived
-        // bounds and BOOL_GROUND extras retained in finite-domain TLS.
-        let _standalone_replay = crate::skolemize::scoped_standalone_finite_domain_replay();
-        let (roots, root_entries) = {
-            let epoch = self.unsat_query_epoch.as_ref()?;
-            (epoch.assertions.clone(), epoch.assertion_entries.clone())
+    /// #semantic-token census — what the exact semantic mint holds, measured
+    /// against the parsed (authored) assertion at the same index. See
+    /// [`SemanticTokenCensus`]. Write-only: nothing here changes the token,
+    /// the verdict, or any artifact.
+    fn semantic_token_census(&self, kind: &UnsatCertificateKind) -> SemanticTokenCensus {
+        let mut census = SemanticTokenCensus {
+            kind: kind.census_kind_tag(),
+            ..SemanticTokenCensus::default()
         };
-        if roots.is_empty()
-            || roots
-                .iter()
-                .any(|&root| self.ctx.terms.sort(root) != &CoreSort::Bool)
-        {
-            return None;
+        if let UnsatCertificateKind::CheckedExactAuthoredSubset(evidence) = kind {
+            // One obligation: the refuted subset, counted by the authority
+            // that admitted it.
+            census.obligations = 1;
+            census.nested_refuted = u32::from(!evidence.rests_on_discharged_trust());
+            census.nested_trust_refuted = u32::from(evidence.rests_on_discharged_trust());
+            return census;
         }
-        let interpreted_operators =
-            exact_finite_expansion_interpreted_operators(&self.ctx.terms, &roots)?;
-        if !exact_operator_identities_are_unshadowed(&self.ctx, &interpreted_operators) {
-            return None;
+        if let UnsatCertificateKind::CheckedExactRmDomainExpansion(evidence) = kind {
+            // One obligation per branch of the RoundingMode cross product:
+            // an elementary `false` conjunct, or a probe refutation counted by
+            // the authority that admitted it.
+            let (branches, false_conjunct, checked, trust) = evidence.refutation_counts();
+            census.obligations = branches;
+            census.ground_false = false_conjunct;
+            census.nested_refuted = checked;
+            census.nested_trust_refuted = trust;
+            return census;
         }
-        let mut expanded_roots = Vec::with_capacity(roots.len());
-        let mut quantified_roots = 0usize;
-        for &root in &roots {
-            if !crate::ematching::contains_quantifier(&self.ctx.terms, root) {
-                expanded_roots.push(root);
-                continue;
-            }
-            quantified_roots += 1;
-            let TermData::Forall(vars, body, _) = self.ctx.terms.get(root).clone() else {
-                return None;
+        let UnsatCertificateKind::CheckedExactClosedSentence(evidence) = kind else {
+            return census;
+        };
+        census.obligations = u32::try_from(evidence.obligations.len()).unwrap_or(u32::MAX);
+        for obligation in &*evidence.obligations {
+            // A nested step accepted on `discharged-trust` is counted apart
+            // from the checked ones, whichever direction it refuted.
+            let slot = match obligation.kind {
+                _ if obligation.kind.is_trust() => &mut census.nested_trust_refuted,
+                ClosedSentenceObligationKind::GroundTrue => &mut census.ground_true,
+                ClosedSentenceObligationKind::GroundFalse => &mut census.ground_false,
+                ClosedSentenceObligationKind::NestedRefuted { .. } => &mut census.nested_refuted,
+                ClosedSentenceObligationKind::NestedNegationRefuted { .. } => {
+                    &mut census.nested_negation_refuted
+                }
             };
-            if vars.is_empty()
-                || self.ctx.terms.sort(body) != &CoreSort::Bool
-                || !exact_finite_binder_occurrences_are_well_sorted(&self.ctx.terms, body, &vars)
-                || crate::ematching::contains_quantifier(&self.ctx.terms, body)
-            {
-                return None;
-            }
-            let (expanded, _) =
-                crate::skolemize::finite_domain_expand_with_instances(&mut self.ctx.terms, root)?;
-            if self.ctx.terms.sort(expanded) != &CoreSort::Bool
-                || crate::ematching::contains_quantifier(&self.ctx.terms, expanded)
-            {
-                return None;
-            }
-            expanded_roots.push(expanded);
+            *slot = slot.saturating_add(1);
         }
-        if quantified_roots == 0 || expanded_roots.len() != roots.len() {
-            return None;
-        }
-        let contradiction =
-            exact_finite_expansion_ground_contradiction(&self.ctx.terms, &expanded_roots)?;
-        let expanded_root_entries = expanded_roots
-            .iter()
-            .map(|&root| self.ctx.terms.entry_stamp(root))
-            .collect::<Option<Vec<_>>>()?;
-        let term_snapshot = self.ctx.terms.snapshot_stamp();
+        let root = evidence.refuted_root;
+        census.sealed_root_nodes = sealed_root_node_count(&self.ctx.terms, root);
+        census.sealed_root_head = sealed_root_head(&self.ctx.terms, root);
+        census.sealed_root_surface = bounded_census_surface(self.format_term(root));
 
-        // Recheck after canonical replay: expansion can grow the term store but
-        // cannot change the query/source epoch or any authored root entry.
-        if !self.exact_plain_hard_unsat_scope_is_current()
-            || self.should_abort_theory_loop()
-            || !self.unsat_query_epoch.as_ref().is_some_and(|epoch| {
-                epoch.assertions == roots && epoch.assertion_entries == root_entries
-            })
-            || !exact_operator_identities_are_unshadowed(&self.ctx, &interpreted_operators)
-            || term_snapshot != self.ctx.terms.snapshot_stamp()
-        {
-            return None;
+        // "The authored text was never kept" is a fact about the ledger, not
+        // about the flag: a lane that borrows retention for this query (the
+        // quantified trace retry, the non-string sequence corroboration) arms
+        // it mid-solve, so the flag can read ON at the mint over a ledger that
+        // was never filled.
+        let parsed = self.ctx.assertions_parsed();
+        if !self.ctx.retains_parsed_assertions() || parsed.is_empty() {
+            census.authored_source = SemanticTokenSource::RetentionOff;
+            return census;
         }
-
-        Some(CheckedExactFiniteExpansionUnsat {
-            query_epoch: self.query_authority_epoch.clone(),
-            source_declaration_stamp: self.ctx.source_context_stamp(),
-            roots: roots.into_boxed_slice(),
-            root_entries: root_entries.into_boxed_slice(),
-            expanded_roots: expanded_roots.into_boxed_slice(),
-            expanded_root_entries: expanded_root_entries.into_boxed_slice(),
-            contradiction,
-            interpreted_operators: interpreted_operators.into_boxed_slice(),
-            term_snapshot,
-        })
+        let originals = self.proof_original_problem_assertions_slice();
+        if parsed.len() != originals.len() || originals != &*evidence.roots {
+            census.authored_source = SemanticTokenSource::Misaligned;
+            return census;
+        }
+        let Some(index) = originals.iter().position(|&candidate| candidate == root) else {
+            census.authored_source = SemanticTokenSource::RootNotInOriginals;
+            return census;
+        };
+        let declared: HashSet<String> = self
+            .ctx
+            .symbol_iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let walk = parsed_assertion_walk(&parsed[index], &declared);
+        census.authored_symbols = walk.symbols;
+        census.authored_nodes = walk.nodes;
+        census.authored_walk_complete = walk.complete;
+        census.authored_head = parsed_assertion_head(&parsed[index]);
+        census.authored_source = SemanticTokenSource::Aligned;
+        census
     }
 
     /// Publish one of the deliberately narrow, independently checked exact
@@ -2906,13 +3473,30 @@ impl Executor {
     ) -> SolveResult {
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         self.last_sat_certificate = None;
         self.last_model = None;
         self.last_model_validated = false;
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
 
+        // #semantic-token census. Taken from the evidence BEFORE it is
+        // wrapped, and recorded only if this mint publishes.
+        let census = self.semantic_token_census(&kind);
+        let authored_subset = matches!(kind, UnsatCertificateKind::CheckedExactAuthoredSubset(_));
         let certificate = UnsatCertificate(kind);
+        // A composite whose weakest branch is a `discharged-trust` admission is
+        // named for what it is, not for the checked certificate it would be
+        // without that branch. The authored-subset theorem names its own
+        // premise set, and its admission tag names the class.
+        let decline = if authored_subset {
+            ProofDeclineMechanism::AuthoredSubsetUnrendered
+        } else if certificate.is_exact_semantic_over_discharged_trust() {
+            ProofDeclineMechanism::ExactExpansionOverDischargedTrust
+        } else {
+            ProofDeclineMechanism::CheckedSemanticCertificateUnrendered
+        };
         if !certificate.checked_exact_semantic_is_current(self) {
             return self.reject_uncertified_verdict_for_publication(stale_message.to_string());
         }
@@ -2922,6 +3506,21 @@ impl Executor {
         }
 
         self.suppress_unsat_proof_reconstruction();
+        // #evidence-stage-3. This lane publishes `unsat` on a semantic
+        // certificate and nulls `last_proof` two dozen lines above, by design.
+        // The CLI then printed "UNSAT produced no reconstructable proof". Name
+        // the lane so the census can separate "nothing was ever built" from
+        // "what was built has no external shape". Diagnostic only — the
+        // verdict, the certificate token and the suppression are all unchanged.
+        //
+        // #semantic-token census (2026-09-11): what was built is measured
+        // beside this line, not assumed. `closed_sentence_certify_false_inner`
+        // walks the sealed root and keeps only its leaves; on every class file
+        // at two fresh seeds those leaves are one empty-model evaluation of
+        // `true` over a root term construction folded from the authored
+        // assertion. There is no authored-scope derivation here to render.
+        self.record_proof_decline(decline);
+        self.last_semantic_token_census = Some(census);
         self.last_unknown_reason = None;
         self.last_statistics.set_int(statistic, 1);
         self.last_result = Some(SolveResult::unsat());
@@ -3063,9 +3662,35 @@ impl Executor {
     ) -> SolveResult {
         // #cert-accounting item 6: count refusals so "the funnel is silently
         // eating verdicts" is a number rather than an instrumentation session.
-        cert_accounting::record_publication_rejection();
+        //
+        // Scope it. The counter is process-global, and the nested
+        // certification sub-solves (deferred-trust discharge,
+        // closed-sentence refutation) reach this same funnel on the same
+        // thread: an internal probe that correctly fails closed on its own
+        // strength bumped the SAME cell as a refusal of the user's query. A
+        // corpus census then read `cert.publication_rejections > 0` beside a
+        // published verdict as "the gate refused the artifact and AY published
+        // anyway". Measured on that census's own reproducers (QF_BV
+        // `sage__app7__bench_6643`, QF_AX `swap_t3_np_nf_ai_00007_003` and
+        // `…_00008_001`): every refusal came from a nested discharge probe,
+        // reached through `discharge_trust_clause_impl`, while the outer
+        // certification went on to succeed on a later discharge attempt. The
+        // public share is `total - nested`, and recording the scope is what
+        // makes that subtraction possible.
+        cert_accounting::record_publication_rejection(if inside_nested_certification_solve() {
+            cert_accounting::RejectionScope::NestedCertificationSolve
+        } else {
+            cert_accounting::RejectionScope::PublicQuery
+        });
         self.publish_unknown_from_origin(UnknownOrigin::VerdictCertification);
-        self.record_model_validation_unknown_diagnostic(diagnostic);
+        // WITHHELD, not "published". Every caller of this method returns the
+        // `SolveResult::Unknown` below straight to the publication boundary,
+        // in every mode — there is no rigor level at which a refusal recorded
+        // here still ships as `unsat`. The tier used to be read off
+        // `self.self_check`, which made the default-mode transcript announce
+        // `[UNCONFIRMED/published]` beside a `unknown` answer; that
+        // contradiction was reported as ay publishing an uncertified UNSAT.
+        self.record_withheld_verdict_unknown_diagnostic(diagnostic);
         SolveResult::Unknown
     }
 
@@ -3077,6 +3702,8 @@ impl Executor {
     /// schematic instances, but no solver-owned transformation may intervene.
     pub(super) fn begin_unsat_query_epoch(&mut self, assertions: &[TermId]) {
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         let Some(assertion_entries) = UnsatQueryEpoch::capture_entries(self, assertions) else {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!("CERT/epoch cleared: begin capture_entries declined");
@@ -3093,6 +3720,7 @@ impl Executor {
             assumptions: None,
             assumption_entries: None,
             literal_false_assumption_source: false,
+            authored_assumption_surfaces: AuthoredAssumptionSurfaces::Unbound,
             proof_output_requested: self.is_producing_proofs(),
             declared_extension: Vec::new(),
             declared_extension_entries: Vec::new(),
@@ -3115,6 +3743,8 @@ impl Executor {
     /// later provisional UNSAT fails closed instead of borrowing authority.
     pub(super) fn rebind_unsat_query_epoch_assertions(&mut self, assertions: &[TermId]) -> bool {
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         let can_rebind = self.unsat_query_epoch.as_ref().is_some_and(|epoch| {
             epoch.assumptions.is_none()
                 && epoch.assumption_entries.is_none()
@@ -3277,7 +3907,9 @@ impl Executor {
         extension: super::optimization::ParetoFrontExhaustionExtension,
     ) -> bool {
         self.pending_nested_array_bool_bv_unsat = None;
-        if self.ctx.objectives().is_empty() {
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
+        if extension.inventory_is_empty() {
             return false;
         }
         let Some(binding) = extension.into_current_binding(self) else {
@@ -3304,6 +3936,52 @@ impl Executor {
         } else {
             false
         }
+    }
+
+    /// Whether the retained strict proof was rehomed onto a raw authored
+    /// top-level assertion that elaboration does not itself retain as an
+    /// epoch root.
+    ///
+    /// This is only a presentation preference between two already-checked
+    /// certificates. The caller still requires the strict checker to accept
+    /// the incumbent proof and the terminal-trust screen (including its
+    /// foreign-assume provenance check) to pass. A canonical exact-source
+    /// BV/LIA bundle assumes the epoch's elaborated roots, so letting it
+    /// replace this proof would silently undo the checked transport back to
+    /// the source spelling that retained-source artifacts promise.
+    fn last_proof_rehomes_authored_source(&self, scope: &AuthenticatedUnsatScope) -> bool {
+        if self.last_proof_raw_original_assertions.is_empty() {
+            return false;
+        }
+        let Some(proof) = self.last_proof.as_ref() else {
+            return false;
+        };
+        proof.steps.iter().any(|step| {
+            matches!(step, ay_core::ProofStep::Assume(term)
+                if self.last_proof_raw_original_assertions.contains(term)
+                    && !scope.assertions.contains(term)
+                    && !scope.assumptions.contains(term)
+                    && !scope.declared_extension.contains(term))
+        })
+    }
+
+    /// Whether the retained proof already carries the checker-owned local
+    /// Euclidean remainder-range certificate. That certificate is strictly
+    /// stronger presentation evidence for its exact authored shape than a
+    /// whole-query BV/LIA tautology, so a native bundle must not displace it
+    /// merely because both lemmas use a native-only wire rule.
+    fn last_proof_has_lia_mod_range_certificate(&self) -> bool {
+        self.last_proof.as_ref().is_some_and(|proof| {
+            proof.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    ay_core::ProofStep::TheoryLemma {
+                        kind: ay_core::TheoryLemmaKind::LiaModRange,
+                        ..
+                    }
+                )
+            })
+        })
     }
 
     /// Authenticate the exact public-query scope for one provisional UNSAT.
@@ -3362,23 +4040,15 @@ impl Executor {
         match self.proof_problem_assertion_provenance.as_ref() {
             Some(provenance) if provenance.original_problem_assertions != epoch.assertions => {
                 probe_cert_reject(|| {
-                    let render = |ids: &[TermId]| -> String {
-                        ids.iter()
-                            .enumerate()
-                            .map(|(i, t)| {
-                                let rendered = ay_proof::format_term_alethe(&self.ctx.terms, *t);
-                                format!("    [{i}] {rendered}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
                     format!(
                         "assertion epoch mismatch\n  provenance.original_problem_assertions \
                          ({}):\n{}\n  epoch.assertions ({}):\n{}",
                         provenance.original_problem_assertions.len(),
-                        render(&provenance.original_problem_assertions),
+                        self.bounded_cert_reject_probe_terms(
+                            &provenance.original_problem_assertions
+                        ),
                         epoch.assertions.len(),
-                        render(&epoch.assertions),
+                        self.bounded_cert_reject_probe_terms(&epoch.assertions),
                     )
                 });
                 return Err(UnsatCertificationError::AssertionEpochMismatch);
@@ -3456,131 +4126,247 @@ impl Executor {
         // Affine handoff: every mint attempt consumes the quarantine token,
         // including scope failures and stronger proof/sidecar wins.
         let pending_nested_array = self.pending_nested_array_bool_bv_unsat.take();
+        let pending_bounded_bv_lia = self.pending_bounded_bv_lia_unsat.take();
+        self.clear_strict_native_bundle_states();
         let authenticated_scope = self.authenticate_unsat_query_scope(assumptions, true)?;
-        let epoch = self
-            .unsat_query_epoch
-            .as_ref()
-            .ok_or(UnsatCertificationError::MissingEpoch)?;
-        let pending_nested_array = self.require_current_pending_nested_array_for_mint(
-            pending_nested_array,
-            epoch,
-            assumptions,
-        )?;
+        let pending_nested_array = {
+            let epoch = self
+                .unsat_query_epoch
+                .as_ref()
+                .ok_or(UnsatCertificationError::MissingEpoch)?;
+            self.require_current_pending_nested_array_for_mint(
+                pending_nested_array,
+                epoch,
+                assumptions,
+            )?
+        };
+        let pending_bounded_bv_lia = self
+            .require_current_pending_bounded_bv_lia_for_mint(pending_bounded_bv_lia, assumptions)?;
         self.probe_unsat_certificate_entry();
         // Read before the lane chain below can consume it (#missing-proof-probe).
         let pending_nested_array_present = pending_nested_array.is_some();
+        let pending_bounded_bv_lia_present = pending_bounded_bv_lia.is_some();
 
-        let strict_presentation = self.check_strict_unsat_presentation();
-        let certification_source = match strict_presentation {
-            Ok(()) => CertificationSource::StrictProof,
-            Err(presentation_failure) => {
-                // These three lanes authenticate the exact immutable public
-                // query independently of the Alethe presentation. Consequently
-                // a missing, malformed, resource-limited, or otherwise
-                // structurally rejected presentation cannot invalidate their
-                // theorem. They are deliberately unavailable when the caller
-                // explicitly requested a translated proof or strict proof
-                // verification: those modes promise that artifact itself.
-                let independently_checked = if self.independent_sidecar_blocked_by_presentation() {
-                    None
-                } else if self.checked_sat_refutation_authorizes(epoch, assumptions) {
-                    Some(CertificationSource::CheckedSatRefutation)
-                } else if let Some(pending) = pending_nested_array {
-                    // The final quarantine already paid for and replayed this
-                    // exact finite-array refutation. Move it forward; never
-                    // authenticate the same query a second time here.
-                    Some(CertificationSource::PendingNestedArray(pending))
-                } else if let Some((evidence, exact_roots)) =
-                    self.authenticate_bool_bv_query(epoch, assumptions)?
-                {
-                    Some(CertificationSource::CheckedBoolBv {
-                        evidence,
-                        exact_roots,
-                    })
-                } else if let Some((evidence, exact_roots)) =
-                    self.authenticate_bv_lia_query(epoch, assumptions)?
-                {
-                    Some(CertificationSource::CheckedBvLia {
-                        evidence,
-                        exact_roots,
-                    })
-                } else if let Some((evidence, exact_roots)) =
-                    self.authenticate_uf_leaf_bool_bv_query(epoch, assumptions)?
-                {
-                    // STRICTLY LAST. Every lane above answers about the exact
-                    // query or an exact reduction of it; this one answers about
-                    // an over-approximating abstraction. Placing it here means
-                    // it can only fire where the chain already yields `None`
-                    // (and hence `MissingProof`), so no query that some earlier
-                    // lane wins today can change its admission class.
-                    Some(CertificationSource::CheckedUfLeafBoolBv {
-                        evidence,
-                        exact_roots,
-                    })
-                } else {
-                    None
-                };
+        let mut strict_presentation = self.check_strict_unsat_presentation();
+        if let Err(StrictProofPresentationFailure::Rejected(error)) = &strict_presentation {
+            if !Self::is_deferred_discharge_rejection(error)
+                && !self.strict_unsat_presentation_required()
+                && self.revert_withheld_derivation_to_poison(error)
+            {
+                strict_presentation = self.check_strict_unsat_presentation();
+            }
+        }
+        // A native-strict proof with no known wire gap remains the preferred
+        // presentation. A route-bound BV/LIA theorem gets its distinct bundle
+        // class only when the existing proof is missing, rejected, or would
+        // honestly render an unsupported Alethe step. A wire gap alone does
+        // not let that bundle displace a strict proof already transported
+        // back onto a raw authored assertion, or one carrying the local
+        // checker-owned mod-range certificate: the bundle is itself a native
+        // certificate over the elaborated epoch roots, so displacement would
+        // lose source provenance without improving the external wire.
+        let strict_presentation_ok = strict_presentation.is_ok();
+        let terminal_trust = self.unsat_proof_terminal_trust_detected();
+        let strict_wire_clean =
+            strict_presentation_ok && !terminal_trust && !self.unsat_proof_has_known_wire_gap();
+        let preserve_authored_proof = strict_presentation_ok
+            && !terminal_trust
+            && (self.last_proof_rehomes_authored_source(&authenticated_scope)
+                || self.last_proof_has_lia_mod_range_certificate());
+        let strict_preferred = strict_wire_clean || preserve_authored_proof;
+        let prepared_native_bv_lia = if strict_preferred {
+            None
+        } else if let Some(pending) = pending_bounded_bv_lia {
+            self.prepare_strict_native_bv_lia_bundle(pending, assumptions)?
+        } else {
+            None
+        };
+        // Do not spend a new search allowance ahead of an already checked,
+        // eligible sidecar. These routes have paid for their source theorem.
+        let existing_sidecar = strict_presentation.is_err()
+            && !self.independent_sidecar_blocked_by_presentation()
+            && (pending_nested_array_present
+                || self.unsat_query_epoch.as_ref().is_some_and(|epoch| {
+                    self.checked_sat_refutation_authorizes(epoch, assumptions)
+                }));
+        let prepared_native_sos =
+            if strict_preferred || prepared_native_bv_lia.is_some() || existing_sidecar {
+                None
+            } else {
+                self.prepare_strict_native_nra_sos_bundle(assumptions)?
+            };
+        let certification_source = if strict_preferred {
+            CertificationSource::StrictProof
+        } else if let Some(prepared) = prepared_native_bv_lia {
+            CertificationSource::StrictNativeBvLiaBundle(prepared)
+        } else if let Some(prepared) = prepared_native_sos {
+            CertificationSource::StrictNativeNraSosBundle(prepared)
+        } else {
+            match strict_presentation {
+                Ok(()) => CertificationSource::StrictProof,
+                Err(presentation_failure) => {
+                    let epoch = self
+                        .unsat_query_epoch
+                        .as_ref()
+                        .ok_or(UnsatCertificationError::MissingEpoch)?;
+                    // These three lanes authenticate the exact immutable public
+                    // query independently of the Alethe presentation. Consequently
+                    // a missing, malformed, resource-limited, or otherwise
+                    // structurally rejected presentation cannot invalidate their
+                    // theorem. They are deliberately unavailable when the caller
+                    // explicitly requested a translated proof or strict proof
+                    // verification: those modes promise that artifact itself.
+                    let independently_checked =
+                        if self.independent_sidecar_blocked_by_presentation() {
+                            None
+                        } else if self.checked_sat_refutation_authorizes(epoch, assumptions) {
+                            Some(CertificationSource::CheckedSatRefutation)
+                        } else if let Some(pending) = pending_nested_array {
+                            // The final quarantine already paid for and replayed this
+                            // exact finite-array refutation. Move it forward; never
+                            // authenticate the same query a second time here.
+                            Some(CertificationSource::PendingNestedArray(pending))
+                        } else if let Some((evidence, exact_roots)) =
+                            self.authenticate_bool_bv_query(epoch, assumptions)?
+                        {
+                            Some(CertificationSource::CheckedBoolBv {
+                                evidence,
+                                exact_roots,
+                            })
+                        } else if let Some((evidence, exact_roots)) =
+                            self.authenticate_bv_lia_query(epoch, assumptions)?
+                        {
+                            Some(CertificationSource::CheckedBvLia {
+                                evidence,
+                                exact_roots,
+                            })
+                        } else if let Some((evidence, exact_roots)) =
+                            self.authenticate_uf_leaf_bool_bv_query(epoch, assumptions)?
+                        {
+                            // STRICTLY LAST. Every lane above answers about the exact
+                            // query or an exact reduction of it; this one answers about
+                            // an over-approximating abstraction. Placing it here means
+                            // it can only fire where the chain already yields `None`
+                            // (and hence `MissingProof`), so no query that some earlier
+                            // lane wins today can change its admission class.
+                            Some(CertificationSource::CheckedUfLeafBoolBv {
+                                evidence,
+                                exact_roots,
+                            })
+                        } else {
+                            None
+                        };
 
-                if let Some(independently_checked) = independently_checked {
-                    independently_checked
-                } else {
-                    match presentation_failure {
-                        StrictProofPresentationFailure::Missing => {
-                            // `MissingProof` has TWO opposite causes and the
-                            // bare error names neither: the refutation is
-                            // genuinely absent (a lane published UNSAT without
-                            // ever building one), or it exists somewhere and
-                            // was not plumbed to `last_proof` — the historical
-                            // shape of this bug at `core_minimize.rs:290` (the
-                            // subset solves consumed the entry proof) and at
-                            // `check_sat.rs:2718` (the seq corroboration threw
-                            // away the proof it had just paid for). The two
-                            // need opposite fixes, so record which independent
-                            // lane could have spoken and did not.
-                            probe_cert_reject(|| {
-                                format!(
-                                    "MissingProof: last_proof=None and no independent lane \
+                    if let Some(independently_checked) = independently_checked {
+                        independently_checked
+                    } else {
+                        match presentation_failure {
+                            StrictProofPresentationFailure::Missing => {
+                                // `MissingProof` has TWO opposite causes and the
+                                // bare error names neither: the refutation is
+                                // genuinely absent (a lane published UNSAT without
+                                // ever building one), or it exists somewhere and
+                                // was not plumbed to `last_proof` — the historical
+                                // shape of this bug at `core_minimize.rs:290` (the
+                                // subset solves consumed the entry proof) and at
+                                // `check_sat.rs:2718` (the seq corroboration threw
+                                // away the proof it had just paid for). The two
+                                // need opposite fixes, so record which independent
+                                // lane could have spoken and did not.
+                                probe_cert_reject(|| {
+                                    format!(
+                                        "MissingProof: last_proof=None and no independent lane \
                                      authorized — strict_presentation_required={} \
                                      checked_sat_refutation_present={} \
                                      pending_nested_array_present={} \
+                                     pending_bounded_bv_lia_present={} \
                                      reconstruction_suppressed={} \
                                      proof_decline={:?} authored_roots={}",
-                                    self.strict_unsat_presentation_required(),
-                                    self.last_checked_sat_refutation.is_some(),
-                                    pending_nested_array_present,
-                                    self.last_unsat_proof_reconstruction_suppressed,
-                                    self.last_proof_decline,
-                                    epoch.assertions.len(),
-                                )
-                            });
-                            return Err(UnsatCertificationError::MissingProof);
-                        }
-                        // Only trust-family presentation failures, and the
-                        // caller's own metered envelope refusal, are eligible
-                        // for the separate clause-discharge fallback. Explicit
-                        // proof and proof-checking modes were excluded above and
-                        // must see the original strict rejection.
-                        //
-                        // Routed through `is_deferred_discharge_rejection`, the
-                        // SAME predicate the corroboration screen in
-                        // `reconfirms_unsat_within` accepts on. These two were
-                        // separate enumerations of the same family, and their
-                        // drift is exactly what let the fallback's entry
-                        // condition become its own rejection reason. One
-                        // definition, so the gate that ROUTES a proof here and
-                        // the screen that ACCEPTS its result cannot disagree
-                        // about what is eligible.
-                        StrictProofPresentationFailure::Rejected(ref error)
-                            if Self::is_deferred_discharge_rejection(error)
-                                && !self.strict_unsat_presentation_required() =>
-                        {
-                            self.discharge_trust_steps_for_certification(error, assumptions)?;
-                            CertificationSource::DischargedTrust
-                        }
-                        StrictProofPresentationFailure::Rejected(error) => {
-                            return Err(UnsatCertificationError::StrictProofRejected {
-                                reason: error.to_string(),
-                            });
+                                        self.strict_unsat_presentation_required(),
+                                        self.last_checked_sat_refutation.is_some(),
+                                        pending_nested_array_present,
+                                        pending_bounded_bv_lia_present,
+                                        self.last_unsat_proof_reconstruction_suppressed,
+                                        self.last_proof_decline,
+                                        epoch.assertions.len(),
+                                    )
+                                });
+                                return Err(UnsatCertificationError::MissingProof);
+                            }
+                            // Only trust-family presentation failures, and the
+                            // caller's own metered envelope refusal, are eligible
+                            // for the separate clause-discharge fallback. Explicit
+                            // proof and proof-checking modes were excluded above and
+                            // must see the original strict rejection.
+                            //
+                            // Routed through `is_deferred_discharge_rejection`, the
+                            // SAME predicate the corroboration screen in
+                            // `reconfirms_unsat_within` accepts on. These two were
+                            // separate enumerations of the same family, and their
+                            // drift is exactly what let the fallback's entry
+                            // condition become its own rejection reason. One
+                            // definition, so the gate that ROUTES a proof here and
+                            // the screen that ACCEPTS its result cannot disagree
+                            // about what is eligible.
+                            StrictProofPresentationFailure::Rejected(ref error)
+                                if Self::is_deferred_discharge_rejection(error)
+                                    && !self.strict_unsat_presentation_required() =>
+                            {
+                                // ONE envelope for the discharge and, if the
+                                // withheld derivation reverts to the poison,
+                                // the poison's discharge too: the second
+                                // charges what the first left, never a fresh
+                                // allowance (P4a.1).
+                                let controls = self.certification_discharge_controls();
+                                let corroboration = match self.discharge_trust_steps_in_envelope(
+                                    error,
+                                    assumptions,
+                                    &controls,
+                                ) {
+                                    Ok(corroboration) => corroboration,
+                                    Err(rejection) => {
+                                        // A withheld derivation whose NON-trust
+                                        // steps step (2) rejects reverts to the
+                                        // poison route; every other failure
+                                        // (forged guard, re-solve) stands, and is
+                                        // the one the poison would have met. A
+                                        // stop is `Stopped`, never a rejection,
+                                        // so it is published as the stop and
+                                        // never reverts.
+                                        let non_trust_step_rejected = matches!(
+                                            &rejection,
+                                            UnsatCertificationError::StrictProofRejected { reason }
+                                                if reason.starts_with(NON_TRUST_STEP_REJECTION)
+                                        );
+                                        if !non_trust_step_rejected
+                                            || !self
+                                                .revert_withheld_derivation_to_poison(&rejection)
+                                        {
+                                            return Err(rejection);
+                                        }
+                                        let Err(StrictProofPresentationFailure::Rejected(
+                                            poison_error,
+                                        )) = self.check_strict_unsat_presentation()
+                                        else {
+                                            return Err(rejection);
+                                        };
+                                        // The poison's discharge is the one that
+                                        // admitted the verdict, so ITS
+                                        // corroboration is the one the label carries.
+                                        self.discharge_trust_steps_in_envelope(
+                                            &poison_error,
+                                            assumptions,
+                                            &controls,
+                                        )?
+                                    }
+                                };
+                                CertificationSource::DischargedTrust(corroboration)
+                            }
+                            StrictProofPresentationFailure::Rejected(error) => {
+                                return Err(UnsatCertificationError::StrictProofRejected {
+                                    reason: error.to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -3837,14 +4623,21 @@ impl Executor {
     /// trust" shape the proof-capability campaign is eliminating, and it is
     /// what the pre-narrowing form of that certificate was rightly distrusted
     /// for.
-    pub(in crate::executor) fn reconfirms_negation_refuted_for_closed_sentence(
+    ///
+    /// Returns the evidence CLASS, not a bool (`None`: declined): a
+    /// `DischargedTrust` refutation is what strict proofs refuse for a directly
+    /// published `unsat`, so the certificates decide with
+    /// [`Self::closed_sentence_refutation_grant`] whether it may become
+    /// authority at the current rigor, and the UNSAT theorem seals the class it
+    /// was granted on into each nested obligation.
+    pub(in crate::executor) fn reconfirm_negation_refuted_for_closed_sentence(
         &self,
         negation: &[TermId],
-    ) -> bool {
+    ) -> Option<ProbeUnsatAuthority> {
         // Depth 0 only — see `CLOSED_SENTENCE_REFUTATION_DEPTH`. A nested
         // refutation reaching back here recurses without bound.
         if CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.get()) > 0 {
-            return false;
+            return None;
         }
         CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.set(d.get() + 1));
         struct DepthDrop;
@@ -3854,65 +4647,189 @@ impl Executor {
             }
         }
         let _guard = DepthDrop;
-        self.reconfirms_unsat_within(negation, WHOLE_PROBLEM_RECONFIRMATION_LIMITS)
+        self.reconfirm_unsat_within(
+            negation,
+            None,
+            CLOSED_SENTENCE_REFUTATION_LIMITS,
+            &self.certification_discharge_controls(),
+            false,
+            ReconfirmationReading::SealedClass,
+        )
     }
 
-    fn reconfirms_unsat_within(
+    /// Whether a closed-sentence certificate may rest on a `DischargedTrust`
+    /// refutation. `false` while strict evidence is demanded — the executor
+    /// option (`check-proofs-strict`) or the CLI's `--rigor strict|certified`
+    /// (`set_strict_grant_evidence_required`) — where a directly published
+    /// `unsat` on the same refutation is withheld. Default rigor is unchanged:
+    /// there the deferred-trust discharge is an admitted authority for UNSAT,
+    /// and the certificates keep accepting the same evidence — at its own
+    /// class, never above it (see [`ProbeUnsatAuthority`]).
+    pub(in crate::executor) fn accepts_discharged_trust_grant(&self) -> bool {
+        !(self.strict_proofs_enabled() || self.strict_grant_evidence_required)
+    }
+
+    /// The grant decision over one nested-refutation outcome at this rigor:
+    /// the class the certificate may rest on, or `None`. A `DischargedTrust`
+    /// refutation grants only while [`Self::accepts_discharged_trust_grant`],
+    /// and it grants AS `DischargedTrust` — the caller seals that class, so a
+    /// trust-derived refutation never becomes a checked admission.
+    pub(in crate::executor) fn closed_sentence_refutation_grant(
+        &self,
+        outcome: Option<ProbeUnsatAuthority>,
+    ) -> Option<ProbeUnsatAuthority> {
+        match outcome? {
+            ProbeUnsatAuthority::Checked => Some(ProbeUnsatAuthority::Checked),
+            ProbeUnsatAuthority::DischargedTrust => self
+                .accepts_discharged_trust_grant()
+                .then_some(ProbeUnsatAuthority::DischargedTrust),
+        }
+    }
+
+    /// The fresh executor a certification RE-SOLVE runs in: this executor's
+    /// context cloned verbatim, with the deletion core minimizer suppressed.
+    ///
+    /// The forged-UNSAT guard and the step-(4) corroboration each re-decide
+    /// the authored problem in a fresh executor and read exactly one thing
+    /// back — the verdict (plus, for corroboration, its strict proof). A
+    /// verbatim clone of a `:produce-unsat-cores true` session carried the
+    /// whole named-core apparatus into that nested solve, including the
+    /// deletion minimizer's subset re-solves — every one a further full
+    /// solve of a problem the nested query needs decided ONCE, whose core
+    /// nobody reads. Measured on deductive-checks's bit-blasted QF_BV obligations
+    /// under the 30 s embedder wall (cores on, proofs off): the corroborating
+    /// re-solve of a 32-bit `bvudiv` refutation ran its own three-attempt
+    /// minimizer pass inside the certification deadline, and the certified
+    /// verdict published as `Unknown(Timeout)`.
+    ///
+    /// What must NOT be switched off is core tracking itself. A first cut
+    /// cleared `:produce-unsat-cores` on the derived context, which dropped
+    /// the named-to-assumption redirect as well — and that redirect is the
+    /// faster engine on some shapes: the DT+UF+LIA `freevar_takesome_manual_d1`
+    /// demand probe decides `unsat` in ~1.7 s through the named-core route
+    /// and needs ~31 s through the plain route, so the corroboration hit its
+    /// 15 s wall and a green probe published `unknown`. Cores are a
+    /// core-TRACKING feature, never verdict authority, so keeping the
+    /// redirect changes nothing about what the nested verdict is accepted
+    /// on (a strictly checked proof, as before); only the minimizer — the
+    /// part that spends the deadline on subsets — is declined
+    /// (`core_shrinking_suppressed`, read by `minimize_assumption_core`).
+    pub(crate) fn new_derived_query_executor(&self) -> Executor {
+        let mut exec = Executor::new();
+        exec.ctx = self.ctx.clone();
+        exec.random_seed = self.random_seed;
+        exec.core_shrinking_suppressed = true;
+        exec.certification_resolve = true;
+        // The re-solve re-decides the same problem: its proof builds carry on
+        // from the exact-division sweeps this executor's build saw fail.
+        exec.exact_division_sweeps = self.exact_division_sweeps.share_with_derived();
+        exec.qlra_lane.nested_inert = true;
+        // Evidence policy P1 (2026-10-02): a re-solve whose verdict is used
+        // as evidence never runs a satisfiability-preserving strengthening.
+        // A strengthening's fact has no implication proof, so it reaches the
+        // refutation as a trust step; a corroborating re-solve that ran the
+        // same strengthening re-derives the same fact and admits it — which is
+        // how LNH's wrong `unsat` was published as `discharged-trust`. With
+        // it off, the forged-UNSAT guard re-decides such a problem as SAT and
+        // the verdict is withdrawn.
+        exec.force_strengthenings_off();
+        exec
+    }
+
+    /// One checked reconfirmation of `problem`, naming the authority it
+    /// accepted on (`None`: declined).
+    ///
+    /// `Checked` when AY's strict checker accepted the fresh re-solve's proof
+    /// end to end; `DischargedTrust` when the proof was accepted only because
+    /// its strict check failed at a trust-kind step or a metered envelope
+    /// refusal — this fallback's entry condition, under which the evidence is
+    /// the fresh re-solve of the same code and nothing more. A caller that
+    /// seals the result into a certificate of its own must carry that class.
+    ///
+    /// `entailed`, when given, is step (4a)'s question: the fresh executor also
+    /// asserts `¬C1 ∨ … ∨ ¬Cn` over its clauses, so `unsat` means `problem`
+    /// entails every one of them, it runs on the question's own counts
+    /// (`limits`), and it stops at the question's own cap as well as at the
+    /// certification deadline (see `trust_clause_entailment`). Everything else
+    /// (the fresh executor, the arena rebuild, the screen) is the same, and a
+    /// question that must not be asked declines. A spent round-trip count
+    /// (`TrustClauseDischargeControls::in_round_trips`) or assembly allowance
+    /// (`redecision_counts`) is a plain decline.
+    ///
+    /// `controls` is the certification's envelope (P4a.1): its polls latch the
+    /// first stop, the nested solve's own stop is classified into it, and its
+    /// backstop is the only deadline the nested solve gets (step (4a) adds its
+    /// cap, half of what remained of the envelope, a lane-local clock that
+    /// `controls` records as such). Once the re-solve has answered, only the
+    /// exact term count is re-checked.
+    ///
+    /// `carry_lnh`: the fresh executor may apply LNH symmetry breaking — only
+    /// for step (4) re-deciding a refutation whose own solve did
+    /// (`lnh_symmetry`, C4/C5). Without it the re-solve of the shape the pass
+    /// exists for (a symmetric pigeonhole core) cannot finish inside the
+    /// deterministic allowance, and the default posture published `unknown`
+    /// for every such refutation; with it, the re-solve proves the symmetry
+    /// of the same query again in its own one-shot check.
+    ///
+    /// `reading` says whether the caller reads the class: when it does not,
+    /// the fresh executor runs under this query's proof bookkeeping meter,
+    /// keeps the proof-mode inprocessing controls past it, and skips the
+    /// trust-elimination members (`screened_reconfirmation`).
+    fn reconfirm_unsat_within(
         &self,
         problem: &[TermId],
+        entailed: Option<&trust_clause_entailment::EntailmentQuestion<'_>>,
         limits: FreshReconfirmationLimits,
-    ) -> bool {
+        controls: &crate::api::proofs::TrustClauseDischargeControls,
+        carry_lnh: bool,
+        reading: ReconfirmationReading,
+    ) -> Option<ProbeUnsatAuthority> {
         if problem.is_empty() {
             // An empty conjunction is satisfiable; there is nothing to confirm.
-            return false;
+            return None;
         }
+        let arm = if entailed.is_some() {
+            "RECONFIRM(4a)"
+        } else {
+            "RECONFIRM(4)"
+        };
         let conflict_limit =
             tighter_optional_limit(self.resource_limit(), Some(limits.max_conflicts));
         let decision_limit =
             tighter_optional_limit(self.decision_limit(), Some(limits.max_decisions));
         if conflict_limit == Some(0) || decision_limit == Some(0) {
-            return false;
+            return None;
         }
-        let certification_deadline = self.certification_deadline.get();
+        // Step (4a) stops at its own cap, never later than the backstop.
+        let nested_deadline = entailed.map_or(controls.backstop, |question| {
+            question.deadline_within(controls.backstop)
+        });
+        // Every poll latches the first stop it sees into `controls`.
         let resources_live = |child: Option<&Executor>| {
-            !self
-                .solve_interrupt
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                && certification_deadline
-                    .is_none_or(|deadline| ay_core::time::Instant::now() < deadline)
-                && !crate::memory::memory_exceeded(self.memory_limit())
-                && !ay_sys::process_memory_exceeded()
-                && !ay_core::TermStore::global_memory_exceeded()
-                && !self.term_memory_exceeded()
-                && !self
-                    .term_memory_limit()
-                    .is_some_and(|limit| self.ctx.terms.true_memory_bytes() > limit)
+            !controls.stop_requested(&self.ctx.terms)
+                && controls.accept_fits(&self.ctx.terms)
                 && child.is_none_or(|executor| {
-                    !executor.term_memory_exceeded()
-                        && !executor
-                            .term_memory_limit()
-                            .is_some_and(|limit| executor.ctx.terms.true_memory_bytes() > limit)
+                    !controls.stop_requested(&executor.ctx.terms)
+                        && controls.accept_fits(&executor.ctx.terms)
                 })
         };
-        if !resources_live(None)
-            || !crate::memory::probe_clone_fits(
-                self.ctx.terms.true_memory_bytes(),
-                self.memory_limit(),
-            )
-        {
-            return false;
+        if !controls.clone_fits(&self.ctx.terms) {
+            return None;
         }
         // This whole-problem re-solve accounted for 94.1% of mint cost on
         // dillig12_m despite only 94/1019 mints reaching it (#cert-accounting 6).
         let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
-        let mut exec = Executor::new();
-        exec.ctx = self.ctx.clone();
+        let mut exec = self.new_derived_query_executor();
+        // Held until the re-solve is screened: its SAT solvers latch the
+        // inprocessing choice when their budget is set (`screened_reconfirmation`).
+        let _kept_inprocessing = self.arm_reconfirmation_posture(&mut exec, reading);
         exec.set_memory_limit(self.memory_limit());
         exec.set_term_memory_limit(self.term_memory_limit());
-        exec.set_solve_controls(self.solve_interrupt.clone(), certification_deadline);
+        exec.set_solve_controls(controls.interrupt.clone(), nested_deadline);
+        exec.set_certification_parent(controls.certify());
+        exec.lnh_reconfirms_carried_symmetry = carry_lnh;
         if !resources_live(Some(&exec)) {
-            return false;
+            return None;
         }
         // Re-decide the AUTHORED problem, NOT `self.ctx.assertions` — the same
         // set steps (1) and (2) use, which `proof_export_scope_assertions`
@@ -3926,8 +4843,14 @@ impl Executor {
         // CORRECT `unsat` was published UNCONFIRMED. Sound but over-conservative
         // — `base |= false` implies `base AND A |= false`, never the reverse.
         exec.ctx.assertions = problem.to_vec();
+        // Step (4a)'s extra root is built in the CLONED arena, before the
+        // rebuild below, so it is one of the roots the rebuild keeps.
+        if let Some(question) = entailed {
+            let refuted_cases = question.refuted_cases(&mut exec.ctx.terms)?;
+            exec.ctx.assertions.push(refuted_cases);
+        }
         if !resources_live(Some(&exec)) {
-            return false;
+            return None;
         }
         // REBUILD THE ARENA AROUND THIS QUERY.
         //
@@ -3960,18 +4883,32 @@ impl Executor {
                 self.memory_limit(),
             )
         {
-            return false;
+            return None;
         }
-        if !exec.ctx.compact_terms_for_derived_query() {
-            probe_cert_reject(|| {
-                "RECONFIRM(4) DECLINED: derived-query arena rebuild could not \
-                 relabel every held term"
-                    .to_string()
-            });
-            return false;
+        //
+        // Not when an AY-internal symbol NAME spells a `TermId` (A-UFA-g6-div0):
+        // relabelling does not reach the digits of `__ay_zerodiv_{op}_{dividend}`,
+        // and the nested `collect_zero_divisor_vars` decoded a moved id (index
+        // 59 in a 55-term arena: a panic; in range, the wrong dividend). Such
+        // an arena is re-solved unpruned, as `pruned_isolated_probe_context`
+        // does: the clone keeps the labelling every spelled id was minted in.
+        match compact_derived_arena(&mut exec.ctx) {
+            None => probe_cert_reject(|| {
+                format!("{arm} arena NOT pruned: an AY-internal symbol name may spell a TermId")
+            }),
+            Some(true) => {}
+            Some(false) => {
+                probe_cert_reject(|| {
+                    format!(
+                        "{arm} DECLINED: derived-query arena rebuild could not relabel \
+                         every held term"
+                    )
+                });
+                return None;
+            }
         }
         if !resources_live(Some(&exec)) {
-            return false;
+            return None;
         }
         // Mint exact authored-root/proof provenance for the nested obligation.
         // We intentionally run only the PLAIN strict checker below rather than
@@ -3993,13 +4930,19 @@ impl Executor {
         // solves may relax into a later hang-protection backstop.
         exec.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
         let trace_rc = ay_core::misc_cli_flags().phase_trace;
-        let verdict = exec.check_sat();
-        self.probe_reconfirmation_outcome(&exec, &verdict, problem);
+        let (verdict, spent_assembly) =
+            redecision_counts::check_within_counts(&mut exec, limits, controls);
+        controls.settle_nested(&exec, crate::api::proofs::EffortShare::Reconfirm);
+        self.probe_reconfirmation_outcome(arm, &exec, &verdict, problem);
         if !matches!(verdict, Ok(ref result) if result.is_unsat()) {
             if trace_rc {
                 eprintln!("c phase-trace reconfirm DECLINED at re-solve verdict={verdict:?}");
             }
-            return false;
+            return None;
+        }
+        if let Some(spent) = spent_assembly {
+            probe_cert_reject(|| format!("{arm} DECLINED: {spent}"));
+            return None;
         }
         if trace_rc {
             eprintln!(
@@ -4014,7 +4957,7 @@ impl Executor {
             if trace_rc {
                 eprintln!("c phase-trace reconfirm DECLINED: re-solve produced no proof");
             }
-            return false;
+            return None;
         };
         let strict = exec.check_proof_strict_with_datatypes(proof);
         // STRUCTURAL screen, not a trust-freeness demand.
@@ -4047,15 +4990,45 @@ impl Executor {
         // original proof is still fully strict-validated, the per-clause
         // standalone-tautology discharge still runs before this, and `unsat`
         // remains the only accepting verdict.
-        let structurally_accepted = match &strict {
-            Ok(_) => true,
-            Err(error) => Self::is_deferred_discharge_rejection(error),
+        // #certify-before-presentation. A twin whose authored-surface document
+        // was withheld by a presentation bound carries its real derivation
+        // here, where it used to carry the one-line `(cl)` poison — which this
+        // screen accepted as a trust-kind rejection without inspecting
+        // anything. When that derivation is itself rejected, it is screened
+        // exactly as the poison it replaces was, the rule the outer funnel
+        // applies through `revert_withheld_derivation_to_poison`: the
+        // corroboration is the re-solve's `unsat`, as it always was, and it is
+        // never promoted to `Checked`.
+        let withheld_twin_rejected = exec.last_proof_surface_withheld.is_some()
+            && matches!(&strict, Err(error) if !Self::is_deferred_discharge_rejection(error));
+        if withheld_twin_rejected {
+            probe_cert_reject(|| {
+                format!(
+                    "RECONFIRM(4) withheld-surface twin derivation REJECTED ({}); screened as \
+                     the (cl) poison the presentation bound installed before",
+                    strict
+                        .as_ref()
+                        .err()
+                        .map_or_else(String::new, ToString::to_string)
+                )
+            });
+        }
+        let accepted_on = match &strict {
+            Ok(_) => Some(ProbeUnsatAuthority::Checked),
+            Err(error)
+                if Self::is_deferred_discharge_rejection(error) || withheld_twin_rejected =>
+            {
+                Some(ProbeUnsatAuthority::DischargedTrust)
+            }
+            Err(_) => None,
         };
-        let landed_live = resources_live(Some(&exec));
+        // A completed re-solve is a fact (#completed-check-accepted): no clock
+        // or RSS re-poll, only the exact count of the terms it built.
+        let landed_live = controls.accept_fits(&exec.ctx.terms);
         if trace_rc {
             match (&strict, landed_live) {
                 (_, false) => eprintln!(
-                    "c phase-trace reconfirm DECLINED: publication resource envelope fired"
+                    "c phase-trace reconfirm DECLINED: the re-solve built past the term ceiling"
                 ),
                 (Ok(_), true) => eprintln!("c phase-trace reconfirm ACCEPTED"),
                 (Err(e), true) if Self::is_deferred_discharge_rejection(e) => eprintln!(
@@ -4068,7 +5041,56 @@ impl Executor {
                 ),
             }
         }
-        structurally_accepted && landed_live
+        accepted_on.filter(|_| landed_live)
+    }
+
+    /// `true` when [`Self::reconfirm_unsat_within`] accepted, in EITHER class:
+    /// the UNSAT funnel's deferred-trust discharge (step 4), which admits both
+    /// at its own admission level (`DischargedTrust`).
+    fn reconfirms_unsat_under(
+        &self,
+        problem: &[TermId],
+        limits: FreshReconfirmationLimits,
+        controls: &crate::api::proofs::TrustClauseDischargeControls,
+    ) -> bool {
+        self.reconfirm_unsat_within(
+            problem,
+            None,
+            limits,
+            controls,
+            self.lnh_carried_by_query,
+            ReconfirmationReading::EitherClass,
+        )
+        .is_some()
+    }
+
+    /// [`Self::reconfirms_unsat_under`] in a fresh envelope of this executor's
+    /// own controls.
+    #[cfg(test)]
+    fn reconfirms_unsat_within(
+        &self,
+        problem: &[TermId],
+        limits: FreshReconfirmationLimits,
+    ) -> bool {
+        self.reconfirms_unsat_under(problem, limits, &self.certification_discharge_controls())
+    }
+
+    /// One certification's envelope over this executor's controls: its
+    /// interrupt, the certification deadline as the backstop, its memory
+    /// ceilings, and the count of its own query (P4a.1).
+    pub(super) fn certification_discharge_controls(
+        &self,
+    ) -> crate::api::proofs::TrustClauseDischargeControls {
+        crate::api::proofs::TrustClauseDischargeControls::new(
+            self.solve_interrupt.clone(),
+            // Certification owns the outer command envelope; search lanes may
+            // temporarily narrow or relax `solve_deadline` without changing
+            // this publication boundary.
+            self.certification_deadline.get(),
+            self.memory_limit(),
+            self.term_memory_limit(),
+            crate::api::proofs::CertificationEffort::for_query(self),
+        )
     }
 
     /// The rejection family the deferred-discharge path is defined over.
@@ -4148,7 +5170,7 @@ impl Executor {
     /// HISTORICAL, and the reason this arm is now bounded by deterministic
     /// counts instead of elapsed time: when it still carried a wall-clock
     /// budget, that nominal figure was not even the operative wall —
-    /// `install_quantifier_deadline_backstop` extended the deadline by
+    /// the then-active quantified-backstop installer extended the deadline by
     /// `remaining * (QUANTIFIED_BACKSTOP_FACTOR - 1)`, so the real ceiling was
     /// 4x it, and a 5.85s re-solve sat at 1.37x margin. Contention past ~1.4x
     /// flipped a correct `unsat` to `unknown`, which is how an ACCEPTING
@@ -4257,54 +5279,21 @@ impl Executor {
             .then_some(false_term)
     }
 
-    fn redecides_definitive_sat_within(&self, authored: &[TermId], budget_ms: u64) -> bool {
-        if authored.is_empty() {
-            return false;
-        }
-        let local_conflict_limit =
-            crate::pipeline_fns::effective_conflict_allowance(None, self.ground_budget_enabled());
-        let local_decision_limit =
-            crate::pipeline_fns::effective_decision_allowance(None, self.ground_budget_enabled());
-        let conflict_limit = tighter_optional_limit(self.resource_limit(), local_conflict_limit);
-        let decision_limit = tighter_optional_limit(self.decision_limit(), local_decision_limit);
-        if conflict_limit == Some(0) || decision_limit == Some(0) {
-            return false;
-        }
-        let Some(local_deadline) =
-            ay_core::time::Instant::now().checked_add(std::time::Duration::from_millis(budget_ms))
-        else {
-            return false;
-        };
-        let deadline = self
-            .certification_deadline
-            .get()
-            .map_or(local_deadline, |outer| outer.min(local_deadline));
-        let resources_live = |child: Option<&Executor>| {
-            !self
-                .solve_interrupt
-                .as_ref()
-                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                && ay_core::time::Instant::now() < deadline
-                && !crate::memory::memory_exceeded(self.memory_limit())
-                && !ay_sys::process_memory_exceeded()
-                && !ay_core::TermStore::global_memory_exceeded()
-                && !self.term_memory_exceeded()
-                && !self
-                    .term_memory_limit()
-                    .is_some_and(|limit| self.ctx.terms.true_memory_bytes() > limit)
-                && child.is_none_or(|executor| {
-                    !executor.term_memory_exceeded()
-                        && !executor
-                            .term_memory_limit()
-                            .is_some_and(|limit| executor.ctx.terms.true_memory_bytes() > limit)
-                })
-        };
-        if !resources_live(None)
-            || !crate::memory::probe_clone_fits(
-                self.ctx.terms.true_memory_bytes(),
-                self.memory_limit(),
-            )
-        {
+    /// Step (1), the forged-UNSAT guard: `true` only when a fresh executor
+    /// re-decides `authored` as a DEFINITIVE SAT. It runs on the guard's share
+    /// of the certification count (an eighth of the allowance, P4a.1; it was a
+    /// 250 ms wall budget that existed only for cost) and on the guard's grant
+    /// of split-loop round trips (`GUARD_ROUND_TRIPS`: the conflict share
+    /// bounds each round, not the rounds), under `controls`' interrupt,
+    /// backstop and memory ceilings. Downgrade-only: a decline, a spent grant
+    /// or a stop reads as "not forged", and a stop stays latched in `controls`
+    /// for the steps after it.
+    fn redecides_definitive_sat_within(
+        &self,
+        authored: &[TermId],
+        controls: &crate::api::proofs::TrustClauseDischargeControls,
+    ) -> bool {
+        if authored.is_empty() || !controls.clone_fits(&self.ctx.terms) {
             return false;
         }
         // #cert-accounting item 6: a WHOLE-PROBLEM re-solve on a fresh
@@ -4313,12 +5302,14 @@ impl Executor {
         // so the mint is cheap EXCEPT when it reaches here. Without a
         // standing counter that has to be rediscovered by hand.
         let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
-        let mut exec = Executor::new();
-        exec.ctx = self.ctx.clone();
-        exec.set_memory_limit(self.memory_limit());
-        exec.set_term_memory_limit(self.term_memory_limit());
-        exec.set_solve_controls(self.solve_interrupt.clone(), Some(deadline));
-        if !resources_live(Some(&exec)) {
+        let mut exec = self.new_derived_query_executor();
+        // The grant's limits are explicit, the default ground budget is off so
+        // it cannot replace them, and quantified solving may not relax the
+        // backstop into a later one.
+        if controls
+            .install_on(&mut exec, crate::api::proofs::EffortShare::Guard)
+            .is_none()
+        {
             return false;
         }
         // Re-decide the AUTHORED assertions, NOT `self.ctx.assertions`.
@@ -4341,23 +5332,15 @@ impl Executor {
         // sound answers is precisely the failure mode this funnel exists to
         // prevent.
         exec.ctx.assertions = authored.to_vec();
-        if !resources_live(Some(&exec)) {
+        if controls.stop_requested(&exec.ctx.terms) || !self.rebuild_forged_guard_arena(&mut exec) {
             return false;
         }
-        // Although this guard is downgrade-only, it is still part of the
-        // caller's solve/publication transaction. Never let its private latency
-        // cap replace an earlier caller deadline, and do not let quantified
-        // solving relax either deadline into a later backstop. The same outer
-        // interrupt and effective RSS ceiling remain authoritative throughout.
-        exec.set_resource_limit(conflict_limit);
-        exec.set_decision_limit(decision_limit);
-        // The effective limits above are now explicit. Disable the fresh
-        // executor's independent default so it cannot silently replace a
-        // caller opt-out (or reintroduce a limit when both sides are unbounded).
-        exec.set_ground_budget_enabled(false);
-        exec.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
-        let result = exec.check_sat();
-        resources_live(Some(&exec)) && matches!(result, Ok(result) if result.is_sat())
+        let result = controls
+            .in_round_trip_grant(crate::api::proofs::EffortShare::Guard, || exec.check_sat());
+        controls.settle_nested(&exec, crate::api::proofs::EffortShare::Guard);
+        // A definitive SAT is a fact about the query; nothing re-polls the
+        // clock after it (#completed-check-accepted).
+        matches!(result, Ok(result) if result.is_sat())
     }
 
     /// The authored obligation this query actually decided.
@@ -4399,7 +5382,14 @@ impl Executor {
         let false_term = self.ctx.terms.false_term();
         let false_is_authored = self.boolean_constant_premises_authored().1;
         let mut authorized_assumptions: Vec<TermId> = Vec::new();
-        let mut exact = true;
+        // A PREMISE removed by the same authority rule makes the set just as
+        // partial as a dropped assumption does. `proof_export_scope_assertions`
+        // retains the canonical `false` OUT whenever the author did not write
+        // it, and preprocessing puts it there by folding a refuted authored
+        // assertion to `false` — so the survivors are a proper subset of the
+        // query and a SAT answer about them is no evidence of forgery. See
+        // `proof_export_scope_assertions_tracking_drop` for the measured loss.
+        let mut exact = !self.proof_export_scope_assertions_tracking_drop().1;
         for &assumption in bound {
             if assumption == false_term && !false_is_authored {
                 exact = false;
@@ -4417,11 +5407,38 @@ impl Executor {
         }
     }
 
+    /// The deferred-trust discharge under ONE envelope for the whole
+    /// certification (P4a.1), and the rule that keeps its stops honest: a stop
+    /// any lane latched is the outcome, whatever the lanes said, and a decline
+    /// that a lane-local clock contributed to is that stop too. A stop only
+    /// ever ends lanes, so it is returned as
+    /// [`UnsatCertificationError::Stopped`], never as a rejection.
+    ///
+    /// `controls` is that envelope; a caller that discharges twice in one
+    /// certification (the withheld derivation reverted to the poison) passes
+    /// the same one both times, so the second charges what the first left.
+    fn discharge_trust_steps_in_envelope(
+        &self,
+        plain_error: &ay_proof::ProofCheckError,
+        bound_assumptions: &[TermId],
+        controls: &crate::api::proofs::TrustClauseDischargeControls,
+    ) -> Result<UnsatCorroboration, UnsatCertificationError> {
+        let outcome =
+            self.discharge_trust_steps_for_certification(plain_error, bound_assumptions, controls);
+        let stop = match outcome {
+            Ok(_) => controls.observed_stop(),
+            Err(_) => controls.decline_stop(),
+        };
+        self.certification_effort_spent.set(controls.effort.spent());
+        stop.map_or(outcome, |stop| Err(UnsatCertificationError::Stopped(stop)))
+    }
+
     fn discharge_trust_steps_for_certification(
         &self,
         plain_error: &ay_proof::ProofCheckError,
         bound_assumptions: &[TermId],
-    ) -> Result<(), UnsatCertificationError> {
+        controls: &crate::api::proofs::TrustClauseDischargeControls,
+    ) -> Result<UnsatCorroboration, UnsatCertificationError> {
         let reject = |reason: String| UnsatCertificationError::StrictProofRejected { reason };
 
         // Depth 0 only. Raising this limit was TRIED AND MEASURED: 64 of the
@@ -4450,17 +5467,25 @@ impl Executor {
         TRUST_DISCHARGE_DEPTH.with(|depth| depth.set(depth.get() + 1));
         let _guard = DepthGuard;
 
-        // (1) Forged-UNSAT guard, dominant — but BUDGETED.
+        // ONE envelope for the whole certification (P4a.1, `controls`): every
+        // nested solve below runs on a share of this query's own count, never
+        // on a clock, and the first stop any of them sees is latched there.
+
+        // (1) Forged-UNSAT guard, dominant — but BOUNDED.
         //
-        // The API-layer guard re-solves with no deadline, which is fine there
-        // because it runs once per public call. Here it runs on the rejection
-        // path of every proof that leaned on a trust step, so an unbounded solve
-        // would add unbounded latency to verdicts that are being DOWNGRADED
-        // anyway. Measured before this budget: `group_quantifiers` went 2.7s ->
-        // 20.1s. The guard is downgrade-only, so cutting it short can only cost
-        // the downgrade it would have forced, never soundness — and the
-        // per-clause discharge in (3) still has to pass.
-        const FORGED_GUARD_BUDGET_MS: u64 = 250;
+        // Here it runs on the rejection path of every proof that leaned on a
+        // trust step, so an unbounded solve would add unbounded latency to
+        // verdicts that are being DOWNGRADED anyway. Measured before any bound:
+        // `group_quantifiers` went 2.7s -> 20.1s. The bound was a 250 ms wall
+        // budget, which made what the guard decided depend on the host's load;
+        // it is now the guard's share of the certification count (an eighth of
+        // the allowance) and its grant of split-loop round trips, without which
+        // a re-solve of cheap rounds ran on to the backstop (the deductive-checks
+        // set-fold obligation: 3750 rounds, 21-39 s, so the query's deadline
+        // decided it). The guard is downgrade-only, so cutting it short can
+        // only cost the downgrade it would have forced, never soundness — and
+        // the per-clause discharge in (3) still has to pass.
+        //
         // The whole-problem re-solve runs at most once per certification and only
         // after per-clause discharge has already failed. Its conflict/decision
         // allowances are fixed above; do not replace them with a wall-clock
@@ -4510,8 +5535,8 @@ impl Executor {
         // 2_000_000 decisions is ~10x more than the re-solve ever needs, so that
         // bound was simply never reached and the wall clock still decided.
         //
-        // Nor is 2000ms the operative wall. `install_quantifier_deadline_backstop`
-        // extends the deadline by `remaining * (QUANTIFIED_BACKSTOP_FACTOR - 1)`,
+        // At that time 2000ms was not the operative wall: the old quantified
+        // backstop extended it by `remaining * (QUANTIFIED_BACKSTOP_FACTOR - 1)`,
         // so the real bound here is 4x this constant = 8000ms, and a 5.85s
         // re-solve sat at just 1.37x margin. That margin — not chance, and not
         // non-convergence — is the entire nondeterminism: contention slowing the
@@ -4580,22 +5605,12 @@ impl Executor {
                  query and a SAT answer about it would be no evidence"
                     .to_string()
             });
-        } else if self.redecides_definitive_sat_within(&problem, FORGED_GUARD_BUDGET_MS) {
+        } else if self.redecides_definitive_sat_within(&problem, controls) {
             probe_cert_reject(|| {
-                let rendered: Vec<String> = problem
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &t)| {
-                        format!(
-                            "    [{i}] {}",
-                            ay_proof::format_term_alethe(&self.ctx.terms, t)
-                        )
-                    })
-                    .collect();
                 format!(
-                    "forged-guard re-decided set ({} terms):\n{}",
+                    "forged-guard re-decided set ({} term IDs):\n{}",
                     problem.len(),
-                    rendered.join("\n")
+                    self.bounded_cert_reject_probe_terms(&problem)
                 )
             });
             return Err(reject(
@@ -4619,11 +5634,7 @@ impl Executor {
             member_signatures.as_slice(),
             Some(problem.as_slice()),
         )
-        .map_err(|error| {
-            reject(format!(
-                "deferred-trust discharge rejected a NON-trust step: {error}"
-            ))
-        })?;
+        .map_err(|error| reject(format!("{NON_TRUST_STEP_REJECTION}: {error}")))?;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             for (step, clause) in &collected {
@@ -4676,22 +5687,13 @@ impl Executor {
         // vacuously true on an empty list — without this conjunct such a proof
         // would be ACCEPTED having discharged nothing at all. Require a real
         // clause-by-clause discharge here; the empty case is step (4)'s.
-        let discharge_controls = crate::api::proofs::TrustClauseDischargeControls {
-            interrupt: self.solve_interrupt.clone(),
-            // Certification owns the outer command envelope; search lanes may
-            // temporarily narrow or relax `solve_deadline` without changing
-            // this publication boundary.
-            deadline: self.certification_deadline.get(),
-            memory_limit: self.memory_limit(),
-            term_memory_limit: self.term_memory_limit(),
-        };
         let all_discharged = !collected.is_empty()
             && collected.iter().all(|(_, clause)| {
                 crate::api::proofs::discharge_trust_clause_with_controls(
                     &self.ctx.terms,
                     clause,
                     &problem,
-                    &discharge_controls,
+                    controls,
                 )
                 .is_some()
             });
@@ -4701,7 +5703,14 @@ impl Executor {
                  is a standalone theory tautology"
                     .to_string()
             });
-            return Ok(());
+            // #evidence-stage-3. This acceptance is the whole authority behind
+            // the published verdict, and until now it reached the outside world
+            // only as a `--probe-cert-reject` string nobody runs and a
+            // statistics counter nobody reads. Record it so the CLI can say
+            // what was re-run.
+            let corroboration = UnsatCorroboration::standalone_tautology();
+            self.last_unsat_corroboration.set(Some(corroboration));
+            return Ok(corroboration);
         }
 
         // (4) CONTEXT-DEPENDENT FALLBACK.
@@ -4714,42 +5723,104 @@ impl Executor {
         // authored assertions in a fresh executor and require UNSAT.
         //
         // This certifies the property without trusting the original proof's
-        // structure. The re-solve's own proof must pass plain strict checking;
-        // a repeated raw UNSAT, trust/hole proof, SAT, or Unknown all decline.
+        // structure.
+        //
+        // CORRECTED at #evidence-stage-3. This comment used to read "the
+        // re-solve's own proof must pass plain strict checking; a repeated raw
+        // UNSAT, trust/hole proof, SAT, or Unknown all decline". That is not
+        // what `reconfirms_unsat_within` does and has not been for some time.
+        // Its screen is STRUCTURAL and deliberately ACCEPTS a trust-family
+        // rejection of the twin proof — see the argument on
+        // `reconfirm_negation_refuted_for_closed_sentence`: this arm is reached
+        // only because the original proof carries a trust step, and the re-solve
+        // is the same deterministic engine on the same query, so demanding a
+        // trust-free twin demanded exactly the artifact whose absence routed us
+        // here. What the arm buys is an INDEPENDENT RE-DECISION (fresh
+        // `Executor`, no shared state, never shown this proof, fixed
+        // conflict/decision bounds), not a checked derivation, and the honest
+        // reading of the residual exposure is on that function.
+        //
         // Re-solve the MINIMAL authored obligation, not the strict-proof
         // superset — the superset carries every quantified axiom twice and
         // doubled the cost of this step. See `authored_corroboration_scope`.
-        if self.reconfirms_unsat_within(&corroboration_scope, WHOLE_PROBLEM_RECONFIRMATION_LIMITS) {
+        //
+        // Before re-solving the whole obligation, step (4a) asks the narrower
+        // question the deferred clauses actually pose: does the authored
+        // obligation entail every one of them? Its answer is evidence only
+        // because step (2) above validated everything else. See
+        // `trust_clause_entailment`.
+        if let Some(corroboration) =
+            self.fresh_executor_corroboration(&problem, &corroboration_scope, &collected, controls)
+        {
             probe_cert_reject(|| {
-                "deferred-trust discharge ACCEPTED at (4): a fresh Executor \
-                 re-decided the authored obligation as UNSAT"
-                    .to_string()
+                format!(
+                    "deferred-trust discharge ACCEPTED at (4): a fresh Executor \
+                     re-decided the authored obligation ({})",
+                    corroboration.tag()
+                )
             });
-            return Ok(());
+            // #evidence-stage-3, as at arm (3): name the re-decision that
+            // authorised publication instead of leaving it invisible.
+            self.last_unsat_corroboration.set(Some(corroboration));
+            return Ok(corroboration);
         }
 
+        let exhausted = controls
+            .effort
+            .exhaustion()
+            .map(|exhausted| format!("; {exhausted}"))
+            .unwrap_or_default();
         Err(reject(format!(
             "{plain_error}; deferred-trust discharge failed: no collected trust \
              clause is a standalone theory tautology (collected {}) AND the \
-             authored assertions could not be independently re-solved as UNSAT",
+             authored assertions could not be independently re-solved as \
+             UNSAT{exhausted}",
             collected.len()
         )))
     }
 
-    /// Convert a live external stop into a fully revoked public Unknown.
+    /// Convert an external stop into a fully revoked public Unknown: the stop
+    /// a metered strict walk of this certification OBSERVED (kept even after
+    /// its signal cleared: the walk reached no verdict), else a live one.
     fn stop_declines_unsat_publication(&mut self) -> Option<SolveResult> {
+        if let Some(stop) = self.certification_stop.get() {
+            return Some(self.publish_envelope_stop(stop));
+        }
         if !self.should_abort_theory_loop() {
             return None;
         }
         // `should_abort_theory_loop` records the exact interrupt/deadline/memory
         // origin. Publish that Unknown through the canonical revocation boundary
         // before any prechecked or freshly minted token can become observable.
+        self.revoke_unsat_publication_for_stop();
+        Some(self.finalize_unknown_publication(SolveResult::Unknown))
+    }
+
+    /// Publish `stop` as the `Unknown` it is (P4a.1): its origin, reason and
+    /// detail (`InterruptFlag` / `Interrupted`, `SolveDeadline` / `Timeout`,
+    /// `MemoryBudget` / `MemoryLimit`), through the canonical revocation
+    /// boundary. Never `SelfCheckRejected`: a stop is not evidence about the
+    /// proof.
+    pub(crate) fn publish_envelope_stop(
+        &mut self,
+        stop: crate::api::proofs::EnvelopeStop,
+    ) -> SolveResult {
+        let (origin, reason, detail) = stop.unknown();
+        self.record_unknown_from_origin(origin);
+        self.last_result = Some(SolveResult::Unknown);
+        self.record_unknown_diagnostic(reason, detail);
+        self.revoke_unsat_publication_for_stop();
+        self.finalize_unknown_publication(SolveResult::Unknown)
+    }
+
+    fn revoke_unsat_publication_for_stop(&mut self) {
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         if !self.is_producing_proofs() {
             self.proof_tracker.disable();
         }
-        Some(self.finalize_unknown_publication(SolveResult::Unknown))
     }
 
     /// Withhold a computed UNSAT whose terminal derivation chain is not
@@ -4785,11 +5856,38 @@ impl Executor {
         if !published.is_unsat() || !self.strict_proofs_enabled() {
             return published;
         }
-        if !self.unsat_proof_terminal_trust_detected() && !self.unsat_proof_has_known_wire_gap() {
+        let terminal_trust = self.unsat_proof_terminal_trust_detected();
+        let known_wire_gap = self.unsat_proof_has_known_wire_gap();
+        if !terminal_trust && !known_wire_gap {
             return published;
         }
+        // Terminal trust is absolute. Only the sealed native BV/LIA and SOS
+        // classes can admit their known wire gap. Both retain the complete
+        // independently replayed proof and exact source-query identity; neither
+        // grants generic hole authority or claims external Alethe support.
+        if !terminal_trust
+            && known_wire_gap
+            && self
+                .last_unsat_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate.strict_native_bundle_verified(self))
+        {
+            return published;
+        }
+        // The refusal carries its cause (D7): read while the proof is still
+        // retained, because publication below revokes it.
+        let detail = if terminal_trust {
+            self.terminal_trust_refusal_detail()
+        } else {
+            "strict proofs withheld a computed UNSAT because its Alethe rendering has a \
+             known wire gap no external checker accepts"
+                .to_string()
+        };
+        self.record_unknown_diagnostic(crate::UnknownReason::ProofTrusted, detail);
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         if !self.is_producing_proofs() {
             self.proof_tracker.disable();
         }
@@ -4866,6 +5964,8 @@ impl Executor {
         });
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
+        self.pending_bounded_bv_lia_unsat = None;
+        self.clear_strict_native_bundle_states();
         if !self.is_producing_proofs() {
             self.proof_tracker.disable();
         }
@@ -4884,6 +5984,9 @@ impl Executor {
         proposed: SolveResult,
         assumptions: &[TermId],
     ) -> SolveResult {
+        // The fresh executors certification runs are never the caller's query
+        // (`lnh_symmetry`, C4).
+        let _lnh_owner = self.lnh_claim_query_ownership();
         // #cert-accounting item 6. Sampled BEFORE certification runs, because
         // `certify_unsat_presentation` disables the tracker on several exits:
         // reading afterwards would report "not tracked" for a solve that had in
@@ -4896,9 +5999,20 @@ impl Executor {
             self.proof_tracker.is_enabled(),
             self.proof_tracker.recorded_step_count(),
         );
+        // A stop a walk observed DURING this certification is this
+        // publication's; one from the solve before it is not.
+        self.certification_stop.set(None);
+        self.certification_effort_spent.set(0);
         let published = self.certify_unsat_presentation(proposed, assumptions);
         let published = self.decline_trust_bearing_unsat_under_strict_proofs(published);
         let published = self.decline_unexportable_assume_scope_under_proof_demand(published);
+        // Native SOS identity checks also inspect the completed proof. A stop
+        // during those final guards must dominate this new publication lane.
+        let published = if published.is_unsat() && self.has_strict_native_nra_sos_bundle_state() {
+            self.stop_declines_unsat_publication().unwrap_or(published)
+        } else {
+            published
+        };
         // Certification can perform the final strict proof check while minting
         // the public capability. Snapshot only after the complete publication
         // funnel so statistics include that authority check on every exit.
@@ -4940,6 +6054,8 @@ impl Executor {
             }
             self.last_unsat_certificate = prechecked;
             self.pending_nested_array_bool_bv_unsat = None;
+            self.pending_bounded_bv_lia_unsat = None;
+            self.clear_strict_native_bundle_states();
             if !self.is_producing_proofs() {
                 self.proof_tracker.disable();
             }
@@ -4948,6 +6064,8 @@ impl Executor {
         self.last_unsat_certificate = None;
         if !proposed.is_unsat() {
             self.pending_nested_array_bool_bv_unsat = None;
+            self.pending_bounded_bv_lia_unsat = None;
+            self.clear_strict_native_bundle_states();
             if !self.is_producing_proofs() {
                 self.proof_tracker.disable();
             }
@@ -4983,7 +6101,7 @@ impl Executor {
             return self.publish_competition_raw_unsat(proposed, assumptions);
         }
 
-        let minted = self.mint_unsat_certificate(assumptions);
+        let minted = self.mint_unsat_certificate_or_replay_unrewritten(assumptions);
         // Strict checking and independent discharge can outlive the solve that
         // produced the provisional verdict. Never retain their token after a
         // late interrupt/deadline/memory stop.
@@ -4994,6 +6112,11 @@ impl Executor {
             Ok(certificate) => {
                 self.last_unsat_certificate = Some(certificate);
                 proposed
+            }
+            // A stop is published as the stop it was, never as a rejection.
+            Err(UnsatCertificationError::Stopped(stop)) => {
+                probe_cert_reject(|| format!("certification stopped: {stop}"));
+                self.publish_envelope_stop(stop)
             }
             Err(error) => {
                 tracing::warn!(%error, "rejecting uncertified public UNSAT verdict");
@@ -5009,6 +6132,44 @@ impl Executor {
         published
     }
 
+    /// [`Self::mint_unsat_certificate`], and when the refutation's PROOF was
+    /// refused (not its query scope), one re-decision of the exact authored
+    /// roots on the unrewritten probe whose strictly checked proof is then
+    /// minted through the same gate (#unrewritten-authored-replay). Scope,
+    /// epoch and assumption failures are never retried.
+    fn mint_unsat_certificate_or_replay_unrewritten(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<UnsatCertificate, UnsatCertificationError> {
+        // A query decided by a pending EXACT-SOURCE theorem is certified by
+        // that theorem or not at all: its rejection (stale after term growth,
+        // or refused under an artifact demand it cannot meet) is that lane's
+        // final word, never a cue to re-decide.
+        let exact_source_pending = self.pending_nested_array_bool_bv_unsat.is_some()
+            || self.pending_bounded_bv_lia_unsat.is_some();
+        match self.mint_unsat_certificate(assumptions) {
+            Err(
+                error @ (UnsatCertificationError::StrictProofRejected { .. }
+                | UnsatCertificationError::MissingProof),
+            ) => {
+                if exact_source_pending
+                    || self.certification_stop.get().is_some()
+                    || self.should_abort_theory_loop()
+                {
+                    return Err(error);
+                }
+                if !self.install_unrewritten_authored_replay(assumptions) {
+                    return Err(error);
+                }
+                probe_cert_reject(|| {
+                    format!("unrewritten authored replay installed after: {error}")
+                });
+                self.mint_unsat_certificate(assumptions)
+            }
+            other => other,
+        }
+    }
+
     /// Validate and discard any stricter pending theorem, then publish the
     /// separately classified competition raw admission.
     fn publish_competition_raw_unsat(
@@ -5016,16 +6177,24 @@ impl Executor {
         proposed: SolveResult,
         assumptions: &[TermId],
     ) -> SolveResult {
-        // CompetitionRaw must not launder a stale capability left by the final
-        // nested-array quarantine. A current token is deliberately discarded:
-        // shedding publishes only its distinct unverified admission class.
-        let pending = self.pending_nested_array_bool_bv_unsat.take();
-        let raw = if pending.as_ref().is_some_and(|candidate| {
+        // CompetitionRaw must not launder a stale capability left by either
+        // the final nested-array quarantine or the bounded BV/LIA source lane.
+        // Current tokens are deliberately discarded: shedding publishes only
+        // its distinct unverified admission class.
+        let pending_nested = self.pending_nested_array_bool_bv_unsat.take();
+        let pending_bv_lia = self.pending_bounded_bv_lia_unsat.take();
+        self.clear_strict_native_bundle_states();
+        let stale_nested = pending_nested.as_ref().is_some_and(|candidate| {
             !self.pending_nested_array_bool_bv_unsat_is_current(candidate, assumptions)
-        }) {
+        });
+        let stale_bv_lia = pending_bv_lia.as_ref().is_some_and(|candidate| {
+            !self.pending_bounded_bv_lia_unsat_is_current(candidate, assumptions)
+        });
+        let raw = if stale_nested || stale_bv_lia {
             Err(UnsatCertificationError::StrictProofRejected {
-                reason: "pending nested finite-array Bool/BV authority became stale before CompetitionRaw admission"
-                    .to_string(),
+                reason:
+                    "pending exact-source authority became stale before CompetitionRaw admission"
+                        .to_string(),
             })
         } else {
             self.mint_competition_raw_certificate(assumptions)
@@ -5067,13 +6236,277 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use ay_core::Proof;
+    use ay_core::{Proof, ProofStep};
 
     use super::*;
     use crate::executor::exact_exists_bounds::ExactExistsDecision;
     use crate::executor_types::UnknownReason;
 
     mod pending_nested_array;
+
+    /// Step (4)'s re-solve is priced above the ground conflict
+    /// allowance by exactly `STEP4_RESOLVE_CONFLICT_FACTOR` (it
+    /// re-decides without the first solve's strengthenings, a
+    /// deliberately harder search; datum: 844,828 unaided lane
+    /// conflicts on QF_UF NEQ004_size7 against the 400k ground
+    /// allowance), while the closed-sentence refutation limits
+    /// stay pinned to the ground allowances and keep only their
+    /// round-trip count (#neq-step4-reprice).
+    #[test]
+    fn step4_resolve_limits_carry_the_factor_closed_sentence_stays_ground() {
+        assert_eq!(
+            WHOLE_PROBLEM_RECONFIRMATION_LIMITS.max_conflicts,
+            Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE * STEP4_RESOLVE_CONFLICT_FACTOR
+        );
+        assert_eq!(
+            WHOLE_PROBLEM_RECONFIRMATION_LIMITS.max_decisions,
+            Executor::DEFAULT_GROUND_DECISION_ALLOWANCE
+        );
+        assert_eq!(
+            CLOSED_SENTENCE_REFUTATION_LIMITS.max_conflicts,
+            Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE
+        );
+        assert_eq!(
+            CLOSED_SENTENCE_REFUTATION_LIMITS.max_decisions,
+            Executor::DEFAULT_GROUND_DECISION_ALLOWANCE
+        );
+        assert!(CLOSED_SENTENCE_REFUTATION_LIMITS.max_round_trips.is_some());
+        assert!(WHOLE_PROBLEM_RECONFIRMATION_LIMITS
+            .max_round_trips
+            .is_none());
+    }
+
+    /// The certification funnel's fresh-executor re-solves (the forged-UNSAT
+    /// guard and the step-(4) corroboration) decide a DERIVED query and read
+    /// only its verdict, so the deletion minimizer's subset re-solves are
+    /// pure waste there (measured on deductive-checks's bit-blasted `bvudiv`
+    /// obligation as a three-attempt minimizer pass inside the certification
+    /// deadline).
+    ///
+    /// A derived-query executor keeps the session's core tracking (so the
+    /// named-core redirect — the faster engine on DT+UF+LIA shapes, see
+    /// `new_derived_query_executor` — is still available to the nested
+    /// solve) but never runs the deletion minimizer, and never touches the
+    /// caller's own executor.
+    #[test]
+    fn derived_query_executor_keeps_core_tracking_and_skips_the_minimizer() {
+        let commands = ay_frontend::parse(
+            "(set-option :produce-unsat-cores true)\n\
+             (set-option :produce-unsat-assumptions true)\n\
+             (declare-sort U 0)\n\
+             (declare-const a U) (declare-const b U) (declare-const c U)\n\
+             (declare-const d U) (declare-const e U)\n\
+             (assert (! (= a b) :named h1))\n\
+             (assert (! (= b c) :named h2))\n\
+             (assert (! (not (= a c)) :named h3))\n\
+             (assert (! (= d e) :named irr1))",
+        )
+        .expect("script parses");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("options, declarations and asserts execute");
+        assert!(executor.produce_unsat_cores_enabled());
+        assert!(!executor.core_shrinking_suppressed);
+
+        let mut nested = executor.new_derived_query_executor();
+        assert!(nested.core_shrinking_suppressed);
+        assert!(
+            nested.produce_unsat_cores_enabled(),
+            "core tracking, and with it the named-core redirect, stays on"
+        );
+        assert_eq!(nested.ctx.assertions, executor.ctx.assertions);
+        assert_eq!(
+            nested.ctx.named_terms_iter().count(),
+            4,
+            "named-term provenance is carried over"
+        );
+        assert!(
+            !executor.core_shrinking_suppressed,
+            "the caller's own session keeps its minimizer"
+        );
+
+        // The nested solve takes the named-core route (the redirect records
+        // a named core) and decides UNSAT, but the minimizer never runs: no
+        // `uc_minimize` statistic, and the padded all-named core is kept
+        // rather than shrunk to the three-member transitivity core.
+        let verdict = nested.check_sat().expect("derived query solves");
+        assert!(verdict.is_unsat());
+        assert_eq!(nested.statistics().get_string("solver.uc_minimize"), None);
+        let core = nested.unsat_core();
+        assert!(
+            core.contains("h1") && core.contains("h2") && core.contains("h3"),
+            "the redirect's core names the refutation: {core}"
+        );
+
+        // The session's own executor still shrinks its core.
+        let verdict = executor.check_sat().expect("session query solves");
+        assert!(verdict.is_unsat());
+        assert!(
+            executor
+                .statistics()
+                .get_string("solver.uc_minimize")
+                .is_some(),
+            "the caller's minimizer is untouched"
+        );
+    }
+
+    /// Regression (#rewritten-constant-premise, corroboration side). An
+    /// assertion the elaborator folds to the constant `false` sits in
+    /// `ctx.assertions` as bare `false` while the parsed surface never says
+    /// `(assert false)`, so `proof_export_scope_assertions` keeps it OUT of
+    /// the strict-proof problem while `authored_corroboration_scope` — which
+    /// reads the authored window — keeps it IN. That divergence made the
+    /// subset `debug_assert!` below fire 6 times while compiler_consumer verified
+    /// `library/core`, from `certify_unsat_for_publication` on queries the
+    /// `ay-chc` PDR lane raised through `Executor::execute_all`.
+    ///
+    /// `export_stripped_authored_false` is what closes it, and the rule it
+    /// encodes is the one this test pins: the strip is a statement about the
+    /// exported SURFACE, not about authorship, so the constant stays a claimed
+    /// premise of the re-solve — but ONLY on the elaborator's concrete
+    /// authored-`assert` records, never on `ctx.assertions` membership, so a
+    /// solver-derived or preprocessing `false` can still never buy itself
+    /// premise status. Dropping the term instead would close the panic and
+    /// cost the correct answer: it is the only contradictory premise, and
+    /// removing it withdraws a real `unsat` to `unknown` (see
+    /// `tests/authored_false_premise_corroboration.rs`).
+    ///
+    /// This test drives the two scope builders directly, which is where the
+    /// assertion lives; it does not reproduce the PDR-lane call path.
+    #[test]
+    fn folded_false_is_a_claimed_premise_of_the_corroboration_scope() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_LIA)\n\
+             (declare-const scope_a Int)\n\
+             (assert (<= 256 scope_a))\n\
+             (assert (< 5 3))",
+        )
+        .expect("folded-false fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("folded-false fixture must elaborate");
+        let false_term = executor.ctx.terms.false_term();
+        assert!(
+            executor.ctx.assertions.contains(&false_term),
+            "the fixture relies on `(< 5 3)` elaborating to the constant `false`"
+        );
+        assert!(
+            !executor.boolean_constant_premises_authored().1,
+            "no line literally asserts `false`, so the parsed surface never spells it"
+        );
+        assert_eq!(
+            executor.export_stripped_authored_false(),
+            Some(false_term),
+            "a concrete authored `assert` produced it, so it is export-stripped \
+             yet still claimed"
+        );
+        let scope = executor.strict_proof_problem_with_bound_assumptions(&[]);
+        assert!(
+            !scope.premises.contains(&false_term),
+            "the export surface still refuses a `false` the file does not spell"
+        );
+        // On the pre-fix code the `debug_assert!` inside this call panics.
+        let corroboration =
+            executor.authored_corroboration_scope(&scope.premises, &scope.authorized_assumptions);
+        assert!(
+            corroboration.contains(&false_term),
+            "the authored contradiction must reach the re-solve, or a correct \
+             `unsat` is withdrawn to `unknown`"
+        );
+        assert!(
+            corroboration
+                .iter()
+                .all(|term| scope.premises.contains(term) || *term == false_term),
+            "every other term of the corroboration scope is a strict-proof premise"
+        );
+        assert!(
+            corroboration.len() > 1,
+            "the genuine authored root still reaches the re-solve beside it"
+        );
+    }
+
+    /// The forged-UNSAT guard must ABSTAIN when that same export strip
+    /// removed a premise: the set it would re-decide is then a PROPER SUBSET
+    /// of the query, and a proper subset of an unsatisfiable set is routinely
+    /// satisfiable, so a SAT answer about it is no evidence of forgery.
+    ///
+    /// Measured on `sfz/min/m494.smt2`, where preprocessing folds
+    /// `(select ((as const (Array (_ BitVec 32) Bool)) false) #x00000003)` to
+    /// the canonical `false`: the guard re-decided the two SATISFIABLE
+    /// survivors and rejected a refutation that z3, the previous commit and
+    /// this binary at `--rigor fast` all publish as `unsat`.
+    #[test]
+    fn a_stripped_false_premise_makes_the_strict_scope_inexact() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_LIA)\n\
+             (declare-const scope_a Int)\n\
+             (assert (<= 256 scope_a))\n\
+             (assert (< 5 3))",
+        )
+        .expect("folded-false fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("folded-false fixture must elaborate");
+        let scope = executor.strict_proof_problem_with_bound_assumptions(&[]);
+        assert!(
+            !scope.exact,
+            "a premise the export strip removed makes the re-decidable set a \
+             proper subset, so the rejecting guard must abstain"
+        );
+    }
+
+    /// Twin: nothing was stripped, so the guard keeps its authority. Exactness
+    /// is what licenses the rejection, and this is the case that must stay
+    /// able to reject.
+    #[test]
+    fn an_unstripped_scope_stays_exact() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_LIA)\n\
+             (declare-const scope_a Int)\n\
+             (assert (<= 256 scope_a))\n\
+             (assert (<= scope_a 255))",
+        )
+        .expect("plain fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("plain fixture must elaborate");
+        let scope = executor.strict_proof_problem_with_bound_assumptions(&[]);
+        assert!(
+            scope.exact,
+            "no premise was removed, so the guard speaks about the whole query"
+        );
+    }
+
+    /// Twin: a file that literally says `(assert false)` authors the
+    /// constant, and both the premises and the corroboration scope keep it.
+    #[test]
+    fn literal_false_stays_in_both_the_premises_and_the_corroboration_scope() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_LIA)\n\
+             (declare-const scope_a Int)\n\
+             (assert (<= 256 scope_a))\n\
+             (assert false)",
+        )
+        .expect("literal-false fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("literal-false fixture must elaborate");
+        let false_term = executor.ctx.terms.false_term();
+        assert!(executor.boolean_constant_premises_authored().1);
+        let scope = executor.strict_proof_problem_with_bound_assumptions(&[]);
+        assert!(scope.premises.contains(&false_term));
+        let corroboration =
+            executor.authored_corroboration_scope(&scope.premises, &scope.authorized_assumptions);
+        assert!(corroboration.contains(&false_term));
+        assert!(corroboration
+            .iter()
+            .all(|term| scope.premises.contains(term)));
+    }
 
     /// The metered envelope refusal must be eligible for deferred discharge,
     /// and the caller-stop refusal must NOT be.
@@ -5731,6 +7164,10 @@ mod tests {
         assert!(proposed.is_unsat());
         executor.last_checked_sat_refutation = None;
         executor.last_proof = None;
+        // Exercise the independent source-verdict fallback, not the stronger
+        // native bundle route that the production solve may also prepare.
+        executor.pending_bounded_bv_lia_unsat = None;
+        executor.clear_strict_native_bundle_states();
 
         let published = executor.certify_unsat_for_publication(proposed, &[]);
         assert!(published.is_unsat());
@@ -5900,7 +7337,10 @@ mod tests {
     fn control_lifetime_forged_unsat_guard_redecides_sat_without_an_external_stop() {
         let mut executor = Executor::new();
         let assertion = satisfiable_boolean_assertion(&mut executor);
-        assert!(executor.redecides_definitive_sat_within(&[assertion], 60_000));
+        assert!(executor.redecides_definitive_sat_within(
+            &[assertion],
+            &executor.certification_discharge_controls()
+        ));
     }
 
     #[test]
@@ -5908,7 +7348,10 @@ mod tests {
         let mut executor = Executor::new();
         let assertion = satisfiable_boolean_assertion(&mut executor);
         executor.set_solve_controls(Some(Arc::new(AtomicBool::new(true))), None);
-        assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
+        assert!(!executor.redecides_definitive_sat_within(
+            &[assertion],
+            &executor.certification_discharge_controls()
+        ));
     }
 
     #[test]
@@ -5919,17 +7362,31 @@ mod tests {
             .checked_sub(Duration::from_millis(1))
             .expect("one millisecond must fit before the current instant");
         executor.set_solve_controls(None, Some(expired));
-        assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
+        assert!(!executor.redecides_definitive_sat_within(
+            &[assertion],
+            &executor.certification_discharge_controls()
+        ));
     }
 
     #[test]
-    fn control_lifetime_child_term_limit_declines_forged_unsat_guard() {
+    fn control_lifetime_exceeded_term_limit_declines_forged_unsat_guard() {
         let mut executor = Executor::new();
         let assertion = satisfiable_boolean_assertion(&mut executor);
         let exact_parent_baseline = executor.ctx.terms.true_memory_bytes();
         executor.set_term_memory_limit(Some(exact_parent_baseline));
         assert!(!executor.term_memory_exceeded());
-        assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
+        // This SAT fixture can finish without growing the copied arena. Test
+        // an actually exceeded budget instead of assuming child allocation;
+        // the strict-UNSAT test above covers growth past an equal baseline.
+        let exceeded_limit = exact_parent_baseline
+            .checked_sub(1)
+            .expect("the Boolean fixture has a nonempty term arena");
+        executor.set_term_memory_limit(Some(exceeded_limit));
+        assert!(executor.term_memory_exceeded());
+        assert!(!executor.redecides_definitive_sat_within(
+            &[assertion],
+            &executor.certification_discharge_controls()
+        ));
     }
 
     #[test]
@@ -5937,7 +7394,10 @@ mod tests {
         let mut executor = Executor::new();
         let assertion = satisfiable_boolean_assertion(&mut executor);
         executor.set_decision_limit(Some(0));
-        assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
+        assert!(!executor.redecides_definitive_sat_within(
+            &[assertion],
+            &executor.certification_discharge_controls()
+        ));
     }
 
     #[test]
@@ -7164,15 +8624,18 @@ mod tests {
         assert!(!executor.query_authorizes_assumption(generated, &[authored], &[]));
     }
 
+    /// P4 (2026-10-02): a `discharged-trust` admission is corroborated, not
+    /// independently verified — AY re-ran its own code — and it carries the
+    /// arm that admitted it, at evidence level E1.
     #[test]
-    fn discharged_trust_certificate_is_independent_not_strict() {
+    fn discharged_trust_certificate_is_corroborated_not_independent() {
         let mut executor = Executor::new();
-        let proposition = executor
-            .ctx
-            .terms
-            .mk_var("trust_discharge_p", ay_core::Sort::Bool);
-        let not_proposition = executor.ctx.terms.mk_not_raw(proposition);
-        executor.ctx.assertions = vec![proposition, not_proposition];
+        // Congruence over an uninterpreted sort, so no Bool/BV, UF-leaf or
+        // native-bundle lane certifies it first and the funnel really reaches
+        // the trust discharge.
+        let (a_eq_b, fa_ne_fb) =
+            crate::executor::strengthening::tests::congruence_clash(&mut executor, "dt_label");
+        executor.ctx.assertions = vec![a_eq_b, fa_ne_fb];
         executor.begin_public_solve(false);
         executor.bind_unsat_query_assumptions(&[]);
         assert!(executor
@@ -7199,9 +8662,25 @@ mod tests {
             .take_unsat_certificate()
             .expect("independent trust discharge mints a token");
         assert!(!certificate.strict_proof_verified());
-        assert!(certificate.independently_verified());
+        assert!(!certificate.independently_verified());
         assert!(!certificate.exact_semantic_verified());
+        assert!(certificate.rests_on_corroboration());
         assert!(certificate.confirms_checked_unsat_emission());
+        assert_eq!(
+            certificate.command_admission(),
+            CommandUnsatAdmission::DischargedTrust
+        );
+        let evidence = certificate.evidence();
+        assert_eq!(evidence.level(), crate::executor::UnsatEvidenceLevel::E1);
+        let corroboration = evidence
+            .corroboration()
+            .expect("a discharged-trust admission always names its corroboration");
+        assert_eq!(corroboration.source(), CorroborationSource::Direct);
+        assert_eq!(
+            Some(corroboration),
+            executor.last_unsat_corroboration(),
+            "the token and the disclosed line name the same arm"
+        );
     }
 
     #[test]
@@ -7353,6 +8832,11 @@ mod tests {
         assert!(!certificate.strict_proof_verified());
         assert!(!certificate.independently_verified());
         assert!(!certificate.exact_semantic_verified());
+        assert!(!certificate.rests_on_corroboration());
+        assert_eq!(
+            certificate.evidence().level(),
+            crate::executor::UnsatEvidenceLevel::E0
+        );
         assert!(
             !certificate.confirms_checked_unsat_emission(),
             "a raw competition admission must not cross a checked probe boundary"
@@ -7437,6 +8921,13 @@ mod tests {
 
     #[test]
     fn closed_sentence_unsat_certifies_nested_alternations_end_to_end() {
+        // The qlra lane's nested search (default ON) refutes both fixtures
+        // first, with a strict expansion certificate; this test is about the
+        // closed-sentence lane, so it runs with the nested search off.
+        let _nested_off = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+            no_qlra_nested: true,
+            ..ay_core::misc_cli_flags().clone()
+        });
         for source in [
             CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT,
             CLOSED_SENTENCE_UNSAT_FORALL_EXISTS_SCRIPT,
@@ -7620,6 +9111,131 @@ mod tests {
         assert!(
             executor.reconfirms_unsat_within(&branch, WHOLE_PROBLEM_RECONFIRMATION_LIMITS),
             "the fresh re-solve must refute the branch it is handed"
+        );
+    }
+
+    /// #certification-envelope-isolation, the contract half.
+    ///
+    /// A search lane claims a slice of the SEARCH wall and restores it; the
+    /// certification envelope — the cell every mandatory-certification lane
+    /// polls — must not move in either direction. Exercised on the raw setter
+    /// and on a real lane pair (`open_quantified_gate_arm` /
+    /// `close_quantified_gate_arm`), which is one of the sites that used to go
+    /// through the command-level `set_deadline`.
+    #[test]
+    fn search_lane_narrowing_never_moves_the_certification_envelope() {
+        let mut executor = Executor::new();
+        let outer = ay_core::time::Instant::now() + Duration::from_secs(60);
+        executor.set_solve_controls(None, Some(outer));
+        assert_eq!(executor.certification_deadline.get(), Some(outer));
+
+        let saved = executor.solve_deadline.get();
+        let slice = ay_core::time::Instant::now() + Duration::from_millis(300);
+        executor.set_search_deadline(Some(slice));
+        assert_eq!(executor.solve_deadline.get(), Some(slice));
+        assert_eq!(
+            executor.certification_deadline.get(),
+            Some(outer),
+            "a search slice must never narrow the certification envelope"
+        );
+        executor.set_search_deadline(saved);
+        assert_eq!(executor.solve_deadline.get(), Some(outer));
+        assert_eq!(executor.certification_deadline.get(), Some(outer));
+
+        let (arm, saved) = executor.open_quantified_gate_arm();
+        assert_eq!(
+            executor.certification_deadline.get(),
+            Some(outer),
+            "opening a quantified gate arm must leave the certification envelope alone"
+        );
+        executor.close_quantified_gate_arm(arm, saved);
+        assert_eq!(executor.solve_deadline.get(), Some(outer));
+        assert_eq!(executor.certification_deadline.get(), Some(outer));
+    }
+
+    /// #certification-envelope-isolation, the funnel half.
+    ///
+    /// The regression shape: a search lane leaves an EXPIRED slice behind on
+    /// the search wall while the command still has its full envelope. The
+    /// step-(4) corroborating re-solve reads the certification envelope, so an
+    /// expired search slice must not starve it. Before the fix the lane's
+    /// `set_deadline` had written the slice into `certification_deadline`
+    /// too, `resources_live` read "expired", and the fresh re-solve was
+    /// declined before it ran.
+    #[test]
+    fn an_expired_search_slice_does_not_starve_the_corroborating_resolve() {
+        let mut executor = Executor::new();
+        let problem = strict_boolean_contradiction(&mut executor);
+        let outer = ay_core::time::Instant::now() + Duration::from_secs(60);
+        executor.set_solve_controls(None, Some(outer));
+        let expired = ay_core::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond must fit before the current instant");
+        executor.set_search_deadline(Some(expired));
+        assert!(executor.solve_deadline.expired());
+        assert!(
+            executor.reconfirms_unsat_within(&problem, WHOLE_PROBLEM_RECONFIRMATION_LIMITS),
+            "the certification envelope is live, so the corroborating re-solve must run and accept"
+        );
+        // The dual, unchanged: an expired CERTIFICATION envelope still declines.
+        executor.set_solve_controls(None, Some(expired));
+        assert!(!executor.reconfirms_unsat_within(&problem, WHOLE_PROBLEM_RECONFIRMATION_LIMITS));
+    }
+
+    /// NEGATIVE CONTROL for #certification-envelope-isolation: widening the
+    /// envelope the funnel reads must not have widened what it ACCEPTS. An
+    /// injected `trust` step whose clause is not a consequence of the authored
+    /// problem — here a forged refutation of a SATISFIABLE problem — is still
+    /// refused by the plain strict checker and by mandatory certification,
+    /// which publishes `unknown` and mints no certificate.
+    #[test]
+    fn an_injected_trust_step_over_a_satisfiable_problem_is_still_rejected() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_UF)\n(declare-const injected_trust_p Bool)\n(assert injected_trust_p)",
+        )
+        .expect("satisfiable fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("satisfiable fixture must elaborate");
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let proposition = executor.ctx.assertions[0];
+        let not_proposition = executor.ctx.terms.mk_not_raw(proposition);
+        let forged = Proof::from_steps(vec![
+            ProofStep::Assume(proposition),
+            ProofStep::Step {
+                rule: ay_core::AletheRule::Trust,
+                clause: vec![not_proposition],
+                premises: Vec::new(),
+                args: Vec::new(),
+            },
+            ProofStep::Resolution {
+                clause: Vec::new(),
+                pivot: proposition,
+                clause1: ay_core::ProofId(0),
+                clause2: ay_core::ProofId(1),
+            },
+        ]);
+        assert!(
+            matches!(
+                ay_proof::check_proof_strict(&forged, &executor.ctx.terms),
+                Err(ay_proof::ProofCheckError::TrustStep { .. })
+            ),
+            "the plain strict checker must name the injected trust step"
+        );
+
+        executor.last_proof = Some(forged);
+        executor.last_checked_sat_refutation = None;
+        let published = executor.certify_unsat_for_publication(SolveResult::unsat(), &[]);
+        assert!(
+            published.is_unknown(),
+            "a forged UNSAT closed by an injected trust step must not publish"
+        );
+        assert!(executor.take_unsat_certificate().is_none());
+        assert_eq!(
+            executor.unknown_reason(),
+            Some(UnknownReason::SelfCheckRejected)
         );
     }
 }

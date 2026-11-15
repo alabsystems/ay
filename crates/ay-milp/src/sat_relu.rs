@@ -2305,6 +2305,7 @@ mod tests {
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
             milp_optimality_tree_certificate: None,
             root_dual_bound_certificate: None,
+            milp_optimality_tree_block: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session
@@ -3225,6 +3226,7 @@ mod tests {
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
             milp_optimality_tree_certificate: None,
             root_dual_bound_certificate: None,
+            milp_optimality_tree_block: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session

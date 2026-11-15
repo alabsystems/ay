@@ -9,6 +9,7 @@ use super::*;
 impl Executor {
     pub(super) fn minimize_scalar_model_values(
         &mut self,
+        budget: &mut MinimizationBudget,
         should_stop: &mut impl FnMut(&Self) -> bool,
     ) -> Option<(Option<Model>, bool, bool)> {
         let mut pre_minimization: Option<Model> = None;
@@ -17,6 +18,11 @@ impl Executor {
         'passes: for _pass in 0..MAX_MINIMIZATION_PASSES {
             if should_stop(self) {
                 stopped = true;
+                break;
+            }
+            // A spent budget ENDS minimization; unlike a stop it keeps what
+            // was shrunk, which the independent gate still has to confirm.
+            if budget.exhausted() {
                 break;
             }
             // Phase 1: candidate lists, plus the BV dependency index they share
@@ -42,15 +48,18 @@ impl Executor {
                     stopped = true;
                     break 'passes;
                 }
+                if budget.exhausted() {
+                    break 'passes;
+                }
                 let changed = match attempt {
                     MinAttempt::Lia(term_id, candidates) => {
-                        self.try_lia_candidates(term_id, candidates)
+                        self.try_lia_candidates(term_id, candidates, budget)
                     }
                     MinAttempt::Lra(term_id, candidates) => {
-                        self.try_lra_candidates(term_id, candidates)
+                        self.try_lra_candidates(term_id, candidates, budget)
                     }
                     MinAttempt::Bv(term_id, candidates) => {
-                        self.try_bv_candidates(term_id, candidates, &dependents)
+                        self.try_bv_candidates(term_id, candidates, &dependents, budget)
                     }
                 };
                 any_changed |= changed;

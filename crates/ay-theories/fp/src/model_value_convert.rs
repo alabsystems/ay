@@ -26,14 +26,15 @@ impl FpModelValue {
         let sb = self.sb();
         let width = eb + sb;
         let stored_bits = sb - 1;
-        let (sign_bit, exp_val, sig_val): (u64, u64, u64) = match self {
+        let (sign_bit, exp_val, sig_val): (u64, u64, u128) = match self {
+            Self::Exact(fields) => return fields.encode(),
             Self::PosZero { .. } => (0, 0, 0),
             Self::NegZero { .. } => (1, 0, 0),
             Self::PosInf { .. } => (0, (1u64 << eb) - 1, 0),
             Self::NegInf { .. } => (1, (1u64 << eb) - 1, 0),
             Self::NaN { .. } => {
                 // Quiet NaN: exponent all-ones, significand MSB set
-                (0, (1u64 << eb) - 1, 1u64 << (stored_bits - 1))
+                (0, (1u64 << eb) - 1, 1u128 << (stored_bits - 1))
             }
             Self::Fp {
                 sign,
@@ -52,6 +53,25 @@ impl FpModelValue {
     /// cannot be faithfully represented (eb > 11 or sb > 53).
     pub fn to_f64(&self) -> Option<f64> {
         match self {
+            Self::Exact(fields) => {
+                if fields.exponent_bits() <= 11 && fields.significand_bits() <= 53 {
+                    let (sign, exponent, significand, eb, sb) = fields.native()?;
+                    return Self::from_fields(sign, exponent, significand, eb, sb)?.to_f64();
+                }
+                if fields.is_nan() {
+                    Some(f64::NAN)
+                } else if fields.is_infinite() {
+                    Some(if fields.sign() {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    })
+                } else if fields.is_zero() {
+                    Some(if fields.sign() { -0.0 } else { 0.0 })
+                } else {
+                    None
+                }
+            }
             Self::PosZero { .. } => Some(0.0),
             Self::NegZero { .. } => Some(-0.0),
             Self::PosInf { .. } => Some(f64::INFINITY),
@@ -97,6 +117,7 @@ impl FpModelValue {
         use num_rational::BigRational;
 
         match self {
+            Self::Exact(_) => crate::exact::to_real(self),
             Self::PosZero { .. } | Self::NegZero { .. } => {
                 Some(BigRational::from_integer(BigInt::from(0)))
             }
@@ -153,48 +174,40 @@ impl FpModelValue {
         }
     }
 
-    /// IEEE 754 less-than. Returns `None` if f64 conversion fails.
+    /// IEEE 754 less-than. Same-format supported values compare exactly.
     /// NaN comparisons return `false` per IEEE 754 (#6020).
     pub fn fp_lt(&self, other: &Self) -> Option<bool> {
         if self.is_nan() || other.is_nan() {
             return Some(false);
         }
-        let a = self.to_f64()?;
-        let b = other.to_f64()?;
-        Some(a < b)
+        Some(self.numeric_order(other)?.is_lt())
     }
 
-    /// IEEE 754 less-than-or-equal. Returns `None` if f64 conversion fails.
+    /// IEEE 754 less-than-or-equal. Same-format supported values compare exactly.
     /// NaN comparisons return `false` per IEEE 754 (#6020).
     pub fn fp_leq(&self, other: &Self) -> Option<bool> {
         if self.is_nan() || other.is_nan() {
             return Some(false);
         }
-        let a = self.to_f64()?;
-        let b = other.to_f64()?;
-        Some(a <= b)
+        Some(!self.numeric_order(other)?.is_gt())
     }
 
-    /// IEEE 754 greater-than. Returns `None` if f64 conversion fails.
+    /// IEEE 754 greater-than. Same-format supported values compare exactly.
     /// NaN comparisons return `false` per IEEE 754 (#6020).
     pub fn fp_gt(&self, other: &Self) -> Option<bool> {
         if self.is_nan() || other.is_nan() {
             return Some(false);
         }
-        let a = self.to_f64()?;
-        let b = other.to_f64()?;
-        Some(a > b)
+        Some(self.numeric_order(other)?.is_gt())
     }
 
-    /// IEEE 754 greater-than-or-equal. Returns `None` if f64 conversion fails.
+    /// IEEE 754 greater-than-or-equal. Same-format supported values compare exactly.
     /// NaN comparisons return `false` per IEEE 754 (#6020).
     pub fn fp_geq(&self, other: &Self) -> Option<bool> {
         if self.is_nan() || other.is_nan() {
             return Some(false);
         }
-        let a = self.to_f64()?;
-        let b = other.to_f64()?;
-        Some(a >= b)
+        Some(!self.numeric_order(other)?.is_lt())
     }
 
     /// Construct an `FpModelValue` from an f64 value for a given FP format.
@@ -263,7 +276,7 @@ impl FpModelValue {
             Some(Self::Fp {
                 sign,
                 exponent: 0,
-                significand: sig,
+                significand: u128::from(sig),
                 eb,
                 sb,
             })
@@ -285,7 +298,7 @@ impl FpModelValue {
             Some(Self::Fp {
                 sign,
                 exponent: biased as u64,
-                significand: sig,
+                significand: u128::from(sig),
                 eb,
                 sb,
             })
@@ -296,8 +309,8 @@ impl FpModelValue {
     /// the target FP format.
     ///
     /// Unlike `from_f64_with_format`, this does not lose precision on formats
-    /// wider than Float64. It currently supports formats that fit the existing
-    /// `FpModelValue` representation (`eb < 64`, `2 <= sb <= 64`).
+    /// wider than Float64. Formats fitting the checked model fields are
+    /// supported; arithmetic work limits remain a caller responsibility.
     pub fn from_rational_with_format(
         value: &BigRational,
         eb: u32,
@@ -306,8 +319,11 @@ impl FpModelValue {
     ) -> Option<Self> {
         let zero = BigInt::from(0);
         let one = BigInt::from(1);
-        if eb == 0 || eb >= 64 || !(2..=64).contains(&sb) {
+        if value.denom() <= &zero {
             return None;
+        }
+        if Self::from_fields(false, 0, 0, eb, sb).is_none() {
+            return crate::exact::to_fp_from_rational(rm, value, eb, sb);
         }
         if value.numer() == &zero {
             return Some(Self::PosZero { eb, sb });
@@ -326,6 +342,10 @@ impl FpModelValue {
         let exponent = floor_log2_positive(&abs_value);
         let min_normal_exp = 1i64 - bias as i64;
 
+        if exponent > bias as i64 {
+            return Some(Self::rounded_overflow(negative, eb, sb, rm));
+        }
+
         if exponent >= min_normal_exp {
             let shift = i64::from(sb - 1) - exponent;
             let scaled = scale_rational_by_pow2(&abs_value, shift);
@@ -339,14 +359,10 @@ impl FpModelValue {
 
             let exponent_field = rounded_exponent + bias as i64;
             if exponent_field >= max_exp_field as i64 {
-                return Some(if negative {
-                    Self::NegInf { eb, sb }
-                } else {
-                    Self::PosInf { eb, sb }
-                });
+                return Some(Self::rounded_overflow(negative, eb, sb, rm));
             }
 
-            let stored_significand = u64::try_from(significand - &hidden_bit).ok()?;
+            let stored_significand = u128::try_from(significand - &hidden_bit).ok()?;
             return Some(Self::Fp {
                 sign: negative,
                 exponent: exponent_field as u64,
@@ -381,7 +397,7 @@ impl FpModelValue {
         Some(Self::Fp {
             sign: negative,
             exponent: 0,
-            significand: u64::try_from(significand).ok()?,
+            significand: u128::try_from(significand).ok()?,
             eb,
             sb,
         })
@@ -390,6 +406,27 @@ impl FpModelValue {
     /// Format as SMT-LIB FP literal.
     pub fn to_smtlib(&self) -> String {
         match self {
+            Self::Exact(fields) => {
+                let (eb, sb) = (fields.exponent_bits(), fields.significand_bits());
+                if fields.is_nan() {
+                    format!("(_ NaN {eb} {sb})")
+                } else if fields.is_infinite() {
+                    let sign = if fields.sign() { "-" } else { "+" };
+                    format!("(_ {sign}oo {eb} {sb})")
+                } else if fields.is_zero() {
+                    let sign = if fields.sign() { "-" } else { "+" };
+                    format!("(_ {sign}zero {eb} {sb})")
+                } else {
+                    let sign = if fields.sign() { 1 } else { 0 };
+                    format!(
+                        "(fp #b{sign} #b{:0eb$b} #b{:0sb$b})",
+                        fields.exponent(),
+                        fields.significand(),
+                        eb = eb as usize,
+                        sb = (sb - 1) as usize
+                    )
+                }
+            }
             Self::PosZero { eb, sb } => format!("(_ +zero {eb} {sb})"),
             Self::NegZero { eb, sb } => format!("(_ -zero {eb} {sb})"),
             Self::PosInf { eb, sb } => format!("(_ +oo {eb} {sb})"),

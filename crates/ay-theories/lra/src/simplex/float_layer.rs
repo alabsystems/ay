@@ -257,14 +257,17 @@ impl LraSolver {
                 if vi >= n {
                     return None;
                 }
-                if candidate.is_basic[vi] {
-                    let c = col_of[vi];
+                // Every lookup is checked: any index outside the candidate's
+                // shape fails closed to the exact path, like `vi >= n` above.
+                if *candidate.is_basic.get(vi)? {
+                    let c = *col_of.get(vi)?;
                     if c == usize::MAX {
                         return None;
                     }
-                    row[c] = &row[c] + &coeff;
+                    let cell = row.get_mut(c)?;
+                    *cell = &*cell + &coeff;
                 } else {
-                    let val = nu_cache[vi].as_ref()?;
+                    let val = nu_cache.get(vi)?.as_ref()?;
                     *rx = &*rx - &(&coeff * &val.rational());
                     let ey = val.epsilon();
                     if !ey.is_zero() {
@@ -355,11 +358,13 @@ impl LraSolver {
         }
         // Values changed out from under the incremental guards → invalidate.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.heap_stale = true;
         // #warm-simplex: wholesale value install bypassed the delta log and
         // the dirty-set tracking — invalidate; the next full scan re-arms.
         self.warm_invalidate();
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // This exit verified EVERY bound and EVERY row equation — a full
         // verification, matching the exact simplex's `all_bounds_satisfied`
         // Sat contract (solve.rs:766-772).
@@ -610,7 +615,7 @@ impl LraSolver {
         // Substitute each basic var by its row until only non-basics remain.
         // Rows are in reduced form (RHS references only non-basics), so each
         // basic var is substituted at most once; cap passes as a safety net.
-        for _ in 0..(self.rows.len() + 2) {
+        for _ in 0..self.rows.len().saturating_add(2) {
             let target = acc
                 .iter()
                 .find(|(v, c)| !c.is_zero() && basic_row.contains_key(*v))
@@ -768,7 +773,8 @@ impl LraSolver {
             farkas
         };
         if !self.conflict_literals_all_asserted(&dedup_literals) {
-            self.stats.stale_conflict_rejected_count += 1;
+            self.stats.stale_conflict_rejected_count =
+                self.stats.stale_conflict_rejected_count.saturating_add(1);
             return TheoryConflict::new(vec![]);
         }
         match dedup_farkas {

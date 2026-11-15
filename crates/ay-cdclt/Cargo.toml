@@ -1,0 +1,26 @@
+[package]
+name = "ay-cdclt"
+description = "CDCL(T) kernel: one ay-sat search per check-sat, theories as plug-ins (the development design notes)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+ay-sat.workspace = true
+ay-lra.workspace = true
+ay-diff-logic.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+# The independent strict checker the proof tests validate the kernel's
+# refutations with; the kernel itself never calls it.
+ay-proof.workspace = true

@@ -10,6 +10,9 @@
 //     and `dsr-trim.c::check_reduced_clause`   -> `check_reduced_clause`
 //   * `dsr-trim.c::check_dsr_line`             -> `sr_redundant_step` (the kernel)
 //
+// The first three, the substitution itself, are in `sr_subst.rs`; the kernel
+// and the per-step driver are here.
+//
 // It reuses the watched-literal BCP engine of `DratChecker` (assign / propagate
 // / backtrack / value / clause DB), exactly as the backward checker does. The
 // only new state is the substitution map `Subst`.
@@ -26,196 +29,13 @@
 // `negated()`=^1, `variable()`=>>1 -- byte-identical to dsr-trim's
 // `FROM_DIMACS_LIT`/`NEGATE_LIT`/`VAR_FROM_LIT`, so witness codes map 1:1.
 
-use super::sr_reduct_core::classify_reduct;
 use super::DratChecker;
 use crate::error::DratCheckError;
 use crate::literal::Literal;
 
-/// The image of a *variable's positive literal* under the substitution sigma.
-///
-/// dsr-trim stores `subst_mappings[var] = mapping ^ IS_NEG(lit)`, i.e. the
-/// image of the positive literal; the sign is re-applied on lookup. We mirror
-/// that: `True`/`False` are the boolean constants `SUBST_TT`/`SUBST_FF`, and
-/// `Lit(m)` is a literal image.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SubImage {
-    True,
-    False,
-    Lit(Literal),
-}
-
-impl SubImage {
-    /// Negate an image (applying the sign of a negative literal on lookup).
-    #[inline]
-    fn negate(self) -> Self {
-        match self {
-            SubImage::True => SubImage::False,
-            SubImage::False => SubImage::True,
-            SubImage::Lit(m) => SubImage::Lit(m.negated()),
-        }
-    }
-}
-
-/// Result of evaluating one literal under sigma. (`map_lit_under_subst`.)
-enum LitImage {
-    True,
-    False,
-    Lit(Literal),
-}
-
-/// Outcome of reducing a clause under sigma. Mirrors dsr-trim's return codes
-/// `SATISFIED_OR_MUL` / `NOT_REDUCED` / `REDUCED` / `CONTRADICTION`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Reduce {
-    /// Some literal maps to true: the reduced clause is satisfied -> skip.
-    Satisfied,
-    /// sigma does not touch the clause (every literal maps to itself).
-    NotReduced,
-    /// sigma touches the clause and it is neither satisfied nor empty.
-    Reduced,
-    /// Every literal maps to false: the reduced clause is empty.
-    Contradiction,
-}
-
-/// The substitution sigma, indexed by variable.
-///
-/// `map[var] == None` means sigma is the identity on `var`.
-struct Subst {
-    map: Vec<Option<SubImage>>,
-    /// The clause pivot (= `witness[0]`), retained for diagnostics.
-    pivot: Literal,
-}
-
-impl Subst {
-    /// Build sigma from an `AddPr`/`AddSr` witness token stream.
-    ///
-    /// Layout (see `dsr-trim::parse_sr_clause_and_witness` and AY's
-    /// `DratWriter::add_sr`): `pivot [pr-atoms...] [pivot(sep) (l m)...]`.
-    /// `witness[0]` is the pivot, which maps to true. Atoms before the second
-    /// pivot occurrence each map to true (PR / DPR part). After the separating
-    /// second pivot, tokens are read in (l, m) pairs giving `sigma(l) = m`
-    /// (the substitution part that makes this SR rather than PR).
-    ///
-    /// Faithful to `assume_subst`: the pivot variable may be re-set in the
-    /// substitution part, but no *other* variable may be assigned twice; a
-    /// duplicate (or a malformed dangling pair) makes the witness invalid and
-    /// the step is rejected (fail closed).
-    fn from_witness(witness: &[Literal], num_vars: usize) -> Result<Self, DratCheckError> {
-        let pivot = *witness
-            .first()
-            .ok_or_else(|| DratCheckError::UnsupportedPr {
-                clause: "empty SR/PR witness".to_string(),
-            })?;
-        let pivot_var = pivot.variable().index();
-        let mut map: Vec<Option<SubImage>> = vec![None; num_vars];
-
-        // pivot |-> true.
-        Self::set(&mut map, pivot, SubImage::True);
-
-        let mut seen_divider = false;
-        let mut i = 1;
-        while i < witness.len() {
-            let lit = witness[i];
-            let var = lit.variable().index();
-            if !seen_divider {
-                if lit == pivot {
-                    // The second occurrence of the pivot is the separator.
-                    seen_divider = true;
-                    i += 1;
-                    continue;
-                }
-                if map[var].is_some() && var != pivot_var {
-                    return Err(Self::invalid("witness assigns a variable twice"));
-                }
-                Self::set(&mut map, lit, SubImage::True);
-                i += 1;
-            } else {
-                // Substitution part: (l, m) pairs.
-                let mapped = *witness.get(i + 1).ok_or_else(|| {
-                    Self::invalid("witness has a dangling substitution half-pair")
-                })?;
-                if map[var].is_some() && var != pivot_var {
-                    return Err(Self::invalid("witness assigns a variable twice"));
-                }
-                Self::set(&mut map, lit, SubImage::Lit(mapped));
-                i += 2;
-            }
-        }
-
-        Ok(Subst { map, pivot })
-    }
-
-    fn invalid(detail: &str) -> DratCheckError {
-        DratCheckError::UnsupportedPr {
-            clause: format!("invalid SR/PR witness: {detail}"),
-        }
-    }
-
-    /// Store `sigma(lit) = image`, normalising to the positive-literal image
-    /// (dsr-trim's `set_mapping_for_subst`).
-    #[inline]
-    fn set(map: &mut [Option<SubImage>], lit: Literal, image: SubImage) {
-        let stored = if lit.is_positive() {
-            image
-        } else {
-            image.negate()
-        };
-        map[lit.variable().index()] = Some(stored);
-    }
-
-    /// Compute `sigma(lit)` (dsr-trim's `map_lit_under_subst`).
-    #[inline]
-    fn map_lit(&self, lit: Literal) -> LitImage {
-        match self.map.get(lit.variable().index()).copied().flatten() {
-            None => LitImage::Lit(lit), // identity
-            Some(image) => {
-                let img = if lit.is_positive() {
-                    image
-                } else {
-                    image.negate()
-                };
-                match img {
-                    SubImage::True => LitImage::True,
-                    SubImage::False => LitImage::False,
-                    SubImage::Lit(m) => LitImage::Lit(m),
-                }
-            }
-        }
-    }
-}
-
-/// Reduce `clause` under sigma (dsr-trim's `reduce_clause_under_subst`).
-///
-/// Pure function of the clause and the substitution -- no engine state -- so it
-/// can be called while a clause is borrowed from the DB.
-fn reduce_clause_under_subst(subst: &Subst, clause: &[Literal]) -> Reduce {
-    let mut falsified = 0usize;
-    let mut identity = 0usize;
-    let mut any_true = false;
-    for &lit in clause {
-        match subst.map_lit(lit) {
-            LitImage::True => any_true = true,
-            LitImage::False => falsified += 1,
-            LitImage::Lit(m) => {
-                if m == lit {
-                    identity += 1;
-                }
-            }
-        }
-    }
-    // The soundness-critical skip/reject decision is the SHARED, Trust-verified
-    // `classify_reduct` (proofs/sr_reduct_soundness_proof.rs makes it
-    // load-bearing). 0=Satisfied, 1=NotReduced, 2=Reduced, 3=Contradiction.
-    // (Counting all literals before classifying — rather than short-circuiting on
-    // the first True — yields the identical class but routes the WHOLE decision
-    // through the verified core.)
-    match classify_reduct(any_true, falsified, identity, clause.len()) {
-        0 => Reduce::Satisfied,
-        1 => Reduce::NotReduced,
-        3 => Reduce::Contradiction,
-        _ => Reduce::Reduced,
-    }
-}
+#[path = "sr_subst.rs"]
+mod subst;
+use subst::{reduce_clause_under_subst, LitImage, Reduce, Subst};
 
 impl DratChecker {
     /// THE TRUSTED KERNEL.
@@ -248,7 +68,7 @@ impl DratChecker {
         clause: &[Literal],
         subst: &Subst,
     ) -> Result<(), DratCheckError> {
-        self.stats.checks += 1;
+        self.stats.checks = self.stats.checks.saturating_add(1);
         let saved = self.trail.len();
 
         // (1) RUP shortcut: assume !clause and propagate.
@@ -272,7 +92,14 @@ impl DratChecker {
 
         // (2) The witness must touch `clause`; a clause that needs no witness
         // would have been RUP above (dsr-trim.c:3544).
-        match reduce_clause_under_subst(subst, clause) {
+        let Some(candidate_reduct) = reduce_clause_under_subst(subst, clause) else {
+            self.backtrack(saved);
+            return Err(self.sr_fail(
+                clause,
+                "reduct tally of a clause under the witness is unrepresentable",
+            ));
+        };
+        match candidate_reduct {
             Reduce::NotReduced => {
                 self.backtrack(saved);
                 return Err(self.sr_fail(clause, "candidate clause not reduced by the witness"));
@@ -294,6 +121,13 @@ impl DratChecker {
             let reduce = match &self.clauses[cidx] {
                 Some(d) => reduce_clause_under_subst(subst, d),
                 None => continue, // deleted
+            };
+            let Some(reduce) = reduce else {
+                self.backtrack(saved);
+                return Err(self.sr_fail(
+                    clause,
+                    "reduct tally of a clause under the witness is unrepresentable",
+                ));
             };
             match reduce {
                 Reduce::Satisfied | Reduce::NotReduced => continue,
@@ -317,9 +151,8 @@ impl DratChecker {
 
         // (4) The candidate clause itself (general-witness case). When sigma
         // satisfies `clause` this is `Satisfied` and trivially passes.
-        if reduce_clause_under_subst(subst, clause) == Reduce::Reduced
-            && !self.check_reduced_clause(clause, subst, base)
-        {
+        // `candidate_reduct` is this same pure reduction, computed in (2).
+        if candidate_reduct == Reduce::Reduced && !self.check_reduced_clause(clause, subst, base) {
             self.backtrack(saved);
             return Err(self.sr_fail(clause, "reduced candidate clause is not implied"));
         }
@@ -365,7 +198,7 @@ impl DratChecker {
     }
 
     fn sr_fail(&mut self, clause: &[Literal], why: &str) -> DratCheckError {
-        self.stats.failures += 1;
+        self.stats.failures = self.stats.failures.saturating_add(1);
         let lits: Vec<_> = clause.iter().map(ToString::to_string).collect();
         DratCheckError::NotImplied {
             clause: format!("{lits:?} ({why})"),
@@ -404,7 +237,7 @@ impl SrChecker {
 
     /// Add one PR/SR step and, on success, commit the clause to the DB.
     fn add_sr(&mut self, clause: &[Literal], witness: &[Literal]) -> Result<(), DratCheckError> {
-        self.inner.stats.additions += 1;
+        self.inner.stats.additions = self.inner.stats.additions.saturating_add(1);
 
         // If the formula is already inconsistent, any non-empty clause is
         // vacuously redundant (matches `DratChecker::add_derived`).
@@ -413,7 +246,11 @@ impl SrChecker {
         }
 
         for &lit in clause.iter().chain(witness.iter()) {
-            self.inner.ensure_capacity(lit.variable().index());
+            let variable = lit.variable().index();
+            if let Err(refusal) = self.inner.ensure_capacity(variable) {
+                self.inner.stats.failures = self.inner.stats.failures.saturating_add(1);
+                return Err(refusal.step_error(variable, self.inner.stats.additions));
+            }
         }
 
         // A tautological clause is trivially redundant; the DB insert skips it.
@@ -422,7 +259,7 @@ impl SrChecker {
         }
 
         let subst = Subst::from_witness(witness, self.inner.num_vars())?;
-        debug_assert_eq!(subst.pivot, witness[0]);
+        debug_assert_eq!(Some(&subst.pivot), witness.first());
         self.inner.sr_redundant_step(clause, &subst)?;
 
         // Redundant: commit it so later steps see it (also sets `inconsistent`
@@ -464,7 +301,7 @@ impl SrChecker {
                 ProofStep::AddPr { clause, witness } => self.add_sr(clause, witness),
             };
             res.map_err(|e| DratCheckError::StepFailed {
-                step: i + 1,
+                step: i.saturating_add(1),
                 source: Box::new(e),
             })?;
         }

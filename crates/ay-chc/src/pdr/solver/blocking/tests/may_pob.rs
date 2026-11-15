@@ -26,7 +26,11 @@ const SAFE_COUNTER: &str = r#"
 
 fn safe_counter_solver(config: PdrConfig) -> (PdrSolver, PredicateId, ChcVar) {
     let problem = ChcParser::parse(SAFE_COUNTER).unwrap();
-    let solver = PdrSolver::new(problem, config);
+    // May-pobs are a legacy technique; the Spacer lane's profile turns them off.
+    let solver = PdrSolver::new(
+        problem,
+        config.with_spacer(crate::pdr::config::SpacerLane::OFF),
+    );
     let inv = solver.problem.get_predicate_by_name("inv").unwrap().id;
     let x = solver.canonical_vars(inv).unwrap()[0].clone();
     (solver, inv, x)

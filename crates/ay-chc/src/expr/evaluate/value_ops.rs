@@ -59,7 +59,7 @@ pub(crate) fn eval_real_big(
                 Some(BigRational::new(BigInt::from(*n), BigInt::from(*d)))
             }
             ChcExpr::Int(n) => Some(BigRational::from(BigInt::from(*n))),
-            ChcExpr::Var(v) => match model.get(&v.name)? {
+            ChcExpr::Var(v) => match super::lookup_model_value(model, v)? {
                 SmtValue::Real(r) => Some(r.clone()),
                 SmtValue::Int(n) => Some(BigRational::from(BigInt::from(*n))),
                 SmtValue::BigInt(b) => Some(BigRational::from(b.as_ref().clone())),
@@ -190,6 +190,22 @@ pub(crate) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
         (SmtValue::Bool(b_val), SmtValue::Int(i_val))
         | (SmtValue::Int(i_val), SmtValue::Bool(b_val)) => {
             Some(*i_val == if *b_val { 1 } else { 0 })
+        }
+
+        // Cross-sort Int/Real: an integer literal in a Real context (SMT-LIB
+        // `(= x 0)` with `x : Real`, the implicit `to_real`) is the same
+        // number; compare exactly as rationals. Before this arm the pair fell
+        // to "never equal", so a CORRECT model `{x: 0}` for `(= x 0)` was
+        // rejected by the strict verifier (#horn-smt-session Rung 1, WP-4
+        // push/pop repro replay: every `(= S1 0)` scope demoted to Unknown on
+        // both the legacy and the session path).
+        (SmtValue::Int(i_val), SmtValue::Real(r_val))
+        | (SmtValue::Real(r_val), SmtValue::Int(i_val)) => {
+            Some(*r_val == BigRational::from_integer(BigInt::from(*i_val)))
+        }
+        (SmtValue::BigInt(i_val), SmtValue::Real(r_val))
+        | (SmtValue::Real(r_val), SmtValue::BigInt(i_val)) => {
+            Some(*r_val == BigRational::from_integer((**i_val).clone()))
         }
 
         // Cross-sort Bool/Real: coerce Bool → Real (true=1, false=0)
@@ -392,7 +408,7 @@ pub(crate) fn eval_int_big(expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) 
         ExprDepthGuard::check()?;
         match expr {
             ChcExpr::Int(n) => Some(BigInt::from(*n)),
-            ChcExpr::Var(v) => match model.get(&v.name)? {
+            ChcExpr::Var(v) => match super::lookup_model_value(model, v)? {
                 SmtValue::Int(n) => Some(BigInt::from(*n)),
                 SmtValue::BigInt(b) => Some(b.as_ref().clone()),
                 _ => None,

@@ -151,6 +151,19 @@ impl OpaqueDtCollectionBudget {
             && self.charge_work(raw_args.saturating_add(pairs))
     }
 
+    /// Charge the congruence fixpoint and the selector scans, then close the
+    /// envelope.
+    ///
+    /// The pair envelope counts pair visits, the unit `record_distinct`
+    /// charges it in: at most `MAX_CONGRUENCE_ROUNDS` visits of every
+    /// selector or constructor pair. What one visit costs grows with the
+    /// longest application spelling (`congruence_weight`: its name bytes plus
+    /// its arity), and that byte-weighted cost is charged to the work
+    /// envelope with the selector scans. Weighting the pair count by name
+    /// bytes made the envelope refuse a query when one datatype's name grew
+    /// by a byte: the same 55 selector and constructor terms (785 pairs) fit
+    /// at a 19-byte weight (954,560) and were refused at 20 (1,004,800), so
+    /// construction never ran and a satisfiable query came back `unknown`.
     pub(super) fn finish(
         &mut self,
         opaque_terms: usize,
@@ -160,16 +173,16 @@ impl OpaqueDtCollectionBudget {
     ) -> Option<OpaqueDtCollectionScope> {
         let selector_pairs = pair_count(datatype_selectors)?;
         let constructor_pairs = pair_count(constructors)?;
-        let congruence = selector_pairs
+        let pair_visits = selector_pairs
             .checked_add(constructor_pairs)?
-            .checked_mul(MAX_CONGRUENCE_ROUNDS)?
-            .checked_mul(congruence_weight.max(1))?;
+            .checked_mul(MAX_CONGRUENCE_ROUNDS)?;
+        let congruence = pair_visits.checked_mul(congruence_weight.max(1))?;
         let selector_scans = self
             .dt_terms
             .checked_mul(datatype_selectors)?
             .checked_mul(congruence_weight.max(1))?
             .checked_mul(16)?;
-        if !self.charge_pair_work(congruence)
+        if !self.charge_pair_work(pair_visits)
             || !self.charge_work(congruence.saturating_add(selector_scans))
             || !self.valid
         {

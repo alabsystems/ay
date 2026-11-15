@@ -139,6 +139,65 @@ impl CoreSolver {
         false
     }
 
+    /// The premises a flat-form comparison of `concats` reads besides the
+    /// concat equality itself, or `None` when one has no proof path (then the
+    /// caller skips every inference: adding premises only weakens the learned
+    /// clauses, skipping only loses an optional propagation, mirroring the
+    /// strict-explanation policy in nf_equality_simpleq.rs #6273).
+    ///
+    /// * Endpoint-empty premises (#flat-forms-empty-premise): `build_flat_forms`
+    ///   DROPS children whose representative is the empty string, so every
+    ///   inference (F_ENDPOINT_EQ / F_UNIFY / F_ENDPOINT_EMP) assumes those
+    ///   children are empty: `explain(child, "")`. Without it, conflicts later
+    ///   built from these proof edges (extf_effort1 explanation chains) are
+    ///   INCOMPLETE and become spurious few-literal conflicts → false UNSAT.
+    /// * Kept children: the flat form holds each one AS ITS REPRESENTATIVE and
+    ///   every inference reads `rep` for `child`, so `explain(child, rep)` is a
+    ///   premise too (nf_length_premise.rs). Without it, F_ENDPOINT_EQ on
+    ///   `p ++ x = p ++ w` with `x = k` decided merges `k = w` on the concat
+    ///   equality alone.
+    fn flat_form_child_premises(
+        terms: &TermStore,
+        state: &SolverState,
+        concats: [TermId; 2],
+    ) -> Option<Vec<TheoryLit>> {
+        let mut premises = Vec::new();
+        for concat in concats {
+            let Some(children) = state.get_concat_children(terms, concat) else {
+                continue;
+            };
+            for &child in children {
+                let rep = state.find(child);
+                let premise = if !state.is_empty_string(terms, rep) {
+                    state.explain(child, rep)
+                } else if matches!(
+                    terms.get(child),
+                    TermData::Const(Constant::String(s)) if s.is_empty()
+                ) {
+                    // Literally the empty-string constant: no premise needed.
+                    continue;
+                } else {
+                    // The empty-string term inside child's EQC to explain against.
+                    let target = state.find_constant_term_id(terms, child).or_else(|| {
+                        state
+                            .empty_string_id()
+                            .filter(|&e| state.find(e) == state.find(child))
+                    });
+                    let premise = target.map(|t| state.explain(child, t)).unwrap_or_default();
+                    if premise.is_empty() {
+                        return None;
+                    }
+                    premise
+                };
+                if child != rep && premise.is_empty() {
+                    return None;
+                }
+                premises.extend(premise);
+            }
+        }
+        Some(premises)
+    }
+
     /// Compare two flat forms component by component.
     ///
     /// Walks both flat forms in parallel:
@@ -167,52 +226,13 @@ impl CoreSolver {
         // Base explanation: why the two concat terms are in the same EQC.
         let mut base_explanation = state.explain_or_all(concat_a, concat_b);
 
-        // Endpoint-empty premise completeness (#flat-forms-empty-premise).
-        // `build_flat_forms` DROPS children whose representative is the empty
-        // string without recording the dependency, so every inference below
-        // (F_ENDPOINT_EQ / F_UNIFY / F_ENDPOINT_EMP) implicitly assumes those
-        // children are empty. Fold each such emptiness premise
-        // `explain(child, "")` into the base explanation; otherwise conflicts
-        // later built from these proof edges (extf_effort1 explanation chains)
-        // are INCOMPLETE and become spurious few-literal conflicts → false
-        // UNSAT. If a premise has no proof path, FAIL CLOSED by skipping the
-        // inference entirely (mirrors the strict-explanation policy in
-        // nf_equality_simpleq.rs #6273): adding premises only strengthens
-        // explanations; skipping only loses an optional propagation.
-        for &concat in &[concat_a, concat_b] {
-            let Some(children) = state.get_concat_children(terms, concat) else {
-                continue;
-            };
-            for &child in children {
-                if !state.is_empty_string(terms, state.find(child)) {
-                    // Kept in the flat form — not a hidden premise.
-                    continue;
-                }
-                if matches!(
-                    terms.get(child),
-                    TermData::Const(Constant::String(s)) if s.is_empty()
-                ) {
-                    // Literally the empty-string constant: no premise needed.
-                    continue;
-                }
-                // The empty-string term inside child's EQC to explain against.
-                let target = state.find_constant_term_id(terms, child).or_else(|| {
-                    state
-                        .empty_string_id()
-                        .filter(|&e| state.find(e) == state.find(child))
-                });
-                let premise = target.map(|t| state.explain(child, t)).unwrap_or_default();
-                if premise.is_empty() {
-                    // No proof path for a non-literal emptiness premise: any
-                    // explanation built from this comparison would be
-                    // incomplete. Fail closed — skip all inferences here.
-                    return false;
-                }
-                for lit in premise {
-                    if !base_explanation.contains(&lit) {
-                        base_explanation.push(lit);
-                    }
-                }
+        let Some(premises) = Self::flat_form_child_premises(terms, state, [concat_a, concat_b])
+        else {
+            return false;
+        };
+        for lit in premises {
+            if !base_explanation.contains(&lit) {
+                base_explanation.push(lit);
             }
         }
 
@@ -254,13 +274,15 @@ impl CoreSolver {
                 return false;
             }
 
-            // Known equal length: infer equality (F_UNIFY).
-            if Self::are_lengths_equal_with_entail(terms, state, ra, rb) {
+            // Known equal length: infer equality (F_UNIFY). The equality also
+            // rests on len(ra) = len(rb), so it carries those literals
+            // (nf_length_premise.rs); an unexplainable one is left to the NF pass.
+            if let Some(len_premise) = Self::unify_length_premise(terms, state, ra, rb) {
                 infer.add_internal_equality(
                     InferenceKind::Unify,
                     ff_a[ia],
                     ff_b[ib],
-                    base_explanation,
+                    Self::with_length_premise(base_explanation, len_premise),
                 );
                 // Internal equality, not a conflict — let pipeline continue.
                 return false;

@@ -46,9 +46,9 @@ pub(crate) struct StaticFeatures {
     pub has_bv: bool,
     /// Formula contains Array-sorted terms
     pub has_arrays: bool,
-    /// Formula contains an array whose index or element sort itself contains
-    /// an array. This is tracked separately because the current nested-array
-    /// arithmetic-combination path cannot yet authorize an UNSAT verdict.
+    /// Formula contains an array whose index or element sort itself contains an
+    /// array, seen through `Seq` elements and datatype fields, declared carriers
+    /// included (`nested_arrays.rs`); a nested-array UNSAT needs checked authority.
     pub has_nested_arrays: bool,
     /// Formula contains String-sorted terms
     pub has_strings: bool,
@@ -101,6 +101,8 @@ pub(crate) struct StaticFeatures {
     pub has_regex: bool,
     /// Formula contains FloatingPoint-sorted terms
     pub has_fpa: bool,
+    /// First-class prime fields require the dedicated exact bounded lane.
+    pub has_finite_field: bool,
     /// Formula contains the SMT-LIB builtin `RoundingMode` carrier.
     ///
     /// AY represents this finite FP sort as an uninterpreted sort internally,
@@ -146,6 +148,8 @@ impl StaticFeatures {
         for &id in root_ids {
             features.collect_term(terms, id, &mut visited);
         }
+        features.has_nested_arrays =
+            features.has_nested_arrays || Self::visited_sorts_carry_nested_array(terms, &visited);
 
         // Count non-UF theories
         features.num_theories = [
@@ -156,12 +160,34 @@ impl StaticFeatures {
             features.has_strings,
             features.has_seq_ops,
             features.has_fpa,
+            features.has_finite_field,
         ]
         .iter()
         .filter(|&&x| x)
         .count();
 
         features
+    }
+
+    /// Whether the collected window lies inside the fragment `solve_dt_uf_nia`
+    /// decides — Bool, Int, uninterpreted sorts/functions and datatypes — with
+    /// no Real, array, bit-vector, floating-point, string or native-sequence
+    /// term anywhere in it. Symbolic integer `div`/`mod` is deliberately NOT
+    /// excluded: that lane eliminates it through guarded Euclidean axioms.
+    ///
+    /// Meaningful only on ASSERTION-collected features (`collect` over the
+    /// live window), never on the declaration-extended set: a declared-but-
+    /// unasserted `Real` constant (the SPARK/Why3 prelude's `real__ref`) or an
+    /// unused array sort must not veto a window whose asserted terms never
+    /// mention them (#ufdtnira-live-content-lane).
+    pub(crate) fn within_dt_uf_nia_theories(&self) -> bool {
+        !self.has_real
+            && !self.has_arrays
+            && !self.has_bv
+            && !self.has_fpa
+            && !self.has_finite_field
+            && !self.has_strings
+            && !self.has_seq_ops
     }
 
     /// Extend feature detection with declared function/constant symbols (#7442).
@@ -210,6 +236,7 @@ impl StaticFeatures {
             self.has_strings,
             self.has_seq_ops,
             self.has_fpa,
+            self.has_finite_field,
         ]
         .iter()
         .filter(|&&x| x)
@@ -409,6 +436,10 @@ impl StaticFeatures {
         match sort {
             Sort::Int => self.has_int = true,
             Sort::Real => self.has_real = true,
+            Sort::Complex => {
+                self.has_real = true;
+                self.has_uf = true;
+            }
             Sort::BitVec(_) => self.has_bv = true,
             Sort::Array(arr) => {
                 self.has_arrays = true;
@@ -427,6 +458,7 @@ impl StaticFeatures {
                 self.has_strings = true;
             }
             Sort::FloatingPoint(_, _) => self.has_fpa = true,
+            Sort::FiniteField(_) => self.has_finite_field = true,
             Sort::Seq(elem) => {
                 // Generic sequence sort — distinct from String theory
                 self.has_seq = true;
@@ -469,6 +501,7 @@ impl StaticFeatures {
 }
 
 mod logic_inference;
+mod nested_arrays;
 
 /// Built-in SMT-LIB operator names that should NOT trigger `has_uf`.
 const BUILTIN_SYMBOLS: &[&str] = &[
@@ -481,6 +514,10 @@ const BUILTIN_SYMBOLS: &[&str] = &[
     "ite",
     "=",
     "distinct",
+    "ff.add",
+    "ff.mul",
+    "ff.neg",
+    "ff.bitsum",
     // Arithmetic + conversions
     "+",
     "-",

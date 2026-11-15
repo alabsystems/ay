@@ -4,7 +4,7 @@
 
 //! Pattern compilation, trigger extraction, and term indexing for E-matching.
 //!
-//! Extracted from the ematching module — pure code motion, no algorithm changes.
+//! The ground-term index uses occurrence-scoped groundness from `occurrences`.
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -12,12 +12,14 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::{TermId, TermStore};
 use ay_euf::EufModel;
 
+#[cfg(any(test, feature = "ematching-differential"))]
+use super::occurrences::GroundOccurrences;
 use super::pattern_helpers::{
     collect_patterns_from_term, collect_patterns_under_nested_binders,
     synthesize_trigger_groups_with_fallback, user_pattern_to_ematch,
 };
-use super::EMATCH_STACK_RED_ZONE;
-use super::EMATCH_STACK_SIZE;
+#[cfg(test)]
+use super::{EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE};
 
 /// Pattern for E-matching: a term structure with placeholders for bound variables.
 #[derive(Clone, Debug)]
@@ -47,20 +49,11 @@ pub(super) struct TermIndex {
 
 /// Dense id of an interned binder scope (see [`BoundVarScopeMemo`]). `0` is
 /// always the empty scope.
+#[cfg(test)]
 type ScopeId = u32;
 
-/// Memo for [`TermIndex::collect_bound_var_ids`].
-///
-/// # Why
-///
-/// `collect_bound_var_ids` is a recursive DAG walk with no visited set, and its
-/// callers run it once per ROOT: `collect_ground_terms_by_sort` and
-/// `collect_bool_uf_arg_terms` walk `0..terms.len()`, `TermIndex::new` walks
-/// every reachable id, and `PersistentMatchState::refresh_index` walks every
-/// newly reachable id. The cost is therefore the SUM OF SUBTREE SIZES over the
-/// whole store, which on the hash-consed 45k-346k-term SPARK/GNATprove stores is
-/// quadratic and measured as ~99% of the solver's wall clock. With the memo it
-/// is one pass per distinct `(term, scope)` pair.
+/// Historical binder-ID walk retained as a test reference for name-scope
+/// memoization. Production groundness now uses `GroundOccurrences`.
 ///
 /// # Why it is behaviour-preserving
 ///
@@ -85,10 +78,9 @@ type ScopeId = u32;
 /// # Pairing rule
 ///
 /// A memo is valid only while used with the SAME `bound_var_ids` accumulator and
-/// the same immutable `TermStore`. Both callers create it as a local of the loop
-/// that owns the accumulator, so the store cannot grow or roll back underneath
-/// it and stale `TermId`s cannot arise.
+/// the same immutable `TermStore`. The test reference pairs them explicitly.
 #[derive(Default)]
+#[cfg(test)]
 pub(super) struct BoundVarScopeMemo {
     /// Sorted, deduplicated binder-name set -> dense id. The empty scope is `0`
     /// and is never stored here.
@@ -97,6 +89,7 @@ pub(super) struct BoundVarScopeMemo {
     walked: HashSet<(u32, ScopeId)>,
 }
 
+#[cfg(test)]
 impl BoundVarScopeMemo {
     /// The id of `bound_names` as a scope, interning it on first sight.
     fn scope_id(&mut self, bound_names: &HashSet<String>) -> ScopeId {
@@ -125,97 +118,35 @@ impl TermIndex {
     /// Build an index of ground App terms reachable from the current assertions.
     /// This indexes all reachable App terms (not just top-level) that are ground.
     ///
-    /// Ground terms are those containing no bound variables. Declared constants
-    /// (from `declare-const` or nullary `declare-fun`) ARE ground - only variables
-    /// bound by enclosing quantifiers are non-ground.
+    /// Groundness is scoped to each asserted occurrence. The same TermId can
+    /// contribute when free even if it also occurs beneath a binder elsewhere.
     #[cfg(any(test, feature = "ematching-differential"))]
     pub(super) fn new(terms: &TermStore, assertions: &[TermId]) -> Self {
-        let mut reachable = Vec::new();
-        let mut reachable_seen: HashSet<u32> = HashSet::default();
-        for &assertion in assertions {
-            Self::collect_reachable_term_ids(terms, assertion, &mut reachable, &mut reachable_seen);
-        }
-        reachable.sort_unstable_by_key(|term| term.0);
-
-        // First pass: collect ALL Var term IDs that are bound by quantifiers.
-        // A Var is bound if its NAME matches a quantifier's binding name.
-        // Variables not in this set (declared constants) are free and thus ground.
-        //
-        // We need to track which binding names are currently in scope as we traverse.
-        let mut bound_var_ids: HashSet<u32> = HashSet::default();
-        let mut bound_names: HashSet<String> = HashSet::default();
-        // One memo for the whole root loop (it is paired with `bound_var_ids`).
-        let mut bound_var_memo = BoundVarScopeMemo::default();
-        for &term_id in &reachable {
-            Self::collect_bound_var_ids(
-                terms,
-                term_id,
-                &mut bound_var_ids,
-                &mut bound_names,
-                &mut bound_var_memo,
-            );
-        }
-
-        // Second pass: index all terms, using the collected bound var IDs.
-        // The is_ground cache prevents redundant recursive traversals for shared subterms.
+        let mut occurrences = GroundOccurrences::default();
+        occurrences.visit_assertions(terms, assertions);
         let mut by_symbol: HashMap<String, Vec<TermId>> = HashMap::default();
-        let mut seen: HashSet<u32> = HashSet::default();
-        let mut ground_cache: HashMap<u32, bool> = HashMap::default();
-
-        for &term_id in &reachable {
-            Self::index_term(
-                terms,
-                term_id,
-                &mut by_symbol,
-                &mut seen,
-                &bound_var_ids,
-                &mut ground_cache,
-            );
+        for term_id in occurrences.take_new_ground_apps() {
+            Self::insert_ground_app(terms, term_id, &mut by_symbol);
         }
         Self { by_symbol }
     }
 
-    pub(super) fn collect_reachable_term_ids(
+    /// Insert exactly once per ground TermId, preserving LI-2's sorted buckets.
+    pub(super) fn insert_ground_app(
         terms: &TermStore,
         term_id: TermId,
-        out: &mut Vec<TermId>,
-        seen: &mut HashSet<u32>,
+        by_symbol: &mut HashMap<String, Vec<TermId>>,
     ) {
-        stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
-            if !seen.insert(term_id.0) {
-                return;
-            }
-            out.push(term_id);
-            match terms.get(term_id) {
-                TermData::App(_, args) => {
-                    for &arg in args {
-                        Self::collect_reachable_term_ids(terms, arg, out, seen);
-                    }
-                }
-                TermData::Not(inner) => {
-                    Self::collect_reachable_term_ids(terms, *inner, out, seen);
-                }
-                TermData::Ite(c, t, e) => {
-                    Self::collect_reachable_term_ids(terms, *c, out, seen);
-                    Self::collect_reachable_term_ids(terms, *t, out, seen);
-                    Self::collect_reachable_term_ids(terms, *e, out, seen);
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, v) in bindings {
-                        Self::collect_reachable_term_ids(terms, *v, out, seen);
-                    }
-                    Self::collect_reachable_term_ids(terms, *body, out, seen);
-                }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    Self::collect_reachable_term_ids(terms, *body, out, seen);
-                }
-                TermData::Const(_) | TermData::Var(_, _) => {}
-                _ => {}
-            }
-        })
+        let TermData::App(sym, _) = terms.get(term_id) else {
+            return;
+        };
+        let bucket = by_symbol.entry(sym.name().to_string()).or_default();
+        if let Err(pos) = bucket.binary_search_by_key(&term_id.0, |t| t.0) {
+            bucket.insert(pos, term_id);
+        }
     }
 
-    /// Collect all Var term IDs that are bound by quantifiers.
+    /// Collect all Var term IDs that are bound by quantifiers (test reference).
     /// `bound_names` contains the names of variables bound by enclosing quantifiers.
     /// A Var is bound only if its name matches one of these binding names.
     /// Uses push/pop on `bound_names` to avoid cloning at each quantifier level.
@@ -224,6 +155,7 @@ impl TermIndex {
     /// `bound_var_ids` accumulator — see [`BoundVarScopeMemo`] for why sharing it
     /// across a whole root loop is behaviour-preserving, and for the pairing rule
     /// it must be used under.
+    #[cfg(test)]
     pub(super) fn collect_bound_var_ids(
         terms: &TermStore,
         term_id: TermId,
@@ -239,6 +171,7 @@ impl TermIndex {
     /// `bound_names` scope threaded down, so the memo key needs no per-node
     /// re-interning. `scope` must always equal `memo.scope_id(bound_names)`;
     /// the only place the scope changes is the quantifier arm, which re-interns.
+    #[cfg(test)]
     fn collect_bound_var_ids_scoped(
         terms: &TermStore,
         term_id: TermId,
@@ -438,123 +371,6 @@ impl TermIndex {
                 _ => {}
             }
         })
-    }
-
-    /// Recursively index a term and all its subterms.
-    ///
-    /// `bound_var_ids` contains term IDs of all Var terms that appear inside
-    /// quantifier bodies. These are the bound variables. Var terms not in this
-    /// set (declared constants) are free and thus ground.
-    pub(super) fn index_term(
-        terms: &TermStore,
-        term_id: TermId,
-        by_symbol: &mut HashMap<String, Vec<TermId>>,
-        seen: &mut HashSet<u32>,
-        bound_var_ids: &HashSet<u32>,
-        ground_cache: &mut HashMap<u32, bool>,
-    ) {
-        stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
-            if seen.contains(&term_id.0) {
-                return;
-            }
-            seen.insert(term_id.0);
-
-            match terms.get(term_id) {
-                TermData::App(sym, args) => {
-                    // Index this App if it's ground (contains no bound variables)
-                    let is_ground = args.iter().all(|&arg| {
-                        Self::is_ground_cached(terms, arg, bound_var_ids, ground_cache)
-                    });
-                    if is_ground {
-                        // Insert via binary-search sorted insert (LI-2) so each
-                        // per-symbol Vec stays globally ascending by TermId. The
-                        // full rebuild walks `reachable` in ascending id order, so
-                        // for it a sorted insert is equivalent to a bare push; the
-                        // incremental refresh, however, can introduce a later-round
-                        // ground App with a LOWER id (constant folding, e.g.
-                        // mk_add -> mk_int), and sorted insert keeps the Vec
-                        // elementwise-identical to a full rebuild over the
-                        // cumulative assertion set.
-                        let bucket = by_symbol.entry(sym.name().to_string()).or_default();
-                        if let Err(pos) = bucket.binary_search_by_key(&term_id.0, |t| t.0) {
-                            bucket.insert(pos, term_id);
-                        }
-                    }
-                    // Recurse into arguments
-                    for &arg in args {
-                        Self::index_term(terms, arg, by_symbol, seen, bound_var_ids, ground_cache);
-                    }
-                }
-                TermData::Not(inner) => {
-                    Self::index_term(terms, *inner, by_symbol, seen, bound_var_ids, ground_cache);
-                }
-                TermData::Ite(c, t, e) => {
-                    Self::index_term(terms, *c, by_symbol, seen, bound_var_ids, ground_cache);
-                    Self::index_term(terms, *t, by_symbol, seen, bound_var_ids, ground_cache);
-                    Self::index_term(terms, *e, by_symbol, seen, bound_var_ids, ground_cache);
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, v) in bindings {
-                        Self::index_term(terms, *v, by_symbol, seen, bound_var_ids, ground_cache);
-                    }
-                    Self::index_term(terms, *body, by_symbol, seen, bound_var_ids, ground_cache);
-                }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    // Bound vars already collected in first pass, just recurse
-                    Self::index_term(terms, *body, by_symbol, seen, bound_var_ids, ground_cache);
-                }
-                TermData::Const(_) | TermData::Var(_, _) => {}
-                // Future TermData variants: skip (nothing to index).
-                _ => {}
-            }
-        })
-    }
-
-    /// Check if a term is ground (contains no bound variables), with memoization.
-    ///
-    /// A `Var` is ground if and only if its term ID is NOT in the `bound_var_ids` set.
-    /// This means declared constants (free variables) are ground, while
-    /// Var terms that appear inside quantifier bodies are not.
-    ///
-    /// The `cache` prevents redundant recursive traversals for shared subterms
-    /// in the hash-consed term DAG.
-    fn is_ground_cached(
-        terms: &TermStore,
-        term_id: TermId,
-        bound_var_ids: &HashSet<u32>,
-        cache: &mut HashMap<u32, bool>,
-    ) -> bool {
-        if let Some(&cached) = cache.get(&term_id.0) {
-            return cached;
-        }
-        let result = stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
-            match terms.get(term_id) {
-                // A Var is ground only if it's NOT bound (not inside any quantifier body)
-                TermData::Var(_, _) => !bound_var_ids.contains(&term_id.0),
-                TermData::Const(_) => true,
-                TermData::App(_, args) => args
-                    .iter()
-                    .all(|&arg| Self::is_ground_cached(terms, arg, bound_var_ids, cache)),
-                TermData::Not(inner) => Self::is_ground_cached(terms, *inner, bound_var_ids, cache),
-                TermData::Ite(c, t, e) => {
-                    Self::is_ground_cached(terms, *c, bound_var_ids, cache)
-                        && Self::is_ground_cached(terms, *t, bound_var_ids, cache)
-                        && Self::is_ground_cached(terms, *e, bound_var_ids, cache)
-                }
-                TermData::Let(bindings, body) => {
-                    bindings
-                        .iter()
-                        .all(|(_, v)| Self::is_ground_cached(terms, *v, bound_var_ids, cache))
-                        && Self::is_ground_cached(terms, *body, bound_var_ids, cache)
-                }
-                // Quantified formulas are never ground terms
-                TermData::Forall(..) | TermData::Exists(..) => false,
-                // Future TermData variants: conservatively not ground.
-                _ => false,
-            }
-        });
-        cache.insert(term_id.0, result);
-        result
     }
 
     pub(super) fn get_by_symbol(&self, symbol: &str) -> &[TermId] {
@@ -779,9 +595,45 @@ impl EqualityClasses {
     /// Terms mapping to the same element name are in the same congruence class.
     /// This brings congruence closure information into E-matching without
     /// persisting the EUF solver (Phase B1b of #3325).
-    pub(super) fn augment_with_euf_model(&mut self, euf_model: &EufModel) {
+    ///
+    /// GROUND MEMBERS ONLY (#ematching-model-class-ground). The EUF model can
+    /// carry a value for a term that mentions a quantifier-BOUND variable — a
+    /// subterm of a `forall` body the ground lane registered while it solved
+    /// around the binder. Such a term is not a ground term: it is never a
+    /// legitimate binding for a pattern variable, and it must not act as a
+    /// bridge between ground classes either. If it were merged here, a nested
+    /// pattern `(f (g x))` would match a ground `(f a)` through the class
+    /// member `(g x_bound)` and bind `x := x_bound` — the quantifier's own
+    /// binder — which (a) yields a non-ground "instance" and (b) counts as a
+    /// primary-trigger hit, so the less specific fallback triggers that carry
+    /// the real ground instances are never consulted. Measured on the deductive-checks
+    /// set-fold obligation (`C_sets/87167-00066`): under proof production the
+    /// bridge lane's model valued `(select inv x_5)` for the binder `x_5`, the
+    /// primary trigger matched only `x := x_5`, and the refutation-carrying
+    /// `x := (select ordering k)` instances of the fallback trigger were never
+    /// produced — `unknown (quantifier-unhandled)` for a z3-`unsat` query.
+    /// Skipping non-ground entries is a pure REFINEMENT of the match relation:
+    /// every binding it produces is one the ground-only matcher could also
+    /// produce, so no instance gains authority and nothing new is asserted.
+    pub(super) fn augment_with_euf_model(
+        &mut self,
+        euf_model: &EufModel,
+        terms: &TermStore,
+        bound_var_ids: &HashSet<u32>,
+        ground_ids: &HashSet<u32>,
+    ) {
         let mut by_value: HashMap<&str, Vec<u32>> = HashMap::default();
         for (term_id, value) in &euf_model.term_values {
+            // A model entry can carry an id the store does not hold (a
+            // synthetic value slot); such an entry is opaque here and keeps
+            // its prior treatment — only a LIVE term can be walked for a
+            // binder, and only a live binder-mentioning term is skipped.
+            if terms.entry_stamp(*term_id).is_some()
+                && !ground_ids.contains(&term_id.0)
+                && super::ground_terms::term_contains_bound_var(terms, *term_id, bound_var_ids)
+            {
+                continue;
+            }
             by_value.entry(value.as_str()).or_default().push(term_id.0);
         }
         for (_, term_ids) in &by_value {

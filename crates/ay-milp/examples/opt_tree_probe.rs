@@ -25,9 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // its budgets and leaf cap POSITIONALLY, so handing it the `solve`
     // subcommand's value table would make it accept 14 names it cannot carry --
     // including `--opt-tree-secs` and `--opt-tree-leaves`, the two settings this
-    // probe exists to sweep. That is the failure mode `knob_census`'s
-    // `no_surface_accepts_a_flag_only_solve_can_carry` was built to catch, and
-    // it caught this file on the first merge that put them in one tree.
+    // probe exists to sweep.
     let flags = parse_applied(&raw, &[], &[]).map_err(std::io::Error::other)?;
     let mut args = flags.positional.iter().cloned();
     let path = args.next().ok_or_else(|| {
@@ -50,8 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
 
     let text = if path.ends_with(".gz") {
-        let bytes = std::fs::read(&path)?;
-        decompress_gz(&bytes)?
+        decompress_gz(&path)?
     } else {
         std::fs::read_to_string(&path)?
     };
@@ -182,17 +179,22 @@ impl std::fmt::Display for Rung {
     }
 }
 
-/// Minimal gzip inflate via the `gzip` binary; the corpus ships `.mps.gz` and
-/// this example is scratch, so shelling out beats a dependency.
-fn decompress_gz(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut c = Command::new("gzip")
-        .arg("-dc")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    c.stdin.as_mut().ok_or("no stdin")?.write_all(bytes)?;
-    let out = c.wait_with_output()?;
+/// Inflate `path` with the system `gzip`, which reads the file itself: no pipe
+/// is written, so a `gzip` that stops early (a corrupt file) is its non-zero
+/// exit, not a SIGPIPE that kills this probe (`unix_hardened` builds run with
+/// SIGPIPE at its default action), and its output can never fill a pipe this
+/// process is blocked writing into.
+fn decompress_gz(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("gzip")
+        .args(["-dc", "--", path])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "gzip -dc {path}: {} ({})",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            out.status
+        )
+        .into());
+    }
     Ok(String::from_utf8(out.stdout)?)
 }

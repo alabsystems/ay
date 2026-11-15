@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% POSITIVE CONTROL for the `conclusion BOUNDS` fix. Refusing a bound while a SOLUTION-EXCLUDING
+% constraint is live must not touch the ordinary branch-and-bound argument, where the database
+% contradiction comes from an OBJECTIVE-IMPROVING constraint: `soli` logs the value-1 solution,
+% installs "objective <= 0", and that is contradictory with the formula. This is the shape the
+% whole optimisation track rests on and it must keep verifying.
+f 1;
+soli x1 ~x2 : 1;
+rup >= 1;
+output NONE;
+conclusion BOUNDS 1 1;
+end pseudo-Boolean proof;

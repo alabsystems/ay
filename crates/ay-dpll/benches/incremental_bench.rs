@@ -8,8 +8,9 @@
 //! 1. Incremental solving with clause retention (assumption-based)
 //! 2. Non-incremental solving with fresh solver per check-sat
 
+use ay_criterion_main::criterion_main;
 use ay_dpll::Executor;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 
 /// Generate an SMT-LIB script with n push/check-sat/pop cycles
 fn generate_incremental_script(num_checks: usize, bv_width: u32) -> String {

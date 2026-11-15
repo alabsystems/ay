@@ -1,0 +1,8 @@
+(declare-const _3 Int)
+(declare-const _4 Int)
+(declare-const _5 Int)
+(declare-const _6 Int)
+(declare-const _8 Int)
+(declare-const _10 Int)
+(declare-const __trust_mir__discr_x Int)
+(assert (and (<= _6 1) (<= _10 1) (or (= __trust_mir__discr_x 0) (= __trust_mir__discr_x 2) (= __trust_mir__discr_x 3) (= __trust_mir__discr_x 4)) (= _3 __trust_mir__discr_x) (= _3 0) (= _10 (bv2int (bvand ((_ int2bv 8) _8) ((_ int2bv 8) 1)))) true (= _6 (bv2int (bvand ((_ int2bv 8) _4) ((_ int2bv 8) 1)))) (= _5 _6) (>= _5 3)))

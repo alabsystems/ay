@@ -234,6 +234,15 @@ pub(crate) fn safe_lp_lower_bound(
     safe_lp_bound_and_point(objective, constraints, num_vars, should_stop).0
 }
 
+/// The literal of a linear (single-literal) term, or `None` for any other
+/// shape (a non-linear product or an empty term).
+fn single_literal(lits: &[PbLit]) -> Option<PbLit> {
+    match (lits.len(), lits.first()) {
+        (1, Some(&lit)) => Some(lit),
+        _ => None,
+    }
+}
+
 /// Exact combinatorial floor for pairwise-disjoint unit-cover rows.
 ///
 /// For a row `sum_{v in S} x_v >= k` under a non-negative linear objective,
@@ -250,9 +259,7 @@ fn disjoint_unit_cover_lower_bound(
     let n = usize::try_from(num_vars).ok()?;
     let mut costs = vec![0i128; n];
     for term in &objective.terms {
-        let [lit] = term.lits.as_slice() else {
-            return None;
-        };
+        let lit = single_literal(&term.lits)?;
         let variable = usize::try_from(lit.var).ok()?.checked_sub(1)?;
         if lit.negated || variable >= n || term.coeff < 0 {
             return None;
@@ -266,11 +273,12 @@ fn disjoint_unit_cover_lower_bound(
             continue;
         }
         let required = usize::try_from(constraint.rhs).ok()?;
-        let mut support = Vec::with_capacity(constraint.terms.len());
+        // Fallible reservation: an allocation failure declines (always safe)
+        // instead of aborting the process.
+        let mut support = Vec::new();
+        support.try_reserve_exact(constraint.terms.len()).ok()?;
         for term in &constraint.terms {
-            let [lit] = term.lits.as_slice() else {
-                return None;
-            };
+            let lit = single_literal(&term.lits)?;
             let variable = usize::try_from(lit.var).ok()?.checked_sub(1)?;
             if lit.negated || variable >= n || term.coeff != 1 {
                 return None;
@@ -278,7 +286,10 @@ fn disjoint_unit_cover_lower_bound(
             support.push(variable);
         }
         support.sort_unstable();
-        if support.windows(2).any(|pair| pair[0] == pair[1]) || required > support.len() {
+        let has_duplicate = support
+            .windows(2)
+            .any(|pair| pair.first().is_some_and(|left| pair.get(1) == Some(left)));
+        if has_duplicate || required > support.len() {
             return None;
         }
         let mut row_costs: Vec<i128> = support.iter().map(|&variable| costs[variable]).collect();
@@ -493,11 +504,17 @@ pub(crate) fn safe_lp_duals_from_raw(
         return None;
     }
     let mut nonzeros = 0usize;
-    let mut rows = Vec::with_capacity(rows_raw.len());
+    // Fallible reservation: an allocation failure yields `None` (no usable
+    // dual) instead of aborting the process.
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(rows_raw.len()).ok()?;
     for (coeffs, b) in rows_raw {
         debug_assert!(coeffs.iter().all(|&(v, x)| v < num_vars && x != 0.0));
-        debug_assert!(coeffs.windows(2).all(|w| w[0].0 < w[1].0));
-        nonzeros += coeffs.len();
+        debug_assert!(coeffs.windows(2).all(|w| w
+            .first()
+            .zip(w.get(1))
+            .is_some_and(|(left, right)| left.0 < right.0)));
+        nonzeros = nonzeros.checked_add(coeffs.len())?;
         if nonzeros > MAX_NONZEROS {
             return None;
         }
@@ -510,12 +527,14 @@ pub(crate) fn safe_lp_duals_from_raw(
         rows,
         upper: None,
     };
-    match model.solve_target(should_stop, target) {
-        Some(SimplexResult { dual, .. }) if dual.len() == model.rows.len() => {
-            Some(clamp_dual(&dual))
-        }
-        _ => None,
+    // Take the whole result with `?` rather than a guarded partial-move
+    // `match` on the `Option`: that match left a MIR `unreachable` default the
+    // Level-0 verifier reported reachable.
+    let solved = model.solve_target(should_stop, target)?;
+    if solved.dual.len() != model.rows.len() {
+        return None;
     }
+    Some(clamp_dual(&solved.dual))
 }
 
 /// [`safe_lp_duals_from_raw`] but ALSO returns the primal point `x* ∈ [0,1]^n`
@@ -533,9 +552,12 @@ pub(crate) fn safe_lp_duals_and_primal_from_raw(
         return None;
     }
     let mut nonzeros = 0usize;
-    let mut rows = Vec::with_capacity(rows_raw.len());
+    // Fallible reservation: an allocation failure yields `None` (no usable
+    // dual) instead of aborting the process.
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(rows_raw.len()).ok()?;
     for (coeffs, b) in rows_raw {
-        nonzeros += coeffs.len();
+        nonzeros = nonzeros.checked_add(coeffs.len())?;
         if nonzeros > MAX_NONZEROS {
             return None;
         }
@@ -548,22 +570,23 @@ pub(crate) fn safe_lp_duals_and_primal_from_raw(
         rows,
         upper: None,
     };
-    match model.solve_target(should_stop, target) {
-        Some(SimplexResult { dual, primal }) if dual.len() == model.rows.len() => {
-            let x = primal
-                .into_iter()
-                .map(|v| {
-                    if v.is_finite() {
-                        v.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            Some((clamp_dual(&dual), x))
-        }
-        _ => None,
+    // Destructure the whole result (see `safe_lp_duals_from_raw`): no guarded
+    // partial move out of the `Option` temporary.
+    let SimplexResult { dual, primal } = model.solve_target(should_stop, target)?;
+    if dual.len() != model.rows.len() {
+        return None;
     }
+    let x = primal
+        .into_iter()
+        .map(|v| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    Some((clamp_dual(&dual), x))
 }
 
 /// Clamps a dual vector to `y >= 0` and replaces non-finite entries with 0; the
@@ -623,10 +646,8 @@ impl LpF64 {
             if term.coeff == 0 {
                 continue;
             }
-            let [lit] = term.lits.as_slice() else {
-                return None; // non-linear objective term.
-            };
-            let v = var_index(*lit, n)?;
+            let lit = single_literal(&term.lits)?; // `None`: non-linear objective term.
+            let v = var_index(lit, n)?;
             let coeff = coeff_to_f64(term.coeff)?;
             if lit.negated {
                 // coeff * (1 - x_v) = coeff - coeff * x_v
@@ -648,13 +669,15 @@ impl LpF64 {
             match constraint.rel {
                 PbRel::Ge => {
                     let row = build_row_f64(constraint, n, 1)?;
-                    nonzeros += row.coeffs.len();
+                    nonzeros = nonzeros.checked_add(row.coeffs.len())?;
                     rows.push(row);
                 }
                 PbRel::Eq => {
                     let pos = build_row_f64(constraint, n, 1)?;
                     let neg = build_row_f64(constraint, n, -1)?;
-                    nonzeros += pos.coeffs.len() + neg.coeffs.len();
+                    nonzeros = nonzeros
+                        .checked_add(pos.coeffs.len())?
+                        .checked_add(neg.coeffs.len())?;
                     rows.push(pos);
                     rows.push(neg);
                 }
@@ -696,10 +719,8 @@ fn build_row_f64(constraint: &PbConstraint, n: usize, sign: i128) -> Option<RowF
     let mut coeff_by_var: BTreeMap<usize, f64> = BTreeMap::new();
     let mut rhs = coeff_to_f64(constraint.rhs.checked_mul(sign)?)?;
     for term in &constraint.terms {
-        let [lit] = term.lits.as_slice() else {
-            return None; // non-linear constraint term.
-        };
-        let v = var_index(*lit, n)?;
+        let lit = single_literal(&term.lits)?; // `None`: non-linear constraint term.
+        let v = var_index(lit, n)?;
         let base = coeff_to_f64(term.coeff.checked_mul(sign)?)?;
         if lit.negated {
             // base * (1 - x_v) = base - base * x_v ; constant moves to rhs.
@@ -787,6 +808,11 @@ fn ns_safe_bound(model: &LpF64, y: &[f64]) -> Option<i128> {
     let n = model.n;
     let m = model.rows.len();
     debug_assert_eq!(y.len(), m);
+    // One multiplier per row is the contract; a mismatched `y` declines (a
+    // `None` is always safe) rather than reading past either vector.
+    if y.len() != m {
+        return None;
+    }
 
     // `gamma_k` (generous): 1.01 * k * u, valid because k*u <= MAX_NONZEROS*u << 0.01.
     let gamma = |k: usize| -> f64 { 1.01 * (k as f64) * UNIT_ROUNDOFF };
@@ -795,8 +821,7 @@ fn ns_safe_bound(model: &LpF64, y: &[f64]) -> Option<i128> {
     let mut s1 = model.offset;
     let mut t1 = model.offset.abs(); // accumulated |partial| magnitude.
     let mut rep_err_b = 0.0f64; // sum_r |y_r| * repError(b_r).
-    for (r, row) in model.rows.iter().enumerate() {
-        let yr = y[r];
+    for (row, &yr) in model.rows.iter().zip(y) {
         if yr == 0.0 {
             continue;
         }
@@ -816,8 +841,7 @@ fn ns_safe_bound(model: &LpF64, y: &[f64]) -> Option<i128> {
     let mut aty_mag = vec![0.0f64; n]; // sum_r |a_rj y_r| per column.
     let mut aty_terms = vec![0usize; n]; // k_j = number of accumulated terms.
     let mut aty_rep = vec![0.0f64; n]; // sum_r |y_r| * repError(a_rj) per column.
-    for (r, row) in model.rows.iter().enumerate() {
-        let yr = y[r];
+    for (row, &yr) in model.rows.iter().zip(y) {
         if yr == 0.0 {
             continue;
         }
@@ -1391,15 +1415,47 @@ fn crash_at_upper(
     }
     let mut gain = 0.0f64;
     let mut harm = 0.0f64;
-    for p in col_ptr[j]..col_ptr[j + 1] {
-        let delta = col_val[p] * span;
+    let (rows, values) = csc_column(col_ptr, col_idx, col_val, j);
+    for (&row, &value) in rows.iter().zip(values) {
+        let delta = value * span;
         if delta > 0.0 {
-            gain += delta.min(rhs[col_idx[p]].max(0.0));
+            // Every row index in the CSC is a row of `rhs`; a missing one
+            // declines the crash (the classic all-lower start), which only
+            // changes the starting point, never the LP.
+            let Some(&row_rhs) = rhs.get(row) else {
+                return false;
+            };
+            gain += delta.min(row_rhs.max(0.0));
         } else {
             harm -= delta;
         }
     }
     gain.is_finite() && harm.is_finite() && gain > harm
+}
+
+/// Structural column `j` of a CSC matrix as parallel `(row index, value)`
+/// slices: `col_idx/col_val[col_ptr[j]..col_ptr[j + 1]]`.
+///
+/// [`Simplex::new`] builds `col_ptr` with `n + 1` monotone entries ending at
+/// the non-zero count, so every structural `j < n` gets its real column. A
+/// column the pointers cannot describe reads as EMPTY rather than panicking;
+/// the simplex is advisory (NS re-derives every bound from the clamped dual),
+/// so that fallback could only cost tightness, never soundness.
+fn csc_column<'a>(
+    col_ptr: &[usize],
+    col_idx: &'a [usize],
+    col_val: &'a [f64],
+    j: usize,
+) -> (&'a [usize], &'a [f64]) {
+    let start = col_ptr.get(j).copied();
+    let end = j.checked_add(1).and_then(|next| col_ptr.get(next)).copied();
+    let (Some(start), Some(end)) = (start, end) else {
+        return (&[], &[]);
+    };
+    match (col_idx.get(start..end), col_val.get(start..end)) {
+        (Some(rows), Some(values)) => (rows, values),
+        _ => (&[], &[]),
+    }
 }
 
 impl Simplex {
@@ -1459,7 +1515,9 @@ impl Simplex {
 
         // Surplus crash basis: B = -I (surplus column of M is -e_r), B^{-1} = -I.
         // Surplus s_r is basic in row slot r; the eta file starts empty.
-        let basis: Vec<usize> = (0..m).map(|i| n + i).collect();
+        // `n + i < n + m == cols`, a sum every caller has already formed, so
+        // the saturation can never engage.
+        let basis: Vec<usize> = (0..m).map(|i| n.saturating_add(i)).collect();
         let mut basic_row: Vec<Option<usize>> = vec![None; cols];
         for (i, &b) in basis.iter().enumerate() {
             basic_row[b] = Some(i);
@@ -1533,21 +1591,36 @@ impl Simplex {
         }
     }
 
+    /// Structural column `j` of `A` as parallel `(row, value)` slices (see
+    /// [`csc_column`]).
+    fn column(&self, j: usize) -> (&[usize], &[f64]) {
+        csc_column(&self.col_ptr, &self.col_idx, &self.col_val, j)
+    }
+
     /// Applies `B^{-1}` to a dense vector `w` IN PLACE: first `B_0^{-1} = -I`
     /// (negate), then each eta in forward order. Cost is `O(m + sum eta nnz)`.
+    ///
+    /// Every eta row index is a row slot `< m == w.len()`; the `get` forms
+    /// below only make that invariant explicit instead of panicking on it.
     fn apply_inverse(&self, w: &mut [f64]) {
         for wi in w.iter_mut() {
             *wi = -*wi; // B_0^{-1} = -I.
         }
         for e in &self.etas {
-            let t = w[e.p];
+            let Some(&t) = w.get(e.p) else {
+                continue;
+            };
             if t == 0.0 {
                 continue;
             }
             for &(i, val) in &e.vec {
-                w[i] += val * t;
+                if let Some(wi) = w.get_mut(i) {
+                    *wi += val * t;
+                }
             }
-            w[e.p] = e.diag * t;
+            if let Some(wp) = w.get_mut(e.p) {
+                *wp = e.diag * t;
+            }
         }
     }
 
@@ -1565,40 +1638,57 @@ impl Simplex {
     /// double-apply that row when the resulting eta is built — corrupting `B^{-1}`).
     fn ftran_sparse(&self, q: usize, out: &mut [f64], nz: &mut Vec<usize>, marked: &mut [bool]) {
         nz.clear();
+        // Every row index below (CSC entries, surplus slots `q - n < m`, eta
+        // rows) is a row slot `< m`, the length of `out` and `marked`; the
+        // `get_mut` forms make that invariant explicit instead of panicking.
         if q < self.n {
-            for p in self.col_ptr[q]..self.col_ptr[q + 1] {
-                let r = self.col_idx[p];
-                if !marked[r] {
-                    marked[r] = true;
+            let (rows, values) = self.column(q);
+            for (&r, &value) in rows.iter().zip(values) {
+                let (Some(seen), Some(slot)) = (marked.get_mut(r), out.get_mut(r)) else {
+                    continue;
+                };
+                if !*seen {
+                    *seen = true;
                     nz.push(r);
                 }
-                out[r] -= self.col_val[p]; // (-I) folded in.
+                *slot -= value; // (-I) folded in.
             }
         } else {
             let r = q - self.n;
-            if !marked[r] {
-                marked[r] = true;
-                nz.push(r);
+            if let (Some(seen), Some(slot)) = (marked.get_mut(r), out.get_mut(r)) {
+                if !*seen {
+                    *seen = true;
+                    nz.push(r);
+                }
+                *slot += 1.0; // -(-1) from -I on surplus -e_r.
             }
-            out[r] += 1.0; // -(-1) from -I on surplus -e_r.
         }
         for e in &self.etas {
-            let t = out[e.p];
+            let Some(&t) = out.get(e.p) else {
+                continue;
+            };
             if t == 0.0 {
                 continue;
             }
             for &(i, val) in &e.vec {
-                if !marked[i] {
-                    marked[i] = true;
+                let (Some(seen), Some(slot)) = (marked.get_mut(i), out.get_mut(i)) else {
+                    continue;
+                };
+                if !*seen {
+                    *seen = true;
                     nz.push(i);
                 }
-                out[i] += val * t;
+                *slot += val * t;
             }
-            out[e.p] = e.diag * t;
+            if let Some(slot) = out.get_mut(e.p) {
+                *slot = e.diag * t;
+            }
         }
         // Clear the markers for the touched rows (leaving `marked` all-false).
         for &r in nz.iter() {
-            marked[r] = false;
+            if let Some(seen) = marked.get_mut(r) {
+                *seen = false;
+            }
         }
     }
 
@@ -1618,13 +1708,21 @@ impl Simplex {
     /// (`v = e_r`, giving `rho = e_r^T B^{-1}`, whose dot with column `M_j` is
     /// `alpha_rj`).
     fn btran_slice(&self, v: &mut [f64]) {
-        for idx in (0..self.etas.len()).rev() {
-            let e = &self.etas[idx];
-            let mut acc = e.diag * v[e.p];
+        // Eta row indices are row slots `< m == v.len()`; `get` makes that
+        // invariant explicit instead of panicking on it.
+        for e in self.etas.iter().rev() {
+            let Some(&vp) = v.get(e.p) else {
+                continue;
+            };
+            let mut acc = e.diag * vp;
             for &(i, val) in &e.vec {
-                acc += val * v[i];
+                if let Some(&vi) = v.get(i) {
+                    acc += val * vi;
+                }
             }
-            v[e.p] = acc;
+            if let Some(slot) = v.get_mut(e.p) {
+                *slot = acc;
+            }
         }
         for zi in v.iter_mut() {
             *zi = -*zi; // B_0^{-1} = -I (applied last for the row product).
@@ -1648,14 +1746,17 @@ impl Simplex {
             if xv == 0.0 || !xv.is_finite() {
                 continue;
             }
-            // v -= M_j * xv.
+            // v -= M_j * xv. Row indices are row slots `< m == v.len()`.
             if j < self.n {
-                for p in self.col_ptr[j]..self.col_ptr[j + 1] {
-                    v[self.col_idx[p]] -= self.col_val[p] * xv;
+                let (rows, values) = self.column(j);
+                for (&row, &value) in rows.iter().zip(values) {
+                    if let Some(slot) = v.get_mut(row) {
+                        *slot -= value * xv;
+                    }
                 }
-            } else {
+            } else if let Some(slot) = v.get_mut(j - self.n) {
                 // surplus column is -e_r: v[r] -= (-1)*xv = v[r] += xv.
-                v[j - self.n] += xv;
+                *slot += xv;
             }
         }
         self.apply_inverse(&mut v);
@@ -2294,28 +2395,37 @@ impl Simplex {
     ) {
         blocks.clear();
         for &i in alpha_nz {
-            let a = alpha[i];
+            // `alpha_nz` lists row slots `< m`; `basis` maps each to a column
+            // `< cols`. A slot or column outside those vectors contributes no
+            // block (the `get` forms make the invariant explicit).
+            let Some(&a) = alpha.get(i) else {
+                continue;
+            };
             if a.abs() <= pivot_tol {
                 continue;
             }
-            let bvar = self.basis[i];
-            let cur = self.xb_val[i];
+            let (Some(&bvar), Some(&cur)) = (self.basis.get(i), self.xb_val.get(i)) else {
+                continue;
+            };
+            let (Some(&lower), Some(&upper)) = (self.lower.get(bvar), self.upper.get(bvar)) else {
+                continue;
+            };
             let slope = -a * dir; // d(xb_i)/dt.
             let (bound, to_upper) = if slope > pivot_tol {
                 // Increasing: normally blocked by the upper bound, but a Phase-I
                 // variable below its lower bound is blocked at that lower bound.
-                if phase1 && cur < self.lower[bvar] - feas_tol {
-                    (self.lower[bvar], false)
+                if phase1 && cur < lower - feas_tol {
+                    (lower, false)
                 } else {
-                    (self.upper[bvar], true)
+                    (upper, true)
                 }
             } else if slope < -pivot_tol {
                 // Decreasing: normally the lower bound; a Phase-I variable above
                 // its upper bound is blocked at that upper bound.
-                if phase1 && cur > self.upper[bvar] + feas_tol {
-                    (self.upper[bvar], true)
+                if phase1 && cur > upper + feas_tol {
+                    (upper, true)
                 } else {
-                    (self.lower[bvar], false)
+                    (lower, false)
                 }
             } else {
                 continue;
@@ -2372,47 +2482,71 @@ impl Simplex {
         r: usize,
         piv: f64,
     ) {
-        let w_q = devex[q];
-        let usable = w_q.is_finite() && w_q > 0.0 && piv.is_finite() && piv != 0.0;
-        if !usable {
-            // Cannot form a meaningful update: restart the reference framework.
+        // `q` and `leaving` are columns `< cols == devex.len()` and `r` is a
+        // row slot `< m == rho.len()`. An index outside them cannot form a
+        // meaningful update, exactly like a non-finite weight or pivot, so it
+        // takes the same restart of the reference framework.
+        let w_q = match devex.get(q) {
+            Some(&w_q) if w_q.is_finite() && w_q > 0.0 && piv.is_finite() && piv != 0.0 => w_q,
+            _ => {
+                // Cannot form a meaningful update: restart the reference framework.
+                devex.fill(1.0);
+                *devex_max = 1.0;
+                return;
+            }
+        };
+        rho.fill(0.0);
+        let Some(pivot_slot) = rho.get_mut(r) else {
             devex.fill(1.0);
             *devex_max = 1.0;
             return;
-        }
-        rho.fill(0.0);
-        rho[r] = 1.0;
+        };
+        *pivot_slot = 1.0;
         self.btran_slice(rho);
 
         for j in 0..self.cols {
-            if j == q || self.basic_row[j].is_some() {
+            let nonbasic = matches!(self.basic_row.get(j), Some(None));
+            if j == q || !nonbasic {
                 continue;
             }
             // `ratio` = alpha_rj / alpha_rq (see the doc comment): rho already
             // carries the 1/piv factor.
             let ratio = if j < self.n {
+                let (rows, values) = self.column(j);
                 let mut dot = 0.0f64;
-                for p in self.col_ptr[j]..self.col_ptr[j + 1] {
-                    dot += rho[self.col_idx[p]] * self.col_val[p];
+                for (&row, &value) in rows.iter().zip(values) {
+                    if let Some(&rho_row) = rho.get(row) {
+                        dot += rho_row * value;
+                    }
                 }
                 dot
             } else {
-                -rho[j - self.n] // surplus column M_{n+s} = -e_s.
+                // surplus column M_{n+s} = -e_s.
+                let Some(&rho_s) = rho.get(j - self.n) else {
+                    continue;
+                };
+                -rho_s
             };
             let candidate = ratio * ratio * w_q;
-            if candidate > devex[j] && candidate.is_finite() {
-                devex[j] = candidate;
+            let Some(weight) = devex.get_mut(j) else {
+                continue;
+            };
+            if candidate > *weight && candidate.is_finite() {
+                *weight = candidate;
                 *devex_max = devex_max.max(candidate);
             }
         }
         // The leaving variable becomes non-basic and needs a weight of its own.
         let w_leaving = (w_q / (piv * piv)).max(1.0);
-        devex[leaving] = if w_leaving.is_finite() {
+        let leaving_weight = if w_leaving.is_finite() {
             w_leaving
         } else {
             1.0
         };
-        *devex_max = devex_max.max(devex[leaving]);
+        if let Some(slot) = devex.get_mut(leaving) {
+            *slot = leaving_weight;
+        }
+        *devex_max = devex_max.max(leaving_weight);
 
         if *devex_max > DEVEX_RESET {
             devex.fill(1.0);
@@ -2425,15 +2559,20 @@ impl Simplex {
     /// surplus `n+r` (so `y · M_{n+r} = -y_r`, giving reduced cost `col_cost - (-y_r)`;
     /// surplus cost is 0 in both phases, so this is just `y_r`).
     fn reduced_cost(&self, j: usize, phase1: bool) -> f64 {
+        // Row indices are row slots `< m == y.len()`; a slot outside `y`
+        // prices at zero (never attractive) instead of panicking.
         if j < self.n {
+            let (rows, values) = self.column(j);
             let mut dot = 0.0f64;
-            for p in self.col_ptr[j]..self.col_ptr[j + 1] {
-                dot += self.y[self.col_idx[p]] * self.col_val[p];
+            for (&row, &value) in rows.iter().zip(values) {
+                if let Some(&y_row) = self.y.get(row) {
+                    dot += y_row * value;
+                }
             }
             self.col_cost(j, phase1) - dot
         } else {
             // surplus n+r: col_cost 0; y·M = -y_r; reduced = 0 - (-y_r) = y_r.
-            self.y[j - self.n]
+            self.y.get(j - self.n).copied().unwrap_or(0.0)
         }
     }
 
@@ -2500,22 +2639,30 @@ impl Simplex {
     /// integer arithmetic from the extracted duals, so accuracy here affects
     /// timing, never soundness.
     fn quick_ns_bound(&self) -> f64 {
+        // `y` and `rhs` both hold one entry per row slot (`m`), and `cost` one
+        // per column (`cols >= n`); the iterator/`get` forms make that
+        // explicit instead of panicking on it.
         let mut bound = 0.0f64;
-        for r in 0..self.m {
-            let yr = self.y[r];
+        for (&yr, &rhs_r) in self.y.iter().zip(&self.rhs).take(self.m) {
             if yr.is_finite() && yr > 0.0 {
-                bound += yr * self.rhs[r];
+                bound += yr * rhs_r;
             }
         }
         for j in 0..self.n {
+            let Some(&cost_j) = self.cost.get(j) else {
+                continue;
+            };
+            let (rows, values) = self.column(j);
             let mut dot = 0.0f64;
-            for p in self.col_ptr[j]..self.col_ptr[j + 1] {
-                let yr = self.y[self.col_idx[p]];
+            for (&row, &value) in rows.iter().zip(values) {
+                let Some(&yr) = self.y.get(row) else {
+                    continue;
+                };
                 if yr.is_finite() && yr > 0.0 {
-                    dot += yr * self.col_val[p];
+                    dot += yr * value;
                 }
             }
-            let d = self.cost[j] - dot;
+            let d = cost_j - dot;
             if d < 0.0 {
                 bound += d;
             }
@@ -2585,60 +2732,86 @@ mod tests {
         false
     }
 
+    /// Error type of the fallible oracle helpers and the tests that use them.
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Value of the first literal of `t` under `x` (the oracle's reading of a
+    /// term: `x` holds variable `v` at index `v - 1`).
+    fn oracle_literal_value(t: &PbTerm, x: &[bool]) -> TestResult<bool> {
+        let l = *t.lits.first().ok_or("oracle term has no literal")?;
+        let index = usize::try_from(
+            l.var
+                .checked_sub(1)
+                .ok_or("oracle literal names variable 0")?,
+        )?;
+        let assigned = *x
+            .get(index)
+            .ok_or("oracle literal is outside the assignment")?;
+        Ok(if l.negated { !assigned } else { assigned })
+    }
+
     // --- Brute-force oracle. Uses i128 internally so large i128 coefficients
     //     summed over up to 12 variables never overflow the oracle. ---
 
-    fn constraint_holds(c: &PbConstraint, x: &[bool]) -> bool {
+    fn constraint_holds(c: &PbConstraint, x: &[bool]) -> TestResult<bool> {
         let mut lhs: i128 = 0;
         for t in &c.terms {
-            let l = t.lits[0];
-            let val = if l.negated {
-                !x[(l.var - 1) as usize]
-            } else {
-                x[(l.var - 1) as usize]
-            };
-            if val {
-                lhs += i128::from(t.coeff);
+            if oracle_literal_value(t, x)? {
+                lhs = lhs
+                    .checked_add(i128::from(t.coeff))
+                    .ok_or("oracle constraint sum overflows i128")?;
             }
         }
-        match c.rel {
+        Ok(match c.rel {
             PbRel::Ge => lhs >= i128::from(c.rhs),
             PbRel::Eq => lhs == i128::from(c.rhs),
-        }
+        })
     }
 
-    fn objective_value(obj: &PbObjective, x: &[bool]) -> i128 {
+    fn objective_value(obj: &PbObjective, x: &[bool]) -> TestResult<i128> {
         let mut total: i128 = 0;
         for t in &obj.terms {
-            let l = t.lits[0];
-            let val = if l.negated {
-                !x[(l.var - 1) as usize]
-            } else {
-                x[(l.var - 1) as usize]
-            };
-            if val {
-                total += i128::from(t.coeff);
+            if oracle_literal_value(t, x)? {
+                total = total
+                    .checked_add(i128::from(t.coeff))
+                    .ok_or("oracle objective sum overflows i128")?;
             }
         }
-        total
+        Ok(total)
     }
 
     /// Brute-force integer optimum over all 2^n assignments (as i128, exact), or
-    /// `None` if infeasible.
+    /// `Ok(None)` if infeasible. `n` must be below 32 (the mask is a `u32`).
     fn brute_force_optimum(
         obj: &PbObjective,
         constraints: &[PbConstraint],
         n: u32,
-    ) -> Option<i128> {
+    ) -> TestResult<Option<i128>> {
+        let assignments = 1u32
+            .checked_shl(n)
+            .ok_or("the brute-force oracle enumerates fewer than 32 variables")?;
         let mut best: Option<i128> = None;
-        for mask in 0u32..(1u32 << n) {
-            let x: Vec<bool> = (0..n).map(|b| (mask >> b) & 1 == 1).collect();
-            if constraints.iter().all(|c| constraint_holds(c, &x)) {
-                let v = objective_value(obj, &x);
+        let mut x: Vec<bool> = Vec::new();
+        x.try_reserve_exact(usize::try_from(n)?)?;
+        for mask in 0u32..assignments {
+            x.clear();
+            for b in 0..n {
+                let bit = mask.checked_shr(b).ok_or("mask shift exceeds 31")?;
+                x.push(bit & 1 == 1);
+            }
+            let mut feasible = true;
+            for c in constraints {
+                if !constraint_holds(c, &x)? {
+                    feasible = false;
+                    break;
+                }
+            }
+            if feasible {
+                let v = objective_value(obj, &x)?;
                 best = Some(best.map_or(v, |b| b.min(v)));
             }
         }
-        best
+        Ok(best)
     }
 
     /// Tiny deterministic xorshift PRNG (no dev-deps).
@@ -2652,9 +2825,16 @@ mod tests {
             self.0 = x;
             x
         }
-        fn range(&mut self, lo: i128, hi: i128) -> i128 {
-            let span = (hi - lo + 1) as u64;
-            lo + (self.next() % span) as i128
+        /// A draw from `lo..=hi`; an empty or unrepresentable span is an error.
+        fn range(&mut self, lo: i128, hi: i128) -> TestResult<i128> {
+            let span = hi
+                .checked_sub(lo)
+                .and_then(|width| width.checked_add(1))
+                .ok_or("range span overflows i128")? as u64;
+            let draw = self.next().checked_rem(span).ok_or("empty range")?;
+            Ok(lo
+                .checked_add(i128::from(draw))
+                .ok_or("range sample overflows i128")?)
         }
     }
 
@@ -2685,15 +2865,16 @@ mod tests {
     }
 
     #[test]
-    fn covering_constraint_bound_sound() {
+    fn covering_constraint_bound_sound() -> TestResult {
         // min x1+x2+x3 s.t. x1+x2+x3 >= 1. LP optimum 1; NS must be <= 1.
         let obj = PbObjective {
             terms: vec![term(1, lit(1)), term(1, lit(2)), term(1, lit(3))],
         };
         let c = ge(vec![term(1, lit(1)), term(1, lit(2)), term(1, lit(3))], 1);
         let b = safe_lp_lower_bound(&obj, &[c.clone()], 3, &never_stop).expect("bound");
-        let opt = brute_force_optimum(&obj, &[c], 3).unwrap();
+        let opt = brute_force_optimum(&obj, &[c], 3)?.ok_or("the covering instance is feasible")?;
         assert!(i128::from(b) <= opt, "bound {b} must be <= optimum {opt}");
+        Ok(())
     }
 
     #[test]
@@ -2717,11 +2898,11 @@ mod tests {
         max_vars: u32,
         coeff_lo: i128,
         coeff_hi: i128,
-    ) -> (PbObjective, Vec<PbConstraint>, u32) {
-        let n: u32 = rng.range(1, i128::from(max_vars)) as u32;
+    ) -> TestResult<(PbObjective, Vec<PbConstraint>, u32)> {
+        let n: u32 = rng.range(1, i128::from(max_vars))? as u32;
         let mut obj_terms = Vec::new();
         for v in 1..=n {
-            let coeff = rng.range(coeff_lo, coeff_hi);
+            let coeff = rng.range(coeff_lo, coeff_hi)?;
             if coeff != 0 {
                 let negated = rng.next() & 1 == 1;
                 obj_terms.push(PbTerm {
@@ -2735,12 +2916,12 @@ mod tests {
         }
         let obj = PbObjective { terms: obj_terms };
 
-        let num_c = rng.range(0, 4);
+        let num_c = rng.range(0, 4)?;
         let mut constraints = Vec::new();
         for _ in 0..num_c {
             let mut terms = Vec::new();
             for v in 1..=n {
-                let coeff = rng.range(coeff_lo, coeff_hi);
+                let coeff = rng.range(coeff_lo, coeff_hi)?;
                 if coeff != 0 {
                     let negated = rng.next() & 1 == 1;
                     terms.push(PbTerm {
@@ -2752,7 +2933,7 @@ mod tests {
             if terms.is_empty() {
                 terms.push(term(1, lit(1)));
             }
-            let rhs = rng.range(coeff_lo, coeff_hi);
+            let rhs = rng.range(coeff_lo, coeff_hi)?;
             let rel = if rng.next().is_multiple_of(4) {
                 PbRel::Eq
             } else {
@@ -2760,24 +2941,24 @@ mod tests {
             };
             constraints.push(PbConstraint { terms, rel, rhs });
         }
-        (obj, constraints, n)
+        Ok((obj, constraints, n))
     }
 
     /// CORE GATE 1: thousands of small random instances; NS bound NEVER exceeds the
     /// true integer optimum, and is a finite reasonable value.
     #[test]
-    fn safe_lp_never_overshoots_bruteforce() {
+    fn safe_lp_never_overshoots_bruteforce() -> TestResult {
         let mut rng = Rng(0xA11C_E555_EED1_2340);
         let mut checked = 0usize;
         let mut produced = 0usize;
         for _ in 0..3000 {
-            let (obj, constraints, n) = random_instance(&mut rng, 12, -3, 4);
-            let Some(opt) = brute_force_optimum(&obj, &constraints, n) else {
+            let (obj, constraints, n) = random_instance(&mut rng, 12, -3, 4)?;
+            let Some(opt) = brute_force_optimum(&obj, &constraints, n)? else {
                 continue; // infeasible: skip.
             };
-            checked += 1;
+            checked = checked.saturating_add(1);
             if let Some(b) = safe_lp_lower_bound(&obj, &constraints, n, &never_stop) {
-                produced += 1;
+                produced = produced.saturating_add(1);
                 assert!(
                     i128::from(b) <= opt,
                     "SOUNDNESS VIOLATION: NS bound {b} > integer optimum {opt}\n\
@@ -2799,6 +2980,7 @@ mod tests {
             "expected the NS bound to be produced often, got {produced}"
         );
         eprintln!("safe_lp_never_overshoots_bruteforce: checked={checked} produced={produced}");
+        Ok(())
     }
 
     /// CORE GATE 2: LARGE coefficients — where f64 error is largest. NS bound must
@@ -2807,7 +2989,7 @@ mod tests {
     /// rows. Magnitudes are kept so the i128 oracle and i128 API never overflow:
     /// per-coeff <= 5e16, n <= 9, so the objective sum stays well within i128.
     #[test]
-    fn safe_lp_adversarial_large_coeffs() {
+    fn safe_lp_adversarial_large_coeffs() -> TestResult {
         let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
         let mut checked = 0usize;
         let mut produced = 0usize;
@@ -2820,16 +3002,19 @@ mod tests {
             (-50_000_000_000_000_000, 50_000_000_000_000_000), // 5e16.
         ];
         for _ in 0..2500 {
-            let (lo, hi) = regimes[(rng.next() as usize) % regimes.len()];
+            let &(lo, hi) = (rng.next() as usize)
+                .checked_rem(regimes.len())
+                .and_then(|regime| regimes.get(regime))
+                .ok_or("no magnitude regime")?;
             // n <= 9: the i128 objective sum (<= 9 * 5e16 = 4.5e17) stays in range,
             // and the 2^n brute force is cheap.
-            let (obj, constraints, n) = random_instance(&mut rng, 9, lo, hi);
-            let Some(opt) = brute_force_optimum(&obj, &constraints, n) else {
+            let (obj, constraints, n) = random_instance(&mut rng, 9, lo, hi)?;
+            let Some(opt) = brute_force_optimum(&obj, &constraints, n)? else {
                 continue;
             };
-            checked += 1;
+            checked = checked.saturating_add(1);
             if let Some(b) = safe_lp_lower_bound(&obj, &constraints, n, &never_stop) {
-                produced += 1;
+                produced = produced.saturating_add(1);
                 assert!(
                     i128::from(b) <= opt,
                     "SOUNDNESS VIOLATION (large coeffs): NS bound {b} > integer optimum {opt}\n\
@@ -2846,19 +3031,24 @@ mod tests {
             "expected the NS bound produced often, got {produced}"
         );
         eprintln!("safe_lp_adversarial_large_coeffs: checked={checked} produced={produced}");
+        Ok(())
     }
 
     /// Degenerate / pathological shapes: equality-heavy near-tight LPs, odd
     /// (non-f64-exact) coefficient multipliers, forced rows.
     #[test]
-    fn safe_lp_degenerate_cases() {
+    fn safe_lp_degenerate_cases() -> TestResult {
         let mut rng = Rng(0x0123_4567_89AB_CDEF);
         let mut checked = 0usize;
         for _ in 0..1500 {
-            let n: u32 = rng.range(1, 8) as u32;
+            let n: u32 = rng.range(1, 8)? as u32;
             let mut obj_terms = Vec::new();
             for v in 1..=n {
-                let coeff = rng.range(-5, 6) * 1_000_003; // odd multiplier: not f64-exact.
+                // odd multiplier: not f64-exact.
+                let coeff = rng
+                    .range(-5, 6)?
+                    .checked_mul(1_000_003)
+                    .ok_or("objective coefficient overflows i128")?;
                 if coeff != 0 {
                     obj_terms.push(term(coeff, lit(v)));
                 }
@@ -2871,18 +3061,23 @@ mod tests {
             // An equality forcing a near-tight LP.
             let mut eq_terms = Vec::new();
             for v in 1..=n {
-                eq_terms.push(term(rng.range(1, 4), lit(v)));
+                eq_terms.push(term(rng.range(1, 4)?, lit(v)));
             }
-            let eq_rhs = rng.range(0, i128::from(n) * 3);
+            let eq_rhs = rng.range(
+                0,
+                i128::from(n)
+                    .checked_mul(3)
+                    .ok_or("equality bound overflows i128")?,
+            )?;
             constraints.push(PbConstraint {
                 terms: eq_terms,
                 rel: PbRel::Eq,
                 rhs: eq_rhs,
             });
-            let Some(opt) = brute_force_optimum(&obj, &constraints, n) else {
+            let Some(opt) = brute_force_optimum(&obj, &constraints, n)? else {
                 continue;
             };
-            checked += 1;
+            checked = checked.saturating_add(1);
             if let Some(b) = safe_lp_lower_bound(&obj, &constraints, n, &never_stop) {
                 assert!(
                     i128::from(b) <= opt,
@@ -2893,6 +3088,7 @@ mod tests {
         }
         assert!(checked > 200, "expected feasible instances, got {checked}");
         eprintln!("safe_lp_degenerate_cases: checked={checked}");
+        Ok(())
     }
 
     /// CORE GATE 3: vs the EXACT rational LP bound. The hard property is still
@@ -2900,17 +3096,17 @@ mod tests {
     /// never EXCEEDS the exact LP bound (exact returns ceil(LP*); safe floors
     /// NS <= LP* <= ceil(LP*)); a safe bound above exact is a red flag.
     #[test]
-    fn safe_lp_vs_exact() {
+    fn safe_lp_vs_exact() -> TestResult {
         use crate::optimize::lp_bound::lp_lower_bound;
         let mut rng = Rng(0xFACE_FEED_0000_9999);
         let mut compared = 0usize;
         let mut both = 0usize;
         for _ in 0..2000 {
-            let (obj, constraints, n) = random_instance(&mut rng, 10, -4, 5);
-            let Some(opt) = brute_force_optimum(&obj, &constraints, n) else {
+            let (obj, constraints, n) = random_instance(&mut rng, 10, -4, 5)?;
+            let Some(opt) = brute_force_optimum(&obj, &constraints, n)? else {
                 continue;
             };
-            compared += 1;
+            compared = compared.saturating_add(1);
             let safe = safe_lp_lower_bound(&obj, &constraints, n, &never_stop);
             let exact = lp_lower_bound(&obj, &constraints, n, &never_stop);
             if let Some(safe) = safe {
@@ -2919,7 +3115,7 @@ mod tests {
                     "SOUNDNESS VIOLATION: safe {safe} > optimum {opt}\nobj={obj:?}\ncons={constraints:?}"
                 );
                 if let Some(exact) = exact {
-                    both += 1;
+                    both = both.saturating_add(1);
                     assert!(
                         safe <= exact,
                         "RED FLAG: safe bound {safe} exceeds exact LP bound {exact} \
@@ -2935,6 +3131,7 @@ mod tests {
         );
         assert!(both > 200, "expected exact+safe overlap often, got {both}");
         eprintln!("safe_lp_vs_exact: compared={compared} both_produced={both}");
+        Ok(())
     }
 
     /// The safe bound must be non-trivially tight on an easy instance.
@@ -2964,7 +3161,7 @@ mod tests {
     /// Speed sanity (not a hard timing assertion): a moderately sized synthetic
     /// instance should be solved by the f64 path in well under a second.
     #[test]
-    fn safe_lp_handles_moderate_instance_quickly() {
+    fn safe_lp_handles_moderate_instance_quickly() -> TestResult {
         let n = 200u32;
         let mut obj_terms = Vec::new();
         for v in 1..=n {
@@ -2974,10 +3171,17 @@ mod tests {
         // A handful of covering rows over disjoint windows.
         let mut constraints = Vec::new();
         let mut start = 1u32;
-        while start + 9 <= n {
-            let terms: Vec<PbTerm> = (start..start + 10).map(|v| term(1, lit(v))).collect();
+        loop {
+            let last = start.checked_add(9).ok_or("window end overflows u32")?;
+            if last > n {
+                break;
+            }
+            let mut terms: Vec<PbTerm> = Vec::with_capacity(10);
+            for v in start..=last {
+                terms.push(term(1, lit(v)));
+            }
             constraints.push(ge(terms, 3));
-            start += 10;
+            start = start.checked_add(10).ok_or("window start overflows u32")?;
         }
         let t = std::time::Instant::now();
         let b = safe_lp_lower_bound(&obj, &constraints, n, &never_stop);
@@ -2986,29 +3190,42 @@ mod tests {
         assert!(b.is_some(), "expected a bound on the moderate instance");
         // Generous ceiling; the f64 simplex should be far faster than this.
         assert!(elapsed.as_secs() < 10, "f64 LP took too long: {elapsed:?}");
+        Ok(())
+    }
+
+    /// Four independent five-item covers over variables `1..=20`, each row
+    /// requiring two of its items; variable `v` costs `(v - 1) % 5 + 1`.
+    fn disjoint_weighted_cover_fixture() -> TestResult<(u32, PbObjective, Vec<PbConstraint>)> {
+        let n = 20u32;
+        let mut objective_terms = Vec::new();
+        for var in 1..=n {
+            let cost = var.checked_sub(1).ok_or("variable 0")? % 5 + 1;
+            objective_terms.push(term(i128::from(cost), lit(var)));
+        }
+        let objective = PbObjective {
+            terms: objective_terms,
+        };
+        let mut constraints = Vec::new();
+        for group in 0..4u32 {
+            let mut terms = Vec::new();
+            for offset in 1..=5u32 {
+                let var = group
+                    .checked_mul(5)
+                    .and_then(|base| base.checked_add(offset))
+                    .ok_or("cover variable overflows u32")?;
+                terms.push(term(1, lit(var)));
+            }
+            constraints.push(ge(terms, 2));
+        }
+        Ok((n, objective, constraints))
     }
 
     #[test]
-    fn safe_lp_and_exact_bound_disjoint_weighted_cover_soundly() {
+    fn safe_lp_and_exact_bound_disjoint_weighted_cover_soundly() -> TestResult {
         use crate::optimize::lp_bound::lp_lower_bound;
         // Four independent five-item covers, each requiring two items with
         // costs 1..=5. Both the LP and integer optimum are 4*(1+2)=12.
-        let n = 20u32;
-        let objective = PbObjective {
-            terms: (1..=n)
-                .map(|var| term(i128::from((var - 1) % 5 + 1), lit(var)))
-                .collect(),
-        };
-        let constraints: Vec<_> = (0..4u32)
-            .map(|group| {
-                ge(
-                    (1..=5)
-                        .map(|offset| term(1, lit(group * 5 + offset)))
-                        .collect(),
-                    2,
-                )
-            })
-            .collect();
+        let (n, objective, constraints) = disjoint_weighted_cover_fixture()?;
 
         let exact = lp_lower_bound(&objective, &constraints, n, &never_stop);
         let (safe, point) = safe_lp_bound_and_point_with_iteration_budget(
@@ -3032,29 +3249,15 @@ mod tests {
                 "each disjoint cover must be satisfied by the advisory point"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn bound_and_dual_returns_only_the_bound_witnessed_by_its_dual() {
+    fn bound_and_dual_returns_only_the_bound_witnessed_by_its_dual() -> TestResult {
         // With a zero-iteration budget the dual is deliberately weak, while
         // the independent disjoint-cover argument proves 12. The paired API
         // must return the weaker NS value that its own dual reproduces.
-        let n = 20u32;
-        let objective = PbObjective {
-            terms: (1..=n)
-                .map(|var| term(i128::from((var - 1) % 5 + 1), lit(var)))
-                .collect(),
-        };
-        let constraints: Vec<_> = (0..4u32)
-            .map(|group| {
-                ge(
-                    (1..=5)
-                        .map(|offset| term(1, lit(group * 5 + offset)))
-                        .collect(),
-                    2,
-                )
-            })
-            .collect();
+        let (n, objective, constraints) = disjoint_weighted_cover_fixture()?;
 
         let (bound, dual) = safe_lp_bound_and_dual_with_iteration_budget(
             &objective,
@@ -3076,6 +3279,7 @@ mod tests {
             bound.is_some_and(|ns| cover > ns),
             "the fixture must keep the independent cover bound strictly stronger"
         );
+        Ok(())
     }
 
     #[test]
@@ -3728,7 +3932,7 @@ mod tests {
     mod convergence_contracts;
     mod replay_crossover;
     #[test]
-    fn devex_pivot_row_is_the_ratio_the_update_needs() {
+    fn devex_pivot_row_is_the_ratio_the_update_needs() -> TestResult {
         // The subtle step in `devex_update` is WHICH basis its `rho` belongs to.
         // It runs after the pivot's eta is appended and after `basis[prow] = col`,
         // so `rho = e_r^T B^{-1}` for the NEW basis, and the update relies on
@@ -3742,19 +3946,21 @@ mod tests {
         // identity on a real basis reached by a real solve.
         let mut rng = Rng(0x0d15_ea5e_1234_5678);
         let n = 24usize;
-        let rows: Vec<(Vec<(usize, f64)>, f64)> = (0..n)
-            .map(|r| {
-                let mut coeffs = vec![(r, 4.0)];
-                for _ in 0..3 {
-                    let v = (rng.next() % n as u64) as usize;
-                    if v != r && !coeffs.iter().any(|&(u, _)| u == v) {
-                        coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
-                    }
+        let mut rows: Vec<(Vec<(usize, f64)>, f64)> = Vec::with_capacity(n);
+        for r in 0..n {
+            let mut coeffs = vec![(r, 4.0)];
+            for _ in 0..3 {
+                let v = rng
+                    .next()
+                    .checked_rem(n as u64)
+                    .ok_or("the fixture has no variables")? as usize;
+                if v != r && !coeffs.iter().any(|&(u, _)| u == v) {
+                    coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
                 }
-                coeffs.sort_unstable_by_key(|&(v, _)| v);
-                (coeffs, 4.0)
-            })
-            .collect();
+            }
+            coeffs.sort_unstable_by_key(|&(v, _)| v);
+            rows.push((coeffs, 4.0));
+        }
         let model = LpF64 {
             n,
             c: (0..n).map(|j| 1.0 + (j % 3) as f64).collect(),
@@ -3773,20 +3979,24 @@ mod tests {
         assert!(simplex.run(&never_stop, SimplexLimits::iterations(20_000), None));
 
         // `M_j` for a structural is its CSC column; for surplus `n+s` it is `-e_s`.
-        let dot = |rho: &[f64], j: usize| -> f64 {
+        // `None` when `rho` is shorter than the row count it must cover.
+        let dot = |rho: &[f64], j: usize| -> Option<f64> {
             if j < n {
                 rows.iter()
                     .enumerate()
                     .map(|(r, (coeffs, _))| {
-                        coeffs
-                            .iter()
-                            .filter(|&&(v, _)| v == j)
-                            .map(|&(_, a)| rho[r] * a)
-                            .sum::<f64>()
+                        let rho_r = *rho.get(r)?;
+                        Some(
+                            coeffs
+                                .iter()
+                                .filter(|&&(v, _)| v == j)
+                                .map(|&(_, a)| rho_r * a)
+                                .sum::<f64>(),
+                        )
                     })
                     .sum()
             } else {
-                -rho[j - n]
+                Some(-*rho.get(j - n)?)
             }
         };
         let mut rho = vec![0.0f64; m];
@@ -3796,7 +4006,7 @@ mod tests {
             simplex.btran_slice(&mut rho);
             for s in 0..m {
                 let want = if s == r { 1.0 } else { 0.0 };
-                let got = dot(&rho, simplex.basis[s]);
+                let got = dot(&rho, simplex.basis[s]).ok_or("pivot row shorter than m")?;
                 assert!(
                     (got - want).abs() <= 1e-7,
                     "e_{r}^T B^-1 M_basis[{s}] = {got}, expected {want}: the pivot \
@@ -3814,9 +4024,11 @@ mod tests {
         let nonbasic = (0..n + m)
             .find(|&j| simplex.basic_row[j].is_none())
             .expect("some column is non-basic at an optimum");
+        let nonbasic_dot = dot(&rho, nonbasic).ok_or("pivot row shorter than m")?;
         assert!(
-            (dot(&rho, nonbasic) - 1.0).abs() > 1e-7,
+            (nonbasic_dot - 1.0).abs() > 1e-7,
             "a non-basic column also dotted to 1, so the identity check is vacuous"
         );
+        Ok(())
     }
 }

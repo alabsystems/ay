@@ -209,7 +209,17 @@ fn guarded_then_projection_rebuilds_strictly_with_exact_wire_text() {
         "(step t9 (cl (not (= (ite (= y 0) x 0) x)) (not (<= 0 (ite (= y 0) x 0))) (<= 0 x)) :rule la_generic :args (-1 1 1))",
         "(step t10 (cl (not (= y 0)) (not (<= 0 (ite (= y 0) x 0))) (<= 0 x)) :rule resolution :premises (t8 t9))",
         "(step t11 (cl (not (= y 0)) (<= 0 x)) :rule resolution :premises (t10 t1))",
-        "(step t12 (cl (or (not (= y 0)) (<= 0 x)) (= y 0)) :rule or_neg :args (0))",
+        // t12's `or_neg` needs `(not (not (= y 0)))` — the negation of the
+        // disjunct `(not (= y 0))` — while the traced literal was
+        // double-negation stripped to `(= y 0)`. This test used to assert the
+        // stripped one-line spelling. MEASURED on the pinned carcara 1.1.0, on
+        // exactly that line: `invalid`, "term '(= y 0)' is of the wrong form,
+        // expected '(not t)'". The step is now the spec-shaped `or_neg` plus
+        // the `not_not` bridge the Alethe spec provides for precisely this,
+        // resolved back to the same clause under the same id — accepted.
+        "(step t12a (cl (or (not (= y 0)) (<= 0 x)) (not (not (= y 0)))) :rule or_neg :args (0))",
+        "(step t12b0 (cl (not (not (not (= y 0)))) (= y 0)) :rule not_not)",
+        "(step t12 (cl (or (not (= y 0)) (<= 0 x)) (= y 0)) :rule resolution :premises (t12a t12b0))",
         "(step t13 (cl (<= 0 x) (or (not (= y 0)) (<= 0 x))) :rule resolution :premises (t11 t12))",
         "(step t14 (cl (or (not (= y 0)) (<= 0 x)) (not (<= 0 x))) :rule or_neg :args (1))",
         "(step t15 (cl (or (not (= y 0)) (<= 0 x)) (or (not (= y 0)) (<= 0 x))) :rule resolution :premises (t13 t14))",

@@ -345,6 +345,9 @@ fn validate_theory_datatype_remaining(
         // constructor→selector registry (field list + order + nullarity)
         // are required; without either this kind fails closed.
         TheoryLemmaKind::DatatypeConstructorReconstruct => {
+            if datatype_axiom::complex_product::recognizes(terms, clause) {
+                return Ok(true);
+            }
             match (dt_decls, ctor_selectors, datatype_member_signatures) {
                 (Some(decls), Some(selectors), Some(_)) => {
                     datatype_axiom::validate_datatype_constructor_reconstruct(

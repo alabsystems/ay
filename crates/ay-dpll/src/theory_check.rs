@@ -467,10 +467,12 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 // SAT literal conversion). Removes redundant equality premises
                 // that are not on the shortest BFS chain.
                 let mut conflict_terms = conflict_terms;
-                if let Some(terms) = self.terms {
-                    let euf_removed =
-                        theory_inference::minimize_euf_conflict(&mut conflict_terms, terms);
-                    self.theory_minimize_lits_removed += euf_removed as u64;
+                if tracking.is_none() {
+                    if let Some(terms) = self.terms {
+                        let euf_removed =
+                            theory_inference::minimize_euf_conflict(&mut conflict_terms, terms);
+                        self.theory_minimize_lits_removed += euf_removed as u64;
+                    }
                 }
                 // #6546: dynamically register unmapped terms so conflict clauses
                 // are never dropped as partial.
@@ -479,12 +481,28 @@ impl<T: TheorySolver> DpllT<'_, T> {
                     .map(|t| self.term_to_literal_or_register(t.term, !t.value))
                     .collect();
                 {
-                    // #8424: Pre-minimize conflict clause with level-0 removal.
-                    let removed =
-                        theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                            self.sat.var_level(var)
-                        });
-                    self.theory_minimize_lits_removed += removed as u64;
+                    let policy = if tracking.is_some() {
+                        theory_inference::ConflictClausePolicy::PreserveLiterals
+                    } else {
+                        theory_inference::ConflictClausePolicy::Deduplicate
+                    };
+                    match theory_inference::minimize_conflict_clause(&mut clause, policy) {
+                        theory_inference::ConflictClauseReduction::Clause { removed } => {
+                            self.theory_minimize_lits_removed += removed as u64
+                        }
+                        theory_inference::ConflictClauseReduction::Tautology
+                        | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                            self.theory_unknown_count += 1;
+                            self.emit_theory_check_event(
+                                "consistency",
+                                "unknown",
+                                None,
+                                Some(conflict_terms.len()),
+                                consistency_duration,
+                            );
+                            return TheoryCheck::Unknown;
+                        }
+                    }
                     // #8165: Track conflict clause literal counts.
                     let clause_len = clause.len() as u64;
                     self.conflict_total_literals += clause_len;
@@ -622,17 +640,31 @@ impl<T: TheorySolver> DpllT<'_, T> {
                     .iter()
                     .map(|t| self.term_to_literal_or_register(t.term, !t.value))
                     .collect();
-                // #8424: Pre-minimize Farkas conflict clause, then level-0 removal.
-                let mut removed = if let Some(ref farkas) = conflict.farkas {
-                    let mut coeffs = farkas.coefficients.clone();
-                    theory_inference::minimize_farkas_conflict(&mut clause, &mut coeffs)
+                // Semantic validity of the full conflict does not validate
+                // zero weights in a downgraded certificate. Retain its row.
+                let mut removed = 0;
+                let policy = if tracking.is_some() {
+                    theory_inference::ConflictClausePolicy::PreserveLiterals
                 } else {
-                    0
+                    theory_inference::ConflictClausePolicy::Deduplicate
                 };
-                // Level-0 removal applies to both Farkas and non-Farkas paths.
-                removed += theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                    self.sat.var_level(var)
-                });
+                match theory_inference::minimize_conflict_clause(&mut clause, policy) {
+                    theory_inference::ConflictClauseReduction::Clause { removed: count } => {
+                        removed += count
+                    }
+                    theory_inference::ConflictClauseReduction::Tautology
+                    | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                        self.theory_unknown_count += 1;
+                        self.emit_theory_check_event(
+                            "consistency",
+                            "unknown",
+                            None,
+                            Some(conflict.literals.len()),
+                            consistency_duration,
+                        );
+                        return TheoryCheck::Unknown;
+                    }
+                }
                 self.theory_minimize_lits_removed += removed as u64;
                 // #8165: Track conflict clause literal counts.
                 let clause_len = clause.len() as u64;

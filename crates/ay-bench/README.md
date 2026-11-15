@@ -6,9 +6,9 @@ scoring methods from SAT Competition, SMT-COMP, and CHC-COMP.
 ## Build
 
 ```bash
-cargo build --release -p ay-bench
+targo --unverified build --release -p ay-bench
 # Also build the solver:
-cargo build --release -p ay
+targo --unverified build --release -p ay
 ```
 
 ## Quick Start

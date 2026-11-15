@@ -144,11 +144,14 @@ impl FpNumeral {
         let sb1 = (sb - 1) as usize;
         let total_bits = u64::from(eb) + u64::from(sb);
         let sign = bits.bit(total_bits - 1);
-        let exp_mask = (BigUint::from(1u8) << (eb as usize)) - BigUint::from(1u8);
-        let sig_mask = (BigUint::from(1u8) << sb1) - BigUint::from(1u8);
-        let shifted = bits.clone() >> sb1;
-        let exp_field = &shifted & &exp_mask;
-        let sig_field = bits & &sig_mask;
+        // Split only occupied data, without a mask proportional to precision.
+        let payload = if sign {
+            bits ^ (BigUint::from(1u8) << (total_bits - 1) as usize)
+        } else {
+            bits.clone()
+        };
+        let exp_field = &payload >> sb1;
+        let sig_field = payload - (&exp_field << sb1);
         let category = Self::category_from_fields(&exp_field, &sig_field, eb);
         Self {
             sign,
@@ -207,29 +210,32 @@ impl Solver {
     #[must_use]
     pub fn fp_numeral_decode(&self, t: Term) -> Option<FpNumeral> {
         let t_id = self.resolve_term("fp_numeral_decode", t).ok()?;
-        let (eb, sb) = match self.terms().sort(t_id).clone() {
-            Sort::FloatingPoint(eb, sb) => (eb, sb),
+        let (eb, sb) = match self.terms().sort(t_id) {
+            Sort::FloatingPoint(eb, sb) => (*eb, *sb),
             _ => return None,
         };
         // Degenerate widths cannot form an IEEE encoding; decline rather than
         // underflow `sb - 1` / `eb` shifts.
-        if eb == 0 || sb == 0 {
+        if !(2..=ay_fp::MAX_ENCODING_EXPONENT_BITS).contains(&eb)
+            || !(2..=ay_fp::MAX_ENCODING_SIGNIFICAND_BITS).contains(&sb)
+        {
             return None;
         }
-        // Clone the node so the immutable borrow of the term store is released
-        // before the per-child `Const` lookups below.
-        let node = self.terms().get(t_id).clone();
+        // Inspect borrowed structure only after admitting the source namespace.
+        let node = self.terms().get(t_id);
         match node {
             // (a) nullary special-value app: (_ +oo eb sb), (_ NaN eb sb), ...
-            TermData::App(Symbol::Indexed(name, _indices), args) if args.is_empty() => {
-                FpNumeral::special(&name, eb, sb)
+            TermData::App(Symbol::Indexed(name, indices), args)
+                if args.is_empty() && indices.as_slice() == [eb, sb] =>
+            {
+                FpNumeral::special(name, eb, sb)
             }
             // (b) 1-arg reinterpret: ((_ to_fp eb sb) bv-const)
-            TermData::App(Symbol::Indexed(name, _indices), args)
-                if name == "to_fp" && args.len() == 1 =>
+            TermData::App(Symbol::Indexed(name, indices), args)
+                if name == "to_fp" && args.len() == 1 && indices.as_slice() == [eb, sb] =>
             {
-                let (bits, width) = self.fp_bv_const_value(args[0])?;
                 let total = eb.checked_add(sb)?;
+                let (bits, width) = self.fp_bv_const_value(args[0], total)?;
                 if width != total {
                     return None;
                 }
@@ -237,9 +243,9 @@ impl Solver {
             }
             // (c) 3-arg component form: (fp sgn-const exp-const sig-const)
             TermData::App(Symbol::Named(name), args) if name == "fp" && args.len() == 3 => {
-                let (sign_v, sign_w) = self.fp_bv_const_value(args[0])?;
-                let (exp_v, exp_w) = self.fp_bv_const_value(args[1])?;
-                let (sig_v, sig_w) = self.fp_bv_const_value(args[2])?;
+                let (sign_v, sign_w) = self.fp_bv_const_value(args[0], 1)?;
+                let (exp_v, exp_w) = self.fp_bv_const_value(args[1], eb)?;
+                let (sig_v, sig_w) = self.fp_bv_const_value(args[2], sb - 1)?;
                 if sign_w != 1 || exp_w != eb || sig_w != sb.checked_sub(1)? {
                     return None;
                 }
@@ -264,9 +270,19 @@ impl Solver {
     /// BitVec constants are stored normalized to a non-negative value in
     /// `[0, 2^width)` (see `TermStore::mk_bitvec`), so `to_biguint` never loses a
     /// sign.
-    fn fp_bv_const_value(&self, id: TermId) -> Option<(BigUint, u32)> {
+    fn fp_bv_const_value(&self, id: TermId, expected_width: u32) -> Option<(BigUint, u32)> {
         match self.terms().get(id) {
             TermData::Const(Constant::BitVec { value, width, .. }) => {
+                if *width != expected_width
+                    || self.terms().sort(id) != &Sort::bitvec(*width)
+                    || value.sign() == num_bigint::Sign::Minus
+                    || value.bits() > u64::from(*width)
+                    || *width
+                        > ay_fp::MAX_ENCODING_EXPONENT_BITS
+                            .checked_add(ay_fp::MAX_ENCODING_SIGNIFICAND_BITS)?
+                {
+                    return None;
+                }
                 value.to_biguint().map(|v| (v, *width))
             }
             _ => None,
@@ -345,5 +361,86 @@ impl Solver {
             sort,
         );
         Ok(self.wrap_term(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Logic;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn exact_numeral_fields_survive_components_and_packed_reinterpretation() {
+        let mut solver = Solver::new(Logic::QfFp);
+        let fraction = (BigInt::from(1) << 198usize) + BigInt::from(1);
+        let sign = solver.try_bv_const_bigint(&BigInt::from(1), 1).unwrap();
+        let exp = solver.try_bv_const_bigint(&BigInt::from(127), 8).unwrap();
+        let sig = solver.try_bv_const_bigint(&fraction, 199).unwrap();
+        let components = solver.try_fp_from_bvs(sign, exp, sig, 8, 200).unwrap();
+        let packed = (BigInt::from(1) << 207usize) + (BigInt::from(127) << 199usize) + &fraction;
+        let reinterpret = solver
+            .try_fp_const_from_bits_bigint(&packed, 8, 200)
+            .unwrap();
+        for value in [components, reinterpret] {
+            let numeral = solver.fp_numeral_decode(value).unwrap();
+            assert!(numeral.sign);
+            assert_eq!(numeral.exp_field, BigUint::from(127u8));
+            assert_eq!(numeral.sig_field, fraction.to_biguint().unwrap());
+            assert!(numeral.is_normal());
+        }
+    }
+
+    #[test]
+    fn malformed_indices_arity_and_unbounded_formats_are_not_numerals() {
+        let mut solver = Solver::new(Logic::QfFp);
+        for (name, indices, sort) in [
+            ("+zero", vec![8, 24], Sort::FloatingPoint(8, 200)),
+            ("+zero", vec![], Sort::FloatingPoint(8, 200)),
+            ("+zero", vec![8, u32::MAX], Sort::FloatingPoint(8, u32::MAX)),
+            ("+zero", vec![1, 200], Sort::FloatingPoint(1, 200)),
+            ("to_fp", vec![8, 200], Sort::FloatingPoint(8, 200)),
+        ] {
+            let id = solver
+                .terms_mut()
+                .mk_app(Symbol::indexed(name, indices), vec![], sort);
+            assert!(solver.fp_numeral_decode(solver.wrap_term(id)).is_none());
+        }
+        let bit = solver.terms_mut().mk_bitvec(BigInt::from(0), 1);
+        let wrong_exp = solver.terms_mut().mk_bitvec(BigInt::from(0), 9);
+        let fraction = solver.terms_mut().mk_bitvec(BigInt::from(0), 199);
+        let id = solver.terms_mut().mk_app(
+            Symbol::named("fp"),
+            vec![bit, wrong_exp, fraction],
+            Sort::FloatingPoint(8, 200),
+        );
+        assert!(solver.fp_numeral_decode(solver.wrap_term(id)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod malformed_fields_tests {
+    use super::*;
+    use crate::api::Logic;
+    use ay_core::TermStore;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn untrusted_raw_bv_payloads_must_match_own_sort_and_unsigned_width() {
+        for (value, sort) in [
+            (BigInt::from(-1), Sort::bitvec(8)),
+            (BigInt::from(256), Sort::bitvec(8)),
+            (BigInt::from(1), Sort::Bool),
+            (BigInt::from(1), Sort::bitvec(9)),
+        ] {
+            let mut solver = Solver::new(Logic::QfFp);
+            *solver.terms_mut() = TermStore::from_entries(
+                vec![(TermData::Const(Constant::BitVec { value, width: 8 }), sort)],
+                None,
+                None,
+                0,
+            );
+            assert!(solver.fp_bv_const_value(TermId(0), 8).is_none());
+        }
     }
 }

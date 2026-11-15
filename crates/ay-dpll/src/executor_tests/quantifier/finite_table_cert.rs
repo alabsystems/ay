@@ -166,8 +166,15 @@ fn finite_table_cert_grants_free_constant_bound() {
 /// parked residue), so the search completes without parking and the exact
 /// public-root table RESCUE — the previously pinned route — is never needed.
 /// The user-visible contract is unchanged and still pinned: `sat`, and ONE
-/// shared interpretation printed for both foralls. The route pins flip to the
-/// new contract: nothing parks, so no rescue grant and no parked stat.
+/// shared interpretation printed for both foralls.
+///
+/// ROUTE NOTE (#demand-post-interleave-fence): instances parked by the
+/// interleaved rounds are now fenced before classification, which drains
+/// the parked queue and thereby unblocks the Phase 2.5d finite-table
+/// certificate (`demand_parked_blocks_sat` no longer holds it back), so
+/// the rescue grant MAY engage on the re-solve. The user-visible contract
+/// (sat + the shared interpretation below) is unchanged; only which lane
+/// certifies it may differ, so the grant-idle pin is dropped.
 #[test]
 fn finite_table_cert_grants_shared_symbol_two_foralls() {
     let commands = parse(
@@ -200,10 +207,11 @@ fn finite_table_cert_grants_shared_symbol_two_foralls() {
          demand search completes without parking and the table rescue is \
          never engaged"
     );
-    assert!(
-        !exec.finite_table_cert_grant_active,
-        "no parked residue means the exact-table rescue lane must stay idle"
-    );
+    // No grant-idle pin: since #demand-post-interleave-fence the parked
+    // queue is drained before classification, so the exact-table rescue
+    // may certify on the re-solve (see the route note above). The pinned
+    // contract is the sat verdict + shared interpretation asserted above.
+    let _ = exec.finite_table_cert_grant_active;
 }
 
 /// A conflicting ground sibling must never be hidden by separately grantable

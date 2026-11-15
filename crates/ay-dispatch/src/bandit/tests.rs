@@ -77,7 +77,7 @@ fn mw_regret_bounded_on_three_arm_trace() {
 }
 
 #[test]
-fn mw_sample_respects_distribution() {
+fn mw_sample_respects_distribution() -> Result<(), Box<dyn std::error::Error>> {
     let mut mw = MultiplicativeWeights::new([Arm::A, Arm::B], 0.5, 1);
     for _ in 0..500 {
         mw.update(Arm::A, 1.0);
@@ -85,16 +85,19 @@ fn mw_sample_respects_distribution() {
     // A-prob should be overwhelming.
     let mut counts = [0usize; 2];
     for _ in 0..5_000 {
-        match mw.sample().expect("non-empty bandit") {
-            Arm::A => counts[0] += 1,
-            Arm::B => counts[1] += 1,
-            Arm::C => unreachable!(),
+        match mw.sample().ok_or("non-empty bandit")? {
+            Arm::A => counts[0] = counts[0].saturating_add(1),
+            Arm::B => counts[1] = counts[1].saturating_add(1),
+            Arm::C => return Err("sampled an arm the bandit was not built with".into()),
         }
     }
-    assert!(
-        counts[0] > counts[1] * 10,
-        "A should vastly outnumber B: {counts:?}"
-    );
+    let b_times_ten = counts[1]
+        .checked_mul(10)
+        .ok_or("B count times ten overflows")?;
+    if counts[0] <= b_times_ten {
+        return Err(format!("A should vastly outnumber B: {counts:?}").into());
+    }
+    Ok(())
 }
 
 #[test]

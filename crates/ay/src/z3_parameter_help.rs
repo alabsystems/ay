@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Exact Z3 5.1.0 command-line parameter discovery.
+//! Z3 5.1.0 discovery with implemented, separately measured 5.3.3 extensions.
 //!
 //! Mechanically captured from `/opt/homebrew/bin/z3` (`Z3 version 5.1.0 - 64
 //! bit`, SHA-256
@@ -5973,6 +5973,11 @@ const ALL_PARAMETER_DESCRIPTIONS: u16 = 1;
 const MODULE_LIST: u16 = 2;
 const GLOBAL_LEGAL_PARAMETERS: u16 = 70;
 
+// Implemented module extension from Z3 5.3.3 seq_rewriter_params.hpp.
+// The historical profile database and its measured denominators stay intact.
+const POWER_PARAMETER: &str = "    max_power_expansion (unsigned int) maximum exponent for expanding sequence repetitions (default: 2)";
+const POWER_PARAMETER_BRIEF: &str = "    max_power_expansion (unsigned int) (default: 2)";
+
 const MODULE_TEXT: &[(&str, u16)] = &[
     ("ackermannization", 48),
     ("algebraic", 36),
@@ -7108,6 +7113,15 @@ fn print_parameter(original: &str) -> i32 {
     } else {
         format!("{module}.{parameter}")
     };
+    if key == "rewriter.max_power_expansion" {
+        safe_println!("  name:           max_power_expansion");
+        safe_println!("  module:         rewriter");
+        safe_println!("  qualified name: rewriter.max_power_expansion");
+        safe_println!("  type:           unsigned int");
+        safe_println!("  description:    maximum exponent for expanding sequence repetitions");
+        safe_println!("  default value:  2");
+        return 0;
+    }
     if let Some(profile) = lookup(PARAMETER_DETAILS, &key) {
         print_profile(profile);
         return 0;
@@ -7160,7 +7174,7 @@ fn print_parameter(original: &str) -> i32 {
     110
 }
 
-fn normalize_parameter(name: &str) -> (String, String) {
+pub(crate) fn normalize_parameter(name: &str) -> (String, String) {
     let name = name.strip_prefix(':').unwrap_or(name);
     let normalized = name
         .chars()
@@ -7185,8 +7199,28 @@ fn lookup(entries: &[(&str, u16)], name: &str) -> Option<u16> {
 }
 
 fn print_profile(profile: u16) {
+    let mut power_printed = false;
     for line in OUTPUT_PROFILES[profile as usize] {
-        safe_println!("{}", OUTPUT_LINES[*line as usize]);
+        let line = OUTPUT_LINES[*line as usize];
+        safe_println!("{}", line);
+        if matches!(profile, ALL_PARAMETERS | ALL_PARAMETER_DESCRIPTIONS)
+            && line.starts_with("[module] rewriter,")
+        {
+            safe_println!(
+                "{}",
+                if profile == ALL_PARAMETERS {
+                    POWER_PARAMETER_BRIEF
+                } else {
+                    POWER_PARAMETER
+                }
+            );
+            power_printed = true;
+        }
+    }
+    if !power_printed && lookup(MODULE_TEXT, "rewriter") == Some(profile) {
+        safe_println!("{}", POWER_PARAMETER);
+    } else if lookup(MODULE_MARKDOWN, "rewriter") == Some(profile) {
+        safe_println!("max_power_expansion | unsigned int | maximum exponent for expanding sequence repetitions | 2");
     }
 }
 
@@ -7300,7 +7334,8 @@ pub(crate) fn legal_module_parameter_lines(
     Some(
         OUTPUT_PROFILES[profile as usize]
             .iter()
-            .map(|index| OUTPUT_LINES[*index as usize]),
+            .map(|index| OUTPUT_LINES[*index as usize])
+            .chain((module == "rewriter").then_some(POWER_PARAMETER)),
     )
 }
 

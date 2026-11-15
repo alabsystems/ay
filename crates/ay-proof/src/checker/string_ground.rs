@@ -47,8 +47,6 @@
 //! so the only way such an application can exist is a user declaration. They
 //! are gone. The genuine SMT-LIB 2.5 dotted aliases this evaluator still
 //! accepts (`str.to.int`, `str.to.re`, `str.in.re`) ARE reserved, so they stay.
-//! `checker/name_authority_tests.rs` re-derives this condition mechanically
-//! from these sources at test time and fails on any new unowned spelling.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet};
 use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId, TermStore};
@@ -799,24 +797,24 @@ impl<'a> GroundEval<'a> {
                 // `eval_str_to_code` returns `-1` — a silent semantic split on
                 // the certification path.) Same policy as `str.from_code`
                 // below, which already fails closed on an unrepresentable code
-                // point.
-                if s[0] as u32 > 0x0002_FFFF {
+                // point. A surrogate is in the alphabet and is stored in its
+                // carrier `char`, which `smtlib_code_point` reads back.
+                let code = ay_core::smtlib_code_point(s[0]);
+                if code > ay_core::SMTLIB_MAX_CODE_POINT {
                     return None;
                 }
-                Some(Val::Int(BigInt::from(s[0] as u32)))
+                Some(Val::Int(BigInt::from(code)))
             }
             ("str.from_code", 1) => {
                 let n = self.eval_int(args[0])?;
                 let Some(n) = n.to_u32() else {
                     return Some(Val::Str(Vec::new()));
                 };
-                if n > 0x0002_FFFF {
+                // Every code point of the alphabet is a character, the
+                // surrogates included (stored in their carriers).
+                let Some(c) = ay_core::smtlib_char(n) else {
                     return Some(Val::Str(Vec::new()));
-                }
-                // A code point inside the SMT-LIB alphabet that Rust cannot
-                // represent as a `char` (surrogate range) is not something this
-                // evaluator will guess about.
-                let c = char::from_u32(n)?;
+                };
                 self.reserve_string_chars(1)?;
                 Some(Val::Str(vec![c]))
             }
@@ -952,12 +950,14 @@ impl<'a> GroundEval<'a> {
                 let lo = self.eval_string(args[0])?;
                 let hi = self.eval_string(args[1])?;
                 // `(re.range lo hi)` denotes the EMPTY language whenever an
-                // endpoint is not a single character, or `lo > hi`.
-                if lo.len() != 1 || hi.len() != 1 || lo[0] > hi[0] || j != i + 1 {
+                // endpoint is not a single character, or `lo > hi` — by code
+                // point, which `char` order is not for a surrogate carrier.
+                if lo.len() != 1 || hi.len() != 1 || j != i + 1 {
                     return Some(false);
                 }
-                let c = self.subject[i];
-                Some(lo[0] <= c && c <= hi[0])
+                let code = ay_core::smtlib_code_point;
+                let (lo, hi, c) = (code(lo[0]), code(hi[0]), code(self.subject[i]));
+                Some(lo <= c && c <= hi)
             }
             ("str.to_re" | "str.to.re", 1) => {
                 let t = self.eval_string(args[0])?;
@@ -1146,10 +1146,12 @@ impl<'a> GroundEval<'a> {
 
 /// SMT-LIB `str.<`: lexicographic order on code points, with the proper prefix
 /// ordering strictly below its extensions.
+/// `str.<`: lexicographic by SMT-LIB code point (a surrogate's carrier `char`
+/// sorts above U+2FFFF, so `char` order is not code-point order).
 fn lex_lt(a: &[char], b: &[char]) -> bool {
     for (x, y) in a.iter().zip(b.iter()) {
         if x != y {
-            return x < y;
+            return ay_core::smtlib_code_point(*x) < ay_core::smtlib_code_point(*y);
         }
     }
     a.len() < b.len()

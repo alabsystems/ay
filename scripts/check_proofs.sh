@@ -31,14 +31,39 @@
 #     holes are visible and countable, and nobody is lied to. Emit `hole`, never
 #     an invented rule name and never `trust`.
 #   * `valid`  is the only thing that counts as a pass.
+#   * `misjudged` is a HARD FAILURE too: pinned carcara answered, but the pair
+#     rests on an `evaluate` step it computes wrongly or a binder it misreads
+#     (`ay check carcara-guard`, the scan every Rust gate applies:
+#     ay_core::pinned_carcara). Its verdict -- `valid` included -- is not
+#     evidence there: it answers `valid` for such refutations of SATISFIABLE
+#     problems.
 #
 # Run this before claiming AY "produces proofs" for any logic.
 #
-# NOTE ON `--rigor standard`: since 2026-09-06 a plain `ay FILE.smt2` has z3's
-# posture and writes NO proof; the Alethe certificate is opt-in. This script
-# therefore runs AY at `--rigor standard`, which is the configuration that
-# writes <input>.smt2.alethe. It also deliberately avoids --z3-mode (and
-# --competition / --no-proof), each of which sheds the proof cycle outright.
+# NOTE ON `--z3-mode`: AY's default-on proof emission is SUPPRESSED by
+# --z3-mode (and by --competition / --no-proof / --rigor fast). Those postures
+# therefore write no proof at all. This script deliberately runs AY with NO
+# posture flag, which is the configuration that writes <input>.smt2.alethe.
+#
+# NOTE ON THE DIALECT: AY runs with `--alethe-dialect pinned-carcara`, which is
+# not a posture flag (it still writes the proof): it spells the document for
+# the checker this script runs, PINNED carcara. AY's default dialect is
+# Clean's vendored Carcara (external-codegen's checker), and two of its differences
+# are not ones pinned carcara can read:
+#   * `dt_project`, Clean's rule for a datatype selector over a constructor
+#     (`(= (fst (mk a b)) a)`). Pinned carcara has no datatype rule, answers
+#     "unknown rule", and rejects the whole document -- exactly the
+#     invented-rule `invalid` above, though Clean checks it. Measured on
+#     `(assert (not (= (fst (mk a b)) a)))`: the default dialect's document is
+#     `invalid ... rule 'dt_project': unknown rule`, RESULT: FAIL; the pinned
+#     dialect prints the step as `hole` and the document is `holey`.
+#   * the sign-filled `bitblast_ashr` layer (also `invalid` here by default).
+# The pinned dialect prints the pinned spelling wherever one exists and the
+# honest `hole` where none does, so `invalid` keeps meaning "not a proof".
+# A spelling with no pinned form at all (some `zero_extend` and divider steps)
+# still prints Clean's, which AY discloses as `carcara_surface=clean-dialect`
+# on its certificate line; this script does not read that line, and still
+# counts such a document `invalid`.
 #
 # CORPUS HYGIENE: AY writes the proof next to its INPUT. To avoid littering the
 # benchmark tree, this script never hands AY the real file — it hands AY a
@@ -87,7 +112,8 @@
 #
 # EXIT CODES
 #   0  no invalid proofs (holey and missing proofs may still be reported)
-#   1  at least one INVALID proof, or a wrong answer, or --require-proof unmet
+#   1  at least one INVALID or MISJUDGED proof, or a wrong answer, or
+#      --require-proof unmet
 #   2  usage / environment error (no AY, no carcara, no instances)
 #   3  MEASUREMENT GUARD tripped -- the run is not evidence either way:
 #      zero proofs reached the checker, or too many instances produced no
@@ -174,7 +200,8 @@ esac
 # ---- locate the tools -------------------------------------------------------
 [ -n "$AY" ] || AY="$REPO_ROOT/target/release/ay"
 [ -x "$AY" ] || die "AY binary not found/executable: $AY
-  build it with:  cargo build --release -p ay --features cli
+  build it with:  targo --unverified build --release -p ay --features cli
+  (without the Trust toolchain: cargo build --release -p ay --features cli)
   (WITHOUT --features cli only the library builds and target/release/ay stays STALE)"
 
 if [ -z "$CARCARA" ]; then
@@ -185,6 +212,9 @@ fi
 
 # `ay` must really be the CLI build, not a stale library-only artifact.
 "$AY" --version >/dev/null 2>&1 || die "'$AY --version' failed; is this a real CLI build?"
+# ... and must carry the pinned-Carcara guard every verdict below goes through.
+"$AY" check carcara-guard --help >/dev/null 2>&1 \
+  || die "'$AY check carcara-guard' is missing; rebuild ay (a carcara verdict without the guard is not evidence)"
 
 AY_STAMP="$("$AY" --version 2>/dev/null | head -1)"
 CARCARA_STAMP="$("$CARCARA" --version 2>/dev/null | head -1)"
@@ -330,6 +360,24 @@ carcara_check() { # $1 = proof, $2 = problem
     CC_REASON="(no [ERROR] on stderr; warnings only)"
   fi
 
+  # PINNED-CARCARA GUARD. On a pair pinned carcara misjudges (an `evaluate`
+  # step it computes wrongly, an `aci_simp` step dropping a repeat of a
+  # non-idempotent operator, a binder it misreads through a `:named` label or
+  # `define-fun`) its verdict says nothing in either direction: it answers
+  # `valid` for such refutations of SATISFIABLE problems. `ay check
+  # carcara-guard` is the scan every Rust gate applies; a refused pair is
+  # `misjudged`, a hard failure, whatever carcara said (fixture c10).
+  case "$CC_VERDICT" in
+    valid|holey|invalid)
+      local guard_out
+      if ! guard_out="$("$AY" check carcara-guard "$1" "$2" 2>&1)"; then
+        CC_VERDICT="misjudged"
+        CC_REASON="$(printf '%s\n' "$guard_out" | grep -m1 -E '^(misjudged-evaluate|misread-binder|misjudged-aci-simp):' | tr '\t' ' ' | cut -c1-200)"
+        [ -n "$CC_REASON" ] || CC_REASON="$(printf '%s\n' "$guard_out" | grep -m1 . | tr '\t' ' ' | cut -c1-200)"
+        CC_REASON="pinned-carcara-guard refused: $CC_REASON"
+      fi ;;
+  esac
+
   if [ -z "$CC_VERDICT" ]; then
     if [ "$rc" -ge 128 ]; then
       CC_VERDICT="checker-timeout"
@@ -343,6 +391,7 @@ carcara_check() { # $1 = proof, $2 = problem
 
 # ---- counters ---------------------------------------------------------------
 N_VALID=0; N_HOLEY=0; N_INVALID=0; N_NOPROOF=0; N_NOTUNSAT=0; N_CCERR=0; N_WRONG=0
+N_MISJUDGED=0
 N_NOANSWER=0
 
 # machine-readable per-instance record, so callers (and the harness self-test)
@@ -417,10 +466,11 @@ while IFS= read -r src; do
   sib_pre=0; [ -e "$sibling" ] && sib_pre=1
 
   t0=$(date +%s)
-  # --rigor standard is what REQUESTS the certificate: since 2026-09-06 a plain
-  # `ay FILE.smt2` has z3's posture (no proof recorded, none minted, nothing
-  # written next to the input), so without this the script would check nothing.
-  ay_out="$("$AY" --rigor standard -T:"$AY_TIMEOUT" "$cell/$base" 2>&1)"
+  # No posture flag: the plain default records the proof, mints the certificate
+  # and writes the sidecar this script then checks. --z3-mode / --no-proof /
+  # --rigor fast would shed all of it and leave nothing to check. The dialect
+  # is the checker's own (see NOTE ON THE DIALECT).
+  ay_out="$("$AY" --alethe-dialect pinned-carcara -T:"$AY_TIMEOUT" "$cell/$base" 2>&1)"
   t1=$(date +%s)
   secs=$((t1 - t0))
 
@@ -460,6 +510,8 @@ while IFS= read -r src; do
                printf '%s\t%s hole step(s)\n' "$base" "$nh" >> "$HOLEY_LIST" ;;
       invalid) N_INVALID=$((N_INVALID + 1))
                printf '%s\t%s\n' "$base" "$CC_REASON" >> "$INVALID_LIST" ;;
+      misjudged) N_MISJUDGED=$((N_MISJUDGED + 1))
+               printf '%s\t%s\n' "$base" "$CC_REASON" >> "$INVALID_LIST" ;;
       *)       N_CCERR=$((N_CCERR + 1))
                printf '%s\t%s: %s\n' "$base" "$CC_VERDICT" "$CC_REASON" >> "$OTHER_LIST" ;;
     esac
@@ -474,11 +526,12 @@ while IFS= read -r src; do
 done < "$LIST"
 
 # ---- report -----------------------------------------------------------------
-CHECKED=$((N_VALID + N_HOLEY + N_INVALID + N_CCERR))
+CHECKED=$((N_VALID + N_HOLEY + N_INVALID + N_MISJUDGED + N_CCERR))
 printf -- '----------------------------------------------------------------\n'
 printf '  %-16s %5d   %s\n' "valid"      "$N_VALID"    "PASS - fully checked by carcara"
 printf '  %-16s %5d   %s\n' "holey"      "$N_HOLEY"    "WARN - structure ok, some steps are 'hole'"
 printf '  %-16s %5d   %s\n' "invalid"    "$N_INVALID"  "FAIL - not a proof (unknown rule / unparseable)"
+[ "$N_MISJUDGED" -gt 0 ] && printf '  %-16s %5d   %s\n' "misjudged" "$N_MISJUDGED" "FAIL - carcara's verdict is not evidence (ay check carcara-guard)"
 [ "$N_CCERR"    -gt 0 ] && printf '  %-16s %5d   %s\n' "checker-error" "$N_CCERR"   "FAIL - carcara produced no verdict"
 [ "$N_NOPROOF"  -gt 0 ] && printf '  %-16s %5d   %s\n' "no-proof"      "$N_NOPROOF" "$([ "$REQUIRE_PROOF" -eq 1 ] && echo 'FAIL - unsat with no certificate' || echo 'note - unsat but no certificate written')"
 [ "$N_NOTUNSAT" -gt 0 ] && printf '  %-16s %5d   %s\n' "not-unsat"     "$N_NOTUNSAT" "skip - unknown/timeout, no proof expected"
@@ -509,6 +562,7 @@ fi
 
 RC=0
 [ "$N_INVALID" -gt 0 ] && RC=1
+[ "$N_MISJUDGED" -gt 0 ] && RC=1
 [ "$N_CCERR"   -gt 0 ] && RC=1
 [ "$N_WRONG"   -gt 0 ] && RC=1
 [ "$REQUIRE_PROOF" -eq 1 ] && [ "$N_NOPROOF" -gt 0 ] && RC=1

@@ -46,6 +46,11 @@ pub(crate) use bv_state::IncrementalBvState;
 mod fp_state;
 pub(crate) use fp_state::{FpIncrementalAdmission, IncrementalFpState};
 
+mod dead_atoms;
+pub(crate) use dead_atoms::{DeadAtomFilter, DeadAtomStats};
+
+mod window_fork;
+
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, TermData, TermId, TermStore, TseitinState};
 use ay_sat::Solver as SatSolver;
@@ -232,6 +237,8 @@ pub(crate) struct IncrementalTheoryState {
     /// last check-sat and union the discovered Bool args into the persisted
     /// set. See [`BoolUfArgCache`].
     pub(crate) bool_uf_arg_cache: BoolUfArgCache,
+    /// #inc-dead-atoms counters for the session-persistent lanes.
+    pub(crate) dead_atom_stats: DeadAtomStats,
 }
 
 /// Incremental cache for the Bool-UF-arg scan in
@@ -300,6 +307,7 @@ impl BoolUfArgCache {
 }
 
 /// Cached bound-axiom generation results for one active-atom set (#8857).
+#[derive(Clone)]
 pub(crate) struct BoundAxiomCache {
     /// Hash of the sorted active-atom TermId indices.
     pub(crate) atom_set_key: u64,
@@ -370,6 +378,7 @@ impl IncrementalTheoryState {
             scratch_var_to_term: HashMap::default(),
             bound_axiom_cache: None,
             bool_uf_arg_cache: BoolUfArgCache::default(),
+            dead_atom_stats: DeadAtomStats::default(),
         }
     }
 
@@ -624,6 +633,7 @@ impl IncrementalSubsystem for IncrementalTheoryState {
         self.theory_check_secs = 0.0;
         self.bound_axiom_cache = None;
         self.bool_uf_arg_cache = BoolUfArgCache::default();
+        self.dead_atom_stats = DeadAtomStats::default();
     }
 }
 
@@ -816,5 +826,20 @@ pub(crate) fn collect_theory_stats_incremental(stats: &mut Statistics, ts: Incre
     stats.set_int("smt.props.euf", obs.props_euf);
     stats.set_int("smt.partial_clauses", obs.partial_clauses);
     stats.set_int("smt.replay_covered_by_calls", obs.replay_covered_by_calls);
+    // Process-wide totals across every executor invocation (the drained
+    // counters above are the last invocation's only).
+    {
+        use crate::combined_solvers::theory_stats as ts;
+        use std::sync::atomic::Ordering::Relaxed;
+        stats.set_int("smt.no_rounds_total", ts::NO_ROUNDS_TOTAL.load(Relaxed));
+        stats.set_int(
+            "smt.combiner_checks_total",
+            ts::COMBINER_CHECKS_TOTAL.load(Relaxed),
+        );
+        stats.set_int(
+            "smt.checks.arrays_total",
+            ts::CHECKS_ARRAYS_TOTAL.load(Relaxed),
+        );
+    }
     stats.debug_assert_consistency();
 }

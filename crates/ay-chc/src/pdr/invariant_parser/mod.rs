@@ -8,6 +8,7 @@
 //! `parse_expr`.
 
 mod parse_expr;
+mod radix_literal;
 
 use crate::error::ChcError;
 use crate::{
@@ -15,7 +16,6 @@ use crate::{
     PredicateId,
 };
 use ay_core::kani_compat::DetHashMap as FxHashMap;
-use std::sync::Arc;
 
 use super::model::{InvariantModel, PredicateInterpretation};
 
@@ -460,7 +460,7 @@ fn build_datatype_sort(
     stack.pop();
     Some(ChcSort::Datatype {
         name: name.to_string(),
-        constructors: Arc::new(constructors),
+        constructors: crate::ChcDtConstructors::new(constructors),
     })
 }
 
@@ -598,6 +598,9 @@ fn validate_qf_expression_inner(
     function_sigs: &FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
 ) -> ChcResult<ChcSort> {
     match expression {
+        ChcExpr::ArrayLambda(_) => Err(ChcError::Parse(
+            "array lambdas are unsupported in this invariant format".into(),
+        )),
         ChcExpr::Bool(_) => Ok(ChcSort::Bool),
         ChcExpr::Int(_) => Ok(ChcSort::Int),
         ChcExpr::Real(_, _) => Ok(ChcSort::Real),

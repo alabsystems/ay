@@ -396,10 +396,13 @@ fn test_cong_bridges_equal_indexed_and_binary_bitvector_literals_with_refl() {
 
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(left, "(bv_lit_cong_f bv_lit_cong_x (_ bv0 32))".to_string());
+    // The problem applies `bv_lit_cong_f` as well as declaring it: the
+    // exporter resolves the proof's function symbols against the problem's
+    // applications (`application_heads.rs`).
     let output = try_export_alethe_with_problem_scope_and_overrides(
         &proof,
         &terms,
-        &[premise_equality],
+        &[premise_equality, conclusion],
         Some(&overrides),
     )
     .expect("equal indexed/binary BV literals must preserve congruence");
@@ -412,31 +415,40 @@ fn test_cong_bridges_equal_indexed_and_binary_bitvector_literals_with_refl() {
     );
 }
 
-fn assert_addition_permutation_declines(
+/// An addition permutation below a congruence is bridged by `poly_simp`,
+/// which pinned Carcara re-derives with its own polynomial normalization
+/// (MEASURED on carcara 1.1.0, git 9a352ee: `(= (+ b a) (+ a b))` and
+/// `(= (+ c b a) (+ a b c))` with the `cong` over them check `valid` for Int
+/// and Real); the judge `printed_poly_simp_holds` is that normalization.
+/// Before `poly_simp` was tried here the step was declined.
+fn assert_addition_permutation_is_poly_simp(
     terms: &TermStore,
     proof: &Proof,
     left: TermId,
     surface: &str,
+    bridge: &str,
 ) {
     use ay_core::kani_compat::DetHashMap;
 
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(left, surface.to_string());
-    let error = try_export_alethe_with_problem_scope_and_overrides(
+    let output = try_export_alethe_with_problem_scope_and_overrides(
         proof,
         terms,
         &scope_covering_proof(proof),
         Some(&overrides),
     )
-    .expect_err("addition permutation is outside the multiplication-only bridge");
+    .expect("an addition permutation is a poly_simp identity");
     assert!(
-        matches!(error, AlethePrintError::InvalidCongruenceStep { .. }),
-        "{error}"
+        output.contains(&format!("(cl {bridge}) :rule poly_simp)"))
+            && output.contains(":rule cong")
+            && !output.contains(":rule hole"),
+        "{output}"
     );
 }
 
 #[test]
-fn test_cong_bridge_rejects_binary_int_addition_permutation() {
+fn test_cong_bridge_proves_binary_int_addition_permutation_by_poly_simp() {
     use ay_core::Symbol;
 
     let mut terms = TermStore::new();
@@ -458,11 +470,17 @@ fn test_cong_bridge_rejects_binary_int_addition_permutation() {
         Vec::new(),
     );
 
-    assert_addition_permutation_declines(&terms, &proof, left, "(f (+ b a) s)");
+    assert_addition_permutation_is_poly_simp(
+        &terms,
+        &proof,
+        left,
+        "(f (+ b a) s)",
+        "(= (+ b a) (+ a b))",
+    );
 }
 
 #[test]
-fn test_cong_bridge_rejects_binary_real_addition_permutation() {
+fn test_cong_bridge_proves_binary_real_addition_permutation_by_poly_simp() {
     use ay_core::Symbol;
 
     let mut terms = TermStore::new();
@@ -484,11 +502,17 @@ fn test_cong_bridge_rejects_binary_real_addition_permutation() {
         Vec::new(),
     );
 
-    assert_addition_permutation_declines(&terms, &proof, left, "(f (+ b a) s)");
+    assert_addition_permutation_is_poly_simp(
+        &terms,
+        &proof,
+        left,
+        "(f (+ b a) s)",
+        "(= (+ b a) (+ a b))",
+    );
 }
 
 #[test]
-fn test_cong_bridge_rejects_nary_addition_permutation() {
+fn test_cong_bridge_proves_nary_addition_permutation_by_poly_simp() {
     use ay_core::Symbol;
 
     let mut terms = TermStore::new();
@@ -511,7 +535,13 @@ fn test_cong_bridge_rejects_nary_addition_permutation() {
         Vec::new(),
     );
 
-    assert_addition_permutation_declines(&terms, &proof, left, "(f (+ c b a) s)");
+    assert_addition_permutation_is_poly_simp(
+        &terms,
+        &proof,
+        left,
+        "(f (+ c b a) s)",
+        "(= (+ c b a) (+ a b c))",
+    );
 }
 
 #[test]

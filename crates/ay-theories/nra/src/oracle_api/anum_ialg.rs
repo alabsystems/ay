@@ -335,7 +335,8 @@ impl OIAlgSet {
     /// infinite endpoint is marked closed, or when a ceiling is exceeded.
     #[must_use]
     pub fn from_parts(parts: &[OIAlgInterval]) -> Option<Self> {
-        let mut ivs = Vec::with_capacity(parts.len());
+        let mut ivs = Vec::new();
+        ivs.try_reserve_exact(parts.len()).ok()?;
         for p in parts {
             let lo = match &p.lo {
                 Some(a) => ialg::AEnd::Fin(a.0.clone()),

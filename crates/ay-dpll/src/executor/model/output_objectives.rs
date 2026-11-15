@@ -19,14 +19,33 @@ impl Executor {
         // is no longer in `ctx.objectives()`. Report the minimized total
         // violated weight recorded by the MaxSMT solve.
         if self.ctx.objectives().is_empty() {
-            if let Some(cost) = self.last_soft_cost {
-                // `:approximate` marks a feasible-but-unproven bound
-                // (resource-limited or weight-incomplete search); consumers
-                // must not treat it as the optimum.
-                if !self.last_soft_cost_optimal {
-                    return format!("(objectives\n (__ay_soft_cost {cost} :approximate)\n)\n");
+            // Grouped softs (Z3 `:id`): one line per group in first-appearance
+            // order, `(id violated-weight)`; the anonymous group renders with
+            // an empty name, exactly as Z3 prints it.
+            if let Some(groups) = &self.last_soft_group_costs {
+                let mut out = String::from("(objectives\n");
+                for group in groups {
+                    out.push_str(&self.soft_group_objective_line(group));
                 }
-                return format!("(objectives\n (__ay_soft_cost {cost})\n)\n");
+                out.push_str(")\n");
+                return out;
+            }
+            if let Some(cost) = self.last_soft_cost {
+                // Defensive fallback: group costs are published together with
+                // the total, so this only renders if that invariant is ever
+                // broken. Same Z3 anonymous-group shape; `:approximate`
+                // marks a feasible-but-unproven bound (resource-limited or
+                // weight-incomplete search) that consumers must not treat as
+                // the optimum.
+                if !self.last_soft_cost_optimal {
+                    return format!("(objectives\n ( {cost} :approximate)\n)\n");
+                }
+                return format!("(objectives\n ( {cost})\n)\n");
+            }
+            // Joint Pareto terminal-`unsat`: the last emitted point is
+            // still reported (see the shared helper below).
+            if let Some(rendered) = self.joint_pareto_last_point_objectives() {
+                return rendered;
             }
             // z3 parity: with no objectives and no soft cost, `(get-objectives)`
             // prints an empty objectives list (exit 0), even before any
@@ -43,7 +62,7 @@ impl Executor {
             if let Some(state) = &self.pareto_state {
                 if let Some(point) = &state.last_point {
                     let objs = self.ctx.objectives();
-                    if objs.len() == point.len() {
+                    if objs.len() == point.len() && self.ctx.soft_constraints().is_empty() {
                         let mut out = String::from("(objectives\n");
                         for (obj, val) in objs.iter().zip(point.iter()) {
                             let term_str = self.format_term(obj.term);
@@ -58,6 +77,12 @@ impl Executor {
                         out.push_str(")\n");
                         return out;
                     }
+                    // Joint Pareto: the point is in unified declaration
+                    // order (arithmetic values interleaved with soft-group
+                    // costs), one coordinate per sequence step.
+                    if let Some(rendered) = self.joint_pareto_last_point_objectives() {
+                        return rendered;
+                    }
                 }
             }
         }
@@ -66,8 +91,113 @@ impl Executor {
             return "(error \"objectives are not available\")".to_string();
         }
 
+        // Joint arithmetic + soft optimization: render ONE list in unified
+        // declaration order, interleaving arithmetic objective lines with
+        // soft-group lines exactly as z3 does.
+        if let Some(groups) = &self.last_soft_group_costs {
+            let mut out = String::from("(objectives\n");
+            for step in self.ctx.objective_sequence() {
+                match step {
+                    ay_frontend::ObjectiveStep::Arithmetic(objective_index) => {
+                        let Some(obj) = self.ctx.objectives().get(*objective_index) else {
+                            return "(error \"objectives are not available\")".to_string();
+                        };
+                        match self.arithmetic_objective_line(*objective_index, obj) {
+                            Ok(line) => out.push_str(&line),
+                            Err(error) => return error,
+                        }
+                    }
+                    ay_frontend::ObjectiveStep::SoftGroup(id) => {
+                        let Some(group) = groups.iter().find(|group| &group.id == id) else {
+                            return "(error \"objectives are not available\")".to_string();
+                        };
+                        out.push_str(&self.soft_group_objective_line(group));
+                    }
+                }
+            }
+            out.push_str(")\n");
+            return out;
+        }
+
         let mut out = String::from("(objectives\n");
         for (objective_index, obj) in self.ctx.objectives().iter().enumerate() {
+            match self.arithmetic_objective_line(objective_index, obj) {
+                Ok(line) => out.push_str(&line),
+                Err(error) => return error,
+            }
+        }
+        out.push_str(")\n");
+        out
+    }
+
+    /// The joint Pareto terminal rendering: after front exhaustion
+    /// (`unsat`), `(get-objectives)` still reports the last emitted
+    /// point, whose coordinates are in unified declaration order
+    /// (arithmetic values interleaved with soft-group costs). Returns
+    /// `None` when no such point is on record.
+    fn joint_pareto_last_point_objectives(&self) -> Option<String> {
+        if !matches!(self.last_result, Some(SolveResult::Unsat(_)))
+            || self.ctx.soft_constraints().is_empty()
+        {
+            return None;
+        }
+        let point = self.pareto_state.as_ref()?.last_point.as_ref()?;
+        let sequence = self.ctx.objective_sequence();
+        if sequence.len() != point.len() {
+            return None;
+        }
+        let objs = self.ctx.objectives();
+        let mut out = String::from("(objectives\n");
+        for (step, val) in sequence.iter().zip(point.iter()) {
+            match step {
+                ay_frontend::ObjectiveStep::Arithmetic(index) => {
+                    let obj = objs.get(*index)?;
+                    let term_str = self.format_term(obj.term);
+                    let value_str = if matches!(self.ctx.terms.sort(obj.term), Sort::BitVec(_)) {
+                        val.numer().to_string()
+                    } else {
+                        self.format_objective_rational(val, obj.term)
+                    };
+                    out.push_str(&format!(" ({term_str} {value_str})\n"));
+                }
+                ay_frontend::ObjectiveStep::SoftGroup(id) => {
+                    let group = super::super::optimization::SoftGroupCost {
+                        id: id.clone(),
+                        cost: u64::try_from(val.to_integer()).ok()?,
+                        interval: false,
+                    };
+                    out.push_str(&self.soft_group_objective_line(&group));
+                }
+            }
+        }
+        out.push_str(")\n");
+        Some(out)
+    }
+
+    /// One soft group's `(get-objectives)` line in Z3's shape.
+    fn soft_group_objective_line(
+        &self,
+        group: &super::super::optimization::SoftGroupCost,
+    ) -> String {
+        let id = group.id.as_deref().unwrap_or("");
+        if group.interval {
+            // No attainable lex predecessor: z3 reports the cost range.
+            format!(" ({id}  (interval 0 {}))\n", group.cost)
+        } else if !self.last_soft_cost_optimal {
+            format!(" ({id} {} :approximate)\n", group.cost)
+        } else {
+            format!(" ({id} {})\n", group.cost)
+        }
+    }
+
+    /// One arithmetic objective's `(get-objectives)` line, or the error
+    /// string the whole command must return instead.
+    fn arithmetic_objective_line(
+        &self,
+        objective_index: usize,
+        obj: &ay_frontend::Objective,
+    ) -> std::result::Result<String, String> {
+        {
             if self.unavailable_objectives.contains(&objective_index) {
                 // A lex predecessor with no attainable optimum — unbounded
                 // (`oo`) or unattained (infinitesimal, #opt-epsilon) — leaves
@@ -75,9 +205,9 @@ impl Executor {
                 // predecessor and a demonstrably FALSE scalar for the suffix
                 // (measured 4.15.4: `(y (- 1))` where max y = 5); AY refuses
                 // to fabricate one. Documented deviation.
-                return format!(
+                return Err(format!(
                     "(error \"objective {objective_index} is unavailable after a lexicographic predecessor with no attainable optimum\")"
-                );
+                ));
             }
             let term_str = self.format_term(obj.term);
             // An objective with no finite optimum is reported as infinity per
@@ -115,16 +245,14 @@ impl Executor {
                             self.format_objective_rational(recorded, obj.term)
                         }
                     } else {
-                        return format!(
+                        return Err(format!(
                             "(error \"objective {objective_index} has no admitted optimization outcome\")"
-                        );
+                        ));
                     }
                 }
             };
-            out.push_str(&format!(" ({term_str} {value_str})\n"));
+            Ok(format!(" ({term_str} {value_str})\n"))
         }
-        out.push_str(")\n");
-        out
     }
 
     /// Format a recorded BOX objective optimum (a `BigRational`) exactly as

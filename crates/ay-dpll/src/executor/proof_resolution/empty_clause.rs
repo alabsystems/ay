@@ -642,8 +642,41 @@ pub(crate) fn try_derive_empty_via_equality_contradiction(
     false
 }
 
+/// How the last-resort closer closed the empty clause, if it closed it at all.
+///
+/// #evidence-stage-3. This closer is where a large share of AY's published
+/// refutations stop being derivations and start being restatements of the
+/// solver's own verdict, and until this enum existed it said so nowhere: the
+/// three trust-bearing outcomes and the two strict-checkable ones all returned
+/// `()`. The caller maps this onto a [`crate::executor::ProofDeclineMechanism`]
+/// so a corpus census can rank them. Nothing about the emitted steps changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrustClosure {
+    /// No leaf of any kind was collected; the proof is unchanged and this
+    /// closer did not close anything.
+    NoLeaves,
+    /// A derived leaf was the constant `false`, so Alethe's own `false` rule
+    /// plus one resolution closes it. Every step is strict-checkable and no
+    /// trust claim is made.
+    DerivedFalseLeaf,
+    /// The head was re-derived from the clause alone by one of the checker's
+    /// own payload-free recognizers. No trust claim is made.
+    ValidatedHead,
+    /// One `Generic` head over the proof's ASSUME-family leaves: the solve's
+    /// own UNSAT verdict about the recorded problem, restated. Honest, and
+    /// unproved.
+    AssumeFamilyTrustHead,
+    /// No assume-family leaf existed, the derived-leaf head found no
+    /// recognizer, and a premiseless empty-clause `trust` step was recorded
+    /// rather than a head that would be false in every model.
+    DerivedLeafTrustStep,
+}
+
 /// Derive the empty clause by adding a trust theory lemma and resolving.
-pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Proof) {
+pub(crate) fn derive_empty_via_trust_lemma(
+    terms: &mut TermStore,
+    proof: &mut Proof,
+) -> TrustClosure {
     let mut assumptions: Vec<(ProofId, TermId)> = proof
         .steps
         .iter()
@@ -681,7 +714,7 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
     }
 
     if assumptions.is_empty() {
-        return;
+        return TrustClosure::NoLeaves;
     }
 
     // #closer-derived-leaf-head, honest sub-case. A derived leaf whose clause
@@ -709,43 +742,40 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
                 premises: vec![tautology, false_id],
                 args: Vec::new(),
             });
-            return;
+            return TrustClosure::DerivedFalseLeaf;
         }
     }
 
     // #trust-lemma-dup-assume — the SAME term can be collected more than once
     // (the identical assertion asserted twice, or an `Assume` that a unit
     // `Trust` step restates). Every occurrence contributes ONE literal to
-    // `negated_clause`, but the `retain` below removes ALL copies of a literal
-    // at once, so the first resolution against a repeated term empties the
-    // literal and every LATER one resolves against a premise that has no
-    // complement left: `clause == premises[0]`'s clause, premise 2 unused.
+    // `negated_clause`, but the first leaf that resolves against a repeated
+    // term eliminates ALL copies of its literal, so every LATER occurrence
+    // resolves against a clause that has no complement left.
     //
     // That is not a resolution, and the strict checker correctly rejects it
     // ("invalid th_resolution derivation"). Measured on `ay-chc --lib`: 6178
-    // such no-op steps, all from this loop, and they were the single largest
-    // source of `deferred-trust discharge rejected a NON-trust step`.
+    // such no-op steps, all from this closer (then a binary chain), and they
+    // were the single largest source of `deferred-trust discharge rejected a
+    // NON-trust step`.
     //
     // Distinct terms have distinct negations (`mk_not_raw` is injective, and
     // `(not x)` maps to `x` while `x` maps to `(not x)`), so deduplicating by
-    // term makes every literal in `negated_clause` unique and every step below
-    // an exact binary resolution.
+    // term makes every literal in `negated_clause` unique and every leaf of
+    // the resolution below eliminate exactly one of them.
     {
         let mut seen_terms: HashMap<TermId, ()> = HashMap::default();
         assumptions.retain(|&(_, term)| seen_terms.insert(term, ()).is_none());
     }
 
-    let mut negation_map: HashMap<TermId, TermId> = HashMap::default();
     let negated_clause: Vec<TermId> = assumptions
         .iter()
         .map(|&(_, term)| {
-            let neg = if let TermData::Not(inner) = terms.get(term) {
+            if let TermData::Not(inner) = terms.get(term) {
                 *inner
             } else {
                 terms.mk_not_raw(term)
-            };
-            negation_map.insert(term, neg);
-            neg
+            }
         })
         .collect();
 
@@ -770,7 +800,7 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
     // empty trust clause is an independent re-decision of the AUTHORED
     // assertions (`api::proofs::discharge_trust_clause`'s empty-clause arm, or
     // the whole-problem re-solve at step (4) of the certification funnel).
-    let lemma_id = if anchored_on_derived_lemmas {
+    let (lemma_id, closure) = if anchored_on_derived_lemmas {
         let Some(validated) = trust_closer::add_validated_head(terms, proof, &negated_clause)
         else {
             // No authority for a head over these leaves. Record the HONEST
@@ -784,30 +814,45 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
             // on this proof's say-so, and no refutable clause enters the
             // artifact.
             proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-            return;
+            return TrustClosure::DerivedLeafTrustStep;
         };
-        validated
+        (validated, TrustClosure::ValidatedHead)
     } else {
-        trust_closer::add_head(terms, proof, &negated_clause)
+        let (id, validated) = trust_closer::add_head(terms, proof, &negated_clause);
+        (
+            id,
+            if validated {
+                TrustClosure::ValidatedHead
+            } else {
+                TrustClosure::AssumeFamilyTrustHead
+            },
+        )
     };
 
-    let mut current_clause = negated_clause;
-    let mut current_id = lemma_id;
-
-    for (assume_id, assume_term) in &assumptions {
-        let neg_term = negation_map[assume_term];
-        current_clause.retain(|&t| t != neg_term);
-
-        current_id = proof.add_step(ProofStep::Step {
-            rule: AletheRule::ThResolution,
-            clause: current_clause.clone(),
-            premises: vec![current_id, *assume_id],
-            args: vec![],
-        });
-    }
-
-    debug_assert!(
-        current_clause.is_empty(),
-        "trust-lemma th_resolution chain did not derive empty clause"
-    );
+    // ONE n-ary `th_resolution` from the head and every leaf to the empty
+    // clause (#parity-memout).
+    //
+    // This was a chain of BINARY steps, one per leaf, each restating every
+    // head literal not yet resolved away: N leaves cost N(N-1)/2 literals.
+    // QF_IDL `parity__13.400.graph` is one authored `and` of 36,440 conjuncts,
+    // so the chain held ~663M `TermId`s (2.65 GB), and once 9d7a44eb31
+    // admitted that root to proof reconstruction the default-posture solve
+    // peaked at 3.0-3.3 GB — twice, in the solve and again in the
+    // reconfirmation re-solve — and ended `unknown (memout)` (measured
+    // 2026-09-30). The n-ary form is the same derivation: same premises, same
+    // conclusion, O(N). Every leaf is a unit (an `assume`, a unit `trust`, or
+    // a unit theory lemma) whose negation is exactly one literal of the
+    // deduplicated head, which is the shape the strict checker's n-ary rule
+    // (`validate_chain_resolution_rule`) decides by set subtraction; a single
+    // leaf keeps the binary step it always was.
+    let mut premises = Vec::with_capacity(assumptions.len() + 1);
+    premises.push(lemma_id);
+    premises.extend(assumptions.iter().map(|&(assume_id, _)| assume_id));
+    proof.add_step(ProofStep::Step {
+        rule: AletheRule::ThResolution,
+        clause: Vec::new(),
+        premises,
+        args: Vec::new(),
+    });
+    closure
 }

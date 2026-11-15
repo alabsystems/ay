@@ -150,16 +150,11 @@ fn short_v_alias_routes_to_version_output() {
     );
 }
 
-#[test]
-#[timeout(30_000)]
-fn solve_session_emits_matching_start_and_end_build_stamp() {
-    let version_output = ay_command()
-        .arg("--version")
-        .output()
-        .expect("spawn ay --version");
-    let version_stdout = String::from_utf8_lossy(&version_output.stdout);
-    let version_fields = parse_build_fields(&version_stdout);
-
+/// Solve a trivial SAT problem under an explicit `AY_SESSION_LOG` level and
+/// return the parsed start and end session markers plus the raw stderr.
+fn solve_session_markers(
+    session_log: &str,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>, String) {
     let input = r#"(set-logic QF_LIA)
 (declare-const x Int)
 (assert (= x 42))
@@ -167,13 +162,16 @@ fn solve_session_emits_matching_start_and_end_build_stamp() {
 "#;
     let (temp_path, _cleanup) = write_temp_file(input, "smt2");
 
+    // An explicit level wins over any ambient competition signal, which would
+    // otherwise force `full`.
     let output = ay_command()
+        .env("AY_SESSION_LOG", session_log)
         .arg(&temp_path)
         .output()
         .expect("spawn ay solve session");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     assert!(
         output.status.success(),
@@ -193,45 +191,12 @@ fn solve_session_emits_matching_start_and_end_build_stamp() {
         .lines()
         .find(|line| line.starts_with("c ay.session.end "))
         .expect("missing session end marker");
-
     let start_fields = parse_marker_fields(start_line);
     let end_fields = parse_marker_fields(end_line);
+    (start_fields, end_fields, stderr)
+}
 
-    assert_eq!(
-        start_fields.get("build.version").map(String::as_str),
-        Some(version_fields["build.version"].as_str()),
-        "session start marker should report the same build.version as --version"
-    );
-    assert_eq!(
-        start_fields.get("build.increment").map(String::as_str),
-        Some(version_fields["build.increment"].as_str()),
-        "session start marker should report the same build.increment as --version"
-    );
-    assert_eq!(
-        start_fields.get("build.commit").map(String::as_str),
-        Some(version_fields["build.commit"].as_str()),
-        "session start marker should report the same build.commit as --version"
-    );
-    assert_eq!(
-        end_fields.get("build.increment").map(String::as_str),
-        Some(version_fields["build.increment"].as_str()),
-        "session end marker should report the same build.increment as --version"
-    );
-    assert_eq!(
-        start_fields.get("build.datetime_utc").map(String::as_str),
-        Some(version_fields["build.datetime_utc"].as_str()),
-        "session start marker should report the same build.datetime_utc as --version"
-    );
-    assert_eq!(
-        start_fields.get("build.stamp").map(String::as_str),
-        Some(version_fields["build.stamp"].as_str()),
-        "session start marker should report the same build.stamp as --version"
-    );
-    assert_eq!(
-        end_fields.get("build.stamp").map(String::as_str),
-        Some(version_fields["build.stamp"].as_str()),
-        "session end marker should report the same build.stamp as --version"
-    );
+fn assert_end_marker_outcome(end_fields: &BTreeMap<String, String>, stderr: &str) {
     assert_eq!(
         end_fields.get("exit.code").map(String::as_str),
         Some("0"),
@@ -243,6 +208,83 @@ fn solve_session_emits_matching_start_and_end_build_stamp() {
             .is_some_and(|value| value.parse::<u128>().is_ok()),
         "session end marker should include numeric wall_time_ms: {stderr}"
     );
+}
+
+/// The session markers name the same build `--version` does (#8870).
+///
+/// Meridian PR1 (58f2aaa13) made the default markers compact: the start marker
+/// states only `build.stamp=` — which concatenates version, increment, commit
+/// and datetime, so nothing is lost — and the end marker keeps the
+/// `build.increment=` harness logs correlate by. `AY_SESSION_LOG=full` restores
+/// every field on both markers for audit transcripts. Both forms must agree
+/// with `--version`.
+#[test]
+#[timeout(30_000)]
+fn solve_session_emits_matching_start_and_end_build_stamp() {
+    let version_output = ay_command()
+        .arg("--version")
+        .output()
+        .expect("spawn ay --version");
+    let version_stdout = String::from_utf8_lossy(&version_output.stdout);
+    let version_fields = parse_build_fields(&version_stdout);
+
+    // Compact (default): the stamp once, on start; the increment on end.
+    let (start_fields, end_fields, stderr) = solve_session_markers("compact");
+    assert_eq!(
+        start_fields.get("build.stamp").map(String::as_str),
+        Some(version_fields["build.stamp"].as_str()),
+        "session start marker should report the same build.stamp as --version: {stderr}"
+    );
+    for key in [
+        "build.version",
+        "build.increment",
+        "build.commit",
+        "build.datetime_utc",
+    ] {
+        assert!(
+            version_fields["build.stamp"].contains(version_fields[key].as_str()),
+            "the compact start marker drops {key}, so the stamp must carry it: {version_stdout}"
+        );
+        assert!(
+            !start_fields.contains_key(key),
+            "the compact start marker should state the build once, as build.stamp only: {stderr}"
+        );
+    }
+    assert_eq!(
+        end_fields.get("build.increment").map(String::as_str),
+        Some(version_fields["build.increment"].as_str()),
+        "session end marker should report the same build.increment as --version: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("build.stamp=").count(),
+        1,
+        "a compact session should state the build stamp exactly once: {stderr}"
+    );
+    assert_end_marker_outcome(&end_fields, &stderr);
+
+    // Full (audit): every build field on start, increment and stamp on end.
+    let (start_fields, end_fields, stderr) = solve_session_markers("full");
+    for key in [
+        "build.version",
+        "build.increment",
+        "build.commit",
+        "build.datetime_utc",
+        "build.stamp",
+    ] {
+        assert_eq!(
+            start_fields.get(key).map(String::as_str),
+            Some(version_fields[key].as_str()),
+            "full session start marker should report the same {key} as --version: {stderr}"
+        );
+    }
+    for key in ["build.increment", "build.stamp"] {
+        assert_eq!(
+            end_fields.get(key).map(String::as_str),
+            Some(version_fields[key].as_str()),
+            "full session end marker should report the same {key} as --version: {stderr}"
+        );
+    }
+    assert_end_marker_outcome(&end_fields, &stderr);
 }
 
 #[test]

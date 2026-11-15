@@ -2753,6 +2753,9 @@ impl Executor {
         let mut array_eq_terms: Vec<TermId> = Vec::new();
         for idx in 0..self.ctx.terms.len() {
             let term_id = TermId(idx as u32);
+            if !self.term_in_array_scope(term_id) {
+                continue;
+            }
             let TermData::Ite(cond, _, _) = self.ctx.terms.get(term_id) else {
                 continue;
             };
@@ -2771,7 +2774,8 @@ impl Executor {
         }
         // Create negation terms (idempotent via hash-consing in mk_not)
         for eq_term in array_eq_terms {
-            let _ = self.ctx.terms.mk_not(eq_term);
+            let negated = self.ctx.terms.mk_not(eq_term);
+            self.include_array_axiom_scope_root(negated);
         }
     }
 

@@ -30,13 +30,16 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _z3_oracle  # noqa: E402
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
     run_captured,
     warn_concurrent_build,
 )
 
-# How each solver is invoked, and how its verdict is read off stdout.
+# How each solver is invoked, and how its verdict is read off stdout. The `z3`
+# argv is replaced in main() by the z3 oracle's path (scripts/_z3_oracle.py):
+# a by-name `z3` can reach a refusing reroute stub or an AY drop-in.
 SOLVERS: dict[str, list[str]] = {
     "z3": ["z3"],
     "ay": ["target/release/ay"],
@@ -133,6 +136,14 @@ def main() -> int:
         if s not in SOLVERS:
             print(f"unknown solver {s!r} (known: {', '.join(SOLVERS)})", file=sys.stderr)
             return 2
+    if "z3" in solvers:
+        try:
+            oracle = _z3_oracle.z3_oracle()
+        except _z3_oracle.Z3Unavailable as error:
+            print(f"no usable z3: {error}", file=sys.stderr)
+            return 2
+        SOLVERS["z3"] = [oracle.path]
+        print(f"z3 oracle: {oracle.identity()}", file=sys.stderr)
 
     times: dict[str, list[float]] = {s: [] for s in solvers}
     solved: dict[str, int] = {s: 0 for s in solvers}

@@ -41,10 +41,20 @@ impl Kitten {
             core: Vec::new(),
             ticks: 0,
             ticks_limit: u64::MAX,
+            terminator: Terminator::default(),
+            terminated: false,
+            terminator_poll_at: 0,
             conflicts: 0,
             decisions: 0,
             propagations: 0,
+            lifetime_solves: 0,
+            lifetime_propagations: 0,
         }
+    }
+
+    /// (solves, propagations) over the kitten's life.
+    pub(crate) fn lifetime_work(&self) -> (u64, u64) {
+        (self.lifetime_solves, self.lifetime_propagations)
     }
 
     /// Clear all clauses, assignments, learned state. Keeps allocated memory.
@@ -109,6 +119,46 @@ impl Kitten {
     /// Get current tick count.
     pub(crate) fn current_ticks(&self) -> u64 {
         self.ticks
+    }
+
+    /// Whether the limit set by `set_ticks_limit` is used up: a solve now
+    /// stops at its next free decision with no answer.
+    pub(crate) fn ticks_exhausted(&self) -> bool {
+        self.ticks >= self.ticks_limit
+    }
+
+    /// Install the terminator later solves poll, dropping a stop latched
+    /// under the previous one. Kept across `clear`.
+    pub(crate) fn set_terminator(&mut self, terminator: Terminator) {
+        self.terminator = terminator;
+        self.terminated = false;
+        self.terminator_poll_at = self.ticks;
+    }
+
+    pub(crate) fn terminator(&self) -> &Terminator {
+        &self.terminator
+    }
+
+    /// Poll the terminator now. Once it has fired, every solve answers
+    /// unknown before its first decision.
+    pub(crate) fn terminated(&mut self) -> bool {
+        if !self.terminated && self.terminator.raised() {
+            self.terminated = true;
+        }
+        self.terminated
+    }
+
+    /// `terminated`, polled once per `TERMINATOR_POLL_TICKS` ticks: the
+    /// check propagation makes before each literal (kitten.c:1090-1093).
+    pub(super) fn terminator_due(&mut self) -> bool {
+        if self.terminated {
+            return true;
+        }
+        if self.ticks < self.terminator_poll_at {
+            return false;
+        }
+        self.terminator_poll_at = self.ticks.saturating_add(TERMINATOR_POLL_TICKS);
+        self.terminated()
     }
 
     /// Randomize decision phases for future branching.

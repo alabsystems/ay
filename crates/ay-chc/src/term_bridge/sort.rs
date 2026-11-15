@@ -7,7 +7,6 @@
 use crate::expr::{ChcDtConstructor, ChcDtSelector, ChcSort};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
-use std::sync::Arc;
 
 /// Convert CHC sort into ay-core sort.
 pub(crate) fn chc_sort_to_core(sort: &ChcSort) -> Sort {
@@ -72,7 +71,7 @@ pub(crate) fn core_sort_to_chc_lossy(sort: &Sort) -> ChcSort {
         Sort::Uninterpreted(name) => ChcSort::Uninterpreted(name.clone()),
         Sort::Datatype(dt) => ChcSort::Datatype {
             name: dt.name.clone(),
-            constructors: Arc::new(
+            constructors: crate::ChcDtConstructors::new(
                 dt.constructors
                     .iter()
                     .map(|ctor| ChcDtConstructor {
@@ -111,7 +110,7 @@ pub(crate) fn core_sort_to_chc_strict(sort: &Sort) -> Option<ChcSort> {
         )),
         Sort::Datatype(dt) => Some(ChcSort::Datatype {
             name: dt.name.clone(),
-            constructors: Arc::new(
+            constructors: crate::ChcDtConstructors::new(
                 dt.constructors
                     .iter()
                     .map(|ctor| ChcDtConstructor {
@@ -135,6 +134,18 @@ pub(crate) fn core_sort_to_chc_strict(sort: &Sort) -> Option<ChcSort> {
         | Sort::Seq(_) => None,
         // Unknown Sort variant; unsupported (#6091).
         _ => None,
+    }
+}
+
+/// Whether [`core_sort_to_chc_strict`] converts `sort`, without building the
+/// CHC sort (which interns every datatype list on the way).
+pub(crate) fn core_sort_decodes_strict(sort: &Sort) -> bool {
+    match sort {
+        Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_) | Sort::Datatype(_) => true,
+        Sort::Array(arr) => {
+            core_sort_decodes_strict(&arr.index_sort) && core_sort_decodes_strict(&arr.element_sort)
+        }
+        _ => false,
     }
 }
 

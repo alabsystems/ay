@@ -34,43 +34,43 @@ pub struct TheoryDisableFlags {
     /// `--max-fixpoint-rounds=N`
     pub max_fixpoint_rounds: Option<usize>,
     /// `--no-nia-clausal-sls` — quarantine the NIA clausal local-search lane
-    /// (B16: was the never-set AY_NIA_NO_CLAUSAL_SLS env var).
+    /// (was the never-set AY_NIA_NO_CLAUSAL_SLS env var).
     pub no_nia_clausal_sls: bool,
     /// `--no-lra-warm-simplex` — disable cross-solve warm simplex state
-    /// (B16: was the never-set LRA warm-simplex env spelling).
+    /// (was the never-set LRA warm-simplex env spelling).
     pub no_lra_warm_simplex: bool,
-    /// `--no-enum-sat` — disable the enum finite-domain SAT lane (B17).
+    /// `--no-enum-sat` — disable the enum finite-domain SAT lane.
     pub no_enum_sat: bool,
     /// `--no-euf-inc-diseq-undo` — disable the incremental disequality-undo
-    /// lane (B30: was the never-set --no-euf-inc-diseq-undo opt-out).
+    /// lane (was the never-set --no-euf-inc-diseq-undo opt-out).
     pub no_euf_inc_diseq_undo: bool,
-    /// `--no-euf-lazy-explain` — restore eager propagation reasons (B30).
+    /// `--no-euf-lazy-explain` — restore eager propagation reasons.
     pub no_euf_lazy_explain: bool,
-    /// `--no-euf-lazy-noprop` — disable lazy no-propagation reasons (B30).
+    /// `--no-euf-lazy-noprop` — disable lazy no-propagation reasons.
     pub no_euf_lazy_noprop: bool,
-    /// `--no-lia-probe-scan` — skip the LIA probe minimization scan (B30).
+    /// `--no-lia-probe-scan` — skip the LIA probe minimization scan.
     pub no_lia_probe_scan: bool,
-    /// `--no-lra-fast-decision` — force the legacy decision-suggestion scan
-    /// (B30).
+    /// `--no-lra-fast-decision` — force the legacy decision-suggestion
+    /// scan.
     pub no_lra_fast_decision: bool,
-    /// `--no-we-s1` — disable the S1 word-equation regex lane (B30).
+    /// `--no-we-s1` — disable the S1 word-equation regex lane.
     pub no_we_s1: bool,
     /// `--no-euf-inc-cong-undo` — disable the incremental congruence-undo
-    /// lane (B36).
+    /// lane.
     pub no_euf_inc_cong_undo: bool,
     /// `--no-lra-shortest-poly` — restore the Z3/Dantzig most-violated
-    /// leaving-variable rule (B36).
+    /// leaving-variable rule.
     pub no_lra_shortest_poly: bool,
-    /// `--no-uc-minimize` — restore padded-superset unsat cores (B17).
+    /// `--no-uc-minimize` — restore padded-superset unsat cores.
     pub no_uc_minimize: bool,
     /// `--disable-phase-epoch-skip` — restore the unconditional O(atoms)
-    /// phase re-seed (B17).
+    /// phase re-seed.
     pub disable_phase_epoch_skip: bool,
     /// `--no-const-interp-cert` — disable the constant-interpretation
-    /// certificate gate (B17; the diagnostic shadow mode retired with the
+    /// certificate gate (the diagnostic shadow mode retired with the
     /// env var, unmeasured).
     pub no_const_interp_cert: bool,
-    /// B28 dpll lane opt-outs (each replaces a never-set default-on env).
+    /// DPLL lane opt-outs (each replaces a never-set default-on env).
     pub no_abvfp_flatten: bool,
     /// `--dpll-no-closed-sentence-cert`
     pub no_closed_sentence_cert: bool,

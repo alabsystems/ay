@@ -385,7 +385,13 @@ fn compare_shape(want: &Row, got: &Row, failures: &mut Vec<String>) {
     }
 }
 
-pub(crate) fn report(tier: Tier, expected: &[Row], failures: &[String], wall: Duration) {
+pub(crate) fn report(
+    tier: Tier,
+    expected: &[Row],
+    failures: &[String],
+    unrun: &[Row],
+    wall: Duration,
+) {
     let converting = expected
         .iter()
         .filter(|row| row.class == "fraction-free")
@@ -398,13 +404,23 @@ pub(crate) fn report(tier: Tier, expected: &[Row], failures: &[String], wall: Du
         expected.len() - converting,
         wall.as_secs_f64()
     );
-    for failure in failures {
-        println!("  FAIL  {failure}");
+    let verdicts = failures
+        .iter()
+        .map(|failure| format!("  FAIL  {failure}"))
+        .chain(unrun.iter().map(|row| {
+            format!(
+                "  COULD NOT RUN  {:<9} {} at {:.1}s: the wall backstop ended it before its counts decided",
+                row.name, row.status, row.wall_s
+            )
+        }));
+    for verdict in verdicts {
+        println!("{verdict}");
     }
-    if failures.is_empty() {
+    if failures.is_empty() && unrun.is_empty() {
         println!("  clean: every switch point, pivot count and exact optimum is exact");
     }
-    println!("=== {} fail ===", failures.len());
+    let (failed, unrun) = (failures.len(), unrun.len());
+    println!("=== {failed} fail, {unrun} could not run ===");
 }
 
 #[cfg(test)]

@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 2.0
+f 2
+p 1 2 +
+deld 1
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

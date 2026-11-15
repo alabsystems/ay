@@ -16,6 +16,7 @@
 //! Originally a single file (`dt_axioms.rs`), split into submodules for code health.
 
 mod acyclicity;
+mod live_terms;
 mod selector;
 
 // Re-export the DT unroll-depth knobs so the DT solve entrypoints
@@ -1555,7 +1556,7 @@ impl Executor {
 
         // Restore assertions after solving.
         self.ctx.assertions = pre_solve_assertions_exact;
-        self.dt_solver_added_axiom_terms.clear();
+        self.retire_dt_solver_added_axiom_terms();
         result
     }
 }

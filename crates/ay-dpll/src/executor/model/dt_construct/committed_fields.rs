@@ -11,7 +11,7 @@ use ay_model_check::ModelValue;
 use super::super::datatype_array_fields::ExactDatatypeArrayFields;
 use super::{
     dt_canonical_pin_supported, dt_canonical_string, eval_to_mv, exact_datatype_sort_name,
-    mv_to_eval, DtBuilder, DtConstructionResult, EvalValue,
+    mv_to_eval, DtBuilder, DtConstructionResult, DtTermKind, EvalValue,
 };
 
 impl DtBuilder<'_> {
@@ -343,6 +343,31 @@ impl DtBuilder<'_> {
             };
             for &m in self.members.get(&root).into_iter().flatten() {
                 let t = self.terms[m];
+                // A constructor-application member's value is structurally
+                // determined by its own head constructor: pinning it to a
+                // class value headed by a DIFFERENT constructor makes the
+                // application read as that foreign value (measured: a
+                // generated `(leaf (w d))` round-trip member of an
+                // `mk`-valued class pinned to the `mk` value, so the
+                // characterization axiom read `is-leaf = false` against
+                // `d = leaf(..)` true). Such a mismatch is reachable
+                // whenever the class value was not forced by that
+                // application (generated round-trip skipped by the
+                // authored-reachability gate, or a soft-conflict reset
+                // free choice). Skip ground/pin for the mismatched
+                // application; evaluators resolve it structurally from
+                // its arguments instead.
+                if let (
+                    DtTermKind::CtorApp { ctor: app_ctor, .. },
+                    ModelValue::Datatype {
+                        ctor: value_ctor, ..
+                    },
+                ) = (&self.kinds[m], value)
+                {
+                    if app_ctor != value_ctor {
+                        continue;
+                    }
+                }
                 if !self.work_budget.charge_value(value) {
                     return None;
                 }

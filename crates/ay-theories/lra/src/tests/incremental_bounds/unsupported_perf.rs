@@ -377,30 +377,35 @@ fn test_checked_r64_add_pattern_gcd_false_overflow() {
     assert_eq!(fixed_small, Some(Rational64::new(1, 1)));
 }
 
-/// Performance canary: `propagate_equalities` performs pairwise comparison
-/// when N variables share the same tight-bound value (lib.rs:5759-5894).
-/// For N=400 this should materialize all 79,800 equalities and complete
-/// within a practical debug-build budget.
-///
-/// The nested loops already make the O(N²) structure obvious in code review.
-/// What this test can enforce reliably on shared hosts is:
-/// 1. the solver still produces the full pair set, and
-/// 2. the concrete workload does not regress into multi-second behavior.
+/// Performance canary: tight-bound equality emission must stay LINEAR
+/// when N variables share the same tight-bound value. Emission is an
+/// anchor star (first same-sort term equated to every later one):
+/// equality is transitive, so the receiving EUF merges the same
+/// classes as all-pairs emission while the retained propagated-pairs
+/// set and per-round rescan stay O(N). All-pairs emission was the
+/// multi-GB growth profiled on QF_LIRA smtopt (thousands of vars
+/// pinned to one value, Θ(N²) pairs re-scanned every Nelson-Oppen
+/// round).
 ///
 /// After #6617, `check()` may surface the same satisfiable state as
-/// `NeedModelEqualities` rather than bare `Sat` when many fixed terms share a
-/// value. That path reserves a representative chain of `n - 1` pairs first, so
-/// `propagate_equalities()` should emit the remaining pairwise equalities.
+/// `NeedModelEqualities` rather than bare `Sat` when many fixed terms
+/// share a value; that path reserves an anchor chain of `n - 1` pairs
+/// first. The invariant this test enforces is that the UNION of the
+/// recorded pairs after `propagate_equalities()` connects all N vars
+/// (a spanning star), with exactly `n - 1` recorded pairs — never the
+/// Θ(N²) pair set — inside a practical debug-build budget.
 #[test]
 fn test_perf_propagate_equalities_quadratic_scaling() {
     use ay_core::time::Instant;
 
     let measure_once = |n: usize| -> (std::time::Duration, usize) {
         let mut terms = TermStore::new();
+        let mut vars = Vec::with_capacity(n);
         let mut ge_atoms = Vec::with_capacity(n);
         let mut le_atoms = Vec::with_capacity(n);
         for i in 0..n {
             let v = terms.mk_var(format!("v{i}"), Sort::Real);
+            vars.push(v);
             let c1 = terms.mk_rational(BigRational::from(BigInt::from(5)));
             ge_atoms.push(terms.mk_ge(v, c1));
             let c2 = terms.mk_rational(BigRational::from(BigInt::from(5)));
@@ -424,17 +429,33 @@ fn test_perf_propagate_equalities_quadratic_scaling() {
         let start = Instant::now();
         let eq_result = solver.propagate_equalities();
         let elapsed = start.elapsed();
-        assert!(
-            !eq_result.equalities.is_empty(),
-            "expected equalities for {n} vars"
-        );
-        let expected_pairs = n * (n - 1) / 2;
-        let expected_remaining_pairs = expected_pairs - (n - 1);
         assert_eq!(
-            eq_result.equalities.len(),
-            expected_remaining_pairs,
-            "expected propagate_equalities() to emit all non-representative-chain \
-             equalities for {n} tight-bound variables"
+            solver.propagated_equality_pairs.len(),
+            n - 1,
+            "anchor star records exactly n-1 pairs for {n} same-value vars"
+        );
+        // Connectivity: every var reaches vars[0] through recorded pairs.
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                let p = parent[x];
+                parent[x] = parent[p];
+                x = p;
+            }
+            x
+        }
+        let index_of = |t: TermId| vars.iter().position(|&v| v == t).expect("var in setup");
+        for &(a, b) in &solver.propagated_equality_pairs {
+            let (ra, rb) = (
+                find(&mut parent, index_of(a)),
+                find(&mut parent, index_of(b)),
+            );
+            parent[ra] = rb;
+        }
+        let root = find(&mut parent, 0);
+        assert!(
+            (0..n).all(|i| find(&mut parent, i) == root),
+            "recorded pairs must connect all {n} vars"
         );
         (elapsed, eq_result.equalities.len())
     };
@@ -443,7 +464,10 @@ fn test_perf_propagate_equalities_quadratic_scaling() {
     let _ = measure_once(32);
 
     let (t_large, pairs_large) = measure_once(400);
-    assert_eq!(pairs_large, (400 * 399 / 2) - 399);
+    assert!(
+        pairs_large <= 399,
+        "propagate_equalities must stay within the star budget, got {pairs_large}"
+    );
     assert!(
         t_large.as_secs() < 5,
         "N=400 took {t_large:?}, exceeds 5s budget"

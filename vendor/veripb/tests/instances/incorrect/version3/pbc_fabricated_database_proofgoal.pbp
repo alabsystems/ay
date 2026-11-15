@@ -1,0 +1,16 @@
+pseudo-Boolean proof version 3.0
+% `pbc` registers NO database proofgoals, so `proofgoal 1` used to FABRICATE the goal
+% `C_1 | witness` with an empty witness -- i.e. `C_1` itself. The scope it opened therefore
+% carried the premise `~C_1` while `C_1` was still in the database, so `rup >= 1 ;` was an
+% instant meaningless contradiction, and closing the goal marked the ENCLOSING `pbc`
+% obligation (a contradiction from `~C`) as discharged without ever checking it.
+% Six lines, no arithmetic, and it forged `s VERIFIED UNSATISFIABLE` for `x1 OR x2`.
+f 1 ;
+pbc >= 1 : subproof
+    proofgoal 1
+        rup >= 1 ;
+    qed;
+qed;
+output NONE;
+conclusion UNSAT ;
+end pseudo-Boolean proof;

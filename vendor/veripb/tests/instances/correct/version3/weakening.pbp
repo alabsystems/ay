@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+f 2;
+pol 1 x1 w;
+e 5 ~x2 1 ~x3 >= 3 : 3;
+pol 3 x3 w;
+e 5 ~x2 >= 2 : 4;
+pol 1 x1 w x3 w;
+e 5 ~x2 >= 2 : 5;
+pol 2 x1 w x2 w;
+e -1 x3 >= -12 : 6;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

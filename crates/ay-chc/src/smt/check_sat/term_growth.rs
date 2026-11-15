@@ -18,7 +18,12 @@ use num_bigint::BigInt;
 
 use super::super::context::SmtContext;
 use super::super::types::{DiseqGuardKind, SmtResult};
+use super::support::LoopSat;
 use super::TermGrowthAction;
+
+#[cfg(test)]
+#[path = "term_growth_sort_tests.rs"]
+mod sort_tests;
 
 /// Baseline per-variable split cap (unbounded case).
 const MAX_VAR_SPLITS: usize = 200;
@@ -105,7 +110,7 @@ impl SmtContext {
         term_to_var: &mut BTreeMap<TermId, u32>,
         var_to_term: &mut BTreeMap<u32, TermId>,
         num_vars: &mut u32,
-        sat: &mut ay_sat::Solver,
+        sat: &mut LoopSat,
         split_state: &mut SplitState,
         debug: bool,
         dt_iterations: usize,
@@ -171,7 +176,7 @@ impl SmtContext {
         term_to_var: &mut BTreeMap<TermId, u32>,
         var_to_term: &mut BTreeMap<u32, TermId>,
         num_vars: &mut u32,
-        sat: &mut ay_sat::Solver,
+        sat: &mut LoopSat,
         split_state: &mut SplitState,
         debug: bool,
         dt_iterations: usize,
@@ -283,7 +288,7 @@ impl SmtContext {
         term_to_var: &mut BTreeMap<TermId, u32>,
         var_to_term: &mut BTreeMap<u32, TermId>,
         num_vars: &mut u32,
-        sat: &mut ay_sat::Solver,
+        sat: &mut LoopSat,
         debug: bool,
     ) {
         let floor_term = self.terms.mk_int(split.floor.clone());
@@ -329,7 +334,7 @@ impl SmtContext {
         term_to_var: &mut BTreeMap<TermId, u32>,
         var_to_term: &mut BTreeMap<u32, TermId>,
         num_vars: &mut u32,
-        sat: &mut ay_sat::Solver,
+        sat: &mut LoopSat,
         split_state: &mut SplitState,
         debug: bool,
         dt_iterations: usize,
@@ -562,28 +567,43 @@ impl SmtContext {
                 })
             });
         let guard_lit = if let Some(g) = guard_lit {
-            g
+            Some(g)
         } else {
-            let val_term = if split.excluded_value.is_integer() {
+            // The constant must carry the VARIABLE's sort: an integral excluded
+            // value of a Real variable is a Real constant, else `mk_eq` sees
+            // `Real = Int` (found by the #horn-smt-session push/pop fuzz —
+            // `mk_eq expects same sort` on a Real disequality split whose
+            // guard atom was not found).
+            let val_term = if *self.terms.sort(split.variable) == ay_core::Sort::Int
+                && split.excluded_value.is_integer()
+            {
                 self.terms.mk_int(split.excluded_value.numer().clone())
             } else {
                 self.terms.mk_rational(split.excluded_value.clone())
             };
-            let eq_atom = self.terms.mk_eq(split.variable, val_term);
-            let eq_var = *term_to_var.entry(eq_atom).or_insert_with(|| {
-                *num_vars += 1;
-                var_to_term.insert(*num_vars, eq_atom);
-                *num_vars
-            });
-            sat.ensure_num_vars(*num_vars as usize);
-            let eq_sat_var = ay_sat::Variable::new(eq_var - 1);
-            ay_sat::Literal::positive(eq_sat_var)
+            // An Int relaxation can exclude a fractional Real value. Its
+            // floor/ceiling split above is still integral. Coerce the guard
+            // canonically, preserving any constant truth at the SAT boundary.
+            let eq_atom = self.terms.mk_eq_coerce(split.variable, val_term);
+            match self.terms.get(eq_atom) {
+                TermData::Const(ay_core::Constant::Bool(false)) => None,
+                TermData::Const(ay_core::Constant::Bool(true)) => return Ok(()),
+                _ => {
+                    let eq_var = *term_to_var.entry(eq_atom).or_insert_with(|| {
+                        *num_vars += 1;
+                        var_to_term.insert(*num_vars, eq_atom);
+                        *num_vars
+                    });
+                    sat.ensure_num_vars(*num_vars as usize);
+                    Some(ay_sat::Literal::positive(ay_sat::Variable::new(eq_var - 1)))
+                }
+            }
         };
-        sat.add_clause(vec![
-            guard_lit,
-            ay_sat::Literal::positive(lt_sat_var),
-            ay_sat::Literal::positive(gt_sat_var),
-        ]);
+        let mut clause = Vec::with_capacity(3);
+        clause.extend(guard_lit);
+        clause.push(ay_sat::Literal::positive(lt_sat_var));
+        clause.push(ay_sat::Literal::positive(gt_sat_var));
+        sat.add_clause(clause);
 
         if debug {
             safe_eprintln!(
@@ -610,7 +630,7 @@ impl SmtContext {
         term_to_var: &mut BTreeMap<TermId, u32>,
         var_to_term: &mut BTreeMap<u32, TermId>,
         num_vars: &mut u32,
-        sat: &mut ay_sat::Solver,
+        sat: &mut LoopSat,
         debug: bool,
         dt_iterations: usize,
     ) -> Result<(), SmtResult> {

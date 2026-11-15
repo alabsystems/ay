@@ -7,6 +7,9 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 
+mod channel;
+use channel::int_arith_channel_claims;
+
 /// Red zone size for `stacker::maybe_grow` in term analysis recursion (#8414).
 ///
 /// Logic detection functions recurse into term structure. On DT-heavy problems
@@ -85,35 +88,75 @@ pub(super) fn is_lia_relevant_term(terms: &TermStore, term: TermId) -> bool {
     ) // stacker::maybe_grow
 }
 
+/// True when `term` is a compound arithmetic-operator application
+/// (`+`, `-`, `*`, `/`, `div`, `mod`, `rem`, `abs`), regardless of whether
+/// its operands are LIA-relevant. An equality with such a side expresses
+/// an arithmetic *relation* the arithmetic solver must see even when a
+/// leaf is uninterpreted: the solver interns UF leaves as opaque vars —
+/// the same treatment comparisons already get (they route by sort
+/// alone). Measured (#ufnia-symdiv-decomp-routing): the symbolic-div
+/// decomposition `(= a (+ (* (p 3) q) r))` was neither LIA-relevant
+/// (UF leaf `(p 3)`) nor a UF equality (compound side), so combined
+/// adapters routed it to EUF only; the arith side never learned the
+/// dividend relation, produced relaxation models with `r = 0`, and
+/// trivial QF_UFNIA goals degraded to `unknown` at the model gate.
+/// A bare UF application side (`(= (f x) 5)`) is NOT compound: those
+/// keep going through the shared-equality channel, unchanged.
+pub(super) fn is_compound_arith_term(terms: &TermStore, term: TermId) -> bool {
+    matches!(
+        terms.get(term),
+        TermData::App(Symbol::Named(name), _)
+            if matches!(
+                name.as_str(),
+                "+" | "-" | "*" | "/" | "div" | "mod" | "rem" | "abs"
+            )
+    )
+}
+
 /// Check whether a term should be routed to arithmetic solvers.
 pub(crate) fn contains_arithmetic_ops(terms: &TermStore, term: TermId) -> bool {
-    stacker::maybe_grow(
-        TERM_ANALYSIS_STACK_RED_ZONE,
-        TERM_ANALYSIS_STACK_SIZE,
-        || match terms.get(term) {
+    // Boolean structure does not hide arithmetic. Use a visited DAG walk so
+    // shared Boolean subexpressions cannot multiply classification work.
+    let mut pending = vec![term];
+    let mut seen = HashSet::default();
+    while let Some(term) = pending.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
             TermData::App(Symbol::Named(name), args) => {
-                if matches!(name.as_str(), "<" | "<=" | ">" | ">=") {
-                    return true;
-                }
-                if matches!(name.as_str(), "+" | "-" | "*" | "/") {
+                if matches!(
+                    name.as_str(),
+                    "<" | "<=" | ">" | ">=" | "+" | "-" | "*" | "/"
+                ) {
                     return true;
                 }
                 if name == "=" && args.len() == 2 {
-                    return is_lia_relevant_term(terms, args[0])
-                        && is_lia_relevant_term(terms, args[1]);
+                    if args.iter().all(|&arg| terms.sort(arg) == &Sort::Bool) {
+                        pending.extend(args.iter().copied());
+                    } else if int_arith_channel_claims(terms, args) {
+                        return true;
+                    }
+                    // Bare UF equalities still use the shared-equality channel;
+                    // do not reclassify them by walking their numeric arguments.
+                    continue;
                 }
-                if name == "distinct" && args.iter().all(|&arg| is_lia_relevant_term(terms, arg)) {
+                if name == "distinct" && int_arith_channel_claims(terms, args) {
                     return true;
                 }
-                false
+                if matches!(name.as_str(), "and" | "or" | "xor" | "=>")
+                    || (name == "distinct"
+                        && args.iter().all(|&arg| terms.sort(arg) == &Sort::Bool))
+                {
+                    pending.extend(args.iter().copied());
+                }
             }
-            TermData::Not(inner) => contains_arithmetic_ops(terms, *inner),
-            TermData::Ite(_, t, e) => {
-                contains_arithmetic_ops(terms, *t) || contains_arithmetic_ops(terms, *e)
-            }
-            _ => false,
-        },
-    ) // stacker::maybe_grow
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(condition, left, right) => pending.extend([*condition, *left, *right]),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Check if a term contains string-int bridge operations that require LIA.
@@ -265,16 +308,14 @@ pub(crate) fn involves_int_arithmetic(terms: &TermStore, term: TermId) -> bool {
                 if !has_int {
                     return false;
                 }
-                return is_lia_relevant_term(terms, args[0])
-                    && is_lia_relevant_term(terms, args[1]);
+                return int_arith_channel_claims(terms, args);
             }
             if matches!(name.as_str(), "+" | "-" | "*" | "/") {
                 return matches!(terms.sort(term), Sort::Int);
             }
             if name == "distinct" {
                 let has_int = args.iter().any(|&arg| matches!(terms.sort(arg), Sort::Int));
-                let all_pure = args.iter().all(|&arg| is_lia_relevant_term(terms, arg));
-                return has_int && all_pure;
+                return has_int && int_arith_channel_claims(terms, args);
             }
             false
         }
@@ -525,8 +566,10 @@ pub(crate) fn involves_real_arithmetic(terms: &TermStore, term: TermId) -> bool 
                 if !has_real {
                     return false;
                 }
-                return is_lra_relevant_term(terms, args[0])
-                    && is_lra_relevant_term(terms, args[1]);
+                return (is_lra_relevant_term(terms, args[0])
+                    && is_lra_relevant_term(terms, args[1]))
+                    || is_compound_arith_term(terms, args[0])
+                    || is_compound_arith_term(terms, args[1]);
             }
             if matches!(name.as_str(), "+" | "-" | "*" | "/") {
                 return matches!(terms.sort(term), Sort::Real);
@@ -536,7 +579,8 @@ pub(crate) fn involves_real_arithmetic(terms: &TermStore, term: TermId) -> bool 
                     .iter()
                     .any(|&arg| matches!(terms.sort(arg), Sort::Real));
                 let all_relevant = args.iter().all(|&arg| is_lra_relevant_term(terms, arg));
-                return has_real && all_relevant;
+                let any_compound = args.iter().any(|&arg| is_compound_arith_term(terms, arg));
+                return has_real && (all_relevant || any_compound);
             }
             false
         }

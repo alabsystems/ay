@@ -1,0 +1,24 @@
+pseudo-Boolean proof version 3.0
+% Regression: a `def_order` block whose optional `transitivity` block is absent
+% is grammatically legal but cannot be accepted, because transitivity of the
+% order is a side condition of the rule and VeriPB cannot autoprove it. This has
+% to be rejected with `Transitivity of the order could not be proven.`; it used
+% to hit a `todo!()` in `OrderContext::autoprove_transitivity` and abort the
+% whole process (SIGABRT, since the release profile sets `panic = "abort"`).
+f 2;
+
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux;
+    end;
+
+    def
+        -1 u1 1 v1 >= 0;
+    end;
+end;
+
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

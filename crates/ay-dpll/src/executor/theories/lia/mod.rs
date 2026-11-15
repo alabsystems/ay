@@ -6,6 +6,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
+mod nia_window;
 mod recovered_model;
 #[cfg(test)]
 mod tests;
@@ -70,7 +71,7 @@ impl Executor {
             .incr_theory_state
             .as_ref()
             .map_or(0, |state| state.scope_depth);
-        let source_depths = self.ctx.active_assertion_min_scope_depths();
+        let source_depths = self.activation_root_depths();
         let mut derived_assertion_entries = Vec::new();
         for (&term, source_sets) in &artifacts.assertion_sources {
             for sources in source_sets {
@@ -237,6 +238,9 @@ impl Executor {
                     // LraSolver of every LIA theory instance.
                     if this.no_lra_theory_propagation {
                         theory.lra_solver_mut().set_no_theory_propagation(true);
+                    }
+                    if this.no_lra_bcp_implied_bounds {
+                        theory.lra_solver_mut().set_no_bcp_implied_bounds(true);
                     }
                     theory
                 },
@@ -656,6 +660,9 @@ impl Executor {
                 if self.no_lra_theory_propagation {
                     theory.lra_solver_mut().set_no_theory_propagation(true);
                 }
+                if self.no_lra_bcp_implied_bounds {
+                    theory.lra_solver_mut().set_no_bcp_implied_bounds(true);
+                }
                 theory
             },
             extract_models: |theory| {
@@ -731,6 +738,9 @@ impl Executor {
                 if self.no_lra_theory_propagation {
                     theory.lra_solver_mut().set_no_theory_propagation(true);
                 }
+                if self.no_lra_bcp_implied_bounds {
+                    theory.lra_solver_mut().set_no_bcp_implied_bounds(true);
+                }
                 theory
             },
             extract_models: |theory| {
@@ -796,83 +806,16 @@ impl Executor {
         }
         // Note: a symbolic/zero-divisor `(rem a b)` is degraded to `unknown`
         // universally in `route_to_solver` before this point (#nia-symbolic-rem-bypass).
-        let original_problem_assertions = self.ctx.assertions.clone();
+        let (mut result, (var_subst, introduced_unconstrained_div_mod)) = self
+            .with_nia_theory_window(|this| {
+                let (var_subst, introduced_unconstrained_div_mod) =
+                    this.preprocess_nia_theory_window();
+                let result = this.solve_nia_inner(Some(&var_subst))?;
+                Ok((result, (var_subst, introduced_unconstrained_div_mod)))
+            })?;
 
-        // Symbolic mod/div elimination for the NIA path (#nia-modxx-zerodiv).
-        //
-        // `preprocess_lia_artifacts` only eliminates `(mod a k)` / `(div a k)`
-        // with a CONSTANT divisor `k`. A `(mod a b)` with a non-constant divisor
-        // (e.g. `(mod x x)`) is left intact, and the LRA layer then flags every
-        // atom containing it as UNSUPPORTED and silently DROPS it from the
-        // tableau. NIA's tentative-patch path treats LRA's "Sat with unsupported
-        // atoms" as feasible and returns SAT on a model that violates those
-        // dropped atoms (e.g. `(<= (* y y) (mod x x))` with `y*y=1, (mod x x)=-1`)
-        // — a wrong-SAT.
-        //
-        // Eliminating symbolic mod/div here replaces `(mod x x)` with a single
-        // fresh integer `r` constrained by the SMT-LIB division axioms
-        // (`x = x*q + r ∧ 0 ≤ r < |x|`, or unconstrained when `x = 0`). Both
-        // occurrences resolve to the SAME `r` because the term store hash-conses
-        // `(mod x x)` and the elimination is run ONCE over the whole assertion
-        // list (shared memo) — so the zero-divisor result stays a single
-        // consistent value across all its uses (the congruence the constant-path
-        // already enforces). The atoms then become ordinary (non)linear LIA
-        // constraints that the tableau actually enforces.
-        //
-        // SOUNDNESS: the symbolic axiom over-approximates nothing — it is the
-        // exact SMT-LIB semantics of `mod`/`div`, with the zero-divisor case left
-        // unconstrained (matching z3). When the elimination introduces an
-        // unconstrained zero-divisor var, SAT must route through the
-        // `sat_validated_by_mod_div_or_branch` bypass because the model evaluator
-        // cannot replay `(mod a 0)` (#div0).
-        if crate::executor::mod_div_elim::contains_symbolic_int_mod_div(
-            &self.ctx.terms,
-            &self.ctx.assertions,
-        ) {
-            let assertions = std::mem::take(&mut self.ctx.assertions);
-            let mod_elim = crate::executor::mod_div_elim::eliminate_int_mod_div(
-                &mut self.ctx.terms,
-                &assertions,
-            );
-            if mod_elim.introduced_unconstrained_div_mod {
-                self.sat_validated_by_mod_div_or_branch = true;
-            }
-            let mut rewritten = mod_elim.constraints;
-            rewritten.extend(mod_elim.rewritten);
-            self.ctx.assertions = rewritten;
-        }
-
-        let artifacts = self.preprocess_lia_artifacts();
-        let introduced_unconstrained_div_mod = artifacts.introduced_unconstrained_div_mod;
-
-        let proof_provenance = ProofProblemAssertionProvenance::from_sources(
-            original_problem_assertions,
-            &artifacts.assertions,
-            artifacts.assertion_sources.clone(),
-        );
-
-        let saved_style = self.counterexample_style();
-        let saved_proof_provenance = self.proof_problem_assertion_provenance.clone();
-        let proof_provenance =
-            proof_provenance.preserving_authority_from(saved_proof_provenance.as_ref());
-        self.set_counterexample_style(crate::CounterexampleStyle::Any);
-        self.proof_problem_assertion_provenance = Some(proof_provenance);
-
-        let original_assertions = std::mem::replace(&mut self.ctx.assertions, artifacts.assertions);
-        let mut result = self.solve_nia_inner(Some(&artifacts.var_subst));
-
-        self.ctx.assertions = original_assertions;
-        self.set_counterexample_style(saved_style);
-        // Same shedding carve-out as `solve_lia_incremental` above; see
-        // `theory_window_provenance_survives_unsat`.
-        if !matches!(result, Ok(ref r) if r.is_unsat())
-            || !self.theory_window_provenance_survives_unsat()
-        {
-            self.proof_problem_assertion_provenance = saved_proof_provenance;
-        }
-
-        if matches!(result, Ok(SolveResult::Sat)) {
-            self.recover_preprocessed_lia_model(&artifacts.var_subst);
+        if matches!(result, SolveResult::Sat) {
+            self.recover_preprocessed_lia_model(&var_subst);
 
             // #model-demand: witness cosmetics, skipped when no consumer exists.
             if self.counterexample_minimization_demanded() && self.last_assumptions.is_none() {
@@ -884,10 +827,10 @@ impl Executor {
                 self.sat_validated_by_mod_div_or_branch = true;
             }
             self.last_model_validated = false;
-            result = self.finalize_sat_model_validation();
+            result = self.finalize_sat_model_validation()?;
         }
 
-        result
+        Ok(result)
     }
 
     fn solve_nia_inner(&mut self, var_subst: Option<&VariableSubstitution>) -> Result<SolveResult> {
@@ -911,6 +854,11 @@ impl Executor {
             }
         });
 
+        // #nia-split-probe: ONE flag per solve for the same reason — the probe
+        // runs at the first factor split of the solve, not of every rebuilt
+        // instance.
+        let split_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         solve_incremental_split_loop_pipeline!(self,
             tag: "NIA",
             persistent_sat_field: persistent_sat,
@@ -932,9 +880,17 @@ impl Executor {
                 // used exclusively on the SAT side (witness construction and
                 // exact re-verification), so it cannot affect any UNSAT.
                 theory.set_root_assertions(self.ctx.assertions.clone());
+                // Div/mod purification adds solver-owned Boolean branches.
+                // Preserve the source shape only for the early SAT-search
+                // schedule, without changing its full working-root witness
+                // checks or promoting any source/proof authority.
+                if let Some(provenance) = &self.proof_problem_assertion_provenance {
+                    theory.set_local_search_source_roots(&provenance.original_problem_assertions);
+                }
                 if let Some(cutoff) = local_search_cutoff {
                     theory.set_local_search_deadline(cutoff);
                 }
+                theory.set_split_probe_flag(split_probe.clone());
                 theory
             },
             extract_models: |theory| {
@@ -946,6 +902,7 @@ impl Executor {
                     recover_substituted_lia_values(&self.ctx.terms, var_subst, model);
                 }
                 TheoryModels {
+                    boolean_leaves: theory.boolean_witness().collect(),
                     lia: lia_model,
                     ..TheoryModels::default()
                 }

@@ -1,0 +1,27 @@
+; Authored source-derived table/resize conjunction, not captured AY output.
+; Retains an uninterpreted read-only float-operation table, not IEEE axioms.
+; Expected unsat. Resources and reference provenance: companion evidence report.
+(set-logic ALL)
+(declare-const table (Array (_ BitVec 136) (_ BitVec 64)))
+(declare-const next_table (Array (_ BitVec 136) (_ BitVec 64)))
+(declare-const lhs (_ BitVec 64))
+(declare-const rhs (_ BitVec 64))
+(declare-const first (_ BitVec 64))
+(declare-const a (Array (_ BitVec 64) (_ BitVec 8)))
+(declare-const b (Array (_ BitVec 64) (_ BitVec 8)))
+(declare-const old (_ BitVec 64))
+(declare-const new (_ BitVec 64))
+(declare-const j (_ BitVec 64))
+(assert (= old (_ bv32 64)))
+(assert (= new (_ bv65 64)))
+(assert (= first (select table (concat (_ bv4 8) (concat lhs rhs)))))
+(assert (= next_table table))
+(assert (forall ((i (_ BitVec 64)))
+  (and (=> (bvult i old) (= (select b i) (select a i)))
+       (=> (and (bvuge i old) (bvult i new))
+           (= (select b i) ((_ extract 7 0) first))))))
+(assert (or
+  (distinct (select next_table (concat (_ bv4 8) (concat lhs rhs))) first)
+  (and (bvuge j old) (bvult j new) (bvuge j (_ bv32 64))
+       (distinct (select b j) ((_ extract 7 0) first)))))
+(check-sat)

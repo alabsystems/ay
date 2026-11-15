@@ -2,158 +2,28 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+//! Clause case splitting on `ite` and `or`: the one-step splits and their
+//! helpers. The drivers that apply them to a whole problem, recording where
+//! each output clause came from, are in [`recorded`].
+
+use super::simplified_conjunction::SimplifiedConjunction;
 use super::*;
 
+mod recorded;
+
 impl ChcProblem {
-    /// Attempt to split clauses on `(ite ...)` occurrences by case-splitting on the condition.
-    ///
-    /// This is a semantics-preserving transformation for CHC:
-    /// - `body ∧ φ(ite(c,t,e)) -> head` becomes two clauses:
-    ///   - `body ∧ c ∧ φ(t) -> head`
-    ///   - `body ∧ ¬c ∧ φ(e) -> head`
-    ///
-    /// The primary goal is to simplify CHC problems that encode program branches using `ite`,
-    /// which can otherwise force PDR to learn many point-wise lemmas.
-    ///
-    /// To avoid exponential blow-ups, this pass limits the number of clauses generated from any
-    /// single input clause. When the limit is reached, remaining `ite` nodes are left intact.
-    pub fn try_split_ites_in_clauses(
-        &mut self,
-        max_clauses_per_input_clause: usize,
-        verbose: bool,
+    /// The `verbose` summary of one splitting pass (`kind`: `ite` or `or`).
+    fn report_case_splits(
+        kind: &str,
+        total_splits: usize,
+        clauses_with_splits: usize,
+        old_len: usize,
+        new_len: usize,
     ) {
-        if max_clauses_per_input_clause <= 1 {
-            return;
-        }
-
-        let old = std::mem::take(&mut self.clauses);
-        let old_len = old.len();
-        let mut new_clauses: Vec<HornClause> = Vec::with_capacity(old_len);
-
-        let mut total_splits: usize = 0;
-        let mut clauses_with_splits: usize = 0;
-
-        for clause in old {
-            let mut pending: Vec<HornClause> = vec![clause];
-            let mut out: Vec<HornClause> = Vec::new();
-            let mut did_split = false;
-
-            while let Some(current) = pending.pop() {
-                if out.len() + pending.len() >= max_clauses_per_input_clause {
-                    out.push(current);
-                    continue;
-                }
-
-                let Some((a, b)) = Self::split_clause_once_on_ite(&current) else {
-                    out.push(current);
-                    continue;
-                };
-
-                did_split = true;
-                total_splits += 1;
-                pending.push(a);
-                pending.push(b);
-            }
-
-            if did_split {
-                clauses_with_splits += 1;
-            }
-            new_clauses.extend(
-                out.into_iter()
-                    .filter(|c| !Self::clause_is_trivially_false(c)),
-            );
-        }
-
-        if verbose && total_splits > 0 {
-            safe_eprintln!(
-                "CHC: ite-splitting: {} splits across {} clauses ({} -> {})",
-                total_splits,
-                clauses_with_splits,
-                old_len,
-                new_clauses.len()
-            );
-        }
-
-        self.clauses = new_clauses;
-    }
-
-    /// Attempt to split clauses on `(or ...)` occurrences by case-splitting on each branch.
-    ///
-    /// This is a semantics-preserving transformation for CHC:
-    /// - `body ∧ (or a b) -> head` becomes:
-    ///   - `body ∧ a -> head`
-    ///   - `body ∧ b -> head`
-    ///
-    /// The primary goal is to eliminate disjunctions inside clause constraints, since AY's
-    /// SMT solver can return `Unknown` on disjunctive LIA queries and force expensive
-    /// recursive case-splitting during model verification.
-    ///
-    /// To avoid exponential blow-ups, this pass limits:
-    /// - the number of clauses generated per input clause, and
-    /// - the OR arity that will be split.
-    pub fn try_split_ors_in_clauses(&mut self, max_clauses_per_input_clause: usize, verbose: bool) {
-        if max_clauses_per_input_clause <= 1 {
-            return;
-        }
-
-        // Keep this consistent with SMT-level OR split caps in verification.
-        const MAX_OR_BRANCHES: usize = 8;
-
-        let old = std::mem::take(&mut self.clauses);
-        let old_len = old.len();
-        let mut new_clauses: Vec<HornClause> = Vec::with_capacity(old_len);
-
-        let mut total_splits: usize = 0;
-        let mut clauses_with_splits: usize = 0;
-
-        for clause in old {
-            let mut pending: Vec<HornClause> = vec![clause];
-            let mut out: Vec<HornClause> = Vec::new();
-            let mut did_split = false;
-
-            while let Some(current) = pending.pop() {
-                if out.len() + pending.len() >= max_clauses_per_input_clause {
-                    out.push(current);
-                    continue;
-                }
-
-                let Some(split) = Self::split_clause_once_on_or(&current, MAX_OR_BRANCHES) else {
-                    out.push(current);
-                    continue;
-                };
-
-                // Splitting adds `split.len() - 1` clauses. If that would exceed our cap,
-                // keep the clause intact.
-                if out.len() + pending.len() + split.len() > max_clauses_per_input_clause {
-                    out.push(current);
-                    continue;
-                }
-
-                did_split = true;
-                total_splits += 1;
-                pending.extend(split);
-            }
-
-            if did_split {
-                clauses_with_splits += 1;
-            }
-            new_clauses.extend(
-                out.into_iter()
-                    .filter(|c| !Self::clause_is_trivially_false(c)),
-            );
-        }
-
-        if verbose && total_splits > 0 {
-            safe_eprintln!(
-                "CHC: or-splitting: {} splits across {} clauses ({} -> {})",
-                total_splits,
-                clauses_with_splits,
-                old_len,
-                new_clauses.len()
-            );
-        }
-
-        self.clauses = new_clauses;
+        safe_eprintln!(
+            "CHC: {kind}-splitting: {total_splits} splits across {clauses_with_splits} clauses \
+             ({old_len} -> {new_len})"
+        );
     }
 
     fn clause_is_trivially_false(clause: &HornClause) -> bool {
@@ -203,13 +73,15 @@ impl ChcProblem {
             return None;
         }
 
+        // Simplify the shared guard once per split; each branch then only
+        // simplifies its own disjunct. Folding the guards in one by one
+        // re-simplified the whole growing constraint per guard and per branch
+        // (O(guards x size)): 91-96 % of PdrSolver::new on wide sally systems
+        // (PERF_vs_winners_2026-09-25, row 6).
+        let guard = SimplifiedConjunction::from_conjuncts(guard_conjuncts);
         let mut split_clauses = Vec::with_capacity(branches.len());
         for branch in branches {
-            let mut new_constraint: Option<ChcExpr> = None;
-            for g in &guard_conjuncts {
-                new_constraint = Self::conjoin_constraint(new_constraint, g.clone());
-            }
-            new_constraint = Self::conjoin_constraint(new_constraint, branch);
+            let new_constraint = guard.conjoin(branch);
 
             split_clauses.push(
                 HornClause::new(
@@ -366,6 +238,32 @@ impl ChcProblem {
     }
 
     fn find_ite_path(expr: &ChcExpr) -> Option<Vec<usize>> {
+        // Shared DAGs (WP-F F0b): the leftmost path to the first `ite` in
+        // preorder, found by following the first child whose subtree holds an
+        // `ite` (memoised per distinct node) — the same path the tree walk
+        // below returns.
+        if crate::expr::dag::tree_size_at_least(expr, crate::expr::dag::DAG_WALK_MIN_TREE) {
+            let mut has_ite = crate::expr::dag::SubtreeAnyVia::new(
+                |e| matches!(e, ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3),
+                |e| matches!(e, ChcExpr::Op(..) | ChcExpr::PredicateApp(..)),
+            );
+            if !has_ite.holds(expr) {
+                return None;
+            }
+            let mut path = Vec::new();
+            let mut current = expr;
+            loop {
+                if matches!(current, ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3) {
+                    return Some(path);
+                }
+                let (ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args)) = current else {
+                    return None;
+                };
+                let (index, child) = args.iter().enumerate().find(|(_, a)| has_ite.holds(a))?;
+                path.push(index);
+                current = child;
+            }
+        }
         crate::expr::maybe_grow_expr_stack(|| match expr {
             // Match any ITE regardless of return sort (boolean or arithmetic)
             ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => Some(Vec::new()),

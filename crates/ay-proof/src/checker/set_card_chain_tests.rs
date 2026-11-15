@@ -74,7 +74,7 @@ fn recurrence_clause(
     let rhs = if delta == 0 {
         inner
     } else {
-        let magnitude = int(terms, delta.abs());
+        let magnitude = terms.mk_int(delta.unsigned_abs().into());
         if delta > 0 {
             terms.mk_add(vec![inner, magnitude])
         } else {

@@ -47,6 +47,11 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 use super::algebraic::ast_as_scalar;
+use super::check_obligations::{
+    assert_reachable_wf_guards, has_loose_bound_variable, lossy_binder_refusal,
+    UNBOUND_VARIABLES_REASON,
+};
+use super::handle_params::{begin_handle_query, finish_handle_query, ParamSet};
 use super::model_params::model_value_to_term;
 use super::solver::{
     apply_finite_set_decision_gate, assert_reachable_finite_set_axioms,
@@ -55,13 +60,13 @@ use super::solver::{
 use super::{
     cache_func_entry, cache_string, ensure_cross_context_translation_semantics,
     ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, finite_set_decision_gate, record_ast_sort,
-    require_term_ast, require_term_ast_or_return, require_term_asts_or_return, term_to_ast,
-    transfer_cross_context_ffi_metadata, DatatypeOp, DecisionOwnerFamily, OptimizeHandle,
-    ParamDescrsHandle, SoftRecord, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context, Z3_func_decl,
-    Z3_func_interp, Z3_goal, Z3_model, Z3_optimize, Z3_param_descrs, Z3_solver, Z3_string,
-    MAX_FFI_REFINEMENT_PRECISION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE,
-    Z3_L_UNDEF, Z3_OK,
+    ffi_guard_int, ffi_guard_mk, ffi_guard_produced, ffi_guard_ptr, ffi_guard_void,
+    finite_set_decision_gate, record_ast_sort, require_term_ast, require_term_ast_or_return,
+    require_term_asts_or_return, term_to_ast, transfer_cross_context_ffi_metadata, DatatypeOp,
+    DecisionOwnerFamily, OptimizeHandle, ParamDescrsHandle, SoftRecord, Z3_ast, Z3_ast_map,
+    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_func_interp, Z3_goal, Z3_model, Z3_optimize,
+    Z3_param_descrs, Z3_solver, Z3_string, MAX_FFI_REFINEMENT_PRECISION, Z3_INVALID_ARG,
+    Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 // ============================================================================
@@ -99,7 +104,7 @@ fn algebraic_number_bound(
     let emit = |ctx: &mut super::Z3Context, r: BigRational| -> Z3_ast {
         let term = ctx.solver.rational_const_bigint(r.numer(), r.denom());
         let ast = term_to_ast(ctx, term);
-        record_ast_sort(ctx, ast, Sort::Real);
+        let ast = record_ast_sort(ctx, ast, Sort::Real);
         ctx.last_error = Z3_OK;
         ast
     };
@@ -301,8 +306,21 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             .map(|i| unsafe { *terms.add(i) })
             .collect()
     };
+    // The handle's own parameters for this query only, a cleared interrupt,
+    // and no definition the query adopted left installed afterwards (libz3
+    // 5.1.0 keeps a later `f(x) == 0` as built; AY's engine rewrote it to
+    // `0 == x + 1` after this query adopted `forall y. f(y) = y + 1`).
+    // SAFETY: `s` is null or a live solver handle of `c`; `c` is null or a
+    // live context, borrowed by each call in turn.
+    let settings = unsafe {
+        begin_handle_query(
+            c,
+            s.as_ref()
+                .map_or_else(ParamSet::default, |handle| handle.params),
+        )
+    };
     // SAFETY: `ffi_guard_int` guards `c`; `s`/`class_ids` null-checked below.
-    unsafe {
+    let verdict = unsafe {
         ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
             if !ctx.decision_engine_is_usable("Z3_get_implied_equalities") {
                 return Z3_L_UNDEF;
@@ -352,6 +370,17 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
                 Z3_L_UNDEF
             );
             let n = term_vec.len();
+            let mut goal_roots = assertions.clone();
+            goal_roots.extend(term_vec.iter().copied());
+            if has_loose_bound_variable(ctx, &goal_roots) {
+                ctx.last_error = super::Z3_EXCEPTION;
+                ctx.error_msg = Some(UNBOUND_VARIABLES_REASON.to_string());
+                return Z3_L_UNDEF;
+            }
+            if let Some(reason) = lossy_binder_refusal(ctx, &goal_roots) {
+                ctx.error_msg = Some(reason);
+                return Z3_L_UNDEF;
+            }
             let mut finite_set_roots = assertions.clone();
             finite_set_roots.extend(tracked_lits.iter().copied());
             finite_set_roots.extend(term_vec.iter().copied());
@@ -413,7 +442,7 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             }
 
             // Load the goal into the shared engine (replaces any prior goal).
-            if let Err(e) = ctx.solver.try_reset_assertions() {
+            if let Err(e) = ctx.reset_engine_for_solver_goal() {
                 ctx.last_error = super::Z3_EXCEPTION;
                 ctx.error_msg = Some(format!("{e}"));
                 return Z3_L_UNDEF;
@@ -434,6 +463,19 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             }
             if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
                 ctx.last_error = super::Z3_EXCEPTION;
+                ctx.error_msg = Some(e);
+                return Z3_L_UNDEF;
+            }
+            let mut wf_roots = finite_set_roots.clone();
+            wf_roots.extend(
+                assertions
+                    .iter()
+                    .chain(&tracked_lits)
+                    .chain(&term_vec)
+                    .copied(),
+            );
+            wf_roots.extend(ctx.global_definition_axioms.iter().copied());
+            if let Err(e) = assert_reachable_wf_guards(ctx, &wf_roots) {
                 ctx.error_msg = Some(e);
                 return Z3_L_UNDEF;
             }
@@ -507,7 +549,11 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             ctx.last_error = Z3_OK;
             Z3_L_TRUE
         })
-    }
+    };
+    // SAFETY: the guarded query has returned, so no borrow of `c` remains;
+    // `c` is null or the caller's live context.
+    unsafe { finish_handle_query(c, settings, "Z3_get_implied_equalities") };
+    verdict
 }
 
 // ============================================================================
@@ -639,7 +685,7 @@ pub unsafe extern "C" fn Z3_qe_model_project(
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/witness handled inside the core.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             qe_project_core(ctx, m, &bound_asts, body, ptr::null_mut())
         })
     }
@@ -669,7 +715,7 @@ pub unsafe extern "C" fn Z3_qe_model_project_skolem(
     // SAFETY: valid array per contract.
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/`map` handled inside the core.
-    unsafe { ffi_guard_ast(c, |ctx| qe_project_core(ctx, m, &bound_asts, body, map)) }
+    unsafe { ffi_guard_produced(c, |ctx| qe_project_core(ctx, m, &bound_asts, body, map)) }
 }
 
 /// Project the bound variables out of `body`, filling `map` with the model
@@ -699,7 +745,7 @@ pub unsafe extern "C" fn Z3_qe_model_project_with_witness(
     // SAFETY: valid array per contract.
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/`map` handled inside the core.
-    unsafe { ffi_guard_ast(c, |ctx| qe_project_core(ctx, m, &bound_asts, body, map)) }
+    unsafe { ffi_guard_produced(c, |ctx| qe_project_core(ctx, m, &bound_asts, body, map)) }
 }
 
 // ============================================================================
@@ -737,7 +783,7 @@ pub unsafe extern "C" fn Z3_datatype_update_field(
 ) -> Z3_ast {
     // SAFETY: `ffi_guard_ast` guards `c`; `field_access` null-checked below.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_datatype_update_field", |ctx| {
             let t_term =
                 require_term_ast_or_return!(ctx, t, "Z3_datatype_update_field", "datatype term", 0);
             let value_term = require_term_ast_or_return!(
@@ -1107,8 +1153,8 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                 }
             }
             if install_error.is_none() {
-                for (t, w, group) in &new_softs {
-                    if let Err(e) = tgt.solver.assert_soft(*t, *w, group.as_deref()) {
+                for (t, w, _group) in &new_softs {
+                    if let Err(e) = tgt.solver.assert_soft(*t, *w, None) {
                         install_error = Some(format!("cannot install soft constraint: {e}"));
                         break;
                     }
@@ -1152,6 +1198,13 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                 return ptr::null_mut();
             }
 
+            let mut objective_slots: Vec<super::ObjectiveSlot> = Vec::new();
+            for (_, _, group) in &new_softs {
+                let slot = super::ObjectiveSlot::Soft(group.clone());
+                if !objective_slots.contains(&slot) {
+                    objective_slots.push(slot);
+                }
+            }
             let handle = Box::into_raw(Box::new(OptimizeHandle {
                 _ctx: target,
                 hard: new_hard,
@@ -1165,7 +1218,13 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                     .collect(),
                 parsed_soft_public_terms: Vec::new(),
                 public_objectives: Vec::new(),
+                objective_senses: Vec::new(),
+                objective_slots,
+                replay_blocker: None,
+                last_objective_values: Vec::new(),
+                last_objective_epsilons: Vec::new(),
                 last_model: None,
+                last_model_text: None,
                 last_check_outcome: None,
                 tracked: new_tracked,
                 scope_markers: Vec::new(),
@@ -1173,6 +1232,7 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                 last_reason_unknown: None,
                 last_statistics: None,
                 terminal_error: None,
+                params: ParamSet::default(),
             }));
             tgt.optimize_handle_cache.push(handle);
             tgt.decision_engine_poisoned = None;

@@ -46,9 +46,14 @@ struct ProofStreamingLoad<'a> {
     original_clauses: Vec<(u64, Vec<i32>)>,
     num_vars: usize,
     num_clauses_declared: usize,
+    /// Clause lines read, which is how VeriPB numbers the formula's constraints.
+    num_clauses_read: u64,
     clause_buf: Vec<Literal>,
     dense_route_requested: bool,
     dense_route_clauses: Option<Vec<Vec<Literal>>>,
+    /// `--sat-veripb-hints` on a VeriPB proof: every clause line is recorded
+    /// for hint lookup, numbered as VeriPB numbers it.
+    note_veripb_originals: bool,
 }
 
 impl<'a> ProofStreamingLoad<'a> {
@@ -61,9 +66,12 @@ impl<'a> ProofStreamingLoad<'a> {
             original_clauses: Vec::new(),
             num_vars: 0,
             num_clauses_declared: 0,
+            num_clauses_read: 0,
             clause_buf: Vec::with_capacity(32),
             dense_route_requested: ay_core::sat_ab_switches().dense_clique_php_proof_route,
             dense_route_clauses: None,
+            note_veripb_originals: proof.format == ProofFormat::Veripb
+                && ay_core::sat_ab_switches().veripb_hints == Some(true),
         }
     }
 
@@ -113,9 +121,13 @@ impl<'a> ProofStreamingLoad<'a> {
             self.original_clauses
                 .push((self.original_clauses.len() as u64 + 1, raw.to_vec()));
         }
+        self.num_clauses_read += 1;
         features.add_dimacs_clause_to_buffer(raw, &mut self.clause_buf);
         if let Some(clauses) = self.dense_route_clauses.as_mut() {
             clauses.push(self.clause_buf.clone());
+        }
+        if self.note_veripb_originals {
+            solver.note_veripb_original(&self.clause_buf, self.num_clauses_read);
         }
         solver.add_clause_reusing_buffer(&mut self.clause_buf);
         Ok(())
@@ -200,6 +212,7 @@ fn run_proof_streaming_reader_body<R: Read>(
         exit_after_streaming_proof_parse_error(load.solver, proof, error);
     }
     let mut solver = require_streaming_proof_solver(load.solver);
+    solver.set_veripb_original_clauses(load.num_clauses_read);
     let features = load
         .features
         .map(SatFeatureAccumulator::finish)

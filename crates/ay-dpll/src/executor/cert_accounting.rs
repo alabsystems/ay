@@ -105,6 +105,19 @@ mod counters {
     pub(super) static RAW_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
     /// Computed verdicts refused at the publication funnel.
     pub(super) static PUBLICATION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    /// Of `PUBLICATION_REJECTIONS`, those recorded while a NESTED
+    /// certification sub-solve was in flight.
+    ///
+    /// These counters are process-global, so a refusal inside a deferred-trust
+    /// discharge or closed-sentence refutation — an internal probe that
+    /// deliberately fails closed on its own strength while the OUTER
+    /// certification goes on to succeed — lands in the same total as a refusal
+    /// of the user's own query. Reading the total alone therefore reports
+    /// "a verdict was refused and published anyway" on runs where nothing of
+    /// the sort happened. Subtracting this field leaves the public-query
+    /// refusals, which are the only ones that can describe the published
+    /// verdict.
+    pub(super) static PUBLICATION_REJECTIONS_NESTED: AtomicU64 = AtomicU64::new(0);
 }
 
 /// An immutable read of the process-global certification counters.
@@ -146,7 +159,14 @@ pub struct CertificationAccounting {
     /// certificate (#proof-capability B3 competition shedding).
     pub raw_admissions: u64,
     /// Verdicts refused by the publication funnel.
+    ///
+    /// This is a process-global total that includes nested certification
+    /// sub-solves; see [`Self::publication_rejections_nested`] before reading
+    /// it as a statement about the published verdict.
     pub publication_rejections: u64,
+    /// Of `publication_rejections`, those recorded inside a nested
+    /// certification sub-solve rather than on the user's own query.
+    pub publication_rejections_nested: u64,
 }
 
 impl CertificationAccounting {
@@ -171,6 +191,7 @@ impl CertificationAccounting {
             nested_corroboration_nanos: load(&counters::NESTED_CORROBORATION_NANOS),
             raw_admissions: load(&counters::RAW_ADMISSIONS),
             publication_rejections: load(&counters::PUBLICATION_REJECTIONS),
+            publication_rejections_nested: load(&counters::PUBLICATION_REJECTIONS_NESTED),
         }
     }
 
@@ -195,6 +216,7 @@ impl CertificationAccounting {
             &counters::NESTED_CORROBORATION_NANOS,
             &counters::RAW_ADMISSIONS,
             &counters::PUBLICATION_REJECTIONS,
+            &counters::PUBLICATION_REJECTIONS_NESTED,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -240,6 +262,9 @@ impl CertificationAccounting {
             publication_rejections: self
                 .publication_rejections
                 .saturating_sub(earlier.publication_rejections),
+            publication_rejections_nested: self
+                .publication_rejections_nested
+                .saturating_sub(earlier.publication_rejections_nested),
         }
     }
 }
@@ -252,7 +277,7 @@ impl std::fmt::Display for CertificationAccounting {
             "cert: decisions={} (internal-lemma={}, proof-tracked={}, both={}) \
              decision_ms={:.1} proof_steps={} mints={} mint_ms={:.1} \
              (internal-lemma mints={} ms={:.1}) nested_corroboration={} ms={:.1} \
-             raw_admissions={} rejections={}",
+             raw_admissions={} rejections={} (nested={})",
             self.decisions,
             self.decisions_internal_lemma,
             self.decisions_proof_tracked,
@@ -267,6 +292,7 @@ impl std::fmt::Display for CertificationAccounting {
             ms(self.nested_corroboration_nanos),
             self.raw_admissions,
             self.publication_rejections,
+            self.publication_rejections_nested,
         )
     }
 }
@@ -306,9 +332,29 @@ pub(in crate::executor) fn record_raw_admission() {
     bump(&counters::RAW_ADMISSIONS, 1);
 }
 
+/// Whose publication funnel refused the verdict.
+///
+/// The counters are process-global, so without this distinction an internal
+/// probe's own (correct, fail-closed) refusal is indistinguishable from a
+/// refusal of the user's query. That conflation is what made a corpus census
+/// read `cert.publication_rejections > 0` next to a published verdict as
+/// "publish after rejection".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum RejectionScope {
+    /// The refusal decided the verdict the caller asked for.
+    PublicQuery,
+    /// The refusal decided a nested certification sub-solve run inside a mint
+    /// (deferred-trust discharge, closed-sentence refutation). The enclosing
+    /// public query is unaffected and may still publish on its own evidence.
+    NestedCertificationSolve,
+}
+
 /// Record a verdict refused by the publication funnel.
-pub(in crate::executor) fn record_publication_rejection() {
+pub(in crate::executor) fn record_publication_rejection(scope: RejectionScope) {
     bump(&counters::PUBLICATION_REJECTIONS, 1);
+    if scope == RejectionScope::NestedCertificationSolve {
+        bump(&counters::PUBLICATION_REJECTIONS_NESTED, 1);
+    }
 }
 
 /// Times the outermost command-boundary decision command on one executor.
@@ -386,7 +432,8 @@ mod tests {
         let before = CertificationAccounting::snapshot();
         record_decision(QueryPublicationRole::InternalLemma, true, 7);
         record_raw_admission();
-        record_publication_rejection();
+        record_publication_rejection(RejectionScope::PublicQuery);
+        record_publication_rejection(RejectionScope::NestedCertificationSolve);
         drop(MintTimer::start(QueryPublicationRole::InternalLemma));
         drop(NestedCorroborationTimer::start());
         drop(DecisionTimer::start());
@@ -401,7 +448,23 @@ mod tests {
         assert!(delta.mints_internal_lemma >= 1);
         assert!(delta.nested_corroboration_solves >= 1);
         assert!(delta.raw_admissions >= 1);
-        assert!(delta.publication_rejections >= 1);
+        assert!(delta.publication_rejections >= 2);
+        assert!(delta.publication_rejections_nested >= 1);
+    }
+
+    /// The nested cell is a SUBSET of the total, on every counter read.
+    /// A census computes the public share as `total - nested`, so an
+    /// over-counted nested cell would make that subtraction underflow into a
+    /// wrong (or, with `saturating_sub`, silently zero) answer.
+    #[test]
+    fn the_nested_cell_never_exceeds_the_total() {
+        record_publication_rejection(RejectionScope::PublicQuery);
+        record_publication_rejection(RejectionScope::NestedCertificationSolve);
+        let now = CertificationAccounting::snapshot();
+        assert!(
+            now.publication_rejections >= now.publication_rejections_nested,
+            "nested refusals are a subset of all refusals"
+        );
     }
 
     #[test]

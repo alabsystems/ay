@@ -13,6 +13,7 @@ use std::ptr;
 
 use ay_dpll::api::{Logic, Solver};
 
+use super::handle_params::ParamSet;
 use super::{
     apply_supported_params, cache_int_symbol, cache_string, cache_symbol, ffi_guard_const_ptr,
     ffi_guard_ptr, ffi_guard_void, ffi_read_bounded_text, require_term_ast_or_return, Z3Config,
@@ -80,6 +81,39 @@ pub unsafe extern "C" fn Z3_set_param_value(
     }));
 }
 
+/// Install the process-wide `--z3-mode` transcript flag once, when a context
+/// is created: the z3 C API library writes nothing to the host's
+/// stderr (z3 does not). The posture only silences the CLI diagnostics (the
+/// partial-model note, MODEL-UNCONFIRMED, the unbounded-objective warning)
+/// and changes no verdict. A no-op when the process already installed its
+/// flags.
+fn install_z3_transcript_posture() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::panic::catch_unwind(|| {
+            ay_core::set_global_misc_cli_flags_with(|flags| flags.z3_transcript = true)
+        });
+    });
+}
+
+/// The engine of a new context with the configuration `c`'s recognized
+/// parameters applied, and those parameters as the context defaults every
+/// handle's own parameters override (see `handle_params`).
+///
+/// # Safety
+/// `c` must be a valid config pointer or null.
+unsafe fn configured_engine(c: Z3_config) -> (Solver, ParamSet) {
+    let mut solver = Solver::new(Logic::All);
+    let mut defaults = ParamSet::default();
+    // SAFETY: `c` is null-checked by `as_ref` and otherwise a live
+    // configuration handle the caller owns (single-threaded shared read).
+    if let Some(config) = unsafe { c.as_ref() } {
+        apply_supported_params(&mut solver, &config.params);
+        defaults.record(&config.params);
+    }
+    (solver, defaults)
+}
+
 /// Shared constructor for both `Z3_mk_context` and `Z3_mk_context_rc`.
 ///
 /// `ref_counted` records whether the caller opted into z3py-style reference
@@ -90,25 +124,25 @@ pub unsafe extern "C" fn Z3_set_param_value(
 /// # Safety
 /// `c` must be a valid config pointer or null.
 unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
-    // Solver::new could theoretically panic; use catch_unwind directly since
-    // we don't have a context yet to pass to ffi_guard.
+    // Solver::new could panic, and there is no context yet for ffi_guard.
     match std::panic::catch_unwind(|| {
-        let mut solver = Solver::new(Logic::All);
-        if !c.is_null() {
-            // SAFETY: `c` was null-checked above and originates from a prior AY FFI allocation
-            // whose handle is kept alive by the owning `Z3Context` (see handle caches in
-            // `mod.rs`). Reading `.params` is a shared-read with no concurrent mutation
-            // because the Z3 C API is single-threaded per context.
-            unsafe {
-                apply_supported_params(&mut solver, &(*c).params);
-            }
-        }
+        // SAFETY: `c` is null or a live configuration handle per this
+        // function's contract, read once while the context is built.
+        let (solver, default_params) = unsafe { configured_engine(c) };
         Box::into_raw(Box::new(Z3Context {
             solver,
+            eval_session: None,
+            eval_active: false,
+            proof_check_callback: None,
+            proof_check_user_context: std::ptr::null_mut(),
+            proof_tracking: Default::default(),
             last_error: Z3_OK,
             error_msg: None,
             decision_owner: None,
             decision_engine_poisoned: None,
+            optimize_engine_displaced: false,
+            optimize_engine_owner: ptr::null(),
+            text_datatypes: Default::default(),
             string_cache: Vec::new(),
             symbol_cache: Vec::new(),
             ffi_const_cache: std::collections::HashMap::new(),
@@ -116,13 +150,22 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             ffi_const_terms_by_identity: std::collections::HashMap::new(),
             ffi_func_names: std::collections::HashMap::new(),
             ffi_func_decls: std::collections::HashMap::new(),
+            ffi_rec_func_decls: std::collections::HashMap::new(),
+            wf_guards: std::collections::HashMap::new(),
+            uninterpreted_sort_names: std::collections::HashSet::new(),
+            bounded_sort_lost: std::collections::HashSet::new(),
+            default_params,
             ffi_decl_symbols: std::collections::HashMap::new(),
             ffi_dt_recognizers: std::collections::HashMap::new(),
             ffi_sort_symbols: std::collections::HashMap::new(),
             ffi_used_decl_names: std::collections::HashSet::new(),
             next_ffi_fresh_id: 0,
-            term_asts: std::cell::RefCell::default(),
-            ast_sorts: Vec::new(),
+            pub_ast: super::pub_ast::PubStore::default(),
+            provenance: super::provenance::Provenance::default(),
+            dt_decl_index: std::collections::HashMap::new(),
+            func_decl_intern: std::collections::HashMap::new(),
+            error_handler: None,
+            error_handler_active: false,
             finite_set_sorts: std::collections::HashMap::new(),
             finite_set_sorts_by_basis: std::collections::HashMap::new(),
             finite_set_term_provenance: std::collections::HashMap::new(),
@@ -133,7 +176,6 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             quantifier_no_patterns: std::collections::HashMap::new(),
             quantifier_ffi_metadata: std::collections::HashMap::new(),
             finite_set_apps: std::collections::HashMap::new(),
-            finite_set_app_backings: std::collections::HashMap::new(),
             finite_set_app_cache: std::collections::HashMap::new(),
             finite_set_decl_signatures: std::collections::HashMap::new(),
             sort_cache: Vec::new(),
@@ -157,8 +199,6 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             probe_cache: Vec::new(),
             parser_context_cache: Vec::new(),
             handle_salt: super::next_handle_salt(),
-            sort_ids: std::collections::HashMap::new(),
-            next_sort_id: 1,
             sort_ast_handles: Vec::new(),
             decl_ast_ids: std::collections::HashMap::new(),
             decl_ast_handles: Vec::new(),
@@ -167,6 +207,9 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             ref_counted,
             ast_refcounts: std::collections::HashMap::new(),
             proof_texts: Vec::new(),
+            proof_applications: Default::default(),
+            proof_application_intern: Default::default(),
+            proof_declarations: Default::default(),
             rcf_num_cache: Vec::new(),
             algebraic_values: Vec::new(),
             background_axioms: Vec::new(),
@@ -201,6 +244,7 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
 /// `c` must be a valid config pointer or null.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_context(c: Z3_config) -> Z3_context {
+    install_z3_transcript_posture();
     // SAFETY: forwards the caller's `# Safety` contract to `mk_context_inner`.
     unsafe { mk_context_inner(c, false) }
 }
@@ -218,6 +262,7 @@ pub unsafe extern "C" fn Z3_mk_context(c: Z3_config) -> Z3_context {
 /// `c` must be a valid config pointer or null.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_context_rc(c: Z3_config) -> Z3_context {
+    install_z3_transcript_posture();
     // SAFETY: forwards the caller's `# Safety` contract to `mk_context_inner`.
     unsafe { mk_context_inner(c, true) }
 }

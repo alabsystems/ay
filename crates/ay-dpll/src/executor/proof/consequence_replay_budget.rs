@@ -2,7 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Query-owned cumulative WALL envelope for consequence-replay ground probes.
+//! Query-owned cumulative envelope for consequence-replay ground probes,
+//! counted in split-loop round trips and backstopped by wall time.
 //!
 //! # Why this exists
 //!
@@ -43,6 +44,24 @@
 //! corroboration re-solve of the lane it needs to build its proof would turn a
 //! publication regression into a certification regression.
 //!
+//! # Counted, not timed (#deterministic-probe-metering)
+//!
+//! A probe used to stop at its wall grant. A same-context probe runs on the
+//! ENCLOSING query's term store, so where it stops decides which terms it
+//! mints, and every later solve of the query sees them: the deductive-checks set-fold
+//! obligation (`deductive_checks_set_fold_posture`) cut its anchored probe at 123
+//! split rounds on an X925 core and at 69 on an A725 core, after which the
+//! whole-set probe, the corroboration solve and the verdict's timing all
+//! differed run to run. A grant is now counted in split-loop round trips
+//! (`ay_core::resource::enter_work_grant`), which stop a probe at the same
+//! round on every host. The wall grant stays, unchanged, as the BACKSTOP: a
+//! probe never runs longer than it did before, and only a probe whose rounds
+//! are slower than the calibration at [`ProbeCap`] still stops at the wall.
+//!
+//! Both currencies are deducted at claim and refunded at settle. The counted
+//! one is the one a probe normally runs out of; the wall one keeps the lane's
+//! total wall spend inside [`QUERY_PROBE_BUDGET_MS`] whatever the rounds cost.
+//!
 //! # Soundness
 //!
 //! Declining a probe can only make this lane return `None`, which the caller
@@ -68,6 +87,66 @@ pub(in crate::executor) const QUERY_PROBE_BUDGET_MS: u64 = 5_000;
 /// granting it only converts the remaining envelope into latency.
 const MIN_PROBE_BUDGET_MS: u64 = 250;
 
+/// One probe's ceiling in both currencies: the counted grant it normally
+/// stops at, and the wall backstop it never outlives.
+///
+/// CALIBRATION (541fd07bb, release, `-C target-cpu=native`), per plan shape.
+///
+/// Capability, the floor under each count: across the 770 metered probes of
+/// `group_quantifiers`, `group_proofs`, `group_auflia`, `group_regression`
+/// and `deductive_checks_*`, the probes that RETURNED A PROOF used at most 7 split-loop
+/// round trips under a standard plan, 4 in a standard anchored attempt, 1
+/// under a positive-Skolem plan and 50 in a positive-Skolem anchored attempt
+/// (a quarter of the plan's grant here: 60). A scoped whole-set probe whose
+/// raw UNSAT has no strict proof (`UnsatUnpromotable`) arms the unscoped
+/// retry, so its count matters too: the most such a probe used is 59
+/// (`deductive_checks` quantified frame), five under the standard grant. On base's
+/// X925 trajectory of the set-fold obligation one reached raw UNSAT only
+/// after 82; a 64-round grant cuts it (its retry proved nothing there).
+///
+/// Wall, the ceiling over each count: the costliest probe rounds measured,
+/// the deductive-checks set-fold obligation's whole-set probes (standard plan), take
+/// up to 14.1 ms each on a slow (A725) core at the host's usual load of 9-14
+/// (7.5-8.9 ms on an X925 core), so 64 of them take 0.9 s of the 2 s cap and
+/// 240 would take 3.4 s of 5 s; two solves sharing one A725 core still stop
+/// that probe at its count, after 1.6 s. A probe whose rounds cost more than
+/// `wall_ms / round_trips` on its host stops at its unchanged wall grant
+/// first, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) struct ProbeCap {
+    pub(in crate::executor) wall_ms: u64,
+    pub(in crate::executor) round_trips: u64,
+}
+
+impl ProbeCap {
+    /// Forall, dual-source and negative-Skolem plans.
+    pub(in crate::executor) const STANDARD: Self = Self {
+        wall_ms: 2_000,
+        round_trips: 64,
+    };
+
+    /// The positive-Skolem plan of finite-frame replay.
+    pub(in crate::executor) const POSITIVE_SKOLEM: Self = Self {
+        wall_ms: 5_000,
+        round_trips: 240,
+    };
+
+    /// `1 / divisor` of this cap, in both currencies.
+    pub(in crate::executor) const fn share(self, divisor: u64) -> Self {
+        Self {
+            wall_ms: self.wall_ms / divisor,
+            round_trips: self.round_trips / divisor,
+        }
+    }
+}
+
+/// The counted envelope, sized like [`QUERY_PROBE_BUDGET_MS`]: one whole
+/// positive-Skolem probe.
+pub(in crate::executor) const QUERY_PROBE_ROUND_TRIPS: u64 = ProbeCap::POSITIVE_SKOLEM.round_trips;
+
+/// The counted floor: [`MIN_PROBE_BUDGET_MS`] of a standard plan's rounds.
+const MIN_PROBE_ROUND_TRIPS: u64 = 8;
+
 /// Largest fraction of the caller's REMAINING deadline a single probe may
 /// claim, as a divisor. The envelope above is absolute; this one is relative,
 /// and is what keeps the lane from consuming a short caller timeout down to
@@ -85,6 +164,15 @@ pub(in crate::executor) struct ConsequenceReplayProbeBudget {
     /// it is the quantity a barrier test can assert on without measuring the
     /// host's clock: grants are decided by this module, elapsed time is not.
     granted_ms: u64,
+    /// Grants handed out since the last external query boundary. A count,
+    /// not a clock: it tells one probe from a probe plus its unscoped retry
+    /// identically on an idle and on a loaded host.
+    claims: u32,
+    /// The counted envelope left, in split-loop round trips.
+    remaining_round_trips: u64,
+    /// Round trips HANDED OUT since the last external query boundary, net of
+    /// refunds: `granted_round_trips() <= QUERY_PROBE_ROUND_TRIPS`.
+    granted_round_trips: u64,
 }
 
 impl Default for ConsequenceReplayProbeBudget {
@@ -92,6 +180,9 @@ impl Default for ConsequenceReplayProbeBudget {
         Self {
             remaining_ms: QUERY_PROBE_BUDGET_MS,
             granted_ms: 0,
+            claims: 0,
+            remaining_round_trips: QUERY_PROBE_ROUND_TRIPS,
+            granted_round_trips: 0,
         }
     }
 }
@@ -103,12 +194,19 @@ impl Default for ConsequenceReplayProbeBudget {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::executor) struct ProbeGrant {
     granted_ms: u64,
+    round_trips: u64,
 }
 
 impl ProbeGrant {
-    /// Wall budget to hand the disposable probe executor.
+    /// Wall backstop to hand the disposable probe executor.
     pub(in crate::executor) fn budget_ms(self) -> u64 {
         self.granted_ms
+    }
+
+    /// Split-loop round trips the probe may run: the grant it normally stops
+    /// at, at the same round on every host.
+    pub(in crate::executor) fn round_trips(self) -> u64 {
+        self.round_trips
     }
 }
 
@@ -116,21 +214,22 @@ impl ConsequenceReplayProbeBudget {
     /// Re-arm at the outer API/command query boundary. Internal authority
     /// restarts, cascade retries, and nested solves must not call this.
     pub(in crate::executor) fn begin_external_query(&mut self) {
-        self.remaining_ms = QUERY_PROBE_BUDGET_MS;
-        self.granted_ms = 0;
+        *self = Self::default();
     }
 
     /// Deduct and return the slice a probe may run for, or `None` when this
-    /// query has no useful wall time left to give it.
+    /// query has no useful work or wall time left to give it.
     ///
-    /// `per_probe_cap_ms` is the lane's own per-probe ceiling; `deadline` is
-    /// the caller's live solve deadline, if any.
+    /// `cap` is the lane's own per-probe ceiling. `deadline` is the caller's
+    /// live solve deadline, if any: it is the outer wall, and only the wall
+    /// backstop is shared out of it.
     pub(in crate::executor) fn claim(
         &mut self,
-        per_probe_cap_ms: u64,
+        cap: ProbeCap,
         deadline: Option<Instant>,
     ) -> Option<ProbeGrant> {
-        let mut granted = per_probe_cap_ms.min(self.remaining_ms);
+        let round_trips = cap.round_trips.min(self.remaining_round_trips);
+        let mut granted = cap.wall_ms.min(self.remaining_ms);
         if let Some(deadline) = deadline {
             let remaining_deadline_ms = u64::try_from(
                 deadline
@@ -140,25 +239,41 @@ impl ConsequenceReplayProbeBudget {
             .unwrap_or(u64::MAX);
             granted = granted.min(remaining_deadline_ms / u64::from(DEADLINE_SHARE_DIVISOR));
         }
-        if granted < MIN_PROBE_BUDGET_MS {
+        if granted < MIN_PROBE_BUDGET_MS || round_trips < MIN_PROBE_ROUND_TRIPS {
             return None;
         }
         self.remaining_ms = self.remaining_ms.saturating_sub(granted);
         self.granted_ms = self.granted_ms.saturating_add(granted);
+        self.remaining_round_trips = self.remaining_round_trips.saturating_sub(round_trips);
+        self.granted_round_trips = self.granted_round_trips.saturating_add(round_trips);
+        self.claims = self.claims.saturating_add(1);
         Some(ProbeGrant {
             granted_ms: granted,
+            round_trips,
         })
     }
 
-    /// Return the unspent remainder of a grant. `spent_ms` is measured wall
-    /// time; anything at or above the grant refunds nothing.
-    pub(in crate::executor) fn settle(&mut self, grant: ProbeGrant, spent_ms: u64) {
+    /// Return the unspent remainder of a grant in both currencies. `spent_ms`
+    /// is measured wall time and `spent_round_trips` the round trips the probe
+    /// started; anything at or above the grant refunds nothing.
+    pub(in crate::executor) fn settle(
+        &mut self,
+        grant: ProbeGrant,
+        spent_ms: u64,
+        spent_round_trips: u64,
+    ) {
         let refund = grant.granted_ms.saturating_sub(spent_ms);
         self.remaining_ms = self
             .remaining_ms
             .saturating_add(refund)
             .min(QUERY_PROBE_BUDGET_MS);
         self.granted_ms = self.granted_ms.saturating_sub(refund);
+        let refund = grant.round_trips.saturating_sub(spent_round_trips);
+        self.remaining_round_trips = self
+            .remaining_round_trips
+            .saturating_add(refund)
+            .min(QUERY_PROBE_ROUND_TRIPS);
+        self.granted_round_trips = self.granted_round_trips.saturating_sub(refund);
     }
 
     /// Remaining envelope, for `--trace-cegqi-attr` attribution and tests.
@@ -173,15 +288,37 @@ impl ConsequenceReplayProbeBudget {
         self.granted_ms
     }
 
+    /// Grants handed out since the last external query boundary.
+    pub(in crate::executor) fn claims(&self) -> u32 {
+        self.claims
+    }
+
+    /// Counted envelope left, in round trips.
+    pub(in crate::executor) fn remaining_round_trips(&self) -> u64 {
+        self.remaining_round_trips
+    }
+
+    /// Round trips granted to probes since the last external query boundary,
+    /// net of refunds.
+    #[cfg(test)]
+    pub(in crate::executor) fn granted_round_trips(&self) -> u64 {
+        self.granted_round_trips
+    }
+
     #[cfg(test)]
     pub(in crate::executor) fn set_remaining_ms(&mut self, remaining_ms: u64) {
         self.remaining_ms = remaining_ms;
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor) fn set_remaining_round_trips(&mut self, remaining: u64) {
+        self.remaining_round_trips = remaining;
     }
 }
 
 impl Executor {
     /// Run ONE consequence-replay ground probe under this query's cumulative
-    /// wall envelope, or decline without running it.
+    /// envelope, counted and wall-backstopped, or decline without running it.
     ///
     /// The probe's wall clock is spent out of the enclosing query's
     /// PUBLICATION window: every millisecond here is one certification and the
@@ -192,7 +329,7 @@ impl Executor {
     pub(in crate::executor) fn metered_consequence_replay_probe(
         &mut self,
         consequences: &[ay_core::TermId],
-        per_probe_cap_ms: u64,
+        cap: ProbeCap,
     ) -> Option<ay_core::Proof> {
         use crate::executor::quantifier_loop::result_mapping::SameContextProbeOutcome;
 
@@ -200,7 +337,7 @@ impl Executor {
         // #7956 posture — a derived window on the shared store must not let
         // the fixpoint seed hundreds of phantom congruence axioms from the
         // outer solve's dead array-equality terms.
-        match self.granted_consequence_replay_probe(consequences, per_probe_cap_ms, true)? {
+        match self.granted_consequence_replay_probe(consequences, cap, true)? {
             SameContextProbeOutcome::Proof(proof) => Some(proof),
             SameContextProbeOutcome::UnsatUnpromotable => {
                 // (#frame-probe-unscoped-retry) The scoped probe refuted the
@@ -216,11 +353,7 @@ impl Executor {
                 // the raw-UNSAT-but-unpromotable outcome is retried, and the
                 // retried proof still passes the probe's strict checker, the
                 // stitcher, and the outer strict re-check before publication.
-                match self.granted_consequence_replay_probe(
-                    consequences,
-                    per_probe_cap_ms,
-                    false,
-                )? {
+                match self.granted_consequence_replay_probe(consequences, cap, false)? {
                     SameContextProbeOutcome::Proof(proof) => Some(proof),
                     SameContextProbeOutcome::UnsatUnpromotable | SameContextProbeOutcome::Other => {
                         None
@@ -231,22 +364,36 @@ impl Executor {
         }
     }
 
+    /// ONE window-scoped claim and no unscoped retry: the anchored-first
+    /// consequence-replay attempt's probe. Its spend can then never exceed the
+    /// one grant it was sized for, so the whole-set probe that follows a
+    /// failed attempt keeps the rest of the envelope.
+    pub(in crate::executor) fn metered_scoped_consequence_replay_probe(
+        &mut self,
+        consequences: &[ay_core::TermId],
+        cap: ProbeCap,
+    ) -> Option<ay_core::Proof> {
+        use crate::executor::quantifier_loop::result_mapping::SameContextProbeOutcome;
+
+        match self.granted_consequence_replay_probe(consequences, cap, true)? {
+            SameContextProbeOutcome::Proof(proof) => Some(proof),
+            SameContextProbeOutcome::UnsatUnpromotable | SameContextProbeOutcome::Other => None,
+        }
+    }
+
     /// Claim one grant from the query envelope, run one same-context probe
     /// under it, settle the unspent remainder, and report the attribution.
     /// `None` means the envelope itself declined (no grant, no probe run).
     fn granted_consequence_replay_probe(
         &mut self,
         consequences: &[ay_core::TermId],
-        per_probe_cap_ms: u64,
+        cap: ProbeCap,
         scope_to_window: bool,
     ) -> Option<crate::executor::quantifier_loop::result_mapping::SameContextProbeOutcome> {
         use crate::executor::quantifier_loop::result_mapping::SameContextProbeOutcome;
 
         let deadline = self.solve_deadline.get();
-        let Some(grant) = self
-            .consequence_replay_probe_budget
-            .claim(per_probe_cap_ms, deadline)
-        else {
+        let Some(grant) = self.consequence_replay_probe_budget.claim(cap, deadline) else {
             super::authored_consequence_replay::replay_note(|| {
                 "decline: query probe envelope exhausted; a refutation this lane \
                  would have stitched must now publish through another lane"
@@ -255,21 +402,33 @@ impl Executor {
             return None;
         };
         let started = Instant::now();
-        let outcome =
-            self.checked_same_context_unsat_proof(consequences, grant.budget_ms(), scope_to_window);
+        let round_trips_before = ay_core::resource::thread_round_trips();
+        let outcome = self.checked_same_context_unsat_proof(
+            consequences,
+            crate::executor::quantifier_loop::result_mapping::SameContextWindow::Ground,
+            Some(grant.budget_ms()),
+            Some(grant.round_trips()),
+            scope_to_window,
+        );
+        let spent_round_trips =
+            ay_core::resource::thread_round_trips().saturating_sub(round_trips_before);
         let spent_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.consequence_replay_probe_budget.settle(grant, spent_ms);
+        self.consequence_replay_probe_budget
+            .settle(grant, spent_ms, spent_round_trips);
         super::authored_consequence_replay::replay_note(|| {
             format!(
-                "probe(scoped={scope_to_window}): {}, {spent_ms}ms of a {}ms grant \
-                 ({}ms granted, {}ms left in the query envelope)",
+                "probe(scoped={scope_to_window}, claim {}): {}, {spent_round_trips} of {} round \
+                 trips and {spent_ms}ms of a {}ms wall backstop ({} round trips and {}ms \
+                 left in the query envelope)",
+                self.consequence_replay_probe_budget.claims(),
                 match &outcome {
                     SameContextProbeOutcome::Proof(_) => "proof",
                     SameContextProbeOutcome::UnsatUnpromotable => "unsat but no strict proof",
                     SameContextProbeOutcome::Other => "no proof",
                 },
+                grant.round_trips(),
                 grant.budget_ms(),
-                self.consequence_replay_probe_budget.granted_ms(),
+                self.consequence_replay_probe_budget.remaining_round_trips(),
                 self.consequence_replay_probe_budget.remaining_ms(),
             )
         });
@@ -294,89 +453,27 @@ impl Executor {
     pub(crate) fn consequence_replay_probe_envelope_ms() -> u64 {
         QUERY_PROBE_BUDGET_MS
     }
+
+    /// Probe grants this query's consequence-replay lane has claimed. An
+    /// accounting read like the one above, but free of wall time entirely.
+    pub(crate) fn consequence_replay_probe_claims(&self) -> u32 {
+        self.consequence_replay_probe_budget.claims()
+    }
+
+    /// Split-loop round trips this query's lane has been granted, net of
+    /// refunds, and the counted envelope that bounds them.
+    pub(crate) fn consequence_replay_probe_round_trips_granted(&self) -> (u64, u64) {
+        (
+            self.consequence_replay_probe_budget.granted_round_trips(),
+            QUERY_PROBE_ROUND_TRIPS,
+        )
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
+#[path = "consequence_replay_budget_tests.rs"]
+mod tests;
 
-    #[test]
-    fn a_fresh_envelope_grants_the_whole_per_probe_cap() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let grant = budget.claim(5_000, None).expect("fresh envelope grants");
-        assert_eq!(grant.budget_ms(), 5_000);
-        assert_eq!(budget.remaining_ms(), 0);
-    }
-
-    /// The regression in one assertion: four probes that each burn their whole
-    /// slice cost the query ONE envelope, not four per-probe caps.
-    #[test]
-    fn four_exhausting_probes_cost_one_envelope_not_four_caps() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let mut spent = 0;
-        for _ in 0..4 {
-            let Some(grant) = budget.claim(5_000, None) else {
-                continue;
-            };
-            // A probe that exhausts its slice refunds nothing.
-            budget.settle(grant, grant.budget_ms());
-            spent += grant.budget_ms();
-        }
-        assert_eq!(
-            spent, QUERY_PROBE_BUDGET_MS,
-            "the lane's total wall spend per query must be the envelope, not 4 x the per-probe cap"
-        );
-    }
-
-    #[test]
-    fn an_unspent_grant_is_refunded_for_the_next_probe() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let first = budget.claim(5_000, None).expect("fresh envelope grants");
-        budget.settle(first, 40);
-        assert_eq!(budget.remaining_ms(), QUERY_PROBE_BUDGET_MS - 40);
-        let second = budget.claim(5_000, None).expect("refunded envelope grants");
-        assert_eq!(second.budget_ms(), QUERY_PROBE_BUDGET_MS - 40);
-    }
-
-    #[test]
-    fn a_slice_below_the_floor_is_declined_rather_than_granted() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        budget.set_remaining_ms(MIN_PROBE_BUDGET_MS - 1);
-        assert!(budget.claim(5_000, None).is_none());
-        assert_eq!(
-            budget.remaining_ms(),
-            MIN_PROBE_BUDGET_MS - 1,
-            "a declined claim must not deduct"
-        );
-    }
-
-    #[test]
-    fn a_probe_may_not_claim_the_callers_whole_remaining_deadline() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let grant = budget.claim(5_000, Some(deadline)).expect("grants a share");
-        assert!(
-            grant.budget_ms() <= 1_500,
-            "a probe claimed {}ms of a 3000ms remaining deadline",
-            grant.budget_ms()
-        );
-    }
-
-    #[test]
-    fn an_expired_deadline_declines_instead_of_granting() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let deadline = Instant::now();
-        assert!(budget.claim(5_000, Some(deadline)).is_none());
-    }
-
-    #[test]
-    fn the_external_query_boundary_replenishes() {
-        let mut budget = ConsequenceReplayProbeBudget::default();
-        let grant = budget.claim(5_000, None).expect("fresh envelope grants");
-        budget.settle(grant, grant.budget_ms());
-        assert_eq!(budget.remaining_ms(), 0);
-        budget.begin_external_query();
-        assert_eq!(budget.remaining_ms(), QUERY_PROBE_BUDGET_MS);
-    }
-}
+#[cfg(test)]
+#[path = "consequence_replay_work_grant_tests.rs"]
+mod work_grant_tests;

@@ -14,7 +14,7 @@
 # fixture) — AY interns a constant by name within a context, so a shared
 # process-wide context would collide across suites.
 #
-# Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_firstcontact.py -v
+# Run:  targo --unverified build -p ay-ffi  &&  pytest bindings/python/tests/test_firstcontact.py -v
 
 import pytest
 

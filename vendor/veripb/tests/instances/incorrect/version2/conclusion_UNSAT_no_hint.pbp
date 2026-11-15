@@ -1,0 +1,5 @@
+pseudo-Boolean proof version 2.0
+f 3
+output NONE
+conclusion UNSAT
+end pseudo-Boolean proof

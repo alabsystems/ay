@@ -107,6 +107,26 @@ fn accepts_proof_with_no_assumes() {
 }
 
 #[test]
+fn accepts_carcara_reserved_bit_blasting_operators() {
+    // carcara resolves these undeclared (`Operator::BvPBbTerm`/`BvBbTerm`,
+    // `ParamOperator::BvBitOf`/`BvIntOf`); corpus documents using each are
+    // `valid`. An unreserved `@` name stays undefined.
+    let steps = "(step t0 (cl (= #b10 (@pbbterm 0 1) (@bbterm ((_ @bit_of 0) #b10) false) \
+                 ((_ @int_of 1) #b10))) :rule hole)\n";
+    accept(&format!(
+        "{steps}(step t1 (cl) :rule hole :premises (t0))\n"
+    ));
+    let defect = reject(&format!(
+        "{}(step t1 (cl) :rule hole :premises (t0))\n",
+        steps.replace("@bbterm", "@nosuch")
+    ));
+    assert!(
+        matches!(&defect, AletheDefect::UndefinedSymbol { name, .. } if name == "@nosuch"),
+        "{defect:?}"
+    );
+}
+
+#[test]
 fn accepts_all_four_attribute_keywords_in_order() {
     accept(
         "(assume a0 p)\n\
@@ -897,6 +917,40 @@ fn self_check_writer_reports_the_declaration_preamble() {
         verdict.expect_err("must reject").tag(),
         "declaration-command"
     );
+}
+
+/// The writer reads the stream in the dialect it is given: Clean's
+/// vocabulary admits `dt_project`, pinned Carcara's refuses it as
+/// `unknown-rule` (pinned Carcara voids the whole document over it), and
+/// `new` reads the default, Clean.
+#[test]
+fn self_check_writer_reads_the_stream_in_its_dialect() {
+    use std::io::Write as _;
+    let scope = ProblemScope::from_smtlib_source(
+        "(declare-datatypes ((Pair 0)) (((mk (fst Int) (snd Int)))))\n\
+         (declare-const a Int)\n(declare-const b Int)\n",
+    );
+    let text = "(assume a0 (not (= (fst (mk a b)) a)))\n\
+                (step t1 (cl (= (fst (mk a b)) a)) :rule dt_project)\n\
+                (step t2 (cl) :rule resolution :premises (a0 t1))\n";
+    let run = |writer: AletheSelfCheckWriter<Vec<u8>>| {
+        let mut writer = writer;
+        writer.write_all(text.as_bytes()).expect("write");
+        let (sink, verdict) = writer.finish();
+        assert_eq!(String::from_utf8(sink).expect("utf8"), text);
+        verdict
+    };
+    let report = run(AletheSelfCheckWriter::new(Vec::new(), scope.clone()))
+        .expect("the default dialect is Clean");
+    assert_eq!(report.steps, 2);
+    run(AletheSelfCheckWriter::new(Vec::new(), scope.clone()).with_dialect(AletheDialect::Clean))
+        .expect("Clean implements dt_project");
+    match run(
+        AletheSelfCheckWriter::new(Vec::new(), scope).with_dialect(AletheDialect::PinnedCarcara)
+    ) {
+        Err(AletheDefect::UnknownRule { rule, .. }) => assert_eq!(rule, "dt_project"),
+        other => panic!("the pinned vocabulary must refuse dt_project: {other:?}"),
+    }
 }
 
 #[test]

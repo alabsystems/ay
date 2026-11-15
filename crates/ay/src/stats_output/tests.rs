@@ -286,6 +286,36 @@ fn curated_block_states_the_verdict_and_both_clocks() {
     assert!(curated.contains(":time "), "{curated}");
 }
 
+/// `-st` is z3's spelling, and z3 prints four resource rows on every run:
+/// `:time`, `:memory`, `:max-memory` and `:rlimit-count`. Curation kept the
+/// first three and dropped the deterministic one, so a caller comparing ay's
+/// `-st` with z3's found that meter only under `--stats-full`. Each must
+/// survive curation with the full block's value.
+#[test]
+fn curated_block_keeps_z3s_four_resource_rows() {
+    let mut stats = ay_dpll::Statistics::default();
+    stats.rlimit_count = 97;
+    let curated = curated_smt_statistics(&stats, "sat", Duration::ZERO, false);
+    for key in [":time", ":memory", ":max-memory", ":rlimit-count"] {
+        assert!(
+            curated
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(key)),
+            "missing z3 resource row {key} in:\n{curated}"
+        );
+    }
+    assert!(
+        curated
+            .lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>() == [":rlimit-count", "97"]),
+        "the curated :rlimit-count must carry the counter's value:\n{curated}"
+    );
+    assert!(
+        stats.to_string().contains(":rlimit-count 97"),
+        "the full block must carry the same value, or curation invented it"
+    );
+}
+
 /// Group labels are a terminal affordance. Redirected `-st` must stay a
 /// comment-free s-expression, because that is what anything parsing it expects.
 #[test]
@@ -356,4 +386,54 @@ fn quantifier_group_is_conditional_but_complete_once_it_fires() {
             .any(|l| l.contains(":quantifier.proxies_minted") && l.trim_end().ends_with(" 0")),
         "{curated}"
     );
+}
+
+/// The quantified routes record their verdicts, refusals and parked
+/// certificates in `extra`. `-st` prints exactly the keys present under the
+/// three route prefixes, with the full block's value, and nothing on a run the
+/// routes never touched.
+#[test]
+fn quantified_route_rows_follow_extra_exactly() {
+    let idle = ay_dpll::Statistics::default();
+    let curated = curated_smt_statistics(&idle, "sat", Duration::ZERO, true);
+    assert!(!curated.contains("quantified routes"), "{curated}");
+    assert!(!curated.contains(":qsat."), "{curated}");
+
+    let mut engaged = ay_dpll::Statistics::default();
+    engaged.extra.insert(
+        "qsat.publish".to_string(),
+        ay_dpll::StatValue::String("unsat-expansion-refused".to_string()),
+    );
+    engaged
+        .extra
+        .insert("qlra.cert_steps".to_string(), ay_dpll::StatValue::Int(45));
+    engaged
+        .extra
+        .insert("qlra.seconds".to_string(), ay_dpll::StatValue::Float(2.5));
+    engaged.extra.insert(
+        "eq_qe.gate".to_string(),
+        ay_dpll::StatValue::String("refused".to_string()),
+    );
+    engaged
+        .extra
+        .insert("qsatx.unrelated".to_string(), ay_dpll::StatValue::Int(1));
+    let curated = curated_smt_statistics(&engaged, "unknown", Duration::ZERO, false);
+    let full = engaged.to_string();
+    for key in [
+        ":qsat.publish",
+        ":qlra.cert_steps",
+        ":qlra.seconds",
+        ":eq_qe.gate",
+    ] {
+        let row = curated
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(key))
+            .unwrap_or_else(|| panic!("missing {key} in:\n{curated}"));
+        let value = row.split_whitespace().nth(1).expect("row has a value");
+        assert!(
+            full.contains(&format!("{key} {value}")),
+            "curated {key} {value} differs from the full block:\n{full}"
+        );
+    }
+    assert!(!curated.contains(":qsatx."), "{curated}");
 }

@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+f 3;
+solx p1 p2 q1 z1 z2;
+solx p1 ~p2 q1 z1 z2;
+solx ~p1 p2 q1 z1 z2;
+sol ~p1 ~p2 q1 z1 z2;
+rup 1 ~p1 >= 1 ;
+rup >= 1 ;
+output NONE;
+conclusion BOUNDS 10 10;
+end pseudo-Boolean proof;

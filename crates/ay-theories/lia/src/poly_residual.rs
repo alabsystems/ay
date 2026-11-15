@@ -463,7 +463,7 @@ impl LiaSolver<'_> {
                     continue;
                 }
                 let value = -(&rec.poly.constant / coeff);
-                if matches!(self.terms.sort(factor), Sort::Int) && !value.is_integer() {
+                if matches!(self.terms().sort(factor), Sort::Int) && !value.is_integer() {
                     let mut lits = vec![rec.lit];
                     lits.extend(rec.reasons.iter().copied());
                     if let Some(conflict) = self.finish_residual_conflict(lits) {
@@ -489,7 +489,10 @@ impl LiaSolver<'_> {
         let mut vars: Vec<TermId> = self.integer_vars.iter().copied().collect();
         vars.sort_unstable_by_key(|t| t.0);
         for term in vars {
-            let Some((Some(lb), Some(ub))) = self.lra.get_bounds(term) else {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness): the fixed
+            // value is substituted into a residual whose contradiction is a
+            // published conflict.
+            let Some((Some(lb), Some(ub))) = self.justified_bounds(term) else {
                 continue;
             };
             let li = Self::effective_int_lower(&lb);
@@ -518,7 +521,7 @@ impl LiaSolver<'_> {
     ) -> Vec<ResidualAtom> {
         let mut out = Vec::new();
         for &(term, value) in atoms {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(term) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(term) else {
                 continue;
             };
             if args.len() != 2 {
@@ -533,13 +536,13 @@ impl LiaSolver<'_> {
                 ">" => (ResidualOp::Lt, true),
                 _ => continue,
             };
-            if !matches!(self.terms.sort(args[0]), Sort::Int | Sort::Real) {
+            if !matches!(self.terms().sort(args[0]), Sort::Int | Sort::Real) {
                 continue;
             }
             let mut reasons = Vec::new();
             let mut nonlinear = false;
             let Some(pl) = eval_poly(
-                self.terms,
+                self.terms(),
                 args[0],
                 subst,
                 &mut reasons,
@@ -549,7 +552,7 @@ impl LiaSolver<'_> {
                 continue;
             };
             let Some(pr) = eval_poly(
-                self.terms,
+                self.terms(),
                 args[1],
                 subst,
                 &mut reasons,
@@ -580,7 +583,7 @@ impl LiaSolver<'_> {
     fn residual_gcd_feasible(&self, poly: &Poly) -> Option<bool> {
         for mono in poly.terms.keys() {
             for &factor in mono {
-                if !matches!(self.terms.sort(factor), Sort::Int) {
+                if !matches!(self.terms().sort(factor), Sort::Int) {
                     return None;
                 }
             }

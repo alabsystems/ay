@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+f 1 ;
+% The degree of the reified constraint fits into an `i64`, but the constraint it stands for needs a
+% wider type.
+e z1 <== 1 x1 <= 9223372036854775807 : 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

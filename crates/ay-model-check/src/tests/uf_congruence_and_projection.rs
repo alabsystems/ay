@@ -27,6 +27,46 @@ fn uf_collapsed_arguments_refute_strict_inequality() {
 }
 
 #[test]
+fn uf_over_int_indexed_arrays_with_differing_defaults_keys_them_apart() {
+    // `f : (Array Int Int) -> Int` applied to two arrays that agree at their
+    // only explicit key but have different defaults. Over the infinite Int
+    // index some index reads both defaults, so the arrays differ and the two
+    // applications are separate graph keys: `(> (f a) (f b))` with f(a) = 4,
+    // f(b) = 3 is a valid witness. The untyped key comparison cannot see the
+    // index sort and used to fail closed ("cannot decide congruence-key
+    // equality"), turning such a sat into `unknown` (2026-09-25 arrays
+    // fix-up, fresh ufarr_2410_0122).
+    let mut ts = TermStore::new();
+    let asort = Sort::array(Sort::Int, Sort::Int);
+    let a = ts.mk_var("a", asort.clone());
+    let b = ts.mk_var("b", asort);
+    let f_a = app(&mut ts, "f", &[a], Sort::Int);
+    let f_b = app(&mut ts, "f", &[b], Sort::Int);
+    let gt = app(&mut ts, ">", &[f_a, f_b], Sort::Bool);
+    let array = |default: i64| {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(default)),
+            store: vec![(ModelValue::Int(int(0)), ModelValue::Int(int(7)))],
+        }))
+    };
+    let m = UfStubModel::new()
+        .leaf(a, array(1))
+        .leaf(b, array(2))
+        .uf(f_a, ModelValue::Int(int(4)))
+        .uf(f_b, ModelValue::Int(int(3)));
+    assert_confirmed(&verdict(&ts, &m, &[gt]));
+
+    // Control: equal defaults and equal explicit reads are the SAME key, so
+    // the first-seen value governs both applications and `>` is refuted.
+    let same = UfStubModel::new()
+        .leaf(a, array(1))
+        .leaf(b, array(1))
+        .uf(f_a, ModelValue::Int(int(4)))
+        .uf(f_b, ModelValue::Int(int(3)));
+    assert_violates(&verdict(&ts, &same, &[gt]));
+}
+
+#[test]
 fn uf_distinct_arguments_confirm_valid_model() {
     // Distinct arguments (a = 5, b = 7): the two applications key differently and
     // keep their own committed values (f(5) = 1 > f(7) = 0), so the witness is
@@ -70,9 +110,13 @@ fn uf_congruent_applications_share_one_value() {
 fn uf_array_keys_with_finite_domain_coverage_fail_closed() {
     // The two array arguments are extensionally equal over Bool even though
     // their stored defaults differ: the left stores cover both domain values.
-    // They therefore denote one UF graph key. Without index-sort evidence the
-    // key comparison must remain unresolved, never install two results and
-    // confirm the impossible conjunction `f(left) = 7 ∧ f(right) = 8`.
+    // They therefore denote one UF graph key, and the gate must never install
+    // two results and confirm the impossible conjunction
+    // `f(left) = 7 ∧ f(right) = 8`. The untyped key comparison cannot see the
+    // index sort and leaves the key unresolved (fail closed); the typed
+    // comparison (`congruence_keys_equal_at_sorts`) sees that the two stored
+    // Bool keys cover the carrier, proves the keys EQUAL, and so refutes the
+    // model outright. Either way it is never confirmed.
     let mut ts = TermStore::new();
     let array_sort = Sort::array(Sort::Bool, Sort::Int);
     let zero = ts.mk_int(int(0));
@@ -103,7 +147,7 @@ fn uf_array_keys_with_finite_domain_coverage_fail_closed() {
         .uf(left_app, ModelValue::Int(int(7)))
         .uf(right_app, ModelValue::Int(int(8)));
 
-    assert_cannot(&verdict(&ts, &model, &[left_definition, right_definition]));
+    assert_violates(&verdict(&ts, &model, &[left_definition, right_definition]));
 }
 
 #[test]

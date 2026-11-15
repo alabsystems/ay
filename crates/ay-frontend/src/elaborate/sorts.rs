@@ -8,19 +8,258 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use super::{Context, ElaborateError, Result};
 use crate::command;
 use crate::sexp::{PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
-use ay_core::{Sort, TermId};
+use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
 /// Match the established CHC parser bound. SMT terms are represented densely
 /// during bit-blasting, so accepting a larger compact width would permit an
 /// unbounded allocation before the solver's resource limit can intervene.
 pub(super) const MAX_BITVECTOR_WIDTH: u32 = 1 << 20;
 
-/// `FpPrecision` exposes its exponent bias as `u32`; formats with 32 or more
-/// exponent bits cannot be represented by that API without overflowing.
-pub(super) const MAX_FP_EXPONENT_BITS: u32 = 31;
+/// The exponent carrier is u64; 63 bits also keeps its bias in signed i64.
+/// Exact arithmetic has separate, smaller work/precision limits.
+pub(super) const MAX_FP_EXPONENT_BITS: u32 = 63;
 
 /// Significands are bit-blasted densely. Use the same width envelope as BV.
 pub(super) const MAX_FP_SIGNIFICAND_BITS: u32 = MAX_BITVECTOR_WIDTH;
+
+/// Builtin sort families whose availability depends on the selected
+/// SMT-LIB logic's signature. z3 rejects a builtin sort outside the
+/// declared logic (`unknown sort 'BitVec'`); AY historically accepted
+/// every builtin in every logic, which changed verdicts on ill-formed
+/// scripts (z3 errors and continues with a trivial problem). The table
+/// below is measured against z3 5.1.0 (`declare-const` probes per
+/// logic); logics not listed stay permissive. Builtin function symbols
+/// are gated against the same table by
+/// [`Context::require_logic_builtin_signature`] (DR-59).
+pub(super) const FAM_INT: u16 = 1 << 0;
+pub(super) const FAM_REAL: u16 = 1 << 1;
+pub(super) const FAM_BV: u16 = 1 << 2;
+pub(super) const FAM_ARRAY: u16 = 1 << 3;
+pub(super) const FAM_STRING: u16 = 1 << 4;
+pub(super) const FAM_REGLAN: u16 = 1 << 5;
+pub(super) const FAM_SEQ: u16 = 1 << 6;
+pub(super) const FAM_FP: u16 = 1 << 7;
+pub(super) const FAM_RM: u16 = 1 << 8;
+pub(super) const FAM_FF: u16 = 1 << 9;
+
+/// Logics whose shell signature rejects nonlinear arithmetic
+/// applications (products of degree ≥ 2, divisions by a non-numeral),
+/// measured against z3 5.1.0 with `(* x y)` / `(div x y)` probes over
+/// every logic in [`LOGIC_SORT_FAMILIES`]. Quantified `LIA`/`UFDTLIA`
+/// accept nonlinear terms; `AUFLIA`/`AUFLIRA`/`LRA`/`UFLRA` reject.
+const NONLINEAR_REJECTING_LOGICS: &[&str] = &[
+    "AUFLIA",
+    "AUFLIRA",
+    "LRA",
+    "QF_AUFLIA",
+    "QF_IDL",
+    "QF_LIA",
+    "QF_LRA",
+    "QF_RDL",
+    "QF_S",
+    "QF_SLIA",
+    "QF_UFIDL",
+    "QF_UFLIA",
+    "QF_UFLRA",
+    "UFLRA",
+];
+
+/// Logics whose shell signature admits only difference-arithmetic
+/// applications, measured against z3 5.1.0 (`(+ x y)` probes).
+/// `QF_UFRDL` is measured unrestricted and is deliberately absent.
+const DIFFERENCE_LOGICS: &[&str] = &["QF_IDL", "QF_RDL", "QF_UFIDL"];
+
+/// Logics whose shell signature installs the `^` power operator,
+/// measured against z3 5.1.0. Every other measured logic reports
+/// `unknown constant ^`; with no logic selected `^` is also known.
+const POWER_KNOWN_LOGICS: &[&str] = &["ALL", "EIA", "QF_EIA", "QF_SEQ"];
+
+/// The builtin sort families a (possibly nested) sort mentions.
+fn sort_family_mask(sort: &Sort) -> u16 {
+    let mut mask = 0u16;
+    let mut pending = vec![sort];
+    while let Some(current) = pending.pop() {
+        match current {
+            Sort::Int => mask |= FAM_INT,
+            Sort::Real => mask |= FAM_REAL,
+            Sort::BitVec(_) => mask |= FAM_BV,
+            Sort::String | Sort::Char => mask |= FAM_STRING,
+            Sort::RegLan => mask |= FAM_REGLAN,
+            Sort::FloatingPoint(..) => mask |= FAM_FP,
+            Sort::FiniteField(_) => mask |= FAM_FF,
+            Sort::Uninterpreted(name) if name == "RoundingMode" => mask |= FAM_RM,
+            Sort::Array(array) => {
+                mask |= FAM_ARRAY;
+                pending.push(&array.index_sort);
+                pending.push(&array.element_sort);
+            }
+            Sort::Seq(element) => {
+                mask |= FAM_SEQ;
+                pending.push(element);
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
+fn is_arithmetic_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "~"
+            | "*"
+            | "/"
+            | "div"
+            | "mod"
+            | "rem"
+            | "abs"
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "^"
+            | "to_real"
+            | "to_int"
+            | "is_int"
+    )
+}
+
+/// The builtin sort families `logic`'s signature provides, or `None`
+/// for a logic with no measured signature (permissive).
+const LOGIC_SORT_FAMILIES: &[(&str, u16)] = &[
+    (
+        "ALL",
+        FAM_INT
+            | FAM_REAL
+            | FAM_BV
+            | FAM_STRING
+            | FAM_REGLAN
+            | FAM_SEQ
+            | FAM_FP
+            | FAM_RM
+            | FAM_ARRAY
+            | FAM_FF,
+    ),
+    ("QF_FF", FAM_FF),
+    ("AUFDT", FAM_ARRAY),
+    ("AUFDTLIA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("AUFDTLIRA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("AUFLIA", FAM_INT | FAM_ARRAY),
+    ("AUFLIRA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("AUFLRA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    (
+        "EIA",
+        FAM_INT
+            | FAM_REAL
+            | FAM_BV
+            | FAM_STRING
+            | FAM_REGLAN
+            | FAM_SEQ
+            | FAM_FP
+            | FAM_RM
+            | FAM_ARRAY,
+    ),
+    ("HORN", FAM_INT | FAM_REAL | FAM_BV | FAM_ARRAY),
+    ("LIA", FAM_INT | FAM_REAL),
+    ("LIRA", FAM_INT | FAM_REAL),
+    ("LRA", FAM_REAL),
+    ("NIA", FAM_INT | FAM_REAL),
+    ("NIRA", FAM_INT | FAM_REAL),
+    ("NRA", FAM_REAL),
+    ("QF_ABV", FAM_BV | FAM_ARRAY),
+    (
+        "QF_ABVFP",
+        FAM_INT | FAM_REAL | FAM_BV | FAM_FP | FAM_RM | FAM_ARRAY,
+    ),
+    ("QF_ALIA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("QF_AUFBV", FAM_BV | FAM_ARRAY),
+    ("QF_AUFBVLIA", FAM_INT | FAM_REAL | FAM_BV | FAM_ARRAY),
+    ("QF_AUFBVLRA", FAM_INT | FAM_REAL | FAM_BV | FAM_ARRAY),
+    ("QF_AUFLIA", FAM_INT | FAM_ARRAY),
+    ("QF_AUFLIRA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("QF_AUFLRA", FAM_INT | FAM_REAL | FAM_ARRAY),
+    ("QF_AX", FAM_ARRAY),
+    ("QF_BV", FAM_BV),
+    ("QF_BVFP", FAM_INT | FAM_REAL | FAM_BV | FAM_FP | FAM_RM),
+    ("QF_DT", 0),
+    (
+        "QF_EIA",
+        FAM_INT
+            | FAM_REAL
+            | FAM_BV
+            | FAM_STRING
+            | FAM_REGLAN
+            | FAM_SEQ
+            | FAM_FP
+            | FAM_RM
+            | FAM_ARRAY,
+    ),
+    ("QF_FP", FAM_INT | FAM_REAL | FAM_FP | FAM_RM),
+    ("QF_FPLRA", FAM_INT | FAM_REAL | FAM_FP | FAM_RM),
+    ("QF_IDL", FAM_INT),
+    ("QF_LIA", FAM_INT),
+    ("QF_LIRA", FAM_INT | FAM_REAL),
+    ("QF_LRA", FAM_REAL),
+    ("QF_NIA", FAM_INT),
+    ("QF_NIRA", FAM_INT | FAM_REAL),
+    ("QF_NRA", FAM_REAL),
+    ("QF_RDL", FAM_REAL),
+    (
+        "QF_S",
+        FAM_INT | FAM_REAL | FAM_STRING | FAM_REGLAN | FAM_SEQ,
+    ),
+    (
+        "QF_SEQ",
+        FAM_INT
+            | FAM_REAL
+            | FAM_BV
+            | FAM_STRING
+            | FAM_REGLAN
+            | FAM_SEQ
+            | FAM_FP
+            | FAM_RM
+            | FAM_ARRAY,
+    ),
+    (
+        "QF_SLIA",
+        FAM_INT | FAM_REAL | FAM_STRING | FAM_REGLAN | FAM_SEQ,
+    ),
+    (
+        "QF_SNIA",
+        FAM_INT | FAM_REAL | FAM_STRING | FAM_REGLAN | FAM_SEQ,
+    ),
+    ("QF_UF", 0),
+    ("QF_UFBV", FAM_BV),
+    ("QF_UFBVLIA", FAM_INT | FAM_REAL | FAM_BV),
+    ("QF_UFDT", 0),
+    ("QF_UFIDL", FAM_INT),
+    ("QF_UFLIA", FAM_INT),
+    ("QF_UFLRA", FAM_REAL),
+    ("QF_UFNIA", FAM_INT | FAM_REAL),
+    ("QF_UFNIRA", FAM_INT | FAM_REAL),
+    ("QF_UFNRA", FAM_REAL),
+    ("QF_UFRDL", FAM_INT | FAM_REAL),
+    ("UF", 0),
+    ("UFDT", 0),
+    ("UFDTLIA", FAM_INT | FAM_REAL),
+    ("UFDTLIRA", FAM_INT | FAM_REAL),
+    ("UFDTLRA", FAM_INT | FAM_REAL),
+    ("UFDTNIA", FAM_INT | FAM_REAL),
+    ("UFDTNIRA", FAM_INT | FAM_REAL),
+    ("UFDTNRA", FAM_INT | FAM_REAL),
+    ("UFLIA", FAM_INT | FAM_REAL),
+    ("UFLRA", FAM_REAL),
+    ("UFNIA", FAM_INT),
+    ("UFNIRA", FAM_INT | FAM_REAL),
+    ("UFNRA", FAM_INT | FAM_REAL),
+];
+
+fn logic_sort_families(logic: &str) -> Option<u16> {
+    LOGIC_SORT_FAMILIES
+        .iter()
+        .find_map(|&(name, mask)| (name == logic).then_some(mask))
+}
 
 impl Context {
     /// Run one lazy sort-synonym expansion while keeping the recursion guard
@@ -249,6 +488,394 @@ impl Context {
     /// `(Name A1 .. An)` lazily monomorphizes the instance (registering its
     /// constructors/selectors/testers) on first use — see
     /// [`Context::instantiate_parametric_datatype`].
+    /// Reject a builtin sort outside the declared logic's signature.
+    /// z3 answers the arithmetic-sibling shapes (`Int` where only
+    /// `Real` is signed, `Real` where only `Int` is) with its
+    /// `logic does not support integers/reals` messages and other
+    /// absent families with `unknown sort` (measured; declaration
+    /// wrappers like `Invalid constant declaration:` are z3
+    /// parser-context prefixes AY does not reproduce — DR-59
+    /// residual). No logic selected (or an unmeasured one) is
+    /// permissive.
+    fn require_logic_sort_family(&self, family: u16, display: &str) -> Result<()> {
+        if !self.enforce_logic_sort_signatures || self.strict_logic_compliance {
+            return Ok(());
+        }
+        let Some(logic) = self.logic.as_deref() else {
+            return Ok(());
+        };
+        match logic_sort_families(logic) {
+            Some(allowed) if allowed & family == 0 => {
+                if family == FAM_INT && allowed & FAM_REAL != 0 {
+                    Err(ElaborateError::LogicDoesNotSupportIntegers)
+                } else if family == FAM_REAL && allowed & FAM_INT != 0 {
+                    Err(ElaborateError::LogicDoesNotSupportReals)
+                } else {
+                    Err(ElaborateError::UnknownSort(display.to_string()))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Reject a non-bitvector array index under the BV-array logics.
+    /// Same gating as [`Self::require_logic_sort_family`]: shell-only,
+    /// never under strict SMT-LIB compliance (z3's own C-API parser is
+    /// permissive here too). Only the index is restricted; z3 accepts
+    /// any element sort its signature knows.
+    fn require_logic_array_index(&self, index: &Sort) -> Result<()> {
+        if !self.enforce_logic_sort_signatures || self.strict_logic_compliance {
+            return Ok(());
+        }
+        if matches!(self.logic.as_deref(), Some("QF_ABV" | "QF_AUFBV"))
+            && !matches!(index, Sort::BitVec(_))
+        {
+            return Err(ElaborateError::LogicArrayIndexNotBitVec);
+        }
+        Ok(())
+    }
+
+    /// Reject a builtin whose single sort family is outside the
+    /// declared logic's shell signature, with z3's `unknown constant`
+    /// shape (the CLI renders [`ElaborateError::UndefinedSymbol`]
+    /// with the application signature). Used for indexed identifiers
+    /// and bare builtin constants, whose family is known from the
+    /// name alone. Same gating as [`Self::require_logic_sort_family`].
+    pub(super) fn require_logic_builtin_family(&self, name: &str, family: u16) -> Result<()> {
+        if !self.enforce_logic_sort_signatures || self.strict_logic_compliance {
+            return Ok(());
+        }
+        let Some(logic) = self.logic.as_deref() else {
+            return Ok(());
+        };
+        match logic_sort_families(logic) {
+            Some(allowed) if allowed & family == 0 => {
+                Err(ElaborateError::UndefinedSymbol(name.to_string()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Reject a builtin application outside the declared logic's
+    /// shell signature, mirroring z3 5.1.0's term-level checks
+    /// (measured; DR-59). Called only from the surface application
+    /// path after builtin dispatch, so user-declared symbols, macro
+    /// expansions already resolved to declarations, and the native
+    /// canonical-application API are never gated. Same shell-only
+    /// gating as [`Self::require_logic_sort_family`].
+    pub(super) fn require_logic_builtin_signature(
+        &self,
+        name: &str,
+        args: &[TermId],
+        result: TermId,
+    ) -> Result<()> {
+        if !self.enforce_logic_sort_signatures || self.strict_logic_compliance {
+            return Ok(());
+        }
+        // Extension spellings z3's SMT-LIB shell installs in no
+        // signature at all (measured, including `ALL` and no logic).
+        if matches!(name, "min" | "max" | "**") {
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        }
+        let Some(logic) = self.logic.as_deref() else {
+            return Ok(());
+        };
+        let Some(allowed) = logic_sort_families(logic) else {
+            return Ok(());
+        };
+        if name == "^" && !POWER_KNOWN_LOGICS.contains(&logic) {
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        }
+        if matches!(name, "and" | "or" | "not" | "xor" | "=>" | "ite" | "if") {
+            return Ok(());
+        }
+        if matches!(name, "=" | "distinct") {
+            return self.require_logic_equality_families(args, allowed);
+        }
+        let mut signature = sort_family_mask(self.terms.sort(result));
+        for &arg in args {
+            signature |= sort_family_mask(self.terms.sort(arg));
+        }
+        // In an FP signature, bit-vectors are the FP literal/conversion
+        // currency even though the BitVec sort itself is not declarable
+        // there: z3 accepts the `fp` constructor over BV literals under
+        // QF_FP/QF_FPLRA (measured against 4.16.0) while still rejecting
+        // BV operators and `(_ BitVec n)` declarations. So an
+        // FP-involving application's BV signature bits are excused; a
+        // purely-BV application (no FP anywhere) still rejects.
+        let missing = if signature & FAM_FP != 0 && allowed & FAM_FP != 0 {
+            signature & !allowed & !FAM_BV
+        } else {
+            signature & !allowed
+        };
+        // z3 types bare numerals as Real in a real signature, so a
+        // dual-sorted operator over Int numerals only is its Real
+        // instance there (measured: `(+ 1 2)`, `(< 1 2)`, `(abs …)`,
+        // `(is_int 1)` under QF_LRA/QF_NRA/QF_RDL) — and the same
+        // holds for numeral composites under `ite`/arithmetic
+        // (`(<= (+ (ite b 1 0) (ite c 1 0)) 1)`, the CVC-translated
+        // QF_LRA shape). AY folds those numerals as Int, so excuse
+        // exactly that shape. Int-only operators
+        // (`div`/`mod`/`rem`/`to_int`) stay rejected, and
+        // `to_real` — the identity cast there — gets z3's casting
+        // message instead.
+        let int_numerals_in_real_signature = missing == FAM_INT
+            && allowed & FAM_REAL != 0
+            && is_arithmetic_builtin(name)
+            && !matches!(name, "div" | "mod" | "rem" | "to_int")
+            && args
+                .iter()
+                .all(|&arg| self.terms.sort(arg) != &Sort::Int || self.is_numeral_composite(arg))
+            && (self.terms.sort(result) != &Sort::Int || self.is_numeral_composite(result));
+        if int_numerals_in_real_signature && name == "to_real" {
+            return Err(ElaborateError::LogicDoesNotSupportCastingOperators);
+        }
+        if missing != 0 && !int_numerals_in_real_signature {
+            if is_arithmetic_builtin(name) {
+                if missing & FAM_REAL != 0 && allowed & FAM_INT != 0 {
+                    return Err(ElaborateError::LogicDoesNotSupportReals);
+                }
+                if missing & FAM_INT != 0 && allowed & FAM_REAL != 0 {
+                    return Err(ElaborateError::LogicDoesNotSupportIntegers);
+                }
+            }
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        }
+        if is_arithmetic_builtin(name) {
+            self.require_logic_arithmetic_profile(logic, name, args)?;
+        }
+        Ok(())
+    }
+
+    /// z3 reports a core equality over BV/Real/Int literals in a
+    /// logic without that family as `logic does not support …`
+    /// rather than `unknown constant =`. String literal equalities
+    /// are measured accepted even where `String` is not declarable,
+    /// so only these three families are checked. Int is excused
+    /// where Real is available: numerals are polymorphic there, and
+    /// declared Int symbols are already sort-gated.
+    fn require_logic_equality_families(&self, args: &[TermId], allowed: u16) -> Result<()> {
+        for &arg in args {
+            let families = sort_family_mask(self.terms.sort(arg));
+            // BV is excused where FP is available: BV literals and
+            // FP->BV conversion results are equality-comparable in an FP
+            // signature (measured against z3 4.16.0: `(= #b01 #b01)` and
+            // `(= ((_ fp.to_ubv 8) r x) #b00000001)` are accepted under
+            // QF_FP, rejected under QF_LIA).
+            if families & FAM_BV != 0 && allowed & (FAM_BV | FAM_FP) == 0 {
+                return Err(ElaborateError::LogicDoesNotSupportBitvectors);
+            }
+            if families & FAM_REAL != 0 && allowed & FAM_REAL == 0 {
+                return Err(ElaborateError::LogicDoesNotSupportReals);
+            }
+            if families & FAM_INT != 0 && allowed & (FAM_INT | FAM_REAL) == 0 {
+                return Err(ElaborateError::LogicDoesNotSupportIntegers);
+            }
+        }
+        Ok(())
+    }
+
+    /// The linear/difference application shapes z3's shell enforces
+    /// for the measured logics. Runs only once every sort family in
+    /// the signature is available, so cross-family applications keep
+    /// their `does not support` / `unknown constant` shapes. Checks
+    /// the elaborated operands: a syntactically nontrivial but
+    /// constant-folded divisor such as `(div x (+ 1 1))` is accepted
+    /// here where z3's syntactic check rejects it — a documented
+    /// permissive residual (DR-59), never a wrong verdict.
+    fn require_logic_arithmetic_profile(
+        &self,
+        logic: &str,
+        name: &str,
+        args: &[TermId],
+    ) -> Result<()> {
+        if NONLINEAR_REJECTING_LOGICS.contains(&logic) {
+            match name {
+                "*" => {
+                    let degree: u32 = args.iter().map(|&arg| self.arith_term_degree(arg)).sum();
+                    if degree >= 2 {
+                        return Err(ElaborateError::LogicNonlinearArithmetic);
+                    }
+                }
+                "/" | "div" | "mod" | "rem" => {
+                    if args.iter().skip(1).any(|&d| !self.is_numeral_term(d)) {
+                        return Err(ElaborateError::LogicNonlinearArithmetic);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if DIFFERENCE_LOGICS.contains(&logic) && !self.is_difference_application(name, args) {
+            return Err(ElaborateError::LogicOnlyDifferenceArithmetic);
+        }
+        Ok(())
+    }
+
+    /// Polynomial degree of an elaborated arithmetic term, capped
+    /// at 2 (the linear/nonlinear boundary is all the gate needs).
+    fn arith_term_degree(&self, term: TermId) -> u32 {
+        stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+            match self.terms.get(term) {
+                TermData::Const(Constant::Int(_) | Constant::Rational(_)) => 0,
+                TermData::App(Symbol::Named(op), operands) if op == "*" => operands
+                    .iter()
+                    .map(|&operand| self.arith_term_degree(operand))
+                    .sum::<u32>()
+                    .min(2),
+                TermData::App(Symbol::Named(op), operands)
+                    if matches!(op.as_str(), "+" | "-" | "~" | "to_real" | "to_int" | "abs") =>
+                {
+                    operands
+                        .iter()
+                        .map(|&operand| self.arith_term_degree(operand))
+                        .max()
+                        .unwrap_or(0)
+                }
+                _ if matches!(self.terms.sort(term), Sort::Int | Sort::Real) => 1,
+                _ => 0,
+            }
+        })
+    }
+
+    /// Whether an elaborated term is a numeric literal, peeling the
+    /// unary-negation applications the term store may keep unfolded.
+    /// A division of numerals counts: z3's parser produces it as a
+    /// rational numeral, so `(/ 4.0 2.0)` is a literal where
+    /// `(+ 1.0 1.0)` is not (measured in QF_RDL/QF_IDL).
+    fn is_numeral_term(&self, term: TermId) -> bool {
+        stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+            self.is_numeral_term_inner(term)
+        })
+    }
+
+    /// An Int-sorted term z3's shell types as Real in a real
+    /// signature: a numeral, or a composite of numerals under
+    /// dual-sorted constructs (`ite` branches, `+`/`-`/`*`/`abs`).
+    /// z3 assigns numerals the expected sort top-down, so
+    /// `(<= (+ (ite b 1 0) (ite c 1 0)) 1)` is Real arithmetic
+    /// under QF_LRA (measured); AY types the same leaves Int
+    /// bottom-up. Int-only operators and non-numeral Int leaves
+    /// (declared symbols are sort-gated at declaration) stay out.
+    fn is_numeral_composite(&self, term: TermId) -> bool {
+        stacker::maybe_grow(PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE, || {
+            self.is_numeral_composite_inner(term)
+        })
+    }
+
+    fn is_numeral_composite_inner(&self, term: TermId) -> bool {
+        if self.is_numeral_term(term) {
+            return true;
+        }
+        if self.terms.sort(term) != &Sort::Int {
+            return false;
+        }
+        match self.terms.get(term) {
+            TermData::Ite(_, then_t, else_t) => {
+                self.is_numeral_composite(*then_t) && self.is_numeral_composite(*else_t)
+            }
+            TermData::App(Symbol::Named(op), operands)
+                if matches!(op.as_str(), "+" | "-" | "~" | "*" | "abs") =>
+            {
+                !operands.is_empty() && operands.iter().all(|&o| self.is_numeral_composite(o))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_numeral_term_inner(&self, term: TermId) -> bool {
+        match self.terms.get(term) {
+            TermData::Const(Constant::Int(_) | Constant::Rational(_)) => true,
+            TermData::App(Symbol::Named(op), operands)
+                if matches!(op.as_str(), "-" | "~") && operands.len() == 1 =>
+            {
+                self.is_numeral_term(operands[0])
+            }
+            TermData::App(Symbol::Named(op), operands) if op == "/" && operands.len() == 2 => {
+                operands.iter().all(|&o| self.is_numeral_term(o))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a term may appear as an operand of a difference
+    /// application: anything that is not itself an arithmetic
+    /// application (variables, literals, `ite`, user applications).
+    fn is_difference_atom(&self, term: TermId) -> bool {
+        match self.terms.get(term) {
+            TermData::App(Symbol::Named(op), _) => !matches!(
+                op.as_str(),
+                "+" | "-"
+                    | "~"
+                    | "*"
+                    | "/"
+                    | "div"
+                    | "mod"
+                    | "rem"
+                    | "abs"
+                    | "^"
+                    | "to_real"
+                    | "to_int"
+            ),
+            _ => true,
+        }
+    }
+
+    /// Whether `term` is an elaborated sum that counts as a single
+    /// difference atom: a `+` application whose own arguments are all
+    /// numerals or difference atoms. Elaboration normalizes `(- x y)`
+    /// to addition form, so a plain `+` head is not enough — the
+    /// normalized subtraction carries a negated non-numeral argument
+    /// and must not count, while a surface sum or an atom±numeral
+    /// difference (`(- x 1)` → `(+ x -1)`) does. Measured against
+    /// z3 4.16.0: `(+ 1 (+ 1 x))` and `(+ (- x 1) 19)` are admissible
+    /// under QF_UFIDL, `(+ (- x y) 1)` is not.
+    fn is_difference_plus_atom(&self, term: TermId) -> bool {
+        match self.terms.get(term) {
+            TermData::App(Symbol::Named(op), args) if op.as_str() == "+" => args
+                .iter()
+                .all(|&arg| self.is_numeral_term(arg) || self.is_difference_atom(arg)),
+            _ => false,
+        }
+    }
+
+    /// The application shapes measured admissible under the
+    /// difference logics: sums with at most one non-numeral atom (a
+    /// nested difference sum counting as one atom), binary
+    /// differences of atoms or of a difference sum minus a numeral,
+    /// negation of numerals, and comparisons over (recursively
+    /// checked) operands. Every other arithmetic head — including
+    /// all-numeral `(* 2 3)` — is rejected, matching z3's syntactic
+    /// check.
+    fn is_difference_application(&self, name: &str, args: &[TermId]) -> bool {
+        match name {
+            "+" => {
+                let non_numerals: Vec<TermId> = args
+                    .iter()
+                    .copied()
+                    .filter(|&arg| !self.is_numeral_term(arg))
+                    .collect();
+                non_numerals.len() <= 1
+                    && non_numerals.iter().all(|&arg| {
+                        self.is_difference_atom(arg) || self.is_difference_plus_atom(arg)
+                    })
+            }
+            "-" | "~" if args.len() == 1 => self.is_numeral_term(args[0]),
+            "-" if args.len() == 2 => {
+                let (left, right) = (args[0], args[1]);
+                let left_ok = self.is_difference_atom(left) || self.is_difference_plus_atom(left);
+                let right_ok = self.is_numeral_term(right)
+                    || (self.is_difference_atom(left) && self.is_difference_atom(right));
+                left_ok && right_ok
+            }
+            // A division of numerals is a rational literal in z3's
+            // parser, admissible even under QF_RDL (measured); the
+            // nonlinear divisor check has already run.
+            "/" => args.iter().all(|&arg| self.is_numeral_term(arg)),
+            "<" | "<=" | ">" | ">=" => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn elaborate_sort(&mut self, sort: &command::Sort) -> Result<Sort> {
         let empty: HashMap<String, Sort> = HashMap::default();
         self.elaborate_sort_inner(sort, &empty)
@@ -295,10 +922,23 @@ impl Context {
                     // terms here, but user declarations over the carrier have
                     // the ordinary sound equality/UF semantics.
                     "Proof" if self.logic.is_none() => Ok(Sort::Uninterpreted("Proof".to_string())),
-                    "Int" => Ok(Sort::Int),
-                    "Real" => Ok(Sort::Real),
-                    "String" => Ok(Sort::String),
-                    "RegLan" => Ok(Sort::RegLan),
+                    "Int" => {
+                        self.require_logic_sort_family(FAM_INT, "Int")?;
+                        Ok(Sort::Int)
+                    }
+                    "Real" => {
+                        self.require_logic_sort_family(FAM_REAL, "Real")?;
+                        Ok(Sort::Real)
+                    }
+                    "Complex" if matches!(self.logic(), None | Some("ALL")) => Ok(Sort::Complex),
+                    "String" => {
+                        self.require_logic_sort_family(FAM_STRING, "String")?;
+                        Ok(Sort::String)
+                    }
+                    "RegLan" => {
+                        self.require_logic_sort_family(FAM_REGLAN, "RegLan")?;
+                        Ok(Sort::RegLan)
+                    }
                     // SMT-LIB FloatingPoint theory sort abbreviations. Without these
                     // a `(declare-fun x () Float32)` would fall through to the
                     // Uninterpreted fallback below, and `x` would never route through
@@ -306,10 +946,22 @@ impl Context {
                     // bitblast_fp_predicate is gated on Sort::FloatingPoint). That
                     // gap caused symbolic-variable QF_FP conflicts such as
                     // `x = 1.0 AND x = 2.0` to be reported SAT (false-SAT).
-                    "Float16" => Ok(Sort::FloatingPoint(5, 11)),
-                    "Float32" => Ok(Sort::FloatingPoint(8, 24)),
-                    "Float64" => Ok(Sort::FloatingPoint(11, 53)),
-                    "Float128" => Ok(Sort::FloatingPoint(15, 113)),
+                    "Float16" => {
+                        self.require_logic_sort_family(FAM_FP, "FloatingPoint")?;
+                        Ok(Sort::FloatingPoint(5, 11))
+                    }
+                    "Float32" => {
+                        self.require_logic_sort_family(FAM_FP, "FloatingPoint")?;
+                        Ok(Sort::FloatingPoint(8, 24))
+                    }
+                    "Float64" => {
+                        self.require_logic_sort_family(FAM_FP, "FloatingPoint")?;
+                        Ok(Sort::FloatingPoint(11, 53))
+                    }
+                    "Float128" => {
+                        self.require_logic_sort_family(FAM_FP, "FloatingPoint")?;
+                        Ok(Sort::FloatingPoint(15, 113))
+                    }
                     // The FloatingPoint theory's `RoundingMode` is a BUILTIN
                     // sort that is never `declare-sort`ed, so it is not in
                     // `sort_defs`. Its carrier is the reserved name
@@ -318,7 +970,10 @@ impl Context {
                     // name the executor's finite-domain pass keys on.
                     // `ensure_sort_name_available` already forbids redeclaring
                     // it, so this can never shadow a user sort.
-                    "RoundingMode" => Ok(Sort::Uninterpreted("RoundingMode".to_string())),
+                    "RoundingMode" => {
+                        self.require_logic_sort_family(FAM_RM, "RoundingMode")?;
+                        Ok(Sort::Uninterpreted("RoundingMode".to_string()))
+                    }
                     other => {
                         if let Some(s) = self.sort_defs.get(other) {
                             return Ok(s.clone());
@@ -366,7 +1021,27 @@ impl Context {
                 }
             }
             command::Sort::Indexed(name, indices) => match name.as_str() {
+                "FiniteField" => {
+                    if !matches!(self.logic(), None | Some("ALL" | "QF_FF")) {
+                        return Err(ElaborateError::UnknownSort(name.clone()));
+                    }
+                    let field = if indices.len() == 1 {
+                        indices[0]
+                            .as_numeral()
+                            .and_then(|n| n.parse().ok())
+                            .and_then(ay_core::FiniteFieldSort::new)
+                    } else {
+                        None
+                    };
+                    field.map(Sort::FiniteField).ok_or_else(|| {
+                        ElaborateError::InvalidConstant(
+                            "FiniteField requires one prime modulus from 2 through 4294967291"
+                                .into(),
+                        )
+                    })
+                }
                 "BitVec" => {
+                    self.require_logic_sort_family(FAM_BV, "BitVec")?;
                     if indices.len() != 1 {
                         return Err(ElaborateError::InvalidConstant(
                             "BitVec sort requires exactly 1 width index".to_string(),
@@ -384,6 +1059,7 @@ impl Context {
                     Self::checked_bitvector_sort(width)
                 }
                 "FloatingPoint" => {
+                    self.require_logic_sort_family(FAM_FP, "FloatingPoint")?;
                     if indices.len() != 2 {
                         return Err(ElaborateError::InvalidConstant(
                             "FloatingPoint sort requires exactly 2 indices (eb sb)".to_string(),
@@ -414,8 +1090,17 @@ impl Context {
                     "indexed sort: {other}"
                 ))),
             },
+            // z3 4.12.5 knows none of these; `FiniteSet` is z3 5's. Under
+            // `--z3-mode` they are unknown sorts, which only drops a command
+            // z3 4.12.5 drops too.
+            command::Sort::Parameterized(name, _)
+                if self.z3_mode && matches!(name.as_str(), "FiniteSet" | "Multiset" | "Map") =>
+            {
+                Err(ElaborateError::UnknownSort(name.clone()))
+            }
             command::Sort::Parameterized(name, params) => match name.as_str() {
                 "Array" => {
+                    self.require_logic_sort_family(FAM_ARRAY, "Array")?;
                     if params.len() != 2 {
                         return Err(ElaborateError::InvalidConstant(
                             "Array requires 2 type parameters".to_string(),
@@ -423,6 +1108,7 @@ impl Context {
                     }
                     let index = self.elaborate_sort_inner(&params[0], subst)?;
                     let element = self.elaborate_sort_inner(&params[1], subst)?;
+                    self.require_logic_array_index(&index)?;
                     Ok(Sort::array(index, element))
                 }
                 "->" if self
@@ -441,6 +1127,7 @@ impl Context {
                     Ok(Sort::array(index, element))
                 }
                 "Seq" => {
+                    self.require_logic_sort_family(FAM_SEQ, "Seq")?;
                     if params.len() != 1 {
                         return Err(ElaborateError::InvalidConstant(
                             "Seq requires 1 type parameter".to_string(),

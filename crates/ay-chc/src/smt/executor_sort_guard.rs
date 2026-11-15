@@ -5,6 +5,7 @@
 //! Sort preflight for CHC expressions serialized to SMT-LIB executor paths.
 
 use crate::{ChcExpr, ChcOp, ChcSort};
+use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::sync::Arc;
 
 fn is_numeric_sort(sort: &ChcSort) -> bool {
@@ -52,22 +53,91 @@ fn same_width_bv_binary_args(args: &[Arc<ChcExpr>]) -> bool {
 /// conservative internal abstractions but unsupported by that serialization
 /// boundary, e.g. arithmetic `<` over BV terms or same-BV-op operands with
 /// different widths. Those cases should become `Unknown`, not a frontend panic.
+///
+/// The answer is the first failing node in post-order — a function of each
+/// subtree — so on large inputs it is memoised per distinct node (WP-F F0b).
 pub(crate) fn unsupported_executor_expr_reason(expr: &ChcExpr) -> Option<&'static str> {
+    if semantic_tree_size_at_least(expr, crate::expr::dag::DAG_WALK_MIN_TREE) {
+        let mut memo = FxHashMap::default();
+        return reason_memo(expr, &mut memo);
+    }
+    reason_plain(expr)
+}
+
+/// Include closed lambda code in the plain-walk/memo threshold. A small
+/// capture environment must not hide an exponentially shared body from it.
+fn semantic_tree_size_at_least(root: &ChcExpr, limit: usize) -> bool {
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(expr) = stack.pop() {
+        visited = visited.saturating_add(1);
+        let children = crate::expr::dag::children(expr);
+        let body = match expr {
+            ChcExpr::ArrayLambda(lambda) => Some(lambda.body().as_ref()),
+            _ => None,
+        };
+        // Each queued child costs at least one visit. Stop before allocating
+        // a pending stack wider than the threshold.
+        if visited
+            .saturating_add(stack.len())
+            .saturating_add(children.len())
+            .saturating_add(usize::from(body.is_some()))
+            >= limit
+        {
+            return true;
+        }
+        stack.extend(children.iter().map(AsRef::as_ref));
+        stack.extend(body);
+    }
+    false
+}
+
+type ReasonMemo = FxHashMap<*const ChcExpr, Option<&'static str>>;
+
+fn reason_plain(expr: &ChcExpr) -> Option<&'static str> {
+    crate::expr::maybe_grow_expr_stack(|| reason_node(expr, &mut |child| reason_plain(child)))
+}
+
+fn reason_memo(expr: &ChcExpr, memo: &mut ReasonMemo) -> Option<&'static str> {
+    if crate::expr::dag::children(expr).is_empty() && !matches!(expr, ChcExpr::ArrayLambda(_)) {
+        return reason_node(expr, &mut |_| None);
+    }
+    let key = expr as *const ChcExpr;
+    if let Some(known) = memo.get(&key) {
+        return *known;
+    }
+    let reason = crate::expr::maybe_grow_expr_stack(|| {
+        reason_node(expr, &mut |child| reason_memo(child, memo))
+    });
+    memo.insert(key, reason);
+    reason
+}
+
+/// One node's verdict given how to judge its children (`recurse`): the first
+/// failing child's reason, else this node's own sort check.
+fn reason_node(
+    expr: &ChcExpr,
+    recurse: &mut dyn FnMut(&ChcExpr) -> Option<&'static str>,
+) -> Option<&'static str> {
     match expr {
         ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => None,
         ChcExpr::Var(_) => None,
-        ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => args
-            .iter()
-            .find_map(|arg| unsupported_executor_expr_reason(arg)),
-        ChcExpr::ConstArray(_, value) => unsupported_executor_expr_reason(value),
+        ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
+            args.iter().find_map(|arg| recurse(arg))
+        }
+        ChcExpr::ConstArray(_, value) => recurse(value),
+        ChcExpr::ArrayLambda(lambda) => {
+            if !lambda.captures_are_well_typed() {
+                return Some("array lambda has mismatched capture sorts");
+            }
+            recurse(lambda.body())
+                .or_else(|| lambda.captures().iter().find_map(|value| recurse(value)))
+        }
         ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => {
             Some("internal marker expression is not a standalone SMT-LIB term")
         }
         ChcExpr::Op(op, args) => {
-            if let Some(reason) = args
-                .iter()
-                .find_map(|arg| unsupported_executor_expr_reason(arg))
-            {
+            if let Some(reason) = args.iter().find_map(|arg| recurse(arg)) {
                 return Some(reason);
             }
 

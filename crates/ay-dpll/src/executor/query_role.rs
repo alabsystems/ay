@@ -33,9 +33,8 @@
 //!
 //! A future stage that wants the role to change behaviour must add a
 //! `CommandExecutionBoundary` variant so the exhaustive boundary matches force
-//! every publication site to classify it, and must re-audit the three
-//! `sat_chokepoint_conformance` pins that enumerate those variants. None of
-//! that is required — or done — while the role only counts.
+//! every publication site to classify it. None of that is required — or
+//! done — while the role only counts.
 //!
 //! # Why a typed entrypoint rather than an option
 //!

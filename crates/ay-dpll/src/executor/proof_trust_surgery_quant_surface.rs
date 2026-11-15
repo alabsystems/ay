@@ -143,25 +143,34 @@ impl Executor {
         originals: &[(TermId, FrontendTerm)],
         plan: &QuantConsequencePlan,
     ) -> bool {
-        let Some(parsed) = authority.original(originals, plan.forall_term) else {
+        let source = plan.source_quantifier;
+        let Some(parsed) = authority.original(originals, source) else {
             return false;
         };
-        if !authority.authenticate(
-            self,
-            audit,
-            originals,
-            plan.forall_term,
-            plan.forall_term,
-            true,
-        ) || !self.register_quant_chain_surface(
+        // The chain instantiates the raw rebuild; it must print exactly as the
+        // authored premise does (same authority as `register_quant_negation_surface`).
+        if !authority.authenticate(self, audit, originals, source, source, true)
+            || (plan.forall_term != source
+                && !authority.authenticate(self, audit, originals, source, plan.forall_term, false))
+        {
+            return false;
+        }
+        audit.protect_operand(&mut self.ctx.terms, source);
+        audit.require_same_rendering(&mut self.ctx.terms, source, plan.forall_term);
+        if !self.register_quant_chain_surface(
             authority,
             audit,
-            plan.forall_term,
+            source,
             plan.forall_term,
             parsed,
             &plan.chain,
         ) {
             return false;
+        }
+        // Identity consequence: the authenticated chain IS the derivation;
+        // there is no lemma to protect and nothing may be consumed beside it.
+        if plan.lemma.is_empty() {
+            return plan.supports.is_empty();
         }
         for &support in &plan.supports {
             if !authority.authenticate(self, audit, originals, support, support, true) {

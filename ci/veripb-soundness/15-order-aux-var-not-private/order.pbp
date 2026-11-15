@@ -1,0 +1,39 @@
+pseudo-Boolean proof version 3.0
+f 4;
+def_order triv
+  vars
+    left u1;
+    right v1;
+    aux $a1;
+  end vars;
+  spec
+    red +1 ~$a1 >= 1 : $a1 -> 0;
+  end spec;
+  def
+    +1 ~u1 +1 v1 >= 1;
+  end def;
+  transitivity
+    vars
+      fresh_right w1;
+      fresh_aux_1 $b1;
+      fresh_aux_2 $c1;
+    end vars;
+    proof
+      proofgoal #1
+        pol 4 5 + 6 +;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order triv x1;
+red +1 $a1 >= 1 : $a1 -> 1;
+dom >= 1 : y1 -> 0 : subproof
+  scope geq
+    proofgoal #2
+      rup >= 1;
+    qed #2 : -1;
+  end scope;
+qed dom;
+output NONE;
+conclusion UNSAT;
+end pseudo-Boolean proof;

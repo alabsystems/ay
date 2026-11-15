@@ -373,9 +373,7 @@ where
         if let Some(bus) = external_bounds {
             bus.publish_reported_dual(floor);
         }
-        if crate::optimize::shared_bounds::publish_reported_dual_global(floor) {
-            eprintln!("c dual {floor}");
-        }
+        crate::optimize::shared_bounds::announce_reported_dual_global(floor);
     }
 
     // LP-FLOOR INCUMBENT PROBE. When the (exact-rational, cut-strengthened) LP
@@ -665,17 +663,11 @@ where
                 if let Some(bus) = external_bounds {
                     bus.publish_reported_dual(reported);
                 }
-                {
-                    if crate::optimize::shared_bounds::publish_reported_dual_global(reported) {
-                        // STDERR, and only on improvement. The PB competition
-                        // verdict is read from STDOUT, so this cannot perturb a
-                        // result; it exists because an OPT run that ends
-                        // SATISFIABLE currently reports nothing about how far it
-                        // drove the dual, which makes the dual side of the
-                        // search unmeasurable from outside.
-                        eprintln!("c dual {reported}");
-                    }
-                }
+                // STDERR, only on improvement, and only where the front end has
+                // not silenced it: the PB competition verdict is read from
+                // STDOUT, so this cannot perturb a result, but Z3 mode's stderr
+                // is byte-exact (`shared_bounds::REPORTED_DUAL_STDERR`).
+                crate::optimize::shared_bounds::announce_reported_dual_global(reported);
                 if should_stop() {
                     return Some(OptResult::Satisfiable(best_assignment, best_value));
                 }
@@ -891,7 +883,10 @@ impl LoopState {
     /// Returns the no-cost-polarity assumptions for every soft at or above the
     /// current threshold, plus whether the stratum is full (all remaining softs).
     fn collect_stratum_assumptions(&mut self) -> (Vec<PbLit>, bool) {
-        let mut assumptions = Vec::with_capacity(self.softs.len());
+        // The capacity is only a hint: a failed reservation falls back to
+        // growing on push, exactly as an unreserved vector would.
+        let mut assumptions = Vec::new();
+        let _ = assumptions.try_reserve(self.softs.len());
         for soft in &self.softs {
             if soft.weight >= self.threshold {
                 assumptions.push(complement(soft.literal));
@@ -920,8 +915,10 @@ impl LoopState {
         let mut max_below: i128 = 0;
         for soft in &self.softs {
             if soft.weight < self.threshold {
-                sum += soft.weight;
-                count += 1;
+                // Heuristic statistics: saturation only matters for weight sums
+                // beyond i128, where any average still clamps into range below.
+                sum = sum.saturating_add(soft.weight);
+                count = count.saturating_add(1);
                 max_below = max_below.max(soft.weight);
             }
         }
@@ -929,8 +926,13 @@ impl LoopState {
             self.threshold = min_w;
             return;
         }
-        let avg = sum / count;
-        let half_plus = max_below / 2 + 1;
+        // `count` is positive here, so the quotient is always defined; the
+        // `None` arm only exists because `checked_div` cannot see that.
+        let Some(avg) = sum.checked_div(count) else {
+            self.threshold = min_w;
+            return;
+        };
+        let half_plus = (max_below / 2).saturating_add(1);
         let mut next = avg.max(half_plus);
         next = next.min(self.threshold.saturating_sub(1)).max(min_w);
         self.threshold = next;
@@ -972,7 +974,8 @@ fn harden_softs(
                 }
             }
         } else {
-            idx += 1;
+            // `idx < state.softs.len()` above, so this never saturates.
+            idx = idx.saturating_add(1);
         }
     }
     true
@@ -1394,7 +1397,8 @@ where
     // Aux variables (DIMACS index > placeholder_count) -> fresh native vars.
     let aux_count = next_var.checked_sub(placeholder_count)?;
     let aux_len = usize::try_from(aux_count).ok()?;
-    let mut aux_vars: Vec<u32> = Vec::with_capacity(aux_len);
+    let mut aux_vars: Vec<u32> = Vec::new();
+    aux_vars.try_reserve(aux_len).ok()?;
     for _ in 0..aux_len {
         aux_vars.push(solver.new_var()?);
     }
@@ -1451,7 +1455,7 @@ where
             return None;
         }
         mapped.clear();
-        mapped.reserve(clause.len());
+        mapped.try_reserve(clause.len()).ok()?;
         for &dimacs in clause {
             mapped.push(map(dimacs)?);
         }
@@ -1466,7 +1470,8 @@ where
         }
     }
 
-    let mut result = Vec::with_capacity(outputs.outputs.len());
+    let mut result = Vec::new();
+    result.try_reserve(outputs.outputs.len()).ok()?;
     for (&weight, &dimacs) in outputs.weights.iter().zip(outputs.outputs.iter()) {
         result.push((weight, map(dimacs)?));
     }
@@ -1489,24 +1494,28 @@ fn normalize_weighted_softs(objective: &PbObjective) -> Option<(Vec<WeightedSoft
         if term.coeff == 0 {
             continue;
         }
-        let [lit] = term.lits.as_slice() else {
+        if term.lits.len() != 1 {
+            return None;
+        }
+        let Some(&lit) = term.lits.first() else {
             return None;
         };
         let (cost_lit, weight) = if term.coeff > 0 {
-            (*lit, term.coeff)
+            (lit, term.coeff)
         } else {
             let flipped = term.coeff.checked_neg()?;
-            offset += term.coeff;
-            (complement(*lit), flipped)
+            offset = offset.checked_add(term.coeff)?;
+            (complement(lit), flipped)
         };
         let entry = weights_by_lit.entry(cost_lit).or_insert_with(|| {
             order.push(cost_lit);
             0
         });
-        *entry += weight;
+        *entry = entry.checked_add(weight)?;
     }
 
-    let mut softs = Vec::with_capacity(order.len());
+    let mut softs = Vec::new();
+    softs.try_reserve(order.len()).ok()?;
     for lit in order {
         let weight = *weights_by_lit.get(&lit)?;
         if weight <= 0 {
@@ -1803,8 +1812,15 @@ fn structural_lower_bound_with_parity(
     if parity_cuts.is_empty() {
         return base;
     }
-    let mut augmented =
-        Vec::with_capacity(instance.constraints.len().saturating_add(parity_cuts.len()));
+    let mut augmented = Vec::new();
+    if augmented
+        .try_reserve(instance.constraints.len().saturating_add(parity_cuts.len()))
+        .is_err()
+    {
+        // The parity cuts only tighten `base`; without room for them `base` is
+        // still a sound bound on its own.
+        return base;
+    }
     augmented.extend_from_slice(&instance.constraints);
     augmented.extend_from_slice(parity_cuts);
     let with_cuts =
@@ -1844,7 +1860,10 @@ where
         return None;
     }
     let bound = objective_at_most_constraint(objective, floor).ok()?;
-    let mut probe_constraints = Vec::with_capacity(instance.constraints.len().saturating_add(1));
+    let mut probe_constraints = Vec::new();
+    probe_constraints
+        .try_reserve(instance.constraints.len().saturating_add(1))
+        .ok()?;
     probe_constraints.extend_from_slice(&instance.constraints);
     probe_constraints.push(bound);
     let probe_instance = PbInstance {
@@ -2233,7 +2252,9 @@ mod tests {
         assert!(n <= 20, "brute force only for tiny instances");
         let mut best: Option<i128> = None;
         for mask in 0u32..(1u32 << n) {
-            let assignment: Vec<bool> = (0..n).map(|i| (mask >> i) & 1 == 1).collect();
+            let assignment: Vec<bool> = (0..n)
+                .map(|i| mask.checked_shr(i as u32).is_some_and(|bits| bits & 1 == 1))
+                .collect();
             if !crate::eval::verify_all_constraints(&instance.constraints, &assignment) {
                 continue;
             }
@@ -2498,12 +2519,12 @@ mod tests {
     /// (mirrors the existing differential-test generator; adds random objective
     /// literal polarity so soft-selector complementation is exercised).
     fn random_weighted_instance(next: &mut impl FnMut() -> u64) -> (PbInstance, PbObjective) {
-        let num_vars = 3 + (next() % 5) as u32; // 3..=7 vars
-        let num_constraints = 1 + (next() % 4) as usize; // 1..=4 constraints
+        let num_vars = 3u32.saturating_add((next() % 5) as u32); // 3..=7 vars
+        let num_constraints = 1usize.saturating_add((next() % 4) as usize); // 1..=4 constraints
 
         let mut obj_terms = Vec::new();
         for v in 1..=num_vars {
-            let coeff = 1 + (next() % 8) as i128; // weights 1..=8
+            let coeff = 1i128.saturating_add((next() % 8) as i128); // weights 1..=8
             let negated = next().is_multiple_of(4);
             obj_terms.push(PbTerm {
                 coeff,
@@ -2536,8 +2557,11 @@ mod tests {
                     }],
                 });
             }
-            let max_rhs = terms.len() as i128;
-            let rhs = 1 + (next() as i128 % max_rhs.max(1));
+            // `next() as i128` is non-negative, so taking the residue in u64
+            // against the (non-zero) term count gives the same value.
+            let max_rhs = (terms.len() as u64).max(1);
+            let residue = next().checked_rem(max_rhs).unwrap_or(0);
+            let rhs = 1i128.saturating_add(i128::from(residue));
             constraints.push(PbConstraint {
                 terms,
                 rel: crate::types::PbRel::Ge,
@@ -2596,7 +2620,7 @@ mod tests {
         let mut trace = Vec::new();
         let mut rounds = 0usize;
         loop {
-            rounds += 1;
+            rounds = rounds.saturating_add(1);
             assert!(rounds < 10_000, "descent did not terminate");
             if state.softs.is_empty() {
                 return DescentOutcome {
@@ -2694,7 +2718,7 @@ mod tests {
                 assert!(
                     lb <= bf,
                     "batched lower bound {lb} after round {} exceeds true optimum {bf}",
-                    round + 1
+                    round.saturating_add(1)
                 );
             }
             assert!(
@@ -2710,7 +2734,7 @@ mod tests {
                     descent.lower_bound
                 );
             }
-            checked += 1;
+            checked = checked.saturating_add(1);
         }
         assert!(checked >= 40, "only {checked} feasible instances checked");
     }
@@ -2762,7 +2786,7 @@ mod tests {
                 reference, capped,
                 "cap=1 descent diverged from the single-core reference path"
             );
-            checked += 1;
+            checked = checked.saturating_add(1);
         }
         assert!(checked >= 25, "only {checked} feasible instances checked");
     }
@@ -2814,7 +2838,9 @@ mod tests {
         assert!(n <= 20, "brute force only for tiny instances");
         let mut best: Option<(Vec<bool>, i128)> = None;
         for mask in 0u32..(1u32 << n) {
-            let assignment: Vec<bool> = (0..n).map(|i| (mask >> i) & 1 == 1).collect();
+            let assignment: Vec<bool> = (0..n)
+                .map(|i| mask.checked_shr(i as u32).is_some_and(|bits| bits & 1 == 1))
+                .collect();
             if !crate::eval::verify_all_constraints(&instance.constraints, &assignment) {
                 continue;
             }
@@ -2945,7 +2971,7 @@ mod tests {
                 // can only accelerate); anything else was caught above.
                 _ => {}
             }
-            checked += 1;
+            checked = checked.saturating_add(1);
         }
         assert!(checked >= 25, "only {checked} feasible instances checked");
     }

@@ -35,8 +35,13 @@ impl Solver {
     ///
     /// # Panics
     ///
-    /// Panics if `name` is already bound to a function or a different constant
-    /// sort. Repeating the exact declaration is idempotent. The sole surface
+    /// Panics if `name` is reserved — an ay builtin theory-operator spelling
+    /// (for example `fp` or `int2bv`), a declaration-activated collection
+    /// operator, or ay's internal `__ay_` namespace — or if `name` is already
+    /// bound to a function or a different constant sort. Use
+    /// [`try_declare_const`](Self::try_declare_const) to receive either refusal
+    /// as a [`SolverError`] instead. Repeating the exact declaration is
+    /// idempotent. The sole surface
     /// refinement accepted is a same-named `Uninterpreted("T")` placeholder to
     /// a concrete `Datatype` named `T`; the reverse spelling reuses the term but
     /// retains its more informative datatype metadata.
@@ -208,6 +213,63 @@ impl Solver {
             sort: self.terms().sort(term_id).clone(),
         });
         Ok(self.wrap_term(term_id))
+    }
+
+    /// Register `term`, a constant grafted into this solver from another one
+    /// ([`translate_terms_from`](Self::translate_terms_from)), as a declared
+    /// constant under its own core name, so this solver's models interpret
+    /// it. A graft only re-interns the `Var`; without this the translated
+    /// constant was no declared symbol of the target, its models printed no
+    /// value for it, and the Z3 C API published `sat` for a translated solver
+    /// with a model that falsified its assertions (measured: `x > 0 ∧ x < 5`
+    /// translated to a fresh context).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SolverError::InvalidArgument`] when `term` is not a constant
+    /// or its name is already bound to a different declaration.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_adopt_translated_constant(
+        &mut self,
+        term: Term,
+        sort: Sort,
+    ) -> Result<(), SolverError> {
+        let id = self.resolve_term("adopt_translated_constant", term)?;
+        let ay_core::TermData::Var(name, _) = self.terms().get(id).clone() else {
+            return Err(SolverError::InvalidArgument {
+                operation: "adopt_translated_constant",
+                message: "the translated term is not a constant".to_string(),
+            });
+        };
+        if let Some(&existing) = self.var_terms_by_name.get(&name) {
+            return if existing == id {
+                Ok(())
+            } else {
+                Err(SolverError::InvalidArgument {
+                    operation: "adopt_translated_constant",
+                    message: format!("constant '{name}' is already declared differently"),
+                })
+            };
+        }
+        if self.executor.context().has_symbol_binding(&name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "adopt_translated_constant",
+                message: format!("symbol '{name}' is already bound to a different declaration"),
+            });
+        }
+        let core_sort = self.terms().sort(id).clone();
+        self.executor
+            .context_mut_internal()
+            .register_native_global_symbol(name.clone(), id, core_sort.clone());
+        self.var_names.insert(id, name.clone());
+        self.var_terms_by_name.insert(name.clone(), id);
+        self.var_sorts.insert(id, sort);
+        self.record_native_replay_event(NativeReplayEventKind::DeclareConst {
+            name,
+            term: id,
+            sort: core_sort,
+        });
+        Ok(())
     }
 
     /// Declare an integer constant (0-arity) variable.

@@ -360,6 +360,13 @@ impl TheorySolver for UfMapLiaSolver<'_> {
         self.arrays.note_applied_theory_lemma(clause);
     }
 
+    fn reacknowledge_applied_theory_lemma(
+        &mut self,
+        clause: &[TheoryLit],
+    ) -> ay_core::TheoryLemmaReplay {
+        self.arrays.reacknowledge_applied_theory_lemma(clause)
+    }
+
     fn supports_theory_aware_branching(&self) -> bool {
         self.lia.supports_theory_aware_branching()
     }

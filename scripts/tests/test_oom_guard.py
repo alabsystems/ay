@@ -10,9 +10,14 @@ unittest, runnable via:
     python3 -m unittest discover scripts/tests
 """
 import contextlib
+import ctypes
+import ctypes.util
+import errno
 import io
+import json
 import lzma
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -29,11 +34,7 @@ SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPTS_DIR)
 
 import _oom_guard as og  # noqa: E402
-import chccomp_harness  # noqa: E402
 import smtcomp_harness  # noqa: E402
-import chccomp_regression  # noqa: E402
-import chccomp_track_sweep  # noqa: E402
-import pb_sweep  # noqa: E402
 import pbcomp_harness  # noqa: E402
 import wind_tunnel  # noqa: E402
 
@@ -50,6 +51,22 @@ if not TRUE_BIN.is_file():
     raise RuntimeError(
         "OOM-guard tests require the POSIX /usr/bin/true executable"
     )
+
+
+def plan_detected_host_with_scratch_lease(test, label):
+    """One 256 MiB-floor plan from the REAL planner on detected RAM, holding a
+    scratch lease instead of the host's.
+
+    The host lease belongs to real campaigns: a differential gate admitted on
+    this machine holds it for its whole run, and must neither turn the suite red
+    nor be refused because the suite took it.
+    """
+    plan = og.plan_solver_resources(1, mem_floor_mb=256, label=label, acquire_lease=False)
+    lease_dir = tempfile.TemporaryDirectory()
+    test.addCleanup(lease_dir.cleanup)
+    og.acquire_harness_lease(label, _lock_path=os.path.join(lease_dir.name, "host.lock"))
+    test.addCleanup(og._release_harness_lease)
+    return plan
 
 
 class PlanSolverResourcesTest(unittest.TestCase):
@@ -167,8 +184,14 @@ class PlanSolverResourcesTest(unittest.TestCase):
 
     def test_cgroup_limit_and_current_usage_bound_automatic_plan(self):
         cgroup = og.CgroupMemory(limit_mb=8192, current_mb=2048)
+        # The automatic plan also reads the host's live free memory. Pin it to
+        # 0, the reading's "unknown", so that only the cgroup bounds this plan:
+        # the live trim has its own tests above, and left unpinned this one
+        # failed whenever the host running the suite was short of memory
+        # ("only 0MiB remains", measured 2026-10-08 under a parallel build).
         with mock.patch.object(og, "physical_ram_mb", return_value=8192), \
-             mock.patch.object(og, "cgroup_memory_mb", return_value=cgroup):
+             mock.patch.object(og, "cgroup_memory_mb", return_value=cgroup), \
+             mock.patch.object(og, "host_available_ram_mb", return_value=0):
             plan = og.plan_solver_resources(2, cores=4, acquire_lease=False)
         self.assertEqual(plan.headroom_mb, 1024)
         self.assertEqual(plan.jobs, 2)
@@ -245,6 +268,9 @@ class PlanSolverResourcesTest(unittest.TestCase):
             og.acquire_harness_lease("relative test lease", _lock_path="lease.lock")
 
     def test_hidden_lease_path_coordinates_sidecars_with_distinct_tmpdirs(self):
+        # Hang detectors: a sidecar's lease record, and its reading of the owner's, wait
+        # up to _GROUP_SETTLE_S on `ps`.
+        hang_s = 2 * og._GROUP_SETTLE_S
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             first_tmp = root / "first-tmp"
@@ -275,7 +301,7 @@ class PlanSolverResourcesTest(unittest.TestCase):
                     daemon=True,
                 )
                 reader.start()
-                reader.join(timeout=10)
+                reader.join(timeout=hang_s)
                 self.assertFalse(reader.is_alive(), "first lease sidecar did not arm")
                 self.assertEqual(ready, [b"AY_OOM_HARNESS_LEASE_READY_V1\n"])
 
@@ -283,7 +309,7 @@ class PlanSolverResourcesTest(unittest.TestCase):
                     command,
                     input=b"",
                     capture_output=True,
-                    timeout=10,
+                    timeout=hang_s,
                     env=second_env,
                     check=False,
                 )
@@ -293,12 +319,12 @@ class PlanSolverResourcesTest(unittest.TestCase):
                 )
 
                 first.stdin.close()
-                self.assertEqual(first.wait(timeout=10), 0)
+                self.assertEqual(first.wait(timeout=hang_s), 0)
                 replacement = subprocess.run(
                     command,
                     input=b"",
                     capture_output=True,
-                    timeout=10,
+                    timeout=hang_s,
                     env=second_env,
                     check=False,
                 )
@@ -487,6 +513,68 @@ class PlanSolverResourcesTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "process scan unavailable"):
                 og.warn_concurrent_build()
 
+    def _count_builds_with_process_read_error(self, leaf, phase, number):
+        # Inject the real open/read boundary, not the detector's result. The
+        # second live driver must still be detected after the first disappears.
+        root = "/mock-proc"
+        entries = mock.MagicMock()
+        entries.__iter__.return_value = iter([
+            types.SimpleNamespace(name="1966920"),
+            types.SimpleNamespace(name="100"),
+        ])
+        error = OSError(number, "injected per-process read failure")
+
+        def open_proc(path, mode):
+            self.assertEqual(mode, "rb")
+            if path == f"{root}/1966920/{leaf}":
+                if phase == "open":
+                    raise error
+                stream = mock.MagicMock()
+                stream.__enter__.return_value.read.side_effect = error
+                return stream
+            if path.endswith("/comm"):
+                return io.BytesIO(b"targo\n")
+            self.assertTrue(path.endswith("/cmdline"))
+            return io.BytesIO(b"targo\0--unverified\0build\0")
+
+        with mock.patch.object(og.os.path, "isdir", return_value=True), \
+                mock.patch.object(og.os, "scandir", return_value=entries), \
+                mock.patch.object(og, "_process_state", return_value="S"), \
+                mock.patch("builtins.open", side_effect=open_proc):
+            return og.count_active_rustc(proc_root=root, ancestor_pids=set())
+
+    def test_build_detection_ignores_only_vanished_process_reads(self):
+        for leaf in ("comm", "cmdline"):
+            for phase in ("open", "read"):
+                for number in (errno.ENOENT, errno.ESRCH):
+                    with self.subTest(leaf=leaf, phase=phase, errno=number):
+                        self.assertEqual(
+                            self._count_builds_with_process_read_error(
+                                leaf, phase, number
+                            ),
+                            1,
+                        )
+
+    def test_build_detection_preserves_non_exit_process_read_errors(self):
+        for leaf in ("comm", "cmdline"):
+            for phase in ("open", "read"):
+                for number in (errno.EACCES, errno.EPERM, errno.EIO, errno.EINVAL):
+                    with self.subTest(leaf=leaf, phase=phase, errno=number):
+                        with self.assertRaisesRegex(RuntimeError, "cannot inspect"):
+                            self._count_builds_with_process_read_error(
+                                leaf, phase, number
+                            )
+
+    def test_build_process_directory_errors_are_not_exit_races(self):
+        for number in (errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EIO):
+            with self.subTest(errno=number), \
+                    mock.patch.object(og.os.path, "isdir", return_value=True), \
+                    mock.patch.object(
+                        og.os, "scandir", side_effect=OSError(number, "scan failed")
+                    ):
+                with self.assertRaisesRegex(RuntimeError, "cannot inspect build processes"):
+                    og._named_build_processes("/mock-proc")
+
     def test_build_detection_includes_targo_and_trustc_and_excludes_ancestor(self):
         with tempfile.TemporaryDirectory() as td:
             proc = Path(td)
@@ -509,10 +597,14 @@ class PlanSolverResourcesTest(unittest.TestCase):
             process(104, "rustc", ["rustc", "done.rs"], state="Z")
             process(105, "compiler_consumer", ["compiler_consumer", "paused.rs"], state="T")
             process(106, "targo", ["targo", "test"], state="T")
+            # `targo tippy` is the Trust lint lane (stock `cargo clippy`), and
+            # `targo --unverified build` names its lane before the subcommand.
+            process(107, "targo", ["targo", "tippy", "--workspace"])
+            process(108, "targo", ["targo", "--unverified", "build"])
 
             self.assertEqual(
                 og.count_active_rustc(proc_root=td, ancestor_pids={103}),
-                2,
+                4,
             )
 
     def test_build_process_walk_is_bounded(self):
@@ -549,37 +641,6 @@ class WindTunnelEnvMergeTest(unittest.TestCase):
         self.assertNotIn("NBCORE", env)
 
 
-class ChcEnvelopeRecordingTest(unittest.TestCase):
-    """The CHC harnesses must record the enforced per-child --memory envelope:
-    baselines/sweeps were measured under ay's 85%-of-RAM default, so results
-    taken under different envelopes are not comparable and a solved->unknown
-    flip under a tight cap must be attributable to the cap."""
-
-    def test_track_sweep_record_carries_memlimit(self):
-        task = types.SimpleNamespace(smt2=os.devnull, verdict=None,
-                                     rel_id="fam/x.smt2")
-        rec = chccomp_track_sweep.run_one(task, 5, str(TRUE_BIN),
-                                          memlimit_mb=777)
-        self.assertEqual(rec["memlimit_mb"], 777)
-        self.assertEqual(rec["status"], "unknown")
-
-    def test_track_sweep_rejects_missing_memory_envelope(self):
-        task = types.SimpleNamespace(smt2=os.devnull, verdict=None,
-                                     rel_id="fam/x.smt2")
-        with self.assertRaises(ValueError):
-            chccomp_track_sweep.run_one(task, 5, str(TRUE_BIN))
-
-    def test_regression_record_carries_memlimit(self):
-        entry = {"year": "2025", "track": "LIA-Lin", "instance": "i.yml",
-                 "verdict": "sat", "wall": 1.0}
-        with mock.patch.object(chccomp_regression, "resolve_smt2",
-                               return_value=os.devnull):
-            rec = chccomp_regression.run(entry, 1, str(TRUE_BIN),
-                                         memlimit_mb=777)
-        self.assertEqual(rec["memlimit_mb"], 777)
-        self.assertEqual(rec["status"], "unknown")
-
-
 class RssWatchdogTest(unittest.TestCase):
     """rss_watchdog: the external backstop for solver children that do not
     enforce their envelope themselves (the main ay binary's `pb` subcommand
@@ -589,11 +650,59 @@ class RssWatchdogTest(unittest.TestCase):
            "b = bytearray(400 * 1024 * 1024)\n"  # ~400 MiB RSS
            "time.sleep(60)\n")
 
-    def _spawn(self, code):
-        return subprocess.Popen([sys.executable, "-c", code],
+    # A target that exits on a TIMER races the watchdog's arming: under load
+    # the arming (a `ps` scan that authenticates the group) can start after a
+    # 0.2 s child has already exited, and rss_watchdog then refuses, correctly,
+    # to arm on a group that is gone ("cannot authenticate process-group
+    # identity"). The targets below exit on an EVENT that exists only once
+    # the watchdog is armed, so arming precedes exit by construction. Their
+    # 60 s bound is a hang guard, never the expected path: it exits 3.
+    #
+    # Exits once the file named by argv[1] exists: the armed sidecar's
+    # ready signal.
+    EXIT_AFTER_READY_FILE = (
+        "import os, sys, time\n"
+        "deadline = time.monotonic() + 60\n"
+        "while not os.path.exists(sys.argv[1]):\n"
+        "    if time.monotonic() > deadline:\n"
+        "        sys.exit(3)\n"
+        "    time.sleep(0.01)\n"
+    )
+    # Exits 0.5 s after stdin reaches EOF, which the test causes only once
+    # rss_watchdog has returned an armed guard; the 0.5 s keeps the child
+    # live across several armed polls.
+    EXIT_AFTER_STDIN_EOF = (
+        "import select, sys, time\n"
+        "if not select.select([sys.stdin], [], [], 60)[0]:\n"
+        "    sys.exit(3)\n"
+        "sys.stdin.read()\n"
+        "time.sleep(0.5)\n"
+    )
+    # How long the stall tests keep the sidecar off the CPU between spawning
+    # (or attaching to) the target and arming. A timer-bound target is gone
+    # well inside it; an event-bound one cannot be.
+    ARMING_STALL_S = 2.0
+
+    def _spawn(self, code, *args, stdin=None):
+        proc = subprocess.Popen([sys.executable, "-c", code, *args],
+                                stdin=stdin,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 start_new_session=True)
+        self.addCleanup(self._kill_if_running, proc)
+        return proc
+
+    @staticmethod
+    def _kill_if_running(proc):
+        """Cleanup for a test that failed before its target exited."""
+        if proc.stdin is not None:
+            proc.stdin.close()
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
 
     def test_kills_child_over_envelope(self):
         proc = self._spawn(self.HOG)
@@ -609,13 +718,26 @@ class RssWatchdogTest(unittest.TestCase):
         self.assertEqual(rc, -signal.SIGKILL)
         self.assertIn("memout", stderr.getvalue())
 
-    def test_child_within_envelope_untouched(self):
-        proc = self._spawn("import time; time.sleep(0.5)")
+    def _assert_child_within_envelope_untouched(self, arming_stall_s):
+        proc = self._spawn(self.EXIT_AFTER_STDIN_EOF, stdin=subprocess.PIPE)
+        if arming_stall_s:
+            # The harness loses the CPU before arming; the target runs on.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=arming_stall_s)
         guard = og.rss_watchdog(proc, 10000, label="test", poll_s=0.1)
+        proc.stdin.close()  # armed: let the child finish inside its envelope
         rc = proc.wait(timeout=30)
         guard.stop()
         self.assertFalse(guard.breached)
         self.assertEqual(rc, 0)
+
+    def test_child_within_envelope_untouched(self):
+        self._assert_child_within_envelope_untouched(arming_stall_s=0)
+
+    def test_child_within_envelope_untouched_when_arming_is_descheduled(self):
+        self._assert_child_within_envelope_untouched(
+            arming_stall_s=self.ARMING_STALL_S
+        )
 
     def test_rss_watchdog_refuses_non_group_leader(self):
         proc = mock.Mock(pid=1234)
@@ -638,6 +760,8 @@ class RssWatchdogTest(unittest.TestCase):
             og, "_watch_process_identity", return_value=(4242, "replacement")
         ), mock.patch.object(
             og, "_safe_getpgid", return_value=4242
+        ), mock.patch.object(
+            og, "_process_group_exists", return_value=True
         ), mock.patch.object(
             og, "_terminate_process_group"
         ) as terminate:
@@ -681,6 +805,9 @@ class RssWatchdogTest(unittest.TestCase):
             def stop(self):
                 pass
 
+            def check_enforcement(self):
+                pass
+
         guard = FakeGuard()
         proc = types.SimpleNamespace(pid=4242, pgid=4242)
         input_stream = io.BytesIO(b"WATCH 1 4242 128 74657374\n")
@@ -712,25 +839,41 @@ class RssWatchdogTest(unittest.TestCase):
         ):
             self.assertTrue(og.watch_existing_process(999999, 128))
 
-    def test_watch_existing_process_signals_ready_after_arming(self):
-        proc = self._spawn("import time; time.sleep(0.2)")
-        reaper = threading.Thread(target=proc.wait)
-        reaper.start()
+    def _assert_ready_after_arming(self, arming_stall_s):
         with tempfile.TemporaryDirectory() as td:
             ready = Path(td, "ready")
-            breached = og.watch_existing_process(
-                proc.pid,
-                10000,
-                label="ready-test",
-                poll_s=0.01,
-                grace_mb=0,
-                ready_file=str(ready),
-            )
+            proc = self._spawn(self.EXIT_AFTER_READY_FILE, str(ready))
+            reaper = threading.Thread(target=proc.wait)
+            reaper.start()
+            arm = og.rss_watchdog
+
+            def descheduled_arm(*args, **kwargs):
+                # The sidecar has attached but loses the CPU before arming;
+                # the target runs on, and a timer-bound one exits (and is
+                # reaped) inside this stall.
+                reaper.join(timeout=arming_stall_s)
+                return arm(*args, **kwargs)
+
+            with mock.patch.object(og, "rss_watchdog", side_effect=descheduled_arm):
+                breached = og.watch_existing_process(
+                    proc.pid,
+                    10000,
+                    label="ready-test",
+                    poll_s=0.01,
+                    grace_mb=0,
+                    ready_file=str(ready),
+                )
             self.assertFalse(breached)
             self.assertEqual(ready.read_text(), "ready\n")
         reaper.join(timeout=5)
         self.assertFalse(reaper.is_alive())
         self.assertEqual(proc.returncode, 0)
+
+    def test_watch_existing_process_signals_ready_after_arming(self):
+        self._assert_ready_after_arming(arming_stall_s=0)
+
+    def test_watch_existing_process_signals_ready_when_arming_is_descheduled(self):
+        self._assert_ready_after_arming(arming_stall_s=self.ARMING_STALL_S)
 
     def test_watch_existing_process_refuses_ready_when_watchdog_is_unarmed(self):
         proc = self._spawn("import time; time.sleep(60)")
@@ -895,7 +1038,8 @@ class RssWatchdogTest(unittest.TestCase):
 
         def capture_spawn(*args, **kwargs):
             proc = real_popen(*args, **kwargs)
-            spawned.append(proc)
+            if kwargs.get("start_new_session"):
+                spawned.append(proc)
             return proc
 
         with mock.patch.object(og.subprocess, "Popen", side_effect=capture_spawn), \
@@ -1288,13 +1432,12 @@ class RssWatchdogTest(unittest.TestCase):
 
     def test_run_guarded_preserves_wait_error_after_cleanup(self):
         proc = mock.Mock(pid=4242, returncode=None)
-        proc.wait.side_effect = OSError("simulated wait failure")
         guard = mock.Mock(breach_time_ns=None)
         with mock.patch.object(og, "guarded_popen", return_value=(proc, guard)), \
-             mock.patch.object(og, "_kill_and_reap_group"):
+             mock.patch.object(og, "wait_guarded_exit", side_effect=OSError("simulated wait failure")):
             with self.assertRaisesRegex(OSError, "simulated wait failure"):
                 og.run_guarded(["solver"], 128, timeout_s=1)
-        guard.stop.assert_called_once_with()
+        guard.finish.assert_called_once_with(proc, "harness")
 
     def test_first_terminal_cause_uses_monotonic_trigger_order(self):
         self.assertEqual(
@@ -1317,11 +1460,13 @@ class RssWatchdogTest(unittest.TestCase):
         )
 
     def test_watchdog_stop_fails_if_thread_does_not_terminate(self):
-        guard = object.__new__(og._RssWatchdog)
+        with mock.patch.object(og.threading, "Thread"), \
+             mock.patch.object(og.threading.Event, "wait", return_value=True):
+            guard = og._RssWatchdog(mock.Mock(pid=4242), 4242, 128, 0.02,
+                                    "stuck-watchdog-test", (4243, "anchor"))
+        guard._phase = og._WatchPhase.QUIESCED
         guard._stop_evt = mock.Mock()
-        guard._thread = mock.Mock()
         guard._thread.is_alive.return_value = True
-        guard._label = "stuck-watchdog-test"
         with self.assertRaisesRegex(RuntimeError, "did not stop"):
             guard.stop()
         guard._stop_evt.set.assert_called_once_with()
@@ -1360,83 +1505,6 @@ class SmtcompEnvelopeTest(unittest.TestCase):
         complete canonical envelope travels with the record."""
         self.assertIn("resource_envelope",
                       smtcomp_harness.run_one.__code__.co_varnames)
-
-
-class PbSweepMemoutTest(unittest.TestCase):
-    """pb_sweep.run_one labels a watchdog kill as 'memout' — the envelope is
-    enforced externally because the default ./target/release/ay `pb`
-    subcommand ignores the exported MEMLIMIT env."""
-
-    def test_hog_child_reported_as_memout(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
-            fh.write(RssWatchdogTest.HOG)
-            hog = fh.name
-        try:
-            # Non-"ay" solver name => cmd is [cmd_tmpl, f]; use the python
-            # interpreter as the "solver" and the hog script as the instance.
-            rec = pb_sweep.run_one("hog", sys.executable, hog, 30.0,
-                                   env=None, memlimit_mb=32)
-        finally:
-            os.unlink(hog)
-        self.assertEqual(rec["status"], "memout")
-
-
-class PbBenchEnvelopeTest(unittest.TestCase):
-    """The shell PB harness must use the shared watchdog even at jobs=1 and
-    persist the actual envelope in its CSV."""
-
-    def test_shell_harness_records_guarded_envelope(self):
-        with tempfile.TemporaryDirectory() as td:
-            script = os.path.join(td, "pb_bench.sh")
-            shutil.copyfile(os.path.join(SCRIPTS_DIR, "pb_bench.sh"), script)
-            os.chmod(script, 0o755)
-            guard_log = os.path.join(td, "guard.log")
-            guard = os.path.join(td, "_oom_guard.py")
-            Path(guard).write_text(
-                """\
-import os
-import subprocess
-import sys
-
-with open(os.environ["AY_TEST_GUARD_LOG"], "a", encoding="utf-8") as log:
-    log.write(" ".join(sys.argv[1:]) + "\\n")
-if sys.argv[1] == "plan":
-    print("PLAN_JOBS=1")
-    print("PLAN_MEMLIMIT_MB=64")
-    print("PLAN_NBCORE=1")
-    print("PLAN_HEADROOM_MB=128")
-elif sys.argv[1] == "run":
-    command = sys.argv[sys.argv.index("--") + 1:]
-    raise SystemExit(subprocess.run(command, check=False).returncode)
-else:
-    raise SystemExit(f"unexpected guard command: {sys.argv[1]}")
-"""
-            )
-            solver = os.path.join(td, "solver")
-            with open(solver, "w") as fh:
-                fh.write("#!/bin/sh\nprintf 's SATISFIABLE\\n'\n")
-            os.chmod(solver, 0o755)
-            corpus = os.path.join(td, "DEC-LIN")
-            os.makedirs(corpus)
-            Path(corpus, "tiny.opb").write_text("* #variable= 0 #constraint= 0\n")
-            output = os.path.join(td, "results.csv")
-            environment = os.environ.copy()
-            environment["AY_TEST_GUARD_LOG"] = guard_log
-            proc = subprocess.run(
-                [script, solver, "1", corpus, output, "1"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=environment,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            rows = Path(output).read_text().splitlines()
-            self.assertIn("resource_memlimit_mb", rows[0])
-            self.assertIn("resource_enforcement", rows[0])
-            self.assertTrue(rows[1].endswith("|rss_watchdog"), rows[1])
-            guard_calls = Path(guard_log).read_text().splitlines()
-            self.assertIn("--warn-concurrent-build", guard_calls[0])
-            self.assertIn("run --limit-mb 64", guard_calls[1])
 
 
 class WindTunnelMemoutTest(unittest.TestCase):
@@ -1513,34 +1581,6 @@ class PbcompChildEnvTest(unittest.TestCase):
         self.assertEqual(r2.memlimit_mb, 1072)
 
 
-class ChccompHarnessEnvelopeTest(unittest.TestCase):
-    """chccomp_harness cmd_run wiring: ay children get --memory and every
-    record carries the enforced envelope (resumable JSONL files can span
-    runs, so the envelope must live per record)."""
-
-    def test_ay_argv_carries_memory_flag(self):
-        old = chccomp_harness._AY_MEMLIMIT_MB
-        try:
-            chccomp_harness._AY_MEMLIMIT_MB = 512
-            argv = chccomp_harness._ay_argv("x.smt2", 10)
-            self.assertIn("--memory", argv)
-            self.assertEqual(argv[argv.index("--memory") + 1], "512")
-            chccomp_harness._AY_MEMLIMIT_MB = 0
-            self.assertNotIn("--memory", chccomp_harness._ay_argv("x.smt2", 10))
-        finally:
-            chccomp_harness._AY_MEMLIMIT_MB = old
-
-    def test_run_one_record_carries_memlimit(self):
-        chccomp_harness.SOLVERS["truebin"] = lambda f, t: [str(TRUE_BIN)]
-        try:
-            task = chccomp_harness.Task(rel_id="fam/x.yml", smt2=os.devnull,
-                                        verdict=None, placeholder=False)
-            rec = chccomp_harness.run_one("truebin", task, 5, memlimit_mb=777)
-        finally:
-            del chccomp_harness.SOLVERS["truebin"]
-        self.assertEqual(rec["memlimit_mb"], 777)
-
-
 class WindTunnelBuildGuardTest(unittest.TestCase):
     """wind_tunnel refuses to start while a cargo build is active."""
 
@@ -1589,6 +1629,1813 @@ class WindTunnelBuildGuardTest(unittest.TestCase):
         rc, err = self._run_main(build_active=False)
         self.assertNotIn("REFUSING", err)
         self.assertIn("no instances found", err)
+
+
+class GroupExitTest(unittest.TestCase):
+    """`_group_has_exited` on real process groups."""
+
+    def test_an_exited_unreaped_child_has_exited_and_a_live_one_has_not(self):
+        exited = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        live = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not og._group_has_exited(exited.pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(og._group_has_exited(exited.pid))
+            self.assertTrue(og._process_group_exists(exited.pid), "the zombie holds its group")
+            self.assertFalse(og._group_has_exited(live.pid))
+        finally:
+            exited.wait()
+            live.kill()
+            live.wait()
+        self.assertFalse(og._group_has_exited(exited.pid), "no members is not an exit")
+
+    def test_an_unreadable_process_listing_is_not_an_exit(self):
+        with mock.patch.object(og.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertFalse(og._group_has_exited(os.getpid()))
+
+    def test_a_group_reaped_after_the_probe_has_ended(self):
+        # A real child its parent reaps at once: whatever moment the reap
+        # lands at, the group has ended once it is reaped, and a live group
+        # has not.
+        exited = subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        live = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+        try:
+            exited.wait()
+            self.assertTrue(og._group_has_ended(exited.pid))
+            self.assertFalse(og._group_has_ended(live.pid))
+        finally:
+            live.kill()
+            live.wait()
+
+    def test_ended_needs_the_group_gone_after_an_empty_listing(self):
+        # Probe finds the group, the listing finds no member (it was reaped in
+        # between), the second probe no longer finds it: ended. The same
+        # listing with the group still found is not an exit (fail-closed).
+        with mock.patch.object(og, "_group_has_exited", return_value=False):
+            with mock.patch.object(og, "_process_group_exists", side_effect=[True, False]):
+                self.assertTrue(og._group_has_ended(4242))
+            with mock.patch.object(og, "_process_group_exists", side_effect=[True, True]):
+                self.assertFalse(og._group_has_ended(4242))
+
+
+class GuardCompletionModelTest(unittest.TestCase):
+    """Deterministic lifecycle controls: no real process or watchdog thread."""
+
+    @contextlib.contextmanager
+    def model(self):
+        proc = mock.Mock(pid=4242, returncode=0, args=["modeled-child"])
+        proc.poll.return_value = 0
+        proc.wait.return_value = 0
+        guard = og._RssWatchdog.__new__(og._RssWatchdog)
+        guard.armed = True
+        guard.breached = False
+        guard.breach_time_ns = None
+        guard.peak_rss_mb = 7
+        guard._proc = guard._owned_proc = proc
+        guard._pgid = 4242
+        guard._kill_mb = 128
+        guard._poll_s = 0.02
+        guard._label = "completion-model"
+        guard._group_identity = (4243, "original-anchor")
+        guard._stop_evt = threading.Event()
+        guard._ready_evt = threading.Event()
+        guard._terminal_evt = threading.Event()
+        guard._lifecycle_lock = threading.RLock()
+        guard._phase = og._WatchPhase.ACTIVE
+        guard._events = []
+        guard._worker_error = None
+        guard._kill_sent = False
+        guard._frozen_members = None
+        guard.identity_lost = False
+        guard.identity_lost_time_ns = None
+        state = {"alive": True, "stopped": False, "joined": False, "trace": []}
+
+        def join(timeout=None):
+            state["trace"].append("join")
+            state["joined"] = True
+            guard._terminal_evt.set()
+
+        guard._thread = mock.Mock()
+        guard._thread.is_alive.side_effect = lambda: not state["joined"]
+        guard._thread.join.side_effect = join
+
+        def signal_group(pgid, signum):
+            self.assertEqual(pgid, 4242)
+            self.assertTrue(state["alive"], "must not signal an absent/recycled group")
+            state["trace"].append(signum)
+            if signum == signal.SIGSTOP:
+                self.assertFalse(state["joined"], "must keep monitoring through stop delivery")
+                state["stopped"] = True
+            elif signum == signal.SIGKILL:
+                state["alive"] = False
+            else:
+                self.fail("unexpected group signal")
+
+        def snapshot(pgid, identity):
+            state["trace"].append("snapshot")
+            self.assertEqual(identity, guard._group_identity)
+            if state["alive"] and state["stopped"]:
+                return ((4243, "original-anchor"), (4244, "original-child"))
+            return None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(og, "_group_identity_is_current", side_effect=lambda *_: state["alive"]))
+            stack.enter_context(mock.patch.object(og, "_process_group_exists", side_effect=lambda *_: state["alive"]))
+            stack.enter_context(mock.patch.object(og.os, "killpg", side_effect=signal_group))
+            stack.enter_context(mock.patch.object(og, "_stopped_group_snapshot", side_effect=snapshot))
+            stack.enter_context(mock.patch.object(og.time, "sleep"))
+            yield proc, guard, state
+
+    def test_finish_stops_and_observes_group_before_join_then_kills_once(self):
+        with self.model() as (proc, guard, state):
+            evidence = guard.finish(proc)
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertFalse(evidence["identity_lost"])
+            self.assertIsNone(evidence["worker_error"])
+            trace = state["trace"]
+            self.assertGreaterEqual(trace.count("snapshot"), 3)
+            self.assertLess(trace.index(signal.SIGSTOP), trace.index("join"))
+            self.assertLess(trace.index("snapshot"), trace.index("join"))
+            self.assertLess(trace.index("join"), trace.index(signal.SIGKILL))
+            self.assertEqual(trace.count(signal.SIGKILL), 1)
+            self.assertNotIn(signal.SIGCONT, trace)
+
+    def test_finish_refuses_a_different_process_owner_before_signalling(self):
+        with self.model() as (_, guard, state):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "different process owner"):
+                guard.finish(mock.Mock(pid=4242))
+            self.assertEqual(state["trace"], [])
+
+    def test_launch_does_not_resume_if_monitor_failed_before_sigcont(self):
+        with self.model() as (proc, guard, state):
+            guard._worker_error = "monitor failed during launch"
+            guard._phase = og._WatchPhase.ERROR
+            with mock.patch.object(og.subprocess, "Popen", return_value=proc), \
+                 mock.patch.object(og.os, "getpgid", return_value=4242), \
+                 mock.patch.object(og, "_watch_process_identity", return_value=(4242, "leader")), \
+                 mock.patch.object(og, "_group_watch_identity", return_value=guard._group_identity), \
+                 mock.patch.object(og, "_wait_for_guard_stop"), \
+                 mock.patch.object(og, "rss_watchdog", return_value=guard):
+                with self.assertRaises(og.GuardEnforcementError):
+                    og.guarded_popen(["modeled-child"], 128)
+            self.assertNotIn(signal.SIGCONT, state["trace"])
+            self.assertFalse(state["alive"])
+
+    def test_early_monitor_stop_stays_refused_after_successful_cleanup(self):
+        with self.model() as (proc, guard, state):
+            guard.stop()
+            with self.assertRaises(og.GuardEnforcementError):
+                guard.finish(proc)
+            self.assertIsNotNone(guard.evidence()["worker_error"])
+            self.assertFalse(state["alive"])
+            self.assertNotIn(signal.SIGSTOP, state["trace"])
+
+    def test_direct_stop_accepts_fresh_whole_group_absence_without_prior_error(self):
+        with self.model() as (proc, guard, state):
+            state["alive"] = False
+            guard.stop()
+            guard.check_enforcement()
+            self.assertEqual(guard._phase, og._WatchPhase.GROUP_GONE)
+            self.assertIsNone(guard._worker_error)
+            self.assertEqual(guard.finish(proc)["phase"], "reaped")
+
+    def test_pre_resume_memout_returns_terminal_guard_without_sigcont(self):
+        with self.model() as (proc, guard, state):
+            state["alive"] = False
+            guard._phase = og._WatchPhase.KILL_SENT
+            guard._kill_sent = guard.breached = True
+            guard.breach_time_ns = 1
+            with mock.patch.object(og.subprocess, "Popen", return_value=proc), \
+                 mock.patch.object(og.os, "getpgid", return_value=4242), \
+                 mock.patch.object(og, "_watch_process_identity", return_value=(4242, "leader")), \
+                 mock.patch.object(og, "_group_watch_identity", return_value=guard._group_identity), \
+                 mock.patch.object(og, "_wait_for_guard_stop"), \
+                 mock.patch.object(og, "rss_watchdog", return_value=guard):
+                self.assertEqual(og.guarded_popen(["modeled-child"], 128), (proc, guard))
+            self.assertNotIn(signal.SIGCONT, state["trace"])
+            self.assertEqual(guard.finish(proc)["phase"], "reaped")
+            self.assertTrue(guard.breached)
+            self.assertFalse(guard.identity_lost)
+
+    def test_identity_loss_stays_refused_if_same_identity_recovers_for_cleanup(self):
+        with self.model() as (proc, guard, state):
+            with mock.patch.object(og, "_group_identity_is_current", return_value=False):
+                with guard._lifecycle_lock:
+                    self.assertFalse(guard._retain_authenticated_group())
+            with self.assertRaises(og.GuardEnforcementError):
+                guard.finish(proc)
+            self.assertTrue(guard.identity_lost)
+            self.assertIsNotNone(guard.identity_lost_time_ns)
+            self.assertFalse(state["alive"])
+
+    def test_recycled_group_is_never_signalled_or_accepted(self):
+        with self.model() as (proc, guard, state):
+            with mock.patch.object(og, "_group_identity_is_current", return_value=False), \
+                 mock.patch.object(og, "_reap_group_without_signalling", side_effect=og.GuardEnforcementError("foreign group")):
+                with guard._lifecycle_lock:
+                    guard._retain_authenticated_group()
+                with self.assertRaises(og.GuardEnforcementError):
+                    guard.finish(proc)
+            self.assertNotIn(signal.SIGSTOP, state["trace"])
+            self.assertNotIn(signal.SIGKILL, state["trace"])
+
+    def test_monitor_exception_is_sticky_even_with_child_exit_zero(self):
+        with self.model() as (proc, guard, state):
+            with mock.patch.object(guard._stop_evt, "wait", return_value=False), \
+                 mock.patch.object(og, "process_group_rss_mb", side_effect=OSError("sampler broken")):
+                guard._watch()
+            with self.assertRaises(og.GuardEnforcementError):
+                guard.finish(proc)
+            self.assertIn("sampler broken", guard.evidence()["worker_error"])
+            self.assertFalse(state["alive"])
+
+    def test_watchdog_memout_uses_own_terminal_kill_without_identity_loss(self):
+        with self.model() as (proc, guard, state):
+            with mock.patch.object(guard._stop_evt, "wait", return_value=False), \
+                 mock.patch.object(og, "process_group_rss_mb", return_value=129):
+                guard._watch()
+            evidence = guard.finish(proc)
+            self.assertTrue(guard.breached)
+            self.assertFalse(guard.identity_lost)
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertEqual(state["trace"].count(signal.SIGKILL), 1)
+            self.assertNotIn(signal.SIGSTOP, state["trace"])
+
+    def test_observed_whole_group_absence_is_not_nonempty_identity_loss(self):
+        with self.model() as (proc, guard, state):
+            state["alive"] = False
+            with mock.patch.object(guard._stop_evt, "wait", return_value=False):
+                guard._watch()
+            evidence = guard.finish(proc)
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertFalse(evidence["identity_lost"])
+            self.assertNotIn(signal.SIGKILL, state["trace"])
+            self.assertTrue(any(e["kind"] == "whole-group-absent" for e in evidence["events"]))
+
+    def test_exited_unreaped_child_is_whole_group_exit_not_identity_loss(self):
+        # macOS: getpgid(zombie) is ESRCH, so the identity check fails while
+        # the unreaped zombie still holds the group. That is the child's exit.
+        with self.model() as (proc, guard, state):
+            state["zombie"] = True
+
+            def reap(timeout=None):
+                state["zombie"] = False
+                return 0
+
+            proc.wait.side_effect = reap
+            with mock.patch.object(og, "_group_identity_is_current", return_value=False), \
+                 mock.patch.object(og, "_process_group_exists", side_effect=lambda *_: state["zombie"]), \
+                 mock.patch.object(og, "_group_has_exited", side_effect=lambda *_: state["zombie"]), \
+                 mock.patch.object(guard._stop_evt, "wait", return_value=False):
+                guard._watch()
+                evidence = guard.finish(proc)
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertFalse(evidence["identity_lost"])
+            self.assertNotIn(signal.SIGSTOP, state["trace"])
+            self.assertNotIn(signal.SIGKILL, state["trace"])
+            self.assertTrue(any(e["kind"] == "whole-group-exited" for e in evidence["events"]))
+
+    def test_group_reaped_between_probe_and_listing_is_gone_not_identity_loss(self):
+        # The parent reaps the last zombie after the existence probe found the
+        # group and before the member listing: the listing finds no member,
+        # and the probe no longer finds the group. That is the child's exit.
+        with self.model() as (proc, guard, state):
+            state["zombie"] = True
+
+            def probe(*_):
+                present = state["zombie"]
+                if present:
+                    state["zombie"] = False  # reaped right after this probe
+                return present
+
+            with mock.patch.object(og, "_group_identity_is_current", return_value=False), \
+                 mock.patch.object(og, "_process_group_exists", side_effect=probe), \
+                 mock.patch.object(og, "_group_has_exited", return_value=False), \
+                 mock.patch.object(guard._stop_evt, "wait", return_value=False):
+                guard._watch()
+                evidence = guard.finish(proc)
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertFalse(evidence["identity_lost"])
+            self.assertNotIn(signal.SIGSTOP, state["trace"])
+            self.assertNotIn(signal.SIGKILL, state["trace"])
+            self.assertTrue(any(e["kind"] == "whole-group-reaped" for e in evidence["events"]))
+
+    def test_group_still_found_after_an_empty_listing_is_identity_loss(self):
+        # NEGATIVE CONTROL: an empty listing alone decides nothing. A group the
+        # probe still finds after it keeps the loss fail-closed.
+        with self.model() as (proc, guard, state):
+            with mock.patch.object(og, "_group_identity_is_current", return_value=False), \
+                 mock.patch.object(og, "_process_group_exists", return_value=True), \
+                 mock.patch.object(og, "_group_has_exited", return_value=False), \
+                 mock.patch.object(guard._stop_evt, "wait", return_value=False):
+                guard._watch()
+                self.assertTrue(guard.identity_lost)
+                with self.assertRaisesRegex(og.GuardEnforcementError, "enforcement lost"):
+                    guard.finish(proc)
+            self.assertNotIn(signal.SIGKILL, state["trace"])
+
+    def test_late_runnable_member_prevents_quiescent_completion(self):
+        with self.model() as (proc, guard, state):
+            members = ((4243, "original-anchor"), (4244, "original-child"))
+            with mock.patch.object(og, "_stopped_group_snapshot", side_effect=[members, members, None]):
+                with self.assertRaisesRegex(og.GuardEnforcementError, "stopped group changed"):
+                    guard.finish(proc)
+            self.assertFalse(state["alive"], "authenticated abort still cleans the changed group")
+
+    def test_a_stalled_host_delays_the_stop_and_finish_still_quiesces(self):
+        """On a shared host under load the stop of a finished solver can take seconds to
+        show: here four listings of 3 s each see a runnable member before the group shows
+        stopped. finish waits for it and completes; it used to give up after 5 s with
+        `cannot confirm whole-group quiescence`, which cancels a differential campaign."""
+        clock = [1000.0]
+        with self.model() as (proc, guard, state), \
+                mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]):
+            settled = og._stopped_group_snapshot  # the model's: stopped members once SIGSTOP landed
+
+            def stalled(pgid, identity):
+                if clock[0] < 1012.0:
+                    clock[0] += 3.0
+                    return None
+                return settled(pgid, identity)
+
+            with mock.patch.object(og, "_stopped_group_snapshot", side_effect=stalled):
+                evidence = guard.finish(proc)
+        self.assertEqual(evidence["phase"], "reaped")
+        self.assertEqual(state["trace"].count(signal.SIGKILL), 1)
+
+    def test_a_listing_slower_than_five_seconds_is_waited_for(self):
+        """A `ps` listing that takes 12 s on a stalled host is waited for; it used to time
+        out at 5 s, and the guard refused the run (`cannot inspect stopped group`)."""
+        identity = (4243, "original-anchor")
+
+        def listing(argv, timeout=None, **_):
+            if timeout is not None and timeout < 12:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return types.SimpleNamespace(stdout="4243 4242 T\n")
+
+        with mock.patch.object(og.subprocess, "run", side_effect=listing), \
+             mock.patch.object(og, "_watch_process_identity", side_effect=lambda pid: (pid, "original-anchor")), \
+             mock.patch.object(og, "_safe_getpgid", return_value=4242):
+            self.assertEqual(og._stopped_group_snapshot(4242, identity), (identity,))
+
+    def test_an_identity_listing_slower_than_ten_seconds_is_waited_for(self):
+        """The `ps` listing that picks a new group's identity, at spawn and again when its
+        monitor arms, is waited for when it takes 12 s; it used to time out at 10 s, and
+        the spawn failed `cannot authenticate process-group identity`."""
+        def listing(argv, timeout=None, **_):
+            if timeout is not None and timeout < 12:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return types.SimpleNamespace(returncode=0, stdout="4242 4242\n4243 4242\n4300 4300\n")
+
+        def exists(path):
+            return False if path == "/proc/self/stat" else os.path.exists(path)
+
+        with mock.patch.object(og.os.path, "exists", side_effect=exists), \
+             mock.patch.object(og.subprocess, "run", side_effect=listing), \
+             mock.patch.object(og, "_watch_process_identity", side_effect=lambda pid: (pid, "anchor")), \
+             mock.patch.object(og, "_safe_getpgid", return_value=4242):
+            self.assertEqual(og._group_watch_identity(4242, 4242), (4243, "anchor"))
+
+    def test_a_guarded_child_slower_than_ten_seconds_to_stop_is_waited_for(self):
+        """The exec-stopped wrapper of a new guarded child stops itself before it runs the
+        command; on a stalled host that can take 12 s, and the guard waits for it. It used
+        to give up at 10 s with `guarded child did not stop for attach`."""
+        clock = [1000.0]
+        stopped = (signal.SIGSTOP << 8) | 0x7F  # the wait status of a SIGSTOPped child
+
+        def waitpid(pid, _options):
+            return (pid, stopped) if clock[0] >= 1012.0 else (0, 0)
+
+        with mock.patch.object(og.os, "waitpid", side_effect=waitpid), \
+             mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(og.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + 1.0)):
+            og._wait_for_guard_stop(types.SimpleNamespace(pid=4242), 4242, "stalled-spawn-test")
+        self.assertGreaterEqual(clock[0], 1012.0)
+
+    @staticmethod
+    def bounded_clock(what):
+        """A fake clock whose sleep moves it 1 s, and which fails the test, rather than
+        hanging it, once ten settle bounds have passed: a wait with no bound."""
+        clock = [1000.0]
+
+        def tick(_seconds):
+            clock[0] += 1.0
+            if clock[0] > 1000.0 + 10 * og._GROUP_SETTLE_S:
+                raise AssertionError(f"{what} has no bound")
+
+        return clock, tick
+
+    def test_a_group_that_never_shows_quiescent_fails_once_the_settle_bound_passes(self):
+        """The settle bound is a hang detector, not a licence to wait: a group that never
+        shows the same stopped members twice fails `cannot confirm whole-group quiescence`
+        once `_GROUP_SETTLE_S` has passed, and the authenticated abort still kills it once."""
+        clock, tick = self.bounded_clock("the quiescence wait")
+        with self.model() as (proc, guard, state), \
+                mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(og.time, "sleep", side_effect=tick), \
+                mock.patch.object(og, "_stopped_group_snapshot", return_value=None):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "cannot confirm whole-group quiescence"):
+                guard.finish(proc)
+        self.assertGreaterEqual(clock[0], 1000.0 + og._GROUP_SETTLE_S)
+        self.assertFalse(state["alive"])
+        self.assertEqual(state["trace"].count(signal.SIGKILL), 1)
+
+    def test_a_guarded_child_that_never_stops_fails_once_the_settle_bound_passes(self):
+        """A new guarded child that never stops itself for attach fails `guarded child did
+        not stop for attach` once `_GROUP_SETTLE_S` has passed."""
+        clock, tick = self.bounded_clock("the wait for the stop")
+        with mock.patch.object(og.os, "waitpid", return_value=(0, 0)), \
+             mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(og.time, "sleep", side_effect=tick):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "did not stop for attach"):
+                og._wait_for_guard_stop(types.SimpleNamespace(pid=4242), 4242, "never-stops-test")
+        self.assertGreaterEqual(clock[0], 1000.0 + og._GROUP_SETTLE_S)
+
+    def test_a_killed_group_is_waited_for_until_it_disappears_and_no_longer(self):
+        """After the final kill the reap waits for the group to leave the process table: on
+        a stalled host for 12 s, and it used to give up at 5 s (`could not confirm
+        whole-group disappearance`). A group that never leaves still fails that way once
+        `_GROUP_SETTLE_S` has passed."""
+        for leaves_at, fails in ((1012.0, False), (float("inf"), True)):
+            with self.subTest(leaves_at=leaves_at):
+                clock, tick = self.bounded_clock("the wait for the group to disappear")
+                proc = mock.Mock(pid=4242)
+                proc.wait.return_value = 0
+                with mock.patch.object(og, "_process_group_exists", side_effect=lambda _pgid: clock[0] < leaves_at), \
+                     mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(og.time, "sleep", side_effect=tick):
+                    if fails:
+                        with self.assertRaisesRegex(og.GuardEnforcementError, "whole-group disappearance"):
+                            og._reap_group_without_signalling(proc, 4242, "never-leaves-test")
+                        self.assertGreaterEqual(clock[0], 1000.0 + og._GROUP_SETTLE_S)
+                    else:
+                        og._reap_group_without_signalling(proc, 4242, "slow-to-leave-test")
+                        self.assertGreaterEqual(clock[0], leaves_at)
+                proc.wait.assert_called_once_with(timeout=og._GROUP_SETTLE_S)
+
+    def test_the_exit_and_identity_listings_are_waited_for_on_a_stalled_host(self):
+        """Two more `ps` listings take 12 s on a stalled host and are waited for. The one
+        that tells an all-zombie group from a live one used to time out at 5 s, and a
+        finished group read as still running; the one that reads a member's start time
+        used to time out at 5 s too, and the monitor read a lost identity, which ends its
+        enforcement of the group for good."""
+        def listing(argv, timeout=None, **_):
+            if timeout is not None and timeout < 12:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if argv[:2] == ["ps", "-axo"]:
+                return types.SimpleNamespace(returncode=0, stdout="4243 4242 Z\n")
+            return types.SimpleNamespace(returncode=0, stdout="Thu Oct  8 10:00:00 2026\n")
+
+        with mock.patch.object(og.subprocess, "run", side_effect=listing), \
+             mock.patch.object(og, "_process_identity", side_effect=lambda pid: (pid, None)):
+            self.assertTrue(og._group_has_exited(4242))
+            self.assertEqual(og._watch_process_identity(4243), (4243, "Thu Oct  8 10:00:00 2026"))
+
+    def test_snapshot_refuses_runnable_missing_anchor_unknown_and_duplicate_rows(self):
+        identity = (4243, "original-anchor")
+        for rows in ("4243 4242 R\n", "4244 4242 T\n", "4243 4242 ?\n"):
+            with self.subTest(rows=rows), \
+                 mock.patch.object(og.subprocess, "run", return_value=types.SimpleNamespace(stdout=rows)), \
+                 mock.patch.object(og, "_watch_process_identity", side_effect=lambda pid: (pid, "original-anchor")), \
+                 mock.patch.object(og, "_safe_getpgid", return_value=4242):
+                self.assertIsNone(og._stopped_group_snapshot(4242, identity))
+        for rows in ("malformed\n", "4243 4242 T\n4243 4242 T\n"):
+            with self.subTest(rows=rows), \
+                 mock.patch.object(og.subprocess, "run", return_value=types.SimpleNamespace(stdout=rows)), \
+                 mock.patch.object(og, "_watch_process_identity", return_value=identity), \
+                 mock.patch.object(og, "_safe_getpgid", return_value=4242):
+                with self.assertRaises(og.GuardEnforcementError):
+                    og._stopped_group_snapshot(4242, identity)
+
+    def test_wait_refuses_failed_monitor_before_accepting_zero_exit(self):
+        with self.model() as (proc, guard, _):
+            guard._worker_error = "monitor unavailable"
+            with self.assertRaises(og.GuardEnforcementError):
+                og.wait_guarded_exit(proc, guard, 1)
+            proc.poll.assert_not_called()
+
+    def test_run_guarded_does_not_return_success_when_completion_refuses(self):
+        proc = mock.Mock(pid=4242, returncode=0)
+        guard = mock.Mock(breach_time_ns=None)
+        guard.finish.side_effect = og.GuardEnforcementError("identity lost")
+        with mock.patch.object(og, "guarded_popen", return_value=(proc, guard)), \
+             mock.patch.object(og, "wait_guarded_exit", return_value=0):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "identity lost"):
+                og.run_guarded(["modeled-child"], 128, timeout_s=1)
+        guard.finish.assert_called_once_with(proc, "harness")
+
+    def test_run_captured_does_not_return_success_when_completion_refuses(self):
+        proc = mock.Mock(pid=4242, returncode=0, stdout=io.BytesIO(b"ok"), stderr=io.BytesIO())
+        proc.poll.return_value = 0
+        guard = mock.Mock()
+        guard.finish.side_effect = og.GuardEnforcementError("monitor failed")
+        with mock.patch.object(og, "guarded_popen", return_value=(proc, guard)):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "monitor failed"):
+                og.run_captured(["modeled-child"], 128, timeout_s=1)
+        guard.finish.assert_called_once_with(proc, "harness")
+
+    def test_a_slow_spawn_does_not_spend_the_childs_budget(self):
+        """The spawn's waits are hang detectors (`_GROUP_SETTLE_S`), so on a stalled host
+        the spawn alone can outlast a solver's whole budget. The budget, and run_captured's
+        wall time, start at the authenticated resume: a 30 s spawn and then a 2 s solve in
+        a 5 s budget is an answer. Both used to start before the spawn, so the solver was
+        killed as it resumed, recorded as a time-out, and its printed answer thrown away
+        (the differential gate then read the posture as undecided)."""
+        for runner in ("run_captured", "run_guarded"):
+            with self.subTest(runner=runner):
+                clock = [1000.0]
+                proc = mock.Mock(pid=4242, returncode=0,
+                                 stdout=io.BytesIO(b"unsat\n"), stderr=io.BytesIO())
+                proc.poll.side_effect = lambda: 0 if clock[0] >= 1032.0 else None
+                guard = mock.Mock(breach_time_ns=None)
+                guard._owned_proc = proc
+                guard.finish.return_value = {"phase": "reaped"}
+
+                def slow_spawn(*_args, **_kwargs):
+                    clock[0] += 30.0
+                    return proc, guard
+
+                def tick(_seconds):
+                    clock[0] += 0.5
+                    if clock[0] > 1100.0:
+                        raise AssertionError("the modeled child never finished")
+
+                with mock.patch.object(og, "guarded_popen", side_effect=slow_spawn), \
+                     mock.patch.object(og.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(og.time, "sleep", side_effect=tick):
+                    if runner == "run_captured":
+                        result = og.run_captured(["modeled-child"], 128, timeout_s=5)
+                        self.assertFalse(result.timed_out)
+                        self.assertEqual(result.stdout, "unsat\n")
+                        self.assertLess(result.wall_sec, 5.0)
+                    else:
+                        self.assertEqual(og.run_guarded(["modeled-child"], 128, timeout_s=5), 0)
+
+    def test_attached_watch_does_not_report_done_on_identity_loss(self):
+        guard = mock.Mock(armed=True)
+        guard.wait_terminal.return_value = True
+        guard.check_enforcement.side_effect = og.GuardEnforcementError("identity lost")
+        with mock.patch.object(og, "_AttachedProcess", return_value=mock.Mock(pid=4242)), \
+             mock.patch.object(og, "rss_watchdog", return_value=guard):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "identity lost"):
+                og.watch_existing_process(4242, 128)
+        guard.terminate_if_authenticated.assert_called_once_with()
+
+    def test_failed_launch_never_learns_a_replacement_group_identity(self):
+        proc = mock.Mock(pid=4242, _guard_group_identity=(4243, "original-anchor"), _guard_kill_sent=False)
+        with mock.patch.object(og, "_group_identity_is_current", return_value=False), \
+             mock.patch.object(og, "_process_group_exists", return_value=True), \
+             mock.patch.object(og.os, "killpg") as send:
+            with self.assertRaises(og.GuardEnforcementError):
+                og._kill_and_reap_group(proc, 4242, "failed-launch")
+        send.assert_not_called()
+
+    def test_unarmed_guard_cleanup_uses_launch_identity_without_completion(self):
+        with self.model() as (proc, guard, state):
+            proc._guard_group_identity = guard._group_identity
+            proc._guard_kill_sent = False
+            unarmed = og._NoopWatchdog()
+            with mock.patch.object(unarmed, "stop") as stop:
+                og._kill_reap_failed_spawn(proc, 4242, unarmed)
+            self.assertFalse(state["alive"])
+            self.assertEqual(state["trace"].count(signal.SIGKILL), 1)
+            proc.wait.assert_called_once_with(timeout=og._GROUP_SETTLE_S)
+            stop.assert_called_once_with()
+            self.assertFalse(hasattr(unarmed, "finish"))
+
+
+class CapturedSetupCleanupTest(unittest.TestCase):
+    """Post-spawn setup failures must retain authenticated cleanup ownership."""
+
+    @contextlib.contextmanager
+    def setup_model(self, *, fail_start=None, fail_construct=None,
+                    started_before_error=False, stuck=None, finish_error=None):
+        proc = mock.Mock(pid=4242, returncode=0)
+        proc.stdout = io.BytesIO(b"output")
+        proc.stderr = io.BytesIO()
+        proc.stdin = io.BytesIO()
+        proc.poll.return_value = 0
+        guard = mock.Mock(breach_time_ns=None)
+        guard.finish.side_effect = finish_error
+        original = RuntimeError("injected capture setup failure")
+        threads = []
+        owner = self
+
+        class CaptureThread:
+            def __init__(self, *, target, args=(), name, daemon):
+                self.name = name
+                self.target = target
+                self.args = args
+                self.ident = None
+                self.joined = False
+                self.alive = False
+                if name == fail_construct:
+                    raise original
+                threads.append(self)
+
+            def start(self):
+                if self.name != fail_start or started_before_error:
+                    self.ident = len(threads)
+                    self.alive = True
+                if self.name == fail_start:
+                    raise original
+
+            def join(self, timeout):
+                owner.assertIsNotNone(self.ident, "never join an unstarted thread")
+                owner.assertTrue(guard.finish.called, "finish must precede pipe joining")
+                owner.assertEqual(timeout, 5)
+                self.joined = True
+                if self.name != stuck:
+                    self.target(*self.args)
+                    self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+        with mock.patch.object(og, "guarded_popen", return_value=(proc, guard)), \
+             mock.patch.object(og.threading, "Thread", CaptureThread):
+            yield proc, guard, threads, original
+
+    def test_invalid_utf8_input_is_rejected_before_spawn(self):
+        with mock.patch.object(og, "guarded_popen") as spawn:
+            with self.assertRaises(UnicodeEncodeError):
+                og.run_captured(["modeled-child"], 128, 1, input_text="\ud800")
+        spawn.assert_not_called()
+
+    def test_each_partial_thread_start_failure_finishes_and_closes_streams(self):
+        for name in ("harness-stdout", "harness-stderr", "harness-stdin"):
+            for started_before_error in (False, True):
+                with self.subTest(name=name, started=started_before_error), \
+                     self.setup_model(fail_start=name,
+                                      started_before_error=started_before_error) as state:
+                    proc, guard, threads, original = state
+                    with self.assertRaises(RuntimeError) as caught:
+                        og.run_captured(["modeled-child"], 128, 1, input_text="input")
+                    self.assertIs(caught.exception, original)
+                    guard.finish.assert_called_once_with(proc, "harness")
+                    proc.poll.assert_not_called()
+                    for thread in threads:
+                        self.assertEqual(thread.joined, thread.ident is not None)
+                    self.assertTrue(all(s.closed for s in (proc.stdout, proc.stderr, proc.stdin)))
+
+    def test_each_thread_constructor_failure_also_finishes_and_closes_streams(self):
+        for name in ("harness-stdout", "harness-stderr", "harness-stdin"):
+            with self.subTest(name=name), self.setup_model(fail_construct=name) as state:
+                proc, guard, threads, original = state
+                with self.assertRaises(RuntimeError) as caught:
+                    og.run_captured(["modeled-child"], 128, 1, input_text="input")
+                self.assertIs(caught.exception, original)
+                guard.finish.assert_called_once_with(proc, "harness")
+                proc.poll.assert_not_called()
+                for thread in threads:
+                    self.assertEqual(thread.joined, thread.ident is not None)
+                self.assertTrue(all(s.closed for s in (proc.stdout, proc.stderr, proc.stdin)))
+
+    def test_setup_exception_survives_failed_authenticated_finish(self):
+        finish_error = og.GuardEnforcementError("injected identity loss")
+        with self.setup_model(fail_start="harness-stderr", finish_error=finish_error) as state:
+            proc, guard, threads, original = state
+            with self.assertRaises(RuntimeError) as caught:
+                og.run_captured(["modeled-child"], 128, 1, input_text="input")
+            self.assertIs(caught.exception, original)
+            guard.finish.assert_called_once_with(proc, "harness")
+            self.assertTrue(threads[0].joined)
+            self.assertTrue(all(s.closed for s in (proc.stdout, proc.stderr, proc.stdin)))
+            if hasattr(original, "add_note"):
+                self.assertIn("injected identity loss", "\n".join(original.__notes__))
+
+    def test_signal_setup_failure_restores_handlers_after_finish(self):
+        for failing_signal in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=failing_signal), self.setup_model() as state:
+                proc, guard, threads, original = state
+                previous = {signal.SIGINT: object(), signal.SIGTERM: object()}
+
+                def install(signum, handler):
+                    if handler is previous[signum]:
+                        self.assertTrue(guard.finish.called)
+                    elif signum == failing_signal:
+                        raise original
+
+                with mock.patch.object(og.signal, "getsignal", side_effect=previous.__getitem__) as get, \
+                     mock.patch.object(og.signal, "signal", side_effect=install) as set_handler:
+                    with self.assertRaises(RuntimeError) as caught:
+                        og.run_captured(["modeled-child"], 128, 1, input_text="input")
+                self.assertIs(caught.exception, original)
+                guard.finish.assert_called_once_with(proc, "harness")
+                proc.poll.assert_not_called()
+                for call in get.call_args_list:
+                    signum = call.args[0]
+                    set_handler.assert_any_call(signum, previous[signum])
+                self.assertTrue(all(thread.joined for thread in threads))
+                self.assertTrue(all(s.closed for s in (proc.stdout, proc.stderr, proc.stdin)))
+
+    def test_real_stderr_start_failure_reaps_guarded_child(self):
+        plan = plan_detected_host_with_scratch_lease(self, "capture-setup-test")
+        limit = min(256, plan.memlimit_mb)
+        self.assertGreaterEqual(limit, 256)
+        self.assertEqual(plan.jobs, 1)
+        label = "capture-setup-real-test"
+        original = RuntimeError("injected real stderr start failure")
+        captured = []
+        capture_threads = []
+        real_spawn = og.guarded_popen
+        real_start = threading.Thread.start
+
+        def spawn(*args, **kwargs):
+            pair = real_spawn(*args, **kwargs)
+            captured.append(pair)
+            return pair
+
+        def start(thread):
+            if thread.name == f"{label}-stderr":
+                raise original
+            if thread.name == f"{label}-stdout":
+                capture_threads.append(thread)
+            return real_start(thread)
+
+        try:
+            with mock.patch.object(og, "guarded_popen", side_effect=spawn), \
+                 mock.patch.object(threading.Thread, "start", start):
+                with self.assertRaises(RuntimeError) as caught:
+                    og.run_captured(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        limit, timeout_s=5, label=label, input_text="input",
+                    )
+            self.assertIs(caught.exception, original)
+            self.assertEqual(len(captured), 1)
+            proc, guard = captured[0]
+            evidence = guard.evidence()
+            self.assertEqual(evidence["phase"], "reaped")
+            self.assertFalse(evidence["identity_lost"])
+            self.assertIsNone(evidence["worker_error"])
+            self.assertEqual(evidence["kill_threshold_mib"], limit)
+            self.assertIsNotNone(proc.returncode)
+            self.assertFalse(og._process_group_exists(proc.pid), evidence)
+            self.assertEqual(len(capture_threads), 1)
+            self.assertIsNotNone(capture_threads[0].ident)
+            self.assertFalse(capture_threads[0].is_alive())
+            self.assertTrue(all(s.closed for s in (proc.stdout, proc.stderr, proc.stdin)))
+        finally:
+            # A failing regression must still discharge the real child owner.
+            for proc, guard in captured:
+                try:
+                    if guard.evidence()["phase"] != "reaped":
+                        guard.finish(proc, label)
+                finally:
+                    for thread in capture_threads:
+                        if thread.ident is not None:
+                            thread.join(timeout=5)
+                    if not any(thread.is_alive() for thread in capture_threads):
+                        for stream in (proc.stdout, proc.stderr, proc.stdin):
+                            stream.close()
+
+    def test_cleanup_does_not_close_a_stream_still_owned_by_a_live_thread(self):
+        with self.setup_model(fail_start="harness-stderr", stuck="harness-stdout") as state:
+            proc, guard, threads, original = state
+            with self.assertRaises(RuntimeError) as caught:
+                og.run_captured(["modeled-child"], 128, 1, input_text="input")
+            self.assertIs(caught.exception, original)
+            guard.finish.assert_called_once_with(proc, "harness")
+            self.assertTrue(threads[0].joined)
+            self.assertFalse(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+            self.assertTrue(proc.stdin.closed)
+            if hasattr(original, "add_note"):
+                self.assertIn("pipes did not close", "\n".join(original.__notes__))
+            proc.stdout.close()  # This test models the thread; none was spawned.
+
+
+class LegacyGuardedCallerTest(unittest.TestCase):
+    """The PB and wait4 owners must never turn a lost monitor into an answer."""
+
+    def model(self, stdout=b"sat\n", returncode=0):
+        proc = mock.Mock(pid=4242, returncode=returncode)
+        proc.poll.return_value = returncode
+        proc.stdout = io.BytesIO(stdout)
+        proc.stderr = io.BytesIO()
+        guard = mock.Mock(armed=True, breached=False, peak_rss_mb=12)
+        guard._owned_proc = proc
+        guard.check_enforcement.return_value = None
+        guard.finish.return_value = {
+            "phase": "reaped", "identity_lost": False, "worker_error": None,
+        }
+        return proc, guard
+
+    def invoke_pb(self, lane):
+        if lane == "solver":
+            return pbcomp_harness.run_one(
+                "modeled-child", Path("instance.opb"), 5, "python",
+                memlimit_mb=256, nbcore=1,
+            )
+        return pbcomp_harness.check_solution_via_ay(
+            "modeled-child", Path("instance.opb"), None, ["x1"], {}, 256,
+        )
+
+    def test_pb_callers_refuse_monitor_loss_before_accepting_child_zero(self):
+        for lane in ("solver", "checker"):
+            with self.subTest(lane=lane):
+                proc, guard = self.model()
+                guard.check_enforcement.side_effect = og.GuardEnforcementError("lost monitor")
+                with mock.patch.object(pbcomp_harness, "guarded_popen", return_value=(proc, guard)), \
+                     mock.patch.object(pbcomp_harness, "parse_solver_output_stream") as parse:
+                    with self.assertRaisesRegex(og.GuardEnforcementError, "lost monitor"):
+                        self.invoke_pb(lane)
+                proc.poll.assert_not_called()
+                guard.finish.assert_called_once()
+                guard.stop.assert_not_called()
+                parse.assert_not_called()
+
+    def test_pb_callers_refuse_failed_completion_after_child_zero(self):
+        for lane in ("solver", "checker"):
+            with self.subTest(lane=lane):
+                proc, guard = self.model()
+                guard.finish.side_effect = og.GuardEnforcementError("completion refused")
+                with mock.patch.object(pbcomp_harness, "guarded_popen", return_value=(proc, guard)), \
+                     mock.patch.object(pbcomp_harness, "parse_solver_output_stream") as parse:
+                    with self.assertRaisesRegex(og.GuardEnforcementError, "completion refused"):
+                        self.invoke_pb(lane)
+                self.assertTrue(proc.poll.called)
+                guard.finish.assert_called_once()
+                parse.assert_not_called()
+
+    def test_pb_timeout_and_memout_precedence_is_preserved(self):
+        for lane in ("solver", "checker"):
+            for breached in (False, True):
+                with self.subTest(lane=lane, breached=breached):
+                    proc, guard = self.model(returncode=-signal.SIGKILL)
+                    guard.breached = breached
+                    with mock.patch.object(pbcomp_harness, "guarded_popen", return_value=(proc, guard)), \
+                         mock.patch.object(pbcomp_harness, "wait_guarded_exit",
+                                           side_effect=subprocess.TimeoutExpired("modeled-child", 5)):
+                        result = self.invoke_pb(lane)
+                    guard.finish.assert_called_once()
+                    if lane == "solver":
+                        self.assertEqual(result.status, "MEMOUT" if breached else "TIMEOUT")
+                        self.assertEqual(result.memout, breached)
+                        self.assertTrue(result.timed_out)  # historical PB records retain both facts
+                    else:
+                        self.assertEqual(result, (False, None, "ay verify exceeded memory envelope"
+                                                  if breached else "ay verify timed out"))
+
+    def test_pb_output_limit_remains_a_refusal_after_completion(self):
+        proc, guard = self.model()
+        with mock.patch.object(pbcomp_harness, "guarded_popen", return_value=(proc, guard)), \
+             mock.patch.object(pbcomp_harness, "stream_reached_limit", return_value=True), \
+             mock.patch.object(pbcomp_harness, "parse_solver_output_stream") as parse:
+            result = self.invoke_pb("solver")
+        self.assertEqual(result.status, "ERROR")
+        self.assertIn("capture limit", result.note)
+        parse.assert_not_called()
+        guard.finish.assert_called_once()
+
+    @contextlib.contextmanager
+    def smt_model(self, proc, guard, wait_results):
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+        with mock.patch.object(smtcomp_harness, "guarded_popen", return_value=(proc, guard)), \
+             mock.patch.object(smtcomp_harness.threading, "Thread", return_value=thread), \
+             mock.patch.object(smtcomp_harness.os, "wait4", side_effect=wait_results) as wait4:
+            yield wait4
+
+    def invoke_smt(self):
+        return smtcomp_harness.run_process(
+            smtcomp_harness.Invocation(["modeled-child"]), timeout_s=5, memlimit_mb=256,
+        )
+
+    def test_smt_checks_enforcement_before_reaping_child(self):
+        proc, guard = self.model()
+        guard.check_enforcement.side_effect = og.GuardEnforcementError("lost monitor")
+        with self.smt_model(proc, guard, []) as wait4:
+            with self.assertRaisesRegex(og.GuardEnforcementError, "lost monitor"):
+                self.invoke_smt()
+        wait4.assert_not_called()
+        guard.finish.assert_called_once()
+        guard.stop.assert_not_called()
+
+    def test_smt_checks_enforcement_after_reap_and_before_result(self):
+        proc, guard = self.model()
+        guard.check_enforcement.side_effect = [None, og.GuardEnforcementError("lost at reap")]
+        usage = types.SimpleNamespace(ru_utime=1.25, ru_stime=0.75)
+        with self.smt_model(proc, guard, [(4242, 7 << 8, usage)]):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "lost at reap"):
+                self.invoke_smt()
+        self.assertEqual(proc.returncode, 7)
+        guard.finish.assert_called_once()
+
+    def test_smt_refuses_failed_completion_after_recording_wait4_status(self):
+        proc, guard = self.model()
+        guard.finish.side_effect = og.GuardEnforcementError("completion refused")
+        usage = types.SimpleNamespace(ru_utime=1.25, ru_stime=0.75)
+        with self.smt_model(proc, guard, [(4242, 0, usage)]):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "completion refused"):
+                self.invoke_smt()
+        guard.finish.assert_called_once()
+        proc.wait.assert_not_called()
+
+    def test_smt_preserves_exact_wait4_cpu_and_nonzero_exit_before_finish(self):
+        proc, guard = self.model()
+        usage = types.SimpleNamespace(ru_utime=1.25, ru_stime=0.75)
+
+        def finish(owner, label):
+            self.assertIs(owner, proc)
+            self.assertEqual(owner.returncode, 7)
+
+        guard.finish.side_effect = finish
+        with self.smt_model(proc, guard, [(4242, 7 << 8, usage)]):
+            result = self.invoke_smt()
+        self.assertEqual(result.exit_code, 7)
+        self.assertEqual(result.cpu_sec, 2.0)
+        self.assertFalse(result.timed_out)
+        guard.finish.assert_called_once()
+        proc.poll.assert_not_called()
+        proc.wait.assert_not_called()
+
+    def test_smt_timeout_kill_uses_guard_and_keeps_wait4_accounting(self):
+        for breached in (False, True):
+            with self.subTest(breached=breached):
+                proc, guard = self.model(returncode=None)
+                guard.breached = breached
+                usage = types.SimpleNamespace(ru_utime=0.2, ru_stime=0.3)
+                with self.smt_model(proc, guard, [(0, 0, None), (4242, signal.SIGKILL, usage)]), \
+                     mock.patch.object(smtcomp_harness, "GRACE_SEC", 0), \
+                     mock.patch.object(smtcomp_harness.time, "monotonic", side_effect=[0, 6, 7]), \
+                     mock.patch.object(smtcomp_harness.time, "sleep"), \
+                     mock.patch.object(smtcomp_harness.os, "killpg") as raw_kill:
+                    result = self.invoke_smt()
+                guard.terminate_if_authenticated.assert_called_once()
+                guard.finish.assert_called_once()
+                raw_kill.assert_not_called()
+                self.assertEqual(result.cpu_sec, 0.5)
+                self.assertEqual(result.exit_code, -signal.SIGKILL)
+                self.assertEqual(result.memout, breached)
+                self.assertEqual(result.timed_out, not breached)
+
+    def test_smt_stolen_wait4_child_is_refused_not_fabricated_zero(self):
+        proc, guard = self.model(returncode=None)
+        with self.smt_model(proc, guard, ChildProcessError("already reaped")):
+            with self.assertRaisesRegex(og.GuardEnforcementError, "wait4 lost its owned child"):
+                self.invoke_smt()
+        guard.finish.assert_called_once()
+
+    def test_failed_spawn_keeps_oserror_result_and_guard_refusal_distinct(self):
+        for lane in ("solver", "checker", "smt"):
+            module = smtcomp_harness if lane == "smt" else pbcomp_harness
+            with self.subTest(lane=lane):
+                with mock.patch.object(module, "guarded_popen", side_effect=OSError("missing executable")):
+                    result = self.invoke_smt() if lane == "smt" else self.invoke_pb(lane)
+                if lane == "solver":
+                    self.assertEqual(result.status, "ERROR")
+                    self.assertIn("spawn:", result.note)
+                elif lane == "checker":
+                    self.assertEqual(result, (False, None, "ay verify spawn failed: missing executable"))
+                else:
+                    self.assertEqual(result.spawn_error, "missing executable")
+                with mock.patch.object(module, "guarded_popen",
+                                       side_effect=og.GuardEnforcementError("attach refused")):
+                    with self.assertRaisesRegex(og.GuardEnforcementError, "attach refused"):
+                        self.invoke_smt() if lane == "smt" else self.invoke_pb(lane)
+
+    def test_all_three_callers_reap_real_post_leader_descendants(self):
+        # Tiny Python subjects only, run sequentially. The real planner caps
+        # their explicit zero-grace group budget; no solver/compiler is used.
+        plan = plan_detected_host_with_scratch_lease(self, "legacy-caller-descendant-test")
+        limit = min(256, plan.memlimit_mb)
+        self.assertGreaterEqual(limit, 256)
+        self.assertEqual(plan.jobs, 1)
+        for lane in ("solver", "checker", "smt"):
+            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                ready = root / "descendant-ready"
+                pidfile = root / "descendant-pid"
+                script = root / "child.py"
+                child_code = (
+                    "import pathlib,time; "
+                    f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+                    "time.sleep(30)"
+                )
+                script.write_text(
+                    f"#!{sys.executable}\n"
+                    "import pathlib,subprocess,sys,time\n"
+                    f"p = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                    f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid))\n"
+                    "deadline = time.monotonic() + 5\n"
+                    f"while not pathlib.Path({str(ready)!r}).exists():\n"
+                    "    if time.monotonic() >= deadline: raise RuntimeError('descendant did not start')\n"
+                    "    time.sleep(0.01)\n"
+                    "print('s UNKNOWN' if sys.argv[1:3] == ['pb', 'solve'] else 'computed=0', flush=True)\n"
+                )
+                script.chmod(0o755)
+                captured = []
+
+                def spawn(*args, **kwargs):
+                    pair = og.guarded_popen(*args, **kwargs)
+                    captured.append(pair)
+                    return pair
+
+                module = smtcomp_harness if lane == "smt" else pbcomp_harness
+                with mock.patch.object(module, "guarded_popen", side_effect=spawn):
+                    if lane == "solver":
+                        result = pbcomp_harness.run_one(str(script), root / "unused.opb", 5,
+                                                       "python", memlimit_mb=limit, nbcore=1)
+                        self.assertEqual(result.status, "UNKNOWN")
+                    elif lane == "checker":
+                        result = pbcomp_harness.check_solution_via_ay(
+                            str(script), root / "unused.opb", None, ["x1"], {}, limit,
+                        )
+                        self.assertEqual(result, (True, 0, ""))
+                    else:
+                        result = smtcomp_harness.run_process(
+                            smtcomp_harness.Invocation([str(script)]), timeout_s=5, memlimit_mb=limit,
+                        )
+                        self.assertEqual(result.exit_code, 0)
+                        self.assertIsNotNone(result.cpu_sec)
+                self.assertTrue(ready.is_file())
+                self.assertGreater(int(pidfile.read_text()), 0)
+                self.assertEqual(len(captured), 1)
+                proc, guard = captured[0]
+                evidence = guard.evidence()
+                self.assertEqual(evidence["phase"], "reaped")
+                self.assertFalse(evidence["identity_lost"])
+                self.assertIsNone(evidence["worker_error"])
+                self.assertEqual(evidence["kill_threshold_mib"], limit)
+                self.assertFalse(og._process_group_exists(proc.pid), evidence)
+
+
+class WatchServerCommandReaderTest(unittest.TestCase):
+    """Use real buffered pipes: BytesIO cannot expose fd/read-ahead bugs."""
+
+    @contextlib.contextmanager
+    def reader(self, initial=b""):
+        read_fd, write_fd = os.pipe()
+        source = os.fdopen(read_fd, "rb")
+        writer = [write_fd]
+        closing = threading.Event()
+        consumed = threading.Event()
+        lines = queue.Queue()
+        errors = []
+        real_read = os.read
+
+        def observe_read(fd, count):
+            data = real_read(fd, count)
+            if fd == read_fd and data:
+                consumed.set()
+            return data
+
+        def close_writer():
+            if writer[0] is not None:
+                os.close(writer[0])
+                writer[0] = None
+
+        def collect():
+            try:
+                for line in og._watch_server_command_lines(source, closing):
+                    lines.put(line)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=collect, daemon=True)
+        with mock.patch.object(og.os, "read", side_effect=observe_read):
+            try:
+                if initial:
+                    self.assertEqual(os.write(write_fd, initial), len(initial))
+                worker.start()
+                yield types.SimpleNamespace(
+                    writer=write_fd, close_writer=close_writer, closing=closing,
+                    consumed=consumed, lines=lines, worker=worker, errors=errors,
+                )
+            finally:
+                # Release even an old buffered readline on assertion failure.
+                # Tests assert cancellation BEFORE this EOF-producing cleanup.
+                closing.set()
+                close_writer()
+                if worker.ident is not None:
+                    worker.join(timeout=3)
+                if not worker.is_alive():
+                    source.close()
+                self.assertFalse(worker.is_alive(), "reader survived cleanup EOF")
+        self.assertEqual(errors, [])
+
+    def test_coalesced_lines_arrive_before_another_write_or_eof(self):
+        with self.reader(b"first\nsecond\n") as reader:
+            self.assertEqual(reader.lines.get(timeout=2), b"first\n")
+            self.assertEqual(reader.lines.get(timeout=2), b"second\n")
+            self.assertTrue(reader.worker.is_alive())
+            self.assertTrue(reader.lines.empty())
+
+    def test_partial_input_cancels_before_writer_closes(self):
+        with self.reader(b"WATCH") as reader:
+            self.assertTrue(reader.consumed.wait(2), "partial input was never read")
+            reader.closing.set()
+            reader.worker.join(timeout=1)
+            self.assertFalse(reader.worker.is_alive(), "partial readline ignored cancellation")
+            self.assertTrue(reader.lines.empty())
+
+    def test_quiet_input_cancels_before_writer_closes(self):
+        with self.reader() as reader:
+            reader.closing.set()
+            reader.worker.join(timeout=1)
+            self.assertFalse(reader.worker.is_alive())
+            self.assertTrue(reader.lines.empty())
+
+    def test_fragmented_lines_preserve_bytes(self):
+        with self.reader(b"fir") as reader:
+            self.assertTrue(reader.consumed.wait(2))
+            with self.assertRaises(queue.Empty):
+                reader.lines.get(timeout=0.05)
+            os.write(reader.writer, b"st\nsec")
+            self.assertEqual(reader.lines.get(timeout=2), b"first\n")
+            os.write(reader.writer, b"ond\n")
+            self.assertEqual(reader.lines.get(timeout=2), b"second\n")
+
+    def test_maximum_line_preserves_following_command(self):
+        maximum = b"x" * (og.WATCH_SERVER_MAX_COMMAND_BYTES - 1) + b"\n"
+        with self.reader(maximum + b"next\n") as reader:
+            self.assertEqual(reader.lines.get(timeout=2), maximum)
+            self.assertEqual(reader.lines.get(timeout=2), b"next\n")
+
+    def test_overlong_unterminated_line_returns_without_eof(self):
+        overlong = b"x" * (og.WATCH_SERVER_MAX_COMMAND_BYTES + 1)
+        with self.reader(overlong) as reader:
+            self.assertEqual(reader.lines.get(timeout=2), overlong)
+            reader.worker.join(timeout=1)
+            self.assertFalse(reader.worker.is_alive())
+            self.assertTrue(reader.lines.empty())
+
+    def test_partial_eof_preserves_tail_for_protocol_refusal(self):
+        with self.reader(b"WATCH") as reader:
+            reader.close_writer()
+            self.assertEqual(reader.lines.get(timeout=2), b"WATCH")
+            self.assertEqual(reader.lines.get(timeout=2), b"")
+            reader.worker.join(timeout=1)
+            self.assertFalse(reader.worker.is_alive())
+
+    def test_complete_eof_drains_all_lines(self):
+        with self.reader(b"first\nsecond\n") as reader:
+            reader.close_writer()
+            self.assertEqual([reader.lines.get(timeout=2) for _ in range(3)],
+                             [b"first\n", b"second\n", b""])
+
+    def test_empty_eof_is_reported(self):
+        with self.reader() as reader:
+            reader.close_writer()
+            self.assertEqual(reader.lines.get(timeout=2), b"")
+
+    def test_finite_bytesio_fallback_preserves_lines_and_cancellation(self):
+        closing = threading.Event()
+        self.assertEqual(
+            list(og._watch_server_command_lines(io.BytesIO(b"first\nsecond\n"), closing)),
+            [b"first\n", b"second\n", b""],
+        )
+        closing.set()
+        self.assertEqual(list(og._watch_server_command_lines(io.BytesIO(b"unread\n"), closing)), [])
+
+    def assert_server_io_failure(self, operation):
+        read_fd, write_fd = os.pipe()
+        source = os.fdopen(read_fd, "rb")
+        force_output_failure = threading.Event()
+        errors = []
+
+        class Output(io.BytesIO):
+            def write(self, data):
+                if force_output_failure.is_set():
+                    raise BrokenPipeError("test teardown")
+                return super().write(data)
+
+        output = Output()
+        error = OSError("injected command " + operation + " failure")
+
+        def serve():
+            try:
+                og.serve_watchdog_requests(source, output)
+            except BaseException as failure:
+                errors.append(failure)
+
+        module = og.select if operation == "select" else og.os
+        worker = threading.Thread(target=serve, daemon=True)
+        with mock.patch.object(module, operation, side_effect=error):
+            try:
+                os.write(write_fd, b"WATCH")
+                worker.start()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), "server hid reader failure behind heartbeats")
+                self.assertEqual(errors, [error])
+                self.assertTrue(output.getvalue().startswith(og.WATCH_SERVER_READY))
+            finally:
+                # A regressed server can still be stopped by heartbeat output
+                # failure, so a failing assertion does not leak its threads.
+                force_output_failure.set()
+                os.close(write_fd)
+                if worker.ident is not None:
+                    worker.join(timeout=3)
+                if not worker.is_alive():
+                    source.close()
+                self.assertFalse(worker.is_alive(), "server survived test cleanup")
+
+    def test_server_propagates_select_failure(self):
+        self.assert_server_io_failure("select")
+
+    def test_server_propagates_read_failure(self):
+        self.assert_server_io_failure("read")
+
+
+NORMAL = {"source": "fake", "raw": 1, "state": "normal"}
+CRITICAL = {"source": "fake", "raw": 4, "state": "critical"}
+# A 128 GiB host: margin max(16384, ceil(0.12 * 131072) = 15729) = 16384 MiB.
+HOST_MB = 131072
+
+
+def fake_window(*available, pressure=NORMAL):
+    return [{"index": i, "t_unix": 0.0, "t_offset_s": 15.0 * i, "available_mb": value,
+             "pressure": pressure} for i, value in enumerate(available)]
+
+
+# vm_stat output in the shape this host prints (16 KiB pages). Every row is a
+# whole number of MiB (a multiple of 64 pages) and no two rows are equal, so
+# adding any row to the formula, or dropping one, moves the answer.
+VM_STAT_MIB = {
+    "Pages free": 15625, "Pages active": 30000, "Pages inactive": 4700,
+    "Pages speculative": 625, "Pages throttled": 3, "Pages wired down": 5000,
+    "Pages purgeable": 91, "Pages purged": 280, "File-backed pages": 39000,
+    "Anonymous pages": 27000, "Pages stored in compressor": 1800,
+    "Pages occupied by compressor": 700,
+}
+VM_STAT_TEXT = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n" + "".join(
+    f"{key + ':':<40}{mib * 64:>14}.\n" for key, mib in VM_STAT_MIB.items()
+) + '"Translation faults":                    68532362807.\nPageouts:      6371.\n'
+
+# sysctlbyname(3): int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+#                                   void *newp, size_t newlen);
+SYSCTLBYNAME = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32),
+                                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+
+
+def fake_sysctlbyname(value, rc=0, size=None):
+    """A sysctlbyname stand-in that answers ``value`` (and ``size``) with ``rc``."""
+    calls = []
+
+    def call(name, oldp, oldlenp, newp, newlen):
+        calls.append((name, oldlenp[0], newp, newlen))
+        if rc == 0:
+            oldp[0] = value
+            if size is not None:
+                oldlenp[0] = size
+        return rc
+
+    return SYSCTLBYNAME(call), calls
+
+
+class AvailableMemoryProbeTest(unittest.TestCase):
+    """The figure admission compares against the envelope, pinned to its formula."""
+
+    def darwin_available(self, **vm_stat):
+        with mock.patch.object(og.sys, "platform", "darwin"), \
+                mock.patch.object(og.subprocess, "check_output", **vm_stat) as run:
+            return og.host_available_ram_reading(), run
+
+    def test_darwin_available_is_free_speculative_inactive_purgeable_only(self):
+        available, run = self.darwin_available(return_value=VM_STAT_TEXT)
+        self.assertEqual(run.call_args.args[0], ["vm_stat"])
+        # Active pages (excluded on purpose: the docstring says why), wired,
+        # throttled and compressor pages never count as room; the 16 KiB page
+        # size comes from the header, not the 4 KiB default.
+        self.assertEqual(available, 15625 + 625 + 4700 + 91)
+
+    def test_darwin_available_is_none_when_vm_stat_fails_or_has_no_rows(self):
+        for vm_stat in (dict(side_effect=subprocess.CalledProcessError(1, ["vm_stat"])),
+                        dict(side_effect=FileNotFoundError("vm_stat")),
+                        dict(side_effect=subprocess.TimeoutExpired(["vm_stat"], 30)),
+                        dict(return_value="Mach Virtual Memory Statistics: "
+                                          "(page size of 16384 bytes)\n"),
+                        dict(return_value="")):
+            with self.subTest(vm_stat=vm_stat):
+                self.assertIsNone(self.darwin_available(**vm_stat)[0])
+                with mock.patch.object(og.sys, "platform", "darwin"), \
+                        mock.patch.object(og.subprocess, "check_output", **vm_stat):
+                    # The planner's soft clamp reads unknown as 0 (no clamp).
+                    self.assertEqual(og.host_available_ram_mb(), 0)
+
+    def test_linux_available_is_memavailable_and_none_without_it(self):
+        meminfo = ("MemTotal:       134217728 kB\nMemFree:          1048576 kB\n"
+                   "MemAvailable:    50331648 kB\nCached:         41943040 kB\n")
+        for text, expected in ((meminfo, 49152),
+                               (meminfo.replace("MemAvailable", "MemAvail"), None)):
+            with self.subTest(expected=expected), \
+                    mock.patch.object(og.sys, "platform", "linux"), \
+                    mock.patch.object(og, "open", create=True,
+                                      return_value=io.StringIO(text)) as opened:
+                self.assertEqual(og.host_available_ram_reading(), expected)
+                self.assertEqual(opened.call_args.args[0], "/proc/meminfo")
+        with mock.patch.object(og.sys, "platform", "linux"), \
+                mock.patch.object(og, "open", create=True, side_effect=OSError("no proc")):
+            self.assertIsNone(og.host_available_ram_reading())
+
+
+class MeasuredRamAdmissionTest(unittest.TestCase):
+    """admit_campaign: measured headroom, not "no compiler anywhere". Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lock = os.path.join(self.tmp.name, "lease.lock")
+        self.sleeps = []
+
+    def tearDown(self):
+        og._release_harness_lease()
+        self.tmp.cleanup()
+
+    def admit(self, available, pressure=None, rss=40, builds=0, jobs=2, ram_mb=HOST_MB):
+        readings = iter(available)
+        pressures = iter(pressure or [NORMAL] * len(available))
+        return og.admit_campaign(
+            jobs, label="admission-test", ram_mb=ram_mb, cores=18,
+            available_probe=lambda: next(readings), pressure_probe=lambda: next(pressures),
+            rss_probe=lambda: rss, build_probe=lambda: builds,
+            sleep=self.sleeps.append, _lock_path=self.lock)
+
+    def assert_lease_free(self):
+        self.assertIsNone(og._ACTIVE_HARNESS_LEASE)
+        og.acquire_harness_lease("probe", _lock_path=self.lock)
+        og._release_harness_lease()
+
+    def test_busy_but_roomy_host_admits_with_compilers_running(self):
+        # Five compiler/build processes are running and 60 GiB is free: the old
+        # veto refused this host for hours; measured headroom admits it.
+        plan, record = self.admit([61440, 60000, 62000], builds=5)
+        self.assertEqual(record["decision"], "admit")
+        self.assertEqual(record["active_build_processes"], 5)
+        self.assertEqual(record["margin_mb"], 16384)
+        # harness = peak RSS 40 + 2 jobs x 2 streams x 1 MiB of bounded capture
+        self.assertEqual(record["harness_mb"], 44)
+        # The enforced caps were sized into the measured room, and they fit.
+        self.assertEqual(record["envelope_mb"], plan.jobs * plan.memlimit_mb + 44)
+        self.assertLessEqual(record["envelope_mb"] + record["margin_mb"],
+                             record["min_available_mb"])
+        self.assertEqual(plan.jobs, 2)
+        self.assertGreaterEqual(plan.memlimit_mb, 1024)
+        self.assertIsNotNone(og._ACTIVE_HARNESS_LEASE)
+
+    def test_tight_host_refuses_and_releases_the_lease(self):
+        # 17 GiB free: after the 16 GiB peer margin and the harness, not one
+        # 1 GiB child fits.
+        with self.assertRaises(og.AdmissionRefused) as caught:
+            self.admit([17408, 17408, 17408])
+        record = caught.exception.record
+        self.assertEqual(record["decision"], "refuse")
+        self.assertIn("tight host", record["reason"])
+        self.assert_lease_free()
+
+    def test_tight_host_decision_counts_the_whole_enforced_envelope_and_margin(self):
+        # 2 x 8192 MiB caps + 100 MiB harness + 16384 margin = 32868 > 32000.
+        record = og.ram_admission_decision(fake_window(32000, 32000, 32000), 2, 8192, 100,
+                                           HOST_MB)
+        self.assertEqual(record["required_mb"], 32868)
+        self.assertEqual(record["decision"], "refuse")
+        self.assertIn("tight host", record["reason"])
+        record = og.ram_admission_decision(fake_window(32868, 32868, 32868), 2, 8192, 100,
+                                           HOST_MB)
+        self.assertEqual(record["decision"], "admit")
+
+    def test_margin_is_an_eighth_of_the_host_with_no_absolute_floor(self):
+        # 128 GiB keeps the 16 GiB the policy was measured with (DR-12); every
+        # other host gets the same share, rounded up, and nothing sized for one host.
+        self.assertEqual(og.admission_margin_mb(HOST_MB), 16384)
+        self.assertEqual(og.admission_margin_mb(262144), 32768)
+        self.assertEqual(og.admission_margin_mb(24576), 3072)
+        self.assertEqual(og.admission_margin_mb(24577), 3073)
+        self.assertEqual(og.admission_margin_mb(8192), 1024)
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                og.admission_margin_mb(bad)
+
+    # The three readings of one refused try on a 14-core, 24 GiB host, from the
+    # 2026-10-14 landing log (try 1 of 36 consecutive COULD NOT RUN; pressure
+    # normal throughout).
+    SMALL_HOST_MB = 24576
+    SMALL_HOST_WINDOW = [10370, 10732, 15888]
+
+    def test_small_host_admits_into_the_room_it_measured(self):
+        plan, record = self.admit(self.SMALL_HOST_WINDOW, builds=4, ram_mb=self.SMALL_HOST_MB)
+        self.assertEqual(record["decision"], "admit")
+        self.assertEqual(record["margin_mb"], 3072)
+        self.assertEqual(record["min_available_mb"], 10370)
+        # Never oversubscribed: the enforced envelope plus the margin fits the
+        # minimum reading, and each child keeps at least the floor.
+        self.assertLessEqual(plan.jobs * plan.memlimit_mb + record["harness_mb"]
+                             + record["margin_mb"], record["min_available_mb"])
+        self.assertEqual(record["required_mb"],
+                         plan.jobs * plan.memlimit_mb + record["harness_mb"] + 3072)
+        self.assertGreaterEqual(plan.memlimit_mb, 1024)
+        self.assertEqual(plan.jobs, 2)
+
+    def test_small_host_refused_under_the_old_floor(self):
+        # The mutant: the 16 GiB floor sized for a 128 GiB host. On the same
+        # readings not one 1 GiB child fits, which is the starvation DR-43 ends.
+        def old_rule(physical_mb):
+            return max(16 * 1024, -(-12 * int(physical_mb) // 100))
+        with mock.patch.object(og, "admission_margin_mb", side_effect=old_rule), \
+                self.assertRaises(og.AdmissionRefused) as caught:
+            self.admit(self.SMALL_HOST_WINDOW, ram_mb=self.SMALL_HOST_MB)
+        self.assertIn("tight host", caught.exception.record["reason"])
+        self.assert_lease_free()
+
+    def test_small_host_still_refuses_when_one_child_does_not_fit(self):
+        # 3072 margin + 44 harness + one 1024 floor child = 4140 MiB.
+        with self.assertRaises(og.AdmissionRefused) as caught:
+            self.admit([4139, 9000, 9000], ram_mb=self.SMALL_HOST_MB)
+        self.assertIn("tight host", caught.exception.record["reason"])
+        self.assert_lease_free()
+        plan, record = self.admit([4140, 9000, 9000], ram_mb=self.SMALL_HOST_MB)
+        self.assertEqual(record["decision"], "admit")
+        self.assertEqual((plan.jobs, plan.memlimit_mb), (1, 1024))
+
+    def test_unreadable_measurement_refuses(self):
+        cases = (
+            dict(available=[60000, None, 60000]),
+            dict(available=[60000, 60000, 60000], pressure=[NORMAL, None, NORMAL]),
+            dict(available=[60000, 60000, 60000], rss=None),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.sleeps.clear()
+                with self.assertRaises(og.AdmissionRefused) as caught:
+                    self.admit(**case)
+                self.assertIn("cannot measure", caught.exception.record["reason"])
+                self.assertEqual(caught.exception.record["decision"], "refuse")
+                self.assert_lease_free()
+        # A probe that raises is unmeasurable too, never "free".
+        record = og.ram_admission_decision(
+            og.sample_admission_window(1, 0, lambda: 1 / 0, lambda: NORMAL, sleep=None),
+            2, 1024, 10, HOST_MB)
+        self.assertEqual(record["decision"], "refuse")
+
+    def test_critical_pressure_at_admission_refuses(self):
+        with self.assertRaises(og.AdmissionRefused) as caught:
+            self.admit([90000, 90000, 90000], pressure=[NORMAL, CRITICAL, NORMAL])
+        self.assertIn("critical", caught.exception.record["reason"])
+
+    def test_window_takes_the_minimum_of_its_samples(self):
+        # The dip in the middle decides: first, last or max would all admit.
+        envelope = dict(jobs=2, memlimit_mb=10000, harness_mb=100, physical_mb=HOST_MB)
+        record = og.ram_admission_decision(fake_window(90000, 30000, 80000), **envelope)
+        self.assertEqual(record["min_available_mb"], 30000)
+        self.assertEqual(record["decision"], "refuse")
+        # The window itself: three readings, two 15 s waits (~30 s), all recorded.
+        values = iter([90000, 30000, 80000])
+        window = og.sample_admission_window(available_probe=lambda: next(values),
+                                            pressure_probe=lambda: NORMAL,
+                                            sleep=self.sleeps.append)
+        self.assertEqual([row["available_mb"] for row in window], [90000, 30000, 80000])
+        self.assertEqual(self.sleeps, [15.0, 15.0])
+        # And the planner sizes the caps from the minimum, not a lucky reading.
+        plan, record = self.admit([90000, 30000, 80000])
+        self.assertEqual(record["min_available_mb"], 30000)
+        self.assertLessEqual(plan.jobs * plan.memlimit_mb, 30000 - 16384 - 44)
+
+    def test_admission_record_lists_every_sample_envelope_margin_and_decision(self):
+        _plan, record = self.admit([61440, 60000, 62000], builds=3)
+        text = "\n".join(og.format_admission(record))
+        for needle in ("admission: ADMIT", "sample 0", "sample 1", "sample 2", "envelope",
+                       "margin 16384 MiB", "active build processes: 3 (recorded, not a veto)"):
+            self.assertIn(needle, text)
+        json.dumps(record)  # it goes into the run's record as JSON
+
+
+class LandingBuildPlanTest(unittest.TestCase):
+    """A landing's cargo job count fits the room measured now (DR-44). Pure."""
+
+    def test_the_measured_small_host_gets_the_jobs_that_fit(self) -> None:
+        # Two readings on the 24 GiB host on 2026-10-14, less the 3072 MiB
+        # margin, at 9216 MiB per 14 jobs (658 MiB a job).
+        plan = og.landing_build_plan(10370, 24576, 14)
+        self.assertEqual((plan["margin_mb"], plan["room_mb"], plan["jobs"]), (3072, 7298, 11))
+        self.assertEqual(og.landing_build_plan(9550, 24576, 14)["jobs"], 9)
+
+    def test_a_roomy_host_is_bounded_by_its_cores(self) -> None:
+        self.assertEqual(og.landing_build_plan(61440, HOST_MB, 18)["jobs"], 18)
+        self.assertEqual(og.landing_build_plan(12288 + 3072, 24576, 14)["jobs"], 14)
+
+    def test_no_room_or_no_reading_is_one_job_never_a_refusal(self) -> None:
+        for available, physical, cores in ((1000, 24576, 14), (3500, 24576, 14), (None, 24576, 14),
+                                           (9000, 0, 14), (9000, 24576, 0)):
+            with self.subTest(available=available, physical=physical, cores=cores):
+                self.assertEqual(og.landing_build_plan(available, physical, cores)["jobs"], 1)
+
+    def test_never_oversubscribed_over_a_grid(self) -> None:
+        for physical in (8192, 24576, HOST_MB, 262144):
+            for available in range(0, physical + 1, max(1, physical // 37)):
+                for cores in (1, 4, 14, 64):
+                    for peak, jobs_at in ((og.BUILD_PEAK_MB, og.BUILD_PEAK_JOBS), (4096, 8), (512, 1)):
+                        plan = og.landing_build_plan(available, physical, cores, peak, jobs_at)
+                        jobs = plan["jobs"]
+                        self.assertTrue(1 <= jobs <= cores, plan)
+                        if jobs > 1:
+                            self.assertLessEqual(jobs * peak, (available - og.admission_margin_mb(physical)) * jobs_at,
+                                                 plan)
+
+    def test_an_oversubscribing_plan_is_caught(self) -> None:
+        # The mutant: a job per core, whatever the room holds.
+        original = og.landing_build_plan
+
+        def per_core(available_mb=None, physical_mb=None, cores=None, peak_mb=og.BUILD_PEAK_MB,
+                     peak_jobs=og.BUILD_PEAK_JOBS):
+            plan = dict(original(available_mb, physical_mb, cores, peak_mb, peak_jobs))
+            plan["jobs"] = cores or 1
+            return plan
+        with mock.patch.object(og, "landing_build_plan", side_effect=per_core):
+            result = unittest.TestResult()
+            unittest.TestSuite([LandingBuildPlanTest("test_never_oversubscribed_over_a_grid"),
+                                LandingBuildPlanTest("test_the_measured_small_host_gets_the_jobs_that_fit")]).run(result)
+        self.assertTrue(result.failures, "a plan of one job per core must fail the room check")
+
+    def test_a_caller_s_job_count_bounds_the_plan(self) -> None:
+        # build-slot (or the lander) sets CARGO_BUILD_JOBS to its share of the
+        # machine; the landing never plans above it, and never below the room.
+        roomy = og.landing_build_plan(16358, 24576, 14)
+        self.assertEqual(roomy["jobs"], 14)
+        bounded = og.landing_build_plan(16358, 24576, 14, cap=4)
+        self.assertEqual(bounded["jobs"], 4)
+        self.assertIn("at most the caller's 4", bounded["why"])
+        self.assertEqual(og.landing_build_plan(9550, 24576, 14, cap=12)["jobs"], 9, "the room still governs")
+        for cap in (None, 0, -3):
+            self.assertEqual(og.landing_build_plan(16358, 24576, 14, cap=cap)["jobs"], 14, cap)
+
+    def test_land_sh_bounds_every_round_by_what_its_caller_set(self) -> None:
+        scripts = Path(og.__file__).resolve().parent
+        for script in ("land.sh",):
+            text = (scripts / script).read_text(encoding="utf-8")
+            self.assertIn("capture_build_cap", text,
+                          f"{script} distinguishes generated allocations from caller caps")
+        land = (scripts / "land.sh").read_text(encoding="utf-8").splitlines()
+        start = land.index("plan_builds() {")
+        body = "\n".join(land[start:land.index("}", start) + 1])
+        with tempfile.TemporaryDirectory() as out:
+            for caller, most in (("2", 2), ("", os.cpu_count())):
+                done = subprocess.run(
+                    ["/bin/bash", "-c", body + '\nnote() { printf "%s\\n" "$*"; }\nplan_builds\n'
+                     'printf "jobs=%s\\n" "$CARGO_BUILD_JOBS"'],
+                    cwd=scripts.parent, capture_output=True, text=True, timeout=60, check=False,
+                    env={**os.environ, "OUT": out, "LAND_CALLER_JOBS": caller, "CARGO_BUILD_JOBS": "99"})
+                with self.subTest(caller=caller):
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    jobs = int(done.stdout.split("jobs=")[-1])
+                    self.assertTrue(1 <= jobs <= most, done.stdout)
+
+    def test_generated_budget_does_not_become_an_explicit_cap(self) -> None:
+        land = (Path(og.__file__).resolve().parent / "land.sh").read_text().splitlines()
+        start = land.index("capture_build_cap() {")
+        body = "\n".join(land[start:land.index("}", start) + 1])
+        cases = [
+            ({"CARGO_BUILD_JOBS": "14"}, "14"),
+            ({"CARGO_BUILD_JOBS": "14", "TARGO_PLANNED_JOBS": "14"}, ""),
+            ({"CARGO_BUILD_JOBS": "4", "TARGO_PLANNED_JOBS": "14"}, "4"),
+            ({"CARGO_BUILD_JOBS": "14", "BUILD_SLOT_CPU_SOURCE": "available-slots",
+              "BUILD_SLOT_CPU_BUDGET": "14"}, ""),
+            ({"CARGO_BUILD_JOBS": "14", "TARGO_PLANNED_JOBS": "14",
+              "TARGO_CALLER_JOBS": "3"}, "3"),
+        ]
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in {"LAND_CALLER_JOBS", "CARGO_BUILD_JOBS", "TARGO_CALLER_JOBS",
+                              "TARGO_PLANNED_JOBS", "BUILD_SLOT_CPU_SOURCE", "BUILD_SLOT_CPU_BUDGET"}}
+        for extra, expected in cases:
+            with self.subTest(extra=extra):
+                done = subprocess.run(
+                    ["/bin/bash", "-c", body + '\ncapture_build_cap\n'
+                     'printf "%s:%s" "$LAND_CALLER_JOBS" "${TARGO_CALLER_JOBS-}"'],
+                    env={**clean, **extra}, capture_output=True, text=True, check=True)
+                self.assertEqual(done.stdout, expected + ":" + expected)
+
+    def test_the_cli_prints_the_plan_a_landing_evals(self) -> None:
+        done = subprocess.run([sys.executable, str(Path(og.__file__)), "landing-plan"], capture_output=True,
+                              text=True, timeout=60, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"(?m)^LAND_BUILD_JOBS=[1-9][0-9]*$")
+        memory = dict(line.split("=", 1) for line in done.stdout.splitlines()
+                      if line.startswith(("LAND_JOB_MEMORY_BYTES=", "LAND_MEMORY_RESERVE_BYTES=")))
+        self.assertEqual(int(memory["LAND_JOB_MEMORY_BYTES"]),
+                         (og.BUILD_PEAK_MB * 1048576 + og.BUILD_PEAK_JOBS - 1) // og.BUILD_PEAK_JOBS)
+        if og.physical_ram_mb():
+            self.assertEqual(int(memory["LAND_MEMORY_RESERVE_BYTES"]),
+                             og.admission_margin_mb(og.physical_ram_mb()) * 1048576)
+        self.assertRegex(done.stdout, r"(?m)^LAND_HOST_PLAN='cores \d+ ram \d+ MiB available .* build jobs \d+ = .*'$")
+        done = subprocess.run([sys.executable, str(Path(og.__file__)), "landing-plan", "--cap", "1"],
+                              capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"(?m)^LAND_BUILD_JOBS=1$")
+
+
+class MemoryPressureWatchTest(unittest.TestCase):
+    """Pressure going critical mid-run stops the children; nothing real is pressured."""
+
+    def run_stopped_child(self, script, grace_s):
+        with tempfile.TemporaryDirectory() as td:
+            ready = Path(td, "ready")
+            marker = Path(td, "terminated")
+            cancel = threading.Event()
+            # Critical only once the child is up and has installed its handler.
+            watch = og.MemoryPressureWatch(
+                label="pressure-test", probe=lambda: CRITICAL if ready.exists() else NORMAL,
+                poll_s=0.05, on_critical=cancel.set, trace_path=os.path.join(td, "trace.jsonl"))
+            watch.start()
+            try:
+                result = og.run_captured(
+                    ["/bin/sh", "-c", script.format(ready=ready, marker=marker)], 10000,
+                    timeout_s=20, label="pressure-test", cancel_event=cancel,
+                    terminate_grace_s=grace_s)
+            finally:
+                summary = watch.stop()
+            trace = [json.loads(line) for line in Path(td, "trace.jsonl").read_text().splitlines()]
+            return result, watch, summary, trace, marker.exists()
+
+    def test_critical_pressure_mid_run_terminates_children_and_trips(self):
+        result, watch, summary, trace, terminated = self.run_stopped_child(
+            'trap "echo term > {marker}; exit 143" TERM; : > {ready}; '
+            'while :; do sleep 0.05; done', grace_s=5.0)
+        self.assertTrue(watch.tripped)
+        self.assertIn("critical", watch.trip_reason)
+        self.assertTrue(summary["tripped"])
+        self.assertTrue(result.cancelled)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(terminated, "the child never saw SIGTERM")
+        kinds = [event["kind"] for event in result.guard_evidence["events"]]
+        self.assertIn("authenticated-terminate", kinds)
+        self.assertIn("group-reaped", kinds)
+        self.assertEqual(result.guard_evidence["phase"], "reaped")
+        self.assertLess(result.wall_sec, 15)
+        states = [row["pressure"]["state"] for row in trace]
+        self.assertEqual(states[0], "normal")
+        self.assertIn("critical", states)
+
+    def test_child_ignoring_sigterm_is_killed_after_the_grace(self):
+        result, watch, _summary, _trace, terminated = self.run_stopped_child(
+            'trap "" TERM; : > {ready}; while :; do sleep 0.05; done', grace_s=0.5)
+        self.assertTrue(watch.tripped)
+        self.assertTrue(result.cancelled)
+        self.assertFalse(terminated)
+        kinds = [event["kind"] for event in result.guard_evidence["events"]]
+        self.assertIn("authenticated-terminate", kinds)
+        self.assertIn("authenticated-kill", kinds)
+        self.assertEqual(result.guard_evidence["phase"], "reaped")
+        self.assertGreaterEqual(result.wall_sec, 0.5)
+
+    def test_unmeasurable_pressure_mid_run_fails_closed(self):
+        readings = iter([NORMAL, NORMAL])
+        cancel = threading.Event()
+        watch = og.MemoryPressureWatch(label="pressure-test", probe=lambda: next(readings, None),
+                                       poll_s=0.01, on_critical=cancel.set, max_unknown=3)
+        with watch:
+            self.assertTrue(cancel.wait(10))
+        self.assertTrue(watch.tripped)
+        self.assertIn("unmeasurable for 3", watch.trip_reason)
+        self.assertEqual(watch.summary()["counts"]["normal"], 2)
+
+    def test_normal_and_warn_pressure_never_trip(self):
+        readings = iter([NORMAL, dict(NORMAL, raw=2, state="warn")] * 10)
+        cancel = threading.Event()
+        watch = og.MemoryPressureWatch(label="pressure-test", probe=lambda: next(readings, NORMAL),
+                                       poll_s=0.01, on_critical=cancel.set)
+        with watch:
+            time.sleep(0.3)
+        self.assertFalse(watch.tripped)
+        self.assertFalse(cancel.is_set())
+        self.assertGreater(watch.summary()["polls"], 5)
+
+    def test_darwin_levels_follow_the_kernel_constants(self):
+        # NOTE_MEMORYSTATUS_PRESSURE_{NORMAL,WARN,CRITICAL} = 0x1, 0x2, 0x4.
+        for raw, state in ((1, "normal"), (2, "warn"), (4, "critical"), (0, None), (3, None)):
+            with self.subTest(raw=raw), \
+                    mock.patch.object(og.sys, "platform", "darwin"), \
+                    mock.patch.object(og, "_darwin_pressure_raw", return_value=raw):
+                reading = og.memory_pressure_reading()
+                self.assertEqual(reading and reading["state"], state)
+
+    def test_linux_psi_full_avg10_is_critical_from_sixty_percent(self):
+        def psi(full):
+            return io.StringIO("some avg10=70.00 avg60=1.00 avg300=0.50 total=9\n"
+                               f"full avg10={full} avg60=0.00 avg300=0.00 total=1\n")
+
+        for full, state in (("59.99", "normal"), ("60.00", "critical"), ("0.00", "normal")):
+            with self.subTest(full=full), \
+                    mock.patch.object(og.sys, "platform", "linux"), \
+                    mock.patch("builtins.open", return_value=psi(full)):
+                self.assertEqual(og.memory_pressure_reading()["state"], state)
+        with mock.patch.object(og.sys, "platform", "linux"), \
+                mock.patch("builtins.open", side_effect=OSError("no PSI")):
+            self.assertIsNone(og.memory_pressure_reading())
+        # A file without the `full` line (or with an unreadable one) is no
+        # reading at all, never "normal".
+        for text in ("some avg10=70.00 avg60=1.00 avg300=0.50 total=9\n",
+                     "some avg10=0.00 avg60=0.00 avg300=0.00 total=9\nfull avg10=n/a\n"):
+            with self.subTest(text=text), \
+                    mock.patch.object(og.sys, "platform", "linux"), \
+                    mock.patch.object(og, "open", create=True, return_value=io.StringIO(text)):
+                self.assertIsNone(og.memory_pressure_reading())
+
+    def test_darwin_probe_reads_the_level_through_sysctlbyname(self):
+        # The kernel's answer, not a constant: each dispatch level comes back as
+        # read, from one sysctlbyname call naming the sysctl, with no fork.
+        # Select the guard's platform without changing stdlib sys.platform:
+        # ctypes.util must still import the real host's native loader.
+        for raw, state in ((1, "normal"), (2, "warn"), (4, "critical")):
+            sysctlbyname, calls = fake_sysctlbyname(raw)
+            with self.subTest(raw=raw), \
+                    mock.patch.object(og, "sys", types.SimpleNamespace(platform="darwin")), \
+                    mock.patch.object(og, "_DARWIN_SYSCTLBYNAME", [sysctlbyname]), \
+                    mock.patch.object(og.subprocess, "run") as fallback:
+                self.assertEqual(og.memory_pressure_reading(), {
+                    "source": "sysctl kern.memorystatus_vm_pressure_level",
+                    "raw": raw, "state": state})
+                self.assertEqual(calls, [(b"kern.memorystatus_vm_pressure_level",
+                                          ctypes.sizeof(ctypes.c_uint32), None, 0)])
+                fallback.assert_not_called()
+        if sys.platform == "darwin":
+            # And the real call reads this kernel: a fresh libc binding, with the
+            # fallback disabled, answers one of the three dispatch levels.
+            with mock.patch.object(og, "_DARWIN_SYSCTLBYNAME", []), \
+                    mock.patch.object(og.subprocess, "run",
+                                      side_effect=OSError("fallback disabled")) as fallback:
+                self.assertIn(og._darwin_pressure_raw(), og.DARWIN_PRESSURE_STATES)
+                fallback.assert_not_called()
+
+    def test_darwin_probe_falls_back_to_sysctl_and_otherwise_fails_closed(self):
+        name = "kern.memorystatus_vm_pressure_level"
+        sysctlbyname_failed = fake_sysctlbyname(0, rc=-1)[0]
+        wrong_size = fake_sysctlbyname(4, size=8)[0]  # not the uint32 the kernel answers
+        cases = (
+            (sysctlbyname_failed, dict(return_value=subprocess.CompletedProcess(
+                ["sysctl"], 0, stdout="4\n", stderr="")), 4),
+            (wrong_size, dict(return_value=subprocess.CompletedProcess(
+                ["sysctl"], 0, stdout="2\n", stderr="")), 2),
+            (sysctlbyname_failed, dict(side_effect=subprocess.CalledProcessError(1, ["sysctl"])),
+             None),
+            (sysctlbyname_failed, dict(side_effect=subprocess.TimeoutExpired(["sysctl"], 5)),
+             None),
+            (wrong_size, dict(side_effect=FileNotFoundError("sysctl")), None),
+            (sysctlbyname_failed, dict(return_value=subprocess.CompletedProcess(
+                ["sysctl"], 0, stdout="", stderr="")), None),
+        )
+        for sysctlbyname, fallback_result, expected in cases:
+            probe = mock.Mock(wraps=sysctlbyname)
+            with self.subTest(fallback=fallback_result, expected=expected), \
+                    mock.patch.object(og, "sys", types.SimpleNamespace(platform="darwin")), \
+                    mock.patch.object(og, "_DARWIN_SYSCTLBYNAME", [probe]), \
+                    mock.patch.object(og.subprocess, "run", **fallback_result) as fallback:
+                self.assertEqual(og._darwin_pressure_raw(), expected)
+                self.assertEqual(fallback.call_args.args[0], ["sysctl", "-n", name])
+                reading = og.memory_pressure_reading()
+                self.assertEqual(reading and reading["raw"], expected)
+                self.assertEqual(probe.call_count, 2)
+                self.assertEqual(fallback.call_count, 2)
+        if sys.platform == "darwin":
+            # The real fallback reads this kernel too.
+            with mock.patch.object(og, "_DARWIN_SYSCTLBYNAME", [sysctlbyname_failed]):
+                self.assertIn(og._darwin_pressure_raw(), og.DARWIN_PRESSURE_STATES)
+
+    def test_watch_thread_failure_trips_instead_of_dying(self):
+        # The trace disk fills after the first poll: the poll raises inside the
+        # watch thread, which must stop the campaign, not leave it unwatched.
+        class FullDisk(io.StringIO):
+            writes = 0
+
+            def write(self, text):
+                self.writes += 1
+                if self.writes > 1:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                return super().write(text)
+
+        cancel = threading.Event()
+        watch = og.MemoryPressureWatch(label="pressure-test", probe=lambda: NORMAL,
+                                       poll_s=0.01, on_critical=cancel.set,
+                                       trace_path="/nonexistent/pressure.jsonl")
+        with mock.patch.object(og, "open", create=True, return_value=FullDisk()):
+            watch.start()
+        try:
+            self.assertTrue(cancel.wait(10), "the watch thread died and nothing stopped the run")
+        finally:
+            summary = watch.stop()
+        self.assertTrue(watch.tripped)
+        self.assertTrue(summary["tripped"])
+        self.assertIn("watch failed", watch.trip_reason)
+        self.assertIn("No space left on device", watch.trip_reason)
+
+    def test_default_probes_are_the_kernel_readings(self):
+        # The gate passes no probes: the watch and the admission window must then
+        # read the kernel functions, and an unmeasurable kernel refuses / trips.
+        cancel = threading.Event()
+        with mock.patch.object(og, "memory_pressure_reading", return_value=None) as pressure, \
+                mock.patch.object(og, "host_available_ram_reading", return_value=None) as avail:
+            watch = og.MemoryPressureWatch(label="pressure-test", poll_s=0.01,
+                                           on_critical=cancel.set)
+            with watch:
+                self.assertTrue(cancel.wait(10))
+            window = og.sample_admission_window(1, 0, sleep=None)
+        self.assertIn("unmeasurable for 3", watch.trip_reason)
+        # The watch's unmeasurable polls, then the window's one reading.
+        self.assertGreaterEqual(pressure.call_count, og.PRESSURE_MAX_UNKNOWN + 1)
+        avail.assert_called_once_with()
+        self.assertEqual([(row["available_mb"], row["pressure"]) for row in window],
+                         [(None, None)])
+        self.assertEqual(og.ram_admission_decision(window, 2, 1024, 10, HOST_MB)["decision"],
+                         "refuse")
 
 
 if __name__ == "__main__":

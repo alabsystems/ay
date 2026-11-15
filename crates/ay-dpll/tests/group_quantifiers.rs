@@ -9,8 +9,12 @@
 
 mod common;
 
+#[path = "group_quantifiers/and_root_certificate_partition.rs"]
+mod and_root_certificate_partition;
 #[path = "group_quantifiers/bounded_int_guard_soundness.rs"]
 mod bounded_int_guard_soundness;
+#[path = "group_quantifiers/boxed_library_diagonal_instances.rs"]
+mod boxed_library_diagonal_instances;
 
 #[path = "group_quantifiers/bv_forall_uf_completion_soundness.rs"]
 mod bv_forall_uf_completion_soundness;
@@ -26,8 +30,21 @@ mod cegqi_refinement_5888;
 mod cegqi_refinement_5975;
 #[path = "group_quantifiers/cegqi_unknown_mapping_2879.rs"]
 mod cegqi_unknown_mapping_2879;
+#[path = "group_quantifiers/checked_exact_exists_sat_evidence.rs"]
+mod checked_exact_exists_sat_evidence;
 #[path = "group_quantifiers/closed_universal_validity_precheck.rs"]
 mod closed_universal_validity_precheck;
+#[path = "group_quantifiers/definition_fold_authored_identity.rs"]
+mod definition_fold_authored_identity;
+#[path = "group_quantifiers/definition_split_without_proof.rs"]
+mod definition_split_without_proof;
+#[path = "group_quantifiers/degrade_277_narrowing.rs"]
+mod degrade_277_narrowing;
+#[path = "group_quantifiers/demand_lane_flush_soundness.rs"]
+mod demand_lane_flush_soundness;
+#[path = "group_quantifiers/derived_bound_expansion_unsat.rs"]
+mod derived_bound_expansion_unsat;
+
 #[path = "group_quantifiers/ematching_1939.rs"]
 mod ematching_1939;
 #[path = "group_quantifiers/ematching_1975.rs"]
@@ -36,22 +53,40 @@ mod ematching_1975;
 mod ematching_deadline_break;
 #[path = "group_quantifiers/ematching_e2e_3325.rs"]
 mod ematching_e2e_3325;
+#[path = "group_quantifiers/ematching_memory_bound.rs"]
+mod ematching_memory_bound;
 #[path = "group_quantifiers/ematching_multiround_3994.rs"]
 mod ematching_multiround_3994;
 #[path = "group_quantifiers/ematching_post_cegqi_7979.rs"]
 mod ematching_post_cegqi_7979;
+#[path = "group_quantifiers/equated_universal_evidence.rs"]
+mod equated_universal_evidence;
 #[path = "group_quantifiers/finite_domain_5848.rs"]
 mod finite_domain_5848;
 #[path = "group_quantifiers/forall_goal_int_boundary_discharge.rs"]
 mod forall_goal_int_boundary_discharge;
 #[path = "group_quantifiers/frame_quantifier_instance_resolve.rs"]
 mod frame_quantifier_instance_resolve;
+#[path = "group_quantifiers/fuel_guard_verus_reductions.rs"]
+mod fuel_guard_verus_reductions;
+#[path = "group_quantifiers/fuel_guarded_definitions.rs"]
+mod fuel_guarded_definitions;
+#[path = "group_quantifiers/ground_resolve_carry.rs"]
+mod ground_resolve_carry;
+#[path = "group_quantifiers/guarded_disjunct_instantiation.rs"]
+mod guarded_disjunct_instantiation;
+#[path = "group_quantifiers/guarded_nested_quantifiers.rs"]
+mod guarded_nested_quantifiers;
 #[path = "group_quantifiers/incremental_scope_recheck_soundness.rs"]
 mod incremental_scope_recheck_soundness;
+#[path = "group_quantifiers/instance_bool_argument_purification.rs"]
+mod instance_bool_argument_purification;
 #[path = "group_quantifiers/left_inverse_attack_corpus.rs"]
 mod left_inverse_attack_corpus;
 #[path = "group_quantifiers/mbqi_5971.rs"]
 mod mbqi_5971;
+#[path = "group_quantifiers/model_based_instantiation_switch.rs"]
+mod model_based_instantiation_switch;
 #[path = "group_quantifiers/nested_skolem_functions_7150.rs"]
 mod nested_skolem_functions_7150;
 #[path = "group_quantifiers/pattern_annotation_verdict_invariance.rs"]
@@ -68,6 +103,10 @@ mod quantifier_capture_avoidance_5911;
 mod quantifier_dpll_7150;
 #[path = "group_quantifiers/quantifier_model_3441.rs"]
 mod quantifier_model_3441;
+#[path = "group_quantifiers/quantifier_proxy_abstraction.rs"]
+mod quantifier_proxy_abstraction;
+#[path = "group_quantifiers/quantifier_under_boolean_equality.rs"]
+mod quantifier_under_boolean_equality;
 #[path = "group_quantifiers/quantprod_model_production.rs"]
 mod quantprod_model_production;
 #[path = "group_quantifiers/scoped_macro_non_adoption.rs"]
@@ -88,5 +127,7 @@ mod ufbv_fixpoint_probe_admission;
 mod ufbv_strict_uf_completion_coverage;
 #[path = "group_quantifiers/ufnira_uf_completion_soundness.rs"]
 mod ufnira_uf_completion_soundness;
+#[path = "group_quantifiers/unknown_retry_allowance.rs"]
+mod unknown_retry_allowance;
 #[path = "group_quantifiers/vacuous_trigger_completeness.rs"]
 mod vacuous_trigger_completeness;

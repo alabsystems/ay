@@ -10,7 +10,7 @@ impl LraSolver {
     ///
     /// Bland's rule: to prevent cycling, always choose the eligible variable with
     /// the smallest index when there are ties. This guarantees termination.
-    fn find_pivot_candidate(
+    pub(super) fn find_pivot_candidate(
         &self,
         row_idx: usize,
         violated_bound: BoundType,
@@ -98,7 +98,7 @@ impl LraSolver {
     /// Secondary: smallest column size (cheaper pivot update).
     /// Tiebreak: smallest variable index for determinism.
     ///
-    /// Falls back to Bland when `bland_mode` is active (after repeated bases).
+    /// Uses the least-index rule when `bland_mode` is active (after the pivot threshold).
     ///
     /// #8003 TL87: Also returns the coefficient position within the row, enabling
     /// O(1) coefficient lookup in `compute_update_amount_with_coeff` instead of
@@ -127,12 +127,24 @@ impl LraSolver {
         let row = &self.rows[row_idx];
         let basic_var = row.basic_var;
 
-        // Score: (not_free_deps, col_size) — all minimized.
+        // Score: (not_free_deps, col_size, non_unit) — all minimized.
         // `tie_count` tracks how many candidates share the current best score,
         // for reservoir sampling tiebreak (Z3 simplex_def.h:575-580).
         // #8003 TL87: Track coeff_pos (index into row.coeffs) for the best
         // candidate, enabling O(1) coefficient access after selection.
-        let mut best: Option<(u32, i32, usize, usize, usize)> = None; // (var, dir, nf_deps, col_sz, coeff_pos)
+        //
+        // #lra-unit-pivot-pref (`--lra-unit-pivot-pref`, EXPERIMENTAL, default
+        // OFF): the third key prefers a ±1 entering coefficient among
+        // candidates tied on the two Z3 keys. Dividing the pivot row by ±1
+        // keeps integer rows integer and keeps `is_all_i64()` rows on the
+        // i64/precomputed pivot lanes. When OFF the key is a constant 0, so
+        // the tuple comparison below is byte-identical to the historical
+        // `(not_free_deps, col_sz)` comparison. A different preference among
+        // VALID entering candidates changes the pivot path (hence possibly
+        // the model or the Farkas explanation), never feasibility, so this
+        // stays behind the flag until a corpus diff clears it for default-on.
+        let unit_pref = ay_core::misc_cli_flags().lra_unit_pivot_pref;
+        let mut best: Option<(u32, i32, usize, usize, usize, usize)> = None; // (var, dir, nf_deps, col_sz, non_unit, coeff_pos)
         let mut tie_count: u32 = 0;
 
         for (coeff_pos, &(nb_var, ref coeff)) in row.coeffs.iter().enumerate() {
@@ -184,33 +196,36 @@ impl LraSolver {
                 let best_nf = best.as_ref().map_or(usize::MAX, |b| b.2);
                 let not_free_deps = self.count_not_free_basic_deps(nb_var, basic_var, best_nf);
                 let col_sz = self.col_size(nb_var);
+                let non_unit = usize::from(unit_pref && !(coeff.is_one() || coeff.is_neg_one()));
+                let score = (not_free_deps, col_sz, non_unit);
 
                 let is_strictly_better = match &best {
                     None => true,
-                    Some((_, _, best_nfd, best_csz, _)) => {
-                        not_free_deps < *best_nfd
-                            || (not_free_deps == *best_nfd && col_sz < *best_csz)
+                    Some((_, _, best_nfd, best_csz, best_nu, _)) => {
+                        score < (*best_nfd, *best_csz, *best_nu)
                     }
                 };
                 if is_strictly_better {
-                    best = Some((nb_var, dir, not_free_deps, col_sz, coeff_pos));
+                    best = Some((nb_var, dir, not_free_deps, col_sz, non_unit, coeff_pos));
                     tie_count = 1;
-                } else if let Some((_, _, best_nfd, best_csz, _)) = &best {
-                    // Tie: same (not_free_deps, col_size). Use reservoir sampling
-                    // to pick uniformly at random among tied candidates.
-                    // Reference: Z3 simplex_def.h:575-580.
-                    if not_free_deps == *best_nfd && col_sz == *best_csz {
-                        tie_count += 1;
-                        let r = Self::pivot_xorshift32(&mut self.pivot_rng) % tie_count;
-                        if r == 0 {
-                            best = Some((nb_var, dir, not_free_deps, col_sz, coeff_pos));
+                } else if let Some((_, _, best_nfd, best_csz, best_nu, _)) = &best {
+                    // Tie: same (not_free_deps, col_size[, non_unit]). Use
+                    // reservoir sampling to pick uniformly at random among
+                    // tied candidates. Reference: Z3 simplex_def.h:575-580.
+                    if score == (*best_nfd, *best_csz, *best_nu) {
+                        tie_count = tie_count.saturating_add(1);
+                        // `tie_count >= 2` here; the checked form names the
+                        // (unreachable) zero divisor as "keep the incumbent".
+                        let r = Self::pivot_xorshift32(&mut self.pivot_rng).checked_rem(tie_count);
+                        if r == Some(0) {
+                            best = Some((nb_var, dir, not_free_deps, col_sz, non_unit, coeff_pos));
                         }
                     }
                 }
             }
         }
 
-        best.map(|(var, dir, _, _, coeff_pos)| (var, dir, coeff_pos))
+        best.map(|(var, dir, _, _, _, coeff_pos)| (var, dir, coeff_pos))
     }
 
     /// Xorshift32 PRNG for pivot tiebreaking. Fast, minimal state.
@@ -260,8 +275,9 @@ impl LraSolver {
     /// Ensure column index is large enough for variable `var`.
     fn ensure_col_index(&mut self, var: u32) {
         let vi = var as usize;
-        if vi >= self.col_index.len() {
-            self.col_index.resize(vi + 1, Vec::new());
+        // One (possibly empty) entry list per variable id: grow to cover `vi`.
+        while self.col_index.len() <= vi {
+            self.col_index.push(Vec::new());
         }
     }
 

@@ -1,0 +1,62 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): an order definition proved its transitivity
+* before the `def` block that supplies the relation.
+*
+* `def_order`/`pre_order` is a SEQUENCE -- `vars`, an optional `spec`, `def`,
+* an optional `transitivity`, an optional `reflexivity`, `end` -- and every
+* side condition of the order is checked against the definition `def` supplies.
+* `OrderProofRule` builds the transitivity obligations by iterating
+* `constructed_order.definition` at the moment `proof` runs, one proofgoal per
+* definition constraint. Written before `def`, that iteration is over an empty
+* list, so the two lines `proof` / `end` below discharged transitivity for a
+* relation that did not exist yet -- and the order's closing `end` then skips
+* the real check, because `transitivity_proven` is already set.
+*
+* Only the version-3 grammar enforced the sequence: `Parser::def_order_rule`
+* reads the blocks in that order and errors on anything else, while the
+* version-2 parser dispatches every line through one flat match. Same shape as
+* wrong verdict 23, one level down -- that one pinned WHICH rules may appear
+* inside an order definition, this one pins WHEN.
+*
+* The round-4 freshness guard passes cleanly here: `fresh_right w1 w2 w3` has
+* exactly `|right|` entries, all fresh and pairwise distinct. What is wrong is
+* not the transitivity proof but that there was nothing to prove.
+*
+* The relation `def` then supplies orders x1 < x2 < x3 < x1, and one `dom`
+* chases the cycle to the empty contradiction. The formula is
+* exactly-one-of-three and is satisfied by `x1 = 1, x2 = 0, x3 = 0` (and by the
+* two rotations); this used to print `s VERIFIED UNSATISFIABLE` at exit 0 under
+* default flags, from the same binary that verifies
+* correct/version2/pre_order_transitivity_after_def.
+f 4
+pre_order cyc
+    vars
+        left u1 u2 u3
+        right v1 v2 v3
+        aux
+    end
+    transitivity
+        vars
+            fresh_right w1 w2 w3
+        end
+        proof
+        end
+    end
+    def
+        1 ~u1 1 v1 1 v2 >= 1 ;
+        1 ~u2 1 v2 1 v3 >= 1 ;
+        1 ~u3 1 v3 1 v1 >= 1 ;
+    end
+end
+load_order cyc x1 x2 x3
+dom >= 1 ; x1 -> x2 x2 -> x3 x3 -> x1 ; begin
+    proofgoal #4
+        u 1 ~x1 >= 1 ;
+        u 1 ~x2 >= 1 ;
+        u 1 ~x3 >= 1 ;
+        u >= 1 ;
+    end
+end
+output NONE
+conclusion UNSAT
+end pseudo-Boolean proof

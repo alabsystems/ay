@@ -15,6 +15,7 @@ use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 
+use super::expansion::{ExpansionPolicy, SubstitutionExpander};
 use super::solver::DiophSolver;
 use crate::SubstitutionTriple;
 
@@ -32,12 +33,19 @@ impl DiophSolver {
     /// substitution definitions.  This allows recovering the full expression of
     /// an original variable in terms of other original (free) variables, even
     /// when coefficient reduction introduced intermediate fresh variables.
+    /// An expression that needs a free fresh parameter (#4830), or whose exact
+    /// expansion exceeds the expander's budget (D3), is left out: every entry
+    /// returned is an exact consequence of the equations.
     pub(crate) fn get_expanded_substitutions(
         &self,
         num_original_vars: usize,
         expand_fresh: bool,
     ) -> Vec<SubstitutionTriple<usize, BigInt>> {
         let mut result = Vec::new();
+        let mut expander = SubstitutionExpander::new(
+            &self.substitutions,
+            ExpansionPolicy::StopAtOriginals { num_original_vars },
+        );
 
         for (&var, (coeffs, constant)) in &self.substitutions {
             if var >= num_original_vars {
@@ -51,105 +59,19 @@ impl DiophSolver {
                 let mut coeffs_vec: Vec<_> = coeffs.iter().map(|(&v, c)| (v, c.clone())).collect();
                 coeffs_vec.sort_by_key(|(v, _)| *v);
                 result.push((var, coeffs_vec, constant.clone()));
-            } else {
-                let expanded = self.expand_single_substitution(coeffs, constant, num_original_vars);
-                if let Some((coeffs_vec, expanded_const)) = expanded {
-                    result.push((var, coeffs_vec, expanded_const));
+            } else if let Some(form) = expander.expand(var) {
+                if form.coeffs.is_empty() || form.coeffs.keys().any(|&v| v >= num_original_vars) {
+                    continue;
                 }
+                let mut coeffs_vec: Vec<_> =
+                    form.coeffs.iter().map(|(&v, c)| (v, c.clone())).collect();
+                coeffs_vec.sort_by_key(|(v, _)| *v);
+                result.push((var, coeffs_vec, form.constant.clone()));
             }
         }
 
         result.sort_by_key(|(v, _, _)| *v);
         result
-    }
-
-    /// Expand a single substitution by recursively substituting fresh variables.
-    fn expand_single_substitution(
-        &self,
-        coeffs: &HashMap<usize, BigInt>,
-        constant: &BigInt,
-        num_original_vars: usize,
-    ) -> Option<(Vec<(usize, BigInt)>, BigInt)> {
-        let mut expanded_coeffs: HashMap<usize, BigInt> = HashMap::default();
-        let mut expanded_const = constant.clone();
-        let mut worklist: Vec<(usize, BigInt)> =
-            coeffs.iter().map(|(&v, c)| (v, c.clone())).collect();
-
-        let mut iteration = 0;
-        let max_iterations = 100;
-        while let Some((dep_var, dep_coeff)) = worklist.pop() {
-            iteration += 1;
-            if iteration > max_iterations {
-                break;
-            }
-
-            if dep_var < num_original_vars {
-                *expanded_coeffs.entry(dep_var).or_insert_with(BigInt::zero) += &dep_coeff;
-            } else if let Some((sub_coeffs, sub_const)) = self.substitutions.get(&dep_var) {
-                expanded_const += &dep_coeff * sub_const;
-                for (&sub_dep, sub_c) in sub_coeffs {
-                    worklist.push((sub_dep, &dep_coeff * sub_c));
-                }
-            } else {
-                // Fresh variable with no substitution — it's a free parameter.
-                // The expansion is incomplete; return None so this substitution
-                // is not used for bound feasibility inference (#4830).
-                return None;
-            }
-        }
-
-        expanded_coeffs.retain(|_, v| !v.is_zero());
-
-        if !expanded_coeffs.is_empty() && expanded_coeffs.keys().all(|&v| v < num_original_vars) {
-            let mut coeffs_vec: Vec<_> = expanded_coeffs.into_iter().collect();
-            coeffs_vec.sort_by_key(|(v, _)| *v);
-            Some((coeffs_vec, expanded_const))
-        } else {
-            None
-        }
-    }
-
-    /// Expand a single substitution including free fresh parameters.
-    ///
-    /// Unlike `expand_single_substitution` which returns None when free
-    /// parameters are encountered, this method includes them in the
-    /// expansion. This preserves GCD information needed for modular
-    /// constraint detection.
-    ///
-    /// Returns (coefficients_map, expanded_constant) where coefficients
-    /// may include both original and fresh variable indices.
-    fn expand_substitution_with_free_params(
-        &self,
-        coeffs: &HashMap<usize, BigInt>,
-        constant: &BigInt,
-    ) -> (HashMap<usize, BigInt>, BigInt) {
-        let mut expanded_coeffs: HashMap<usize, BigInt> = HashMap::default();
-        let mut expanded_const = constant.clone();
-        let mut worklist: Vec<(usize, BigInt)> =
-            coeffs.iter().map(|(&v, c)| (v, c.clone())).collect();
-
-        let mut iteration = 0;
-        let max_iterations = 100;
-        while let Some((dep_var, dep_coeff)) = worklist.pop() {
-            iteration += 1;
-            if iteration > max_iterations {
-                break;
-            }
-
-            if let Some((sub_coeffs, sub_const)) = self.substitutions.get(&dep_var) {
-                // Variable has a substitution — expand it
-                expanded_const += &dep_coeff * sub_const;
-                for (&sub_dep, sub_c) in sub_coeffs {
-                    worklist.push((sub_dep, &dep_coeff * sub_c));
-                }
-            } else {
-                // Original variable or free fresh parameter — keep as-is
-                *expanded_coeffs.entry(dep_var).or_insert_with(BigInt::zero) += &dep_coeff;
-            }
-        }
-
-        expanded_coeffs.retain(|_, v| !v.is_zero());
-        (expanded_coeffs, expanded_const)
     }
 
     /// Get modular constraints for all original variables from Diophantine
@@ -161,7 +83,9 @@ impl DiophSolver {
     /// variables — they represent unconstrained integer multiples.
     ///
     /// Returns `(var_idx, gcd, residue)` for variables where GCD > 1,
-    /// meaning `var ≡ residue (mod gcd)`.
+    /// meaning `var ≡ residue (mod gcd)`. A variable whose exact expansion is
+    /// not available (budget) yields nothing: the GCD of a partial sum is not
+    /// a modulus of the variable (D3).
     ///
     /// This is critical for cross-mod reasoning: when `x = 2*q1` and
     /// `x = 3*q2`, the Dioph solver derives `r3 = -6*f - 6*q3` where `f`
@@ -173,22 +97,25 @@ impl DiophSolver {
         use super::super::positive_mod;
 
         let mut result = Vec::new();
+        let mut expander =
+            SubstitutionExpander::new(&self.substitutions, ExpansionPolicy::FreeParams);
 
-        for (&var, (coeffs, constant)) in &self.substitutions {
+        for &var in self.substitutions.keys() {
             if var >= num_original_vars {
                 continue;
             }
 
-            let (expanded_coeffs, expanded_const) =
-                self.expand_substitution_with_free_params(coeffs, constant);
+            let Some(form) = expander.expand(var) else {
+                continue;
+            };
 
-            if expanded_coeffs.is_empty() {
+            if form.coeffs.is_empty() {
                 continue;
             }
 
             // Compute GCD of all coefficient absolute values
             let mut gcd = BigInt::zero();
-            for coeff in expanded_coeffs.values() {
+            for coeff in form.coeffs.values() {
                 let abs_c = coeff.abs();
                 if gcd.is_zero() {
                     gcd = abs_c;
@@ -201,7 +128,7 @@ impl DiophSolver {
             }
 
             if gcd > BigInt::one() {
-                let residue = positive_mod(&expanded_const, &gcd);
+                let residue = positive_mod(&form.constant, &gcd);
                 result.push((var, gcd, residue));
             }
         }

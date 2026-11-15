@@ -74,24 +74,30 @@ impl LraSolver {
             };
             keep.push(valid);
             if !valid {
-                dropped += 1;
+                dropped = dropped.saturating_add(1);
             }
         }
         for basis in bases {
             self.note_implied_reason_basis(basis);
         }
         if dropped > 0 {
-            let mut i = 0;
+            // `keep` holds exactly one verdict per propagation, in order, so
+            // the iterator is never exhausted early; were it ever short, the
+            // unjudged propagation is dropped (never trusting an unvalidated
+            // reason).
+            let mut verdicts = keep.iter();
             propagations.retain(|prop| {
-                let k = keep[i];
-                i += 1;
+                let k = verdicts.next().copied().unwrap_or(false);
                 if !k {
                     self.propagated_atoms
                         .remove(&(prop.literal.term, prop.literal.value));
                 }
                 k
             });
-            self.stats.stale_reason_filtered_count += dropped;
+            self.stats.stale_reason_filtered_count = self
+                .stats
+                .stale_reason_filtered_count
+                .saturating_add(dropped);
         }
     }
 
@@ -777,14 +783,14 @@ impl LraSolver {
                         if !self.propagation_seen_buf.insert(atom_term) {
                             continue;
                         }
-                        // Filter: not eq/distinct, not already asserted.
+                        // Filter: not already asserted. Equality/distinct
+                        // atoms are candidates too: the interval loop below
+                        // decides them when the expression interval fixes
+                        // or excludes zero.
                         // Note: multi-variable atoms (coeffs.len() > 1) are now
                         // included (#4919). compute_expr_interval uses implied
                         // bounds to derive finite intervals for compound atoms.
                         if let Some(Some(info)) = self.atom_cache.get(&atom_term) {
-                            if info.is_eq || info.is_distinct {
-                                continue;
-                            }
                             if self.asserted.contains_key(&atom_term) {
                                 continue;
                             }
@@ -815,14 +821,101 @@ impl LraSolver {
             // We need the LinearExpr for compute_expr_interval and collect_interval_reasons.
             // Since we don't mutate atom_cache during this loop, this is safe via
             // index-based access: get the expr reference, compute, then collect reasons.
-            let (expr, is_le) = match self.atom_cache.get(atom_term) {
-                Some(Some(info)) => (&info.expr, info.is_le),
+            let (expr, is_le, is_eq, is_distinct) = match self.atom_cache.get(atom_term) {
+                Some(Some(info)) => (&info.expr, info.is_le, info.is_eq, info.is_distinct),
                 _ => continue,
             };
 
             // Compound atoms are queued during check(); the remaining candidates are
             // single-variable atoms handled with plain interval propagation.
             let (lb, ub) = self.compute_expr_interval(expr);
+
+            if is_eq || is_distinct {
+                // Integer mode: a propagated disequality literal feeds the
+                // LIA disequality-split machinery and measuredly derails
+                // search on QF_LIA convert queries (stable 30 s losses),
+                // so equality atoms are not decided here in integer mode.
+                if self.integer_mode {
+                    continue;
+                }
+                // Equality atom asserts "expr = 0"; a distinct atom asserts
+                // its negation (value=true means disequality). The interval
+                // decides the equality when it collapses to zero (both
+                // endpoints prove the non-strict bound) or excludes zero
+                // (one endpoint proves the strict separation). Reasons are
+                // the interval reasons of the deciding side(s); the fixed
+                // case needs BOTH sides, each complete on its own.
+                let eq_holds = ub
+                    .as_ref()
+                    .is_some_and(|ep| Self::endpoint_implies_le_zero(ep, false))
+                    && lb
+                        .as_ref()
+                        .is_some_and(|ep| Self::endpoint_implies_ge_zero(ep, false));
+                let eq_fails_low = lb
+                    .as_ref()
+                    .is_some_and(|ep| Self::endpoint_implies_not_le_zero(ep, false));
+                let eq_fails_high = ub
+                    .as_ref()
+                    .is_some_and(|ep| Self::endpoint_implies_not_ge_zero(ep, false));
+                debug_assert!(
+                    !(eq_holds && (eq_fails_low || eq_fails_high)),
+                    "LRA propagate() contradiction: equality atom {atom_term:?} both fixed and excluded",
+                );
+                let decided: Option<bool> = if eq_holds {
+                    Some(!is_distinct)
+                } else if eq_fails_low || eq_fails_high {
+                    Some(is_distinct)
+                } else {
+                    None
+                };
+                let Some(value) = decided else {
+                    diag_not_implied += 1;
+                    continue;
+                };
+                if self.propagated_atoms.contains(&(*atom_term, value)) {
+                    diag_already_propagated += 1;
+                    continue;
+                }
+                let reason = if eq_holds {
+                    let upper =
+                        self.collect_interval_reasons_with_seen(expr, true, &mut interval_seen);
+                    let lower =
+                        self.collect_interval_reasons_with_seen(expr, false, &mut interval_seen);
+                    if upper.is_empty() || lower.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut merged = upper;
+                        for lit in lower {
+                            if !merged.contains(&lit) {
+                                merged.push(lit);
+                            }
+                        }
+                        merged
+                    }
+                } else {
+                    // Fails-low is decided by the lower endpoint (expr > 0);
+                    // fails-high by the upper endpoint (expr < 0).
+                    self.collect_interval_reasons_with_seen(expr, !eq_fails_low, &mut interval_seen)
+                };
+                if reason.is_empty() {
+                    diag_empty_reason += 1;
+                    continue;
+                }
+                diag_success += 1;
+                self.stats.eager_reason_count += 1;
+                Self::note_propagated(
+                    &mut self.propagated_atoms,
+                    &mut self.propagated_trail,
+                    *atom_term,
+                    value,
+                );
+                propagations.push(TheoryPropagation {
+                    literal: TheoryLit::new(*atom_term, value),
+                    reason,
+                    reason_data: None,
+                });
+                continue;
+            }
 
             // Diagnostic: track why interval propagation fails.
             if lb.is_none() && ub.is_none() {
@@ -1506,25 +1599,21 @@ impl LraSolver {
             None => return false,
         };
 
-        // Get tighter of direct and implied bound
-        let ib = if vi < self.implied_bounds.len() {
+        // Get tighter of direct and implied bound. Each side is produced by
+        // one call, so the match below reads each discriminant once (a value
+        // merged from several branches re-reads it per branch, and those
+        // re-reads lose the enum's tag range).
+        let ib = self.implied_bounds.get(vi).and_then(|(lower, upper)| {
             if need_upper {
-                self.implied_bounds[vi].1.as_ref()
+                upper.as_ref()
             } else {
-                self.implied_bounds[vi].0.as_ref()
+                lower.as_ref()
             }
-        } else {
-            None
-        };
-        let direct_bound = if let Some(info) = self.vars.get(vi) {
-            if need_upper {
-                info.upper.as_ref().map(|b| (&b.value, b.strict))
-            } else {
-                info.lower.as_ref().map(|b| (&b.value, b.strict))
-            }
-        } else {
-            None
-        };
+        });
+        let direct_bound = self.vars.get(vi).and_then(|info| {
+            let side = if need_upper { &info.upper } else { &info.lower };
+            side.as_ref().map(|b| (&b.value, b.strict))
+        });
         let (bound_val, bound_strict) = match (direct_bound, ib) {
             (Some((dv, ds)), Some(iv)) => {
                 if need_upper {

@@ -243,44 +243,64 @@ fn build(then_value: i64, else_value: i64) -> Fixture {
 
 // ===== the wire =====
 
-/// The exact wire text. `fresh_def_eq` and `ite_branch_projection` are
-/// INTERNALLY checked rules with no external Alethe primitive, so both lower to
-/// an honest `hole` -- the same convention `minted_definition_leaf` already
-/// prints its minted definition under. This lane therefore trades a `:rule
-/// trust` for two honest `hole`s plus four externally named rules; it never
-/// leaves a `:rule trust` on the wire.
+/// The intrinsic projection now has a checked external derivation. The
+/// minted definition and the fixture's unauthenticated closer still do not:
+/// exporting this fragment must not upgrade their source authority.
 #[test]
-fn the_fragment_prints_its_rules_on_the_wire() {
+fn the_fragment_preserves_unsupported_source_premises_on_the_wire() {
     let mut f = fixture();
     let goal = negative_half(&mut f);
     let mut proof = leaf_proof(&mut f.exec, goal);
     assert_eq!(rerun(&mut f.exec, &mut proof), 1);
     let document = ay_proof::try_export_alethe(&proof, &f.exec.ctx.terms)
-        .expect("the finished proof must export");
-    assert_eq!(
-        document.matches(":rule trust").count(),
-        0,
-        "no trust step may reach the wire:\n{document}"
-    );
-    for expected in [
-        "(step t0 (cl (= __ay_ite_def_5 (ite itedef_c 1 0))) :rule hole)",
-        "(step t1 (cl (not itedef_c) (= (ite itedef_c 1 0) 1)) :rule hole)",
-        ":rule eq_transitive",
-        ":rule th_resolution",
-        ":rule or_neg",
-        ":rule contraction",
-    ] {
-        assert!(
-            document.contains(expected),
-            "missing `{expected}` on the wire:\n{document}"
-        );
-    }
-    // The minted definition, the ite projection, and the fixture's own closer.
+        .expect("the fragment exports with its honest unsupported steps");
+    assert_eq!(document.matches(":rule trust").count(), 0);
     assert_eq!(
         document.matches(":rule hole").count(),
-        3,
-        "exactly the two internally-checked leaf steps and the fixture's own closer:\n{document}"
+        2,
+        "the minted definition and unauthenticated closer remain unsupported:\n{document}"
     );
+    assert!(f.exec.proof_has_known_wire_gap(&proof));
+    assert!(!f
+        .exec
+        .check_proof_strict_with_datatypes(&proof)
+        .is_ok_and(|quality| quality.is_complete()));
+    assert_eq!(premiseless_unit_trust_leaves(&proof), 1);
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::FreshDefEq,
+            ..
+        }
+    )));
+
+    let projection = proof
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ProofStep::TheoryLemma {
+                kind: ay_core::TheoryLemmaKind::IteBranchProjection,
+                clause,
+                ..
+            } => Some(clause),
+            _ => None,
+        })
+        .expect("the actual fragment contains its intrinsic projection");
+    let mut work = 8 * 1024 * 1024;
+    assert!(ay_proof::checked_ite_branch_projection_lowering_supported(
+        &f.exec.ctx.terms,
+        projection,
+        None,
+        &mut work
+    ));
+    let mut wrong_guard = projection.clone();
+    wrong_guard[0] = f.exec.ctx.terms.mk_var("fragment_wrong_guard", Sort::Bool);
+    assert!(!ay_proof::checked_ite_branch_projection_lowering_supported(
+        &f.exec.ctx.terms,
+        &wrong_guard,
+        None,
+        &mut work
+    ));
 }
 
 #[test]

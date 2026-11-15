@@ -13,6 +13,7 @@ use std::time::Duration;
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 use crate::engine_config::ChcEngineConfig;
+use crate::pdr::Counterexample;
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcOp, ChcProblem, SmtContext, SmtValue};
 
@@ -70,13 +71,12 @@ pub enum TpaResult {
     Unsafe {
         /// Number of steps to reach bad state
         steps: u64,
-        /// Counterexample trace: state assignments at each step boundary.
-        ///
-        /// Each entry maps state variable names to their values at that step.
-        /// For TPA's power abstraction, intermediate states are extracted from
-        /// the SAT model at times 0, 1, and 2 (where each "step" in the
-        /// abstraction represents 2^power actual transitions).
-        trace: Option<Vec<FxHashMap<String, SmtValue>>>,
+        /// The counterexample: the concrete path the reachability recursion's
+        /// models witnessed, as a ground derivation (validated on the solved
+        /// problem) with its derivation witness — or a skeleton of `steps`
+        /// when the path does not ground-validate. Consumers re-validate
+        /// either on their own clauses.
+        counterexample: Counterexample,
     },
 
     /// Could not determine safety within limits
@@ -112,10 +112,69 @@ pub(super) enum PowerResult {
     Safe,
     Unsafe {
         steps: u64,
-        /// Model from SAT query (for trace extraction)
-        model: FxHashMap<String, SmtValue>,
+        /// Concrete path witnessed by the recursion's models, if complete.
+        path: Option<ConcretePath>,
     },
     Unknown,
+}
+
+/// A concrete path witnessed by the SMT models of the reachability
+/// recursion.
+///
+/// `states[0]` lies in the query's `from` set and `states.last()` in its `to`
+/// set; consecutive states are one base transition apart. Midpoints and
+/// refined targets are point equalities read off the same models, so the
+/// segments of a recursive decomposition meet at a common state. Nothing here
+/// is trusted: the path only ever becomes ground evidence that is
+/// re-validated on the problem's clauses.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ConcretePath {
+    /// Canonical states along the path (`None` where a model is silent).
+    pub(super) states: Vec<Vec<Option<SmtValue>>>,
+    /// Transition-system locals of the transition into `states[j + 1]`,
+    /// version suffixes stripped.
+    pub(super) transition_locals: Vec<FxHashMap<String, SmtValue>>,
+    /// Entries of the segment models under their own names: the init and
+    /// query locals of the path's endpoints.
+    pub(super) endpoint_locals: FxHashMap<String, SmtValue>,
+}
+
+impl ConcretePath {
+    /// Longest path (in transitions) kept as per-step evidence; a longer
+    /// counterexample is reported without it rather than held in memory.
+    pub(super) const MAX_STEPS: usize = 4_096;
+
+    /// A zero-transition path through one state whose values the
+    /// neighbouring segments supply when joined.
+    pub(super) fn point(ts: &TransitionSystem) -> Self {
+        Self {
+            states: vec![vec![None; ts.state_vars().len()]],
+            ..Self::default()
+        }
+    }
+
+    /// Concatenate `next` onto `self` at their shared junction state (the
+    /// last state of `self`, the first of `next`); values one side is silent
+    /// on are taken from the other. `None` past [`Self::MAX_STEPS`].
+    pub(super) fn join(mut self, next: Self) -> Option<Self> {
+        if self.states.len() + next.states.len() > Self::MAX_STEPS + 2 {
+            return None;
+        }
+        let mut next_states = next.states.into_iter();
+        let junction = next_states.next()?;
+        let last = self.states.last_mut()?;
+        for (mine, theirs) in last.iter_mut().zip(junction) {
+            if mine.is_none() {
+                *mine = theirs;
+            }
+        }
+        self.states.extend(next_states);
+        self.transition_locals.extend(next.transition_locals);
+        for (name, value) in next.endpoint_locals {
+            self.endpoint_locals.entry(name).or_insert(value);
+        }
+        Some(self)
+    }
 }
 
 /// Records the 1-inductive state invariant a fixed-point exit certified.
@@ -142,11 +201,12 @@ pub(super) struct SafetyExplanation {
 pub(super) enum ReachResult {
     Reachable {
         steps: u64,
-        /// Model from SAT query (for trace extraction)
-        model: FxHashMap<String, SmtValue>,
         /// Refined target: the subset of the original target that is actually reachable.
         /// Used in recursive decomposition to pass verified intermediate states.
         refined_target: Option<ChcExpr>,
+        /// The concrete path the models witnessed (`None` when a segment had
+        /// no model, e.g. the trivial `from == to` case).
+        path: Option<ConcretePath>,
     },
     Unreachable,
     /// SMT solver returned Unknown; cannot determine reachability (#2654).
@@ -162,8 +222,8 @@ pub(super) enum ReachResult {
 pub(super) enum ExactQueryCacheEntry {
     Reachable {
         steps: u64,
-        model: FxHashMap<String, SmtValue>,
         refined_target: Option<ChcExpr>,
+        path: Option<ConcretePath>,
     },
     Unreachable,
 }
@@ -173,12 +233,12 @@ impl ExactQueryCacheEntry {
         match self {
             Self::Reachable {
                 steps,
-                model,
                 refined_target,
+                path,
             } => ReachResult::Reachable {
                 steps,
-                model,
                 refined_target,
+                path,
             },
             Self::Unreachable => ReachResult::Unreachable,
         }
@@ -188,12 +248,12 @@ impl ExactQueryCacheEntry {
         match result {
             ReachResult::Reachable {
                 steps,
-                model,
                 refined_target,
+                path,
             } => Some(Self::Reachable {
                 steps: *steps,
-                model: model.clone(),
                 refined_target: refined_target.clone(),
+                path: path.clone(),
             }),
             ReachResult::Unreachable => Some(Self::Unreachable),
             ReachResult::Unknown => None,
@@ -214,6 +274,12 @@ pub(crate) struct TpaSolver {
 
     /// Extracted transition system
     pub(super) transition_system: Option<TransitionSystem>,
+
+    /// Whether `transition_system` was extracted from `problem` (canonical
+    /// state `v{i}` = argument `i` of its predicate), so a concrete path is a
+    /// path of `problem`'s clauses. False for a caller-supplied system
+    /// (SingleLoop encodings).
+    pub(super) ts_from_problem: bool,
 
     /// Exact power abstractions: T^{=n} represents exactly 2^n steps
     pub(super) exact_powers: Vec<Option<ChcExpr>>,
@@ -251,11 +317,12 @@ impl Drop for TpaSolver {
 impl TpaSolver {
     /// Create a new TPA solver for the given problem.
     pub(crate) fn new(problem: ChcProblem, config: TpaConfig) -> Self {
-        let smt = problem.make_smt_context();
+        let smt = problem.make_search_smt_context();
         Self {
             problem,
             config,
             transition_system: None,
+            ts_from_problem: false,
             exact_powers: Vec::new(),
             less_than_powers: Vec::new(),
             exact_query_cache: Vec::new(),
@@ -272,6 +339,7 @@ impl TpaSolver {
     /// that cannot be re-derived from the original multi-predicate ChcProblem.
     pub(crate) fn with_transition_system(mut self, ts: TransitionSystem) -> Self {
         self.transition_system = Some(ts);
+        self.ts_from_problem = false;
         self
     }
 

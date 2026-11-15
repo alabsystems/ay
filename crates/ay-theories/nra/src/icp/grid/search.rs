@@ -57,7 +57,11 @@ impl NraSolver<'_> {
         bx: VarBox,
         budget: &mut usize,
     ) -> Option<UniResult> {
-        if search.exact.spent() {
+        // SAT-only search: a stopped check finds no model here. Its node
+        // budget bounds candidates, not time (QF_NRA meti-tarski
+        // `atan-vega-3` at `-T:2` was in this search until the watchdog's
+        // hard exit, sampled 452/787).
+        if search.exact.spent() || ay_core::resource::check_stop_requested() {
             return None;
         }
         if depth == search.order.len() {
@@ -91,7 +95,7 @@ impl NraSolver<'_> {
             probe.note_candidates(depth, &candidates, &interval);
         }
         for candidate in candidates {
-            if *budget == 0 {
+            if *budget == 0 || ay_core::resource::check_stop_requested() {
                 if let Some(probe) = search.probe {
                     probe.starved();
                 }

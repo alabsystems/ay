@@ -743,8 +743,8 @@ fn test_pdr_trace_unknown_has_conservative_fail_reason() {
     let dir = tempfile::tempdir().unwrap();
     let trace_path = dir.path().join("unknown_reason.jsonl");
 
-    // Use the safe problem with a pre-cancelled cancellation token so PDR
-    // returns Unknown immediately on the first main-loop check. This is
+    // Use the safe problem with a pre-cancelled cancellation token so PDR's
+    // original owner refuses the solve before any search. This is
     // more robust than tight budget limits, which can be defeated by the
     // startup invariant discovery pipeline on trivial problems.
     let problem = safe_problem();

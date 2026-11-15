@@ -6,6 +6,8 @@ use super::*;
 use ay_model_check::ArrayValue;
 use num_bigint::BigInt;
 
+mod nested_value_text;
+
 fn int(value: i64) -> ModelValue {
     ModelValue::Int(BigInt::from(value))
 }
@@ -128,9 +130,15 @@ fn direct_scalar_parser_enforces_cumulative_text_budget() {
 #[test]
 fn direct_scalar_parser_rejects_oversized_text() {
     let (executor, _) = array_field_parser_fixture();
+    let guard = RenderedDatatypeGuard::new(&executor);
     let oversized = "1".repeat(super::super::rendered_dt_limits::MAX_RENDERED_DT_BYTES + 1);
     assert!(executor
-        .typed_scalar_text(&oversized, &Sort::Int, &mut TypedArrayParseBudget::new())
+        .typed_field_value_text(
+            &oversized,
+            &Sort::Int,
+            &guard,
+            &mut TypedArrayParseBudget::new()
+        )
         .is_none());
 }
 

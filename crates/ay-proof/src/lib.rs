@@ -47,44 +47,89 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{quote_symbol, TermId, TermStore};
 pub use ay_core::{AletheRule, BvGateType, Proof, ProofId, ProofStep, TheoryLemmaKind};
+pub use bv_offset_bridge::derive_bv_offset_normalization;
 use std::fmt::Write;
 
+mod alethe_document_scan;
 mod alethe_parser;
 mod alethe_printer;
+mod application_heads;
 mod array_row_axiom;
 mod array_store_overwrite;
+mod authored_surfaces;
 mod bundle;
 pub mod bv_blast_export;
 pub mod bv_blast_lean;
 pub mod bv_blast_solver;
 pub mod bv_cnf_refutation;
+mod bv_offset_bridge;
 mod checker;
 mod congruence_derivation;
 mod congruence_forest;
 mod definition_bridge;
+mod exact_division_sweeps;
 mod la_generic_signs;
+mod non_adjacent_form;
+mod nra_sos_query;
 mod partial;
 mod quality;
+pub mod resolution_dag_memo;
+mod sat_sweep;
 mod scope;
 mod terminal_trust;
 mod variables;
 mod wire_rule;
 
+pub use alethe_document_scan::AletheDocumentScan;
 pub use alethe_parser::{
-    check_alethe_document, checkable_rule_names, AletheDefect, AletheDocumentChecker,
-    AletheDocumentReport, AletheSelfCheckWriter, Pos as AlethePos, ProblemScope,
+    check_alethe_document, check_alethe_document_in_dialect, checkable_rule_names, AletheDefect,
+    AletheDocumentChecker, AletheDocumentReport, AletheSelfCheckWriter, Pos as AlethePos,
+    ProblemScope,
 };
+pub use alethe_printer::dialect::{
+    capture_alethe_dialect_report, with_alethe_dialect, AletheDialect, AletheDialectReport,
+    CleanOnlySpelling,
+};
+pub use alethe_printer::refused_surface_hole::with_refused_surface_steps_declined_to_hole;
 pub use alethe_printer::{
+    arith_equality_chain_lowering_supported, carcara_declaration_gap, carcara_proof_surface,
     carcara_proof_surface_is_supported, certified_let_assume_bridge_is_supported,
-    checked_bv_bitblast_lowering_supported, effective_wire_term_overrides_for_proof,
-    split_alethe_application_bounded, trans_step_surface_is_supported, AlethePrintError,
-    AletheSurfaceParseError,
+    checked_array_read_lowering_supported, checked_bv_bitblast_lowering_supported,
+    checked_bv_bitblast_lowering_supported_asking,
+    checked_bv_bitblast_lowering_supported_within_solve, checked_euf_transitive_lowering_supported,
+    checked_ground_substitution_lowering_supported,
+    checked_guarded_row_expansion_lowering_supported,
+    checked_ite_branch_projection_lowering_supported, checked_shadowed_stores_lowering_supported,
+    checked_urem_bound_lowering_supported, dt_project_lowering_supported,
+    effective_wire_term_overrides_for_proof, lia_lattice_lowering_supported,
+    mul_overflow_division_lowering_supported, negation_shell_assume_surface_pairs,
+    nra_sos_lowering_supported, recognize_mul_overflow_division, split_alethe_application_bounded,
+    theory_lemma_bv_arithmetic_lowering_supported_within_solve, trans_step_surface_is_supported,
+    AlethePrintError, AletheSurfaceParseError, BvSupportDeclines, CarcaraSurface, CompleteBlastAsk,
 };
 pub use array_row_axiom::{mint_row1_axiom, plan_row1_axiom_instances};
 pub use array_store_overwrite::{mint_store_overwrite_axiom, plan_store_overwrite_instances};
+pub use authored_surfaces::{
+    effective_wire_term_overrides_for_authored_proof,
+    effective_wire_term_overrides_for_authored_proof_with_progress,
+    export_alethe_with_authored_surfaces, export_alethe_with_authored_surfaces_with_progress,
+    folded_authored_assume_bridge_is_supported,
+    folded_authored_assume_bridge_is_supported_with_progress,
+    nullary_definition_assume_bridge_is_supported, term_overrides_outside_confined_let_assumes,
+    try_export_alethe_with_authored_surfaces, try_export_alethe_with_authored_surfaces_until,
+    try_export_alethe_with_authored_surfaces_with_progress,
+    try_export_alethe_with_authored_surfaces_within_solve, AletheAuthoredSurfaces, AskingSolve,
+};
 pub use bundle::{
-    re_check_bundle_strict, render_term_canonical, BundleReCheck, SerializableProofBundle,
-    PROOF_BUNDLE_SCHEMA,
+    capture_strict_retained_bundle_with_resource_control, re_check_bundle_strict,
+    re_check_bundle_strict_with_cancellation, re_check_bundle_strict_with_resource_control,
+    re_check_retained_bundle_strict_with_resource_control,
+    read_retained_proof_bundle_with_resource_control,
+    read_retained_proof_bundle_with_resource_control_and_diagnostics, render_term_canonical,
+    BundleReCheck, RetainedProofBundle, RetainedProofCapture, RetainedProofTransportLimits,
+    RetainedReadDiagnostics, RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal,
+    RetainedReadStage, RetainedReadTerminal, SerializableProofBundle, PROOF_BUNDLE_SCHEMA,
+    RETAINED_PROOF_BUNDLE_SCHEMA,
 };
 pub use bv_blast_export::{
     export_bv_blast_proof, BitLemma, BitLemmaKind, BvBlastExportError, BvBlastProof,
@@ -102,6 +147,7 @@ pub use bv_cnf_refutation::surface_bv_cnf_refutation;
 pub use checker::assumed_is_authored_bool_ite_consequence;
 pub use checker::clause_mentions_floating_point;
 pub use checker::clause_mentions_string_or_regex;
+pub use checker::fp_ground_format_supported;
 pub use checker::recognize_arith_clause_tautology;
 pub use checker::recognize_arith_eq_implies_bound;
 pub use checker::recognize_arith_eq_triangle;
@@ -115,6 +161,7 @@ pub use checker::recognize_euf_transitive;
 pub use checker::recognize_ground_evaluate;
 pub use checker::recognize_ite_branch_projection;
 pub use checker::recognize_ite_same;
+pub use checker::recognize_native_bv_affine_identity;
 pub use checker::recognize_nra_interval_unsat;
 pub use checker::recognize_nra_univariate_unsat;
 pub use checker::recognize_order_ite_tautology;
@@ -133,8 +180,9 @@ pub use checker::FreshDefRegistry;
 pub use checker::{
     authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
     authenticate_uf_leaf_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
-    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
-    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    recognize_bool_tautology, recognize_bv_bitblast,
+    recognize_bv_bitblast_speculative_with_progress, recognize_bv_bitblast_with_progress,
+    recognize_bv_ground_evaluate, AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
     MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
     MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
@@ -159,6 +207,9 @@ pub use checker::{
     recognize_ground_equality_substitution, ExtDiffRegistry,
 };
 pub use checker::{
+    recognize_bv_offset_spines_with_progress, recognize_bv_reconstruct_with_progress,
+};
+pub use checker::{
     recognize_datatype_constructor_reconstruct, recognize_datatype_distinct,
     recognize_datatype_exhaustive, recognize_datatype_ground_conflict,
     recognize_datatype_selector_project, recognize_datatype_tester_eval,
@@ -168,7 +219,8 @@ pub use checker::{
 pub use checker::{recognize_euf_congruence_explanation, recognize_euf_polarity_congruence};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use checker::{
-    recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_rounding_mode_domain,
+    recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_ground_eval_with_progress,
+    recognize_fp_ground_eval_without_enumeration_with_progress, recognize_fp_rounding_mode_domain,
 };
 pub use checker::{recognize_set_card_chain_recurrence, recognize_subset_theory_lemma};
 pub use checker::{MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_WORK_PER_LEMMA};
@@ -177,7 +229,13 @@ pub use congruence_derivation::{
     CongruenceDerivation,
 };
 pub use definition_bridge::{plan_definitional_bridge, DefinitionBridge, MAX_BRIDGE_CANDIDATES};
+pub use exact_division_sweeps::{
+    without_exact_division, ExactDivisionSweepMemo, ExactDivisionSweepScope,
+};
 pub use la_generic_signs::*;
+pub use nra_sos_query::{
+    check_nra_sos_query_with_progress, CheckedNraSosQuery, NraSosQueryCheckError,
+};
 pub use partial::{check_proof_partial, check_proof_partial_with_progress, PartialProofCheck};
 pub use quality::{
     authenticate_premise_clauses_strict_with_context,
@@ -189,9 +247,10 @@ pub use quality::{
     check_proof_partial_with_quality, check_proof_partial_with_quality_and_progress,
     check_proof_strict, check_proof_strict_with_context,
     check_proof_strict_with_context_and_progress, check_proof_strict_with_datatypes,
-    check_proof_strict_with_datatypes_and_selectors, check_proof_strict_with_typed_context,
-    check_proof_strict_with_typed_context_and_progress, check_proof_with_quality,
-    validate_array_extensionality_provenance, AuthenticatedPremiseClauses,
+    check_proof_strict_with_datatypes_and_selectors, check_proof_strict_with_native_fp_context,
+    check_proof_strict_with_typed_context, check_proof_strict_with_typed_context_and_progress,
+    check_proof_with_quality, validate_array_extensionality_provenance,
+    AuthenticatedPremiseClauses, NativeFpProofContext, NativeFpSnapshotQuality,
     PremiseClausesWithDeferredGeneric, ProofQuality,
 };
 pub use scope::problem_scope_symbol_names;
@@ -200,9 +259,13 @@ pub use terminal_trust::{
 };
 pub use wire_rule::{
     arith_eq_implies_bound_lowering_supported, arith_eq_triangle_lowering_supported,
-    arith_poly_simp_lowering_supported, evaluate_step_lowering_supported,
-    exact_clause_surface_preserved, int_bounds_tautology_lowering_supported,
-    la_generic_farkas_lowering_supported, lia_divisibility_lowering_supported, promoted_wire_rule,
+    arith_poly_simp_lowering_supported, bv_eq_simplify_step_lowering_supported,
+    bv_offset_spines_step_lowering_supported, bv_reconstruct_step_lowering_supported,
+    evaluate_step_lowering_supported, exact_clause_surface_preserved,
+    int_bounds_tautology_lowering_supported, la_generic_farkas_lowering_supported,
+    lia_divisibility_lowering_supported, promoted_wire_rule,
+    theory_lemma_bv_arithmetic_lowering_supported,
+    theory_lemma_bv_arithmetic_lowering_supported_asking,
     theory_lemma_poly_simp_lowering_supported, ArithPolySimpPromotionBudget,
     MAX_ARITH_POLY_SIMP_PROMOTIONS_PER_PROOF,
 };
@@ -335,6 +398,7 @@ pub fn try_export_alethe(proof: &Proof, terms: &TermStore) -> Result<String, Ale
         let step_id = ProofId(idx as u32);
         output.push_str(&printer.format_step(step, step_id)?);
         output.push('\n');
+        printer.finish_exported_step(step_id);
     }
 
     Ok(output)
@@ -435,20 +499,41 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget(
     term_overrides: Option<&HashMap<TermId, String>>,
     work_budget: Option<u64>,
 ) -> Result<String, AlethePrintError> {
-    let mut output = Vec::new();
-    match try_export_alethe_with_problem_scope_overrides_and_budget_to(
-        &mut output,
+    try_export_alethe_with_authored_assume_shells(
         proof,
         terms,
         problem_assertions,
         term_overrides,
+        None,
         work_budget,
-    ) {
-        Ok(()) => Ok(String::from_utf8(output).expect("Alethe printer emits UTF-8")),
-        Err(AletheStreamError::Print(e)) => Err(e),
-        // Writing into a Vec<u8> is infallible.
-        Err(AletheStreamError::Io(e)) => unreachable!("Vec<u8> sink cannot fail: {e}"),
-    }
+    )
+}
+
+/// [`try_export_alethe_with_problem_scope_overrides_and_budget`] plus the
+/// authored `not`-shell spellings for `assume` leaves; see
+/// [`try_export_alethe_with_authored_surfaces_to`].
+///
+/// # Errors
+///
+/// As [`try_export_alethe_with_problem_scope_overrides_and_budget`], plus
+/// [`AlethePrintError::InvalidSurfaceStep`] when a promised authored spelling
+/// is not derivable from the printed term.
+pub fn try_export_alethe_with_authored_assume_shells(
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+    negation_shell_assumes: Option<&HashMap<TermId, String>>,
+    work_budget: Option<u64>,
+) -> Result<String, AlethePrintError> {
+    try_export_alethe_with_authored_surfaces(
+        proof,
+        terms,
+        problem_assertions,
+        term_overrides,
+        AletheAuthoredSurfaces::shells(negation_shell_assumes),
+        work_budget,
+    )
 }
 
 /// Error type for the streaming Alethe export ([`AletheStreamError::Io`] can
@@ -566,13 +651,142 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
     term_overrides: Option<&HashMap<TermId, String>>,
     work_budget: Option<u64>,
 ) -> Result<(), AletheStreamError> {
+    try_export_alethe_with_authored_surfaces_to(
+        out,
+        proof,
+        terms,
+        problem_assertions,
+        term_overrides,
+        AletheAuthoredSurfaces::default(),
+        work_budget,
+    )
+}
+
+/// [`try_export_alethe_with_problem_scope_overrides_and_budget_to`] plus the
+/// authored surfaces ([`AletheAuthoredSurfaces`]): the `not`-shell spellings
+/// for `assume` leaves (#assume-boundary) and the nullary `define-fun`
+/// premises.
+///
+/// `negation_shell_assumes` maps an assumed term to the EXACT text the problem
+/// file asserts for it, in the one case AY's term store cannot represent:
+/// `TermStore::mk_not` eliminates a double negation at construction, so
+/// `(assert (not (not phi)))` leaves only `phi` behind and the `assume` printed
+/// for it is AY's own rewriting rather than a premise of the query. The printer
+/// puts the authored text at the leaf and derives the canonical unit with stock
+/// `not_not` steps; it fails closed if the authored text is not exactly that
+/// shape over the term's own printed rendering.
+///
+/// # Errors
+///
+/// As [`try_export_alethe_with_problem_scope_overrides_and_budget_to`], plus
+/// [`AlethePrintError::InvalidSurfaceStep`] when a promised authored spelling
+/// is not derivable from the printed term.
+pub fn try_export_alethe_with_authored_surfaces_to<W: std::io::Write>(
+    out: &mut W,
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+    surfaces: AletheAuthoredSurfaces<'_>,
+    work_budget: Option<u64>,
+) -> Result<(), AletheStreamError> {
+    try_export_alethe_with_authored_surfaces_to_with_progress(
+        out,
+        proof,
+        terms,
+        problem_assertions,
+        term_overrides,
+        surfaces,
+        work_budget,
+        &mut || true,
+    )
+}
+
+/// Caller-controlled streaming export. The same irreversible observation is
+/// used before preparation, between steps, and before reporting success.
+/// On error the sink may contain a prefix; publish a temporary file only on
+/// success. The callback grants no proof authority and introduces no deadline.
+///
+/// # Errors
+/// As [`try_export_alethe_with_authored_surfaces_to`], plus caller refusal.
+pub fn try_export_alethe_with_authored_surfaces_to_with_progress<W: std::io::Write>(
+    out: &mut W,
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+    surfaces: AletheAuthoredSurfaces<'_>,
+    work_budget: Option<u64>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<(), AletheStreamError> {
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget)
+        .with_emission_progress(keep_going)
+        .with_authored_surfaces(surfaces);
+    export_alethe_with_printer_to(out, proof, terms, problem_assertions, &printer)
+}
+
+/// Stream through the configured printer, retaining its original progress owner.
+pub(crate) fn export_alethe_with_printer_to<W: std::io::Write>(
+    out: &mut W,
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    printer: &AlethePrinter<'_>,
+) -> Result<(), AletheStreamError> {
+    printer
+        .check_emission_progress(0)
+        .map_err(AletheStreamError::Print)?;
     validate_reachable_assumes_in_problem_scope(proof, problem_assertions)
         .map_err(AletheStreamError::Print)?;
-    let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget);
     printer
         .prepare_proof(proof)
         .map_err(AletheStreamError::Print)?;
 
+    let definitions = prepare_alethe_definitions(&printer, proof, terms, problem_assertions)?;
+    // The same obligation for APPLICATION heads and SORT names, which the
+    // definitions walk never sees (`application_heads.rs`): judged on the
+    // shipped bytes of each definition and step.
+    let foreign_symbols =
+        application_heads::unresolvable_proof_symbols(proof, terms, problem_assertions);
+    for definition in &definitions {
+        application_heads::decline_if_shipped(definition, &foreign_symbols)
+            .map_err(AletheStreamError::Print)?;
+    }
+    printer
+        .check_emission_progress(0)
+        .map_err(AletheStreamError::Print)?;
+    for definition in definitions {
+        writeln!(out, "{definition}").map_err(AletheStreamError::Io)?;
+    }
+    for (idx, step) in proof.steps.iter().enumerate() {
+        let step_id = ProofId(idx as u32);
+        printer
+            .check_emission_progress(step_id.0)
+            .map_err(AletheStreamError::Print)?;
+        let rendered = printer
+            .format_step(step, step_id)
+            .map_err(AletheStreamError::Print)?;
+        printer
+            .check_emission_progress(step_id.0.saturating_add(1))
+            .map_err(AletheStreamError::Print)?;
+        application_heads::decline_if_shipped(&rendered, &foreign_symbols)
+            .map_err(AletheStreamError::Print)?;
+        out.write_all(rendered.as_bytes())
+            .map_err(AletheStreamError::Io)?;
+        out.write_all(b"\n").map_err(AletheStreamError::Io)?;
+        printer.finish_exported_step(step_id);
+    }
+    printer
+        .check_emission_progress(u32::try_from(proof.steps.len()).unwrap_or(u32::MAX))
+        .map_err(AletheStreamError::Print)
+}
+
+fn prepare_alethe_definitions(
+    printer: &AlethePrinter<'_>,
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+) -> Result<Vec<String>, AletheStreamError> {
     // An Alethe PROOF document has no declaration command (see
     // `AlethePrintError::UndeclarableProofSymbols` for the carcara
     // measurement). Every symbol free in the proof but absent from the problem
@@ -641,29 +855,7 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
             &undeclarable,
         )));
     }
-    for definition in definitions {
-        writeln!(out, "{definition}").map_err(AletheStreamError::Io)?;
-    }
-
-    for (idx, step) in proof.steps.iter().enumerate() {
-        let step_id = ProofId(idx as u32);
-        let rendered = printer
-            .format_step(step, step_id)
-            .map_err(AletheStreamError::Print)?;
-        out.write_all(rendered.as_bytes())
-            .map_err(AletheStreamError::Io)?;
-        out.write_all(b"\n").map_err(AletheStreamError::Io)?;
-        // #A2b: bounded-overhead emission for the synthesized-default
-        // certificate — never delays or changes the verdict, which was
-        // printed before emission began.
-        if printer.work_budget_exhausted() {
-            return Err(AletheStreamError::Print(
-                printer.work_budget_error(step_id.0.saturating_add(1)),
-            ));
-        }
-    }
-
-    Ok(())
+    Ok(definitions)
 }
 
 include!("reachable_assume_validation.rs");

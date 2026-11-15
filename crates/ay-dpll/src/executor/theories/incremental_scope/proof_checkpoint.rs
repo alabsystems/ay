@@ -54,12 +54,12 @@ impl ProofCheckpointBudget {
     }
 
     #[cfg(test)]
-    pub(super) fn set_remaining(&mut self, bytes: usize) {
+    pub(in crate::executor) fn set_remaining(&mut self, bytes: usize) {
         self.remaining = bytes;
     }
 
     #[cfg(test)]
-    pub(super) fn remaining(&self) -> usize {
+    pub(in crate::executor) fn remaining(&self) -> usize {
         self.remaining
     }
 }

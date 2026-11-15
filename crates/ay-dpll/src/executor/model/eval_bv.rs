@@ -16,6 +16,21 @@ use super::{EvalValue, Executor, Model};
 
 impl Executor {
     pub(super) fn normalize_bv_value(value: BigInt, width: u32) -> BigInt {
+        if super::evaluation_copies::active() {
+            if value.sign() != num_bigint::Sign::Minus && value.bits() <= u64::from(width) {
+                return value;
+            }
+            // Power-of-two construction, subtraction and AND output can
+            // retain several width-sized buffers. Prepay before the shift;
+            // the original stopped attempt prevents this sentinel escaping.
+            let bytes = usize::try_from(u64::from(width).div_ceil(64))
+                .ok()
+                .and_then(|limbs| limbs.checked_add(1))
+                .and_then(|limbs| limbs.checked_mul(4 * std::mem::size_of::<u64>()));
+            if !bytes.is_some_and(|bytes| super::evaluation_copies::pay(bytes, bytes)) {
+                return BigInt::zero();
+            }
+        }
         // Euclidean residue mod 2^width, i.e. the unsigned `width`-bit value.
         // `value & (2^width - 1)` equals `((value % 2^width) + 2^width) % 2^width`
         // for EVERY BigInt: num-bigint's bitwise ops use two's-complement
@@ -79,6 +94,9 @@ impl Executor {
         if let Sort::BitVec(bv) = sort {
             if let Some(ref bv_model) = model.bv_model {
                 if let Some(val) = bv_model.values.get(&term_id) {
+                    if !super::evaluation_copies::integer(val) {
+                        return EvalValue::Unknown;
+                    }
                     return EvalValue::BitVec {
                         value: val.clone(),
                         width: bv.width,

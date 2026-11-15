@@ -172,14 +172,18 @@ impl LraSolver {
         proof
     }
 
-    pub(crate) fn queue_model_seeded_propagations(&mut self, debug: bool) {
+    /// Returns `true` when at least one probe ran: the probes pivot the
+    /// tableau and the restore (`dual_simplex`) rebuilds a BOUND-feasible
+    /// assignment, not the one the caller's disequality check validated —
+    /// the caller must re-check disequalities against the new assignment.
+    pub(crate) fn queue_model_seeded_propagations(&mut self, debug: bool) -> bool {
         if !self.last_simplex_feasible || !self.pending_propagations.is_empty() {
-            return;
+            return false;
         }
 
         let candidates = self.collect_model_seed_candidates();
         if candidates.is_empty() {
-            return;
+            return false;
         }
 
         let saved_pending_bound_refinements = std::mem::take(&mut self.pending_bound_refinements);
@@ -200,10 +204,15 @@ impl LraSolver {
         let saved_pending_fixed_term_equalities = self.pending_fixed_term_equalities.clone();
         let saved_pending_offset_equalities = self.pending_offset_equalities.clone();
         let saved_trivial_conflict = self.trivial_conflict.clone();
+        let saved_trivial_conflict_scope = self.trivial_conflict_scope;
         let saved_last_simplex_feasible = self.last_simplex_feasible;
         let saved_bounds_tightened_since_simplex = self.bounds_tightened_since_simplex;
         let saved_vars_tightened_since_simplex =
             std::mem::take(&mut self.vars_tightened_since_simplex);
+        // Seeded proving asserts/pops against a fresh tightened vec while
+        // the saved one is parked: the pre-scan completeness chain does
+        // not span it (records from either side are discarded at restore).
+        self.pre_scan_tightened_complete = false;
         let saved_dirty = self.dirty;
         let saved_last_compound_propagations_queued = self.last_compound_propagations_queued;
         let saved_last_compound_wake_dirty_hits = self.last_compound_wake_dirty_hits;
@@ -252,7 +261,7 @@ impl LraSolver {
                 // the inconsistency is resolved deliberately rather than by accident.
                 self.dirty = true;
                 self.bounds_tightened_since_simplex = true;
-                self.last_simplex_feasible = false;
+                self.set_last_simplex_feasible(false);
                 self.discard_lra_basis_region_candidate();
                 if self.warm.enabled {
                     self.heap_stale = true;
@@ -291,9 +300,11 @@ impl LraSolver {
         self.pending_fixed_term_equalities = saved_pending_fixed_term_equalities;
         self.pending_offset_equalities = saved_pending_offset_equalities;
         self.trivial_conflict = saved_trivial_conflict;
-        self.last_simplex_feasible = saved_last_simplex_feasible;
+        self.trivial_conflict_scope = saved_trivial_conflict_scope;
+        self.set_last_simplex_feasible(saved_last_simplex_feasible);
         self.bounds_tightened_since_simplex = saved_bounds_tightened_since_simplex;
         self.vars_tightened_since_simplex = saved_vars_tightened_since_simplex;
+        self.pre_scan_tightened_complete = false;
         self.dirty = saved_dirty;
         self.last_compound_propagations_queued = saved_last_compound_propagations_queued;
         self.last_compound_wake_dirty_hits = saved_last_compound_wake_dirty_hits;
@@ -317,5 +328,6 @@ impl LraSolver {
                 seeded
             );
         }
+        attempted_any
     }
 }

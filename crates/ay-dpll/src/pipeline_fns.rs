@@ -586,6 +586,18 @@ pub(crate) fn export_split_loop_eager_stats(
     last_statistics.set_int("dpll.eager.props_fed_back", stats.props_fed_back);
     last_statistics.set_int("dpll.eager.props_clause_added", stats.props_clause_added);
     last_statistics.set_int(
+        "dpll.eager.level0_lazy_explained",
+        stats.level0_lazy_explained,
+    );
+    last_statistics.set_int(
+        "dpll.eager.level0_lazy_unexplained",
+        stats.level0_lazy_unexplained,
+    );
+    last_statistics.set_int(
+        "dpll.eager.level0_lazy_certified",
+        stats.level0_lazy_certified,
+    );
+    last_statistics.set_int(
         "dpll.eager.state_unchanged_skips",
         stats.state_unchanged_skips,
     );
@@ -758,7 +770,7 @@ pub(crate) fn encode_model_equality(
     theory_opt: Option<&mut dyn ay_core::TheorySolver>,
     emit_arith_triangle: bool,
 ) {
-    let eq_atom = terms.mk_eq_coerce(eq_lhs, eq_rhs);
+    let eq_atom = model_equality_atom(terms, eq_lhs, eq_rhs);
     // For the dedup variant, triangle clauses are added only on the first
     // request for this eq atom; without a dedup set, always add them.
     let add_triangle_clauses = match added_model_eqs {
@@ -1010,8 +1022,9 @@ pub(crate) enum AddConflictClauseOutcome {
     Break(SolveResult),
 }
 
-/// Convert a verified incremental theory conflict into a SAT blocking clause,
-/// pre-minimizing it by removing level-0 (permanently assigned) literals (#8424).
+/// Convert a verified incremental theory conflict into a SAT blocking clause.
+/// Only logical identities may normalize it; tautological explanations refuse
+/// rather than becoming a strengthened clause or root-UNSAT shortcut.
 ///
 /// De-macro'd from `pipeline_add_incremental_conflict_clause!`. Returns
 /// [`AddConflictClauseOutcome`] instead of doing caller-loop control flow; the
@@ -1042,39 +1055,43 @@ pub(crate) fn add_incremental_conflict_clause(
             })
         })
         .collect();
-    if clause.is_empty() {
-        if !conflict_terms.is_empty() {
-            tracing::warn!(
-                tag = tag,
-                num_conflict_terms = conflict_terms.len(),
-                "{}",
-                unmapped_message
-            );
-            if set_unknown_on_error {
-                *last_unknown_reason = Some(UnknownReason::Incomplete);
-            }
-            *last_result = Some(SolveResult::Unknown);
-            return AddConflictClauseOutcome::Break(SolveResult::Unknown);
+    // Every cause must map, including a nonempty partial map. Omitting one
+    // cause strengthens the verified full lemma and invalidates its proof row.
+    if clause.len() != conflict_terms.len() {
+        tracing::warn!(
+            tag = tag,
+            num_conflict_terms = conflict_terms.len(),
+            mapped = clause.len(),
+            "{}",
+            unmapped_message
+        );
+        if set_unknown_on_error {
+            *last_unknown_reason = Some(UnknownReason::Incomplete);
         }
-        *last_result = Some(SolveResult::unsat());
-        return AddConflictClauseOutcome::Break(SolveResult::unsat());
+        *last_result = Some(SolveResult::Unknown);
+        return AddConflictClauseOutcome::Break(SolveResult::Unknown);
     }
-    // #8424: Pre-minimize conflict clauses in the ordinary solving lane.  In
-    // proof mode the theory annotation authenticates the complete blocking
-    // clause; removing level-0 literals would require a separate weakening
-    // premise that the indexed direct annotation cannot represent.
-    let _minimize_removed = if proof_enabled {
-        0
-    } else {
-        crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-            solver.var_level(var)
-        })
-    };
     if clause.is_empty() {
-        // All conflict literals were at level 0 — this is an UNSAT root conflict.
         *last_result = Some(SolveResult::unsat());
         return AddConflictClauseOutcome::Break(SolveResult::unsat());
     }
+    // An indexed proof row retains its complete signed literal inventory.
+    // Ordinary normalization may only deduplicate; root assignments are not
+    // independent authority to strengthen a theory lemma across scopes.
+    let policy = if proof_enabled {
+        crate::theory_inference::ConflictClausePolicy::PreserveLiterals
+    } else {
+        crate::theory_inference::ConflictClausePolicy::Deduplicate
+    };
+    if !matches!(
+        crate::theory_inference::minimize_conflict_clause(&mut clause, policy),
+        crate::theory_inference::ConflictClauseReduction::Clause { .. }
+    ) {
+        *last_unknown_reason = Some(UnknownReason::Incomplete);
+        *last_result = Some(SolveResult::Unknown);
+        return AddConflictClauseOutcome::Break(SolveResult::Unknown);
+    }
+    // A nonempty input cannot become empty by identity-only normalization.
     let before = solver.issued_original_clause_id_max();
     solver.add_clause(clause);
     AddConflictClauseOutcome::Added {
@@ -1196,6 +1213,16 @@ pub(crate) use original_clause_authority::{
     place_original_clause_authority_at_id, place_single_original_clause_authority,
 };
 
+/// The eager-persistent split-loop arm's counted rounds (P4a): decision slices
+/// and the search allowance they draw on, in place of its wall-clock windows.
+pub(crate) mod eager_persistent_rounds;
+
+/// The SAT-visible atom of a requested model equality, and the round-budget
+/// freshness test that reads it (#model-eq-encoded-atom).
+mod model_equality_atom;
+use model_equality_atom::model_equality_atom;
+pub(crate) use model_equality_atom::model_equality_request_is_new;
+
 #[cfg(test)]
 mod tests {
     use super::rebind_bound_axiom_farkas;
@@ -1233,3 +1260,7 @@ mod tests {
         .expect("rebound coefficients must certify the clause order");
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_conflict_semantics_tests.rs"]
+mod conflict_semantics_tests;

@@ -13,25 +13,47 @@ use num_rational::BigRational;
 use proptest::prelude::*;
 
 /// Directly check that an integer model satisfies an atom `x − y ⋈ c`.
+///
+/// A variable with no reading in the model does not satisfy the atom.
 fn int_atom_holds(atom: &DiffAtom<i64>, model: &[i64]) -> bool {
-    let x = model[atom.lhs];
+    let Some(&x) = model.get(atom.lhs) else {
+        return false;
+    };
     // var-vs-const: rhs is the implicit zero var, value 0 (model is shifted so).
-    let y = atom.rhs.map_or(0, |r| model[r]);
-    let d = x - y;
+    let y = match atom.rhs {
+        None => 0,
+        Some(r) => match model.get(r) {
+            Some(&v) => v,
+            None => return false,
+        },
+    };
+    // Exact in i128: the difference of two i64 values cannot overflow it.
+    let d = x as i128 - y as i128;
+    let c = atom.c as i128;
     match atom.op {
-        Op::Le => d <= atom.c,
-        Op::Lt => d < atom.c,
-        Op::Eq => d == atom.c,
-        Op::Ge => d >= atom.c,
-        Op::Gt => d > atom.c,
+        Op::Le => d <= c,
+        Op::Lt => d < c,
+        Op::Eq => d == c,
+        Op::Ge => d >= c,
+        Op::Gt => d > c,
     }
 }
 
 /// Directly check that a rational model satisfies an atom.
+///
+/// A variable with no reading in the model does not satisfy the atom.
 fn rat_atom_holds(atom: &DiffAtom<BigRational>, model: &[BigRational]) -> bool {
-    let x = &model[atom.lhs];
+    let Some(x) = model.get(atom.lhs) else {
+        return false;
+    };
     let zero = BigRational::from_integer(0.into());
-    let y = atom.rhs.map_or(&zero, |r| &model[r]);
+    let y = match atom.rhs {
+        None => &zero,
+        Some(r) => match model.get(r) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
     let d = x - y;
     match atom.op {
         Op::Le => d <= atom.c,
@@ -131,7 +153,9 @@ proptest! {
         cut in 1usize..15,
     ) {
         let cut = cut.min(atoms.len());
-        let prefix = &atoms[..cut];
+        let prefix = atoms
+            .get(..cut)
+            .ok_or_else(|| TestCaseError::fail("cut exceeds the atom count"))?;
         if let BuildResult::Unsat { .. } = solve_int_atoms(prefix) {
             prop_assert!(
                 matches!(solve_int_atoms(&atoms), BuildResult::Unsat { .. }),

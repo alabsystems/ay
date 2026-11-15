@@ -277,17 +277,23 @@ impl PdrSolver {
                         .clone()
                         .unwrap_or(ChcExpr::Bool(true)),
                 );
+                // A push from `level` to `level + 1` reads guards at check
+                // level `level + 1` (`push_guard_check_level`); under the lane
+                // the body frame is the delta frame `frame_hyp(level)` (S6).
                 query_parts.push(self.clause_guarded_constraint(
                     lemma.predicate,
                     clause_index,
                     head_args,
-                    level,
+                    Self::push_guard_check_level(level),
                 ));
 
                 for (body_pred, body_args) in &clause.body.predicates {
-                    let frame_constraint = self.frames[level]
-                        .get_predicate_constraint(*body_pred)
-                        .unwrap_or(ChcExpr::Bool(true));
+                    let frame_constraint = if self.spacer_core {
+                        self.frame_hyp(level, *body_pred)
+                    } else {
+                        self.frames[level].get_predicate_constraint(*body_pred)
+                    }
+                    .unwrap_or(ChcExpr::Bool(true));
                     let Some(frame_on_body) =
                         self.apply_to_args(*body_pred, &frame_constraint, body_args)
                     else {

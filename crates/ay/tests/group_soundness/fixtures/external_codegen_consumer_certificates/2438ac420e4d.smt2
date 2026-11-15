@@ -1,0 +1,8 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const x7 (_ BitVec 64))
+(declare-const imm12 (_ BitVec 12))
+(assert (not (= (concat (_ bv0 32) (bvadd ((_ extract 31 0) x7) (bvmul ((_ zero_extend 20) imm12) (_ bv4096 32)))) ((_ zero_extend 32) (bvadd ((_ extract 31 0) x7) (bvshl ((_ zero_extend 20) imm12) (_ bv12 32)))))))
+(check-sat)
+(exit)

@@ -15,13 +15,15 @@
 /// `--verify-proof` is rejected by the route gate before this adapter runs.
 ///
 /// A SYNTHESIZED DEFAULT is likewise dropped while the proof cycle is shed
-/// (`PROOF_CYCLE_SHED_ENABLED`: a plain solve, `--no-proof`, `--z3-mode`,
-/// competition mode). A shedding executor records no proof, so the artifact
-/// could never be rendered, and handing the config to `configure_proof_policy`
-/// would call `set_best_effort_produce_proofs` and silently re-arm the tracker
-/// for a sidecar nobody asked for. `build_proof_config` still synthesizes the
-/// default for every `.smt2` input because the CHC runner retargets it to
-/// `<input>.chccert`; only the SMT decision route sheds it.
+/// (`PROOF_CYCLE_SHED_ENABLED`: `--no-proof`, `--z3-mode`, competition mode —
+/// never a plain solve, which is proof-carrying by default). A shedding
+/// executor records no proof, so the artifact could never be rendered, and
+/// handing the config to `configure_proof_policy` would call
+/// `set_best_effort_produce_proofs` and silently re-arm the tracker for a
+/// sidecar the user explicitly declined. `build_proof_config` already
+/// suppresses the synthesized default for each of those flags, so this is a
+/// second, executor-facing latch on the same decision: it keeps the z3-exact
+/// posture honest even if the two predicates ever drift apart.
 ///
 /// Returns `None` when `proof_config` is `None`, verify-only temporary, or a
 /// synthesized default under shedding. Explicit proof configs are returned

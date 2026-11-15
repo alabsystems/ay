@@ -1,0 +1,19 @@
+pseudo-Boolean proof version 3.0
+% `pol 1 4 * 4 d` multiplies a 2^62 coefficient out of i64 and divides it back
+% in. The live checker promotes to i128 for the intermediate and returns an
+% i64-representable result; the proved kernel's NARROW domain refuses the
+% multiply, because the intermediate leaves the machine word.
+%
+% This used to pin the reason that names exactly that pairing --
+% `kernel-guard-refused-with-narrow-result`, a counted SKIP rather than a
+% divergence, since a derivation may legitimately leave i64 and come back. It
+% now pins the stronger fact: the bridge re-runs the refused step at the
+% kernel's unbounded instantiation, where the intermediate is exact, and
+% verifies the whole derivation. The distinction the old reason drew -- "dipped
+% out and came back" versus "wrapped" -- no longer has to be left undecided,
+% because the wide replay decides it (see the development design notes section 7.3).
+f 1;
+pol 1 4 * 4 d;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

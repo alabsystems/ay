@@ -1,3 +1,4 @@
+# STOCK EXCEPTION: Trust seal 9192 has no Linux std, gnu or musl (2026-09-28: E0463).
 FROM rust:1.95-bookworm
 
 # Install necessary build tools for compiling the solver and building GMP/MPFR for musl

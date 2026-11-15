@@ -90,7 +90,8 @@ impl Context {
         for (name, sort) in params {
             env.insert(name.clone(), self.terms.mk_var(name, sort.clone()));
         }
-        let body_term = self.elaborate_term(body, &env)?;
+        // z3 reads the parts of the body elaboration passes over too.
+        let body_term = self.with_skip_journal(body, |ctx| ctx.elaborate_term(body, &env))?;
         let actual = self.terms.sort(body_term);
         if actual == result_sort
             || (self.int_real_coercions() && actual == &Sort::Int && result_sort == &Sort::Real)
@@ -123,6 +124,11 @@ impl Context {
         let public_sort = self.elaborate_public_sort(sort)?;
         let sort = self.elaborate_sort(sort)?;
         let internal_name = self.ordinary_source_binding_internal_name(name);
+        if let Some(identity) = &internal_name {
+            // A private identity of a user declaration is uninterpreted
+            // whatever its spelling (`declared_functions.rs` in ay-core).
+            self.terms.register_declared_function(identity);
+        }
         let term_name = internal_name.as_deref().unwrap_or(name);
         let term = self.mk_declared_const_term(term_name, &sort, None);
         self.register_overloadable_symbol(
@@ -453,6 +459,11 @@ impl Context {
         }
 
         let internal_name = self.ordinary_source_binding_internal_name(name);
+        if let Some(identity) = &internal_name {
+            // A private identity of a user declaration is uninterpreted
+            // whatever its spelling (`declared_functions.rs` in ay-core).
+            self.terms.register_declared_function(identity);
+        }
 
         // If no arguments, it's a constant — apply the same eager single-
         // constructor datatype elimination as declare-const.

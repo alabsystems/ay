@@ -475,16 +475,18 @@ fn rem_uses_nearest_quotient_not_truncation() {
     assert_eq!(bits_of(&rem(&[three_val, two]).unwrap()), 0xbf80_0000);
 }
 
-/// A format the value type cannot hold must decline, not truncate.
+/// Wider storage does not admit formats outside the arithmetic envelope.
 #[test]
 fn out_of_envelope_formats_decline() {
-    let float128 = ModelValue::FloatingPoint {
+    let unsupported = ModelValue::FloatingPoint {
         sign: false,
         exponent: 0,
         significand: 0,
         exponent_bits: 15,
-        significand_bits: 113,
+        significand_bits: 130,
     };
-    assert!(Fp::from_value(&float128).is_err());
-    assert!(round_to_format(&real(1, 1), 15, 113, RoundingMode::Rne, false).is_err());
+    assert!(Fp::from_value(&unsupported).is_err());
+    for (eb, sb) in [(15, 130), (1, 128), (64, 112), (15, u32::MAX)] {
+        assert!(round_to_format(&real(1, 1), eb, sb, RoundingMode::Rne, false).is_err());
+    }
 }

@@ -11,7 +11,13 @@ use super::{
     AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError, ProofProducingLowerer,
     MAX_PROOF_PRODUCING_TERM_NODES,
 };
-use crate::{bv_blast_solver::export_bv_blast_proof_expr_with_limits, BvExpr, BvExprExportError};
+use crate::{
+    bv_blast_export::{BvBlastProof, BvBlastValidateError},
+    bv_blast_solver::{export_bv_blast_proof_expr_with_limits, BvExprProofLimits},
+    BvExpr, BvExprExportError,
+};
+
+mod counted_declines;
 
 /// Authenticate that the conjunction of `roots` is UNSAT in the supported
 /// quantifier-free Bool/BV fragment, exact recursively finite arrays, and the
@@ -23,8 +29,9 @@ use crate::{bv_blast_solver::export_bv_blast_proof_expr_with_limits, BvExpr, BvE
 /// step before returning an opaque capability. Internal bit-vector terms may
 /// be up to 128 bits subject to the finite proof-production envelope; the
 /// serialized/top-level `BvBlastProof` width contract remains unchanged.
-/// `caller_deadline`, when present, is clamped with this checker's fixed
-/// three-second ceiling.
+/// The lane's budget is COUNTED (see `producer_limits.rs`); `caller_deadline`,
+/// when present, and otherwise the producer's hang guard, only stop it. A
+/// stop — like any exhausted cap — is a capability DECLINE, never a veto.
 pub fn authenticate_bool_bv_unsat_query(
     terms: &TermStore,
     roots: &[TermId],
@@ -51,12 +58,15 @@ pub fn authenticate_bool_bv_unsat_query(
     let lowered = lower_authentication_roots(terms, roots, deadline)?;
     let conjunction = balanced_bool_expr(lowered.expressions, true, BvExpr::and)
         .map_err(|reason| BoolBvUnsatAuthenticationError::Refutation { reason })?;
-    let false_expr = BvExpr::const_val(0, 1);
-    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
-        .map_err(|error| match error {
-            BvExprExportError::NoRefutation if lowered.used_array_congruence => {
+    let proof =
+        export_refutation(&conjunction, &limits, deadline).map_err(|error| match error {
+            BvExprExportError::NoRefutation
+                if lowered.used_array_congruence || lowered.used_uninterpreted_leaves =>
+            {
                 BoolBvUnsatAuthenticationError::UnsupportedFragment {
-                    reason: "same-array read-congruence reduction is satisfiable".to_string(),
+                    reason:
+                        "array read abstraction is satisfiable; the exact query is inconclusive"
+                            .to_string(),
                 }
             }
             BvExprExportError::NoRefutation => BoolBvUnsatAuthenticationError::Satisfiable,
@@ -74,15 +84,13 @@ pub fn authenticate_bool_bv_unsat_query(
     let replay_limits = proof_replay_limits(&limits);
     proof
         .validate_with_limits(&replay_limits)
-        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
-            reason: error.to_string(),
-        })?;
+        .map_err(replay_failure)?;
 
     Ok(AuthenticatedBoolBvUnsatQuery {
         term_snapshot,
         roots: roots.into(),
         used_exact_finite_arrays: lowered.used_exact_finite_arrays,
-        used_uninterpreted_leaves: false,
+        used_uninterpreted_leaves: lowered.used_uninterpreted_leaves,
     })
 }
 
@@ -139,13 +147,14 @@ pub fn authenticate_uf_leaf_bool_bv_unsat_query(
             BoolBvUnsatAuthenticationError::UnsupportedFragment { reason }
         }
     })?;
+    #[cfg(test)]
+    lowerer.audit_census();
     let used_uninterpreted_leaves = lowerer.used_uninterpreted_leaves;
     let used_exact_finite_arrays = lowerer.used_exact_finite_arrays;
     let conjunction = balanced_bool_expr(expressions, true, BvExpr::and)
         .map_err(|reason| BoolBvUnsatAuthenticationError::Refutation { reason })?;
-    let false_expr = BvExpr::const_val(0, 1);
-    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
-        .map_err(|error| match error {
+    let proof =
+        export_refutation(&conjunction, &limits, deadline).map_err(|error| match error {
             BvExprExportError::NoRefutation if used_uninterpreted_leaves => {
                 BoolBvUnsatAuthenticationError::UnsupportedFragment {
                     reason: "the congruence-free uninterpreted-leaf abstraction is satisfiable, \
@@ -166,9 +175,7 @@ pub fn authenticate_uf_leaf_bool_bv_unsat_query(
     let replay_limits = proof_replay_limits(&limits);
     proof
         .validate_with_limits(&replay_limits)
-        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
-            reason: error.to_string(),
-        })?;
+        .map_err(replay_failure)?;
 
     Ok(AuthenticatedBoolBvUnsatQuery {
         term_snapshot,
@@ -260,13 +267,14 @@ pub fn authenticate_atom_leaf_bool_bv_unsat_query(
             BoolBvUnsatAuthenticationError::UnsupportedFragment { reason }
         }
     })?;
+    #[cfg(test)]
+    lowerer.audit_census();
     let used_uninterpreted_leaves = lowerer.used_uninterpreted_leaves;
     let used_exact_finite_arrays = lowerer.used_exact_finite_arrays;
     let conjunction = balanced_bool_expr(expressions, true, BvExpr::and)
         .map_err(|reason| BoolBvUnsatAuthenticationError::Refutation { reason })?;
-    let false_expr = BvExpr::const_val(0, 1);
-    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
-        .map_err(|error| match error {
+    let proof =
+        export_refutation(&conjunction, &limits, deadline).map_err(|error| match error {
             BvExprExportError::NoRefutation if used_uninterpreted_leaves => {
                 BoolBvUnsatAuthenticationError::UnsupportedFragment {
                     reason: "the congruence-free uninterpreted-leaf abstraction is satisfiable, \
@@ -287,9 +295,7 @@ pub fn authenticate_atom_leaf_bool_bv_unsat_query(
     let replay_limits = proof_replay_limits(&limits);
     proof
         .validate_with_limits(&replay_limits)
-        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
-            reason: error.to_string(),
-        })?;
+        .map_err(replay_failure)?;
 
     Ok(AuthenticatedBoolBvUnsatQuery {
         term_snapshot,
@@ -299,9 +305,61 @@ pub fn authenticate_atom_leaf_bool_bv_unsat_query(
     })
 }
 
+/// Export the lane's refutation of `conjunction` — or repeat the counted
+/// exhaustion this exact lowered query already reached under the same caps
+/// (`counted_declines.rs`).
+fn export_refutation(
+    conjunction: &BvExpr,
+    limits: &BvExprProofLimits,
+    deadline: Instant,
+) -> Result<BvBlastProof, BvExprExportError> {
+    let key = counted_declines::key(conjunction);
+    if let Some(exhausted) = counted_declines::remembered(key) {
+        return Err(exhausted);
+    }
+    counted_declines::note_export();
+    let exported =
+        export_bv_blast_proof_expr_with_limits(conjunction, &BvExpr::const_val(0, 1), limits);
+    // Every wall-clock check in the export compares the monotonic clock with
+    // this one `deadline`: an exhaustion that ended before it was a counted
+    // cap's, never the deadline's.
+    if let Err(exhausted @ BvExprExportError::ResourceLimit { .. }) = &exported {
+        if Instant::now() < deadline {
+            counted_declines::remember(key, exhausted);
+        }
+    }
+    exported
+}
+
+/// Classify a failed independent replay of the lane's OWN surfaced proof.
+///
+/// Only a replay that examined a step and rejected it is evidence that the
+/// claimed refutation is wrong ([`BoolBvUnsatAuthenticationError::Replay`], a
+/// veto). A replay that ran out of its counted caps, or was stopped by the
+/// caller's deadline or the hang guard, examined nothing it could object to:
+/// that is the lane running out of its own envelope, a DECLINE like every other
+/// exhausted bound here. (A three-second wall used to end replay under load
+/// and was read as a veto.)
+fn replay_failure(error: BvBlastValidateError) -> BoolBvUnsatAuthenticationError {
+    match error {
+        BvBlastValidateError::DeadlineExceeded
+        | BvBlastValidateError::Cancelled
+        | BvBlastValidateError::WorkOverflow
+        | BvBlastValidateError::ResourceLimit { .. } => {
+            BoolBvUnsatAuthenticationError::ResourceLimit {
+                reason: format!("replay: {error}"),
+            }
+        }
+        other => BoolBvUnsatAuthenticationError::Replay {
+            reason: other.to_string(),
+        },
+    }
+}
+
 struct LoweredAuthenticationRoots {
     expressions: Vec<BvExpr>,
     used_array_congruence: bool,
+    used_uninterpreted_leaves: bool,
     used_exact_finite_arrays: bool,
 }
 
@@ -312,10 +370,21 @@ fn lower_authentication_roots(
 ) -> Result<LoweredAuthenticationRoots, BoolBvUnsatAuthenticationError> {
     let mut lowerer = ProofProducingLowerer::new(terms, deadline);
     let pure_reason = match lowerer.lower_bool_terms(roots) {
-        Ok(expressions) => {
+        Ok(mut expressions) => {
+            let consistency = lowerer.take_sparse_read_consistency().map_err(|reason| {
+                if lowerer.resource_exhausted {
+                    BoolBvUnsatAuthenticationError::ResourceLimit { reason }
+                } else {
+                    BoolBvUnsatAuthenticationError::UnsupportedFragment { reason }
+                }
+            })?;
+            expressions.extend(consistency);
+            #[cfg(test)]
+            lowerer.audit_census();
             return Ok(LoweredAuthenticationRoots {
                 expressions,
                 used_array_congruence: false,
+                used_uninterpreted_leaves: lowerer.used_uninterpreted_leaves,
                 used_exact_finite_arrays: lowerer.used_exact_finite_arrays,
             });
         }
@@ -327,11 +396,16 @@ fn lower_authentication_roots(
 
     let mut reduction = ProofProducingLowerer::new(terms, deadline);
     match array_congruence::lower_same_array_read_disequalities(terms, roots, &mut reduction) {
-        Ok(Some(expressions)) => Ok(LoweredAuthenticationRoots {
-            expressions,
-            used_array_congruence: true,
-            used_exact_finite_arrays: reduction.used_exact_finite_arrays,
-        }),
+        Ok(Some(expressions)) => {
+            #[cfg(test)]
+            reduction.audit_census();
+            Ok(LoweredAuthenticationRoots {
+                expressions,
+                used_array_congruence: true,
+                used_uninterpreted_leaves: reduction.used_uninterpreted_leaves,
+                used_exact_finite_arrays: reduction.used_exact_finite_arrays,
+            })
+        }
         Ok(None) => Err(BoolBvUnsatAuthenticationError::UnsupportedFragment {
             reason: pure_reason,
         }),
@@ -343,3 +417,7 @@ fn lower_authentication_roots(
         }),
     }
 }
+
+#[cfg(test)]
+#[path = "authenticated_query/budget_tests.rs"]
+mod budget_tests;

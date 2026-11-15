@@ -7,7 +7,6 @@
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Constant, TermData};
 use ay_core::{Sort, TermId, TermStore};
-use ay_fp::RoundingMode;
 
 /// Result of checking for unsupported FP operations.
 pub(super) enum FpSupportStatus {
@@ -85,39 +84,31 @@ pub(super) fn is_to_fp_unsigned_supported(terms: &TermStore, args: &[TermId]) ->
     args.len() == 2 && matches!(terms.sort(args[1]), Sort::BitVec(_))
 }
 
-/// Whether `term` denotes a *concrete literal* IEEE rounding mode
-/// (`RNE`/`RNA`/`RTP`/`RTN`/`RTZ`, or their long spellings).
-///
-/// This mirrors exactly what `FpSolver::get_rounding_mode` accepts without
-/// falling back to its silent `default() == RNE` branch: a nullary
-/// application or a variable whose name resolves via `RoundingMode::from_name`.
-/// Anything else — a declared `RoundingMode` constant, an `ite` over modes,
-/// a let-bound mode — is *symbolic* and must NOT be assumed to be RNE.
-fn is_literal_rounding_mode(terms: &TermStore, term: TermId) -> bool {
-    match terms.get(term) {
-        TermData::App(sym, args) => {
-            args.is_empty() && RoundingMode::from_name(sym.name()).is_some()
-        }
-        TermData::Var(name, _) => RoundingMode::from_name(name).is_some(),
-        _ => false,
+/// Whether the bit-blaster encodes the rounding-mode term `term`: a literal
+/// mode, a declared constant (three bits of its own), or an `ite` over such
+/// terms (see `ay-theories/fp/src/rm.rs`). A rounding mode computed by a user
+/// function has no encoding.
+fn is_encoded_rounding_mode(terms: &TermStore, term: TermId) -> bool {
+    if !crate::executor::rm_domain::is_rm_sort(terms.sort(term)) {
+        return false;
     }
-}
-
-/// The rounding-mode operand of an FP application, if it takes one.
-///
-/// Every FP op that rounds reads its mode from `args[0]` (see the
-/// `get_rounding_mode(args[0])` call sites in `ay-theories/fp`:
-/// `decompose.rs` for fp.add/sub/mul/div/sqrt/fma/roundToIntegral,
-/// `conversion.rs` for 2-arg to_fp / to_fp_unsigned, `bitblast.rs` for
-/// fp.to_ubv / fp.to_sbv). The 1-arg (BV reinterpret) and 3-arg (fp
-/// constructor) `to_fp` forms carry no rounding mode.
-fn rounding_mode_operand(name: &str, args: &[TermId]) -> Option<TermId> {
-    match name {
-        "fp.add" | "fp.sub" | "fp.mul" | "fp.div" | "fp.sqrt" | "fp.fma" | "fp.roundToIntegral" => {
-            args.first().copied()
+    if ay_fp::rewriter::rounding_mode_literal(terms, term).is_some() {
+        return true;
+    }
+    match terms.get(term) {
+        TermData::Var(..) => true,
+        TermData::Ite(_, t, e) => {
+            is_encoded_rounding_mode(terms, *t) && is_encoded_rounding_mode(terms, *e)
         }
-        "to_fp" | "to_fp_unsigned" | "fp.to_ubv" | "fp.to_sbv" if args.len() == 2 => Some(args[0]),
-        _ => None,
+        TermData::App(sym, args) if args.is_empty() && terms.is_declared_function(sym.name()) => {
+            true
+        }
+        TermData::App(ay_core::Symbol::Named(name), args)
+            if name == "ite" && args.len() == 3 && !terms.is_declared_function(name) =>
+        {
+            is_encoded_rounding_mode(terms, args[1]) && is_encoded_rounding_mode(terms, args[2])
+        }
+        _ => false,
     }
 }
 
@@ -131,17 +122,6 @@ fn check_fp_app_support(
     args: &[TermId],
     has_to_real: &mut bool,
 ) -> Option<FpSupportStatus> {
-    // SOUNDNESS (symbolic RoundingMode): an FP rounding op whose mode operand
-    // is not a concrete literal mode would be silently rounded as RNE by
-    // `get_rounding_mode`, dropping constraints like `(= rm RTP)` and producing
-    // wrong sat/unsat verdicts in BOTH directions. Fail closed to Unknown rather
-    // than assume RNE. Literal modes (constant-folded or written directly) are
-    // unaffected. See the `fp_symbolic_rounding_mode_*` regression tests.
-    if let Some(rm_term) = rounding_mode_operand(name, args) {
-        if !is_literal_rounding_mode(terms, rm_term) {
-            return Some(FpSupportStatus::Unsupported);
-        }
-    }
     match name {
         "to_fp" if !is_to_fp_supported(terms, args) => Some(FpSupportStatus::Unsupported),
         "to_fp_unsigned" if !is_to_fp_unsigned_supported(terms, args) => {
@@ -177,18 +157,13 @@ pub(super) fn check_fp_support(terms: &TermStore, roots: &[TermId]) -> FpSupport
         if !visited.insert(term) {
             continue;
         }
-        // STRENGTHENED BACKSTOP (#P0.2 symbolic RoundingMode): ANY remaining
-        // non-literal RoundingMode-sorted term — not just a rounding-op
-        // operand — fails the solve closed. This subsumes the operand check
-        // below and closes the free-Tseitin-atom hole for leftover RM
-        // equality atoms (`(= rm1 rm2)` over RM-sorted terms is not an FP
-        // predicate, so it would otherwise become an unconstrained SAT
-        // variable — false-SAT #6189). The rm_expand enumeration eliminates
-        // every in-scope symbolic RM before this walk; whatever it could not
-        // eliminate (RM ites, RM-valued UF apps, >cap var counts) must return
-        // `unknown`, never a guess.
-        if matches!(terms.sort(term), Sort::Uninterpreted(name) if name == "RoundingMode")
-            && !is_literal_rounding_mode(terms, term)
+        // Symbolic rounding modes are encoded as three bits (declared
+        // constants and `ite`s over modes); their equalities are bit-blasted
+        // predicates, never free Tseitin atoms (false-SAT #6189). A mode the
+        // bit-blaster cannot encode fails the solve closed: `unknown`, never
+        // a guess.
+        if ay_fp::rewriter::is_rounding_mode_sort(terms.sort(term))
+            && !is_encoded_rounding_mode(terms, term)
         {
             return FpSupportStatus::Unsupported;
         }

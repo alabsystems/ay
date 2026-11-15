@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the wrapped watcher slack needs no unusual number in the formula at all.
+% Two legal `pol <id> <n> -` steps lower the right-hand sides to -9223372036854775806, which
+% makes both derived constraints trivially true; their true slack 2^63 wrapped to i64::MIN,
+% so each of them claimed to propagate all of its literals -- x1 from one and ~x1 from the
+% other -- and the level-zero trail conflicted. The formula is satisfiable (all three
+% variables true).
+f 2 ;
+pol 1 9223372036854775807 - ;
+pol 2 9223372036854775807 - ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 5 ;
+end pseudo-Boolean proof;

@@ -1,0 +1,7 @@
+(set-logic QF_BV)
+(declare-const vbase (_ BitVec 64))
+(declare-const frame (_ BitVec 64))
+(declare-const value (_ BitVec 16))
+(declare-const next_state (_ BitVec 16))
+(assert (and (and (or (bvuge (bvadd (_ bv24 64) frame) (bvadd (_ bv1 64) vbase)) (bvuge vbase (bvadd (bvadd (_ bv24 64) (_ bv2 64)) frame))) (bvugt (bvadd (bvadd (_ bv24 64) (_ bv2 64)) frame) (bvadd (_ bv24 64) frame))) (and (bvugt (bvadd (_ bv2 64) vbase) vbase) (not (= value (bvor ((_ zero_extend 8) (ite (= (bvadd (bvadd (_ bv24 64) (_ bv1 64)) frame) vbase) ((_ extract 15 8) next_state) (ite (= (bvadd (_ bv24 64) frame) vbase) ((_ extract 7 0) next_state) ((_ extract 7 0) value)))) (bvshl ((_ zero_extend 8) (ite (= (bvadd (bvadd (_ bv24 64) (_ bv1 64)) frame) (bvadd (_ bv1 64) vbase)) ((_ extract 15 8) next_state) (ite (= (bvadd (_ bv24 64) frame) (bvadd (_ bv1 64) vbase)) ((_ extract 7 0) next_state) ((_ extract 15 8) value)))) (_ bv8 16))))))))
+(check-sat)

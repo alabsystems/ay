@@ -1,0 +1,5 @@
+(declare-const _4 Int)
+(declare-const _5 Int)
+(declare-const _6 Bool)
+(declare-const |k#s1_0| Int)
+(assert (and (>= _4 0) (<= _4 3) (=> (>= _4 0) (= |k#s1_0| _4)) (=> (not (>= _4 0)) (= |k#s1_0| (+ _4 18446744073709551616))) (= _5 |k#s1_0|) (= _6 (< _5 4)) (>= _5 4)))

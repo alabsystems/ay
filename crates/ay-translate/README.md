@@ -197,7 +197,7 @@ Common replacement patterns:
 ## Local Verification
 
 ```bash
-cargo test -p ay-translate
-cargo test -p ay-translate --release
-cargo run -p ay-translate --example simple_translate
+targo --unverified test -p ay-translate
+targo --unverified test -p ay-translate --release
+targo --unverified run -p ay-translate --example simple_translate
 ```

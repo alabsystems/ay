@@ -75,8 +75,9 @@ use std::sync::Arc;
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 use crate::{
-    ChcDtConstructor, ChcDtSelector, ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseBody,
-    ClauseHead, HornClause, InvariantModel, PredicateId, PredicateInterpretation,
+    ChcDtConstructor, ChcDtConstructors, ChcDtSelector, ChcExpr, ChcOp, ChcProblem, ChcSort,
+    ChcVar, ClauseBody, ClauseHead, HornClause, InvariantModel, PredicateId,
+    PredicateInterpretation,
 };
 
 use super::{
@@ -214,7 +215,6 @@ impl FlattenCx<'_> {
 // ── Flattening metadata ────────────────────────────────────────────────────
 
 /// Information about how one DT predicate argument was flattened.
-#[allow(clippy::rc_buffer)]
 #[derive(Debug, Clone)]
 struct DtArgFlatInfo {
     /// Original predicate argument index.
@@ -222,7 +222,7 @@ struct DtArgFlatInfo {
     /// Original predicate argument sort.
     original_sort: ChcSort,
     /// Original constructors.
-    constructors: Arc<Vec<ChcDtConstructor>>,
+    constructors: ChcDtConstructors,
     /// Whether this DT has a single constructor (struct-like).
     single_ctor: bool,
     /// Synthetic original variable used when rebuilding invariant formulas.
@@ -307,7 +307,7 @@ impl DtFlattener {
 
 impl Transformer for DtFlattener {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
-        if !problem.has_datatype_sorts() {
+        if !problem.has_datatype_sorts() || problem.has_array_lambda() {
             return TransformationResult {
                 problem,
                 back_translator: Box::new(IdentityBackTranslator),
@@ -411,9 +411,8 @@ fn flatten_sort_with_stack(
     }
 }
 
-#[allow(clippy::rc_buffer)]
 fn flatten_single_ctor_sort(
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     dt_stack: &mut Vec<String>,
     max_depth: usize,
     disc: DiscKind,
@@ -431,9 +430,8 @@ fn flatten_single_ctor_sort(
     result
 }
 
-#[allow(clippy::rc_buffer)]
 fn flatten_multi_ctor_sort(
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     dt_stack: &mut Vec<String>,
     max_depth: usize,
     disc: DiscKind,
@@ -512,9 +510,8 @@ fn dt_flatten_sort_supported_with_stack(
 /// discriminant sort. Non-defaultable column sorts (opaque recursive
 /// backedges) keep the legacy `Int 0` filler in inactive constructor
 /// columns; the disc-guarded equality schema never compares those columns.
-#[allow(clippy::rc_buffer)]
 fn multi_ctor_layout_supported(
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     dt_stack: &mut Vec<String>,
     max_depth: usize,
     disc: DiscKind,
@@ -611,7 +608,7 @@ fn flatten_problem(problem: &ChcProblem, map: &mut DtFlatMap, verbose: bool) -> 
                 .collect();
             let sort = ChcSort::Datatype {
                 name: name.clone(),
-                constructors: Arc::new(constructors),
+                constructors: crate::ChcDtConstructors::new(constructors),
             };
             sort_flatten_hits_cap(&sort, &mut Vec::new(), max_depth)
         });
@@ -1662,10 +1659,10 @@ fn dt_slice_eq_with_stack(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::rc_buffer)]
+#[allow(clippy::too_many_arguments)]
 fn single_ctor_slice_eq(
     parent_sort: &ChcSort,
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     lhs: &[ChcExpr],
     rhs: &[ChcExpr],
     dt_stack: &mut Vec<String>,
@@ -1705,10 +1702,10 @@ fn single_ctor_slice_eq(
     ChcExpr::and_all(parts)
 }
 
-#[allow(clippy::too_many_arguments, clippy::rc_buffer)]
+#[allow(clippy::too_many_arguments)]
 fn multi_ctor_slice_eq(
     parent_sort: &ChcSort,
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     lhs: &[ChcExpr],
     rhs: &[ChcExpr],
     dt_stack: &mut Vec<String>,
@@ -2293,7 +2290,7 @@ fn dt_arg_info_matches_sort(info: &DtArgFlatInfo, sort: &ChcSort, disc: DiscKind
     let ChcSort::Datatype { constructors, .. } = sort else {
         return false;
     };
-    if info.constructors.as_ref() != constructors.as_ref() {
+    if info.constructors != *constructors {
         return false;
     }
     info.components
@@ -2503,9 +2500,8 @@ fn flattened_component_exprs_with_stack(
     }
 }
 
-#[allow(clippy::rc_buffer)]
 fn flattened_single_ctor_components(
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     value: ChcExpr,
     dt_stack: &mut Vec<String>,
     max_depth: usize,
@@ -2536,9 +2532,8 @@ fn flattened_single_ctor_components(
 /// Per-variant columns: the discriminant (tester ITE chain) followed by every
 /// variant's selector applications. Wrong-variant selector applications are
 /// exactly the theory's free accessor values — the column semantics.
-#[allow(clippy::rc_buffer)]
 fn flattened_multi_ctor_components(
-    constructors: &Arc<Vec<ChcDtConstructor>>,
+    constructors: &ChcDtConstructors,
     value: ChcExpr,
     dt_stack: &mut Vec<String>,
     max_depth: usize,

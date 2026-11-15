@@ -5,6 +5,10 @@
 use super::{wire_rule_name, TheoryLemmaKind};
 
 impl TheoryLemmaKind {
+    /// Capacity of the historical inline prime-field certificate variants.
+    /// Owning `ProofStep::FiniteFieldLinear` has resource-admitted row storage.
+    pub const MAX_FINITE_FIELD_LINEAR_ROWS: usize = 8;
+
     /// Get the Alethe rule name for this lemma kind.
     #[must_use]
     pub fn alethe_rule(&self) -> &'static str {
@@ -70,6 +74,7 @@ impl TheoryLemmaKind {
             Self::IntBoundLatticeGap => "int_bound_lattice_gap",
             Self::IntCutLatticeGap => "int_cut_lattice_gap",
             Self::IntGuardedSplitGap => "int_guarded_split_gap",
+            Self::IntCgCutChain => "int_cg_cut_chain",
             Self::ArithDisequalitySplit => "arith_disequality_split",
             Self::IteSame => "ite_same",
             Self::FpClassification { .. } => "fp_classification",
@@ -80,10 +85,18 @@ impl TheoryLemmaKind {
             Self::Generic => "trust",
             Self::RoundingModeDomain => "fp_rounding_mode_domain",
             Self::FpGroundEval => "fp_ground_eval",
+            Self::FiniteFieldExhaustive => "finite_field_exhaustive",
+            Self::FiniteFieldLinear(_) => "finite_field_linear",
+            Self::FiniteFieldLinearWide(_) => "finite_field_linear_wide",
+            Self::FiniteFieldQuadratic => "finite_field_quadratic",
+            Self::FiniteFieldUnivariate => "finite_field_univariate",
+            Self::FiniteFieldIdeal => "finite_field_ideal",
             Self::ArrayFiniteExtensionality => "array_finite_extensionality",
             Self::ArrayFiniteSelectExpansion => "array_finite_select_expansion",
             Self::QuantifierNegatedExistsDual => "quantifier_negated_exists_dual",
             Self::GroundEqualitySubstitution => "ground_equality_substitution",
+            Self::BvMulOverflowDivision => "bv_mul_overflow_division",
+            Self::BvUremBound => "bv_urem_bound",
         }
     }
 

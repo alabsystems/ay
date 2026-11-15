@@ -45,7 +45,10 @@ impl<'a> Parser<'a> {
             .map(|l| &l.token)
             .unwrap_or(&Token::Eof);
         if self.pos < self.tokens.len() {
-            self.pos += 1;
+            // Below `tokens.len()`, so the successor cannot overflow.
+            if let Some(next) = self.pos.checked_add(1) {
+                self.pos = next;
+            }
         }
         t
     }

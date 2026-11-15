@@ -82,7 +82,8 @@ fn test_simple_equivalence() {
 
     let mut decompose = Decompose::new(2);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 2];
-    let result = decompose.run(&watches, 2, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 2, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat, "Should not be UNSAT");
     assert!(
@@ -121,7 +122,8 @@ fn test_conflicting_scc() {
 
     let mut decompose = Decompose::new(2);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 2];
-    let result = decompose.run(&watches, 2, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 2, &vals, &frozen, &var_states, true);
 
     assert!(result.unsat, "Should detect UNSAT from conflicting SCC");
 }
@@ -139,7 +141,8 @@ fn test_no_equivalence() {
 
     let mut decompose = Decompose::new(2);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 2];
-    let result = decompose.run(&watches, 2, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 2, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     assert_eq!(result.substituted, 0, "Should find no equivalences");
@@ -160,7 +163,8 @@ fn test_transitive_chain_equivalence() {
 
     let mut decompose = Decompose::new(3);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 3];
-    let result = decompose.run(&watches, 3, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     // All should map to x0 (smallest variable).
@@ -185,7 +189,8 @@ fn test_frozen_variable_stays_representative() {
 
     let mut decompose = Decompose::new(2);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 2];
-    let result = decompose.run(&watches, 2, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 2, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     // x1 is frozen, so it should be the representative.
@@ -214,7 +219,8 @@ fn test_two_frozen_variables_in_scc_remain_self_represented() {
 
     let mut decompose = Decompose::new(3);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 3];
-    let result = decompose.run(&watches, 3, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let result = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     assert_eq!(
@@ -253,7 +259,8 @@ fn test_clause_rewriting() {
 
     let mut decompose = Decompose::new(3);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 3];
-    let scc_result = decompose.run(&watches, 3, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let scc_result = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
 
     assert!(!scc_result.unsat);
     assert!(scc_result.substituted > 0);
@@ -286,7 +293,8 @@ fn test_rewrite_removes_duplicates() {
 
     let mut decompose = Decompose::new(3);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 3];
-    let scc_result = decompose.run(&watches, 3, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let scc_result = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
 
     let vals = vec![0i8; 6];
     let rewrite_result = rewrite_clauses(&clauses, &scc_result.reprs, &vals);
@@ -340,7 +348,8 @@ fn test_tarjan_matches_naive_scc_on_random_binary_formulas() {
 
         let mut decompose = Decompose::new(NUM_VARS);
         let var_states = vec![crate::solver::lifecycle::VarState::Active; NUM_VARS];
-        let result = decompose.run(&watches, NUM_VARS, &vals, &frozen, &var_states, true);
+        let graph = BinaryGraph::new(&watches, &clauses);
+        let result = decompose.run(graph, NUM_VARS, &vals, &frozen, &var_states, true);
 
         assert_eq!(
             result.unsat, expected_unsat,
@@ -377,7 +386,8 @@ fn test_rewrite_proof_log_carries_clause_idx() {
     let frozen = vec![0u32; 3];
     let mut decompose = Decompose::new(3);
     let var_states = vec![crate::solver::lifecycle::VarState::Active; 3];
-    let scc = decompose.run(&watches, 3, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &clauses);
+    let scc = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
     assert!(!scc.unsat);
     assert!(scc.substituted > 0);
 

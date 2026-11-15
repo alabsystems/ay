@@ -9,6 +9,9 @@ use ay_sat::{Literal, SatResult, Solver};
 use num_bigint::BigInt;
 use proptest::prelude::*;
 
+mod blast_cut;
+mod division_carry;
+
 fn setup_store() -> TermStore {
     TermStore::new()
 }
@@ -150,6 +153,30 @@ fn test_batch_fresh_vars_allocates_contiguous_range() {
     assert_eq!(solver.num_vars(), 4);
 
     assert_eq!(solver.fresh_var(), 5);
+}
+
+/// Regression (b009): `batch_fresh_vars` accepts a range whose last variable
+/// is `i32::MAX` (it only refuses `next > i32::MAX + 1`), and
+/// `BvFreshVarRange::last` used to compute `first + count - 1` as
+/// `(first + count) - 1`, which overflowed `CnfLit` for exactly that range.
+#[test]
+fn batch_fresh_vars_range_ending_at_i32_max_has_a_last() -> Result<(), Box<dyn std::error::Error>> {
+    let store = setup_store();
+    let mut solver = BvSolver::new(&store);
+
+    let range = solver.batch_fresh_vars(i32::MAX as usize);
+
+    if range.first() != Some(1) {
+        return Err(format!("first() = {:?}, expected Some(1)", range.first()).into());
+    }
+    if range.last() != Some(i32::MAX) {
+        return Err(format!("last() = {:?}, expected Some(i32::MAX)", range.last()).into());
+    }
+    let iter_last = range.iter().last();
+    if iter_last != Some(i32::MAX) {
+        return Err(format!("iter().last() = {iter_last:?}, expected Some(i32::MAX)").into());
+    }
+    Ok(())
 }
 
 #[test]

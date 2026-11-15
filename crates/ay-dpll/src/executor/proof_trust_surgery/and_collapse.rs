@@ -118,7 +118,7 @@ impl Executor {
         };
         new_proof.add_resolution(Vec::new(), pos_term, neg_unit, pos_unit);
         if !matches!(
-            ay_proof::check_proof_strict(&new_proof, &self.ctx.terms),
+            self.check_proof_strict_until_stopped(&new_proof),
             Ok(quality) if quality.trust_count == 0
         ) || ay_proof::validate_reachable_assumes_in_problem_scope(&new_proof, &[authored_root])
             .is_err()
@@ -126,6 +126,187 @@ impl Executor {
             return false;
         }
         *proof = new_proof;
+        true
+    }
+
+    /// `(and .. false ..)` / `(and .. (not true) ..)`: the authored conjunction
+    /// carries a Boolean-constant conjunct that is false by itself. Extract it
+    /// with one `and_pos` and refute it with the premise-free `false` / `true`
+    /// axiom. The assumed premise is the exact raw re-intern of the parsed
+    /// conjunction, which the original-assertion capture pass has already
+    /// entered in both the rebuild and the raw-source ledgers; any other
+    /// premise is refused by the scope check below.
+    pub(super) fn rebuild_constant_false_and_collapse(
+        &mut self,
+        proof: &mut Proof,
+        operands: &[FrontendTerm],
+    ) -> bool {
+        let mut conjs = Vec::with_capacity(operands.len());
+        for op in operands {
+            let Some(t) = self.raw_intern_surface(op) else {
+                return false;
+            };
+            conjs.push(t);
+        }
+        let x = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("and"), conjs.clone(), Sort::Bool);
+        if !matches!(
+            self.ctx.terms.get(x),
+            TermData::App(Symbol::Named(op), a) if op == "and" && a.len() == conjs.len()
+        ) || !self.last_proof_raw_original_assertions.contains(&x)
+        {
+            return false;
+        }
+        let terms = &mut self.ctx.terms;
+        let false_term = terms.false_term();
+        let true_term = terms.true_term();
+        let Some(index) = conjs.iter().position(|&c| {
+            c == false_term || matches!(terms.get(c), TermData::Not(inner) if *inner == true_term)
+        }) else {
+            return false;
+        };
+        let Ok(position) = u32::try_from(index) else {
+            return false;
+        };
+        let constant = conjs[index];
+        let not_x = terms.mk_not_raw(x);
+        let mut new_proof = Proof::new();
+        let assume_id = new_proof.add_assume(x, None);
+        let extraction = new_proof.add_rule_step(
+            AletheRule::AndPos(position),
+            vec![not_x, constant],
+            Vec::new(),
+            vec![x],
+        );
+        let unit = new_proof.add_resolution(vec![constant], x, extraction, assume_id);
+        if constant == false_term {
+            let not_false = terms.mk_not_raw(false_term);
+            let axiom =
+                new_proof.add_rule_step(AletheRule::False, vec![not_false], Vec::new(), Vec::new());
+            new_proof.add_resolution(Vec::new(), false_term, unit, axiom);
+        } else {
+            let axiom =
+                new_proof.add_rule_step(AletheRule::True, vec![true_term], Vec::new(), Vec::new());
+            new_proof.add_resolution(Vec::new(), true_term, axiom, unit);
+        }
+        if !matches!(
+            self.check_proof_strict_until_stopped(&new_proof),
+            Ok(quality) if quality.trust_count == 0
+        ) || ay_proof::validate_reachable_assumes_in_problem_scope(&new_proof, &[x]).is_err()
+        {
+            return false;
+        }
+        *proof = new_proof;
+        self.record_rebuilt_authored_proof_premise(x);
+        true
+    }
+
+    /// An authored conjunction that elaboration folded to `false` because its
+    /// separately elaborated conjuncts contradict each other: project each
+    /// raw conjunct, transport it onto its elaborated form with checked
+    /// steps, and close on an elaborated `false` or a complementary pair.
+    pub(super) fn rebuild_transported_and_collapse(
+        &mut self,
+        proof: &mut Proof,
+        operands: &[FrontendTerm],
+    ) -> bool {
+        let mut conjs = Vec::with_capacity(operands.len());
+        for op in operands {
+            let Some(t) = self.raw_intern_surface(op) else {
+                return false;
+            };
+            conjs.push(t);
+        }
+        let x = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("and"), conjs.clone(), Sort::Bool);
+        if !matches!(
+            self.ctx.terms.get(x),
+            TermData::App(Symbol::Named(op), a) if op == "and" && a.len() == conjs.len()
+        ) || !self.last_proof_raw_original_assertions.contains(&x)
+        {
+            return false;
+        }
+        let true_term = self.ctx.terms.true_term();
+        let false_term = self.ctx.terms.false_term();
+        let not_x = self.ctx.terms.mk_not_raw(x);
+        let mut new_proof = Proof::new();
+        let assume_id = new_proof.add_assume(x, None);
+        let mut units: HashMap<TermId, ProofId> = HashMap::default();
+        let mut close: Option<(TermId, ProofId, ProofId)> = None;
+        for (index, (op, &raw)) in operands.iter().zip(conjs.iter()).enumerate() {
+            let Ok(position) = u32::try_from(index) else {
+                return false;
+            };
+            let Some(elaborated) = self
+                .ctx
+                .elaborate_surface_subterm(strip_frontend_annotations(op))
+            else {
+                return false;
+            };
+            if elaborated == true_term {
+                continue;
+            }
+            let extraction = new_proof.add_rule_step(
+                AletheRule::AndPos(position),
+                vec![not_x, raw],
+                Vec::new(),
+                vec![x],
+            );
+            let raw_unit = new_proof.add_resolution(vec![raw], x, extraction, assume_id);
+            let (fact, unit) = if elaborated == raw {
+                (raw, raw_unit)
+            } else {
+                let Some(plan) = self.plan_conjunct_transport(raw, elaborated) else {
+                    continue;
+                };
+                let unit =
+                    self.emit_conjunct_transport(&mut new_proof, raw_unit, raw, elaborated, &plan);
+                (elaborated, unit)
+            };
+            units.entry(fact).or_insert(unit);
+            if fact == false_term {
+                let not_false = self.ctx.terms.mk_not_raw(false_term);
+                let axiom = new_proof.add_rule_step(
+                    AletheRule::False,
+                    vec![not_false],
+                    Vec::new(),
+                    Vec::new(),
+                );
+                close = Some((false_term, axiom, unit));
+                break;
+            }
+            let complement = match self.ctx.terms.get(fact) {
+                TermData::Not(inner) => *inner,
+                _ => self.ctx.terms.mk_not_raw(fact),
+            };
+            if let Some(&other) = units.get(&complement) {
+                let (pivot, negative, positive) = match self.ctx.terms.get(fact) {
+                    TermData::Not(inner) => (*inner, unit, other),
+                    _ => (fact, other, unit),
+                };
+                close = Some((pivot, negative, positive));
+                break;
+            }
+        }
+        let Some((pivot, negative, positive)) = close else {
+            return false;
+        };
+        let transported: Vec<TermId> = units.keys().copied().collect();
+        new_proof.add_resolution(Vec::new(), pivot, negative, positive);
+        if !matches!(
+            self.check_proof_strict_until_stopped(&new_proof),
+            Ok(quality) if quality.trust_count == 0
+        ) || ay_proof::validate_reachable_assumes_in_problem_scope(&new_proof, &[x]).is_err()
+        {
+            return false;
+        }
+        *proof = new_proof;
+        self.record_rebuilt_authored_proof_premise(x);
+        self.drop_surface_overrides_below(&transported);
         true
     }
 

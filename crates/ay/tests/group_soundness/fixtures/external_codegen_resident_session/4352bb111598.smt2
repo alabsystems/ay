@@ -1,0 +1,7 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const ld_v90_o0 (_ BitVec 64))
+(declare-const ld_v90_o8 (_ BitVec 64))
+(assert (not (= (ite (not (= ld_v90_o0 ld_v90_o8)) ld_v90_o0 (_ bv255 64)) (ite (not (= ld_v90_o0 ld_v90_o8)) ld_v90_o0 (_ bv0 64)))))
+(check-sat)

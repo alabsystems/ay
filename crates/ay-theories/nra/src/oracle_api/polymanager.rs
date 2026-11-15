@@ -45,7 +45,10 @@ impl OModGcdDiag {
     /// input, a constant input, or a unit modular image.
     #[must_use]
     pub fn shortcuts(&self) -> u32 {
-        self.0.shortcut_zero + self.0.shortcut_const + self.0.shortcut_unit_image
+        self.0
+            .shortcut_zero
+            .saturating_add(self.0.shortcut_const)
+            .saturating_add(self.0.shortcut_unit_image)
     }
 
     /// Primes entered, and primes rejected before the recursion ran.

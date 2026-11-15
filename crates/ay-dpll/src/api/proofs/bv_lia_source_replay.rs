@@ -9,23 +9,21 @@ use ay_core::{TermId, TermStore};
 use super::TrustClauseDischargeControls;
 
 /// Prove either the standalone clause or its entailment from exact authored
-/// assertions with the independent bounded source interpreter. One deadline is
-/// shared by both attempts; every unsupported or exhausted query fails closed.
+/// assertions with the independent bounded source interpreter. Its bound is
+/// the interpreter's own counted work (`ay_proof`'s `MAX_WORK`), never a
+/// clock; the envelope's backstop, if any, is passed through as a stop.
+/// Every unsupported or exhausted query fails closed.
 pub(super) fn discharge_source_bv_lia(
     terms: &TermStore,
     clause: &[TermId],
     assertions: &[TermId],
     controls: &TrustClauseDischargeControls,
 ) -> bool {
-    if controls.stop_requested(terms) {
-        return false;
-    }
-    let deadline = controls.nested_deadline();
-    if !controls.term_store_clone_fits(terms, deadline) {
+    if !controls.clone_fits(terms) {
         return false;
     }
     let mut replay_terms = terms.clone();
-    if !controls.accept_until(&replay_terms, deadline) {
+    if controls.stop_requested(&replay_terms) || !controls.accept_fits(&replay_terms) {
         return false;
     }
     let mut negated = Vec::new();
@@ -33,20 +31,19 @@ pub(super) fn discharge_source_bv_lia(
         return false;
     }
     for &literal in clause {
-        if !controls.live_until(&replay_terms, deadline) {
+        if controls.stop_requested(&replay_terms) {
             return false;
         }
         negated.push(replay_terms.mk_not(literal));
     }
-    if !controls.accept_until(&replay_terms, deadline) {
+    if !controls.accept_fits(&replay_terms) {
         return false;
     }
-    if ay_proof::authenticate_bv_lia_unsat_query(&replay_terms, &negated, Some(deadline)).is_ok()
-        && controls.accept_until(&replay_terms, deadline)
+    if ay_proof::authenticate_bv_lia_unsat_query(&replay_terms, &negated, controls.backstop).is_ok()
     {
         return true;
     }
-    if !controls.accept_until(&replay_terms, deadline) {
+    if controls.stop_requested(&replay_terms) {
         return false;
     }
     let Some(root_count) = assertions.len().checked_add(negated.len()) else {
@@ -61,11 +58,7 @@ pub(super) fn discharge_source_bv_lia(
     }
     roots.extend_from_slice(assertions);
     roots.extend_from_slice(&negated);
-    if !controls.accept_until(&replay_terms, deadline) {
-        return false;
-    }
-    ay_proof::authenticate_bv_lia_unsat_query(&replay_terms, &roots, Some(deadline)).is_ok()
-        && controls.accept_until(&replay_terms, deadline)
+    ay_proof::authenticate_bv_lia_unsat_query(&replay_terms, &roots, controls.backstop).is_ok()
 }
 
 #[cfg(test)]
@@ -99,10 +92,13 @@ mod tests {
             &terms,
             &tautological_clause,
             &[],
-            &TrustClauseDischargeControls {
-                deadline: Some(expired),
-                ..TrustClauseDischargeControls::default()
-            },
+            &TrustClauseDischargeControls::new(
+                None,
+                Some(expired),
+                None,
+                None,
+                super::super::CertificationEffort::default(),
+            ),
         ));
 
         let source_limit = terms.true_memory_bytes();
@@ -119,10 +115,13 @@ mod tests {
             &terms,
             &tautological_clause,
             &[],
-            &TrustClauseDischargeControls {
-                term_memory_limit: Some(source_limit),
-                ..TrustClauseDischargeControls::default()
-            },
+            &TrustClauseDischargeControls::new(
+                None,
+                None,
+                None,
+                Some(source_limit),
+                super::super::CertificationEffort::default(),
+            ),
         ));
     }
 }

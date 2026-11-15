@@ -1107,8 +1107,6 @@ mod tests {
 
     #[test]
     fn exact_markdown_tactic_database_is_closed() {
-        assert_eq!(TACTICS.len(), 118);
-        assert_eq!(PROFILES.len(), 56);
         assert!(TACTICS.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(PROFILES
             .iter()

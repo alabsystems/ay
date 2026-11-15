@@ -104,14 +104,9 @@ static void test_enum(Z3_context c) {
         CHECK_U(Z3_get_arity(c, rd), 1, "Color recognizer arity");
         CHECK_U(Z3_get_sort_kind(c, Z3_get_range(c, rd)), Z3_BOOL_SORT,
                 "Color recognizer range Bool");
-        // Shared cross-check: both AY ("is-red") and libz3 ("is") begin "is".
-        CHECK_B(strncmp(rn, "is", 2) == 0, 1, "recognizer name begins is");
-#ifndef AY_TWIN_USE_Z3
-        // AY-only: exact canonical recognizer spelling.
-        char want[64];
-        snprintf(want, sizeof want, "is-%s", names[i]);
-        CHECK_STR(rn, want, "AY recognizer name is-<ctor>");
-#endif
+        // libz3 names every recognizer "is" (the constructor is its one
+        // func_decl parameter); AY matches.
+        CHECK_STR(rn, "is", "recognizer name is");
     }
 
     // The constructor/recognizer func_decls are REAL: build (is-red red) and

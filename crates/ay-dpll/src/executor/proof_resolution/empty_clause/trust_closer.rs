@@ -45,14 +45,31 @@ use super::*;
 // are jointly inconsistent", and on #4751 that claim is an INTEGER fact —
 // their negations are satisfiable over ℚ — which is why no Farkas
 // reconstruction ever rescued them.
-pub(super) fn add_head(terms: &TermStore, proof: &mut Proof, negated_clause: &[TermId]) -> ProofId {
+/// The head, and whether a CHECKER recognizer re-derived it.
+///
+/// #evidence-stage-3: the second cell is the caller's only way to tell a
+/// derived refutation from one closed on the solver's own say-so, and the
+/// caller is where the attribution is recorded. Returning it changes no
+/// artifact — the same step is added either way.
+pub(super) fn add_head(
+    terms: &TermStore,
+    proof: &mut Proof,
+    negated_clause: &[TermId],
+) -> (ProofId, bool) {
     if let Some(id) = add_validated_head(terms, proof, negated_clause) {
-        return id;
+        return (id, true);
     }
     // Genuine trust fallback: SAT proof reconstruction could not derive the
     // empty clause from existing steps and no theory schema covers the head,
     // so `Generic` is the honest label.
-    proof.add_theory_lemma_with_kind("trust", negated_clause.to_vec(), TheoryLemmaKind::Generic)
+    (
+        proof.add_theory_lemma_with_kind(
+            "trust",
+            negated_clause.to_vec(),
+            TheoryLemmaKind::Generic,
+        ),
+        false,
+    )
 }
 
 /// The VALIDATED half of [`add_head`]: the three payload-free recognizers and

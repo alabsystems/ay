@@ -11,21 +11,25 @@ readme.workspace = true
 ay-core.workspace = true
 ay-sat.workspace = true
 num-bigint.workspace = true
+num-integer.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 proptest.workspace = true
+# The z3 oracle policy of the FP differential audit (checker/fp_ground_adversarial_audit_tests).
+ay-test-support.workspace = true
 wait-timeout.workspace = true
 ay-lrat-check.workspace = true
 # Differential-fuzz ORACLES ONLY (tests/string_ground_diff_fuzz.rs). The
 # checker's ground string/regex evaluator must stay independent of the solver,
 # so this is a dev-dependency and must never become a real dependency.
 ay-strings.workspace = true
-# NAME-AUTHORITY LINT ONLY (checker/name_authority_tests.rs). The lint asserts
+# TESTS ONLY: the standard-and scope control uses the ordinary frontend.
+# The name-authority lint (checker/name_authority_tests.rs) asserts
 # that every operator spelling a strict validator matches on is a spelling
 # `ay-frontend` guarantees denotes the native theory operator. The checker must
 # stay independent of the frontend, so this is a dev-dependency and must never

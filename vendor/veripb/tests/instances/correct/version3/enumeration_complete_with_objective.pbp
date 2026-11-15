@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+% Positive-direction companion of `incorrect/enumeration_after_soli`: having an
+% objective, and logging a solution with a plain `sol`, must not trip the guard.
+% Only `soli`/`obji` store the objective-improving constraint that removes
+% solutions without counting them; `sol` removes nothing. Both projections onto
+% the preserved variable x1 are witnessed and counted, so the enumeration really
+% is complete.
+f 1;
+sol x1 ~x2;
+solx x1 ~x2;
+solx ~x1 x2;
+pol 2 3 +;
+output NONE;
+conclusion ENUMERATION_COMPLETE 2;
+end pseudo-Boolean proof;

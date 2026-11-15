@@ -75,7 +75,9 @@ impl KindSolver {
                 }
                 return self.finish_with_result_trace(0, KindResult::Unknown);
             }
-            let mut ctx = self.problem.make_smt_context();
+            // INV-S2: `init` UNSAT publishes `Safe(true)` directly.
+            let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+            let mut ctx = self.problem.make_search_smt_context();
             if ctx
                 .check_sat_with_timeout(&ts.init, init_timeout)
                 .is_unsat()
@@ -89,7 +91,7 @@ impl KindSolver {
 
         // Shared SMT context for incremental expression conversion.
         // Shared SMT context for expression conversion.
-        let mut smt = self.problem.make_smt_context();
+        let mut smt = self.problem.make_search_smt_context();
 
         // Initialize 3 incremental query contexts (Golem Kind.cc:57-59).
         let (mut base_ctx, mut fwd_ctx, mut bwd_ctx) = (
@@ -211,7 +213,9 @@ impl KindSolver {
                     }
                     fresh_exprs.push(ts.query_at(k));
                     let fresh_formula = ChcExpr::and_vec(fresh_exprs);
-                    let mut fresh_ctx = self.problem.make_smt_context();
+                    // Rung 4: kind's fresh re-checks stay off the session.
+                    let _fresh_pin = crate::smt::lane::ScopedVerificationMode::install();
+                    let mut fresh_ctx = self.problem.make_search_smt_context();
                     let retry_timeout = self.query_timeout_for_run(start_time);
                     let r = if retry_timeout.is_zero() {
                         crate::smt::SmtResult::Unknown
@@ -253,7 +257,10 @@ impl KindSolver {
                 }
                 fresh_exprs.push(ts.query_at(k));
                 let fresh_conjunction = ChcExpr::and_vec(fresh_exprs);
-                let mut fresh_ctx = self.problem.make_smt_context();
+                // Rung 4: the fresh cross-check of a base-case SAT stays off
+                // the session (INV-S2), independent of the incremental path.
+                let _fresh_pin = crate::smt::lane::ScopedVerificationMode::install();
+                let mut fresh_ctx = self.problem.make_search_smt_context();
                 let confirm_timeout = self.query_timeout_for_run(start_time);
                 if confirm_timeout.is_zero() {
                     if self.config.base.verbose {

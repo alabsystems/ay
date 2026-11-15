@@ -1,0 +1,19 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the propagator computed the slack `coeff_sum - degree` in the row's
+% OWN integer width. Both operands fit; their difference need not. For
+% `2 x1 >= -9223372036854775806` the true slack is 2^63, one past i64::MAX, which wrapped
+% to i64::MIN; every coefficient then compared as "greater than the slack", so a trivially
+% true row was reported to propagate ALL its literals unconditionally. Lines 2 and 3 below
+% are legitimately accepted (a trivial conclusion is a valid RUP conclusion) and put the
+% trail in conflict, after which line 4 RUPs the empty contradiction. The formula is the
+% ordinary satisfiable clause `x1 OR x2`, so the poison is entirely in the proof.
+%
+% Control: raise both degrees by one, to -9223372036854775805. The slack is then exactly
+% i64::MAX, no wrap occurs, and line 4 is rejected.
+f 1 ;
+rup 2 x1 >= -9223372036854775806 ;
+rup 2 ~x1 >= -9223372036854775806 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

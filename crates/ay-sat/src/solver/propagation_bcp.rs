@@ -14,6 +14,7 @@
 // overhead in the hottest loop of the solver.
 #![allow(clippy::needless_range_loop)]
 
+use super::counted_admission::propagation::{Admission, Uncounted};
 use super::*;
 use crate::solver::propagation::bcp_mode;
 use crate::solver::solver_stats::BCP_LEARNED_1963_BLOCKER_CERT_MIN_REPEATS;
@@ -42,11 +43,17 @@ use ay_prefetch::val_at;
 /// registers across consecutive fast-path iterations, eliminating pointer
 /// reloads per watcher (#3758, #8243).
 ///
-/// All slice accesses use `ay_prefetch::entry_at`/`entry_set`/`val_at`
-/// which bypass bounds checks in release builds. The invariants:
+/// Every slice access is a checked `get`/`get_mut` whose failure is stated
+/// here, so the function is panic-free for all inputs of its own signature
+/// (the Level-0 bar) at the cost of the bounds check the old checked
+/// accessors already paid. The invariants the callers maintain:
 /// - `i < entries.len()` from the loop condition
-/// - `j <= i` from the compaction invariant (j only increments on fast path)
-/// - `blocker_raw < vals.len()` from the literal encoding invariant
+/// - `j <= i` from the compaction invariant (j only increments on fast path);
+///   a caller that breaks it gets a scan that ends at `(i, j, None)`, which
+///   drops no watcher (truncating to an out-of-range `j` keeps every entry)
+/// - `blocker_raw < vals.len()` from the literal encoding invariant; a blocker
+///   outside `vals` reads as unassigned (a blocker MISS), so the slow path
+///   re-examines the clause instead of trusting a satisfied blocker
 ///
 /// Val prefetch (#8465): on large instances (50K+ vars), vals[] spans
 /// ~100KB+. Each blocker indexes randomly into it. Prefetch the NEXT
@@ -61,27 +68,34 @@ fn bcp_scan_blocker_fast_path(
     mut i: usize,
     mut j: usize,
 ) -> (usize, usize, Option<(u32, u64, i8)>) {
-    let watch_len = entries.len();
-
-    while i < watch_len {
-        let entry = ay_prefetch::entry_at(entries, i);
+    while let Some(&entry) = entries.get(i) {
         // Unconditional speculative copy of the full entry (blocker + clause
         // ref) to the compaction position. Slow-path keep paths (binary
         // propagation, binary conflict, unit propagation, conflict-break)
         // increment j without calling set_entry, so the data at position j
-        // must already be correct (#8491).
-        ay_prefetch::entry_set(entries, j, entry);
+        // must already be correct (#8491). `j <= i < entries.len()`, so the
+        // slot exists; a caller that broke the invariant ends the scan.
+        let Some(slot) = entries.get_mut(j) else {
+            break;
+        };
+        *slot = entry;
+        // `i < entries.len()` and `j < entries.len()`, so neither increment
+        // can overflow; the checked forms state it for the verifier.
+        let (Some(next_i), Some(next_j)) = (i.checked_add(1), j.checked_add(1)) else {
+            break;
+        };
         // Prefetch next blocker's val while we process this one.
-        if i + 1 < watch_len {
-            let next_entry = ay_prefetch::entry_at(entries, i + 1);
+        if let Some(&next_entry) = entries.get(next_i) {
             ay_prefetch::prefetch_val_l1(vals, watched::entry_blocker_raw(next_entry) as usize);
         }
         let blocker_raw = watched::entry_blocker_raw(entry);
-        let blocker_val = val_at(vals, blocker_raw as usize);
-        i += 1;
+        // Out-of-range blocker (a broken literal encoding) reads as
+        // unassigned: a blocker miss, never a satisfied fast-path keep.
+        let blocker_val = vals.get(blocker_raw as usize).copied().unwrap_or(0);
+        i = next_i;
         if blocker_val > 0 {
             // Satisfied: full entry already copied above.
-            j += 1;
+            j = next_j;
             continue;
         }
         // Blocker miss: the clause ref is in the SAME entry already loaded —
@@ -113,28 +127,32 @@ fn bcp_scan_blocker_fast_path_domain(
     mut i: usize,
     mut j: usize,
 ) -> (usize, usize, u64, Option<(u32, u64, i8)>) {
-    let watch_len = entries.len();
     let mut skips: u64 = 0;
-    while i < watch_len {
-        let entry = ay_prefetch::entry_at(entries, i);
-        ay_prefetch::entry_set(entries, j, entry);
-        if i + 1 < watch_len {
-            let next_entry = ay_prefetch::entry_at(entries, i + 1);
+    // Same checked accesses and invariants as `bcp_scan_blocker_fast_path`.
+    while let Some(&entry) = entries.get(i) {
+        let Some(slot) = entries.get_mut(j) else {
+            break;
+        };
+        *slot = entry;
+        let (Some(next_i), Some(next_j)) = (i.checked_add(1), j.checked_add(1)) else {
+            break;
+        };
+        if let Some(&next_entry) = entries.get(next_i) {
             ay_prefetch::prefetch_val_l1(vals, watched::entry_blocker_raw(next_entry) as usize);
         }
         let blocker_raw = watched::entry_blocker_raw(entry);
-        let blocker_val = val_at(vals, blocker_raw as usize);
-        i += 1;
+        let blocker_val = vals.get(blocker_raw as usize).copied().unwrap_or(0);
+        i = next_i;
         if blocker_val > 0 {
             // Satisfied blocker: kept, full entry already copied.
-            j += 1;
+            j = next_j;
             continue;
         }
         // Fused #8475 domain skip: an UNASSIGNED out-of-domain blocker cannot be
         // falsified by the restricted query — keep the watcher, stay in-loop.
         if blocker_val == 0 && !domain_has_lit(domain, blocker_raw) {
-            skips += 1;
-            j += 1;
+            skips = skips.saturating_add(1);
+            j = next_j;
             continue;
         }
         return (i, j, skips, Some((blocker_raw, entry, blocker_val)));
@@ -150,12 +168,11 @@ fn bcp_scan_blocker_fast_path_domain(
 /// the blocker (`blit`) in these satisfied paths.
 #[inline(always)]
 fn bcp_set_kept_blocker(deferred: &mut WatchList, index: usize, entry: u64, blocker_raw: u32) {
-    let entries = deferred.entries_mut();
-    ay_prefetch::entry_set(
-        entries,
-        index,
-        watched::entry_with_blocker(entry, blocker_raw),
-    );
+    // `index` is the compaction slot `j < i <= entries.len()` the entry was
+    // already copied to; there is no slot to update outside the list.
+    if let Some(slot) = deferred.entries_mut().get_mut(index) {
+        *slot = watched::entry_with_blocker(entry, blocker_raw);
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +238,16 @@ impl Solver {
     ///          if Some(cref), conflicting clause identified, qhead frozen
     #[inline]
     pub(super) fn propagate_bcp<const MODE: u8>(&mut self) -> Option<ClauseRef> {
+        match self.propagate_bcp_admitted::<MODE, _>(&Uncounted) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn propagate_bcp_admitted<const MODE: u8, A: Admission>(
+        &mut self,
+        admission: &A,
+    ) -> Result<Option<ClauseRef>, A::Error> {
         let advance_saved_pos =
             MODE == bcp_mode::SEARCH && self.cold.bcp_advance_saved_pos_after_unassigned_move;
         let defer_saved_pos_extraction =
@@ -249,37 +276,37 @@ impl Solver {
                     defer_saved_pos_extraction,
                 ) {
                     (true, true, true, true) => self
-                        .propagate_bcp_impl::<MODE, true, true, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, true, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, true, true, false) => self
-                        .propagate_bcp_impl::<MODE, true, true, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, true, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, true, false, true) => self
-                        .propagate_bcp_impl::<MODE, true, false, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, false, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, true, false, false) => self
-                        .propagate_bcp_impl::<MODE, true, false, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, false, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, false, true, true) => self
-                        .propagate_bcp_impl::<MODE, false, true, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, true, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, false, true, false) => self
-                        .propagate_bcp_impl::<MODE, false, true, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, true, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, false, false, true) => self
-                        .propagate_bcp_impl::<MODE, false, false, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, false, true, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (true, false, false, false) => self
-                        .propagate_bcp_impl::<MODE, false, false, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, false, false, true, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, true, true, true) => self
-                        .propagate_bcp_impl::<MODE, true, true, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, true, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, true, true, false) => self
-                        .propagate_bcp_impl::<MODE, true, true, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, true, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, true, false, true) => self
-                        .propagate_bcp_impl::<MODE, true, false, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, false, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, true, false, false) => self
-                        .propagate_bcp_impl::<MODE, true, false, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, true, false, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, false, true, true) => self
-                        .propagate_bcp_impl::<MODE, false, true, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, true, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, false, true, false) => self
-                        .propagate_bcp_impl::<MODE, false, true, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, true, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, false, false, true) => self
-                        .propagate_bcp_impl::<MODE, false, false, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, false, true, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                     (false, false, false, false) => self
-                        .propagate_bcp_impl::<MODE, false, false, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip>(),
+                        .propagate_bcp_impl::<MODE, false, false, false, false, $reset_learned_1963_false_saved_pos, $relocate_learned_1963_true_tail, $learned_1963_fsw_gent_skip, A>(admission),
                 }
             };
         }
@@ -384,9 +411,11 @@ impl Solver {
         const RESET_LEARNED_1963_FALSE_SAVED_POS: bool,
         const RELOCATE_LEARNED_1963_TRUE_TAIL: bool,
         const LEARNED_1963_FSW_GENT_SKIP: bool,
+        A: Admission,
     >(
         &mut self,
-    ) -> Option<ClauseRef> {
+        admission: &A,
+    ) -> Result<Option<ClauseRef>, A::Error> {
         debug_assert!(
             !self.has_empty_clause,
             "BUG: propagate_bcp called with has_empty_clause=true"
@@ -444,6 +473,14 @@ impl Solver {
             self.trail.len(),
         );
         while self.qhead < self.trail.len() {
+            if let Err(stopped) = admission.before_watch(self) {
+                self.num_propagations += (self.qhead - qhead_start) as u64;
+                if MODE == bcp_mode::SEARCH {
+                    self.num_search_propagations += (self.qhead - qhead_start) as u64;
+                }
+                self.flush_bcp_ticks::<MODE>(ticks);
+                return Err(stopped);
+            }
             let p = self.trail[self.qhead];
             self.qhead += 1;
             if MODE == bcp_mode::PROBE {
@@ -487,7 +524,9 @@ impl Solver {
                     if MODE == bcp_mode::SEARCH {
                         self.num_search_propagations += (self.qhead - qhead_start) as u64;
                     }
-                    return Some(self.binary_conflict_finalize(conflict_ref, qhead_start));
+                    return Ok(Some(
+                        self.binary_conflict_finalize(conflict_ref, qhead_start),
+                    ));
                 }
                 if binary_count == watch_len {
                     continue;
@@ -1725,7 +1764,7 @@ impl Solver {
                     if MODE == bcp_mode::SEARCH {
                         self.num_search_propagations += (self.qhead - qhead_start) as u64;
                     }
-                    return Some(self.conflict_finalize(
+                    return Ok(Some(self.conflict_finalize(
                         false_lit,
                         clause_ref,
                         j + 1,
@@ -1733,7 +1772,7 @@ impl Solver {
                         watch_len,
                         qhead_start,
                         bc,
-                    ));
+                    )));
                 }
 
                 // Unit propagation
@@ -1844,7 +1883,9 @@ impl Solver {
                 if MODE == bcp_mode::SEARCH {
                     self.num_search_propagations += (self.qhead - qhead_start) as u64;
                 }
-                return Some(self.binary_conflict_finalize(conflict_ref, qhead_start));
+                return Ok(Some(
+                    self.binary_conflict_finalize(conflict_ref, qhead_start),
+                ));
             }
         }
 
@@ -1863,7 +1904,7 @@ impl Solver {
             self.qhead,
             self.trail.len(),
         );
-        None
+        Ok(None)
     }
 
     /// Flush accumulated BCP ticks to the per-technique counter.
@@ -1874,13 +1915,14 @@ impl Solver {
     pub(super) fn flush_bcp_ticks<const MODE: u8>(&mut self, ticks: u64) {
         match MODE {
             bcp_mode::SEARCH => {
-                self.search_ticks[usize::from(self.stable_mode)] += ticks;
+                let slot = &mut self.search_ticks[usize::from(self.stable_mode)];
+                *slot = slot.saturating_add(ticks);
             }
             bcp_mode::PROBE => {
-                self.cold.probe_ticks += ticks;
+                self.cold.probe_ticks = self.cold.probe_ticks.saturating_add(ticks);
             }
             bcp_mode::VIVIFY => {
-                self.cold.vivify_ticks += ticks;
+                self.cold.vivify_ticks = self.cold.vivify_ticks.saturating_add(ticks);
             }
             _ => {}
         }
@@ -1947,6 +1989,9 @@ impl Solver {
                 // Emit HBR clause to proof stream (#4966). HBR clauses
                 // are derived via resolution from the original clause and
                 // binary implication chains — they ARE RUP-derivable.
+                // `--sat-veripb-hints`: the chains are on the trail; walk
+                // them from the clause being propagated (veripb_ready.rs).
+                self.veripb_ready_from_reason(&[dom_neg, unit], ClauseRef(off as u32));
                 let _ =
                     self.proof_emit_add_prechecked(&[dom_neg, unit], &[], ProofAddKind::Derived);
                 let hbr_idx = self.add_clause_db_checked(
@@ -2051,7 +2096,10 @@ impl Solver {
         conflict_ref: ClauseRef,
         qhead_start: usize,
     ) -> ClauseRef {
-        self.num_propagations += (self.qhead - qhead_start) as u64;
+        // Statistic: the trail only grows during BCP, so `qhead >= qhead_start`.
+        self.num_propagations = self
+            .num_propagations
+            .saturating_add(self.qhead.saturating_sub(qhead_start) as u64);
         // Reason marks maintained incrementally by enqueue_bcp (#8100).
         self.no_conflict_until = if self.decision_level == 0 {
             0
@@ -2062,7 +2110,8 @@ impl Solver {
         self.last_conflict_clause_ref = Some(conflict_ref);
         self.last_conflict_clause_id = clause_id;
         let trace_clause_id = if clause_id == 0 {
-            u64::from(conflict_ref.0) + 1
+            // A u32 offset plus one never reaches u64::MAX: exact.
+            u64::from(conflict_ref.0).saturating_add(1)
         } else {
             clause_id
         };
@@ -2091,7 +2140,9 @@ impl Solver {
         let mut j = j_start;
         if i < watch_len {
             self.deferred_watch_list.copy_within(i, watch_len, j);
-            j += watch_len - i;
+            // `copy_within` just checked `j + (watch_len - i) <= len`, so the
+            // sum is exact; saturation is unreachable.
+            j = j.saturating_add(watch_len - i);
         }
         if binary_count != u32::MAX {
             self.finalize_watch_list_with_bc(false_lit, j, binary_count);
@@ -2105,7 +2156,10 @@ impl Solver {
             }
             self.deferred_replacement_watches.clear();
         }
-        self.num_propagations += (self.qhead - qhead_start) as u64;
+        // Statistic: the trail only grows during BCP, so `qhead >= qhead_start`.
+        self.num_propagations = self
+            .num_propagations
+            .saturating_add(self.qhead.saturating_sub(qhead_start) as u64);
         // CaDiCaL propagate.cpp:487: trail before current decision level
         // was conflict-free.
         self.no_conflict_until = if self.decision_level == 0 {
@@ -2128,7 +2182,8 @@ impl Solver {
         self.last_conflict_clause_ref = Some(clause_ref);
         self.last_conflict_clause_id = clause_id;
         let trace_clause_id = if clause_id == 0 {
-            u64::from(clause_ref.0) + 1
+            // A u32 offset plus one never reaches u64::MAX: exact.
+            u64::from(clause_ref.0).saturating_add(1)
         } else {
             clause_id
         };
@@ -2195,7 +2250,17 @@ impl Solver {
     ///          deferred replacement watches are flushed in both outcomes
     #[inline]
     pub(super) fn propagate_domain_bcp(&mut self, domain: &[bool]) -> Option<ClauseRef> {
-        self.propagate_domain_bcp_impl::<false>(domain)
+        self.propagate_domain_bcp_uncounted::<false>(domain)
+    }
+
+    fn propagate_domain_bcp_uncounted<const IC3: bool>(
+        &mut self,
+        domain: &[bool],
+    ) -> Option<ClauseRef> {
+        match self.propagate_domain_bcp_impl::<IC3, _>(domain, &Uncounted) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
     }
 
     /// Shared core of domain-restricted BCP (#8475, #8569).
@@ -2215,7 +2280,11 @@ impl Solver {
     /// shared conflict finalizers, so the entry/exit bookkeeping
     /// (`num_propagations`, `no_conflict_until`,
     /// `last_conflict_clause_ref`/`id`, `trace_conflict`) matches base BCP.
-    fn propagate_domain_bcp_impl<const IC3: bool>(&mut self, domain: &[bool]) -> Option<ClauseRef> {
+    pub(super) fn propagate_domain_bcp_impl<const IC3: bool, A: Admission>(
+        &mut self,
+        domain: &[bool],
+        admission: &A,
+    ) -> Result<Option<ClauseRef>, A::Error> {
         debug_assert!(
             self.decision_level > 0,
             "BUG: propagate_domain_bcp_impl called at level 0 — level 0 must use full BCP"
@@ -2249,6 +2318,13 @@ impl Solver {
         let chrono = !IC3 && self.chrono_enabled;
 
         while self.qhead < self.trail.len() {
+            if let Err(stopped) = admission.before_watch(self) {
+                self.num_propagations += (self.qhead - qhead_start) as u64;
+                if !IC3 {
+                    self.flush_bcp_ticks::<{ bcp_mode::SEARCH }>(ticks);
+                }
+                return Err(stopped);
+            }
             let p = self.trail[self.qhead];
             self.qhead += 1;
             let false_lit = p.negated();
@@ -2292,7 +2368,7 @@ impl Solver {
                         if IC3 {
                             // Immediate conflict return (#8569). Keep the
                             // current watcher and the unscanned suffix.
-                            return Some(self.conflict_finalize(
+                            return Ok(Some(self.conflict_finalize(
                                 false_lit,
                                 clause_ref,
                                 j + 1,
@@ -2300,7 +2376,7 @@ impl Solver {
                                 watch_len,
                                 qhead_start,
                                 saved_bc,
-                            ));
+                            )));
                         }
                         // Record and continue scanning binaries (#8043).
                         binary_conflict = Some(clause_ref);
@@ -2473,7 +2549,7 @@ impl Solver {
                     if !IC3 {
                         self.flush_bcp_ticks::<{ bcp_mode::SEARCH }>(ticks);
                     }
-                    return Some(self.conflict_finalize(
+                    return Ok(Some(self.conflict_finalize(
                         false_lit,
                         clause_ref,
                         j + 1,
@@ -2481,7 +2557,7 @@ impl Solver {
                         watch_len,
                         qhead_start,
                         saved_bc,
-                    ));
+                    )));
                 }
 
                 // Unit propagation on the (in-domain) other watched literal.
@@ -2526,7 +2602,9 @@ impl Solver {
             if !IC3 {
                 if let Some(conflict_ref) = binary_conflict {
                     self.flush_bcp_ticks::<{ bcp_mode::SEARCH }>(ticks);
-                    return Some(self.binary_conflict_finalize(conflict_ref, qhead_start));
+                    return Ok(Some(
+                        self.binary_conflict_finalize(conflict_ref, qhead_start),
+                    ));
                 }
             }
         }
@@ -2543,7 +2621,7 @@ impl Solver {
             self.qhead,
             self.trail.len(),
         );
-        None
+        Ok(None)
     }
 
     /// Domain-restricted BCP stripped for IC3/PDR incremental queries
@@ -2857,7 +2935,7 @@ impl Solver {
     #[cfg(not(feature = "raw-pointer-bcp"))]
     #[inline]
     pub(super) fn propagate_bcp_ic3(&mut self, domain: &[bool]) -> Option<ClauseRef> {
-        self.propagate_domain_bcp_impl::<true>(domain)
+        self.propagate_domain_bcp_uncounted::<true>(domain)
     }
 }
 

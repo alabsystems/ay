@@ -1,0 +1,3 @@
+c ONE-KNOB CONTROL: byte-identical to opt.wcnf except `-0001` -> `-1`.
+h 1 0
+5 -1 0

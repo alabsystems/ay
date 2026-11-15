@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+red >= 0 ; ; begin
+    start_time test
+    pol -1 2 *
+    end_time test
+end -1
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

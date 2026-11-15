@@ -134,7 +134,9 @@ impl PdkindSolver {
 
     /// Check trivial cases before main loop
     pub(super) fn check_trivial_cases(&self, ts: &TransitionSystem) -> Option<RawPdkindResult> {
-        let mut ctx = self.problem.make_smt_context();
+        // INV-S2: `init` UNSAT publishes `Safe(false)` directly.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+        let mut ctx = self.problem.make_search_smt_context();
 
         // Check if init is empty
         if ctx.check_sat(&ts.init).is_unsat() {

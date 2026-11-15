@@ -32,8 +32,6 @@ use std::path::{Path, PathBuf};
 #[cfg(not(debug_assertions))]
 use std::process::{Command, Stdio};
 #[cfg(not(debug_assertions))]
-use std::sync::OnceLock;
-#[cfg(not(debug_assertions))]
 use std::time::Duration;
 #[cfg(not(debug_assertions))]
 use wait_timeout::ChildExt;
@@ -71,9 +69,6 @@ const ORIGINAL_RELEASE_REPRODUCERS: [&str; 3] = [
 ];
 
 #[cfg(not(debug_assertions))]
-static Z3_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-#[cfg(not(debug_assertions))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SolverOutcome {
     Sat,
@@ -104,15 +99,14 @@ fn workspace_path(relative: impl AsRef<Path>) -> PathBuf {
         .join(relative)
 }
 
+/// The full sweep's MANDATORY z3 oracle: reached by path and proved to be z3
+/// (`ay_test_support::z3`: `Z3_PATH`, else the first identified z3 on `PATH`),
+/// never a `z3` spawned by name.
 #[cfg(not(debug_assertions))]
-fn z3_available() -> bool {
-    *Z3_AVAILABLE.get_or_init(|| {
-        Command::new("z3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    })
+fn z3_oracle() -> &'static ay_test_support::z3::Z3Oracle {
+    ay_test_support::z3::require_z3(&format!(
+        "ay qf_lra_cli_release_sweep_6564 {FULL_SWEEP_ENV}=1"
+    ))
 }
 
 #[cfg(not(debug_assertions))]
@@ -339,7 +333,7 @@ fn run_command_with_timeout(
 
 #[cfg(not(debug_assertions))]
 fn run_z3_file(path: &Path) -> Result<SolverOutcome, String> {
-    let mut command = Command::new("z3");
+    let mut command = z3_oracle().command();
     command
         .arg(format!("-T:{BENCHMARK_TIMEOUT_SECS}"))
         .arg(path);
@@ -410,10 +404,8 @@ fn compare_cli_release_entry_6564(
 #[ntest::timeout(240_000)]
 fn qf_lra_cli_release_soundness_selected_batch_6564() -> Result<(), String> {
     let full_sweep = full_sweep_requested_6564()?;
-    if full_sweep && !z3_available() {
-        return Err(format!(
-            "{FULL_SWEEP_ENV}=1 requires z3 in PATH for differential checking"
-        ));
+    if full_sweep {
+        z3_oracle();
     }
 
     let entries = qf_lra_release_entries_6564(full_sweep)?;

@@ -7,9 +7,12 @@
 //! These helpers are shared between the `Executor` and combined theory solvers
 //! for rendering numeric model values and sorts.
 
+use ay_core::render_admission::{self as output, Owner};
 use ay_core::term::Symbol;
 use ay_core::{quote_symbol, Sort};
 use num_rational::BigRational;
+
+mod admission;
 
 /// Format a `Sort` as an SMT-LIB sort string.
 pub(crate) fn format_sort(sort: &Sort) -> String {
@@ -17,6 +20,8 @@ pub(crate) fn format_sort(sort: &Sort) -> String {
         Sort::Bool => "Bool".to_string(),
         Sort::Int => "Int".to_string(),
         Sort::Real => "Real".to_string(),
+        Sort::Complex => "Complex".to_string(),
+        Sort::FiniteField(field) => format!("(_ FiniteField {})", field.modulus()),
         Sort::String => "String".to_string(),
         Sort::RegLan => "RegLan".to_string(),
         Sort::BitVec(bv) => format!("(_ BitVec {})", bv.width),
@@ -42,13 +47,43 @@ pub(crate) fn format_sort_surface(ctx: &ay_frontend::Context, sort: &Sort) -> St
         .unwrap_or_else(|| format_sort(sort))
 }
 
+pub(crate) fn format_sort_surface_owned(
+    ctx: &ay_frontend::Context,
+    sort: &Sort,
+    owner: Owner<'_>,
+) -> String {
+    if let Some(owner) = owner {
+        match ctx.format_sort_surface_admitted(sort, owner) {
+            Some(value) => value,
+            None => {
+                output::invalid(Some(owner));
+                String::new()
+            }
+        }
+    } else {
+        format_sort_surface(ctx, sort)
+    }
+}
+
 /// Format a `Symbol` (function/constant name) for SMT-LIB output.
 pub(crate) fn format_symbol(sym: &Symbol) -> String {
+    format_symbol_owned(sym, None)
+}
+
+pub(crate) fn format_symbol_owned(sym: &Symbol, owner: Owner<'_>) -> String {
     match sym {
-        Symbol::Named(name) => quote_symbol(name),
+        Symbol::Named(name) => output::quote(owner, name),
         Symbol::Indexed(name, indices) => {
-            let indices_str: Vec<String> = indices.iter().map(ToString::to_string).collect();
-            format!("(_ {} {})", quote_symbol(name), indices_str.join(" "))
+            let mut indices_str = Vec::new();
+            if !output::reserve(&mut indices_str, indices.len(), owner) {
+                return String::new();
+            }
+            for value in indices {
+                indices_str.push(output::format(owner, format_args!("{value}")));
+            }
+            let name = output::quote(owner, name);
+            let joined = output::join(owner, &indices_str, " ");
+            output::format(owner, format_args!("(_ {name} {joined})"))
         }
         // All current Symbol variants handled above (#5692).
         // Wildcard covers future variants from #[non_exhaustive].
@@ -162,15 +197,98 @@ pub(crate) fn canonical_internal_atom(s: &str) -> String {
     }
 }
 
+/// Binding-aware field literal shared by assertions, values and model defaults.
+/// At most 1024 name probes share the native field slice's bounded work posture.
+/// Refusal is explicit, never an approximate/rebound residue.
+pub(crate) fn format_field_literal_surface(
+    ctx: &ay_frontend::Context,
+    value: u32,
+    field: ay_core::FiniteFieldSort,
+    poll: impl FnMut() -> bool,
+) -> Option<String> {
+    format_field_literal_in_namespace(ctx, value, field, poll, |_| false)
+}
+
+pub(crate) fn format_field_literal_in_namespace(
+    ctx: &ay_frontend::Context,
+    value: u32,
+    field: ay_core::FiniteFieldSort,
+    mut poll: impl FnMut() -> bool,
+    mut occupied: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    format_field_literal_owned(ctx, value, field, None, &mut poll, &mut occupied)
+}
+
+pub(crate) fn format_field_literal_owned(
+    ctx: &ay_frontend::Context,
+    value: u32,
+    field: ay_core::FiniteFieldSort,
+    owner: Owner<'_>,
+    mut poll: impl FnMut() -> bool,
+    mut occupied: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    if !poll() {
+        return None;
+    }
+    if value >= field.modulus() {
+        return None;
+    }
+    let canonical = output::format(owner, format_args!("ff{value}"));
+    if !output::pay(owner, canonical.len(), 0) {
+        return None;
+    }
+    if !ctx.has_symbol_binding(&canonical) && !occupied(&canonical) {
+        let result = output::format(
+            owner,
+            format_args!("(as ff{value} (_ FiniteField {}))", field.modulus()),
+        );
+        return output::pay(owner, 0, 0).then_some(result);
+    }
+    let mut representative = u64::from(value);
+    for _ in 0..1024 {
+        if !poll() {
+            return None;
+        }
+        let name = output::format(
+            owner,
+            format_args!("#f{representative}m{}", field.modulus()),
+        );
+        if !output::pay(owner, name.len(), 0) {
+            return None;
+        }
+        if !ctx.has_symbol_binding(&name) && !occupied(&name) {
+            return Some(name);
+        }
+        representative = representative.checked_add(u64::from(field.modulus()))?;
+    }
+    None
+}
+
 /// Canonical default value of a sort at a public SMT-LIB boundary.
 /// Nominal sorts require their owning context so private carrier identities
 /// never leak. This is only for genuinely unconstrained model slots, never a
 /// fallback for failed evaluation.
-pub(crate) fn format_default_value_surface(ctx: &ay_frontend::Context, sort: &Sort) -> String {
-    match sort {
+pub(crate) fn format_default_value_surface(
+    ctx: &ay_frontend::Context,
+    sort: &Sort,
+) -> Option<String> {
+    format_default_value_surface_with_poll(ctx, sort, &mut || true)
+}
+
+pub(crate) fn format_default_value_surface_with_poll(
+    ctx: &ay_frontend::Context,
+    sort: &Sort,
+    poll: &mut impl FnMut() -> bool,
+) -> Option<String> {
+    if !poll() {
+        return None;
+    }
+    Some(match sort {
         Sort::Bool => "false".to_string(),
         Sort::Int => "0".to_string(),
         Sort::Real => "0.0".to_string(),
+        Sort::Complex => "(complex.make 0.0 0.0)".to_string(),
+        Sort::FiniteField(field) => return format_field_literal_surface(ctx, 0, *field, poll),
         Sort::String => "\"\"".to_string(),
         Sort::RegLan => "re.none".to_string(),
         Sort::BitVec(width) => format_bitvec(&num_bigint::BigInt::from(0), width.width),
@@ -180,7 +298,7 @@ pub(crate) fn format_default_value_surface(ctx: &ay_frontend::Context, sort: &So
         Sort::Array(array) => format!(
             "((as const {}) {})",
             format_sort_surface(ctx, sort),
-            format_default_value_surface(ctx, &array.element_sort)
+            format_default_value_surface_with_poll(ctx, &array.element_sort, poll)?
         ),
         Sort::Uninterpreted(name) if name == "RoundingMode" => {
             format_model_atom_surface(ctx, sort, "roundNearestTiesToEven")
@@ -193,27 +311,45 @@ pub(crate) fn format_default_value_surface(ctx: &ay_frontend::Context, sort: &So
         other => {
             unreachable!("unhandled Sort variant in format_default_value_surface(): {other:?}")
         }
-    }
+    })
 }
 
 /// Format a `BigRational` as an SMT-LIB Real value.
 pub(crate) fn format_rational(val: &BigRational) -> String {
+    format_rational_owned(val, None)
+}
+
+pub(crate) fn format_rational_owned(val: &BigRational, owner: Owner<'_>) -> String {
+    if !output::pay(owner, 1, 0) {
+        return String::new();
+    }
+    if owner.is_some() && val.denom().sign() != num_bigint::Sign::Plus {
+        output::invalid(owner);
+        return String::new();
+    }
+    let Some(numer) = admission::decimal(val.numer(), owner) else {
+        return String::new();
+    };
+    let negative = val.numer().sign() == num_bigint::Sign::Minus;
     if val.is_integer() {
-        // Integer value: format as decimal
-        let numer = val.numer();
-        if numer.sign() == num_bigint::Sign::Minus {
-            format!("(- {}.0)", numer.magnitude())
+        if negative {
+            output::format(owner, format_args!("(- {numer}.0)"))
         } else {
-            format!("{numer}.0")
+            output::format(owner, format_args!("{numer}.0"))
         }
     } else {
-        // Fractional value: format as (/ num denom)
-        let numer = val.numer();
-        let denom = val.denom();
-        if numer.sign() == num_bigint::Sign::Minus {
-            format!("(- (/ {} {}))", numer.magnitude(), denom)
+        let Some(mut denom) = admission::decimal(val.denom(), owner) else {
+            return String::new();
+        };
+        // Preserve the legacy representation even for a caller's raw negative
+        // denominator; admitted producer data above requires a positive one.
+        if val.denom().sign() == num_bigint::Sign::Minus {
+            denom = output::format(owner, format_args!("-{denom}"));
+        }
+        if negative {
+            output::format(owner, format_args!("(- (/ {numer} {denom}))"))
         } else {
-            format!("(/ {numer} {denom})")
+            output::format(owner, format_args!("(/ {numer} {denom})"))
         }
     }
 }
@@ -251,12 +387,50 @@ pub(crate) fn format_real(val: &BigRational) -> String {
 
 /// Format a `BigInt` as an SMT-LIB Int value.
 pub(crate) fn format_bigint(val: &num_bigint::BigInt) -> String {
-    use num_bigint::Sign;
+    format_bigint_owned(val, None)
+}
 
+pub(crate) fn format_bigint_owned(val: &num_bigint::BigInt, owner: Owner<'_>) -> String {
+    use num_bigint::Sign;
+    let Some(digits) = admission::decimal(val, owner) else {
+        return String::new();
+    };
     match val.sign() {
-        Sign::Minus => format!("(- {})", val.magnitude()),
-        Sign::NoSign | Sign::Plus => val.to_string(),
+        Sign::Minus => output::format(owner, format_args!("(- {digits})")),
+        Sign::NoSign | Sign::Plus => digits,
     }
+}
+
+/// Render a borrowed integer through the existing counted radix kernel and
+/// UTF-8 sink. The caller supplies its original owner; this creates no grant.
+pub fn format_bigint_with_admission(
+    value: &num_bigint::BigInt,
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<String, ay_core::original_query::CountedAdmissionError> {
+    let text = format_bigint_owned(value, Some(owner));
+    owner.check()?;
+    Ok(text)
+}
+
+/// The same original-owned native formatter for an exact rational value.
+pub fn format_rational_with_admission(
+    value: &BigRational,
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<String, ay_core::original_query::CountedAdmissionError> {
+    let text = format_rational_owned(value, Some(owner));
+    owner.check()?;
+    Ok(text)
+}
+
+/// The canonical width-preserving BV printer with its original owner.
+pub fn format_bitvec_with_admission(
+    value: &num_bigint::BigInt,
+    width: u32,
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<String, ay_core::original_query::CountedAdmissionError> {
+    let text = format_bitvec_owned(value, width, Some(owner));
+    owner.check()?;
+    Ok(text)
 }
 
 /// Format a `BigInt` as an SMT-LIB BitVec literal.
@@ -277,24 +451,64 @@ pub(crate) fn format_bigint(val: &num_bigint::BigInt) -> String {
 /// legal SMT-LIB but z3 never emits it, so it would be a gratuitous parity
 /// break. (#1793)
 pub fn format_bitvec(val: &num_bigint::BigInt, width: u32) -> String {
+    format_bitvec_owned(val, width, None)
+}
+
+pub(crate) fn format_bitvec_owned(
+    val: &num_bigint::BigInt,
+    width: u32,
+    owner: Owner<'_>,
+) -> String {
+    use std::borrow::Cow;
+    let canonical = val.sign() != num_bigint::Sign::Minus && val.bits() <= u64::from(width);
+    if owner.is_some() && (!canonical || width == 0) {
+        output::invalid(owner);
+        return String::new();
+    }
     // Reduce into [0, 2^width) so negative inputs print their two's-complement
     // bit pattern. `&` with the mask is only correct for non-negative values in
     // sign-magnitude BigInt, so use a true modular reduction.
-    let modulus = num_bigint::BigInt::from(1u8) << width;
-    let unsigned_val: num_bigint::BigInt = ((val % &modulus) + &modulus) % &modulus;
+    let unsigned_val = if canonical {
+        Cow::Borrowed(val)
+    } else {
+        let modulus = num_bigint::BigInt::from(1u8) << width;
+        Cow::Owned(((val % &modulus) + &modulus) % &modulus)
+    };
 
     // Hex only when one hex digit maps to a whole number of bits.
     if width.is_multiple_of(4) {
         let hex_digits = (width / 4) as usize;
+        if !admission::bitwise(unsigned_val.bits(), 4, owner) {
+            return String::new();
+        }
         let hex_str = unsigned_val.to_str_radix(16);
-        return format!("#x{hex_str:0>hex_digits$}");
+        let mut result = output::Buffer::new(owner);
+        if !result.push("#x")
+            || !result.repeat('0', hex_digits.saturating_sub(hex_str.len()))
+            || !result.push(&hex_str)
+        {
+            return String::new();
+        }
+        return result.finish();
     }
 
     // Every other width: binary, one digit per bit, zero-padded to the width.
+    if !admission::bitwise(unsigned_val.bits(), 1, owner) {
+        return String::new();
+    }
     let bin_str = unsigned_val.to_str_radix(2);
     let bin_digits = width as usize;
-    format!("#b{bin_str:0>bin_digits$}")
+    let mut result = output::Buffer::new(owner);
+    if !result.push("#b")
+        || !result.repeat('0', bin_digits.saturating_sub(bin_str.len()))
+        || !result.push(&bin_str)
+    {
+        return String::new();
+    }
+    result.finish()
 }
+
+pub(crate) mod array_cell;
 
 #[cfg(test)]
 mod tests;

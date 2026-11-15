@@ -34,7 +34,7 @@ impl ParseState {
                 optcert_trivial: false,
                 root_dual_bound: None,
                 tree: None,
-                opt_tree: None,
+                opt_tree_body: None,
                 affine_aggregation: None,
                 parity_infeasibility: None,
                 sat_relu_infeasibility: None,

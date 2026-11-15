@@ -8,7 +8,11 @@ use super::super::term::arith_coercible;
 use super::{Context, ElaborateError, Result};
 
 impl Context {
-    fn expect_bool_operands(&self, operation: &str, args: &[TermId]) -> Result<()> {
+    pub(in crate::elaborate) fn expect_bool_operands(
+        &self,
+        operation: &str,
+        args: &[TermId],
+    ) -> Result<()> {
         for &arg in args {
             self.expect_arg_sort(arg, &Sort::Bool)
                 .map_err(|_| ElaborateError::SortMismatch {
@@ -209,7 +213,11 @@ impl Context {
                 let then_sort = self.terms.sort(arg_ids[1]).clone();
                 let else_sort = self.terms.sort(arg_ids[2]).clone();
                 if then_sort != else_sort {
-                    if arith_coercible(&then_sort) && arith_coercible(&else_sort) {
+                    if arith_coercible(&then_sort)
+                        && arith_coercible(&else_sort)
+                        && !self.z3_rejects_bool_beside_number(&then_sort, &else_sort)
+                    {
+                        self.note_bool_beside_number(&then_sort, &else_sort);
                         self.maybe_promote_numeric_args(&mut arg_ids[1..3])?;
                     } else if !self.lenient_sort_coercions() {
                         // Non-coercible differing branches: z3 reports the pair as

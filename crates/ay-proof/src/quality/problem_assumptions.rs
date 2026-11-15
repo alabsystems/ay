@@ -6,12 +6,18 @@
 
 use std::mem::size_of;
 
+#[cfg(test)]
 use ay_core::kani_compat::DetHashSet;
 use ay_core::{Proof, ProofId, ProofStep, Symbol, TermData, TermId, TermStore};
 
 use super::{charge_progress, checked_add_usize, checked_mul_usize};
 use crate::checker::ProofCheckError;
 
+mod metered;
+pub(super) use metered::validate_problem_assumptions_with_progress;
+
+/// Legacy authorization oracle; production uses the fully metered closure.
+#[cfg(test)]
 pub(super) fn validate_problem_assumptions_metered(
     proof: &Proof,
     terms: &TermStore,

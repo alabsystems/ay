@@ -376,8 +376,15 @@ fn end_to_end_sum_of_squares_unsat_carries_certificate() {
     assert!(rendered.contains("; ay-nra Positivstellensatz certificate"));
 }
 
+/// A linearly infeasible system is answered by the relaxation-first check
+/// (#nra-relaxation-first) before any exact pre-phase runs, as the simplex's
+/// own Farkas conflict over the two asserted bounds: the degree-0
+/// Positivstellensatz this test used to read off the SOS attachment, now
+/// carried natively by the conflict (and checked by the strict `la_generic`
+/// lane) instead of by an internal witness the Alethe rendering prints as a
+/// `hole`.
 #[test]
-fn end_to_end_linear_farkas_unsat_carries_certificate() {
+fn end_to_end_linear_unsat_is_the_relaxation_farkas_conflict() {
     use crate::NraSolver;
     use ay_core::term::TermStore;
     use ay_core::{Sort, TheoryResult, TheorySolver};
@@ -394,12 +401,12 @@ fn end_to_end_linear_farkas_unsat_carries_certificate() {
     solver.assert_literal(le, true);
     let res = solver.check();
     assert!(
-        matches!(res, TheoryResult::Unsat(_)),
-        "x>=1 & x<=0 is UNSAT"
-    );
-    assert!(
-        solver.took_sos_unsat_certificate(),
-        "the linear UNSAT must carry a Farkas (degree-0 SOS) certificate"
+        matches!(
+            &res,
+            TheoryResult::UnsatWithFarkas(conflict)
+                if conflict.farkas.is_some() && conflict.literals.len() == 2
+        ),
+        "x>=1 & x<=0 is UNSAT with a two-literal Farkas conflict, got {res:?}"
     );
 }
 

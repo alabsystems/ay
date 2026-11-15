@@ -50,22 +50,7 @@ impl Executor {
             ..
         } = check_partial_with_executor_progress(self, proof, WantQuality::Yes);
         self.proof_check_result = Some(summary.clone());
-        if let Some(error) = error {
-            let shape = Self::proof_shape_summary(proof);
-            let checked = shape.checked_steps;
-            let skipped = shape.skipped_hole_steps;
-            let total = shape.total_steps;
-            self.record_proof_check_stats(1, shape);
-            tracing::error!(
-                error = %error,
-                checked_steps = checked,
-                skipped_hole_steps = skipped,
-                total_steps = total,
-                "internal proof checker rejected UNSAT proof"
-            );
-        } else {
-            self.record_proof_check_stats(0, summary);
-        }
+        self.record_partial_check_outcome(summary, error);
 
         if let Some(ref quality) = quality {
             tracing::debug!(
@@ -128,23 +113,36 @@ impl Executor {
         let MeteredPartialCheck { summary, error, .. } =
             check_partial_with_executor_progress(self, proof, WantQuality::No);
         self.proof_check_result = Some(summary.clone());
-        if let Some(error) = error {
-            let shape = Self::proof_shape_summary(proof);
-            let checked = shape.checked_steps;
-            let skipped = shape.skipped_hole_steps;
-            let total = shape.total_steps;
-            self.record_proof_check_stats(1, shape);
+        self.record_partial_check_outcome(summary, error);
+    }
 
-            tracing::error!(
-                error = %error,
-                checked_steps = checked,
-                skipped_hole_steps = skipped,
-                total_steps = total,
-                "internal proof checker rejected UNSAT proof"
-            );
-        } else {
+    /// Record one metered diagnostic walk, failure included, by the walk's
+    /// OWN counts.
+    ///
+    /// On a rejection `checked_steps` is the validated prefix the walk
+    /// reached, as [`PartialProofCheck`] promises (#4592) — never the proof's
+    /// shape. The shape (every non-hole step) used to be logged and recorded
+    /// here, so every rejected or cancelled walk reported
+    /// `checked_steps == total_steps` on a hole-free proof, whether it had
+    /// validated one step or all of them.
+    #[cfg(feature = "proof-checker")]
+    fn record_partial_check_outcome(
+        &mut self,
+        summary: PartialProofCheck,
+        error: Option<ProofCheckError>,
+    ) {
+        let Some(error) = error else {
             self.record_proof_check_stats(0, summary);
-        }
+            return;
+        };
+        tracing::error!(
+            error = %error,
+            checked_steps = summary.checked_steps,
+            skipped_hole_steps = summary.skipped_hole_steps,
+            total_steps = summary.total_steps,
+            "internal proof checker rejected UNSAT proof"
+        );
+        self.record_proof_check_stats(1, summary);
     }
 
     #[cfg(feature = "proof-checker")]

@@ -64,6 +64,7 @@ pub(crate) enum Token<'a> {
 
     /// Symbol (identifier)
     #[regex(r"[a-zA-Z~!@$%^&*_+=<>.?/\-][a-zA-Z0-9~!@$%^&*_+=<>.?/\-]*", |lex| lex.slice())]
+    #[regex(r"#f[0-9m-]*", finite_field_symbol)]
     Symbol(&'a str),
 
     /// Quoted symbol `|...|`, including Z3 5.0.0's `\|` / `\\` escapes.
@@ -87,3 +88,14 @@ pub(crate) enum Token<'a> {
 #[cfg(test)]
 #[path = "lexer_tests.rs"]
 mod tests;
+
+// Logos has no look-ahead assertions. A field numeral is one complete token;
+// suffixes must not turn a binary equality into an unrelated n-ary formula.
+fn finite_field_symbol<'a>(lex: &mut logos::Lexer<'a, Token<'a>>) -> Option<&'a str> {
+    let boundary = lex
+        .remainder()
+        .chars()
+        .next()
+        .is_none_or(|c| matches!(c, ' ' | '\t' | '\r' | '\n' | '(' | ')' | ';'));
+    boundary.then(|| lex.slice())
+}

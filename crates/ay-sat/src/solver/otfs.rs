@@ -16,6 +16,19 @@ use crate::solver::WatchOrderPolicy;
 use crate::watched::ClauseRef;
 
 impl super::Solver {
+    /// `otfs_strengthen` while conflict analysis resolves from `conflict`, the
+    /// clause the strengthened reason's annotated-RUP hints are read from
+    /// (`--sat-veripb-hints`).
+    pub(super) fn otfs_strengthen_from(
+        &mut self,
+        conflict: ClauseRef,
+        reason_ref: ClauseRef,
+        pivot: Literal,
+    ) -> bool {
+        self.veripb_note_otfs_conflict(conflict);
+        self.otfs_strengthen(reason_ref, pivot)
+    }
+
     /// Strengthen a reason clause via on-the-fly self-subsumption.
     ///
     /// Removes the pivot variable and any level-0 literals from the clause,
@@ -169,6 +182,8 @@ impl super::Solver {
         // comment at the Derived/LRAT branch). Use TrustedTransform so the
         // forward checker verifies well-formedness (non-empty, non-tautological,
         // not fully-falsified) without requiring a full RUP derivation.
+        // `--sat-veripb-hints`: annotated from the trail (veripb_derived.rs).
+        self.veripb_otfs_ready(&new_lits);
         if let Ok(new_id) = self.proof_emit_add(&new_lits, &hints, ProofAddKind::TrustedTransform) {
             // Update clause ID mapping: the clause at this index now has a new
             // LRAT ID (the old ID was deleted). Without this update,
@@ -213,9 +228,10 @@ impl super::Solver {
         // OTFS only fires on a clause that was just a reason in conflict
         // analysis, so under the two-stage arm this is an `OnClauseUse(c)`
         // (`score += 1`), not a reset to MAX_USED.
-        if self.two_stage_clause_management {
+        if self.two_stage_scoring() {
             self.two_stage_note_analysis_use(clause_idx);
-        } else {
+        }
+        if !self.two_stage_clause_management {
             self.arena
                 .set_used(clause_idx, crate::clause_arena::MAX_USED);
         }

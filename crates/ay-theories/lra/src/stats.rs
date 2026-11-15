@@ -28,6 +28,10 @@ pub(crate) struct LraStats {
     pub(crate) check_count: u64,
     /// Number of theory conflicts detected.
     pub(crate) conflict_count: u64,
+    /// Total literals across emitted theory-conflict clauses (core size).
+    pub(crate) conflict_lits_total: u64,
+    /// Largest emitted theory-conflict clause, in literals.
+    pub(crate) conflict_lits_max: u64,
     /// Number of theory propagations emitted.
     pub(crate) propagation_count: u64,
 
@@ -43,6 +47,11 @@ pub(crate) struct LraStats {
     /// Number of `assert_literal` calls that skipped setting `dirty=true`
     /// because the same `(term, value)` was already asserted (#8255).
     pub(crate) assert_dirty_skips: u64,
+    /// #lra-scope-trail: number of `push` calls that found atoms asserted
+    /// since the last check and applied their bounds in the scope being
+    /// closed (`apply_pending_atoms_before_push`). Zero under the eager
+    /// DPLL(T) cadence, which checks before every push.
+    pub(crate) scope_push_flushes: u64,
     /// Number of `propagate_impl` calls that skipped `compute_implied_bounds`
     /// because `check_during_propagate` already ran it (#8468).
     pub(crate) propagate_implied_bounds_fresh_skips: u64,
@@ -119,6 +128,10 @@ pub(crate) struct LraStats {
     /// Unjustified bounds retracted from infeasible rows after an empty
     /// conflict (#A2 conflict_without_literals livelock fix).
     pub(crate) unjustified_bound_retractions: u64,
+    /// Tight pins the Nelson-Oppen scan did not export as equalities because
+    /// a reason is not a live asserted atom — an NIA/NRA model guess
+    /// (#nonlinear-shared-reasons).
+    pub(crate) unjustified_exports_refused: u64,
 
     // ----- Simplex/pivot counters -----
     /// Number of `check()` calls where simplex returned SAT.
@@ -161,6 +174,10 @@ pub(crate) struct LraStats {
     pub(crate) f64_rows_skipped: u64,
     /// Individual variable derivations skipped by per-variable f64 pre-screening.
     pub(crate) f64_vars_skipped: u64,
+    /// Exact row derivations dropped before explanation construction because
+    /// the derived bound is not tighter than the variable's current implied
+    /// bound (the deferred-update apply loop would discard it).
+    pub(crate) implied_not_tighter_skips: u64,
 
     // ----- Snapshot telemetry (#8255) -----
     /// Number of `save_feasible_snapshot` calls skipped because simplex did

@@ -58,7 +58,8 @@ needed (Ctypes/findlib are *not* dependencies).
 
 ```sh
 # 1. Build the AY FFI library (produces target/debug/libay_ffi.{a,dylib}).
-cargo build -p ay-ffi
+targo --unverified build -p ay-ffi   # Trust toolchain
+cargo build -p ay-ffi                # stock Rust
 
 # 2. Build and run the OCaml test (statically links libay_ffi.a).
 bash bindings/ocaml/run.sh           # or: bash bindings/ocaml/run.sh --release

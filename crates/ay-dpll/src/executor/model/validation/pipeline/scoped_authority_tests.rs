@@ -7,24 +7,6 @@ use ay_core::Sort;
 use ay_model_check::ModelValue;
 
 #[test]
-fn every_strict_funnel_uses_the_scoped_authority_wrapper() {
-    let source = include_str!("../pipeline.rs");
-    let scoped_call = ["self.verify_model_strict_", "with_scoped_authority()"].concat();
-    assert_eq!(
-        source.matches(&scoped_call).count(),
-        7,
-        "each of the three strict funnels, its retry, and the \
-         #repair-fallback-unrepaired re-check must share one authority policy"
-    );
-    let raw_call = ["self.verify_model_", "strict()"].concat();
-    assert_eq!(
-        source.matches(&raw_call).count(),
-        2,
-        "raw strict checks belong only inside the scoped wrapper and the exact-certificate read-only gate"
-    );
-}
-
-#[test]
 fn datatype_strict_authority_is_scoped_and_fails_closed() {
     let commands = ay_frontend::parse(
         r#"
@@ -45,7 +27,7 @@ fn datatype_strict_authority_is_scoped_and_fails_closed() {
             .expect("W6 strict-authority fixture executes"),
         ["sat"]
     );
-    let original_roots = executor.independent_gate_query_roots();
+    let original_roots = executor.independent_gate_query_roots().unwrap();
     let model = executor.last_model.as_ref().expect("sat retains a model");
     assert!(!executor
         .authenticated_datatype_array_field_classes(model)

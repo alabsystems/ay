@@ -35,8 +35,9 @@ use crate::{
 mod bounds;
 mod bounds_single;
 mod bounds_two_var;
-mod finite_domain;
+pub(crate) mod finite_domain;
 mod model;
+mod union_find;
 
 /// Result of one Gaussian elimination run over the enumeration matrix
 /// (private to `try_direct_enumeration`; the cacheable subset is mirrored
@@ -216,7 +217,7 @@ impl LiaSolver<'_> {
     /// enumeration did not determine returns `false` (unverifiable ⇒ do not
     /// use the witness). Real-sorted shared equalities are skipped: they
     /// constrain the LRA relaxation, not this Int witness.
-    fn witness_satisfies_shared_equalities(
+    pub(crate) fn witness_satisfies_shared_equalities(
         &self,
         solution: &[(usize, BigInt)],
         idx_to_term: &[TermId],
@@ -236,8 +237,8 @@ impl LiaSolver<'_> {
             values.insert(term, BigRational::from(val.clone()));
         }
         for (lhs, rhs, _) in &self.shared_equalities {
-            if !matches!(self.terms.sort(*lhs), Sort::Int)
-                || !matches!(self.terms.sort(*rhs), Sort::Int)
+            if !matches!(self.terms().sort(*lhs), Sort::Int)
+                || !matches!(self.terms().sort(*rhs), Sort::Int)
             {
                 continue;
             }
@@ -331,7 +332,7 @@ impl LiaSolver<'_> {
         let mut matrix: Vec<(Vec<BigRational>, BigRational)> = Vec::new();
 
         for &literal in &self.assertion_view().positive_equalities {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 
@@ -385,7 +386,7 @@ impl LiaSolver<'_> {
         // construction. The conflict-probe loop re-enters here once per
         // candidate shared equality with a byte-identical matrix (shared
         // equalities never enter it), so steps 2..k skip the elimination.
-        let rref: std::rc::Rc<(EnumMatrix, Vec<usize>)> = {
+        let rref: std::sync::Arc<(EnumMatrix, Vec<usize>)> = {
             let cached = match &self.enum_rref_cache {
                 Some(cache) if cache.key == matrix => Some(cache.outcome.clone()),
                 _ => None,
@@ -400,15 +401,15 @@ impl LiaSolver<'_> {
                     }
                     return DirectEnumResult::NoConclusion;
                 }
-                Some(EnumRrefOutcome::Rref(rc)) => rc,
+                Some(EnumRrefOutcome::Rref(shared)) => shared,
                 None => match self.eliminate_enum_matrix(matrix.clone(), num_vars, debug) {
                     EnumElimination::Rref(work, pivot_cols) => {
-                        let rc = std::rc::Rc::new((work, pivot_cols));
+                        let shared = std::sync::Arc::new((work, pivot_cols));
                         self.enum_rref_cache = Some(EnumRrefCache {
                             key: matrix,
-                            outcome: EnumRrefOutcome::Rref(std::rc::Rc::clone(&rc)),
+                            outcome: EnumRrefOutcome::Rref(std::sync::Arc::clone(&shared)),
                         });
-                        rc
+                        shared
                     }
                     EnumElimination::CoeffExplosion => {
                         self.enum_rref_cache = Some(EnumRrefCache {

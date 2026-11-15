@@ -6,6 +6,7 @@ use super::*;
 
 #[path = "authored_congruence_commit.rs"]
 mod certified_commit;
+mod predicates;
 #[path = "authored_congruence_support.rs"]
 mod support;
 
@@ -81,6 +82,12 @@ impl Executor {
                 decode_eq_local(&self.ctx.terms, root).map(|(lhs, rhs)| (root, lhs, rhs))
             })
             .collect();
+
+        if self.try_authored_predicate_congruence(proof, &authored, &authored_equalities)
+            != predicates::Outcome::Declined
+        {
+            return;
+        }
 
         // ARM A — the refuting disequality is itself authored:
         //   `(= a_i b_i)` … plus `(not (= (f a) (f b)))`.

@@ -400,9 +400,26 @@ fn merge_datatype_cell_completion(
     }
 }
 
-/// Exact extractor carrier spelling for `sort`: `@<name>!<canonical usize>`.
-/// Ascriptions, quoted spellings, whitespace, foreign sorts, overflow, and
-/// live constructor identities all decline.
+/// Exact extractor carrier spelling for `sort`: `@<name>!<canonical usize>`,
+/// the BARE internal token the EUF extractor mints (`completion.rs`,
+/// `format!("@{sort_name}!{counter}")`). Ascriptions (`(as @D!0 D)`), pipe-
+/// quoted spellings (`|@D!0|`), non-canonical counters, foreign sorts,
+/// overflow, and live constructor identities all decline.
+///
+/// The datatype NAME is compared verbatim, exactly as the extractor embeds
+/// it — a name that needs pipe-quoting on the SMT-LIB surface (deductive-checks's
+/// tuple datatype `(u32, u32)`, whose carrier is `@(u32, u32)!0`) is an
+/// ordinary registered datatype here. `RenderedDatatypeGuard` already admits
+/// such carrier names (only constructor HEADS must be bare-safe, because they
+/// are rendered raw); declining them here left every datatype-valued array
+/// cell of such a sort spelled as an opaque carrier that no completion or
+/// gate pass could normalize to its class's constructor tree, and the
+/// independent gate fail-closed a genuine `sat` ("datatype sort requires a
+/// constructor-bearing value") whenever an arithmetic lane made the array
+/// extractor keep the carrier spelling (C-4 of the 2026-09-16 solver-fix
+/// round). The token shape is unambiguous regardless of the characters the
+/// name contains: the name is a fixed prefix and the counter must be a
+/// canonical `usize`, so one spelling names exactly one class of one sort.
 pub(super) fn exact_datatype_carrier_token(
     guard: &RenderedDatatypeGuard,
     constructor_tokens: &HashSet<String>,
@@ -422,9 +439,10 @@ pub(super) fn exact_datatype_carrier_token(
     if token.len() > max_token_len {
         return false;
     }
-    if ay_core::quote_symbol(datatype_name) != datatype_name
-        || ay_core::quote_symbol(token) != token
-    {
+    // A pipe-quoted or sort-ascribed spelling is a PRINTED dialect leaking
+    // into internal state, never a carrier (`executor_format::
+    // strip_model_atom_ascription` documents the two dialects).
+    if token.starts_with('|') || token.starts_with('(') {
         return false;
     }
     let prefix = format!("@{datatype_name}!");

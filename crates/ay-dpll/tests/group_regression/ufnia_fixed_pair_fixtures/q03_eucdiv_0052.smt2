@@ -1,0 +1,22 @@
+; Verus-style: EucDiv/EucMod/Mul defined by triggered universals.
+; Equisatisfiable with its ground twin, which z3 4.12.5 answers sat.
+; AY answered unsat before the fixed-term export required both sides justified.
+(declare-fun f (Int) Int)
+(declare-fun g (Int Int) Int)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const d Int)
+(declare-const e Int)
+(declare-const c Int)
+(declare-const z Int)
+(declare-fun EucDiv (Int Int) Int)
+(declare-fun EucMod (Int Int) Int)
+(declare-fun Mul (Int Int) Int)
+(assert (forall ((a Int) (b Int)) (! (= (EucDiv a b) (div a b)) :pattern ((EucDiv a b)))))
+(assert (forall ((a Int) (b Int)) (! (= (EucMod a b) (mod a b)) :pattern ((EucMod a b)))))
+(assert (forall ((a Int) (b Int)) (! (= (Mul a b) (* a b)) :pattern ((Mul a b)))))
+(assert (= (EucDiv (* 3 d) d) (- 1)))
+(assert (distinct (Mul e d) (Mul c x)))
+(assert (= 0 (EucMod x (g e y))))
+(assert (= x c))
+(check-sat)

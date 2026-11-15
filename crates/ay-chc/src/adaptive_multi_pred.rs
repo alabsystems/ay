@@ -35,10 +35,13 @@ use std::time::Duration;
 use crate::adaptive::{AdaptivePortfolio, StagedProbeBudgetProfile};
 use crate::adaptive_decision_log::DecisionEntry;
 
+mod query_only_landing;
+
 /// Outcome of the query-only discharge on a fully-inlined preprocessed
 /// problem: either every query body was refuted (Safe direction, carrying the
-/// discharged clause count), or a satisfiable query body was replay-confirmed
-/// on the ORIGINAL clauses as a verified counterexample (Unsafe direction).
+/// discharged clause count), or a satisfiable query body was confirmed on the
+/// ORIGINAL clauses (its model's back-translated derivation, else the bounded
+/// replay) as a verified counterexample (Unsafe direction).
 pub(crate) enum QueryOnlyDischarge {
     Discharged(usize),
     VerifiedUnsafe(Counterexample),
@@ -72,6 +75,25 @@ impl AdaptivePortfolio {
                 );
                 None
             }
+            PortfolioResult::Safe(model)
+                if model.is_empty()
+                    && !crate::empty_acyclic_safe_check::query_cone_is_acyclic(&self.problem) =>
+            {
+                // The finalize gate admits this Safe only once
+                // `empty_acyclic_safe_check` re-decides it, and that check
+                // refuses a cyclic query cone before deciding anything. The
+                // classifier calls a stutter rule `P(x) /\ C => P(x)` acyclic
+                // (it derives no new tuple, so exhaustive BMC is sound past
+                // it), the re-check counts it as a cycle, and the Safe could
+                // only be demoted to unknown after ending a round that later
+                // lanes answer. Decline it instead, like an array Safe above.
+                tracing::warn!(
+                    depth,
+                    "Adaptive: acyclic BMC returned an empty-model Safe on a query cone the \
+                     independent re-check refuses as cyclic; declining it so later lanes run"
+                );
+                None
+            }
             PortfolioResult::Safe(model) if model.is_empty() => Some((
                 PortfolioResult::Safe(model),
                 ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
@@ -95,6 +117,7 @@ impl AdaptivePortfolio {
         label: &'static str,
         replay_depth_hint: usize,
         cancellation: &CancellationToken,
+        back_translator: &dyn crate::transform::BackTranslator,
     ) -> Option<QueryOnlyDischarge> {
         let boundary_open = || {
             !self.cancellation_token.is_cancelled()
@@ -106,7 +129,7 @@ impl AdaptivePortfolio {
         }
         let _query_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
         let _term_budget_guard =
-            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+            crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
         if !problem.predicates().is_empty() {
             return None;
         }
@@ -147,12 +170,19 @@ impl AdaptivePortfolio {
             if !boundary_open() {
                 return None;
             }
+            // Implied by the body, so its `unsat` is the body's, and no
+            // verdict rests on it alone: `unsat` is followed by
+            // original-clause validation or the fresh recheck of the
+            // unsimplified body, `sat` only triggers the replay on the
+            // original clauses. Pinned clause-local arrays would otherwise keep
+            // the inlined straight line in the array theory.
             let body = query
                 .body
                 .constraint
                 .clone()
                 .unwrap_or(ChcExpr::Bool(true))
-                .simplify_constants();
+                .simplify_constants()
+                .eliminate_definitions_per_disjunct();
             if !boundary_open() {
                 return None;
             }
@@ -175,16 +205,30 @@ impl AdaptivePortfolio {
             }
             match query_result {
                 result if result.is_unsat() => {}
-                SmtResult::Sat(_) => {
+                SmtResult::Sat(model) => {
                     // A satisfiable query body in the fully-inlined problem is
                     // a counterexample CANDIDATE, not an Unknown. Previously
                     // this arm was lumped with Unknown and the computed
-                    // verdict was discarded. Promote it only through the
-                    // fail-closed bounded-BMC replay on the ORIGINAL clauses
-                    // (fresh verified witness + strict PdrSolver replay via
-                    // `replay_confirm_unsafe_on_problem`); the transformed
-                    // model itself is never trusted. Anything unconfirmed
-                    // keeps the historical fail-closed None.
+                    // verdict was discarded. Promote it only through a
+                    // derivation that ground-validates on the ORIGINAL
+                    // clauses: first the model's own, back-translated
+                    // (`land_query_only_model`), else the fail-closed
+                    // bounded-BMC replay (fresh verified witness + strict
+                    // PdrSolver replay via `replay_confirm_unsafe_on_problem`).
+                    // The transformed model itself is never trusted. Anything
+                    // unconfirmed keeps the historical fail-closed None.
+                    if let Some(landed) = self.land_query_only_model(
+                        problem,
+                        query,
+                        &model,
+                        back_translator,
+                        label,
+                        deadline,
+                        cancellation,
+                    ) {
+                        return boundary_open()
+                            .then_some(QueryOnlyDischarge::VerifiedUnsafe(landed));
+                    }
                     if self.config.verbose {
                         safe_eprintln!(
                             "Adaptive: {label} query-only clause {idx} is satisfiable; \
@@ -269,7 +313,7 @@ impl AdaptivePortfolio {
         }
         let _query_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
         let _term_budget_guard =
-            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+            crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
         if !problem.predicates().is_empty() || problem.clauses().is_empty() {
             return false;
         }
@@ -353,7 +397,7 @@ impl AdaptivePortfolio {
         }
         let _recheck_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
         let _term_budget_guard =
-            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+            crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
         if transformed_problem.has_array_sorts() || transformed_problem.has_datatype_sorts() {
             tracing::warn!(
                 depth,
@@ -399,6 +443,7 @@ impl AdaptivePortfolio {
         let recheck = BmcSolver::new(
             recheck_problem,
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(recheck_cancel),
@@ -411,7 +456,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -495,8 +544,11 @@ impl AdaptivePortfolio {
         {
             return false;
         }
-        let verified =
-            verifier.verify_model_per_rule(model, remaining.min(Duration::from_millis(1500)));
+        // Each rule's executor search is bounded by counted work, and its wall
+        // follows the deadline (a quarter of what remains, 2-30 s) instead of
+        // a fixed 1.5 s, which refused valid models whenever the host was
+        // loaded (`pdr::verification::model::counted`).
+        let verified = verifier.verify_model_at_preprocessed_safe_boundary(model, deadline);
         if verified
             && !self.cancellation_token.is_cancelled()
             && !cancellation.is_cancelled()
@@ -560,7 +612,7 @@ impl AdaptivePortfolio {
         }
         let _probe_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(probe_deadline);
         let _term_budget_guard =
-            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+            crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
         let stage_budget = probe_deadline.saturating_duration_since(Instant::now());
         let PreprocessSummary {
             transformed_problem,
@@ -599,6 +651,7 @@ impl AdaptivePortfolio {
             label,
             depth,
             cancellation,
+            back_translator.as_ref(),
         ) {
             Some(QueryOnlyDischarge::Discharged(query_count)) => {
                 let transformed_model = InvariantModel::default();
@@ -701,10 +754,11 @@ impl AdaptivePortfolio {
                 // of aborting the probe.
             }
             Some(QueryOnlyDischarge::VerifiedUnsafe(verified_cex)) => {
-                // The counterexample was replay-confirmed on the ORIGINAL
-                // clauses inside `replay_confirm_unsafe_on_problem` (fresh
-                // witness + strict PdrSolver replay), so it needs no
-                // back-translation from the transformed space.
+                // The counterexample's derivation already ground-validated on
+                // the ORIGINAL clauses: back-translated by
+                // `land_query_only_model`, or replay-confirmed inside
+                // `replay_confirm_unsafe_on_problem` (fresh witness + strict
+                // PdrSolver replay). It needs no further back-translation.
                 if !boundary_open() {
                     return None;
                 }
@@ -721,17 +775,31 @@ impl AdaptivePortfolio {
         if !boundary_open() {
             return None;
         }
-        let bmc_budget = probe_deadline.saturating_duration_since(Instant::now());
-        if bmc_budget.is_zero() {
-            return None;
-        }
         let rekey_probe_problem = features.uses_arrays.then(|| transformed_problem.clone());
         if !boundary_open() {
+            return None;
+        }
+        let mut survivor_cancel = cancellation.child();
+        survivor_cancel.link_upstream(&self.cancellation_token);
+        let survivor_cancel = survivor_cancel.sticky_child();
+        let survivor = if bmc_is_acyclic && bmc_features.num_predicates == 1 {
+            crate::transform::ClauseInliner::capture_acyclic_survivor_until(
+                &transformed_problem,
+                probe_deadline,
+                &survivor_cancel,
+            )
+            .ok()?
+        } else {
+            None
+        };
+        let bmc_budget = probe_deadline.saturating_duration_since(Instant::now());
+        if bmc_budget.is_zero() || !boundary_open() {
             return None;
         }
         let bmc = BmcSolver::new(
             transformed_problem,
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(cancellation.child()),
@@ -747,7 +815,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -761,17 +833,46 @@ impl AdaptivePortfolio {
         }
         match result {
             PortfolioResult::Safe(model) => {
-                let translated_model = back_translator.translate_validity(model.clone());
-                if !boundary_open() {
+                let landing_open = || {
+                    boundary_open()
+                        && (!model.is_empty()
+                            || survivor.is_none()
+                            || (!survivor_cancel.is_cancelled()
+                                && !crate::smt::smt_deadline_expired()
+                                && crate::bmc::memory::Budget::capture(None, None).open()))
+                };
+                // Keep BMC's original empty result for the unchanged equisat
+                // fallback. A synthesized witness is only a validation candidate.
+                let candidate = if model.is_empty() {
+                    match &survivor {
+                        Some(survivor) => survivor
+                            .materialize_until(probe_deadline, &survivor_cancel)
+                            .ok()?,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let validation_cancel = if model.is_empty() && survivor.is_some() {
+                    &survivor_cancel
+                } else {
+                    cancellation
+                };
+                if !landing_open() {
+                    return None;
+                }
+                let translated_model =
+                    back_translator.translate_validity(candidate.unwrap_or_else(|| model.clone()));
+                if !landing_open() {
                     return None;
                 }
                 if self.validate_preprocessed_safe_model(
                     &translated_model,
                     label,
                     probe_deadline,
-                    cancellation,
+                    validation_cancel,
                 ) {
-                    if !boundary_open() {
+                    if !landing_open() {
                         return None;
                     }
                     return Some((
@@ -779,7 +880,7 @@ impl AdaptivePortfolio {
                         ValidationEvidence::FullVerification,
                     ));
                 }
-                if !boundary_open() {
+                if !landing_open() {
                     return None;
                 }
                 if model.is_empty() {
@@ -813,9 +914,9 @@ impl AdaptivePortfolio {
                             &transform_memory,
                             depth,
                             recheck_deadline,
-                            cancellation,
+                            validation_cancel,
                         )?;
-                        if !boundary_open() {
+                        if !landing_open() {
                             return None;
                         }
                         return Some((PortfolioResult::Safe(model), evidence));
@@ -943,7 +1044,7 @@ impl AdaptivePortfolio {
         if !boundary_open() {
             return None;
         }
-        let Some(translated) = translated else {
+        let Some(mut translated) = translated else {
             if verbose {
                 safe_eprintln!(
                     "{lane}: ground back-translation of the transformed derivation \
@@ -954,6 +1055,10 @@ impl AdaptivePortfolio {
             }
             return None;
         };
+        // A step may carry bindings its clause does not mention, which the
+        // checked replay's artifact export refuses; validation reads only the
+        // clause's own, so narrowing first changes no verdict below.
+        translated.retain_clause_bindings(&self.problem);
         if let Err(err) =
             crate::ground_derivation::validate_ground_derivation(&self.problem, &translated)
         {
@@ -993,7 +1098,16 @@ impl AdaptivePortfolio {
             && !features.has_cycles
             && !features.uses_arrays
             && self.problem.has_bv_sorts()
-            && (features.num_predicates >= 32 || features.dag_depth >= 32 || features.has_ite)
+            && features.acyclic_bv_proof_scale_or_ite()
+    }
+
+    pub(crate) fn is_fully_collapsed_query_problem(problem: &ChcProblem) -> bool {
+        problem.predicates().is_empty()
+            && !problem.clauses().is_empty()
+            && problem
+                .clauses()
+                .iter()
+                .all(|clause| clause.is_query() && clause.body.predicates.is_empty())
     }
 
     /// Scalarized graph-collapse + level-BMC probe with the ground-witness
@@ -1046,7 +1160,7 @@ impl AdaptivePortfolio {
         {
             return None;
         }
-        let mut collapse_cancel = self.cancellation_token.child();
+        let mut collapse_cancel = self.lane_token();
         if let Some(caller) = caller_cancellation {
             collapse_cancel.link_upstream(caller);
         }
@@ -1055,7 +1169,7 @@ impl AdaptivePortfolio {
         let _collapse_smt_deadline =
             crate::smt::ScopedSmtDeadline::install_until(collapse_deadline);
         let _term_budget_guard =
-            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+            crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
         let boundary_open = || {
             !collapse_cancel.is_cancelled()
                 && !self.cancellation_token.is_cancelled()
@@ -1199,6 +1313,7 @@ impl AdaptivePortfolio {
             let level_bmc = BmcSolver::new(
                 level_problem,
                 BmcConfig {
+                    smt_lane: crate::smt::SmtLane::Verification,
                     base: ChcEngineConfig {
                         verbose,
                         cancellation_token: Some(level_cancel.clone()),
@@ -1211,7 +1326,11 @@ impl AdaptivePortfolio {
                     enable_k_induction: false,
                     enable_adaptive_stepping: false,
                     proof_cross_check: false,
+                    memory_budget: None,
                     ts_probe_clamp: None,
+                    soft_time_budget: None,
+                    probe_extension_deadline: None,
+                    resume_frontier: None,
                     sweep_past_spurious_sat: true,
                 },
             );
@@ -1324,7 +1443,7 @@ impl AdaptivePortfolio {
         .into_iter()
         .flatten()
         .min()?;
-        let route_cancellation = self.cancellation_token.child();
+        let route_cancellation = self.lane_token();
         let _route_timeout = route_cancellation
             .cancel_after(route_deadline.saturating_duration_since(Instant::now()));
         let boundary_open = || {
@@ -1531,6 +1650,7 @@ impl AdaptivePortfolio {
         let bmc = BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(route_cancellation.clone()),
@@ -1544,7 +1664,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -1553,6 +1677,12 @@ impl AdaptivePortfolio {
         if !boundary_open() {
             return None;
         }
+        // Outside arrays, the only exhaustive Safe declined below is one on a
+        // query cone the independent re-check refuses as cyclic: every
+        // counterexample up to `depth` is already ruled out, so the
+        // unsafe-only pass after it could only spend the stage budget.
+        let declined_exhaustive_safe =
+            matches!(result, PortfolioResult::Safe(_)) && !features.uses_arrays;
         if let Some(hit) = self.acyclic_bmc_probe_result(result, features, depth) {
             // This is the raw, untransformed `self.problem` probe. Cache an
             // empty-model scalar proof only here, after the exact exhaustive
@@ -1569,6 +1699,9 @@ impl AdaptivePortfolio {
                 crate::acyclic_cert_cache::record_acyclic_bmc_safe(&self.problem, depth);
             }
             return Some(hit);
+        }
+        if declined_exhaustive_safe {
+            return None;
         }
 
         // The exact acyclic safe-first pass can find a SAT branch it cannot
@@ -1595,6 +1728,7 @@ impl AdaptivePortfolio {
         let fallback = BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(route_cancellation.clone()),
@@ -1608,7 +1742,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
@@ -1658,20 +1796,97 @@ impl AdaptivePortfolio {
             return None;
         }
 
+        let mut cached_native_summary = None;
         let high_arity_bv_proof_shape = self.is_high_arity_acyclic_bv_proof_shape(features);
         if high_arity_bv_proof_shape {
-            let exact_stage_budget = remaining.min(Duration::from_secs(45)).max(stage_budget);
-            if let Some(result) = self.run_direct_acyclic_bmc_probe(
-                features,
-                exact_stage_budget,
-                "original BV-exact",
-                true,
+            // The existing BV-native pipeline can collapse these generated DAGs
+            // to query bodies that the original-model/original-witness checks
+            // already discharge. Prefer only that fully collapsed candidate,
+            // not a general transformed BMC run. Preprocessing and the raw
+            // original fallback share ONE existing exact-probe grant, leaving
+            // its recovery reserve intact even when the candidate refuses.
+            let prefix_started = Instant::now();
+            let exact_stage_budget = Self::exact_acyclic_probe_grant(remaining);
+            let requested = prefix_started + exact_stage_budget;
+            let prefix_deadline =
+                route_deadline.map_or(requested, |boundary| boundary.min(requested));
+            let _prefix_solve_deadline =
+                crate::smt::ScopedSolveDeadline::new(Some(prefix_deadline));
+            let _prefix_smt_deadline =
+                crate::smt::ScopedSmtDeadline::install_until(prefix_deadline);
+            let _term_budget_guard =
+                crate::bmc::memory::Budget::capture(None, self.config.memory_budget).install();
+
+            if let Some(summary) = PreprocessSummary::build_bv_native_with_limits(
+                self.problem.clone(),
+                self.config.verbose,
+                Some(prefix_deadline),
+                &self.cancellation_token,
             ) {
-                return Some(result);
+                if Self::is_fully_collapsed_query_problem(&summary.transformed_problem) {
+                    let result = self.run_preprocessed_acyclic_bmc_probe_until(
+                        summary,
+                        features,
+                        prefix_deadline,
+                        "BV-native collapsed",
+                        true,
+                        &self.cancellation_token,
+                    );
+                    self.decision_log.log_decision(DecisionEntry {
+                        stage: "collapsed_bv_native_query_prepass",
+                        gate_result: true,
+                        gate_reason: "BV-native summary fully collapsed to query-only clauses"
+                            .to_string(),
+                        budget_secs: exact_stage_budget.as_secs_f64(),
+                        elapsed_secs: prefix_started.elapsed().as_secs_f64(),
+                        result: result
+                            .as_ref()
+                            .map_or("unknown", |(result, _)| Self::result_to_str(result)),
+                        lemmas_learned: 0,
+                        max_frame: 0,
+                    });
+                    if result.is_some() && !self.budget_exhausted(Some(prefix_deadline)) {
+                        return result;
+                    }
+                } else {
+                    // A noncollapsed summary does not change the original-first
+                    // route. Keep it for the existing native tail instead of
+                    // repeating preprocessing after the exact original probe.
+                    cached_native_summary = Some(summary);
+                }
             }
-            if self.budget_exhausted(route_deadline) {
-                return None;
+
+            let fallback_budget = prefix_deadline.saturating_duration_since(Instant::now());
+            if !fallback_budget.is_zero() && !self.cancellation_token.is_cancelled() {
+                let fallback_started = Instant::now();
+                let result = self.run_direct_acyclic_bmc_probe(
+                    features,
+                    fallback_budget,
+                    "original BV-exact",
+                    true,
+                );
+                self.decision_log.log_decision(DecisionEntry {
+                    stage: "original_bv_exact_acyclic_probe",
+                    gate_result: true,
+                    gate_reason: "original exact fallback within the unchanged prefix deadline"
+                        .to_string(),
+                    budget_secs: fallback_budget.as_secs_f64(),
+                    elapsed_secs: fallback_started.elapsed().as_secs_f64(),
+                    result: result
+                        .as_ref()
+                        .map_or("unknown", |(result, _)| Self::result_to_str(result)),
+                    lemmas_learned: 0,
+                    max_frame: 0,
+                });
+                if result.is_some() && !self.budget_exhausted(Some(prefix_deadline)) {
+                    return result;
+                }
             }
+        }
+        // The prefix scopes end here: a refused/capped prefix must not impose
+        // its expired local deadline on the unchanged native recovery tail.
+        if self.budget_exhausted(route_deadline) {
+            return None;
         }
 
         // Use the same fail-closed dependency classification as the outer
@@ -1770,15 +1985,18 @@ impl AdaptivePortfolio {
         // Build the BV-native summary before selecting the bound. Inlining can
         // collapse generated basic-block DAGs by hundreds of predicates, so the
         // exhaustive acyclic bound must follow the transformed graph.
-        let summary = PreprocessSummary::build_bv_native_with_limits(
-            self.problem.clone(),
-            self.config.verbose,
-            route_deadline,
-            &self.cancellation_token,
-        )?;
+        let summary = match cached_native_summary {
+            Some(summary) => summary,
+            None => PreprocessSummary::build_bv_native_with_limits(
+                self.problem.clone(),
+                self.config.verbose,
+                route_deadline,
+                &self.cancellation_token,
+            )?,
+        };
         let prefer_exact_native = self.problem.has_bv_sorts()
             && !features.uses_arrays
-            && (features.num_predicates >= 32 || features.dag_depth >= 32 || features.has_ite);
+            && features.acyclic_bv_proof_scale_or_ite();
         let requested = Instant::now() + native_stage_budget;
         let probe_deadline = route_deadline.map_or(requested, |boundary| boundary.min(requested));
         self.run_preprocessed_acyclic_bmc_probe_until(
@@ -1813,6 +2031,34 @@ impl AdaptivePortfolio {
                 .min(Duration::from_secs(13))
                 .min(remaining)
         }
+    }
+
+    /// Grant for the exact acyclic BMC probe, keeping a recovery reserve.
+    ///
+    /// The exact lane is complete for these DAGs, so it used to be given the
+    /// whole remaining budget (`remaining.min(45s).max(stage_budget)`). That is
+    /// only a good bet while the lane reaches its `check-sat`s: it can also
+    /// return `Unknown` having issued NO checks, and then the budget is gone and
+    /// nothing was learned. Measured on model-checker-consumer's Kani corpus queries, the
+    /// probe that does answer needs tens of milliseconds after preprocessing,
+    /// so a reserve is enough to keep the verdict.
+    ///
+    /// The reserve only ever LOWERS the grant, so a refusal still comes earlier
+    /// than before and no verdict depends on it.
+    pub(crate) fn exact_acyclic_probe_grant(remaining: Duration) -> Duration {
+        /// Absolute cap the exact lane never exceeded.
+        const EXACT_PROBE_CAP: Duration = Duration::from_secs(45);
+        /// Share of the remaining budget the exact lane may consume, leaving
+        /// the rest for a probe that can answer if the exact lane refuses.
+        const EXACT_PROBE_SHARE: f64 = 0.6;
+
+        let granted = remaining.mul_f64(EXACT_PROBE_SHARE).min(EXACT_PROBE_CAP);
+        if granted.is_zero() {
+            // Too little left to split: spend what there is rather than
+            // refusing on an empty budget.
+            return remaining;
+        }
+        granted
     }
 
     pub(crate) fn multi_pred_portfolio_timeout(remaining: Duration) -> Duration {
@@ -1891,6 +2137,13 @@ impl AdaptivePortfolio {
                 safe_eprintln!("Adaptive: MultiPredLinear early BV shallow-BMC found Unsafe");
             }
             return (result, ValidationEvidence::FullVerification);
+        }
+
+        // Cyclic BV/array paths need finite rule selections rather than the
+        // raw indicator disjunction. Only a retained original ground
+        // derivation can finish this minority-slice probe.
+        if let Some(result) = self.try_linear_bv_array_refutation(features, deadline) {
+            return result;
         }
 
         // Stage 0.5: Exact BMC probe for acyclic DAGs.
@@ -2655,6 +2908,7 @@ impl AdaptivePortfolio {
                 );
             }
             engines.push(EngineConfig::Bmc(BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -2667,7 +2921,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             }));
         } else if features.uses_arrays {
@@ -2687,6 +2945,7 @@ impl AdaptivePortfolio {
                 );
             }
             engines.push(EngineConfig::Bmc(BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -2699,7 +2958,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             }));
         } else if features.is_linear && features.num_predicates >= 2 {
@@ -2721,6 +2984,7 @@ impl AdaptivePortfolio {
                 );
             }
             engines.push(EngineConfig::Bmc(BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     ..ChcEngineConfig::default()
@@ -2733,7 +2997,11 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             }));
         } else if features.has_cycles {

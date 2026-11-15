@@ -127,6 +127,7 @@ fn test_euf_axiom_result_struct() {
     let result = EufAxiomResult {
         clauses: vec![ay_core::CnfClause::new(vec![1, 2, 3])],
         num_vars: 5,
+        bail: None,
     };
     assert_eq!(result.clauses.len(), 1);
     assert_eq!(result.num_vars, 5);

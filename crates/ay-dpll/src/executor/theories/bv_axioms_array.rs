@@ -22,6 +22,25 @@ use std::collections::BTreeMap;
 use super::super::Executor;
 use super::ArrayAxiomResult;
 
+mod complex_selects;
+mod fc_candidates;
+mod fc_constants;
+mod fc_guard;
+mod late_reads;
+mod row2_work;
+mod row_guard;
+
+#[cfg(test)]
+mod late_read_tests;
+#[cfg(test)]
+mod row_guard_integration_tests;
+#[cfg(test)]
+mod row_index_constant_tests;
+
+use fc_candidates::{CandidatePrefixes, Category};
+pub(in crate::executor) use late_reads::LateArrayReads;
+use late_reads::MAX_LATE_ARRAY_READS;
+
 fn debug_abv_packed_lookup() -> bool {
     ay_core::misc_cli_flags().debug_abv_packed_lookup
 }
@@ -3052,102 +3071,14 @@ impl Executor {
     /// encoder can connect such a read to `select(a, j)`, but only if that base
     /// read exists as a term with BV bits. Residual `select(ite(c, a, b), j)`
     /// terms likewise need branch reads for guarded ITE clauses. This helper
-    /// creates those reads as extra roots, not assertions, and repeats to cover
-    /// nested store chains.
+    /// creates those reads as extra roots, not assertions. Generation-ordered
+    /// work discovers only appended roots to cover nested store chains without
+    /// repeatedly rescanning the original assertion DAG.
     pub(in crate::executor) fn materialize_array_row2_read_terms(
         &mut self,
         extra_roots: &mut Vec<TermId>,
-    ) -> usize {
-        const MAX_ROW2_READ_TERMS: usize = 20_000;
-
-        let mut known_roots: HashSet<TermId> = extra_roots.iter().copied().collect();
-        let mut seen_obligations: HashSet<(TermId, TermId)> = HashSet::default();
-        let mut added = 0usize;
-
-        loop {
-            let mut select_terms: Vec<(TermId, TermId, TermId)> = Vec::new();
-            let mut store_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
-            let mut visited = HashSet::default();
-
-            for &assertion in &self.ctx.assertions {
-                self.collect_array_terms(
-                    assertion,
-                    &mut select_terms,
-                    &mut store_terms,
-                    &mut visited,
-                );
-            }
-            for &term in extra_roots.iter() {
-                self.collect_array_terms(term, &mut select_terms, &mut store_terms, &mut visited);
-            }
-
-            if select_terms.is_empty() {
-                break;
-            }
-
-            let mut selects_by_array: HashMap<TermId, Vec<TermId>> = HashMap::default();
-            for &(_select_term, array, index) in &select_terms {
-                selects_by_array.entry(array).or_default().push(index);
-            }
-
-            let mut progress = false;
-            for &(_select_term, array, sel_idx) in &select_terms {
-                let TermData::Ite(_cond, then_array, else_array) = self.ctx.terms.get(array) else {
-                    continue;
-                };
-                let then_array = *then_array;
-                let else_array = *else_array;
-
-                for branch_array in [then_array, else_array] {
-                    if !matches!(self.ctx.terms.sort(branch_array), Sort::Array(_)) {
-                        continue;
-                    }
-                    if !seen_obligations.insert((branch_array, sel_idx)) {
-                        continue;
-                    }
-                    let read_term = self.ctx.terms.mk_select(branch_array, sel_idx);
-                    if known_roots.insert(read_term) {
-                        extra_roots.push(read_term);
-                        added += 1;
-                        progress = true;
-                        if added >= MAX_ROW2_READ_TERMS {
-                            return added;
-                        }
-                    }
-                }
-            }
-
-            for &(store_term, base_array, store_idx, _store_val) in &store_terms {
-                let Some(indices) = selects_by_array.get(&store_term) else {
-                    continue;
-                };
-
-                for &sel_idx in indices {
-                    if store_idx == sel_idx {
-                        continue;
-                    }
-                    if !seen_obligations.insert((base_array, sel_idx)) {
-                        continue;
-                    }
-
-                    let read_term = self.ctx.terms.mk_select(base_array, sel_idx);
-                    if known_roots.insert(read_term) {
-                        extra_roots.push(read_term);
-                        added += 1;
-                        progress = true;
-                        if added >= MAX_ROW2_READ_TERMS {
-                            return added;
-                        }
-                    }
-                }
-            }
-
-            if !progress {
-                break;
-            }
-        }
-
-        added
+    ) -> LateArrayReads {
+        row2_work::materialize(self, extra_roots)
     }
 
     /// Ensure array-index/value BV terms are bit-blasted before generating
@@ -3157,6 +3088,7 @@ impl Executor {
         &self,
         bv_solver: &mut BvSolver<'_>,
         extra_terms: &[TermId],
+        late_reads: Option<&LateArrayReads>,
     ) {
         let mut select_terms: Vec<(TermId, TermId, TermId)> = Vec::new();
         let mut store_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
@@ -3177,6 +3109,9 @@ impl Executor {
         for &(_, _, store_idx, store_val) in &store_terms {
             let _ = bv_solver.ensure_term_bits(store_idx);
             let _ = bv_solver.ensure_term_bits(store_val);
+        }
+        if let Some(reads) = late_reads {
+            reads.materialize_bits(bv_solver, &self.ctx.terms);
         }
     }
 
@@ -3344,6 +3279,7 @@ impl Executor {
         var_offset: u32,
         extra_terms: &[TermId],
         tseitin_term_to_var: &BTreeMap<TermId, u32>,
+        late_reads: Option<&LateArrayReads>,
     ) -> ArrayAxiomResult {
         let mut result = ArrayAxiomResult {
             clauses: Vec::new(),
@@ -3498,13 +3434,24 @@ impl Executor {
                     continue;
                 }
 
-                // Create diff variables for index bits: diff_k ↔ (i_k ⊕ j_k)
-                // Skip bit positions where both are known-equal constants
-                // (XOR is trivially 0, contributing nothing to "some_diff").
+                // Encode index differences: diff_k ↔ (i_k ⊕ j_k). As in
+                // BvSolver::mk_xor, a single encoding-time constant needs only
+                // the other signed literal (negated for true), not a gate.
+                // Both-constant and both-symbolic cases keep the old encoding.
                 let mut diff_vars = Vec::with_capacity(idx_i_bits.len());
                 for (&bit_i, &bit_j) in idx_i_bits.iter().zip(idx_j_bits.iter()) {
                     let v_i = bv_solver.bit_constant_value(bit_i);
                     let v_j = bv_solver.bit_constant_value(bit_j);
+                    let constant_and_other = match (v_i, v_j) {
+                        (Some(constant), None) => Some((constant, bit_j)),
+                        (None, Some(constant)) => Some((constant, bit_i)),
+                        _ => None,
+                    };
+                    if let Some((constant, other)) = constant_and_other {
+                        let other = offset_bit(other);
+                        diff_vars.push(if constant { -other } else { other });
+                        continue;
+                    }
                     if let (Some(ci), Some(cj)) = (v_i, v_j) {
                         if ci == cj {
                             continue; // Known-equal: XOR is always 0
@@ -3532,34 +3479,22 @@ impl Executor {
                         .push(ay_core::CnfClause::new(vec![ob_i, -ob_j, diff_var]));
                 }
 
-                // If diff_vars is empty (all bits known-equal), skip this pair
-                // — the indices are definitionally equal, handled by mk_select.
+                // Distinct index terms can still encode the same constants
+                // (for example a residual bvadd(0, 0)). With no differences,
+                // ROW1 is unconditional; syntactic mk_select rewriting need
+                // not have equated this raw select with the stored value.
                 if diff_vars.is_empty() {
+                    for (&selected, &value) in result_lits.iter().zip(&val_lits) {
+                        result
+                            .clauses
+                            .push(ay_core::CnfClause::new(vec![-selected, value]));
+                        result
+                            .clauses
+                            .push(ay_core::CnfClause::new(vec![selected, -value]));
+                    }
+                    // ROW2 has a false antecedent here, so it needs neither a
+                    // base read nor an index-equality summary variable.
                     continue;
-                }
-
-                // ROW1: (i == j) → (result == v)
-                // Clausal: (some_diff) ∨ (result_k == v_k)
-                // = (diff_0 ∨ diff_1 ∨ ... ∨ ¬result_k ∨ v_k)
-                //   (diff_0 ∨ diff_1 ∨ ... ∨ result_k ∨ ¬v_k)
-                let suffix_start = diff_vars.len();
-                let mut clause_buf = Vec::with_capacity(suffix_start + 2);
-                clause_buf.extend_from_slice(&diff_vars);
-                clause_buf.push(0);
-                clause_buf.push(0);
-
-                for (&ob_r, &ob_v) in result_lits.iter().zip(val_lits.iter()) {
-                    clause_buf[suffix_start] = -ob_r;
-                    clause_buf[suffix_start + 1] = ob_v;
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(clause_buf.clone()));
-
-                    clause_buf[suffix_start] = ob_r;
-                    clause_buf[suffix_start + 1] = -ob_v;
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(clause_buf.clone()));
                 }
 
                 // ROW2: (i != j) → (result == select(a, j))
@@ -3574,39 +3509,24 @@ impl Executor {
                 let read_term = normalized_select_index
                     .get(&base_array)
                     .and_then(|by_idx| by_idx.get(&norm_sel_idx))
-                    .copied();
-
-                if let Some(read_term) = read_term {
-                    if let Some(read_lits) = scalar_elem_lits(read_term) {
-                        if read_lits.len() == result_lits.len() {
-                            // Create eq_idx variable: eq_idx ↔ ¬(diff_0 ∨ ... ∨ diff_n)
-                            let eq_idx = next_var as i32;
-                            next_var += 1;
-
-                            // eq_idx → ¬diff_k for each k
-                            for &diff_var in &diff_vars {
-                                result
-                                    .clauses
-                                    .push(ay_core::CnfClause::new(vec![-eq_idx, -diff_var]));
-                            }
-                            // (diff_0 ∨ ... ∨ diff_n ∨ eq_idx)
-                            let mut eq_def_clause = diff_vars.clone();
-                            eq_def_clause.push(eq_idx);
-                            result.clauses.push(ay_core::CnfClause::new(eq_def_clause));
-
-                            // ROW2: ¬eq_idx → (result_k == read_k)
-                            // = (eq_idx ∨ ¬result_k ∨ read_k) ∧ (eq_idx ∨ result_k ∨ ¬read_k)
-                            for (&ob_r, &ob_rd) in result_lits.iter().zip(read_lits.iter()) {
-                                result
-                                    .clauses
-                                    .push(ay_core::CnfClause::new(vec![eq_idx, -ob_r, ob_rd]));
-                                result
-                                    .clauses
-                                    .push(ay_core::CnfClause::new(vec![eq_idx, ob_r, -ob_rd]));
-                            }
-                        }
-                    }
-                }
+                    .copied()
+                    .or_else(|| late_reads.and_then(|reads| reads.get(base_array, sel_idx)));
+                let read_lits = read_term
+                    .and_then(|read_term| scalar_elem_lits(read_term))
+                    .filter(|read_lits| read_lits.len() == result_lits.len());
+                // Reserve the SAME summary variable ROW2 already needed. ROW1
+                // can reference its later definition without copying every
+                // index-difference literal into every value-bit clause. Missing
+                // or incompatible base reads keep the original wide ROW1;
+                // they do not gain another variable or any ROW2 constraint.
+                let row2 = read_lits.as_deref().map(|read_lits| {
+                    let eq_idx = next_var as i32;
+                    next_var += 1;
+                    (eq_idx, read_lits)
+                });
+                row_guard::emit_row_clauses(&diff_vars, &result_lits, &val_lits, row2, |clause| {
+                    result.clauses.push(ay_core::CnfClause::new(clause))
+                });
             }
         }
 
@@ -3626,10 +3546,18 @@ impl Executor {
                 continue;
             };
 
-            let Some(&then_read) = exact_select_index.get(&(*then_array, sel_idx)) else {
+            let Some(then_read) = exact_select_index
+                .get(&(*then_array, sel_idx))
+                .copied()
+                .or_else(|| late_reads.and_then(|reads| reads.get(*then_array, sel_idx)))
+            else {
                 continue;
             };
-            let Some(&else_read) = exact_select_index.get(&(*else_array, sel_idx)) else {
+            let Some(else_read) = exact_select_index
+                .get(&(*else_array, sel_idx))
+                .copied()
+                .or_else(|| late_reads.and_then(|reads| reads.get(*else_array, sel_idx)))
+            else {
                 continue;
             };
 
@@ -4582,19 +4510,25 @@ impl Executor {
             }
         }
         let mut fc_global_pairs_emitted: usize = 0;
-        let mut fc_global_pairs_skipped: usize = 0;
+        let mut fc_global_pairs_skipped: u128 = 0;
+        // Invocation-local only: exact index pairs share one fully emitted
+        // guard across arrays, never their value consequents or pair charges.
+        let mut fc_index_guards = fc_guard::IndexEqualityGuards::new(fc_global_pair_budget);
 
         for (&array, selects) in &selects_by_array {
             if selects.len() < 2 {
                 continue;
             }
 
-            // Collect FC candidate pairs, separated by priority (#8286).
-            // Same-base pairs first (always generated), cross-base second (budgeted).
-            let mut finite_domain_pairs: Vec<(usize, usize)> = Vec::new();
-            let mut same_base_pairs: Vec<(usize, usize)> = Vec::new();
-            let mut cross_base_pairs: Vec<(usize, usize)> = Vec::new();
-            let mut finite_pair_seen: HashSet<(usize, usize)> = HashSet::default();
+            // Retain only each category's potentially usable prefix. Full
+            // category counts still drive the diagnostics, and the
+            // output order remains finite -> same-base -> cross-base. The scan
+            // remains quadratic; only candidate storage is now budget-bounded.
+            let mut candidates = CandidatePrefixes::new(
+                fc_same_base_budget_per_array,
+                fc_cross_base_budget_per_array,
+                fc_global_pair_budget - fc_global_pairs_emitted,
+            );
 
             // Small finite BV-index arrays are common for packed-word memory
             // encodings. Make FC complete between symbolic base-array reads and
@@ -4608,14 +4542,22 @@ impl Executor {
                         if matches!(&arr_sort.index_sort, Sort::BitVec(idx_bv) if idx_bv.width <= 4)
                 );
 
-            if finite_domain_complete {
-                for i in 0..selects.len() {
-                    for j in (i + 1)..selects.len() {
-                        let (_sel1, idx1) = selects[i];
-                        let (_sel2, idx2) = selects[j];
-                        if idx1 == idx2 {
-                            continue;
-                        }
+            for i in 0..selects.len() {
+                for j in (i + 1)..selects.len() {
+                    let (_sel1, idx1) = selects[i];
+                    let (_sel2, idx2) = selects[j];
+                    if idx1 == idx2 {
+                        continue;
+                    }
+                    if fc_constants::provably_distinct_literal_indices(
+                        &self.ctx.terms,
+                        array,
+                        idx1,
+                        idx2,
+                    ) {
+                        continue;
+                    }
+                    if finite_domain_complete {
                         let idx1_const = matches!(
                             self.ctx.terms.get(idx1),
                             TermData::Const(Constant::BitVec { .. })
@@ -4625,22 +4567,9 @@ impl Executor {
                             TermData::Const(Constant::BitVec { .. })
                         );
                         if idx1_const ^ idx2_const {
-                            finite_pair_seen.insert((i, j));
-                            finite_domain_pairs.push((i, j));
+                            candidates.observe(Category::Finite, (i, j));
+                            continue;
                         }
-                    }
-                }
-            }
-
-            for i in 0..selects.len() {
-                for j in (i + 1)..selects.len() {
-                    let (_sel1, idx1) = selects[i];
-                    let (_sel2, idx2) = selects[j];
-                    if idx1 == idx2 {
-                        continue;
-                    }
-                    if finite_pair_seen.contains(&(i, j)) {
-                        continue;
                     }
 
                     // Classify as same-base or cross-base using normalized keys.
@@ -4649,50 +4578,43 @@ impl Executor {
                         .zip(norm_key_cache.get(&idx2))
                         .is_some_and(|(nk1, nk2)| nk1.shares_base_with(nk2));
 
-                    if shares_base {
-                        same_base_pairs.push((i, j));
+                    let category = if shares_base {
+                        Category::SameBase
                     } else {
-                        cross_base_pairs.push((i, j));
-                    }
+                        Category::CrossBase
+                    };
+                    candidates.observe(category, (i, j));
                 }
             }
 
             // Process same-base pairs (up to their budget — high priority),
             // then cross-base pairs (up to their budget). Anything past a
             // budget is left to the Phase 10.7 CEGAR FC refinement.
-            let same_base_limit = fc_same_base_budget_per_array.min(same_base_pairs.len());
-            let cross_base_limit = fc_cross_base_budget_per_array.min(cross_base_pairs.len());
-            if ptrace && same_base_limit < same_base_pairs.len() {
+            let counts = candidates.counts();
+            let same_base_limit = candidates.same_base_limit();
+            if ptrace && same_base_limit < counts.same_base {
                 // No silent caps: make the truncation visible in the trace.
                 eprintln!(
                     "c phase-trace array-axioms.fc-same-base-truncated kept={} of {}",
-                    same_base_limit,
-                    same_base_pairs.len()
+                    same_base_limit, counts.same_base
                 );
             }
-            if ptrace && (same_base_pairs.len() + cross_base_pairs.len() > 500) {
+            if ptrace && (counts.same_base + counts.cross_base > 500) {
                 eprintln!(
                     "c phase-trace array-axioms.fc-array selects={} finite={} same_base={} cross_base={} clauses_so_far={}",
                     selects.len(),
-                    finite_domain_pairs.len(),
-                    same_base_pairs.len(),
-                    cross_base_pairs.len(),
+                    counts.finite,
+                    counts.same_base,
+                    counts.cross_base,
                     result.clauses.len()
                 );
             }
-            let all_pairs = finite_domain_pairs
-                .iter()
-                .chain(same_base_pairs[..same_base_limit].iter())
-                .chain(cross_base_pairs[..cross_base_limit].iter());
-
-            for &(i, j) in all_pairs {
-                // Global FC budget (see FC_GLOBAL_PAIR_BUDGET): pairs beyond it
-                // are counted (reported below — no silent caps) and left to the
-                // CEGAR refinement.
-                if fc_global_pairs_emitted >= fc_global_pair_budget {
-                    fc_global_pairs_skipped += 1;
-                    continue;
-                }
+            fc_global_pairs_skipped += candidates.global_skipped();
+            for &(i, j) in candidates.selected() {
+                // Remaining candidates still consume global allowance BEFORE
+                // missing-bit and encoded/normalized distinctness pruning.
+                // Only authenticated distinct literal pairs were excluded
+                // before admission; omitted suffixes still require lazy CEGAR.
                 fc_global_pairs_emitted += 1;
                 let (sel1, idx1) = selects[i];
                 let (sel2, idx2) = selects[j];
@@ -4748,70 +4670,17 @@ impl Executor {
                 // (the development design notes). `eq_idx` below depends
                 // only on the INDEX bits, which exist for both cases.
 
-                // Create diff variables only for bit positions that are NOT
-                // known-equal constants. Known-equal bits always have XOR = 0,
-                // so their diff variables are trivially false and don't
-                // contribute to the "some_diff" disjunction.
-                let mut diff_vars = Vec::with_capacity(idx1_bits.len());
-                for (&b1, &b2) in idx1_bits.iter().zip(idx2_bits.iter()) {
-                    // Skip bit positions where both are the same known constant.
-                    let v1 = bv_solver.bit_constant_value(b1);
-                    let v2 = bv_solver.bit_constant_value(b2);
-                    if let (Some(c1), Some(c2)) = (v1, v2) {
-                        if c1 == c2 {
-                            continue; // Known-equal: XOR is always 0
-                        }
-                    }
-
-                    let ob1 = offset_bit(b1);
-                    let ob2 = offset_bit(b2);
-                    let diff_var = next_var as i32;
-                    next_var += 1;
-                    diff_vars.push(diff_var);
-
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(vec![-diff_var, ob1, ob2]));
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(vec![-diff_var, -ob1, -ob2]));
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(vec![-ob1, ob2, diff_var]));
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(vec![ob1, -ob2, diff_var]));
-                }
-
-                // If no diff variables were created (all bits known-equal),
-                // functional consistency is trivially required. But this case
-                // should not happen because idx1 != idx2 syntactically.
-                if diff_vars.is_empty() {
-                    continue;
-                }
-
-                // Use eq_idx summary variable to encode FC compactly.
-                // Instead of wide clauses (diff_0 ∨ ... ∨ diff_N ∨ -s1_k ∨ s2_k)
-                // with N+2 literals each, we introduce eq_idx such that:
-                //   eq_idx ↔ (idx1 == idx2)  i.e.  eq_idx ↔ ¬(diff_0 ∨ ... ∨ diff_N)
-                // Then FC becomes: eq_idx → (sel1_k == sel2_k)
-                // This produces 2-literal and 3-literal clauses instead of
-                // (N+2)-literal clauses, reducing clause count and improving
-                // unit propagation in the SAT solver.
-                // Same pattern as ROW2 encoding above (lines ~477-505).
-                let eq_idx = next_var as i32;
-                next_var += 1;
-
-                // eq_idx → ¬diff_k  (2-literal clauses)
-                for &diff_var in &diff_vars {
-                    result
-                        .clauses
-                        .push(ay_core::CnfClause::new(vec![-eq_idx, -diff_var]));
-                }
-                // (diff_0 ∨ ... ∨ diff_N ∨ eq_idx)  (definition clause)
-                let mut eq_def_clause = diff_vars.clone();
-                eq_def_clause.push(eq_idx);
-                result.clauses.push(ay_core::CnfClause::new(eq_def_clause));
+                // Reuse definitions only AFTER all existing admission checks.
+                // Exact pairs have the same immutable bit encoding/offset for
+                // this call. A hit still reaches its own value consequence.
+                let eq_idx = fc_index_guards.get_or_emit(
+                    (idx1, idx2),
+                    (idx1_bits, idx2_bits),
+                    bv_solver,
+                    bv_offset,
+                    &mut next_var,
+                    &mut result,
+                );
 
                 // FC consequent: eq_idx → (select(a, i) == select(a, j)).
                 // scalar_elem_lits covers BitVec elements (term bits) AND Bool
@@ -5154,24 +5023,7 @@ impl Executor {
         // Build set of array TermIds that have stores on them (the base array
         // of any store, or the store term itself since select(store(...), i)
         // has the store as its array operand).
-        let mut store_arrays: HashSet<TermId> = HashSet::default();
-        for &(store_term, base_array, _, _) in &stores {
-            store_arrays.insert(store_term);
-            store_arrays.insert(base_array);
-            // Walk up the store chain to mark all intermediate arrays
-            let mut current = base_array;
-            loop {
-                match self.ctx.terms.get(current) {
-                    TermData::App(Symbol::Named(name), args)
-                        if name.as_str() == "store" && args.len() == 3 =>
-                    {
-                        store_arrays.insert(args[0]);
-                        current = args[0];
-                    }
-                    _ => break,
-                }
-            }
-        }
+        let store_arrays: HashSet<TermId> = complex_selects::store_arrays(&stores).collect();
 
         // A select is complex if its array operand is a store or reads from
         // an array that has stores.

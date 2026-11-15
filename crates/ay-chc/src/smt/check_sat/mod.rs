@@ -4,26 +4,45 @@
 
 //! Main check_sat implementation (DPLL(T) loop).
 
+mod array_completion;
 mod bitblast;
 mod cnf;
 #[cfg(test)]
 mod completeness_diag;
+mod counted_query;
+mod executor_first;
+mod horn_session;
+#[cfg(test)]
+mod masked_residue_tests;
+mod model_completion;
 mod preprocess;
+mod query_datatypes;
 mod relevancy;
+mod scalar_route;
 mod support;
 mod term_growth;
 mod theory_loop;
 mod theory_model;
+
+pub(in crate::smt) use model_completion::complete_model_from_bindings;
+use model_completion::evaluable_free_vars_missing_from_model;
 
 // Re-export the cumulative-budget test hooks (defined in the private `bitblast`
 // submodule) at `smt` visibility so `smt::tests_check_sat` can toggle the gate.
 #[cfg(test)]
 pub(in crate::smt) use bitblast::{
     clear_bitblast_max_total_bits_override_for_tests,
-    set_bitblast_dynamic_abort_override_for_tests, set_bitblast_max_total_bits_override_for_tests,
+    set_bitblast_max_total_bits_override_for_tests,
 };
+#[cfg(test)]
+pub(in crate::smt) use executor_first::{
+    record_executor_session_for_tests, take_executor_session_budgets_for_tests,
+};
+#[cfg(test)]
+pub(crate) use scalar_route::ill_typed_engine_queries;
 
-use super::context::SmtContext;
+use super::context::{SmtContext, SmtLane};
+use super::lane;
 use super::model_verify::verify_sat_model_strict_with_mod_retry;
 use super::types::{ModelVerifyResult, SmtResult, SmtValue};
 use crate::ChcExpr;
@@ -96,6 +115,91 @@ pub(super) fn checksat_trace_level() -> u8 {
     *LEVEL.get_or_init(|| ay_core::misc_cli_flags().chc_checksat_trace.unwrap_or(0))
 }
 
+/// Process-wide count of `check_sat` calls refused because the thread's SMT
+/// deadline had already expired (Rung 0, T3 "post-deadline no-op storm").
+static POST_DEADLINE_REFUSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's share of [`POST_DEADLINE_REFUSALS`]. The deadline being
+    /// refused is thread-local (`smt::deadline`), and so is what a test can
+    /// attribute to itself: the process-wide count also moves with every
+    /// concurrent test's refusals, which could satisfy a `>= before + n` read.
+    static THREAD_POST_DEADLINE_REFUSALS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Number of `check_sat` calls refused post-deadline on THIS thread (tests).
+#[cfg(test)]
+pub(crate) fn post_deadline_refusals() -> usize {
+    THREAD_POST_DEADLINE_REFUSALS.with(std::cell::Cell::get)
+}
+
+/// Record (and, with `--chc-checksat-trace >= 2`, print) a post-deadline
+/// refusal. Level 3 additionally prints a backtrace for the first eight so the
+/// spinning caller can be identified.
+fn note_post_deadline_refusal() {
+    let n = POST_DEADLINE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    THREAD_POST_DEADLINE_REFUSALS.with(|c| c.set(c.get() + 1));
+    let level = checksat_trace_level();
+    if level >= 2 {
+        safe_eprintln!(
+            "[CKSAT-TRACE {:?}] post-deadline check_sat refused (n={n})",
+            std::thread::current().id()
+        );
+        if level >= 3 && n <= 8 {
+            safe_eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+    }
+}
+
+/// Default internal DPLL(T) pre-slice before the executor on Search-lane
+/// pure Bool/LIA/LRA queries (Rung 0, measured — RUNG0 report §3.3): the
+/// internal loop decides the easy majority in 0–3 ms (p90 1–21 ms) where the
+/// executor costs 2–61 ms per decided query, so a short internal first try
+/// keeps those wins; the executor then gets the whole remaining budget for
+/// the queries the internal loop cannot decide (its Unknowns are what the
+/// old capped-fallback schedule turned into 21.7 % Unknown). A/B over six
+/// instances (`AY_CHC_SEARCH_EXEC_FIRST` = 1 / slice=10 / slice=50 / 0):
+/// slice=50 had the fewest Unknown exits and the same throughput as slice=10,
+/// pure executor-first the lowest throughput.
+const SEARCH_LANE_INTERNAL_PRESLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Search-lane scheduling policy for pure Bool/LIA/LRA queries (Rung 0).
+///
+/// Returns `(executor_first, internal_preslice)`. Default: internal DPLL(T)
+/// for at most [`SEARCH_LANE_INTERNAL_PRESLICE`], then the executor with the
+/// whole remaining per-check budget. Measurement knob
+/// `AY_CHC_SEARCH_EXEC_FIRST`: `0` = the pre-Rung-0 internal-first slice
+/// schedule, `1` = executor first with no pre-slice, `slice=<ms>` = an
+/// explicit pre-slice. Read once per process.
+fn search_lane_scalar_policy() -> (bool, Option<std::time::Duration>) {
+    static POLICY: std::sync::OnceLock<(bool, Option<std::time::Duration>)> =
+        std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("AY_CHC_SEARCH_EXEC_FIRST") {
+        Ok(v) if v == "0" => (false, None),
+        Ok(v) if v == "1" => (true, None),
+        Ok(v) if v.starts_with("slice=") => (
+            true,
+            v["slice=".len()..]
+                .parse::<u64>()
+                .ok()
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
+        ),
+        _ => (true, Some(SEARCH_LANE_INTERNAL_PRESLICE)),
+    })
+}
+
+/// Legacy per-context executor-fallback cap (#7109), now applied ONLY to a
+/// solve that carries no deadline of any kind (no per-check timeout, no
+/// thread SMT/solve deadline, no context global deadline): there nothing
+/// else bounds the fallbacks, each of which defaults to 5 s. Every
+/// deadline-carrying solve bounds them by the deadline instead (Rung 0).
+const DEADLINE_FREE_FALLBACK_CAP: u32 = 10;
+
 /// Eligibility scan for the inc-18 EqDiffVar retry: the inc-14 pass only
 /// rewrites Int equality atoms, so a query without Int variables cannot have
 /// been hurt by it and the retry reserve would be pure waste.
@@ -128,17 +232,15 @@ pub(super) fn max_bv_width(expr: &ChcExpr) -> u32 {
             _ => 0,
         }
     }
+    // Max is idempotent, so visiting each distinct node once (WP-F F0b) gives
+    // exactly the tree walk's answer.
     let mut max_w = 0u32;
-    let mut stack: Vec<&ChcExpr> = vec![expr];
-    while let Some(e) = stack.pop() {
+    crate::expr::dag::walk_distinct_preorder(expr, |e| {
         match e {
             ChcExpr::BitVec(_, w) => max_w = max_w.max(*w),
             ChcExpr::Var(v) => max_w = max_w.max(sort_width(&v.sort)),
-            ChcExpr::FuncApp(_, sort, args) => {
-                max_w = max_w.max(sort_width(sort));
-                stack.extend(args.iter().map(|a| a.as_ref()));
-            }
-            ChcExpr::Op(op, args) => {
+            ChcExpr::FuncApp(_, sort, _) => max_w = max_w.max(sort_width(sort)),
+            ChcExpr::Op(op, _) => {
                 // Width-growing ops produce a result WIDER than any operand, so
                 // the operand recursion alone would miss it — read the exact
                 // result width via sort(). (Rare ops, so the sort() cost is
@@ -152,15 +254,11 @@ pub(super) fn max_bv_width(expr: &ChcExpr) -> u32 {
                 ) {
                     max_w = max_w.max(sort_width(&e.sort()));
                 }
-                stack.extend(args.iter().map(|a| a.as_ref()));
-            }
-            ChcExpr::ConstArray(_, inner) => stack.push(inner.as_ref()),
-            ChcExpr::PredicateApp(_, _, args) => {
-                stack.extend(args.iter().map(|a| a.as_ref()));
             }
             _ => {}
         }
-    }
+        crate::expr::dag::Step::Descend
+    });
     max_w
 }
 
@@ -307,11 +405,43 @@ static BV_BITBLAST_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BV_NEW_CLAUSE_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
-static INVALID_SAT_MODEL_DEMOTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Per THREAD: the looping_id test reads only the demotions of its own
+    /// solve. A process-global count also saw the fail-safe demotions of
+    /// concurrently running tests (session differential suites), so the
+    /// test failed only in the full parallel lib run.
+    static INVALID_SAT_MODEL_DEMOTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// #5384 UNSAT replays attempted (SAT-level UNSAT with learned clauses present).
+#[cfg(test)]
+static UNSAT_REPLAY_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// #5384 recoveries taken (the replay came back SAT and replaced the solver).
+#[cfg(test)]
+static UNSAT_RECOVERY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 fn record_theory_solver_build_for_tests() {
     THEORY_SOLVER_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn record_unsat_replay_for_tests() {
+    UNSAT_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn record_unsat_recovery_for_tests() {
+    UNSAT_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(replays attempted, recoveries taken)` by the #5384 UNSAT defense since
+/// the last `reset_reuse_counters_for_tests`.
+#[cfg(test)]
+pub(super) fn unsat_replay_counters_for_tests() -> (usize, usize) {
+    (
+        UNSAT_REPLAY_COUNT.load(Ordering::Relaxed),
+        UNSAT_RECOVERY_COUNT.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]
@@ -335,7 +465,9 @@ pub(super) fn reset_reuse_counters_for_tests() {
     SAT_MODEL_ITERATION_COUNT.store(0, Ordering::Relaxed);
     BV_BITBLAST_BUILD_COUNT.store(0, Ordering::Relaxed);
     BV_NEW_CLAUSE_COUNT.store(0, Ordering::Relaxed);
-    INVALID_SAT_MODEL_DEMOTION_COUNT.store(0, Ordering::Relaxed);
+    INVALID_SAT_MODEL_DEMOTION_COUNT.with(|c| c.set(0));
+    UNSAT_REPLAY_COUNT.store(0, Ordering::Relaxed);
+    UNSAT_RECOVERY_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Count of SAT models that FAILED strict re-verification against the
@@ -347,7 +479,7 @@ pub(super) fn reset_reuse_counters_for_tests() {
 /// disconnected bit sets).
 #[cfg(test)]
 pub(super) fn invalid_sat_model_demotion_count_for_tests() -> usize {
-    INVALID_SAT_MODEL_DEMOTION_COUNT.load(Ordering::Relaxed)
+    INVALID_SAT_MODEL_DEMOTION_COUNT.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -378,70 +510,6 @@ pub(super) fn unassignable_free_var_set_signature_for_tests(
     missing: &[(String, crate::ChcSort)],
 ) -> u64 {
     unassignable_free_var_set_signature(missing)
-}
-
-/// All SCALAR variables of `exprs` that occur in a position the STRICT model
-/// verifier can evaluate but have NO representation in `model` — neither a direct
-/// assignment nor a BvToBool bit-decomposition. Deduplicated by name, in
-/// first-encounter order, with their sorts (empty if none are missing).
-///
-/// This is the signature of an upstream abstraction DROPPING the variable\'s
-/// defining conjunct (the fail-open repro class). Three deliberate exemptions
-/// keep every known-legitimate Indeterminate acceptance intact:
-///
-/// - Variables occurring ONLY inside uninterpreted `PredicateApp`/`FuncApp`
-///   argument lists: the strict evaluator skips those atoms entirely, so such a
-///   variable cannot affect verification (#4712).
-/// - Array / datatype / uninterpreted-sorted variables: the theory solver owns
-///   them and the strict evaluator generally cannot evaluate their atoms anyway
-///   (the conditional array/DT demotion in `assumptions.rs` #6047/#7016 is the
-///   existing, separate guard for that class).
-/// - Scalars whose BvToBool bit-decomposition IS in the model (`{name}_b0`, the
-///   `transform/bv_to_bool` naming): the model constrains them fully — just in
-///   transformed vocabulary (e.g. the #6781 preprocessed lane) — which is not
-///   the dropped-conjunct signature.
-///
-/// Iterative walk — no recursion-depth hazard on deep expressions.
-pub(in crate::smt) fn evaluable_free_vars_missing_from_model<'a>(
-    exprs: impl IntoIterator<Item = &'a ChcExpr>,
-    model: &FxHashMap<String, SmtValue>,
-) -> Vec<(String, crate::ChcSort)> {
-    let mut missing: Vec<(String, crate::ChcSort)> = Vec::new();
-    let mut seen: FxHashSet<String> = FxHashSet::default();
-    let mut stack: Vec<&ChcExpr> = exprs.into_iter().collect();
-    // Preserve first-encounter order across the conjunct list.
-    stack.reverse();
-    while let Some(e) = stack.pop() {
-        match e {
-            ChcExpr::Var(v) => {
-                let scalar = matches!(
-                    v.sort,
-                    crate::ChcSort::Bool
-                        | crate::ChcSort::Int
-                        | crate::ChcSort::Real
-                        | crate::ChcSort::BitVec(_)
-                );
-                if scalar
-                    && !model.contains_key(&v.name)
-                    && !model.contains_key(&format!("{}_b0", v.name))
-                    && seen.insert(v.name.clone())
-                {
-                    missing.push((v.name.clone(), v.sort.clone()));
-                }
-            }
-            ChcExpr::Op(_, args) => stack.extend(args.iter().map(|a| a.as_ref())),
-            ChcExpr::ConstArray(_, inner) => stack.push(inner.as_ref()),
-            ChcExpr::PredicateApp(..)
-            | ChcExpr::FuncApp(..)
-            | ChcExpr::Bool(_)
-            | ChcExpr::Int(_)
-            | ChcExpr::Real(_, _)
-            | ChcExpr::BitVec(_, _)
-            | ChcExpr::ConstArrayMarker(_)
-            | ChcExpr::IsTesterMarker(_) => {}
-        }
-    }
-    missing
 }
 
 /// Type-appropriate default witness value for a scalar sort, used by the
@@ -556,101 +624,6 @@ fn propagate_equality_definitions(
     });
 }
 
-/// If `lhs` is a scalar variable and `rhs` is a DIFFERENT expression, return the
-/// `(var_name, defining_rhs)` pair describing an SSA binding candidate the
-/// variable can be pinned to. A self-identity (`q = q`) pins nothing, and only
-/// scalar sorts are eligible (matching `evaluable_free_var_missing_from_model`).
-fn binding_candidate<'a>(lhs: &'a ChcExpr, rhs: &'a ChcExpr) -> Option<(String, &'a ChcExpr)> {
-    let ChcExpr::Var(v) = lhs else {
-        return None;
-    };
-    let scalar = matches!(
-        v.sort,
-        crate::ChcSort::Bool
-            | crate::ChcSort::Int
-            | crate::ChcSort::Real
-            | crate::ChcSort::BitVec(_)
-    );
-    if !scalar {
-        return None;
-    }
-    if matches!(rhs, ChcExpr::Var(rv) if rv.name == v.name) {
-        return None;
-    }
-    Some((v.name.clone(), rhs))
-}
-
-/// Complete `model` in place by DERIVING values for scalar variables that occur
-/// in an evaluable position of `expr` but are absent from the model, using their
-/// SSA defining equalities (`q = RHS`) already present in `expr` (the head-arg
-/// binding `q = bvudiv(d, 2)` class the linear model leaves implicit).
-///
-/// A variable is filled ONLY when some `=` atom binds it to a right-hand side
-/// that is itself fully evaluable under the CURRENT model — the unique value the
-/// constraint forces. This NEVER default-assigns and NEVER invents a value: an
-/// unbound or not-yet-evaluable variable is left missing so the caller's
-/// fail-closed net still fires. Only `=` atoms are used; a disequality/negation
-/// never assigns. Existing assignments are never overwritten.
-///
-/// Iterates to a fixpoint so a chain of bindings (`q1 = f(q2)`, `q2 = g(d)`)
-/// resolves in dependency order. Returns `true` iff at least one assignment was
-/// added.
-///
-/// SOUNDNESS: completion only ADDS bindings the constraint forces; every caller
-/// re-runs STRICT verification over the whole expression and accepts ONLY on a
-/// `Valid` verdict, so a derived value inconsistent with any other conjunct
-/// yields Invalid/Indeterminate — never a spurious Sat.
-pub(in crate::smt) fn complete_model_from_bindings(
-    expr: &ChcExpr,
-    model: &mut FxHashMap<String, SmtValue>,
-) -> bool {
-    // Gather candidate (var, defining-rhs) pairs from every `=` atom.
-    let mut bindings: Vec<(String, &ChcExpr)> = Vec::new();
-    let mut stack = vec![expr];
-    while let Some(e) = stack.pop() {
-        match e {
-            ChcExpr::Op(crate::ChcOp::Eq, args) if args.len() == 2 => {
-                let (l, r) = (args[0].as_ref(), args[1].as_ref());
-                if let Some(b) = binding_candidate(l, r) {
-                    bindings.push(b);
-                }
-                if let Some(b) = binding_candidate(r, l) {
-                    bindings.push(b);
-                }
-                stack.push(l);
-                stack.push(r);
-            }
-            ChcExpr::Op(_, args) => stack.extend(args.iter().map(|a| a.as_ref())),
-            ChcExpr::ConstArray(_, inner) => stack.push(inner.as_ref()),
-            _ => {}
-        }
-    }
-    if bindings.is_empty() {
-        return false;
-    }
-    let mut changed = false;
-    // Fixpoint: each pass may make another RHS evaluable via a value derived in
-    // an earlier pass. Terminates because every pass either inserts >= 1 new key
-    // (guarded below) or makes no progress and breaks.
-    loop {
-        let mut progressed = false;
-        for (name, rhs) in &bindings {
-            if model.contains_key(name) {
-                continue;
-            }
-            if let Some(value) = crate::expr::evaluate_expr(rhs, model) {
-                model.insert(name.clone(), value);
-                progressed = true;
-                changed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    changed
-}
-
 /// Strip a single trailing solver-fresh-id suffix (`_<digits>`) from a variable
 /// name so structurally-identical unassignable variables that differ ONLY by a
 /// per-solve fresh id collapse to the same normalized key.
@@ -732,7 +705,7 @@ impl SmtContext {
                 "SAT model from {source} violates original expression; returning Unknown"
             );
             #[cfg(test)]
-            INVALID_SAT_MODEL_DEMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+            INVALID_SAT_MODEL_DEMOTION_COUNT.with(|c| c.set(c.get() + 1));
             return SmtResult::Unknown;
         }
         if matches!(verify_result, ModelVerifyResult::Indeterminate) {
@@ -869,6 +842,11 @@ impl SmtContext {
     }
 
     pub fn check_sat(&mut self, expr: &ChcExpr) -> SmtResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return SmtResult::Unknown;
+        }
+        let _census =
+            lane::CensusFrame::enter1(lane::SmtEntry::CheckSat, Some(self.census_lane()), expr);
         // No-progress circuit breaker (fail-closed): once the solve has been
         // observed spinning on the same unassignable evaluable-position
         // free-variable set (see `sat_or_unknown`), short-circuit every further
@@ -877,6 +855,13 @@ impl SmtContext {
         // cheap read half of the breaker; `is_cancelled` carries the same signal
         // into the engine's own loop-termination checks.
         if crate::smt::no_progress_breaker_tripped() {
+            return SmtResult::Unknown;
+        }
+        // Rung 0 (T3): an expired lane deadline can only yield Unknown — refuse
+        // before any classification work and count it, so the engine loops
+        // (`is_cancelled` now polls the same deadline) stop re-issuing queries.
+        if self.deadlines_expired() {
+            note_post_deadline_refusal();
             return SmtResult::Unknown;
         }
         // Per-engine term memory budget guard (#8600).
@@ -890,6 +875,26 @@ impl SmtContext {
         // Always sound (Unknown).
         if self.bitblast_budget_exceeded(expr) {
             return SmtResult::Unknown;
+        }
+        // #horn-smt-session router gate (Rung 1, design §2.11): a `Search`-lane
+        // context with the session enabled hands an eligible pure Bool/LRA
+        // conjunction to its persistent `HornSmt` session. Never on the
+        // `Verification` lane (INV-S1) and never while a verifier's
+        // `ScopedVerificationMode` is alive on this thread (INV-S2) — the
+        // in-engine `verify_model*` calls run on THIS search context. `None`
+        // = the session did not answer (mode 1 fall-through): the legacy
+        // schedule below runs unchanged.
+        if self.session_gate_open() {
+            if let Some(result) = self.route_to_session(expr) {
+                return result;
+            }
+        }
+        // Under an effort (P4a slice 8) the check stays on ay-chc's internal,
+        // counted path with its whole per-check budget: no executor attempt,
+        // no pre-slice or internal slice sized for one, no fallback. Slice 14
+        // nests the executor route under the run's node, after GuardTree S6.
+        if crate::run_meter::counting() {
+            return self.check_sat_counted(expr);
         }
         // Executor-FIRST policy (inc-12 spacer lane, per-solver opt-in): the
         // spacer-mode PDR engine's wide-Bool transition-system queries punt
@@ -907,32 +912,107 @@ impl SmtContext {
         // executor_first opt-in. The nonlinear-mul guard still applies: those go
         // to the executor fallback path below (idx<len bounds checks are linear,
         // so this fires for the target class).
-        // DT executor-first (#chc25-dtbv-lane-perf): a datatype-bearing query
-        // can ONLY be decided by the executor (the internal DPLL(T) loop has
-        // no datatype theory — it either abstracts DT ops as UF and returns
-        // Unknown, or burns its whole internal slice first). Measured on the
-        // chc_dt_bv_* fixtures: each verification query spent 50-125ms in the
-        // doomed internal theory loop before the executor fallback decided the
-        // SAME query in 1-8ms, plus a wasted prepare-stage executor attempt on
-        // a normalized shape the serializer rejects. Routing DT queries
-        // executor-FIRST (on the ORIGINAL expression) removes both wastes.
-        // Soundness: identical trusted path — this is a pure reordering of
-        // attempts that already run today (the executor fallback), with the
-        // internal loop kept as the fallback on Unknown, so completeness is
-        // unchanged. Gated on the problem actually declaring datatypes before
-        // paying the per-query feature scan.
-        // The `has_ite` arm covers the DT-derived FLATTENED queries (DtFlatten
-        // + BvToInt encode constructor discriminants and wrap arithmetic as
-        // Int ITEs): those are the measured 25-125ms internal spins the
-        // executor decides in 1-8ms. ITE-free queries on DT problems (the
-        // common trivial consecution conjuncts) keep the internal-first order.
-        let dt_executor_first = !self.datatype_defs.is_empty() && {
-            let features = expr.scan_features();
-            features.has_dt || features.has_ite
-        };
+        // DT scheduling depends on this query's carried sorts, not unused
+        // problem declarations. Embedded metadata needs no registry entry;
+        // Array key/value sorts and expression-local constructor returns count.
+        // A bounded scan that cannot finish conservatively chooses the same
+        // executor-first/short-slice schedule, never a solver verdict.
+        // Flattening can erase all DT metadata into scalar ITEs. We have no
+        // provenance distinguishing those from ordinary ITE queries, so they
+        // now use the normal scalar schedule unless another explicit policy
+        // applies. That performance tradeoff needs workload measurement.
+        let datatype_use = query_datatypes::classify(expr);
+        let dt_executor_first = datatype_use.needs_datatype_schedule();
+        // Rung 0 (CHC-COMP 2026): on the SEARCH lane a pure Bool/LIA/LRA query
+        // goes to the ay-dpll Executor first with the whole per-check budget.
+        // Replaying the engines' real query stream showed the executor decides
+        // these queries reliably (0 Unknown / 0 disagreements over 2,484
+        // verdicts, MICROBENCH_QUERY_REPLAY_2026-09-18.md) while the
+        // internal-first slice + capped fallback produced 28–74 % Unknown.
+        // The internal loop stays as the fallback when the executor returns
+        // Unknown, so completeness is unchanged; the Verification lane keeps
+        // the internal-first schedule.
+        let (search_executor_first, search_preslice) = search_lane_scalar_policy();
+        let trace_level = checksat_trace_level();
+        let nonlinear = expr.contains_nonlinear_mul();
+        let scalar =
+            scalar_route::scalar_arith_query(expr, self.lane, nonlinear || dt_executor_first);
+        let pure_scalar = scalar.is_some();
+        let real_executor_first = scalar == Some(scalar_route::ScalarArith::Real);
+        let scalar_executor_first = real_executor_first
+            || (self.lane == SmtLane::Search && search_executor_first && pure_scalar);
+        if trace_level >= 3 {
+            // Origin hunt for ill-typed engine-built atoms: dump the first few
+            // offending conjuncts with the caller's backtrace.
+            static ILL_TYPED_DUMPS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if let Some((offending, reason)) = expr.conjuncts().iter().find_map(|c| {
+                super::executor_sort_guard::unsupported_executor_expr_reason(c)
+                    .map(|r| (c.clone(), r))
+            }) {
+                if ILL_TYPED_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    let text = crate::pdr::model::InvariantModel::expr_to_smtlib(&offending);
+                    safe_eprintln!(
+                        "[CKSAT-TRACE {:?}] ILL-TYPED conjunct ({reason}): {} vars={:?}\n{}",
+                        std::thread::current().id(),
+                        &text[..text.len().min(300)],
+                        offending
+                            .vars()
+                            .iter()
+                            .map(|v| format!("{}:{}", v.name, v.sort))
+                            .collect::<Vec<_>>(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
+        if trace_level >= 2 {
+            safe_eprintln!(
+                "[CKSAT-TRACE {:?}] policy lane={:?} nonlinear={nonlinear} pure_scalar={pure_scalar} dt={dt_executor_first} scalar_exec_first={scalar_executor_first} strikes={} conv_budget_exceeded={}",
+                std::thread::current().id(),
+                self.lane,
+                self.conversion_budget_strikes,
+                self.conversion_budget_exceeded
+            );
+        }
+        if scalar_executor_first {
+            // A Real query goes straight to the executor, whose Search lane
+            // solves the query's equalities first (`smt::solve_eqs`): the
+            // internal loop can never refute a query with Real atoms (#5925),
+            // so on the refutations the engines mostly ask for, the pre-slice
+            // only spent its whole 50 ms.
+            let real_query = crate::ab_switches::get().search_solve_eqs
+                && expr.vars().iter().any(|v| v.sort == crate::ChcSort::Real);
+            if let (Some(preslice), false) = (search_preslice, real_query) {
+                // Measurement variant: a short internal pre-slice catches the
+                // ~10 ms internal wins before paying the executor set-up.
+                let slice = match self.clamp_timeout_to_deadlines(Some(
+                    self.check_timeout
+                        .get()
+                        .map_or(preslice, |t| t.min(preslice)),
+                )) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => preslice,
+                    Err(()) => return SmtResult::Unknown,
+                };
+                if !slice.is_zero() {
+                    let prev = self.check_timeout.replace(Some(slice));
+                    let early = self.check_sat_internal(expr);
+                    self.check_timeout.set(prev);
+                    if !matches!(early, SmtResult::Unknown) {
+                        if self.exact_term_memory_exceeded() {
+                            return SmtResult::Unknown;
+                        }
+                        crate::smt::note_solve_progress();
+                        return early;
+                    }
+                }
+            }
+        }
         let mut executor_first_unknown = false;
         if (self.executor_first_check_sat
             || dt_executor_first
+            || scalar_executor_first
             || expr.contains_wide_const_mod_div())
             && !expr.contains_nonlinear_mul()
         {
@@ -940,14 +1020,29 @@ impl SmtContext {
                 .check_timeout
                 .get()
                 .unwrap_or(std::time::Duration::from_secs(5));
-            let timeout = match crate::smt::clamp_timeout_to_smt_deadline(Some(timeout)) {
+            let timeout = match self.clamp_timeout_to_deadlines(Some(timeout)) {
                 Ok(Some(t)) => t,
                 Ok(None) => timeout,
                 Err(()) => return SmtResult::Unknown,
             };
             if !timeout.is_zero() {
                 let propagated_model = FxHashMap::default();
+                let t_first = ay_core::time::Instant::now();
+                if trace_level >= 1 {
+                    safe_eprintln!(
+                        "[CKSAT-TRACE {:?}] executor-first start timeout={timeout:?}",
+                        std::thread::current().id()
+                    );
+                }
                 let first = self.check_sat_via_executor(expr, &propagated_model, timeout);
+                if trace_level >= 1 {
+                    safe_eprintln!(
+                        "[CKSAT-TRACE {:?}] executor-first done dt={:.3}s unknown={}",
+                        std::thread::current().id(),
+                        t_first.elapsed().as_secs_f64(),
+                        matches!(first, SmtResult::Unknown)
+                    );
+                }
                 if !matches!(first, SmtResult::Unknown) {
                     if self.exact_term_memory_exceeded() {
                         return SmtResult::Unknown;
@@ -973,32 +1068,18 @@ impl SmtContext {
         // fallback gate then blocked the executor entirely. The slice
         // preserves fast internal wins (post-Stage-1/2 lustre checks decide
         // internally in ~10ms) while guaranteeing the more complete executor
-        // always sees real budget. With no per-check budget set, behavior is
-        // unchanged.
-        let slice = self
-            .check_timeout
-            .get()
-            .map(|t| (t / 4).min(std::time::Duration::from_secs(2)));
-        // DT-problem internal-slice cap (#chc25-dtbv-lane-perf, companion to
-        // the DT executor-first dispatch above): on a datatype-declaring
-        // problem, the flattened lane queries (Int discriminant + value vars,
-        // wrap-arithmetic ITEs) are exactly the shape the internal loop spins
-        // on and the executor decides in 1-8ms. Measured on chc_dt_bv_*: the
-        // internal loop burned its full 125ms slice per such query before the
-        // fallback answered instantly. Cap the internal slice at 25ms there —
-        // fast internal wins (0-4ms, the common case) are preserved, the
-        // doomed spins are bounded, and the executor fallback (identical
-        // trusted path) gets the budget instead. Non-DT problems: unchanged.
-        let slice = if self.datatype_defs.is_empty() {
-            slice
-        } else {
-            const DT_INTERNAL_SLICE_CAP: std::time::Duration = std::time::Duration::from_millis(25);
-            Some(slice.map_or(DT_INTERNAL_SLICE_CAP, |s| s.min(DT_INTERNAL_SLICE_CAP)))
-        };
+        // always sees real budget. Ordinary scalar queries have no internal
+        // slice when no per-check timeout is set.
+        // Share the exact query-local classification with executor-first.
+        // Only DT-present/indeterminate queries receive the 25ms cap.
+        let rescue = real_executor_first && executor_first_unknown;
+        let slice = scalar_route::internal_slice(datatype_use, rescue, self.check_timeout.get())
+            .map(crate::smt::executor_work::narrow_internal_slice);
         if trace {
             safe_eprintln!(
-                "[CKSAT-TRACE {:?}] enter check_sat budget={:?} slice={:?} expr_nodes~{}",
+                "[CKSAT-TRACE {:?}] enter check_sat lane={:?} budget={:?} slice={:?} expr_nodes~{}",
                 std::thread::current().id(),
+                self.lane,
                 self.check_timeout.get(),
                 slice,
                 expr.conjuncts().len()
@@ -1063,15 +1144,39 @@ impl SmtContext {
         // chc_dt_bv_* fixtures: each undecided DT query paid three executor
         // sessions (executor-first + prepare dispatch + fallback); this
         // removes the redundant third.
+        // Search lane: the executor-first attempt already ran EqDiffVar-off,
+        // so no dv-off retry can rescue it — a fallback would be a pure re-run.
         let fallback_is_duplicate = executor_first_unknown
-            && !(super::executor_adapter::dv_unknown_retry_enabled()
+            && !(self.lane != SmtLane::Search
+                && super::executor_adapter::dv_unknown_retry_enabled()
                 && expr_mentions_int_var(expr));
+        // Rung 0: the #7109 per-context cap (10 fallbacks) is gone on BOTH
+        // lanes — every fallback is bounded by the per-check timeout and the
+        // thread SMT deadline below, and a capped fallback was a spurious
+        // Unknown (T4 "fallback exhaustion": 44–95 % Unknown on some lustre
+        // instances; on the Verification lane a lost solve).
+        if trace_level >= 2 && matches!(result, SmtResult::Unknown) {
+            safe_eprintln!(
+                "[CKSAT-TRACE {:?}] fallback gate dup={fallback_is_duplicate} nonlinear={nonlinear} conv_budget_exceeded={} strikes={} deadline_left={:?}",
+                std::thread::current().id(),
+                self.conversion_budget_exceeded,
+                self.conversion_budget_strikes,
+                crate::smt::deadline::smt_deadline_remaining()
+            );
+        }
+        // Rung 0: the #7109 cap is replaced by the deadline bound; only a
+        // deadline-free solve keeps the legacy cap (see DEADLINE_FREE_FALLBACK_CAP).
+        let fallback_bounded_by_deadline = self.check_timeout.get().is_some()
+            || crate::smt::deadline::effective_thread_deadline().is_some()
+            || self.current_global_deadline().is_some();
+        let fallback_count_ok = fallback_bounded_by_deadline
+            || self.executor_fallback_count < DEADLINE_FREE_FALLBACK_CAP;
         if matches!(result, SmtResult::Unknown)
             && !fallback_is_duplicate
-            && !expr.contains_nonlinear_mul()
+            && !nonlinear
             && !self.conversion_budget_exceeded
             && self.conversion_budget_strikes < super::context::MAX_CONVERSION_STRIKES
-            && self.executor_fallback_count < super::context::MAX_EXECUTOR_FALLBACKS
+            && fallback_count_ok
         {
             let check_timeout = self.check_timeout.get();
             let timeout = match check_timeout {
@@ -1081,7 +1186,7 @@ impl SmtContext {
                 None => std::time::Duration::from_secs(5),
             };
             // Respect the thread-local SMT deadline for the fallback too.
-            let timeout = match crate::smt::clamp_timeout_to_smt_deadline(Some(timeout)) {
+            let timeout = match self.clamp_timeout_to_deadlines(Some(timeout)) {
                 Ok(Some(t)) => t,
                 Ok(None) => timeout,
                 Err(()) => std::time::Duration::ZERO,
@@ -1145,6 +1250,14 @@ impl SmtContext {
     /// parity discovery, entry value inference) should NOT use this — they
     /// rely on Unknown to signal graceful degradation.
     pub fn check_sat_with_executor_fallback(&mut self, expr: &ChcExpr) -> SmtResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return SmtResult::Unknown;
+        }
+        let _census = lane::CensusFrame::enter1(
+            lane::SmtEntry::ExecutorFallback,
+            Some(self.census_lane()),
+            expr,
+        );
         // This entry point intentionally bypasses `check_sat`, whose ordinary
         // preflight owns the same check. A verification caller may therefore
         // reach it directly; never let either the native attempt or its
@@ -1166,37 +1279,32 @@ impl SmtContext {
         if self.bitblast_budget_exceeded(expr) {
             return SmtResult::Unknown;
         }
+        // Rung 0 (T3): see `check_sat`.
+        if self.deadlines_expired() {
+            note_post_deadline_refusal();
+            return SmtResult::Unknown;
+        }
+        // Under an effort: the internal path with the whole budget (`check_sat`).
+        if crate::run_meter::counting() {
+            return self.check_sat_counted(expr);
+        }
         let start = ay_core::time::Instant::now();
-        // Internal-first SLICE: cap the native DPLL(T) first attempt so the (far
-        // stronger) ay-dpll Executor fallback always gets budget. Two cases:
-        //  - bit-blasted BV divide/remainder: the native loop restart-thrashes to
-        //    its deadline and returns Unknown while the Executor decides it in ms,
-        //    so a trivially-UNSAT acyclic-safety branch (e.g. `n % 3 ∉ {0,1,2}`)
-        //    would be reported Unknown if native ate the whole budget — cap at 2s
-        //    even when there is no overall budget.
-        //  - FIREFLY-class checks (#23 Stage 2.5): the native loop can't decide them
-        //    (the executor does in ~30ms), so give native only budget/4 ∧ 2s.
-        // Either way the fallback below runs with the remainder.
-        const NATIVE_FIRST_ATTEMPT_CAP: std::time::Duration = std::time::Duration::from_secs(2);
         let total = self.check_timeout.get();
-        let slice = if expr.contains_bv_div_rem() || expr.contains_wide_const_mod_div() {
-            // W1-1B: a preserved wide constant modulus surviving to native runs
-            // opaque-mod (spurious-Sat risk); cap native so the exact executor
-            // fallback always gets budget to decide it authoritatively.
-            Some(total.map_or(NATIVE_FIRST_ATTEMPT_CAP, |t| {
-                t.min(NATIVE_FIRST_ATTEMPT_CAP)
-            }))
-        } else {
-            total.map(|t| (t / 4).min(NATIVE_FIRST_ATTEMPT_CAP))
-        };
-        let result = if let Some(slice) = slice {
-            let prev = self.check_timeout.replace(Some(slice));
-            let r = self.check_sat_internal(expr);
-            self.check_timeout.set(prev);
-            r
-        } else {
-            self.check_sat_internal(expr)
-        };
+        let (slice, real_executor_first) =
+            executor_first::native_first_slice(expr, self.lane, total);
+        // Under a counted allowance the native attempt keeps the width it had
+        // under the 1.5 s cap, as `check_sat`'s internal slice does.
+        let slice = slice.map(crate::smt::executor_work::narrow_internal_slice);
+        // Executor-routed queries: one full-budget Executor session first
+        // (see `executor_first_attempt`), then the sliced internal attempt on
+        // what it leaves; after an undecided first session the tail below
+        // would be a pure re-run.
+        let (result, executor_first_unknown) =
+            match self.executor_first_then_internal(expr, slice, total, start, real_executor_first)
+            {
+                Ok(attempt) => attempt,
+                Err(decided) => return decided,
+            };
         if self.exact_term_memory_exceeded() {
             return SmtResult::Unknown;
         }
@@ -1204,20 +1312,14 @@ impl SmtContext {
         // QF_NIA short-circuit: skip the executor on nonlinear integer
         // multiplication — it cannot decide that fragment and would only burn
         // the full timeout before returning Unknown. See the rationale on
-        // `check_sat`.
-        if matches!(result, SmtResult::Unknown) && !expr.contains_nonlinear_mul() {
-            let timeout = match total {
-                Some(t) => t
-                    .checked_sub(start.elapsed())
-                    .unwrap_or(std::time::Duration::ZERO),
-                None => std::time::Duration::from_secs(5),
-            };
-            // Respect the thread-local SMT deadline for the fallback too.
-            let timeout = match crate::smt::clamp_timeout_to_smt_deadline(Some(timeout)) {
-                Ok(Some(t)) => t,
-                Ok(None) => timeout,
-                Err(()) => std::time::Duration::ZERO,
-            };
+        // `check_sat`. After an executor-first Unknown the tail would re-run
+        // that same attempt on less budget, so it is skipped
+        // (`fallback_is_duplicate` in `check_sat`).
+        if matches!(result, SmtResult::Unknown)
+            && !executor_first_unknown
+            && !expr.contains_nonlinear_mul()
+        {
+            let timeout = self.executor_fallback_budget(total, start);
             if !timeout.is_zero() {
                 let propagated_model = FxHashMap::default();
                 let fallback = self.executor_fallback_with_dv_retry(
@@ -1276,8 +1378,12 @@ impl SmtContext {
         timeout: std::time::Duration,
         trace: bool,
     ) -> SmtResult {
-        let dv_retry =
-            super::executor_adapter::dv_unknown_retry_enabled() && expr_mentions_int_var(expr);
+        // Search lane (Rung 0): every executor script is already EqDiffVar-off
+        // (`SmtContext::executor_disables_eq_diffvar`), so the retry is
+        // redundant — one attempt with the whole budget.
+        let dv_retry = self.lane != SmtLane::Search
+            && super::executor_adapter::dv_unknown_retry_enabled()
+            && expr_mentions_int_var(expr);
         let reserve = if dv_retry {
             (timeout / 3).min(std::time::Duration::from_millis(1500))
         } else {
@@ -1293,7 +1399,7 @@ impl SmtContext {
         // when the first attempt returned early), clamped to the thread SMT
         // deadline like every executor dispatch.
         let remaining = timeout.saturating_sub(attempt_start.elapsed());
-        let retry_timeout = match crate::smt::clamp_timeout_to_smt_deadline(Some(remaining)) {
+        let retry_timeout = match self.clamp_timeout_to_deadlines(Some(remaining)) {
             Ok(Some(t)) => t,
             Ok(None) => remaining,
             Err(()) => return SmtResult::Unknown,
@@ -1319,13 +1425,44 @@ impl SmtContext {
         retry
     }
 
+    /// A check under an effort (P4a slice 8): the internal DPLL(T) path with
+    /// the whole per-check budget, the executor route closed. A query that
+    /// needs the executor answers `unknown`: a preserved wide constant
+    /// modulus, whose opaque native `mod` can yield a spurious `sat` (W1-1B).
+    /// What the closed route costs (the executor-decided checks the internal
+    /// loop cannot decide: Real refutations, array and datatype queries it
+    /// leaves open) is measured in guard-tree.md §14.
+    fn check_sat_counted(&mut self, expr: &ChcExpr) -> SmtResult {
+        if expr.contains_wide_const_mod_div() {
+            let _ = crate::run_meter::close_route();
+            return SmtResult::Unknown;
+        }
+        let result = self.check_sat_internal(expr);
+        if self.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
+        if matches!(result, SmtResult::Unknown) {
+            // The executor fallback's gate (`check_sat`): it would have
+            // retried, unless the run's count is what stopped the check.
+            if !expr.contains_nonlinear_mul()
+                && !self.conversion_budget_exceeded
+                && !crate::run_meter::run_stopped()
+            {
+                let _ = crate::run_meter::close_route();
+            }
+        } else {
+            crate::smt::note_solve_progress();
+        }
+        result
+    }
+
     fn check_sat_internal(&mut self, expr: &ChcExpr) -> SmtResult {
         let trace = checksat_trace_level() >= 1;
         let start = ay_core::time::Instant::now();
         // Clamp to the thread-local SMT deadline (engine budget enforcement).
         // An expired deadline returns Unknown immediately — callers already
         // treat Unknown as a sound "give up" signal.
-        let timeout = match crate::smt::clamp_timeout_to_smt_deadline(self.check_timeout.get()) {
+        let timeout = match self.clamp_timeout_to_deadlines(self.check_timeout.get()) {
             Ok(timeout) => timeout,
             Err(()) => return SmtResult::Unknown,
         };

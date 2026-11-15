@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: ignore(elaborate)
+f 1;
+a +1 x10 >= 1 :::
+   This assertion needs
+   some free text for some reason
+   % this is a comment explaining the assertion
+   % and it contains a semicolon; but that is not read by the parser
+   its very useful
+;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

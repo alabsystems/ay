@@ -191,4 +191,11 @@ impl VerifyReport {
     pub fn messages(&self) -> &[String] {
         &self.messages
     }
+
+    /// Append a finding. It carries no authority: the verdict is unchanged.
+    #[must_use]
+    pub(super) fn with_message(mut self, message: String) -> Self {
+        self.messages.push(message);
+        self
+    }
 }

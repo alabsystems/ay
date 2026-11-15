@@ -81,6 +81,12 @@ impl Executor {
         premises.extend(plans.quant_negations.values().map(|plan| plan.forall_term));
         premises.extend(
             plans
+                .quant_consequences
+                .values()
+                .map(|plan| plan.forall_term),
+        );
+        premises.extend(
+            plans
                 .authored_array_ites
                 .values()
                 .filter(|plan| plan.guard_source != plan.guard)
@@ -104,14 +110,23 @@ impl Executor {
         plans: &SurgeryPlans,
     ) -> Option<Vec<TermId>> {
         let mut premises = Vec::with_capacity(plans.quant_negations.len());
-        for plan in plans.quant_negations.values() {
-            let (canonical, parsed) = originals.get(plan.assertion_index)?;
+        let negations = plans
+            .quant_negations
+            .values()
+            .map(|plan| (plan.assertion_index, plan.forall_term));
+        // Consequence chains instantiate the same kind of raw rebuild.
+        let consequences = plans
+            .quant_consequences
+            .values()
+            .map(|plan| (plan.assertion_index, plan.forall_term));
+        for (assertion_index, forall_term) in negations.chain(consequences) {
+            let (canonical, parsed) = originals.get(assertion_index)?;
             let parsed = strip_frontend_annotations(parsed);
             if matches!(
                 parsed,
                 FrontendTerm::Symbol(name) if name == NATIVE_API_ASSERTION_PLACEHOLDER
             ) {
-                if plan.forall_term != *canonical {
+                if forall_term != *canonical {
                     return None;
                 }
                 continue;
@@ -119,7 +134,7 @@ impl Executor {
             if !matches!(parsed, FrontendTerm::Forall(..)) {
                 return None;
             }
-            premises.push(plan.forall_term);
+            premises.push(forall_term);
         }
         Some(premises)
     }

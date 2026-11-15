@@ -280,3 +280,47 @@ fn test_delete_clause_unchecked_panics_on_reason_clause() {
     // This must panic: deleting a reason clause with Skip policy.
     solver.delete_clause_unchecked(0, mutate::ReasonPolicy::Skip);
 }
+
+/// The direct reason check (the clause's own literals) agrees with refreshed
+/// marks on every clause, including a clause whose variable was unassigned by
+/// backtracking but kept its stale reason pointer.
+#[test]
+fn test_direct_reason_check_agrees_with_refreshed_marks() {
+    let lit = |v: u32, pos: bool| {
+        if pos {
+            Literal::positive(Variable(v))
+        } else {
+            Literal::negative(Variable(v))
+        }
+    };
+    let mut solver: Solver = Solver::new(6);
+    // x0 -> x1 -> x2 (binary chain) and (-x2 | -x3 | x4).
+    let c01 = solver.add_clause_db(&[lit(0, false), lit(1, true)], false);
+    let c12 = solver.add_clause_db(&[lit(1, false), lit(2, true)], false);
+    let c234 = solver.add_clause_db(&[lit(2, false), lit(3, false), lit(4, true)], false);
+    let other = solver.add_clause_db(&[lit(4, false), lit(5, true), lit(0, true)], false);
+    solver.initialize_watches();
+    solver.decide(lit(0, true));
+    assert!(solver.search_propagate().is_none());
+    solver.decide(lit(3, true));
+    assert!(solver.search_propagate().is_none());
+    solver.refresh_reason_clause_marks();
+    for idx in [c01, c12, c234, other] {
+        assert_eq!(
+            solver.is_reason_clause_direct(idx),
+            solver.is_reason_clause_marked(idx),
+            "clause {idx} at level 2"
+        );
+    }
+    // Backtrack to level 1: x3 and x4 are unassigned, x4's reason is stale.
+    solver.backtrack(1);
+    solver.refresh_reason_clause_marks();
+    for idx in [c01, c12, c234, other] {
+        assert_eq!(
+            solver.is_reason_clause_direct(idx),
+            solver.is_reason_clause_marked(idx),
+            "clause {idx} at level 1"
+        );
+    }
+    assert!(!solver.is_reason_clause_direct(c234));
+}

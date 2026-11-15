@@ -155,7 +155,8 @@ fn rewrite_rebinds_then_clears_collapsed_farkas_certificate() {
     });
     let mut rewrites = DetHashMap::default();
     rewrites.insert(not_lower, not_upper);
-    super::Executor::rewrite_proof_terms(&mut terms, &mut proof, &rewrites);
+    super::Executor::rewrite_proof_terms(&mut terms, &mut proof, &rewrites)
+        .expect("Farkas lemmas retain their existing checked rewrite path");
 
     let ProofStep::TheoryLemma { clause, farkas, .. } = &proof.steps[0] else {
         panic!("expected theory lemma");
@@ -190,4 +191,191 @@ fn post_rewrite_sanitation_clears_stale_existing_annotation() {
     };
     assert!(farkas.is_none());
     assert_ne!(not_upper, not_lower);
+}
+
+/// `x + 2y ≥ 4, x ≤ 1, y ≤ 1` needs the Farkas multipliers `(1, 1, 2)`, so the
+/// payload-free funnel's unit arm declines it and labels it `IntCgCutChain`
+/// (`funnel_cut_chain_tests.rs`). Farkas reconstruction runs on that kind
+/// and relabels the lemma `LraFarkas` with the rational certificate, the
+/// externally checkable route; a rationally SATISFIABLE cut chain
+/// (`2x ≥ 1, 2x ≤ 1`, satisfied at `x = 1/2`) has no certificate to find and
+/// keeps its payload-free kind.
+#[test]
+fn reconstruction_relabels_a_non_unit_farkas_cut_chain() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let (one, two, four) = (
+        terms.mk_int(BigInt::from(1)),
+        terms.mk_int(BigInt::from(2)),
+        terms.mk_int(BigInt::from(4)),
+    );
+    let two_y = terms.mk_mul(vec![y, two]);
+    let sum = terms.mk_add(vec![x, two_y]);
+    let low = terms.mk_le(four, sum);
+    let x_le = terms.mk_le(x, one);
+    let y_le = terms.mk_le(y, one);
+    let non_unit = vec![
+        terms.mk_not_raw(low),
+        terms.mk_not_raw(x_le),
+        terms.mk_not_raw(y_le),
+    ];
+    let (kind, _) = crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+        &terms, &non_unit, None, None,
+    );
+    assert_eq!(kind, TheoryLemmaKind::IntCgCutChain);
+
+    let two_x = terms.mk_mul(vec![x, two]);
+    let half_low = terms.mk_le(one, two_x);
+    let half_high = terms.mk_le(two_x, one);
+    let parity = vec![terms.mk_not_raw(half_low), terms.mk_not_raw(half_high)];
+    assert!(ay_core::proof_validation::recognize_int_cg_cut_chain(
+        &terms, &parity
+    ));
+
+    let mut proof = Proof::new();
+    for clause in [&non_unit, &parity] {
+        proof.add_step(ProofStep::TheoryLemma {
+            theory: "LIA".to_string(),
+            clause: clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::IntCgCutChain,
+            lia: None,
+        });
+    }
+    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[], &[], &|| false);
+
+    let ProofStep::TheoryLemma { kind, farkas, .. } = &proof.steps[0] else {
+        panic!("expected theory lemma");
+    };
+    assert_eq!(*kind, TheoryLemmaKind::LraFarkas);
+    let farkas = farkas.as_ref().expect("the rational certificate");
+    assert!(certificate_valid_for_blocking_clause(
+        &terms, &non_unit, farkas
+    ));
+    assert_ne!(farkas.coefficients, vec![Rational64::from_integer(1); 3]);
+
+    let ProofStep::TheoryLemma { kind, farkas, .. } = &proof.steps[1] else {
+        panic!("expected theory lemma");
+    };
+    assert_eq!(*kind, TheoryLemmaKind::IntCgCutChain);
+    assert!(farkas.is_none());
+}
+
+/// `count` arithmetic lemmas `(cl (not (< x_i 0)) (not (> x_i 0)))`, each
+/// declared `LraFarkas` with no certificate, each certifiable on its own.
+fn uncertified_lemmas(terms: &mut TermStore, count: usize) -> Proof {
+    let zero = terms.mk_rational(BigRational::from_integer(0.into()));
+    let mut proof = Proof::new();
+    for index in 0..count {
+        let x = terms.mk_var(&format!("poll_x{index}"), Sort::Real);
+        let below = terms.mk_lt(x, zero);
+        let above = terms.mk_gt(x, zero);
+        proof.add_step(ProofStep::TheoryLemma {
+            theory: "LRA".to_string(),
+            clause: vec![terms.mk_not_raw(below), terms.mk_not_raw(above)],
+            farkas: None,
+            kind: TheoryLemmaKind::LraFarkas,
+            lia: None,
+        });
+    }
+    proof
+}
+
+fn certified(proof: &Proof) -> Vec<bool> {
+    proof
+        .steps
+        .iter()
+        .map(|step| matches!(step, ProofStep::TheoryLemma { farkas, .. } if farkas.is_some()))
+        .collect()
+}
+
+/// The pass polls its stop before EVERY reconstruction attempt
+/// (#r30-4a-nested-assembly-count): the proof assembly charges each poll to
+/// its count, so a poll per attempt is what lets an allowance end the pass at
+/// an attempt the query fixes. A stop seen at the second poll leaves exactly
+/// one lemma certified. Counterfactual: polling every 16 lemmas, as the pass
+/// did, polls once here and certifies all three.
+#[test]
+fn the_farkas_pass_polls_before_every_reconstruction_attempt() {
+    let mut terms = TermStore::new();
+    let mut proof = uncertified_lemmas(&mut terms, 3);
+    let polls = std::cell::Cell::new(0_u32);
+    let count = || {
+        polls.set(polls.get() + 1);
+        false
+    };
+    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[], &[], &count);
+    assert_eq!(polls.get(), 3, "one poll per attempt");
+    assert_eq!(certified(&proof), vec![true; 3], "each lemma certifies");
+
+    let mut proof = uncertified_lemmas(&mut terms, 3);
+    polls.set(0);
+    let stop_at_second = || {
+        polls.set(polls.get() + 1);
+        polls.get() > 1
+    };
+    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[], &[], &stop_at_second);
+    assert_eq!(polls.get(), 2);
+    assert_eq!(certified(&proof), vec![true, false, false]);
+}
+
+/// Every retry against an equality assertion is polled too: they are where
+/// the attempts multiply (`finstore_7373_0110`'s nested assembly ran 7738
+/// attempts). The clause below holds a simplified `(not true)` and neither
+/// equality certifies it, so the pass makes one first attempt and one retry
+/// per equality. Counterfactual: polling only before a lemma's first attempt
+/// sees one poll.
+#[test]
+fn every_equality_retry_is_polled_too() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("retry_x", Sort::Int);
+    let y = terms.mk_var("retry_y", Sort::Int);
+    let z = terms.mk_var("retry_z", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let x_is_y = terms.mk_eq(x, y);
+    let x_is_z = terms.mk_eq(x, z);
+    let positive = terms.mk_gt(x, zero);
+    let non_positive = terms.mk_le(y, zero);
+    let true_term = terms.true_term();
+    let clause = vec![
+        terms.mk_not_raw(true_term),
+        terms.mk_not_raw(positive),
+        terms.mk_not_raw(non_positive),
+    ];
+    let lemma = |clause: &Vec<_>| {
+        let mut proof = Proof::new();
+        proof.add_step(ProofStep::TheoryLemma {
+            theory: "LIA".to_string(),
+            clause: clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::LiaGeneric,
+            lia: None,
+        });
+        proof
+    };
+    let polls = std::cell::Cell::new(0_u32);
+    let count = || {
+        polls.set(polls.get() + 1);
+        false
+    };
+    let mut proof = lemma(&clause);
+    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[x_is_y, x_is_z], &[], &count);
+    assert_eq!(polls.get(), 3, "the first attempt and two retries");
+    assert_eq!(certified(&proof), vec![false]);
+
+    polls.set(0);
+    let stop_at_second = || {
+        polls.set(polls.get() + 1);
+        polls.get() > 1
+    };
+    let mut proof = lemma(&clause);
+    reconstruct_missing_farkas_coefficients(
+        &mut terms,
+        &mut proof,
+        &[x_is_y, x_is_z],
+        &[],
+        &stop_at_second,
+    );
+    assert_eq!(polls.get(), 2, "a stop ends the retries and the pass");
 }

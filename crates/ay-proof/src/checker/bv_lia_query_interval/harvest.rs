@@ -50,57 +50,31 @@ impl QueryChecker<'_> {
             return Ok(false);
         };
 
-        for _ in 0..MAX_INTERVAL_ROUNDS {
-            let mut changed = false;
-            for clause in &clauses {
-                self.meter.charge(1)?;
-                if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
-                    return Ok(false);
-                }
-                let mut unknown: Option<&ClauseLiteral> = None;
-                let mut unknown_count = 0usize;
-                let mut satisfied = false;
-                for literal in clause {
-                    match self.literal_truth(literal, &state)? {
-                        Some(true) => {
-                            satisfied = true;
-                            break;
-                        }
-                        Some(false) => {}
-                        None => {
-                            unknown_count += 1;
-                            unknown = Some(literal);
-                        }
-                    }
-                }
-                if satisfied {
-                    continue;
-                }
-                // Every literal refuted: the authored clause is false.
-                if unknown_count == 0 {
-                    return Ok(true);
-                }
-                if unknown_count != 1 {
-                    continue;
-                }
-                let Some(literal) = unknown else {
-                    // The count and witness are maintained together, but this
-                    // lane is only an additional authenticator: any internal
-                    // inconsistency must decline rather than manufacture UNSAT.
-                    return Ok(false);
-                };
-                match self.assume_literal(literal, &mut state)? {
-                    AssumeOutcome::Conflict => return Ok(true),
-                    AssumeOutcome::Changed => changed = true,
-                    AssumeOutcome::Stable => {}
-                    AssumeOutcome::Decline => return Ok(false),
-                }
+        match self.propagate_interval_clauses(&clauses, &mut state, entry_work)? {
+            AssumeOutcome::Conflict => return Ok(true),
+            AssumeOutcome::Decline => return Ok(false),
+            AssumeOutcome::Stable | AssumeOutcome::Changed => {}
+        }
+
+        // Derive extra exact source ITE facts only after authored-clause
+        // propagation is inconclusive.
+        let prior_clause_count = clauses.len();
+        let Some(appended) =
+            self.append_source_ite_clauses(assertions, &mut clauses, &mut nodes, entry_work)?
+        else {
+            return Ok(false);
+        };
+        if appended != 0 {
+            if !self.seed_interval_atoms(&clauses[prior_clause_count..], &mut state)? {
+                return Ok(false);
             }
-            if !changed {
-                break;
+            match self.propagate_interval_clauses(&clauses, &mut state, entry_work)? {
+                AssumeOutcome::Conflict => return Ok(true),
+                AssumeOutcome::Decline => return Ok(false),
+                AssumeOutcome::Stable | AssumeOutcome::Changed => {}
             }
         }
-        Ok(false)
+        self.small_remainder_cases_refute(&clauses, &state, entry_work)
     }
 
     /// Seed every arithmetic atom with the bounds guaranteed by its shape.
@@ -109,6 +83,17 @@ impl QueryChecker<'_> {
         clauses: &[Vec<ClauseLiteral>],
     ) -> Result<Option<IntervalState>, BvLiaUnsatAuthenticationError> {
         let mut state = IntervalState::default();
+        Ok(self
+            .seed_interval_atoms(clauses, &mut state)?
+            .then_some(state))
+    }
+
+    /// Add shape bounds only for new atoms, preserving every entailed fact.
+    fn seed_interval_atoms(
+        &mut self,
+        clauses: &[Vec<ClauseLiteral>],
+        state: &mut IntervalState,
+    ) -> Result<bool, BvLiaUnsatAuthenticationError> {
         for clause in clauses {
             for literal in clause {
                 let ClauseLiteral::Arithmetic { form, .. } = literal else {
@@ -121,7 +106,7 @@ impl QueryChecker<'_> {
                     let interval = self.shape_interval(atom)?;
                     let limbs = interval.limbs();
                     if state.bound_limbs.saturating_add(limbs) > MAX_BOUND_LIMBS {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     state.bound_limbs += limbs;
                     self.meter.charge(limbs.max(1))?;
@@ -129,7 +114,7 @@ impl QueryChecker<'_> {
                 }
             }
         }
-        Ok(Some(state))
+        Ok(true)
     }
 
     /// Append the universally valid guarded round-trip clause for every

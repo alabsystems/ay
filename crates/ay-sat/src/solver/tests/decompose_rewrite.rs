@@ -7,7 +7,8 @@
 //! and assigned/eliminated variable SCC traversal skipping.
 
 use crate::clause_arena::ClauseArena;
-use crate::decompose::{rewrite_clauses, ClauseMutation, Decompose};
+use crate::decompose::{rewrite_clauses, BinaryGraph, ClauseMutation, Decompose};
+use crate::literal::{Literal, Variable};
 use crate::solver::lifecycle::VarState;
 use crate::test_util::lit;
 use crate::watched::{ClauseRef, WatchedLists, Watcher};
@@ -192,7 +193,8 @@ fn test_scc_skips_assigned_variable_no_equivalence() {
     let var_states = vec![VarState::Active; num_vars];
 
     let mut decompose = Decompose::new(num_vars);
-    let result = decompose.run(&watches, num_vars, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &arena);
+    let result = decompose.run(graph, num_vars, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     assert_eq!(
@@ -220,11 +222,136 @@ fn test_scc_skips_eliminated_variable_no_equivalence() {
     var_states[0] = VarState::Eliminated; // x0 eliminated by BVE
 
     let mut decompose = Decompose::new(num_vars);
-    let result = decompose.run(&watches, num_vars, &vals, &frozen, &var_states, true);
+    let graph = BinaryGraph::new(&watches, &arena);
+    let result = decompose.run(graph, num_vars, &vals, &frozen, &var_states, true);
 
     assert!(!result.unsat);
     assert_eq!(
         result.substituted, 0,
         "eliminated x0 should be skipped in SCC, preventing x0≡x1 equivalence"
     );
+}
+
+/// Watches for exactly the listed `(clause, literal)` pairs: each pair puts
+/// the clause's other literal on `literal`'s list. A test can leave a binary
+/// with one watch, as eager subsumption followed by a targeted flush does.
+fn watches_for(arena: &ClauseArena, num_vars: usize, entries: &[(usize, Literal)]) -> WatchedLists {
+    let mut watches = WatchedLists::new(num_vars);
+    for &(idx, on) in entries {
+        let (l0, l1) = (arena.literal(idx, 0), arena.literal(idx, 1));
+        let other = if on == l0 { l1 } else { l0 };
+        watches.add_watch(on, Watcher::binary(ClauseRef(idx as u32), other));
+    }
+    watches
+}
+
+/// Three variables a < b < c: live binaries a -> b and b <-> c, and one more
+/// binary b -> a watched only on the list that carries b -> a, not on the one
+/// that carries its contrapositive.
+fn one_sided_b_to_a(garbage_learned: bool) -> (ClauseArena, WatchedLists) {
+    let (a, b, c) = (Variable(0), Variable(1), Variable(2));
+    let (pos, neg) = (Literal::positive, Literal::negative);
+    let mut arena = ClauseArena::new();
+    let a_to_b = arena.add(&[neg(a), pos(b)], false);
+    let b_to_c = arena.add(&[neg(b), pos(c)], false);
+    let c_to_b = arena.add(&[neg(c), pos(b)], false);
+    let b_to_a = arena.add(&[neg(b), pos(a)], garbage_learned);
+    if garbage_learned {
+        arena.mark_garbage_keep_data(b_to_a);
+    }
+    let entries = [
+        (a_to_b, neg(a)),
+        (a_to_b, pos(b)),
+        (b_to_c, neg(b)),
+        (b_to_c, pos(c)),
+        (c_to_b, neg(c)),
+        (c_to_b, pos(b)),
+        (b_to_a, neg(b)),
+    ];
+    let watches = watches_for(&arena, 3, &entries);
+    (arena, watches)
+}
+
+/// Every literal maps to a representative that maps to itself.
+fn assert_single_step(reprs: &[Literal]) {
+    for (li, &repr) in reprs.iter().enumerate() {
+        assert_eq!(
+            reprs[repr.index()],
+            repr,
+            "literal {li} maps to a substituted {repr:?}"
+        );
+    }
+}
+
+/// SAT-COMP 5314fd6c's failure (2026-09-14) in three variables. The garbage
+/// learned binary b -> a had lost the watch carrying its contrapositive.
+/// Counting it merged a with b on the positive side only, and the map chained
+/// c -> b -> a: the rewrite left clauses on the substituted b, and the
+/// reconstruction broke the model. Only live binaries count: a stays itself,
+/// and c maps straight to b.
+#[test]
+fn test_half_removed_garbage_binary_is_not_an_implication() {
+    let (arena, watches) = one_sided_b_to_a(true);
+    let (a, b, c) = (Variable(0), Variable(1), Variable(2));
+    let vals = vec![0i8; 6];
+    let frozen = vec![0u32; 3];
+    let var_states = vec![VarState::Active; 3];
+    for need_chains in [false, true] {
+        let mut decompose = Decompose::new(3);
+        let graph = BinaryGraph::new(&watches, &arena);
+        let result = decompose.run(graph, 3, &vals, &frozen, &var_states, need_chains);
+        assert!(!result.unsat);
+        assert_eq!(decompose.stats.stale_binary_watches_skipped, 1);
+        assert_eq!(decompose.stats.chained_representatives, 0);
+        assert_single_step(&result.reprs);
+        let repr = |lit: Literal| result.reprs[lit.index()];
+        assert_eq!(
+            repr(Literal::positive(a)),
+            Literal::positive(a),
+            "a == b rests on garbage"
+        );
+        assert_eq!(repr(Literal::positive(c)), Literal::positive(b));
+        assert_eq!(repr(Literal::negative(c)), Literal::negative(b));
+    }
+}
+
+/// The second guard, reached only through a broken watch invariant: here
+/// b -> a is live but watched on one side. The chain c -> b -> a is sound
+/// (every link is a live binary), so without LRAT the map is composed to one
+/// step; the LRAT chains cover one link only, so under LRAT the round is
+/// refused.
+#[test]
+fn test_chained_representatives_are_composed_or_refused() {
+    let (arena, watches) = one_sided_b_to_a(false);
+    let (a, c) = (Variable(0), Variable(2));
+    let vals = vec![0i8; 6];
+    let frozen = vec![0u32; 3];
+    let var_states = vec![VarState::Active; 3];
+
+    let graph = BinaryGraph::new(&watches, &arena);
+    let mut decompose = Decompose::new(3);
+    let composed = decompose.run(graph, 3, &vals, &frozen, &var_states, false);
+    assert!(!composed.unsat && composed.substituted > 0);
+    // c and ¬c pointed at b and ¬b; b already pointed straight at a.
+    assert_eq!(decompose.stats.chained_representatives, 2);
+    assert_single_step(&composed.reprs);
+    assert_eq!(
+        composed.reprs[Literal::positive(c).index()],
+        Literal::positive(a)
+    );
+    assert_eq!(
+        composed.reprs[Literal::negative(c).index()],
+        Literal::negative(a)
+    );
+
+    let mut decompose = Decompose::new(3);
+    let refused = decompose.run(graph, 3, &vals, &frozen, &var_states, true);
+    assert!(!refused.unsat);
+    assert_eq!(refused.substituted, 0);
+    assert_eq!(decompose.stats.chained_rounds_refused, 1);
+    assert!(refused
+        .reprs
+        .iter()
+        .enumerate()
+        .all(|(li, r)| r.index() == li));
 }

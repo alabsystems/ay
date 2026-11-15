@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `Clause::add` falls back to a general PB constraint when the degree of
+% the sum does not stay 1, and that fallback subtracted the merge cancellation from the
+% degree in i64 after checking only the unadjusted sum. Here the degree sum is i64::MIN + 1
+% and both variables cancel, so the true degree is i64::MIN - 1; it used to wrap to
+% i64::MAX and made the trivially true sum the empty contradiction. The formula is
+% satisfiable (x1 true).
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

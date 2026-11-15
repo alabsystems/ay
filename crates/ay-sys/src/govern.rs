@@ -16,8 +16,8 @@
 //! been removed; this module is the surviving mechanism.) The path model
 //! structurally cannot cover us.
 //!
-//! - `cargo build` rewrites `target/release/<name>` on every build.
-//! - `cargo run` execs a hash-named artifact under `target/*/deps/`.
+//! - `targo --unverified build` rewrites the executable on every build.
+//! - `targo --unverified run` executes a hash-named build artifact.
 //! - `ay-base` and `ay-fixed` were **copies of this binary at `/private/tmp`
 //!   paths that did not exist at install time, under names in no list**.
 //!
@@ -34,17 +34,17 @@
 //! Any userspace watchdog dies with its harness — it disarms exactly when it is
 //! needed.
 //!
-//! **L1 — `taskpolicy -m <MB>`.** A fatal jetsam memlimit; the kernel SIGKILLs
-//! within 0.2–0.5% of it, and it is exact on `phys_footprint`, the metric jetsam
-//! and the compressor actually key on.
+//! **L1 — native fatal footprint policy.** The canonical `trust-exec-policy`
+//! leaf prepares equal active/inactive jetsam limits; native SETEXEC applies
+//! them to this final image. Unsupported or rejected policy refuses execution.
+//! No probe subprocess, taskpolicy wrapper or executable-name assumption is
+//! involved. A footprint limit is distinct from an RSS or address-space quota.
 //!
 //! > **The trap** (measured 2026-07-15): the memlimit
-//! > binds ONLY the exact image `taskpolicy` execs. *Any* later `execve`
+//! > binds ONLY the final image. *Any* later `execve`
 //! > destroys it — even in the same pid — and it is not inherited across `fork`.
-//! > So `taskpolicy` must be the immediate exec'ing parent of the real image,
-//! > with no shell, wrapper, or interpreter in between. That is why [`arm`]
-//! > re-execs *this executable* directly under `taskpolicy` and then refuses to
-//! > do it a second time.
+//! > That is why [`arm`] applies the policy at its own final SETEXEC, without
+//! > an intervening image, and does not replace the image a second time.
 //!
 //! **L2 — `RLIMIT_AS = floor + 2 × budget`.** Inherited across both `fork` and
 //! `execve`, so it covers descendants and any re-exec that L1 structurally
@@ -90,16 +90,9 @@ pub const ARMED_ENV: &str = "AY_GOVERN_ARMED";
 
 /// The pid of the ROOT `ay` process — the one a caller actually spawned.
 ///
-/// [`arm`] re-execs this image under `taskpolicy` so the jetsam memlimit binds
-/// the real binary (see the module docs). A caller that spawned `ay` and wants
-/// to bind provenance to "the process I started" therefore CANNOT use
-/// `std::process::id()` from inside the solver: by the time anything runs, the
-/// image has been through `exec(taskpolicy)` and `taskpolicy`'s own exec of
-/// the real binary, and the observed pid need not be the one the caller holds.
-///
-/// This is not hypothetical: external-codegen binds its exported BV CNF to the pid it
-/// spawned, and measured the CNF reporting a DIFFERENT pid than the one it
-/// launched — which made that binding permanently unsatisfiable.
+/// [`arm`] uses native SETEXEC, preserving the caller's actual PID and birth.
+/// This marker retains the root identity through subsequent solver forks and
+/// remains compatible with consumers binding exported artifacts to that root.
 ///
 /// `arm` records the root pid here BEFORE the exec chain. The environment
 /// survives `exec`, and the re-exec'd image returns early from `arm` (it is
@@ -314,9 +307,6 @@ mod cli_budget_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
-const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
-
 /// Exit code used when the bound cannot be established.
 ///
 /// Deliberately the shell's "found but not executable" code, matching
@@ -396,13 +386,10 @@ fn fail_closed(why: &str) -> ! {
 mod imp {
     use super::{
         budget_mb, fail_closed,
-        spawn::{l1_installable, reexec_self_governed, self_path},
-        ARMED_ENV, AS_SLACK, MIN_AS_HEADROOM_MB, ROOT_PID_ENV, TASKPOLICY,
+        spawn::{footprint_limit, reexec_self_governed, self_path},
+        AS_SLACK, MIN_AS_HEADROOM_MB,
     };
     use std::mem::{size_of, zeroed};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
 
     /// This process's current address space, which IS the smallest settable
     /// `RLIMIT_AS`. Read directly rather than searched for: `govern-exec`
@@ -436,14 +423,16 @@ mod imp {
         }
     }
 
-    /// Apply L2, then re-exec this image under `taskpolicy` to apply L1.
+    /// Apply L2, then replace this image with the native fatal L1 policy.
     ///
     /// Never returns on success — the process is replaced.
     pub(super) fn arm() {
         let budget = budget_mb();
+        // Reject an unrepresentable native budget before changing L2 or
+        // multiplying it into address-space headroom.
+        let limit = footprint_limit(budget);
 
-        // L2 FIRST, so it is inherited across our exec of taskpolicy AND
-        // taskpolicy's exec of this image, and onward through anything forked.
+        // L2 first: it survives SETEXEC and any subsequent solver forks.
         if let Some(floor) = as_floor() {
             // Headroom is the MAX of the budget-derived slack and a floor that
             // ordinary startup cannot cross (see `MIN_AS_HEADROOM_MB`). An
@@ -461,56 +450,30 @@ mod imp {
             if unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const rl) } != 0 {
                 eprintln!(
                     "ay: WARNING: RLIMIT_AS {want} failed ({}); proceeding with the \
-                     taskpolicy memlimit only",
+                     native footprint limit only",
                     std::io::Error::last_os_error()
                 );
             }
         } else {
             eprintln!(
                 "ay: WARNING: could not determine the RLIMIT_AS floor; proceeding \
-                 with the taskpolicy memlimit only"
+                 with the native footprint limit only"
             );
         }
 
-        // Ask before the point of no return. `execv` cannot report that
-        // `taskpolicy` rejected `-m`, because by then we are gone.
         let Some(exe) = self_path() else {
             fail_closed("could not resolve this executable's own path");
         };
 
-        // `taskpolicy -m` is a macOS 14+ CLI flag, but the KERNEL capability it
-        // wraps is older: taskpolicy just sets a jetsam attribute on the child
-        // it spawns. Do the same thing directly rather than refusing to run.
-        //
-        // This is the SAME L1 bound by the route taskpolicy itself uses, not a
-        // weaker substitute — L2 (RLIMIT_AS) would be, since it bounds ADDRESS
-        // SPACE while the runaway grows FOOTPRINT inside already-mapped arena
-        // pages and never crosses it.
-        if !l1_installable(budget) {
-            reexec_self_governed(budget, &exe);
-        }
-
-        // L1 LAST: taskpolicy must be the IMMEDIATE exec'ing parent of the real
-        // image, because any subsequent execve destroys the memlimit. Nothing
-        // may be inserted between taskpolicy and this binary.
-        let executable = std::ffi::OsStr::from_bytes(exe.as_bytes());
-        let error = Command::new(TASKPOLICY)
-            .arg("-m")
-            .arg(budget.to_string())
-            .arg(executable)
-            .args(std::env::args_os().skip(1))
-            // Install markers only in the replacement image. `Command::env`
-            // builds the exec environment without process-global mutation.
-            .env(ARMED_ENV, "1")
-            .env(ROOT_PID_ENV, std::process::id().to_string())
-            .exec();
-        fail_closed(&format!("exec {TASKPOLICY} failed ({error})"));
+        // L1 is applied at the final image transition. Preparation is not an
+        // admission grant or an authenticated hosted-policy receipt.
+        reexec_self_governed(limit, &exe);
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    /// Non-macOS platforms have no `taskpolicy` and no jetsam. The panics this
+    /// Non-macOS platforms have no jetsam. The panics this
     /// module exists to prevent are all macOS ones, and Linux harnesses already
     /// have `ulimit -v` / cgroups, which actually work there. Do nothing rather
     /// than pretend to a bound we are not holding.
@@ -525,7 +488,7 @@ mod imp {
 /// image through its explicit exec environment.
 ///
 /// On macOS this normally does not return: the process is replaced by itself
-/// running under `taskpolicy`. The replacement re-enters here, observes
+/// carrying a native fatal footprint limit. The replacement observes
 /// [`ARMED_ENV`], and returns immediately, so `main` runs exactly once.
 ///
 /// # Panics

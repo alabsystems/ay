@@ -144,15 +144,18 @@ impl LiaSolver<'_> {
         let (mut lower, mut upper, mut reasons) =
             self.get_integer_bounds_for_term_extended_with_reasons(Some(term_id));
         if let Some((lower_bound, upper_bound)) = self.lra.get_bounds(term_id) {
+            // JUSTIFIED and nameable (#nia-sign-cut-soundness): a
+            // model-derived NIA pin is nameable (its reason is the variable
+            // term) but not a consequence of the assignment.
             if let Some(bound) = lower_bound.as_ref() {
-                if let Some(lits) = Self::nameable_lra_bound_reasons(bound) {
+                if let Some(lits) = self.justified_lra_bound_reasons(bound) {
                     let candidate = Self::effective_int_lower(bound);
                     lower = Some(lower.map_or(candidate.clone(), |current| current.max(candidate)));
                     reasons.extend(lits);
                 }
             }
             if let Some(bound) = upper_bound.as_ref() {
-                if let Some(lits) = Self::nameable_lra_bound_reasons(bound) {
+                if let Some(lits) = self.justified_lra_bound_reasons(bound) {
                     let candidate = Self::effective_int_upper(bound);
                     upper = Some(upper.map_or(candidate.clone(), |current| current.min(candidate)));
                     reasons.extend(lits);

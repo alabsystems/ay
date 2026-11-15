@@ -4,21 +4,22 @@
 
 #![forbid(unsafe_code)]
 
-//! `ay-encode` — the single shared AY-interface crate.
+//! `ay-encode` — the shared AY-interface crate.
 //!
-//! This is the *one* crate that both **model-checker-consumer** (Rust MIR model checker) and
-//! **ty** (TLA+ model checker) consume to talk to the AY solver. It exists so
-//! the two projects share exactly one copy of:
+//! **model-checker-consumer** (Rust MIR model checker) consumes this crate to talk to the AY
+//! solver; its native CHC/PDR lane calls [`invoke`], [`verdict`] and [`proof`].
+//! **ty** (TLA+ model checker) was the second intended consumer but keeps its
+//! own encoders and does not depend on this crate. The crate holds exactly one
+//! copy of:
 //!
 //! 1. the **sort/term builder** surface over [`ay_bindings`] (Bool/Int/BV/
 //!    Array/Datatype) *plus* first-class wrappers for AY's native
-//!    `Seq` / `Set` / `Map` / `String` theories — the encoders ty currently
-//!    hand-rolls (`sequence_encoder`, `finite_set`, `function_encoder`, string
-//!    interning) and that model-checker-consumer lowers ad-hoc;
+//!    `Seq` / `Set` / `Map` / `String` theories, so a frontend need not
+//!    hand-roll them;
 //! 2. one **invocation config** ([`invoke::EncodeConfig`]) + a runner that
 //!    drives [`ay_chc::AdaptivePortfolio`] / [`ay_chc::engines::solve_pdr_proof`];
 //! 3. a **frontend-neutral verdict** ([`verdict::AyVerdict`]) that normalizes
-//!    AY's `Safe` / `Unsafe` / `Unknown` into one type both projects map from;
+//!    AY's `Safe` / `Unsafe` / `Unknown` into one type a frontend maps from;
 //! 4. a **proof hook** ([`proof::Certificate`]) to obtain AY's re-checkable
 //!    evidence (CHC proof transcript, and optionally a SAT-level Alethe cert).
 //!
@@ -30,23 +31,22 @@
 //!   `ay_violation_<label>_<N>` BMC naming convention, and its result→`kani`
 //!   reporting. It calls into this crate to build the [`ay_bindings::AYProgram`]
 //!   / [`ay_chc::ChcProblem`] and to invoke + normalize.
-//! - **ty** keeps `TLA+ -> TlaSort / TlaExpr` translation, its BMC/k-induction
-//!   driver state, and its record/powerset encoders (genuinely TLA-specific).
-//!   It calls into this crate's term builders to replace the four hand-rolled
-//!   theory encoders, and into [`invoke`]/[`verdict`] for the portfolio + PDR.
 //!
 //! In short: **frontend IR → obligations is per-project; obligations → AY is
 //! shared here.** This crate intentionally has *no* knowledge of MIR or TLA+.
 //!
 //! ## Status
 //!
-//! This is the foundation skeleton. Public types and signatures are real and
-//! compile; capabilities that depend on the full port return typed
+//! [`invoke`], [`verdict`], [`proof`] and [`quantified`] are implemented, and
+//! model-checker-consumer calls the first three. Capabilities that depend on a missing
+//! primitive (`terms::set` union/intersect/difference, and
+//! `Certificate::to_alethe` under the `alethe` feature) return typed
 //! [`EncodeError::Unimplemented`] errors and are flagged in their doc comments.
-//! No frontend code is migrated here yet.
 
+pub mod fp;
 pub mod invoke;
 pub mod proof;
+pub mod quantified;
 mod query_proof_report;
 pub mod sorts;
 pub mod terms;
@@ -104,6 +104,14 @@ pub use ay_chc::{
 /// lowering can stay on `ay-encode` alone.
 pub use ay_chc::{normalized_chc_input, normalized_chc_input_sha256};
 
+/// Original quantified-source types and distinct, source-bound safety evidence.
+/// These do not convert to ordinary QF proof transcripts or unchecked verdicts.
+pub use ay_chc::quantified::{
+    QuantifiedChcCounterexample, QuantifiedChcProblem, QuantifiedChcQueryId,
+    QuantifiedChcQueryObligation, QuantifiedChcResult, QuantifiedChcSafety, QuantifiedHornClause,
+    UniversalPremise,
+};
+
 /// Proof-run transcript/artifact types from [`ay_chc`] (G5/G6).
 ///
 /// [`crate::proof::Certificate`] wraps [`ChcProofRunArtifacts`] (the model +
@@ -127,6 +135,10 @@ pub use ay_chc::{
 /// leave per-engine entries empty because specialized routes are represented
 /// by [`AdaptiveSolveTrace`] instead of inaccurate concrete-engine identities.
 pub use ay_chc::{BudgetReport, EngineStopReason};
+
+/// The work AY metered a proof run at (`ChcPdrProofRun::work`,
+/// [`crate::proof::ProofRun::work`]): observation only, in no certificate.
+pub use ay_chc::ChcRunWork;
 
 /// Convenience alias: every public fallible op in this crate returns this.
 pub type Result<T> = std::result::Result<T, EncodeError>;

@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% `wiplvl` naming a level no rule ever established used to index past the end
+% of `context.level_ids` and abort the process (release is `panic = "abort"`),
+% i.e. a crash on ordinary proof text. It is now a checking error. A `wiplvl`
+% of a level that WAS established stays valid -- see the companion instance
+% wipe_level_established under correct/version3.
+f 1;
+wiplvl 7;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

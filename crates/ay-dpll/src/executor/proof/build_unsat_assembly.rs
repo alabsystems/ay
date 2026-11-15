@@ -9,7 +9,10 @@
 use super::*;
 use crate::executor::proof::check::EmptyClauseDerivation;
 
+mod farkas_metadata;
+mod interpolation;
 mod open;
+mod stop;
 
 /// Whether [`Executor::open_unsat_proof_assembly`] authorized a fresh proof build.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -25,10 +28,86 @@ enum AssemblyGate {
 
 impl Executor {
     /// Builds an Alethe-compatible UNSAT proof from assumptions to the empty clause.
+    ///
+    /// The assembly runs in a Certify node (DR-39, GuardTree step S2),
+    /// entered on this thread for its extent: its stop polls read that node
+    /// (`stop.rs`), and a check-sat a pass runs is a `Full` child of it, so
+    /// it obeys the certification envelope and the cancels above it and not
+    /// the search's deadline.
     pub(in crate::executor) fn build_unsat_proof(&mut self) {
-        if self.open_unsat_proof_assembly() == AssemblyGate::Stop {
+        let certify = self.proof_assembly_certify_node();
+        let _in_certify = certify.enter();
+        // Every strict decision of the build shares one memo of the
+        // exact-division sweeps that failed, so no other spelling of a
+        // divider obligation sweeps it again (`ay_proof::ExactDivisionSweepMemo`).
+        let _divider_sweeps = self.exact_division_sweeps.begin_build();
+        let outer = std::mem::replace(&mut self.assembly_certify, certify.downgrade());
+        self.assemble_unsat_proof();
+        self.assembly_certify = outer;
+    }
+
+    /// [`Self::build_unsat_proof`]'s work inside its Certify node: the gate,
+    /// the passes, and the certify-before-presentation decline.
+    fn assemble_unsat_proof(&mut self) {
+        self.last_proof_surface_withheld = None;
+        // A stop already observed skips seeding and the LRAT export too.
+        if self.open_unsat_proof_assembly() == AssemblyGate::Stop
+            || self.abandon_proof_assembly_on_stop()
+        {
             return;
         }
+        self.run_unsat_proof_passes();
+        // #certify-before-presentation. Later presentation passes record
+        // their own declines against the surface that was withheld
+        // (`authored-source-authority-invalid`,
+        // `authored-assume-surface-unavailable`); the decline line must name
+        // the bound that withheld it, which is the actual cause.
+        if let Some(mechanism) = self.last_proof_surface_withheld {
+            if !self.last_unsat_proof_reconstruction_suppressed {
+                // A later lane installed its own authored proof and lifted the
+                // suppression: the kept derivation is no longer the proof.
+                self.last_proof_surface_withheld = None;
+                return;
+            }
+            self.record_proof_decline(mechanism);
+            // The bound refused to collect SPELLINGS for the canonical roots;
+            // it said nothing about the document of what was finally
+            // assembled. When every reachable `assume` of that proof
+            // authenticates against its authored source — the exporter's own
+            // criterion — AND none is a premise AY's provenance does not back
+            // (the certificate line's own foreign-assume detector), the
+            // document is published as it stands and the certificate line
+            // judges it like any other. Measured on the D7 list: UF
+            // `sledgehammer/TypeSafe/uf.1083624` keeps the carcara-VALID
+            // document it had when the poison let a later repair rebuild it;
+            // without the second test AUFDTLIA `german10`/`german135` printed
+            // a quantified `assume` with canonical binder names that carcara
+            // cannot match (holey -> invalid).
+            if self
+                .last_proof
+                .as_ref()
+                .is_some_and(|proof| self.proof_has_authenticated_alethe_surface(proof))
+            {
+                self.last_unsat_proof_reconstruction_suppressed = false;
+                if self.unsat_proof_terminal_foreign_assume() {
+                    self.last_unsat_proof_reconstruction_suppressed = true;
+                }
+            }
+        }
+    }
+
+    /// The bound that withheld the authored-surface document of the current
+    /// UNSAT proof, when the derivation was kept for certification without it
+    /// (#certify-before-presentation). `None` whenever the document was not
+    /// withheld this way.
+    #[must_use]
+    pub fn last_unsat_document_withheld_by(&self) -> Option<ProofDeclineMechanism> {
+        self.last_proof_surface_withheld
+            .filter(|_| self.last_unsat_proof_reconstruction_suppressed)
+    }
+
+    /// The assembly pipeline behind [`Self::assemble_unsat_proof`]'s gate.
+    fn run_unsat_proof_passes(&mut self) {
         let mut proof = if self.proof_tracker.num_steps() > 0 {
             self.seed_proof_from_tracker()
         } else {
@@ -44,15 +123,159 @@ impl Executor {
             .as_ref()
             .and_then(clause_trace_to_lrat_bytes);
 
-        self.derive_and_rewrite_empty_clause(&mut proof);
-        self.select_empty_clause_root(&mut proof);
-        self.promote_certified_theory_lemma_kinds(&mut proof);
-        self.reconstruct_folded_assertion_collapses(&mut proof);
-        self.rescue_residual_trust_steps(&mut proof);
-        self.certify_euf_and_array_leaves(&mut proof);
-        self.reassert_final_promotion_boundaries(&mut proof);
-        self.apply_authored_replacements_and_derivations(&mut proof);
-        self.finalize_unsat_proof(proof);
+        // Every pass boundary observes the interrupt and the certification
+        // deadline: a stopped assembly is discarded, never finished (`stop.rs`).
+        let passes: [fn(&mut Self, &mut Proof); 12] = [
+            Self::derive_empty_clause,
+            Self::capture_interpolation_proof,
+            Self::rewrite_derived_empty_clause,
+            Self::select_empty_clause_root,
+            Self::promote_certified_theory_lemma_kinds,
+            Self::reconstruct_folded_assertion_collapses,
+            Self::rescue_residual_trust_steps,
+            Self::certify_euf_and_array_leaves,
+            Self::reassert_final_promotion_boundaries,
+            Self::apply_authored_replacements_and_derivations,
+            Self::retain_checked_sat_proof_for_wire_gap,
+            // LAST, so it never displaces a renderable proof an earlier route
+            // built; see `proof_divmod_def`.
+            Self::promote_divmod_definitions_last_resort,
+        ];
+        for pass in passes {
+            if self.abandon_proof_assembly_on_stop() {
+                return;
+            }
+            pass(self, &mut proof);
+        }
+        if self.abandon_proof_assembly_on_stop() {
+            return;
+        }
+        self.finalize_bv_source_proof(proof);
+    }
+
+    /// Recheck the retained checked SAT-refutation's query authority after any
+    /// nested reconstruction, and use its materialized proof only for a
+    /// remaining presentation gap — and only when doing so cannot cost this
+    /// query its verdict.
+    ///
+    /// THE SUBSTITUTION MAY ONLY ADD AN ARTIFACT; IT MAY NEVER TURN A
+    /// CERTIFIABLE UNSAT INTO A WITHHELD ONE. The wire-gap screen
+    /// (`proof_has_known_wire_gap`) asks about Alethe/Carcara EXPORTABILITY,
+    /// not about validity, so a document it flags can still be exactly the one
+    /// that certifies the result: under `:produce-proofs` — and under every
+    /// other promised-artifact mode —
+    /// `independent_sidecar_blocked_by_presentation` bars the independent
+    /// sidecar lanes, leaving `check_strict_unsat_presentation` over THIS
+    /// document as `mint_unsat_certificate`'s only remaining route. Handing
+    /// that unchanged checker a materialized reconstruction it rejects (a
+    /// non-deferred `hole` closer, say) in place of one it accepts does not
+    /// weaken a claim: it withholds a correct `unsat` outright, as
+    /// `Unknown("(incomplete self-check-rejected)")`.
+    ///
+    /// So the replacement is adopted only when it is at least as certifiable
+    /// as what it displaces. A candidate the strict checker accepts is always
+    /// eligible; one it rejects is eligible only when the assembled proof was
+    /// already being rejected too, which is the gap this retention was added
+    /// to close. The sidecar's copy is consumed only on adoption, so a
+    /// declined candidate leaves it in place for a later ask.
+    ///
+    /// Monotonicity of the ADOPTED document is not enough: the candidate's own
+    /// cascade can cost the query its verdict as a side effect, so a candidate
+    /// that would is declined before that cascade runs
+    /// (`checked_sat_candidate_would_cost_the_assembled_proof`).
+    fn retain_checked_sat_proof_for_wire_gap(&mut self, proof: &mut Proof) {
+        if self.skips_trust_elimination_repairs() || !self.proof_has_known_wire_gap(proof) {
+            return;
+        }
+        let Some(mut candidate) = self.current_checked_sat_proof_cloned() else {
+            return;
+        };
+        if self.checked_sat_candidate_would_cost_the_assembled_proof(proof, &candidate) {
+            crate::executor::unsat_cert::probe_cert_reject(|| {
+                "checked-sat retention: DECLINE swap (replacement has no authored-source \
+                 presentation; its cascade would suppress the certifying assembled proof)"
+                    .to_string()
+            });
+            return;
+        }
+        self.apply_authored_replacements_and_derivations(&mut candidate);
+        // The exact-fragment reconstruction may re-prove an arithmetic leaf
+        // intrinsically without the assembled proof's interpolation witness.
+        // Preserve only independently replayed, exactly rebound metadata; the
+        // candidate's original-clause/query authority and theorem are unchanged.
+        let stopped = self.make_proof_assembly_should_stop();
+        farkas_metadata::retain_verified_farkas_annotations(
+            &self.ctx.terms,
+            proof,
+            &mut candidate,
+            &stopped,
+        );
+        if stopped() {
+            return;
+        }
+        if !self.checked_sat_substitution_is_monotone(proof, &candidate) {
+            crate::executor::unsat_cert::probe_cert_reject(|| {
+                "checked-sat retention: DECLINE swap (replacement is strictly \
+                 less certifiable than the assembled proof)"
+                    .to_string()
+            });
+            return;
+        }
+        // Adopted: consume the sidecar's copy so nothing re-uses it.
+        let _adopted = self.take_current_checked_sat_proof();
+        *proof = candidate;
+    }
+
+    /// Whether replacing `current` with `replacement` cannot cost this query
+    /// its certification, judged by the same strict checker
+    /// `check_strict_unsat_presentation` runs at mint time.
+    fn checked_sat_substitution_is_monotone(&self, current: &Proof, replacement: &Proof) -> bool {
+        self.check_proof_strict_with_datatypes(replacement).is_ok()
+            || self.check_proof_strict_with_datatypes(current).is_err()
+    }
+
+    /// Whether running the authored cascade over `candidate` would cost this
+    /// query a LIVE, CERTIFIABLE `assembled` proof.
+    ///
+    /// The cascade ends in `restore_reachable_authored_assume_surface_overrides`,
+    /// whose refusal calls `suppress_unsat_proof_reconstruction`: sticky for the
+    /// whole query, whether or not the candidate is then adopted. The
+    /// exact-original fragment `assume`s an original unit that is a CONJUNCT of
+    /// an authored root as-is (`emit_basic_original_unit`), which is exactly
+    /// what the lazy QF_DT lane's `FlattenAnd` image hands it. The strict
+    /// checker admits that `assume` through its `and` expansion, so
+    /// `checked_sat_substitution_is_monotone` cannot see the loss, but no
+    /// `(assert ...)` row spells a bare conjunct (`AuthoredSourceAuthorityInvalid`).
+    /// Since 779076535 that withheld a correct `unsat` as "has no proof" on
+    /// `test_qf_dt_exhaustiveness_emits_firewall_lean` and, measured
+    /// 2026-09-22, on 13 QF_LRA/QF_DT corpus benchmarks under
+    /// `:produce-proofs`, while the displaced proof (the authored root plus
+    /// `and_pos` projections) certifies as `unsat_admission=strict-proof`.
+    ///
+    /// All three conjuncts are side-effect free and load-bearing:
+    /// - reconstruction is still live; once suppressed there is no
+    ///   presentation left to protect;
+    /// - consequence replay's preflight refuses the candidate's `assume`
+    ///   scope, so its restoration would suppress;
+    /// - `assembled` passes the strict check the monotone gate and mint time
+    ///   run. When it does not, the swap is the gap this retention exists to
+    ///   close: both retentions of
+    ///   `model_checker_consumer_quantified_safety/uf_record_unsat.smt2` under
+    ///   `:produce-proofs` (inside its consequence-replay probes) and nine
+    ///   library tests whose cascade repairs the raw candidate have a
+    ///   strict-rejected assembled proof, and declining the `uf_record`
+    ///   candidates withheld it (`step t13 uses unverified trust rule`).
+    ///
+    /// Cheapest first: the strict check runs only for a candidate the other
+    /// two already mark.
+    fn checked_sat_candidate_would_cost_the_assembled_proof(
+        &self,
+        assembled: &Proof,
+        candidate: &Proof,
+    ) -> bool {
+        !self.last_unsat_proof_reconstruction_suppressed
+            && !self.candidate_authored_surface_is_available(candidate)
+            && self.check_proof_strict_with_datatypes(assembled).is_ok()
     }
 
     /// Seeds the candidate proof from the proof tracker's recorded steps.
@@ -133,13 +356,11 @@ impl Executor {
         proof
     }
 
-    /// Derives the empty clause, applies the input-syntax rewrites, and re-establishes
-    /// the Farkas certificates and the derivation on both sides of that rewrite.
+    /// Derives the empty clause from the seeded leaves.
     ///
     /// Assumes `proof` still carries its seeded leaves and that the SAT clause trace
     /// is available for the first `ensure_empty_clause_derivation` (which consumes it).
-    /// On return `proof` may still contain more than one empty-clause root.
-    fn derive_and_rewrite_empty_clause(&mut self, proof: &mut Proof) {
+    fn derive_empty_clause(&mut self, proof: &mut Proof) {
         // Decompose single Generic/trust theory lemmas for combined real
         // conflicts into EUF + arithmetic bridge pairs (#6756 Packet 2).
         // Must run BEFORE ensure_empty_clause_derivation so the two-lemma
@@ -148,7 +369,13 @@ impl Executor {
 
         // Build initial empty clause derivation (pre-rewrite).
         self.ensure_empty_clause_derivation(proof);
+    }
 
+    /// Applies the input-syntax rewrites to the derivation and re-establishes the
+    /// Farkas certificates and the derivation on both sides of that rewrite.
+    ///
+    /// On return `proof` may still contain more than one empty-clause root.
+    fn rewrite_derived_empty_clause(&mut self, proof: &mut Proof) {
         let hidden_equality_assertions = self.collect_hidden_problem_equality_assertions();
 
         // Reconstruct missing Farkas coefficients for arithmetic theory lemmas
@@ -163,6 +390,9 @@ impl Executor {
             tracing::warn!("proof contains dangling premise IDs before rewrite");
         }
         self.apply_input_syntax_rewrites_to_proof(proof);
+        if self.proof_assembly_stop_requested() {
+            return;
+        }
 
         // Rewriting changes arithmetic rows and can merge literals. Transport
         // preserves a positional certificate only when rebinding plus exact
@@ -520,7 +750,7 @@ impl Executor {
         // so the proof carries no trust step here. Fail-safe: only fires on the
         // recognized unary-congruence-over-chain shape, reproduces the original
         // clause exactly, and leaves any other lemma untouched.
-        let euf_split_should_stop = self.make_should_stop();
+        let euf_split_should_stop = self.make_strict_check_stop();
         let euf_split_memory_limit = self.memory_limit();
         Self::split_euf_congruence_lemmas(
             &mut self.ctx.terms,
@@ -614,12 +844,97 @@ impl Executor {
         // certified length theorem is left as a foreign assume.
         Self::promote_string_length_lemma_axioms(&self.ctx.terms, proof);
 
+        // A re-decision whose proof feeds only a trust-accepting screen reads
+        // no promotion below (`unsat_cert/screened_reconfirmation.rs`).
+        if self.skips_trust_elimination_repairs() {
+            return;
+        }
+
+        // A search that kept no SAT-level refutation (a session whose proof
+        // bookkeeping is budgeted, such as `ay --incremental`, exhausts it)
+        // leaves one Generic lemma, the whole query's negation, which the
+        // promotion below re-derives by bit-blasting the whole query. On a pure
+        // bit-vector query the raw ground closure decides it word by word
+        // first, as it does for the one-trust collapse the unbudgeted route
+        // leaves (`rescue_bv_bitblast_collapse`): measured on external-codegen's imul
+        // overflow body (consumer corpus `b32ed068cb36`), the one-shot route
+        // certified in 2.2 s and the resident route spent its whole 30 s
+        // deadline here. A decline leaves `proof` untouched. It goes before
+        // the guarded collapse below, which never applies where it does (that
+        // stage needs an array-reading root and steps aside for a pure
+        // bit-vector closure). The closure raw re-interns the parsed roots, so
+        // it is asked only when the elaborated assertions are pure bit-vector,
+        // a question that interns nothing: on any other query this pass leaves
+        // the term store as it found it. Asked unconditionally, it renumbered
+        // the terms of the session's next check on `group_proofs`'
+        // `frame_ite_lift` u64 fixture, whose Skolemized re-solve then took
+        // another SAT trace and ended `unknown (QuantifierUnhandled)`.
+        // A closure it commits here is an authored replacement like one the
+        // cascade head commits, so it lifts the presentation bound's
+        // withholding by the same rule.
+        if Self::proof_rests_on_one_generic_lemma(proof)
+            && self.elaborated_assertions_are_pure_bit_vector()
+            && self.try_pure_bit_vector_ground_closure_first(proof)
+        {
+            self.publish_replacement_over_withheld_derivation(proof);
+        }
+
+        // Where promoting the Generic BV lemmas could not make this proof
+        // publishable, the cascade's head asks the guarded collapse about the
+        // authored roots whatever the promotion decides. Ask it first: it can
+        // certify an authored root in a fraction of what the producer may
+        // spend refusing a lemma
+        // (`bv_identity_promotion/guarded/before_promotion.rs`). Only the
+        // order changes: a proof it does not replace is promoted below as
+        // before.
+        self.promote_bv_guarded_collapse_before_promotion(proof);
+        // So is the BvUremBound joint, where the promotion would pay for an
+        // exact divider (`bv_identity_promotion/guarded/urem_bound/before_division.rs`).
+        let _replaced = self.promote_urem_bound_before_generic_promotion(proof);
+
         // Generic BV conflicts are promoted only after the strict checker's
         // own semantic recognizer produces and replays a bit-blast/LRAT
         // refutation of the exact clause. This covers both the small exhaustive
         // lane and scalable width-32 identities while leaving SAT, unsupported,
         // or unsurfaceable clauses Generic (and therefore fail-closed).
-        Self::promote_semantically_checked_bv_lemmas(&self.ctx.terms, proof);
+        self.promote_semantically_checked_bv_lemmas(proof);
+    }
+
+    /// An authored replacement committed over a derivation the presentation
+    /// bound withheld (#certify-before-presentation) carries its own authored
+    /// surface, so its document is published exactly as it was when the bound
+    /// installed the poison, once that surface authenticates. Asked where a
+    /// replacement commits: the cascade head
+    /// ([`Self::apply_authored_replacements_and_derivations`]), the pure
+    /// bit-vector closure the Generic promotion tries first
+    /// ([`Self::reassert_final_promotion_boundaries`]), and the BvUremBound
+    /// joint asked ahead of an exact divider
+    /// (`bv_identity_promotion/guarded/urem_bound/before_division.rs`).
+    pub(in crate::executor::proof) fn publish_replacement_over_withheld_derivation(
+        &mut self,
+        proof: &Proof,
+    ) {
+        if self.last_proof_surface_withheld.is_some()
+            && self.proof_has_authenticated_alethe_surface(proof)
+        {
+            self.last_unsat_proof_reconstruction_suppressed = false;
+            self.last_proof_surface_withheld = None;
+        }
+    }
+
+    /// Whether the only theory lemma of `proof` is Generic: the shape a
+    /// refutation with no recorded SAT-level derivation is seeded into. Only a
+    /// trigger: the closure decides from the raw authored roots alone and
+    /// commits only a candidate the strict checker replays.
+    fn proof_rests_on_one_generic_lemma(proof: &Proof) -> bool {
+        let mut lemmas = proof.steps.iter().filter_map(|step| match step {
+            ProofStep::TheoryLemma { kind, .. } => Some(kind),
+            _ => None,
+        });
+        matches!(
+            (lemmas.next(), lemmas.next()),
+            (Some(TheoryLemmaKind::Generic), None)
+        )
     }
 
     /// Runs the authored-root replacement cascade and the arithmetic fallbacks, then
@@ -642,8 +957,23 @@ impl Executor {
         // independently assembled authored premise scope.  The replacement is
         // committed only after the strict checker validates every step and the
         // premise authorization against that same scope.
+        let withheld_derivation = self.last_proof_surface_withheld.map(|_| proof.clone());
         self.replace_with_exact_authored_false_refutation(proof);
-        self.run_authored_replacement_cascade(proof);
+        // A pure bit-vector query gets the word-level ground closure before
+        // the cascade's bit-level members, which can spend the whole query
+        // budget on one multiplier (`try_pure_bit_vector_ground_closure_first`).
+        if !self.skips_trust_elimination_repairs()
+            && !self.try_authenticated_native_bv_refutation(proof)
+            && !self.try_pure_bit_vector_ground_closure_first(proof)
+        {
+            self.run_authored_replacement_cascade(proof);
+        }
+        if withheld_derivation.is_some_and(|derivation| derivation.steps != proof.steps) {
+            self.publish_replacement_over_withheld_derivation(proof);
+        }
+        if self.proof_assembly_stop_requested() {
+            return;
+        }
 
         self.run_arithmetic_reconstruction_fallbacks(proof);
         // Some native certificate kinds are intentionally not surfaceable on
@@ -653,7 +983,7 @@ impl Executor {
         // the conjunction planner one final opportunity after the internal
         // fallback; its atomic commit gate still requires a complete strict
         // proof over the exact authored scope.
-        if self.proof_has_known_wire_gap(proof) {
+        if !self.skips_trust_elimination_repairs() && self.proof_has_known_wire_gap(proof) {
             self.replace_with_exact_authored_conjunct_refutation(proof, RepairEntry::Check);
         }
         let _promoted_intrinsic_leaves = self.promote_intrinsic_tautology_leaves(proof);
@@ -663,6 +993,9 @@ impl Executor {
         // derivation an external checker can re-run; see
         // `congruence_explanation`.
         let _derived_congruence = self.derive_congruence_explanations(proof);
+        if self.proof_assembly_stop_requested() {
+            return;
+        }
         // ... then the PACKED Boolean tautologies; see the module docs.
         let _derived_packed_tautologies = self.derive_packed_boolean_tautologies(proof);
         // ... then the GUARDED-EQUALITY arithmetic leaves whose KIND has no
@@ -673,12 +1006,25 @@ impl Executor {
         // resolution reproduces the leaf's own clause, so every downstream
         // consumer is untouched. See `la_disequality_split`.
         let _derived_la_disequality_splits = self.derive_la_disequality_split_lemmas(proof);
+        // A document that still carries NO derivation — a bare `trust`/`hole`
+        // closer, as a solve with no clause trace or a poisoned rewrite leaves
+        // it — is refuted exactly when the authored roots hold a complementary
+        // pair `t` / `(not t)`; see `authored_complementary_roots`. An
+        // incomplete candidate with no empty clause is eligible too; a
+        // retained assume is not a refutation. Existing closed derivations
+        // keep the original guard and are untouched.
+        let _replaced_complementary_roots =
+            self.replace_bare_closure_with_authored_complementary_roots_refutation(proof);
         false_source::demote_unattributed_assumed_false(self, proof);
         self.demote_unrenderable_eq_transitive_lemmas(proof);
         // Reintroduce exact source spellings only after every replacement and
         // demotion is complete. The printer confines these entries to their
         // own reachable `assume` and proves a checked bridge back to identity
         // spelling before any synthesized clause consumes them.
+        // Replace an assumed elaborated conjunction by its exact authored
+        // spelling plus checked transports, before the presentation pass
+        // decides which assumes need an authored override.
+        self.rehome_elaborated_conjunction_assumes(proof);
         self.restore_reachable_authored_assume_surface_overrides(proof);
     }
 }

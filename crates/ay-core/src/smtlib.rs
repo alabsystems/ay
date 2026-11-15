@@ -10,6 +10,10 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use crate::smtlib_char::{smtlib_char, smtlib_code_point};
+
+pub mod admitted;
+
 /// Capacity-hint clamp for output buffers sized from caller-controlled input
 /// lengths; longer outputs just grow past the hint.
 const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
@@ -41,6 +45,10 @@ const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
 /// assert_eq!(quote_symbol(r"a\b"), r"|a\\b|");
 /// ```
 pub fn quote_symbol(name: &str) -> String {
+    quote_symbol_owned(name, None)
+}
+
+fn quote_symbol_owned(name: &str, owner: admitted::Owner<'_>) -> String {
     // Reserved words in SMT-LIB that need quoting
     // This includes:
     // - `true` and `false` (dedicated tokens in the lexer)
@@ -108,27 +116,71 @@ pub fn quote_symbol(name: &str) -> String {
         "declare-rare-rule",
     ];
 
+    if owner.is_some() {
+        let comparison_work = RESERVED.iter().fold(0usize, |work, word| {
+            work.saturating_add(if word.len() == name.len() {
+                word.len()
+            } else {
+                1
+            })
+        });
+        if !admitted::pay(
+            owner,
+            name.len().saturating_add(comparison_work).saturating_add(8),
+            0,
+        ) {
+            return String::new();
+        }
+    }
     let needs_quoting = name.is_empty()
         || name.starts_with(|c: char| c.is_ascii_digit())
+        || reads_as_signed_number(name)
         || RESERVED.contains(&name)
         || name.contains(|c: char| !is_symbol_char(c));
 
     if needs_quoting {
         // Z3 5.0.0 accepts `\|` and `\\` inside quoted symbols. Escaping is
         // lossless; underscore substitution conflates distinct user symbols.
-        let mut quoted =
-            String::with_capacity(name.len().saturating_add(2).min(MAX_PREALLOC_BYTES));
-        quoted.push('|');
+        let mut quoted = admitted::Buffer::with_capacity(
+            owner,
+            name.len().saturating_add(2).min(MAX_PREALLOC_BYTES),
+        );
+        if !quoted.character('|') {
+            return String::new();
+        }
         for character in name.chars() {
             if matches!(character, '|' | '\\') {
-                quoted.push('\\');
+                if !quoted.character('\\') {
+                    return String::new();
+                }
             }
-            quoted.push(character);
+            if !quoted.character(character) {
+                return String::new();
+            }
         }
-        quoted.push('|');
-        quoted
+        if !quoted.character('|') {
+            return String::new();
+        }
+        quoted.finish()
     } else {
-        name.to_string()
+        admitted::text(owner, name)
+    }
+}
+
+/// A sign followed by a digit, or by `.` and a digit (`-1`, `+0`, `-1.5`,
+/// `-1e3`, `-.5`). SMT-LIB 2.6 allows these as simple symbols, but external
+/// checkers such as Carcara and Clean's verifier lex them as numerals, so an
+/// unquoted `-1` binder or constant makes the whole proof document
+/// unparseable there.
+fn reads_as_signed_number(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some('-' | '+')) {
+        return false;
+    }
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
     }
 }
 
@@ -205,28 +257,66 @@ pub(crate) fn is_symbol_char(c: char) -> bool {
 /// assert_eq!(escape_string_contents(r"\u{61}"), r"\u{5c}u{61}");
 /// ```
 pub fn escape_string_contents(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut result = String::with_capacity(s.len().min(MAX_PREALLOC_BYTES));
+    escape_string_contents_owned(s, None)
+}
+
+fn escape_string_contents_owned(s: &str, owner: admitted::Owner<'_>) -> String {
+    if !admitted::pay(owner, s.len().saturating_mul(2), 0) {
+        return String::new();
+    }
+    let chars: Vec<char> = if owner.is_some() {
+        let mut chars = Vec::new();
+        if !admitted::reserve(&mut chars, s.chars().count(), owner) {
+            return String::new();
+        }
+        chars.extend(s.chars());
+        chars
+    } else {
+        s.chars().collect()
+    };
+    let mut result = admitted::Buffer::with_capacity(owner, s.len().min(MAX_PREALLOC_BYTES));
     let mut rest: &[char] = &chars;
     while let Some((&c, tail)) = rest.split_first() {
+        if !admitted::pay(owner, if c == '\\' { 9 } else { 1 }, 0) {
+            return String::new();
+        }
         rest = tail;
         match c {
-            '"' => result.push_str("\"\""),
+            '"' => {
+                if !result.push("\"\"") {
+                    return String::new();
+                }
+            }
             // A backslash the reader would absorb into a `\u` escape must be
             // written as an escape itself, or the printed literal denotes a
             // different (shorter) string than the value being printed.
             '\\' if parse_unicode_escape(tail).is_some() => {
-                result.push_str("\\u{5c}");
+                if !result.push("\\u{5c}") {
+                    return String::new();
+                }
             }
-            c if ('\u{20}'..='\u{7e}').contains(&c) => result.push(c),
+            c if ('\u{20}'..='\u{7e}').contains(&c) => {
+                if !result.character(c) {
+                    return String::new();
+                }
+            }
             // Outside the theory alphabet a `\u{...}` form is not an escape, so
             // escaping would corrupt the value. Emit the code point raw: the
             // reader takes raw characters literally, so this round-trips.
-            c if c as u32 > SMTLIB_MAX_CODE_POINT => result.push(c),
-            c => result.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if smtlib_code_point(c) > SMTLIB_MAX_CODE_POINT => {
+                if !result.character(c) {
+                    return String::new();
+                }
+            }
+            // A surrogate's carrier prints as the surrogate's own escape.
+            c => {
+                if !result.format(format_args!("\\u{{{:x}}}", smtlib_code_point(c))) {
+                    return String::new();
+                }
+            }
         }
     }
-    result
+    result.finish()
 }
 
 /// Format a string value as an SMT-LIB 2.6 string literal.
@@ -252,36 +342,6 @@ pub fn string_literal(s: &str) -> String {
 /// its characters are taken literally (see [`unescape_string_contents`]).
 pub const SMTLIB_MAX_CODE_POINT: u32 = 0x2FFFF;
 
-/// Why an SMT-LIB string literal could not be decoded into a Rust `String`.
-///
-/// Decoding fails closed rather than returning an approximate string: a decoded
-/// string of the wrong length flips every `str.len`/membership verdict that
-/// mentions it, which is a wrong-verdict (soundness) defect. An honest error is
-/// strictly better than a confident wrong answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StringDecodeError {
-    /// A well-formed, in-alphabet escape denotes a Unicode *surrogate* code
-    /// point (`U+D800..=U+DFFF`). These are legal SMT-LIB characters — the
-    /// alphabet is defined over code points, which include surrogates — but
-    /// Rust's `char`/`String` can only hold Unicode *scalar values*, so such a
-    /// literal is not representable in this decoder's return type.
-    SurrogateCodePoint(u32),
-}
-
-impl core::fmt::Display for StringDecodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            StringDecodeError::SurrogateCodePoint(code) => write!(
-                f,
-                "SMT-LIB string literal denotes surrogate code point U+{code:04X}, \
-                 which is not representable as a Rust char"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StringDecodeError {}
-
 /// Unescape an SMT-LIB string literal's contents.
 ///
 /// SMT-LIB 2.6 conformant: the only escapes are `""` -> `"` and the unicode
@@ -299,15 +359,18 @@ impl std::error::Error for StringDecodeError {}
 /// ```
 /// use ay_core::unescape_string_contents;
 ///
-/// assert_eq!(unescape_string_contents("hello").unwrap(), "hello");
-/// assert_eq!(unescape_string_contents(r#"say ""hi"""#).unwrap(), r#"say "hi""#);
+/// assert_eq!(unescape_string_contents("hello"), "hello");
+/// assert_eq!(unescape_string_contents(r#"say ""hi"""#), r#"say "hi""#);
 /// // Backslash is literal (SMT-LIB 2.6): `\\` stays two backslashes.
-/// assert_eq!(unescape_string_contents(r"path\\to\\file").unwrap(), r"path\\to\\file");
-/// assert_eq!(unescape_string_contents(r"x\u{41}y").unwrap(), "xAy");
+/// assert_eq!(unescape_string_contents(r"path\\to\\file"), r"path\\to\\file");
+/// assert_eq!(unescape_string_contents(r"x\u{41}y"), "xAy");
 /// // Out-of-alphabet: `\u{FFFFF}` is not an escape, so it is nine characters.
-/// assert_eq!(unescape_string_contents(r"\u{FFFFF}").unwrap().chars().count(), 9);
+/// assert_eq!(unescape_string_contents(r"\u{FFFFF}").chars().count(), 9);
+/// // A surrogate is ONE character, held by its carrier (see `smtlib_char`).
+/// assert_eq!(unescape_string_contents(r"\u{d800}").chars().count(), 1);
 /// ```
-pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
+#[must_use]
+pub fn unescape_string_contents(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len().min(MAX_PREALLOC_BYTES));
     let mut rest: &[char] = &chars;
@@ -327,14 +390,13 @@ pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
             // (correctly) reads `"a\\b"` as FOUR characters, while the old
             // behaviour read THREE, flipping every str.len- (and membership-)
             // sensitive verdict on any backslash-bearing literal.
-            match parse_unicode_escape(tail) {
-                Some((code, after_escape)) => {
-                    // In-alphabet by construction, so the only value `char`
-                    // cannot represent is a surrogate. Fail closed rather than
-                    // substituting a replacement character or dropping it:
-                    // either would silently change the string's length.
-                    let ch =
-                        char::from_u32(code).ok_or(StringDecodeError::SurrogateCodePoint(code))?;
+            // `parse_unicode_escape` admits only in-alphabet code points, every
+            // one of which `smtlib_char` stores (a surrogate in its carrier),
+            // so an escape always decodes to exactly one character.
+            let escape = parse_unicode_escape(tail)
+                .and_then(|(code, after_escape)| Some((smtlib_char(code)?, after_escape)));
+            match escape {
+                Some((ch, after_escape)) => {
                     result.push(ch);
                     rest = after_escape;
                 }
@@ -350,7 +412,7 @@ pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
             rest = tail;
         }
     }
-    Ok(result)
+    result
 }
 
 /// Try to parse an SMT-LIB 2.6 unicode escape at the start of
@@ -384,7 +446,8 @@ fn parse_unicode_escape(after_backslash: &[char]) -> Option<(u32, &[char])> {
     };
 
     if let Some((&'{', digits)) = after_u.split_first() {
-        let mut hex = String::with_capacity(5);
+        let mut code = 0u32;
+        let mut count = 0usize;
         let mut rest = digits;
         loop {
             let (&c, tail) = rest.split_first()?; // end of input before `}` — not an escape
@@ -392,16 +455,16 @@ fn parse_unicode_escape(after_backslash: &[char]) -> Option<(u32, &[char])> {
             if c == '}' {
                 break;
             }
-            if !c.is_ascii_hexdigit() || hex.len() == 5 {
+            if !c.is_ascii_hexdigit() || count == 5 {
                 // Non-hex, or a 6th digit: not an escape sequence.
                 return None;
             }
-            hex.push(c);
+            code = code.checked_mul(16)?.checked_add(c.to_digit(16)?)?;
+            count += 1;
         }
-        if hex.is_empty() {
+        if count == 0 {
             return None; // `\u{}` is not an escape
         }
-        let code = u32::from_str_radix(&hex, 16).ok()?;
         if code > SMTLIB_MAX_CODE_POINT {
             return None; // outside the alphabet: not an escape
         }
@@ -410,17 +473,16 @@ fn parse_unicode_escape(after_backslash: &[char]) -> Option<(u32, &[char])> {
         // `\udddd` — exactly 4 hex digits. The maximum such value is 0xFFFF,
         // which is inside the alphabet, so the range check cannot fail here;
         // it is kept so the two branches enforce one identical contract.
-        let mut hex = String::with_capacity(4);
+        let mut code = 0u32;
         let mut rest = after_u;
         for _ in 0..4 {
             let (&c, tail) = rest.split_first()?;
             if !c.is_ascii_hexdigit() {
                 return None;
             }
-            hex.push(c);
+            code = code.checked_mul(16)?.checked_add(c.to_digit(16)?)?;
             rest = tail;
         }
-        let code = u32::from_str_radix(&hex, 16).ok()?;
         if code > SMTLIB_MAX_CODE_POINT {
             return None;
         }

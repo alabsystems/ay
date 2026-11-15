@@ -293,3 +293,36 @@ fn test_decompose_aborts_on_component_less_unassigned_var() {
          variable in a live clause instead of dropping the literal, got {result:?}"
     );
 }
+
+/// Component sub-solvers answer the parent's stop, its deadline flag included:
+/// an owner's deadline timer raises that flag, not the interrupt handle, and a
+/// sub-solver that missed it would run past the parent's timeout (#8134).
+#[test]
+fn test_decompose_sub_solvers_share_the_deadline_flag() {
+    let mut solver = Solver::new(0);
+    solver.set_decompose_enabled(true);
+    let vars: Vec<Variable> = (0..30).map(|_| solver.new_var()).collect();
+    for chain in [0..14, 15..29] {
+        for i in chain {
+            solver.add_clause(vec![
+                Literal::positive(vars[i]),
+                Literal::positive(vars[i + 1]),
+            ]);
+        }
+    }
+
+    let deadline = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    solver.set_deadline_interrupt_handle(Some(std::sync::Arc::clone(&deadline)));
+    let result = solver.try_decompose_solve();
+    assert!(
+        result.is_none(),
+        "a stopped sub-solve abandons decomposition, got {result:?}"
+    );
+
+    deadline.store(false, std::sync::atomic::Ordering::Relaxed);
+    let result = solver.try_decompose_solve();
+    assert!(
+        matches!(result, Some(SatResult::Sat(_))),
+        "expected decompose to solve both components SAT, got {result:?}"
+    );
+}

@@ -49,8 +49,12 @@ mod bv_incremental_push_pop;
 mod bv_sign_extend_validation_6280;
 #[path = "group_bv/bv_width_overflow.rs"]
 mod bv_width_overflow;
+#[path = "group_bv/euf_bv_congruence_budget.rs"]
+mod euf_bv_congruence_budget;
 #[path = "group_bv/int2bv_backward_pin_sat_promotion.rs"]
 mod int2bv_backward_pin_sat_promotion;
+#[path = "group_bv/int2bv_bounded_int_blast.rs"]
+mod int2bv_bounded_int_blast;
 #[path = "group_bv/int2bv_pinned_source_bridge.rs"]
 mod int2bv_pinned_source_bridge;
 #[path = "group_bv/mixed_int_bv_5356.rs"]

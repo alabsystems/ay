@@ -853,7 +853,8 @@ fn test_tangent_plane_small_fractions() {
 /// NEW only once — otherwise the refinement loop's `added == 0` stop can never
 /// fire and it burns its whole iteration cap re-deriving one constraint.
 #[test]
-fn half_bounded_mccormick_envelope_saturates_after_one_row() {
+fn half_bounded_mccormick_envelope_saturates_after_one_row(
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Real);
     let y = terms.mk_var("y", Sort::Real);
@@ -883,7 +884,10 @@ fn half_bounded_mccormick_envelope_saturates_after_one_row() {
     // Mirror that lifecycle so `undo_tentative_patch` below removes both the
     // row and its cache key, rather than merely re-adding a duplicate base row.
     solver.lra.push();
-    solver.tentative_depth += 1;
+    solver.tentative_depth = solver
+        .tentative_depth
+        .checked_add(1)
+        .ok_or("tentative scope depth overflow")?;
     let first = solver.add_mccormick_constraints(&mon);
     let second = solver.add_mccormick_constraints(&mon);
     let third = solver.add_mccormick_constraints(&mon);
@@ -903,6 +907,7 @@ fn half_bounded_mccormick_envelope_saturates_after_one_row() {
         (1, 1),
         "the suppression is scoped to the live tentative scope"
     );
+    Ok(())
 }
 
 /// `TheorySolver::reset` retires the complete LRA state, so it must retire the

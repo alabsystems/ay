@@ -2,6 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use super::fixed_terms::bound_cites_sentinel;
 use super::*;
 
 impl LraSolver {
@@ -104,7 +105,7 @@ impl LraSolver {
                         break;
                     }
                 } else {
-                    nf += 1;
+                    nf = nf.saturating_add(1);
                     if nf > 2 {
                         too_many = true;
                         break;
@@ -226,10 +227,25 @@ impl LraSolver {
         if let Some(info) = self.vars.get(vi) {
             if let (Some(lower), Some(upper)) = (&info.lower, &info.upper) {
                 if !lower.strict && !upper.strict && lower.value == upper.value {
-                    for (term, value) in lower.reason_pairs().chain(upper.reason_pairs()) {
-                        if term.is_sentinel() {
-                            continue;
-                        }
+                    // A pin that is not justified (an NIA/NRA model guess) is
+                    // no fact to export (#nonlinear-shared-reasons): no
+                    // reasons, so the fixed-term export skips the pair.
+                    if !self.bound_reasons_all_asserted(lower)
+                        || !self.bound_reasons_all_asserted(upper)
+                    {
+                        return Vec::new();
+                    }
+                    // A sentinel reason marks a hypothesis or a cut whose
+                    // premises are not recorded; the atoms beside it do not
+                    // entail the fixing, so there is no fact to export.
+                    if bound_cites_sentinel(lower) || bound_cites_sentinel(upper) {
+                        return Vec::new();
+                    }
+                    let complete = lower
+                        .complete_reason_pairs()
+                        .into_iter()
+                        .chain(upper.complete_reason_pairs());
+                    for (term, value) in complete {
                         let lit = TheoryLit::new(term, value);
                         if seen_direct.insert(lit) {
                             reasons.push(lit);
@@ -291,17 +307,22 @@ impl LraSolver {
                 continue;
             }
 
+            // `lhs = rhs` follows from the two fixings together, so each side
+            // must bring its own justification. A side with no reasons is a
+            // guess or a hypothesis; the other side's reasons alone do not
+            // entail the equality, and exporting it under them lets conflict
+            // analysis learn a clause the input does not imply.
             let mut reasons = self.collect_fixed_term_var_reasons(lhs_var);
+            let rhs_reasons = self.collect_fixed_term_var_reasons(rhs_var);
+            if reasons.is_empty() || rhs_reasons.is_empty() {
+                self.propagated_equality_pairs.remove(&pair);
+                continue;
+            }
             let mut seen = reasons.iter().copied().collect::<HashSet<_>>();
-            for lit in self.collect_fixed_term_var_reasons(rhs_var) {
+            for lit in rhs_reasons {
                 if seen.insert(lit) {
                     reasons.push(lit);
                 }
-            }
-
-            if reasons.is_empty() {
-                self.propagated_equality_pairs.remove(&pair);
-                continue;
             }
 
             requests.push(ModelEqualityRequest {
@@ -320,6 +341,51 @@ impl LraSolver {
     ///
     /// Offset equalities are derived from nf==2 rows sharing a non-fixed column.
     /// The reason is the union of all fixed-column bounds in both derivation rows.
+    /// Whether emitting an offset-equality request for this pair
+    /// would be moot (see the two cases below).
+    fn offset_pair_emission_moot(&self, term1: TermId, term2: TermId) -> bool {
+        // Emission skips (#smtopt-offset-churn). Each emitted
+        // request converts a Sat into a NeedModelEqualities
+        // round-trip, and the per-instance dedup above cannot
+        // stop re-emission on its own: `pop` clears
+        // `propagated_equality_pairs` wholesale and the split
+        // loop also recreates theory instances. Two statically
+        // moot cases are therefore skipped here (the pair stays
+        // in the dedup set either way):
+        //
+        // 1. The pair's equality atom is already asserted true
+        //    on the current trail — the combiner has the
+        //    equality. Measured on QF_LIRA LCTES/smtopt: one
+        //    Real pair re-emitted 101 times in 12 s with its
+        //    atom asserted true every time.
+        // 2. Both terms are plain leaves (Var/Const) and no
+        //    authored equality atom over the pair exists — no
+        //    Boolean atom needs the value decided and no other
+        //    theory shares plain arithmetic leaves except
+        //    through the model-value/fixed-term channels, which
+        //    stay active. (smtopt emitted four such pairs per
+        //    final check alongside case 1; either group alone
+        //    kept the churn alive: 107k decisions to `sat`
+        //    without them, 1.4M and `unknown` with them.)
+        //
+        // Sound: both cases only decline an optional split
+        // request; the equality remains entailed by the LP
+        // state, and in case 1 it is already asserted.
+        let eq_atom = self.terms().find_eq(term1, term2);
+        let already_true = eq_atom.is_some_and(|a| {
+            self.asserted.get(&a) == Some(&true)
+                || self.cross_theory_asserted.get(&a) == Some(&true)
+        });
+        let plain_leaf = |t: TermId| {
+            matches!(
+                self.terms().get(t),
+                TermData::Var(_, _) | TermData::Const(_)
+            )
+        };
+        let no_consumer = eq_atom.is_none() && plain_leaf(term1) && plain_leaf(term2);
+        already_true || no_consumer
+    }
+
     pub(crate) fn take_pending_offset_equalities(&mut self) -> Vec<ModelEqualityRequest> {
         let pending = std::mem::take(&mut self.pending_offset_equalities);
         let mut requests = Vec::new();
@@ -344,13 +410,21 @@ impl LraSolver {
                 continue;
             }
 
+            if self.offset_pair_emission_moot(term1, term2) {
+                continue;
+            }
+
             // Construct reason: all fixed-column bounds in both rows.
             // Use collect_fixed_term_var_reasons per fixed column — it handles
             // both direct bounds AND implied-bounds-only variables correctly
             // (falls back to collect_row_reasons_dedup for implied bounds).
+            // Every fixed column the derivation reads must be justified: a
+            // column fixed by a guess contributes no reasons, and the union
+            // of the others would not entail the equality.
             let mut reasons = Vec::new();
             let mut seen = HashSet::default();
-            for &ri in &[row_idx1, row_idx2] {
+            let mut every_fixing_justified = true;
+            'rows: for &ri in &[row_idx1, row_idx2] {
                 if ri >= self.rows.len() {
                     continue;
                 }
@@ -364,6 +438,10 @@ impl LraSolver {
                         continue;
                     }
                     let var_reasons = self.collect_fixed_term_var_reasons(var);
+                    if var_reasons.is_empty() {
+                        every_fixing_justified = false;
+                        break 'rows;
+                    }
                     for lit in var_reasons {
                         if seen.insert(lit) {
                             reasons.push(lit);
@@ -372,7 +450,7 @@ impl LraSolver {
                 }
             }
 
-            if reasons.is_empty() {
+            if !every_fixing_justified || reasons.is_empty() {
                 self.propagated_equality_pairs.remove(&pair);
                 continue;
             }
@@ -396,19 +474,6 @@ impl LraSolver {
         })
     }
 
-    /// Model-value-based equality detection (Z3's `assume_eqs`).
-    ///
-    /// After simplex finds a feasible model, group all shared (non-slack)
-    /// variables by their current model value. For pairs with the same value,
-    /// generate `ModelEqualityRequest`s so the SAT solver can try setting the
-    /// corresponding equality atoms to true. This is a model-based *guess*,
-    /// not a deduction — reasons are empty.
-    ///
-    /// This is critical for benchmarks with many real-variable equality
-    /// comparisons (simple_startup, sc, uart families) where the SAT solver
-    /// would otherwise blindly explore equality branches.
-    ///
-    /// Reference: Z3 `theory_lra.cpp` assume_eqs / random_update.
     /// Fix A: classify a single term as a *native* arithmetic leaf (one whose
     /// LP value is a faithful arithmetic quantity) versus an *opaque* leaf such
     /// as an uninterpreted-function application that LRA only sees through an
@@ -658,6 +723,19 @@ impl LraSolver {
         DiseqClosureGate { uf, blocked_roots }
     }
 
+    /// Model-value-based equality detection (Z3's `assume_eqs`).
+    ///
+    /// After simplex finds a feasible model, group all shared (non-slack)
+    /// variables by their current model value. For pairs with the same value,
+    /// generate `ModelEqualityRequest`s so the SAT solver can try setting the
+    /// corresponding equality atoms to true. This is a model-based *guess*,
+    /// not a deduction — reasons are empty.
+    ///
+    /// This is critical for benchmarks with many real-variable equality
+    /// comparisons (simple_startup, sc, uart families) where the SAT solver
+    /// would otherwise blindly explore equality branches.
+    ///
+    /// Reference: Z3 `theory_lra.cpp` assume_eqs / random_update.
     pub(crate) fn discover_model_value_equalities(&mut self) -> Vec<ModelEqualityRequest> {
         // #8187: Only run model-based equality discovery (Z3's assume_eqs) when
         // the solver is part of a combined theory context (Nelson-Oppen) OR when
@@ -681,8 +759,11 @@ impl LraSolver {
             return Vec::new();
         }
 
-        // Collect (value, var_id, term_id) for shared variables.
-        let mut entries: Vec<(&InfRational, u32, TermId)> = Vec::new();
+        // Collect (order key, value, var_id, term_id) for shared variables.
+        // The key is monotone in the value's rational part, so key-then-exact
+        // sorting below reproduces the exact value order while resolving
+        // most comparisons without Big/Big cross-multiplication.
+        let mut entries: Vec<((i8, i64), &InfRational, u32, TermId)> = Vec::new();
         for (&var_id, &term_id) in &self.var_to_term {
             if self.slack_var_set.contains(&var_id) {
                 continue;
@@ -691,7 +772,8 @@ impl LraSolver {
             if vi >= self.vars.len() {
                 continue;
             }
-            entries.push((&self.vars[vi].value, var_id, term_id));
+            let value = &self.vars[vi].value;
+            entries.push((value.x().order_key(), value, var_id, term_id));
         }
 
         if entries.len() < 2 {
@@ -699,23 +781,27 @@ impl LraSolver {
         }
 
         // Sort by value, then by term_id for determinism.
-        entries.sort_by(|a, b| a.0.cmp(b.0).then(a.2 .0.cmp(&b.2 .0)));
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(b.1))
+                .then(a.3 .0.cmp(&b.3 .0))
+        });
 
         let mut requests = Vec::new();
         let mut i = 0;
         while i < entries.len() {
             // Find the run of entries with the same value.
             let mut j = i + 1;
-            while j < entries.len() && entries[j].0 == entries[i].0 {
+            while j < entries.len() && entries[j].1 == entries[i].1 {
                 j += 1;
             }
             // entries[i..j] all have the same model value.
             if j - i >= 2 {
                 // Anchor pattern: pair the first entry with each subsequent one.
-                let anchor_term = entries[i].2;
+                let anchor_term = entries[i].3;
                 let anchor_sort = self.terms().sort(anchor_term);
                 for entry in entries.iter().take(j).skip(i + 1) {
-                    let other_term = entry.2;
+                    let other_term = entry.3;
                     if anchor_term == other_term {
                         continue;
                     }

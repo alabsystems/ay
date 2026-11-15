@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% The structure control for the deletion route: the identical proof with the `proofgoal 1`
+% wrapper deleted. The deletion obligation is then really checked and the proof is refused --
+% by the UNFIXED checker too. So what forged the verdict is the fabricated goal, not "checked
+% deletion is broken".
+f 2 ;
+strengthening_to_core on;
+delc 2 : : subproof
+qed;
+sol x1 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

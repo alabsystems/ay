@@ -144,13 +144,14 @@ impl Bq {
         }
         // `trailing_zeros` is `None` only for zero, handled above.
         let tz = u32::try_from(a.trailing_zeros().unwrap_or(0)).unwrap_or(u32::MAX);
-        let shift = tz.min(k);
+        // Strip `min(tz, k)` twos; `rest` is what remains of the exponent.
+        let (shift, rest) = if tz < k { (tz, k - tz) } else { (k, 0) };
         if shift == 0 {
             Self { a, k }
         } else {
             Self {
                 a: a >> shift,
-                k: k - shift,
+                k: rest,
             }
         }
     }
@@ -707,7 +708,7 @@ pub(crate) fn refine_to_width(
         }
         let (left, mid, right) = cur.bisect()?;
         let s_mid = poly_sign_at(p, &mid)?;
-        let completed_steps = steps + 1;
+        let completed_steps = steps.checked_add(1)?;
         if s_mid == 0 {
             return Some((
                 Refined::Exact(mid.clone()),
@@ -1005,7 +1006,11 @@ pub(crate) fn select_non_root(p: &[BigInt], iv: &BqInterval) -> Option<Bq> {
             if poly_sign_at(p, &v)? != 0 {
                 return Some(v);
             }
-            probes += 1;
+            // Overflow means more than `u32::MAX` probes: past any `deg + 1`.
+            let Some(next_probes) = probes.checked_add(1) else {
+                break;
+            };
+            probes = next_probes;
             if probes > deg {
                 break;
             }

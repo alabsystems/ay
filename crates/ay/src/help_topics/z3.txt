@@ -9,17 +9,20 @@ page gives you the map, then names the exact three places where ay's
 behavior diverges from z3's. Two of those three change an exit code, so
 read them before you trust ay's exit status in a script.
 
-What does NOT diverge is the default posture of a plain solve. `ay
-problem.smt2` (also `ay solve problem.smt2` and `ay -in`) does what `z3
-problem.smt2` does: it answers, records no proof during search, mints and
-re-checks no certificate afterwards, and writes nothing next to the input
-(z3: proof=false). ay's certification ladder is opt-in, exactly as z3's
-proof=true is: --rigor standard | strict | certified, --proof FILE,
---self-check, --strict-proofs, or (set-option :produce-proofs true) in the
-script. --no-proof and --z3-mode select the plain posture explicitly. The
-independent model gate behind every `sat` is on in every posture; the
-ladder changes proof work only, never a verdict. DIMACS (<input>.drat) and
-CHC (<input>.chccert) keep their proof-carrying defaults.
+One divergence is deliberate and is not on that list because it changes
+no exit code: a plain solve is PROOF-CARRYING. `ay problem.smt2` (also `ay
+solve problem.smt2` and `ay -in`) answers, records a proof during search,
+mints and strict-checks its certificate, and writes <input>.alethe next to
+the input on unsat; z3's default is proof=false with nothing on disk. That
+certificate is what ay is for, so it stays the default.
+
+--z3-mode is the flag for z3-exact behaviour: nothing recorded, nothing
+minted, nothing re-checked, nothing written, plus the clean transcript
+below. --no-proof and --rigor fast reach the same proof posture by their
+own routes; --rigor fast also turns the validation batteries off, which
+--z3-mode does not. The independent model gate behind every `sat` is on in
+every posture; none of this changes a verdict. DIMACS (<input>.drat) and
+CHC (<input>.chccert) are proof-carrying by default too.
 
 Named or symlinked as z3, ay enables --z3-mode on its own, so the
 transcript carries no ay provenance comments:
@@ -193,6 +196,22 @@ KNOWN DIVERGENCES
      (model               (
        (define-fun ...)     (define-fun ...)
      )                    )
+
+4. A query ay cannot decide is an unknown, not an error.
+
+   Where ay has no decision procedure for a query's mix of theories, or
+   hits an internal limit, z3 simply answers. Under --z3-mode, with no
+   proof or trace artifact requested, ay answers unknown, keeps the session
+   going, writes nothing to stderr (z3 writes nothing there either) and
+   exits 0. The cause is in the reason:
+
+     (:reason-unknown "(incomplete decision-execution-error ""unsupported ...
+
+   Without --z3-mode the same query prints (error ...) on stderr and ends
+   the run with exit 1. In the same way, --z3-mode does not print the
+   c !! MODEL-UNCONFIRMED line or the [AY SOUNDNESS GATE] banner. In every
+   mode (get-info :all-statistics) counts them and keeps the last one, as
+   :model-unconfirmed and :soundness-gate.invalid-models.
 
 Next: run `ay diagnose problem.smt2` to solve one file, validate ay's own
 model, and cross-check the verdict against the z3 on your PATH.

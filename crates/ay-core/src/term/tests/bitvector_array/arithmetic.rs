@@ -93,6 +93,51 @@ fn test_bvsub_identity_and_self() {
 }
 
 #[test]
+fn test_bvsub_chained_constant_offsets_fold() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::bitvec(8));
+    let one = store.mk_bitvec(BigInt::from(1), 8);
+    let two = store.mk_bitvec(BigInt::from(2), 8);
+
+    // (x - 1) - 1 is the same term as x - 2.
+    let x_minus_1 = store.mk_bvsub(vec![x, one]);
+    let nested = store.mk_bvsub(vec![x_minus_1, one]);
+    let direct = store.mk_bvsub(vec![x, two]);
+    assert_eq!(nested, direct);
+
+    // (x - 1) - #xFF wraps to x - 0 = x.
+    let ff = store.mk_bitvec(BigInt::from(0xFF), 8);
+    assert_eq!(store.mk_bvsub(vec![x_minus_1, ff]), x);
+
+    // A symbolic subtrahend is left alone.
+    let y = store.mk_var("y", Sort::bitvec(8));
+    let x_minus_y = store.mk_bvsub(vec![x, y]);
+    let kept = store.mk_bvsub(vec![x_minus_y, one]);
+    assert_ne!(kept, store.mk_bvsub(vec![x, y]));
+    assert!(matches!(store.get(kept), TermData::App(_, args) if args[0] == x_minus_y));
+}
+
+#[test]
+fn test_bvadd_chained_constant_offsets_fold() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::bitvec(8));
+    let one = store.mk_bitvec(BigInt::from(1), 8);
+    let two = store.mk_bitvec(BigInt::from(2), 8);
+    let three = store.mk_bitvec(BigInt::from(3), 8);
+
+    let direct = store.mk_bvadd(vec![x, three]);
+    let x_plus_1 = store.mk_bvadd(vec![x, one]);
+    assert_eq!(store.mk_bvadd(vec![x_plus_1, two]), direct);
+    assert_eq!(store.mk_bvadd(vec![two, x_plus_1]), direct);
+    let one_plus_x = store.mk_bvadd(vec![one, x]);
+    assert_eq!(store.mk_bvadd(vec![one_plus_x, two]), direct);
+
+    // (x + 1) + #xFF wraps to x.
+    let ff = store.mk_bitvec(BigInt::from(0xFF), 8);
+    assert_eq!(store.mk_bvadd(vec![x_plus_1, ff]), x);
+}
+
+#[test]
 fn test_bvmul_constant_folding() {
     let mut store = TermStore::new();
 

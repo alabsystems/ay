@@ -224,6 +224,19 @@ impl Context {
             // internal constructor name.
             self.ctor_selectors
                 .insert(ctor_internal.clone(), sel_internals.clone());
+            // Mirror it into the term store. A `declare-datatype` carrier is a
+            // `Sort::Uninterpreted` identity and carries no constructor table,
+            // so without this the store cannot resolve a field index and
+            // `TermStore::try_fold_datatype_selector` declines on every parsed
+            // input — leaving `sel(C(t..))` opaque, which makes each one a
+            // fresh array base for the array-axiom census. Same positional
+            // order and same internal names the solver's terms use.
+            self.terms
+                .register_constructor_fields(&ctor_internal, sel_internals.clone());
+            if let Sort::Uninterpreted(carrier) = dt_sort {
+                self.terms
+                    .register_datatype_field_sorts(carrier, selector_sorts);
+            }
             // Track constructor -> datatype mapping.
             self.constructors.insert(
                 ctor_internal.clone(),
@@ -484,6 +497,22 @@ impl Context {
             for sel in &ctor.selectors {
                 if self.is_reserved_symbol_on_this_route(&sel.name) {
                     return Err(ElaborateError::ReservedSymbol(sel.name.clone()));
+                }
+            }
+        }
+        // A member named like a definition (a `define-fun` or a `:named`
+        // label): z3 rejects the declaration, and a definition shadows the
+        // member here, so accepting it would conflate the two.
+        for ctor in &dec.constructors {
+            let tester = format!("is-{}", ctor.name);
+            let members = std::iter::once(ctor.name.as_str())
+                .chain(std::iter::once(tester.as_str()))
+                .chain(ctor.selectors.iter().map(|sel| sel.name.as_str()));
+            for member in members {
+                if self.fun_defs.contains_key(member) {
+                    return Err(ElaborateError::Redefinition(format!(
+                        "invalid declaration, named expression already defined with this name {member}"
+                    )));
                 }
             }
         }

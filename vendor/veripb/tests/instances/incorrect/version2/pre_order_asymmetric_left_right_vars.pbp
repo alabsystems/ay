@@ -1,0 +1,41 @@
+pseudo-Boolean proof version 2.0
+* Regression test: `left` and `right` name the two sides of the same relation
+* and must be the same length. `OrderRightVariablesRule` checks that when
+* `right` is parsed, which covers version 3.0 (whose grammar admits each list
+* once, in that order), but the version 2.0 parser dispatches line by line and
+* used to accept a SECOND, longer `left` afterwards. The order below was then
+* built with left = [u2, u3] and right = [v1], and every consumer --
+* `ActiveOrder::new`, `get_reflexivity_substitution`,
+* `get_transitivity_substitution`, `get_proofgoals_strict` -- zips the two
+* lists with `izip!` and silently truncates, each to a different length, while
+* `load_order` sizes its literal list against `left` alone. Found by the sweep
+* that followed the `fresh_right` defect (see
+* incorrect/version3/def_order_transitivity_fresh_right_empty): the same shape,
+* a list trusted to have a length nothing establishes. The symmetry is now
+* re-checked when the `vars` block closes.
+f 1
+pre_order bad
+    vars
+        left u1
+        right v1
+        left u2 u3
+        aux
+    end
+    def
+        1 ~u2 1 v1 >= 1 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                u >= 1 ;
+            end -1
+        end
+    end
+end
+load_order bad x1 x2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

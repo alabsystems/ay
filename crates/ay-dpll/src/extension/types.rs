@@ -281,6 +281,10 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// theories that produce splits at full-model time (LRA, LIA, strings).
     /// The executor retrieves this via `take_pending_split()`.
     pub(super) pending_split: Option<ay_core::TheoryResult>,
+    /// Borrowed only from this solve's post-add original-clause ledger.
+    /// Planned/cached historical lemmas are never supplied here.
+    pub(super) installed_theory_lemmas: &'a [ay_core::TheoryLemma],
+    pub(super) installed_theory_should_stop: Option<&'a dyn Fn() -> bool>,
     /// Pending bound-refinement requests discovered during final theory check.
     pub(super) pending_bound_refinements: Vec<BoundRefinementRequest>,
     /// Trail positions saved at each push level (#5548).
@@ -398,6 +402,13 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// epoch (seed unconditionally). `Cell` because `seed_phase_hints_dual`
     /// takes `&self`.
     pub(super) last_seed_epoch: Cell<Option<u64>>,
+    /// Debug-build canary for the epoch skip (#nonlinear-phase-hints): the
+    /// suggestion of EVERY atom in `seed_index` at the last full seed. On a
+    /// skipped seed, every suggestion is re-derived and must equal this —
+    /// the exact claim a theory makes by reporting an epoch. Empty in release
+    /// builds.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub(super) last_seed_hints: RefCell<Vec<Option<bool>>>,
     /// Sticky wander latch (#euf-search-quality): set once the search is
     /// detected "wandering" (decisions >> conflicts) for a theory that opts
     /// into `TheorySolver::wander_hand_to_vsids`. While latched, the extension
@@ -623,6 +634,17 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// spin. A deadline hit only ever degrades the solve to `Unknown`
     /// (fail-closed: never a wrong Sat/Unsat verdict).
     pub(super) solve_deadline: Option<ay_core::time::Instant>,
+    /// Whether the #9505 adaptive "theory decides EVERY decision" mode may
+    /// engage (default true). When false the theory-aware brancher keeps its
+    /// 1-in-2 fractional gating no matter how high decisions/conflicts climbs.
+    /// Set per executor via [`TheoryExtension::with_theory_every_decision`]
+    /// (`Executor::set_no_theory_every_decision`): on the CHC BMC cex lane's
+    /// wide lustre unrollings the every-decision round-robin over all theory
+    /// atoms with LP phases is what blows the decision count up 10-100x
+    /// (BMC_T6_model_search_2026-09-19: peterson depth-3 11 s -> 1.8 s,
+    /// metros_2 ten unsat depths unknown -> 4.5 s), while the QF_LRA
+    /// induction families it was added for keep it.
+    pub(super) theory_every_decision_enabled: bool,
     /// Conflict-verification support literals (`DpllT`'s combined
     /// `dt_verification_axioms ++ ematching_support_axioms`), forwarded at
     /// construction via [`TheoryExtension::with_support_axioms`]. Each is true in

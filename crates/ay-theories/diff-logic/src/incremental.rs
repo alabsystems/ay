@@ -107,6 +107,12 @@ pub enum AssertOutcome {
     /// edges forming that cycle — a sound, and by construction cycle-minimal,
     /// explanation. The edge just asserted is included.
     Conflict(Vec<u64>),
+    /// Not decided: restoring feasibility would give a vertex a potential
+    /// with no negation in the weight's width (see [`Negate`]), which no later
+    /// slack could subtract. The edge is left INACTIVE and the potentials are
+    /// unchanged; nothing is claimed about feasibility, so callers treat this
+    /// as *unknown*.
+    Refused,
 }
 
 /// Difference-logic constraint graph with incremental feasibility maintenance.
@@ -284,7 +290,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
     /// the polarity a DPLL(T) search should try first.
     pub fn edge_is_satisfied(&self, id: usize) -> bool {
         debug_assert!(id < self.edges.len(), "unregistered edge id");
-        self.slack(id) >= W::zero()
+        // An unrepresentable slack claims nothing: report "not satisfied".
+        self.slack(id).is_some_and(|s| s >= W::zero())
     }
 
     /// Is this registered edge currently ACTIVE (asserted and not retracted)?
@@ -329,15 +336,17 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         self.level_marks.clear();
     }
 
+    /// `a − b`, or `None` when `b` has no negation in the weight's width.
     #[inline]
-    fn sub(a: &W, b: &W) -> W {
-        a.add(&b.negate())
+    fn sub(a: &W, b: &W) -> Option<W> {
+        Some(a.add(&b.negate()?))
     }
 
     /// Slack of edge `id` under the current potential: `π(from) + w − π(to)`.
-    /// The invariant is that this is `>= 0` for every active edge.
+    /// The invariant is that this is `>= 0` for every active edge. `None` when
+    /// `π(to)` has no negation in the weight's width.
     #[inline]
-    fn slack(&self, id: usize) -> W {
+    fn slack(&self, id: usize) -> Option<W> {
         let e = &self.edges[id];
         Self::sub(&self.pot[e.from].add(&e.weight), &self.pot[e.to])
     }
@@ -345,9 +354,9 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
     /// Activate a registered edge, restoring feasibility or reporting the
     /// negative cycle it closes.
     ///
-    /// On [`AssertOutcome::Conflict`] the edge is left INACTIVE and the
-    /// potentials are unchanged, so the engine stays in a consistent state that
-    /// the caller may keep using after it has processed the conflict.
+    /// On [`AssertOutcome::Conflict`] and [`AssertOutcome::Refused`] the edge is
+    /// left INACTIVE and the potentials are unchanged, so the engine stays in a
+    /// consistent state that the caller may keep using afterwards.
     pub fn assert_edge(&mut self, id: usize) -> AssertOutcome {
         debug_assert!(id < self.edges.len(), "unregistered edge id");
         if self.active[id] {
@@ -355,7 +364,9 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         }
 
         let zero = W::zero();
-        let s0 = self.slack(id);
+        let Some(s0) = self.slack(id) else {
+            return AssertOutcome::Refused;
+        };
         if s0 >= zero {
             // Already satisfied by the current potential: nothing to do.
             self.active[id] = true;
@@ -413,14 +424,16 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 }
                 // Relax with the NON-NEGATIVE slack of the active edge, computed
                 // from disjoint field borrows so no `&self` method call blocks
-                // the `&mut self.dist` write below.
+                // the `&mut self.dist` write below. Every potential is kept
+                // negatable (see the decreases below); should one not be,
+                // skipping the edge could miss a required decrease, so refuse.
+                let Some(neg_to) = self.pot[y].negate() else {
+                    self.reset_scratch();
+                    return AssertOutcome::Refused;
+                };
                 let cand = {
                     let e = &self.edges[eid];
-                    dx.add(
-                        &self.pot[e.from]
-                            .add(&e.weight)
-                            .add(&self.pot[e.to].negate()),
-                    )
+                    dx.add(&self.pot[e.from].add(&e.weight).add(&neg_to))
                 };
                 let better = match &self.dist[y] {
                     Some(d) => &cand < d,
@@ -454,15 +467,9 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         }
 
         // No conflict: apply the required decreases.
-        for i in 0..self.touched.len() {
-            let v = self.touched[i];
-            if let Some(d) = self.dist[v].clone() {
-                if d < zero {
-                    self.pot[v] = self.pot[v].add(&d);
-                }
-            }
+        if !self.apply_decreases() {
+            return AssertOutcome::Refused;
         }
-        self.reset_scratch();
 
         self.active[id] = true;
         self.trail.push(id);
@@ -471,6 +478,34 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
             "feasibility invariant broken after assert"
         );
         AssertOutcome::Consistent
+    }
+
+    /// Move every touched vertex's potential by its negative `dist`, then
+    /// clear the scratch. Every slack subtracts a potential, so every potential
+    /// must stay negatable: the new values are staged in `dist` first, and on
+    /// `false` one was not, so nothing moved.
+    fn apply_decreases(&mut self) -> bool {
+        let zero = W::zero();
+        for i in 0..self.touched.len() {
+            let v = self.touched[i];
+            let staged = match self.dist[v].take() {
+                Some(d) if d < zero => self.pot[v].add(&d),
+                _ => continue,
+            };
+            if !staged.can_negate() {
+                self.reset_scratch();
+                return false;
+            }
+            self.dist[v] = Some(staged);
+        }
+        for i in 0..self.touched.len() {
+            let v = self.touched[i];
+            if let Some(p) = self.dist[v].take() {
+                self.pot[v] = p;
+            }
+        }
+        self.reset_scratch();
+        true
     }
 
     /// Clear only what this assert actually touched. A vertex is `settled` only
@@ -616,7 +651,11 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
             let e = &self.edges[e0];
             (e.from, e.to)
         };
-        let s0 = self.slack(e0);
+        // An unrepresentable slack yields no entailment (losing propagations
+        // is always sound).
+        let Some(s0) = self.slack(e0) else {
+            return Vec::new();
+        };
 
         self.dijkstra_forward(b, budget);
         self.dijkstra_backward(a, budget);
@@ -713,7 +752,7 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         Some(
             bv.add(s0)
                 .add(fu)
-                .add(&self.pot[v].negate())
+                .add(&self.pot[v].negate()?)
                 .add(&self.pot[u]),
         )
     }
@@ -779,13 +818,15 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 if self.fwd_done[y] {
                     continue;
                 }
+                // An unrepresentable slack is skipped: the settled distances
+                // are then real path lengths in a subgraph, which loses
+                // propagations but never produces a wrong one.
+                let Some(neg_to) = self.pot[y].negate() else {
+                    continue;
+                };
                 let cand = {
                     let e = &self.edges[eid];
-                    dx.add(
-                        &self.pot[e.from]
-                            .add(&e.weight)
-                            .add(&self.pot[e.to].negate()),
-                    )
+                    dx.add(&self.pot[e.from].add(&e.weight).add(&neg_to))
                 };
                 let better = match &self.fwd[y] {
                     Some(d) => &cand < d,
@@ -832,13 +873,15 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 if self.bwd_done[y] {
                     continue;
                 }
+                // An unrepresentable slack is skipped: the settled distances
+                // are then real path lengths in a subgraph, which loses
+                // propagations but never produces a wrong one.
+                let Some(neg_to) = self.pot[self.edges[eid].to].negate() else {
+                    continue;
+                };
                 let cand = {
                     let e = &self.edges[eid];
-                    dx.add(
-                        &self.pot[e.from]
-                            .add(&e.weight)
-                            .add(&self.pot[e.to].negate()),
-                    )
+                    dx.add(&self.pot[e.from].add(&e.weight).add(&neg_to))
                 };
                 let better = match &self.bwd[y] {
                     Some(d) => &cand < d,
@@ -874,6 +917,6 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         let zero = W::zero();
         (0..self.edges.len())
             .filter(|i| self.active[*i])
-            .all(|i| self.slack(i) >= zero)
+            .all(|i| self.slack(i).is_some_and(|s| s >= zero))
     }
 }

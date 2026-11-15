@@ -1,0 +1,16 @@
+pseudo-Boolean proof version 3.0
+% DEFECT: the `conclusion BOUNDS` lower-bound guard compared the claimed bound
+% against `best_objective_value`, the objective value of the logged
+% representative. `solx` does not remove the representative, it removes the whole
+% class of assignments agreeing with it on the preserved variables — here the
+% whole x1=0 class, whose minimum is 0 because the objective is over the
+% unpreserved x2. The lower bound is then proved *through* the excluding
+% constraint: `pol 1 2 +` yields `1 x2 >= 1` and `pol 3 100 *` yields
+% `100 x2 >= 100`. The true optimum is 0, witnessed by x1=0, x2=0.
+f 1;
+solx ~x1 x2;
+pol 1 2 +;
+pol 3 100 *;
+output NONE;
+conclusion BOUNDS 100 100 : ~x1 x2;
+end pseudo-Boolean proof;

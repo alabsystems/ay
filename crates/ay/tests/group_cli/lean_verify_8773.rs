@@ -49,6 +49,7 @@ fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
 }
 
+#[cfg(target_os = "linux")]
 fn lake_available() -> bool {
     Command::new("lake")
         .arg("--version")
@@ -74,8 +75,15 @@ fn test_lean_verify_flag_in_help() {
         help.contains("--lean-path"),
         "--lean-path must appear in ay solve --help; help={help}"
     );
+    // Meridian PR2 (e7a92f553) rewrote this help into a summary line plus
+    // detail paragraphs and set the verb as "ACCEPTS"; the contract it states
+    // is unchanged, so match the words, not their case.
+    let lowered = help.to_ascii_lowercase();
     assert!(
-        help.contains("20 only when Lean accepts") && help.contains("never publishes UNSAT"),
+        lowered.contains("20 only when lean accepts")
+            && lowered.contains("2 when lean rejects")
+            && lowered.contains("cannot run")
+            && help.contains("never publishes UNSAT"),
         "--lean-verify help must document the fail-closed unavailable contract; help={help}"
     );
 }
@@ -133,7 +141,9 @@ fn test_lean_path_without_lean_verify_errors() {
 /// `.lean4` proof path, pointing `--lean-path` at a definitely-missing
 /// binary. The verifier MUST report `Unavailable`; because an explicitly
 /// requested kernel check did not run, AY must exit 2 without publishing
-/// UNSAT.
+/// UNSAT. Linux only: elsewhere the verifier is never reached (see
+/// `lean_verify_fails_closed_without_an_authenticated_descriptor`).
+#[cfg(target_os = "linux")]
 #[test]
 fn test_lean_verify_unavailable_bogus_binary_fails_closed() {
     if !lake_available() {
@@ -170,6 +180,41 @@ fn test_lean_verify_unavailable_bogus_binary_fails_closed() {
         !stderr.contains("SOUNDNESS FAILURE"),
         "Unavailable path must not claim soundness failure; stderr={stderr}"
     );
+}
+
+/// The kernel check runs only through a Linux authenticated anonymous
+/// descriptor (6da7afa1f; the development design notes `--lean-verify`: "Unsupported
+/// platforms ... fail closed before UNSAT"). Everywhere else an explicit
+/// `--lean-verify` must refuse before any verifier runs, with or without Lean
+/// installed: exit 2, no UNSAT, the platform named, never a soundness failure.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn lean_verify_fails_closed_without_an_authenticated_descriptor() {
+    let (cnf, proof, _guard) = temp_paths("platform");
+    let output = Command::new(ay_binary())
+        .arg("--lean-verify")
+        .arg("--proof")
+        .arg(&proof)
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("s UNSATISFIABLE"),
+        "leaked UNSAT: {stdout}"
+    );
+    assert!(
+        stderr.contains("unavailable on this platform")
+            && !stderr.contains("Lean verification: OK"),
+        "expected the platform refusal: {stderr}"
+    );
+    assert!(!stderr.contains("SOUNDNESS FAILURE"), "{stderr}");
 }
 
 #[cfg(target_os = "linux")]
@@ -302,6 +347,8 @@ fn test_lean4_proof_output_contains_verified_soundness_boundary() {
 /// Exercise a generated proof whose original-clause table exceeds Lean's
 /// default recursion depth. The pinned project must elaborate the bound theorem
 /// under the emitter's explicit resource policy before UNSAT is published.
+/// Linux only, like the route it exercises.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_lean_verify_with_pinned_project_accepts_deep_bound_unsat() {
     if !lake_available() {

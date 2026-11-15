@@ -157,6 +157,75 @@ fn closed_wide_evaluate_shares_the_expensive_cap_but_legacy_concat_does_not() {
 }
 
 #[test]
+fn unsigned_literal_evaluation_keeps_its_existing_ground_census_and_aggregate_meter() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_bitvec(BigInt::from(0), 128);
+    let high = terms.mk_bitvec(BigInt::from(1) << 127_u32, 128);
+    let comparison = terms.mk_app(Symbol::named("bvult"), [zero, high], Sort::Bool);
+    let truth = terms.true_term();
+    let equality = terms.mk_app(Symbol::named("="), [comparison, truth], Sort::Bool);
+    let denied = terms.mk_not_raw(equality);
+    let mut proof = Proof::new();
+    let assumption = proof.add_assume(denied, None);
+    let mut evaluated = assumption;
+    for _ in 0..=MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF {
+        evaluated = proof.add_rule_step(AletheRule::Evaluate, vec![equality], vec![], vec![]);
+    }
+    proof.add_resolution(Vec::new(), equality, assumption, evaluated);
+    // These exact ground comparisons already validate before the separate
+    // wide-BV evaluator or proof-producing BB owner is entered. Their normal
+    // per-Evaluate semantic fee still belongs to the one aggregate walk.
+    assert_eq!(
+        validate_expensive_bv_budget(&proof, &terms).unwrap(),
+        bv_bitblast::ExpensiveBvAggregateCharge::default()
+    );
+    let mut offers = Vec::new();
+    crate::check_proof_strict_with_context_and_progress(
+        &proof,
+        &terms,
+        None,
+        None,
+        Some(&[denied]),
+        &mut |work, bytes| {
+            offers.push((work, bytes));
+            true
+        },
+    )
+    .unwrap();
+    let first_semantic = offers
+        .iter()
+        .position(|&(work, _)| work >= 100_000)
+        .expect("the existing Evaluate fee remains charged");
+    for refusal in [0, first_semantic] {
+        let mut calls = 0;
+        let mut refused = false;
+        let mut after_refusal = 0;
+        let mut progress = |_: usize, _: usize| {
+            if refused {
+                after_refusal += 1;
+                return false;
+            }
+            let admitted = calls != refusal;
+            calls += 1;
+            refused = !admitted;
+            admitted
+        };
+        assert!(matches!(
+            crate::check_proof_strict_with_context_and_progress(
+                &proof,
+                &terms,
+                None,
+                None,
+                Some(&[denied]),
+                &mut progress,
+            ),
+            Err(ProofCheckError::ResourceLimit)
+        ));
+        assert_eq!(after_refusal, 0, "a refused offer ends the walk");
+    }
+}
+
+#[test]
 fn symbolic_wide_and_unsupported_ground_bv_stay_expensive_and_fail_closed() {
     let mut terms = TermStore::new();
     let symbolic = terms.mk_var("symbolic_width_8", Sort::bitvec(8));

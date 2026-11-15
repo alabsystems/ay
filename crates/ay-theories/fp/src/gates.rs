@@ -11,49 +11,75 @@ use ay_core::{CnfClause, CnfLit};
 
 use super::{FpDecomposed, FpPrecision, FpSolver};
 
+mod simplification;
+
+/// Negate a CNF literal.
+///
+/// Every literal this solver builds is `±v` for a variable `v >= 1` handed out
+/// by `fresh_var`, so `-lit` never overflows `i32`; `wrapping_neg` is total and
+/// identical to `-lit` on that domain (the same form as `ay_core`'s Tseitin
+/// `negate`). The one `i32` without a negation, `i32::MIN`, is not a literal.
+#[inline]
+pub(crate) fn neg_lit(lit: CnfLit) -> CnfLit {
+    lit.wrapping_neg()
+}
+
 // ── CNF gate primitives ─────────────────────────────────────────────────────
 
 impl FpSolver<'_> {
     /// Create a literal that represents (a AND b)
     pub(crate) fn make_and(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if let Some(result) = self.simplify_and(a, b) {
+            return result;
+        }
         let result = self.fresh_var();
         // result <-> (a AND b)
-        self.add_clause(CnfClause::new(vec![-result, a]));
-        self.add_clause(CnfClause::new(vec![-result, b]));
-        self.add_clause(CnfClause::new(vec![-a, -b, result]));
+        self.add_clause(CnfClause::new(vec![neg_lit(result), a]));
+        self.add_clause(CnfClause::new(vec![neg_lit(result), b]));
+        self.add_clause(CnfClause::new(vec![neg_lit(a), neg_lit(b), result]));
         result
     }
 
     /// Create a literal that represents (a OR b)
     pub(crate) fn make_or(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if let Some(result) = self.simplify_or(a, b) {
+            return result;
+        }
         let result = self.fresh_var();
         // result <-> (a OR b)
-        self.add_clause(CnfClause::new(vec![-result, a, b]));
-        self.add_clause(CnfClause::new(vec![-a, result]));
-        self.add_clause(CnfClause::new(vec![-b, result]));
+        self.add_clause(CnfClause::new(vec![neg_lit(result), a, b]));
+        self.add_clause(CnfClause::new(vec![neg_lit(a), result]));
+        self.add_clause(CnfClause::new(vec![neg_lit(b), result]));
         result
     }
 
     /// Create a literal that represents (a XOR b)
     pub(crate) fn make_xor(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
+        if let Some(result) = self.simplify_xor(a, b) {
+            return result;
+        }
         let result = self.fresh_var();
-        self.add_clause(CnfClause::new(vec![a, b, -result]));
-        self.add_clause(CnfClause::new(vec![a, -b, result]));
-        self.add_clause(CnfClause::new(vec![-a, b, result]));
-        self.add_clause(CnfClause::new(vec![-a, -b, -result]));
+        self.add_clause(CnfClause::new(vec![a, b, neg_lit(result)]));
+        self.add_clause(CnfClause::new(vec![a, neg_lit(b), result]));
+        self.add_clause(CnfClause::new(vec![neg_lit(a), b, result]));
+        self.add_clause(CnfClause::new(vec![
+            neg_lit(a),
+            neg_lit(b),
+            neg_lit(result),
+        ]));
         result
     }
 
     /// Create a literal that is true iff all bits are zero
     pub(crate) fn make_all_zero(&mut self, bits: &[CnfLit]) -> CnfLit {
-        if bits.is_empty() {
+        let Some((&first, rest)) = bits.split_first() else {
             let result = self.fresh_var();
             self.add_clause(CnfClause::unit(result));
             return result;
-        }
-        let mut result = -bits[0];
-        for &bit in &bits[1..] {
-            let neg_bit = -bit;
+        };
+        let mut result = neg_lit(first);
+        for &bit in rest {
+            let neg_bit = neg_lit(bit);
             result = self.make_and(result, neg_bit);
         }
         result
@@ -61,13 +87,13 @@ impl FpSolver<'_> {
 
     /// Create a literal that is true iff all bits are one
     pub(crate) fn make_all_ones(&mut self, bits: &[CnfLit]) -> CnfLit {
-        if bits.is_empty() {
+        let Some((&first, rest)) = bits.split_first() else {
             let result = self.fresh_var();
             self.add_clause(CnfClause::unit(result));
             return result;
-        }
-        let mut result = bits[0];
-        for &bit in &bits[1..] {
+        };
+        let mut result = first;
+        for &bit in rest {
             result = self.make_and(result, bit);
         }
         result
@@ -76,18 +102,18 @@ impl FpSolver<'_> {
     /// Create a literal that is true iff NOT all bits are one
     pub(crate) fn make_not_all_ones(&mut self, bits: &[CnfLit]) -> CnfLit {
         let all_ones = self.make_all_ones(bits);
-        -all_ones
+        neg_lit(all_ones)
     }
 
     /// Create a literal that is true iff any bit is nonzero
     pub(crate) fn make_any_nonzero(&mut self, bits: &[CnfLit]) -> CnfLit {
-        if bits.is_empty() {
+        let Some((&first, rest)) = bits.split_first() else {
             let result = self.fresh_var();
-            self.add_clause(CnfClause::unit(-result));
+            self.add_clause(CnfClause::unit(neg_lit(result)));
             return result;
-        }
-        let mut result = bits[0];
-        for &bit in &bits[1..] {
+        };
+        let mut result = first;
+        for &bit in rest {
             result = self.make_or(result, bit);
         }
         result
@@ -96,14 +122,15 @@ impl FpSolver<'_> {
     /// Create bits representing equality of two bit vectors
     pub(crate) fn make_bits_equal(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         debug_assert_eq!(a.len(), b.len(), "Bit vectors must have same length");
-        if a.is_empty() {
+        let mut pairs = a.iter().zip(b);
+        let Some((&a0, &b0)) = pairs.next() else {
             let result = self.fresh_var();
             self.add_clause(CnfClause::unit(result));
             return result;
-        }
-        let mut result = self.make_xnor(a[0], b[0]);
-        for i in 1..a.len() {
-            let bit_eq = self.make_xnor(a[i], b[i]);
+        };
+        let mut result = self.make_xnor(a0, b0);
+        for (&ai, &bi) in pairs {
+            let bit_eq = self.make_xnor(ai, bi);
             result = self.make_and(result, bit_eq);
         }
         result
@@ -112,7 +139,7 @@ impl FpSolver<'_> {
     /// Create a literal that represents (a XNOR b) = NOT (a XOR b)
     pub(crate) fn make_xnor(&mut self, a: CnfLit, b: CnfLit) -> CnfLit {
         let xor = self.make_xor(a, b);
-        -xor
+        neg_lit(xor)
     }
 
     /// Create an if-then-else on bits: result = cond ? then_bits : else_bits
@@ -123,20 +150,26 @@ impl FpSolver<'_> {
         else_bits: &[CnfLit],
     ) -> Vec<CnfLit> {
         debug_assert_eq!(then_bits.len(), else_bits.len());
-        let mut result = Vec::with_capacity(then_bits.len());
-        for i in 0..then_bits.len() {
-            result.push(self.make_ite(cond, then_bits[i], else_bits[i]));
+        let mut result = Vec::new();
+        // A capacity hint only: on failure `push` grows the vector as before.
+        let _ = result.try_reserve_exact(then_bits.len());
+        for (&then_bit, &else_bit) in then_bits.iter().zip(else_bits) {
+            result.push(self.make_ite(cond, then_bit, else_bit));
         }
         result
     }
 
     /// Create if-then-else: result = cond ? then_val : else_val
     pub(crate) fn make_ite(&mut self, cond: CnfLit, then_val: CnfLit, else_val: CnfLit) -> CnfLit {
+        if let Some(result) = self.simplify_ite(cond, then_val, else_val) {
+            return result;
+        }
         let result = self.fresh_var();
-        self.add_clause(CnfClause::new(vec![-cond, -then_val, result]));
-        self.add_clause(CnfClause::new(vec![-cond, then_val, -result]));
-        self.add_clause(CnfClause::new(vec![cond, -else_val, result]));
-        self.add_clause(CnfClause::new(vec![cond, else_val, -result]));
+        let (not_cond, not_result) = (neg_lit(cond), neg_lit(result));
+        self.add_clause(CnfClause::new(vec![not_cond, neg_lit(then_val), result]));
+        self.add_clause(CnfClause::new(vec![not_cond, then_val, not_result]));
+        self.add_clause(CnfClause::new(vec![cond, neg_lit(else_val), result]));
+        self.add_clause(CnfClause::new(vec![cond, else_val, not_result]));
         result
     }
 
@@ -163,10 +196,10 @@ impl FpSolver<'_> {
     pub(crate) fn make_bv_eq(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         debug_assert_eq!(a.len(), b.len());
         let mut result = self.const_true();
-        for i in 0..a.len() {
+        for (&ai, &bi) in a.iter().zip(b) {
             // bit_eq = NOT (a[i] XOR b[i])
-            let xor_bit = self.make_xor(a[i], b[i]);
-            result = self.make_and(result, -xor_bit);
+            let xor_bit = self.make_xor(ai, bi);
+            result = self.make_and(result, neg_lit(xor_bit));
         }
         result
     }

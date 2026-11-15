@@ -42,6 +42,40 @@ impl<'ctx, 'model> Emission<'ctx, 'model> {
         true
     }
 
+    /// Admit a STREAMED `opttree` body without ever holding a second copy of
+    /// it.
+    ///
+    /// [`Self::admit`] takes an owned `String`, which is right for every block
+    /// that is cheap to build and wrong for this one: a streamed tree body is
+    /// the largest object in the process by an order of magnitude — the whole
+    /// reason it was streamed — and materialising `opttree\n<body>\nend` as a
+    /// second `String` before copying it into `blocks` would put two of them
+    /// live at once and hand back the memory ceiling that streaming removed.
+    /// The cap is checked against the total this WOULD write, so a body that
+    /// does not fit is still dropped whole rather than shortened.
+    pub(super) fn admit_opt_tree_body(&mut self, body: &str) -> bool {
+        let total = OPT_TREE_OPEN.len() + OPT_TREE_CLOSE.len() + 2 + body.len();
+        if let Some(cap) = self.ctx.max_bytes {
+            if self
+                .blocks
+                .len()
+                .checked_add(total)
+                .is_none_or(|sum| sum > cap)
+            {
+                self.truncated
+                    .push(format!("truncated optimality-tree bytes={total} cap={cap}"));
+                return false;
+            }
+        }
+        self.blocks.reserve(total);
+        self.blocks.push_str(OPT_TREE_OPEN);
+        self.blocks.push('\n');
+        self.blocks.push_str(body);
+        self.blocks.push_str(OPT_TREE_CLOSE);
+        self.blocks.push('\n');
+        true
+    }
+
     pub(super) fn block_claim(
         &mut self,
         name: &'static str,

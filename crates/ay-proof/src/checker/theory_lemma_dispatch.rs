@@ -77,13 +77,15 @@ fn validate_theory_core(
         // content, and each gate's declared operator. Unsupported or too-wide
         // clauses fail closed pending full proof-bitblaster coverage (#8071).
         TheoryLemmaKind::BvBitBlast => {
-            bv_bitblast::validate_bv_bitblast(terms, step_id, clause, None)?;
+            bv_bitblast::validate_bv_bitblast_with_progress(
+                terms, step_id, clause, None, progress,
+            )?;
         }
         // Boolean tautology: a propositional clause true under every bounded
         // assignment (e.g. `(= (not (not p)) p)`). Validated by the same
         // exhaustive bounded evaluator, without the bit-blast BV-content gate.
         TheoryLemmaKind::BoolTautology => {
-            bv_bitblast::validate_bool_tautology(terms, step_id, clause)?;
+            bv_bitblast::validate_bool_tautology_with_progress(terms, step_id, clause, progress)?;
         }
         TheoryLemmaKind::ArithEqTriangle => {
             lia::validate_arith_eq_triangle(terms, step_id, clause)?;
@@ -129,14 +131,53 @@ fn validate_theory_numeric_and_fp(
     let clause = context.clause;
     let progress = &mut *context.progress;
     match kind {
+        // A Chvátal–Gomory cut chain, re-derived and re-validated from the
+        // clause in exact arithmetic; no payload.
+        TheoryLemmaKind::IntCgCutChain => {
+            lia::validate_int_cg_cut_chain(terms, step_id, clause)?;
+        }
         TheoryLemmaKind::OrderIteTautology => {
             order_ite::validate_order_ite_tautology(terms, step_id, clause)?;
+        }
+        // The checked multiplication overflow identity, re-derived term for
+        // term from the clause's four limbs; no payload.
+        TheoryLemmaKind::BvMulOverflowDivision => {
+            if !crate::recognize_mul_overflow_division(terms, clause) {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: "bv_mul_overflow_division: the clause is not the unit checked \
+                             multiplication overflow identity over four distinct limbs"
+                        .to_string(),
+                });
+            }
+        }
+        TheoryLemmaKind::BvUremBound => {
+            bv_urem_bound::validate(terms, step_id, clause, progress)?;
         }
         TheoryLemmaKind::FpClassification { .. } => {
             fp_bounded::validate_fp_classification(terms, step_id, clause)?;
         }
         TheoryLemmaKind::FpRoundingModeDomain => {
             fp_bounded::validate_fp_rounding_mode_domain(terms, step_id, clause)?;
+        }
+        TheoryLemmaKind::FiniteFieldLinear(multipliers) => {
+            let multipliers = multipliers.map(u32::from);
+            finite_field::linear::validate(terms, step_id, clause, &multipliers, progress)?;
+        }
+        TheoryLemmaKind::FiniteFieldLinearWide(multipliers) => {
+            finite_field::linear::validate(terms, step_id, clause, &multipliers, progress)?;
+        }
+        TheoryLemmaKind::FiniteFieldExhaustive => {
+            finite_field::validate(terms, step_id, clause, progress)?;
+        }
+        TheoryLemmaKind::FiniteFieldQuadratic => {
+            finite_field::quadratic::validate(terms, step_id, clause, progress)?;
+        }
+        TheoryLemmaKind::FiniteFieldUnivariate => {
+            finite_field::univariate::validate(terms, step_id, clause, progress)?;
+        }
+        TheoryLemmaKind::FiniteFieldIdeal => {
+            finite_field::ideal::validate(terms, step_id, clause, progress)?;
         }
         // Exact IEEE-754 evaluation (`fp_ground`): the clause is TRUE under
         // every assignment of whatever variables survive its own ground
@@ -146,7 +187,7 @@ fn validate_theory_numeric_and_fp(
         // schema check; unsupported operators, unbounded variable domains
         // and budget exhaustion all fail closed.
         TheoryLemmaKind::FpGroundEval => {
-            fp_ground::validate_fp_ground_eval(terms, step_id, clause)?;
+            fp_ground::validate_fp_ground_eval_with_progress(terms, step_id, clause, progress)?;
         }
         TheoryLemmaKind::RoundingModeDomain => {
             rounding_mode::validate_rounding_mode_domain(terms, step_id, clause)?;
@@ -162,7 +203,13 @@ fn validate_theory_numeric_and_fp(
             fp_forward_error::validate_fp_forward_error(terms, step_id, clause)?;
         }
         TheoryLemmaKind::BvBitBlastGate { gate_type, width } => {
-            bv_bitblast::validate_bv_bitblast(terms, step_id, clause, Some((gate_type, width)))?;
+            bv_bitblast::validate_bv_bitblast_with_progress(
+                terms,
+                step_id,
+                clause,
+                Some((gate_type, width)),
+                progress,
+            )?;
         }
         // Array theory lemmas: semantic ROW validation (#8820).
         //
@@ -268,7 +315,13 @@ fn validate_theory_arrays_and_strings(
     let datatype_member_signatures = context.datatype_member_signatures;
     match kind {
         TheoryLemmaKind::ArrayExtensionality => {
-            array_axiom::validate_array_extensionality(terms, step_id, clause, ext_diff)?;
+            array_axiom::validate_array_extensionality(
+                terms,
+                step_id,
+                clause,
+                ext_diff,
+                &mut *context.progress,
+            )?;
         }
         // Complete finite-carrier array schemas. Unlike Skolemized
         // extensionality, these are theory tautologies and need no witness
@@ -294,12 +347,11 @@ fn validate_theory_arrays_and_strings(
                 datatype_member_signatures,
             )?;
         }
-        // FP→BV lemmas: fail-closed until semantic lowering exists (#8820).
-        //
-        // Enforces the cheap schema checks first, then rejects because
-        // strict IEEE 754 re-verification against the BV circuit is #8075.
+        // Exact constructor and complete Mul/Add/Sub word schemas rederive
+        // the whole FP/BV clause on the original owner. Arbitrary circuits
+        // still fail closed; an operation tag is never source authority.
         TheoryLemmaKind::FpToBv { operation } => {
-            fp_to_bv::validate_fp_to_bv(terms, step_id, clause, operation)?;
+            fp_to_bv::validate_fp_to_bv(terms, step_id, clause, operation, &mut *context.progress)?;
         }
         // String theory lemmas: fail-closed semantic validation (#8820).
         //

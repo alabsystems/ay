@@ -25,6 +25,14 @@
 use crate::atom::Negate;
 use crate::weight::Weight;
 
+/// Vertex-count limit of [`DiffGraph::check`]: a graph with `VAR_LIMIT` or more
+/// vertices is [`DiffResult::Refused`] rather than decided.
+///
+/// Bellman-Ford keeps two dense per-vertex tables, so the vertex count is an
+/// allocation size. `2^28` vertices is far beyond anything the `O(|V|·|E|)`
+/// check could finish on, and the refusal happens before anything is allocated.
+pub const VAR_LIMIT: usize = 1 << 28;
+
 /// Result of [`DiffGraph::check`].
 #[derive(Clone, Debug)]
 pub enum DiffResult<W> {
@@ -35,6 +43,11 @@ pub enum DiffResult<W> {
     /// indices (into [`DiffGraph::edges`]) forming the cycle. Summing their
     /// weights yields a value `< 0`.
     Unsat { cycle: Vec<usize> },
+    /// Not decided; nothing is claimed about the system. The graph has
+    /// [`VAR_LIMIT`] or more vertices, or an internal invariant (every edge
+    /// endpoint is a vertex, a predecessor walk closes into a cycle) did not
+    /// hold. Callers treat this as *unknown*.
+    Refused,
 }
 
 /// One stored edge `from → to : weight`, i.e. the constraint `to - from <= weight`.
@@ -74,7 +87,10 @@ impl<W: Weight + Negate> DiffGraph<W> {
     /// Ensure vertex index `v` exists, growing the vertex set if needed.
     pub fn ensure_var(&mut self, v: usize) {
         if v >= self.n_vars {
-            self.n_vars = v + 1;
+            // `v == usize::MAX` saturates to a vertex count of `usize::MAX`,
+            // which is at or above `VAR_LIMIT`, so `check` refuses the graph
+            // rather than deciding one that lacks vertex `v`.
+            self.n_vars = v.saturating_add(1);
         }
     }
 
@@ -110,12 +126,16 @@ impl<W: Weight + Negate> DiffGraph<W> {
                 self.certify_cycle(&cycle);
                 DiffResult::Unsat { cycle }
             }
+            BfOutcome::Refused => DiffResult::Refused,
         }
     }
 
     /// Bellman-Ford from the implicit zero-distance super-source.
     fn bellman_ford(&self) -> BfOutcome<W> {
         let n = self.n_vars;
+        if n >= VAR_LIMIT {
+            return BfOutcome::Refused;
+        }
         // All vertices start reachable at distance 0 (super-source with 0-weight
         // edges). This finds shortest paths over the whole graph in one shot.
         let mut dist: Vec<W> = vec![W::zero(); n];
@@ -129,10 +149,19 @@ impl<W: Weight + Negate> DiffGraph<W> {
             let mut any = false;
             for (ei, e) in self.edges.iter().enumerate() {
                 // relax to via from: dist[to] > dist[from] + w ?
-                let cand = dist[e.from].add(&e.weight);
-                if cand < dist[e.to] {
-                    dist[e.to] = cand;
-                    pred[e.to] = Some(ei);
+                // `add_constraint` grows the vertex set to cover both
+                // endpoints, so a missing one is a broken invariant: refuse.
+                let (Some(d_from), Some(d_to)) = (dist.get(e.from), dist.get(e.to)) else {
+                    return BfOutcome::Refused;
+                };
+                let cand = d_from.add(&e.weight);
+                if cand < *d_to {
+                    let (Some(d_slot), Some(p_slot)) = (dist.get_mut(e.to), pred.get_mut(e.to))
+                    else {
+                        return BfOutcome::Refused;
+                    };
+                    *d_slot = cand;
+                    *p_slot = Some(ei);
                     any = true;
                     changed_vertex = Some(e.to);
                 }
@@ -149,10 +178,10 @@ impl<W: Weight + Negate> DiffGraph<W> {
         // We completed n rounds and the last one still relaxed something ⇒ a
         // negative cycle exists. Recover it from the predecessor chain.
         match changed_vertex {
-            Some(start) => {
-                let cycle = self.recover_cycle(start, &pred);
-                BfOutcome::NegativeCycle { cycle }
-            }
+            Some(start) => match self.recover_cycle(start, &pred) {
+                Some(cycle) => BfOutcome::NegativeCycle { cycle },
+                None => BfOutcome::Refused,
+            },
             // Defensive: `any` was true so changed_vertex must be Some. If not,
             // treat as feasible (the distances are valid).
             None => BfOutcome::Feasible { dist },
@@ -164,13 +193,19 @@ impl<W: Weight + Negate> DiffGraph<W> {
     ///
     /// Walk predecessors `n` times to land *inside* a cycle, then follow
     /// predecessors collecting edges until we return to that vertex.
-    fn recover_cycle(&self, start: usize, pred: &[Option<usize>]) -> Vec<usize> {
+    ///
+    /// `None` when the predecessor chain does not behave as Bellman-Ford
+    /// guarantees (a vertex or edge index out of range, a cycle vertex with no
+    /// predecessor, or a walk that does not close within the edge count); the
+    /// caller then refuses to decide.
+    fn recover_cycle(&self, start: usize, pred: &[Option<usize>]) -> Option<Vec<usize>> {
         // Step back n times to guarantee we are on the cycle.
         let mut v = start;
         for _ in 0..self.n_vars {
-            v = match pred[v] {
-                Some(ei) => self.edges[ei].from,
-                None => break,
+            v = match pred.get(v) {
+                Some(Some(ei)) => self.edges.get(*ei)?.from,
+                Some(None) => break,
+                None => return None,
             };
         }
         // Now v is on the cycle. Collect edges from v back to v.
@@ -178,19 +213,22 @@ impl<W: Weight + Negate> DiffGraph<W> {
         let mut edges_rev: Vec<usize> = Vec::new();
         let mut cur = cycle_node;
         loop {
-            let ei = pred[cur].expect("cycle node must have predecessor");
+            // A cycle node always has a predecessor.
+            let ei = pred.get(cur).copied().flatten()?;
             edges_rev.push(ei);
-            cur = self.edges[ei].from;
+            cur = self.edges.get(ei)?.from;
             if cur == cycle_node {
                 break;
             }
-            // Safety valve: never loop longer than the edge count.
+            // Safety valve: never loop longer than the edge count. A walk
+            // that has not closed by then is not a cycle; refuse it rather
+            // than report it as one.
             if edges_rev.len() > self.edges.len() {
-                break;
+                return None;
             }
         }
         edges_rev.reverse();
-        edges_rev
+        Some(edges_rev)
     }
 
     /// `debug_assert` that the model satisfies every stored constraint by direct
@@ -198,18 +236,22 @@ impl<W: Weight + Negate> DiffGraph<W> {
     /// i.e. `model[to] <= model[from] + w`.
     fn certify_model(&self, model: &[W]) {
         for e in &self.edges {
-            let rhs = model[e.from].add(&e.weight);
+            // An endpoint missing from the model fails the certificate.
+            let holds = match (model.get(e.from), model.get(e.to)) {
+                (Some(from), Some(to)) => *to <= from.add(&e.weight),
+                _ => false,
+            };
             debug_assert!(
-                model[e.to] <= rhs,
+                holds,
                 "diff-logic SAT self-cert failed: constraint v{} - v{} <= {:?} violated by model \
                  (lhs v{}={:?}, v{}={:?})",
                 e.to,
                 e.from,
                 e.weight,
                 e.to,
-                model[e.to],
+                model.get(e.to),
                 e.from,
-                model[e.from],
+                model.get(e.from),
             );
         }
     }
@@ -219,24 +261,38 @@ impl<W: Weight + Negate> DiffGraph<W> {
     fn certify_cycle(&self, cycle: &[usize]) {
         debug_assert!(!cycle.is_empty(), "diff-logic UNSAT cert: empty cycle");
         // Check it forms a closed walk: each edge's `to` == next edge's `from`.
+        // An edge index outside the edge list fails the certificate.
         for w in cycle.windows(2) {
-            let a = &self.edges[w[0]];
-            let b = &self.edges[w[1]];
-            debug_assert_eq!(
-                a.to, b.from,
+            let contiguous = match *w {
+                [ai, bi] => match (self.edges.get(ai), self.edges.get(bi)) {
+                    (Some(a), Some(b)) => a.to == b.from,
+                    _ => false,
+                },
+                _ => false,
+            };
+            debug_assert!(
+                contiguous,
                 "diff-logic UNSAT cert: cycle not contiguous at edges {w:?}"
             );
         }
-        let first = &self.edges[cycle[0]];
-        let last = &self.edges[*cycle.last().unwrap()];
-        debug_assert_eq!(
-            last.to, first.from,
-            "diff-logic UNSAT cert: cycle does not close"
-        );
+        if let (Some(&fi), Some(&li)) = (cycle.first(), cycle.last()) {
+            let closes = match (self.edges.get(fi), self.edges.get(li)) {
+                (Some(first), Some(last)) => last.to == first.from,
+                _ => false,
+            };
+            debug_assert!(closes, "diff-logic UNSAT cert: cycle does not close");
+        }
         // Sum weights and assert < 0.
         let mut sum = W::zero();
         for &ei in cycle {
-            sum = sum.add(&self.edges[ei].weight);
+            let edge = self.edges.get(ei);
+            debug_assert!(
+                edge.is_some(),
+                "diff-logic UNSAT cert: edge index {ei} out of range"
+            );
+            if let Some(e) = edge {
+                sum = sum.add(&e.weight);
+            }
         }
         debug_assert!(
             sum < W::zero(),
@@ -248,11 +304,43 @@ impl<W: Weight + Negate> DiffGraph<W> {
 enum BfOutcome<W> {
     Feasible { dist: Vec<W> },
     NegativeCycle { cycle: Vec<usize> },
+    Refused,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// `model[a] - model[b]`, or an error if either reading is missing or the
+    /// difference overflows.
+    fn model_diff(model: &[i64], a: usize, b: usize) -> Result<i64, Box<dyn std::error::Error>> {
+        let x = *model
+            .get(a)
+            .ok_or("model has no reading for the left variable")?;
+        let y = *model
+            .get(b)
+            .ok_or("model has no reading for the right variable")?;
+        Ok(x.checked_sub(y).ok_or("model difference overflows i64")?)
+    }
+
+    /// Summed weight of `cycle`'s edges in `g`.
+    fn cycle_weight(
+        g: &DiffGraph<i64>,
+        cycle: &[usize],
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut sum = 0i64;
+        for &e in cycle {
+            let w = g
+                .edges()
+                .get(e)
+                .ok_or("cycle names an edge not in the graph")?
+                .weight;
+            sum = sum.checked_add(w).ok_or("cycle weight overflows i64")?;
+        }
+        Ok(sum)
+    }
 
     #[test]
     fn empty_is_sat() {
@@ -261,50 +349,57 @@ mod tests {
     }
 
     #[test]
-    fn simple_sat_chain() {
+    fn simple_sat_chain() -> TestResult {
         // x - y <= 5, y - z <= 3  ⇒ sat
         let mut g = DiffGraph::<i64>::new(3);
         g.add_constraint(0, 1, 5); // x - y <= 5
         g.add_constraint(1, 2, 3); // y - z <= 3
         match g.check() {
             DiffResult::Sat { model } => {
-                assert!(model[0] - model[1] <= 5);
-                assert!(model[1] - model[2] <= 3);
+                assert!(model_diff(&model, 0, 1)? <= 5);
+                assert!(model_diff(&model, 1, 2)? <= 3);
+                Ok(())
             }
-            DiffResult::Unsat { .. } => panic!("expected sat"),
+            DiffResult::Unsat { .. } | DiffResult::Refused => Err("expected sat".into()),
         }
     }
 
     #[test]
-    fn two_cycle_unsat() {
+    fn two_cycle_unsat() -> TestResult {
         // x - y <= -1 and y - x <= -1  ⇒ sum cycle weight -2 < 0  ⇒ unsat
         let mut g = DiffGraph::<i64>::new(2);
         g.add_constraint(0, 1, -1);
         g.add_constraint(1, 0, -1);
         match g.check() {
             DiffResult::Unsat { cycle } => {
-                let sum: i64 = cycle.iter().map(|&e| g.edges()[e].weight).sum();
+                let sum = cycle_weight(&g, &cycle)?;
                 assert!(sum < 0);
                 assert_eq!(cycle.len(), 2);
+                Ok(())
             }
-            DiffResult::Sat { .. } => panic!("expected unsat"),
+            DiffResult::Sat { .. } | DiffResult::Refused => Err("expected unsat".into()),
         }
     }
 
     #[test]
-    fn equal_cycle_is_sat() {
+    fn equal_cycle_is_sat() -> TestResult {
         // x - y <= 1 and y - x <= -1  ⇒ x - y = 1, feasible (cycle weight 0)
         let mut g = DiffGraph::<i64>::new(2);
         g.add_constraint(0, 1, 1);
         g.add_constraint(1, 0, -1);
         match g.check() {
-            DiffResult::Sat { model } => assert_eq!(model[0] - model[1], 1),
-            DiffResult::Unsat { .. } => panic!("expected sat (zero-weight cycle)"),
+            DiffResult::Sat { model } => {
+                assert_eq!(model_diff(&model, 0, 1)?, 1);
+                Ok(())
+            }
+            DiffResult::Unsat { .. } | DiffResult::Refused => {
+                Err("expected sat (zero-weight cycle)".into())
+            }
         }
     }
 
     #[test]
-    fn three_cycle_unsat() {
+    fn three_cycle_unsat() -> TestResult {
         // x-y<=1, y-z<=1, z-x<=-3  ⇒ cycle 1+1-3=-1 <0 unsat
         let mut g = DiffGraph::<i64>::new(3);
         g.add_constraint(0, 1, 1);
@@ -312,24 +407,31 @@ mod tests {
         g.add_constraint(2, 0, -3);
         match g.check() {
             DiffResult::Unsat { cycle } => {
-                let sum: i64 = cycle.iter().map(|&e| g.edges()[e].weight).sum();
+                let sum = cycle_weight(&g, &cycle)?;
                 assert!(sum < 0);
+                Ok(())
             }
-            DiffResult::Sat { .. } => panic!("expected unsat"),
+            DiffResult::Sat { .. } | DiffResult::Refused => Err("expected unsat".into()),
         }
     }
 
     #[test]
-    fn negative_self_loop_unsat() {
+    fn negative_self_loop_unsat() -> TestResult {
         // x - x <= -1  ⇒ 0 <= -1  ⇒ unsat (1-edge negative cycle)
         let mut g = DiffGraph::<i64>::new(1);
         g.add_constraint(0, 0, -1);
         match g.check() {
             DiffResult::Unsat { cycle } => {
                 assert_eq!(cycle.len(), 1);
-                assert!(g.edges()[cycle[0]].weight < 0);
+                let e = cycle.first().ok_or("empty cycle")?;
+                let edge = g
+                    .edges()
+                    .get(*e)
+                    .ok_or("cycle names an edge not in the graph")?;
+                assert!(edge.weight < 0);
+                Ok(())
             }
-            DiffResult::Sat { .. } => panic!("expected unsat"),
+            DiffResult::Sat { .. } | DiffResult::Refused => Err("expected unsat".into()),
         }
     }
 
@@ -340,5 +442,31 @@ mod tests {
         assert!(matches!(g.check(), DiffResult::Sat { .. }));
         g.add_constraint(1, 0, 0); // y - x <= 0  ⇒ cycle -1 unsat
         assert!(matches!(g.check(), DiffResult::Unsat { .. }));
+    }
+
+    #[test]
+    fn vertex_count_at_the_limit_is_refused_before_allocating() {
+        // A constraint on the largest index below the limit makes the vertex
+        // count exactly `VAR_LIMIT`; the check refuses instead of allocating
+        // two `2^28`-entry tables.
+        let mut g = DiffGraph::<i64>::new(0);
+        g.add_constraint(VAR_LIMIT - 1, 0, 1);
+        assert_eq!(g.num_vars(), VAR_LIMIT);
+        assert!(matches!(g.check(), DiffResult::Refused));
+        // The same holds for a graph created at the limit with no edges.
+        assert!(matches!(
+            DiffGraph::<i64>::new(VAR_LIMIT).check(),
+            DiffResult::Refused
+        ));
+    }
+
+    #[test]
+    fn largest_vertex_index_saturates_and_is_refused() {
+        // `usize::MAX + 1` overflowed the vertex count; it now saturates and
+        // the graph is refused, never decided without vertex `usize::MAX`.
+        let mut g = DiffGraph::<i64>::new(1);
+        g.add_constraint(usize::MAX, 0, -1);
+        assert_eq!(g.num_vars(), usize::MAX);
+        assert!(matches!(g.check(), DiffResult::Refused));
     }
 }

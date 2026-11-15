@@ -20,10 +20,33 @@ fn test_scoped_reincarnated_dt_selector_projection_collapse_is_strict_checkable(
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs, vec!["unsat"]);
+    // The re-declared datatype's members are AY-internal identities
+    // (`__ay_overload_N`) the problem file never spells. The exporter declines
+    // a document that applies one (`ay_proof` `application_heads.rs`): the
+    // document it used to publish was `invalid` to pinned Carcara
+    // (`identifier '__ay_overload_1' is not defined`). Trust is judged on the
+    // rendered commands only, since the decline's banner names `:rule trust`.
     let text = exec.get_proof();
+    let commands: Vec<&str> = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("(step") || line.starts_with("(assume"))
+        .collect();
     assert!(
-        !text.contains(":rule trust"),
+        !commands.iter().any(|line| line.contains(":rule trust")),
         "private member identities must retain trust-free reconstruction:\n{text}"
+    );
+    assert!(
+        !commands.iter().any(|line| line.contains("__ay_overload_")),
+        "a rendered document never spells an internal member identity:\n{text}"
+    );
+    // No command at all means the export declined, and then it says why.
+    assert!(
+        !commands.is_empty()
+            || (text.contains("(error \"UNVERIFIABLE PROOF")
+                && text.contains("does not declare")
+                && text.contains("(__ay_overload_")),
+        "a declined export names the internal identity it refused:\n{text}"
     );
     let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
     match exec.check_proof_strict_with_datatypes(proof) {

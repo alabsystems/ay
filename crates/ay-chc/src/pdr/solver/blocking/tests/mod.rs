@@ -7,8 +7,10 @@
 use super::super::*;
 use super::bool_normalization::{denormalize_int_to_bool, normalize_bool_to_int};
 
+mod fact_step_alias;
 mod may_pob;
-mod source_regression_tests;
+mod pob_cores;
+mod prev_level_zero;
 
 fn unit_test_config() -> PdrConfig {
     PdrConfig {
@@ -129,6 +131,7 @@ fn block_obligation_mbp_predecessor_mentions_all_canonical_vars() {
         BlockResult::AlreadyBlocked => {
             panic!("expected Reachable predecessor, got AlreadyBlocked")
         }
+        BlockResult::MustReachable(_) => panic!("reach facts belong to the nonlinear lane"),
         BlockResult::Unknown => panic!("expected Reachable predecessor, got Unknown"),
     };
 
@@ -446,7 +449,10 @@ fn block_obligation_returns_already_blocked_when_frame_constraint_unsat() {
 "#;
 
     let problem = ChcParser::parse(smt2).unwrap();
-    let mut solver = PdrSolver::new(problem, unit_test_config());
+    let mut solver = PdrSolver::new(
+        problem,
+        unit_test_config().with_spacer(crate::pdr::config::SpacerLane::OFF),
+    );
 
     let inv = solver.problem.get_predicate_by_name("Inv").unwrap().id;
     let canon_x = solver.canonical_vars(inv).unwrap()[0].clone();
@@ -692,8 +698,9 @@ fn block_obligation_preserves_soundness_for_mixed_sat_no_cube_and_unsat_clauses(
                 "expected SAT-no-cube telemetry when returning Unknown"
             );
         }
-        // Also sound: cube extraction succeeded on a SAT predecessor.
-        BlockResult::Reachable(_) => {}
+        // Also sound: cube extraction succeeded on a SAT predecessor (or,
+        // under the nonlinear lane, the state was proven reachable).
+        BlockResult::Reachable(_) | BlockResult::MustReachable(_) => {}
         BlockResult::Blocked(_) => {
             panic!("mixed SAT-no-cube/UNSAT predecessor clauses must not produce Blocked")
         }
@@ -876,7 +883,7 @@ fn block_obligation_uses_cluster_min_max_generalization_for_non_init_predicate()
 "#;
 
     let problem = ChcParser::parse(smt2).unwrap();
-    let mut config = unit_test_config();
+    let mut config = unit_test_config().with_spacer(crate::pdr::config::SpacerLane::OFF);
     config.use_convex_closure = true;
 
     let mut solver = PdrSolver::new(problem, config);

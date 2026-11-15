@@ -1,0 +1,8 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const a (_ BitVec 64))
+(declare-const b (_ BitVec 64))
+(assert (not (= (ite (bvsge a b) (_ bv1 1) (_ bv0 1)) (ite (= (= ((_ extract 63 63) (bvsub a b)) (_ bv1 1)) (and (not (= ((_ extract 63 63) a) ((_ extract 63 63) b))) (not (= ((_ extract 63 63) a) ((_ extract 63 63) (bvsub a b)))))) (_ bv1 1) (_ bv0 1)))))
+(check-sat)
+(exit)

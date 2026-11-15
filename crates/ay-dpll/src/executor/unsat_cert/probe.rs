@@ -9,7 +9,6 @@ use ay_core::{ProofId, TermId};
 use super::Executor;
 
 const CERT_REJECT_PROBE_MAX_TERMS: usize = 32;
-const CERT_REJECT_PROBE_MAX_TERM_CHARS: usize = 8 * 1024;
 
 /// Print a certification-rejection diagnostic when `--probe-cert-reject` is set.
 ///
@@ -25,10 +24,9 @@ pub(in crate::executor) fn probe_cert_reject(message: impl FnOnce() -> String) {
 /// Print one unprefixed certification/datatype diagnostic through the shared
 /// output boundary.
 ///
-/// Raw diagnostics retain their historical `c ...` spelling and are visible
-/// only under `--probe-cert-reject`. Callers still decide which work to perform:
-/// in particular, the authority census remains guarded by the same typed flag
-/// before it invokes this sink.
+/// Raw diagnostics retain their `c ...` spelling and are visible only under
+/// `--probe-cert-reject`. Callers must observe existing results without replaying
+/// proof construction or invoking stateful renderers solely for this sink.
 pub(crate) fn probe_cert_reject_raw(message: impl FnOnce() -> String) {
     emit_probe_cert_reject(ProbeFormat::Raw, message);
 }
@@ -51,22 +49,14 @@ fn emit_probe_cert_reject(format: ProbeFormat, message: impl FnOnce() -> String)
 }
 
 impl Executor {
-    fn bounded_cert_reject_probe_term(&self, term: TermId) -> String {
-        let formatted = self.format_term(term);
-        let Some((cut, _)) = formatted
-            .char_indices()
-            .nth(CERT_REJECT_PROBE_MAX_TERM_CHARS)
-        else {
-            return formatted;
-        };
-        format!("{}…", &formatted[..cut])
-    }
-
+    /// Identity-only diagnostics must not invoke the solver's term renderer:
+    /// finite-field formatting can record an evaluation stop, and truncating
+    /// afterwards does not bound traversal of the term graph.
     pub(in crate::executor) fn bounded_cert_reject_probe_terms(&self, terms: &[TermId]) -> String {
         let mut formatted: Vec<String> = terms
             .iter()
             .take(CERT_REJECT_PROBE_MAX_TERMS)
-            .map(|&term| self.bounded_cert_reject_probe_term(term))
+            .map(ToString::to_string)
             .collect();
         if terms.len() > CERT_REJECT_PROBE_MAX_TERMS {
             formatted.push(format!(
@@ -122,7 +112,9 @@ mod tests {
 
         assert_eq!(
             message,
-            "deferred trust details: collected_steps=1\n  step t7 clause=[lemma, (not lemma)]\n  authored_assertions=[authored]"
+            format!(
+                "deferred trust details: collected_steps=1\n  step t7 clause=[{lemma}, {not_lemma}]\n  authored_assertions=[{authored}]"
+            )
         );
     }
 }

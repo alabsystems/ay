@@ -8,8 +8,6 @@ use super::super::mutate::{
     DeleteResult, ForwardSubsumptionRetention, ReasonPolicy, ReplaceResult,
 };
 use super::super::*;
-#[cfg(feature = "gpu")]
-use crate::gpu::subsume as gpu_subsume;
 
 impl Solver {
     #[inline]
@@ -164,90 +162,6 @@ impl Solver {
         }
     }
 
-    /// Run GPU-accelerated pairwise subsumption as a bulk pre-pass.
-    ///
-    /// Collects all active clauses (irredundant AND learned — the shared
-    /// deletion applier promotes a learned subsumer to irredundant when it
-    /// subsumes an irredundant clause) with no level-0 fixed literals,
-    /// sends them to the GPU for O(n^2) pairwise checking, and applies
-    /// `(subsumed_idx, subsumer_idx)` pairs through the standard guarded
-    /// deletion pipeline.
-    ///
-    /// Only runs when the clause count exceeds `gpu_subsume::GPU_SUBSUME_THRESHOLD`
-    /// (10K). Below that, GPU dispatch overhead exceeds the parallelism benefit.
-    ///
-    /// Returns the number of GPU-detected subsumptions applied.
-    #[cfg(feature = "gpu")]
-    fn gpu_subsume_prepass(&mut self) -> usize {
-        // Collect active clauses suitable for GPU subsumption: irredundant,
-        // no fixed literals, within size limit.
-        let mut clause_indices: Vec<usize> = Vec::new();
-        for idx in self.arena.indices() {
-            if self.arena.is_dead(idx) || self.arena.is_empty_clause(idx) {
-                continue;
-            }
-            let lits = self.arena.literals(idx);
-            if lits.len() > 100 {
-                continue;
-            }
-            // Skip clauses with level-0 fixed literals.
-            let has_fixed = lits.iter().any(|lit| {
-                let li = lit.index();
-                li < self.vals.len() && self.vals[li] != 0
-            });
-            if has_fixed {
-                continue;
-            }
-            clause_indices.push(idx);
-        }
-
-        if !gpu_subsume::should_use_gpu(clause_indices.len()) {
-            return 0;
-        }
-
-        // Lazy-init GPU context.
-        let ctx = match self.inproc.gpu_context() {
-            Some(ctx) => ctx,
-            None => return 0,
-        };
-
-        // Pack clauses as raw u32 literal arrays for the GPU.
-        let raw_clauses: Vec<Vec<u32>> = clause_indices
-            .iter()
-            .map(|&idx| self.arena.literals(idx).iter().map(|lit| lit.0).collect())
-            .collect();
-        let clause_refs: Vec<&[u32]> = raw_clauses.iter().map(|c| c.as_slice()).collect();
-
-        let pairs = match gpu_subsume::gpu_subsume_check(ctx, &clause_refs) {
-            Ok(pairs) => pairs,
-            Err(err) => {
-                tracing::debug!("GPU subsumption check failed (falling back to CPU): {err}");
-                return 0;
-            }
-        };
-
-        // Apply GPU-detected subsumption: translate pair indices back to
-        // arena clause indices and feed into the standard deletion pipeline.
-        let mut applied = 0;
-        for pair in &pairs {
-            let subsumer_arena_idx = clause_indices[pair.subsumer];
-            let subsumed_arena_idx = clause_indices[pair.subsumed];
-            if self.apply_forward_subsumption_deletion(subsumed_arena_idx, subsumer_arena_idx) {
-                applied += 1;
-            }
-        }
-
-        if applied > 0 {
-            tracing::debug!(
-                gpu_pairs = pairs.len(),
-                applied,
-                clauses_checked = clause_indices.len(),
-                "GPU subsumption pre-pass"
-            );
-        }
-        applied
-    }
-
     /// Run SIMD-accelerated batch subsumption as a pre-pass (#8410).
     ///
     /// Packs active clauses into a cache-friendly SIMD arena, generates
@@ -296,15 +210,6 @@ impl Solver {
             return;
         }
 
-        // GPU pre-pass: when clause count exceeds threshold, run GPU pairwise
-        // subsumption as a bulk accelerator before the fine-grained CPU pass.
-        // The GPU pass handles the embarrassingly-parallel O(n^2) case; the
-        // CPU pass then handles incremental dirty-variable-guided checking.
-        #[cfg(feature = "gpu")]
-        {
-            let _gpu_applied = self.gpu_subsume_prepass();
-        }
-
         // SIMD pre-pass (#8410): when the jit feature is enabled, run
         // NEON/SSE2 batch subsumption before the one-watch CPU pass.
         // Packs clauses into a cache-friendly flat arena and uses 4-lane
@@ -337,9 +242,10 @@ impl Solver {
         // and dynamic keep-set thresholds from the last reduce_db() pass.
         // CaDiCaL: likely_to_be_kept_clause gates candidate selection.
         let kept = crate::subsume::KeptThresholds {
-            tier2_lbd: self.tiers.tier2_lbd[0],
+            tier2_lbd: self.tiers.reduce_tier2(),
             kept_glue: self.tiers.kept_glue,
             kept_size: self.tiers.kept_size,
+            irredundant_only: self.cold.subsume_kissat,
         };
         let result = self.inproc.subsumer.run_forward_subsumption(
             &mut self.arena,
@@ -401,6 +307,9 @@ impl Solver {
             } else {
                 None
             };
+            // `--sat-veripb-hints`: the strengthened clause follows from the
+            // subsumer and the old clause, which the replacement names itself.
+            self.veripb_note_antecedent_ref(ClauseRef(*subsumer_idx as u32));
             match self.replace_clause_with_explicit_lrat_hints(
                 *clause_idx,
                 new_lits,

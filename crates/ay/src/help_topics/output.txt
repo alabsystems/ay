@@ -92,8 +92,8 @@ STATISTICS
 
   --stats (--st, and z3's -st and stats=true) prints one (:statistics ...)
   s-expression to stderr, curated and grouped by what a solve spends
-  itself on. On t.smt2 that is 26 rows in six groups -- abridged here to
-  the first row of each:
+  itself on. On t.smt2 that is 27 rows in six groups -- abridged here to
+  the whole answer group and the first row of each other:
 
     $ ay solve -q --stats t.smt2
     (:statistics
@@ -101,6 +101,7 @@ STATISTICS
       :result                          sat
       :total-time                      0.001
       :time                            0.00
+      :rlimit-count                    20
       ; search
       :conflicts                       0
       ; theory

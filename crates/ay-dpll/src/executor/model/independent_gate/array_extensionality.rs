@@ -27,11 +27,12 @@ impl IndependentModelView<'_> {
         if class.len() < 2 {
             return None; // not an extensionality case
         }
-        if self.model.array_model.as_ref().is_some_and(|arrays| {
-            class
-                .iter()
-                .any(|member| arrays.read_conflicted.contains(member))
-        }) {
+        if self
+            .model
+            .array_model
+            .as_ref()
+            .is_some_and(|arrays| class.iter().any(|member| arrays.is_withheld(member)))
+        {
             return None;
         }
         let adopted = self.adopted_array_class_value(&class, index_sort, element_sort)?;

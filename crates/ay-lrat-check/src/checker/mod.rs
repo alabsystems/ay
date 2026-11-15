@@ -10,7 +10,12 @@
 use crate::dimacs::Literal;
 use crate::lrat_parser::LratStep;
 use ay_core::kani_compat::{det_hash_map_new, DetHashMap as HashMap};
+use std::collections::TryReserveError;
 use std::io::Write;
+
+#[cfg(test)]
+use dense::try_filled;
+use dense::DenseArrays;
 
 /// Largest dense variable universe accepted by checker frontends.
 ///
@@ -18,6 +23,11 @@ use std::io::Write;
 /// arrays per variable. The ceiling matches AY's supported 58.6M-variable
 /// competition giant while rejecting the former 268M-variable envelope.
 pub const MAX_DENSE_VARS: usize = 1 << 26;
+
+/// Literal-index ceiling implied by [`MAX_DENSE_VARS`]: two polarity slots
+/// per variable. Every per-literal array (`marks`, `checked_lits`,
+/// `occ_lists`) stays strictly below this length.
+pub(crate) const MAX_DENSE_LITS: usize = 2 * MAX_DENSE_VARS;
 
 #[cfg(test)]
 pub(super) use types::{is_tautological, lit};
@@ -67,9 +77,10 @@ pub struct LratChecker {
     occ_lists: Vec<Vec<u64>>,
     /// Strict (fail-fast) mode: first failure prevents subsequent operations.
     strict: bool,
-    /// Set by any failing operation when `strict` is `true`. Once set, all
-    /// further `add_derived`, `add_original`, `delete`, and `delete_verified`
-    /// calls return `false` without processing.
+    /// Set by any failing operation when `strict` is `true`, and by the
+    /// constructor when the requested universe exceeds [`MAX_DENSE_VARS`].
+    /// Once set, all further `add_derived`, `add_original`, `delete`, and
+    /// `delete_verified` calls return `false` without processing.
     pub(crate) failed: bool,
     /// Prevents double-conclusion in `conclude_unsat()`.
     concluded: bool,
@@ -94,38 +105,88 @@ impl LratChecker {
         Self::with_strict(num_vars, false)
     }
 
+    /// Build a checker for variables `0..num_vars`.
+    ///
+    /// A universe beyond [`MAX_DENSE_VARS`] is refused rather than allocated:
+    /// every frontend rejects such a formula before constructing a checker,
+    /// and on the library API it used to demand dense arrays of up to
+    /// `2 * usize::MAX` slots (a capacity-overflow panic, or an abort from
+    /// the allocator). A universe inside the envelope is still up to 2^27
+    /// literal slots (3 GiB for `occ_lists`), so its arrays are allocated
+    /// fallibly, and an allocator refusal is refused the same way instead of
+    /// aborting the process. A refused checker starts with an empty
+    /// universe, already failed (`stats.failures == 1`), so every operation
+    /// returns `false` and no proof can conclude [`ConcludeResult::Verified`].
     fn with_strict(num_vars: usize, strict: bool) -> Self {
-        let lit_slots = num_vars
-            .checked_mul(2)
-            .expect("num_vars too large: 2 * num_vars overflows usize");
+        if num_vars > MAX_DENSE_VARS {
+            let _ = writeln!(
+                std::io::stderr(),
+                "LRAT FAIL: num_vars={num_vars} exceeds the dense variable envelope \
+                 {MAX_DENSE_VARS}; refusing to allocate"
+            );
+            return Self::from_dense(None, strict);
+        }
+        // `num_vars <= 2^26` here, so `2 * num_vars` cannot overflow and
+        // every dense array stays below 2^27 entries.
+        Self::from_allocation(
+            num_vars,
+            DenseArrays::try_alloc(num_vars, num_vars * 2),
+            strict,
+        )
+    }
+
+    /// Build a checker for `num_vars` variables from the outcome of
+    /// allocating its dense arrays: an allocator refusal yields a refused
+    /// checker (see [`Self::with_strict`]).
+    fn from_allocation(
+        num_vars: usize,
+        allocation: Result<DenseArrays, TryReserveError>,
+        strict: bool,
+    ) -> Self {
+        match allocation {
+            Ok(dense) => Self::from_dense(Some((num_vars, dense)), strict),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "LRAT FAIL: cannot allocate the dense arrays for \
+                     num_vars={num_vars}: {error}; refusing"
+                );
+                Self::from_dense(None, strict)
+            }
+        }
+    }
+
+    /// Build a checker over already allocated dense arrays for a universe of
+    /// `universe` variables, or a refused checker when `dense` is `None`.
+    fn from_dense(dense: Option<(usize, DenseArrays)>, strict: bool) -> Self {
+        let (universe, dense, refused) = match dense {
+            Some((universe, dense)) => (universe, dense, false),
+            None => (0, DenseArrays::default(), true),
+        };
+        let mut stats = Stats::default();
+        if refused {
+            stats.failures = 1;
+        }
         Self {
             clause_arena: Vec::new(),
             clause_index: det_hash_map_new(),
             weakened_clauses: det_hash_map_new(),
-            assigns: vec![None; num_vars],
+            assigns: dense.assigns,
             trail: Vec::new(),
-            stats: Stats::default(),
+            stats,
             has_empty_clause: false,
-            num_vars,
+            num_vars: universe,
             // 2 slots per variable (positive and negative polarity).
-            marks: vec![false; 2 * num_vars],
-            checked_lits: vec![false; 2 * num_vars],
+            marks: dense.marks,
+            checked_lits: dense.checked_lits,
             hint_generation: 0,
             checked_stack: Vec::new(),
-            occ_lists: vec![Vec::new(); lit_slots],
+            occ_lists: dense.occ_lists,
             strict,
-            failed: false,
+            failed: refused,
             concluded: false,
             last_derived_id: 0,
         }
-    }
-
-    /// Look up clause literals by entry.
-    #[inline]
-    pub(crate) fn clause_lits(&self, entry: ClauseEntry) -> &[Literal] {
-        let start = entry.start as usize;
-        let end = start + entry.len as usize;
-        &self.clause_arena[start..end]
     }
 
     /// Check whether a clause is tautological using the `marks` array.
@@ -150,67 +211,10 @@ impl LratChecker {
         found
     }
 
-    /// Insert a clause into the arena. Returns `None` on u32 overflow.
-    fn insert_clause(
-        &mut self,
-        clause_id: u64,
-        clause: &[Literal],
-        tautological: bool,
-        original: bool,
-    ) -> Option<ClauseEntry> {
-        let start = match u32::try_from(self.clause_arena.len()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "LRAT FAIL: arena offset overflow ({} literals exceeds u32)",
-                    self.clause_arena.len()
-                );
-                return None;
-            }
-        };
-        let len = match u32::try_from(clause.len()) {
-            Ok(l) => l,
-            Err(_) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "LRAT FAIL: clause length overflow ({} literals exceeds u32)",
-                    clause.len()
-                );
-                return None;
-            }
-        };
-        if start.checked_add(len).is_none() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "LRAT FAIL: arena range overflow (start={start} + len={len})"
-            );
-            return None;
-        }
-        self.clause_arena.extend_from_slice(clause);
-        // Register each literal in occurrence lists for O(occ) RAT lookup.
-        for &lit in clause {
-            let idx = lit.index();
-            if idx >= self.occ_lists.len() {
-                self.occ_lists.resize_with(idx + 1, Vec::new);
-            }
-            self.occ_lists[idx].push(clause_id);
-        }
-        let entry = ClauseEntry {
-            start,
-            len,
-            hint_gen: 0,
-            tautological,
-            original,
-        };
-        self.clause_index.insert(clause_id, entry);
-        Some(entry)
-    }
-
     /// Record a failure. In strict mode, blocks all subsequent operations.
     #[inline]
     fn record_failure(&mut self) {
-        self.stats.failures += 1;
+        self.stats.failures = self.stats.failures.saturating_add(1);
         if self.strict {
             self.failed = true;
         }
@@ -257,7 +261,7 @@ impl LratChecker {
             self.record_failure();
             return false;
         }
-        self.stats.originals += 1;
+        self.stats.originals = self.stats.originals.saturating_add(1);
         true
     }
 
@@ -290,15 +294,38 @@ impl LratChecker {
             return false;
         }
         self.last_derived_id = clause_id;
-        for &lit in clause {
-            self.ensure_var_extended(lit);
+        if !self.admit_extended(clause, "trusted") {
+            return false;
         }
         let taut = self.check_tautological(clause);
         if self.insert_clause(clause_id, clause, taut, false).is_none() {
             self.record_failure();
             return false;
         }
-        self.stats.derived += 1;
+        self.stats.derived = self.stats.derived.saturating_add(1);
+        true
+    }
+
+    /// Grow the assignment array for every literal of a trusted or derived
+    /// `clause`, which may use extension variables beyond `num_vars`.
+    ///
+    /// Returns `false`, recording a failure, when a literal lies outside the
+    /// dense envelope ([`MAX_DENSE_VARS`]). The LRAT frontends refuse such
+    /// literals while parsing; this covers the library API, where one literal
+    /// of variable `Variable::MAX_ID` would otherwise size the dense arrays
+    /// to 2^31 entries.
+    fn admit_extended(&mut self, clause: &[Literal], kind: &str) -> bool {
+        for &lit in clause {
+            if !self.ensure_var_extended(lit) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "LRAT FAIL: {kind} clause literal {lit} exceeds the dense variable \
+                     envelope {MAX_DENSE_VARS}"
+                );
+                self.record_failure();
+                return false;
+            }
+        }
         true
     }
 
@@ -365,10 +392,10 @@ impl LratChecker {
             return false;
         }
         self.last_derived_id = clause_id;
-        for &lit in clause {
-            self.ensure_var_extended(lit);
+        if !self.admit_extended(clause, "derived") {
+            return false;
         }
-        self.stats.derived += 1;
+        self.stats.derived = self.stats.derived.saturating_add(1);
 
         // Zero is the hint-list terminator, never a clause reference. Reject
         // it in the direct API as well as i64::MIN, whose negation overflows.
@@ -379,7 +406,7 @@ impl LratChecker {
 
         let ok = self.verify_chain(clause, hints);
         if !ok {
-            let failure_num = self.stats.failures + 1;
+            let failure_num = self.stats.failures.saturating_add(1);
             if failure_num <= 10 {
                 let missing: Vec<i64> = hints
                     .iter()
@@ -410,49 +437,18 @@ impl LratChecker {
         ok
     }
 
-    /// Compact the clause arena by removing dead space from deleted clauses (#8624).
-    ///
-    /// The arena is append-only: `delete()` removes a clause from `clause_index`
-    /// but leaves its literals in `clause_arena`. Over long proofs this dead
-    /// space accumulates. `compact_arena()` rebuilds the arena with only live
-    /// clauses and updates `clause_index` entries accordingly.
-    ///
-    /// Called automatically when arena size exceeds 2x the live data size.
-    pub(crate) fn compact_arena(&mut self) {
-        let mut new_arena: Vec<Literal> =
-            Vec::with_capacity(self.clause_index.values().map(|e| e.len as usize).sum());
-
-        for entry in self.clause_index.values_mut() {
-            let old_start = entry.start as usize;
-            let old_end = old_start + entry.len as usize;
-            let new_start = new_arena.len() as u32;
-            new_arena.extend_from_slice(&self.clause_arena[old_start..old_end]);
-            entry.start = new_start;
-        }
-
-        self.clause_arena = new_arena;
-        self.stats.compactions += 1;
-    }
-
-    /// Check whether the arena should be compacted and do so if needed.
-    ///
-    /// Triggers when arena size exceeds 2x the total live clause literal count.
-    fn maybe_compact_arena(&mut self) {
-        let live_size: usize = self.clause_index.values().map(|e| e.len as usize).sum();
-        if self.clause_arena.len() > live_size.saturating_mul(2) && live_size > 0 {
-            self.compact_arena();
-        }
-    }
-
+    // clause_lits(), insert_clause(), compact_arena() are in arena.rs
     // delete(), delete_verified(), finalize_clause() are in deletion.rs
     // derived_empty_clause(), conclude_unsat(), stats_summary() are in conclude.rs
 }
 
+mod arena;
 mod assigns;
 mod blocked;
 mod chain;
 mod conclude;
 mod deletion;
+mod dense;
 mod rat;
 mod resolution;
 mod types;
@@ -473,6 +469,8 @@ mod tests_cadical_parity;
 mod tests_conclude;
 #[cfg(test)]
 mod tests_coverage;
+#[cfg(test)]
+mod tests_dense_envelope;
 #[cfg(test)]
 mod tests_e2e;
 #[cfg(test)]

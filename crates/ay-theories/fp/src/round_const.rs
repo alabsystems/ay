@@ -16,12 +16,18 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
+/// Largest exponent field admitted by native IEEE encoding construction.
+pub const MAX_ENCODING_EXPONENT_BITS: u32 = 63;
+/// Largest significand admitted by native IEEE encoding construction.
+pub const MAX_ENCODING_SIGNIFICAND_BITS: u32 = 1 << 20;
+
 /// `2^e` as an exact rational (handles negative `e`).
 fn pow2_rational(e: i64) -> BigRational {
+    let magnitude = BigInt::one() << e.unsigned_abs();
     if e >= 0 {
-        BigRational::from(BigInt::from(2).pow(e as u32))
+        BigRational::from(magnitude)
     } else {
-        BigRational::new(BigInt::one(), BigInt::from(2).pow((-e) as u32))
+        BigRational::new(BigInt::one(), magnitude)
     }
 }
 

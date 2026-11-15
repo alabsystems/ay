@@ -70,14 +70,7 @@ impl EufSolver<'_> {
         self.dt_merge_dirty = true;
         let proof_reason = reason.clone();
         let edge_key = Self::edge_key(a, b);
-        #[cfg(not(kani))]
         if let hashbrown::hash_map::Entry::Vacant(e) = self.equality_edges.entry(edge_key) {
-            e.insert(reason);
-            self.undo_trail
-                .push(UndoRecord::RemoveEqualityEdge(edge_key.0, edge_key.1));
-        }
-        #[cfg(kani)]
-        if let std::collections::btree_map::Entry::Vacant(e) = self.equality_edges.entry(edge_key) {
             e.insert(reason);
             self.undo_trail
                 .push(UndoRecord::RemoveEqualityEdge(edge_key.0, edge_key.1));

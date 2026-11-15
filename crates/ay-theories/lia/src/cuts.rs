@@ -109,7 +109,7 @@ impl LiaSolver<'_> {
             // Conservative approach: only generate HNF cuts from original equalities.
             // This is less powerful but always sound.
             for &literal in &self.assertion_view().positive_equalities {
-                let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+                let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                     continue;
                 };
 
@@ -407,12 +407,12 @@ impl LiaSolver<'_> {
                 }
             }
         };
-        let terms = self.terms;
+        let terms = self.terms();
         let extract_mul_const = |t: TermId| terms.extract_integer_constant(t);
 
         // Parse lhs with positive sign
         crate::linear_collect::collect_linear_terms(
-            self.terms,
+            self.terms(),
             lhs,
             &BigInt::one(),
             &mut coeffs,
@@ -426,7 +426,7 @@ impl LiaSolver<'_> {
 
         // Parse rhs with negative sign (move to LHS)
         crate::linear_collect::collect_linear_terms(
-            self.terms,
+            self.terms(),
             rhs,
             &-BigInt::one(),
             &mut coeffs,

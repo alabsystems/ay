@@ -960,7 +960,8 @@ fn eq_via_sub_zero_matches_direct_eq() {
 ///   N = (Extract(a-b, w-1, w-1) == 1)
 ///   V = (asign != bsign) AND (rsign != asign)     [subtraction overflow]
 fn signed_lt_flag_form(a: &BvExpr, b: &BvExpr, w: u32) -> BvExpr {
-    let msb = w - 1;
+    // Every caller passes a real (nonzero) width; the MSB of width `w` is `w - 1`.
+    let msb = w.saturating_sub(1);
     let sub = BvExpr::sub(a.clone(), b.clone());
     let ext = |e: &BvExpr| BvExpr::extract(e.clone(), msb, msb);
     let asign = ext(a);

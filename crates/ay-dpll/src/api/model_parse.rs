@@ -4,16 +4,29 @@
 
 //! Model output parsing for AY Solver API.
 
+mod get_value;
 mod legacy;
+mod scalar_functions;
+mod typed;
+mod typed_literals;
 
 use ay_core::kani_compat::DetHashMap as HashMap;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::Zero;
 
-use ay_core::{Sort, TermStore};
+use ay_core::Sort;
 
-use super::types::{Model, ModelValue, Term};
+use super::types::{Model, ModelValue};
+
+pub(super) use get_value::{parse_get_value_output, MAX_GET_VALUE_TERMS};
+pub(crate) use scalar_functions::{decode_scalar_function_models, parse_scalar_function_models};
+pub(crate) use typed_literals::decode_typed_literals;
+
+/// The legacy FP parser shares exact field widths with typed model decoding.
+pub(super) fn parse_fp_literal(value: &ay_frontend::SExpr, eb: u32, sb: u32) -> Option<ModelValue> {
+    typed::Decoder::new().decode(value, &Sort::FloatingPoint(eb, sb))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModelSort {
@@ -23,6 +36,7 @@ enum ModelSort {
     BitVec(u32),
     Str,
     FloatingPoint(u32, u32),
+    FiniteField(ay_core::FiniteFieldSort),
     Seq(Box<Self>),
     Array(Box<Self>, Box<Self>),
     /// User-declared sort name (may be datatype or uninterpreted).
@@ -38,6 +52,7 @@ pub(super) fn parse_model_str(model_str: &str) -> Model {
             bool_values: HashMap::default(),
             bv_values: HashMap::default(),
             fp_values: HashMap::default(),
+            field_values: HashMap::default(),
             string_values: HashMap::default(),
             seq_values: HashMap::default(),
             array_values: HashMap::default(),
@@ -76,6 +91,12 @@ pub(super) fn parse_model_str(model_str: &str) -> Model {
                     ModelSort::Str => {
                         if let ay_frontend::SExpr::String(s) = value {
                             model.string_values.insert(name, s.clone());
+                        }
+                    }
+                    ModelSort::FiniteField(field) => {
+                        let v = parse_field_literal(value, field);
+                        if v != ModelValue::Unknown {
+                            model.field_values.insert(name, v);
                         }
                     }
                     ModelSort::FloatingPoint(eb, sb) => {
@@ -215,6 +236,11 @@ fn parse_model_sort(sexp: &ay_frontend::SExpr) -> Option<ModelSort> {
         // Unrecognized symbol: user-declared sort (datatype or uninterpreted)
         ay_frontend::SExpr::Symbol(s) => Some(ModelSort::UserDeclared(s.clone())),
         ay_frontend::SExpr::List(items) if items.len() == 3 => {
+            if items[0].is_symbol("_") && items[1].is_symbol("FiniteField") {
+                let p = items[2].as_numeral()?.parse().ok()?;
+                return ay_core::FiniteFieldSort::new(p).map(ModelSort::FiniteField);
+            }
+
             // (_ BitVec N)
             if items[0].is_symbol("_") && items[1].is_symbol("BitVec") {
                 match &items[2] {
@@ -268,6 +294,7 @@ fn model_sort_to_core(sort: &ModelSort) -> Sort {
         ModelSort::BitVec(w) => Sort::BitVec(ay_core::BitVecSort::new(*w)),
         ModelSort::Str => Sort::String,
         ModelSort::FloatingPoint(eb, sb) => Sort::FloatingPoint(*eb, *sb),
+        ModelSort::FiniteField(field) => Sort::FiniteField(*field),
         ModelSort::Seq(elem) => Sort::Seq(Box::new(model_sort_to_core(elem))),
         ModelSort::Array(idx, elem) => {
             Sort::array(model_sort_to_core(idx), model_sort_to_core(elem))
@@ -360,39 +387,18 @@ fn parse_bv_value(sexp: &ay_frontend::SExpr) -> Option<BigInt> {
     parse_bv_value_with_width(sexp).map(|(v, _)| v)
 }
 
-pub(super) fn parse_get_value_output(
-    output: &str,
-    terms: &[Term],
-    term_store: &TermStore,
-) -> Option<Vec<ModelValue>> {
-    let sexps = ay_frontend::sexp::parse_sexps(output).ok()?;
-    if sexps.len() != 1 {
-        return None;
-    }
-
-    let pairs = sexps[0].as_list()?;
-    if pairs.len() != terms.len() {
-        return None;
-    }
-
-    let mut values = Vec::with_capacity(terms.len());
-    for (pair, term) in pairs.iter().zip(terms.iter()) {
-        let items = pair.as_list()?;
-        if items.len() != 2 {
-            return None;
-        }
-
-        let value_sexp = &items[1];
-        // The caller authenticates the term slice; use its validated numeric ID.
-        let sort = term_store.sort(term.id());
-        values.push(parse_value_sexp(value_sexp, sort));
-    }
-
-    Some(values)
-}
-
 // Re-export compound parsers for backward compatibility with test imports.
 use super::model_parse_compound::parse_seq_value;
-pub(crate) use super::model_parse_compound::{
-    parse_array_value, parse_dt_value, parse_fp_value, parse_value_sexp,
-};
+#[cfg(test)]
+pub(crate) use super::model_parse_compound::parse_value_sexp;
+pub(crate) use super::model_parse_compound::{parse_array_value, parse_dt_value, parse_fp_value};
+
+/// Reuse the bounded exact data-only decoder for this new model carrier.
+pub(crate) fn parse_field_literal(
+    value: &ay_frontend::SExpr,
+    field: ay_core::FiniteFieldSort,
+) -> ModelValue {
+    typed::Decoder::new()
+        .decode(value, &Sort::FiniteField(field))
+        .unwrap_or(ModelValue::Unknown)
+}

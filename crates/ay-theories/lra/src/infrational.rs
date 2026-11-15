@@ -140,17 +140,17 @@ impl InfRational {
     pub(crate) fn x_rational(&self) -> Rational {
         self.x.clone()
     }
-    /// Return both finite and infinitesimal parts as inline i64 rationals.
-    ///
-    /// This is a no-allocation guard for prospective JIT lowering: callers
-    /// must fail closed when either side has already escaped to the bignum
-    /// representation.
+    /// Borrow the rational part: compare or test integrality without cloning
+    /// (replaces `rational() == bound.to_big()` patterns on hot paths).
     #[inline]
-    pub(crate) fn try_as_i64_parts(&self) -> Option<((i64, i64), (i64, i64))> {
-        match (&self.x, &self.y) {
-            (Rational::Small(xn, xd), Rational::Small(yn, yd)) => Some(((*xn, *xd), (*yn, *yd))),
-            _ => None,
-        }
+    pub(crate) fn x(&self) -> &Rational {
+        &self.x
+    }
+    /// Borrow both parts `(x, y)` of `x + y·ε` without cloning
+    /// (#nonlinear-phase-hints: exact sign of the materialised value).
+    #[inline]
+    pub(crate) fn parts(&self) -> (&Rational, &Rational) {
+        (&self.x, &self.y)
     }
     /// Backward-compatible: get epsilon as BigRational (allocates).
     pub(crate) fn epsilon(&self) -> BigRational {
@@ -190,7 +190,9 @@ impl InfRational {
     /// Multiply by a coefficient given as raw (numerator, denominator) i64 pair.
     ///
     /// Bypasses Rational enum matching entirely -- pure i128 arithmetic when the
-    /// InfRational's components are also Small. Falls back to `mul_rat` on overflow.
+    /// InfRational's components are also Small. Falls back to `mul_rat` on overflow,
+    /// with the pair normalized by `Rational::new` (a raw pair need not satisfy
+    /// the `Small` invariant `d > 0`, gcd 1).
     ///
     /// Hot path: called by `update_nonbasic` when the coefficient is `Small(n, d)`,
     /// which is the case for 100% of QF_LRA benchmarks (#8406).
@@ -212,7 +214,7 @@ impl InfRational {
                 }
             }
         }
-        self.mul_rat(&Rational::Small(cn, cd))
+        self.mul_rat(&Rational::new(cn, cd))
     }
 
     /// Fused add-assign of `delta * (cn/cd)` where (cn, cd) is a raw i64 rational.
@@ -234,12 +236,12 @@ impl InfRational {
                             return;
                         }
                     }
-                    self.y += &(&delta.y * &Rational::Small(cn, cd));
+                    self.y += &(&delta.y * &Rational::new(cn, cd));
                 }
                 return;
             }
         }
-        let adj = delta.mul_rat(&Rational::Small(cn, cd));
+        let adj = delta.mul_rat(&Rational::new(cn, cd));
         *self += &adj;
     }
 

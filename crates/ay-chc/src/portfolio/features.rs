@@ -35,6 +35,7 @@
 
 use crate::classifier::{ProblemClass, ProblemClassifier, ProblemFeatures};
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort};
+use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 // ---------------------------------------------------------------------------
 // Theory classification
@@ -534,30 +535,27 @@ impl ChcFeatureExtractor {
     }
 
     /// Check if an expression tree contains any bitvector operations.
+    ///
+    /// Each distinct shared node is visited once (WP-F F0b); the answer is an
+    /// OR over nodes, so it equals the former tree walk's.
     fn expr_has_bv_ops(expr: &ChcExpr) -> bool {
-        let mut stack = vec![expr];
-        while let Some(current) = stack.pop() {
-            match current {
-                ChcExpr::BitVec(_, _) => return true,
-                ChcExpr::Var(v) if matches!(v.sort, ChcSort::BitVec(_)) => return true,
-                ChcExpr::Op(op, args) => {
-                    if Self::is_bv_op(op) {
-                        return true;
-                    }
-                    for arg in args {
-                        stack.push(arg.as_ref());
-                    }
-                }
-                ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                    for arg in args {
-                        stack.push(arg.as_ref());
-                    }
-                }
-                ChcExpr::ConstArray(_, val) => stack.push(val.as_ref()),
-                _ => {}
+        use crate::expr::dag::Step;
+        let mut found = false;
+        crate::expr::dag::walk_distinct_preorder(expr, |current| {
+            let hit = match current {
+                ChcExpr::BitVec(_, _) => true,
+                ChcExpr::Var(v) => matches!(v.sort, ChcSort::BitVec(_)),
+                ChcExpr::Op(op, _) => Self::is_bv_op(op),
+                _ => false,
+            };
+            if hit {
+                found = true;
+                Step::Stop
+            } else {
+                Step::Descend
             }
-        }
-        false
+        });
+        found
     }
 
     fn is_bv_op(op: &ChcOp) -> bool {
@@ -637,9 +635,9 @@ impl ChcFeatureExtractor {
 
             let (depth, size) = Self::measure_expr(constraint);
             max_depth = max_depth.max(depth);
-            total_depth += depth;
+            total_depth = total_depth.saturating_add(depth);
             max_size = max_size.max(size);
-            total_nodes += size;
+            total_nodes = total_nodes.saturating_add(size);
         }
 
         BodyComplexity {
@@ -673,6 +671,15 @@ impl ChcFeatureExtractor {
     ///
     /// Uses an iterative approach to avoid stack overflow on deep trees.
     fn measure_expr(expr: &ChcExpr) -> (usize, usize) {
+        // Huge shared DAGs (WP-F F0d): the same two numbers — tree depth and
+        // tree node count — computed per distinct node (saturating).
+        if crate::expr::dag::tree_size_at_least(expr, FEATURE_TREE_LIMIT) {
+            let (tree, height) = crate::expr::dag::tree_size_and_height(expr);
+            return (
+                height.saturating_add(1),
+                usize::try_from(tree).unwrap_or(usize::MAX),
+            );
+        }
         // (expression, current_depth)
         let mut stack: Vec<(&ChcExpr, usize)> = vec![(expr, 1)];
         let mut max_depth = 0usize;
@@ -683,6 +690,12 @@ impl ChcFeatureExtractor {
             max_depth = max_depth.max(depth);
 
             match current {
+                ChcExpr::ArrayLambda(lambda) => {
+                    stack.push((lambda.body(), depth + 1));
+                    for value in lambda.captures() {
+                        stack.push((value, depth + 1));
+                    }
+                }
                 ChcExpr::Op(_, args) => {
                     for arg in args {
                         stack.push((arg.as_ref(), depth + 1));
@@ -971,6 +984,24 @@ impl ChcFeatureExtractor {
         constants: &mut Vec<u128>,
         max_mul_degree: &mut usize,
     ) {
+        // Huge shared DAGs (WP-F F0d): the tree walk never finished on these,
+        // so they get the per-DISTINCT-node version of the same statistics
+        // (each constant node once; the longest chain of directly nested
+        // products). Smaller inputs keep the exact per-occurrence walk below.
+        if crate::expr::dag::tree_size_at_least(expr, FEATURE_TREE_LIMIT) {
+            let mut chain = FxHashMap::default();
+            crate::expr::dag::walk_distinct_preorder(expr, |current| {
+                match current {
+                    ChcExpr::Int(n) => constants.push(n.unsigned_abs()),
+                    ChcExpr::Op(ChcOp::Mul, _) => {
+                        *max_mul_degree = (*max_mul_degree).max(mul_chain(current, &mut chain));
+                    }
+                    _ => {}
+                }
+                crate::expr::dag::Step::Descend
+            });
+            return;
+        }
         // (expr, current_mul_depth)
         let mut stack: Vec<(&ChcExpr, usize)> = vec![(expr, 0)];
         while let Some((current, mul_depth)) = stack.pop() {
@@ -1053,56 +1084,45 @@ impl ChcFeatureExtractor {
     ///
     /// This is a lightweight syntactic check, not a full abstract interpretation.
     fn classify_transition_constraint(expr: &ChcExpr) -> (bool, bool, bool) {
+        use crate::expr::dag::Step;
         let mut has_reset = false;
         let mut has_inc = false;
         let mut has_dec = false;
-        let mut stack = vec![expr];
-
-        while let Some(current) = stack.pop() {
-            match current {
-                ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
-                    // Check for reset: x = constant
-                    let lhs_is_const = matches!(args[0].as_ref(), ChcExpr::Int(_));
-                    let rhs_is_const = matches!(args[1].as_ref(), ChcExpr::Int(_));
-                    if (lhs_is_const && !rhs_is_const) || (!lhs_is_const && rhs_is_const) {
-                        has_reset = true;
-                    }
-                    // Check for increment: x = y + c
-                    if let ChcExpr::Op(ChcOp::Add, add_args) = args[1].as_ref() {
-                        if add_args.len() == 2 {
-                            if let ChcExpr::Int(c) = add_args[1].as_ref() {
-                                if *c > 0 {
-                                    has_inc = true;
-                                } else if *c < 0 {
-                                    has_dec = true;
-                                }
-                            }
-                        }
-                    }
-                    if let ChcExpr::Op(ChcOp::Sub, sub_args) = args[1].as_ref() {
-                        if sub_args.len() == 2 {
-                            if let ChcExpr::Int(c) = sub_args[1].as_ref() {
-                                if *c > 0 {
-                                    has_dec = true;
-                                }
+        // Flags are ORs over nodes: each distinct shared node once (WP-F F0b).
+        crate::expr::dag::walk_distinct_preorder(expr, |current| match current {
+            ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
+                // Check for reset: x = constant
+                let lhs_is_const = matches!(args[0].as_ref(), ChcExpr::Int(_));
+                let rhs_is_const = matches!(args[1].as_ref(), ChcExpr::Int(_));
+                if (lhs_is_const && !rhs_is_const) || (!lhs_is_const && rhs_is_const) {
+                    has_reset = true;
+                }
+                // Check for increment: x = y + c
+                if let ChcExpr::Op(ChcOp::Add, add_args) = args[1].as_ref() {
+                    if add_args.len() == 2 {
+                        if let ChcExpr::Int(c) = add_args[1].as_ref() {
+                            if *c > 0 {
+                                has_inc = true;
+                            } else if *c < 0 {
+                                has_dec = true;
                             }
                         }
                     }
                 }
-                ChcExpr::Op(_, args) => {
-                    for arg in args {
-                        stack.push(arg.as_ref());
+                if let ChcExpr::Op(ChcOp::Sub, sub_args) = args[1].as_ref() {
+                    if sub_args.len() == 2 {
+                        if let ChcExpr::Int(c) = sub_args[1].as_ref() {
+                            if *c > 0 {
+                                has_dec = true;
+                            }
+                        }
                     }
                 }
-                ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                    for arg in args {
-                        stack.push(arg.as_ref());
-                    }
-                }
-                ChcExpr::ConstArray(_, val) => stack.push(val.as_ref()),
-                _ => {}
+                // The tree walk does not look inside an equality.
+                Step::Skip
             }
-        }
+            _ => Step::Descend,
+        });
 
         (has_reset, has_inc, has_dec)
     }
@@ -1140,6 +1160,32 @@ impl ChcFeatureExtractor {
         max_disjuncts: &mut usize,
         num_equality: &mut usize,
     ) {
+        // Huge shared DAGs (WP-F F0d): count each distinct node once (the
+        // per-occurrence tree walk below never finished on these).
+        if crate::expr::dag::tree_size_at_least(expr, FEATURE_TREE_LIMIT) {
+            let mut has_var = crate::expr::dag::SubtreeAny::new(|e| matches!(e, ChcExpr::Var(_)));
+            crate::expr::dag::walk_distinct_preorder(expr, |current| {
+                if let ChcExpr::Op(op, args) = current {
+                    match op {
+                        ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge
+                            if args.len() == 2
+                                && has_var.holds(&args[0])
+                                && has_var.holds(&args[1]) =>
+                        {
+                            *num_relational += 1;
+                        }
+                        ChcOp::Eq => *num_equality += 1,
+                        ChcOp::Or => {
+                            let count = Self::count_top_level_ops(current, &ChcOp::Or);
+                            *max_disjuncts = (*max_disjuncts).max(count);
+                        }
+                        _ => {}
+                    }
+                }
+                crate::expr::dag::Step::Descend
+            });
+            return;
+        }
         let mut stack = vec![expr];
         while let Some(current) = stack.pop() {
             match current {
@@ -1200,6 +1246,28 @@ impl ChcFeatureExtractor {
         }
         false
     }
+}
+
+/// Tree size from which the per-occurrence feature walks switch to their
+/// per-distinct-node DAG forms (WP-F F0d). Inputs below it keep the exact
+/// historical feature values; above it the tree walks never finished.
+const FEATURE_TREE_LIMIT: usize = 1 << 20;
+
+/// Length of the longest chain of directly nested products starting at
+/// `node` (a `Mul` counts 1 plus its longest `Mul` child chain).
+fn mul_chain(node: &ChcExpr, memo: &mut FxHashMap<*const ChcExpr, usize>) -> usize {
+    let ChcExpr::Op(ChcOp::Mul, args) = node else {
+        return 0;
+    };
+    let key = node as *const ChcExpr;
+    if let Some(&known) = memo.get(&key) {
+        return known;
+    }
+    let below = crate::expr::maybe_grow_expr_stack(|| {
+        args.iter().map(|a| mul_chain(a, memo)).max().unwrap_or(0)
+    });
+    memo.insert(key, below + 1);
+    below + 1
 }
 
 impl std::fmt::Display for ChcFeatureVector {
@@ -1687,11 +1755,10 @@ mod tests {
     #[test]
     fn test_dt_bv_theory_classification() {
         use crate::{ChcDtConstructor, ChcDtSelector};
-        use std::sync::Arc;
 
         let dt_sort = ChcSort::Datatype {
             name: "OptionBV8".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 ChcDtConstructor {
                     name: "None".to_string(),
                     selectors: vec![],

@@ -9,7 +9,6 @@
 //! caching to avoid redundant work across queries with identical
 //! BV structure.
 
-use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 use ay_core::TermId;
 
@@ -21,122 +20,36 @@ use crate::expr::ExprFeatures;
 #[cfg(test)]
 use super::{record_bv_bitblast_for_tests, record_bv_new_clauses_for_tests};
 
-/// Default per-term BV bit-width above which `attach_bv_bitblasting` refuses to
-/// bit-blast (fail-closed). Overridable via `AY_BITBLAST_MAX_WIDTH`.
-///
-/// 16_384 is 64× the widest BV width that occurs in ANY real obligation in this
-/// codebase (the widest observed is 256), so a genuine small-BV query is never
-/// refused — yet it is far below the hundreds-of-thousands-of-bits blow-up that
-/// an arbitrary-precision obligation (e.g. `rational::Rat::inv`) forces.
+#[cfg(test)]
+mod encoding_stop_tests;
+#[cfg(test)]
+mod full_adder_cache_tests;
+#[cfg(test)]
+mod transient_cache_tests;
+
+/// Existing per-term width envelope, independent of persistent cache retention.
 const DEFAULT_BITBLAST_MAX_WIDTH: u32 = 16_384;
 
-/// The effective per-term BV bit-width bit-blast budget (cached after first
-/// read). `AY_BITBLAST_MAX_WIDTH=<n>` overrides the default; a zero/garbage
-/// value falls back to the default (never disables the guard). Shared by the
-/// ChcExpr-level gate in `check_sat`/`check_sat_with_executor_fallback` and the
-/// term-level backstop guard in `attach_bv_bitblasting`.
+/// Shared by the expression-level gate and the interned-term backstop.
 pub(super) fn bitblast_max_width() -> u32 {
     // B25: env override retired; the named constant is the value.
     DEFAULT_BITBLAST_MAX_WIDTH
 }
 
-/// Default CUMULATIVE bit-blast budget: the maximum SUM of BV bit-widths across
-/// ALL terms of a single query that will be bit-blasted before the query is
-/// refused (fail-closed). Overridable via `AY_BITBLAST_MAX_TOTAL_BITS`.
-///
-/// This is the guard for the REAL grind. The per-term `DEFAULT_BITBLAST_MAX_WIDTH`
-/// guard never fires on the observed obligations (crown_deep::f64_to_rat,
-/// crown::Relu, preact_bounds, certz::qpair_json/lincon_json): NO single BV term
-/// is wide (each is ≤ 256 bits). Instead MANY moderate-width terms ACCUMULATE —
-/// their bit-blasts sum PAST the `MAX_PERSISTENT_CACHE_ENTRIES` (500_000) cap
-/// (observed 916k / 1_069k / 1_379k entries), so the cache clears at the cap and
-/// refills, thrashing with zero progress until a ~52-minute watchdog SIGKILL.
-///
-/// 400_000 sits comfortably BELOW the 500_000 cache cap so the thrash never
-/// STARTS, yet far above any real small-BV obligation (widest real term 256
-/// bits, modest term counts → cumulative bit totals orders of magnitude under
-/// this), so no genuine query is refused — WHEN MEASURED ACCURATELY. This
-/// value calibrates the `attach_bv_bitblasting` backstop, whose
-/// `bitblast_bv_width_and_total` sums over the interned term DAG actually
-/// being blasted (bits ≈ minted cache entries there).
+/// Base for the historical total-bit query envelope. This is not a cache cap
+/// or a deterministic-effort allowance; those are different resource policies.
 const DEFAULT_BITBLAST_MAX_TOTAL_BITS: u64 = 400_000;
 
-/// Pre-gate multiplier (model-checker-consumer #43 bisect, 2026-07-12): the EARLY gate in
-/// `bitblast_budget_exceeded` measures via `total_bv_bits`, a `ChcExpr` walk
-/// that dedups by `Arc` pointer identity only. CHC BMC unrolling freshly
-/// instantiates clause bodies per depth, so logically-shared subterms are
-/// counted once PER INSTANTIATION — safe acyclic contract CHCs that blast and
-/// solve in 2-6s (accurate totals far under the base budget) counted ~1.03M
-/// "bits" and were refused, flipping Safe -> Unknown across the
-/// function-contract corpus. The pre-gate therefore allows OVERCOUNT_FACTOR x
-/// the base budget: legitimate BMC-unrolled lanes (~1M overcounted) pass with
-/// ~8x headroom, the observed thrash class (916k-2.56M interned entries of
-/// up-to-256-bit terms → tens-to-hundreds of millions under the same walk)
-/// is still refused early, and anything in between is decided by the ACCURATE
-/// backstop before any cache entry is minted.
+/// Expression walks deduplicate by Arc identity, not interned term identity.
+/// Both existing gates use this relaxed envelope to accommodate that overcount.
 const PREGATE_OVERCOUNT_FACTOR: u64 = 20;
 
-/// Budget for the early, overcounting `ChcExpr`-walk gate. Scales with the
-/// base budget so `AY_BITBLAST_MAX_TOTAL_BITS` and the test override move
-/// both gates proportionally.
+/// Budget for the expression-level and interned-term total-bit gates.
 pub(super) fn bitblast_pregate_max_total_bits() -> u64 {
     bitblast_max_total_bits().saturating_mul(PREGATE_OVERCOUNT_FACTOR)
 }
 
-/// DYNAMIC bit-blast abort (model-checker-consumer #46): the ground-truth thrash condition.
-///
-/// The static bit-count gates above PREDICT blast cost from term shapes, but
-/// the prediction is structurally imprecise in both directions: BMC-unrolled
-/// CHCs count ~1M "bits" (per-depth re-instantiation defeats pointer AND
-/// content dedup) yet mint well under the cache cap and solve in seconds,
-/// while a flat accumulation of genuinely-distinct variables counts the same
-/// ~1M bits and mints 2.5M entries (5x). Only the blast itself knows. So the
-/// blast loop polls `BvSolver::minted_entries_estimate()` — the live count of
-/// exactly the collections `PersistentBvCache::total_entries()` would capture
-/// — and ABORTS the query (fail-closed Unknown, same contract as the static
-/// refusals) the moment a single query's blast reaches the cap that would
-/// otherwise trigger capture-time clear-and-rebuild on every subsequent
-/// query (the observed ny-cert ~52-minute SIGKILL grind).
-///
-/// Trade-off, documented deliberately: a hypothetical one-shot query minting
-/// slightly over the cap that would have completed (slowly, with one
-/// capture-time clear) now returns Unknown fast. That regime is exactly the
-/// pathological one the cap exists to flag, and every observed legitimate
-/// lane mints far below it; `AY_BITBLAST_DYNAMIC_ABORT=0` disables the guard
-/// for diagnosis.
-fn bitblast_dynamic_abort_enabled() -> bool {
-    #[cfg(test)]
-    {
-        match TEST_DYNAMIC_ABORT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => return true,
-            2 => return false,
-            _ => {}
-        }
-    }
-    // B27: CLI-owned (--chc-no-bitblast-dynamic-abort); env retired.
-    crate::ab_switches::get().bitblast_dynamic_abort
-}
-
-/// Test-only override for the dynamic abort: `0` = env/default path,
-/// `1` = force-on, `2` = force-off (lets one serial test exercise both the
-/// legacy thrash reproduction and the aborted behaviour despite the
-/// process-wide `OnceLock`).
-#[cfg(test)]
-static TEST_DYNAMIC_ABORT_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(test)]
-pub(in crate::smt) fn set_bitblast_dynamic_abort_override_for_tests(v: u8) {
-    TEST_DYNAMIC_ABORT_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Test-only override for the cumulative budget. The `OnceLock` in
-/// `bitblast_max_total_bits` caches the env/default value process-wide on first
-/// read, so a test cannot toggle the budget via the environment (a second test
-/// would see the first test's cached value). This atomic lets a single test
-/// measure BOTH the un-gated thrash (set a huge value to disable the gate) and
-/// the gated bounded behaviour (clear back to 0 → normal env/default path).
-/// `0` = no override (use the normal path). Zero overhead in non-test builds.
+/// Test-only override for the total-bit envelope; zero selects the default.
 #[cfg(test)]
 static TEST_TOTAL_BITS_OVERRIDE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -151,11 +64,7 @@ pub(in crate::smt) fn clear_bitblast_max_total_bits_override_for_tests() {
     TEST_TOTAL_BITS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The effective CUMULATIVE bit-blast budget (cached after first read).
-/// `AY_BITBLAST_MAX_TOTAL_BITS=<n>` overrides the default; a zero/garbage value
-/// falls back to the default (never disables the guard). Shared by the
-/// ChcExpr-level gate in `check_sat`/`check_sat_with_executor_fallback` and the
-/// term-level backstop in `attach_bv_bitblasting`.
+/// Base total-bit budget shared by the two existing static query gates.
 pub(super) fn bitblast_max_total_bits() -> u64 {
     #[cfg(test)]
     {
@@ -178,6 +87,12 @@ fn is_bv_predicate_symbol(name: &str) -> bool {
     )
 }
 
+fn checked_bv_layout(existing: u32, extra: u32) -> Option<(i32, u32)> {
+    let combined = existing.checked_add(extra)?;
+    i32::try_from(combined).ok()?;
+    Some((i32::try_from(existing).ok()?, combined))
+}
+
 impl SmtContext {
     /// Attach BV bit-blasting to the CNF state if the query has BV operations.
     ///
@@ -197,39 +112,33 @@ impl SmtContext {
         if !features.has_bv {
             return true;
         }
+        use ay_bv::BvSolver;
+        #[cfg(test)]
+        record_bv_bitblast_for_tests();
 
-        // Bit-blast cost guard (fail-closed), a term-level backstop for the same
-        // gate `check_sat`/`check_sat_with_executor_fallback` apply on the raw
-        // ChcExpr. Two ways bit-blasting explodes the PersistentBvCache past its
-        // cap — after which the cache clears and refills on every subsequent
-        // query and the whole verification wave grinds with zero progress until a
-        // watchdog SIGKILL:
-        //
-        //  1. One arbitrary-precision term (e.g. `rational::Rat::inv`) forces a
-        //     BV hundreds of thousands of bits wide — caught by the WIDTH bound.
-        //  2. MANY moderate-width terms (each ≤ 256 bits) whose bit-blasts SUM
-        //     past the cap — the observed real mechanism, invisible to the width
-        //     bound because no single term is wide — caught by the TOTAL bound.
-        // Bit-blasting mints ≈ one fresh SAT variable and several clauses per
-        // bit, so either bound overflowing means the cache would overflow.
-        //
-        // SOUNDNESS (the whole argument): refusing to bit-blast makes this
-        // method ABSTAIN and the caller (`check_sat_internal`) return Unknown.
-        // Abstaining is ALWAYS sound — an un-blasted SAT instance is missing its
-        // BV constraints, so we never run the theory loop on it and therefore
-        // never report Sat (a false refutation) nor Unsat (a false proof).
-        // Completeness is lost ONLY on obligations that genuinely need a huge
-        // blast, and those produce no verdict at all today (they grind to a
-        // SIGKILL that kills the entire wave), so Unknown is strictly better.
-        // The thresholds are far above any real small-BV obligation, so no
-        // genuine query is refused.
+        let mut bv_solver = BvSolver::new(&self.terms);
+        if let Some(flag) = crate::smt::deadline::lane_interrupt_flag() {
+            bv_solver.set_interrupt(flag);
+        }
+        if !bv_solver.inherit_current_encoding_guard() {
+            return false;
+        }
+        let encoding = bv_solver.encoding_guard();
+        if !encoding.open() {
+            return false;
+        }
+
+        // Existing width/total query envelopes remain separate from retention.
+        // Refusal must return false: a caller cannot solve an incomplete BV
+        // encoding. Removing these static envelopes needs query-owned effort
+        // accounting; a bounded persistent cache does not provide that policy.
         let (max_bv_width, total_bv_bits) = self.bitblast_bv_width_and_total(state);
         let width_budget = bitblast_max_width();
         if max_bv_width > width_budget {
             tracing::warn!(
                 width = max_bv_width,
                 budget = width_budget,
-                "bitblast width budget exceeded; abstaining (Unknown) to avoid PersistentBvCache thrash"
+                "bitblast width budget exceeded; abstaining (Unknown)"
             );
             if self.verbose || crate::debug_chc_smt_enabled() {
                 safe_eprintln!(
@@ -238,17 +147,14 @@ impl SmtContext {
             }
             return false;
         }
-        // Relaxed to the HIGH pre-gate threshold (model-checker-consumer #46): with the
-        // dynamic mid-blast abort below enforcing the true entry cap, this
-        // static count is only a fast-path early-out for astronomically-large
-        // queries — predicting cost from bit counts alone misjudges legitimate
-        // BMC-unrolled CHC lanes by up to 5x in either direction.
+        // This historical envelope uses the high pre-gate threshold because
+        // bit counts are not precise estimates of the resulting circuit size.
         let total_budget = bitblast_pregate_max_total_bits();
         if total_bv_bits > total_budget {
             tracing::warn!(
                 total_bits = total_bv_bits,
                 budget = total_budget,
-                "bitblast cumulative total-bits budget exceeded; abstaining (Unknown) to avoid PersistentBvCache thrash"
+                "bitblast cumulative total-bits budget exceeded; abstaining (Unknown)"
             );
             if self.verbose || crate::debug_chc_smt_enabled() {
                 safe_eprintln!(
@@ -258,93 +164,51 @@ impl SmtContext {
             return false;
         }
 
-        use ay_bv::BvSolver;
-        #[cfg(test)]
-        record_bv_bitblast_for_tests();
-
-        let mut persistent_bv_cache = std::mem::take(&mut self.persistent_bv_cache);
-        let mut bv_solver = BvSolver::new(&self.terms);
-        let current_terms: Vec<TermId> = state.var_to_term.values().copied().collect();
-        let mut bv_key_memo = FxHashMap::default();
-        let current_signature =
-            self.bv_cache_signature(current_terms.iter().copied(), &mut bv_key_memo);
-        let reuse_cached_bv = persistent_bv_cache.signature == current_signature;
-        if reuse_cached_bv {
-            // Restore over the TRANSITIVE BV SUB-TERM CLOSURE of the atoms,
-            // not the atom terms alone. `cache.term_to_bits` holds the bit
-            // vectors of every blasted sub-term (variables, adders, ...), but
-            // the atoms themselves are Bool — restoring only atoms brings
-            // back their memoized predicate vars while leaving every
-            // variable's bits unknown to `bv_solver`. Any NEW atom over a
-            // previously-blasted variable then mints a SECOND, disconnected
-            // set of bit variables for the same term: the replayed circuit
-            // constrains the old bits, the new atom constrains the new bits,
-            // nothing links them, and model extraction (which reads
-            // `term_to_bits`) reports values that violate the memoized atoms.
-            // That is the "SAT model from DPLL(T) loop violates original
-            // expression" WARN-flood that collapsed the native BV lane to
-            // Unknown on model-checker-consumer PDR workloads (looping_id L0 failure):
-            // every PDR frame query shares the atom signature but adds fresh
-            // cube atoms over the same state variables.
-            let restore_terms = self.bv_subterm_closure(&current_terms);
-            bv_key_memo =
-                self.restore_cached_bv_state(&persistent_bv_cache, &mut bv_solver, restore_terms);
+        if !encoding.open() {
+            return false;
         }
+        let mut persistent_bv_cache = std::mem::take(&mut self.persistent_bv_cache);
+        let current_terms: Vec<TermId> = state.var_to_term.values().copied().collect();
+        let (current_signature, reuse_cached_bv, mut bv_key_memo) =
+            self.open_bv_cache(&mut persistent_bv_cache, &mut bv_solver, &current_terms);
         let mut bv_connections: Vec<(u32, i32)> = Vec::new();
 
-        // Check each Tseitin variable's term for BV predicates, polling the
-        // DYNAMIC abort guard after each blast step (see
-        // `bitblast_dynamic_abort_enabled`). Mechanically-correct condition:
-        // `minted_entries_estimate()` counts the live sizes of exactly the
-        // collections `capture_cached_bv_state` copies into the persistent
-        // cache and `PersistentBvCache::total_entries()` sums for the
-        // capture-time cap-clear — so crossing the cap HERE is the same event
-        // that would trigger clear-and-rebuild-per-query afterwards. On reuse,
-        // restored entries count too: a signature-matched restore means the
-        // same query shape, so restored+new is what a fresh blast of this
-        // query would mint. SOUNDNESS/CLEANLINESS: nothing has touched
-        // `state` yet (SAT clauses are wired only after this loop), so
-        // aborting here leaves the caller's solver exactly as the static
-        // refusals above do — we restore the untouched persistent cache and
-        // return false, and the caller reports Unknown. Capture-time
-        // `enforce_capacity` stays as the between-queries eviction backstop.
-        let dynamic_cap = crate::smt::context::MAX_PERSISTENT_CACHE_ENTRIES;
-        let dynamic_abort = bitblast_dynamic_abort_enabled();
+        // The retention cap is not an active-query limit. A larger complete
+        // circuit remains usable by this query; capture below simply declines
+        // to retain it. Only the original encoding owner may stop the blast.
         for (&tseitin_var, &term) in &state.var_to_term {
             if let Some(bv_lit) = bv_solver.bitblast_predicate(term) {
                 bv_connections.push((tseitin_var, bv_lit));
             }
-            if dynamic_abort && bv_solver.minted_entries_estimate() > dynamic_cap {
-                let minted = bv_solver.minted_entries_estimate();
-                tracing::warn!(
-                    minted,
-                    cap = dynamic_cap,
-                    "bitblast aborted mid-blast: minted entries reached the cache cap; abstaining (Unknown)"
-                );
-                if self.verbose || crate::debug_chc_smt_enabled() {
-                    safe_eprintln!(
-                        "[CHC-SMT] bitblast aborted: minted entries {minted} reached cache cap {dynamic_cap}; returning Unknown (fail-closed)"
-                    );
-                }
+            if !encoding.open() {
+                drop(bv_solver);
                 self.persistent_bv_cache = persistent_bv_cache;
                 return false;
             }
         }
 
+        if !encoding.open() {
+            drop(bv_solver);
+            self.persistent_bv_cache = persistent_bv_cache;
+            return false;
+        }
         let new_pre_connection_clauses = bv_solver.take_clauses();
         #[cfg(test)]
         record_bv_new_clauses_for_tests(new_pre_connection_clauses.len());
 
-        // #6090: checked conversion — num_vars exceeding i32::MAX cannot
-        // be represented in DIMACS literal encoding. Skip BV if overflow.
-        if !bv_connections.is_empty() && i32::try_from(state.num_vars).is_ok() {
-            let offset = state.num_vars as i32; // safe: checked above
+        if !bv_connections.is_empty() {
             let bv_total_vars = bv_solver.num_vars();
+            // Both the offset and every shifted literal must fit DIMACS.
+            // Never report successful attachment after skipping the circuit.
+            let Some((offset, combined_vars)) = checked_bv_layout(state.num_vars, bv_total_vars)
+            else {
+                drop(bv_solver);
+                self.persistent_bv_cache = persistent_bv_cache;
+                return false;
+            };
 
             // Grow SAT solver to accommodate BV variables.
-            state
-                .sat
-                .ensure_num_vars((state.num_vars + bv_total_vars) as usize);
+            state.sat.ensure_num_vars(combined_vars as usize);
 
             // Replay the persistent BV circuit before wiring query-local
             // Tseitin roots. This keeps the fresh SAT solver aligned with
@@ -406,6 +270,11 @@ impl SmtContext {
             };
             circuit_clauses.extend(new_pre_connection_clauses);
             circuit_clauses.extend(new_post_connection_clauses);
+            if !encoding.open() {
+                drop(bv_solver);
+                self.persistent_bv_cache = Default::default();
+                return false;
+            }
             self.capture_cached_bv_state(
                 &mut persistent_bv_cache,
                 &bv_solver,
@@ -420,7 +289,7 @@ impl SmtContext {
                 .iter()
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
-            state.num_vars += bv_total_vars;
+            state.num_vars = combined_vars;
 
             if crate::debug_chc_smt_enabled() {
                 safe_eprintln!(
@@ -441,6 +310,11 @@ impl SmtContext {
                 Vec::new()
             };
             circuit_clauses.extend(new_pre_connection_clauses);
+            if !encoding.open() {
+                drop(bv_solver);
+                self.persistent_bv_cache = Default::default();
+                return false;
+            }
             self.capture_cached_bv_state(
                 &mut persistent_bv_cache,
                 &bv_solver,
@@ -448,6 +322,11 @@ impl SmtContext {
                 &mut bv_key_memo,
                 circuit_clauses,
             );
+        }
+        drop(bv_solver);
+        if !encoding.open() {
+            self.persistent_bv_cache = Default::default();
+            return false;
         }
         self.persistent_bv_cache = persistent_bv_cache;
         true
@@ -458,7 +337,7 @@ impl SmtContext {
     /// `restore_cached_bv_state` must see so that cached bit vectors of
     /// VARIABLES and intermediate BV terms are restored alongside the atoms'
     /// memoized predicate vars (see the reuse-path comment at the call site).
-    pub(super) fn bv_subterm_closure(&self, roots: &[TermId]) -> Vec<TermId> {
+    pub(in crate::smt) fn bv_subterm_closure(&self, roots: &[TermId]) -> Vec<TermId> {
         use ay_core::TermData;
 
         let mut visited: FxHashSet<TermId> = FxHashSet::default();

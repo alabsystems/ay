@@ -311,7 +311,7 @@ fn test_detect_logic_array_from_expr_ops() {
 fn test_detect_logic_nested_datatype_selector_bv() {
     let inner = ChcSort::Datatype {
         name: "Inner".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-inner".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "payload".to_string(),
@@ -321,7 +321,7 @@ fn test_detect_logic_nested_datatype_selector_bv() {
     };
     let wrapper = ChcSort::Datatype {
         name: "Wrapper".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-wrapper".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "inner".to_string(),
@@ -339,7 +339,7 @@ fn test_detect_logic_nested_datatype_selector_bv() {
 fn test_detect_logic_datatype_bv_mixed_with_arithmetic_uses_content_routing() {
     let carrier = ChcSort::Datatype {
         name: "BvCarrier".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-bv-carrier".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "payload".to_string(),
@@ -366,7 +366,7 @@ fn test_detect_logic_datatype_bv_mixed_with_arithmetic_uses_content_routing() {
 fn test_detect_logic_array_of_datatype_activates_dt_logic() {
     let pair = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-pair".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "fst".to_string(),
@@ -1165,7 +1165,7 @@ fn test_executor_uf_declarations_are_typed_and_signature_checked() {
 fn test_uf_collector_excludes_nested_datatype_symbols() {
     let inner = ChcSort::Datatype {
         name: "InnerUfAudit".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-inner-uf-audit".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "payload-uf-audit".to_string(),
@@ -1175,7 +1175,7 @@ fn test_uf_collector_excludes_nested_datatype_symbols() {
     };
     let wrapper = ChcSort::Datatype {
         name: "WrapperUfAudit".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-wrapper-uf-audit".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "inner-uf-audit".to_string(),
@@ -1462,7 +1462,7 @@ fn test_check_sat_via_executor_empty_vars_returns_unknown() {
 fn test_check_sat_via_executor_declares_expr_local_datatype_terms_9476() {
     let option_u8 = ChcSort::Datatype {
         name: "Option_u8".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None_Option_u8".to_string(),
                 selectors: vec![],
@@ -1935,7 +1935,7 @@ fn test_emit_declare_datatype_roundtrip_nested_array_sort() {
 
 #[test]
 fn test_emit_declare_datatypes_nested_dependency_is_simultaneous_and_deterministic() {
-    let inner_constructors = Arc::new(vec![ChcDtConstructor {
+    let inner_constructors = crate::ChcDtConstructors::new(vec![ChcDtConstructor {
         name: "mk-inner".to_string(),
         selectors: vec![ChcDtSelector {
             name: "inner-value".to_string(),
@@ -1944,9 +1944,9 @@ fn test_emit_declare_datatypes_nested_dependency_is_simultaneous_and_determinist
     }]);
     let inner_sort = ChcSort::Datatype {
         name: "Inner".to_string(),
-        constructors: Arc::clone(&inner_constructors),
+        constructors: inner_constructors.clone(),
     };
-    let outer_constructors = Arc::new(vec![ChcDtConstructor {
+    let outer_constructors = crate::ChcDtConstructors::new(vec![ChcDtConstructor {
         name: "mk-outer".to_string(),
         selectors: vec![ChcDtSelector {
             name: "outer-inner".to_string(),
@@ -1955,7 +1955,7 @@ fn test_emit_declare_datatypes_nested_dependency_is_simultaneous_and_determinist
     }]);
     let outer_sort = ChcSort::Datatype {
         name: "Outer".to_string(),
-        constructors: Arc::clone(&outer_constructors),
+        constructors: outer_constructors.clone(),
     };
 
     let forward_vars = [
@@ -2010,24 +2010,24 @@ fn test_emit_declare_datatypes_roundtrip_mutual_forward_references() {
 
 #[test]
 fn test_collect_dt_declarations_accepts_finite_mutual_resolution_snapshots() {
-    let unresolved_a = Arc::new(vec![ChcDtConstructor {
+    let unresolved_a = crate::ChcDtConstructors::new(vec![ChcDtConstructor {
         name: "mk-a".to_string(),
         selectors: vec![ChcDtSelector {
             name: "a-b".to_string(),
             sort: ChcSort::Uninterpreted("B".to_string()),
         }],
     }]);
-    let resolved_b = Arc::new(vec![ChcDtConstructor {
+    let resolved_b = crate::ChcDtConstructors::new(vec![ChcDtConstructor {
         name: "mk-b".to_string(),
         selectors: vec![ChcDtSelector {
             name: "b-a".to_string(),
             sort: ChcSort::Datatype {
                 name: "A".to_string(),
-                constructors: Arc::clone(&unresolved_a),
+                constructors: unresolved_a.clone(),
             },
         }],
     }]);
-    let resolved_a = Arc::new(vec![ChcDtConstructor {
+    let resolved_a = crate::ChcDtConstructors::new(vec![ChcDtConstructor {
         name: "mk-a".to_string(),
         selectors: vec![ChcDtSelector {
             name: "a-b".to_string(),
@@ -2057,14 +2057,14 @@ fn test_collect_dt_declarations_rejects_conflict_hidden_in_repeated_outer_sort()
     fn nested_outer(inner_constructor: &str) -> ChcSort {
         let inner = ChcSort::Datatype {
             name: "InnerConflict".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: inner_constructor.to_string(),
                 selectors: Vec::new(),
             }]),
         };
         ChcSort::Datatype {
             name: "OuterConflict".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mk-outer-conflict".to_string(),
                 selectors: vec![ChcDtSelector {
                     name: "outer-conflict-inner".to_string(),
@@ -2146,7 +2146,7 @@ fn test_collect_dt_declarations_constructor_cap_is_exact() {
     fn datatype_with_constructors(count: usize) -> ChcSort {
         ChcSort::Datatype {
             name: "Wide".to_string(),
-            constructors: Arc::new(
+            constructors: crate::ChcDtConstructors::new(
                 (0..count)
                     .map(|index| ChcDtConstructor {
                         name: format!("wide-{index}"),
@@ -2964,60 +2964,19 @@ mod query_role_accounting {
     }
 }
 
-/// #cert-accounting item 3: the vetted inventory of internal-lemma
-/// declarations in this crate.
-///
-/// The declaration is inert today, so this list guards a future stage rather
-/// than the present one — but it is exactly the list a reviewer would
-/// otherwise have to rebuild by hand the moment any policy keys on the role.
-/// A channel on which a raw executor `"unsat"` BECOMES the published claim
-/// must never appear here.
+/// T8: every search executor comes from `new_search_executor`, which inherits
+/// the process-level proof-cycle posture through
+/// `MiscCliFlags::search_executor_sheds_proof_cycle`. The library default —
+/// no CLI flags installed — is the proof-carrying posture.
 #[test]
-fn internal_lemma_declarations_match_the_vetted_inventory() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found: Vec<String> = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("ay-chc src is readable") {
-            let path = entry.expect("directory entry is readable").path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("source file is readable");
-            // Skip the `tests.rs` module this assertion lives in: its own
-            // fixtures legitimately name both roles.
-            if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
-                continue;
-            }
-            let declares = text.contains("execute_internal_lemma")
-                || text.contains("execute_all_internal_lemma")
-                || text.contains("ExecutorQueryRole::InternalLemma");
-            if declares {
-                let relative = path
-                    .strip_prefix(&root)
-                    .expect("enumerated file is below src")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                found.push(relative);
-            }
-        }
-    }
-    found.sort();
-    assert_eq!(
-        found,
-        vec![
-            // The SmtContext executor fallback and the incremental conjunction
-            // check: both feed PDR search only.
-            "smt/executor_adapter/mod.rs".to_string(),
-            // PDR's own executor-backed reachability/blocking queries.
-            "smt/pdr_executor_backend.rs".to_string(),
-            "smt/persistent.rs".to_string(),
-        ],
-        "a new internal-lemma declaration requires an explicit audit of what \
-         backs the published claim on that channel"
-    );
+fn new_search_executor_inherits_the_process_proof_cycle_posture() {
+    let shed = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        search_executor_sheds_proof_cycle: true,
+        ..Default::default()
+    });
+    assert!(new_search_executor().competition_mode());
+    drop(shed);
+    let certified = ay_core::misc_test_override::set(ay_core::MiscCliFlags::default());
+    assert!(!new_search_executor().competition_mode());
+    drop(certified);
 }

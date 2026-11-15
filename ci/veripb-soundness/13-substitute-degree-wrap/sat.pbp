@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% The same formula and the same binary, proved SATISFIABLE. `x1 = x2 = 1` is the only model and
+% it is one; the `s VERIFIED UNSATISFIABLE` next door is therefore visibly false without
+% trusting any second tool.
+%
+% This half is also the guard against a bogus fix: a "fix" that simply refused rows with
+% extreme degrees would satisfy the negative test and break `variants/honest-substitution/`.
+f 2;
+sol x1 x2 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

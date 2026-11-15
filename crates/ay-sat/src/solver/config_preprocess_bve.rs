@@ -300,8 +300,14 @@ impl Solver {
         if self.num_vars <= PREPROCESS_EXPENSIVE_MAX_VARS {
             return false;
         }
-        let collapsed_vars = self.var_lifecycle.count_removed();
         let rederived_active_vars = self.var_lifecycle.count_active();
+        // `--sat-live-size-gates`: a root-level collapse (fixed variables)
+        // reopens BVE as a substitution collapse does.
+        let collapsed_vars = if live_size_gates() {
+            self.num_vars.saturating_sub(rederived_active_vars)
+        } else {
+            self.var_lifecycle.count_removed()
+        };
         if !config_preprocess_policy::bve_post_collapse_reopens(
             true,
             self.num_vars,
@@ -321,6 +327,17 @@ impl Solver {
             0.0
         };
         !config_preprocess_policy::PreprocessPolicy::skip_dense_formula(active_clauses, density)
+    }
+
+    /// The variable count the expensive-pass size gates read: the parsed
+    /// `num_vars`, or under `--sat-live-size-gates` the live variables
+    /// (`count_active`, an O(num_vars) scan, once per inprocessing round).
+    pub(in crate::solver) fn size_gate_vars(&self) -> usize {
+        if live_size_gates() {
+            self.var_lifecycle.count_active()
+        } else {
+            self.num_vars
+        }
     }
 
     /// Complete the giant raw-BVE unlock qualification for THIS formula
@@ -428,6 +445,10 @@ impl Solver {
         if self.cold.bve_post_factor_qualified {
             return true;
         }
+        if self.bve_post_factor_band_qualifies() {
+            self.cold.bve_post_factor_qualified = true;
+            return true;
+        }
         if !config_preprocess_policy::bve_post_factor_enabled() {
             return false;
         }
@@ -466,6 +487,45 @@ impl Solver {
         }
         self.cold.bve_post_factor_qualified = true;
         true
+    }
+
+    /// `--sat-bve-post-factor-band`: the Default route's sparse band (density
+    /// and active-variable caps) judged on the formula factoring left rather
+    /// than on the input. Qualifies only when BVE is still off, factoring
+    /// added extension variables, and the factored formula is in band and not
+    /// dense by the preprocessing policy. Fail-closed on LRAT, incremental use
+    /// and the BVE kill switches.
+    pub(in crate::solver) fn bve_post_factor_band_qualifies(&self) -> bool {
+        let switches = ay_core::sat_ab_switches();
+        if switches.bve_post_factor_band != Some(true) || self.inproc_ctrl.bve.enabled {
+            return false;
+        }
+        if self.cold.lrat_enabled
+            || self.cold.has_been_incremental
+            || ay_core::sat_disable_flags().no_bve
+            || switches.no_bve_sparse
+        {
+            return false;
+        }
+        if self.num_vars <= self.cold.pre_factor_num_vars {
+            return false;
+        }
+        let active_vars = self.num_vars.saturating_sub(self.trail.len());
+        let max_vars = switches
+            .bve_sparse_max_vars
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::variant::BVE_SPARSE_MAX_VARS);
+        if active_vars == 0 || active_vars > max_vars {
+            return false;
+        }
+        let max_density = switches
+            .bve_sparse_max_density
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(crate::variant::BVE_SPARSE_MAX_DENSITY);
+        let clauses = self.arena.active_clause_count();
+        let density = clauses as f64 / active_vars as f64;
+        density <= max_density
+            && !config_preprocess_policy::PreprocessPolicy::skip_dense_formula(clauses, density)
     }
 
     /// Whether the post-factor BVE clause-reopen is engaged for THIS formula
@@ -669,7 +729,9 @@ impl Solver {
         // when it is armed pre-collapse). Bounded and knob-scoped: no-op
         // unless --sat-no-bve-post-collapse (default ON, =0 kills) actually
         // unlocked this call.
-        if post_collapse_unlock || giant_raw_unlock || post_factor_unlock {
+        if (post_collapse_unlock || giant_raw_unlock || post_factor_unlock)
+            && self.preprocess_wall_budgets_enabled()
+        {
             // Proof-aware (wf_0c7d84e9): see PROOF_WALL_BUDGET_SCALE.
             let extension_secs = self.bve_wall_budget_scale()
                 * if self.bve_sparse_deep_active() {
@@ -790,7 +852,8 @@ impl Solver {
                 FASTELIM_WALL_CLOCK_LIMIT_SECS
             };
         if (self.bve_sparse_deep_active() || !self.preprocess_timed_out())
-            && bve_wall_start.elapsed().as_secs() < pass1_wall_limit
+            && (!self.preprocess_wall_budgets_enabled()
+                || bve_wall_start.elapsed().as_secs() < pass1_wall_limit)
         {
             if !self.cold.elimfast_disabled {
                 self.cold.last_bve_marked = self.cold.bve_marked.wrapping_sub(1);
@@ -841,7 +904,8 @@ impl Solver {
                 // if preprocessing is already taking too long. Reduced from 5s
                 // to 2s: gate-BVE consumed ~4s for marginal benefit on medium
                 // instances. Kissat spends only 0.89s on eliminate.
-                if bve_wall_start.elapsed().as_secs() >= 2 {
+                if self.preprocess_wall_budgets_enabled() && bve_wall_start.elapsed().as_secs() >= 2
+                {
                     break;
                 }
                 // Cumulative clause growth guard (#8398, #8482): stop escalating
@@ -912,6 +976,13 @@ impl Solver {
             }
             let _elim_gate_total = self.var_lifecycle.count_removed() - elim_before_gate;
         }
+        // Preprocessing's bounds (fastelim 8 and 16, the gate passes 1 to 16)
+        // are Kissat's `fastelimbound`; in-search elimination starts from its
+        // own `elimbound` of 0 and doubles it after every complete phase,
+        // which the engine now keeps across variable compaction (compact.rs).
+        // Without this reset the first in-search phase would inherit the last
+        // gate pass's bound plus one doubling.
+        self.inproc.bve.reset_growth_bound_for_inprocessing();
 
         self.clear_stale_reasons();
 
@@ -965,6 +1036,9 @@ impl Solver {
     /// already handles irredundant clauses via occurrence-list-driven deletion;
     /// this method handles the redundant (learned) clauses that BVE misses.
     pub(in crate::solver) fn flush_learned_with_eliminated_vars(&mut self) {
+        // Counted work under `--sat-deterministic-inproc`: one streamed pass
+        // over the arena (det_work.rs).
+        self.charge_inproc_scan(self.arena_scan_te());
         let mut to_flush: Vec<usize> = Vec::new();
         for idx in self.arena.indices() {
             if !self.arena.is_learned(idx) {
@@ -983,4 +1057,9 @@ impl Solver {
             self.delete_clause_checked(idx, ReasonPolicy::ClearLevel0);
         }
     }
+}
+
+/// `--sat-live-size-gates` (see `SatAbSwitches::live_size_gates`).
+pub(in crate::solver) fn live_size_gates() -> bool {
+    ay_core::sat_ab_switches().live_size_gates == Some(true)
 }

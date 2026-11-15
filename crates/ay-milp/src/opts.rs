@@ -226,8 +226,7 @@ pub struct EngineEconomics {
     // CARRIERS FOR THE READER-WITHOUT-WRITER CENSUS (`opts/carriers.rs`).
     //
     // Each knob had a reader but no writer, making its CLI switch unrecognised and inert.
-    // `tests/knob_census.rs` fails if that state returns. Every field remains
-    // `None` by default, so no compiled default moves.
+    // Every field remains `None` by default, so no compiled default moves.
     // ------------------------------------------------------------------
     singleton_sub: Option<bool>,
     node_cut_eager: Option<bool>,
@@ -906,6 +905,8 @@ pub struct SolveOpts {
     /// cloned during one top-level native MILP solve. Cleared when the
     /// owning/nested `BabSession::check` returns.
     pub(crate) ft_adoption_solve_latch: Option<crate::sepstat::FtAdoptionSolveLatch>,
+    /// Private ownership carrier for one session's actual native tree call.
+    pub(crate) cut_capture: Option<crate::integer_cut_capture::NativeCutCapture>,
 }
 
 impl Default for SolveOpts {
@@ -928,6 +929,7 @@ impl Default for SolveOpts {
             fixed_assignment_tree_warm_start: None,
             engine: EngineEconomics::new(),
             ft_adoption_solve_latch: None,
+            cut_capture: None,
         }
     }
 }

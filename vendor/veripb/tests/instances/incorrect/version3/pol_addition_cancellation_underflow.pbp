@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `pol`'s `+` range-checked only the SUM of the two degrees and then
+% subtracted the literal-cancellation constant in the narrow integer type, unchecked.
+% The cancellation is always >= 0, so the subtraction can only underflow: the derived
+% row `1 x2 >= i64::MIN - 1` (MORE trivially true than either operand) was stored with
+% degree i64::MAX, i.e. as the empty contradiction. The formula is satisfiable (x1 = 1).
+f 1 ;
+rup 1 x1 1 x2 >= -9223372036854775808 ;
+pol 2 ~x1 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

@@ -13,12 +13,12 @@
 //! The goal is to catch regressions in strings behavior on real-world
 //! benchmark inputs, not only hand-written formulas.
 
+use crate::common::{check_z3_or_skip as z3_available, solve_with_z3_file};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn solve_with_ay_script(smt: &str) -> Result<String, String> {
     let commands = parse(smt).map_err(|e| format!("parse error: {e}"))?;
@@ -26,31 +26,6 @@ fn solve_with_ay_script(smt: &str) -> Result<String, String> {
     exec.execute_all(&commands)
         .map(|lines| lines.join("\n"))
         .map_err(|e| format!("ay execute_all error: {e}"))
-}
-
-fn z3_available() -> bool {
-    Command::new("z3")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn solve_with_z3_file(path: &Path) -> Result<String, String> {
-    let output = Command::new("z3")
-        .arg(path)
-        .output()
-        .map_err(|e| format!("failed to spawn z3 for {}: {e}", path.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "z3 failed for {} with status {}: {}",
-            path.display(),
-            output.status,
-            stderr
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn repo_path(relative: &str) -> PathBuf {
@@ -228,30 +203,12 @@ fn qf_s_qf_slia_reference_benchmarks_match_z3() {
 }
 
 fn report_soundness_bugs(soundness_bugs: &[String]) {
-    // Known soundness regressions being actively tracked.
-    // issue4701_substr_splice removed: #4057 soundness fix eliminates false UNSAT
-    // (now returns unknown instead of unsat, classified as completeness gap).
-    const KNOWN: &[&str] = &[];
-    let (known, new_bugs): (Vec<_>, Vec<_>) = soundness_bugs
-        .iter()
-        .partition(|bug| KNOWN.iter().any(|k| bug.contains(k)));
-    if !known.is_empty() {
-        eprintln!(
-            "KNOWN soundness regressions:\n  {}",
-            known
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
-    }
+    // No exemption list: a wrong definite answer is never quarantined
+    // (tests/divergences.toml rule 1). The last entry, issue4701_substr_splice,
+    // left when the #4057 fix turned its false UNSAT into unknown.
     assert!(
-        new_bugs.is_empty(),
-        "NEW SOUNDNESS BUGS:\n{}",
-        new_bugs
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        soundness_bugs.is_empty(),
+        "SOUNDNESS BUGS:\n{}",
+        soundness_bugs.join("\n\n")
     );
 }

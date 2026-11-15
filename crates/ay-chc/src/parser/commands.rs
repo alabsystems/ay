@@ -13,7 +13,8 @@ use super::ChcParser;
 use crate::expr::{ChcDtConstructor, ChcDtSelector};
 use crate::{ChcError, ChcExpr, ChcResult, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
-use std::sync::Arc;
+
+pub(in crate::parser) mod resolve_sorts;
 
 /// Function-position symbols parsed as theory operators rather than declarations.
 pub(super) const BUILTIN_TERM_SYMBOLS: &[&str] = &[
@@ -22,8 +23,8 @@ pub(super) const BUILTIN_TERM_SYMBOLS: &[&str] = &[
     "bvor", "bvsdiv", "bvsdiv_i", "bvsge", "bvsgt", "bvshl", "bvsle", "bvslt", "bvsmod",
     "bvsmod_i", "bvsrem", "bvsrem_i", "bvsub", "bvudiv", "bvudiv_i", "bvuge", "bvugt", "bvule",
     "bvult", "bvurem", "bvurem_i", "bvxnor", "bvxor", "concat", "const", "distinct", "div",
-    "exists", "false", "forall", "implies", "is_int", "ite", "let", "mod", "not", "or", "select",
-    "store", "to_int", "to_real", "true",
+    "exists", "false", "forall", "implies", "is_int", "ite", "lambda", "let", "mod", "not", "or",
+    "select", "store", "to_int", "to_real", "true",
 ];
 
 impl ChcParser {
@@ -42,7 +43,7 @@ impl ChcParser {
         self.expect_char('(')?;
         self.skip_whitespace_and_comments();
 
-        let cmd = self.parse_symbol()?;
+        let cmd = self.parse_modelled_command()?;
         self.skip_whitespace_and_comments();
 
         match cmd.as_str() {
@@ -333,51 +334,37 @@ impl ChcParser {
 
         let unresolved_datatype_sort = ChcSort::Datatype {
             name: datatype_name.clone(),
-            constructors: Arc::new(chc_constructors),
+            constructors: crate::ChcDtConstructors::new(chc_constructors),
         };
 
         // Store the initial sort so self-recursive selector references can be
         // resolved after the constructor list has been parsed.
-        self.declared_datatype_sorts
-            .insert(datatype_name.clone(), unresolved_datatype_sort);
+        self.set_declared_datatype_sort(datatype_name.clone(), unresolved_datatype_sort);
         let datatype_sort = self
-            .declared_datatype_sorts
-            .get(&datatype_name)
-            .map(|sort| self.resolve_dt_sort_refs(sort))
+            .resolve_declared_datatype_sort(&datatype_name)
             .expect("datatype sort inserted before resolution");
-        self.declared_datatype_sorts
-            .insert(datatype_name.clone(), datatype_sort.clone());
+        self.set_declared_datatype_sort(datatype_name.clone(), datatype_sort.clone());
 
-        let resolved_ctors: Vec<(String, Vec<(String, ChcSort)>)> = parsed_ctors
-            .iter()
-            .map(|(ctor_name, sels)| {
-                let resolved_sels = sels
-                    .iter()
-                    .map(|(sel_name, sel_sort)| {
-                        (sel_name.clone(), self.resolve_sort_refs(sel_sort))
-                    })
-                    .collect();
-                (ctor_name.clone(), resolved_sels)
-            })
-            .collect();
+        // Each selector sort is resolved once, against the final registry,
+        // for both the problem's definition and the registered functions.
+        let resolved_ctors = self.resolve_constructor_sorts(&parsed_ctors);
 
         // Propagate DT definition to the problem so SmtContext can emit
         // declare-datatype commands for the executor adapter (#7016).
         self.problem
-            .add_datatype_def(datatype_name.clone(), resolved_ctors);
+            .add_datatype_def(datatype_name.clone(), resolved_ctors.clone());
 
         // Pass 3: Register constructors, selectors, and testers in self.functions.
-        for (ctor_name, selectors) in &parsed_ctors {
+        for (ctor_name, selectors) in &resolved_ctors {
             // Register each selector: datatype -> field_sort
             let mut selector_sorts: Vec<ChcSort> = Vec::new();
-            for (sel_name, sel_sort) in selectors {
-                let resolved_sort = self.resolve_sort_refs(sel_sort);
+            for (sel_name, resolved_sort) in selectors {
                 self.register_datatype_function(
                     sel_name.clone(),
                     resolved_sort.clone(),
                     vec![datatype_sort.clone()],
                 )?;
-                selector_sorts.push(resolved_sort);
+                selector_sorts.push(resolved_sort.clone());
             }
 
             // Register constructor: (field_sorts) -> datatype
@@ -498,14 +485,13 @@ impl ChcParser {
 
             let datatype_sort = ChcSort::Datatype {
                 name: datatype_name.clone(),
-                constructors: Arc::new(chc_constructors),
+                constructors: crate::ChcDtConstructors::new(chc_constructors),
             };
 
             self.problem
                 .add_datatype_def(datatype_name.clone(), parsed_ctors.clone());
 
-            self.declared_datatype_sorts
-                .insert(datatype_name, datatype_sort.clone());
+            self.set_declared_datatype_sort(datatype_name, datatype_sort);
         }
 
         // Step 5: Resolve mutual DT references (#8419).
@@ -520,51 +506,43 @@ impl ChcParser {
         // DTs — it sees `Uninterpreted("Result8")` and treats it as a scalar,
         // leaving DT operations (constructors/selectors/testers) in the flattened
         // output. This causes DT+BV CHC problems with nested datatypes to fail.
-        {
-            let resolved_sorts: Vec<(String, ChcSort)> = self
-                .declared_datatype_sorts
-                .iter()
-                .map(|(name, sort)| (name.clone(), self.resolve_dt_sort_refs(sort)))
-                .collect();
-            for (name, resolved) in resolved_sorts {
-                self.declared_datatype_sorts.insert(name, resolved);
-            }
-            // Also update the problem's datatype defs with resolved sorts.
-            for (name, parsed_ctors) in sort_names_copy.iter().zip(all_parsed_ctors.iter()) {
-                let resolved_ctors: Vec<(String, Vec<(String, ChcSort)>)> = parsed_ctors
-                    .iter()
-                    .map(|(ctor_name, sels)| {
-                        let resolved_sels: Vec<(String, ChcSort)> = sels
-                            .iter()
-                            .map(|(sel_name, sel_sort)| {
-                                (sel_name.clone(), self.resolve_sort_refs(sel_sort))
-                            })
-                            .collect();
-                        (ctor_name.clone(), resolved_sels)
-                    })
-                    .collect();
-                self.problem.add_datatype_def(name.clone(), resolved_ctors);
-            }
+        //
+        // Resolution can change only this block's entries and entries that
+        // mention an `Uninterpreted` sort and have not already resolved to
+        // themselves; `resolve_registry` resolves exactly those.
+        resolve_sorts::resolve_registry(
+            &mut self.declared_datatype_sorts,
+            &mut self.dt_resolution,
+            &sort_names_copy,
+        );
+        // Also update the problem's datatype defs with resolved sorts; each
+        // selector sort is resolved once, for the defs and for Step 6.
+        let block_ctors: Vec<Vec<(String, Vec<(String, ChcSort)>)>> = all_parsed_ctors
+            .iter()
+            .map(|parsed_ctors| self.resolve_constructor_sorts(parsed_ctors))
+            .collect();
+        for (name, resolved_ctors) in sort_names_copy.iter().zip(&block_ctors) {
+            self.problem
+                .add_datatype_def(name.clone(), resolved_ctors.clone());
         }
 
         // Step 6: Register constructors, selectors, and testers with resolved sorts.
-        for (datatype_name, parsed_ctors) in sort_names_copy.iter().zip(all_parsed_ctors.iter()) {
+        for (datatype_name, resolved_ctors) in sort_names_copy.iter().zip(&block_ctors) {
             let datatype_sort = self
                 .declared_datatype_sorts
                 .get(datatype_name)
                 .expect("DT sort must exist after Step 5")
                 .clone();
 
-            for (ctor_name, selectors) in parsed_ctors {
+            for (ctor_name, selectors) in resolved_ctors {
                 let mut selector_sorts: Vec<ChcSort> = Vec::new();
-                for (sel_name, sel_sort) in selectors {
-                    let resolved_sort = self.resolve_sort_refs(sel_sort);
+                for (sel_name, resolved_sort) in selectors {
                     self.register_datatype_function(
                         sel_name.clone(),
                         resolved_sort.clone(),
                         vec![datatype_sort.clone()],
                     )?;
-                    selector_sorts.push(resolved_sort);
+                    selector_sorts.push(resolved_sort.clone());
                 }
                 self.register_datatype_function(
                     ctor_name.clone(),
@@ -582,67 +560,44 @@ impl ChcParser {
         Ok(())
     }
 
-    /// Resolve `Uninterpreted("X")` references inside a sort to `Datatype{...}`
-    /// when "X" has been declared as a datatype. Used after Step 4 of
-    /// `parse_declare_datatypes` to fix mutual DT references (#8419).
-    fn resolve_sort_refs(&self, sort: &ChcSort) -> ChcSort {
-        self.resolve_sort_refs_seen(sort, &mut FxHashSet::default())
+    /// Replace a datatype registry entry, telling sort resolution first.
+    fn set_declared_datatype_sort(&mut self, name: String, sort: ChcSort) {
+        resolve_sorts::set_entry(
+            &mut self.declared_datatype_sorts,
+            &mut self.dt_resolution,
+            name,
+            sort,
+        );
     }
 
-    fn resolve_sort_refs_seen(
-        &self,
-        sort: &ChcSort,
-        seen_datatypes: &mut FxHashSet<String>,
-    ) -> ChcSort {
-        match sort {
-            ChcSort::Uninterpreted(name) => {
-                if let Some(dt_sort) = self.declared_datatype_sorts.get(name) {
-                    if !seen_datatypes.insert(name.clone()) {
-                        return dt_sort.clone();
-                    }
-                    let resolved = self.resolve_sort_refs_seen(dt_sort, seen_datatypes);
-                    seen_datatypes.remove(name);
-                    resolved
-                } else {
-                    sort.clone()
-                }
-            }
-            ChcSort::Array(key, val) => ChcSort::Array(
-                Box::new(self.resolve_sort_refs_seen(key, seen_datatypes)),
-                Box::new(self.resolve_sort_refs_seen(val, seen_datatypes)),
-            ),
-            ChcSort::Datatype { name, constructors } => {
-                if !seen_datatypes.insert(name.clone()) {
-                    return sort.clone();
-                }
-                let resolved_ctors: Vec<ChcDtConstructor> = constructors
+    /// Resolve the registry entry for `name`: replace each `Uninterpreted("X")`
+    /// it reaches with the datatype declared as "X" (#8419).
+    fn resolve_declared_datatype_sort(&mut self, name: &str) -> Option<ChcSort> {
+        let registry = &self.declared_datatype_sorts;
+        let sort = registry.get(name)?;
+        let mut resolver = resolve_sorts::Resolver::new(registry, &mut self.dt_resolution);
+        Some(resolver.resolve(sort).into_owned())
+    }
+
+    /// Resolve every selector sort of one parsed constructor list.
+    fn resolve_constructor_sorts(
+        &mut self,
+        parsed_ctors: &[(String, Vec<(String, ChcSort)>)],
+    ) -> Vec<(String, Vec<(String, ChcSort)>)> {
+        let mut resolver =
+            resolve_sorts::Resolver::new(&self.declared_datatype_sorts, &mut self.dt_resolution);
+        parsed_ctors
+            .iter()
+            .map(|(ctor_name, selectors)| {
+                let resolved = selectors
                     .iter()
-                    .map(|ctor| ChcDtConstructor {
-                        name: ctor.name.clone(),
-                        selectors: ctor
-                            .selectors
-                            .iter()
-                            .map(|sel| ChcDtSelector {
-                                name: sel.name.clone(),
-                                sort: self.resolve_sort_refs_seen(&sel.sort, seen_datatypes),
-                            })
-                            .collect(),
+                    .map(|(sel_name, sel_sort)| {
+                        (sel_name.clone(), resolver.resolve(sel_sort).into_owned())
                     })
                     .collect();
-                seen_datatypes.remove(name);
-                ChcSort::Datatype {
-                    name: name.clone(),
-                    constructors: Arc::new(resolved_ctors),
-                }
-            }
-            // Scalar sorts: no resolution needed.
-            _ => sort.clone(),
-        }
-    }
-
-    /// Resolve DT sort references in a top-level DT sort (convenience wrapper).
-    fn resolve_dt_sort_refs(&self, sort: &ChcSort) -> ChcSort {
-        self.resolve_sort_refs(sort)
+                (ctor_name.clone(), resolved)
+            })
+            .collect()
     }
 
     /// Parse a rule command
@@ -707,7 +662,7 @@ impl ChcParser {
                 ClauseBody::new(preds, constraint)
             };
             let clause = HornClause::new(body, ClauseHead::False);
-            self.problem.add_clause(clause);
+            self.add_clause_with_optional_action(clause, None)?;
         } else {
             // Predicate name form
             let pred_name = self.parse_symbol()?;

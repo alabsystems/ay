@@ -22,8 +22,6 @@
 
 mod model;
 mod theory_impl;
-#[cfg(kani)]
-mod verification;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;

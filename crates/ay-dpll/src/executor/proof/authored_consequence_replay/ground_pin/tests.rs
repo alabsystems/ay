@@ -39,16 +39,17 @@ fn executor_with_instance(script: &str, value: i64) -> Executor {
 }
 
 fn pinned_instance_executor(pinned_value: i64) -> Executor {
-    executor_with_instance(
-        &format!(
-            r#"
+    executor_with_instance(&pinned_instance_problem(pinned_value), 2)
+}
+
+fn pinned_instance_problem(pinned_value: i64) -> String {
+    format!(
+        r#"
                 (set-logic AUFLIA)
                 (declare-fun f (Int) Int)
-                (assert (forall ((x Int)) (> (f x) (+ x 1))))
+                (assert (forall ((x Int)) (< (+ x 1) (f x))))
                 (assert (= (f 2) {pinned_value}))
             "#
-        ),
-        2,
     )
 }
 
@@ -77,6 +78,7 @@ fn ground_pin_instance_refutation_is_strictly_checked() {
     let mut exec = pinned_instance_executor(3);
     assert!(exec.try_translate_authored_consequence_replay_unsat());
     let proof = exec.last_proof.clone().expect("translation installs proof");
+    exec.restore_reachable_authored_assume_surface_overrides(&proof);
     assert!(proof.steps.iter().any(|step| matches!(
         step,
         ProofStep::TheoryLemma {
@@ -95,11 +97,143 @@ fn ground_pin_instance_refutation_is_strictly_checked() {
         .check_proof_strict_with_datatypes(&proof)
         .is_ok_and(|quality| quality.is_complete()));
     assert!(
-        exec.proof_has_known_wire_gap(&proof),
-        "ground substitution is native-strict but intentionally not external-wire strict"
+        !exec.proof_has_known_wire_gap(&proof),
+        "structural substitution and the separate checked evaluation are exportable"
     );
     let authored = exec.exact_concrete_authored_scope();
     assert!(ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &authored).is_ok());
+    let overrides = exec.proof_export_term_overrides();
+    let text = ay_proof::try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &exec.ctx.terms,
+        &authored,
+        overrides.as_ref(),
+    )
+    .expect("original-scope ground-pin export");
+    assert!(!text.contains(":rule hole") && !text.contains(":rule trust"));
+    let path = std::env::temp_dir().join(format!(
+        "ay-ground-pin-original-scope-{}.json",
+        std::process::id()
+    ));
+    let problem = format!("{}\n(check-sat)\n", pinned_instance_problem(3));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "type": "alethe_certificate", "version": "1.0", "problem": problem, "proof": text,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    println!("independent ground-pin certificate: {}", path.display());
+}
+
+/// Pinned carcara's last verdict line on `proof` against `problem` in AY's
+/// canonical invocation (`carcara check -- PROOF PROBLEM`), or `None` when
+/// carcara is not installed; under `CI` a missing carcara fails the test.
+fn pinned_carcara_verdict(tag: &str, problem: &str, proof: &str) -> Option<String> {
+    if let Err(misjudged) = ay_core::pinned_carcara::pinned_carcara_can_judge(problem, proof) {
+        panic!("{tag}: {misjudged}\n{proof}");
+    }
+    let installed = std::env::var_os("CARCARA_PATH")
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .chain(
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".cargo/bin/carcara")),
+        )
+        .chain(
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join("carcara")),
+        )
+        .find(|candidate| candidate.is_file());
+    let Some(carcara) = installed else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{tag}: carcara is not installed, and the replay is mandatory in CI"
+        );
+        eprintln!("{tag}: carcara is not installed; the pinned replay is skipped");
+        return None;
+    };
+    let stem = std::env::temp_dir().join(format!("ay-ground-pin-{tag}-{}", std::process::id()));
+    let (problem_path, proof_path) = (stem.with_extension("smt2"), stem.with_extension("alethe"));
+    std::fs::write(&problem_path, problem).expect("write problem");
+    std::fs::write(&proof_path, proof).expect("write proof");
+    let output = std::process::Command::new(carcara)
+        .arg("check")
+        .arg("--")
+        .arg(&proof_path)
+        .arg(&problem_path)
+        .output()
+        .expect("run carcara");
+    let _ = std::fs::remove_file(&problem_path);
+    let _ = std::fs::remove_file(&proof_path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout.lines().last().unwrap_or("").trim().to_string())
+}
+
+/// The authored instance with the pinned `x = 2`, translated and exported:
+/// the screen's wire-gap judgement and the exported document.
+fn changed_instance_surface_export(body: &str) -> (String, bool, String) {
+    let problem = pinned_instance_problem(3).replace("(< (+ x 1) (f x))", body);
+    let mut exec = executor_with_instance(&problem, 2);
+    assert!(exec.try_translate_authored_consequence_replay_unsat());
+    let proof = exec.last_proof.clone().expect("native proof is complete");
+    exec.restore_reachable_authored_assume_surface_overrides(&proof);
+    let wire_gap = exec.proof_has_known_wire_gap(&proof);
+    let authored = exec.exact_concrete_authored_scope();
+    let overrides = exec.proof_export_term_overrides();
+    let text = ay_proof::try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &exec.ctx.terms,
+        &authored,
+        overrides.as_ref(),
+    )
+    .expect("the changed instance surface exports");
+    (format!("{problem}\n(check-sat)\n"), wire_gap, text)
+}
+
+/// The authored `(> (f x) (+ x 1))` instance is not the canonical
+/// `(< (+ 2 1) (f 2))` the substitution lemma reads. The publication screen
+/// still judges the authored spelling a wire gap (it does not model the
+/// confined-instance channel: conservative), but the exporter confines the
+/// authored instance to its `forall_inst` and derives the canonical one with
+/// `comp_simplify` (`surface_equivalence/comparison.rs`), so the lemma
+/// lowers without a `hole` and pinned carcara re-derives every step. Until
+/// that schema this document held a `hole` for the instance.
+#[test]
+fn ground_pin_reversed_instance_surface_is_derived_without_a_hole() {
+    let (problem, wire_gap, text) = changed_instance_surface_export("(> (f x) (+ x 1))");
+    assert!(wire_gap);
+    assert!(
+        text.contains(
+            "(step t1.fi (cl (or (not (forall ((x Int)) (> (f x) (+ x 1)))) (> (f 2) (+ 2 1)))) \
+             :rule forall_inst :args (2))"
+        ),
+        "{text}"
+    );
+    assert!(text.contains(":rule comp_simplify"), "{text}");
+    assert!(
+        !text.contains(":rule hole") && !text.contains(":rule trust"),
+        "{text}"
+    );
+    if let Some(verdict) = pinned_carcara_verdict("reversed", &problem, &text) {
+        assert_eq!(verdict, "valid", "{text}");
+    }
+}
+
+/// NEGATIVE TWIN, the original intent: an instance surface no schema relates
+/// to the canonical one (`(+ 1 x)` commuted as well as reversed) keeps the
+/// wire gap and an honest `hole`, never a step carcara rejects.
+#[test]
+fn ground_pin_unrelated_instance_surface_retains_wire_gap() {
+    let (problem, wire_gap, text) = changed_instance_surface_export("(> (f x) (+ 1 x))");
+    assert!(wire_gap);
+    assert!(text.contains(":rule hole"), "{text}");
+    if let Some(verdict) = pinned_carcara_verdict("unrelated", &problem, &text) {
+        assert_eq!(verdict, "holey", "{text}");
+    }
 }
 
 #[test]

@@ -86,7 +86,7 @@ fn callback_early_termination_stops_enumeration() {
 
     let mut count = 0usize;
     let stats = solver.enumerate_with_callback(AllSatConfig::default(), |_| {
-        count += 1;
+        count = count.saturating_add(1);
         count < 3 // stop after collecting 3rd
     });
 

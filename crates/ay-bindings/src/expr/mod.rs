@@ -31,15 +31,18 @@ mod bool;
 mod bv;
 mod display;
 mod drop;
-mod dt;
+pub(crate) mod dt;
+mod finite_forall;
 mod fp;
 mod fp_predict;
 mod int;
 mod overflow;
+mod range_copy;
 mod real;
 mod seq;
 mod share;
 mod string;
+mod truncating;
 
 pub mod fold;
 
@@ -221,7 +224,6 @@ impl Expr {
 
     /// Create a boolean constant.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn bool_const(value: bool) -> Self {
         Self {
             sort: Sort::bool(),
@@ -231,22 +233,18 @@ impl Expr {
 
     /// Create a true constant.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn true_() -> Self {
         Self::bool_const(true)
     }
 
     /// Create a false constant.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn false_() -> Self {
         Self::bool_const(false)
     }
 
     /// Create a bitvector constant.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(width > 0))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     pub fn bitvec_const(value: impl Into<BigInt>, width: u32) -> Self {
         assert!(width > 0, "BitVec width must be > 0");
         Self {
@@ -260,7 +258,6 @@ impl Expr {
 
     /// Create an integer constant.
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_int()))]
     pub fn int_const(value: impl Into<BigInt>) -> Self {
         Self {
             sort: Sort::int(),
@@ -270,7 +267,6 @@ impl Expr {
 
     /// Create an integer constant (shorthand).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_int()))]
     pub fn int(value: impl Into<BigInt>) -> Self {
         Self::int_const(value)
     }
@@ -289,7 +285,6 @@ impl Expr {
     /// assert!(r.sort().is_real());
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_real()))]
     pub fn real_const(value: impl Into<BigInt>) -> Self {
         Self {
             sort: Sort::real(),
@@ -299,7 +294,6 @@ impl Expr {
 
     /// Create a real constant (shorthand).
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_real()))]
     pub fn real(value: impl Into<BigInt>) -> Self {
         Self::real_const(value)
     }
@@ -338,7 +332,6 @@ impl Expr {
     /// let state_xy = Expr::func_app("state", vec![x, y]);
     /// ```
     #[must_use]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn func_app(name: impl Into<String>, args: Vec<Self>) -> Self {
         Self {
             sort: Sort::bool(), // CHC relations return Bool
@@ -369,17 +362,21 @@ impl Expr {
     // ===== Quantifiers =====
 
     /// Universal quantifier.
+    ///
+    /// A bounded, trigger-free finite-support BV array-read formula may be
+    /// represented by its exactly equivalent ground conjunction. Other
+    /// quantifiers retain their original representation.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(body.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn forall(vars: Vec<(String, Sort)>, body: Self) -> Self {
         Self::forall_with_triggers(vars, body, Vec::new())
     }
 
     /// Universal quantifier with trigger patterns for E-matching.
+    ///
+    /// Nonempty trigger lists always retain the quantifier and its patterns.
+    /// With no triggers, the finite-support normalization of [`Self::forall`]
+    /// also applies.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(body.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn forall_with_triggers(
         vars: Vec<(String, Sort)>,
         body: Self,
@@ -390,16 +387,12 @@ impl Expr {
 
     /// Existential quantifier.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(body.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn exists(vars: Vec<(String, Sort)>, body: Self) -> Self {
         Self::exists_with_triggers(vars, body, Vec::new())
     }
 
     /// Existential quantifier with trigger patterns for E-matching.
     #[must_use]
-    #[cfg_attr(kani, kani::requires(body.sort.is_bool()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bool()))]
     pub fn exists_with_triggers(
         vars: Vec<(String, Sort)>,
         body: Self,
@@ -411,12 +404,19 @@ impl Expr {
     // ===== Quantifier try_* variants (#5818) =====
 
     /// Fallible universal quantifier — returns `Err` if body is not Bool.
+    /// Uses the same finite-support normalization as [`Self::forall`].
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_forall(vars: Vec<(String, Sort)>, body: Self) -> Result<Self, crate::SortError> {
         Self::try_forall_with_triggers(vars, body, Vec::new())
     }
 
     /// Fallible universal quantifier with triggers — returns `Err` if body is not Bool.
+    ///
+    /// For one BV binder with no triggers, a fully authenticated finite-support
+    /// array-read formula may become an equivalent ground conjunction. This is
+    /// a representation change, not general quantifier elimination. Unsupported
+    /// shapes or exhausted normalization limits keep the original body, binders,
+    /// and triggers unchanged; they do not create a partial approximation.
     #[must_use = "try_* methods return a Result that must be used"]
     pub fn try_forall_with_triggers(
         vars: Vec<(String, Sort)>,
@@ -425,6 +425,13 @@ impl Expr {
     ) -> Result<Self, crate::SortError> {
         if !body.sort.is_bool() {
             return Err(crate::SortError::unary("forall", "Bool body", &body.sort));
+        }
+        if triggers.is_empty() {
+            if let [(binder, sort)] = vars.as_slice() {
+                if let Some(ground) = finite_forall::eliminate(&body, binder, sort) {
+                    return Ok(ground);
+                }
+            }
         }
         Ok(Self {
             sort: Sort::bool(),

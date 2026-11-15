@@ -22,8 +22,6 @@ impl Expr {
         /// Test if floating-point value is NaN.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_nan / try_fp_is_nan,
         check: is_fp,
         assert_msg: "fp_is_nan requires FP sort",
@@ -35,8 +33,6 @@ impl Expr {
         /// Test if floating-point value is infinite.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_infinite / try_fp_is_infinite,
         check: is_fp,
         assert_msg: "fp_is_infinite requires FP sort",
@@ -48,8 +44,6 @@ impl Expr {
         /// Test if floating-point value is zero (positive or negative).
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_zero / try_fp_is_zero,
         check: is_fp,
         assert_msg: "fp_is_zero requires FP sort",
@@ -61,8 +55,6 @@ impl Expr {
         /// Test if floating-point value is normal.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_normal / try_fp_is_normal,
         check: is_fp,
         assert_msg: "fp_is_normal requires FP sort",
@@ -74,8 +66,6 @@ impl Expr {
         /// Test if floating-point value is subnormal.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_subnormal / try_fp_is_subnormal,
         check: is_fp,
         assert_msg: "fp_is_subnormal requires FP sort",
@@ -87,8 +77,6 @@ impl Expr {
         /// Test if floating-point value is positive.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_positive / try_fp_is_positive,
         check: is_fp,
         assert_msg: "fp_is_positive requires FP sort",
@@ -100,8 +88,6 @@ impl Expr {
         /// Test if floating-point value is negative.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Bool.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_bool())]
         fn fp_is_negative / try_fp_is_negative,
         check: is_fp,
         assert_msg: "fp_is_negative requires FP sort",
@@ -113,8 +99,6 @@ impl Expr {
 
     /// Convert FP to signed bitvector of given width.
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_floating_point()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     pub fn fp_to_sbv(self, rm: RoundingMode, width: u32) -> Self {
         self.try_fp_to_sbv(rm, width)
             .expect("fp_to_sbv requires FP sort")
@@ -138,8 +122,6 @@ impl Expr {
 
     /// Convert FP to unsigned bitvector of given width.
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_floating_point()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     pub fn fp_to_ubv(self, rm: RoundingMode, width: u32) -> Self {
         self.try_fp_to_ubv(rm, width)
             .expect("fp_to_ubv requires FP sort")
@@ -165,8 +147,6 @@ impl Expr {
         /// Convert FP to real number.
         /// REQUIRES: `self` is an FP sort.
         /// ENSURES: result sort is Real.
-        #[kani_requires(self.sort.is_floating_point())]
-        #[kani_ensures(|result: &Self| result.sort.is_real())]
         fn fp_to_real / try_fp_to_real,
         check: is_fp,
         assert_msg: "fp_to_real requires FP sort",
@@ -180,8 +160,6 @@ impl Expr {
     /// SMT-LIB: `(fp.to_ieee_bv x)`
     /// Result sort: `(_ BitVec (eb + sb))` for `(_ FloatingPoint eb sb)` input.
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_floating_point()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_bitvec()))]
     pub fn fp_to_ieee_bv(self) -> Self {
         self.try_fp_to_ieee_bv()
             .expect("fp_to_ieee_bv requires FP sort")
@@ -211,10 +189,6 @@ impl Expr {
     ///
     /// SMT-LIB: `(fp sign exp sig)`
     #[must_use]
-    #[cfg_attr(kani, kani::requires(
-        sign.sort.is_bitvec() && exponent.sort.is_bitvec() && significand.sort.is_bitvec()
-    ))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_floating_point()))]
     pub fn fp_from_bvs(sign: Self, exponent: Self, significand: Self) -> Self {
         Self::try_fp_from_bvs(sign, exponent, significand)
             .expect("fp_from_bvs requires BV sorts with sign=1-bit")
@@ -269,8 +243,6 @@ impl Expr {
     ///
     /// SMT-LIB: `((_ to_fp eb sb) rm bv)` where bv has width eb+sb.
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_floating_point()))]
     pub fn bv_to_fp(self, rm: RoundingMode, eb: u32, sb: u32) -> Self {
         self.try_bv_to_fp(rm, eb, sb)
             .expect("bv_to_fp requires BV sort")
@@ -297,8 +269,6 @@ impl Expr {
     ///
     /// SMT-LIB: `((_ to_fp_unsigned eb sb) rm bv)`
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_bitvec()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_floating_point()))]
     pub fn bv_to_fp_unsigned(self, rm: RoundingMode, eb: u32, sb: u32) -> Self {
         self.try_bv_to_fp_unsigned(rm, eb, sb)
             .expect("bv_to_fp_unsigned requires BV sort")
@@ -329,8 +299,6 @@ impl Expr {
     ///
     /// SMT-LIB: `((_ to_fp eb sb) rm fp)`
     #[must_use = "expression operations return a new Expr"]
-    #[cfg_attr(kani, kani::requires(self.sort.is_floating_point()))]
-    #[cfg_attr(kani, kani::ensures(|result: &Self| result.sort.is_floating_point()))]
     pub fn fp_to_fp(self, rm: RoundingMode, eb: u32, sb: u32) -> Self {
         self.try_fp_to_fp(rm, eb, sb)
             .expect("fp_to_fp requires FP sort")

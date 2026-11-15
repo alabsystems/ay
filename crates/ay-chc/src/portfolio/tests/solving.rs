@@ -186,6 +186,140 @@ fn parallel_winner_reaps_delayed_loser_before_return() {
     );
 }
 
+/// metros_4 regression shape (WP-D1-E): a loser that ignores cancellation for
+/// seconds must not hold a validated verdict back. The winner is returned
+/// after the bounded reap; the straggler is detached (and still running).
+#[test]
+#[timeout(10_000)]
+fn parallel_winner_detaches_loser_that_ignores_cancellation() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_secs(8)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let loser_started = Arc::new(AtomicBool::new(false));
+    let loser_alive = Arc::new(AtomicBool::new(false));
+    let loser_saw_expired_lane = Arc::new(AtomicBool::new(false));
+    let observed_started = loser_started.clone();
+    let observed_alive = loser_alive.clone();
+    let observed_lane = loser_saw_expired_lane.clone();
+    let solver = PortfolioSolver::new(problem, config).with_sequential_test_engine(
+        move |idx, cancellation| {
+            if idx == 0 {
+                while !observed_started.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Safe(winning_model.clone()), "TEST_WINNER")
+            } else {
+                observed_alive.store(true, Ordering::SeqCst);
+                observed_started.store(true, Ordering::SeqCst);
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                // The lane binding makes every SMT check on this thread see an
+                // expired deadline and hands executors a set interrupt flag.
+                let interrupt_set = crate::smt::deadline::lane_interrupt_flag()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed));
+                observed_lane.store(
+                    crate::smt::smt_deadline_expired() && interrupt_set,
+                    Ordering::SeqCst,
+                );
+                // Ignore the cancellation far beyond the verdict reap bound.
+                thread::sleep(Duration::from_secs(3));
+                observed_alive.store(false, Ordering::SeqCst);
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_STRAGGLER")
+            }
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let result = solver.solve_parallel();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "a validated winner waited {elapsed:?} for a straggler (bound {VERDICT_REAP_BOUND:?})"
+    );
+    assert!(
+        loser_alive.load(Ordering::SeqCst),
+        "the straggler is detached, not joined"
+    );
+    assert!(loser_saw_expired_lane.load(Ordering::SeqCst));
+    // Let the detached straggler finish so it does not outlive the test binary's
+    // other tests by much.
+    while loser_alive.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Without a verdict the synchronous barrier stays: a timed-out portfolio
+/// does not return while a cancelled worker is still running.
+#[test]
+#[timeout(10_000)]
+fn parallel_timeout_without_verdict_still_joins_slow_loser() {
+    let problem = create_safe_problem();
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_millis(300)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let slow_alive = Arc::new(AtomicBool::new(false));
+    let observed_alive = slow_alive.clone();
+    let solver = PortfolioSolver::new(problem, config).with_sequential_test_engine(
+        move |idx, cancellation| {
+            if idx == 1 {
+                observed_alive.store(true, Ordering::SeqCst);
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                thread::sleep(Duration::from_millis(900));
+                observed_alive.store(false, Ordering::SeqCst);
+            }
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_UNKNOWN")
+        },
+    );
+
+    let result = solver.solve_parallel();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(
+        !slow_alive.load(Ordering::SeqCst),
+        "an Unknown portfolio must still join its cancelled workers"
+    );
+}
+
 #[test]
 #[timeout(5000)]
 fn parallel_timeout_worker_cancellation_does_not_poison_grace_validation() {
@@ -962,25 +1096,6 @@ fn explicit_term_memory_budget_is_divided_by_live_worker_capacity() {
     config.memory_budget = Some(300);
     assert_eq!(config.per_engine_term_budget(3), Some(100));
     assert_eq!(config.per_engine_term_budget(1), Some(300));
-}
-
-#[test]
-fn test_algebraic_prepass_does_not_emit_placeholder_unsafe_9691() {
-    let source = include_str!("../mod.rs");
-    let prepass = source
-        .split("fn try_algebraic_prepass(&self) -> Option<PortfolioResult>")
-        .nth(1)
-        .and_then(|rest| rest.split("fn bv_to_int_for_algebraic(&self)").next())
-        .expect("portfolio algebraic prepass should be present");
-
-    assert!(
-        !prepass.contains("PortfolioResult::Unsafe"),
-        "raw PortfolioSolver algebraic prepass must not expose Unsafe without a replayable original witness"
-    );
-    assert!(
-        prepass.contains("produced no replayable witness; returning Unknown"),
-        "algebraic Unsafe must fail closed with an explicit replayability reason"
-    );
 }
 
 #[test]

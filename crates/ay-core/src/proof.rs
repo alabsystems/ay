@@ -11,10 +11,12 @@ mod accessors;
 mod annotations;
 mod builders;
 mod fp;
+mod nra_sos;
 mod theory_lemma_kind;
 
 pub use annotations::{BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation};
 pub use fp::FpOp;
+pub use nra_sos::{NraSosCertificate, NraSosOrigin, NraSosRational, NraSosShapeError, NraSosTerm};
 
 /// Kind of theory lemma for proof export
 ///
@@ -447,7 +449,7 @@ pub enum TheoryLemmaKind {
     /// intrinsic, exactly like [`Self::BoolTautology`] for the propositional
     /// case.
     ///
-    /// Uses Alethe rule `arith_clause_tautology`.
+    /// Also checks unit BV affine identities modulo their width (`poly_simp`).
     ArithClauseTautology,
 
     /// Term-`ite` branch projection: `(cl C (= (ite C a b) b))` or
@@ -938,6 +940,14 @@ pub enum TheoryLemmaKind {
     /// Alethe has no rule for exact FP evaluation, so this internal
     /// certificate renders as an honest `hole` on that wire.
     FpGroundEval,
+    /// Exhaustive exact prime-field clause validation over complete finite domains.
+    FiniteFieldExhaustive,
+    /// Source-ordered multipliers proving a contradiction over one prime field.
+    /// Entries beyond the number of clause literals must be zero.
+    FiniteFieldLinear([u8; 8]),
+    /// Full-width source-ordered prime-field multipliers. The byte payload's
+    /// historical wire identity remains unchanged. Unused entries are zero.
+    FiniteFieldLinearWide([u32; 8]),
 
     /// Exact extensionality over a small, completely enumerated array index
     /// carrier.
@@ -1014,9 +1024,73 @@ pub enum TheoryLemmaKind {
     /// quantifier instance below every provenance seam, and this lemma
     /// re-derives the substituted clause from the exact recorded instance
     /// plus the authored defining equalities (the deductive-checks letleak shape).
-    /// No external Alethe rule exists; the wire prints the honest `hole`
-    /// fallback.
+    /// The printer lowers a bounded structural/Boolean subset to checked
+    /// congruence and discharged subproofs; other shapes retain `hole`.
     GroundEqualitySubstitution,
+
+    /// Integer clause refuted by a Chvátal–Gomory cut chain (no payload; see `proof_validation::lia_cut_chain`).
+    IntCgCutChain,
+
+    /// The checked unsigned multiplication overflow identity of a `2m`-bit
+    /// product over `m`-bit limbs (external-codegen's u128 `checked_mul` lowering):
+    ///
+    /// ```text
+    /// (= (ite (not (= H 0)) #b1 #b0)
+    ///    (ite (and (not (= A 0)) (not (= (bvudiv (bvmul A B) A') B))) #b1 #b0))
+    /// ```
+    ///
+    /// with `A = (concat a_hi a_lo)`, `B = (concat b_hi b_lo)`,
+    /// `A' = (ite (= A 0) 1 A)` and `H` the schoolbook high half of `A * B`
+    /// (limb products, the middle sum's carry by `bvult`, the carry shifted
+    /// by `m`). Valid for every value of the four limbs: `H != 0` exactly
+    /// when `A * B >= 2^2m`, which for `A != 0` is exactly when dividing
+    /// the wrapped product by `A` does not give back `B`.
+    ///
+    /// Also the signed (i128) form, `bvsdiv` expanded by its SMT-LIB
+    /// definition: the magnitudes' schoolbook high half is nonzero or their
+    /// wrapped product exceeds the sign-dependent limit exactly when
+    /// `B != 0` and `(bvmul A B) sdiv D != A`, or `A = MIN, B = -1`.
+    ///
+    /// `ay-proof`'s strict checker re-derives the complete clause from the
+    /// four limbs and accepts nothing else; the Alethe printer emits a
+    /// complete, hole-free certificate (the checker's own restoring divider
+    /// followed stage by stage, the schoolbook identity, quotient
+    /// uniqueness; for the signed form, the unsigned identity over the
+    /// magnitudes and a case analysis of the four `bvsdiv` cases).
+    ///
+    /// Uses Alethe rule `bv_mul_overflow_division` internally; the wire
+    /// spelling is the printed certificate.
+    BvMulOverflowDivision,
+
+    /// Exact unsigned remainder range theorem:
+    /// `(or (= d (_ bv0 n)) (bvult (bvurem x d) d))`.
+    ///
+    /// The checker independently validates the complete typed Bool/BV source
+    /// DAG and exact operand identities. The initial certificate envelope is
+    /// `1 <= n <= 128`; unsupported shapes fail closed. This is a dedicated
+    /// SMT-LIB theory rule, not a schema shortcut for `BvBitBlast`. The Clean
+    /// exporter proves it through the checked restoring-divider stages.
+    /// Appended so all existing serialized enum ordinals remain unchanged.
+    BvUremBound,
+
+    /// Complete univariate degree-two root exhaustion over an odd prime field.
+    /// The independent checker reparses the authored conjunction, computes the
+    /// common-root gcd, removes repeated and disequality roots, and checks
+    /// residual nonresiduosity. No producer polynomial or root is trusted.
+    /// Native-only: external Alethe honestly emits a hole. Appended to retain
+    /// all historical serialized ordinals.
+    FiniteFieldQuadratic,
+    /// Univariate prime-field root exhaustion, independently reconstructed
+    /// from the clause using gcd with X^p-X and disequality-root removal.
+    /// No producer polynomial or factor is evidence. Native-only; appended
+    /// to preserve historical serialized ordinals.
+    FiniteFieldUnivariate,
+    /// Finite-domain ideal contradiction over a prime field, reconstructed
+    /// independently from authored equations, valid X_i^p-X_i identities,
+    /// bounded Macaulay row closure and univariate Frobenius gcd. No producer
+    /// basis or algebraic success bit is evidence. Native-only; appended to
+    /// preserve every historical serialized ordinal.
+    FiniteFieldIdeal,
 }
 mod theory_lemma_kind_serde;
 

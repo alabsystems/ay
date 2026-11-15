@@ -289,7 +289,7 @@ fn check_constructor(
             // bounded without granting schema-driven synthesis authority.
             Sort::Int if allow_bounded_int => {}
             Sort::BitVec(bitvec) => {
-                if bitvec.width > 256 {
+                if !(1..=256).contains(&bitvec.width) {
                     return None;
                 }
                 let width = usize::try_from(bitvec.width).ok()?;
@@ -305,8 +305,11 @@ fn check_constructor(
             }
             Sort::Array(array) if allow_bounded_int => {
                 check_concrete_array_sort(
+                    schemas,
                     &array.index_sort,
                     &array.element_sort,
+                    depth,
+                    stack,
                     nodes,
                     static_render_bytes,
                 )?;
@@ -329,24 +332,29 @@ fn check_constructor(
     Some(datatype_fields == 1)
 }
 
-/// The concrete array-cell reader currently supports scalar finite-map keys
-/// and values only. Arbitrarily large numerals and strings remain bounded by
-/// the enclosing rendered S-expression limit; bitvectors additionally carry a
-/// schema-level width cap.
+/// Concrete finite maps retain scalar keys but may contain registered
+/// datatypes or further arrays. Every referenced schema is checked by the
+/// enclosing worklist; the concrete value still needs the bounded typed parse.
 fn check_concrete_array_sort(
+    schemas: &HashMap<String, DatatypeSchema>,
     index_sort: &Sort,
     element_sort: &Sort,
+    depth: usize,
+    stack: &mut Vec<(String, usize)>,
     nodes: &mut usize,
     static_render_bytes: &mut usize,
 ) -> Option<()> {
-    for sort in [index_sort, element_sort] {
+    if depth > MAX_RENDERED_DT_DEPTH {
+        return None;
+    }
+    for (sort, is_element) in [(index_sort, false), (element_sort, true)] {
         *nodes = nodes.checked_add(1)?;
         if *nodes > MAX_RENDERED_DT_NODES {
             return None;
         }
         match sort {
             Sort::Bool | Sort::Int | Sort::Real | Sort::String => {}
-            Sort::BitVec(bitvec) if bitvec.width <= 256 => {
+            Sort::BitVec(bitvec) if (1..=256).contains(&bitvec.width) => {
                 let width = usize::try_from(bitvec.width).ok()?;
                 let bytes = if width % 4 == 0 {
                     width / 4 + 2
@@ -357,6 +365,20 @@ fn check_concrete_array_sort(
                 if *static_render_bytes > MAX_RENDERED_DT_BYTES {
                     return None;
                 }
+            }
+            Sort::Uninterpreted(name) if is_element && schemas.contains_key(name) => {
+                stack.push((name.clone(), depth.checked_add(1)?));
+            }
+            Sort::Array(array) if is_element => {
+                check_concrete_array_sort(
+                    schemas,
+                    &array.index_sort,
+                    &array.element_sort,
+                    depth.checked_add(1)?,
+                    stack,
+                    nodes,
+                    static_render_bytes,
+                )?;
             }
             _ => return None,
         }

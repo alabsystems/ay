@@ -92,6 +92,18 @@ impl IncrementalPdrContext {
         timeout: Option<std::time::Duration>,
         phase_seed_model: Option<&FxHashMap<String, SmtValue>>,
     ) -> IncrementalCheckResult {
+        if crate::run_meter::charge(crate::run_meter::Step::SmtEntry).is_err() {
+            return IncrementalCheckResult::Unknown;
+        }
+        // Census (`--chc-session-coverage`): nothing is built when it is off.
+        let _census = crate::smt::lane::census::coverage_enabled().then(|| {
+            let exprs: Vec<&ChcExpr> = assumptions.iter().collect();
+            crate::smt::lane::CensusFrame::enter(
+                crate::smt::lane::SmtEntry::IncrementalPdr,
+                Some(self.own_smt.census_lane()),
+                &exprs,
+            )
+        });
         // Install seed model on own_smt for the duration of the query.
         let prev_seed = self.own_smt.phase_seed_model.take();
         self.own_smt.phase_seed_model = phase_seed_model.cloned();
@@ -259,11 +271,15 @@ impl IncrementalPdrContext {
             }
 
             let should_stop = || {
+                ay_core::resource::note_sat_stop_poll();
                 timeout.is_some_and(|t| start.elapsed() >= t) || TermStore::global_memory_exceeded()
             };
-            let sat_result = self
-                .sat
-                .solve_with_assumptions_interruptible(sat_assumptions, should_stop);
+            if crate::run_meter::charge(crate::run_meter::Step::TheoryRound).is_err() {
+                return IncrementalCheckResult::Unknown;
+            }
+            let sat_result = crate::run_meter::sat_solve(&mut self.sat, |sat| {
+                sat.solve_with_assumptions_interruptible(sat_assumptions, should_stop)
+            });
 
             match sat_result.result() {
                 ay_sat::AssumeResult::Unsat(_core, _) => {

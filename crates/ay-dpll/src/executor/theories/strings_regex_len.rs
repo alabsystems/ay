@@ -589,19 +589,22 @@ impl Executor {
                     // Non-singleton endpoint(s): empty language ⇒ empty alphabet.
                     return Some(HashSet::default());
                 }
-                let lo_c = lo.chars().next().unwrap();
-                let hi_c = hi.chars().next().unwrap();
+                // By SMT-LIB code point: the range may span the surrogate
+                // block, whose characters `char` order skips (their carriers
+                // sort above the alphabet, see `ay_core::smtlib_char`).
+                let lo_c = ay_core::smtlib_code_point(lo.chars().next().unwrap());
+                let hi_c = ay_core::smtlib_code_point(hi.chars().next().unwrap());
                 if lo_c > hi_c {
                     // Reversed range: empty language ⇒ empty alphabet.
                     return Some(HashSet::default());
                 }
-                let span = (hi_c as u32).checked_sub(lo_c as u32)?;
+                let span = hi_c - lo_c;
                 if span as usize + 1 > MAX_REGEX_ALPHABET {
                     return None;
                 }
                 let mut set = HashSet::default();
-                for cp in (lo_c as u32)..=(hi_c as u32) {
-                    set.insert(char::from_u32(cp)?);
+                for cp in lo_c..=hi_c {
+                    set.insert(ay_core::smtlib_char(cp)?);
                 }
                 Some(set)
             }
@@ -764,6 +767,41 @@ mod w1b_tests {
             assert_eq!(pos.matches(c), Some(true), "{c:?} ∈ [a-z]");
             assert_eq!(neg.matches(c), Some(true), "{c:?} ∉ [a-b]");
         }
+    }
+
+    /// `regex_accepted_alphabet` reads a `re.range` by SMT-LIB code point,
+    /// surrogates included (2026-09-24 fp-strings fix-up; the verifier's M12
+    /// and the whole-hunk revert M12b). In `char` order a range whose low
+    /// endpoint is a surrogate carrier reads as REVERSED, and the empty
+    /// alphabet it then returns lets the pre-pass refute a satisfiable
+    /// membership; with `char::from_u32` a surrogate in the span voids the
+    /// alphabet.
+    #[test]
+    fn accepted_alphabet_of_a_range_is_by_code_point() {
+        let cp = |code: u32| ay_core::smtlib_char(code).expect("in the SMT-LIB alphabet");
+        let mut exec = Executor::new();
+        let mut range = |lo: char, hi: char| {
+            let lo = exec.ctx.terms.mk_string(lo.to_string());
+            let hi = exec.ctx.terms.mk_string(hi.to_string());
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("re.range"), vec![lo, hi], Sort::RegLan)
+        };
+        let across = range(cp(0xDFFE), '\u{e001}');
+        let wide = range(cp(0xD800), '\u{e000}');
+        let reversed = range('\u{e000}', cp(0xDFFF));
+        let expected: HashSet<char> = [cp(0xDFFE), cp(0xDFFF), '\u{e000}', '\u{e001}']
+            .into_iter()
+            .collect();
+        assert_eq!(exec.regex_accepted_alphabet(across), Some(expected));
+        // 2,049 characters: too wide to enumerate -- no information, never
+        // the empty alphabet.
+        assert_eq!(exec.regex_accepted_alphabet(wide), None);
+        // Reversed by code point: the empty language.
+        assert_eq!(
+            exec.regex_accepted_alphabet(reversed),
+            Some(HashSet::default())
+        );
     }
 
     #[test]

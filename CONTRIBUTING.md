@@ -2,42 +2,37 @@
 
 ## Build
 
-```bash
-cargo build --release --locked -p ay --features cli --bin ay
-```
+AY builds with ALab's Trust compiler, which `rust-toolchain.toml` pins; the
+[README](README.md#build) says how to install it. `targo` is the spelling for
+every command (`targo --unverified test`, `targo fmt`, `targo tippy`).
 
-A current stable Rust toolchain is the only requirement. That is a statement
-about this published snapshot, whose `rust-toolchain.toml` pins stock stable
-Rust; publication installs that pin, so no consumer or contributor needs a
-verifying compiler to build, test, or patch AY. ALab's development tree pins
-the Trust verifying compiler as its default instead (verification on, in an
-advisory policy), which is why some in-tree notes talk about proof obligations
-that plain stable Rust never emits.
+```bash
+targo --unverified build --release --locked -p ay --features cli --bin ay
+```
 
 ## Test
 
 Start with the narrowest check that covers your change, then broaden:
 
 ```bash
-cargo fmt --check --all
-cargo check --workspace --all-targets
-cargo test -p <crate>          # e.g. -p ay-sat, -p ay-dpll
-cargo check -p ay --features cli
+targo fmt --check --all
+targo --unverified check --workspace --all-targets
+targo --unverified test -p <crate>          # e.g. -p ay-sat, -p ay-dpll
+targo --unverified check -p ay --features cli
 ```
 
-AY deliberately has no hosted GitHub Actions workflow. Maintainers run the
-checked-in local solver gate and the full public-export check instead:
+AY has no hosted GitHub Actions workflow. Ordinary changes use the native
+landing command after focused checks:
 
 ```bash
-cargo run --locked -p ay --features cli -- gate solver
-publish/publish.sh check ay --check
+targo --unverified run --locked -p ay --features cli -- gate land
 ```
 
-The publication command builds an allowlisted export, runs fail-closed content
-guards, and checks the pinned, locked public workspace in an isolated Cargo
-environment. Run the narrowest relevant checks first; solver changes should
-also be checked against a reference solver and, where possible, a proof or
-model checker.
+Publication validation is separate: run `pub check` when preparing a public
+release. It checks the allowlisted export and the pinned public workspace.
+Solver changes also need a discriminating regression and comparison against a
+reference solver or independent proof/model checker. Do not rerun unrelated
+benchmark campaigns or legacy script suites to land a local change.
 
 ## Licensing
 

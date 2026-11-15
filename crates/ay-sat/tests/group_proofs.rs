@@ -12,8 +12,6 @@
 
 mod common;
 
-#[path = "group_proofs/clearlevel0_proof_id_guard.rs"]
-mod clearlevel0_proof_id_guard;
 #[path = "group_proofs/extension_addclauses_8480.rs"]
 mod extension_addclauses_8480;
 #[path = "group_proofs/extension_proof_trace.rs"]
@@ -28,8 +26,8 @@ mod lean4_kernel_e2e;
 mod performance_proofs;
 #[path = "group_proofs/proof_coverage_p258.rs"]
 mod proof_coverage_p258;
-#[path = "group_proofs/proofaddkind_reconciliation_guard.rs"]
-mod proofaddkind_reconciliation_guard;
+#[path = "group_proofs/resolution_dag_polling.rs"]
+mod resolution_dag_polling;
 #[path = "group_proofs/standalone_checker_e2e.rs"]
 mod standalone_checker_e2e;
 #[path = "group_proofs/theory_lemma_lrat_guard.rs"]

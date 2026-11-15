@@ -1,0 +1,50 @@
+# ENVIRONMENT NAMES THIS REPOSITORY OWNS THAT THIS CRATE DOES NOT READ.
+#
+# One name per line; `#` starts a comment. Consumed by `knobs.rs` through
+# `include_str!`, so the audit can tell a name that belongs to the repository's
+# own tooling from a mistyped knob. Kept OUT of Rust source deliberately, like
+# `tests/retired_env_names.txt`.
+#
+# DERIVED, NOT DECLARED. `tooling_env_names_are_derived_from_the_repository` in
+# `tests/env_ledger_tooling.rs` rebuilds this set from the files git tracks under
+# `scripts/`, `publish/` and `competition/` (shell `$NAME` / `${NAME}` references
+# and Python `os.environ` / `os.getenv` reads, with `scripts/tests/` excluded
+# because its fixtures are deliberately non-existent names) minus this crate's own
+# ledger, and requires exact agreement. A new script's names are read once `git
+# add` puts it in the index. Do not hand-edit this file to silence that test:
+# either the name is really read by the repository's tooling, in which case the
+# scan finds it, or it is not, in which case it belongs nowhere.
+AY_AB_CORPUS
+AY_BENCH_ROOT
+AY_BIN
+AY_COMMIT
+AY_CONTINUOUS_HEADROOM_MB
+AY_CONTINUOUS_JOBS
+AY_CONTINUOUS_MEMLIMIT_MB
+AY_CORPUS
+AY_DIR
+AY_LIB
+AY_OOM_GUARD_PARENT_LEASE
+AY_PB26_VERIPB_BIN
+AY_PB_BIN
+AY_PB_DEV_BIN
+AY_PB_PARALLEL
+AY_PF_ARM_C
+AY_PROOFMODE_BIN
+AY_PROOF_RETAIN_CAP_BYTES
+AY_REPO
+AY_ROOT
+AY_SAT26_LOCAL_VALIDATION_BINARY
+AY_SATCOMP_MATRIX
+AY_SAT_AI_CLASS
+AY_SAT_EMIT_STATS_JSON
+AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT
+AY_SAT_TARGET_CPU
+AY_SAT_TRACK
+AY_SGF_SWEEP
+AY_SMOKE_CARGO_HOME
+AY_SMOKE_CARGO_HOME_TEMP
+AY_SOURCE_GIT_DIRTY
+AY_STAMP
+AY_TIMEOUT
+AY_VERIPB_RUSTC

@@ -40,24 +40,27 @@ impl LratChecker {
         let mut witness_ids: Vec<u64> = Vec::new();
 
         // Parse witness groups: each starts with a negative hint ID.
-        let mut i = 0;
-        while i < rat_hints.len() {
-            let hint = rat_hints[i];
+        let mut rest = rat_hints;
+        while let Some((&hint, tail)) = rest.split_first() {
             if hint >= 0 {
                 // Unexpected positive hint after RAT section started.
                 return false;
             }
             debug_assert!(hint != i64::MIN, "hint i64::MIN would overflow on negation");
-            let witness_clause_id = (-hint) as u64;
+            // `hint < 0`, so its magnitude is `-hint` (and `i64::MIN` maps to
+            // 2^63 rather than overflowing).
+            let witness_clause_id = hint.unsigned_abs();
             witness_ids.push(witness_clause_id);
-            i += 1;
 
-            // Collect the positive hints for this witness.
-            let rup_start = i;
-            while i < rat_hints.len() && rat_hints[i] > 0 {
-                i += 1;
-            }
-            let witness_rup_hints = &rat_hints[rup_start..i];
+            // Collect the positive hints for this witness: the maximal run
+            // of positive hints that follows the witness ID.
+            let rup_len = tail.iter().take_while(|&&h| h > 0).count();
+            let (Some(witness_rup_hints), Some(next)) = (tail.get(..rup_len), tail.get(rup_len..))
+            else {
+                // Unreachable: `rup_len` counts a prefix of `tail`.
+                return false;
+            };
+            rest = next;
 
             // Verify this RAT witness.
             if !self.verify_one_rat_witness(
@@ -108,7 +111,7 @@ impl LratChecker {
                 std::io::stderr(),
                 "LRAT RAT: {} clause(s) containing ~pivot {neg_pivot} not covered by witnesses: {:?}",
                 uncovered.len(),
-                &uncovered[..uncovered.len().min(10)],
+                uncovered.get(..10).unwrap_or(uncovered.as_slice()),
             );
             return false;
         }
@@ -178,8 +181,9 @@ impl LratChecker {
                     return true;
                 }
                 None => {
-                    self.ensure_var_extended(neg);
-                    self.assign(neg);
+                    if !self.assign(neg) {
+                        return false;
+                    }
                 }
             }
         }
@@ -263,7 +267,7 @@ impl LratChecker {
                         _ => {
                             // Not falsified: either true (satisfied) or unassigned.
                             // CaDiCaL counts both as non-falsified (#5233).
-                            non_falsified_count += 1;
+                            non_falsified_count = non_falsified_count.saturating_add(1);
                             if non_falsified_count >= 2 {
                                 break; // early exit: already non-unit
                             }
@@ -297,7 +301,11 @@ impl LratChecker {
 
             match action {
                 HintAction::Conflict => return true,
-                HintAction::Propagate(unit) => self.assign(unit),
+                HintAction::Propagate(unit) => {
+                    if !self.assign(unit) {
+                        return false;
+                    }
+                }
                 HintAction::SatisfiedUnit => {} // no-op: continue to next hint
                 HintAction::NonUnit => return false, // CaDiCaL parity: non-unit hint = failure
             }

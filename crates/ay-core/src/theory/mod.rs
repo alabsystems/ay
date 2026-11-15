@@ -8,12 +8,11 @@
 
 use crate::term::{TermId, TermStore};
 
+mod kernel_ids;
 mod soundness;
 mod types;
 
-#[cfg(kani)]
-mod kani_proofs;
-
+pub use kernel_ids::{AtomHandle, Effort, RuleId, StrengthenId};
 pub use soundness::assert_conflict_soundness;
 pub use types::{
     BoundRefinementRequest, DiscoveredDisequality, DiscoveredEquality, DisequalitySplitRequest,
@@ -21,6 +20,15 @@ pub use types::{
     NativeTheoryPropagationBackend, NativeTheoryPropagationProfile, SplitRequest, StringLemma,
     StringLemmaKind, TheoryConflict, TheoryLemma, TheoryLit, TheoryPropagation, TheoryResult,
 };
+
+/// Effect of replaying an actually installed clause against current theory work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TheoryLemmaReplay {
+    /// No current derived work changed its acknowledgment state.
+    Unchanged,
+    /// At least one current, exact derived clause became acknowledged.
+    CurrentWorkAcknowledged,
+}
 
 /// Trait for theory solvers.
 ///
@@ -78,6 +86,15 @@ pub trait TheorySolver {
     /// once per (re)created theory instance, BEFORE the first `propagate()`.
     /// The default implementation does nothing. (#euf-atom-filter)
     fn set_sat_atom_terms(&mut self, _term_to_var: &crate::kani_compat::DetHashMap<TermId, u32>) {}
+
+    /// Whether the lazy split loop hands this solver, beside the theory
+    /// atoms, the truth value of every Boolean variable that is the argument
+    /// of an uninterpreted function. Such a variable is not a theory atom by
+    /// shape; a solver with an E-graph needs its value to join `(f p)` with
+    /// `(f q)` when `p` and `q` agree. The default is `false`.
+    fn reads_bool_argument_values(&self) -> bool {
+        false
+    }
 
     /// Assert a literal to the theory solver.
     fn assert_literal(&mut self, literal: TermId, value: bool);
@@ -144,6 +161,35 @@ pub trait TheorySolver {
     /// The default is `false`, which is correct for theories where
     /// `check_during_propagate` already delegates to `check`.
     fn needs_final_check_after_sat(&self) -> bool {
+        false
+    }
+
+    /// A last SAT-ONLY attempt before the split loop ends the search
+    /// `unknown` because this theory's integer split walk is unbounded (the
+    /// oscillation guard, #split-walk-sat-fallback).
+    ///
+    /// Return `true` only when the theory now holds a model of the ORIGINAL
+    /// assertions that it has verified exactly and that `extract_model`
+    /// reports; the executor then stores it as a `Sat` candidate, and the
+    /// usual model validation still decides. It can never contribute to an
+    /// `unsat`: the alternative is the `unknown` the guard was about to
+    /// return. The default declines.
+    fn try_sat_before_split_giveup(&mut self) -> bool {
+        false
+    }
+
+    /// A last SAT-ONLY attempt before the split loop accepts a round as `Sat`
+    /// on a STALE request — a model equality or expression split with nothing
+    /// new to encode (#1771, #stale-expr-split) — and leaves the verdict to
+    /// the model gate (#stale-accept-sat-lane).
+    ///
+    /// The round is `Sat` whatever this returns. `true` means the theory has
+    /// replaced the model `extract_model` reports with one it verified
+    /// exactly against the ORIGINAL assertions. A theory must decline without
+    /// side effects unless the model it would otherwise report provably
+    /// falsifies an original assertion (so the gate was going to reject it).
+    /// The default declines.
+    fn try_sat_before_stale_accept(&mut self) -> bool {
         false
     }
 
@@ -226,6 +272,15 @@ pub trait TheorySolver {
     /// The default implementation is a no-op.
     fn note_applied_theory_lemma(&mut self, _clause: &[TheoryLit]) {}
 
+    /// Re-acknowledge a clause from the caller's actually installed SAT ledger.
+    /// Planned/dedup-seen clauses do not satisfy this contract. The caller must
+    /// keep the same active SAT scope, theory instance, stop and deadline.
+    /// This may request a normal recheck; it never supplies a SAT verdict.
+    fn reacknowledge_applied_theory_lemma(&mut self, clause: &[TheoryLit]) -> TheoryLemmaReplay {
+        self.note_applied_theory_lemma(clause);
+        TheoryLemmaReplay::Unchanged
+    }
+
     /// Push a new incremental scope.
     ///
     /// Saves a boundary marker so that all semantic effects occurring after
@@ -270,7 +325,11 @@ pub trait TheorySolver {
     /// - **Pending propagation buffers**: stale propagations from the popped
     ///   scope must not leak into future `propagate()` calls.
     /// - **Pending conflict state**: `trivial_conflict` (LRA) and similar
-    ///   fields must be cleared.
+    ///   fields must be cleared when they were recorded inside the popped
+    ///   scope. A conflict recorded in a SURVIVING scope (LRA applies the
+    ///   atoms asserted since the last check at `push` time, in the scope of
+    ///   their assertion — `#lra-scope-trail`) is not stale and stays
+    ///   pending for the next `check()`.
     /// - **Pending injectivity equalities** (DT): derived from popped merges.
     /// - **External equality/disequality facts** (arrays): re-derived each
     ///   check cycle.
@@ -697,6 +756,23 @@ pub trait TheorySolver {
     /// negated equalities), so the polarity must be carried through.
     fn explain_propagation(&mut self, _lit: TermId, _reason_data: u64) -> Option<Vec<TheoryLit>> {
         None
+    }
+
+    /// Reason literals for a lazy propagation that a proof-tracking consumer
+    /// is about to fix at decision level 0, so the level-0 unit gets a proof.
+    ///
+    /// The default is [`explain_propagation`](Self::explain_propagation). A
+    /// theory that forwards another solver's lazy propagations without
+    /// explaining them in conflict analysis (LIA over its LRA relaxation)
+    /// answers here with the inner solver's explanation. `None` means "no
+    /// explanation": the consumer delivers the propagation lazily, as it does
+    /// above level 0, and never drops it.
+    fn explain_level0_propagation(
+        &mut self,
+        lit: TermId,
+        reason_data: u64,
+    ) -> Option<Vec<TheoryLit>> {
+        self.explain_propagation(lit, reason_data)
     }
 
     /// Notify the theory that a lazy propagation was rejected upstream.

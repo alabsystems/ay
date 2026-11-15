@@ -427,6 +427,25 @@ impl ConvergenceMonitor {
         (scaled as u64).max(Self::FRAME_STALL_SECS)
     }
 
+    /// Whether no frame advanced for `stall_secs`: wall time, or under an
+    /// effort the run's ticks, with the window converted at ay-sat's
+    /// calibration anchor (`ay_sat::TICKS_PER_MS`, the unit of the effort,
+    /// DR-37), so a slower host stalls at the same point (P4a slice 8).
+    fn frame_stalled(&self, stall_secs: u64) -> bool {
+        match (
+            crate::run_meter::counted_ticks(),
+            self.last_frame_advance_ticks,
+        ) {
+            (Some(now), Some(at)) => {
+                let window = stall_secs
+                    .saturating_mul(1_000)
+                    .saturating_mul(ay_sat::TICKS_PER_MS);
+                now.saturating_sub(at) >= window
+            }
+            _ => self.last_frame_advance.elapsed().as_secs() >= stall_secs,
+        }
+    }
+
     /// Graduated stagnation check returning a response level (#7906).
     ///
     /// Returns a `StagnationResponse` that indicates the severity of detected
@@ -457,8 +476,7 @@ impl ConvergenceMonitor {
         // Check frame stall: no frame advancement in adaptive_stall_secs
         // while we've done at least adaptive_window iterations total.
         if current_iteration >= adaptive_window {
-            let secs_since_frame = self.last_frame_advance.elapsed().as_secs();
-            if secs_since_frame >= adaptive_stall_secs {
+            if self.frame_stalled(adaptive_stall_secs) {
                 let lemma_delta = current_lemma_count.saturating_sub(self.window_lemma_count);
                 let iter_delta = current_iteration.saturating_sub(self.window_start_iteration);
                 if iter_delta > 0 && lemma_delta == 0 {
@@ -556,6 +574,26 @@ impl ConvergenceMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under an effort the frame stall is measured in the run's ticks at
+    /// ay-sat's anchor, never in wall time (P4a slice 8): a window's worth of
+    /// ticks since the last frame advance stalls, one fewer does not, however
+    /// long either took.
+    #[test]
+    fn under_an_effort_the_frame_stall_is_counted_in_ticks() {
+        let meter = crate::run_meter::RunMeter::open(Some(u64::MAX / 2), None);
+        let monitor = ConvergenceMonitor::new();
+        let window = 1_000 * ay_sat::TICKS_PER_MS;
+        assert_eq!(crate::run_meter::charge_ticks_for_tests(window - 1), Ok(()));
+        assert!(!monitor.frame_stalled(1));
+        assert_eq!(crate::run_meter::charge_ticks_for_tests(1), Ok(()));
+        assert!(monitor.frame_stalled(1));
+        drop(meter);
+        assert!(
+            !ConvergenceMonitor::new().frame_stalled(1),
+            "without an effort: wall time, and none has passed"
+        );
+    }
 
     // =========================================================================
     // ProblemSizeHint tests

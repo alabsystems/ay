@@ -211,12 +211,22 @@ fn test_qf_fp_classification_is_strict_checkable() {
         let mut exec = Executor::new();
         let outputs = exec.execute_all(&commands).unwrap();
         assert_eq!(outputs, vec!["unsat"], "{body} must be UNSAT");
+        // D7 (2026-09-22): the document renders what the strict checker
+        // accepted, and the FP sort is DISCLOSED as outside pinned Carcara's
+        // grammar rather than refused at the printer.
         let text = exec.get_proof();
         assert!(
-            text.contains("UNVERIFIABLE PROOF")
-                && text.contains("unsupported by pinned Carcara"),
-            "the native FP proof is strict, but its unsupported sort must fail \
-             closed at the pinned-Carcara boundary; got:\n{text}"
+            !text.contains("UNVERIFIABLE PROOF") && !text.contains(":rule trust"),
+            "{body}: the native FP proof must render without a trust fallback; got:\n{text}"
+        );
+        let surface = exec
+            .last_unsat_proof_carcara_surface()
+            .expect("an UNSAT in proof mode retains its proof");
+        assert!(
+            surface
+                .unsupported_reason()
+                .is_some_and(|reason| reason.contains("FloatingPoint")),
+            "{body}: the FP sort must be disclosed as unsupported by pinned Carcara, got {surface}"
         );
         let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
         assert!(
@@ -256,11 +266,28 @@ fn test_qf_fplra_forward_error_is_strict_checkable() {
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs, vec!["unsat"]);
+    // D7 (2026-09-22): FpForwardError is an internally certified AY kind with
+    // no Alethe rule, so the wire document exposes it as an honest `hole` —
+    // and the FP sort is DISCLOSED as outside pinned Carcara's grammar rather
+    // than refused at the printer.
     let text = exec.get_proof();
     assert!(
-        text.contains("UNVERIFIABLE PROOF") && text.contains("unsupported by pinned Carcara"),
-        "FpForwardError is internally certified, while pinned Carcara cannot \
-         parse the FP sort at all; the Alethe boundary must fail closed:\n{text}"
+        !text.contains("UNVERIFIABLE PROOF") && !text.contains(":rule trust"),
+        "the forward-error proof must render without a trust fallback; got:\n{text}"
+    );
+    assert!(
+        text.contains(":rule hole") && !text.contains(":rule fp_forward_error"),
+        "FpForwardError is an internally certified AY kind, not an Alethe rule; \
+         the wire proof must expose the unsupported semantic step as an honest hole:\n{text}"
+    );
+    let surface = exec
+        .last_unsat_proof_carcara_surface()
+        .expect("an UNSAT in proof mode retains its proof");
+    assert!(
+        surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains("FloatingPoint")),
+        "the FP sort must be disclosed as unsupported by pinned Carcara, got {surface}"
     );
     let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
     assert!(proof.steps.iter().any(|step| matches!(
@@ -428,4 +455,25 @@ fn test_qf_dt_tester_exclusion_emits_firewall_lean() {
         .expect("expected a DtTesterExcl firewall file");
     assert!(f.contains("firewall_combined_unsat"));
     assert!(f.contains("| k0 | k1 | k2"));
+}
+
+#[test]
+fn defined_fp_to_integer_ground_casts_have_strict_replay() {
+    for cast in [
+        "((_ fp.to_sbv 32) RTZ ((_ to_fp 5 11) #x3f00))",
+        "((_ fp.to_ubv 32) RTZ ((_ to_fp 8 24) #x3fe00000))",
+        "((_ fp.to_sbv 32) RTZ ((_ to_fp 11 53) #x3ffc000000000000))",
+    ] {
+        let input = format!(
+            "(set-option :produce-proofs true) (set-logic QF_FP) (assert (not (= {cast} (_ bv1 32)))) (check-sat)"
+        );
+        let commands = parse(&input).unwrap();
+        let mut exec = Executor::new();
+        assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+        let proof = exec.last_proof.as_ref().expect("retained proof");
+        let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)
+            .expect("strict ground conversion replay");
+        assert_eq!(quality.trust_count, 0);
+        assert!(ay_proof::terminal_trust_report(proof).is_trust_free());
+    }
 }

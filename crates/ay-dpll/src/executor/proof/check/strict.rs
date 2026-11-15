@@ -99,8 +99,10 @@ impl Executor {
             problem: problem.as_slice(),
         };
         if let Some((outcome, work)) = self.strict_walk_memo_lookup(proof, &key) {
-            self.strict_check_memo_hits
-                .set(self.strict_check_memo_hits.get() + 1);
+            if !matches!(outcome, Err(ProofCheckError::Cancelled)) {
+                self.strict_check_memo_hits
+                    .set(self.strict_check_memo_hits.get() + 1);
+            }
             return (outcome, work);
         }
         let (outcome, work) = check_with_executor_progress_reporting_work(

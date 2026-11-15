@@ -279,6 +279,206 @@ fn false_disjunct_or_rejects_a_consistent_equality() {
     assert_eq!(proof.steps.len(), steps_before);
 }
 
+/// The CANONICAL spelling of the same fold (#false-disjunct-canonical):
+/// `64d468871` rebuilds substituted Boolean connectives through `mk_or`, which
+/// drops the `false` disjunct and returns the sole survivor bare, so the leaf
+/// the `inc_some_list` probe carries is now `(not (is-Nil self_current))`
+/// itself -- here `(<= x 0)`. Provenance and authored sources are unchanged.
+fn canonical_sole_survivor_fixture() -> Fixture {
+    let mut fixture = false_disjunct_fixture();
+    let false_term = fixture.executor.ctx.terms.false_term();
+    let canonical = fixture
+        .executor
+        .ctx
+        .terms
+        .mk_or(vec![false_term, fixture.kept]);
+    assert_eq!(
+        canonical, fixture.kept,
+        "mk_or must drop the folded literal and return the sole survivor bare"
+    );
+    let mut assertion_sources = HashMap::default();
+    assertion_sources.insert(canonical, vec![vec![fixture.orig]]);
+    fixture.executor.proof_problem_assertion_provenance = Some(ProofProblemAssertionProvenance {
+        original_problem_assertions: vec![fixture.orig, fixture.equality],
+        problem_assertions: vec![fixture.orig, fixture.equality],
+        assertion_sources,
+    });
+    fixture.goal = canonical;
+    fixture
+}
+
+/// RED before the canonical arm: the planner required a literal `false`
+/// disjunct, so the canonical leaf stayed a trust step and surgery declined.
+#[test]
+fn canonical_sole_survivor_rebuilds_strictly_without_repacking() {
+    let mut fixture = canonical_sole_survivor_fixture();
+    let mut proof = trust_refutation(&mut fixture.executor, fixture.goal);
+    let not_goal = fixture.executor.ctx.terms.mk_not_raw(fixture.goal);
+    let mut originals = fixture_originals(&fixture);
+    install_surface_overrides(&mut fixture.executor, &originals);
+    originals.push((not_goal, native_placeholder()));
+
+    assert!(
+        fixture
+            .executor
+            .try_rebuild_with_trust_surgery(&mut proof, &originals),
+        "the canonical sole survivor of a folded or must be recognized and rebuilt"
+    );
+    let quality = ay_proof::check_proof_strict(&proof, &fixture.executor.ctx.terms)
+        .expect("rebuilt canonical survivor must be strict");
+    assert_eq!(quality.trust_count, 0, "no trust steps: {quality}");
+    assert_eq!(quality.hole_count, 0, "no hole steps: {quality}");
+
+    // The same authored decomposition and checked refutation as the
+    // positional form, ending at the survivor itself.
+    let alethe = ay_proof::export_alethe(&proof, &fixture.executor.ctx.terms);
+    for line in [
+        "(step t3 (cl (= a 1) (<= x 0)) :rule or :premises (t1))",
+        "(step t4 (cl (not (= a 0)) (not (= a 1))) :rule la_generic :args (-1 1))",
+        "(step t6 (cl (<= x 0)) :rule resolution :premises (t3 t5))",
+    ] {
+        assert!(
+            alethe.contains(line),
+            "expected exact wire line {line:?} in:\n{alethe}"
+        );
+    }
+    assert!(
+        !alethe.contains(":rule or_neg") && !alethe.contains(":rule contraction"),
+        "a sole survivor IS the goal; nothing may be re-packed:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule trust") && !alethe.contains(":rule hole"),
+        "printed Alethe must be trust-free:\n{alethe}"
+    );
+}
+
+#[test]
+fn canonical_sole_survivor_requires_recorded_provenance() {
+    let mut fixture = canonical_sole_survivor_fixture();
+    fixture.executor.proof_problem_assertion_provenance = None;
+    let mut proof = trust_refutation(&mut fixture.executor, fixture.goal);
+    let steps_before = proof.steps.len();
+    let originals = fixture_originals(&fixture);
+    assert!(
+        !fixture
+            .executor
+            .try_rebuild_with_trust_surgery(&mut proof, &originals),
+        "without provenance the canonical survivor must fail closed"
+    );
+    assert_eq!(proof.steps.len(), steps_before);
+}
+
+/// Membership pairing is exact: a canonical target literal that restates NO
+/// source disjunct leaves every source disjunct to be refuted, and the
+/// surviving `(<= x 0)` is not refutable from `(= a 0)`, so the leaf stays
+/// trusted rather than being "derived" from an unrelated authored `or`.
+#[test]
+fn canonical_target_must_restate_a_source_disjunct() {
+    let mut fixture = false_disjunct_fixture();
+    let stray = fixture
+        .executor
+        .ctx
+        .elaborate_surface_subterm(&app(
+            "<=",
+            [FrontendTerm::Symbol("x".to_string()), numeral("1")],
+        ))
+        .expect("stray literal elaborates");
+    let mut assertion_sources = HashMap::default();
+    assertion_sources.insert(stray, vec![vec![fixture.orig]]);
+    fixture.executor.proof_problem_assertion_provenance = Some(ProofProblemAssertionProvenance {
+        original_problem_assertions: vec![fixture.orig, fixture.equality],
+        problem_assertions: vec![fixture.orig, fixture.equality],
+        assertion_sources,
+    });
+    let mut proof = trust_refutation(&mut fixture.executor, stray);
+    let steps_before = proof.steps.len();
+    let originals = fixture_originals(&fixture);
+    assert!(
+        !fixture
+            .executor
+            .try_rebuild_with_trust_surgery(&mut proof, &originals),
+        "a target that restates no source disjunct must fail closed"
+    );
+    assert_eq!(proof.steps.len(), steps_before);
+}
+
+/// Two survivors: the canonical target is `mk_or` of both (sorted, no
+/// `false`), so each survivor is an operand of the goal and the plan re-packs
+/// them with `or_neg` + `contraction` exactly as for the positional spelling.
+#[test]
+fn canonical_survivor_or_repacks_strictly() {
+    let mut executor = Executor::new();
+    let _ = declare(&mut executor, "a", "Int");
+    let _ = declare(&mut executor, "x", "Int");
+    let _ = declare(&mut executor, "y", "Int");
+    let x_le = app("<=", [FrontendTerm::Symbol("x".to_string()), numeral("0")]);
+    let y_le = app("<=", [FrontendTerm::Symbol("y".to_string()), numeral("0")]);
+    let parsed_orig = app(
+        "or",
+        [
+            app("=", [FrontendTerm::Symbol("a".to_string()), numeral("1")]),
+            x_le.clone(),
+            y_le.clone(),
+        ],
+    );
+    let orig = executor
+        .ctx
+        .elaborate_surface_subterm(&parsed_orig)
+        .expect("authored or elaborates");
+    let parsed_equality = app("=", [FrontendTerm::Symbol("a".to_string()), numeral("0")]);
+    let equality = executor
+        .ctx
+        .elaborate_surface_subterm(&parsed_equality)
+        .expect("authored equality elaborates");
+    let kept_x = executor
+        .ctx
+        .elaborate_surface_subterm(&x_le)
+        .expect("first survivor elaborates");
+    let kept_y = executor
+        .ctx
+        .elaborate_surface_subterm(&y_le)
+        .expect("second survivor elaborates");
+    let false_term = executor.ctx.terms.false_term();
+    let goal = executor.ctx.terms.mk_or(vec![false_term, kept_x, kept_y]);
+    let ay_core::TermData::App(_, goal_disjuncts) = executor.ctx.terms.get(goal) else {
+        panic!("two survivors must intern as an or");
+    };
+    assert!(
+        goal_disjuncts.len() == 2 && !goal_disjuncts.contains(&false_term),
+        "the canonical goal must keep both survivors and drop the folded literal"
+    );
+    let mut assertion_sources = HashMap::default();
+    assertion_sources.insert(goal, vec![vec![orig]]);
+    executor.proof_problem_assertion_provenance = Some(ProofProblemAssertionProvenance {
+        original_problem_assertions: vec![orig, equality],
+        problem_assertions: vec![orig, equality],
+        assertion_sources,
+    });
+    let mut proof = trust_refutation(&mut executor, goal);
+    let not_goal = executor.ctx.terms.mk_not_raw(goal);
+    let mut originals = vec![(orig, parsed_orig), (equality, parsed_equality)];
+    install_surface_overrides(&mut executor, &originals);
+    originals.push((not_goal, native_placeholder()));
+
+    assert!(
+        executor.try_rebuild_with_trust_surgery(&mut proof, &originals),
+        "the canonical survivor or must be recognized and rebuilt"
+    );
+    let quality = ay_proof::check_proof_strict(&proof, &executor.ctx.terms)
+        .expect("rebuilt canonical survivor or must be strict");
+    assert_eq!(quality.trust_count, 0, "no trust steps: {quality}");
+    assert_eq!(quality.hole_count, 0, "no hole steps: {quality}");
+    let alethe = ay_proof::export_alethe(&proof, &executor.ctx.terms);
+    assert!(
+        alethe.contains(":rule or_neg") && alethe.contains(":rule contraction"),
+        "two survivors are re-packed into the canonical goal:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule trust") && !alethe.contains(":rule hole"),
+        "printed Alethe must be trust-free:\n{alethe}"
+    );
+}
+
 /// FALSIFY-ONCE. The byte-identical false-disjunct derivation — same rules,
 /// same step order the emitter produces — planted with a support equality
 /// `(= a 1)` that does NOT conflict with the folded disjunct `(= a 1)`, over

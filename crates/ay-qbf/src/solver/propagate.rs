@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::formula::MAX_QBF_VARS;
 
 impl QbfSolver {
     /// Convert a literal to its watch index
@@ -12,10 +13,26 @@ impl QbfSolver {
         var * 2 + usize::from(!lit.is_positive())
     }
 
+    /// Build the watch table on first use: two lists per variable plus the
+    /// unused id-0 pair, then watches for every original clause. Returns
+    /// `false` (building nothing) above `MAX_QBF_VARS` variables, which
+    /// `input_valid` already excludes; restating the bound here bounds the
+    /// table's allocation.
+    pub(super) fn ensure_watches(&mut self) -> bool {
+        if self.watches.is_empty() {
+            let num_vars = self.formula.num_vars();
+            if num_vars > MAX_QBF_VARS {
+                return false;
+            }
+            self.watches = vec![Vec::new(); num_vars * 2 + 2];
+            self.init_watches();
+        }
+        true
+    }
+
     /// Initialize watches for all original clauses
     pub(super) fn init_watches(&mut self) {
-        for i in 0..self.formula.clauses().len() {
-            let clause = &self.formula.clauses()[i];
+        for (i, clause) in self.formula.clauses().iter().enumerate() {
             if clause.len() >= 2 {
                 // Watch first two literals
                 let lit0 = clause[0];
@@ -71,7 +88,8 @@ impl QbfSolver {
         // Main propagation loop using watched literals
         while self.qhead < self.trail.len() {
             let false_lit = self.trail[self.qhead];
-            self.qhead += 1;
+            // `qhead < trail.len()` here, so the increment never saturates.
+            self.qhead = self.qhead.saturating_add(1);
 
             // Check clauses watching the negation of this literal
             // (those clauses now have one of their watched literals false)
@@ -90,11 +108,18 @@ impl QbfSolver {
                     continue;
                 }
 
-                // Get the clause
+                // Get the clause. Watches are only created for existing
+                // clause indices and clauses are never removed (deletion
+                // empties them), so a watch naming no clause cannot occur;
+                // if one did, leave it in place and move on.
                 let clause = if is_learned {
-                    &self.learned[clause_idx]
+                    self.learned.get(clause_idx)
                 } else {
-                    &self.formula.clauses()[clause_idx]
+                    self.formula.clauses().get(clause_idx)
+                };
+                let Some(clause) = clause else {
+                    i += 1;
+                    continue;
                 };
 
                 // Skip deleted (empty) learned clauses — lazy watch cleanup
@@ -140,7 +165,7 @@ impl QbfSolver {
                         return PropResult::Conflict(global_clause_idx);
                     }
                     ClauseStatus::Unit(prop_lit) => {
-                        self.propagations += 1;
+                        self.propagations = self.propagations.saturating_add(1);
                         self.assign(prop_lit, Reason::Propagated(global_clause_idx));
                         i += 1;
                     }
@@ -158,7 +183,9 @@ impl QbfSolver {
     fn propagate_unit_clauses(&mut self) -> Option<usize> {
         // Check original unit clauses
         for i in 0..self.formula.clauses().len() {
-            let clause = &self.formula.clauses()[i];
+            let Some(clause) = self.formula.clauses().get(i) else {
+                break;
+            };
             if clause.len() == 1 {
                 let lit = clause[0];
                 match self.lit_value(lit) {
@@ -166,7 +193,7 @@ impl QbfSolver {
                     Assignment::False => return Some(i),
                     Assignment::Unassigned => {
                         if self.formula.lit_is_existential(lit) {
-                            self.propagations += 1;
+                            self.propagations = self.propagations.saturating_add(1);
                             self.assign(lit, Reason::Propagated(i));
                         } else {
                             // Universal unit clause - blocked
@@ -187,13 +214,17 @@ impl QbfSolver {
             }
             if clause.len() == 1 {
                 let lit = clause[0];
-                let global_idx = self.formula.clauses().len() + i;
+                // Two in-memory vectors of clauses cannot hold more than
+                // usize::MAX clauses between them, so this never stops early.
+                let Some(global_idx) = self.formula.clauses().len().checked_add(i) else {
+                    break;
+                };
                 match self.lit_value(lit) {
                     Assignment::True => {}
                     Assignment::False => return Some(global_idx),
                     Assignment::Unassigned => {
                         // Learned clauses can propagate universals
-                        self.propagations += 1;
+                        self.propagations = self.propagations.saturating_add(1);
                         self.assign(lit, Reason::Propagated(global_idx));
                     }
                 }
@@ -219,8 +250,8 @@ impl QbfSolver {
                 continue; // deleted by reduction, or empty (SAT handled elsewhere)
             }
             // Check cube status
-            let mut num_false = 0;
-            let mut num_unassigned = 0;
+            let mut num_false: usize = 0;
+            let mut num_unassigned: usize = 0;
             let mut unassigned_lit = None;
             let mut has_true = false;
 
@@ -231,10 +262,10 @@ impl QbfSolver {
                         break;
                     }
                     Assignment::False => {
-                        num_false += 1;
+                        num_false = num_false.saturating_add(1);
                     }
                     Assignment::Unassigned => {
-                        num_unassigned += 1;
+                        num_unassigned = num_unassigned.saturating_add(1);
                         unassigned_lit = Some(lit);
                     }
                 }
@@ -253,15 +284,18 @@ impl QbfSolver {
                 continue;
             }
 
-            if num_unassigned == 1 && num_false == cube.len() - 1 {
-                // Unit propagation: one literal must be true
-                // This forces a universal variable
-                let lit = unassigned_lit.expect("num_unassigned==1 guarantees Some");
-                self.propagations += 1;
-                if i < self.cube_used.len() {
-                    self.cube_used[i] = true;
+            // `num_unassigned == 1` means the one unassigned literal was
+            // recorded, so `unassigned_lit` is `Some` whenever this matches.
+            if let (1, Some(lit)) = (num_unassigned, unassigned_lit) {
+                if cube.len().checked_sub(1) == Some(num_false) {
+                    // Unit propagation: one literal must be true
+                    // This forces a universal variable
+                    self.propagations = self.propagations.saturating_add(1);
+                    if i < self.cube_used.len() {
+                        self.cube_used[i] = true;
+                    }
+                    self.assign(lit, Reason::CubePropagated(i));
                 }
-                self.assign(lit, Reason::CubePropagated(i));
             }
         }
 
@@ -309,7 +343,7 @@ impl QbfSolver {
     /// single universal literals are blocked (adversary controls them).
     fn check_clause_unit(&self, clause: &[Literal], is_learned: bool) -> ClauseStatus {
         let mut unassigned_existential = None;
-        let mut num_unassigned_exist = 0;
+        let mut num_unassigned_exist: usize = 0;
         let mut unassigned_univ_lits = Vec::new();
         let mut has_satisfied = false;
 
@@ -322,7 +356,7 @@ impl QbfSolver {
                 Assignment::False => {}
                 Assignment::Unassigned => {
                     if self.formula.lit_is_existential(lit) {
-                        num_unassigned_exist += 1;
+                        num_unassigned_exist = num_unassigned_exist.saturating_add(1);
                         unassigned_existential = Some(lit);
                     } else {
                         unassigned_univ_lits.push(lit);
@@ -361,15 +395,16 @@ impl QbfSolver {
 
     /// Check if a set of literals contains a complementary pair (x and ¬x)
     fn contains_complementary(lits: &[Literal]) -> bool {
-        for i in 0..lits.len() {
-            for j in (i + 1)..lits.len() {
-                // Check if lits[i] and lits[j] are complements (same var, different polarity)
-                if lits[i].variable() == lits[j].variable()
-                    && lits[i].is_positive() != lits[j].is_positive()
-                {
-                    return true;
-                }
+        // Compare each literal with every literal after it.
+        let mut rest = lits;
+        while let [first, tail @ ..] = rest {
+            // Complements share the variable and differ in polarity
+            if tail.iter().any(|other| {
+                first.variable() == other.variable() && first.is_positive() != other.is_positive()
+            }) {
+                return true;
             }
+            rest = tail;
         }
         false
     }

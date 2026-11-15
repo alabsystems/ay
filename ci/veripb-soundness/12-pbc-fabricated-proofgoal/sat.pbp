@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% The same formula and the same binary, proved SATISFIABLE. One checker, one formula, both
+% verdicts, so the false `s VERIFIED UNSATISFIABLE` next door needs no external oracle to be
+% recognised as false.
+f 1 ;
+sol x1 x2 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

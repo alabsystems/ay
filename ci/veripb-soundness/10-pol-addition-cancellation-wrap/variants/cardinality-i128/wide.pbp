@@ -1,0 +1,23 @@
+pseudo-Boolean proof version 3.0
+% Truth: SATISFIABLE. The only row has a left-hand side in {0, 2^63-1} and a
+% right-hand side of exactly i128::MIN, so it is trivially true and every
+% assignment is a model. `sat.pbp` here makes the same checker say
+% `s VERIFIED SATISFIABLE`, with the model x1 = 0.
+%
+% Same defect as fixture 11 one integer width up, and a DIFFERENT branch of the
+% same function, so a fix that only guards the i64 arm still fails here.
+% `pol x1 1 +` adds the literal axiom `x1 >= 0` to row 1. The summed degree is
+% i128::MIN, which fits i128; x1 and ~x1 cancel by 1; `Cardinality::add`'s
+% `TryInto::<i128>` branch then computes `degree_sum - cancel` in i128, so
+% i128::MIN - 1 wraps to i128::MAX.
+%
+% Correct result: `9223372036854775806 ~x1 >= -170141183460469231731687303715884105729`
+%   (trivially true).
+% Unfixed result: `9223372036854775806 ~x1 >= 170141183460469231731687303715884105727`
+%   (degree far above the coefficient sum, i.e. a contradiction), so
+%   `conclusion UNSAT : 2` is accepted.
+f 1 ;
+pol x1 1 + ;
+output NONE;
+conclusion UNSAT : 2 ;
+end pseudo-Boolean proof;

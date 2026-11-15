@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% POSITIVE CONTROL for the `solx` empty-preserved-set fix: refusing an EMPTY preserved set must
+% not touch a preserved set of size one. Both values of x1 extend to a solution, so the complete
+% enumeration over the preserved set is 2, and the two exclusions contradict each other.
+f 1;
+solx x1 x2;
+solx ~x1 x2;
+rup >= 1;
+output NONE;
+conclusion ENUMERATION_COMPLETE 2;
+end pseudo-Boolean proof;

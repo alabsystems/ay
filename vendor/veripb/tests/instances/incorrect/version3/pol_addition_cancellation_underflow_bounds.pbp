@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% The forgery is not confined to the UNSAT verdict: the same wrapped row made the checker
+% certify `BOUNDS INF <= obj <= INF` for an optimisation problem whose optimum is 0.
+f 1 ;
+pol 1 ~x1 + ;
+output NONE;
+conclusion BOUNDS INF INF ;
+end pseudo-Boolean proof;

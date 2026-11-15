@@ -40,9 +40,12 @@ extern crate ay_core;
 mod bounded_enum;
 mod check_loop;
 mod factor_split;
+mod factor_split_provenance;
 pub(crate) mod feasible_set;
+mod full_conflict;
 mod interval_contract;
 mod local_search;
+mod local_search_order;
 mod model_state;
 mod monomial;
 mod nlsat;
@@ -95,6 +98,7 @@ fn maybe_grow_nia_stack<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(NIA_STACK_RED_ZONE, NIA_STACK_SIZE, f)
 }
 
+pub use local_search_order::is_integer_unit_conjunction;
 pub use monomial::Monomial;
 
 /// Per-phase timing breakdown for NIA-specific work (#8823).
@@ -194,6 +198,13 @@ pub struct NiaSolver<'a> {
     div_purifications: Vec<DivPurification>,
     /// Asserted atoms for conflict generation
     asserted: Vec<(TermId, bool)>,
+
+    /// Incremental SOS fragment translation cache (see
+    /// `sos_check::SosFragmentCache`): `build_sos_fragment_with_progress`
+    /// runs on every NIA check and previously retranslated the whole
+    /// asserted set -- the top profile stack on Certora QF_UFDTNIA
+    /// 39657...48. Interior-mutable because fragment building is `&self`.
+    pub(crate) sos_fragment_cache: std::cell::RefCell<sos_check::SosFragmentCache>,
     /// Scope markers for push/pop: (asserted_len, div_purifications_len)
     scopes: Vec<(usize, usize)>,
     /// Debug flag
@@ -208,11 +219,31 @@ pub struct NiaSolver<'a> {
     patch_count: u64,
     /// Number of tentative sign cuts injected
     sign_cut_count: u64,
+    /// Number of iteration >= 1 LIA refutations published while model guesses
+    /// were in the tentative scope (#nia-sign-cut-soundness telemetry,
+    /// `nia_unsat_with_guesses`). Sound by the justified-bound discipline in
+    /// the LIA/LRA; the count lets a census see how often that discipline
+    /// carried a verdict.
+    unsat_with_guesses_count: u64,
     /// Number of tentative LIA scopes active (sign-cut + patch scopes).
     /// The sign-cut path and try_tentative_patch each push one scope.
     /// undo_tentative_patch() must pop ALL of them to avoid leaking
     /// model-dependent bounds into future queries.
     tentative_depth: u32,
+    /// Number of MODEL GUESSES asserted into the open tentative scope(s)
+    /// (#nia-sign-cut-soundness): tentative sign cuts (`x >= 0` / `x <= 0`
+    /// from the current model value) and integer-rounding / patch pins
+    /// (`x = round(model(x))`). Every producer goes through
+    /// `inject_tentative_sign_cuts` or `apply_patch`, the two chokepoints
+    /// that bump this. A guess is a heuristic that steers the LP toward a
+    /// model the monomial check can verify; it is NOT a theorem. Nothing
+    /// downstream can build a verdict on one — its reason is the variable
+    /// term, which the LRA's Farkas guard and the LIA's justified-bound reads
+    /// see as unasserted — and debug builds audit that by re-deriving any
+    /// LIA UNSAT observed while this is non-zero in a guess-free scope (z3
+    /// `nla_basics_lemmas::sign_lemma` discipline: a model-guessed sign is a
+    /// decision, never a fact). Reset to zero by `undo_tentative_patch`.
+    tentative_guess_count: u32,
 
     // --- clauseSMT NLSAT techniques (#8453, ported from NRA #8445) ---
     /// Per-variable feasible sets: intersection of clause-level feasible sets.
@@ -242,6 +273,39 @@ pub struct NiaSolver<'a> {
     /// Tracks which atoms from `registered_atoms` already have truth values.
     pub(crate) asserted_atom_set: HashSet<TermId>,
 
+    /// Every theory atom the DPLL layer has registered (`register_atom`), i.e.
+    /// the instance's SAT-visible arithmetic vocabulary. Sizes the phase-hint
+    /// epoch gate (#nonlinear-phase-hints); nothing else reads it. Cleared by
+    /// `reset`, which the eager lanes call before re-registering.
+    pub(crate) sat_atoms: HashSet<TermId>,
+
+    /// Memo of `suggest_phase` results keyed by the wrapped LRA's
+    /// `phase_state_epoch` (the same generation `phase_hint_epoch`
+    /// reports when size-gated in). The SAT seeder re-queries every
+    /// atom after every BCP quiescence; below the epoch-skip size
+    /// gate that re-seed is deliberately unconditional for
+    /// trajectory reasons, so the per-atom feasible-set sign walk
+    /// repeated identically thousands of times per solve (~17% of
+    /// the wall on Certora QF_UFDTNIA 39657...48). Suggestions are a
+    /// pure function of the term store and the state that epoch
+    /// covers (the contract `phase_hint_epoch` already asserts and
+    /// the DPLL debug canary checks), so serving them from this memo
+    /// is value- AND trajectory-exact: the seeder still overwrites
+    /// phase arrays every quiescence, just without recomputing.
+    pub(crate) phase_memo: std::cell::RefCell<(Option<u64>, HashMap<TermId, Option<bool>>)>,
+
+    /// Per-epoch memo of leaf value signs for the feasible-set look-ahead
+    /// (`term_value_sign` / `term_has_value` in nlsat.rs), keyed by the
+    /// same `phase_state_epoch` as `phase_memo`. The seeder's per-atom
+    /// sign walk re-reads the signs of shared operand leaves for every
+    /// atom at every quiescence; the per-atom memo cannot reuse those
+    /// across atoms, so leaf reads (column lookup + materialised sign)
+    /// dominated the walk on Certora QF_UFDTNIA. A leaf's sign is a pure
+    /// function of the state the epoch covers, so this is value- and
+    /// trajectory-exact exactly as `phase_memo` is.
+    pub(crate) leaf_sign_memo:
+        std::cell::RefCell<(Option<u64>, HashMap<TermId, Option<std::cmp::Ordering>>)>,
+
     /// Real per-phase timings for NIA-specific work (#8823). Populated by
     /// `Instant::now()` measurements in `nia_check_loop`. Separate from
     /// `self.lia.timings()` so a dispatcher can see NIA overhead distinct
@@ -253,6 +317,30 @@ pub struct NiaSolver<'a> {
     /// problems even when exhaustive integer enumeration finds a satisfying
     /// point. Keep that witness available for executor model validation.
     bounded_enum_model: Option<HashMap<TermId, BigInt>>,
+    bounded_enum_bool_model: HashMap<TermId, bool>,
+
+    /// Interval-contracted integer bounds from the most recent
+    /// `try_bounded_enumeration` in the CURRENT asserted scope
+    /// (#nia-mccormick-contracted-bounds). The contractor derives bounds
+    /// that flow through nonlinear atoms and compound linear equalities
+    /// (e.g. `main - 3 = 0 ∧ c + main <= 0` gives `c <= -3`) which the
+    /// LRA's stored variable bounds may only carry in weaker sentinel
+    /// form (`c <= 0`, reason = the variable term). McCormick envelopes
+    /// consult this stash and keep the tighter side; a contracted
+    /// endpoint is justified by the asserted literals as a whole (the
+    /// contractor's soundness contract: seeds are justified bounds and
+    /// every rule only removes values excluded by asserted atoms).
+    /// Cleared whenever the asserted set changes (assert/pop/reset and
+    /// at `check()` entry), so a stale endpoint can never outlive its
+    /// justifying trail.
+    contracted_bounds: HashMap<TermId, (Option<i64>, Option<i64>)>,
+
+    /// Narrow premise literals for product-sum-derived contracted
+    /// endpoints, keyed by `(var, is_lower)` (#nia-product-sum-bound).
+    /// Factor split cites these for a contracted-completed box instead
+    /// of every asserted literal, keeping learned conflicts small.
+    /// Cleared together with `contracted_bounds`.
+    contracted_bound_reasons: HashMap<(TermId, bool), Vec<(TermId, bool)>>,
 
     /// Monomial-congruence aux-var pairs already linked via
     /// `add_monomial_congruence_lemmas` (#nia-congruence). NIA's `check()` can
@@ -281,6 +369,13 @@ pub struct NiaSolver<'a> {
     /// `zero_bound_emitted`.
     box_bound_emitted: HashSet<(TermId, BigRational)>,
 
+    /// Zero-product / quotient / interval-product cuts already emitted in
+    /// this scope (#nia-zero-product, see
+    /// `zero_bound_lemmas.rs::add_zero_product_lemmas`). Keyed by
+    /// `(target, bound, is_lower)` with the same pop/reset clearing
+    /// discipline as `box_bound_emitted`.
+    zero_product_emitted: HashSet<(TermId, BigRational, bool)>,
+
     /// Set by the NIA check loop when the most recent UNSAT verdict carries a
     /// replayable rational Positivstellensatz / SOS certificate of infeasibility
     /// (see [`sos`] and [`sos_check`]). A REAL SOS refutation certifies emptiness
@@ -291,7 +386,7 @@ pub struct NiaSolver<'a> {
     /// independent checker.
     pub(crate) last_unsat_certificate: Option<sos::SosCertificate>,
 
-    /// Hard wall-clock deadline for the refinement loop (#nia-deadline).
+    /// Cooperative wall-clock deadline for the refinement loop (#nia-deadline).
     ///
     /// Mirror of `LiaSolver::deadline` (#lia-deadline-forward): the DPLL/N-O
     /// callers only poll their own deadline BETWEEN theory checks, so a single
@@ -318,6 +413,10 @@ pub struct NiaSolver<'a> {
     /// instance (#nia-clausal-sls).
     local_search_done: bool,
 
+    /// Scheduling shape of the source roots before arithmetic purification.
+    /// These roots supply no assertions or proof/model authority.
+    local_search_first_offer: Option<local_search_order::FirstOffer>,
+
     /// Absolute wall cutoff for the clausal local-search lane
     /// (#nia-clausal-sls), shared by every theory instance the split loop
     /// creates during one solve.
@@ -330,6 +429,12 @@ pub struct NiaSolver<'a> {
     /// absolute cutoff installed before the split loop caps the lane's TOTAL
     /// share of the solve and leaves the remainder to the rest of the pipeline.
     local_search_deadline: Option<ay_core::time::Instant>,
+
+    /// Once-per-solve flag of the split probe (#nia-split-probe): a short,
+    /// time-sliced clausal local search offered when the solve's first factor
+    /// split is about to enumerate. Shared by every theory instance the split
+    /// loop creates, like `local_search_deadline`; `None` disables it.
+    split_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a> NiaSolver<'a> {
@@ -342,6 +447,9 @@ impl<'a> NiaSolver<'a> {
         // making standalone NIA over-approximate nonlinear `*` as a fresh opaque
         // LRA variable (a sound relaxation) instead of poisoning LRA to Unknown.
         lia.set_combined_theory_mode(true);
+        // The NIA's loop steers its own refinement from the inner LIA's split
+        // requests; the lattice closure stays a pure-LIA tool (see the setter).
+        lia.set_lattice_closure(false);
         Self {
             terms,
             lia,
@@ -354,6 +462,7 @@ impl<'a> NiaSolver<'a> {
             monomial_trail: Vec::new(),
             div_purifications: Vec::new(),
             asserted: Vec::new(),
+            sos_fragment_cache: std::cell::RefCell::default(),
             scopes: Vec::new(),
             debug,
             check_count: 0,
@@ -362,23 +471,34 @@ impl<'a> NiaSolver<'a> {
             tangent_lemma_count: 0,
             patch_count: 0,
             sign_cut_count: 0,
+            unsat_with_guesses_count: 0,
             tentative_depth: 0,
+            tentative_guess_count: 0,
             feasible_sets: HashMap::default(),
             blocked_vars: Vec::new(),
             fixed_vars: Vec::new(),
             feasible_set_count: 0,
             registered_atoms: Vec::new(),
             asserted_atom_set: HashSet::default(),
+            sat_atoms: HashSet::default(),
+            phase_memo: std::cell::RefCell::new((None, HashMap::default())),
+            leaf_sign_memo: std::cell::RefCell::new((None, HashMap::default())),
             timings: NiaTimings::default(),
             bounded_enum_model: None,
+            bounded_enum_bool_model: HashMap::default(),
+            contracted_bounds: HashMap::default(),
+            contracted_bound_reasons: HashMap::default(),
             congruence_linked: HashSet::default(),
             zero_bound_emitted: HashSet::default(),
             box_bound_emitted: HashSet::default(),
+            zero_product_emitted: HashSet::default(),
             last_unsat_certificate: None,
             deadline: None,
             root_assertions: Vec::new(),
             local_search_done: false,
+            local_search_first_offer: None,
             local_search_deadline: None,
+            split_probe: None,
         }
     }
 
@@ -390,7 +510,10 @@ impl<'a> NiaSolver<'a> {
     /// completeness but never soundness.
     pub fn set_root_assertions(&mut self, roots: Vec<TermId>) {
         self.root_assertions = roots;
+        self.bounded_enum_model = None;
+        self.bounded_enum_bool_model.clear();
         self.local_search_done = false;
+        self.local_search_first_offer = None;
     }
 
     /// Install the shared absolute wall cutoff for the clausal local-search
@@ -403,7 +526,14 @@ impl<'a> NiaSolver<'a> {
         self.local_search_deadline = Some(cutoff);
     }
 
-    /// Install a hard wall-clock deadline on the NIA solver (#nia-deadline).
+    /// Install the once-per-solve split-probe flag (#nia-split-probe). Callers
+    /// create ONE flag per solve, before the split loop, and hand every theory
+    /// instance a clone, so the probe runs at most once per solve.
+    pub fn set_split_probe_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.split_probe = Some(flag);
+    }
+
+    /// Install a cooperative wall-clock deadline on the NIA solver (#nia-deadline).
     ///
     /// Mirrors `LiaSolver::set_deadline` (#8749) and follows the
     /// #lia-deadline-forward pattern: the deadline is stored here for the
@@ -419,25 +549,27 @@ impl<'a> NiaSolver<'a> {
         self.lia.set_deadline(deadline);
     }
 
-    /// Whether the enclosing solve's wall-clock budget is exhausted
-    /// (#nia-deadline). `false` when no deadline was installed.
+    /// Whether the enclosing solve's wall or live Check stop is exhausted.
+    /// The shared poll also observes cancellation and ancestor work grants;
+    /// a missing solver-owned deadline does not hide those controls.
     pub(crate) fn should_timeout(&self) -> bool {
         self.deadline
             .is_some_and(|dl| ay_core::time::Instant::now() >= dl)
+            || ay_core::resource::check_stop_requested()
     }
 
-    /// True iff the most recent `check()` returned UNSAT with a replayable
-    /// rational Positivstellensatz / SOS certificate attached (see [`sos`]). When
-    /// true, [`NiaSolver::render_sos_unsat_certificate`] yields an independently
-    /// checkable algebraic proof of infeasibility.
+    /// True iff the most recent `check()` retained a privately checked rational
+    /// Positivstellensatz / SOS certificate (see [`sos`]). Its factor positions
+    /// refer to the translated theory subset, not an authenticated public query.
+    /// The renderer is diagnostic; exact-source native publication separately
+    /// constructs and replays a typed `NraSos` bundle.
     pub fn took_sos_unsat_certificate(&self) -> bool {
         self.last_unsat_certificate.is_some()
     }
 
-    /// Render the last UNSAT's Positivstellensatz certificate as an Alethe-style
-    /// proof step (empty clause, `:rule nia_positivstellensatz`), or `None` if
-    /// the last UNSAT had no certificate. Variable names are resolved from the
-    /// term store.
+    /// Render the private certificate as diagnostic comments followed by an
+    /// honest Alethe `:rule hole`, or `None` when none was retained. This is not
+    /// an externally supported rule or portable proof. Names use the term store.
     pub fn render_sos_unsat_certificate(&self, step: &str) -> Option<String> {
         let cert = self.last_unsat_certificate.as_ref()?;
         Some(cert.render_alethe(step, |t| match self.terms.get(t) {
@@ -496,5 +628,26 @@ impl<'a> NiaSolver<'a> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(kani)]
-mod verification;
+#[cfg(test)]
+mod sign_cut_soundness_tests;
+
+#[cfg(test)]
+mod shared_reason_tests;
+
+#[cfg(test)]
+mod factor_split_premise_tests;
+
+#[cfg(test)]
+mod factor_split_premise_provenance_tests;
+
+#[cfg(test)]
+mod split_giveup_tests;
+
+#[cfg(test)]
+mod stale_accept_tests;
+
+#[cfg(test)]
+mod split_probe_tests;
+
+#[cfg(test)]
+mod factor_split_precision_tests;

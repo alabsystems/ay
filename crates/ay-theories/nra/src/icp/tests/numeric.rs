@@ -108,7 +108,8 @@ fn interval_scale_points_is_flat_in_interval_width() {
 /// dyadic, distinct, spread, and bounded in denominator — and must decline
 /// rather than guess where there is no scale to work at.
 #[test]
-fn interval_scale_points_reach_where_the_fixed_alphabet_cannot() {
+fn interval_scale_points_reach_where_the_fixed_alphabet_cannot(
+) -> Result<(), Box<dyn std::error::Error>> {
     let iv = |l: BigRational, h: BigRational| Interval {
         lo: Endpoint::Finite(l, false),
         hi: Endpoint::Finite(h, false),
@@ -128,14 +129,17 @@ fn interval_scale_points_reach_where_the_fixed_alphabet_cannot() {
     for p in &pts {
         assert!(interval_contains(&narrow, p), "{p} escaped the interval");
         let d = p.denom();
+        let top_bit = (d.bits() as usize)
+            .checked_sub(1)
+            .ok_or("a denominator is nonzero")?;
         assert!(
-            d == &(BigInt::one() << (d.bits() as usize - 1)),
+            d == &(BigInt::one() << top_bit),
             "{p} is not dyadic — the denominator bound is the point"
         );
         assert!(p.denom().bits() as usize <= GRID_SCALE_MAX_BITS + 1);
     }
-    for i in 1..pts.len() {
-        assert!(pts[i - 1] != pts[i], "duplicate candidate {}", pts[i]);
+    for (prev, next) in pts.iter().zip(pts.iter().skip(1)) {
+        assert!(prev != next, "duplicate candidate {next}");
     }
     // Spread, not clustered against the lower endpoint.
     assert!(pts.iter().max() > pts.iter().min());
@@ -164,6 +168,7 @@ fn interval_scale_points_reach_where_the_fixed_alphabet_cannot() {
         BigRational::new(BigInt::from(3), BigInt::one() << 80u32),
     );
     assert!(interval_scale_points(&hair, GRID_MIN_BRANCH).is_empty());
+    Ok(())
 }
 
 #[test]

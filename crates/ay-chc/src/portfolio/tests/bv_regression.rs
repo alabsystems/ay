@@ -52,6 +52,7 @@ fn test_bv_trivial_cex_validates_against_original_problem_6293() {
     let trivial_cex = Counterexample {
         steps: Vec::new(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
 

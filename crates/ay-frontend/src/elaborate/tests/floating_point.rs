@@ -47,9 +47,9 @@ fn invalid_or_unrepresentable_fp_formats_fail_before_bitblasting() {
     for input in [
         "(declare-const x (_ FloatingPoint 1 24))",
         "(declare-const x (_ FloatingPoint 8 1))",
-        "(declare-const x (_ FloatingPoint 32 24))",
+        "(declare-const x (_ FloatingPoint 64 24))",
         "(declare-const x (_ FloatingPoint 8 1048577))",
-        "(assert (= (_ +zero 32 24) (_ +zero 32 24)))",
+        "(assert (= (_ +zero 64 24) (_ +zero 64 24)))",
     ] {
         let commands = parse(input).expect("syntax parses");
         let mut ctx = Context::new();

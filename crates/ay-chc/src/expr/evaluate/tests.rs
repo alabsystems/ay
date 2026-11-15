@@ -347,7 +347,10 @@ fn test_evaluate_expr_select_with_model_var() {
             entries: vec![(SmtValue::Int(3), SmtValue::Int(99))],
         },
     );
-    let arr_var = ChcExpr::Var(int_var("arr"));
+    let arr_var = ChcExpr::Var(crate::ChcVar::new(
+        "arr",
+        crate::ChcSort::Array(Box::new(crate::ChcSort::Int), Box::new(crate::ChcSort::Int)),
+    ));
     // select(arr, 3) → 99
     let sel = ChcExpr::Op(ChcOp::Select, vec![a(arr_var.clone()), a(ChcExpr::Int(3))]);
     assert_eq!(evaluate_expr(&sel, &model), Some(SmtValue::Int(99)));
@@ -357,10 +360,24 @@ fn test_evaluate_expr_select_with_model_var() {
 }
 
 #[test]
+fn test_evaluate_expr_select_rejects_scalar_declared_array_model() {
+    let model = FxHashMap::from_iter([(
+        "arr".to_string(),
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries: vec![(SmtValue::Int(3), SmtValue::Int(99))],
+        },
+    )]);
+    let scalar = ChcExpr::Var(int_var("arr"));
+    let selected = ChcExpr::select(scalar, ChcExpr::Int(3));
+    assert_eq!(evaluate_expr(&selected, &model), None);
+}
+
+#[test]
 fn test_evaluate_expr_datatype_selector_and_tester() {
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -773,10 +790,36 @@ mod bigint_escape_value_ops {
     use crate::expr::ChcVar;
     use crate::ChcSort;
     use num_bigint::BigInt;
+    use num_rational::BigRational;
     use std::sync::Arc;
 
     fn big_probe() -> BigInt {
         (BigInt::from(1u8) << 128) + 1
+    }
+
+    /// Int vs Real compares as numbers: an integer literal in a Real context
+    /// (`(= x 0)`, `x : Real`) is the same number as `0.0`; the pair used to
+    /// fall to the "never equal" arm and rejected correct models.
+    #[test]
+    fn smt_values_equal_int_vs_real_compares_numerically() {
+        let zero_r = SmtValue::Real(BigRational::from_integer(BigInt::from(0)));
+        let two_r = SmtValue::Real(BigRational::from_integer(BigInt::from(2)));
+        let half_r = SmtValue::Real(BigRational::new(BigInt::from(1), BigInt::from(2)));
+        assert_eq!(smt_values_equal(&SmtValue::Int(0), &zero_r), Some(true));
+        assert_eq!(smt_values_equal(&zero_r, &SmtValue::Int(0)), Some(true));
+        assert_eq!(smt_values_equal(&SmtValue::Int(2), &two_r), Some(true));
+        assert_eq!(smt_values_equal(&SmtValue::Int(1), &two_r), Some(false));
+        assert_eq!(smt_values_equal(&SmtValue::Int(0), &half_r), Some(false));
+        let big = SmtValue::int_from_bigint(big_probe());
+        let big_r = SmtValue::Real(BigRational::from_integer(big_probe()));
+        assert_eq!(smt_values_equal(&big, &big_r), Some(true));
+        assert_eq!(smt_values_equal(&big_r, &SmtValue::Int(1)), Some(false));
+        // The strict verifier accepts `{x: 0}` for `(= x 0)` with a Real `x`.
+        let x = ChcExpr::var(ChcVar::new("x", ChcSort::Real));
+        let e = ChcExpr::eq(x, ChcExpr::Int(0));
+        let mut model = FxHashMap::default();
+        model.insert("x".to_string(), zero_r);
+        assert_eq!(evaluate_expr(&e, &model), Some(SmtValue::Bool(true)));
     }
 
     /// smt_values_equal BigInt arms: equal bigs true, big vs big+1 false,
@@ -985,6 +1028,25 @@ mod real_eval {
         model.insert("B".to_string(), real(1, 2));
         model.insert("C".to_string(), real(1, 1));
         assert_eq!(evaluate_expr(&expr, &model), Some(SmtValue::Bool(true)));
+    }
+
+    #[test]
+    fn real_arithmetic_term_evaluates_to_its_exact_value() {
+        // A Real term in VALUE position (a head argument), not under `=`.
+        let a = ChcExpr::var(ChcVar::new("A", ChcSort::Real));
+        let mut model = FxHashMap::default();
+        model.insert("A".to_string(), real(1, 4));
+        let sum = ChcExpr::add(ChcExpr::Real(1, 2), a.clone());
+        assert_eq!(evaluate_expr(&sum, &model), Some(real(3, 4)));
+        let scaled = ChcExpr::mul(ChcExpr::Real(-2, 1), a.clone());
+        assert_eq!(evaluate_expr(&scaled, &model), Some(real(-1, 2)));
+        // Division by zero still abstains; Int-only terms keep the i128 lane.
+        let by_zero = ChcExpr::Op(ChcOp::Div, vec![Arc::new(a), Arc::new(ChcExpr::Real(0, 1))]);
+        assert_eq!(evaluate_expr(&by_zero, &model), None);
+        model.insert("N".to_string(), SmtValue::Int(i128::MAX));
+        let n = ChcExpr::var(ChcVar::new("N", ChcSort::Int));
+        let overflow = ChcExpr::Op(ChcOp::Add, vec![Arc::new(n), Arc::new(ChcExpr::Int(1))]);
+        assert_eq!(evaluate_expr(&overflow, &model), None);
     }
 
     #[test]

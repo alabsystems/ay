@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const a (_ BitVec 8))
+(declare-const b (_ BitVec 8))
+(assert (not (= (ite (not (= (bvmul ((_ sign_extend 8) a) ((_ sign_extend 8) b)) ((_ sign_extend 8) (bvmul a b)))) (_ bv1 1) (_ bv0 1)) (ite (not (= ((_ extract 15 8) (bvmul ((_ sign_extend 8) a) ((_ sign_extend 8) b))) (bvashr (bvmul a b) (_ bv7 8)))) (_ bv1 1) (_ bv0 1)))))
+(check-sat)
+(exit)

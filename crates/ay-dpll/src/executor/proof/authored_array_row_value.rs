@@ -120,7 +120,7 @@ impl Executor {
                 .ctx
                 .terms
                 .mk_app(Symbol::named("="), [left, right], Sort::Bool);
-            if ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[equality]) {
+            if self.recognize_bv_bitblast_until_stopped(&[equality]) {
                 let step = candidate.add_theory_lemma_with_kind(
                     "bv",
                     vec![equality],
@@ -198,7 +198,7 @@ impl Executor {
             .terms
             .mk_app(Symbol::named("="), [left, right], Sort::Bool);
         let disequality = self.ctx.terms.mk_not_raw(equality);
-        if ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[disequality]) {
+        if self.recognize_bv_bitblast_until_stopped(&[disequality]) {
             let step = candidate.add_theory_lemma_with_kind(
                 "bv",
                 vec![disequality],
@@ -246,7 +246,7 @@ impl Executor {
                     .terms
                     .mk_app(Symbol::named("="), [anchor_left, anchor_right], Sort::Bool);
             let anchor_disequality = self.ctx.terms.mk_not_raw(anchor_equality);
-            if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[anchor_disequality]) {
+            if !self.recognize_bv_bitblast_until_stopped(&[anchor_disequality]) {
                 break 'anchor;
             }
 
@@ -308,7 +308,7 @@ impl Executor {
             {
                 continue;
             }
-            if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[inner, disequality]) {
+            if !self.recognize_bv_bitblast_until_stopped(&[inner, disequality]) {
                 continue;
             }
             let lemma = candidate.add_theory_lemma_with_kind(

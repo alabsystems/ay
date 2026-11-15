@@ -19,6 +19,7 @@ tracing.workspace = true
 [dev-dependencies]
 ay-test-support.workspace = true
 criterion.workspace = true
+ay-criterion-main.workspace = true
 proptest.workspace = true
 serial_test.workspace = true
 

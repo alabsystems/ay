@@ -12,6 +12,9 @@ impl ChcProblem {
     pub(crate) fn try_scalarize_int_indexed_const_array_selects_with_map(
         &mut self,
     ) -> Option<ArrayScalarizationMap> {
+        if self.has_array_lambda() {
+            return None;
+        }
         let mut index_map: FxHashMap<ChcSort, FxHashSet<ConstIndex>> = FxHashMap::default();
         let mut symbolic_sorts: FxHashSet<ChcSort> = FxHashSet::default();
         for clause in &self.clauses {
@@ -47,6 +50,9 @@ impl ChcProblem {
     pub(crate) fn try_scalarize_property_directed_with_map(
         &mut self,
     ) -> Option<ArrayScalarizationMap> {
+        if self.has_array_lambda() {
+            return None;
+        }
         let mut index_map: FxHashMap<ChcSort, FxHashSet<ConstIndex>> = FxHashMap::default();
         for clause in self.clauses.iter().filter(|c| c.is_query()) {
             if let Some(c) = &clause.body.constraint {
@@ -259,6 +265,10 @@ impl ChcProblem {
         extra_indices: &[(ChcSort, ChcExpr)],
         drop_symbolic_key_sorts: bool,
     ) -> Option<ArrayScalarizationMap> {
+        let has_lambda = self.has_array_lambda();
+        if drop_symbolic_key_sorts && has_lambda {
+            return None;
+        }
         let mut index_map: FxHashMap<ChcSort, FxHashSet<ConstIndex>> = FxHashMap::default();
         let mut symbolic_sorts: FxHashSet<ChcSort> = FxHashSet::default();
         for clause in &self.clauses {
@@ -293,8 +303,44 @@ impl ChcProblem {
                     .insert(const_index);
             }
         }
+        // A preceding transform can fold every `select` at a constant index
+        // away (constant propagation over a ground array turns the query
+        // read into a literal), leaving no select from which to learn the
+        // tracked cells. The constant `store` indices that produced those
+        // ground values identify the same cells, so use them only for key
+        // sorts that no select (or caller-supplied extra index) covered.
+        // Select-driven scalarization is unchanged whenever it has indices.
+        let mut store_index_map: FxHashMap<ChcSort, FxHashSet<ConstIndex>> = FxHashMap::default();
+        for clause in &self.clauses {
+            if let Some(c) = &clause.body.constraint {
+                Self::collect_const_store_indices(c, &mut store_index_map);
+            }
+            for (_, args) in &clause.body.predicates {
+                for arg in args {
+                    Self::collect_const_store_indices(arg, &mut store_index_map);
+                }
+            }
+            if let ClauseHead::Predicate(_, args) = &clause.head {
+                for arg in args {
+                    Self::collect_const_store_indices(arg, &mut store_index_map);
+                }
+            }
+        }
+        for (key_sort, indices) in store_index_map {
+            if drop_symbolic_key_sorts && symbolic_sorts.contains(&key_sort) {
+                continue;
+            }
+            index_map.entry(key_sort).or_insert(indices);
+        }
         if index_map.is_empty() {
             return None;
+        }
+        if has_lambda {
+            self.admit_lambda_observations(
+                &index_map,
+                crate::expr::MAX_PREPROCESSING_NODES,
+                crate::smt::smt_deadline_expired,
+            )?;
         }
         Some(self.apply_scalarization(index_map))
     }
@@ -321,7 +367,11 @@ impl ChcProblem {
             for (arg_idx, sort) in pred.arg_sorts.iter().enumerate() {
                 if Self::is_scalarizable_array_sort(sort) {
                     let key_sort = Self::array_key_sort(sort).expect("checked above");
-                    let val_sort = Self::array_value_sort(sort).expect("checked above");
+                    let Some(val_sort) = Self::array_value_sort(sort) else {
+                        new_sorts.push(sort.clone());
+                        arg_map.push(ArrayScalarizedArg::Original(arg_idx));
+                        continue;
+                    };
                     if let Some(indices) = sorted_index_map.get(key_sort) {
                         if indices.is_empty() {
                             new_sorts.push(sort.clone());
@@ -409,6 +459,19 @@ impl ChcProblem {
         match expr {
             ChcExpr::Int(k) => Some(ConstIndex::Int(*k)),
             ChcExpr::BitVec(v, w) => Some(ConstIndex::BitVec(*v, *w)),
+            ChcExpr::Op(ChcOp::BvAdd | ChcOp::BvSub, args) if args.len() == 2 => {
+                // Keep the same bounded, DAG-aware constant folding used by
+                // the verifier. In particular, it checks operand widths and
+                // performs modular arithmetic rather than truncating an
+                // ill-typed or wider-than-u128 operation into a tracked key.
+                let folded = expr.simplify_constants_checked(crate::smt::smt_deadline_expired)?;
+                match &folded {
+                    ChcExpr::BitVec(value, width) if (1..=128).contains(width) => {
+                        Some(ConstIndex::BitVec(*value, *width))
+                    }
+                    _ => None,
+                }
+            }
             ChcExpr::Op(ChcOp::BvConcat, args) if args.len() == 2 => {
                 let hi = Self::try_eval_const_index(&args[0])?;
                 let lo = Self::try_eval_const_index(&args[1])?;
@@ -441,86 +504,75 @@ impl ChcProblem {
         }
     }
 
+    /// Set-valued collector over nodes: each distinct shared node is visited
+    /// once (WP-F F0b), in the tree walk's first-occurrence order.
     fn collect_const_array_select_indices(
         expr: &ChcExpr,
         index_map: &mut FxHashMap<ChcSort, FxHashSet<ConstIndex>>,
     ) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
-                let arr_sort = args[0].sort();
-                if Self::is_scalarizable_array_sort(&arr_sort) {
-                    if let Some(ci) = Self::try_eval_const_index(&args[1]) {
-                        let key_sort = Self::array_key_sort(&arr_sort)
-                            .expect("checked above")
-                            .clone();
-                        if let Some(ci) = ci.coerce_to_sort(&key_sort) {
-                            index_map.entry(key_sort).or_default().insert(ci);
+        crate::expr::dag::walk_distinct_preorder(expr, |node| {
+            if let ChcExpr::Op(ChcOp::Select, args) = node {
+                if args.len() == 2 {
+                    let arr_sort = args[0].sort();
+                    if Self::is_scalarizable_array_sort(&arr_sort) {
+                        if let Some(ci) = Self::try_eval_const_index(&args[1]) {
+                            let key_sort = Self::array_key_sort(&arr_sort)
+                                .expect("checked above")
+                                .clone();
+                            if let Some(ci) = ci.coerce_to_sort(&key_sort) {
+                                index_map.entry(key_sort).or_default().insert(ci);
+                            }
                         }
                     }
                 }
-                for a in args {
-                    Self::collect_const_array_select_indices(a, index_map);
-                }
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_const_array_select_indices(a, index_map);
-                }
-            }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                for a in args {
-                    Self::collect_const_array_select_indices(a, index_map);
-                }
-            }
-            ChcExpr::ConstArray(_ks, val) => {
-                Self::collect_const_array_select_indices(val, index_map);
-            }
-            ChcExpr::Bool(_)
-            | ChcExpr::Int(_)
-            | ChcExpr::BitVec(_, _)
-            | ChcExpr::Real(_, _)
-            | ChcExpr::Var(_)
-            | ChcExpr::ConstArrayMarker(_)
-            | ChcExpr::IsTesterMarker(_) => {}
+            crate::expr::dag::Step::Descend
         });
     }
 
+    /// See [`Self::collect_const_array_select_indices`] (same DAG walk), for
+    /// constant `store` indices instead of `select` indices.
+    fn collect_const_store_indices(
+        expr: &ChcExpr,
+        index_map: &mut FxHashMap<ChcSort, FxHashSet<ConstIndex>>,
+    ) {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| {
+            if let ChcExpr::Op(ChcOp::Store, args) = node {
+                if args.len() == 3 {
+                    let arr_sort = args[0].sort();
+                    if Self::is_scalarizable_array_sort(&arr_sort) {
+                        if let Some(ci) = Self::try_eval_const_index(&args[1]) {
+                            let key_sort = Self::array_key_sort(&arr_sort)
+                                .expect("checked above")
+                                .clone();
+                            if let Some(ci) = ci.coerce_to_sort(&key_sort) {
+                                index_map.entry(key_sort).or_default().insert(ci);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::expr::dag::Step::Descend
+        });
+    }
+
+    /// See [`Self::collect_const_array_select_indices`] (same DAG walk).
     fn collect_symbolic_select_key_sorts(expr: &ChcExpr, symbolic_sorts: &mut FxHashSet<ChcSort>) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
-                let arr_sort = args[0].sort();
-                if Self::is_scalarizable_array_sort(&arr_sort)
-                    && Self::try_eval_const_index(&args[1]).is_none()
-                {
-                    let key_sort = Self::array_key_sort(&arr_sort)
-                        .expect("checked above")
-                        .clone();
-                    symbolic_sorts.insert(key_sort);
-                }
-                for a in args {
-                    Self::collect_symbolic_select_key_sorts(a, symbolic_sorts);
-                }
-            }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_symbolic_select_key_sorts(a, symbolic_sorts);
+        crate::expr::dag::walk_distinct_preorder(expr, |node| {
+            if let ChcExpr::Op(ChcOp::Select, args) = node {
+                if args.len() == 2 {
+                    let arr_sort = args[0].sort();
+                    if Self::is_scalarizable_array_sort(&arr_sort)
+                        && Self::try_eval_const_index(&args[1]).is_none()
+                    {
+                        let key_sort = Self::array_key_sort(&arr_sort)
+                            .expect("checked above")
+                            .clone();
+                        symbolic_sorts.insert(key_sort);
+                    }
                 }
             }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                for a in args {
-                    Self::collect_symbolic_select_key_sorts(a, symbolic_sorts);
-                }
-            }
-            ChcExpr::ConstArray(_ks, val) => {
-                Self::collect_symbolic_select_key_sorts(val, symbolic_sorts);
-            }
-            ChcExpr::Bool(_)
-            | ChcExpr::Int(_)
-            | ChcExpr::BitVec(_, _)
-            | ChcExpr::Real(_, _)
-            | ChcExpr::Var(_)
-            | ChcExpr::ConstArrayMarker(_)
-            | ChcExpr::IsTesterMarker(_) => {}
+            crate::expr::dag::Step::Descend
         });
     }
 
@@ -538,7 +590,7 @@ impl ChcProblem {
                         out.push(Self::scalarize_expr(arg, index_map));
                     } else {
                         for idx in indices {
-                            out.push(Self::scalar_value_at_index(arg, idx, sort));
+                            out.push(Self::scalar_value_at_index(arg, idx, sort, index_map));
                         }
                     }
                 } else {
@@ -579,17 +631,30 @@ impl ChcProblem {
         array_expr: &ChcExpr,
         index: &ConstIndex,
         array_sort: &ChcSort,
+        index_map: &FxHashMap<ChcSort, Vec<ConstIndex>>,
     ) -> ChcExpr {
         crate::expr::maybe_grow_expr_stack(|| match array_expr {
             ChcExpr::Var(v) if Self::is_scalarizable_array_sort(&v.sort) => {
                 ChcExpr::Var(Self::scalar_var_for_array(v, index))
             }
             ChcExpr::Op(ChcOp::Store, args) if args.len() == 3 => {
-                let cond = ChcExpr::eq(args[1].as_ref().clone(), index.to_expr());
-                let then_ = args[2].as_ref().clone();
-                let else_ = Self::scalar_value_at_index(&args[0], index, array_sort);
+                let cond = ChcExpr::eq(Self::scalarize_expr(&args[1], index_map), index.to_expr());
+                let then_ = Self::scalarize_expr(&args[2], index_map);
+                let else_ = Self::scalar_value_at_index(&args[0], index, array_sort, index_map);
                 ChcExpr::ite(cond, then_, else_)
             }
+            ChcExpr::ArrayLambda(lambda) => lambda
+                .instantiate(index.to_expr())
+                .map(|value| {
+                    let value = value.simplify_array_ops().simplify_constants();
+                    Self::scalarize_expr(&value, index_map)
+                })
+                .unwrap_or_else(|| ChcExpr::select(array_expr.clone(), index.to_expr())),
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => ChcExpr::ite(
+                Self::scalarize_expr(&args[0], index_map),
+                Self::scalar_value_at_index(&args[1], index, array_sort, index_map),
+                Self::scalar_value_at_index(&args[2], index, array_sort, index_map),
+            ),
             ChcExpr::ConstArray(_ks, val) => (**val).clone(),
             _ => ChcExpr::select(array_expr.clone(), index.to_expr()),
         })
@@ -597,6 +662,15 @@ impl ChcProblem {
 
     fn scalarize_expr(expr: &ChcExpr, index_map: &FxHashMap<ChcSort, Vec<ConstIndex>>) -> ChcExpr {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => ChcExpr::ArrayLambda(
+                lambda.with_captures(
+                    lambda
+                        .captures()
+                        .iter()
+                        .map(|value| std::sync::Arc::new(Self::scalarize_expr(value, index_map)))
+                        .collect(),
+                ),
+            ),
             ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
                 expr.clone()
             }
@@ -626,7 +700,9 @@ impl ChcProblem {
                             .get(key_sort)
                             .is_some_and(|indices| indices.contains(&ci))
                         {
-                            return Self::scalar_value_at_index(&args[0], &ci, &arr_sort);
+                            return Self::scalar_value_at_index(
+                                &args[0], &ci, &arr_sort, index_map,
+                            );
                         }
                     }
                 }
@@ -659,7 +735,9 @@ impl ChcProblem {
 
         let mut out = Vec::new();
         for c in &conjuncts {
-            if let Some(expanded) = Self::scalarize_store_equality(c, index_map) {
+            if let Some(expanded) = Self::scalarize_const_array_equality(c, index_map) {
+                out.extend(expanded);
+            } else if let Some(expanded) = Self::scalarize_store_equality(c, index_map) {
                 out.extend(expanded);
             } else {
                 out.push(Self::scalarize_expr(c, index_map));
@@ -673,6 +751,58 @@ impl ChcProblem {
         ChcExpr::and_all(out)
             .simplify_array_ops()
             .simplify_constants()
+    }
+
+    /// Observe a constant array or a closed scalar lambda at every tracked
+    /// index. Lambda equality is an abstraction: SAFE still requires validation
+    /// on the original full-array clauses by the caller's certified route.
+    /// Constant propagation introduces exactly these ground pinning
+    /// equalities in clause bodies; leaving the full array equality behind
+    /// makes an otherwise scalarizable clause retain an array term, so PDR
+    /// falls back to its much weaker native-array search.
+    fn scalarize_const_array_equality(
+        conjunct: &ChcExpr,
+        index_map: &FxHashMap<ChcSort, Vec<ConstIndex>>,
+    ) -> Option<Vec<ChcExpr>> {
+        let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let (array_var, const_array) = match (args[0].as_ref(), args[1].as_ref()) {
+            (ChcExpr::Var(var), rhs @ (ChcExpr::ConstArray(..) | ChcExpr::ArrayLambda(_)))
+            | (rhs @ (ChcExpr::ConstArray(..) | ChcExpr::ArrayLambda(_)), ChcExpr::Var(var))
+                if Self::is_scalarizable_array_sort(&var.sort) && rhs.sort() == var.sort =>
+            {
+                (var, rhs)
+            }
+            _ => return None,
+        };
+        let key_sort = Self::array_key_sort(&array_var.sort)?;
+        let indices = index_map.get(key_sort)?;
+        if indices.is_empty() {
+            return None;
+        }
+        Some(
+            indices
+                .iter()
+                .map(|index| {
+                    ChcExpr::eq(
+                        ChcExpr::Var(Self::scalar_var_for_array(array_var, index)),
+                        Self::scalarize_expr(
+                            &Self::scalar_value_at_index(
+                                const_array,
+                                index,
+                                &array_var.sort,
+                                index_map,
+                            ),
+                            index_map,
+                        ),
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn scalarize_store_equality(
@@ -727,7 +857,7 @@ impl ChcProblem {
         let mut out = Vec::new();
         for k in indices {
             let next_k = ChcExpr::Var(Self::scalar_var_for_array(next_arr, k));
-            let base_k = Self::scalar_value_at_index(store_base, k, &base_sort);
+            let base_k = Self::scalar_value_at_index(store_base, k, &base_sort, index_map);
             out.push(ChcExpr::or(
                 ChcExpr::not(ChcExpr::eq(idx_expr.clone(), k.to_expr())),
                 ChcExpr::eq(next_k.clone(), val_expr.clone()),
@@ -744,3 +874,8 @@ impl ChcProblem {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lambda_tests;
+
+mod lambda;

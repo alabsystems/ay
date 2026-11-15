@@ -4,7 +4,7 @@
 
 use std::process::Command;
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -42,26 +42,22 @@ fn run_pb_solve(args: &[&str], file: &NamedTempFile) -> (std::process::ExitStatu
     )
 }
 
+/// The checker for this suite, or `None` when the machine has none.
+///
+/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` (scrub
+/// log, 2026-07-18) records keeping `/tmp/veripb-3/bin/veripb` in as "the
+/// neutral candidate". Neutral it is — machine-independent, so it survives into
+/// a public snapshot — but neutral is not IDENTIFIED: nothing in this repo
+/// builds that path and its name records no commit and no patch. Neither does
+/// `$VERIPB_BIN`, and neither does `$PATH`. None of the three was put to a
+/// single probe here, and this file's assertions are of the form "the checker
+/// ACCEPTED ay's proof", which an unsound checker satisfies for free.
+///
+/// The ONE resolver keeps all three candidates and makes each earn it: the
+/// self-test battery, then the twenty-two committed fixtures on which published
+/// VeriPB 3.0.2 contradicts the truth.
 fn find_local_veripb() -> Option<PathBuf> {
-    for var in ["AY_PB26_VERIPB_BIN", "VERIPB_BIN", "VERIPB"] {
-        if let Some(candidate) = env::var_os(var).map(PathBuf::from) {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    for candidate in [Path::new("/tmp/veripb-3/bin/veripb")] {
-        if candidate.is_file() {
-            return Some(candidate.to_path_buf());
-        }
-    }
-
-    env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|dir| dir.join("veripb"))
-        .find(|candidate| candidate.is_file())
+    ay_test_support::veripb::optional_checker("pb26_cli_output")
 }
 
 fn verify_proof_with_local_veripb(test_name: &str, opb_path: &Path, proof_path: &Path) {

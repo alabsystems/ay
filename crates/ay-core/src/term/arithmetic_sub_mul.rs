@@ -10,7 +10,104 @@
 use super::*;
 use num_traits::One;
 
+/// Recursive constructor reentry can alternate between raw `+`, `*`, and
+/// negation even though each individual addition DAG is handled iteratively.
+/// Above this chain length, retain an exact compact product instead.
+const MAX_MUL_ARITHMETIC_ALTERNATIONS: usize = 128;
+
 impl TermStore {
+    /// A DAG-memoized postorder bound on arithmetic constructor reentry.
+    /// Consecutive `+` nodes have no transition cost, so even a very deep
+    /// pure addition chain can use the iterative distributor below.
+    fn mul_reentry_within_budget(&self, root: TermId) -> bool {
+        let mut completed: crate::kani_compat::DetHashMap<TermId, usize> =
+            crate::kani_compat::det_hash_map_new();
+        let mut pending = vec![(root, false)];
+        while let Some((node, expanded)) = pending.pop() {
+            if completed.contains_key(&node) {
+                continue;
+            }
+            let (kind, children) = match self.get(node) {
+                TermData::App(Symbol::Named(name), args)
+                    if matches!(name.as_str(), "+" | "*" | "-") =>
+                {
+                    (name.as_str(), args.clone())
+                }
+                _ => {
+                    completed.insert(node, 0);
+                    continue;
+                }
+            };
+            if !expanded {
+                pending.push((node, true));
+                for &child in children.iter().rev() {
+                    if !completed.contains_key(&child) {
+                        pending.push((child, false));
+                    }
+                }
+                continue;
+            }
+            let mut changes = 0usize;
+            for child in children {
+                let child_kind = match self.get(child) {
+                    TermData::App(Symbol::Named(name), _)
+                        if matches!(name.as_str(), "+" | "*" | "-") =>
+                    {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                };
+                let transition = usize::from(child_kind.is_some_and(|other| other != kind));
+                changes = changes.max(completed[&child] + transition);
+            }
+            if changes > MAX_MUL_ARITHMETIC_ALTERNATIONS {
+                return false;
+            }
+            completed.insert(node, changes);
+        }
+        true
+    }
+
+    /// Distribute one fixed coefficient over an addition DAG in postorder.
+    /// Each distinct input node is built once; duplicate edges reuse the
+    /// hash-consed result. Children complete left-to-right, so an ordinary
+    /// tree interns in the same order as the former recursive constructor.
+    /// An explicit stack avoids recursion on deep raw addition chains.
+    fn mk_mul_distribute_const_add_dag(&mut self, coefficient: TermId, root: TermId) -> TermId {
+        let mut completed: crate::kani_compat::DetHashMap<TermId, TermId> =
+            crate::kani_compat::det_hash_map_new();
+        let mut pending = vec![(root, false)];
+        while let Some((node, expanded)) = pending.pop() {
+            if completed.contains_key(&node) {
+                continue;
+            }
+            let children = match self.get(node) {
+                TermData::App(Symbol::Named(name), args) if name == "+" && args.len() >= 2 => {
+                    Some(args.clone())
+                }
+                _ => None,
+            };
+            let Some(children) = children else {
+                completed.insert(node, self.mk_mul(vec![coefficient, node]));
+                continue;
+            };
+            if !expanded {
+                pending.push((node, true));
+                for &child in children.iter().rev() {
+                    if !completed.contains_key(&child) {
+                        pending.push((child, false));
+                    }
+                }
+                continue;
+            }
+            // Every child frame, including a repeated/shared edge, completes
+            // before this expanded frame. Thus all lookups are present.
+            let products: Vec<TermId> = children.iter().map(|child| completed[child]).collect();
+            completed.insert(node, self.mk_add(products));
+        }
+        completed[&root]
+    }
+
     /// Create subtraction with constant folding and normalization to addition form
     ///
     /// Converts binary subtraction to addition: (a - b) -> (+ a (- b))
@@ -281,14 +378,17 @@ impl TermStore {
                         return self.mk_int(BigInt::from(-1));
                     }
                     if result_args.len() == 1 {
-                        return self.mk_neg(result_args[0]);
+                        if self.mul_reentry_within_budget(result_args[0]) {
+                            return self.mk_neg(result_args[0]);
+                        }
+                        result_args.push(self.mk_int(BigInt::from(-1)));
+                    } else {
+                        // (* -1 a b) -> (- (* a b))
+                        let inner_mul = self.mk_mul(result_args);
+                        return self.mk_neg(inner_mul);
                     }
-                    // (* -1 a b) -> (- (* a b))
-                    let inner_mul = self.mk_mul(result_args);
-                    return self.mk_neg(inner_mul);
-                }
-                // Identity: don't add 1 to the product
-                if !const_product_int.is_one() {
+                } else if !const_product_int.is_one() {
+                    // Identity: don't add 1 to the product.
                     result_args.push(self.mk_int(const_product_int));
                 }
             } else if sort == Sort::Real {
@@ -302,14 +402,17 @@ impl TermStore {
                         return self.mk_rational(BigRational::from(BigInt::from(-1)));
                     }
                     if result_args.len() == 1 {
-                        return self.mk_neg(result_args[0]);
+                        if self.mul_reentry_within_budget(result_args[0]) {
+                            return self.mk_neg(result_args[0]);
+                        }
+                        result_args.push(self.mk_rational(BigRational::from(BigInt::from(-1))));
+                    } else {
+                        // (* -1 a b) -> (- (* a b))
+                        let inner_mul = self.mk_mul(result_args);
+                        return self.mk_neg(inner_mul);
                     }
-                    // (* -1 a b) -> (- (* a b))
-                    let inner_mul = self.mk_mul(result_args);
-                    return self.mk_neg(inner_mul);
-                }
-                // Identity: don't add 1 to the product
-                if const_product_rat != BigRational::one() {
+                } else if const_product_rat != BigRational::one() {
+                    // Identity: don't add 1 to the product.
                     result_args.push(self.mk_rational(const_product_rat));
                 }
             }
@@ -345,19 +448,12 @@ impl TermStore {
             };
 
             if let Some((const_term, sum_term)) = const_and_sum {
-                let sum_args = match self.get(sum_term) {
-                    TermData::App(Symbol::Named(name), args) if name == "+" && args.len() >= 2 => {
-                        Some(args.clone())
+                if matches!(self.get(sum_term), TermData::App(Symbol::Named(name), args)
+                    if name == "+" && args.len() >= 2)
+                {
+                    if self.mul_reentry_within_budget(sum_term) {
+                        return self.mk_mul_distribute_const_add_dag(const_term, sum_term);
                     }
-                    _ => None,
-                };
-
-                if let Some(sum_args) = sum_args {
-                    let mut distributed = Vec::with_capacity(sum_args.len());
-                    for t in sum_args {
-                        distributed.push(self.mk_mul(vec![const_term, t]));
-                    }
-                    return self.mk_add(distributed);
                 }
             }
         }

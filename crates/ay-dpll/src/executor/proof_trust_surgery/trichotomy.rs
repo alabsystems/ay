@@ -451,7 +451,12 @@ impl Executor {
     /// for `orig` containing the term-level `ite_term = (ite cond u v)`.
     /// Fail-closed: `None` when any raw application does not intern with the
     /// exact expected shape.
-    pub(in crate::executor::proof_repair) fn build_ite_lift_connectives(
+    ///
+    /// Shared with the consequence-replay lifted-assertion promoter
+    /// (#probe-ite-lift-promoter), which emits the identical
+    /// `ite_intro`/`equiv_pos2`/`and_pos`/`ite1`/`ite2` chain over a probe
+    /// assertion, so both producers derive the branch equalities the same way.
+    pub(in crate::executor) fn build_ite_lift_connectives(
         &mut self,
         orig: TermId,
         cond: TermId,

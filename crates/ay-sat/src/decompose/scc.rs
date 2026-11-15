@@ -10,17 +10,48 @@
 //!
 //! Reference: CaDiCaL `decompose.cpp:130-356`
 
+use crate::clause_arena::ClauseArena;
 use crate::kani_compat::DetHashMap as HashMap;
 use crate::literal::Literal;
-use crate::watched::WatchedLists;
+use crate::watched::{ClauseRef, WatchedLists};
 
 use super::{Decompose, DecomposeResult, EquivChain, TRAVERSED};
+
+/// The binary implication graph, read off the watch lists of the arena's
+/// clauses.
+///
+/// A clause marked garbage keeps its literals and, until a flush, its watches.
+/// Eager subsumption marks a subsumed learned binary garbage without unlinking
+/// it, and the targeted flush (#8101) removes stale entries one literal's list
+/// at a time. A half-removed binary is an implication without its
+/// contrapositive: on SAT-COMP 5314fd6c (2026-09-14) three of them broke the
+/// graph's skew symmetry, chained the representative map and lost
+/// constraints. So an entry counts only while its clause is live, which is
+/// also what the rewrite's DRAT or VeriPB steps and the LRAT chains cite.
+#[derive(Clone, Copy)]
+pub(crate) struct BinaryGraph<'a> {
+    watches: &'a WatchedLists,
+    clauses: &'a ClauseArena,
+}
+
+impl<'a> BinaryGraph<'a> {
+    pub(crate) fn new(watches: &'a WatchedLists, clauses: &'a ClauseArena) -> Self {
+        Self { watches, clauses }
+    }
+
+    /// Whether the binary watch entry for `clause_ref` stands for a live clause.
+    #[inline]
+    fn live(&self, clause_ref: ClauseRef) -> bool {
+        let idx = clause_ref.0 as usize;
+        idx < self.clauses.len() && !self.clauses.is_dead(idx)
+    }
+}
 
 impl Decompose {
     /// Run one round of iterative Tarjan SCC on the binary implication graph.
     pub(super) fn run_round(
         &mut self,
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         num_vars: usize,
         vals: &[i8],
         frozen: &[u32],
@@ -82,7 +113,7 @@ impl Decompose {
                     }
 
                     let neg_parent = parent.negated();
-                    let wl = watches.get_watches(neg_parent);
+                    let wl = graph.watches.get_watches(neg_parent);
                     let mut pushed_child = false;
 
                     while child_pos < wl.len() {
@@ -90,6 +121,10 @@ impl Decompose {
                         child_pos += 1;
 
                         if !wl.is_binary(wi) {
+                            continue;
+                        }
+                        if !graph.live(wl.clause_ref(wi)) {
+                            self.stats.stale_binary_watches_skipped += 1;
                             continue;
                         }
 
@@ -135,7 +170,7 @@ impl Decompose {
                         // SCC root found. Pop all members.
                         self.process_scc(
                             parent,
-                            watches,
+                            graph,
                             vals,
                             frozen,
                             var_states,
@@ -166,7 +201,7 @@ impl Decompose {
     fn process_scc(
         &mut self,
         root: Literal,
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         vals: &[i8],
         frozen: &[u32],
         var_states: &[crate::solver::lifecycle::VarState],
@@ -250,7 +285,7 @@ impl Decompose {
         // CaDiCaL decompose.cpp:260-356.
         // When !need_chains, skip the expensive BFS + 118K-element allocations (#3366).
         let chains = if need_chains {
-            self.build_equiv_chains(repr, &scc_members, watches, vals, var_states)
+            self.build_equiv_chains(repr, &scc_members, graph, vals, var_states)
         } else {
             HashMap::default()
         };
@@ -293,7 +328,7 @@ impl Decompose {
         &self,
         repr: Literal,
         scc_members: &[u32],
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         vals: &[i8],
         var_states: &[crate::solver::lifecycle::VarState],
     ) -> HashMap<u32, EquivChain> {
@@ -319,9 +354,9 @@ impl Decompose {
         while let Some(next_raw) = bfs_queue.pop() {
             let next = Literal(next_raw);
             let neg_next = next.negated();
-            let wl = watches.get_watches(neg_next);
+            let wl = graph.watches.get_watches(neg_next);
             for wi in 0..wl.len() {
-                if !wl.is_binary(wi) {
+                if !wl.is_binary(wi) || !graph.live(wl.clause_ref(wi)) {
                     continue;
                 }
                 let child = wl.blocker(wi);
@@ -370,7 +405,7 @@ impl Decompose {
 
             // 2. lit_to_repr: BFS from lit to repr through binary implications,
             //    avoiding the forward-path edges to get the "other" SCC path.
-            let rev_chain = self.bfs_path_to_repr(lit, repr, &in_scc, watches, vals, var_states);
+            let rev_chain = self.bfs_path_to_repr(lit, repr, &in_scc, graph, vals, var_states);
 
             chains.insert(
                 lit_raw,
@@ -391,7 +426,7 @@ impl Decompose {
         start: Literal,
         target: Literal,
         in_scc: &[bool],
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         vals: &[i8],
         var_states: &[crate::solver::lifecycle::VarState],
     ) -> Vec<u32> {
@@ -413,9 +448,9 @@ impl Decompose {
                 break;
             }
             let neg_next = next.negated();
-            let wl = watches.get_watches(neg_next);
+            let wl = graph.watches.get_watches(neg_next);
             for wi in 0..wl.len() {
-                if !wl.is_binary(wi) {
+                if !wl.is_binary(wi) || !graph.live(wl.clause_ref(wi)) {
                     continue;
                 }
                 let child = wl.blocker(wi);

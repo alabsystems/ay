@@ -1,0 +1,39 @@
+pseudo-Boolean proof version 3.0
+% The SECOND `izip!` of `get_transitivity_substitution` truncates the same way. This order
+% declares the auxiliary variable `$z` but no `fresh_aux_1` / `fresh_aux_2`, so a one-element
+% list was zipped against two empty ones and produced NOTHING: all three instances of the
+% relation in the transitivity obligation shared the same `$z` instead of each getting its own
+% copy, and the obligation checked was not the transitivity of the order. The order used to
+% install anyway (`s VERIFIED NO CONCLUSION`); the arity check now refuses it.
+%
+% Unlike `order.pbp` and `alias.pbp` this variant is a HARDENING, not a demonstrated wrong
+% verdict: no forgery riding on the shared auxiliary variable was constructed. It is here
+% because it is the identical truncation in the identical function, and validating one list
+% while leaving the other two unchecked would be arbitrary.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 ~$z +1 u1 +1 ~v1 >= 1 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

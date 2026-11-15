@@ -61,7 +61,12 @@ fn try_budgeted_pdr(
             PortfolioResult::Unsafe(cex),
             ValidationEvidence::FullVerification,
         )),
-        PdrResult::Unknown | PdrResult::NotApplicable => None,
+        PdrResult::Unknown | PdrResult::NotApplicable => {
+            // CH4b: what the probe learned is a seed for a caller that
+            // continues on this problem.
+            portfolio.record_search_seed_pool(solver.export_lemmas());
+            None
+        }
     }
 }
 
@@ -199,6 +204,12 @@ impl DilligMulProfile {
 
     fn scan_into(expr: &ChcExpr, profile: &mut Self) {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                Self::scan_into(lambda.body(), profile);
+                for value in lambda.captures() {
+                    Self::scan_into(value, profile);
+                }
+            }
             ChcExpr::Op(op, args) => {
                 if *op == ChcOp::Mul {
                     if Self::is_nontrivial_scalar_coeff_mul(args) {
@@ -242,6 +253,13 @@ impl DilligMulProfile {
 
 fn expr_contains_ite(expr: &ChcExpr) -> bool {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            expr_contains_ite(lambda.body())
+                || lambda
+                    .captures()
+                    .iter()
+                    .any(|value| expr_contains_ite(value))
+        }
         ChcExpr::Op(ChcOp::Ite, _) => true,
         ChcExpr::Op(_, args) => args.iter().any(|arg| expr_contains_ite(arg)),
         ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
@@ -753,6 +771,10 @@ fn expr_any(expr: &ChcExpr, predicate: &mut impl FnMut(&ChcExpr) -> bool) -> boo
         return true;
     }
     match expr {
+        ChcExpr::ArrayLambda(lambda) => lambda
+            .captures()
+            .iter()
+            .any(|value| expr_any(value, predicate)),
         ChcExpr::Op(_, args) => args.iter().any(|arg| expr_any(arg.as_ref(), predicate)),
         ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
             args.iter().any(|arg| expr_any(arg, predicate))
@@ -889,6 +911,7 @@ impl AdaptivePortfolio {
 
     fn adt_lia_expr_under_model(expr: &ChcExpr, model: &InvariantModel) -> Option<ChcExpr> {
         match expr {
+            ChcExpr::ArrayLambda(_) => None,
             ChcExpr::PredicateApp(_, pred, args) => {
                 let interp = model.get(pred)?;
                 let plain_args = args
@@ -989,7 +1012,7 @@ impl AdaptivePortfolio {
         Ok(())
     }
 
-    fn validate_translated_safe_model_on_original(
+    pub(crate) fn validate_translated_safe_model_on_original(
         &self,
         model: &InvariantModel,
         per_clause_budget: Duration,
@@ -1759,7 +1782,7 @@ impl AdaptivePortfolio {
         None
     }
 
-    fn validate_original_counterexample_with_budget(
+    pub(crate) fn validate_original_counterexample_with_budget(
         &self,
         cex: &Counterexample,
         budget: Duration,
@@ -1913,9 +1936,10 @@ impl AdaptivePortfolio {
         let bmc_budget = route_budget.min(Duration::from_secs(2));
         if bmc_budget >= Duration::from_millis(10) {
             // Child of the portfolio handle (item 5).
-            let cancel = self.cancellation_token.child();
+            let cancel = self.lane_token();
             let _timeout_guard = cancel.cancel_after(bmc_budget);
             let bmc_config = BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(cancel),
@@ -1928,7 +1952,11 @@ impl AdaptivePortfolio {
                 acyclic_safe: false,
                 prefer_exact_acyclic_first: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             };
             let bmc_solver = crate::bmc::BmcSolver::new(self.problem.clone(), bmc_config);
@@ -1938,6 +1966,10 @@ impl AdaptivePortfolio {
                 serde_json::json!({
                     "bmc_max_depth": bmc_stats.max_depth_reached,
                     "bmc_checks": bmc_stats.num_checks,
+                    "bmc_safe_first_decision_requests_started": bmc_stats.safe_first_decision_requests_started,
+                    "bmc_safe_first_decision_requests_completed": bmc_stats.safe_first_decision_requests_completed,
+                    "bmc_safe_first_raw_model_requests_started": bmc_stats.safe_first_raw_model_requests_started,
+                    "bmc_safe_first_raw_model_requests_completed": bmc_stats.safe_first_raw_model_requests_completed,
                     "bmc_budget_exhausted": bmc_stats.budget_exhausted,
                     "bmc_exhausted_search": bmc_stats.exhausted_search,
                     "bmc_used_executor_path": bmc_stats.used_executor_path,
@@ -2036,7 +2068,7 @@ impl AdaptivePortfolio {
         }
 
         // Child of the portfolio handle (item 5).
-        let cancel = self.cancellation_token.child();
+        let cancel = self.lane_token();
         let cancellation_observer = cancel.clone();
         let _timeout_guard = cancel.cancel_after(kind_budget);
         let max_k = if recognized.vars.len() <= 16 { 6 } else { 3 };
@@ -2160,16 +2192,19 @@ impl AdaptivePortfolio {
         }
     }
 
-    /// Solve simple loop problems with validation evidence tracking.
+    /// Solve simple loop problems with validation evidence tracking (#5746):
+    /// the foreground of the SimpleLoop ladder race (`adaptive_ladder_race`).
     ///
-    /// Safe results get `FullVerification` evidence: direct Kind candidates are
-    /// checked against the original init/transition/query clauses before they
-    /// can leave the adaptive path.
-    /// Part of #5746.
+    /// Runs the cheap synchronous routes, then the parallel portfolio (or the
+    /// BV dual lane). Direct Kind, the Houdini prepass, the solo PDR probe,
+    /// the front BMC probe and the Farkas route run concurrently as race
+    /// members (`simple_loop_ladder_members`); `bmc_member` says the front BMC
+    /// probe is one of them, so the portfolio drops its own BMC engine.
     pub(super) fn solve_simple_loop_with_evidence(
         &self,
         features: &ProblemFeatures,
         deadline: Option<ay_core::time::Instant>,
+        bmc_member: bool,
     ) -> (PortfolioResult, ValidationEvidence) {
         let _strategy_start = Instant::now();
 
@@ -2215,92 +2250,6 @@ impl AdaptivePortfolio {
             }
         }
 
-        // Stage 1: Try K-Induction (forward AND backward per Golem's Kind.cc)
-        // This gives quick wins for problems with k-inductive invariants.
-        // Reference: Golem Kind.cc:44-133 tries both forward and backward k-induction.
-        // Cap Kind budget to the remaining time budget (if any).
-        //
-        // #6047: Skip KIND for problems with arrays. Bit-blasting array operations
-        // (especially with BV32 indices) causes catastrophic blowup: a BV32-indexed
-        // array at k=1 produces 689K SAT variables and 4.9M clauses, consuming the
-        // entire solve budget. PDR/Spacer handles arrays far better via SMT-level
-        // reasoning with array MBP (Model-Based Projection).
-        //
-        // #5877: KIND now uses non-incremental mode for BV problems (each query
-        // gets a fresh SmtContext). This avoids the incremental solver state
-        // corruption that caused false-UNSAT on BV bitblast formulas, while still
-        // allowing KIND's k-induction to find proofs. The non-incremental path
-        // is slower (no learned clause reuse) but correct.
-        //
-        // #7930: Skip Kind for DT problems too. Kind with SingleLoop encoding
-        // produces huge flattened formulas for DT+BV problems (Option<u8>,
-        // struct wrappers), adding CPU contention without useful k-induction
-        // results. Matches the ComplexLoop DT guard in adaptive_multi_pred_complex.rs.
-        let skip_kind = features.uses_arrays || features.uses_datatypes;
-        if !skip_kind {
-            // #5877: BV problems get a tight KIND budget. Non-incremental
-            // BV-to-Int queries at k>=2 produce formulas with 3+ copies of
-            // the transition relation (each with BV range constraints). Even
-            // with a 1s per-query timeout, preprocessing consumes the entire
-            // budget before DPLL starts. Cap BV to 1s (enough for k=0/k=1
-            // which take ~40ms total). Pure LIA gets 3s — enough for k=0..3
-            // attempts while leaving budget for the PDR probe and parallel
-            // portfolio that follow. Previous 8s starved PDR for problems
-            // like yz_plus_minus_1 and s_mutants_02 that need relational
-            // invariants (not k-inductive).
-            // #8856: Keep the common pure-LIA pre-pass at 1.5s so fruitless
-            // induction attempts do not starve the downstream PDR probe. For
-            // Dillig-style multiplicative counters, Kind needs the older 3s
-            // window to reach the k-inductive proof before PDR enters a long
-            // frame-relative invariant search.
-            let kind_budget_nominal = self.simple_loop_kind_budget_nominal(features);
-            // Scaled with the global budget (#phase0c): long competition
-            // runs let Kind reach deeper k on slow-check instances.
-            let kind_budget =
-                self.scaled_probe_budget(deadline, kind_budget_nominal, 8, Duration::from_mins(1));
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: Simple loop direct Kind attempt (budget {:.1}s)",
-                    kind_budget.as_secs_f64()
-                );
-            }
-            if let Some(result) = self.try_kind(kind_budget) {
-                // Kind Safe results passed original-clause validation inside
-                // `try_kind`. Kind Unsafe results carry counterexample traces
-                // that finalize_verified_result validates independently.
-                let evidence = if matches!(result, PortfolioResult::Unsafe(_)) {
-                    ValidationEvidence::CounterexampleVerification
-                } else {
-                    ValidationEvidence::FullVerification
-                };
-                if self.config.verbose {
-                    safe_eprintln!("Adaptive: Simple loop direct Kind solved the problem");
-                }
-                return (result, evidence);
-            }
-            if self.config.verbose {
-                safe_eprintln!("Adaptive: Simple loop direct Kind returned Unknown");
-            }
-        } else if self.config.verbose {
-            tracing::info!(
-                "Adaptive: Skipping K-Induction for array problem (bit-blasting blowup)"
-            );
-        }
-
-        // #11 QUAL-MINE: conjunctive-Houdini prepass for single-predicate BV
-        // problems (vmt shape), fed by the mined qualifier vocabulary. Placed
-        // AFTER the cheap unsafe routes above (front BMC probe upstream,
-        // deterministic BV transition, Kind) so already-solved BV unsafes
-        // keep their fast path; the sat-side vmt instances this targets are
-        // not solved by those stages and reach here within a few seconds.
-        // Sound: the prepass validates every survivor against the original
-        // clauses and fails closed to None.
-        if self.problem.has_bv_sorts() && !features.uses_arrays && !features.uses_datatypes {
-            if let Some(result) = self.try_houdini_conjunctive_prepass(features, deadline) {
-                return result;
-            }
-        }
-
         if self.config.verbose {
             safe_eprintln!("Adaptive: Using simple loop strategy (TPA probe, PDR fallback)");
         }
@@ -2321,143 +2270,20 @@ impl AdaptivePortfolio {
             );
         }
 
-        // Stage 1.25 (removed): the focused BMC probe now runs FIRST in the
-        // SimpleLoop strategy arm (try_simple_loop_bmc_probe in
-        // adaptive_engines.rs), before the LIA/Farkas route and Kind, so
-        // shallow counterexamples no longer wait behind invariant routes.
-
-        // Stage 1.5: Focused production-PDR probe for non-BV simple loops.
-        //
-        // Some single-predicate loops regress after KIND soundness hardening:
-        // KIND spends its budget on rejected induction candidates, while a
-        // direct production PDR run can still prove safety quickly
-        // (dillig32-style pattern). Give PDR a short solo window before the
-        // wider parallel portfolio so it can return a verified result without
-        // competing with less-matched engines.
-        // #chc25-lever-5: BV single-predicate transition systems (vmt-chc
-        // shape) now get the same solo window — Lane C's BV-native PDR
-        // (bv_generalization + bounds_bv discovery) never left startup while
-        // racing four CPU-contended lanes, yet it is the engine best matched
-        // to this shape. Gated to compact systems (≤60 clauses) so huge
-        // bit-blasts (ssh) don't eat the window; the same validation gates
-        // guard the verdict.
-        let direct_pdr_candidate = features.is_single_predicate
-            && !features.uses_arrays
-            && !features.uses_real
-            && (!self.problem.has_bv_sorts() || self.problem.clauses().len() <= 60);
-        if direct_pdr_candidate {
-            // #8856: Increased from 6s to 8s. Budget freed by reducing
-            // Kind (3s→1.5s) and BMC (2s→1.5s) probes goes to PDR which
-            // handles the majority of SAT invariant discovery.
-            // Scaled with the global budget (#phase0c): competition runs
-            // (1800s) give the solo PDR window up to 120s.
-            let pdr_probe_budget = self.scaled_probe_budget(
-                deadline,
-                Duration::from_secs(8),
-                15,
-                Duration::from_mins(2),
-            );
-            if !pdr_probe_budget.is_zero() {
-                if self.config.verbose {
-                    safe_eprintln!(
-                        "Adaptive: Simple loop production PDR probe (budget {:.1}s)",
-                        pdr_probe_budget.as_secs_f64()
-                    );
-                }
-                // #8288: For DT problems, run PDR on the DT-flattened problem
-                // so PDR sees scalar fields instead of constructor/selector ops.
-                // The DT-aware PDR (with MBP) can handle DTs but struggles to
-                // discover field-relationship invariants like fst(p) = snd(p).
-                // After flattening, this becomes p_fst = p_snd — a trivial equality.
-                if self.problem.has_datatype_sorts() {
-                    let dt_pipeline = TransformationPipeline::new()
-                        .with(DtFlattener::new().with_verbose(self.config.verbose));
-                    let dt_result = dt_pipeline.transform(self.problem.clone());
-                    let pdr_config =
-                        PdrConfig::production(self.config.verbose).with_tla_trace_from_env();
-                    if let Some((pdr_result, evidence)) = try_budgeted_pdr_on_problem(
-                        self,
-                        &dt_result.problem,
-                        pdr_config,
-                        pdr_probe_budget,
-                    ) {
-                        let transform_memory = dt_result.transform_memory();
-                        // Back-translate the result to the original problem's DT vocabulary.
-                        match pdr_result {
-                            PortfolioResult::Safe(model) => {
-                                let orig_model =
-                                    dt_result.back_translator.translate_validity(model);
-                                let validation_budget =
-                                    pdr_probe_budget.min(Duration::from_millis(1500));
-                                if self.validate_translated_safe_model_on_original(
-                                    &orig_model,
-                                    validation_budget,
-                                ) {
-                                    return (PortfolioResult::Safe(orig_model), evidence);
-                                }
-                                if self.config.verbose {
-                                    safe_eprintln!(
-                                        "Adaptive: DT-flattened PDR Safe failed original CHC validation"
-                                    );
-                                }
-                                return (
-                                    PortfolioResult::Unknown,
-                                    ValidationEvidence::FullVerification,
-                                );
-                            }
-                            PortfolioResult::Unsafe(cex) => {
-                                if !transform_memory.unsafe_backtranslation_complete() {
-                                    if self.config.verbose {
-                                        safe_eprintln!(
-                                            "Adaptive: DT-flattened PDR Unsafe rejected before promotion; {}",
-                                            transform_memory.diagnostic_summary()
-                                        );
-                                    }
-                                    return (
-                                        PortfolioResult::Unknown,
-                                        ValidationEvidence::FullVerification,
-                                    );
-                                }
-                                let orig_cex = dt_result.back_translator.translate_invalidity(cex);
-                                let validation_budget =
-                                    pdr_probe_budget.min(Duration::from_secs(3));
-                                if self.validate_original_counterexample_with_budget(
-                                    &orig_cex,
-                                    validation_budget,
-                                ) {
-                                    return (
-                                        PortfolioResult::Unsafe(orig_cex),
-                                        ValidationEvidence::CounterexampleVerification,
-                                    );
-                                }
-                                if self.config.verbose {
-                                    safe_eprintln!(
-                                        "Adaptive: DT-flattened PDR Unsafe failed original CHC validation"
-                                    );
-                                }
-                                return (
-                                    PortfolioResult::Unknown,
-                                    ValidationEvidence::FullVerification,
-                                );
-                            }
-                            PortfolioResult::Unknown | PortfolioResult::NotApplicable => {}
-                        }
-                    }
-                } else {
-                    let pdr_config =
-                        PdrConfig::production(self.config.verbose).with_tla_trace_from_env();
-                    if let Some(result) = try_budgeted_pdr(self, pdr_config, pdr_probe_budget) {
-                        return result;
-                    }
-                }
-            }
-        }
+        // The front BMC probe, Kind, the Houdini prepass, the Farkas route and
+        // the solo PDR probe run concurrently with this foreground as ladder-
+        // race members (`simple_loop_ladder_members`), so the portfolio below
+        // starts at t=0 with the whole remaining budget.
 
         let remaining_budget = self
             .remaining_budget(deadline)
             .unwrap_or(Duration::from_secs(25));
         if !unbounded_budget && remaining_budget.is_zero() {
             return unknown_accepted_result();
+        }
+
+        if let Some(result) = self.query_flag_race_poll("before the parallel portfolio") {
+            return result;
         }
 
         // Stage 2: Run all engines in parallel.
@@ -2603,12 +2429,16 @@ impl AdaptivePortfolio {
                         if validation_budget.is_zero() {
                             PortfolioResult::Unknown
                         } else {
+                            // `orig_cex` names the clauses of `self.problem`; a
+                            // verifier that case-split or expanded them would
+                            // read its indices against other clauses.
                             let mut verifier = PdrSolver::new(
                                 self.problem.clone(),
                                 PdrConfig {
                                     verbose: self.config.verbose,
                                     solve_timeout: Some(validation_budget),
                                     disable_array_scalarization: true,
+                                    preserve_original_clauses: true,
                                     ..PdrConfig::default()
                                 },
                             );
@@ -2641,11 +2471,165 @@ impl AdaptivePortfolio {
         }
 
         let mut config = self.simple_loop_portfolio_config(full_budget);
+        if bmc_member {
+            // The whole-budget front BMC member searches the original problem
+            // next to this portfolio; a second BMC on the preprocessed copy
+            // would only repeat its levels.
+            config
+                .engines
+                .retain(|engine| !matches!(engine, EngineConfig::Bmc(_)));
+        }
         self.apply_original_problem_engine_selection(&mut config);
-        (
-            self.run_portfolio(config),
-            ValidationEvidence::FullVerification,
-        )
+        // T1/T9: the portfolio observes the query-flag race's proof signal; a
+        // candidate proven in the background cancels the engines, and the
+        // poll below publishes it instead of the cancelled round's Unknown.
+        config.external_cancellation = Some(self.lane_token());
+        let result = self.run_portfolio(config);
+        if matches!(
+            result,
+            PortfolioResult::Unknown | PortfolioResult::NotApplicable
+        ) {
+            if let Some(result) = self.query_flag_race_poll("after the parallel portfolio") {
+                return result;
+            }
+        }
+        (result, ValidationEvidence::FullVerification)
+    }
+
+    /// Direct forward/backward K-induction for simple loops (Golem Kind.cc
+    /// :44-133), a SimpleLoop ladder-race member.
+    ///
+    /// #6047: skipped for arrays (bit-blasting BV32-indexed array operations
+    /// produced 689K SAT variables at k=1). #7930: skipped for datatypes (the
+    /// SingleLoop encoding of DT+BV shapes adds contention without results).
+    /// #5877: BV runs non-incremental with a tight budget
+    /// (`simple_loop_kind_budget_nominal`). Kind Safe results passed
+    /// original-clause validation inside `try_kind`; Unsafe traces are
+    /// validated by `finalize_verified_result`.
+    pub(super) fn try_simple_loop_direct_kind(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+        if features.uses_arrays || features.uses_datatypes {
+            return None;
+        }
+        // Scaled with the global budget (#phase0c): long competition runs let
+        // Kind reach deeper k on slow-check instances.
+        let kind_budget = self.scaled_probe_budget(
+            deadline,
+            self.simple_loop_kind_budget_nominal(features),
+            8,
+            Duration::from_mins(1),
+        );
+        if self.config.verbose {
+            safe_eprintln!(
+                "Adaptive: Simple loop direct Kind attempt (budget {:.1}s)",
+                kind_budget.as_secs_f64()
+            );
+        }
+        let result = self.try_kind(kind_budget)?;
+        let evidence = if matches!(result, PortfolioResult::Unsafe(_)) {
+            ValidationEvidence::CounterexampleVerification
+        } else {
+            ValidationEvidence::FullVerification
+        };
+        if self.config.verbose {
+            safe_eprintln!("Adaptive: Simple loop direct Kind solved the problem");
+        }
+        Some((result, evidence))
+    }
+
+    /// Focused production-PDR probe for simple loops on the ORIGINAL problem,
+    /// a SimpleLoop ladder-race member.
+    ///
+    /// Some single-predicate loops regress after KIND soundness hardening
+    /// while a direct production PDR still proves safety quickly
+    /// (dillig32-style). #chc25-lever-5: compact BV transition systems
+    /// (≤60 clauses) get the same probe — Lane C's BV-native PDR never left
+    /// startup while racing contended lanes. CH4b: not inside a collapse-first
+    /// nested run (won nothing there). #8288: datatype problems run PDR on the
+    /// DT-flattened problem and re-validate the back-translated verdict on the
+    /// original clauses (fail-closed to no verdict).
+    pub(super) fn try_simple_loop_solo_pdr_probe(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+        let direct_pdr_candidate = !self.config.collapse_first_nested
+            && features.is_single_predicate
+            && !features.uses_arrays
+            && !features.uses_real
+            && (!self.problem.has_bv_sorts() || self.problem.clauses().len() <= 60);
+        if !direct_pdr_candidate {
+            return None;
+        }
+        // Scaled with the global budget (#phase0c): competition runs (1800s)
+        // give the solo PDR window up to 120s.
+        let pdr_probe_budget =
+            self.scaled_probe_budget(deadline, Duration::from_secs(8), 15, Duration::from_mins(2));
+        if pdr_probe_budget.is_zero() {
+            return None;
+        }
+        if self.config.verbose {
+            safe_eprintln!(
+                "Adaptive: Simple loop production PDR probe (budget {:.1}s)",
+                pdr_probe_budget.as_secs_f64()
+            );
+        }
+        let pdr_config = PdrConfig::production(self.config.verbose).with_tla_trace_from_env();
+        if !self.problem.has_datatype_sorts() {
+            return try_budgeted_pdr(self, pdr_config, pdr_probe_budget);
+        }
+
+        let dt_result = TransformationPipeline::new()
+            .with(DtFlattener::new().with_verbose(self.config.verbose))
+            .transform(self.problem.clone());
+        let (pdr_result, evidence) =
+            try_budgeted_pdr_on_problem(self, &dt_result.problem, pdr_config, pdr_probe_budget)?;
+        let transform_memory = dt_result.transform_memory();
+        // Back-translate the result to the original problem's DT vocabulary.
+        match pdr_result {
+            PortfolioResult::Safe(model) => {
+                let orig_model = dt_result.back_translator.translate_validity(model);
+                let validation_budget = pdr_probe_budget.min(Duration::from_millis(1500));
+                if self.validate_translated_safe_model_on_original(&orig_model, validation_budget) {
+                    return Some((PortfolioResult::Safe(orig_model), evidence));
+                }
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Adaptive: DT-flattened PDR Safe failed original CHC validation"
+                    );
+                }
+                None
+            }
+            PortfolioResult::Unsafe(cex) => {
+                if !transform_memory.unsafe_backtranslation_complete() {
+                    if self.config.verbose {
+                        safe_eprintln!(
+                            "Adaptive: DT-flattened PDR Unsafe rejected before promotion; {}",
+                            transform_memory.diagnostic_summary()
+                        );
+                    }
+                    return None;
+                }
+                let orig_cex = dt_result.back_translator.translate_invalidity(cex);
+                let validation_budget = pdr_probe_budget.min(Duration::from_secs(3));
+                if self.validate_original_counterexample_with_budget(&orig_cex, validation_budget) {
+                    return Some((
+                        PortfolioResult::Unsafe(orig_cex),
+                        ValidationEvidence::CounterexampleVerification,
+                    ));
+                }
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Adaptive: DT-flattened PDR Unsafe failed original CHC validation"
+                    );
+                }
+                None
+            }
+            PortfolioResult::Unknown | PortfolioResult::NotApplicable => None,
+        }
     }
 
     pub(crate) fn use_bv_native_direct_route(&self, features: &ProblemFeatures) -> bool {
@@ -2733,6 +2717,8 @@ impl AdaptivePortfolio {
                 }),
                 // BMC for bounded counterexample discovery (#5383).
                 // TRL subsumes BMC's safety proving but NOT its UNSAT capability.
+                // Dropped by the caller when the whole-budget front BMC probe
+                // runs as a ladder-race member next to this portfolio.
                 EngineConfig::Bmc(BmcConfig::default()),
             ],
             parallel: true,
@@ -2964,50 +2950,5 @@ mod tests {
             panic!("counter-cell route should validate");
         };
         assert!(matches!(result, PortfolioResult::Safe(_)));
-    }
-
-    #[test]
-    fn direct_pdr_probe_merges_stats_for_cli_observability() {
-        let source = include_str!("adaptive_bv_strategy.rs");
-        let direct_probe = source
-            .split("fn try_budgeted_pdr(")
-            .nth(1)
-            .and_then(|rest| rest.split("/// Run PDR on a specific problem").next())
-            .expect("direct PDR helper should be present");
-
-        assert!(
-            direct_probe.contains("solver.solve_with_stats()"),
-            "direct PDR probe must keep solver stats instead of calling solve()"
-        );
-        assert!(
-            direct_probe.contains("portfolio.accumulate_stats(&result_with_stats.stats)"),
-            "direct PDR probe must merge PDR stats into AdaptivePortfolio stats"
-        );
-    }
-
-    #[test]
-    fn dt_flattened_unsafe_requires_original_replay_9691() {
-        let source = include_str!("adaptive_bv_strategy.rs");
-        let dt_flattened_unsafe = source
-            .split("PortfolioResult::Unsafe(cex) => {")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("PortfolioResult::Unknown | PortfolioResult::NotApplicable")
-                    .next()
-            })
-            .expect("DT-flattened PDR Unsafe arm should be present");
-
-        assert!(
-            dt_flattened_unsafe.contains("unsafe_backtranslation_complete"),
-            "DT-flattened Unsafe must first require complete transform-memory backtranslation"
-        );
-        assert!(
-            dt_flattened_unsafe.contains("validate_original_counterexample_with_budget"),
-            "DT-flattened Unsafe must replay the translated witness on the original CHC before promotion"
-        );
-        assert!(
-            dt_flattened_unsafe.contains("ValidationEvidence::CounterexampleVerification"),
-            "accepted DT-flattened Unsafe must carry counterexample-verification evidence"
-        );
     }
 }

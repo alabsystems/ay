@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to
+% incorrect/version3/opb_two_constraints_on_one_line: the same two constraints,
+% one per line as the format requires, with an honest refutation.
+%
+% The formula is unsatisfiable, which is the point: written on one line the
+% second constraint was dropped and the remainder verified as satisfiable.
+% Written correctly, the two add to the empty contradiction.
+f 2;
+pol 1 2 +;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

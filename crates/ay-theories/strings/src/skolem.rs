@@ -198,7 +198,3 @@ impl SkolemCache {
 #[cfg(test)]
 #[path = "skolem_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "skolem_verification.rs"]
-mod verification;

@@ -664,6 +664,28 @@ fn make_deep_conjunction(depth: usize) -> ChcExpr {
     expr
 }
 
+/// ONE conjunct with more DISTINCT nodes than `MAX_CONVERSION_NODES`.
+///
+/// Since WP-F F0c, `convert_expr` memoises shared nodes and its budget counts
+/// distinct nodes, so `make_deep_conjunction` (a ~3-node-per-level DAG whose
+/// tree doubles per level) converts fine; budget-exhaustion tests need a
+/// genuinely large input. It is a single disjunction because `check_sat`
+/// converts a top-level conjunction conjunct by conjunct. Each atom
+/// `(> x_i i)` converts 3 nodes.
+fn make_budget_exceeding_disjunction() -> ChcExpr {
+    let atoms = super::context::MAX_CONVERSION_NODES / 3 + 1024;
+    ChcExpr::or_vec(
+        (0..atoms)
+            .map(|i| {
+                ChcExpr::gt(
+                    ChcExpr::var(ChcVar::new(format!("budget_x{i}"), ChcSort::Int)),
+                    ChcExpr::int(i as i64),
+                )
+            })
+            .collect(),
+    )
+}
+
 struct GlobalTermBytesGuard;
 
 impl Drop for GlobalTermBytesGuard {
@@ -683,15 +705,24 @@ fn force_global_term_memory_exceeded() -> GlobalTermBytesGuard {
 
 #[test]
 fn test_convert_expr_budget_exceeded_returns_unknown() {
-    // Build a pathologically deep expression (2^20 = 1M+ nodes).
-    // Without the budget, this would allocate gigabytes.
-    let deep = make_deep_conjunction(21);
+    // Build an expression with more distinct nodes than the conversion budget.
+    // Without the budget, this would allocate gigabytes of terms.
+    let deep = make_budget_exceeding_disjunction();
 
     let mut ctx = SmtContext::new();
     let result = ctx.check_sat(&deep);
     assert!(
         matches!(result, SmtResult::Unknown),
         "Expected Unknown for budget-exceeded expression, got {result:?}"
+    );
+    // The budget itself: converting the query directly trips it. (Inside
+    // `check_sat` a query this large is routed as datatype-indeterminate first,
+    // so its Unknown may arrive before conversion.)
+    let mut direct = SmtContext::new();
+    let _ = direct.convert_expr(&deep);
+    assert!(
+        direct.conversion_budget_exceeded(),
+        "more distinct nodes than MAX_CONVERSION_NODES must trip the budget"
     );
 }
 
@@ -715,7 +746,7 @@ fn test_convert_expr_small_expression_works() {
 #[test]
 fn test_conversion_budget_resets_between_checks() {
     // After a budget-exceeded check, subsequent small checks should succeed.
-    let deep = make_deep_conjunction(21);
+    let deep = make_budget_exceeding_disjunction();
     let x = ChcVar::new("x", ChcSort::Int);
     let small = ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(0));
 
@@ -770,7 +801,7 @@ fn test_assumption_mode_returns_unknown_when_global_term_memory_exceeded() {
 fn test_incremental_background_budget_exceeded_returns_unknown() {
     // If background conversion exceeds the expression budget, incremental queries
     // must conservatively return Unknown instead of using a partial background.
-    let deep = make_deep_conjunction(21);
+    let deep = make_budget_exceeding_disjunction();
 
     let mut smt = SmtContext::new();
     let mut inc = IncrementalQueryContext::new();
@@ -794,7 +825,7 @@ fn test_incremental_background_budget_exceeded_returns_unknown() {
 fn test_incremental_background_budget_unknown_resets_conversion_state() {
     // Unknown from background overflow should not leave `smt` stuck in
     // conversion-budget-exceeded mode for subsequent conversions.
-    let deep = make_deep_conjunction(21);
+    let deep = make_budget_exceeding_disjunction();
 
     let mut smt = SmtContext::new();
     let mut inc = IncrementalQueryContext::new();
@@ -1378,9 +1409,50 @@ fn test_incremental_modular_arithmetic_model_validity() {
 fn test_check_sat_exact_term_memory_landing_rejects_sub_refresh_growth() {
     let mut ctx = SmtContext::new();
     let exact_baseline = ctx.terms.true_memory_bytes();
+    let instance_baseline = ctx.terms.instance_term_bytes();
+    let term_baseline = ctx.terms.len();
     ctx.set_term_memory_budget(Some(exact_baseline));
     assert!(!ctx.exact_term_memory_exceeded());
+    // Warm the approximate guard before allocation, so its 64 KiB refresh
+    // window cannot accidentally make this a hot-loop rejection test.
+    assert!(!ctx.term_memory_exceeded());
 
+    // Unlike var=constant equalities, a non-singleton bound survives constant
+    // propagation and must be converted into the context's real term store.
+    let query = ChcExpr::gt(
+        ChcExpr::var(ChcVar::new("exact_smt_landing", ChcSort::Int)),
+        ChcExpr::int(0),
+    );
+    let result = ctx.check_sat(&query);
+
+    assert!(ctx.terms.len() > term_baseline);
+    let exact_growth = ctx.terms.true_memory_bytes() - exact_baseline;
+    let instance_growth = ctx.terms.instance_term_bytes() - instance_baseline;
+    assert!((1..64 * 1024).contains(&exact_growth));
+    assert!((1..64 * 1024).contains(&instance_growth));
+    assert!((1..1024).contains(&ctx.conversion_node_count));
+    assert!(!ctx.conversion_budget_exceeded());
+    assert!(!ctx.term_memory_exceeded());
+    assert!(ctx.exact_term_memory_exceeded());
+    assert!(matches!(result, SmtResult::Unknown));
+
+    let mut fresh = SmtContext::new();
+    fresh.set_term_memory_budget(None);
+    assert!(matches!(fresh.check_sat(&query), SmtResult::Sat(_)));
+}
+
+#[test]
+fn test_check_sat_exact_term_memory_allows_allocation_free_equalities() {
+    let mut ctx = SmtContext::new();
+    let exact_baseline = ctx.terms.true_memory_bytes();
+    let instance_baseline = ctx.terms.instance_term_bytes();
+    let term_baseline = ctx.terms.len();
+    ctx.set_term_memory_budget(Some(exact_baseline));
+    assert!(!ctx.exact_term_memory_exceeded());
+    assert!(!ctx.term_memory_exceeded());
+
+    // Every binding is collected and substituted before core-term conversion.
+    // The resulting model must still satisfy every original equality.
     let conjuncts: Vec<ChcExpr> = (0..64)
         .map(|index| {
             ChcExpr::eq(
@@ -1395,8 +1467,20 @@ fn test_check_sat_exact_term_memory_landing_rejects_sub_refresh_growth() {
     let query = ChcExpr::and_all(conjuncts);
     let result = ctx.check_sat(&query);
 
-    assert!(ctx.exact_term_memory_exceeded());
-    assert!(matches!(result, SmtResult::Unknown));
+    assert_eq!(ctx.terms.len(), term_baseline);
+    assert_eq!(ctx.terms.true_memory_bytes(), exact_baseline);
+    assert_eq!(ctx.terms.instance_term_bytes(), instance_baseline);
+    assert_eq!(ctx.conversion_node_count, 0);
+    assert!(!ctx.exact_term_memory_exceeded());
+    let SmtResult::Sat(model) = result else {
+        panic!("allocation-free equalities should remain SAT: {result:?}");
+    };
+    for index in 0..64 {
+        assert_eq!(
+            model.get(&format!("exact_smt_landing_{index}")),
+            Some(&SmtValue::Int(index))
+        );
+    }
 }
 
 #[test]

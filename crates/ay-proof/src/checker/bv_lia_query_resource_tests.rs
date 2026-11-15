@@ -230,6 +230,18 @@ fn owned_integer_arithmetic_preflights_magnitude_and_limb_work() {
         .expect_err("division work must be charged before computing the residue");
     assert_resource(error, "deterministic work budget");
 
+    checker.meter.work = MAX_WORK - 200;
+    let error = checker
+        .divide_bounded_ints(&dividend, &(-&divisor))
+        .expect_err("division work must be charged before computing a signed quotient");
+    assert_resource(error, "deterministic work budget");
+
+    let oversized = BigInt::one() << MAX_INTEGER_BITS;
+    let error = checker
+        .divide_bounded_ints(&oversized, &BigInt::one())
+        .expect_err("division must reject an oversized operand before arithmetic");
+    assert_resource(error, "integer magnitude");
+
     checker.meter.work = MAX_WORK - 8;
     let error = checker
         .residue_bounded_int(&dividend, 8)

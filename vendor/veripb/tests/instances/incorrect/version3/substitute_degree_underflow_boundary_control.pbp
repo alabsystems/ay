@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Byte-identical to `substitute_degree_underflow.pbp` except that the degree is `i64::MIN + 1`
+% instead of `i64::MIN`, one unit off the wrap. The substituted degree is then exactly
+% `i64::MIN`, which still fits, so no contradicting row is produced and this forgery was
+% refused by the UNFIXED checker too. That is what pins causation to the overflow rather than
+% to "large numbers confuse the checker".
+f 2;
+rup 1 x2 >= -9223372036854775807 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

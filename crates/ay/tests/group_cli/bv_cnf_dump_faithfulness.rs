@@ -732,10 +732,13 @@ fn mismatched_declared_logic_cannot_bypass_pure_qf_bv_gate() {
                 .any(|line| matches!(line.trim(), "sat" | "unsat")),
             "unsupported array formula must be rejected without a definitive verdict; stdout={stdout}; stderr={stderr}"
         );
-        assert!(
-            stdout.contains("supports pure QF_BV") || stderr.contains("supports pure QF_BV"),
-            "stdout={stdout}; stderr={stderr}"
-        );
+        // The mismatched-array script is now rejected during elaboration
+        // (`Array` is outside QF_BV's sort signature, as in z3) before the
+        // export gate runs; the declared-ABV script still reaches the gate.
+        let rejected = stdout.contains("supports pure QF_BV")
+            || stderr.contains("supports pure QF_BV")
+            || (name == "mismatched-array" && stdout.contains("unknown sort 'Array'"));
+        assert!(rejected, "stdout={stdout}; stderr={stderr}");
         assert!(!dump.exists());
     }
 }

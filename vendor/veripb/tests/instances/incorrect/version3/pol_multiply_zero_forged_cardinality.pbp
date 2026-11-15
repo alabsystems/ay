@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `pol <id> 0 *` scaled the coefficients in situ and left the
+% zero-coefficient terms behind, breaking the "no zero coefficient" invariant
+% that `all_coeff_one` reads. After `pol 1 0 * 2 +` the coefficient sum equalled
+% the term count, so `into_smallest_type` rebuilt the constraint from its
+% literals alone and forged `1 x1 1 x2 >= 2` where the true result is
+% `2 x2 >= 2`. The formula's only model is x1=0 x2=1, so the contradiction this
+% derives -- and the UNSAT conclusion -- are false. Single-digit coefficients.
+f 3 ;
+pol 1 0 * 2 + ;
+pol 4 3 + ;
+output NONE;
+conclusion UNSAT : 5 ;
+end pseudo-Boolean proof;

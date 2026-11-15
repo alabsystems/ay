@@ -90,7 +90,7 @@ fn publish_parallel_dimacs_result(
 ) {
     match result {
         SatResult::Sat(model) => {
-            crate::mark_verdict_printed();
+            crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(10));
             safe_println!("s SATISFIABLE");
             emit_dimacs_sat_model(&model);
             let _ = io::stdout().flush();
@@ -110,7 +110,7 @@ fn publish_parallel_dimacs_result(
                 fail_dimacs_certification_or_exit(reason);
             };
             validate_dimacs_unsat_publication_before_verdict(authority);
-            crate::mark_verdict_printed();
+            crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(20));
             safe_println!("s UNSATISFIABLE");
             authority.commit_after_verdict();
             let _ = io::stdout().flush();
@@ -118,7 +118,7 @@ fn publish_parallel_dimacs_result(
             std::process::exit(crate::dimacs_verdict_exit_code(20));
         }
         SatResult::Unknown => {
-            dimacs_exit_if_timed_out(None);
+            dimacs_exit_if_timed_out(None, None);
             // Same memout-honesty rule as the sequential publication arm
             // (finish_pipeline.rs): an Unknown caused by the memory budget
             // reports the memout grammar/exit code, never generic-incomplete.
@@ -133,12 +133,18 @@ fn publish_parallel_dimacs_result(
                     "c reason: incomplete (cube-and-conquer could not determine satisfiability)"
                 ),
             }
-            safe_println!("s UNKNOWN");
+            settle_unanswered_dimacs_exit();
+            if !crate::mark_verdict_printed() {
+                safe_println!("s UNKNOWN");
+            }
         }
         #[allow(unreachable_patterns)]
         _ => {
+            settle_unanswered_dimacs_exit();
             safe_eprintln!("c reason: unknown");
-            safe_println!("s UNKNOWN");
+            if !crate::mark_verdict_printed() {
+                safe_println!("s UNKNOWN");
+            }
         }
     }
 }

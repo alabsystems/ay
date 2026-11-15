@@ -1,0 +1,38 @@
+pseudo-Boolean proof version 3.0
+% NOT a forgery: `aux.pbp` with the two `fresh_aux` lists restored. A real order with one fresh
+% copy per `right` variable and one fresh copy of the auxiliary variable per instance of the
+% relation. All three lists have the declared arity, no entry aliases a `left`, `right` or `aux`
+% variable, and the order still installs -- ACCEPTED before and after.
+%
+% This is the guard against over-fixing. A validation that simply refused `def_order` blocks, or
+% that demanded lists the format does not require, would pass every negative case here and break
+% this one -- and with it every dominance-based proof AY emits.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 ~$z +1 u1 +1 ~v1 >= 1 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+      fresh_aux_1 $b1 ;
+      fresh_aux_2 $c1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

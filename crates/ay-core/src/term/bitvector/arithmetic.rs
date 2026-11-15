@@ -54,7 +54,65 @@ impl TermStore {
             }
         }
 
+        // Offset chaining: (x + c1) + c2 = x + (c1 + c2), mod 2^width.
+        let (outer_const, other) = match (self.get_bitvec(a), self.get_bitvec(b)) {
+            (None, Some((c2, _))) => (Some(c2.clone()), a),
+            (Some((c2, _)), None) => (Some(c2.clone()), b),
+            _ => (None, a),
+        };
+        if let Some(c2) = outer_const {
+            if let Some((x, c1)) = self.bv_const_offset_parts("bvadd", other) {
+                let sum = self.mk_bitvec(Self::bv_mask(&(c1 + c2), width), width);
+                return self.mk_bvadd(vec![x, sum]);
+            }
+        } else if self.get_bv_width(b) == Some(width) {
+            // In Z/(2^width), move a nested constant to the outermost sum so
+            // equivalent array indices share an offset. Keep the relative
+            // order of symbolic terms: (c + x) + y becomes (x + y) + c.
+            // Each rewrite removes a constant from below a symbolic addition;
+            // the offset chaining above combines constants when both sides
+            // carry one, including overflow back to zero.
+            for (offset, other, left) in [(a, b, true), (b, a, false)] {
+                if let Some((x, c)) = self.bv_const_offset_parts("bvadd", offset) {
+                    let sum = if left {
+                        self.mk_bvadd(vec![x, other])
+                    } else {
+                        self.mk_bvadd(vec![other, x])
+                    };
+                    let constant = self.mk_bitvec(c, width);
+                    return self.mk_bvadd(vec![sum, constant]);
+                }
+            }
+        }
+
         self.mk_bv_binary_app("bvadd", args, width)
+    }
+
+    /// Split `op(x, c)` into `(x, c)` when `c` is a constant; for the
+    /// commutative `bvadd`, `op(c, x)` splits the same way.
+    fn bv_const_offset_parts(&self, op: &str, term: TermId) -> Option<(TermId, BigInt)> {
+        let TermData::App(Symbol::Named(name), args) = self.get(term) else {
+            return None;
+        };
+        let &[x, c] = args.as_slice() else {
+            return None;
+        };
+        if name != op {
+            return None;
+        }
+        let width = self.get_bv_width(term)?;
+        if self.get_bv_width(x) != Some(width) || self.get_bv_width(c) != Some(width) {
+            return None;
+        }
+        if let Some((value, _)) = self.get_bitvec(c) {
+            return Some((x, value.clone()));
+        }
+        if op == "bvadd" {
+            if let Some((value, _)) = self.get_bitvec(x) {
+                return Some((c, value.clone()));
+            }
+        }
+        None
     }
 
     /// Create bitvector subtraction with constant folding and simplifications
@@ -86,6 +144,17 @@ impl TermStore {
         // Self-subtraction: x - x = 0
         if a == b {
             return self.mk_bitvec(BigInt::zero(), width);
+        }
+
+        // Offset chaining: (x - c1) - c2 = x - (c1 + c2), mod 2^width. Without
+        // it, instantiating `f(y) = f(y - 1)` at `y := x - 1` mints
+        // `x - 1 - 1` instead of the `x - 2` a sibling instance already has.
+        if let Some((c2, _)) = self.get_bitvec(b) {
+            let c2 = c2.clone();
+            if let Some((x, c1)) = self.bv_const_offset_parts("bvsub", a) {
+                let sum = self.mk_bitvec(Self::bv_mask(&(c1 + c2), width), width);
+                return self.mk_bvsub(vec![x, sum]);
+            }
         }
 
         self.mk_bv_binary_app("bvsub", args, width)

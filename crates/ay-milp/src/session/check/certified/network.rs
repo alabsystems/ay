@@ -139,7 +139,7 @@ fn finish_terminal(
             proof,
         )
     };
-    RouteOutcome::finish(outcome)
+    RouteOutcome::finish_with_proof(outcome, proof)
 }
 
 /// A block-angular optimum still passes through the common evidence floor.

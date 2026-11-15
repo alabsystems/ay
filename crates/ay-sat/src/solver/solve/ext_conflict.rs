@@ -205,6 +205,13 @@ impl Solver {
             // conflicts, not reduction rounds. No-op unless the arm is armed.
             self.two_stage_periodic_decay_if_due();
             if self.should_reduce_db() {
+                // A backjump to level 0 for out-of-order units reaches the
+                // extension like the one above.
+                if self.reduce_db_backjumps_to_root() {
+                    self.materialize_lazy_reasons_through_level_for_backtrack(ext, 0);
+                    self.cold.lazy_materialization_failed = false;
+                    ext.backtrack(0);
+                }
                 self.reduce_db();
             }
         }

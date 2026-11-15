@@ -17,6 +17,9 @@ use std::ptr;
 use ay_dpll::api::TermKind;
 
 use super::quantifiers::{PatternHandle, Z3_pattern};
+#[path = "quantifier_de_bruijn_body.rs"]
+mod de_bruijn_body;
+
 use super::{
     alloc_sort, cache_symbol, cache_symbol_key, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr,
     ffi_guard_uint, lookup_ast_sort, require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context,
@@ -87,9 +90,38 @@ pub unsafe extern "C" fn Z3_get_quantifier_body(c: Z3_context, a: Z3_ast) -> Z3_
             let term =
                 require_term_ast_or_return!(ctx, a, "Z3_get_quantifier_body", "quantifier", 0);
             let children = ctx.solver.term_children(term);
-            children.first().map_or(0, |&t| term_to_ast(ctx, t))
+            let Some(&body) = children.first() else {
+                return 0;
+            };
+            // z3's body names its binders by de Bruijn index (the last binder
+            // is `(:var 0)`), so `substitute_vars` instantiates it (it was a
+            // no-op on AY's named-constant body). A body the conversion cannot
+            // rebuild is returned as it is stored.
+            let body = de_bruijn_body::de_bruijn_body(ctx, term, body).unwrap_or(body);
+            term_to_ast(ctx, body)
         })
     }
+}
+
+/// The public sort of binder `index` of `quantifier` when the C API or a
+/// parsed text recorded one (a FiniteSet binder's engine sort is its
+/// characteristic array).
+fn quantifier_bound_public_sort(
+    ctx: &super::Z3Context,
+    quantifier: ay_dpll::api::Term,
+    index: usize,
+) -> Option<ay_dpll::api::Sort> {
+    ctx.quantifier_public_bound_terms
+        .get(&quantifier)
+        .and_then(|bounds| bounds.get(index))
+        .and_then(|&bound| lookup_ast_sort(ctx, term_to_ast(ctx, bound)))
+        .cloned()
+        .or_else(|| {
+            ctx.parsed_quantifier_public_bound_sorts
+                .get(&quantifier)
+                .and_then(|sorts| sorts.get(index))
+                .cloned()
+        })
 }
 
 /// Get the number of bound variables in a quantifier.
@@ -157,7 +189,26 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_name(
                 return cache_symbol_key(ctx, symbol);
             }
             match ctx.solver.quantifier_bound_vars(term) {
-                Some(vars) if index < vars.len() => cache_symbol(ctx, vars[index].0.clone()),
+                // A binder named by a private API identity (a quantifier the
+                // evaluator or a rewrite rebuilt over the caller's constant)
+                // shows the caller's name, never `!ay.z3-const!N`.
+                // A de Bruijn binder minted under a private spelling (its name
+                // was reused at another sort, or had to avoid capture) shows
+                // the caller's symbol too: z3 shows `w`, never
+                // `!ay.z3-bound!1!w`.
+                Some(vars) if index < vars.len() => {
+                    let identity = &vars[index].0;
+                    match ctx
+                        .ffi_const_terms_by_identity
+                        .get(identity)
+                        .and_then(|bound| ctx.ffi_const_metadata.get(bound))
+                        .map(|(_, symbol)| symbol.clone())
+                        .or_else(|| ctx.ffi_decl_symbols.get(identity).cloned())
+                    {
+                        Some(symbol) => cache_symbol_key(ctx, symbol),
+                        None => cache_symbol(ctx, identity.clone()),
+                    }
+                }
                 _ => ptr::null_mut(),
             }
         })
@@ -197,19 +248,7 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_sort(
                 Some(vars) if index < vars.len() => vars[index].1.clone(),
                 _ => return ptr::null_mut(),
             };
-            let public_sort = ctx
-                .quantifier_public_bound_terms
-                .get(&term)
-                .and_then(|bounds| bounds.get(index))
-                .and_then(|&bound| lookup_ast_sort(ctx, term_to_ast(ctx, bound)))
-                .cloned()
-                .or_else(|| {
-                    ctx.parsed_quantifier_public_bound_sorts
-                        .get(&term)
-                        .and_then(|sorts| sorts.get(index))
-                        .cloned()
-                })
-                .unwrap_or(engine_sort);
+            let public_sort = quantifier_bound_public_sort(ctx, term, index).unwrap_or(engine_sort);
             alloc_sort(ctx, public_sort)
         })
     }
@@ -382,3 +421,7 @@ pub unsafe extern "C" fn Z3_get_quantifier_no_pattern_ast(
         })
     }
 }
+
+#[cfg(test)]
+#[path = "t5_p0_integration_tests.rs"]
+mod t5_p0_integration_tests;

@@ -64,4 +64,25 @@ pub enum DratCheckError {
     /// an unverified PR step.
     #[error("PR/DPR clause addition is not checkable by the DRAT (RUP/RAT) checker: {clause}")]
     UnsupportedPr { clause: String },
+
+    /// A derived clause mentions a variable outside the dense checker
+    /// envelope, so the clause cannot be represented, let alone checked.
+    #[error(
+        "variable index {variable} is outside the dense checker envelope \
+         (maximum {maximum} variables) (step {step})"
+    )]
+    VariableOutOfRange {
+        variable: usize,
+        maximum: usize,
+        step: u64,
+    },
+
+    /// A derived clause mentions a variable inside the dense checker
+    /// envelope, but the allocator refused to grow the dense arrays to cover
+    /// it, so the clause cannot be represented, let alone checked.
+    #[error(
+        "cannot allocate the dense checker arrays for variable index {variable} \
+         (step {step})"
+    )]
+    DenseAllocationFailed { variable: usize, step: u64 },
 }

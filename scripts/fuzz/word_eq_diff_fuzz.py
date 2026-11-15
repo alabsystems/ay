@@ -19,7 +19,7 @@ say sat).
 
 Usage:
   python3 scripts/fuzz/word_eq_diff_fuzz.py --count 2000 --seed 0 \
-      --ay target/debug/ay --z3 /opt/homebrew/bin/z3
+      --ay target/debug/ay --z3 z3
 
 Exit code 0 iff DISAGREE == 0 and PIN-FAIL == 0.
 """
@@ -37,6 +37,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[1]
 REPO = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
+import _z3_oracle  # noqa: E402
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
     run_captured,
@@ -254,7 +255,7 @@ def main():
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ay", default="target/debug/ay")
-    ap.add_argument("--z3", default="/opt/homebrew/bin/z3")
+    ap.add_argument("--z3", default="z3", help="z3 name or path; resolved by scripts/_z3_oracle.py")
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--keep-failures", default=None, help="dir to save disagreeing cases")
     ap.add_argument(
@@ -266,6 +267,15 @@ def main():
     args = ap.parse_args()
     if args.count <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--count and --timeout must be finite and positive")
+    # Verdicts and model pins come only from a z3 that proved it is z3, run by
+    # its path: a by-name z3 can be a refusing reroute stub (every verdict
+    # empty) or an AY drop-in (AY checked against AY).
+    try:
+        oracle = _z3_oracle.resolve_z3_spelling(args.z3)
+    except _z3_oracle.Z3Unavailable as error:
+        ap.error(f"--z3 {args.z3}: no usable z3: {error}")
+    args.z3 = oracle.path
+    print(f"z3 oracle: {oracle.identity()}", file=sys.stderr)
 
     warn_concurrent_build()
     plan = plan_solver_resources(1, label="fuzz/word_eq_diff_fuzz.py")
@@ -384,6 +394,7 @@ def main():
         "count": args.count,
         "ay_binary": args.ay,
         "z3_binary": args.z3,
+        "z3_oracle": oracle.identity(),
         "timeout_seconds": args.timeout,
         "agree": agree,
         "skip": skip,

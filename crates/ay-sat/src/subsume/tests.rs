@@ -388,6 +388,7 @@ fn test_kept_thresholds_filters_unlikely_learned() {
         tier2_lbd: 6,
         kept_glue: 8,
         kept_size: 5,
+        irredundant_only: false,
     };
     let result =
         subsumer.run_forward_subsumption(&mut clauses, &freeze_counts, &all_dirty, &vals, kept);
@@ -438,6 +439,7 @@ fn test_kept_thresholds_passes_within_bounds() {
         tier2_lbd: 6,
         kept_glue: 8,
         kept_size: 5,
+        irredundant_only: false,
     };
     let result =
         subsumer.run_forward_subsumption(&mut clauses, &freeze_counts, &all_dirty, &vals, kept);
@@ -446,5 +448,211 @@ fn test_kept_thresholds_passes_within_bounds() {
         result.subsumed.iter().any(|&(sub, _)| sub == c1),
         "tier3 learned clause within keptglue/keptsize should still be subsumed, got: {:?}",
         result.subsumed
+    );
+}
+
+/// `--sat-subsume-kissat` (`irredundant_only`): a learned ternary clause is
+/// neither subsumed nor a subsumer; a learned binary still subsumes, since
+/// Kissat's binaries are all irredundant.
+#[test]
+fn test_irredundant_only_skips_learned_non_binary_clauses() {
+    let kissat = KeptThresholds {
+        irredundant_only: true,
+        ..KeptThresholds::all_inclusive()
+    };
+    let freeze_counts = vec![0u32; 6];
+    let all_dirty = vec![true; 6];
+    let vals = vec![0i8; 12];
+
+    // Learned ternary {0,1,2} would subsume irredundant {0,1,2,3}.
+    let mut subsumer = Subsumer::new(6);
+    subsumer.check_limit = 0;
+    let mut clauses = ClauseArena::new();
+    clauses.add(&[lit(0, true), lit(1, true), lit(2, true)], true);
+    let target = clauses.add(
+        &[lit(0, true), lit(1, true), lit(2, true), lit(3, true)],
+        false,
+    );
+    let result =
+        subsumer.run_forward_subsumption(&mut clauses, &freeze_counts, &all_dirty, &vals, kissat);
+    assert!(
+        result.subsumed.is_empty(),
+        "learned ternary subsumer: {:?}",
+        result.subsumed
+    );
+    let mut subsumer = Subsumer::new(6);
+    subsumer.check_limit = 0;
+    let result = subsumer.run_forward_subsumption(
+        &mut clauses,
+        &freeze_counts,
+        &all_dirty,
+        &vals,
+        KeptThresholds::all_inclusive(),
+    );
+    assert!(result.subsumed.iter().any(|&(sub, _)| sub == target));
+
+    // A learned binary {4,5} still subsumes irredundant {4,5,0}.
+    let mut subsumer = Subsumer::new(6);
+    subsumer.check_limit = 0;
+    let mut clauses = ClauseArena::new();
+    clauses.add(&[lit(4, true), lit(5, true)], true);
+    let target = clauses.add(&[lit(4, true), lit(5, true), lit(0, true)], false);
+    let result =
+        subsumer.run_forward_subsumption(&mut clauses, &freeze_counts, &all_dirty, &vals, kissat);
+    assert!(
+        result.subsumed.iter().any(|&(sub, _)| sub == target),
+        "{:?}",
+        result.subsumed
+    );
+}
+
+/// Independent reimplementation of the legacy length-group candidate
+/// generation (Cartesian product over length groups, a-major, diagonal
+/// skipped, 200k pair cap), returning detected (subsumed, subsumer)
+/// arena pairs in legacy order. The production prepass must match this
+/// exactly while checking only occurrence-plausible pairs.
+#[cfg(feature = "jit")]
+fn legacy_simd_prepass_reference(clauses: &ClauseArena, vals: &[i8]) -> Vec<(usize, usize)> {
+    let mut clause_data: Vec<(usize, usize)> = Vec::new();
+    for idx in clauses.indices() {
+        if clauses.is_dead(idx) || clauses.is_empty_clause(idx) {
+            continue;
+        }
+        let lits = clauses.literals(idx);
+        if lits.len() < 2 || lits.len() > 20 {
+            continue;
+        }
+        let has_fixed = lits.iter().any(|lit| {
+            let li = lit.index();
+            li < vals.len() && vals[li] != 0
+        });
+        if has_fixed {
+            continue;
+        }
+        clause_data.push((idx, lits.len()));
+    }
+    if clause_data.len() < 500 {
+        return Vec::new();
+    }
+    clause_data.sort_unstable_by_key(|&(_, len)| len);
+    let n = clause_data.len();
+    let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+    let mut group_start = 0;
+    while group_start < n {
+        let group_len = clause_data[group_start].1;
+        let mut group_end = group_start + 1;
+        while group_end < n && clause_data[group_end].1 == group_len {
+            group_end += 1;
+        }
+        groups.push((group_len, group_start, group_end));
+        group_start = group_end;
+    }
+    let mut out = Vec::new();
+    let mut checked = 0usize;
+    'legacy: for (gi, &(_, a_start, a_end)) in groups.iter().enumerate() {
+        for &(_, b_start, b_end) in &groups[gi..] {
+            for a in a_start..a_end {
+                for b in b_start..b_end {
+                    if a == b {
+                        continue;
+                    }
+                    let a_lits = clauses.literals(clause_data[a].0);
+                    let b_lits = clauses.literals(clause_data[b].0);
+                    if a_lits.iter().all(|l| b_lits.contains(l)) {
+                        out.push((clause_data[b].0, clause_data[a].0));
+                    }
+                    checked += 1;
+                    if checked >= 200_000 {
+                        break 'legacy;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Occurrence-indexed candidate generation must reproduce the legacy
+/// length-group generation's detections exactly (same pairs, same
+/// order) on an under-cap database with planted subsumptions, including
+/// a duplicate pair (equal-length subsumption in both directions).
+#[cfg(feature = "jit")]
+#[test]
+fn simd_prepass_matches_legacy_generation() {
+    let mut clauses = ClauseArena::new();
+    // Planted clauses on low variables.
+    let subsumer = clauses.add(&[lit(0, true), lit(1, true), lit(2, true)], false);
+    let subsumed = clauses.add(
+        &[
+            lit(0, true),
+            lit(1, true),
+            lit(2, true),
+            lit(3, true),
+            lit(4, true),
+        ],
+        false,
+    );
+    clauses.add(&[lit(5, true), lit(6, true)], false);
+    clauses.add(
+        &[lit(5, true), lit(6, true), lit(7, true), lit(8, true)],
+        false,
+    );
+    clauses.add(&[lit(20, true), lit(21, true), lit(22, true)], false);
+    clauses.add(&[lit(20, true), lit(21, true), lit(22, true)], false);
+    // Near miss: shares literals with the subsumer but is not a superset.
+    clauses.add(&[lit(0, true), lit(1, true), lit(9, true)], false);
+    // Pad past the 500-clause threshold with clauses spread over all
+    // lengths 2..=20 on disjoint variables, keeping the legacy pair
+    // count under the 200k cap.
+    let mut var = 100u32;
+    for len in 2..=20u32 {
+        for _ in 0..27 {
+            let lits: Vec<_> = (0..len).map(|k| lit(var + k, true)).collect();
+            clauses.add(&lits, false);
+            var += len;
+        }
+    }
+    let vals = vec![0i8; 2 * (var as usize + 1)];
+    let result = simd_prepass::simd_subsume_prepass(&clauses, &vals);
+    let expected = legacy_simd_prepass_reference(&clauses, &vals);
+    assert!(
+        expected.contains(&(subsumed, subsumer)),
+        "reference itself must find the planted pair"
+    );
+    assert_eq!(result.pairs, expected);
+}
+
+/// Over the pair cap, the prepass still matches the capped legacy
+/// generation, but checks only occurrence-plausible pairs: 600 disjoint
+/// binary clauses make the legacy generation spend its whole 200k cap
+/// inside the binary group, while the occurrence index admits almost
+/// none of those pairs.
+#[cfg(feature = "jit")]
+#[test]
+fn simd_prepass_over_cap_checks_only_plausible_pairs() {
+    let mut clauses = ClauseArena::new();
+    clauses.add(&[lit(0, true), lit(1, true), lit(2, true)], false);
+    clauses.add(
+        &[
+            lit(0, true),
+            lit(1, true),
+            lit(2, true),
+            lit(3, true),
+            lit(4, true),
+        ],
+        false,
+    );
+    for i in 0..600u32 {
+        let v = 10 + 2 * i;
+        clauses.add(&[lit(v, true), lit(v + 1, true)], false);
+    }
+    let vals = vec![0i8; 2500];
+    let result = simd_prepass::simd_subsume_prepass(&clauses, &vals);
+    let expected = legacy_simd_prepass_reference(&clauses, &vals);
+    assert_eq!(result.pairs, expected);
+    assert!(
+        result.pairs_checked < 50_000,
+        "occurrence-indexed generation must stay far below the pair cap, got {}",
+        result.pairs_checked
     );
 }

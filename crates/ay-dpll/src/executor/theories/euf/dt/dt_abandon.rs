@@ -105,7 +105,7 @@ use crate::proof_tracker::ProofTrackerCheckpoint;
 /// the entry ledgers are MOVED back rather than cloned after the inner solve
 /// may have grown the corresponding structures, and a second close is a type
 /// error rather than a stale-checkpoint panic.
-pub(super) struct DtLazyEntryState {
+pub(in crate::executor::theories::euf) struct DtLazyEntryState {
     /// Entry assertion window; restored on abandon so the eager lane mines the
     /// ORIGINAL shapes (its pre-lift snapshot must not see an already-lifted
     /// list or the fuzz881 acyclicity units are lost).
@@ -173,7 +173,9 @@ impl Executor {
     /// [`Self::dt_lazy_discard_attempt`] or [`Self::dt_lazy_commit_attempt`],
     /// or the tracker's scope stack is left unbalanced (the by-value API makes
     /// a double close impossible; a leak is still the caller's to avoid).
-    pub(super) fn dt_lazy_capture_entry_state(&mut self) -> Option<DtLazyEntryState> {
+    pub(in crate::executor::theories::euf) fn dt_lazy_capture_entry_state(
+        &mut self,
+    ) -> Option<DtLazyEntryState> {
         let proof_checkpoint = self.bounded_proof_rollback_checkpoint().ok()?;
         let state = DtLazyEntryState {
             assertions: self.ctx.assertions.clone(),
@@ -205,7 +207,10 @@ impl Executor {
     /// trajectory, so drop the watermark WITHOUT truncating, and leave every
     /// other field exactly as the attempt left it. The checkpoints are dropped
     /// unused.
-    pub(super) fn dt_lazy_commit_attempt(&mut self, entry: DtLazyEntryState) {
+    pub(in crate::executor::theories::euf) fn dt_lazy_commit_attempt(
+        &mut self,
+        entry: DtLazyEntryState,
+    ) {
         while self.proof_tracker.scope_depth() > entry.proof_scope_depth {
             self.proof_tracker.commit_speculative_scope();
         }
@@ -239,7 +244,11 @@ impl Executor {
     /// remove the attempt's steps (it cannot, if an inner solve called
     /// `reset()` and cleared the scope stack under us — in which case the
     /// ledger checkpoint also reports a moved ledger).
-    pub(super) fn dt_lazy_discard_attempt(&mut self, entry: DtLazyEntryState, lane: &str) -> bool {
+    pub(in crate::executor::theories::euf) fn dt_lazy_discard_attempt(
+        &mut self,
+        entry: DtLazyEntryState,
+        lane: &str,
+    ) -> bool {
         let DtLazyEntryState {
             assertions,
             pre_lift,

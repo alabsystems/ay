@@ -1,0 +1,8 @@
+(set-logic UFNIA)
+(declare-sort V 0)
+(declare-fun P (V) Bool)
+(assert (forall ((v V)) (P v)))
+(declare-const b Int)
+(assert (> b 6))
+(assert (forall ((x Int)) (or (> b 5) (>= (* x x) 0))))
+(check-sat)

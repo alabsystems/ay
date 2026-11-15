@@ -45,6 +45,8 @@ mod diseq_swap;
 mod edge_summary;
 mod entry_failure;
 mod expr;
+#[path = "blocking/reachability/single_body/fact_names.rs"]
+mod fact_names;
 mod helpers;
 mod hyperedge;
 pub(super) mod inductiveness;
@@ -56,6 +58,8 @@ mod model_building;
 mod must_reachability;
 pub(super) mod prop_solver;
 mod solve;
+/// Spacer-faithful lemma side (Workstream B, `DESIGN` §4.2; owner WP-B1-L).
+mod spacer_core;
 mod startup;
 mod stats;
 mod strengthen;
@@ -250,6 +254,10 @@ pub(super) struct ConvergenceMonitor {
     pub solve_start: ay_core::time::Instant,
     /// Wall-clock time of the most recent frame advancement (push_frame).
     pub last_frame_advance: ay_core::time::Instant,
+    /// Under an effort, the run's spent ticks at the most recent frame
+    /// advancement (`run_meter::counted_ticks`): the frame stall is measured
+    /// in them, not in wall time (P4a slice 8). `None` otherwise.
+    pub last_frame_advance_ticks: Option<u64>,
     /// Total lemma count at the start of each window.
     pub window_lemma_count: usize,
     /// Iteration count at the start of each window.
@@ -296,6 +304,7 @@ impl ConvergenceMonitor {
         Self {
             solve_start: now,
             last_frame_advance: now,
+            last_frame_advance_ticks: crate::run_meter::counted_ticks(),
             window_lemma_count: 0,
             window_start_iteration: 0,
             window_frame_count: 0,
@@ -308,6 +317,7 @@ impl ConvergenceMonitor {
     /// Record a frame advancement event.
     pub(super) fn note_frame_advance(&mut self) {
         self.last_frame_advance = ay_core::time::Instant::now();
+        self.last_frame_advance_ticks = crate::run_meter::counted_ticks();
     }
 
     /// Record a strengthen() outcome.
@@ -329,6 +339,7 @@ impl ConvergenceMonitor {
         current_frame_count: usize,
     ) {
         self.last_frame_advance = ay_core::time::Instant::now();
+        self.last_frame_advance_ticks = crate::run_meter::counted_ticks();
         self.window_lemma_count = current_lemma_count;
         self.window_start_iteration = current_iteration;
         self.window_frame_count = current_frame_count;
@@ -556,6 +567,8 @@ pub(super) struct PdrTelemetry {
     pub entry_inductive_failure_counts: FxHashMap<EntryInductiveFailureReason, usize>,
     /// Counter for verification queries.
     pub verification_queries: usize,
+    /// Exact submitted-model refusal only; never inferred from a bool/tuple.
+    pub model_validation_failure: Option<crate::engines::ExternalInvariantValidation>,
     /// Counter for generalization attempts.
     pub generalization_attempts: usize,
     /// Actual LIA/Farkas template/certificate route counters.
@@ -574,6 +587,19 @@ pub(super) struct PdrTelemetry {
     pub clause_rotation_counter: usize,
     /// Strategy adaptation telemetry for data-driven threshold tuning (#7918).
     pub strategy: StrategyTelemetry,
+    /// Wall time anchored concrete searches have spent across this solver's
+    /// verifier runs (`verification::concrete::ConcreteBudget`), each within
+    /// its run's allowance. The verifiers and the model verification cascade
+    /// (`invariant_check/safety_proof_cascade.rs`) move their own wall-clock
+    /// budgets forward by it; the solve deadline does not.
+    pub concrete_anchored_search: std::time::Duration,
+}
+
+impl PdrTelemetry {
+    /// Add `spent` to [`Self::concrete_anchored_search`].
+    pub(in crate::pdr) fn add_anchored_search(&mut self, spent: std::time::Duration) {
+        self.concrete_anchored_search = self.concrete_anchored_search.saturating_add(spent);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -754,6 +780,24 @@ pub(super) struct ReachabilityState {
     /// Derivation store for tracking multi-body clause progress (Spacer derivation).
     /// See the development design notes.
     pub derivations: DerivationStore,
+    /// The nonlinear lane's reach facts per predicate, oldest first: point
+    /// states with a complete derivation tree (fact clauses, or clause steps
+    /// over earlier lane facts) — the must summaries its queries cover body
+    /// atoms with (`blocking/reachability/nonlinear.rs`).
+    pub lane_facts: FxHashMap<PredicateId, Vec<ReachFactId>>,
+    /// `(predicate, point state)` → its lane reach fact (one fact per point).
+    pub lane_fact_index: FxHashMap<(PredicateId, ChcExpr), ReachFactId>,
+    /// How often each multi-atom query child (by query clause, level,
+    /// predicate and state hash) was produced: a child that keeps coming back
+    /// at one level is a step that makes no progress (`nl_hyper_query_step`
+    /// then answers Unknown).
+    pub lane_query_children: FxHashMap<(usize, usize, PredicateId, u64), usize>,
+    /// Spacer's derivations, as a memo: for a POB `(predicate, level, state
+    /// hash)` and a clause, the reach facts that covered the atoms before the
+    /// one whose child was queued. The re-queried POB resumes from them (the
+    /// child's reach fact extends exactly that prefix), instead of covering the
+    /// atoms afresh from a new model and oscillating between prefixes.
+    pub lane_derivations: FxHashMap<(PredicateId, usize, u64, usize), Vec<ReachFactId>>,
 }
 
 impl ReachabilityState {
@@ -764,6 +808,10 @@ impl ReachabilityState {
             reach_facts_saturated: false,
             reach_solvers: ReachSolverStore::new(),
             derivations: DerivationStore::new(),
+            lane_facts: FxHashMap::default(),
+            lane_fact_index: FxHashMap::default(),
+            lane_query_children: FxHashMap::default(),
+            lane_derivations: FxHashMap::default(),
         }
     }
 }
@@ -788,12 +836,22 @@ pub struct PdrSolver {
     pub(super) problem: ChcProblem,
     /// Problem after query normalization but before PDR-local array scalarization.
     pub(super) model_problem: ChcProblem,
+    /// The problem this solver was handed, before any PDR-local rewrite: the
+    /// clause list its published counterexamples' ground derivations name.
+    pub(super) input_problem: ChcProblem,
     /// Reversal maps for PDR-local array scalarization steps.
     pub(super) array_scalarization_maps: Vec<ArrayScalarizationMap>,
     /// Configuration
     pub(super) config: PdrConfig,
     /// Consolidated cache subsystem (static lookups + bounded dynamic caches, #3590).
     pub(super) caches: caches::PdrCacheStore,
+    /// The source-name census of `problem` (`fact_names::SourceNames`), computed
+    /// once on first use: `problem` is immutable after construction, and
+    /// `source_names()` is called inside per-query / per-fact / per-clause loops
+    /// (a full-problem walk with one String per symbol node each time, before
+    /// this cache). A census interrupted by cancellation is never stored.
+    pub(in crate::pdr::solver) source_names_cache:
+        std::cell::OnceCell<std::rc::Rc<fact_names::SourceNames>>,
     /// Frames F_0, F_1, ..., F_N (over-approximations / blocking lemmas)
     pub(super) frames: Vec<Frame>,
     // --- Obligation queue (#3301) ---
@@ -963,6 +1021,51 @@ pub struct PdrSolver {
     /// uses the depth bound), so a failed replay at depth D fails for every
     /// depth ≤ D until the problem or budget changes.
     pub(in crate::pdr) failed_replay_depth: Option<usize>,
+    /// Whether `problem` passes native ground validation's whole-source
+    /// preflight (computed once, on the first replay). When it does not, no
+    /// derivation can validate on it, so the bounded-BMC replay is skipped:
+    /// its result could never be accepted, and its executor scans walk the
+    /// clauses as trees (a 48-level shared `let` chain never returned).
+    pub(in crate::pdr) ground_validation_admitted: Option<bool>,
+
+    // --- Workstream B: Spacer-faithful POB/lemma lane (`DESIGN` §3.7, C5) ---
+    /// `config.spacer.enabled && !uses_arrays && !has_bv_sorts && !has_datatype_sorts`
+    /// (§7.4). Gates the dispatch to `block_linear`, the delta `frame_hyp`
+    /// redefinition of `cumulative_frame_constraint`, the honoured lemma
+    /// level and the lifted caps. `false` ⇒ byte-identical legacy behaviour.
+    #[allow(dead_code)] // read by the dispatch (commit 3) and the lane
+    pub(in crate::pdr::solver) spacer_core: bool,
+    /// `spacer_core` on a problem with a hyperedge clause (`SpacerLane::nonlinear`):
+    /// every predicate is blocked by the lane, every clause with a body goes
+    /// through the multi-atom query (`blocking/reachability/nonlinear.rs`), and
+    /// reachability is carried by concrete reach facts instead of POB chains.
+    pub(in crate::pdr::solver) lane_nonlinear: bool,
+    /// Per predicate: every defining clause is a fact or has one body predicate.
+    pub(in crate::pdr::solver) linear_pred_cache: Vec<bool>,
+    /// No clause has more than one body predicate (gates `free_pob` and the
+    /// concretisation walk).
+    #[allow(dead_code)]
+    pub(in crate::pdr::solver) problem_is_linear: bool,
+    /// `config.spacer.backend`, degraded to `Legacy` while
+    /// `incremental_pdr_enabled()` is false.
+    pub(in crate::pdr::solver) oracle_backend: spacer_core::OracleBackend,
+    /// Board counters (§4.6); telemetry only, never read by a verdict path.
+    pub(in crate::pdr::solver) spacer_stats: spacer_core::SpacerCoreStats,
+    /// Telemetry only: the class of the `BlockResult::Unknown` about to be
+    /// returned (set at the exit site in `blocking/`, consumed by `strengthen`).
+    pub(in crate::pdr::solver) pending_unknown_class: Option<spacer_core::stats::UnknownClass>,
+    /// Telemetry only: set by the lane when the lemma it returns went through
+    /// Phase B/D (consumed by `strengthen`'s Blocked arm for attribution).
+    pub(in crate::pdr::solver) lane_lemma_pending: Option<bool>,
+    /// How `new` expanded nullary fail predicates (`None`: it did not). An
+    /// Unsafe result's ground derivation is restated over the problem the
+    /// solver was handed through it (`restate_cex_for_input`).
+    pub(in crate::pdr::solver) nullary_expansion: Option<crate::problem::NullaryExpansion>,
+    /// For each clause of `problem`, the clause it was case-split from in the
+    /// problem before the splits (after nullary expansion; `None`: the splits
+    /// moved no clause). Unsafe results are restated through it
+    /// (`restate_cex_for_input`).
+    pub(in crate::pdr::solver) case_split_origins: Option<Vec<usize>>,
 }
 
 impl PdrSolver {
@@ -1105,6 +1208,18 @@ impl PdrSolver {
         per_arg: &mut FxHashMap<(PredicateId, usize), usize>,
     ) {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                for value in lambda.captures() {
+                    Self::collect_symbolic_selects_for_array_arg(
+                        predicate,
+                        original_arg,
+                        array_var,
+                        value,
+                        seen_cells,
+                        per_arg,
+                    );
+                }
+            }
             ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
                 if matches!(args[0].as_ref(), ChcExpr::Var(var) if var == array_var) {
                     if let Some(index_key) = Self::symbolic_scalarization_index_key(&args[1]) {
@@ -1256,6 +1371,15 @@ impl PdrSolver {
             return false;
         }
         let from_level = self.generalization_escalation_level;
+        // Workstream B (`DESIGN` §4.2.5 "escalation raises ind_gen_max_queries
+        // ×2/×4"): under the lane escalation widens the inductive-generalisation
+        // budget instead of re-enabling global guidance — convex closure stays
+        // off with the rest of the Spacer profile. The legacy toggles below
+        // still apply to the predicates the lane bypasses (hyperedges).
+        if self.spacer_core && self.generalization_escalation_level < 2 {
+            self.config.spacer.ind_gen_max_queries =
+                self.config.spacer.ind_gen_max_queries.saturating_mul(2);
+        }
         let next_level = match self.generalization_escalation_level {
             0 => {
                 self.config.use_farkas_combination = true;
@@ -1264,7 +1388,9 @@ impl PdrSolver {
             }
             1 => {
                 self.config.use_relational_equality = true;
-                self.config.use_convex_closure = true;
+                if !self.spacer_core {
+                    self.config.use_convex_closure = true;
+                }
                 2
             }
             2 => {
@@ -1410,9 +1536,50 @@ impl PdrSolver {
             .smt
             .current_timeout()
             .unwrap_or(std::time::Duration::from_secs(5));
+        // #honest-deadline: the persistent executor backend is the ONE
+        // check-sat path that does not run through `SmtContext::check_sat`, so
+        // the absolute solve deadline `solve_init` installs (see
+        // `set_global_solve_deadline`, whose contract is that EVERY check_sat
+        // honors it "even when invoked without a per-query timeout") never
+        // reached it. Every call therefore opened a FRESH relative window from
+        // `current_timeout()` — 5s by default — however long ago the route
+        // boundary closed, and a PDR round that keeps issuing queries between
+        // two `is_cancelled()` polls ran unbounded past its share. Measured on
+        // the `split_cycle_overflow` soundness fixture (10s budget, portfolio
+        // engine deadline at 10.2s): 1110 backend queries issued with
+        // `is_cancelled() == true` and 0ns left on the solve deadline, 92s of
+        // wall clock for a 10s route.
+        //
+        // Fail-closed on both counts, at the boundary every PDR loop already
+        // polls. The ONLY transition either can cause is
+        // `Sat`/`Unsat` -> `Unknown` after the boundary has closed, and a
+        // decisive verdict produced past the deadline is already demoted by
+        // `enforce_authoritative_publication_boundary`; no proof is lost.
+        if self.is_cancelled() {
+            return SmtResult::Unknown;
+        }
+        let deadline = [self.solve_deadline, self.smt.current_global_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let timeout = match deadline {
+            Some(deadline) => {
+                timeout.min(deadline.saturating_duration_since(ay_core::time::Instant::now()))
+            }
+            None => timeout,
+        };
+        // A sub-millisecond remainder must not be handed to the backend: it
+        // serializes the per-query bound as `(set-option :timeout <ms>)`, where
+        // a value of 0 means UNLIMITED, so rounding down would reopen exactly
+        // the unbounded window this guard exists to close.
+        if timeout < std::time::Duration::from_millis(1) {
+            return SmtResult::Unknown;
+        }
+        let memory = self.validation_memory();
         let backend = self
             .executor_backend
             .get_or_insert_with(PdrExecutorBackend::new);
+        backend.set_term_memory_limit(memory.term_limit());
         let result = backend.check_sat(expr, timeout);
         match &result {
             SmtResult::Unknown => {

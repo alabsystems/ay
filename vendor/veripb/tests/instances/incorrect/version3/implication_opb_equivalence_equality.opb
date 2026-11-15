@@ -1,0 +1,3 @@
+* #variable= 2 #constraint= 2
+* An equivalence of an equality would state that the literal is implied by a tautology.
+z1 <==> 1 x1 = 1 ;

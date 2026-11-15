@@ -1,0 +1,431 @@
+{
+  "id": 11061097,
+  "doi": "10.5281/zenodo.11061097",
+  "files": [
+    {
+      "key": "BVFP.tar.zst",
+      "size": 45506,
+      "checksum": "md5:6701dfad006e3f4b583501be6a2e1a97"
+    },
+    {
+      "key": "NRA.tar.zst",
+      "size": 733355,
+      "checksum": "md5:9cce91c1b98d7f49bbb227e86e84ca89"
+    },
+    {
+      "key": "QF_AUFBVFP.tar.zst",
+      "size": 3631,
+      "checksum": "md5:f2fae25282f3baeb2c8a2cbdd6aba001"
+    },
+    {
+      "key": "AUFBVFP.tar.zst",
+      "size": 3327928,
+      "checksum": "md5:d0a189570b935a8309e116484d546079"
+    },
+    {
+      "key": "UFNIA.tar.zst",
+      "size": 81844479,
+      "checksum": "md5:4d564c9d3b5764635dd76a42710ba1ba"
+    },
+    {
+      "key": "QF_UFNIA.tar.zst",
+      "size": 34358449,
+      "checksum": "md5:4c94c991e767b6aaa82fa073adf88699"
+    },
+    {
+      "key": "QF_RDL.tar.zst",
+      "size": 10044067,
+      "checksum": "md5:9bf68dc840db5e8f83940e436aae0756"
+    },
+    {
+      "key": "QF_LIA.tar.zst",
+      "size": 688955075,
+      "checksum": "md5:d71191111a0d80d6558a8784058d081c"
+    },
+    {
+      "key": "QF_BVFP.tar.zst",
+      "size": 1033258,
+      "checksum": "md5:c9aa57f04510048611ad0ad027c8ef76"
+    },
+    {
+      "key": "AUFLIA.tar.zst",
+      "size": 10040305,
+      "checksum": "md5:437ed821aadae411ce7cf03d51bd5d45"
+    },
+    {
+      "key": "QF_NIA.tar.zst",
+      "size": 190504215,
+      "checksum": "md5:cedb6a98a0b692381daf6e07647074b6"
+    },
+    {
+      "key": "QF_UFDTLIA.tar.zst",
+      "size": 3658028,
+      "checksum": "md5:e7351e3e0d63b3f620ca78eab6a84f7a"
+    },
+    {
+      "key": "UFBVDT.tar.zst",
+      "size": 13288,
+      "checksum": "md5:2d08042b5471ab0c5987086ae756211a"
+    },
+    {
+      "key": "UFBV.tar.zst",
+      "size": 1707837,
+      "checksum": "md5:1e4875ffca80b34991d8cd1ff36f6dfe"
+    },
+    {
+      "key": "QF_UFLRA.tar.zst",
+      "size": 162815543,
+      "checksum": "md5:efcc423fd0f50e9b7942779d02e376ed"
+    },
+    {
+      "key": "QF_FP.tar.zst",
+      "size": 7534342,
+      "checksum": "md5:d690d40fb847d889ed3b69e34ce82382"
+    },
+    {
+      "key": "QF_SNIA.tar.zst",
+      "size": 3188,
+      "checksum": "md5:cb05bfb9a30fb6693f3d6319c4b735ac"
+    },
+    {
+      "key": "QF_UFDTNIA.tar.zst",
+      "size": 2875325,
+      "checksum": "md5:d16acca8fac1e83c5339bf5c9697bab2"
+    },
+    {
+      "key": "QF_BVFPLRA.tar.zst",
+      "size": 37049,
+      "checksum": "md5:17591d0523fc99a075014707a5fc57fd"
+    },
+    {
+      "key": "ABV.tar.zst",
+      "size": 1223078,
+      "checksum": "md5:d1c126fc1373251bed6b258bfa993b32"
+    },
+    {
+      "key": "LRA.tar.zst",
+      "size": 4049673,
+      "checksum": "md5:6c1bc1d3c9aa9ddcbacf7e1fd7e70876"
+    },
+    {
+      "key": "UFNIRA.tar.zst",
+      "size": 15900,
+      "checksum": "md5:b85ed2aa742bb4e3fbb79724cb25d02d"
+    },
+    {
+      "key": "QF_UFFP.tar.zst",
+      "size": 673,
+      "checksum": "md5:c39b683eeff9c0f476853f1327b7ade7"
+    },
+    {
+      "key": "UFDTLIRA.tar.zst",
+      "size": 8554737,
+      "checksum": "md5:2dc60b62682fbf05ffe7c98a17544161"
+    },
+    {
+      "key": "UFLIA.tar.zst",
+      "size": 47105799,
+      "checksum": "md5:9083e02a0a7c80c059c3ad4ec1ee8c22"
+    },
+    {
+      "key": "AUFLIRA.tar.zst",
+      "size": 1717938,
+      "checksum": "md5:aede9eb4bbd769f739cc46540eadd23e"
+    },
+    {
+      "key": "LIA.tar.zst",
+      "size": 264612,
+      "checksum": "md5:5e07a6a3c2a034531880f54eda29a7f4"
+    },
+    {
+      "key": "QF_ABV.tar.zst",
+      "size": 139559467,
+      "checksum": "md5:1522a83775e718596fc86d4fa6bf7551"
+    },
+    {
+      "key": "QF_AUFBV.tar.zst",
+      "size": 1184909,
+      "checksum": "md5:83c6c9bf34bd38a078c389cecf7ed0a3"
+    },
+    {
+      "key": "QF_BV.tar.zst",
+      "size": 1734941977,
+      "checksum": "md5:3104e6a73841bccab5a2b0960afa8576"
+    },
+    {
+      "key": "QF_NRA.tar.zst",
+      "size": 211274094,
+      "checksum": "md5:1616dc6d8d2396a3e3586e98fa5b45c4"
+    },
+    {
+      "key": "QF_UFDT.tar.zst",
+      "size": 21713990,
+      "checksum": "md5:28ff0c0da7108adfe091b8359beb4b05"
+    },
+    {
+      "key": "BV.tar.zst",
+      "size": 105886462,
+      "checksum": "md5:928199eb72bfc9f8aba5ad0d668da4ba"
+    },
+    {
+      "key": "QF_UFDTLIRA.tar.zst",
+      "size": 20111,
+      "checksum": "md5:5fcae3d066b309c2f2d6adae0d9137b8"
+    },
+    {
+      "key": "AUFBVDTNIRA.tar.zst",
+      "size": 10121017,
+      "checksum": "md5:58d0e9516a62f9c59a6a8d45d72826a4"
+    },
+    {
+      "key": "QF_ABVFPLRA.tar.zst",
+      "size": 88633,
+      "checksum": "md5:a9b4ca3a9877dbf19ac2392884563849"
+    },
+    {
+      "key": "QF_ALIA.tar.zst",
+      "size": 491146,
+      "checksum": "md5:7b071c2b4eb446cbe66fda9cb120ba9b"
+    },
+    {
+      "key": "ABVFP.tar.zst",
+      "size": 17490,
+      "checksum": "md5:287cbddb8cdacc5e78b9519401d65a15"
+    },
+    {
+      "key": "QF_AUFNIA.tar.zst",
+      "size": 214529,
+      "checksum": "md5:e83ad12117f943a186087630e4d9644e"
+    },
+    {
+      "key": "README.md",
+      "size": 8692,
+      "checksum": "md5:36cc560de6fa9faabbb5ae3dc039c557"
+    },
+    {
+      "key": "UFDTLIA.tar.zst",
+      "size": 70005,
+      "checksum": "md5:e97b565e5291efc20226f7e82a33bdfb"
+    },
+    {
+      "key": "UFLRA.tar.zst",
+      "size": 1519,
+      "checksum": "md5:eb0d28bd85a3309701b07d12f7a9fdba"
+    },
+    {
+      "key": "ANIA.tar.zst",
+      "size": 70271,
+      "checksum": "md5:aaa6afe8e92c13f5d7b298ed452e7a2d"
+    },
+    {
+      "key": "AUFFPDTNIRA.tar.zst",
+      "size": 102736,
+      "checksum": "md5:1da97fef42f951e98c22894aab0f2b50"
+    },
+    {
+      "key": "AUFBVDTLIA.tar.zst",
+      "size": 532246,
+      "checksum": "md5:5c1125c222a1a4528c45fefc5e6357ae"
+    },
+    {
+      "key": "AUFBVDTNIA.tar.zst",
+      "size": 2155,
+      "checksum": "md5:4cec126df51e3a3b356b1dc7ebad24c5"
+    },
+    {
+      "key": "ABVFPLRA.tar.zst",
+      "size": 14551,
+      "checksum": "md5:fc9aefb376a612bc4bcf0c50743f01ba"
+    },
+    {
+      "key": "ALIA.tar.zst",
+      "size": 939127,
+      "checksum": "md5:ff299885849bbaa19218abc3ded70ecd"
+    },
+    {
+      "key": "AUFDTNIRA.tar.zst",
+      "size": 1068959,
+      "checksum": "md5:a141b86783054f5b995397e1adf9f0d7"
+    },
+    {
+      "key": "AUFDTLIRA.tar.zst",
+      "size": 3243251,
+      "checksum": "md5:bf143567536c7cbd0a45c36897d9e3eb"
+    },
+    {
+      "key": "AUFNIRA.tar.zst",
+      "size": 2556743,
+      "checksum": "md5:3f98814253594a79311564d4ef9ecae9"
+    },
+    {
+      "key": "BVFPLRA.tar.zst",
+      "size": 41455,
+      "checksum": "md5:9aa7d06e16ad39058470538addd56dda"
+    },
+    {
+      "key": "FPLRA.tar.zst",
+      "size": 5942,
+      "checksum": "md5:115f967f2908b2a475cf4840304f420c"
+    },
+    {
+      "key": "QF_AUFLIA.tar.zst",
+      "size": 411551,
+      "checksum": "md5:04daa09ea9fc278be7a70398c06d319d"
+    },
+    {
+      "key": "QF_NIRA.tar.zst",
+      "size": 103441,
+      "checksum": "md5:672666516597abc5dcfe52ce64448f3d"
+    },
+    {
+      "key": "FP.tar.zst",
+      "size": 154854,
+      "checksum": "md5:9266f740be56d625e432a88c2e2c6ca6"
+    },
+    {
+      "key": "QF_ABVFP.tar.zst",
+      "size": 2213767,
+      "checksum": "md5:31dca8664daad57a6af2b3e69fadd440"
+    },
+    {
+      "key": "NIA.tar.zst",
+      "size": 44187,
+      "checksum": "md5:bb0ff113f35602f924d33f73550cdbc0"
+    },
+    {
+      "key": "QF_S.tar.zst",
+      "size": 2909837,
+      "checksum": "md5:e7a201b1fff6c952f278154d6513a0c0"
+    },
+    {
+      "key": "UFFPDTNIRA.tar.zst",
+      "size": 300503,
+      "checksum": "md5:b38dced99129173fe479ef45d46c5a95"
+    },
+    {
+      "key": "QF_ANIA.tar.zst",
+      "size": 1626819,
+      "checksum": "md5:d03556a1b5760a839290b4e112525ebf"
+    },
+    {
+      "key": "QF_AX.tar.zst",
+      "size": 131549,
+      "checksum": "md5:6d323ea02eb4d74e8ac77420bf94e3cb"
+    },
+    {
+      "key": "AUFBV.tar.zst",
+      "size": 256012961,
+      "checksum": "md5:a436dc2389d5ee4aba251287364f2c68"
+    },
+    {
+      "key": "AUFDTLIA.tar.zst",
+      "size": 7752329,
+      "checksum": "md5:3d9ef9170c6304766bc551a24e2ee052"
+    },
+    {
+      "key": "UFBVLIA.tar.zst",
+      "size": 4629420,
+      "checksum": "md5:2b80135bc383a4510eded4a0682929d9"
+    },
+    {
+      "key": "UFDT.tar.zst",
+      "size": 37853585,
+      "checksum": "md5:303442ce9004f251b633947c267f4ea5"
+    },
+    {
+      "key": "QF_DT.tar.zst",
+      "size": 43959596,
+      "checksum": "md5:34701f2c49bf4669a550ac8124b8cad0"
+    },
+    {
+      "key": "QF_SLIA.tar.zst",
+      "size": 31834010,
+      "checksum": "md5:277e586bf556ee33dc638348bc6de50a"
+    },
+    {
+      "key": "QF_UF.tar.zst",
+      "size": 54287659,
+      "checksum": "md5:3ce26e05264581931a583bae96b87f34"
+    },
+    {
+      "key": "QF_UFBV.tar.zst",
+      "size": 87797101,
+      "checksum": "md5:50d22090ac82e882761f0648f109485f"
+    },
+    {
+      "key": "UFDTNIA.tar.zst",
+      "size": 24029,
+      "checksum": "md5:d5b595deef96d6dad6f310188258b844"
+    },
+    {
+      "key": "QF_IDL.tar.zst",
+      "size": 428334372,
+      "checksum": "md5:c8bf55ac95e36ad7bbf4a8e5ffebbf1e"
+    },
+    {
+      "key": "AUFNIA.tar.zst",
+      "size": 1118,
+      "checksum": "md5:250855ebe5e8b250307c386f370ce079"
+    },
+    {
+      "key": "UFBVFP.tar.zst",
+      "size": 9521,
+      "checksum": "md5:1d58d81b34a7ebc6e16da22c6348f48b"
+    },
+    {
+      "key": "UFDTNIRA.tar.zst",
+      "size": 3631031,
+      "checksum": "md5:4eae82cb3b589af48ce21fed9b5081f3"
+    },
+    {
+      "key": "UFIDL.tar.zst",
+      "size": 67461,
+      "checksum": "md5:08c482769c88bdf91997d605d2d049be"
+    },
+    {
+      "key": "QF_LRA.tar.zst",
+      "size": 182105257,
+      "checksum": "md5:acded5157ed73f2672d1421f205b7209"
+    },
+    {
+      "key": "QF_UFBVDT.tar.zst",
+      "size": 2432873,
+      "checksum": "md5:6f8ac2e14f4a6dcc590943942396e4e4"
+    },
+    {
+      "key": "QF_UFFPDTNIRA.tar.zst",
+      "size": 19296,
+      "checksum": "md5:33a75ae25d8bc5f72ac6657854e9e13b"
+    },
+    {
+      "key": "QF_UFLIA.tar.zst",
+      "size": 18901126,
+      "checksum": "md5:26d8d7e71c33b10c9767beebddb5da9e"
+    },
+    {
+      "key": "UF.tar.zst",
+      "size": 51607764,
+      "checksum": "md5:fab8dd7f2a2d97333aca35a80cc55e74"
+    },
+    {
+      "key": "QF_UFIDL.tar.zst",
+      "size": 35806637,
+      "checksum": "md5:41ad4e99e97e190694ada9d36b47c369"
+    },
+    {
+      "key": "QF_UFNRA.tar.zst",
+      "size": 20995,
+      "checksum": "md5:717e4be953658562a3891fa5413fe807"
+    },
+    {
+      "key": "QF_FPLRA.tar.zst",
+      "size": 20062,
+      "checksum": "md5:8c772eeefa58e21c513bb002a8062548"
+    },
+    {
+      "key": "QF_LIRA.tar.zst",
+      "size": 174570,
+      "checksum": "md5:91b40bba661bb35819a17a324f55c21f"
+    }
+  ]
+}

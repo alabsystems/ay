@@ -1,0 +1,38 @@
+pseudo-Boolean proof version 3.0
+f 0;
+@x pol x1;
+@x pol x2;
+@x pol x3;
+@x pol x4;
+@x pol x5;
+@x pol x6;
+@x pol x7;
+@x pol x8;
+@x pol x9;
+def_order lex3 % Defines lexicographical order (u1, u2, u3) <= (v1, v2, v3).
+    vars                % Variables used in the order.
+        left u1 u2 u3;  % Must contain the same number of variables as in `right'.
+        right v1 v2 v3; % Must contain the same number of variables as in `left'.
+        aux;
+    end vars;           % `end vars' could just be `end'.
+
+    def      % Constraint(s) defining the order.
+        -1 u1 +1 v1 -2 u2 +2 v2 -4 u3 +4 v3 >= 0;
+    end def; % `end def' could be `def'.
+
+    transitivity                  % Proof of transitivity (must come before reflexivity).
+        vars                      % Fresh variables used in proof.
+            fresh_right w1 w2 w3; % Must contain the same number of variables as in `right'.
+        end vars;                 % `end vars' could just be `end'.
+
+        proof
+            proofgoal #1     % -1 u1 +1 v1 -2 u2 +2 v2 -4 u3 +4 v3 >= 0;
+                @x pol 1 2 + 3 +;
+            qed #1 : @x;     % `#1' and `: -1' are optional.
+        qed proof;           % `proof' is optional.
+    end transitivity;        % `end transitivity' could just be `end'.
+end def_order; % `end def_order' could just be `end'.
+e +1 x9 >= 0 : @x;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

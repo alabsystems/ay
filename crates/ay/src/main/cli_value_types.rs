@@ -161,6 +161,16 @@ impl From<CliProofFormat> for ProofFormat {
     }
 }
 
+/// CLI wrapper for [`ay_proof::AletheDialect`] (`--alethe-dialect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum CliAletheDialect {
+    /// Clean's vendored Carcara, the checker external-codegen promotes on.
+    Clean,
+    /// Pinned Carcara 1.1.0 (git 9a352ee, `reference/tools.toml`).
+    PinnedCarcara,
+}
+
 /// CLI wrapper for [`ay_core::DeclaredProofChecker`] (`--proof-checker`).
 ///
 /// A capability declaration paired with the format: `dsr-trim` verifies the DSR
@@ -216,22 +226,25 @@ enum CliAssuranceLevel {
     /// engine selection -- are UNCHANGED. Also forced automatically when a
     /// SAT-competition wrapper env signal is present.
     ///
-    /// A plain SMT-LIB solve with no `--rigor` and no proof flag already runs
+    /// `--z3-mode` is the documented flag for z3-exact behaviour; it reaches
     /// this rung's PROOF posture (nothing recorded, minted, re-checked, or
-    /// written -- z3's default) while keeping the validation batteries on;
-    /// see `certification_requested`.
+    /// written) without turning off the validation batteries. `--no-proof`
+    /// reaches it too.
     Fast,
-    /// The certifying rung. Batteries included: runtime result validation is
-    /// ON, default proof-certificate emission is ON (SMT-LIB writes
-    /// `<input>.alethe`; DIMACS/CHC do so at every rung but `fast`), and the
-    /// emitted proof is re-checked afterward (the built-in --verify-proof
-    /// re-check). Opt-in for SMT-LIB input; `None` on the dial resolves here
-    /// only for the legacy switches' projection, not for a plain solve.
+    /// The default. Batteries included: runtime result validation is ON,
+    /// default proof-certificate emission is ON (SMT-LIB writes
+    /// `<input>.alethe`, DIMACS `<input>.drat`, CHC `<input>.chccert`), and
+    /// the emitted proof is re-checked afterward (the built-in --verify-proof
+    /// re-check). `None` on the dial resolves here, so a plain solve is
+    /// certifying.
     Standard,
-    /// Strict proof diagnostic and terminal-trust screen (== --strict-proofs).
-    /// Uses AY's strict semantic checker while constructing proofs and
-    /// downgrades a terminal Trust-backed `unsat` to `unknown`. Other checker
-    /// failures remain diagnostics.
+    /// Strict proofs (== --strict-proofs): `unsat` only together with a
+    /// certificate. Uses AY's strict semantic checker while constructing proofs
+    /// and answers `unknown` when the proof has a terminal Trust step, or when
+    /// its certificate carries an unproved step or an `assume` that is not an
+    /// assertion of the input as written, on every input route (file, stdin,
+    /// incremental) whether or not a certificate file is written. Other
+    /// checker failures remain diagnostics.
     Strict,
     /// Fail-closed self-check (== --self-check). AY emits only an answer it can
     /// verify itself -- model evaluation for `sat`, a strict same-problem

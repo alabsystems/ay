@@ -234,6 +234,45 @@ pub const CHECKABLE_ALETHE_RULES: [&str; 182] = [
     "xor_pos2",
 ];
 
+/// Rule names Clean's vendored Carcara implements and pinned Carcara 9a352ee
+/// does not: a document may name one only when it is spelled for Clean's
+/// checker (`ay_proof::AletheDialect::Clean`).
+///
+/// This is deliberately NOT part of [`CHECKABLE_ALETHE_RULES`]. That table is
+/// a claim about the pinned checker, and every name in it may pass through
+/// [`wire_rule_name`] into any document; a name the pinned checker does not
+/// implement turns the whole document `invalid` there (the reverted
+/// `dt_distinct` -> `dt_clash` alias). The names here never pass through
+/// [`wire_rule_name`]: [`wire_rule_name`]`("dt_project")` stays
+/// [`UNPROVED_STEP_RULE`], and only a dedicated printer lowering, run in the
+/// Clean dialect, writes them.
+///
+/// * `dt_project` — `(cl (= (S (C t_0 .. t_n)) t_i))` with no premises and no
+///   arguments, `S` the `i`-th selector of the constructor `C` of a declared
+///   non-parametric datatype (Clean 4dc90e8ea, `third-party/carcara`
+///   DOWNSTREAM.md row C2). MEASURED 2026-10-02: Clean's
+///   `clean cert verify-external` accepts it and refuses a wrong field; the
+///   pinned `carcara 1.1.0 [git 9a352ee]` answers `checking failed on step
+///   't0' with rule 'dt_project': unknown rule`.
+///
+/// MUST stay sorted (binary-searched) and disjoint from
+/// [`CHECKABLE_ALETHE_RULES`].
+pub const CLEAN_DIALECT_ALETHE_RULES: [&str; 3] = [
+    "bv_reconstruct_v1",
+    "dt_project",
+    // Requires the separately versioned offset-spine capability, not the
+    // older immediate-addend EqSimplify extension or default Clean checker.
+    "eq_simplify_bv_offset_spines",
+];
+
+/// True if `name` is a rule only Clean's vendored Carcara implements
+/// ([`CLEAN_DIALECT_ALETHE_RULES`]). A document spelled for Clean's checker may
+/// name it; one spelled for pinned Carcara may not.
+#[must_use]
+pub fn is_clean_dialect_alethe_rule(name: &str) -> bool {
+    CLEAN_DIALECT_ALETHE_RULES.binary_search(&name).is_ok()
+}
+
 /// The Alethe rule name used for a step whose justification is not being
 /// claimed: an honest, checker-accepted placeholder.
 ///
@@ -448,7 +487,8 @@ pub enum AletheRule {
     NotTrue,
     /// Negation of false
     NotFalse,
-    /// And introduction
+    /// Project one immediate conjunct from a unit positive conjunction premise.
+    /// Standard `and` takes its zero-based integer index in `:args`.
     And,
     /// And elimination (position i)
     AndPos(u32),
@@ -758,6 +798,45 @@ pub enum AletheRule {
     ///
     /// Appended to preserve serialized discriminants of the older variants.
     Reordering,
+
+    /// Binder join (Alethe `qnt_join`): `(cl (= (Q x⃗ (Q y⃗ φ)) (Q x⃗y⃗ φ)))`.
+    ///
+    /// Currying a quantifier's binder list is an equivalence whenever the
+    /// names are distinct. Read right to left it splits an authored
+    /// multi-binder quantifier into one binder over the rest, which is what
+    /// lets the single-binder `sko_forall`/`sko_ex` Skolemize a multi-binder
+    /// existential one binder at a time, each witness with its own registered
+    /// choice. See `ay_proof::checker::quantifier::validate_qnt_join` for the
+    /// strict re-derivation and its soundness argument. `qnt_join` is a
+    /// pinned wire rule (`CHECKABLE_ALETHE_RULES`).
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    QntJoin,
+
+    /// One atom of a FRESH div/mod purification: `(cl atom)` with
+    /// `:args (q D r M)`, where the executor minted `q`/`r` for `(div x k)` /
+    /// `(mod x k)` and `D`/`M` are the terms they are defined by.
+    ///
+    /// Like [`Self::FreshDefEq`] this is a conservative definitional
+    /// extension, not an inference: `atom` must be VALID with `q := D` and
+    /// `r := M` (`ay_core::proof_validation::recognize_divmod_def`), and both
+    /// bindings join the one `FreshDefRegistry` map, which decides FRESH,
+    /// INDEPENDENT and SINGLE DEFINIENS. The pinned checker has no such rule,
+    /// so it prints as `hole`.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    DivModDef,
+    /// Bounded canonical BV equality/common-addend simplification. This
+    /// fragment requires Clean's `eq_simplify_bv_offsets` dialect capability;
+    /// generic wire spelling remains a hole until the printer checks it.
+    /// Appended to preserve older serialized discriminants.
+    EqSimplify,
+    /// Versioned bounded literal add/subtract spine equality. Requires the
+    /// explicit Clean `eq_simplify_bv_offset_spines_v1` capability; appended to
+    /// preserve every earlier serialized discriminant and rule contract.
+    BvOffsetSpinesV1,
+    /// Bounded full-width reconstruction from aligned, disjoint word slices.
+    BvReconstructV1,
 }
 
 impl AletheRule {
@@ -832,6 +911,9 @@ impl AletheRule {
             Self::AllSimplify => "all_simplify",
             Self::BoolSimplify => "bool_simplify",
             Self::ArithSimplify => "arith_simplify",
+            Self::EqSimplify => "eq_simplify",
+            Self::BvOffsetSpinesV1 => "eq_simplify_bv_offset_spines",
+            Self::BvReconstructV1 => "bv_reconstruct_v1",
             Self::BvBitblast => "bv_bitblast",
             Self::ReadOverWritePos => "read_over_write_pos",
             Self::ReadOverWriteNeg => "read_over_write_neg",
@@ -852,6 +934,8 @@ impl AletheRule {
             Self::FreshDefBound => "fresh_def_bound",
             Self::FreshDefEq => "fresh_def_eq",
             Self::Reordering => "reordering",
+            Self::QntJoin => "qnt_join",
+            Self::DivModDef => "divmod_def",
         }
     }
 
@@ -872,6 +956,12 @@ impl AletheRule {
     /// checkable rule names directly and pass through here unchanged.
     #[must_use]
     pub fn wire_name(&self) -> &str {
+        if matches!(
+            self,
+            Self::EqSimplify | Self::BvOffsetSpinesV1 | Self::BvReconstructV1
+        ) {
+            return UNPROVED_STEP_RULE;
+        }
         wire_rule_name(self.name())
     }
 }

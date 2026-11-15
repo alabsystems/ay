@@ -28,11 +28,11 @@
 //!
 //! # Honest divergences
 //!
-//! - [`Z3_fixedpoint_from_string`]: AY does not parse Z3's fixedpoint/Datalog
-//!   *script* dialect (declare-rel/declare-var/rule/query). Rather than
-//!   fabricate a rule/query set — which would silently corrupt every later
-//!   verdict — it sets `Z3_EXCEPTION` and returns an EMPTY (never null) query
-//!   vector, adding nothing.
+//! - [`Z3_fixedpoint_from_string`] (and `_from_file` in
+//!   `fixedpoint_ext.rs`) parse the SMT-LIB2 fixedpoint script dialect
+//!   for real (see the section at the bottom of this file); the only
+//!   boundary is that script relations live under their written names,
+//!   disjoint from C-API-registered relations' private names.
 //! - The trace-family functions map the counterexample's engine-reported
 //!   `clause_index` back onto the asserted rule snapshot. When the portfolio's
 //!   internal transforms renumber clauses the mapping may be partial; it is
@@ -49,8 +49,8 @@ use super::fixedpoint::{
     solve_problem, QueryOutcome, TranslateErr, REASON_UNTRANSLATABLE,
 };
 use super::{
-    cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, require_term_ast_or_return,
+    cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit, ffi_guard_const_ptr,
+    ffi_guard_int, ffi_guard_produced, ffi_guard_ptr, ffi_guard_void, require_term_ast_or_return,
     term_to_ast, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string,
     Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
@@ -379,7 +379,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_ground_sat_answer(
     // SAFETY: `ffi_guard_ast` null-checks `c` and catches panics; `d` is
     // dereferenced only after an explicit null-check.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             if d.is_null() {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg =
@@ -533,18 +533,333 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_rule_names_along_trace(
 }
 
 // ============================================================================
-// SMT-LIB2 / fixedpoint-script parsing (honest divergence).
+// SMT-LIB2 fixedpoint-script parsing (`declare-rel` / `declare-var` /
+// `rule` / `query`).
 // ============================================================================
+//
+// z3's `Z3_fixedpoint_from_string`/`_from_file` parse the SMT-LIB2
+// fixedpoint dialect: relations are registered, rules added, plain
+// assertions become background theory, and the queries are returned as an
+// AST vector. AY implements that contract here over the real shared
+// front-end: each command is split with `ay_frontend::CommandStream`
+// (exact source slices), declarations are threaded into the context
+// solver's persistent symbol table as `declare-fun`/`declare-const`
+// (relations are Bool-valued functions; rule variables are constants the
+// CHC translator reads as clause variables), and rule/query/assertion
+// terms are elaborated through `Solver::parse_smtlib2` inside one
+// push/pop scope so no rule formula lingers as a solver assertion.
+// Relation argument sorts are recovered from a probe atom's elaborated
+// children, so datatype and other non-builtin column sorts are exact.
+// Any parse or elaboration failure adds nothing to the handle and is
+// reported as `Z3_PARSER_ERROR` with a null return — the shapes z3's
+// header documents. (Shipped libz3 4.16/5.1.0 in fact segfault inside
+// `Z3_fixedpoint_from_string` on any script that registers a rule;
+// measured 2026-10-17. AY implements the documented contract instead of
+// reproducing the crash.)
+//
+// One deliberate superset: z3's script grammar accepts only a bare
+// relation name in `(query ...)`; AY additionally accepts a ground or
+// open relation application there, matching `Z3_fixedpoint_query`'s
+// own argument contract. Scripts valid in z3 behave identically.
+//
+// Known boundary, shared with the rest of this surface: relation
+// identity here is the SMT-LIB written name. A relation previously
+// registered through the C API lives under its private FFI name, so a
+// script rule cannot reference it (and vice versa); such a rule fails
+// translation and the query answers `Z3_L_UNDEF` rather than guessing.
+
+/// Render a parsed sort back to SMT-LIB text (structural; sort symbols
+/// are quoted when they are not simple symbols). `None` for a future
+/// sort-AST variant this renderer does not know — callers fail closed
+/// rather than emit a guessed rendering.
+fn render_parsed_sort(sort: &ay_frontend::Sort) -> Option<String> {
+    match sort {
+        ay_frontend::Sort::Simple(name) => Some(ay_core::quote_symbol(name)),
+        ay_frontend::Sort::Parameterized(name, params) => {
+            let inner: Option<Vec<String>> = params.iter().map(render_parsed_sort).collect();
+            Some(format!(
+                "({} {})",
+                ay_core::quote_symbol(name),
+                inner?.join(" ")
+            ))
+        }
+        ay_frontend::Sort::Indexed(name, indices) => {
+            let inner: Vec<&str> = indices.iter().map(ay_frontend::Index::text).collect();
+            Some(format!(
+                "(_ {} {})",
+                ay_core::quote_symbol(name),
+                inner.join(" ")
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The term text inside a one-term command slice `(head <term>)`.
+fn command_term_text(slice: &str) -> Option<&str> {
+    let trimmed = slice.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let (_, rest) = inner.split_once(char::is_whitespace)?;
+    Some(rest.trim())
+}
+
+/// Elaborate exactly one formula through the shared parse bridge and
+/// return its term.
+fn elaborate_one_assertion(
+    ctx: &mut super::Z3Context,
+    who: &str,
+    script: &str,
+) -> Result<Term, String> {
+    let terms = ctx
+        .solver
+        .parse_smtlib2(script)
+        .map_err(|e| format!("{who}: {e}"))?;
+    match terms.as_slice() {
+        [term] => Ok(*term),
+        _ => Err(format!(
+            "{who}: expected exactly one elaborated formula, got {}",
+            terms.len()
+        )),
+    }
+}
+
+/// Split a script into (exact source slice, command) pairs. Done before
+/// any solver mutation: a script that does not even split must not
+/// touch the symbol table.
+fn split_fixedpoint_script(
+    source: &str,
+    who: &str,
+) -> Result<Vec<(String, ay_frontend::Command)>, String> {
+    use ay_frontend::{CommandStream, CommandStreamItem};
+    let mut stream = CommandStream::new(source);
+    let mut items = Vec::new();
+    loop {
+        let start = stream.position();
+        match stream.next_command() {
+            None => return Ok(items),
+            Some(CommandStreamItem::Error(e)) => return Err(format!("{who}: {e}")),
+            Some(CommandStreamItem::Command(cmd)) => {
+                let end = stream.position();
+                items.push((source[start..end].to_string(), *cmd));
+            }
+        }
+    }
+}
+
+/// Declaration phase (persistent): relations and rule variables become
+/// ordinary solver symbols; every other non-rule command executes
+/// verbatim through the shared bridge. Returns each declared
+/// relation's name and rendered argument sorts.
+fn declare_fixedpoint_script_symbols(
+    ctx: &mut super::Z3Context,
+    items: &[(String, ay_frontend::Command)],
+    who: &str,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    use ay_frontend::Command;
+    let mut relations: Vec<(String, Vec<String>)> = Vec::new();
+    for (slice, cmd) in items {
+        match cmd {
+            Command::DeclareRel(name, sorts) => {
+                let sort_texts: Option<Vec<String>> =
+                    sorts.iter().map(render_parsed_sort).collect();
+                let sort_texts = sort_texts
+                    .ok_or_else(|| format!("{who}: declare-rel {name}: unsupported sort form"))?;
+                let decl = format!(
+                    "(declare-fun {} ({}) Bool)",
+                    ay_core::quote_symbol(name),
+                    sort_texts.join(" ")
+                );
+                ctx.solver
+                    .parse_smtlib2(&decl)
+                    .map_err(|e| format!("{who}: declare-rel {name}: {e}"))?;
+                relations.push((name.clone(), sort_texts));
+            }
+            Command::DeclareVar(name, sort) => {
+                let sort_text = render_parsed_sort(sort)
+                    .ok_or_else(|| format!("{who}: declare-var {name}: unsupported sort form"))?;
+                let decl = format!(
+                    "(declare-const {} {})",
+                    ay_core::quote_symbol(name),
+                    sort_text
+                );
+                ctx.solver
+                    .parse_smtlib2(&decl)
+                    .map_err(|e| format!("{who}: declare-var {name}: {e}"))?;
+            }
+            Command::Rule(_) | Command::Query(_) | Command::Assert(_) => {}
+            _ => {
+                ctx.solver
+                    .parse_smtlib2(slice)
+                    .map_err(|e| format!("{who}: {e}"))?;
+            }
+        }
+    }
+    Ok(relations)
+}
+
+/// Recover each relation's elaborated argument sorts from a probe
+/// atom's children (exact for datatype and other non-builtin sorts).
+fn probe_relation_arg_sorts(
+    ctx: &mut super::Z3Context,
+    who: &str,
+    relations: &[(String, Vec<String>)],
+) -> Result<Vec<(String, Vec<ChcSort>)>, String> {
+    let mut rel_sorts: Vec<(String, Vec<ChcSort>)> = Vec::new();
+    for (r, (name, sort_texts)) in relations.iter().enumerate() {
+        if sort_texts.is_empty() {
+            rel_sorts.push((name.clone(), Vec::new()));
+            continue;
+        }
+        let mut probe = String::new();
+        let mut args: Vec<String> = Vec::new();
+        for (i, st) in sort_texts.iter().enumerate() {
+            let v = format!("ay-fp-probe-{r}-{i}");
+            probe.push_str(&format!("(declare-const {v} {st})"));
+            args.push(v);
+        }
+        probe.push_str(&format!(
+            "(assert ({} {}))",
+            ay_core::quote_symbol(name),
+            args.join(" ")
+        ));
+        let atom = elaborate_one_assertion(ctx, who, &probe)?;
+        let arg_sorts = ctx
+            .solver
+            .term_children(atom)
+            .iter()
+            .map(|&child| ChcSort::from(ctx.solver.term_sort(child)))
+            .collect();
+        rel_sorts.push((name.clone(), arg_sorts));
+    }
+    Ok(rel_sorts)
+}
+
+/// The material captured from one script, before it is committed to
+/// the handle: relation signatures, rule terms, background axioms,
+/// and query terms.
+type CapturedScript = (Vec<(String, Vec<ChcSort>)>, Vec<Term>, Vec<Term>, Vec<Term>);
+
+/// Elaborate relation signatures, rules, background assertions, and
+/// queries inside one push/pop scope so no captured formula stays
+/// asserted on the solver.
+fn capture_fixedpoint_script_terms(
+    ctx: &mut super::Z3Context,
+    who: &str,
+    items: &[(String, ay_frontend::Command)],
+    relations: &[(String, Vec<String>)],
+) -> Result<CapturedScript, String> {
+    use ay_frontend::Command;
+    ctx.solver.try_push().map_err(|e| format!("{who}: {e}"))?;
+    let body = (|| {
+        let rel_sorts = probe_relation_arg_sorts(ctx, who, relations)?;
+        let mut rules: Vec<Term> = Vec::new();
+        let mut axioms: Vec<Term> = Vec::new();
+        let mut queries: Vec<Term> = Vec::new();
+        for (slice, cmd) in items {
+            match cmd {
+                Command::Rule(_) => {
+                    let text = command_term_text(slice)
+                        .ok_or_else(|| format!("{who}: malformed rule command"))?;
+                    rules.push(elaborate_one_assertion(
+                        ctx,
+                        who,
+                        &format!("(assert {text})"),
+                    )?);
+                }
+                Command::Assert(_) => {
+                    let terms = ctx
+                        .solver
+                        .parse_smtlib2(slice)
+                        .map_err(|e| format!("{who}: {e}"))?;
+                    axioms.extend(terms);
+                }
+                Command::Query(term) => {
+                    queries.push(elaborate_query(
+                        ctx,
+                        who,
+                        slice,
+                        term,
+                        relations,
+                        queries.len(),
+                    )?);
+                }
+                _ => {}
+            }
+        }
+        Ok((rel_sorts, rules, axioms, queries))
+    })();
+    match ctx.solver.try_pop() {
+        Ok(()) => body,
+        Err(e) => Err(format!("{who}: {e}")),
+    }
+}
+
+/// Parse a whole fixedpoint script into `handle` (see the section docs).
+/// Returns the query ASTs on success; on any failure nothing is added
+/// to the handle.
+pub(super) fn fixedpoint_parse_script(
+    ctx: &mut super::Z3Context,
+    handle: &mut super::FixedpointHandle,
+    source: &str,
+    who: &str,
+) -> Result<Vec<Z3_ast>, String> {
+    let items = split_fixedpoint_script(source, who)?;
+    let relations = declare_fixedpoint_script_symbols(ctx, &items, who)?;
+    let (rel_sorts, rules, axioms, queries) =
+        capture_fixedpoint_script_terms(ctx, who, &items, &relations)?;
+    for (name, arg_sorts) in rel_sorts {
+        if !handle.relations.iter().any(|r| r.name == name) {
+            handle
+                .relations
+                .push(super::RegisteredRelation { name, arg_sorts });
+        }
+    }
+    for rule in rules {
+        handle.rules.push(rule);
+        handle.rule_names.push(None);
+    }
+    handle.assertions.extend(axioms);
+    Ok(queries.iter().map(|&t| term_to_ast(ctx, t)).collect())
+}
+
+/// Elaborate one `(query ...)` term: an application is asserted as-is;
+/// a bare relation symbol of positive arity becomes an atom over fresh
+/// probe constants (reachability of some instance, as in z3).
+fn elaborate_query(
+    ctx: &mut super::Z3Context,
+    who: &str,
+    slice: &str,
+    term: &ay_frontend::Term,
+    relations: &[(String, Vec<String>)],
+    ordinal: usize,
+) -> Result<Term, String> {
+    use ay_frontend::Term as ParsedTerm;
+    if let ParsedTerm::Symbol(name) = term {
+        if let Some((_, sort_texts)) = relations.iter().find(|(n, _)| n == name) {
+            if !sort_texts.is_empty() {
+                let mut probe = String::new();
+                let mut args: Vec<String> = Vec::new();
+                for (i, st) in sort_texts.iter().enumerate() {
+                    let v = format!("ay-fp-query-{ordinal}-{i}");
+                    probe.push_str(&format!("(declare-const {v} {st})"));
+                    args.push(v);
+                }
+                probe.push_str(&format!(
+                    "(assert ({} {}))",
+                    ay_core::quote_symbol(name),
+                    args.join(" ")
+                ));
+                return elaborate_one_assertion(ctx, who, &probe);
+            }
+        }
+    }
+    let text = command_term_text(slice).ok_or_else(|| format!("{who}: malformed query command"))?;
+    elaborate_one_assertion(ctx, who, &format!("(assert {text})"))
+}
 
 /// Parse a fixedpoint-rule script string and add its rules, returning the
-/// queries found.
-///
-/// DIVERGENCE: AY does not parse Z3's fixedpoint/Datalog *script* dialect
-/// (`declare-rel` / `declare-var` / `rule` / `query`). Rather than fabricate a
-/// rule/query set — which would silently corrupt the CHC problem and every later
-/// verdict — this sets `Z3_EXCEPTION` and returns an EMPTY (never null) query
-/// vector, adding no rules. Rules must be built with `Z3_fixedpoint_add_rule` /
-/// `Z3_fixedpoint_register_relation` instead.
+/// queries found (see the section docs for the dialect and the one
+/// documented naming boundary).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `f` a valid fixedpoint handle; `s` a
@@ -555,9 +870,12 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_string(
     f: Z3_fixedpoint,
     s: Z3_string,
 ) -> Z3_ast_vector {
-    // The dialect is unsupported and the source is never parsed, so a non-null
-    // pointer is intentionally not dereferenced or scanned.
-    let script_present = !s.is_null();
+    let source: Option<String> = if s.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees a valid null-terminated C string when non-null.
+        unsafe { super::ffi_read_bounded_parser_text(s) }.ok()
+    };
     // SAFETY: `ffi_guard_ptr` null-checks `c` and catches panics; `f` is
     // null-checked below.
     unsafe {
@@ -567,21 +885,23 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_string(
                 ctx.error_msg = Some("null Z3_fixedpoint handle in from_string".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             }
-            if !script_present {
+            let Some(source) = source.as_deref() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_fixedpoint_from_string: null source".to_string());
                 return cache_ast_vector(ctx, Vec::new());
+            };
+            let handle = &mut *f;
+            match fixedpoint_parse_script(ctx, handle, source, "Z3_fixedpoint_from_string") {
+                Ok(queries) => {
+                    ctx.last_error = Z3_OK;
+                    cache_ast_vector(ctx, queries)
+                }
+                Err(message) => {
+                    ctx.last_error = super::Z3_PARSER_ERROR;
+                    ctx.error_msg = Some(message);
+                    std::ptr::null_mut()
+                }
             }
-            // DIVERGENCE: no fixedpoint-script parser — honest empty result
-            // rather than fabricated rules/queries.
-            ctx.last_error = Z3_EXCEPTION;
-            ctx.error_msg = Some(
-                "Z3_fixedpoint_from_string: parsing the Z3 fixedpoint/Datalog script dialect is \
-                 not supported; build rules via Z3_fixedpoint_add_rule instead. No rules were \
-                 added and an empty query vector is returned."
-                    .to_string(),
-            );
-            cache_ast_vector(ctx, Vec::new())
         })
     }
 }

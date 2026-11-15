@@ -96,6 +96,15 @@ impl LraSolver {
         self.dual_simplex_with_max_iters(max_iters)
     }
 
+    /// A `vars_tightened_since_simplex` clear outside the pre-scan: the
+    /// completeness chain survives only when every recorded bound write
+    /// was already covered by a completed pre-scan.
+    pub(crate) fn note_tightened_cleared(&mut self) {
+        if self.tightened_writes != self.tightened_writes_at_scan {
+            self.pre_scan_tightened_complete = false;
+        }
+    }
+
     /// Run dual simplex with a tighter per-invocation budget for propagation-time
     /// checks (#8003 Gap 4). During BCP, a single theory check should not consume
     /// the entire timeout on degenerate problems. If the budget is exhausted, return
@@ -242,8 +251,46 @@ impl LraSolver {
             tightened_buf[..tightened_count]
                 .copy_from_slice(&self.vars_tightened_since_simplex[..tightened_count]);
         }
+        // Sorted-targeted scan at any budget: while
+        // `pre_scan_tightened_complete` holds, every bound write since
+        // the last full scan is recorded in
+        // `vars_tightened_since_simplex`, so the only vars that can
+        // carry a contradictory bound pair are in that set. Scanning it
+        // in ascending var order returns exactly the full scan's first
+        // contradiction (the loop below is shared; only the var
+        // sequence differs). The full scan over 10k+ vars on every BCP
+        // simplex call was a top stack on Certora-class files, where
+        // the tightened set per call is small. A debug oracle below
+        // re-checks completeness on every sorted-targeted scan.
+        let use_sorted_targeted = !use_targeted && self.pre_scan_tightened_complete;
+        if use_sorted_targeted {
+            self.pre_scan_targeted_count += 1;
+            self.pre_scan_scratch.clear();
+            self.pre_scan_scratch
+                .extend_from_slice(&self.vars_tightened_since_simplex);
+            self.pre_scan_scratch.sort_unstable();
+            self.pre_scan_scratch.dedup();
+            #[cfg(debug_assertions)]
+            {
+                for (var, info) in self.vars.iter().enumerate() {
+                    let (Some(lower), Some(upper)) = (&info.lower, &info.upper) else {
+                        continue;
+                    };
+                    let contradicts = lower.value > upper.value
+                        || (lower.value == upper.value && (lower.strict || upper.strict));
+                    debug_assert!(
+                        !contradicts
+                            || self.pre_scan_scratch.binary_search(&(var as u32)).is_ok(),
+                        "pre-scan completeness broken: contradictory var {var} not in tightened set"
+                    );
+                }
+            }
+        }
+        let mut saw_skipped_contradiction = false;
         let scan_count = if use_targeted {
             tightened_count
+        } else if use_sorted_targeted {
+            self.pre_scan_scratch.len()
         } else {
             num_vars
         };
@@ -270,6 +317,8 @@ impl LraSolver {
         for scan_idx in 0..scan_count {
             let var = if use_targeted {
                 tightened_buf[scan_idx] as usize
+            } else if use_sorted_targeted {
+                self.pre_scan_scratch[scan_idx] as usize
             } else {
                 scan_idx
             };
@@ -415,6 +464,7 @@ impl LraSolver {
                     // tracking). Skip this variable and continue scanning for a
                     // non-degenerate conflict. (#4666)
                     if dedup_lits.is_empty() {
+                        saw_skipped_contradiction = true;
                         continue;
                     }
                     // #8784: Stale-reason guard. If any reason is no longer
@@ -429,6 +479,7 @@ impl LraSolver {
                     // without prematurely globally abandoning the check.
                     if !self.conflict_literals_all_asserted(&dedup_lits) {
                         self.stats.stale_conflict_rejected_count += 1;
+                        saw_skipped_contradiction = true;
                         continue;
                     }
                     summarize(
@@ -462,6 +513,7 @@ impl LraSolver {
                 // After contradictory-literal removal, the conflict may be
                 // empty. Skip this variable and continue scanning. (#4666)
                 if dedup_lits.is_empty() {
+                    saw_skipped_contradiction = true;
                     continue;
                 }
                 // #8784: Stale-reason guard. See comment above on the
@@ -470,6 +522,7 @@ impl LraSolver {
                 // live contradiction on another variable before giving up.
                 if !self.conflict_literals_all_asserted(&dedup_lits) {
                     self.stats.stale_conflict_rejected_count += 1;
+                    saw_skipped_contradiction = true;
                     continue;
                 }
                 summarize(
@@ -486,6 +539,22 @@ impl LraSolver {
                     Some(f) => TheoryConflict::with_farkas(dedup_lits, f),
                     None => TheoryConflict::new(dedup_lits),
                 });
+            }
+        }
+
+        // The pre-scan fell through without returning a conflict. A full
+        // or sorted-targeted scan that skipped no contradictory var
+        // (re)establishes the tightened-set completeness chain; a
+        // skipped contradiction (degenerate/stale conflict above) breaks
+        // it, since that var remains contradictory outside future
+        // tightened sets until its bounds change again. The legacy
+        // small-budget targeted scan neither establishes nor breaks it.
+        if saw_skipped_contradiction {
+            self.pre_scan_tightened_complete = false;
+        } else {
+            self.tightened_writes_at_scan = self.tightened_writes;
+            if !use_targeted {
+                self.pre_scan_tightened_complete = true;
             }
         }
 
@@ -534,32 +603,24 @@ impl LraSolver {
         }
 
         let mut last_print = 0usize;
-        // Cycling detection: track basis signatures (hash of basic variable set).
-        // With InfRational (#4919 RC0), degenerate cycling from strict bounds
-        // is eliminated. The basis hash check serves as a safety net for any
-        // remaining degenerate cases (e.g., equal non-strict bounds creating
-        // zero-step pivots). When repeated bases are detected, Bland mode
-        // activates to guarantee termination (#2718, #4919 Phase 2).
-
-        // Reset Bland mode at the start of each simplex invocation (#4919 Phase 2).
-        // Bland mode is activated during the run if basis repeats are detected.
+        // Start each check with the cheaper pivot heuristic. A bounded number
+        // of pivots later, switch to the least-index rule in Dutertre and de
+        // Moura's dual-simplex Check (CAV 2006, Fig. 3). Comparing a basis hash
+        // only with its immediate predecessor cannot detect an ordinary cycle:
+        // every pivot changes the basis, and a repeated basis occurs at least
+        // two pivots later. A pivot count needs no history or hash assumptions.
+        let was_bland_mode = self.bland_mode;
         self.bland_mode = false;
-        self.basis_repeat_count = 0;
-
-        // Compute initial basis hash from all basic variables (#6221 Finding 1).
-        // Use incremental XOR hashing: O(1) per pivot instead of O(rows).
-        // mix_u32 provides avalanche mixing to avoid trivial XOR collisions.
-        let mut basis_hash: u64 = 0;
-        for row in &self.rows {
-            basis_hash ^= Self::mix_u32(row.basic_var);
-        }
-        let mut prev_basis_hash: u64 = basis_hash;
+        self.pivots_before_bland = 0;
 
         // Build infeasible heap before the main loop (#4919 Phase B, #8782).
         // When heap_stale is false, incremental track_var_feasibility() calls
         // during bound assertion have kept the heap current — skip the O(rows)
         // full rebuild.
-        if self.heap_stale {
+        // A prior bounded check may have left least-index keys in the heap.
+        // Rebuild those keys for the ordinary heuristic even when the heap's
+        // membership itself is current.
+        if self.heap_stale || was_bland_mode {
             self.rebuild_infeasible_heap();
         }
 
@@ -648,11 +709,24 @@ impl LraSolver {
         let bland_gated_cap = Self::dual_simplex_iteration_budget(max_iters, true);
         for iter in 0..bland_gated_cap {
             // #7852: keep the smaller budget while searching normally, but
-            // once repeated bases trigger Bland mode allow up to 10x more
+            // once the pivot threshold triggers least-index mode allow up to 10x more
             // pivots (capped at 10M) so LP-family cases can finish.
             let cap = Self::dual_simplex_iteration_budget(max_iters, self.bland_mode);
             if iter >= cap {
                 break;
+            }
+            if self.solve_deadline_passed() {
+                summarize(
+                    "unknown",
+                    "solve_deadline_passed",
+                    iterations_run,
+                    pivot_count,
+                    nonbasic_repair_rounds,
+                    leaving_fixups,
+                    self.rows.len(),
+                    self.vars.len(),
+                );
+                return TheoryResult::Unknown;
             }
             iterations_run = iter + 1;
             trace!(
@@ -878,8 +952,7 @@ impl LraSolver {
 
             // Find a suitable pivot candidate using cost-benefit heuristic (#4919 Phase 2).
             // Prefers entering variables with smaller column size (cheaper pivot).
-            // Falls back to Bland's rule after BLAND_THRESHOLD repeated bases to
-            // guarantee termination on degenerate LPs (#2718).
+            // Uses least-index selection after BLAND_THRESHOLD pivots.
             let chosen: Option<(u32, InfRational)> =
                 if let Some((entering_var, _direction, coeff_pos)) =
                     self.find_beneficial_entering(row_idx, violated_bound)
@@ -1026,6 +1099,11 @@ impl LraSolver {
             // check() call on a dense LP from burning unbounded CPU time (#8003).
             if self.stats.check_pivot_count >= self.check_pivot_budget() {
                 self.stats.check_pivot_budget_exhaustions += 1;
+                // The pivot has changed the basis, but heap re-tracking and
+                // the leaving nonbasic's bound fixup are still below. A retry
+                // must rebuild basic membership and scan all nonbasics.
+                self.heap_stale = true;
+                self.warm_invalidate();
                 summarize(
                     "unknown",
                     "check_pivot_budget_exhausted",
@@ -1044,26 +1122,25 @@ impl LraSolver {
             self.track_var_feasibility(entering_var);
             self.track_var_feasibility(leaving_var);
 
-            // Track basis hash for cycling detection → Bland mode activation (#4919 Phase 2).
-            // Incremental O(1) update (#6221 Finding 1): XOR out leaving, XOR in entering.
+            // The least-index phase follows the bounded-variable dual-simplex
+            // Check of Dutertre and de Moura (CAV 2006, Fig. 3): choose the
+            // smallest infeasible basic and smallest eligible nonbasic, then
+            // move the leaving basic exactly to its violated bound. The last
+            // step is handled by compute_update_amount_with_coeff, which does
+            // not clamp the entering variable in this phase.
             if !self.bland_mode {
-                basis_hash ^= Self::mix_u32(leaving_var) ^ Self::mix_u32(entering_var);
-                if basis_hash == prev_basis_hash {
-                    self.basis_repeat_count += 1;
-                    if self.basis_repeat_count >= BLAND_THRESHOLD {
-                        self.bland_mode = true;
-                        // Rebuild heap with smallest-index keys for anti-cycling
-                        self.rebuild_infeasible_heap();
-                        debug!(
-                            target: "ay::lra",
-                            iter,
-                            repeat_count = self.basis_repeat_count,
-                            "LRA activating Bland's rule after repeated bases"
-                        );
-                    }
-                } else {
-                    self.basis_repeat_count = 0;
-                    prev_basis_hash = basis_hash;
+                self.pivots_before_bland = self.pivots_before_bland.saturating_add(1);
+                if self.pivots_before_bland >= BLAND_THRESHOLD {
+                    self.bland_mode = true;
+                    // Existing heap keys encode the old heuristic. Rebuild it
+                    // so the next leaving variable is the smallest index.
+                    self.rebuild_infeasible_heap();
+                    debug!(
+                        target: "ay::lra",
+                        iter,
+                        pivots = self.pivots_before_bland,
+                        "LRA activating least-index pivoting"
+                    );
                 }
             }
 
@@ -1127,6 +1204,23 @@ impl LraSolver {
 }
 
 impl LraSolver {
+    /// Install the wall-clock deadline of the enclosing solve. The dual
+    /// simplex answers `Unknown` once it has passed (polled before every
+    /// iteration: one clock read is negligible next to a pivot, and over
+    /// exploding rationals a single pivot can take seconds, so the pivot
+    /// budget alone let one check run far past the caller's timeout (measured
+    /// through the Z3 C API: `y / x > x, y = 1` with a 3 s timeout never
+    /// returned).
+    pub fn set_deadline(&mut self, deadline: ay_core::time::Instant) {
+        self.solve_deadline = Some(deadline);
+    }
+
+    /// Whether the installed solve deadline has passed.
+    pub(crate) fn solve_deadline_passed(&self) -> bool {
+        self.solve_deadline
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
     /// Per-check pivot budget (#uc-lia-unknown).
     ///
     /// The historical value was a FIXED 10,000 (`CHECK_PIVOT_BUDGET`), justified by

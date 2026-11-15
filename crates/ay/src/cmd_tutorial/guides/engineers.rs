@@ -165,7 +165,7 @@ measure the model, preserve UNKNOWN, and validate returned solutions.
 
 Run the complete Python programs from a source checkout:
 
-  cargo build -p ay-ffi
+  targo --unverified build -p ay-ffi    # or: cargo build -p ay-ffi
   PYTHONPATH=bindings/python python3 bindings/python/examples/search_sudoku.py
   PYTHONPATH=bindings/python python3 bindings/python/examples/search_token_router.py
   PYTHONPATH=bindings/python python3 bindings/python/examples/search_minesweeper.py
@@ -224,7 +224,8 @@ fn automation() {
     print_block(
         r#"Build and invoke the exact binary you intend to ship:
 
-  cargo build --release --locked -p ay --features cli --bin ay
+  targo --unverified build --release --locked -p ay --features cli --bin ay
+      (`cargo build ...` with the same arguments without the Trust toolchain)
   ./target/release/ay --features
 
 Batch SMT over stdin (pass argv and stdin directly, without a shell):
@@ -308,7 +309,8 @@ Assumptions, cores, interrupts, resource limits, and typed values are exposed.
 
 Run the complete in-tree example:
 
-  cargo run -p ay-dpll --example native_api
+  targo --unverified run -p ay-dpll --example native_api
+      (`cargo run ...` with the same arguments without the Trust toolchain)
 
 For finite-domain search, `ay-search` layers names, domains, linear expressions,
 global constraints, enumeration, and optimization over AY's CP-SAT machinery.
@@ -355,7 +357,7 @@ Unsupported operations fail explicitly or return unknown where appropriate.
 3. Measure the exact corpus
 
   ay diagnose --reference z3 problem.smt2
-  ay bench run EVAL --reference-solver "$(command -v z3)"
+  ay bench run EVAL --reference-solver z3
 
 4. Move stable code to native Rust or AY Search when you want typed construction.
 

@@ -97,7 +97,22 @@ fn run_flow_cutter(path: &std::path::Path, graph: &str, budget: Duration) -> Opt
         .spawn()
         .ok()?;
     let pid = child.id();
-    child.stdin.take()?.write_all(graph.as_bytes()).ok()?;
+    // A FlowCutter that dies before reading all of its input must cost the TD
+    // scores, not the counter: a plain `ChildStdin` write raises SIGPIPE, which
+    // a `unix_hardened` build does not ignore (`ay_sys::child_pipe`; measured
+    // 2026-09-26: `ay model-count` exited 141 here).
+    let Ok(mut stdin) = ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let written = stdin.write_all(graph.as_bytes());
+    drop(stdin); // EOF ends the graph.
+    if written.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
     let stdout = child.stdout.take()?;
     // Reader thread accumulates output while we wait out the budget.
     let reader = std::thread::spawn(move || {
@@ -363,6 +378,31 @@ mod tests {
         let mid = scores[2];
         assert!(mid >= scores[0] && mid >= scores[4], "{scores:?}");
         assert!(scores.iter().all(|&s| s >= 0.0));
+    }
+
+    /// A FlowCutter that exits without reading its input costs the TD scores,
+    /// never the process. The graph is far larger than a pipe buffer, so the
+    /// write can only end in `EPIPE` once the child is gone; on a plain
+    /// `ChildStdin` in a `unix_hardened` build (SIGPIPE at its default,
+    /// terminating disposition) that write killed this test binary with exit
+    /// 141, as it killed `ay model-count`.
+    #[cfg(unix)]
+    #[test]
+    fn a_flow_cutter_that_dies_unread_declines_instead_of_killing_the_counter() {
+        // `true` exits at once and never reads stdin. An existing binary, not
+        // a freshly written script: exec'ing a file this multi-threaded test
+        // process just wrote can fail with ETXTBSY, which would decline on the
+        // spawn and never reach the write under test.
+        let exits_unread = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|path| path.exists())
+            .expect("a `true` binary");
+        let graph = "1 2\n".repeat(1 << 20);
+        assert!(
+            run_flow_cutter(exits_unread, &graph, Duration::from_secs(5)).is_none(),
+            "a FlowCutter that read nothing produced no decomposition"
+        );
     }
 
     #[test]

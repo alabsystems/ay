@@ -140,7 +140,7 @@ impl IncrementalPdrContext {
             level_act_vars: Vec::new(),
             query_act_vars: Vec::new(),
             lemma_exprs: Vec::new(),
-            own_smt: SmtContext::new(),
+            own_smt: SmtContext::new_search(),
         }
     }
 

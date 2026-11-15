@@ -363,17 +363,35 @@ pub(crate) fn validate_linear_ideal_refutation_with_progress(
 /// Sharing one extraction and one `WorkMeter` matters: this runs on every
 /// trust-kind theory lemma of every proof, and re-parsing each clause would
 /// double the caller's proof-wide resource charge for the whole `Generic` arm.
-/// Declaration-free recognizer used by proof producers: `true` exactly when
-/// the strict `crate::checker` `ArithClauseTautology` arm accepts the
-/// clause (recognizer IS the validator, so classifier and checker cannot
-/// drift). Runs under the validator's own work meter with an unbounded
-/// progress callback.
+/// Declaration-free recognizer used by proof producers: `true` only when the
+/// strict `crate::checker` `ArithClauseTautology` arm accepts the clause (the
+/// recognizer runs the validator's own code, so a clause it labels always
+/// validates). It is the validator minus the modular affine identities
+/// Carcara's `poly_simp` cannot replay: those that read elaboration's
+/// power-of-two shifts and those that need a monomial whose coefficient wraps
+/// to zero (`bv_affine` module docs); only
+/// [`recognize_native_bv_affine_identity`] labels those. Runs under the
+/// validator's own work meter with an unbounded progress callback.
 #[must_use]
 pub fn recognize_arith_clause_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
-    validate_generic_arithmetic_refutation_with_progress(terms, ProofId(0), clause, &mut |_, _| {
-        true
-    })
-    .is_ok()
+    generic_arithmetic_refutation(terms, ProofId(0), clause, &mut |_, _| true, false).is_ok()
+}
+
+/// Whether `clause` is an exact modular affine identity once elaboration's
+/// power-of-two shifts `concat(extract[w-k-1:0](x), 0_k)` are read as `2^k * x`
+/// and a coefficient may wrap to zero.
+///
+/// The strict `ArithClauseTautology` arm accepts such a clause, but Carcara's
+/// `poly_simp` cannot replay every one (it has no `concat`, and it keeps a
+/// monomial whose coefficient wraps to zero), so one only this recognizer
+/// labels prints as a `hole`. It is deliberately
+/// NOT part of [`recognize_arith_clause_tautology`]: the lanes that consult
+/// that recognizer first would otherwise prefer this unprintable lemma where a
+/// printable one (a checked bit-blast circuit) exists. Only a lane that has
+/// weighed that trade asks this.
+#[must_use]
+pub fn recognize_native_bv_affine_identity(terms: &TermStore, clause: &[TermId]) -> bool {
+    super::bv_affine::check_native(terms, clause, &mut |_, _| true).unwrap_or(false)
 }
 
 pub(crate) fn validate_generic_arithmetic_refutation_with_progress(
@@ -382,6 +400,29 @@ pub(crate) fn validate_generic_arithmetic_refutation_with_progress(
     clause: &[TermId],
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
+    generic_arithmetic_refutation(terms, step_id, clause, progress, true)
+}
+
+fn generic_arithmetic_refutation(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+    elaborated_shifts: bool,
+) -> Result<(), ProofCheckError> {
+    let affine = if elaborated_shifts {
+        super::bv_affine::check_native(terms, clause, progress)?
+    } else {
+        super::bv_affine::check(terms, clause, progress)?
+    };
+    if affine
+        || super::bv_affine::complement_relation(terms, clause, progress)?.is_some()
+        || super::bv_affine::guarded_mask_identity(terms, clause, progress)?.is_some()
+        || super::bv_affine::context_identity(terms, clause, progress)?.is_some()
+        || super::bv_affine::partition_identity(terms, clause, progress)?.is_some()
+    {
+        return Ok(());
+    }
     decide_generic_arithmetic_refutation_with_progress(terms, clause, progress).map_err(|reason| {
         if reason == WORK_METER_RESOURCE_LIMIT {
             ProofCheckError::ResourceLimit

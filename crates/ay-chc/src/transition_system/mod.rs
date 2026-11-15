@@ -46,6 +46,7 @@
 //! - `pdr/solver.rs:1010-1020`
 
 mod extract;
+pub(crate) use extract::{TsClauseDisjunct, TsClauseDisjuncts};
 #[allow(dead_code)] // #8879 foundation: runtime enqueue/install wiring is out of scope.
 pub(crate) mod transition_cluster;
 // Trust: temporal-logic backend uses the public `tla2` name. The module is now
@@ -55,6 +56,7 @@ pub(crate) mod transition_cluster;
 #[allow(unused_imports)]
 pub(crate) use transition_cluster as tla2_cluster;
 mod versioning;
+pub(crate) use versioning::state_var_time;
 
 use crate::{ChcExpr, ChcVar, PredicateId};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
@@ -272,3 +274,5 @@ impl TransitionSystem {
 #[allow(clippy::unwrap_used, clippy::panic)]
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod versioning_names_tests;

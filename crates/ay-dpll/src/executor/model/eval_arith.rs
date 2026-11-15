@@ -165,6 +165,12 @@ impl Executor {
                     _ => continue,
                 }
             }
+            // Only a value the solve ASSIGNED is a witness, never the
+            // evaluator's default 0 (it refuted a repeated check of
+            // `forall qi. ... 4 <= (div -1 0)`; z3: sat, `div0(-1) = 4`).
+            if !Self::model_assigns_int(model, candidate.witness) {
+                continue;
+            }
             // The witness is Int-sorted by construction, so no input can make
             // this fail; it is here because the cost of being wrong is a
             // non-integer standing in for an integer division, which would be

@@ -42,8 +42,52 @@
 mod gauss;
 
 use super::*;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// The probe's stop condition. On the wall clock it is the deadline; under
+/// `--sat-deterministic-inproc` it is a count of elementary operations that
+/// each phase charges as it goes, against `GF_PROBE_WORK_BUDGET`: the
+/// classification pass per clause (which also covers the scope pass's second
+/// read of the negative clauses), the fit per scope, the elimination per
+/// pivot.
+pub(super) struct GfBudget {
+    deadline: Option<Instant>,
+    ops: Cell<u64>,
+}
+
+impl GfBudget {
+    /// A wall budget of `wall`, or, when `counted`, the work budget.
+    fn new(wall: Duration, counted: bool) -> Self {
+        let deadline = (!counted).then(|| Instant::now() + wall);
+        Self {
+            deadline,
+            ops: Cell::new(0),
+        }
+    }
+
+    /// Charge `ops` elementary operations (counted under the flag only).
+    #[inline]
+    pub(super) fn charge(&self, ops: u64) {
+        if self.deadline.is_none() {
+            self.ops.set(self.ops.get().saturating_add(ops));
+        }
+    }
+
+    #[inline]
+    pub(super) fn exhausted(&self) -> bool {
+        match self.deadline {
+            Some(deadline) => Instant::now() >= deadline,
+            None => self.ops.get() >= GF_PROBE_WORK_BUDGET,
+        }
+    }
+}
+
+/// `GF_PROBE_BUDGET` in elementary operations, under
+/// `--sat-deterministic-inproc`: 2,000 ms at the Gauss elimination's own
+/// figure of ~33.5M u8 operations per ~10 ms pivot column.
+const GF_PROBE_WORK_BUDGET: u64 = 6_700_000_000;
 
 /// Total wall budget for the whole probe (detection + fit + elimination +
 /// verification). The family completes in single-digit milliseconds; the
@@ -144,7 +188,7 @@ impl Solver {
     /// The probe proper: detect, fit, eliminate, reconstruct, verify.
     /// Immutable on solver state; `None` on any bail-out.
     pub(super) fn gf_linear_probe(&self, budget: Duration) -> Option<Vec<bool>> {
-        let deadline = Instant::now() + budget;
+        let deadline = GfBudget::new(budget, self.deterministic_inproc());
         // Cheap count gates first: the family is 1200 vars / 21K clauses.
         let active = self.arena.active_clause_count();
         if active == 0 || active > GF_PROBE_MAX_ACTIVE_CLAUSES || self.num_vars > GF_PROBE_MAX_VARS
@@ -152,21 +196,28 @@ impl Solver {
             return None;
         }
 
-        let det = self.gf_detect(deadline)?;
+        let det = self.gf_detect(&deadline)?;
 
         // Fit one linear equation per scope; any unfittable scope bails.
         let mut eqs: Vec<(Vec<u32>, Vec<u8>, u8)> = Vec::with_capacity(det.scopes.len());
         for scope in &det.scopes {
-            if self.is_interrupted() || Instant::now() >= deadline {
+            if self.is_interrupted() || deadline.exhausted() {
                 return None;
             }
+            // Fit work: (d-1)^(r-1) candidates, each checked against d^r tuples.
+            let r = scope.groups.len() as u32;
+            deadline.charge(
+                (det.d as u64 - 1)
+                    .saturating_pow(r.saturating_sub(1))
+                    .saturating_mul((det.d as u64).saturating_pow(r)),
+            );
             let (coefs, c) = gauss::fit_scope(det.d, scope.groups.len(), &scope.forbidden)?;
             eqs.push((scope.groups.clone(), coefs, c));
         }
 
         // Dense Gaussian elimination over GF(d). Underdetermined is fine
         // (free unknowns take value 0); inconsistent bails WITHOUT a verdict.
-        let values = gauss::solve_linear_system(det.d, det.groups.len(), &eqs, deadline)?;
+        let values = gauss::solve_linear_system(det.d, det.groups.len(), &eqs, &deadline)?;
 
         // Boolean reconstruction: in each one-hot group, exactly the variable
         // whose rank equals the group's GF(d) value is true. Variables in no
@@ -195,7 +246,7 @@ impl Solver {
     /// Structural detection. Strict: every active clause must be exactly one
     /// of {uniform-width all-positive ALO, within-group all-negative AMO
     /// binary, uniform-width all-negative cross-group forbidden tuple}.
-    fn gf_detect(&self, deadline: Instant) -> Option<GfDetection> {
+    fn gf_detect(&self, deadline: &GfBudget) -> Option<GfDetection> {
         let classified = self.gf_classify(deadline)?;
         let d = classified.d;
         if !is_prime(d) || d > GF_PROBE_MAX_DOMAIN {
@@ -213,7 +264,7 @@ impl Solver {
     /// Pass 1 — polarity/width census over the active clause DB. Bails on
     /// the first mixed-polarity clause (which almost every off-family
     /// instance has within its first few clauses) or non-uniform ALO width.
-    fn gf_classify(&self, deadline: Instant) -> Option<GfClassified> {
+    fn gf_classify(&self, deadline: &GfBudget) -> Option<GfClassified> {
         let mut d = 0usize;
         let mut alo: Vec<usize> = Vec::new();
         let mut neg: Vec<usize> = Vec::new();
@@ -225,11 +276,12 @@ impl Solver {
             since_check += 1;
             if since_check >= GF_PROBE_CHECK_INTERVAL {
                 since_check = 0;
-                if self.is_interrupted() || Instant::now() >= deadline {
+                if self.is_interrupted() || deadline.exhausted() {
                     return None;
                 }
             }
             let lits = self.arena.literals(off);
+            deadline.charge(1 + lits.len() as u64);
             if lits.is_empty() {
                 return None;
             }
@@ -290,7 +342,7 @@ impl Solver {
         neg: &[usize],
         table: &GfGroups,
         d: usize,
-        deadline: Instant,
+        deadline: &GfBudget,
     ) -> Option<Vec<GfScope>> {
         const UNGROUPED: u32 = u32::MAX;
         // Pairwise AMO presence per group: (lo_rank, hi_rank) bit per group.
@@ -308,7 +360,7 @@ impl Solver {
             since_check += 1;
             if since_check >= GF_PROBE_CHECK_INTERVAL {
                 since_check = 0;
-                if self.is_interrupted() || Instant::now() >= deadline {
+                if self.is_interrupted() || deadline.exhausted() {
                     return None;
                 }
             }

@@ -98,6 +98,50 @@ fn algebraic_stats_dump() {
     );
 }
 
+/// Exact split accumulation for the adjusted constant in
+/// `detect_algebraic_full`: subtract `coeff * val` from the running
+/// constant, keeping the integral part in `adj_int` and any fractional
+/// contributions in `adj_frac`.
+///
+/// The plain form (`adj -= BigRational::from(coeff) * val`) pays a
+/// gcd-reduce on every substitution, which dominates the elimination
+/// loop on bound-heavy inputs (Certora QF_UFDTNIA: ~2.5k full passes x
+/// ~650 equations x ~3 rounds). Rational arithmetic is exact and
+/// addition commutes, so the split value is identical; integral
+/// substitutions -- the overwhelmingly common case, and the only kind
+/// Case 1 ever derives -- stay in pure `BigInt` arithmetic.
+fn adj_subtract_scaled(
+    adj_int: &mut BigInt,
+    adj_frac: &mut Option<BigRational>,
+    coeff: &BigInt,
+    val: &BigRational,
+) {
+    if coeff.is_zero() || val.is_zero() {
+        return;
+    }
+    if val.denom().is_one() {
+        *adj_int -= coeff * val.numer();
+    } else {
+        let term = BigRational::from(coeff.clone()) * val;
+        match adj_frac {
+            Some(frac) => *frac -= term,
+            None => *adj_frac = Some(-term),
+        }
+    }
+}
+
+/// Combine the split adjusted constant; `None` when it is fractional
+/// (the caller skips such equations, exactly as before).
+fn adj_final_integer(adj_int: BigInt, adj_frac: Option<BigRational>) -> Option<BigInt> {
+    match adj_frac {
+        None => Some(adj_int),
+        Some(frac) => {
+            let adj = BigRational::from(adj_int) + frac;
+            adj.denom().is_one().then(|| adj.numer().clone())
+        }
+    }
+}
+
 impl LiaSolver<'_> {
     /// Current input stamp for the `detect_algebraic_equalities` memo.
     ///
@@ -200,7 +244,10 @@ impl LiaSolver<'_> {
         // `detect_algebraic_equalities` memo misses on each probe step
         // because the step itself bumps `shared_eq_revision`).
         for &var_term in &self.integer_vars {
-            if let Some((Some(lower), Some(upper))) = self.lra.get_bounds_ref(var_term) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness): these values
+            // are substituted into the shared-equality system and can end in
+            // a propagated equality or a `0 = c` conflict.
+            if let Some((Some(lower), Some(upper))) = self.justified_bounds_ref(var_term) {
                 if lower.value == upper.value && !lower.strict && !upper.strict {
                     tight_bound_values.insert(var_term, lower.value.to_big());
                     initial_tight.insert(var_term);
@@ -243,7 +290,7 @@ impl LiaSolver<'_> {
 
         // Equations from assertion view (positive equalities from assert_literal)
         for &literal in &self.assertion_view().positive_equalities {
-            if let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) {
+            if let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) {
                 if name != "=" || args.len() != 2 {
                     continue;
                 }
@@ -253,8 +300,8 @@ impl LiaSolver<'_> {
                 // elimination treats opaque non-Int terms as variables with
                 // coefficient 1, producing spurious cross-sort equalities
                 // (e.g., x:String = 0:Int) that cause false UNSAT via EUF.
-                let lhs_sort = self.terms.sort(args[0]);
-                let rhs_sort = self.terms.sort(args[1]);
+                let lhs_sort = self.terms().sort(args[0]);
+                let rhs_sort = self.terms().sort(args[1]);
                 if !matches!(lhs_sort, Sort::Int | Sort::Real)
                     || !matches!(rhs_sort, Sort::Int | Sort::Real)
                 {
@@ -271,8 +318,8 @@ impl LiaSolver<'_> {
             // #7451: Sort-guard shared equalities too. EUF→LIA propagation is
             // already filtered in StringsLiaSolver::check(), but apply the same
             // guard here defensively.
-            let lhs_sort = self.terms.sort(lhs);
-            let rhs_sort = self.terms.sort(rhs);
+            let lhs_sort = self.terms().sort(lhs);
+            let rhs_sort = self.terms().sort(rhs);
             if !matches!(lhs_sort, Sort::Int | Sort::Real)
                 || !matches!(rhs_sort, Sort::Int | Sort::Real)
             {
@@ -341,7 +388,10 @@ impl LiaSolver<'_> {
                 equations.iter().enumerate()
             {
                 let mut coeffs = var_coeffs.clone();
-                let mut adj_constant = BigRational::from(constant.clone());
+                // Split adjusted constant (see `adj_subtract_scaled`):
+                // integral part plus rare fractional contributions.
+                let mut adj_int = constant.clone();
+                let mut adj_frac: Option<BigRational> = None;
                 let mut reasons: Vec<TheoryLit> = initial_reasons.clone();
                 let mut reason_seen: HashSet<TheoryLit> = reasons.iter().copied().collect();
 
@@ -365,8 +415,7 @@ impl LiaSolver<'_> {
                 for var in &relevant_bound_vars {
                     let val = &tight_bound_values[var];
                     if let Some(coeff) = coeffs.remove(var) {
-                        let coeff_rat = BigRational::from(coeff);
-                        adj_constant -= &coeff_rat * val;
+                        adj_subtract_scaled(&mut adj_int, &mut adj_frac, &coeff, val);
 
                         if debug {
                             safe_eprintln!(
@@ -376,8 +425,10 @@ impl LiaSolver<'_> {
                             );
                         }
 
-                        // Add tight bound reasons (borrowed — read-only use)
-                        if let Some((Some(lower), Some(upper))) = self.lra.get_bounds_ref(*var) {
+                        // Add tight bound reasons (borrowed — read-only use).
+                        // Same justified filter as the scan that admitted the
+                        // tight value (#nia-sign-cut-soundness).
+                        if let Some((Some(lower), Some(upper))) = self.justified_bounds_ref(*var) {
                             if lower.value == upper.value && !lower.strict && !upper.strict {
                                 for (reason, val) in
                                     lower.reasons.iter().zip(lower.reason_values.iter())
@@ -471,10 +522,8 @@ impl LiaSolver<'_> {
                 // Remove zero coefficients
                 coeffs.retain(|_, c| !c.is_zero());
 
-                // Convert adjusted constant to BigInt
-                let final_constant = if adj_constant.denom().is_one() {
-                    adj_constant.numer().clone()
-                } else {
+                // Convert adjusted constant to BigInt (fractional: skip)
+                let Some(final_constant) = adj_final_integer(adj_int, adj_frac) else {
                     continue;
                 };
 
@@ -514,7 +563,7 @@ impl LiaSolver<'_> {
                                 i,
                                 r.term,
                                 r.value,
-                                self.terms.get(r.term),
+                                self.terms().get(r.term),
                             );
                         }
                     }
@@ -734,7 +783,9 @@ impl LiaSolver<'_> {
         // Fresh integer tight-bound scan (same rule as detect_algebraic_full).
         let mut initial_tbv: HashMap<TermId, BigRational> = HashMap::default();
         for &var_term in &self.integer_vars {
-            if let Some((Some(lower), Some(upper))) = self.lra.get_bounds_ref(var_term) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness), as in
+            // `detect_algebraic_full`.
+            if let Some((Some(lower), Some(upper))) = self.justified_bounds_ref(var_term) {
                 if lower.value == upper.value && !lower.strict && !upper.strict {
                     initial_tbv.insert(var_term, lower.value.to_big());
                 }
@@ -801,12 +852,12 @@ impl LiaSolver<'_> {
     fn probe_collect_all_equations(&self) -> Vec<(HashMap<TermId, BigInt>, BigInt)> {
         let mut eqs = Vec::new();
         for &literal in &self.assertion_view().positive_equalities {
-            if let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) {
+            if let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) {
                 if name != "=" || args.len() != 2 {
                     continue;
                 }
-                let lhs_sort = self.terms.sort(args[0]);
-                let rhs_sort = self.terms.sort(args[1]);
+                let lhs_sort = self.terms().sort(args[0]);
+                let rhs_sort = self.terms().sort(args[1]);
                 if !matches!(lhs_sort, Sort::Int | Sort::Real)
                     || !matches!(rhs_sort, Sort::Int | Sort::Real)
                 {
@@ -834,8 +885,8 @@ impl LiaSolver<'_> {
         for i in start..end {
             let (lhs, rhs, _) = &self.shared_equalities[i];
             let (lhs, rhs) = (*lhs, *rhs);
-            let lhs_sort = self.terms.sort(lhs);
-            let rhs_sort = self.terms.sort(rhs);
+            let lhs_sort = self.terms().sort(lhs);
+            let rhs_sort = self.terms().sort(rhs);
             if !matches!(lhs_sort, Sort::Int | Sort::Real)
                 || !matches!(rhs_sort, Sort::Int | Sort::Real)
             {
@@ -1090,6 +1141,76 @@ impl ProbeAlgIncr {
                     ProbeReduce::Live => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod adj_constant_tests {
+    use super::*;
+
+    fn rat(n: i64, d: i64) -> BigRational {
+        BigRational::new(BigInt::from(n), BigInt::from(d))
+    }
+
+    /// Reference: the pre-change plain BigRational accumulation.
+    fn reference(start: &BigInt, subs: &[(BigInt, BigRational)]) -> Option<BigInt> {
+        let mut adj = BigRational::from(start.clone());
+        for (coeff, val) in subs {
+            adj -= BigRational::from(coeff.clone()) * val;
+        }
+        adj.denom().is_one().then(|| adj.numer().clone())
+    }
+
+    fn split(start: &BigInt, subs: &[(BigInt, BigRational)]) -> Option<BigInt> {
+        let mut adj_int = start.clone();
+        let mut adj_frac = None;
+        for (coeff, val) in subs {
+            adj_subtract_scaled(&mut adj_int, &mut adj_frac, coeff, val);
+        }
+        adj_final_integer(adj_int, adj_frac)
+    }
+
+    #[test]
+    fn split_accumulation_matches_plain_rational_arithmetic() {
+        let big: BigInt = BigInt::from(1i64) << 200;
+        let cases: Vec<(BigInt, Vec<(BigInt, BigRational)>)> = vec![
+            // Integral substitutions only.
+            (
+                BigInt::from(7),
+                vec![(BigInt::from(3), rat(2, 1)), (BigInt::from(-1), rat(5, 1))],
+            ),
+            // Zero coefficient and zero value are exact no-ops.
+            (
+                BigInt::from(-4),
+                vec![(BigInt::from(0), rat(9, 1)), (BigInt::from(9), rat(0, 1))],
+            ),
+            // Fractional parts cancelling to an integer.
+            (
+                BigInt::from(1),
+                vec![(BigInt::from(1), rat(1, 2)), (BigInt::from(1), rat(1, 2))],
+            ),
+            // Fractional parts cancelling to zero.
+            (
+                BigInt::from(3),
+                vec![(BigInt::from(2), rat(1, 2)), (BigInt::from(-2), rat(1, 2))],
+            ),
+            // Genuinely fractional result: both forms decline.
+            (BigInt::from(0), vec![(BigInt::from(1), rat(1, 3))]),
+            // Huge coefficient times integral value.
+            (big.clone(), vec![(big.clone(), rat(-2, 1))]),
+            // Mixed integral and fractional, still fractional overall.
+            (
+                BigInt::from(10),
+                vec![(BigInt::from(4), rat(1, 1)), (BigInt::from(1), rat(2, 3))],
+            ),
+        ];
+        for (start, subs) in &cases {
+            assert_eq!(
+                split(start, subs),
+                reference(start, subs),
+                "start={start} subs={subs:?}"
+            );
         }
     }
 }

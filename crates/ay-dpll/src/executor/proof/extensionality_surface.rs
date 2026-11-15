@@ -56,6 +56,15 @@ impl Executor {
         &self,
         rejected: ay_core::ProofId,
     ) -> Option<Result<String, AlethePrintError>> {
+        // A published render: spelled in this executor's dialect like the
+        // other export entry points.
+        self.in_alethe_dialect(|| self.export_extensionality_surface_in_dialect(rejected))
+    }
+
+    fn export_extensionality_surface_in_dialect(
+        &self,
+        rejected: ay_core::ProofId,
+    ) -> Option<Result<String, AlethePrintError>> {
         if self.last_unsat_proof_reconstruction_suppressed
             || self.last_proof_has_finite_enum_sidecar()
         {

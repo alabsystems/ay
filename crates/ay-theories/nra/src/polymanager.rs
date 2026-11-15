@@ -594,7 +594,8 @@ impl PolyManager {
         let pb = &self.monos[b.0 as usize].pows;
         let mut out: Vec<(PVar, u32)> = Vec::with_capacity(pa.len() + pb.len());
         let (mut i, mut j) = (0usize, 0usize);
-        while i < pa.len() || j < pb.len() {
+        // Ends exactly when both cursors run past their inputs.
+        loop {
             match (pa.get(i), pb.get(j)) {
                 (Some(&(va, ea)), Some(&(vb, eb))) => match va.cmp(&vb) {
                     Ordering::Less => {
@@ -619,7 +620,7 @@ impl PolyManager {
                     out.push(t);
                     j += 1;
                 }
-                (None, None) => unreachable!("loop guard"),
+                (None, None) => break,
             }
         }
         self.intern(out)

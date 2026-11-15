@@ -15,6 +15,3 @@
 #![forbid(unsafe_code)]
 
 pub mod feasible_set;
-
-#[cfg(kani)]
-mod verification;

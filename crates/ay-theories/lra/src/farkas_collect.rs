@@ -72,6 +72,45 @@ impl LraSolver {
         true
     }
 
+    /// Whether every non-sentinel reason of `bound` — its direct reason atoms
+    /// AND its provenance chain — is currently asserted on this solver's own
+    /// trail or the cross-theory trail (#nia-sign-cut-soundness).
+    ///
+    /// This is the bound-level form of [`Self::conflict_literals_all_asserted`]
+    /// and the same predicate `retract_unjustified_row_bounds` (#A2) applies
+    /// before discarding a bound from a Farkas conflict. A bound that fails it
+    /// is not a consequence of the asserted atoms: the NIA's model-derived
+    /// tentative bounds (sign cuts, integer-rounding pins, patch pins, and any
+    /// McCormick row built on them) cite the VARIABLE or MONOMIAL term as
+    /// their reason, and a term is never an asserted atom, so they always
+    /// fail. Sentinel-only bounds (factor-split case hypotheses, Gomory/HNF
+    /// cuts) pass, exactly as they pass the conflict guard.
+    ///
+    /// Allocation-free: walks the inline reason pairs and, when present, the
+    /// provenance DAG directly.
+    pub fn bound_reasons_all_asserted(&self, bound: &Bound) -> bool {
+        // A cross-theory "reason" that is not a Boolean atom is no premise: it
+        // is the placeholder of a reasonless shared equality, or a guess's
+        // reason term that another theory echoed back (an NIA pin's variable
+        // term exported to EUF as the reason of a value equality and returned
+        // as the reason of a shared equality). Counting it as asserted would
+        // make every guess on that variable justified again
+        // (#nonlinear-shared-reasons).
+        let live = |term: TermId, value: bool| -> bool {
+            term.is_sentinel()
+                || self.asserted.get(&term) == Some(&value)
+                || (self.cross_theory_asserted.get(&term) == Some(&value)
+                    && *self.terms().sort(term) == Sort::Bool)
+        };
+        if !bound.reason_pairs().all(|(t, v)| live(t, v)) {
+            return false;
+        }
+        match bound.provenance.as_ref() {
+            Some(provenance) => provenance.reasons_all(&live),
+            None => true,
+        }
+    }
+
     /// Collect ALL contradictory variable bound conflicts, not just the first.
     ///
     /// The `dual_simplex_with_max_iters` precheck returns on the first bound
@@ -181,9 +220,20 @@ impl LraSolver {
             let farkas = if !dedup_coeffs.is_empty() {
                 Some(FarkasAnnotation::new(dedup_coeffs))
             } else if all_fit {
-                Some(FarkasAnnotation::new(
-                    (0..dedup_lits.len()).map(|_| Rational64::from(1)).collect(),
-                ))
+                // One unit coefficient per deduplicated literal, pushed into a
+                // reservation made up front. If the reservation fails the
+                // conflict is still emitted, only without a Farkas
+                // certificate: it stays valid, exactly as on the `!all_fit`
+                // path.
+                let mut ones = Vec::new();
+                if ones.try_reserve_exact(dedup_lits.len()).is_ok() {
+                    for _ in &dedup_lits {
+                        ones.push(Rational64::from(1));
+                    }
+                    Some(FarkasAnnotation::new(ones))
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -715,15 +765,7 @@ impl LraSolver {
 
             // Retract, recording the old bound on the trail so scope pops
             // restore it exactly as for normal bound assertions.
-            let old_bound = match side {
-                BoundType::Lower => self.vars[vi].lower.take(),
-                BoundType::Upper => self.vars[vi].upper.take(),
-            };
-            self.trail.push((var, side, old_bound));
-            // Bound retracted -> LIA algebraic-detection memo is stale.
-            self.bump_bound_revision();
-            // The implied-bounds slot may hold the retracted bound's overlay.
-            self.note_direct_bound_widened(var);
+            self.retract_unjustified_bound_slot(var, side);
             retracted += 1;
             if self.debug_lra {
                 safe_eprintln!(
@@ -741,6 +783,37 @@ impl LraSolver {
             self.track_var_feasibility(basic_var);
         }
         retracted
+    }
+
+    /// Remove the unjustified bound in `(var, side)`, recording it on the
+    /// trail so scope pops restore it exactly as for normal bound assertions.
+    ///
+    /// The slot is left EMPTY for the rest of the scope — including any
+    /// justified bound the unjustified one had tightened over (on `z*w >= 2`
+    /// asserted and tightened by a McCormick row built on a tentative NIA
+    /// cut, the product has no lower bound at all once the row's bound is
+    /// retracted, and the relaxed LP wanders below 2). Restoring that
+    /// predecessor from the trail is sound and was implemented; measured
+    /// (2026-09-22, #nia-sign-cut-soundness) it moved the LP walk enough to
+    /// lose two decided QF_UFNIA fuzz files (`nia_8301_{019,088}`: a
+    /// tentative patch verified two iterations earlier on a point the UF
+    /// side then rejected), while the `sat` it bought on the attack corpus
+    /// (gen2/h1346, h0139) is bought as well by the NIA's verified-point
+    /// `Sat` criterion. It is not done here; see
+    /// `2026-09-21-nia-sign-cut-soundness.md` in the campaign ledger.
+    fn retract_unjustified_bound_slot(&mut self, var: u32, side: BoundType) {
+        let vi = var as usize;
+        let old_bound = match side {
+            BoundType::Lower => self.vars[vi].lower.take(),
+            BoundType::Upper => self.vars[vi].upper.take(),
+        };
+        self.trail.push((var, side, old_bound));
+        // Bound retracted -> LIA algebraic-detection memo is stale.
+        self.bump_bound_revision();
+        // A widened bound moves the materialisation delta (#nonlinear-phase-hints).
+        self.note_phase_state_change();
+        // The implied-bounds slot may hold the retracted bound's overlay.
+        self.note_direct_bound_widened(var);
     }
 
     /// Variable-level analogue of `retract_unjustified_row_bounds` for the
@@ -795,15 +868,7 @@ impl LraSolver {
                 continue;
             }
 
-            let old_bound = match side {
-                BoundType::Lower => self.vars[vi].lower.take(),
-                BoundType::Upper => self.vars[vi].upper.take(),
-            };
-            self.trail.push((var, side, old_bound));
-            // Bound retracted -> LIA algebraic-detection memo is stale.
-            self.bump_bound_revision();
-            // The implied-bounds slot may hold the retracted bound's overlay.
-            self.note_direct_bound_widened(var);
+            self.retract_unjustified_bound_slot(var, side);
             retracted += 1;
             if self.debug_lra {
                 safe_eprintln!(

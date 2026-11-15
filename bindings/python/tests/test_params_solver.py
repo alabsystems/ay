@@ -22,7 +22,7 @@
 #   * Params / args2params / ParamDescrsRef: z3py-shaped surface, repr format
 #     matched to z3py's `(params k v ...)`.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests/test_params_solver.py -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests/test_params_solver.py -v
 
 import os
 import tempfile

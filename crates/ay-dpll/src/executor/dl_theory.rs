@@ -573,16 +573,23 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             let (Some(from), Some(to)) = (pot.get(e.from), pot.get(e.to)) else {
                 continue;
             };
-            let slack = from.add(&e.weight).add(&to.negate());
+            // A slack whose negation is unrepresentable cannot bound `δ`;
+            // skipping it is sound because `check_sat` re-validates the model.
+            let Some(neg_to) = to.negate() else { continue };
+            let slack = from.add(&e.weight).add(&neg_to);
             slacks.push(slack.parts());
         }
         let delta = pick_delta_from_slacks(&slacks);
 
         let base = pot.get(ZERO_VERTEX).cloned().unwrap_or_else(W::zero);
         let mut values: HashMap<TermId, BigRational> = HashMap::default();
-        for (&term, &v) in &self.var_index {
-            let Some(p) = pot.get(v) else { continue };
-            values.insert(term, p.add(&base.negate()).realize(&delta));
+        // An unnegatable base leaves the model empty; `check_sat` re-validates
+        // it against the original assertions and degrades to `Unknown`.
+        if let Some(neg_base) = base.negate() {
+            for (&term, &v) in &self.var_index {
+                let Some(p) = pot.get(v) else { continue };
+                values.insert(term, p.add(&neg_base).realize(&delta));
+            }
         }
         ay_lra::LraModel { values }
     }
@@ -654,6 +661,14 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
                 }
                 AssertOutcome::Conflict(tags) => {
                     self.record_conflict(&tags);
+                    return;
+                }
+                // The engine refused the edge (a potential it needs has no
+                // negation in the weight's width) and left it inactive: fail
+                // closed, exactly like an unmodellable literal, so the route
+                // falls back to simplex.
+                AssertOutcome::Refused => {
+                    self.raise_unsupported();
                     return;
                 }
             }

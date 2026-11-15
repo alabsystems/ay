@@ -14,7 +14,10 @@ use ay_core::{Sort, TermId};
 
 use super::{EvalValue, Model, NormalizedArray, EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE};
 
+use super::certified_array_read::CertifiedArrayRead;
 use super::Executor;
+
+mod ground_equality;
 
 /// Cached index behind [`Executor::array_def_candidates`]: every asserted
 /// binary `=` keyed by each side's `TermId`, in definitional-constraint order,
@@ -63,7 +66,7 @@ impl Executor {
         default_term: TermId,
     ) -> EvalValue {
         if let Some(value) = model.completed_values.get(&default_term) {
-            return value.clone();
+            return super::evaluation_copies::copy(value);
         }
         // A `(default a)` of arithmetic/BV/Bool sort participates directly in
         // that theory.  Its theory assignment is authoritative; an EUF class
@@ -258,7 +261,7 @@ impl Executor {
             if model
                 .array_model
                 .as_ref()
-                .is_some_and(|arrays| arrays.read_conflicted.contains(&array))
+                .is_some_and(|arrays| arrays.is_withheld(&array))
             {
                 continue;
             }
@@ -351,43 +354,19 @@ impl Executor {
         (!names.is_empty()).then_some(names)
     }
 
-    /// Drop enum-index cells written in a FOREIGN encoding once the constructor
-    /// encoding already covers the whole carrier. Returns whether anything
-    /// changed.
+    /// Normalize enum-indexed cells before completion fills missing cells.
     ///
-    /// An enum-datatype-indexed array can end up carrying every cell TWICE: once
-    /// keyed by an internal carrier token minted by uninterpreted-sort completion
-    /// (`@Color!0`), and once keyed by the real constructor (`red`). Both name the
-    /// same element, but only one is a value anything downstream can interpret.
-    /// z3 rejects `@Color!0` as an unknown constant, and the independent gate —
-    /// which is RIGHT to refuse to equate two unrelated encodings — reports
-    /// `equality between incomparable model values (Uninterpreted vs Datatype)`
-    /// and cannot confirm a `sat` that is otherwise perfectly good:
+    /// Extracted keys can name an EUF carrier (`@Color!0`) while the evaluator
+    /// and printer use a registered nullary constructor (`red`). Re-key only
+    /// through a unique same-sort constructor class from this model. Preserve
+    /// the extractor's newest-first order and all observed values; numeric
+    /// carrier suffixes confer no constructor identity.
     ///
-    /// ```smtlib
-    /// (declare-datatypes ((Color 0)) (((red) (green) (blue))))
-    /// (declare-const a (Array Color Int))
-    /// (assert (= (select a red) 1))
-    /// (assert (= (select a blue) 3))
-    /// ```
-    ///
-    /// The interpretation held `[@Color!1↦0, @Color!2↦3, @Color!0↦1, green↦0,
-    /// blue↦3, red↦1]` — three cells, each duplicated. Because the gate scans the
-    /// authoritative end first, it met `@Color!1` before ever reaching `red`.
-    ///
-    /// This is the PRODUCER-side normalization the incomparable-values arm of
-    /// `ay_model_check::value_eq` asks for. Teaching that comparison to equate the
-    /// two encodings instead would blunt exactly the check the gate depends on —
-    /// and could not even be done correctly here, since `@Color!1` and `blue` are
-    /// only the same element by virtue of a carrier mapping `value_eq` cannot see.
-    ///
-    /// SOUNDNESS: foreign-encoded cells are dropped ONLY when the retained
-    /// constructor-keyed cells cover EVERY constructor of the carrier. The
-    /// interpretation is then TOTAL in the constructor encoding, so every index
-    /// value already resolves to a concrete cell and no read can reach a dropped
-    /// one — the array denotes exactly the same function before and after. When
-    /// coverage is incomplete nothing is dropped and the prior behaviour stands.
-    fn canonicalize_enum_indexed_cells(
+    /// Foreign keys can be dropped once constructor-keyed cells cover every
+    /// inhabitant. Until then, missing or ambiguous class mappings remain
+    /// unresolved. All candidates still face the unchanged original-input
+    /// model gates; the independent value comparison gains no new equivalence.
+    pub(super) fn canonicalize_enum_indexed_cells(
         &self,
         model: &mut Model,
         relevant: Option<&HashSet<TermId>>,
@@ -409,19 +388,53 @@ impl Executor {
             else {
                 continue;
             };
-            let covered = constructors
-                .iter()
-                .all(|c| interp.stores.iter().any(|(index, _)| index == c));
-            if !covered {
-                continue;
+            // Read the model's exact constructor classes before completion can
+            // fill constructor-named cells from a default. A carrier-keyed
+            // observed cell already fixes that same cell; filling it first
+            // loses its value. Ambiguous or absent classes confer no mapping.
+            let mut carriers: DetHashMap<&str, Option<&str>> = DetHashMap::default();
+            if let Some(euf) = &model.euf_model {
+                for constructor in &constructors {
+                    let Some(info) = self.ctx.symbol_info_by_identity(constructor) else {
+                        continue;
+                    };
+                    if info.sort != array_sort.index_sort || !info.arg_sorts.is_empty() {
+                        continue;
+                    }
+                    let Some(carrier) = info.term.and_then(|term| euf.term_values.get(&term))
+                    else {
+                        continue;
+                    };
+                    carriers
+                        .entry(carrier.as_str())
+                        .and_modify(|value| {
+                            if *value != Some(constructor.as_str()) {
+                                *value = None;
+                            }
+                        })
+                        .or_insert(Some(constructor.as_str()));
+                }
             }
-            let kept: Vec<(String, String)> = interp
+            let normalized: Vec<(String, String)> = interp
                 .stores
                 .iter()
-                .filter(|(index, _)| constructors.iter().any(|c| c == index))
-                .cloned()
+                .map(|(index, value)| {
+                    let index = carriers
+                        .get(index.as_str())
+                        .copied()
+                        .flatten()
+                        .unwrap_or(index);
+                    (index.to_string(), value.clone())
+                })
                 .collect();
-            if kept.len() != interp.stores.len() {
+            let covered = constructors
+                .iter()
+                .all(|c| normalized.iter().any(|(index, _)| index == c));
+            let kept: Vec<(String, String)> = normalized
+                .into_iter()
+                .filter(|(index, _)| !covered || constructors.iter().any(|c| c == index))
+                .collect();
+            if kept != interp.stores {
                 rewrites.push((array, kept));
             }
         }
@@ -524,6 +537,15 @@ impl Executor {
         array: TermId,
         index: TermId,
     ) -> EvalValue {
+        if model.functional_arrays.is_some() {
+            let index_value = self.evaluate_term(model, index);
+            if let Some(value) = self.functional_array_read(model, array, &index_value) {
+                return value;
+            }
+        }
+        if let Some(value) = self.certified_const_array_select(model, array, index) {
+            return value;
+        }
         // Track the array variables whose definitional equality we have already
         // chased during this evaluation. A mutual/cyclic definition — e.g. the
         // extensionality equality `(= s s_pre)` injected for a two-array
@@ -534,42 +556,90 @@ impl Executor {
         // the base-array model lookup (a concrete value or `Unknown`, both of
         // which are sound for model completion).
         let mut def_visited = HashSet::default();
-        self.evaluate_select_resolving_defs(model, array, index, &mut def_visited)
+        self.evaluate_select_resolving_defs(model, array, index, &mut def_visited, &mut None, 0)
     }
 
     /// Inner implementation of [`Self::evaluate_select`] threading a
     /// definition-cycle guard (`def_visited`) through the array-variable
     /// definitional-equality recursion.
-    fn evaluate_select_resolving_defs(
+    pub(super) fn evaluate_select_resolving_defs(
         &self,
         model: &Model,
         array: TermId,
         index: TermId,
         def_visited: &mut HashSet<TermId>,
+        certified: &mut Option<CertifiedArrayRead>,
+        depth: usize,
     ) -> EvalValue {
-        let index_val = self.evaluate_term(model, index);
+        let index_val = match certified.as_mut() {
+            Some(read) => read.scalar(self, model, index),
+            None => self.evaluate_term(model, index),
+        };
+
+        if let Some(value) = self.functional_array_read(model, array, &index_val) {
+            return value;
+        }
 
         // Walk through store layers with visited-set cycle guard.
         // In a well-formed term DAG, this chain is structurally finite.
         let mut current_array = array;
         let mut visited = HashSet::default();
         loop {
+            if let Some(read) = certified.as_mut() {
+                if !read.visit(self, current_array, depth) {
+                    return EvalValue::Unknown;
+                }
+                match read.resolve(self, model, current_array) {
+                    Ok(Some(value)) => {
+                        current_array = value;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(()) => return EvalValue::Unknown,
+                }
+            }
             if !visited.insert(current_array) {
                 break; // cycle detected in malformed term
             }
+            if let Some(value) = self.functional_array_read(model, current_array, &index_val) {
+                return value;
+            }
             let term = self.ctx.terms.get(current_array);
             match term {
+                TermData::Ite(condition, then_array, else_array) => {
+                    // Read the selected array only after the model supplies an
+                    // exact Boolean guard. An undecidable guard is not evidence
+                    // for either branch or an ambient interpretation of the ITE.
+                    let condition = match certified.as_mut() {
+                        Some(read) => read.scalar(self, model, *condition),
+                        None => self.evaluate_term(model, *condition),
+                    };
+                    current_array = match condition {
+                        EvalValue::Bool(true) => *then_array,
+                        EvalValue::Bool(false) => *else_array,
+                        _ => return EvalValue::Unknown,
+                    };
+                    continue;
+                }
                 TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
                     let store_index = args[1];
                     let store_value = args[2];
-                    let store_index_val = self.evaluate_term(model, store_index);
+                    let store_index_val = match certified.as_mut() {
+                        Some(read) => read.scalar(self, model, store_index),
+                        None => self.evaluate_term(model, store_index),
+                    };
 
                     // ROW1/ROW2 require exact equality/disequality evidence for
                     // every index sort. Algebraic (and recursively Seq)
                     // comparisons can remain undecided at their refinement cap;
                     // that is evidence for neither row and must fail closed.
                     match Self::eval_values_equal_exact(&index_val, &store_index_val) {
-                        Some(true) => return self.evaluate_term(model, store_value),
+                        Some(true) => {
+                            return match certified.as_mut() {
+                                Some(read) => read.scalar(self, model, store_value),
+                                None => self.evaluate_term(model, store_value),
+                            }
+                        }
                         Some(false) => {}
                         None => return EvalValue::Unknown,
                     }
@@ -580,7 +650,10 @@ impl Executor {
                 }
                 TermData::App(sym, args) if sym.name() == "const-array" && args.len() == 1 => {
                     // const-array: all indices map to the same value
-                    return self.evaluate_term(model, args[0]);
+                    return match certified.as_mut() {
+                        Some(read) => read.scalar(self, model, args[0]),
+                        None => self.evaluate_term(model, args[0]),
+                    };
                 }
                 TermData::App(sym, args) if sym.name() == "lambda-array" && args.len() == 2 => {
                     // Runtime beta reduction. Term construction eagerly reduces
@@ -602,7 +675,7 @@ impl Executor {
                     }
                     return super::dt_model::with_scoped_term_override(
                         args[0],
-                        index_val.clone(),
+                        super::evaluation_copies::copy(&index_val),
                         || self.evaluate_term(model, args[1]),
                     );
                 }
@@ -626,16 +699,30 @@ impl Executor {
                     // keep peeling. Resolution is exact-or-nothing: on any
                     // undecidable index it returns None and we fall through to
                     // the existing sound opaque handling.
-                    match self.resolve_array_valued_select(model, args[0], args[1], def_visited) {
+                    match self.resolve_array_valued_select(
+                        model,
+                        args[0],
+                        args[1],
+                        def_visited,
+                        certified,
+                        depth + 1,
+                    ) {
                         Some(inner) if inner != current_array => {
                             current_array = inner;
                             continue;
                         }
+                        _ if certified.is_some() => return EvalValue::Unknown,
                         _ => break,
                     }
                 }
                 _ => break,
             }
+        }
+
+        // An owned structural read never opens ambient definition recovery
+        // or raw array/BV completion after its exact carrier walk declines.
+        if certified.is_some() {
+            return EvalValue::Unknown;
         }
 
         // Resolve an explicit constructor definition `(= a <array-expr>)`
@@ -679,7 +766,14 @@ impl Executor {
                     && def != array
                     && def_visited.insert(current_array)
                 {
-                    return self.evaluate_select_resolving_defs(model, def, index, def_visited);
+                    return self.evaluate_select_resolving_defs(
+                        model,
+                        def,
+                        index,
+                        def_visited,
+                        certified,
+                        depth + 1,
+                    );
                 }
             }
         }
@@ -715,6 +809,23 @@ impl Executor {
         let store_result = self.lookup_array_model_store_entry(model, current_array, &index_val);
         if !matches!(store_result, EvalValue::Unknown) {
             return store_result;
+        }
+
+        // A definition-built interpretation is the authority for this
+        // variable: its definition was model-true with every operand
+        // resolved at extraction. A direct select's bit-blasted bits
+        // may be unconstrained junk (the BV encoding links a defined
+        // array to its chain only at finitely many extensionality
+        // indices), so they must not veto the built value below.
+        if model
+            .array_model
+            .as_ref()
+            .is_some_and(|am| am.definition_authoritative.contains(&current_array))
+        {
+            let built = self.lookup_array_model(model, current_array, &index_val);
+            if !matches!(built, EvalValue::Unknown) {
+                return built;
+            }
         }
 
         let exact_select_result = self.bv_exact_select_fallback(model, current_array, index);
@@ -775,6 +886,8 @@ impl Executor {
         outer_arr: TermId,
         outer_idx: TermId,
         def_visited: &mut HashSet<TermId>,
+        certified: &mut Option<CertifiedArrayRead>,
+        depth: usize,
     ) -> Option<TermId> {
         // A binder-dependent nested array denotes a different array per beta
         // instance; no ambient TermId resolution is valid then.
@@ -783,19 +896,38 @@ impl Executor {
         {
             return None;
         }
-        let idx_val = self.evaluate_term(model, outer_idx);
+        let idx_val = match certified.as_mut() {
+            Some(read) => read.scalar(self, model, outer_idx),
+            None => self.evaluate_term(model, outer_idx),
+        };
         if matches!(idx_val, EvalValue::Unknown) {
             return None;
         }
         let mut arr = outer_arr;
         let mut visited = HashSet::default();
         loop {
+            if let Some(read) = certified.as_mut() {
+                if !read.visit(self, arr, depth) {
+                    return None;
+                }
+                match read.resolve(self, model, arr) {
+                    Ok(Some(value)) => {
+                        arr = value;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(()) => return None,
+                }
+            }
             if !visited.insert(arr) {
                 return None; // structural cycle in a malformed term DAG
             }
             match self.ctx.terms.get(arr) {
                 TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
-                    let store_idx_val = self.evaluate_term(model, args[1]);
+                    let store_idx_val = match certified.as_mut() {
+                        Some(read) => read.scalar(self, model, args[1]),
+                        None => self.evaluate_term(model, args[1]),
+                    };
                     match Self::eval_values_equal_exact(&idx_val, &store_idx_val) {
                         // ROW1: this write determines the read — its value is
                         // the inner array term.
@@ -819,7 +951,14 @@ impl Executor {
                 {
                     // A deeper nesting level: resolve it first, then continue
                     // peeling the array it denotes.
-                    match self.resolve_array_valued_select(model, args[0], args[1], def_visited) {
+                    match self.resolve_array_valued_select(
+                        model,
+                        args[0],
+                        args[1],
+                        def_visited,
+                        certified,
+                        depth + 1,
+                    ) {
                         Some(inner) if inner != arr => {
                             arr = inner;
                             continue;
@@ -828,6 +967,9 @@ impl Executor {
                     }
                 }
                 TermData::Var(_, _) => {
+                    if certified.is_some() {
+                        return None;
+                    }
                     // Opaque array-of-array base: only a structural definition
                     // (`(= v (store ...))` / `(= v (const-array ...))`) pins the
                     // inner array. A genuinely free base has no concrete inner
@@ -882,6 +1024,16 @@ impl Executor {
                 }
                 _ => break,
             }
+        }
+
+        // Definition-built interpretations outrank exact select bits
+        // (see evaluate_select_resolving_defs): no conflict to report.
+        if model
+            .array_model
+            .as_ref()
+            .is_some_and(|am| am.definition_authoritative.contains(&current_array))
+        {
+            return false;
         }
 
         let store_result = self.lookup_array_model_store_entry(model, current_array, &index_val);
@@ -975,7 +1127,7 @@ impl Executor {
         // poisoned cell, so it is not usable as miss evidence even when some
         // other phase happened to materialize one.  Exact explicit stores
         // above remain safe and continue to resolve.
-        if array_model.read_conflicted.contains(&array) {
+        if array_model.is_withheld(&array) {
             return EvalValue::Unknown;
         }
 
@@ -1032,6 +1184,9 @@ impl Executor {
                         Some(true) => {
                             let sort = self.ctx.terms.sort(term_id);
                             if let Sort::BitVec(bv) = sort {
+                                if !super::evaluation_copies::integer(val) {
+                                    return EvalValue::Unknown;
+                                }
                                 return EvalValue::BitVec {
                                     value: val.clone(),
                                     width: bv.width,
@@ -1079,11 +1234,11 @@ impl Executor {
         if let Some(euf_model) = model.euf_model.as_ref() {
             let mut found: Option<&str> = None;
             for &term_id in euf_model.term_values.keys() {
-                // `term_values` can carry non-term SENTINEL keys (e.g. the
-                // `REPAIR_MARKER` = TermId(u32::MAX - 7) inserted by
-                // `repair_asserted_array_read_pins`); `terms.get` on an
-                // out-of-range id panics (index-out-of-bounds). Skip any key not
-                // backed by a real term — the same guard eval_uf uses (#g4-dt-ce-select).
+                // Defensive: `terms.get` on an out-of-range id panics
+                // (index-out-of-bounds), so skip any key not backed by a real
+                // term — the same guard eval_uf uses (#g4-dt-ce-select). The
+                // repair marker that once lived here as a sentinel key is now
+                // `EufModel::array_read_pins_repaired`.
                 if (term_id.0 as usize) >= self.ctx.terms.len() {
                     continue;
                 }
@@ -1157,6 +1312,9 @@ impl Executor {
                 {
                     let sort = self.ctx.terms.sort(term_id);
                     if let Sort::BitVec(bv) = sort {
+                        if !super::evaluation_copies::integer(val) {
+                            return EvalValue::Unknown;
+                        }
                         return EvalValue::BitVec {
                             value: val.clone(),
                             width: bv.width,
@@ -1187,11 +1345,37 @@ impl Executor {
     /// refinement cap, or a sequence containing one). Callers may apply ROW1
     /// only on `Some(true)` and ROW2/difference reasoning only on `Some(false)`.
     pub(super) fn eval_values_equal_exact(a: &EvalValue, b: &EvalValue) -> Option<bool> {
+        if super::evaluation_copies::active() {
+            return super::evaluation_copies::equal(a, b);
+        }
         match (a, b) {
             (EvalValue::Unknown, _) | (_, EvalValue::Unknown) => None,
             (EvalValue::Bool(a), EvalValue::Bool(b)) => Some(a == b),
+            (
+                EvalValue::FiniteField { value: a, field: p },
+                EvalValue::FiniteField { value: b, field: q },
+            ) => Some(a == b && p == q),
             (EvalValue::Element(a), EvalValue::Element(b)) => Some(a == b),
             (EvalValue::Rational(a), EvalValue::Rational(b)) => Some(a == b),
+            (
+                EvalValue::Complex {
+                    real: ar,
+                    imaginary: ai,
+                },
+                EvalValue::Complex {
+                    real: br,
+                    imaginary: bi,
+                },
+            ) => {
+                match (
+                    Self::eval_values_equal_exact(ar, br),
+                    Self::eval_values_equal_exact(ai, bi),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
             (
                 EvalValue::BitVec {
                     value: av,
@@ -1286,6 +1470,27 @@ impl Executor {
         eq_term: TermId,
         args: &[TermId],
     ) -> EvalValue {
+        if let Some(value) = self.functional_array_equality(model, eq_term, args) {
+            return value;
+        }
+        // Two GROUND operands (`const-array` under `store`s and decided
+        // `ite`s, over evaluated scalars) compare exactly, also on the BV
+        // lane: no reconstructed interpretation takes part, so the BV-backed
+        // guard of the general comparison does not apply, and a finite index
+        // sort the writes cover is accounted for (#aufbv-const-array-equality).
+        if let Some(equal) = self.ground_array_equality(model, args[0], args[1]) {
+            return EvalValue::Bool(equal);
+        }
+        self.evaluate_array_equality_without_functional_snapshot(model, args)
+    }
+
+    /// Preserve the existing conservative array comparisons when no complete
+    /// functional snapshot supplied an answer.
+    fn evaluate_array_equality_without_functional_snapshot(
+        &self,
+        model: &Model,
+        args: &[TermId],
+    ) -> EvalValue {
         // Try semantic comparison via normalized array models.
         if let Some(result) = self.compare_array_models_normalized(model, args[0], args[1]) {
             // BV-backed array interpretations are reconstructed from select/store
@@ -1376,7 +1581,6 @@ impl Executor {
         // that laundered the solver's own guess into a "verified" verdict
         // (circular self-validation, the same hole #5499/#6282/#as-array-ext
         // closed elsewhere). Unknown is the only honest answer.
-        let _ = eq_term;
         EvalValue::Unknown
     }
 
@@ -1826,6 +2030,19 @@ impl Executor {
         }
     }
 
+    /// Format an array element using its declared sort's exact model spelling.
+    fn format_normalized_array_element(&self, value: &EvalValue, term: TermId) -> String {
+        // Stored Real model rows use the declared-sort rational spelling.
+        // Structural store and const-array overlays must use the same exact
+        // normal form: e.g. numeral 9 and decimal 9.0 denote one Real.
+        match (self.ctx.terms.sort(term), value) {
+            (Sort::Real, EvalValue::Rational(value)) => {
+                crate::executor_format::format_rational(value)
+            }
+            _ => self.format_eval_value(value, term),
+        }
+    }
+
     /// Normalize an array term to (default_value, sorted store map) for semantic comparison.
     ///
     /// Returns None if the array cannot be fully normalized.
@@ -1840,7 +2057,7 @@ impl Executor {
             if model
                 .array_model
                 .as_ref()
-                .is_some_and(|arrays| arrays.read_conflicted.contains(&term_id))
+                .is_some_and(|arrays| arrays.is_withheld(&term_id))
             {
                 return None;
             }
@@ -1869,7 +2086,7 @@ impl Executor {
                         return None;
                     }
                     let index_str = self.format_eval_value(&index_val, args[1]);
-                    let value_str = self.format_eval_value(&value_val, args[2]);
+                    let value_str = self.format_normalized_array_element(&value_val, args[2]);
 
                     // Overwrite existing entry at this index if present.
                     if let Some(existing) = base.1.iter_mut().find(|(k, _)| *k == index_str) {
@@ -1887,7 +2104,7 @@ impl Executor {
                     if matches!(default_val, EvalValue::Unknown) {
                         return None;
                     }
-                    let default_str = self.format_eval_value(&default_val, args[0]);
+                    let default_str = self.format_normalized_array_element(&default_val, args[0]);
                     Some((Some(default_str), Vec::new()))
                 }
                 TermData::Let(bindings, body) if bindings.is_empty() => {
@@ -2058,7 +2275,7 @@ impl Executor {
                         return None;
                     }
                     let index_str = self.format_eval_value(&index_val, args[1]);
-                    let value_str = self.format_eval_value(&value_val, args[2]);
+                    let value_str = self.format_normalized_array_element(&value_val, args[2]);
 
                     if let Some(existing) = base.1.iter_mut().find(|(k, _)| *k == index_str) {
                         existing.1 = value_str;
@@ -2075,7 +2292,7 @@ impl Executor {
                     if matches!(default_val, EvalValue::Unknown) {
                         return None;
                     }
-                    let default_str = self.format_eval_value(&default_val, args[0]);
+                    let default_str = self.format_normalized_array_element(&default_val, args[0]);
                     Some((Some(default_str), Vec::new()))
                 }
                 TermData::Let(bindings, body) if bindings.is_empty() => {
@@ -2238,7 +2455,7 @@ impl Executor {
     /// any SAT answer for the current query certifies satisfiability of
     /// assertions AND assumptions together, so a definitional equality from
     /// either set holds in every model of the current query.
-    fn definitional_constraint_terms(&self) -> impl Iterator<Item = TermId> + '_ {
+    pub(super) fn definitional_constraint_terms(&self) -> impl Iterator<Item = TermId> + '_ {
         self.ctx
             .assertions
             .iter()

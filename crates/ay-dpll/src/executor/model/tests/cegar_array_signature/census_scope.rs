@@ -32,16 +32,22 @@ fn generated_reads_do_not_become_public_congruence_observations() {
 
     pair.executor.ctx.assertions = vec![conflict];
     pair.executor.independent_gate_authored_assertions = Some(vec![truth]);
-    assert!(!pair.executor.problem_has_array());
-    assert!(!pair.executor.array_select_congruence_violated(&model));
+    assert!(!pair.executor.problem_has_array().unwrap());
+    assert!(!pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .census_congruence_cegar_lemma(&model)
         .is_none());
 
     pair.executor.independent_gate_authored_assertions = Some(vec![conflict]);
-    assert!(pair.executor.problem_has_array());
-    assert!(pair.executor.array_select_congruence_violated(&model));
+    assert!(pair.executor.problem_has_array().unwrap());
+    assert!(pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .census_congruence_cegar_lemma(&model)
@@ -75,14 +81,14 @@ fn authored_array_equalities_remain_hard_after_sat_elimination() {
     assert!(model.term_to_var.is_empty());
 
     executor.independent_gate_authored_assertions = Some(vec![array_equality, read_conflict]);
-    assert!(executor.array_select_congruence_violated(&model));
+    assert!(executor.array_select_congruence_violated(&model).unwrap());
 
     let conjunction = executor
         .ctx
         .terms
         .mk_and(vec![array_equality, read_conflict]);
     executor.independent_gate_authored_assertions = Some(vec![conjunction]);
-    assert!(executor.array_select_congruence_violated(&model));
+    assert!(executor.array_select_congruence_violated(&model).unwrap());
 }
 
 #[test]
@@ -111,7 +117,10 @@ fn assuming_only_reads_are_public_congruence_observations() {
     pair.executor.independent_gate_authored_assertions = Some(vec![truth]);
     pair.executor.last_assumptions = Some(vec![assumption]);
 
-    assert!(pair.executor.array_select_congruence_violated(&model));
+    assert!(pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .census_congruence_cegar_lemma(&model)
@@ -149,11 +158,17 @@ fn nonempty_let_excludes_conditioned_reads_but_keeps_sibling_ground_observations
 
     pair.executor.independent_gate_authored_assertions = Some(vec![let_root]);
     assert!(
-        !pair.executor.array_select_congruence_violated(&model),
+        !pair
+            .executor
+            .array_select_congruence_violated(&model)
+            .unwrap(),
         "binder-conditioned reads are not public ground observations"
     );
     pair.executor.independent_gate_authored_assertions = Some(vec![let_root, conflict]);
-    assert!(pair.executor.array_select_congruence_violated(&model));
+    assert!(pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .datatype_array_field_required_terms()
@@ -185,7 +200,10 @@ fn empty_let_remains_an_exact_ground_census_alias() {
         (pair.right, 2),
     ]);
 
-    assert!(pair.executor.array_select_congruence_violated(&model));
+    assert!(pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .datatype_array_field_required_terms()
@@ -222,11 +240,17 @@ fn quantifier_excludes_conditioned_reads_but_keeps_sibling_ground_observations()
 
     pair.executor.independent_gate_authored_assertions = Some(vec![quantified]);
     assert!(
-        !pair.executor.array_select_congruence_violated(&model),
+        !pair
+            .executor
+            .array_select_congruence_violated(&model)
+            .unwrap(),
         "quantifier-conditioned reads are not public ground observations"
     );
     pair.executor.independent_gate_authored_assertions = Some(vec![quantified, conflict]);
-    assert!(pair.executor.array_select_congruence_violated(&model));
+    assert!(pair
+        .executor
+        .array_select_congruence_violated(&model)
+        .unwrap());
     assert!(pair
         .executor
         .datatype_array_field_required_terms()

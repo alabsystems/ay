@@ -186,13 +186,9 @@ fn test_display_small_literals() {
     assert_eq!(format!("{neg}"), "-1");
 }
 
-/// Dense-range twin of the Kani harnesses in `literal.rs` (`mod verification`).
 /// Checks every encoding soundness invariant — variable/polarity round-trip,
 /// negation involution, index round-trip, and the proof-checker-critical DIMACS
-/// round-trip — over a dense range of variables and signed literals. This runs
-/// locally (validating the property expressions and catching any real encoding
-/// regression); the `#[cfg(kani)]` harnesses prove the same invariants over the
-/// full bounded input space via model-checker-consumer/Kani.
+/// round-trip — over a dense range of variables and signed literals.
 #[test]
 fn test_encoding_invariants_dense() {
     for v in 0u32..=20_000 {

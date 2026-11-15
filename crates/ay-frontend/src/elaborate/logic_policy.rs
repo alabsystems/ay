@@ -409,6 +409,7 @@ impl Context {
             | Command::Display(term, _)
             | Command::DebugSet(_, term, _)
             | Command::Simplify(term)
+            | Command::SimplifyWithParams(term, _)
             | Command::Eval(term)
             | Command::Maximize(term)
             | Command::Minimize(term)
@@ -993,6 +994,7 @@ fn is_bitvector_operator(name: &str) -> bool {
         || matches!(
             name,
             "concat"
+                | "mkbv"
                 | "extract"
                 | "repeat"
                 | "zero_extend"
@@ -1050,6 +1052,224 @@ mod tests {
             context.process_command(&command)?;
         }
         Ok(context)
+    }
+
+    fn signature_context(script: &str) -> Result<Context> {
+        let mut context = Context::new();
+        context.set_enforce_logic_sort_signatures(true);
+        for command in
+            parse(script).map_err(|error| ElaborateError::Unsupported(error.to_string()))?
+        {
+            context.process_command(&command)?;
+        }
+        Ok(context)
+    }
+
+    #[test]
+    fn shell_sort_signatures_match_z3() {
+        // z3's shell rejects builtin sorts outside the declared
+        // logic's signature; measured against z3 5.1.0.
+        for script in [
+            "(set-logic QF_DT)(declare-const x (_ BitVec 8))",
+            "(set-logic QF_BV)(declare-const x (Array Bool Bool))",
+            "(set-logic QF_UF)(declare-const x String)",
+        ] {
+            assert!(
+                matches!(
+                    signature_context(script),
+                    Err(ElaborateError::UnknownSort(_))
+                ),
+                "accepted {script}"
+            );
+        }
+        // Arithmetic-sibling sort rejections carry z3's dedicated
+        // messages, not `unknown sort` (measured).
+        for (script, expected) in [
+            (
+                "(set-logic QF_LRA)(declare-const x Int)",
+                "logic does not support integers",
+            ),
+            (
+                "(set-logic QF_LIA)(declare-const x Real)",
+                "logic does not support reals",
+            ),
+            (
+                "(set-logic AUFLIA)(declare-const x Real)",
+                "logic does not support reals",
+            ),
+        ] {
+            match signature_context(script) {
+                Err(error) => assert_eq!(error.to_string(), expected, "wrong error for {script}"),
+                Ok(_) => panic!("accepted {script}"),
+            }
+        }
+        // BV-array logics additionally require a bitvector array
+        // index (the element sort is unrestricted despite z3's
+        // wording; 50-case matrix against z3 5.1.0).
+        for script in [
+            "(set-logic QF_ABV)(declare-const x (Array Bool Bool))",
+            "(set-logic QF_AUFBV)(declare-const x (Array Bool (_ BitVec 8)))",
+            "(set-logic QF_ABV)(declare-sort U 0)(declare-const x (Array U Bool))",
+        ] {
+            assert!(
+                matches!(
+                    signature_context(script),
+                    Err(ElaborateError::LogicArrayIndexNotBitVec)
+                ),
+                "accepted {script}"
+            );
+        }
+        for script in [
+            "(set-logic QF_LIA)(declare-const x Int)",
+            "(set-logic QF_LRA)(declare-const x Real)",
+            // z3 keeps `Real` in most mixed/quantified integer logics.
+            "(set-logic LIA)(declare-const x Real)",
+            "(set-logic QF_AX)(declare-const x (Array Bool Bool))",
+            "(set-logic QF_AUFBV)(declare-const x (Array (_ BitVec 8) (_ BitVec 8)))",
+            "(set-logic QF_ABV)(declare-const x (Array (_ BitVec 8) Bool))",
+            "(declare-const x (_ BitVec 8))",
+        ] {
+            signature_context(script).unwrap_or_else(|error| {
+                panic!("rejected {script}: {error:?}");
+            });
+        }
+        // The library default stays permissive, like libz3's parser.
+        let mut permissive = Context::new();
+        for command in parse("(set-logic QF_DT)(declare-const x (_ BitVec 8))").unwrap() {
+            permissive.process_command(&command).unwrap();
+        }
+    }
+
+    #[test]
+    fn shell_function_signatures_match_z3() {
+        // Builtin applications outside the declared logic's shell
+        // signature: `unknown constant` in z3 5.1.0 (55-case matrix).
+        for script in [
+            "(set-logic QF_LIA)(assert (= (bvadd #x00 #x01) #x01))",
+            "(set-logic QF_LIA)(assert (= (str.len \"a\") 1))",
+            "(set-logic QF_DT)(assert (= (+ 1 2) 3))",
+            "(set-logic QF_BV)(assert (= (bv2nat #x01) 1))",
+            "(set-logic QF_LIA)(assert (= ((_ int2bv 8) 1) #x01))",
+            "(set-logic QF_BV)(assert (fp.isZero (_ +zero 8 24)))",
+            "(set-logic QF_BV)(assert (= RNE RNE))",
+            "(set-logic QF_BV)(assert (= re.none re.none))",
+            "(set-logic QF_BV)(assert ((_ divisible 2) 4))",
+            "(set-logic QF_NIA)(declare-const x Int)(assert (= (^ x 2) 4))",
+            "(set-logic ALL)(declare-const x Int)(declare-const y Int)(assert (= (min x y) 0))",
+            "(declare-const x Int)(declare-const y Int)(assert (= (max x y) 0))",
+            "(set-logic ALL)(assert (= (** 2 3) 8))",
+        ] {
+            assert!(
+                matches!(
+                    signature_context(script),
+                    Err(ElaborateError::UndefinedSymbol(_))
+                ),
+                "accepted {script}"
+            );
+        }
+        // Arithmetic family/profile rejections carry z3's dedicated
+        // messages instead of `unknown constant`.
+        for (script, expected) in [
+            ("(set-logic QF_LIA)(assert (= (to_real 1) 1.0))", "logic does not support reals"),
+            ("(set-logic QF_LRA)(assert (= (to_int 1.0) 1))", "logic does not support integers"),
+            ("(set-logic QF_LRA)(assert (= (to_real 1) 1.0))", "logic does not support casting operators"),
+            ("(set-logic QF_LIA)(assert (= #x00 #x00))", "logic does not support bitvectors"),
+            ("(set-logic QF_BV)(assert (= 1 1))", "logic does not support integers"),
+            ("(set-logic QF_LIA)(declare-const x Int)(declare-const y Int)(assert (= (* x y) 0))", "logic does not support nonlinear arithmetic"),
+            ("(set-logic QF_SLIA)(declare-const x Int)(declare-const y Int)(assert (= (div x y) 0))", "logic does not support nonlinear arithmetic"),
+            ("(set-logic QF_IDL)(declare-const x Int)(declare-const y Int)(assert (< (+ x y) 0))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_IDL)(declare-const x Int)(assert (< (* 2 x) 0))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_IDL)(declare-const x Int)(assert (< (- x) 0))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_IDL)(assert (< (div 6 2) 7))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_RDL)(declare-const x Real)(assert (< (/ x 2.0) 7.0))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_RDL)(assert (< (* 2.0 3.0) 7.0))", "logic only supports difference arithmetic"),
+            ("(set-logic QF_LRA)(assert (<= (div (ite true 7 0) 2) 4))", "logic does not support integers"),
+        ] {
+            match signature_context(script) {
+                Err(error) => assert_eq!(error.to_string(), expected, "wrong error for {script}"),
+                Ok(_) => panic!("accepted {script}"),
+            }
+        }
+        // In-signature applications stay accepted, including Int
+        // numerals in a real signature and z3's permissive
+        // quantified-logic arithmetic.
+        for script in [
+            "(set-logic QF_BV)(assert (= (bvadd #x00 #x01) #x01))",
+            "(set-logic QF_LIA)(declare-const x Int)(assert (= (* 2 x) 0))",
+            "(set-logic QF_LIA)(declare-const x Int)(assert (= (div x 2) 0))",
+            "(set-logic QF_LRA)(assert (= (+ 1 2) 3))",
+            "(set-logic QF_LRA)(assert (< 1 2))",
+            // Numeral composites under `ite`/arithmetic are Real
+            // arithmetic for z3's shell (the CVC-translated shape).
+            "(set-logic QF_LRA)(declare-const b Bool)(declare-const c Bool)(assert (<= (+ (ite b 1 0) (ite c 1 0)) 1))",
+            "(set-logic QF_LRA)(declare-const b Bool)(assert (let ((y (ite b 1 0))) (<= (+ y y) 1)))",
+            "(set-logic QF_LRA)(declare-const b Bool)(assert (<= (abs (ite b 1 0)) 1))",
+            "(set-logic QF_IDL)(declare-const x Int)(declare-const y Int)(assert (< (- x y) 0))",
+            "(set-logic QF_IDL)(declare-const x Int)(assert (< (+ x 1) 0))",
+            "(set-logic QF_RDL)(assert (< (/ 4.0 2.0) 7.0))",
+            "(set-logic QF_RDL)(declare-const x Real)(declare-const y Real)(assert (< (- x y) (- (/ 3.0 2.0))))",
+            "(set-logic LIA)(declare-const x Int)(declare-const y Int)(assert (= (* x y) 0))",
+            "(set-logic ALL)(declare-const x Int)(assert (= (^ x 2) 4))",
+            "(set-logic QF_DT)(assert (= \"a\" \"a\"))",
+            "(set-logic QF_UF)(declare-sort U 0)(declare-fun f (U) U)(declare-const u U)(assert (= (f u) u))",
+            "(set-logic QF_FP)(assert (fp.isZero (_ +zero 8 24)))",
+        ] {
+            signature_context(script)
+                .unwrap_or_else(|error| panic!("rejected {script}: {error:?}"));
+        }
+        // The library default stays permissive, like libz3's parser.
+        let mut permissive = Context::new();
+        for command in parse("(set-logic QF_LIA)(assert (= (bvadd #x00 #x01) #x01))").unwrap() {
+            permissive.process_command(&command).unwrap();
+        }
+    }
+
+    #[test]
+    fn shell_fp_and_difference_surface_matches_z3() {
+        // BV literals/conversions are the FP signature's currency even
+        // though the BitVec sort is not declarable there; a nested sum
+        // counts as one atom of its parent sum in the difference
+        // logics; `(_ fp.to_ieee_bv)` is the standard zero-index head.
+        // All measured against z3 4.16.0. Split out of
+        // `shell_function_signatures_match_z3` for the line gate.
+        for script in [
+            "(set-logic QF_FP)(declare-const x Float64)(assert (= x (fp #b0 #b11101111001 #b0110111010110101000110000000100011001111111100100110)))",
+            "(set-logic QF_FPLRA)(declare-const x Float64)(assert (= x (fp #b0 #b11101111001 #b0110111010110101000110000000100011001111111100100110)))",
+            "(set-logic QF_FP)(assert (= #b01 #b01))",
+            "(set-logic QF_FP)(declare-const x Float64)(declare-const r RoundingMode)(assert (= ((_ fp.to_ubv 8) r x) #b00000001))",
+            "(set-logic QF_FP)(declare-const x Float64)(declare-const r RoundingMode)(assert (= ((_ fp.to_sbv 8) r x) #b00000001))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(assert (= (+ 1 (+ 1 x)) 3))",
+            "(set-logic QF_IDL)(declare-const x Int)(assert (= (+ (+ x 1) 1) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(assert (= (+ 1 (+ 1 (+ 1 (+ 1 x)))) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(assert (= (+ (- x 1) 19) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(assert (= (- (+ x 1) 2) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(assert (= (- (- x 1) 2) 3))",
+            "(set-logic QF_FP)(declare-const x Float64)(assert (= ((_ to_fp 11 53) ((_ fp.to_ieee_bv) x)) x))",
+        ] {
+            signature_context(script)
+                .unwrap_or_else(|error| panic!("rejected {script}: {error:?}"));
+        }
+        // BV operators stay unknown in an FP signature.
+        assert!(matches!(
+            signature_context("(set-logic QF_FP)(assert (= (bvadd #b01 #b01) #b10))"),
+            Err(ElaborateError::UndefinedSymbol(_))
+        ));
+        for script in [
+            "(set-logic QF_UFIDL)(declare-const x Int)(declare-const y Int)(assert (= (+ (+ x y) 1) 3))",
+            "(set-logic QF_IDL)(declare-const x Int)(declare-const y Int)(assert (= (- (+ x 1) y) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(declare-const y Int)(assert (= (+ (- x y) 1) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(declare-const y Int)(assert (= (- (- x 1) y) 3))",
+            "(set-logic QF_UFIDL)(declare-const x Int)(declare-const y Int)(assert (= (- x (- y 1)) 3))",
+        ] {
+            match signature_context(script) {
+                Err(error) => assert_eq!(
+                    error.to_string(),
+                    "logic only supports difference arithmetic",
+                    "wrong error for {script}"
+                ),
+                Ok(_) => panic!("accepted {script}"),
+            }
+        }
     }
 
     #[test]

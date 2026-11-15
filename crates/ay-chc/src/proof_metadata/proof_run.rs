@@ -32,6 +32,7 @@ impl std::fmt::Debug for ChcPdrProofRun {
             .field("problem", &self.metadata.normalized_input_sha256())
             .field("result", &self.result)
             .field("metadata", &self.metadata)
+            .field("work", &self.work)
             .finish()
     }
 }
@@ -99,6 +100,7 @@ impl ChcPdrProofRun {
             problem: std::sync::Arc::new(IterativeDropProblem::new(problem)),
             result,
             metadata,
+            work: None,
         }
     }
 
@@ -107,7 +109,24 @@ impl ChcPdrProofRun {
             problem: self.problem.clone(),
             result: self.result.clone(),
             metadata,
+            work: self.work,
         }
+    }
+
+    /// The same run with its metered work attached (`None`: not metered).
+    pub(crate) fn with_work(mut self, work: Option<crate::ChcRunWork>) -> Self {
+        self.work = work;
+        self
+    }
+
+    /// The work this run's solve was metered at (guard-tree.md §13): the
+    /// ticks of its GuardTree node and what they are made of. `None` for a
+    /// run that was not metered (the adaptive portfolio's, or one started
+    /// below a GuardTree node that counts). Observation only:
+    /// it decided nothing, and it is in no metadata, artifact or digest,
+    /// since a clock can still steer the search that produced it.
+    pub fn work(&self) -> Option<&crate::ChcRunWork> {
+        self.work.as_ref()
     }
 
     /// Return the exact normalized problem this run solved and verified.
@@ -317,12 +336,22 @@ impl ChcProofRunWithBudgetReport {
         elapsed: std::time::Duration,
         cancellation_requested_at_return: bool,
     ) -> Self {
-        let stop_reason = Self::classify_stop_reason(
-            proof_run.result(),
-            cancellation_requested_at_return,
-            configured_budget,
-            elapsed,
-        );
+        // Under an effort the run's node says what stopped it (its latched
+        // stop, `ChcRunWork::stop`), so the count's stop is never read off the
+        // wall clock and a backstop is never the count's (P4a slice 8).
+        let effort_stop = proof_run
+            .work()
+            .filter(|work| work.effort.is_some())
+            .map(|work| work.stop);
+        let stop_reason = match effort_stop {
+            Some(stop) => Self::classify_effort_stop_reason(proof_run.result(), stop),
+            None => Self::classify_stop_reason(
+                proof_run.result(),
+                cancellation_requested_at_return,
+                configured_budget,
+                elapsed,
+            ),
+        };
         let adaptive_trace = crate::AdaptiveSolveTrace::direct_pdr_proof(
             configured_budget,
             elapsed,
@@ -336,6 +365,28 @@ impl ChcProofRunWithBudgetReport {
             adaptive_trace,
             stop_reason,
             cancellation_requested_at_return,
+        }
+    }
+
+    /// A run under an effort, by its node's stop: `Rlimit` is the count's,
+    /// `Deadline` and `Cpu` the backstop's, `Cancelled` a cancel's; `Memory`
+    /// and no stop, a search that ended without a verdict.
+    fn classify_effort_stop_reason(
+        result: &VerifiedChcResult,
+        stop: Option<ay_core::resource::Exhausted>,
+    ) -> ChcProofRunStopReason {
+        use ay_core::resource::Exhausted;
+        if matches!(
+            result,
+            VerifiedChcResult::Safe(_) | VerifiedChcResult::Unsafe(_)
+        ) {
+            return ChcProofRunStopReason::Definitive;
+        }
+        match stop {
+            Some(Exhausted::Rlimit) => ChcProofRunStopReason::EffortExhausted,
+            Some(Exhausted::Cancelled) => ChcProofRunStopReason::ExternallyCancelled,
+            Some(Exhausted::Deadline | Exhausted::Cpu) => ChcProofRunStopReason::BudgetExhausted,
+            Some(Exhausted::Memory) | None => ChcProofRunStopReason::Inconclusive,
         }
     }
 
@@ -413,23 +464,111 @@ impl ChcProofRunWithBudgetReport {
     /// intact. Replay wall time is added to the authoritative whole-run elapsed
     /// time; the solve's stop classification is unchanged.
     #[must_use]
-    pub fn with_checked_replay(mut self, replay_budget: std::time::Duration) -> Self {
+    pub fn with_checked_replay(self, replay_budget: std::time::Duration) -> Self {
+        self.with_checked_replay_with_progress(replay_budget, &mut || true)
+    }
+
+    /// Attempt checked replay under both its budget and caller-owned progress.
+    ///
+    /// Returning `false` stops this attempt permanently, even if a later call
+    /// would return `true`. Refusal or an AY-classified panic leaves the original
+    /// evidence intact; it cannot change the solve verdict or grant new checked
+    /// evidence. Other panics reaching this wrapper unwind through the existing
+    /// AY panic boundary without returning new evidence; inner validators retain
+    /// their own panic handling. Attempted replay time, including the final
+    /// admission poll, is added to the elapsed report. The solve's stop reason,
+    /// adaptive trace and solve-completion cancellation snapshot are not rewritten.
+    ///
+    /// Already-checked reports and results ineligible for replay are unchanged
+    /// without calling `progress`, including with a zero budget. Returning an
+    /// existing checked artifact does not perform a fresh replay or grant new
+    /// authority over a different problem.
+    ///
+    /// Polling is cooperative. SMT execution, rendering, metadata, arithmetic,
+    /// allocation and teardown retain opaque intervals; this is not a hard
+    /// deadline or a 100 ms cancellation guarantee. The final poll is the
+    /// admission point; replacing the original evidence can then perform
+    /// additional opaque destruction before this call returns.
+    #[must_use]
+    pub fn with_checked_replay_with_progress(
+        self,
+        replay_budget: std::time::Duration,
+        progress: &mut dyn FnMut() -> bool,
+    ) -> Self {
+        self.with_checked_replay_with_controls(replay_budget, progress, None)
+    }
+
+    /// Attempt checked replay with the caller's thread-safe cancellation token.
+    ///
+    /// Unlike an arbitrary borrowed progress callback, the full cloned token
+    /// can be observed during active SMT work. Parent observations and sticky
+    /// refusal are retained without cancelling or resetting caller state.
+    /// Evidence, solve telemetry and no-op rules match
+    /// [`Self::with_checked_replay_with_progress`]. Opaque export/offline
+    /// checking and cleanup remain; this is not a hard latency contract.
+    /// As in the progress API, old-evidence disposal follows final admission.
+    #[must_use]
+    pub fn with_checked_replay_with_cancellation(
+        self,
+        replay_budget: std::time::Duration,
+        cancellation: &crate::CancellationToken,
+    ) -> Self {
+        self.with_checked_replay_with_controls(replay_budget, &mut || true, Some(cancellation))
+    }
+
+    fn with_checked_replay_with_controls(
+        mut self,
+        replay_budget: std::time::Duration,
+        progress: &mut dyn FnMut() -> bool,
+        parent: Option<&crate::CancellationToken>,
+    ) -> Self {
         if self.checked_replay().is_some() || !self.proof_run().accepted_as_proof() {
             return self;
         }
 
         let started = ay_core::time::Instant::now();
+        let cancellation = parent.map(crate::smt::executor_adapter::ReplayCancellation::new);
+        let elapsed_before = self.budget_report.total_elapsed;
+        let mut stopped = false;
+        let mut poll = || {
+            if !stopped {
+                stopped = started.elapsed() >= replay_budget
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    || !progress()
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    || started.elapsed() >= replay_budget;
+            }
+            !stopped
+        };
         let checked = ay_core::catch_ay_panics(
-            std::panic::AssertUnwindSafe(|| self.proof_run().run_checked_replay(replay_budget)),
+            std::panic::AssertUnwindSafe(|| {
+                let checked = self
+                    .proof_run()
+                    .run_checked_replay_with_controls_started_at(
+                        started,
+                        replay_budget,
+                        &mut poll,
+                        parent,
+                    )?;
+                self.budget_report.total_elapsed = elapsed_before.saturating_add(started.elapsed());
+                if !poll() {
+                    return Err(crate::ChcError::Verification(
+                        "checked replay attachment interrupted; retaining original evidence"
+                            .to_owned(),
+                    ));
+                }
+                Ok(checked)
+            }),
             |reason| Err(crate::ChcError::Internal(reason)),
         );
-        self.budget_report.total_elapsed = self
-            .budget_report
-            .total_elapsed
-            .saturating_add(started.elapsed());
         if let Ok(checked) = checked {
             self.evidence = ChcProofRunEvidence::Checked(checked);
         }
+        self.budget_report.total_elapsed = elapsed_before.saturating_add(started.elapsed());
         self
     }
 
@@ -469,6 +608,9 @@ fn validate_artifact_bytes(
         ))
     }
 }
+
+#[cfg(test)]
+mod replay_progress_tests;
 
 #[cfg(test)]
 mod tests {

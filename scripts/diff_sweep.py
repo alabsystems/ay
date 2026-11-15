@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _z3_oracle  # noqa: E402
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
     run_captured,
@@ -55,6 +56,15 @@ def _which_path(cmd):
 def available_solvers():
     avail = {}
     for name, argv in SOLVERS.items():
+        if name == "z3":
+            # The reference answers only through a z3 that proved it is z3,
+            # run by its path: a file named z3 on PATH can be a refusing
+            # reroute stub or an AY drop-in (scripts/_z3_oracle.py).
+            oracle = _z3_oracle.find_z3()
+            if oracle is not None:
+                print(f"z3 oracle: {oracle.identity()}", file=sys.stderr)
+                avail[name] = [oracle.path] + argv[1:]
+            continue
         # Every absolute path in the argv must exist (catches e.g. smtinterpol
         # whose launcher `java` is present but whose jar is not — previously
         # counted "available" and then errored on every single file).

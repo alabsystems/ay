@@ -46,6 +46,9 @@ mod assume_classification;
 mod authored_array;
 #[path = "proof_trust_surgery/authored_or.rs"]
 mod authored_or;
+#[path = "proof_trust_surgery/conjunct_transport.rs"]
+mod conjunct_transport;
+pub(in crate::executor) use conjunct_transport::TransportPlan;
 #[path = "proof_trust_surgery/distinct_classification.rs"]
 mod distinct_classification;
 #[path = "proof_trust_surgery/equality_collapse.rs"]
@@ -203,7 +206,14 @@ struct QuantInstanceChain {
 /// assume per consumed original, and one re-verified `la_generic` lemma
 /// `(cl (not inst) (not orig).. L)` closed by resolutions.
 struct QuantConsequencePlan {
-    /// The original `forall` assertion the instance derives from.
+    /// The authored `forall` as elaborated (the problem premise).
+    source_quantifier: TermId,
+    /// Index of its parsed authored source in `originals`.
+    assertion_index: usize,
+    /// Its raw surface-faithful rebuild, which the `forall_inst` chain
+    /// instantiates: the chain is built from the PARSED body, so it matches
+    /// only this term, never an elaborated body that normalization rewrote
+    /// (e.g. `=>` into `or`). Same design as `QuantNegationPlan`.
     forall_term: TermId,
     /// The plan-time-built derivation of `(cl chain.target)`.
     chain: QuantInstanceChain,
@@ -211,6 +221,13 @@ struct QuantConsequencePlan {
     supports: Vec<TermId>,
     /// The validated lemma clause `(not chain.target) (not s)... L`,
     /// ending in the trust unit `L` the consumers expect.
+    ///
+    /// EMPTY exactly for an IDENTITY consequence: the trust unit `L` is the
+    /// instance `chain.target` itself (the conjunct preprocessing kept as is),
+    /// so the chain already derives `(cl L)` and there are no supports. The
+    /// lemma would otherwise be the tautology `(cl (not L) L)`, whose pivot
+    /// occurs in both polarities and which the surface audit's `unique_atoms`
+    /// guard rightly refuses to emit.
     lemma: Vec<TermId>,
 }
 
@@ -279,6 +296,15 @@ enum AndDistinctKind {
         /// binary-equality orientation flip (possibly under one `not`).
         lits: Vec<(TermId, TermId)>,
     },
+    /// The raw conjunct is the canonical conjunct with its top-level binary
+    /// equality flipped (possibly under one `not`): the file-orientation
+    /// literal is assumed and bridged by one certified `eq_symmetric` +
+    /// `equiv_pos1/2` orientation step.
+    EqFlip,
+    /// Elaboration folded closed subterms of the raw conjunct, rewrote a
+    /// folded `(= p false)` to `(not p)`, or dropped disjuncts that fold to
+    /// `false`: the checked transport plan derives the canonical conjunct.
+    Transport(Box<TransportPlan>),
 }
 
 /// A recognized preprocessor-derived unit trust step `(cl L)` where an

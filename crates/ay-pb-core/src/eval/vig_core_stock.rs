@@ -9,8 +9,7 @@
 // fragment with one line removed, because a native contract clause is raw grammar
 // that a stock rustc rejects at parse time. `eval.rs` selects between them on
 // `cfg(deductive_verify)`, so the verifier NEVER reads this file and the gate is never
-// verified in a weakened form. `tests/native_contract_twins.rs` pins the two
-// bodies together, so a divergence fails the suite instead of shipping silently.
+// verified in a weakened form.
 
 /// See `vig_core.rs` for the incumbent-gate contract and the postcondition this
 /// spelling cannot carry.

@@ -67,14 +67,17 @@ impl LogicCategory {
     ///
     /// "Some" is deliberate: a few categories reach their lane only for part of
     /// the feature space (`QfNira`/`QfUfnira`/`Ufnira` decline when a Real sort
-    /// is present, because `solve_nia`/`solve_uf_nia` have no LRA), and those
+    /// is present, because `solve_nia`/`solve_uf_nia` have no LRA; `Ufdtnira`
+    /// takes the `Ufdtnia` lane only when the LIVE window is Real-free and
+    /// array-free, `StaticFeatures::within_dt_uf_nia_theories`), and those
     /// count as having a lane.
     pub(crate) const fn has_ground_lane(self) -> bool {
         match self {
-            // No DT composition over a nonlinear REAL base exists: there is no
-            // `solve_uf_nra` sibling for `solve_with_dt_axioms` to compose with,
-            // so both tables answer a sound `unknown`.
-            Self::Ufdtnra | Self::Ufdtnira => false,
+            // No DT composition over a nonlinear REAL base is wired:
+            // `solve_uf_nra` exists (`QfUfnra`/`Ufnra` route to it) but
+            // `solve_with_dt_axioms` has never been composed over it, so both
+            // tables answer a sound `unknown`.
+            Self::Ufdtnra => false,
             // Quantified NIRA: `solve_nia` has no LRA and the mixed category
             // carries Reals by construction.
             Self::Nira => false,
@@ -148,7 +151,11 @@ impl LogicCategory {
             | Self::Ufdtnia
             | Self::Aufdt
             | Self::Aufdtlia
-            | Self::Aufdtlira => true,
+            | Self::Aufdtlira
+            // Declared UFDTNIRA/AUFDTNIRA: the `Ufdtnia` lane, taken by both
+            // tables when the LIVE window carries neither a Real nor an array
+            // term (#ufdtnira-live-content-lane).
+            | Self::Ufdtnira => true,
         }
     }
 
@@ -547,8 +554,10 @@ impl LogicCategory {
             Self::DtAuflia if nl_int && !features.has_arrays => Self::Ufdtnia,
             Self::DtAuflia if nl_int => Self::Other,
             // DT + nonlinear Real / mixed -> Other. There is no `solve_uf_nra`
-            // DT composition to route to (`Ufdtnra`/`Ufdtnira` themselves answer
-            // a bare Unknown), so the fail-closed refusal stands.
+            // DT composition to route to (`Ufdtnra` answers a bare Unknown, and
+            // `Ufdtnira` takes the `Ufdtnia` lane only on a Real-free, array-
+            // free live window, which a mixed Int/Real `DtAuflira` window is
+            // not), so the fail-closed refusal stands.
             Self::DtAuflra if nl_real => Self::Other,
             Self::DtAuflira if nl_int || nl_real => Self::Other,
 

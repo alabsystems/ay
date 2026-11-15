@@ -805,6 +805,110 @@ fn test_check_sat_assuming_records_internal_error_for_non_bool_assumption() {
     assert!(solver.executor_error().is_some());
 }
 
+/// A theory mix with no combined decision procedure is a refusal, published as
+/// `Incomplete` (the router's reason for the same refusal under a
+/// `FAIL_CLOSED_COMBINED` declaration), never as `InternalError`: an embedder
+/// reads `InternalError` as a solver fault. Since 550b6b40e the router answers
+/// the refusal with the standard `unknown` instead of an executor error, so
+/// `executor_error()` stays empty, and the refusal is the diagnostic: phase
+/// `theory-combination`, its text as the detail. The query never searched. A
+/// genuine executor error is still `InternalError` (the non-Bool assumption
+/// above).
+///
+/// The shape is Trust's bitwise operator bridged through `bv2nat` into a
+/// nonlinear Int product: one shared symbol, so one component and no lane.
+/// Trust's other shape, the multiply-overflow record, has disjoint halves, so
+/// the partition rescue now searches it (the next test, and
+/// `theory_mix_rescue` for the refusal diagnostic beside the rescue).
+#[test]
+fn test_theory_mix_without_a_lane_is_incomplete_not_internal_error() {
+    use crate::UnknownReason;
+
+    let mut solver = Solver::try_new_with_smtlib_logic("QF_AUFBVNIA").unwrap();
+    let l = solver.declare_const("l", Sort::bitvec(32));
+    let mask = solver.bv_const(15, 32);
+    let low_bits = solver.bvand(l, mask);
+    let low = solver.bv2int(low_bits);
+    let a = solver.declare_const("a", Sort::Int);
+    let product = solver.mul(low, a);
+    let ten = solver.int_const(10);
+    let big = solver.gt(product, ten);
+    solver.assert_term(big);
+
+    let details = solver.check_sat_with_details();
+    assert_eq!(details.result, SolveResult::Unknown);
+    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
+    assert_eq!(details.unknown_reason, Some(UnknownReason::Incomplete));
+    assert_eq!(
+        solver.executor_error(),
+        None,
+        "the refusal is an answer, not an executor fault"
+    );
+    let diagnostic = details
+        .unknown_diagnostic
+        .as_ref()
+        .expect("an unknown carries a diagnostic");
+    assert_eq!(
+        diagnostic.phase.as_deref(),
+        Some("theory-combination"),
+        "{diagnostic:?}"
+    );
+    assert!(
+        diagnostic.detail.as_deref().is_some_and(|detail| {
+            detail.contains("unsupported logic: QF_AUFBVNIA")
+                && detail.contains("no combined decision procedure")
+        }),
+        "the diagnostic names the refusal, not a search: {diagnostic:?}"
+    );
+}
+
+/// Trust's unsigned var*var multiply-overflow record, simplified to 32-bit
+/// operands: a bitvector conjunct beside a nonlinear Int conjunct over
+/// disjoint symbols. The router's `unknown` lets the symbol-disjoint partition
+/// rescue solve each component in its own lane, and the merged model is
+/// validated. (Trust's own record, over the 64-bit images of its operands,
+/// runs the rescue to its deadline instead: `theory_mix_rescue`.)
+#[test]
+fn test_theory_mix_over_disjoint_symbols_is_decided_by_its_components() {
+    let mut solver = Solver::try_new_with_smtlib_logic("QF_AUFBVNIA").unwrap();
+    let l = solver.declare_const("l", Sort::bitvec(32));
+    let r = solver.declare_const("r", Sort::bitvec(32));
+    let product = solver.bvmul(l, r);
+    let recovered = solver.bvudiv(product, l);
+    let mismatch = solver.eq(recovered, r);
+    let mismatch = solver.not(mismatch);
+    solver.assert_term(mismatch);
+    let a = solver.declare_const("a", Sort::Int);
+    let b = solver.declare_const("b", Sort::Int);
+    let int_product = solver.mul(a, b);
+    let ten = solver.int_const(10);
+    let big = solver.gt(int_product, ten);
+    solver.assert_term(big);
+
+    let details = solver.check_sat_with_details();
+    assert!(
+        details.result.is_sat() && details.result.was_model_validated(),
+        "{:?}",
+        details.result
+    );
+    let statistics = solver.statistics();
+    assert_eq!(
+        statistics.get_int("solver.partition_rescue.components"),
+        Some(2)
+    );
+    assert_eq!(
+        statistics.get_string("solver.partition_rescue.outcome"),
+        Some("sat")
+    );
+    assert_eq!(
+        statistics.get_string("unknown.phase"),
+        None,
+        "a decided query keeps no refusal diagnostic"
+    );
+}
+
+mod theory_mix_rescue;
+
 #[test]
 fn test_unknown_reason_clears_after_successful_solve_and_reset() {
     let mut solver = Solver::new(Logic::QfLia);

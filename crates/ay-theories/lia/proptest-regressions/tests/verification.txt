@@ -6,3 +6,8 @@
 # everyone who runs the test benefits from these saved cases.
 cc e9e22d2c7728573ea011c3bb30b95533b6f8732071f52af22846458009118867 # shrinks to _val = 0
 cc 02e7d3b76d78ebf6d689ba6009a9f6d72ef1e3cf95d2a9ff8c7ccda6a49248ef # shrinks to k = 0
+cc 3358c790127aa4233204181bb6a321218dd394734e6c5c466b35d62fc9976562 # shrinks to _val = 0
+cc da7d75d22329f7ef8ae31df306605824680e95ce2557b4c635d59611d7d0b2a8 # shrinks to k = 0
+cc 701ba9c5c2f9630332f1a3f817a810aee12dc3eda867f85df9b7840ec329f766 # shrinks to c1 = 0, c2 = 0, c3 = 1, constraint_type = 3
+cc d3e019063e09656d5421ecb4d7cf851e108f2c9e5af7d8bafc2149bf96ddebc6 # shrinks to c1 = 6, c2 = 1, c3 = -9, constraint_type = 2
+cc 312f47d857529bf8e59ab9abad4c69dddc72c318c57507f93f563b9d1080e7a4 # shrinks to k = 0

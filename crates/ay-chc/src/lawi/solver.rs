@@ -16,11 +16,14 @@
 //! 6. When all leaves are covered → Safe (invariant = ∨ of uncovered labels)
 
 use crate::engine_config::ChcEngineConfig;
-use crate::engine_result::{build_single_pred_model, skeleton_counterexample, ChcEngineResult};
+use crate::engine_result::{build_single_pred_model, ChcEngineResult};
+use crate::ground_derivation::linear_trace::LinearTrace;
 use crate::interpolant_validation::collect_conjuncts_for_interpolation;
-use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
+use crate::interpolation::stats::{self, EngineTag, ExitReason};
+use crate::interpolation::{interpolating_sat_constraints_lra_proof_first, InterpolatingSatResult};
 use crate::lawi::art::{AbstractReachabilityTree, ArtVertexId};
 use crate::lawi::covering::CoveringRelation;
+use crate::pdr::Counterexample;
 use crate::smt::{SmtContext, SmtResult};
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcProblem, ChcSort};
@@ -93,8 +96,9 @@ impl LabelingFunction {
 
 /// Result of attempting to refine a spurious error path.
 enum RefineResult {
-    /// The error path is satisfiable — real counterexample found.
-    Unsafe(usize),
+    /// The error path is satisfiable — real counterexample found, carrying
+    /// the path model's ground evidence when it validates.
+    Unsafe(Counterexample),
     /// The path was spurious; labels were strengthened at these vertices.
     Refined(Vec<ArtVertexId>),
     /// Interpolation failed; cannot determine safety.
@@ -180,10 +184,11 @@ impl LawiSolver {
 
         // Precheck: SAT(init ∧ query) ⇒ unsafe at depth 0.
         let init_and_query = ChcExpr::and(ts.init.clone(), ts.query.clone());
-        let mut smt = SmtContext::new();
+        let mut smt = SmtContext::new_search();
         match smt.check_sat(&init_and_query) {
-            SmtResult::Sat(_) => {
-                return ChcEngineResult::Unsafe(skeleton_counterexample(&self.problem, 0));
+            SmtResult::Sat(model) => {
+                let trace = LinearTrace::from_ts_unrolling(ts, &model, 0);
+                return ChcEngineResult::Unsafe(self.trace_counterexample(&trace, 0));
             }
             SmtResult::Unknown => return ChcEngineResult::Unknown,
             _ => {}
@@ -224,11 +229,8 @@ impl LawiSolver {
             if is_error {
                 // Error leaf reached — attempt refinement.
                 match self.refine(vertex) {
-                    RefineResult::Unsafe(depth) => {
-                        return ChcEngineResult::Unsafe(skeleton_counterexample(
-                            &self.problem,
-                            depth,
-                        ));
+                    RefineResult::Unsafe(cex) => {
+                        return ChcEngineResult::Unsafe(cex);
                     }
                     RefineResult::Refined(strengthened) => {
                         // Re-attempt covering for strengthened vertices.
@@ -321,7 +323,7 @@ impl LawiSolver {
         let negated = ChcExpr::not(label_coverer);
         let query = ChcExpr::and(label_coveree, negated);
 
-        let mut smt = SmtContext::new();
+        let mut smt = SmtContext::new_search();
         matches!(
             smt.check_sat(&query),
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_)
@@ -336,9 +338,8 @@ impl LawiSolver {
     ///
     /// Reference: `reference/golem/src/engine/Lawi.cc:513-549`.
     fn refine(&mut self, error_vertex: ArtVertexId) -> RefineResult {
-        let ts = match self.ts.as_ref() {
-            Some(ts) => ts,
-            None => return RefineResult::Failed,
+        let Some(ts) = self.ts.as_ref() else {
+            return RefineResult::Failed;
         };
 
         let path_vertices = self.art().path_vertices_from_root(error_vertex);
@@ -359,11 +360,12 @@ impl LawiSolver {
 
         // Check satisfiability of the full path.
         let full_path = ChcExpr::and_all(path_parts.iter().cloned());
-        let mut smt = SmtContext::new();
+        let mut smt = SmtContext::new_search();
         match smt.check_sat(&full_path) {
-            SmtResult::Sat(_) => {
-                // Real counterexample.
-                return RefineResult::Unsafe(k);
+            SmtResult::Sat(model) => {
+                // Real counterexample: its model is the witness.
+                let trace = self.path_trace(ts, &path_edges, &model);
+                return RefineResult::Unsafe(self.trace_counterexample(&trace, k));
             }
             SmtResult::Unknown => return RefineResult::Failed,
             _ => {
@@ -384,6 +386,11 @@ impl LawiSolver {
         let mut strengthened = Vec::new();
 
         for boundary in 1..k {
+            // Each boundary builds O(k) conjunctions and an interpolation call
+            // with no deadline: stop refining once LAWI is cancelled.
+            if self.config.base.is_cancelled() {
+                break;
+            }
             let a_formula = ChcExpr::and_all(path_parts[..=boundary].iter().cloned());
             let b_formula = ChcExpr::and_all(path_parts[boundary + 1..].iter().cloned());
 
@@ -397,16 +404,28 @@ impl LawiSolver {
             let mut b_constraints = Vec::new();
             collect_conjuncts_for_interpolation(&b_formula, &mut b_constraints);
 
-            let interpolant =
-                match interpolating_sat_constraints(&a_constraints, &b_constraints, &shared_vars) {
-                    InterpolatingSatResult::Unsat(itp) => itp,
-                    InterpolatingSatResult::Unknown => {
-                        if self.config.base.verbose {
-                            safe_eprintln!("LAWI: interpolation failed at boundary {}", boundary);
-                        }
-                        continue;
+            let interpolant = match interpolating_sat_constraints_lra_proof_first(
+                &a_constraints,
+                &b_constraints,
+                &shared_vars,
+                None,
+            ) {
+                InterpolatingSatResult::Unsat(itp) => itp,
+                InterpolatingSatResult::Unknown => {
+                    if self.config.base.verbose {
+                        safe_eprintln!("LAWI: interpolation failed at boundary {}", boundary);
                     }
-                };
+                    // Not an engine exit (refinement continues with the
+                    // next boundary); the line attributes the failure.
+                    stats::record_engine_exit_detail(
+                        EngineTag::Lawi,
+                        ExitReason::ItpFail,
+                        k,
+                        &format!("boundary={boundary} continue=true"),
+                    );
+                    continue;
+                }
+            };
 
             // Normalize interpolant from time `boundary` back to time 0.
             // Reference: `reference/golem/src/engine/Lawi.cc:791-798`.

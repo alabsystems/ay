@@ -303,6 +303,25 @@ impl VSIDS {
         update: batch::BatchScoreUpdate,
         vars: &[usize],
     ) {
+        match self.repair_heap_after_evsids_batch_admitted(
+            update,
+            vars,
+            &super::counted_analysis::HeapOrdinary,
+        ) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn repair_heap_after_evsids_batch_admitted<
+        P: super::counted_analysis::HeapPolicy,
+    >(
+        &mut self,
+        update: batch::BatchScoreUpdate,
+        vars: &[usize],
+        policy: &P,
+    ) -> Result<(), P::Error> {
+        policy.work(1)?;
         match update.in_heap {
             0 => {}
             1 => {
@@ -312,6 +331,7 @@ impl VSIDS {
                         pos, INVALID_POS,
                         "BUG: batch repair requested sift for non-heap var {var}"
                     );
+                    policy.sift(self)?;
                     self.sift_up(pos as usize);
                 }
             }
@@ -321,18 +341,21 @@ impl VSIDS {
                 // removed); the density heuristic still picks the rebuild
                 // when it is cheaper.
                 if batch::evsids_batch_prefers_rebuild(update.in_heap, self.heap.len()) {
+                    policy.rebuild(self)?;
                     self.rebuild_heap();
                 } else {
-                    self.sparse_reheapify_affected_paths(vars);
+                    self.sparse_reheapify_affected_paths_admitted(vars, policy)?;
                 }
             }
         }
 
         #[cfg(debug_assertions)]
         if update.in_heap > 0 {
+            policy.debug_heap(self)?;
             self.debug_assert_heap_property();
             self.debug_assert_heap_pos_consistent();
         }
+        Ok(())
     }
 
     /// Restore the max-heap invariant after a uniform batch bump in O(k log n)
@@ -355,97 +378,84 @@ impl VSIDS {
     /// climbing pushes a non-bumped ancestor one slot deeper, where it can land
     /// above an already-processed bumped node it no longer dominates, leaving a
     /// child-greater-than-parent violation the sift-up pass never revisits.)
-    fn sparse_reheapify_affected_paths(&mut self, vars: &[usize]) {
-        // Take the scratch buffers out so we can freely call `&mut self`
-        // methods below; swapped back at the end to retain the allocations
-        // across conflicts.
+    fn sparse_reheapify_affected_paths_admitted<P: super::counted_analysis::HeapPolicy>(
+        &mut self,
+        vars: &[usize],
+        p: &P,
+    ) -> Result<(), P::Error> {
+        p.sparse_entry(self)?;
+        // On refusal/unwind these locally owned Copy buffers are dropped;
+        // registrations prepay retirement. The enclosing counted solver
+        // scope is terminal, so no partially updated heap can escape.
         let mut positions = std::mem::take(&mut self.heap_repair_scratch);
         let mut ordered = std::mem::take(&mut self.heap_repair_order);
         positions.clear();
-
-        // Collect the FULL root-ward path (to the root) of every in-heap bumped
-        // variable. The union of these paths is closed under taking parents, so
-        // it forms a top-closed region: a Floyd-style bottom-up `sift_down`
-        // (deepest position first) over exactly this region restores the
-        // max-heap invariant. When a region position is processed, both its
-        // children subtrees are valid heaps — the in-region child was already
-        // processed (deeper, handled earlier), and every off-region subtree
-        // contains only non-bumped (unchanged) variables and so was never
-        // disturbed by the bump. sift_down both lifts bumped nodes that must
-        // rise and sinks displaced non-bumped ancestors.
-        //
-        // Instruction-shave #4: paths from different variables share all
-        // ancestors above their lowest common ancestor, so the old
-        // collect-all/sort-desc/dedup pipeline sorted ~k*log(n) entries with
-        // heavy duplication near the root. Replaced by (a) per-position visit
-        // stamps that terminate each climb at the first already-collected
-        // ancestor (every ancestor of a stamped position is itself stamped,
-        // by induction over completed climbs), and (b) a counting sort by
-        // tree depth instead of a comparison sort.
-        //
-        // Identity note: the old code processed the region in strictly
-        // decreasing position order = depth-descending with decreasing order
-        // within each depth. The counting sort below is depth-descending with
-        // collection order within each depth. Same-depth positions root
-        // disjoint subtrees, so their sift_downs touch disjoint heap/heap_pos
-        // slots and commute exactly: the final heap layout is bit-identical
-        // (layout is search-observable via `shuffle_scores`).
+        if self.heap_repair_epoch == u32::MAX {
+            p.work(self.heap_repair_stamp.len())?;
+        }
         self.heap_repair_epoch = self.heap_repair_epoch.wrapping_add(1);
         if self.heap_repair_epoch == 0 {
             self.heap_repair_stamp.fill(0);
             self.heap_repair_epoch = 1;
         }
         let epoch = self.heap_repair_epoch;
-        if self.heap_repair_stamp.len() < self.heap.len() {
+        let growth = self.heap.len().saturating_sub(self.heap_repair_stamp.len());
+        if growth > 0 {
+            p.work(growth)?;
+            p.reserve(&mut self.heap_repair_stamp, growth)?;
             self.heap_repair_stamp.resize(self.heap.len(), 0);
         }
-
-        // Depth of position p is ilog2(p+1); u32 positions bound depth < 32.
         let mut depth_counts = [0u32; 32];
         for &idx in vars {
+            p.work(1)?;
             let pos = self.heap_pos[idx];
             if pos == INVALID_POS {
                 continue;
             }
-            let mut p = pos as usize;
+            let mut at = pos as usize;
             loop {
-                if self.heap_repair_stamp[p] == epoch {
+                p.work(1)?;
+                if self.heap_repair_stamp[at] == epoch {
                     break;
                 }
-                self.heap_repair_stamp[p] = epoch;
-                positions.push(p as u32);
-                depth_counts[(p as u32 + 1).ilog2() as usize] += 1;
-                if p == 0 {
+                p.reserve(&mut positions, 1)?;
+                p.work(2)?; // append and eventual scratch retirement
+                self.heap_repair_stamp[at] = epoch;
+                positions.push(at as u32);
+                depth_counts[(at as u32 + 1).ilog2() as usize] += 1;
+                if at == 0 {
                     break;
                 }
-                p = (p - 1) / 2;
+                at = (at - 1) / 2;
             }
         }
-
         if !positions.is_empty() {
-            // Counting-sort scatter: deepest depth bucket first.
             let mut cursor = [0u32; 32];
             let mut acc = 0u32;
-            for d in (0..32).rev() {
-                cursor[d] = acc;
-                acc += depth_counts[d];
+            for depth in (0..32).rev() {
+                cursor[depth] = acc;
+                acc += depth_counts[depth];
             }
             ordered.clear();
+            p.work(positions.len())?;
+            p.reserve(&mut ordered, positions.len())?;
             ordered.resize(positions.len(), 0);
-            for &p in &positions {
-                let d = (p + 1).ilog2() as usize;
-                ordered[cursor[d] as usize] = p;
-                cursor[d] += 1;
+            for &pos in &positions {
+                p.work(2)?;
+                let depth = (pos + 1).ilog2() as usize;
+                ordered[cursor[depth] as usize] = pos;
+                cursor[depth] += 1;
             }
-            for &p in &ordered {
-                self.sift_down(p as usize);
+            for &pos in &ordered {
+                p.sift(self)?;
+                self.sift_down(pos as usize);
             }
         }
-
         positions.clear();
         ordered.clear();
         self.heap_repair_scratch = positions;
         self.heap_repair_order = ordered;
+        Ok(())
     }
 
     pub(super) fn repair_heap_after_batch(&mut self, update: batch::BatchScoreUpdate) {

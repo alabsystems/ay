@@ -1498,7 +1498,7 @@ pub fn verify_single_row_infeasibility_certificate(
 }
 
 /// Deadline-aware model-bound replay for a single-row proof artifact.
-pub(crate) fn verify_single_row_infeasibility_certificate_with_deadline(
+pub fn verify_single_row_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &SingleRowDpInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -1528,7 +1528,7 @@ pub fn verify_multi_row_infeasibility_certificate(
 }
 
 /// Deadline-aware model-bound replay for a multi-row decision-DAG artifact.
-pub(crate) fn verify_multi_row_infeasibility_certificate_with_deadline(
+pub fn verify_multi_row_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &MultiRowBddInfeasibilityCertificate,
     deadline: Option<Instant>,

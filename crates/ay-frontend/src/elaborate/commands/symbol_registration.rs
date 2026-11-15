@@ -9,6 +9,45 @@ use crate::elaborate::{DeclarationKind, PublicSort, SymbolBindingOrigin};
 use ay_core::{Sort, TermId};
 
 impl Context {
+    /// Preflight the existing native-global adoption operation for a scalar
+    /// Bool/BV constant. This reserves metadata only; registration still uses
+    /// the canonical binding/provenance method and creates no new term.
+    pub fn reserve_native_global_constant_adoption(
+        &mut self,
+        name: &str,
+        term: TermId,
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Result<(), ay_core::term::CountedTermError> {
+        use ay_core::term::CountedTermError;
+        owner.admit(name.len(), 0)?;
+        if !matches!(self.terms.sort(term), Sort::Bool | Sort::BitVec(_))
+            || self.has_symbol_binding(name)
+        {
+            return Err(CountedTermError::InvalidInput);
+        }
+        if self.symbols.len() == self.symbols.capacity() {
+            owner.admit(self.symbols.allocation_size(), 0)?;
+            for key in self.symbols.keys() {
+                owner.admit(key.len(), 0)?;
+            }
+        }
+        ay_core::term::reserve_map_counted(&mut self.symbols, 1, owner)?;
+        let work = self
+            .scopes
+            .len()
+            .checked_mul(
+                name.len()
+                    .checked_add(1)
+                    .ok_or(CountedTermError::InvalidInput)?,
+            )
+            .ok_or(CountedTermError::InvalidInput)?;
+        // Replacement snapshots clone only this scalar SymbolInfo: its
+        // argument vectors/internal-name are empty; the fresh declaration's
+        // Arc marker is shared, not reallocated per scope.
+        owner.admit(work, 2 * std::mem::size_of::<usize>())?;
+        owner.check()?;
+        Ok(())
+    }
     pub(super) fn register_symbol_with_internal_name(
         &mut self,
         name: String,

@@ -166,6 +166,12 @@ pub(in crate::executor) struct LaneAccount {
     pub(super) certified_ms: u64,
     /// How many certificates that was — trace only, the rule reads the times.
     pub(super) certificates: u64,
+    /// Sub-solve refutations admitted only as `discharged-trust` (monotonic;
+    /// a pass compares it before and after to learn whether the certificate
+    /// it installs rests on one — see `finite_model_pass_trust`). The probe
+    /// mode refuses that class, so this stays zero unless that line fails,
+    /// and a pass it marks is refused at install.
+    pub(super) discharged_trust_refutations: u64,
     /// Test-only override of the per-invocation cap
     /// ([`FINITE_MODEL_LANE_BUDGET_MS`] when `None`).
     ///

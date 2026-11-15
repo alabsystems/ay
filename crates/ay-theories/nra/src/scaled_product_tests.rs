@@ -204,7 +204,8 @@ fn compound_factor_is_recorded_and_blocks_unavailable_models() {
     let mut solver = NraSolver::new(&terms);
     solver.assert_literal(atom, true);
     assert!(solver.compound_factors.contains(&sum));
-    assert!(solver.has_undefined_compound_factors());
+    let memo = std::cell::RefCell::new(crate::check_loop::ValueMemo::default());
+    assert!(solver.has_undefined_compound_factors(&memo));
     assert!(solver.has_inconsistent_monomials());
 }
 

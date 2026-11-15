@@ -128,6 +128,32 @@ fn test_fp_add_sat_8456() {
 // FP to_real model validation (#8456)
 // ---------------------------------------------------------------------------
 
+/// Double-precision `fp.div` chain from KLEE's `aachen_real_diction_style`
+/// query.01 (QF_BVFP): the restoring divider rebuilt `bv_neg(b)` and a
+/// full-width comparator per iteration (#fp-div-borrow), peaking at
+/// 1.02 GB governed-`unknown (memout)`; deriving `>=` from the trial
+/// subtraction's carry-out decides `unsat` at ~529 MB (z3 `unsat`,
+/// 567 MB).
+#[test]
+fn test_fp_div_double_chain_decides_unsat() {
+    let smt = r#"
+(set-logic QF_BVFP)
+(declare-fun words_ackermann!0 () (_ BitVec 32))
+(assert (bvslt (_ bv300 32) words_ackermann!0))
+(assert (bvslt words_ackermann!0 (_ bv500 32)))
+(assert
+ (let ((?x15 ((_ to_fp 11 53) roundNearestTiesToEven words_ackermann!0)))
+ (let ((?x25 (fp.mul roundNearestTiesToEven (fp.div roundNearestTiesToEven ?x15 ((_ to_fp 11 53) (_ bv4625759767262920704 64))) ((_ to_fp 11 53) (_ bv4600697235336603894 64)))))
+ (let ((?x19 (fp.mul roundNearestTiesToEven (fp.div roundNearestTiesToEven ((_ to_fp 11 53) (_ bv4648524056004395008 64)) ?x15) ((_ to_fp 11 53) (_ bv4622832427505129882 64)))))
+ (let ((?x29 (fp.add roundNearestTiesToEven (fp.add roundNearestTiesToEven ?x19 ?x25) ((_ to_fp 11 53) (_ bv13848338044683372462 64)))))
+ (not (not (fp.isNaN ((_ to_fp 8 24) roundNearestTiesToEven ?x29)))))))))
+(check-sat)
+"#;
+    let result = solve(smt);
+    let r = sat_result(&result);
+    assert_eq!(r, Some("unsat"), "diction_style div chain: {result}");
+}
+
 /// FP to_real: mixed FP+Real formula exercises the merged model path.
 /// This previously required skip_model_eval to avoid false Unknown.
 #[test]

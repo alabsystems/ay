@@ -44,8 +44,13 @@ impl LiaSolver<'_> {
             .collect();
 
         // Reasons for any tightened bounds: the equalities that produced the
-        // Dioph substitutions.
-        let reasons = self.dioph_cached_reasons.clone();
+        // Dioph substitutions, PLUS (per row, below) the bound reasons of every
+        // fixed variable folded into the row constant and of the row bound
+        // being tightened (#nia-sign-cut-soundness). A tightened bound is a
+        // consequence of exactly those facts; citing only the substitution
+        // equalities laundered any folded bound — including a model-derived
+        // NIA pin — into a derived bound with clean reasons.
+        let base_reasons = self.dioph_cached_reasons.clone();
 
         // Get all bounded integer rows from the simplex tableau.
         let rows = self.lra.get_bounded_integer_rows(&self.integer_vars);
@@ -72,6 +77,11 @@ impl LiaSolver<'_> {
             // Scaled constant from the tableau row
             expr_constant += (&row.constant * &lcm_den).to_integer();
 
+            // Bound reasons of the fixed variables folded into this row's
+            // constant (#nia-sign-cut-soundness); joined to `base_reasons`
+            // for every bound tightened from this row.
+            let mut fold_reasons: Vec<(TermId, bool)> = Vec::new();
+
             for &(var_id, ref coeff) in &row.coeffs {
                 let scaled = (coeff * &lcm_den).to_integer();
 
@@ -82,9 +92,12 @@ impl LiaSolver<'_> {
                     break;
                 };
 
-                // Check if this variable is fixed (equal bounds)
-                if let Some((Some(lb), Some(ub))) = self.lra.get_var_bounds(var_id) {
-                    if lb == ub {
+                // Check if this variable is fixed (equal bounds) — by
+                // JUSTIFIED bounds only (#nia-sign-cut-soundness): an NIA
+                // rounding / patch pin is `lb == ub` too and is not a fact.
+                if let Some((Some(lb_b), Some(ub_b))) = self.justified_var_bounds_ref(var_id) {
+                    if lb_b.value == ub_b.value {
+                        let lb = lb_b.value_big();
                         // Fixed variable: fold into constant.
                         // Contribution: scaled * lb = (coeff * lcm_den) * (lb_numer / lb_denom).
                         // This must be an exact integer; truncation would corrupt the GCD
@@ -97,6 +110,8 @@ impl LiaSolver<'_> {
                             break;
                         }
                         expr_constant += contrib;
+                        fold_reasons.extend(lb_b.reason_pairs().filter(|(t, _)| !t.is_sentinel()));
+                        fold_reasons.extend(ub_b.reason_pairs().filter(|(t, _)| !t.is_sentinel()));
                         continue;
                     }
                 }
@@ -164,6 +179,30 @@ impl LiaSolver<'_> {
                 continue;
             };
 
+            // The row's own bounds (already justified: `get_bounded_integer_rows`
+            // reports only justified basic-variable bounds) contribute their
+            // reasons to the tightened bound they are tightened FROM.
+            let join_reasons = |side: Option<&Bound>| -> Vec<(TermId, bool)> {
+                let mut all = base_reasons.clone();
+                for &(t, v) in &fold_reasons {
+                    if !all.iter().any(|&(r, _)| r == t) {
+                        all.push((t, v));
+                    }
+                }
+                if let Some(b) = side {
+                    for (t, v) in b.reason_pairs().filter(|(t, _)| !t.is_sentinel()) {
+                        if !all.iter().any(|&(r, _)| r == t) {
+                            all.push((t, v));
+                        }
+                    }
+                }
+                all
+            };
+            let (ub_reasons, lb_reasons) = match self.lra.var_bounds_with_reasons(row.basic_var) {
+                Some((lb, ub)) => (join_reasons(ub), join_reasons(lb)),
+                None => (join_reasons(None), join_reasons(None)),
+            };
+
             // Tighten upper bound
             if let Some(ref ub_rat) = row.upper_bound {
                 let ub_scaled = (ub_rat * &lcm_den).to_integer();
@@ -189,7 +228,7 @@ impl LiaSolver<'_> {
                         }
                         let lra_var = self.lra.ensure_var_registered(basic_term);
                         self.lra
-                            .add_direct_bound_with_reasons(lra_var, new_ub, false, &reasons);
+                            .add_direct_bound_with_reasons(lra_var, new_ub, false, &ub_reasons);
                         // Dioph row tightening → rescan this var (#C4).
                         // (Direct field access: `sub_map` holds a borrow of
                         // `dioph_cached_substitutions` across the loop.)
@@ -224,7 +263,7 @@ impl LiaSolver<'_> {
                         }
                         let lra_var = self.lra.ensure_var_registered(basic_term);
                         self.lra
-                            .add_direct_bound_with_reasons(lra_var, new_lb, true, &reasons);
+                            .add_direct_bound_with_reasons(lra_var, new_lb, true, &lb_reasons);
                         // Dioph row tightening → rescan this var (#C4).
                         // (Direct field access: `sub_map` holds a borrow of
                         // `dioph_cached_substitutions` across the loop.)

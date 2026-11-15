@@ -120,7 +120,7 @@ fn test_local_binding_shadows_scalar_nullary_uf() {
 
 #[test]
 fn test_non_horn_nested_relation_fails_validation_before_query_slicing() {
-    let problem = ChcParser::parse(
+    let error = ChcParser::parse(
         r#"
             (set-logic HORN)
             (declare-rel P ())
@@ -129,11 +129,11 @@ fn test_non_horn_nested_relation_fails_validation_before_query_slicing() {
             (query (or P (= x 0)))
         "#,
     )
-    .expect("the surface parser retains the non-Horn Boolean shape for validation");
+    .expect_err("the parser refuses a relation nested in a background constraint");
 
     assert!(
-        matches!(problem.validate(), Err(crate::ChcError::Verification(_))),
-        "a relation nested in a background constraint must not reach dependency slicing"
+        error.to_string().contains("unsupported CHC input"),
+        "a relation nested in a background constraint must not reach dependency slicing: {error}"
     );
 }
 

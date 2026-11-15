@@ -64,6 +64,50 @@ fn test_materialization_delta_positive_epsilon_upper_bound() {
 
 /// #7654: extract_model() must snap asserted single-variable equalities back
 /// to their exact constant instead of returning a delta-shifted value.
+/// An asserted disequality whose simplex value is `x + k·ε` (accepted by the
+/// check: not zero) must not be zeroed by the materialisation δ
+/// (DPLL_LRA_perf_2026-09-23 §1). `x > 0`, `x <= 1`, `2x = 1` asserted false,
+/// `x = 0+ε`: the bound envelope alone gives δ = 1/2 and publishes x = 1/2.
+#[test]
+fn test_materialization_delta_avoids_disequality_zero_point() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(BigRational::one());
+    let two = terms.mk_rational(BigRational::from(BigInt::from(2)));
+    let two_x = terms.mk_mul(vec![two, x]);
+    let x_gt_zero = terms.mk_gt(x, zero);
+    let x_le_one = terms.mk_le(x, one);
+    let two_x_eq_one = terms.mk_eq(two_x, one);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [x_gt_zero, x_le_one, two_x_eq_one] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(x_gt_zero, true);
+    solver.assert_literal(x_le_one, true);
+    solver.assert_literal(two_x_eq_one, false);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    let x_var = *solver.term_to_var.get(&x).expect("x must be registered");
+    solver.vars[x_var as usize].value = InfRational::new(BigRational::zero(), BigRational::one());
+
+    let model = solver.extract_model();
+    let x_val = model
+        .values
+        .get(&x)
+        .expect("x must be in the model")
+        .clone();
+    let half = BigRational::new(BigInt::from(1), BigInt::from(2));
+    assert!(
+        x_val > BigRational::zero() && x_val <= BigRational::one(),
+        "materialised x must keep its bounds, got {x_val}"
+    );
+    assert_ne!(
+        x_val, half,
+        "materialised x must not land on the excluded 2x = 1"
+    );
+}
+
 #[test]
 fn test_extract_model_snaps_asserted_single_var_equality_7654() {
     let mut terms = TermStore::new();

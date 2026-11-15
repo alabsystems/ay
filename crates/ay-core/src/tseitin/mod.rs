@@ -21,10 +21,16 @@
 //! - Positive integer N means variable N is true
 //! - Negative integer -N means variable N is false
 
+mod counted;
 mod encode;
 mod transform;
 mod types;
 
+pub use counted::{
+    CountedCnf, DistinctBridge as CountedCnfDistinctBridge, Error as CountedCnfError,
+    Justification as CountedCnfJustification, Row as CountedCnfRow,
+    SourceLit as CountedCnfSourceLit, Step as CountedCnfStep, COUNTED_CNF_WORK_VERSION,
+};
 pub use types::*;
 
 use crate::proof::AletheRule;
@@ -243,5 +249,5 @@ impl<'a> Tseitin<'a> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(kani)]
-mod kani_proofs;
+#[cfg(test)]
+mod assertion_result_tests;

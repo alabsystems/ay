@@ -11,8 +11,10 @@ use crate::{ChcExpr, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 use super::counterexample::Counterexample;
+use super::cube::literals::LitCube;
 use super::derivation::DerivationId;
 use super::frame::Lemma;
+use super::reach_fact::ReachFactId;
 
 /// Represents possible offsets for a variable (accounting for OR branches in constraints)
 #[derive(Debug)]
@@ -27,6 +29,8 @@ pub(super) enum VarOffset {
 pub(super) enum InitResult {
     Safe,
     Unsafe,
+    UnsafeWithEvidence(super::Counterexample),
+    Interrupted,
 }
 
 /// Type of bound constraint extracted from bad state
@@ -71,6 +75,12 @@ pub(super) enum BlockResult {
     AlreadyBlocked,
     /// Not blocked - predecessor state exists (boxed to reduce enum size)
     Reachable(Box<PredecessorState>),
+    /// The POB is REACHABLE: the reach fact (a concrete state of the POB's
+    /// predicate inside the POB, with its derivation tree down to the facts)
+    /// was just recorded. Returned only by the nonlinear Spacer lane
+    /// (`lane_nonlinear`), which tracks reachability by reach facts rather
+    /// than by POB parent chains.
+    MustReachable(ReachFactId),
     /// Unknown
     Unknown,
 }
@@ -87,4 +97,10 @@ pub(super) struct PredecessorState {
     /// through all premises of a hyperedge.
     /// Scaffolding for #1275; will be used when derivation tracking completes.
     pub(super) derivation_id: Option<DerivationId>,
+    /// Literal view of `state` from the Spacer lane's child constructor
+    /// (Workstream B, `DESIGN` §3.2, contract C8). `Some` whenever the lane
+    /// is on (R1: the cube's top-level conjuncts; R2: the free-variable
+    /// implicant), `None` on the legacy path; S hands it to the child as
+    /// `ProofObligation.lits`.
+    pub(super) lits: Option<LitCube>,
 }

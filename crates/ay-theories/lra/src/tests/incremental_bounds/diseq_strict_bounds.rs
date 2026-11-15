@@ -598,3 +598,73 @@ fn test_free_integer_pairwise_repair_rejects_tableau_row_vars_8785() {
         "vars that occur in tableau rows are not free; repair must fall back to an expression split, got {result:?}"
     );
 }
+
+/// The #8765 disequality retain in `pop_inner` is skipped when the pop
+/// unasserted no atoms and no asserted value flipped since the last
+/// scan: no trail entry can have died, so the scan would be a no-op.
+/// `diseq_retain_scans` makes the skip observable; the outer-scope
+/// disequality must survive skipped pops (the #8765 scenario) and a
+/// pop that does unassert the disequality atom must still scan and
+/// drop its entry.
+#[test]
+fn test_disequality_retain_skipped_when_pop_kills_nothing() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+    let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
+    let five = terms.mk_rational(BigRational::from(BigInt::from(5)));
+    let ten = terms.mk_rational(BigRational::from(BigInt::from(10)));
+
+    let x_ge_0 = terms.mk_ge(x, zero);
+    let x_le_10 = terms.mk_le(x, ten);
+    let x_eq_5 = terms.mk_eq(x, five); // asserted false → x != 5
+    let x_ge_1 = terms.mk_ge(x, one);
+    let x_ge_5 = terms.mk_ge(x, five);
+    let x_le_5 = terms.mk_le(x, five);
+
+    let mut solver = LraSolver::new(&terms);
+    solver.assert_literal(x_ge_0, true);
+    solver.assert_literal(x_le_10, true);
+    solver.assert_literal(x_eq_5, false); // outer-scope disequality
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert_eq!(solver.diseq_retain_scans, 0);
+
+    // A pop whose scope asserted (and so unasserts) an atom must scan.
+    solver.push();
+    solver.assert_literal(x_ge_1, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    solver.pop();
+    assert_eq!(solver.diseq_retain_scans, 1);
+
+    // An empty scope's pop unasserts nothing and flips nothing: skip.
+    solver.push();
+    solver.pop();
+    assert_eq!(
+        solver.diseq_retain_scans, 1,
+        "empty pop must skip the disequality retain scan"
+    );
+
+    // The outer disequality survived both pops: x = 5 is still refused.
+    solver.assert_literal(x_ge_5, true);
+    solver.assert_literal(x_le_5, true);
+    assert!(
+        !matches!(solver.check(), TheoryResult::Sat),
+        "outer-scope x != 5 must survive skipped pops"
+    );
+    solver.reset();
+
+    // A pop that unasserts the disequality atom itself must scan and
+    // drop the entry (x = 5 becomes SAT afterwards).
+    solver.assert_literal(x_ge_0, true);
+    solver.assert_literal(x_le_10, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    let scans_before = solver.diseq_retain_scans;
+    solver.push();
+    solver.assert_literal(x_eq_5, false);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    solver.pop();
+    assert_eq!(solver.diseq_retain_scans, scans_before + 1);
+    solver.assert_literal(x_ge_5, true);
+    solver.assert_literal(x_le_5, true);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+}

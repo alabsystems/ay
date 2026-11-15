@@ -35,16 +35,33 @@ fn run_script_with_oll_rounds(script: &str) -> (Vec<String>, u64) {
     (outputs, rounds)
 }
 
-/// Extract the `__ay_soft_cost` value from a `(get-objectives)` output string.
+/// Extract the total violated soft weight from a `(get-objectives)` output
+/// string in Z3's per-group shape: `"(objectives\n ( <n>)\n)\n"` for the
+/// anonymous group, ` (id <n>)` lines for named groups. Sums every group's
+/// cost; a trailing `:approximate` marker on a line is ignored.
 fn parse_soft_cost(objectives_output: &str) -> Option<u64> {
-    // Output form: "(objectives\n (__ay_soft_cost <n>)\n)\n".
-    let tag = "(__ay_soft_cost ";
-    let start = objectives_output.find(tag)? + tag.len();
-    let rest = &objectives_output[start..];
-    let end = rest.find(')')?;
-    // A `:approximate` qualifier may follow the value (resource-limited /
-    // weight-incomplete results); take the leading numeric token.
-    rest[..end].split_whitespace().next()?.parse::<u64>().ok()
+    let mut total = 0u64;
+    let mut any = false;
+    for line in objectives_output.lines() {
+        let Some(inner) = line
+            .trim()
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue; // the "(objectives" / ")" framing lines
+        };
+        let mut tokens = inner.split_whitespace();
+        let first = tokens.next()?;
+        // Anonymous line: "( <n> ...)"; named line: "(id <n> ...)".
+        let value_token = if first.parse::<u64>().is_ok() {
+            first
+        } else {
+            tokens.next()?
+        };
+        total += value_token.parse::<u64>().ok()?;
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// Hand case: hard `(or a b)`, soft `(not a):1`, soft `(not b):1`.
@@ -793,51 +810,320 @@ fn maxsmt_unknown_engine_is_rejected() {
     );
 }
 
-/// `:id` partitions softs into independent objectives. Until that richer
-/// result is implemented, the parsed path must not flatten groups and certify a
-/// different optimization problem.
+/// `:id` partitions softs into group objectives, optimized lexicographically
+/// in first-appearance order (Z3 semantics, pinned against z3 4.16): the
+/// first group wins the conflict outright, and `(get-objectives)` reports one
+/// `(id violated-weight)` line per group.
 #[test]
-fn maxsmt_grouped_softs_are_honest_unknown() {
-    let mut exec = Executor::new();
-    let cmds = parse(
-        "(set-logic QF_UF)(declare-const a Bool)\
-         (assert-soft a :weight 1 :id first)\
-         (assert-soft (not a) :weight 1 :id second)(check-sat)",
-    )
-    .unwrap();
-    let outputs = exec.execute_all(&cmds).unwrap();
-    assert_eq!(outputs, vec!["unknown"]);
-    assert_eq!(exec.last_result(), Some(&SolveResult::Unknown));
-    assert_eq!(exec.unknown_reason(), Some(UnknownReason::Unsupported));
-    assert!(exec.last_model.is_none());
-    assert!(exec.last_sat_certificate.is_none());
-    assert!(exec.last_soft_cost.is_none());
-    assert!(exec.last_soft_violations.is_none());
+fn maxsmt_grouped_softs_lex_first_group_wins() {
+    let outputs = run_script(
+        "(declare-const x Int)\
+         (assert-soft (> x 0) :weight 1 :id A)\
+         (assert-soft (< x 0) :weight 1 :id B)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (A 0)\n (B 1)\n)\n");
+    // A is fully satisfied, so the witness has x > 0 (never x < 0 or x = 0).
+    assert!(
+        !outputs[2].contains("(- ") && !outputs[2].contains("(x 0)"),
+        "first group must win: {}",
+        outputs[2]
+    );
+
+    // Swapping declaration order swaps the winner: order is semantic.
+    let outputs = run_script(
+        "(declare-const x Int)\
+         (assert-soft (< x 0) :weight 1 :id B)\
+         (assert-soft (> x 0) :weight 1 :id A)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (B 0)\n (A 1)\n)\n");
+    assert!(
+        outputs[2].contains("(- "),
+        "swapped first group must win: {}",
+        outputs[2]
+    );
 }
 
-/// Arithmetic objectives and soft constraints require one joint optimization
-/// order. Until that engine exists, parsed SMT-LIB must not prioritize MaxSMT
-/// and silently discard the arithmetic objective.
+/// Weights inside one named group still minimize that group's total violated
+/// weight, and a single named group renders in Z3's `(id cost)` shape.
 #[test]
-fn maxsmt_mixed_with_arithmetic_objective_is_honest_unknown() {
+fn maxsmt_single_named_group_weighted() {
+    let outputs = run_script(
+        "(declare-const x Int)(assert (> x 0))\
+         (assert-soft (< x 0) :weight 3 :id g)\
+         (assert-soft (= x 5) :weight 1 :id g)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    // x = 5 violates only the weight-3 soft (cost 3); any other positive x
+    // violates both (cost 4).
+    assert_eq!(outputs[1], "(objectives\n (g 3)\n)\n");
+    assert!(outputs[2].contains("(x 5)"), "witness: {}", outputs[2]);
+}
+
+/// Softs without `:id` form the anonymous group, ordered by first appearance
+/// among the named groups and rendered with an empty objective name, as Z3
+/// prints it.
+#[test]
+fn maxsmt_anonymous_group_mixes_with_named() {
+    let outputs = run_script(
+        "(declare-const x Int)\
+         (assert-soft (= x 1) :weight 2)\
+         (assert-soft (= x 2) :weight 2 :id A)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n ( 0)\n (A 2)\n)\n");
+    assert!(outputs[2].contains("(x 1)"), "witness: {}", outputs[2]);
+}
+
+/// Hard-unsatisfiable grouped softs still answer `unsat` (the hard part alone
+/// decides), with no soft accounting published.
+#[test]
+fn maxsmt_grouped_hard_unsat() {
     let mut exec = Executor::new();
     let cmds = parse(
-        "(set-logic QF_LIA)(declare-const x Int)\
-         (assert (and (<= 0 x) (<= x 10)))\
-         (maximize x)(assert-soft (= x 0) :weight 3)(check-sat)",
+        "(declare-const x Int)(assert (> x 3))(assert (< x 2))\
+         (assert-soft (= x 1) :id A)(assert-soft (= x 2) :id B)(check-sat)",
     )
     .unwrap();
     let outputs = exec.execute_all(&cmds).unwrap();
-    assert_eq!(outputs, vec!["unknown"]);
-    assert_eq!(exec.last_result(), Some(&SolveResult::Unknown));
-    assert_eq!(exec.unknown_reason(), Some(UnknownReason::Unsupported));
-    assert!(exec.last_model.is_none());
-    assert!(exec.last_sat_certificate.is_none());
+    assert_eq!(outputs, vec!["unsat"]);
     assert!(exec.last_soft_cost.is_none());
     assert!(exec.last_soft_violations.is_none());
+    assert!(exec.last_soft_group_costs.is_none());
+}
+
+/// Grouped `box`: each group optimizes INDEPENDENTLY (both reach cost 0 on
+/// conflicting softs), `(get-objectives)` reports the independent optima,
+/// and the published model attains the FIRST group's optimum — exactly
+/// z3's box behavior, pinned against z3 4.16.
+#[test]
+fn maxsmt_grouped_box_independent_optima_first_model() {
+    let outputs = run_script(
+        "(set-option :opt.priority box)(declare-const x Int)\
+         (assert-soft (> x 0) :id A)(assert-soft (< x 0) :id B)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (A 0)\n (B 0)\n)\n");
+    // The first group's optimum requires x > 0.
+    assert!(
+        !outputs[2].contains("(- ") && !outputs[2].contains("(x 0)"),
+        "first group's witness: {}",
+        outputs[2]
+    );
+}
+
+/// Grouped `pareto`: stateful front enumeration over group costs in
+/// declaration order — each `(check-sat)` emits the next Pareto point,
+/// exhaustion answers `unsat` (objectives still report the last point),
+/// and the cycle restarts. Pinned against z3 4.16; the emitted SET and
+/// the protocol must match, not z3's emission order.
+#[test]
+fn maxsmt_grouped_pareto_enumerates_front_and_cycles() {
+    let mut points = Vec::new();
+    let mut exec = Executor::new();
+    let setup = parse(
+        "(set-option :opt.priority pareto)(declare-const x Int)\
+         (assert (and (>= x 0) (<= x 2)))\
+         (assert-soft (= x 0) :id A)(assert-soft (= x 2) :id B)",
+    )
+    .unwrap();
+    exec.execute_all(&setup).unwrap();
+    for _ in 0..2 {
+        let out = exec
+            .execute_all(&parse("(check-sat)(get-objectives)").unwrap())
+            .unwrap();
+        assert_eq!(out[0], "sat");
+        points.push(out[1].clone());
+    }
+    let exhausted = exec
+        .execute_all(&parse("(check-sat)(get-objectives)").unwrap())
+        .unwrap();
+    assert_eq!(exhausted[0], "unsat");
+    // After the terminal unsat, objectives still report the last point.
+    assert_eq!(exhausted[1], points[1]);
+    // The front is exactly {(A 0)(B 1), (A 1)(B 0)} as a SET.
+    points.sort();
+    assert_eq!(
+        points,
+        [
+            "(objectives\n (A 0)\n (B 1)\n)\n",
+            "(objectives\n (A 1)\n (B 0)\n)\n"
+        ]
+    );
+    // The next call restarts the cycle.
+    let restarted = exec
+        .execute_all(&parse("(check-sat)(get-objectives)").unwrap())
+        .unwrap();
+    assert_eq!(restarted[0], "sat");
+    assert!(points.contains(&restarted[1]));
+}
+
+/// Joint `pareto`: arithmetic objectives and soft groups share one front
+/// in declaration order.
+#[test]
+fn joint_pareto_mixed_front() {
+    let mut exec = Executor::new();
+    let setup = parse(
+        "(set-option :opt.priority pareto)(declare-const x Int)\
+         (assert (and (>= x 0) (<= x 3)))\
+         (maximize x)(assert-soft (= x 0) :id A)",
+    )
+    .unwrap();
+    exec.execute_all(&setup).unwrap();
+    let mut points = Vec::new();
+    for _ in 0..2 {
+        let out = exec
+            .execute_all(&parse("(check-sat)(get-objectives)").unwrap())
+            .unwrap();
+        assert_eq!(out[0], "sat");
+        points.push(out[1].clone());
+    }
+    let exhausted = exec.execute_all(&parse("(check-sat)").unwrap()).unwrap();
+    assert_eq!(exhausted, ["unsat"]);
+    points.sort();
+    assert_eq!(
+        points,
+        [
+            "(objectives\n (x 0)\n (A 0)\n)\n",
+            "(objectives\n (x 3)\n (A 1)\n)\n"
+        ]
+    );
+}
+
+/// Arithmetic objectives and soft constraints optimize as ONE
+/// declaration-ordered lexicographic list (Z3): whichever is declared first
+/// wins outright, and `(get-objectives)` renders both interleaved.
+#[test]
+fn joint_soft_and_arithmetic_objectives_lex_in_declaration_order() {
+    // Maximize first: x takes its bound; the soft pays full weight.
+    let outputs = run_script(
+        "(set-logic QF_LIA)(declare-const x Int)\
+         (assert (and (<= 0 x) (<= x 10)))\
+         (maximize x)(assert-soft (= x 0) :weight 3)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (x 10)\n ( 3)\n)\n");
+    assert!(outputs[2].contains("(x 10)"), "witness: {}", outputs[2]);
+
+    // Soft first: the soft is satisfied exactly; maximize is then pinned.
+    let outputs = run_script(
+        "(set-logic QF_LIA)(declare-const x Int)\
+         (assert (and (<= 0 x) (<= x 10)))\
+         (assert-soft (= x 0) :weight 3)(maximize x)\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n ( 0)\n (x 0)\n)\n");
+    assert!(outputs[2].contains("(x 0)"), "witness: {}", outputs[2]);
+}
+
+/// Interleaved soft groups and arithmetic objectives keep declaration order
+/// through the whole lex chain.
+#[test]
+fn joint_interleaved_groups_and_objectives() {
+    let outputs = run_script(
+        "(declare-const x Int)(declare-const y Int)\
+         (assert (and (<= 0 x) (<= x 10) (<= 0 y) (<= y 10) (<= (+ x y) 12)))\
+         (assert-soft (= y 7) :id A)(minimize x)(assert-soft (= x 9) :id B)\
+         (check-sat)(get-objectives)(get-value (x y))",
+    );
+    assert_eq!(outputs[0], "sat");
+    // A wins (y=7), then x minimizes to 0, then B pays its weight 1.
+    assert_eq!(outputs[1], "(objectives\n (A 0)\n (x 0)\n (B 1)\n)\n");
+    assert!(outputs[2].contains("(x 0)"), "witness: {}", outputs[2]);
+    assert!(outputs[2].contains("(y 7)"), "witness: {}", outputs[2]);
+}
+
+/// An unbounded arithmetic objective leaves later soft groups with z3's
+/// interval outcome instead of a fabricated scalar.
+#[test]
+fn joint_unbounded_objective_makes_later_soft_group_an_interval() {
+    let outputs = run_script(
+        "(declare-const x Int)(declare-const y Int)\
+         (assert (>= x 0))(assert (>= y 0))\
+         (maximize x)(assert-soft (= y 3) :weight 2 :id g)\
+         (check-sat)(get-objectives)",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert!(
+        outputs[1].contains("(x oo)"),
+        "unbounded maximize: {}",
+        outputs[1]
+    );
+    assert!(
+        outputs[1].contains("(g  (interval 0 2))"),
+        "later soft group is an interval: {}",
+        outputs[1]
+    );
+}
+
+/// Joint `box`: arithmetic and soft objectives optimize INDEPENDENTLY,
+/// render in declaration order, and the published model attains the FIRST
+/// declared objective — pinned against z3 4.16.
+#[test]
+fn joint_box_independent_optima_first_witness() {
+    // Arithmetic first: x=10 attains the maximize; the soft's independent
+    // optimum (x<0 satisfiable alone) is still 0.
+    let outputs = run_script(
+        "(set-option :opt.priority box)(declare-const x Int)\
+         (maximize x)(assert-soft (< x 0) :id A)(assert (<= x 10))\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (x 10)\n (A 0)\n)\n");
+    assert!(outputs[2].contains("(x 10)"), "witness: {}", outputs[2]);
+
+    // Soft first: the witness attains the soft (x<0); maximize still
+    // reports its independent optimum 10.
+    let outputs = run_script(
+        "(set-option :opt.priority box)(declare-const x Int)\
+         (assert-soft (< x 0) :id A)(maximize x)(assert (<= x 10))\
+         (check-sat)(get-objectives)(get-value (x))",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (A 0)\n (x 10)\n)\n");
+    assert!(
+        outputs[2].contains("(- "),
+        "soft-first witness is negative: {}",
+        outputs[2]
+    );
+}
+
+/// Joint `box` does not stop at an unbounded objective: the remaining
+/// independent optima are still exact scalars (no lex suffix intervals).
+#[test]
+fn joint_box_unbounded_objective_keeps_independent_soft_optimum() {
+    let outputs = run_script(
+        "(set-option :opt.priority box)(declare-const x Int)\
+         (maximize x)(assert-soft (< x 0) :id A)(assert (>= x 0))\
+         (check-sat)(get-objectives)",
+    );
+    assert_eq!(outputs[0], "sat");
+    assert_eq!(outputs[1], "(objectives\n (x oo)\n (A 1)\n)\n");
+}
+
+/// Hard-unsatisfiable joint problems still answer `unsat` with no objective
+/// state published.
+#[test]
+fn joint_hard_unsat_publishes_nothing() {
+    let mut exec = Executor::new();
+    let cmds = parse(
+        "(declare-const x Int)(assert (> x 3))(assert (< x 2))\
+         (maximize x)(assert-soft (= x 0))(check-sat)",
+    )
+    .unwrap();
+    let outputs = exec.execute_all(&cmds).unwrap();
+    assert_eq!(outputs, vec!["unsat"]);
+    assert!(exec.last_soft_cost.is_none());
+    assert!(exec.last_soft_group_costs.is_none());
     assert!(exec.finite_objective_values.is_empty());
-    assert!(exec.unbounded_objectives.is_empty());
-    assert!(exec.objective_certificates.is_empty());
 }
 
 /// `check-sat-assuming` has no optimization semantics. Parsed softs must not

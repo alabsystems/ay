@@ -40,6 +40,49 @@ pub fn pdr_solve_problem(problem: &ChcProblem, config: PdrConfig) -> PdrResult {
     PdrSolver::solve_problem(problem, config)
 }
 
+/// Board-level counters of one direct PDR solve (Workstream B locks L-V/L2;
+/// `DESIGN_spacer_pob_lemma_pipeline.md` §6 S11).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PdrTestStats {
+    /// Lemmas in the frames at the end of the solve.
+    pub lemmas_learned: usize,
+    /// Highest frame index reached.
+    pub max_frame: usize,
+    /// Proof obligations popped by `strengthen`.
+    pub pobs_processed: usize,
+    /// POBs that were blocked with a lemma.
+    pub blocked_pobs: usize,
+    /// Lemmas recorded by the board (legacy + lane).
+    pub board_lemmas: usize,
+    /// Share of processed POBs that were point cubes.
+    pub point_cube_share: f64,
+    /// Lemmas per blocked POB.
+    pub lemmas_per_blocked_pob: f64,
+    /// The full board counter block (`SpacerCoreStats::json()`).
+    pub counters: serde_json::Value,
+    /// Candidate models that failed verification during the solve.
+    pub model_verification_failures: usize,
+}
+
+/// Run one direct PDR solve (no case-split prepass) and return the result
+/// with the board counters.
+pub fn pdr_solve_with_stats(problem: &ChcProblem, config: PdrConfig) -> (PdrResult, PdrTestStats) {
+    let mut solver = PdrSolver::new(problem.clone(), config);
+    let run = solver.solve_with_stats();
+    let stats = PdrTestStats {
+        lemmas_learned: run.stats.lemmas_learned,
+        max_frame: run.stats.max_frame,
+        pobs_processed: run.stats.spacer_pobs_processed,
+        blocked_pobs: run.stats.spacer_blocked_pobs,
+        board_lemmas: run.stats.spacer_lemmas,
+        point_cube_share: run.stats.spacer_point_cube_share,
+        lemmas_per_blocked_pob: run.stats.spacer_lemmas_per_blocked_pob,
+        counters: run.stats.spacer_counters,
+        model_verification_failures: run.stats.model_verification_failures,
+    };
+    (run.result, stats)
+}
+
 /// Parse a CHC input string and run PDR for testing (convenience wrapper
 /// for `PdrSolver::solve_from_str`).
 pub fn pdr_solve_from_str(input: &str, config: PdrConfig) -> ChcResult<PdrResult> {
@@ -61,6 +104,18 @@ pub fn adaptive_uses_bv_native_direct_route(problem: &ChcProblem) -> bool {
     let adaptive = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::default());
     let features = classifier::ProblemClassifier::classify(problem);
     adaptive.use_bv_native_direct_route(&features)
+}
+
+/// The `HornSmt` session's differential harness (#horn-smt-session Rung 1,
+/// design §8 / §10.1; WP-4) for out-of-crate tests such as
+/// `tests/group_soundness/session_pushpop_vs_z3.rs`, which needs z3 on
+/// `PATH`. Each driver returns a report whose `passed()` is the 0-disagreement
+/// bar; `disagreements` carries the offending scripts verbatim.
+pub mod session_harness {
+    pub use crate::smt::session::harness::{
+        run_diff_lra, run_pushpop_files, run_pushpop_fuzz, run_replay, DiffReport, ReplayReport,
+        Verdict, Z3,
+    };
 }
 
 /// Parse an SMT model value through the CHC SMT backend's model parser.

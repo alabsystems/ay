@@ -191,6 +191,7 @@ impl SymmetryDetector {
     /// All emitted constraints have pairwise-disjoint ORIGINAL-variable support
     /// (disjoint groups compose soundly); the aux variables are fresh.
     ///
+    #[cfg(test)]
     /// `fresh_base` is the first unused variable id; aux equal-prefix variables
     /// are allocated sequentially from there. Returns `(clauses, aux_allocated)`;
     /// the caller MUST `ensure_num_vars(fresh_base + aux_allocated)` before adding
@@ -200,6 +201,18 @@ impl SymmetryDetector {
         clauses: &[Vec<Literal>],
         fresh_base: u32,
     ) -> (Vec<Vec<Literal>>, u32) {
+        let (out, aux, _) = self.detect_and_encode_composite_with_chain(clauses, fresh_base);
+        (out, aux)
+    }
+
+    /// As `detect_and_encode_composite`, and the Schreier–Sims chain's summary
+    /// over the generators found (symmetry fixing, step 2: the chain fix-and-cut
+    /// will walk; today only counted).
+    pub(crate) fn detect_and_encode_composite_with_chain(
+        &self,
+        clauses: &[Vec<Literal>],
+        fresh_base: u32,
+    ) -> (Vec<Vec<Literal>>, u32, super::schreier::ChainSummary) {
         let generators = self.find_composite_generators(clauses);
 
         // Emit a per-generator lex-leader constraint for each gate-verified
@@ -224,7 +237,31 @@ impl SymmetryDetector {
             out.extend(cls);
         }
 
-        (out, next - fresh_base)
+        let summary = if generators.is_empty() {
+            super::schreier::ChainSummary::default()
+        } else {
+            let maps: Vec<BTreeMap<u32, u32>> = generators
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .map(|(a, b)| (a.index() as u32, b.index() as u32))
+                        .collect()
+                })
+                .collect();
+            let domain = clauses
+                .iter()
+                // A literal's variable is at most i32::MAX, so the successor
+                // never saturates.
+                .flat_map(|c| {
+                    c.iter()
+                        .map(|l| (l.variable().index() as u32).saturating_add(1))
+                })
+                .max()
+                .unwrap_or(0);
+            super::schreier::summarise_generators(&maps, domain, 0x5EED_5EED)
+        };
+        // `next` only grows from `fresh_base`, so this difference is exact.
+        (out, next.saturating_sub(fresh_base), summary)
     }
 
     /// Public accessor for the gate-checkable automorphism generators, used by
@@ -247,6 +284,130 @@ impl SymmetryDetector {
         &self,
         clauses: &[Vec<Literal>],
     ) -> Vec<BTreeMap<Variable, Variable>> {
+        self.find_composite_generators_budgeted(
+            clauses,
+            super::IR_NODE_BUDGET,
+            super::IR_WORK_BUDGET,
+        )
+    }
+
+    /// Fix-and-cut (symmetry fixing, step 3): the gate-verified generators
+    /// under the given IR budgets, the Schreier–Sims chain over them, and the
+    /// walk's units and orbit binaries. No lex-leader clauses: the walk's
+    /// constraints are lex-leader consequences under their own order (base
+    /// first), and two orders must not be mixed.
+    pub(crate) fn detect_fix_and_cut(
+        &self,
+        clauses: &[Vec<Literal>],
+        num_vars: u32,
+    ) -> (super::fixcut::FixAndCut, super::schreier::ChainSummary) {
+        // Rounds: a round's units, propagated over the residual (with the
+        // round's binaries added), leave a formula whose symmetries are
+        // those of the formula plus the constraints so far — each round's
+        // WLOG argument composes with the last, and its witnesses fix every
+        // variable the units assigned, so the proof's goals hold by RUP.
+        let mut total = super::fixcut::FixAndCut::default();
+        let mut summary = super::schreier::ChainSummary::default();
+        let mut current: Vec<Vec<Literal>> = clauses.to_vec();
+        for _ in 0..super::FIX_AND_CUT_ROUNDS {
+            let (walk, chain) = self.fix_and_cut_round(&current, num_vars);
+            summary.generators = summary.generators.saturating_add(chain.generators);
+            summary.base_len = summary.base_len.saturating_add(chain.base_len);
+            summary.work = summary.work.saturating_add(chain.work);
+            let units = walk.units.clone();
+            let binaries = walk.binaries.clone();
+            let stop = units.is_empty() || walk.budget_hit;
+            total.absorb(walk);
+            if stop {
+                break;
+            }
+            current.extend(binaries.iter().map(|b| b.to_vec()));
+            match super::fixcut::simplify_by_units(&current, &units, num_vars) {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        (total, summary)
+    }
+
+    /// One fix-and-cut round over `clauses`.
+    fn fix_and_cut_round(
+        &self,
+        clauses: &[Vec<Literal>],
+        num_vars: u32,
+    ) -> (super::fixcut::FixAndCut, super::schreier::ChainSummary) {
+        // Signed automorphisms (polarity flips allowed): negation fixing is
+        // where Satsuma's units on xor_op and StConn come from.
+        let formula_counts = build_formula_counts(clauses);
+        // The flip group first (exact, one GF(2) elimination), then the
+        // signed IR search for the permutation part.
+        let (flips, _flip_stats) =
+            super::flips::find_flip_symmetries(clauses, num_vars, &formula_counts);
+        let generators = super::ir::find_signed_automorphisms_budgeted(
+            clauses,
+            &formula_counts,
+            super::FIX_AND_CUT_IR_NODE_BUDGET,
+            super::FIX_AND_CUT_IR_MAX_GENERATORS,
+            super::FIX_AND_CUT_IR_WORK_BUDGET,
+        );
+        // No backtracking fallback here: on em_8_4_5_fbc (2,420 variables,
+        // 33K clauses) it ran past 9 GiB after the IR searches came back
+        // empty; the signed search already covers the sign-preserving group.
+        if generators.is_empty() && flips.rank() == 0 {
+            return (
+                super::fixcut::FixAndCut::default(),
+                super::schreier::ChainSummary::default(),
+            );
+        }
+        let flip_rank = flips.rank() as u64;
+        let (walk, chain) = super::fixcut::fix_and_cut_with_flips(
+            clauses,
+            &generators,
+            flips,
+            num_vars,
+            0x5EED_5EED,
+            super::FIX_AND_CUT_WORK_BUDGET,
+        );
+        // Soundness guard: a symmetry of the residual clause set says nothing
+        // about a variable that occurs in none of them (root-assigned,
+        // eliminated, or unused), so no step may fix or relate one. A walk
+        // that does is discarded whole (2026-09-22: 26 false UNSAT answers).
+        let mut occurs = vec![false; num_vars as usize];
+        for c in clauses {
+            for l in c {
+                if let Some(o) = occurs.get_mut(l.variable().index()) {
+                    *o = true;
+                }
+            }
+        }
+        let foreign = walk
+            .steps
+            .iter()
+            .flat_map(|s| s.clause.iter())
+            .any(|l| !occurs.get(l.variable().index()).copied().unwrap_or(false));
+        let walk = if foreign {
+            super::fixcut::FixAndCut {
+                budget_hit: true,
+                ..Default::default()
+            }
+        } else {
+            walk
+        };
+        let summary = super::schreier::ChainSummary {
+            generators: (generators.len() as u64).saturating_add(flip_rank),
+            base_len: chain.depth() as u64,
+            orbits: 0,
+            work: chain.work(),
+        };
+        (walk, summary)
+    }
+
+    fn find_composite_generators_budgeted(
+        &self,
+        clauses: &[Vec<Literal>],
+        node_budget: u64,
+        work_budget: u64,
+    ) -> Vec<BTreeMap<Variable, Variable>> {
         let formula_counts = build_formula_counts(clauses);
 
         // PRIMARY: individualization-refinement automorphism finder (saucy/nauty
@@ -256,11 +417,12 @@ impl SymmetryDetector {
         // preprocessing stays well under a second or two.
         // B2: budgets are the shared constants in `symmetry/mod.rs`, the same
         // ones the signed route reads — one source of truth, no env override.
-        let mut generators = super::ir::find_automorphisms(
+        let mut generators = super::ir::find_automorphisms_budgeted(
             clauses,
             &formula_counts,
-            super::IR_NODE_BUDGET,
+            node_budget,
             super::IR_MAX_GENERATORS,
+            work_budget,
         );
 
         // FALLBACK: if IR finds nothing, try the backtracking closure finder.
@@ -574,9 +736,11 @@ fn encode_perm_lex_leader(
     let mut e_prev: Option<Variable> = None; // e_0 ≡ true (empty prefix)
     for (j, &xj) in support.iter().enumerate() {
         // y_j = (perm·x)_{w_j} = x_{perm⁻¹(w_j)}.
-        let yj = *inv
-            .get(&xj)
-            .expect("support is closed under perm (a permutation of itself)");
+        // The closure check above guarantees the lookup; were it ever to
+        // miss, emitting no constraint (and allocating no aux) is sound.
+        let Some(&yj) = inv.get(&xj) else {
+            return (Vec::new(), 0);
+        };
         // Constraint: prefix-equal -> x_j >= y_j == (¬e_j ∨ x_j ∨ ¬y_j).
         match e_prev {
             None => clauses.push(vec![Literal::positive(xj), Literal::negative(yj)]),
@@ -586,14 +750,16 @@ fn encode_perm_lex_leader(
                 Literal::negative(yj),
             ]),
         }
-        if j + 1 < n {
+        // `j + 1 < n`, spelled without the addition (`j < n`, so `n >= 1`).
+        if j < n.saturating_sub(1) {
             let e_next = Variable(next);
             next = next.saturating_add(1);
             emit_eq_prefix_def(&mut clauses, e_next, e_prev, xj, yj);
             e_prev = Some(e_next);
         }
     }
-    (clauses, next - fresh_base)
+    // `next` only grows from `fresh_base`, so this difference is exact.
+    (clauses, next.saturating_sub(fresh_base))
 }
 
 /// One family-specific substitution-redundancy proof step.
@@ -743,12 +909,23 @@ fn split_variable_disjoint(clauses: &[Vec<Literal>]) -> Option<Vec<Vec<Vec<Liter
         .map(|l| l.variable().index())
         .max()?;
     let mut parent: Vec<u32> = (0..=max_var as u32).collect();
+    // Every entry of `parent` is a valid index (it starts as the identity
+    // over `0..=max_var` and only ever receives roots), so the lookups below
+    // always hit; an index outside the table is treated as its own root.
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            parent[x as usize] = parent[parent[x as usize] as usize]; // path halving
-            x = parent[x as usize];
+        loop {
+            let Some(&p) = parent.get(x as usize) else {
+                return x;
+            };
+            if p == x {
+                return x;
+            }
+            let grandparent = parent.get(p as usize).copied().unwrap_or(p);
+            if let Some(slot) = parent.get_mut(x as usize) {
+                *slot = grandparent; // path halving
+            }
+            x = grandparent;
         }
-        x
     }
     for clause in clauses {
         let mut it = clause.iter().map(|l| l.variable().index() as u32);
@@ -770,8 +947,9 @@ fn split_variable_disjoint(clauses: &[Vec<Literal>]) -> Option<Vec<Vec<Vec<Liter
         };
         let root = find(&mut parent, first.variable().index() as u32);
         let idx = *bucket_of.entry(root).or_insert_with(|| {
+            let fresh = parts.len();
             parts.push(Vec::new());
-            parts.len() - 1
+            fresh
         });
         parts[idx].push(clause.clone());
     }
@@ -964,7 +1142,10 @@ fn swap_preserves_formula_interruptible(
 
 /// Apply a variable swap to a canonical clause key and re-sort.
 fn swap_clause_key(clause: &[u32], pair: BinarySwap) -> Vec<u32> {
-    let mut swapped = Vec::with_capacity(clause.len());
+    // Capacity is only a hint: if the reservation is refused, `push` below
+    // grows the vector as needed.
+    let mut swapped = Vec::new();
+    let _ = swapped.try_reserve_exact(clause.len());
     for &raw in clause {
         let lit = Literal(raw);
         let mapped_var = if lit.variable() == pair.lhs {
@@ -1014,7 +1195,10 @@ pub(crate) fn permutation_preserves_formula(
 /// Apply a variable permutation to a canonical clause key and re-sort.
 #[allow(dead_code)] // #17 building block (see permutation_preserves_formula).
 fn permute_clause_key(clause: &[u32], perm: &BTreeMap<Variable, Variable>) -> Vec<u32> {
-    let mut permuted = Vec::with_capacity(clause.len());
+    // Capacity is only a hint: if the reservation is refused, `push` below
+    // grows the vector as needed.
+    let mut permuted = Vec::new();
+    let _ = permuted.try_reserve_exact(clause.len());
     for &raw in clause {
         let lit = Literal(raw);
         let mapped_var = perm.get(&lit.variable()).copied().unwrap_or(lit.variable());
@@ -1157,16 +1341,25 @@ fn sign_preserving_matchings(
             out.push(current.clone());
             return;
         }
-        let fl = free[k];
+        // `k < free.len()` from here on (the caller starts at 0 and steps by
+        // one), so neither the lookup nor the successor can fail.
+        let (Some(&fl), Some(next_k)) = (free.get(k), k.checked_add(1)) else {
+            return;
+        };
         for (idx, rl) in remaining.iter().enumerate() {
-            if used[idx] || fl.is_positive() != rl.is_positive() {
+            // `used` has one slot per remaining literal.
+            if used.get(idx) != Some(&false) || fl.is_positive() != rl.is_positive() {
                 continue;
             }
-            used[idx] = true;
+            if let Some(slot) = used.get_mut(idx) {
+                *slot = true;
+            }
             current.push((fl.variable(), rl.variable()));
-            rec(k + 1, free, remaining, used, current, out);
+            rec(next_k, free, remaining, used, current, out);
             current.pop();
-            used[idx] = false;
+            if let Some(slot) = used.get_mut(idx) {
+                *slot = false;
+            }
         }
     }
     if free.len() != remaining.len() {
@@ -1339,7 +1532,8 @@ fn find_composite_symmetries_backtracking(
     let mut seen_pairs: std::collections::BTreeSet<(Variable, Variable)> = Default::default();
     let mut ordered_pairs: Vec<(Variable, Variable)> = Vec::new();
     let mut clause_order: Vec<usize> = (0..clauses.len()).collect();
-    clause_order.sort_by_key(|&ci| clauses[ci].len());
+    // Every `ci` indexes `clauses` (the order is `0..clauses.len()`).
+    clause_order.sort_by_key(|&ci| clauses.get(ci).map_or(0, Vec::len));
     'cooccur: for &ci in &clause_order {
         let c = &clauses[ci];
         for a_idx in 0..c.len() {
@@ -2356,6 +2550,24 @@ mod tests {
         let mut extra = clique_colouring_clauses(4, 3);
         extra.push((0..4).map(|v| Literal::positive(Variable(v))).collect());
         assert!(detect_clique_colouring_aux_free_sr(&extra).is_none());
+        // Near-miss (2026-09-17 audit): the mixed ternary for position pair
+        // (0, 1) and vertex pair (0, 1) replaced by one whose two q-literals
+        // sit in the SAME position row. Counts, edge consistency and the cell
+        // fill all still hold, and the formula is satisfiable; the route
+        // answered UNSAT before the row check.
+        let mut same_row = clique_colouring_clauses(4, 3);
+        let n = 4;
+        let qv = |i: usize, v: usize| Variable((i * n + v) as u32);
+        let spoofed = same_row
+            .iter_mut()
+            .find(|cl| {
+                cl.len() == 3
+                    && cl[0] == Literal::negative(qv(0, 0))
+                    && cl[1] == Literal::negative(qv(1, 1))
+            })
+            .expect("fixture has the (0,1)/(0,1) mixed ternary");
+        spoofed[1] = Literal::negative(qv(0, 1));
+        assert!(detect_clique_colouring_aux_free_sr(&same_row).is_none());
     }
 
     /// Relativized-pigeonhole fixture (`rphp_pN_rN` shape): dense variable ids

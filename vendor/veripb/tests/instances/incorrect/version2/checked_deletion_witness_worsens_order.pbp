@@ -1,0 +1,36 @@
+pseudo-Boolean proof version 2.0
+* The version-2 spelling of
+* `incorrect/version3/checked_deletion_witness_worsens_order.pbp`: the same
+* deletion as the correct companion, with the witness flipped to `x1 -> 1
+* x2 -> 0`. The order is `v1 >= u1`, so the order proofgoal reads `1 x1 >= 1`
+* while the subproof premise (the negation of the deleted constraint) forces
+* x1 = 0. The witness maps the counterexample (0, 0, 1) to the strictly worse
+* (1, 0, 1), the checked deletion fails, and the derived constraint 3 blocks
+* the fallback to unchecked deletion.
+f 2
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order simple x1
+p 1 2 +
+delc 1 ; x1 -> 1 x2 -> 0 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

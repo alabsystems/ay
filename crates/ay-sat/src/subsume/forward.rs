@@ -127,8 +127,10 @@ impl Subsumer {
                 continue;
             }
             if clauses.is_learned(off)
-                && clauses.lbd(off) > kept.tier2_lbd
-                && (clauses.lbd(off) > kept.kept_glue || (lits.len() as u32) > kept.kept_size)
+                && ((kept.irredundant_only && lits.len() > 2)
+                    || (clauses.lbd(off) > kept.tier2_lbd
+                        && (clauses.lbd(off) > kept.kept_glue
+                            || (lits.len() as u32) > kept.kept_size)))
             {
                 continue;
             }
@@ -158,8 +160,10 @@ impl Subsumer {
             // Irredundant → always kept. Tier1/tier2 (glue <= tier2_lbd) → always kept.
             // Tier3: kept only if glue <= keptglue AND size <= keptsize.
             if clauses.is_learned(off)
-                && clauses.lbd(off) > kept.tier2_lbd
-                && (clauses.lbd(off) > kept.kept_glue || (lits.len() as u32) > kept.kept_size)
+                && ((kept.irredundant_only && lits.len() > 2)
+                    || (clauses.lbd(off) > kept.tier2_lbd
+                        && (clauses.lbd(off) > kept.kept_glue
+                            || (lits.len() as u32) > kept.kept_size)))
             {
                 continue;
             }

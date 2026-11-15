@@ -181,3 +181,44 @@ fn test_focused_rephase_schedule_walk_disabled() {
         }
     }
 }
+
+/// `--sat-rephase-kissat` (Kissat 4.0.4 `rephase.c:32-38, 86-89`): rephasing
+/// happens in stable mode only, on the cycle best, walk, inverted, best, walk,
+/// original from the very first rephase.
+#[test]
+fn test_rephase_kissat_schedule_is_stable_only_bwibwo() {
+    use crate::solver::solver_stats::RephaseAttribution as K;
+    let mut solver = Solver::new(4);
+    solver.cold.rephase_kissat = true;
+    solver.cold.stable_only_rephase_enabled = true;
+    solver.cold.rephase_enabled = true;
+    solver.stable_mode = true;
+    let expected = [
+        K::Best,
+        K::Walk,
+        K::Inverted,
+        K::Best,
+        K::Walk,
+        K::Original,
+        K::Best,
+    ];
+    for (n, kind) in expected.iter().enumerate() {
+        let before = solver.stats.rephase_attribution;
+        solver.rephase();
+        let changed: Vec<usize> = (0..before.len())
+            .filter(|&i| solver.stats.rephase_attribution[i] != before[i])
+            .collect();
+        assert_eq!(
+            changed,
+            vec![kind.index()],
+            "rephase {n} should be bucket {}",
+            kind.index()
+        );
+    }
+    // Focused mode never rephases under the switch; stable mode does once due.
+    solver.cold.next_rephase = 0;
+    solver.stable_mode = false;
+    assert!(!solver.should_rephase());
+    solver.stable_mode = true;
+    assert!(solver.should_rephase());
+}

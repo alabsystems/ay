@@ -26,11 +26,10 @@ mod prover_audit;
 #[path = "string_theory_verification/routing.rs"]
 mod routing;
 
+use crate::common::{check_z3_or_skip as z3_available, solve_with_z3};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,37 +76,4 @@ fn solve_with_timeout(smt: &str, timeout_secs: u64) -> Result<String, String> {
             .map(|outputs| outputs.join("\n"))
             .map_err(|e| format!("{e}"))
     }
-}
-
-fn z3_available() -> bool {
-    Command::new("z3")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn solve_with_z3(smt: &str) -> Result<String, String> {
-    let mut child = Command::new("z3")
-        .arg("-in")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn z3: {e}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(smt.as_bytes())
-            .map_err(|e| format!("failed to write SMT to z3 stdin: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed waiting for z3: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("z3 exited with status {}: {stderr}", output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

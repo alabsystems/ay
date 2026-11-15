@@ -37,6 +37,7 @@ fn get_model_int_prefers_lia_over_stale_euf_term_value() {
         term_to_var: DetHashMap::default(),
         bool_overrides: DetHashMap::default(),
         euf_model: Some(euf),
+        materialized_scalar_functions: Default::default(),
         array_model: None,
         lra_model: None,
         lia_model: Some(LiaModel { values: lia }),
@@ -49,9 +50,14 @@ fn get_model_int_prefers_lia_over_stale_euf_term_value() {
         certified_const_interps: Default::default(),
         formula_neutral_function_defaults: Default::default(),
         completed_values: DetHashMap::default(),
+        field_assignments: Default::default(),
         dt_ground: DetHashMap::default(),
         dt_pins: DetHashMap::default(),
         dt_array_field_classes: Vec::new(),
+        residual_arrays: None,
+        functional_arrays: None,
+        _scalar_candidate_memory: None,
+        construction_owner: None,
     });
     exec.last_result = Some(SolveResult::Sat);
 
@@ -164,7 +170,7 @@ fn forall_exists_witness_route_declines_when_no_witness_exists() {
 }
 
 #[cfg(test)]
-fn fp_value(sign: bool, exponent: u64, significand: u64, eb: u32, sb: u32) -> ModelValue {
+fn fp_value(sign: bool, exponent: u64, significand: u128, eb: u32, sb: u32) -> ModelValue {
     ModelValue::FloatingPoint {
         sign,
         exponent,
@@ -267,12 +273,11 @@ fn fp_pin_literal_fails_closed_off_format() {
         &Sort::FloatingPoint(8, 24)
     )
     .is_none());
-    // Float128: 112 stored bits do not fit the value's u64, so the
-    // evaluator's exact envelope refuses the format outright.
+    // A fraction wider than the physical carrier cannot be pinned exactly.
     assert!(fp_model_value_to_literal(
         &mut terms,
-        &fp_value(false, 0, 0, 15, 113),
-        &Sort::FloatingPoint(15, 113)
+        &fp_value(false, 0, 0, 15, 130),
+        &Sort::FloatingPoint(15, 130)
     )
     .is_none());
     // Not a floating-point value at all.
@@ -310,7 +315,7 @@ fn fp_leaf_pins_through_the_dispatcher_to_a_closed_literal() {
         exponent_bits: 8,
         significand_bits: 24,
     };
-    let term = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems)
+    let term = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems, None)
         .expect("an FP model value must pin through the dispatcher");
     // It must NOT be an opaque uninterpreted element.
     assert!(
@@ -326,6 +331,137 @@ fn fp_leaf_pins_through_the_dispatcher_to_a_closed_literal() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn binary128_pin_dispatch_preserves_all_literal_fields() {
+    let mut terms = TermStore::new();
+    let mut elems = QuantifiedGateElements::default();
+    let sort = Sort::FloatingPoint(15, 113);
+    let fraction = (1u128 << 111) | (1u128 << 64) | (1u128 << 63) | 1;
+    let mut pins = Vec::new();
+    for (sign, exponent, significand) in [
+        (false, 0, 0),
+        (true, 0, 0),
+        (false, 0x3fff, fraction),
+        (true, 0x3fff, fraction),
+        (false, 0, 1),
+        (true, 0x7ffe, (1u128 << 112) - 1),
+        (false, 0x7fff, 0),
+        (true, 0x7fff, fraction), // Literal NaN sign/payload must not be normalized.
+    ] {
+        let value = fp_value(sign, exponent, significand, 15, 113);
+        let pin = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems, None)
+            .expect("binary128 must reach the exact dispatcher arm");
+        assert_eq!(terms.sort(pin), &sort);
+        let TermData::App(symbol, args) = terms.get(pin) else {
+            panic!("expected a closed fp literal");
+        };
+        assert_eq!(symbol.name(), "fp");
+        assert_eq!(args.len(), 3);
+        let mut fields = Vec::new();
+        for (&arg, (expected, width)) in args.iter().zip([
+            (u128::from(u8::from(sign)), 1),
+            (u128::from(exponent), 15),
+            (significand, 112),
+        ]) {
+            let TermData::Const(ay_core::term::Constant::BitVec {
+                value,
+                width: actual,
+            }) = terms.get(arg)
+            else {
+                panic!("an FP field must be a constant, not a free pin");
+            };
+            assert_eq!((*actual, value), (width, &BigInt::from(expected)));
+            fields.push(ModelValue::BitVec {
+                width,
+                value: value.clone(),
+            });
+        }
+        let ModelValue::FloatingPoint {
+            sign: s,
+            exponent: e,
+            significand: m,
+            exponent_bits: eb,
+            significand_bits: sb,
+        } = ay_model_check::fp::from_field_bitvectors(&fields).unwrap()
+        else {
+            panic!("independent literal reader changed the value kind");
+        };
+        assert_eq!((s, e, m, eb, sb), (sign, exponent, significand, 15, 113));
+        pins.push(pin);
+    }
+    assert_ne!(pins[0], pins[1], "the sign of zero must survive the pin");
+    assert!(
+        elems.by_token.is_empty(),
+        "no opaque elements may substitute for FP fields"
+    );
+}
+
+#[test]
+fn binary128_pin_refuses_bad_fields_without_interning_a_replacement() {
+    let mut terms = TermStore::new();
+    let mut elems = QuantifiedGateElements::default();
+    for (value, sort) in [
+        (
+            fp_value(false, 1 << 15, 0, 15, 113),
+            Sort::FloatingPoint(15, 113),
+        ),
+        (
+            fp_value(false, 0, 1u128 << 112, 15, 113),
+            Sort::FloatingPoint(15, 113),
+        ),
+        (
+            fp_value(false, 0, u128::MAX, 15, 113),
+            Sort::FloatingPoint(15, 113),
+        ),
+        (fp_value(false, 0, 1, 15, 113), Sort::FloatingPoint(11, 53)),
+        (fp_value(false, 0, 1, 15, 113), Sort::Bool),
+        // The fixed carrier ends at 128 stored fraction bits. Wider data
+        // belongs in FloatingPointExact, whose controlled pin path is separate.
+        (fp_value(false, 0, 0, 15, 130), Sort::FloatingPoint(15, 130)),
+        (
+            fp_value(false, 0, 0, 15, ay_fp::MAX_ENCODING_SIGNIFICAND_BITS + 1),
+            Sort::FloatingPoint(15, ay_fp::MAX_ENCODING_SIGNIFICAND_BITS + 1),
+        ),
+        (fp_value(false, 0, 0, 64, 114), Sort::FloatingPoint(64, 114)),
+        (fp_value(false, 0, 0, 15, 0), Sort::FloatingPoint(15, 0)),
+    ] {
+        let before = terms.len();
+        assert!(fp_model_value_to_literal(&mut terms, &value, &sort).is_none());
+        assert!(model_value_to_pin_term(&mut terms, &value, &sort, &mut elems, None).is_none());
+        assert_eq!(
+            terms.len(),
+            before,
+            "refusal must not mint a neighboring literal"
+        );
+        assert!(elems.by_token.is_empty());
+    }
+}
+
+#[test]
+fn fp_pin_preserves_native_129_bit_format_and_full_fraction() {
+    let mut terms = TermStore::new();
+    let mut elems = QuantifiedGateElements::default();
+    let sort = Sort::FloatingPoint(15, 129);
+    let value = fp_value(true, 127, u128::MAX, 15, 129);
+    let pin = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems, None).unwrap();
+    let ay_core::TermData::App(_, fields) = terms.get(pin) else {
+        panic!("an FP pin must retain its three fields");
+    };
+    assert_eq!(fields.len(), 3);
+    for (&field, (expected, width)) in fields.iter().zip([(1u128, 1), (127, 15), (u128::MAX, 128)])
+    {
+        let ay_core::TermData::Const(ay_core::Constant::BitVec {
+            value,
+            width: actual,
+        }) = terms.get(field)
+        else {
+            panic!("an FP field must be an exact bitvector");
+        };
+        assert_eq!((*actual, value), (width, &BigInt::from(expected)));
+    }
+    assert!(elems.by_token.is_empty());
 }
 
 /// A `RoundingMode` leaf must pin to the MODE, not to an opaque gate
@@ -346,6 +482,7 @@ fn rounding_mode_pins_to_the_literal_not_an_opaque_element() {
             &ModelValue::Uninterpreted(token.to_string()),
             &sort,
             &mut elems,
+            None,
         )
         .expect("a named rounding mode is exactly expressible");
         let TermData::App(sym, args) = terms.get(term).clone() else {
@@ -364,6 +501,7 @@ fn rounding_mode_pins_to_the_literal_not_an_opaque_element() {
         &ModelValue::Uninterpreted("@RoundingMode!0".to_string()),
         &sort,
         &mut elems,
+        None,
     )
     .is_none());
 }

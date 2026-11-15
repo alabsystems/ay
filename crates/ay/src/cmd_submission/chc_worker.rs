@@ -94,14 +94,15 @@ fn chc_worker_bootstrap(opts: &ChcWorkerBootstrapOptions) -> Result<()> {
     } else {
         probe_chc_worker_command(&mut checks, "gh:auth", "gh", &["auth", "status"]);
     }
+    // STOCK EXCEPTION: Trust seal 9192 has no x86_64-unknown-linux-gnu std (2026-09-28: E0463).
     for (name, program, args) in [
         ("tool:rustc", "rustc", &["--version"][..]),
         ("tool:cargo", "cargo", &["--version"][..]),
         ("tool:tar", "tar", &["--version"][..]),
-        ("tool:z3", "z3", &["--version"][..]),
     ] {
         probe_chc_worker_command(&mut checks, name, program, args);
     }
+    probe_chc_worker_z3(&mut checks);
 
     let fail_count = count_checks(&checks, "fail");
     let warn_count = count_checks(&checks, "warn");
@@ -138,6 +139,15 @@ fn chc_worker_bootstrap(opts: &ChcWorkerBootstrapOptions) -> Result<()> {
     println!("wrote {}", display_path_for_report(&report_path, &root));
     println!("status=pass machine_ready={machine_ready} local_only=true");
     Ok(())
+}
+
+/// z3 is the reference oracle: probed by identity and reached by path
+/// (`ay_sys::z3_oracle`), never by name, which can reach a refusing stub.
+fn probe_chc_worker_z3(checks: &mut Vec<JsonValue>) {
+    match ay_sys::z3_oracle::z3_oracle() {
+        Ok(oracle) => push_check(checks, "tool:z3", "pass", oracle.identity()),
+        Err(reason) => push_check(checks, "tool:z3", "warn", format!("unavailable: {reason}")),
+    }
 }
 
 fn chc_worker_shard_plan(opts: &ChcWorkerShardPlanOptions) -> Result<()> {

@@ -82,16 +82,36 @@ fn identical_noncanonical_duplicate_rows_share_one_exact_alethe_surface() {
         .any(|line| line.contains("(assume ") && line.contains("(>= (f b) 0)")));
 }
 
+/// Rows that spell one root DIFFERENTLY are each a premise of the problem,
+/// and the proof assumes the root once, so the FIRST row's spelling, confined
+/// to its own `assume` exactly as a common spelling is, binds as exactly as a
+/// common one (pinned Carcara: `group_proofs` duplicate_authored_root). The
+/// surface used to be withheld, and `--proof FILE` then lost the verdict
+/// (#8821; g06, `(= x (- 2.5))` beside `(= x -2.5)`).
 #[test]
-fn differing_noncanonical_duplicates_withhold_only_alethe() {
+fn differing_noncanonical_duplicates_bind_the_first_rows_spelling() {
     let (solver, _) = duplicate_solver("(assert (>= (f b) 0))\n(assert (<= (+ 0 0) (f b)))");
     assert_native_bundle_is_complete(&solver);
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("the first source row binds the duplicate root");
+    assert!(matches!(
+        artifact.strict_verdict,
+        StrictProofVerdict::Verified(ref quality) if quality.is_complete()
+    ));
+    let assumes: Vec<&str> = artifact
+        .alethe
+        .lines()
+        .filter(|line| line.contains("(assume "))
+        .collect();
     assert!(
-        solver.export_last_unsat_artifact().is_none(),
-        "no arbitrary source row may become the Alethe assume spelling"
+        assumes.iter().any(|line| line.contains("(>= (f b) 0)")),
+        "{assumes:?}"
     );
     assert!(
-        solver.export_last_proof_alethe().is_none(),
-        "Alethe must be withheld while native authority remains available"
+        !assumes
+            .iter()
+            .any(|line| line.trim_end().ends_with(" (<= 0 (f b)))") || line.contains("(+ 0 0)")),
+        "only the first row's spelling is assumed: {assumes:?}"
     );
 }

@@ -1,0 +1,41 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): the same vacuous `sol` as
+* incorrect/version2/order_definition_sol, one subcontext deeper.
+*
+* `transitivity` does not swap the database itself -- `def_order` already did
+* -- but it runs inside the swapped one, and `Subcontext::Transitivity` is no
+* more `is_subproof()` than `Subcontext::Order` is, so it was equally
+* unguarded. It is listed separately because the fix answers the two contexts
+* on separate branches: the order's structural keywords are legal here and in
+* the `def_order` body, while the derivation rules of a `spec` block are legal
+* in neither. The `proof` body inside this same block was never exposed --
+* `OrderProofRule` pushes a `Subcontext::Subproof`, which the older gate did
+* cover.
+*
+* Same unsatisfiable formula and same `s VERIFIED SATISFIABLE` as
+* order_definition_sol.
+f 2
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        sol x1
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+output NONE
+conclusion SAT
+end pseudo-Boolean proof

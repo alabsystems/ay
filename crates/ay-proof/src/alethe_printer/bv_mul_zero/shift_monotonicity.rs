@@ -21,7 +21,7 @@ use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId};
 use std::fmt::Write as _;
 
 /// Exhaustive RUP emits `2^(w+1)-1` clauses. Eight bits is 511 clauses and is
-/// the ratified E5 carrier; wider words stay on the honest `hole` path.
+/// the specialized E5 carrier; wider words require another checked lowering.
 const MAX_SHIFT_MONOTONIC_WIDTH: u32 = 8;
 
 #[derive(Clone, Copy)]

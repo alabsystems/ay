@@ -59,6 +59,13 @@ pub(crate) struct WeakEdge {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WeakEquivGraph {
     adj: HashMap<TermId, Vec<WeakEdge>>,
+    /// Lazily computed undirected component labels (mode `All`):
+    /// node -> component id. The graph is immutable once built (a
+    /// rebuild produces a fresh graph), so labels are computed at
+    /// most once and `weakly_connected` becomes O(1) after the first
+    /// call instead of a per-pair BFS — measured on QF_AX swap files
+    /// where the M6 prune asks it once per candidate pair (88k+).
+    components: RefCell<Option<HashMap<TermId, u32>>>,
 }
 
 /// Edge filter for graph traversals.
@@ -121,10 +128,53 @@ impl WeakEquivGraph {
         None
     }
 
+    /// Compute undirected component labels for mode `All` once.
+    /// `push_undirected_edge` inserts every edge in both directions,
+    /// so reachability under `All` is exactly component membership.
+    fn ensure_component_labels(&self) {
+        if self.components.borrow().is_some() {
+            return;
+        }
+        let mut labels: HashMap<TermId, u32> = HashMap::default();
+        let mut next_id: u32 = 0;
+        let mut nodes: Vec<TermId> = self.adj.keys().copied().collect();
+        nodes.sort_unstable_by_key(|t| t.0);
+        for start in nodes {
+            if labels.contains_key(&start) {
+                continue;
+            }
+            labels.insert(start, next_id);
+            let mut stack = vec![start];
+            while let Some(current) = stack.pop() {
+                if let Some(edges) = self.adj.get(&current) {
+                    for edge in edges {
+                        if !labels.contains_key(&edge.to) {
+                            labels.insert(edge.to, next_id);
+                            stack.push(edge.to);
+                        }
+                    }
+                }
+            }
+            next_id += 1;
+        }
+        *self.components.borrow_mut() = Some(labels);
+    }
+
     /// Whether `a` and `b` are weakly connected (any edges, including
     /// reason-free strong edges).
     pub(crate) fn weakly_connected(&self, a: TermId, b: TermId) -> bool {
-        self.bfs_path(a, b, TraversalMode::All).is_some()
+        if a == b {
+            return true;
+        }
+        self.ensure_component_labels();
+        let labels = self.components.borrow();
+        let Some(labels) = labels.as_ref() else {
+            return false;
+        };
+        match (labels.get(&a), labels.get(&b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
     }
 
     /// Whether `a` and `b` are strongly connected (equality edges only,
@@ -154,9 +204,10 @@ impl WeakEquivGraph {
             match &edge.kind {
                 WeakEdgeKind::Strong { reasons: r } => reasons.extend(r.iter().copied()),
                 WeakEdgeKind::Store { label } => labels.push(*label),
-                WeakEdgeKind::StrongUnreasoned => {
-                    unreachable!("filtered by TraversalMode::Reasoned")
-                }
+                // `TraversalMode::Reasoned` never follows a reason-free edge,
+                // so this arm is not taken. Were one ever on the path, the path
+                // could not justify a lemma: report no reason-carrying path.
+                WeakEdgeKind::StrongUnreasoned => return None,
             }
         }
         ArraySolver::canonicalize_theory_lits(&mut reasons);
@@ -427,7 +478,10 @@ impl ArraySolver<'_> {
 
     /// Debug invariant: a lazy ROW2-down candidate pairs a select on `array`
     /// with a `store` in `array`'s strong class — i.e. the pair lies on a
-    /// length-1 weak path `array ≈ store —[i]— base`.
+    /// length-1 weak path `array ≈ store —[i]— base` — OR the pair is
+    /// joined by an existing equality atom, in which case generation is
+    /// for the guarded clause form (`array != store ∨ ...`) that
+    /// `check_row2` emits before the alias is decided.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_row2_pair_on_length1_weak_path(&self, array: TermId, store: TermId) {
         let pair = Self::ordered_pair(array, store);
@@ -441,9 +495,10 @@ impl ArraySolver<'_> {
             }
         }
         debug_assert!(
-            graph.strongly_connected(array, store),
+            graph.strongly_connected(array, store) || self.get_eq_term(array, store).is_some(),
             "ROW2-down candidate must pair a select array with a store in its \
-             strong class (length-1 weak path): array {array:?}, store {store:?}"
+             strong class (length-1 weak path) or joined by an equality atom: \
+             array {array:?}, store {store:?}"
         );
         if let Some(entry) = self.weak_equiv_cache.borrow_mut().as_mut() {
             entry.verified_strong.insert(pair);
@@ -521,7 +576,7 @@ pub(crate) mod weq5_shadow {
 
     /// Increment a thread-local counter by 1.
     fn bump(counter: &'static LocalKey<Cell<u64>>) {
-        counter.with(|c| c.set(c.get() + 1));
+        counter.with(|c| c.set(c.get().saturating_add(1)));
     }
     /// Read a thread-local counter.
     fn get(counter: &'static LocalKey<Cell<u64>>) -> u64 {

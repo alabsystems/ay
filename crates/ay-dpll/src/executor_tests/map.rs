@@ -203,9 +203,17 @@ fn subset_refuted_by_value_witness_is_unsat() {
 }
 
 /// `subset(m, n)` consistent with the present witnesses (same value, both
-/// contain the key) is SAT.
+/// contain the key) is SAT, so it must never be `unsat`.
+///
+/// EXPECTATION CORRECTED (#map-value-semantics): this pinned `sat`, but that
+/// `sat` was never checked. The native solver enforces subset only over keys
+/// BOTH operands already read, and the independent model gate does not
+/// interpret `map.subset` (it adopts the solver's value), so the published
+/// model could put a key in `m`'s domain that `n` lacks. The native-map gate
+/// now withholds it as `unknown`. Tighten back to `sat` once `map.subset` is
+/// encoded or independently checked; never loosen to accept `unsat`.
 #[test]
-fn subset_consistent_with_witness_is_sat() {
+fn subset_consistent_with_witness_is_never_unsat() {
     let smt = r#"
 (set-logic QF_MAPLIA)
 (declare-const m (Map Int Int))
@@ -217,7 +225,9 @@ fn subset_consistent_with_witness_is_sat() {
 (assert (= (map.get n 9) 5))
 (check-sat)
 "#;
-    assert_eq!(verdict(&solve(smt)), Some("sat"));
+    let output = solve(smt);
+    let got = verdict(&output);
+    assert!(matches!(got, Some("sat" | "unknown")), "got {got:?}");
 }
 
 /// Auto-detected logic (no explicit set-logic) routes map ops to the map solver

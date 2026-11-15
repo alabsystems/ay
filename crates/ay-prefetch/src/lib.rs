@@ -6,11 +6,16 @@
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Platform-specific software prefetch hints.
+//! Platform-specific software prefetch hints and bounds-contracted slice
+//! accessors for ay-sat's hot loops.
 //!
-//! Provides a single function [`prefetch_read_l2`] that issues a non-blocking
-//! L2 cache prefetch hint for a memory address. Used by ay-sat's BCP loop
-//! to hide main-memory latency (~60-80 cycles) when scanning watch lists.
+//! The prefetch hints ([`prefetch_read_l2`] and its L1 and clause-arena
+//! variants) issue a non-blocking cache prefetch for a memory address. ay-sat's
+//! BCP loop uses them to hide main-memory latency (~60-80 cycles) when scanning
+//! watch lists. The slice accessors (`blocker_at`, `blocker_set`,
+//! `clause_ref_at`, `clause_ref_set`, `entry_at`, `entry_set`, `val_at`,
+//! `val_set`, `word_at`) are re-exported from `checked`, whose Trust `requires`
+//! clauses move each index obligation to the call site.
 //!
 //! This crate isolates the `unsafe` inline assembly required for prefetch hints
 //! instead of adding another unsafe exception to ay-sat.
@@ -70,93 +75,6 @@ pub fn prefetch_read_l2<T>(ptr: *const T) {
     {
         let _ = ptr;
     }
-}
-
-/// Slice index for `i8` arrays (val lookup in the BCP hot path).
-///
-/// Panics when `index` is out of bounds. Keeping this public function checked
-/// is required for a sound safe API; callers that have proved a raw-pointer
-/// access valid can use the explicitly unsafe helpers below.
-#[inline(always)]
-pub fn val_at(vals: &[i8], index: usize) -> i8 {
-    vals[index]
-}
-
-/// Checked slice index for `u32` arrays (arena word lookup in BCP hot path).
-///
-/// Like [`val_at`], this panics on an out-of-bounds index. Used for arena
-/// literal access during the BCP replacement scan where the clause offset +
-/// literal index is known to be within the arena's allocated words.
-#[inline(always)]
-pub fn word_at(words: &[u32], index: usize) -> u32 {
-    words[index]
-}
-
-/// Checked slice read for `u32` arrays (SoA blocker/clause_ref in BCP hot path).
-///
-/// Like [`val_at`], this panics on an out-of-bounds index. Used in the SoA
-/// blocker fast path to read blocker values (#8243).
-/// With SoA layout, 32 blockers fit per cache line (vs 16 packed u64 entries),
-/// doubling the blocker scan throughput.
-#[inline(always)]
-pub fn blocker_at(blockers: &[u32], index: usize) -> u32 {
-    blockers[index]
-}
-
-/// Checked mutable slice write for `u32` arrays (SoA blocker store in BCP).
-///
-/// Like [`blocker_at`], this panics on an out-of-bounds index. Used in the BCP
-/// compaction loop for the speculative copy `blockers[j] = blockers[i]` (#8243).
-#[inline(always)]
-pub fn blocker_set(blockers: &mut [u32], index: usize, value: u32) {
-    blockers[index] = value;
-}
-
-/// Checked slice read for `u64` arrays (SoA clause_ref in BCP slow path).
-///
-/// Like [`blocker_at`], this panics on an out-of-bounds index. It is only
-/// accessed on blocker miss, avoiding cache pollution on the fast path (#8243).
-/// Each clause_ref word is a `u64` carrying the binary flag at bit 32 plus the
-/// full 32-bit clause word offset in the low bits (#9670).
-#[inline(always)]
-pub fn clause_ref_at(clause_refs: &[u64], index: usize) -> u64 {
-    clause_refs[index]
-}
-
-/// Checked mutable slice write for `u64` arrays (SoA clause_ref store).
-///
-/// Like [`blocker_at`], this panics on an out-of-bounds index.
-#[inline(always)]
-pub fn clause_ref_set(clause_refs: &mut [u64], index: usize, value: u64) {
-    clause_refs[index] = value;
-}
-
-/// Checked slice read for `u64` arrays (watch entry load in BCP hot path).
-///
-/// Like [`val_at`], this panics on an out-of-bounds index. Used in the BCP
-/// blocker fast path to read packed watch entries.
-#[inline(always)]
-pub fn entry_at(entries: &[u64], index: usize) -> u64 {
-    entries[index]
-}
-
-/// Checked mutable slice write for `u64` arrays (watch entry store in BCP).
-///
-/// Like [`entry_at`], this panics on an out-of-bounds index. Used in the BCP
-/// blocker fast path for the speculative copy `entries[j] = entries[i]`.
-/// The compaction invariant `j <= i < entries.len()` guarantees safety.
-#[inline(always)]
-pub fn entry_set(entries: &mut [u64], index: usize, value: u64) {
-    entries[index] = value;
-}
-
-/// Checked mutable slice write for `i8` arrays (val store in enqueue).
-///
-/// Like [`val_at`], this panics on an out-of-bounds index. Used in `enqueue()`
-/// to set `vals[lit] = 1` and `vals[¬lit] = -1`.
-#[inline(always)]
-pub fn val_set(vals: &mut [i8], index: usize, value: i8) {
-    vals[index] = value;
 }
 
 /// Issue a non-blocking L2 cache prefetch hint for a specific offset
@@ -277,6 +195,16 @@ pub fn watch_iter_raw(entries: &mut [u64]) -> (*mut u64, *const u64) {
     let end = unsafe { ptr.add(len).cast_const() };
     (ptr, end)
 }
+
+// The checked accessors carry native Trust contract clauses, which are raw
+// grammar stock rustc cannot parse; the verifier reads `checked.rs` and every
+// other compiler reads its clause-stripped twin. `build.rs` refuses drift.
+#[path = "checked_stock.rs"]
+mod checked;
+pub use checked::{
+    blocker_at, blocker_set, clause_ref_at, clause_ref_set, entry_at, entry_set, val_at, val_set,
+    word_at,
+};
 
 /// Read a literal u32 from the clause arena using raw pointer arithmetic.
 /// Equivalent to CaDiCaL's `lits[k]` where `lits = clause->begin()`.

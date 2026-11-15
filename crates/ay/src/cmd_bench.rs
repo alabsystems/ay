@@ -76,9 +76,8 @@ pub(crate) enum BenchCommand {
 
         /// Stamp a comparison run class into results.json.
         ///
-        /// `bench compare run` sets and VERIFIES this itself; a manually
-        /// stamped class is recorded as unverified. Unstamped runs carry no
-        /// class and must not be quoted as one
+        /// A manually stamped class is recorded as unverified. Unstamped runs
+        /// carry no class and must not be quoted as one.
         #[arg(long, value_enum, value_name = "CLASS")]
         run_class: Option<RunClass>,
 
@@ -103,13 +102,6 @@ pub(crate) enum BenchCommand {
         #[arg(long)]
         sat_variant: Option<String>,
     },
-
-    /// Compare AY against a competition's field under labeled run classes
-    Compare(crate::cmd_bench_compare::BenchCompareArgs),
-
-    /// Plan or run the catalog-complete external-reviewer campaign.
-    #[cfg(feature = "bench")]
-    Campaign(crate::cmd_bench_campaign::CampaignArgs),
 
     /// Score existing results JSON.
     Score {
@@ -496,8 +488,8 @@ impl std::fmt::Display for Domain {
 /// Comparison run class recorded by `bench run --run-class`.
 ///
 /// A number never travels without its class. Plain `bench run` only STAMPS
-/// the class (plus a host fingerprint) into results.json; verification
-/// against cited official specs belongs to `bench compare check`/`run`.
+/// the class (plus a host fingerprint) into results.json; it does not establish
+/// an official competition result.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum RunClass {
     /// Local run on hardware matching the cited official machine specs
@@ -580,8 +572,6 @@ pub(crate) fn run(_command: BenchCommand) -> anyhow::Result<()> {
 #[cfg(feature = "bench")]
 pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
     match command {
-        BenchCommand::Compare(args) => crate::cmd_bench_compare::run(args),
-        BenchCommand::Campaign(args) => crate::cmd_bench_campaign::run(args),
         BenchCommand::Run {
             eval_ids,
             all,
@@ -936,12 +926,20 @@ fn parse_run_reference_solvers(
             if let Some((name, _)) = entry.split_once('=') {
                 if !has_separator(name) {
                     let mut parsed = parse_reference_solvers(vec![entry])?;
-                    return Ok(parsed.remove(0));
+                    let (name, path) = parsed.remove(0);
+                    if name == "z3" {
+                        return Ok((name, vet_reference_z3(&path)?));
+                    }
+                    return Ok((name, path));
                 }
             }
             if has_separator(&entry) {
                 let path = PathBuf::from(&entry);
-                return Ok((reference_display_name(&path), path));
+                let name = reference_display_name(&path);
+                if name == "z3" {
+                    return Ok((name, vet_reference_z3(&path)?));
+                }
+                return Ok((name, path));
             }
             let name = entry.trim().to_string();
             if name.is_empty() {
@@ -949,7 +947,7 @@ fn parse_run_reference_solvers(
                     "--reference-solver must be [NAME=]PATH, got {entry:?}"
                 ));
             }
-            let path = resolve_reference_solver_name(&name, repo_root);
+            let path = resolve_reference_solver_name(&name, repo_root)?;
             Ok((name, path))
         })
         .collect()
@@ -982,14 +980,47 @@ fn reference_tool_env_key(name: &str) -> String {
 }
 
 /// Resolve a bare reference-solver NAME: `$AY_TOOL_<NAME>` override, then the
-/// tool registry's install target and fallback paths, then the bare name
-/// itself (left for $PATH resolution when the solver is spawned).
+/// tool registry's install target and fallback paths, then — for `z3` — the
+/// z3 oracle (`ay_sys::z3_oracle`: `Z3_PATH`, else the first z3 on PATH that
+/// proves it is z3, reached past reroute stubs), then the bare name itself
+/// (left for $PATH resolution when the solver is spawned).
 #[cfg(any(feature = "bench", test))]
-fn resolve_reference_solver_name(name: &str, repo_root: &std::path::Path) -> PathBuf {
-    if let Some(path) = std::env::var_os(reference_tool_env_key(name)) {
-        return PathBuf::from(path);
+fn resolve_reference_solver_name(
+    name: &str,
+    repo_root: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let explicit = std::env::var_os(reference_tool_env_key(name))
+        .map(PathBuf::from)
+        .or_else(|| resolve_reference_solver_via_registry(name, repo_root));
+    if name != "z3" {
+        return Ok(explicit.unwrap_or_else(|| PathBuf::from(name)));
     }
-    resolve_reference_solver_via_registry(name, repo_root).unwrap_or_else(|| PathBuf::from(name))
+    // z3 is AY's reference oracle, so every z3 candidate must prove it is z3.
+    // An explicit choice (the override or the registry's install) that does
+    // not is an error, never a fall-through, and with no explicit choice the
+    // workspace's identity-checked resolution decides. Nothing here hands the
+    // bare name on to a later PATH lookup.
+    match explicit {
+        Some(path) => vet_reference_z3(&path),
+        None => ay_sys::z3_oracle::z3_oracle()
+            .map(|oracle| oracle.path().to_path_buf())
+            .map_err(|unavailable| {
+                anyhow::anyhow!("--reference-solver z3: no z3 proved it is z3 ({unavailable})")
+            }),
+    }
+}
+
+/// The path of `candidate` when it proves it is z3; an error naming why not.
+#[cfg(any(feature = "bench", test))]
+fn vet_reference_z3(candidate: &std::path::Path) -> anyhow::Result<PathBuf> {
+    ay_sys::z3_oracle::identify_z3(candidate)
+        .map(|oracle| oracle.path().to_path_buf())
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "--reference-solver z3: {} is not z3: {reason}",
+                candidate.display()
+            )
+        })
 }
 
 /// Minimal reader over reference/tools.toml — resolution fields only.
@@ -1206,6 +1237,51 @@ mod tests {
                 PathBuf::from("runs/width=15/fake-z3")
             )]
         );
+    }
+
+    /// A shell script at `dir/name` that answers `--version` with `banner`
+    /// and anything else (the `--z3-mode --version` control included) with
+    /// nothing and exit 1.
+    #[cfg(unix)]
+    fn fake_solver(dir: &std::path::Path, name: &str, banner: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"{banner}\"; exit 0; fi\nexit 1\n"
+            ),
+        )
+        .expect("write fake solver");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake solver");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_run_reference_solvers_z3_must_prove_it_is_z3() {
+        // Every spelling that names z3 is identity-checked: a program that
+        // does not print a Z3 banner is refused, never run as the oracle.
+        let root = tempfile::tempdir().expect("tempdir");
+        let impostor = fake_solver(root.path(), "z3", "impostor 1.0");
+        for entry in [
+            format!("z3={}", impostor.display()),
+            impostor.display().to_string(),
+        ] {
+            let error = parse_run_reference_solvers(vec![entry.clone()], root.path())
+                .expect_err("a z3 that is not z3 must be refused");
+            assert!(error.to_string().contains("is not z3"), "{entry}: {error}");
+        }
+        // The same spellings pass for a program that proves it is z3.
+        let real_dir = root.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("mkdir");
+        let real = fake_solver(&real_dir, "z3", "Z3 version 4.13.0 - 64 bit");
+        let parsed =
+            parse_run_reference_solvers(vec![format!("z3={}", real.display())], root.path())
+                .expect("a z3 that proves it is z3");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "z3");
     }
 
     #[test]

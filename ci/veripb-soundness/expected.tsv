@@ -1,0 +1,50 @@
+# Checker soundness fixtures: twenty-two pairs covering the TWENTY-ONE confirmed
+# wrong-verdict defects in published VeriPB 3.0.2 (defect 7 has two
+# manifestations with opposite wrong verdicts, hence 22 rows for 21 defects).
+# Every one of these is a formula/proof pair where the checker's verdict
+# CONTRADICTS the truth. A checker AY is willing to trust must refuse all
+# twenty-two.
+#
+# The gate asserts REJECT = "printed no accepting `s ...` verdict line at any
+# guarantee level". `s VERIFIED NO CONCLUSION` is also a rejection here (the
+# proof concluded nothing), and so is a parse/checking error with no `s` line.
+#
+# These run in ~0.1s total, so they gate every push. See README.md for what
+# each bug is and where it was fixed.
+#
+# Rows 10 to 22 cover defects 9 to 21, the post-fork ones. They were fixed here
+# as ay patch 0002 and later reconciled into the fork, so the single pinned patch
+# (the fork's alab-main delta) now closes them; stock upstream fixes none of
+# them. Each of those directories also carries `sat.pbp` — the
+# SAME formula and the SAME binary, proved SATISFIABLE — and `variants/`,
+# including a one-knob control that is rejected by the unfixed checker too and so
+# pins the forgery to the defect rather than to "large numbers" or "that rule is
+# broken", plus a positive variant that must keep being ACCEPTED so an
+# over-broad "fix" cannot pass. Those are not rows: the schema is one pair per
+# row and the headline pair is the one that reaches the defect from an ordinary
+# formula. A fix has to close every variant anyway; see each directory's
+# README.md.
+#
+# dir	formula-flag	formula	proof	ground-truth	wrong-verdict-if-unfixed
+01-formula-truncation-utf8	--opb	t.opb	t.pbp	solution falsifies the formula	VERIFIED SATISFIABLE
+02-cnf-unterminated-clause	--cnf	t.cnf	c.pbp	solution falsifies the formula	VERIFIED SATISFIABLE
+03-degree-wrap-weaken	--opb	sat2.opb	w.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+04-mir-oversized-divisor	--opb	mir.opb	mir.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+05-le-degree-negation-wrap	--opb	le.opb	le.pbp	UNSATISFIABLE	VERIFIED SATISFIABLE
+06-unchecked-deletion-conclusion-sat	--opb	amo.opb	amo.pbp	UNSATISFIABLE	VERIFIED SATISFIABLE
+07-normalize-cancellation-wrap	--opb	norm.opb	norm.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+08-normalize-negation-wrap	--opb	neg.opb	neg.pbp	UNSATISFIABLE	VERIFIED SATISFIABLE
+09-preserved-add-reification-wrap	--opb	pres.opb	pres.pbp	input has 1 solution over its preserved set, output has 2	VERIFIED OUTPUT EQUIENUMERABLE
+10-pol-addition-cancellation-wrap	--opb	add.opb	add.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+11-propagation-slack-overflow	--opb	plain.opb	plain.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+12-pbc-fabricated-proofgoal	--opb	pbc.opb	pbc.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+13-substitute-degree-wrap	--opb	sub.opb	sub.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+14-def-order-unvalidated-fresh-vars	--opb	order.opb	order.pbp	SATISFIABLE	VERIFIED UNSATISFIABLE
+15-order-aux-var-not-private	--opb	order.opb	order.pbp	SATISFIABLE (13 models)	VERIFIED UNSATISFIABLE
+16-v2-parser-no-rule-scope	--opb	unsat.opb	v2.pbp	UNSATISFIABLE (0 models)	VERIFIED SATISFIABLE
+17-enumeration-complete-obji	--opb	enum.opb	enum.pbp	3 solutions over the preserved set	VERIFIED COMPLETE ENUMERATION OF 0 SOLUTIONS
+18-solx-empty-preserved-set	--opb	empty.opb	empty.pbp	SATISFIABLE, optimum 0	VERIFIED BOUNDS 1000 <= obj <= 1000
+19-conclusion-bounds-solx-contradiction	--opb	bounds.opb	bounds.pbp	optimum is 0	VERIFIED BOUNDS 10 <= obj <= 10
+20-output-guarantee-solx-unguarded	--opb	equisat.opb	equisat.pbp	input has 3 solutions, the exported core has none	VERIFIED OUTPUT EQUISATISFIABLE
+21-sol-then-obji-evades-equienum	--opb	equienum.opb	equienum.pbp	input has 3 solutions, the exported core has none	VERIFIED OUTPUT EQUIENUMERABLE
+22-wcnf-literal-token-text	--wcnf	split.wcnf	split.pbp	INFEASIBLE (its two hard clauses contradict)	VERIFIED BOUNDS 0 <= obj <= 0

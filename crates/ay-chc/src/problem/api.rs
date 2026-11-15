@@ -64,6 +64,37 @@ impl ChcProblem {
         }
     }
 
+    /// Internal source-only constructor: never simplify or normalize a clause.
+    /// The caller must authenticate all expressions before using this skeleton.
+    pub(crate) fn with_raw_source_clauses(
+        mut self,
+        mut clauses: Vec<HornClause>,
+    ) -> ChcResult<Self> {
+        if !self.clauses.is_empty()
+            || !self.pruned_false_queries.is_empty()
+            || self.pruned_query_source.is_some()
+            || self.next_source_query_ordinal != 0
+            || self.stripped_body_forall
+        {
+            return Err(crate::ChcError::Verification(
+                "quantified source requires a declaration-only problem".into(),
+            ));
+        }
+        for clause in &mut clauses {
+            clause.source_query_ordinal = if clause.is_query() {
+                let ordinal = self.next_source_query_ordinal;
+                self.next_source_query_ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    crate::ChcError::Verification("quantified source query ordinal overflow".into())
+                })?;
+                Some(ordinal)
+            } else {
+                None
+            };
+        }
+        self.clauses = clauses;
+        Ok(self)
+    }
+
     /// Split the active safety queries into exact independent obligations.
     ///
     /// Each returned problem contains exactly one false-head query and only
@@ -198,7 +229,8 @@ impl ChcProblem {
             });
         }
 
-        let content_sha256 = problem.normalized_input_sha256();
+        let (normalized_input_schema, content_sha256) =
+            crate::proof_metadata::normalized_chc_input_identity(&problem);
 
         ChcQueryObligation {
             id: ChcQueryObligationId {
@@ -206,6 +238,7 @@ impl ChcProblem {
                 query_clause_index,
                 defining_clause_index,
                 label,
+                normalized_input_schema,
                 content_sha256,
             },
             problem,
@@ -223,7 +256,7 @@ impl ChcProblem {
         }
     }
 
-    fn query_obligation_label(
+    pub(super) fn query_obligation_label(
         problem: &Self,
         query: &HornClause,
         marker: PredicateId,
@@ -434,6 +467,23 @@ impl ChcProblem {
         &self.clauses
     }
 
+    /// Borrow all clause roots OWNED by this problem for clone-work admission.
+    /// Unlike source_clauses, includes owned pruned roots even when their
+    /// semantic registry lives in pruned_query_source. This is NOT a source
+    /// registry/semantic iterator or proof authority; do not type old pruned
+    /// clauses against current transformed declarations. Shared frozen Arc
+    /// provenance is not recursively copied by ChcProblem::clone.
+    pub(crate) fn owned_clauses_for_budget(&self) -> impl Iterator<Item = &HornClause> {
+        self.clauses.iter().chain(self.pruned_false_queries.iter())
+    }
+
+    /// Borrow the complete immutable source separately validated by validate.
+    /// Resource/type admission must inspect it under ITS OWN declarations;
+    /// this accessor grants no semantic, transform, source or proof authority.
+    pub(crate) fn frozen_pruned_source_for_budget(&self) -> Option<&Self> {
+        self.pruned_query_source.as_deref()
+    }
+
     pub(crate) fn source_clauses(&self) -> impl Iterator<Item = &HornClause> {
         self.clauses.iter().chain(
             self.pruned_false_queries
@@ -538,11 +588,25 @@ impl ChcProblem {
     }
 
     /// Create an SmtContext pre-configured with this problem's DT definitions (#7016).
+    ///
+    /// The context is on the [`crate::smt::SmtLane::Verification`] lane: this
+    /// is what every final verifier (`PdrSolver::new` with a default
+    /// `PdrConfig`, BMC-as-verifier, the CLI discharge gate) constructs.
+    /// Engines use [`Self::make_search_smt_context`].
     pub fn make_smt_context(&self) -> crate::smt::SmtContext {
         let mut smt = crate::smt::SmtContext::new();
         if !self.datatype_defs.is_empty() {
             smt.set_datatype_defs(self.datatype_defs.clone());
         }
+        smt
+    }
+
+    /// [`Self::make_smt_context`] on the [`crate::smt::SmtLane::Search`] lane —
+    /// for ENGINE contexts only (search guidance; the verdict is re-derived on
+    /// a `Verification` context before publication).
+    pub fn make_search_smt_context(&self) -> crate::smt::SmtContext {
+        let mut smt = self.make_smt_context();
+        smt.set_lane(crate::smt::SmtLane::Search);
         smt
     }
 
@@ -751,6 +815,17 @@ impl ChcProblem {
         let mut stack = vec![root];
         while let Some(expr) = stack.pop() {
             match expr {
+                ChcExpr::ArrayLambda(lambda) => {
+                    if Self::sort_contains_datatype_bounded(&lambda.binder().sort, sort_nodes) {
+                        return true;
+                    }
+                    *expr_nodes = match expr_nodes.checked_add(lambda.captures().len() + 1) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_EXPR_NODES => count,
+                        _ => return true,
+                    };
+                    stack.push(lambda.body());
+                    stack.extend(lambda.captures().iter().map(AsRef::as_ref));
+                }
                 ChcExpr::Bool(_)
                 | ChcExpr::Int(_)
                 | ChcExpr::Real(_, _)
@@ -985,11 +1060,8 @@ impl ChcProblem {
         match sort {
             ChcSort::BitVec(_) => true,
             ChcSort::Array(k, v) => Self::sort_contains_bitvec(k) || Self::sort_contains_bitvec(v),
-            ChcSort::Datatype { constructors, .. } => constructors.iter().any(|ctor| {
-                ctor.selectors
-                    .iter()
-                    .any(|sel| Self::sort_contains_bitvec(&sel.sort))
-            }),
+            // Decided once per definition at interning, not by walking it.
+            ChcSort::Datatype { constructors, .. } => constructors.contains_bitvec(),
             _ => false,
         }
     }

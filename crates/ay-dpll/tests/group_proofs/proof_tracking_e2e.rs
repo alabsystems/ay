@@ -458,10 +458,10 @@ fn test_propositional_multi_clause_resolution_proof() {
 
 /// QF_BV proof: independently replayed bit-blast theorem + resolution.
 ///
-/// AY's strict checker regenerates and checks the exact BV refutation. Generic
-/// `BvBitBlast` clauses still render as honest `hole` steps because Alethe
-/// 1.0/Carcara has no compatible monolithic rule. This exact authored shape is
-/// stronger: transitivity yields a ground disequality lowered through `evaluate`.
+/// AY's strict checker regenerates and checks the exact BV refutation. Alethe
+/// 1.0/Carcara has no monolithic rule for a generic `BvBitBlast` clause, so one
+/// reaches the wire only through a lowering Carcara re-derives step by step, or
+/// else as an honest `hole`; this exact authored shape must not need the hole.
 #[test]
 #[timeout(5_000)]
 fn test_bv_proof_end_to_end_strict_internal_certificate() {
@@ -495,12 +495,19 @@ fn test_bv_proof_end_to_end_strict_internal_certificate() {
     // before the authored BV cascade, silently downgrading bv_bitblast
     // certificates to holes) — verified by running this test at 1e10745f2
     // (the hole disappears) and its parent b868972b5 (hole still printed).
-    // With the authored BV cascade restored, the ground BV disequality closes
+    // With the authored BV cascade restored, the ground BV disequality closed
     // through the f466f0dda evaluate cascade (each step an implemented
-    // carcara rule), so the exported Alethe document no longer needs the
-    // honest `hole` this test previously pinned. The capability moved
-    // forward; pin the hole-free rendering and the `evaluate` closure that
-    // now carries it.
+    // carcara rule), so the exported Alethe document no longer needed the
+    // honest `hole` this test previously pinned.
+    //
+    // d22d4f03f landed c5db644c1's compact shared-endpoint lowering. The joint
+    // guarded repair derives `(and (= x #x05) (= x #x0A))` with `and_neg`,
+    // then its `BvBitBlast` lemma closes through `and_pos`, `eq_transitive`,
+    // and `evaluate` before the general bit-blast fallback. Pin that exact
+    // canonical closure, not the larger circuit used before this lowering
+    // landed. The separate mandatory trust-free external check remains the
+    // variable arm of `carcara_external_check::
+    // test_carcara_trust_free_bv_constant_endpoint_mismatch`.
     assert!(
         !proof.contains(":rule hole"),
         "the BV disequality closure must stay hole-free:\n{proof}"

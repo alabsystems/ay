@@ -43,6 +43,11 @@ pub(crate) struct PrepassReachability {
     /// is the attribution counter: a behaviour change on a query with this at
     /// zero did not come from the deep-QE lane.
     pub(crate) deep_qe_unknown_retries: u64,
+    /// Times an `Unknown` reached the deep-QE retry boundary (the CEGAR loop's
+    /// early return or `deep_qe_unknown_retry`'s own guard) and the retry stood
+    /// down because a checked certificate was DEMANDED. A stand-down test that
+    /// sees this at zero never offered the retry an `Unknown`, so it is vacuous.
+    pub(crate) deep_qe_demand_stand_downs: u64,
     /// Times the #qe-alternation-route recognizer ACCEPTED the problem (pure
     /// arithmetic, quantified, no UF / arrays / BV / nonlinear) at the pre-pass
     /// site, i.e. the route was applicable.

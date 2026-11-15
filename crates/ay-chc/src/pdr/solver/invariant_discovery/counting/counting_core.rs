@@ -320,7 +320,7 @@ impl PdrSolver {
 
         let target_level = 1;
         for (pred_id, invariant) in direct_candidates {
-            if self.frames[target_level].contains_lemma(pred_id, &invariant) {
+            if !self.error_implied_lemma_admissible(pred_id, &invariant, target_level) {
                 continue;
             }
             // Check if this is a mod equality invariant (= (mod var k) r) that can be
@@ -386,7 +386,7 @@ impl PdrSolver {
             //   pred(vars) → (guard(vars) → conclusion(vars))
             //
             // So we can add them directly without inductiveness checks.
-            if self.frames[target_level].contains_lemma(pred_id, &conditional_invariant) {
+            if !self.error_implied_lemma_admissible(pred_id, &conditional_invariant, target_level) {
                 continue;
             }
             // #2459: Route through add_lemma_to_frame for cross-predicate propagation.
@@ -405,5 +405,33 @@ impl PdrSolver {
                 );
             }
         }
+    }
+
+    /// Whether `lemma`, derived by [`Self::discover_error_implied_invariants`]
+    /// from an error clause on `pred`, may enter frame `level`: it is not there
+    /// yet, and it is closed over `pred`'s canonical variables, name AND sort
+    /// (`closed_over`; a cancelled census refuses).
+    ///
+    /// The error clause `pred(x) ∧ guard(x, l) ∧ ¬conclusion(x) → false` gives
+    /// `∀l. guard(x, l) ⇒ conclusion(x)`. The pattern extractors rename only
+    /// the body arguments (and #2492's expression-argument constituents to
+    /// themselves), so a guard conjunct over a query local keeps `l` free
+    /// under its source name, and a frame lemma has no binder for it: the
+    /// first clause the lemma meets captures `l` at that clause's sort
+    /// (#5805's shape, as in `backward_chain_lemma`). A Bool local met a
+    /// step's Int head argument of the same name in
+    /// `translate_to_canonical_names` (the sort tripwire; an ill-sorted
+    /// blocking query in release); an Int local, like 022c-horn_000's `G`,
+    /// `H`, is captured silently and can make a check spuriously UNSAT.
+    fn error_implied_lemma_admissible(
+        &self,
+        pred: PredicateId,
+        lemma: &ChcExpr,
+        level: usize,
+    ) -> bool {
+        !self.frames[level].contains_lemma(pred, lemma)
+            && self
+                .canonical_vars(pred)
+                .is_some_and(|canonical| self.closed_over(lemma, canonical))
     }
 }

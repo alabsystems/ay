@@ -1,0 +1,22 @@
+pseudo-Boolean proof version 3.0
+f 7 ;
+% A reification shorthand in the OPB file is the same constraint as the one written with the same
+% syntax in the proof file, ...
+e z1 z2 ~z3 ==> +1 x1 +2 x2 >= 2 : 1 ;
+e z1 <== +1 x1 +2 x2 >= 2 : 2 ;
+e z2 ==> 1 x1 1 x2 <= 1 : 3 ;
+e z2 <== 1 x1 1 x2 <= 1 : 4 ;
+e z3 ~z4 ==> -3 x1 2 ~x2 >= -1 : 5 ;
+e z4 <== -3 x1 2 ~x2 >= -1 : 6 ;
+e z5 z6 ==> >= 1 : 7 ;
+% ... and stands for the constraint one would otherwise have to write by hand.
+e 1 x1 2 x2 2 ~z1 2 ~z2 2 z3 >= 2 : 1 ;
+e 1 ~x1 2 ~x2 2 z1 >= 2 : 2 ;
+e 1 ~x1 1 ~x2 1 ~z2 >= 1 : 3 ;
+e 1 x1 1 x2 2 z2 >= 2 : 4 ;
+e 3 ~x1 2 ~x2 2 ~z3 2 z4 >= 2 : 5 ;
+e 3 x1 2 x2 4 z4 >= 4 : 6 ;
+e 1 ~z5 1 ~z6 >= 1 : 7 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

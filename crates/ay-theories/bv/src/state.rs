@@ -11,13 +11,31 @@
 use super::*;
 
 impl BvSolver<'_> {
+    /// Actual canonical false allocation in this completed encoding.
+    ///
+    /// This is a value-encoding hint, not clause/source proof authority. The
+    /// consumer must still independently authenticate every translated clause.
+    pub fn canonical_false_literal(&self) -> Option<CnfLit> {
+        let literal = self.cached_false_lit?;
+        (self.encoding_complete() && literal > 0 && literal as u32 <= self.num_vars())
+            .then_some(literal)
+    }
+
     /// Get the generated CNF clauses
     pub fn clauses(&self) -> &[CnfClause] {
-        &self.clauses
+        if self.encoding_complete() {
+            &self.clauses
+        } else {
+            &[]
+        }
     }
 
     /// Take ownership of the generated CNF clauses
     pub fn take_clauses(&mut self) -> Vec<CnfClause> {
+        if !self.encoding_complete() {
+            self.clauses.clear();
+            return Vec::new();
+        }
         std::mem::take(&mut self.clauses)
     }
 
@@ -27,12 +45,17 @@ impl BvSolver<'_> {
     /// code. It is intended as the BV-side handoff for future external code generation
     /// clause emitters.
     pub fn clause_batch(&self) -> BvClauseBatch {
+        if !self.encoding_complete() {
+            return BvClauseBatch::new(0);
+        }
         BvClauseBatch::from_clauses(self.num_vars(), &self.clauses)
     }
 
     /// Get the number of variables used
     pub fn num_vars(&self) -> u32 {
-        self.next_var - 1
+        // `next_var` is one past the last variable (variables are 1-indexed);
+        // a `set_next_var(0)` restore counts as no variables.
+        self.next_var.saturating_sub(1)
     }
 
     /// Cheap O(1) estimate of how many persistent-cache entries this solver's
@@ -62,6 +85,9 @@ impl BvSolver<'_> {
     ///
     /// Returns None if the term has not been processed by the bit-blaster
     pub fn get_term_bits(&self, term: TermId) -> Option<&[CnfLit]> {
+        if !self.encoding_complete() {
+            return None;
+        }
         self.term_to_bits.get(&term).map(Vec::as_slice)
     }
 
@@ -73,7 +99,8 @@ impl BvSolver<'_> {
         if !matches!(self.terms.sort(term), Sort::BitVec(_)) {
             return None;
         }
-        Some(self.get_bits(term))
+        let bits = self.get_bits(term);
+        self.encoding_complete().then_some(bits)
     }
 
     /// Ensure a Bool-sorted term has a single-literal representation.
@@ -87,7 +114,8 @@ impl BvSolver<'_> {
         if !matches!(self.terms.sort(term), Sort::Bool) {
             return None;
         }
-        Some(self.bitblast_bool(term))
+        let lit = self.bitblast_bool(term);
+        self.encoding_complete().then_some(lit)
     }
 
     /// Get an iterator over all bit-blasted terms and their bit representations
@@ -320,17 +348,20 @@ impl BvSolver<'_> {
     /// the flag is set to `true`. This allows `set_timeout()` and `interrupt()`
     /// to take effect during BV theory solving.
     pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        // Preserve the first original handle while still polling the current one.
+        let _ = self.encoding_complete();
+        self.encoding.retain_first_interrupt(&flag);
         self.interrupt = Some(flag);
+        let _ = self.encoding_complete();
     }
 
     /// Check whether the external interrupt flag has been set (#8609).
     ///
-    /// Returns `true` if the interrupt flag exists and is set to `true`.
+    /// Returns `true` after an encoding-owner refusal is observed, including
+    /// raw interrupt, captured check-stop and memory refusal.
     /// Used for cooperative cancellation in hot loops.
     pub fn is_interrupted(&self) -> bool {
-        self.interrupt
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        !self.encoding_complete()
     }
 
     /// Count the number of bit positions where both literals are known-equal

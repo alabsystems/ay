@@ -377,13 +377,13 @@ fn fix_3890_replace_re_union_ground() {
     );
 }
 
-/// str.replace_re_all with re.+: replace all sequences of "a" in "aabaac".
-/// re.+(str.to_re "a") matches "aa", then "aa", then "c" has no match.
-/// Result: "xbxc" (each "aa" run replaced by "x").
-///
-/// BUG: AY currently returns false-UNSAT on this formula. The str.replace_re_all
-/// ground evaluator does not correctly handle re.+ (Kleene plus) patterns.
-/// This is a soundness gap in regex replacement. See follow-up issue.
+/// str.replace_re_all with re.+ over "aabaac". SMT-LIB replaces the leftmost
+/// SHORTEST non-empty match each time, so every single "a" is replaced: the
+/// result is "xxbxxc", and `x = "xbxc"` (the leftmost-LONGEST reading) is UNSAT.
+/// cvc5 1.3.4 answers unsat (and x = "xxbxxc" without the second assertion);
+/// z3 4.16.0 answers unknown. AY's unsat is CORRECT. This test was labelled
+/// "KNOWN BUG #6261: false-UNSAT" under the longest-match reading, and its
+/// message asked whoever saw it change to flip it to reject unsat.
 #[test]
 #[timeout(10_000)]
 fn fix_3890_replace_re_all_plus_ground() {
@@ -396,15 +396,12 @@ fn fix_3890_replace_re_all_plus_ground() {
 "#;
     let result = crate::common::solve(smt);
     let answer = crate::common::sat_result(&result);
-    // KNOWN BUG (#6261): AY returns false-UNSAT on this SAT formula.
-    // The str.replace_re_all ground evaluator mishandles re.+ patterns.
-    // When fixed, this assertion should fail — tighten to:
-    //   assert!(matches!(answer, Some("sat") | Some("unknown")), ...);
+    // Leftmost-shortest semantics (see the doc comment): unsat is the truth.
     assert_eq!(
         answer,
         Some("unsat"),
-        "BUG #6261 FIXED? str.replace_re_all with re.+ no longer returns false-UNSAT \
-         (got {answer:?}). Tighten this assertion to reject unsat.",
+        "replace_re_all(\"aabaac\", re.+(\"a\"), \"x\") = \"xxbxxc\" (leftmost-shortest), \
+         so x = \"xbxc\" is unsat; got {answer:?}. A sat here is a false model.",
     );
 }
 

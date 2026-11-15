@@ -8,9 +8,16 @@
 //! It supports IEEE 754 comparison semantics, SMT-LIB formatting, and
 //! conversion to native f64 and exact BigRational.
 
+mod exact;
+mod fields;
+pub use fields::Fields as FpFields;
+
 /// A concrete IEEE 754 floating-point value reconstructed from a SAT model.
 #[derive(Debug, Clone)]
 pub enum FpModelValue {
+    /// Exact fields beyond the native u64 exponent or u128 stored fraction.
+    /// Cloning shares immutable field data; no rounded native value is invented.
+    Exact(FpFields),
     /// Positive zero
     PosZero {
         /// Exponent bit width
@@ -53,8 +60,8 @@ pub enum FpModelValue {
         sign: bool,
         /// Biased exponent (raw bit pattern)
         exponent: u64,
-        /// Stored significand (without hidden bit)
-        significand: u64,
+        /// Stored significand (without hidden bit), including binary128's 112 bits.
+        significand: u128,
         /// Exponent bit width
         eb: u32,
         /// Significand bit width (including hidden bit)
@@ -66,6 +73,7 @@ impl FpModelValue {
     /// Returns the exponent bit width.
     pub fn eb(&self) -> u32 {
         match self {
+            Self::Exact(fields) => fields.exponent_bits(),
             Self::PosZero { eb, .. }
             | Self::NegZero { eb, .. }
             | Self::PosInf { eb, .. }
@@ -78,6 +86,7 @@ impl FpModelValue {
     /// Returns the significand bit width (including hidden bit).
     pub fn sb(&self) -> u32 {
         match self {
+            Self::Exact(fields) => fields.significand_bits(),
             Self::PosZero { sb, .. }
             | Self::NegZero { sb, .. }
             | Self::PosInf { sb, .. }
@@ -89,23 +98,26 @@ impl FpModelValue {
 
     /// True if this value is NaN.
     pub fn is_nan(&self) -> bool {
-        matches!(self, Self::NaN { .. })
+        matches!(self, Self::NaN { .. }) || matches!(self, Self::Exact(fields) if fields.is_nan())
     }
 
     /// True if this value is positive or negative infinity.
     pub fn is_infinite(&self) -> bool {
         matches!(self, Self::PosInf { .. } | Self::NegInf { .. })
+            || matches!(self, Self::Exact(fields) if fields.is_infinite())
     }
 
     /// True if this value is positive or negative zero.
     pub fn is_zero(&self) -> bool {
         matches!(self, Self::PosZero { .. } | Self::NegZero { .. })
+            || matches!(self, Self::Exact(fields) if fields.is_zero())
     }
 
     /// True if this value is positive (sign bit = 0).
     /// +0 is positive, -0 is not. NaN is not positive.
     pub fn is_positive(&self) -> bool {
         match self {
+            Self::Exact(fields) => !fields.sign() && !fields.is_nan(),
             Self::PosZero { .. } | Self::PosInf { .. } => true,
             Self::NegZero { .. } | Self::NegInf { .. } | Self::NaN { .. } => false,
             Self::Fp { sign, .. } => !sign,
@@ -116,6 +128,7 @@ impl FpModelValue {
     /// -0 is negative, +0 is not. NaN is not negative.
     pub fn is_negative(&self) -> bool {
         match self {
+            Self::Exact(fields) => fields.sign() && !fields.is_nan(),
             Self::NegZero { .. } | Self::NegInf { .. } => true,
             Self::PosZero { .. } | Self::PosInf { .. } | Self::NaN { .. } => false,
             Self::Fp { sign, .. } => *sign,
@@ -125,6 +138,9 @@ impl FpModelValue {
     /// True if this value is a normal (non-zero, non-subnormal, non-special) number.
     pub fn is_normal(&self) -> bool {
         match self {
+            Self::Exact(fields) => {
+                fields.exponent().bits() != 0 && !fields.is_nan() && !fields.is_infinite()
+            }
             Self::Fp { exponent, eb, .. } => {
                 let max_exp = (1u64 << eb) - 1;
                 *exponent != 0 && *exponent != max_exp
@@ -136,6 +152,7 @@ impl FpModelValue {
     /// True if this value is subnormal (biased exponent = 0, significand != 0).
     pub fn is_subnormal(&self) -> bool {
         match self {
+            Self::Exact(fields) => fields.exponent().bits() == 0 && !fields.is_zero(),
             Self::Fp {
                 exponent,
                 significand,
@@ -148,6 +165,7 @@ impl FpModelValue {
     /// Negate this value: flip the sign.
     pub fn negate(&self) -> Self {
         match self {
+            Self::Exact(fields) => Self::Exact(fields.with_sign(!fields.sign())),
             Self::PosZero { eb, sb } => Self::NegZero { eb: *eb, sb: *sb },
             Self::NegZero { eb, sb } => Self::PosZero { eb: *eb, sb: *sb },
             Self::PosInf { eb, sb } => Self::NegInf { eb: *eb, sb: *sb },
@@ -172,6 +190,7 @@ impl FpModelValue {
     /// Absolute value: clear the sign bit.
     pub fn abs(&self) -> Self {
         match self {
+            Self::Exact(fields) => Self::Exact(fields.with_sign(false)),
             Self::NegZero { eb, sb } => Self::PosZero { eb: *eb, sb: *sb },
             Self::NegInf { eb, sb } => Self::PosInf { eb: *eb, sb: *sb },
             Self::NaN { eb, sb } => Self::NaN { eb: *eb, sb: *sb },
@@ -194,6 +213,9 @@ impl FpModelValue {
 
     /// IEEE 754 equality: NaN != NaN, +0 == -0.
     pub fn fp_eq(&self, other: &Self) -> bool {
+        if matches!(self, Self::Exact(_)) || matches!(other, Self::Exact(_)) {
+            return self.numeric_order(other) == Some(std::cmp::Ordering::Equal);
+        }
         if self.is_nan() || other.is_nan() {
             return false;
         }
@@ -228,6 +250,28 @@ impl FpModelValue {
     /// distinguishes +0 from -0 by bit pattern. This is required for the SMT-LIB
     /// `=` operator, which is always reflexive per the standard.
     pub fn structural_eq(&self, other: &Self) -> bool {
+        if matches!(self, Self::Exact(_)) || matches!(other, Self::Exact(_)) {
+            if (self.eb(), self.sb()) != (other.eb(), other.sb()) {
+                return false;
+            }
+            if self.is_nan() || other.is_nan() {
+                return self.is_nan() && other.is_nan();
+            }
+            if self.is_zero() || other.is_zero() {
+                return self.is_zero()
+                    && other.is_zero()
+                    && self.is_negative() == other.is_negative();
+            }
+            if self.is_infinite() || other.is_infinite() {
+                return self.is_infinite()
+                    && other.is_infinite()
+                    && self.is_negative() == other.is_negative();
+            }
+            return match (self.exact_fields(), other.exact_fields()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+        }
         match (self, other) {
             (Self::NaN { eb: e1, sb: s1 }, Self::NaN { eb: e2, sb: s2 }) => e1 == e2 && s1 == s2,
             (Self::PosZero { eb: e1, sb: s1 }, Self::PosZero { eb: e2, sb: s2 }) => {

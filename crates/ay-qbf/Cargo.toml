@@ -15,7 +15,7 @@ ay-sat.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-ntest = "0.9"
+ay-criterion-main.workspace = true
 
 [[bench]]
 name = "qbf_bench"

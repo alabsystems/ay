@@ -89,7 +89,32 @@ pub(crate) enum DiagnosticPass {
 }
 
 impl DiagnosticPass {
-    fn as_str(self) -> &'static str {
+    /// Every pass, indexed by its trace code (`Solver::diagnostic_pass_code`).
+    pub(crate) const BY_CODE: [Self; 21] = [
+        Self::None,
+        Self::Input,
+        Self::Learning,
+        Self::BVE,
+        Self::BCE,
+        Self::Vivify,
+        Self::Subsume,
+        Self::Probe,
+        Self::Backbone,
+        Self::Congruence,
+        Self::Decompose,
+        Self::HTR,
+        Self::Factor,
+        Self::Condition,
+        Self::TransRed,
+        Self::Sweep,
+        Self::Reduce,
+        Self::Flush,
+        Self::CCE,
+        Self::Reorder,
+        Self::Sbva,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Input => "input",

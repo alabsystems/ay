@@ -88,7 +88,7 @@ public final class Native {
 
         // 2. Walk up from the working directory looking for a Cargo workspace
         //    root (target/{debug,release}/<basename>). This is the in-tree
-        //    dev workflow: `cargo build -p ay-ffi` first.
+        //    dev workflow: `targo --unverified build -p ay-ffi` (stock Rust: `cargo build -p ay-ffi`) first.
         Path here = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath();
         for (Path dir = here; dir != null; dir = dir.getParent()) {
             for (String profile : new String[] {"debug", "release"}) {
@@ -102,7 +102,7 @@ public final class Native {
 
         throw new AyZ3Exception(
             "Could not locate libay_ffi shared library. Build it with "
-            + "`cargo build -p ay-ffi`, or set AYZ3_LIB to its full path.\n"
+            + "`targo --unverified build -p ay-ffi` (Trust toolchain) or `cargo build -p ay-ffi`, or set AYZ3_LIB to its full path.\n"
             + "Tried:\n  " + String.join("\n  ", tried));
     }
 

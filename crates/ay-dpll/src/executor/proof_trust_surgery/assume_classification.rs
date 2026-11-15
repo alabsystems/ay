@@ -77,8 +77,10 @@ impl Executor {
         }
         // A `let`-wrapped surface (common in SMT-COMP inputs) hides the
         // repairable shape: expand the bindings first (pure substitution;
-        // fail-closed on any capture risk). External checkers compare
-        // against the same expansion (carcara: `--expand-let-bindings`).
+        // fail-closed on any capture risk). An external checker reaches the
+        // same expansion: in AY's canonical invocation (`carcara check --
+        // PROOF PROBLEM`) through the printer's `:rule let` bridge from the
+        // problem's own `let`, and under `--expand-let-bindings` at parse time.
         let expanded;
         let parsed = if matches!(strip_frontend_annotations(parsed), FrontendTerm::Let(..)) {
             match expand_surface_lets(

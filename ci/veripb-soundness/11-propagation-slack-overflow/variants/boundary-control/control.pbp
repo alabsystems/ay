@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+% ONE OFF THE BOUNDARY. Byte-for-byte the proof of `variants/formula-borne/`, against a
+% formula whose two degrees are each ONE LARGER: -9223372036854775805 instead of
+% -9223372036854775806. The slack is then 2 + 9223372036854775805 = 9223372036854775807,
+% exactly i64::MAX, so nothing wraps.
+%
+% This proof is REJECTED by the UNFIXED checker and by the fixed one alike. That is the
+% point: it pins the forgery to the WRAP and not to "large numbers confuse the checker".
+% One unit of magnitude is the entire difference between a forged
+% `s VERIFIED UNSATISFIABLE` and a correct refusal.
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

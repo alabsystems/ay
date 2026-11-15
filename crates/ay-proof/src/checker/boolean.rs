@@ -368,6 +368,12 @@ pub(crate) fn validate_and_neg(
     clause: &[TermId],
     source_term: Option<TermId>,
 ) -> Result<(), ProofCheckError> {
+    // The ordered emitted shape proves the same exact multiset by immediate
+    // IDs, including duplicate conjunct occurrences. No recursive matching is
+    // needed; keep the existing matcher for every other valid spelling.
+    if super::boolean_and_neg_shape::and_neg_is_emitted_identity_shape(terms, clause, source_term) {
+        return Ok(());
+    }
     let args = decode_and_source(terms, source_term, clause)
         .ok_or_else(|| make_err(step, "and_neg", "could not determine and-source term"))?;
     if clause.len() != args.len() + 1 {

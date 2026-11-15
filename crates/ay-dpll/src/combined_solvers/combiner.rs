@@ -46,7 +46,11 @@ use crate::term_helpers::{
     is_uf_real_equality,
 };
 
+mod congruence_scope;
 mod notification_replay;
+mod term_cache_carry;
+
+pub(crate) use term_cache_carry::CombinerTermCacheCarry;
 
 /// Endpoint adjacency + dedup index over a `Vec<EufArrayNotifyReplayEdge>`,
 /// maintained incrementally across the prune/append batch loops so the
@@ -184,6 +188,16 @@ impl DietMode {
 /// etc.) with a single implementation of the check loop, equality propagation,
 /// push/pop, and assert_literal routing. Fixing a bug in the N-O loop fixes
 /// it for ALL logic combinations simultaneously.
+/// Memoized static prefix outcome for `suggest_phase_with_arrays`
+/// (#combiner-suggest-static).
+#[derive(Clone, Copy)]
+pub(super) enum StaticPhasePrefix {
+    /// The shape tests decide the suggestion without the arithmetic lane.
+    Fixed(Option<bool>),
+    /// Fall through to the LIA/LRA delegate.
+    Delegate,
+}
+
 pub struct TheoryCombiner<'a> {
     /// A5 lazy arith-equality adapter (experiment, AY_A5_LAZY_ARITH=1):
     /// Int EQUALITY atoms are EUF-owned during search (congruence handles
@@ -227,6 +241,30 @@ pub struct TheoryCombiner<'a> {
     /// array state has not changed since the last successful, no-new-equalities
     /// array pass (#6820).
     pub(super) array_epoch: u64,
+    /// Memoized `suggest_phase` results (#combiner-suggest-memo),
+    /// keyed by the arithmetic phase epoch. Every suggestion this
+    /// combiner emits is a pure function of (atom, epoch): the
+    /// arrays overrides are static term-shape predicates and the
+    /// delegate is epoch-stable by the same invariant
+    /// `phase_hint_epoch` documents. Memoizing VALUES (unlike the
+    /// seeder's write skip) preserves the search trajectory
+    /// byte-for-byte, so it applies below the epoch size gate where
+    /// the per-quiescence O(atoms) re-query is the top profile leaf
+    /// on decision-dense small files (QF_AUFLIA swap). Behind
+    /// `RefCell` because `suggest_phase` takes `&self`.
+    pub(super) suggest_phase_memo:
+        std::cell::RefCell<ay_core::kani_compat::DetHashMap<TermId, (u64, Option<bool>)>>,
+    /// Static prefix outcomes for `suggest_phase_with_arrays`
+    /// (#combiner-suggest-static): the two shape tests at its head
+    /// (array-sorted equality, simple-side equality, select/store
+    /// inequality) are pure functions of immutable term shape, so
+    /// their verdict — return a fixed phase or delegate to the
+    /// arithmetic lane — never expires, unlike the epoch-keyed memo
+    /// above. On backtrack-dense search the phase epoch turns over
+    /// at nearly every check, so this layer is what actually
+    /// absorbs the per-quiescence re-query volume.
+    pub(super) suggest_prefix_static:
+        std::cell::RefCell<ay_core::kani_compat::DetHashMap<TermId, StaticPhasePrefix>>,
     /// Array epoch at which `arrays.check()` last returned `Sat` and emitted no
     /// new equalities. When equal to `array_epoch`, the next N-O iteration can
     /// skip the array step entirely.
@@ -443,6 +481,10 @@ pub struct TheoryCombiner<'a> {
     pub(super) dt_d2: Option<ay_dt::DtSplitOnDemand>,
 }
 
+/// Equalities recorded between stop polls in
+/// [`TheoryCombiner::record_cross_theory_equalities`].
+const CROSS_REPLAY_STOP_POLL_STRIDE: usize = 64;
+
 impl<'a> TheoryCombiner<'a> {
     /// M-A2 lazy-persistent-combiner: rebind the live combiner onto a SUPERSET
     /// (append-extended) term store so it can FOLLOW the executor's append-only
@@ -563,6 +605,8 @@ impl<'a> TheoryCombiner<'a> {
             lra: None,
             arrays: Some(arrays),
             array_epoch: 0,
+            suggest_phase_memo: std::cell::RefCell::default(),
+            suggest_prefix_static: std::cell::RefCell::default(),
             array_quiescent_epoch: None,
             // Legacy-on by default; the QF_AX solve route demotes the lanes
             // for the shapes where they are measured pure overhead via
@@ -638,6 +682,8 @@ impl<'a> TheoryCombiner<'a> {
             lra: None,
             arrays: None,
             array_epoch: 0,
+            suggest_phase_memo: std::cell::RefCell::default(),
+            suggest_prefix_static: std::cell::RefCell::default(),
             array_quiescent_epoch: None,
             interface: Some(InterfaceBridge::new()),
             scope_depth: 0,
@@ -703,6 +749,8 @@ impl<'a> TheoryCombiner<'a> {
             lra: Some(lra),
             arrays: None,
             array_epoch: 0,
+            suggest_phase_memo: std::cell::RefCell::default(),
+            suggest_prefix_static: std::cell::RefCell::default(),
             array_quiescent_epoch: None,
             interface: Some(InterfaceBridge::new()),
             scope_depth: 0,
@@ -771,6 +819,8 @@ impl<'a> TheoryCombiner<'a> {
             lra: None,
             arrays: Some(arrays),
             array_epoch: 0,
+            suggest_phase_memo: std::cell::RefCell::default(),
+            suggest_prefix_static: std::cell::RefCell::default(),
             array_quiescent_epoch: None,
             interface: Some(InterfaceBridge::new()),
             scope_depth: 0,
@@ -839,6 +889,8 @@ impl<'a> TheoryCombiner<'a> {
             lra: Some(lra),
             arrays: Some(arrays),
             array_epoch: 0,
+            suggest_phase_memo: std::cell::RefCell::default(),
+            suggest_prefix_static: std::cell::RefCell::default(),
             array_quiescent_epoch: None,
             interface: Some(InterfaceBridge::new()),
             scope_depth: 0,
@@ -1184,7 +1236,19 @@ impl<'a> TheoryCombiner<'a> {
         if ay_sys::process_memory_exceeded() {
             return true;
         }
-        false
+        // Portfolio lane memory share (per-thread group entered by the CHC
+        // portfolio): the trip cancels only the lane's own token, which no
+        // executor interrupt handle observes, so it is polled here directly.
+        // Same cost class and the same soundness argument as the ceiling.
+        if ay_sys::current_memory_group_soft_tripped() {
+            return true;
+        }
+        // The check this combiner runs in: the process cancel and the
+        // executor's live per-check deadline, for combiners built without
+        // their own deadline. AUFLIA Rodin `smt2370683544275539232` sat in
+        // N-O rounds (`record_cross_theory_equalities`) past `-T:30` until
+        // the watchdog's hard exit. Same soundness argument: Unknown only.
+        ay_core::resource::check_stop_requested()
     }
 
     // Model extraction and LIA state preservation: see combiner_models.rs
@@ -1207,16 +1271,63 @@ impl<'a> TheoryCombiner<'a> {
         }
     }
 
+    /// Unmemoized phase suggestion (#combiner-suggest-memo): the
+    /// trait `suggest_phase` wraps this with the epoch-keyed memo.
+    fn suggest_phase_compute(&self, atom: TermId) -> Option<bool> {
+        if self.arrays.is_some() {
+            return self.suggest_phase_with_arrays(atom);
+        }
+        if let Some(lia) = &self.lia {
+            return lia.suggest_phase(atom);
+        }
+        if let Some(lra) = &self.lra {
+            return lra.suggest_phase(atom);
+        }
+        None
+    }
+
     fn suggest_phase_with_arrays(&self, atom: TermId) -> Option<bool> {
+        // #combiner-suggest-static: the shape prefix is a pure
+        // function of term shape; memoize its verdict forever.
+        let prefix = match self
+            .suggest_prefix_static
+            .try_borrow()
+            .ok()
+            .and_then(|m| m.get(&atom).copied())
+        {
+            Some(p) => p,
+            None => {
+                let p = self.suggest_phase_prefix_compute(atom);
+                if let Ok(mut m) = self.suggest_prefix_static.try_borrow_mut() {
+                    m.insert(atom, p);
+                }
+                p
+            }
+        };
+        match prefix {
+            StaticPhasePrefix::Fixed(phase) => return phase,
+            StaticPhasePrefix::Delegate => {}
+        }
+        if let Some(lia) = &self.lia {
+            return lia.suggest_phase(atom);
+        }
+        if let Some(lra) = &self.lra {
+            return lra.suggest_phase(atom);
+        }
+        None
+    }
+
+    /// Unmemoized static shape prefix of `suggest_phase_with_arrays`.
+    fn suggest_phase_prefix_compute(&self, atom: TermId) -> StaticPhasePrefix {
         if let TermData::App(ref sym, ref args) = self.terms.get(atom) {
             if sym.name() == "=" && args.len() == 2 {
                 if matches!(self.terms.sort(args[0]), Sort::Array(_)) {
-                    return None;
+                    return StaticPhasePrefix::Fixed(None);
                 }
                 let lhs_is_simple = !is_select_or_store(self.terms, args[0]);
                 let rhs_is_simple = !is_select_or_store(self.terms, args[1]);
                 if lhs_is_simple && rhs_is_simple {
-                    return Some(false);
+                    return StaticPhasePrefix::Fixed(Some(false));
                 }
             }
         }
@@ -1227,16 +1338,10 @@ impl<'a> TheoryCombiner<'a> {
                 && (arg_involves_select_or_store(self.terms, args[0])
                     || arg_involves_select_or_store(self.terms, args[1]))
             {
-                return None;
+                return StaticPhasePrefix::Fixed(None);
             }
         }
-        if let Some(lia) = &self.lia {
-            return lia.suggest_phase(atom);
-        }
-        if let Some(lra) = &self.lra {
-            return lra.suggest_phase(atom);
-        }
-        None
+        StaticPhasePrefix::Delegate
     }
 }
 
@@ -1944,7 +2049,18 @@ impl TheoryCombiner<'_> {
         let mut removed: Vec<bool> = vec![false; self.cross_theory_equality_replays.len()];
         let mut mutated = false;
 
-        for eq in equalities {
+        for (index, eq) in equalities.iter().enumerate() {
+            // One batch can be thousands of equalities, each a reachability
+            // search over the retained replays: AUFLIA Rodin
+            // `smt2370683544275539232` (`--z3-mode -T:30`) was inside a single
+            // batch past the deadline until the watchdog's hard exit (sampled
+            // 684 of 790). The N-O loop polls only between rounds. Replays
+            // are a cache of equalities whose reasons hold; leaving the rest
+            // of a stopped check's batch unrecorded loses propagation, never
+            // soundness, and the round's own poll then ends the check.
+            if index % CROSS_REPLAY_STOP_POLL_STRIDE == 0 && index > 0 && self.is_interrupted() {
+                break;
+            }
             let mut reason = eq.reason.clone();
             reason.sort_by_key(|lit| (lit.term.0, lit.value));
             reason.dedup_by_key(|lit| (lit.term, lit.value));
@@ -2253,18 +2369,38 @@ impl TheoryCombiner<'_> {
         }
     }
 
+    /// Stable imported-prefix union for array replay intake. Imported duplicates
+    /// keep their exact positions; persistent entries append once only when
+    /// their full endpoint AND reason payload is absent. Borrowed set keys
+    /// avoid cloning reason vectors solely for membership testing.
+    pub(super) fn stable_array_replay_union(
+        imported: &[ArrayPropagatedEqualityReplay],
+        persistent: &[ArrayPropagatedEqualityReplay],
+    ) -> Vec<ArrayPropagatedEqualityReplay> {
+        let mut replays = imported.to_vec();
+        let mut seen: DetHashSet<&ArrayPropagatedEqualityReplay> = imported.iter().collect();
+        for replay in persistent {
+            if seen.insert(replay) {
+                replays.push(replay.clone());
+            }
+        }
+        replays
+    }
+
     pub(crate) fn replay_valid_array_equalities_to_euf(&mut self) -> usize {
         if self.imported_array_equality_replays.is_empty() && self.array_equality_replays.is_empty()
         {
             return 0;
         }
 
-        let mut replays = self.imported_array_equality_replays.clone();
-        for replay in &self.array_equality_replays {
-            if !replays.contains(replay) {
-                replays.push(replay.clone());
-            }
-        }
+        // Same stable union as the adjacent cross-theory intake, without the
+        // per-entry deep Vec::contains scan. Do not dedup the imported prefix
+        // or identify replays only by endpoints: reason payloads and repeat
+        // delivery counts remain part of the existing intake contract.
+        let replays = Self::stable_array_replay_union(
+            &self.imported_array_equality_replays,
+            &self.array_equality_replays,
+        );
 
         let mut replayed = 0usize;
         let mut seeded = DetHashSet::default();
@@ -2605,9 +2741,7 @@ impl TheorySolver for TheoryCombiner<'_> {
                 self.lia_bcp_dirty = true;
             }
             if let Some(interface) = &mut self.interface {
-                interface.track_interface_term(self.terms, literal);
-                interface.collect_int_constants(self.terms, literal);
-                interface.track_uf_arith_args(self.terms, literal);
+                interface.track_int_literal(self.terms, literal);
             }
         } else if let Some(lra) = &mut self.lra {
             if self.arrays.is_some() {
@@ -2628,9 +2762,7 @@ impl TheorySolver for TheoryCombiner<'_> {
                         lra.assert_shared_disequality(lhs, rhs, &[reason]);
                     }
                     if let Some(interface) = &mut self.interface {
-                        interface.track_interface_term(self.terms, literal);
-                        interface.collect_real_constants(self.terms, literal);
-                        interface.track_uf_arith_args(self.terms, literal);
+                        interface.track_real_literal(self.terms, literal);
                     }
                     return;
                 }
@@ -2655,9 +2787,7 @@ impl TheorySolver for TheoryCombiner<'_> {
                 }
             }
             if let Some(interface) = &mut self.interface {
-                interface.track_interface_term(self.terms, literal);
-                interface.collect_real_constants(self.terms, literal);
-                interface.track_uf_arith_args(self.terms, literal);
+                interface.track_real_literal(self.terms, literal);
             }
         }
     }
@@ -2713,6 +2843,7 @@ impl TheorySolver for TheoryCombiner<'_> {
         self.replay_valid_cross_theory_equalities();
         self.replay_valid_euf_array_notifications();
         self.replay_valid_array_equalities_to_euf();
+        super::theory_stats::inc_combiner_check();
         let __no_result = self.nelson_oppen_check();
         // Candidate-REJECTION diagnosis (env-gated `AY_REJECT_INSTRUMENT`,
         // verdict-neutral): categorise what the N-O combiner returns for each
@@ -3060,16 +3191,32 @@ impl TheorySolver for TheoryCombiner<'_> {
     }
 
     fn suggest_phase(&self, atom: TermId) -> Option<bool> {
-        if self.arrays.is_some() {
-            return self.suggest_phase_with_arrays(atom);
+        // #combiner-suggest-memo: see the field doc. The epoch is the
+        // ungated arithmetic phase epoch (0 when no arithmetic lane
+        // exists — suggestions are then static term shape only).
+        let epoch = if let Some(lia) = &self.lia {
+            lia.phase_epoch_unchecked()
+        } else if let Some(lra) = &self.lra {
+            lra.phase_hint_epoch().unwrap_or(0)
+        } else {
+            0
+        };
+        // Per-entry epoch stamps: a hit requires the stored stamp to
+        // match the current epoch, so epoch turns never pay an
+        // O(capacity) map clear — stale entries are overwritten in
+        // place on their next query.
+        if let Ok(memo) = self.suggest_phase_memo.try_borrow() {
+            if let Some(&(stamp, cached)) = memo.get(&atom) {
+                if stamp == epoch {
+                    return cached;
+                }
+            }
         }
-        if let Some(lia) = &self.lia {
-            return lia.suggest_phase(atom);
+        let fresh = self.suggest_phase_compute(atom);
+        if let Ok(mut memo) = self.suggest_phase_memo.try_borrow_mut() {
+            memo.insert(atom, (epoch, fresh));
         }
-        if let Some(lra) = &self.lra {
-            return lra.suggest_phase(atom);
-        }
-        None
+        fresh
     }
 
     fn suggest_decision_atom(&self) -> Option<(TermId, bool)> {
@@ -3183,6 +3330,17 @@ impl TheorySolver for TheoryCombiner<'_> {
         }
     }
 
+    fn reacknowledge_applied_theory_lemma(
+        &mut self,
+        clause: &[TheoryLit],
+    ) -> ay_core::TheoryLemmaReplay {
+        self.arrays
+            .as_mut()
+            .map_or(ay_core::TheoryLemmaReplay::Unchanged, |arrays| {
+                arrays.reacknowledge_applied_theory_lemma(clause)
+            })
+    }
+
     fn supports_farkas_semantic_check(&self) -> bool {
         self.lra.is_some()
     }
@@ -3236,6 +3394,26 @@ impl TheorySolver for TheoryCombiner<'_> {
         // EUF declines anything without its magic).
         if let Some(lia) = &mut self.lia {
             if let Some(result) = lia.explain_propagation(lit, reason_data) {
+                return Some(result);
+            }
+        }
+        if let Some(lra) = &mut self.lra {
+            if let Some(result) = lra.explain_propagation(lit, reason_data) {
+                return Some(result);
+            }
+        }
+        self.euf.explain_propagation(lit, reason_data)
+    }
+
+    fn explain_level0_propagation(
+        &mut self,
+        lit: TermId,
+        reason_data: u64,
+    ) -> Option<Vec<TheoryLit>> {
+        // Same cascade as `explain_propagation`, but LIA answers for the lazy
+        // propagations of its inner LRA (`LiaSolver::explain_level0_propagation`).
+        if let Some(lia) = &mut self.lia {
+            if let Some(result) = lia.explain_level0_propagation(lit, reason_data) {
                 return Some(result);
             }
         }

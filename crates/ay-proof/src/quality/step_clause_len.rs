@@ -7,6 +7,8 @@ fn step_clause_len(step: &ProofStep) -> usize {
         ProofStep::Assume(_) => 1,
         ProofStep::Resolution { clause, .. }
         | ProofStep::TheoryLemma { clause, .. }
+        | ProofStep::FiniteFieldLinear { clause, .. }
+        | ProofStep::NraSos { clause, .. }
         | ProofStep::Step { clause, .. } => clause.len(),
         ProofStep::Anchor { .. } => 0,
         _ => 0,

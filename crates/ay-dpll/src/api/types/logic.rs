@@ -83,6 +83,8 @@ pub enum Logic {
     QfUfnira,
     /// Quantifier-free IEEE 754 floating-point
     QfFp,
+    /// Quantifier-free prime-field arithmetic (bounded native slice).
+    QfFf,
     /// Quantifier-free bitvectors + floating-point
     QfBvfp,
     /// Quantifier-free arrays + bitvectors + floating-point
@@ -180,6 +182,7 @@ impl Logic {
             Self::QfUfnra => "QF_UFNRA",
             Self::QfUfnira => "QF_UFNIRA",
             Self::QfFp => "QF_FP",
+            Self::QfFf => "QF_FF",
             Self::QfBvfp => "QF_BVFP",
             Self::QfAbvfp => "QF_ABVFP",
             Self::QfS => "QF_S",
@@ -250,6 +253,7 @@ impl std::str::FromStr for Logic {
             "QF_UFNRA" | "QF_AUFNRA" => Ok(Self::QfUfnra),
             "QF_UFNIRA" | "QF_AUFNIRA" => Ok(Self::QfUfnira),
             "QF_FP" | "QF_FPLRA" => Ok(Self::QfFp),
+            "QF_FF" => Ok(Self::QfFf),
             "QF_BVFP" | "QF_FPBV" => Ok(Self::QfBvfp),
             "QF_ABVFP" | "QF_AFPBV" => Ok(Self::QfAbvfp),
             "QF_S" => Ok(Self::QfS),
@@ -311,6 +315,11 @@ impl SortExt for Sort {
             Self::Bool => CmdSort::Simple("Bool".to_string()),
             Self::Int => CmdSort::Simple("Int".to_string()),
             Self::Real => CmdSort::Simple("Real".to_string()),
+            Self::Complex => CmdSort::Simple("Complex".to_string()),
+            Self::FiniteField(field) => CmdSort::Indexed(
+                "FiniteField".into(),
+                vec![CmdIndex::Numeral(field.modulus().to_string())],
+            ),
             Self::BitVec(bv) => CmdSort::Indexed(
                 "BitVec".to_string(),
                 vec![CmdIndex::Numeral(bv.width.to_string())],

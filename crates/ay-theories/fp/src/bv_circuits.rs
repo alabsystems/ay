@@ -8,7 +8,12 @@
 //! helpers from `gates.rs`.
 
 use ay_core::{CnfClause, CnfLit};
+use num_bigint::BigInt;
 
+use crate::construction::control::{uninterrupted, BuildControl};
+use crate::construction::FpBuildStage;
+
+use super::gates::neg_lit;
 use super::FpSolver;
 
 impl FpSolver<'_> {
@@ -19,7 +24,7 @@ impl FpSolver<'_> {
             return lit;
         }
         let v = self.fresh_var();
-        self.add_clause(CnfClause::unit(-v));
+        self.add_clause(CnfClause::unit(neg_lit(v)));
         self.cached_false = Some(v);
         v
     }
@@ -39,15 +44,48 @@ impl FpSolver<'_> {
     /// Create a constant bitvector of given width from a u64 value.
     /// Bit 0 is the LSB.
     pub(crate) fn const_bv(&mut self, value: u64, width: usize) -> Vec<CnfLit> {
-        (0..width)
-            .map(|i| {
-                if i < 64 && (value >> i) & 1 == 1 {
-                    self.const_true()
-                } else {
-                    self.const_false()
-                }
-            })
-            .collect()
+        let mut bits = Vec::new();
+        // A capacity hint only: on failure `push` grows the vector as before.
+        let _ = bits.try_reserve_exact(width);
+        for i in 0..width {
+            bits.push(if i < 64 && (value >> i) & 1 == 1 {
+                self.const_true()
+            } else {
+                self.const_false()
+            });
+        }
+        bits
+    }
+
+    /// Encode a signed host integer, sign-extending beyond 64 bits. Effective
+    /// FP exponents have two guard bits, so a 63-bit format needs 65 bits here.
+    pub(crate) fn const_bv_signed(&mut self, value: i64, width: usize) -> Vec<CnfLit> {
+        let mut bits = self.const_bv(value as u64, width.min(64));
+        if width > 64 {
+            let sign = if value < 0 {
+                self.const_true()
+            } else {
+                self.const_false()
+            };
+            bits.resize(width, sign);
+        }
+        bits
+    }
+
+    /// Create an exact-width constant without truncating it to a host word.
+    /// As with BV literals, bit 0 is the LSB and excess high bits are omitted.
+    pub(crate) fn const_bv_bigint(&mut self, value: &BigInt, width: usize) -> Vec<CnfLit> {
+        let mut bits = Vec::new();
+        // Match const_bv's existing capacity-hint behavior.
+        let _ = bits.try_reserve_exact(width);
+        for i in 0..width {
+            bits.push(if value.bit(i as u64) {
+                self.const_true()
+            } else {
+                self.const_false()
+            });
+        }
+        bits
     }
 
     /// Zero-extend a bitvector by prepending `extra` zero bits at the MSB.
@@ -60,13 +98,36 @@ impl FpSolver<'_> {
         result
     }
 
+    /// Resize an UNSIGNED bitvector to `width` bits: zero-extend, or drop high
+    /// bits. Dropping is exact only when the caller knows the value fits.
+    pub(crate) fn resize_unsigned(&mut self, bits: &[CnfLit], width: usize) -> Vec<CnfLit> {
+        if bits.len() >= width {
+            bits[..width].to_vec()
+        } else {
+            self.zero_extend(bits, width - bits.len())
+        }
+    }
+
+    /// The number of bits an unsigned `value` needs (at least 1).
+    pub(crate) const fn bits_to_hold(value: u64) -> usize {
+        let bits = (u64::BITS - value.leading_zeros()) as usize;
+        if bits == 0 {
+            1
+        } else {
+            bits
+        }
+    }
+
     /// Sign-extend a bitvector by replicating the MSB.
     pub(crate) fn sign_extend(&mut self, bits: &[CnfLit], extra: usize) -> Vec<CnfLit> {
         debug_assert!(
             !bits.is_empty(),
             "invariant: sign_extend requires non-empty input"
         );
-        let msb = bits[bits.len() - 1];
+        // A zero-width vector has value 0, whose extension is all zeros.
+        let Some(&msb) = bits.last() else {
+            return self.zero_extend(bits, extra);
+        };
         let mut result = bits.to_vec();
         for _ in 0..extra {
             result.push(msb);
@@ -99,11 +160,12 @@ impl FpSolver<'_> {
     /// Ripple-carry addition of two bitvectors. Result has same width as inputs.
     pub(crate) fn bv_add(&mut self, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
         debug_assert_eq!(a.len(), b.len());
-        let n = a.len();
-        let mut result = Vec::with_capacity(n);
+        let mut result = Vec::new();
+        // A capacity hint only: on failure `push` grows the vector as before.
+        let _ = result.try_reserve_exact(a.len());
         let mut carry = self.const_false();
-        for i in 0..n {
-            let (sum, cout) = self.full_adder(a[i], b[i], carry);
+        for (&ai, &bi) in a.iter().zip(b) {
+            let (sum, cout) = self.full_adder(ai, bi, carry);
             result.push(sum);
             carry = cout;
         }
@@ -112,7 +174,7 @@ impl FpSolver<'_> {
 
     /// Negate a bitvector (two's complement).
     pub(crate) fn bv_neg(&mut self, a: &[CnfLit]) -> Vec<CnfLit> {
-        let inverted: Vec<CnfLit> = a.iter().map(|&lit| -lit).collect();
+        let inverted: Vec<CnfLit> = a.iter().map(|&lit| neg_lit(lit)).collect();
         let one = self.const_bv(1, a.len());
         self.bv_add(&inverted, &one)
     }
@@ -121,6 +183,28 @@ impl FpSolver<'_> {
     pub(crate) fn bv_sub(&mut self, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
         let neg_b = self.bv_neg(b);
         self.bv_add(a, &neg_b)
+    }
+
+    /// Subtraction with borrow indication: returns `(a - b, a >= b)`.
+    ///
+    /// One adder pass (`a + ~b + 1`): the final carry-out is 1 exactly
+    /// when `a >= b` unsigned. Functionally identical difference bits
+    /// to [`Self::bv_sub`]; used by the restoring divider, where the
+    /// previous form rebuilt `bv_neg(b)` (a full-width incrementer)
+    /// and a separate full-width comparator on every one of the `n`
+    /// iterations — measured at width 161 (one double `fp.div`):
+    /// 227k SAT vars before this change. (#fp-div-borrow)
+    pub(crate) fn bv_sub_with_ge(&mut self, a: &[CnfLit], b: &[CnfLit]) -> (Vec<CnfLit>, CnfLit) {
+        debug_assert_eq!(a.len(), b.len());
+        let mut result = Vec::new();
+        let _ = result.try_reserve_exact(a.len());
+        let mut carry = self.const_true();
+        for (&ai, &bi) in a.iter().zip(b) {
+            let (sum, cout) = self.full_adder(ai, neg_lit(bi), carry);
+            result.push(sum);
+            carry = cout;
+        }
+        (result, carry)
     }
 
     /// Bitwise OR of two bitvectors.
@@ -134,17 +218,32 @@ impl FpSolver<'_> {
 
     /// Multiplication of two bitvectors. Result has same width as inputs.
     pub(crate) fn bv_mul(&mut self, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
+        uninterrupted(|control| self.bv_mul_with_control(a, b, control))
+    }
+
+    /// The shared multiplier, with refusal before allocating each row.
+    pub(crate) fn bv_mul_with_control<C: BuildControl>(
+        &mut self,
+        a: &[CnfLit],
+        b: &[CnfLit],
+        control: &mut C,
+    ) -> Result<Vec<CnfLit>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::MultiplyRow))?;
         debug_assert_eq!(a.len(), b.len());
         let n = a.len();
         if n == 0 {
-            return vec![];
+            control.checkpoint(self.construction_progress(FpBuildStage::MultiplyRow))?;
+            return Ok(vec![]);
         }
         // Shift-and-add multiplier
         let zero = self.const_false();
         let mut acc = vec![zero; n];
         for (i, &b_bit) in b.iter().enumerate() {
+            control.checkpoint(self.construction_progress(FpBuildStage::MultiplyRow))?;
             // partial product: a[j] & b[i], for positions where i+j < n
-            let mut partial = Vec::with_capacity(n);
+            let mut partial = Vec::new();
+            // A capacity hint only: on failure `push` grows the vector as before.
+            let _ = partial.try_reserve_exact(n);
             for &a_bit in a.iter().take(n.saturating_sub(i)) {
                 partial.push(self.make_and(a_bit, b_bit));
             }
@@ -154,11 +253,12 @@ impl FpSolver<'_> {
             }
             // Shift left by i: prepend i zeros, truncate to n bits
             let mut shifted = vec![zero; i];
-            shifted.extend_from_slice(&partial[..n.saturating_sub(i)]);
+            shifted.extend(partial.iter().take(n.saturating_sub(i)));
             shifted.truncate(n);
             acc = self.bv_add(&acc, &shifted);
         }
-        acc
+        control.checkpoint(self.construction_progress(FpBuildStage::MultiplyRow))?;
+        Ok(acc)
     }
 
     /// Logical right shift by a symbolic amount (barrel shifter).
@@ -181,12 +281,15 @@ impl FpSolver<'_> {
                 current = self.make_ite_bits(overflow, &all_zero, &current);
                 break;
             }
-            let mut shifted = Vec::with_capacity(n);
+            let mut shifted = Vec::new();
+            // A capacity hint only: on failure `push` grows the vector as before.
+            let _ = shifted.try_reserve_exact(n);
             for j in 0..n {
-                if j + shift_amount < n {
-                    shifted.push(current[j + shift_amount]);
-                } else {
-                    shifted.push(zero);
+                // `current` is n bits wide, so the source bit exists iff
+                // `j + shift_amount < n`.
+                match j.checked_add(shift_amount).and_then(|k| current.get(k)) {
+                    Some(&bit) => shifted.push(bit),
+                    None => shifted.push(zero),
                 }
             }
             current = self.make_ite_bits(b_bit, &shifted, &current);
@@ -211,12 +314,14 @@ impl FpSolver<'_> {
                 current = self.make_ite_bits(overflow, &all_zero, &current);
                 break;
             }
-            let mut shifted = Vec::with_capacity(n);
+            let mut shifted = Vec::new();
+            // A capacity hint only: on failure `push` grows the vector as before.
+            let _ = shifted.try_reserve_exact(n);
             for j in 0..n {
-                if j >= shift_amount {
-                    shifted.push(current[j - shift_amount]);
-                } else {
-                    shifted.push(zero);
+                // The source bit exists iff `j >= shift_amount`.
+                match j.checked_sub(shift_amount).and_then(|k| current.get(k)) {
+                    Some(&bit) => shifted.push(bit),
+                    None => shifted.push(zero),
                 }
             }
             current = self.make_ite_bits(b_bit, &shifted, &current);
@@ -238,6 +343,17 @@ impl FpSolver<'_> {
         a: &[CnfLit],
         b: &[CnfLit],
     ) -> (Vec<CnfLit>, Vec<CnfLit>) {
+        uninterrupted(|control| self.bv_udiv_urem_with_control(a, b, control))
+    }
+
+    /// The shared restoring divider, with refusal before allocating each row.
+    pub(crate) fn bv_udiv_urem_with_control<C: BuildControl>(
+        &mut self,
+        a: &[CnfLit],
+        b: &[CnfLit],
+        control: &mut C,
+    ) -> Result<(Vec<CnfLit>, Vec<CnfLit>), C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::DivideRow))?;
         let n = a.len();
         debug_assert_eq!(n, b.len());
         debug_assert!(n > 0);
@@ -255,19 +371,20 @@ impl FpSolver<'_> {
         let mut quot = vec![zero; n];
 
         for i in (0..n).rev() {
+            control.checkpoint(self.construction_progress(FpBuildStage::DivideRow))?;
             // Shift remainder left by 1 and bring in dividend bit a[i]
-            let mut shifted_rem = Vec::with_capacity(n);
+            let mut shifted_rem = Vec::new();
+            // A capacity hint only: on failure `push` grows the vector as before.
+            let _ = shifted_rem.try_reserve_exact(n);
             shifted_rem.push(a[i]); // LSB = next dividend bit
-            shifted_rem.extend_from_slice(&rem[..n - 1]); // shift up
+            if let Some((_, below_msb)) = rem.split_last() {
+                // Shift up: every bit of the n-bit remainder but its MSB.
+                shifted_rem.extend_from_slice(below_msb);
+            }
 
-            // Trial subtraction: trial = shifted_rem - b
-            let trial = self.bv_sub(&shifted_rem, b);
-
-            // Borrow/sign: if trial MSB (sign bit in n-bit two's complement)
-            // indicates a negative result, the subtraction underflowed.
-            // Actually for unsigned subtraction, borrow = carry_out complement.
-            // We use the unsigned comparison: shifted_rem >= b iff no borrow.
-            let ge = self.make_unsigned_ge(&shifted_rem, b);
+            // Trial subtraction: trial = shifted_rem - b, with the
+            // carry-out giving `shifted_rem >= b` directly (#fp-div-borrow).
+            let (trial, ge) = self.bv_sub_with_ge(&shifted_rem, b);
 
             // quotient bit
             quot[i] = ge;
@@ -276,35 +393,37 @@ impl FpSolver<'_> {
             rem = self.make_ite_bits(ge, &trial, &shifted_rem);
         }
 
-        (quot, rem)
+        control.checkpoint(self.construction_progress(FpBuildStage::DivideRow))?;
+        Ok((quot, rem))
     }
 
     /// Unsigned greater-than-or-equal comparison: a >= b.
     pub(crate) fn make_unsigned_ge(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         // a >= b  iff  NOT (a < b)
         let a_lt_b = self.make_unsigned_lt(a, b);
-        -a_lt_b
+        neg_lit(a_lt_b)
     }
 
     /// Unsigned less-than comparison: a < b.
     pub(crate) fn make_unsigned_lt(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         debug_assert_eq!(a.len(), b.len());
-        if a.is_empty() {
+        let mut pairs = a.iter().zip(b);
+        let Some((&a_lsb, &b_lsb)) = pairs.next() else {
             let result = self.fresh_var();
-            self.add_clause(CnfClause::unit(-result));
+            self.add_clause(CnfClause::unit(neg_lit(result)));
             return result;
-        }
+        };
 
         // Iterate LSB→MSB so the MSB (highest weight) gets final priority.
         // At each bit: result = (a[i]<b[i]) || (a[i]==b[i] && prev_result).
         // The last-processed bit (MSB) overrides all lower bits.
-        let not_a_lsb = -a[0];
-        let mut result = self.make_and(not_a_lsb, b[0]);
+        let not_a_lsb = neg_lit(a_lsb);
+        let mut result = self.make_and(not_a_lsb, b_lsb);
 
-        for i in 1..a.len() {
-            let not_a_i = -a[i];
-            let bit_lt = self.make_and(not_a_i, b[i]);
-            let bit_eq = self.make_xnor(a[i], b[i]);
+        for (&a_i, &b_i) in pairs {
+            let not_a_i = neg_lit(a_i);
+            let bit_lt = self.make_and(not_a_i, b_i);
+            let bit_eq = self.make_xnor(a_i, b_i);
             let bit_eq_and_result = self.make_and(bit_eq, result);
             result = self.make_or(bit_lt, bit_eq_and_result);
         }
@@ -315,25 +434,29 @@ impl FpSolver<'_> {
     /// Signed less-than comparison (two's complement).
     pub(crate) fn bv_slt(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         debug_assert_eq!(a.len(), b.len());
-        let n = a.len();
-        debug_assert!(n > 0);
+        debug_assert!(!a.is_empty());
         // a < b signed iff:
         // (a_msb=1, b_msb=0) => true (a is negative, b positive)
         // (a_msb=0, b_msb=1) => false
         // (same MSB) => unsigned(a[n-2:0]) < unsigned(b[n-2:0])
-        let a_neg = a[n - 1];
-        let b_pos = -b[n - 1];
+        let (Some((&a_msb, a_low)), Some((&b_msb, b_low))) = (a.split_last(), b.split_last())
+        else {
+            // Zero-width vectors both have value 0, and 0 < 0 is false.
+            return self.const_false();
+        };
+        let a_neg = a_msb;
+        let b_pos = neg_lit(b_msb);
         let case1 = self.make_and(a_neg, b_pos);
 
-        let a_pos = -a[n - 1];
-        let b_neg = b[n - 1];
+        let a_pos = neg_lit(a_msb);
+        let b_neg = b_msb;
         let case2 = self.make_and(a_pos, b_neg);
 
-        let same_msb = self.make_xnor(a[n - 1], b[n - 1]);
-        let lower_lt = self.make_unsigned_lt(&a[..n - 1], &b[..n - 1]);
+        let same_msb = self.make_xnor(a_msb, b_msb);
+        let lower_lt = self.make_unsigned_lt(a_low, b_low);
         let case3 = self.make_and(same_msb, lower_lt);
 
-        let not_case2 = -case2;
+        let not_case2 = neg_lit(case2);
         let case1_or_3 = self.make_or(case1, case3);
         self.make_and(not_case2, case1_or_3)
     }
@@ -341,7 +464,7 @@ impl FpSolver<'_> {
     /// Signed less-than-or-equal comparison (two's complement).
     pub(crate) fn bv_sle(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         let b_lt_a = self.bv_slt(b, a);
-        -b_lt_a
+        neg_lit(b_lt_a)
     }
 
     /// Count leading zeros of a bitvector. Result width = result_width.
@@ -358,12 +481,56 @@ impl FpSolver<'_> {
         // etc.
         // We build this as nested ITE: starting from position 0 (all zeros case)
         let mut lz = self.const_bv(n as u64, result_width);
-        for (i, &bit) in bits.iter().enumerate() {
+        // Pair bits[i] with n - 1 - i: the counts run n-1 down to 0.
+        for (&bit, count) in bits.iter().zip((0..n).rev()) {
             // If bits[i] is set, lz = (n - 1 - i)
-            let count = (n - 1 - i) as u64;
-            let count_bv = self.const_bv(count, result_width);
+            let count_bv = self.const_bv(count as u64, result_width);
             lz = self.make_ite_bits(bit, &count_bv, &lz);
         }
         lz
+    }
+}
+
+impl FpSolver<'_> {
+    /// Logical left shift under the caller's original construction controller.
+    pub(crate) fn bv_shl_with_control<C: BuildControl>(
+        &mut self,
+        a: &[CnfLit],
+        b: &[CnfLit],
+        control: &mut C,
+    ) -> Result<Vec<CnfLit>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let n = a.len();
+        let zero = self.const_false();
+        let mut current = a.to_vec();
+        for i in 0..b.len() {
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            let b_bit = b[i];
+            let shift_amount = match 1usize.checked_shl(i as u32) {
+                Some(v) => v,
+                None => n,
+            };
+            if shift_amount >= n {
+                let overflow = self.bv_or_reduce(&b[i..]);
+                let all_zero = vec![zero; n];
+                current = self.make_ite_bits(overflow, &all_zero, &current);
+                drop(all_zero);
+                control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+                break;
+            }
+            let mut shifted = Vec::new();
+            let _ = shifted.try_reserve_exact(n);
+            for j in 0..n {
+                match j.checked_sub(shift_amount).and_then(|k| current.get(k)) {
+                    Some(&bit) => shifted.push(bit),
+                    None => shifted.push(zero),
+                }
+            }
+            current = self.make_ite_bits(b_bit, &shifted, &current);
+            drop(shifted);
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        }
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(current)
     }
 }

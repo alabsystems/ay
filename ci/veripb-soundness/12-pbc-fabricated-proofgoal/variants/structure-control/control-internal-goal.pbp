@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% The second knob: the same proof with the INTERNAL goal spelling `proofgoal #1` instead of the
+% database spelling `proofgoal 1`. `pop_internal_goal` has always errored on an unregistered
+% index ("The internal proofgoal with ID #1 does not exist"), so this was refused before the
+% fix as well -- the two spellings were simply not symmetric, and the fix makes them so.
+f 1 ;
+pbc >= 1 : subproof
+proofgoal #1
+rup >= 1 ;
+qed;
+qed;
+output NONE;
+conclusion UNSAT ;
+end pseudo-Boolean proof;

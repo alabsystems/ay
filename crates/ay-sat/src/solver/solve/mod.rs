@@ -19,8 +19,10 @@
 //! - `finalize`: Result declaration and proof finalization
 
 mod analyze;
+mod assumption_unsat_proof;
 mod diagnostics;
 mod ext_conflict;
+mod extension_effects;
 mod extension_entry;
 mod finalize;
 mod finalize_sat;
@@ -33,6 +35,7 @@ mod inprocessing_incremental;
 mod inprocessing_maintenance;
 mod inprocessing_schedule;
 mod preprocessing_extension_transaction;
+mod proof_progress;
 #[cfg(test)]
 mod tests;
 mod theory_backend;
@@ -41,6 +44,7 @@ mod theory_entry;
 
 use super::config_preprocess_cleanup::PreprocessOutcome;
 use super::*;
+pub(in crate::solver) type ProofProgress<'a> = Option<&'a dyn Fn() -> bool>;
 impl Solver {
     /// Run one inprocessing pass with scoped diagnostic tracing and timing.
     #[inline]
@@ -50,6 +54,7 @@ impl Solver {
         run: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let start = ay_core::time::Instant::now();
+        let work_before = self.pass_work_baseline();
         let yield_before = self.inprocessing_yield_signal(pass);
         self.stats.record_inprocessing_run(pass);
         self.set_diagnostic_pass(pass);
@@ -57,6 +62,7 @@ impl Solver {
         self.clear_diagnostic_pass();
         let elapsed_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.stats.record_inprocessing_time(pass, elapsed_ns);
+        self.record_pass_work(work_before);
         if self.inprocessing_yield_signal(pass) > yield_before {
             self.stats.record_inprocessing_yield(pass);
         }
@@ -64,16 +70,18 @@ impl Solver {
     }
 
     #[inline]
-    pub(super) fn run_probe_inprocessing_pass(&mut self) -> bool {
+    pub(super) fn run_probe_inprocessing_pass(&mut self, should_stop: &dyn Fn() -> bool) -> bool {
         let start = ay_core::time::Instant::now();
+        let work_before = self.pass_work_baseline();
         let yield_before = self.inprocessing_yield_signal(DiagnosticPass::Probe);
         self.stats.record_inprocessing_run(DiagnosticPass::Probe);
         self.set_diagnostic_pass(DiagnosticPass::Probe);
-        let probe_unsat = self.probe();
+        let probe_unsat = self.probe_until(should_stop);
         self.clear_diagnostic_pass();
         let elapsed_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.stats
             .record_inprocessing_time(DiagnosticPass::Probe, elapsed_ns);
+        self.record_pass_work(work_before);
         if self.inprocessing_yield_signal(DiagnosticPass::Probe) > yield_before {
             self.stats.record_inprocessing_yield(DiagnosticPass::Probe);
         }
@@ -82,6 +90,9 @@ impl Solver {
 
     #[inline]
     pub(super) fn run_intree_inprocessing_pass(&mut self) -> bool {
+        if ay_core::sat_ab_switches().inproc_passes_kissat == Some(true) {
+            return false;
+        }
         let yield_before = self.inprocessing_yield_signal(DiagnosticPass::Probe);
         self.stats.record_inprocessing_run(DiagnosticPass::Probe);
         let intree_unsat = self.intree_probe();
@@ -168,6 +179,11 @@ impl Solver {
                     .saturating_add(stats.kitten_backbone)
                     .saturating_add(stats.clauses_rewritten)
             }
+            // Observability only, like Sweep: both fell through to 0, so
+            // `inproc_sbva_yields` read 0 on a run that introduced 3,649
+            // extension variables (vdwb_k6_n250, 2026-09-19).
+            DiagnosticPass::Sbva => self.cold.sbva_groups_total,
+            DiagnosticPass::Factor => self.factor_stats().factored_count,
             _ => 0,
         }
     }
@@ -243,8 +259,10 @@ impl Solver {
     /// Solve the formula
     pub fn solve(&mut self) -> SolverSatResult {
         let result = self.solve_raw();
-        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
-        SolverSatResult::from_solver_result(result)
+        if self.counted_stop_reason().is_none() {
+            self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
+        }
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Internal solve returning raw `SatResult`.
@@ -306,8 +324,10 @@ impl Solver {
         F: Fn() -> bool,
     {
         let result = self.solve_interruptible_raw(should_stop);
-        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
-        SolverSatResult::from_solver_result(result)
+        if self.counted_stop_reason().is_none() {
+            self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
+        }
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Interruptible solve without the configured dry-run artifact export.
@@ -323,11 +343,23 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
-        SolverSatResult::from_solver_result(self.solve_interruptible_raw(should_stop))
+        let result = self.solve_interruptible_raw(should_stop);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Internal interruptible solve returning raw `SatResult`.
     fn solve_interruptible_raw<F>(&mut self, should_stop: F) -> SatResult
+    where
+        F: Fn() -> bool,
+    {
+        self.solve_interruptible_raw_with_proof_progress(should_stop, None)
+    }
+
+    fn solve_interruptible_raw_with_proof_progress<F>(
+        &mut self,
+        should_stop: F,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult
     where
         F: Fn() -> bool,
     {
@@ -340,14 +372,14 @@ impl Solver {
         }
 
         if self.has_empty_clause {
-            let result = self.declare_unsat();
+            let result = self.declare_unsat_with_proof_progress(proof_progress);
             self.trace_sat_result(&result);
             self.finish_tla_trace();
             return result;
         }
 
         if self.cold.scope_selectors.is_empty() {
-            let result = self.solve_no_assumptions(should_stop);
+            let result = self.solve_no_assumptions_with_proof_progress(should_stop, proof_progress);
             self.trace_sat_result(&result);
             self.finish_tla_trace();
             return result;
@@ -386,8 +418,10 @@ impl Solver {
     /// When scope selectors are empty, falls back to normal solving.
     pub fn solve_with_phase_hints(&mut self, phase_hints: &dyn Extension) -> SolverSatResult {
         let result = self.solve_with_phase_hints_raw(phase_hints);
-        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
-        SolverSatResult::from_solver_result(result)
+        if self.counted_stop_reason().is_none() {
+            self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
+        }
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Internal phase-hint solve returning raw `SatResult`.
@@ -442,6 +476,13 @@ impl Solver {
     /// is trivially solved during initialization (empty formula, unit
     /// propagation conflict), `None` if the CDCL loop should proceed.
     pub(in crate::solver) fn init_solve(&mut self) -> Option<SatResult> {
+        self.init_solve_with_proof_progress(None)
+    }
+
+    fn init_solve_with_proof_progress(
+        &mut self,
+        proof_progress: ProofProgress<'_>,
+    ) -> Option<SatResult> {
         // Record wall-clock start time for progress and observer reporting (#8155).
         if self.cold.progress_enabled || self.has_observer() {
             self.cold.solve_start_time = Some(ay_core::time::Instant::now());
@@ -454,6 +495,11 @@ impl Solver {
         }
         self.cold.has_solved_once = true;
         self.reset_search_state();
+        if self.original_ledger_replay_failed() {
+            return Some(
+                self.declare_unknown_with_reason(SatUnknownReason::ProofFinalizationFailure),
+            );
+        }
         // CaDiCaL: init_solve must start at decision level 0
         debug_assert_eq!(
             self.decision_level, 0,
@@ -514,6 +560,8 @@ impl Solver {
                 .count();
             let ratio = binary_count as f64 / self.num_original_clauses as f64;
             self.cold.jump_reasons_enabled = ratio >= 0.99;
+            // `--sat-jump-reasons-kissat`: the gate Kissat actually applies.
+            self.reclassify_jump_reasons_kissat(true);
         }
 
         self.initialize_watches();
@@ -522,18 +570,21 @@ impl Solver {
             // Contradictory unit clauses — collect LRAT resolution chain
             // from the conflict clause so the empty-clause step has proper hints.
             self.record_level0_conflict_chain(conflict_ref);
-            return Some(self.declare_unsat());
+            return Some(self.declare_unsat_with_proof_progress(proof_progress));
         }
 
         let trail_before = self.trail.len();
-        let init_conflict = self.search_propagate();
+        let init_conflict = match self.search_propagate_counted() {
+            Ok(conflict) => conflict,
+            Err(reason) => return Some(self.declare_unknown_with_reason(reason)),
+        };
         if let Some(conflict_ref) = init_conflict {
             // Record the BCP resolution chain for proof reconstruction (#4176).
             // Standard analyze_conflict uses 1UIP which assumes decision_level > 0.
             // At level 0, use a dedicated chain recorder that just collects the
             // clause IDs involved in the BCP conflict.
             self.record_level0_conflict_chain(conflict_ref);
-            return Some(self.declare_unsat());
+            return Some(self.declare_unsat_with_proof_progress(proof_progress));
         }
         if self.cold.tla_trace.is_some() && self.trail.len() > trail_before {
             self.tla_trace_step(
@@ -549,6 +600,17 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
+        self.solve_no_assumptions_with_proof_progress(should_stop, None)
+    }
+
+    fn solve_no_assumptions_with_proof_progress<F>(
+        &mut self,
+        should_stop: F,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult
+    where
+        F: Fn() -> bool,
+    {
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
         // #8754: finalize_sat_fail_count is STICKY — see solve_raw() comment.
@@ -557,7 +619,7 @@ impl Solver {
             return self.declare_unknown_with_reason(reason);
         }
 
-        let init_result = self.init_solve();
+        let init_result = self.init_solve_with_proof_progress(proof_progress);
         if let Some(reason) = self.solve_stop_reason(&should_stop) {
             return self.declare_unknown_with_reason(reason);
         }
@@ -695,14 +757,14 @@ impl Solver {
                     if let Some(reason) = cleanup_stop {
                         return self.declare_unknown_with_reason(reason);
                     }
-                    return self.declare_unsat();
+                    return self.declare_unsat_with_proof_progress(proof_progress);
                 }
                 PreprocessOutcome::Complete => {
                     if let Some(reason) = cleanup_stop {
                         return self.declare_unknown_with_reason(reason);
                     }
                     if cleanup_unsat {
-                        return self.declare_unsat();
+                        return self.declare_unsat_with_proof_progress(proof_progress);
                     }
                 }
             }
@@ -778,14 +840,21 @@ impl Solver {
                         dense_mutex_computed_gate;
                 }
                 if active_vars < 1000 && density > 10.0 {
-                    // Small dense formulas (clique_n2_k10, pigeon hole):
-                    // disable stable-mode EMA to prevent restart storms
-                    // (#8135, #8466). Pure reluctant doubling is correct
-                    // for these combinatorial instances.
-                    self.cold.stable_ema_gate = u64::MAX;
-                    // Default behavior keeps the legacy 10-conflict floor.
-                    // The #9164 dense-mutex experiment raises this only for
-                    // opt-in, binary-heavy clique-shaped formulas.
+                    if ay_core::sat_ab_switches().stable_ema != Some(true) {
+                        // Small dense formulas (clique_n2_k10, pigeon hole):
+                        // disable stable-mode EMA to prevent restart storms
+                        // (#8135, #8466). Pure reluctant doubling is correct
+                        // for these combinatorial instances. An explicit
+                        // `--sat-stable-ema true` force wins over this band
+                        // heuristic, as with the mode-equiticks force.
+                        self.cold.stable_ema_gate = u64::MAX;
+                    }
+                    // The focused-mode floor is a separate knob: it applies
+                    // whether or not the stable EMA is forced on, so the
+                    // force stays a single-variable lever. Default behavior
+                    // keeps the legacy 10-conflict floor; the #9164
+                    // dense-mutex experiment raises this only for opt-in,
+                    // binary-heavy clique-shaped formulas.
                     self.cold.focused_restart_gate = self.cold.focused_restart_gate.max(10);
                 }
                 if self.cold.dense_mutex_focused_restart_gate_experiment
@@ -848,7 +917,18 @@ impl Solver {
         // list bloat from excessive learned clauses.
         //
         // Only set if the caller hasn't already set an explicit limit.
+        // `--sat-reduce-schedule-kissat`: Kissat reduces on its conflict limit
+        // only, first at `reduceinit` = 1,000 conflicts.
+        let kissat_reduce_schedule =
+            ay_core::sat_ab_switches().reduce_schedule_kissat == Some(true);
+        if kissat_reduce_schedule {
+            self.cold.next_reduce_db = self
+                .cold
+                .next_reduce_db
+                .max(self.num_conflicts.saturating_add(1_000));
+        }
         if self.cold.max_learned_clauses.is_none()
+            && !kissat_reduce_schedule
             && self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD
         {
             // Two-tier cap (#8655/#8448): very large formulas (>1M clauses) get
@@ -911,8 +991,15 @@ impl Solver {
             very_large && switches.large_rephase_walk.unwrap_or_default();
         self.cold.mode_equiticks_large_band =
             very_large && switches.mode_equiticks_large.unwrap_or_default();
+        // `--sat-very-large-band false` puts a formula above the threshold on
+        // the 100K-1M path below instead: no stable start, default decay,
+        // rephasing and the stable EMA left to their own switches. The band
+        // is keyed on the raw clause count, so it also takes non-BMC formulas
+        // (2c458ef3, 35.6M clauses, is 344K binaries after Kissat's
+        // simplification; E00X23 has 2.1M clauses over 15K variables).
+        let band = very_large && switches.very_large_band != Some(false);
         if self.cold.mode_lock == cold::ModeLock::None && LARGE_FORMULA_STABLE_PHASE_SCALE {
-            if self.num_original_clauses > VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD {
+            if band {
                 // Large structured formula (>1M clauses, #8655/#8448): start in
                 // stable mode directly. This matches Kissat's stabilizeonly=1
                 // behavior and the IC3 pattern (which also locks to stable mode).
@@ -1031,7 +1118,10 @@ impl Solver {
                 // is the only in-search caller), which is the divergence from
                 // kissat — kissat rephases in stable mode on formulas of any
                 // size and reaches the 'W' slots of its {B,W,I,B,W,O} cycle.
-                if self.cold.rephase_enabled && !self.cold.large_rephase_walk {
+                if self.cold.rephase_enabled
+                    && !self.cold.large_rephase_walk
+                    && !self.cold.rephase_kissat
+                {
                     tracing::info!(
                         clauses = self.num_original_clauses,
                         "disabling rephasing for large structured formula (#8655)"
@@ -1056,14 +1146,16 @@ impl Solver {
                 // Disable by setting stable_ema_gate to u64::MAX (same as the
                 // small-dense formula disable path). This matches CaDiCaL's
                 // stable-mode behavior which uses pure reluctant doubling.
-                if self.cold.stable_ema_gate != u64::MAX {
+                if self.cold.stable_ema_gate != u64::MAX && switches.stable_ema != Some(true) {
                     tracing::info!(
                         clauses = self.num_original_clauses,
                         "disabling stable-mode EMA restarts for large structured formula (#8655)"
                     );
                     self.cold.stable_ema_gate = u64::MAX;
                 }
-            } else if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
+            } else if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD
+                && switches.mode_length_kissat != Some(true)
+            {
                 // Large formula (100K-1M clauses): scale initial phase
                 // length so the solver builds better statistics before
                 // the first mode switch.
@@ -1101,7 +1193,11 @@ impl Solver {
         //
         // This also increases the rephase count base used in the NLOG3N
         // scheduling, so subsequent rephases are also spaced further apart.
-        if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
+        // `--sat-rephase-kissat`: Kissat rephases in stable mode only and
+        // first at `rephaseinit` = 1,000 conflicts whatever the formula size.
+        if self.cold.rephase_kissat {
+            self.cold.stable_only_rephase_enabled = true;
+        } else if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
             let scale = (self.num_original_clauses as f64).log10();
             let scaled_rephase = (REPHASE_INITIAL as f64 * scale) as u64;
             if scaled_rephase > self.cold.next_rephase {
@@ -1165,7 +1261,26 @@ impl Solver {
                 1.0
             };
             let limit = (INPROBE_INTERVAL as f64 * delta * scale) as u64;
+            // `--sat-probe-round-kissat`: Kissat counts preprocessing as its
+            // first probing and sets the first limit to `probeinit` 100 scaled
+            // by the clause count (probe.c:95, kimits.c:130-131).
+            let limit = if self.cold.probe_round_kissat {
+                self.cold.inprobe_phases = self.cold.inprobe_phases.max(1);
+                inprocessing_schedule::kissat_probe_interval(self.num_original_clauses as u64, 1)
+            } else {
+                limit
+            };
             self.cold.next_inprobe_conflict = self.total_conflicts().saturating_add(limit);
+            // `--sat-eliminate-cadence-kissat`: the first in-search elimination
+            // at Kissat's initial limit, whatever preprocessing did
+            // (kimits.c:123-124; preprocessing BVE is not a Kissat elimination).
+            if self.cold.eliminate_cadence_kissat {
+                let first = super::inprocessing::kissat_eliminate_interval_nlog2n(
+                    self.arena.irredundant_count() as u64,
+                    1,
+                );
+                self.inproc_ctrl.bve.next_conflict = self.num_conflicts.saturating_add(first);
+            }
         }
 
         if let Some(reason) = self.solve_stop_reason(&should_stop) {
@@ -1207,7 +1322,7 @@ impl Solver {
                         return self.declare_sat_from_current_assignment();
                     }
                     // UNSAT proven at level 0 during lucky phase
-                    return self.declare_unsat();
+                    return self.declare_unsat_with_proof_progress(proof_progress);
                 }
             }
         }
@@ -1217,12 +1332,17 @@ impl Solver {
 
         // Run warmup to initialize target phases before walk
         // Warmup uses propagation-based phase setting which is O(1) per propagation
-        self.try_warmup();
+        // `--sat-initial-phase-kissat`: no warmup, startup walk or
+        // Jeroslow-Wang seeding; every first decision is true (Kissat).
+        let seed_phases = ay_core::sat_ab_switches().initial_phase_kissat != Some(true);
+        if seed_phases {
+            self.try_warmup();
+        }
 
         // Try walk-based phase initialization for larger formulas
         // Walk uses ProbSAT to find good initial phases by minimizing unsatisfied clauses
         let walk_start = ay_core::time::Instant::now();
-        let walk_found = self.try_walk();
+        let walk_found = seed_phases && self.try_walk();
         self.stats.walk_time_ns = walk_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         if walk_found {
             // Walk found an assignment satisfying (some subset of) clauses.
@@ -1253,7 +1373,9 @@ impl Solver {
         // appears in more/shorter clauses, so assigning it true satisfies more
         // constraints. CaDiCaL computes this in phases.cpp for initial_phase=2.
         // Cost: O(total_literals), negligible even on 4M-clause formulas (~10ms).
-        self.init_jw_phases();
+        if seed_phases {
+            self.init_jw_phases();
+        }
 
         // Independent-support branching (solver/indep_support.rs): drop the
         // whitelist members preprocessing retired. The support itself was
@@ -1262,7 +1384,12 @@ impl Solver {
 
         let t0 = ay_core::time::Instant::now();
         let probe_ns_before = self.stats.indep_enum_time_ns;
-        let result = self.search_with_parked_indep_enum(should_stop);
+        // Kissat classifies at search start, after preprocessing (search.c):
+        // the gate set before preprocessing may be stale here.
+        if self.decision_level == 0 {
+            self.reclassify_jump_reasons_kissat(true);
+        }
+        let result = self.search_with_parked_indep_enum(should_stop, proof_progress);
         // The parked enumeration's slice runs inside that call; bill it to the
         // probe, not to search, so `search_time_ns` still measures search.
         let probe_ns = self.stats.indep_enum_time_ns - probe_ns_before;
@@ -1278,15 +1405,52 @@ impl Solver {
     ///
     /// With nothing parked — the whole corpus outside the admitted family —
     /// this is exactly `cdcl_loop_pure` and costs one `Option` check.
-    fn search_with_parked_indep_enum<F>(&mut self, should_stop: F) -> SatResult
+    fn search_with_parked_indep_enum<F>(
+        &mut self,
+        should_stop: F,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult
     where
         F: Fn() -> bool,
     {
         let Some(head_start_until) = self.indep_enum_head_start_until() else {
-            return self.cdcl_loop_pure(should_stop);
+            return self.cdcl_loop_pure_with_proof_progress(should_stop, proof_progress);
         };
-        let head_start_stop = || should_stop() || ay_core::time::Instant::now() >= head_start_until;
-        let searched = self.cdcl_loop_pure(&head_start_stop);
+        let searched = if self.deterministic_inproc() {
+            // Counted head start: search stops at a search-tick target through
+            // the per-conflict resource check, and reaching it reads as the
+            // wall head start's interrupt below. The caller's own conflict,
+            // decision and search-tick budgets keep their meaning: one of them
+            // reached at the same conflict ends the solve, and the enumeration
+            // does not run.
+            let head_start_ticks = self.indep_enum_head_start_ticks().unwrap_or(0);
+            self.cold.search_tick_stop =
+                Some(self.total_search_ticks().saturating_add(head_start_ticks));
+            let searched = self.cdcl_loop_pure_with_proof_progress(&should_stop, proof_progress);
+            let head_start_over = self.search_tick_stop_reached();
+            self.cold.search_tick_stop = None;
+            if matches!(searched, SatResult::Unknown)
+                && self.cold.last_unknown_reason == Some(SatUnknownReason::ResourceBudget)
+                && head_start_over
+                && !self.conflict_budget_exhausted()
+                && !self.decision_budget_exhausted()
+                && !self.caller_search_tick_stop_reached()
+            {
+                // The tick stop is checked at every conflict, before the
+                // amortized stop poll: a proof-write failure, the deadline or
+                // an interrupt that came first keeps its own reason.
+                if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                    self.cold.indep_enum_pending = None;
+                    return self.declare_unknown_with_reason(reason);
+                }
+                self.cold.last_unknown_reason = Some(SatUnknownReason::Interrupted);
+            }
+            searched
+        } else {
+            let head_start_stop =
+                || should_stop() || ay_core::time::Instant::now() >= head_start_until;
+            self.cdcl_loop_pure_with_proof_progress(&head_start_stop, proof_progress)
+        };
         // A verdict, or a stop the CALLER asked for (interrupt, deadline,
         // resource budget), ends the solve exactly as it would have without
         // the probe.
@@ -1308,7 +1472,7 @@ impl Solver {
         }
         self.cold.last_unknown_reason = None;
         self.cold.last_unknown_detail = None;
-        self.cdcl_loop_pure(should_stop)
+        self.cdcl_loop_pure_with_proof_progress(should_stop, proof_progress)
     }
 }
 

@@ -126,6 +126,8 @@ use super::Executor;
 
 #[path = "proof_fresh_def_candidates.rs"]
 mod candidates;
+#[path = "proof_divmod_def.rs"]
+mod divmod;
 use candidates::{Candidate, DefKind, Orientation};
 
 /// A candidate that survived stage A, with its chosen reading.

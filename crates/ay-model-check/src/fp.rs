@@ -57,11 +57,10 @@
 //!
 //! # Envelope
 //!
-//! [`ModelValue::FloatingPoint`] stores the exponent and significand fields in
-//! `u64`, so formats wider than that are not representable and are DECLINED
-//! here rather than truncated. `Float16`, `Float32` and `Float64` are all well
-//! inside the envelope; `Float128` (`sb = 113`) is not representable by the
-//! value type at all and declines. Separately, every `2^k` this module
+//! [`ModelValue::FloatingPoint`] stores a `u64` exponent and `u128` fraction.
+//! Formats are admitted according to the exact capacity of those fields.
+//! Wider arithmetic uses borrowed, admitted `fp_exact` plans and this same
+//! rounding kernel. Unsupported formats are DECLINED rather than truncated. Every `2^k` this module
 //! materialises is bounded by [`MAX_SHIFT`], so a pathological format or a
 //! pathological Real cannot turn a gate pass into an allocation storm. Crossing
 //! that bound turns a possible confirmation into a refusal, never the reverse.
@@ -77,11 +76,8 @@ use crate::ModelValue;
 /// practice is far inside it (`Float256` is `eb = 19`).
 const EB_MAX: u32 = 63;
 
-/// Largest significand precision handled, hidden bit included. Fixed by
-/// [`ModelValue::FloatingPoint`] storing the stored fraction in a `u64`: at
-/// `sb = 65` the field bound `1u64 << (sb - 1)` itself overflows, so the
-/// envelope stops one short of that rather than computing a wrong bound.
-const SB_MAX: u32 = 64;
+/// Significand precision including the hidden bit: 128 stored fraction bits.
+const SB_MAX: u32 = 129;
 
 /// Largest power of two this module will materialise, as an exponent.
 ///
@@ -91,7 +87,7 @@ const SB_MAX: u32 = 64;
 /// yields `Err`, which the caller fails closed on. `2^MAX_SHIFT` is a 128 KiB
 /// integer, and no in-envelope format needs a shift anywhere near it (the
 /// widest, `eb = 20`, needs about `2^19`).
-const MAX_SHIFT: i64 = 1 << 20;
+pub(crate) const MAX_SHIFT: i64 = 1 << 20;
 
 /// Marker error for a result SMT-LIB deliberately leaves UNCONSTRAINED.
 ///
@@ -167,7 +163,7 @@ pub struct Fp {
     /// Biased exponent field.
     pub(crate) exponent: u64,
     /// Stored fraction, without the hidden bit.
-    pub(crate) significand: u64,
+    pub(crate) significand: u128,
     /// Exponent-field width.
     pub(crate) eb: u32,
     /// Significand precision including the hidden bit.
@@ -204,11 +200,33 @@ fn bias_of(eb: u32) -> i64 {
 /// Whether `(eb, sb)` is a format this module can represent exactly.
 ///
 /// Checked at every entry point that takes a format from the TERM (`to_fp`'s
-/// indices) rather than from an already-validated datum: `Fp::nan(15, 113)`
-/// would shift a `u64` by 111 places, so an unchecked format is a panic, not
-/// merely a wrong answer.
+/// indices) rather than from an already-validated datum. The widest admitted
+/// fraction has 128 stored bits; unchecked formats could shift past the u128
+/// carrier and must refuse before constructing even a special value.
+pub(crate) fn format_supported(eb: u32, sb: u32) -> bool {
+    (2..=EB_MAX).contains(&eb) && (2..=SB_MAX).contains(&sb)
+}
+
+// Raw data also retains the complete u64 exponent field. Arithmetic has the
+// narrower signed-bias bound above; reading data never grants arithmetic.
+pub(crate) fn data_format_supported(eb: u32, sb: u32) -> bool {
+    (2..=64).contains(&eb) && (2..=SB_MAX).contains(&sb)
+}
+
+pub(crate) fn data_fields_fit(eb: u32, sb: u32, exponent: u64, significand: u128) -> bool {
+    data_format_supported(eb, sb)
+        && (eb == 64 || exponent < (1u64 << eb))
+        && u128::BITS - significand.leading_zeros() <= sb - 1
+}
+
+pub(crate) fn fields_fit(eb: u32, sb: u32, exponent: u64, significand: u128) -> bool {
+    format_supported(eb, sb)
+        && exponent <= all_ones(eb)
+        && u128::BITS - significand.leading_zeros() <= sb - 1
+}
+
 fn check_format(eb: u32, sb: u32) -> Result<(), String> {
-    if !(2..=EB_MAX).contains(&eb) || !(2..=SB_MAX).contains(&sb) {
+    if !format_supported(eb, sb) {
         return Err("unsupported floating-point format".to_string());
     }
     Ok(())
@@ -276,6 +294,11 @@ impl Fp {
     /// Declines an out-of-envelope format or a field that does not fit its
     /// width — a malformed payload is not something to coerce.
     pub fn from_value(value: &ModelValue) -> Result<Self, String> {
+        if matches!(value, ModelValue::FloatingPointExact { .. }) {
+            let native =
+                crate::fp_exact::native(value).ok_or("unsupported FP arithmetic field width")?;
+            return Self::from_value(&native);
+        }
         let &ModelValue::FloatingPoint {
             sign,
             exponent,
@@ -287,7 +310,7 @@ impl Fp {
             return Err("expected a floating-point value".to_string());
         };
         check_format(eb, sb)?;
-        if exponent > all_ones(eb) || significand >= (1u64 << (sb - 1)) {
+        if !fields_fit(eb, sb, exponent, significand) {
             return Err("malformed floating-point payload".to_string());
         }
         Ok(Self {
@@ -436,17 +459,7 @@ impl Fp {
         Self {
             sign: false,
             exponent: all_ones(eb),
-            significand: 1u64 << (sb - 2),
-            eb,
-            sb,
-        }
-    }
-
-    fn max_finite(sign: bool, eb: u32, sb: u32) -> Self {
-        Self {
-            sign,
-            exponent: all_ones(eb) - 1,
-            significand: (1u64 << (sb - 1)) - 1,
+            significand: 1u128 << (sb - 2),
             eb,
             sb,
         }
@@ -524,8 +537,47 @@ pub fn round_to_integer(value: &BigRational, rm: RoundingMode) -> BigInt {
     }
 }
 
+/// Rounded fields shared by the native and admitted wide carriers. Keeping
+/// one encoder prevents carry, subnormal and overflow rules from diverging.
+struct RoundedFields {
+    sign: bool,
+    exponent: u64,
+    fraction: BigInt,
+}
+impl RoundedFields {
+    fn zero(sign: bool) -> Self {
+        Self {
+            sign,
+            exponent: 0,
+            fraction: BigInt::zero(),
+        }
+    }
+    fn native(self, eb: u32, sb: u32) -> Result<Fp, String> {
+        let significand =
+            u128::try_from(self.fraction).map_err(|_| "significand out of range".to_string())?;
+        if !fields_fit(eb, sb, self.exponent, significand) {
+            return Err("rounded floating-point result is out of range".into());
+        }
+        Ok(Fp {
+            sign: self.sign,
+            exponent: self.exponent,
+            significand,
+            eb,
+            sb,
+        })
+    }
+    fn exact(self, eb: u32, sb: u32) -> Result<ModelValue, String> {
+        let (sign, fraction) = self.fraction.into_parts();
+        if sign == num_bigint::Sign::Minus {
+            return Err("negative rounded floating-point fraction".into());
+        }
+        crate::fp_exact::construct(self.sign, self.exponent.into(), fraction, eb, sb)
+            .ok_or_else(|| "rounded floating-point result is out of range".into())
+    }
+}
+
 /// IEEE-754 §7.4: which value an overflowing magnitude rounds to.
-fn overflow(negative: bool, eb: u32, sb: u32, rm: RoundingMode) -> Fp {
+fn overflow(negative: bool, eb: u32, sb: u32, rm: RoundingMode) -> RoundedFields {
     let to_infinity = match rm {
         RoundingMode::Rne | RoundingMode::Rna => true,
         RoundingMode::Rtz => false,
@@ -533,9 +585,17 @@ fn overflow(negative: bool, eb: u32, sb: u32, rm: RoundingMode) -> Fp {
         RoundingMode::Rtn => negative,
     };
     if to_infinity {
-        Fp::inf(negative, eb, sb)
+        RoundedFields {
+            sign: negative,
+            exponent: all_ones(eb),
+            fraction: BigInt::zero(),
+        }
     } else {
-        Fp::max_finite(negative, eb, sb)
+        RoundedFields {
+            sign: negative,
+            exponent: all_ones(eb) - 1,
+            fraction: (BigInt::one() << (sb - 1) as usize) - 1,
+        }
     }
 }
 
@@ -554,8 +614,33 @@ pub fn round_to_format(
     zero_sign: bool,
 ) -> Result<Fp, String> {
     check_format(eb, sb)?;
+    round_fields(x, eb, sb, rm, zero_sign)?.native(eb, sb)
+}
+
+/// Called only after the original evaluator admits the wide arithmetic plan.
+/// The scalar check remains defensive; it never substitutes for that admission.
+pub(crate) fn round_to_exact_format(
+    x: &BigRational,
+    eb: u32,
+    sb: u32,
+    rm: RoundingMode,
+    zero_sign: bool,
+) -> Result<ModelValue, String> {
+    if !(2..=EB_MAX).contains(&eb) || !(2..=MAX_SHIFT as u32).contains(&sb) {
+        return Err("wide floating-point rounding exceeds the exact envelope".into());
+    }
+    round_fields(x, eb, sb, rm, zero_sign)?.exact(eb, sb)
+}
+
+fn round_fields(
+    x: &BigRational,
+    eb: u32,
+    sb: u32,
+    rm: RoundingMode,
+    zero_sign: bool,
+) -> Result<RoundedFields, String> {
     if x.is_zero() {
-        return Ok(Fp::zero(zero_sign, eb, sb));
+        return Ok(RoundedFields::zero(zero_sign));
     }
     let negative = x.is_negative();
     let magnitude = x.abs();
@@ -581,7 +666,7 @@ pub fn round_to_format(
         .ok_or_else(|| "exponent out of range".to_string())?;
     let scaled = scale_pow2(&magnitude, k)?;
     let m = round_magnitude(&scaled, negative, rm);
-    encode(negative, e, m, eb, sb, rm)
+    encode_fields(negative, e, m, eb, sb, rm)
 }
 
 /// Assemble the IEEE fields from a rounded significand `m` at exponent `e`,
@@ -593,12 +678,23 @@ pub fn round_to_format(
 /// scaling a rational, but the encoding rules are identical.
 fn encode(
     negative: bool,
+    e: i64,
+    m: BigInt,
+    eb: u32,
+    sb: u32,
+    rm: RoundingMode,
+) -> Result<Fp, String> {
+    encode_fields(negative, e, m, eb, sb, rm)?.native(eb, sb)
+}
+
+fn encode_fields(
+    negative: bool,
     mut e: i64,
     mut m: BigInt,
     eb: u32,
     sb: u32,
     rm: RoundingMode,
-) -> Result<Fp, String> {
+) -> Result<RoundedFields, String> {
     let bias = bias_of(eb);
     let emax = bias;
 
@@ -618,7 +714,7 @@ fn encode(
     if m.is_zero() {
         // Underflowed all the way: the sign of an exact-zero result is the
         // sign of the value being rounded, not `zero_sign`.
-        return Ok(Fp::zero(negative, eb, sb));
+        return Ok(RoundedFields::zero(negative));
     }
     let hidden = BigInt::one() << (sb - 1) as usize;
     let (exponent, significand) = if m < hidden {
@@ -631,21 +727,10 @@ fn encode(
         (BigInt::from(biased), m - &hidden)
     };
     let exponent = u64::try_from(exponent).map_err(|_| "exponent out of range".to_string())?;
-    let significand =
-        u64::try_from(significand).map_err(|_| "significand out of range".to_string())?;
-    // The assembled fields must sit inside the format. No input can violate
-    // this, so no test can trigger it; it is here because the cost of being
-    // wrong is a well-formed float holding a DIFFERENT number, which the gate
-    // would happily confirm. A refusal is the recoverable failure.
-    if exponent > all_ones(eb) || significand >= (1u64 << (sb - 1)) {
-        return Err("rounded floating-point result is out of range".to_string());
-    }
-    Ok(Fp {
+    Ok(RoundedFields {
         sign: negative,
         exponent,
-        significand,
-        eb,
-        sb,
+        fraction: significand,
     })
 }
 
@@ -659,6 +744,9 @@ fn encode(
 /// `Ok(None)` means `name` is not one of them, so the caller can keep
 /// dispatching.
 pub fn classify(name: &str, value: &ModelValue) -> Result<Option<bool>, String> {
+    if matches!(value, ModelValue::FloatingPointExact { .. }) {
+        return crate::fp_exact::classify(name, value);
+    }
     let known = matches!(
         name,
         "fp.isNaN"
@@ -764,6 +852,12 @@ pub fn compare_fields(a: &Fp, b: &Fp) -> Result<Option<core::cmp::Ordering>, Str
 ///
 /// `Ok(None)` means `name` is not one of the five.
 pub fn compare(name: &str, values: &[ModelValue]) -> Result<Option<bool>, String> {
+    if values
+        .iter()
+        .any(|value| matches!(value, ModelValue::FloatingPointExact { .. }))
+    {
+        return crate::fp_exact::compare(name, values);
+    }
     use core::cmp::Ordering;
     let accept: fn(Ordering) -> bool = match name {
         "fp.eq" => |o| o == Ordering::Equal,
@@ -800,6 +894,9 @@ pub fn comparison(name: &str, values: &[ModelValue]) -> Result<bool, String> {
 ///
 /// `Ok(None)` means `name` is neither.
 pub fn unary_sign(name: &str, value: &ModelValue) -> Result<Option<ModelValue>, String> {
+    if matches!(value, ModelValue::FloatingPointExact { .. }) {
+        return crate::fp_exact::unary_sign(name, value);
+    }
     let mut fp = Fp::from_value(value)?;
     match name {
         "fp.abs" => fp.sign = false,
@@ -826,38 +923,7 @@ pub fn sign_op(name: &str, value: &ModelValue) -> Result<ModelValue, String> {
 /// three bitvectors instead of assembling them itself — the operand of nearly
 /// every FP assertion, trusted rather than checked.
 pub fn from_field_bitvectors(values: &[ModelValue]) -> Result<ModelValue, String> {
-    let [s, e, m] = <&[ModelValue; 3]>::try_from(values)
-        .map_err(|_| "fp expects three bitvector arguments".to_string())?;
-    let bv = |v: &ModelValue| -> Result<(u32, u64), String> {
-        let ModelValue::BitVec { width, value } = v else {
-            return Err("fp expects bitvector arguments".to_string());
-        };
-        let value = u64::try_from(value).map_err(|_| "fp field too wide".to_string())?;
-        Ok((*width, value))
-    };
-    let (sw, sv) = bv(s)?;
-    let (eb, ev) = bv(e)?;
-    let (mw, mv) = bv(m)?;
-    if sw != 1 || sv > 1 {
-        return Err("fp expects a 1-bit sign".to_string());
-    }
-    let sb = mw
-        .checked_add(1)
-        .ok_or_else(|| "unsupported floating-point format".to_string())?;
-    check_format(eb, sb)?;
-    // A field wider than its declared width is a malformed literal, not
-    // something to mask down into a plausible value.
-    if ev > all_ones(eb) || mv >= (1u64 << (sb - 1)) {
-        return Err("malformed floating-point literal field".to_string());
-    }
-    Ok(Fp {
-        sign: sv == 1,
-        exponent: ev,
-        significand: mv,
-        eb,
-        sb,
-    }
-    .to_value())
+    crate::fp_exact::literal(values)
 }
 
 /// The `(fp s e m)` literal, under the name the operator has in SMT-LIB.
@@ -869,25 +935,39 @@ pub fn literal(values: &[ModelValue]) -> Result<ModelValue, String> {
 // arithmetic
 // ===========================================================================
 
+pub(crate) enum Special {
+    Nan,
+    Inf(bool),
+    Zero(bool),
+}
+impl Special {
+    fn native(self, eb: u32, sb: u32) -> Fp {
+        match self {
+            Self::Nan => Fp::nan(eb, sb),
+            Self::Inf(sign) => Fp::inf(sign, eb, sb),
+            Self::Zero(sign) => Fp::zero(sign, eb, sb),
+        }
+    }
+}
+
 /// The exact result of a binary arithmetic operation, before rounding.
 ///
 /// `Ok(Ok(exact))` means the operands are all finite and the caller should round
 /// `exact`; `Ok(Err(special))` is a result the extended-real rules fix outright.
 /// The special-value rules are decided here because they are stated on the
 /// extended reals, not on the rounded result.
-fn arith_exact(
+pub(crate) fn arith_exact(
     name: &str,
-    a: Fp,
-    b: Fp,
-    eb: u32,
-    sb: u32,
+    x: Ext,
+    y: Ext,
+    a_sign: bool,
+    b_sign: bool,
     rm: RoundingMode,
-) -> Result<Result<BigRational, Fp>, String> {
-    let (x, y) = (a.ext()?, b.ext()?);
+) -> Result<Result<BigRational, Special>, String> {
     if x == Ext::Nan || y == Ext::Nan {
-        return Ok(Err(Fp::nan(eb, sb)));
+        return Ok(Err(Special::Nan));
     }
-    let sign_xor = a.sign ^ b.sign;
+    let sign_xor = a_sign ^ b_sign;
     match name {
         "fp.add" | "fp.sub" => {
             // `fp.sub a b` is `fp.add a (fp.neg b)`; the caller has already
@@ -896,21 +976,21 @@ fn arith_exact(
             // is only one place to get the zero signs wrong.
             match (&x, &y) {
                 // `(+oo) + (-oo)` is the one invalid sum.
-                (Ext::Inf(p), Ext::Inf(q)) if p != q => Ok(Err(Fp::nan(eb, sb))),
-                (Ext::Inf(p), _) => Ok(Err(Fp::inf(*p, eb, sb))),
-                (_, Ext::Inf(q)) => Ok(Err(Fp::inf(*q, eb, sb))),
+                (Ext::Inf(p), Ext::Inf(q)) if p != q => Ok(Err(Special::Nan)),
+                (Ext::Inf(p), _) => Ok(Err(Special::Inf(*p))),
+                (_, Ext::Inf(q)) => Ok(Err(Special::Inf(*q))),
                 (Ext::Fin(p), Ext::Fin(q)) => {
                     let sum = p + q;
                     if sum.is_zero() {
                         // IEEE-754 §6.3: a zero sum of like-signed zeros keeps
                         // that sign; every other exactly-zero sum is `+0`,
                         // except under `RTN` where it is `-0`.
-                        let sign = if a.is_zero() && b.is_zero() && a.sign == b.sign {
-                            a.sign
+                        let sign = if p.is_zero() && q.is_zero() && a_sign == b_sign {
+                            a_sign
                         } else {
                             rm == RoundingMode::Rtn
                         };
-                        return Ok(Err(Fp::zero(sign, eb, sb)));
+                        return Ok(Err(Special::Zero(sign)));
                     }
                     Ok(Ok(sum))
                 }
@@ -918,32 +998,32 @@ fn arith_exact(
             }
         }
         "fp.mul" => match (&x, &y) {
-            (Ext::Inf(_), Ext::Fin(q)) if q.is_zero() => Ok(Err(Fp::nan(eb, sb))),
-            (Ext::Fin(p), Ext::Inf(_)) if p.is_zero() => Ok(Err(Fp::nan(eb, sb))),
-            (Ext::Inf(_), _) | (_, Ext::Inf(_)) => Ok(Err(Fp::inf(sign_xor, eb, sb))),
+            (Ext::Inf(_), Ext::Fin(q)) if q.is_zero() => Ok(Err(Special::Nan)),
+            (Ext::Fin(p), Ext::Inf(_)) if p.is_zero() => Ok(Err(Special::Nan)),
+            (Ext::Inf(_), _) | (_, Ext::Inf(_)) => Ok(Err(Special::Inf(sign_xor))),
             (Ext::Fin(p), Ext::Fin(q)) => {
                 let product = p * q;
                 if product.is_zero() {
-                    return Ok(Err(Fp::zero(sign_xor, eb, sb)));
+                    return Ok(Err(Special::Zero(sign_xor)));
                 }
                 Ok(Ok(product))
             }
             (Ext::Nan, _) | (_, Ext::Nan) => unreachable!("NaN handled above"),
         },
         "fp.div" => match (&x, &y) {
-            (Ext::Inf(_), Ext::Inf(_)) => Ok(Err(Fp::nan(eb, sb))),
-            (Ext::Inf(_), Ext::Fin(_)) => Ok(Err(Fp::inf(sign_xor, eb, sb))),
-            (Ext::Fin(_), Ext::Inf(_)) => Ok(Err(Fp::zero(sign_xor, eb, sb))),
+            (Ext::Inf(_), Ext::Inf(_)) => Ok(Err(Special::Nan)),
+            (Ext::Inf(_), Ext::Fin(_)) => Ok(Err(Special::Inf(sign_xor))),
+            (Ext::Fin(_), Ext::Inf(_)) => Ok(Err(Special::Zero(sign_xor))),
             (Ext::Fin(p), Ext::Fin(q)) => {
                 if q.is_zero() {
                     if p.is_zero() {
-                        return Ok(Err(Fp::nan(eb, sb)));
+                        return Ok(Err(Special::Nan));
                     }
-                    return Ok(Err(Fp::inf(sign_xor, eb, sb)));
+                    return Ok(Err(Special::Inf(sign_xor)));
                 }
                 let quotient = p / q;
                 if quotient.is_zero() {
-                    return Ok(Err(Fp::zero(sign_xor, eb, sb)));
+                    return Ok(Err(Special::Zero(sign_xor)));
                 }
                 Ok(Ok(quotient))
             }
@@ -980,8 +1060,8 @@ pub fn arith(
         "fp.mul" | "fp.div" => a.sign ^ b.sign,
         _ => rm == RoundingMode::Rtn,
     };
-    match arith_exact(name, a, b, eb, sb, rm)? {
-        Err(special) => Ok(Some(special.to_value())),
+    match arith_exact(name, a.ext()?, b.ext()?, a.sign, b.sign, rm)? {
+        Err(special) => Ok(Some(special.native(eb, sb).to_value())),
         Ok(exact) => Ok(Some(
             round_to_format(&exact, eb, sb, rm, zero_sign)?.to_value(),
         )),
@@ -1004,34 +1084,48 @@ pub fn fma(rm: RoundingMode, values: &[ModelValue]) -> Result<ModelValue, String
         return Err("fp.fma operands have different formats".to_string());
     }
     let (eb, sb) = (a.eb, a.sb);
-    let (x, y, z) = (a.ext()?, b.ext()?, c.ext()?);
-    if x == Ext::Nan || y == Ext::Nan || z == Ext::Nan {
-        return Ok(Fp::nan(eb, sb).to_value());
+    match fma_exact(a.ext()?, b.ext()?, c.ext()?, a.sign, b.sign, c.sign, rm) {
+        Ok(exact) => Ok(round_to_format(&exact, eb, sb, rm, rm == RoundingMode::Rtn)?.to_value()),
+        Err(special) => Ok(special.native(eb, sb).to_value()),
     }
-    let product_sign = a.sign ^ b.sign;
+}
+
+pub(crate) fn fma_exact(
+    x: Ext,
+    y: Ext,
+    z: Ext,
+    a_sign: bool,
+    b_sign: bool,
+    c_sign: bool,
+    rm: RoundingMode,
+) -> Result<BigRational, Special> {
+    if x == Ext::Nan || y == Ext::Nan || z == Ext::Nan {
+        return Err(Special::Nan);
+    }
+    let product_sign = a_sign ^ b_sign;
     let product = match (&x, &y) {
-        (Ext::Inf(_), Ext::Fin(q)) if q.is_zero() => return Ok(Fp::nan(eb, sb).to_value()),
-        (Ext::Fin(p), Ext::Inf(_)) if p.is_zero() => return Ok(Fp::nan(eb, sb).to_value()),
+        (Ext::Inf(_), Ext::Fin(q)) if q.is_zero() => return Err(Special::Nan),
+        (Ext::Fin(p), Ext::Inf(_)) if p.is_zero() => return Err(Special::Nan),
         (Ext::Inf(_), _) | (_, Ext::Inf(_)) => Ext::Inf(product_sign),
         (Ext::Fin(p), Ext::Fin(q)) => Ext::Fin(p * q),
         (Ext::Nan, _) | (_, Ext::Nan) => unreachable!("NaN handled above"),
     };
     match (&product, &z) {
         // An infinite product plus the opposite infinity is undefined.
-        (Ext::Inf(p), Ext::Inf(q)) if p != q => Ok(Fp::nan(eb, sb).to_value()),
-        (Ext::Inf(p), _) => Ok(Fp::inf(*p, eb, sb).to_value()),
-        (_, Ext::Inf(q)) => Ok(Fp::inf(*q, eb, sb).to_value()),
+        (Ext::Inf(p), Ext::Inf(q)) if p != q => Err(Special::Nan),
+        (Ext::Inf(p), _) => Err(Special::Inf(*p)),
+        (_, Ext::Inf(q)) => Err(Special::Inf(*q)),
         (Ext::Fin(p), Ext::Fin(q)) => {
             let sum = p + q;
             if sum.is_zero() {
-                let sign = if p.is_zero() && q.is_zero() && product_sign == c.sign {
+                let sign = if p.is_zero() && q.is_zero() && product_sign == c_sign {
                     product_sign
                 } else {
                     rm == RoundingMode::Rtn
                 };
-                return Ok(Fp::zero(sign, eb, sb).to_value());
+                return Err(Special::Zero(sign));
             }
-            Ok(round_to_format(&sum, eb, sb, rm, rm == RoundingMode::Rtn)?.to_value())
+            Ok(sum)
         }
         (Ext::Nan, _) | (_, Ext::Nan) => unreachable!("NaN handled above"),
     }
@@ -1078,17 +1172,44 @@ pub fn sqrt(rm: RoundingMode, value: &ModelValue) -> Result<ModelValue, String> 
         }
     };
 
+    let (e, m) = sqrt_positive_parts(&a, eb, sb, rm)?;
+    Ok(encode(false, e, m, eb, sb, rm)?.to_value())
+}
+
+/// Called only after the original evaluator admits the wide arithmetic plan.
+pub(crate) fn sqrt_positive_to_exact_format(
+    a: &BigRational,
+    eb: u32,
+    sb: u32,
+    rm: RoundingMode,
+) -> Result<ModelValue, String> {
+    if !(2..=EB_MAX).contains(&eb) || !(2..=MAX_SHIFT as u32).contains(&sb) {
+        return Err("wide floating-point square root exceeds the exact envelope".into());
+    }
+    if !a.is_positive() {
+        return Err("positive square-root kernel needs a positive operand".into());
+    }
+    let (e, m) = sqrt_positive_parts(a, eb, sb, rm)?;
+    encode_fields(false, e, m, eb, sb, rm)?.exact(eb, sb)
+}
+
+fn sqrt_positive_parts(
+    a: &BigRational,
+    eb: u32,
+    sb: u32,
+    rm: RoundingMode,
+) -> Result<(i64, BigInt), String> {
     let bias = bias_of(eb);
     let emin = 1 - bias;
 
     // `log2(sqrt(a)) = log2(a)/2`, so the floor is within one of the halved
     // bit-length; settle it exactly by squaring the candidate power of two.
-    let log_a = floor_log2(&a);
+    let log_a = floor_log2(a);
     let mut e = log_a.div_euclid(2);
-    while !pow2_le(2 * e, &a) {
+    while !pow2_le(2 * e, a) {
         e -= 1;
     }
-    while pow2_le(2 * (e + 1), &a) {
+    while pow2_le(2 * (e + 1), a) {
         e += 1;
     }
     e = e.max(emin);
@@ -1100,7 +1221,7 @@ pub fn sqrt(rm: RoundingMode, value: &ModelValue) -> Result<ModelValue, String> 
     let two_k = k
         .checked_mul(2)
         .ok_or_else(|| "exponent out of range".to_string())?;
-    let scaled = scale_pow2(&a, two_k)?;
+    let scaled = scale_pow2(a, two_k)?;
     let (numerator, denominator) = (scaled.numer().clone(), scaled.denom().clone());
     let product = &numerator * &denominator; // P, so that q = sqrt(P)/D
     let root = product.sqrt(); // floor(sqrt(P)), exact integer square root
@@ -1136,7 +1257,7 @@ pub fn sqrt(rm: RoundingMode, value: &ModelValue) -> Result<ModelValue, String> 
     };
     // `sqrt` of a finite positive value can never overflow the format, so the
     // shared encoder's overflow arm is unreachable here.
-    Ok(encode(false, e, m, eb, sb, rm)?.to_value())
+    Ok((e, m))
 }
 
 /// `fp.rem`: the IEEE-754 REMAINDER, which is EXACT and therefore takes no
@@ -1182,8 +1303,7 @@ pub fn rem(values: &[ModelValue]) -> Result<ModelValue, String> {
     }
 }
 
-/// `fp.roundToIntegral`: exact, and never overflows — an integral value of the
-/// format is always representable in it.
+/// `fp.roundToIntegral` with exact rounding and format overflow handling.
 pub fn round_to_integral(rm: RoundingMode, value: &ModelValue) -> Result<ModelValue, String> {
     let fp = Fp::from_value(value)?;
     match fp.ext()? {
@@ -1222,6 +1342,12 @@ pub fn round_to_integral(rm: RoundingMode, value: &ModelValue) -> Result<ModelVa
 ///
 /// `Ok(None)` means `name` is neither operator.
 pub fn min_max(name: &str, values: &[ModelValue]) -> Result<Option<ModelValue>, String> {
+    if values
+        .iter()
+        .any(|value| matches!(value, ModelValue::FloatingPointExact { .. }))
+    {
+        return crate::fp_exact::min_max(name, values);
+    }
     let want_min = match name {
         "fp.min" => true,
         "fp.max" => false,
@@ -1308,7 +1434,7 @@ pub fn to_fp_rounded(
     value: &ModelValue,
 ) -> Result<ModelValue, String> {
     // Checked BEFORE the special-value shortcuts below, which construct data in
-    // the TARGET format directly: an unvalidated `sb` there would shift a `u64`
+    // the TARGET format directly: an unvalidated `sb` there would shift a `u128`
     // out of range rather than decline.
     check_format(eb, sb)?;
     let exact: BigRational = match value {
@@ -1336,7 +1462,7 @@ pub fn to_fp_rounded(
         }
         ModelValue::Real(r) => r.clone(),
         ModelValue::Int(n) => BigRational::from_integer(n.clone()),
-        ModelValue::FloatingPoint { .. } => {
+        ModelValue::FloatingPoint { .. } | ModelValue::FloatingPointExact { .. } => {
             // A format conversion. NaN, the infinities and the zeros have no
             // rational value to round, and each carries information (the zero's
             // sign) that a trip through `BigRational` would lose.
@@ -1347,7 +1473,7 @@ pub fn to_fp_rounded(
                         sign: fp.sign,
                         ..Fp::nan(eb, sb)
                     }
-                    .to_value())
+                    .to_value());
                 }
                 Ext::Inf(sign) => return Ok(Fp::inf(sign, eb, sb).to_value()),
                 Ext::Fin(x) => {
@@ -1369,9 +1495,11 @@ pub fn to_fp_rounded(
 /// `((_ fp.to_sbv m) rm x)` / `((_ fp.to_ubv m) rm x)`.
 ///
 /// SMT-LIB leaves the result UNSPECIFIED when `x` is NaN, infinite, or rounds
-/// outside the target width, so those decline rather than wrap — wrapping would
-/// let the gate confirm a value the solver never claimed. Declining is the
-/// conservative reading: it costs completeness only.
+/// outside the target width, so those report [`UNDERSPECIFIED`] rather than
+/// wrap — wrapping would let the gate confirm a value the solver never claimed.
+/// The evaluator then adopts the model's own value for the application, keyed
+/// for congruence on the rounding mode, the width and `x`: the result is
+/// unspecified, but it is still a function of `(rm, x)`.
 pub fn to_bv(
     unsigned: bool,
     width: u32,
@@ -1383,7 +1511,7 @@ pub fn to_bv(
     }
     let fp = Fp::from_value(value)?;
     let Ext::Fin(x) = fp.ext()? else {
-        return Err("fp.to_sbv/to_ubv is unspecified for NaN and infinity".to_string());
+        return Err(UNDERSPECIFIED.to_string());
     };
     let n = round_to_integer(&x, rm);
     let (low, high) = if unsigned {
@@ -1393,7 +1521,7 @@ pub fn to_bv(
         (-half.clone(), half - 1)
     };
     if n < low || n > high {
-        return Err("fp.to_sbv/to_ubv result is out of range (unspecified)".to_string());
+        return Err(UNDERSPECIFIED.to_string());
     }
     let encoded = if n.is_negative() {
         n + (BigInt::one() << width as usize)
@@ -1442,6 +1570,11 @@ pub fn to_bv_named(
 /// sorts and never equal.
 #[must_use]
 pub fn same_element(a: &ModelValue, b: &ModelValue) -> bool {
+    if matches!(a, ModelValue::FloatingPointExact { .. })
+        || matches!(b, ModelValue::FloatingPointExact { .. })
+    {
+        return crate::fp_exact::same_element(a, b).unwrap_or(false);
+    }
     let (
         ModelValue::FloatingPoint {
             sign: sign_a,
@@ -1464,12 +1597,18 @@ pub fn same_element(a: &ModelValue, b: &ModelValue) -> bool {
     if (eb_a, sb_a) != (eb_b, sb_b) {
         return false;
     }
-    // Max exponent with a non-zero stored significand. The width guard keeps
-    // `all_ones` in range for any payload the value type can hold; an
-    // out-of-range width falls through to exact field identity, which is what
-    // this comparison did for every value before NaN was distinguished.
-    let is_nan = |exponent: &u64, significand: &u64| {
-        (1..64).contains(eb_a) && *exponent == all_ones(*eb_a) && *significand != 0
+    // Raw data includes the full u64 exponent field, independently of the
+    // narrower signed-bias arithmetic envelope. Never shift u64 by 64, and
+    // canonicalize only well-formed data as the single SMT NaN element.
+    let is_nan = |exponent: &u64, significand: &u128| {
+        data_fields_fit(*eb_a, *sb_a, *exponent, *significand)
+            && *exponent
+                == if *eb_a == 64 {
+                    u64::MAX
+                } else {
+                    all_ones(*eb_a)
+                }
+            && *significand != 0
     };
     if is_nan(exponent_a, significand_a) && is_nan(exponent_b, significand_b) {
         return true;
@@ -1495,16 +1634,7 @@ pub fn same_element(a: &ModelValue, b: &ModelValue) -> bool {
 /// it from the model's own committed encoding — checked by
 /// [`check_ieee_nan_encoding`] before it is believed.
 pub fn to_ieee_bv(value: &ModelValue) -> Result<ModelValue, String> {
-    let fp = Fp::from_value(value)?;
-    if fp.is_nan() {
-        return Err(UNDERSPECIFIED.to_string());
-    }
-    let stored = (fp.sb - 1) as usize;
-    let mut bits = BigInt::from(fp.significand) | (BigInt::from(fp.exponent) << stored);
-    if fp.sign {
-        bits |= BigInt::one() << (fp.eb as usize + stored);
-    }
-    Ok(ModelValue::bitvec(bits, fp.eb + fp.sb))
+    crate::fp_exact::to_ieee_bv(value)
 }
 
 /// Whether `fp.to_ieee_bv` of this value is the unspecified case.
@@ -1513,7 +1643,7 @@ pub fn to_ieee_bv(value: &ModelValue) -> Result<ModelValue, String> {
 /// on [`UNDERSPECIFIED`], asks this first.
 #[must_use]
 pub fn to_ieee_bv_unspecified(value: &ModelValue) -> bool {
-    Fp::from_value(value).is_ok_and(Fp::is_nan)
+    crate::fp_exact::ieee_unspecified(value)
 }
 
 /// Whether `encoding` is an admissible `(fp.to_ieee_bv x)` result for a NaN `x`
@@ -1528,24 +1658,7 @@ pub fn to_ieee_bv_unspecified(value: &ModelValue) -> bool {
 /// the underspecified branch from laundering a solver or evaluator bug into a
 /// confirmed `sat`.
 pub fn check_ieee_nan_encoding(operand: &ModelValue, encoding: &ModelValue) -> Result<(), String> {
-    let fp = Fp::from_value(operand)?;
-    if !fp.is_nan() {
-        return Err("fp.to_ieee_bv is not underspecified on this operand".to_string());
-    }
-    let ModelValue::BitVec { width, value } = encoding else {
-        return Err("fp.to_ieee_bv must denote a bitvector".to_string());
-    };
-    if *width != fp.eb + fp.sb {
-        return Err("fp.to_ieee_bv result has the wrong width".to_string());
-    }
-    let stored = (fp.sb - 1) as usize;
-    let all_exponent_ones = (BigInt::one() << fp.eb as usize) - BigInt::one();
-    let payload = value.clone() & ((BigInt::one() << stored) - BigInt::one());
-    let exponent = (value.clone() >> stored) & all_exponent_ones.clone();
-    if exponent != all_exponent_ones || payload.is_zero() {
-        return Err("fp.to_ieee_bv of NaN must denote a NaN encoding".to_string());
-    }
-    Ok(())
+    crate::fp_exact::check_ieee_nan_encoding(operand, encoding)
 }
 
 /// [`check_ieee_nan_encoding`] as a predicate: whether `bits` is a NaN encoding
@@ -1569,6 +1682,11 @@ pub fn min_max_unspecified(name: &str, values: &[ModelValue]) -> bool {
         return false;
     }
     let [a, b] = values else { return false };
+    if matches!(a, ModelValue::FloatingPointExact { .. })
+        || matches!(b, ModelValue::FloatingPointExact { .. })
+    {
+        return crate::fp_exact::opposite_zeros(a, b);
+    }
     let (Ok(x), Ok(y)) = (Fp::from_value(a), Fp::from_value(b)) else {
         return false;
     };
@@ -1578,6 +1696,11 @@ pub fn min_max_unspecified(name: &str, values: &[ModelValue]) -> bool {
 /// Whether `value` is a zero in the same format as `like`.
 #[must_use]
 pub fn is_zero_of_format(value: &ModelValue, like: &ModelValue) -> bool {
+    if matches!(value, ModelValue::FloatingPointExact { .. })
+        || matches!(like, ModelValue::FloatingPointExact { .. })
+    {
+        return crate::fp_exact::is_zero_of_format(value, like);
+    }
     let (Ok(v), Ok(l)) = (Fp::from_value(value), Fp::from_value(like)) else {
         return false;
     };
@@ -1597,6 +1720,20 @@ pub fn check_min_max_choice(operands: &[ModelValue], adopted: &ModelValue) -> Re
     let [a, b] = operands else {
         return Err("fp.min/fp.max expects two floating-point arguments".to_string());
     };
+    if operands
+        .iter()
+        .chain(std::iter::once(adopted))
+        .any(|value| matches!(value, ModelValue::FloatingPointExact { .. }))
+    {
+        if !crate::fp_exact::opposite_zeros(a, b) {
+            return Err("fp.min/fp.max is not underspecified on these operands".into());
+        }
+        return if crate::fp_exact::is_zero_of_format(adopted, a) {
+            Ok(())
+        } else {
+            Err("fp.min/fp.max of +0 and -0 must be a zero of that format".into())
+        };
+    }
     let x = Fp::from_value(a)?;
     let y = Fp::from_value(b)?;
     if !(x.is_zero() && y.is_zero() && x.sign != y.sign && x.same_format(y)) {

@@ -449,9 +449,18 @@ fn demand_shadow_tripwire_currently_decided_obligations() {
     // DT+LIA gap to its z3-UNSAT verdict when armed. Reclassify the not-unsat pin
     // accordingly; the never-wrong-`sat` soundness fence and the prod==shadow
     // DISAGREE fence below both hold unconditionally.
-    let lazy_auflia = std::env::var("AY_DT_LAZY_AUFLIA")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    //
+    // 2026-09-17 (a0b2cf86c): the route is DEFAULT-ON at its `solve_dt_uf_lia`
+    // call site — the one this forall-free probe takes — with `AY_DT_LAZY_AUFLIA=0`
+    // as the kill switch, so the armed arm is the ordinary production solve and
+    // the red is closed there (`unsat` in 0.26 s, z3 `unsat`). The sibling pin in
+    // `demand_probes::demand_red_probes_are_not_unsat_today` was reclassified in
+    // that commit; this copy still read the pre-flip opt-in spelling (armed only
+    // when the variable was SET non-zero) and so asserted the kill-switch arm
+    // against a default-on solve. The predicate MUST read exactly like
+    // production's `is_none_or(|v| v != "0")`, or the pin asserts the wrong arm.
+    let lazy_auflia =
+        std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v.to_str().is_none_or(|v| v != "0"));
     assert_ne!(
         shadow_g, "sat",
         "tripwire SOUNDNESS: red_ground_dtlia returned a wrong sat in shadow \

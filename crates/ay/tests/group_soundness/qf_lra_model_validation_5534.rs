@@ -25,17 +25,16 @@
 use ntest::timeout;
 use std::process::Command;
 
-fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
+use crate::corpus::optional_corpus_file;
+
+/// First stdout line of `ay` on the gitignored QF_LRA corpus file, or `None`
+/// when the file is absent and skipping is allowed. `None` is never a verdict:
+/// this used to return `"unknown"`, which the one-sided oracle below accepts,
+/// so the guard passed wherever the corpus was absent (see `common/corpus.rs`).
+fn run_ay(test: &str, smt_file: &str, timeout_ms: u64) -> Option<String> {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smtcomp/QF_LRA/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        smt_file
-    );
-    if !std::path::Path::new(&benchmark_path).is_file() {
-        eprintln!("SKIP: optional QF_LRA benchmark not found: {benchmark_path}");
-        return "unknown".to_string();
-    }
+    let benchmark_path =
+        optional_corpus_file(test, &format!("benchmarks/smtcomp/QF_LRA/{smt_file}"))?;
 
     let output = Command::new(ay_path)
         .arg(format!("-t:{timeout_ms}"))
@@ -44,7 +43,7 @@ fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
         .expect("Failed to spawn ay");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    stdout.trim().lines().next().unwrap_or("").to_string()
+    Some(stdout.trim().lines().next().unwrap_or("").to_string())
 }
 
 /// #5534 primary reproducer: `1.smt2` is UNSAT (Z3 confirms). Historically AY
@@ -54,7 +53,9 @@ fn run_ay(smt_file: &str, timeout_ms: u64) -> String {
 #[test]
 #[timeout(60_000)]
 fn qf_lra_5534_benchmark_1_never_false_sat() {
-    let result = run_ay("1.smt2", 30_000);
+    let Some(result) = run_ay("qf_lra_5534_benchmark_1_never_false_sat", "1.smt2", 30_000) else {
+        return;
+    };
     assert_ne!(
         result, "sat",
         "Soundness regression (#5534): AY reported 'sat' on benchmarks/smtcomp/QF_LRA/1.smt2 \
@@ -71,7 +72,9 @@ fn qf_lra_5534_benchmark_1_never_false_sat() {
 #[test]
 #[timeout(60_000)]
 fn qf_lra_5534_benchmark_5_never_false_sat() {
-    let result = run_ay("5.smt2", 30_000);
+    let Some(result) = run_ay("qf_lra_5534_benchmark_5_never_false_sat", "5.smt2", 30_000) else {
+        return;
+    };
     assert_ne!(
         result, "sat",
         "Soundness regression (#5534): AY reported 'sat' on benchmarks/smtcomp/QF_LRA/5.smt2 \

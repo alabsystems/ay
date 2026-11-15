@@ -14,6 +14,7 @@ The source checkout contains **two** working loaders:
    package does not bundle this large build artifact or export the harness;
    build and exercise it from an AY checkout:
    ```sh
+   # STOCK EXCEPTION: Trust seal 9192 has no wasm32-unknown-unknown std (2026-09-28: E0463).
    rustup target add wasm32-unknown-unknown
    cargo build --release --target wasm32-unknown-unknown -p ay-ffi --lib --no-default-features
    node bindings/js/test-wasm.mjs      # real sat/unsat/model from the .wasm
@@ -61,7 +62,7 @@ parsed by AY's restricted grammar—never JavaScript passed to `eval`. The
 Minesweeper.
 
 ```sh
-# after cargo build -p ay-ffi && (cd bindings/js && npm install)
+# after targo --unverified build -p ay-ffi (stock Rust: cargo build -p ay-ffi) && (cd bindings/js && npm install)
 node bindings/js/examples/search-sudoku.mjs
 node bindings/js/examples/search-token-router.mjs
 node bindings/js/examples/search-minesweeper.mjs
@@ -78,8 +79,9 @@ SearchSpec range.
 - Node.js ≥ 18 (developed/verified on Node v26).
 - The `libay_ffi` shared library. Build it once from the repo root:
   ```sh
-  cargo build -p ay-ffi          # debug -> target/debug/libay_ffi.{dylib,so}
-  # or: cargo build -p ay-ffi --release
+  targo --unverified build -p ay-ffi   # debug -> target/debug/libay_ffi.{dylib,so}
+  # or: targo --unverified build -p ay-ffi --release
+  # stock Rust: cargo build -p ay-ffi [--release]
   ```
 
 ## Install & run
@@ -206,6 +208,7 @@ is byte-identical):
   strings into linear memory.
 
 ```sh
+# STOCK EXCEPTION: Trust seal 9192 has no wasm32-unknown-unknown std (2026-09-28: E0463).
 rustup target add wasm32-unknown-unknown
 cargo build --release --target wasm32-unknown-unknown -p ay-ffi --lib --no-default-features
 node bindings/js/test-wasm.mjs   # → real sat/unsat/model from ay_ffi.wasm

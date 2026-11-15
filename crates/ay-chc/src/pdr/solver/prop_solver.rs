@@ -48,7 +48,28 @@ pub(super) enum SegmentKey {
     Inductiveness { clause_index: usize },
 }
 
-/// Activation state for a registered background segment.
+/// Contract A-5 placeholder (Workstream B `DESIGN` §3.8, R4): the Horn
+/// session's `AssertId` (Workstream A, `smt/session`) is not on this branch
+/// yet. The SHAPE of `check_lits` is what A-5 pins; the alias is replaced by
+/// the real id type when the session lands.
+#[allow(dead_code)]
+pub(super) type AssertIdA5 = u64;
+
+/// Result of `check_lits` (A-5). `exact = !over_approximate`; `uses_level`
+/// is reported ONLY when every frame conjunct of the query was id-asserted
+/// (otherwise `Some(level)`, no jump).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(super) enum LitCheck {
+    Sat(FxHashMap<String, SmtValue>),
+    Unsat {
+        core: Vec<bool>,
+        exact: bool,
+        uses_level: Option<usize>,
+    },
+    Unknown,
+}
+
 struct SegmentActivation {
     /// SAT variable (1-based) controlling this segment.
     /// Segment is active when `NOT act_var` is assumed.
@@ -275,6 +296,48 @@ impl PredicatePropSolver {
     /// Used for standalone SAT checks (e.g., interpolation A-side feasibility)
     /// that don't correspond to a PDR query family but still benefit from the
     /// persistent solver's Tseitin cache and SAT state.
+    /// Contract A-5 (`DESIGN` §3.8; owner WP-B1-L with Workstream A, R4).
+    ///
+    /// `frame_index` f activates exactly the lemma ids with `level ≥ f`
+    /// (delta direction; the HEAD context's `k >= level` rule,
+    /// `incremental_pdr/solve.rs:203-207`). Callers pass f = level-1 for
+    /// Reach/Inductive and f = k for Push. `lits[i]` are one-shot `extra`
+    /// conjuncts; the core over them comes back by index (`HornCheck::Unsat
+    /// .extra_core`, contract amendment requested from Workstream A; fallback:
+    /// push(); assert_persistent(lit_i); check_assuming(active ∪ ids); pop()).
+    /// `Poisoned`/`Unsupported` ⇒ `Unknown`.
+    ///
+    /// Unit test required with the adapter: a lemma inserted at level k is
+    /// active for a Reach query with `frame_index = k` and `k-1`, inactive at `k+1`.
+    #[allow(dead_code)]
+    pub(super) fn check_lits(
+        &mut self,
+        frame_index: usize,
+        segments: &[SegmentKey],
+        extra: &[ChcExpr],
+        lits: &[ChcExpr],
+        signed: &[(AssertIdA5, bool)],
+        deadline: Option<ay_core::time::Instant>,
+    ) -> LitCheck {
+        let _ = (frame_index, segments, extra, lits, signed, deadline);
+        todo!("WP-B1-L/A (R4): check_lits under contract A-5")
+    }
+
+    /// A-5: body-frame instantiation of `lemma` for `(clause_index, body_pos)`
+    /// at `level` (Spacer `add_lemma_from_child`); `None` while the session
+    /// backend is unavailable (`uses_level` then never jumps).
+    #[allow(dead_code)]
+    pub(super) fn assert_lemma_for_body(
+        &mut self,
+        lemma: &ChcExpr,
+        clause_index: usize,
+        body_pos: usize,
+        level: usize,
+    ) -> Option<AssertIdA5> {
+        let _ = (lemma, clause_index, body_pos, level);
+        None
+    }
+
     pub(super) fn check_feasibility(
         &mut self,
         level: usize,

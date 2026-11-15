@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+f 2;
+pol 1 2 2 2 * * *;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

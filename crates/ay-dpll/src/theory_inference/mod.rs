@@ -742,9 +742,8 @@ pub(crate) fn minimize_farkas_conflict(
 ///
 /// Returns the number of duplicate literals removed.
 ///
-/// Superseded by `minimize_conflict_with_levels` which also removes
-/// level-0 literals. Retained for tests and as a fallback when level
-/// information is not available.
+/// Superseded by `minimize_conflict_clause`, which also classifies
+/// tautologies without strengthening them. Retained for existing controls.
 #[allow(dead_code)]
 pub(crate) fn minimize_plain_conflict(clause: &mut Vec<ay_sat::Literal>) -> usize {
     if clause.len() <= MIN_CLAUSE_SIZE_FOR_MINIMIZE {
@@ -757,81 +756,67 @@ pub(crate) fn minimize_plain_conflict(clause: &mut Vec<ay_sat::Literal>) -> usiz
     original_len - clause.len()
 }
 
-/// Minimize a theory conflict clause using SAT assignment levels.
+/// How the caller preserves the signed literal inventory of a proof row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConflictClausePolicy {
+    /// A positional proof/annotation remains attached to the complete clause.
+    PreserveLiterals,
+    /// Exact duplicate literals are a logical identity in an ordinary clause.
+    Deduplicate,
+}
+
+/// A tautological lemma cannot drive conflict analysis or root UNSAT.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConflictClauseReduction {
+    Clause { removed: usize },
+    Tautology,
+    AllocationRefused,
+}
+
+fn sorted_clause_is_tautology(clause: &[ay_sat::Literal]) -> bool {
+    clause
+        .windows(2)
+        .any(|pair| pair[0].variable() == pair[1].variable() && pair[0] != pair[1])
+}
+
+/// Normalize a clause using logical identities only.
 ///
-/// This implements Z3/CaDiCaL-style self-subsumption for theory conflicts:
-/// 1. Remove duplicate literals (sort + dedup)
-/// 2. Remove literals assigned at decision level 0 (root-level assignments
-///    are permanent and don't need to appear in blocking clauses)
-/// 3. Remove tautological pairs (x and !x)
-///
-/// The `var_level` closure returns `Some(level)` for assigned variables and
-/// `None` for unassigned ones. This allows the function to work with both
-/// the SAT solver (via `Solver::var_level`) and the extension context (via
-/// `SolverContext::var_level`).
-///
-/// Returns the number of literals removed.
-pub(crate) fn minimize_conflict_with_levels(
+/// Sorting changes no signed literal. Complementary literals make the WHOLE
+/// clause true: report that disposition before deleting anything. In ordinary
+/// clauses exact duplicates may be removed. Root-level literals are retained:
+/// an assignment level alone proves neither that a literal is false nor that
+/// its scoped/proof premise authorizes strengthening this theory lemma.
+/// Ordinary normalization sorts in place. A positional proof row is never
+/// changed: classify a fallibly allocated Literal-only scratch copy instead.
+/// Allocation failure refuses the candidate; no solver operation, work grant
+/// or resource limit is introduced.
+pub(crate) fn minimize_conflict_clause(
     clause: &mut Vec<ay_sat::Literal>,
-    var_level: impl Fn(ay_sat::Variable) -> Option<u32>,
-) -> usize {
-    if clause.len() <= MIN_CLAUSE_SIZE_FOR_MINIMIZE {
-        return 0;
+    policy: ConflictClausePolicy,
+) -> ConflictClauseReduction {
+    if policy == ConflictClausePolicy::PreserveLiterals {
+        let mut sorted = Vec::new();
+        if sorted.try_reserve_exact(clause.len()).is_err() {
+            return ConflictClauseReduction::AllocationRefused;
+        }
+        sorted.extend_from_slice(clause);
+        sorted.sort_unstable();
+        return if sorted_clause_is_tautology(&sorted) {
+            ConflictClauseReduction::Tautology
+        } else {
+            ConflictClauseReduction::Clause { removed: 0 }
+        };
     }
-
     let original_len = clause.len();
-
-    // Phase 1: Sort for dedup and tautology detection.
     clause.sort_unstable();
-
-    // Phase 2: Single-pass compaction that removes:
-    //   (a) duplicate literals (adjacent after sort)
-    //   (b) tautological pairs — same variable, opposite polarity
-    //   (c) literals assigned at decision level 0
-    //
-    // Level-0 literals are permanently assigned and can never be
-    // backtracked. Including them in the blocking clause wastes space
-    // without adding any conflict-driving information. Z3 performs this
-    // in smt_conflict_resolution.cpp:process_antecedent() by skipping
-    // level-0 literals during conflict clause construction.
-    let mut write = 0;
-    let mut i = 0;
-    while i < clause.len() {
-        let lit = clause[i];
-
-        // Skip duplicate of previous literal.
-        if write > 0 && clause[write - 1] == lit {
-            i += 1;
-            continue;
-        }
-
-        // Check for tautological pair: same variable, opposite polarity.
-        // After sort, literals of the same variable are adjacent.
-        if i + 1 < clause.len()
-            && lit.variable() == clause[i + 1].variable()
-            && lit != clause[i + 1]
-        {
-            // Skip both literals (tautology makes the clause trivially true).
-            // However, a trivially-true conflict clause is unsound — if we
-            // detect a tautology, skip the pair but do NOT short-circuit.
-            // The caller (SAT solver) will handle the simplified clause.
-            i += 2;
-            continue;
-        }
-
-        // Remove level-0 literals.
-        if var_level(lit.variable()) == Some(0) {
-            i += 1;
-            continue;
-        }
-
-        clause[write] = lit;
-        write += 1;
-        i += 1;
+    if sorted_clause_is_tautology(clause) {
+        return ConflictClauseReduction::Tautology;
     }
-    clause.truncate(write);
-
-    original_len - clause.len()
+    clause.dedup();
+    ConflictClauseReduction::Clause {
+        removed: original_len - clause.len(),
+    }
 }
 
 /// Whether any subterm of the clause is sorted by a REGISTERED datatype —
@@ -1530,107 +1515,101 @@ mod tests {
     }
 
     // =====================================================================
-    // Level-aware conflict clause minimization tests (#8424)
+    // Logical-identity conflict normalization. Old level-only and pair-deletion
+    // expectations are preserved in the original source packet, not waived.
     // =====================================================================
 
-    /// Helper: make a negative Literal from a raw variable id.
     fn neg_lit(v: u32) -> ay_sat::Literal {
         ay_sat::Literal::negative(ay_sat::Variable::new(v))
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_removes_level0_literals() {
-        // 6 literals: vars 1,2,3 at level 0, vars 4,5,6 at level 3
+    fn conflict_normalization_retains_all_root_candidates() {
         let mut clause = vec![lit(1), lit(2), lit(3), lit(4), lit(5), lit(6)];
-        let removed = minimize_conflict_with_levels(&mut clause, |var| {
-            if var.index() <= 3 {
-                Some(0) // level 0
-            } else {
-                Some(3) // level 3
-            }
-        });
-        assert_eq!(removed, 3, "should remove 3 level-0 literals");
-        assert_eq!(clause.len(), 3);
-        // Remaining literals should be vars 4, 5, 6 (sorted)
-        assert_eq!(clause, vec![lit(4), lit(5), lit(6)]);
+        let original = clause.clone();
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Clause { removed: 0 }
+        );
+        assert_eq!(clause, original);
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_removes_duplicates() {
-        // 6 literals with duplicates, all at non-zero levels
+    fn conflict_normalization_removes_exact_duplicates_only() {
         let mut clause = vec![lit(3), lit(1), lit(3), lit(2), lit(1), lit(4)];
-        let removed = minimize_conflict_with_levels(&mut clause, |_| Some(5));
-        assert_eq!(removed, 2, "should remove 2 duplicates");
-        assert_eq!(clause.len(), 4);
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Clause { removed: 2 }
+        );
         assert_eq!(clause, vec![lit(1), lit(2), lit(3), lit(4)]);
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_removes_level0_and_duplicates() {
-        // Mix of duplicates and level-0 assignments
+    fn conflict_normalization_dedup_keeps_every_distinct_literal() {
         let mut clause = vec![lit(1), lit(2), lit(1), lit(3), lit(4), lit(5)];
-        let removed = minimize_conflict_with_levels(&mut clause, |var| {
-            if var.index() == 2 || var.index() == 4 {
-                Some(0)
-            } else {
-                Some(2)
-            }
-        });
-        // Removes: 1 duplicate of lit(1), lit(2) at level 0, lit(4) at level 0
-        assert_eq!(removed, 3);
-        assert_eq!(clause.len(), 3);
-        assert_eq!(clause, vec![lit(1), lit(3), lit(5)]);
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Clause { removed: 1 }
+        );
+        assert_eq!(clause, vec![lit(1), lit(2), lit(3), lit(4), lit(5)]);
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_skips_small_clauses() {
-        let mut clause = vec![lit(1), lit(2), lit(3)];
-        let removed = minimize_conflict_with_levels(&mut clause, |_| Some(0));
-        assert_eq!(removed, 0, "should skip clauses below threshold");
+    fn conflict_normalization_detects_small_tautologies_too() {
+        let mut clause = vec![lit(1), neg_lit(1), lit(2)];
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Tautology
+        );
         assert_eq!(clause.len(), 3);
+        assert!(clause.contains(&lit(1)) && clause.contains(&neg_lit(1)));
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_unassigned_vars_kept() {
-        // Unassigned variables (None level) should be kept
-        let mut clause = vec![lit(1), lit(2), lit(3), lit(4), lit(5), lit(6)];
-        let removed = minimize_conflict_with_levels(&mut clause, |var| {
-            if var.index() <= 3 {
-                None // unassigned
-            } else {
-                Some(0) // level 0
-            }
-        });
-        assert_eq!(removed, 3, "should remove 3 level-0 literals");
-        assert_eq!(clause.len(), 3);
-        assert_eq!(clause, vec![lit(1), lit(2), lit(3)]);
+    fn conflict_normalization_keeps_signed_unresolved_literals() {
+        let mut clause = vec![lit(1), neg_lit(2), lit(3), neg_lit(4), lit(5), lit(6)];
+        let mut original = clause.clone();
+        original.sort_unstable();
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Clause { removed: 0 }
+        );
+        assert_eq!(clause, original);
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_tautology_removal() {
-        // Clause with both x and !x for some variable
+    fn conflict_normalization_classifies_tautology_without_pair_deletion() {
         let mut clause = vec![lit(1), neg_lit(1), lit(2), lit(3), lit(4), lit(5)];
-        let removed = minimize_conflict_with_levels(&mut clause, |_| Some(2));
-        // lit(1) and neg_lit(1) form a tautological pair — both removed
-        assert_eq!(removed, 2, "should remove tautological pair");
-        assert_eq!(clause.len(), 4);
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::Deduplicate),
+            ConflictClauseReduction::Tautology
+        );
+        assert_eq!(clause.len(), 6);
+        assert!(clause.contains(&lit(1)) && clause.contains(&neg_lit(1)));
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_all_level0_returns_empty() {
-        // All literals at level 0 — clause becomes empty
-        let mut clause = vec![lit(1), lit(2), lit(3), lit(4), lit(5), lit(6)];
-        let removed = minimize_conflict_with_levels(&mut clause, |_| Some(0));
-        assert_eq!(removed, 6);
-        assert!(clause.is_empty());
+    fn conflict_normalization_preserves_positional_proof_inventory() {
+        let mut clause = vec![lit(3), lit(2), lit(1), lit(3), lit(4), lit(5)];
+        let original = clause.clone();
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::PreserveLiterals),
+            ConflictClauseReduction::Clause { removed: 0 }
+        );
+        assert_eq!(clause, original);
     }
 
     #[test]
-    fn test_minimize_conflict_with_levels_no_removals() {
-        // All at non-zero levels, no duplicates
+    fn conflict_normalization_does_not_empty_a_nonempty_clause() {
         let mut clause = vec![lit(1), lit(2), lit(3), lit(4), lit(5), lit(6)];
-        let removed = minimize_conflict_with_levels(&mut clause, |_| Some(3));
-        assert_eq!(removed, 0);
+        assert_eq!(
+            minimize_conflict_clause(&mut clause, ConflictClausePolicy::PreserveLiterals),
+            ConflictClauseReduction::Clause { removed: 0 }
+        );
         assert_eq!(clause.len(), 6);
     }
 }
+
+#[cfg(test)]
+#[path = "minimizer_semantics_tests.rs"]
+mod minimizer_semantics_tests;

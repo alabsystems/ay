@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+f 3;
+solx ~x1 ~x2 ~x3;
+e 1 x1 1 x3 >= 1 : -1 ;
+solx ~x1 ~x2 x3;
+e 1 x1 1 ~x3 >= 1 : -1 ;
+solx x1 ~x2 ~x3;
+e 1 ~x1 1 x3 >= 1 : -1 ;
+pol 2 5 + s 4 6 + s +;
+output NONE;
+conclusion ENUMERATION_COMPLETE 3;
+end pseudo-Boolean proof;

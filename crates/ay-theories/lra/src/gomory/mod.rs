@@ -36,5 +36,10 @@ struct GomoryCandidate {
 
 mod generation;
 mod support;
+mod term_cuts;
+
+pub use term_cuts::TermCut;
+#[cfg(test)]
+mod fractional_bound_tests;
 #[cfg(test)]
 mod tests;

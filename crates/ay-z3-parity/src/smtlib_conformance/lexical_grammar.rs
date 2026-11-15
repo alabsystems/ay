@@ -133,7 +133,7 @@ impl ProcessExpectation {
     fn text(self, obligation: &str) -> String {
         match self {
             Self::ExactSuccess => format!(
-                "{obligation}; exact stdout={SUCCESS_MARKER:?} plus newline; stderr=\"\"; exit=0"
+                "{obligation}; stdout={SUCCESS_STDOUT:?}; stderr=\"\"; exit=0"
             ),
             Self::PositionedRecovery => format!(
                 "{obligation}; one `(error \"line 2 column 3: ...\")`, then {RECOVERY_MARKER:?}; stderr=\"\"; exit=1"
@@ -370,10 +370,10 @@ pub(super) fn validate_and_replay(
     let productions = reference_inventory::load_bound_language_grammar(
         input,
         context.manifest_dir,
-        &canonical_profile(),
+        &canonical_profile()?,
     )?;
     let prepared = prepare_campaign(&productions)?;
-    validate_recorded_shape(receipt, &prepared)?;
+    validate_recorded_shape(&receipt.case_results, &prepared)?;
     if context.mode.replays_registered_validators() {
         let envelope = receipt
             .resource_envelope
@@ -1004,7 +1004,7 @@ fn process_completed(process: &ProcessObservation) -> bool {
 }
 
 fn validate_recorded_shape(
-    receipt: &ValidatorReceipt,
+    recorded: &[ValidatorCase],
     prepared: &PreparedCampaign,
 ) -> Result<(), String> {
     let mut expected = prepared
@@ -1028,16 +1028,14 @@ fn validate_recorded_shape(
         )
     }));
     expected.sort_by(|left, right| left.0.cmp(&right.0));
-    if receipt.case_results.len() != expected.len() {
+    if recorded.len() != expected.len() {
         return Err(format!(
             "{VALIDATOR_ID} detailed case inventory drift: expected {}, got {}",
             expected.len(),
-            receipt.case_results.len()
+            recorded.len()
         ));
     }
-    for (row, (id, input_sha256, expected_text, expectation)) in
-        receipt.case_results.iter().zip(expected)
-    {
+    for (row, (id, input_sha256, expected_text, expectation)) in recorded.iter().zip(expected) {
         if row.id != id || row.input_sha256 != input_sha256 || row.expected != expected_text {
             return Err(format!(
                 "{VALIDATOR_ID} case identity, input, or obligation drift at {id}"
@@ -1102,6 +1100,94 @@ fn validate_recorded_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recorded_positive_fixture(index: usize) -> (PreparedCampaign, ValidatorCase) {
+        let name = PRODUCTION_NAMES[index];
+        let production = LanguageGrammarProduction {
+            name: name.to_string(),
+            macro_name: source_macro_name(name).unwrap().to_string(),
+            path: "fixture-language.tex".to_string(),
+            git_blob: "1".repeat(40),
+            content_sha256: "2".repeat(64),
+            production_sha256: "3".repeat(64),
+            production: format!("{name} ::= fixture"),
+        };
+        let case = positive_case(&production, index).unwrap();
+        // This is the receipt representation emitted by transcript_case(),
+        // including its escaped newline. It must remain acceptable to the
+        // independent shape check rather than adopt a second description.
+        let row = ValidatorCase {
+            id: case.id.clone(),
+            input_sha256: sha256_bytes(&case.input),
+            expected: format!(
+                "authenticated {name} production accepts its well-formed embedded witness; stdout=\"AY_GRAMMAR_OK\\n\"; stderr=\"\"; exit=0"
+            ),
+            observed: "recorded exact successful transcript".to_string(),
+            stdout: Some(SUCCESS_STDOUT.to_string()),
+            stderr: Some(String::new()),
+            exit_code: Some(0),
+            process: Some(ProcessObservation {
+                stdin_complete: true,
+                timed_out: false,
+                memout: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }),
+            outcome: ValidatorCaseOutcome::Pass,
+        };
+        (
+            PreparedCampaign {
+                static_rows: Vec::new(),
+                process_cases: vec![case],
+            },
+            row,
+        )
+    }
+
+    #[test]
+    fn recorded_positive_transcripts_replay_without_obligation_drift() {
+        for index in 0..RESPONSE_PRODUCTION_START {
+            let (prepared, recorded) = recorded_positive_fixture(index);
+            let bytes = serde_json::to_vec(&recorded).unwrap();
+            let round_trip: ValidatorCase = serde_json::from_slice(&bytes).unwrap();
+            validate_recorded_shape(&[round_trip], &prepared)
+                .unwrap_or_else(|error| panic!("{}: {error}", PRODUCTION_NAMES[index]));
+        }
+    }
+
+    #[test]
+    fn replay_still_rejects_changed_identity_input_obligation_and_success() {
+        let (prepared, recorded) = recorded_positive_fixture(18);
+        assert_eq!(
+            recorded.id,
+            "language.lexical-and-grammar.attribute.positive"
+        );
+        let mut altered_rows = Vec::new();
+        let mut row = recorded.clone();
+        row.id.push_str(".other");
+        altered_rows.push(row);
+        let mut row = recorded.clone();
+        row.input_sha256 = sha256_bytes(b"changed input");
+        altered_rows.push(row);
+        let mut row = recorded.clone();
+        row.expected.push_str("; weakened obligation");
+        altered_rows.push(row);
+        let mut row = recorded.clone();
+        row.stdout = Some(SUCCESS_MARKER.to_string());
+        altered_rows.push(row);
+        let mut row = recorded.clone();
+        row.stderr = Some("unexpected diagnostic".to_string());
+        altered_rows.push(row);
+        let mut row = recorded.clone();
+        row.exit_code = Some(1);
+        altered_rows.push(row);
+        let mut row = recorded;
+        row.process.as_mut().unwrap().stdout_truncated = true;
+        altered_rows.push(row);
+        for row in altered_rows {
+            assert!(validate_recorded_shape(&[row], &prepared).is_err());
+        }
+    }
 
     #[test]
     fn production_catalog_is_closed_and_duplicate_free() {

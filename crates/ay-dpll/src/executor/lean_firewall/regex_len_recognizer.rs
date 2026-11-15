@@ -78,15 +78,16 @@ fn regex_len_tier(re: &ReAst, pin: LenPin) -> Option<RegexLenTier> {
 ///
 /// The literal arrives ALREADY decoded: `ay_frontend::sexp` runs
 /// `ay_core::unescape_string_contents` (exact 1-5 hex digits, value ≤ 0x2FFFF,
-/// non-escapes literal, surrogates rejected) on every string token, and fails
-/// the whole parse on a literal it cannot represent. So this cannot disagree
-/// with the solver's own reading of the literal — there is no second decoder
-/// here to get out of step. The only remaining check is that every code point
-/// is inside the SMT-LIB alphabet the `Re` model describes.
+/// non-escapes literal, a surrogate stored in its carrier `char`) on every
+/// string token. So this cannot disagree with the solver's own reading of the
+/// literal — there is no second decoder here to get out of step, only
+/// `ay_core::smtlib_code_point` reading each character back. The remaining
+/// check is that every code point is inside the SMT-LIB alphabet the `Re`
+/// model describes.
 fn regex_literal_code_points(lit: &str) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for ch in lit.chars() {
-        let cp = ch as u32;
+        let cp = ay_core::smtlib_code_point(ch);
         if cp > SMTLIB_MAX_CODE_POINT || out.len() >= REGEX_LEN_MAX_LITERAL_CHARS {
             return None;
         }

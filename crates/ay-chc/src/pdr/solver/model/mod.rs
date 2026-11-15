@@ -4,10 +4,16 @@
 
 //! Counterexample construction, fixed-point checks, and model extraction.
 
+/// Forward cex re-concretisation (Workstream B, `DESIGN` §3.6; every chain).
+mod cex_concretize;
+#[cfg(test)]
+mod cex_wiring_tests;
 mod convex_closure;
 mod counterexample;
 mod fixed_point;
 mod point_blocking;
+#[cfg(test)]
+mod push_guard_level_tests;
 mod push_lemmas;
 #[cfg(test)]
 mod tests;
@@ -16,6 +22,9 @@ use super::{
     ChcExpr, ChcOp, ChcSort, ChcVar, Frame, FxHashMap, FxHashSet, InvariantModel, PdrSolver,
     PredicateId, SmtResult, SmtValue,
 };
+
+#[allow(unused_imports)] // consumed by strengthen.rs from R1 (C6)
+pub(in crate::pdr::solver) use cex_concretize::ConcretizeFail;
 
 // Bounded storage for convex-closure blocked-state history (#2819).
 pub(super) const MAX_BLOCKED_STATES_PER_PREDICATE: usize = 100;

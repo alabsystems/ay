@@ -1230,15 +1230,18 @@ fn dt_nonlinear_int_is_recorded_as_having_a_ground_lane() {
     assert!(LogicCategory::QfNira.has_ground_lane());
     assert!(LogicCategory::QfUfnira.has_ground_lane());
     assert!(LogicCategory::Ufnira.has_ground_lane());
+    // Declared UFDTNIRA/AUFDTNIRA reaches the `Ufdtnia` lane on a Real-free,
+    // array-free live window — "some of the feature space" counts
+    // (#ufdtnira-live-content-lane).
+    assert!(LogicCategory::Ufdtnira.has_ground_lane());
 }
 
-/// The fail-closed residue keeps NO lane: there is no `solve_uf_nra` sibling for
-/// `solve_with_dt_axioms` to compose with, and `Other` is the recognized-but-
-/// uncombinable set.
+/// The fail-closed residue keeps NO lane: no DT composition over `solve_uf_nra`
+/// is wired, quantified `Nira` carries Reals by construction, and `Other` is the
+/// recognized-but-uncombinable set.
 #[test]
 fn laneless_categories_stay_laneless() {
     assert!(!LogicCategory::Ufdtnra.has_ground_lane());
-    assert!(!LogicCategory::Ufdtnira.has_ground_lane());
     assert!(!LogicCategory::Nira.has_ground_lane());
     assert!(!LogicCategory::Other.has_ground_lane());
 }

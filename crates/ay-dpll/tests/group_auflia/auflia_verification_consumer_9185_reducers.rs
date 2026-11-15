@@ -18,99 +18,15 @@
 //! not the capability pins, are what guard against a wrong SAT.
 
 use crate::common::{run_executor_smt_with_timeout, SolverOutcome};
+use model_replay::expect_sat_with_model_replayed_through_z3;
 use ntest::timeout;
+
+#[path = "auflia_verification_consumer_9185_reducers/model_replay.rs"]
+mod model_replay;
 
 fn expect_sat(input: &str, label: &str) {
     let result = run_executor_smt_with_timeout(input, 30).expect("execution should succeed");
     assert_eq!(result, SolverOutcome::Sat, "{label}: expected SAT");
-}
-
-/// The strongest SAT pin available from an integration test: AY must answer
-/// `sat`, AY's own fail-closed self-checker (`--self-check`) must CONFIRM that
-/// answer, and the model AY publishes must satisfy the AUTHORED assertions when
-/// replayed through z3.
-///
-/// Use this — never a bare [`expect_sat`] — wherever a pin previously demanded
-/// `unknown` "for want of a materialized and rechecked model". Flipping such a
-/// pin to `expect_sat` alone would trade a fail-closed guard for a weaker one;
-/// this trades it for a stronger one, because it fails on a `sat` that has no
-/// model behind it as well as on a `sat` whose model is wrong.
-///
-/// Replay mechanics: AY's `(get-model)` block is spliced into the replay file
-/// verbatim as `define-fun` commands — ordinary SMT-LIB macro definitions — so
-/// z3 evaluates the authored formula UNDER exactly the interpretation AY
-/// published instead of re-deciding the problem. Any symbol AY omits keeps its
-/// `declare-fun`, so a `sat` here proves AY's published interpretation EXTENDS
-/// to a total model; it can never be rescued by reinterpreting a symbol AY
-/// pinned. `decls` is required to hold one declaration per line so the splice
-/// can drop exactly the ones the model defines.
-///
-/// The replay file is emitted under `(set-logic ALL)` for the same reason the
-/// `arbitrary_seq_quantifier_is_sat_by_constant_interpretation` cross-check
-/// below is: z3 rejects the `(Seq Int)` sort under `AUFLIA` and would answer
-/// `sat` for a vacuously empty problem, which is not a check of anything.
-fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &str, label: &str) {
-    let problem = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n");
-    let result = run_executor_smt_with_timeout(&problem, 30).expect("execution should succeed");
-    assert_eq!(result, SolverOutcome::Sat, "{label}: expected SAT");
-
-    // AY's own fail-closed checker must confirm it: in `--self-check` mode a
-    // verdict is emitted only when AY's in-tree checker validates it, so an
-    // unbacked `sat` degrades to `unknown` here.
-    let self_checked = crate::common::solve_selfcheck_vec(&problem);
-    assert_eq!(
-        crate::common::sat_result(&self_checked.join("\n")),
-        Some("sat"),
-        "{label}: AY's own fail-closed self-check must confirm this SAT, not degrade it:\n{self_checked:?}"
-    );
-
-    let with_model = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n(get-model)\n");
-    let output = crate::common::solve(&with_model);
-    let model = output
-        .split_once("(model")
-        .map(|(_, rest)| rest.trim_end().trim_end_matches(')').to_string())
-        .unwrap_or_else(|| panic!("{label}: a certified SAT must publish a model:\n{output}"));
-
-    if !crate::common::check_z3_or_skip() {
-        return;
-    }
-    let defined: Vec<String> = model
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("(define-fun "))
-        .filter_map(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
-        .collect();
-    assert!(
-        !defined.is_empty(),
-        "{label}: the published model defines no symbol:\n{output}"
-    );
-    let kept_decls: String = decls
-        .lines()
-        .filter(|line| {
-            let name = line
-                .trim()
-                .trim_start_matches('(')
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default();
-            !defined.iter().any(|d| d == name)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let replay = format!("(set-logic ALL)\n{kept_decls}\n{model}\n{asserts}\n(check-sat)\n");
-    let path = std::env::temp_dir().join(format!(
-        "ay_9185_model_replay_{}_{}.smt2",
-        std::process::id(),
-        label.len()
-    ));
-    std::fs::write(&path, &replay).expect("write replay file");
-    let outcome = crate::common::run_z3_file(&path, 20).expect("run z3");
-    let _ = std::fs::remove_file(&path);
-    assert_eq!(
-        outcome,
-        SolverOutcome::Sat,
-        "{label}: AY's published model does not satisfy the authored assertions (z3):\n{replay}"
-    );
 }
 
 fn expect_unknown(input: &str, label: &str) {
@@ -1097,13 +1013,49 @@ fn verification_consumer_bucket_mod_ground_completion_rejects_concrete_contradic
 
 #[test]
 #[timeout(30_000)]
-fn hashmap_invariant_nested_definition_is_soundly_unknown_without_model_certificate() {
-    // This is satisfiable (choose seq_len_proxy = 0 and the invariant false),
-    // but the nested quantified RHS has no constructive total-model certificate.
-    expect_unknown(
-        r#"
-(set-logic AUFLIA)
-(declare-sort MyHashMap 0)
+fn hashmap_invariant_nested_definition_is_decided_sat_with_replayed_model() {
+    // PIN REFRESH 2026-10-06: this was
+    // `..._is_soundly_unknown_without_model_certificate`. The formula is
+    // satisfiable (`seq_len_proxy := 0` falsifies the left conjunct, so the
+    // invariant is `false` whatever the nested universal says), and the pin
+    // held `unknown` only because AY had no certificate behind a `sat` here:
+    // the incapability pin the file header retires.
+    //
+    // The certificate arrived with 536978d9e (feat(quant): generic quantified
+    // model check), merged by 51da687ca. The model check fixes the candidate
+    // model with the pin `seq_len_proxy = 0`, decides the nested universal
+    // TRUE by a checked auxiliary UNSAT of `pin ∧ ¬matrix[sk]` (`0 <= sk < 0`
+    // has no solution, whatever the two Seq-argument functions it cannot
+    // table are), solves the residual under that pin, re-evaluates the
+    // ORIGINAL residual on the staged model, and installs authority only
+    // then. Measured: 536978d9e's parent answers `unknown`, 536978d9e `sat`;
+    // the gate records `deferred-certified-bv-full-domain` (the model check's
+    // grant, its refutation admitted as checked, not as discharged trust);
+    // the printed model (`seq_len_proxy = 0`, the invariant `false`) replays
+    // `sat` through z3 4.8.12, the same model with the invariant `true`
+    // replays `unsat`; and `--self-check` answers `sat` too.
+    //
+    // The check below fails on a `sat` with no model, on one the quantified
+    // publication gate recorded no certificate for, and on a model z3
+    // rejects. `--self-check` is asserted too, but it trusts the same
+    // model-check grant (measured: a model check that mis-decides a universal
+    // publishes the same wrong `sat` under `--self-check`), so the z3 replay
+    // is the independent check. The two twins below run through the same
+    // model check: one keeps `unknown` where the universal's truth rests on a
+    // function the check cannot table, the other refuses `sat` for a
+    // contradiction the check must not certify away; and
+    // `hashmap_invariant_nested_definition_direct_contradiction_is_not_sat`
+    // still guards the wrong SAT that AY refutes before the model check.
+    expect_sat_with_model_replayed_through_z3(
+        HASHMAP_INVARIANT_DECLS,
+        HASHMAP_INVARIANT_DEFINITION,
+        "ay#8971/verification-consumer hashmap invariant nested definition reducer",
+    );
+}
+
+/// One declaration per line, as [`expect_sat_with_model_replayed_through_z3`]
+/// requires.
+const HASHMAP_INVARIANT_DECLS: &str = "(declare-sort MyHashMap 0)
 (declare-sort List 0)
 (declare-fun self () MyHashMap)
 (declare-fun good_arg () List)
@@ -1112,8 +1064,10 @@ fn hashmap_invariant_nested_definition_is_soundly_unknown_without_model_certific
 (declare-fun myhashmap_buckets (MyHashMap) (Seq Int))
 (declare-fun method_index_logic_2_s_i ((Seq Int) Int) Int)
 (declare-fun logic_good__bucket (MyHashMap List Int) Bool)
-(declare-fun method_no_double_binding_1_i (Int) Bool)
-(assert (= (method___quantifier_consumer_invariant_creusot__test_P__P_MyHashMap_1_d4d79486173684d6170 self)
+(declare-fun method_no_double_binding_1_i (Int) Bool)";
+
+const HASHMAP_INVARIANT_DEFINITION: &str =
+    "(assert (= (method___quantifier_consumer_invariant_creusot__test_P__P_MyHashMap_1_d4d79486173684d6170 self)
            (and (< 0 seq_len_proxy)
                 (forall ((i Int))
                   (! (or (and (logic_good__bucket self good_arg i)
@@ -1124,10 +1078,76 @@ fn hashmap_invariant_nested_definition_is_soundly_unknown_without_model_certific
                      :pattern ((logic_good__bucket self good_arg i))
                      :pattern ((method_no_double_binding_1_i
                                   (method_index_logic_2_s_i (myhashmap_buckets self) i)))
-                     :pattern ((method_index_logic_2_s_i (myhashmap_buckets self) i)))))))
+                     :pattern ((method_index_logic_2_s_i (myhashmap_buckets self) i)))))))";
+
+#[test]
+#[timeout(30_000)]
+fn hashmap_invariant_definition_over_seq_argument_table_fails_closed() {
+    // The fail-closed twin of the pin above, at what the model-check
+    // certificate cannot cover. Here the model check pins
+    // `seq_len_proxy = 1`, so the universal is the single point `i = 0`, and
+    // with `logic_good__bucket self good_arg 0` asserted it holds iff
+    // `method_no_double_binding_1_i` is true at
+    // `method_index_logic_2_s_i (myhashmap_buckets self) 0`. That function
+    // takes a `(Seq Int)` argument, a sort the model check cannot table (it
+    // leaves the symbol free: "has an unfixable sort"), and the binding table
+    // is true at 7 and false at 8, so neither `¬matrix[sk]` nor the instance
+    // at `0` is refuted, and the universal sits under a definition, not as a
+    // conjunct the pass may refine: it declines (trace on 4cf7a38be:
+    // "node TermId(19) refine ... undetermined"). Satisfiable (z3 under
+    // `(set-logic ALL)`: `sat`), but AY has no model behind a `sat` here, so
+    // `unknown` is the only answer it can back today; measured `unknown` on
+    // 4cf7a38be, b9818f6c4 and 8b4bcfd5a (default and `--self-check` mode).
+    //
+    // This is an incapability pin that also forbids `unsat`. Counterfactual,
+    // measured on 8b4bcfd5a: a model check that decides this universal
+    // `false` without the checked refutation of its instance publishes `sat`
+    // with a model z3 rejects (the gate records it certified, and
+    // `--self-check` publishes it too); this test goes red. A guess of `true`
+    // does not turn it red: witness preparation rejects the staged model
+    // (trace on b9818f6c4: "model falsifies the residual and nothing is
+    // fillable") and the answer stays `unknown`. A check that guesses `true`
+    // even where the instance IS refuted publishes a wrong `sat` on
+    // `hashmap_invariant_held_with_no_binding_allowed_is_not_sat`, which goes
+    // red (measured on 8b4bcfd5a). A capability that later decides this
+    // formula soundly must re-pin to `expect_sat_with_model_replayed_through_z3`,
+    // never to a bare `expect_sat`.
+    expect_unknown(
+        &format!(
+            "(set-logic AUFLIA)\n{HASHMAP_INVARIANT_DECLS}\n{HASHMAP_INVARIANT_DEFINITION}
+(assert (= seq_len_proxy 1))
+(assert (logic_good__bucket self good_arg 0))
+(assert (method_no_double_binding_1_i 7))
+(assert (not (method_no_double_binding_1_i 8)))
 (check-sat)
-"#,
-        "ay#8971/verification-consumer hashmap invariant nested definition reducer",
+"
+        ),
+        "ay#8971/verification-consumer hashmap invariant definition over a Seq-argument table",
+    );
+}
+
+#[test]
+#[timeout(30_000)]
+fn hashmap_invariant_held_with_no_binding_allowed_is_not_sat() {
+    // The wrong-SAT twin through the same model check. The invariant is
+    // asserted over `[0, 1)` while no binding is allowed at all, so the
+    // instance at `0` contradicts the second universal: UNSAT (z3 under
+    // `(set-logic ALL)`: `unsat`). The model check reaches this formula
+    // (pin `seq_len_proxy = 1`), decides the nested universal FALSE, finds the
+    // residual refuted by the asserted invariant, and declines; on 4cf7a38be
+    // the answer is `unknown`. Counterfactual, measured on b9818f6c4 and
+    // 8b4bcfd5a: a model check that certifies a universal `true` without its
+    // checked refutation publishes `sat` here.
+    expect_not_sat(
+        &format!(
+            "(set-logic AUFLIA)\n{HASHMAP_INVARIANT_DECLS}\n{HASHMAP_INVARIANT_DEFINITION}
+(assert (method___quantifier_consumer_invariant_creusot__test_P__P_MyHashMap_1_d4d79486173684d6170 self))
+(assert (= seq_len_proxy 1))
+(assert (forall ((x Int)) (not (method_no_double_binding_1_i x))))
+(check-sat)
+"
+        ),
+        "ay#8971/verification-consumer hashmap invariant held with no binding allowed",
     );
 }
 

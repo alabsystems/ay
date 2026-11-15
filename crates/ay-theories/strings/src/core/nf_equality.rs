@@ -307,7 +307,11 @@ impl CoreSolver {
         target: &str,
         infer: &mut InferenceManager,
     ) -> NfCheckResult {
-        let mut offset = 0; // How far into `target` we've consumed.
+        // How far into `target` we've consumed, in BYTES. Every advance is by a
+        // whole component constant that matched, so `offset` always lies on a
+        // char boundary of `target` (UTF-8 is self-synchronizing: a byte-equal
+        // prefix of complete characters ends where a character ends).
+        let mut offset = 0;
 
         for &component in &nf.base {
             let comp_rep = state.find(component);
@@ -331,8 +335,13 @@ impl CoreSolver {
                         infer.add_conflict(InferenceKind::ConstantSplit, explanation);
                         return NfCheckResult::Conflict;
                     }
-                    let target_slice = &target[offset..offset + s.len()];
-                    if s != target_slice {
+                    // Compare BYTES, never slice `target` as a `str` here: the
+                    // component's byte length can end inside a multi-byte
+                    // character of `target` (`"0"` against `"٣…"`), and a `str`
+                    // slice there panics. Byte equality of two valid UTF-8
+                    // strings is character equality, so this decides exactly
+                    // the same match.
+                    if !target.as_bytes()[offset..].starts_with(s.as_bytes()) {
                         // Mismatch — conflict.
                         let Some(explanation) =
                             Self::build_nf_vs_constant_explanation(terms, nf, state)

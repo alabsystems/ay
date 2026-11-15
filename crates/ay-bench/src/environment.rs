@@ -45,43 +45,29 @@ impl PinnedSolver {
         resources: &crate::resource::PlannedResources,
         label: &str,
     ) -> Result<Self> {
+        Self::capture_until(path, resources, label, None)
+    }
+
+    /// The caller owns the original deadline; no metadata probe renews it.
+    pub(crate) fn capture_before(
+        path: &Path,
+        resources: &crate::resource::PlannedResources,
+        label: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        Self::capture_until(path, resources, label, Some(deadline))
+    }
+
+    fn capture_until(
+        path: &Path,
+        resources: &crate::resource::PlannedResources,
+        label: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        provenance_remaining(deadline)?;
         use std::io::Write as _;
 
-        let source_path = std::fs::canonicalize(path)
-            .with_bench_context(|| format!("canonicalizing solver binary {}", path.display()))?;
-        let mut source_options = std::fs::OpenOptions::new();
-        source_options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            source_options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-        }
-        let mut source = source_options
-            .open(&source_path)
-            .with_bench_context(|| format!("opening solver binary {}", source_path.display()))?;
-        let before = source.metadata()?;
-        if !before.file_type().is_file() {
-            return Err(BenchError::msg(format!(
-                "solver path is not a regular file: {}",
-                source_path.display()
-            )));
-        }
-        if before.len() > MAX_SOLVER_BINARY_BYTES {
-            return Err(BenchError::msg(format!(
-                "solver binary exceeds the fixed {MAX_SOLVER_BINARY_BYTES}-byte snapshot cap: {}",
-                source_path.display()
-            )));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if before.permissions().mode() & 0o111 == 0 {
-                return Err(BenchError::msg(format!(
-                    "solver path is not executable: {}",
-                    source_path.display()
-                )));
-            }
-        }
+        let (source_path, mut source, before) = open_solver_source(path)?;
 
         let directory = tempfile::Builder::new()
             .prefix("ay-solver-pin-")
@@ -102,6 +88,7 @@ impl PinnedSolver {
         let mut size_bytes = 0_u64;
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
+            provenance_remaining(deadline)?;
             let read = source.read(&mut buffer).with_bench_context(|| {
                 format!("copying pinned solver binary {}", source_path.display())
             })?;
@@ -140,30 +127,7 @@ impl PinnedSolver {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&execution_path, std::fs::Permissions::from_mode(0o500))?;
         }
-        let output = resources.capture_external_output(
-            &execution_path,
-            ["--version"],
-            Duration::from_secs(10),
-            label,
-        )?;
-        if !output.status.success() {
-            return Err(BenchError::msg(format!(
-                "{label}: pinned solver version probe exited {}: {}",
-                output.status,
-                sanitize_metadata_text(output.stderr.trim())
-            )));
-        }
-        let text = if output.stdout.trim().is_empty() {
-            output.stderr
-        } else {
-            output.stdout
-        };
-        let version_output = sanitize_metadata_text(text.trim());
-        if version_output.is_empty() {
-            return Err(BenchError::msg(format!(
-                "{label}: pinned solver version probe produced no output"
-            )));
-        }
+        let version_output = capture_solver_version(&execution_path, resources, label, deadline)?;
         let provenance = SolverProvenance::from_version_output(
             &source_path,
             format!("sha256:{:x}", hasher.finalize()),
@@ -189,6 +153,93 @@ impl PinnedSolver {
     pub(crate) fn verify_source(&self) -> Result<()> {
         let _ = &self.source_path;
         self.provenance.verify_current()
+    }
+
+    pub(crate) fn verify_source_before(&self, deadline: std::time::Instant) -> Result<()> {
+        self.provenance.verify_current_until(Some(deadline))
+    }
+}
+
+fn open_solver_source(path: &Path) -> Result<(PathBuf, std::fs::File, std::fs::Metadata)> {
+    let source_path = std::fs::canonicalize(path)
+        .with_bench_context(|| format!("canonicalizing solver binary {}", path.display()))?;
+    let mut source_options = std::fs::OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        source_options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let source = source_options
+        .open(&source_path)
+        .with_bench_context(|| format!("opening solver binary {}", source_path.display()))?;
+    let before = source.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(BenchError::msg(format!(
+            "solver path is not a regular file: {}",
+            source_path.display()
+        )));
+    }
+    if before.len() > MAX_SOLVER_BINARY_BYTES {
+        return Err(BenchError::msg(format!(
+            "solver binary exceeds the fixed {MAX_SOLVER_BINARY_BYTES}-byte snapshot cap: {}",
+            source_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if before.permissions().mode() & 0o111 == 0 {
+            return Err(BenchError::msg(format!(
+                "solver path is not executable: {}",
+                source_path.display()
+            )));
+        }
+    }
+    Ok((source_path, source, before))
+}
+
+fn capture_solver_version(
+    execution_path: &Path,
+    resources: &crate::resource::PlannedResources,
+    label: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<String> {
+    let output = resources.capture_external_output(
+        execution_path,
+        ["--version"],
+        provenance_remaining(deadline)?.min(Duration::from_secs(10)),
+        label,
+    )?;
+    provenance_remaining(deadline)?;
+    if !output.status.success() {
+        return Err(BenchError::msg(format!(
+            "{label}: pinned solver version probe exited {}: {}",
+            output.status,
+            sanitize_metadata_text(output.stderr.trim())
+        )));
+    }
+    let text = if output.stdout.trim().is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    let version_output = sanitize_metadata_text(text.trim());
+    if version_output.is_empty() {
+        return Err(BenchError::msg(format!(
+            "{label}: pinned solver version probe produced no output"
+        )));
+    }
+    Ok(version_output)
+}
+
+fn provenance_remaining(deadline: Option<std::time::Instant>) -> Result<Duration> {
+    match deadline {
+        None => Ok(Duration::MAX),
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| BenchError::msg("original solver provenance deadline expired")),
     }
 }
 
@@ -270,6 +321,11 @@ impl SolverProvenance {
     }
 
     pub(crate) fn verify_current(&self) -> Result<()> {
+        self.verify_current_until(None)
+    }
+
+    fn verify_current_until(&self, deadline: Option<std::time::Instant>) -> Result<()> {
+        provenance_remaining(deadline)?;
         let canonical = std::fs::canonicalize(&self.path)
             .with_bench_context(|| format!("re-canonicalizing solver binary {}", self.path))?;
         if canonical.display().to_string() != self.path {
@@ -279,7 +335,10 @@ impl SolverProvenance {
                 canonical.display()
             )));
         }
-        let (sha256, size_bytes) = Self::file_identity(&canonical)?;
+        let (sha256, size_bytes) = match deadline {
+            Some(deadline) => Self::file_identity_until(&canonical, Some(deadline))?,
+            None => Self::file_identity(&canonical)?,
+        };
         if sha256 != self.sha256 || size_bytes != self.size_bytes {
             return Err(BenchError::msg(format!(
                 "solver binary changed during benchmark campaign: {} (expected {} / {} bytes, found {} / {} bytes)",
@@ -290,6 +349,14 @@ impl SolverProvenance {
     }
 
     fn file_identity(path: &Path) -> Result<(String, u64)> {
+        Self::file_identity_until(path, None)
+    }
+
+    fn file_identity_until(
+        path: &Path,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(String, u64)> {
+        provenance_remaining(deadline)?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -319,6 +386,7 @@ impl SolverProvenance {
         let mut size_bytes = 0_u64;
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
+            provenance_remaining(deadline)?;
             let read = file
                 .read(&mut buffer)
                 .with_bench_context(|| format!("hashing solver binary {}", path.display()))?;
@@ -334,7 +402,14 @@ impl SolverProvenance {
                     path.display()
                 )));
             }
-            hasher.update(&buffer[..read]);
+            let filled = buffer.get(..read).ok_or_else(|| {
+                BenchError::msg(format!(
+                    "hashing solver binary {} read {read} bytes into a {}-byte buffer",
+                    path.display(),
+                    buffer.len()
+                ))
+            })?;
+            hasher.update(filled);
         }
         let metadata_after = file
             .metadata()
@@ -345,6 +420,7 @@ impl SolverProvenance {
                 path.display()
             )));
         }
+        provenance_remaining(deadline)?;
         Ok((format!("sha256:{:x}", hasher.finalize()), size_bytes))
     }
 

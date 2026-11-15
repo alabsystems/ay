@@ -1,0 +1,179 @@
+[workspace]
+members = [
+	"veripb-checker",
+    "veripb-core-proved",
+    "veripb-formula",
+    "veripb-rules",
+    "veripb-parser",
+    "veripb-propagator",
+    "veripb-second-reader",
+]
+resolver = "3"
+
+
+[workspace.package]
+authors = ["Andy Oertel <andy.oertel@cs.lth.se>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92.0"
+repository = "https://gitlab.com/MIAOresearch/software/VeriPB"
+
+
+[package]
+name = "veripb"
+version = "3.0.2"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "VeriPB is a proof checker for verifying pseudo-Boolean certificates of satisfiability, unsatisfiability, and optimality bounds."
+keywords = ["pseudo-Boolean", "checker", "certification", "satisfiability", "optimization"]
+categories = ["command-line-utilities", "science"]
+exclude = [
+    "tests/instances"
+]
+autobenches = false
+default-run = "veripb"
+
+[features]
+default = []
+# The historical frontend is retained for independent regression tests. AY
+# consumes the checking libraries and supplies its own CLI and allocator.
+reference-cli = ["dep:colored", "dep:env_logger", "dep:git-version", "dep:itertools"]
+
+[dependencies]
+ahash = "0.8.12"
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+clap-verbosity-flag = "3.0"
+colored = { version = "3.1.1", optional = true }
+env_logger = { version = "0.11.11", optional = true }
+git-version = { version = "0.3.9", optional = true }
+itertools = { version = "0.15.0", optional = true }
+log = "0.4"
+thiserror = "2.0.20"
+
+[dependencies.veripb-checker]
+version = "0.1.0"
+path = "veripb-checker"
+
+[dependencies.veripb-formula]
+version = "0.1.2"
+path = "veripb-formula"
+
+[dependencies.veripb-parser]
+version = "0.1.2"
+path = "veripb-parser"
+
+
+[dev-dependencies]
+flate2 = "1"
+glob = "0.3.4"
+libtest-mimic = "0.8.2"
+# `tests/kernel_divergence.rs` builds constraints at the unbounded integer the
+# proved kernel is stated over, and reads rules as `veripb_rules::Instruction`.
+# Upstream dropped both from the ROOT crate when it moved malachite into the
+# sub-crates; they are restored here as dev-dependencies, which is where they
+# belong -- neither is used anywhere in `src/`.
+malachite-bigint = "0.10.0"
+tempfile = "3.27.0"
+xz2 = "0.1"
+zstd = "0.13"
+
+[dev-dependencies.veripb-propagator]
+version = "0.1.2"
+path = "veripb-propagator"
+
+[dev-dependencies.veripb-rules]
+version = "0.1.0"
+path = "veripb-rules"
+
+
+[lib]
+name = "veripb"
+path = "src/lib.rs"
+
+
+[[bin]]
+name = "veripb"
+path = "src/bin/main.rs"
+required-features = ["reference-cli"]
+
+[[bin]]
+name = "compare_benchmarks"
+path = "benches/compare_benchmarks.rs"
+required-features = ["reference-cli"]
+
+[[bench]]
+name = "veripb-bench"
+path = "benches/bench.rs"
+harness = false
+
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
+
+
+[[test]]
+name = "kernel_verify"
+path = "tests/kernel_verify.rs"
+harness = false
+
+
+[[test]]
+name = "kernel_verify_perf"
+path = "tests/kernel_verify_perf.rs"
+harness = false
+
+
+[profile.release]
+lto = true
+panic = "abort"
+# Integer overflow is a soundness failure in this checker, not a performance
+# question. A wrapped degree turns a trivially true constraint into the empty
+# contradiction, and the run prints `s VERIFIED UNSATISFIABLE` on a satisfiable
+# formula with exit 0 -- eighteen of the wrong-verdict regression INSTANCES in
+# this tree have exactly that shape (the seven round-1 wraps against upstream
+# `4bb10c2c` and the eleven round-2 wraps against the pre-fix `443f8abb`; they
+# are instances, not defects, and they span fewer defects than eighteen). With
+# overflow checks on, all eighteen abort instead: exit 134 and no `s ...` line,
+# sixteen naming the offending line in this workspace and two naming the
+# primitive integer operator in `core`.
+#
+# This is the profile that matters: `targo --unverified install --path .`, the
+# command the README gives users, builds `release`. CI ran `cargo nextest run
+# --workspace`, i.e. the dev profile, where overflow checks have always been
+# on -- which is how a green suite coexisted with eighteen shipped wraps.
+#
+# Measured 2026-08-23, when the setting was turned on: geometric-mean slowdown
+# x1.011 over five real normalized-PB25 instances (up to 10.2M variables) and
+# the `tests/kernel_verify_perf.rs` replay shapes as they stood then (six; a
+# seventh, `CnfWideClause`, was added afterwards) at 30-125x their in-tree
+# sizes; worst case x1.09 on a shape that does nothing but integer arithmetic;
+# x1.005 under `--kernel-verify`. Clean build +3%, binary +1.7%. The whole
+# workspace suite is green either way and the corpus verdicts are identical.
+#
+# Two caveats this measurement should have recorded and did not, kept here
+# rather than repeated in README and CHANGELOG, which now defer to this block:
+#
+#   * It names no hardware, no repetition count and no timer, unlike the two
+#     later measurements in this tree that do -- `tests/kernel_verify_perf.rs`
+#     and the `MAX_DENSE_VAR_IDX` doc comment in
+#     `veripb-formula/src/var_type.rs`. Follow those two for the house style.
+#   * The five PB25 instances are not in this repository and no script fetches
+#     them, so the headline x1.011 is NOT reproducible from a clone. The
+#     reproducible half is the replay shapes. Re-measure before quoting the
+#     aggregate, and note that per the audit recorded in
+#     `tests/kernel_verify_perf.rs`, LTO code placement alone is worth about
+#     +-9% on a single shape here -- so the x1.09 worst case is a single-shape
+#     ratio quoted at the magnitude of layout noise.
+overflow-checks = true
+# Comment out the following line for profiling to enable debug symbols.
+# debug = true
+
+[profile.bench]
+debug = true

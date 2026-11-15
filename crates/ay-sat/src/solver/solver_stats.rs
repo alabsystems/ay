@@ -494,6 +494,18 @@ pub(crate) struct SolverStats {
     /// #9102: learned clauses whose shrink path was skipped because every
     /// non-UIP literal was on a distinct decision level.
     pub shrink_singleton_fast_path_skips: u64,
+    /// Kissat `literals_deduced`: first-UIP clause literals (UIP included)
+    /// entering shrink/minimize, so the learned size can be read against it.
+    pub shrink_lits_deduced: u64,
+    /// Literals a block UIP replaced (block size minus one per success).
+    pub shrink_lits_block_removed: u64,
+    /// Literals the per-literal minimization fallback removed in failed blocks.
+    pub shrink_lits_fallback_removed: u64,
+    /// Block-UIP searches that reached the level's decision (no block UIP).
+    pub shrink_fail_decision: u64,
+    /// Block-UIP searches stopped by a lower-level reason literal that is
+    /// neither kept nor provably removable.
+    pub shrink_fail_lower: u64,
     /// #9102: LRAT removed-literal snapshots collected after shrink/minimize.
     pub lrat_original_learned_snapshot_copies: u64,
     /// #9102: literals copied into LRAT removed-literal snapshots.
@@ -803,6 +815,8 @@ pub(crate) struct SolverStats {
     pub stable_ema_fires: u64,
     /// Cumulative sum of LBD values fed to EMA updates.
     pub lbd_sum: u64,
+    /// Sum of learned-clause lengths (Kissat `literals_learned`).
+    pub learned_literals: u64,
     /// Count of LBD values fed to EMA updates.
     pub lbd_count: u64,
     /// Focused-mode: EMA condition true but blocked by conflict gate.
@@ -878,6 +892,92 @@ pub(crate) struct SolverStats {
     pub focused_decisions: u64,
     /// Stable-mode decisions.
     pub stable_decisions: u64,
+    /// Search conflicts found in stable mode (the rest were focused): the
+    /// stable share Kissat reports per mode, 67-92 percent on cabp-V-nos6.
+    pub stable_conflicts: u64,
+    /// Sampled decision-relevance measurement (every 1024th conflict, split
+    /// by mode): how many trail decisions the conflict analysis actually
+    /// touched (seen set). Separates branching-order quality from trail
+    /// depth in the decisions/conflict gap: decisions = Sum(level - target)
+    /// mixes both, and neither avg level nor LBD distinguishes them.
+    pub sampled_conflicts_focused: u64,
+    pub sampled_conflicts_stable: u64,
+    pub sampled_decisions_focused: u64,
+    pub sampled_decisions_stable: u64,
+    pub sampled_relevant_focused: u64,
+    pub sampled_relevant_stable: u64,
+    /// Source split of the sampled decisions above by bump-stamp age at
+    /// sample time: `recent` = bumped within the last 4096 bumps (the
+    /// variable order the branching heuristic just promoted), `stale` =
+    /// older or never bumped since long ago. Separates stale-queue-order
+    /// dilution from fresh-bump misranking within focused mode.
+    pub sampled_decisions_recent_focused: u64,
+    pub sampled_decisions_recent_stable: u64,
+    pub sampled_relevant_recent_focused: u64,
+    pub sampled_relevant_recent_stable: u64,
+    pub sampled_decisions_stale_focused: u64,
+    pub sampled_decisions_stale_stable: u64,
+    pub sampled_relevant_stale_focused: u64,
+    pub sampled_relevant_stale_stable: u64,
+    /// Sum of analyzed-set sizes at the sampled conflicts (same sampling as
+    /// the relevance counters), per mode. Normalizes relevance by how much
+    /// of the formula each conflict touches: identical relevance at larger
+    /// analyzed sets is weaker branching signal, not equal quality.
+    pub sampled_analyzed_focused: u64,
+    pub sampled_analyzed_stable: u64,
+    /// Sums over the same sampled conflicts of trail length, trail literals
+    /// whose variable has a target phase, and those agreeing with it, per
+    /// mode. Tests whether shallower AY descents (fewer assigned vars at
+    /// conflict than Kissat) come from weaker cascades per decision or from
+    /// descent divergence from the target assignment.
+    pub sampled_trail_len_focused: u64,
+    pub sampled_trail_len_stable: u64,
+    pub sampled_target_set_focused: u64,
+    pub sampled_target_set_stable: u64,
+    pub sampled_target_agree_focused: u64,
+    pub sampled_target_agree_stable: u64,
+    /// Descent-length histogram: decisions per restart segment, bucketed
+    /// [<=64, 65..=256, 257..=1024, >1024], per mode at restart time, plus
+    /// the decision total at the previous restart. Read-only diagnostic
+    /// for the decision-stack-height difference vs Kissat (equal
+    /// conflicts/restart but far more AY decisions/restart on 67133027).
+    pub descent_hist_focused: [u64; 4],
+    pub descent_hist_stable: [u64; 4],
+    pub decisions_at_last_restart: u64,
+    /// Propagations-per-decision histogram: BCP assignments after each
+    /// decision until the next decision point, bucketed
+    /// [0, 1..=16, 17..=64, 65..=256, 257..=1024, >1024] and split at
+    /// the 1024th conflict (early vs late search). Read-only diagnostic
+    /// for the implication-density gap vs Kissat on 67133027-class rows.
+    pub prop_decision_hist_early: [u64; 6],
+    pub prop_decision_hist_late: [u64; 6],
+    /// Zero-propagation decisions split by the attributed decision's
+    /// level band [1..=8, 9..=64, 65..=512, >512] and by mode
+    /// [focused, stable], plus all decisions by level band for rates.
+    /// Separates deep-trail don't-care decisions from bulk re-decision.
+    pub prop_zero_by_level: [u64; 4],
+    pub prop_zero_by_mode: [u64; 2],
+    pub decisions_by_level: [u64; 4],
+    /// Decisions taken while BCP had not consumed the whole trail
+    /// (qhead < trail.len() at the decision point). Zero in a strict
+    /// decide/propagate alternation; separates true decision batching
+    /// from propagation-counter coverage gaps in the histogram above.
+    pub decisions_with_pending_props: u64,
+    /// Propagation total at the previous decision point; the first
+    /// decision has no predecessor to attribute propagations to.
+    pub props_at_last_decision: u64,
+    pub seen_first_decision: bool,
+    pub last_decision_level: u32,
+    pub last_decision_stable: bool,
+    /// First 128 main-driver search decisions (variable index + 1;
+    /// probe/backbone decisions excluded), for decision-ordering
+    /// comparison against Kissat on 67133027-class rows.
+    pub first_search_decisions: [u32; 128],
+    pub first_search_decisions_len: u64,
+    /// `--sat-stable-lock-at`: the classifier's score (x1000) and the conflict
+    /// count at which stable mode was locked (0: not locked).
+    pub stable_lock_score_milli: i64,
+    pub stable_locked_at: u64,
     /// Cumulative per-pass inprocessing wall time in nanoseconds.
     pub inprocessing_time_ns: [u64; INPROCESS_TIMING_LABELS.len()],
     /// Per-pass attempt/run/yield counters for policy tuning.
@@ -900,6 +1000,19 @@ pub(crate) struct SolverStats {
     pub bounded_backbone_backoff_triggers: u64,
     /// Bounded-CDCL backbone calls, excluding binary-backbone calls.
     pub bounded_backbone_runs: u64,
+    /// Bounded-CDCL backbone passes that reached the last variable (pass marks on).
+    pub backbone_completed_passes: u64,
+    /// Stacked binary-backbone rounds, probes, and conflicts refused as units
+    /// because they reached below the probe's level (`backbone_stacked.rs`).
+    pub backbone_stacked_rounds: u64,
+    pub backbone_stacked_probes: u64,
+    pub backbone_stacked_guard_skips: u64,
+    /// Where a guard-skipped conflict reached: a root-false side, a stacked
+    /// lower level, a dead clause still watched, an analysis off the level.
+    pub backbone_stacked_skip_other_root: u64,
+    pub backbone_stacked_skip_other_stack: u64,
+    pub backbone_stacked_skip_dead_clause: u64,
+    pub backbone_stacked_skip_uip_level: u64,
     /// Bounded-CDCL backbone calls that produced a pass-local yield.
     pub bounded_backbone_yields: u64,
     /// Bounded-CDCL backbone wall time, excluding binary-backbone calls.
@@ -932,12 +1045,6 @@ pub(crate) struct SolverStats {
     /// Total simplifications across all inprocessing rounds (#8099).
     /// Counts clauses removed + literals strengthened per round.
     pub inprocessing_simplifications: u64,
-    /// GPU BVE: completed GPU resolvent dispatches.
-    pub gpu_bve_dispatches: u64,
-    /// GPU BVE: ordered positive/negative clause pairs processed.
-    pub gpu_bve_pairs: u64,
-    /// GPU BVE: tautological resolvents skipped after GPU generation.
-    pub gpu_bve_tautologies: u64,
     /// Wall-clock time spent in preprocessing phase (nanoseconds).
     pub preprocess_time_ns: u64,
     /// Wall-clock time spent in CDCL search loop (nanoseconds).
@@ -959,6 +1066,9 @@ pub(crate) struct SolverStats {
     pub indep_support_decidable_vars: u64,
     /// Gate definitions recovered by the independent-support computation.
     pub indep_support_gates: u64,
+    /// Free variables in the GE basis over the recovered XOR gates
+    /// (0 when no basis was built; `indep_support/ge.rs`).
+    pub indep_support_ge_free_vars: u64,
     /// Supports refused because the closure replay left a decidable variable
     /// underivable.
     pub indep_support_closure_rejected: u64,
@@ -1016,6 +1126,8 @@ pub(crate) struct SolverStats {
     pub rephase_walk_gate_skips: u64,
     /// Number of MAB arm switches (branch heuristic changes via UCB1).
     pub mab_arm_switches: u64,
+    /// MAB-UCB1 branch epochs completed (an arm was scored and the next one picked).
+    pub mab_epochs: u64,
     /// Retired SAT propagation compiler: propagations discovered by native code.
     /// Retained as zeroed telemetry after production removal in #8517.
     pub jit_propagations: u64,
@@ -1134,6 +1246,8 @@ pub(crate) struct SolverStats {
     pub learned_reduction_deleted: u64,
     /// Learned clause reduction telemetry: clauses protected because they are reasons.
     pub learned_reduction_reason_protected: u64,
+    /// Learned binary clauses left out of reduction (`--sat-keep-learned-binaries`).
+    pub learned_reduction_binary_kept: u64,
     /// Learned clause reduction telemetry: IC3 lemmas protected from deletion.
     pub learned_reduction_ic3_protected: u64,
     /// Learned clause reduction telemetry: low-LBD clauses protected from deletion.
@@ -1418,33 +1532,6 @@ pub(crate) struct SolverStats {
     /// Deduplication is a form of subsumption (exact duplicate = trivially
     /// subsumed). Tracked separately for per-source breakdown.
     pub dedup_deleted: u64,
-
-    /// Approximate-BCP filter (#8789 Phase 2): number of active clauses the
-    /// filter classified as `NoopLikely` (≥2 surviving signature bits,
-    /// i.e., the clause is definitely not unit and definitely not
-    /// falsified) where the exact BCP view agreed — the clause was
-    /// neither unit nor falsified on the real trail. A high ratio of
-    /// `approx_bcp_noop_matched` to total filter invocations quantifies
-    /// the Phase 3 BCP-skip potential. Always zero when the
-    /// `approx-bcp-filter` feature is off.
-    pub approx_bcp_noop_matched: u64,
-    /// Approximate-BCP filter (#8789 Phase 2): number of active clauses the
-    /// filter classified as `ConflictLikely` (≤1 surviving signature bit,
-    /// i.e., "maybe unit or falsified") where the exact BCP view also
-    /// saw the clause as unit or falsified under the current trail.
-    /// This is the true-positive column of the filter's confusion
-    /// matrix. Always zero when the `approx-bcp-filter` feature is off.
-    pub approx_bcp_conflict_matched: u64,
-    /// Approximate-BCP filter (#8789 Phase 2): number of active clauses
-    /// where the filter returned `NoopLikely` ("≥2 literals not
-    /// falsified, safe to skip") but the exact trail-based check found
-    /// the clause was actually unit or falsified. This counter **must
-    /// stay at zero** for the filter to be sound — a nonzero value
-    /// means the soundness property in `filter::may_be_unit_or_falsified`
-    /// is violated on real solver state. Phase 2 integration flags this
-    /// as a hard correctness bug. Always zero when the
-    /// `approx-bcp-filter` feature is off.
-    pub approx_bcp_mismatch_detected: u64,
 }
 
 impl SolverStats {
@@ -2009,6 +2096,11 @@ impl SolverStats {
             shrink_block_attempts: 0,
             shrink_block_successes: 0,
             shrink_singleton_fast_path_skips: 0,
+            shrink_lits_deduced: 0,
+            shrink_lits_block_removed: 0,
+            shrink_lits_fallback_removed: 0,
+            shrink_fail_decision: 0,
+            shrink_fail_lower: 0,
             lrat_original_learned_snapshot_copies: 0,
             lrat_original_learned_snapshot_literals: 0,
             lrat_original_learned_snapshot_singleton_skips: 0,
@@ -2166,6 +2258,7 @@ impl SolverStats {
             stable_reluctant_fires: 0,
             stable_ema_fires: 0,
             lbd_sum: 0,
+            learned_literals: 0,
             lbd_count: 0,
             focused_ema_blocked_by_conflict_gate: 0,
             dense_mutex_focused_restart_gate_updates: 0,
@@ -2193,6 +2286,46 @@ impl SolverStats {
             level_at_conflict_sum: 0,
             focused_decisions: 0,
             stable_decisions: 0,
+            stable_conflicts: 0,
+            sampled_conflicts_focused: 0,
+            sampled_conflicts_stable: 0,
+            sampled_decisions_focused: 0,
+            sampled_decisions_stable: 0,
+            sampled_relevant_focused: 0,
+            sampled_relevant_stable: 0,
+            sampled_decisions_recent_focused: 0,
+            sampled_decisions_recent_stable: 0,
+            sampled_relevant_recent_focused: 0,
+            sampled_relevant_recent_stable: 0,
+            sampled_decisions_stale_focused: 0,
+            sampled_decisions_stale_stable: 0,
+            sampled_relevant_stale_focused: 0,
+            sampled_relevant_stale_stable: 0,
+            sampled_analyzed_focused: 0,
+            sampled_analyzed_stable: 0,
+            sampled_trail_len_focused: 0,
+            sampled_trail_len_stable: 0,
+            sampled_target_set_focused: 0,
+            sampled_target_set_stable: 0,
+            sampled_target_agree_focused: 0,
+            sampled_target_agree_stable: 0,
+            descent_hist_focused: [0; 4],
+            descent_hist_stable: [0; 4],
+            decisions_at_last_restart: 0,
+            prop_decision_hist_early: [0; 6],
+            prop_decision_hist_late: [0; 6],
+            prop_zero_by_level: [0; 4],
+            prop_zero_by_mode: [0; 2],
+            decisions_by_level: [0; 4],
+            decisions_with_pending_props: 0,
+            props_at_last_decision: 0,
+            seen_first_decision: false,
+            last_decision_level: 0,
+            last_decision_stable: false,
+            first_search_decisions: [0; 128],
+            first_search_decisions_len: 0,
+            stable_lock_score_milli: 0,
+            stable_locked_at: 0,
             inprocessing_time_ns: [0; INPROCESS_TIMING_LABELS.len()],
             inprocessing_pass_attempts: [0; INPROCESS_ACCOUNTING_LABELS.len()],
             inprocessing_pass_runs: [0; INPROCESS_ACCOUNTING_LABELS.len()],
@@ -2203,6 +2336,14 @@ impl SolverStats {
             inprocessing_yield_rescue_backbone_cooldown_rounds: 0,
             bounded_backbone_backoff_triggers: 0,
             bounded_backbone_runs: 0,
+            backbone_completed_passes: 0,
+            backbone_stacked_rounds: 0,
+            backbone_stacked_probes: 0,
+            backbone_stacked_guard_skips: 0,
+            backbone_stacked_skip_other_root: 0,
+            backbone_stacked_skip_other_stack: 0,
+            backbone_stacked_skip_dead_clause: 0,
+            backbone_stacked_skip_uip_level: 0,
             bounded_backbone_yields: 0,
             bounded_backbone_ms: 0,
             bounded_backbone_binary_suppressed: 0,
@@ -2215,9 +2356,6 @@ impl SolverStats {
             incremental_reconnect_watches_us: 0,
             incremental_reconnect_watches_calls: 0,
             inprocessing_simplifications: 0,
-            gpu_bve_dispatches: 0,
-            gpu_bve_pairs: 0,
-            gpu_bve_tautologies: 0,
             preprocess_time_ns: 0,
             search_time_ns: 0,
             lucky_time_ns: 0,
@@ -2227,6 +2365,7 @@ impl SolverStats {
             indep_support_installed_size: 0,
             indep_support_decidable_vars: 0,
             indep_support_gates: 0,
+            indep_support_ge_free_vars: 0,
             indep_support_closure_rejected: 0,
             indep_support_rejected_size: 0,
             indep_support_decisions: 0,
@@ -2248,6 +2387,7 @@ impl SolverStats {
             rephase_walk_runs: 0,
             rephase_walk_gate_skips: 0,
             mab_arm_switches: 0,
+            mab_epochs: 0,
             jit_propagations: 0,
             jit_conflicts: 0,
             jit_blocker_skips: 0,
@@ -2299,6 +2439,7 @@ impl SolverStats {
             learned_reduction_considered: 0,
             learned_reduction_deleted: 0,
             learned_reduction_reason_protected: 0,
+            learned_reduction_binary_kept: 0,
             learned_reduction_ic3_protected: 0,
             learned_reduction_low_lbd_protected: 0,
             learned_reduction_usage_protected: 0,
@@ -2408,9 +2549,6 @@ impl SolverStats {
             mli_used_in_analysis: 0,
             compact_stale_clauses_deleted: 0,
             dedup_deleted: 0,
-            approx_bcp_noop_matched: 0,
-            approx_bcp_conflict_matched: 0,
-            approx_bcp_mismatch_detected: 0,
         }
     }
 
@@ -2426,6 +2564,64 @@ impl SolverStats {
             _ => 4,
         };
         self.lbd_buckets[idx] += 1;
+    }
+
+    /// Attribute the propagations since the previous decision point to
+    /// that decision and start a new attribution window. Called once per
+    /// decision, after all propagations for the previous decision are
+    /// complete. Read-only w.r.t. search state.
+    #[inline]
+    pub(crate) fn record_prop_decision(
+        &mut self,
+        propagations: u64,
+        conflicts: u64,
+        level: u32,
+        stable_mode: bool,
+    ) {
+        fn level_band(level: u32) -> usize {
+            match level {
+                0..=8 => 0,
+                9..=64 => 1,
+                65..=512 => 2,
+                _ => 3,
+            }
+        }
+        self.decisions_by_level[level_band(level)] += 1;
+        if self.seen_first_decision {
+            let delta = propagations.saturating_sub(self.props_at_last_decision);
+            let bucket = match delta {
+                0 => 0,
+                1..=16 => 1,
+                17..=64 => 2,
+                65..=256 => 3,
+                257..=1024 => 4,
+                _ => 5,
+            };
+            if conflicts < 1024 {
+                self.prop_decision_hist_early[bucket] += 1;
+            } else {
+                self.prop_decision_hist_late[bucket] += 1;
+            }
+            if delta == 0 {
+                self.prop_zero_by_level[level_band(self.last_decision_level)] += 1;
+                self.prop_zero_by_mode[usize::from(self.last_decision_stable)] += 1;
+            }
+        }
+        self.seen_first_decision = true;
+        self.props_at_last_decision = propagations;
+        self.last_decision_level = level;
+        self.last_decision_stable = stable_mode;
+    }
+
+    /// Record one main-driver search decision variable (0-based index)
+    /// while the bounded first-128 trace has room. Read-only.
+    #[inline]
+    pub(crate) fn record_first_search_decision(&mut self, var_index: u32) {
+        let len = self.first_search_decisions_len;
+        if len < self.first_search_decisions.len() as u64 {
+            self.first_search_decisions[len as usize] = var_index + 1;
+            self.first_search_decisions_len = len + 1;
+        }
     }
 
     /// Record a decision level for peak/average tracking (#8131).
@@ -2560,5 +2756,54 @@ mod tests {
         );
         assert!(top_fsw.iter().all(|row| row.fsw_steps > 0));
         assert_eq!(table.top_fsw_scan_steps(2), 12);
+    }
+
+    #[test]
+    fn prop_decision_histogram_buckets_and_early_late_split() {
+        let mut stats = SolverStats::new();
+        // First decision only opens the attribution window.
+        stats.record_prop_decision(100, 0, 1, false);
+        assert_eq!(stats.prop_decision_hist_early, [0; 6]);
+        // Deltas: 0, 16, 17, 256, 1024, 1025 -> one per bucket, early.
+        stats.record_prop_decision(100, 1, 2, false);
+        stats.record_prop_decision(116, 2, 3, false);
+        stats.record_prop_decision(133, 3, 4, false);
+        stats.record_prop_decision(389, 4, 5, false);
+        stats.record_prop_decision(1413, 5, 6, false);
+        stats.record_prop_decision(2438, 1023, 7, true);
+        assert_eq!(stats.prop_decision_hist_early, [1, 1, 1, 1, 1, 1]);
+        assert_eq!(stats.prop_decision_hist_late, [0; 6]);
+        // The single early zero is attributed to the level-1 focused
+        // decision that opened the window.
+        assert_eq!(stats.prop_zero_by_level, [1, 0, 0, 0]);
+        assert_eq!(stats.prop_zero_by_mode, [1, 0]);
+        // At 1024 conflicts the same zero delta lands in the late split,
+        // attributed to the level-7 stable decision before it.
+        stats.record_prop_decision(2438, 1024, 1, false);
+        assert_eq!(stats.prop_decision_hist_late, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(stats.prop_zero_by_level, [2, 0, 0, 0]);
+        assert_eq!(stats.prop_zero_by_mode, [1, 1]);
+        // A regressive propagation counter saturates to a zero delta;
+        // a deep decision attributes its zero to the top level band.
+        stats.record_prop_decision(2438, 1500, 600, false);
+        stats.record_prop_decision(7, 2000, 601, false);
+        assert_eq!(stats.prop_decision_hist_late, [3, 0, 0, 0, 0, 0]);
+        assert_eq!(stats.prop_zero_by_level, [3, 0, 0, 1]);
+        assert_eq!(stats.decisions_by_level, [8, 0, 0, 2]);
+    }
+
+    #[test]
+    fn first_search_decisions_record_and_saturate() {
+        let mut stats = SolverStats::new();
+        stats.record_first_search_decision(41);
+        stats.record_first_search_decision(0);
+        assert_eq!(stats.first_search_decisions_len, 2);
+        assert_eq!(stats.first_search_decisions[0], 42);
+        assert_eq!(stats.first_search_decisions[1], 1);
+        for var in 0..500u32 {
+            stats.record_first_search_decision(var);
+        }
+        assert_eq!(stats.first_search_decisions_len, 128);
+        assert_eq!(stats.first_search_decisions[127], 126);
     }
 }

@@ -1,0 +1,58 @@
+# AY certified-track CI instance set.
+#
+# Every row is an instance committed to THIS repository, the status AY must
+# report, and the conclusion the pinned VeriPB must confirm. Nothing here
+# depends on an external corpus, so a fresh clone can run the whole gate.
+#
+# COLUMNS
+#   instance    repo-relative path
+#   mode        verify      proof MUST exist and MUST be accepted by the checker
+#                           with the expected conclusion. Anything else fails CI.
+#               unverifiable
+#                           the pinned checker cannot even parse the FORMULA, so
+#                           no verdict is obtainable. AY's status is still
+#                           checked, and the gate FAILS if the checker ever
+#                           starts accepting the proof — that means the row can
+#                           be promoted to `verify` and must not stay quiet.
+#   status      the `s ...` line AY must print
+#   conclusion  the checker's conclusion text, as VeriPB restates it
+#               (`SATISFIABLE`, `UNSATISFIABLE`, `BOUNDS <lo> <= obj <= <hi>`);
+#               `-` for `unverifiable` rows
+#
+# Fields are TAB-separated (conclusions contain spaces). `#` starts a comment.
+#
+# COVERAGE, by certified proof class:
+#   DEC-LIN SAT ........ trivial-sat, cardinality-5
+#   DEC-LIN UNSAT ...... trivial-unsat, clausal-unsat-2x4, pigeonhole-3-2
+#   OPT-LIN optimum .... optimization-small, optimization-weighted (all-positive
+#                        objective), opt-negative-objective (mixed sign, negative
+#                        optimum — the case the `optimum <= 0` early return used
+#                        to swallow)
+#   OPT-LIN infeasible . opt-unsat-infeasible (BOUNDS INF <= obj <= INF)
+#   NLC ................ nonlinear-small (unverifiable: see below)
+#
+# instance	mode	status	conclusion
+benchmarks/pb-comp/test-instances/trivial-sat.opb	verify	s SATISFIABLE	SATISFIABLE
+benchmarks/pb-comp/test-instances/cardinality-5.opb	verify	s SATISFIABLE	SATISFIABLE
+benchmarks/pb-comp/test-instances/trivial-unsat.opb	verify	s UNSATISFIABLE	UNSATISFIABLE
+benchmarks/pb-comp/test-instances/clausal-unsat-2x4.opb	verify	s UNSATISFIABLE	UNSATISFIABLE
+benchmarks/pb-comp/test-instances/pigeonhole-3-2.opb	verify	s UNSATISFIABLE	UNSATISFIABLE
+benchmarks/pb-comp/test-instances/optimization-small.opb	verify	s OPTIMUM FOUND	BOUNDS 3 <= obj <= 3
+benchmarks/pb-comp/test-instances/optimization-weighted.opb	verify	s OPTIMUM FOUND	BOUNDS 3 <= obj <= 3
+ci/cert-instances/opt-negative-objective.opb	verify	s OPTIMUM FOUND	BOUNDS -2 <= obj <= -2
+ci/cert-instances/opt-unsat-infeasible.opb	verify	s UNSATISFIABLE	BOUNDS INF <= obj <= INF
+# Statuses are those of the PB competition binary `ay-pb` (the gate's default
+# AY_PB_BIN). Running the gate with AY_PB_BIN=target/release/ay currently fails
+# on the row below only: the `ay` CLI answers `s UNSUPPORTED` for non-linear
+# input where `ay-pb` answers `s SATISFIABLE`. That divergence is a real
+# front-end inconsistency, recorded here rather than papered over.
+#
+# NLC: VeriPB 3.0.2's OPB parser has no non-linear term grammar — it stops at
+# `+1 x1 x2` with "Expected '>=', '<=', or integer!" and never reaches the
+# proof. AY emits a proof file regardless, which is therefore an UNCHECKABLE
+# certificate today, not a verified one. Recorded rather than deleted so the
+# gap stays visible and so the row flips to a hard failure the moment a checker
+# can parse it.
+benchmarks/pb-comp/test-instances/nonlinear-small.opb	unverifiable	s SATISFIABLE	-
+ci/cert-instances/opt-oddcycle-halfintegral.opb	verify	s OPTIMUM FOUND	BOUNDS -2 <= obj <= -2
+ci/cert-instances/opt-knapsack-fractional-dual.opb	verify	s OPTIMUM FOUND	BOUNDS -84 <= obj <= -84

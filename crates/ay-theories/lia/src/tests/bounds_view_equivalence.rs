@@ -25,7 +25,7 @@ fn reference_bounds(solver: &LiaSolver<'_>, tid: TermId) -> (Option<BigInt>, Opt
             continue;
         }
 
-        let TermData::App(Symbol::Named(name), args) = solver.terms.get(literal) else {
+        let TermData::App(Symbol::Named(name), args) = solver.terms().get(literal) else {
             continue;
         };
 

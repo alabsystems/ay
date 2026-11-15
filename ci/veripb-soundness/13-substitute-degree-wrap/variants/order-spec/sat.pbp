@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+% The same formula and binary with a model: `x1 OR x2` is satisfiable.
+sol x1 x2 ;
+output NONE;
+conclusion SAT : x1 x2 ;
+end pseudo-Boolean proof;

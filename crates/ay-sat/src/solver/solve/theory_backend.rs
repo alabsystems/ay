@@ -6,6 +6,9 @@
 
 use super::super::*;
 use super::theory_callback::{NullCallback, TheoryCallback, TheoryModelCheck};
+use super::ProofProgress;
+
+mod main_driver;
 
 impl Solver {
     pub(crate) fn disable_extension_inprocessing(&mut self) {
@@ -217,11 +220,22 @@ impl Solver {
     where
         F: Fn() -> bool,
     {
+        self.cdcl_loop_pure_with_proof_progress(should_stop, None)
+    }
+
+    pub(super) fn cdcl_loop_pure_with_proof_progress<F>(
+        &mut self,
+        should_stop: F,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult
+    where
+        F: Fn() -> bool,
+    {
         if self.cold.tla_trace.is_some() {
             let mut callback = NullCallback;
-            self.cdcl_loop_impl::<false, _, _>(&mut callback, should_stop)
+            self.cdcl_loop_impl::<false, _, _>(&mut callback, should_stop, proof_progress)
         } else {
-            self.cdcl_loop_main_no_tla(should_stop)
+            self.cdcl_loop_main_no_tla(should_stop, proof_progress)
         }
     }
 
@@ -238,7 +252,7 @@ impl Solver {
         C: TheoryCallback,
         F: Fn() -> bool,
     {
-        self.cdcl_loop_impl::<true, _, _>(callback, should_stop)
+        self.cdcl_loop_impl::<true, _, _>(callback, should_stop, None)
     }
 
     #[inline]
@@ -290,135 +304,23 @@ impl Solver {
         }
     }
 
-    /// Main/default CDCL loop for pure SAT with no TLA tracing.
-    ///
-    /// This is intentionally a direct spelling of the `USE_CALLBACK = false`
-    /// path from `cdcl_loop_impl`: no theory callback object, no theory model
-    /// checks, and no per-iteration TLA branches. The TLA-enabled pure route
-    /// continues to use `cdcl_loop_impl::<false>` above.
-    fn cdcl_loop_main_no_tla<F>(&mut self, should_stop: F) -> SatResult
+    /// The same default pure search schedule is shared by ordinary and counted
+    /// operation policies. The latter retains the original invocation owner;
+    /// selected operations not yet admitted stop before their ordinary tail.
+    fn cdcl_loop_main_no_tla<F>(
+        &mut self,
+        should_stop: F,
+        proof_progress: ProofProgress<'_>,
+    ) -> SatResult
     where
         F: Fn() -> bool,
     {
-        // Branch-independent time-based interrupt (see solve_with_assumptions_impl):
-        // a restart-thrash regime can starve the per-conflict/per-decision
-        // `should_stop` checks below, so check it at the loop top, amortized every
-        // 1024 iterations, to keep wall-clock query deadlines fail-closed.
-        let mut loop_iters: u64 = 0;
-        loop {
-            if let Some(reason) = self.active_interrupt_reason() {
-                return self.declare_unknown_with_reason(reason);
-            }
-            loop_iters = loop_iters.wrapping_add(1);
-            if loop_iters & 1023 == 0 {
-                if let Some(reason) = self.solve_stop_reason(&should_stop) {
-                    return self.declare_unknown_with_reason(reason);
-                }
-                // Conflict-independent memory poll (see cdcl_loop_impl): the
-                // reduction-time poll requires conflicts, so a low-conflict
-                // regime would otherwise never see the process memory gate.
-                self.poll_process_memory_limit_now();
-            }
-
-            self.import_portfolio_shared_clauses_at_root();
-
-            if self.has_empty_clause {
-                return self.declare_unsat();
-            }
-
-            if let Some(conflict_ref) = self.search_propagate_standard() {
-                if self.decision_level == 0 {
-                    if self.cold.trace_ext_conflict {
-                        self.trace_bcp_conflict_level0(conflict_ref);
-                    }
-                    self.record_level0_conflict_chain(conflict_ref);
-                    return self.declare_unsat();
-                }
-
-                self.conflicts_since_restart += 1;
-                self.num_conflicts += 1;
-                self.on_conflict_random_decision();
-                self.notify_observer_conflict();
-
-                if self.cold.trace_ext_conflict {
-                    self.trace_bcp_conflict_detail(conflict_ref);
-                }
-
-                if self.resource_budget_exhausted() {
-                    return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
-                }
-                if self.num_conflicts.is_multiple_of(100) {
-                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
-                        return self.declare_unknown_with_reason(reason);
-                    }
-                    self.maybe_emit_progress();
-                }
-
-                self.analyze_and_backtrack(conflict_ref, "main search loop", |_, _| {});
-                self.maybe_run_restart_pure();
-                continue;
-            }
-
-            // BCP drained without a conflict: the one point in the loop where a
-            // compaction deferred by `reduce_db` can actually run.
-            self.run_deferred_arena_compaction();
-
-            let restarted = self.maybe_run_restart_pure();
-            if restarted {
-            } else if self.should_rephase() {
-                if self.decision_level != 0 {
-                    self.backtrack(0);
-                }
-                self.rephase();
-                // The rephase walk satisfied every included clause and the
-                // candidate passed reconstruction + full clause-DB
-                // verification (latch_rephase_walk_model). We are at level 0
-                // — the same safe point the startup walk declares from.
-                if let Some(model) = self.cold.rephase_walk_model.take() {
-                    return self.declare_sat_from_model(model);
-                }
-            } else if self.should_run_lookahead() {
-                debug_assert_eq!(self.decision_level, 0);
-                self.run_lookahead_round();
-                if self.has_empty_clause {
-                    return self.declare_unsat();
-                }
-            } else if self.inprocessing_gates_pass() {
-                if self.decision_level != 0 {
-                    self.backtrack(0);
-                }
-                let found_unsat = self.run_restart_inprocessing();
-                if found_unsat {
-                    return self.declare_unsat();
-                }
-                continue;
-            } else if let Some(la_lit) = self.take_lookahead_decision() {
-                self.decide(la_lit);
-                if self.num_decisions.is_multiple_of(1000) {
-                    // Deterministic decision-budget checkpoint FIRST
-                    // (#ground-determinism), then the nondeterministic
-                    // external stops — so a budget-exhausted stop is
-                    // attributed to the budget on every host.
-                    if self.decision_budget_exhausted() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
-                    }
-                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
-                        return self.declare_unknown_with_reason(reason);
-                    }
-                }
-            } else if let Some(var) = self.pick_next_decision_variable_main() {
-                let lit = self.pick_phase(var);
-                self.decide(lit);
-                if self.num_decisions.is_multiple_of(1000) {
-                    if self.decision_budget_exhausted() {
-                        return self.declare_unknown_with_reason(SatUnknownReason::ResourceBudget);
-                    }
-                    if let Some(reason) = self.solve_stop_reason(&should_stop) {
-                        return self.declare_unknown_with_reason(reason);
-                    }
-                }
-            } else {
-                return self.declare_cdcl_complete_assignment_sat_no_tla();
+        if self.cold.counted_admission.is_some() {
+            main_driver::counted::run(self, &should_stop, proof_progress)
+        } else {
+            match main_driver::run_ordinary(self, &should_stop, proof_progress) {
+                Ok(result) => result,
+                Err(reason) => self.declare_unknown_with_reason(reason),
             }
         }
     }
@@ -427,6 +329,7 @@ impl Solver {
         &mut self,
         callback: &mut C,
         should_stop: F,
+        proof_progress: ProofProgress<'_>,
     ) -> SatResult
     where
         C: TheoryCallback,
@@ -437,6 +340,9 @@ impl Solver {
         // the wall-clock query deadline.
         let mut loop_iters: u64 = 0;
         loop {
+            if let Some(reason) = self.counted_step_stop_reason() {
+                return self.declare_unknown_with_reason(reason);
+            }
             if let Some(reason) = self.active_interrupt_reason() {
                 return self.declare_unknown_with_reason(reason);
             }
@@ -463,7 +369,7 @@ impl Solver {
 
             // Check if an inprocessing/theory lemma detected global UNSAT.
             if self.has_empty_clause {
-                return self.declare_unsat();
+                return self.declare_unsat_with_proof_progress(proof_progress);
             }
 
             // Propagate — search-specialized BCP (no probe/vivify overhead).
@@ -478,9 +384,13 @@ impl Solver {
                 0
             };
             let propagate_result = if USE_CALLBACK {
-                self.search_propagate()
+                self.search_propagate_counted()
             } else {
-                self.search_propagate_standard()
+                self.search_propagate_standard_counted()
+            };
+            let propagate_result = match propagate_result {
+                Ok(conflict) => conflict,
+                Err(reason) => return self.declare_unknown_with_reason(reason),
             };
             if let Some(conflict_ref) = propagate_result {
                 if self.cold.tla_trace.is_some() {
@@ -509,11 +419,15 @@ impl Solver {
                         callback.materialize_lazy_reasons(self);
                     }
                     self.record_level0_conflict_chain(conflict_ref);
-                    return self.declare_unsat();
+                    return self.declare_unsat_with_proof_progress(proof_progress);
                 }
 
                 self.conflicts_since_restart += 1;
                 self.num_conflicts += 1;
+                self.stats.stable_conflicts += u64::from(self.stable_mode);
+                if self.num_conflicts >= self.cold.stable_lock_at {
+                    self.decide_stable_lock();
+                }
                 self.on_conflict_random_decision();
                 self.notify_observer_conflict();
                 // #8452: BCP-level conflict — not a direct theory conflict.
@@ -548,13 +462,7 @@ impl Solver {
                 }
 
                 if USE_CALLBACK {
-                    // #8467: Pre-materialize lazy theory reasons at the current
-                    // decision level so 1UIP resolution never encounters them.
-                    callback.materialize_lazy_reasons(self);
-                    let context = callback.conflict_context();
-                    self.analyze_and_backtrack(conflict_ref, context, |solver, level| {
-                        callback.backtrack_after_materializing_lazy_reasons(solver, level);
-                    });
+                    self.analyze_theory_conflict(conflict_ref, callback);
                 } else {
                     self.analyze_and_backtrack(conflict_ref, "main search loop", |_, _| {});
                 }
@@ -580,6 +488,9 @@ impl Solver {
 
             if USE_CALLBACK {
                 // Run backend-specific propagation checks before making a SAT decision.
+                if let Some(reason) = self.counted_step_stop_reason() {
+                    return self.declare_unknown_with_reason(reason);
+                }
                 let mut theory_result = callback.propagate(self);
                 if self.cold.trace_ext_conflict {
                     self.trace_theory_result_tag(&theory_result);
@@ -598,6 +509,9 @@ impl Solver {
                 if matches!(theory_result, TheoryPropResult::Continue)
                     && self.trail.len() > trail_len_before_prop
                 {
+                    if let Some(reason) = self.counted_step_stop_reason() {
+                        return self.declare_unknown_with_reason(reason);
+                    }
                     let forced = callback.propagate_force(self);
                     if self.cold.trace_ext_conflict {
                         self.trace_theory_result_tag(&forced);
@@ -668,6 +582,9 @@ impl Solver {
                         self.stats.bcp_theory_fixpoint_entries += 1;
                         let mut fixpoint_iter = 0u32;
                         loop {
+                            if let Some(reason) = self.counted_step_stop_reason() {
+                                return self.declare_unknown_with_reason(reason);
+                            }
                             // Check for pending theory conflict before BCP (#6262).
                             if let Some(conflict_ref) = self.take_live_pending_theory_conflict() {
                                 self.conflicts_since_restart += 1;
@@ -683,20 +600,9 @@ impl Solver {
                                     // arena offsets).
                                     callback.materialize_lazy_reasons(self);
                                     self.record_level0_conflict_chain(conflict_ref);
-                                    return self.declare_unsat();
+                                    return self.declare_unsat_with_proof_progress(proof_progress);
                                 }
-                                // #8467: Pre-materialize lazy theory reasons.
-                                callback.materialize_lazy_reasons(self);
-                                let context = callback.conflict_context();
-                                self.analyze_and_backtrack(
-                                    conflict_ref,
-                                    context,
-                                    |solver, level| {
-                                        callback.backtrack_after_materializing_lazy_reasons(
-                                            solver, level,
-                                        );
-                                    },
-                                );
+                                self.analyze_theory_conflict(conflict_ref, callback);
                                 self.maybe_run_restart(callback);
                                 break;
                             }
@@ -716,7 +622,10 @@ impl Solver {
 
                             // Re-run BCP on any new unit propagations from theory lemmas.
                             let trail_before = self.trail.len();
-                            let bcp_result = self.search_propagate();
+                            let bcp_result = match self.search_propagate_counted() {
+                                Ok(conflict) => conflict,
+                                Err(reason) => return self.declare_unknown_with_reason(reason),
+                            };
                             if let Some(conflict_ref) = bcp_result {
                                 // BCP found a conflict — handle normally.
                                 if self.decision_level == 0 {
@@ -725,7 +634,7 @@ impl Solver {
                                     // arena offsets).
                                     callback.materialize_lazy_reasons(self);
                                     self.record_level0_conflict_chain(conflict_ref);
-                                    return self.declare_unsat();
+                                    return self.declare_unsat_with_proof_progress(proof_progress);
                                 }
                                 self.conflicts_since_restart += 1;
                                 self.num_conflicts += 1;
@@ -739,18 +648,7 @@ impl Solver {
                                     }
                                     self.maybe_emit_progress();
                                 }
-                                // #8467: Pre-materialize lazy theory reasons.
-                                callback.materialize_lazy_reasons(self);
-                                let context = callback.conflict_context();
-                                self.analyze_and_backtrack(
-                                    conflict_ref,
-                                    context,
-                                    |solver, level| {
-                                        callback.backtrack_after_materializing_lazy_reasons(
-                                            solver, level,
-                                        );
-                                    },
-                                );
+                                self.analyze_theory_conflict(conflict_ref, callback);
                                 self.maybe_run_restart(callback);
                                 break;
                             }
@@ -835,15 +733,9 @@ impl Solver {
                         // chain (lazy table indexes are not arena offsets).
                         callback.materialize_lazy_reasons(self);
                         self.record_level0_conflict_chain(conflict_ref);
-                        return self.declare_unsat();
+                        return self.declare_unsat_with_proof_progress(proof_progress);
                     }
-                    // #8467: Pre-materialize lazy theory reasons at the current
-                    // decision level so 1UIP resolution never encounters them.
-                    callback.materialize_lazy_reasons(self);
-                    let context = callback.conflict_context();
-                    self.analyze_and_backtrack(conflict_ref, context, |solver, level| {
-                        callback.backtrack_after_materializing_lazy_reasons(solver, level);
-                    });
+                    self.analyze_theory_conflict(conflict_ref, callback);
                     self.maybe_run_restart(callback);
                     continue;
                 }
@@ -906,7 +798,7 @@ impl Solver {
                 // After lookahead, level-0 propagation may have derived UNSAT
                 // via failed literals.
                 if self.has_empty_clause {
-                    return self.declare_unsat();
+                    return self.declare_unsat_with_proof_progress(proof_progress);
                 }
             } else if self.inprocessing_gates_pass() {
                 if self.decision_level != 0 {
@@ -916,9 +808,10 @@ impl Solver {
                         self.cold.lazy_materialization_failed = false;
                     }
                 }
-                let found_unsat = self.run_restart_inprocessing();
-                if found_unsat {
-                    return self.declare_unsat();
+                if let Some(result) =
+                    self.run_inprocessing_round_until(&should_stop, proof_progress)
+                {
+                    return result;
                 }
                 continue;
             } else if let Some(suggested) = if USE_CALLBACK && !self.relevancy_should_engage() {
@@ -941,6 +834,7 @@ impl Solver {
                 None
             } {
                 // Extension suggested a decision (CP search heuristic)
+                self.cold.search_decisions += 1;
                 self.decide(suggested);
                 if self.num_decisions.is_multiple_of(1000) {
                     // Deterministic decision-budget checkpoint FIRST
@@ -964,6 +858,7 @@ impl Solver {
             } else if let Some(la_lit) = self.take_lookahead_decision() {
                 // #8087: Use the lookahead-guided decision if available.
                 // This overrides VSIDS for one decision after a lookahead round.
+                self.cold.search_decisions += 1;
                 self.decide(la_lit);
                 if self.num_decisions.is_multiple_of(1000) {
                     if self.decision_budget_exhausted() {
@@ -996,6 +891,13 @@ impl Solver {
                 } else {
                     self.pick_phase(var)
                 };
+                // G4: the extension sees the heuristic's pick (z3 decide_eh).
+                let lit = if USE_CALLBACK {
+                    callback.on_decide(self, lit)
+                } else {
+                    lit
+                };
+                self.cold.search_decisions += 1;
                 self.decide(lit);
                 // Interrupt check on decision path (#3237, #6296): ensures
                 // check_sat_with_timeout is respected even without conflicts.
@@ -1041,14 +943,9 @@ impl Solver {
                         // chain (lazy table indexes are not arena offsets).
                         callback.materialize_lazy_reasons(self);
                         self.record_level0_conflict_chain(conflict_ref);
-                        return self.declare_unsat();
+                        return self.declare_unsat_with_proof_progress(proof_progress);
                     }
-                    // #8467: Pre-materialize lazy theory reasons.
-                    callback.materialize_lazy_reasons(self);
-                    let context = callback.conflict_context();
-                    self.analyze_and_backtrack(conflict_ref, context, |solver, level| {
-                        callback.backtrack_after_materializing_lazy_reasons(solver, level);
-                    });
+                    self.analyze_theory_conflict(conflict_ref, callback);
                     self.maybe_run_restart(callback);
                     continue;
                 }
@@ -1058,6 +955,9 @@ impl Solver {
                 // unit's watch consequences are still pending.
                 if self.has_empty_clause || self.qhead < self.trail.len() {
                     continue;
+                }
+                if let Some(reason) = self.counted_step_stop_reason() {
+                    return self.declare_unknown_with_reason(reason);
                 }
                 match callback.check_model(self) {
                     TheoryModelCheck::Sat => {
@@ -1073,6 +973,15 @@ impl Solver {
                     }
                     TheoryModelCheck::Unknown(reason) => {
                         return self.declare_unknown_with_reason(reason);
+                    }
+                    TheoryModelCheck::Continue(cont) => {
+                        // G2: lemmas at the current level, no restart.
+                        if let Some(result) = self.apply_final_check_continue(callback, cont) {
+                            return result;
+                        }
+                        if self.has_empty_clause {
+                            return self.declare_unsat_with_proof_progress(proof_progress);
+                        }
                     }
                     TheoryModelCheck::AddClauses(clauses) => {
                         // #8480: Backtrack to level 0 before adding theory
@@ -1110,7 +1019,7 @@ impl Solver {
                             self.add_theory_lemma_scoped(clause);
                         }
                         if self.has_empty_clause {
-                            return self.declare_unsat();
+                            return self.declare_unsat_with_proof_progress(proof_progress);
                         }
                         // Continue the CDCL loop — BCP will process the new
                         // clauses at level 0 and begin fresh search.

@@ -1,0 +1,265 @@
+# external-codegen resident-session corpus (AY session-history regression).
+#
+# Captured 2026-09-16 from external-codegen 8adc273f, crates/rustc-codegen-external-codegen lib
+# tests run with --test-threads=1, through a recording wrapper around AY: every
+# resident-server window (`ay --incremental`; the plugin sends body, then
+# (echo "==TCG_SRV_n=="), then (reset)) and every strict one-shot query file
+# (body, then (exit)). Each <id>.smt2 is one body, byte-exact minus that framing;
+# id = first 12 hex digits of sha256(body). Two captures (AY build 8256 and AY
+# 5da8198d1) were merged and de-duplicated.
+#
+# expected = the verdict of the body alone in a fresh session. Measured identical
+# on AY 0.13.0 build 8256 (dd4de9e94), 0.26.0 build 9581 (2fe2c96cd), ca0dd42ad
+# and 5da8198d1.
+#
+# columns: id<TAB>expected<TAB>external-codegen obligation name(s), "-" when the trace
+# run did not reach that body
+0107e2cbfe12	sat	si_nonnull_none_option_niche (get-value)
+0174e41d6a41	sat	unit_euclid_latch_edge_Goto_slot0 (get-value)
+0314a376ea5e	sat	p1_scalar_deref_store_wrong_width_finalmem_mem_base_v9_0_8 (get-value)
+0335ca361b98	sat	fl_nonnull_none_option_ref,se_nonnull_none_split_f0
+04d5548598df	unsat	vr_range_size1_result_len
+04fa1ded58ea	sat	sbs_wrong_stride_state_new_ptr (get-value)
+06210639edff	sat	si_swap_loads_state_new_ptr
+06901b94303b	sat	sbp_high_half_state_new_start (get-value)
+0ac6a146b9d3	unsat	sb_alt_offsets_option_tag
+0bb400a3cc5d	sat	p1_deref_store_sibling_clobber_finalmem_mem_base_v9_24_8
+0c0c0bdfa4d7	unsat	rn_unsigned_option_tag
+0c0fae56346b	sat	vec_index_inverted_bounds_trap (get-value)
+0dd7bd852d1e	unsat	vr_range_correct_trap
+0e5c987c2550	sat	se_wrong_idx_split_f0 (get-value)
+100e0d48add4	unsat	rn_u32_option_tag
+12240c99525f	unsat	stride_size1_ptr
+12f4bd65d427	sat	rn_signedness_state_new_start (get-value)
+131b00648323	unsat	vr_wrong_base_trap
+1357b15c41bf	sat	si_post_inc_option_niche
+13e482e5d74e	sat	rn_w4_signedness_state_new_start (get-value)
+151bc272640b	unsat	sbp_alt_offsets_option_payload
+169f4e93af94	sat	rn_w4_post_inc_option_payload (get-value)
+174e8a4e5bd0	unsat	stride_size1_trap
+184e71abd51a	sat	p1_field_store_sibling_clobber_finalmem_mem_base_v7_24_8 (get-value)
+1b191beb46e0	unsat	rn_u32_state_new_start
+1b64a90d0e0e	unsat	vec_index_size1_elem_addr
+1c84090f6b76	unsat	rn_signed_option_tag
+1d8b9e3469a9	sat	si_stride2_state_new_ptr (get-value)
+1df98b67329c	unsat	p1_deref_store_wrong_width_finalmem_mem_base_v9_24_8
+1dffe542b987	unsat	vr_range_size1_result_ptr
+1e8609654f13	sat	split_at_inverted_bounds_trap
+20525a84cf0f	sat	bridge_bounds_check_dom_ult_1024_implies_ult_512_w64 (get-value)
+209544a3ef2b	unsat	p1_deref_store_wrong_offset_finalmem_mem_base_v9_24_8
+2104d22c07da	sat	fl_wrong_idx_option_ref (get-value)
+229ed425df60	unsat	vec_index_correct_elem_addr
+2355f9353c40	unsat	si_size1_option_niche
+23b285b0bc14	sat	sb_ft_not_cleared_state_new_ft
+26e27d4dfc1b	sat	se_wrong_idx_split_f0
+2848f1c6ca80	sat	split_at_swapped_halves_fst_data
+287acbde3154	unsat	p1_field_store_correct_finalmem_mem_base_v7_24_8
+2a78b1495834	unsat	fl_last_option_ref
+2ab32ee2dcc4	sat	bridge_bounds_check_dom_ule_1024_implies_ult_1024_w64 (get-value)
+2cea879072ee	sat	vr_inverted_trap (get-value)
+2cf4621469a1	unsat	p1_field_store_wrong_offset_finalmem_mem_base_v7_24_8
+2d1b847a2ee8	sat	se_sub_swap_split_tail_len
+2f0dc3c24be6	unsat	split_at_correct_snd_len
+2fedfcfe4439	unsat	bridge_bounds_check_dom_ult_64_implies_ult_1024_w64
+30b1e3226b65	unsat	split_at_correct_trap
+31cd90101ccf	sat	fl_wrong_idx_option_ref
+339793379c16	sat	si_advance_done_state_new_ptr (get-value)
+3447395b217f	unsat	rn_i8_signed_option_tag
+35a11a703893	unsat	si_size1_state_new_ptr
+36112543cc69	sat	sbp_state_uncond_state_new_state (get-value)
+37aa77671e68	sat	p1_scalar_deref_store_wrong_width_finalmem_mem_base_v9_0_8
+37b7f6542e04	sat	rn_w4_advance_done_state_new_start (get-value)
+380af8bb3d7a	unsat	p1_copy_wrong_offset_finalmem_mem_base_v51_0_8
+38b780489b37	sat	fl_inverted_option_ref,se_inverted_split_f0
+3ba4bfb85853	unsat	sbs_stride1_state_new_ft
+3bf0e0bf02a1	unsat	split_at_correct_fst_data
+3eb448bf51b1	unsat	se_first_f1_split_tail_len,se_first_split_tail_len,se_last_s1_split_tail_len,se_last_split_tail_len
+3edb82e89707	sat	unit_euclid_latch_edge_Goto_slot0
+3f6c3d4c0699	sat	fl_unconditional_option_ref (get-value),se_dropped_select_split_f0 (get-value),se_select_wrong_field_split_f0 (get-value)
+41b6f620d598	unsat	stride_wrong_base_trap
+41f0172366de	unsat	-
+4352bb111598	sat	si_nonnull_none_option_niche
+43709d9fb1c7	sat	p1_scalar_deref_store_swapped_base_finalmem_mem_base_v9_0_8 (get-value)
+44ff67ad8d57	unsat	rn_u16_option_tag
+457245233362	sat	stride_wrong_scale_end
+4783d1307540	sat	fl_wrong_base_option_ref
+483959fba4c1	sat	sbp_high_half_state_new_start
+48bea07f5b7a	sat	fl_unconditional_option_ref,se_dropped_select_split_f0,se_select_wrong_field_split_f0
+4a8330a7775c	unsat	rn_u16_option_payload
+4f0bb794a201	sat	sbs_nonnull_none_option_niche (get-value)
+50759b6a0191	sat	sbs_nonnull_none_option_niche
+51306a009d08	sat	rn_w4_step2_state_new_start
+519a4e3d3eef	unsat	sbp_correct_state_new_state
+5268fd88579f	unsat	p1_copy_wrong_source_finalmem_mem_base_v51_0_8
+5550e46562f2	unsat	bridge_bounds_check_dom_ule_1023_implies_ult_1024_w64
+55de2137b918	unsat	fl_first_option_ref
+5604b750b792	sat	vr_wrong_scale_result_ptr (get-value)
+56c60f1354bf	sat	stride_inverted_check_trap (get-value)
+57bef673d7be	unsat	sbs_correct_state_new_ptr
+57f9c1fcaf9b	unsat	vr_range_correct_result_len
+592bf7524cd7	unsat	p1_scalar_deref_store_correct_finalmem_mem_base_v9_0_8
+5ae425a7e308	sat	bridge_bounds_check_dom_ule_1024_implies_ult_1024_w64
+5b14da4279d6	unsat	p1_field_load_correct_load0_spec_load0_value
+5b9ecebfe20c	unsat	stride_size1_end
+5cad138b9ef3	sat	sb_no_guard_state_new_start
+5ee59eaedf13	sat	p1_field_load_wrong_offset_load0_spec_load0_value (get-value)
+609832e7272e	sat	rn_tag_swap_option_tag
+6384033f53f5	sat	p1_copy_swapped_finalmem_mem_base_v51_0_8 (get-value)
+641968be79c8	sat	sbp_no_guard_state_new_start
+6571e307b51d	sat	sbp_advance_done_state_new_start (get-value)
+658cbe8eeb6f	sat	p1_field_load_swapped_base_load0_spec_load0_value
+67a3db852864	unsat	sb_correct_option_payload
+67aa46230955	sat	vec_index_inverted_bounds_trap
+67ebc36cc7bc	sat	vec_index_wrong_scale_elem_addr
+696354db0729	sat	rn_swap_loads_state_new_start (get-value)
+6a41e213ffeb	unsat	vr_from_correct_result_len
+6b4669091bde	sat	sb_ft_not_cleared_state_new_ft (get-value)
+6c4ba75a220b	sat	sbp_tag_swap_option_tag
+6ca8368a10ba	unsat	vr_from_correct_result_ptr
+6e3de72d4963	unsat	rn_w4_i64_add_state_new_start
+6f82a8beccfd	sat	vr_wrong_sub_result_len
+6fd1db6c44b9	sat	split_at_inverted_bounds_trap (get-value)
+70cb5cfb9628	unsat	p1_field_store_swapped_value_finalmem_mem_base_v7_24_8
+719c5b759edf	sat	vr_wrong_scale_result_ptr
+72fb3fe6353a	sat	stride_swapped_ptr_end_ptr (get-value)
+73a00cf731c0	sat	sbs_wrong_stride_state_new_ptr
+74289c30017c	sat	sb_countdown_swap_state_new_start (get-value)
+7547376d8baa	sat	sbp_post_inc_option_payload (get-value)
+758d3c8d8705	unsat	se_last_split_f0
+7599219acecd	sat	p1_scalar_deref_store_swapped_base_finalmem_mem_base_v9_0_8
+75bad3f666a6	sat	rn_w4_tag_swap_option_tag
+76a794e48a6f	unsat	vec_index_wrong_base_trap
+77a208e8873e	sat	rn_step2_state_new_start (get-value)
+77ccf9a0fd1f	sat	bridge_bounds_check_dom_ult_2048_implies_ult_1024_w64 (get-value)
+7a656a13fe30	sat	sb_no_guard_state_new_start (get-value)
+7b2406c0c81d	sat	se_wrong_base_split_f0 (get-value)
+7da115ba6940	sat	stride_swapped_ptr_end_ptr
+7f7d69fd1832	sat	sbp_tag_swap_option_tag (get-value)
+8030e32d6fd2	sat	rn_w4_tag_swap_option_tag (get-value)
+80e438222f25	unsat	sb_alt_offsets_state_new_start
+82dc8ea31858	unsat	rn_i32_signed_option_payload
+862e29d37de6	unsat	fl_last_s1_option_ref,se_last_s1_split_f0
+89168fd0c4e0	unsat	sb_alt_offsets_option_payload
+89cddeb3107b	sat	sb_advance_done_state_new_start
+8aa88e2a15c4	sat	sbp_advance_done_state_new_start
+8e3a0f848bec	unsat	vr_range_correct_result_ptr
+8e6d2f14982b	sat	si_swap_loads_state_new_ptr (get-value)
+8ebf5f078209	unsat	bridge_bounds_check_dom_ult_1024_implies_ult_1024_w64
+8f0cc935a086	sat	vec_index_wrong_scale_elem_addr (get-value)
+90c9cfd4745a	sat	split_at_swapped_halves_fst_data (get-value)
+915decb5328b	sat	fl_inverted_option_ref (get-value),se_inverted_split_f0 (get-value)
+9192e18a367d	sat	p1_field_load_swapped_base_load0_spec_load0_value (get-value)
+91df1d74b2ae	unsat	p1_field_store_wrong_width_finalmem_mem_base_v7_24_8
+9382ac20894b	unsat	sbp_alt_offsets_state_new_start
+945e3d53212d	sat	p1_field_load_wrong_offset_load0_spec_load0_value
+947eef801022	sat	rn_signedness_state_new_start
+95546d945a8e	sat	sb_advance_done_state_new_start (get-value)
+99a5964522f7	unsat	sbp_correct_state_new_start
+9a4f7b217bba	sat	sb_ft_unconditional_state_new_ft (get-value)
+9cb90481e74d	sat	p1_copy_swapped_finalmem_mem_base_v51_0_8
+9cba2013ff17	unsat	rn_i32_signed_state_new_start
+9cde74c1f8a5	sat	vr_incomplete_trap (get-value)
+9d9b4d44b9a9	sat	sb_ft_unconditional_state_new_ft
+9f8757f75436	unsat	-
+9f88f146702e	sat	rn_w4_advance_done_state_new_start
+9fe3a1072514	sat	stride_wrong_base_end (get-value)
+a04b6bc32089	sat	rn_step2_state_new_start
+a0718a3a688a	unsat	se_first_split_f1
+a10d31bfa771	sat	p1_deref_store_sibling_clobber_finalmem_mem_base_v9_24_8 (get-value)
+a1d7abfa7f3b	unsat	-
+a255214131bb	sat	sbs_post_inc_option_niche
+a46eaf79a3f8	sat	sbp_reset_swap_state_new_state
+a4843b2f86b7	unsat	se_first_f1_split_f1
+a4900031892d	unsat	stride_correct_ptr
+a4bd06c887cc	sat	vr_incomplete_trap
+a5e2ca84dc25	unsat	rn_signed_state_new_start
+a7f5f5b55acb	unsat	sbp_alt_offsets_option_tag
+a966c0eb5921	unsat	sbp_correct_option_payload
+a98cbc46ac26	sat	si_post_inc_option_niche (get-value)
+a9a0dd780726	sat	rn_w4_signedness_state_new_start
+aa81f171b369	unsat	sbp_correct_option_tag
+abaa4fbf89ba	unsat	sbp_alt_offsets_state_new_state
+ae4c092b78e1	sat	sbs_post_inc_option_niche (get-value)
+b0e562b80f89	unsat	rn_i8_signed_option_payload
+b143e5b63a79	sat	rn_w4_end_lie_state_new_start
+b184209378ed	sat	fl_nonnull_none_option_ref (get-value),se_nonnull_none_split_f0 (get-value)
+b21ae57010b9	sat	sb_post_inc_option_payload
+b2471d1199e5	unsat	vr_range_size1_trap
+b24782ad15dc	sat	p1_field_store_sibling_clobber_finalmem_mem_base_v7_24_8
+b2fc593628c2	unsat	rn_signed_option_payload
+b3eb21338f2b	sat	unit_euclid_latch_edge_Goto_slot0 (get-value)
+b553206cc5c7	sat	stride_wrong_scale_end (get-value)
+b5652a18a053	sat	se_sub_swap_split_tail_len (get-value)
+b5ef9b2bf5c0	sat	vr_inverted_trap
+b6480e9a59a2	sat	sbp_reset_swap_state_new_state (get-value)
+bb0a1d4e1bfc	sat	sbp_no_guard_state_new_start (get-value)
+bcd177f99f4d	sat	unit_euclid_latch_edge_Goto_slot0
+bced648154fb	unsat	sb_correct_state_new_ft
+bd83f45baf04	sat	fl_wrong_scale_option_ref (get-value),se_wrong_scale_split_f0 (get-value)
+bd9949e18e89	unsat	split_at_correct_snd_data
+bdd30a110763	sat	rn_swap_loads_state_new_start
+bffc9f943e04	sat	bridge_bounds_check_dom_ult_1024_implies_ult_512_w64
+c1144a49c0e7	unsat	sbs_correct_state_new_ft
+c1e2e08afd5e	unsat	split_at_size1_snd_data
+c3387c62649f	unsat	vr_from_correct_trap
+c4ec5fd1b947	sat	vr_wrong_sub_result_len (get-value)
+c6e28db0f1f7	sat	vec_index_wrong_base_elem_addr
+c7c3a32fc8b3	sat	sb_countdown_swap_state_new_start
+c7dff31faca4	unsat	sbs_correct_option_niche
+c8e10a660896	sat	fl_wrong_base_option_ref (get-value)
+c945d5c7cb19	sat	split_at_wrong_scale_snd_data
+caddab1a4586	sat	rn_post_inc_option_payload
+ccb4042983bc	unsat	split_at_correct_fst_len
+cceff2190fa4	unsat	p1_deref_store_correct_finalmem_mem_base_v9_24_8
+cfe5f409d60c	sat	sb_post_inc_option_payload (get-value)
+cff7c37fc86a	sat	si_inverted_state_new_ptr
+d0a5bd348dc7	unsat	rn_i8_signed_state_new_start
+d1e6fcf7e517	unsat	p1_deref_store_swapped_value_finalmem_mem_base_v9_24_8
+d2323fcb2792	unsat	p1_copy_dropped_lane_finalmem_mem_base_v51_0_8
+d2b292a63151	sat	vr_wrong_base_result_ptr
+d3680a460d5e	unsat	rn_i32_signed_option_tag
+d37430bd8c91	unsat	se_first_f1_split_f0
+d452efd8eacf	sat	vec_index_wrong_base_elem_addr (get-value)
+d5a5ace7ef09	sat	si_stride2_state_new_ptr
+d99dc2ce949d	sat	rn_w4_end_lie_state_new_start (get-value)
+da9e2b57c46d	sat	si_advance_done_state_new_ptr
+dcd988616dae	unsat	stride_correct_end
+df075a57fed5	sat	fl_wrong_scale_option_ref,se_wrong_scale_split_f0
+e0d30db2388f	unsat	sb_correct_option_tag
+e19a07b7a4c2	sat	rn_post_inc_option_payload (get-value)
+e39aee94cf6a	sat	si_inverted_state_new_ptr (get-value)
+e3dcdd1934bc	unsat	sb_correct_state_new_start
+e45ebe6cc2d1	sat	p1_deref_store_swapped_base_finalmem_mem_base_v9_24_8 (get-value)
+e5ec58020da5	unsat	rn_u16_state_new_start
+e7494af49984	sat	rn_w4_post_inc_option_payload
+e77269afa276	unsat	stride_correct_n
+e8859647ff15	unsat	p1_copy_correct_finalmem_mem_base_v51_0_8
+e8d8024823c2	sat	split_at_swapped_sub_snd_len (get-value)
+ea15e72e80bf	sat	sbp_post_inc_option_payload
+ec3c1d5d068d	sat	sb_tag_swap_option_tag (get-value)
+f02849e11b76	unsat	vec_index_correct_trap
+f197afc16d3a	sat	rn_tag_swap_option_tag (get-value)
+f1bb879c3ced	unsat	sbs_stride1_state_new_ptr
+f1c8781581eb	unsat	stride_size1_n
+f22314296254	sat	vr_wrong_base_result_ptr (get-value)
+f359b926785d	sat	sbs_ft_not_cleared_state_new_ft (get-value)
+f5394bbe42f8	sat	rn_advance_done_state_new_start (get-value)
+f5eb4d7c9ee1	sat	se_wrong_base_split_f0
+f5fc82d8b1ec	sat	rn_w4_step2_state_new_start (get-value)
+f6e59046f1d3	unsat	si_size8_state_new_ptr
+f771ffb51a5c	unsat	stride_correct_trap
+f773ec13b437	unsat	rn_unsigned_state_new_start
+f786d070d896	sat	sbs_ft_not_cleared_state_new_ft
+f7d3ae662313	sat	stride_wrong_base_end
+f8e551878cf9	unsat	sb_alt_offsets_state_new_ft
+f96fabdbde3c	sat	stride_inverted_check_trap
+f99a2d3a9ea2	sat	sb_tag_swap_option_tag
+f9a2398a3b09	sat	rn_advance_done_state_new_start
+f9ca09c936e5	sat	sbp_state_uncond_state_new_state
+fa122b794f3e	unsat	stride_wrong_base_ptr
+fb38bcc8297b	sat	bridge_bounds_check_dom_ult_2048_implies_ult_1024_w64
+fb47deff6ff1	unsat	sbs_stride1_option_niche
+fcc730f054d9	sat	split_at_wrong_scale_snd_data (get-value)
+fd3ef063c78a	unsat	-
+fd5ae75b6c3c	sat	split_at_swapped_sub_snd_len
+fe46289a94da	sat	p1_deref_store_swapped_base_finalmem_mem_base_v9_24_8

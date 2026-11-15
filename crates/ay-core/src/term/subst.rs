@@ -19,6 +19,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "subst_sort_tests.rs"]
+mod sort_rebuild_tests;
+
 /// Arity guards as slice patterns, so every element access in the rebuild
 /// dispatchers below is structurally in bounds.
 fn unary(args: &[TermId]) -> Option<TermId> {
@@ -39,6 +43,49 @@ fn ternary(args: &[TermId]) -> Option<(TermId, TermId, TermId)> {
     match args {
         &[a, b, c] => Some((a, b, c)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod postorder_tests;
+
+/// Iterative depth-first postorder over the immutable term DAG. Explicit
+/// Visit/Finish frames replace recursive continuations (CLRS, 4th ed.,
+/// section 20.3, depth-first search). Reverse pushes retain the former
+/// left-to-right constructor order and therefore the exact interner order.
+/// Like the former workers, this requires a valid term DAG; raw cyclic
+/// `TermData` is not authenticated by this infallible core operation.
+enum RebuildFrame {
+    Visit(TermId),
+    Finish(TermId),
+}
+
+fn queue_rebuild_children(store: &TermStore, term: TermId, stack: &mut Vec<RebuildFrame>) {
+    stack.push(RebuildFrame::Finish(term));
+    match store.get(term) {
+        TermData::Const(_) | TermData::Var(_, _) => {}
+        TermData::App(_, args) => {
+            stack.extend(args.iter().rev().copied().map(RebuildFrame::Visit));
+        }
+        TermData::Not(inner) => stack.push(RebuildFrame::Visit(*inner)),
+        TermData::Ite(c, t, e) => {
+            stack.push(RebuildFrame::Visit(*e));
+            stack.push(RebuildFrame::Visit(*t));
+            stack.push(RebuildFrame::Visit(*c));
+        }
+        TermData::Let(bindings, body) => {
+            stack.push(RebuildFrame::Visit(*body));
+            stack.extend(
+                bindings
+                    .iter()
+                    .rev()
+                    .map(|(_, value)| RebuildFrame::Visit(*value)),
+            );
+        }
+        // As before, triggers and binder sorts are retained but not traversed.
+        TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
+            stack.push(RebuildFrame::Visit(*body));
+        }
     }
 }
 
@@ -97,39 +144,58 @@ impl TermStore {
         term: TermId,
         cache: &mut crate::kani_compat::DetHashMap<TermId, TermId>,
     ) -> TermId {
-        if let Some(&cached) = cache.get(&term) {
-            return cached;
+        let mut stack = vec![RebuildFrame::Visit(term)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                RebuildFrame::Visit(current) => {
+                    if cache.contains_key(&current) {
+                        continue;
+                    }
+                    queue_rebuild_children(self, current, &mut stack);
+                }
+                RebuildFrame::Finish(current) => {
+                    let result = self.simplify_cached(current, cache);
+                    cache.insert(current, result);
+                }
+            }
         }
+        // For a valid DAG, every Visit either finds a completed entry or queues
+        // exactly one Finish after its children; the root and traversed children are
+        // therefore present before these internal cache lookups.
+        cache[&term]
+    }
 
-        let result = match self.get(term).clone() {
+    fn simplify_cached(
+        &mut self,
+        term: TermId,
+        cache: &crate::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        match self.get(term).clone() {
             TermData::Const(_) | TermData::Var(_, _) => term,
             TermData::App(sym, args) => {
                 // Rebuild children first, then re-apply the folding constructor for
                 // this operator. Even if no child changed, run it through
                 // `rebuild_app` so a constant application that escaped eager
                 // folding (e.g. a raw parser-built `(+ 2 3)`) collapses.
-                let new_args: Vec<TermId> = args
-                    .iter()
-                    .map(|&arg| self.simplify_inner(arg, cache))
-                    .collect();
+                let new_args: Vec<TermId> = args.iter().map(|&arg| cache[&arg]).collect();
                 self.rebuild_app(&sym, new_args, term)
             }
             TermData::Not(inner) => {
-                let new_inner = self.simplify_inner(inner, cache);
+                let new_inner = cache[&inner];
                 self.mk_not(new_inner)
             }
             TermData::Ite(c, t, e) => {
-                let nc = self.simplify_inner(c, cache);
-                let nt = self.simplify_inner(t, cache);
-                let ne = self.simplify_inner(e, cache);
+                let nc = cache[&c];
+                let nt = cache[&t];
+                let ne = cache[&e];
                 self.mk_ite(nc, nt, ne)
             }
             TermData::Let(bindings, body) => {
                 let new_bindings: Vec<(String, TermId)> = bindings
                     .iter()
-                    .map(|(name, val)| (name.clone(), self.simplify_inner(*val, cache)))
+                    .map(|(name, val)| (name.clone(), cache[val]))
                     .collect();
-                let new_body = self.simplify_inner(body, cache);
+                let new_body = cache[&body];
                 if new_bindings == bindings && new_body == body {
                     term
                 } else {
@@ -138,7 +204,7 @@ impl TermStore {
                 }
             }
             TermData::Forall(vars, body, triggers) => {
-                let new_body = self.simplify_inner(body, cache);
+                let new_body = cache[&body];
                 if new_body == body {
                     term
                 } else {
@@ -149,7 +215,7 @@ impl TermStore {
                 }
             }
             TermData::Exists(vars, body, triggers) => {
-                let new_body = self.simplify_inner(body, cache);
+                let new_body = cache[&body];
                 if new_body == body {
                     term
                 } else {
@@ -159,10 +225,7 @@ impl TermStore {
                     rebuilt
                 }
             }
-        };
-
-        cache.insert(term, result);
-        result
+        }
     }
 
     fn substitute_inner(
@@ -172,27 +235,47 @@ impl TermStore {
         to: &[TermId],
         cache: &mut crate::kani_compat::DetHashMap<TermId, TermId>,
     ) -> TermId {
-        // Direct hit: replace WITHOUT recursing into the replacement
-        // (simultaneous semantics). Checked first so a top-level match wins.
-        // `zip` honors only the common prefix, so unequal `from`/`to` lengths
-        // need no pre-truncation.
-        for (&f, &t) in from.iter().zip(to.iter()) {
-            if term == f {
-                return t;
+        let mut stack = vec![RebuildFrame::Visit(term)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                RebuildFrame::Visit(current) => {
+                    // Direct hits precede cache lookup and do not visit the
+                    // replacement, including self-referential replacements.
+                    if let Some(replacement) = from
+                        .iter()
+                        .zip(to)
+                        .find_map(|(&f, &t)| (current == f).then_some(t))
+                    {
+                        cache.insert(current, replacement);
+                        continue;
+                    }
+                    if cache.contains_key(&current) {
+                        continue;
+                    }
+                    queue_rebuild_children(self, current, &mut stack);
+                }
+                RebuildFrame::Finish(current) => {
+                    let result = self.substitute_cached(current, cache);
+                    cache.insert(current, result);
+                }
             }
         }
-        if let Some(&cached) = cache.get(&term) {
-            return cached;
-        }
+        cache[&term]
+    }
 
-        let result = match self.get(term).clone() {
+    fn substitute_cached(
+        &mut self,
+        term: TermId,
+        cache: &crate::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        match self.get(term).clone() {
             TermData::Const(_) | TermData::Var(_, _) => term,
             TermData::App(sym, args) => {
                 let mut changed = false;
                 let new_args: Vec<TermId> = args
                     .iter()
                     .map(|&arg| {
-                        let new_arg = self.substitute_inner(arg, from, to, cache);
+                        let new_arg = cache[&arg];
                         changed |= new_arg != arg;
                         new_arg
                     })
@@ -204,7 +287,7 @@ impl TermStore {
                 }
             }
             TermData::Not(inner) => {
-                let new_inner = self.substitute_inner(inner, from, to, cache);
+                let new_inner = cache[&inner];
                 if new_inner != inner {
                     self.mk_not(new_inner)
                 } else {
@@ -212,9 +295,9 @@ impl TermStore {
                 }
             }
             TermData::Ite(c, t, e) => {
-                let nc = self.substitute_inner(c, from, to, cache);
-                let nt = self.substitute_inner(t, from, to, cache);
-                let ne = self.substitute_inner(e, from, to, cache);
+                let nc = cache[&c];
+                let nt = cache[&t];
+                let ne = cache[&e];
                 if nc != c || nt != t || ne != e {
                     self.mk_ite(nc, nt, ne)
                 } else {
@@ -226,12 +309,12 @@ impl TermStore {
                 let new_bindings: Vec<(String, TermId)> = bindings
                     .iter()
                     .map(|(name, val)| {
-                        let new_val = self.substitute_inner(*val, from, to, cache);
+                        let new_val = cache[val];
                         changed |= new_val != *val;
                         (name.clone(), new_val)
                     })
                     .collect();
-                let new_body = self.substitute_inner(body, from, to, cache);
+                let new_body = cache[&body];
                 changed |= new_body != body;
                 if changed {
                     let sort = self.sort(term).clone();
@@ -241,7 +324,7 @@ impl TermStore {
                 }
             }
             TermData::Forall(vars, body, triggers) => {
-                let new_body = self.substitute_inner(body, from, to, cache);
+                let new_body = cache[&body];
                 if new_body != body {
                     let sort = self.sort(term).clone();
                     let rebuilt = self.intern(TermData::Forall(vars, new_body, triggers), sort);
@@ -252,7 +335,7 @@ impl TermStore {
                 }
             }
             TermData::Exists(vars, body, triggers) => {
-                let new_body = self.substitute_inner(body, from, to, cache);
+                let new_body = cache[&body];
                 if new_body != body {
                     let sort = self.sort(term).clone();
                     let rebuilt = self.intern(TermData::Exists(vars, new_body, triggers), sort);
@@ -262,10 +345,7 @@ impl TermStore {
                     term
                 }
             }
-        };
-
-        cache.insert(term, result);
-        result
+        }
     }
 
     /// Rebuild an `App(sym, args)` node using simplifying constructors where one
@@ -340,7 +420,22 @@ impl TermStore {
             ("-", Some(a), _) => self.mk_neg(a),
             ("-", ..) => self.mk_sub(args),
             ("*", ..) => self.mk_mul(args),
-            ("/", _, Some((a, b))) => self.mk_div(a, b),
+            ("/", _, Some((a, b))) => {
+                // Raw consumer terms and ground substitutions can spell Real
+                // division with Int numerals. Preserve `/`'s Real semantics;
+                // the separate `div` arm below remains integer division.
+                let a = if self.sort(a) == &Sort::Int {
+                    self.mk_to_real(a)
+                } else {
+                    a
+                };
+                let b = if self.sort(b) == &Sort::Int {
+                    self.mk_to_real(b)
+                } else {
+                    b
+                };
+                self.mk_div(a, b)
+            }
             ("div", _, Some((a, b))) => self.mk_intdiv(a, b),
             ("mod", _, Some((a, b))) => self.mk_mod(a, b),
             ("rem", _, Some((a, b))) => self.mk_rem(a, b),

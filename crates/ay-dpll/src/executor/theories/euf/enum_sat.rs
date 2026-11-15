@@ -73,6 +73,7 @@ use ay_euf::EufModel;
 use ay_sat::{Literal, SatResult, Solver as SatSolver, Variable};
 
 use super::super::super::Executor;
+use super::super::ChainSpend;
 use crate::executor_types::{Result, SolveResult};
 
 /// Fall through to the general lane above this many estimated extra clauses.
@@ -291,7 +292,7 @@ impl Executor {
         self.last_statistics
             .set_int("enum_sat.atoms", scan.atoms.len() as u64);
         self.last_statistics.set_int("enum_sat.vars", total_vars);
-        self.arm_sat_conflict_budget(&mut solver, 0);
+        self.arm_sat_count_budget(&mut solver, ChainSpend::NONE);
         let should_stop = self.make_should_stop();
         let result = solver.solve_interruptible(should_stop).into_inner();
         collect_sat_stats!(self, &solver);

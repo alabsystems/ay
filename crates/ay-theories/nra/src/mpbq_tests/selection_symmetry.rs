@@ -4,15 +4,25 @@
 
 /// `select_non_root` must be symmetric under negation.
 #[test]
-fn select_non_root_is_symmetric_under_negation() {
+fn select_non_root_is_symmetric_under_negation() -> Result<(), Box<dyn std::error::Error>> {
     let mut neg: Vec<BigInt> = vec![BigInt::from(1)];
     for j in 0u32..=6 {
-        let two_j = BigInt::from(1i64 << j);
-        let f = [&two_j + 1, two_j.clone()];
-        let mut out = vec![BigInt::zero(); neg.len() + 1];
-        for (i, c) in neg.iter().enumerate() {
-            out[i] += c * &f[0];
-            out[i + 1] += c * &f[1];
+        let two_j = BigInt::from(1i64.checked_shl(j).ok_or("2^j fits i64")?);
+        let (f0, f1) = (&two_j + 1, two_j.clone());
+        // The product has one more coefficient than `neg`; seven factors keep
+        // it at eight, far inside the fallible reservation.
+        let len = neg
+            .len()
+            .checked_add(1)
+            .ok_or("coefficient count fits usize")?;
+        let mut out: Vec<BigInt> = Vec::new();
+        out.try_reserve_exact(len)?;
+        out.push(BigInt::zero());
+        for c in &neg {
+            if let Some(last) = out.last_mut() {
+                *last += c * &f0;
+            }
+            out.push(c * &f1);
         }
         neg = out;
     }
@@ -42,4 +52,5 @@ fn select_non_root_is_symmetric_under_negation() {
         Some(0),
         "answer must not be a root"
     );
+    Ok(())
 }

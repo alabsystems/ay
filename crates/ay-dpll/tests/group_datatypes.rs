@@ -13,6 +13,8 @@ mod common;
 mod cause_b_parsed_gate;
 #[path = "group_datatypes/dt_array_field_model_witness.rs"]
 mod dt_array_field_model_witness;
+#[path = "group_datatypes/dt_boolean_definition_model.rs"]
+mod dt_boolean_definition_model;
 #[path = "group_datatypes/dt_bv_selector_over_ite_soundness.rs"]
 mod dt_bv_selector_over_ite_soundness;
 #[path = "group_datatypes/dt_combined_lane_soundness.rs"]
@@ -23,6 +25,8 @@ mod dt_d1_lazy_propagation;
 mod dt_d2_lazy_lane;
 #[path = "group_datatypes/dt_egraph_acyclicity_soundness.rs"]
 mod dt_egraph_acyclicity_soundness;
+#[path = "group_datatypes/dt_model_construction_name_length.rs"]
+mod dt_model_construction_name_length;
 #[path = "group_datatypes/dt_selector_field_soundness.rs"]
 mod dt_selector_field_soundness;
 #[path = "group_datatypes/dt_stack_safety_8414.rs"]

@@ -69,7 +69,7 @@ use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use ay_core::term::{Constant, Symbol, TermData, TermId};
-use ay_core::{TheoryLit, TheoryResult};
+use ay_core::TheoryResult;
 
 use super::*;
 
@@ -307,7 +307,25 @@ impl NiaSolver<'_> {
         // candidate set is a complete cover (see module docs), so the first
         // satisfying integer is a genuine witness and the absence of any
         // satisfying candidate is a genuine UNSAT.
-        for cand in &candidates {
+        for (tested, cand) in candidates.iter().enumerate() {
+            // Wall-clock abort (#nia-enum-deadline). This loop is up to
+            // MAX_MIDDLE_WIDTH candidates long and each step substitutes the
+            // candidate into EVERY asserted atom by exact BigInt evaluation,
+            // so it is exactly the "walk that never reads the clock" shape
+            // that hung compiler_consumer — on the same check path, just one pre-phase
+            // earlier. `None` is this decider's existing "out of fragment /
+            // unconfirmed" answer, so declining claims nothing: the caller
+            // falls through to the refinement loop, whose own poll turns the
+            // next boundary into Unknown.
+            if self.enum_deadline_expired(tested as i64) {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] univariate-int: wall-clock deadline exceeded after {tested} \
+                         candidates — returning None (unknown)"
+                    );
+                }
+                return None;
+            }
             if self.int_satisfies_all(var, cand) {
                 self.record_univariate_model(var, cand);
                 if self.debug {
@@ -328,12 +346,7 @@ impl NiaSolver<'_> {
 
     /// Build the asserted-literal conflict for a univariate UNSAT verdict.
     fn univariate_unsat(&self) -> TheoryResult {
-        let conflict: Vec<TheoryLit> = self
-            .asserted
-            .iter()
-            .map(|&(term, value)| TheoryLit::new(term, value))
-            .collect();
-        TheoryResult::Unsat(conflict)
+        TheoryResult::Unsat(self.full_conflict_lits())
     }
 
     /// Test whether the integer assignment `var = value` satisfies EVERY
@@ -368,6 +381,7 @@ impl NiaSolver<'_> {
         // Materialize any registered monomial aux vars under this assignment so
         // the model is consistent (e.g. the aux var for `x*x`).
         let Some(v64) = value.to_i64() else {
+            self.bounded_enum_bool_model.clear();
             self.bounded_enum_model = Some(model);
             return;
         };
@@ -378,6 +392,7 @@ impl NiaSolver<'_> {
                 model.insert(mon.aux_var, value);
             }
         }
+        self.bounded_enum_bool_model.clear();
         self.bounded_enum_model = Some(model);
     }
 
@@ -393,6 +408,14 @@ impl NiaSolver<'_> {
         // testing them against all atoms decides the problem.
         for c in constraints {
             if c.rel == Rel::Eq {
+                // Wall-clock abort (#nia-enum-deadline) before the divisor
+                // enumeration: `integer_roots` trial-divides up to
+                // sqrt(MAX_DIVISOR_CONSTANT) = 1e6 times and then evaluates
+                // the polynomial at every signed divisor. Bounded, but not by
+                // the clock.
+                if self.enum_deadline_expired(0) {
+                    return None;
+                }
                 let roots = integer_roots(&c.poly)?;
                 for r in roots {
                     if !candidates.contains(&r) {
@@ -421,8 +444,27 @@ impl NiaSolver<'_> {
             return None;
         }
         let mut k = -b.clone();
+        let mut walked: i64 = 0;
         while k <= b {
-            push_unique(&mut candidates, k.clone());
+            // Wall-clock abort (#nia-enum-deadline). MAX_MIDDLE_WIDTH admits
+            // 2e6 points here; measured on this branch before the poll existed,
+            // a single call at width 2e5 ran 23 s against a 100 ms deadline,
+            // and the admitted maximum extrapolates to tens of minutes in ONE
+            // unpolled call bracketed by (not entered by) the check loop's
+            // pre-phase polls. `None` = "completeness not guaranteed cheaply",
+            // this routine's existing decline, which the caller already treats
+            // as Unknown.
+            if self.enum_deadline_expired(walked) {
+                return None;
+            }
+            walked += 1;
+            // A plain `push`, NOT `push_unique`: `k` runs strictly increasing
+            // over `[-b, b]`, so every value here is distinct by construction,
+            // and the only earlier candidates are the two tail reps `±(b+1)`,
+            // which lie outside that interval. `push_unique` is a linear
+            // `contains` scan, so using it here made the walk O(width²) in
+            // BigInt comparisons — the whole of the 23 s measured above.
+            candidates.push(k.clone());
             k += BigInt::one();
         }
         Some(candidates)
@@ -841,6 +883,103 @@ mod tests {
         };
         let b = cauchy_bound(std::slice::from_ref(&c)).expect("nonconstant");
         assert_eq!(b, BigInt::from(17));
+    }
+
+    /// `x*x <= c` (inequality-only, so the candidate set is Path B: the whole
+    /// bounded middle `[-B, B]` with `B = 1 + c`, i.e. `2c + 3` candidates)
+    /// driven straight through the univariate pre-phase with `deadline`
+    /// installed.
+    fn univariate_square_le(
+        c: i64,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Option<TheoryResult> {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let xx = terms.mk_mul(vec![x, x]);
+        let c_c = terms.mk_int(BigInt::from(c));
+        let atom = terms.mk_le(xx, c_c);
+        let mut solver = NiaSolver::new(&terms);
+        solver.assert_literal(atom, true);
+        if let Some(dl) = deadline {
+            solver.set_deadline(dl);
+        }
+        solver.try_univariate_integer()
+    }
+
+    #[test]
+    fn univariate_pre_phase_polls_the_deadline_while_enumerating_candidates() {
+        // REGRESSION (2026-09-11, review of the deadline commit). The check
+        // loop's two new polls sit immediately BEFORE and AFTER the call to
+        // `try_univariate_integer`, so they BRACKET this pre-phase without ever
+        // entering it — and inside it the Path B middle walk
+        // (`while k <= b`, up to MAX_MIDDLE_WIDTH = 2_000_000 points) and the
+        // candidate-testing loop both ran with no clock read at all. Measured
+        // before this fix, with a 100 ms deadline installed: width 20_017 took
+        // 191 ms, width 80_021 took 3.08 s and width 200_009 took 23.0 s —
+        // quadratic, because the middle walk deduped with a linear `contains`
+        // scan over candidates that are distinct by construction.
+        let expired = ay_core::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the monotonic clock is more than a second past its epoch");
+
+        // Wide enough that neither loop can be walked inside the assertion.
+        let start = ay_core::time::Instant::now();
+        let verdict = univariate_square_le(100_003, Some(expired));
+        let took = start.elapsed();
+        assert!(
+            verdict.is_none(),
+            "an expired deadline must abort the univariate pre-phase at its \
+             existing decline (None); it has no other no-claim answer — got \
+             {verdict:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "the pre-phase must abort at its first in-loop poll, not after a \
+             200_009-candidate walk — took {took:?}"
+        );
+
+        // The poll must fire INSIDE the walk, not only where it starts: count
+        // the polls over a live-budget walk of the same shape. The counter
+        // lives in `bounded_enum` because this pre-phase reuses that module's
+        // 256-point poll helper.
+        let live = ay_core::time::Instant::now() + std::time::Duration::from_secs(3600);
+        bounded_enum::reset_enum_deadline_polls();
+        let verdict = univariate_square_le(4_001, Some(live));
+        let polls = bounded_enum::enum_deadline_polls();
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "x*x <= 4001 is satisfiable (x = 0), so the live-budget walk must \
+             still decide it — got {verdict:?}"
+        );
+        assert!(
+            polls > 1,
+            "the middle walk and the candidate walk must read the clock as they \
+             go; a single entry poll is the defect, got {polls} polls"
+        );
+
+        // ANTI-VACUITY: with budget left the decider still returns both real
+        // verdicts on this fragment, witness-verified and cover-complete.
+        let verdict = univariate_square_le(9, Some(live));
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "x*x <= 9 is satisfiable — got {verdict:?}"
+        );
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let xx = terms.mk_mul(vec![x, x]);
+        let minus_one = terms.mk_int(BigInt::from(-1));
+        let atom = terms.mk_le(xx, minus_one);
+        let mut solver = NiaSolver::new(&terms);
+        solver.assert_literal(atom, true);
+        solver.set_deadline(live);
+        assert!(
+            matches!(
+                solver.try_univariate_integer(),
+                Some(TheoryResult::Unsat(_))
+            ),
+            "x*x <= -1 has no integer model and the cover is complete, so the \
+             decider must still prove Unsat with budget left"
+        );
     }
 
     #[test]

@@ -38,9 +38,12 @@ impl LraSolver {
                 bt
             );
         }
-        self.next_var += 1;
+        self.next_var = self.next_var.saturating_add(1);
         self.term_to_var.insert(term, var);
         self.var_to_term.insert(var, term);
+        // A term gained a column: `has_value` / `get_value` flip for it
+        // (#nonlinear-phase-hints).
+        self.note_phase_state_change();
         // Extend vars vector if needed
         while self.vars.len() <= var as usize {
             self.vars.push(VarInfo::default());
@@ -65,8 +68,8 @@ impl LraSolver {
         let mut seen_atoms: HashSet<TermId> = HashSet::default();
         for (&var, atoms) in &self.var_to_atoms {
             let vi = var as usize;
-            if vi >= self.unassigned_atom_count.len() {
-                self.unassigned_atom_count.resize(vi + 1, 0);
+            while self.unassigned_atom_count.len() <= vi {
+                self.unassigned_atom_count.push(0);
             }
             seen_atoms.clear();
             for &atom_term in atoms {
@@ -79,11 +82,11 @@ impl LraSolver {
                     .atom_cache
                     .get(&atom_term)
                     .is_some_and(|info| info.as_ref().is_some_and(|i| i.is_eq || i.is_distinct));
-                if dominated {
+                if dominated || self.asserted.contains_key(&atom_term) {
                     continue;
                 }
-                if !self.asserted.contains_key(&atom_term) {
-                    self.unassigned_atom_count[vi] += 1;
+                if let Some(count) = self.unassigned_atom_count.get_mut(vi) {
+                    *count = count.saturating_add(1);
                 }
             }
         }
@@ -241,7 +244,7 @@ impl LraSolver {
                         // unsupported. Unlike div/mod (which always mark
                         // unsupported), abs model validation succeeds with
                         // opaque assignments.
-                        if !self.combined_theory_mode {
+                        if !self.opaque_operators_ok() {
                             self.mark_current_atom_unsupported();
                         }
                         let var = self.intern_var(term);
@@ -285,7 +288,7 @@ impl LraSolver {
                     // so an n-ary chain has no downstream interpreter and keeps
                     // the fail-closed marking in every mode.
                     "div" | "mod" if !args.is_empty() => {
-                        if !self.combined_theory_mode || args.len() != 2 {
+                        if !self.opaque_operators_ok() || args.len() != 2 {
                             self.mark_current_atom_unsupported();
                         }
                         let var = self.intern_var(term);
@@ -308,7 +311,7 @@ impl LraSolver {
                         if self.debug_lra {
                             safe_eprintln!("[LRA] Unknown function: {:?}", other);
                         }
-                        if !self.combined_theory_mode && !is_bool_connective {
+                        if !self.unknown_functions_ok() && !is_bool_connective {
                             self.mark_current_atom_unsupported();
                         }
                         let var = self.intern_var(term);

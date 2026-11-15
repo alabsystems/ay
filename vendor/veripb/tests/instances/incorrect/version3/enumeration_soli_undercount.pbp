@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% DEFECT: the non-degenerate form of `enumeration_after_soli` — the claimed count
+% is not 0, so the fix cannot be a "reject count 0" band-aid. One projection
+% (x1=1) is genuinely witnessed and counted by `solx`; the `soli` then deletes
+% the whole x1=0 class (its only solutions have x2=1, hence objective 1) without
+% counting it, and the contradiction derived afterwards rests on that deletion.
+% The formula has two projected solutions onto x1, not one.
+f 1;
+solx x1 ~x2;
+soli ~x1 x2;
+pol 1 2 + 3 +;
+output NONE;
+conclusion ENUMERATION_COMPLETE 1;
+end pseudo-Boolean proof;

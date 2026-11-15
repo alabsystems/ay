@@ -263,3 +263,62 @@ fn test_normalize_ternary() {
     assert_eq!(t2, t3);
     assert!(t1.0 <= t1.1 && t1.1 <= t1.2);
 }
+
+/// Every ternary pair over `num_vars` variables that resolves on some pivot:
+/// `(pivot, C1 ∋ pivot, C2 ∋ ¬pivot)`, both polarities of the pivot, distinct
+/// variables within each clause, and all polarities of the side literals.
+fn ternary_resolution_pairs(num_vars: u32) -> Vec<(Literal, [Literal; 3], [Literal; 3])> {
+    let mut pairs = Vec::new();
+    for pivot in (0..num_vars).flat_map(|v| [lit(v, true), lit(v, false)]) {
+        let sides: Vec<[Literal; 2]> = (0..num_vars)
+            .flat_map(|a| (0..num_vars).map(move |b| (a, b)))
+            .filter(|&(a, b)| a != b && a != pivot.variable().0 && b != pivot.variable().0)
+            .flat_map(|(a, b)| (0..4).map(move |pol| [lit(a, pol & 1 == 1), lit(b, pol & 2 == 2)]))
+            .collect();
+        for [l1, l2] in &sides {
+            for [l3, l4] in &sides {
+                pairs.push((pivot, [pivot, *l1, *l2], [pivot.negated(), *l3, *l4]));
+            }
+        }
+    }
+    pairs
+}
+
+/// Resolution soundness, exhaustively over 5 variables: for every pair from
+/// [`ternary_resolution_pairs`] and all 32 assignments, `C1 ∧ C2` implies the
+/// resolvent `try_resolve` returns. The resolvent is also exactly
+/// `(C1 \ {p}) ∪ (C2 \ {¬p})`, refused only when that set is tautological or
+/// longer than three literals.
+#[test]
+fn test_htr_resolution_sound_exhaustive_five_vars() {
+    const NUM_VARS: u32 = 5;
+    let (mut resolved, mut refused) = (0usize, 0usize);
+    for (pivot, c1, c2) in ternary_resolution_pairs(NUM_VARS) {
+        let mut naive: Vec<Literal> = c1[1..].iter().chain(&c2[1..]).copied().collect();
+        naive.sort_unstable();
+        naive.dedup();
+        let tautology = naive.iter().any(|l| naive.contains(&l.negated()));
+        let Some(mut resolvent) = HTR::new(NUM_VARS as usize).try_resolve(&c1, &c2, pivot) else {
+            assert!(tautology || naive.len() > 3, "refused {c1:?} x {c2:?}");
+            refused += 1;
+            continue;
+        };
+        resolved += 1;
+        for assignment in 0..1u32 << NUM_VARS {
+            let sat = |c: &[Literal]| {
+                c.iter()
+                    .any(|l| (assignment >> l.variable().0) & 1 == u32::from(l.is_positive()))
+            };
+            assert!(
+                !(sat(&c1) && sat(&c2)) || sat(&resolvent),
+                "{c1:?} x {c2:?} -> {resolvent:?} under {assignment:05b}"
+            );
+        }
+        resolvent.sort_unstable();
+        assert_eq!(resolvent, naive, "{c1:?} x {c2:?} on {pivot:?}");
+    }
+    assert!(
+        resolved > 0 && refused > 0,
+        "resolved {resolved}, refused {refused}"
+    );
+}

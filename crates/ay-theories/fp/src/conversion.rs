@@ -4,73 +4,19 @@
 
 //! FP conversion helpers: rounding-mode decoding and `to_fp` encodings.
 
+mod polling;
+
 use ay_core::term::{Constant, Symbol, TermData, TermId};
 use ay_core::{CnfLit, Sort};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
+use super::construction::control::{uninterrupted, BuildControl};
+use super::construction::FpBuildStage;
 use super::model_value::FpModelValue;
-use super::{FpDecomposed, FpPrecision, FpSolver, RoundingMode};
+use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand, RM_ORDER};
 
 impl FpSolver<'_> {
-    /// Get rounding mode from a term.
-    /// Handles both `TermData::App("RNE", _)` (from parser/API) and
-    /// `TermData::Var("RNE", _)` (from some frontends). See #6203.
-    /// INVARIANT (#P0.2 symbolic RoundingMode): the silent-RNE default
-    /// branches below must be UNREACHABLE for a symbolic (non-literal) mode.
-    /// Upstream, `check_fp_support` fails ANY non-literal RoundingMode-sorted
-    /// term closed to `unknown` before bit-blasting, the rm_expand
-    /// enumeration substitutes literal modes before solving, and the model
-    /// evaluator's concretization bails (fails closed) on an unpinned RM
-    /// term. Defaulting a live symbolic mode to RNE here would drop
-    /// constraints like `(= rm RTP)` — a wrong verdict in both directions —
-    /// so the debug assertions make any regression of that guard loud.
-    pub(crate) fn get_rounding_mode(&self, term: TermId) -> RoundingMode {
-        let data = self.terms.get(term);
-        match data {
-            TermData::App(sym, _) => match RoundingMode::from_name(sym.name()) {
-                Some(rm) => rm,
-                None => {
-                    debug_assert!(
-                        false,
-                        "get_rounding_mode reached with non-literal mode app '{}' — \
-                         upstream fail-close guard regressed (#P0.2)",
-                        sym.name()
-                    );
-                    tracing::warn!(
-                        name = sym.name(),
-                        "unrecognized rounding mode, defaulting to RNE"
-                    );
-                    RoundingMode::default()
-                }
-            },
-            TermData::Var(name, _) => match RoundingMode::from_name(name) {
-                Some(rm) => rm,
-                None => {
-                    debug_assert!(
-                        false,
-                        "get_rounding_mode reached with symbolic mode variable '{name}' — \
-                         upstream fail-close guard regressed (#P0.2)"
-                    );
-                    tracing::warn!(
-                        name,
-                        "unrecognized rounding mode variable, defaulting to RNE"
-                    );
-                    RoundingMode::default()
-                }
-            },
-            _ => {
-                debug_assert!(
-                    false,
-                    "get_rounding_mode reached with non-symbolic mode term {term:?} — \
-                     upstream fail-close guard regressed (#P0.2)"
-                );
-                tracing::warn!(?term, "non-symbolic rounding mode term, defaulting to RNE");
-                RoundingMode::default()
-            }
-        }
-    }
-
     /// Decompose an FP constructor `(fp sign_bv exp_bv sig_bv)` into CNF
     /// variables. Each of the three fields is handled independently:
     ///
@@ -110,35 +56,54 @@ impl FpSolver<'_> {
         args: &[TermId],
         precision: FpPrecision,
     ) -> FpDecomposed {
+        uninterrupted(|control| {
+            self.decompose_fp_constructor_with_control(args, precision, control)
+        })
+    }
+
+    pub(crate) fn decompose_fp_constructor_with_control<C: BuildControl>(
+        &mut self,
+        args: &[TermId],
+        precision: FpPrecision,
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         // Every early return below re-asserts `has_encoding_gap` rather than
         // trusting the callee to have set it. `fresh_decomposed` hands back
         // UNCONSTRAINED bits; if it is ever reached without the gap flag armed,
         // a `sat` built on those bits is published as a real answer. The flag is
         // idempotent, so re-arming it costs nothing and closes that hole by
         // construction instead of by audit.
-        let Some(sign) = self.fp_constructor_sign_bit(args[0]) else {
+        let Some(sign) = self.fp_constructor_sign_bit_with_control(args[0], control)? else {
             self.has_encoding_gap = true;
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         };
-        let Some(exponent) =
-            self.fp_constructor_field_bits(args[1], precision.exponent_bits() as usize)
+        let Some(exponent) = self.fp_constructor_field_bits_with_control(
+            args[1],
+            precision.exponent_bits() as usize,
+            control,
+        )?
         else {
             self.has_encoding_gap = true;
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         };
-        let Some(significand) =
-            self.fp_constructor_field_bits(args[2], precision.significand_bits() as usize - 1)
+        let Some(significand) = self.fp_constructor_field_bits_with_control(
+            args[2],
+            precision.significand_bits() as usize - 1,
+            control,
+        )?
         else {
             self.has_encoding_gap = true;
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         };
 
-        FpDecomposed {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(FpDecomposed {
             sign,
             exponent,
             significand,
             precision,
-        }
+        })
     }
 
     /// Resolve the sign bit of an `(fp s e m)` constructor: a literal for a
@@ -146,42 +111,56 @@ impl FpSolver<'_> {
     ///
     /// `None` means "cannot encode this operand" and the caller must fail
     /// closed; it must NEVER be turned into a fresh unconstrained literal here.
-    fn fp_constructor_sign_bit(&mut self, arg: TermId) -> Option<CnfLit> {
+    fn fp_constructor_sign_bit_with_control<C: BuildControl>(
+        &mut self,
+        arg: TermId,
+        control: &mut C,
+    ) -> Result<Option<CnfLit>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         if let Some(v) = self.extract_bv_const(arg) {
-            return Some(if v.bit(0) {
+            return Ok(Some(if v.bit(0) {
                 self.const_true()
             } else {
                 self.const_false()
-            });
+            }));
         }
-        let bits = self.bitblast_conv_bv_arg(arg, 1)?;
-        bits.first().copied()
+        Ok(self
+            .bitblast_conv_bv_arg_with_control(arg, 1, control)?
+            .and_then(|bits| bits.first().copied()))
     }
 
     /// Resolve an exponent/significand field of an `(fp s e m)` constructor:
     /// constant bits when the BV arg is a constant, else the symbolic BV bits.
     ///
     /// `None` means "cannot encode this operand" — see
-    /// [`Self::fp_constructor_sign_bit`].
-    fn fp_constructor_field_bits(&mut self, arg: TermId, width: usize) -> Option<Vec<CnfLit>> {
+    /// [`Self::fp_constructor_sign_bit_with_control`].
+    fn fp_constructor_field_bits_with_control<C: BuildControl>(
+        &mut self,
+        arg: TermId,
+        width: usize,
+        control: &mut C,
+    ) -> Result<Option<Vec<CnfLit>>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         if let Some(v) = self.extract_bv_const(arg) {
-            return Some(
-                (0..width)
-                    .map(|i| {
-                        if v.bit(i as u64) {
-                            self.const_true()
-                        } else {
-                            self.const_false()
-                        }
-                    })
-                    .collect(),
-            );
+            let bits = (0..width)
+                .map(|i| {
+                    if v.bit(i as u64) {
+                        self.const_true()
+                    } else {
+                        self.const_false()
+                    }
+                })
+                .collect();
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            return Ok(Some(bits));
         }
-        let bits = self.bitblast_conv_bv_arg(arg, width)?;
+        let Some(bits) = self.bitblast_conv_bv_arg_with_control(arg, width, control)? else {
+            return Ok(None);
+        };
         // Width discipline: the FP field is exactly `width` bits. A shorter
         // vector would leave the top field bits unconstrained — the very
         // wrong-`sat` generator this fix exists to remove.
-        (bits.len() == width).then_some(bits)
+        Ok((bits.len() == width).then_some(bits))
     }
 
     /// Decompose `(_ to_fp eb sb)` based on argument count and sorts.
@@ -190,18 +169,33 @@ impl FpSolver<'_> {
         args: &[TermId],
         precision: FpPrecision,
     ) -> FpDecomposed {
-        match args.len() {
-            1 => self.make_to_fp_from_bv_reinterpret(args[0], precision),
+        uninterrupted(|control| self.decompose_to_fp_with_control(args, precision, control))
+    }
+
+    pub(crate) fn decompose_to_fp_with_control<C: BuildControl>(
+        &mut self,
+        args: &[TermId],
+        precision: FpPrecision,
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        let result = match args.len() {
+            1 => self.make_to_fp_from_bv_reinterpret_with_control(args[0], precision, control)?,
             2 => {
-                let rm = self.get_rounding_mode(args[0]);
+                let rm = self.rounding_operand_with_control(args[0], control)?;
                 let arg_sort = self.terms.sort(args[1]).clone();
                 match arg_sort {
                     Sort::FloatingPoint(..) => {
-                        let x = self.get_fp(args[1]);
+                        let x = self.get_fp_with_control(args[1], control)?;
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                         self.make_to_fp_float(&x, rm, precision)
                     }
-                    Sort::BitVec(_) => self.make_to_fp_signed(args[1], rm, precision),
-                    Sort::Real | Sort::Int => self.make_to_fp_real(args[1], rm, precision),
+                    Sort::BitVec(_) => {
+                        self.make_to_fp_signed_with_control(args[1], rm, precision, control)?
+                    }
+                    Sort::Real | Sort::Int => {
+                        self.make_to_fp_real_with_control(args[1], rm, precision, control)?
+                    }
                     _ => {
                         tracing::warn!(
                             ?arg_sort,
@@ -212,12 +206,14 @@ impl FpSolver<'_> {
                     }
                 }
             }
-            3 => self.decompose_fp_constructor(args, precision),
+            3 => self.decompose_fp_constructor_with_control(args, precision, control)?,
             _ => {
                 tracing::warn!(nargs = args.len(), "to_fp: unexpected argument count");
                 self.fresh_decomposed(precision)
             }
-        }
+        };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Decompose `(_ to_fp_unsigned eb sb) rm bv` — unsigned BV-to-FP.
@@ -226,48 +222,63 @@ impl FpSolver<'_> {
         args: &[TermId],
         precision: FpPrecision,
     ) -> FpDecomposed {
+        uninterrupted(|control| {
+            self.decompose_to_fp_unsigned_with_control(args, precision, control)
+        })
+    }
+
+    pub(crate) fn decompose_to_fp_unsigned_with_control<C: BuildControl>(
+        &mut self,
+        args: &[TermId],
+        precision: FpPrecision,
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         if args.len() != 2 {
             tracing::warn!(
                 nargs = args.len(),
                 "to_fp_unsigned: expected 2 arguments (rm, bv)"
             );
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         }
-        let rm = self.get_rounding_mode(args[0]);
-        self.make_to_fp_unsigned(args[1], rm, precision)
+        let rm = self.rounding_operand_with_control(args[0], control)?;
+        self.make_to_fp_unsigned_with_control(args[1], rm, precision, control)
     }
 
     /// Reinterpret a bitvector as an IEEE 754 floating-point bit pattern.
-    fn make_to_fp_from_bv_reinterpret(
+    fn make_to_fp_from_bv_reinterpret_with_control<C: BuildControl>(
         &mut self,
         bv_term: TermId,
         precision: FpPrecision,
-    ) -> FpDecomposed {
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
         let total = 1 + eb + (sb - 1);
 
         if let Some(bv_val) = self.extract_bv_const(bv_term) {
-            let fp = self.fresh_decomposed(precision);
             let sign_val = bv_val.bit((total - 1) as u64);
-            self.constrain_constant(
-                &fp,
+            let fp = self.make_constant(
+                precision,
                 sign_val,
                 |i| bv_val.bit(u64::from(i) + (sb as u64 - 1)),
                 |i| bv_val.bit(u64::from(i)),
             );
-            return fp;
+            control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+            return Ok(fp);
         }
 
-        let Some(bv_bits) = self.bitblast_conv_bv_arg(bv_term, total) else {
-            return self.fresh_decomposed(precision);
+        let Some(bv_bits) = self.bitblast_conv_bv_arg_with_control(bv_term, total, control)? else {
+            return Ok(self.fresh_decomposed(precision));
         };
-        FpDecomposed {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(FpDecomposed {
             sign: bv_bits[total - 1],
             exponent: bv_bits[sb - 1..sb - 1 + eb].to_vec(),
             significand: bv_bits[0..sb - 1].to_vec(),
             precision,
-        }
+        })
     }
 
     /// Bit-blast a (possibly composite) BV argument to an int→fp conversion.
@@ -285,38 +296,55 @@ impl FpSolver<'_> {
         bv_term: TermId,
         bv_sz: usize,
     ) -> Option<Vec<CnfLit>> {
-        match self.bitblast_bv_value(bv_term, bv_sz) {
-            Some(bits) => Some(bits),
-            None => {
-                self.has_encoding_gap = true;
-                None
-            }
-        }
+        uninterrupted(|control| self.bitblast_conv_bv_arg_with_control(bv_term, bv_sz, control))
+    }
+
+    pub(crate) fn bitblast_conv_bv_arg_with_control<C: BuildControl>(
+        &mut self,
+        bv_term: TermId,
+        bv_sz: usize,
+        control: &mut C,
+    ) -> Result<Option<Vec<CnfLit>>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        Ok(
+            match self.bitblast_bv_value_with_control(bv_term, bv_sz, control)? {
+                Some(bits) => Some(bits),
+                None => {
+                    self.has_encoding_gap = true;
+                    None
+                }
+            },
+        )
     }
 
     /// Convert a signed bitvector to floating-point with rounding.
-    fn make_to_fp_signed(
+    fn make_to_fp_signed_with_control<C: BuildControl>(
         &mut self,
         bv_term: TermId,
-        rm: RoundingMode,
+        rm: RmOperand,
         precision: FpPrecision,
-    ) -> FpDecomposed {
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
-        let exp_sz = eb + 2;
         let sig_sz = sb + 4;
 
         let bv_sz = match self.terms.sort(bv_term).clone() {
             Sort::BitVec(bvs) => bvs.width as usize,
             _ => {
                 tracing::warn!("to_fp signed: argument is not BitVec");
-                return self.fresh_decomposed(precision);
+                return Ok(self.fresh_decomposed(precision));
             }
         };
+        // Signed, and wide enough for `bv_sz - 2` and for what `fp_round`
+        // derives from it (see `int_conversion_exponent_width`).
+        let exp_sz = Self::int_conversion_exponent_width(eb, sb, bv_sz);
 
-        let Some(bv_bits) = self.bitblast_conv_bv_arg(bv_term, bv_sz) else {
-            return self.fresh_decomposed(precision);
+        let Some(bv_bits) = self.bitblast_conv_bv_arg_with_control(bv_term, bv_sz, control)? else {
+            return Ok(self.fresh_decomposed(precision));
         };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let is_zero = self.make_all_zero(&bv_bits);
         let zero_fp = self.make_zero(precision, false);
 
@@ -324,7 +352,7 @@ impl FpSolver<'_> {
         let neg_bv = self.bv_neg(&bv_bits);
         let abs_bv = self.make_ite_bits(sign_bit, &neg_bv, &bv_bits);
 
-        let lz = self.bv_leading_zeros(&abs_bv, exp_sz);
+        let lz = self.conversion_lz_with_control(&abs_bv, exp_sz, control)?;
         let lz_extended = if bv_sz > exp_sz {
             self.zero_extend(&lz, bv_sz - exp_sz)
         } else if bv_sz < exp_sz {
@@ -332,7 +360,7 @@ impl FpSolver<'_> {
         } else {
             lz.clone()
         };
-        let shifted = self.bv_shl(&abs_bv, &lz_extended);
+        let shifted = self.bv_shl_with_control(&abs_bv, &lz_extended, control)?;
 
         let mut sig_bits = Vec::with_capacity(sig_sz);
         if bv_sz >= sig_sz {
@@ -351,41 +379,61 @@ impl FpSolver<'_> {
         }
         debug_assert_eq!(sig_bits.len(), sig_sz);
 
-        let base_exp = self.const_bv((bv_sz as u64).wrapping_sub(2), exp_sz);
+        let base_exp = self.const_bv_signed(bv_sz as i64 - 2, exp_sz);
         let exp_bits = self.bv_sub(&base_exp, &lz);
 
-        let rounded = self.fp_round(precision, rm, sign_bit, &sig_bits, &exp_bits);
-        self.make_ite_fp(is_zero, &zero_fp, &rounded, precision)
+        let rounded = self.conversion_round_with_control(
+            precision, rm, sign_bit, &sig_bits, &exp_bits, control,
+        )?;
+        let result = self.make_ite_fp(is_zero, &zero_fp, &rounded, precision);
+        drop(rounded);
+        drop(exp_bits);
+        drop(base_exp);
+        drop(sig_bits);
+        drop(shifted);
+        drop(lz_extended);
+        drop(lz);
+        drop(abs_bv);
+        drop(neg_bv);
+        drop(zero_fp);
+        drop(bv_bits);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Convert an unsigned bitvector to floating-point with rounding.
-    fn make_to_fp_unsigned(
+    fn make_to_fp_unsigned_with_control<C: BuildControl>(
         &mut self,
         bv_term: TermId,
-        rm: RoundingMode,
+        rm: RmOperand,
         precision: FpPrecision,
-    ) -> FpDecomposed {
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
-        let exp_sz = eb + 2;
         let sig_sz = sb + 4;
 
         let bv_sz = match self.terms.sort(bv_term).clone() {
             Sort::BitVec(bvs) => bvs.width as usize,
             _ => {
                 tracing::warn!("to_fp_unsigned: argument is not BitVec");
-                return self.fresh_decomposed(precision);
+                return Ok(self.fresh_decomposed(precision));
             }
         };
+        // Signed, and wide enough for `bv_sz - 2` and for what `fp_round`
+        // derives from it (see `int_conversion_exponent_width`).
+        let exp_sz = Self::int_conversion_exponent_width(eb, sb, bv_sz);
 
-        let Some(bv_bits) = self.bitblast_conv_bv_arg(bv_term, bv_sz) else {
-            return self.fresh_decomposed(precision);
+        let Some(bv_bits) = self.bitblast_conv_bv_arg_with_control(bv_term, bv_sz, control)? else {
+            return Ok(self.fresh_decomposed(precision));
         };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let result_sign = self.const_false();
         let is_zero = self.make_all_zero(&bv_bits);
         let zero_fp = self.make_zero(precision, false);
 
-        let lz = self.bv_leading_zeros(&bv_bits, exp_sz);
+        let lz = self.conversion_lz_with_control(&bv_bits, exp_sz, control)?;
         let lz_extended = if bv_sz > exp_sz {
             self.zero_extend(&lz, bv_sz - exp_sz)
         } else if bv_sz < exp_sz {
@@ -393,7 +441,7 @@ impl FpSolver<'_> {
         } else {
             lz.clone()
         };
-        let shifted = self.bv_shl(&bv_bits, &lz_extended);
+        let shifted = self.bv_shl_with_control(&bv_bits, &lz_extended, control)?;
 
         let mut sig_bits = Vec::with_capacity(sig_sz);
         if bv_sz >= sig_sz {
@@ -412,11 +460,29 @@ impl FpSolver<'_> {
         }
         debug_assert_eq!(sig_bits.len(), sig_sz);
 
-        let base_exp = self.const_bv((bv_sz as u64).wrapping_sub(2), exp_sz);
+        let base_exp = self.const_bv_signed(bv_sz as i64 - 2, exp_sz);
         let exp_bits = self.bv_sub(&base_exp, &lz);
 
-        let rounded = self.fp_round(precision, rm, result_sign, &sig_bits, &exp_bits);
-        self.make_ite_fp(is_zero, &zero_fp, &rounded, precision)
+        let rounded = self.conversion_round_with_control(
+            precision,
+            rm,
+            result_sign,
+            &sig_bits,
+            &exp_bits,
+            control,
+        )?;
+        let result = self.make_ite_fp(is_zero, &zero_fp, &rounded, precision);
+        drop(rounded);
+        drop(exp_bits);
+        drop(base_exp);
+        drop(sig_bits);
+        drop(shifted);
+        drop(lz_extended);
+        drop(lz);
+        drop(zero_fp);
+        drop(bv_bits);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Convert a ground Real (or Int) literal to floating-point with rounding.
@@ -431,34 +497,62 @@ impl FpSolver<'_> {
     /// or the target format is outside the exact-rounding helper's supported
     /// range, we fail closed (flag an encoding gap so the solver returns a sound
     /// `unknown` rather than guessing an unconstrained value).
-    fn make_to_fp_real(
+    fn make_to_fp_real_with_control<C: BuildControl>(
         &mut self,
         real_term: TermId,
-        rm: RoundingMode,
+        rm: RmOperand,
         precision: FpPrecision,
-    ) -> FpDecomposed {
-        let Some(value) = self.eval_ground_rational(real_term) else {
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        let Some(value) = self.eval_ground_rational_with_control(real_term, control)? else {
             tracing::warn!(
                 ?real_term,
                 "to_fp from Real: argument is not a ground rational literal — encoding gap"
             );
             self.has_encoding_gap = true;
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         };
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let eb = precision.exponent_bits();
         let sb = precision.significand_bits();
-        let Some(mv) = FpModelValue::from_rational_with_format(&value, eb, sb, rm) else {
+        let rounded = |mode| FpModelValue::from_rational_with_format(&value, eb, sb, mode);
+        let result = match rm {
+            RmOperand::Literal(mode) => {
+                rounded(mode).map(|mv| self.constrain_to_model_value(&mv, precision))
+            }
+            RmOperand::Symbolic(_) => {
+                // One constant per mode, selected by the mode's bits.
+                let mut selected = None;
+                for mode in RM_ORDER.into_iter().rev() {
+                    let Some(mv) = rounded(mode) else {
+                        selected = None;
+                        break;
+                    };
+                    let constant = self.constrain_to_model_value(&mv, precision);
+                    selected = Some(match selected {
+                        None => constant,
+                        Some(rest) => {
+                            let is_mode = self.rm_is(rm, mode);
+                            self.make_ite_fp(is_mode, &constant, &rest, precision)
+                        }
+                    });
+                }
+                selected
+            }
+        };
+        let Some(result) = result else {
             tracing::warn!(
                 eb,
                 sb,
                 "to_fp from Real: format unsupported by exact rounding — encoding gap"
             );
             self.has_encoding_gap = true;
-            return self.fresh_decomposed(precision);
+            return Ok(self.fresh_decomposed(precision));
         };
-
-        self.constrain_to_model_value(&mv, precision)
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Pin a fresh decomposed FP value to a concrete [`FpModelValue`] bit
@@ -469,6 +563,12 @@ impl FpSolver<'_> {
         precision: FpPrecision,
     ) -> FpDecomposed {
         match *mv {
+            FpModelValue::Exact(ref fields) => self.make_constant(
+                precision,
+                fields.sign(),
+                |i| fields.exponent().bit(i as u64),
+                |i| fields.significand().bit(i as u64),
+            ),
             FpModelValue::PosZero { .. } => self.make_zero(precision, false),
             FpModelValue::NegZero { .. } => self.make_zero(precision, true),
             FpModelValue::PosInf { .. } => self.make_infinity(precision, false),
@@ -479,16 +579,12 @@ impl FpSolver<'_> {
                 exponent,
                 significand,
                 ..
-            } => {
-                let fp = self.fresh_decomposed(precision);
-                self.constrain_constant(
-                    &fp,
-                    sign,
-                    |i| (exponent >> i) & 1 == 1,
-                    |i| (significand >> i) & 1 == 1,
-                );
-                fp
-            }
+            } => self.make_constant(
+                precision,
+                sign,
+                |i| (exponent >> i) & 1 == 1,
+                |i| (significand >> i) & 1 == 1,
+            ),
         }
     }
 
@@ -496,55 +592,94 @@ impl FpSolver<'_> {
     ///
     /// Returns `None` if the term contains any non-constant leaf or an
     /// operator/shape this evaluator does not cover (caller fails closed).
-    fn eval_ground_rational(&self, term: TermId) -> Option<BigRational> {
-        match self.terms.get(term) {
+    fn eval_ground_rational_with_control<C: BuildControl>(
+        &self,
+        term: TermId,
+        control: &mut C,
+    ) -> Result<Option<BigRational>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        let result = match self.terms.get(term) {
             TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
             TermData::Const(Constant::Int(n)) => Some(BigRational::from(n.clone())),
             TermData::App(Symbol::Named(name), args) => match name.as_str() {
                 "+" if !args.is_empty() => {
                     let mut sum = BigRational::from(BigInt::from(0));
                     for &a in args {
-                        sum += self.eval_ground_rational(a)?;
+                        let Some(value) = self.eval_ground_rational_with_control(a, control)?
+                        else {
+                            return Ok(None);
+                        };
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+                        sum += value;
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                     }
                     Some(sum)
                 }
-                "-" if args.len() == 1 => Some(-self.eval_ground_rational(args[0])?),
+                "-" if args.len() == 1 => {
+                    let value = self.eval_ground_rational_with_control(args[0], control)?;
+                    control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+                    value.map(|value| -value)
+                }
                 "-" if args.len() >= 2 => {
-                    let mut acc = self.eval_ground_rational(args[0])?;
+                    let Some(mut acc) = self.eval_ground_rational_with_control(args[0], control)?
+                    else {
+                        return Ok(None);
+                    };
                     for &a in &args[1..] {
-                        acc -= self.eval_ground_rational(a)?;
+                        let Some(value) = self.eval_ground_rational_with_control(a, control)?
+                        else {
+                            return Ok(None);
+                        };
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+                        acc -= value;
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                     }
                     Some(acc)
                 }
                 "*" if !args.is_empty() => {
                     let mut prod = BigRational::from(BigInt::from(1));
                     for &a in args {
-                        prod *= self.eval_ground_rational(a)?;
+                        let Some(value) = self.eval_ground_rational_with_control(a, control)?
+                        else {
+                            return Ok(None);
+                        };
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+                        prod *= value;
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                     }
                     Some(prod)
                 }
                 "/" if args.len() >= 2 => {
-                    let mut acc = self.eval_ground_rational(args[0])?;
+                    let Some(mut acc) = self.eval_ground_rational_with_control(args[0], control)?
+                    else {
+                        return Ok(None);
+                    };
                     for &a in &args[1..] {
-                        let d = self.eval_ground_rational(a)?;
+                        let Some(d) = self.eval_ground_rational_with_control(a, control)? else {
+                            return Ok(None);
+                        };
                         if d.numer() == &BigInt::from(0) {
-                            return None;
+                            return Ok(None);
                         }
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                         acc /= d;
+                        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
                     }
                     Some(acc)
                 }
                 _ => None,
             },
             _ => None,
-        }
+        };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 
     /// Convert FP to FP with different precision.
     fn make_to_fp_float(
         &mut self,
         x: &FpDecomposed,
-        rm: RoundingMode,
+        rm: RmOperand,
         to_precision: FpPrecision,
     ) -> FpDecomposed {
         let from_precision = x.precision;
@@ -615,10 +750,12 @@ impl FpSolver<'_> {
             res
         };
 
-        let exp_sz = to_eb + 2;
+        // `to_eb + 2` and `max(from_eb, to_eb) + 2` (z3's) unless a format
+        // needs more (`fp_conversion_widths`).
+        let (work_sz, exp_sz) = Self::fp_conversion_widths(from_eb, from_sb, to_eb, to_sb);
         // Compute the normalized unbiased exponent `exp - lz` in a working width
         // wide enough to hold the source's most-negative normalized exponent, then
-        // saturate (sign-aware clamp) into the target's `to_eb + 2` field.
+        // saturate (sign-aware clamp) into the target's `exp_sz`-bit field.
         //
         // `exp` (from unpack) is the SIGNED unbiased source exponent at width
         // `from_eb`. For a subnormal source it is `1 - from_bias`, and the
@@ -629,12 +766,12 @@ impl FpSolver<'_> {
         // infinity instead of the correct smallest subnormal). Materializing the
         // subtraction at a narrow width before clamping is the unsoundness.
         //
-        // Work in W = max(from_eb, to_eb) + 2 bits, keeping the exponent signed
-        // and un-truncated, mirroring z3's fpa2bv_converter::mk_to_fp_float which
-        // keeps the exponent at max(from_ebits, to_ebits) + 2 through normalization
-        // so fp_round's TINY (underflow-to-subnormal) path receives the true,
-        // very-negative exponent.
-        let work_sz = from_eb.max(to_eb) + 2;
+        // Work in W = max(from_eb, to_eb) + 2 bits (or more, holding the
+        // source's smallest subnormal), keeping the exponent signed and
+        // un-truncated, mirroring z3's fpa2bv_converter::mk_to_fp_float which
+        // keeps the exponent at max(from_ebits, to_ebits) + 2 through
+        // normalization so fp_round's TINY (underflow-to-subnormal) path
+        // receives the true, very-negative exponent.
         debug_assert!(work_sz >= exp_sz, "work width must cover target exp field");
         debug_assert!(work_sz >= from_eb, "work width must cover source exp width");
 

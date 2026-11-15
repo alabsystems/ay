@@ -12,8 +12,8 @@
 //! `rustc_private` driver frozen on `nightly-2025-12-03`, links this crate.
 //!
 //! `gate_decision_stock.rs` is the same decision without the clause, and
-//! `mod.rs` selects between the two on `cfg(deductive_verify)`. The two are pinned to
-//! each other, and to the proof fixture, by `tests/smt_model_gate_conformance.rs`.
+//! `mod.rs` selects between the two on `cfg(deductive_verify)`; `tests/gate_decision.rs`
+//! checks the truth table of whichever one a build compiles.
 
 /// Pure, contract-carrying decision core of the independent SAT gate — the SMT
 /// twin of the SAT-side Verified-SAT-Gate (`decision_sat_self_checked` in
@@ -31,7 +31,7 @@
 /// `Sat -> {Sat, Unknown}`, never toward unsoundness.
 ///
 /// The postcondition is a native `ensures` clause, which the default
-/// (Trust) toolchain parses unconditionally: no `cfg` gate, no
+/// (`channel = "trust"`) toolchain parses unconditionally: no `cfg` gate, no
 /// `trust` dependency, and no `--extern trust` overlay. It replaced a
 /// `` attribute that was inert
 /// outside the ratchet lane and, once verification became the default, a hard

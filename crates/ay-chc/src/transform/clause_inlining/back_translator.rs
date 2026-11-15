@@ -22,6 +22,20 @@ use super::super::{
     BackTranslator, InvalidityWitness, TransformMemoryReport, TransformObligation, ValidityWitness,
 };
 
+mod bounded_cases;
+mod definition_refutation;
+mod exact_projection;
+mod read_only_arrays;
+mod repeated_formals;
+#[cfg(test)]
+mod synthesis_capture;
+
+/// Upper bound on premise steps one ground translation may synthesize for
+/// body predicates the inliner folded away (`align_premises_synthesizing_inlined`).
+const MAX_SYNTHESIZED_PREMISE_STEPS: usize = 2048;
+/// Nesting bound of one synthesized definitional chain.
+const MAX_SYNTHESIS_DEPTH: usize = 16;
+
 /// Cap AllSAT+MBP existential projection during back-translation.
 ///
 /// If the cap is hit before the exact projection is covered, synthesis fails
@@ -1414,9 +1428,7 @@ impl InliningBackTranslator {
                     blocking.node_count(1_000_000)
                 );
             }
-            match smt
-                .check_sat_with_executor_fallback_timeout(&blocking, EXISTENTIAL_QE_CHECK_TIMEOUT)
-            {
+            match Self::check_projection_query(&mut smt, &blocking) {
                 SmtResult::Sat(model) => {
                     let projection = mbp
                         .keep_only(&formula, keep_vars, &model)
@@ -1453,9 +1465,7 @@ impl InliningBackTranslator {
         let mut exactness = SmtContext::new();
         let missing_region =
             ChcExpr::and(formula.clone(), ChcExpr::not(projected.clone())).simplify_constants();
-        match exactness
-            .check_sat_with_executor_fallback_timeout(&missing_region, EXISTENTIAL_QE_CHECK_TIMEOUT)
-        {
+        match Self::check_projection_query(&mut exactness, &missing_region) {
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {}
             SmtResult::Sat(_) => return None,
             SmtResult::Unknown => {}
@@ -1475,6 +1485,55 @@ impl InliningBackTranslator {
     fn close_synthesized_interpretation(
         interp: PredicateInterpretation,
     ) -> Option<PredicateInterpretation> {
+        #[cfg(test)]
+        synthesis_capture::before_projection(&interp);
+        // A definition refuted with its top-level definitions substituted away
+        // never fires: its exact image is `false`, and no bounded projection
+        // is spent on it. A stopped owner publishes nothing.
+        if Self::refuted_definition(&interp.formula)? {
+            return Some(PredicateInterpretation::new(
+                interp.vars,
+                ChcExpr::Bool(false),
+            ));
+        }
+        // A local array the body only reads is eliminated exactly first: no
+        // projection below can drop an array-sorted local. Only a closed
+        // exact image of the reduced formula is taken. A semantic decline may
+        // try another strategy, but exhausting the original projection scope
+        // is terminal: retries must not manufacture fresh resource credit.
+        if let Some(reduced) = read_only_arrays::ackermannize(&interp.formula, &interp.vars) {
+            let mut candidate = Some(reduced);
+            let mut split = false;
+            while let Some(formula) = candidate.take() {
+                match exact_projection::project(&formula, &interp.vars) {
+                    exact_projection::Projection::Closed(projected) => {
+                        // The consistency constraints leave ground index
+                        // comparisons in the branches the projection closed.
+                        return Some(PredicateInterpretation::new(
+                            interp.vars,
+                            projected.simplify_constants(),
+                        ));
+                    }
+                    exact_projection::Projection::Stopped => return None,
+                    exact_projection::Projection::Declined => {}
+                }
+                // Once more, with its bounded locals split into their cases.
+                if !split {
+                    split = true;
+                    candidate = bounded_cases::split(&formula, &interp.vars);
+                }
+            }
+        }
+        let projection = exact_projection::project(&interp.formula, &interp.vars);
+        #[cfg(test)]
+        synthesis_capture::after_projection(&projection);
+        match projection {
+            exact_projection::Projection::Closed(formula) => {
+                return Some(PredicateInterpretation::new(interp.vars, formula));
+            }
+            exact_projection::Projection::Stopped => return None,
+            exact_projection::Projection::Declined => {}
+        }
         if let Some(formula) =
             Self::existentially_project_to_head_vars(&interp.formula, &interp.vars)
         {
@@ -1710,6 +1769,8 @@ impl InliningBackTranslator {
         clause: &HornClause,
         model: &ValidityWitness,
     ) -> Option<PredicateInterpretation> {
+        #[cfg(test)]
+        let _capture_definition = synthesis_capture::enter_definition(clause);
         // Extract formal parameter variables from the head
         let head_vars = match &clause.head {
             ClauseHead::Predicate(_, args) => {
@@ -1736,7 +1797,7 @@ impl InliningBackTranslator {
         // A repeated variable in the head — `P(x, y, x)`, which is legal CHC —
         // gives two FORMAL PARAMETERS THE SAME NAME. `PredicateInterpretation`
         // is applied by zipping `vars` against the call's actual arguments and
-        // running a FIRST-MATCH substitution, so a duplicated name makes the
+        // building a name-keyed substitution, so a duplicated name makes the
         // interpretation bind to the wrong argument position: the invariant
         // silently constrains argument #2 when it should constrain #0. A
         // tautological clause then reports "implication failed", and the
@@ -1746,23 +1807,7 @@ impl InliningBackTranslator {
         // The meaning of a repeated head variable is that those positions are
         // EQUAL, so make each repeat a FRESH parameter and carry that equality
         // explicitly. Parameter names become distinct and no constraint is lost.
-        let mut seen_names: Vec<String> = Vec::with_capacity(head_vars.len());
-        let mut dedup_equalities: Vec<ChcExpr> = Vec::new();
-        let mut head_vars_deduped: Vec<ChcVar> = Vec::with_capacity(head_vars.len());
-        for (idx, v) in head_vars.iter().enumerate() {
-            if seen_names.iter().any(|n| n == &v.name) {
-                let fresh = ChcVar::new(format!("__dedup_a{idx}_{}", v.name), v.sort.clone());
-                dedup_equalities.push(ChcExpr::eq(
-                    ChcExpr::var(fresh.clone()),
-                    ChcExpr::var(v.clone()),
-                ));
-                head_vars_deduped.push(fresh);
-            } else {
-                seen_names.push(v.name.clone());
-                head_vars_deduped.push(v.clone());
-            }
-        }
-        let head_vars = head_vars_deduped;
+        let (head_vars, dedup_equalities) = repeated_formals::build(clause, &head_vars, model);
 
         // Start with the body constraint
         let constraint = clause
@@ -1846,65 +1891,87 @@ impl InliningBackTranslator {
         clauses: &[&HornClause],
         model: &ValidityWitness,
     ) -> Option<PredicateInterpretation> {
+        Self::synthesize_disjunctive_while(clauses, model, &|| true)
+    }
+
+    /// The caller's poll only declines candidate construction; it never grants
+    /// proof authority to the shared, potentially incomplete projection.
+    pub(super) fn synthesize_disjunctive_while(
+        clauses: &[&HornClause],
+        model: &ValidityWitness,
+        open: &impl Fn() -> bool,
+    ) -> Option<PredicateInterpretation> {
         let mut disjuncts: Vec<Arc<ChcExpr>> = Vec::new();
         let mut shared_vars: Option<Vec<ChcVar>> = None;
         for (def_idx, clause) in clauses.iter().enumerate() {
+            if !open() {
+                return None;
+            }
             let interp = Self::synthesize_interpretation(clause, model)?;
+            if !open() {
+                return None;
+            }
             if shared_vars.is_none() {
                 shared_vars = Some(interp.vars.clone());
             }
-            // Rename interp vars to match the first definition's vars.
-            let formula = if let Some(ref sv) = shared_vars {
-                let head_subst: Vec<(ChcVar, ChcExpr)> = interp
-                    .vars
-                    .iter()
-                    .zip(sv.iter())
-                    .filter(|(a, b)| a.name != b.name)
-                    .map(|(from, to)| (from.clone(), ChcExpr::var(to.clone())))
-                    .collect();
-                if head_subst.is_empty() {
-                    interp.formula
-                } else {
-                    // Alpha-rename free body vars that collide with target
-                    // shared_vars names before renaming head vars.
-                    let head_var_names: FxHashSet<&str> =
-                        interp.vars.iter().map(|v| v.name.as_str()).collect();
-                    let target_names: FxHashSet<&str> =
-                        sv.iter().map(|v| v.name.as_str()).collect();
-                    let mut alpha_subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
-                    for fv in interp.formula.vars() {
-                        if head_var_names.contains(fv.name.as_str()) {
-                            continue;
-                        }
-                        if target_names.contains(fv.name.as_str()) {
-                            let fresh =
-                                ChcVar::new(format!("_bt{}_{}", def_idx, fv.name), fv.sort.clone());
-                            alpha_subst.push((fv, ChcExpr::var(fresh)));
-                        }
-                    }
-                    let formula = if alpha_subst.is_empty() {
-                        interp.formula
-                    } else {
-                        interp.formula.substitute(&alpha_subst)
-                    };
-                    formula.substitute(&head_subst)
-                }
-            } else {
-                interp.formula
-            };
+            let formula = Self::rename_disjunct_formals(interp, shared_vars.as_deref(), def_idx);
+            if !open() {
+                return None;
+            }
             disjuncts.push(Arc::new(formula));
         }
         let vars = shared_vars?;
         let formula = if disjuncts.len() == 1 {
-            Arc::unwrap_or_clone(disjuncts.pop().unwrap())
+            Arc::unwrap_or_clone(disjuncts.pop()?)
         } else {
             ChcExpr::Op(ChcOp::Or, disjuncts)
         };
         let allowed: FxHashSet<ChcVar> = vars.iter().cloned().collect();
-        if !Self::vars_are_closed(&formula, &allowed) {
+        if !open() || !Self::vars_are_closed(&formula, &allowed) || !open() {
             return None;
         }
         Some(PredicateInterpretation::new(vars, formula))
+    }
+
+    /// Preserve the existing capture-avoiding alignment between definitions.
+    fn rename_disjunct_formals(
+        interp: PredicateInterpretation,
+        shared_vars: Option<&[ChcVar]>,
+        def_idx: usize,
+    ) -> ChcExpr {
+        let Some(shared_vars) = shared_vars else {
+            return interp.formula;
+        };
+        let head_subst: Vec<(ChcVar, ChcExpr)> = interp
+            .vars
+            .iter()
+            .zip(shared_vars)
+            .filter(|(a, b)| a.name != b.name)
+            .map(|(from, to)| (from.clone(), ChcExpr::var(to.clone())))
+            .collect();
+        if head_subst.is_empty() {
+            return interp.formula;
+        }
+        // Alpha-rename free body vars that collide with target shared names
+        // before renaming head vars, exactly as in ordinary back-translation.
+        let head_var_names: FxHashSet<&str> = interp.vars.iter().map(|v| v.name.as_str()).collect();
+        let target_names: FxHashSet<&str> = shared_vars.iter().map(|v| v.name.as_str()).collect();
+        let mut alpha_subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
+        for fv in interp.formula.vars() {
+            if head_var_names.contains(fv.name.as_str()) {
+                continue;
+            }
+            if target_names.contains(fv.name.as_str()) {
+                let fresh = ChcVar::new(format!("_bt{}_{}", def_idx, fv.name), fv.sort.clone());
+                alpha_subst.push((fv, ChcExpr::var(fresh)));
+            }
+        }
+        let formula = if alpha_subst.is_empty() {
+            interp.formula
+        } else {
+            interp.formula.substitute(&alpha_subst)
+        };
+        formula.substitute(&head_subst)
     }
 
     /// Remap witness PredicateIds from compacted space to original space.
@@ -2238,6 +2305,8 @@ impl BackTranslator for InliningBackTranslator {
     }
 
     fn translate_validity(&self, mut witness: ValidityWitness) -> ValidityWitness {
+        #[cfg(test)]
+        let _capture_stage = synthesis_capture::enter_stage(self);
         // Step 1: Remap engine witness from compacted IDs to original IDs.
         // The engine produced interpretations keyed by new (compacted) PredicateIds;
         // we need them keyed by original IDs for back-translation to work.
@@ -2497,6 +2566,9 @@ impl InliningBackTranslator {
         // fact (the C₀ application, for an expanded step).
         let mut mapped: Vec<usize> = Vec::with_capacity(derivation.steps.len());
         let mut query_step = None;
+        // Premise steps this translation may synthesize for folded-away body
+        // predicates (`align_premises_synthesizing_inlined`).
+        let mut synthesis_budget = MAX_SYNTHESIZED_PREMISE_STEPS;
 
         for (old_index, step) in derivation.steps.iter().enumerate() {
             let Some(premise_targets) = step
@@ -2549,11 +2621,22 @@ impl InliningBackTranslator {
                         ));
                         return None;
                     };
-                    let Some(ordered_premises) = Self::order_surviving_premises(
-                        &clause.body.predicates,
+                    // A trace that exists but cannot be expanded (poisoned:
+                    // the same predicate inlined twice into this clause, or
+                    // composed again across passes) still names, per inlined
+                    // predicate, the defining clause it used — a hint for the
+                    // synthesis below, never evidence.
+                    let trace_hint = self.composition_traces.get(&step.clause_index);
+                    let mut env = step.env.clone();
+                    let Some(ordered_premises) = Self::align_premises_synthesizing_inlined(
+                        clause,
+                        input_index,
                         &premise_targets,
-                        &steps,
+                        &mut env,
+                        &mut steps,
                         input_clauses,
+                        trace_hint,
+                        &mut synthesis_budget,
                     ) else {
                         log_ground_translation_detail(format_args!(
                             "clause-inliner: could not align premises for uncomposed input \
@@ -2561,7 +2644,6 @@ impl InliningBackTranslator {
                         ));
                         return None;
                     };
-                    let mut env = step.env.clone();
                     crate::ground_derivation::complete::seed_env_from_premises(
                         clause,
                         &ordered_premises,
@@ -3236,33 +3318,354 @@ impl InliningBackTranslator {
         Some(surviving.remove(matching[0]))
     }
 
-    /// Order translated premises exactly as an input clause's body.
-    fn order_surviving_premises(
-        body_preds: &[(PredicateId, Vec<ChcExpr>)],
-        premises: &[usize],
-        emitted_steps: &[crate::ground_derivation::GroundDerivationStep],
+    /// Align the translated premises of an OUTPUT step with the body
+    /// predicates of its C₀ INPUT clause by predicate identity, and SYNTHESIZE
+    /// a premise step for every body predicate that has none.
+    ///
+    /// Why a premise can be missing: an output clause whose composition trace
+    /// cannot be expanded (poisoned — the same predicate inlined twice into it,
+    /// or composed again across inlining passes) is mapped to its C₀ input
+    /// clause, which still names the body predicates the inliner folded away.
+    /// Their derivations are not in the output derivation, but they are
+    /// determined by it: the C₀ environment fixes each call's argument values,
+    /// and the INPUT problem's own clauses for that predicate derive them
+    /// (kind2's definitional nodes: `swimmingpool_*`, `durationThm_3_e7_334`,
+    /// LRACORE_CH4B_owner_2026-09-23 §3.7). `synthesize_premise_step` rebuilds
+    /// the missing steps by a bounded ground search over those clauses.
+    ///
+    /// Soundness: synthesis only PROPOSES steps. Any failure discards the
+    /// partial steps and fails the translation closed; on success the whole
+    /// derivation is still validated on the input problem by the caller and
+    /// again on the ORIGINAL clauses by every acceptance site. An ambiguous
+    /// surviving premise (two translated premises for one body predicate) and
+    /// an unconsumed translated premise still fail closed, as before.
+    #[allow(clippy::too_many_arguments)]
+    fn align_premises_synthesizing_inlined(
+        clause: &HornClause,
+        input_index: usize,
+        premise_targets: &[usize],
+        env: &mut FxHashMap<String, SmtValue>,
+        steps: &mut Vec<crate::ground_derivation::GroundDerivationStep>,
         input_clauses: &[HornClause],
+        trace_hint: Option<&ClauseTrace>,
+        budget: &mut usize,
     ) -> Option<Vec<usize>> {
-        let mut surviving = premises.to_vec();
-        let ordered = body_preds
-            .iter()
-            .map(|(body_pred, _)| {
-                Self::take_surviving_premise(
-                    *body_pred,
-                    &mut surviving,
-                    emitted_steps,
-                    input_clauses,
-                )
-            })
-            .collect::<Option<Vec<_>>>()?;
+        use crate::ground_derivation::{
+            complete::propagate_env_for_clause, log_ground_translation_detail,
+        };
+
+        let mut surviving = premise_targets.to_vec();
+        let mut ordered = Vec::with_capacity(clause.body.predicates.len());
+        let mut synthesized = 0usize;
+        // Call-argument values for synthesis come from a PROBE copy of the
+        // environment with C₀'s own equalities propagated (no defaults — a
+        // default would name a derivation the search did not find). The
+        // caller's `env` itself is left exactly as the exact-alignment path
+        // always had it — premise values are seeded first and C₀'s equalities
+        // propagated afterwards by the caller — and only gains the bindings a
+        // SYNTHESIZED premise derives. Propagating into `env` here flipped that
+        // precedence and lost DRAGON_all2_e7_5406's replay (inl A/B, 19:2x).
+        let mut probe = env.clone();
+        propagate_env_for_clause(clause, &mut probe);
+        for (body_pred, args) in &clause.body.predicates {
+            let matching =
+                Self::surviving_premises_deriving(*body_pred, &surviving, steps, input_clauses);
+            let premise = match matching.len() {
+                1 => surviving.remove(matching[0]),
+                0 => {
+                    let hint_def = trace_hint
+                        .and_then(|trace| trace.steps.get(body_pred))
+                        .and_then(|composition| composition.def_input_index);
+                    let mark = steps.len();
+                    let Some(index) = Self::synthesize_premise_step(
+                        *body_pred,
+                        args,
+                        &probe,
+                        steps,
+                        input_clauses,
+                        hint_def,
+                        0,
+                        budget,
+                    ) else {
+                        steps.truncate(mark);
+                        log_ground_translation_detail(format_args!(
+                            "clause-inliner: no surviving premise for body predicate {body_pred:?} of \
+                             input clause {input_index} and none could be synthesized; fail closed"
+                        ));
+                        return None;
+                    };
+                    // The call's bare-variable arguments take the values the
+                    // synthesized premise derived — in the caller's environment
+                    // and in the probe, so later calls in this body see them.
+                    Self::bind_call_args_from_premise(args, index, steps, input_clauses, env);
+                    Self::bind_call_args_from_premise(
+                        args,
+                        index,
+                        steps,
+                        input_clauses,
+                        &mut probe,
+                    );
+                    synthesized += 1;
+                    index
+                }
+                found => {
+                    log_ground_translation_detail(format_args!(
+                        "clause-inliner: expected one surviving premise for body predicate \
+                         {body_pred:?}, found {found}; fail closed"
+                    ));
+                    return None;
+                }
+            };
+            ordered.push(premise);
+        }
         if !surviving.is_empty() {
-            crate::ground_derivation::log_ground_translation_detail(format_args!(
+            log_ground_translation_detail(format_args!(
                 "clause-inliner: {} translated premises were not consumed; fail closed",
                 surviving.len()
             ));
             return None;
         }
+        if synthesized > 0 {
+            log_ground_translation_detail(format_args!(
+                "clause-inliner: synthesized {synthesized} premise step(s) for input clause \
+                 {input_index} from the input problem's own clauses"
+            ));
+        }
         Some(ordered)
+    }
+
+    /// Positions in `surviving` whose premise step derives `body_pred`.
+    fn surviving_premises_deriving(
+        body_pred: PredicateId,
+        surviving: &[usize],
+        steps: &[crate::ground_derivation::GroundDerivationStep],
+        input_clauses: &[HornClause],
+    ) -> Vec<usize> {
+        surviving
+            .iter()
+            .enumerate()
+            .filter_map(|(position, premise)| {
+                let premise_head = steps
+                    .get(*premise)
+                    .and_then(|premise_step| input_clauses.get(premise_step.clause_index))
+                    .and_then(|premise_clause| premise_clause.head.predicate_id());
+                (premise_head == Some(body_pred)).then_some(position)
+            })
+            .collect()
+    }
+
+    /// Bind the bare-variable call arguments of `args` that `env` does not
+    /// bind yet from the head values `premise` derived.
+    fn bind_call_args_from_premise(
+        args: &[ChcExpr],
+        premise: usize,
+        steps: &[crate::ground_derivation::GroundDerivationStep],
+        input_clauses: &[HornClause],
+        env: &mut FxHashMap<String, SmtValue>,
+    ) {
+        let Some(premise_step) = steps.get(premise) else {
+            return;
+        };
+        let Some(ClauseHead::Predicate(_, head_args)) = input_clauses
+            .get(premise_step.clause_index)
+            .map(|clause| &clause.head)
+        else {
+            return;
+        };
+        for (arg, head_arg) in args.iter().zip(head_args.iter()) {
+            let ChcExpr::Var(var) = arg else {
+                continue;
+            };
+            if env.contains_key(&var.name) {
+                continue;
+            }
+            if let Some(value) =
+                crate::ground_derivation::eval_ground_pub(head_arg, &premise_step.env)
+            {
+                env.insert(var.name.clone(), value);
+            }
+        }
+    }
+
+    /// Synthesize one derivation step for `pred(args)` — called from a clause
+    /// whose environment is `caller_env` — out of the INPUT problem's clauses
+    /// with head `pred`, pushing it (and, recursively, the steps of its own
+    /// body predicates) onto `steps`. Returns the step's index.
+    ///
+    /// Candidates: the defining clause the poisoned trace recorded for `pred`
+    /// (`hint_def`) first, then every input clause with that head, in order.
+    /// A candidate fires only if its head can carry the call's argument values
+    /// where they are known, its body predicates synthesize in turn, its
+    /// environment completes, and its constraint ground-evaluates to `true`
+    /// under that environment. A failed candidate leaves nothing behind
+    /// (`steps` is truncated back), so a partial attempt can never become an
+    /// unreferenced padding step. Depth and total-step bounds keep the search
+    /// finite; exhausting either fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn synthesize_premise_step(
+        pred: PredicateId,
+        args: &[ChcExpr],
+        caller_env: &FxHashMap<String, SmtValue>,
+        steps: &mut Vec<crate::ground_derivation::GroundDerivationStep>,
+        input_clauses: &[HornClause],
+        hint_def: Option<usize>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Option<usize> {
+        // The route's solve deadline governs this search like every other
+        // acceptance step (`portfolio::validation::boundary_closed`): past it,
+        // fail closed instead of finishing a derivation nobody can accept.
+        if crate::smt::current_thread_solve_deadline()
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+        {
+            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                "clause-inliner: premise synthesis for {pred:?} past the solve deadline; fail closed"
+            ));
+            return None;
+        }
+        if depth > MAX_SYNTHESIS_DEPTH || *budget == 0 {
+            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                "clause-inliner: premise synthesis for {pred:?} exceeded its bounds (depth {depth}, \
+                 budget left {budget}); fail closed"
+            ));
+            return None;
+        }
+        let required: Vec<Option<SmtValue>> = args
+            .iter()
+            .map(|arg| crate::ground_derivation::eval_ground_pub(arg, caller_env))
+            .collect();
+        let mut candidates: Vec<usize> = Vec::new();
+        if let Some(hint) = hint_def {
+            if input_clauses
+                .get(hint)
+                .and_then(|clause| clause.head.predicate_id())
+                == Some(pred)
+            {
+                candidates.push(hint);
+            }
+        }
+        let rest: Vec<usize> = (0..input_clauses.len())
+            .filter(|index| {
+                !candidates.contains(index)
+                    && input_clauses[*index].head.predicate_id() == Some(pred)
+            })
+            .collect();
+        candidates.extend(rest);
+        for candidate in candidates {
+            let clause = &input_clauses[candidate];
+            let ClauseHead::Predicate(_, head_args) = &clause.head else {
+                continue;
+            };
+            if head_args.len() != required.len() {
+                continue;
+            }
+            let mark = steps.len();
+            if let Some(index) = Self::synthesize_with_clause(
+                clause,
+                candidate,
+                head_args,
+                &required,
+                steps,
+                input_clauses,
+                depth,
+                budget,
+            ) {
+                return Some(index);
+            }
+            steps.truncate(mark);
+        }
+        None
+    }
+
+    /// One candidate of `synthesize_premise_step`; see there.
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_with_clause(
+        clause: &HornClause,
+        candidate: usize,
+        head_args: &[ChcExpr],
+        required: &[Option<SmtValue>],
+        steps: &mut Vec<crate::ground_derivation::GroundDerivationStep>,
+        input_clauses: &[HornClause],
+        depth: usize,
+        budget: &mut usize,
+    ) -> Option<usize> {
+        use crate::ground_derivation::complete::{
+            complete_env_for_clause, propagate_env_for_clause,
+        };
+        use crate::ground_derivation::eval_ground_pub;
+
+        // Every ATTEMPT is charged, not only a successful one: a failed
+        // candidate recurses into its body predicates first, so under a
+        // recursive helper with k defining clauses the depth bound alone
+        // would admit ~sum(k^d) attempts before the search gave up.
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let mut env: FxHashMap<String, SmtValue> = FxHashMap::default();
+        // A bare-variable head position takes the value the call requires.
+        for (head_arg, value) in head_args.iter().zip(required.iter()) {
+            if let (ChcExpr::Var(var), Some(value)) = (head_arg, value) {
+                match env.get(&var.name) {
+                    Some(existing) if existing != value => return None,
+                    _ => {
+                        env.insert(var.name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        propagate_env_for_clause(clause, &mut env);
+        // Exact pruning before any recursion: a constraint conjunct that is
+        // already ground-false under the bound head values cannot fire,
+        // whatever the body predicates would derive. Indeterminate conjuncts
+        // are left for the full evaluation below.
+        if let Some(constraint) = &clause.body.constraint {
+            if constraint
+                .collect_conjuncts()
+                .iter()
+                .any(|conjunct| eval_ground_pub(conjunct, &env) == Some(SmtValue::Bool(false)))
+            {
+                return None;
+            }
+        }
+        let mut premises = Vec::with_capacity(clause.body.predicates.len());
+        for (body_pred, args) in &clause.body.predicates {
+            let index = Self::synthesize_premise_step(
+                *body_pred,
+                args,
+                &env,
+                steps,
+                input_clauses,
+                None,
+                depth + 1,
+                budget,
+            )?;
+            Self::bind_call_args_from_premise(args, index, steps, input_clauses, &mut env);
+            premises.push(index);
+        }
+        if !complete_env_for_clause(clause, &mut env) {
+            return None;
+        }
+        // The clause must fire under this environment ...
+        if let Some(constraint) = &clause.body.constraint {
+            if eval_ground_pub(constraint, &env) != Some(SmtValue::Bool(true)) {
+                return None;
+            }
+        }
+        // ... and its head must carry exactly the values the call requires.
+        for (head_arg, value) in head_args.iter().zip(required.iter()) {
+            if let Some(value) = value {
+                if eval_ground_pub(head_arg, &env).as_ref() != Some(value) {
+                    return None;
+                }
+            }
+        }
+        steps.push(crate::ground_derivation::GroundDerivationStep {
+            clause_index: candidate,
+            env,
+            premises,
+        });
+        Some(steps.len() - 1)
     }
 
     /// Reconstruct premise references for a clause body, recursing into inlined

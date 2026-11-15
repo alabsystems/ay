@@ -85,12 +85,15 @@ fn bounded_mul_zero_orientations_export_checked_multiplier_circuits() {
 
 #[test]
 fn mul_zero_lowering_declines_over_cap_and_surface_drift() {
+    // Over its cap the mul-zero lowering declines. The clause is still true,
+    // and the general complete bit-blast now proves it (Clean `5390f432b8`
+    // accepted that document in a refutation of its negation, 2026-09-29).
     let (terms, step, _, _) = raw_mul_zero_step(33, 1, false);
     let output = AlethePrinter::new(&terms)
         .format_step(&step, ProofId(0))
-        .expect("unsupported shapes retain an honest hole");
-    assert!(output.contains(":rule hole"), "{output}");
-    assert!(!output.contains(":rule bitblast_mult"), "{output}");
+        .expect("the general bit-blast renders");
+    assert!(!output.contains("__ay_bvmul_zero_"), "{output}");
+    assert!(!output.contains(":rule hole"), "{output}");
 
     let (terms, step, equality, product) = raw_mul_zero_step(8, 1, false);
     for (overridden, spelling) in [

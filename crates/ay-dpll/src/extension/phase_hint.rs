@@ -11,7 +11,7 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{TermId, TheorySolver};
 use ay_sat::{ExtPropagateResult, Extension, SolverContext};
 use ay_sat::{Literal, Variable};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Lightweight extension that only provides phase hints from a theory solver.
 ///
@@ -62,6 +62,11 @@ pub(crate) struct PhaseHintExtension<'a, T: TheorySolver> {
     /// (also seed unconditionally). Uses `Cell` for interior mutability since
     /// `seed_phase_hints_dual` takes `&self`.
     last_seed_epoch: Cell<Option<u64>>,
+    /// Debug-build canary for the epoch skip (#nonlinear-phase-hints): every
+    /// atom's suggestion at the last full seed, re-derived and compared on a
+    /// skip. Empty in release builds.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    last_seed_hints: RefCell<Vec<Option<bool>>>,
     /// Scan index for theory-aware branching (amortized O(1) per call).
     /// Uses Cell for interior mutability since suggest_decision takes &self.
     theory_decision_idx: Cell<usize>,
@@ -122,6 +127,7 @@ impl<'a, T: TheorySolver> PhaseHintExtension<'a, T> {
             theory_atoms,
             seed_index,
             last_seed_epoch: Cell::new(None),
+            last_seed_hints: RefCell::new(Vec::new()),
             theory_decision_idx: Cell::new(0),
             theory_decision_call_count: Cell::new(0),
         }
@@ -255,6 +261,22 @@ impl<T: TheorySolver> Extension for PhaseHintExtension<'_, T> {
         if !phase_epoch_skip_disabled() {
             if let Some(epoch) = self.theory.phase_hint_epoch() {
                 if self.last_seed_epoch.get() == Some(epoch) {
+                    // #nonlinear-phase-hints: hold the theory to its epoch
+                    // promise in debug builds (see `TheoryExtension`'s twin).
+                    #[cfg(debug_assertions)]
+                    {
+                        let hints = self.last_seed_hints.borrow();
+                        if hints.len() == self.seed_index.len() {
+                            for (&(_, atom), &recorded) in self.seed_index.iter().zip(hints.iter())
+                            {
+                                let now = self.theory.suggest_phase(atom);
+                                assert_eq!(
+                                    now, recorded,
+                                    "phase-hint epoch {epoch} unchanged but suggest_phase({atom:?}) moved"
+                                );
+                            }
+                        }
+                    }
                     return;
                 }
                 self.last_seed_epoch.set(Some(epoch));
@@ -289,6 +311,16 @@ impl<T: TheorySolver> Extension for PhaseHintExtension<'_, T> {
                     target_phase[idx] = v;
                 }
             }
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut hints = self.last_seed_hints.borrow_mut();
+            hints.clear();
+            hints.extend(
+                self.seed_index
+                    .iter()
+                    .map(|&(_, atom)| self.theory.suggest_phase(atom)),
+            );
         }
     }
 }

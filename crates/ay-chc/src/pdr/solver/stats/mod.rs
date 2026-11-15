@@ -211,6 +211,14 @@ impl PdrSolver {
             secs_since_frame_advance: self.convergence.time_since_frame_advance().as_secs_f64(),
             consecutive_stagnant_windows: self.convergence.consecutive_stagnant_windows,
             terminated_by_stagnation: self.terminated_by_stagnation,
+            // Workstream B board counters (§4.6).
+            spacer_pobs_processed: self.spacer_stats.pobs_processed,
+            spacer_blocked_pobs: self.spacer_stats.blocked_pobs,
+            spacer_lemmas: self.spacer_stats.lemmas,
+            spacer_point_cube_share: self.spacer_stats.point_cube_share(),
+            spacer_lemmas_per_blocked_pob: self.spacer_stats.lemmas_per_blocked_pob(),
+            spacer_counters: self.spacer_stats.json(),
+            model_verification_failures: self.verification.total_model_failures,
         }
     }
 

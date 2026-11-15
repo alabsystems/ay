@@ -8,6 +8,19 @@ use super::*;
 use crate::executor::proof_repair::proof_trust_surgery::surface_terms::expand_surface_lets;
 use crate::executor::proof_trust_surgery_provenance::MAX_PROVENANCE_REPAIR_TERMS;
 
+#[path = "source_resolution/canonical_render.rs"]
+mod canonical_render;
+
+#[path = "source_resolution/identity_surfaces.rs"]
+mod identity_surfaces;
+
+#[path = "source_resolution/nullary_macro.rs"]
+mod nullary_macro;
+
+#[cfg(test)]
+#[path = "source_resolution/tests.rs"]
+mod tests;
+
 /// Total rows the provenance-mismatch fallback may clone/hash while
 /// reconstructing its exact export-scope authority. Charge rows before
 /// deduplication so repeated assumptions cannot hide allocation work.
@@ -15,8 +28,20 @@ const MAX_RECOVERED_EXPORT_SCOPE_ROWS: usize = MAX_AUTHORED_ORIGINAL_INDEX_ROWS;
 
 /// The authenticated presentation of one reachable native assumption.
 pub(super) enum ReachableAuthoredSource {
-    /// The root already has an exact problem row in canonical identity form.
+    /// The root already has an exact problem row in canonical identity form:
+    /// some source row's own text IS the Alethe printer's canonical rendering,
+    /// so publishing that rendering publishes what the problem wrote. Only
+    /// this grant licenses the whole-root canonical seal.
     Identity(TermId),
+    /// The root is authenticated by the RAW-source ledgers alone
+    /// (`last_proof_rebuild_originals` + `last_proof_raw_original_assertions`),
+    /// with no source row claiming its canonical text. That grant is about the
+    /// root's TERM, not its spelling: the fold-to-false promoters raw-rebuild a
+    /// premise whose authored surface — an author-named binder, a `(_ bvN W)`
+    /// literal — is carried by DESCENDANT overrides, and the canonical
+    /// rendering is exactly the text those overrides exist to avoid. Treated
+    /// like `Identity` when clearing a stale root entry, never sealed.
+    RawIdentity(TermId),
     /// Re-render the parsed source row as an assume-scoped override. The final
     /// bit permits an exact common duplicate spelling to replace a stale
     /// earlier-pass spelling for the same root.
@@ -26,6 +51,14 @@ pub(super) enum ReachableAuthoredSource {
     /// authority, this retains the source `let` spelling so the printer emits
     /// its certified elimination bridge before the expanded root is used.
     ExpandedLet(TermId, String),
+    /// A single source row whose top-level connective elaboration FOLDED away
+    /// (`(or (< x 3) false)` interns as `(< x 3)`): the head comparison cannot
+    /// confine it, so it is `Untouched` unless the Alethe printer derives the
+    /// canonical unit from that exact spelling with checked steps
+    /// (`ay_proof::folded_authored_assume_bridge_is_supported`). The restoring
+    /// pass renders the spelling exactly as it would install it and asks, then
+    /// re-judges it against the finished map (`confined_spelling.rs`).
+    Folded(TermId, FrontendTerm),
     /// An authored premise this presentation-only pass has nothing to restore
     /// for. This is not an authority failure: the root keeps the rendering an
     /// earlier replacement pass installed.
@@ -35,6 +68,20 @@ pub(super) enum ReachableAuthoredSource {
     /// to their own `assume`. Clearing the latter can erase a folded authored
     /// conjunction that an earlier pass correctly installed.
     Untouched,
+}
+
+impl ReachableAuthoredSource {
+    /// The root whose CANONICAL text a source row authenticates, if any.
+    ///
+    /// Only such a root may be pinned by the whole-root seal: a `RawIdentity`
+    /// grant is evidence about the root's TERM, and sealing it would publish
+    /// the very canonical rendering its descendant overrides exist to replace.
+    pub(super) fn canonical_row_root(&self) -> Option<TermId> {
+        match self {
+            ReachableAuthoredSource::Identity(root) => Some(*root),
+            _ => None,
+        }
+    }
 }
 
 /// Why exact source resolution did not produce an Alethe presentation.
@@ -49,8 +96,6 @@ pub(super) enum AuthoredSourceResolutionFailure {
 struct RootSourceRows {
     first_index: usize,
     count: usize,
-    first_surface: Option<String>,
-    all_surfaces_identical: bool,
     identity_authenticated: bool,
 }
 
@@ -63,8 +108,6 @@ impl RootSourceRows {
             identity_authenticated: surface
                 .as_deref()
                 .is_none_or(|surface| surface == canonical_surface),
-            first_surface: surface,
-            all_surfaces_identical: true,
         }
     }
 
@@ -74,7 +117,6 @@ impl RootSourceRows {
         self.identity_authenticated |= surface
             .as_deref()
             .is_none_or(|surface| surface == canonical_surface);
-        self.all_surfaces_identical &= surface.is_some() && surface == self.first_surface;
     }
 }
 
@@ -93,16 +135,37 @@ fn authored_surface(source: &FrontendTerm) -> Option<String> {
 }
 
 impl Executor {
+    /// Preflight a replacement without changing presentation or proof state.
+    /// A candidate that would suppress source restoration must not preempt the
+    /// existing reconstruction and its independently checked recovery paths.
+    pub(in crate::executor::proof) fn candidate_authored_surface_is_available(
+        &self,
+        proof: &Proof,
+    ) -> bool {
+        let Some(roots) = reachable_authored_assume_roots(proof) else {
+            return false;
+        };
+        if roots.is_empty() {
+            return true;
+        }
+        if !self.ctx.retains_parsed_assertions() {
+            return !self.is_producing_proofs() && !self.proof_artifact_required;
+        }
+        self.resolve_reachable_authored_sources(&roots).is_ok()
+    }
+
     /// Authenticate each reachable root against immutable source provenance.
     ///
     /// A root any of whose source rows already carries the canonical identity
-    /// spelling publishes that canonical text with no override at all — the
-    /// row IS the authentication, at any row count.
+    /// spelling authenticates that canonical text, at any row count. The
+    /// final restoration pass adds a whole-root entry only if descendant
+    /// overrides would otherwise change that text.
     ///
-    /// A repeated canonical root with no such row is presentation-safe in
-    /// exactly one further case: all its rows carry the same noncanonical
-    /// spelling and the printer can confine that spelling to its own `assume`.
-    /// Anything else withholds only Alethe. The checked native proof and its
+    /// A repeated canonical root with no such row is presentation-safe when
+    /// the printer can confine its FIRST row's spelling to its own `assume`:
+    /// every row is a premise of the problem, so that spelling binds exactly
+    /// whether or not the other rows spell it the same way. Anything else
+    /// withholds only Alethe. The checked native proof and its
     /// portable bundle do not depend on choosing a presentation among
     /// semantically equal source rows.
     pub(super) fn resolve_reachable_authored_sources(
@@ -123,14 +186,63 @@ impl Executor {
         {
             return Err(InvalidAuthority);
         }
+        // A root authenticated by both raw-source ledgers needs no rendering
+        // unless it also owns a parsed row or an expanded-let receipt. Keep
+        // those grants independent of the canonical spelling chosen below.
+        let rebuild_authority: DetHashSet<TermId> =
+            self.last_proof_rebuild_originals.iter().copied().collect();
+        let raw_originals: DetHashSet<TermId> = self
+            .last_proof_raw_original_assertions
+            .iter()
+            .copied()
+            .collect();
+        // An unaligned ledger may recover rows later, so every root in that
+        // case must remain in the canonical rendering batch.
+        let row_owners: DetHashSet<TermId> = if provenance_originals.len() == parsed.len() {
+            provenance_originals.iter().copied().collect()
+        } else {
+            roots.iter().copied().collect()
+        };
+        // With only exact raw premises, no parsed row is selected or rendered.
+        // Both independent grants are still required, and an expanded-let
+        // receipt or an unaligned source ledger must take the ordinary audit.
+        // Pricing unused parsed trees here would refuse a bounded ground
+        // reconstruction solely because the generic source collector is smaller.
+        if provenance_originals.len() == parsed.len()
+            && self.last_proof_expanded_let_sources.is_empty()
+            && !roots.is_empty()
+            && roots.len() <= MAX_AUTHORED_ORIGINAL_INDEX_ROWS
+            && roots.iter().all(|root| {
+                rebuild_authority.contains(root)
+                    && raw_originals.contains(root)
+                    && !row_owners.contains(root)
+            })
+        {
+            return Ok(roots
+                .iter()
+                .copied()
+                .map(ReachableAuthoredSource::RawIdentity)
+                .collect());
+        }
+        let priced = roots.iter().copied().filter(|root| {
+            !(rebuild_authority.contains(root)
+                && raw_originals.contains(root)
+                && !row_owners.contains(root))
+        });
         if !crate::executor::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
             parsed.iter(),
-        ) || !proof_surface_syntax::surface_override_roots_have_bounded_work(
-            &self.ctx.terms,
-            roots.iter().copied(),
         ) {
             return Err(InvalidAuthority);
         }
+        let canonical_surfaces = canonical_render::render(
+            &self.ctx.terms,
+            priced.chain(
+                self.last_proof_expanded_let_sources
+                    .iter()
+                    .map(|(root, _, _)| *root),
+            ),
+        )
+        .ok_or(InvalidAuthority)?;
 
         let originals = if provenance_originals.len() != parsed.len() {
             // A public `check-sat-assuming` query may deliberately keep only
@@ -191,26 +303,16 @@ impl Executor {
 
         let reachable: DetHashSet<TermId> = roots.iter().copied().collect();
         let mut rows: DetHashMap<TermId, RootSourceRows> = DetHashMap::default();
-        let mut canonical_surfaces: DetHashMap<TermId, String> = DetHashMap::default();
         for (index, (&original, source)) in originals.iter().zip(parsed).enumerate() {
             if !reachable.contains(&original) {
                 continue;
             }
-            let canonical_surface = canonical_surfaces
-                .entry(original)
-                .or_insert_with(|| ay_proof::format_term_alethe(&self.ctx.terms, original));
+            let canonical_surface = canonical_surfaces.get(&original).ok_or(InvalidAuthority)?;
             rows.entry(original)
                 .and_modify(|summary| summary.observe(source, canonical_surface))
                 .or_insert_with(|| RootSourceRows::new(index, source, canonical_surface));
         }
 
-        let rebuild_authority: DetHashSet<TermId> =
-            self.last_proof_rebuild_originals.iter().copied().collect();
-        let raw_originals: DetHashSet<TermId> = self
-            .last_proof_raw_original_assertions
-            .iter()
-            .copied()
-            .collect();
         let mut expanded_let_sources: DetHashMap<TermId, String> = DetHashMap::default();
         for (root, source_index, source_surface) in &self.last_proof_expanded_let_sources {
             let Some(source) = parsed.get(*source_index) else {
@@ -228,7 +330,7 @@ impl Executor {
             };
             let expanded = proof_surface_syntax::strip_frontend_annotations(&expanded);
             if proof_surface_syntax::format_frontend_term(expanded)
-                != ay_proof::format_term_alethe(&self.ctx.terms, *root)
+                != *canonical_surfaces.get(root).ok_or(InvalidAuthority)?
                 || self
                     .last_proof_term_overrides
                     .as_ref()
@@ -254,6 +356,7 @@ impl Executor {
         };
 
         let mut sources = Vec::with_capacity(roots.len());
+        let mut definitions = None;
         for &root in roots {
             let summary = rows.get(&root);
             if let Some(surface) = expanded_let_sources.get(&root) {
@@ -271,7 +374,7 @@ impl Executor {
             }
             let Some(summary) = summary else {
                 if rebuild_authority.contains(&root) && raw_originals.contains(&root) {
-                    sources.push(ReachableAuthoredSource::Identity(root));
+                    sources.push(ReachableAuthoredSource::RawIdentity(root));
                     continue;
                 }
                 if query_assumptions.contains(&root) {
@@ -291,8 +394,9 @@ impl Executor {
             // against whatever an earlier pass recorded for the same root and
             // declines the WHOLE reconstruction on any disagreement, so a root
             // the problem file spells canonically could cost the query its
-            // entire external proof. Removing instead publishes the canonical
-            // text that row authenticates.
+            // entire external proof. Remove the stale root entry first; the
+            // final restoration pass separately seals against descendant
+            // spellings introduced anywhere in the completed source map.
             //
             // This also subsumes the native-API sentinel, whose exported
             // problem spelling IS the canonical identity: `authored_surface`
@@ -303,22 +407,46 @@ impl Executor {
                 continue;
             }
             if summary.count > 1 {
-                if summary.all_surfaces_identical
-                    && authored_surface_is_assume_confinable(&self.ctx.terms, root, source)
-                {
+                // Rows that spell the root DIFFERENTLY (`(= x (- 2.5))` and
+                // `(= x -2.5)`, g06) are each a premise of the problem, and
+                // pinned Carcara matches an `assume` against any one of
+                // them; the proof assumes the root once. So the first row's
+                // spelling, confined to its own `assume` exactly as a common
+                // spelling is, is as exact a binding as a common one. It used
+                // to withhold the whole surface, and an explicit `--proof
+                // FILE` then lost the verdict (#8821).
+                if self.authored_row_is_assume_confinable(root, source, &mut definitions) {
                     sources.push(ReachableAuthoredSource::Parsed(root, source.clone(), true));
                 } else {
                     return Err(AletheSurfaceUnavailable);
                 }
                 continue;
             }
-            if authored_surface_is_assume_confinable(&self.ctx.terms, root, source) {
-                sources.push(ReachableAuthoredSource::Parsed(root, source.clone(), false));
-            } else {
-                sources.push(ReachableAuthoredSource::Untouched);
-            }
+            let resolved = self.single_authored_row_source(root, source, &mut definitions)?;
+            sources.push(self.folded_row_candidate(root, source, resolved));
         }
         Ok(sources)
+    }
+
+    /// A single row the head comparison left `Untouched` is a fold candidate
+    /// ([`ReachableAuthoredSource::Folded`]), unless it names a nullary macro
+    /// (the definition bridge's) or its root is a constant (shared by every
+    /// assertion that folds to it).
+    fn folded_row_candidate(
+        &self,
+        root: TermId,
+        source: &FrontendTerm,
+        resolved: ReachableAuthoredSource,
+    ) -> ReachableAuthoredSource {
+        match resolved {
+            ReachableAuthoredSource::Untouched
+                if !matches!(self.ctx.terms.get(root), TermData::Const(_))
+                    && !nullary_macro::row_names_nullary_macro(&self.ctx, source) =>
+            {
+                ReachableAuthoredSource::Folded(root, source.clone())
+            }
+            resolved => resolved,
+        }
     }
 
     /// Native proof access remains independent; this wrapper is exclusively
@@ -327,17 +455,25 @@ impl Executor {
         &self,
     ) -> Option<&Proof> {
         let proof = self.last_proof()?;
+        self.proof_has_authenticated_alethe_surface(proof)
+            .then_some(proof)
+    }
+
+    /// Whether `proof` has an authenticated Alethe surface: a finite-enum
+    /// sidecar, or retained source text that resolves every reachable
+    /// authored `assume` to one exact spelling.
+    pub(in crate::executor) fn proof_has_authenticated_alethe_surface(
+        &self,
+        proof: &Proof,
+    ) -> bool {
         if self.last_proof_has_finite_enum_sidecar() {
-            return Some(proof);
+            return true;
         }
         if !self.ctx.retains_parsed_assertions() {
-            return None;
+            return false;
         }
-        let roots = reachable_authored_assume_roots(proof)?;
-        if roots.is_empty() || self.resolve_reachable_authored_sources(&roots).is_ok() {
-            Some(proof)
-        } else {
-            None
-        }
+        reachable_authored_assume_roots(proof).is_some_and(|roots| {
+            roots.is_empty() || self.resolve_reachable_authored_sources(&roots).is_ok()
+        })
     }
 }

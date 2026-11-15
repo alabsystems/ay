@@ -10,8 +10,14 @@
 //! in `mod.rs`.
 
 mod cegqi_debug;
+pub(super) mod definition_fold_gate;
+mod diagonal_scope;
 mod ematching_rounds;
 mod finite_expansion_provenance;
+mod guarded_enumerative_census;
+mod nested_guarded;
+pub(in crate::executor) mod quantifier_proxy;
+mod skolem_guarded_instances;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol};
@@ -56,6 +62,12 @@ pub(super) struct EmatchingSummary {
     /// UNCONDITIONALLY-asserted Foralls — the SOUND conflict-verification
     /// support subset (see [`crate::ematching::collect_unconditional_foralls`]).
     pub unconditional_forall_roots: HashSet<TermId>,
+    /// (#quantifier-guarded-instances) Union across rounds of instances of
+    /// universals the assertion set does NOT entail. Never asserted as facts;
+    /// `add_guarded_instance_clauses` turns each into `(or (not q) body[t̄])`
+    /// once the proxy abstraction has minted `q`, and drops any record whose
+    /// quantifier got no proxy.
+    pub guarded_instantiations: Vec<crate::ematching::ForallInstantiationProvenance>,
 }
 
 fn classify_ematching_proof_sources(
@@ -96,6 +108,10 @@ pub(super) struct CegqiPreparation {
     pub has_completely_unhandled_quantifiers: bool,
     pub unhandled_quantifiers: Vec<TermId>,
     pub cegqi_state: Vec<(TermId, CegqiInstantiator)>,
+    /// (#quantifier-guarded-enumerative) Enumerated bindings for triggerless
+    /// universals the assertion set does not entail. The caller turns each into
+    /// a GUARDED clause; nothing in this vector was asserted.
+    pub guarded_enumerative_records: Vec<crate::ematching::ForallInstantiationProvenance>,
 }
 
 /// (#p2-diag-position) Collect, in deterministic assertion order, the universal
@@ -558,6 +574,16 @@ impl Executor {
     /// unsat EPR/UF formula (fuzzer Class B). Cheap: `k` instances per forall (k =
     /// #constants), NOT `k^n`.
     ///
+    /// # SCOPE
+    ///
+    /// Only universals whose body applies no function to its binders, or
+    /// over an uninterpreted sort, take part; and when the input asked for
+    /// instantiation through triggers only (`smt.mbqi false`), of the latter
+    /// only those without a pattern or inside a larger assertion. See
+    /// [`diagonal_scope::takes_diagonal_instances`]. Instances of the others
+    /// mint fresh ground terms such as `(* c c)` over interpreted sorts, or
+    /// `(f c c)` on top of what the pattern of `f`'s definition matches.
+    ///
     /// # SOUNDNESS CONTRACT (#p2-diag-position wrong-UNSAT repair)
     ///
     /// The diagonal instance is asserted as a TOP-LEVEL CONJUNCT, so it is sound
@@ -576,6 +602,16 @@ impl Executor {
         let seed = self.ctx.assertions.clone();
         let by_sort = collect_ground_terms_by_sort(&self.ctx.terms, &seed);
         let mut to_add: Vec<crate::ematching::ForallInstantiationProvenance> = Vec::new();
+        // An input that asked for triggers only keeps its patterned
+        // universals out of the pass.
+        let instantiation = if self.model_based_instantiation_is_off() {
+            diagonal_scope::Instantiation::TriggersOnly
+        } else {
+            diagonal_scope::Instantiation::Unrestricted
+        };
+        // A universal that is an assertion by itself, as against one the
+        // caller found inside a larger assertion.
+        let asserted: HashSet<TermId> = seed.iter().copied().collect();
         for &quant in quantifiers {
             // A no_mbqi ("E-matching only") quantifier — the Hilbert-`choose`
             // combined axiom `forall i,j. P(i,j) => P(chosen)` — must NOT receive
@@ -590,8 +626,8 @@ impl Executor {
             if self.ctx.terms.is_no_mbqi(quant) {
                 continue;
             }
-            let (vars, body) = match self.ctx.terms.get(quant) {
-                TermData::Forall(v, b, _) => (v.clone(), *b),
+            let (vars, body, triggers) = match self.ctx.terms.get(quant) {
+                TermData::Forall(v, b, t) => (v.clone(), *b, t.clone()),
                 _ => continue,
             };
             if vars.len() < 2 {
@@ -600,6 +636,20 @@ impl Executor {
             let sort0 = vars[0].1.clone();
             if !vars.iter().all(|(_, s)| *s == sort0) {
                 continue; // all bound vars must share a sort
+            }
+            if !diagonal_scope::takes_diagonal_instances(
+                &self.ctx.terms,
+                &vars,
+                body,
+                &triggers,
+                instantiation,
+                if asserted.contains(&quant) {
+                    diagonal_scope::Standing::Asserted
+                } else {
+                    diagonal_scope::Standing::PartOfAnAssertion
+                },
+            ) {
+                continue; // see "SCOPE" above
             }
             let Some(consts) = by_sort.get(&sort0) else {
                 continue;
@@ -669,6 +719,18 @@ impl Executor {
         let mut expanded = Vec::new();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
+            // A bounded integer existential expands to a disjunction, whose
+            // proof needs integer exhaustiveness, not `forall_inst`. Until
+            // that strict bridge exists, keep the authored existential for
+            // the canonical registered-Skolem path below. Its witness body is
+            // asserted, so E-matching can instantiate source universals at the
+            // same witness instead of replaying an unproved ground OR.
+            if self.strict_unsat_presentation_required()
+                && matches!(self.ctx.terms.get(a), TermData::Exists(vars, ..)
+                    if vars.len() == 1 && vars[0].1 == Sort::Int)
+            {
+                continue;
+            }
             // Recurse into the whole assertion (not just a top-level quantifier) so a
             // bounded quantifier NESTED under `(not ...)` / `(and ...)` / `(or ...)` is
             // also expanded. `(not (exists X. (and (<= 0 X)(<= X 4) p)))` was NOT a
@@ -774,13 +836,7 @@ impl Executor {
                         // `recorded_ground == ground` (the recording expansion
                         // reproduced the exact replacement term). It only stops
                         // discarding evidence the pass already produced.
-                        self.quant_expansion_records
-                            .push(crate::executor::QuantExpansionRecord {
-                                original: a,
-                                assertion_index: idx,
-                                expanded: ground,
-                                instances: folded_instances,
-                            });
+                        self.record_finite_expansion(a, idx, ground, folded_instances);
                     }
                 }
             }
@@ -1215,6 +1271,160 @@ impl Executor {
             }
         }
         self.ctx.assertions.extend(derived);
+    }
+
+    /// (#defn-fold-under-forall) Fold asserted GROUND DEFINING equalities whose
+    /// defined variable has an Array or Datatype sort into the bodies of the
+    /// quantified assertions. Every original assertion is RETAINED, including
+    /// each defining equality itself; only quantifier-carrying assertions are
+    /// rewritten.
+    ///
+    /// # Why
+    ///
+    /// A source-derivation replay obligation renders one clause occurrence per
+    /// step with its own free constants, so the aggregate a universal premise
+    /// reads reaches the binder through a VARIABLE:
+    ///
+    /// ```text
+    /// (assert (= v (mkVec (_ bv0 64) (_ bv65 64) (_ bv65 64)
+    ///                     ((as const (Array (_ BitVec 64) (_ BitVec 8))) f))))
+    /// (assert (forall ((i (_ BitVec 64)))
+    ///           (=> (bvult i (fld_len v)) (= (select (fld_data v) i) f))))
+    /// (assert (= (_ bv7 8) f))
+    /// ```
+    ///
+    /// `(fld_len v)` is a selector over a variable, not a literal, so
+    /// `expand_finite_domains` sees an unbounded 64-bit binder and declines --
+    /// the same shape `#entailed-bound-expansion` describes for Int bounds --
+    /// and the fall-through lane's candidate array for `(fld_data v)` is the
+    /// zero-filled default, which fails the body for every `f` pinned away
+    /// from zero. Measured on the stock binary: the query above answers
+    /// `Unknown(QuantifierUnhandled)` in ~2ms and keeps answering it for the
+    /// whole wall, while the SAME query with `v` replaced by its definition
+    /// inside the binder answers `sat` with a validated model in one probe.
+    ///
+    /// After the fold, `try_fold_datatype_selector` in the substituter
+    /// collapses `(fld_len (mkVec ..))` to `(_ bv65 64)` and
+    /// `(fld_data (mkVec ..))` to the constant array, and
+    /// `TermStore::mk_select`'s read-over-const-array rewrite collapses the
+    /// body read to `f` -- a literal-bounded binder the existing finite-domain
+    /// expansion already decides.
+    ///
+    /// # Soundness
+    ///
+    /// `v = t` is an ASSERTED conjunct, so `v` and `t` denote the same value in
+    /// every model of the problem; replacing `v` by `t` inside another
+    /// assertion is equals-for-equals and removes no model and admits none, in
+    /// either direction. The defining equality is NOT deleted, so `v` stays
+    /// constrained and no model reconstruction is owed -- which is why the
+    /// `skip_array_sort` hazard of #7890 (a validator needing a defining
+    /// equality the substitution removed) cannot arise here. Substitution
+    /// under a binder is capture-free: `substitute_quantifier` shadows the
+    /// bound names, and a value mentioning a variable SPELLED like a binder is
+    /// not folded under it, since every instantiator replaces binders by name
+    /// (`definition_fold_gate::capture_free_definitions`). Values that mention
+    /// a collected key are dropped, so the single pass terminates and follows
+    /// no chain or cycle.
+    ///
+    /// # Blast radius
+    ///
+    /// Byte-identical no-op unless the problem has BOTH a surviving quantifier
+    /// and an asserted `v = t` with `v` of Array or Datatype sort, and even
+    /// then only a quantified assertion with a binder BOUND that reads such a
+    /// `v` changes (`definition_fold_gate::bound_reads`). It runs after
+    /// `install_proof_source_provenance`, alongside `merge_adjacent_universals`
+    /// and before the `original_assertions` snapshot, so a proof must DERIVE
+    /// this replacement rather than whitelist it as an authored Assume --
+    /// fail-closed, never unsound.
+    pub(super) fn fold_ground_definitions_into_universals(&mut self) {
+        if !self
+            .ctx
+            .assertions
+            .iter()
+            .any(|&a| contains_quantifier(&self.ctx.terms, a))
+        {
+            return;
+        }
+        let subst = self.collect_ground_aggregate_definitions();
+        if subst.is_empty() {
+            return;
+        }
+        let defined: HashSet<TermId> = subst.keys().copied().collect();
+        let assertions = self.ctx.assertions.clone();
+        let mut rewritten: Vec<TermId> = Vec::with_capacity(assertions.len());
+        for assertion in assertions {
+            // Only a binder bound can be exposed; any other universal keeps its
+            // authored identity, and with it the E-matching proof provenance a
+            // public UNSAT needs. Only capture-free definitions fold
+            // (`definition_fold_gate`).
+            let terms = &mut self.ctx.terms;
+            let folded = definition_fold_gate::fold(terms, assertion, &subst, &defined);
+            rewritten.push(folded);
+        }
+        self.ctx.assertions = rewritten;
+    }
+
+    /// Asserted `v = <term>` definitions with `v` an atomic `Var` of Array or
+    /// Datatype sort and `<term>` a quantifier-free non-`Var` term mentioning
+    /// no collected key.
+    ///
+    /// Same conjunct walk and the same key-free discipline as
+    /// [`Self::collect_ground_int_eq_subst`]; only the sort gate differs, and
+    /// it confines the fold to the aggregate definitions whose use sites the
+    /// selector-over-constructor and read-over-const-array rewrites actually
+    /// collapse. `var = var` is skipped (orientation ambiguity / cycles).
+    /// First mapping per variable wins, over a `Vec` of candidates, so the map
+    /// is order-deterministic.
+    fn collect_ground_aggregate_definitions(&self) -> HashMap<TermId, TermId> {
+        let mut conjuncts: Vec<TermId> = Vec::new();
+        for &a in &self.ctx.assertions {
+            conjuncts.push(a);
+            collect_and_conjuncts(&self.ctx.terms, a, &mut conjuncts);
+        }
+        let mut candidates: Vec<(TermId, TermId)> = Vec::new();
+        let mut keys: HashSet<TermId> = HashSet::default();
+        for &c in &conjuncts {
+            let TermData::App(sym, args) = self.ctx.terms.get(c) else {
+                continue;
+            };
+            if sym.name() != "=" || args.len() != 2 {
+                continue;
+            }
+            let (x, y) = (args[0], args[1]);
+            // Equality operands share a sort; gate the fold to the aggregates.
+            if !matches!(self.ctx.terms.sort(x), Sort::Array(_) | Sort::Datatype(_)) {
+                continue;
+            }
+            let x_is_var = matches!(self.ctx.terms.get(x), TermData::Var(..));
+            let y_is_var = matches!(self.ctx.terms.get(y), TermData::Var(..));
+            let candidate = if x_is_var && !y_is_var {
+                Some((x, y))
+            } else if y_is_var && !x_is_var {
+                Some((y, x))
+            } else {
+                None
+            };
+            let Some((v, e)) = candidate else {
+                continue;
+            };
+            if contains_quantifier(&self.ctx.terms, e) {
+                continue;
+            }
+            keys.insert(v);
+            candidates.push((v, e));
+        }
+        let mut subst: HashMap<TermId, TermId> = HashMap::default();
+        for (v, e) in candidates {
+            if subst.contains_key(&v) {
+                continue;
+            }
+            // Key-free values only: the occurs check and the no-chain rule in
+            // one test, so the single pass is exact and terminating.
+            if !term_mentions_any_var(&self.ctx.terms, e, &keys) {
+                subst.insert(v, e);
+            }
+        }
+        subst
     }
 
     /// Collect asserted GROUND integer equalities `v = <expr>` as a substitution
@@ -1792,6 +2002,24 @@ impl Executor {
         self.active_support_axioms.push(TheoryLit::new(root, true));
     }
 
+    /// (#degrade277-narrow) Fold one lane's entailed-universal set into the
+    /// per-query union `entailed_forall_authority`.
+    ///
+    /// Called with the EXACT set the lane consulted before it was allowed to
+    /// conjoin an instance, so the union answers "which universals could any
+    /// lane have conjoined an instance of during this query?" — never a
+    /// re-derivation over a different assertion set. Recording strictly GROWS
+    /// the set, and a larger set only makes the `degrade@277` narrowing
+    /// decline more often, so an over-record is fail-closed.
+    pub(super) fn record_entailed_forall_authority(
+        &mut self,
+        entailed: &ay_core::kani_compat::DetHashSet<TermId>,
+    ) {
+        self.entailed_forall_authority
+            .get_or_insert_with(Default::default)
+            .extend(entailed.iter().copied());
+    }
+
     /// Promote-unsat optimization (Phase D, #557): check deferred instantiations
     /// against the current model and promote conflict-producing ones.
     ///
@@ -1865,6 +2093,7 @@ impl Executor {
         quantifiers: &[TermId],
         ematching_has_uninstantiated: bool,
         ematching_uninstantiated_quantifiers: &HashSet<TermId>,
+        enumerative_admission: crate::quant_unit_authority::EnumerativeAdmission,
     ) -> CegqiPreparation {
         let mut cegqi_has_forall = false;
         let mut cegqi_has_exists = false;
@@ -1876,6 +2105,12 @@ impl Executor {
         let mut has_completely_unhandled_quantifiers = false;
         let mut unhandled_quantifier_list: Vec<TermId> = Vec::new();
         let mut cegqi_state: Vec<(TermId, CegqiInstantiator)> = Vec::new();
+        // (#quantifier-guarded-enumerative) Enumerated bindings for TRIGGERLESS
+        // universals the assertion set does NOT entail. Never asserted here;
+        // returned to `process_quantifiers`, which builds one guarded clause per
+        // record once the abstraction has minted the proxies.
+        let mut guarded_enumerative_records: Vec<crate::ematching::ForallInstantiationProvenance> =
+            Vec::new();
         // Enumerative instantiation is an incomplete fallback. It should range
         // over ground terms already present in the preprocessed problem, not
         // recursively bootstrap on sibling instantiations added earlier in the
@@ -1883,6 +2118,9 @@ impl Executor {
         // quantifiers enumerate terms synthesized by earlier ones, creating a
         // one-shot saturation loop on recursive axiom families (#7883).
         let enum_seed_assertions = self.ctx.assertions.clone();
+        // One ground-term collection for the round: every quantifier below
+        // enumerates over the same seed (`GroundTermsRound`).
+        let mut ground_terms_round = crate::ematching::GroundTermsRound::default();
 
         // (#auflia-disjunct-forall-false-unsat) The universals the CURRENT
         // assertion set actually ENTAILS. Computed over the pre-CEGQI snapshot —
@@ -1891,6 +2129,37 @@ impl Executor {
         // Only these may have a ground instance conjoined (see the gate below).
         let entailed_foralls: HashSet<TermId> =
             crate::ematching::entailed_forall_set(&mut self.ctx.terms, &enum_seed_assertions);
+        // (#degrade277-narrow) This is the set the enumerative lane below is
+        // licensed by (`quant_is_entailed_forall`). Record it into the
+        // per-query union the `degrade@277` narrowing reads.
+        self.record_entailed_forall_authority(&entailed_foralls);
+        // (#quantifier-guarded-enumerative) The quantifier SHAPE this solve
+        // presents, printed under `--debug-cert` because it is the evidence the
+        // lane's structural trigger was chosen on and the cheapest way for a
+        // later session to re-measure the discriminator on a fresh sample.
+        // Diagnostic only: no verdict path reads it.
+        if ay_core::misc_cli_flags().debug_cert {
+            let foralls = quantifiers
+                .iter()
+                .filter_map(|&q| match self.ctx.terms.get(q) {
+                    TermData::Forall(_, _, triggers) => Some((q, triggers.is_empty())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let n_trig = foralls.iter().filter(|(_, bare)| !bare).count();
+            let n_triggerless_nonentailed = foralls
+                .iter()
+                .filter(|(q, bare)| *bare && !entailed_foralls.contains(q))
+                .count();
+            ay_core::safe_eprintln!(
+                "CERT/qshape quantifiers={} foralls={} with_triggers={n_trig} \
+                 triggerless_nonentailed={n_triggerless_nonentailed} assertions={} \
+                 enumerative_admission={enumerative_admission:?}",
+                quantifiers.len(),
+                foralls.len(),
+                enum_seed_assertions.len()
+            );
+        }
 
         // #forall-bare-bool wrong-SAT: snapshot the genuine (non-CE) assertions
         // that exist BEFORE any CE lemma is pushed below, together with their
@@ -1965,6 +2234,58 @@ impl Executor {
                     || (ematching_has_uninstantiated
                         && ematching_uninstantiated_quantifiers.contains(&quant)));
             if !should_process {
+                // (#quantifier-guarded-enumerative) A TRIGGERLESS universal the
+                // assertion set does not entail is exactly what `should_process`
+                // refuses above, and the refusal stays: nothing below this point
+                // runs for it, so no instance is conjoined, no CE lemma is
+                // minted, and it is still recorded as unhandled. What is added
+                // is a pure RECORD of the enumerated bindings, which
+                // `add_guarded_instance_clauses` later turns into
+                // `(or (not qproxy) body[t̄])` — an implication, valid at any
+                // polarity, rather than the top-level fact this lane may not
+                // assert. The routing bookkeeping below is untouched, so the
+                // SAT-side firewall reads exactly the values it read before.
+                //
+                // The three eligibility conditions mirror the entailed lane's,
+                // so the guarded lane enumerates the same families and no
+                // others.
+                if is_forall
+                    && !has_triggers
+                    && !quant_is_entailed_forall
+                    && !self.ctx.terms.is_no_mbqi(quant)
+                    && (is_triggerless_cegqi_forall
+                        || is_triggerless_interpreted_forall
+                        || (ematching_has_uninstantiated
+                            && ematching_uninstantiated_quantifiers.contains(&quant)))
+                    // Asked only for an eligible universal (`&&` short-circuits),
+                    // and the answer is recorded: the census is the test-visible
+                    // evidence of what the structural trigger decided.
+                    && self.guarded_enumerative_gate(enumerative_admission)
+                {
+                    let enum_insts = enumerative_instantiation(
+                        &mut self.ctx.terms,
+                        &enum_seed_assertions,
+                        quant,
+                        100,
+                        &mut ground_terms_round,
+                    );
+                    for (binding, simplified_instance) in enum_insts {
+                        // The record carries the BINDING, not the simplified
+                        // instance: `add_guarded_instance_clauses` rebuilds the
+                        // exact structural instance from the quantifier and the
+                        // binding and refuses the record when it cannot, so a
+                        // guarded clause is always the substitution the strict
+                        // `forall_inst` checker would reconstruct.
+                        let _ = simplified_instance;
+                        guarded_enumerative_records.push(
+                            crate::ematching::ForallInstantiationProvenance {
+                                quantifier: quant,
+                                binding,
+                                instance: simplified_instance,
+                            },
+                        );
+                    }
+                }
                 // #3 (BV/UF forall fail-closed): a forall that is neither a
                 // CEGQI candidate nor an E-matching-uninstantiated quantifier
                 // (e.g. a pure BitVector-sorted forall whose bound-variable
@@ -1987,6 +2308,7 @@ impl Executor {
                     &enum_seed_assertions,
                     quant,
                     100,
+                    &mut ground_terms_round,
                 );
                 let mut proof_records = Vec::with_capacity(enum_insts.len());
                 // B2 audit (mode divergence, positive-form twin of
@@ -2014,6 +2336,12 @@ impl Executor {
                     };
                     self.ctx.assertions.push(inst);
                     self.push_active_support_axiom(inst);
+                    // (#iff-split-implied-authority) The binder values that
+                    // may refute the query; the implied-universal firewall
+                    // lane can only certify an instance it is told about.
+                    for &value in &binding {
+                        self.note_instance_witness_hint(value);
+                    }
                     proof_records.push(crate::ematching::ForallInstantiationProvenance {
                         quantifier: quant,
                         binding,
@@ -2064,6 +2392,7 @@ impl Executor {
             &raw_ce_lemma_ids,
             &raw_ce_lemma_quants,
             &pre_cegqi_assertions,
+            &entailed_foralls,
             &mut cegqi_ce_lemma_ids,
             &mut cegqi_ce_lemma_groups,
         );
@@ -2076,16 +2405,25 @@ impl Executor {
             has_completely_unhandled_quantifiers,
             unhandled_quantifiers: unhandled_quantifier_list,
             cegqi_state,
+            guarded_enumerative_records,
         }
     }
 
     /// Flatten top-level AND assertions (#4877), recompute CE lemma IDs after
-    /// flattening (#5991), and strip quantified formulas from assertions.
+    /// flattening (#5991), abstract the quantifiers the assertion set does not
+    /// entail to fresh Boolean proxies (#quantifier-proxy-abstraction), and
+    /// strip whatever quantified formulas remain.
+    ///
+    /// `entailed_foralls` is the set the caller already computed over the
+    /// pre-CEGQI snapshot. It is READ here, never recomputed: `entailed_forall_
+    /// set` takes `&mut TermStore` and mints NNF-dual terms, so a second call
+    /// would shift every later `TermId`.
     fn flatten_and_strip_quantifiers(
         &mut self,
         raw_ce_lemma_ids: &[TermId],
         raw_ce_lemma_quants: &[TermId],
         pre_cegqi_assertions: &HashSet<TermId>,
+        entailed_foralls: &HashSet<TermId>,
         cegqi_ce_lemma_ids: &mut Vec<TermId>,
         cegqi_ce_lemma_groups: &mut Vec<(TermId, Vec<TermId>)>,
     ) {
@@ -2148,9 +2486,280 @@ impl Executor {
                 .collect();
         }
 
+        self.abstract_unentailed_quantifiers(
+            entailed_foralls,
+            cegqi_ce_lemma_ids,
+            cegqi_ce_lemma_groups,
+        );
+
         self.ctx
             .assertions
             .retain(|&a| !contains_quantifier(&self.ctx.terms, a));
+    }
+
+    /// Replace the quantifier occurrences the assertion set does NOT entail by
+    /// fresh Boolean proxies, so the `retain` below keeps the surrounding
+    /// GROUND content instead of deleting the whole assertion
+    /// (#quantifier-proxy-abstraction).
+    ///
+    /// SOUNDNESS. The rewrite is an over-approximation: `SAT(A)` implies
+    /// `SAT(σ(A))` by extending any model of `A` with `q_i := ⟦Q_i⟧`, so a
+    /// refutation of `σ(A)` refutes `A`, at any polarity and in any position.
+    /// The converse fails, so `quantifier_abstraction_active` forbids every
+    /// `sat` publication for the rest of this solve. The full argument, the
+    /// fail-closed refusals, and the reverse-substitution differential live in
+    /// [`quantifier_proxy`].
+    ///
+    /// Byte-identical to the previous behaviour when the kill switch is off:
+    /// nothing is minted, no assertion is rewritten, and no state is set.
+    fn abstract_unentailed_quantifiers(
+        &mut self,
+        entailed_foralls: &HashSet<TermId>,
+        cegqi_ce_lemma_ids: &[TermId],
+        cegqi_ce_lemma_groups: &[(TermId, Vec<TermId>)],
+    ) {
+        if !crate::quant_unit_authority::quantifier_proxy_abstraction_enabled() {
+            return;
+        }
+        // The CEGQI counterexample lemmas are keyed BY `TermId` in
+        // `cegqi_ce_lemma_ids` / `cegqi_ce_lemma_groups`, which
+        // `disambiguate_cegqi_unsat` strips by identity. Rewriting one would
+        // orphan the key and drop a genuine constraint from the ground
+        // re-solve — the exact shape of the `#forall-bare-bool` wrong-SAT this
+        // file's own comment records. Protect them; a CE lemma that still
+        // carries a quantifier keeps the baseline deletion.
+        let mut protected: HashSet<TermId> = cegqi_ce_lemma_ids.iter().copied().collect();
+        for (_, group) in cegqi_ce_lemma_groups {
+            protected.extend(group.iter().copied());
+        }
+        let outcome = quantifier_proxy::purify_quantifier_atoms(
+            &mut self.ctx.terms,
+            &mut self.ctx.assertions,
+            entailed_foralls,
+            &protected,
+        );
+        // (#entailed-to-true) What purify left quantified has only entailed
+        // universals; keep its ground content instead of letting the caller's
+        // `retain` delete it whole.
+        quantifier_proxy::keep_ground_content_of_entailed(
+            &mut self.ctx.terms,
+            &mut self.ctx.assertions,
+            entailed_foralls,
+            &protected,
+        );
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/qproxy: rewritten={} refused={} proxies={}",
+                outcome.rewritten_assertions,
+                outcome.refused_assertions,
+                outcome.proxies.len(),
+            );
+        }
+        if !outcome.is_active() {
+            return;
+        }
+        // Bump the FIELD, never `set_int` the dotted name: the
+        // `(:statistics ...)` block prints `guarded_quantifier_counters()`,
+        // which reads the field, so a `set_int` would leave the printed row at
+        // zero while stashing the real value in the `extra` map under a name
+        // nothing prints. Stage 2 shipped with exactly that defect, which is
+        // why `:quantifier.proxies_minted` read 0 on files that minted
+        // hundreds of proxies.
+        self.last_statistics.quantifier_proxies_minted += outcome.proxies.len() as u64;
+        self.quantifier_abstraction_active = true;
+        // (#skolem-guarded-proxy-instances) The proxy is a FREE Boolean: the
+        // rewritten assertion reaches the ground solver, but nothing relates
+        // `q` to the quantifier it abstracts, so the solver guesses it and the
+        // head arm of `classify_quantifier_result` turns the resulting `Sat`
+        // into `unknown`. Hang the one class of instance that is sound for a
+        // quantifier in ANY position off the proxy literal. UNSAT-only and
+        // fail-closed on every refusal; see the module doc for the model
+        // extension argument.
+        if crate::quant_unit_authority::skolem_guarded_proxy_instances_enabled() {
+            let guarded = skolem_guarded_instances::assert_skolem_guarded_instances(
+                &mut self.ctx.terms,
+                &mut self.ctx.assertions,
+                &outcome.proxies,
+            );
+            self.last_statistics.quantifier_guarded_instances_created += guarded.created as u64;
+            self.last_statistics.quantifier_guarded_instances_asserted += guarded.asserted as u64;
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!(
+                    "CERT/qguard: created={} asserted={}",
+                    guarded.created, guarded.asserted
+                );
+            }
+            if guarded.asserted > 0 {
+                // Recorded AFTER the guards are in and BEFORE the caller's
+                // `retain`. The rescue leg at `CERT/degrade@277` re-solves
+                // exactly this set in isolation, so every member must be a
+                // CONSEQUENCE of the authored problem (under the proxy model
+                // extension). Two filters enforce that:
+                //
+                //   * `protected` is the CEGQI counterexample-lemma set —
+                //     `not B_q(c)` over FRESH counterexample constants. Those
+                //     are search ASSUMPTIONS, not consequences: a refutation
+                //     that uses one says nothing about the query, and
+                //     publishing it would be a false `unsat`. They are
+                //     excluded, and the exclusion is complete because
+                //     `cegqi_ce_lemma_ids` and the per-universal groups are
+                //     computed over the LIVE, post-`FlattenAnd` vector with the
+                //     CE-exclusive filter (a conjunct that aliases a genuine
+                //     pre-existing assertion is deliberately NOT in the set,
+                //     and keeping such a conjunct is right — it is genuine).
+                //   * a member that still carries a quantifier is dropped: the
+                //     caller's `retain` is about to drop it anyway, and
+                //     dropping a conjunct only weakens the obligation, which
+                //     preserves the `snapshot UNSAT implies query UNSAT`
+                //     direction.
+                //
+                // Everything else in the vector at this point is either an
+                // authored (post-Skolemization, post-abstraction) assertion or
+                // an instance of a forall the assertion set ENTAILS — both
+                // instantiation gates upstream refuse to conjoin an instance of
+                // a non-entailed universal — so each is a consequence.
+                self.quantifier_guarded_abstraction_snapshot = self
+                    .ctx
+                    .assertions
+                    .iter()
+                    .copied()
+                    .filter(|a| !protected.contains(a))
+                    .filter(|&a| !contains_quantifier(&self.ctx.terms, a))
+                    .collect();
+            }
+        }
+        self.quantifier_proxies.extend(outcome.proxies);
+    }
+
+    /// (#quantifier-guarded-instances) Assert one GUARDED clause
+    /// `(or (not q) body[t̄])` per surviving E-matched instance of a universal
+    /// the assertion set does NOT entail, where `q` is the fresh Boolean proxy
+    /// [`purify_quantifier_atoms`] minted for that universal.
+    ///
+    /// # Why this is sound where the unconditional conjunct is not
+    ///
+    /// The refusal this lane relaxes (`ematching/mod.rs`,
+    /// `#auflia-disjunct-forall-false-unsat`) is about the ASSERTION FORM, not
+    /// about instantiation: `∀x̄.B ⊨ B[t̄]` always holds, but conjoining `B[t̄]`
+    /// at top level asserts the consequent unconditionally, which is licensed
+    /// only when the problem entails `∀x̄.B`. The guarded clause asserts the
+    /// IMPLICATION instead. Under the abstraction's semantics `q := ⟦Q⟧` (the
+    /// model extension argued in [`quantifier_proxy`]), `q` true means `Q`
+    /// holds in the model, hence `B[t̄]` does; `q` false satisfies the clause on
+    /// its guard. So the clause is true in EVERY model of the abstracted
+    /// problem, at any polarity and in any position — which is exactly the
+    /// property the top-level conjunct lacked.
+    ///
+    /// # What this deliberately does not do
+    ///
+    /// * It never calls `push_active_support_axiom`. The support set's contract
+    ///   is "true in every model of the CURRENT problem" and is consumed by the
+    ///   conflict-verification rescue; a guarded clause is a consequence of the
+    ///   ABSTRACTION, not of the authored quantifier being entailed, so it must
+    ///   not travel there.
+    /// * It asserts the EXACT structural instance (`exact_forall_instance`),
+    ///   never the matcher's possibly-simplified one, and drops the record when
+    ///   the exact substitution is unsupported (a `let` in the body, a shadowed
+    ///   or captured binder name, a DAG over the work limit). That keeps every
+    ///   clause reconstructible by the strict `forall_inst` checker from the
+    ///   quantifier and the recorded binding alone.
+    /// * It never pushes a clause that carries a quantifier. The caller's
+    ///   `retain` has already run, so a quantified clause pushed here would
+    ///   reach the ground solve unstripped. Each quantifier nested in the
+    ///   instance is replaced by a proxy of its own instead, and a record whose
+    ///   nested quantifier gets none is dropped (`nested_guarded`).
+    /// * It drops a record whose quantifier got no proxy, unless the
+    ///   quantifier is the NNF dual `collect_quantifiers` reads off
+    ///   `(not (exists ...))` for a proxied existential: that record is
+    ///   guarded by the existential's proxy itself, `(or q ¬φ[t̄])`
+    ///   (`nested_guarded`).
+    ///
+    /// Returns the number of clauses actually pushed.
+    pub(super) fn add_guarded_instance_clauses(
+        &mut self,
+        records: &[crate::ematching::ForallInstantiationProvenance],
+    ) -> usize {
+        if !crate::quant_unit_authority::quantifier_guarded_instances_enabled() {
+            return 0;
+        }
+        if records.is_empty() || self.quantifier_proxies.is_empty() {
+            return 0;
+        }
+        let mut created: u64 = 0;
+        let mut asserted: usize = 0;
+        // `--debug-cert` attribution of the records this pass drops.
+        let (mut no_exact, mut nested_refused) = (0usize, 0usize);
+        let mut existing: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
+        // A record whose guard is a nested proxy minted later in the same
+        // pass waits for it: the pass repeats while it mints proxies.
+        let mut pending: Vec<usize> = (0..records.len()).collect();
+        let mut minted = 0usize;
+        loop {
+            let minted_before = minted;
+            let mut still_pending = Vec::new();
+            for index in pending {
+                let record = &records[index];
+                let (clause, instance) = match self.guarded_clause(record, &mut minted) {
+                    nested_guarded::GuardedOutcome::NoGuard => {
+                        still_pending.push(index);
+                        continue;
+                    }
+                    nested_guarded::GuardedOutcome::NoInstance => {
+                        no_exact += 1;
+                        continue;
+                    }
+                    nested_guarded::GuardedOutcome::NestedRefused => {
+                        nested_refused += 1;
+                        continue;
+                    }
+                    nested_guarded::GuardedOutcome::Clause { clause, instance } => {
+                        (clause, instance)
+                    }
+                };
+                created += 1;
+                if !existing.insert(clause) {
+                    continue;
+                }
+                self.ctx.assertions.push(clause);
+                // The clause itself is NEVER an input: `register_proof_context`
+                // labels an assertion `h{idx}` only when it is in
+                // `proof_problem_assertions()` (frozen before preprocessing), so
+                // the exporter demotes it, and a labelled assumption would assert
+                // an inference AY never made
+                // (`a_guarded_clause_is_never_an_authored_problem_assertion`).
+                // Its CHECKED derivation is built from the authored side instead:
+                // the provenance below lets consequence replay
+                // (`plan_guarded_clausal_instances`) derive the clause's resolvent
+                // on the proxy, `(or L… body[t̄] …)`, from the authored clause that
+                // carries the universal, by `or` + `forall_inst` + `resolution`.
+                self.guarded_instance_clauses.insert(clause);
+                self.guarded_instance_records.push(
+                    crate::ematching::ForallInstantiationProvenance {
+                        quantifier: record.quantifier,
+                        binding: record.binding.clone(),
+                        instance,
+                    },
+                );
+                asserted += 1;
+            }
+            pending = still_pending;
+            if minted == minted_before || pending.is_empty() {
+                break;
+            }
+        }
+        let no_proxy = pending.len();
+        self.last_statistics.quantifier_proxies_minted += minted as u64;
+        self.last_statistics.quantifier_guarded_instances_created += created;
+        self.last_statistics.quantifier_guarded_instances_asserted += asserted as u64;
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/qguard: records={} created={created} asserted={asserted} proxies={} \
+                 no_proxy={no_proxy} no_exact={no_exact} nested_refused={nested_refused}",
+                records.len(),
+                self.quantifier_proxies.len(),
+            );
+        }
+        asserted
     }
 
     /// Post-CEGQI E-matching pass (#7979): run one E-matching round over the
@@ -2216,6 +2825,7 @@ impl Executor {
         // loop's slice. Reset the index/eqclasses so they are an exact function of
         // `combined` (the seen memo persists across the epoch).
         qm.begin_round_group();
+        let watermark = self.ctx.terms.len();
 
         // `combined` is a NON-monotonically rewritten root set (assertions were
         // flattened + quantifier-stripped, then refinement quantifiers re-added).
@@ -2225,6 +2835,20 @@ impl Executor {
         // `invalidate_index` cached-TermIndex path).
         let mut ematching_result =
             qm.run_ematching_round(&mut self.ctx.terms, &combined, euf_model_ref, &should_stop);
+        let new_terms = self.ctx.terms.len().saturating_sub(watermark);
+        if self
+            .ematching_check_budget
+            .charge(ematching_result.instantiations.len(), new_terms)
+        {
+            ematching_result.reached_limit = true;
+        }
+        // (#degrade277-narrow) Record what THIS round was licensed to conjoin,
+        // before any of its instances is asserted.
+        let round_entailed = std::mem::take(&mut ematching_result.entailed_foralls);
+        self.record_entailed_forall_authority(&round_entailed);
+        self.record_matched_instances(&ematching_result.conditional_forall_instantiations);
+        self.record_matched_instances(&ematching_result.guarded_instantiations);
+        self.record_matched_instances(&ematching_result.unconditional_forall_instantiations);
         self.materialize_exact_ematching_instances(
             &mut ematching_result.instantiations,
             &mut ematching_result.unconditional_forall_roots,
@@ -2267,6 +2891,7 @@ impl Executor {
                 rounds_completed: 1,
                 instances_created: inst_count,
                 unconditional_forall_roots: ematching_result.unconditional_forall_roots,
+                guarded_instantiations: ematching_result.guarded_instantiations,
             };
             (true, Some(summary))
         } else {
@@ -2661,13 +3286,10 @@ mod tests {
         );
     }
 
-    /// (#finite-exists-skolem-provenance) A finite-expanded TOP-LEVEL positive
-    /// single-binder `exists` must record the same #skolem-unit-authority
-    /// provenance the in-place Skolemization route records, so the
-    /// consequence-replay producer can hand its probe the witness facts and
-    /// derive them with the strict `sko_forall` chain.
+    /// A strict bounded integer existential stays authored until canonical
+    /// Skolemization, whose registered choice licenses the actual witness body.
     #[test]
-    fn finite_expanded_top_level_exists_records_skolem_instance_provenance() {
+    fn proof_bounded_integer_exists_keeps_registered_skolem_authority() {
         let commands = parse(
             r#"
                 (set-logic UFLIA)
@@ -2688,11 +3310,19 @@ mod tests {
             panic!("fixture asserts a top-level exists");
         };
 
-        let _ = exec.process_quantifiers();
+        let mut finite_expansions = exec.expand_finite_domains();
+        assert_eq!(
+            exec.ctx.assertions,
+            vec![original],
+            "proof mode must preserve the authored integer existential"
+        );
+        assert!(exec.skolem_instance_records.is_empty());
+
+        exec.skolemize_existentials(&mut finite_expansions);
 
         let [record] = exec.skolem_instance_records.as_slice() else {
             panic!(
-                "finite expansion of a top-level exists must record exactly one \
+                "canonical Skolemization must record exactly one \
                  Skolem-instance provenance entry, got {}",
                 exec.skolem_instance_records.len()
             );
@@ -2705,8 +3335,7 @@ mod tests {
         );
         assert_eq!(
             record.asserted, record.instance,
-            "the finite-expansion route never rewrites the assertion stack, so \
-             the asserted term is the raw instance itself"
+            "the asserted witness body must be the exact registered instance"
         );
         let TermData::Var(witness_name, _) = exec.ctx.terms.get(record.witness).clone() else {
             panic!("witness must be a plain Skolem constant");
@@ -2715,6 +3344,15 @@ mod tests {
             exec.ctx.terms.is_skolem_symbol(&witness_name),
             "the minted witness must be registered in the exact Skolem registry"
         );
+        let choice = exec
+            .ctx
+            .terms
+            .skolem_choice(record.witness)
+            .expect("canonical witness must have a registered choice");
+        assert_eq!(choice.binder, vars[0].0);
+        assert_eq!(choice.sort, vars[0].1);
+        assert_eq!(choice.body, body);
+        assert!(exec.ctx.assertions.contains(&record.asserted));
         // The recorded instance is the EXACT substitution the strict checker
         // re-derives.
         let mut substitution: HashMap<String, TermId> = HashMap::default();
@@ -2725,6 +3363,29 @@ mod tests {
             "recorded instance must be the exact single-binder substitution"
         );
         assert!(!contains_quantifier(&exec.ctx.terms, record.instance));
+    }
+
+    #[test]
+    fn internal_tracking_keeps_ordinary_integer_and_boolean_finite_expansion() {
+        for script in [
+            "(set-logic UFLIA) (declare-fun P (Int) Bool) \
+             (assert (exists ((x Int)) (and (<= 0 x) (<= x 3) (P x))))",
+            "(set-logic UF) (declare-fun P (Bool) Bool) \
+             (assert (exists ((x Bool)) (P x)))",
+        ] {
+            let mut exec = Executor::new();
+            exec.proof_tracker.enable();
+            exec.execute_all(&parse(script).expect("finite fixture"))
+                .expect("fixture setup");
+            assert!(!exec.strict_unsat_presentation_required());
+            let original = exec.ctx.assertions[0];
+            let _ = exec.expand_finite_domains();
+            assert_ne!(exec.ctx.assertions[0], original);
+            assert!(!contains_quantifier(
+                &exec.ctx.terms,
+                exec.ctx.assertions[0]
+            ));
+        }
     }
 
     /// GUARD-REMOVAL PROOF (#finite-exists-skolem-provenance kill switch):
@@ -3100,7 +3761,12 @@ mod tests {
         let not_p_a = exec.ctx.terms.mk_not(ground_assertion);
         let not_p_g_a = exec.ctx.terms.mk_not(p_g_a);
 
-        let _prep = exec.setup_cegqi_for_unhandled(&quantifiers, true, &uninstantiated);
+        let _prep = exec.setup_cegqi_for_unhandled(
+            &quantifiers,
+            true,
+            &uninstantiated,
+            crate::quant_unit_authority::EnumerativeAdmission::MatcherProduced,
+        );
 
         assert!(
             exec.ctx.assertions.contains(&p_g_a),

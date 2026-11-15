@@ -16,10 +16,21 @@ use ay_core::kani_compat::DetHashMap as FxHashMap;
 use num_traits::One;
 use std::sync::Arc;
 
+mod collect;
+
+use collect::collect_equalities;
+
 /// Extract equalities and linear relations, then propagate values.
 ///
-/// Scans an expression for equality constraints like `(= x 5)` or `(= x (+ y 1))`
-/// and uses them to derive variable values through fixpoint iteration.
+/// Scans a conjunction for values (`(= x 5)`, `(= (+ y 1) 5)`, `(= (- y 1) 5)`)
+/// and relations (`(= x y)`, `(= x (- y 1))`), then derives values across the
+/// relations until no relation can fill in a missing variable.
+///
+/// `(= x (+ y 1))` is NOT a relation here: the `(lhs, (+ ..))` value arm of
+/// [`extract_equalities_with_relations`] matches it first and records nothing
+/// when `lhs` is not a constant. Callers that populate a model follow this with
+/// [`augment_model_from_eval_equalities`], which evaluates `(+ y 1)` once `y` is
+/// known.
 pub(in crate::pdr) fn extract_equalities_and_propagate(expr: &ChcExpr) -> FxHashMap<String, i128> {
     let mut values = FxHashMap::default();
     let mut relations: Vec<(String, String, i128)> = Vec::new(); // (x, y, c) means x = y + c
@@ -51,29 +62,26 @@ pub(in crate::pdr) fn extract_equalities_and_propagate(expr: &ChcExpr) -> FxHash
             }
         }
     }
-    // Postcondition: fixpoint reached — no relation can derive a new value
+    // Postcondition: fixpoint reached — no relation can derive a value for a
+    // variable that has none.
+    //
+    // NOT a postcondition: that every relation AGREES with the values. The
+    // extracted conjuncts can contradict each other, because nothing requires
+    // `expr` to be satisfiable — `init_must_summaries_from_facts` hands in every
+    // fact clause's constraint unchecked, and `(and (= x y) (= x 5) (= y 6))` is a
+    // fact whose body no state satisfies. The loop keeps the values it saw, and
+    // the caller's formula (UNSAT) is what denotes the states, not these values;
+    // the counterexample verifier re-checks any witness built from them. An
+    // earlier version asserted agreement too, under this message; it fired on
+    // Trust's `if a == u32::MAX { a + 1 } else { 1 }` with overflow checks on
+    // (debug builds print it as a compiler panic).
     debug_assert!(
-        {
-            let mut stable = true;
-            for (x, y, c) in &relations {
-                if let Some(&y_val) = values.get(y) {
-                    if let Some(x_val) = y_val.checked_add(*c) {
-                        if !values.contains_key(x) {
-                            stable = false;
-                            break;
-                        }
-                        // Consistency: if x already has a value, it must agree
-                        if let Some(&existing) = values.get(x) {
-                            if existing != x_val {
-                                stable = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            stable
-        },
+        relations.iter().all(|(x, y, c)| {
+            values
+                .get(y)
+                .and_then(|y_val| y_val.checked_add(*c))
+                .is_none_or(|_| values.contains_key(x))
+        }),
         "BUG: extract_equalities_and_propagate did not reach fixpoint",
     );
     values
@@ -186,31 +194,6 @@ pub(in crate::pdr) fn extract_equalities_with_relations(
                         }
                     }
                 }
-                // Handle (= x (+ y c)) or (= x (+ c y)) - linear relation
-                (ChcExpr::Var(x), ChcExpr::Op(ChcOp::Add, add_args)) if add_args.len() == 2 => {
-                    let (a0, a1) = (add_args[0].as_ref(), add_args[1].as_ref());
-                    if let ChcExpr::Var(y) = a0 {
-                        if let Some(c) = try_eval_const(a1) {
-                            relations.push((x.name.clone(), y.name.clone(), c));
-                        }
-                    } else if let ChcExpr::Var(y) = a1 {
-                        if let Some(c) = try_eval_const(a0) {
-                            relations.push((x.name.clone(), y.name.clone(), c));
-                        }
-                    }
-                }
-                (ChcExpr::Op(ChcOp::Add, add_args), ChcExpr::Var(x)) if add_args.len() == 2 => {
-                    let (a0, a1) = (add_args[0].as_ref(), add_args[1].as_ref());
-                    if let ChcExpr::Var(y) = a0 {
-                        if let Some(c) = try_eval_const(a1) {
-                            relations.push((x.name.clone(), y.name.clone(), c));
-                        }
-                    } else if let ChcExpr::Var(y) = a1 {
-                        if let Some(c) = try_eval_const(a0) {
-                            relations.push((x.name.clone(), y.name.clone(), c));
-                        }
-                    }
-                }
                 // Handle (= x (- y c)) - subtraction
                 (ChcExpr::Var(x), ChcExpr::Op(ChcOp::Sub, sub_args)) if sub_args.len() == 2 => {
                     if let ChcExpr::Var(y) = sub_args[0].as_ref() {
@@ -251,64 +234,6 @@ pub(in crate::pdr) fn extract_equalities_with_relations(
             }
         }
         _ => {}
-    });
-}
-
-/// Collect equalities from an expression into a list of (lhs, rhs) pairs.
-pub(in crate::pdr) fn collect_equalities(
-    expr: &ChcExpr,
-    out: &mut Vec<(Arc<ChcExpr>, Arc<ChcExpr>)>,
-) {
-    crate::expr::maybe_grow_expr_stack(|| match expr {
-        ChcExpr::Op(ChcOp::And | ChcOp::Or, args) => {
-            for a in args {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::Op(ChcOp::Not, args) => {
-            if let Some(a) = args.first() {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::Op(ChcOp::Implies | ChcOp::Iff, args) => {
-            if let Some(a) = args.first() {
-                collect_equalities(a, out);
-            }
-            if let Some(b) = args.get(1) {
-                collect_equalities(b, out);
-            }
-        }
-        ChcExpr::Op(ChcOp::Ite, args) => {
-            for a in args {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
-            out.push((args[0].clone(), args[1].clone()));
-        }
-        ChcExpr::Op(_, args) => {
-            for a in args {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::PredicateApp(_, _, args) => {
-            for a in args {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::FuncApp(_, _, args) => {
-            for a in args {
-                collect_equalities(a, out);
-            }
-        }
-        ChcExpr::Bool(_)
-        | ChcExpr::Int(_)
-        | ChcExpr::BitVec(_, _)
-        | ChcExpr::Real(_, _)
-        | ChcExpr::Var(_)
-        | ChcExpr::ConstArrayMarker(_)
-        | ChcExpr::IsTesterMarker(_)
-        | ChcExpr::ConstArray(_, _) => {}
     });
 }
 

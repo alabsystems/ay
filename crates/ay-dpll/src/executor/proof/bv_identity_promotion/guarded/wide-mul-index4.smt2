@@ -1,0 +1,7 @@
+(set-logic QF_ABV)
+(declare-fun a () (Array (_ BitVec 4) (_ BitVec 32)))
+(declare-fun x () (_ BitVec 32))
+(declare-fun y () (_ BitVec 32))
+(assert (= x #x00000000))
+(assert (bvugt (select (store a #x0 (bvmul x y)) #x0) #x00000000))
+(check-sat)

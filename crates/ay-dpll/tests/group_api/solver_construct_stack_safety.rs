@@ -30,11 +30,51 @@
 //! embedder scenario verbatim. A pre-fix overflow aborts this whole test
 //! binary with "thread ... has overflowed its stack" (SIGABRT), which is
 //! the intended loud failure mode, matching the other *_stack_safety tests.
+//!
+//! The caller's thread still pays for the `Executor` VALUE, twice: the
+//! by-value `Executor::new` holds one copy in its own frame (stacker's return
+//! slot) on top of the caller's. The direct-`Executor` case needs about
+//! `2 * size_of::<Executor>() + 10 KiB` (measured 2026-09-30, aarch64 Linux,
+//! opt-level 1: 150,408 B fails at 300 KiB and passes at 304 KiB; 92,552 B
+//! fails at 188 KiB and passes at 192 KiB). 0027a7b70 put a 57,864 B
+//! `ScopedWindowLanes` inline (91,592 -> 150,408 B) and the 192 KiB case
+//! aborted this binary. The fields that embed an `ay_sat::Solver`
+//! (`scoped_window_lanes`, `incr_bv_state`, `incr_fp_state`) are boxed now,
+//! about 54 KB, and [`EXECUTOR_INLINE_SIZE_CEILING`] makes the next growth a
+//! test failure that names its cause instead of an abort.
 
 use std::sync::mpsc;
 use std::time::Duration;
 
 use ay_dpll::api::{Logic, SolveResult, Solver};
+
+/// Ceiling on `size_of::<ay_dpll::Executor>()` for the small-stack cases
+/// below. Measured 53,968-54,432 B across main on 2026-09-30 (dev profile; release drops the
+/// debug-only fields). At the ceiling the direct-`Executor` case needs about
+/// 2 * 64 KiB + 10 KiB = 138 KiB of its 192 KiB thread, so this fails well
+/// before an overflow would abort the binary. A new field that crosses it is
+/// boxed, not accommodated by raising the ceiling: the incremental lanes each
+/// embed an ~19 KB `ay_sat::Solver`, and `RUSTC_BOOTSTRAP=1 cargo rustc -p
+/// ay-dpll --lib -- -Zprint-type-sizes` lists `executor::Executor`'s fields
+/// by size.
+const EXECUTOR_INLINE_SIZE_CEILING: usize = 64 * 1024;
+
+fn assert_executor_inline_size_within_ceiling() {
+    let size = size_of::<ay_dpll::Executor>();
+    assert!(
+        size <= EXECUTOR_INLINE_SIZE_CEILING,
+        "size_of::<Executor>() is {size} B, over the {EXECUTOR_INLINE_SIZE_CEILING} B \
+         small-stack ceiling: the by-value Executor::new pays every inline byte twice \
+         on the caller's thread, so box the field that grew it"
+    );
+}
+
+/// The ceiling on its own, so a growth is reported by name even when no
+/// small-stack case runs.
+#[test]
+fn executor_inline_size_stays_under_small_stack_ceiling() {
+    assert_executor_inline_size_within_ceiling();
+}
 
 /// Construct a `Solver` (Logic::All — deductive-checks's choice), run a trivial
 /// check-sat, and confirm completion from a thread with `stack` bytes.
@@ -76,6 +116,7 @@ fn solver_construction_on_2mib_libtest_stack() {
 /// 4x margin over the measured post-fix requirement (48 KiB passes).
 #[test]
 fn solver_construction_on_192kib_stack() {
+    assert_executor_inline_size_within_ceiling();
     construct_on_small_stack("construct-192kib", 192 * 1024);
 }
 
@@ -84,8 +125,11 @@ fn solver_construction_on_192kib_stack() {
 /// 192 KiB fails pre-fix; post-fix threshold is 128 KiB (the ~56 KB
 /// `Executor` local plus its unelided by-value return copies are inherent
 /// to the public by-value `Executor::new` API and stay on this thread).
+/// Re-measured 2026-09-30 at about 54 KB: passes at 128 KiB, which is also the
+/// smallest stack this aarch64 host grants (`PTHREAD_STACK_MIN`).
 #[test]
 fn executor_construction_on_192kib_stack() {
+    assert_executor_inline_size_within_ceiling();
     let (tx, rx) = mpsc::channel();
 
     let handle = std::thread::Builder::new()

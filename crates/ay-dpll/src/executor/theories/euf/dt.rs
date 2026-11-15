@@ -4,6 +4,7 @@
 
 //! Datatype (DT) theory solving and DT+X combined routes.
 
+use super::super::super::guard_nodes::ShareOf;
 use super::super::super::Executor;
 use crate::executor_types::{Result, SolveResult};
 use crate::preprocess::PreprocessingPass;
@@ -17,6 +18,7 @@ mod axiom_proof;
 mod context_derivation;
 mod dt_abandon;
 mod lazy_proof_state;
+mod model_recheck_atoms;
 
 use axiom_proof::recognized_axiom_kind;
 
@@ -43,9 +45,17 @@ pub(in crate::executor) enum DtLazyAcceptance {
     Definitive,
     /// Publish only UNSAT; demote a lane `Sat` to a lane MISS so the eager
     /// authority — and its datatype-carrying-array degrade gate and D0
-    /// model-e-graph recheck — stays terminal (`solve_dt_ax`,
-    /// `solve_dt_ufbv`, `solve_dt_aufbv`).
+    /// model-e-graph recheck — stays terminal (`solve_dt_ax`, and the BV
+    /// routes on the UF-at-datatype-sort shape).
     UnsatOnly,
+    /// Publish UNSAT always; publish a lane `Sat` only when this lane runs
+    /// the eager authority's two post-`Sat` datatype passes itself and both
+    /// pass: the independent fail-closed gate CONFIRMS the model against
+    /// the authored assertions (subsuming the datatype-carrying-array
+    /// degrade gate, which defers to exactly that confirmation) and the
+    /// D0 model-e-graph recheck is clean (#dt-lazy-bv-confirmed-sat;
+    /// `solve_dt_ufbv`, `solve_dt_aufbv`). Anything less is a lane MISS.
+    SatWhenConfirmed,
 }
 
 impl Executor {
@@ -135,6 +145,10 @@ impl Executor {
         if self.dt_occurs_check_unsat_from_equalities(&occurs_check_assertions, &[]) {
             self.last_unknown_reason = None;
             return Ok(SolveResult::unsat());
+        }
+        // Finite-domain datatype lane (E13, `dt_finite`), as in `solve_dt_ax`.
+        if let Some(result) = self.try_solve_dt_finite_domain()? {
+            return Ok(result);
         }
 
         // Lazy, demand-driven case-splitting via iterative deepening (the DT
@@ -286,7 +300,7 @@ impl Executor {
 
         // Restore assertions to original length (remove temporary axioms).
         self.ctx.assertions = base_assertions_exact;
-        self.dt_solver_added_axiom_terms.clear();
+        self.retire_dt_solver_added_axiom_terms();
         result
     }
 
@@ -431,6 +445,9 @@ impl Executor {
         // attribution question it existed for is settled; unset was already
         // byte-identical control flow.)
         let mut prev_term_len: Option<usize> = None;
+        // The assertions, axioms included, the previous round of this call
+        // solved (see `solve_with_dt_axioms_at_depth`).
+        let mut solved_window: Option<Vec<TermId>> = None;
         // D0 model-e-graph recheck pass (#dt-model-recheck): constructed once
         // per solve so its clause dedup / fresh-EUF validation state persists
         // across recheck rounds (a re-emitted clause fails closed instead of
@@ -471,8 +488,12 @@ impl Executor {
                 }
             }
             let pre_axiom_term_len = self.ctx.terms.len();
-            let result =
-                self.solve_with_dt_axioms_at_depth(acyclicity_sort.clone(), solve_fn, depth);
+            let round = self.solve_with_dt_axioms_at_depth(
+                acyclicity_sort.clone(),
+                solve_fn,
+                depth,
+                &mut solved_window,
+            );
             // M5 LAW #4 (DT-emitter charge-AND-tag): the selector emitter just minted
             // the depth-`depth` selector frontier (`sel_i(...)`, its (C)/(D) axioms)
             // as fresh terms — the campaign's SECOND minter. Tag those newly-minted
@@ -490,14 +511,28 @@ impl Executor {
                     qm.demand_tag_dt_minted(pre_axiom_term_len, end, tag_gen);
                 }
             }
+            // This depth adds no axiom the previous round did not already
+            // solve with: the assertion window is the one that round answered
+            // `Unknown` on (the loop re-enters only after an `Unknown`; a
+            // model-recheck re-solve appends its lemmas to the assertions, so
+            // its window differs). Deepening has nothing left to offer this
+            // call, and the answer is that `Unknown`, never a verdict: no round
+            // ran, so nothing here could justify a Sat or an Unsat. The reason
+            // the previous round recorded stands. (A phase trace shows the
+            // round as `result=repeat`.)
             if ay_core::misc_cli_flags().phase_trace {
+                let shown = match &round {
+                    Some(result) => format!("{:?}", result.as_ref().map(|r| format!("{r:?}"))),
+                    None => "repeat".to_string(),
+                };
                 eprintln!(
-                    "c phase-trace dt-round-result depth={} result={:?} reason={:?}",
-                    depth,
-                    result.as_ref().map(|r| format!("{r:?}")),
-                    self.last_unknown_reason
+                    "c phase-trace dt-round-result depth={} result={} reason={:?}",
+                    depth, shown, self.last_unknown_reason
                 );
             }
+            let Some(result) = round else {
+                return Ok(SolveResult::Unknown);
+            };
 
             // SOUNDNESS: the DT selector/injectivity axioms materialized above are
             // derived from syntactic terms. Constructor injectivity *through array
@@ -680,12 +715,30 @@ impl Executor {
     /// final-check can re-solve at increasing depths. Behaviour at the
     /// warm-start depth is identical to the original single-pass solve,
     /// including the spurious-acyclicity-UNSAT post-hoc re-check.
+    ///
+    /// `solved_window` is the assertion vector, axioms included, that the
+    /// caller's previous round solved. When this depth produces the very same
+    /// vector the round is not run and `None` is returned; the caller answers
+    /// `Unknown`. The deepening loop re-enters only after an `Unknown`, and
+    /// solving the same assertions again is expected to repeat it. That is an
+    /// empirical basis, not a certainty: the ground solve keeps incremental SAT
+    /// state, and with the ground-solve carry (DECISIONS.md DR-45) a re-solve is
+    /// a different search. Measured 2026-10-15 over 386 datatype files (123 in
+    /// the repo, 263 gate-generated), in both postures, with and without the
+    /// carry: 22-25 repeated rounds in 4-5 files were all `Unknown` except one
+    /// `Sat` (g11_00031), the previous round's refuted witness, demoted again;
+    /// no final verdict changed. The exit answers `Unknown`, so it can cost
+    /// completeness, never soundness. The loop's own
+    /// stop test compares term-store sizes, which the solve itself grows
+    /// (split atoms, model terms), so it does not see that a deeper unroll
+    /// added nothing.
     fn solve_with_dt_axioms_at_depth(
         &mut self,
         acyclicity_sort: Option<Sort>,
         solve_fn: fn(&mut Self) -> Result<SolveResult>,
         max_recursive_depth: usize,
-    ) -> Result<SolveResult> {
+        solved_window: &mut Option<Vec<TermId>>,
+    ) -> Option<Result<SolveResult>> {
         let base_assertions: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         let mut extra_axioms =
             self.dt_selector_axioms_to_depth(&base_assertions, max_recursive_depth);
@@ -739,6 +792,18 @@ impl Executor {
         // gate). Sound: the emitted EXACT datatype-equality biconditional is a
         // datatype tautology, so it can never cause a false-unsat.
         extra_axioms.extend(self.dt_datatype_value_equality_congruence_axioms(&base_assertions));
+        // Read-over-write FIELD congruence for datatype-valued selects taken
+        // over a store / array-ite chain (#dt-array-select-over-store). Every
+        // pass above groups datatype-valued selects by their SYNTACTIC base
+        // array, so `(select (store d i v) j)` is related to nothing: its
+        // fields stay free, the SAT core invents them, and the strict
+        // `datatype-field` oracle degrades a genuinely UNSAT obligation to a
+        // fail-closed `unknown`. Sound: `dt_fold_select` applies only valid
+        // array identities, so the folded term is semantically EQUAL to the
+        // raw select and the emitted field/tester congruence is a tautology —
+        // entailed, so it can only prune. Runs last so every pass above sees a
+        // byte-identical term store (same fresh-symbol numbering).
+        extra_axioms.extend(self.dt_array_select_over_store_field_axioms(&base_assertions));
 
         // Guarded datatype-acyclicity clauses from disjunctive contexts
         // (#dt-acyclic-case-split); see `solve_dt` for the rationale. Sound for
@@ -765,20 +830,52 @@ impl Executor {
             extra_axioms.extend(self.dt_acyclicity_depth_axioms(sort.clone()));
         }
 
+        // The window this round would solve is the assertions with the axioms
+        // appended. The very window the previous round solved is not solved
+        // again (see the doc comment): nothing is recorded or appended, so the
+        // executor leaves this round exactly as it entered it, apart from the
+        // hash-consed axiom terms, which name the previous round's.
+        let window_len = self.ctx.assertions.len() + extra_axioms.len();
+        if let Some(previous) = solved_window.as_deref() {
+            let (base, axioms) = previous.split_at(previous.len().min(self.ctx.assertions.len()));
+            if previous.len() == window_len
+                && base == self.ctx.assertions.as_slice()
+                && axioms == extra_axioms.as_slice()
+            {
+                return None;
+            }
+        }
+
         if self.produce_proofs_enabled() {
             self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
         let base_assertions_exact = self.ctx.assertions.clone();
+        // Size the eager authority's materialization at this depth. The lazy
+        // lane already prints `dt-auflia-lazy-axioms`; the eager route — which
+        // decides every file the lazy lane declines or misses — printed only its
+        // verdict, so a deepening round that materializes a selector closure
+        // orders of magnitude larger than the problem left no trace at all. See
+        // `dt-round-result` for the verdict of the same round.
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!(
+                "c phase-trace dt-eager-axioms depth={max_recursive_depth} \
+                 base={} generated={} terms={}",
+                base_assertions_exact.len(),
+                extra_axioms.len(),
+                self.ctx.terms.len()
+            );
+        }
         // Record the appended axiom terms so the in-loop validation's
         // #dt-embedded-cycle compound guard exempts them (each is an entailed
         // datatype tautology; see `dt_solver_added_axiom_terms`).
         self.dt_solver_added_axiom_terms
             .extend(extra_axioms.iter().copied());
         self.ctx.assertions.extend(extra_axioms);
+        *solved_window = Some(self.ctx.assertions.clone());
         let result = solve_fn(self);
         self.ctx.assertions = base_assertions_exact;
-        self.dt_solver_added_axiom_terms.clear();
+        self.retire_dt_solver_added_axiom_terms();
 
         // Post-hoc soundness re-check for spurious acyclicity UNSAT
         // (#dt-array-acyc wrong-unsat / FALSE THEOREM). The recursive selector
@@ -805,9 +902,9 @@ impl Executor {
             && self.dt_acyclicity_unsat_is_spurious(acyclicity_sort, solve_fn)
         {
             self.last_unknown_reason = Some(crate::executor_types::UnknownReason::Incomplete);
-            return Ok(SolveResult::Unknown);
+            return Some(Ok(SolveResult::Unknown));
         }
-        result
+        Some(result)
     }
 
     /// Re-solve with acyclicity depth axioms SCOPED to the pre-selector-axiom
@@ -854,7 +951,7 @@ impl Executor {
         self.ctx.assertions.extend(extra_axioms);
         let scoped_result = solve_fn(self);
         self.ctx.assertions = base_assertions_exact;
-        self.dt_solver_added_axiom_terms.clear();
+        self.retire_dt_solver_added_axiom_terms();
 
         // Spurious iff the scoped (artifact-free) re-solve does NOT reproduce the
         // unsat. A genuine cycle stays unsat under scoping (asserted constructors
@@ -902,44 +999,8 @@ impl Executor {
             return DtModelRecheck::Clean;
         };
 
-        // Datatype sort names (internal, possibly instance-mangled).
-        let dt_names: HashSet<String> = self
-            .ctx
-            .datatype_iter()
-            .map(|(name, _)| name.to_string())
-            .collect();
-        let is_dt_sort = |sort: &Sort| match sort {
-            Sort::Datatype(dt) => dt_names.contains(&dt.name),
-            Sort::Uninterpreted(name) => dt_names.contains(name),
-            _ => false,
-        };
-
-        // The model's TRUE datatype equalities: asserted top-level units are
-        // true in every accepted model; everything else reads the SAT
-        // assignment (this is where the axiom-(C) instantiation equalities
-        // `t = C(sel_1 t, ...)` the bit-blast core decided live). An atom the
-        // SAT layer never saw is skipped — fewer merges can only MISS a
-        // conflict (fail-open for that atom; the always-on gates remain the
-        // backstop), never invent one.
-        let asserted: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
-        let mut true_eqs: Vec<TermId> = Vec::new();
-        for raw in 0..self.ctx.terms.len() {
-            let tid = TermId(raw as u32);
-            let TermData::App(Symbol::Named(sym), args) = self.ctx.terms.get(tid) else {
-                continue;
-            };
-            if sym.as_str() != "=" || args.len() != 2 || !is_dt_sort(self.ctx.terms.sort(args[0])) {
-                continue;
-            }
-            let truth = if asserted.contains(&tid) {
-                Some(true)
-            } else {
-                self.term_value(&model.sat_model, &model.term_to_var, tid)
-            };
-            if truth == Some(true) {
-                true_eqs.push(tid);
-            }
-        }
+        // The model's TRUE ground datatype equalities (`model_recheck_atoms`).
+        let true_eqs = self.dt_model_true_ground_equalities(&model.sat_model, &model.term_to_var);
         if true_eqs.is_empty() {
             return DtModelRecheck::Clean;
         }
@@ -980,6 +1041,41 @@ impl Executor {
                 DtModelRecheck::LemmasInjected
             }
         }
+    }
+
+    /// #dt-lazy-pre-attempt: the lazy DT+LIA lane attempt `solve_dt_auflia`
+    /// runs first, hoisted to the DT+LIA dispatch so it executes BEFORE
+    /// `solve_dt_uf_lia`'s eager authority.
+    ///
+    /// Why the hoist is load-bearing (measured 2026-11-09 on the Certora
+    /// QF_UFDTLIA family): the dispatch tries the array-free UF route first
+    /// for its catamorphism wins, but that route's call-site exclusion
+    /// (`dt_lazy_query_applies_uninterpreted_at_datatype_sort`) skips the
+    /// lane exactly on the UF-at-datatype-sort shape Certora emits, and its
+    /// eager authority then consumes the whole budget — `65782_…_6` wanders
+    /// 55k decisions to the deadline; `39657_…_47` floods 972k terms and
+    /// 378k proof steps, after which the sibling route's identical lane
+    /// attempt declines at `proof-rollback-checkpoint` (the checkpoint
+    /// clone no longer fits the query envelope). Attempting the lane FIRST,
+    /// on the array-enabled residual with no exclusion (exactly the attempt
+    /// `solve_dt_auflia` already makes when it is reached), decides
+    /// `65782_…_6` `sat` in ~4s. A miss restores state in full and the
+    /// dispatch proceeds in its previous order; `solve_dt_auflia` skips its
+    /// duplicate attempt via `dt_auflia_lazy_pre_attempted`.
+    pub(in crate::executor) fn try_dt_auf_lazy_pre_attempt(
+        &mut self,
+    ) -> Result<Option<SolveResult>> {
+        if self.should_abort_theory_loop() {
+            return Ok(None);
+        }
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_some_and(|v| v == "0") {
+            return Ok(None);
+        }
+        self.dt_auflia_lazy_pre_attempted = true;
+        self.try_solve_dt_auflia_lazy_maybe_incremental(
+            Self::solve_auf_lia,
+            DtLazyAcceptance::Definitive,
+        )
     }
 
     /// Solve combined DT + LIA (#1760). DT axioms + acyclicity(Int) → AUFLIA.
@@ -1024,7 +1120,14 @@ impl Executor {
         // `unknown` on them at `-T:300`. Definitive results from this lane pass the
         // same model gates as the eager authority; a miss restores state and falls
         // through, so the eager path remains the terminal authority.
-        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+        // Skipped when the dispatch already ran this identical attempt
+        // (`try_dt_auf_lazy_pre_attempt`): re-running it after the UF route's
+        // eager authority cannot turn its earlier miss into a hit — the lane
+        // restores state exactly — and would only spend speculative budget
+        // twice.
+        if !self.dt_auflia_lazy_pre_attempted
+            && std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0")
+        {
             if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
                 Self::solve_auf_lia,
                 DtLazyAcceptance::Definitive,
@@ -1072,10 +1175,11 @@ impl Executor {
         self.clear_quantified_sat_authority();
         self.last_validation_stats = None;
         self.model_validation_delegated_assertions.clear();
-        self.dt_solver_added_axiom_terms.clear();
+        self.retire_dt_solver_added_axiom_terms();
         self.last_soft_cost = None;
         self.last_soft_cost_optimal = true;
         self.last_soft_violations = None;
+        self.last_soft_group_costs = None;
         self.finite_objective_values.clear();
         self.unbounded_objectives.clear();
         self.infinitesimal_objectives.clear();
@@ -1090,12 +1194,20 @@ impl Executor {
     /// about the discarded term. Snapshot-keyed model indexes are cleared as
     /// well: rebuilding them is cheap compared with making their shrink
     /// detection part of this rollback's soundness argument.
-    fn clear_dt_lazy_rebuildable_term_indexes(&mut self) {
+    pub(in crate::executor) fn clear_dt_lazy_rebuildable_term_indexes(&mut self) {
         self.reset_array_congruence_caches();
         *self.select_by_array_index.borrow_mut() = (0, Default::default());
         *self.array_def_index.borrow_mut() = None;
         *self.required_terms_index.borrow_mut() = None;
         ay_euf::clear_bool_arg_repair_candidates();
+    }
+
+    /// Name the entry gate that turned the optional lazy DT+LIA lane down
+    /// (`--phase-trace` only). See `try_solve_dt_auflia_lazy`.
+    fn trace_dt_auflia_lazy_decline(gate: &str) {
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!("c phase-trace dt-auflia-lazy-decline gate={gate}");
+        }
     }
 
     /// Lazy DT + LIA lane (campaign L1a): solve the DT+LIA(+Array) residual
@@ -1134,6 +1246,13 @@ impl Executor {
     /// `solve_fn` is the inner combiner the residual is routed through —
     /// `solve_auf_lia` (array-enabled) or `solve_uf_lia` (array-free) — chosen
     /// by the caller to match the eager authority it shadows.
+    ///
+    /// Every `return Ok(None)` below the entry gates is a silent fall-through to
+    /// the eager DT authority, so a file that never prints
+    /// `dt-auflia-lazy-axioms` carries no evidence of WHICH precondition refused
+    /// it — the attribution the 2026-09-16 gap census left open on the Certora
+    /// QF_UFDT{LIA,NIA} family ("declines at an unattributed pre-axiom gate").
+    /// `trace_dt_auflia_lazy_decline` names the gate under `--phase-trace`.
     fn try_solve_dt_auflia_lazy(
         &mut self,
         solve_fn: fn(&mut Self) -> Result<SolveResult>,
@@ -1142,27 +1261,40 @@ impl Executor {
         // Incremental gate (#dt-lazy-incremental-gate): the lane's term-store
         // rollback contract is unenforceable under a persistent incremental
         // session (recycled TermIds alias stale encodings → wrong-UNSAT). Skip.
+        // A scoped, budget-capped internal probe owns the solve: the lane's
+        // half-remaining-budget trade is wrong there (see
+        // `dt_lazy_lane_suppressed_for_scoped_probe`). Leave the eager
+        // authority the whole cap.
+        if self.dt_lazy_lane_suppressed_for_scoped_probe {
+            Self::trace_dt_auflia_lazy_decline("scoped-probe-suppression");
+            return Ok(None);
+        }
         if self.has_persistent_dt_lazy_session() {
+            Self::trace_dt_auflia_lazy_decline("persistent-incremental-session");
             return Ok(None);
         }
         if !self.dt_lazy_lemma_cache_isolation_available() {
+            Self::trace_dt_auflia_lazy_decline("lemma-cache-isolation");
             return Ok(None);
         }
         // Eligibility: at least one RECURSIVE datatype (a constructor with a
         // datatype-sorted field). Pure enum/nullary content is handled by the
         // finite-domain lane; this route targets the recursive DT+LIA family.
         if !self.dt_auflia_lazy_eligible() {
+            Self::trace_dt_auflia_lazy_decline("not-recursive-datatype");
             return Ok(None);
         }
         // The exact rollback snapshot below roughly doubles the TermStore
         // footprint. Decline this OPTIONAL lane before cloning when less than
         // that headroom remains; the eager authority below is unchanged.
         if !self.dt_auflia_snapshot_preflight() {
+            Self::trace_dt_auflia_lazy_decline("snapshot-preflight");
             return Ok(None);
         }
         let Ok(entry_proof_checkpoint) = self.bounded_proof_rollback_checkpoint() else {
             // Optional lane: preserve the eager authority when the cumulative
             // proof-snapshot allocation envelope has been exhausted.
+            Self::trace_dt_auflia_lazy_decline("proof-rollback-checkpoint");
             return Ok(None);
         };
 
@@ -1258,7 +1390,26 @@ impl Executor {
         // nothing set is retired).
         let depth: usize = 1;
         let base_assertions: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
-        let mut extra_axioms = self.dt_selector_axioms_to_depth(&base_assertions, depth);
+        // #dt-lazy-frontier-diet: arm the frontier tester diet for this
+        // lane's depth-1 slice only (restored immediately after the one
+        // generation call that reads it). At depth 1 every selector-created
+        // term is frontier — it receives no (C) of its own, so its tester
+        // atoms occur only in its own exhaustiveness (D) / mutual-exclusion
+        // (G) clauses, which constrain nothing else in the residual. On the
+        // Certora `39657_47` shape that family is 3,087 of the lane's
+        // 5,951 generated axioms (total asserts 6,996 -> 3,909) and ~half
+        // the inner solve's decisions (47,273 -> 21,813 on the minimized
+        // 15-assertion core). Soundness is the lane's existing discipline:
+        // the omitted clauses are datatype tautologies, so a lane UNSAT
+        // still refutes the authored assertions, and a lane `Sat` is
+        // published only through the same gate checks as today; the
+        // generator itself refuses the diet whenever a live quantified
+        // term exists. Unlike the BV routes (which arm it for their eager
+        // rounds too), arming here scopes strictly to this speculative
+        // lane — the eager authority below is byte-identical.
+        let mut extra_axioms = self.with_dt_frontier_tester_diet(|exec| {
+            exec.dt_selector_axioms_to_depth(&base_assertions, depth)
+        });
         let assertions_snapshot = self.ctx.assertions.clone();
         extra_axioms.extend(self.dt_guarded_acyclicity_disjuncts(&assertions_snapshot, &[]));
         extra_axioms.extend(self.dt_guarded_acyclicity_guard_units(&assertions_snapshot, &[]));
@@ -1297,15 +1448,19 @@ impl Executor {
         }
 
         // Time split: the lazy attempt gets HALF the remaining budget so a lane
-        // miss can at worst halve — never consume — the eager lane's time.
-        let saved_deadline = self.solve_deadline.get();
-        if let Some(deadline) = saved_deadline {
-            let now = ay_core::time::Instant::now();
-            if deadline <= now {
+        // miss can at worst halve — never consume — the eager lane's time. The
+        // half is a deadline share (GT6, GuardTree step S3): the executor's
+        // deadline is never written, and the share counts itself. Without a
+        // share the deadline found here is put back after the attempt.
+        let found_deadline = self.solve_deadline.get();
+        let mut share = None;
+        if let Some(deadline) = found_deadline {
+            if deadline <= ay_core::time::Instant::now() {
+                Self::trace_dt_auflia_lazy_decline("deadline-before-inner-solve");
                 rollback_on_fallback(self);
                 return Ok(None);
             }
-            self.solve_deadline.set(Some(now + (deadline - now) / 2));
+            share = self.open_deadline_share(ShareOf::Search);
         }
         // L2 eager-arm routing (`AY_DT_LAZY_AUFLIA_EAGER`, default off ⇒ this
         // whole block is inert and the lane is byte-identical to L1a): the
@@ -1324,7 +1479,7 @@ impl Executor {
         }
         let result = solve_fn(self);
         self.dt_lazy_auflia_eager_arm = saved_eager_arm;
-        self.solve_deadline.set(saved_deadline);
+        self.end_sliced_attempt(share, found_deadline);
         self.ctx.assertions = base_assertions_exact;
 
         if ay_core::misc_cli_flags().phase_trace {
@@ -1359,11 +1514,11 @@ impl Executor {
                 Ok(SolveResult::Unknown)
             }
             // UNSAT-ONLY routes (#dt-lazy-dtax-route): the eager authority for
-            // `solve_dt_ax`/`solve_dt_ufbv`/`solve_dt_aufbv` runs post-`Sat`
-            // datatype passes this lane does not — the datatype-carrying-array
-            // injectivity degrade gate and the D0 model-e-graph recheck that the
-            // BV cores have no combiner-hosted equivalent for. Rather than
-            // duplicate them here, a lane `Sat` on those routes is a lane MISS:
+            // `solve_dt_ax` runs post-`Sat` datatype passes this lane does not
+            // duplicate — the datatype-carrying-array injectivity degrade
+            // gate and the D0 model-e-graph recheck. (The BV routes run those
+            // passes inside the lane instead; see `SatWhenConfirmed` below,
+            // #dt-lazy-bv-confirmed-sat.) A lane `Sat` here is a lane MISS:
             // it rolls back and the eager authority stays terminal. UNSAT is
             // admitted because the lane only ever asserts datatype TAUTOLOGIES
             // (a strict subset of the eager axiom families), so a refutation of
@@ -1371,6 +1526,23 @@ impl Executor {
             Ok(SolveResult::Sat) if matches!(acceptance, DtLazyAcceptance::UnsatOnly) => {
                 if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-auflia-lazy-unsat-only-fallback");
+                }
+                self.last_model_validated = false;
+                Ok(SolveResult::Unknown)
+            }
+            // CONFIRMED-Sat routes (#dt-lazy-bv-confirmed-sat): the BV eager
+            // authority's post-`Sat` datatype passes run HERE instead — the
+            // independent gate must confirm the witness against the authored
+            // assertions and the D0 model-e-graph recheck must be clean.
+            // A spurious witness from the sparse axiom subset is exactly
+            // what those gates exist to refute; anything short of both is a
+            // lane MISS and the eager authority stays terminal.
+            Ok(SolveResult::Sat)
+                if matches!(acceptance, DtLazyAcceptance::SatWhenConfirmed)
+                    && !self.dt_lazy_sat_confirmed_for_bv() =>
+            {
+                if ay_core::misc_cli_flags().phase_trace {
+                    eprintln!("c phase-trace dt-auflia-lazy-unconfirmed-fallback");
                 }
                 self.last_model_validated = false;
                 Ok(SolveResult::Unknown)
@@ -1429,6 +1601,7 @@ impl Executor {
         // persistent SAT state does not solve that proof-translation problem.
         // Keep this incremental optimization clamped until it can return a
         // self-contained authored-scope proof without shrinking its term store.
+        Self::trace_dt_auflia_lazy_decline("incremental-clamp");
         Ok(None)
     }
 
@@ -1467,7 +1640,7 @@ impl Executor {
         {
             return false;
         }
-        let clone_limit = ay_core::TermStore::per_engine_budget() / 2;
+        let clone_limit = self.predictive_term_clone_budget();
         self.ctx
             .terms
             .diagnostic_clone_memory_bytes(clone_limit)
@@ -1640,27 +1813,50 @@ impl Executor {
         // route the rusthorn List-sum VC gl.smt2 takes — it is array-free so
         // the DtAuflia dispatch tries `solve_dt_uf_lia` first).
         //
-        // This call site reads `is_some_and` — i.e. it stays OPT-IN — where the
-        // sibling `solve_dt_auflia` reads `is_none_or`. That asymmetry looks
-        // like an oversight from the 2026-08-31 default-on promotion, and it is
-        // NOT: flipping it was tried and MEASURED, and it costs more than it
-        // gains. Turning the lane on here closes the ground DT+LIA
-        // `red_ground_dtlia` probe to its z3-correct `unsat` (a real win), but
-        // this is also the route the DT-MBQI-Sat certificate's re-sequence
-        // probe takes on its MIN1 shape, and the lane's half-remaining-budget
-        // time split starves that capped ground-core solve: the grant is lost
-        // and a published `sat` degrades to `unknown`. Three pins trip on it —
-        // `dt_cert_grants_min1_under_on`,
-        // `dt_cert_grants_min1_under_on_and_lazy` and
-        // `dt_cert_min1_grant_independent_of_lazy_kill_switch` — which is
-        // exactly the composition failure their own comment was written to
-        // catch ("a FUTURE lazy-lane change that becomes eligible on a DT-cert
-        // shape ... could then starve the cert via the R1 half-budget time
-        // split"). Landing it needs the cert probe's scoped solve to opt out of
-        // the lane first; until then the array-free DT+LIA route still reaches
-        // the lane through the `solve_dt_auflia` fallback, one eager attempt
-        // later. See `solve_dt_auflia` / `try_solve_dt_auflia_lazy`.
-        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_some_and(|v| v != "0") {
+        // This call site now reads `is_none_or`, matching its `solve_dt_auflia`
+        // sibling: the lane is DEFAULT-ON with `AY_DT_LAZY_AUFLIA=0` as the kill
+        // switch.
+        //
+        // It had stayed OPT-IN for a measured reason: the lane takes HALF the
+        // remaining budget for its speculative attempt, and this is the route
+        // the DT-MBQI-Sat certificate's re-sequence probe takes on its MIN1
+        // shape, where the budget is already capped at 8 s — so the lane ate
+        // half the cap, the eager authority that produces the candidate got the
+        // rest, and a published `sat` degraded to `unknown`. Three pins locked
+        // that composition (`dt_cert_grants_min1_under_on`,
+        // `dt_cert_grants_min1_under_on_and_lazy`,
+        // `dt_cert_min1_grant_independent_of_lazy_kill_switch`), and flipping
+        // this gate alone trips all three — re-measured 2026-09-17, 3 of 40
+        // failing against 40 of 40 on the unflipped base. The old comment named
+        // the remedy and it is now taken: the probe's scoped solve OPTS OUT of
+        // the lane (`dt_lazy_lane_suppressed_for_scoped_probe`, set around
+        // `dt_cert_resequence_probe`'s capped `route_to_solver`), which restores
+        // all three pins with the lane on here.
+        //
+        // What the flip buys (2026-09-17 DT gap-family measurement): this gate —
+        // NOT the selector-axiom size budget the census attributed the family to
+        // — is what withheld the Certora QF_UFDTLIA `65782_…_6` verdict. The
+        // lane decides it `sat` in ~3 s with the independent model gate
+        // reporting `confirmed-sat`, while the eager authority below is still
+        // `unknown` at 10x the time and 4x the memory budget. It also closes the
+        // `red_ground_dtlia` probe's documented ground DT+LIA gap to its
+        // z3-correct `unsat` in 0.26 s.
+        // See `solve_dt_auflia` / `try_solve_dt_auflia_lazy`.
+        //
+        // #dt-lazy-uninterpreted-datatype-result: with ONE exclusion, measured.
+        // The lane cannot build a publishable witness when the query applies an
+        // uninterpreted function at a datatype result sort, and default-on'ing
+        // it here without this exclusion WITHDREW two `sat` verdicts z3 and the
+        // base both answer. Held at the CALL SITE rather than inside the lane
+        // because it is a property of what this route's eager authority
+        // (`solve_with_dt_axioms` over `solve_uf_lia`) supplies that the lane
+        // does not — and because the array-enabled sibling `solve_dt_auflia`
+        // was already default-on before this branch and must keep its verdicts:
+        // declining inside the lane costs `s_arr_4` there, measured.
+        // See `dt_lazy_query_applies_uninterpreted_at_datatype_sort`.
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0")
+            && !self.dt_lazy_query_applies_uninterpreted_at_datatype_sort()
+        {
             if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
                 Self::solve_uf_lia,
                 DtLazyAcceptance::Definitive,
@@ -1740,33 +1936,58 @@ impl Executor {
         self.solve_with_dt_axioms(Some(Sort::Int), Self::solve_auflira)
     }
 
+    /// Keep this route-local scheduling switch scoped even when a lazy lane
+    /// returns an error or a caller catches an unwind and reuses the Executor.
+    /// No result, panic payload, model/proof state, or query budget changes.
+    fn with_dt_frontier_tester_diet<R>(&mut self, run: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.dt_frontier_tester_diet_armed;
+        self.dt_frontier_tester_diet_armed = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self)));
+        self.dt_frontier_tester_diet_armed = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Solve combined DT + BV (#1766). DT axioms only (no acyclicity) → UFBV.
     pub(in crate::executor) fn solve_dt_ufbv(&mut self) -> Result<SolveResult> {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
-        // Sparse on-demand DT axiom lane, UNSAT-only (#dt-lazy-dtax-route).
-        // The eager authority below materialises a selector frontier that
-        // branches by the datatype's recursive fan-out to `DT_WARM_START_DEPTH`
-        // and deepens to 64; on the Barrett `rec-fun-ijcar2016` ForElimination
-        // members that is 3.2 GB in 2.3 s and 6.6 GB by the deadline, with no
-        // verdict, on files z3 refutes in 0.02 s. The lane replaces the flood
-        // with the depth-1 syntactic slice plus occurrence-driven sparse
-        // relevance axioms — every one a datatype tautology, so its UNSAT is a
-        // refutation of the original problem. A lane `Sat` is demoted to a lane
-        // MISS (`DtLazyAcceptance::UnsatOnly`) because this route's post-`Sat`
-        // datatype passes live in `solve_with_dt_axioms`; the eager authority
-        // stays terminal for every non-UNSAT outcome. Kill switch and gating
-        // are the lane's own (`AY_DT_LAZY_AUFLIA`).
-        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
-            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
-                Self::solve_ufbv,
-                DtLazyAcceptance::UnsatOnly,
-            )? {
-                return Ok(result);
+        self.with_dt_frontier_tester_diet(|exec| {
+            // Sparse on-demand DT axiom lane (#dt-lazy-dtax-route,
+            // #dt-lazy-bv-confirmed-sat). The eager authority below materialises
+            // a selector frontier that branches by the datatype's recursive
+            // fan-out to `DT_WARM_START_DEPTH` and deepens to 64; on the Barrett
+            // `rec-fun-ijcar2016` ForElimination members that is 3.2 GB in 2.3 s
+            // and 6.6 GB by the deadline, with no verdict, on files z3 refutes
+            // in 0.02 s. The lane replaces the flood with the depth-1 syntactic
+            // slice plus occurrence-driven sparse relevance axioms — every one
+            // a datatype tautology, so its UNSAT is a refutation of the original
+            // problem. A lane `Sat` publishes only when the lane itself runs
+            // this route's post-`Sat` datatype passes (independent-gate
+            // confirmation + clean D0 model-e-graph recheck,
+            // `DtLazyAcceptance::SatWhenConfirmed`); on the UF-at-datatype-sort
+            // shape — whose lane witness the publish funnel cannot read
+            // (#dt-lazy-uninterpreted-datatype-result) — the lane stays
+            // UNSAT-only. Every other outcome is a lane miss and the eager
+            // authority stays terminal. Kill switch and gating are the lane's
+            // own (`AY_DT_LAZY_AUFLIA`).
+            if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+                let acceptance = if exec.dt_lazy_query_applies_uninterpreted_at_datatype_sort() {
+                    DtLazyAcceptance::UnsatOnly
+                } else {
+                    DtLazyAcceptance::SatWhenConfirmed
+                };
+                if let Some(result) =
+                    exec.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_ufbv, acceptance)?
+                {
+                    return Ok(result);
+                }
             }
-        }
-        self.solve_with_dt_axioms(None, Self::solve_ufbv)
+            exec.solve_with_dt_axioms(None, Self::solve_ufbv)
+        })
     }
 
     /// Solve combined DT + Arrays + BV (#1766). DT axioms only → AUFBV.
@@ -1774,28 +1995,39 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
-        // Sparse on-demand DT axiom lane, UNSAT-only (#dt-lazy-dtax-route).
-        // The eager authority below materialises a selector frontier that
-        // branches by the datatype's recursive fan-out to `DT_WARM_START_DEPTH`
-        // and deepens to 64; on the Barrett `rec-fun-ijcar2016` ForElimination
-        // members that is 3.2 GB in 2.3 s and 6.6 GB by the deadline, with no
-        // verdict, on files z3 refutes in 0.02 s. The lane replaces the flood
-        // with the depth-1 syntactic slice plus occurrence-driven sparse
-        // relevance axioms — every one a datatype tautology, so its UNSAT is a
-        // refutation of the original problem. A lane `Sat` is demoted to a lane
-        // MISS (`DtLazyAcceptance::UnsatOnly`) because this route's post-`Sat`
-        // datatype passes live in `solve_with_dt_axioms`; the eager authority
-        // stays terminal for every non-UNSAT outcome. Kill switch and gating
-        // are the lane's own (`AY_DT_LAZY_AUFLIA`).
-        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
-            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
-                Self::solve_aufbv,
-                DtLazyAcceptance::UnsatOnly,
-            )? {
-                return Ok(result);
+        self.with_dt_frontier_tester_diet(|exec| {
+            // Sparse on-demand DT axiom lane (#dt-lazy-dtax-route,
+            // #dt-lazy-bv-confirmed-sat). The eager authority below materialises
+            // a selector frontier that branches by the datatype's recursive
+            // fan-out to `DT_WARM_START_DEPTH` and deepens to 64; on the Barrett
+            // `rec-fun-ijcar2016` ForElimination members that is 3.2 GB in 2.3 s
+            // and 6.6 GB by the deadline, with no verdict, on files z3 refutes
+            // in 0.02 s. The lane replaces the flood with the depth-1 syntactic
+            // slice plus occurrence-driven sparse relevance axioms — every one
+            // a datatype tautology, so its UNSAT is a refutation of the original
+            // problem. A lane `Sat` publishes only when the lane itself runs
+            // this route's post-`Sat` datatype passes (independent-gate
+            // confirmation + clean D0 model-e-graph recheck,
+            // `DtLazyAcceptance::SatWhenConfirmed`); on the UF-at-datatype-sort
+            // shape — whose lane witness the publish funnel cannot read
+            // (#dt-lazy-uninterpreted-datatype-result) — the lane stays
+            // UNSAT-only. Every other outcome is a lane miss and the eager
+            // authority stays terminal. Kill switch and gating are the lane's
+            // own (`AY_DT_LAZY_AUFLIA`).
+            if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+                let acceptance = if exec.dt_lazy_query_applies_uninterpreted_at_datatype_sort() {
+                    DtLazyAcceptance::UnsatOnly
+                } else {
+                    DtLazyAcceptance::SatWhenConfirmed
+                };
+                if let Some(result) =
+                    exec.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_aufbv, acceptance)?
+                {
+                    return Ok(result);
+                }
             }
-        }
-        self.solve_with_dt_axioms(None, Self::solve_aufbv)
+            exec.solve_with_dt_axioms(None, Self::solve_aufbv)
+        })
     }
 
     /// Solve combined DT + Arrays (#1766). DT axioms only → Array+EUF.
@@ -1810,6 +2042,14 @@ impl Executor {
         // callbacks. Strictly gated: any construct outside the fragment — and
         // any SAT model the always-on gates reject — falls through here.
         if let Some(result) = self.try_solve_enum_finite_domain()? {
+            return Ok(result);
+        }
+        // Finite-domain datatype lane (E13, `dt_finite`): list-shaped
+        // QF_DT (blocksworld BMC) as one content-named CNF. Its UNSAT is
+        // D-independent (Theorem 1 there) and published in `--z3-mode` only;
+        // its SAT passes the lane's own evaluator, the validation pipeline
+        // and the independent gate. Declines fall through unchanged.
+        if let Some(result) = self.try_solve_dt_finite_domain()? {
             return Ok(result);
         }
         // Lazy DT lane (DESIGN_lazy_dt.md stages D1+D2, routing per R1):
@@ -2043,20 +2283,23 @@ impl Executor {
         // R1 time split: the lazy attempt gets HALF the remaining budget so
         // a lane miss can at worst halve — never consume — the eager lane's
         // time. No wall deadline (library/CLI use without timeout): the lane
-        // runs to verdict; the kill switch remains available.
-        let saved_deadline = self.solve_deadline.get();
-        if let Some(deadline) = saved_deadline {
-            let now = ay_core::time::Instant::now();
-            if deadline <= now {
+        // runs to verdict; the kill switch remains available. The half is a
+        // deadline share (GT6, GuardTree step S3): the executor's deadline is
+        // never written, and the share counts itself. Without a share the
+        // deadline found here is put back after the attempt.
+        let found_deadline = self.solve_deadline.get();
+        let mut share = None;
+        if let Some(deadline) = found_deadline {
+            if deadline <= ay_core::time::Instant::now() {
                 self.dt_lazy_discard_attempt(entry_state, "dt-lazy");
                 return Ok(None);
             }
-            self.solve_deadline.set(Some(now + (deadline - now) / 2));
+            share = self.open_deadline_share(ShareOf::Search);
         }
         self.dt_lazy_splits = Some((dt_registry, bases));
         let result = self.solve_array_euf();
         self.dt_lazy_splits = None;
-        self.solve_deadline.set(saved_deadline);
+        self.end_sliced_attempt(share, found_deadline);
         self.ctx.assertions = base_assertions_exact;
 
         if ay_core::misc_cli_flags().phase_trace {
@@ -2106,6 +2349,32 @@ impl Executor {
         }
     }
 
+    /// The eager BV authority's post-`Sat` datatype passes, run by the
+    /// sparse lane itself for `DtLazyAcceptance::SatWhenConfirmed`
+    /// (#dt-lazy-bv-confirmed-sat): the independent fail-closed gate
+    /// confirms the decoded model against the authored assertions AND
+    /// the D0 model-e-graph recheck finds no constructor clash/cycle in
+    /// the model's true datatype equalities. A recheck that injects
+    /// lemmas (or is inconclusive) is NOT clean — the caller demotes to
+    /// a lane miss and the rollback discards the injected clauses, so
+    /// the eager authority re-derives them in its own recheck loop.
+    fn dt_lazy_sat_confirmed_for_bv(&mut self) -> bool {
+        if !matches!(
+            self.confirm_sat_with_independent_gate(),
+            ay_model_check::GateVerdict::ConfirmedSat
+        ) {
+            return false;
+        }
+        let mut pass = ay_dt::DtEgraphPass::new();
+        for (dt_name, ctors) in self.ctx.datatype_iter() {
+            pass.register_datatype(dt_name, ctors);
+        }
+        matches!(
+            self.dt_model_egraph_recheck(&mut pass),
+            DtModelRecheck::Clean
+        )
+    }
+
     /// Whether the lazy lane's stored `Sat` model would print WITHOUT a
     /// definition for some user-declared datatype-sorted constant — i.e. the
     /// single-source assignment has no value for its class AND the class is
@@ -2133,6 +2402,90 @@ impl Executor {
             {
                 return true;
             }
+        }
+        false
+    }
+
+    /// #dt-lazy-uninterpreted-datatype-result: whether the query APPLIES an
+    /// uninterpreted function at a DATATYPE result sort — `(declare-fun g (Int)
+    /// Lst)` used as `(g n)`.
+    ///
+    /// This is the one shape on which a lane `Sat` is not publishable, and it is
+    /// the shape that made the lane WITHDRAW two `sat` verdicts z3 and the base
+    /// both answer, when it was default-on'd at `solve_dt_uf_lia`:
+    ///
+    /// ```smt2
+    /// (declare-fun g (Int) Lst)
+    /// (assert (not (is-nil (g n))))   (assert (is-cons (g n)))
+    /// ```
+    ///
+    /// `(g n)` is datatype-sorted and nothing determines its value from its
+    /// argument. The eager authority commits one through the post-`Sat`
+    /// total-datatype-model construction (`Model::dt_ground`) that the lane does
+    /// NOT run; the lane's witness carries the value only in the DT e-graph
+    /// assignment, which does not survive model finalization. Measured on
+    /// `s_dexh_1`: `confirm_sat_with_independent_gate` answers `confirmed-sat`
+    /// at the lane's own exit and the publish funnel answers `cannot-confirm`
+    /// ("model commits no value for this application of `g` … datatype dispatch
+    /// also declined") over the finalized model, so `Sat` fails closed — while
+    /// the eager authority the lane pre-empted decides the same window
+    /// `sat`/`confirmed-sat` in milliseconds.
+    ///
+    /// Read at the `solve_dt_uf_lia` CALL SITE, to stand the whole lane down
+    /// before any entry snapshot exists — not as an in-lane `Ok(None)` and not
+    /// as the narrower `DtLazyAcceptance::UnsatOnly` that `solve_dt_ax`,
+    /// `solve_dt_ufbv` and `solve_dt_aufbv` take for their own missing post-`Sat`
+    /// datatype passes. Both alternatives were tried and both are refuted,
+    /// measured:
+    ///
+    /// * `UnsatOnly` demotes the lane `Sat` to a lane MISS, but a miss under
+    ///   PROOF PRODUCTION cannot roll the term store back —
+    ///   `rollback_on_fallback`'s measured AUFLIA proof-production guard retains
+    ///   the speculative ledger and its terms — so the eager authority inherits
+    ///   a store it did not build. On `s_dexh_1` it then materializes 13
+    ///   datatype axioms in ONE deepening round and answers with a model the
+    ///   gate still cannot confirm, where the same authority on a rolled-back
+    ///   store materializes 25, takes two, and answers `sat`/`confirmed-sat`.
+    ///   The `--z3-mode` arm, which produces no proof and therefore DOES roll
+    ///   back, recovered the verdict; the product posture did not;
+    /// * declining inside the lane fixes both postures but also reaches the
+    ///   array-enabled sibling `solve_dt_auflia`, which was default-on BEFORE
+    ///   this branch and whose verdicts must not move: it costs `s_arr_4`
+    ///   (`sat`/`confirmed-sat` on base and on the lane, `unknown` with the
+    ///   in-lane decline).
+    ///
+    /// Cost, measured: this route gives up every verdict the lane would have
+    /// reached on such a query, including QF_UFDTLIA `65782_…_6`, whose lane
+    /// `Sat` the funnel DOES confirm. The criterion is syntactic because the
+    /// model-side ones are not predictive: the DT e-graph HAS a value for
+    /// `(g n)` here (so a "model leaves the application unvalued" test does not
+    /// fire) and LACKS one on `65782_…_6` (so it fires on the file that is fine)
+    /// — measured both ways, 2026-09-18.
+    fn dt_lazy_query_applies_uninterpreted_at_datatype_sort(&self) -> bool {
+        for raw in 0..self.ctx.terms.len() {
+            let term = TermId(raw as u32);
+            let head = match self.ctx.terms.get(term) {
+                TermData::App(Symbol::Named(name), args) if !args.is_empty() => name.to_string(),
+                _ => continue,
+            };
+            // Testers are Bool-sorted and drop out here; a datatype-sorted
+            // selector application is excluded by name below, because its value
+            // IS determined by its argument.
+            let sort = self.ctx.terms.sort(term).clone();
+            if self.datatype_sort_name(&sort).is_none() {
+                continue;
+            }
+            if self.ctx.constructor_selectors(&head).is_some()
+                || self.ctx.is_constructor(&head).is_some()
+                || self.is_exact_dt_internal_symbol(&head)
+                || self
+                    .ctx
+                    .ctor_selectors_iter()
+                    .any(|(_, selectors)| selectors.iter().any(|s| *s == head))
+            {
+                continue;
+            }
+            return true;
         }
         false
     }
@@ -2360,6 +2713,10 @@ impl Executor {
         Some((dt_registry, bases))
     }
 }
+
+#[cfg(test)]
+#[path = "dt/deepening_repeat_tests.rs"]
+mod deepening_repeat_tests;
 
 #[cfg(test)]
 mod rollback_artifact_tests {
@@ -2944,3 +3301,6 @@ mod dt_axiom_attribution_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod frontier_scope_tests;

@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+f 4;
+pol 1 1 * 2 1 * + 3 1 * + 4 1 * +;
+e >= 1 : 5;
+pol x1;
+pol ~x1;
+pol x2;
+pol ~x2;
+pol x3;
+pol ~x3;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

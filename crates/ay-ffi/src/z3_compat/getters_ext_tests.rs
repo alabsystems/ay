@@ -254,6 +254,96 @@ fn func_decl_id_stable_and_distinct() {
     }
 }
 
+/// `(as-array f)` and lambda-array terms ARE built by AY (`Z3_mk_as_array`,
+/// `Z3_mk_lambda_const`): the classifiers must recognize them, and
+/// `Z3_get_as_array_func_decl` must hand back `f`'s declaration.
+#[test]
+fn as_array_and_lambda_classifiers_recognize_real_terms() {
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let dom = [int];
+        let f = Z3_mk_func_decl(
+            c,
+            Z3_mk_string_symbol(c, c"f".as_ptr()),
+            1,
+            dom.as_ptr(),
+            int,
+        );
+        let arr = Z3_mk_as_array(c, f);
+        assert_ne!(arr, 0);
+        assert!(Z3_is_as_array(c, arr));
+        assert!(!Z3_is_lambda(c, arr));
+        let back = Z3_get_as_array_func_decl(c, arr);
+        assert!(!back.is_null());
+        let name = std::ffi::CStr::from_ptr(Z3_get_symbol_string(c, Z3_get_decl_name(c, back)))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, "f");
+        assert_eq!(Z3_get_arity(c, back), 1);
+
+        let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"x".as_ptr()), int);
+        let bound = [x];
+        let lam = Z3_mk_lambda_const(c, 1, bound.as_ptr(), x);
+        assert_ne!(lam, 0);
+        assert!(Z3_is_lambda(c, lam));
+        assert!(!Z3_is_as_array(c, lam));
+
+        Z3_del_context(c);
+    }
+}
+
+static ERROR_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ERROR_HANDLER_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+unsafe extern "C" fn counting_error_handler(c: Z3_context, code: std::ffi::c_uint) {
+    ERROR_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ERROR_HANDLER_LAST.store(code, std::sync::atomic::Ordering::SeqCst);
+    // The handler may query the error state reentrantly (libz3 allows it);
+    // those accessor calls must not re-invoke the handler.
+    // SAFETY: `c` is the live context the guard passed through.
+    let _ = unsafe { Z3_get_error_code(c) };
+    // SAFETY: same live context.
+    let _ = unsafe { Z3_get_error_msg(c, code) };
+}
+
+/// A registered error handler fires once per API call that leaves a
+/// non-OK error state (libz3 behavior), and clearing it stops the calls.
+#[test]
+fn error_handler_fires_once_per_failed_call() {
+    use std::sync::atomic::Ordering::SeqCst;
+    ERROR_HANDLER_CALLS.store(0, SeqCst);
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"x".as_ptr()), int);
+        Z3_set_error_handler(c, Some(counting_error_handler));
+
+        // A succeeding call does not fire it.
+        let _ = Z3_mk_int(c, 1, int);
+        assert_eq!(ERROR_HANDLER_CALLS.load(SeqCst), 0);
+
+        // A failing call fires exactly once with the Z3 error code, and the
+        // error state remains readable afterwards.
+        assert!(Z3_get_as_array_func_decl(c, x).is_null());
+        assert_eq!(ERROR_HANDLER_CALLS.load(SeqCst), 1);
+        assert_eq!(ERROR_HANDLER_LAST.load(SeqCst), Z3_INVALID_ARG);
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+        assert_eq!(
+            ERROR_HANDLER_CALLS.load(SeqCst),
+            1,
+            "accessors do not re-fire"
+        );
+
+        // Clearing the handler stops further calls.
+        Z3_set_error_handler(c, None);
+        assert!(Z3_get_as_array_func_decl(c, x).is_null());
+        assert_eq!(ERROR_HANDLER_CALLS.load(SeqCst), 1);
+
+        Z3_del_context(c);
+    }
+}
+
 #[test]
 fn divergence_sentinels_never_fabricate() {
     unsafe {
@@ -261,7 +351,7 @@ fn divergence_sentinels_never_fabricate() {
         let int = Z3_mk_int_sort(c);
         let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"x".as_ptr()), int);
 
-        // No algebraic numbers / as-array nodes / lambdas in AY.
+        // A free constant is none of algebraic / as-array / lambda.
         assert!(!Z3_is_algebraic_number(c, x));
         assert!(!Z3_is_as_array(c, x));
         assert!(!Z3_is_lambda(c, x));
@@ -274,6 +364,60 @@ fn divergence_sentinels_never_fabricate() {
         // Well-sortedness: any live term is well-sorted by construction.
         assert!(Z3_is_well_sorted(c, x));
 
+        Z3_del_context(c);
+    }
+}
+
+/// `Z3_is_algebraic_number` is true exactly for genuine irrational
+/// algebraic values (measured libz3 5.1.0): √2 yes; plain rationals
+/// and rational-valued roots (√4, (√2)²) no.
+#[test]
+fn is_algebraic_number_recognizes_irrationals() {
+    unsafe {
+        let c = ctx();
+        let real = Z3_mk_real_sort(c);
+        let two = Z3_mk_numeral(c, c"2".as_ptr(), real);
+        let sqrt2 = Z3_algebraic_root(c, two, 2);
+        assert_ne!(sqrt2, 0);
+        assert!(Z3_is_algebraic_number(c, sqrt2));
+        assert!(!Z3_is_algebraic_number(c, two));
+        let sq = Z3_algebraic_power(c, sqrt2, 2);
+        assert!(
+            !Z3_is_algebraic_number(c, sq),
+            "(sqrt2)^2 folds to a numeral"
+        );
+        let root4 = Z3_algebraic_root(c, Z3_mk_numeral(c, c"4".as_ptr(), real), 2);
+        assert!(!Z3_is_algebraic_number(c, root4), "sqrt(4) is rational");
+        Z3_del_context(c);
+    }
+}
+
+/// An `(as-array f)` declaration carries one parameter of kind
+/// `Z3_PARAMETER_FUNC_DECL` naming `f` (measured libz3 5.1.0); AY
+/// computes it from the decl's `as-array[f]` name on query.
+#[test]
+fn as_array_decl_carries_func_decl_parameter() {
+    unsafe {
+        let c = ctx();
+        let int = Z3_mk_int_sort(c);
+        let f = Z3_mk_func_decl(
+            c,
+            Z3_mk_string_symbol(c, c"f".as_ptr()),
+            1,
+            [int].as_ptr(),
+            int,
+        );
+        assert!(!f.is_null());
+        assert_eq!(Z3_get_decl_num_parameters(c, f), 0);
+        let aa = Z3_mk_as_array(c, f);
+        assert_ne!(aa, 0);
+        let d = Z3_get_app_decl(c, aa);
+        assert!(!d.is_null());
+        assert_eq!(Z3_get_decl_num_parameters(c, d), 1);
+        assert_eq!(Z3_get_decl_parameter_kind(c, d, 0), Z3_PARAMETER_FUNC_DECL);
+        assert_eq!(Z3_get_decl_func_decl_parameter(c, d, 0), f);
+        assert!(Z3_get_decl_func_decl_parameter(c, d, 1).is_null());
+        assert!(Z3_get_decl_func_decl_parameter(c, f, 0).is_null());
         Z3_del_context(c);
     }
 }

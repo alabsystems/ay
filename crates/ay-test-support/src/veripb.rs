@@ -73,27 +73,133 @@ const NO_CONCLUSION: &str = "NO CONCLUSION";
 /// no checker installed (which is how the fail-loudly behaviour is tested).
 pub const SEARCH_PATH_ENV: &str = "AY_VERIPB_SEARCH_PATH";
 
-/// Known local build locations, tried after `$PATH`.
+/// Relative path, under the shared cache root, of the PRE-PIN cache layout: a
+/// bare clone directory whose name carries NO checker identity.
+///
+/// It is named here only so it can be RECOGNISED and reported — never resolved.
+/// See [`known_build_locations`].
+pub const PRE_PIN_CACHE_REL: &str = "VeriPB/target/release/veripb";
+
+/// The shared checker cache root (`$XDG_CACHE_HOME`, else `$HOME/.cache`), if
+/// this environment names one.
+fn cache_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|cache| cache.join("ay-veripb"))
+}
+
+/// The pre-pin cache path, when a binary is actually sitting at it.
+///
+/// Resolution IGNORES it (see [`known_build_locations`]); [`ResolveError`]
+/// names it so "no checker found" cannot be mistaken for "no checker built"
+/// when an unpinnable one is present.
+fn stale_pre_pin_build() -> Option<PathBuf> {
+    let candidate = cache_root()?.join(PRE_PIN_CACHE_REL);
+    candidate.is_file().then_some(candidate)
+}
+
+/// The NEUTRAL default candidate. `publish/DECISIONS.md` (2026-07-18 scrub log)
+/// kept it deliberately when the maintainer's personal path was dropped: it is
+/// machine-independent, so it can survive into a public snapshot.
+///
+/// Neutrality is not identity. Nothing in this repo builds it, no script writes
+/// it, and its name records no commit and no patch — a binary there could be any
+/// checker at all. It is kept (the publishing decision stands) but it is now
+/// RANKED BELOW the identity-bearing pinned builds, and, like every other
+/// identity-free source, it only becomes evidence by passing [`soundness_gate`].
+pub const NEUTRAL_DEFAULT: &str = "/tmp/veripb-3/bin/veripb";
+
+/// Placeholder occupying the `$PATH` slot in the searched list when `$PATH`
+/// holds no `veripb`. `is_file()` is false for it, so it is never resolved; it
+/// exists so the "searched, in order:" message keeps naming that slot IN ITS
+/// REAL POSITION — which is the only reason a reader can tell the order changed.
+const PATH_SLOT: &str = "$PATH/veripb";
+
+/// The search order below the environment overrides, as a pure function of the
+/// three environment facts it depends on, so the RANKING is testable without
+/// `set_var` (process-global and racy under a threaded runner). The injection
+/// idiom accepts an explicit environment reader so tests do not mutate process state.
+/// Production AY uses its integrated checker; this resolver is for independent
+/// reference checks and developer tools.
+fn search_order(
+    cache: Option<&Path>,
+    path_hit: Option<PathBuf>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(cache) = cache {
+        candidates.extend(pinned_cache_candidates(cache));
+    }
+    candidates.push(path_hit.unwrap_or_else(|| PathBuf::from(PATH_SLOT)));
+    candidates.push(PathBuf::from(NEUTRAL_DEFAULT));
+    if let Some(home) = home {
+        candidates.push(home.join(".cargo/bin/veripb"));
+    }
+    candidates
+}
+
+/// Known local build locations, in RANK ORDER, tried after the environment
+/// overrides.
+///
+/// THE RANKING (changed 2026-09-22, the totality half of the identity fix):
+///
+/// ```text
+///   1. <cache>/<pinned-id>[-rustc<fp>]/target/release/veripb   identity-bearing
+///   2. $PATH/veripb                                            ambient
+///   3. /tmp/veripb-3/bin/veripb                                neutral default
+///   4. $HOME/.cargo/bin/veripb                                 ambient
+/// ```
+///
+/// Rows 2-4 carry NO identity, and rows 2 and 3 used to outrank row 1 — `$PATH`
+/// because [`locate`] scanned it before consulting this list at all, and
+/// `/tmp/veripb-3` because it was the first element here. So on a machine with
+/// both, an unidentifiable checker beat the pinned build that the repo's own
+/// scripts had built. Removing the LAST-ranked identity-free candidate while
+/// leaving the FIRST-ranked ones is not a fix; this is the rest of it.
+///
+/// Rank is now: explicitly named (the [`CHECKER_ENV_VARS`] overrides, handled in
+/// [`locate`]) > pinned identity > ambient. Nothing here is trusted on its rank:
+/// whichever candidate wins still has to pass [`self_test`] AND
+/// [`soundness_gate`] in [`vet`] before any suite sees it.
+///
+/// EVERY cache path offered here carries the checker's IDENTITY in its
+/// directory name — the pinned upstream commit plus the reviewed patch's
+/// sha-256 prefix ([`pinned_build_id`]), keyed or legacy-unkeyed
+/// ([`is_pinned_cache_dir`]). That is the whole contract with the builders
+/// (`scripts/cert_ci.sh`, `scripts/ci/pb_certified_gate.sh`), which clone the
+/// pinned commit, apply the pinned patch, and build at exactly such a path.
+///
+/// WHAT WAS REMOVED, AND WHY IT WAS NOT COMPATIBILITY. This list used to end
+/// with `<cache>/VeriPB/target/release/veripb`, described as "the original
+/// pre-pin cache layout populated by an early `scripts/cert_ci.sh`". That
+/// description is the argument against it: the early script `git clone
+/// --depth 1`d the upstream DEFAULT BRANCH and built whatever it got, so a
+/// binary at that path is by construction UNPINNED and UNPATCHED — precisely
+/// the checker the pin exists to exclude. Nothing writes that path any more,
+/// its name records no commit and no patch, so no amount of it being "first
+/// come" makes it identifiable.
+///
+/// MEASURED 2026-09-22 on this workstation: with the pinned patch re-cut (pin
+/// sha `11d772ad…`) no keyed directory matched any more, resolution fell
+/// through to that path, and the clean upstream checkout sitting there —
+/// `git rev-parse HEAD` == the pinned commit, tree CLEAN, i.e. the patch never
+/// applied — was handed to every checker-backed suite in the workspace. It
+/// reports the pinned version, so `pin::check_version` passed it; it then
+/// ACCEPTED all 22 committed wrong-verdict fixtures. Every "and VeriPB said
+/// VERIFIED" in the workspace was, that day, a statement about a checker with
+/// 21 known wrong-verdict defects.
+///
+/// A stale build there is therefore not resolved, and not silently skipped
+/// either: [`ResolveError::NotFound`] names it as IGNORED, with the pinned
+/// build id to rebuild at.
 fn known_build_locations() -> Vec<PathBuf> {
     if let Some(raw) = std::env::var_os(SEARCH_PATH_ENV) {
         return std::env::split_paths(&raw).collect();
     }
-    let mut candidates = vec![PathBuf::from("/tmp/veripb-3/bin/veripb")];
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    if let Some(cache) = cache {
-        let cache = cache.join("ay-veripb");
-        candidates.extend(pinned_cache_candidates(&cache));
-        // Compatibility with the original pre-pin cache layout populated by an
-        // early scripts/cert_ci.sh. The pinned paths above come first: their
-        // directory identity covers the upstream commit and the reviewed patch.
-        candidates.push(cache.join("VeriPB/target/release/veripb"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".cargo/bin/veripb"));
-    }
-    candidates
+    let cache = cache_root();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    search_order(cache.as_deref(), path_lookup(), home.as_deref())
 }
 
 /// Cache-key contract shared with `scripts/lib/veripb_build_id.sh` (the ONE
@@ -162,6 +268,15 @@ fn pinned_cache_candidates(cache: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+// `pinned_cache_checker()` lived here from 7b961aad9 until this commit: a
+// public "first existing identity-bearing cache build" for the suites that roll
+// their own probe. It was right about the CACHE and wrong about the shape of
+// the problem — it hands back a path with nothing asked of the binary, and its
+// three callers each still consulted `$VERIPB_BIN` and `$PATH` first, ungated,
+// before ever reaching it. Those callers now use `optional_checker`, which goes
+// through the one resolver and its two batteries, so an accessor that returns
+// an UNVETTED checker path has no caller and no business being public.
+
 fn path_lookup() -> Option<PathBuf> {
     let executable = format!("veripb{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
@@ -177,9 +292,22 @@ pub enum ResolveError {
     /// An environment override was set but does not name an existing file.
     BadOverride { var: &'static str, value: PathBuf },
     /// Nothing was found in any searched location.
-    NotFound { searched: Vec<String> },
+    NotFound {
+        searched: Vec<String>,
+        /// [`pinned_build_id`] — the cache directory name a build must land at
+        /// for this resolver to accept it.
+        pinned_id: String,
+        /// A binary sitting at the identity-free PRE-PIN cache path, if one is
+        /// there. It is NOT a candidate; it is reported so that "no checker
+        /// found" on a machine that visibly has a `veripb` binary is explained
+        /// rather than merely asserted.
+        ignored_pre_pin: Option<PathBuf>,
+    },
     /// A binary was found but does not behave like a VeriPB checker.
     SelfTestFailed { checker: PathBuf, detail: String },
+    /// A binary was found, behaves like a checker, and gives WRONG VERDICTS on
+    /// the committed fixtures. The worst case there is: it looks like evidence.
+    Unsound { checker: PathBuf, detail: String },
 }
 
 impl fmt::Display for ResolveError {
@@ -191,28 +319,77 @@ impl fmt::Display for ResolveError {
                  Unset it or point it at a VeriPB checker binary.",
                 value.display()
             ),
-            Self::NotFound { searched } => write!(
-                formatter,
-                "no VeriPB checker found. Searched, in order: {}. \
-                 Install VeriPB, put `veripb` on PATH, or set VERIPB_BIN.",
-                searched.join(", ")
-            ),
+            Self::NotFound {
+                searched,
+                pinned_id,
+                ignored_pre_pin,
+            } => {
+                write!(
+                    formatter,
+                    "no VeriPB checker found. Searched, in order: {}. \
+                     Build the pinned checker (`scripts/cert_ci.sh` or \
+                     `scripts/ci/pb_certified_gate.sh`, which clone {}, apply {} and \
+                     build into a cache directory named `{pinned_id}[-rustc<fingerprint>]`), \
+                     or set VERIPB_BIN.",
+                    searched.join(", "),
+                    pin::commit(),
+                    pin::patch(),
+                )?;
+                if let Some(stale) = ignored_pre_pin {
+                    write!(
+                        formatter,
+                        "\nIGNORED: `{}` exists but is the PRE-PIN cache layout — its name \
+                         records no commit and no patch, and the early script that wrote it \
+                         built the upstream default branch UNPATCHED. A verdict from it is \
+                         not evidence (published 3.0.2 accepts all 22 committed \
+                         wrong-verdict fixtures), so it is not resolved. Rebuild at the \
+                         pinned path instead of pointing VERIPB_BIN at it.",
+                        stale.display()
+                    )?;
+                }
+                Ok(())
+            }
             Self::SelfTestFailed { checker, detail } => write!(
                 formatter,
                 "`{}` was resolved as the VeriPB checker but failed its self-test \
                  (a real checker must verify a known-good proof and reject a known-bad one): {detail}",
                 checker.display()
             ),
+            Self::Unsound { checker, detail } => write!(
+                formatter,
+                "`{}` was resolved as the VeriPB checker, behaves like one, and is NOT a \
+                 SOUND one: {detail}\n\
+                 A verdict from it is not evidence of anything. This is the gate the \
+                 version string cannot be: published VeriPB 3.0.2 reports the pinned \
+                 `{}` and still contradicts the truth on these fixtures. Build the pinned \
+                 checker (`scripts/cert_ci.sh` or `scripts/ci/pb_certified_gate.sh`: clone \
+                 {}, apply {}) instead of pointing this resolver at an unpatched one.",
+                checker.display(),
+                pin::version(),
+                pin::commit(),
+                pin::patch(),
+            ),
         }
     }
 }
 
-/// Locate a checker without running the self-test.
+/// Locate a checker without vetting it.
 ///
-/// Order: `VERIPB_BIN`, `AY_PB26_VERIPB_BIN`, `VERIPB`, then `$PATH`, then the
-/// known local build locations. An environment override that does not name an
-/// existing file is an ERROR, not a reason to fall through — a typo in
-/// `VERIPB_BIN` must never silently degrade to "checker absent".
+/// Order: `VERIPB_BIN`, `AY_PB26_VERIPB_BIN`, `VERIPB`, then
+/// [`known_build_locations`] — whose first entries are the identity-bearing
+/// pinned cache builds, and which now owns the `$PATH` slot too (this function
+/// used to scan `$PATH` before consulting that list at all, so an ambient
+/// checker outranked the pinned one, and [`SEARCH_PATH_ENV`] could not in fact
+/// "model a machine with no checker installed" on a box that had one on
+/// `$PATH`, though its doc says that is what it is for).
+///
+/// An environment override that does not name an existing file is an ERROR, not
+/// a reason to fall through — a typo in `VERIPB_BIN` must never silently
+/// degrade to "checker absent".
+///
+/// NOTHING here establishes that the binary found is a checker, let alone a
+/// SOUND one. That is [`vet`]'s job, and every caller outside this module goes
+/// through it.
 pub fn locate() -> Result<PathBuf, ResolveError> {
     let mut searched = Vec::new();
     for var in CHECKER_ENV_VARS {
@@ -231,17 +408,17 @@ pub fn locate() -> Result<PathBuf, ResolveError> {
         }
         searched.push(format!("${var}"));
     }
-    searched.push(String::from("$PATH/veripb"));
-    if let Some(found) = path_lookup() {
-        return Ok(found);
-    }
     for candidate in known_build_locations() {
         searched.push(candidate.display().to_string());
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    Err(ResolveError::NotFound { searched })
+    Err(ResolveError::NotFound {
+        searched,
+        pinned_id: pinned_build_id(),
+        ignored_pre_pin: stale_pre_pin_build(),
+    })
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -722,15 +899,106 @@ pub fn self_test(checker: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The BEHAVIOURAL half of the pin: every committed wrong-verdict fixture, run
+/// against `checker`, all of which it must REFUSE.
+///
+/// # Why resolution and not just one gate test
+///
+/// [`self_test`] proves the binary is a checker. It does NOT prove it is a
+/// CORRECT one, and that is not a gap in the probes — it is the measured fact
+/// this module exists around: published VeriPB 3.0.2 passes all six self-test
+/// probes, reports the pinned version string, and answers `s VERIFIED
+/// UNSATISFIABLE` for satisfiable formulas. On 2026-09-22 exactly that binary
+/// became the checker behind every "and VeriPB said VERIFIED" in this
+/// workspace.
+///
+/// Identity closed that hole for ONE source — the cache — by refusing paths
+/// whose directory name records no commit and no patch. But a directory name is
+/// a convention, not a proof, and it is not even available for the other
+/// sources: `$VERIPB_BIN`, `$PATH/veripb`, [`NEUTRAL_DEFAULT`] and
+/// `~/.cargo/bin/veripb` are all identity-free by construction. So every
+/// resolved checker, FROM ANY SOURCE, is put to the behavioural gate instead.
+///
+/// This is not a new policy: `scripts/cert_ci.sh` has always run
+/// `veripb_require_self_test` AND `veripb_require_soundness` over whatever
+/// `$VERIPB` it resolved, from any source, over these same fixtures and this
+/// same manifest. The Rust resolver was the one out of line.
+///
+/// MEASURED COST, 2026-09-22 on this workstation with the pinned build: twenty-
+/// two extra checker spawns, ONCE PER PROCESS behind [`resolve_once`]'s
+/// `OnceLock`, alongside the six self-test probes resolution already ran. On
+/// `ay-pb --test veripb_pin_gate`, 0.07 s before and 0.12 s after on an
+/// otherwise idle box (+0.05 s; that target already ran the same twenty-two in
+/// its own test, so it goes from 28 spawns to 50). Two runs taken while several
+/// other builds shared the machine read 0.21 s and 0.26 s — the spread is load,
+/// not the battery.
+///
+/// # Errors
+/// A report naming every fixture the checker accepted, what it answered, what is
+/// actually true, and what an unfixed build answers there. Callers must treat it
+/// as fatal: this is the one failure that looks like success.
+///
+/// # Panics
+/// When `ci/veripb-soundness/expected.tsv` is missing or malformed. An empty
+/// fixture list would make this gate a no-op, which is the exact failure mode
+/// the module is built against, so it is a hard stop rather than a pass.
+pub fn soundness_gate(checker: &Path) -> Result<(), String> {
+    let fixtures = pin::soundness_fixtures();
+    let accepted: Vec<String> = fixtures
+        .iter()
+        .filter_map(|fixture| {
+            // The flag comes from the MANIFEST, not from `run`'s `--opb`
+            // default: one fixture is a DIMACS CNF and one a WCNF, and two
+            // format flags would leave the choice to the argument parser.
+            let outcome = run(
+                checker,
+                &fixture.formula,
+                &fixture.proof,
+                &[fixture.flag.as_str()],
+            );
+            (!outcome.is_rejected()).then(|| {
+                format!(
+                    "  - {}: got `{}`, but the truth is {} (an unfixed checker answers `{}` here)",
+                    fixture.name,
+                    outcome.verdict_or_placeholder(),
+                    fixture.truth,
+                    fixture.wrong_verdict
+                )
+            })
+        })
+        .collect();
+
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "it ACCEPTED {} of the {} committed proof/formula pairs whose verdict \
+         CONTRADICTS the truth:\n{}",
+        accepted.len(),
+        fixtures.len(),
+        accepted.join("\n")
+    ))
+}
+
+/// Everything resolution proves about a checker binary, applied to whatever
+/// [`locate`] returned and regardless of WHERE it came from.
+///
+/// Split out of [`resolve_once`] so the two batteries can be driven over an
+/// arbitrary path in a test — the point being tested is precisely that the
+/// source does not matter.
+fn vet(checker: PathBuf) -> Result<PathBuf, ResolveError> {
+    if let Err(detail) = self_test(&checker) {
+        return Err(ResolveError::SelfTestFailed { checker, detail });
+    }
+    if let Err(detail) = soundness_gate(&checker) {
+        return Err(ResolveError::Unsound { checker, detail });
+    }
+    Ok(checker)
+}
+
 fn resolve_once() -> &'static Result<PathBuf, ResolveError> {
     static RESOLVED: OnceLock<Result<PathBuf, ResolveError>> = OnceLock::new();
-    RESOLVED.get_or_init(|| {
-        let checker = locate()?;
-        match self_test(&checker) {
-            Ok(()) => Ok(checker),
-            Err(detail) => Err(ResolveError::SelfTestFailed { checker, detail }),
-        }
-    })
+    RESOLVED.get_or_init(|| vet(locate()?))
 }
 
 /// Resolve a self-tested checker, or report why none is usable.
@@ -751,16 +1019,22 @@ fn opted_out() -> bool {
 /// explicitly opts out via `AY_VERIPB_OPTIONAL`; the skip is then announced on
 /// stderr with the [`SKIP_MARKER`] prefix so it is greppable in CI logs.
 ///
-/// A resolved-but-bogus checker (self-test failure) always panics: the opt-out
-/// excuses an ABSENT checker, never a FAKE one.
+/// A resolved-but-bogus checker always panics — self-test failure (not a
+/// checker) and soundness-gate failure (a checker that gives wrong verdicts)
+/// alike: the opt-out excuses an ABSENT checker, never a FAKE or an UNSOUND
+/// one.
 #[must_use]
 pub fn require_checker(suite: &str) -> Option<PathBuf> {
     match resolve() {
         Ok(checker) => Some(checker),
-        Err(error @ ResolveError::SelfTestFailed { .. }) => panic!(
-            "{suite}: the resolved VeriPB checker is not a working checker.\n{error}\n\
-             This suite refuses to run against a binary that cannot check proofs."
-        ),
+        Err(error @ (ResolveError::SelfTestFailed { .. } | ResolveError::Unsound { .. })) => {
+            panic!(
+                "{suite}: the resolved VeriPB checker is not a checker this workspace may \
+             certify against.\n{error}\n\
+             This suite refuses to run against a binary that cannot check proofs, or \
+             that checks them wrongly."
+            )
+        }
         Err(error) => {
             if opted_out() {
                 eprintln!(
@@ -773,6 +1047,46 @@ pub fn require_checker(suite: &str) -> Option<PathBuf> {
                  {error}\n\
                  Set {OPT_OUT_ENV}=1 to acknowledge running WITHOUT external verification."
             )
+        }
+    }
+}
+
+/// Resolve the checker for a suite that DEGRADES when none is installed —
+/// falling back to a text-shape check — instead of failing like
+/// [`require_checker`].
+///
+/// Six such suites each rolled their own "is a checker around?" probe: some
+/// read `$VERIPB_BIN` and scanned `$PATH`, some hardcoded a cache path, and NOT
+/// ONE of them ran a single probe against what it found. A probe that finds an
+/// unsound checker is worse than one that finds nothing, because the suite then
+/// reads green having asked a binary with twenty-one wrong-verdict defects.
+///
+/// So the degrade policy is narrowed to what it was always meant to cover:
+///
+/// * checker ABSENT -> `None`, announced on stderr with [`SKIP_MARKER`];
+/// * checker present but not a checker ([`self_test`]), or a checker that gives
+///   WRONG VERDICTS ([`soundness_gate`]) -> PANIC;
+/// * an override set to a path that does not exist -> PANIC. "A typo in
+///   `VERIPB_BIN` must never silently degrade to 'checker absent'" is this
+///   module's own rule, and a probe that swallowed [`ResolveError::BadOverride`]
+///   broke it in the one place nobody was looking.
+#[must_use]
+pub fn optional_checker(suite: &str) -> Option<PathBuf> {
+    match resolve() {
+        Ok(checker) => Some(checker),
+        Err(error @ (ResolveError::SelfTestFailed { .. } | ResolveError::Unsound { .. })) => {
+            panic!(
+                "{suite}: a VeriPB checker was found and it must not be used.\n{error}\n\
+             Degrading is this suite's policy for a MISSING checker, never for a broken \
+             or unsound one."
+            )
+        }
+        Err(error @ ResolveError::BadOverride { .. }) => {
+            panic!("{suite}: the checker override is set and wrong.\n{error}")
+        }
+        Err(error) => {
+            eprintln!("{SKIP_MARKER}: {suite} did not run the checker. {error}");
+            None
         }
     }
 }
@@ -1006,24 +1320,9 @@ pub mod pin {
             assert!(!version().is_empty());
         }
 
-        #[test]
-        fn the_pinned_patch_matches_its_recorded_hash() {
-            use sha2::{Digest, Sha256};
-            for (path, expected, key) in [(patch(), patch_sha256(), "VERIPB_PATCH_SHA256")] {
-                let path = repo_root().join(path);
-                let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-                    panic!("pinned patch {} unreadable: {error}", path.display())
-                });
-                let digest = format!("{:x}", Sha256::digest(&bytes));
-                assert_eq!(
-                    digest,
-                    expected,
-                    "{} does not match {key} in {PIN_PATH}. The patch is part of \
-                     the checker's identity — update both together.",
-                    path.display()
-                );
-            }
-        }
+        // The patch-file hash check lives in tests/veripb_patch_pin.rs: the
+        // patch is development-only (the public snapshot ships the pin, not
+        // the patch), so that one test target is excluded from the export.
 
         #[test]
         fn all_twenty_two_soundness_fixtures_are_present_on_disk() {
@@ -1200,18 +1499,20 @@ LLVM version: 20.1.0\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A Trust-only machine has no bare `rustc` on PATH; the lib must fall
-    /// back to the compiler_consumer sysroot's compat entry DELIBERATELY, and on a
-    /// machine that does carry a bare rustc the PATH one must outrank the
-    /// fallback (it is what cargo would run). Both branches assert a
-    /// documented rule.
+    /// The compiler_consumer sysroot's compat entry keys the cache whenever the Trust
+    /// toolchain is installed: that is the compiler `targo` runs, and it
+    /// outranks a bare `rustc` on PATH (inside aterm that is a reroute stub,
+    /// and on a Trust machine it is not what builds the checker). Only a host
+    /// without compiler_consumer falls through to the PATH rustc, which plain cargo runs.
     #[cfg(unix)]
     #[test]
     fn cache_key_compiler_resolution_covers_a_trust_only_machine() {
         let dir = unique_temp_dir("build-id-trust");
         let bin = dir.join("bin");
+        let stock_bin = dir.join("stock-bin");
         let sysroot = dir.join("sysroot");
         std::fs::create_dir_all(&bin).expect("mkdir");
+        std::fs::create_dir_all(&stock_bin).expect("mkdir");
         std::fs::create_dir_all(sysroot.join("bin")).expect("mkdir");
         let sysroot_rustc = sysroot.join("bin/rustc");
         write_stub_rustc(&sysroot_rustc);
@@ -1219,40 +1520,47 @@ LLVM version: 20.1.0\n";
             &bin.join("compiler_consumer"),
             &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", sysroot.display()),
         );
+        let path_rustc = stock_bin.join("rustc");
+        write_stub_rustc(&path_rustc);
         let lib = pin::repo_root().join(BUILD_ID_LIB);
-        let output = Command::new("sh")
-            .arg("-u")
-            .arg("-c")
-            .arg(format!(
-                "PATH='{}:/usr/bin:/bin'; export PATH\n. '{}'\ncommand -v rustc || printf '\\n'\nveripb_rustc_path",
-                bin.display(),
-                lib.display()
-            ))
-            .env_remove("RUSTC")
-            .output()
-            .expect("run sh against the build-id lib");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let mut lines = stdout.lines();
-        let on_path = lines.next().unwrap_or("");
-        let resolved = lines.next().unwrap_or("");
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if on_path.is_empty() {
+        let resolve = |path: String| {
+            let output = Command::new("sh")
+                .arg("-u")
+                .arg("-c")
+                .arg(format!(
+                    "PATH='{path}'; export PATH\n. '{}'\nveripb_rustc_path",
+                    lib.display()
+                ))
+                .env_remove("RUSTC")
+                .output()
+                .expect("run sh against the build-id lib");
             assert_eq!(
-                resolved,
-                sysroot_rustc.to_str().unwrap(),
-                "with no rustc on PATH the compiler_consumer sysroot compat entry must key the cache"
+                output.status.code(),
+                Some(0),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
-        } else {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string()
+        };
+        // Trust toolchain installed, with or without a bare rustc on PATH.
+        for path in [
+            format!("{}:/usr/bin:/bin", bin.display()),
+            format!("{}:{}:/usr/bin:/bin", stock_bin.display(), bin.display()),
+        ] {
             assert_eq!(
-                resolved, on_path,
-                "a PATH rustc outranks the sysroot fallback — it is what cargo runs"
+                resolve(path.clone()),
+                sysroot_rustc.to_str().unwrap(),
+                "the compiler_consumer sysroot compat entry must key the cache (PATH={path})"
             );
         }
+        // No compiler_consumer: the PATH rustc plain cargo would run.
+        assert_eq!(
+            resolve(format!("{}:/usr/bin:/bin", stock_bin.display())),
+            path_rustc.to_str().unwrap(),
+            "without the Trust toolchain the PATH rustc keys the cache"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1340,6 +1648,208 @@ LLVM version: 20.1.0\n";
             vec![empty.join(&pinned_id).join("target/release/veripb")]
         );
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// REGRESSION (2026-09-22): every cache path this resolver will hand to a
+    /// gate must carry the checker's IDENTITY in its directory name.
+    ///
+    /// The resolver used to append `<cache>/VeriPB/target/release/veripb` — the
+    /// PRE-PIN layout — after the identity-bearing ones. Its name records no
+    /// commit and no patch, and the early `scripts/cert_ci.sh` that populated it
+    /// `git clone --depth 1`d the upstream DEFAULT BRANCH and built it
+    /// UNPATCHED. When the pin's patch was re-cut, no keyed directory matched
+    /// any more, resolution fell through to that path, and an upstream 3.0.2
+    /// that ACCEPTS all 22 committed wrong-verdict fixtures became the checker
+    /// behind every "and VeriPB said VERIFIED" in this workspace. The version
+    /// string did not discriminate it: it reports the pinned `3.0.2`.
+    ///
+    /// So: a checker binary present at that path must NOT be resolvable, and
+    /// every cache candidate offered must be one `is_pinned_cache_dir` accepts.
+    #[test]
+    fn resolution_never_offers_a_cache_path_without_the_pin_identity() {
+        let cache = unique_temp_dir("cache-identity-scan");
+        let pinned_id = pinned_build_id();
+        for name in [
+            "VeriPB",
+            "veripb",
+            "4bb10c2ce98a8c80122a7a2399d7f35ffdc6e58e-deadbeefcafe",
+            &format!("{pinned_id}-rustc1.99.0-dev-acb08e7616"),
+        ] {
+            std::fs::create_dir_all(cache.join(name).join("target/release"))
+                .expect("create cache entry");
+            std::fs::write(
+                cache.join(name).join("target/release/veripb"),
+                b"#!/bin/sh\nexit 0\n",
+            )
+            .expect("write stub checker");
+        }
+
+        let offered = pinned_cache_candidates(&cache);
+        for candidate in &offered {
+            let dir = candidate
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .expect("cache candidate is <cache>/<id>/target/release/veripb");
+            assert!(
+                is_pinned_cache_dir(dir, &pinned_id),
+                "resolution offered `{}`, whose directory name `{dir}` carries no pin \
+                 identity — a binary there could be any checker at all",
+                candidate.display()
+            );
+        }
+        assert!(
+            !offered
+                .iter()
+                .any(|candidate| candidate.ends_with(PRE_PIN_CACHE_REL)),
+            "the PRE-PIN cache layout `{PRE_PIN_CACHE_REL}` is back in the resolution \
+             order; by construction it holds an UNPINNED, UNPATCHED upstream build"
+        );
+        assert_eq!(
+            offered,
+            vec![cache
+                .join(format!("{pinned_id}-rustc1.99.0-dev-acb08e7616"))
+                .join("target/release/veripb")],
+            "only the identity-bearing entry is a candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    // ------------------------------------------------------------------
+    // TOTALITY (2026-09-22). Identity closed ONE source, the cache. These
+    // close the rest: the ranking, and the gate that applies to every source
+    // because identity is not available for any of the others.
+    // ------------------------------------------------------------------
+
+    /// A stub that PASSES all six [`self_test`] probes and still gives wrong
+    /// verdicts — a faithful model of published VeriPB 3.0.2, which is the
+    /// binary this workspace actually resolved on 2026-09-22.
+    ///
+    /// It dispatches on the last argument, which `run_text` places in a scratch
+    /// directory named after the probe label, so the six probes are answered
+    /// exactly as a real checker answers them while everything else — the
+    /// twenty-two committed fixtures included — is rubber-stamped.
+    #[cfg(unix)]
+    const UPSTREAM_3_0_2_MODEL: &str = r#"#!/bin/sh
+for a in "$@"; do p="$a"; done
+case "$p" in
+  *selftest-good-unsat*) echo 's VERIFIED UNSATISFIABLE'; exit 0 ;;
+  *selftest-good-sat*)   echo 's VERIFIED SATISFIABLE'; exit 0 ;;
+  *selftest-*)           echo 'c refused'; exit 1 ;;
+  *)                     echo 's VERIFIED UNSATISFIABLE'; exit 0 ;;
+esac
+"#;
+
+    /// THE reason resolution cannot stop at [`self_test`], as an executable
+    /// statement rather than a claim in prose.
+    ///
+    /// The six probes ask "is this a checker?" and this stub answers yes to all
+    /// six. Nothing in them asks "is it a CORRECT one?", and the measured
+    /// incident is precisely a binary that passes them, reports the pinned
+    /// version string, and contradicts the truth on every committed fixture.
+    #[cfg(unix)]
+    #[test]
+    fn a_checker_can_pass_every_self_test_probe_and_still_fail_the_soundness_gate() {
+        let dir = unique_temp_dir("upstream-model");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stub = dir.join("veripb");
+        write_stub(&stub, UPSTREAM_3_0_2_MODEL);
+
+        self_test(&stub).expect("the model answers all six probes the way a checker does");
+
+        let detail = soundness_gate(&stub)
+            .expect_err("a checker that rubber-stamps the fixtures is not a sound checker");
+        assert!(detail.contains("ACCEPTED 22 of the 22"), "{detail}");
+        assert!(detail.contains("03-degree-wrap-weaken"), "{detail}");
+
+        match vet(stub.clone()) {
+            Err(ResolveError::Unsound { checker, .. }) => assert_eq!(checker, stub),
+            other => panic!("resolution must refuse it as Unsound, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate does not depend on WHICH source offered the binary.
+    ///
+    /// [`vet`] is what every caller of [`resolve`] goes through and it takes a
+    /// path: it cannot see whether that path came from `$VERIPB_BIN`, from
+    /// `$PATH`, from [`NEUTRAL_DEFAULT`], from `~/.cargo/bin` or from an
+    /// identity-bearing cache directory. That is the property being pinned —
+    /// four of those five channels cannot carry an identity at all, so the one
+    /// thing that can be asked of all five is that the binary BEHAVE.
+    #[cfg(unix)]
+    #[test]
+    fn vetting_does_not_depend_on_which_source_offered_the_binary() {
+        let root = unique_temp_dir("any-source");
+        for channel in ["env-override", "path-hit", "neutral-default"] {
+            let dir = root.join(channel);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let stub = dir.join("veripb");
+            write_stub(&stub, UPSTREAM_3_0_2_MODEL);
+            assert!(
+                matches!(vet(stub), Err(ResolveError::Unsound { .. })),
+                "an unsound checker offered through `{channel}` was accepted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REGRESSION (2026-09-22, totality): the RANK of the identity-bearing
+    /// pinned build.
+    ///
+    /// `/tmp/veripb-3/bin/veripb` used to be the FIRST element of the built-in
+    /// list, and `$PATH` was scanned before that list was consulted at all. So
+    /// on a machine carrying both, a checker whose path records no commit and
+    /// no patch beat the build this repo's own scripts produce. The neutral
+    /// default is still offered — `publish/DECISIONS.md` keeps it on purpose —
+    /// but it is offered LAST-but-one, not first.
+    #[test]
+    fn the_pinned_build_outranks_every_identity_free_candidate() {
+        let cache = unique_temp_dir("rank-cache");
+        let pinned_id = pinned_build_id();
+        let keyed = format!("{pinned_id}-rustc1.99.0-dev-acb08e7616");
+        std::fs::create_dir_all(cache.join(&keyed)).expect("mkdir");
+        let home = unique_temp_dir("rank-home");
+        let on_path = unique_temp_dir("rank-path").join("veripb");
+
+        assert_eq!(
+            search_order(Some(&cache), Some(on_path.clone()), Some(&home)),
+            vec![
+                cache.join(&keyed).join("target/release/veripb"),
+                on_path,
+                PathBuf::from(NEUTRAL_DEFAULT),
+                home.join(".cargo/bin/veripb"),
+            ],
+            "identity-bearing pinned build first; $PATH, the neutral default and \
+             ~/.cargo/bin carry no identity and rank below it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// An empty `$PATH` slot still occupies its position in the searched list,
+    /// so [`ResolveError::NotFound`]'s "searched, in order:" keeps telling the
+    /// truth about the order — the only way a reader can see the ranking.
+    #[test]
+    fn the_path_slot_is_reported_in_its_real_position_when_nothing_is_on_path() {
+        let cache = unique_temp_dir("slot-cache");
+        let pinned_id = pinned_build_id();
+        assert_eq!(
+            search_order(Some(&cache), None, None),
+            vec![
+                cache.join(&pinned_id).join("target/release/veripb"),
+                PathBuf::from(PATH_SLOT),
+                PathBuf::from(NEUTRAL_DEFAULT),
+            ]
+        );
+        assert!(
+            !PathBuf::from(PATH_SLOT).is_file(),
+            "the `$PATH` placeholder must never be resolvable"
+        );
     }
 
     #[test]

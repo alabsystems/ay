@@ -580,15 +580,21 @@ impl LraSolver {
             return None;
         }
         if !self.conflict_literals_all_asserted(&dedup_lits) {
-            self.stats.stale_conflict_rejected_count += 1;
+            self.stats.stale_conflict_rejected_count =
+                self.stats.stale_conflict_rejected_count.saturating_add(1);
             return None;
         }
         let farkas = if !dedup_coeffs.is_empty() {
             Some(FarkasAnnotation::new(dedup_coeffs))
         } else if all_fit {
-            Some(FarkasAnnotation::new(
-                (0..dedup_lits.len()).map(|_| Rational64::from(1)).collect(),
-            ))
+            // One unit coefficient per deduplicated literal. The reservation
+            // is a hint only: `push` still grows the vector if it fails.
+            let mut ones = Vec::new();
+            let _ = ones.try_reserve_exact(dedup_lits.len());
+            for _ in &dedup_lits {
+                ones.push(Rational64::from(1));
+            }
+            Some(FarkasAnnotation::new(ones))
         } else {
             None
         };

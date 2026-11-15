@@ -76,7 +76,33 @@ pub(super) fn validated_route(
         || features.has_quantifiers
         || features.has_nonlinear_int
         || features.has_nonlinear_real
-        || features.has_int_div_mod
+        // Int `div`/`mod` is out of slice only while a BITVECTOR is still live.
+        // The combination this validator fences is BV + arithmetic, and a
+        // div/mod residue is fenced because it would reach the conservative
+        // BV<->LIA bridge, not because ay cannot decide it: `QF_LIA` and
+        // `QF_UFLIA` — two routes this very predicate ADMITS below — decide
+        // `mod`/`div` through `mod_div_elim` and publish strict proofs.
+        //
+        // Excluding it unconditionally made admission NON-MONOTONE in the
+        // declared logic name, which is the one thing a logic name must never
+        // do: a declared name is an upper bound on the symbols a script may
+        // mention, so widening it can lose no verdict. Measured on the ay
+        // binary at 6695757a6:
+        //
+        //   (set-logic QF_LIA)       (assert (= k (mod a 4))) (<= k 3) (>= k 4)  -> unsat
+        //   (set-logic QF_UFBVLIA)   ... the same three assertions ...           -> unknown
+        //
+        // There is no bitvector anywhere in that query. The shape is not
+        // exotic: `TermStore::mk_bv2nat` rewrites the masked residue
+        // `bv2nat(bvand(int2bv_w(x), 2^k-1))` to `(mod x 2^k)` AT INTERNING
+        // TIME, so every power-of-two-mask index obligation Trust's vcgen
+        // emits (`let i = a & 3; arr[i]`) arrives here BV-free and carrying a
+        // `mod` — and was answered `unknown (incomplete)` for that reason
+        // alone.
+        //
+        // The fence stays exactly where it was for every query that still
+        // carries a bitvector.
+        || (features.has_int_div_mod && features.has_bv)
         || features.has_is_int_real;
     if outside_slice {
         return None;
@@ -184,6 +210,69 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    /// #ufbvlia-modmonotone. A BV-FREE `mod`/`div` footprint is admitted and
+    /// routed to the plain scalar Int lane this predicate already lists.
+    ///
+    /// The shape is not hypothetical: `TermStore::mk_bv2nat` rewrites
+    /// `bv2nat(bvand(int2bv_w(x), 2^k-1))` to `(mod x 2^k)` at interning time,
+    /// so a power-of-two-mask index query declared `QF_UFBVLIA` reaches this
+    /// predicate with `has_int_div_mod` set and NO bitvector left at all.
+    #[test]
+    fn bv_free_int_div_mod_is_admitted_to_the_scalar_int_lane() {
+        let terms = TermStore::new();
+        let cases = [
+            (
+                StaticFeatures {
+                    has_int: true,
+                    has_int_var: true,
+                    has_int_div_mod: true,
+                    num_theories: 1,
+                    ..StaticFeatures::default()
+                },
+                LogicCategory::QfLia,
+            ),
+            (
+                StaticFeatures {
+                    has_int: true,
+                    has_int_var: true,
+                    has_int_div_mod: true,
+                    has_uf: true,
+                    num_theories: 1,
+                    ..StaticFeatures::default()
+                },
+                LogicCategory::QfUflia,
+            ),
+        ];
+        for (features, expected) in cases {
+            assert_eq!(
+                validated_route(&features, &terms, None, false),
+                Some(expected),
+                "a BV-free div/mod footprint has no theory COMBINATION to fence"
+            );
+        }
+    }
+
+    /// The UNSAFE twin of the test above: the moment a bitvector is live the
+    /// div/mod residue could reach the conservative BV<->LIA bridge, so the
+    /// fence stays exactly where it was. This must keep returning `None`.
+    #[test]
+    fn int_div_mod_beside_a_live_bitvector_stays_fenced() {
+        let terms = TermStore::new();
+        let features = StaticFeatures {
+            has_int: true,
+            has_int_var: true,
+            has_bv: true,
+            has_int_div_mod: true,
+            num_theories: 2,
+            ..StaticFeatures::default()
+        };
+        assert_eq!(
+            validated_route(&features, &terms, Some(&[Vec::new()]), false),
+            None,
+            "BV + div/mod is the combination this validator exists to fence"
+        );
     }
 
     #[test]

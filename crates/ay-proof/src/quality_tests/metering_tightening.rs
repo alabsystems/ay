@@ -45,6 +45,7 @@ fn payload(work: usize, unfolded: usize) -> PayloadStats {
         work,
         bytes: 64,
         unfolded_work: unfolded,
+        fp_assignments: 0,
         order_assignments: 0,
     }
 }

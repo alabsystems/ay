@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% The genuinely valid conclusion for the formula of
+% `incorrect/conclusion_BOUNDS_solx_unpreserved_objective`: the optimum is 0,
+% witnessed by x1=0, x2=0. The pair documents the contradiction that fix closes —
+% the same binary used to certify both `BOUNDS 100 100` and `BOUNDS 0 0` here.
+f 1;
+output NONE;
+conclusion BOUNDS 0 0 : ~x1 ~x2;
+end pseudo-Boolean proof;

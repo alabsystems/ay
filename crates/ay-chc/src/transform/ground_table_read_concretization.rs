@@ -584,6 +584,7 @@ fn term_is_table_free(expr: &ChcExpr, depth: usize) -> bool {
         return false;
     }
     maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(_) => false,
         ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => true,
         ChcExpr::Var(v) => !matches!(v.sort, ChcSort::Array(_, _)),
         ChcExpr::ConstArray(_, _) | ChcExpr::ConstArrayMarker(_) => false,

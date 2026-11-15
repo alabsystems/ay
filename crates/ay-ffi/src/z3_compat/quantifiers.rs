@@ -8,18 +8,20 @@
 //! the `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
+use std::collections::HashSet;
 use std::ffi::c_uint;
 use std::ptr;
 
-use ay_dpll::api::{Sort, Term};
+use ay_dpll::api::{de_bruijn_index, Sort, Term, TermKind};
 
 use super::{
     activate_finite_set_quantifier_gate, bounded_sort_hi, ffi_count_within_limit,
-    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, finite_set_engine_public_sort,
-    lookup_ast_sort, range_guard_term, record_ast_sort, record_bounded_array_ext_lemma,
-    require_term_ast_or_return, require_term_asts_or_return, sort_mentions_finite_set, term_to_ast,
-    QuantifierFfiMetadata, SymbolKey, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
-    MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG, Z3_INVALID_USAGE,
+    ffi_counts_within_limit, ffi_guard_mk, ffi_guard_ptr, finite_set_engine_public_sort,
+    lookup_ast_sort, public_ast_sort, range_guard_term, record_ast_sort,
+    record_bounded_array_ext_lemma, render_public_sort, require_term_ast_or_return,
+    require_term_asts_or_return, sort_mentions_finite_set, term_to_ast, QuantifierFfiMetadata,
+    SymbolKey, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS,
+    Z3_INVALID_ARG, Z3_INVALID_USAGE,
 };
 
 /// Metadata supplied alongside one quantifier construction. Keeping it in the
@@ -37,10 +39,14 @@ fn register_quantifier_metadata(
     input: QuantifierMetadataInput<'_>,
     no_patterns: Vec<Term>,
 ) -> bool {
+    // The empty symbol is no id: z3py passes `qid=""` and `skid=""` for every
+    // `ForAll` / `Exists`, which made each such quantifier carry ids and
+    // refused its translation into another context.
+    let named = |id: Option<SymbolKey>| id.filter(|id| !id.display_name().is_empty());
     let metadata = QuantifierFfiMetadata {
         weight: input.weight,
-        quantifier_id: input.quantifier_id,
-        skolem_id: input.skolem_id,
+        quantifier_id: named(input.quantifier_id),
+        skolem_id: named(input.skolem_id),
         no_patterns,
     };
     if let Some(existing) = ctx.quantifier_ffi_metadata.get(&term) {
@@ -190,16 +196,434 @@ pub unsafe extern "C" fn Z3_mk_bound(c: Z3_context, index: c_uint, ty: Z3_sort) 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bound", |ctx| {
             // Create a named variable that encodes the de Bruijn index.
-            let name = format!("__db{index}");
+            // One variable per index and sort (`__db{index}`, then
+            // `__db{index}:{j}`): z3 allows `Var(0, Int)` beside `Var(0, Bool)`.
             let engine_sort = finite_set_engine_public_sort(ctx, &sort);
-            let term = ctx.solver.declare_const(&name, engine_sort);
-            let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, sort.clone());
-            ast
+            match de_bruijn_var_at(ctx, index as usize, engine_sort, &sort) {
+                Ok(term) => term_to_ast(ctx, term),
+                Err(e) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_mk_bound: {e}"));
+                    0
+                }
+            }
         })
     }
+}
+
+// ============================================================================
+// De Bruijn binders (`Z3_mk_forall`, `Z3_mk_exists`, `Z3_mk_quantifier*`,
+// `Z3_mk_lambda`)
+// ============================================================================
+//
+// z3 binds a de Bruijn body positionally: in a binder over `n` declarations,
+// `(:var k)` with `k < n` is declaration `n-1-k`, and `(:var k)` with `k >= n`
+// is `(:var k-n)` of the enclosing scope. AY binds by NAME, so a de Bruijn
+// construction must (1) mint one named binder per declaration, (2) replace
+// each `(:var k)`, `k < n`, by its binder in the body and in the patterns, and
+// (3) shift every `(:var k)`, `k >= n`, to `(:var k-n)` so it still names the
+// same enclosing binder from outside. Until T5 gives the public AST its own
+// de Bruijn nodes, these helpers are the quarantine for that path (T5 design
+// §4 P0.2 Q1). Each refuses rather than guess:
+//
+// * a body variable whose sort differs from its binder's is refused (z3
+//   accepts the AST, then answers `unsat` where AY would have answered `sat`:
+//   judge_fid/f1.py b, measured on libz3 5.1.0);
+// * a binder never captures a name that occurs in the body (a caller's free
+//   constant, another quantifier's binder, a lambda's slot), and is never one
+//   of the caller's own constants;
+// * no declaration can panic (`try_declare_const`, never `declare_const`).
+
+/// The most spellings tried for one binder before the construction is refused.
+const MAX_BINDER_VARIANTS: usize = 64;
+
+/// The de Bruijn variable `(:var index)` at public sort `public`, whose
+/// engine sort is `engine`. Refused when the variable's AST already carries a
+/// different public sort: AY gives each index one engine variable per ENGINE
+/// sort, so two public sorts with one lowering (a FiniteSet and its
+/// characteristic array) would otherwise share one handle and the second
+/// would silently re-sort the first.
+pub(crate) fn de_bruijn_var_at(
+    ctx: &mut Z3Context,
+    index: usize,
+    engine: Sort,
+    public: &Sort,
+) -> Result<Term, String> {
+    let term = ctx
+        .solver
+        .try_de_bruijn_var(index, engine)
+        .map_err(|e| e.to_string())?;
+    match recorded_de_bruijn_sort(ctx, term) {
+        Some(existing) if existing != *public => Err(format!(
+            "(:var {index}) already has sort {} in this context, and AY cannot also give it \
+             sort {}",
+            render_public_sort(ctx, &existing),
+            render_public_sort(ctx, public)
+        )),
+        Some(_) => Ok(term),
+        None => {
+            let ast = term_to_ast(ctx, term);
+            // Stated so the binder's term reads at its public sort.
+            let _binder_ast = record_ast_sort(ctx, ast, public.clone());
+            Ok(term)
+        }
+    }
+}
+
+/// The public sort recorded for a de Bruijn variable's AST, when that sort
+/// lowers to the variable's engine sort. A record that does not was written
+/// by a builder that folded to the variable (`Z3_mk_char_to_int(c)` is `c`
+/// itself in AY, and records `Int` on it), so it is not the variable's sort.
+fn recorded_de_bruijn_sort(ctx: &Z3Context, var: Term) -> Option<Sort> {
+    let engine = ctx.solver.term_sort(var);
+    let recorded = lookup_ast_sort(ctx, term_to_ast(ctx, var))?;
+    (finite_set_engine_public_sort(ctx, recorded) == engine).then(|| recorded.clone())
+}
+
+/// The public sort of a de Bruijn variable: its consistent recorded sort
+/// (a FiniteSet over its characteristic-array engine sort), else its engine
+/// sort, which for a de Bruijn variable is the sort it was declared at.
+pub(crate) fn de_bruijn_public_sort(ctx: &Z3Context, var: Term) -> Sort {
+    recorded_de_bruijn_sort(ctx, var).unwrap_or_else(|| ctx.solver.term_sort(var))
+}
+
+/// What the roots of a de Bruijn construction (body, patterns, no-patterns)
+/// contain.
+pub(crate) struct DeBruijnScan {
+    /// Each distinct de Bruijn variable term with its index.
+    pub(crate) occurrences: Vec<(usize, Term)>,
+    /// Every variable name that occurs, free or as a binder (a quantifier's
+    /// bound names, a lambda's slot) — the names a new binder must not take.
+    pub(crate) names: HashSet<String>,
+}
+
+/// Walk `roots` once (shared subterms once) and collect their de Bruijn
+/// variables and every variable name.
+pub(crate) fn scan_de_bruijn(ctx: &Z3Context, roots: &[Term]) -> DeBruijnScan {
+    let mut scan = DeBruijnScan {
+        occurrences: Vec::new(),
+        names: HashSet::new(),
+    };
+    let mut seen = HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        match ctx.solver.term_kind(term) {
+            TermKind::Var { name } => {
+                if let Some(index) = de_bruijn_index(&name) {
+                    scan.occurrences.push((index, term));
+                }
+                scan.names.insert(name);
+            }
+            TermKind::Forall | TermKind::Exists => {
+                if let Some(bound) = ctx.solver.quantifier_bound_vars(term) {
+                    scan.names.extend(bound.into_iter().map(|(name, _)| name));
+                }
+                if let Some(triggers) = ctx.solver.quantifier_triggers(term) {
+                    stack.extend(triggers.into_iter().flatten());
+                }
+            }
+            _ => {}
+        }
+        stack.extend(ctx.solver.term_children(term));
+    }
+    scan
+}
+
+/// The spelling of binder `variant` for a declaration named `base`.
+/// Variant 0 is the caller's own name, kept whenever it is safe so binder
+/// names, printing and the identity of a rebuilt quantifier stay z3's; it is
+/// skipped for a de Bruijn spelling (`__db0` would bind every loose
+/// `(:var 0)`) and for AY's private namespace. Further variants are private
+/// (`!ay.` names, refused on every caller-facing route), so they can never be
+/// a caller's symbol.
+fn binder_spelling(base: &str, variant: usize) -> Option<String> {
+    if variant > 0 {
+        return Some(format!("!ay.z3-bound!{variant}!{base}"));
+    }
+    let private = base.starts_with("!ay.") && !base.starts_with("!ay.z3-symbol.");
+    (de_bruijn_index(base).is_none() && !private).then(|| base.to_string())
+}
+
+/// One declaration of a de Bruijn binder: the caller's symbol, its semantic
+/// spelling (`SymbolHandle::semantic_name`) and its public sort.
+pub(crate) struct BinderDecl {
+    pub(crate) symbol: SymbolKey,
+    pub(crate) spelling: String,
+    pub(crate) sort: Sort,
+}
+
+/// Read `n` binder declarations from a caller's parallel `sorts` / `names`
+/// arrays; `None` when an entry is null.
+///
+/// # Safety
+/// `sorts` and `names` must each point to `n` elements, and every non-null
+/// entry must be a live AY sort / symbol handle.
+pub(crate) unsafe fn read_binder_decls(
+    n: c_uint,
+    sorts: *const Z3_sort,
+    names: *const Z3_symbol,
+) -> Option<Vec<BinderDecl>> {
+    let mut decls = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        // SAFETY: the caller guarantees both arrays hold `n` elements.
+        let (sort_ptr, sym_ptr) = unsafe { (*sorts.add(i), *names.add(i)) };
+        if sort_ptr.is_null() || sym_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: non-null entries are live AY handles kept alive by their
+        // context (caller contract); the C API is single-threaded per context.
+        let (sort, symbol, spelling) = unsafe {
+            (
+                (*sort_ptr).sort.clone(),
+                (*sym_ptr).key.clone(),
+                (*sym_ptr).semantic_name(),
+            )
+        };
+        decls.push(BinderDecl {
+            symbol,
+            spelling,
+            sort,
+        });
+    }
+    Some(decls)
+}
+
+/// Mint one named binder per declaration.
+///
+/// A binder is a native constant, so the same construction always yields the
+/// same binder (z3: rebuilding a quantifier gives an equal AST, measured), and
+/// the choice depends only on the construction's content, so a translated
+/// quantifier and one rebuilt in the target agree. A spelling is skipped when
+/// it occurs anywhere in the roots (`occupied`: capture), when another
+/// declaration of this binder took it, when it is bound to something else
+/// (another sort, a function, a parsed text's declaration) and when it names
+/// one of the caller's constants (`Z3_mk_const`): a binder must not share its
+/// identity with a constant of the goal.
+fn mint_de_bruijn_binders(
+    ctx: &mut Z3Context,
+    decls: &[BinderDecl],
+    occupied: &HashSet<String>,
+) -> Result<Vec<Term>, String> {
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut binders = Vec::with_capacity(decls.len());
+    for BinderDecl {
+        symbol,
+        spelling,
+        sort: public,
+    } in decls
+    {
+        let engine = finite_set_engine_public_sort(ctx, public);
+        let mut chosen = None;
+        for variant in 0..MAX_BINDER_VARIANTS {
+            let Some(name) = binder_spelling(spelling, variant) else {
+                continue;
+            };
+            if occupied.contains(&name) || taken.contains(&name) {
+                continue;
+            }
+            let Ok(term) = ctx.solver.try_declare_const(&name, engine.clone()) else {
+                continue;
+            };
+            if ctx.ffi_const_metadata.contains_key(&term) {
+                continue;
+            }
+            // One engine sort can carry two public sorts (a FiniteSet and its
+            // characteristic array): never re-sort an existing binder.
+            let ast = term_to_ast(ctx, term);
+            if lookup_ast_sort(ctx, ast).is_some_and(|recorded| recorded != public) {
+                continue;
+            }
+            chosen = Some((name, term));
+            break;
+        }
+        let Some((name, term)) = chosen else {
+            return Err(format!(
+                "no binder spelling for '{}' at sort {} avoids the names its body uses",
+                symbol.display_name(),
+                render_public_sort(ctx, public)
+            ));
+        };
+        if name != symbol.display_name() {
+            // Printing shows the caller's symbol, not the private spelling.
+            ctx.ffi_decl_symbols.insert(name.clone(), symbol.clone());
+        }
+        taken.insert(name);
+        let ast = term_to_ast(ctx, term);
+        // Stated so the binder's term reads at its public sort.
+        let _binder_ast = record_ast_sort(ctx, ast, public.clone());
+        binders.push(term);
+    }
+    Ok(binders)
+}
+
+/// A whole de Bruijn construction over `decls`: mint the binders
+/// (`mint_de_bruijn_binders`) clear of every name in `roots`, then resolve the
+/// roots' de Bruijn variables against them (`bind_de_bruijn_roots`).
+/// Returns the binders (declaration order) and the bound roots (same order).
+pub(crate) fn bind_de_bruijn_construction(
+    ctx: &mut Z3Context,
+    decls: &[BinderDecl],
+    roots: &[Term],
+) -> Result<(Vec<Term>, Vec<Term>), String> {
+    let scan = scan_de_bruijn(ctx, roots);
+    let binders = mint_de_bruijn_binders(ctx, decls, &scan.names)?;
+    let public_sorts: Vec<Sort> = decls.iter().map(|decl| decl.sort.clone()).collect();
+    let bound = bind_de_bruijn_roots(ctx, &public_sorts, &binders, &scan, roots)?;
+    Ok((binders, bound))
+}
+
+/// Resolve the loose de Bruijn variables of a CONSTANT-style binder's roots
+/// (`Z3_mk_forall_const`, `Z3_mk_exists_const`, `Z3_mk_quantifier_const*`,
+/// `Z3_mk_lambda_const`) against its bound constants, as z3 does.
+///
+/// z3 abstracts the bound constants into `(:var n-1-i)` WITHOUT shifting the
+/// body's own variables, so a loose `(:var k)`, `k < n`, is captured by
+/// binder `n-1-k`, and `(:var k)`, `k >= n`, still names `(:var k-n)` of the
+/// enclosing scope (libz3 5.1.0, measured, `q1_const_pins.py`:
+/// `Exists([x], x != Var(0))` is `(exists ((x Int)) (distinct x x))`, unsat;
+/// `Lambda([x], x + Var(0))` is `(lambda ((x Int)) (+ x x))`;
+/// `substitute_vars(ForAll([x], Var(1) > x), 5)` is `(forall ((x Int)) (> 5
+/// x))`). AY left them free, so its formula differed from z3's, and
+/// `substitute_vars` then replaced a variable z3 had bound: `Exists([x], x !=
+/// Var(0))` with `Var(0) -> 5` answered sat where z3 answers unsat.
+///
+/// Refused (`Err`) when a variable's sort differs from its binder's (z3
+/// builds the ill-sorted AST; `judge_sound/j6.py`), and when a binder inside
+/// the roots has a bound constant's name: resolving a variable under it to
+/// that constant would be captured by the inner binder.
+pub(crate) fn bind_loose_vars_to_constants(
+    ctx: &mut Z3Context,
+    binders: &[Term],
+    public_sorts: &[Sort],
+    roots: &[Term],
+) -> Result<Vec<Term>, String> {
+    let scan = scan_de_bruijn(ctx, roots);
+    if scan.occurrences.is_empty() {
+        return Ok(roots.to_vec());
+    }
+    let (inner_binders, _) = super::provenance::binder_names(ctx, roots);
+    for &binder in binders {
+        if let TermKind::Var { name } = ctx.solver.term_kind(binder) {
+            if inner_binders.contains(&name) {
+                return Err(format!(
+                    "the body binds {} again and has loose de Bruijn variables, which z3 binds \
+                     to the bound constants; AY would capture them in the inner binder",
+                    super::ffi_surface_text(ctx, &ay_core::quote_symbol(&name))
+                ));
+            }
+        }
+    }
+    bind_de_bruijn_roots(ctx, public_sorts, binders, &scan, roots)
+}
+
+/// A quantifier's roots: its body, its trigger groups and its no-pattern
+/// terms, flattened in that order for one binding pass.
+pub(crate) struct QuantifierRoots {
+    pub(crate) body: Term,
+    pub(crate) triggers: Option<Vec<Vec<Term>>>,
+    pub(crate) no_patterns: Vec<Term>,
+}
+
+impl QuantifierRoots {
+    fn flatten(&self) -> Vec<Term> {
+        let pattern_count = self
+            .triggers
+            .as_ref()
+            .map_or(0, |groups| groups.iter().map(Vec::len).sum::<usize>());
+        let mut roots = Vec::with_capacity(1 + pattern_count + self.no_patterns.len());
+        roots.push(self.body);
+        if let Some(groups) = &self.triggers {
+            roots.extend(groups.iter().flatten().copied());
+        }
+        roots.extend(self.no_patterns.iter().copied());
+        roots
+    }
+
+    /// The same layout rebuilt from `flat` (one term per `flatten` slot);
+    /// `None` when the lengths disagree.
+    fn rebuilt(&self, flat: Vec<Term>) -> Option<Self> {
+        if flat.len() != self.flatten().len() {
+            return None;
+        }
+        let mut flat = flat.into_iter();
+        let body = flat.next()?;
+        let triggers = self.triggers.as_ref().map(|groups| {
+            groups
+                .iter()
+                .map(|group| flat.by_ref().take(group.len()).collect())
+                .collect()
+        });
+        Some(Self {
+            body,
+            triggers,
+            no_patterns: flat.collect(),
+        })
+    }
+
+    /// Apply a binding pass over every root.
+    pub(crate) fn bind_with(
+        self,
+        bind: impl FnOnce(&[Term]) -> Result<Vec<Term>, String>,
+    ) -> Result<Self, String> {
+        let bound = bind(&self.flatten())?;
+        self.rebuilt(bound)
+            .ok_or_else(|| "a quantifier root was lost while binding".to_string())
+    }
+}
+
+/// Resolve the de Bruijn variables of `roots` against `binders` (declaration
+/// order; `public_sorts` are their public sorts): `(:var k)`, `k < n`, becomes
+/// binder `n-1-k`, and `(:var k)`, `k >= n`, becomes `(:var k-n)` at the same
+/// sort. Refuses a variable whose public sort differs from its binder's.
+fn bind_de_bruijn_roots(
+    ctx: &mut Z3Context,
+    public_sorts: &[Sort],
+    binders: &[Term],
+    scan: &DeBruijnScan,
+    roots: &[Term],
+) -> Result<Vec<Term>, String> {
+    let n = binders.len();
+    let mut from = Vec::with_capacity(scan.occurrences.len());
+    let mut to = Vec::with_capacity(scan.occurrences.len());
+    for &(index, var) in &scan.occurrences {
+        let public = de_bruijn_public_sort(ctx, var);
+        let replacement = match index.checked_sub(n) {
+            Some(outer) => {
+                let engine = ctx.solver.term_sort(var);
+                de_bruijn_var_at(ctx, outer, engine, &public)?
+            }
+            None => {
+                let position = n - 1 - index;
+                let (Some(binder), Some(binder_sort)) =
+                    (binders.get(position), public_sorts.get(position))
+                else {
+                    return Err(format!("(:var {index}) has no binder"));
+                };
+                if public != *binder_sort {
+                    return Err(format!(
+                        "(:var {index}) has sort {}, but the binder it refers to has sort {}",
+                        render_public_sort(ctx, &public),
+                        render_public_sort(ctx, binder_sort)
+                    ));
+                }
+                *binder
+            }
+        };
+        from.push(var);
+        to.push(replacement);
+    }
+    if from.is_empty() {
+        return Ok(roots.to_vec());
+    }
+    Ok(roots
+        .iter()
+        .map(|&root| ctx.solver.substitute(root, &from, &to))
+        .collect())
 }
 
 /// Guard a quantifier body for bounded-Int-lowered bound variables.
@@ -370,7 +794,7 @@ pub(crate) unsafe fn mk_quantifier_const(
         // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so
         // it cannot cross the FFI boundary.
         unsafe {
-            return ffi_guard_ast(c, |ctx| {
+            return ffi_guard_mk(c, "mk_quantifier_const", |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("quantifier requires at least one bound variable".to_string());
                 0
@@ -427,7 +851,7 @@ pub(crate) unsafe fn mk_quantifier_const(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "mk_quantifier_const", |ctx| {
             let vars = require_term_asts_or_return!(ctx, &bound_asts, "quantifier construction", 0);
             let has_finite_set_binder = bound_asts.iter().any(|&ast| {
                 lookup_ast_sort(ctx, ast).is_some_and(|sort| sort_mentions_finite_set(ctx, sort))
@@ -451,6 +875,33 @@ pub(crate) unsafe fn mk_quantifier_const(
                 }
                 None => None,
             };
+            // z3 binds the roots' loose de Bruijn variables to the bound
+            // constants (`bind_loose_vars_to_constants`).
+            let public_bound_sorts: Vec<Sort> = bound_asts
+                .iter()
+                .zip(&vars)
+                .map(|(&ast, &var)| public_ast_sort(ctx, ast, var))
+                .collect();
+            let roots = QuantifierRoots {
+                body: body_term,
+                triggers: trigger_slices,
+                no_patterns: no_pattern_terms,
+            };
+            let bound = roots.bind_with(|roots| {
+                bind_loose_vars_to_constants(ctx, &vars, &public_bound_sorts, roots)
+            });
+            let QuantifierRoots {
+                body: body_term,
+                triggers: trigger_slices,
+                no_patterns: no_pattern_terms,
+            } = match bound {
+                Ok(bound) => bound,
+                Err(e) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("quantifier construction: {e}"));
+                    return 0;
+                }
+            };
             // Relativize bounded-Int-lowered bound vars (Char / finite-domain)
             // to their carrier range — see `guard_bounded_quantifier_body`.
             let var_bounds: Vec<(Term, i64)> = vars
@@ -470,20 +921,17 @@ pub(crate) unsafe fn mk_quantifier_const(
                 _ => None,
             };
             let body_term = guard_bounded_quantifier_body(ctx, is_forall, &var_bounds, body_term);
-            let result = if let Some(ref trigger_slices) = trigger_slices {
-                let trigger_refs: Vec<&[Term]> = trigger_slices.iter().map(Vec::as_slice).collect();
-                if is_forall {
-                    ctx.solver
-                        .try_forall_with_triggers(&vars, body_term, &trigger_refs)
-                } else {
-                    ctx.solver
-                        .try_exists_with_triggers(&vars, body_term, &trigger_refs)
-                }
-            } else if is_forall {
-                ctx.solver.try_forall(&vars, body_term)
-            } else {
-                ctx.solver.try_exists(&vars, body_term)
-            };
+            // The C API keeps binder identity: its bound constants ARE the
+            // public binders (`Solver::z3_compat_quantifier`).
+            let trigger_refs: Option<Vec<&[Term]>> = trigger_slices
+                .as_ref()
+                .map(|slices| slices.iter().map(Vec::as_slice).collect());
+            let result = ctx.solver.z3_compat_quantifier(
+                is_forall,
+                &vars,
+                body_term,
+                trigger_refs.as_deref(),
+            );
 
             match result {
                 Ok(term) => {
@@ -508,8 +956,7 @@ pub(crate) unsafe fn mk_quantifier_const(
                     if has_finite_set_binder {
                         activate_finite_set_quantifier_gate(ctx, term, "constant-style quantifier");
                     }
-                    record_ast_sort(ctx, ast, Sort::Bool);
-                    ast
+                    record_ast_sort(ctx, ast, Sort::Bool)
                 }
                 Err(e) => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -607,8 +1054,9 @@ pub unsafe extern "C" fn Z3_mk_exists(
 
 /// Shared implementation for de Bruijn-style quantifiers.
 ///
-/// Creates fresh named variables for each de Bruijn index, then delegates
-/// to the const-style quantifier construction.
+/// Mints one named binder per declaration and resolves the body's and the
+/// patterns' de Bruijn variables against them (`bind_de_bruijn_construction`),
+/// then builds the quantifier over the binders.
 ///
 /// # Safety
 /// All pointers must be valid.
@@ -640,7 +1088,7 @@ pub(crate) unsafe fn mk_quantifier_db(
         // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so
         // it cannot cross the FFI boundary.
         unsafe {
-            return ffi_guard_ast(c, |ctx| {
+            return ffi_guard_mk(c, "mk_quantifier_db", |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("quantifier requires at least one bound variable".to_string());
                 0
@@ -648,43 +1096,23 @@ pub(crate) unsafe fn mk_quantifier_db(
         }
     }
 
-    // Pre-extract sort/name data from raw pointers before entering the guard
-    let mut decl_data: Vec<(Sort, String)> = Vec::with_capacity(num_decls as usize);
-    for i in 0..num_decls as usize {
-        // SAFETY: The caller's `# Safety` contract guarantees `sorts` points to at least the
-        // declared number of elements. The count was range-checked above, and null-checked
-        // before entering this block, so `sorts.add(i)` stays within the caller's allocation.
-        let sort_ptr = unsafe { *sorts.add(i) };
-        // SAFETY: The caller's `# Safety` contract guarantees `decl_names` points to at least
-        // the declared number of elements. The count was range-checked above, and null-checked
-        // before entering this block, so `decl_names.add(i)` stays within the caller's
-        // allocation.
-        let sym_ptr = unsafe { *decl_names.add(i) };
-        if sort_ptr.is_null() || sym_ptr.is_null() {
-            // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on
-            // this extern "C" function requires it to be a valid, non-aliased pointer (or
-            // null). `ffi_guard_ast` handles the null case internally and catches any
-            // unwinding panic so it cannot cross the FFI boundary.
-            unsafe {
-                return ffi_guard_ast(c, |ctx| {
-                    ctx.last_error = Z3_INVALID_ARG;
-                    ctx.error_msg = Some("null sort or name in quantifier declaration".to_string());
-                    0
-                });
-            }
+    // Pre-extract sort/name data from raw pointers before entering the guard.
+    // SAFETY: The caller's `# Safety` contract guarantees `sorts` and
+    // `decl_names` point to at least `num_decls` elements of live AY handles;
+    // the count was range-checked and both arrays null-checked above.
+    let Some(decl_data) = (unsafe { read_binder_decls(num_decls, sorts, decl_names) }) else {
+        // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on
+        // this extern "C" function requires it to be a valid, non-aliased pointer (or
+        // null). `ffi_guard_ast` handles the null case internally and catches any
+        // unwinding panic so it cannot cross the FFI boundary.
+        unsafe {
+            return ffi_guard_mk(c, "mk_quantifier_db", |ctx| {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some("null sort or name in quantifier declaration".to_string());
+                0
+            });
         }
-        // SAFETY: `sort_ptr` was null-checked above and originates from a prior AY FFI
-        // allocation whose handle is kept alive by the owning `Z3Context` (see handle caches
-        // in `mod.rs`). Reading `.sort` is a shared-read with no concurrent mutation because
-        // the Z3 C API is single-threaded per context.
-        let sort = unsafe { (*sort_ptr).sort.clone() };
-        // SAFETY: `sym_ptr` was null-checked above and originates from a prior AY FFI
-        // allocation whose handle is kept alive by the owning `Z3Context` (see handle caches
-        // in `mod.rs`). Reading the symbol key is a shared-read with no concurrent mutation because
-        // the Z3 C API is single-threaded per context.
-        let name = unsafe { (*sym_ptr).semantic_name() };
-        decl_data.push((sort, name));
-    }
+    };
 
     // Create bound variables + quantifier in a single guard closure
     // (can't split into two guards since both need &mut ctx)
@@ -693,10 +1121,10 @@ pub(crate) unsafe fn mk_quantifier_db(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "mk_quantifier_db", |ctx| {
             let has_finite_set_binder = decl_data
                 .iter()
-                .any(|(sort, _)| sort_mentions_finite_set(ctx, sort));
+                .any(|decl| sort_mentions_finite_set(ctx, &decl.sort));
             // Authenticate every caller-provided term/pattern before declaring
             // bound variables, so a rejected call leaves the solver unchanged.
             let body_term =
@@ -742,38 +1170,54 @@ pub(crate) unsafe fn mk_quantifier_db(
                 None
             };
 
-            let mut vars: Vec<Term> = Vec::with_capacity(decl_data.len());
-            for (sort, name) in &decl_data {
-                let engine_sort = finite_set_engine_public_sort(ctx, sort);
-                let term = ctx.solver.declare_const(name, engine_sort);
-                let ast = term_to_ast(ctx, term);
-                record_ast_sort(ctx, ast, sort.clone());
-                vars.push(term);
-            }
+            // Bind the body's, the patterns' and the no-patterns' de Bruijn
+            // variables to named binders (see `bind_de_bruijn_roots`): without
+            // this, `(:var 0)` stayed a FREE variable of the quantifier, so
+            // `forall x. (:var 0) > 0` was answered sat (z3: unsat, p1_db.py).
+            let roots = QuantifierRoots {
+                body: body_term,
+                triggers: trigger_slices,
+                no_patterns: no_pattern_terms,
+            };
+            let mut vars = Vec::new();
+            let bound = roots.bind_with(|roots| {
+                let (binders, bound) = bind_de_bruijn_construction(ctx, &decl_data, roots)?;
+                vars = binders;
+                Ok(bound)
+            });
+            let QuantifierRoots {
+                body: body_term,
+                triggers: trigger_slices,
+                no_patterns: no_pattern_terms,
+            } = match bound {
+                Ok(bound) => bound,
+                Err(e) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("quantifier construction: {e}"));
+                    return 0;
+                }
+            };
 
             // Relativize bounded-Int-lowered bound vars (Char / finite-domain)
             // to their carrier range — see `guard_bounded_quantifier_body`.
             let var_bounds: Vec<(Term, i64)> = decl_data
                 .iter()
                 .zip(vars.iter())
-                .filter_map(|((sort, _), &v)| bounded_sort_hi(sort).map(|hi| (v, hi)))
+                .filter_map(|(decl, &v)| bounded_sort_hi(&decl.sort).map(|hi| (v, hi)))
                 .collect();
             let body_term = guard_bounded_quantifier_body(ctx, is_forall, &var_bounds, body_term);
 
-            let result = if let Some(ref trigger_slices) = trigger_slices {
-                let trigger_refs: Vec<&[Term]> = trigger_slices.iter().map(Vec::as_slice).collect();
-                if is_forall {
-                    ctx.solver
-                        .try_forall_with_triggers(&vars, body_term, &trigger_refs)
-                } else {
-                    ctx.solver
-                        .try_exists_with_triggers(&vars, body_term, &trigger_refs)
-                }
-            } else if is_forall {
-                ctx.solver.try_forall(&vars, body_term)
-            } else {
-                ctx.solver.try_exists(&vars, body_term)
-            };
+            // The C API keeps binder identity: its bound constants ARE the
+            // public binders (`Solver::z3_compat_quantifier`).
+            let trigger_refs: Option<Vec<&[Term]>> = trigger_slices
+                .as_ref()
+                .map(|slices| slices.iter().map(Vec::as_slice).collect());
+            let result = ctx.solver.z3_compat_quantifier(
+                is_forall,
+                &vars,
+                body_term,
+                trigger_refs.as_deref(),
+            );
 
             match result {
                 Ok(term) => {
@@ -785,8 +1229,7 @@ pub(crate) unsafe fn mk_quantifier_db(
                     if has_finite_set_binder {
                         activate_finite_set_quantifier_gate(ctx, term, "de-Bruijn quantifier");
                     }
-                    record_ast_sort(ctx, ast, Sort::Bool);
-                    ast
+                    record_ast_sort(ctx, ast, Sort::Bool)
                 }
                 Err(e) => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -797,3 +1240,23 @@ pub(crate) unsafe fn mk_quantifier_db(
         })
     }
 }
+
+#[cfg(test)]
+#[path = "t5x_quarantine_support.rs"]
+mod t5x_quarantine_support;
+
+#[cfg(test)]
+#[path = "t5x_quarantine_q1_tests.rs"]
+mod t5x_quarantine_q1_tests;
+
+#[cfg(test)]
+#[path = "t5x_quarantine_q1_const_tests.rs"]
+mod t5x_quarantine_q1_const_tests;
+
+#[cfg(test)]
+#[path = "t5x_quarantine_q34_tests.rs"]
+mod t5x_quarantine_q34_tests;
+
+#[cfg(test)]
+#[path = "t5x_quarantine_q4_bool_tests.rs"]
+mod t5x_quarantine_q4_bool_tests;

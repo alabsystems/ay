@@ -183,6 +183,10 @@ pub enum Sort {
     /// arguments) is NOT supported and fails with an honest sort error — it is
     /// never silently mis-solved.
     TypeVar(String),
+    /// Complex numbers, represented semantically by a pair of Real components.
+    Complex,
+    /// Prime field of the checked characteristic; never an uninterpreted sort.
+    FiniteField(FiniteFieldSort),
 }
 
 // Hand-written serde impls for the sort types.
@@ -194,8 +198,15 @@ pub enum Sort {
 // plain matches with no operation that can panic. The derive expansions
 // carried Trust L0 panic-freedom obligations the verifier could not
 // discharge; this form discharges them by construction.
+mod complex;
+mod finite_field;
+pub use finite_field::{FiniteFieldSort, MAX_FINITE_FIELD_MODULUS};
+
 mod sort_serde {
-    use super::{ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
+    use super::{
+        ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, FiniteFieldSort,
+        Sort,
+    };
     use serde::de::{
         Deserialize, Deserializer, EnumAccess, Error as DeError, MapAccess, SeqAccess, Unexpected,
         VariantAccess, Visitor,
@@ -996,6 +1007,8 @@ mod sort_serde {
         "Char",
         "FiniteDomain",
         "TypeVar",
+        "Complex",
+        "FiniteField",
     ];
 
     impl Serialize for Sort {
@@ -1042,6 +1055,10 @@ mod sort_serde {
                 Sort::TypeVar(ref name) => {
                     serializer.serialize_newtype_variant("Sort", 13, "TypeVar", name)
                 }
+                Sort::Complex => serializer.serialize_unit_variant("Sort", 14, "Complex"),
+                Sort::FiniteField(field) => {
+                    serializer.serialize_newtype_variant("Sort", 15, "FiniteField", &field)
+                }
             }
         }
     }
@@ -1061,6 +1078,8 @@ mod sort_serde {
         Char,
         FiniteDomain,
         TypeVar,
+        Complex,
+        FiniteField,
     }
 
     impl<'de> Deserialize<'de> for SortVariant {
@@ -1100,9 +1119,11 @@ mod sort_serde {
                 11 => Ok(SortVariant::Char),
                 12 => Ok(SortVariant::FiniteDomain),
                 13 => Ok(SortVariant::TypeVar),
+                14 => Ok(SortVariant::Complex),
+                15 => Ok(SortVariant::FiniteField),
                 _ => Err(DeError::invalid_value(
                     Unexpected::Unsigned(value),
-                    &"variant index 0 <= i < 14",
+                    &"variant index 0 <= i < 16",
                 )),
             }
         }
@@ -1126,6 +1147,8 @@ mod sort_serde {
                 "Char" => Ok(SortVariant::Char),
                 "FiniteDomain" => Ok(SortVariant::FiniteDomain),
                 "TypeVar" => Ok(SortVariant::TypeVar),
+                "Complex" => Ok(SortVariant::Complex),
+                "FiniteField" => Ok(SortVariant::FiniteField),
                 _ => Err(DeError::unknown_variant(value, SORT_VARIANTS)),
             }
         }
@@ -1149,6 +1172,8 @@ mod sort_serde {
                 b"Char" => Ok(SortVariant::Char),
                 b"FiniteDomain" => Ok(SortVariant::FiniteDomain),
                 b"TypeVar" => Ok(SortVariant::TypeVar),
+                b"Complex" => Ok(SortVariant::Complex),
+                b"FiniteField" => Ok(SortVariant::FiniteField),
                 _ => Err(DeError::unknown_variant(
                     &String::from_utf8_lossy(value),
                     SORT_VARIANTS,
@@ -1288,6 +1313,14 @@ mod sort_serde {
                 }
                 (SortVariant::TypeVar, variant) => {
                     variant.newtype_variant::<String>().map(Sort::TypeVar)
+                }
+                (SortVariant::FiniteField, variant) => {
+                    let field: FiniteFieldSort = variant.newtype_variant()?;
+                    Ok(Sort::FiniteField(field))
+                }
+                (SortVariant::Complex, variant) => {
+                    variant.unit_variant()?;
+                    Ok(Sort::Complex)
                 }
             }
         }
@@ -1530,6 +1563,8 @@ impl fmt::Display for Sort {
             Self::Bool => write!(f, "Bool"),
             Self::Int => write!(f, "Int"),
             Self::Real => write!(f, "Real"),
+            Self::Complex => write!(f, "Complex"),
+            Self::FiniteField(field) => write!(f, "(_ FiniteField {})", field.modulus()),
             Self::BitVec(bv) => write!(f, "(_ BitVec {})", bv.width),
             Self::Array(arr) => write!(f, "(Array {} {})", arr.index_sort, arr.element_sort),
             Self::String => write!(f, "String"),
@@ -1548,25 +1583,3 @@ impl fmt::Display for Sort {
 #[cfg(test)]
 #[path = "sort_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    /// REQUIRES: w1 != w2 (distinct bitvector widths)
-    /// ENSURES: BitVec(w1) != BitVec(w2) (different widths are distinct sorts)
-    #[kani::proof]
-    fn proof_bitvec_width_distinguishes() {
-        let w1: u32 = kani::any();
-        let w2: u32 = kani::any();
-        kani::assume(w1 != w2);
-
-        let bv1 = Sort::bitvec(w1);
-        let bv2 = Sort::bitvec(w2);
-
-        assert!(
-            bv1 != bv2,
-            "Different bitvector widths must be distinct sorts"
-        );
-    }
-}

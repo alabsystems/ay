@@ -12,8 +12,8 @@
 //! passing one parsed cleanly, changed nothing, and mislabeled the result.
 //! That is measurement rule R7's vacuous null, and this campaign has paid for it
 //! four times already (`--root-cuts-per-round`, `--gmi-rounds`,
-//! `--eager-perturb-mode`, `--no-float`). `tests/knob_census.rs` is the gate that
-//! stops incident five; this module is the repair for the backlog it found.
+//! `--eager-perturb-mode`, `--no-float`); this module is the repair for the
+//! backlog a reader/writer census found.
 //!
 //! # Every carrier here is `None` by default
 //!
@@ -563,9 +563,7 @@ impl EngineEconomics {
     }
     /// Lower the census-repaired carriers into the knob profile.
     ///
-    /// One table rather than a hundred `if let` arms: the list is mechanical,
-    /// and a table is what `tests/knob_census.rs` reads as evidence that each
-    /// knob has a writer.
+    /// One table rather than a hundred `if let` arms: the list is mechanical.
     pub(super) fn extend_census_profile(&self, mut p: Profile) -> Profile {
         for (knob, value) in [
             (Knob::SingletonSub, self.singleton_sub.map(Setting::Flag)),

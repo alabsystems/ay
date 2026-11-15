@@ -1,0 +1,8 @@
+(set-logic UFNRA)
+(declare-sort V 0)
+(declare-fun P (V) Bool)
+(assert (forall ((v V)) (P v)))
+(declare-const b Real)
+(assert (> b 6.0))
+(assert (forall ((x Real)) (or (> b 5.0) (>= (* x x) 0.0))))
+(check-sat)

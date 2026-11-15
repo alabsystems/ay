@@ -96,9 +96,37 @@ fn test_cegqi_symbolic_modulus_stays_fail_closed() {
 
 /// A live UF widens the post-quantifier route to QF_UFNIA. The guard is tied
 /// to the unsupported operation, not one particular widened category.
+///
+/// The bound is `(f 0) + 5`, so no instance at a ground term of the problem
+/// refutes it (`x := d` gives `(div d d) = 1 <= 5`): only a counterexample-
+/// guided `x` does, and that is what the guard keeps fail-closed. With the
+/// bound `(f 0)` itself the instance at `x := d` refutes the universal
+/// through the exact quotient `(div d d) = 1` (#nia-symbolic-division-exact),
+/// which `test_uflia_symbolic_divisor_refuted_by_a_ground_instance` pins.
 #[test]
 #[ntest::timeout(20_000)]
 fn test_cegqi_uflia_symbolic_divisor_stays_fail_closed() {
+    let input = r#"
+        (set-logic UFLIA)
+        (declare-fun d () Int)
+        (declare-fun f (Int) Int)
+        (assert (= (f 0) 0))
+        (assert (> d 0))
+        (assert (forall ((x Int)) (<= (div x d) (+ (f 0) 5))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_eq!(outputs, vec!["unknown"]);
+}
+
+/// UNSAT (z3 4.12.5): the universal fails at `x := d`, a ground term of the
+/// problem, because `(div d d) = 1 > 0 = (f 0)` when `d > 0`. The refutation
+/// uses that one instance and the exact-quotient lemma, no counterexample.
+#[test]
+#[ntest::timeout(20_000)]
+fn test_uflia_symbolic_divisor_refuted_by_a_ground_instance() {
     let input = r#"
         (set-logic UFLIA)
         (declare-fun d () Int)
@@ -111,7 +139,7 @@ fn test_cegqi_uflia_symbolic_divisor_stays_fail_closed() {
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
-    assert_eq!(outputs, vec!["unknown"]);
+    assert_eq!(outputs, vec!["unsat"]);
 }
 
 /// Division by literal zero keeps the #57 underspecified semantics.

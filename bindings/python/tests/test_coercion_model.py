@@ -18,7 +18,7 @@
 # values). SOUNDNESS: ayz3 reports AY's REAL answer; coercion produces a
 # semantically correct ToReal-promoted term, never a hack.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 from fractions import Fraction
 

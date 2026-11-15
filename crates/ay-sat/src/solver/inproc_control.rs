@@ -114,8 +114,9 @@ impl InprocessingProofSupport {
             | ProofTransform::Factor
             | ProofTransform::Sbva
             | ProofTransform::Decompose
-            | ProofTransform::Congruence => Self::DratOnly,
-            ProofTransform::Sweep | ProofTransform::Symmetry => Self::None,
+            | ProofTransform::Congruence
+            | ProofTransform::Sweep => Self::DratOnly,
+            ProofTransform::Symmetry => Self::None,
             ProofTransform::Inprobe
             | ProofTransform::Vivify
             | ProofTransform::VivifyIrred

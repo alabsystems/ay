@@ -16,11 +16,12 @@
 use crate::literal::{Literal, Variable};
 use std::mem::size_of;
 
-mod replay;
+pub(crate) mod admitted;
+#[cfg(test)]
+pub(crate) mod legacy_sweep_tests;
+pub(crate) mod replay;
 #[cfg(test)]
 mod tests;
-#[cfg(kani)]
-mod verification;
 
 use replay::{reconstruct_sweep, reconstruct_witness};
 
@@ -105,18 +106,6 @@ impl ReconstructionStack {
             .sum();
         // 24 bytes for the Vec header of `steps`.
         24 + backbone + step_contents
-    }
-
-    /// Whether there are no reconstruction steps.
-    #[cfg(kani)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.steps.is_empty()
-    }
-
-    /// Remove all reconstruction steps (used by Kani proofs only).
-    #[cfg(kani)]
-    pub(crate) fn clear(&mut self) {
-        self.steps.clear();
     }
 
     /// Drain witness entries from the reconstruction stack, preserving non-witness steps.
@@ -319,6 +308,14 @@ impl ReconstructionStack {
     ///
     /// Reference: CaDiCaL `extend.cpp:121-204`.
     pub(crate) fn reconstruct(&self, model: &mut Vec<bool>) {
+        admitted::ordinary(self.reconstruct_admitted(model, &admitted::Ordinary));
+    }
+
+    pub(crate) fn reconstruct_admitted<P: admitted::Work>(
+        &self,
+        model: &mut Vec<bool>,
+        policy: &P,
+    ) -> Result<(), P::Error> {
         // Single-pass reverse reconstruction, matching CaDiCaL extend.cpp:121-204.
         //
         // Process ALL steps in reverse order regardless of type. This preserves
@@ -332,15 +329,17 @@ impl ReconstructionStack {
         // before any sweep steps, causing cascading variable flip violations on
         // large formulas (IBM12 #5696).
         for step in self.steps.iter().rev() {
+            policy.work(1)?;
             match step {
                 ReconstructionStep::Witness(wc) => {
-                    reconstruct_witness(model, &wc.witness, &wc.clause);
+                    replay::reconstruct_witness_admitted(model, &wc.witness, &wc.clause, policy)?;
                 }
                 ReconstructionStep::Sweep { num_vars, lit_map } => {
-                    reconstruct_sweep(model, *num_vars, lit_map);
+                    replay::reconstruct_sweep_admitted(model, *num_vars, lit_map, policy)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Get a reference to the steps slice for diagnostic replay (#8485).

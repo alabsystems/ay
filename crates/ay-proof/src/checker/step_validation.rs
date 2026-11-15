@@ -115,6 +115,22 @@ pub(crate) fn validate_step_with_datatypes_and_progress(
     );
     match step {
         ProofStep::Assume(term) => derived_clauses.push(Some(vec![*term])),
+        ProofStep::FiniteFieldLinear {
+            clause,
+            multipliers,
+        } => {
+            finite_field::linear::validate_variable(terms, step_id, clause, multipliers, progress)?;
+            derived_clauses.push(Some(clause.clone()));
+        }
+        ProofStep::NraSos {
+            clause,
+            certificate,
+        } => {
+            // A typed witness is never an unchecked axiom, even in non-strict
+            // mode. Publish its clause only after complete independent replay.
+            validate_nra_sos_with_progress(terms, step_id, clause, certificate, progress)?;
+            derived_clauses.push(Some(clause.clone()));
+        }
         ProofStep::TheoryLemma {
             clause,
             kind,
@@ -139,12 +155,15 @@ pub(crate) fn validate_step_with_datatypes_and_progress(
             progress,
         )?,
         ProofStep::Step {
-            rule: rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq),
+            rule:
+                rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq | AletheRule::DivModDef),
             clause,
             premises,
             args,
         } => derived_clauses.push(Some(if strict {
-            validate_fresh_definition_step(terms, rule, step_id, clause, premises, args, fresh_defs)?
+            validate_fresh_definition_step(
+                terms, rule, step_id, clause, premises, args, fresh_defs,
+            )?
         } else {
             // Non-strict checking admits the clause exactly as it admits the
             // premiseless `trust` step this rule replaces.

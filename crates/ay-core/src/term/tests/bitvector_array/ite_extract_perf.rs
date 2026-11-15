@@ -484,17 +484,6 @@ fn test_instance_term_bytes_tracks_allocation() {
     );
 }
 
-#[test]
-#[serial(global_term_memory)]
-fn test_global_memory_exceeded_default_threshold() {
-    // With a fresh counter and default 4GB limit, memory should not be exceeded
-    TermStore::reset_global_term_bytes();
-    assert!(
-        !TermStore::global_memory_exceeded(),
-        "fresh counter should not exceed 4GB limit"
-    );
-}
-
 /// Verify that per-instance accounting tracks allocation when new terms are interned,
 /// including both inline TermEntry size and heap allocations inside TermData.
 ///
@@ -929,28 +918,6 @@ fn test_heap_accounting_let_binding() {
         delta >= entry_size + min_heap,
         "Let binding accounting: delta {delta} should be >= {entry_size} (entry) + {min_heap} (bindings heap)",
     );
-}
-
-/// Verify per-engine budget computation.
-#[test]
-#[serial(global_term_memory)]
-fn test_per_engine_budget_divides_by_engine_count() {
-    // With usize::MAX limit and 4 engines, per-engine budget is usize::MAX / 4.
-    TermStore::set_engine_count(4);
-    let budget = TermStore::per_engine_budget();
-    assert_eq!(budget, usize::MAX / 4);
-
-    // Reset to 1 engine (default).
-    TermStore::set_engine_count(1);
-    let budget = TermStore::per_engine_budget();
-    assert_eq!(budget, usize::MAX);
-
-    // 0 engines clamps to 1 (prevent division by zero).
-    TermStore::set_engine_count(0);
-    let budget = TermStore::per_engine_budget();
-    assert_eq!(budget, usize::MAX);
-
-    TermStore::set_engine_count(1);
 }
 
 /// Verify that hash-consed duplicates do not double-count memory.

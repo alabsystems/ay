@@ -13,6 +13,9 @@ use super::{
     usable_atom, ArithIteSeeding, RootAuthentication, MAX_OR_DISTRIBUTION_CHOICES,
     MAX_OR_DISTRIBUTION_CLAUSES, MAX_SEED_DEPTH,
 };
+use ay_frontend::command::Term as FrontendTerm;
+
+use crate::executor::proof_surface_syntax::strip_frontend_annotations;
 use crate::executor::proof_trust_surgery_provenance::{
     immediate_surface_parts_match, surface_arithmetic_ite_matches, surface_or_decomposition_matches,
 };
@@ -54,7 +57,9 @@ impl Executor {
                 // would print a different rule shape than the authored text.
                 if unit.is_none() && !self.and_root_matches_authored_surface(auth, fact, &conjuncts)
                 {
-                    return true;
+                    return self.seed_raw_authored_conjunction(
+                        seeding, candidate, auth, fact, &conjuncts, depth,
+                    );
                 }
                 let unit = unit.unwrap_or_else(|| seeding.assume_once(candidate, fact));
                 let not_fact = self.ctx.terms.mk_not_raw(fact);
@@ -455,6 +460,93 @@ impl Executor {
             return false;
         };
         immediate_surface_parts_match(&mut self.ctx, parsed, "and", conjuncts)
+    }
+
+    /// Seed the exact raw re-intern of an authored conjunction.
+    ///
+    /// Parse mode only. The root must be in the raw-source ledger, i.e. the
+    /// recursive raw re-intern of one parsed `(and ...)` original, so its
+    /// `and_pos` projections are positional over the authored text by
+    /// construction. Each projected raw conjunct is seeded as its elaborated
+    /// conjunct when a checked transport exists (folded closed subterms,
+    /// `(= p false)`, `false` disjuncts, a lifted equality over an `ite`),
+    /// and as itself otherwise. Always `true`: an unmatched root is skipped.
+    fn seed_raw_authored_conjunction(
+        &mut self,
+        seeding: &mut ArithIteSeeding,
+        candidate: &mut Proof,
+        auth: &mut RootAuthentication<'_>,
+        root: TermId,
+        conjuncts: &[TermId],
+        depth: usize,
+    ) -> bool {
+        if auth.native_asserted.is_some()
+            || !self.last_proof_raw_original_assertions.contains(&root)
+        {
+            return true;
+        }
+        let mut operands = None;
+        for (_, parsed) in auth.originals {
+            let FrontendTerm::App(head, parsed_operands) = strip_frontend_annotations(parsed)
+            else {
+                continue;
+            };
+            if head != "and" || parsed_operands.len() != conjuncts.len() {
+                continue;
+            }
+            if self.raw_intern_surface(parsed) == Some(root) {
+                operands = Some(parsed_operands.clone());
+                break;
+            }
+        }
+        let Some(operands) = operands else {
+            return true;
+        };
+        let unit = seeding.assume_once(candidate, root);
+        let not_root = self.ctx.terms.mk_not_raw(root);
+        let true_term = self.ctx.terms.true_term();
+        for (index, (&conjunct, operand)) in conjuncts.iter().zip(operands.iter()).enumerate() {
+            let Ok(position) = u32::try_from(index) else {
+                continue;
+            };
+            if !seeding.charge() {
+                return true;
+            }
+            let and_pos = candidate.add_rule_step(
+                AletheRule::AndPos(position),
+                vec![not_root, conjunct],
+                Vec::new(),
+                vec![root],
+            );
+            let conjunct_unit = candidate.add_resolution(vec![conjunct], root, and_pos, unit);
+            let elaborated = self
+                .ctx
+                .elaborate_surface_subterm(strip_frontend_annotations(operand));
+            let (fact, fact_unit) = match elaborated {
+                Some(elaborated) if elaborated == true_term => continue,
+                Some(elaborated) if elaborated != conjunct => {
+                    match self.plan_conjunct_transport(conjunct, elaborated) {
+                        Some(plan) => {
+                            seeding.transported.push(elaborated);
+                            let unit = self.emit_conjunct_transport(
+                                candidate,
+                                conjunct_unit,
+                                conjunct,
+                                elaborated,
+                                &plan,
+                            );
+                            (elaborated, unit)
+                        }
+                        None => (conjunct, conjunct_unit),
+                    }
+                }
+                _ => (conjunct, conjunct_unit),
+            };
+            if !self.seed_fact_clauses(seeding, candidate, auth, fact, Some(fact_unit), depth + 1) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Seed an authored formula-level ITE root, fail-closed. The root is

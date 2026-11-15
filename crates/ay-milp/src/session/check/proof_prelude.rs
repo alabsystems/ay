@@ -40,7 +40,7 @@ fn try_sat_relu_proof(session: &mut BabSession, state: &mut CheckState) -> Route
         plan.try_solve_with_proof(&session.model, Some(deadline), session.opts.memory_budget)
     });
 
-    let outcome = match decision {
+    let (outcome, proof) = match decision {
         Some(crate::sat_relu::SatReluProofDecision::Sat(checked)) => {
             #[cfg(test)]
             crate::sat_relu::test_wait_before_session_finish();
@@ -53,13 +53,14 @@ fn try_sat_relu_proof(session: &mut BabSession, state: &mut CheckState) -> Route
                 &session.opts,
             );
             let claims = lane_frame.take_lane_claims();
-            session.admit_or_defer(
+            let outcome = session.admit_or_defer(
                 &crate::claim::SAT_RELU_PROOF,
                 outcome,
                 &solved,
                 claims,
                 Finisher::AlreadyFinished,
-            )
+            );
+            (outcome, SupplementalProof::None)
         }
         Some(crate::sat_relu::SatReluProofDecision::Unsat(certificate)) => {
             session.sat_relu_infeasibility_certificate = Some(certificate);
@@ -75,13 +76,14 @@ fn try_sat_relu_proof(session: &mut BabSession, state: &mut CheckState) -> Route
                 SupplementalProof::VerifiedSatReluInfeasibility,
             );
             let claims = lane_frame.take_lane_claims();
-            session.admit_or_defer(
+            let outcome = session.admit_or_defer(
                 &crate::claim::SAT_RELU_PROOF,
                 outcome,
                 &solved,
                 claims,
                 Finisher::AlreadyFinished,
-            )
+            );
+            (outcome, SupplementalProof::VerifiedSatReluInfeasibility)
         }
         None => {
             drop(lane_frame);
@@ -91,7 +93,9 @@ fn try_sat_relu_proof(session: &mut BabSession, state: &mut CheckState) -> Route
             return RouteOutcome::Continue;
         }
     };
-    outcome.map_or(RouteOutcome::Continue, RouteOutcome::finish)
+    outcome.map_or(RouteOutcome::Continue, |outcome| {
+        RouteOutcome::finish_with_proof(outcome, proof)
+    })
 }
 
 /// Admit only a source-verified parity refutation as typed authority.
@@ -116,13 +120,14 @@ fn try_parity(session: &mut BabSession, state: &mut CheckState) -> RouteOutcome 
             drop(lane_frame);
             session.parity_infeasibility_certificate = Some(certificate);
             let solved = state.take_solved(session);
-            RouteOutcome::finish(finish_exact_reduction_with_supplemental_proof(
+            let outcome = finish_exact_reduction_with_supplemental_proof(
                 infeasible,
                 &session.model,
                 &solved,
                 &session.opts,
                 SupplementalProof::VerifiedParityInfeasibility,
-            ))
+            );
+            RouteOutcome::finish_with_proof(outcome, SupplementalProof::VerifiedParityInfeasibility)
         }
         Outcome::Optimal {
             value,

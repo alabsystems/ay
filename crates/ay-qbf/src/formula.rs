@@ -293,7 +293,9 @@ impl QbfFormula {
         // Q-resolution never reduces a tautological clause: removing only the
         // universal side of a complementary pair would turn a tautology into
         // a real constraint. Preserve it verbatim.
-        let mut seen = HashSet::with_capacity(clause.len());
+        // The reservation is only a capacity hint; inserts grow on demand.
+        let mut seen = HashSet::new();
+        let _ = seen.try_reserve(clause.len());
         for &literal in clause {
             if seen.contains(&literal.negated()) {
                 return clause.to_vec();

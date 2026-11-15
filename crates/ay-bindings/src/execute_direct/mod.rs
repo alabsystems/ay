@@ -5,7 +5,8 @@
 //! Direct AY Program Execution.
 //!
 //! This module provides direct execution of `AYProgram` against the
-//! `ay_dpll::api::Solver` without SMT-LIB2 serialization and parsing.
+//! `ay_dpll::api::Solver`. Programs requesting proofs also retain bounded
+//! assertion source, checked against the translated term, for independent replay.
 //!
 //! Decomposed into submodules per #1056.
 //!
@@ -81,22 +82,30 @@
 //!
 //! See issue #513 for context.
 
+mod assertion_source;
 mod constraints;
 mod context;
+mod datatypes;
+mod digest;
 mod driver;
 mod extract;
 mod fallback;
 mod incremental;
 mod logic;
+mod memo;
 mod omt;
+mod payload;
+mod session;
 mod translate;
 mod translate_bridge;
+mod truncating;
 mod types;
 
 use crate::program::AYProgram;
 use driver::{execute_typed_with_details_impl, into_untyped_details, render_execute_result};
 
 pub use ay_dpll::api::ModelValue;
+pub use session::{ExecutionSession, SessionCheck};
 pub use types::{
     CheckSatOutcome, ExecuteCounterexample, ExecuteDegradation, ExecuteDegradationKind,
     ExecuteDetails, ExecuteError, ExecuteFallback, ExecuteFallbackKind, ExecuteResult,

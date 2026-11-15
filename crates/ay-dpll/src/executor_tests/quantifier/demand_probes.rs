@@ -16,12 +16,15 @@
 //!   dual-vocabulary bridge chain and the two-recursive-field tree defining
 //!   forall.  Both solve `unsat` in a plain production solve and run in the
 //!   default suite.
-//! - REDS — expected NOT `unsat` today (Unknown/timeout). Post-M5 this is the
-//!   residual ground DT+LIA combiner gap (`red_ground_dtlia`, NO foralls, so the
-//!   demand lane arms nothing and the solve is byte-identical to the eager path).
-//!   The pin asserts the verdict is not `unsat`: **if it ever flips, a human must
-//!   look** — with no forall to gate it would be an unexpected ground-combiner
-//!   change, not a demand-lane win.
+//! - REDS — the residual ground DT+LIA combiner gap (`red_ground_dtlia`, NO
+//!   foralls, so the demand lane arms nothing and the solve is byte-identical to
+//!   the eager path). It was pinned NOT `unsat` while the lazy-DT-AUFLIA route
+//!   was opt-in on `solve_dt_uf_lia`; since that call site went default-on
+//!   (2026-09-17) the lazy route closes it to its z3-correct `unsat` in 0.26 s
+//!   and the pin asserts THAT. With the kill switch `AY_DT_LAZY_AUFLIA=0` the
+//!   old expectation is asserted instead: a flip to `unsat` there would be an
+//!   unexpected ground-combiner change with no forall to gate it, and **a human
+//!   must look**. The never-wrong-`sat` arm is unconditional in both.
 //!
 //! MEASURED RECLASSIFICATION (2026-07-16, b9e51ad1): the blueprint's fourth red,
 //! `freevar_bridge_repro`, is EMPIRICALLY `unsat` (<0.01s) on this base — its
@@ -248,6 +251,10 @@ const PRODUCTION_FLIPS: &[(&str, &str)] = &[
         GREEN_FREEVAR_TAKESOME_MANUAL_D1,
     ),
     ("sum_tree_forall", RED_SUM_TREE_FORALL),
+    (
+        "uf787634_bridge_chain",
+        super::uf787_bridge_withheld::UF787634_BRIDGE_CHAIN,
+    ),
 ];
 
 /// Post-M5 residual reds: expected NOT-`unsat` (the lane arms nothing here).
@@ -332,9 +339,15 @@ fn demand_red_probes_are_not_unsat_today() {
     // demand-lane change. Reclassify the pin accordingly (the file's own "flip =>
     // celebrate and reclassify" rule); the never-wrong-`sat` soundness arm holds
     // unconditionally.
-    let lazy_auflia = std::env::var("AY_DT_LAZY_AUFLIA")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    //
+    // 2026-09-17: the route is now DEFAULT-ON at its `solve_dt_uf_lia` call site
+    // (`AY_DT_LAZY_AUFLIA=0` is the kill switch), so the armed arm below is the
+    // ordinary one and the red is closed in a plain production solve — measured
+    // `unsat` in 0.26 s against the eager path's `unknown`. This predicate MUST
+    // read exactly like production's `is_none_or(|v| v != "0")`, or the pin
+    // asserts the wrong arm.
+    let lazy_auflia =
+        std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v.to_str().is_none_or(|v| v != "0"));
     for (name, smt2) in REDS {
         let (verdict, _stats) = solve(smt2, RED_TIMEOUT);
         if lazy_auflia {

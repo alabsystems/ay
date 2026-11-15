@@ -9,9 +9,11 @@
 //!
 //! Submodules:
 //! - `mbp`: Model-based projection (MBP) cube extraction strategies.
+//! - `free`: the Spacer lane's free child constructor (R2, exact MBP, no pins).
 
 use super::{cube, Arc, ChcExpr, ChcSort, ChcVar, FxHashMap, PdrSolver, PredicateId, SmtValue};
 
+mod free;
 mod mbp;
 
 impl PdrSolver {

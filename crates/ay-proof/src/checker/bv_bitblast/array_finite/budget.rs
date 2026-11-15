@@ -6,14 +6,15 @@
 
 use ay_core::{time::Instant, TermId};
 
-use super::super::{bv_expr_nodes, BvExpr, ProofProducingLowerer, MAX_PROOF_PRODUCING_EXPR_NODES};
+use super::super::{BvExpr, ProofProducingLowerer, MAX_FINITE_ARRAY_EXPANSION_NODES};
 use super::{
     classify_source_sort, FiniteArrayExpr, FiniteSortShape, FiniteSourceSort,
     MAX_EXACT_FINITE_ARRAY_WORK,
 };
 
-impl ProofProducingLowerer<'_> {
+impl ProofProducingLowerer<'_, '_> {
     pub(super) fn term_shape(&mut self, term: TermId) -> Result<FiniteSortShape, String> {
+        self.poll_lowering()?;
         if self.terms.entry_stamp(term).is_none() {
             return Err(format!(
                 "finite-array operand term {} is outside the live term store",
@@ -64,6 +65,7 @@ impl ProofProducingLowerer<'_> {
         count: usize,
         context: &str,
     ) -> Result<(), String> {
+        self.poll_lowering()?;
         cells.try_reserve_exact(count).map_err(|error| {
             self.resource_exhausted = true;
             format!("{context} allocation failed: {error}")
@@ -71,6 +73,7 @@ impl ProofProducingLowerer<'_> {
     }
 
     pub(super) fn charge_array_work(&mut self, amount: usize, context: &str) -> Result<(), String> {
+        self.poll_lowering()?;
         if Instant::now() >= self.deadline {
             self.resource_exhausted = true;
             return Err("proof-producing finite-array deadline exceeded".to_string());
@@ -97,10 +100,10 @@ impl ProofProducingLowerer<'_> {
         nodes: usize,
         context: &str,
     ) -> Result<(), String> {
-        if nodes > MAX_PROOF_PRODUCING_EXPR_NODES {
+        if nodes > MAX_FINITE_ARRAY_EXPANSION_NODES {
             self.resource_exhausted = true;
             Err(format!(
-                "{context} would produce {nodes} BvExpr nodes, above limit {MAX_PROOF_PRODUCING_EXPR_NODES}"
+                "{context} would produce {nodes} BvExpr nodes, above limit {MAX_FINITE_ARRAY_EXPANSION_NODES}"
             ))
         } else {
             Ok(())
@@ -114,7 +117,7 @@ impl ProofProducingLowerer<'_> {
     ) -> Result<usize, String> {
         let mut nodes = 0_usize;
         for cell in &array.cells {
-            let cell_nodes = bv_expr_nodes(cell).map_err(|error| {
+            let cell_nodes = self.count_bv_nodes(cell).map_err(|error| {
                 self.resource_exhausted = true;
                 format!("{context}: {error}")
             })?;
@@ -122,10 +125,10 @@ impl ProofProducingLowerer<'_> {
                 self.resource_exhausted = true;
                 format!("{context} node-count overflow")
             })?;
-            if nodes > MAX_PROOF_PRODUCING_EXPR_NODES {
+            if nodes > MAX_FINITE_ARRAY_EXPANSION_NODES {
                 self.resource_exhausted = true;
                 return Err(format!(
-                    "{context} exceeds {MAX_PROOF_PRODUCING_EXPR_NODES} BvExpr nodes"
+                    "{context} exceeds {MAX_FINITE_ARRAY_EXPANSION_NODES} BvExpr nodes"
                 ));
             }
         }
@@ -144,12 +147,13 @@ impl ProofProducingLowerer<'_> {
             let mut value_nodes = 0_usize;
             for cell in value {
                 value_nodes = value_nodes
-                    .checked_add(bv_expr_nodes(cell).map_err(|_| ())?)
+                    .checked_add(self.count_bv_nodes(cell).map_err(|_| ())?)
                     .ok_or(())?;
             }
             let mut condition_nodes = 0_usize;
             for condition in conditions {
-                let mask_nodes = bv_expr_nodes(condition)
+                let mask_nodes = self
+                    .count_bv_nodes(condition)
                     .map_err(|_| ())?
                     .checked_add(usize::from(shape.leaf_width() > 1))
                     .ok_or(())?;
@@ -188,7 +192,8 @@ impl ProofProducingLowerer<'_> {
         let count = (|| {
             let mut mask_nodes = 0_usize;
             for condition in conditions {
-                let condition_nodes = bv_expr_nodes(condition)
+                let condition_nodes = self
+                    .count_bv_nodes(condition)
                     .map_err(|_| ())?
                     .checked_add(usize::from(element.leaf_width() > 1))
                     .ok_or(())?;
@@ -239,6 +244,7 @@ impl ProofProducingLowerer<'_> {
         mut expressions: Vec<BvExpr>,
         width: u32,
     ) -> Result<BvExpr, String> {
+        self.poll_lowering()?;
         if expressions.is_empty() {
             return Ok(BvExpr::const_val(0, width));
         }
@@ -251,6 +257,7 @@ impl ProofProducingLowerer<'_> {
             )?;
             let mut current = expressions.into_iter();
             while let Some(lhs) = current.next() {
+                self.poll_lowering()?;
                 next.push(match current.next() {
                     Some(rhs) => BvExpr::or(lhs, rhs),
                     None => lhs,
@@ -258,6 +265,7 @@ impl ProofProducingLowerer<'_> {
             }
             expressions = next;
         }
+        self.poll_lowering()?;
         expressions
             .pop()
             .ok_or_else(|| "finite-array balanced select lost its final expression".to_string())

@@ -13,6 +13,42 @@ use std::sync::Arc;
 
 use super::{BoundKind, Literal, Mbp};
 
+/// Above this many `lower_bounds.len() * upper_bounds.len()` resolvents,
+/// [`Mbp::project_real_var`] substitutes the model's own value for the
+/// variable instead of resolving every lower/upper pair (2026-09-24,
+/// `LRA_memouts_2026-09-24.md`).
+///
+/// Unlike [`Mbp::project_integer_var`] (which the Omega-test-style tightest
+/// lower bound reduces to one `upper_bounds.len()` pass, see below), the LRA
+/// path resolves every lower bound against every upper bound: `L*U` new
+/// `ChcExpr` literals per eliminated variable, none of them repeats of one
+/// another (a genuine combinatorial expansion, not tree-vs-DAG redundancy, so
+/// no `seen`-pointer dedup can bound it). `Mbp::project` eliminates its
+/// `projectable_vars` in sequence, each one's output literals feeding the
+/// next one's bound extraction, so the product compounds across variables.
+/// Measured: PDKIND's `generalize -> Mbp::project` on the wide, ITE-heavy
+/// transition relations of `om1_with_relays_general_{3,4,5}_9_*` (sally) and
+/// `cav12/{toy,toy-bug,kundu-bug,simple_array_inversion,transmitter}` (dozens
+/// of Real state variables, hundreds of derived bounds per clause) drove RSS
+/// past a 16 GiB budget in 18-56 s with no single allocation ever large
+/// enough, and no loop-head checkpoint inside this nested loop, to let the
+/// per-lane `ay_sys::MemoryGroup`'s cooperative cancel or hard-unwind
+/// intervene before the process-wide allocator ceiling finally aborted the
+/// whole run past its own budget.
+///
+/// The fallback is sound by the same argument [`Mbp::project`] already uses
+/// for its `subst_vars` (Bool) and `fallback_vars` (MBQI) substitutions: the
+/// caller's `model` already satisfies every literal in `with_var` at the
+/// variable's own model value, so substituting that value keeps the model a
+/// witness for the projected formula (`model |= psi`), and it costs
+/// `with_var.len()` literals — the size of the INPUT to this step — instead
+/// of `lower_bounds.len() * upper_bounds.len()`. It activates only when the
+/// full resolution would exceed the cap, so every instance whose per-variable
+/// bound counts stay below it (the overwhelming majority measured so far,
+/// including every currently-passing LRA-Lin/LIA-Lin/BV instance) takes the
+/// exact same exact-resolution path as before, byte for byte.
+const MAX_REAL_MBP_RESOLVENTS: usize = 4096;
+
 impl Mbp {
     /// Project out a single variable from the implicant
     pub(super) fn project_single_var(
@@ -166,15 +202,21 @@ impl Mbp {
         // has the higher t/c value. Compare t1/c1 vs t2/c2 as t1*c2 vs t2*c1
         // to avoid integer division imprecision (truncation or floor can both
         // give wrong orderings for negative values with non-unit coefficients).
+        //
+        // The products of two i128 operands need up to 255 bits, so they are
+        // formed exactly as big integers. In i128 they overflowed — an
+        // unevaluable bound reads as i128::MIN, and any coefficient above 1
+        // then panicked "attempt to multiply with overflow" (measured: PDKIND
+        // on examples/model_checker_consumer_looping_id_bv64.smt2, caught by the portfolio
+        // and reported as `unknown`).
+        let cross = |value: i128, coefficient: i128| {
+            num_bigint::BigInt::from(value) * num_bigint::BigInt::from(coefficient.saturating_abs())
+        };
         let best_lower = lower_bounds.iter().max_by(|(c1, t1, _), (c2, t2, _)| {
-            let abs1 = c1.saturating_abs();
-            let abs2 = c2.saturating_abs();
             let ev1 = self.eval_arith(t1, model).unwrap_or(i128::MIN);
             let ev2 = self.eval_arith(t2, model).unwrap_or(i128::MIN);
             // Compare t1/c1 vs t2/c2 as t1*c2 vs t2*c1 (cross-multiply)
-            let lhs = i128::from(ev1) * i128::from(abs2);
-            let rhs = i128::from(ev2) * i128::from(abs1);
-            lhs.cmp(&rhs)
+            cross(ev1, *c2).cmp(&cross(ev2, *c1))
         });
 
         // Generate resolved constraints
@@ -232,7 +274,7 @@ impl Mbp {
         var: &ChcVar,
         with_var: Vec<Literal>,
         mut without_var: Vec<Literal>,
-        _model: &FxHashMap<String, SmtValue>,
+        model: &FxHashMap<String, SmtValue>,
     ) -> Vec<Literal> {
         // Similar to integer but without divisibility concerns.
         // Keep coefficients so bound resolution can cross-multiply correctly
@@ -298,6 +340,28 @@ impl Mbp {
 
         if lower_bounds.is_empty() || upper_bounds.is_empty() {
             return without_var;
+        }
+
+        // Cap the Fourier-Motzkin cross product (see `MAX_REAL_MBP_RESOLVENTS`).
+        // Above the cap, substitute the model's own value for `var` into every
+        // literal that mentions it: `with_var.len()` new literals instead of
+        // `lower_bounds.len() * upper_bounds.len()`, sound by the same model-
+        // witness argument as the equality branch above.
+        if lower_bounds.len().saturating_mul(upper_bounds.len()) > MAX_REAL_MBP_RESOLVENTS {
+            if let Some(value) = Self::model_value_expr(var, model) {
+                for lit in &with_var {
+                    let new_atom = lit.atom.substitute(&[(var.clone(), value.clone())]);
+                    let simplified = new_atom.simplify_constants();
+                    if simplified != ChcExpr::Bool(true) {
+                        without_var.push(Literal::new(simplified, lit.positive));
+                    }
+                }
+                return without_var;
+            }
+            // No model value for `var` (should not happen: `project()` is only
+            // ever invoked under a model that satisfies `formula`, including
+            // this variable) — fall through to the exact resolution below
+            // rather than silently dropping soundness-relevant constraints.
         }
 
         // Resolve each lower bound with each upper bound.

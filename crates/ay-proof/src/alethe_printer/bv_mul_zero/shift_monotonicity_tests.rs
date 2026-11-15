@@ -79,6 +79,20 @@ fn assert_honest_hole(case: &RawShiftStep) {
     assert!(!output.contains(":rule trust"), "{output}");
 }
 
+fn assert_checked_broader_lowering(case: &RawShiftStep) {
+    let ProofStep::TheoryLemma { clause, .. } = &case.step else {
+        panic!("theory lemma");
+    };
+    let printer = AlethePrinter::new(&case.terms);
+    assert!(printer
+        .format_bv_shift_monotonicity(ProofId(3), clause)
+        .is_none());
+    let output = printer.format_step(&case.step, ProofId(3)).unwrap();
+    assert!(!output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule trust"), "{output}");
+    assert!(output.contains(":rule bitblast_"), "{output}");
+}
+
 #[test]
 fn exact_bounded_shift_shape_exports_checked_carcara_rules() {
     for width in 2_u32..=8 {
@@ -107,7 +121,8 @@ fn exact_bounded_shift_shape_exports_checked_carcara_rules() {
 
 #[test]
 fn shift_shape_declines_outside_exact_width_and_shift_envelope() {
-    for (width, shift) in [(9, 1), (8, 0), (8, 8), (8, 9)] {
+    assert_checked_broader_lowering(&raw_shift_step(9, 1));
+    for (width, shift) in [(8, 0), (8, 8), (8, 9)] {
         assert_honest_hole(&raw_shift_step(width, shift));
     }
 }
@@ -134,7 +149,9 @@ fn shift_shape_declines_connective_operand_and_clause_drift() {
         kind: TheoryLemmaKind::BvBitBlast,
         lia: None,
     };
-    assert_honest_hole(&signed);
+    // The bounded legacy template still declines signed comparisons; the
+    // general checked circuit now derives this valid stronger premise.
+    assert_checked_broader_lowering(&signed);
 
     let mut non_unit = raw_shift_step(8, 1);
     let extra = non_unit.terms.mk_var("p", Sort::Bool);
@@ -158,7 +175,7 @@ fn shift_shape_declines_connective_operand_and_clause_drift() {
         kind: TheoryLemmaKind::BvBitBlast,
         lia: None,
     };
-    assert_honest_hole(&reversed_and);
+    assert_checked_broader_lowering(&reversed_and);
 }
 
 #[test]

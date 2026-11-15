@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod constant_pairs;
+
 impl ArraySolver<'_> {
     fn canonicalize_explanation(reasons: &mut Vec<TheoryLit>) {
         reasons.sort_by_key(|lit| (lit.term.0, lit.value));
@@ -79,7 +81,28 @@ impl ArraySolver<'_> {
     }
 
     /// Check equivalence class cross-product for known disequalities.
+    ///
+    /// Memoized by ordered class-representative pair in the
+    /// frozen-graph window (#arrays-distinct-witness-cache): the
+    /// cross-product only reads the two classes, `diseq_set` and term
+    /// constants, so per-pair repetition across the 88k candidate
+    /// pairs of the QF_AX swap files collapses to one scan per class
+    /// pair. Measured as the dominant leaf after the witness cache.
     fn known_distinct_via_equiv_classes(&self, t1: TermId, t2: TermId) -> bool {
+        let c1 = self.equiv_class_representative(t1);
+        let c2 = self.equiv_class_representative(t2);
+        let key = Self::ordered_pair(c1, c2);
+        if let Some(known) = eq_paths_cache::get_known_distinct_class(key.0, key.1) {
+            return known;
+        }
+        let known = self.known_distinct_via_equiv_classes_scan(t1, t2);
+        if c1 != c2 {
+            eq_paths_cache::put_known_distinct_class(key.0, key.1, known);
+        }
+        known
+    }
+
+    fn known_distinct_via_equiv_classes_scan(&self, t1: TermId, t2: TermId) -> bool {
         if self.equiv_class_cache_version == Some(self.eq_adj_version) {
             let c1 = self
                 .equiv_class_map
@@ -195,10 +218,10 @@ impl ArraySolver<'_> {
     /// sorted). Outside the window every call recomputes, exactly as before.
     pub(crate) fn select_conflict_candidate_pairs(&self) -> Rc<[(TermId, TermId)]> {
         self.candidate_pairs_calls
-            .set(self.candidate_pairs_calls.get() + 1);
+            .set(self.candidate_pairs_calls.get().saturating_add(1));
         if let Some(hit) = eq_paths_cache::get_candidate_pairs() {
             self.candidate_pairs_memo_hits
-                .set(self.candidate_pairs_memo_hits.get() + 1);
+                .set(self.candidate_pairs_memo_hits.get().saturating_add(1));
             // M1 gate (4): spot-check (debug builds, 1-in-32 hits) that the
             // memoized set equals a fresh recomputation.
             #[cfg(debug_assertions)]
@@ -213,8 +236,11 @@ impl ArraySolver<'_> {
         }
         let pairs: Rc<[(TermId, TermId)]> =
             Rc::from(self.select_conflict_candidate_pairs_uncached());
-        self.candidate_pairs_generated
-            .set(self.candidate_pairs_generated.get() + pairs.len() as u64);
+        self.candidate_pairs_generated.set(
+            self.candidate_pairs_generated
+                .get()
+                .saturating_add(pairs.len() as u64),
+        );
         eq_paths_cache::put_candidate_pairs(&pairs);
         pairs
     }
@@ -271,20 +297,6 @@ impl ArraySolver<'_> {
             }
         }
         class_constants.sort_unstable_by_key(|(class_key, _)| class_key.0);
-        for i in 0..class_constants.len() {
-            for j in (i + 1)..class_constants.len() {
-                if class_constants[i].1 == class_constants[j].1 {
-                    continue;
-                }
-                // Classes both disequal AND constant-distinct are enumerated
-                // once: the class-pair set already dedups them (D2).
-                class_pairs.insert(Self::ordered_pair(
-                    class_constants[i].0,
-                    class_constants[j].0,
-                ));
-            }
-        }
-
         // INDEX-KEYED PRUNING. Both consumers of this candidate set discard any
         // pair whose two selects' indices are not provably equal (via
         // `explain_equal_if_provable` / `known_equal`). Partition the distinct
@@ -308,8 +320,7 @@ impl ArraySolver<'_> {
 
         // Per value class: index block -> selects (preserving the sorted order
         // already established on `selects_by_class`).
-        let mut class_block_groups: HashMap<TermId, HashMap<TermId, Vec<TermId>>> =
-            HashMap::default();
+        let mut class_block_groups = constant_pairs::ClassBlockGroups::default();
         for (&class_rep, class_selects) in &selects_by_class {
             let mut groups: HashMap<TermId, Vec<TermId>> = HashMap::default();
             for &sel in class_selects {
@@ -319,6 +330,10 @@ impl ArraySolver<'_> {
             }
             class_block_groups.insert(class_rep, groups);
         }
+        // Enumerating every constant-valued class pair BEFORE this grouping
+        // is quadratic even for unrelated constant indices. Only class pairs
+        // sharing an existing index block can emit a select pair below.
+        constant_pairs::add_pairs(&class_constants, &class_block_groups, &mut class_pairs);
 
         let mut candidate_pairs = HashSet::default();
         for &(lhs_class, rhs_class) in &class_pairs {
@@ -409,6 +424,7 @@ impl ArraySolver<'_> {
         if let Some(hit) = eq_paths_cache::get_paths(start) {
             return hit;
         }
+        propagation::prop_eq_stats::add(&propagation::prop_eq_stats::paths_bfs, 1);
         let paths = Rc::new(self.equality_reason_paths_from_uncached(start));
         eq_paths_cache::put_paths(start, &paths);
         paths
@@ -436,30 +452,47 @@ impl ArraySolver<'_> {
         queue.push_back(start);
 
         while let Some(current) = queue.pop_front() {
-            let current_path = paths.get(&current).cloned().unwrap_or_default();
             if let Some(neighbors) = self.eq_adj.get(&current) {
+                // Clone the current path lazily on the first ACCEPTED
+                // edge: rejected edges (unreasoned sentinel, unassigned
+                // atom) previously paid a full path clone each, and a
+                // node whose edges all reject paid one per pop. Edge
+                // examination order and first-visit wins are unchanged,
+                // so every produced path is byte-identical.
+                let mut current_path: Option<Vec<TheoryLit>> = None;
                 for &(other, eq_term) in neighbors {
                     if paths.contains_key(&other) {
                         continue;
                     }
 
-                    let mut next_path = current_path.clone();
-                    if eq_term.is_sentinel() {
-                        let key = Self::ordered_pair(current, other);
-                        let Some(edge_reasons) = self.external_eq_reasons.get(&key) else {
-                            continue;
-                        };
-                        if edge_reasons.is_empty() {
-                            continue;
-                        }
-                        next_path.extend(edge_reasons.iter().copied());
-                    } else {
-                        if self.assigns.get(&eq_term) != Some(&true) {
-                            continue;
-                        }
-                        next_path.push(TheoryLit::new(eq_term, true));
+                    // Decide acceptance (and gather the edge's reasons)
+                    // before cloning the current path.
+                    enum EdgeReasons<'a> {
+                        Asserted(TermId),
+                        External(&'a [TheoryLit]),
                     }
-
+                    let accepted = if eq_term.is_sentinel() {
+                        let key = Self::ordered_pair(current, other);
+                        match self.external_eq_reasons.get(&key) {
+                            Some(reasons) if !reasons.is_empty() => EdgeReasons::External(reasons),
+                            _ => continue,
+                        }
+                    } else if self.assigns.get(&eq_term) == Some(&true) {
+                        EdgeReasons::Asserted(eq_term)
+                    } else {
+                        continue;
+                    };
+                    let base = current_path
+                        .get_or_insert_with(|| paths.get(&current).cloned().unwrap_or_default());
+                    let mut next_path = base.clone();
+                    match accepted {
+                        EdgeReasons::Asserted(eq_term) => {
+                            next_path.push(TheoryLit::new(eq_term, true));
+                        }
+                        EdgeReasons::External(reasons) => {
+                            next_path.extend(reasons.iter().copied());
+                        }
+                    }
                     paths.insert(other, next_path);
                     queue.push_back(other);
                 }
@@ -467,6 +500,73 @@ impl ArraySolver<'_> {
         }
 
         paths
+    }
+
+    /// Single-target reason path `start -> goal` over the same
+    /// reason-carrying edges as `equality_reason_paths_from`, via a
+    /// predecessor forest memoized per start in the frozen-graph
+    /// window (#arrays-distinct-witness-cache). The forest BFS uses
+    /// the identical FIFO order and first-visit rule as the full-map
+    /// builder, so the reconstructed path is byte-identical to
+    /// `equality_reason_paths_from(start)[goal]`, at O(component)
+    /// small entries instead of one path Vec per node.
+    fn equality_reason_path_to(&self, start: TermId, goal: TermId) -> Option<Vec<TheoryLit>> {
+        if start == goal {
+            return Some(Vec::new());
+        }
+        let forest = eq_paths_cache::get_reason_prev(start).unwrap_or_else(|| {
+            let built = Rc::new(self.build_reason_forest(start));
+            eq_paths_cache::put_reason_prev(start, &built);
+            built
+        });
+        if !forest.contains_key(&goal) {
+            return None;
+        }
+        let mut segments: Vec<&[TheoryLit]> = Vec::new();
+        let mut cursor = goal;
+        while cursor != start {
+            let (parent, reasons) = forest.get(&cursor)?;
+            segments.push(reasons.as_ref());
+            cursor = *parent;
+        }
+        let mut path = Vec::new();
+        for segment in segments.into_iter().rev() {
+            path.extend(segment.iter().copied());
+        }
+        Some(path)
+    }
+
+    fn build_reason_forest(&self, start: TermId) -> eq_paths_cache::ReasonPredecessors {
+        let mut prev: eq_paths_cache::ReasonPredecessors = HashMap::default();
+        let mut queue = std::collections::VecDeque::new();
+        let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::default();
+        seen.insert(start);
+        queue.push_back(start);
+        while let Some(current) = queue.pop_front() {
+            let Some(neighbors) = self.eq_adj.get(&current) else {
+                continue;
+            };
+            for &(other, eq_term) in neighbors {
+                if seen.contains(&other) {
+                    continue;
+                }
+                let reasons: Rc<[TheoryLit]> = if eq_term.is_sentinel() {
+                    let key = Self::ordered_pair(current, other);
+                    match self.external_eq_reasons.get(&key) {
+                        Some(reasons) if !reasons.is_empty() => reasons.as_slice().into(),
+                        _ => continue,
+                    }
+                } else if self.assigns.get(&eq_term) == Some(&true) {
+                    [TheoryLit::new(eq_term, true)].as_slice().into()
+                } else {
+                    continue;
+                };
+                seen.insert(other);
+                prev.insert(other, (current, reasons));
+                queue.push_back(other);
+            }
+        }
+        prev
     }
 
     /// Build an asserted-equality path between two terms.
@@ -643,6 +743,7 @@ impl ArraySolver<'_> {
         if let Some(hit) = eq_paths_cache::get_equal(t1, t2) {
             return hit;
         }
+        propagation::prop_eq_stats::add(&propagation::prop_eq_stats::equal_uncached, 1);
         let reason = self.explain_equal_if_provable_uncached(t1, t2);
         eq_paths_cache::put_equal(t1, t2, &reason);
         reason
@@ -690,6 +791,19 @@ impl ArraySolver<'_> {
     }
 
     /// Reconstruct a non-empty explanation for `t1 ≠ t2` when possible.
+    ///
+    /// #arrays-distinct-witness-cache: the search below is
+    /// O(|C1|×|C2|) in the sizes of the two equivalence classes and
+    /// was measured as THE hot leaf on QF_AX swap files (88k
+    /// candidate pairs across two large select classes, each pair
+    /// re-searching the same rep cross-product). The witness it
+    /// finds — one rep pair plus middle reasons — is a pure function
+    /// of the ordered class pair, so inside the frozen-graph window
+    /// it is memoized there; later pairs compose path + middle +
+    /// path from the per-source path memos. Any composed explanation
+    /// is a valid proof of distinctness (canonicalized like the
+    /// legacy result); it may differ from the legacy per-pair best,
+    /// never in soundness.
     fn explain_distinct(&self, t1: TermId, t2: TermId) -> Vec<TheoryLit> {
         if let Some(eq_term) = self.get_eq_term(t1, t2) {
             if self.assigns.get(&eq_term) == Some(&false) {
@@ -697,9 +811,64 @@ impl ArraySolver<'_> {
             }
         }
 
+        let c1 = self.equiv_class_representative(t1);
+        let c2 = self.equiv_class_representative(t2);
+        if c1 != c2 {
+            let key = Self::ordered_pair(c1, c2);
+            match eq_paths_cache::get_distinct_witness(key.0, key.1) {
+                eq_paths_cache::WitnessLookup::NoWitness => return Vec::new(),
+                eq_paths_cache::WitnessLookup::Cold => {
+                    let (best, witness) = self.explain_distinct_search(t1, t2);
+                    let oriented = witness.map(|(lrep, rrep, middle)| {
+                        if c1 == key.0 {
+                            (lrep, rrep, middle)
+                        } else {
+                            (rrep, lrep, middle)
+                        }
+                    });
+                    eq_paths_cache::put_distinct_witness(key.0, key.1, &oriented);
+                    return best;
+                }
+                eq_paths_cache::WitnessLookup::Witness(w_lhs, w_rhs, middle) => {
+                    let (lhs_rep, rhs_rep) = if c1 == key.0 {
+                        (w_lhs, w_rhs)
+                    } else {
+                        (w_rhs, w_lhs)
+                    };
+                    if let (Some(lp), Some(rp)) = (
+                        self.equality_reason_path_to(t1, lhs_rep),
+                        self.equality_reason_path_to(t2, rhs_rep),
+                    ) {
+                        let mut reasons = Vec::new();
+                        reasons.extend(lp.iter().copied());
+                        reasons.extend(middle.iter().copied());
+                        reasons.extend(rp.iter().copied());
+                        Self::canonicalize_explanation(&mut reasons);
+                        return reasons;
+                    }
+                    // Witness reps not reachable from these terms (should
+                    // not happen for same-class members): fall through to
+                    // the legacy search rather than trusting the cache.
+                }
+            }
+        }
+
+        self.explain_distinct_search(t1, t2).0
+    }
+
+    /// Legacy O(|C1|×|C2|) witness search. Also returns the witness
+    /// triple `(lhs_rep, rhs_rep, middle_reasons)` behind the best
+    /// explanation (oriented t1-side / t2-side), for the class-pair
+    /// witness cache.
+    fn explain_distinct_search(
+        &self,
+        t1: TermId,
+        t2: TermId,
+    ) -> (Vec<TheoryLit>, eq_paths_cache::DistinctWitness) {
         let lhs_paths = self.equality_reason_paths_from(t1);
         let rhs_paths = self.equality_reason_paths_from(t2);
         let mut best: Option<Vec<TheoryLit>> = None;
+        let mut best_witness: Option<(TermId, TermId, Vec<TheoryLit>)> = None;
 
         for (lhs_rep, lhs_path) in lhs_paths.iter() {
             for (rhs_rep, rhs_path) in rhs_paths.iter() {
@@ -715,7 +884,10 @@ impl ArraySolver<'_> {
                             match &best {
                                 Some(best_reasons)
                                     if !Self::explanation_better(&reasons, best_reasons) => {}
-                                _ => best = Some(reasons),
+                                _ => {
+                                    best_witness = Some((*lhs_rep, *rhs_rep, Vec::new()));
+                                    best = Some(reasons);
+                                }
                             }
                         }
                     }
@@ -731,7 +903,14 @@ impl ArraySolver<'_> {
                         match &best {
                             Some(best_reasons)
                                 if !Self::explanation_better(&reasons, best_reasons) => {}
-                            _ => best = Some(reasons),
+                            _ => {
+                                best_witness = Some((
+                                    *lhs_rep,
+                                    *rhs_rep,
+                                    vec![TheoryLit::new(eq_term, false)],
+                                ));
+                                best = Some(reasons);
+                            }
                         }
                     }
                 }
@@ -747,14 +926,17 @@ impl ArraySolver<'_> {
                         match &best {
                             Some(best_reasons)
                                 if !Self::explanation_better(&reasons, best_reasons) => {}
-                            _ => best = Some(reasons),
+                            _ => {
+                                best_witness = Some((*lhs_rep, *rhs_rep, diseq_reasons.clone()));
+                                best = Some(reasons);
+                            }
                         }
                     }
                 }
             }
         }
 
-        best.unwrap_or_default()
+        (best.unwrap_or_default(), best_witness)
     }
 
     /// Check if two terms are provably distinct WITH explanation reasons (#5086).
@@ -778,6 +960,7 @@ impl ArraySolver<'_> {
         if let Some(hit) = eq_paths_cache::get_distinct(t1, t2) {
             return hit;
         }
+        propagation::prop_eq_stats::add(&propagation::prop_eq_stats::distinct_uncached, 1);
         let reason = self.explain_distinct_if_provable_uncached(t1, t2);
         eq_paths_cache::put_distinct(t1, t2, &reason);
         reason
@@ -881,16 +1064,6 @@ impl ArraySolver<'_> {
         }
 
         None
-    }
-
-    /// Public wrapper for `asserted_equality_path` used by `check_select_map`
-    /// to collect SAT-visible equality reasons along an equality path (#8598).
-    pub(crate) fn asserted_equality_path_pub(
-        &self,
-        start: TermId,
-        goal: TermId,
-    ) -> Option<Vec<TermId>> {
-        self.asserted_equality_path(start, goal)
     }
 
     /// Search for a function application `f(v1, ..., vn)` in the term store

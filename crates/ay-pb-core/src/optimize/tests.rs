@@ -160,16 +160,26 @@ fn test_engine_pre_clone_memory_guard_declines_to_unknown() {
     // proving the guard is a strict no-op when there is budget.
     let input = "* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n";
 
-    // A 1 KB limit makes the running test process exceed any nonzero
-    // percentage, so the predictive pre-clone probe trips immediately.
-    let old_limit = ay_sys::get_process_memory_limit();
-    ay_sys::set_process_memory_limit(1024);
+    // THREAD-LOCAL pressure hook, never the process-global memory limit.
+    //
+    // This test used to flip `PROCESS_MEMORY_LIMIT` to 1 KB for the duration of
+    // its solve. Cargo runs the tests of one binary as parallel THREADS of one
+    // process, so every other test's `engine.solve()` that overlapped this
+    // window also saw the 1 KB limit, tripped the same pre-clone guard, and
+    // returned `Unknown` — making unrelated tests (e.g.
+    // `test_engine_handles_negative_unit_objective`) fail spuriously under load
+    // and pass in isolation.
+    //
+    // The thread-local hook forces exactly the same predictive branch on THIS
+    // thread only, so the guard is still covered and no other thread can
+    // observe the pressure. It is also platform-independent: the old form
+    // needed a `cfg` because it depended on the OS footprint reading.
+    ay_sys::force_process_memory_predictive_exceeded_for_testing(true);
     let mut engine = engine_from_opb(input);
     let guarded = engine.solve();
-    // Restore the global limit before asserting so a failure cannot leak the
-    // tiny limit into other tests running concurrently.
-    ay_sys::set_process_memory_limit(old_limit);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    // Clear before asserting so a failure cannot leak the forced state into
+    // later tests reusing this thread.
+    ay_sys::force_process_memory_predictive_exceeded_for_testing(false);
     assert_eq!(
         guarded,
         OptResult::Unknown,

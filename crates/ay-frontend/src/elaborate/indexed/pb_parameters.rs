@@ -38,9 +38,12 @@ fn parse_pb_rational_index(index: &ParsedIndex, op: &str) -> Result<BigRational>
         return Ok(BigRational::from_integer(value));
     }
 
+    // An unquoted `-2` / `-2.5` arrives as a signed numeral or decimal
+    // (`sexp::negative_numeric_literal`); a quoted `|-2|` stays a symbol, which
+    // Z3 5.1.0 refuses as an index ("unknown function -2").
     let text = match index {
         ParsedIndex::Decimal(text) => text.as_str(),
-        ParsedIndex::Symbol(text) if is_negative_decimal_text(text) => text.as_str(),
+        ParsedIndex::Numeral(text) if is_negative_decimal_text(text) => text.as_str(),
         _ => {
             return Err(ElaborateError::InvalidConstant(format!(
                 "{op}: expected a rational parameter, got '{}'",
@@ -55,7 +58,8 @@ fn parse_pb_rational_index(index: &ParsedIndex, op: &str) -> Result<BigRational>
 
 fn parse_unsigned_index_value(index: &ParsedIndex) -> Option<BigInt> {
     match index {
-        ParsedIndex::Numeral(text) => text.parse().ok(),
+        // Unsigned only: a signed `-1` is a negative rational, not `u32` 1.
+        ParsedIndex::Numeral(text) if !text.starts_with('-') => text.parse().ok(),
         ParsedIndex::Hexadecimal(text) => {
             BigInt::parse_bytes(text.strip_prefix("#x")?.as_bytes(), 16)
         }

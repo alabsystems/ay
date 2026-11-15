@@ -104,7 +104,7 @@ printf 'p cnf 2 2\na 1 0\ne 2 0\n1 2 0\n-1 -2 0\n' > /tmp/t.qdimacs && ay qbf so
 | SMT-COMP 2026 | Incremental track (17 divisions) | partial — push/pop and --incremental stdin both give the exact correct sat/unsat sequence; planned 2026 entry deliberately limited to QF_UF+QF_LRA after a soundness audit; the Incremental-only division QF_Equality+Bitvec+Arith (QF_UFBVLIA/QF_BVLRA/QF_AUFBV*) returns only unknown |
 | SMT-COMP 2026 | Unsat Core track (19 divisions) | partial — (get-unsat-core) with named assertions returns exact minimal cores in every division family tested (QF_UF, QF_LIA, QF_BV); however the generated 2026 submission declares no UnsatCore participation |
 | SMT-COMP 2026 | Model Validation track (13 divisions) | partial — (get-model) emits well-formed (model (define-fun ...)) with correct values across QF_LIA, QF_BV, QF_DT, QF_FP (covers QF_LinearIntArith, QF_Bitvec, QF_Datatypes, QF_FPArith families incl. the MV-only QF_ADT divisions' logics QF_ABV/QF_AUFBV); planned 2026 MV entry is QF_UF+QF_LRA only |
-| SMT-COMP 2026 | Proof Exhibition track (19 divisions) | partial — Alethe emission works in every division family tested: 17/17 unsat instances produced proofs via --proof FILE.alethe, and a .alethe sidecar is written on UNSAT at `--rigor standard` or above (since 2026-09-06 a plain SMT-LIB solve has z3's posture and writes none); QF-division proofs are fully rule-checkable (0 trust steps in 13/17), while strings/quantified-BV/UFLIA/BV proofs contain a ':rule trust' placeholder; no ProofExhibition participation in the generated submission |
+| SMT-COMP 2026 | Proof Exhibition track (19 divisions) | partial — Alethe emission works in every division family tested: 17/17 unsat instances produced proofs via --proof FILE.alethe, and a .alethe sidecar is written by default on UNSAT; QF-division proofs are fully rule-checkable (0 trust steps in 13/17), while strings/quantified-BV/UFLIA/BV proofs contain a ':rule trust' placeholder; no ProofExhibition participation in the generated submission |
 | SMT-COMP 2026 | Parallel track (19 divisions) | not yet — no SMT parallel portfolio; --parallel N is documented and implemented for DIMACS SAT only (SMT input just solves single-threaded) |
 | SMT-COMP 2026 | Cloud track (19 divisions) | not yet — no distributed SMT solver; the only distributed-worker tooling is CHC-COMP-specific |
 
@@ -356,7 +356,6 @@ roadmap, distinct from what ships today:
 | XCSP³ (XML) frontend | XCSP³ Competition entry (solving core exists) |
 | TPTP frontend + ATP-grade quantifier search | CASC entry (cvc5 precedent) |
 | SyGuS-IF frontend + synthesis engine | SyGuS (cvc5 precedent) |
-| `ay bench compare run/refs/import/report` (the runner half of the comparison system) | one-command replay-class runs on the benchmark machine |
 
 Nothing is currently entered-but-withdrawn: QF_UFLIA (SMT-COMP), withdrawn
 2026-06-15, was re-added 2026-07-28 once the false-SAT fix was proven.
@@ -376,7 +375,7 @@ Capabilities with no competition home, verified the same way:
 | Capability | Status |
 | --- | --- |
 | OMT: minimize/maximize + (get-objectives) + LRA Farkas objective certificates | ready — minimize and maximize both solve; (get-objectives) prints optima; (get-objective-certificates) emits a Farkas dual certificate with sense/bound/entails/strict fields |
-| MaxSMT via assert-soft | ready — weighted (assert-soft ... :weight N) solved to the true optimum; cost reported via (get-objectives) as __ay_soft_cost |
+| MaxSMT via assert-soft | ready — weighted (assert-soft ... :weight N) solved to the true optimum, including `:id` groups (lexicographic, Z3 order); costs reported via (get-objectives) in Z3's per-group shape |
 | AllSAT enumeration (full + projected) | ready — full and projected enumeration both work with exhaustive/capped reporting; one stale-binary vs HEAD discrepancy on don't-care expansion (see evidence) |
 | Incremental solving via native API (push/pop across check-sat) | ready — push/assert/check/pop verified live in-process through four language surfaces; sat→unsat→sat round-trip correct |
 | Exact + projected + weighted model counting (MCC output format) | ready — exact unweighted `mc`, projected `pmc`, and weighted `wmc`/`pwmc` (exact rationals, zero and negative weights) are all correct; only the `model-count --help` one-liner is stale, still reading "exact unweighted MC/PMC" (`crates/ay/src/main.rs:754`) |

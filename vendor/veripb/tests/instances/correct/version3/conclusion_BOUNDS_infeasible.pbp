@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+f 5;
+pol 3 1 * 4 1 * + s;
+pol 1 2 + 6 +;
+pol 1 2 + 6 + 2 d;
+pol 5 2 * 8 2 * +;
+output NONE;
+conclusion BOUNDS INF : 9 INF;
+end pseudo-Boolean proof;

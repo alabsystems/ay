@@ -15,6 +15,9 @@ use serde::de::{
 use serde::ser::{Serialize, SerializeStructVariant, Serializer};
 use std::fmt;
 
+#[cfg(test)]
+mod tests;
+
 const VARIANTS: &[&str] = &[
     "EufTransitive",
     "EufReflexive",
@@ -91,6 +94,15 @@ const VARIANTS: &[&str] = &[
     "ArrayFiniteSelectExpansion",
     "QuantifierNegatedExistsDual",
     "GroundEqualitySubstitution",
+    "IntCgCutChain",
+    "BvMulOverflowDivision",
+    "BvUremBound",
+    "FiniteFieldExhaustive",
+    "FiniteFieldLinear",
+    "FiniteFieldLinearWide",
+    "FiniteFieldQuadratic",
+    "FiniteFieldUnivariate",
+    "FiniteFieldIdeal",
 ];
 
 impl Serialize for TheoryLemmaKind {
@@ -371,6 +383,41 @@ impl Serialize for TheoryLemmaKind {
                 74,
                 "GroundEqualitySubstitution",
             ),
+            TheoryLemmaKind::IntCgCutChain => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 75, "IntCgCutChain")
+            }
+            TheoryLemmaKind::BvMulOverflowDivision => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 76, "BvMulOverflowDivision")
+            }
+            TheoryLemmaKind::FiniteFieldExhaustive => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 78, "FiniteFieldExhaustive")
+            }
+            TheoryLemmaKind::FiniteFieldLinear(multipliers) => serializer
+                .serialize_newtype_variant(
+                    "TheoryLemmaKind",
+                    79,
+                    "FiniteFieldLinear",
+                    &multipliers,
+                ),
+            TheoryLemmaKind::FiniteFieldLinearWide(multipliers) => serializer
+                .serialize_newtype_variant(
+                    "TheoryLemmaKind",
+                    80,
+                    "FiniteFieldLinearWide",
+                    &multipliers,
+                ),
+            TheoryLemmaKind::BvUremBound => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 77, "BvUremBound")
+            }
+            TheoryLemmaKind::FiniteFieldQuadratic => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 81, "FiniteFieldQuadratic")
+            }
+            TheoryLemmaKind::FiniteFieldUnivariate => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 82, "FiniteFieldUnivariate")
+            }
+            TheoryLemmaKind::FiniteFieldIdeal => {
+                serializer.serialize_unit_variant("TheoryLemmaKind", 83, "FiniteFieldIdeal")
+            }
         }
     }
 }
@@ -451,6 +498,15 @@ enum VariantTag {
     ArrayFiniteSelectExpansion,
     QuantifierNegatedExistsDual,
     GroundEqualitySubstitution,
+    IntCgCutChain,
+    BvMulOverflowDivision,
+    BvUremBound,
+    FiniteFieldExhaustive,
+    FiniteFieldLinear,
+    FiniteFieldLinearWide,
+    FiniteFieldQuadratic,
+    FiniteFieldUnivariate,
+    FiniteFieldIdeal,
 }
 
 impl<'de> Deserialize<'de> for VariantTag {
@@ -551,9 +607,18 @@ impl Visitor<'_> for VariantTagVisitor {
             72 => Ok(VariantTag::ArrayFiniteSelectExpansion),
             73 => Ok(VariantTag::QuantifierNegatedExistsDual),
             74 => Ok(VariantTag::GroundEqualitySubstitution),
+            75 => Ok(VariantTag::IntCgCutChain),
+            76 => Ok(VariantTag::BvMulOverflowDivision),
+            77 => Ok(VariantTag::BvUremBound),
+            78 => Ok(VariantTag::FiniteFieldExhaustive),
+            79 => Ok(VariantTag::FiniteFieldLinear),
+            80 => Ok(VariantTag::FiniteFieldLinearWide),
+            81 => Ok(VariantTag::FiniteFieldQuadratic),
+            82 => Ok(VariantTag::FiniteFieldUnivariate),
+            83 => Ok(VariantTag::FiniteFieldIdeal),
             _ => Err(DeError::invalid_value(
                 Unexpected::Unsigned(value),
-                &"variant index 0 <= i < 75",
+                &"known TheoryLemmaKind variant index",
             )),
         }
     }
@@ -640,6 +705,15 @@ impl Visitor<'_> for VariantTagVisitor {
             "ArrayFiniteSelectExpansion" => Ok(VariantTag::ArrayFiniteSelectExpansion),
             "QuantifierNegatedExistsDual" => Ok(VariantTag::QuantifierNegatedExistsDual),
             "GroundEqualitySubstitution" => Ok(VariantTag::GroundEqualitySubstitution),
+            "IntCgCutChain" => Ok(VariantTag::IntCgCutChain),
+            "BvMulOverflowDivision" => Ok(VariantTag::BvMulOverflowDivision),
+            "BvUremBound" => Ok(VariantTag::BvUremBound),
+            "FiniteFieldExhaustive" => Ok(VariantTag::FiniteFieldExhaustive),
+            "FiniteFieldLinear" => Ok(VariantTag::FiniteFieldLinear),
+            "FiniteFieldLinearWide" => Ok(VariantTag::FiniteFieldLinearWide),
+            "FiniteFieldQuadratic" => Ok(VariantTag::FiniteFieldQuadratic),
+            "FiniteFieldUnivariate" => Ok(VariantTag::FiniteFieldUnivariate),
+            "FiniteFieldIdeal" => Ok(VariantTag::FiniteFieldIdeal),
             _ => Err(DeError::unknown_variant(value, VARIANTS)),
         }
     }
@@ -726,6 +800,15 @@ impl Visitor<'_> for VariantTagVisitor {
             b"ArrayFiniteSelectExpansion" => Ok(VariantTag::ArrayFiniteSelectExpansion),
             b"QuantifierNegatedExistsDual" => Ok(VariantTag::QuantifierNegatedExistsDual),
             b"GroundEqualitySubstitution" => Ok(VariantTag::GroundEqualitySubstitution),
+            b"IntCgCutChain" => Ok(VariantTag::IntCgCutChain),
+            b"BvMulOverflowDivision" => Ok(VariantTag::BvMulOverflowDivision),
+            b"BvUremBound" => Ok(VariantTag::BvUremBound),
+            b"FiniteFieldExhaustive" => Ok(VariantTag::FiniteFieldExhaustive),
+            b"FiniteFieldLinear" => Ok(VariantTag::FiniteFieldLinear),
+            b"FiniteFieldLinearWide" => Ok(VariantTag::FiniteFieldLinearWide),
+            b"FiniteFieldQuadratic" => Ok(VariantTag::FiniteFieldQuadratic),
+            b"FiniteFieldUnivariate" => Ok(VariantTag::FiniteFieldUnivariate),
+            b"FiniteFieldIdeal" => Ok(VariantTag::FiniteFieldIdeal),
             _ => Err(DeError::unknown_variant(
                 &String::from_utf8_lossy(value),
                 VARIANTS,
@@ -1022,6 +1105,28 @@ impl<'de> Visitor<'de> for KindVisitor {
                 variant.unit_variant()?;
                 Ok(TheoryLemmaKind::RoundingModeDomain)
             }
+            (VariantTag::FiniteFieldExhaustive, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::FiniteFieldExhaustive)
+            }
+            (VariantTag::FiniteFieldLinear, variant) => Ok(TheoryLemmaKind::FiniteFieldLinear(
+                variant.newtype_variant()?,
+            )),
+            (VariantTag::FiniteFieldLinearWide, variant) => Ok(
+                TheoryLemmaKind::FiniteFieldLinearWide(variant.newtype_variant()?),
+            ),
+            (VariantTag::FiniteFieldQuadratic, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::FiniteFieldQuadratic)
+            }
+            (VariantTag::FiniteFieldUnivariate, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::FiniteFieldUnivariate)
+            }
+            (VariantTag::FiniteFieldIdeal, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::FiniteFieldIdeal)
+            }
             (VariantTag::FpGroundEval, variant) => {
                 variant.unit_variant()?;
                 Ok(TheoryLemmaKind::FpGroundEval)
@@ -1041,6 +1146,18 @@ impl<'de> Visitor<'de> for KindVisitor {
             (VariantTag::GroundEqualitySubstitution, variant) => {
                 variant.unit_variant()?;
                 Ok(TheoryLemmaKind::GroundEqualitySubstitution)
+            }
+            (VariantTag::IntCgCutChain, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::IntCgCutChain)
+            }
+            (VariantTag::BvMulOverflowDivision, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::BvMulOverflowDivision)
+            }
+            (VariantTag::BvUremBound, variant) => {
+                variant.unit_variant()?;
+                Ok(TheoryLemmaKind::BvUremBound)
             }
         }
     }

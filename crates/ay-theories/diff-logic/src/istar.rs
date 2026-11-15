@@ -79,7 +79,9 @@ impl IStar {
             return None;
         }
         let n = q.numer().to_i128()?;
-        if n.abs() >= FAST_LANE_LIMIT {
+        // `unsigned_abs`, not `abs`: `i128::MIN` has no positive i128 and is
+        // rejected here like every other giant.
+        if n.unsigned_abs() >= FAST_LANE_LIMIT.unsigned_abs() {
             return None;
         }
         Some(n)
@@ -115,17 +117,19 @@ impl Weight for IStar {
 
 impl Negate for IStar {
     #[inline]
-    fn negate(&self) -> Self {
-        Self {
-            q: self
-                .q
-                .checked_neg()
-                .expect("IStar integer negation overflow"),
-            eps: self
-                .eps
-                .checked_neg()
-                .expect("IStar epsilon negation overflow"),
-        }
+    fn negate(&self) -> Option<Self> {
+        // Neither `i128::MIN` nor an ε-count of `i64::MIN` has a negation in
+        // its width; refuse rather than wrap (sign flip) or saturate (off by
+        // one).
+        Some(Self {
+            q: self.q.checked_neg()?,
+            eps: self.eps.checked_neg()?,
+        })
+    }
+
+    #[inline]
+    fn can_negate(&self) -> bool {
+        self.q != i128::MIN && self.eps != i64::MIN
     }
 }
 
@@ -139,17 +143,20 @@ pub fn pick_delta_from_slacks(slacks: &[(i128, i64)]) -> BigRational {
     let mut bound: Option<BigRational> = None;
     for &(g, k) in slacks {
         if g > 0 && k < 0 {
+            // `-k` as `unsigned_abs` (equal for `k < 0`): `i64::MIN` has no
+            // positive i64.
             let limit = BigRational::from_integer(g.into())
-                / BigRational::from_integer(i128::from(-k).into());
-            bound = Some(match bound {
-                Some(b) if b <= limit => b,
-                _ => limit,
-            });
+                / BigRational::from_integer(k.unsigned_abs().into());
+            // Keep the tighter (smaller) bound.
+            if bound.as_ref().is_none_or(|b| limit < *b) {
+                bound = Some(limit);
+            }
         }
     }
-    match bound {
-        Some(b) => b / BigRational::from_integer(2.into()),
-        None => BigRational::one(),
+    if let Some(b) = bound {
+        b / BigRational::from_integer(2.into())
+    } else {
+        BigRational::one()
     }
 }
 
@@ -201,9 +208,59 @@ mod tests {
     }
 
     #[test]
-    fn negate_round_trips() {
+    fn fast_lane_rejects_the_most_negative_i128() {
+        // `i128::MIN.abs()` overflowed; it is a giant like any other.
+        let min = BigRational::from_integer(i128::MIN.into());
+        assert_eq!(IStar::fits_fast_lane(&min), None);
+        let edge = BigRational::from_integer((-FAST_LANE_LIMIT).into());
+        assert_eq!(IStar::fits_fast_lane(&edge), None);
+        let inside = BigRational::from_integer((1 - FAST_LANE_LIMIT).into());
+        assert_eq!(IStar::fits_fast_lane(&inside), Some(1 - FAST_LANE_LIMIT));
+    }
+
+    #[test]
+    fn pick_delta_accepts_the_most_negative_eps_count() {
+        // `-k` overflowed for `k = i64::MIN`; the bound is g / 2^63.
+        let d = pick_delta_from_slacks(&[(1, i64::MIN), (1, -1)]);
+        let two_pow_63 = BigRational::from_integer(num_bigint::BigInt::from(1u64 << 63));
+        assert_eq!(d, BigRational::new(1.into(), 2.into()) / two_pow_63);
+    }
+
+    #[test]
+    fn negate_round_trips() -> Result<(), String> {
         let v = IStar::new(7, -1);
-        assert_eq!(v.negate().negate(), v);
-        assert_eq!(v.add(&v.negate()), <IStar as Weight>::zero());
+        let neg = v.negate().ok_or("IStar(7, -1) must negate")?;
+        let back = neg.negate().ok_or("IStar(-7, 1) must negate")?;
+        if back != v {
+            return Err(format!("double negation of {v:?} gave {back:?}"));
+        }
+        let sum = v.add(&neg);
+        if sum != <IStar as Weight>::zero() {
+            return Err(format!("{v:?} + -{v:?} gave {sum:?}, not zero"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn negate_refuses_the_unrepresentable_parts() -> Result<(), String> {
+        // `-i128::MIN` and `-i64::MIN` have no value in their width: `None`,
+        // never a wrapped (sign-flipped) or saturated (off-by-one) weight.
+        for w in [IStar::new(i128::MIN, 0), IStar::new(0, i64::MIN)] {
+            if let Some(n) = w.negate() {
+                return Err(format!("{w:?} negated to {n:?}; expected None"));
+            }
+            if w.can_negate() {
+                return Err(format!("{w:?} claims to be negatable"));
+            }
+        }
+        let edge = IStar::new(i128::MIN + 1, i64::MIN + 1);
+        if !edge.can_negate() {
+            return Err(format!("{edge:?} claims to be unnegatable"));
+        }
+        let want = IStar::new(i128::MAX, i64::MAX);
+        match edge.negate() {
+            Some(n) if n == want => Ok(()),
+            got => Err(format!("{edge:?} negated to {got:?}; expected {want:?}")),
+        }
     }
 }

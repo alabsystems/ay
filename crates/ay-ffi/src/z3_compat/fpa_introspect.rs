@@ -61,9 +61,9 @@ use num_traits::{ToPrimitive, Zero};
 use ay_dpll::api::Sort;
 
 use super::{
-    cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, record_ast_sort,
-    require_fpa_rounding_mode, require_term_ast, require_term_ast_or_return, term_to_ast,
-    Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_string, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_mk, mk_ast,
+    require_ast, require_ast_or_return, require_fpa_rounding_mode, Z3Context, Z3_ast, Z3_context,
+    Z3_sort, Z3_string, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 /// Record an error code + message on the context and return the null AST sentinel.
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_real(
     let Some((eb, sb)) = (unsafe { fp_sort_params(s) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_to_fp_real", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -133,22 +133,20 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_real(
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_to_fp_real", |ctx| {
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_real", rm) else {
                 return 0;
             };
-            let Some(rt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_fp_real", "real value") else {
+            let Some(rt) = require_ast(ctx, t, "Z3_mk_fpa_to_fp_real", "real value")
+                .map(|decoded| decoded.term)
+            else {
                 return 0;
             };
             if !matches!(ctx.solver.sort_of(rt), Sort::Real) {
                 return ast_error(ctx, Z3_SORT_ERROR, "Z3_mk_fpa_to_fp_real: t must be a Real");
             }
             match ctx.solver.try_real_to_fp(rmt, rt, eb, sb) {
-                Ok(x) => {
-                    let a = term_to_ast(ctx, x);
-                    record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-                    a
-                }
+                Ok(x) => mk_ast(ctx, x, Sort::FloatingPoint(eb, sb)),
                 Err(e) => ast_error(ctx, Z3_SORT_ERROR, format!("{e}")),
             }
         })
@@ -179,7 +177,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_int_real(
     let Some((eb, sb)) = (unsafe { fp_sort_params(s) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_to_fp_int_real", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -190,15 +188,17 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_int_real(
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_to_fp_int_real", |ctx| {
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_int_real", rm) else {
                 return 0;
             };
-            let Some(et) = require_term_ast(ctx, exp, "Z3_mk_fpa_to_fp_int_real", "exponent")
+            let Some(et) = require_ast(ctx, exp, "Z3_mk_fpa_to_fp_int_real", "exponent")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
-            let Some(st) = require_term_ast(ctx, sig, "Z3_mk_fpa_to_fp_int_real", "significand")
+            let Some(st) = require_ast(ctx, sig, "Z3_mk_fpa_to_fp_int_real", "significand")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -217,11 +217,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_int_real(
                 );
             }
             match ctx.solver.try_int_real_to_fp(rmt, et, st, eb, sb) {
-                Ok(x) => {
-                    let a = term_to_ast(ctx, x);
-                    record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-                    a
-                }
+                Ok(x) => mk_ast(ctx, x, Sort::FloatingPoint(eb, sb)),
                 Err(e) => ast_error(ctx, Z3_SORT_ERROR, format!("{e}")),
             }
         })
@@ -246,7 +242,7 @@ pub unsafe extern "C" fn Z3_fpa_is_numeral(c: Z3_context, t: Z3_ast) -> bool {
     // null-checks it and catches panics at the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            let term = require_term_ast_or_return!(ctx, t, "Z3_fpa_is_numeral", "term", 0);
+            let term = require_ast_or_return!(ctx, t, "Z3_fpa_is_numeral", "term", 0).term;
             i32::from(ctx.solver.fp_numeral_decode(term).is_some())
         }) != 0
     }
@@ -271,7 +267,9 @@ macro_rules! fpa_is_category {
             // SAFETY: `c` forwarded under the caller's contract.
             unsafe {
                 ffi_guard_int(c, 0, |ctx| {
-                    let Some(term) = require_term_ast(ctx, t, stringify!($name), "term") else {
+                    let Some(term) =
+                        require_ast(ctx, t, stringify!($name), "term").map(|decoded| decoded.term)
+                    else {
                         return 0;
                     };
                     match ctx.solver.fp_numeral_decode(term) {
@@ -350,7 +348,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_sign(c: Z3_context, t: Z3_ast, sgn: 
     // written only on the success path within the guarded closure.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            let term = require_term_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_sign", "term", 0);
+            let term = require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_sign", "term", 0).term;
             match ctx.solver.fp_numeral_decode(term) {
                 Some(d) if !d.is_nan() => {
                     *sgn = d.sign;
@@ -379,7 +377,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_sign_bv(c: Z3_context, t: Z3_ast) ->
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let term = require_term_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_sign_bv", "term", 0);
+            let term = require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_sign_bv", "term", 0).term;
             let Some(d) = ctx.solver.fp_numeral_decode(term) else {
                 return ast_error(
                     ctx,
@@ -395,11 +393,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_sign_bv(c: Z3_context, t: Z3_ast) ->
                 );
             }
             match ctx.solver.try_bv_const(i64::from(d.sign), 1) {
-                Ok(bv) => {
-                    let a = term_to_ast(ctx, bv);
-                    record_ast_sort(ctx, a, Sort::bitvec(1));
-                    a
-                }
+                Ok(bv) => mk_ast(ctx, bv, Sort::bitvec(1)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -422,7 +416,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_significand_bv(c: Z3_context, t: Z3_
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let term =
-                require_term_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_significand_bv", "term", 0);
+                require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_significand_bv", "term", 0).term;
             let Some(d) = ctx.solver.fp_numeral_decode(term) else {
                 return ast_error(
                     ctx,
@@ -440,11 +434,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_significand_bv(c: Z3_context, t: Z3_
             let width = d.sb - 1;
             let val = BigInt::from(d.sig_field);
             match ctx.solver.try_bv_const_bigint(&val, width) {
-                Ok(bv) => {
-                    let a = term_to_ast(ctx, bv);
-                    record_ast_sort(ctx, a, Sort::bitvec(width));
-                    a
-                }
+                Ok(bv) => mk_ast(ctx, bv, Sort::bitvec(width)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -472,13 +462,9 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_significand_uint64(
     // written only on the success path within the guarded closure.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            let term = require_term_ast_or_return!(
-                ctx,
-                t,
-                "Z3_fpa_get_numeral_significand_uint64",
-                "term",
-                0
-            );
+            let term =
+                require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_significand_uint64", "term", 0)
+                    .term;
             match ctx.solver.fp_numeral_decode(term) {
                 Some(d) if !d.is_nan() => match d.sig_field.to_u64() {
                     Some(v) => {
@@ -521,13 +507,14 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_significand_string(
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 t,
                 "Z3_fpa_get_numeral_significand_string",
                 "term",
                 ptr::null()
-            );
+            )
+            .term;
             let Some(d) = ctx.solver.fp_numeral_decode(term) else {
                 return str_error(
                     ctx,
@@ -572,7 +559,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_exponent_bv(
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let term =
-                require_term_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_exponent_bv", "term", 0);
+                require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_exponent_bv", "term", 0).term;
             let Some(d) = ctx.solver.fp_numeral_decode(term) else {
                 return ast_error(
                     ctx,
@@ -597,11 +584,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_exponent_bv(
                 d.is_subnormal(),
             );
             match ctx.solver.try_bv_const_bigint(&val, width) {
-                Ok(bv) => {
-                    let a = term_to_ast(ctx, bv);
-                    record_ast_sort(ctx, a, Sort::bitvec(width));
-                    a
-                }
+                Ok(bv) => mk_ast(ctx, bv, Sort::bitvec(width)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -632,7 +615,7 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_exponent_int64(
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
             let term =
-                require_term_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_exponent_int64", "term", 0);
+                require_ast_or_return!(ctx, t, "Z3_fpa_get_numeral_exponent_int64", "term", 0).term;
             match ctx.solver.fp_numeral_decode(term) {
                 Some(d) if !d.is_nan() => {
                     let val = fp_exponent_value(
@@ -682,13 +665,14 @@ pub unsafe extern "C" fn Z3_fpa_get_numeral_exponent_string(
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 t,
                 "Z3_fpa_get_numeral_exponent_string",
                 "term",
                 ptr::null()
-            );
+            )
+            .term;
             let Some(d) = ctx.solver.fp_numeral_decode(term) else {
                 return str_error(
                     ctx,

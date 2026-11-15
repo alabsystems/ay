@@ -509,9 +509,14 @@ pub fn rebuild_with_children(original: &Expr, children: Vec<Expr>) -> Expr {
             let a = it.next().unwrap();
             ExprValue::FpGe(a, it.next().unwrap())
         }
-        ExprValue::FpRem(_, _) => {
+        ExprValue::FpRem(_, _) | ExprValue::FpTruncatingRem(_, _) => {
             let a = it.next().unwrap();
-            ExprValue::FpRem(a, it.next().unwrap())
+            let b = it.next().unwrap();
+            if matches!(original.value(), ExprValue::FpRem(..)) {
+                ExprValue::FpRem(a, b)
+            } else {
+                ExprValue::FpTruncatingRem(a, b)
+            }
         }
         ExprValue::FpMin(_, _) => {
             let a = it.next().unwrap();
@@ -548,6 +553,20 @@ pub fn rebuild_with_children(original: &Expr, children: Vec<Expr>) -> Expr {
                 cond,
                 then_expr,
                 else_expr: it.next().unwrap(),
+            }
+        }
+        ExprValue::ArrayRangeCopy { .. } => {
+            let Ok([dst, src, lo, hi, src_start]) =
+                <[Expr; 5]>::try_from(it.by_ref().collect::<Vec<_>>())
+            else {
+                return original.clone();
+            };
+            ExprValue::ArrayRangeCopy {
+                dst,
+                src,
+                lo,
+                hi,
+                src_start,
             }
         }
         ExprValue::Store { .. } => {

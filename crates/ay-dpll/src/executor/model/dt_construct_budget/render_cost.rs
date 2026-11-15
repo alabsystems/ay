@@ -51,7 +51,9 @@ pub(super) fn model_value_work(value: &ModelValue, limit: usize) -> Option<usize
                 }
                 1
             }
-            ModelValue::FloatingPoint { .. } | ModelValue::Algebraic(_) => return None,
+            ModelValue::FloatingPoint { .. }
+            | ModelValue::FloatingPointExact { .. }
+            | ModelValue::Algebraic(_) => return None,
         };
         work = work.checked_add(payload)?;
         if work > limit {
@@ -145,7 +147,7 @@ pub(super) fn canonical_render_bytes(value: &ModelValue, limit: usize) -> Option
 fn canonical_string_literal_bytes(text: &str, limit: usize) -> Option<usize> {
     let mut bytes = 2usize;
     for character in text.chars() {
-        let code = character as u32;
+        let code = ay_core::smtlib_code_point(character);
         let payload = match character {
             '"' => 2,
             '\\' => 6,

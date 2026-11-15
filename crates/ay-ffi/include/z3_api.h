@@ -1137,6 +1137,7 @@ typedef enum {
     Z3_OP_BSREM_I,
     Z3_OP_BUREM_I,
     Z3_OP_BSMOD_I,
+    Z3_OP_MKBV,
 
     // Proofs
     Z3_OP_PR_UNDEF = 0x500,
@@ -1181,6 +1182,8 @@ typedef enum {
     Z3_OP_PR_MODUS_PONENS_OEQ,
     Z3_OP_PR_TH_LEMMA,
     Z3_OP_PR_HYPER_RESOLVE,
+    Z3_OP_PR_TH_ASSUMPTION_ADD,
+    Z3_OP_PR_TH_LEMMA_ADD,
 
     // Relational algebra
     Z3_OP_RA_STORE = 0x600,
@@ -1222,6 +1225,7 @@ typedef enum {
     Z3_OP_SEQ_MAPI,           
     Z3_OP_SEQ_FOLDL,          
     Z3_OP_SEQ_FOLDLI,         
+    Z3_OP_SEQ_POWER,
 
     // strings
     Z3_OP_STR_TO_INT,
@@ -7746,6 +7750,42 @@ extern "C" {
     def_API('Z3_get_estimated_alloc_size', UINT64, ())
     */
     uint64_t Z3_API Z3_get_estimated_alloc_size(void);
+
+    // Implemented Z3 5.3 additions. Historical enum values are retained;
+    // this surface does not claim complete Z3 5.3 ABI compatibility.
+    // Exact native prime-field slice: prime cardinalities through 4294967291.
+    #define Z3_FINITE_FIELD_SORT ((Z3_sort_kind)15)
+    #define Z3_OP_FF_NUM ((Z3_decl_kind)0xd000)
+    #define Z3_OP_FF_ADD ((Z3_decl_kind)0xd001)
+    #define Z3_OP_FF_MUL ((Z3_decl_kind)0xd002)
+    #define Z3_OP_FF_NEG ((Z3_decl_kind)0xd003)
+    #define Z3_OP_FF_BITSUM ((Z3_decl_kind)0xd004)
+    Z3_sort Z3_API Z3_mk_finite_field_sort(Z3_context c, Z3_string prime);
+    Z3_string Z3_API Z3_get_finite_field_sort_size(Z3_context c, Z3_sort s);
+    Z3_ast Z3_API Z3_mk_ff_add(Z3_context c, unsigned n, Z3_ast const args[]);
+    Z3_ast Z3_API Z3_mk_ff_mul(Z3_context c, unsigned n, Z3_ast const args[]);
+    Z3_ast Z3_API Z3_mk_ff_neg(Z3_context c, Z3_ast arg);
+    Z3_ast Z3_API Z3_mk_ff_bitsum(Z3_context c, unsigned n, Z3_ast const args[]);
+    #define Z3_COMPLEX_SORT ((Z3_sort_kind)16)
+    #define Z3_OP_COMPLEX ((Z3_decl_kind)531)
+    #define Z3_OP_REAL_PART ((Z3_decl_kind)532)
+    #define Z3_OP_IMAG_PART ((Z3_decl_kind)533)
+    Z3_ast Z3_API Z3_mk_seq_power(Z3_context c, Z3_ast s, Z3_ast n);
+    Z3_sort Z3_API Z3_mk_complex_sort(Z3_context c);
+    Z3_ast Z3_API Z3_mk_complex(Z3_context c, Z3_ast real, Z3_ast imaginary);
+    Z3_ast Z3_API Z3_mk_real_part(Z3_context c, Z3_ast value);
+    Z3_ast Z3_API Z3_mk_imag_part(Z3_context c, Z3_ast value);
+
+    // Supported native proofs are checked structurally; unavailable rules or
+    // premise bindings produce command errors. The callback may query/build
+    // ASTs and replace/unregister itself, but must not delete c, recursively
+    // evaluate SMT-LIB on c, or throw across the C ABI. Client-owned UTF-8/NUL
+    // report storage must survive immediate return.
+    Z3_DECLARE_CLOSURE(Z3_proof_check_eh, Z3_string,
+                      (void *user_context, Z3_context c,
+                       Z3_ast proof, Z3_ast_vector assertions));
+    void Z3_API Z3_set_proof_check_callback(Z3_context c, void *user_context,
+                                          Z3_proof_check_eh callback);
 
     /**@}*/
 

@@ -78,7 +78,7 @@
 //!
 //! # Two defects the prototype measured on itself, and how this port avoids them
 //!
-//! The Python prototype (`scripts/pb_certified_bb_cert.py`) found both in its own
+//! The former Python prototype (available in git history) found both in its own
 //! output. They are recorded here because a port that reproduced them would look
 //! like it worked.
 //!
@@ -124,7 +124,9 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::cp_replay::self_check_soli_refutation;
 use super::{evaluate_linear_objective, format_assignment};
-use crate::optimize::lp_bound::{lp_dual_raw_diagnosed, LpDualDecline};
+use crate::optimize::lp_bound::{
+    cert_refuses_but_wide_admits, lp_dual_raw_diagnosed, lp_dual_raw_diagnosed_wide, LpDualDecline,
+};
 use crate::proof::steps::{ConstraintId, ProofStep};
 use crate::proof::veripb::{veripb_input_constraint_count, VeriPbWriter};
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
@@ -316,6 +318,15 @@ const MAX_NODE_LP_POLLS_FAST: u64 = 16;
 /// that arrives sooner. Note that 142 and 178 also mean the give-up set is NOT
 /// identical across 16, 64, 128 and 144 — the claim that it was is corrected
 /// above.
+///
+/// AN UNRESOLVED CROSS-TRACK MEASUREMENT. This cap was sized on "every
+/// instance this route certifies walks `guided=0`". Audit `5eefb03b4` measured
+/// `hw64-vm99p` — certified by this route with its LP refused for size — at
+/// `nodes=129 guided=64 polls=0`, which this cap would decline at the 17th
+/// blind node; `KE_450_009` (also LP-refused) has the same shape. Neither
+/// instance was re-measured with this cap in place. Since [`MAX_WORK`] now
+/// bounds the blind path's cost too, the next resize of this constant should
+/// start from that pair. See also [`run`].
 const MAX_BLIND_NODES: u64 = 16;
 
 /// How many nodes the search opens before it will consult the caller's
@@ -439,6 +450,195 @@ const MAX_LEAF_SCALE: i128 = 1 << 20;
 /// ones (a sibling's closing combination) and the root's, not a long history.
 const MAX_DUAL_POOL: usize = 8;
 
+/// THE ROUTE'S BOUND ON WORK, counted in MODEL NONZEROS TOUCHED.
+///
+/// # Why a poll count was not a bound on work
+///
+/// Every other budget in this file counts EVENTS — nodes, depth, LP polls — and
+/// each of them bounds the search only if the events cost a bounded amount.
+/// They do not. `MAX_TOTAL_LP_POLLS` is the one that was asked to carry the
+/// route, and a poll's cost grows with the model: the same 32,768 polls are
+/// 3.7 s on `injcomp_..._size_29` and, on a model six times as wide, a
+/// ten-minute hole in a solve that never consults the caller's clock.
+///
+/// The instance that proves it is INSIDE the shipped size caps, so no cap
+/// change reaches it: `opm2-z7-s2` (2,023 variables, 31,798 rows, 79,762
+/// nonzeros) is admitted by `CERT_MAX_VARS`/`CERT_MAX_ROWS`/`CERT_MAX_NONZEROS`
+/// and, measured on 2026-09-01 with a frozen probe, spent 675 s in ONE call of
+/// this unscheduled rung and returned nothing. (The size-cap track recorded it
+/// as "past 700 s without returning"; re-measured here it DOES return, which
+/// makes the defect sharper rather than smaller — what it returns after those
+/// 675 s is a decline, and the only thing that ended it was a poll count.) Its
+/// two budgets explain the cost between them: the poll budget
+/// alone is `32,768 x (31,798 rows + 79,762 nonzeros + 2,023 columns) = 3.7e9`
+/// nonzero-touches, and the tree budget alone is `4,096` nodes each of which
+/// rescans every row for [`single_row_farkas`] and again for the node model.
+/// Neither number is large; their PRODUCT with the row count is.
+///
+/// # What this counts, and why the unit is a nonzero
+///
+/// A nonzero is what every expensive thing here is linear in — the residual
+/// scan, the exact `try_leaf` re-derivation, the ladder's bigint multiply per
+/// dual, and one simplex poll's chunk of tableau. So the meter charges, at
+/// four sites and nowhere else:
+///
+/// * [`Model::residual`] — the row's nonzeros, once per row per scan;
+/// * [`try_leaf`] — `num_vars` plus the nonzeros of every CITED row;
+/// * [`NodeLp::scaled`] — one per dual cleared;
+/// * one LP poll — the node LP's own size, `rows + nonzeros + columns`, which is
+///   the "poll-row product" the poll count was missing.
+///
+/// IT IS A COUNT, NOT A CLOCK. `grep -nE 'Instant|Duration|elapsed|SystemTime'`
+/// over this file returns exactly one line — the one you are reading — and the
+/// meter is a pure function of the tree walked, so the emitted bytes still do
+/// not depend on how busy the box is.
+///
+/// # SIZED FROM MEASUREMENT
+///
+/// Work spent by the EIGHT instances this route certifies, measured with the
+/// meter installed and the cap effectively absent (`1 << 100`), one solve at a
+/// time. Six were measured by the work-bound track (probe `fa2f6ef6`); the
+/// independent audit `5eefb03b4` found the sizing table had omitted two
+/// certifiers its own ancestry names (`fir04_trarea_ac`, `m100_300_10_20.r`)
+/// and metered them on the shipping probe, with byte-identical proofs before
+/// and after (`attempts=1`, so `work` is one search):
+///
+/// ```text
+///   instance                            nodes  polls         WORK     scan      lp
+///   g9x9                                   29    469      466,000   35,814   237,893
+///   dominating_set_hexgrid_opt_r6_c50       5  4,184    7,626,104   23,644  7,530,056
+///   sbox_4_shg                            355  5,569   19,463,416 2,653,018 13,481,661
+///   fir04_trarea_ac                         .      .   58,161,616   137,350 57,901,672
+///   hw64-vm99p                            129      0   64,493,578 58,594,698        0
+///   m100_300_10_20.r                    1,443      .   67,335,739 5,965,652 31,243,812
+///   addm4.r                                73 11,021   84,737,385 2,050,197 79,542,023
+///   f20c10b_008_area_delay                 49  9,122  402,615,218 8,213,867 384,199,010
+/// ```
+///
+/// READ THE `hw64-vm99p` ROW BEFORE ANY OTHER. It spends ZERO polls and 64.5
+/// MILLION units of work, all of it scanning, because its LP is refused by a
+/// size cap and it walks 129 nodes rescanning 1,556 rows over 45,696 columns
+/// with no relaxation at all. `MAX_TOTAL_LP_POLLS` cannot see one unit of that.
+/// The same shape is what runs `f20c10b_011`'s DECLINE to 406.0 M at
+/// `polls=0/32768`.
+///
+/// `1 << 30` = 1,073,741,824 is the power of two above the heaviest, 2.67x over
+/// `f20c10b_008`. `1 << 29` was the alternative and is NOT taken: it fits
+/// (1.33x, the same headroom `MAX_TOTAL_LP_POLLS` carries over `sbox_4_shg`)
+/// and would halve the decline ceiling, but a meter this new is likelier to
+/// have its accounting adjusted than the poll count is, and 1.33x is close
+/// enough that an adjustment would silently DELETE the heaviest certifier this
+/// route has. The price of the safer number is about a minute on a decline that
+/// today has no bound at all.
+///
+/// Raising it cannot make a proof wrong, only slower; lowering it turns
+/// certificates into declines, and the first one it turns is `f20c10b_008`.
+/// The A/B gate for any resize is proof-sha equality on those eight. Both rows
+/// the audit added fit `1 << 30` AND the rejected `1 << 29`, so the constant
+/// stands; only the completeness of the table was wrong.
+///
+/// # WHAT THIS BOUNDS, STATED WITHOUT ROUNDING
+///
+/// A COUNT BOUNDS WORK AND REPRODUCIBILITY, NOT WALL TIME, and the spread here
+/// is WIDER than the one `MAX_TOTAL_LP_POLLS` already admits (13x), because the
+/// meter deliberately puts two different arithmetics in one unit. Measured rate,
+/// same runs as the table above:
+///
+/// ```text
+///   f20c10b_011  119.4 M units/s   scan-dominated: i128 row arithmetic
+///   hw64-vm99p    95.0 M units/s   scan-dominated
+///   addm4.r       20.8 M units/s
+///   f20c10b_008    8.7 M units/s   lp-dominated: exact rational tableau
+///   opm2-z7-s2     5.2 M units/s   lp-dominated
+///   hexgrid_r6_c50 2.5 M units/s   lp-dominated, densest tableau measured
+/// ```
+///
+/// So the honest ceiling for ONE search is one full budget at the slowest
+/// measured rate — about 430 s — and NOT the four seconds the fastest suggests.
+/// The ROUTE's ceiling is twice that: a model in the dual-attempt band that
+/// certifies runs a second search budgeted at what the first spent, so the
+/// route can spend up to `2 * MAX_WORK`, about 860 s (see [`run`]). That is a
+/// large number and it is stated rather than glossed. It is also the first ceiling
+/// this route has ever had: measured against it, `opm2-z7-s2` spends 675 s
+/// today to return nothing and `f20c10b_011` at a wider admission ran 1,240 s,
+/// and NEITHER of them was bounded by anything that can see a row count.
+///
+/// THE NEXT LEVER IS IN THAT TABLE, and it is not this constant. The 50x spread
+/// is one axis: an `lp` unit is a bignum tableau entry and a `scan` unit is an
+/// `i128` add. Weighting `charge_lp` by the measured ratio would tighten the
+/// ceiling ~10x AND cut what a losing second attempt costs `hw64-vm99p` by the
+/// same factor, at the price of re-sizing this constant from a fresh
+/// measurement of all eight. It is not done here because a weight measured on one
+/// instance is a tuned constant, and this file has none.
+const MAX_WORK: u128 = 1 << 30;
+
+/// The deterministic work meter. Three subtotals because a decline that says
+/// WHERE the work went is a diagnosis and a single number is not.
+///
+/// `Cell` rather than `&mut` for the same reason [`Search::polls`] is one: the
+/// meter is read from inside the `should_stop` closure the LP holds, while the
+/// search still owns everything else.
+struct Work {
+    /// Nonzeros scanned computing residuals — [`single_row_farkas`] and the node
+    /// model build.
+    scan: std::cell::Cell<u128>,
+    /// Nonzeros re-derived by [`try_leaf`], plus one per dual cleared by
+    /// [`NodeLp::scaled`].
+    leaf: std::cell::Cell<u128>,
+    /// LP polls, each charged at its own node LP's size.
+    lp: std::cell::Cell<u128>,
+    /// What this attempt may spend. [`MAX_WORK`] for the first attempt; see
+    /// [`run`] for why the second one gets less.
+    budget: u128,
+}
+
+impl Work {
+    fn new(budget: u128) -> Self {
+        Self {
+            scan: std::cell::Cell::new(0),
+            leaf: std::cell::Cell::new(0),
+            lp: std::cell::Cell::new(0),
+            budget,
+        }
+    }
+
+    fn spent(&self) -> u128 {
+        self.scan
+            .get()
+            .saturating_add(self.leaf.get())
+            .saturating_add(self.lp.get())
+    }
+
+    /// TRUE once the budget is gone. Every loop that can run long consults it,
+    /// so the overrun past `budget` is one row or one poll, never one model.
+    fn exhausted(&self) -> bool {
+        self.spent() >= self.budget
+    }
+
+    fn charge_scan(&self, units: usize) {
+        self.scan.set(self.scan.get().saturating_add(units as u128));
+    }
+
+    fn charge_leaf(&self, units: usize) {
+        self.leaf.set(self.leaf.get().saturating_add(units as u128));
+    }
+
+    fn charge_lp(&self, units: u128) {
+        self.lp.set(self.lp.get().saturating_add(units));
+    }
+}
+
+/// Which LP admission an attempt asks for. See [`run`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// The shipped certificate caps. What every model gets first, and what all
+    /// but the near-a-cap ones ever get.
+    Certificate,
+    /// The wide caps, for the SECOND attempt on a model the certificate caps
+    /// refused. See `lp_bound::WIDE_MAX_VARS`.
+    Wide,
+}
+
 /// What the search concluded. Three outcomes, and the whole point of the type is
 /// that the middle one is NOT the last one.
 ///
@@ -493,6 +693,17 @@ struct Run {
     lp_decline: Option<String>,
 }
 
+impl Run {
+    /// A run that never searched: `reason` names the precondition that failed.
+    fn declined(reason: &'static str) -> Self {
+        Run {
+            lp_decline: None,
+            outcome: Outcome::Exhausted(reason),
+            stats: Stats::default(),
+        }
+    }
+}
+
 /// Counts the search spent, reported by [`certified_bb_diagnosis`] so a decline
 /// names a NUMBER rather than a mood. All four are the deterministic budgets'
 /// own units, so a decline can be read straight against [`MAX_NODES`],
@@ -516,6 +727,20 @@ struct Stats {
     /// Nodes whose fast LP pass refused and which therefore paid for the full
     /// one as well. See [`MAX_NODE_LP_POLLS_FAST`].
     escalations: u64,
+    /// Nonzeros touched, and where. The budget that actually bounds this route
+    /// on a wide model; see [`MAX_WORK`].
+    ///
+    /// With `attempts=2`, `work` is the total over BOTH searches (the route's
+    /// real cost) while `work_scan`/`work_leaf`/`work_lp` stay the subtotals of
+    /// the search whose outcome was kept — so `scan + leaf + lp != work` there,
+    /// by design. (`hw64-vm99p`: 64,493,578 kept vs `work=130,190,926`.)
+    work: u128,
+    work_scan: u128,
+    work_leaf: u128,
+    work_lp: u128,
+    /// How many searches [`run`] paid for: 1 normally, 2 when the model was near
+    /// a cap and the second attempt was run to look for a smaller proof.
+    attempts: u32,
 }
 
 impl std::fmt::Display for Stats {
@@ -523,7 +748,8 @@ impl std::fmt::Display for Stats {
         write!(
             f,
             "nodes={}/{MAX_NODES} leaves={} replays={} guided={} escalations={} farkas={} \
-             depth={}/{MAX_DEPTH} polls={}/{MAX_TOTAL_LP_POLLS}",
+             depth={}/{MAX_DEPTH} polls={}/{MAX_TOTAL_LP_POLLS} \
+             work={}/{MAX_WORK}(scan={} leaf={} lp={}) attempts={}",
             self.nodes,
             self.leaves,
             self.replays,
@@ -531,7 +757,12 @@ impl std::fmt::Display for Stats {
             self.escalations,
             self.farkas,
             self.depth,
-            self.polls
+            self.polls,
+            self.work,
+            self.work_scan,
+            self.work_leaf,
+            self.work_lp,
+            self.attempts
         )
     }
 }
@@ -633,6 +864,15 @@ struct Residual {
 }
 
 impl Model {
+    /// Nonzeros over the `>=` rows only — the count `cert_refuses_but_wide_admits`
+    /// needs, and the one the work meter's scan charges are proportional to.
+    fn structural_nonzeros(&self) -> usize {
+        self.rows
+            .iter()
+            .map(Vec::len)
+            .fold(0_usize, usize::saturating_add)
+    }
+
     /// The residual of row `c` at a node. `None` on arithmetic overflow.
     ///
     /// THE DISCHARGE TEST LIVES HERE, and it is the first of the two defects
@@ -641,7 +881,8 @@ impl Model {
     /// i.e. only if `degree <= least`. The prototype tested `degree <= 0`,
     /// which is the same thing ONLY when every free coefficient is
     /// non-negative.
-    fn residual(&self, row: usize, fixed: &[Option<bool>]) -> Option<Residual> {
+    fn residual(&self, row: usize, fixed: &[Option<bool>], work: &Work) -> Option<Residual> {
+        work.charge_scan(self.rows[row].len().saturating_add(1));
         let mut degree = self.rhs[row];
         let mut least = 0_i128;
         let mut most = 0_i128;
@@ -706,6 +947,7 @@ fn try_leaf(
     ys: &[(usize, i128)],
     qo: i128,
     optimum: i128,
+    work: &Work,
 ) -> Option<Leaf> {
     if qo < 0 || ys.iter().any(|&(_, multiplier)| multiplier <= 0) {
         return None;
@@ -713,6 +955,15 @@ fn try_leaf(
     if ys.is_empty() && qo == 0 {
         return None;
     }
+    // Two dense passes over the variables plus one pass over every cited row —
+    // charged BEFORE the work, so a leaf cannot be re-derived for free.
+    work.charge_leaf(
+        model.num_vars.saturating_add(
+            ys.iter()
+                .map(|&(row, _)| model.rows[row].len())
+                .fold(0_usize, usize::saturating_add),
+        ),
+    );
     let mut coefficient = vec![0_i128; model.num_vars];
     let mut aggregate_degree = 0_i128;
     for &(row, multiplier) in ys {
@@ -787,11 +1038,24 @@ fn try_leaf(
 /// `R = degree - Σ_{v free} max(0, A[c,v]) - Σ_{v ∈ F1} A[c,v] = residual.degree - residual.most > 0`
 /// — which is the infeasibility test itself. No phase-1 LP, no objective, and
 /// the leaf cites the `soli` row not at all.
-fn single_row_farkas(model: &Model, fixed: &[Option<bool>], optimum: i128) -> Option<Leaf> {
+fn single_row_farkas(
+    model: &Model,
+    fixed: &[Option<bool>],
+    optimum: i128,
+    work: &Work,
+) -> Option<Leaf> {
     for row in 0..model.rows.len() {
-        let residual = model.residual(row, fixed)?;
+        // The scan is one full pass over the model per node, so it is one of the
+        // two places a wide model's cost actually lives (see [`MAX_WORK`]) and it
+        // has to be stoppable INSIDE the loop. Giving up here reports no Farkas
+        // leaf, which is what "I did not look" means; the caller's own budget
+        // check then ends the search.
+        if work.exhausted() {
+            return None;
+        }
+        let residual = model.residual(row, fixed, work)?;
         if residual.degree > residual.most {
-            if let Some(leaf) = try_leaf(model, fixed, &[(row, 1)], 0, optimum) {
+            if let Some(leaf) = try_leaf(model, fixed, &[(row, 1)], 0, optimum, work) {
                 return Some(leaf);
             }
         }
@@ -821,7 +1085,10 @@ impl NodeLp {
     /// either (nothing downstream assumes dual feasibility) but is pointless —
     /// it can only make the aggregate coefficients larger without making the
     /// degree larger.
-    fn scaled(&self, scale: i128) -> Option<Vec<(usize, i128)>> {
+    fn scaled(&self, scale: i128, work: &Work) -> Option<Vec<(usize, i128)>> {
+        // One bigint multiply and one floor per dual, and the ladder runs this
+        // twelve times per node.
+        work.charge_leaf(self.duals.len());
         let mut out = Vec::with_capacity(self.duals.len());
         for (row, dual) in &self.duals {
             let scaled = dual * BigRational::from_integer(BigInt::from(scale));
@@ -860,6 +1127,8 @@ fn solve_node_lp(
     optimum: i128,
     polls: &std::cell::Cell<u64>,
     budget: u64,
+    work: &Work,
+    admission: Admission,
 ) -> Result<NodeLp, String> {
     let free: Vec<usize> = (0..model.num_vars)
         .filter(|&v| fixed[v].is_none())
@@ -874,8 +1143,15 @@ fn solve_node_lp(
 
     let mut kept: Vec<usize> = Vec::new();
     let mut constraints: Vec<PbConstraint> = Vec::new();
+    let mut kept_nonzeros = 0_usize;
     for row in 0..model.rows.len() {
-        let Some(residual) = model.residual(row, fixed) else {
+        // The second full pass over the model per node. Same reason as
+        // `single_row_farkas`: stoppable inside the loop, and giving up is a
+        // refusal, which every caller already handles.
+        if work.exhausted() {
+            return Err("work-budget".into());
+        }
+        let Some(residual) = model.residual(row, fixed, work) else {
             return Err("overflow".into());
         };
         if residual.degree <= residual.least {
@@ -897,6 +1173,8 @@ fn solve_node_lp(
             // violated; `single_row_farkas` owns that node and is tried first.
             return Err("row-violated-under-the-fixings".into());
         }
+        kept_nonzeros = kept_nonzeros.saturating_add(terms.len());
+        work.charge_scan(terms.len());
         kept.push(row);
         constraints.push(PbConstraint {
             terms,
@@ -943,25 +1221,44 @@ fn solve_node_lp(
         return Err("overflow".into());
     };
 
-    // TWO caps, both COUNTS. The per-solve one exists because this route runs an
+    // THREE caps, all COUNTS. The two poll caps exist because this route runs an
     // LP per node: a budget that is generous for a single solve is the whole
-    // route's cost when there are hundreds.
+    // route's cost when there are hundreds. The THIRD is the work meter, and it
+    // is the one that survives contact with a wide model — a poll here is
+    // charged at THIS LP's size, so 32,768 polls on a 31,798-row node model
+    // cost what they actually cost instead of what they cost on a 240-row one.
+    // See [`MAX_WORK`].
     let entry = polls.get();
+    let poll_weight = (constraints.len() as u128)
+        .saturating_add(kept_nonzeros as u128)
+        .saturating_add(free.len() as u128);
     let Ok(num_free) = u32::try_from(free.len()) else {
         return Err("too-many-free-variables".into());
     };
-    let raw = lp_dual_raw_diagnosed(
-        &objective,
-        &constraints,
-        num_free,
-        Some(target),
-        Some(MAX_LEAF_SCALE),
-        &|| {
-            let spent = polls.get().saturating_add(1);
-            polls.set(spent);
-            spent > MAX_TOTAL_LP_POLLS || spent.saturating_sub(entry) > budget
-        },
-    )
+    let stop = || {
+        let spent = polls.get().saturating_add(1);
+        polls.set(spent);
+        work.charge_lp(poll_weight);
+        spent > MAX_TOTAL_LP_POLLS || spent.saturating_sub(entry) > budget || work.exhausted()
+    };
+    let raw = match admission {
+        Admission::Certificate => lp_dual_raw_diagnosed(
+            &objective,
+            &constraints,
+            num_free,
+            Some(target),
+            Some(MAX_LEAF_SCALE),
+            &stop,
+        ),
+        Admission::Wide => lp_dual_raw_diagnosed_wide(
+            &objective,
+            &constraints,
+            num_free,
+            Some(target),
+            Some(MAX_LEAF_SCALE),
+            &stop,
+        ),
+    }
     .map_err(|decline| decline.label())?;
     if raw.num_constraint_rows != constraints.len() {
         return Err("row-count".into());
@@ -1138,6 +1435,10 @@ struct Search<'a> {
     /// certificate this route makes. It can only ever turn a certificate into a
     /// decline; it never reaches the emitter, so no proof byte depends on it.
     should_stop: &'a dyn Fn() -> bool,
+    /// The deterministic work meter. See [`MAX_WORK`].
+    work: Work,
+    /// Which LP admission this attempt asks for. See [`run`].
+    admission: Admission,
 }
 
 /// What one node resolved to.
@@ -1230,16 +1531,22 @@ impl Search<'_> {
         {
             return NodeResult::Exhausted("interrupted");
         }
+        // THE BUDGET THAT ACTUALLY BOUNDS THIS ROUTE ON A WIDE MODEL. The three
+        // above are counts of EVENTS whose cost grows with the row count; this
+        // one counts the cost. See [`MAX_WORK`].
+        if self.work.exhausted() {
+            return NodeResult::Exhausted("work-budget");
+        }
 
         // 1. The node's rows are already contradictory through one of them.
         //    Exact, no LP, and it cites no objective.
-        if let Some(leaf) = single_row_farkas(self.model, &self.fixed, self.optimum) {
+        if let Some(leaf) = single_row_farkas(self.model, &self.fixed, self.optimum, &self.work) {
             self.stats.farkas = self.stats.farkas.saturating_add(1);
             return self.close(&leaf);
         }
         // 2. Every objective coefficient that matters is already fixed, and the
         //    fixed part alone exceeds the refuted budget.
-        if let Some(leaf) = try_leaf(self.model, &self.fixed, &[], 1, self.optimum) {
+        if let Some(leaf) = try_leaf(self.model, &self.fixed, &[], 1, self.optimum, &self.work) {
             return self.close(&leaf);
         }
         // 3. REPLAY. An ancestor's multipliers, re-derived against THIS node's
@@ -1248,10 +1555,11 @@ impl Search<'_> {
         let model = self.model;
         let optimum = self.optimum;
         let fixed = &self.fixed;
+        let work = &self.work;
         let replayed = self
             .pool
             .iter()
-            .find_map(|(ys, qo)| try_leaf(model, fixed, ys, *qo, optimum));
+            .find_map(|(ys, qo)| try_leaf(model, fixed, ys, *qo, optimum, work));
         if let Some(leaf) = replayed {
             self.stats.replays = self.stats.replays.saturating_add(1);
             return self.close(&leaf);
@@ -1270,6 +1578,8 @@ impl Search<'_> {
             } else {
                 MAX_NODE_LP_POLLS_FAST
             },
+            &self.work,
+            self.admission,
         );
         // ...and only a refusal a bigger allowance could actually change. Every
         // other one is decided before the first poll and re-deriving it costs a
@@ -1287,6 +1597,8 @@ impl Search<'_> {
                 self.optimum,
                 &self.polls,
                 MAX_NODE_LP_POLLS,
+                &self.work,
+                self.admission,
             );
             // A second refusal keeps the FIRST reason, which is the one the
             // diagnosis reports and the one that names the model.
@@ -1304,21 +1616,30 @@ impl Search<'_> {
         }
         if let Ok(node) = lp.as_ref() {
             for scale in node.scales() {
-                let Some(ys) = node.scaled(scale) else {
+                let Some(ys) = node.scaled(scale, &self.work) else {
                     continue;
                 };
                 // 3. The objective leaf: the node's dual bound exceeds the
                 //    refuted budget. Cites the `soli` row at the SAME scale as
                 //    the rows, which is what makes the single `d K` at the end
                 //    round the degree without disturbing any ratio.
-                if let Some(leaf) = try_leaf(self.model, &self.fixed, &ys, scale, self.optimum) {
+                if let Some(leaf) = try_leaf(
+                    self.model,
+                    &self.fixed,
+                    &ys,
+                    scale,
+                    self.optimum,
+                    &self.work,
+                ) {
                     self.remember(&ys, scale);
                     return self.close(&leaf);
                 }
                 // 4. The same multipliers with `qo = 0`: a multi-row Farkas
                 //    leaf, for a node closed by its rows alone rather than by
                 //    its bound.
-                if let Some(leaf) = try_leaf(self.model, &self.fixed, &ys, 0, self.optimum) {
+                if let Some(leaf) =
+                    try_leaf(self.model, &self.fixed, &ys, 0, self.optimum, &self.work)
+                {
                     self.stats.farkas = self.stats.farkas.saturating_add(1);
                     self.remember(&ys, 0);
                     return self.close(&leaf);
@@ -1334,7 +1655,7 @@ impl Search<'_> {
         if let Ok(node) = lp.as_ref() {
             let widest = node
                 .scales()
-                .filter_map(|scale| node.scaled(scale).map(|ys| (ys, scale)))
+                .filter_map(|scale| node.scaled(scale, &self.work).map(|ys| (ys, scale)))
                 .filter(|(ys, _)| !ys.is_empty())
                 .max_by_key(|&(_, scale)| scale);
             if let Some((ys, scale)) = widest {
@@ -1495,32 +1816,164 @@ fn fallback_branch_variable(model: &Model, fixed: &[Option<bool>]) -> Option<usi
     best.map(|(var, _)| var)
 }
 
+/// DUAL ATTEMPT: run the tree BOTH ways when the model sits ON a size cap, and
+/// keep the SMALLER verified proof.
+///
+/// # The pair that proves one global cap cannot be right for both
+///
+/// Measured 2026-09-01 (`census/size-caps-2026-09-01`), same rung, same tree,
+/// only the LP's admission moved:
+///
+/// ```text
+///   instance      vars  rows   CERTIFICATE caps          WIDE caps
+///   KE_450_009  20,023   372   71,145,872 B in 431.6 s   902,662 B in 6.1 s
+///   hw64-vm99p  45,696 1,556      761,527 B in   0.5 s   no verdict at 600 s
+/// ```
+///
+/// `KE_450_009` misses `CERT_MAX_VARS` by TWENTY-THREE VARIABLES and is 78.8x
+/// smaller and 71x faster with the LP it is refused. `hw64-vm99p` is the exact
+/// opposite: its certificate exists BECAUSE the refusal makes the tree fall back
+/// to ancestor-guided branching, and handing it an LP deletes the certificate.
+/// A bigger cap is not a superset of a smaller one, so neither number is right
+/// for both — and the answer is not a number, it is running both.
+///
+/// # THE SECOND ATTEMPT IS PAID FOR BY THE FIRST
+///
+/// Three rules, and each one is there because the measurement says so rather
+/// than because it is tidy:
+///
+/// 1. THE FIRST ATTEMPT IS THE SHIPPED ONE, unchanged, at [`MAX_WORK`]. Nothing
+///    this function does can lose a certificate that exists today.
+/// 2. THE SECOND ATTEMPT RUNS ONLY WHEN THE FIRST ONE CERTIFIED. It is a SIZE
+///    optimisation, never a coverage tool, and the corpus is what decides that:
+///    of the 18 instances the certificate caps refuse (measured by the size-cap
+///    track, `census/size-caps-2026-09-01`), seventeen carry an LP gap of 80 to
+///    1.5e12 objective units that no dual point admitted at any cap could close;
+///    the eighteenth, `f20c10b_011` (gap 1), declines under BOTH admissions.
+///    The only two the wide admission actually converts are the two in the
+///    table — both of which ALREADY certify at the shipped caps. So
+///    the measured conversion value of a second attempt on a DECLINE is zero,
+///    and its measured cost is 335.9 s (`n3div36`), 600 s (`single-obj-f50`) and
+///    1,240 s (`f20c10b_011`). A decline therefore pays nothing at all here.
+/// 3. THE SECOND ATTEMPT'S BUDGET IS WHAT THE FIRST ONE SPENT. If you already
+///    hold a proof, a smaller one is not worth more work than the one you have.
+///    That caps the whole route at 2x the FIRST attempt — NOT 2x the winner:
+///    on `KE_450_009` the winner is attempt 2 at 24,811,507 units and the
+///    route spent 374,936,995, 15.1x the winner and 1.07x the first. Its
+///    absolute ceiling is `2 * MAX_WORK`. That makes the loser's cost a number
+///    rather than a hope.
+///
+/// It is also the reason the WORK METER had to come first: rule 3 is meaningless
+/// in polls (`hw64-vm99p` spends ZERO of them and still walks 129 nodes) and
+/// unbounded in wall time.
+///
+/// # What can change, and what cannot
+///
+/// Only the BYTES can change, and only downward. The second attempt's text goes
+/// through the same [`self_check_soli_refutation`] replay as the first, and it
+/// is adopted only when it is strictly shorter. A model the certificate caps
+/// ADMIT never reaches here at all ([`cert_refuses_but_wide_admits`] is false
+/// when the two admissions agree), so the two attempts can never be the same
+/// tree run twice. An interrupt from `should_stop` in the second attempt is
+/// just a losing second attempt: the first proof is kept.
+///
+/// # THE OPEN INTERACTION WITH [`MAX_BLIND_NODES`], NOT MEASURED HERE
+///
+/// Both pair rows above were measured WITHOUT [`MAX_BLIND_NODES`], which landed
+/// in parallel. A model the certificate caps refuse gets no node LP at all, so
+/// every branching node of its first attempt is blind: audit `5eefb03b4`
+/// measured `hw64-vm99p` at `guided=64`, and `KE_450_009`'s 297-leaf first
+/// tree is blind throughout. With the blind cap at 16, rule 2 then means the
+/// second attempt is never reached for either, and what the cap costs is those
+/// two FIRST-attempt certificates — a decision that belongs to the blind cap,
+/// not to this function. This function still fires, unchanged, for any model
+/// in the band whose blind first tree fits under the cap.
 fn run(
     instance: &PbInstance,
     incumbent: &[bool],
     optimum: i128,
     should_stop: &dyn Fn() -> bool,
 ) -> Run {
+    let mut first = attempt(
+        instance,
+        incumbent,
+        optimum,
+        should_stop,
+        Admission::Certificate,
+        MAX_WORK,
+    );
+    first.stats.attempts = 1;
+    let Outcome::Proof(held) = &first.outcome else {
+        return first;
+    };
     let Some(model) = build_model(instance) else {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("shape"),
-            stats: Stats::default(),
-        };
+        return first;
+    };
+    if !cert_refuses_but_wide_admits(
+        model.num_vars,
+        model.rows.len(),
+        model.structural_nonzeros(),
+    ) {
+        return first;
+    }
+    let held_len = held.len();
+    let paid_for = first.stats.work;
+    let second = attempt(
+        instance,
+        incumbent,
+        optimum,
+        should_stop,
+        Admission::Wide,
+        paid_for,
+    );
+    match &second.outcome {
+        Outcome::Proof(text) if text.len() < held_len => {
+            let mut winner = second;
+            winner.stats.attempts = 2;
+            // `work` is BOTH attempts, so the total is the route's real cost.
+            // The three subtotals beside it stay the WINNER's — the tree whose
+            // bytes were kept — which is what a reader of `attempts=2` wants.
+            winner.stats.work = winner.stats.work.saturating_add(paid_for);
+            winner
+        }
+        Outcome::Refuted { .. } => {
+            // FAIL CLOSED, and this branch should be unreachable. The first
+            // attempt emitted bytes that its own cutting-planes replay accepted
+            // as a refutation of `obj <= optimum - 1`; a witness achieving less
+            // than `optimum` would mean that replay accepted a proof of a false
+            // statement. The two cannot both be believed, so neither is
+            // returned.
+            let mut broken = second;
+            broken.outcome = Outcome::Exhausted("second-attempt-refutes-the-first");
+            broken.stats.attempts = 2;
+            broken.stats.work = broken.stats.work.saturating_add(paid_for);
+            broken
+        }
+        _ => {
+            first.stats.attempts = 2;
+            first.stats.work = first.stats.work.saturating_add(second.stats.work);
+            first
+        }
+    }
+}
+
+/// ONE search, at one LP admission, under one work budget.
+fn attempt(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    should_stop: &dyn Fn() -> bool,
+    admission: Admission,
+    work_budget: u128,
+) -> Run {
+    let Some(model) = build_model(instance) else {
+        return Run::declined("shape");
     };
     if incumbent.len() != model.num_vars {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("shape"),
-            stats: Stats::default(),
-        };
+        return Run::declined("shape");
     }
     let Some(objective) = instance.objective.as_ref() else {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("shape"),
-            stats: Stats::default(),
-        };
+        return Run::declined("shape");
     };
     if evaluate_linear_objective(objective, incumbent) != Some(optimum)
         || !crate::eval::verify_all_constraints(&instance.constraints, incumbent)
@@ -1528,42 +1981,22 @@ fn run(
         // The upper bound is not established, so there is nothing to close a
         // lower bound against. This is the cheap guard, not the premise: the
         // premise is `Outcome::Refuted`, which needs a witness.
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("incumbent-does-not-achieve-the-claim"),
-            stats: Stats::default(),
-        };
+        return Run::declined("incumbent-does-not-achieve-the-claim");
     }
     let Ok(input_count) = veripb_input_constraint_count(instance) else {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("input-count"),
-            stats: Stats::default(),
-        };
+        return Run::declined("input-count");
     };
     if input_count != model.rows.len() as u64 {
         // `>=`-only inputs are one id each; anything else means this module's
         // `row + 1` id arithmetic would be citing the wrong rows.
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("input-count"),
-            stats: Stats::default(),
-        };
+        return Run::declined("input-count");
     }
     let Ok(mut writer) = VeriPbWriter::new(Vec::<u8>::new(), input_count) else {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("emit-failed"),
-            stats: Stats::default(),
-        };
+        return Run::declined("emit-failed");
     };
     let Ok(soli) = writer.log_step(ProofStep::SolutionImproving(format_assignment(incumbent)))
     else {
-        return Run {
-            lp_decline: None,
-            outcome: Outcome::Exhausted("emit-failed"),
-            stats: Stats::default(),
-        };
+        return Run::declined("emit-failed");
     };
 
     let mut search = Search {
@@ -1578,10 +2011,16 @@ fn run(
         pool: Vec::new(),
         lp_decline: None,
         should_stop,
+        work: Work::new(work_budget),
+        admission,
     };
     let root = search.dfs(0, None);
     let mut stats = search.stats;
     stats.polls = search.polls.get();
+    stats.work = search.work.spent();
+    stats.work_scan = search.work.scan.get();
+    stats.work_leaf = search.work.leaf.get();
+    stats.work_lp = search.work.lp.get();
     let lp_decline = search.lp_decline.clone();
     let done = |outcome| Run {
         outcome,
@@ -1697,14 +2136,20 @@ pub(super) fn certified_bb_diagnosis(
 #[cfg(test)]
 mod tests {
     use super::{
-        certified_bb_diagnosis, certify_opt_lin_certified_bb, fallback_branch_variable,
-        single_row_farkas, try_leaf, MAX_BLIND_NODES, MAX_DEPTH, MAX_DUAL_POOL, MAX_NODES,
-        MAX_NODE_LP_POLLS, MAX_NODE_LP_POLLS_FAST, MAX_ROOT_LP_POLLS, MAX_TOTAL_LP_POLLS,
-        MAX_UNINTERRUPTIBLE_NODES, MAX_UNINTERRUPTIBLE_POLLS,
+        attempt, certified_bb_diagnosis, certify_opt_lin_certified_bb, fallback_branch_variable,
+        run, single_row_farkas, try_leaf, Admission, Outcome, Work, MAX_BLIND_NODES, MAX_DEPTH,
+        MAX_DUAL_POOL, MAX_NODES, MAX_NODE_LP_POLLS, MAX_NODE_LP_POLLS_FAST, MAX_ROOT_LP_POLLS,
+        MAX_TOTAL_LP_POLLS, MAX_UNINTERRUPTIBLE_NODES, MAX_UNINTERRUPTIBLE_POLLS, MAX_WORK,
     };
     use crate::optimize::lp_bound::LpDualDecline;
     use crate::proof::cert::cp_replay::self_check_soli_refutation;
     use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
+
+    /// A work meter with a budget nothing in a unit test can reach, for the
+    /// arithmetic tests — they are about `try_leaf`'s algebra, not its budget.
+    fn unmetered() -> Work {
+        Work::new(u128::MAX)
+    }
 
     fn term(coeff: i128, var: u32, negated: bool) -> PbTerm {
         PbTerm {
@@ -2063,12 +2508,12 @@ mod tests {
         let fixed = vec![None; model.num_vars];
         // One edge row at multiplier 1 with no objective: `x_a + x_b >= 1` minus
         // the two axioms leaves degree 1 - 1 - 1 < 0. No leaf.
-        assert!(try_leaf(&model, &fixed, &[(0, 1)], 0, 6).is_none());
+        assert!(try_leaf(&model, &fixed, &[(0, 1)], 0, 6, &unmetered()).is_none());
         // The same row against the objective at scale 1 is the LP-dual floor of
         // ONE edge, which is nowhere near 6.
-        assert!(try_leaf(&model, &fixed, &[(0, 1)], 1, 6).is_none());
+        assert!(try_leaf(&model, &fixed, &[(0, 1)], 1, 6, &unmetered()).is_none());
         // Nothing at all cited is never a leaf.
-        assert!(try_leaf(&model, &fixed, &[], 0, 6).is_none());
+        assert!(try_leaf(&model, &fixed, &[], 0, 6, &unmetered()).is_none());
     }
 
     /// THE FARKAS LEAF THE PROTOTYPE DID NOT HAVE. Fix both endpoints of an edge
@@ -2081,7 +2526,8 @@ mod tests {
         let mut fixed = vec![None; model.num_vars];
         fixed[0] = Some(false);
         fixed[1] = Some(false);
-        let leaf = single_row_farkas(&model, &fixed, 6).expect("a violated row must close");
+        let leaf =
+            single_row_farkas(&model, &fixed, 6, &unmetered()).expect("a violated row must close");
         assert_eq!(leaf.qo, 0, "a Farkas leaf must not cite the objective");
         assert_eq!(leaf.ys, vec![(0, 1)], "row 0 is `x1 + x2 >= 1`");
         assert_eq!(
@@ -2286,6 +2732,97 @@ mod tests {
         assert_eq!(never.as_deref(), Some(plain.as_str()));
     }
 
+    /// THE WORK METER IS SIZED FROM EVERY INSTANCE THIS ROUTE CERTIFIES, and
+    /// this test is what fails when someone lowers it.
+    ///
+    /// The numbers are the measured spend of the eight with the meter installed
+    /// (six with no cap, `MAX_WORK = 1 << 100`, probe `fa2f6ef6`; `fir04` and
+    /// `m100_300` added by audit `5eefb03b4` on the shipping probe, which the
+    /// first sizing omitted), one solve at a time. Every one of them must stay
+    /// strictly inside the cap or that instance stops being a certificate.
+    #[test]
+    fn the_work_meter_admits_every_instance_this_route_certifies() {
+        const MEASURED: [(&str, u128); 8] = [
+            ("g9x9", 466_000),
+            ("dominating_set_hexgrid_opt_r6_c50", 7_626_104),
+            ("sbox_4_shg", 19_463_416),
+            ("fir04_trarea_ac", 58_161_616),
+            ("hw64-vm99p", 64_493_578),
+            ("m100_300_10_20.r", 67_335_739),
+            ("addm4.r", 84_737_385),
+            ("f20c10b_008_area_delay", 402_615_218),
+        ];
+        for (name, spent) in MEASURED {
+            assert!(
+                MAX_WORK > spent,
+                "MAX_WORK = {MAX_WORK} would decline {name}, which spends {spent} \
+                 nonzero-touches and certifies today"
+            );
+        }
+        let heaviest = MEASURED.iter().map(|&(_, w)| w).max().expect("eight rows");
+        assert!(
+            MAX_WORK < heaviest.saturating_mul(8),
+            "a cap this far above the heaviest measured certifier ({heaviest}) is not \
+             sized from anything; the point of the meter is that opm2-z7-s2 STOPS"
+        );
+        // The control the meter exists for: `opm2-z7-s2` is 2,023 columns over
+        // 31,798 rows and 79,762 nonzeros, admitted by every size cap, and its
+        // POLL budget alone authorises more work than this cap allows.
+        let opm2_poll_work: u128 = u128::from(MAX_TOTAL_LP_POLLS) * (31_798 + 79_762 + 2_023);
+        assert!(
+            opm2_poll_work > MAX_WORK,
+            "if the poll budget cannot outspend the work budget on the widest admitted \
+             model, the work budget is not bounding anything"
+        );
+    }
+
+    /// A BUDGET THE POLL COUNT CANNOT SEE. `hw64-vm99p` walks 129 nodes at
+    /// `polls=0`, so "polls spent" is not a measure of what this route does; the
+    /// meter is, and it stops the search in its own name.
+    #[test]
+    fn the_work_budget_stops_a_search_that_has_spent_no_polls() {
+        let (instance, incumbent, optimum) = petersen_vertex_cover();
+        assert!(
+            certify_opt_lin_certified_bb(&instance, &incumbent, optimum).is_some(),
+            "the shipped budgets certify this instance"
+        );
+        let run = attempt(
+            &instance,
+            &incumbent,
+            optimum,
+            &|| false,
+            Admission::Certificate,
+            1,
+        );
+        match run.outcome {
+            Outcome::Exhausted(reason) => assert_eq!(
+                reason, "work-budget",
+                "the decline must NAME the budget that fired"
+            ),
+            _ => panic!("a one-unit work budget must stop this search"),
+        }
+        assert_eq!(
+            run.stats.polls, 0,
+            "and it must fire before the first LP poll, which is the case the poll \
+             budget structurally cannot cover"
+        );
+    }
+
+    /// THE SECOND ATTEMPT NEVER RUNS WHERE IT WOULD BE THE SAME TREE. It is
+    /// gated on the two admissions DISAGREEING, so a model inside the
+    /// certificate caps — which is every instance this route certifies except
+    /// `hw64-vm99p` — pays exactly nothing for it.
+    #[test]
+    fn a_model_inside_the_caps_pays_nothing_for_the_second_attempt() {
+        let (instance, incumbent, optimum) = petersen_vertex_cover();
+        let run = run(&instance, &incumbent, optimum, &|| false);
+        assert!(matches!(run.outcome, Outcome::Proof(_)));
+        assert_eq!(
+            run.stats.attempts, 1,
+            "a 10-variable model is nowhere near a cap and must be searched once"
+        );
+    }
+
     /// THE FALLBACK IS A RANKING, AND ITS TIE-BREAK IS TOTAL. Determinism is the
     /// whole reason this route may use a heuristic at all: the emitted bytes
     /// must not depend on iteration order, so equal-weight variables must always
@@ -2345,7 +2882,7 @@ mod tests {
         let ys: Vec<(usize, i128)> = (0..15).map(|row| (row, 1_i128)).collect();
         let root = vec![None; model.num_vars];
         assert!(
-            try_leaf(&model, &root, &ys, 2, optimum).is_none(),
+            try_leaf(&model, &root, &ys, 2, optimum, &unmetered()).is_none(),
             "the whole edge relaxation at the root is LP*, which is below the optimum"
         );
         // Five is one short: `R = 5 - 5 = 0`, and `try_leaf` demands STRICTLY
@@ -2355,12 +2892,12 @@ mod tests {
             five[var] = Some(false);
         }
         assert!(
-            try_leaf(&model, &five, &ys, 2, optimum).is_none(),
+            try_leaf(&model, &five, &ys, 2, optimum, &unmetered()).is_none(),
             "R = 0 is not a leaf"
         );
         let mut six = five.clone();
         six[5] = Some(false);
-        let leaf = try_leaf(&model, &six, &ys, 2, optimum)
+        let leaf = try_leaf(&model, &six, &ys, 2, optimum, &unmetered())
             .expect("the SAME multipliers must close once one more variable is fixed");
         assert_eq!(
             leaf.support,

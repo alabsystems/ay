@@ -123,7 +123,6 @@ states/
 # Mutation testing artifacts
 mutants/
 .mutmut-cache/
-kani_status.json
 
 # Generated design index
 the development design notes
@@ -278,6 +277,21 @@ benchmarks/sat/unsat/*.drat
 # not match it (the name continues past `.chccert`), so without this line every
 # test run that touches a `benchmarks/smt` fixture leaves untracked files behind.
 .*.chccert.ay-chc.lock
+# The DIMACS default-proof status marker (449fd06aa) sits beside the default
+# `<input>.drat` as `<input>.drat.ay-status`, with a transient `.ay-status.lock`
+# transaction and a dot-prefixed `.ay-dimacs-proof-<pid>-<nonce>.stage`
+# staging sibling. The `*.cnf.drat` rule above matches none of them, so solving
+# a fixture in place (test_cli_dimacs_unsat_corpus_soundness runs `ay` on every
+# benchmarks/sat/unsat/*.cnf) left one untracked marker per fixture.
+*.cnf.drat.ay-status
+*.dimacs.drat.ay-status
+*.drat.ay-status.lock
+.ay-dimacs-proof-*.stage
+# The authenticated-removal path keeps its invalidated tombstone in a private
+# `.ay-dimacs-proof-<pid>-<nonce>/discard` directory beside the input (pinned by
+# the dimacs cleanup tests); re-solving a fixture whose stale proof is present
+# leaves one per removal.
+.ay-dimacs-proof-*/
 *.pbp.tmp-*
 *.proof-artifact.json.tmp.*
 chc-obligations/
@@ -324,7 +338,7 @@ benchmarks/minizinc/challenge-2025/
 # machine-specific symlink to the built ay binary (created by mzn_challenge/setup.sh)
 competition/minizinc/ay
 
-# SAT-COMP 2025 sample fetched by scripts/_fetch_sat2025_sample.sh (default DEST)
+# Preserve any existing local SAT-COMP 2025 sample data outside source control.
 benchmarks/sat/satcomp2025/
 
 # All-divisions corpus fetched by fetch-all.sh / `ay-z3-parity fetch` (gitignored like smtlib-sample)
@@ -375,3 +389,7 @@ the development design notes*.jsonl
 #     want the trend shared.
 the development design notes
 the development design notes
+
+# patch(1) / merge leftovers (a stray proof.rs.rej.orig was once committed)
+*.rej
+*.orig

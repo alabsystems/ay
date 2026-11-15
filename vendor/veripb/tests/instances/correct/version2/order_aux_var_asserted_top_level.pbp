@@ -1,0 +1,47 @@
+pseudo-Boolean proof version 2.0
+* The version 2.0 manifestation of defect 14 (order auxiliary variables are not
+* order-private), ported from the ay repo's patch 0002-ay-post-fork-soundness-fixes.
+* There it was filed under `incorrect/` because 0002 closed the hole by refusing
+* the top-level aux-var assertion at ACCEPTANCE. This fork closes the same hole
+* at the SCOPE-INJECTION point instead (`ScopeAuxVarNotFresh`, exercised by the
+* version-3 companions `incorrect/version3/order_aux_var_asserted_top_level*`),
+* and that check is enough because version 2.0 has NO `scope` construct at all:
+* there is no way to inject the order's specification into a subproof, so the
+* asserted `a1` can never be turned into a contradiction. This proof therefore
+* verifies at exit 0 with `s VERIFIED NO CONCLUSION` and forges nothing — it is
+* correct. Pinned here so a future change that DID make the v2 aux-var route
+* forge a verdict would flip this to an accepting `s VERIFIED UNSATISFIABLE` and
+* fail the suite. See `ci/veripb-soundness/15-order-aux-var-not-private/`.
+f 1
+pre_order triv
+    vars
+        left u1
+        right v1
+        aux a1
+    end
+    spec
+        red 1 ~a1 >= 1 ; a1 → 0 ; begin
+        end
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+            fresh_aux_1 b1
+            fresh_aux_2 c1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order triv x1
+red 1 a1 >= 1 ; a1 → 1 ; begin
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

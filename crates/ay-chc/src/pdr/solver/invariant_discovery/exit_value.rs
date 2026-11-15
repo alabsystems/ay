@@ -10,7 +10,6 @@
 //! transitions. Novel technique — solves count_by_2_m_nest.
 
 use super::super::PdrSolver;
-use crate::pdr::frame::Lemma;
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
 
 mod entry_init;
@@ -417,12 +416,13 @@ impl PdrSolver {
                 }
             }
         }
+        // The composed bound is read off one exit-value composition, not off
+        // every transition into the predicate, so it takes the SMT-checked
+        // admission rather than being written straight into frame 1 as
+        // algebraically verified (which would skip every admission check).
         for (pred_id, var, composed_exit) in candidates {
             let bound_formula = ChcExpr::le(ChcExpr::var(var), ChcExpr::Int(composed_exit));
-            self.add_lemma_to_frame(
-                Lemma::new(pred_id, bound_formula, 1).with_algebraically_verified(true),
-                1,
-            );
+            self.add_discovered_invariant(pred_id, bound_formula, 1);
         }
     }
 }

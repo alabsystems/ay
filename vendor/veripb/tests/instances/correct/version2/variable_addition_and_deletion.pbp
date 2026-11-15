@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+f 1
+red 2 x1 0 ~f0 >= 0 ; f0 -> 0 ;
+red -2 x1 3 f0 >= 1 ; f0 -> 1 ;
+del id 2 3
+soli x1
+output NONE
+conclusion BOUNDS -1 -1
+end pseudo-Boolean proof

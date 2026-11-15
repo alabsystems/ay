@@ -93,7 +93,10 @@ pub(crate) fn normalize_small(mut n: i64, mut d: i64) -> Option<(i64, i64)> {
     }
     let g = gcd_u64(n.unsigned_abs(), d.unsigned_abs());
     if g > 1 {
-        Some((n / g as i64, d / g as i64))
+        // `d > 0` here, so `g <= d <= i64::MAX` and the divisions are exact:
+        // the checked forms only spell out what the gcd already guarantees.
+        let g = i64::try_from(g).ok()?;
+        Some((n.checked_div(g)?, d.checked_div(g)?))
     } else {
         Some((n, d))
     }
@@ -161,22 +164,48 @@ impl Rational {
     ///
     /// `to_rug` is the historical interop name; it returns a
     /// `num_rational::BigRational`.
+    ///
+    /// The `Small` arm builds the `Ratio` with `new_raw`, NOT `new`:
+    /// `Ratio::new` re-runs num-bigint's Stein gcd on the pair, but the
+    /// `Small` invariant (`denom > 0`, `gcd(|numer|, denom) == 1`, see the
+    /// type docs) is enforced by every constructor, and `Ratio::reduce` on
+    /// an already-reduced pair with a positive denominator is the identity —
+    /// so `new_raw` yields the bit-identical `Ratio` without the gcd. The
+    /// 2026-09-09 `sample` of the ny_propagate verification gate showed this
+    /// gcd (reached through `to_big()` from the NIA factor split) as the
+    /// single largest leaf; see `rational_ops.rs` (#certora-bigint-fast) for
+    /// the same argument on the operator side.
     #[inline]
     pub fn to_rug(&self) -> BigBacking {
         match self {
-            Self::Small(n, d) => BigRational::new(BigInt::from(*n), BigInt::from(*d)),
+            Self::Small(n, d) => Self::small_to_backing(*n, *d),
             Self::Big(br) => (**br).clone(),
         }
     }
 
+    /// Build the canonical `Ratio` of a `Small(n, d)` pair without a gcd.
+    ///
+    /// `n == 0` is routed through the canonical zero (`0/1`) because
+    /// `is_zero` tolerates a `Small(0, d)` shape; every other pair is
+    /// coprime with `d > 0` by the `Small` invariant (pinned by the
+    /// `debug_assert`), which is exactly `Ratio`'s reduced form.
+    #[inline]
+    fn small_to_backing(n: i64, d: i64) -> BigBacking {
+        if n == 0 {
+            return BigRational::from_integer(BigInt::zero());
+        }
+        debug_assert!(
+            d > 0 && gcd_u64(n.unsigned_abs(), d.unsigned_abs()) == 1,
+            "Rational::Small invariant violated: {n}/{d}"
+        );
+        BigRational::new_raw(BigInt::from(n), BigInt::from(d))
+    }
+
     /// Convert to num_rational::BigRational (backward compatibility).
-    /// For the Big variant, converts from the active backend when needed.
+    /// Byte-identical to [`Self::to_rug`] (gcd-free for `Small`).
     #[inline]
     pub fn to_big(&self) -> BigRational {
-        match self {
-            Self::Small(n, d) => BigRational::new(BigInt::from(*n), BigInt::from(*d)),
-            Self::Big(br) => (**br).clone(),
-        }
+        self.to_rug()
     }
 
     /// Compare `self` against a `BigRational` without allocating.
@@ -243,18 +272,29 @@ impl Rational {
     }
 
     /// Compute the absolute value of this `Rational`, returning a `BigRational`.
+    ///
+    /// `|n|` and `d` stay coprime, so the `Small` arm is gcd-free like
+    /// [`Self::to_rug`]; `i64::MIN.unsigned_abs()` fits a `u64`, so the
+    /// magnitude is exact.
     #[inline]
     pub fn abs_bigrational(&self) -> BigRational {
         match self {
-            Self::Small(n, d) => BigRational::new(BigInt::from(n.unsigned_abs()), BigInt::from(*d)),
+            Self::Small(0, _) => BigRational::from_integer(BigInt::zero()),
+            Self::Small(n, d) => {
+                debug_assert!(*d > 0 && gcd_u64(n.unsigned_abs(), d.unsigned_abs()) == 1);
+                BigRational::new_raw(BigInt::from(n.unsigned_abs()), BigInt::from(*d))
+            }
             Self::Big(br) => num_traits::Signed::abs(&**br),
         }
     }
 
-    /// Borrow as BigRational (allocates -- use sparingly).
+    /// Borrow as BigRational (allocates only for `Small`).
     #[inline]
     pub fn as_big(&self) -> std::borrow::Cow<'_, BigRational> {
-        std::borrow::Cow::Owned(self.to_big())
+        match self {
+            Self::Big(br) => std::borrow::Cow::Borrowed(&**br),
+            small => std::borrow::Cow::Owned(small.to_big()),
+        }
     }
 
     /// Check if this is the inline representation.
@@ -306,7 +346,13 @@ impl Rational {
     pub fn to_integer(&self) -> BigInt {
         match self {
             Self::Small(n, 1) => BigInt::from(*n),
-            Self::Small(n, d) => BigInt::from(*n / *d),
+            // The `Small` invariant (`d > 0`) makes the i64 quotient exact;
+            // any pair it cannot divide goes through the arbitrary-precision
+            // backing, which truncates exactly like the `Big` arm.
+            Self::Small(n, d) => match n.checked_div(*d) {
+                Some(q) => BigInt::from(q),
+                None => self.to_rug().to_integer(),
+            },
             Self::Big(br) => br.to_integer(),
         }
     }
@@ -342,11 +388,18 @@ impl fmt::Display for Rational {
 }
 
 impl PartialEq for Rational {
+    /// Value equality. Mixed `Small`/`Big` pairs go through the
+    /// allocation-free [`Rational::cmp_big`] cross-multiplication instead of
+    /// materialising (and re-normalising) both sides as `BigRational`;
+    /// `Big`/`Big` compares the backings by reference (`Ratio::eq` is
+    /// `cmp == Equal`, value-based). Same predicate, no allocation.
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Small(n1, d1), Self::Small(n2, d2)) => n1 == n2 && d1 == d2,
-            _ => self.to_rug() == other.to_rug(),
+            (Self::Small(_, _), Self::Big(b)) => self.cmp_big(b) == Ordering::Equal,
+            (Self::Big(a), Self::Small(_, _)) => other.cmp_big(a) == Ordering::Equal,
+            (Self::Big(a), Self::Big(b)) => **a == **b,
         }
     }
 }
@@ -361,6 +414,12 @@ impl PartialOrd for Rational {
 }
 
 impl Ord for Rational {
+    /// Exact rational order. Mixed pairs use [`Rational::cmp_big`] (i128
+    /// cross-multiplication when the `Big` side's limbs fit i64, otherwise
+    /// `BigInt x i64`), reversed for the `Big`-on-the-left orientation;
+    /// `Big`/`Big` compares the backings by reference. No allocation on any
+    /// arm — this is the comparison under every `InfRational::cmp_bound`,
+    /// `lower.value > upper.value` scan and `should_update` check.
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
@@ -369,7 +428,9 @@ impl Ord for Rational {
                 let rhs = i128::from(*n2) * i128::from(*d1);
                 lhs.cmp(&rhs)
             }
-            _ => self.to_rug().cmp(&other.to_rug()),
+            (Self::Small(_, _), Self::Big(b)) => self.cmp_big(b),
+            (Self::Big(a), Self::Small(_, _)) => other.cmp_big(a).reverse(),
+            (Self::Big(a), Self::Big(b)) => (**a).cmp(&**b),
         }
     }
 }

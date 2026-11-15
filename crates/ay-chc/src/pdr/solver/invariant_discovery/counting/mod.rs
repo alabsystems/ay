@@ -12,6 +12,8 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 mod counting_core;
 mod counting_extract;
+#[cfg(test)]
+mod error_implied_tests;
 mod multi_linear;
 mod same_delta_diff;
 mod three_var_diff;

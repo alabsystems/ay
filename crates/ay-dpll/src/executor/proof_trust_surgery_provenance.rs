@@ -19,10 +19,12 @@ mod original_index;
 pub(in crate::executor) use original_index::{prepare_rebuilt_premise_append, OriginalSourceIndex};
 #[path = "proof_trust_surgery_planning_budget.rs"]
 mod planning_budget;
+pub use planning_budget::CanonicalWorkRefusal;
 #[cfg(test)]
 pub(in crate::executor) use planning_budget::MAX_FARKAS_ATTEMPTS;
 pub(in crate::executor) use planning_budget::{
-    canonical_term_work, surgery_sources_are_bounded, OperandCharge, SurgeryPlanningBudget,
+    canonical_term_work, canonical_term_work_probe_metered, canonical_term_work_refusal,
+    surgery_sources_are_bounded, OperandCharge, SurgeryPlanningBudget,
 };
 
 /// Hard width bound for provenance-driven repair inputs.

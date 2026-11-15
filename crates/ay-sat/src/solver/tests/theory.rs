@@ -1473,6 +1473,7 @@ fn test_unknown_from_extension_stop_with_empty_formula() {
     impl Extension for StopOnInitExtension {
         fn propagate(&mut self, _ctx: &dyn SolverContext) -> ExtPropagateResult {
             ExtPropagateResult {
+                clause_origin: crate::TheoryClauseOrigin::Lemma,
                 clauses: vec![],
                 propagations: vec![],
                 lazy_propagations: vec![],
@@ -1480,6 +1481,8 @@ fn test_unknown_from_extension_stop_with_empty_formula() {
                 stop: true,
                 bump_vars: vec![],
                 proof_script: vec![],
+                definitions: vec![],
+                num_vars: 0,
             }
         }
 
@@ -1529,6 +1532,7 @@ fn test_unsat_from_extension_empty_conflict() {
             if !self.fired {
                 self.fired = true;
                 ExtPropagateResult {
+                    clause_origin: crate::TheoryClauseOrigin::Lemma,
                     clauses: vec![],
                     propagations: vec![],
                     lazy_propagations: vec![],
@@ -1536,6 +1540,8 @@ fn test_unsat_from_extension_empty_conflict() {
                     stop: false,
                     bump_vars: vec![],
                     proof_script: vec![],
+                    definitions: vec![],
+                    num_vars: 0,
                 }
             } else {
                 ExtPropagateResult::none()
@@ -1577,6 +1583,7 @@ fn test_extension_stop_does_not_mask_level0_unsat() {
             }
             self.fired = true;
             ExtPropagateResult {
+                clause_origin: crate::TheoryClauseOrigin::Lemma,
                 clauses: vec![vec![Literal::negative(Variable(0))]],
                 propagations: vec![],
                 lazy_propagations: vec![],
@@ -1584,6 +1591,8 @@ fn test_extension_stop_does_not_mask_level0_unsat() {
                 stop: true,
                 bump_vars: vec![],
                 proof_script: vec![],
+                definitions: vec![],
+                num_vars: 0,
             }
         }
 
@@ -2398,5 +2407,30 @@ fn test_decision_budget_cleared_solves_to_completion() {
     assert!(
         matches!(result, SatResult::Unsat(_)),
         "PHP(6,5) is UNSAT, got {result:?}"
+    );
+}
+
+/// A theory propagation's reason clause is learned and must be deletable once
+/// it is no longer a reason: with the arena's default LBD of 0 it was
+/// permanently protected, and on the XOR/Gauss route every propagation left a
+/// clause behind (mdp-32-11-sat: 1.68M retained at 300K conflicts, 2026-09-19).
+#[test]
+fn a_theory_propagation_reason_clause_is_deletable_by_reduction() {
+    let mut solver = Solver::new(3);
+    let x0_pos = Literal::positive(Variable(0));
+    let x1_pos = Literal::positive(Variable(1));
+    let x1_neg = Literal::negative(Variable(1));
+    solver.decide(x1_pos);
+    solver.qhead = solver.trail.len();
+    let clause_ref = solver
+        .add_theory_propagation(vec![x0_pos, x1_neg], x0_pos)
+        .expect("the propagation is stored as a clause");
+    let idx = clause_ref.0 as usize;
+    assert!(solver.arena.is_learned(idx));
+    assert!(
+        solver.arena.lbd(idx) > solver.reduce_permanent_protect_lbd(),
+        "lbd {} must exceed the permanent-protection bound {}",
+        solver.arena.lbd(idx),
+        solver.reduce_permanent_protect_lbd()
     );
 }

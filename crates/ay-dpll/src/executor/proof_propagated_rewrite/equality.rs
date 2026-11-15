@@ -6,6 +6,16 @@
 
 use super::*;
 
+mod array_folds;
+mod closed_fold;
+mod scalar_canonical;
+
+#[cfg(test)]
+mod recursion_tests;
+
+// A bounded node count alone does not bound the native recursion stack.
+const MAX_ACTIVE_EQUALITY_DEPTH: usize = 128;
+
 enum FoldShape {
     Same(Vec<TermId>),
     Swapped,
@@ -23,12 +33,17 @@ impl PropagationChainPlanner<'_> {
         t: TermId,
         stamp: u32,
     ) -> Option<EqRes> {
-        if let Some(&memoized) = cx.eq_memo.get(&(t, stamp)) {
+        let key = (t, stamp, cx.scalar_equality_mode);
+        if let Some(&memoized) = cx.eq_memo.get(&key) {
             return memoized;
         }
         cx.spend(1)?;
+        if cx.eq_in_progress.len() >= MAX_ACTIVE_EQUALITY_DEPTH || !cx.eq_in_progress.insert(key) {
+            return None;
+        }
         let result = self.plan_derive_eq_inner(cx, t, stamp);
-        cx.eq_memo.insert((t, stamp), result);
+        cx.eq_in_progress.remove(&key);
+        cx.eq_memo.insert(key, result);
         result
     }
 
@@ -470,6 +485,43 @@ impl PropagationChainPlanner<'_> {
         let mut bridge =
             self.plan_fold_bridge(cx, term, folded, &symbol, &args, &new_args, &child_results);
         if bridge.is_none() {
+            // VariableSubstitution keeps payload ITE equalities unexpanded.
+            // Try that exact array-derived spelling before the structural
+            // fallback; the enclosing record still must match the result.
+            if let Some(candidate) = self.plan_array_payload_candidate(cx, &symbol, &new_args) {
+                bridge = self.plan_array_fold(
+                    cx,
+                    term,
+                    candidate,
+                    &symbol,
+                    &args,
+                    &new_args,
+                    &child_results,
+                );
+                if bridge.is_some() {
+                    folded = candidate;
+                    tail = cx
+                        .entry_by_expr
+                        .get(&folded)
+                        .copied()
+                        .filter(|&(_, _, entry_stamp)| entry_stamp <= stamp);
+                }
+            }
+        }
+        if bridge.is_none() {
+            if let Some((candidate, candidate_bridge)) =
+                self.plan_scalar_canonical_fold(cx, term, &symbol, &args, &new_args, &child_results)
+            {
+                folded = candidate;
+                bridge = Some(candidate_bridge);
+                tail = cx
+                    .entry_by_expr
+                    .get(&folded)
+                    .copied()
+                    .filter(|&(_, _, entry_stamp)| entry_stamp <= stamp);
+            }
+        }
+        if bridge.is_none() {
             // Producer-model fallback (#4751). `fold_rebuild` models the
             // `PropagateValues` pass, which rebuilds boolean connectives
             // through `mk_and`/`mk_or` and therefore DROPS unit conjuncts:
@@ -559,7 +611,18 @@ impl PropagationChainPlanner<'_> {
                 child_results,
             ),
             FoldShape::Collapsing => self
-                .plan_linear_identity_fold(cx, term, folded, symbol, args, new_args, child_results)
+                .plan_array_fold(cx, term, folded, symbol, args, new_args, child_results)
+                .or_else(|| {
+                    self.plan_linear_identity_fold(
+                        cx,
+                        term,
+                        folded,
+                        symbol,
+                        args,
+                        new_args,
+                        child_results,
+                    )
+                })
                 .or_else(|| {
                     self.plan_collapsing_fold(
                         cx,
@@ -849,16 +912,21 @@ impl PropagationChainPlanner<'_> {
         let term_to_rebuilt = self
             .terms
             .mk_app(Symbol::named("="), [term, rebuilt], Sort::Bool);
+        let rebuilt_to_folded =
+            self.terms
+                .mk_app(Symbol::named("="), [rebuilt, folded], Sort::Bool);
+        // Pick the closing step BEFORE emitting anything: a fold no strict
+        // route closes must decline without leaving an orphan `cong` behind
+        // for the later fold bridges. Term interning and step order are
+        // unchanged for every fold that has a route.
+        let route = self.closed_fold_evaluation_route(cx, rebuilt, new_args, rebuilt_to_folded)?;
         let congruence = cx.chain.add_rule_step(
             AletheRule::Cong,
             vec![term_to_rebuilt],
             premises,
             Vec::new(),
         );
-        let rebuilt_to_folded =
-            self.terms
-                .mk_app(Symbol::named("="), [rebuilt, folded], Sort::Bool);
-        let evaluation = self.plan_closed_fold_evaluation(cx, rebuilt, new_args, rebuilt_to_folded);
+        let evaluation = self.emit_closed_fold_evaluation(cx, route, rebuilt_to_folded);
         let term_to_folded = self
             .terms
             .mk_app(Symbol::named("="), [term, folded], Sort::Bool);
@@ -1275,60 +1343,5 @@ impl PropagationChainPlanner<'_> {
             .chain
             .add_resolution(vec![equality, not_folded_literal], rebuilt, neg1, b_id);
         Some(cx.chain.add_resolution(vec![equality], folded, r1, r2))
-    }
-
-    fn plan_closed_fold_evaluation(
-        &mut self,
-        cx: &mut PlanCx<'_>,
-        rebuilt: TermId,
-        new_args: &[TermId],
-        equality: TermId,
-    ) -> ProofId {
-        let arithmetic_only = matches!(
-            self.terms.sort(rebuilt),
-            Sort::Bool | Sort::Int | Sort::Real
-        ) && new_args
-            .iter()
-            .all(|&arg| matches!(self.terms.sort(arg), Sort::Bool | Sort::Int | Sort::Real));
-        if arithmetic_only {
-            return cx.chain.add_rule_step(
-                AletheRule::Evaluate,
-                vec![equality],
-                Vec::new(),
-                Vec::new(),
-            );
-        }
-        if cx.closed_bv_bitblast_bridge {
-            return cx.chain.add_step(ProofStep::TheoryLemma {
-                theory: "theory".to_owned(),
-                clause: vec![equality],
-                farkas: None,
-                kind: TheoryLemmaKind::BvBitBlast,
-                lia: None,
-            });
-        }
-        // The strict `evaluate` BV fragment is concat-only. Use the bounded
-        // BvLiaTautology re-proof and propositional double-negation strip from
-        // `emit_forall_inst_unit_chain`; both are independently re-proved by
-        // the untouched checker.
-        let negated = self.terms.mk_not_raw(equality);
-        let double_negated = self.terms.mk_not_raw(negated);
-        let lemma = cx.chain.add_step(ProofStep::TheoryLemma {
-            theory: "theory".to_owned(),
-            clause: vec![double_negated],
-            farkas: None,
-            kind: TheoryLemmaKind::BvLiaTautology,
-            lia: None,
-        });
-        let triple_negated = self.terms.mk_not_raw(double_negated);
-        let strip = cx.chain.add_step(ProofStep::TheoryLemma {
-            theory: "theory".to_owned(),
-            clause: vec![triple_negated, equality],
-            farkas: None,
-            kind: TheoryLemmaKind::BoolTautology,
-            lia: None,
-        });
-        cx.chain
-            .add_resolution(vec![equality], double_negated, lemma, strip)
     }
 }

@@ -1,0 +1,61 @@
+{
+  "scope": "independent model-checker source; not CLI-after, formal verification, whole-workspace or landing",
+  "base": "c18ac0f027a36185937afc94bf89de79636542dd",
+  "rust_read_set": {
+    "crates/ay-model-check/src/eval.rs": "36374fc37d01060a5e7db75930d3d95173bdc5012021fae38bb11bff31efeb16",
+    "crates/ay-model-check/src/eval/fp_arithmetic_admission_tests.rs": "7166987b8ef2ef6f272823aad2fcd8f95ff627281849ca4c367e8f95205621d4",
+    "crates/ay-model-check/src/eval/quantifier.rs": "8f35b817ed1d76e729fa9009f0ceb77d9df0b78926fe68699e0b773c7462579b",
+    "crates/ay-model-check/src/fp.rs": "ca96f8afd0c0364842ec2a1ed199e22ebb57d9f6c64dc837c707457256fc709f",
+    "crates/ay-model-check/src/fp_exact.rs": "ecd61b2386dd899e87a4e5da7666c1ceccb654ba44c8ffa52c36eed3b3341c7a",
+    "crates/ay-model-check/src/fp_exact/arithmetic.rs": "aa3f69eb23f3651cad06829b91236348aa75f0bd942c14e06e99ab939a97f127",
+    "crates/ay-model-check/src/tests.rs": "b198679d0670bd41650d193836f9ac5c886fbf091cd8e9ccc7558f8709f55cb2",
+    "crates/ay-model-check/src/tests/fp_arithmetic_exact.rs": "ea29e091c218c5b9a816921ae772ce1a2e85069a1c987c00305322239637b9cc",
+    "crates/ay-model-check/src/tests/fp_exact.rs": "ca1d323d0b90728b6bd6d536ae6d2d0351f06c64d4a8b26e8dff5cd0e3023332"
+  },
+  "toolchain": {
+    "lane": "targo --unverified",
+    "targo_sha256": "195a697408b3df99273ad138a45f5ed07aad755c51d3f33e13750e470c71fd79",
+    "trustc_store": "16387.noindex",
+    "trustc_sha256": "0acc4862fe98d55f71585dd2e651ad166ce789f049d77b78dfe3d11112889c34",
+    "overrides": "RUSTC,CARGO_BUILD_RUSTC,RUSTC_WRAPPER,RUSTC_WORKSPACE_WRAPPER unset",
+    "configuration": "checked-in unchanged",
+    "admission": "canonical build-slot --cpus 7",
+    "source_home": "normal locked/offline cache consumer fp-main-4ddf7df9a; no manual cache mutations"
+  },
+  "controls": {
+    "command": "targo --unverified test --locked --offline -p ay-model-check --lib",
+    "passed": 807,
+    "failed": 0,
+    "ignored": 0,
+    "filtered": 0,
+    "build_seconds": 17.27,
+    "runtime_seconds": 0.14,
+    "log_sha256": "ad4882a00e23d543032dcf23836d47ac50e8780263db930015e736c2e6b20a9d"
+  },
+  "reference": {
+    "version": "Z3 5.3.3",
+    "binary_sha256": "9b3df8db3324ac2de9ebdd2841477366ecad0626656f806c2168ebf2732745a4",
+    "command": "z3 -T:5 memory_max_size=256 fp-wide-rounded-reference.smt2",
+    "independent_field_claims": 65,
+    "expected": "unsat",
+    "actual": "unsat",
+    "input_sha256": "ab5ca216f097856b87d1e9422bfe63923894af3508ef917d3deb9c01a73c6073"
+  },
+  "public_before": {
+    "source": "59b93184d9fe77c148a1b0725e9c92024b9ef3aa",
+    "build": 14947,
+    "binary_sha256": "f3969589da39ebc76d50cab415cae48d6f39bf83f40206a996d3f378e8fe00f3",
+    "command": "ay solve --timeout 5000 --memory 256 fp-wide-rounded-add.smt2",
+    "assurance": "default; no --z3-mode/no proof override",
+    "result": "unknown",
+    "phase": "independent-model-check-gate",
+    "reason": "unsupported FP arithmetic field width",
+    "z3": "sat"
+  },
+  "limitations": [
+    "Postchange production CLI is pending parent composition/build",
+    "sqrt and unadmitted huge formats remain unsupported",
+    "No solver math dependency, fresh allowance or verification-policy change",
+    "Initial affected run48pass1failure was obsolete CannotConfirm expectation; strengthened to ModelViolates"
+  ]
+}

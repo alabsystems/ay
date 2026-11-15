@@ -5,6 +5,7 @@
 use super::*;
 use crate::pdr::solver::core;
 use crate::pdr::solver::prop_solver::SegmentKey;
+use crate::pdr::solver::spacer_core::stats::CubeSource;
 use crate::HornClause;
 
 impl PdrSolver {
@@ -24,8 +25,16 @@ impl PdrSolver {
         transition_constraints: &mut Vec<ChcExpr>,
         clause_interpolation_data: &mut Vec<ClauseInterpolationData>,
         had_sat_no_cube: &mut bool,
+        cores: &mut Vec<ClauseCore>,
     ) -> Result<(), BlockResult> {
         let (body_pred, body_args) = &clause.body.predicates[0];
+        let lane = self.lane_records_cores(pob);
+        // Under the lane: UNSAT `(clause, fact)` pairs whose cores are computed
+        // after the loop (the loop holds an immutable borrow of `self.problem`;
+        // C3 needs `&mut self`). An early `Reachable`/`Unknown` return drops
+        // them: `cores` is only read when every clause blocked.
+        let mut unsat_pairs: Vec<(usize, Vec<ChcExpr>, bool)> = Vec::new();
+        let mut source_names = None;
         for (fact_index, fact) in self
             .problem
             .clauses_defining_with_index(*body_pred)
@@ -39,14 +48,6 @@ impl PdrSolver {
             if fact_head_args.len() != body_args.len() {
                 continue;
             }
-            let eqs: Vec<ChcExpr> = body_args
-                .iter()
-                .cloned()
-                .zip(fact_head_args.iter().cloned())
-                .map(|(a, b)| ChcExpr::eq(a, b))
-                .collect();
-            let init_match = ChcExpr::and_all(eqs);
-
             let exclusion_constraint = self.predecessor_exclusion_constraint(
                 "[prev_level=0]",
                 pob.level,
@@ -54,6 +55,47 @@ impl PdrSolver {
                 body_args,
                 unknown_predecessors,
             );
+            let mut open = || !self.is_cancelled();
+            if source_names.is_none() {
+                // #lvl1-repeat: go through the solver's cached census
+                // (`source_names()`, once per solver) rather than a fresh
+                // `SourceNames::collect` walk. This loop runs once per
+                // (proof obligation, level-0 fact) pair, itself inside PDR's
+                // hottest blocking/generalization path; an uncached walk here
+                // repeated the full-problem census on every call and starved
+                // the search of real solving time on fact-join-heavy
+                // instances (repeat_000).
+                source_names = Some(self.source_names().ok_or(BlockResult::Unknown)?);
+            }
+            let names = source_names.as_ref().ok_or(BlockResult::Unknown)?;
+            // A prefix is not freshness: legal source binders can spell it.
+            // Source-only allocation keeps cached clause/fact backgrounds
+            // stable; a later query collision or partial rename is terminal.
+            let (fact_constraint, fact_head_args) = names
+                .rename(
+                    &fact_constraint,
+                    fact_head_args,
+                    &format!("__lvl0_fact_{fact_index}_"),
+                    [
+                        base,
+                        clause_constraint,
+                        state_on_head,
+                        guarded,
+                        &exclusion_constraint,
+                    ]
+                    .into_iter()
+                    .chain(head_args)
+                    .chain(body_args),
+                    &mut open,
+                )
+                .ok_or(BlockResult::Unknown)?;
+            let eqs: Vec<ChcExpr> = body_args
+                .iter()
+                .cloned()
+                .zip(fact_head_args)
+                .map(|(a, b)| ChcExpr::eq(a, b))
+                .collect();
+            let init_match = ChcExpr::and_all(eqs);
 
             let query = self.bound_int_vars(ChcExpr::and_all([
                 base.clone(),
@@ -151,7 +193,43 @@ impl PdrSolver {
             };
             match result {
                 SmtResult::Sat(model) => {
+                    // Workstream B R2 (`free_pob`, §4.1.3): the child is the exact
+                    // projection of `T_c ∧ post` under the unminimised Q1 model.
+                    if self.lane_free_pob(pob.predicate) {
+                        let excluded =
+                            Self::excluded_states(pob.level, *body_pred, unknown_predecessors);
+                        let child = self.child_cube_from_model(
+                            *body_pred,
+                            body_args,
+                            clause_constraint,
+                            state_on_head,
+                            &model,
+                            Some(&exclusion_constraint),
+                            &excluded,
+                        );
+                        self.spacer_stats.record_free_child(
+                            child.source,
+                            child.substituted,
+                            &child.exact,
+                        );
+                        let Some(cube) = child.cube else {
+                            *had_sat_no_cube = true;
+                            self.telemetry.sat_no_cube_events += 1;
+                            continue;
+                        };
+                        return Err(BlockResult::Reachable(Box::new(PredecessorState {
+                            predicate: *body_pred,
+                            state: cube.expr().clone(),
+                            clause_index,
+                            smt_model: model,
+                            derivation_id: None,
+                            lits: Some(cube),
+                        })));
+                    }
                     let query_for_cube = sat_query.as_ref().unwrap_or(&query);
+                    if self.spacer_core {
+                        self.spacer_stats.minimize_calls += 1;
+                    }
                     let model = Self::minimize_projection_model_with_context(
                         &mut self.smt,
                         &projection_vars,
@@ -182,15 +260,36 @@ impl PdrSolver {
                             continue;
                         }
                     };
+                    let lits = self.lane_child_lits(&cube);
+                    if lits.is_some() {
+                        self.spacer_stats.record_cube_source(CubeSource::Legacy, 0);
+                    }
                     return Err(BlockResult::Reachable(Box::new(PredecessorState {
                         predicate: *body_pred,
                         state: cube,
                         clause_index,
                         smt_model: model,
                         derivation_id: None,
+                        lits,
                     })));
                 }
                 SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
+                    // Workstream B (C2/C3): one `ClauseCore` per UNSAT
+                    // `(clause, fact)` pair; the exclusion-free background is
+                    // `T_c ∧ guarded ∧ fact ∧ init_match`.
+                    if lane {
+                        let had_exclusion = !matches!(exclusion_constraint, ChcExpr::Bool(true));
+                        unsat_pairs.push((
+                            fact_index,
+                            vec![
+                                clause_constraint.clone(),
+                                guarded.clone(),
+                                fact_constraint.clone(),
+                                init_match.clone(),
+                            ],
+                            had_exclusion,
+                        ));
+                    }
                     if self.config.use_interpolation {
                         let transition = ChcExpr::and_all([
                             clause_constraint.clone(),
@@ -217,6 +316,17 @@ impl PdrSolver {
             }
         }
 
+        for (fact_index, background, had_exclusion) in unsat_pairs {
+            let core = self.lane_clause_core(
+                pob,
+                clause_index,
+                Some(fact_index),
+                &background,
+                head_args,
+                had_exclusion,
+            );
+            cores.push(core);
+        }
         Ok(())
     }
 
@@ -237,11 +347,21 @@ impl PdrSolver {
         transition_constraints: &mut Vec<ChcExpr>,
         clause_interpolation_data: &mut Vec<ClauseInterpolationData>,
         had_sat_no_cube: &mut bool,
+        cores: &mut Vec<ClauseCore>,
     ) -> Result<(), BlockResult> {
         let (body_pred, body_args) = &clause.body.predicates[0];
-        let frame_constraint = self.frames[prev_level]
-            .get_predicate_constraint(*body_pred)
-            .unwrap_or(ChcExpr::Bool(true));
+        let lane = self.lane_records_cores(pob);
+        // Workstream B (D2, contract C5): under the lane the body hypothesis is
+        // the ONE frame hypothesis `frame_hyp(prev_level) = ∧_{j ≥ prev_level}
+        // frames[j]` (the delta frame, `Bool(false)` kept) instead of the local
+        // frame — a stronger sound hypothesis; the rest of the query text is
+        // HEAD's (S4). Flag off ⇒ the local frame, byte-identical to before.
+        let frame_constraint = if self.spacer_core {
+            self.frame_hyp(prev_level, *body_pred)
+        } else {
+            self.frames[prev_level].get_predicate_constraint(*body_pred)
+        }
+        .unwrap_or(ChcExpr::Bool(true));
         let frame_on_body = match self.apply_to_args(*body_pred, &frame_constraint, body_args) {
             Some(e) => e,
             None => return Err(BlockResult::Unknown),
@@ -279,10 +399,33 @@ impl PdrSolver {
             safe_eprintln!("  query={}", query);
         }
 
+        let had_exclusion = !matches!(exclusion_constraint, ChcExpr::Bool(true));
         let simplified = query.propagate_equalities();
         if matches!(simplified, ChcExpr::Bool(false)) {
             if self.config.verbose {
                 safe_eprintln!("  Result: UNSAT (propagation)");
+            }
+            // Workstream B (C2 coverage rule): the propagation shortcut is an
+            // UNSAT pair too. The verdict is the syntactic one (S4); C3 only
+            // ATTRIBUTES it — the exclusion-free proxied solve returns the
+            // core when it can (its own equality closure fires on the same
+            // contradiction) and all-true inexact otherwise, so L's Phase A
+            // is not forced by this pair alone (measured by L on two_counters:
+            // ~11 Reach solves per lemma when this record was all-true).
+            if lane {
+                let core = self.lane_clause_core(
+                    pob,
+                    clause_index,
+                    None,
+                    &[
+                        clause_constraint.clone(),
+                        guarded.clone(),
+                        frame_on_body.clone(),
+                    ],
+                    head_args,
+                    had_exclusion,
+                );
+                cores.push(core);
             }
             return Ok(());
         }
@@ -345,7 +488,43 @@ impl PdrSolver {
         match result {
             SmtResult::Sat(model) => {
                 self.record_reachable_pob_countermodel(pob, head_args, &model);
+                // Workstream B R2 (`free_pob`, §4.1.1 step 4 / §4.1.3): no model
+                // minimisation; the child is the exact projection of `T_c ∧ post`.
+                if self.lane_free_pob(pob.predicate) {
+                    let excluded =
+                        Self::excluded_states(pob.level, *body_pred, unknown_predecessors);
+                    let child = self.child_cube_from_model(
+                        *body_pred,
+                        body_args,
+                        clause_constraint,
+                        state_on_head,
+                        &model,
+                        Some(&exclusion_constraint),
+                        &excluded,
+                    );
+                    self.spacer_stats.record_free_child(
+                        child.source,
+                        child.substituted,
+                        &child.exact,
+                    );
+                    let Some(cube) = child.cube else {
+                        *had_sat_no_cube = true;
+                        self.telemetry.sat_no_cube_events += 1;
+                        return Ok(());
+                    };
+                    return Err(BlockResult::Reachable(Box::new(PredecessorState {
+                        predicate: *body_pred,
+                        state: cube.expr().clone(),
+                        clause_index,
+                        smt_model: model,
+                        derivation_id: None,
+                        lits: Some(cube),
+                    })));
+                }
                 let query_for_cube = sat_query.as_ref().unwrap_or(&query);
+                if self.spacer_core {
+                    self.spacer_stats.minimize_calls += 1;
+                }
                 let model = Self::minimize_projection_model_with_context(
                     &mut self.smt,
                     &projection_vars,
@@ -374,17 +553,41 @@ impl PdrSolver {
                     }
                 };
 
+                let lits = self.lane_child_lits(&cube);
+                if lits.is_some() {
+                    self.spacer_stats.record_cube_source(CubeSource::Legacy, 0);
+                }
                 Err(BlockResult::Reachable(Box::new(PredecessorState {
                     predicate: *body_pred,
                     state: cube,
                     clause_index,
                     smt_model: model,
                     derivation_id: None,
+                    lits,
                 })))
             }
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
                 if self.config.verbose {
                     safe_eprintln!("  Result: UNSAT");
+                }
+                // Workstream B (C2/C3): the clause's core over the POB's
+                // literals; the background is exclusion-free (`T_c ∧ guarded ∧
+                // F(body)`), so an exclusion-dependent UNSAT comes back all-true
+                // inexact with `had_exclusion = true` and Phase 0 decides (D4).
+                if lane {
+                    let core = self.lane_clause_core(
+                        pob,
+                        clause_index,
+                        None,
+                        &[
+                            clause_constraint.clone(),
+                            guarded.clone(),
+                            frame_on_body.clone(),
+                        ],
+                        head_args,
+                        had_exclusion,
+                    );
+                    cores.push(core);
                 }
                 if self.config.use_interpolation {
                     let transition =
@@ -413,7 +616,7 @@ impl PdrSolver {
         }
     }
 
-    fn predecessor_exclusion_constraint(
+    pub(super) fn predecessor_exclusion_constraint(
         &self,
         scope_label: &str,
         parent_level: usize,

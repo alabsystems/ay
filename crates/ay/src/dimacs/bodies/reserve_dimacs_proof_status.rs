@@ -3,36 +3,22 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_dimacs_status_reservation(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
+    // An exit waits for this reservation until its custody is registered
+    // (status_custody.rs), and the process-exit sweep exists before the lock.
+    let _reserving = DimacsStatusReserving::enter();
+    // The exit claims the run before it reads the in-flight count, and this
+    // reservation counts itself before it reads the claim (both SeqCst): so
+    // either the exit waits for this reservation, or no lock is created.
+    if crate::run_claimed_unanswered() {
+        return Err(io::Error::other(
+            "the run ended unanswered; no DIMACS proof status transaction was reserved",
+        ));
+    }
+    arm_abandoned_dimacs_proof_sweep();
     let proof_path = resolved_dimacs_proof_path(proof_path)?;
     let status_path = dimacs_proof_status_path_from_path(&proof_path);
     let lock_path = dimacs_proof_status_lock_path(&status_path);
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE);
-    }
-    let mut lock_descriptor = options.open(&lock_path).map_err(|error| {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "synthesized-default proof status transaction '{}' is already active",
-                    lock_path.display()
-                ),
-            )
-        } else {
-            error
-        }
-    })?;
+    let mut lock_descriptor = open_dimacs_status_lock(&lock_path)?;
     let lock_identity = regular_file_identity(&lock_descriptor, &lock_path).map_err(|error| {
         dimacs_invalidation_error(
             error,
@@ -83,12 +69,52 @@ fn create_dimacs_status_reservation(proof_path: &str) -> io::Result<DimacsProofS
             "DIMACS proof status transaction lock",
         ));
     }
+    let custody = register_reserved_dimacs_status_custody(
+        &lock_path,
+        &status_path,
+        &lock_descriptor,
+        lock_identity,
+    )?;
     Ok(DimacsProofStatusReservation {
         proof_path,
         status_path,
         lock_path,
         lock_descriptor,
         lock_identity,
+        custody,
+    })
+}
+
+/// Create the status transaction lock `lock_path` exclusively: never through
+/// a symlink, never over an existing object.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn open_dimacs_status_lock(lock_path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE);
+    }
+    options.open(lock_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "synthesized-default proof status transaction '{}' is already active",
+                    lock_path.display()
+                ),
+            )
+        } else {
+            error
+        }
     })
 }
 
@@ -109,13 +135,21 @@ fn reject_preexisting_dimacs_status(
                 ),
                 Err(error) => error,
             };
-            let cleanup = remove_authenticated_visible_file(
-                &reservation.lock_path,
-                &reservation.lock_descriptor,
-                reservation.lock_identity,
-                "DIMACS proof status transaction lock",
-                DimacsPublicationInvalidation::Empty,
-            );
+            // An exit that already settled the lock owns it now.
+            let cleanup = match reservation.custody.claim_settling() {
+                Ok(claim) => {
+                    let removed = remove_authenticated_visible_file(
+                        &reservation.lock_path,
+                        &reservation.lock_descriptor,
+                        reservation.lock_identity,
+                        "DIMACS proof status transaction lock",
+                        DimacsPublicationInvalidation::Empty,
+                    );
+                    claim.finish(removed.is_ok());
+                    removed
+                }
+                Err(settled) => return Err(settled),
+            };
             Err(status_transaction_error(
                 error,
                 cleanup,

@@ -127,7 +127,7 @@ impl LiaSolver<'_> {
         let mut source_lits: Vec<TheoryLit> = Vec::new();
 
         for &literal in &self.assertion_view().positive_equalities {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {

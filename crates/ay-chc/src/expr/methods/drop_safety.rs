@@ -69,6 +69,13 @@ impl ChcExpr {
                     // else: shared Arc, refcount decremented, no deep recursion
                 }
             }
+            Self::ArrayLambda(lambda) => {
+                for arc in lambda.take_children_for_drop() {
+                    if let Ok(inner) = Arc::try_unwrap(arc) {
+                        worklist.push(inner);
+                    }
+                }
+            }
             Self::ConstArray(_ks, arc) => {
                 let taken = std::mem::replace(arc, Arc::new(Self::Bool(false)));
                 if let Ok(inner) = Arc::try_unwrap(taken) {

@@ -59,6 +59,8 @@ mod dispatch;
 mod dt_tautology;
 mod euf;
 mod farkas;
+mod int_real_mix;
+mod standalone;
 mod structural;
 
 #[cfg(test)]
@@ -204,10 +206,15 @@ pub(crate) use dispatch::conflict_has_array_context;
 pub(crate) use dispatch::make_verification_combiner;
 pub(crate) use dispatch::verify_conflict_semantic;
 pub(crate) use dispatch::verify_conflict_semantic_euf_prechecked;
-pub(crate) use dispatch::{verify_conflict_semantic_memoized, ConflictSemanticVerifyMemo};
+pub(crate) use dispatch::{
+    verify_conflict_semantic_classified, verify_conflict_semantic_memoized,
+    ConflictSemanticVerdict, ConflictSemanticVerifyMemo,
+};
 pub(crate) use dt_tautology::build_datatype_tautology_axioms;
 pub(crate) use euf::verify_euf_conflict;
+pub(crate) use euf::verify_euf_conflict_classified;
 pub(crate) use farkas::verify_theory_conflict_with_farkas;
+pub(crate) use standalone::conflict_is_refuted_on_its_own;
 pub(crate) use structural::{
     dedup_conflict_literals, dedup_conflict_with_farkas, verify_theory_conflict,
     verify_theory_propagation,

@@ -27,6 +27,14 @@
 //! behavior. MODEL_CHECKER_CONSUMER-style consumers treat non-admissible transcripts as
 //! demotion-net rejections, so "fail closed to metadata-only" is the safe
 //! direction.
+//!
+//! Retained UNSAT replay uses one finite logical work/storage allowance across
+//! all rows, live exact export, v4 transport, byte replay and artifact writing.
+//! It accounts controlled proof operations, byte-buffer admission, row-vector
+//! reservations, chunked hashes and output backing reservations. Intermediate
+//! metadata JSON construction, source seals and result/summary clones still
+//! have opaque, phase-polled allocation intervals. This is not complete
+//! allocator accounting, a whole-call RSS ceiling or a hard latency guarantee.
 
 use super::{
     ChcCheckedReplayArtifacts, ChcCheckedReplayObligation, ChcCheckedReplaySummary,
@@ -39,6 +47,8 @@ use crate::classifier::ProblemClassifier;
 use crate::pdr::{ChcReplayObligation, ChcReplayObligationKind};
 use crate::smt::executor_adapter::{
     collect_uninterpreted_function_declarations, emit_declare_uninterpreted_function,
+    smtlib_first_verdict_via_executor_with_limit as replay_smt_verdict, ReplayCancellation,
+    ReplayLimit,
 };
 use crate::{
     ChcError, ChcExpr, ChcProblem, ChcResult, ChcSort, ChcVar, ClauseHead, PredicateId,
@@ -50,6 +60,12 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 mod checked_run;
+mod compact_ground;
+mod ground_export;
+pub(crate) mod phase_probe;
+#[cfg(test)]
+mod progress_tests;
+mod retained_resources;
 mod strict_bundle;
 pub use checked_run::ChcCheckedReplayObligationPayload;
 use checked_run::SealedReplayObligationPayload;
@@ -71,6 +87,20 @@ enum CheckedReplayPlan {
         format: super::ChcReplayPayloadFormat,
         artifact_bytes: Vec<u8>,
     },
+}
+
+/// Owned caller binding, separate from the one call-wide progress allowance.
+struct CheckedReplayBinding {
+    options: ChcProofEvidenceOptions,
+    solver: ChcProofSolverIdentity,
+    obligation_id: String,
+    base_evidence: Option<ChcReplayEvidence>,
+}
+
+fn replay_deadline(start: Instant, budget: Duration) -> ChcResult<Instant> {
+    start.checked_add(budget).ok_or_else(|| {
+        verification_error("checked replay budget cannot be represented as an absolute deadline")
+    })
 }
 
 impl CheckedReplayPlan {
@@ -168,15 +198,176 @@ impl ChcPdrProofRun {
     /// failure, and any digest-binding mismatch return `Err`, and callers must
     /// keep using the original metadata-only run.
     pub fn run_checked_replay(&self, budget: Duration) -> ChcResult<ChcCheckedReplayRun> {
-        let engine = self.metadata.engine.clone();
-        let mut options = ChcProofEvidenceOptions::pdr_strict(&crate::PdrConfig::default());
-        options.proof_mode = format!("checked-replay:{engine}");
-        let solver = ChcProofSolverIdentity::new(engine);
-        let obligation_id = format!(
-            "ay-chc:checked-replay:{}",
-            self.metadata.normalized_input_sha256
+        self.run_checked_replay_with_progress(budget, &mut || true)
+    }
+
+    /// Run checked replay with a caller-owned cooperative cancellation callback.
+    ///
+    /// Returning `false` permanently rejects this attempt without changing the
+    /// original run. One time budget and callback cover default binding setup,
+    /// ground export/validation and final checked-evidence publication. Ground
+    /// interruption never selects a different format or an SMT fallback.
+    ///
+    /// SMT solving observes the original absolute deadline, but the borrowed
+    /// callback is not polled asynchronously there. Metadata, strict bundle
+    /// export/rechecking, arithmetic, serde and cleanup retain opaque intervals.
+    /// Post-phase checks include worker cleanup; no hard deadline or 100 ms
+    /// latency is guaranteed. Zero or unrepresentable budgets reject before
+    /// invoking the callback.
+    pub fn run_checked_replay_with_progress(
+        &self,
+        budget: Duration,
+        callback: &mut dyn FnMut() -> bool,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_progress_and_cancellation(budget, callback, None)
+    }
+
+    /// Run checked replay with a thread-safe caller cancellation token.
+    ///
+    /// The token and its inherited parent flags reach active SMT search and
+    /// mandatory certification as well as cooperative replay boundaries. An
+    /// observed request is sticky for this attempt, even after caller reset.
+    /// Caller tokens are never set or reset by replay. Opaque export, offline
+    /// checking, serialization and cleanup remain; no hard return-time or
+    /// approximately 100 ms latency guarantee is made.
+    pub fn run_checked_replay_with_cancellation(
+        &self,
+        budget: Duration,
+        cancellation: &crate::CancellationToken,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_progress_and_cancellation(
+            budget,
+            &mut || true,
+            Some(cancellation),
+        )
+    }
+
+    pub(crate) fn run_checked_replay_with_progress_and_cancellation(
+        &self,
+        budget: Duration,
+        callback: &mut dyn FnMut() -> bool,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_controls_started_at(
+            Instant::now(),
+            budget,
+            callback,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn run_checked_replay_with_controls_started_at(
+        &self,
+        start: Instant,
+        budget: Duration,
+        callback: &mut dyn FnMut() -> bool,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_binding_factory(start, budget, callback, cancellation, || {
+            let engine = self.metadata.engine.clone();
+            let mut options = ChcProofEvidenceOptions::pdr_strict(&crate::PdrConfig::default());
+            options.proof_mode = format!("checked-replay:{engine}");
+            CheckedReplayBinding {
+                options,
+                solver: ChcProofSolverIdentity::new(engine),
+                obligation_id: format!(
+                    "ay-chc:checked-replay:{}",
+                    self.metadata.normalized_input_sha256
+                ),
+                base_evidence: None,
+            }
+        })
+    }
+
+    fn run_checked_replay_with_binding_factory(
+        &self,
+        start: Instant,
+        budget: Duration,
+        callback: &mut dyn FnMut() -> bool,
+        cancellation: Option<&crate::CancellationToken>,
+        binding: impl FnOnce() -> CheckedReplayBinding,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        if budget.is_zero() {
+            return Err(verification_error(
+                "checked replay budget is zero; staying metadata-only",
+            ));
+        }
+        let original_deadline = replay_deadline(start, budget)?;
+        // Snapshot the later caller's controls before any retained callback
+        // can remove or replace their ambient scopes.
+        let caller_interrupt = crate::smt::deadline::lane_interrupt_flag();
+        let control = crate::smt::replay_control::ScopedReplayControl::install_until(
+            original_deadline,
+            cancellation,
         );
-        self.run_checked_replay_with_binding(options, solver, obligation_id, None, budget)
+        let mut compact_owner = match &self.result {
+            VerifiedChcResult::Unsafe(cex) => cex
+                .counterexample()
+                .compact_evidence()
+                .map(|evidence| evidence.owner()),
+            _ => None,
+        };
+        let caller_stop = compact_ground::capture_caller(compact_owner.as_mut())?;
+        compact_ground::admit_control(
+            compact_owner.as_mut(),
+            &control,
+            caller_interrupt.as_deref(),
+        )?;
+        // Install the retained observer before any later admission can consume
+        // a one-shot original callback without latching the witness owner.
+        let _compact_scope = compact_owner.as_ref().map(|owner| owner.enter());
+        if let Some(owner) = &mut compact_owner {
+            owner
+                .poll()
+                .map_err(|error| verification_error(error.to_string()))?;
+        }
+        compact_ground::admit_control(
+            compact_owner.as_mut(),
+            &control,
+            caller_interrupt.as_deref(),
+        )?;
+        let deadline = control.deadline();
+        let cancellation = control.cancellation().map(ReplayCancellation::new);
+        let limit = match &cancellation {
+            Some(cancellation) => ReplayLimit::Cancellable {
+                deadline,
+                cancellation,
+            },
+            None => ReplayLimit::Until(deadline),
+        };
+        let mut continuation = compact_ground::continuation(
+            compact_owner.as_ref(),
+            callback,
+            caller_stop,
+            &control,
+            caller_interrupt,
+        );
+        // One retained row per original clause at most: the single request
+        // owner may declare that many obligations, one work envelope each.
+        let mut progress = ground_export::ReplayProgress::new_retained_for_rows(
+            limit,
+            &mut continuation,
+            self.problem().clauses().len(),
+        )
+        .map_err(|error| {
+            // Admission can reject an elapsed limit before its first
+            // callback. That refusal still belongs to the witness.
+            if let Some(owner) = &mut compact_owner {
+                let _ = owner.refuse::<()>(crate::ground_derivation::compact::Error::Stopped);
+            }
+            error
+        })?;
+        if let Some(owner) = compact_owner {
+            progress.retain_compact_owner(owner)?;
+        }
+        progress.check()?;
+        // Binding construction (including caller-defined ID conversion) occurs
+        // only after entry admission. The worker checks again before use.
+        let checked = self.run_checked_replay_with_control(binding(), limit, &mut progress)?;
+        // The worker's plan, proof/report intermediates and other locals have
+        // now been destroyed. Charge that cleanup before public admission.
+        progress.check()?;
+        Ok(checked)
     }
 
     /// Run the checked replay pass against caller-supplied manifest binding
@@ -187,6 +378,14 @@ impl ChcPdrProofRun {
     /// When `base_evidence` already carries replay obligation artifacts, their
     /// digest set must exactly match the obligations this pass renders and
     /// executes — otherwise the pass fails closed.
+    ///
+    /// Ground export and validation cooperatively poll the same original
+    /// `budget`; cancellation never selects another format or an SMT fallback.
+    /// Rendering, metadata authentication, strict SMT bundles, arithmetic,
+    /// serialization internals and allocation/destruction retain opaque phases.
+    /// Post-phase and final checks reject observed budget exhaustion before
+    /// publishing checked evidence; they do not promise a hard deadline or a
+    /// 100 ms response time.
     pub fn run_checked_replay_with_binding(
         &self,
         options: ChcProofEvidenceOptions,
@@ -195,177 +394,233 @@ impl ChcPdrProofRun {
         base_evidence: Option<ChcReplayEvidence>,
         budget: Duration,
     ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_binding_and_progress(
+            options,
+            solver,
+            obligation_id,
+            base_evidence,
+            budget,
+            &mut || true,
+        )
+    }
+
+    /// Run caller-bound checked replay with cooperative cancellation.
+    ///
+    /// This preserves [`Self::run_checked_replay_with_binding`]'s exact source
+    /// and artifact admission rules. A callback refusal is sticky across every
+    /// selected ground format and fresh validation, and prevents publication.
+    /// The original budget begins before converting `obligation_id`; no inner
+    /// phase receives a fresh duration. Zero or unrepresentable budgets reject
+    /// before conversion or callback. Supplied options/evidence remain
+    /// untrusted binding inputs.
+    ///
+    /// Opaque SMT, metadata, arithmetic, serde and allocation/cleanup phases
+    /// remain; see [`Self::run_checked_replay_with_progress`]. This API does not
+    /// promise a hard wall-clock deadline or asynchronous caller cancellation
+    /// inside SMT. The original deadline is enforced independently there.
+    pub fn run_checked_replay_with_binding_and_progress(
+        &self,
+        options: ChcProofEvidenceOptions,
+        solver: ChcProofSolverIdentity,
+        obligation_id: impl Into<String>,
+        base_evidence: Option<ChcReplayEvidence>,
+        budget: Duration,
+        callback: &mut dyn FnMut() -> bool,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_binding_factory(Instant::now(), budget, callback, None, || {
+            CheckedReplayBinding {
+                options,
+                solver,
+                obligation_id: obligation_id.into(),
+                base_evidence,
+            }
+        })
+    }
+
+    /// Run caller-bound replay with an owned observation of a cancellation token.
+    ///
+    /// Exact manifest, source, payload and proof admission rules match
+    /// [`Self::run_checked_replay_with_binding`]. The full token, including
+    /// inherited parents, reaches active SMT and cooperative ground validation.
+    /// Observed refusal is sticky and never selects a different format or
+    /// fallback. This call does not set or reset the supplied token.
+    ///
+    /// One original wall starts before supplied-ID conversion. Zero or
+    /// unrepresentable budgets and pre-cancellation refuse before conversion;
+    /// a request observed after conversion still prevents publication.
+    /// Conversion and opaque intervals within offline proof checking are not
+    /// forcibly interrupted. No hard return-time or 100 ms guarantee is made.
+    pub fn run_checked_replay_with_binding_and_cancellation(
+        &self,
+        options: ChcProofEvidenceOptions,
+        solver: ChcProofSolverIdentity,
+        obligation_id: impl Into<String>,
+        base_evidence: Option<ChcReplayEvidence>,
+        budget: Duration,
+        cancellation: &crate::CancellationToken,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        self.run_checked_replay_with_binding_factory(
+            Instant::now(),
+            budget,
+            &mut || true,
+            Some(cancellation),
+            || CheckedReplayBinding {
+                options,
+                solver,
+                obligation_id: obligation_id.into(),
+                base_evidence,
+            },
+        )
+    }
+
+    fn run_checked_replay_with_control(
+        &self,
+        binding: CheckedReplayBinding,
+        limit: ReplayLimit<'_>,
+        progress: &mut ground_export::ReplayProgress<'_>,
+    ) -> ChcResult<ChcCheckedReplayRun> {
+        let CheckedReplayBinding {
+            options,
+            solver,
+            obligation_id,
+            base_evidence,
+        } = binding;
         let problem = self.problem();
-        let obligation_id = obligation_id.into();
-        if budget.is_zero() {
-            return Err(verification_error(
-                "checked replay budget is zero; staying metadata-only",
-            ));
-        }
-        let start = Instant::now();
+        progress.check()?;
         let preferred_ground_format = match &base_evidence {
             Some(evidence) if !evidence.replay_obligations.is_empty() => evidence
                 .replay_obligations
                 .iter()
                 .find_map(|artifact| match artifact.payload_format {
                     format @ (super::ChcReplayPayloadFormat::GroundDerivationV1
-                    | super::ChcReplayPayloadFormat::GroundDerivationV2) => Some(Some(format)),
+                    | super::ChcReplayPayloadFormat::GroundDerivationV2
+                    | super::ChcReplayPayloadFormat::CompactGroundDerivationV1) => {
+                        Some(Some(format))
+                    }
                     super::ChcReplayPayloadFormat::SmtlibV1 => None,
                 })
                 .unwrap_or(None),
             _ => Some(super::ChcReplayPayloadFormat::SmtlibV1),
         };
+        progress.check()?;
 
         // 1. Render the obligations for this sealed result.
-        let (certificate, plan) = match &self.result {
-            VerifiedChcResult::Safe(inv) => {
-                let certificate = inv.model().to_certificate(problem);
-                let mut obligations =
-                    crate::engines::chc_safe_replay_obligations(problem, inv.model())?;
-                if obligations.is_empty() {
-                    // Empty-model acyclic-exhaustion certificate: the sound
-                    // replay set is the depth-exhaustion UNSAT check itself,
-                    // synthesized as one Safety obligation per query clause.
-                    obligations = acyclic_exhaustion_replay_obligations(problem)?;
+        let (certificate, plan) = phase_probe::result(phase_probe::Phase::Render, limit, || {
+            Ok(match &self.result {
+                VerifiedChcResult::Safe(inv) => {
+                    let certificate = inv.model().to_certificate(problem);
+                    progress.check()?;
+                    let mut obligations =
+                        crate::engines::chc_safe_replay_obligations(problem, inv.model())?;
+                    progress.check()?;
+                    if obligations.is_empty() {
+                        // Empty-model acyclic-exhaustion certificate: the sound
+                        // replay set is the depth-exhaustion UNSAT check itself,
+                        // synthesized as one Safety obligation per query clause.
+                        obligations = acyclic_exhaustion_replay_obligations(problem)?;
+                    }
+                    (certificate, CheckedReplayPlan::Smt(obligations))
                 }
-                (certificate, CheckedReplayPlan::Smt(obligations))
-            }
-            VerifiedChcResult::Unsafe(cex) => {
-                let certificate = cex.counterexample().to_certificate(problem);
-                let ground_artifact = match preferred_ground_format {
-                    None => Ok(None),
-                    Some(super::ChcReplayPayloadFormat::GroundDerivationV1) => {
-                        self.unsafe_ground_derivation_artifact_bytes().map(|bytes| {
-                            bytes.map(|artifact_bytes| {
-                                (
-                                    super::ChcReplayPayloadFormat::GroundDerivationV1,
-                                    artifact_bytes,
-                                )
-                            })
-                        })
+                VerifiedChcResult::Unsafe(cex) => {
+                    let certificate = cex.counterexample().to_certificate(problem);
+                    progress.check()?;
+                    if let Some(plan) =
+                        compact_ground::select_plan(self, preferred_ground_format, progress)?
+                    {
+                        return Ok((certificate, plan));
                     }
-                    Some(super::ChcReplayPayloadFormat::GroundDerivationV2) => self
-                        .unsafe_ground_derivation_artifact_v2_bytes()
-                        .map(|bytes| {
-                            bytes.map(|artifact_bytes| {
-                                (
-                                    super::ChcReplayPayloadFormat::GroundDerivationV2,
-                                    artifact_bytes,
-                                )
+                    let plan = ground_export::select_plan(
+                        preferred_ground_format,
+                        |format, progress| {
+                            match format {
+                        super::ChcReplayPayloadFormat::GroundDerivationV1 => {
+                            self.unsafe_ground_derivation_artifact_bytes_with_progress(progress)
+                        }
+                        super::ChcReplayPayloadFormat::GroundDerivationV2 => {
+                            self.unsafe_ground_derivation_artifact_v2_bytes_with_progress(progress)
+                        }
+                        super::ChcReplayPayloadFormat::CompactGroundDerivationV1 => {
+                            self.unsafe_compact_ground_derivation_artifact_bytes_with_progress(progress)
+                        }
+                        super::ChcReplayPayloadFormat::SmtlibV1 => {
+                            Err(crate::ChcGroundDerivationArtifactError {
+                                reason:
+                                    crate::ChcGroundDerivationArtifactErrorReason::SchemaMismatch,
+                                reason_code: "schema_mismatch",
+                                detail: "ground exporter cannot select SMT-LIB".to_string(),
                             })
-                        }),
-                    // No caller-supplied evidence: preserve v1 for existing
-                    // no-UF derivations, then upgrade only a v1-rejected
-                    // derivation to the source-authenticated v2 representation.
-                    Some(super::ChcReplayPayloadFormat::SmtlibV1) => {
-                        match self.unsafe_ground_derivation_artifact_bytes() {
-                            Ok(Some(artifact_bytes)) => Ok(Some((
-                                super::ChcReplayPayloadFormat::GroundDerivationV1,
-                                artifact_bytes,
-                            ))),
-                            Ok(None) => Ok(None),
-                            Err(v1_error) => match self
-                                .unsafe_ground_derivation_artifact_v2_bytes()
-                            {
-                                Ok(Some(artifact_bytes)) => Ok(Some((
-                                    super::ChcReplayPayloadFormat::GroundDerivationV2,
-                                    artifact_bytes,
-                                ))),
-                                Ok(None) => Err(v1_error),
-                                Err(v2_error) => Err(verification_error(format!(
-                                    "ground-derivation v1 export failed ({v1_error}); v2 export failed ({v2_error})"
-                                ))),
-                            },
                         }
                     }
-                };
-                let plan = match ground_artifact {
-                    Ok(Some((format, artifact_bytes))) => CheckedReplayPlan::GroundDerivation {
-                        format,
-                        artifact_bytes,
-                    },
-                    Ok(None) => CheckedReplayPlan::Smt(
-                        cex.counterexample()
-                            .trace_validity_replay_obligations(problem)?,
-                    ),
-                    Err(ground_error) => {
-                        // Ground artifacts are preferred because their checker
-                        // is deciding and supports multi-predicate DAGs. A
-                        // legacy single-predicate SMT trace remains a sound
-                        // independent fallback when artifact export itself is
-                        // unavailable for a supported old result.
-                        match cex
-                            .counterexample()
-                            .trace_validity_replay_obligations(problem)
-                        {
-                            Ok(obligations) => CheckedReplayPlan::Smt(obligations),
-                            Err(trace_error) => {
-                                return Err(verification_error(format!(
-                                    "checked replay could not produce Unsafe evidence: ground derivation: {ground_error}; SMT trace fallback: {trace_error}"
-                                )));
-                            }
-                        }
-                    }
-                };
-                (certificate, plan)
-            }
-            _ => {
-                return Err(verification_error(
-                    "checked replay requires a verified Safe/Unsafe proof result",
-                ));
-            }
-        };
+                        },
+                        || {
+                            cex.counterexample()
+                                .trace_validity_replay_obligations(problem)
+                        },
+                        progress,
+                    )?;
+                    (certificate, plan)
+                }
+                _ => {
+                    return Err(verification_error(
+                        "checked replay requires a verified Safe/Unsafe proof result",
+                    ));
+                }
+            })
+        })?;
+        phase_probe::rendered_rows(plan.len(), limit);
+        progress.check()?;
         if plan.is_empty() {
             return Err(verification_error(
                 "checked replay found no obligations to execute",
             ));
         }
 
-        // 2. Check every obligation. SMT executors receive the remaining hard
-        // budget. Ground validation is resource-bounded by its artifact limits
-        // and elapsed-time-admitted before and after, but is not interruptible
-        // mid-validation.
-        let mut checked_rows = Vec::with_capacity(plan.len());
-        let mut obligation_payloads = Vec::with_capacity(plan.len());
-        let mut replay_records = Vec::with_capacity(plan.len());
+        // 2. Check every obligation. SMT executors receive the SAME absolute
+        // deadline, including time already spent preparing this row. Ground
+        // export and validation share it through the caller's progress polls.
+        let mut checked_rows = retained_resources::vector(plan.len(), &mut |work, bytes| {
+            progress.charge(work, bytes)
+        })?;
+        let mut obligation_payloads =
+            retained_resources::vector(plan.len(), &mut |work, bytes| {
+                progress.charge(work, bytes)
+            })?;
+        let mut replay_records = retained_resources::vector(plan.len(), &mut |work, bytes| {
+            progress.charge(work, bytes)
+        })?;
         if let CheckedReplayPlan::Smt(obligations) = &plan {
-            for obligation in obligations {
-                let Some(remaining) = budget.checked_sub(start.elapsed()) else {
+            for (row_index, obligation) in obligations.iter().enumerate() {
+                progress.check()?;
+                if limit.check().is_none() {
                     return Err(verification_error(format!(
-                        "checked replay budget exhausted before obligation {}",
-                        obligation.name
-                    )));
-                };
-                if remaining.is_zero() {
-                    return Err(verification_error(format!(
-                        "checked replay budget exhausted before obligation {}",
+                        "checked replay budget exhausted or interrupted before obligation {}",
                         obligation.name
                     )));
                 }
                 let expected = expected_verdict(obligation.kind);
+                let _row_scope = phase_probe::row_scope(phase_probe::Row {
+                    row: row_index,
+                    clause: obligation.clause_index,
+                    kind: match obligation.kind {
+                        ChcReplayObligationKind::Initiation => 1,
+                        ChcReplayObligationKind::Consecution => 2,
+                        ChcReplayObligationKind::Safety => 3,
+                        ChcReplayObligationKind::TraceValidity => 4,
+                    },
+                    bytes: obligation.smtlib.len(),
+                });
 
-                let (checker_command, strict_cert, strict_bundle_bytes, alethe_bytes) = if expected
-                    == "unsat"
-                {
-                    let strict_bundle::StrictBundleDischarge {
+                let (checker_command, strict_cert, bound_retained) = if expected == "unsat" {
+                    let strict_bundle::RetainedDischarge {
                         cert,
-                        bundle_bytes,
-                        alethe_bytes,
+                        bound,
                         checker_command,
-                    } = strict_bundle::discharge(obligation, remaining, expected)?;
-                    (
-                        checker_command,
-                        Some(cert),
-                        Some(bundle_bytes),
-                        alethe_bytes,
-                    )
+                    } = strict_bundle::discharge_retained(obligation, progress.retained_mut()?)?;
+                    (checker_command, Some(cert), Some(bound))
                 } else {
                     // SAT trace-validity obligations have no UNSAT proof. The
                     // executor checks their concrete witness by verdict.
-                    let verdict = crate::smt::executor_adapter::smtlib_first_verdict_via_executor(
-                        &obligation.smtlib,
-                        Some(remaining),
-                    );
+                    let verdict = replay_smt_verdict(&obligation.smtlib, limit, None);
                     if verdict.as_deref() != Some(expected) {
                         return Err(verification_error(format!(
                             "checked replay obligation {} expected {expected}, got {}",
@@ -380,13 +635,25 @@ impl ChcPdrProofRun {
                         ),
                         None,
                         None,
-                        None,
                     )
                 };
-                let query = ChcProofArtifactDigest::from_bytes(
+                progress.check()?;
+                let query = retained_resources::artifact(
                     "replay-obligation",
                     obligation.smtlib.as_bytes(),
-                );
+                    &mut |work, bytes| progress.charge(work, bytes),
+                )?;
+                let row_bytes = obligation
+                    .name
+                    .len()
+                    .checked_mul(12)
+                    .and_then(|bytes| bytes.checked_add(8192))
+                    .ok_or_else(|| verification_error("checked replay record size overflow"))?;
+                retained_resources::admit(
+                    &mut |work, bytes| progress.charge(work, bytes),
+                    row_bytes,
+                    row_bytes,
+                )?;
                 replay_records.push(serde_json::json!({
                     "name": obligation.name,
                     "kind": obligation.kind.as_str(),
@@ -412,14 +679,30 @@ impl ChcPdrProofRun {
                 if let Some(cert) = strict_cert {
                     row = row.with_strict_cert(cert);
                 }
-                let payload = SealedReplayObligationPayload::try_new_smt(
-                    &row,
-                    obligation.smtlib.as_bytes().to_vec(),
-                    strict_bundle_bytes,
-                    alethe_bytes,
-                )?;
+                let payload = match bound_retained {
+                    Some(bound) => SealedReplayObligationPayload::try_new_retained(
+                        &row,
+                        bound,
+                        progress.retained_mut()?,
+                    )?,
+                    None => {
+                        retained_resources::admit(
+                            &mut |work, bytes| progress.charge(work, bytes),
+                            obligation.smtlib.len(),
+                            obligation.smtlib.len(),
+                        )?;
+                        SealedReplayObligationPayload::try_new_smt_with_progress(
+                            &row,
+                            obligation.smtlib.as_bytes().to_vec(),
+                            None,
+                            None,
+                            &mut || progress.poll(),
+                        )?
+                    }
+                };
                 checked_rows.push(row);
                 obligation_payloads.push(payload);
+                progress.check()?;
             }
         }
         if let CheckedReplayPlan::GroundDerivation {
@@ -427,92 +710,75 @@ impl ChcPdrProofRun {
             artifact_bytes,
         } = plan
         {
-            let _remaining = budget
-                .checked_sub(start.elapsed())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| {
-                    verification_error(
-                        "checked replay budget exhausted before ground-derivation validation",
-                    )
-                })?;
-            let validated = match format {
-                super::ChcReplayPayloadFormat::GroundDerivationV1 => {
-                    crate::validate_chc_ground_derivation_artifact(problem, &artifact_bytes)
-                }
-                super::ChcReplayPayloadFormat::GroundDerivationV2 => {
-                    crate::validate_chc_ground_derivation_artifact_v2(problem, &artifact_bytes)
-                }
-                super::ChcReplayPayloadFormat::SmtlibV1 => {
-                    unreachable!("ground replay plan cannot contain an SMT payload")
-                }
-            }
-            .map_err(|error| {
-                verification_error(format!(
-                    "checked replay {} validation: {error}",
+            if format == super::ChcReplayPayloadFormat::CompactGroundDerivationV1 {
+                let (row, payload, record) =
+                    compact_ground::check_row(self, artifact_bytes, progress)?;
+                checked_rows.push(row);
+                obligation_payloads.push(payload);
+                replay_records.push(record);
+            } else {
+                let validated =
+                    ground_export::validate_ground(problem, format, &artifact_bytes, progress)?;
+                let name = super::replay_payload_role(format);
+                let expected = "valid";
+                let query = ChcProofArtifactDigest::from_bytes(name, &artifact_bytes);
+                let checker_command = format!(
+                    "{CHC_IN_PROCESS_REPLAY_CHECKER_NAME} --validate-{} {name}",
                     format.as_str()
-                ))
-            })?;
-            let name = super::replay_payload_role(format);
-            let expected = "valid";
-            let query = ChcProofArtifactDigest::from_bytes(name, &artifact_bytes);
-            let checker_command = format!(
-                "{CHC_IN_PROCESS_REPLAY_CHECKER_NAME} --validate-{} {name}",
-                format.as_str()
-            );
-            replay_records.push(serde_json::json!({
-                "name": name,
-                "kind": ChcReplayObligationKind::TraceValidity.as_str(),
-                "payload_format": format.as_str(),
-                "query_sha256": query.sha256,
-                "expected": expected,
-                "verdict": expected,
-                "status": "pass",
-                "step_count": validated.step_count(),
-                "strict_bundle": false,
-                "strict_alethe": false,
-                "strict_cert": null,
-            }));
-            let row = ChcCheckedReplayObligation::new(
-                name,
-                ChcReplayObligationKind::TraceValidity,
-                query,
-                checker_command,
-                ChcReplayCheckResult::pass(),
-            );
-            let row = match format {
-                super::ChcReplayPayloadFormat::GroundDerivationV1 => {
-                    row.with_ground_derivation_payload()
-                }
-                super::ChcReplayPayloadFormat::GroundDerivationV2 => {
-                    row.with_ground_derivation_v2_payload()
-                }
-                super::ChcReplayPayloadFormat::SmtlibV1 => {
-                    unreachable!("ground replay plan cannot contain an SMT payload")
-                }
-            };
-            let payload = SealedReplayObligationPayload::try_new_ground_derivation(
-                &row,
-                &validated,
-                artifact_bytes,
-            )?;
-            if budget
-                .checked_sub(start.elapsed())
-                .filter(|remaining| !remaining.is_zero())
-                .is_none()
-            {
-                return Err(verification_error(
-                    "checked replay budget exhausted during ground-derivation validation",
-                ));
+                );
+                replay_records.push(serde_json::json!({
+                    "name": name,
+                    "kind": ChcReplayObligationKind::TraceValidity.as_str(),
+                    "payload_format": format.as_str(),
+                    "query_sha256": query.sha256,
+                    "expected": expected,
+                    "verdict": expected,
+                    "status": "pass",
+                    "step_count": validated.step_count(),
+                    "strict_bundle": false,
+                    "strict_alethe": false,
+                    "strict_cert": null,
+                }));
+                let row = ChcCheckedReplayObligation::new(
+                    name,
+                    ChcReplayObligationKind::TraceValidity,
+                    query,
+                    checker_command,
+                    ChcReplayCheckResult::pass(),
+                );
+                let row = match format {
+                    super::ChcReplayPayloadFormat::GroundDerivationV1 => {
+                        row.with_ground_derivation_payload()
+                    }
+                    super::ChcReplayPayloadFormat::GroundDerivationV2 => {
+                        row.with_ground_derivation_v2_payload()
+                    }
+                    super::ChcReplayPayloadFormat::SmtlibV1
+                    | super::ChcReplayPayloadFormat::CompactGroundDerivationV1 => {
+                        unreachable!("ground replay plan cannot contain an SMT payload")
+                    }
+                };
+                let payload = SealedReplayObligationPayload::try_new_ground_derivation(
+                    &row,
+                    &validated,
+                    artifact_bytes,
+                )?;
+                progress.check()?;
+                checked_rows.push(row);
+                obligation_payloads.push(payload);
             }
-            checked_rows.push(row);
-            obligation_payloads.push(payload);
         }
 
         // 3. Assemble the checked replay artifacts.
+        progress.check()?;
         let normalized = super::normalized_chc_input(problem);
         let problem_bytes = normalized.into_bytes();
-        let problem_digest = ChcProofArtifactDigest::from_bytes("problem", &problem_bytes);
+        let problem_digest =
+            retained_resources::artifact("problem", &problem_bytes, &mut |work, bytes| {
+                progress.charge(work, bytes)
+            })?;
         let certificate_bytes = certificate.into_bytes();
+        progress.check()?;
 
         let checker = ChcReplayCheckerIdentity::new(
             CHC_IN_PROCESS_REPLAY_CHECKER_NAME,
@@ -579,13 +845,17 @@ impl ChcPdrProofRun {
                 ));
             }
         }
+        progress.check()?;
 
         // Certificate artifact: reuse the evidence binding when present (the
         // CLI wrote the identical certificate text to disk), else attach ours.
         let certificate_digest = match evidence.proof.clone() {
             Some(existing) => {
-                let ours =
-                    ChcProofArtifactDigest::from_bytes("proof-certificate", &certificate_bytes);
+                let ours = retained_resources::artifact(
+                    "proof-certificate",
+                    &certificate_bytes,
+                    &mut |work, bytes| progress.charge(work, bytes),
+                )?;
                 if existing.sha256 != ours.sha256 || existing.bytes != ours.bytes {
                     return Err(verification_error(
                         "checked replay certificate does not match the supplied proof artifact digest",
@@ -594,8 +864,11 @@ impl ChcPdrProofRun {
                 existing
             }
             None => {
-                let digest =
-                    ChcProofArtifactDigest::from_bytes("proof-certificate", &certificate_bytes);
+                let digest = retained_resources::artifact(
+                    "proof-certificate",
+                    &certificate_bytes,
+                    &mut |work, bytes| progress.charge(work, bytes),
+                )?;
                 evidence = evidence.with_proof(digest.clone());
                 digest
             }
@@ -629,14 +902,19 @@ impl ChcPdrProofRun {
                         }))
                         .collect::<Vec<_>>(),
                 });
-                let bytes = serde_json::to_vec(&run_log_value).map_err(|error| {
-                    verification_error(format!("checked replay run log serialization: {error}"))
+                let bytes = retained_resources::encode(&run_log_value, &mut |work, bytes| {
+                    progress.charge(work, bytes)
                 })?;
-                let digest = ChcProofArtifactDigest::from_bytes("solver-transcript", &bytes);
+                let digest = retained_resources::artifact(
+                    "solver-transcript",
+                    &bytes,
+                    &mut |work, bytes| progress.charge(work, bytes),
+                )?;
                 evidence = evidence.with_solver_transcript(digest.clone());
                 (digest, Some(bytes))
             }
         };
+        progress.check()?;
 
         // Replay log (the pass record) is always produced by this pass and
         // replaces any placeholder replay report on the supplied evidence.
@@ -653,12 +931,17 @@ impl ChcPdrProofRun {
             "problem_sha256": problem_digest.sha256,
             "obligations": replay_records,
         });
-        let replay_log_bytes = serde_json::to_vec(&replay_log_value).map_err(|error| {
-            verification_error(format!("checked replay log serialization: {error}"))
-        })?;
-        let replay_log_digest =
-            ChcProofArtifactDigest::from_bytes("replay-report", &replay_log_bytes);
+        let replay_log_bytes =
+            retained_resources::encode(&replay_log_value, &mut |work, bytes| {
+                progress.charge(work, bytes)
+            })?;
+        let replay_log_digest = retained_resources::artifact(
+            "replay-report",
+            &replay_log_bytes,
+            &mut |work, bytes| progress.charge(work, bytes),
+        )?;
         evidence.replay_report = Some(replay_log_digest.clone());
+        progress.check()?;
 
         // 4. Build the manifest, validate the summary against it, and admit.
         let manifest =
@@ -677,15 +960,20 @@ impl ChcPdrProofRun {
             checked_rows,
         )
         .map_err(|error| verification_error(error.to_string()))?;
+        progress.check()?;
         let in_process_seal = super::ChcInProcessReplaySeal::new(&summary, problem);
         let checked_report_bytes =
-            serde_json::to_vec(&summary.to_json_value()).map_err(|error| {
-                verification_error(format!("checked replay report serialization: {error}"))
+            retained_resources::encode(&summary.to_json_value(), &mut |work, bytes| {
+                progress.charge(work, bytes)
             })?;
-        let checked_report_sha256 = super::sha256_hex(&checked_report_bytes);
+        let checked_report_sha256 =
+            retained_resources::hash(&checked_report_bytes, &mut |work, bytes| {
+                progress.charge(work, bytes)
+            })?;
         let manifest = manifest
             .try_with_in_process_checked_replay_summary(summary.clone(), in_process_seal)
             .map_err(|error| verification_error(error.to_string()))?;
+        progress.check()?;
 
         // 5. Upgrade the transcript metadata (fail-closed constructor).
         let metadata = ChcProofTranscriptMetadata::for_checked_run(
@@ -697,7 +985,7 @@ impl ChcPdrProofRun {
             verification_error("checked replay metadata upgrade rejected; staying metadata-only")
         })?;
 
-        Ok(ChcCheckedReplayRun {
+        let checked = ChcCheckedReplayRun {
             proof_run: self.with_metadata(metadata),
             manifest,
             summary,
@@ -707,7 +995,11 @@ impl ChcPdrProofRun {
             replay_log_bytes,
             checked_report_bytes,
             obligation_payloads,
-        })
+        };
+        // `with_metadata` clones the retained result and metadata. Poll after
+        // that opaque work too, before the local capability can escape.
+        progress.check()?;
+        Ok(checked)
     }
 }
 
@@ -754,6 +1046,29 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
             }
         }
     }
+    let mut obligations = Vec::new();
+    for (clause_index, formula) in acyclic_exhaustion_query_formulas(problem)? {
+        let name = format!("clause-{clause_index}-safety-acyclic-exhaustion");
+        let smtlib = render_acyclic_exhaustion_obligation(problem, &name, clause_index, &formula)?;
+        obligations.push(ChcReplayObligation {
+            name,
+            kind: ChcReplayObligationKind::Safety,
+            clause_index,
+            smtlib,
+        });
+    }
+    Ok(obligations)
+}
+
+/// The per-query-clause inlining formulas behind
+/// [`acyclic_exhaustion_replay_obligations`], as `(clause_index, formula)`,
+/// without that exporter's scalar-sort rendering guard. Each formula is
+/// satisfiable iff a derivation of that query exists. The independent
+/// empty-model check (`crate::empty_acyclic_safe_check`) decides these for
+/// nonlinear query cones; its callers own their theory admission.
+pub(crate) fn acyclic_exhaustion_query_formulas(
+    problem: &ChcProblem,
+) -> ChcResult<Vec<(usize, ChcExpr)>> {
     let mut expansion_problem = problem.clone();
     expansion_problem.strip_dead_end_cycle_predicates();
     let features = ProblemClassifier::classify(&expansion_problem);
@@ -763,7 +1078,7 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
         ));
     }
 
-    let mut obligations = Vec::new();
+    let mut formulas = Vec::new();
     let mut expansion = AcyclicExpansion::default();
     for (clause_index, clause) in problem.clauses().iter().enumerate() {
         if !matches!(clause.head, ClauseHead::False) {
@@ -784,22 +1099,14 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
                 &mut Vec::new(),
             )?);
         }
-        let formula = ChcExpr::and_all(conjuncts);
-        let name = format!("clause-{clause_index}-safety-acyclic-exhaustion");
-        let smtlib = render_acyclic_exhaustion_obligation(problem, &name, clause_index, &formula)?;
-        obligations.push(ChcReplayObligation {
-            name,
-            kind: ChcReplayObligationKind::Safety,
-            clause_index,
-            smtlib,
-        });
+        formulas.push((clause_index, ChcExpr::and_all(conjuncts)));
     }
-    if obligations.is_empty() {
+    if formulas.is_empty() {
         return Err(verification_error(
             "acyclic-exhaustion replay export found no query clause",
         ));
     }
-    Ok(obligations)
+    Ok(formulas)
 }
 
 fn is_scalar_sort(sort: &ChcSort) -> bool {

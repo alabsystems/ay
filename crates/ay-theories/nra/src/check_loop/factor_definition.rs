@@ -6,6 +6,68 @@
 
 use super::*;
 
+/// `floor(log2(|value|))` of a non-zero rational, from bit lengths plus one
+/// shifted comparison.
+fn floor_log2_abs(value: &BigRational) -> i64 {
+    let numer = value.numer().magnitude();
+    let denom = value.denom().magnitude();
+    let e0 = numer.bits() as i64 - denom.bits() as i64;
+    let below = if e0 >= 0 {
+        numer < &(denom << (e0 as u64))
+    } else {
+        &(numer << ((-e0) as u64)) < denom
+    };
+    if below {
+        e0 - 1
+    } else {
+        e0
+    }
+}
+
+/// Whether `aux == coeff * product(values)`, decided exactly but without a
+/// gcd reduction per multiply. Sign and magnitude screens reject most
+/// mismatches from bit lengths alone; survivors compare cross-multiplied
+/// numerator/denominator products, which agree with the reduced comparison
+/// because rational equality is representation-independent. Forming the
+/// reduced product instead spends nearly all of its time in binary gcd when
+/// model values carry thousand-digit numerators (measured on `40f50`, where
+/// this check was ~99% of solver samples inside `Ratio::reduce`).
+pub(super) fn scaled_product_equals(
+    aux: &BigRational,
+    coeff: &BigRational,
+    values: &[BigRational],
+) -> bool {
+    use num_bigint::Sign;
+    use num_traits::Zero;
+    if coeff.is_zero() || values.iter().any(|value| value.is_zero()) {
+        return aux.is_zero();
+    }
+    if aux.is_zero() {
+        return false;
+    }
+    let mut negative = coeff.numer().sign() == Sign::Minus;
+    let mut log_sum = floor_log2_abs(coeff);
+    for value in values {
+        negative ^= value.numer().sign() == Sign::Minus;
+        log_sum += floor_log2_abs(value);
+    }
+    if (aux.numer().sign() == Sign::Minus) != negative {
+        return false;
+    }
+    let aux_log = floor_log2_abs(aux);
+    let terms = values.len() as i64 + 1;
+    if aux_log < log_sum || aux_log >= log_sum + terms {
+        return false;
+    }
+    let mut numer = coeff.numer().clone();
+    let mut denom = coeff.denom().clone();
+    for value in values {
+        numer *= value.numer();
+        denom *= value.denom();
+    }
+    aux.numer() * &denom == &numer * aux.denom()
+}
+
 impl NraSolver<'_> {
     /// Check `aux == coeff * product(factors)` under a fully available model.
     /// Missing values are unavailable evidence and therefore inconsistent for
@@ -50,23 +112,33 @@ impl NraSolver<'_> {
     /// [`has_undefined_compound_factors`](Self::has_undefined_compound_factors)
     /// remain the independent cross-check, so a compound factor must ALSO agree
     /// with its exact linear definition.
-    pub(super) fn check_monomial_consistency(&self, monomial: &crate::monomial::Monomial) -> bool {
-        let mut product = BigRational::one();
+    pub(super) fn check_monomial_consistency(
+        &self,
+        monomial: &crate::monomial::Monomial,
+        memo: &std::cell::RefCell<ValueMemo>,
+    ) -> bool {
+        let Some(aux) = self.memo_var_value(monomial.aux_var, memo) else {
+            return false;
+        };
+        let mut values = Vec::with_capacity(monomial.vars.len());
         for &factor in &monomial.vars {
-            let Some(value) = self.monomial_factor_value(factor) else {
+            let Some(value) = self.monomial_factor_value_memo(factor, memo) else {
                 return false;
             };
-            product *= value;
+            values.push(value);
         }
-        self.var_value(monomial.aux_var)
-            .is_some_and(|value| value == monomial.aux_from_product(&product))
+        scaled_product_equals(&aux, &monomial.coeff, &values)
     }
 
     /// Check every exact nonlinear relation before authorizing `Sat`.
+    /// One value memo serves the whole read-only pass, so the LRA
+    /// materialisation δ is scanned at most once however many factor
+    /// occurrences the pass evaluates.
     pub(crate) fn has_inconsistent_monomials(&self) -> bool {
+        let memo = std::cell::RefCell::new(ValueMemo::default());
         self.products()
-            .any(|monomial| !self.check_monomial_consistency(monomial))
-            || self.has_undefined_compound_factors()
+            .any(|monomial| !self.check_monomial_consistency(monomial, &memo))
+            || self.has_undefined_compound_factors(&memo)
     }
 
     /// Expand a term as `sum(coeff_i * atom_i) + constant` within the same
@@ -83,6 +155,9 @@ impl NraSolver<'_> {
         if depth > crate::LINEAR_DEFINITION_MAX_DEPTH {
             return false;
         }
+        let Some(child_depth) = depth.checked_add(1) else {
+            return false;
+        };
         if let Some(value) = crate::constant_value_of(self.terms, term) {
             *constant += multiplier * value;
             return true;
@@ -90,19 +165,20 @@ impl NraSolver<'_> {
         match self.terms.get(term) {
             TermData::App(ay_core::term::Symbol::Named(name), args) => match name.as_str() {
                 "+" => args.iter().all(|&arg| {
-                    self.linear_definition_of(arg, multiplier, depth + 1, atoms, constant)
+                    self.linear_definition_of(arg, multiplier, child_depth, atoms, constant)
                 }),
                 "-" if args.len() == 1 => {
                     let negated = -multiplier.clone();
-                    self.linear_definition_of(args[0], &negated, depth + 1, atoms, constant)
+                    self.linear_definition_of(args[0], &negated, child_depth, atoms, constant)
                 }
                 "-" if args.len() >= 2 => {
-                    if !self.linear_definition_of(args[0], multiplier, depth + 1, atoms, constant) {
+                    if !self.linear_definition_of(args[0], multiplier, child_depth, atoms, constant)
+                    {
                         return false;
                     }
                     let negated = -multiplier.clone();
                     args[1..].iter().all(|&arg| {
-                        self.linear_definition_of(arg, &negated, depth + 1, atoms, constant)
+                        self.linear_definition_of(arg, &negated, child_depth, atoms, constant)
                     })
                 }
                 "*" => {
@@ -120,7 +196,7 @@ impl NraSolver<'_> {
                     }
                     let scaled = multiplier * scale;
                     if let Some(inner) = symbolic {
-                        self.linear_definition_of(inner, &scaled, depth + 1, atoms, constant)
+                        self.linear_definition_of(inner, &scaled, child_depth, atoms, constant)
                     } else {
                         *constant += scaled;
                         true
@@ -133,7 +209,7 @@ impl NraSolver<'_> {
                             return self.linear_definition_of(
                                 args[0],
                                 &scaled,
-                                depth + 1,
+                                child_depth,
                                 atoms,
                                 constant,
                             );
@@ -157,9 +233,12 @@ impl NraSolver<'_> {
     /// Whether a compound factor is absent from the candidate model, cannot be
     /// expanded within the bounded exact fragment, or disagrees with its exact
     /// linear definition. Every uncertainty blocks a theory-level `Sat`.
-    pub(crate) fn has_undefined_compound_factors(&self) -> bool {
+    pub(crate) fn has_undefined_compound_factors(
+        &self,
+        memo: &std::cell::RefCell<ValueMemo>,
+    ) -> bool {
         for &factor in &self.compound_factors {
-            let Some(factor_value) = self.var_value(factor) else {
+            let Some(factor_value) = self.memo_var_value(factor, memo) else {
                 return true;
             };
             let mut atoms = Vec::new();
@@ -170,7 +249,7 @@ impl NraSolver<'_> {
             }
             let mut total = constant;
             for (atom, coefficient) in atoms {
-                let Some(value) = self.var_value(atom) else {
+                let Some(value) = self.memo_var_value(atom, memo) else {
                     return true;
                 };
                 total += coefficient * value;
@@ -187,7 +266,7 @@ impl NraSolver<'_> {
         use ay_lra::GomoryCut;
 
         let factors = std::mem::take(&mut self.compound_factors);
-        let mut added = 0;
+        let mut added: usize = 0;
         for &factor in &factors {
             if self.compound_defs_emitted.contains(&factor) {
                 continue;
@@ -219,10 +298,73 @@ impl NraSolver<'_> {
                     factor,
                 );
             }
-            added += 2;
+            added = added.saturating_add(2);
             self.compound_defs_emitted.insert(factor);
         }
         self.compound_factors = factors;
         added
+    }
+}
+
+#[cfg(test)]
+mod product_eq_tests {
+    use super::scaled_product_equals;
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    use num_traits::One;
+
+    fn q(n: i64, d: i64) -> BigRational {
+        BigRational::new(n.into(), d.into())
+    }
+
+    fn naive(aux: &BigRational, coeff: &BigRational, values: &[BigRational]) -> bool {
+        let mut product = coeff.clone();
+        for value in values {
+            product *= value;
+        }
+        *aux == product
+    }
+
+    #[test]
+    fn scaled_product_equals_matches_naive_reduced_product() {
+        let cases: Vec<(BigRational, BigRational, Vec<BigRational>)> = vec![
+            (q(6, 1), q(1, 1), vec![q(2, 1), q(3, 1)]),
+            (q(7, 1), q(1, 1), vec![q(2, 1), q(3, 1)]),
+            (q(-6, 1), q(1, 1), vec![q(2, 1), q(3, 1)]),
+            (q(0, 1), q(5, 1), vec![q(0, 1), q(9, 1)]),
+            (q(1, 1), q(5, 1), vec![q(0, 1), q(9, 1)]),
+            (q(0, 1), q(5, 1), vec![q(2, 1), q(9, 1)]),
+            (q(3, 2), q(3, 1), vec![q(1, 2)]),
+            (q(1, 1), q(1, 1), vec![]),
+            (q(2, 1), q(1, 1), vec![]),
+            (q(-4, 1), q(-2, 1), vec![q(2, 1)]),
+            (q(1, 8), q(1, 1), vec![q(1, 2), q(1, 4)]),
+            (q(1_000_000, 1), q(1, 1), vec![q(1, 2), q(1, 4)]),
+            (q(5, 3), q(0, 1), vec![q(7, 1)]),
+            (q(0, 1), q(0, 1), vec![q(7, 1)]),
+        ];
+        for (aux, coeff, values) in &cases {
+            assert_eq!(
+                scaled_product_equals(aux, coeff, values),
+                naive(aux, coeff, values),
+                "aux={aux} coeff={coeff} values={values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_product_equals_handles_huge_cancelling_operands() {
+        // (2^4000 / 3^700) * (3^700 / 2^4000) == 1, with operands far larger
+        // than any single gcd a per-multiply reduction would want to run.
+        let mut pow3 = BigInt::from(1);
+        for _ in 0..700 {
+            pow3 *= 3;
+        }
+        let pow2 = BigInt::from(1i64) << 4000u32;
+        let a = BigRational::new(pow2.clone(), pow3.clone());
+        let b = BigRational::new(pow3, pow2);
+        let one = BigRational::one();
+        assert!(scaled_product_equals(&one, &one, &[a.clone(), b.clone()]));
+        assert!(!scaled_product_equals(&q(3, 1), &one, &[a, b]));
     }
 }

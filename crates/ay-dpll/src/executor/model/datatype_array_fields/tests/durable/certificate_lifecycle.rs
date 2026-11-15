@@ -205,7 +205,7 @@ fn legacy_import_work_exhaustion_preserves_w6_and_discards_partial_rows() {
 #[test]
 fn oversized_authored_scope_fails_closed_and_recovers() {
     let mut fixture = build_fixture();
-    let original_roots = fixture.executor.independent_gate_query_roots();
+    let original_roots = fixture.executor.independent_gate_query_roots().unwrap();
     let oversized_roots: Vec<_> = (0..(MAX_EXACT_ARRAY_FIELD_TERMS + 1))
         .map(|ordinal| {
             fixture

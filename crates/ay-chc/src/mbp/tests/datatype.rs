@@ -669,7 +669,7 @@ fn test_smt_value_to_expr_real_field() {
         use crate::expr::{ChcDtConstructor, ChcDtSelector};
         ChcSort::Datatype {
             name: "RealWrapper".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "wrapper".to_string(),
                 selectors: vec![ChcDtSelector {
                     name: "val".to_string(),

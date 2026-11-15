@@ -263,7 +263,10 @@ fn test_validation_rejects_empty_model_when_only_transformed_problem_is_predicat
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -362,6 +365,7 @@ fn test_validation_rejects_no_witness_spurious_unsafe() {
             .map(|_| CounterexampleStep::new(inv, FxHashMap::default()))
             .collect(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
     match solver.validate_unsafe(&fake_cex) {
@@ -397,6 +401,7 @@ fn test_validation_accepts_no_witness_reachable_unsafe() {
             .map(|_| CounterexampleStep::new(inv, FxHashMap::default()))
             .collect(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
     match solver.validate_unsafe(&cex) {
@@ -796,7 +801,10 @@ fn test_accept_or_reject_preprocessed_individually_inductive_model_rejected() {
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -885,7 +893,10 @@ fn test_accept_or_reject_preprocessed_non_individually_inductive_model_rejected(
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -1281,7 +1292,10 @@ fn test_accept_rejects_backtranslated_safe_invalid_on_original_problem() {
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -1317,6 +1331,7 @@ fn test_accept_rejects_backtranslated_unsafe_invalid_on_original_problem() {
             .map(|_| CounterexampleStep::new(inv, FxHashMap::default()))
             .collect(),
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
 
@@ -1370,7 +1385,10 @@ fn test_accept_rejects_backtranslated_unsafe_invalid_on_original_problem() {
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -1543,7 +1561,10 @@ fn test_unsafe_validation_replaces_stale_ground_derivation_for_cyclic_original()
         deterministic_sequential_schedule: false,
         deterministic_global_deadline: None,
         construction_deadline: None,
+        parallel_deadline: None,
         construction_aborted: false,
+        rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
+        engine_memory_limits_override: None,
         sequential_test_engine: None,
         sequential_test_publish_delay: None,
         parallel_worker_limit_override: None,
@@ -1740,5 +1761,52 @@ fn test_verified_boundary_rejects_safe_with_unsafe_evidence() {
     assert!(
         matches!(result, VerifiedChcResult::Unknown(_)),
         "Safe results must not be promoted with counterexample-only validation evidence"
+    );
+}
+
+/// The extended per-rule re-run is the same strict validation with more time
+/// per clause: it accepts the inductive invariant and rejects the
+/// query-blocking but non-inductive one exactly as `PerRule` does.
+#[test]
+fn per_rule_extended_validation_is_as_strict_as_per_rule() {
+    let problem = create_safe_problem();
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![],
+        parallel: false,
+        timeout: None,
+        parallel_timeout: None,
+        verbose: false,
+
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let solver = PortfolioSolver::new(problem.clone(), config);
+    let v0 = ChcVar::new("v0", ChcSort::Int);
+    let inductive =
+        build_single_pred_model(&problem, ChcExpr::le(ChcExpr::var(v0), ChcExpr::int(5)))
+            .expect("single-pred model");
+    let not_inductive = make_query_only_but_not_inductive_model(&problem);
+    for mode in [ValidationBudget::PerRule, ValidationBudget::PerRuleExtended] {
+        assert!(
+            matches!(
+                solver.validate_safe_with_mode(&inductive, mode),
+                ValidationResult::Valid
+            ),
+            "{mode:?} must accept the inductive invariant"
+        );
+        assert!(
+            matches!(
+                solver.validate_safe_with_mode(&not_inductive, mode),
+                ValidationResult::Invalid(_)
+            ),
+            "{mode:?} must reject the non-inductive invariant"
+        );
+    }
+    assert!(
+        ValidationBudget::PerRuleExtended.to_duration(&problem)
+            > ValidationBudget::PerRule.to_duration(&problem)
     );
 }

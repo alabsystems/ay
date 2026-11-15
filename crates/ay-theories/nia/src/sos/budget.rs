@@ -13,6 +13,10 @@ use num_traits::Zero;
 
 use super::MultiPoly;
 
+mod progress;
+use progress::ProgressHandle;
+pub(crate) use progress::SosProgress;
+
 /// Maximum asserted theory literals inspected by one SOS attempt.
 pub(crate) const MAX_SOS_ASSERTED_LITERALS: usize = 1_024;
 /// Maximum source-term visits during polynomial translation.
@@ -43,18 +47,82 @@ pub(crate) const MAX_SOS_LP_PIVOTS: usize = 4_096;
 /// Maximum retained cells in one Phase-1 tableau input.
 pub(crate) const MAX_SOS_LP_CELLS: usize = 65_536;
 
+/// Charges between wall-clock progress consultations. The callback
+/// behind `SosProgress` reads the deadline/memory guard (a clock
+/// syscall), and the polynomial charges below run up to
+/// `MAX_SOS_MONOMIAL_WORK` times per attempt: polling on every charge
+/// made the clock read itself a top profile frame on Certora
+/// QF_UFDTNIA 39657...48. Charges are tiny exact operations, so
+/// observing a stop up to this many charges late is immaterial; the
+/// refusal itself stays sticky in `SosProgress`, and explicit
+/// `poll()` calls (attempt entry/final, LP pivots) remain exact.
+const CHARGE_POLL_INTERVAL: u32 = 64;
+
 /// Shared deterministic work meter for polynomial construction.
 #[derive(Debug, Default)]
-pub(crate) struct SosPolynomialBudget {
+pub(crate) struct SosPolynomialBudget<'a> {
     term_visits: usize,
     monomial_work: usize,
     term_products: usize,
+    charges_until_poll: u32,
+    progress: ProgressHandle<'a>,
 }
 
-impl SosPolynomialBudget {
+impl<'a> SosPolynomialBudget<'a> {
+    pub(crate) fn with_progress(progress: &'a SosProgress<'_>) -> Self {
+        Self {
+            progress: ProgressHandle::new(progress),
+            ..Self::default()
+        }
+    }
+
+    /// Resume from a counts snapshot taken by [`Self::counts`] (the
+    /// incremental SOS fragment cache continuing a previous build's
+    /// cumulative budget exactly where it left off).
+    pub(crate) fn with_progress_and_counts(
+        progress: &'a SosProgress<'_>,
+        counts: (usize, usize, usize),
+    ) -> Self {
+        Self {
+            term_visits: counts.0,
+            monomial_work: counts.1,
+            term_products: counts.2,
+            charges_until_poll: 0,
+            progress: ProgressHandle::new(progress),
+        }
+    }
+
+    /// Cumulative `(term_visits, monomial_work, term_products)` so far.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (self.term_visits, self.monomial_work, self.term_products)
+    }
+
+    pub(crate) fn poll(&self) -> bool {
+        self.progress.poll()
+    }
+
+    /// Progress consultation for the per-charge hot paths: consults the
+    /// callback on the first charge and then every
+    /// `CHARGE_POLL_INTERVAL` charges. Once a refusal is observed the
+    /// countdown stays at zero, so every later charge re-asks (cheap:
+    /// `SosProgress` short-circuits once refused) and declines.
+    pub(crate) fn poll_charged(&mut self) -> bool {
+        if self.charges_until_poll == 0 {
+            if !self.progress.poll() {
+                return false;
+            }
+            self.charges_until_poll = CHARGE_POLL_INTERVAL;
+        }
+        self.charges_until_poll -= 1;
+        true
+    }
+
     /// Charge one source-term visit at `depth`.
     pub(crate) fn visit_term(&mut self, depth: usize) -> bool {
-        if depth > MAX_SOS_TERM_DEPTH || self.term_visits >= MAX_SOS_TERM_VISITS {
+        if !self.poll_charged()
+            || depth > MAX_SOS_TERM_DEPTH
+            || self.term_visits >= MAX_SOS_TERM_VISITS
+        {
             return false;
         }
         self.term_visits += 1;
@@ -63,7 +131,7 @@ impl SosPolynomialBudget {
 
     /// Charge one monomial insertion or coefficient merge.
     pub(crate) fn charge_monomial(&mut self) -> bool {
-        if self.monomial_work >= MAX_SOS_MONOMIAL_WORK {
+        if !self.poll_charged() || self.monomial_work >= MAX_SOS_MONOMIAL_WORK {
             return false;
         }
         self.monomial_work += 1;
@@ -72,7 +140,7 @@ impl SosPolynomialBudget {
 
     /// Charge one term-by-term distributive product.
     pub(crate) fn charge_product(&mut self) -> bool {
-        if self.term_products >= MAX_SOS_TERM_PRODUCTS {
+        if !self.poll_charged() || self.term_products >= MAX_SOS_TERM_PRODUCTS {
             return false;
         }
         self.term_products += 1;
@@ -104,7 +172,7 @@ fn add_term(
     poly: &mut MultiPoly,
     monomial: Vec<TermId>,
     coefficient: BigRational,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Option<()> {
     if !budget.charge_monomial()
         || !rational_fits(&coefficient)
@@ -142,8 +210,11 @@ fn add_term(
 pub(crate) fn checked_poly_add(
     left: &MultiPoly,
     right: &MultiPoly,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Option<MultiPoly> {
+    if !budget.poll() {
+        return None;
+    }
     let mut result = left.clone();
     for (monomial, coefficient) in &right.terms {
         add_term(&mut result, monomial.clone(), coefficient.clone(), budget)?;
@@ -154,8 +225,11 @@ pub(crate) fn checked_poly_add(
 /// Negate a polynomial within the coefficient and work envelope.
 pub(crate) fn checked_poly_neg(
     poly: &MultiPoly,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Option<MultiPoly> {
+    if !budget.poll() {
+        return None;
+    }
     let mut result = MultiPoly::zero();
     for (monomial, coefficient) in &poly.terms {
         add_term(&mut result, monomial.clone(), -coefficient, budget)?;
@@ -167,7 +241,7 @@ pub(crate) fn checked_poly_neg(
 pub(crate) fn checked_poly_sub(
     left: &MultiPoly,
     right: &MultiPoly,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Option<MultiPoly> {
     let negated = checked_poly_neg(right, budget)?;
     checked_poly_add(left, &negated, budget)
@@ -177,8 +251,11 @@ pub(crate) fn checked_poly_sub(
 pub(crate) fn checked_poly_mul(
     left: &MultiPoly,
     right: &MultiPoly,
-    budget: &mut SosPolynomialBudget,
+    budget: &mut SosPolynomialBudget<'_>,
 ) -> Option<MultiPoly> {
+    if !budget.poll() {
+        return None;
+    }
     let mut result = MultiPoly::zero();
     for (left_monomial, left_coefficient) in &left.terms {
         for (right_monomial, right_coefficient) in &right.terms {
@@ -201,23 +278,39 @@ pub(crate) fn checked_poly_mul(
 
 /// Checked accumulator used for LP work accounting.
 #[derive(Debug)]
-pub(crate) struct SosLpBudget {
+pub(crate) struct SosLpBudget<'a> {
     updates_left: usize,
     pivots_left: usize,
+    progress: ProgressHandle<'a>,
 }
 
-impl Default for SosLpBudget {
+impl Default for SosLpBudget<'_> {
     fn default() -> Self {
         Self {
             updates_left: MAX_SOS_LP_UPDATES,
             pivots_left: MAX_SOS_LP_PIVOTS,
+            progress: ProgressHandle::default(),
         }
     }
 }
 
-impl SosLpBudget {
+impl<'a> SosLpBudget<'a> {
+    pub(crate) fn with_progress(progress: &'a SosProgress<'_>) -> Self {
+        Self {
+            progress: ProgressHandle::new(progress),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn poll(&self) -> bool {
+        self.progress.poll()
+    }
+
     /// Charge exact-rational updates before performing them.
     pub(crate) fn charge_updates(&mut self, count: usize) -> bool {
+        if !self.poll() {
+            return false;
+        }
         let Some(left) = self.updates_left.checked_sub(count) else {
             return false;
         };
@@ -227,6 +320,9 @@ impl SosLpBudget {
 
     /// Charge one simplex pivot.
     pub(crate) fn charge_pivot(&mut self) -> bool {
+        if !self.poll() {
+            return false;
+        }
         let Some(left) = self.pivots_left.checked_sub(1) else {
             return false;
         };
@@ -262,6 +358,50 @@ mod tests {
         let mut depth = SosPolynomialBudget::default();
         assert!(depth.visit_term(MAX_SOS_TERM_DEPTH));
         assert!(!depth.visit_term(MAX_SOS_TERM_DEPTH + 1));
+    }
+
+    #[test]
+    fn polynomial_charges_throttle_progress_callback_but_stay_sticky() {
+        use std::cell::Cell;
+        // Always-allow: 200 charges must consult the (wall-clock) callback
+        // far fewer times than once per charge, but at least once.
+        let calls = Cell::new(0usize);
+        let allow = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let progress = SosProgress::new(&allow);
+        let mut budget = SosPolynomialBudget::with_progress(&progress);
+        for _ in 0..200 {
+            assert!(budget.charge_monomial());
+        }
+        assert!(
+            (1..=8).contains(&calls.get()),
+            "callback invoked {} times for 200 charges",
+            calls.get()
+        );
+
+        // A stop is observed within a bounded number of further charges
+        // and then sticks (the lattice of refusals is unchanged, only
+        // the observation lag is bounded).
+        let stop_calls = Cell::new(0usize);
+        let stop_after_first = || {
+            stop_calls.set(stop_calls.get() + 1);
+            stop_calls.get() < 2
+        };
+        let progress = SosProgress::new(&stop_after_first);
+        let mut budget = SosPolynomialBudget::with_progress(&progress);
+        let mut refused_at = None;
+        for i in 0..512 {
+            if !budget.charge_monomial() {
+                refused_at = Some(i);
+                break;
+            }
+        }
+        let refused_at = refused_at.expect("stop must be observed within bounded charges");
+        assert!(refused_at < 256, "observed after {refused_at} charges");
+        assert!(!budget.charge_monomial(), "refusal must stick");
+        assert!(!budget.poll(), "explicit poll must observe the refusal");
     }
 
     #[test]
@@ -316,6 +456,7 @@ mod tests {
         let mut budget = SosLpBudget {
             updates_left: 1,
             pivots_left: 1,
+            ..SosLpBudget::default()
         };
         assert!(budget.charge_updates(1));
         assert!(!budget.charge_updates(1));

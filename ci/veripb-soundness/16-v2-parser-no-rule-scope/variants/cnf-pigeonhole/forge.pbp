@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 2.0
+output NONE
+pre_order forge
+sol x1
+conclusion SAT
+end pseudo-Boolean proof

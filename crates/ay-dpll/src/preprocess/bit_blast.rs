@@ -264,6 +264,7 @@ impl BitBlast {
                 | "bvsub"
                 | "bvneg"
                 | "bvmul"
+                | "mkbv"
                 | "concat"
                 | "bvshl"
                 | "bvlshr"
@@ -349,10 +350,10 @@ impl BitBlast {
             // `rotate_right` carry a CONSTANT amount (an SMT-LIB index), so they
             // are a fixed bit permutation; `bvcomp` is a 1-bit equality reducer.
             "bvand" | "bvor" | "bvxor" | "bvnot" | "bvnand" | "bvnor" | "bvxnor" | "bvadd"
-            | "bvsub" | "bvneg" | "bvmul" | "concat" | "bvshl" | "bvlshr" | "bvashr" | "bvult"
-            | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge" | "extract"
-            | "zero_extend" | "sign_extend" | "repeat" | "rotate_left" | "rotate_right"
-            | "bvcomp" => {}
+            | "bvsub" | "bvneg" | "bvmul" | "mkbv" | "concat" | "bvshl" | "bvlshr" | "bvashr"
+            | "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
+            | "extract" | "zero_extend" | "sign_extend" | "repeat" | "rotate_left"
+            | "rotate_right" | "bvcomp" => {}
             // Boolean skeleton connectives (operands are Boolean).
             "and" | "or" | "xor" | "=>" | "implies" => {}
             // Everything else (uninterpreted functions over BV, division/rem
@@ -641,6 +642,10 @@ impl BitBlast {
                 let a = self.bits(terms, args[0]);
                 self.neg(terms, &a)
             }
+            "mkbv" => args
+                .iter()
+                .map(|&arg| self.blast_bool(terms, arg))
+                .collect(),
             "concat" => {
                 // (concat a b c): a most significant, c least. LSB-first result
                 // is c ++ b ++ a — walk operands in reverse, appending bits.

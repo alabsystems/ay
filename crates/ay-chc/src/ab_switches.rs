@@ -4,7 +4,7 @@
 
 //! Engine A/B switches, set ONCE by the frontend before any solve.
 //!
-//! B15 of the env-flag retirement: these were `AY_CHC_*`/`AY_DT_*` env vars
+//! These were `AY_CHC_*`/`AY_DT_*` env vars
 //! nothing set. Every switch guards a SOUND alternative path (each site's
 //! comment carries the argument); disabling is for A/B measurement and
 //! bisection, never correctness. Same set-once shape as
@@ -33,67 +33,89 @@ pub struct ChcAbSwitches {
     pub houdini_phaseb_fast: bool,
     /// Datatype-BMC intermediate-definition elimination.
     pub dt_bmc_elim: bool,
-    /// Bit-blast dynamic abort (B27).
+    /// Bit-blast dynamic abort.
     pub bitblast_dynamic_abort: bool,
-    /// BMC multi-predicate transition system (B27).
+    /// BMC multi-predicate transition system.
     pub bmc_multipred_ts: bool,
-    /// BMC incremental transition system (B27).
+    /// BMC incremental transition system.
     pub bmc_ts_incremental: bool,
-    /// Array store-forwarding transform (B27).
+    /// Array store-forwarding transform.
     pub array_store_forwarding: bool,
-    /// Catamorphism element abstraction (B27).
+    /// Catamorphism element abstraction.
     pub cata_elements: bool,
-    /// Ground-derivation backtranslation (B27).
+    /// Ground-derivation backtranslation.
     pub ground_backtranslation: bool,
-    /// Ground-table read concretization (B27).
+    /// Ground-table read concretization.
     pub ground_table_concretization: bool,
-    /// Houdini BV lane (B27).
+    /// Houdini BV lane.
     pub houdini_bv: bool,
-    /// Predicate-component split transform (B27).
+    /// Predicate-component split transform.
     pub pc_split: bool,
-    /// Symmetric-split transform (B27).
+    /// Symmetric-split transform.
     pub split_sym: bool,
-    /// Word-to-BV transform (B27).
+    /// Word-to-BV transform.
     pub word_bv: bool,
-    /// PDR may-POB route (B27).
+    /// PDR may-POB route.
     pub may_pob: bool,
-    /// Executor decision-variable retry (B27).
+    /// Executor decision-variable retry.
     pub exec_dv_retry: bool,
-    /// Executor unknown-memo (B27).
+    /// Executor unknown-memo.
     pub exec_unknown_memo: bool,
-    /// Frontend probe clamp (B27).
+    /// Frontend probe clamp.
     pub front_probe_clamp: bool,
-    /// Graph collapse preprocessing (B27).
+    /// Graph collapse preprocessing.
     pub graph_collapse: bool,
-    /// Houdini disjunctive pool (B27).
+    /// Houdini disjunctive pool.
     pub houdini_disjunctive: bool,
-    /// Houdini stage-5 widening classes (B27).
+    /// Houdini stage-5 widening classes.
     pub houdini_stage5: bool,
-    /// IMC proof-backed interpolants (B27).
+    /// IMC proof-backed interpolants.
     pub imc_proof_itp: bool,
-    /// PDR lemma sanitization (B27).
+    /// PDR lemma sanitization.
     pub pdr_lemma_sanitize: bool,
-    /// TPA fixpoint check (B27; the env was an opt-out spelled `=1`).
+    /// TPA fixpoint check (the env was an opt-out spelled `=1`).
     pub tpa_fixpoint: bool,
-    /// Array branch of relational-equality Houdini (B33; the env opt-out was
+    /// Array branch of relational-equality Houdini (the env opt-out was
     /// spelled `=1`). Disabling it also disables the v2 templates.
     pub array_relational: bool,
     /// Richer v2 relational templates (affine alignment + select couplings)
-    /// layered under the lane above (B33).
+    /// layered under the lane above.
     pub array_relational_v2: bool,
-    /// Bounded datatype-aware BMC refutation (B33).
+    /// Bounded datatype-aware BMC refutation.
     pub dt_bmc: bool,
-    /// Qualifier-mining pass (B33).
+    /// Qualifier-mining pass.
     pub qual_mine: bool,
-    /// Mixed control∨data CNF qualifier class (B33).
+    /// Mixed control∨data CNF qualifier class.
     pub qual_mixed: bool,
-    /// Catamorphism abstraction route (B54; was the `AY_CHC_DISABLE_CATA`
+    /// Catamorphism abstraction route (was the `AY_CHC_DISABLE_CATA`
     /// kill switch).
     pub cata_route: bool,
-    /// CATA v2 relational abstraction (B54).
+    /// CATA v2 relational abstraction.
     pub cata_v2: bool,
-    /// Condense superpass (B54).
+    /// Condense superpass.
     pub condense: bool,
+    /// Search-lane equality solving before the executor (`smt::solve_eqs`,
+    /// `--chc-no-search-solve-eqs` disables).
+    pub search_solve_eqs: bool,
+    // --- Workstream B: Spacer-faithful POB/lemma lane (`DESIGN` §4.5) ---
+    /// `--chc-spacer-rung <0..5>`: cumulative flag preset (`SpacerLane::rung`).
+    /// Default 2 (R3: free POBs from the exact MBP, core lemmas, inductive
+    /// generalisation); 0 = the legacy pipeline.
+    pub spacer_rung: u8,
+    /// `--chc-spacer-free-pob[=0|1]` override (R2 constructor).
+    pub spacer_free_pob: Option<bool>,
+    /// `--chc-spacer-core-lemma[=0|1]` override.
+    pub spacer_core_lemma: Option<bool>,
+    /// `--chc-spacer-ind-gen[=0|1]` override.
+    pub spacer_ind_gen: Option<bool>,
+    /// `--chc-spacer-confirm-cores[=0|1]` override (D1 confirmation).
+    pub spacer_confirm_cores: Option<bool>,
+    /// `--chc-spacer-lift-caps[=0|1]` override (enumeration exits → counters).
+    pub spacer_lift_caps: Option<bool>,
+    /// `--chc-spacer-session[=0|1]` override (`OracleBackend::Session`, R4).
+    pub spacer_session: Option<bool>,
+    /// `--chc-spacer-nonlinear[=0|1]` override (the lane on nonlinear problems).
+    pub spacer_nonlinear: Option<bool>,
 }
 
 impl Default for ChcAbSwitches {
@@ -136,6 +158,15 @@ impl Default for ChcAbSwitches {
             cata_route: true,
             cata_v2: true,
             condense: true,
+            search_solve_eqs: true,
+            spacer_rung: 2,
+            spacer_free_pob: None,
+            spacer_core_lemma: None,
+            spacer_ind_gen: None,
+            spacer_confirm_cores: None,
+            spacer_lift_caps: None,
+            spacer_session: None,
+            spacer_nonlinear: None,
         }
     }
 }
@@ -163,7 +194,7 @@ pub fn get() -> ChcAbSwitches {
 
 #[cfg(test)]
 thread_local! {
-    /// In-process per-test override (B33; same seam as
+    /// In-process per-test override (same seam as
     /// `ay_pb_core::ab_switches`): the set-once global cannot be flipped
     /// inside one test binary, so A/B tests scope an override through
     /// [`TestOverride`] — the seam the retired `ScopedEnvVar` steering used

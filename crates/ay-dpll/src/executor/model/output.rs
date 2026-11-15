@@ -8,21 +8,31 @@
 //! live in sibling `output_format.rs`.
 
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
-use ay_core::term::TermData;
+use ay_core::term::{TermConstructionAdmission as _, TermData};
 use ay_core::{quote_symbol, string_literal, Sort, Symbol, TermId};
 
 use crate::executor_format::{
-    format_bigint, format_bitvec, format_default_value_surface, format_model_atom_surface,
-    format_real, format_sort_surface,
+    format_bigint, format_bitvec, format_model_atom_surface, format_real, format_sort_surface,
 };
 use crate::executor_types::SolveResult;
 
+use super::construction_owner::{ModelConstructionRead, ModelRead};
 use super::Executor;
-use super::{debug_model, EvalValue, Model};
+use super::{debug_model, CertifiedConstInterpBody, EvalValue, LinearIntBody, Model};
+
+mod aggregate_constants;
+use aggregate_constants::{AggregateConstantValue, AggregateConstantValues};
+
+/// Nesting bound of [`Executor::gv_printed_bool`].
+const PRINTED_BOOL_DEPTH: u32 = 256;
 
 impl Executor {
     /// Generate model output for get-model command.
     pub(crate) fn model(&self) -> String {
+        self.checked_evaluation_output(|| self.model_unstopped())
+    }
+
+    fn model_unstopped(&self) -> String {
         if !self.produce_models_enabled() {
             return "(error \"model generation is not enabled\")".to_string();
         }
@@ -33,16 +43,38 @@ impl Executor {
         // model (the values exist in a model, nothing is fabricated at print
         // time — #no-fabricated-model-values).
         let dummy_model;
+        let published_candidate;
+        let mut unvalidated_candidate = false;
         let model = match (&self.last_result, &self.last_model) {
             (Some(SolveResult::Sat), Some(m)) => m,
             (Some(SolveResult::Sat), None) => {
                 dummy_model = self.completed_default_model();
                 &dummy_model
             }
-            _ => {
-                return "(error \"model is not available\")".to_string();
-            }
+            _ => match self.publishable_candidate() {
+                Some(candidate) => {
+                    unvalidated_candidate = true;
+                    published_candidate = candidate;
+                    &published_candidate
+                }
+                None => return "(error \"model is not available\")".to_string(),
+            },
         };
+        if unvalidated_candidate {
+            self.with_model_data_read(model, |read| self.model_from_selected(read, true))
+        } else {
+            self.with_model_construction_read(model, |read| self.model_from_selected(read, false))
+        }
+    }
+
+    fn model_from_selected(&self, read: &dyn ModelRead, unvalidated_candidate: bool) -> String {
+        let model = read.model();
+        if !self.materialized_scalar_functions_current(model) {
+            return "(error \"materialized scalar function model is stale\")".to_string();
+        }
+        if !model.residual_arrays_are_current(&self.ctx) {
+            return "(error \"retained array model is stale\")".to_string();
+        }
 
         // Collect model values for user-declared symbols.
         //
@@ -70,7 +102,10 @@ impl Executor {
         // it — that is the model the gate confirmed, so it round-trips. A leaf
         // the gate leaves unresolved is simply absent here and falls through to
         // the existing renderer (fail-closed, no fabrication).
-        let gate_emit = self.gate_emit_reconstructions(model);
+        let aggregate_values = match AggregateConstantValues::collect(self, model) {
+            Ok(values) => values,
+            Err(error) => return format!("(error \"{error}\")"),
+        };
 
         // Ground UF applications, collected once on first need and shared by
         // every symbol that reaches the fallback below. Lazy because the sweep
@@ -78,7 +113,21 @@ impl Executor {
         let mut ground_uf_apps: Option<DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>>> =
             None;
 
-        for (name, info) in self.ctx.symbol_iter() {
+        'symbols: for (name, info) in self.ctx.symbol_iter() {
+            // A validated model prints whole or not at all. An unvalidated
+            // candidate leaves out a symbol whose value cannot be rendered
+            // (reported with the other omissions below) instead of failing the
+            // whole command.
+            macro_rules! unrenderable {
+                ($symbols:lifetime, $error:expr) => {{
+                    if unvalidated_candidate {
+                        omitted.push(name.to_string());
+                        continue $symbols;
+                    }
+                    return $error;
+                }};
+            }
+
             // Skip DT-internal symbols (constructors, testers, selectors) (#5412).
             if self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info)) {
                 continue;
@@ -93,6 +142,38 @@ impl Executor {
             // symbol is ever suppressed.
             if self.ctx.is_internal_symbol(name) {
                 continue;
+            }
+
+            // Keep nullary output on the same typed ownership path as the
+            // independent view, before any competing constant interpretation.
+            if info.arg_sorts.is_empty() {
+                if let Some(term_id) = info.term {
+                    match self.completed_model_value(model, term_id) {
+                        Ok(Some(value)) => {
+                            let Some(value) = self.format_gate_model_value(&value, &info.sort)
+                            else {
+                                unrenderable!(
+                                    'symbols,
+                                    "(error \"completed model value cannot be rendered exactly\")"
+                                        .to_string()
+                                );
+                            };
+                            definitions.push(format!(
+                                "  (define-fun {} () {} {value})",
+                                quote_symbol(name),
+                                format_sort_surface(&self.ctx, &info.sort)
+                            ));
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            unrenderable!(
+                                'symbols,
+                                "(error \"retained array model value is unavailable\")".to_string()
+                            );
+                        }
+                    }
+                }
             }
 
             // A checked projection is the exact total interpretation of this
@@ -240,12 +321,36 @@ impl Executor {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // The printing channel has always been a TERM channel — the
+                // body below is whatever the certified interpretation says,
+                // and for a CONSTANT body that is the published constant.
+                // A SYMBOLIC body carries no `TermId` to print, so it is
+                // rendered from its coefficients against the same `x!i`
+                // parameter spellings the signature above just emitted; a
+                // rendering failure is an error, never a silently omitted or
+                // guessed definition.
+                let body = match entry.body() {
+                    CertifiedConstInterpBody::Constant { value, .. } => self.format_term(*value),
+                    CertifiedConstInterpBody::LinearInt(linear) => {
+                        match format_linear_int_body(linear) {
+                            Some(rendered) => rendered,
+                            None => {
+                                tracing::error!(
+                                    surface_name = %name,
+                                    "refusing to format a malformed certified linear interpretation"
+                                );
+                                return "(error \"malformed certified constant-interpretation model\")"
+                                    .to_string();
+                            }
+                        }
+                    }
+                };
                 definitions.push(format!(
                     "  (define-fun {} ({}) {}\n    {})",
                     quote_symbol(name),
                     params_str,
                     format_sort_surface(&self.ctx, &info.sort),
-                    self.format_term(entry.value())
+                    body
                 ));
                 continue;
             }
@@ -292,7 +397,7 @@ impl Executor {
                     quote_symbol(name),
                     params_str,
                     format_sort_surface(&self.ctx, &info.sort),
-                    format_default_value_surface(&self.ctx, &info.sort)
+                    self.default_value_surface(&info.sort)
                 ));
                 continue;
             }
@@ -338,6 +443,45 @@ impl Executor {
 
             // Handle functions with arguments (generate function tables).
             if !info.arg_sorts.is_empty() {
+                let identity = self.ctx.symbol_identity_name(name, info);
+                match model.constant_array_function_for_output(
+                    self,
+                    identity,
+                    &info.arg_sorts,
+                    &info.sort,
+                ) {
+                    Ok(Some(value)) => {
+                        let Some(admission) = model.constant_array_read_admission(self) else {
+                            return "(error \"retained array function owner unavailable\")"
+                                .to_owned();
+                        };
+                        match self.format_retained_constant_function(
+                            name,
+                            &info.arg_sorts,
+                            &info.sort,
+                            value,
+                            &admission,
+                        ) {
+                            Ok(definition) => {
+                                if ay_core::term::reserve_counted(&mut definitions, 1, &admission)
+                                    .is_err()
+                                {
+                                    return "(error \"retained model output refused\")".to_owned();
+                                }
+                                definitions.push(definition);
+                            }
+                            Err(_) => {
+                                return "(error \"retained array function cannot be rendered\")"
+                                    .to_owned()
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        return "(error \"retained array function source changed\")".to_owned()
+                    }
+                }
                 // Did the EUF route publish an interpretation for this symbol?
                 // When it does not, the ground-application fallback below is the
                 // only thing standing between a UF-bearing `sat` and an
@@ -359,10 +503,10 @@ impl Executor {
                         ) {
                             Ok(table) => table,
                             Err(e) => {
-                                return format!(
+                                unrenderable!('symbols, format!(
                                     "(error \"model value for function {} is not available: {e}\")",
                                     quote_symbol(name)
-                                );
+                                ));
                             }
                         };
                         // Resolve @?N placeholders in function table values (#5452).
@@ -410,10 +554,10 @@ impl Executor {
                             // instead of a fabricated default
                             // (#no-fabricated-model-values).
                             Err(e) => {
-                                return format!(
+                                unrenderable!('symbols, format!(
                                     "(error \"model value for function {} is not available: {e}\")",
                                     quote_symbol(name)
-                                );
+                                ));
                             }
                         }
                     }
@@ -476,10 +620,19 @@ impl Executor {
                         for &assertion in &self.ctx.assertions {
                             self.collect_uf_applications(assertion, &mut collected, &mut visited);
                         }
+                        // An exact finite-domain expansion is the ground form of
+                        // an assertion that is STILL asserted; the quantifier
+                        // loop restores the authored vector before output, so
+                        // without this the instantiated applications the model
+                        // actually committed values to are invisible here and
+                        // every guarded-binder UF is published as nothing.
+                        for root in self.finitely_expanded_ground_roots() {
+                            self.collect_uf_applications(root, &mut collected, &mut visited);
+                        }
                         collected
                     });
                     if let Some(applications) = apps.get(&(name.to_string(), arity)) {
-                        match self.uf_table_from_ground_applications(model, applications) {
+                        match self.uf_table_from_ground_applications_in_read(read, applications) {
                             Some(table) => {
                                 match self.format_function_table(
                                     name,
@@ -515,6 +668,14 @@ impl Executor {
             if let Some(term_id) = info.term {
                 // For constants (no arguments), look up value.
                 let sort_str = format_sort_surface(&self.ctx, &info.sort);
+                let shared_value = match aggregate_values.resolve(self, model, term_id) {
+                    Ok(AggregateConstantValue::Value(value)) => Some(value),
+                    Ok(AggregateConstantValue::Absent) => None,
+                    // Preserve get-model's established poisoned-class omission;
+                    // get-value treats this same refusal as a batch error.
+                    Ok(AggregateConstantValue::Poisoned) => continue,
+                    Err(error) => unrenderable!('symbols, format!("(error \"{error}\")")),
+                };
 
                 // Handle array-sorted symbols specially. Render a `store`-chain
                 // that satisfies the asserted `(select a i) = v` constraints
@@ -523,17 +684,17 @@ impl Executor {
                 // bare const-array default, which would VIOLATE the assertions —
                 // an invalid witness (#model-array-witness).
                 if let Sort::Array(_) = &info.sort {
-                    let array_value = if let Some(value) = gate_emit.get(&term_id) {
-                        value.clone()
+                    let array_value = if let Some(value) = shared_value {
+                        value
                     } else if let Some(value) =
                         self.format_array_witness_value(model, term_id, &info.sort)
                     {
                         value
                     } else {
-                        return format!(
+                        unrenderable!('symbols, format!(
                             "(error \"model value for array {} is not available\")",
                             quote_symbol(name)
-                        );
+                        ));
                     };
                     definitions.push(format!(
                         "  (define-fun {} () {}\n    {})",
@@ -546,37 +707,9 @@ impl Executor {
 
                 let quoted_name = quote_symbol(name);
 
-                // Single-source DT value (#mv-dt-single-source): when the DT
-                // lane exported its e-graph model, a datatype-sorted constant
-                // reads the ONE per-class assignment shared with the total
-                // selector definitions and `(get-value)` — printing any other
-                // engine's value here (gate reconstruction included) could
-                // disagree with a totalization branch key derived from the
-                // assignment and un-fire it under Dolmen. Falls through when
-                // absent (combined lanes) or the class fails closed.
-                if self.datatype_sort_name(&info.sort).is_some() {
-                    if let Some(v) = self.dt_egraph_value(model, term_id) {
-                        definitions.push(format!("  (define-fun {quoted_name} () {sort_str} {v})"));
-                        continue;
-                    }
-                    // Fail-closed omission (stage-4 review F2): a class the
-                    // assignment POISONED (self-check failure / unrepairable
-                    // collision) must NOT fall back to any legacy emitter —
-                    // the legacy strategies re-derive the same incoherent
-                    // value the check already proved wrong
-                    // (`c8-tester-distinct`: byte-identical `distinct`-violating
-                    // collision → E:bad-model, division-voiding). Omitting the
-                    // definition is at worst a partial model (0 points to a
-                    // validator), never a wrong one.
-                    if self.dt_egraph_class_poisoned(model, term_id) {
-                        continue;
-                    }
-                }
-
-                // Entailed gate reconstruction wins for a datatype-sorted const
-                // (coherent with the confirmed model, marker-free); otherwise fall
-                // through to the per-leaf DT materializer below.
-                if let Some(ctor_expr) = gate_emit.get(&term_id) {
+                // The shared resolver already applied e-graph/poison priority
+                // before the gate's entailed aggregate reconstruction.
+                if let Some(ctor_expr) = shared_value {
                     definitions.push(format!(
                         "  (define-fun {quoted_name} () {sort_str} {ctor_expr})"
                     ));
@@ -612,18 +745,16 @@ impl Executor {
                 // concrete `EvalValue::Seq` witness installed by completion.
                 // Consulting EUF first leaked bare `@ay-seq!N` identifiers and
                 // made get-model disagree with get-value.
-                if !matches!(
-                    info.sort,
-                    Sort::Int | Sort::Real | Sort::Seq(_) | Sort::BitVec(_)
-                ) {
-                    if let Some(ref euf_model) = model.euf_model {
-                        if let Some(elem) = euf_model.term_values.get(&term_id) {
-                            let elem = format_model_atom_surface(&self.ctx, &info.sort, elem);
-                            definitions
-                                .push(format!("  (define-fun {quoted_name} () {sort_str} {elem})"));
-                            continue;
-                        }
-                    }
+                // FloatingPoint and RoundingMode constants likewise render
+                // through the chain: the FP model owns their values (a mode is
+                // what the FP circuit decoded from its bits).
+                // `euf_printed_constant` owns the sort rule; the independent
+                // gate reads the same function, so what prints here is what
+                // the gate checked.
+                if let Some(elem) = self.euf_printed_constant(model, term_id, &info.sort) {
+                    let elem = format_model_atom_surface(&self.ctx, &info.sort, elem);
+                    definitions.push(format!("  (define-fun {quoted_name} () {sort_str} {elem})"));
+                    continue;
                 }
 
                 // Try LRA model for Real sort — but an exact NRA algebraic
@@ -765,16 +896,16 @@ impl Executor {
                 // concat), printing an INVALID witness that contradicted the
                 // assertions.
                 if matches!(info.sort, Sort::Seq(..)) {
-                    match self.term_value_string(model, term_id) {
+                    match self.term_value_string_in_read(read, term_id) {
                         Ok(value_str) => {
                             definitions.push(format!(
                                 "  (define-fun {quoted_name} () {sort_str} {value_str})"
                             ));
                         }
                         Err(e) => {
-                            return format!(
+                            unrenderable!('symbols, format!(
                                 "(error \"model value for {quoted_name} is not available: {e}\")"
-                            );
+                            ));
                         }
                     }
                     continue;
@@ -831,7 +962,7 @@ impl Executor {
                 // falsifies. The committed value falls through to the
                 // `evaluate_term` renderer below, keeping emit faithful to the gate.
                 if matches!(info.sort, Sort::Int | Sort::Real)
-                    && matches!(self.evaluate_term(model, term_id), EvalValue::Unknown)
+                    && matches!(read.evaluate(term_id), EvalValue::Unknown)
                 {
                     let mut resolved = self.extract_value_from_asserted_equalities(model, term_id);
                     if resolved.is_none() {
@@ -850,9 +981,9 @@ impl Executor {
                             let value_str = match self.try_format_eval_value_user(&value, term_id) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    return format!(
+                                    unrenderable!('symbols, format!(
                                         "(error \"model value for {quoted_name} is not available: {e}\")"
-                                    );
+                                    ));
                                 }
                             };
                             definitions.push(format!(
@@ -881,17 +1012,32 @@ impl Executor {
                         continue;
                     }
                 }
-                let eval_value = self.evaluate_term(model, term_id);
+                let mut eval_value = read.evaluate(term_id);
+                // A declared constant with no FREE occurrence in the query is
+                // unconstrained: the Z3 C API binds its quantifiers over the
+                // caller's own constants (`Z3_mk_forall_const`), so `q` of
+                // `forall q. (3 <= q <= 6) => a = 1` is a declared symbol the
+                // solver never assigns. Any value is a witness; the canonical
+                // default completes it (measured: "model value for q is not
+                // available (internal error: sat accepted without a total
+                // model)", and the API published `sat` with an EMPTY model).
+                if matches!(eval_value, EvalValue::Unknown)
+                    && !self.var_occurs_free_in_current_query(term_id)
+                {
+                    if let Some(default) = self.unconstrained_default_value(&info.sort) {
+                        eval_value = default;
+                    }
+                }
                 let value_str = match &eval_value {
                     // Unknown keeps its specific invariant-violation message
                     // (ordered BEFORE the user-facing delegation so the
                     // "sat accepted without a total model" diagnostic text is
                     // preserved).
                     EvalValue::Unknown => {
-                        return format!(
+                        unrenderable!('symbols, format!(
                             "(error \"model value for {quoted_name} is not available \
                              (internal error: sat accepted without a total model)\")"
-                        );
+                        ));
                     }
                     // Sort-aware user-facing formatting (#real-fmt): Real
                     // constants print as z3-exact Real literals (`0.0`,
@@ -900,9 +1046,9 @@ impl Executor {
                     _ => match self.try_format_eval_value_user(&eval_value, term_id) {
                         Ok(s) => s,
                         Err(e) => {
-                            return format!(
+                            unrenderable!('symbols, format!(
                                 "(error \"model value for {quoted_name} is not available: {e}\")"
-                            );
+                            ));
                         }
                     },
                 };
@@ -926,7 +1072,12 @@ impl Executor {
         // evaluates these natively (and rejects attempts to re-define them
         // with E:id-def-conflict). This is the same declaration-free form
         // cvc5 emits for uninterpreted-sort models.
-        if !omitted.is_empty() {
+        if unvalidated_candidate {
+            self.finish_candidate_definitions(&mut definitions, &mut omitted);
+        }
+        // Not under `--z3-mode`, whose stderr stays empty as z3's does; the
+        // response itself shows the omission.
+        if !omitted.is_empty() && !ay_core::misc_cli_flags().z3_transcript {
             // stderr ONLY — stdout is the get-model response. The harness
             // already captures `stderr_tail`, so this makes a partial model
             // greppable in the run record instead of silently scoring zero.
@@ -938,7 +1089,24 @@ impl Executor {
                 omitted.join(" ")
             );
         }
-        if definitions.is_empty() {
+        if let Some(admission) = model.constant_array_read_admission(self) {
+            let mut text = ay_core::render_admission::Buffer::new(Some(&admission));
+            if !text.push("(model\n") {
+                return "(error \"retained model output refused\")".to_owned();
+            }
+            for definition in &definitions {
+                if !text.push(definition) || !text.character('\n') {
+                    return "(error \"retained model output refused\")".to_owned();
+                }
+            }
+            if !text.character(')')
+                || admission.check().is_err()
+                || !super::evaluation_copies::validate(self)
+            {
+                return "(error \"retained model output refused\")".to_owned();
+            }
+            text.finish()
+        } else if definitions.is_empty() {
             "(model\n)".to_string()
         } else {
             format!("(model\n{}\n)", definitions.join("\n"))
@@ -956,6 +1124,9 @@ impl Executor {
             return Err("(error \"model generation is not enabled\")".to_string());
         }
         match (&self.last_result, &self.last_model) {
+            (Some(SolveResult::Sat), Some(m)) if !self.materialized_scalar_functions_current(m) => {
+                Err("(error \"materialized scalar function model is stale\")".to_string())
+            }
             (Some(SolveResult::Sat), Some(m)) => Ok(m),
             (Some(SolveResult::Sat), None) => {
                 // Trivially-SAT: every declared constant is unconstrained, so
@@ -970,11 +1141,11 @@ impl Executor {
 
     /// Compute the printed value of a single term against `model`.
     ///
-    /// This is the per-term core shared by `(get-value ...)` and `(eval ...)`.
-    /// It performs array/datatype/uninterpreted resolution and the Unknown
-    /// fallbacks (asserted-equality and inequality-bound extraction) exactly as
-    /// `get-value` does, returning just the value text (no `(term value)`
-    /// wrapper).
+    /// This is the fallback renderer for `(get-value ...)` and the direct
+    /// renderer for `(eval ...)`. The batch value command first consults its
+    /// shared aggregate-constant authority; this method handles the remaining
+    /// array/datatype/uninterpreted resolution and Unknown fallbacks, returning
+    /// just the value text (no `(term value)` wrapper).
     ///
     /// `Err` when the term has NO value under the model: the former behavior
     /// printed a fabricated sort default (a lie — e.g. `(get-value ((f 1)))`
@@ -985,9 +1156,82 @@ impl Executor {
         model: &Model,
         term_id: TermId,
     ) -> Result<String, String> {
+        // Internal formatting helpers run under their caller's immutable
+        // model-read/gate boundary; do not create a root scan for every field.
+        self.check_evaluation_read()?;
+        if !self.materialized_scalar_functions_current(model) {
+            return Err("materialized scalar function model is stale".to_string());
+        }
+        // A published finite-domain lane model is one total model of its
+        // signature; every printer reads it first (#dt-fd-ground-model).
+        let result = match self.dt_fd_ground_value(model, term_id) {
+            Some(value) => Ok(value),
+            None => self.term_value_string_unstopped(model, term_id),
+        };
+        self.check_evaluation_read()?;
+        result
+    }
+
+    fn term_value_string_in_read(
+        &self,
+        read: &dyn ModelRead,
+        term_id: TermId,
+    ) -> Result<String, String> {
+        let model = read.model();
+        self.check_evaluation_read()?;
+        if let Some(value) = read.check_array_functions(term_id)? {
+            return self
+                .format_gate_model_value(&value, self.ctx.terms.sort(term_id))
+                .ok_or_else(|| "array function query value cannot be rendered exactly".to_owned());
+        }
+        let result = match self.dt_fd_ground_value(model, term_id) {
+            Some(value) => Ok(value),
+            None => self.term_value_string_unstopped_in_read(model, term_id, Some(read)),
+        };
+        self.check_evaluation_read()?;
+        result
+    }
+
+    /// [`Self::term_value_string`] without the stop checks and without the
+    /// published lane model: the per-term authorities only.
+    pub(in crate::executor) fn term_value_string_unstopped(
+        &self,
+        model: &Model,
+        term_id: TermId,
+    ) -> Result<String, String> {
+        self.term_value_string_unstopped_in_read(model, term_id, None)
+    }
+
+    fn term_value_string_unstopped_in_read(
+        &self,
+        model: &Model,
+        term_id: TermId,
+        read: Option<&dyn ModelRead>,
+    ) -> Result<String, String> {
+        match self.completed_model_value(model, term_id) {
+            Ok(Some(value)) => {
+                if model.has_constant_array_functions() {
+                    let admission = model
+                        .constant_array_read_admission(self)
+                        .ok_or("retained array owner unavailable")?;
+                    return self
+                        .retained_array_render_value(
+                            &value,
+                            self.ctx.terms.sort(term_id),
+                            &admission,
+                        )
+                        .map_err(|error| error.to_string());
+                }
+                return self
+                    .format_gate_model_value(&value, self.ctx.terms.sort(term_id))
+                    .ok_or_else(|| "completed model value cannot be rendered exactly".to_string());
+            }
+            Ok(None) => {}
+            Err(()) => return Err("retained array model value is unavailable".to_string()),
+        }
         // Route projection applications to the selected argument through this
-        // same per-term formatting core. This keeps `(get-value)` identical to
-        // the evaluator and also handles non-scalar sorts (arrays, datatypes,
+        // same per-term formatting core. This preserves the evaluator's
+        // selected argument and handles non-scalar sorts (arrays, datatypes,
         // sequences) using the selected argument's established renderer. An
         // unavailable selected value remains unavailable; no finite-table or
         // asserted-equality fallback may replace the total projection. Peeling
@@ -1002,7 +1246,26 @@ impl Executor {
             Err(error) => return Err(error.to_string()),
         };
         let sort = self.ctx.terms.sort(term_id);
+        if let Some(value) = self.certified_const_array_output(model, term_id) {
+            return value;
+        }
+        // This precedes asserted-equality/witness recovery as well as raw
+        // scalar lookup: a refused owned read cannot acquire a second value.
+        if let Some(value) = self.certified_const_array_read(model, term_id) {
+            return self.try_format_eval_value_user(&value, term_id);
+        }
         if matches!(sort, Sort::Array(_)) {
+            if self.is_ordinary_array_function_application(term_id)? {
+                // A per-application extraction default is not a coherent UF
+                // interpretation. Rich retained packages answer before this
+                // fallback; unsupported/ambiguous ordinary UFs must refuse.
+                return self
+                    .functional_array_render(model, term_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "array-valued function has no coherent committed interpretation".to_owned()
+                    });
+            }
             // Render a `store`-chain that satisfies the asserted
             // `(select term i) = v` constraints, mirroring `(get-model)`
             // (#model-array-witness).
@@ -1019,12 +1282,19 @@ impl Executor {
             match self.resolve_dt_value(sort_name, term_id, model) {
                 Some(ctor_expr) => Ok(ctor_expr),
                 None => {
-                    let eval_value = self.evaluate_term(model, term_id);
+                    let eval_value = read.map_or_else(
+                        || self.evaluate_term(model, term_id),
+                        |read| read.evaluate(term_id),
+                    );
                     self.try_format_eval_value_user(&eval_value, term_id)
                 }
             }
         } else {
-            let eval_value = self.evaluate_term(model, term_id);
+            let eval_value = read.map_or_else(
+                || self.evaluate_term(model, term_id),
+                |read| read.evaluate(term_id),
+            );
+            self.check_evaluation_read()?;
             // For selector apps returning Unknown, scan assertions (#5432).
             let eval_value = if matches!(eval_value, EvalValue::Unknown) {
                 self.extract_value_from_asserted_equalities(model, term_id)
@@ -1032,6 +1302,7 @@ impl Executor {
             } else {
                 eval_value
             };
+            self.check_evaluation_read()?;
             // For Real/Int-sorted terms still Unknown after equality scan,
             // try bound extraction from inequality assertions (#5506).
             let eval_value = if matches!(eval_value, EvalValue::Unknown) {
@@ -1049,6 +1320,7 @@ impl Executor {
             } else {
                 eval_value
             };
+            self.check_evaluation_read()?;
             // For a Seq-sorted term with no direct theory value or defining
             // `(= s ...)` equality, reconstruct the witness from its
             // `(seq.len s) = N` / `(seq.nth s i) = v` constraints (#model-seq-witness).
@@ -1061,6 +1333,7 @@ impl Executor {
                 } else {
                     eval_value
                 };
+            self.check_evaluation_read()?;
             // A UF application at an argument point the function table does
             // not list reads back the printed define-fun's ELSE branch, so
             // (get-value) never contradicts (get-model).
@@ -1128,12 +1401,229 @@ impl Executor {
             Some((_, else_value)) => self.resolve_table_value(else_value, result_sort, model),
             // Empty table: the same unconstrained-function body `(get-model)`
             // prints.
-            None => Ok(format_default_value_surface(&self.ctx, result_sort)),
+            None => Ok(self.default_value_surface(result_sort)),
         })
+    }
+
+    /// The `(get-value)` answer for one requested term.
+    fn get_value_string(
+        &self,
+        read: &dyn ModelRead,
+        aggregate_values: &AggregateConstantValues,
+        term_id: TermId,
+    ) -> Result<String, String> {
+        if let Some(value) = read.check_array_functions(term_id)? {
+            return self
+                .format_gate_model_value(&value, self.ctx.terms.sort(term_id))
+                .ok_or_else(|| "array function query value cannot be rendered exactly".to_owned());
+        }
+        if !self.materialized_scalar_functions_current(read.model()) {
+            return Err("materialized scalar function model is stale".to_string());
+        }
+        let value = self.get_value_core(read, aggregate_values, term_id);
+        if value.is_err() && matches!(self.ctx.terms.sort(term_id), Sort::Bool) {
+            // A Boolean combination whose leaves all have printed values has
+            // the value those printed values give it (#get-value-printed-bool).
+            let mut memo = DetHashMap::default();
+            if let Some(b) = self.gv_printed_bool(
+                read,
+                aggregate_values,
+                term_id,
+                &mut memo,
+                PRINTED_BOOL_DEPTH,
+            ) {
+                return Ok(b.to_string());
+            }
+        }
+        value
+    }
+
+    /// A Boolean term evaluated over the printed values of its parts
+    /// (#get-value-printed-bool): a part with its own `(get-value)` answer
+    /// reads it; connectives and `ite` combine their parts; `=` / `distinct`
+    /// compare their arguments' printed values when those are ground texts
+    /// that are their own identity (`canonical_datatype_value`). The
+    /// per-term evaluator has no value for, e.g., `(= k29 k30)` over two
+    /// eliminated single-constructor records whose fields nothing
+    /// constrains, while `(get-value)` prints both records; the answer here
+    /// is the one those printed records give, so the printed values stay
+    /// one model (E13 round 6, `gvlane_61_0050`). `None` when some part has
+    /// no printed value.
+    fn gv_printed_bool(
+        &self,
+        read: &dyn ModelRead,
+        aggregate_values: &AggregateConstantValues,
+        term: TermId,
+        memo: &mut DetHashMap<TermId, Option<bool>>,
+        fuel: u32,
+    ) -> Option<bool> {
+        if let Some(&known) = memo.get(&term) {
+            return known;
+        }
+        let value = self.gv_printed_bool_uncached(read, aggregate_values, term, memo, fuel);
+        memo.insert(term, value);
+        value
+    }
+
+    fn gv_printed_bool_uncached(
+        &self,
+        read: &dyn ModelRead,
+        aggregate_values: &AggregateConstantValues,
+        term: TermId,
+        memo: &mut DetHashMap<TermId, Option<bool>>,
+        fuel: u32,
+    ) -> Option<bool> {
+        if fuel == 0 {
+            return None;
+        }
+        if let Ok(value) = self.get_value_core(read, aggregate_values, term) {
+            return match value.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+        }
+        let fuel = fuel - 1;
+        match self.ctx.terms.get(term) {
+            TermData::Not(inner) => self
+                .gv_printed_bool(read, aggregate_values, *inner, memo, fuel)
+                .map(|b| !b),
+            TermData::Ite(c, t, e) => {
+                let branch = if self.gv_printed_bool(read, aggregate_values, *c, memo, fuel)? {
+                    *t
+                } else {
+                    *e
+                };
+                self.gv_printed_bool(read, aggregate_values, branch, memo, fuel)
+            }
+            TermData::App(sym, args) => match sym.name() {
+                "not" if args.len() == 1 => self
+                    .gv_printed_bool(read, aggregate_values, args[0], memo, fuel)
+                    .map(|b| !b),
+                "and" | "or" => {
+                    let absorbing = sym.name() == "or";
+                    let mut unknown = false;
+                    for &a in args {
+                        match self.gv_printed_bool(read, aggregate_values, a, memo, fuel) {
+                            Some(b) if b == absorbing => return Some(absorbing),
+                            Some(_) => {}
+                            None => unknown = true,
+                        }
+                    }
+                    (!unknown).then_some(!absorbing)
+                }
+                "=>" | "xor" => {
+                    let mut values = Vec::with_capacity(args.len());
+                    for &a in args {
+                        values.push(self.gv_printed_bool(read, aggregate_values, a, memo, fuel)?);
+                    }
+                    if sym.name() == "xor" {
+                        return Some(values.iter().fold(false, |acc, &b| acc ^ b));
+                    }
+                    let (last, premises) = values.split_last()?;
+                    Some(!premises.iter().all(|&b| b) || *last)
+                }
+                "=" | "distinct" if args.len() >= 2 => {
+                    let mut values = Vec::with_capacity(args.len());
+                    for &a in args {
+                        let value = if matches!(self.ctx.terms.sort(a), Sort::Bool) {
+                            self.gv_printed_bool(read, aggregate_values, a, memo, fuel)?
+                                .to_string()
+                        } else {
+                            self.get_value_string(read, aggregate_values, a)
+                                .ok()
+                                .filter(|v| self.canonical_datatype_value(v))?
+                        };
+                        values.push(value);
+                    }
+                    Some(if sym.name() == "=" {
+                        values.iter().all(|v| *v == values[0])
+                    } else {
+                        (0..values.len())
+                            .all(|i| (i + 1..values.len()).all(|j| values[i] != values[j]))
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`Self::get_value_string`] without the printed-Boolean fallback.
+    fn get_value_core(
+        &self,
+        read: &dyn ModelRead,
+        aggregate_values: &AggregateConstantValues,
+        term_id: TermId,
+    ) -> Result<String, String> {
+        let model = read.model();
+        // A published finite-domain lane model values every term of its
+        // signature as ONE total model (#dt-fd-ground-model); the
+        // per-term authorities below would value a selector the query
+        // does not apply independently of its argument's value.
+        if let Some(value) = self.dt_fd_ground_value(model, term_id) {
+            return Ok(value);
+        }
+        // A wrong-constructor selector application the model never valued
+        // reads the printed selector table (#get-value-wrong-ctor), before
+        // the aggregate reader: that reader completes a datatype-sorted term
+        // interned after the check (a `(get-value)` term such as
+        // `(tl13 nil15)`) with a value of its own, which the printed table
+        // does not carry (E13 round 6, `incrgv_61_0017`).
+        if let Some(value) = self.wrong_ctor_selector_table_value(model, term_id)? {
+            return Ok(value);
+        }
+        match aggregate_values.resolve(self, model, term_id)? {
+            AggregateConstantValue::Value(value) => Ok(value),
+            AggregateConstantValue::Absent => {
+                // A non-query selector on its owning constructor projects
+                // the argument's printed field (#get-value-wrong-ctor).
+                if let Some(value) = self.wrong_ctor_selector_case_value(model, term_id)? {
+                    return Ok(value);
+                }
+                // A tester answers for its argument's printed value
+                // (#get-value-tester-coherence).
+                if let Some((arg, tested)) = self.tester_application(term_id) {
+                    if let Ok(value) = self.get_value_string(read, aggregate_values, arg) {
+                        if let Some(answer) = self.tester_on_printed_value(arg, tested, &value) {
+                            return Ok(answer.to_string());
+                        }
+                    }
+                }
+                // So does an equality over datatype values
+                // (#get-value-tester-coherence).
+                if let Some(args) = self.datatype_comparison(term_id) {
+                    let mut values = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        match self.get_value_string(read, aggregate_values, arg) {
+                            Ok(value) if self.canonical_datatype_value(&value) => {
+                                values.push(value);
+                            }
+                            _ => break,
+                        }
+                    }
+                    if values.len() == args.len() {
+                        let equal = values.iter().all(|v| *v == values[0]);
+                        let distinct = (0..values.len())
+                            .all(|i| (i + 1..values.len()).all(|j| values[i] != values[j]));
+                        let is_eq = matches!(self.ctx.terms.get(term_id), TermData::App(sym, _) if sym.name() == "=");
+                        return Ok(if is_eq { equal } else { distinct }.to_string());
+                    }
+                }
+                self.term_value_string_in_read(read, term_id)
+            }
+            AggregateConstantValue::Poisoned => {
+                Err("datatype model class is incoherent".to_string())
+            }
+        }
     }
 
     /// Generate output for get-value command.
     pub(crate) fn values(&self, requested: &[(String, TermId)]) -> String {
+        self.checked_evaluation_output(|| self.values_unstopped(requested))
+    }
+
+    fn values_unstopped(&self, requested: &[(String, TermId)]) -> String {
         // Check if we have a model.
         //
         // For trivially-SAT cases where `last_model` is `None` (e.g., all
@@ -1148,6 +1638,11 @@ impl Executor {
             Err(e) => return e,
         };
 
+        self.with_model_construction_read(model, |read| self.values_from_selected(read, requested))
+    }
+
+    fn values_from_selected(&self, read: &dyn ModelRead, requested: &[(String, TermId)]) -> String {
+        let model = read.model();
         // Memoize evaluation across ALL requested terms (#eval-memo). `get-value`
         // over N terms that share large subterms — e.g. a Kani query's ~190
         // violation flags, each a boolean expression reading the same 20M-node
@@ -1157,6 +1652,10 @@ impl Executor {
         // for the query); dropped at function exit.
         let _eval_memo = super::EvalMemoSession::new();
         let _t_gv = std::time::Instant::now();
+        let aggregate_values = match AggregateConstantValues::for_values(self, model, requested) {
+            Ok(values) => values,
+            Err(error) => return format!("(error \"{error}\")"),
+        };
 
         // Echo the term's ORIGINAL SMT-LIB text as the key (per the SMT-LIB
         // spec), not a reconstruction of the elaborated term — a
@@ -1164,7 +1663,7 @@ impl Executor {
         // `(wrap <field>)`, whose fresh field var must not leak into the key.
         let mut pairs: Vec<String> = Vec::with_capacity(requested.len());
         for (term_str, term_id) in requested {
-            match self.term_value_string(model, *term_id) {
+            match self.get_value_string(read, &aggregate_values, *term_id) {
                 Ok(value_str) => pairs.push(format!("({term_str} {value_str})")),
                 // A term with no value under the model errors honestly —
                 // never a fabricated default (#no-fabricated-model-values).
@@ -1195,6 +1694,40 @@ impl Executor {
     /// `define-fun`, whose else-branch would then commit some other row's value
     /// at the unread point — a fabricated value in all but name
     /// (#no-fabricated-model-values). The caller omits the symbol instead.
+    /// Whether `term` is a quantifier that the canonical finite-domain expander
+    /// replaced, in THIS solve, with a ground conjunction that is still
+    /// available to the model census.
+    ///
+    /// Two conditions make the record usable. Its ORIGINAL must still be one of
+    /// the current assertions — the quantifier loop restores the authored
+    /// vector after the ground run, so a record whose original is gone no
+    /// longer describes anything that is asserted. And its replacement must be
+    /// quantifier-free, because `collect_uf_applications` does not descend into
+    /// binders and would otherwise silently miss constrained points. Together
+    /// they make `expanded` an exact ground equivalent of a formula asserted
+    /// right now, so the applications it mentions are EXACTLY the points at
+    /// which that assertion constrains a function symbol — which is the premise
+    /// the blanket quantifier guard below was conservatively assuming could
+    /// never hold.
+    pub(super) fn quantifier_is_finitely_expanded(&self, term: TermId) -> bool {
+        self.quant_expansion_records.iter().any(|record| {
+            record.original == term
+                && self.ctx.assertions.contains(&record.original)
+                && !crate::ematching::contains_quantifier(&self.ctx.terms, record.expanded)
+        })
+    }
+
+    /// Ground replacements of the quantifiers
+    /// [`Self::quantifier_is_finitely_expanded`] accepts, to be censused
+    /// alongside `ctx.assertions`.
+    pub(super) fn finitely_expanded_ground_roots(&self) -> Vec<TermId> {
+        self.quant_expansion_records
+            .iter()
+            .filter(|record| self.quantifier_is_finitely_expanded(record.original))
+            .map(|record| record.expanded)
+            .collect()
+    }
+
     /// True when `name` occurs anywhere beneath a quantifier in the assertions.
     ///
     /// Such a symbol is NOT determined by its ground applications: a
@@ -1233,6 +1766,16 @@ impl Executor {
                         || walk(exec, *body, name, under_quant, seen)
                 }
                 TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                    // A binder the canonical finite-domain expander replaced
+                    // with a quantifier-free ground conjunction constrains the
+                    // symbol at exactly the points that conjunction applies it
+                    // to, and the census below walks that conjunction. So this
+                    // is NOT an occurrence whose points the ground table would
+                    // miss, and omitting the symbol for it would discard an
+                    // interpretation the solve already checked.
+                    if exec.quantifier_is_finitely_expanded(term) {
+                        return false;
+                    }
                     walk(exec, *body, name, true, seen)
                         || triggers
                             .iter()
@@ -1255,16 +1798,66 @@ impl Executor {
         model: &Model,
         applications: &[(TermId, Vec<TermId>)],
     ) -> Option<Vec<(Vec<String>, String)>> {
+        let read = ModelConstructionRead::new(self, model).ok()?;
+        let result = self.uf_table_from_ground_applications_in_read(&read, applications);
+        read.finish().ok()?;
+        result
+    }
+
+    fn uf_table_from_ground_applications_in_read(
+        &self,
+        read: &dyn ModelRead,
+        applications: &[(TermId, Vec<TermId>)],
+    ) -> Option<Vec<(Vec<String>, String)>> {
         let mut table = Vec::with_capacity(applications.len());
         for (app, args) in applications {
-            let value = self.term_value_string(model, *app).ok()?;
+            let value = self.uf_table_candidate_value_in_read(read, *app).ok()?;
             let mut key = Vec::with_capacity(args.len());
             for &arg in args {
-                key.push(self.term_value_string(model, arg).ok()?);
+                key.push(self.uf_table_candidate_value_in_read(read, arg).ok()?);
             }
             table.push((key, value));
         }
         Some(table)
+    }
+
+    /// Candidate rows precede the total-table interpretation they construct.
+    /// Never enter public UF-table evaluation here: that would recursively
+    /// ask this same builder for its unfinished table. These per-application
+    /// values are only candidate DATA; duplicate argument rows and all authored
+    /// assertions still pass the existing independent total-model gate.
+    fn uf_table_candidate_value_in_read(
+        &self,
+        read: &dyn ModelRead,
+        term: TermId,
+    ) -> Result<String, String> {
+        self.check_evaluation_read()?;
+        let model = read.model();
+        if !self.materialized_scalar_functions_current(model) {
+            return Err("materialized scalar function model is stale".to_owned());
+        }
+        let result = if self.is_ordinary_array_function_application(term)? {
+            match self.completed_model_value(model, term) {
+                Err(()) => return Err("retained array model value is unavailable".to_owned()),
+                Ok(Some(value)) => self
+                    .format_gate_model_value(&value, self.ctx.terms.sort(term))
+                    .ok_or_else(|| "array candidate cannot be rendered exactly".to_owned()),
+                Ok(None) => {
+                    if let Some(value) = self.certified_const_array_output(model, term) {
+                        value
+                    } else if let Some(value) = self.functional_array_render(model, term)? {
+                        Ok(value)
+                    } else {
+                        self.format_array_witness_value(model, term, self.ctx.terms.sort(term))
+                            .ok_or_else(|| "array candidate is incomplete".to_owned())
+                    }
+                }
+            }
+        } else {
+            self.term_value_string_unstopped_in_read(model, term, Some(read))
+        };
+        self.check_evaluation_read()?;
+        result
     }
 
     /// Generate output for the Z3 `(eval <term>)` command.
@@ -1278,10 +1871,12 @@ impl Executor {
             Ok(m) => m,
             Err(e) => return e,
         };
-        match self.term_value_string(model, term_id) {
-            Ok(value_str) => value_str,
-            Err(e) => format!("(error \"value is not available: {e}\")"),
-        }
+        self.with_model_construction_read(model, |read| {
+            match self.term_value_string_in_read(read, term_id) {
+                Ok(value_str) => value_str,
+                Err(e) => format!("(error \"value is not available: {e}\")"),
+            }
+        })
     }
 }
 
@@ -1425,5 +2020,253 @@ mod uf_interp_bv_lane_tests {
             !out.contains("(define-fun d "),
             "a define-fun symbol must not be re-emitted by the fallback: {out}"
         );
+    }
+}
+
+/// Render `lambda x-bar. k + sum_i c_i * x_i` as an SMT-LIB body over the
+/// printer's own `x!i` parameter spellings.
+///
+/// The parameter names are minted here from the body's arity rather than
+/// passed in, so they cannot drift from the `(define-fun f ((x!0 Int) ..) ..)`
+/// signature emitted beside them — both come from the same `x!{index}` rule.
+/// `None` on an empty body: a nullary head is published as a constant, never
+/// through this path.
+fn format_linear_int_body(linear: &LinearIntBody) -> Option<String> {
+    if linear.arity() == 0 {
+        return None;
+    }
+    let zero = num_bigint::BigInt::from(0);
+    let one = num_bigint::BigInt::from(1);
+    let minus_one = num_bigint::BigInt::from(-1);
+    let mut summands: Vec<String> = Vec::new();
+    for (index, coefficient) in linear.coefficients().iter().enumerate() {
+        if *coefficient == zero {
+            continue;
+        }
+        let parameter = quote_symbol(&format!("x!{index}"));
+        summands.push(if *coefficient == one {
+            parameter
+        } else if *coefficient == minus_one {
+            format!("(- {parameter})")
+        } else {
+            format!("(* {} {})", format_bigint(coefficient), parameter)
+        });
+    }
+    if *linear.constant() != zero || summands.is_empty() {
+        summands.push(format_bigint(linear.constant()));
+    }
+    Some(match summands.len() {
+        1 => summands.remove(0),
+        _ => format!("(+ {})", summands.join(" ")),
+    })
+}
+
+/// The PRINTED body is the only form of a symbolic interpretation a consumer
+/// ever sees, and for a head the certificate owns nothing reconciles it
+/// against a second source: `printed_uf_rows` opts such a head out entirely,
+/// so the independent gate re-evaluates the same in-memory [`LinearIntBody`]
+/// rather than re-reading this text. Rendering and
+/// [`LinearIntBody::evaluate`] are therefore two implementations of one
+/// function with no cross-check between them — these tests are that
+/// cross-check.
+#[cfg(test)]
+mod linear_int_body_printing_tests {
+    use super::{format_linear_int_body, Executor, LinearIntBody};
+    use ay_frontend::parse;
+    use num_bigint::BigInt;
+
+    fn body(coefficients: &[i64], constant: i64) -> LinearIntBody {
+        LinearIntBody::new(
+            coefficients.iter().copied().map(BigInt::from).collect(),
+            BigInt::from(constant),
+        )
+        .expect("a non-nullary linear body")
+    }
+
+    /// Every coefficient branch, by exact spelling.
+    ///
+    /// The minter currently emits only `λ x̄. x_j + k` — one coefficient equal
+    /// to `1` and the rest `0` — so the `-1` and `|c| > 1` arms are reachable
+    /// only by widening the family. Pinning them NOW is the point: a widening
+    /// that renders them wrong publishes a model that disagrees with the
+    /// interpretation the certificate proved, and nothing downstream would
+    /// notice (see the module note above).
+    #[test]
+    fn rendering_covers_every_coefficient_branch() {
+        for (coefficients, constant, expected) in [
+            (&[1i64][..], 3i64, "(+ x!0 3)"),
+            // A negative constant must take SMT-LIB's unary-minus form; a bare
+            // `-1` is not a numeral and would not re-parse.
+            (&[1][..], -1, "(+ x!0 (- 1))"),
+            (&[1][..], 0, "x!0"),
+            (&[-1][..], 0, "(- x!0)"),
+            (&[-1][..], 2, "(+ (- x!0) 2)"),
+            // A zero coefficient is ELIDED, and a body that elides everything
+            // must still print its constant rather than an empty `(+ )`.
+            (&[0][..], 5, "5"),
+            (&[0][..], 0, "0"),
+            (&[0, 1][..], 2, "(+ x!1 2)"),
+            (&[1, 1][..], 0, "(+ x!0 x!1)"),
+            (&[3, -2][..], -7, "(+ (* 3 x!0) (* (- 2) x!1) (- 7))"),
+        ] {
+            assert_eq!(
+                format_linear_int_body(&body(coefficients, constant)).as_deref(),
+                Some(expected),
+                "rendering of {coefficients:?} + {constant}"
+            );
+        }
+        // A nullary head is published as a constant and must never reach this
+        // path; `LinearIntBody::new` refuses to build one at all.
+        assert!(LinearIntBody::new(Vec::new(), BigInt::from(1)).is_none());
+    }
+
+    /// AY re-reads its OWN printed body and must agree with the evaluator at
+    /// the argument point.
+    ///
+    /// The script asserts the DISEQUALITY, so `unsat` is agreement: the
+    /// printed `(define-fun ...)` body, parsed and evaluated by the ordinary
+    /// front end, equals what [`LinearIntBody::evaluate`] computed. Any
+    /// rendering defect — a dropped constant, a sign, a parameter index, a
+    /// bare negative numeral that fails to parse — makes this `sat` or an
+    /// execution error.
+    #[test]
+    fn printed_body_agrees_with_the_evaluator_at_every_probed_point() {
+        for (coefficients, constant) in [
+            (&[1i64][..], 3i64),
+            (&[1][..], -1),
+            (&[1][..], 0),
+            (&[-1][..], 4),
+            (&[0][..], 9),
+            (&[5][..], -1_000_000_007),
+            (&[0, 1][..], 2),
+            (&[3, -2][..], -7),
+        ] {
+            let linear = body(coefficients, constant);
+            let rendered = format_linear_int_body(&linear).expect("a renderable body");
+            let signature = (0..linear.arity())
+                .map(|index| format!("(x!{index} Int)"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for point in [&[0i64, 0][..], &[7, -3][..], &[-11, 13][..]] {
+                let arguments = &point[..linear.arity()];
+                let expected = linear
+                    .evaluate(
+                        &arguments
+                            .iter()
+                            .copied()
+                            .map(BigInt::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("the arity matches");
+                let outputs = disagreement_verdict(&signature, &rendered, arguments, &expected);
+                assert!(
+                    outputs.iter().any(|line| line == "unsat"),
+                    "printed body `{rendered}` disagrees with `evaluate` at \
+                     {arguments:?}: expected {expected}, script said {outputs:?}"
+                );
+            }
+        }
+    }
+
+    /// NEGATIVE CONTROL for the harness above, so it can never report
+    /// agreement vacuously.
+    ///
+    /// The same script shape with a body that is ONE OFF from the certified
+    /// one must come back `sat`. Without this, a harness whose script failed
+    /// to parse, or that read the wrong output line, or that compared against
+    /// a value it had itself derived from the rendering, would "pass" for
+    /// every body including a wrong one.
+    #[test]
+    fn the_agreement_harness_detects_a_wrong_body() {
+        let linear = body(&[1], 3);
+        let expected = linear
+            .evaluate(&[BigInt::from(7)])
+            .expect("the arity matches");
+        let outputs = disagreement_verdict("(x!0 Int)", "(+ x!0 4)", &[7], &expected);
+        assert!(
+            outputs.iter().any(|line| line == "sat"),
+            "the harness must REFUTE `x!0 + 4` against `evaluate`'s {expected}, \
+             but the script said {outputs:?}"
+        );
+    }
+
+    /// Run `(assert (not (= (f args) expected)))` against the PRINTED body and
+    /// return AY's own output lines. `unsat` is agreement; `sat` is a
+    /// rendering that denotes a different function.
+    fn disagreement_verdict(
+        signature: &str,
+        rendered: &str,
+        arguments: &[i64],
+        expected: &BigInt,
+    ) -> Vec<String> {
+        let call = arguments
+            .iter()
+            .map(|argument| numeral(&BigInt::from(*argument)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "(set-logic ALL)\n\
+             (define-fun f ({signature}) Int {rendered})\n\
+             (assert (not (= (f {call}) {})))\n\
+             (check-sat)\n",
+            numeral(expected)
+        );
+        let commands = parse(&script).expect("the printed body re-parses");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands).expect("the script executes")
+    }
+
+    /// SMT-LIB has no negative numeral literal.
+    fn numeral(value: &BigInt) -> String {
+        if value.sign() == num_bigint::Sign::Minus {
+            format!("(- {})", value.magnitude())
+        } else {
+            value.to_string()
+        }
+    }
+}
+
+impl Executor {
+    /// Whether the `Var` `var` occurs FREE in a current assertion or an
+    /// assumption of the last check: an occurrence under a quantifier or
+    /// `let` that binds its name is not free.
+    fn var_occurs_free_in_current_query(&self, var: TermId) -> bool {
+        let TermData::Var(name, _) = self.ctx.terms.get(var) else {
+            return true;
+        };
+        // (term, binders in scope); a binder of `name` hides it below.
+        let mut stack: Vec<(TermId, bool)> = self
+            .ctx
+            .assertions
+            .iter()
+            .chain(self.last_assumptions.iter().flatten())
+            .map(|&root| (root, false))
+            .collect();
+        let mut seen: DetHashSet<(TermId, bool)> = DetHashSet::default();
+        while let Some((t, shadowed)) = stack.pop() {
+            if shadowed || !seen.insert((t, shadowed)) {
+                continue;
+            }
+            if t == var {
+                return true;
+            }
+            match self.ctx.terms.get(t) {
+                TermData::App(_, args) => stack.extend(args.iter().map(|&a| (a, false))),
+                TermData::Not(inner) => stack.push((*inner, false)),
+                TermData::Ite(c, a, b) => stack.extend([(*c, false), (*a, false), (*b, false)]),
+                TermData::Let(bindings, body) => {
+                    stack.extend(bindings.iter().map(|(_, value)| (*value, false)));
+                    let binds = bindings.iter().any(|(bound, _)| bound == name);
+                    stack.push((*body, binds));
+                }
+                TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                    let binds = vars.iter().any(|(bound, _)| bound == name);
+                    stack.push((*body, binds));
+                    stack.extend(triggers.iter().flatten().map(|&t| (t, binds)));
+                }
+                _ => {}
+            }
+        }
+        false
     }
 }

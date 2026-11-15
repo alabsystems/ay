@@ -68,6 +68,7 @@ struct DtLazyAttemptState {
     uflia_repair_conflict_tables: Vec<String>,
     last_degrade_was_datatype_array: bool,
     nested_array_row_reduction_unsat: bool,
+    nested_array_free_justification_unsat: bool,
     uflia_congruence_lane: bool,
     uflia_congruence_gate_rejected: bool,
     qfax_retry_done: bool,
@@ -81,6 +82,7 @@ struct DtLazyAttemptState {
     original_problem_had_quantifiers: bool,
     in_nested_array_residue_probe: bool,
     residue_probe_failures: u32,
+    array_uf_abstraction_failures: u32,
     mod_div_or_branch_rescue_depth: u8,
 }
 
@@ -116,6 +118,7 @@ impl DtLazyAttemptState {
             uflia_repair_conflict_tables: executor.uflia_repair_conflict_tables.clone(),
             last_degrade_was_datatype_array: executor.last_degrade_was_datatype_array,
             nested_array_row_reduction_unsat: executor.nested_array_row_reduction_unsat,
+            nested_array_free_justification_unsat: executor.nested_array_free_justification_unsat,
             uflia_congruence_lane: executor.uflia_congruence_lane,
             uflia_congruence_gate_rejected: executor.uflia_congruence_gate_rejected,
             qfax_retry_done: executor.qfax_retry_done,
@@ -129,6 +132,7 @@ impl DtLazyAttemptState {
             original_problem_had_quantifiers: executor.original_problem_had_quantifiers,
             in_nested_array_residue_probe: executor.in_nested_array_residue_probe,
             residue_probe_failures: executor.residue_probe_failures,
+            array_uf_abstraction_failures: executor.array_uf_abstraction_failures,
             mod_div_or_branch_rescue_depth: executor.mod_div_or_branch_rescue_depth,
         }
     }
@@ -163,6 +167,7 @@ impl DtLazyAttemptState {
         executor.uflia_repair_conflict_tables = self.uflia_repair_conflict_tables;
         executor.last_degrade_was_datatype_array = self.last_degrade_was_datatype_array;
         executor.nested_array_row_reduction_unsat = self.nested_array_row_reduction_unsat;
+        executor.nested_array_free_justification_unsat = self.nested_array_free_justification_unsat;
         executor.uflia_congruence_lane = self.uflia_congruence_lane;
         executor.uflia_congruence_gate_rejected = self.uflia_congruence_gate_rejected;
         executor.qfax_retry_done = self.qfax_retry_done;
@@ -176,6 +181,7 @@ impl DtLazyAttemptState {
         executor.original_problem_had_quantifiers = self.original_problem_had_quantifiers;
         executor.in_nested_array_residue_probe = self.in_nested_array_residue_probe;
         executor.residue_probe_failures = self.residue_probe_failures;
+        executor.array_uf_abstraction_failures = self.array_uf_abstraction_failures;
         executor.mod_div_or_branch_rescue_depth = self.mod_div_or_branch_rescue_depth;
         self.array_ext_witness_cache
     }

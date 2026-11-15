@@ -32,7 +32,7 @@
 //! inconclusive claims remain explicitly unverified.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::types::{PbConstraint, PbInstance, PbObjective, PbRel};
 
@@ -45,7 +45,8 @@ pub use report::{UnverifiedReason, VerificationFailure, VerificationVerdict, Ver
 pub enum Z3Mode {
     /// Never invoke z3 (model + objective checks only).
     Off,
-    /// Invoke z3 if it is available on `PATH`.
+    /// Invoke z3 if one resolves: `Z3_PATH`, else the first z3 on `PATH` that
+    /// proves it is z3 (`ay_sys::z3_oracle`), run by its path.
     ///
     /// An unavailable or inconclusive checker leaves an optimum claim
     /// unverified; it never produces a fully verified report.
@@ -78,7 +79,7 @@ pub struct SolverOutput {
 pub enum OptimalityCheck {
     /// The status was not `OPTIMUM FOUND`, so optimality was not checked.
     NotApplicable,
-    /// z3 was not run (mode `Off`, or `Auto` with z3 absent). Carries the reason.
+    /// z3 was not run (mode `Off`, or no z3 resolved). Carries the reason.
     Skipped(String),
     /// z3 proved no feasible assignment beats the claimed optimum (`unsat`).
     Confirmed,
@@ -150,13 +151,22 @@ pub fn verify(
     z3: Z3Mode,
     z3_timeout_secs: u64,
 ) -> VerifyReport {
-    report::verify_with_checker(
+    let report = report::verify_with_checker(
         instance,
         output,
         z3,
         z3_timeout_secs,
         run_z3_optimality_check,
-    )
+    );
+    // A confirmation only ever comes from a completed run of the resolved
+    // oracle, so name it; refutations and inconclusive runs carry it in their
+    // detail.
+    match (report.optimality(), ay_sys::z3_oracle::z3_oracle()) {
+        (OptimalityCheck::Confirmed, Ok(oracle)) => {
+            report.with_message(format!("optimality checker: {}", oracle.identity()))
+        }
+        _ => report,
+    }
 }
 
 /// Ask z3 whether any feasible assignment has objective <= `claimed - 1`.
@@ -174,17 +184,20 @@ fn run_z3_optimality_check(
         );
     };
     match run_z3(&smt, timeout_secs) {
-        Ok(Z3Result::Unsat) => OptimalityCheck::Confirmed,
-        Ok(Z3Result::Sat) => OptimalityCheck::Refuted(format!(
-            "z3 found a feasible assignment strictly better than the claimed optimum {claimed}"
+        Ok((Z3Result::Unsat, _)) => OptimalityCheck::Confirmed,
+        Ok((Z3Result::Sat, oracle)) => OptimalityCheck::Refuted(format!(
+            "z3 found a feasible assignment strictly better than the claimed optimum {claimed} \
+             (oracle: {})",
+            oracle.identity()
         )),
-        Ok(Z3Result::Unknown) => {
-            OptimalityCheck::Inconclusive(format!("z3 returned unknown within {timeout_secs}s"))
-        }
+        Ok((Z3Result::Unknown, oracle)) => OptimalityCheck::Inconclusive(format!(
+            "z3 returned unknown within {timeout_secs}s (oracle: {})",
+            oracle.identity()
+        )),
         Err(e) => match e {
-            Z3Error::NotFound => OptimalityCheck::Skipped(
-                "z3 not found on PATH (install z3 to enable this check)".to_string(),
-            ),
+            Z3Error::Unavailable(reason) => OptimalityCheck::Skipped(format!(
+                "no usable z3 ({reason}); install z3 or set Z3_PATH to enable this check"
+            )),
             Z3Error::Io(msg) => {
                 OptimalityCheck::Inconclusive(format!("z3 invocation failed: {msg}"))
             }
@@ -202,31 +215,44 @@ enum Z3Result {
 }
 
 enum Z3Error {
-    NotFound,
+    Unavailable(String),
     Io(String),
     UnsuccessfulExit(String),
 }
 
-fn run_z3(smt2: &str, timeout_secs: u64) -> Result<Z3Result, Z3Error> {
-    let mut child = Command::new("z3")
+/// Run the resolved z3 oracle (never `z3` by name: a name can reach a stub or
+/// an impostor, and a `sat`/`unsat` line from either would decide the check).
+fn run_z3(
+    smt2: &str,
+    timeout_secs: u64,
+) -> Result<(Z3Result, &'static ay_sys::z3_oracle::Z3Oracle), Z3Error> {
+    let oracle = ay_sys::z3_oracle::z3_oracle()
+        .map_err(|reason| Z3Error::Unavailable(reason.to_string()))?;
+    let identity = || oracle.identity();
+    let mut child = oracle
+        .command()
         .arg(format!("-T:{timeout_secs}"))
         .arg("-in")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Z3Error::NotFound
-            } else {
-                Z3Error::Io(e.to_string())
-            }
-        })?;
+        .map_err(|e| Z3Error::Io(format!("{e} (oracle: {})", identity())))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(smt2.as_bytes())
-            .map_err(|e| Z3Error::Io(e.to_string()))?;
+    // A z3 that exits before reading the whole query costs the check (it is
+    // inconclusive), never the verifier: this binary runs with SIGPIPE at its
+    // default (terminate) disposition, so the query goes through
+    // `ChildPipeWriter`, which reports the dead reader as `EPIPE`. The writer
+    // drops (EOF) as soon as the query is written.
+    let written = ay_sys::child_pipe::ChildPipeWriter::take_from(&mut child)
+        .and_then(|mut stdin| stdin.write_all(smt2.as_bytes()));
+    if let Err(e) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Z3Error::Io(format!(
+            "writing the query to z3 failed: {e} (oracle: {})",
+            identity()
+        )));
     }
     let out = child
         .wait_with_output()
@@ -236,18 +262,21 @@ fn run_z3(smt2: &str, timeout_secs: u64) -> Result<Z3Result, Z3Error> {
             || "terminated by signal".to_string(),
             |code| format!("exit status {code}"),
         );
-        return Err(Z3Error::UnsuccessfulExit(detail));
+        return Err(Z3Error::UnsuccessfulExit(format!(
+            "{detail} (oracle: {})",
+            identity()
+        )));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         match line.trim() {
-            "unsat" => return Ok(Z3Result::Unsat),
-            "sat" => return Ok(Z3Result::Sat),
-            "unknown" => return Ok(Z3Result::Unknown),
+            "unsat" => return Ok((Z3Result::Unsat, oracle)),
+            "sat" => return Ok((Z3Result::Sat, oracle)),
+            "unknown" => return Ok((Z3Result::Unknown, oracle)),
             _ => {}
         }
     }
-    Ok(Z3Result::Unknown)
+    Ok((Z3Result::Unknown, oracle))
 }
 
 /// Build an SMT-LIB2 query that is satisfiable iff some feasible assignment has
@@ -372,3 +401,6 @@ fn int_smt(v: i128) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod child_pipe_tests;

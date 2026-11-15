@@ -1,0 +1,28 @@
+; Authored complete occurrence-tree conjunction, NOT an AY-renderer capture or
+; a MODEL_CHECKER_CONSUMER export. False-query twin: independently filled vectors cannot agree.
+; Expected: unsat. No finite-instance approximation replaces a full premise.
+(set-logic ALL)
+(declare-datatype Vec ((mkVec
+  (ptr (_ BitVec 64)) (len (_ BitVec 64)) (cap (_ BitVec 64))
+  (data (Array (_ BitVec 64) (_ BitVec 8))))))
+(declare-const v0 Vec)
+(declare-const f0 (_ BitVec 8))
+(declare-const v1 Vec)
+(declare-const f1 (_ BitVec 8))
+(declare-const a Vec)
+(declare-const b Vec)
+(assert (= v0 (mkVec (_ bv0 64) (_ bv65 64) (_ bv65 64)
+  ((as const (Array (_ BitVec 64) (_ BitVec 8))) f0))))
+(assert (forall ((i (_ BitVec 64)))
+  (=> (bvult i (len v0)) (= (select (data v0) i) f0))))
+(assert (= v1 (mkVec (_ bv0 64) (_ bv65 64) (_ bv65 64)
+  ((as const (Array (_ BitVec 64) (_ BitVec 8))) f1))))
+(assert (forall ((i (_ BitVec 64)))
+  (=> (bvult i (len v1)) (= (select (data v1) i) f1))))
+(assert (= a v0))
+(assert (= (_ bv7 8) f0))
+(assert (= b v1))
+(assert (= (_ bv9 8) f1))
+(assert (and (bvult (_ bv64 64) (len a)) (bvult (_ bv64 64) (len b))
+  (= (select (data a) (_ bv64 64)) (select (data b) (_ bv64 64)))))
+(check-sat)

@@ -11,7 +11,8 @@ use ay_core::kani_compat::DetHashMap as FxHashMap;
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcSort, ChcVar, SmtValue};
 
-use super::solver::TpaSolver;
+use super::solver::{ConcretePath, TpaSolver};
+use crate::ground_derivation::linear_trace::{ts_locals_with_suffix, ts_state_at};
 
 impl TpaSolver {
     /// Refine target state from model - extracts concrete values at time 2.
@@ -38,48 +39,119 @@ impl TpaSolver {
         extract_state_from_model(model, ts, 1, 0)
     }
 
-    /// Extract counterexample trace from SAT model.
-    ///
-    /// Attempts to extract variable assignments at time steps 0, 1, and 2.
-    /// Only states with values present in the model are included.
-    ///
-    /// For TPA queries, the trace structure depends on the query type:
-    /// - Immediate counterexample (init ∧ query): only time 0 present
-    /// - Power query: times 0, 1, 2 present (each step = 2^power transitions)
-    ///
-    /// The returned trace contains concrete variable assignments at each step boundary.
-    pub(super) fn extract_trace_from_model(
+    /// Concrete segment of a power-0 exact query model,
+    /// `from(0) ∧ T(0→1) ∧ T'(1→2) ∧ to(2)`: three states and both
+    /// transitions' locals (`T` = `transition_at(0)`, locals `…__t0`; `T'` its
+    /// shifted, freshened copy, locals `…__t0_f{tag}`).
+    pub(super) fn exact_base_path(
         &self,
         model: &FxHashMap<String, SmtValue>,
         ts: &TransitionSystem,
-    ) -> Vec<FxHashMap<String, SmtValue>> {
-        let mut trace = Vec::new();
-
-        // Extract states at times 0, 1, and 2 from the model
-        for time in 0..=2 {
-            let mut state = FxHashMap::default();
-
-            for var in ts.state_vars() {
-                // Variables are named: base (time 0), base_1 (time 1), base_2 (time 2)
-                let var_name = if time == 0 {
-                    var.name.clone()
-                } else {
-                    format!("{}_{}", var.name, time)
-                };
-
-                if let Some(value) = model.get(&var_name) {
-                    // Store with the base variable name (without time suffix)
-                    state.insert(var.name.clone(), value.clone());
-                }
-            }
-
-            if !state.is_empty() {
-                trace.push(state);
-            }
+    ) -> ConcretePath {
+        ConcretePath {
+            states: (0..=2).map(|step| ts_state_at(ts, model, step)).collect(),
+            transition_locals: vec![
+                ts_locals_with_suffix(model, "__t0"),
+                freshened_ts_locals(model, "__t0"),
+            ],
+            endpoint_locals: endpoint_locals(model),
         }
-
-        trace
     }
+
+    /// Concrete segment of a power-0 less-than query model whose DIRECT
+    /// disjunct held: `from(0) ∧ id(0→2) ∧ to(2)`, zero transitions.
+    pub(super) fn identity_base_path(
+        &self,
+        model: &FxHashMap<String, SmtValue>,
+        ts: &TransitionSystem,
+    ) -> ConcretePath {
+        ConcretePath {
+            states: vec![merge_states(
+                ts_state_at(ts, model, 0),
+                ts_state_at(ts, model, 2),
+            )],
+            transition_locals: Vec::new(),
+            endpoint_locals: endpoint_locals(model),
+        }
+    }
+
+    /// Concrete segment of a power-0 less-than query model whose COMPOSED
+    /// disjunct held: `from(0) ∧ id(0→1) ∧ T'(1→2) ∧ to(2)`, one transition.
+    pub(super) fn composed_base_path(
+        &self,
+        model: &FxHashMap<String, SmtValue>,
+        ts: &TransitionSystem,
+    ) -> ConcretePath {
+        ConcretePath {
+            states: vec![
+                merge_states(ts_state_at(ts, model, 0), ts_state_at(ts, model, 1)),
+                ts_state_at(ts, model, 2),
+            ],
+            transition_locals: vec![freshened_ts_locals(model, "__t0")],
+            endpoint_locals: endpoint_locals(model),
+        }
+    }
+
+    /// Concrete state of an `init ∧ query` model (the depth-0 counterexample).
+    pub(super) fn trivial_path(
+        &self,
+        model: &FxHashMap<String, SmtValue>,
+        ts: &TransitionSystem,
+    ) -> ConcretePath {
+        ConcretePath {
+            states: vec![ts_state_at(ts, model, 0)],
+            transition_locals: Vec::new(),
+            endpoint_locals: endpoint_locals(model),
+        }
+    }
+}
+
+/// Model entries under their own (unversioned) names, for the init and query
+/// locals of a path's endpoints. Freshened copies (`…_f{tag}`) are left out:
+/// every composed transition mints new ones, so they would only grow the map.
+fn endpoint_locals(model: &FxHashMap<String, SmtValue>) -> FxHashMap<String, SmtValue> {
+    model
+        .iter()
+        .filter(|(name, _)| {
+            !name
+                .rsplit_once("_f")
+                .is_some_and(|(_, tag)| !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// Two readings of one state (identity-linked time copies): each value from
+/// whichever reading has it.
+fn merge_states(
+    mut primary: Vec<Option<SmtValue>>,
+    secondary: Vec<Option<SmtValue>>,
+) -> Vec<Option<SmtValue>> {
+    for (value, other) in primary.iter_mut().zip(secondary) {
+        if value.is_none() {
+            *value = other;
+        }
+    }
+    primary
+}
+
+/// Locals of a shifted, freshened transition copy: model names
+/// `{local}{step_suffix}_f{tag}`, returned under `{local}`.
+fn freshened_ts_locals(
+    model: &FxHashMap<String, SmtValue>,
+    step_suffix: &str,
+) -> FxHashMap<String, SmtValue> {
+    model
+        .iter()
+        .filter_map(|(name, value)| {
+            let (head, tag) = name.rsplit_once("_f")?;
+            if tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let base = head.strip_suffix(step_suffix)?;
+            (!base.is_empty()).then(|| (base.to_string(), value.clone()))
+        })
+        .collect()
 }
 
 /// Extract state variable values from an SMT model at the given `from_time`,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::smt::executor_adapter::{
     collect_uninterpreted_function_declarations_for_exprs, emit_declare_uninterpreted_function,
+    sort_to_smtlib,
 };
 use crate::{ChcError, ChcExpr, ChcOp, ChcProblem, ChcResult, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
@@ -264,7 +265,11 @@ impl InvariantModel {
                 if i > 0 {
                     output.push(' ');
                 }
-                output.push_str(&format!("({} {})", quote_symbol(&var.name), var.sort));
+                output.push_str(&format!(
+                    "({} {})",
+                    quote_symbol(&var.name),
+                    sort_to_smtlib(&var.sort)
+                ));
             }
 
             // Sanitize: output only the formula with declared parameters (#5246)
@@ -313,7 +318,12 @@ impl InvariantModel {
                 if i > 0 {
                     out.push(' ');
                 }
-                let _ = write!(out, "({} {})", quote_symbol(&var.name), var.sort);
+                let _ = write!(
+                    out,
+                    "({} {})",
+                    quote_symbol(&var.name),
+                    sort_to_smtlib(&var.sort)
+                );
             }
             let formula = Self::sanitize_formula_for_output(&interp.vars, &interp.formula);
             let _ = write!(out, ") Bool\n  ");
@@ -505,6 +515,7 @@ impl InvariantModel {
         // nullary macro expansion.  It also gives the proof renderer an empty
         // declaration namespace for the private guard emitted below.
         if !is_constant_false {
+            out.push_str(&self.replay_datatype_declarations(clause, violation)?);
             let declarations = collect_uninterpreted_function_declarations_for_exprs(
                 std::iter::once(violation)
                     .chain(self.interpretations.values().map(|interp| &interp.formula)),
@@ -536,7 +547,7 @@ impl InvariantModel {
                     out,
                     "(declare-const {} {})",
                     quote_symbol(&var.name),
-                    var.sort
+                    sort_to_smtlib(&var.sort)
                 );
             }
             let _ = writeln!(out, "(assert {})", Self::expr_to_smtlib(violation));
@@ -576,7 +587,11 @@ impl InvariantModel {
                 if i > 0 {
                     output.push(' ');
                 }
-                output.push_str(&format!("({} {})", quote_symbol(&var.name), var.sort));
+                output.push_str(&format!(
+                    "({} {})",
+                    quote_symbol(&var.name),
+                    sort_to_smtlib(&var.sort)
+                ));
             }
 
             // Sanitize: output only the formula with declared parameters (#5246)
@@ -764,11 +779,20 @@ impl InvariantModel {
                 let args_str: Vec<_> = args.iter().map(|a| Self::expr_to_smtlib(a)).collect();
                 format!("({} {})", op_str, args_str.join(" "))
             }
+            ChcExpr::ArrayLambda(lambda) => {
+                let values: Vec<_> = lambda
+                    .captures()
+                    .iter()
+                    .map(|value| Self::expr_to_smtlib(value))
+                    .collect();
+                lambda.render(&values, &Self::expr_to_smtlib(lambda.body()))
+            }
             ChcExpr::ConstArrayMarker(_) => "(as const)".to_string(),
             ChcExpr::IsTesterMarker(name) => format!("(_ is {})", quote_symbol(name)),
             ChcExpr::ConstArray(key_sort, val) => {
                 let val_str = Self::expr_to_smtlib(val);
-                let val_sort = val.sort();
+                let key_sort = sort_to_smtlib(key_sort);
+                let val_sort = sort_to_smtlib(&val.sort());
                 format!("((as const (Array {key_sort} {val_sort})) {val_str})")
             }
         })
@@ -796,6 +820,11 @@ impl InvariantModel {
     }
 }
 
+mod replay_datatypes;
+
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod const_array_tests;

@@ -223,7 +223,7 @@ impl LiaSolver<'_> {
         // stays small and the common case settles in one extra check.
         let mut conflict_vars: HashSet<TermId> = HashSet::default();
         for lit in literals {
-            collect_atom_vars_impl(self.terms, lit.term, &mut conflict_vars);
+            collect_atom_vars_impl(self.terms(), lit.term, &mut conflict_vars);
         }
         let touches = |i: usize| -> bool {
             let (lhs, rhs, _) = &self.shared_equalities[i];
@@ -707,7 +707,7 @@ impl LiaSolver<'_> {
     /// (congruence-refined) problem is UNSAT, so any subset the probe proves
     /// sufficient is genuinely sufficient.
     fn build_conflict_probe(&self, literals: &[TheoryLit], prefix: &[usize]) -> Self {
-        let mut probe = LiaSolver::new(self.terms);
+        let mut probe = LiaSolver::new(self.terms());
         probe.conflict_probe = true;
         probe.deadline = self.deadline;
         probe.set_combined_theory_mode(self.combined_theory_mode());
@@ -969,7 +969,7 @@ impl LiaSolver<'_> {
             // converges (#7956).
             self.reachable_vars_buf.clear();
             for lit in &literals {
-                collect_atom_vars_impl(self.terms, lit.term, &mut self.reachable_vars_buf);
+                collect_atom_vars_impl(self.terms(), lit.term, &mut self.reachable_vars_buf);
             }
             let mut changed = true;
             while changed {
@@ -1054,7 +1054,7 @@ impl LiaSolver<'_> {
             // Use free function for split-borrow compatibility.
             self.conflict_vars_buf.clear();
             for lit in &literals {
-                collect_atom_vars_impl(self.terms, lit.term, &mut self.conflict_vars_buf);
+                collect_atom_vars_impl(self.terms(), lit.term, &mut self.conflict_vars_buf);
             }
             let dioph_relevant = self
                 .conflict_vars_buf
@@ -1362,6 +1362,11 @@ fn prescreen_batch_verdict_record(r: &TheoryResult) {
 /// check-sat) never seeds the first conflicts of a new detour. Also clears
 /// the #probe-prefix-bisect fail streak: evidence gathered under a previous
 /// attempt's trajectory should not pre-switch the new one.
+///
+/// The executor also resets at every external decision query, so a query on a
+/// thread that served others before it starts from the same state, and around
+/// a same-context probe (with [`save_probe_state`] / [`restore_probe_state`]),
+/// so a probe neither inherits nor leaves the enclosing solve's state.
 pub fn reset_probe_subset_hint() {
     PROBE_SUBSET_HINT.with(|hint| hint.borrow_mut().clear());
     PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
@@ -1378,7 +1383,7 @@ pub fn reset_probe_subset_hint() {
 /// stale hint is verified by an actual probe check before use — but the
 /// streak/total feed the scan-vs-bisect strategy switch, so leaking a
 /// failed extension's counters would re-route the resume's trajectory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeStateSnapshot {
     hint: Vec<(TermId, TermId)>,
     scan_fail_streak: u32,
@@ -1401,6 +1406,23 @@ pub fn restore_probe_state(snapshot: ProbeStateSnapshot) {
     PROBE_SUBSET_HINT.with(|hint| *hint.borrow_mut() = snapshot.hint);
     PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(snapshot.scan_fail_streak));
     PROBE_SCAN_BIG_FAIL_TOTAL.with(|total| total.set(snapshot.scan_big_fail_total));
+}
+
+/// A probe trajectory state built from its parts, for tests of the callers
+/// that reset, save and restore it (install it with [`restore_probe_state`]).
+/// Not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn probe_state_for_tests(
+    hint: Vec<(TermId, TermId)>,
+    scan_fail_streak: u32,
+    scan_big_fail_total: u64,
+) -> ProbeStateSnapshot {
+    ProbeStateSnapshot {
+        hint,
+        scan_fail_streak,
+        scan_big_fail_total,
+    }
 }
 
 /// Probe observability (#uflia-probe-stats): process-global counters for
@@ -1520,6 +1542,13 @@ fn probe_scan_big_fail_record(order_len: usize) {
 /// Extract variable TermIds from an atom (comparison or equality).
 /// Free function to allow split-borrow patterns (#8599).
 pub(crate) fn collect_atom_vars_impl(terms: &TermStore, atom: TermId, vars: &mut HashSet<TermId>) {
+    // A sentinel "literal" names no term: it is the placeholder reason of an
+    // axiom / hypothesis bound (Gomory cut, factor-split pin, patch
+    // verification pin) that a reason collector let through. It contributes
+    // no variable, and indexing the store with it is out of bounds.
+    if atom.is_sentinel() {
+        return;
+    }
     match terms.get(atom) {
         TermData::App(Symbol::Named(name), args) => match name.as_str() {
             "<=" | ">=" | "<" | ">" | "=" | "distinct" => {
@@ -1595,7 +1624,17 @@ impl LiaSolver<'_> {
         }
 
         // Cached models are only valid for the current asserted set.
-        self.direct_enum_witness = None;
+        // #lia-dive-repair: keep a stored witness (dive/enumeration
+        // lane) for exact re-validation below instead of dropping
+        // it here — the executor's final check re-asks `check()`
+        // right after the giveup lane stored one, and clearing it
+        // unconditionally discarded exactly the model the lane
+        // verified (convert-1546: lane success followed by
+        // NeedModelEqualities and an overall `unknown`). Mutators
+        // (assert_literal/push/pop/reset) already clear it; the
+        // re-validation below is the same exact gate as at
+        // storage time, so a stale witness can only decline.
+        let cached_witness = self.direct_enum_witness.take();
 
         // #8124: If assert_shared_equality detected an impossible constant
         // equality, report it immediately.
@@ -1653,6 +1692,20 @@ impl LiaSolver<'_> {
         // contradiction, detected incrementally at assert time (#C3).
         if let Some(&(_, lit)) = self.const_bool_conflicts.first() {
             return TheoryResult::Unsat(vec![lit]);
+        }
+
+        // #lia-dive-repair: a stored witness that still satisfies
+        // every asserted literal and shared equality under exact
+        // re-evaluation decides Sat directly (restored so
+        // `extract_model` reports it). Placed after the cheap
+        // conflict detectors above so their verdicts keep
+        // precedence in shape, though a fully verified witness
+        // and a genuine conflict cannot coexist.
+        if let Some(model) = cached_witness {
+            if self.stored_witness_still_valid(&model) {
+                self.direct_enum_witness = Some(model);
+                return TheoryResult::Sat;
+            }
         }
 
         if let Some(conflict) = self.check_affine_disequality_implication(debug) {
@@ -1761,14 +1814,10 @@ impl LiaSolver<'_> {
         // neither the should_run_dioph re-solve nor the tightening loop below can
         // observe substitutions/reasons from a popped scope (#3736). When the set
         // is unchanged the caches stay valid and are reused as-is (the win).
+        // D2: the caches are also keyed on the bounds folded into them; see
+        // `dioph_cache`.
         if self.dioph_needs_revalidation {
-            if equality_key_changed {
-                self.dioph_safe_dependent_vars.clear();
-                self.dioph_cached_substitutions.clear();
-                self.dioph_cached_modular_gcds.clear();
-                self.dioph_cached_reasons.clear();
-            }
-            self.dioph_needs_revalidation = false;
+            self.revalidate_dioph_caches(equality_key_changed);
         }
         // #8144: Re-enable Dioph when shared equalities are active.
         // fold_fixed_vars_in_equation now returns fold_reasons (Vec<TheoryLit>)
@@ -1795,10 +1844,7 @@ impl LiaSolver<'_> {
             should_run_dioph = false;
         }
         if !has_equalities {
-            self.dioph_safe_dependent_vars.clear();
-            self.dioph_cached_substitutions.clear();
-            self.dioph_cached_modular_gcds.clear();
-            self.dioph_cached_reasons.clear();
+            self.clear_dioph_equality_caches();
             self.dioph_modified_bounds = false;
             self.dioph_bound_term_ids.clear();
         }
@@ -1841,12 +1887,17 @@ impl LiaSolver<'_> {
         // visible instead of falling through to model-equality splitting.
         {
             let max_tighten_rounds = 4;
-            let mut prev_fixed_count = self.count_fixed_integer_vars();
+            // Computed lazily on the first round that actually runs: with
+            // no cached substitutions the loop breaks immediately, and the
+            // full integer-var scan would be pure overhead per check.
+            let mut prev_fixed_count: Option<usize> = None;
 
             for tighten_round in 0..max_tighten_rounds {
                 if self.dioph_cached_substitutions.is_empty() {
                     break;
                 }
+                let prev_count =
+                    *prev_fixed_count.get_or_insert_with(|| self.count_fixed_integer_vars());
                 instrument::bump(&instrument::DIOPH_TIGHTEN_ROUNDS);
 
                 let bounds_tightened = self.timed_propagate_bounds_through_substitutions();
@@ -1868,7 +1919,7 @@ impl LiaSolver<'_> {
                 }
 
                 let new_fixed_count = self.count_fixed_integer_vars();
-                if new_fixed_count <= prev_fixed_count {
+                if new_fixed_count <= prev_count {
                     break;
                 }
 
@@ -1876,12 +1927,12 @@ impl LiaSolver<'_> {
                     safe_eprintln!(
                         "[LIA] Dioph tighten round {}: {} newly fixed vars (was {}, now {})",
                         tighten_round,
-                        new_fixed_count - prev_fixed_count,
-                        prev_fixed_count,
+                        new_fixed_count - prev_count,
+                        prev_count,
                         new_fixed_count
                     );
                 }
-                prev_fixed_count = new_fixed_count;
+                prev_fixed_count = Some(new_fixed_count);
 
                 if self.should_timeout() {
                     if debug {
@@ -1908,6 +1959,8 @@ impl LiaSolver<'_> {
         self.gomory_iterations = 0;
         self.hnf_iterations = 0;
         let mut cube_tried = false;
+        // Lattice closure before an unbounded split, once per check (lattice_refute_bridge).
+        let mut lattice_tried = false;
 
         loop {
             if self.should_timeout() {
@@ -2069,6 +2122,9 @@ impl LiaSolver<'_> {
                     }
 
                     if let Some(split) = self.find_unsplit_integer_var() {
+                        if let Some(unsat) = self.lattice_once(&mut lattice_tried, split.variable) {
+                            return unsat;
+                        }
                         if debug {
                             safe_eprintln!(
                                 "[LIA] LRA returned Unknown, splitting unsplit var {:?} at midpoint {}",
@@ -2095,6 +2151,11 @@ impl LiaSolver<'_> {
                             safe_eprintln!("[LIA] Disequality conflicts with modular constraint");
                         }
                         return TheoryResult::Unsat(reasons);
+                    }
+                    if let Some((var, _)) = self.check_integer_constraints() {
+                        if let Some(unsat) = self.lattice_once(&mut lattice_tried, var) {
+                            return unsat;
+                        }
                     }
                     return TheoryResult::NeedDisequalitySplit(split);
                 }
@@ -2153,6 +2214,9 @@ impl LiaSolver<'_> {
                     }
 
                     if let Some((var, value)) = self.check_integer_constraints() {
+                        if let Some(unsat) = self.lattice_once(&mut lattice_tried, var) {
+                            return unsat;
+                        }
                         if let Some(conflict) = self.gcd_test_tableau() {
                             if debug {
                                 safe_eprintln!("[LIA] Tableau GCD test detected UNSAT");
@@ -2167,21 +2231,13 @@ impl LiaSolver<'_> {
                             continue;
                         }
 
-                        if !cube_tried {
-                            cube_tried = true;
-                            instrument::bump(&instrument::CUBE_TESTS);
-                            // The cube test shrinks bounds on any subset of the
-                            // integer vars (and pops them on failure) —
-                            // conservatively rescan everything (#C4).
-                            self.mark_int_bounds_all_dirty();
-                            if self.lra.try_cube_test(&self.integer_vars) {
-                                if debug {
-                                    safe_eprintln!("[LIA] Cube test succeeded, re-checking");
-                                }
-                                continue;
-                            }
-                        }
-
+                        // Gomory runs BEFORE the cube test:
+                        // `should_try_gomory` blocks cuts once the cube
+                        // test has been attempted (#3073), so with the cube
+                        // block first this gate was unreachable in the Sat
+                        // path and `gomory_iterations` stayed 0 (the
+                        // v20_problem__019 split walk then drifted to the
+                        // oscillation guard instead of cutting).
                         if self.should_try_gomory(cube_tried) {
                             let cuts = self.timed_generate_gomory_cuts();
 
@@ -2272,6 +2328,20 @@ impl LiaSolver<'_> {
                                 continue;
                             }
                         }
+                        if !cube_tried {
+                            cube_tried = true;
+                            instrument::bump(&instrument::CUBE_TESTS);
+                            // The cube test shrinks bounds on any subset of the
+                            // integer vars (and pops them on failure) —
+                            // conservatively rescan everything (#C4).
+                            self.mark_int_bounds_all_dirty();
+                            if self.lra.try_cube_test(&self.integer_vars) {
+                                if debug {
+                                    safe_eprintln!("[LIA] Cube test succeeded, re-checking");
+                                }
+                                continue;
+                            }
+                        }
 
                         let num_equalities = self.count_equalities();
                         let num_vars = self.integer_vars.len();
@@ -2356,6 +2426,9 @@ impl LiaSolver<'_> {
                     // over model equalities to prevent accepting fractional
                     // models.
                     if let Some((var, value)) = self.check_integer_constraints() {
+                        if let Some(unsat) = self.lattice_once(&mut lattice_tried, var) {
+                            return unsat;
+                        }
                         if debug {
                             safe_eprintln!(
                                 "[LIA] NeedModelEquality deferred: integer var {:?} has non-integer value, splitting",
@@ -2371,6 +2444,9 @@ impl LiaSolver<'_> {
                 TheoryResult::NeedModelEqualities(reqs) => {
                     // #7884: Same integrality guard as NeedModelEquality above.
                     if let Some((var, value)) = self.check_integer_constraints() {
+                        if let Some(unsat) = self.lattice_once(&mut lattice_tried, var) {
+                            return unsat;
+                        }
                         if debug {
                             safe_eprintln!(
                                 "[LIA] NeedModelEqualities deferred: integer var {:?} has non-integer value, splitting",
@@ -2445,38 +2521,25 @@ impl LiaSolver<'_> {
         // modular/congruence infeasibility is caught early instead of waiting
         // for the full `check()` — this is decisive for cascade-style
         // benchmarks (#8733) that otherwise spend most of their budget in
-        // propagation before the final check.
-        // #C5: served from the incrementally maintained assertion view —
-        // no per-BCP O(asserted) re-scan + sort.
-        let (equality_key_empty, needs_bcp_dioph) = {
-            let equality_key = self.equality_key();
-            (
-                equality_key.is_empty(),
-                !equality_key.is_empty() && self.dioph_equality_key != equality_key,
-            )
-        };
+        // propagation before the final check. It is ALSO re-checked periodically
+        // under an UNCHANGED equality set, because its feasibility half reads
+        // bounds the search moves; policy and run live in `dioph_bcp`.
+        let (equality_key_empty, needs_bcp_dioph) = self.bcp_dioph_arm();
 
         // #C8: re-validate the equality-derived caches after a pop/soft_reset.
         // When the equality set changed, drop them before the modular checks
         // (which iterate dioph_cached_substitutions, modular.rs:189) can reuse a
         // popped scope's substitutions (#3736). An unchanged set keeps them.
+        // D2: the caches are also keyed on the bounds folded into them; see
+        // `dioph_cache`.
         if self.dioph_needs_revalidation {
-            if needs_bcp_dioph {
-                self.dioph_safe_dependent_vars.clear();
-                self.dioph_cached_substitutions.clear();
-                self.dioph_cached_modular_gcds.clear();
-                self.dioph_cached_reasons.clear();
-            }
-            self.dioph_needs_revalidation = false;
+            self.revalidate_dioph_caches(needs_bcp_dioph);
         }
 
         if equality_key_empty {
             self.dioph_equality_key.clear();
             self.dioph_needs_full_check = false;
-            self.dioph_safe_dependent_vars.clear();
-            self.dioph_cached_substitutions.clear();
-            self.dioph_cached_modular_gcds.clear();
-            self.dioph_cached_reasons.clear();
+            self.clear_dioph_equality_caches();
             self.dioph_modified_bounds = false;
             self.dioph_bound_term_ids.clear();
         }
@@ -2493,55 +2556,12 @@ impl LiaSolver<'_> {
         // follow-up checks even when it requests a split or model equality.
         if can_use_current_bounds {
             if needs_bcp_dioph {
-                // The cache invalidation MUST run unconditionally: stale Dioph
-                // substitutions under an outdated equality key are unsound for
-                // any downstream consumer.
-                self.dioph_equality_key.clear();
-                self.dioph_safe_dependent_vars.clear();
-                self.dioph_cached_substitutions.clear();
-                self.dioph_cached_modular_gcds.clear();
-                self.dioph_cached_reasons.clear();
-                self.dioph_modified_bounds = false;
-                self.dioph_bound_term_ids.clear();
-
-                // Search-phase deferral (#nip benchmark): the from-scratch
-                // BCP-time Dioph solve ran on EVERY equality-key change — on
-                // boundary-pattern problems that is every decision (~205ms
-                // each, ~100% of solve time). While in the eager SEARCH
-                // phase, skip only the expensive solve and leave
-                // dioph_needs_full_check sticky: needs_final_check_after_sat
-                // == true guarantees the post-SAT full check runs it before
-                // any SAT is accepted. Skipping conflict DETECTION mid-search
-                // only delays the conflict — it can never accept a wrong SAT.
-                const BCP_DIOPH_UNPRODUCTIVE_LIMIT: u32 = 4;
-                if self.in_search_phase
-                    && self.dioph_bcp_unproductive_streak >= BCP_DIOPH_UNPRODUCTIVE_LIMIT
-                {
-                    // Adaptive deferral: this search's BCP-time Dioph runs have
-                    // been consistently unproductive — stop paying the
-                    // from-scratch elimination per decision and let the
-                    // post-SAT final check (guaranteed by
-                    // needs_final_check_after_sat) cover completeness.
-                    // Productive searches (modular-cascade class, #8736) never
-                    // reach the limit and keep their early Dioph conflicts.
-                    self.dioph_needs_full_check = true;
-                } else {
-                    if let Some(reasons) = self.timed_try_diophantine_solve() {
-                        if debug {
-                            safe_eprintln!("[LIA] BCP-time Dioph solve detected UNSAT");
-                        }
-                        self.dioph_bcp_unproductive_streak = 0;
-                        return TheoryResult::Unsat(reasons);
+                match self.bcp_dioph_run(debug) {
+                    dioph_bcp::BcpDiophOutcome::Conflict(reasons) => {
+                        return TheoryResult::Unsat(reasons)
                     }
-                    self.dioph_bcp_unproductive_streak =
-                        self.dioph_bcp_unproductive_streak.saturating_add(1);
-
-                    // NOTE: nothing between the key comparison above and this
-                    // point mutates `asserted`, so the view's equality key is
-                    // unchanged and this clone equals the compared key (#C5).
-                    self.dioph_equality_key = self.equality_key().to_vec();
-                    self.dioph_needs_full_check = true;
-                    clear_bcp_dioph_after = true;
+                    dioph_bcp::BcpDiophOutcome::Deferred => {}
+                    dioph_bcp::BcpDiophOutcome::Ran => clear_bcp_dioph_after = true,
                 }
             }
 
@@ -2567,10 +2587,7 @@ impl LiaSolver<'_> {
             }
 
             if clear_bcp_dioph_after {
-                self.dioph_safe_dependent_vars.clear();
-                self.dioph_cached_substitutions.clear();
-                self.dioph_cached_modular_gcds.clear();
-                self.dioph_cached_reasons.clear();
+                self.clear_dioph_equality_caches();
                 self.dioph_modified_bounds = false;
                 self.dioph_bound_term_ids.clear();
             }

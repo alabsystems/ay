@@ -645,7 +645,8 @@ fn test_interpolation_stats_tracked() {
     let config = PdrConfig {
         use_interpolation: true,
         ..PdrConfig::default()
-    };
+    }
+    .with_spacer(crate::pdr::config::SpacerLane::OFF);
     let mut solver = PdrSolver::new(problem, config);
     let result = solver.solve();
     assert!(
@@ -702,7 +703,8 @@ fn test_interpolation_stats_tracks_conjunctive_a_unsat_skip() {
         PdrConfig {
             use_interpolation: true,
             ..PdrConfig::default()
-        },
+        }
+        .with_spacer(crate::pdr::config::SpacerLane::OFF),
     );
 
     let result = solver.solve();

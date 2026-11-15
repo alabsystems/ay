@@ -11,6 +11,8 @@ use super::derivation_evidence::{
     sealed_propagation_environment,
 };
 use super::*;
+
+mod retention;
 use crate::sat_proof_manager::{
     FragmentContextDerivation, FragmentInstanceDerivation, FragmentInstanceRootDerivation,
     FragmentPropagationEnvironment, FragmentSkolemDerivation,
@@ -379,6 +381,16 @@ fn build_fragment(
         .ok_or(CheckedSatRefutationError::MissingScopeAuthority)?;
     let clausification_proofs = executor.last_clausification_proofs.as_deref();
     let theory_proofs = executor.last_original_clause_theory_proofs.as_deref();
+    crate::executor::probe_cert_reject_raw(|| {
+        format!(
+            "c sat-variable-fragment owner=build_fragment query_epoch={:#x} trace_address={:p} map_address={:p} namespace=sat-global-zero-based solver_num_vars={:?} mapped_vars={}",
+            executor.query_authority_epoch.diagnostic_address(),
+            trace,
+            var_to_term,
+            trace.solver_num_vars(),
+            var_to_term.len(),
+        )
+    });
     // #dt-ground-conflict: registries for the pedigree-free DT lane, built
     // BEFORE the manager takes the mutable term-store borrow. `None` on
     // datatype-free problems — the lane is then skipped entirely.
@@ -426,7 +438,7 @@ fn authenticate_and_compose(
     authored: &AuthoredTerms,
     strict: &StrictContext,
     original_id_cone: Option<&HashSet<u64>>,
-) -> Result<(), CheckedSatRefutationError> {
+) -> Result<usize, CheckedSatRefutationError> {
     let authentication_bytes = strict_authentication_bytes(fragment.proof(), &mut replay.meter)?;
     replay
         .meter
@@ -489,46 +501,8 @@ fn authenticate_and_compose(
         &strict.selector_decls,
         &strict.member_signatures,
         &mut replay.meter,
-    )
-}
-
-fn finish_capability(
-    authority: SealedAuthority,
-    authored: AuthoredTerms,
-    replay: &mut ReplayValidation,
-) -> Result<CheckedSatRefutation, CheckedSatRefutationError> {
-    let boxed_root_bytes = checked_resource_mul(
-        authored.ordered_roots.len(),
-        size_of::<TermId>(),
-        ResolutionValidationResource::Bytes,
     )?;
-    replay
-        .meter
-        .charge(authored.ordered_roots.len(), boxed_root_bytes)?;
-    let ordered_authored_roots = authored.ordered_roots.into_boxed_slice();
-    let boxed_assumption_bytes = checked_resource_mul(
-        authored.ordered_assumptions.len(),
-        size_of::<TermId>(),
-        ResolutionValidationResource::Bytes,
-    )?;
-    replay
-        .meter
-        .charge(authored.ordered_assumptions.len(), boxed_assumption_bytes)?;
-    let ordered_assumptions = authored.ordered_assumptions.into_boxed_slice();
-    replay.meter.charge(0, 0)?;
-    let original_clause_count = checked_resource_add(
-        replay.validated.original_mappings().len(),
-        ordered_assumptions.len(),
-        ResolutionValidationResource::OriginalClauses,
-    )?;
-    Ok(CheckedSatRefutation {
-        query_epoch: authority.query_epoch,
-        source_context_stamp: authority.source_context_stamp,
-        ordered_authored_roots,
-        ordered_assumptions,
-        original_clause_count,
-        derived_step_count: replay.validated.dag().derived.len(),
-    })
+    Ok(authenticated.re_derived_premise_count())
 }
 
 pub(super) fn build(
@@ -566,7 +540,7 @@ pub(super) fn build(
         &mut replay.meter,
     )?;
     phase("fragment");
-    authenticate_and_compose(
+    let re_derived_premises = authenticate_and_compose(
         executor,
         &fragment,
         &mut replay,
@@ -574,5 +548,11 @@ pub(super) fn build(
         &strict,
         original_id_cone.as_ref(),
     )?;
-    finish_capability(authority, authored, &mut replay)
+    let mut checked =
+        retention::finish_capability(authority, authored, re_derived_premises, &mut replay)?;
+    // Optional presentation resumes the same meter after all mandatory verdict
+    // work. A refusal cannot destroy the already authenticated native verdict.
+    checked.native_proof =
+        retention::native_candidate(executor, fragment, &mut replay, &strict, &checked);
+    Ok(checked)
 }

@@ -24,13 +24,17 @@ use crate::literal::Literal;
 // We insert clauses of varying lengths and time the deletion.
 
 #[test]
-fn test_delete_clause_scales_with_clause_length() {
+fn test_delete_clause_scales_with_clause_length() -> Result<(), Box<dyn std::error::Error>> {
     // Insert two long clauses of the same length, delete one.
     // With O(k²) matching, doubling k should 4x the work.
     // We can't directly measure time, but we can verify correctness
     // and that the stats counters are consistent.
-    for k in [10, 50, 100, 200] {
-        let num_vars = k + 2;
+    for k in [10usize, 50, 100, 200] {
+        // Bound the clause length so the literal vectors below stay small.
+        if k > 1 << 16 {
+            return Err(format!("clause length {k} is out of range").into());
+        }
+        let num_vars = k.checked_add(2).ok_or("variable count overflows")?;
         let mut checker = DratChecker::new(num_vars, false);
 
         // Create a long clause: variables [0, k)
@@ -58,6 +62,7 @@ fn test_delete_clause_scales_with_clause_length() {
         checker.delete_clause(&clause2);
         assert_eq!(checker.live_clauses, 0, "k={k}: no clauses should remain");
     }
+    Ok(())
 }
 
 // -- Finding #3: Deleted clause slots are reused --
@@ -195,12 +200,14 @@ fn test_hash_distinct_clauses_different_buckets() {
 
     // All four hashes should be distinct (for this small example).
     let hashes = [h1, h2, h3, h4];
-    for i in 0..4 {
-        for j in (i + 1)..4 {
+    for (i, &hash_i) in hashes.iter().enumerate() {
+        for (j, &hash_j) in hashes.iter().enumerate() {
+            if j <= i {
+                continue;
+            }
             assert_ne!(
-                hashes[i], hashes[j],
-                "hash collision between clauses {i} and {j}: both hash to {:#x}",
-                hashes[i]
+                hash_i, hash_j,
+                "hash collision between clauses {i} and {j}: both hash to {hash_i:#x}"
             );
         }
     }
@@ -223,53 +230,64 @@ fn test_hash_retains_even_literal_multiplicity() {
 // -- Verify propagation count scales linearly with proof size --
 
 #[test]
-fn test_propagation_count_linear_in_proof_steps() {
+fn test_propagation_count_linear_in_proof_steps() -> Result<(), Box<dyn std::error::Error>> {
     // For a chain of binary implications, propagations should scale linearly
     // with the number of steps, not quadratically.
-    for n in [10, 20, 40] {
-        let num_vars = n + 2;
+    for n in [10usize, 20, 40] {
+        let num_vars = n.checked_add(2).ok_or("variable count overflows")?;
         let mut checker = DratChecker::new(num_vars, false);
 
         // Build implication chain: v0 → v1 → v2 → ... → v_{n-1}
         // As clauses: (~v0 v v1), (~v1 v v2), ..., (~v_{n-2} v v_{n-1})
         checker.add_original(&[lit(0, true)]); // unit: v0 = true
 
-        for i in 0..(n - 1) {
-            checker.add_original(&[lit(i as u32, false), lit((i + 1) as u32, true)]);
+        for i in 0..n.checked_sub(1).ok_or("empty chain")? {
+            let next = i.checked_add(1).ok_or("chain index overflows")?;
+            checker.add_original(&[lit(i as u32, false), lit(next as u32, true)]);
         }
 
         // After BCP from v0, all v1..v_{n-1} should be propagated.
         // Total propagations from originals should be roughly O(n).
         let props = checker.stats.propagations;
+        let bound = n.checked_mul(3).ok_or("propagation bound overflows")?;
         assert!(
-            props <= (n * 3) as u64,
+            props <= bound as u64,
             "n={n}: propagations ({props}) should be O(n), not O(n²)"
         );
     }
+    Ok(())
 }
 
 // -- Verify delete of non-existent long clauses is efficient --
 
 #[test]
-fn test_delete_nonexistent_scales_linearly() {
+fn test_delete_nonexistent_scales_linearly() -> Result<(), Box<dyn std::error::Error>> {
     let mut checker = DratChecker::new(200, false);
 
     // Add 100 binary clauses.
-    for i in 0..100 {
-        checker.add_original(&[lit((i * 2) as u32, true), lit((i * 2 + 1) as u32, true)]);
+    for i in 0u32..100 {
+        let first = i.checked_mul(2).ok_or("variable overflows")?;
+        let second = first.checked_add(1).ok_or("variable overflows")?;
+        checker.add_original(&[lit(first, true), lit(second, true)]);
     }
 
     // Delete clauses that don't exist (different variables).
     let before_misses = checker.stats.missed_deletes;
-    for i in 0..100 {
-        let base = 200 + i * 2;
-        checker.delete_clause(&[lit(base as u32, true), lit((base + 1) as u32, true)]);
+    for i in 0u32..100 {
+        let base = i
+            .checked_mul(2)
+            .and_then(|offset| offset.checked_add(200))
+            .ok_or("variable overflows")?;
+        let next = base.checked_add(1).ok_or("variable overflows")?;
+        checker.delete_clause(&[lit(base, true), lit(next, true)]);
     }
-    assert_eq!(
-        checker.stats.missed_deletes - before_misses,
-        100,
-        "all 100 deletes should be misses"
-    );
+    let misses = checker
+        .stats
+        .missed_deletes
+        .checked_sub(before_misses)
+        .ok_or("missed-delete counter went backwards")?;
+    assert_eq!(misses, 100, "all 100 deletes should be misses");
+    Ok(())
 }
 
 // -- Verify backward checker completes on scaled inputs --

@@ -52,7 +52,7 @@ pub(super) fn execute_typed_with_details_impl(
     let logic = parse_logic(program)?;
 
     // Create execution context
-    let mut ctx = ExecutionContext::new(logic)?;
+    let mut ctx = ExecutionContext::new(logic, program)?;
 
     // `AYProgram::set_option` stores program-level metadata rather than a
     // `Constraint::SetOption` command. The text executor has always emitted

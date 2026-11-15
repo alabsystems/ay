@@ -167,10 +167,10 @@ impl GateTable {
 /// doubling watermark keeps each list at O(gates using that literal) instead of
 /// O(rewrites touching it), at an amortized O(len log len) per doubling.
 ///
-/// Gated by `--sat-congruence-bounded-occs` (default OFF): duplicates DO change
-/// how many times `rewrite_gate_after_merge` runs inside one drain, so this is a
-/// scheduling change, not a pure lifetime fix, and it is unmeasured on the
-/// corpus.
+/// Gated by `--sat-congruence-bounded-occs`, default ON since 2026-09-15: a
+/// scheduling change, since duplicates change how often `rewrite_gate_after_merge`
+/// runs in one drain. Measured: it converts 5553fec2's memory-out, and 36 sampled
+/// instances solve byte-identically with and without it.
 fn push_occurrence(occs: &mut [Vec<usize>], lit: usize, gi: usize) {
     if occs_are_bounded() {
         let list = &mut occs[lit];
@@ -193,7 +193,7 @@ fn occs_are_bounded() -> bool {
     *F.get_or_init(|| {
         ay_core::sat_ab_switches()
             .congruence_bounded_occs
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -498,8 +498,8 @@ impl CongruenceClosure {
                     gate_alive[gi] = false;
                     let unit_lit = if parity_flip { out } else { out ^ 1 };
                     // Parity-certified XOR collapse: the emitted polarity is the
-                    // machine-checked-exact parity (ay-sat-verified
-                    // xor_collapse_parity_verified). #7137-relax.
+                    // machine-checked-exact parity (ay-sat-congruence-core
+                    // xor_collapse_parity). #7137-relax.
                     if Self::record_unit(
                         unit_lit,
                         &mut unit_vals,

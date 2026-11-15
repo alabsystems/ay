@@ -108,6 +108,14 @@ pub(crate) fn build_lead(
     if !support.iter().all(|v| inv.contains_key(v)) {
         return None; // image set differs from the support
     }
+    // The lead scaffold `L ∨ ¬s_1` is RUP only when σ²(x_1) = x_1: under s_1
+    // the definitions give x'_1 = σ(x_1) and p'_1 = σ²(x_1), and the gadget
+    // clause closes the conflict only for an involution. A generator with a
+    // cycle longer than two made the checker reject the certificate
+    // (2026-09-17 audit); skipping it is sound.
+    if sigma.iter().any(|(k, v)| sigma.get(v) != Some(k)) {
+        return None; // not an involution
+    }
 
     // 1-based position of each support variable.
     let pos: BTreeMap<Variable, usize> = support
@@ -268,6 +276,35 @@ mod tests {
             }
         }
         (keep, scaffold, del)
+    }
+
+    /// A 3-cycle is a fixed-point-free permutation of its support but not an
+    /// involution; its lead scaffold is not RUP (2026-09-17 audit), so no
+    /// lead is built for it.
+    #[test]
+    fn a_three_cycle_builds_no_lead() {
+        let clauses = vec![
+            vec![
+                Literal::positive(v(0)),
+                Literal::positive(v(1)),
+                Literal::positive(v(2)),
+            ],
+            vec![
+                Literal::negative(v(0)),
+                Literal::negative(v(1)),
+                Literal::negative(v(2)),
+            ],
+        ];
+        let mut sigma = BTreeMap::new();
+        sigma.insert(v(0), v(1));
+        sigma.insert(v(1), v(2));
+        sigma.insert(v(2), v(0));
+        assert!(build_lead(&clauses, &sigma, 3).is_none());
+        let (clauses, sigma) = two_var();
+        assert!(
+            build_lead(&clauses, &sigma, 2).is_some(),
+            "an involution still builds"
+        );
     }
 
     #[test]

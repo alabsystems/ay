@@ -12,6 +12,12 @@
 //! duplicate predicates, missing definitions, type drift, and trailing material
 //! all fail closed before replay.
 
+mod envelope;
+pub use envelope::{
+    prepare_qf_invariant_envelope_with_work, PreparedQfInvariantEnvelope,
+    QfEnvelopePreparationError, QfInvariantEnvelopeView,
+};
+
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -506,24 +512,25 @@ pub fn parse_qf_invariant_model_artifact(
             ),
         ));
     }
-    let envelope: QfInvariantModelEnvelope = serde_json::from_slice(bytes).map_err(|error| {
+    // The ordinary parser consumes the SAME envelope implementation. Legacy
+    // preparation has no caller work/copy accounting claim.
+    let envelope = envelope::decode(bytes, &mut envelope::Legacy).map_err(|error| {
+        let reason = match error {
+            QfEnvelopePreparationError::NonCanonical => {
+                ChcQfInvariantModelArtifactErrorReason::NonCanonicalEnvelope
+            }
+            QfEnvelopePreparationError::TooLarge => {
+                ChcQfInvariantModelArtifactErrorReason::ArtifactTooLarge
+            }
+            QfEnvelopePreparationError::Malformed | QfEnvelopePreparationError::Control(_) => {
+                ChcQfInvariantModelArtifactErrorReason::MalformedEnvelope
+            }
+        };
         ChcQfInvariantModelArtifactError::new(
-            ChcQfInvariantModelArtifactErrorReason::MalformedEnvelope,
-            error.to_string(),
+            reason,
+            "QF envelope decoding or canonical bytes refused",
         )
     })?;
-    let canonical_envelope = serde_json::to_vec(&envelope).map_err(|error| {
-        ChcQfInvariantModelArtifactError::new(
-            ChcQfInvariantModelArtifactErrorReason::SerializationFailed,
-            error.to_string(),
-        )
-    })?;
-    if canonical_envelope != bytes {
-        return Err(ChcQfInvariantModelArtifactError::new(
-            ChcQfInvariantModelArtifactErrorReason::NonCanonicalEnvelope,
-            "artifact JSON differs from AY's canonical field order/escaping",
-        ));
-    }
     if envelope.schema != CHC_QF_INVARIANT_MODEL_ARTIFACT_SCHEMA || envelope.schema_version != 1 {
         return Err(ChcQfInvariantModelArtifactError::new(
             ChcQfInvariantModelArtifactErrorReason::SchemaMismatch,

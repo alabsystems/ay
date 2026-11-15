@@ -34,7 +34,8 @@
 //!   one exists, and completed with a canonical default otherwise (genuinely
 //!   free slack);
 //! - an UNCOMMITTED class takes a generated value: distinct-by-construction
-//!   candidates (nullary constructors, then a pumped recursive constructor)
+//!   candidates (base constructors, then scalar-field enumeration, then a
+//!   pumped recursive constructor)
 //!   filtered by negative-tester commitments, preferring values unused by any
 //!   other same-sort class;
 //! - selector CONGRUENCE over rendered values is reconciled: two selector
@@ -67,6 +68,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId};
 
+use super::rendered_dt_guard::RenderedDatatypeGuard;
 use super::{EvalValue, Executor, Model};
 
 /// Hard cap on value-construction recursion depth (fail-closed poison past it).
@@ -151,11 +153,150 @@ enum CtorCommit {
 }
 
 impl Executor {
+    /// Prefer one checked synthesized assignment over a competing legacy
+    /// construction. This stages the pins-free candidate, so neither the old
+    /// pins nor a cached assignment can certify their own replacement.
+    pub(super) fn prefer_checked_synthesized_datatype_model(
+        &self,
+        model: &mut Model,
+        extra_roots: &[TermId],
+    ) -> bool {
+        const MAX_SOURCE_TERMS: usize = 16_384;
+        if self.dt_theory_model.is_some()
+            || self.dt_lazy_splits.is_some()
+            || !model.dt_array_field_classes.is_empty()
+            || self.dt_egraph_building.get()
+            || self.ctx.terms.len() > MAX_SOURCE_TERMS
+            || self.ctx.assertions.len() > MAX_SOURCE_TERMS
+            || extra_roots.len() > MAX_SOURCE_TERMS
+            || self.solve_deadline.expired()
+            || self.evaluation_stop_origin().is_some()
+            || !self.dt_egraph_synth_applicable(model)
+        {
+            return false;
+        }
+        // Completion is judged against the authored query and the producing
+        // lane's exact value commitments, even when preprocessing removed
+        // their defining equalities from the working assertion vector. Bound
+        // every input slice before the shared collector allocates its union.
+        let authored_len = self
+            .independent_gate_authored_assertions
+            .as_ref()
+            .map_or(self.ctx.assertions.len(), Vec::len);
+        let root_count = authored_len
+            .checked_add(self.ctx.assertions.len())
+            .and_then(|n| n.checked_add(self.last_assumptions.as_ref().map_or(0, Vec::len)))
+            .and_then(|n| n.checked_add(extra_roots.len()))
+            .and_then(|n| n.checked_add(self.lane_model_pin_roots.len()));
+        if !root_count.is_some_and(|n| n <= MAX_SOURCE_TERMS) {
+            return false;
+        }
+        let Some(roots) = self.datatype_model_collection_roots(extra_roots) else {
+            return false;
+        };
+        if !self.synthesized_datatype_uf_owner_is_reachable(&roots, MAX_SOURCE_TERMS) {
+            return false;
+        }
+        let mut candidate = model.clone();
+        candidate.dt_ground.clear();
+        candidate.dt_pins.clear();
+        let previous = self.dt_egraph_assignment.replace(None);
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::with_isolated_eval_memo(|| {
+                self.dt_egraph_assignment_cached(&candidate)
+                    .is_some_and(|assignment| {
+                        assignment.self_check_ok
+                            && self.dt_egraph_self_check_roots(&candidate, &assignment, &roots)
+                    })
+                    && !self.solve_deadline.expired()
+                    && self.evaluation_stop_origin().is_none()
+            })
+        }));
+        match checked {
+            Ok(true) => {
+                // The assignment cache has no model key. Replacing it can
+                // change published semantics even if no legacy pins existed.
+                candidate.revoke_all_quantified_model_seals();
+                *model = candidate;
+                super::eval_memo_clear();
+                true
+            }
+            Ok(false) => {
+                self.dt_egraph_assignment.replace(previous);
+                false
+            }
+            Err(payload) => {
+                self.dt_egraph_assignment.replace(previous);
+                self.dt_egraph_building.set(false);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// This preference arbitrates ordinary UF interpretations returning a
+    /// datatype. Builtin selectors and constructors retain their existing
+    /// datatype construction owner. A declaration or an old store node alone
+    /// cannot activate a new owner for the current query.
+    fn synthesized_datatype_uf_owner_is_reachable(
+        &self,
+        roots: &[TermId],
+        max_work: usize,
+    ) -> bool {
+        if roots.len() > max_work {
+            return false;
+        }
+        let guard = RenderedDatatypeGuard::new(self);
+        if !guard.is_bounded() {
+            return false;
+        }
+        let mut pending = roots.to_vec();
+        let mut seen = HashSet::default();
+        let mut found = false;
+        let mut work = 0_usize;
+        while let Some(term) = pending.pop() {
+            work = work.saturating_add(1);
+            if work > max_work
+                || self.external_stop_reason().is_some()
+                || self.evaluation_stop_origin().is_some()
+            {
+                return false;
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::Forall(..) | TermData::Exists(..) | TermData::Let(..) => return false,
+                TermData::App(symbol, args) => {
+                    if pending.len().saturating_add(args.len()) > max_work {
+                        return false;
+                    }
+                    found |= self
+                        .dt_completion_ordinary_uf_application_guarded(&guard, symbol, args, term);
+                    pending.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => pending.push(*inner),
+                TermData::Ite(c, a, b) => {
+                    if pending.len().saturating_add(3) > max_work {
+                        return false;
+                    }
+                    pending.extend([*c, *a, *b]);
+                }
+                TermData::Const(_) | TermData::Var(..) => {}
+                // TermData is non-exhaustive across the crate boundary.
+                // Unknown shapes never authorize an ownership transfer.
+                _ => return false,
+            }
+        }
+        found
+    }
+
     /// Drop the DT e-graph export and its derived assignment (called on every
     /// stored verdict and at each `check_sat` entry, #mv-dt-single-source).
     pub(in crate::executor) fn clear_dt_theory_model(&mut self) {
         self.dt_theory_model = None;
         self.dt_validation_wants_egraph = false;
+        self.lane_model_pin_roots.clear();
+        self.lane_ground_model = None;
         self.dt_egraph_assignment.replace(None);
     }
 
@@ -817,7 +958,20 @@ impl Executor {
                 if ay_core::misc_cli_flags().phase_trace {
                     let mut reps: Vec<u32> = builder.poisoned.iter().map(|t| t.0).collect();
                     reps.sort_unstable();
-                    eprintln!("c phase-trace dt-egraph-poisoned reps={reps:?}");
+                    let details: Vec<_> = reps
+                        .iter()
+                        .take(16)
+                        .map(|&raw| {
+                            let rep = TermId(raw);
+                            (
+                                self.format_term(rep),
+                                dtm.ctor_app_of.get(&rep),
+                                dtm.pos_tester_of.get(&rep),
+                                dtm.neg_testers_of.get(&rep),
+                            )
+                        })
+                        .collect();
+                    eprintln!("c phase-trace dt-egraph-poisoned reps={reps:?} details={details:?}");
                 }
             }
 
@@ -903,22 +1057,51 @@ impl Executor {
     /// here, and the caller withholds the totalizations (fail-closed partial,
     /// never a wrong printed model).
     fn dt_egraph_self_check(&self, model: &Model, asg: &DtEgraphAssignment) -> bool {
+        self.dt_egraph_self_check_roots(model, asg, &self.ctx.assertions)
+    }
+
+    fn dt_egraph_self_check_roots(
+        &self,
+        model: &Model,
+        asg: &DtEgraphAssignment,
+        assertions: &[TermId],
+    ) -> bool {
         let mut overrides: HashMap<TermId, EvalValue> = HashMap::default();
         let mut memo: HashMap<TermId, Option<String>> = HashMap::default();
-        let assertions = self.ctx.assertions.clone();
-        for &assertion in &assertions {
+        for &assertion in assertions {
             if !self.collect_asg_overrides(model, asg, assertion, 4096, &mut overrides, &mut memo) {
                 return false;
             }
         }
         let _guard = super::dt_model::OverrideGuard::install(overrides);
-        for &assertion in &assertions {
-            if !matches!(self.evaluate_term(model, assertion), EvalValue::Bool(true)) {
+        for &assertion in assertions {
+            let observed = self.evaluate_term(model, assertion);
+            if !matches!(&observed, EvalValue::Bool(true)) {
                 if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
-                        "c phase-trace dt-egraph-self-check-fail assertion={}",
-                        assertion.0
+                        "c phase-trace dt-egraph-self-check-fail assertion={} term={} value={observed:?}",
+                        assertion.0,
+                        self.format_term(assertion)
                     );
+                    for (&from, &to) in self.recorded_var_substitutions.iter().take(16) {
+                        eprintln!(
+                            "c phase-trace dt-egraph-substitution from={} to={} same_sort={} from_value={:?} to_value={:?} from_class={:?} to_class={:?}",
+                            self.format_term(from), self.format_term(to),
+                            self.ctx.terms.sort(from) == self.ctx.terms.sort(to),
+                            self.evaluate_term(model, from), self.evaluate_term(model, to),
+                            asg.class_value.get(&asg.dtm.rep(from)),
+                            asg.class_value.get(&asg.dtm.rep(to)),
+                        );
+                        if self.datatype_sort_name(self.ctx.terms.sort(from)).is_some() {
+                            eprintln!(
+                                "c phase-trace dt-egraph-substitution-stored from_euf={:?} to_euf={:?} from_pin={:?} to_pin={:?} from_completed={:?} to_completed={:?}",
+                                model.euf_model.as_ref().and_then(|euf| euf.term_values.get(&from)),
+                                model.euf_model.as_ref().and_then(|euf| euf.term_values.get(&to)),
+                                model.dt_pins.get(&from), model.dt_pins.get(&to),
+                                model.completed_values.get(&from), model.completed_values.get(&to),
+                            );
+                        }
+                    }
                 }
                 return false;
             }
@@ -1405,13 +1588,76 @@ impl AsgBuilder<'_> {
         }
     }
 
+    /// Whether a base-tier constructor field of this sort may take its
+    /// canonical default in a GENERATED value: the default must be a
+    /// closed ground term the theory is already committed to. Bool is
+    /// excluded (the Bool fallback below enumerates both values exactly),
+    /// datatype fields belong to the pump, and uninterpreted fields'
+    /// inhabitants belong to the theory model — generating
+    /// `(as @Key!0 Key)` would mint a domain element no theory committed
+    /// to (`a_constructor_with_only_uninterpreted_fields_generates_nothing`).
+    fn base_field_generable(&self, sort: &Sort) -> bool {
+        if self.exec.datatype_sort_name(sort).is_some() {
+            return false;
+        }
+        match sort {
+            Sort::Bool | Sort::Datatype(_) => false,
+            Sort::Uninterpreted(name) => name == "RoundingMode",
+            Sort::Array(array) => self.base_field_generable(&array.element_sort),
+            _ => true,
+        }
+    }
+
+    /// The `j`-th non-default value of an enumerable scalar sort
+    /// (`1, 2, 3, ...`), rendered in the same surface form as the sort's
+    /// canonical default (`0` / `0.0` / all-zero bits). `None` for other
+    /// sorts and past a small BitVec's range.
+    fn scalar_enumerated_value(sort: &Sort, j: u64) -> Option<String> {
+        let n = j.checked_add(1)?;
+        match sort {
+            Sort::Int => Some(n.to_string()),
+            Sort::Real => Some(format!("{n}.0")),
+            Sort::BitVec(bv) => {
+                if bv.width < 64 && n >= (1u64 << bv.width) {
+                    return None;
+                }
+                Some(crate::executor_format::format_bitvec(
+                    &num_bigint::BigInt::from(n),
+                    bv.width,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// How many non-default values [`Self::scalar_enumerated_value`]
+    /// yields before exhaustion (`None` = unbounded at u64 candidate
+    /// indices). Lets the recursive pump resume after a finite scalar
+    /// tier instead of re-emitting its first values.
+    fn scalar_enumeration_extras(sort: &Sort) -> Option<u64> {
+        match sort {
+            Sort::BitVec(bv) if bv.width < 64 => Some((1u64 << bv.width) - 1),
+            Sort::Int | Sort::Real | Sort::BitVec(_) => None,
+            _ => Some(0),
+        }
+    }
+
     /// The `k`-th generated value of datatype `sort_name`, top-level heads
-    /// restricted away from `ruled_out`: nullary constructors first (in
-    /// declaration order), then a recursive "pump" constructor wrapped around
-    /// the `(k - #nullary)`-th generated value of its first datatype field
-    /// (other fields canonical defaults). Injective in `k`, so distinct `k`
-    /// give distinct values. `None` when the sort runs out of candidates (a
-    /// finite enumeration) or nesting exhausts `depth`.
+    /// restricted away from `ruled_out`: base constructors first (in
+    /// declaration order — zero-field constructors and scalar-only ones,
+    /// rendered over canonical field defaults), then scalar enumeration
+    /// of the first base constructor's Int/Real/BitVec field
+    /// (#dt-egraph-scalar-enum: shallow distinct values exist there, so
+    /// separation must not manufacture ever-deeper trees — the Certora
+    /// `x27 (x22 (_ BitVec 256))` leaf beside recursive `x119` otherwise
+    /// pumped ~900 KB of nested values into one model), then a recursive
+    /// "pump" constructor wrapped around the remaining-index generated
+    /// value of its first datatype field (other fields canonical
+    /// defaults).
+    /// Injective in `k` up to one duplicate where the Bool fallback below
+    /// re-renders a scalar-base value, so distinct `k` give distinct values
+    /// after the caller's used-value skip. `None` when the sort runs out of
+    /// candidates (a finite enumeration) or nesting exhausts `depth`.
     fn gen_value(
         &self,
         sort_name: &str,
@@ -1429,22 +1675,64 @@ impl AsgBuilder<'_> {
             .find(|(n, _)| *n == sort_name)
             .map(|(_, cs)| cs.to_vec())?;
         let allowed: Vec<&String> = ctors.iter().filter(|c| !ruled_out.contains(c)).collect();
-        let nullary: Vec<&String> = allowed
+        // Base tier (#dt-egraph-scalar-base): a constructor whose fields
+        // are all generable scalars is a finite value once those fields
+        // take canonical defaults — zero-field constructors included, but
+        // also scalar-only ones like `(leaf (w Int))`. Without this tier a
+        // recursive datatype whose only base constructors carry scalars
+        // (the Certora shape `(x276 (x184 Int))` beside recursive
+        // constructors, no nullary constructor at all) generates NO value:
+        // the pump below recurses to depth 0, every free class poisons,
+        // and a lane `Sat` cannot publish its model. `base_field_generable`
+        // keeps Bool fields with the exact Bool enumeration below and
+        // uninterpreted fields with the theory model.
+        let base: Vec<(String, Vec<(String, Sort)>)> = allowed
             .iter()
-            .copied()
-            .filter(|c| {
-                self.exec
-                    .ctx
-                    .constructor_selector_info(c)
-                    .is_none_or(|fs| fs.is_empty())
+            .filter_map(|c| match self.exec.ctx.constructor_selector_info(c) {
+                None => Some(((*c).clone(), Vec::new())),
+                Some(fs) => fs
+                    .iter()
+                    .all(|(_, fsort)| self.base_field_generable(fsort))
+                    .then(|| ((*c).clone(), fs.to_vec())),
             })
             .collect();
-        if (k as usize) < nullary.len() {
-            let ctor = nullary[k as usize].clone();
-            let v = self.exec.dt_surface(&ctor).to_string();
-            return Some((ctor, Vec::new(), v));
+        if (k as usize) < base.len() {
+            let (ctor, fields) = &base[k as usize];
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(_, fsort)| self.exec.canonical_default_value(fsort))
+                .collect();
+            let v = render_ctor(self.exec.dt_surface(ctor), &parts);
+            return Some((ctor.clone(), parts, v));
         }
-        let j = k - nullary.len() as u64;
+        let mut j = k - base.len() as u64;
+        // Scalar tier (#dt-egraph-scalar-enum): vary the first enumerable
+        // scalar field of the first base constructor that has one. The
+        // canonical (zero) rendering already appeared in the base tier,
+        // so enumeration starts at one.
+        let scalar_pump = base.iter().find_map(|(ctor, fields)| {
+            fields.iter().enumerate().find_map(|(idx, (_, fsort))| {
+                matches!(fsort, Sort::Int | Sort::Real | Sort::BitVec(_))
+                    .then(|| (ctor.clone(), fields.clone(), idx, fsort.clone()))
+            })
+        });
+        if let Some((ctor, fields, idx, fsort)) = scalar_pump {
+            match Self::scalar_enumerated_value(&fsort, j) {
+                Some(value) => {
+                    let mut parts: Vec<String> = fields
+                        .iter()
+                        .map(|(_, s)| self.exec.canonical_default_value(s))
+                        .collect();
+                    parts[idx] = value;
+                    let v = render_ctor(self.exec.dt_surface(&ctor), &parts);
+                    return Some((ctor, parts, v));
+                }
+                None => match Self::scalar_enumeration_extras(&fsort) {
+                    Some(extras) => j -= extras,
+                    None => return None,
+                },
+            }
+        }
         // First allowed constructor with a datatype-sorted field is the pump.
         let dt_pump = allowed.iter().find_map(|c| {
             let fs = self.exec.ctx.constructor_selector_info(c)?;
@@ -1457,7 +1745,7 @@ impl AsgBuilder<'_> {
             // field instead (`j` = 0 -> true, 1 -> false; injective, then
             // exhausted). Without this, a FINITE datatype built over scalars
             // — `(Opt Bool)`: onone / (osome true) / (osome false) — offers
-            // only `#nullary + 1` generated values, so distinct-but-free
+            // only `#base` generated values (one Bool value per constructor), so distinct-but-free
             // classes of such sorts (and of sorts nesting them, e.g.
             // `(Opt (Opt Bool))` with 4 inhabitants) can never separate and
             // the whole assignment fails closed (#mv-dt-single-source).
@@ -2082,6 +2370,240 @@ fn value_head(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn solved_synthesis_candidate() -> (Executor, Model, TermId) {
+        let mut exec = executor_for(
+            "(set-logic ALL) (declare-datatype D ((Z) (S (pred D))))
+             (declare-const x D) (declare-fun f (D) D) (declare-const n Int)
+             (assert (is-S x)) (assert (= (f x) Z)) (assert (= n 0))",
+        );
+        let outputs = exec
+            .execute_all(&ay_frontend::parse("(check-sat)").expect("query"))
+            .expect("ground solve");
+        assert_eq!(outputs.last().map(String::as_str), Some("sat"));
+        let application = (0..exec.ctx.terms.len())
+            .map(|index| TermId(index as u32))
+            .find(
+                |&term| matches!(exec.ctx.terms.get(term), TermData::App(s, _) if s.name() == "f"),
+            )
+            .expect("authored application");
+        let model = exec.last_model.take().expect("ground candidate");
+        assert!(model.euf_model.is_some());
+        exec.dt_theory_model = None;
+        exec.dt_lazy_splits = None;
+        (exec, model, application)
+    }
+
+    #[test]
+    fn synthesized_owner_replaces_legacy_pins_before_model_confirmation() {
+        let (mut exec, mut model, application) = solved_synthesis_candidate();
+        model.dt_ground.insert(
+            application,
+            ay_model_check::ModelValue::Datatype {
+                ctor: "S".to_string(),
+                args: vec![ay_model_check::ModelValue::Datatype {
+                    ctor: "Z".to_string(),
+                    args: vec![],
+                }],
+            },
+        );
+        model
+            .dt_pins
+            .insert(application, EvalValue::Element("(S Z)".to_string()));
+        let epoch = model.seal_quantified_grant_model();
+        assert!(exec.prefer_checked_synthesized_datatype_model(&mut model, &[]));
+        assert!(!model.carries_quantified_grant_model(&epoch));
+        assert!(model.dt_ground.is_empty() && model.dt_pins.is_empty());
+        exec.last_model = Some(model);
+        assert!(matches!(
+            exec.confirm_sat_with_independent_gate(),
+            ay_model_check::GateVerdict::ConfirmedSat
+        ));
+        let values = exec
+            .execute_all(&ay_frontend::parse("(get-value ((f x)))").expect("getter"))
+            .expect("read");
+        assert!(values.last().expect("value").contains(" Z)"));
+    }
+
+    #[test]
+    fn a_fresh_assignment_revokes_old_seals_without_legacy_pins() {
+        let (exec, mut model, _) = solved_synthesis_candidate();
+        model.dt_ground.clear();
+        model.dt_pins.clear();
+        let epoch = model.seal_quantified_grant_model();
+        let previous = exec.dt_egraph_assignment.borrow().clone();
+        assert!(
+            previous.is_some(),
+            "the old public model cached its assignment"
+        );
+        assert!(exec.prefer_checked_synthesized_datatype_model(&mut model, &[]));
+        assert!(!model.carries_quantified_grant_model(&epoch));
+        assert!(!Arc::ptr_eq(
+            previous.as_ref().expect("previous"),
+            exec.dt_egraph_assignment.borrow().as_ref().expect("fresh"),
+        ));
+    }
+
+    #[test]
+    fn supplemental_roots_can_decline_a_synthesized_assignment_atomically() {
+        let (exec, mut model, _) = solved_synthesis_candidate();
+        let epoch = model.seal_quantified_grant_model();
+        let previous = exec.dt_egraph_assignment.borrow().clone();
+        let impossible = exec.ctx.terms.false_term();
+        assert!(!exec.prefer_checked_synthesized_datatype_model(&mut model, &[impossible]));
+        assert!(model.carries_quantified_grant_model(&epoch));
+        assert!(Arc::ptr_eq(
+            previous.as_ref().expect("previous"),
+            exec.dt_egraph_assignment
+                .borrow()
+                .as_ref()
+                .expect("restored"),
+        ));
+    }
+
+    fn rejected_root_extension_keeps_model(configure: impl FnOnce(&mut Executor)) {
+        let (mut exec, mut model, _) = solved_synthesis_candidate();
+        configure(&mut exec);
+        let epoch = model.seal_quantified_grant_model();
+        let previous = exec.dt_egraph_assignment.borrow().clone();
+        assert!(!exec.prefer_checked_synthesized_datatype_model(&mut model, &[]));
+        assert!(model.carries_quantified_grant_model(&epoch));
+        assert!(Arc::ptr_eq(
+            previous.as_ref().expect("previous"),
+            exec.dt_egraph_assignment
+                .borrow()
+                .as_ref()
+                .expect("restored"),
+        ));
+    }
+
+    #[test]
+    fn authored_roots_can_decline_a_synthesized_assignment_atomically() {
+        rejected_root_extension_keeps_model(|exec| {
+            exec.independent_gate_authored_assertions = Some(vec![exec.ctx.terms.false_term()]);
+        });
+    }
+
+    #[test]
+    fn producing_lane_roots_can_decline_a_synthesized_assignment_atomically() {
+        rejected_root_extension_keeps_model(|exec| {
+            exec.lane_model_pin_roots.push(exec.ctx.terms.false_term());
+        });
+    }
+
+    #[test]
+    fn oversized_authored_window_declines_before_assignment_replacement() {
+        rejected_root_extension_keeps_model(|exec| {
+            exec.independent_gate_authored_assertions =
+                Some(vec![exec.ctx.terms.true_term(); 16_385]);
+        });
+    }
+
+    #[test]
+    fn builtin_selector_only_query_keeps_its_datatype_owner() {
+        let exec = executor_for(
+            "(declare-datatype D ((Z) (S (pred D)))) (declare-const x D)
+             (assert (= x (pred Z))) (assert (= x (S Z)))",
+        );
+        let mut model = Model::empty();
+        model.euf_model = Some(ay_euf::EufModel::default());
+        let epoch = model.seal_quantified_grant_model();
+        assert!(!exec.prefer_checked_synthesized_datatype_model(&mut model, &[]));
+        assert!(model.carries_quantified_grant_model(&epoch));
+        assert!(exec.dt_egraph_assignment.borrow().is_none());
+    }
+
+    #[test]
+    fn unused_datatype_uf_and_historical_application_do_not_activate_ownership() {
+        let mut exec = executor_for(
+            "(declare-datatype D ((Z) (S (pred D)))) (declare-const x D)
+             (declare-fun f (D) D) (assert (= x Z))",
+        );
+        let x = exec
+            .ctx
+            .symbol_info_by_identity("x")
+            .expect("x")
+            .term
+            .expect("constant");
+        let sort = exec.ctx.terms.sort(x).clone();
+        let old = exec
+            .ctx
+            .terms
+            .mk_app(ay_core::Symbol::named("f"), [x], sort);
+        assert!(exec.synthesized_datatype_uf_owner_is_reachable(&[old], 100));
+        assert!(!exec.synthesized_datatype_uf_owner_is_reachable(&exec.ctx.assertions, 100));
+    }
+
+    #[test]
+    fn malformed_datatype_uf_signature_does_not_activate_ownership() {
+        let mut exec =
+            executor_for("(declare-datatype D ((Z) (S (pred D)))) (declare-fun f (D) D)");
+        let argument = exec.ctx.terms.mk_int(0.into());
+        let sort = exec
+            .ctx
+            .symbol_info_by_identity("f")
+            .expect("f")
+            .sort
+            .clone();
+        assert!(exec.datatype_sort_name(&sort).is_some());
+        let app = exec
+            .ctx
+            .terms
+            .mk_app(ay_core::Symbol::named("f"), [argument], sort);
+        assert!(!exec.synthesized_datatype_uf_owner_is_reachable(&[app], 100));
+    }
+
+    #[test]
+    fn defined_datatype_function_does_not_activate_ownership() {
+        let mut exec = executor_for(
+            "(declare-datatype D ((Z) (S (pred D)))) (declare-const x D)
+             (define-fun f ((y D)) D y)",
+        );
+        let x = exec
+            .ctx
+            .symbol_info_by_identity("x")
+            .expect("x")
+            .term
+            .expect("constant");
+        let sort = exec.ctx.terms.sort(x).clone();
+        let app = exec
+            .ctx
+            .terms
+            .mk_app(ay_core::Symbol::named("f"), [x], sort);
+        assert!(!exec.synthesized_datatype_uf_owner_is_reachable(&[app], 100));
+    }
+
+    #[test]
+    fn failed_synthesized_self_check_restores_model_cache_and_seal() {
+        let exec = executor_for(
+            "(declare-datatype D ((Z) (S (pred D)))) (declare-const x D) (assert false)",
+        );
+        let mut model = Model::empty();
+        model.euf_model = Some(ay_euf::EufModel::default());
+        model.dt_pins.insert(TermId(0), EvalValue::Bool(true));
+        let epoch = model.seal_quantified_grant_model();
+        let previous = Arc::new(DtEgraphAssignment {
+            dtm: ay_dt::DtModel::default(),
+            class_value: HashMap::default(),
+            class_fields: HashMap::default(),
+            class_ctor: HashMap::default(),
+            poisoned: HashSet::default(),
+            diseq_incoherent: HashSet::default(),
+            self_check_ok: true,
+        });
+        exec.dt_egraph_assignment.replace(Some(previous.clone()));
+        assert!(!exec.prefer_checked_synthesized_datatype_model(&mut model, &[]));
+        assert!(model.carries_quantified_grant_model(&epoch));
+        assert!(matches!(
+            model.dt_pins.get(&TermId(0)),
+            Some(EvalValue::Bool(true))
+        ));
+        assert!(exec
+            .dt_egraph_assignment
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| Arc::ptr_eq(cache, &previous)));
+    }
+
     fn executor_for(declarations: &str) -> Executor {
         let commands = ay_frontend::parse(declarations).expect("valid fixture declarations");
         let mut executor = Executor::new();
@@ -2172,6 +2694,36 @@ mod tests {
             generated_run(&executor, "Opt", 8),
             vec!["onone", "(osome true)", "(osome false)"],
             "nullary first, then the two Bool values, then exhausted"
+        );
+    }
+
+    /// A scalar-only base constructor enumerates its numeric field before
+    /// the recursive pump: shallow distinct values exist in the field, so
+    /// separation must not manufacture ever-deeper trees (the Certora
+    /// `x27 (x22 (_ BitVec 256))` shape beside recursive `x119`).
+    #[test]
+    fn scalar_base_fields_enumerate_before_the_recursive_pump() {
+        let executor = executor_for(
+            r#"
+            (set-logic ALL)
+            (declare-datatype Tree ((leaf (weight Int)) (node (left Tree) (right Tree))))
+            (declare-datatype BvTree ((bleaf (bits (_ BitVec 8))) (bnode (child BvTree))))
+        "#,
+        );
+        assert_eq!(
+            generated_run(&executor, "Tree", 4),
+            vec!["(leaf 0)", "(leaf 1)", "(leaf 2)", "(leaf 3)"],
+            "Int base fields enumerate shallowly before pumping"
+        );
+        assert_eq!(
+            generated_run(&executor, "BvTree", 4),
+            vec![
+                "(bleaf #x00)",
+                "(bleaf #x01)",
+                "(bleaf #x02)",
+                "(bleaf #x03)"
+            ],
+            "BitVec base fields enumerate shallowly before pumping"
         );
     }
 }

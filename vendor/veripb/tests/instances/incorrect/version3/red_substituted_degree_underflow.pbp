@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `substitute` lowered the degree by the coefficient of every literal set
+% to true with a plain `-=`. Substituting x1 into the trivially true
+% `5 x1 1 x2 >= -9223372036854775806` gives i64::MIN - 3, which wrapped to a huge positive
+% degree, i.e. into a contradicting constraint -- and a contradicting source syntactically
+% implies *every* target, so the `red` proof goal `1 x2 >= 1` was auto-discharged with no
+% proof. It is not entailed: x1 true, x2 false, x3 false satisfies the formula and the
+% negation of the added constraint.
+f 3 ;
+red 1 x3 >= 1 : x3 -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

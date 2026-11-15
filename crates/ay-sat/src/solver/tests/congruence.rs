@@ -101,6 +101,38 @@ fn test_congruence_uses_level0_vals_to_collapse_duplicate_and_gates() {
     );
 }
 
+/// The no-proof route disables the arena-offset clause-id table; congruence
+/// must not allocate it when it adds its equivalence binaries (one unguarded
+/// write reserved all of it, 677 MiB on a 1.5M-variable formula).
+#[test]
+fn test_congruence_equivalence_binaries_leave_disabled_clause_ids_unallocated() {
+    let mut solver: Solver = Solver::new(4);
+    solver.set_clause_ids_disabled(true);
+    let (y0, y1, b, c) = (Variable(0), Variable(1), Variable(2), Variable(3));
+    // y0 = AND(b, c) and y1 = AND(b, c): congruent.
+    for y in [y0, y1] {
+        solver.add_clause(vec![
+            Literal::negative(b),
+            Literal::negative(c),
+            Literal::positive(y),
+        ]);
+        solver.add_clause(vec![Literal::positive(b), Literal::negative(y)]);
+        solver.add_clause(vec![Literal::positive(c), Literal::negative(y)]);
+    }
+    solver.initialize_watches();
+    assert!(solver.process_initial_clauses().is_none());
+    solver.congruence();
+    assert!(
+        solver.congruence_stats().equivalences_found > 0,
+        "the fixture must make congruence add equivalence binaries"
+    );
+    assert_eq!(
+        solver.cold.clause_ids.capacity(),
+        0,
+        "the disabled table stays unallocated"
+    );
+}
+
 #[test]
 fn test_preprocess_congruence_does_not_force_decompose_when_disabled() {
     let mut solver: Solver = Solver::new(4);

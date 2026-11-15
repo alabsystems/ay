@@ -199,6 +199,44 @@ static int floating_point_family(Z3_context c) {
     return 0;
 }
 
+
+/* Exact raw fields: a high fraction bit AND the least significant bit survive
+ * both component construction and packed reinterpretation. */
+static int exact_floating_point_numerals(Z3_context c) {
+    Z3_sort format = Z3_mk_fpa_sort(c, 8, 200);
+    Z3_ast sign = Z3_mk_unsigned_int64(c, 1, Z3_mk_bv_sort(c, 1));
+    Z3_ast exponent = Z3_mk_unsigned_int64(c, 127, Z3_mk_bv_sort(c, 8));
+    Z3_ast fraction = Z3_mk_numeral(c, "401734511064747568885490523085290650630550748445698208825345", Z3_mk_bv_sort(c, 199));
+    Z3_ast components = Z3_mk_fpa_fp(c, sign, exponent, fraction);
+    Z3_ast packed = Z3_mk_numeral(c, "308130369986661385335171231206417929033632424057850526169038849", Z3_mk_bv_sort(c, 208));
+    Z3_ast values[] = {Z3_simplify(c, components),
+        Z3_simplify(c, Z3_mk_fpa_to_fp_bv(c, packed, format))};
+    for (unsigned i = 0; i < 2; ++i) {
+        bool negative = false;
+        uint64_t narrow = 123;
+        CHECK(values[i]);
+        CHECK(Z3_fpa_get_numeral_sign(c, values[i], &negative) && negative);
+        Z3_ast raw = Z3_fpa_get_numeral_significand_bv(c, values[i]);
+        CHECK(raw && strcmp(Z3_get_numeral_string(c, raw), "401734511064747568885490523085290650630550748445698208825345") == 0);
+        CHECK(strcmp(Z3_fpa_get_numeral_significand_string(c, values[i]), "1.5000000000000000000000000000000000000000000000000000000000012446030555722283414288128107560248481180504337442334266202233229579397668070766882367889646251427233913933179110244964249432086944580078125") == 0);
+        CHECK(strcmp(Z3_fpa_get_numeral_exponent_string(c, values[i], true), "127") == 0);
+        CHECK(strcmp(Z3_fpa_get_numeral_exponent_string(c, values[i], false), "0") == 0);
+        CHECK(!Z3_fpa_get_numeral_significand_uint64(c, values[i], &narrow));
+    }
+    Z3_ast zero = Z3_mk_fpa_zero(c, format, true);
+    bool negative = false;
+    CHECK(Z3_fpa_is_numeral_zero(c, zero));
+    CHECK(Z3_fpa_get_numeral_sign(c, zero, &negative) && negative);
+    CHECK(strcmp(Z3_fpa_get_numeral_significand_string(c, zero), "1") == 0);
+    CHECK(strcmp(Z3_fpa_get_numeral_exponent_string(c, zero, false), "0") == 0);
+    Z3_ast nan = Z3_mk_fpa_nan(c, format);
+    CHECK(Z3_fpa_is_numeral_nan(c, nan));
+    CHECK(!Z3_fpa_get_numeral_significand_bv(c, nan));
+    CHECK(Z3_get_error_code(c) == Z3_INVALID_ARG);
+
+    return 0;
+}
+
 static int arithmetic_and_introspection_family(Z3_context c) {
     Z3_sort ints = AY_CALL(Z3_mk_int_sort, (c));
     Z3_sort reals = AY_CALL(Z3_mk_real_sort, (c));
@@ -236,6 +274,7 @@ int main(int argc, char **argv) {
     CHECK(bitvector_family(c) == 0);
     CHECK(string_regex_family(c) == 0);
     CHECK(floating_point_family(c) == 0);
+    CHECK(exact_floating_point_numerals(c) == 0);
     CHECK(arithmetic_and_introspection_family(c) == 0);
     AY_CALL(Z3_interrupt, (c));
     AY_CALL(Z3_del_context, (c));

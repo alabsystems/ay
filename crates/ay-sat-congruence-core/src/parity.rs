@@ -7,21 +7,36 @@
 // This is the single, shared source of truth for the GF(2) parity arithmetic
 // that the congruence XOR-collapse path uses to decide the polarity of a
 // derived unit. It is compiled by `cargo` (the solver depends on this crate
-// and calls these functions) AND verified by `offline deductive checker check` against the
-// exact same source bytes (the development proof harness pulls this
-// file in with `include!`, so the proof is over the real code — NO TWIN).
+// and calls these functions) AND submitted to `offline deductive checker check` as the exact
+// same source bytes (the development proof harness pulls this file in
+// with `include!`, so the obligation is over the real code — NO TWIN).
+//
+// PROOF STATUS — a measurement, not a standing claim; re-run before quoting it.
+// Measured 2026-09-23 on compiler_consumer/targo 321aaeda7 (atpkg trust store 9192):
+// `offline deductive checker check` over BOTH harnesses in `proofs/` returns Verdict
+// INCONCLUSIVE, Gate FAIL. The `u8` overflow and hardened-boundary rows of
+// `xor_collapse_parity` are PROVED; its `assert_eq!` soundness obligation is
+// UNKNOWN (model-checker-consumer PDR returned unknown) and its panic-freedom row is UNKNOWN
+// (the native CHC bundle refuses an `Alloca` without a bound extent). Those
+// PROVED rows depend on the verifier's wall-clock budget: re-run 2026-09-24 on
+// the same toolchain at load average ~90, every overflow, boundary and
+// assertion row of `xor_collapse_parity` came back TIMEOUT (3000 ms, "budget
+// exceeded before accepting primary evidence"); the verdict stays INCONCLUSIVE.
+// `xor_accumulate_parity` carries no obligation at all. So neither the bounded
+// nor the unbounded parity property is machine-proved today; both are checked
+// by EXECUTION in `lib.rs`'s tests.
 // Module-level rustdoc lives on the crate root in `lib.rs`; this file uses
 // plain `//` comments so it stays valid when `include!`d into the proof.
 //
 // Soundness rationale: the historical `asconhash-m5_6` false UNSAT (#6997) was
 // a single XOR-folded parity bit off by one flip, so an EVEN (satisfiable)
 // cycle was mis-tagged ODD and a contradiction unit NOT entailed by the
-// clauses was emitted. The obligation proved here (`acc == GF(2) mod-2 popcount
+// clauses was emitted. The obligation stated here (`acc == GF(2) mod-2 popcount
 // of true contributions`) is exactly the property whose violation produces
 // that class of false UNSAT. Arity is bounded by `XOR_ARITY_LIMIT = 5`
 // (`ay-sat/src/gates/xor.rs`), so the fixed-width model is FAITHFUL, not an
-// approximation — and the bounded-MC exhaustive-finite verifier route can
-// discharge it over the complete finite Bool domain.
+// approximation — a verifier route that grounds the complete finite Bool
+// domain could discharge it (see PROOF STATUS above for whether one does).
 
 /// THE GF(2) accumulation step the real congruence XOR-collapse runs.
 ///
@@ -45,9 +60,10 @@ pub fn xor_accumulate_parity(acc: bool, contribution: bool) -> bool {
 ///
 /// SOUNDNESS OBLIGATION (trust-checkable): the returned parity bit equals the
 /// GF(2) mod-2 popcount of its true contributions — see
-/// the development proof harness, discharged through `offline deductive checker check`
-/// by the bounded-MC exhaustive-finite route over the complete 2^6 Bool domain.
-/// A derived XOR-collapse unit is sound iff this holds.
+/// the development proof harness. `offline deductive checker check` leaves it UNKNOWN
+/// as measured 2026-09-23 (PROOF STATUS at the top of this file); the
+/// exhaustive 2^6 test in `lib.rs` checks it by execution. A derived
+/// XOR-collapse unit is sound iff this holds.
 #[inline]
 #[must_use]
 pub fn xor_collapse_parity(
@@ -63,10 +79,13 @@ pub fn xor_collapse_parity(
     // exhaustive-finite verifier route can ground and discharge the embedded
     // obligation over the complete finite Bool domain.
     let acc = neg_out ^ c0 ^ c1 ^ c2 ^ c3 ^ c4;
-    // SOUNDNESS OBLIGATION (trust-checked): the folded parity bit equals the
+    // SOUNDNESS OBLIGATION (trust-checkable): the folded parity bit equals the
     // GF(2) mod-2 popcount of its true contributions. A derived XOR-collapse
     // unit is sound iff this holds. Max popcount is 6, so the `u8` sum never
-    // overflows. `offline deductive checker check` proves this for ALL 2^6 inputs.
+    // overflows (those overflow rows are proved when the verifier's wall-clock
+    // budget is met; see PROOF STATUS). The equality itself is UNKNOWN
+    // to `offline deductive checker check` as measured 2026-09-23 — see PROOF STATUS at the
+    // top of this file; it is checked for all 2^6 inputs by execution.
     assert_eq!(
         acc,
         (((neg_out as u8) + (c0 as u8) + (c1 as u8) + (c2 as u8) + (c3 as u8) + (c4 as u8)) % 2
@@ -85,17 +104,19 @@ pub fn xor_collapse_parity(
 /// gate of ANY arity.
 ///
 /// SOUNDNESS (UNBOUNDED): the returned bit equals the GF(2) mod-2 popcount of the
-/// `true` contributions, for slices of EVERY length, by induction:
+/// `true` contributions, for slices of EVERY length. The argument is a
+/// HAND-WRITTEN induction, not a machine-checked one:
 ///   * base: empty prefix `acc == false == (0 % 2 == 1)`;
 ///   * step: `xor_accumulate_parity(acc, b) == acc ^ b` flips parity iff `b`.
-/// This unbounded obligation is a RESEARCH WIP and is deliberately kept OUT of
-/// this lib's trust surface so the crate compiles CLEAN/load-bearing through
-/// `targo`: the canonical engine proves the BOUNDED core ([`xor_collapse_parity`],
-/// the solver's arity<=5 reality, exhaustive finite domain) but cannot yet
-/// discharge the loop-inductive form (multi-predicate cyclic CHC frontier). The
-/// property is still checked at runtime by the 0..=12 exhaustive test in `lib.rs`,
-/// and the unproven trust obligation lives in the development proof harness
-/// (INCONCLUSIVE), not here.
+/// This unbounded obligation is kept OUT of this lib's trust surface; no
+/// `offline deductive checker check` run discharges it. the development proof harness
+/// states the inductive step (`step_bv`) and measured INCONCLUSIVE on
+/// 2026-09-23 (its assertion is UNKNOWN; PROOF STATUS at the top of this file).
+/// What IS established is by execution only, in `lib.rs`: the exhaustive test
+/// over every slice of length `0..=16`, and a test that checks the base case,
+/// the step over its complete 2x2 state, and that the fold is that step
+/// iterated for lengths `1..=20`. The step from there to EVERY length is the
+/// hand-written induction above; no test observes a length past 20.
 #[inline]
 #[must_use]
 pub fn xor_collapse_slice(bits: &[bool]) -> bool {

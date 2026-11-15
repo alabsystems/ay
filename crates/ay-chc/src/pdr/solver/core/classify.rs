@@ -73,6 +73,18 @@ pub(in crate::pdr::solver) fn ensure_prop_solver_split<'a>(
     })
 }
 
+/// "Pure LIA" here means *linear arithmetic over scalar sorts*: `Real` state
+/// is included on purpose, because the incremental-SAT-trust and executor
+/// backend gates keyed off `problem_is_pure_lia` are sound for LRA too.
+///
+/// The consequence every BUDGET gate must respect: `problem_is_pure_lia` is
+/// `true` for the sally / vmt LRA transition systems, so a discovery budget
+/// written as `if !problem_is_pure_lia { budget }` (the BV-era pattern) silently
+/// runs UNBOUNDED on Real state. Real-sorted problems are as wide and as
+/// expensive to enumerate over as the Int ones the budgets were tuned for, so
+/// budget gates must consult `problem.has_real_sorts()` explicitly — see
+/// `discover_bv_range_invariants` (`bounds_bv.rs`) and the wide-var startup cap
+/// (`startup/mod.rs`).
 pub(super) fn sort_is_pure_lia(sort: &ChcSort) -> bool {
     matches!(sort, ChcSort::Bool | ChcSort::Int | ChcSort::Real)
 }
@@ -115,23 +127,21 @@ pub(super) fn expr_is_pure_lia(expr: &ChcExpr) -> bool {
 /// Assumes scan_features() was already called on the root and rejected non-LIA
 /// features (ITE, mod/div, arrays, UF). This function only checks op/sort, never
 /// re-calls scan_features, making the total cost O(n) instead of O(n²).
+///
+/// A conjunction over nodes, so each distinct shared node is checked once
+/// (WP-F F0b) — same answer as the recursive walk.
 fn expr_is_pure_lia_structural(expr: &ChcExpr) -> bool {
-    crate::expr::maybe_grow_expr_stack(|| match expr {
+    crate::expr::dag::all_distinct(expr, |node| match node {
+        ChcExpr::ArrayLambda(_) => false,
         ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) => true,
         ChcExpr::BitVec(_, _)
         | ChcExpr::ConstArrayMarker(_)
         | ChcExpr::IsTesterMarker(_)
         | ChcExpr::ConstArray(_, _) => false,
         ChcExpr::Var(v) => sort_is_pure_lia(&v.sort),
-        ChcExpr::Op(op, args) => {
-            op_is_pure_lia(op) && args.iter().all(|arg| expr_is_pure_lia_structural(arg))
-        }
-        ChcExpr::PredicateApp(_, _, args) => {
-            args.iter().all(|arg| expr_is_pure_lia_structural(arg))
-        }
-        ChcExpr::FuncApp(_, sort, args) => {
-            sort_is_pure_lia(sort) && args.iter().all(|arg| expr_is_pure_lia_structural(arg))
-        }
+        ChcExpr::Op(op, _) => op_is_pure_lia(op),
+        ChcExpr::PredicateApp(..) => true,
+        ChcExpr::FuncApp(_, sort, _) => sort_is_pure_lia(sort),
     })
 }
 
@@ -189,29 +199,23 @@ pub(super) fn expr_is_integer_arithmetic(expr: &ChcExpr) -> bool {
 /// Structural integer-arithmetic check: LIA ops + ITE + mod/div allowed.
 /// Assumes scan_features() was already called on the root and rejected
 /// arrays/UF. Only checks op/sort compatibility — never re-calls scan_features.
+///
+/// A conjunction over nodes, so each distinct shared node is checked once
+/// (WP-F F0b) — same answer as the recursive walk.
 fn expr_is_integer_arithmetic_structural(expr: &ChcExpr) -> bool {
-    crate::expr::maybe_grow_expr_stack(|| match expr {
+    crate::expr::dag::all_distinct(expr, |node| match node {
+        ChcExpr::ArrayLambda(_) => false,
         ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) => true,
         ChcExpr::BitVec(_, _)
         | ChcExpr::ConstArrayMarker(_)
         | ChcExpr::IsTesterMarker(_)
         | ChcExpr::ConstArray(_, _) => false,
         ChcExpr::Var(v) => sort_is_pure_lia(&v.sort),
-        ChcExpr::Op(op, args) => {
-            (op_is_pure_lia(op) || matches!(op, ChcOp::Ite | ChcOp::Mod | ChcOp::Div))
-                && args
-                    .iter()
-                    .all(|arg| expr_is_integer_arithmetic_structural(arg))
+        ChcExpr::Op(op, _) => {
+            op_is_pure_lia(op) || matches!(op, ChcOp::Ite | ChcOp::Mod | ChcOp::Div)
         }
-        ChcExpr::PredicateApp(_, _, args) => args
-            .iter()
-            .all(|arg| expr_is_integer_arithmetic_structural(arg)),
-        ChcExpr::FuncApp(_, sort, args) => {
-            sort_is_pure_lia(sort)
-                && args
-                    .iter()
-                    .all(|arg| expr_is_integer_arithmetic_structural(arg))
-        }
+        ChcExpr::PredicateApp(..) => true,
+        ChcExpr::FuncApp(_, sort, _) => sort_is_pure_lia(sort),
     })
 }
 
@@ -248,19 +252,17 @@ pub(super) fn sort_is_bitvector_compatible(sort: &ChcSort) -> bool {
 /// constants/variables, and operations over those sorts. Int/Real/Array/UF
 /// sorts and their operations cause rejection.
 pub(super) fn expr_is_bitvector_only(expr: &ChcExpr) -> bool {
-    crate::expr::maybe_grow_expr_stack(|| match expr {
-        ChcExpr::Bool(_) => true,
-        ChcExpr::BitVec(_, _) => true,
+    // A conjunction over nodes: each distinct shared node once (WP-F F0b).
+    crate::expr::dag::all_distinct(expr, |node| match node {
+        ChcExpr::ArrayLambda(_) => false,
+        ChcExpr::Bool(_) | ChcExpr::BitVec(_, _) => true,
         ChcExpr::Int(_) | ChcExpr::Real(_, _) => false,
         ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) | ChcExpr::ConstArray(_, _) => {
             false
         }
         ChcExpr::Var(v) => sort_is_bitvector_compatible(&v.sort),
-        ChcExpr::Op(_, args) => args.iter().all(|arg| expr_is_bitvector_only(arg)),
-        ChcExpr::PredicateApp(_, _, args) => args.iter().all(|arg| expr_is_bitvector_only(arg)),
-        ChcExpr::FuncApp(_, sort, args) => {
-            sort_is_bitvector_compatible(sort) && args.iter().all(|arg| expr_is_bitvector_only(arg))
-        }
+        ChcExpr::Op(..) | ChcExpr::PredicateApp(..) => true,
+        ChcExpr::FuncApp(_, sort, _) => sort_is_bitvector_compatible(sort),
     })
 }
 

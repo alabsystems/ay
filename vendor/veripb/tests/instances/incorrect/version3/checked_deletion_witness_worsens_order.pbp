@@ -1,0 +1,43 @@
+pseudo-Boolean proof version 3.0
+% The twin of `correct/version3/checked_deletion_witness_under_order.pbp`: the
+% same formula, order and deletion, with the witness flipped from `x1 -> 0
+% x2 -> 1` to `x1 -> 1 x2 -> 0`. Both witnesses satisfy the deleted constraint
+% and leave the rest of the core untouched; only the order tells them apart.
+%
+% The order is `v1 >= u1`, so the goal `O(x1|w, x1)` reads `-1 + x1 >= 0`, i.e.
+% `1 x1 >= 1`. The subproof premise is the negation of the deleted constraint,
+% which forces x1 = 0, so the goal is false and the checked deletion fails.
+% That is the real condition behind the format's advice to keep the deletion
+% witness trivial under a loaded order, and it is a semantic refusal rather
+% than an implementation limit: the witness maps the counterexample
+% (0, 0, 1) to (1, 0, 1), which is strictly worse in the loaded order.
+%
+% The derived constraint 3 also blocks the fallback to unchecked deletion, so
+% this instance is refused with or without `--force-checked-deletion`.
+f 2;
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux;
+    end;
+    def
+        -1 u1 1 v1 >= 0;
+    end;
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+            proofgoal #1
+                pol -2 -3 + -1 +;
+            qed : -1;
+        qed;
+    end;
+end;
+load_order simple x1;
+pol 1 2 +;
+delc 1 : x1 -> 1 x2 -> 0 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

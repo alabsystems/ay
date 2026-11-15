@@ -51,6 +51,40 @@ impl LraSolver {
             );
         }
 
+        // The cached-Sat shortcut below assumes the assignment is the one the
+        // last full check validated. Post-Sat work inside that check (the
+        // model-value equality discovery of `assume_eqs`, model-seeded
+        // propagation probes) can pivot the tableau and move a variable ONTO
+        // the excluded value of an asserted disequality without any new bound
+        // arriving (`dirty` stays false). Observed through the persistent
+        // `HornSmt` session (CHC-COMP 2026 Rung 1, WP-4 push/pop fuzz): a
+        // `check()` right after a `NeedModelEqualities` round returned the
+        // cached Sat with `x4 = 5` while `¬(x4 = 5)` was asserted. A stale
+        // assignment must fail closed into the full path, never out as Sat.
+        if !self.dirty && !self.disequality_trail.is_empty() {
+            let violated = self.disequality_trail.iter().any(|(term, expr, value)| {
+                if self.asserted.get(term) != Some(value) {
+                    return false;
+                }
+                let mut eval_inf = InfRational::from_rat(expr.constant.clone());
+                for &(var, ref coeff) in &expr.coeffs {
+                    if let Some(info) = self.vars.get(var as usize) {
+                        eval_inf += &info.value.mul_rat(coeff);
+                    }
+                }
+                eval_inf.is_zero()
+            });
+            if violated {
+                if debug {
+                    safe_eprintln!(
+                        "[LRA] Not dirty, but an asserted disequality is violated by the current assignment: running the full check"
+                    );
+                }
+                self.dirty = true;
+                self.last_diseq_check_had_violation = true;
+            }
+        }
+
         if !self.dirty {
             if debug {
                 safe_eprintln!("[LRA] Not dirty, returning early");
@@ -154,7 +188,8 @@ impl LraSolver {
             // cleared before the call, making it always empty inside simplex.
             let result = self.dual_simplex();
             self.vars_tightened_since_simplex.clear();
-            self.last_simplex_feasible = matches!(result, TheoryResult::Sat);
+            self.note_tightened_cleared();
+            self.set_last_simplex_feasible(matches!(result, TheoryResult::Sat));
             if self.last_simplex_feasible {
                 self.enqueue_lra_basis_region_request_at_safe_boundary();
                 self.drain_lra_basis_region_requests_at_safe_boundary();
@@ -287,7 +322,7 @@ impl LraSolver {
                     break;
                 }
                 let re = self.dual_simplex();
-                self.last_simplex_feasible = matches!(re, TheoryResult::Sat);
+                self.set_last_simplex_feasible(matches!(re, TheoryResult::Sat));
                 if !matches!(re, TheoryResult::Sat) {
                     return re;
                 }
@@ -359,7 +394,7 @@ impl LraSolver {
                     let prefer_model_eqs = model_eqs
                         .iter()
                         .any(|req| self.model_eq_pair_prefer_over_split(req));
-                    if !model_eqs.is_empty() && prefer_model_eqs {
+                    if !model_eqs.is_empty() && prefer_model_eqs && self.assume_eqs_over_split {
                         if debug {
                             safe_eprintln!(
                                 "[LRA] assume_eqs (over expression-split): discovered {} model-value equalities",
@@ -414,7 +449,7 @@ impl LraSolver {
                     let prefer_model_eqs = model_eqs
                         .iter()
                         .any(|req| self.model_eq_pair_prefer_over_split(req));
-                    if !model_eqs.is_empty() && prefer_model_eqs {
+                    if !model_eqs.is_empty() && prefer_model_eqs && self.assume_eqs_over_split {
                         if debug {
                             safe_eprintln!(
                                 "[LRA] assume_eqs (over shared expression-split): discovered {} model-value equalities",
@@ -522,7 +557,20 @@ impl LraSolver {
             other => other,
         };
         if matches!(result, TheoryResult::Sat) {
-            self.queue_model_seeded_propagations(debug);
+            // The seeded probes pivot the tableau and restore only BOUND
+            // feasibility, so the assignment the disequality check above
+            // validated may be gone (a variable can land exactly on an excluded
+            // value). Re-validate the asserted disequalities on the restored
+            // assignment and hand a violation back as the usual split request
+            // instead of a Sat whose model violates a disequality (observed
+            // through the persistent `HornSmt` session, CHC-COMP 2026 Rung 1
+            // WP-4 fuzz: `(distinct x4 -7)` with `x4 = -7` in the model).
+            let probed = self.queue_model_seeded_propagations(debug);
+            if probed && !disequalities.is_empty() && !has_asserted_unsupported {
+                if let Some(diseq_result) = self.check_disequalities(&disequalities, debug) {
+                    return diseq_result;
+                }
+            }
             // Collect equality requests from both fixed-term and offset equality mechanisms.
             let mut all_requests = Vec::new();
             if self.pending_fixed_term_equalities.len() > 1 {
@@ -561,12 +609,15 @@ impl LraSolver {
                 };
             }
         }
-        if matches!(
-            result,
-            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
-        ) {
-            // eprintln!("[LRA-DEBUG] check() returning UNSAT/UnsatWithFarkas (simplex passthrough)");
+        let conflict_lits = match &result {
+            TheoryResult::Unsat(lits) => Some(lits.len() as u64),
+            TheoryResult::UnsatWithFarkas(c) => Some(c.literals.len() as u64),
+            _ => None,
+        };
+        if let Some(n) = conflict_lits {
             self.stats.conflict_count += 1;
+            self.stats.conflict_lits_total += n;
+            self.stats.conflict_lits_max = self.stats.conflict_lits_max.max(n);
             self.stats.full_check_conflict_count += 1;
             // Leave dirty=true so next check() re-runs the simplex after
             // backtrack. Without this, backtrack without pop causes check()
@@ -825,8 +876,9 @@ impl LraSolver {
                 // potentially inconsistent state, so the gate must still fire.
                 self.post_simplex_bounds_added = false;
                 self.vars_tightened_since_simplex.clear();
+                self.note_tightened_cleared();
             }
-            self.last_simplex_feasible = matches!(r, TheoryResult::Sat);
+            self.set_last_simplex_feasible(matches!(r, TheoryResult::Sat));
             if self.last_simplex_feasible {
                 self.enqueue_lra_basis_region_request_at_safe_boundary();
                 self.drain_lra_basis_region_requests_at_safe_boundary();
@@ -979,11 +1031,15 @@ impl LraSolver {
             || !self.pending_fixed_term_equalities.is_empty()
             || !self.pending_offset_equalities.is_empty();
 
-        if matches!(
-            result,
-            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
-        ) {
+        let conflict_lits = match &result {
+            TheoryResult::Unsat(lits) => Some(lits.len() as u64),
+            TheoryResult::UnsatWithFarkas(c) => Some(c.literals.len() as u64),
+            _ => None,
+        };
+        if let Some(n) = conflict_lits {
             self.stats.conflict_count += 1;
+            self.stats.conflict_lits_total += n;
+            self.stats.conflict_lits_max = self.stats.conflict_lits_max.max(n);
         } else {
             // Preserve deferred full-check work: the final check() must revisit
             // skipped disequality/model-equality logic even when the arithmetic
@@ -1031,8 +1087,8 @@ impl LraSolver {
         // #inc-guard-memo anchor: trust ONLY the fully-verified simplex Sat
         // exit (`last_simplex_verified` — heap-empty basic check + full
         // non-basic `violates_bounds` scan, the guard's exact predicate).
-        // Optimistic Sats (budget-exhaustion conversion, pre-loop fast path,
-        // BLAS bridge — the #8810 hhk2008 family) leave the flag false, so
+        // Optimistic Sats (budget-exhaustion conversion, pre-loop fast path —
+        // the #8810 hhk2008 family) leave the flag false, so
         // the propagation-time guards keep their full rescan for them. This
         // O(1) anchor is what collapses the measured 3.3e9 redundant
         // var-scans at BMC depth 14.
@@ -1040,7 +1096,7 @@ impl LraSolver {
         if self.stats.total_pivots == self.pivots_at_last_snapshot
             && !self.feasible_value_snapshot.is_empty()
         {
-            self.stats.snapshot_pivot_skips += 1;
+            self.stats.snapshot_pivot_skips = self.stats.snapshot_pivot_skips.saturating_add(1);
             return;
         }
         self.pivots_at_last_snapshot = self.stats.total_pivots;
@@ -1063,9 +1119,12 @@ impl LraSolver {
         // the cache was reset (old_len == 0 || cache empty) so the two
         // structures stay in sync.
         if old_len == 0 || self.phase_hint_cache.is_empty() {
-            self.feasible_value_snapshot.resize(n, Rational::zero());
-            for (i, var_info) in self.vars.iter().enumerate() {
-                self.feasible_value_snapshot[i] = var_info.value.x_rational();
+            // The snapshot mirrors `vars` one-to-one: rebuild it element by
+            // element from the variables that already exist.
+            self.feasible_value_snapshot.clear();
+            for var_info in &self.vars {
+                self.feasible_value_snapshot
+                    .push(var_info.value.x_rational());
             }
 
             // #8008: Pre-compute phase hints for all registered atoms against
@@ -1075,14 +1134,27 @@ impl LraSolver {
             return;
         }
 
-        self.feasible_value_snapshot.resize(n, Rational::zero());
+        // Keep the first `min(old_len, n)` snapshot values for comparison and
+        // extend the mirror one slot per new variable, in index order.
+        self.feasible_value_snapshot.truncate(n);
         let mut changed_vars: Vec<u32> = Vec::new();
-        for i in 0..n {
-            let new_val = self.vars[i].value.x_rational();
-            if i >= old_len || self.feasible_value_snapshot[i] != new_val {
-                changed_vars.push(i as u32);
+        for (i, var_info) in self.vars.iter().enumerate() {
+            let new_val = var_info.value.x_rational();
+            match self.feasible_value_snapshot.get_mut(i) {
+                // A slot survives the truncation only for `i < min(old_len, n)`.
+                Some(slot) => {
+                    if *slot != new_val {
+                        changed_vars.push(i as u32);
+                    }
+                    *slot = new_val;
+                }
+                None => {
+                    // `i >= min(old_len, n)`: a variable the old snapshot did
+                    // not cover, so it is changed by definition.
+                    changed_vars.push(i as u32);
+                    self.feasible_value_snapshot.push(new_val);
+                }
             }
-            self.feasible_value_snapshot[i] = new_val;
         }
 
         if changed_vars.is_empty() {
@@ -1115,21 +1187,32 @@ impl LraSolver {
     /// Uses split borrows: iterates `registered_atoms` and `atom_cache` (read),
     /// evaluates against `vars` (read), writes to `phase_hint_cache` (write).
     fn rebuild_phase_hint_cache(&mut self) {
-        self.phase_hint_cache.clear();
         // Collect atoms to iterate without holding a borrow on self.
         // registered_atoms is typically small (hundreds of atoms), so the
         // Vec allocation is negligible compared to the Rational arithmetic saved.
         let atoms: Vec<TermId> = self.registered_atoms.iter().copied().collect();
+        let mut new_cache: HashMap<TermId, bool> = HashMap::default();
         for atom in atoms {
             if let Some(phase) = Self::evaluate_atom_phase_inner(&self.atom_cache, &self.vars, atom)
             {
-                self.phase_hint_cache.insert(atom, phase);
+                new_cache.insert(atom, phase);
             }
         }
-        // A rebuild may have changed any suggestion; advance the phase-hint
-        // epoch so the SAT-side seeder re-seeds rather than skipping. See
+        // Advance the phase-hint epoch only when a suggestion actually
+        // changed (or the registered-atom set grew, giving some atom a
+        // first suggestion). A rebuild whose every phase reproduces the
+        // previous cache leaves the SAT-side seeder's skip valid — on
+        // 10^5-atom files most feasible refreshes move values without
+        // flipping any atom's sign, and the unconditional bump forced an
+        // O(atoms) re-seed after each. See
         // `LraSolver::phase_hint_epoch` / `TheorySolver::phase_hint_epoch`.
-        self.phase_hint_epoch = self.phase_hint_epoch.wrapping_add(1);
+        let changed = new_cache != self.phase_hint_cache
+            || self.registered_atoms.len() != self.phase_epoch_registered_len;
+        self.phase_hint_cache = new_cache;
+        if changed {
+            self.phase_epoch_registered_len = self.registered_atoms.len();
+            self.phase_hint_epoch = self.phase_hint_epoch.wrapping_add(1);
+        }
     }
 
     /// #D1: Incremental counterpart to `rebuild_phase_hint_cache`. Re-evaluates
@@ -1153,20 +1236,28 @@ impl LraSolver {
         }
         atoms.sort_unstable();
         atoms.dedup();
+        // Advance the phase-hint epoch only on an actual suggestion change
+        // (flip, first entry, or removal) or registered-atom growth, as in
+        // the full rebuild. See `TheorySolver::phase_hint_epoch`.
+        let mut changed = self.registered_atoms.len() != self.phase_epoch_registered_len;
         for atom in atoms {
             match Self::evaluate_atom_phase_inner(&self.atom_cache, &self.vars, atom) {
                 Some(phase) => {
-                    self.phase_hint_cache.insert(atom, phase);
+                    if self.phase_hint_cache.insert(atom, phase) != Some(phase) {
+                        changed = true;
+                    }
                 }
                 None => {
-                    self.phase_hint_cache.remove(&atom);
+                    if self.phase_hint_cache.remove(&atom).is_some() {
+                        changed = true;
+                    }
                 }
             }
         }
-        // An incremental rebuild touched at least one atom over a changed
-        // variable; advance the phase-hint epoch so the SAT-side seeder
-        // re-seeds. See `TheorySolver::phase_hint_epoch`.
-        self.phase_hint_epoch = self.phase_hint_epoch.wrapping_add(1);
+        if changed {
+            self.phase_epoch_registered_len = self.registered_atoms.len();
+            self.phase_hint_epoch = self.phase_hint_epoch.wrapping_add(1);
+        }
     }
 
     /// Evaluate a single atom against variable values and return the

@@ -466,6 +466,26 @@ pub struct RealAlgebraicValue {
 }
 
 impl RealAlgebraicValue {
+    /// Same exact retained representation; false does not prove different
+    /// mathematical values. This borrowed comparison performs no refinement.
+    pub fn same_representation(&self, other: &Self) -> bool {
+        self.alpha == other.alpha && self.residue == other.residue
+    }
+    /// Visit every variable-sized rational payload retained by a clone,
+    /// without cloning, normalizing, refining or rendering this value.
+    /// A caller can preadmit each coefficient and interval endpoint under its
+    /// original resource owner; false stops before visiting the next payload.
+    /// The caller separately accounts the fixed value and vector elements.
+    pub fn visit_copy_coefficients(&self, mut visit: impl FnMut(&BigRational) -> bool) -> bool {
+        self.alpha
+            .poly
+            .coeffs()
+            .iter()
+            .chain(self.residue.coeffs())
+            .chain([&self.alpha.lo, &self.alpha.hi])
+            .all(&mut visit)
+    }
+
     /// Reduce `poly(alpha)` to an exact scalar: a rational when the residue
     /// modulo the defining polynomial is constant, else an algebraic value.
     pub(crate) fn reduce(alpha: &RealAlgebraic, poly: &UniPoly) -> RealScalar {
@@ -1140,6 +1160,34 @@ pub(crate) fn lagrange_interpolate(points: &[(BigRational, BigRational)]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_payload_visit_covers_both_polynomials_and_interval_and_stops() {
+        let value = sqrt2().as_value().add_rational(&rat(3));
+        let expected = value.alpha.poly.coeffs().len() + value.residue.coeffs().len() + 2;
+        let mut visits = 0;
+        let mut occupied = 0;
+        assert!(value.visit_copy_coefficients(|coefficient| {
+            visits += 1;
+            occupied += coefficient.numer().bits() + coefficient.denom().bits();
+            true
+        }));
+        assert_eq!(visits, expected);
+        assert!(occupied > 0);
+        let mut remaining = expected - 1;
+        assert!(!value.visit_copy_coefficients(|_| {
+            if remaining == 0 {
+                false
+            } else {
+                remaining -= 1;
+                true
+            }
+        }));
+        assert_eq!(
+            value.cmp_rational(&rat(4)),
+            Some(std::cmp::Ordering::Greater)
+        );
+    }
 
     fn poly(coeffs: &[i64]) -> UniPoly {
         UniPoly::from_coeffs(

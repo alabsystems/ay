@@ -199,12 +199,18 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         conflict_terms: &[TheoryLit],
         clause: &mut Vec<Literal>,
         ctx: &dyn SolverContext,
-    ) {
+    ) -> crate::theory_inference::ConflictClauseReduction {
         self.record_context_conflict_premises(conflict_terms, ctx);
-        let removed = crate::theory_inference::minimize_conflict_with_levels(clause, |var| {
-            ctx.var_level(var)
-        });
-        self.eager_stats.theory_minimize_lits_removed += removed as u64;
+        let policy = if self.proof.is_some() {
+            crate::theory_inference::ConflictClausePolicy::PreserveLiterals
+        } else {
+            crate::theory_inference::ConflictClausePolicy::Deduplicate
+        };
+        let result = crate::theory_inference::minimize_conflict_clause(clause, policy);
+        if let crate::theory_inference::ConflictClauseReduction::Clause { removed } = result {
+            self.eager_stats.theory_minimize_lits_removed += removed as u64;
+        }
+        result
     }
 
     /// Record a lazy level-0 propagation without changing its SAT reason path.

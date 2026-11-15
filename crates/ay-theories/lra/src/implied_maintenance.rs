@@ -54,7 +54,8 @@ impl LraSolver {
             if use_incremental {
                 let changed = std::mem::take(&mut self.direct_bounds_changed_vars);
                 // #8003: Bump generation once for the batch of direct bound changes.
-                self.bound_generation += 1;
+                // A u64 bumped at most once per call cannot reach `u64::MAX`.
+                self.bound_generation = self.bound_generation.saturating_add(1);
                 let cur_gen = self.bound_generation;
                 for &var in &changed {
                     let i = var as usize;
@@ -78,23 +79,36 @@ impl LraSolver {
                 self.direct_bounds_changed_vars.clear();
             } else {
                 self.direct_bounds_changed_vars.clear();
-                self.stats.implied_full_overlays += 1;
+                self.stats.implied_full_overlays =
+                    self.stats.implied_full_overlays.saturating_add(1);
                 did_full_overlay = true;
                 // #8857: Full-scan overlay is a lattice rebuild — reset all
                 // Zeno-throttle streaks.
                 self.implied_tighten_streak.fill(0);
                 // #8003: Full scan — bump generation and stamp all vars.
-                self.bound_generation += 1;
+                self.bound_generation = self.bound_generation.saturating_add(1);
                 let cur_gen = self.bound_generation;
                 let mut fixed_vars = std::mem::take(&mut self.ib_fixed_vars_scratch);
                 fixed_vars.clear();
-                fixed_vars.reserve(num_vars);
+                // Capacity hint only: if the reservation fails, `push` grows
+                // the scratch vector as variables are visited.
+                let _ = fixed_vars.try_reserve(num_vars);
                 let mut any_big = false;
                 for (i, info) in self.vars.iter().enumerate() {
                     any_big |= Self::var_has_big_direct_bound(info);
-                    Self::overlay_direct_bound_for_var(info, &mut self.implied_bounds[i]);
+                    // Stamp only variables whose slot actually changed.
+                    // Restamping every variable made the generation skip
+                    // useless after any full overlay (resize/pop rebuild):
+                    // every row then looked newer than its last analysis
+                    // (measured on Gcd: 4,040 full overlays, 35M rows
+                    // re-analyzed in 20 s for 72k delivered propagations).
+                    // The skip compares only stamps, and row arithmetic
+                    // reads only slot values/strictness, so an unchanged
+                    // slot needs no new generation.
+                    let changed =
+                        Self::overlay_direct_bound_for_var(info, &mut self.implied_bounds[i]);
                     fixed_vars.push(i as u32);
-                    if i < self.var_bound_gen.len() {
+                    if changed && i < self.var_bound_gen.len() {
                         self.var_bound_gen[i] = cur_gen;
                     }
                 }
@@ -148,7 +162,10 @@ impl LraSolver {
         target_vi: usize,
         ub_direction: bool,
     ) -> Option<BoundExplanation> {
-        let mut contributing_vars: SmallVec<[Antecedent; 3]> = SmallVec::new();
+        // Every contribution but the target's own lands here: size the buffer
+        // once instead of growing it push by push past the inline capacity.
+        let mut contributing_vars: SmallVec<[Antecedent; 3]> =
+            SmallVec::with_capacity(contribs.len().saturating_sub(1));
         for &(other_vi, ref other_eq_c, _) in contribs {
             if other_vi == target_vi {
                 continue;
@@ -193,7 +210,8 @@ impl LraSolver {
     /// O(column size).
     pub(crate) fn stamp_var_for_rederivation(&mut self, var: u32) {
         let vi = var as usize;
-        self.bound_generation += 1;
+        // A u64 bumped once per call cannot reach `u64::MAX`.
+        self.bound_generation = self.bound_generation.saturating_add(1);
         if vi < self.var_bound_gen.len() {
             self.var_bound_gen[vi] = self.bound_generation;
         }

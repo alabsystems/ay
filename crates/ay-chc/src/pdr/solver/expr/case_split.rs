@@ -19,6 +19,7 @@
 use super::super::PdrSolver;
 use crate::smt::{SmtContext, SmtResult};
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
+mod first_ite;
 #[cfg(test)]
 mod timeout_observation;
 use std::sync::Arc;
@@ -107,47 +108,6 @@ impl PdrSolver {
         } else {
             vec![constraint.clone()]
         }
-    }
-
-    /// Split on the first ITE occurrence anywhere in a boolean formula.
-    ///
-    /// Returns `(cond, then_case, else_case)` where:
-    /// - `then_case` is `expr` with the first `ite(cond, t, e)` replaced by `t`
-    /// - `else_case` is `expr` with the first `ite(cond, t, e)` replaced by `e`
-    pub(in crate::pdr::solver) fn split_first_ite_anywhere(
-        expr: &ChcExpr,
-    ) -> Option<(ChcExpr, ChcExpr, ChcExpr)> {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => Some((
-                args[0].as_ref().clone(),
-                args[1].as_ref().clone(),
-                args[2].as_ref().clone(),
-            )),
-            ChcExpr::Op(op, args) => {
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some((cond, then_sub, else_sub)) = Self::split_first_ite_anywhere(arg) {
-                        let mut then_args: Vec<Arc<ChcExpr>> = Vec::with_capacity(args.len());
-                        let mut else_args: Vec<Arc<ChcExpr>> = Vec::with_capacity(args.len());
-                        for (j, a) in args.iter().enumerate() {
-                            if i == j {
-                                then_args.push(Arc::new(then_sub.clone()));
-                                else_args.push(Arc::new(else_sub.clone()));
-                            } else {
-                                then_args.push(a.clone());
-                                else_args.push(a.clone());
-                            }
-                        }
-                        return Some((
-                            cond,
-                            ChcExpr::Op(*op, then_args),
-                            ChcExpr::Op(*op, else_args),
-                        ));
-                    }
-                }
-                None
-            }
-            _ => None,
-        })
     }
 
     /// If `expr` contains an ITE, split into two guarded cases. Otherwise return `None`.
@@ -413,7 +373,7 @@ impl PdrSolver {
             if or_cases.len() > 1 && or_cases.len() <= MAX_OR_SPLIT_CASES {
                 ("OR", or_cases)
             } else {
-                let diseqs = Self::extract_disequalities(query);
+                let diseqs = Self::extract_disequalities(query, MAX_DISEQ_SPLIT_CANDIDATES + 1);
                 if diseqs.is_empty() || diseqs.len() > MAX_DISEQ_SPLIT_CANDIDATES {
                     return (SmtResult::Unknown, None);
                 }

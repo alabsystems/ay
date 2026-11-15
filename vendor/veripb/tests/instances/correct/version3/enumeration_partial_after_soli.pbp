@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Positive-direction companion of `incorrect/enumeration_soli_undercount`, and
+% the scope line of that fix: `ENUMERATION_PARTIAL n` claims only that at least
+% `n` projected solutions were witnessed. No rule ever adds models, so the `solx`
+% below really did witness a distinct projected solution of the original problem
+% and the claim survives the `soli`. Only the COMPLETE leg is guarded.
+f 1;
+solx x1 ~x2;
+soli ~x1 x2;
+pol 1 2 + 3 +;
+output NONE;
+conclusion ENUMERATION_PARTIAL 1;
+end pseudo-Boolean proof;

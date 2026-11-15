@@ -715,11 +715,30 @@ fn drop_huge_instance_in_background(instance: PbInstance) {
     if instance.constraints.len() < BACKGROUND_DROP_MIN_ROWS {
         return;
     }
+    drop_with_spare_computation(instance);
+}
+
+/// The constructor's deferred free is real computational work too. Without
+/// a spare unit, retain the documented synchronous destruction behavior.
+fn drop_with_spare_computation<T: Send + 'static>(value: T) {
+    let Ok(Some(permit)) = ay_sys::compute_budget::try_extra() else {
+        return;
+    };
+    drop_on_owned_unit(value, permit);
+}
+
+fn drop_on_owned_unit<T: Send + 'static>(value: T, permit: ay_sys::compute_budget::ExtraPermit) {
     let _ = std::thread::Builder::new()
         .name("pb-prep-drop".into())
         .stack_size(64 * 1024)
-        .spawn(move || drop(instance));
+        .spawn(move || {
+            let _ = permit.run(move || drop(value));
+        });
 }
+
+#[cfg(test)]
+#[path = "cdcl/compute_drop_tests.rs"]
+mod compute_drop_tests;
 
 fn should_stop_constructor_load<F>(should_stop: &mut F, poll_budget: &mut usize) -> bool
 where
@@ -6431,6 +6450,3 @@ fn decide_tightened_solve_result(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod kani_covering_bound;

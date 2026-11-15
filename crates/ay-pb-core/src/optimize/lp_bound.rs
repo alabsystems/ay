@@ -144,13 +144,16 @@ const MAX_DENSE_TABLEAU_ENTRIES: usize = 85_000_000;
 /// a superset of a smaller one here.
 ///
 /// AND THE CONTROL SAYS THE CAP IS NOT WHAT PROTECTS US. `opm2-z7-s2` (2,023
-/// vars, 31,798 structural rows) is admitted BY THESE CAPS AS SHIPPED and
-/// already runs past 700 s in one call without returning. So the multi-minute
-/// hole is reachable inside the caps today: what is missing is not a smaller
-/// number here but a wall-aware budget in `certified_bb`, whose only bound is a
-/// poll COUNT (`MAX_TOTAL_LP_POLLS`) whose cost per poll grows with the row
-/// count. Until that exists, moving these three numbers trades certificates for
-/// stalls in both directions.
+/// vars, 31,798 structural rows) is admitted BY THESE CAPS AS SHIPPED and still
+/// spent 675 s in one call to return nothing. So the multi-minute hole is
+/// reachable inside the caps today: what was missing is not a smaller number
+/// here but a SIZE-AWARE budget in `certified_bb`, whose only bound was a poll
+/// COUNT (`MAX_TOTAL_LP_POLLS`) whose cost per poll grows with the row count.
+/// THAT NOW EXISTS and it is a COUNT, not a clock: `certified_bb::MAX_WORK`
+/// meters model nonzeros touched, and the same instance returns
+/// `exhausted(work-budget)` in 164.7 s having used 28.3% of its poll budget.
+/// Moving these three numbers would still trade certificates for stalls in both
+/// directions.
 ///
 /// THE 18 ARE THEREFORE DOCUMENTED-EXCLUDED, NOT SILENTLY REFUSED. Grouped by
 /// the cap each one actually trips — `MAX_VARS` is tested first, so a model
@@ -174,6 +177,10 @@ const MAX_DENSE_TABLEAU_ENTRIES: usize = 85_000_000;
 /// long decline to no verdict at all. The upside worth chasing is
 /// `KE_450_009`'s 78.8x, and the way to get it is to run the tree BOTH ways and
 /// keep the smaller proof — not to widen a box that also deletes `hw64-vm99p`.
+/// THAT IS NOW DONE: see [`WIDE_MAX_VARS`] and `certified_bb::run`.
+/// `KE_450_009` emits 902,662 bytes instead of 71,145,872 for 7.1% more work,
+/// `hw64-vm99p` keeps its 761,527 byte-for-byte, and these three constants did
+/// not move.
 const CERT_MAX_VARS: usize = 20_000;
 /// Row cap for the certificate path.
 ///
@@ -228,6 +235,69 @@ const CERT_MAX_ROWS: usize = 40_000;
 /// nonzeros and two million", which its own preceding sentence already
 /// contradicted at ~399,000.)
 const CERT_MAX_NONZEROS: usize = 400_000;
+
+/// The SECOND admission the certificate path may ask for — the one the tier that
+/// actually runs these models already has (`safe_lp_bound`: 50k variables, 50k
+/// structural rows, 2M nonzeros; the dense exact tiers decline on
+/// [`MAX_DENSE_TABLEAU_ENTRIES`] either way).
+///
+/// # This is NOT a raise of [`CERT_MAX_VARS`], and the difference is the point
+///
+/// Raising the certificate caps to these numbers was built and measured on
+/// 2026-09-01 and LOST certificates — see [`CERT_MAX_VARS`] for the table. The
+/// row that settled it was `hw64-vm99p`, whose certificate exists BECAUSE the
+/// LP is refused: with `lp=model-too-large` the tree falls back to
+/// ancestor-guided branching and closes 65 leaves in half a second, and with an
+/// LP it spends the whole budget and returns nothing. A bigger cap is not a
+/// superset of a smaller one.
+///
+/// So these numbers are not the caps. They are the SECOND ATTEMPT, reachable
+/// only through [`lp_dual_raw_diagnosed_wide`], and only for a model that the
+/// certificate caps have already refused. `certified_bb` runs the tree BOTH
+/// ways and keeps the smaller VERIFIED proof, which is what the doc comment on
+/// [`CERT_MAX_VARS`] said the upside was and how to get it. Nothing that the
+/// certificate caps ADMIT reaches this path at all, so no proof this crate
+/// emits today can change because these constants exist.
+const WIDE_MAX_VARS: usize = 50_000;
+/// Rows for the wide attempt: constraint rows PLUS one box row per variable,
+/// the same accounting [`LpModel::build_diagnosed`] does. 100k = the tier's 50k
+/// structural rows plus its 50k variables, which is how the split cap the
+/// 2026-09-01 measurement used is expressed in this crate's single row count.
+const WIDE_MAX_ROWS: usize = 100_000;
+/// Nonzeros for the wide attempt: the tier's own 2M structural entries plus one
+/// box entry per variable at [`WIDE_MAX_VARS`].
+const WIDE_MAX_NONZEROS: usize = 2_050_000;
+
+/// Whether [`LpSizeCaps::CERTIFICATE`] refuses this shape while
+/// [`LpSizeCaps::WIDE`] admits it — the exact "near a cap" test, computed from
+/// the SAME row and nonzero accounting [`LpModel::build_diagnosed`] performs so
+/// that the predicate cannot drift from the caps it is predicting.
+///
+/// `structural_nonzeros` is the count over `>=` rows only, which is the shape
+/// `certified_bb` builds (it declines `PbRel::Eq` outright). Callers with `=`
+/// rows would have to count each of them twice; there are none.
+///
+/// A `false` here means the two attempts would walk the IDENTICAL tree — either
+/// both admitted or both refused — so running the second one buys nothing and
+/// costs a whole search.
+pub(crate) fn cert_refuses_but_wide_admits(
+    num_vars: usize,
+    num_ge_rows: usize,
+    structural_nonzeros: usize,
+) -> bool {
+    // Box rows: one row and one nonzero per variable, appended by
+    // `build_diagnosed` after the constraints.
+    let (Some(rows), Some(nonzeros)) = (
+        num_ge_rows.checked_add(num_vars),
+        structural_nonzeros.checked_add(num_vars),
+    ) else {
+        return false;
+    };
+    let refused_by =
+        |caps: LpSizeCaps| num_vars > caps.vars || rows > caps.rows || nonzeros > caps.nonzeros;
+    refused_by(LpSizeCaps::CERTIFICATE) && !refused_by(LpSizeCaps::WIDE)
+}
+
 /// Poll cadence, in tableau entries, INSIDE a single Gauss-Jordan pivot. A
 /// pivot rewrites up to `n * (m + n)` entries (order 1e8 on the largest
 /// admitted shapes) with growing bignum numerators, so polling only BETWEEN
@@ -797,6 +867,13 @@ impl LpSizeCaps {
         rows: CERT_MAX_ROWS,
         nonzeros: CERT_MAX_NONZEROS,
     };
+    /// The SECOND attempt's admission. Never the default for anything; see
+    /// [`WIDE_MAX_VARS`].
+    const WIDE: Self = Self {
+        vars: WIDE_MAX_VARS,
+        rows: WIDE_MAX_ROWS,
+        nonzeros: WIDE_MAX_NONZEROS,
+    };
 
     /// Names the cap a partially built model has already broken.
     fn decline(&self, rows: usize, nonzeros: usize) -> Option<LpDualDecline> {
@@ -869,8 +946,94 @@ pub(crate) fn lp_dual_raw_diagnosed(
     max_scale: Option<i128>,
     should_stop: &dyn Fn() -> bool,
 ) -> Result<LpDualRaw, LpDualDecline> {
-    let model =
-        LpModel::build_diagnosed(objective, constraints, num_vars, LpSizeCaps::CERTIFICATE)?;
+    lp_dual_raw_admitted(
+        objective,
+        constraints,
+        num_vars,
+        target,
+        max_scale,
+        should_stop,
+        LpSizeCaps::CERTIFICATE,
+    )
+}
+
+/// [`lp_dual_raw_diagnosed`] at the WIDE admission — everything downstream of
+/// the size check is byte-for-byte the same solve.
+///
+/// THE ONLY CALLER IS `certified_bb`'s SECOND ATTEMPT, and it reaches here only
+/// for a model [`cert_refuses_but_wide_admits`] returned `true` for. See
+/// [`WIDE_MAX_VARS`]: these numbers are not a raise of the certificate caps,
+/// and no proof that exists today can change because this function exists —
+/// every model the certificate caps admit takes the other wrapper.
+pub(crate) fn lp_dual_raw_diagnosed_wide(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    target: Option<i128>,
+    max_scale: Option<i128>,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<LpDualRaw, LpDualDecline> {
+    lp_dual_raw_admitted(
+        objective,
+        constraints,
+        num_vars,
+        target,
+        max_scale,
+        should_stop,
+        LpSizeCaps::WIDE,
+    )
+}
+
+/// The dual point [`lp_dual_raw_admitted`] starts from, with its tier's name.
+///
+/// Cheap tier first (<= F64_TIER_SIMPLEX_BUDGET), so the exact tier can no
+/// longer starve it of the clock it needs; the exact dispatch runs only when
+/// the cheap point did not reach `target`.
+fn best_dual_tier(
+    model: &LpModel,
+    target: Option<i128>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(DualSolution, &'static str)> {
+    let mut best = model
+        .solve_dual_f64_certified(Some(F64_TIER_CERT_SIMPLEX_ITERS), should_stop)
+        .map(|solution| (solution, "f64-certified"));
+    let reached_target =
+        |candidate: &Option<(DualSolution, &'static str)>| match (candidate, target) {
+            (Some((solution, _)), Some(want)) => solution.bound >= want,
+            _ => false,
+        };
+    if !reached_target(&best) {
+        if let Some(exact) =
+            model.solve_dual(should_stop, target, Some(F64_TIER_CERT_SIMPLEX_ITERS))
+        {
+            // Strictly better bound wins; on a tie the CONVERGED point wins,
+            // because only a converged solve licenses reading its shortfall as
+            // an integrality gap (see `LpDualRaw::converged`).
+            let better = match &best {
+                Some((cheap, _)) => {
+                    exact.bound > cheap.bound
+                        || (exact.bound == cheap.bound && exact.optimal && !cheap.optimal)
+                }
+                None => true,
+            };
+            if better {
+                best = Some((exact, "exact-dispatch"));
+            }
+        }
+    }
+    best
+}
+
+fn lp_dual_raw_admitted(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    target: Option<i128>,
+    max_scale: Option<i128>,
+    should_stop: &dyn Fn() -> bool,
+    caps: LpSizeCaps,
+) -> Result<LpDualRaw, LpDualDecline> {
+    let model = LpModel::build_diagnosed(objective, constraints, num_vars, caps)?;
     let n = usize::try_from(num_vars).map_err(|_| LpDualDecline::ModelShape)?;
     let num_constraint_rows = model
         .rows
@@ -903,36 +1066,8 @@ pub(crate) fn lp_dual_raw_diagnosed(
         }
     }
 
-    // Cheap tier first (<= F64_TIER_SIMPLEX_BUDGET), so the exact tier can no
-    // longer starve it of the clock it needs.
-    let mut best = model
-        .solve_dual_f64_certified(Some(F64_TIER_CERT_SIMPLEX_ITERS), should_stop)
-        .map(|solution| (solution, "f64-certified"));
-    let reached_target =
-        |candidate: &Option<(DualSolution, &'static str)>| match (candidate, target) {
-            (Some((solution, _)), Some(want)) => solution.bound >= want,
-            _ => false,
-        };
-    if !reached_target(&best) {
-        if let Some(exact) =
-            model.solve_dual(should_stop, target, Some(F64_TIER_CERT_SIMPLEX_ITERS))
-        {
-            // Strictly better bound wins; on a tie the CONVERGED point wins,
-            // because only a converged solve licenses reading its shortfall as
-            // an integrality gap (see `LpDualRaw::converged`).
-            let better = match &best {
-                Some((cheap, _)) => {
-                    exact.bound > cheap.bound
-                        || (exact.bound == cheap.bound && exact.optimal && !cheap.optimal)
-                }
-                None => true,
-            };
-            if better {
-                best = Some((exact, "exact-dispatch"));
-            }
-        }
-    }
-    let (dual, mut tier) = best.ok_or(LpDualDecline::NoDualPoint)?;
+    let (dual, mut tier) =
+        best_dual_tier(&model, target, should_stop).ok_or(LpDualDecline::NoDualPoint)?;
     let mut bound = dual.bound;
     let mut duals = dual.duals;
     let mut converged = dual.optimal;
@@ -4217,14 +4352,57 @@ mod tests {
             "f20c10b_011 has 43,326 constraint rows; admitted, it returned nothing \
              in 1,240 s, against a 3.4 s decline today"
         );
-        // `opm2-z7-s2` is the CONTROL and stays ADMITTED: it already runs past
-        // 700 s inside these caps, which is why lowering them is not the answer
-        // either — the missing bound is a work-aware one in `certified_bb`.
+        // `opm2-z7-s2` is the CONTROL and stays ADMITTED: it spent 675 s
+        // inside these caps to return nothing, which is why lowering them was
+        // not the answer either. The bound that WAS missing is a size-aware
+        // COUNT, and it now lives in `certified_bb::MAX_WORK`.
         assert!(
             2_023 <= CERT_MAX_VARS && 31_798 <= CERT_MAX_ROWS,
             "opm2-z7-s2 (2,023 vars, 31,798 constraint rows) must stay ADMITTED: it \
              is the evidence that a smaller cap is not the answer either"
         );
+    }
+
+    /// THE WIDE ADMISSION IS A BAND, NOT A RAISE, AND THE BAND IS THE MEASURED
+    /// PAIR.
+    ///
+    /// `cert_refuses_but_wide_admits` decides whether `certified_bb` pays for a
+    /// SECOND search. It must be true for exactly the models where the two
+    /// admissions disagree — otherwise the route either doubles its work to walk
+    /// the identical tree twice, or never finds the 78.8x `KE_450_009` leaves on
+    /// the table in [`CERT_MAX_VARS`].
+    #[test]
+    fn the_wide_admission_is_exactly_the_band_between_the_two_cap_sets() {
+        // `KE_450_009`: 20,023 vars / 372 `>=` rows / 59,169 nonzeros. It misses
+        // CERT_MAX_VARS by TWENTY-THREE and is 78.8x smaller with the LP.
+        assert!(cert_refuses_but_wide_admits(20_023, 372, 59_169));
+        // `hw64-vm99p`: 45,696 / 1,556 / 182,784. Refused for the same reason
+        // and, measured, it must KEEP the refusal's proof — which is why the
+        // second attempt is a size comparison and not a replacement.
+        assert!(cert_refuses_but_wide_admits(45_696, 1_556, 182_784));
+        // `f20c10b_011`: 13,304 / 43,326 / 103,545 — refused on ROWS, admitted
+        // wide. It declines under both, and the second attempt is gated on the
+        // first CERTIFYING, so it never pays.
+        assert!(cert_refuses_but_wide_admits(13_304, 43_326, 103_545));
+        // `opm2-z7-s2`: 2,023 / 31,798 / 79,762 — ADMITTED by the certificate
+        // caps. The two attempts would be the same tree, so there is no second
+        // one; what bounds this instance is `certified_bb::MAX_WORK`.
+        assert!(!cert_refuses_but_wide_admits(2_023, 31_798, 79_762));
+        // The certifying six are far inside: `g9x9` and `sbox_4_shg`.
+        assert!(!cert_refuses_but_wide_admits(81, 81, 369));
+        assert!(!cert_refuses_but_wide_admits(147, 240, 2_584));
+        // Outside BOTH: no second attempt there either, because it would refuse
+        // at the root and cost a whole tree to say so.
+        assert!(!cert_refuses_but_wide_admits(WIDE_MAX_VARS + 1, 10, 100));
+        assert!(!cert_refuses_but_wide_admits(10, WIDE_MAX_ROWS + 1, 100));
+        // The wide numbers are the tier's admission, not a new cap: the
+        // certificate caps themselves are untouched and pinned by
+        // `the_certificate_caps_are_the_measured_ones`.
+        assert_eq!(
+            (WIDE_MAX_VARS, WIDE_MAX_ROWS, WIDE_MAX_NONZEROS),
+            (50_000, 100_000, 2_050_000)
+        );
+        assert!(WIDE_MAX_VARS > CERT_MAX_VARS && WIDE_MAX_ROWS > CERT_MAX_ROWS);
     }
 
     #[test]

@@ -187,11 +187,10 @@ static void scenario_from_string(void) {
 // Scenario 3: assert_and_track + get_unsat_core.
 //   track (x >= 5) as p1, track (x <= 3) as p2  ->  UNSAT.
 // libz3 returns the participating core {p1,p2} (size 2). AY's Optimize engine
-// cannot extract a participating-only core (it does not thread check-time
-// assumptions), so rather than return an over-approximate full-tracked-set core
-// that could include NON-participating literals (a wrong value), AY honestly
-// returns an EMPTY core. Documented divergence (see ay_z3_compat.h). The tracked
-// constraints are still asserted, so the UNSAT verdict itself is correct.
+// does not thread check-time assumptions, so it reports EVERY tracking literal
+// in scope: a valid core (with the untracked assertions it is the formula found
+// unsat), not minimized. Here both literals participate, so it is z3's core. An
+// empty core would be wrong: it claims the untracked assertions alone are unsat.
 // ---------------------------------------------------------------------------
 static void scenario_unsat_core(void) {
     Z3_config cfg = Z3_mk_config();
@@ -214,13 +213,8 @@ static void scenario_unsat_core(void) {
     CHECK_U(r, Z3_L_FALSE, "tracked problem == unsat");
 
     Z3_ast_vector core = Z3_optimize_get_unsat_core(c, o);
-#ifdef AY_TWIN_USE_Z3
-    CHECK_U(Z3_ast_vector_size(c, core), 2, "z3: unsat core size == 2");
-#else
-    // AY honest divergence: participating-only optimize cores are unsupported
-    // (no assumption threading) -> empty core, never an over-approximate/wrong one.
-    CHECK_U(Z3_ast_vector_size(c, core), 0, "ay: optimize unsat core empty (documented)");
-#endif
+    // Both tracked assertions take part: the core is {p1, p2} (z3 and AY).
+    CHECK_U(Z3_ast_vector_size(c, core), 2, "unsat core size == 2");
 
     Z3_optimize_dec_ref(c, o);
     Z3_del_context(c);

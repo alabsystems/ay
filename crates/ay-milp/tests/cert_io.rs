@@ -452,6 +452,7 @@ fn emit_session_certificate_with_tree(
         block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: opt_tree,
         root_dual_bound_certificate: None,
+        milp_optimality_tree_block: None,
         single_machine_scheduling_optimality_certificate: session
             .single_machine_scheduling_optimality_certificate(),
         single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
@@ -791,6 +792,22 @@ fn network_infeasibility_artifact_round_trips_and_corruption_fails() {
     assert!(ayc.contains("evidence infeasible SUCCINCT network-design-infeasibility"));
     let parsed = cert_io::parse(&ayc).expect("network infeasibility certificate parses");
     assert!(parsed.network_design_infeasibility.is_some());
+    let model = ay_milp::read_mps(NETWORK_INF).expect("source model").model;
+    let proof = parsed
+        .network_design_infeasibility
+        .as_ref()
+        .expect("typed consumer proof");
+    ay_milp::verify_network_design_infeasibility_certificate_with_deadline(&model, proof, None)
+        .expect("public bounded replay");
+    assert!(
+        ay_milp::verify_network_design_infeasibility_certificate_with_deadline(
+            &model,
+            proof,
+            Some(std::time::Instant::now())
+        )
+        .is_err()
+    );
+
     let report = cert_io::check(&ayc, NETWORK_INF);
     assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
@@ -808,6 +825,33 @@ fn parity_infeasibility_artifact_round_trips_and_row_tampering_fails() {
 
     let parsed = cert_io::parse(&ayc).expect("parity certificate parses");
     assert!(parsed.parity_infeasibility.is_some());
+    let model = ay_milp::read_mps(PARITY_INF).expect("parity source").model;
+    let proof = parsed
+        .parity_infeasibility
+        .as_ref()
+        .expect("typed parity proof");
+    ay_milp::verify_parity_infeasibility_certificate_with_deadline(&model, proof, None)
+        .expect("bounded parity replay");
+    assert!(
+        ay_milp::verify_parity_infeasibility_certificate_with_deadline(
+            &model,
+            proof,
+            Some(std::time::Instant::now())
+        )
+        .is_err()
+    );
+    let feasible = ay_milp::read_mps(&PARITY_INF.replace("R1       -1", "R1        0"))
+        .expect("relaxed parity source")
+        .model;
+    let point = vec![BigRational::from_integer(0.into()); feasible.num_cols()];
+    feasible
+        .check_point(&point)
+        .expect("changed source is feasible");
+    assert!(
+        ay_milp::verify_parity_infeasibility_certificate_with_deadline(&feasible, proof, None)
+            .is_err()
+    );
+
     let report = cert_io::check(&ayc, PARITY_INF);
     assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
@@ -826,6 +870,73 @@ fn single_row_dp_infeasibility_artifact_verifies_and_tampering_fails() {
     assert!(ayc.contains("evidence infeasible SUCCINCT single-row-dp"));
     let parsed = cert_io::parse(&ayc).expect("single-row DP certificate parses");
     assert!(parsed.single_row_dp.is_some());
+    let model = ay_milp::read_mps(DP_INF).expect("source model").model;
+    let proof = parsed.single_row_dp.as_ref().expect("typed consumer proof");
+    // Generate an actual open-domain artifact. A direct DP proof also binds
+    // its explicit objective, whereas feasibility projection drops objectives,
+    // so a certificate from the earlier MPS solve cannot simply be reused.
+    {
+        let mut open_source = ay_milp::Model::new();
+        let x = open_source.add_binary_col();
+        let y = open_source.add_binary_col();
+        let z = open_source.add_binary_col();
+        open_source.add_int_col(0.0, f64::INFINITY);
+        open_source.add_row(18.0, 18.0, &[(x, 6.0), (y, 10.0), (z, 14.0)]);
+        let opts = SolveOpts::new()
+            .with_time_limit(std::time::Duration::from_secs(20))
+            .with_require_certificates(true);
+        let mut open_session =
+            BabSession::new(open_source.clone(), &opts).expect("open DP session");
+        let outcome = open_session.check().expect("open-domain DP solve");
+        assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
+        let proof = open_session
+            .open_domain_single_row_dp_infeasibility_certificate()
+            .expect("actual open-domain DP artifact");
+        assert!(
+            ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate(
+                &open_source,
+                proof
+            )
+        );
+        assert!(
+            ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate_with_deadline(
+                &open_source,
+                proof,
+                None
+            )
+        );
+        assert!(
+            !ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate_with_deadline(
+                &open_source,
+                proof,
+                Some(std::time::Instant::now())
+            )
+        );
+        let mut feasible = ay_milp::Model::new();
+        for _ in 0..model.num_cols() {
+            feasible.add_binary_col();
+        }
+        feasible.add_int_col(0.0, f64::INFINITY);
+        let point = vec![BigRational::from_integer(0.into()); feasible.num_cols()];
+        feasible
+            .check_point(&point)
+            .expect("source mutation is feasible");
+        assert!(
+            !ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate(&feasible, proof)
+        );
+    }
+
+    ay_milp::verify_single_row_dp_infeasibility_certificate_with_deadline(&model, proof, None)
+        .expect("public bounded replay");
+    assert!(
+        ay_milp::verify_single_row_dp_infeasibility_certificate_with_deadline(
+            &model,
+            proof,
+            Some(std::time::Instant::now())
+        )
+        .is_err()
+    );
+
     let report = cert_io::check(&ayc, DP_INF);
     assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
@@ -861,6 +972,52 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
     assert!(ayc.contains("evidence infeasible SUCCINCT multi-row-bdd"));
     let parsed = cert_io::parse(&ayc).expect("multi-row BDD certificate parses");
     assert!(parsed.multi_row_bdd.is_some());
+    let model = ay_milp::read_mps(BDD_INF).expect("source model").model;
+    let proof = parsed.multi_row_bdd.as_ref().expect("typed consumer proof");
+    // Appending an unused open integer leaves exactly the same bounded
+    // residual. This exercises the public open-domain verifier for this proof
+    // kind independently of which route the production portfolio selects.
+    let mut open_source = model.clone();
+    open_source.add_int_col(0.0, f64::INFINITY);
+    assert!(
+        ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate(&open_source, proof)
+    );
+    assert!(
+        ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate_with_deadline(
+            &open_source,
+            proof,
+            None
+        )
+    );
+    assert!(
+        !ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate_with_deadline(
+            &open_source,
+            proof,
+            Some(std::time::Instant::now())
+        )
+    );
+    let mut feasible = ay_milp::Model::new();
+    for _ in 0..model.num_cols() {
+        feasible.add_binary_col();
+    }
+    feasible.add_int_col(0.0, f64::INFINITY);
+    let point = vec![BigRational::from_integer(0.into()); feasible.num_cols()];
+    feasible
+        .check_point(&point)
+        .expect("source mutation is feasible");
+    assert!(!ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate(&feasible, proof));
+
+    ay_milp::verify_multi_row_bdd_infeasibility_certificate_with_deadline(&model, proof, None)
+        .expect("public bounded replay");
+    assert!(
+        ay_milp::verify_multi_row_bdd_infeasibility_certificate_with_deadline(
+            &model,
+            proof,
+            Some(std::time::Instant::now())
+        )
+        .is_err()
+    );
+
     let report = cert_io::check(&ayc, BDD_INF);
     assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     let format = "ay.multi-row-bdd-infeasible.v1";
@@ -930,6 +1087,52 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
                 .open_domain_multi_row_bdd_infeasibility_certificate()
                 .is_some()
     );
+    // Consumer replay uses the source model, never a residual carried by an artifact.
+    let feasible = ay_milp::read_mps(&OPEN_INF.replace("RLOW      1", "RLOW      0"))
+        .expect("relaxed source")
+        .model;
+    feasible
+        .check_point(&[
+            BigRational::from_integer(0.into()),
+            BigRational::from_integer(2.into()),
+        ])
+        .expect("source really is feasible");
+    if let Some(proof) = session.open_domain_single_row_dp_infeasibility_certificate() {
+        assert!(
+            ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate(
+                session.model(),
+                proof
+            )
+        );
+        assert!(
+            !ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate(&feasible, proof)
+        );
+        assert!(
+            !ay_milp::verify_open_domain_single_row_dp_infeasibility_certificate_with_deadline(
+                session.model(),
+                proof,
+                Some(std::time::Instant::now())
+            )
+        );
+    }
+    if let Some(proof) = session.open_domain_multi_row_bdd_infeasibility_certificate() {
+        assert!(
+            ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate(
+                session.model(),
+                proof
+            )
+        );
+        assert!(
+            !ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate(&feasible, proof)
+        );
+        assert!(
+            !ay_milp::verify_open_domain_multi_row_bdd_infeasibility_certificate_with_deadline(
+                session.model(),
+                proof,
+                Some(std::time::Instant::now())
+            )
+        );
+    }
     let ayc = emit_session_certificate(&session, OPEN_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-dp")
@@ -986,6 +1189,37 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
         .is_some());
+    let proof = session
+        .open_domain_hybrid_pb_lp_infeasibility_certificate()
+        .expect("typed consumer artifact");
+    assert!(
+        ay_milp::verify_open_domain_hybrid_pb_lp_infeasibility_certificate(session.model(), proof)
+    );
+    assert!(
+        ay_milp::verify_open_domain_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            None
+        )
+    );
+    assert!(
+        !ay_milp::verify_open_domain_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            Some(std::time::Instant::now())
+        )
+    );
+    let feasible = ay_milp::read_mps(&OPEN_HYBRID_INF.replace("RLOW       1", "RLOW       0"))
+        .expect("relaxed source")
+        .model;
+    feasible
+        .check_point(&[
+            BigRational::from_integer(0.into()),
+            BigRational::from_integer(2.into()),
+            BigRational::from_integer(0.into()),
+        ])
+        .expect("source really is feasible");
+    assert!(!ay_milp::verify_open_domain_hybrid_pb_lp_infeasibility_certificate(&feasible, proof));
     let ayc = emit_session_certificate(&session, OPEN_HYBRID_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-hybrid-pb-lp"),
@@ -1033,6 +1267,45 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
     assert!(session
         .open_domain_hybrid_integer_lift_infeasibility_certificate()
         .is_some());
+    let proof = session
+        .open_domain_hybrid_integer_lift_infeasibility_certificate()
+        .expect("typed consumer artifact");
+    assert!(
+        ay_milp::verify_open_domain_hybrid_integer_lift_infeasibility_certificate(
+            session.model(),
+            proof
+        )
+    );
+    assert!(
+        ay_milp::verify_open_domain_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            None
+        )
+    );
+    assert!(
+        !ay_milp::verify_open_domain_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            Some(std::time::Instant::now())
+        )
+    );
+    let feasible =
+        ay_milp::read_mps(&OPEN_HYBRID_INTEGER_INF.replace("RLOW       1", "RLOW       0"))
+            .expect("relaxed source")
+            .model;
+    feasible
+        .check_point(&[
+            BigRational::from_integer(0.into()),
+            BigRational::from_integer(2.into()),
+            BigRational::from_integer(0.into()),
+        ])
+        .expect("source really is feasible");
+    assert!(
+        !ay_milp::verify_open_domain_hybrid_integer_lift_infeasibility_certificate(
+            &feasible, proof
+        )
+    );
     let ayc = emit_session_certificate(&session, OPEN_HYBRID_INTEGER_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-hybrid-integer-lift"),
@@ -1067,7 +1340,10 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     let scale = p.obj_scale.clone();
     let opts = SolveOpts::new()
         .with_time_limit(std::time::Duration::from_mins(5)) // Hang guard, not a performance limit.
-        .with_require_certificates(true);
+        .with_require_certificates(true)
+        // This fixture pins a serializer, not the default speculative probe's
+        // scheduling. Keep the hybrid route available after that probe expires.
+        .with_engine(EngineEconomics::new().with_hybrid_pb_lp(true));
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture hybrid solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
@@ -1083,6 +1359,22 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     );
     let parsed = cert_io::parse(&ayc).expect("hybrid certificate parses");
     assert!(parsed.hybrid_pb_lp.is_some());
+    let proof = parsed.hybrid_pb_lp.as_ref().expect("typed hybrid proof");
+    ay_milp::verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+        session.model(),
+        proof,
+        None,
+    )
+    .expect("public bounded hybrid replay");
+    assert_eq!(
+        ay_milp::verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            Some(std::time::Instant::now())
+        ),
+        Err(ay_milp::HybridPbLpCertificateVerificationError::Interrupted),
+    );
+
     let report = cert_io::check(&ayc, HYBRID_INF);
     assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     let format = "ay.hybrid-pb-lp-infeasible.v1";
@@ -1096,6 +1388,14 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
         .add_row(f64::NEG_INFINITY, f64::INFINITY, &[])
         .expect("model mutation");
     assert!(session.hybrid_pb_lp_infeasibility_certificate().is_none());
+}
+
+#[test]
+fn default_hybrid_model_still_emits_verifying_infeasibility() {
+    let (ayc, outcome) = solve_full_and_emit(HYBRID_INF);
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
+    let report = cert_io::check(&ayc, HYBRID_INF);
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 }
 
 #[test]
@@ -1117,6 +1417,46 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
         .is_some());
+    let proof = session
+        .hybrid_integer_lift_infeasibility_certificate()
+        .expect("typed consumer artifact");
+    ay_milp::verify_hybrid_integer_lift_infeasibility_certificate(session.model(), proof)
+        .expect("public original-model replay");
+    ay_milp::verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+        session.model(),
+        proof,
+        None,
+    )
+    .expect("same replay without a deadline");
+    assert_eq!(
+        ay_milp::verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+            session.model(),
+            proof,
+            Some(std::time::Instant::now())
+        ),
+        Err(ay_milp::HybridIntegerLiftCertificateVerificationError::Interrupted),
+    );
+    assert_eq!(
+        ay_milp::verify_hybrid_integer_lift_infeasibility_certificate_interruptible(
+            session.model(),
+            proof,
+            None,
+            &mut || true
+        ),
+        Err(ay_milp::HybridIntegerLiftCertificateVerificationError::Interrupted),
+    );
+    let feasible = ay_milp::read_mps(&HYBRID_INTEGER_INF.replace("RLOW       1", "RLOW       0"))
+        .expect("relaxed source")
+        .model;
+    feasible
+        .check_point(&[
+            BigRational::from_integer(0.into()),
+            BigRational::from_integer(0.into()),
+        ])
+        .expect("source really is feasible");
+    assert!(
+        ay_milp::verify_hybrid_integer_lift_infeasibility_certificate(&feasible, proof).is_err()
+    );
     let ayc = emit_session_certificate(&session, HYBRID_INTEGER_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT hybrid-integer-lift"),
@@ -1741,6 +2081,7 @@ fn a_size_cap_downgrades_the_claim_it_drops() {
         block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: None,
         root_dual_bound_certificate: None,
+        milp_optimality_tree_block: None,
         single_machine_scheduling_optimality_certificate: s
             .single_machine_scheduling_optimality_certificate(),
         single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
@@ -2603,4 +2944,204 @@ fn a_tree_checked_against_a_different_model_is_not_verified() {
     let (ayc, _) = milp_with_tree();
     let r = cert_io::check(&ayc, LP);
     assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+}
+
+/// The `.ayc` a STREAMED tree produces, from the same session and outcome as
+/// [`milp_with_tree`].
+fn milp_with_streamed_tree() -> String {
+    let p = ay_milp::read_mps(MILP).expect("parses");
+    let names = p.col_names.clone();
+    let scale = p.obj_scale.clone();
+    let opts = SolveOpts::new().with_time_limit(std::time::Duration::from_secs(20));
+    let mut session = BabSession::new(p.model, &opts).expect("session");
+    let outcome = session.check().expect("solve");
+    let Outcome::Optimal {
+        value,
+        model_values,
+        ..
+    } = &outcome
+    else {
+        panic!("MILP fixture must solve to optimality: {outcome:?}");
+    };
+    let (streamed, _) = ay_milp::stream_optimality_tree(
+        session.model(),
+        value,
+        model_values,
+        &ay_milp::OptimalityTreeBudget::new(4096),
+    );
+    let streamed = streamed.expect("the streaming descent closes the same model");
+    let ctx = cert_io::EmitCtx {
+        model: session.model(),
+        model_text: MILP,
+        col_names: &names,
+        obj_scale: &scale,
+        provenance: "host=test",
+        replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
+        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
+        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
+        network_design_infeasibility_certificate: session
+            .network_design_infeasibility_certificate(),
+        network_design_optimality_certificate: session.network_design_optimality_certificate(),
+        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
+        milp_optimality_tree_certificate: None,
+        milp_optimality_tree_block: Some(streamed.body()),
+        root_dual_bound_certificate: None,
+        single_machine_scheduling_optimality_certificate: session
+            .single_machine_scheduling_optimality_certificate(),
+        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
+        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
+        open_domain_single_row_dp_infeasibility_certificate: session
+            .open_domain_single_row_dp_infeasibility_certificate(),
+        open_domain_multi_row_bdd_infeasibility_certificate: session
+            .open_domain_multi_row_bdd_infeasibility_certificate(),
+        open_domain_hybrid_pb_lp_infeasibility_certificate: session
+            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
+        open_domain_hybrid_integer_lift_infeasibility_certificate: session
+            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
+        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
+        hybrid_integer_lift_infeasibility_certificate: session
+            .hybrid_integer_lift_infeasibility_certificate(),
+        max_bytes: None,
+    };
+    cert_io::emit(&ctx, &outcome)
+}
+
+#[test]
+fn a_streamed_tree_emits_a_byte_identical_certificate() {
+    // THE FORMAT PIN. A streaming emitter is a memory optimisation and NOTHING
+    // ELSE; the moment its output differs from the held tree's, twenty ratchet
+    // pins and the PB gate are measuring a different artifact than they were
+    // built against. `%END sha256` digests the body, so equality here is
+    // equality of every block, every record and the digest over them.
+    let (held, _) = milp_with_tree();
+    let streamed = milp_with_streamed_tree();
+    // The `solver ... epoch=<unix seconds>` stamp is the one field that is a
+    // function of WHEN rather than of WHAT, so it — and only it — is normalised
+    // before the comparison. The `%END sha256` trailer digests the body
+    // INCLUDING that stamp, so it is normalised on the same rule.
+    let norm = |s: &str| -> String {
+        s.lines()
+            .map(|l| {
+                if l.starts_with("solver ") || l.starts_with("%END sha256") {
+                    "<stamp>".to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        norm(&held),
+        norm(&streamed),
+        "the streamed certificate is not the held certificate"
+    );
+    // And it is not merely equal, it is CHECKABLE: same verdict, same exit.
+    let r = cert_io::check(&streamed, MILP);
+    assert_eq!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 0);
+    assert!(streamed.contains("evidence dual SUCCINCT optimality-tree"));
+}
+
+#[test]
+fn a_streamed_tree_that_does_not_fit_the_cap_is_dropped_and_the_claim_downgraded() {
+    // THE ONE PATH A CHEAPER PRODUCER COULD HAVE MADE DISHONEST. A streamed
+    // body is admitted by its own writer (`admit_opt_tree_body`) rather than by
+    // the generic `admit`, so it needs its own proof that an overflowing block
+    // is DROPPED WHOLE and its claim downgraded to `NONE` — never silently
+    // shortened, and never left labelled SUCCINCT with nothing behind it.
+    //
+    // A shortened `opttree` block is the most dangerous truncation in the
+    // format: the grammar cannot tell a pre-order walk that stops early from
+    // one that finished, so a half-tree would look structurally fine while
+    // covering only part of the feasible set. The verifier refuses it
+    // (`Incomplete`), and this refuses it one step earlier, at emission.
+    let p = ay_milp::read_mps(MILP).expect("parses");
+    let names = p.col_names.clone();
+    let scale = p.obj_scale.clone();
+    let opts = SolveOpts::new().with_time_limit(std::time::Duration::from_secs(20));
+    let mut session = BabSession::new(p.model, &opts).expect("session");
+    let outcome = session.check().expect("solve");
+    let Outcome::Optimal {
+        value,
+        model_values,
+        ..
+    } = &outcome
+    else {
+        panic!("MILP fixture must solve to optimality: {outcome:?}");
+    };
+    let (streamed, _) = ay_milp::stream_optimality_tree(
+        session.model(),
+        value,
+        model_values,
+        &ay_milp::OptimalityTreeBudget::new(4096),
+    );
+    let streamed = streamed.expect("the streaming descent closes this model");
+    assert!(!streamed.body().is_empty());
+
+    let emit = |cap: Option<usize>| -> String {
+        let ctx = cert_io::EmitCtx {
+            model: session.model(),
+            model_text: MILP,
+            col_names: &names,
+            obj_scale: &scale,
+            provenance: "host=test",
+            replay_claims: session.replay_claims(),
+            affine_aggregation_certificate: session.affine_aggregation_certificate(),
+            parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
+            sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
+            network_design_infeasibility_certificate: session
+                .network_design_infeasibility_certificate(),
+            network_design_optimality_certificate: session.network_design_optimality_certificate(),
+            block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
+            milp_optimality_tree_certificate: None,
+            milp_optimality_tree_block: Some(streamed.body()),
+            root_dual_bound_certificate: None,
+            single_machine_scheduling_optimality_certificate: session
+                .single_machine_scheduling_optimality_certificate(),
+            single_row_dp_infeasibility_certificate: session
+                .single_row_dp_infeasibility_certificate(),
+            multi_row_bdd_infeasibility_certificate: session
+                .multi_row_bdd_infeasibility_certificate(),
+            open_domain_single_row_dp_infeasibility_certificate: session
+                .open_domain_single_row_dp_infeasibility_certificate(),
+            open_domain_multi_row_bdd_infeasibility_certificate: session
+                .open_domain_multi_row_bdd_infeasibility_certificate(),
+            open_domain_hybrid_pb_lp_infeasibility_certificate: session
+                .open_domain_hybrid_pb_lp_infeasibility_certificate(),
+            open_domain_hybrid_integer_lift_infeasibility_certificate: session
+                .open_domain_hybrid_integer_lift_infeasibility_certificate(),
+            hybrid_pb_lp_infeasibility_certificate: session
+                .hybrid_pb_lp_infeasibility_certificate(),
+            hybrid_integer_lift_infeasibility_certificate: session
+                .hybrid_integer_lift_infeasibility_certificate(),
+            max_bytes: cap,
+        };
+        cert_io::emit(&ctx, &outcome)
+    };
+
+    // A cap that admits the witness but not the tree: the DUAL claim is the one
+    // that must fall, and the primal one must survive untouched.
+    let tight = emit(Some(streamed.body().len()));
+    assert!(tight.contains("truncated optimality-tree"), "{tight}");
+    assert!(tight.contains("evidence dual NONE truncated"), "{tight}");
+    assert!(!tight.contains("\nopttree\n"), "{tight}");
+    assert!(!tight.contains("\nboundleaf\n"), "{tight}");
+    // NOT Verified, and not silently shortened either: there is no partial tree
+    // in the file at all.
+    let r = cert_io::check(&tight, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_ne!(r.status().exit_code(), 0);
+
+    // CONTROL: the same body under no cap verifies, so the refusal above is
+    // about the cap and not about the streamed body being unusable.
+    let full = emit(None);
+    assert!(
+        full.contains("evidence dual SUCCINCT optimality-tree"),
+        "{full}"
+    );
+    let r = cert_io::check(&full, MILP);
+    assert_eq!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 0);
 }

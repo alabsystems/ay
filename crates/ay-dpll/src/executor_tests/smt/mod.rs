@@ -12,7 +12,11 @@ use ay_frontend::parse;
 mod array_declared_witness;
 #[cfg(debug_assertions)]
 mod array_persistent_combiner_shadow;
+mod bv_lia_indep_agreement;
+mod bv_lia_indep_final_assignment;
 mod bv_lia_indep_model_graft;
+mod dt_array_field_proxy;
+mod dt_array_quoted_carrier;
 mod qf_auflia;
 mod qf_auflia_l3_propagation;
 mod qf_auflra_and_regression;
@@ -22,3 +26,4 @@ mod qf_lia;
 mod qf_lra;
 mod qf_uflia;
 mod qf_uflra;
+mod set_fold_pinned_read_proof_fold;

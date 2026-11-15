@@ -36,9 +36,7 @@
 
 mod analysis;
 
-use crate::{
-    ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause, PredicateId,
-};
+use crate::{ChcExpr, ChcProblem, ChcSort, ClauseBody, ClauseHead, HornClause, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 use super::{
@@ -124,42 +122,33 @@ impl DeadParamEliminator {
             }
         }
 
-        // Build new problem with reduced predicates
-        let mut new_problem = ChcProblem::new();
-        // Preserve datatype definitions (problem-level routing metadata,
-        // #7016): parameter elimination never touches datatype declarations,
-        // and dropping them silently degraded downstream executor routing on
-        // DT problems (#chc25-dtbv-lane-perf).
-        for (name, ctors) in problem.datatype_defs() {
-            new_problem.add_datatype_def(name.clone(), ctors.clone());
-        }
-
-        // Declare predicates with reduced arities
-        for pred in problem.predicates() {
-            let mapping = &position_map[&pred.id];
-            let new_sorts: Vec<ChcSort> = pred
-                .arg_sorts
+        // Preserve actions, source ordinals, datatype signatures and the
+        // frozen source interpretation of previously pruned queries.
+        let kept: Vec<Vec<usize>> = problem
+            .predicates()
+            .iter()
+            .map(|predicate| {
+                position_map[&predicate.id]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, target)| target.map(|_| position))
+                    .collect()
+            })
+            .collect();
+        let mut new_problem = problem.clone();
+        if new_problem
+            .project_predicate_signatures(&kept, &mut || !ay_core::resource::check_stop_requested())
+            .is_none()
+        {
+            let identity = problem
+                .predicates()
                 .iter()
-                .enumerate()
-                .filter_map(|(i, sort)| {
-                    if mapping[i].is_some() {
-                        Some(sort.clone())
-                    } else {
-                        None
-                    }
-                })
+                .map(|predicate| (predicate.id, (0..predicate.arity()).map(Some).collect()))
                 .collect();
-            new_problem.declare_predicate(&pred.name, new_sorts);
+            return (problem.clone(), identity);
         }
-
-        // Rewrite clauses
-        for clause in problem.clauses() {
-            let new_clause = self.rewrite_clause(clause, &position_map);
-            new_problem.add_clause(new_clause);
-        }
-
-        if problem.is_fixedpoint_format() {
-            new_problem.set_fixedpoint_format();
+        for clause in new_problem.clauses_mut() {
+            *clause = self.rewrite_clause(clause, &position_map);
         }
 
         if self.verbose {
@@ -220,7 +209,10 @@ impl DeadParamEliminator {
             ClauseHead::False => ClauseHead::False,
         };
 
-        HornClause::new(new_body, new_head)
+        let mut rewritten = clause.clone();
+        rewritten.body = new_body;
+        rewritten.head = new_head;
+        rewritten
     }
 }
 
@@ -321,30 +313,19 @@ impl BackTranslator for DeadParamBackTranslator {
                 }
             };
 
-            // Rebuild the variable list with dead parameters re-inserted
-            let mut new_vars = Vec::with_capacity(original_sorts.len());
-            let mut reduced_idx = 0;
-            for (old_idx, sort) in original_sorts.iter().enumerate() {
-                if old_idx < mapping.len() && mapping[old_idx].is_some() {
-                    // Live parameter — use the variable from the reduced interpretation
-                    if reduced_idx < interp.vars.len() {
-                        new_vars.push(interp.vars[reduced_idx].clone());
-                    } else {
-                        // Fallback: create a fresh variable
-                        new_vars.push(ChcVar::new(
-                            format!("__dead_{pred_id}_{old_idx}"),
-                            sort.clone(),
-                        ));
-                    }
-                    reduced_idx += 1;
-                } else {
-                    // Dead parameter — insert a fresh unconstrained variable
-                    new_vars.push(ChcVar::new(
-                        format!("__dead_{pred_id}_{old_idx}"),
-                        sort.clone(),
-                    ));
-                }
-            }
+            let kept: Vec<_> = mapping
+                .iter()
+                .enumerate()
+                .filter_map(|(position, target)| target.map(|_| position))
+                .collect();
+            let Some(new_vars) = super::parameter_vars::restore(
+                interp,
+                original_sorts,
+                &kept,
+                &format!("__dead_{pred_id}"),
+            ) else {
+                continue;
+            };
 
             new_interpretations.insert(
                 *pred_id,

@@ -19,13 +19,13 @@ struct ProbeBudget {
 }
 
 enum SingleRowProbe {
-    Finished(Outcome),
+    Finished(RouteOutcome),
     Declined(ProbeBudget),
 }
 
 pub(super) fn run(session: &mut BabSession, state: &mut CheckState) -> RouteOutcome {
     let budget = match try_single_row(session, state) {
-        SingleRowProbe::Finished(outcome) => return RouteOutcome::finish(outcome),
+        SingleRowProbe::Finished(outcome) => return outcome,
         SingleRowProbe::Declined(budget) => budget,
     };
     for route in [try_multi_row, try_open_domain, try_hybrid] {
@@ -99,11 +99,11 @@ fn try_multi_row(
         return RouteOutcome::Continue;
     };
     session.multi_row_bdd_infeasibility_certificate = Some(certificate);
-    RouteOutcome::finish(finish_infeasible(
+    finish_infeasible(
         session,
         state,
         SupplementalProof::VerifiedMultiRowBddInfeasibility,
-    ))
+    )
 }
 
 fn try_open_domain(
@@ -151,7 +151,7 @@ fn try_open_domain(
         }
         _ => return RouteOutcome::Continue,
     };
-    RouteOutcome::finish(finish_infeasible(session, state, proof))
+    finish_infeasible(session, state, proof)
 }
 
 fn try_hybrid(
@@ -166,7 +166,7 @@ fn try_hybrid(
         "hybrid_pb_lp",
         budget.single_row_cost,
         budget.deadline,
-        |deadline| crate::hybrid_pb_lp::try_solve_certified(&session.model, Some(deadline)),
+        |deadline| crate::hybrid_pb_lp::try_refute_certified(&session.model, Some(deadline)),
     );
     if structure_trace_enabled() {
         eprintln!(
@@ -178,11 +178,11 @@ fn try_hybrid(
     match direct {
         Some(crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Infeasible(certificate)) => {
             session.hybrid_pb_lp_infeasibility_certificate = Some(certificate);
-            RouteOutcome::finish(finish_infeasible(
+            finish_infeasible(
                 session,
                 state,
                 SupplementalProof::VerifiedHybridPbLpInfeasibility,
-            ))
+            )
         }
         Some(_) => RouteOutcome::Continue,
         None => try_lifted_hybrid(session, state, budget),
@@ -199,7 +199,7 @@ fn try_lifted_hybrid(
         "hybrid_integer_lift",
         budget.single_row_cost,
         budget.deadline,
-        |deadline| crate::hybrid_integer_lift::try_solve_certified(&session.model, Some(deadline)),
+        |deadline| crate::hybrid_integer_lift::try_refute_certified(&session.model, Some(deadline)),
     );
     if structure_trace_enabled() {
         eprintln!(
@@ -215,20 +215,20 @@ fn try_lifted_hybrid(
         return RouteOutcome::Continue;
     };
     session.hybrid_integer_lift_infeasibility_certificate = Some(certificate);
-    RouteOutcome::finish(finish_infeasible(
+    finish_infeasible(
         session,
         state,
         SupplementalProof::VerifiedHybridIntegerLiftInfeasibility,
-    ))
+    )
 }
 
 fn finish_infeasible(
     session: &BabSession,
     state: &mut CheckState,
     proof: SupplementalProof,
-) -> Outcome {
+) -> RouteOutcome {
     let solved = state.take_solved(session);
-    finish_exact_reduction_with_supplemental_proof(
+    let outcome = finish_exact_reduction_with_supplemental_proof(
         Outcome::Infeasible {
             cert: None,
             tree_cert: None,
@@ -237,5 +237,6 @@ fn finish_infeasible(
         &solved,
         &session.opts,
         proof,
-    )
+    );
+    RouteOutcome::finish_with_proof(outcome, proof)
 }

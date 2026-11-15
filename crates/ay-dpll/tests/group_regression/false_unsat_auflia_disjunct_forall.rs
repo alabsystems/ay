@@ -238,6 +238,18 @@ fn six_rodin_benchmarks_are_never_unsat() {
         checked += 1;
     }
     if checked == 0 {
+        // A false-UNSAT guard that checked nothing is not a passing guard. This
+        // used to print and PASS, and a worktree agent reported the whole
+        // family green while this test read zero files. `AY_REQUIRE_CORPUS=1`
+        // is the workspace's existing switch for exactly that, and any bisect,
+        // attribution or A/B harness must set it.
+        assert!(
+            std::env::var_os("AY_REQUIRE_CORPUS").is_none(),
+            "AY_REQUIRE_CORPUS=1 is set and none of the six \
+             AUFLIA/20170829-Rodin corpus files were found — this guard \
+             checked NOTHING. Fetch with `ay-z3-parity fetch \
+             benchmarks/smtlib-all --divisions AUFLIA`."
+        );
         eprintln!(
             "SKIP: none of the six AUFLIA/20170829-Rodin corpus files are \
              present. Fetch with `ay-z3-parity fetch benchmarks/smtlib-all \

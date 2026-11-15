@@ -7,16 +7,21 @@
 //! Extracted from `mod.rs` to reduce file size (Wave C1 of #2998 module splits).
 //! All methods are `impl Executor` — they share the same method namespace.
 
-use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::term::{Constant, Symbol, TermData, TermStore};
+use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId};
-use ay_fp::{FpModelValue, FpSolver, RoundingMode};
-use ay_sat::{SatResult, Solver as SatSolver};
+use ay_fp::{FpModelValue, RoundingMode};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use super::{EvalValue, Executor, Model};
+
+mod controlled;
+mod fields;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+pub(in crate::executor) use controlled::FpEvalPhase;
 
 /// Round an exact rational to an integer per the SMT-LIB rounding-mode
 /// semantics used by `fp.to_sbv` / `fp.to_ubv`:
@@ -46,44 +51,6 @@ fn round_rational_to_integer(r: &BigRational, rm: RoundingMode) -> BigInt {
     }
 }
 
-/// Significand of an f64 value that underflows into the target format's
-/// subnormal range. `None` when the result is not representable in `u64`.
-///
-/// Split out of the conversion because this shift arithmetic is what PANICKED:
-/// `right_shift = 1 - target_exp_biased` is UNBOUNDED — `target_exp_biased` is
-/// arbitrarily negative when an f64 normal is converted to a narrow target — so
-/// the total shift routinely exceeds 63, and Rust's `>>` is not defined past the
-/// operand width. With overflow checks on that is `attempt to shift right with
-/// overflow` (observed as `exit_code: 1` on
-/// `inc/FPArith/.../float20_true-unreach-call.i.smt2`, on a scoreboard that
-/// nonetheless reported `errors: 0`). With them off it is worse: the shift
-/// amount is masked to 6 bits and a NONZERO significand is fabricated for a
-/// value that underflowed to zero — a wrong model value rather than a crash.
-///
-/// Treating the shift arithmetically removes both: a 53-bit significand shifted
-/// right by 64 or more is exactly `0`, which is the signed zero the caller
-/// already returns for a zero significand.
-fn underflow_significand(full_sig: u64, right_shift: u64, shift_to_target: i64) -> Option<u64> {
-    if right_shift >= 64 {
-        return Some(0);
-    }
-    let base = full_sig >> right_shift;
-    if shift_to_target < 0 {
-        // Shifting further right; saturating past the width is exact zero.
-        return match right_shift.checked_add(shift_to_target.unsigned_abs()) {
-            Some(total) if total < 64 => Some(full_sig >> total),
-            _ => Some(0),
-        };
-    }
-    // Target format wider than f64: the left shift can drop high bits. Fail
-    // closed rather than publish a silently truncated significand.
-    let left = u32::try_from(shift_to_target).ok()?;
-    if left >= 64 || base.leading_zeros() < left {
-        return None;
-    }
-    Some(base << left)
-}
-
 impl Executor {
     /// Resolve a rounding-mode operand to a concrete mode: a literal
     /// (`RNE`…`roundTowardZero`) directly, otherwise THROUGH THE MODEL
@@ -92,13 +59,12 @@ impl Executor {
     /// `evaluate_term` as an `Element` carrying the mode's long name).
     /// `None` — never a silent RNE default — when the model does not pin it.
     fn rounding_mode(&self, model: &Model, rm_term: TermId) -> Option<RoundingMode> {
-        let literal = match self.ctx.terms.get(rm_term) {
-            TermData::App(sym, _) => RoundingMode::from_name(sym.name()),
-            TermData::Var(name, _) => RoundingMode::from_name(name),
-            _ => None,
-        };
-        if literal.is_some() {
-            return literal;
+        if !crate::executor::rm_domain::is_rm_sort(self.ctx.terms.sort(rm_term)) {
+            return None;
+        }
+        if let Some(literal) = crate::executor::rm_domain::rm_literal_mode(&self.ctx.terms, rm_term)
+        {
+            return Some(literal);
         }
         match self.evaluate_term(model, rm_term) {
             EvalValue::Element(name) => RoundingMode::from_name(&name),
@@ -106,8 +72,65 @@ impl Executor {
         }
     }
 
-    fn is_rne_rounding_mode(&self, model: &Model, rm_term: TermId) -> bool {
-        matches!(self.rounding_mode(model, rm_term), Some(RoundingMode::RNE))
+    /// The value the solve chose for an application of `fp.to_ubv`/`fp.to_sbv`
+    /// at an argument where SMT-LIB leaves the result unspecified (NaN, an
+    /// infinity, or out of range for the width).
+    ///
+    /// The conversion is still a FUNCTION of `(rm, x)`: every application of
+    /// the same operator, width and mode at an equal `x` denotes one value. The
+    /// FP bit-blaster records each application's chosen bits; this reads the
+    /// application's own record or — when preprocessing rewrote the
+    /// application the solver saw (a folded constant argument) — the record of
+    /// any application of the same function at an equal argument. Disagreeing
+    /// records, or none, abstain (`Unknown`).
+    fn unspec_to_bv(
+        &self,
+        model: &Model,
+        term_id: TermId,
+        sort: &Sort,
+        rm: RoundingMode,
+        x: &FpModelValue,
+    ) -> EvalValue {
+        let own = self.bv_model_cache_fallback(model, term_id, sort);
+        if !matches!(own, EvalValue::Unknown) {
+            return own;
+        }
+        let TermData::App(own_symbol, _) = self.ctx.terms.get(term_id) else {
+            return EvalValue::Unknown;
+        };
+        let name = own_symbol.name();
+        let (Some(bv_model), Sort::BitVec(bv)) = (model.bv_model.as_ref(), sort) else {
+            return EvalValue::Unknown;
+        };
+        let key = x.to_smtlib();
+        let mut chosen: Option<&BigInt> = None;
+        for (&other, value) in &bv_model.values {
+            let TermData::App(sym, args) = self.ctx.terms.get(other) else {
+                continue;
+            };
+            if other == term_id
+                || sym.name() != name
+                || args.len() != 2
+                || self.ctx.terms.sort(other) != sort
+                || super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, other)
+                || self.rounding_mode(model, args[0]) != Some(rm)
+            {
+                continue;
+            }
+            match self.evaluate_term(model, args[1]) {
+                EvalValue::Fp(y) if y.to_smtlib() == key => {}
+                _ => continue,
+            }
+            match chosen {
+                None => chosen = Some(value),
+                Some(previous) if previous == value => {}
+                Some(_) => return EvalValue::Unknown,
+            }
+        }
+        chosen.map_or(EvalValue::Unknown, |value| EvalValue::BitVec {
+            value: value.clone(),
+            width: bv.width,
+        })
     }
 
     /// Exact IEEE 754 remainder `fp.rem(x, y)` for the model evaluator.
@@ -168,328 +191,6 @@ impl Executor {
         // The remainder is exact and representable, so RNE performs no rounding.
         FpModelValue::from_rational_with_format(&r, eb, sb, RoundingMode::RNE)
             .map_or(EvalValue::Unknown, EvalValue::Fp)
-    }
-
-    /// Convert an `f64` result back to an `EvalValue::Fp`, inheriting the
-    /// format (eb, sb) from a reference operand. Returns `Unknown` for
-    /// formats wider than Float64 (eb=11, sb=53).
-    fn f64_to_fp_eval(&self, val: f64, reference: &FpModelValue) -> EvalValue {
-        let eb = reference.eb();
-        let sb = reference.sb();
-        if eb > 11 || sb > 53 {
-            return EvalValue::Unknown;
-        }
-        if val.is_nan() {
-            return EvalValue::Fp(FpModelValue::NaN { eb, sb });
-        }
-        if val.is_infinite() {
-            return if val.is_sign_positive() {
-                EvalValue::Fp(FpModelValue::PosInf { eb, sb })
-            } else {
-                EvalValue::Fp(FpModelValue::NegInf { eb, sb })
-            };
-        }
-        if val == 0.0 {
-            return if val.is_sign_negative() {
-                EvalValue::Fp(FpModelValue::NegZero { eb, sb })
-            } else {
-                EvalValue::Fp(FpModelValue::PosZero { eb, sb })
-            };
-        }
-        // Decompose into IEEE 754 components
-        let bits = val.to_bits();
-        let sign = (bits >> 63) != 0;
-        let f64_exp = ((bits >> 52) & 0x7FF) as i64;
-        let f64_frac = bits & 0x000F_FFFF_FFFF_FFFF;
-
-        let bias = (1i64 << (eb - 1)) - 1;
-        let stored_bits = sb - 1;
-
-        if f64_exp == 0 {
-            // Subnormal in f64 — try to represent in target format
-            // The actual exponent is 1 - 1023 = -1022 for f64 subnormals
-            let f64_bias: i64 = 1023;
-            let actual_exp = 1 - f64_bias;
-            let target_exp_biased = actual_exp + bias;
-            if target_exp_biased <= 0 {
-                // Subnormal in target format too
-                let shift = i64::from(stored_bits) - 52 + (1 - target_exp_biased);
-                let sig = if shift >= 0 {
-                    f64_frac << shift as u64
-                } else {
-                    f64_frac >> (-shift) as u64
-                };
-                EvalValue::Fp(FpModelValue::Fp {
-                    sign,
-                    exponent: 0,
-                    significand: sig,
-                    eb,
-                    sb,
-                })
-            } else {
-                // Normalizes in target format — punt to Unknown for now
-                EvalValue::Unknown
-            }
-        } else {
-            // Normal in f64
-            let f64_bias: i64 = 1023;
-            let actual_exp = f64_exp - f64_bias;
-            let target_exp_biased = actual_exp + bias;
-            let max_exp = (1i64 << eb) - 1;
-            if target_exp_biased >= max_exp {
-                // Overflow to infinity in target format
-                return if sign {
-                    EvalValue::Fp(FpModelValue::NegInf { eb, sb })
-                } else {
-                    EvalValue::Fp(FpModelValue::PosInf { eb, sb })
-                };
-            }
-            if target_exp_biased <= 0 {
-                // Underflow to subnormal or zero in target format
-                // Shift significand right by (1 - target_exp_biased) places
-                let hidden = 1u64 << 52;
-                let full_sig = f64_frac | hidden;
-                let right_shift = (1 - target_exp_biased) as u64;
-                let shift_to_target = if stored_bits >= 52 {
-                    i64::from(stored_bits - 52)
-                } else {
-                    -i64::from(52 - stored_bits)
-                };
-                let Some(sig) = underflow_significand(full_sig, right_shift, shift_to_target)
-                else {
-                    return EvalValue::Unknown;
-                };
-                if sig == 0 {
-                    return if sign {
-                        EvalValue::Fp(FpModelValue::NegZero { eb, sb })
-                    } else {
-                        EvalValue::Fp(FpModelValue::PosZero { eb, sb })
-                    };
-                }
-                return EvalValue::Fp(FpModelValue::Fp {
-                    sign,
-                    exponent: 0,
-                    significand: sig,
-                    eb,
-                    sb,
-                });
-            }
-            // Normal in target format: shift significand with RNE rounding (#6203)
-            let sig = if stored_bits >= 52 {
-                f64_frac << (stored_bits - 52)
-            } else {
-                let shift = 52 - stored_bits;
-                let truncated = f64_frac >> shift;
-                // RNE: check guard, round, sticky bits
-                let guard = (f64_frac >> (shift - 1)) & 1;
-                let sticky = if shift >= 2 {
-                    (f64_frac & ((1u64 << (shift - 1)) - 1)) != 0
-                } else {
-                    false
-                };
-                // Round up if: guard=1 AND (sticky=1 OR truncated is odd)
-                if guard == 1 && (sticky || (truncated & 1) == 1) {
-                    truncated + 1
-                } else {
-                    truncated
-                }
-            };
-            // Handle significand overflow from rounding (e.g., 0b1111...1 + 1)
-            let max_sig = (1u64 << stored_bits) - 1;
-            if sig > max_sig {
-                let new_exp = target_exp_biased + 1;
-                if new_exp >= max_exp {
-                    return if sign {
-                        EvalValue::Fp(FpModelValue::NegInf { eb, sb })
-                    } else {
-                        EvalValue::Fp(FpModelValue::PosInf { eb, sb })
-                    };
-                }
-                EvalValue::Fp(FpModelValue::Fp {
-                    sign,
-                    exponent: new_exp as u64,
-                    significand: 0, // carry into exponent
-                    eb,
-                    sb,
-                })
-            } else {
-                EvalValue::Fp(FpModelValue::Fp {
-                    sign,
-                    exponent: target_exp_biased as u64,
-                    significand: sig,
-                    eb,
-                    sb,
-                })
-            }
-        }
-    }
-
-    fn clone_eval_value_term(
-        &self,
-        terms: &mut TermStore,
-        sort: &Sort,
-        value: &EvalValue,
-    ) -> Option<TermId> {
-        match value {
-            EvalValue::Bool(v) => Some(terms.mk_bool(*v)),
-            EvalValue::Rational(r) => {
-                if matches!(sort, Sort::Int) && r.is_integer() {
-                    Some(terms.mk_int(r.numer().clone()))
-                } else {
-                    Some(terms.mk_rational(r.clone()))
-                }
-            }
-            EvalValue::BitVec { value, width } => Some(terms.mk_bitvec(value.clone(), *width)),
-            EvalValue::Fp(fp) => self.clone_fp_value_term(terms, fp),
-            EvalValue::String(s) => Some(terms.mk_string(s.clone())),
-            // RoundingMode model value (#P0.2 symbolic RoundingMode): clone as
-            // the literal nullary app, which the standalone FP solver resolves
-            // by name (`RoundingMode::from_name` accepts the long spelling).
-            EvalValue::Element(name)
-                if matches!(sort, Sort::Uninterpreted(s) if s == "RoundingMode")
-                    && RoundingMode::from_name(name).is_some() =>
-            {
-                Some(terms.mk_app(Symbol::named(name), vec![], sort.clone()))
-            }
-            _ => None,
-        }
-    }
-
-    fn clone_fp_value_term(&self, terms: &mut TermStore, value: &FpModelValue) -> Option<TermId> {
-        let eb = value.eb();
-        let sb = value.sb();
-        let sort = Sort::FloatingPoint(eb, sb);
-        match value {
-            FpModelValue::PosZero { .. } => {
-                Some(terms.mk_app(Symbol::indexed("+zero", vec![eb, sb]), vec![], sort))
-            }
-            FpModelValue::NegZero { .. } => {
-                Some(terms.mk_app(Symbol::indexed("-zero", vec![eb, sb]), vec![], sort))
-            }
-            FpModelValue::PosInf { .. } => {
-                Some(terms.mk_app(Symbol::indexed("+oo", vec![eb, sb]), vec![], sort))
-            }
-            FpModelValue::NegInf { .. } => {
-                Some(terms.mk_app(Symbol::indexed("-oo", vec![eb, sb]), vec![], sort))
-            }
-            FpModelValue::NaN { .. } => {
-                Some(terms.mk_app(Symbol::indexed("NaN", vec![eb, sb]), vec![], sort))
-            }
-            FpModelValue::Fp { .. } => {
-                let (bits, _) = value.to_ieee_bv();
-                let sig_width = sb - 1;
-                let sign = (&bits >> (eb + sig_width)) & BigInt::one();
-                let exp_mask = (BigInt::one() << eb) - BigInt::one();
-                let sig_mask = (BigInt::one() << sig_width) - BigInt::one();
-                let exponent = (&bits >> sig_width) & exp_mask;
-                let significand = bits & sig_mask;
-                let sign_term = terms.mk_bitvec(sign, 1);
-                let exp_term = terms.mk_bitvec(exponent, eb);
-                let sig_term = terms.mk_bitvec(significand, sig_width);
-                Some(terms.mk_app(
-                    Symbol::named("fp"),
-                    vec![sign_term, exp_term, sig_term],
-                    sort,
-                ))
-            }
-        }
-    }
-
-    fn clone_constant_term(&self, terms: &mut TermStore, constant: &Constant) -> Option<TermId> {
-        match constant {
-            Constant::Bool(v) => Some(terms.mk_bool(*v)),
-            Constant::Int(v) => Some(terms.mk_int(v.clone())),
-            Constant::Rational(v) => Some(terms.mk_rational(v.0.clone())),
-            Constant::BitVec { value, width } => Some(terms.mk_bitvec(value.clone(), *width)),
-            Constant::String(s) => Some(terms.mk_string(s.clone())),
-            _ => None,
-        }
-    }
-
-    fn concretize_term_for_fp_eval(
-        &self,
-        model: &Model,
-        term_id: TermId,
-        concrete_terms: &mut TermStore,
-        cache: &mut HashMap<TermId, TermId>,
-    ) -> Option<TermId> {
-        if let Some(&cached) = cache.get(&term_id) {
-            return Some(cached);
-        }
-
-        let sort = self.ctx.terms.sort(term_id).clone();
-
-        // FP bit-blast completion rebuilds a fresh concrete term. A scoped
-        // lambda value must be cloned into that term before any ambient FP
-        // model lookup; otherwise the rebuilt expression captures the bound
-        // variable's context-free model value instead of its beta value.
-        if let Some(value) = super::dt_model::active_term_override_lookup(&self.ctx.terms, term_id)
-        {
-            let concrete = self.clone_eval_value_term(concrete_terms, &sort, &value)?;
-            cache.insert(term_id, concrete);
-            return Some(concrete);
-        }
-
-        if !matches!(sort, Sort::FloatingPoint(..)) {
-            let eval = self.evaluate_term(model, term_id);
-            if !matches!(eval, EvalValue::Unknown) {
-                let concrete = self.clone_eval_value_term(concrete_terms, &sort, &eval)?;
-                cache.insert(term_id, concrete);
-                return Some(concrete);
-            }
-        } else if !super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id) {
-            if let Some(fp_model) = &model.fp_model {
-                if let Some(value) = fp_model.values.get(&term_id) {
-                    let concrete = self.clone_fp_value_term(concrete_terms, value)?;
-                    cache.insert(term_id, concrete);
-                    return Some(concrete);
-                }
-            }
-        }
-
-        // FAIL CLOSED on an unpinned symbolic RoundingMode (#P0.2): cloning an
-        // RM-sorted Var symbolically would let the standalone FP solver's
-        // `get_rounding_mode` fall into its silent `default() == RNE` branch —
-        // a wrong evaluation, not just an unknown one. (A model-pinned RM term
-        // was already cloned as its literal by the Element arm above; a
-        // LITERAL app or literal-named Var — embedder terms — resolves by name
-        // downstream and passes through.)
-        if matches!(&sort, Sort::Uninterpreted(s) if s == "RoundingMode")
-            && !crate::executor::rm_domain::is_rm_literal(&self.ctx.terms, term_id)
-        {
-            return None;
-        }
-
-        let concrete = match self.ctx.terms.get(term_id) {
-            TermData::Const(constant) => self.clone_constant_term(concrete_terms, constant)?,
-            TermData::Var(name, _) => concrete_terms.mk_var(name.clone(), sort.clone()),
-            TermData::App(sym, args) => {
-                let concrete_args = args
-                    .iter()
-                    .map(|&arg| self.concretize_term_for_fp_eval(model, arg, concrete_terms, cache))
-                    .collect::<Option<Vec<_>>>()?;
-                concrete_terms.mk_app(sym.clone(), concrete_args, sort.clone())
-            }
-            TermData::Not(arg) => {
-                let concrete_arg =
-                    self.concretize_term_for_fp_eval(model, *arg, concrete_terms, cache)?;
-                concrete_terms.mk_not(concrete_arg)
-            }
-            TermData::Ite(cond, then_term, else_term) => {
-                let concrete_cond =
-                    self.concretize_term_for_fp_eval(model, *cond, concrete_terms, cache)?;
-                let concrete_then =
-                    self.concretize_term_for_fp_eval(model, *then_term, concrete_terms, cache)?;
-                let concrete_else =
-                    self.concretize_term_for_fp_eval(model, *else_term, concrete_terms, cache)?;
-                concrete_terms.mk_ite(concrete_cond, concrete_then, concrete_else)
-            }
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return None,
-            _ => return None,
-        };
-
-        cache.insert(term_id, concrete);
-        Some(concrete)
     }
 
     fn signed_bv_to_bigint(&self, value: &BigInt, width: u32) -> BigInt {
@@ -559,51 +260,40 @@ impl Executor {
         }
     }
 
-    fn evaluate_fp_term_via_bitblast(&self, model: &Model, term_id: TermId) -> EvalValue {
-        let Sort::FloatingPoint(..) = self.ctx.terms.sort(term_id) else {
-            return EvalValue::Unknown;
+    /// `name(args)` computed exactly by `ay_fp::exact`, or Unknown when an
+    /// operand or the mode is not pinned or the result is not computed there.
+    fn exact_fp_op(&self, model: &Model, name: &str, args: &[TermId]) -> EvalValue {
+        use ay_fp::exact;
+        let fp = |i: usize| match self.evaluate_term(model, *args.get(i)?) {
+            EvalValue::Fp(v) => Some(v),
+            _ => None,
         };
-
-        let mut concrete_terms = TermStore::new();
-        let mut cache = HashMap::default();
-        let Some(concrete_term) =
-            self.concretize_term_for_fp_eval(model, term_id, &mut concrete_terms, &mut cache)
-        else {
-            return EvalValue::Unknown;
-        };
-
-        let mut fp_solver = FpSolver::new(&concrete_terms);
-        fp_solver.get_fp(concrete_term);
-        if fp_solver.has_encoding_gap() {
-            return EvalValue::Unknown;
-        }
-
-        let term_to_fp = fp_solver.term_to_fp().clone();
-        let clauses = fp_solver.take_clauses();
-        let mut sat_solver = SatSolver::new(fp_solver.num_vars() as usize);
-        sat_solver.set_congruence_enabled(false);
-        for clause in &clauses {
-            let lits: Vec<ay_sat::Literal> = clause
-                .literals()
-                .iter()
-                .map(|&lit| crate::cnf_lit_to_sat(lit))
-                .collect();
-            sat_solver.add_clause(lits);
-        }
-
-        match sat_solver.solve().into_inner() {
-            SatResult::Sat(sat_model) => {
-                let fp_model =
-                    Self::extract_fp_model_from_bits(&sat_model, &term_to_fp, 0, &concrete_terms);
-                fp_model
-                    .values
-                    .get(&concrete_term)
-                    .cloned()
-                    .map(EvalValue::Fp)
-                    .unwrap_or(EvalValue::Unknown)
+        let rounded =
+            |op: fn(RoundingMode, &FpModelValue, &FpModelValue) -> Option<FpModelValue>| {
+                op(self.rounding_mode(model, args[0])?, &fp(1)?, &fp(2)?)
+            };
+        let value = match name {
+            "fp.add" => rounded(exact::add),
+            "fp.sub" => rounded(exact::sub),
+            "fp.mul" => rounded(exact::mul),
+            "fp.div" => rounded(exact::div),
+            "fp.fma" => (|| {
+                exact::fma(
+                    self.rounding_mode(model, args[0])?,
+                    &fp(1)?,
+                    &fp(2)?,
+                    &fp(3)?,
+                )
+            })(),
+            "fp.sqrt" => (|| exact::sqrt(self.rounding_mode(model, args[0])?, &fp(1)?))(),
+            "fp.roundToIntegral" => {
+                (|| exact::round_to_integral(self.rounding_mode(model, args[0])?, &fp(1)?))()
             }
-            _ => EvalValue::Unknown,
-        }
+            "fp.min" => (|| exact::min(&fp(0)?, &fp(1)?))(),
+            "fp.max" => (|| exact::max(&fp(0)?, &fp(1)?))(),
+            _ => None,
+        };
+        value.map_or(EvalValue::Unknown, EvalValue::Fp)
     }
 
     /// Evaluate a floating-point application term.
@@ -619,6 +309,10 @@ impl Executor {
         sort: &Sort,
         term_id: TermId,
     ) -> EvalValue {
+        if self.evaluation_stop_origin().is_some() {
+            return EvalValue::Unknown;
+        }
+        let work_before = super::eval_guard::work_budget_poison();
         if matches!(sort, Sort::FloatingPoint(..))
             && !super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, term_id)
         {
@@ -702,7 +396,7 @@ impl Executor {
                 _ => EvalValue::Unknown,
             },
 
-            // FP comparison predicates (via f64 conversion)
+            // FP comparison predicates (exact same-format field order)
             "fp.eq" if args.len() == 2 => {
                 match (
                     self.evaluate_term(model, args[0]),
@@ -757,74 +451,19 @@ impl Executor {
                 }
             }
 
-            // FP arithmetic (via f64 conversion, rounding mode arg[0])
-            // f64 natively uses RNE. For non-RNE rounding modes, we
-            // cannot compute the correct result via f64, so return
-            // Unknown to skip model validation (#6203).
-            "fp.add" if args.len() == 3 => {
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match (
-                        self.evaluate_term(model, args[1]),
-                        self.evaluate_term(model, args[2]),
-                    ) {
-                        (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                            (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa + fb, &a),
-                            _ => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
+            // Rounding arithmetic, exactly under every mode and format
+            // (`ay_fp::exact`: exact rationals, one rounding). A result it does
+            // not compute (a format outside its envelope, `fp.min` of +0 and
+            // -0, an unpinned mode) is Unknown here and is evaluated by the
+            // bit-blasted fallback below.
+            "fp.add" | "fp.sub" | "fp.mul" | "fp.div" if args.len() == 3 => {
+                self.exact_fp_op(model, name, args)
             }
-            "fp.sub" if args.len() == 3 => {
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match (
-                        self.evaluate_term(model, args[1]),
-                        self.evaluate_term(model, args[2]),
-                    ) {
-                        (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                            (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa - fb, &a),
-                            _ => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
+            "fp.sqrt" | "fp.roundToIntegral" if args.len() == 2 => {
+                self.exact_fp_op(model, name, args)
             }
-            "fp.mul" if args.len() == 3 => {
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match (
-                        self.evaluate_term(model, args[1]),
-                        self.evaluate_term(model, args[2]),
-                    ) {
-                        (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                            (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa * fb, &a),
-                            _ => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
-            }
-            "fp.div" if args.len() == 3 => {
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match (
-                        self.evaluate_term(model, args[1]),
-                        self.evaluate_term(model, args[2]),
-                    ) {
-                        (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                            (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa / fb, &a),
-                            _ => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
-            }
+            "fp.fma" if args.len() == 4 => self.exact_fp_op(model, name, args),
+            "fp.min" | "fp.max" if args.len() == 2 => self.exact_fp_op(model, name, args),
             "fp.rem" if args.len() == 2 => {
                 // fp.rem has no rounding mode argument. Computed with exact
                 // rational arithmetic (see `fp_rem_exact`) — the f64 path lost
@@ -837,172 +476,15 @@ impl Executor {
                     _ => EvalValue::Unknown,
                 }
             }
-            "fp.sqrt" if args.len() == 2 => {
-                // args[0] = rounding mode, args[1] = x
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match self.evaluate_term(model, args[1]) {
-                        EvalValue::Fp(a) => match a.to_f64() {
-                            Some(fa) => self.f64_to_fp_eval(fa.sqrt(), &a),
-                            None => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
-            }
-            "fp.min" if args.len() == 2 => {
-                match (
-                    self.evaluate_term(model, args[0]),
-                    self.evaluate_term(model, args[1]),
-                ) {
-                    (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                        (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa.min(fb), &a),
-                        _ => EvalValue::Unknown,
-                    },
-                    _ => EvalValue::Unknown,
-                }
-            }
-            "fp.max" if args.len() == 2 => {
-                match (
-                    self.evaluate_term(model, args[0]),
-                    self.evaluate_term(model, args[1]),
-                ) {
-                    (EvalValue::Fp(a), EvalValue::Fp(b)) => match (a.to_f64(), b.to_f64()) {
-                        (Some(fa), Some(fb)) => self.f64_to_fp_eval(fa.max(fb), &a),
-                        _ => EvalValue::Unknown,
-                    },
-                    _ => EvalValue::Unknown,
-                }
-            }
-            "fp.roundToIntegral" if args.len() == 2 => {
-                // args[0] = rounding mode, args[1] = x
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match self.evaluate_term(model, args[1]) {
-                        EvalValue::Fp(a) => match a.to_f64() {
-                            Some(fa) => self.f64_to_fp_eval(fa.round(), &a),
-                            None => EvalValue::Unknown,
-                        },
-                        _ => EvalValue::Unknown,
-                    }
-                }
-            }
-            "fp.fma" if args.len() == 4 => {
-                // args[0] = rounding mode, args[1..3] = x, y, z
-                // fma(x, y, z) = x * y + z
-                if !self.is_rne_rounding_mode(model, args[0]) {
-                    EvalValue::Unknown
-                } else {
-                    match (
-                        self.evaluate_term(model, args[1]),
-                        self.evaluate_term(model, args[2]),
-                        self.evaluate_term(model, args[3]),
-                    ) {
-                        (EvalValue::Fp(a), EvalValue::Fp(b), EvalValue::Fp(c)) => {
-                            match (a.to_f64(), b.to_f64(), c.to_f64()) {
-                                (Some(fa), Some(fb), Some(fc)) => {
-                                    self.f64_to_fp_eval(fa.mul_add(fb, fc), &a)
-                                }
-                                _ => EvalValue::Unknown,
-                            }
-                        }
-                        _ => EvalValue::Unknown,
-                    }
-                }
-            }
-
             // FP constructor: (fp #bS #bE #bM) → FpModelValue
-            "fp" if args.len() == 3 => {
-                let sign_val = match self.evaluate_term(model, args[0]) {
-                    EvalValue::BitVec { value, width: 1 } => value != BigInt::zero(),
-                    _ => return EvalValue::Unknown,
-                };
-                let exp_val = match self.evaluate_term(model, args[1]) {
-                    EvalValue::BitVec { value, width } => (value.to_u64().unwrap_or(0), width),
-                    _ => return EvalValue::Unknown,
-                };
-                let sig_val = match self.evaluate_term(model, args[2]) {
-                    EvalValue::BitVec { value, width } => (value.to_u64().unwrap_or(0), width),
-                    _ => return EvalValue::Unknown,
-                };
-                let eb = exp_val.1;
-                let sb = sig_val.1 + 1; // SMT-LIB sb includes hidden bit
-                let exponent = exp_val.0;
-                let significand = sig_val.0;
-                let max_exponent = (1u64 << eb) - 1;
-                let fp_value = if exponent == max_exponent && significand != 0 {
-                    FpModelValue::NaN { eb, sb }
-                } else if exponent == max_exponent && significand == 0 {
-                    if sign_val {
-                        FpModelValue::NegInf { eb, sb }
-                    } else {
-                        FpModelValue::PosInf { eb, sb }
-                    }
-                } else if exponent == 0 && significand == 0 {
-                    if sign_val {
-                        FpModelValue::NegZero { eb, sb }
-                    } else {
-                        FpModelValue::PosZero { eb, sb }
-                    }
-                } else {
-                    FpModelValue::Fp {
-                        sign: sign_val,
-                        exponent,
-                        significand,
-                        eb,
-                        sb,
-                    }
-                };
-                EvalValue::Fp(fp_value)
-            }
+            "fp" if args.len() == 3 => self
+                .fp_from_model_fields(model, args, sort)
+                .map_or(EvalValue::Unknown, EvalValue::Fp),
 
             // (_ to_fp eb sb) from BV: reinterpret bitvector as IEEE 754
-            "to_fp" if args.len() == 1 => {
-                let Sort::FloatingPoint(eb, sb) = sort else {
-                    return EvalValue::Unknown;
-                };
-                match self.evaluate_term(model, args[0]) {
-                    EvalValue::BitVec { value, .. } => {
-                        let total_bits = eb + sb;
-                        let sign_val =
-                            (value.clone() >> (total_bits - 1)) & BigInt::one() != BigInt::zero();
-                        let exp_mask = (BigInt::one() << eb) - 1;
-                        let exponent = ((value.clone() >> (sb - 1)) & &exp_mask)
-                            .to_u64()
-                            .unwrap_or(0);
-                        let sig_mask = (BigInt::one() << (sb - 1)) - 1;
-                        let significand = (&value & &sig_mask).to_u64().unwrap_or(0);
-                        let max_exponent = (1u64 << eb) - 1;
-                        let fp_value = if exponent == max_exponent && significand != 0 {
-                            FpModelValue::NaN { eb: *eb, sb: *sb }
-                        } else if exponent == max_exponent && significand == 0 {
-                            if sign_val {
-                                FpModelValue::NegInf { eb: *eb, sb: *sb }
-                            } else {
-                                FpModelValue::PosInf { eb: *eb, sb: *sb }
-                            }
-                        } else if exponent == 0 && significand == 0 {
-                            if sign_val {
-                                FpModelValue::NegZero { eb: *eb, sb: *sb }
-                            } else {
-                                FpModelValue::PosZero { eb: *eb, sb: *sb }
-                            }
-                        } else {
-                            FpModelValue::Fp {
-                                sign: sign_val,
-                                exponent,
-                                significand,
-                                eb: *eb,
-                                sb: *sb,
-                            }
-                        };
-                        EvalValue::Fp(fp_value)
-                    }
-                    _ => EvalValue::Unknown,
-                }
-            }
+            "to_fp" if args.len() == 1 => self
+                .fp_from_model_ieee_bits(model, args[0], sort)
+                .map_or(EvalValue::Unknown, EvalValue::Fp),
 
             // (_ to_fp eb sb) from FP / signed BV / Real / Int
             // args[0] = rounding mode, args[1] = source value
@@ -1051,8 +533,13 @@ impl Executor {
                 };
                 match self.evaluate_term(model, args[1]) {
                     EvalValue::Fp(v) => {
+                        // NaN, the infinities and out-of-range values leave the
+                        // result unspecified — but the solve CHOSE one, as a
+                        // function of (rm, x). Read that choice back (recorded
+                        // by the FP bit-blaster), as `fp.to_ieee_bv` of NaN
+                        // does; abstain when it is not recorded.
                         if v.is_nan() || v.is_infinite() {
-                            return EvalValue::Unknown;
+                            return self.unspec_to_bv(model, term_id, sort, rm, &v);
                         }
                         match v.to_rational() {
                             Some(r) => {
@@ -1062,7 +549,7 @@ impl Executor {
                                 let width = bv.width;
                                 let max_val = (BigInt::one() << width as usize) - BigInt::one();
                                 if int_val.is_negative() || int_val > max_val {
-                                    return EvalValue::Unknown; // out of range → unspecified
+                                    return self.unspec_to_bv(model, term_id, sort, rm, &v);
                                 }
                                 EvalValue::BitVec {
                                     value: int_val,
@@ -1087,8 +574,9 @@ impl Executor {
                 };
                 match self.evaluate_term(model, args[1]) {
                     EvalValue::Fp(v) => {
+                        // Unspecified off its domain, but chosen: see fp.to_ubv.
                         if v.is_nan() || v.is_infinite() {
-                            return EvalValue::Unknown;
+                            return self.unspec_to_bv(model, term_id, sort, rm, &v);
                         }
                         match v.to_rational() {
                             Some(r) => {
@@ -1101,7 +589,7 @@ impl Executor {
                                 let max_val =
                                     (BigInt::one() << (width as usize - 1)) - BigInt::one();
                                 if int_val < min_val || int_val > max_val {
-                                    return EvalValue::Unknown; // overflow
+                                    return self.unspec_to_bv(model, term_id, sort, rm, &v);
                                 }
                                 // Two's complement encoding
                                 let modulus = BigInt::one() << width as usize;
@@ -1176,59 +664,35 @@ impl Executor {
         };
 
         if matches!(eval, EvalValue::Unknown) {
-            self.evaluate_fp_term_via_bitblast(model, term_id)
+            // A stopped child is not an unavailable operand to reconstruct.
+            // This local comparison does not turn every opportunistic W4
+            // budget refusal elsewhere into a terminal evaluation failure.
+            if self.evaluation_stop_origin().is_some() {
+                return EvalValue::Unknown;
+            }
+            if super::eval_guard::work_budget_poison() != work_before {
+                self.record_evaluation_stop(
+                    crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
+                );
+                return EvalValue::Unknown;
+            }
+            // These fields were checked exactly above. An invalid shape or
+            // unavailable field is not permission to reconstruct another value.
+            // Keep this refusal after the stopped-child checks so a work-budget
+            // refusal remains sticky for the entire external read.
+            if (name == "fp" && args.len() == 3) || (name == "to_fp" && args.len() == 1) {
+                return EvalValue::Unknown;
+            }
+            match self.evaluate_fp_term_via_bitblast_controlled(model, term_id, &|_| {}) {
+                Ok(Some(value)) => EvalValue::Fp(value),
+                Ok(None) => EvalValue::Unknown,
+                Err(origin) => {
+                    self.record_evaluation_stop(origin);
+                    EvalValue::Unknown
+                }
+            }
         } else {
             eval
         }
-    }
-}
-
-#[cfg(test)]
-mod underflow_significand_tests {
-    use super::underflow_significand;
-
-    /// The exact shape that panicked: an f64 normal rebased into a narrow
-    /// target underflows so far that the right shift exceeds the operand width.
-    /// Before the fix this was `attempt to shift right with overflow`.
-    #[test]
-    fn shift_past_operand_width_is_zero_not_a_panic() {
-        let full_sig = (1u64 << 52) | 0x000f_ffff_ffff_ffff;
-        for right_shift in [64u64, 65, 86, 128, 1_000, u64::MAX] {
-            assert_eq!(
-                underflow_significand(full_sig, right_shift, -3),
-                Some(0),
-                "right_shift={right_shift} must underflow to exact zero"
-            );
-            assert_eq!(underflow_significand(full_sig, right_shift, 3), Some(0));
-        }
-    }
-
-    /// The additive path must not overflow `u64` while summing the two shifts.
-    #[test]
-    fn combined_shift_saturates_instead_of_wrapping() {
-        assert_eq!(underflow_significand(u64::MAX, 63, i64::MIN), Some(0));
-        assert_eq!(underflow_significand(u64::MAX, 1, -63), Some(0));
-        // 1 + 62 = 63 is still in range and must be a real shift, not zero.
-        assert_eq!(underflow_significand(1u64 << 63, 1, -62), Some(1));
-    }
-
-    /// In-range shifts keep their exact pre-fix behaviour.
-    #[test]
-    fn in_range_shifts_are_unchanged() {
-        let sig = 1u64 << 52;
-        assert_eq!(underflow_significand(sig, 4, 0), Some(sig >> 4));
-        assert_eq!(underflow_significand(sig, 4, -2), Some(sig >> 6));
-        assert_eq!(underflow_significand(1, 0, 8), Some(256));
-    }
-
-    /// A left shift that would drop high bits fails CLOSED rather than
-    /// publishing a truncated significand as if it were exact.
-    #[test]
-    fn overflowing_left_shift_fails_closed() {
-        assert_eq!(underflow_significand(1u64 << 63, 0, 1), None);
-        assert_eq!(underflow_significand(u64::MAX, 0, 1), None);
-        assert_eq!(underflow_significand(1, 0, 64), None);
-        // Exactly fits: 1 << 63 is representable.
-        assert_eq!(underflow_significand(1, 0, 63), Some(1u64 << 63));
     }
 }

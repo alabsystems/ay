@@ -16,8 +16,20 @@ use super::{split_application, AlethePrintError, AlethePrinter};
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Proof, ProofId, ProofStep, Sort, TermData, TermId};
 
+mod boolean_fold;
 mod bounds;
+mod distinct;
+mod document_canonical;
 mod equivalence;
+mod nullary_definition;
+mod post_commit;
+mod printed_terms;
+mod shadowed;
+mod shared_canonical;
+#[cfg(test)]
+mod spelling_bridge_tests;
+pub(super) use boolean_fold::BooleanFoldScope;
+pub(super) use equivalence::comparison_reversal_step;
 
 use bounds::{
     account_authored_assume_emission, account_authored_assume_planning_input,
@@ -38,7 +50,10 @@ const MAX_AUTHORED_ASSUME_PLANNER_STEPS: usize = 1_000_000;
 #[derive(Clone, Copy)]
 enum EquivalenceLeafSchema {
     AuthoredAssume,
-    MultiplicationOnly,
+    /// The use-site schema: exact arithmetic identities only (see
+    /// `format_nested_identity_surface_equivalence`).
+    UseSiteIdentities,
+    NullaryDefinition, // `AuthoredAssume` plus definition premises (`nullary_definition`)
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +69,65 @@ fn oriented_equivalence(surface: &str, canonical: &str, direction: EquivalenceDi
     }
 }
 
+/// The most `not` shell PAIRS one authored assume bridge will discharge.
+///
+/// One pair is what SMT-LIB actually writes (`(assert (not (not phi)))`); the
+/// cap exists so a pathological spelling cannot make the peel loop the
+/// document's cost centre, and each admitted pair costs two emitted steps.
+const MAX_NEGATION_SHELL_PAIRS: usize = 8;
+
+/// Number of `(not (not ...))` shell pairs that turn `canonical` into
+/// `surface`, or `None` when `surface` is not that shape.
+///
+/// PURELY TEXTUAL, and deliberately so. The contract this discharges is
+/// carcara's: an `assume` is matched against the problem file's own syntax
+/// before any rule runs, so the only question that matters is whether the
+/// authored bytes are the canonical bytes under `k` negation shells. AY's term
+/// store cannot answer it — `TermStore::mk_not` eliminates a double negation at
+/// CONSTRUCTION, so `(not (not phi))` has no `TermId` at all and every
+/// term-level provenance check necessarily reports AY's own rewriting as the
+/// problem's assertion.
+#[must_use]
+pub(super) fn negation_shell_pairs(surface: &str, canonical: &str) -> Option<usize> {
+    if surface == canonical {
+        return None;
+    }
+    let mut rest = surface;
+    for pairs in 1..=MAX_NEGATION_SHELL_PAIRS {
+        rest = rest.strip_prefix("(not (not ")?.strip_suffix("))")?;
+        if rest == canonical {
+            return Some(pairs);
+        }
+    }
+    None
+}
+
+/// The exact admission the printer and its PRODUCER must agree on before an
+/// authored negation-shell spelling is promised at an `assume` leaf.
+///
+/// Both sides ask this one function, on the same two strings: the authored
+/// text, and the text the DOCUMENT uses for the assumed term (which is the
+/// source-override rendering wherever one is in play, not the override-free
+/// canonical one). A producer that promises a bridge the printer then declines
+/// would publish a leaf nobody derived; the printer therefore re-asks at
+/// emission and fails closed on any disagreement.
+#[must_use]
+pub fn negation_shell_assume_surface_pairs(surface: &str, canonical: &str) -> Option<usize> {
+    if surface.len() > MAX_EQUIVALENCE_BYTES || canonical.len() > MAX_EQUIVALENCE_BYTES {
+        return None;
+    }
+    negation_shell_pairs(surface, canonical)
+}
+
+/// Render `shells` negation shells around `canonical` (`0` is `canonical`).
+pub(super) fn negation_shell_rendering(canonical: &str, shells: usize) -> String {
+    let mut text = canonical.to_string();
+    for _ in 0..shells {
+        text = format!("(not (not {text}))");
+    }
+    text
+}
+
 struct AuthoredAssumePlan {
     surface: String,
     canonical: String,
@@ -62,9 +136,28 @@ struct AuthoredAssumePlan {
 }
 
 #[derive(Clone, Copy)]
-enum AuthoredAssumeBridge {
+pub(super) enum AuthoredAssumeBridge {
     Equivalence,
     LinearArithmeticImplication,
+    /// A binary authored `(distinct a b)` over the canonical `(not (= x y))`:
+    /// `distinct_elim` (+ `not_symm` when the pair is swapped). See
+    /// [`distinct`].
+    DistinctElimination,
+    /// A checked `(= surface canonical)` from `surface_equivalence` onto the
+    /// document's rendering of the term. See [`document_canonical`].
+    PrintedEquivalence,
+    /// An authored `(= x y)` whose canonical term conjoins unary congruences
+    /// `(= (f x) (f y))`. See [`document_canonical`].
+    CongruentConjunction,
+    /// An authored spelling that FOLDS onto an arithmetic comparison the
+    /// checked unit `la_generic` implication turns into the canonical one
+    /// (`(or (< y 2.5) false)` over `(< y (/ 5.0 2.0))`). See
+    /// [`boolean_fold`].
+    FoldedLinearImplication,
+    /// An authored spelling that FOLDS onto the document's rendering of the
+    /// term (`(= (= (f a) c) false)` over `(not (= (f a) c))`, whose operand
+    /// keeps its own authored orientation). See [`document_canonical`].
+    FoldedDocumentEquivalence,
 }
 
 #[derive(Default)]
@@ -84,8 +177,49 @@ struct AuthoredAssumePlanner {
     /// term-keyed only after the duplicate census has excluded every term for
     /// which even one sibling `Assume` id is consumed.
     assume_only_terms: HashSet<TermId>,
+    /// Assumed terms some explicitly annotated `resolution`/`th_resolution`
+    /// step consumes. Those keep the document-wide `distinct` spelling that
+    /// the dedicated distinct/equality resolution bridge rewrites; the
+    /// confined `distinct_elim` bridge is not planned for them.
+    annotated_resolution_premises: HashSet<TermId>,
+    /// Strict descendants of overridden terms (`None`: walk over its cap),
+    /// computed on first use: only the document-canonical fallback reads it.
+    /// See `strict_descendants_of_overridden_terms`; only overridden terms
+    /// the proof prints count when [`Self::printed_roots`] is known.
+    override_descendants: std::cell::OnceCell<Option<HashSet<TermId>>>,
+    /// The terms the proof's steps mention at top level (`None`: a step shape
+    /// the reader does not know). See [`printed_terms`].
+    printed_roots: Option<Vec<TermId>>,
     inspected_terms: usize,
     accounting: AuthoredAssumeAccounting,
+}
+
+impl AuthoredAssumePlanner {
+    /// Count one more inspected term against the planner bound.
+    fn count_inspected_term(&mut self, id: ProofId) -> Result<(), AlethePrintError> {
+        let Some(next_inspected) = self.inspected_terms.checked_add(1) else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume inspected-term count overflowed",
+            ));
+        };
+        if next_inspected > MAX_AUTHORED_ASSUME_BRIDGES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume inspected-term count exceeds the planner bound",
+            ));
+        }
+        self.inspected_terms = next_inspected;
+        Ok(())
+    }
+
+    /// The confined `distinct_elim` bridge is planned only for a term no
+    /// annotated resolution consumes: those keep the document-wide `distinct`
+    /// spelling the dedicated distinct/equality resolution bridge rewrites.
+    fn admits_distinct_elimination(&self, term: TermId, surface: &str, canonical: &str) -> bool {
+        !self.annotated_resolution_premises.contains(&term)
+            && distinct::distinct_elimination_is_supported(surface, canonical)
+    }
 }
 
 /// Borrowed admission and exact work charge for cloning the override ledger.
@@ -194,7 +328,7 @@ fn consumed_authored_assume_ids(proof: &Proof) -> Result<Vec<bool>, AlethePrintE
                 mark(*clause2)?;
             }
             ProofStep::Anchor { end_step, .. } => mark(*end_step)?,
-            ProofStep::Assume(_) | ProofStep::TheoryLemma { .. } => {}
+            ProofStep::Assume(_) | ProofStep::TheoryLemma { .. } | ProofStep::NraSos { .. } => {}
             _ => {
                 return Err(invalid_authored_assume_plan(
                     ProofId(index as u32),
@@ -211,6 +345,7 @@ impl AlethePrinter<'_> {
     /// map is admitted and its scan/copy work fits the caller's emission budget.
     /// No owned override string is duplicated on a declining path.
     pub(super) fn initialize_wire_term_overrides(&self) -> Result<(), AlethePrintError> {
+        self.check_emission_progress(0)?;
         if self.wire_term_overrides_initialized.get() {
             return Ok(());
         }
@@ -257,16 +392,50 @@ impl AlethePrinter<'_> {
             );
             return (Some(output), 1);
         }
+        if matches!(bridge, AuthoredAssumeBridge::DistinctElimination) {
+            return (
+                distinct::render_distinct_elimination_bridge(id, surface, canonical),
+                1,
+            );
+        }
+        if matches!(bridge, AuthoredAssumeBridge::PrintedEquivalence) {
+            return self.render_printed_equivalence_bridge(id, term, surface, canonical);
+        }
+        if matches!(bridge, AuthoredAssumeBridge::CongruentConjunction) {
+            return (
+                document_canonical::render_congruent_conjunction_bridge(id, surface, canonical),
+                1,
+            );
+        }
+        if matches!(bridge, AuthoredAssumeBridge::FoldedLinearImplication) {
+            return boolean_fold::render_folded_linear_implication_with_progress(
+                id,
+                surface,
+                canonical,
+                &mut |amount| self.admit_emission_work(amount),
+            );
+        }
+        if matches!(bridge, AuthoredAssumeBridge::FoldedDocumentEquivalence) {
+            // ProofId is one 't' and at most ten u32 digits; admit its small
+            // formatting allocation before the borrowed-id fold entry.
+            if !self.admit_emission_work(16) {
+                return (None, 0);
+            }
+            return boolean_fold::render_folded_document_equivalence_with_progress(
+                &id.to_string(),
+                surface,
+                canonical,
+                &mut |amount| self.admit_emission_work(amount),
+            );
+        }
         let mut equality_steps = Vec::new();
         let mut nodes = 0;
         let equality_id = format!("{id}.n");
-        if !self.build_authored_surface_equivalence(
+        if !self.authored_equivalence_with_canonical(
             &equality_id,
             surface,
             term,
-            EquivalenceLeafSchema::AuthoredAssume,
-            EquivalenceDirection::SurfaceToCanonical,
-            0,
+            Some(canonical),
             &mut nodes,
             &mut equality_steps,
         ) {
@@ -293,6 +462,7 @@ impl AlethePrinter<'_> {
         plan: &AuthoredAssumePlan,
         accounting: &mut AuthoredAssumeAccounting,
     ) -> Result<bool, AlethePrintError> {
+        self.check_emission_progress(0)?;
         account_authored_assume_planning_input(id, plan.input_bytes, accounting)?;
 
         let (rendered, nodes) = self.render_authored_assume_bridge(
@@ -302,6 +472,7 @@ impl AlethePrinter<'_> {
             &plan.canonical,
             plan.bridge,
         );
+        self.check_emission_progress(0)?;
         let Some(planning_nodes) = accounting.total_nodes.checked_add(nodes) else {
             return Err(invalid_authored_assume_plan(
                 id,
@@ -337,6 +508,24 @@ impl AlethePrinter<'_> {
         Ok(true)
     }
 
+    fn render_admitted_authored_canonical(
+        &self,
+        id: ProofId,
+        term: TermId,
+    ) -> Result<String, AlethePrintError> {
+        let Some(canonical_charge) = bounds::canonical_rendering_work_upper_bound(self.terms, term)
+        else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "canonical rendering has no bounded work estimate",
+            ));
+        };
+        if !self.admit_emission_work(canonical_charge) {
+            self.check_emission_progress(0)?;
+        }
+        Ok(crate::render_term_canonical(self.terms, term))
+    }
+
     fn plan_new_authored_assume_term(
         &self,
         id: ProofId,
@@ -344,25 +533,15 @@ impl AlethePrinter<'_> {
         surface: &str,
         planner: &mut AuthoredAssumePlanner,
     ) -> Result<Option<AuthoredAssumePlan>, AlethePrintError> {
-        let Some(next_inspected) = planner.inspected_terms.checked_add(1) else {
-            return Err(invalid_authored_assume_plan(
-                id,
-                "authored assume inspected-term count overflowed",
-            ));
-        };
-        if next_inspected > MAX_AUTHORED_ASSUME_BRIDGES {
-            return Err(invalid_authored_assume_plan(
-                id,
-                "authored assume inspected-term count exceeds the planner bound",
-            ));
-        }
-        planner.inspected_terms = next_inspected;
+        self.check_emission_progress(0)?;
+        planner.count_inspected_term(id)?;
         if !matches!(self.terms.sort(term), Sort::Bool) {
             return Err(invalid_authored_assume_plan(
                 id,
                 "an authored assume bridge root is not Boolean",
             ));
         }
+        let mut shared_canonical = None;
         match canonical_term_is_bounded_for_authored_assume(self.terms, term) {
             CanonicalRenderBound::Bounded => {}
             // A binder, a `let` or an internal constant array is a schema this
@@ -374,14 +553,33 @@ impl AlethePrinter<'_> {
             // document over one quantified assertion.
             CanonicalRenderBound::UnsupportedShape => return Ok(None),
             CanonicalRenderBound::ExceedsBound => {
-                return Err(invalid_authored_assume_plan(
-                    id,
-                    "authored assume canonical term exceeds the structural rendering bound",
-                ))
+                shared_canonical = self.shared_definition_canonical(term, surface);
+                if shared_canonical.is_some() {
+                    // The checked single-buffer projection fits the SAME
+                    // input/node/depth limits; no assumed equality is added.
+                } else if let Some(input_bytes) =
+                    shadowed::exact_input_bytes(self.terms, term, surface)
+                {
+                    account_authored_assume_planning_input(
+                        id,
+                        input_bytes,
+                        &mut planner.accounting,
+                    )?;
+                    return Ok(None);
+                } else {
+                    return Err(invalid_authored_assume_plan(
+                        id,
+                        "authored assume canonical term exceeds the structural rendering bound",
+                    ));
+                }
             }
         }
-        let canonical = crate::render_term_canonical(self.terms, term);
-        let Some(input_bytes) = surface.len().checked_add(canonical.len()) else {
+        let mut canonical = if let Some(text) = shared_canonical {
+            text
+        } else {
+            self.render_admitted_authored_canonical(id, term)?
+        };
+        let Some(mut input_bytes) = surface.len().checked_add(canonical.len()) else {
             return Err(invalid_authored_assume_plan(
                 id,
                 "authored assume bridge input size overflowed",
@@ -399,20 +597,29 @@ impl AlethePrinter<'_> {
         }
         let mut probe_steps = Vec::new();
         let mut probe_nodes = 0;
-        let bridge = if self.build_authored_surface_equivalence(
+        let bridge = if self.authored_equivalence_with_canonical(
             "probe",
             surface,
             term,
-            EquivalenceLeafSchema::AuthoredAssume,
-            EquivalenceDirection::SurfaceToCanonical,
-            0,
+            Some(&canonical),
             &mut probe_nodes,
             &mut probe_steps,
         ) {
             AuthoredAssumeBridge::Equivalence
         } else if crate::printed_la_generic_unit_implication_is_supported(surface, &canonical) {
             AuthoredAssumeBridge::LinearArithmeticImplication
+        } else if self.folded_linear_implication_admitted(term, surface, &canonical) {
+            AuthoredAssumeBridge::FoldedLinearImplication
+        } else if planner.admits_distinct_elimination(term, surface, &canonical) {
+            AuthoredAssumeBridge::DistinctElimination
+        } else if let Some((bridge, rendered, rendered_bytes)) =
+            self.document_canonical_plan(id, term, surface, planner)?
+        {
+            canonical = rendered;
+            input_bytes = rendered_bytes;
+            bridge
         } else {
+            self.check_emission_progress(0)?;
             account_authored_assume_planning_input(id, input_bytes, &mut planner.accounting)?;
             return Ok(None);
         };
@@ -469,6 +676,7 @@ impl AlethePrinter<'_> {
         planner: AuthoredAssumePlanner,
     ) -> Result<(), AlethePrintError> {
         let accounting = &planner.accounting;
+        self.check_emission_progress(0)?;
         let Some(total_charge) = proof_step_count
             .checked_mul(2)
             .and_then(|work| work.checked_add(accounting.total_input_bytes))
@@ -496,6 +704,8 @@ impl AlethePrinter<'_> {
         let mut bridged = self.authored_assume_bridged.borrow_mut();
         let mut assume_only = self.assume_only_override_terms.borrow_mut();
         let mut linear_arithmetic_bridges = self.linear_arithmetic_assume_bridges.borrow_mut();
+        let mut distinct_bridges = self.distinct_elimination_assume_bridges.borrow_mut();
+        let mut document_bridges = self.document_canonical_assume_bridges.borrow_mut();
         if planner.planned.keys().any(|term| {
             canonical_renderings.contains_key(term)
                 || surfaces.contains_key(term)
@@ -522,6 +732,18 @@ impl AlethePrinter<'_> {
                 AuthoredAssumeBridge::LinearArithmeticImplication
             ) {
                 linear_arithmetic_bridges.insert(term);
+            }
+            if matches!(plan.bridge, AuthoredAssumeBridge::DistinctElimination) {
+                distinct_bridges.insert(term);
+            }
+            if matches!(
+                plan.bridge,
+                AuthoredAssumeBridge::PrintedEquivalence
+                    | AuthoredAssumeBridge::CongruentConjunction
+                    | AuthoredAssumeBridge::FoldedLinearImplication
+                    | AuthoredAssumeBridge::FoldedDocumentEquivalence
+            ) {
+                document_bridges.insert(term, plan.bridge);
             }
             canonical_renderings.insert(term, plan.canonical);
             surfaces.insert(term, plan.surface);
@@ -560,9 +782,14 @@ impl AlethePrinter<'_> {
             return Ok(());
         }
         let consumed = consumed_authored_assume_ids(proof)?;
-        let mut planner = AuthoredAssumePlanner::default();
+        let mut planner = AuthoredAssumePlanner {
+            annotated_resolution_premises: distinct::annotated_resolution_premise_terms(proof),
+            printed_roots: printed_terms::printed_proof_roots(proof),
+            ..AuthoredAssumePlanner::default()
+        };
         let mut consumed_override_terms = HashSet::default();
         for (index, step) in proof.steps.iter().enumerate() {
+            self.check_emission_progress(0)?;
             let ProofStep::Assume(term) = step else {
                 continue;
             };
@@ -584,6 +811,7 @@ impl AlethePrinter<'_> {
         planner
             .assume_only_terms
             .retain(|term| !consumed_override_terms.contains(term));
+        self.replan_stale_document_bridges(proof, &mut planner)?;
         self.commit_authored_assume_plan(proof.steps.len(), planner)
     }
 
@@ -616,12 +844,25 @@ impl AlethePrinter<'_> {
                 reason: "authored assume bridge lost its canonical rendering".to_string(),
             });
         };
-        let bridge = if self
+        let document_bridge = self
+            .document_canonical_assume_bridges
+            .borrow()
+            .get(&term)
+            .copied();
+        let bridge = if let Some(bridge) = document_bridge {
+            bridge
+        } else if self
             .linear_arithmetic_assume_bridges
             .borrow()
             .contains(&term)
         {
             AuthoredAssumeBridge::LinearArithmeticImplication
+        } else if self
+            .distinct_elimination_assume_bridges
+            .borrow()
+            .contains(&term)
+        {
+            AuthoredAssumeBridge::DistinctElimination
         } else {
             AuthoredAssumeBridge::Equivalence
         };

@@ -1,0 +1,7 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const slot_idx (_ BitVec 8))
+(assert (not (= (_ bv0 8) (bvand (_ bv7 8) (bvmul (_ bv8 8) slot_idx)))))
+(check-sat)
+(exit)

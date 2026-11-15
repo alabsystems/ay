@@ -93,6 +93,39 @@ pub(super) enum BveSkipReason {
     ClauseGrowthGuard,
 }
 
+impl BveSkipReason {
+    /// Dense index for per-reason counting.
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::DisabledFlag => 0,
+            Self::IntervalNotDue => 1,
+            Self::FixpointGuard => 2,
+            Self::ThresholdDelay => 3,
+            Self::ClauseGrowthGuard => 4,
+        }
+    }
+
+    /// Stats tags, in `index` order.
+    pub(super) const TAGS: [&'static str; BveSkipReason::COUNT] = [
+        "disabled_flag",
+        "interval_not_due",
+        "fixpoint_guard",
+        "threshold_delay",
+        "clause_growth_guard",
+    ];
+
+    pub(super) const COUNT: usize = 5;
+}
+
+/// The scheduler-level gates that keep an otherwise due BVE round from running,
+/// in the order `Solver::bve_gate_skip_counts` counts them.
+pub(super) const BVE_GATE_TAGS: [&'static str; 4] = [
+    "gate_dependent_passes",
+    "dense_formula",
+    "proportional_guard",
+    "wall_budget",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TransredSkipReason {
     DisabledFlag,
@@ -181,9 +214,11 @@ impl VivifyTierRun {
 
 mod accessors;
 mod backbone;
+mod backbone_stacked;
 mod bce;
 mod bve;
 pub(crate) use bve::BveBodyScratch;
+pub(in crate::solver) use bve::{kissat_eliminate_interval, kissat_eliminate_interval_nlog2n};
 mod cce;
 mod component;
 mod condition;
@@ -344,6 +379,27 @@ impl Solver {
         if self.cold.inc_engine_reset_mode {
             return false;
         }
+        // Queue ownership (#triage-lra-const-eq): a queued theory conflict
+        // owns its ClauseRef until the solve loop consumes it — the same rule
+        // `should_reduce_db`, `reduce_db` and arena compaction already follow.
+        // `can_delete_clause` refuses such a clause, and replacing it in place
+        // would rewrite a conflict the loop has yet to analyse. Queue entries
+        // DO cross solve boundaries: a DPLL(T) round that returns to its
+        // caller (split / model-equality request) leaves them for the next
+        // `solve_with_assumptions`, whose `run_incremental_inprocessing` runs
+        // this pass at level 0 BEFORE the CDCL loop drains the queue. Once a
+        // root unit satisfies such a clause at level 0, every sweep pass
+        // found it, the delete was refused, and the pass still counted as a
+        // mutation — an unbounded fixpoint loop whose per-16-clause deadline
+        // poll never fired on a 3-clause affected set (observed: CHC
+        // heap__findmax.array_000 once LRA stopped skipping violated constant
+        // equalities; 45 s spent here under a 624 ms query timeout).
+        // Skip WITHOUT arming the fixpoint guard, so the first call after the
+        // queue drains does the sweep. SOUND: L0 GC is an optimization (see
+        // the inc_engine_reset_mode skip above).
+        if !self.pending_theory_conflicts.is_empty() {
+            return false;
+        }
         // Fixpoint guard: skip if no new level-0 assignments.
         if self.fixed_count == self.cold.last_collect_fixed {
             return false;
@@ -375,8 +431,28 @@ impl Solver {
         // update (next call resumes) and the debug post-conditions (a
         // truncated pass legitimately leaves satisfied clauses behind).
         let mut deadline_truncated = false;
+        // A delete the mutation layer refused (`DeleteResult::Skipped`) leaves
+        // a satisfied clause behind. It must not count as progress (that made
+        // the fixpoint loop unbounded, see the queue-ownership skip above),
+        // and like a truncated sweep it leaves work for a later call: the
+        // fixpoint guard is not armed and the satisfied-clause post-condition
+        // does not apply.
+        let mut delete_refused = false;
+        let mut first_pass = true;
 
         loop {
+            // Bulk deletion window for this pass (see `defer_binary_unlink`);
+            // closed before propagation and on every exit.
+            self.defer_binary_unlink = true;
+            // #triage-lra-const-eq: poll the whole-solve deadline once per
+            // fixpoint pass too. The in-sweep poll below is amortized per 16
+            // clauses and its counter restarts every pass, so a pass over a
+            // small affected set never reached it.
+            if !first_pass && (self.solve_deadline_expired() || self.is_interrupted()) {
+                deadline_truncated = true;
+                break;
+            }
+            first_pass = false;
             self.ensure_reason_clause_marks_current();
 
             // ── gc_occ rebuild (#8078, #8466) ─────────────────────────────
@@ -602,9 +678,15 @@ impl Solver {
                     } else {
                         None
                     };
-                    let delete_result =
-                        self.delete_clause_checked(clause_idx, ReasonPolicy::ClearLevel0);
-                    if is_irredundant && matches!(delete_result, DeleteResult::Deleted) {
+                    let delete_result = self
+                        .delete_clause_checked_optional_gc(clause_idx, ReasonPolicy::ClearLevel0);
+                    if !matches!(delete_result, DeleteResult::Deleted) {
+                        // Refused (queued theory conflict, LRAT readiness,
+                        // inactive): nothing changed, so this is NOT progress.
+                        delete_refused = true;
+                        continue;
+                    }
+                    if is_irredundant {
                         self.note_irredundant_clause_removed_for_bve(
                             clause_idx,
                             old_lits_snapshot
@@ -625,6 +707,7 @@ impl Solver {
                 if new_lits.len() < clause_len {
                     // All literals false at level 0 → clause unsatisfied → UNSAT.
                     if new_lits.is_empty() {
+                        self.end_deferred_binary_unlink();
                         return true;
                     }
                     // Per-clause BVE occ notification (#8364): snapshot old literals
@@ -652,7 +735,10 @@ impl Solver {
                         self.replace_clause_checked(clause_idx, &new_lits)
                     };
                     match result {
-                        ReplaceResult::Empty => return true,
+                        ReplaceResult::Empty => {
+                            self.end_deferred_binary_unlink();
+                            return true;
+                        }
                         ReplaceResult::Unit | ReplaceResult::Replaced => {
                             pass_mutated = true;
                             // #8375: clause strengthened by L0 GC (false literal
@@ -671,6 +757,7 @@ impl Solver {
                 }
             }
 
+            self.end_deferred_binary_unlink();
             if self.propagate_check_unsat() {
                 return true;
             }
@@ -687,6 +774,9 @@ impl Solver {
             }
         }
 
+        // Close a bulk-deletion window left open by a `break` (the pass flushes
+        // before propagating otherwise).
+        self.end_deferred_binary_unlink();
         // Flush deferred stale reason cleanup (#8140).
         self.defer_stale_reason_cleanup = false;
         self.clear_stale_reasons();
@@ -701,7 +791,7 @@ impl Solver {
 
         // #array-deadline-forward: only arm the fixpoint guard after a
         // COMPLETE sweep — a truncated pass must be resumed by the next call.
-        if !deadline_truncated {
+        if !deadline_truncated && !delete_refused {
             self.cold.last_collect_fixed = self.fixed_count;
         }
 
@@ -728,7 +818,7 @@ impl Solver {
         // #array-deadline-forward: skipped after a deadline-truncated sweep —
         // unprocessed satisfied clauses are expected then (see the sweep poll).
         #[cfg(debug_assertions)]
-        if !deadline_truncated {
+        if !deadline_truncated && !delete_refused {
             // Arena integrity pre-check: validate all active clauses have in-range
             // literals before the GC post-condition check. If this fires, the arena
             // is corrupt (ArenaIter misalignment, stale shrink_map, etc.) and the
@@ -993,7 +1083,8 @@ impl Solver {
                 .is_none()
         };
         if self.cold.disconnected_deletions == 0 && no_new_clauses && arena_baseline > 0 {
-            // Phase 3+4 only: clear dirty state and rewind trail.
+            self.charge_reconnect_scan(arena_baseline, true); // det_work.rs
+                                                              // Phase 3+4 only: clear dirty state and rewind trail.
             self.dirty_watches.iter_mut().for_each(|d| *d = false);
             self.dirty_watch_list.clear();
             self.watches.debug_assert_binary_first();
@@ -1023,23 +1114,24 @@ impl Solver {
             return;
         }
 
-        // Phase 1: Purge stale watch entries from all watch lists.
-        //
-        // During BVE with watches_disconnected=true:
-        // - delete_clause_checked() skips binary watch removal (#4924)
-        // - replace_clause_core() updates watches for strengthened clauses,
-        //   but only when watches are intact at the time of strengthening.
-        //   When instantiate() clears and rebuilds watches mid-BVE, then
-        //   subsequent strengthening in later rounds may leave stale
-        //   long-clause entries on old watched-literal lists.
-        //
-        // Purge both binary and long-clause stale entries:
-        // - Binary: keep only if clause is still active in the arena.
-        // - Long: keep only if clause is active AND `lit` is one of the
-        //   clause's current watched literals (positions [0] or [1]).
-        // Iterate ALL watch lists including extension variables from BVE/SBVA
-        // beyond num_vars -- extension variables can have watch entries (#8135).
-        // Track pre-existing clauses that lose a watch entry for Phase 1b.
+        self.charge_reconnect_scan(arena_baseline, false); // det_work.rs
+                                                           // Phase 1: Purge stale watch entries from all watch lists.
+                                                           //
+                                                           // During BVE with watches_disconnected=true:
+                                                           // - delete_clause_checked() skips binary watch removal (#4924)
+                                                           // - replace_clause_core() updates watches for strengthened clauses,
+                                                           //   but only when watches are intact at the time of strengthening.
+                                                           //   When instantiate() clears and rebuilds watches mid-BVE, then
+                                                           //   subsequent strengthening in later rounds may leave stale
+                                                           //   long-clause entries on old watched-literal lists.
+                                                           //
+                                                           // Purge both binary and long-clause stale entries:
+                                                           // - Binary: keep only if clause is still active in the arena.
+                                                           // - Long: keep only if clause is active AND `lit` is one of the
+                                                           //   clause's current watched literals (positions [0] or [1]).
+                                                           // Iterate ALL watch lists including extension variables from BVE/SBVA
+                                                           // beyond num_vars -- extension variables can have watch entries (#8135).
+                                                           // Track pre-existing clauses that lose a watch entry for Phase 1b.
         let total_watch_lits = self.watches.num_lists();
         let mut needs_reattach: Vec<usize> = Vec::new();
         for lit_idx in 0..total_watch_lits {
@@ -1270,6 +1362,7 @@ impl Solver {
     /// rebuild_watches/BCP, since conflict analysis follows reason chains.
     pub(super) fn clear_stale_reasons(&mut self) {
         let mut cleared = false;
+        self.charge_stale_reason_scan(); // det_work.rs
 
         if self.stale_reasons.is_empty() {
             // Fallback: full scan for watch-free BVE or other paths that
@@ -1283,7 +1376,7 @@ impl Solver {
                     && !self.var_data[vi].is_lazy_theory_reason()
                     && !self.arena.is_active(reason as usize)
                 {
-                    self.var_data[vi].reason = NO_REASON;
+                    self.var_data[vi].clear_reason();
                     cleared = true;
                 }
             }
@@ -1298,7 +1391,7 @@ impl Solver {
                         && !self.var_data[vi].is_lazy_theory_reason()
                         && !self.arena.is_active(reason as usize)
                     {
-                        self.var_data[vi].reason = NO_REASON;
+                        self.var_data[vi].clear_reason();
                         cleared = true;
                     }
                 }
@@ -1377,6 +1470,7 @@ impl Solver {
     ///    post-BVE instantiation
     pub(super) fn rebuild_watches(&mut self) {
         let rebuild_start = ay_core::time::Instant::now();
+        self.charge_rebuild_scan(); // det_work.rs
         self.stats.clear_bcp_learned_1963_blocker_certs();
         // Clear all watch lists
         self.watches = WatchedLists::new(self.num_vars);

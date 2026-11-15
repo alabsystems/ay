@@ -58,6 +58,12 @@ impl QueryAuthorityEpoch {
         Self(Arc::new(QueryAuthorityEpochMarker))
     }
 
+    /// Observe the address of the currently borrowed epoch marker only.
+    /// This is not authority and may be reused after a disjoint lifetime.
+    pub(in crate::executor) fn diagnostic_address(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     pub(in crate::executor) fn is_same_epoch(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -79,6 +85,11 @@ pub(in crate::executor) struct QuantifiedSatAuthorityGrant {
     root_entries: Box<[Option<TermEntryStamp>]>,
     projection_bindings: QuantifiedProjectionBindings,
     model_epoch: Option<QuantifiedGrantModelEpoch>,
+    /// What the certificate behind this grant rests on: `DischargedTrust`
+    /// when a refutation it consumed was admitted only because a fresh
+    /// executor running the same code re-decided it. Never strengthens the
+    /// grant; it is what the publication gate records as the authority.
+    admission: crate::executor::unsat_cert::ProbeUnsatAuthority,
 }
 
 #[derive(Debug)]
@@ -123,6 +134,7 @@ impl QuantifiedSatAuthorityGrant {
                 .collect(),
             projection_bindings: QuantifiedProjectionBindings::None,
             model_epoch: None,
+            admission: crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
         }
     }
 
@@ -150,7 +162,15 @@ impl QuantifiedSatAuthorityGrant {
                 .collect(),
             projection_bindings,
             model_epoch: Some(model_epoch),
+            admission: crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
         })
+    }
+
+    /// The authority class the certificate behind this grant rests on.
+    pub(in crate::executor) const fn admission(
+        &self,
+    ) -> crate::executor::unsat_cert::ProbeUnsatAuthority {
+        self.admission
     }
 
     /// Whether this grant still covers exactly the roots a gate will check.
@@ -424,8 +444,13 @@ impl Executor {
                 })
     }
 
-    fn install_bv_sat_authority_roots(&mut self, roots: Box<[TermId]>) {
-        let grant = QuantifiedSatAuthorityGrant::for_checked_roots(self, &roots);
+    fn install_bv_sat_authority_roots(
+        &mut self,
+        roots: Box<[TermId]>,
+        admission: crate::executor::unsat_cert::ProbeUnsatAuthority,
+    ) {
+        let mut grant = QuantifiedSatAuthorityGrant::for_checked_roots(self, &roots);
+        grant.admission = admission;
         self.bv_quantifier_full_domain_proof = true;
         self.bv_quantifier_full_domain_query_grant = Some(grant);
     }
@@ -437,10 +462,11 @@ impl Executor {
         evidence: CheckedBvFullDomainSatAuthority,
     ) -> bool {
         self.revoke_bv_full_domain_sat_authority();
+        let admission = evidence.admission();
         let Some(roots) = evidence.into_current_roots(self) else {
             return false;
         };
-        self.install_bv_sat_authority_roots(roots);
+        self.install_bv_sat_authority_roots(roots, admission);
         true
     }
 

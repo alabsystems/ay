@@ -20,17 +20,32 @@
 //! expectations below break the build. The `pass` case is the non-vacuity
 //! control (the compile-fails must fail for the RIGHT reason, not because the
 //! legitimate surface broke).
+//!
+//! trybuild compiles these cases by spawning `$CARGO` itself, so each test
+//! runs inside `ay_test_support::trybuild_lane::with_trybuild_cargo`, which
+//! gives that child a lane-aware `$CARGO` and a working directory that loads
+//! no build posture (the module says why each is needed). The expectations
+//! themselves are trybuild's, unchanged.
+
+use std::path::{Path, PathBuf};
+
+/// Workspace root (two levels above `CARGO_MANIFEST_DIR` for ay-pb).
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
 
 #[test]
 fn primal_worker_is_structurally_verdict_incapable() {
-    let t = trybuild::TestCases::new();
-    // Non-vacuity: a legitimate improvement-only primal run COMPILES.
-    t.pass("tests/ui/primal_run_improvement_only_ok.rs");
-    // A primal run cannot RETURN a verdict-carrying `PbSolution`.
-    t.compile_fail("tests/ui/primal_run_cannot_return_solution.rs");
-    // A primal run cannot SEND a verdict: `PrimalSender` has no such method,
-    // and the `WorkerMsg::Done` carrier is private and unnameable.
-    t.compile_fail("tests/ui/primal_sender_cannot_send_done.rs");
+    ay_test_support::trybuild_lane::with_trybuild_cargo(&workspace_root(), || {
+        let t = trybuild::TestCases::new();
+        // Non-vacuity: a legitimate improvement-only primal run COMPILES.
+        t.pass("tests/ui/primal_run_improvement_only_ok.rs");
+        // A primal run cannot RETURN a verdict-carrying `PbSolution`.
+        t.compile_fail("tests/ui/primal_run_cannot_return_solution.rs");
+        // A primal run cannot SEND a verdict: `PrimalSender` has no such
+        // method, and the `WorkerMsg::Done` carrier is private and unnameable.
+        t.compile_fail("tests/ui/primal_sender_cannot_send_done.rs");
+    });
 }
 
 /// COMPILE-TIME lock for the SharedBounds lb TYPED-BY-SOURCE rule (design
@@ -41,9 +56,11 @@ fn primal_worker_is_structurally_verdict_incapable() {
 /// OPTIMUM upgrade.
 #[test]
 fn shared_bounds_lb_is_typed_by_source() {
-    let t = trybuild::TestCases::new();
-    // Non-vacuity: the unprivileged read-only surface COMPILES.
-    t.pass("tests/ui/shared_bounds_read_only_ok.rs");
-    // A floor cannot be forged by struct literal or constructor call.
-    t.compile_fail("tests/ui/shared_bounds_lb_requires_audited_source.rs");
+    ay_test_support::trybuild_lane::with_trybuild_cargo(&workspace_root(), || {
+        let t = trybuild::TestCases::new();
+        // Non-vacuity: the unprivileged read-only surface COMPILES.
+        t.pass("tests/ui/shared_bounds_read_only_ok.rs");
+        // A floor cannot be forged by struct literal or constructor call.
+        t.compile_fail("tests/ui/shared_bounds_lb_requires_audited_source.rs");
+    });
 }

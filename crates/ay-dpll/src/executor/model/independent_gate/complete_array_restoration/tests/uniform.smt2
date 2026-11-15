@@ -1,0 +1,5 @@
+(set-logic ALL)
+(declare-const ay_qcex_0 (Array (_ BitVec 64) (_ BitVec 8)))
+(declare-const ay_qcex_1 (Array (_ BitVec 64) (_ BitVec 8)))
+(assert (let ((ay_qcex_2 ((as const (Array (_ BitVec 64) (_ BitVec 8))) (_ bv9 8)))) (and true (let ((ay!source!0 ay_qcex_0)) (forall ((ay!source!1 (_ BitVec 64))) (= (select ay!source!0 ay!source!1) (_ bv9 8)))) (let ((ay!source!2 ay_qcex_1)) (= (select ay!source!2 (_ bv18446744073709551615 64)) (_ bv9 8))) (= (let ((ay!source!2 ay_qcex_1)) ay!source!2) (let ((ay!source!0 ay_qcex_0)) ay!source!0)) (= ay_qcex_0 ay_qcex_2) (= ay_qcex_1 ay_qcex_2))))
+(check-sat)

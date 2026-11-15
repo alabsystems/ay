@@ -90,6 +90,57 @@ mod unix_tests {
         false
     }
 
+    /// Whether `pid` holds an anonymous `O_TMPFILE` stage in `dir` open.
+    ///
+    /// That is how Linux stages an unsealed proof: the inode has no name to
+    /// strand and none for [`staging_files`] to see, but the solver keeps it
+    /// open, and `/proc/<pid>/fd` shows it as `<dir>/#<inode> (deleted)`.
+    #[cfg(target_os = "linux")]
+    fn holds_anonymous_stage(pid: u32, dir: &Path) -> bool {
+        let Ok(dir) = dir.canonicalize() else {
+            return false;
+        };
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .any(|target| {
+                target.parent() == Some(dir.as_path())
+                    && target
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with('#') && name.ends_with(" (deleted)"))
+            })
+    }
+
+    /// Wait until `pid` has staged its unsealed proof in `dir`, under either
+    /// staging scheme: a named sibling stage, or (Linux) an anonymous inode.
+    ///
+    /// Waiting only for the NAMED stage made the SAT-COMP case vacuous on
+    /// Linux: it slept the whole budget, and the parse-bound formula (every
+    /// clause has a positive literal, so all-true satisfies it) was solved
+    /// before the signal -- measured at 14.6 s against a 30 s budget, with the
+    /// anonymous stage visible from 0.35 s -- so `kill -TERM` hit a finished
+    /// run that had printed `s SATISFIABLE`.
+    fn wait_for_staged_proof(pid: u32, dir: &Path, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if !staging_files(dir).is_empty() {
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            if holds_anonymous_stage(pid, dir) {
+                return true;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = pid;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn terminate(pid: u32) {
         let status = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
@@ -150,6 +201,82 @@ mod unix_tests {
         assert!(
             !proof.exists(),
             "an unsealed proof must never be published by the exit sweep"
+        );
+    }
+
+    /// The shipped SAT-COMP invocation (VeriPB proof, competition wrapper),
+    /// terminated mid-solve: it answers `s UNKNOWN` with exit 0 and leaves its
+    /// output directory empty. No proof, no stage, no quarantine directory
+    /// (2026-09-13; a runner must never be left the proof of an unanswered run).
+    #[test]
+    #[timeout(120_000)]
+    fn terminated_satcomp_veripb_solve_leaves_an_empty_output_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cnf = dir.path().join("parse-bound.cnf");
+        let output_dir = dir.path().join("output");
+        std::fs::create_dir(&output_dir).expect("create output directory");
+        write_parse_bound_cnf(&cnf);
+        let proof = output_dir.join("proof.out");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ay"))
+            .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+            .env(
+                "AY_INTERNAL_SATCOMP_WRAPPER",
+                "main-regular-default-veripb-v1",
+            )
+            .env("AY_SAT_COMPETITION_PROFILE", "regular")
+            .env("AY_SAT_PROFILE_ID", "ay-sat-regular-main")
+            .env("AY_SAT_VARIANT", "default")
+            .env("AY_COMPETITION_JIT_MODE", "off")
+            .args(["solve", "--sat-variant", "default", "--proof"])
+            .arg(&proof)
+            .args([
+                "--proof-format",
+                "veripb",
+                "--proof-checker",
+                "veripb",
+                "--no-verify-proof",
+                "--timeout=600000",
+            ])
+            .arg(&cnf)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ay");
+
+        // Signal only once the proof is staged, on every platform: this case
+        // is about a run terminated WITH a proof in progress.
+        assert!(
+            wait_for_staged_proof(child.id(), &output_dir, Duration::from_secs(30)),
+            "the solver must stage its unsealed proof in the output directory"
+        );
+        terminate(child.id());
+        let Some(status) = child
+            .wait_timeout(Duration::from_secs(30))
+            .expect("wait for the terminated solver")
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the terminated solver never exited");
+        };
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().expect("piped stdout"), &mut stdout)
+            .expect("read stdout");
+
+        let status_lines: Vec<&str> = stdout
+            .lines()
+            .filter(|line| line.starts_with("s "))
+            .collect();
+        assert_eq!(status_lines, ["s UNKNOWN"], "stdout: {stdout}");
+        assert_eq!(status.code(), Some(0), "the competition unknown exit code");
+        let left: Vec<PathBuf> = std::fs::read_dir(&output_dir)
+            .expect("read output directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "an unanswered run must leave its output directory empty; found {left:?}"
         );
     }
 

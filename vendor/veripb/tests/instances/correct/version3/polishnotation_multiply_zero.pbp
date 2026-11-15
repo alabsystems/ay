@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 5;
+pol x1 0 *;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

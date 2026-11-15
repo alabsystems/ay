@@ -7,7 +7,7 @@
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
-use super::budget::{rational_fits, SosLpBudget, MAX_SOS_LP_CELLS};
+use super::budget::{rational_fits, SosLpBudget, SosProgress, MAX_SOS_LP_CELLS};
 use super::{one, zero};
 
 /// Decide feasibility of `{ A x = b, x >= 0 }` over the rationals.
@@ -15,18 +15,33 @@ use super::{one, zero};
 /// Bland's rule guarantees algorithmic termination; the explicit pivot,
 /// rational-update, coefficient-size, and tableau-size limits bound concrete
 /// resource use. Exhaustion returns `None` and cannot produce a certificate.
-#[allow(clippy::needless_range_loop)] // Tableau pivoting uses row/column identities.
+#[cfg(test)]
 pub(super) fn lp_phase1_feasible(
+    a: Vec<Vec<BigRational>>,
+    b: Vec<BigRational>,
+    n: usize,
+) -> Option<Vec<BigRational>> {
+    lp_phase1_feasible_with_progress(a, b, n, &SosProgress::new(&|| true))
+}
+
+#[allow(clippy::needless_range_loop)] // Tableau pivoting uses row/column identities.
+pub(super) fn lp_phase1_feasible_with_progress(
     mut a: Vec<Vec<BigRational>>,
     mut b: Vec<BigRational>,
     n: usize,
+    progress: &SosProgress<'_>,
 ) -> Option<Vec<BigRational>> {
+    let mut budget = SosLpBudget::with_progress(progress);
     let m = a.len();
-    if b.len() != m
+    if !budget.poll()
+        || b.len() != m
         || n > MAX_SOS_LP_CELLS
         || a.iter().any(|row| row.len() != n)
-        || !a.iter().flatten().all(rational_fits)
-        || !b.iter().all(rational_fits)
+        || !a
+            .iter()
+            .flatten()
+            .all(|value| budget.poll() && rational_fits(value))
+        || !b.iter().all(|value| budget.poll() && rational_fits(value))
     {
         return None;
     }
@@ -36,13 +51,19 @@ pub(super) fn lp_phase1_feasible(
         return None;
     }
     if m == 0 {
-        return Some(vec![zero(); n]);
+        let solution = vec![zero(); n];
+        return budget.poll().then_some(solution);
     }
-    let mut budget = SosLpBudget::default();
     normalize_rhs(&mut a, &mut b, n, &mut budget)?;
 
+    if !budget.poll() {
+        return None;
+    }
     let mut tableau = vec![vec![zero(); tableau_cols]; m];
     for row in 0..m {
+        if !budget.poll() {
+            return None;
+        }
         for column in 0..n {
             tableau[row][column] = a[row][column].clone();
         }
@@ -55,6 +76,9 @@ pub(super) fn lp_phase1_feasible(
 
     let mut pivots = 0usize;
     loop {
+        if !budget.poll() {
+            return None;
+        }
         let Some(entering) = reduced_costs.iter().position(Signed::is_negative) else {
             if ay_core::debug_channel_active(ay_core::DebugChannel::Nia) {
                 safe_eprintln!("[NIA] SOS LP pivots={pivots} m={m} n={n} total={total}");
@@ -92,16 +116,19 @@ pub(super) fn lp_phase1_feasible(
             solution[basis[row]] = tableau[row][total].clone();
         }
     }
-    Some(solution)
+    budget.poll().then_some(solution)
 }
 
 fn normalize_rhs(
     a: &mut [Vec<BigRational>],
     b: &mut [BigRational],
     n: usize,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<()> {
     for row in 0..a.len() {
+        if !budget.poll() {
+            return None;
+        }
         if b[row].is_negative() {
             for column in 0..n {
                 a[row][column] = lp_neg(&a[row][column], budget)?;
@@ -116,10 +143,13 @@ fn initial_reduced_costs(
     tableau: &[Vec<BigRational>],
     total: usize,
     is_artificial: impl Fn(usize) -> bool,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<Vec<BigRational>> {
     let mut costs = Vec::with_capacity(total);
     for column in 0..total {
+        if !budget.poll() {
+            return None;
+        }
         let mut cost = if is_artificial(column) { one() } else { zero() };
         for row in tableau {
             if !row[column].is_zero() {
@@ -136,11 +166,14 @@ fn choose_leaving_row(
     basis: &[usize],
     entering: usize,
     rhs_column: usize,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<usize> {
     let mut leaving = None;
     let mut best = None;
     for row in 0..tableau.len() {
+        if !budget.poll() {
+            return None;
+        }
         if tableau[row][entering].is_positive() {
             let ratio = lp_div(&tableau[row][rhs_column], &tableau[row][entering], budget)?;
             let take = match &best {
@@ -165,7 +198,7 @@ fn pivot_tableau(
     leaving: usize,
     entering: usize,
     total: usize,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<()> {
     let pivot = tableau[leaving][entering].clone();
     if !pivot.is_one() {
@@ -179,6 +212,9 @@ fn pivot_tableau(
         .filter(|&column| !tableau[leaving][column].is_zero())
         .collect();
     for row in 0..tableau.len() {
+        if !budget.poll() {
+            return None;
+        }
         if row != leaving && !tableau[row][entering].is_zero() {
             let factor = tableau[row][entering].clone();
             for &column in &support {
@@ -202,7 +238,7 @@ fn pivot_tableau(
 pub(super) fn lp_add(
     left: &BigRational,
     right: &BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<BigRational> {
     bounded_binary(left, right, budget, |left, right| left + right)
 }
@@ -210,7 +246,7 @@ pub(super) fn lp_add(
 pub(super) fn lp_sub(
     left: &BigRational,
     right: &BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<BigRational> {
     bounded_binary(left, right, budget, |left, right| left - right)
 }
@@ -218,7 +254,7 @@ pub(super) fn lp_sub(
 pub(super) fn lp_mul(
     left: &BigRational,
     right: &BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<BigRational> {
     bounded_binary(left, right, budget, |left, right| left * right)
 }
@@ -226,7 +262,7 @@ pub(super) fn lp_mul(
 fn lp_div(
     left: &BigRational,
     right: &BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
 ) -> Option<BigRational> {
     if right.is_zero() {
         return None;
@@ -237,7 +273,7 @@ fn lp_div(
 fn bounded_binary(
     left: &BigRational,
     right: &BigRational,
-    budget: &mut SosLpBudget,
+    budget: &mut SosLpBudget<'_>,
     operation: impl FnOnce(&BigRational, &BigRational) -> BigRational,
 ) -> Option<BigRational> {
     if !budget.charge_updates(1) {
@@ -247,7 +283,7 @@ fn bounded_binary(
     rational_fits(&result).then_some(result)
 }
 
-fn lp_neg(value: &BigRational, budget: &mut SosLpBudget) -> Option<BigRational> {
+fn lp_neg(value: &BigRational, budget: &mut SosLpBudget<'_>) -> Option<BigRational> {
     if !budget.charge_updates(1) {
         return None;
     }

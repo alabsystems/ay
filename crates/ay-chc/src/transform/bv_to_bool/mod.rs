@@ -86,7 +86,7 @@ impl BvToBoolBitBlaster {
 
 impl Transformer for BvToBoolBitBlaster {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
-        if !problem.has_bv_sorts() {
+        if !problem.has_bv_sorts() || problem.has_array_lambda() {
             return TransformationResult {
                 problem,
                 back_translator: Box::new(IdentityBackTranslator),

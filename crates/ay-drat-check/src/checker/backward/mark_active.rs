@@ -77,9 +77,14 @@ impl BackwardChecker {
             .into_iter()
             .filter(|&lit| self.inner.value(lit) != Some(false))
             .collect();
-        let removed = original_len - reduced.len();
+        // `filter` never grows the clause, so the subtraction is exact.
+        let removed = original_len.saturating_sub(reduced.len());
         if removed > 0 {
-            self.inner.stats.reduced_literals += removed as u64;
+            self.inner.stats.reduced_literals = self
+                .inner
+                .stats
+                .reduced_literals
+                .saturating_add(removed as u64);
         }
         reduced
     }
@@ -112,7 +117,7 @@ impl BackwardChecker {
             let hash = DratChecker::hash_clause(clause);
             let bucket = self.inner.bucket_idx(hash);
             self.inner.hash_buckets[bucket].push(cidx);
-            self.inner.live_clauses += 1;
+            self.inner.live_clauses = self.inner.live_clauses.saturating_add(1);
         }
     }
 
@@ -143,20 +148,20 @@ impl BackwardChecker {
     ///
     /// Returns true if RAT succeeds (and marks deps), false otherwise.
     pub(super) fn check_rat_backward(&mut self, clause: &[Literal]) -> bool {
-        if clause.is_empty() {
+        let Some((&first, rest)) = clause.split_first() else {
             return false;
-        }
-        self.inner.stats.rat_checks += 1;
+        };
+        self.inner.stats.rat_checks = self.inner.stats.rat_checks.saturating_add(1);
         // Try the first literal as pivot with ACTIVE filtering + deps.
         let result = self
             .inner
-            .check_rat_with_pivot_deps(clause, clause[0], Some(&self.active));
+            .check_rat_with_pivot_deps(clause, first, Some(&self.active));
         if result.success {
             self.mark_rat_deps_active(&result);
             return true;
         }
         // Pivot fallback: try remaining literals.
-        for &alt_pivot in &clause[1..] {
+        for &alt_pivot in rest {
             let result =
                 self.inner
                     .check_rat_with_pivot_deps(clause, alt_pivot, Some(&self.active));

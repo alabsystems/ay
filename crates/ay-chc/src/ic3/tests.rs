@@ -229,6 +229,86 @@ fn test_ic3_one_step_unsafe() {
     }
 }
 
+/// Regression test: multi-step counterexamples preserve the Init -> Bad trace contract.
+///
+/// Two state variables s0, s1. Init: 00.
+/// Transitions:
+/// - 00 -> 01
+/// - 01 -> 10
+/// - 10 -> 10
+///
+/// Bad: 10. This exercises predecessor parent links: the unsafe trace must
+/// start with an initial cube and end with a bad cube, not just return the
+/// final bad obligation.
+///
+/// Ported from the pre-publication history (a300268979, 2026-05-17); it
+/// pins the parent-link trace reconstruction of f504bd9fa7's IC3 fix.
+#[test]
+fn test_ic3_two_step_unsafe_trace_spans_init_to_bad() {
+    let (sv, iv, nv, total) = make_vars(2, 0);
+    let s0 = sv[0];
+    let s1 = sv[1];
+    let s0_next = nv[0];
+    let s1_next = nv[1];
+
+    // Init: s0=0, s1=0.
+    let init_clauses = vec![vec![Literal::negative(s0)], vec![Literal::negative(s1)]];
+
+    // s0' = s0 OR s1.
+    // s1' = NOT s0 AND NOT s1.
+    let trans_clauses = vec![
+        vec![
+            Literal::negative(s0_next),
+            Literal::positive(s0),
+            Literal::positive(s1),
+        ],
+        vec![Literal::positive(s0_next), Literal::negative(s0)],
+        vec![Literal::positive(s0_next), Literal::negative(s1)],
+        vec![
+            Literal::positive(s1_next),
+            Literal::positive(s0),
+            Literal::positive(s1),
+        ],
+        vec![Literal::negative(s1_next), Literal::negative(s0)],
+        vec![Literal::negative(s1_next), Literal::negative(s1)],
+    ];
+
+    // Bad: s0=1, s1=0.
+    let bad_literals = vec![Literal::positive(s0), Literal::negative(s1)];
+
+    let ts = BitLevelTransitionSystem::new(
+        2,
+        0,
+        sv,
+        nv,
+        iv,
+        init_clauses,
+        trans_clauses,
+        bad_literals,
+        total,
+    );
+
+    let mut solver = Ic3Solver::new(ts, false);
+    let result = solver.solve();
+
+    match result {
+        Ic3Result::Unsafe { trace } => {
+            assert!(
+                trace.len() >= 2,
+                "multi-step counterexample should include predecessor links: {trace:?}"
+            );
+            let first = trace.first().expect("trace must have an initial cube");
+            assert!(first.literals.contains(&Literal::negative(s0)));
+            assert!(first.literals.contains(&Literal::negative(s1)));
+
+            let last = trace.last().expect("trace must have a bad cube");
+            assert!(last.literals.contains(&Literal::positive(s0)));
+            assert!(last.literals.contains(&Literal::negative(s1)));
+        }
+        other => panic!("expected Unsafe, got {other:?}"),
+    }
+}
+
 /// Test: safe system with nontrivial transition.
 ///
 /// Two state variables x, y. Init: x=0, y=0.

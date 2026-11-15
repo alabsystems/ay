@@ -27,17 +27,17 @@ type ArrayOpsMemo = FxHashMap<*const ChcExpr, Arc<ChcExpr>>;
 ///
 /// Both `eliminate_ite` and `eliminate_mod` need: a fresh-variable counter,
 /// a list of collected definitional constraints, and a node budget (#2774).
-struct EliminationState {
+pub(super) struct EliminationState {
     /// Counter for generating unique variable names
-    counter: u32,
+    pub(super) counter: u32,
     /// Collected definitional constraints
-    constraints: Vec<ChcExpr>,
+    pub(super) constraints: Vec<ChcExpr>,
     /// Node traversal budget (#2774). Returns original expression when exhausted.
-    budget: usize,
+    pub(super) budget: usize,
 }
 
 impl EliminationState {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             counter: 0,
             constraints: Vec::new(),
@@ -46,7 +46,7 @@ impl EliminationState {
     }
 
     /// Decrement budget by one. Returns false if budget is exhausted.
-    fn tick(&mut self) -> bool {
+    pub(super) fn tick(&mut self) -> bool {
         if self.budget == 0 {
             return false;
         }
@@ -54,7 +54,7 @@ impl EliminationState {
         true
     }
 
-    fn fresh_var(&mut self, prefix: &str, sort: ChcSort) -> ChcVar {
+    pub(super) fn fresh_var(&mut self, prefix: &str, sort: ChcSort) -> ChcVar {
         let name = format!("{}_{}", prefix, self.counter);
         self.counter += 1;
         ChcVar::new(name, sort)
@@ -111,7 +111,7 @@ impl ChcExpr {
         }
     }
 
-    /// Eliminate arithmetic ite expressions by introducing auxiliary variables and constraints.
+    /// Eliminate arithmetic ite expressions per path (see `eliminate_dag.rs` for the entry point).
     ///
     /// The CHC SMT backend ultimately relies on the LIA solver, which only supports linear
     /// integer/real arithmetic terms. Arithmetic-valued ite terms (e.g. `(ite c 1 0)`) create
@@ -122,7 +122,7 @@ impl ChcExpr {
     ///
     /// Boolean-valued ite expressions are left intact.
     /// If the expression tree exceeds 1M nodes, returns `self` unchanged (#2774).
-    pub(crate) fn eliminate_ite(&self) -> Self {
+    pub(super) fn eliminate_ite_tree(&self) -> Self {
         let mut state = EliminationState::new();
         let Some(transformed) = self.eliminate_ite_recursive(&mut state) else {
             return self.clone();
@@ -270,6 +270,83 @@ impl ChcExpr {
         })
     }
 
+    /// The `(x, 2^k)` of a `bv2nat` argument `bvand(m, int2bv_w(x))` (either
+    /// operand order) whose constant mask `m` is `2^k - 1` with `1 <= k < w`.
+    ///
+    /// Its `bv2nat` value is exactly `x mod 2^k` for every integer `x`, since
+    /// `2^k` divides `2^w`. It is the shape ay-core's `TermStore::mk_bv2nat`
+    /// turns into `(mod x 2^k)` (`masked_int2bv_residue`), after this
+    /// expression-level mod elimination has run: unless it is eliminated
+    /// here, the native DPLL(T) loop hands ay-lia an opaque `mod`, whose
+    /// atoms the LRA relaxation skips as unsupported. The mask is read the way
+    /// the term builder folds it (a `BitVec` below `2^w`, or `int2bv_w(c)`
+    /// reduced mod `2^w` as `mk_int2bv` does), and the zero and all-ones masks
+    /// are excluded because `mk_bvand` folds them away, so this matches exactly
+    /// the shapes ay-core turns into `(mod x 2^k)`.
+    pub(crate) fn masked_int2bv_residue(arg: &Self) -> Option<(&Self, i128)> {
+        fn mask_of_width(mask: &ChcExpr, width: u32) -> Option<u128> {
+            let value = match mask {
+                ChcExpr::BitVec(value, w) if *w == width => *value,
+                // `int2bv_w(c)` is `c mod 2^w`: ay-core's `mk_int2bv` folds the
+                // constant to that residue, so `int2bv32(2^32 + 255)` is the
+                // mask 255 there and becomes a `mod` like any other.
+                ChcExpr::Op(ChcOp::Int2Bv(w), args) if *w == width && args.len() == 1 => {
+                    let ChcExpr::Int(c) = args[0].as_ref() else {
+                        return None;
+                    };
+                    // As two's complement, `c` is `c mod 2^128`, and its low
+                    // `w` bits are `c mod 2^w` for every `w <= 128`. Wider, a
+                    // non-negative `c` (below 2^127) is its own residue, and a
+                    // negative one is `2^w + c >= 2^128`, never a low mask
+                    // below the width.
+                    match width {
+                        0..=127 => c.cast_unsigned() & ((1u128 << width) - 1),
+                        128 => c.cast_unsigned(),
+                        _ => u128::try_from(*c).ok()?,
+                    }
+                }
+                _ => return None,
+            };
+            (width >= 128 || value >> width == 0).then_some(value)
+        }
+        let Self::Op(ChcOp::BvAnd, args) = arg else {
+            return None;
+        };
+        let [lhs, rhs] = args.as_slice() else {
+            return None;
+        };
+        for (mask, value) in [(lhs, rhs), (rhs, lhs)] {
+            let Self::Op(ChcOp::Int2Bv(width), source) = value.as_ref() else {
+                continue;
+            };
+            let [x] = source.as_slice() else {
+                continue;
+            };
+            // Only an operand `eliminate_mod` itself would decompose, so the
+            // feature scan never flags a residue the pass then leaves alone.
+            if !Self::is_int_euclidean_dividend(x.as_ref()) {
+                continue;
+            }
+            let Some(mask) = mask_of_width(mask, *width) else {
+                continue;
+            };
+            let Some(modulus) = mask.checked_add(1) else {
+                continue;
+            };
+            // 1 <= k < w: a zero mask folds to 0 and an all-ones mask is the
+            // identity in the term builder; neither becomes a `mod`.
+            let below_width = *width >= 128 || modulus < (1u128 << *width);
+            if mask == 0 || !modulus.is_power_of_two() || !below_width {
+                continue;
+            }
+            let Ok(modulus) = i128::try_from(modulus) else {
+                continue;
+            };
+            return Some((x.as_ref(), modulus));
+        }
+        None
+    }
+
     /// Recursive helper for mod elimination.
     /// Returns `None` if the node budget is exhausted (#2774).
     fn eliminate_mod_recursive(&self, state: &mut EliminationState) -> Option<Self> {
@@ -279,6 +356,25 @@ impl ChcExpr {
                 return None;
             }
             Some(match self {
+                // `bv2nat(bvand(2^k - 1, int2bv_w(x)))` is `(mod x 2^k)`
+                // (`masked_int2bv_residue`): decompose it like one.
+                Self::Op(ChcOp::Bv2Nat, args)
+                    if args.len() == 1
+                        && Self::masked_int2bv_residue(args[0].as_ref()).is_some() =>
+                {
+                    let (x, modulus) = Self::masked_int2bv_residue(args[0].as_ref())?;
+                    let x = x
+                        .eliminate_mod_recursive(state)
+                        .unwrap_or_else(|| x.clone());
+                    let (_, r) = Self::euclidean_decompose(
+                        state,
+                        x,
+                        Self::Int(modulus),
+                        Self::Int(modulus),
+                        "mod",
+                    );
+                    Self::Var(r)
+                }
                 Self::Op(ChcOp::Mod, args)
                     if args.len() == 2 && Self::is_int_euclidean_dividend(args[0].as_ref()) =>
                 {
@@ -563,6 +659,17 @@ impl ChcExpr {
             }
         }
 
+        fn simplify_arguments(
+            args: &[Arc<ChcExpr>],
+            budget: &Cell<usize>,
+            depth: usize,
+            memo: &mut ArrayOpsMemo,
+        ) -> Vec<Arc<ChcExpr>> {
+            args.iter()
+                .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
+                .collect()
+        }
+
         fn simplify_inner(
             expr: &ChcExpr,
             budget: &Cell<usize>,
@@ -597,10 +704,7 @@ impl ChcExpr {
                     // fallback) so child `Arc`s go through the pointer-identity
                     // memo — mirrors `simplify_constants` (#7060).
                     ChcExpr::Op(op, args) => {
-                        let simplified_args: Vec<Arc<ChcExpr>> = args
-                            .iter()
-                            .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
-                            .collect();
+                        let simplified_args = simplify_arguments(args, budget, depth, memo);
                         // Skip rebuild when children are unchanged (#3665).
                         let args_changed = !args
                             .iter()
@@ -613,10 +717,7 @@ impl ChcExpr {
                         }
                     }
                     ChcExpr::FuncApp(name, sort, args) => {
-                        let simplified_args: Vec<Arc<ChcExpr>> = args
-                            .iter()
-                            .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
-                            .collect();
+                        let simplified_args = simplify_arguments(args, budget, depth, memo);
                         let args_changed = !args
                             .iter()
                             .zip(simplified_args.iter())
@@ -628,10 +729,7 @@ impl ChcExpr {
                         }
                     }
                     ChcExpr::PredicateApp(name, id, args) => {
-                        let simplified_args: Vec<Arc<ChcExpr>> = args
-                            .iter()
-                            .map(|arg| simplify_arg(arg, budget, depth + 1, memo))
-                            .collect();
+                        let simplified_args = simplify_arguments(args, budget, depth, memo);
                         let args_changed = !args
                             .iter()
                             .zip(simplified_args.iter())
@@ -651,6 +749,15 @@ impl ChcExpr {
                         }
                     }
 
+                    ChcExpr::ArrayLambda(lambda) => ChcExpr::ArrayLambda(
+                        lambda.with_captures(
+                            lambda
+                                .captures()
+                                .iter()
+                                .map(|value| simplify_arg(value, budget, depth + 1, memo))
+                                .collect(),
+                        ),
+                    ),
                     // Leaf markers with no array-relevant children.
                     _ => expr.clone(),
                 })
@@ -754,8 +861,18 @@ impl ChcExpr {
     /// Concrete ROW1/ROW2 reductions are free. When the budget is exhausted,
     /// remaining selects stay as-is (sound: no precision loss beyond what the
     /// array theory would produce on its own).
+    ///
+    /// Only `select` nodes are rewritten, so an expression without array ops
+    /// is returned as is, after one DAG-linear scan. The rewrite itself is a
+    /// tree walk that spends up to `MAX_PREPROCESSING_NODES` visits and
+    /// allocations on a shared DAG, and the PDR inductiveness queries call
+    /// this on every query, array or not.
     pub(crate) fn expand_select_store_symbolic(&self) -> Self {
         use std::cell::Cell;
+
+        if !self.contains_array_ops() {
+            return self.clone();
+        }
 
         const MAX_NODES: usize = MAX_PREPROCESSING_NODES;
         /// Number of symbolic `select(store(...))` expansions allowed per call.

@@ -382,12 +382,31 @@ impl Solver {
         false
     }
 
+    /// Whether learned binary clauses stay out of reduction: the test
+    /// override, else `--sat-keep-learned-binaries`.
+    fn keep_learned_binaries(&self) -> bool {
+        self.cold
+            .keep_learned_binaries
+            .unwrap_or_else(|| ay_core::sat_ab_switches().keep_learned_binaries == Some(true))
+    }
+
+    #[cfg(test)]
+    pub(in crate::solver) fn set_keep_learned_binaries(&mut self, on: bool) {
+        self.cold.keep_learned_binaries = Some(on);
+    }
+
     #[inline]
     pub(super) fn reduce_delete_permille(&self) -> u64 {
-        let low = if self.small_dense_learned_reduce_policy() {
+        let kissat_schedule = ay_core::sat_ab_switches().reduce_schedule_kissat == Some(true);
+        let low = if self.small_dense_learned_reduce_policy() && !kissat_schedule {
             SMALL_DENSE_REDUCE_LOW_PERMILLE
         } else {
-            REDUCE_LOW_PERMILLE
+            // `--sat-reduce-low-permille 500` is Kissat's `reducelow`; the
+            // shipped 750 is CaDiCaL's fixed target (see the switch's doc).
+            ay_core::sat_ab_switches()
+                .reduce_low_permille
+                .filter(|&low| low <= REDUCE_HIGH_PERMILLE)
+                .unwrap_or(REDUCE_LOW_PERMILLE)
         };
         dynamic_reduce_delete_permille(low, REDUCE_HIGH_PERMILLE, self.cold.num_reductions)
     }
@@ -412,6 +431,8 @@ impl Solver {
         let mut usage_protected = 0u64;
         let mut hyper_deleted = 0u64;
         let mut hyper_kept = 0u64;
+        let mut binary_kept = 0u64;
+        let keep_binaries = self.keep_learned_binaries();
 
         // Reuse persistent buffer and enumerate learned clauses from the arena's
         // learned-clause index instead of walking the full mixed arena.
@@ -428,7 +449,11 @@ impl Solver {
                 continue;
             }
             considered += 1;
-            if self.is_reason_clause_marked(idx) {
+            if keep_binaries && self.arena.len_of(idx) <= 2 && !self.arena.is_hyper(idx) {
+                binary_kept += 1;
+                continue;
+            }
+            if self.is_reason_clause_marked(idx) || self.binary_clause_may_support_the_trail(idx) {
                 reason_protected += 1;
                 continue;
             }
@@ -448,7 +473,7 @@ impl Solver {
             // lifetime in both flush and normal paths.
             if self.arena.is_hyper(idx) {
                 debug_assert!(self.arena.len_of(idx) <= 3);
-                if used == 0 {
+                if used == 0 && !self.hyper_clause_may_support_the_trail(idx) {
                     to_flush.push(idx);
                     deleted += 1;
                     hyper_deleted += 1;
@@ -495,6 +520,7 @@ impl Solver {
         self.stats.learned_reduction_considered += considered;
         self.stats.learned_reduction_deleted += deleted;
         self.stats.learned_reduction_reason_protected += reason_protected;
+        self.stats.learned_reduction_binary_kept += binary_kept;
         self.stats.learned_reduction_ic3_protected += ic3_protected;
         self.stats.learned_reduction_low_lbd_protected += low_lbd_protected;
         self.stats.learned_reduction_usage_protected += usage_protected;
@@ -513,27 +539,35 @@ impl Solver {
     ///
     /// Returns true if no conflict, false if UNSAT at level 0.
     fn propagate_out_of_order_units(&mut self) -> bool {
-        if self.decision_level == 0 {
-            return true;
-        }
-        let start = if self.trail_lim.is_empty() {
-            0
-        } else {
-            self.trail_lim[0]
-        };
-        let mut found_oou = false;
-        for i in start..self.trail.len() {
-            let lit = self.trail[i];
-            if self.var_data[lit.variable().index()].level == 0 {
-                found_oou = true;
-                break;
-            }
-        }
-        if !found_oou {
+        if !self.has_out_of_order_units() {
             return true;
         }
         self.backtrack(0);
         self.search_propagate().is_none()
+    }
+
+    /// Whether a level-0 literal sits above the first decision on the trail
+    /// (chronological backtracking leaves such units in place).
+    fn has_out_of_order_units(&self) -> bool {
+        if self.decision_level == 0 {
+            return false;
+        }
+        let start = self.trail_lim.first().copied().unwrap_or(0);
+        self.trail
+            .iter()
+            .skip(start)
+            .any(|lit| self.var_data[lit.variable().index()].level == 0)
+    }
+
+    /// Whether [`Self::reduce_db`] will backjump to level 0 before reducing
+    /// (to propagate out-of-order units, CaDiCaL reduce.cpp:223). A caller
+    /// with an extension, or with an assumption prefix, must hear of that
+    /// backjump first, like any other: the conflict-analysis paths call their
+    /// backtrack hook with level 0 when this holds, just before `reduce_db`.
+    pub(super) fn reduce_db_backjumps_to_root(&self) -> bool {
+        self.pending_theory_conflicts.is_empty()
+            && self.chrono_enabled
+            && self.has_out_of_order_units()
     }
 
     /// Reduce the learned clause database using tier-based management.
@@ -570,10 +604,20 @@ impl Solver {
         }
         // CaDiCaL reduce.cpp:223: propagate out-of-order units first.
         if self.chrono_enabled && !self.propagate_out_of_order_units() {
-            self.has_empty_clause = true;
+            self.raise_empty_clause_flag();
             return;
         }
         self.cold.num_reductions += 1;
+        self.promote_learned_binaries_kissat();
+        // Kissat reclassifies at every reduction; above level 0 the gate may
+        // only open (`--sat-jump-reasons-kissat`, `solver/jump_reasons.rs`).
+        self.reclassify_jump_reasons_kissat(false);
+        // `--sat-reduce-kissat-recompute`: this reduction's tier limits come
+        // from the usage seen so far (Kissat `reduce.c:159`).
+        let kissat_recompute = ay_core::sat_ab_switches().reduce_kissat_recompute == Some(true);
+        if kissat_recompute {
+            self.recompute_tier();
+        }
         self.mem_probe_report("reduce.pre");
         self.ensure_reason_clause_marks_current();
 
@@ -690,6 +734,8 @@ impl Solver {
             let mut stage1_kept = 0u64;
             let mut stage2_candidates = 0u64;
             let mut stage2_deleted = 0u64;
+            let mut binary_kept = 0u64;
+            let keep_binaries = self.keep_learned_binaries();
 
             // Reuse persistent buffer and enumerate learned clauses from the
             // arena's learned-clause index instead of walking the full mixed arena.
@@ -706,7 +752,26 @@ impl Solver {
                     continue;
                 }
                 considered += 1;
-                if self.is_reason_clause_marked(idx) {
+                // Kissat never reduces a binary clause (they are not in its
+                // arena); `--sat-keep-learned-binaries` does the same, and
+                // saves the per-reduction scan of the blanket-protected ones
+                // (167K per reduction on SDP_134_18_4334). Hyper binary
+                // resolvents keep their own rule below: probing makes about
+                // 50K of them per round there, CaDiCaL deletes the unused
+                // ones at the next reduction, and keeping them grew the
+                // learned clauses from 71K to 641K at the 300K cap.
+                if keep_binaries && self.arena.len_of(idx) <= 2 && !self.arena.is_hyper(idx) {
+                    binary_kept += 1;
+                    continue;
+                }
+                if self.is_reason_clause_marked(idx)
+                    || self.binary_clause_may_support_the_trail(idx)
+                {
+                    // `--sat-reduce-protect-kissat`: Kissat decrements `used`
+                    // before its reason check (reduce.c:70-74).
+                    if self.cold.reduce_protect_kissat && !two_stage {
+                        self.arena.decay_used(idx);
+                    }
                     reason_protected += 1;
                     continue;
                 }
@@ -740,7 +805,7 @@ impl Solver {
                 // otherwise keep but never enter the sort pool.
                 if self.arena.is_hyper(idx) {
                     debug_assert!(self.arena.len_of(idx) <= 3);
-                    if retention_score == 0 {
+                    if retention_score == 0 && !self.hyper_clause_may_support_the_trail(idx) {
                         let delete_result =
                             self.delete_clause_unchecked(idx, mutate::ReasonPolicy::Skip);
                         if delete_result == mutate::DeleteResult::Deleted {
@@ -777,7 +842,9 @@ impl Solver {
                 // LBD-1 clauses permanently; stale LBD-2 clauses continue into
                 // the used-gated Core branch below. IC3 keeps CORE_LBD because
                 // glue-2 blocking lemmas must persist across incremental queries.
-                if self.arena.lbd(idx) <= self.reduce_permanent_protect_lbd() {
+                if !self.cold.reduce_protect_kissat
+                    && self.arena.lbd(idx) <= self.reduce_permanent_protect_lbd()
+                {
                     low_lbd_protected += 1;
                     continue;
                 }
@@ -1017,6 +1084,7 @@ impl Solver {
             self.stats.learned_reduction_considered += considered;
             self.stats.learned_reduction_deleted += deleted;
             self.stats.learned_reduction_reason_protected += reason_protected;
+            self.stats.learned_reduction_binary_kept += binary_kept;
             self.stats.learned_reduction_ic3_protected += ic3_protected;
             self.stats.learned_reduction_low_lbd_protected += low_lbd_protected;
             self.stats.learned_reduction_usage_protected += usage_protected;
@@ -1135,6 +1203,10 @@ impl Solver {
             self.compact_arena_locality();
         }
 
+        // The cap and byte triggers sleep until the learned count has grown a
+        // tenth (at least 256 clauses) past what this reduction left behind.
+        self.record_reduction_retrigger_points();
+
         // Schedule next reduction: Kissat-style sqrt(reductions) (#8655).
         //
         // Kissat reduce.c:193: UPDATE_CONFLICT_LIMIT(reduce, reductions, SQRT, false)
@@ -1154,8 +1226,10 @@ impl Solver {
         // On small dense UNSAT formulas (e.g., clique graphs: 180 vars, 3160
         // clauses), the interval can still grow too large. Capping at 2x
         // num_original_clauses keeps the clause DB proportional to formula size.
-        if let Some(cap) = self.small_formula_reduce_interval_cap() {
-            delta = delta.min(cap);
+        if ay_core::sat_ab_switches().reduce_schedule_kissat != Some(true) {
+            if let Some(cap) = self.small_formula_reduce_interval_cap() {
+                delta = delta.min(cap);
+            }
         }
         // Cap reduce interval for large formulas (#8655).
         // With sqrt(conflicts) scaling, at 1M conflicts the interval reaches
@@ -1163,7 +1237,11 @@ impl Solver {
         // the learned clause DB bloats significantly in 25K conflicts.
         // Cap at LARGE_FORMULA_REDUCE_MAX_INTERVAL (5000) to keep reductions
         // frequent on large formulas, matching CaDiCaL's effective behavior.
-        if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
+        // `--sat-reduce-large-cap false` leaves Kissat's sqrt schedule uncapped
+        // (E00X23: 495 reductions by 2.43M conflicts against Kissat's 273 by 3.0M).
+        if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD
+            && ay_core::sat_ab_switches().reduce_large_cap != Some(false)
+        {
             delta = delta.min(LARGE_FORMULA_REDUCE_MAX_INTERVAL);
         }
         delta = delta.max(1);
@@ -1186,9 +1264,64 @@ impl Solver {
         }
 
         // Recompute dynamic tier boundaries if scheduled
-        if self.num_conflicts >= self.tiers.next_recompute_tier {
+        if !kissat_recompute && self.num_conflicts >= self.tiers.next_recompute_tier {
             self.recompute_tier();
         }
         self.mem_probe_report("reduce.post");
+    }
+}
+
+impl Solver {
+    /// A hyper-binary (or ternary) resolvent with a literal assigned above the
+    /// root may be the reason of that assignment, or lie on the implication
+    /// chain a jump reason summarises: on a mostly-binary formula a binary
+    /// propagation is recorded as a literal-tagged reason (`FLAG_BINARY_REASON`)
+    /// that names a dominator, not the clause, so `refresh_reason_clause_marks`
+    /// cannot protect the clause and reduction deleted it while the search was
+    /// still above it. The next conflict analysis or minimisation that resolved
+    /// through it then learned a clause whose proof step is not RUP for the
+    /// checker, which had honoured the deletion (a rejected certificate on a
+    /// random binary CSP, found by the 2026-09-17 audit). Keeping such a clause
+    /// for one more round costs nothing; it is deleted once its literals are
+    /// unassigned or at the root.
+    pub(super) fn hyper_clause_may_support_the_trail(&self, idx: usize) -> bool {
+        // The reason marks name every clause-referenced reason on the trail
+        // exactly. A reason the marks cannot name is a literal-encoded
+        // binary reason, and those exist only under jump reasons
+        // (`cold.jump_reasons_enabled`: formulas at least 99 percent binary
+        // without LRAT — the random binary CSP of the audit above). With
+        // jump reasons off this guard was pure false positives: on
+        // SDP_134_18_4334 it protected 167K learned binaries per reduction
+        // (10.2M scans over 61 reductions at the 300K cap) and let the
+        // unused hyper resolvents accumulate to 370K. `--sat-blanket-trail-
+        // protection true` restores the guard everywhere.
+        if !self.cold.jump_reasons_enabled && !self.blanket_trail_protection_forced() {
+            return false;
+        }
+        self.arena.literals(idx).iter().any(|lit| {
+            let vi = lit.variable().index();
+            vi < self.num_vars && self.var_is_assigned(vi) && self.var_data[vi].level > 0
+        })
+    }
+
+    /// The same protection for every learned binary clause: a binary
+    /// propagation is never a clause reason, so the reason marks cannot name
+    /// the clause; while one of its literals is assigned above the root the
+    /// clause may be what propagated it, or a link of the chain behind a jump
+    /// reason.
+    pub(super) fn binary_clause_may_support_the_trail(&self, idx: usize) -> bool {
+        self.arena.len_of(idx) <= 2 && self.hyper_clause_may_support_the_trail(idx)
+    }
+
+    /// `--sat-blanket-trail-protection true`, or the test override.
+    fn blanket_trail_protection_forced(&self) -> bool {
+        self.cold
+            .blanket_trail_protection
+            .unwrap_or_else(|| ay_core::sat_ab_switches().blanket_trail_protection == Some(true))
+    }
+
+    #[cfg(test)]
+    pub(in crate::solver) fn set_blanket_trail_protection(&mut self, on: bool) {
+        self.cold.blanket_trail_protection = Some(on);
     }
 }

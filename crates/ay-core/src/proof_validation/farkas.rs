@@ -708,19 +708,6 @@ fn collect_subterms(terms: &TermStore, term: TermId, out: &mut BTreeSet<TermId>)
 /// closure. This is the ONLY way a new equality between opaque terms is derived,
 /// and it is sound precisely because each argument equality it relies on was
 /// itself established from the conflict's own equality literals (never assumed).
-fn terms_congruent(terms: &TermStore, a: TermId, b: TermId, uf: &TermUnionFind) -> bool {
-    match (terms.get(a), terms.get(b)) {
-        (TermData::App(sa, aargs), TermData::App(sb, bargs)) => {
-            sa == sb
-                && aargs.len() == bargs.len()
-                && aargs
-                    .iter()
-                    .zip(bargs.iter())
-                    .all(|(&x, &y)| uf.find(x) == uf.find(y))
-        }
-        _ => false,
-    }
-}
 
 /// Build the congruence closure of a conflict's positive equality literals.
 ///
@@ -752,28 +739,45 @@ fn build_congruence_closure(terms: &TermStore, conflict: &[TheoryLit]) -> TermUn
         .copied()
         .filter(|&t| matches!(terms.get(t), TermData::App(_, _)))
         .collect();
-    // Guard against pathological blowup of the O(n^2) pairwise scan: bail to the
-    // linear path on very large conflicts. Sound — bailing only makes the
-    // verifier reject more (never accept more).
+    // Guard against pathological blowup on very large conflicts: bail to the
+    // linear path. Sound — bailing only makes the verifier reject more
+    // (never accept more).
     if apps.len() > 4096 {
         return TermUnionFind::new();
     }
-    // Fixpoint: re-scan until no further congruence merges occur (handles chains
-    // like `f(g(a)) ≡ f(g(b))` once `g(a) ≡ g(b)` is established).
+    // Signature-table closure: in each round, group applications by
+    // (head symbol, argument representatives); applications sharing a
+    // signature are congruent and merge. Rounds repeat until a round merges
+    // nothing (handles chains like `f(g(a)) ≡ f(g(b))` once `g(a) ≡ g(b)`
+    // is established). This computes the same least congruence as a pairwise
+    // scan — the merge rule is identical and the least fixed point is unique
+    // — at near-linear cost per round instead of O(n^2) pair checks, which
+    // dominated solver time on wide conflicts (miniflight profile).
+    let mut signatures: std::collections::HashMap<(Symbol, Vec<TermId>), TermId> =
+        std::collections::HashMap::with_capacity(apps.len());
     loop {
+        signatures.clear();
         let mut changed = false;
-        let mut tail = apps.as_slice();
-        while let &[a, ref rest @ ..] = tail {
-            for &b in rest {
-                if uf.find(a) == uf.find(b) {
-                    continue;
+        for &app in &apps {
+            let TermData::App(symbol, args) = terms.get(app) else {
+                continue;
+            };
+            let signature = (
+                symbol.clone(),
+                args.iter().map(|&arg| uf.find(arg)).collect::<Vec<_>>(),
+            );
+            match signatures.entry(signature) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let other = *entry.get();
+                    if uf.find(other) != uf.find(app) {
+                        uf.union(other, app);
+                        changed = true;
+                    }
                 }
-                if terms_congruent(terms, a, b, &uf) {
-                    uf.union(a, b);
-                    changed = true;
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(app);
                 }
             }
-            tail = rest;
         }
         if !changed {
             break;

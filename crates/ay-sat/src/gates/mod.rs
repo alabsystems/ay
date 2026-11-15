@@ -91,7 +91,18 @@ pub(crate) enum BveExtraction {
         resolve_gate_pairs: bool,
     },
     /// One polarity alone is inconsistent after removing the pivot literal.
-    FailedLiteral { unit: Literal },
+    FailedLiteral {
+        unit: Literal,
+        /// The kitten core's learned lemmas, in derivation order, in the
+        /// solver's literal encoding (empty when antecedent tracking is off).
+        /// Each, lifted by `unit`, is RUP with respect to the pivot's
+        /// occurrence clauses and the lifted lemmas before it, and the unit
+        /// is RUP after all of them: the certificate of the unit (Kissat
+        /// definition.c, `traverse_one_sided_core_lemma`). A one-sided core
+        /// implies the unit by resolution, not by propagation, so a proof
+        /// that carries the bare unit is rejected (cabp-M k33, 2026-09-16).
+        core_lemmas: Vec<Vec<u32>>,
+    },
 }
 
 /// Statistics for gate extraction
@@ -123,6 +134,11 @@ pub(crate) struct GateExtractor {
     marked_lits: Vec<Literal>,
     /// Statistics
     stats: GateStats,
+    /// Clause visits of the ITE base-pair scans since the last
+    /// `take_ite_scan_visits`: the work `--sat-deterministic-inproc` charges
+    /// against gate extraction's counted budget, which the per-pivot
+    /// occurrence effort does not see.
+    ite_scan_visits: u64,
 }
 
 impl GateExtractor {
@@ -131,7 +147,13 @@ impl GateExtractor {
         Self {
             marked_lits: Vec::new(),
             stats: GateStats::default(),
+            ite_scan_visits: 0,
         }
+    }
+
+    /// Clause visits of the ITE base-pair scans since the last call.
+    pub(crate) fn take_ite_scan_visits(&mut self) -> u64 {
+        std::mem::take(&mut self.ite_scan_visits)
     }
 
     /// Ensure internal buffers can handle `num_vars` variables.
@@ -439,8 +461,11 @@ impl GateExtractor {
         defining_clauses.dedup();
 
         match side_mask {
-            1 => Some(BveExtraction::FailedLiteral { unit: pivot_pos }),
-            2 => Some(BveExtraction::FailedLiteral { unit: pivot_neg }),
+            1 | 2 => {
+                let unit = if side_mask == 1 { pivot_pos } else { pivot_neg };
+                let core_lemmas = kitten.core_lemmas_external().lemmas;
+                Some(BveExtraction::FailedLiteral { unit, core_lemmas })
+            }
             // CaDiCaL definition extraction sets `definition_unit` when a
             // kitten core spans both polarities. That disables the same-gate
             // skip in elim.cpp:501, so gate×gate pairs are resolved in

@@ -1,0 +1,10 @@
+* #variable= 5 #constraint= 7
+* An equality stands for two constraints, so it carries one label for each of them, in the order
+* in which they are loaded.
+@sum_lo @sum_hi 1 x1 1 x2 = 1 ;
+* A right implication of an equality is two constraints in the same way.
+@reif_lo @reif_hi z1 ==> 1 x1 1 x3 = 1 ;
+* An equivalence stands for its two directions, so it takes a label for each of them too.
+@equiv_fwd @equiv_rev z2 <==> 1 x1 >= 1 ;
+* A line that stands for one constraint still takes exactly one label.
+@plain 1 x1 >= 1 ;

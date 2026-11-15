@@ -34,6 +34,14 @@ use super::NiaSolver;
 /// Unknown, never a wrong verdict.
 const MAX_REFINEMENT_MODEL_BITS: u64 = 4096;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitialSearchStage {
+    Enumeration,
+    Refinement,
+    FullSearch,
+    Complete,
+}
+
 impl NiaSolver<'_> {
     /// Last-resort SAT-only lane: clausal local search over the ORIGINAL
     /// assertion formulas (`#nia-clausal-sls`, see `local_search.rs`).
@@ -44,7 +52,7 @@ impl NiaSolver<'_> {
     /// AProVE termination VCs) has none. Local search cannot refute, so this
     /// can only turn `unknown` into an exactly-verified `sat`; it never returns
     /// `Unsat` and never bumps `conflict_count`.
-    fn try_local_search_lane(&mut self) -> Option<TheoryResult> {
+    pub(crate) fn try_local_search_lane(&mut self) -> Option<TheoryResult> {
         let start = ay_core::time::Instant::now();
         let result = self.try_clausal_local_search();
         self.timings.enumeration += start.elapsed();
@@ -141,7 +149,7 @@ impl NiaSolver<'_> {
     /// *asserted* equalities (or are syntactically identical), so the `reasons`
     /// always justify the lemma. Returns the number of congruence equalities
     /// added (0 when nothing is congruent — the common case, so this is cheap).
-    fn add_monomial_congruence_lemmas(&mut self) -> usize {
+    pub(crate) fn add_monomial_congruence_lemmas(&mut self) -> usize {
         // Need at least two monomials for any congruence to be possible.
         if self.monomials.len() < 2 {
             return 0;
@@ -290,17 +298,41 @@ impl NiaSolver<'_> {
         self.lia.assert_shared_equality(lhs, rhs, &reason_lits);
     }
 
-    /// Undo all tentative scopes (sign-cut + patch) if any are active.
+    /// Undo all tentative scopes (sign-cut + patch) if any are active, and
+    /// forget the model guesses they held (#nia-sign-cut-soundness): once
+    /// the scopes are popped no guess is in force.
     pub(crate) fn undo_tentative_patch(&mut self) {
         while self.tentative_depth > 0 {
-            self.lia.pop();
+            // A tentative pop: EUF has not backtracked, so the LIA keeps its
+            // Nelson-Oppen sent-equality dedup (see `LiaSolver::pop_tentative`).
+            self.lia.pop_tentative();
             self.tentative_depth -= 1;
         }
+        self.tentative_guess_count = 0;
     }
 
     /// Inject model-derived sign bounds for original variables into a tentative
-    /// LIA scope. Based on Z3's `nla_basics_lemmas.cpp:sign_lemma()`.
-    fn inject_tentative_sign_cuts(&mut self) -> usize {
+    /// LIA scope. Based on Z3's `nla_basics_lemmas.cpp:sign_lemma()` — with
+    /// one deliberate difference (#nia-sign-cut-soundness): z3's sign lemma is
+    /// an IMPLICATION clause over sign ATOMS (`x > 0 ∧ y > 0 → x*y > 0`) that
+    /// the SAT solver decides; the model only picks which clause to emit. AY
+    /// asserts the guessed sign as a tentative BOUND whose reason is the
+    /// variable term — never an asserted atom — because it is cheaper and
+    /// steers the LP toward a model the monomial check can verify. That bound
+    /// is a heuristic, not a theorem, and it is sound ONLY because nothing
+    /// downstream can build a verdict on it: the LRA's Farkas guard (#8764)
+    /// rejects any simplex conflict citing it and retracts it (#A2), and the
+    /// LIA's verdict-producing side checks read only JUSTIFIED bounds and
+    /// refuse to publish a conflict citing a non-atom (`ay_lia`
+    /// `justified_bounds`). Every guess is also counted in
+    /// `tentative_guess_count` so the check loop can audit that invariant.
+    ///
+    /// Cuts from successive model points accumulate in ONE scope (the scope
+    /// is pushed once per check), so a later, opposite guess can pin a
+    /// variable to 0 by guesses alone — harmless under the discipline above
+    /// (the pin steers the LP; it cannot be a fact), and kept because the
+    /// steering is what the heuristic buys.
+    pub(crate) fn inject_tentative_sign_cuts(&mut self) -> usize {
         let zero = BigRational::zero();
         let mut added = 0;
 
@@ -342,9 +374,62 @@ impl NiaSolver<'_> {
                 },
                 var_id,
             );
+            self.tentative_guess_count += 1;
             added += 1;
         }
         added
+    }
+
+    /// Debug-build diagnostic for the #nia-sign-cut-soundness invariant:
+    /// re-derive the LIA UNSAT just observed with model guesses in force in a
+    /// scope that holds NO guess — the base scope plus even-power
+    /// non-negativity and McCormick over the base-scope bounds. Pops the
+    /// tentative scopes, rechecks (up to three McCormick passes, as the
+    /// tangent recheck does), pops again. Returns whether the refutation
+    /// survived. `false` is a lead, not a verdict: other exact lemma
+    /// families (secant, box, zero-bound) are not re-derived here. Compiled
+    /// under `cfg(debug_assertions)` only and run only with `--debug nia`;
+    /// its rows and pivots stay in the tableau, which is why release builds
+    /// rely on the invariant itself (justified reads + exit guard in the
+    /// LIA, the Farkas guard in the LRA) rather than on this re-derivation.
+    #[cfg(debug_assertions)]
+    fn audit_unsat_is_guess_free(&mut self) -> bool {
+        self.undo_tentative_patch();
+        self.lia.push_tentative();
+        self.tentative_depth += 1;
+        let mons = std::mem::take(&mut self.monomials);
+        for mon in mons.values() {
+            self.add_even_power_nonneg(mon);
+            self.add_mccormick_constraints(mon);
+        }
+        let mut refuted = false;
+        for _ in 0..3 {
+            let recheck = self.lia.check();
+            let recheck = self.normalize_lia_result(recheck);
+            if matches!(
+                recheck,
+                TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+            ) {
+                refuted = true;
+                break;
+            }
+            let mut added_any = false;
+            for mon in mons.values() {
+                if self.add_mccormick_constraints(mon) > 0 {
+                    added_any = true;
+                }
+            }
+            if !added_any {
+                break;
+            }
+        }
+        self.monomials = mons;
+        debug_assert_eq!(
+            self.tentative_guess_count, 0,
+            "the guess-free audit must not assert model guesses"
+        );
+        self.undo_tentative_patch();
+        refuted
     }
 
     /// Get the value of a term: tries LRA model first, then constant extraction.
@@ -658,6 +743,21 @@ impl NiaSolver<'_> {
         #[cfg(not(debug_assertions))]
         const MAX_ITERATIONS: usize = 500;
 
+        // Deadline poll BEFORE the pre-phases (#nia-deadline). The refinement
+        // loop below polls at every iteration boundary, but the two exact
+        // pre-phases run ahead of it, so an expired budget used to buy a full
+        // univariate + SOS attempt before the first poll. Unknown is always
+        // sound; no verdict has been computed yet.
+        if self.should_timeout() {
+            if self.debug {
+                safe_eprintln!(
+                    "[NIA] wall-clock deadline already exceeded on entry \
+                     — returning Unknown before the exact pre-phases"
+                );
+            }
+            return TheoryResult::Unknown;
+        }
+
         // Exact univariate-integer decider (#nia-univariate-int). Fires only
         // when there is at least one nonlinear monomial (linear problems are
         // already complete in LIA) and EVERY asserted atom is a polynomial
@@ -681,28 +781,62 @@ impl NiaSolver<'_> {
             }
         }
 
+        if self.should_timeout() {
+            if self.debug {
+                safe_eprintln!(
+                    "[NIA] wall-clock deadline exceeded after the univariate pre-phase \
+                     — returning Unknown instead of running the SOS pre-phase"
+                );
+            }
+            return TheoryResult::Unknown;
+        }
+
         // Exact rational SOS / Positivstellensatz UNSAT decision pre-phase (W3,
         // #nia-sos). Discharges coupled-multivariate NIA infeasibilities —
         // cross-term / quadratic-form refutations like `(x−y)²<0`, `x²+y²<2xy`,
         // overflow/box-product bounds — that the incremental-linearization loop
-        // below would otherwise leave at `Unknown`. Certificate-gated and
-        // sound-for-UNSAT ONLY: it returns exactly `Unsat` (with an
+        // below would otherwise leave at `Unknown`. Cancellation returns a
+        // terminal Unknown instead of starting another phase. Otherwise it is
+        // certificate-gated and UNSAT-only: it returns `Unsat` (with an
         // independently re-checkable Positivstellensatz certificate, or on a
-        // syntactically-false atom) or falls through. It NEVER emits `Sat` and
+        // syntactically-false atom), or an ordinary decline falls through.
+        // It NEVER emits `Sat` and
         // NEVER turns a satisfiable system into `Unsat` (see sos_check.rs).
-        if let Some(result) = self.try_sos_positivstellensatz_unsat() {
-            self.conflict_count += 1;
-            if self.debug {
-                safe_eprintln!("[NIA] SOS Positivstellensatz pre-phase: {result:?}");
+        match self.try_sos_attempt() {
+            super::sos_check::SosAttempt::Interrupted => return TheoryResult::Unknown,
+            super::sos_check::SosAttempt::Refuted(conflict) => {
+                self.conflict_count += 1;
+                let result = TheoryResult::Unsat(conflict);
+                if self.debug {
+                    safe_eprintln!("[NIA] SOS Positivstellensatz pre-phase: {result:?}");
+                }
+                return result;
             }
-            return result;
+            super::sos_check::SosAttempt::Declined => {}
+        }
+        // A stopped SOS attempt declines without a verdict. Do not start
+        // congruence/cut construction before the next loop-boundary poll.
+        if self.should_timeout() {
+            return TheoryResult::Unknown;
         }
 
         // Track whether tangent hyperplane approximations were used.
         // Tangent planes are model-point linearizations that may exclude valid
         // solutions. When tangent planes were used and LIA becomes UNSAT,
-        // the UNSAT is unreliable. McCormick envelopes, even-power
-        // non-negativity, and sign cuts do NOT set this flag.
+        // the loop re-derives the refutation with only exact lemmas before
+        // publishing it (completeness: the recheck often still refutes).
+        //
+        // This flag is NOT what keeps an UNSAT sound (#nia-sign-cut-soundness).
+        // Sign cuts, integer-rounding / patch pins, McCormick rows built on
+        // them, pairwise McCormick and division-refinement cuts are all
+        // model-point guesses too, and none sets it — soundness comes from the
+        // fact that every such bound carries a VARIABLE or MONOMIAL term as
+        // its reason, so the LRA's Farkas guard rejects any simplex conflict
+        // citing it, the LIA's verdict-producing side checks read only
+        // JUSTIFIED bounds, and the LIA refuses to publish a conflict citing
+        // a non-atom. Measured on main b1c1f8f201 before that discipline: 18
+        // satisfiable QF_NIA files answered `unsat` at the "genuine" site
+        // below through sign cuts and rounding pins alone.
         let mut used_tangent_approximation = false;
 
         // Refinement livelock detection (#nia-refine-stall): the tangent /
@@ -719,6 +853,10 @@ impl NiaSolver<'_> {
         // reorders when the fallbacks run).
         let mut stall_fingerprint: Option<u64> = None;
         let mut stall_repeats: usize = 0;
+        // #nia-mccormick-contracted-bounds: at most one contracted-box
+        // factor-split attempt per check on the NeedSplit path below.
+        let mut contracted_split_tried = false;
+        let mut initial_search = InitialSearchStage::Enumeration;
 
         // Monomial congruence (#nia-congruence): link the opaque product vars
         // of monomials whose factor multisets are equal under the asserted
@@ -994,7 +1132,39 @@ impl NiaSolver<'_> {
                             }
                             return TheoryResult::Unknown;
                         }
-                        return TheoryResult::Sat;
+                        // LIA Sat with consistent monomials. Claim Sat only for
+                        // a point the exact evaluator confirms — the LIA's Sat
+                        // may rest on its direct-enumeration witness while the
+                        // tableau point the monomial check used is fractional
+                        // or relaxed (#nia-sign-cut-soundness, SAT side); a
+                        // provably wrong / fractional point falls through to
+                        // the refinement below instead of a `sat` the model
+                        // gate would reject.
+                        if let Some(result) = self.sat_verdict_for_current_point() {
+                            return result;
+                        }
+                    }
+
+                    // Enumeration can decline while still contracting a small
+                    // factor box. Give refinement one LIA recheck, then try
+                    // that exact cover before the full SAT-only search.
+                    if initial_search == InitialSearchStage::FullSearch {
+                        initial_search = InitialSearchStage::Complete;
+                        let start = ay_core::time::Instant::now();
+                        let split = self.try_bounded_factor_split();
+                        self.timings.enumeration += start.elapsed();
+                        if let Some(result) = split {
+                            if matches!(result, TheoryResult::Unsat(_)) {
+                                self.conflict_count += 1;
+                            }
+                            return result;
+                        }
+                        if let Some(result) = self.try_local_search_lane() {
+                            return result;
+                        }
+                        // These searches drop tentative scopes. Do not refine
+                        // or forward a result using the pre-search LIA model.
+                        continue;
                     }
 
                     // Livelock check (#nia-refine-stall): fingerprint the
@@ -1025,7 +1195,37 @@ impl NiaSolver<'_> {
                     // to stall (#7978). This is especially important for problems
                     // where LIA returns NeedSplit before tangent planes iterate
                     // enough to trigger the stall-point enumeration.
-                    if iteration == 0 {
+                    if initial_search == InitialSearchStage::Enumeration {
+                        initial_search = InitialSearchStage::Refinement;
+                        // #nia-sls-first-offer: at the first inconsistent
+                        // point, offer the clausal local
+                        // search before bounded enumeration. The lane
+                        // searches the root assertions (trail-independent)
+                        // and only ever claims a Sat it verified exactly;
+                        // the previous offer points sit behind the
+                        // monomial-consistent branch and late fallbacks, so
+                        // on queries whose LIA point is always
+                        // monomial-inconsistent (measured: VeryMax p32315,
+                        // 161/161 checks) the lane never ran while
+                        // enumeration produced full-cover conflicts
+                        // indefinitely. The offer is SLICED (split-probe
+                        // slice inside the shared cutoff): the full lane
+                        // here starved enumeration on UNSAT shapes it
+                        // decides in well under a second (measured:
+                        // 60-link nonzero chain, 0.44 s quarantined vs
+                        // 20 s timeout), and the full lane remains
+                        // available at the later offer points.
+                        // Preserve source-unit scheduling through purification:
+                        // exact refinement precedes SAT-only search for a
+                        // completed integer-unit conjunction. Alternatives or
+                        // an incomplete/stopped scan retain the sliced offer.
+                        let source_unit_conjunction =
+                            self.root_assertions_are_integer_unit_conjunction();
+                        if !source_unit_conjunction {
+                            if let Some(result) = self.try_local_search_first_offer() {
+                                return result;
+                            }
+                        }
                         let enum_start = ay_core::time::Instant::now();
                         let enum_result = self.try_bounded_enumeration();
                         self.timings.enumeration += enum_start.elapsed();
@@ -1041,11 +1241,33 @@ impl NiaSolver<'_> {
                             }
                             return result;
                         }
+                        // Enumeration declined: alternatives or an incomplete
+                        // source scan may spend the full lane's remaining
+                        // shared budget here. A completed unit conjunction
+                        // reaches exact refinement below first; the existing
+                        // late fallback still offers SLS if refinement stalls
+                        // or cannot decide.
+                        // The full lane remains available for witnesses that
+                        // need more than the first-offer slice: here for
+                        // alternatives, at the late fallback for unit roots.
+                        if !source_unit_conjunction {
+                            if let Some(result) = self.try_local_search_lane() {
+                                return result;
+                            }
+                        }
                     }
+
+                    // Zero-product / quotient / interval-product lemmas
+                    // (#nia-zero-product): exact cuts from justified bounds,
+                    // emitted BEFORE the tentative scope opens so they read
+                    // only real-scope bounds (the function also gates on
+                    // tentative_depth). Asserted bounds materialize at the
+                    // first LIA check, so this is the earliest useful point.
+                    let zero_product_added = self.add_zero_product_lemmas(true);
 
                     // Tentative sign cuts for variables with unknown sign
                     if self.tentative_depth == 0 {
-                        self.lia.push();
+                        self.lia.push_tentative();
                         self.tentative_depth += 1;
                     }
                     let sign_cuts = self.inject_tentative_sign_cuts();
@@ -1078,7 +1300,9 @@ impl NiaSolver<'_> {
                             if !self.has_scaled_product_vars()
                                 || self.current_model_point_status() != Some(false)
                             {
-                                return TheoryResult::Sat;
+                                if let Some(result) = self.sat_verdict_for_current_point() {
+                                    return result;
+                                }
                             }
                         }
                     }
@@ -1097,7 +1321,9 @@ impl NiaSolver<'_> {
                             if !self.has_scaled_product_vars()
                                 || self.current_model_point_status() != Some(false)
                             {
-                                return TheoryResult::Sat;
+                                if let Some(result) = self.sat_verdict_for_current_point() {
+                                    return result;
+                                }
                             }
                         }
                     }
@@ -1135,6 +1361,10 @@ impl NiaSolver<'_> {
                     let enhanced = self.apply_enhanced_refinement();
                     self.timings.tangent += tangent_start.elapsed();
                     added += enhanced;
+                    // Exact zero-product cuts emitted above also count as
+                    // refinement progress (they force a re-check) but are
+                    // NOT tangent approximations.
+                    added += zero_product_added;
 
                     if added == 0 || refinement_stalled || iteration == MAX_ITERATIONS {
                         // Tangent planes stalled -- try bounded enumeration
@@ -1195,24 +1425,92 @@ impl NiaSolver<'_> {
                         if let Some(result) = self.try_local_search_lane() {
                             return result;
                         }
+                        // A fractional Int variable outside the monomials keeps
+                        // the tableau point from ever being a model; hand it
+                        // to branch-and-bound (#nia-sign-cut-soundness). After
+                        // the local search, not before: on an UNBOUNDED
+                        // variable the split walks (`y <= 0`, then `y <= -1`,
+                        // ...) without ever converging, and the local search
+                        // is what decides such files (signfuzz p066 ran to the
+                        // deadline with the split ahead of it).
+                        if let Some(split) = self.fractional_int_split() {
+                            if self.debug {
+                                safe_eprintln!(
+                                    "[NIA] refinement stalled on a fractional tableau point: \
+                                     splitting {:?} at {}",
+                                    split.variable,
+                                    split.value
+                                );
+                            }
+                            return TheoryResult::NeedSplit(split);
+                        }
                         return TheoryResult::Unknown;
                     }
 
+                    if initial_search == InitialSearchStage::Refinement {
+                        initial_search = InitialSearchStage::FullSearch;
+                    }
                     continue;
                 }
                 TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
                     self.conflict_count += 1;
                     if iteration == 0 {
-                        // First iteration: no tangent planes, LIA conflict is genuine.
+                        // First iteration: `check()` popped every tentative
+                        // scope on entry and nothing model-derived has been
+                        // asserted since, so the LIA conflict is genuine.
                         // Move instead of clone since we're returning (#8599).
+                        debug_assert_eq!(
+                            self.tentative_guess_count, 0,
+                            "iteration 0 runs before any model guess is asserted"
+                        );
                         return lia_result;
+                    }
+                    // #nia-sign-cut-soundness: at iteration >= 1 the tentative
+                    // scope holds model guesses (sign cuts, rounding / patch
+                    // pins) and the McCormick rows built on them. The LIA's
+                    // UNSAT is nevertheless a theorem of the asserted atoms:
+                    // its side checks read only justified bounds, its exit
+                    // guard refuses a conflict citing a non-atom, and the
+                    // LRA's Farkas guard rejects a simplex conflict citing a
+                    // guess. Count the case (`nia_unsat_with_guesses`) so a
+                    // census can see how often a published refutation had
+                    // guesses in scope; in debug builds with `--debug nia`,
+                    // also re-derive it in a guess-free scope and report the
+                    // outcome. The re-derivation is diagnostic, not a gate: it
+                    // re-adds only even-power and McCormick lemmas, so a
+                    // refutation that used another exact lemma family (secant,
+                    // box, zero-bound) can legitimately fail it, and in release
+                    // its extra rows and pivots were measured to perturb the
+                    // LP walk enough to lose decided QF_UFNIA fuzz files.
+                    if self.tentative_guess_count > 0 && !used_tangent_approximation {
+                        self.unsat_with_guesses_count += 1;
+                        #[cfg(debug_assertions)]
+                        if self.debug {
+                            let guesses = self.tentative_guess_count;
+                            let refuted = self.audit_unsat_is_guess_free();
+                            safe_eprintln!(
+                                "[NIA] Iteration {iteration}: LIA UNSAT with {guesses} model \
+                                 guess(es) in force; guess-free re-derivation refuted={refuted}"
+                            );
+                        }
                     }
                     if used_tangent_approximation {
                         // Tangent planes may have over-constrained. Recheck with
-                        // only exact lemmas (McCormick, even-power, sign cuts,
-                        // and division refinement at fresh model point).
+                        // only exact lemmas (McCormick, even-power, and division
+                        // refinement at the fresh model point) plus the sign-cut
+                        // heuristic — which, like every other guess, cannot
+                        // reach a verdict (see above) but steers the LP.
                         self.undo_tentative_patch();
-                        self.lia.push();
+                        // Zero-product lemmas are exact, so they belong in
+                        // the exact-only recheck; re-derive them now, in the
+                        // real scope with clean (non-tentative) bounds and
+                        // before the monomials mem::take below. The dedup
+                        // set is cleared because copies emitted inside the
+                        // popped tentative scope are gone (real-scope
+                        // copies duplicate harmlessly).
+                        self.zero_product_emitted.clear();
+                        self.add_zero_product_lemmas(true);
+                        self.lia.push_tentative();
                         self.tentative_depth += 1;
                         self.inject_tentative_sign_cuts();
                         // Use mem::take to avoid cloning all Monomial values (#8599).
@@ -1257,12 +1555,9 @@ impl NiaSolver<'_> {
                         self.monomials = mons;
                         self.undo_tentative_patch();
                         if recheck_proved {
-                            let conflict: Vec<TheoryLit> = self
-                                .asserted
-                                .iter()
-                                .map(|&(t, v)| TheoryLit { term: t, value: v })
-                                .collect();
-                            return TheoryResult::Unsat(conflict);
+                            // The recheck refuted the LIA state as a whole,
+                            // EUF shared-equality rows included.
+                            return TheoryResult::Unsat(self.full_conflict_lits());
                         }
                         // Try bounded enumeration before giving up -- it can decide
                         // the original nonlinear problem independently of tangent planes.
@@ -1324,13 +1619,11 @@ impl NiaSolver<'_> {
                         }
                         return TheoryResult::Unknown;
                     }
-                    // Only exact lemmas were used. UNSAT is genuine.
-                    let conflict: Vec<TheoryLit> = self
-                        .asserted
-                        .iter()
-                        .map(|&(t, v)| TheoryLit { term: t, value: v })
-                        .collect();
-                    return TheoryResult::Unsat(conflict);
+                    // No tangent approximation in force: the LIA's refutation
+                    // stands (see the invariant above) — as a refutation of
+                    // the LIA state, which includes the EUF shared-equality
+                    // rows it holds (`full_conflict`).
+                    return TheoryResult::Unsat(self.full_conflict_lits());
                 }
                 other => {
                     // Cover-closed fast path (#nia-factor-split-fastpath):
@@ -1373,6 +1666,32 @@ impl NiaSolver<'_> {
                         }
                     }
 
+                    // Contracted-box factor split before forwarding a
+                    // genuine `NeedSplit` (#nia-mccormick-contracted-bounds):
+                    // when the interval contractor completed a small
+                    // finite box for some monomial factor (incomplete from
+                    // asserted atoms alone), enumerating that box is exact
+                    // progress the value-by-value walk cannot make — the
+                    // walk splits a fractional lambda while the shared
+                    // factor sits at its bound. Once per check; falls
+                    // through to the unchanged forwarding when the split
+                    // cannot decide.
+                    if matches!(other, TheoryResult::NeedSplit(_))
+                        && !contracted_split_tried
+                        && self.has_contracted_factor_candidate()
+                    {
+                        contracted_split_tried = true;
+                        let enum_start = ay_core::time::Instant::now();
+                        let split = self.try_bounded_factor_split();
+                        self.timings.enumeration += enum_start.elapsed();
+                        if let Some(result) = split {
+                            if matches!(result, TheoryResult::Unsat(_)) {
+                                self.conflict_count += 1;
+                            }
+                            return result;
+                        }
+                    }
+
                     // SAT-only capped model search before forwarding a genuine
                     // `NeedSplit` (#nia-capped-search-needsplit). On unbounded
                     // satisfiable queries (e.g. `x*x = k*y ∧ x > c`) the LIA
@@ -1403,6 +1722,16 @@ impl NiaSolver<'_> {
                             }
                             return result;
                         }
+                    }
+                    // A first refinement may request an outer split rather
+                    // than return Sat. Preserve the full SAT-witness offer
+                    // there too, after the exact factor/capped searches.
+                    if initial_search == InitialSearchStage::FullSearch {
+                        initial_search = InitialSearchStage::Complete;
+                        if let Some(result) = self.try_local_search_lane() {
+                            return result;
+                        }
+                        continue;
                     }
                     return lia_result.clone();
                 }
@@ -1600,3 +1929,6 @@ mod eq_union_find_tests {
         assert!(reasons.is_empty());
     }
 }
+#[cfg(test)]
+#[path = "check_loop/sos_stop_tests.rs"]
+mod sos_stop_tests;

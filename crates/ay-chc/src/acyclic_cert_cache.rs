@@ -47,6 +47,16 @@
 //!
 //! The reuse is therefore exactly equivalent to re-running the proof; on any
 //! non-match the caller falls back to the correct-but-slower re-run unchanged.
+//!
+//! ## Scope since 2026-09-29
+//!
+//! A hit (like the BMC run it stands in for) is no longer sufficient to admit
+//! an empty model anywhere. Re-running (or recalling) the engine that
+//! produced a certificate cannot validate it: a BMC encoding defect validated
+//! its own wrong Safe that way (MODEL_CHECKER_CONSUMER state report §4-A1). Every reader
+//! (the empty-model validators, the proof-grade PDR prepass) now also
+//! requires `crate::empty_acyclic_safe_check` to decide the claim without the
+//! engine.
 
 use crate::ChcProblem;
 use std::collections::HashMap;

@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+f 2;
+pol 1;
+core id 3 ;
+del id 1;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -163,6 +163,8 @@ pub(crate) const SEP_LABELS: [&str; SEP_N] = [
     "covers",
     "mir",
     "strongcg",
+    // Retired separator; the index stays reserved so later labels keep their
+    // historical positions (see `cuts/mixing_history.md`). It records nothing.
     "mixing",
     "lifted_cover",
     "implied_bound",

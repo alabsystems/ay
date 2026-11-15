@@ -35,15 +35,35 @@ fn run_ay(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Extract the `__ay_soft_cost` value from `(get-objectives)` output.
+/// Extract the total violated soft weight from `(get-objectives)` output in
+/// Z3's per-group shape (`( <n>)` anonymous, `(id <n>)` named; a trailing
+/// `:approximate` marker is ignored). Sums every group's cost.
 fn soft_cost(stdout: &str) -> Option<u64> {
-    let tag = "(__ay_soft_cost ";
-    let start = stdout.find(tag)? + tag.len();
-    let rest = &stdout[start..];
-    let end = rest.find(')')?;
-    // A `:approximate` qualifier may follow the value (resource-limited /
-    // weight-incomplete results); take the leading numeric token.
-    rest[..end].split_whitespace().next()?.parse::<u64>().ok()
+    let block_start = stdout.find("(objectives")?;
+    let mut total = 0u64;
+    let mut any = false;
+    for line in stdout[block_start..].lines() {
+        let Some(inner) = line
+            .trim()
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let mut tokens = inner.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        let value_token = if first.parse::<u64>().is_ok() {
+            first
+        } else {
+            match tokens.next() {
+                Some(token) => token,
+                None => continue,
+            }
+        };
+        total += value_token.parse::<u64>().ok()?;
+        any = true;
+    }
+    any.then_some(total)
 }
 
 #[test]
@@ -153,8 +173,9 @@ fn soft_plus_objective_never_reports_a_nonoptimal_objective() {
     // Deleting the soft line gives the correct `(x 10)`, proving the soft line
     // alone flips it.
     //
-    // AY now fails closed on the unsupported combination rather than fabricate an
-    // optimum (zero-invalid-outputs). The one thing it must NEVER do is emit a
+    // AY now optimizes the combination jointly in declaration order (the
+    // maximize is declared first, so x takes its true optimum and the soft
+    // is free to hold). The one thing it must NEVER do is emit a
     // non-optimal `(objectives ...)` value.
     let out = run_ay(
         "(declare-const x Int)\n\
@@ -171,9 +192,10 @@ fn soft_plus_objective_never_reports_a_nonoptimal_objective() {
         "must not report the non-optimal objective x=0 (true max is 10): {out}"
     );
     assert!(
-        out.contains("error"),
-        "the unsupported soft+objective combination must fail closed with an error: {out}"
+        out.contains("(x 10)"),
+        "joint optimization must find the true optimum x=10: {out}"
     );
+    assert!(!out.contains("error"), "joint problem must solve: {out}");
 
     // Control: the SAME problem without the soft line optimizes correctly.
     let control = run_ay(

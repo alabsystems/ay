@@ -28,6 +28,8 @@ mod guarded_range;
 mod integer_evaluation;
 #[path = "bv_lia_query_interval.rs"]
 mod interval_refutation;
+#[path = "bv_lia_query_masked_residue.rs"]
+mod masked_residue;
 #[path = "bv_lia_query_pins.rs"]
 mod pins;
 #[path = "bv_lia_query_sort.rs"]
@@ -473,7 +475,15 @@ impl<'a> QueryChecker<'a> {
                         .to_string(),
                 });
             }
-            stack.extend(children.into_iter().map(|child| (child, depth + 1)));
+            // `depth <= MAX_TERM_DEPTH` here, so the increment never fails; it
+            // is taken outside the closure, where that guard is in scope.
+            let next_depth =
+                depth
+                    .checked_add(1)
+                    .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
+                        resource: "sort-validation depth",
+                    })?;
+            stack.extend(children.into_iter().map(|child| (child, next_depth)));
         }
         Ok(())
     }
@@ -501,7 +511,8 @@ impl<'a> QueryChecker<'a> {
                     reason: "a source assertion or Boolean connective is not Boolean".to_string(),
                 });
             }
-            if out.len() + stack.len() > MAX_TERM_NODES {
+            // A saturated sum is past the limit and takes the same refusal.
+            if out.len().saturating_add(stack.len()) > MAX_TERM_NODES {
                 return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
                     resource: "flattened assertion nodes",
                 });
@@ -605,26 +616,16 @@ impl<'a> QueryChecker<'a> {
             .enumerate()
             .map(|(index, &term)| (term, index))
             .collect();
-        let mut parent: Vec<usize> = (0..vars.len()).collect();
-
-        fn find(parent: &mut [usize], mut index: usize) -> usize {
-            let mut root = index;
-            while parent[root] != root {
-                root = parent[root];
-            }
-            while parent[index] != index {
-                let next = parent[index];
-                parent[index] = root;
-                index = next;
-            }
-            root
+        // `vars` are the collected Int variables of a DAG already held to
+        // `MAX_TERM_NODES` nodes; the bound is restated for the allocation.
+        if vars.len() > MAX_TERM_NODES {
+            return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "integer variable classes",
+            });
         }
-        fn union(parent: &mut [usize], left: usize, right: usize) {
-            let left = find(parent, left);
-            let right = find(parent, right);
-            if left != right {
-                parent[right] = left;
-            }
+        let mut parent: Vec<usize> = Vec::new();
+        for slot in 0..vars.len() {
+            parent.push(slot);
         }
 
         for &assertion in assertions {
@@ -632,10 +633,14 @@ impl<'a> QueryChecker<'a> {
             let Some((name, args)) = named_app(self.terms, assertion) else {
                 continue;
             };
-            if name == "=" && args.len() == 2 {
-                if let (Some(&left), Some(&right)) = (index.get(&args[0]), index.get(&args[1])) {
-                    union(&mut parent, left, right);
-                }
+            if name != "=" {
+                continue;
+            }
+            let Some((left_arg, right_arg)) = two_args(args) else {
+                continue;
+            };
+            if let (Some(&left), Some(&right)) = (index.get(&left_arg), index.get(&right_arg)) {
+                class_union(&mut parent, left, right).ok_or_else(class_index_error)?;
             }
         }
 
@@ -643,13 +648,16 @@ impl<'a> QueryChecker<'a> {
         let mut class_of = HashMap::new();
         let mut members: Vec<Vec<TermId>> = Vec::new();
         for (var_index, &term) in vars.iter().enumerate() {
-            let root = find(&mut parent, var_index);
+            let root = class_root(&mut parent, var_index).ok_or_else(class_index_error)?;
             let next = root_to_class.len();
             let class = *root_to_class.entry(root).or_insert(next);
             if class == members.len() {
                 members.push(Vec::new());
             }
-            members[class].push(term);
+            members
+                .get_mut(class)
+                .ok_or_else(class_index_error)?
+                .push(term);
             class_of.insert(term, class);
         }
         let mut classes = IntClasses {
@@ -677,13 +685,13 @@ impl<'a> QueryChecker<'a> {
         let Some((mut name, args)) = named_app(self.terms, assertion) else {
             return Ok(());
         };
-        if args.len() != 2 {
+        let Some((first, second)) = two_args(args) else {
             return Ok(());
-        }
+        };
 
         if name == "=" {
-            if let Some((var, value)) = var_const_pair(self.terms, args) {
-                if let Some(&class) = classes.class_of.get(&var) {
+            if let Some((var, value)) = var_const_pair(self.terms, first, second) {
+                if let Some(class) = classes.class_of.get(&var).copied() {
                     self.tighten_lower_bound_from_ref(&mut classes.bounds[class], value)?;
                     self.tighten_upper_bound_from_ref(&mut classes.bounds[class], value)?;
                 }
@@ -694,20 +702,23 @@ impl<'a> QueryChecker<'a> {
         if !matches!(name, "<" | "<=" | ">" | ">=") {
             return Ok(());
         }
-        let (var, constant, variable_on_left) = if is_int_var(self.terms, args[0]) {
-            let Some(value) = int_constant(self.terms, args[1]) else {
+        let (var, constant, variable_on_left) = if is_int_var(self.terms, first) {
+            let Some(value) = int_constant(self.terms, second) else {
                 return Ok(());
             };
-            (args[0], value, true)
-        } else if is_int_var(self.terms, args[1]) {
-            let Some(value) = int_constant(self.terms, args[0]) else {
+            (first, value, true)
+        } else if is_int_var(self.terms, second) {
+            let Some(value) = int_constant(self.terms, first) else {
                 return Ok(());
             };
-            (args[1], value, false)
+            (second, value, false)
         } else {
             return Ok(());
         };
-        let Some(&class) = classes.class_of.get(&var) else {
+        // `copied` hands back a tagged `Option<usize>`: a let-else on the
+        // niche-encoded `Option<&usize>` switched on a discriminant the
+        // verifier's model left unconstrained (its counterexample read -1).
+        let Some(class) = classes.class_of.get(&var).copied() else {
             return Ok(());
         };
         if !variable_on_left {
@@ -716,7 +727,9 @@ impl<'a> QueryChecker<'a> {
                 "<=" => ">=",
                 ">" => "<",
                 ">=" => "<=",
-                _ => unreachable!(),
+                // `name` was checked to be one of the four comparisons above;
+                // anything else records no bound, as the match below does.
+                _ => return Ok(()),
             };
         }
         match name {
@@ -829,6 +842,7 @@ impl<'a> QueryChecker<'a> {
             self.meter.charge(1)?;
             if self.interval_proves_false(assertion)?
                 || self.residue_identity_proves_false(assertion, classes)?
+                || masked_residue::refutes_identity(self.terms, assertion)
             {
                 return Ok(true);
             }
@@ -854,13 +868,16 @@ impl<'a> QueryChecker<'a> {
         let Some((name, args)) = named_app(self.terms, term) else {
             return Ok(false);
         };
-        if args.len() != 2 || !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
+        if !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
             return Ok(false);
         }
-        let Some((left_low, left_high)) = self.int_interval(args[0], 0)? else {
+        let Some((first, second)) = two_args(args) else {
             return Ok(false);
         };
-        let Some((right_low, right_high)) = self.int_interval(args[1], 0)? else {
+        let Some((left_low, left_high)) = self.int_interval(first, 0)? else {
+            return Ok(false);
+        };
+        let Some((right_low, right_high)) = self.int_interval(second, 0)? else {
             return Ok(false);
         };
         for (left, right) in [
@@ -940,11 +957,14 @@ impl<'a> QueryChecker<'a> {
         let Some((name, args)) = named_app(self.terms, term) else {
             return Ok(false);
         };
-        if args.len() != 2 || !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
+        if !matches!(name, "<" | "<=" | ">" | ">=" | "=") {
             return Ok(false);
         }
-        let left = self.semantic_int_key(args[0], classes)?;
-        let right = self.semantic_int_key(args[1], classes)?;
+        let Some((first, second)) = two_args(args) else {
+            return Ok(false);
+        };
+        let left = self.semantic_int_key(first, classes)?;
+        let right = self.semantic_int_key(second, classes)?;
         let Some((left, right)) = left.zip(right) else {
             return Ok(false);
         };
@@ -1143,12 +1163,16 @@ impl<'a> QueryChecker<'a> {
                 reason: "a term used as a Boolean assertion is not Boolean".to_string(),
             });
         }
-        if let Some(value) = self.eval_bool(term, env, memo, depth + 1)? {
-            return Ok(if value == desired {
-                EnforceOutcome::Stable
-            } else {
-                EnforceOutcome::Conflict
-            });
+        // The `Option<bool>` results below are compared with `==` rather than
+        // matched: a match switches on the niche-encoded discriminant, which
+        // the verifier's model leaves unconstrained (its counterexample picked
+        // the discriminant -1 and reached the match's `unreachable` arm).
+        let known = self.eval_bool(term, env, memo, depth + 1)?;
+        if known == Some(desired) {
+            return Ok(EnforceOutcome::Stable);
+        }
+        if known == Some(!desired) {
+            return Ok(EnforceOutcome::Conflict);
         }
 
         match self.terms.get(term) {
@@ -1167,16 +1191,16 @@ impl<'a> QueryChecker<'a> {
                 if desired {
                     let left = self.eval_bool(args[0], env, memo, depth + 1)?;
                     let right = self.eval_bool(args[1], env, memo, depth + 1)?;
-                    match (left, right) {
-                        (Some(false), _) | (_, Some(true)) => Ok(EnforceOutcome::Stable),
-                        (Some(true), None) => {
-                            self.enforce_bool(args[1], true, env, classes, memo, depth + 1)
-                        }
-                        (None, Some(false)) => {
-                            self.enforce_bool(args[0], false, env, classes, memo, depth + 1)
-                        }
-                        (Some(true), Some(false)) => Ok(EnforceOutcome::Conflict),
-                        _ => Ok(EnforceOutcome::Stable),
+                    if left == Some(false) || right == Some(true) {
+                        Ok(EnforceOutcome::Stable)
+                    } else if left == Some(true) && right.is_none() {
+                        self.enforce_bool(args[1], true, env, classes, memo, depth + 1)
+                    } else if left.is_none() && right == Some(false) {
+                        self.enforce_bool(args[0], false, env, classes, memo, depth + 1)
+                    } else if left == Some(true) && right == Some(false) {
+                        Ok(EnforceOutcome::Conflict)
+                    } else {
+                        Ok(EnforceOutcome::Stable)
                     }
                 } else {
                     let left = self.enforce_bool(args[0], true, env, classes, memo, depth + 1)?;
@@ -1192,14 +1216,13 @@ impl<'a> QueryChecker<'a> {
                 }
             }
             TermData::Ite(condition, then_term, else_term) => {
-                match self.eval_bool(*condition, env, memo, depth + 1)? {
-                    Some(true) => {
-                        self.enforce_bool(*then_term, desired, env, classes, memo, depth + 1)
-                    }
-                    Some(false) => {
-                        self.enforce_bool(*else_term, desired, env, classes, memo, depth + 1)
-                    }
-                    None => Ok(EnforceOutcome::Stable),
+                let condition = self.eval_bool(*condition, env, memo, depth + 1)?;
+                if condition == Some(true) {
+                    self.enforce_bool(*then_term, desired, env, classes, memo, depth + 1)
+                } else if condition == Some(false) {
+                    self.enforce_bool(*else_term, desired, env, classes, memo, depth + 1)
+                } else {
+                    Ok(EnforceOutcome::Stable)
                 }
             }
             TermData::Var(..) if *self.terms.sort(term) == Sort::Bool => {
@@ -1269,22 +1292,41 @@ impl<'a> QueryChecker<'a> {
         memo: &mut HashMap<TermId, Value>,
         depth: usize,
     ) -> Result<EnforceOutcome, BvLiaUnsatAuthenticationError> {
-        let left_value = self.eval_value(left, env, memo, depth + 1)?;
-        let right_value = self.eval_value(right, env, memo, depth + 1)?;
-        match (left_value, right_value) {
-            (Some(left), Some(right)) => Ok(if self.values_equal(&left, &right)? {
+        // The caller passes at most `MAX_TERM_DEPTH + 1`, so the increment
+        // never fails; it is checked rather than assumed.
+        let next_depth =
+            depth
+                .checked_add(1)
+                .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
+                    resource: "propagation depth",
+                })?;
+        let left_value = self.eval_value(left, env, memo, next_depth)?;
+        let right_value = self.eval_value(right, env, memo, next_depth)?;
+        // Each value is compared by reference or moved whole, on a path that
+        // returns. Matching the `(left_value, right_value)` pair moved one
+        // `Value` out of it in some arms only, and the drop where the arms
+        // rejoined switched on the partially moved field's niche-encoded
+        // discriminant, whose `unreachable` arm the verifier refuted.
+        if let Some((known_left, known_right)) = left_value.as_ref().zip(right_value.as_ref()) {
+            return Ok(if self.values_equal(known_left, known_right)? {
                 EnforceOutcome::Stable
             } else {
                 EnforceOutcome::Conflict
-            }),
-            (None, Some(value)) if matches!(self.terms.get(left), TermData::Var(..)) => {
-                self.assign_value(left, value, env, classes)
-            }
-            (Some(value), None) if matches!(self.terms.get(right), TermData::Var(..)) => {
-                self.assign_value(right, value, env, classes)
-            }
-            _ => Ok(EnforceOutcome::Stable),
+            });
         }
+        // At most one side is known: it is assigned to the other side when
+        // that side is a variable.
+        if left_value.is_none() && matches!(self.terms.get(left), TermData::Var(..)) {
+            return right_value.map_or(Ok(EnforceOutcome::Stable), |value| {
+                self.assign_value(left, value, env, classes)
+            });
+        }
+        if right_value.is_none() && matches!(self.terms.get(right), TermData::Var(..)) {
+            return left_value.map_or(Ok(EnforceOutcome::Stable), |value| {
+                self.assign_value(right, value, env, classes)
+            });
+        }
+        Ok(EnforceOutcome::Stable)
     }
 
     fn assign_value(
@@ -1487,11 +1529,63 @@ fn int_constant(terms: &TermStore, term: TermId) -> Option<&BigInt> {
     }
 }
 
-fn var_const_pair<'a>(terms: &'a TermStore, args: &[TermId]) -> Option<(TermId, &'a BigInt)> {
-    if is_int_var(terms, args[0]) {
-        int_constant(terms, args[1]).map(|value| (args[0], value))
-    } else if is_int_var(terms, args[1]) {
-        int_constant(terms, args[0]).map(|value| (args[1], value))
+/// The root of `index` in the integer-class union-find, compressing the path.
+///
+/// `build_int_classes` passes only positions in `vars`, and every stored parent
+/// is one too, so no read is out of range; one that were would be an internal
+/// inconsistency, refused (`None`) rather than indexed.
+fn class_root(parent: &mut [usize], mut index: usize) -> Option<usize> {
+    let mut root = index;
+    loop {
+        let next = *parent.get(root)?;
+        if next == root {
+            break;
+        }
+        root = next;
+    }
+    loop {
+        let slot = parent.get_mut(index)?;
+        let next = *slot;
+        if next == index {
+            break;
+        }
+        *slot = root;
+        index = next;
+    }
+    Some(root)
+}
+
+/// Merge the classes of `left` and `right`; `None` as for [`class_root`].
+fn class_union(parent: &mut [usize], left: usize, right: usize) -> Option<()> {
+    let left = class_root(parent, left)?;
+    let right = class_root(parent, right)?;
+    if left != right {
+        *parent.get_mut(right)? = left;
+    }
+    Some(())
+}
+
+/// The refusal for a class index outside the collected variables.
+fn class_index_error() -> BvLiaUnsatAuthenticationError {
+    BvLiaUnsatAuthenticationError::UnsupportedFragment {
+        reason: "an integer class index is outside the collected variables".to_string(),
+    }
+}
+
+/// Both elements of a two-element argument list, or `None` for any other
+/// length. Read through `first`/`get`, so no element read is an unchecked index.
+fn two_args(args: &[TermId]) -> Option<(TermId, TermId)> {
+    match (args.len(), args.first(), args.get(1)) {
+        (2, Some(&first), Some(&second)) => Some((first, second)),
+        _ => None,
+    }
+}
+
+fn var_const_pair(terms: &TermStore, first: TermId, second: TermId) -> Option<(TermId, &BigInt)> {
+    if is_int_var(terms, first) {
+        int_constant(terms, second).map(|value| (first, value))
+    } else if is_int_var(terms, second) {
+        int_constant(terms, first).map(|value| (second, value))
     } else {
         None
     }

@@ -91,7 +91,10 @@ impl LraSolver {
         // coefficient guard, we continue selecting from the remaining pool.
         let mut cuts = Vec::new();
         while cuts.len() < MAX_GOMORY_CUTS_PER_CHECK && !candidates.is_empty() {
-            let candidate = Self::cubic_bias_pick(&mut candidates, &mut self.gomory_rng);
+            let Some(candidate) = Self::cubic_bias_pick(&mut candidates, &mut self.gomory_rng)
+            else {
+                break;
+            };
             let row = &self.rows[candidate.row_idx];
             let basic_var = candidate.basic_var;
             let basic_value = self.vars[basic_var as usize].value.rational();
@@ -137,10 +140,15 @@ impl LraSolver {
         let one_minus_f_0 = BigRational::one() - &f_0;
         // Z3-style coefficient explosion guard:
         // skip rows whose transformed coefficients exceed abs_max^2.
+        // abs_max is the row's numerator scale (largest |numerator| among
+        // its coefficients): tableau rows are pivot-normalized, so their
+        // coefficients are fractional with the pivot denominator baked
+        // into every numerator, and a magnitude-based scale (e.g. ceil)
+        // collapses to 1 and rejects every real cut.
         let abs_max = row
             .coeffs
             .iter()
-            .map(|(_, coeff)| Self::abs_ceil_coeff(&coeff.to_big()))
+            .map(|(_, coeff)| coeff.to_big().numer().abs())
             .max()
             .unwrap_or_default();
         let big_number = &abs_max * &abs_max;
@@ -200,8 +208,18 @@ impl LraSolver {
                 break;
             }
 
-            // Standard GMI (Cornuejols 2007) cut coefficient g_j.
-            let g_j = if is_int_nonbasic {
+            // GMI's integer formula applies to the SHIFTED column, not just
+            // the original variable. If an integer variable sits at a
+            // fractional bound, x-lb (or ub-x) is not integer. Use the standard
+            // continuous-column relaxation in that case (Cornuejols 2007).
+            // E.g. x=3*y/2-2, y>=5/3 has witness (1,2); treating y-5/3 as
+            // integer instead derives the invalid cut y>=8/3.
+            let active_bound = if at_ub { &info.upper } else { &info.lower };
+            let integer_shift = is_int_nonbasic
+                && active_bound
+                    .as_ref()
+                    .is_some_and(|bound| bound.value.to_big().is_integer());
+            let g_j = if integer_shift {
                 let effective_coeff = if at_ub { -coeff.clone() } else { coeff.clone() };
                 let f_j = crate::fractional_part(&effective_coeff);
                 if f_j.is_zero() {

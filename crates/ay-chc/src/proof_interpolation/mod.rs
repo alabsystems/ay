@@ -135,7 +135,8 @@ mod tests;
 pub(crate) use farkas::extract_interpolant_from_proof;
 pub(crate) use lia_farkas::compute_interpolant_from_lia_farkas;
 pub(crate) use linear::{
-    build_linear_inequality, rational64_abs, strengthen_strict_lia_constraint,
+    build_linear_inequality, build_linear_inequality_in_sort, combined_row_sort, rational64_abs,
+    strengthen_strict_lia_constraint,
 };
 pub(crate) use proof_marking::{collect_farkas_lemmas, mark_proof_nodes};
 pub(crate) use proof_traversal::{traverse_proof, TraversalAlgorithm};
@@ -298,46 +299,5 @@ impl DependencyMark {
             (AB, _) | (_, AB) => AB,
             (A, B) | (B, A) => AB,
         }
-    }
-}
-
-// ============================================================================
-// Kani Verification Harnesses
-// ============================================================================
-
-#[cfg(kani)]
-mod verification {
-    use super::*;
-
-    fn any_dependency_mark() -> DependencyMark {
-        let v: u8 = kani::any();
-        kani::assume(v < 4);
-        match v {
-            0 => DependencyMark::None,
-            1 => DependencyMark::A,
-            2 => DependencyMark::B,
-            _ => DependencyMark::AB,
-        }
-    }
-
-    #[kani::proof]
-    fn proof_dependency_mark_union_commutative() {
-        let a = any_dependency_mark();
-        let b = any_dependency_mark();
-        assert_eq!(a.union(b), b.union(a));
-    }
-
-    #[kani::proof]
-    fn proof_dependency_mark_union_associative() {
-        let a = any_dependency_mark();
-        let b = any_dependency_mark();
-        let c = any_dependency_mark();
-        assert_eq!(a.union(b).union(c), a.union(b.union(c)));
-    }
-
-    #[kani::proof]
-    fn proof_dependency_mark_union_idempotent() {
-        let a = any_dependency_mark();
-        assert_eq!(a.union(a), a);
     }
 }

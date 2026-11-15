@@ -192,3 +192,39 @@ fn occ_only_matches_full_build() {
         }
     }
 }
+
+/// A list that outgrows `POS_MAP_MIN_LEN` gets a position map; removals must
+/// leave exactly the order a linear search plus `swap_remove` leaves, both
+/// while the map exists and for lists that never had one.
+#[test]
+fn position_map_removals_match_linear_search() {
+    let heavy = lit(1);
+    let mut occ = OccList::new(4);
+    let mut model: Vec<usize> = Vec::new();
+    for idx in 0..100 {
+        occ.add_clause(idx, &[heavy, lit(2)]);
+        model.push(idx);
+    }
+    assert!(
+        occ.pos_map[heavy.index()].is_some(),
+        "a 100-entry list is indexed"
+    );
+    assert!(occ.pos_map[lit(3).index()].is_none());
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    while !model.is_empty() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let victim = model[(state % model.len() as u64) as usize];
+        occ.remove_clause(victim, &[heavy, lit(2)]);
+        let pos = model.iter().position(|&c| c == victim).expect("present");
+        model.swap_remove(pos);
+        assert_eq!(occ.get(heavy), model.as_slice());
+        assert_eq!(occ.get(lit(2)), model.as_slice());
+        assert!(!occ.contains(heavy, victim));
+        assert!(!occ.contains(lit(2), victim));
+        if let Some(&kept) = model.first() {
+            assert!(occ.contains(heavy, kept) && occ.contains(lit(2), kept));
+        }
+    }
+}

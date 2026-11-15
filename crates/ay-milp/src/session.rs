@@ -35,10 +35,20 @@ use crate::tree_cert::{exact_farkas_from_float_ray, MilpInfeasibilityCertificate
 
 mod affine;
 mod check;
+mod float_advice;
 mod reframed_margin;
 mod supplemental_proof;
+mod w2_timing;
+
+pub use float_advice::FloatLpAdvice;
+
+/// Per-phase wall clock for the W2 ledger shape, re-exported so
+/// `examples/w2_tier_timing.rs` can run it without widening the crate's
+/// solver API. See [`w2_timing::diag_w2_tier_timing`].
+pub use w2_timing::diag_w2_tier_timing;
 
 use reframed_margin::MarginEvidenceBar;
+pub use supplemental_proof::InfeasibilityEvidenceKind;
 use supplemental_proof::SupplementalProof;
 
 fn fixed_assignment_tree_start_assignment(
@@ -425,10 +435,17 @@ mod probe_arm_tests {
         );
     }
 
-    /// Spend the attempt's wall AS CPU: the arm genuinely working its slice out.
+    /// Spend the attempt's slice AS CPU: the arm genuinely working its slice
+    /// out. Spinning only until the wall deadline is not that: on a loaded
+    /// host the scheduler can take most of a 2 ms window, and `probe_arm`
+    /// then rightly calls the attempt robbed and reruns it. So spin until
+    /// both the wall has passed the deadline and this thread has burned the
+    /// whole slice on `probe_clock` (the wall itself on the fallback).
     fn spin_through(deadline: Instant) {
+        let slice = deadline.saturating_duration_since(Instant::now());
+        let cpu_started = probe_clock();
         let mut acc = 0u64;
-        while Instant::now() < deadline {
+        while Instant::now() < deadline || probe_clock().saturating_sub(cpu_started) < slice {
             acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
         }
         std::hint::black_box(acc);
@@ -3573,6 +3590,18 @@ pub struct LpSession {
     /// Materialized only when the float lane declines. Kept across exact
     /// re-solves for warm starts and dropped when the model box narrows.
     lp: Option<ExactLp>,
+    /// The rows' implied box for the NS tier (`crate::presolve::implied_box_f64`),
+    /// computed on first use and dropped whenever the model box narrows. Outer
+    /// `None` = not computed yet; inner `None` = unavailable for this model
+    /// (inexact coefficients, a proven-empty box, or an expired deadline), in
+    /// which case the tier prices against the declared box as before.
+    implied_box: Option<Option<(Vec<f64>, Vec<f64>)>>,
+    /// `false` when the cached box came from a sweep the deadline cut short or
+    /// refused outright. Such a box is still an enclosure and serves the query
+    /// that computed it, but it is NOT pinned: the query drops it on the way
+    /// out so the next one gets a fresh sweep under its own budget, instead of
+    /// pricing a degraded box for the life of the model box.
+    implied_box_pinned: bool,
 }
 
 impl LpSession {
@@ -3592,6 +3621,8 @@ impl LpSession {
             model: model.clone(),
             opts: opts.clone(),
             lp: None,
+            implied_box: None,
+            implied_box_pinned: false,
         })
     }
 
@@ -3619,6 +3650,8 @@ impl LpSession {
             model,
             opts: opts.clone(),
             lp: None,
+            implied_box: None,
+            implied_box_pinned: false,
         }))
     }
 
@@ -3630,6 +3663,33 @@ impl LpSession {
             lp.request_range_logical_triangular_crash();
         }
         Some(lp)
+    }
+
+    /// Pin one public operation's deadline before waiting, and retain its
+    /// caller unit through float advice, exact fallback and result replay.
+    fn with_compute<R>(
+        &mut self,
+        stopped: R,
+        operation: impl FnOnce(&mut Self) -> Result<R, MilpError>,
+    ) -> Result<R, MilpError> {
+        let caller_options = self.opts.clone();
+        let deadline = caller_options.effective_deadline(Instant::now());
+        let scope = ay_sys::compute_budget::ComputeScope::enter_until(|| {
+            deadline.is_some_and(|end| Instant::now() >= end)
+        })
+        .map_err(|error| MilpError::Session {
+            message: format!("MILP computation budget: {error}"),
+        })?;
+        let Some(_scope) = scope else {
+            return Ok(stopped);
+        };
+        self.opts.deadline = deadline;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        self.opts = caller_options;
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Optimize the single-column objective `x_col` in `sense`.
@@ -3648,6 +3708,18 @@ impl LpSession {
 
     /// Optimize the model's own objective (coefficients, offset, sense).
     pub fn optimize_model_objective(&mut self) -> Result<Outcome, MilpError> {
+        let deadline = self.opts.effective_deadline(Instant::now());
+        let _compute = ay_sys::compute_budget::ComputeScope::enter_until(|| {
+            deadline.is_some_and(|end| Instant::now() >= end)
+        })
+        .map_err(|error| MilpError::Session {
+            message: format!("MILP computation budget: {error}"),
+        })?;
+        let Some(_compute) = _compute else {
+            return Ok(Outcome::Unknown {
+                reason: UnknownReason::Timeout,
+            });
+        };
         let coeffs: Vec<(u32, f64)> = (0..self.model.num_cols())
             .map(|i| (i as u32, self.model.obj_coeff(Col(i as u32))))
             .filter(|&(_, a)| a != 0.0)
@@ -3656,11 +3728,13 @@ impl LpSession {
         // column so an authoritative nonzero whose f64 proxy underflowed to
         // zero is still present in witness/value replay.
         let exact = authoritative_exact_objective(&self.model);
-        Ok(self.optimize_linear(
+        Ok(self.optimize_linear_until(
             &coeffs,
             self.model.sense(),
             self.model.objective_offset(),
             exact,
+            deadline,
+            true,
         ))
     }
 
@@ -3957,6 +4031,23 @@ impl LpSession {
     where
         F: FnMut(usize) -> bool + ?Sized,
     {
+        let _compute = match ay_sys::compute_budget::ComputeScope::enter_until(|| {
+            deadline.is_some_and(|end| Instant::now() >= end) || !work(0)
+        }) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                return Outcome::Unknown {
+                    reason: UnknownReason::Timeout,
+                }
+            }
+            Err(error) => {
+                return Outcome::Unknown {
+                    reason: UnknownReason::SolverIncomplete {
+                        detail: format!("MILP computation budget: {error}"),
+                    },
+                }
+            }
+        };
         let exact_terms = model_obj_exact
             .as_ref()
             .map_or(0, |(coefficients, _)| coefficients.len());
@@ -4141,35 +4232,19 @@ impl LpSession {
         expr: &[(Col, f64)],
         sense: Sense,
     ) -> Result<Option<Vec<f64>>, MilpError> {
-        for (col, w) in expr {
-            if col.index() >= self.model.num_cols() {
-                return Err(MilpError::Session {
-                    message: format!("column {} out of range", col.index()),
-                });
-            }
-            if !w.is_finite() {
-                return Err(MilpError::Session {
-                    message: "non-finite objective weight".to_string(),
-                });
-            }
-        }
-        if expr.is_empty() || !float_lane_enabled(&self.opts) {
-            return Ok(None);
-        }
-        let scale = match sense {
-            Sense::Minimize => 1.0_f64,
-            Sense::Maximize => -1.0_f64,
-        };
-        let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, w * scale)).collect();
-        let Some(mut lp) = self.float_lp(&scaled, Sense::Minimize) else {
-            return Ok(None);
-        };
-        lp.plain_cold = true;
-        let cand = lp.solve(self.opts.effective_deadline(Instant::now()));
-        if cand.status != SimplexStatus::Optimal {
-            return Ok(None);
-        }
-        Ok(Some(cand.duals))
+        self.with_compute(None, |session| {
+            session.float_dual_for_expr_inner(expr, sense)
+        })
+    }
+
+    fn float_dual_for_expr_inner(
+        &mut self,
+        expr: &[(Col, f64)],
+        sense: Sense,
+    ) -> Result<Option<Vec<f64>>, MilpError> {
+        Ok(self
+            .float_candidate_for_expr(expr, sense)?
+            .map(|(candidate, _deadline)| candidate.duals))
     }
 
     /// Rigorous bound on an arbitrary LINEAR EXPRESSION `Σ wᵢ·x_{cᵢ}`, without
@@ -4203,6 +4278,19 @@ impl LpSession {
     /// # Errors
     /// [`MilpError::Session`] if any column index is out of range.
     pub fn rigorous_bound_expr(
+        &mut self,
+        expr: &[(Col, f64)],
+        sense: Sense,
+    ) -> Result<Outcome, MilpError> {
+        self.with_compute(
+            Outcome::Unknown {
+                reason: UnknownReason::Timeout,
+            },
+            |session| session.rigorous_bound_expr_inner(expr, sense),
+        )
+    }
+
+    fn rigorous_bound_expr_inner(
         &mut self,
         expr: &[(Col, f64)],
         sense: Sense,
@@ -4253,7 +4341,7 @@ impl LpSession {
     /// The single-column case is exactly this with a one-entry objective, so the two share
     /// their soundness argument: run the float lane once for a dual vector, then evaluate the
     /// weak-duality bound with directed rounding.
-    fn ns_bound_expr(&self, expr: &[(Col, f64)], sense: Sense) -> Option<BigRational> {
+    fn ns_bound_expr(&mut self, expr: &[(Col, f64)], sense: Sense) -> Option<BigRational> {
         // Same side-store caveat as `ns_bound`: NS encloses the f64 matrix, not a different
         // true rational held alongside it.
         if self.model.has_inexact_coeffs() || !float_lane_enabled(&self.opts) {
@@ -4286,30 +4374,14 @@ impl LpSession {
         // Zeroing the offending component is SOUND: it is exactly dropping that constraint
         // from the dual, and weak duality holds for any validly-signed multiplier vector.
         // The bound is weaker but FINITE, which beats declining outright.
-        let clamp = |src: &[f64]| -> Vec<f64> {
-            src.iter()
-                .enumerate()
-                .map(|(r, &yr)| {
-                    let (_coeffs, lb, ub) = self.model.row(Row(r as u32));
-                    if (yr > 0.0 && !lb.is_finite()) || (yr < 0.0 && !ub.is_finite()) {
-                        0.0
-                    } else {
-                        yr
-                    }
-                })
-                .collect()
-        };
-        let clamped_y = clamp(&cand.duals);
-        let clamped_neg = clamp(&neg_y);
-        let best = [
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &cand.duals),
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &neg_y),
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &clamped_y),
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &clamped_neg),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(f64::NEG_INFINITY, f64::max);
+        let clamped_y = self.clamp_duals_to_row_sides(&cand.duals);
+        let clamped_neg = self.clamp_duals_to_row_sides(&neg_y);
+        self.ensure_implied_box();
+        let best = [&cand.duals, &neg_y, &clamped_y, &clamped_neg]
+            .into_iter()
+            .filter_map(|y| self.price_ns(&obj, y))
+            .fold(f64::NEG_INFINITY, f64::max);
+        self.release_implied_box();
         if !best.is_finite() {
             return None;
         }
@@ -4317,6 +4389,15 @@ impl LpSession {
     }
 
     pub fn rigorous_bound(&mut self, col: Col, sense: Sense) -> Result<Outcome, MilpError> {
+        self.with_compute(
+            Outcome::Unknown {
+                reason: UnknownReason::Timeout,
+            },
+            |session| session.rigorous_bound_inner(col, sense),
+        )
+    }
+
+    fn rigorous_bound_inner(&mut self, col: Col, sense: Sense) -> Result<Outcome, MilpError> {
         if col.index() >= self.model.num_cols() {
             return Err(MilpError::Session {
                 message: format!("column {} out of range", col.index()),
@@ -4337,15 +4418,73 @@ impl LpSession {
         })
     }
 
+    /// Zero every dual component whose sign points at an INFINITE side of its
+    /// row. Such a component would send the NS slack term `min_{s} y_r·s` to
+    /// −∞ and the whole bound with it; dropping the component is exactly
+    /// dropping that row from the dual, and weak duality holds for any
+    /// validly-signed multiplier vector, so the result is a weaker but FINITE
+    /// rigorous bound. Float duals carry components of order 1e-17 with an
+    /// arbitrary sign on every INACTIVE one-sided row, so on a model with any
+    /// such row an unclamped candidate is a coin toss and the clamped one is
+    /// what actually answers.
+    fn clamp_duals_to_row_sides(&self, src: &[f64]) -> Vec<f64> {
+        src.iter()
+            .enumerate()
+            .map(|(r, &yr)| {
+                let (_coeffs, lb, ub) = self.model.row(Row(r as u32));
+                if (yr > 0.0 && !lb.is_finite()) || (yr < 0.0 && !ub.is_finite()) {
+                    0.0
+                } else {
+                    yr
+                }
+            })
+            .collect()
+    }
+
+    /// Compute the rows' implied box once per model box (see the field). A
+    /// sweep the deadline cut short is used but not pinned (see
+    /// `implied_box_pinned`).
+    fn ensure_implied_box(&mut self) {
+        if self.implied_box.is_none() {
+            let deadline = self.opts.effective_deadline(Instant::now());
+            self.implied_box = Some(crate::presolve::implied_box_f64(&self.model, deadline));
+            self.implied_box_pinned = !deadline.is_some_and(|d| Instant::now() >= d);
+        }
+    }
+
+    /// Drop a box that was computed under a lapsed deadline, so it is not reused.
+    fn release_implied_box(&mut self) {
+        if !self.implied_box_pinned {
+            self.implied_box = None;
+        }
+    }
+
+    /// The NS price of `obj` under the duals `y`: over the rows' implied box
+    /// when one is available (the tighter box; what lets FREE columns be priced
+    /// at all), else over the declared box. Call [`Self::ensure_implied_box`]
+    /// first; without it this silently prices the wider box.
+    fn price_ns(&self, obj: &[f64], y: &[f64]) -> Option<f64> {
+        match self.implied_box.as_ref().and_then(|b| b.as_ref()) {
+            Some((lower, upper)) => {
+                crate::ns::rigorous_lower_bound_with_box(&self.model, obj, y, lower, upper)
+            }
+            None => crate::ns::rigorous_lower_bound(&self.model, obj, y),
+        }
+    }
+
     /// The Neumaier–Shcherbina safe bound on `col` in `sense`, or `None` to
     /// defer to the exact rim. Runs the float lane once for a dual vector, then
-    /// evaluates the weak-duality bound (crate::ns) with directed rounding.
+    /// evaluates the weak-duality bound (crate::ns) with directed rounding —
+    /// over the rows' IMPLIED box, so that a free column (a layered model's
+    /// pre-activations) meeting a slightly nonzero float reduced cost still has
+    /// a finite corner to be priced at instead of sending the query to the
+    /// exact rim.
     ///
     /// To bound `max x_col` we bound `min (−x_col)` and negate. Robust to the
     /// float dual's sign convention: `y` and `−y` are BOTH valid duals for the
     /// NS argument (soundness is dual-independent), so the tighter (max) of the
     /// two bounds is taken — the correct-convention one wins automatically.
-    fn ns_bound(&self, col: Col, sense: Sense) -> Option<BigRational> {
+    fn ns_bound(&mut self, col: Col, sense: Sense) -> Option<BigRational> {
         // NS evaluates the `f64` matrix with directed rounding.  That encloses
         // the dyadic values represented by those f64s, but it cannot enclose a
         // different true rational held in the model's side-store.  Calling the
@@ -4368,13 +4507,18 @@ impl LpSession {
         let mut obj = vec![0.0_f64; self.model.num_cols()];
         obj[col.index()] = coeff;
         let neg_y: Vec<f64> = cand.duals.iter().map(|d| -d).collect();
-        let best = [
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &cand.duals),
-            crate::ns::rigorous_lower_bound(&self.model, &obj, &neg_y),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(f64::NEG_INFINITY, f64::max);
+        // The same four candidates as `ns_bound_expr`: both sign conventions, each also
+        // clamped to its rows' finite sides (see `clamp_duals_to_row_sides`). Without the
+        // clamp a float dual's 1e-17 noise on an inactive one-sided row declined every
+        // query on the W2 shape, sending it to the exact rim.
+        let clamped_y = self.clamp_duals_to_row_sides(&cand.duals);
+        let clamped_neg = self.clamp_duals_to_row_sides(&neg_y);
+        self.ensure_implied_box();
+        let best = [&cand.duals, &neg_y, &clamped_y, &clamped_neg]
+            .into_iter()
+            .filter_map(|y| self.price_ns(&obj, y))
+            .fold(f64::NEG_INFINITY, f64::max);
+        self.release_implied_box();
         if !best.is_finite() {
             return None;
         }
@@ -4423,6 +4567,7 @@ impl LpSession {
         }
         self.model.set_col_bounds(col, new_lb, new_ub);
         self.lp = None;
+        self.implied_box = None;
         true
     }
 
@@ -6661,6 +6806,56 @@ fn ceil_f64(r: &BigRational) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
+mod outward_rounding_tests {
+    use super::{ceil_f64, floor_f64};
+    use num_rational::BigRational;
+    use num_traits::FromPrimitive;
+
+    /// `floor_f64` / `ceil_f64` are the exact→f64 commit at the OBBT boundary:
+    /// a bound that rounded the wrong way would cut feasible points off the
+    /// model. A non-dyadic must round strictly OUTWARD on both sides and the
+    /// two results must be adjacent f64s; a dyadic is its own floor and ceil;
+    /// negatives round toward ∓∞, not toward zero. (Salvaged from the retired
+    /// `milp-for-ny` branch, whose `ns.rs` carried this test; main had none.)
+    #[test]
+    fn floor_ceil_bracket_exact_rationals() {
+        let third = BigRational::new(1.into(), 3.into());
+        let lo = floor_f64(&third).unwrap();
+        let hi = ceil_f64(&third).unwrap();
+        assert!(
+            BigRational::from_f64(lo).unwrap() < third,
+            "floor above value"
+        );
+        assert!(
+            BigRational::from_f64(hi).unwrap() > third,
+            "ceil below value"
+        );
+        assert_eq!(lo.next_up(), hi, "floor and ceil are adjacent f64s");
+
+        let half = BigRational::new(1.into(), 2.into());
+        assert_eq!(floor_f64(&half), Some(0.5));
+        assert_eq!(ceil_f64(&half), Some(0.5));
+
+        let neg_third = BigRational::new((-1).into(), 3.into());
+        let nlo = floor_f64(&neg_third).unwrap();
+        let nhi = ceil_f64(&neg_third).unwrap();
+        assert!(
+            BigRational::from_f64(nlo).unwrap() < neg_third,
+            "negative floor toward -inf"
+        );
+        assert!(
+            BigRational::from_f64(nhi).unwrap() > neg_third,
+            "negative ceil toward +inf"
+        );
+        assert_eq!(
+            nlo.next_up(),
+            nhi,
+            "negative floor and ceil are adjacent f64s"
+        );
+    }
+}
+
 /// Tuning for [`LpSession::obbt`].
 #[derive(Debug, Clone, Copy)]
 pub struct ObbtOpts {
@@ -6882,6 +7077,8 @@ enum Finisher {
 /// optimization checks, cut harvesting (native engine only).
 pub struct BabSession {
     model: Model,
+    harvested_cuts: Vec<crate::CertifiedIntegerCut>,
+    cut_harvest_summary: crate::CutHarvestSummary,
     opts: SolveOpts,
     lane: MilpLane,
     scopes: Vec<ScopeFrame>,
@@ -6915,6 +7112,9 @@ pub struct BabSession {
     /// "trust me" annotation attach to another solve's verdict, which is
     /// precisely the failure the certificate format exists to prevent.
     replay_claims: Vec<crate::cert_io::ReplayClaim>,
+    /// Diagnostic provenance from the terminal supplemental finalizer, never
+    /// inferred from retained candidate artifacts or used as proof authority.
+    admitted_infeasibility_evidence: Option<InfeasibilityEvidenceKind>,
     /// Ordered exact propagation/substitution replay from the last native
     /// solve, with any proof kept in its rebuilt reduced frame.
     affine_aggregation_certificate: Option<crate::AffineAggregationCertificate>,
@@ -7088,6 +7288,7 @@ impl BabSession {
             root_strong_branch_shortlist: Vec::new(),
             pending_network_design_replay: None,
             replay_claims: Vec::new(),
+            admitted_infeasibility_evidence: None,
             affine_aggregation_certificate: None,
             affine_aggregation_verification: None,
             parity_infeasibility_certificate: None,
@@ -7104,6 +7305,8 @@ impl BabSession {
             open_domain_hybrid_integer_lift_infeasibility_certificate: None,
             hybrid_pb_lp_infeasibility_certificate: None,
             hybrid_integer_lift_infeasibility_certificate: None,
+            harvested_cuts: Vec::new(),
+            cut_harvest_summary: crate::CutHarvestSummary::default(),
         })
     }
 
@@ -7272,6 +7475,19 @@ impl BabSession {
         self.parity_infeasibility_certificate.as_ref()
     }
 
+    /// Supplemental artifact selected by the last completed check's accepted
+    /// infeasibility finalizer. Diagnostic attribution only: replay the actual
+    /// artifact against [`Self::model`] to establish evidence authority.
+    ///
+    /// `None` also covers ordinary root/tree certificates carried directly by
+    /// `Outcome`; it does not mean that an infeasibility result is uncertified.
+    /// A new check, a model mutation, or a failed/non-infeasible check clears
+    /// this value. Merely retaining a candidate artifact cannot set it.
+    #[must_use]
+    pub fn admitted_infeasibility_evidence(&self) -> Option<InfeasibilityEvidenceKind> {
+        self.admitted_infeasibility_evidence
+    }
+
     /// Model-bound resolution refutation produced by the SAT/ReLU route.
     #[must_use]
     pub fn sat_relu_infeasibility_certificate(
@@ -7395,6 +7611,9 @@ impl BabSession {
     /// Any model mutation invalidates every replay annotation and typed side
     /// artifact before the mutation can become externally observable.
     fn invalidate_last_evidence(&mut self) {
+        self.admitted_infeasibility_evidence = None;
+        self.harvested_cuts.clear();
+        self.cut_harvest_summary = crate::CutHarvestSummary::default();
         self.pending_network_design_replay = None;
         self.replay_claims.clear();
         self.clear_affine_evidence();
@@ -7456,6 +7675,8 @@ impl BabSession {
         if let MilpLane::Smt(smt) = &mut self.lane {
             smt.push()?;
         }
+        self.harvested_cuts.clear();
+        self.cut_harvest_summary = crate::CutHarvestSummary::default();
         self.scopes.push(ScopeFrame {
             rows_len: self.model.num_rows(),
             saved_bounds: Vec::new(),
@@ -7590,6 +7811,7 @@ impl BabSession {
     /// capture and is independently replay-verified against this session's
     /// caller-frame model by `finish`.
     pub fn check_shared_binary_prefix(&mut self, split_cols: &[Col]) -> Result<Outcome, MilpError> {
+        self.invalidate_last_evidence();
         self.validate_shared_binary_prefix(split_cols)?;
         self.check_with_shared_binary_prefix(split_cols, None, MarginMode::Disabled, None)
     }
@@ -7611,6 +7833,7 @@ impl BabSession {
         &mut self,
         split_cols: &[Col],
     ) -> Result<Outcome, MilpError> {
+        self.invalidate_last_evidence();
         self.validate_shared_binary_prefix(split_cols)?;
         self.check_with_shared_binary_prefix(split_cols, None, MarginMode::Required, None)
     }
@@ -7642,6 +7865,7 @@ impl BabSession {
         candidates: &[Col],
         fsb_opts: &TargetFsbPrefixOpts,
     ) -> Result<Outcome, MilpError> {
+        self.invalidate_last_evidence();
         self.validate_shared_binary_prefix(fallback_prefix)?;
         let request = crate::bab::TargetFsbPrefixRequest::new(candidates, *fsb_opts);
         self.check_with_shared_binary_prefix(
@@ -7676,11 +7900,14 @@ impl BabSession {
         split_cols: &[Col],
         workers: NonZeroUsize,
     ) -> Result<Outcome, MilpError> {
+        self.invalidate_last_evidence();
         self.validate_shared_binary_prefix(split_cols)?;
         self.check_with_shared_binary_prefix(split_cols, Some(workers), MarginMode::Disabled, None)
     }
 
-    fn validate_shared_binary_prefix(&self, split_cols: &[Col]) -> Result<(), MilpError> {
+    fn validate_shared_binary_prefix(&mut self, split_cols: &[Col]) -> Result<(), MilpError> {
+        self.harvested_cuts.clear();
+        self.cut_harvest_summary = crate::CutHarvestSummary::default();
         const MAX_SHARED_PREFIX_COLS: usize = 4;
         if split_cols.is_empty() || split_cols.len() > MAX_SHARED_PREFIX_COLS {
             return Err(MilpError::Session {
@@ -7735,6 +7962,11 @@ impl BabSession {
         margin_mode: MarginMode<'_>,
         target_fsb_prefix: Option<crate::bab::TargetFsbPrefixRequest<'_>>,
     ) -> Result<Outcome, MilpError> {
+        self.admitted_infeasibility_evidence = None;
+        // Invalidate before even entering the resource/census frame, so an
+        // early admission failure or unwind cannot expose a previous batch.
+        self.harvested_cuts.clear();
+        self.cut_harvest_summary = crate::CutHarvestSummary::default();
         let started = Instant::now();
         let frame = FtAdoptionFrame::enter(self);
         frame.session.check_with_shared_binary_prefix_in_frame(
@@ -7777,6 +8009,18 @@ impl BabSession {
             // A claim from a PREVIOUS check on this session is never live here.
             self.deferred_claim = None;
             self.last_deferred = None;
+            let deadline = self.opts.deadline;
+            let _compute = ay_sys::compute_budget::ComputeScope::enter_until(|| {
+                deadline.is_some_and(|end| Instant::now() >= end)
+            })
+            .map_err(|error| MilpError::Session {
+                message: format!("MILP computation budget: {error}"),
+            })?;
+            let Some(_compute) = _compute else {
+                return Ok(Outcome::Unknown {
+                    reason: UnknownReason::Timeout,
+                });
+            };
             // The same objective view the body builds, rebuilt here because the
             // body owns its copy. Identical construction, deliberately duplicated
             // rather than plumbed through every route exit.
@@ -7815,8 +8059,22 @@ impl BabSession {
         }));
         attempt_options.restore(self);
         match attempt {
-            Ok(result) => result,
+            Ok(result) => {
+                if !matches!(&result, Ok(Outcome::Infeasible { .. })) {
+                    self.admitted_infeasibility_evidence = None;
+                }
+                if result.as_ref().map_or(true, |outcome| {
+                    !crate::integer_cut_capture::finished(outcome)
+                }) {
+                    self.harvested_cuts.clear();
+                    self.cut_harvest_summary = crate::CutHarvestSummary::default();
+                }
+                result
+            }
             Err(payload) => {
+                self.admitted_infeasibility_evidence = None;
+                self.harvested_cuts.clear();
+                self.cut_harvest_summary = crate::CutHarvestSummary::default();
                 self.deferred_claim = None;
                 self.last_deferred = None;
                 std::panic::resume_unwind(payload)
@@ -7962,12 +8220,20 @@ impl BabSession {
         ints <= SMT_FALLBACK_MAX_INTS
     }
 
-    /// Harvest certified cut rows discovered by the last `check`.
-    ///
-    /// Exact-only paths do not emit cuts; the native branch-and-cut engine may
-    /// populate this collection.
-    pub fn harvest_cuts(&mut self) -> Vec<CertifiedRow> {
-        Vec::new()
+    /// Drain exact integer cuts from actual global root rows adopted by the
+    /// last finished native tree. Each artifact replays against the caller's
+    /// model; unsupported derivations and all node-local cuts confer no authority.
+    /// See [`Self::cut_harvest_summary`] for the certified subset's coverage.
+    pub fn harvest_cuts(&mut self) -> Vec<crate::CertifiedIntegerCut> {
+        std::mem::take(&mut self.harvested_cuts)
+    }
+
+    /// Coverage of globally adopted root-cut sides from the last finished tree.
+    /// This initial checker covers source-row rank-one rounding; other recipes
+    /// are counted explicitly as unsupported, never silently certified.
+    #[must_use]
+    pub fn cut_harvest_summary(&self) -> crate::CutHarvestSummary {
+        self.cut_harvest_summary
     }
 
     /// The stored incumbent seed (advice; native engine).
@@ -8907,4 +9173,169 @@ mod tests {
 pub(crate) fn prime_env() {
     let _ = float_lane_tune_enabled();
     let _ = smt_lane_forced();
+}
+
+#[cfg(test)]
+mod implied_box_session_tests {
+    use num_rational::BigRational;
+    use num_traits::ToPrimitive;
+
+    use super::LpSession;
+    use crate::exact::{Budget, ExactLp, LpOptimum};
+    use crate::model::{Col, Model, Sense};
+    use crate::opts::SolveOpts;
+    use crate::outcome::Outcome;
+    use ay_lra::rational::Rational;
+
+    /// A two-layer W2 slice: inputs boxed, pre-activations FREE and tied by
+    /// equality rows, triangle-relaxed post-activations feeding the next layer.
+    fn w2_slice() -> (Model, Vec<Col>) {
+        let mut m = Model::new();
+        let width = 4;
+        let mut prev: Vec<Col> = (0..width)
+            .map(|i| m.add_col(-1.0, 1.0 + i as f64 * 0.25))
+            .collect();
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut w = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng % 2000) as f64 - 1000.0) / 1000.0
+        };
+        let mut targets = Vec::new();
+        for layer in 0..2 {
+            let mut out = Vec::new();
+            for _ in 0..width {
+                let y = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+                let mut coeffs: Vec<(Col, f64)> = prev.iter().map(|&x| (x, w())).collect();
+                coeffs.push((y, -1.0));
+                m.add_row(0.0, 0.0, &coeffs);
+                out.push(y);
+            }
+            if layer == 1 {
+                targets = out;
+                break;
+            }
+            let mut post = Vec::new();
+            for &x in &out {
+                let z = m.add_col(0.0, 4.0);
+                m.add_row(0.0, f64::INFINITY, &[(z, 1.0), (x, -1.0)]);
+                m.add_row(f64::NEG_INFINITY, 2.0, &[(z, 1.0), (x, -0.5)]);
+                post.push(z);
+            }
+            prev = post;
+        }
+        (m, targets)
+    }
+
+    fn bound(o: Outcome) -> BigRational {
+        match o {
+            Outcome::Bound {
+                dual_bound,
+                rigorous: true,
+            } => dual_bound,
+            other => panic!("expected a rigorous bound, got {other:?}"),
+        }
+    }
+
+    /// The point of the implied box: on the layered shape every rigorous
+    /// column bound is answered by the NS tier — the exact rim is never
+    /// materialised — and each answer brackets the exact optimum from the
+    /// rigorous side while staying within 1e-6 of it.
+    #[test]
+    fn rigorous_bounds_on_free_columns_stay_on_the_ns_tier() {
+        let (m, targets) = w2_slice();
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        let budget = Budget {
+            deadline: None,
+            max_iters: 100_000,
+        };
+        for &t in &targets {
+            // `lp.is_none()` would not show the tier — the rim's float-first path
+            // certifies a basis without materialising `lp` — so ask the tier itself
+            // and require the public answer to be ITS answer.
+            let ns_lo = s
+                .ns_bound(t, Sense::Minimize)
+                .expect("the NS tier answers min");
+            let ns_hi = s
+                .ns_bound(t, Sense::Maximize)
+                .expect("the NS tier answers max");
+            let (lo, hi) = s.tighten_col_bounds_rigorous(t).expect("bounds");
+            let (lo, hi) = (bound(lo), bound(hi));
+            assert!(
+                lo == ns_lo && hi == ns_hi,
+                "the public query must report the NS tier's answer, not the rim's"
+            );
+            let LpOptimum::Optimal {
+                value: exact_min, ..
+            } = ExactLp::new(&m).minimize(&[(t.0, Rational::new(1, 1))], &budget)
+            else {
+                panic!("exact min")
+            };
+            let LpOptimum::Optimal { value: neg_max, .. } =
+                ExactLp::new(&m).minimize(&[(t.0, Rational::new(-1, 1))], &budget)
+            else {
+                panic!("exact max")
+            };
+            let exact_max = -neg_max;
+            assert!(
+                lo <= exact_min,
+                "lower {lo} exceeds the exact min {exact_min}"
+            );
+            assert!(
+                hi >= exact_max,
+                "upper {hi} undercuts the exact max {exact_max}"
+            );
+            let gap_lo = (exact_min.to_f64().unwrap() - lo.to_f64().unwrap()).abs();
+            let gap_hi = (hi.to_f64().unwrap() - exact_max.to_f64().unwrap()).abs();
+            assert!(
+                gap_lo < 1e-6 && gap_hi < 1e-6,
+                "NS bounds should be tight: {gap_lo} {gap_hi}"
+            );
+        }
+    }
+
+    /// Narrowing the box drops the cached implied box, and the next query
+    /// rebuilds it over the tighter model rather than reusing a stale one.
+    #[test]
+    fn narrowing_invalidates_the_implied_box() {
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(y, 1.0), (x, -2.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        let first = bound(s.rigorous_bound(y, Sense::Minimize).expect("min"));
+        assert!(first <= BigRational::from_integer((-2).into()));
+        assert!(s.implied_box.is_some(), "the box is cached after a query");
+        assert!(s.narrow_col_bounds(x, 0.0, 1.0));
+        assert!(
+            s.implied_box.is_none(),
+            "narrowing must drop the cached box"
+        );
+        let second = bound(s.rigorous_bound(y, Sense::Minimize).expect("min"));
+        assert!(
+            second <= BigRational::from_integer(0.into())
+                && second > BigRational::from_integer((-1).into()),
+            "after x >= 0 the min of y is 0: got {second}"
+        );
+        let rebuilt = s
+            .implied_box
+            .as_ref()
+            .and_then(|b| b.as_ref())
+            .expect("the box is rebuilt over the narrowed model");
+        assert_eq!(
+            (rebuilt.0[y.index()], rebuilt.1[y.index()]),
+            (0.0, 2.0),
+            "the rebuilt box reflects x >= 0"
+        );
+        assert!(
+            s.implied_box_pinned,
+            "a box computed without a deadline is pinned"
+        );
+        assert_eq!(
+            s.ns_bound(y, Sense::Minimize).expect("NS tier"),
+            second,
+            "the answer came from the NS tier"
+        );
+    }
 }

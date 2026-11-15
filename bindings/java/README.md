@@ -63,7 +63,8 @@ Adding a function is mechanical: translate its C prototype to a
 
 ```sh
 # 1. Build the AY FFI library (produces target/debug/libay_ffi.dylib).
-cargo build -p ay-ffi
+targo --unverified build -p ay-ffi   # Trust toolchain
+cargo build -p ay-ffi                # stock Rust
 
 # 2. Build and run the Java test (auto-points AYZ3_LIB at target/debug).
 bash bindings/java/run.sh            # or: bash bindings/java/run.sh --release

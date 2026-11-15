@@ -185,6 +185,7 @@ impl PdrSolver {
 
     fn is_entry_value_constraint_safe(expr: &ChcExpr) -> bool {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(_) => false,
             ChcExpr::Bool(_)
             | ChcExpr::Int(_)
             | ChcExpr::BitVec(_, _)
@@ -272,15 +273,17 @@ impl PdrSolver {
     /// Part of #1402: constant-driven entry value inference.
     fn collect_constants_from_expr(expr: &ChcExpr, constants: &mut FxHashSet<i128>) {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                for value in lambda.captures() {
+                    Self::collect_constants_from_expr(value, constants);
+                }
+            }
             ChcExpr::Int(n) => {
                 constants.insert(*n);
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_constants_from_expr(a.as_ref(), constants);
-                }
-            }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => {
                 for a in args {
                     Self::collect_constants_from_expr(a.as_ref(), constants);
                 }

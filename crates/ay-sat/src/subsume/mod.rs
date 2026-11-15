@@ -29,6 +29,8 @@ pub(crate) mod simd_prepass;
 mod tests;
 
 pub use types::SubsumeStats;
+mod counted;
+
 use types::{Bin, DEFAULT_CHECK_LIMIT};
 pub(crate) use types::{KeptThresholds, SubsumeResult};
 

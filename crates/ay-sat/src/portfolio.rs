@@ -38,6 +38,7 @@ use crate::dimacs::DimacsFormula;
 use crate::features::{InstanceClass, SatFeatures};
 use crate::literal::Literal;
 use crate::proof::ProofOutput;
+
 use crate::solver::{SatResult, Solver};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -48,6 +49,12 @@ use std::thread;
 mod strategy_configs;
 
 use strategy_configs::{bve_focused_config, conservative_config, probe_focused_config};
+
+/// Preserve the isolation of the former spawned worker when the caller runs
+/// one portfolio task under its own computational unit.
+pub(crate) fn run_isolated_inline(task: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+}
 
 const PORTFOLIO_SHARE_MAX_LBD: u32 = 3;
 const PORTFOLIO_SHARE_MAX_CLAUSE_LEN: usize = 32;
@@ -594,6 +601,22 @@ impl PortfolioSolver {
 
     /// Inner implementation shared by `solve` and `solve_with_proof_bytes`.
     fn solve_inner(&self, formula: &DimacsFormula) -> (SatResult, Option<Vec<u8>>) {
+        let Ok(Some(compute)) = ay_sys::compute_budget::ComputeScope::enter_until(|| {
+            self.external_cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        }) else {
+            return (SatResult::Unknown, None);
+        };
+        let mut extras = Vec::new();
+        for _ in 1..self.num_threads.min(self.configs.len()) {
+            match compute.try_extra() {
+                Ok(Some(permit)) => extras.push(permit),
+                Ok(None) => break,
+                Err(_) => return (SatResult::Unknown, None),
+            }
+        }
+        let workers = 1 + extras.len();
         // Reuse cached features from new_adaptive() or extract fresh (#8149).
         let (features, class) = match &self.cached_features {
             Some((f, c)) => (f.clone(), *c),
@@ -604,7 +627,7 @@ impl PortfolioSolver {
             }
         };
 
-        if self.num_threads == 1 || self.configs.len() == 1 {
+        if workers == 1 {
             // Single-threaded: just run normally
             let config = self.configs.first().cloned().unwrap_or_default();
             let mut solver = create_solver_from_config(
@@ -649,124 +672,133 @@ impl PortfolioSolver {
         let external_cancel = self.external_cancel.clone();
 
         thread::scope(|scope| {
-            let handles: Vec<_> = self
-                .configs
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(worker_id, config)| {
-                    let formula_clauses = &formula.clauses;
-                    let num_vars = formula.num_vars;
-                    let num_clauses = formula.clauses.len();
-                    let features_ref = &features;
-                    let terminate = Arc::clone(&terminate);
-                    let result: Arc<Mutex<Option<ThreadResult>>> = Arc::clone(&result);
-                    let share_bus = share_bus.clone();
-                    let external_cancel = external_cancel.clone();
+            let mut handles = Vec::with_capacity(extras.len());
+            let mut inline = None;
+            for (worker_id, config) in self.configs.clone().into_iter().enumerate().take(workers) {
+                let formula_clauses = &formula.clauses;
+                let num_vars = formula.num_vars;
+                let num_clauses = formula.clauses.len();
+                let features_ref = &features;
+                let terminate = Arc::clone(&terminate);
+                let result: Arc<Mutex<Option<ThreadResult>>> = Arc::clone(&result);
+                let share_bus = share_bus.clone();
+                let external_cancel = external_cancel.clone();
 
-                    scope.spawn(move || {
-                        // Create solver with this configuration
-                        let mut solver = create_portfolio_worker_solver(
-                            num_vars,
-                            num_clauses,
-                            &config,
-                            proof_mode,
-                            Arc::clone(&terminate),
+                let task = move || {
+                    // Create solver with this configuration
+                    let mut solver = create_portfolio_worker_solver(
+                        num_vars,
+                        num_clauses,
+                        &config,
+                        proof_mode,
+                        Arc::clone(&terminate),
+                    );
+                    apply_adaptive_adjustments(&mut solver, features_ref, &class);
+                    if let Some(bus) = share_bus {
+                        let export_bus = Arc::clone(&bus);
+                        let import_bus = Arc::clone(&bus);
+                        let mut last_seen_seq = 0_u64;
+                        solver.set_portfolio_clause_sharing(
+                            Some(Box::new(move |literals, lbd| {
+                                let _ = export_bus.export(worker_id, literals, lbd);
+                            })),
+                            Some(Box::new(move || {
+                                import_bus.import_batch(worker_id, &mut last_seen_seq)
+                            })),
                         );
-                        apply_adaptive_adjustments(&mut solver, features_ref, &class);
-                        if let Some(bus) = share_bus {
-                            let export_bus = Arc::clone(&bus);
-                            let import_bus = Arc::clone(&bus);
-                            let mut last_seen_seq = 0_u64;
-                            solver.set_portfolio_clause_sharing(
-                                Some(Box::new(move |literals, lbd| {
-                                    let _ = export_bus.export(worker_id, literals, lbd);
-                                })),
-                                Some(Box::new(move || {
-                                    import_bus.import_batch(worker_id, &mut last_seen_seq)
-                                })),
-                            );
+                    }
+
+                    // Add clauses
+                    for clause in formula_clauses {
+                        solver.add_clause(clause.clone());
+                    }
+
+                    // Stop when the portfolio winner has signalled, or when an
+                    // external (wall-clock/interrupt) cancellation fires. The
+                    // per-worker `terminate` clone stays live for the join
+                    // below; `external_cancel` is moved into the closure.
+                    let should_stop = {
+                        let terminate = Arc::clone(&terminate);
+                        move || {
+                            terminate.load(Ordering::Relaxed)
+                                || external_cancel
+                                    .as_ref()
+                                    .is_some_and(|c| c.load(Ordering::Relaxed))
                         }
+                    };
+                    let solve_result = solver.solve_interruptible(should_stop).into_inner();
 
-                        // Add clauses
-                        for clause in formula_clauses {
-                            solver.add_clause(clause.clone());
-                        }
-
-                        // Stop when the portfolio winner has signalled, or when an
-                        // external (wall-clock/interrupt) cancellation fires. The
-                        // per-worker `terminate` clone stays live for the join
-                        // below; `external_cancel` is moved into the closure.
-                        let should_stop = {
-                            let terminate = Arc::clone(&terminate);
-                            move || {
-                                terminate.load(Ordering::Relaxed)
-                                    || external_cancel
-                                        .as_ref()
-                                        .is_some_and(|c| c.load(Ordering::Relaxed))
-                            }
-                        };
-                        let solve_result = solver.solve_interruptible(should_stop).into_inner();
-
-                        // Store the result unless a winner has already terminated us.
-                        if !terminate.load(Ordering::Relaxed) {
-                            // SOUNDNESS gate (task #14): never let an UNSAT verdict
-                            // win the portfolio unless it is a complete, sound
-                            // refutation of the ORIGINAL formula. A worker that ran
-                            // with cross-worker clause sharing may have refuted a
-                            // *contaminated* clause database (see
-                            // `PORTFOLIO_CLAUSE_SHARING_ENABLED`), so without a
-                            // machine-checkable proof its UNSAT is not trustworthy.
-                            // Proof mode (independent, proof-carrying workers) and the
-                            // sharing-disabled default both yield trustworthy
-                            // refutations. A SAT result is always trustworthy: its
-                            // model is verified against the original formula by
-                            // the solver's always-on model gate before this point. An untrusted
-                            // UNSAT is dropped (not emitted, does not stop siblings)
-                            // so the portfolio fails closed to another worker's sound
-                            // result or to `Unknown` — never to a wrong `UNSAT`.
-                            let trustworthy = portfolio_result_is_trustworthy(
+                    // Store the result unless a winner has already terminated us.
+                    if !terminate.load(Ordering::Relaxed) {
+                        // SOUNDNESS gate (task #14): never let an UNSAT verdict
+                        // win the portfolio unless it is a complete, sound
+                        // refutation of the ORIGINAL formula. A worker that ran
+                        // with cross-worker clause sharing may have refuted a
+                        // *contaminated* clause database (see
+                        // `PORTFOLIO_CLAUSE_SHARING_ENABLED`), so without a
+                        // machine-checkable proof its UNSAT is not trustworthy.
+                        // Proof mode (independent, proof-carrying workers) and the
+                        // sharing-disabled default both yield trustworthy
+                        // refutations. A SAT result is always trustworthy: its
+                        // model is verified against the original formula by
+                        // the solver's always-on model gate before this point. An untrusted
+                        // UNSAT is dropped (not emitted, does not stop siblings)
+                        // so the portfolio fails closed to another worker's sound
+                        // result or to `Unknown` — never to a wrong `UNSAT`.
+                        let trustworthy = portfolio_result_is_trustworthy(
+                            &solve_result,
+                            proof_mode,
+                            clause_sharing_active,
+                        );
+                        if trustworthy {
+                            // COMPLETENESS (#parallel-bv): only a *definitive*
+                            // result (SAT/UNSAT) may win the portfolio and stop
+                            // the other workers. A worker that gave up (`Unknown`
+                            // — e.g. a proof-mode technique bailed) must NOT
+                            // terminate the portfolio: siblings may still be
+                            // productively searching and about to prove
+                            // SAT/UNSAT. It was this "first result, even
+                            // `Unknown`, wins and stops everyone" behaviour that
+                            // made proof-mode `--parallel` give up in a few
+                            // seconds and solve only the easiest instances. An
+                            // `Unknown` is recorded only as a fallback, and a
+                            // later definitive result supersedes it.
+                            let is_definitive = portfolio_result_is_definitive(&solve_result);
+                            // Extract raw proof bytes before the solver is dropped (#8428).
+                            let raw_proof_bytes =
+                                extract_proof_bytes(&mut solver, &solve_result, proof_mode);
+                            let mut guard = result.lock();
+                            let store = portfolio_should_store(
+                                guard.as_ref().map(|r| &r.result),
                                 &solve_result,
-                                proof_mode,
-                                clause_sharing_active,
                             );
-                            if trustworthy {
-                                // COMPLETENESS (#parallel-bv): only a *definitive*
-                                // result (SAT/UNSAT) may win the portfolio and stop
-                                // the other workers. A worker that gave up (`Unknown`
-                                // — e.g. a proof-mode technique bailed) must NOT
-                                // terminate the portfolio: siblings may still be
-                                // productively searching and about to prove
-                                // SAT/UNSAT. It was this "first result, even
-                                // `Unknown`, wins and stops everyone" behaviour that
-                                // made proof-mode `--parallel` give up in a few
-                                // seconds and solve only the easiest instances. An
-                                // `Unknown` is recorded only as a fallback, and a
-                                // later definitive result supersedes it.
-                                let is_definitive = portfolio_result_is_definitive(&solve_result);
-                                // Extract raw proof bytes before the solver is dropped (#8428).
-                                let raw_proof_bytes =
-                                    extract_proof_bytes(&mut solver, &solve_result, proof_mode);
-                                let mut guard = result.lock();
-                                let store = portfolio_should_store(
-                                    guard.as_ref().map(|r| &r.result),
-                                    &solve_result,
-                                );
-                                if store {
-                                    *guard = Some(ThreadResult {
-                                        result: solve_result,
-                                        raw_proof_bytes,
-                                    });
-                                    if is_definitive {
-                                        // Signal other workers to stop.
-                                        terminate.store(true, Ordering::Relaxed);
-                                    }
+                            if store {
+                                *guard = Some(ThreadResult {
+                                    result: solve_result,
+                                    raw_proof_bytes,
+                                });
+                                if is_definitive {
+                                    // Signal other workers to stop.
+                                    terminate.store(true, Ordering::Relaxed);
                                 }
                             }
                         }
-                    })
-                })
-                .collect();
+                    }
+                };
+                if worker_id == 0 {
+                    inline = Some(task);
+                } else if let Some(permit) = extras.pop() {
+                    handles.push(scope.spawn(move || {
+                        let _ = permit.run(task);
+                    }));
+                }
+            }
+
+            // The caller computes under its base unit rather than retaining
+            // an idle base while all actual search is delegated to workers.
+            if let Some(task) = inline {
+                run_isolated_inline(task);
+            }
 
             // Wait for all threads to finish.
             for handle in handles {
@@ -1114,7 +1146,14 @@ fn create_solver_from_config(
     }
 
     // Enable MAB branch selection if requested (portfolio diversity).
-    solver.set_branch_selector_ucb1(config.branch_selector_ucb1);
+    // `--sat-branch-mab` (campaign, 2026-09-22) overrides the engine's own
+    // brancher choice: the portfolio applies its config after the variant's,
+    // so without this the switch never reached the shipped path.
+    solver.set_branch_selector_ucb1(
+        ay_core::sat_ab_switches()
+            .branch_mab
+            .unwrap_or(config.branch_selector_ucb1),
+    );
 
     // Set random seed for variable selection tie-breaking
     solver.set_random_seed(config.seed);

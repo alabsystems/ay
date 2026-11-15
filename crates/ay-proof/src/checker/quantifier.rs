@@ -6,14 +6,25 @@
 
 mod bundle;
 mod forall_inst;
+mod join;
 mod neg_exists;
+mod progress;
+mod scans;
 mod skolem;
+mod substitution;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, Symbol, TermData, TermId, TermStore};
-pub(crate) use bundle::{authenticate_bundle_skolems, validate_sko_forall_uniqueness};
-use forall_inst::matches_single_substitution;
-pub(crate) use forall_inst::validate_forall_inst;
+#[cfg(test)]
+pub(crate) use bundle::authenticate_bundle_skolems;
+pub(crate) use bundle::{
+    authenticate_bundle_skolems_with_progress, validate_sko_forall_uniqueness,
+    validate_sko_forall_uniqueness_with_progress,
+};
+pub(crate) use forall_inst::{validate_forall_inst, validate_forall_inst_with_progress};
+pub(crate) use join::{validate_qnt_join, validate_qnt_join_with_progress};
 pub(crate) use neg_exists::validate_qnt_neg_exists;
+use progress::QuantifierMeter;
+use substitution::matches_single_substitution;
 
 use super::ProofCheckError;
 
@@ -121,45 +132,6 @@ fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 
 const SKOLEM_TERM_WORK_LIMIT: usize = 100_000;
 
-fn term_contains(
-    terms: &TermStore,
-    root: TermId,
-    needle: TermId,
-    work: &mut usize,
-) -> Option<bool> {
-    let mut visited = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if term == needle {
-            return Some(true);
-        }
-        if !visited.insert(term) {
-            continue;
-        }
-        if *work >= SKOLEM_TERM_WORK_LIMIT {
-            return None;
-        }
-        *work += 1;
-        match terms.get(term) {
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(condition, then_branch, else_branch) => {
-                stack.extend([*condition, *then_branch, *else_branch]);
-            }
-            TermData::Let(bindings, body) => {
-                stack.extend(bindings.iter().map(|(_, value)| *value));
-                stack.push(*body);
-            }
-            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-                stack.push(*body);
-                stack.extend(triggers.iter().flatten().copied());
-            }
-            _ => {}
-        }
-    }
-    Some(false)
-}
-
 /// Validate the internal flat representation of Alethe `sko_forall`.
 ///
 /// Shape: a premiseless unit equality
@@ -177,22 +149,54 @@ fn validate_sko_forall_with_authority(
     authority: SkolemWitnessAuthority,
     work: &mut usize,
 ) -> Result<(), ProofCheckError> {
+    validate_sko_forall_with_authority_and_progress(
+        terms,
+        step,
+        clause,
+        premise_count,
+        args,
+        authority,
+        work,
+        &mut |_, _| true,
+    )
+}
+
+/// Preserve the collector's proof-wide local counter while allowing it to
+/// supply one shared callback when its remaining authority phases are metered.
+#[allow(clippy::too_many_arguments)] // Exact legacy inputs plus the shared caller envelope.
+fn validate_sko_forall_with_authority_and_progress(
+    terms: &TermStore,
+    step: ProofId,
+    clause: &[TermId],
+    premise_count: usize,
+    args: &[TermId],
+    authority: SkolemWitnessAuthority,
+    work: &mut usize,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    let mut meter = QuantifierMeter::new(step, "sko_forall", work, progress);
+    meter.charge(1, 0)?;
     if premise_count != 0 {
-        return Err(invalid(step, "must not have premises"));
+        return Err(meter.invalid("must not have premises")?);
     }
     let [equality] = clause else {
-        return Err(invalid(step, "conclusion must be one equality literal"));
+        return Err(meter.invalid("conclusion must be one equality literal")?);
     };
-    let Some((quantified, instance)) = decode_eq(terms, *equality) else {
-        return Err(invalid(step, "conclusion must be a binary equality"));
+    let TermData::App(Symbol::Named(name), equality_args) = meter.term(terms, *equality)? else {
+        return Err(meter.invalid("conclusion must be a binary equality")?);
     };
+    meter.name(name)?;
+    let [quantified, instance] = equality_args.as_slice() else {
+        return Err(meter.invalid("conclusion must be a binary equality")?);
+    };
+    if name != "=" {
+        return Err(meter.invalid("conclusion must be a binary equality")?);
+    }
+    let (quantified, instance) = (*quantified, *instance);
     let [witness] = args else {
-        return Err(invalid(
-            step,
-            "must carry exactly one Skolem witness argument",
-        ));
+        return Err(meter.invalid("must carry exactly one Skolem witness argument")?);
     };
-    let (bindings, body, source_is_exists) = match terms.get(quantified) {
+    let (bindings, body, source_is_exists) = match meter.term(terms, quantified)? {
         TermData::Forall(bindings, body, _) => (bindings, body, false),
         // The positive-`exists` flat form `(= (exists x. B) B[sk])` is the
         // `sko_ex` reading: `sk` is definitionally the Hilbert choice
@@ -201,13 +205,10 @@ fn validate_sko_forall_with_authority(
         // (binder, sort, UNNEGATED body) matches this exact quantifier, so a
         // witness minted for a different quantifier can never be borrowed.
         TermData::Exists(bindings, body, _) => (bindings, body, true),
-        _ => return Err(invalid(step, "equality left side must be a quantifier")),
+        _ => return Err(meter.invalid("equality left side must be a quantifier")?),
     };
     let [(binder, binder_sort)] = bindings.as_slice() else {
-        return Err(invalid(
-            step,
-            "only a single quantifier binding is supported",
-        ));
+        return Err(meter.invalid("only a single quantifier binding is supported")?);
     };
     let body = *body;
     skolem::validate_witness_authority(
@@ -221,6 +222,7 @@ fn validate_sko_forall_with_authority(
             source_is_exists,
             authority,
         },
+        &mut meter,
     )?;
     skolem::validate_fresh_substitution(
         terms,
@@ -232,8 +234,9 @@ fn validate_sko_forall_with_authority(
             binder,
             witness: *witness,
         },
-        work,
-    )
+        &mut meter,
+    )?;
+    meter.charge(0, 0)
 }
 
 /// Validate one `sko_forall` step against the live solver's authenticated
@@ -245,8 +248,20 @@ pub(crate) fn validate_sko_forall(
     premise_count: usize,
     args: &[TermId],
 ) -> Result<(), ProofCheckError> {
+    validate_sko_forall_with_progress(terms, step, clause, premise_count, args, &mut |_, _| true)
+}
+
+/// Validate a registered Skolem step within the caller's aggregate envelope.
+pub(crate) fn validate_sko_forall_with_progress(
+    terms: &TermStore,
+    step: ProofId,
+    clause: &[TermId],
+    premise_count: usize,
+    args: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
     let mut work = 0usize;
-    validate_sko_forall_with_authority(
+    validate_sko_forall_with_authority_and_progress(
         terms,
         step,
         clause,
@@ -254,10 +269,13 @@ pub(crate) fn validate_sko_forall(
         args,
         SkolemWitnessAuthority::TermStoreRegistry,
         &mut work,
+        progress,
     )
 }
 
 #[cfg(test)]
 mod local_lane_tests;
+#[cfg(test)]
+mod progress_tests;
 #[cfg(test)]
 mod tests;

@@ -7,8 +7,9 @@
 //!
 //! This is the floating-point analogue of the bounded Bool/BV evaluator in
 //! [`super::bv_bitblast`]: a `FpClassification` lemma clause is accepted only
-//! when it is TRUE under EVERY assignment of its (small-width) FP variables.
-//! The evaluator enumerates all `2^(eb+sb)` bit patterns of each FP-sorted
+//! when it is TRUE under EVERY assignment of its FP variables. Exact symbolic
+//! schemas below are width-independent; otherwise the bounded evaluator
+//! enumerates all `2^(eb+sb)` bit patterns of each FP-sorted
 //! variable, reconstructs each as a concrete IEEE 754 value, evaluates the
 //! clause, and requires it true for every assignment. If any assignment
 //! falsifies the clause the lemma is rejected — so a non-tautology can never be
@@ -32,7 +33,7 @@
 //! `fp.isInfinite`, `fp.isZero`, `fp.isNormal`, `fp.isSubnormal`,
 //! `fp.isPositive`, `fp.isNegative`), the sign/structural unary ops (`fp.abs`,
 //! `fp.neg`), equality (`=` structural and `fp.eq` IEEE), and the comparisons
-//! (`fp.lt`, `fp.leq`, `fp.gt`, `fp.geq`, evaluated exactly over `BigRational`).
+//! (`fp.lt`, `fp.leq`, `fp.gt`, `fp.geq`, ordered exactly by decoded IEEE fields).
 //! Boolean connectives (`not`/`and`/`or`/`xor`/`=>`/`ite`) and FP literals
 //! (`+zero`/`-zero`/`+oo`/`-oo`/`NaN`/`(fp s e m)`) are supported as glue.
 //!
@@ -41,19 +42,21 @@
 //! conversions `to_fp`/`fp.to_*`) are intentionally UNSUPPORTED here — they
 //! require a correctly-rounded exact-rational arithmetic evaluator that does not
 //! yet exist in the checker, and the only existing evaluator (`eval_fp.rs`) is
-//! f64-based double-rounding, unsuitable as a proof oracle. There is one
-//! width-independent path: the five IEEE exponent/significand classes (NaN,
+//! f64-based double-rounding, unsuitable as a proof oracle. There are two
+//! width-independent paths: exact NaN identity and the five-way IEEE class
+//! partition. For the latter, the five IEEE exponent/significand classes (NaN,
 //! infinity, zero, normal, and subnormal) form an exact disjoint partition, so
 //! their pairwise-exclusion clauses are checked symbolically. Any other clause
 //! mentioning an unsupported op, or whose enumerated FP width exceeds the bound,
 //! fails closed.
 
-use num_bigint::BigInt;
-use num_rational::BigRational;
-
 use ay_core::{Constant, FpOp, ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
+
+#[path = "fp_bounded/nan_identity.rs"]
+mod nan_identity;
+pub(crate) use nan_identity::{is_exact_nan_identity, NanIdentityView};
 
 /// Total enumerated FP bits across all distinct FP variables in one clause. A
 /// Float16 variable is 16 bits = 65536 patterns; the checker is a validator,
@@ -66,8 +69,8 @@ const MAX_FP_ASSIGNMENT_BITS: u32 = 16;
 /// would accept it. The exact inverse of the validator: the proof classifier
 /// (`ay-dpll`) calls this to upgrade a `Generic`/trust FP lemma into the
 /// strict-checkable `FpClassification` kind ONLY when strict mode will
-/// independently re-validate it by either an exact IEEE class-partition rule or
-/// exhaustive bounded evaluation — so the classifier and checker cannot drift.
+/// independently re-validate it by exact NaN identity, an IEEE class-partition
+/// rule, or exhaustive bounded evaluation — so classifier and checker cannot drift.
 /// A non-tautological clause, an unsupported FP op, or a too-wide clause outside
 /// that exact schema is rejected.
 #[must_use]
@@ -125,13 +128,13 @@ fn rm_literal_index(terms: &TermStore, term: TermId) -> Option<usize> {
     if !matches!(terms.sort(term), Sort::Uninterpreted(name) if name == "RoundingMode") {
         return None;
     }
-    let TermData::App(symbol, args) = terms.get(term) else {
+    let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
         return None;
     };
-    if !args.is_empty() {
+    if !args.is_empty() || terms.is_declared_function(name) {
         return None;
     }
-    match symbol.name() {
+    match name.as_str() {
         "RNE" => Some(0),
         "RNA" => Some(1),
         "RTP" => Some(2),
@@ -148,7 +151,10 @@ fn binary_equality(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> 
     let TermData::App(symbol, args) = terms.get(term) else {
         return None;
     };
-    (symbol.name() == "=" && args.len() == 2).then(|| (args[0], args[1]))
+    (matches!(symbol, Symbol::Named(name) if name == "=")
+        && args.len() == 2
+        && !terms.is_declared_function(symbol.name()))
+    .then(|| (args[0], args[1]))
 }
 
 fn is_rm_pairwise_disequality(terms: &TermStore, term: TermId) -> bool {
@@ -168,7 +174,10 @@ fn is_exact_rm_distinctness(terms: &TermStore, term: TermId) -> bool {
     let TermData::App(symbol, conjuncts) = terms.get(term) else {
         return false;
     };
-    if symbol.name() != "and" || conjuncts.len() != 10 {
+    if !matches!(symbol, Symbol::Named(name) if name == "and")
+        || conjuncts.len() != 10
+        || terms.is_declared_function(symbol.name())
+    {
         return false;
     }
 
@@ -203,7 +212,10 @@ fn is_exact_rm_coverage(terms: &TermStore, term: TermId) -> bool {
     let TermData::App(symbol, disjuncts) = terms.get(term) else {
         return false;
     };
-    if symbol.name() != "or" || disjuncts.len() != 5 {
+    if !matches!(symbol, Symbol::Named(name) if name == "or")
+        || disjuncts.len() != 5
+        || terms.is_declared_function(symbol.name())
+    {
         return false;
     }
 
@@ -240,7 +252,11 @@ fn is_exact_rm_six_term_pigeonhole(terms: &TermStore, term: TermId) -> bool {
     let TermData::App(symbol, conjuncts) = terms.get(*distinct) else {
         return false;
     };
-    if terms.sort(*distinct) != &Sort::Bool || symbol.name() != "and" || conjuncts.len() != 15 {
+    if terms.sort(*distinct) != &Sort::Bool
+        || !matches!(symbol, Symbol::Named(name) if name == "and")
+        || terms.is_declared_function(symbol.name())
+        || conjuncts.len() != 15
+    {
         return false;
     }
 
@@ -351,12 +367,15 @@ fn fp_value_class_atom(terms: &TermStore, term: TermId) -> Option<(TermId, FpVal
     let [argument] = args.as_slice() else {
         return None;
     };
-    if !matches!(terms.sort(*argument), Sort::FloatingPoint(_, _)) {
+    if !matches!(terms.sort(*argument), Sort::FloatingPoint(eb, sb) if *eb > 1 && *sb > 1) {
         return None;
     }
     let Symbol::Named(operator) = symbol else {
         return None;
     };
+    if terms.is_declared_function(operator) {
+        return None;
+    }
     let class = match operator.as_str() {
         "fp.isNaN" => FpValueClass::Nan,
         "fp.isInfinite" => FpValueClass::Infinite,
@@ -388,7 +407,10 @@ fn collect_required_fp_value_classes(
         return;
     }
     if let TermData::App(Symbol::Named(operator), args) = terms.get(term) {
-        if operator == "and" && terms.sort(term) == &Sort::Bool {
+        if operator == "and"
+            && !terms.is_declared_function(operator)
+            && terms.sort(term) == &Sort::Bool
+        {
             for &argument in args {
                 collect_required_fp_value_classes(terms, argument, required, depth + 1);
             }
@@ -424,7 +446,7 @@ fn is_exact_fp_value_class_exclusion(terms: &TermStore, clause: &[TermId]) -> bo
 /// Every literal must be `Bool`-sorted (a classification/comparison/equality
 /// clause is propositional). The clause must mention at least one FP-sorted
 /// sub-term (otherwise it is not an FP lemma — route it elsewhere). Outside the
-/// width-independent class-exclusion schema, all FP variables must be enumerable
+/// width-independent NaN-identity/class-exclusion schemas, FP variables must be enumerable
 /// within the bit budget, and every assignment of those variables must satisfy
 /// the clause.
 pub(crate) fn validate_fp_classification(
@@ -437,6 +459,11 @@ pub(crate) fn validate_fp_classification(
             step: step_id,
             reason: "fp_classification clause must be non-empty".to_string(),
         });
+    }
+    // SMT-LIB FP values contain one abstract NaN. This constant-size schema
+    // needs neither FP arithmetic nor enumeration; fp.eq is not structural =.
+    if nan_identity::in_store(terms, step_id, clause)? {
+        return Ok(());
     }
     for &lit in clause {
         if !matches!(terms.sort(lit), Sort::Bool) {
@@ -480,7 +507,13 @@ pub(crate) fn validate_fp_classification(
         });
     }
 
-    let total_bits: u32 = vars.iter().map(|v| v.eb + v.sb).sum();
+    let total_bits = vars
+        .iter()
+        .try_fold(0u32, |sum, v| sum.checked_add(v.eb)?.checked_add(v.sb))
+        .ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "floating-point enumeration width overflow".to_owned(),
+        })?;
     if total_bits > MAX_FP_ASSIGNMENT_BITS {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
@@ -585,7 +618,7 @@ fn principal_fp_op(terms: &TermStore, term: TermId, stack: &mut Vec<TermId>) -> 
 
 /// A concrete IEEE 754 value reconstructed from a raw `eb+sb`-bit pattern.
 /// Stored as the decoded fields; classification/sign/equality/comparison are
-/// pure integer/rational logic over these fields.
+/// pure integer logic over these fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FpVal {
     /// True if the sign bit is set (negative).
@@ -704,86 +737,34 @@ impl FpVal {
     /// IEEE 754 equality (`fp.eq`): NaN != anything (incl NaN), +0 == -0,
     /// otherwise equal real value.
     fn fp_eq(&self, other: &Self) -> bool {
-        if self.is_nan() || other.is_nan() {
-            return false;
-        }
-        if self.is_zero() && other.is_zero() {
-            return true;
-        }
-        if self.is_infinite() && other.is_infinite() {
-            return self.sign == other.sign;
-        }
-        if self.is_infinite() || other.is_infinite() {
-            return false;
-        }
-        // Both finite non-zero: compare exact rational value.
-        match (self.to_rational(), other.to_rational()) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+        self.cmp_real(other) == Some(std::cmp::Ordering::Equal)
     }
 
-    /// Exact rational value of a FINITE number. `None` for NaN/inf.
-    fn to_rational(self) -> Option<BigRational> {
-        if self.is_nan() || self.is_infinite() {
-            return None;
-        }
-        if self.is_zero() {
-            return Some(BigRational::from_integer(BigInt::from(0)));
-        }
-        let bias = (1u64 << (self.eb - 1)) - 1;
-        let stored_bits = self.sb - 1;
-        let sig_int = if self.exponent == 0 {
-            BigInt::from(self.significand)
-        } else {
-            (BigInt::from(1u64) << stored_bits as usize) + BigInt::from(self.significand)
-        };
-        let exp_shift: i64 = if self.exponent == 0 {
-            1i64 - bias as i64 - i64::from(stored_bits)
-        } else {
-            self.exponent as i64 - bias as i64 - i64::from(stored_bits)
-        };
-        let result = if exp_shift >= 0 {
-            BigRational::from_integer(sig_int << (exp_shift as u64))
-        } else {
-            BigRational::new(sig_int, BigInt::from(1u64) << ((-exp_shift) as u64))
-        };
-        Some(if self.sign { -result } else { result })
-    }
-
-    /// Total IEEE-754 order helper for `fp.lt`/`leq`/`gt`/`geq`. Returns the
-    /// comparison of the real values, with infinities handled exactly. NaN
-    /// operands are handled by the caller (all FP comparisons are false on NaN).
-    /// Returns `None` only if a NaN slips in (caller guards).
+    /// For one format, positive IEEE encodings increase lexicographically by
+    /// exponent and trailing significand. Negative values reverse that order.
+    /// This includes subnormals and infinities without reconstructing rationals
+    /// or shifting by a potentially enormous format-dependent exponent.
     fn cmp_real(&self, other: &Self) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering;
-        if self.is_nan() || other.is_nan() {
+        if (self.eb, self.sb) != (other.eb, other.sb) || self.is_nan() || other.is_nan() {
             return None;
         }
-        // Map each value to an extended-real category for total ordering.
-        // -inf < finite < +inf; +0 == -0.
-        let rank = |v: &Self| -> (i8, Option<BigRational>) {
-            if v.is_infinite() {
-                if v.sign {
-                    (-1, None) // -inf
-                } else {
-                    (1, None) // +inf
-                }
-            } else {
-                (0, v.to_rational())
-            }
-        };
-        let (ra, qa) = rank(self);
-        let (rb, qb) = rank(other);
-        match ra.cmp(&rb) {
-            Ordering::Equal => match (qa, qb) {
-                (Some(a), Some(b)) => Some(a.cmp(&b)),
-                // both infinities of the same sign
-                (None, None) => Some(Ordering::Equal),
-                _ => None,
-            },
-            other => Some(other),
+        if self.is_zero() && other.is_zero() {
+            return Some(Ordering::Equal);
         }
+        if self.sign != other.sign {
+            return Some(if self.sign {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        let magnitude = (self.exponent, self.significand).cmp(&(other.exponent, other.significand));
+        Some(if self.sign {
+            magnitude.reverse()
+        } else {
+            magnitude
+        })
     }
 }
 
@@ -825,7 +806,10 @@ fn is_fp_literal_symbol(terms: &TermStore, term: TermId, symbol: &Symbol, args: 
     let Symbol::Indexed(name, indices) = symbol else {
         return false;
     };
-    if !args.is_empty() || !matches!(name.as_str(), "+zero" | "-zero" | "+oo" | "-oo" | "NaN") {
+    if !args.is_empty()
+        || terms.is_declared_function(name)
+        || !matches!(name.as_str(), "+zero" | "-zero" | "+oo" | "-oo" | "NaN")
+    {
         return false;
     }
     matches!(terms.sort(term), Sort::FloatingPoint(eb, sb) if indices.as_slice() == [*eb, *sb])
@@ -845,7 +829,11 @@ fn collect_fp_vars(
         return None;
     }
     stack.push(term);
-    if let Sort::FloatingPoint(_, _) = terms.sort(term) {
+    if let Sort::FloatingPoint(eb, sb) = terms.sort(term) {
+        if !(2..=64).contains(eb) || *sb < 2 {
+            stack.pop();
+            return None;
+        }
         *mentions_fp = true;
     }
     let result = match terms.get(term) {
@@ -876,10 +864,18 @@ fn collect_fp_vars(
             collect_fp_vars(terms, e, vars, mentions_fp, stack)
         }
         TermData::App(sym, args) => {
+            if terms.is_declared_function(sym.name()) {
+                stack.pop();
+                return None;
+            }
             let name = sym.name();
             // FP nullary literal `(_ +zero eb sb)` etc. Decided before the
             // argument clone so the `Symbol` itself never has to be cloned.
             let is_fp_literal = is_fp_literal_symbol(terms, term, sym, args);
+            if !is_fp_literal && !matches!(sym, Symbol::Named(_)) {
+                stack.pop();
+                return None;
+            }
             let args = args.clone();
             if is_fp_literal {
                 Some(())
@@ -962,6 +958,9 @@ fn build_env(vars: &[FpVar], assignment: u64) -> Env {
 /// Evaluate a Bool-sorted term under `env`. Returns `None` if a sub-term is
 /// not evaluable (fail closed — never guesses).
 fn eval_bool(terms: &TermStore, term: TermId, env: &Env) -> Option<bool> {
+    if terms.sort(term) != &Sort::Bool {
+        return None;
+    }
     match terms.get(term) {
         TermData::Const(Constant::Bool(b)) => Some(*b),
         TermData::Var(_, _) => None, // Bool variables: out of scope for FP lemmas.
@@ -973,8 +972,11 @@ fn eval_bool(terms: &TermStore, term: TermId, env: &Env) -> Option<bool> {
                 eval_bool(terms, *e, env)
             }
         }
-        TermData::App(sym, args) => {
-            let name = sym.name();
+        TermData::App(Symbol::Named(name), args) => {
+            if terms.is_declared_function(name) {
+                return None;
+            }
+            let name = name.as_str();
             match name {
                 // FP classification predicates.
                 "fp.isNaN" | "fp.isInfinite" | "fp.isZero" | "fp.isNormal" | "fp.isSubnormal"
@@ -995,11 +997,17 @@ fn eval_bool(terms: &TermStore, term: TermId, env: &Env) -> Option<bool> {
                 }
                 // IEEE equality and comparisons.
                 "fp.eq" if args.len() == 2 => {
+                    if terms.sort(args[0]) != terms.sort(args[1]) {
+                        return None;
+                    }
                     let a = eval_fp(terms, args[0], env)?;
                     let b = eval_fp(terms, args[1], env)?;
                     Some(a.fp_eq(&b))
                 }
                 "fp.lt" | "fp.leq" | "fp.gt" | "fp.geq" if args.len() == 2 => {
+                    if terms.sort(args[0]) != terms.sort(args[1]) {
+                        return None;
+                    }
                     let a = eval_fp(terms, args[0], env)?;
                     let b = eval_fp(terms, args[1], env)?;
                     // NaN ⇒ all comparisons false.
@@ -1016,19 +1024,21 @@ fn eval_bool(terms: &TermStore, term: TermId, env: &Env) -> Option<bool> {
                     })
                 }
                 // Structural `=`: dispatch on operand sort.
-                "=" if args.len() == 2 => match terms.sort(args[0]) {
-                    Sort::FloatingPoint(_, _) => {
-                        let a = eval_fp(terms, args[0], env)?;
-                        let b = eval_fp(terms, args[1], env)?;
-                        Some(a.structural_eq(&b))
+                "=" if args.len() == 2 && terms.sort(args[0]) == terms.sort(args[1]) => {
+                    match terms.sort(args[0]) {
+                        Sort::FloatingPoint(_, _) => {
+                            let a = eval_fp(terms, args[0], env)?;
+                            let b = eval_fp(terms, args[1], env)?;
+                            Some(a.structural_eq(&b))
+                        }
+                        Sort::Bool => {
+                            let a = eval_bool(terms, args[0], env)?;
+                            let b = eval_bool(terms, args[1], env)?;
+                            Some(a == b)
+                        }
+                        _ => None,
                     }
-                    Sort::Bool => {
-                        let a = eval_bool(terms, args[0], env)?;
-                        let b = eval_bool(terms, args[1], env)?;
-                        Some(a == b)
-                    }
-                    _ => None,
-                },
+                }
                 "and" => {
                     let mut acc = true;
                     for &a in args {
@@ -1064,7 +1074,8 @@ fn eval_bool(terms: &TermStore, term: TermId, env: &Env) -> Option<bool> {
 
 /// Evaluate an FP-sorted term under `env`. Returns `None` if not evaluable.
 fn eval_fp(terms: &TermStore, term: TermId, env: &Env) -> Option<FpVal> {
-    match terms.get(term) {
+    let format = fp_sort_of(terms, term)?;
+    let result = match terms.get(term) {
         TermData::Var(_, _) => env.fp.iter().find(|(t, _)| *t == term).map(|(_, v)| *v),
         TermData::Ite(c, t, e) => {
             if eval_bool(terms, *c, env)? {
@@ -1074,6 +1085,12 @@ fn eval_fp(terms: &TermStore, term: TermId, env: &Env) -> Option<FpVal> {
             }
         }
         TermData::App(sym, args) => {
+            if terms.is_declared_function(sym.name()) {
+                return None;
+            }
+            if !matches!(sym, Symbol::Named(_)) && !is_fp_literal_symbol(terms, term, sym, args) {
+                return None;
+            }
             let name = sym.name();
             match name {
                 "fp.abs" if args.len() == 1 => Some(eval_fp(terms, args[0], env)?.abs()),
@@ -1092,19 +1109,19 @@ fn eval_fp(terms: &TermStore, term: TermId, env: &Env) -> Option<FpVal> {
             }
         }
         _ => None,
-    }
+    };
+    result.filter(|value| (value.eb, value.sb) == format)
 }
 
 fn fp_sort_of(terms: &TermStore, term: TermId) -> Option<(u32, u32)> {
     match terms.sort(term) {
-        Sort::FloatingPoint(eb, sb) => Some((*eb, *sb)),
+        Sort::FloatingPoint(eb, sb) if (2..=64).contains(eb) && *sb >= 2 => Some((*eb, *sb)),
         _ => None,
     }
 }
 
 /// Build the concrete value for an FP special-constant literal.
 fn literal_fpval(name: &str, eb: u32, sb: u32) -> FpVal {
-    let stored_bits = sb - 1;
     let max_exp = if eb >= 64 { u64::MAX } else { (1u64 << eb) - 1 };
     match name {
         "+zero" => FpVal {
@@ -1135,15 +1152,13 @@ fn literal_fpval(name: &str, eb: u32, sb: u32) -> FpVal {
             eb,
             sb,
         },
-        // Canonical quiet NaN: exponent all-ones, MSB of stored significand set.
+        // One abstract NaN: exponent all-ones and any nonzero trailing field.
         "NaN" => FpVal {
             sign: false,
             exponent: max_exp,
-            significand: if stored_bits == 0 {
-                0
-            } else {
-                1u64 << (stored_bits - 1)
-            },
+            // SMT-LIB has one abstract NaN; every nonzero payload denotes it.
+            // Payload one is valid even when the format exceeds u64 precision.
+            significand: 1,
             eb,
             sb,
         },
@@ -1160,7 +1175,10 @@ fn fp_from_triple(terms: &TermStore, s: TermId, e: TermId, m: TermId) -> Option<
         return None;
     }
     let eb = exp_w;
-    let sb = sig_w + 1; // stored significand is sb-1 bits.
+    if !(2..=64).contains(&eb) {
+        return None;
+    }
+    let sb = sig_w.checked_add(1)?; // stored significand is sb-1 bits.
     let sign = sign_val == 1;
     Some(FpVal {
         sign,
@@ -1176,6 +1194,12 @@ fn bv_const(terms: &TermStore, term: TermId) -> Option<(u64, u32)> {
     match terms.get(term) {
         TermData::Const(Constant::BitVec { value, width }) => {
             use num_traits::ToPrimitive;
+            if *width == 0
+                || value.bits() > u64::from(*width)
+                || !matches!(terms.sort(term), Sort::BitVec(sort) if sort.width == *width)
+            {
+                return None;
+            }
             let v = value.to_u64()?;
             Some((v, *width))
         }
@@ -1187,6 +1211,49 @@ fn bv_const(terms: &TermStore, term: TermId) -> Option<(u64, u32)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registered_classification_and_literals_are_opaque() {
+        for name in ["fp.isNaN", "NaN"] {
+            let mut terms = TermStore::new();
+            let nan = terms.mk_app(
+                Symbol::indexed("NaN", vec![3, 5]),
+                [],
+                Sort::FloatingPoint(3, 5),
+            );
+            let claim = app1(&mut terms, "fp.isNaN", nan, Sort::Bool);
+            assert!(validate_fp_classification(&terms, ProofId(0), &[claim]).is_ok());
+            terms.register_declared_function(name);
+            assert!(validate_fp_classification(&terms, ProofId(0), &[claim]).is_err());
+        }
+    }
+
+    #[test]
+    fn registered_class_predicate_has_no_partition_axiom() {
+        let mut terms = TermStore::new();
+        let x = fp_var(&mut terms, "x", 8, 24);
+        let nan = app1(&mut terms, "fp.isNaN", x, Sort::Bool);
+        let zero = app1(&mut terms, "fp.isZero", x, Sort::Bool);
+        let clause = [terms.mk_not_raw(nan), terms.mk_not_raw(zero)];
+        assert!(validate_fp_classification(&terms, ProofId(0), &clause).is_ok());
+        terms.register_declared_function("fp.isNaN");
+        assert!(validate_fp_classification(&terms, ProofId(0), &clause).is_err());
+    }
+
+    #[test]
+    fn registered_rounding_names_do_not_prove_distinctness() {
+        for name in ["RNE", "="] {
+            let mut terms = TermStore::new();
+            let mode = Sort::Uninterpreted("RoundingMode".to_owned());
+            let a = terms.mk_app(Symbol::named("RNE"), [], mode.clone());
+            let b = terms.mk_app(Symbol::named("RNA"), [], mode);
+            let equality = eq(&mut terms, a, b);
+            let claim = terms.mk_not_raw(equality);
+            assert!(validate_fp_rounding_mode_domain(&terms, ProofId(0), &[claim]).is_ok());
+            terms.register_declared_function(name);
+            assert!(validate_fp_rounding_mode_domain(&terms, ProofId(0), &[claim]).is_err());
+        }
+    }
+
     /// Build `(_ FloatingPoint eb sb)` variable.
     fn fp_var(terms: &mut TermStore, name: &str, eb: u32, sb: u32) -> TermId {
         terms.mk_var(name, Sort::FloatingPoint(eb, sb))
@@ -1196,6 +1263,113 @@ mod tests {
     }
     fn eq(terms: &mut TermStore, a: TermId, b: TermId) -> TermId {
         terms.mk_app(Symbol::named("="), vec![a, b], Sort::Bool)
+    }
+
+    #[test]
+    fn fp_constructor_does_not_trust_a_mismatched_bitvector_field_sort() {
+        let entries = vec![
+            (
+                TermData::Const(Constant::BitVec {
+                    value: 0.into(),
+                    width: 1,
+                }),
+                Sort::bitvec(1),
+            ),
+            (
+                TermData::Const(Constant::BitVec {
+                    value: 0.into(),
+                    width: 3,
+                }),
+                Sort::bitvec(4),
+            ),
+            (
+                TermData::Const(Constant::BitVec {
+                    value: 0.into(),
+                    width: 4,
+                }),
+                Sort::bitvec(4),
+            ),
+            (
+                TermData::App(Symbol::named("fp"), vec![TermId(0), TermId(1), TermId(2)]),
+                Sort::FloatingPoint(3, 5),
+            ),
+            (
+                TermData::App(Symbol::named("fp.isZero"), vec![TermId(3)]),
+                Sort::Bool,
+            ),
+        ];
+        let terms = TermStore::from_entries(entries, None, None, 0);
+        assert!(validate_fp_classification(&terms, ProofId(0), &[TermId(4)]).is_err());
+    }
+
+    #[test]
+    fn field_order_handles_wide_exponents_fraction_bits_signs_and_special_values() {
+        use std::cmp::Ordering;
+        for (sb, fraction) in [(3, 2), (113, u64::MAX - 1)] {
+            let low = FpVal {
+                sign: false,
+                exponent: u64::MAX - 1,
+                significand: fraction,
+                eb: 64,
+                sb,
+            };
+            let high = FpVal {
+                significand: fraction + 1,
+                ..low
+            };
+            assert_eq!(low.cmp_real(&high), Some(Ordering::Less));
+            assert_eq!(low.neg().cmp_real(&high.neg()), Some(Ordering::Greater));
+            let infinity = literal_fpval("+oo", 64, sb);
+            assert_eq!(high.cmp_real(&infinity), Some(Ordering::Less));
+            assert_eq!(infinity.neg().cmp_real(&high.neg()), Some(Ordering::Less));
+            let zero = literal_fpval("+zero", 64, sb);
+            assert!(zero.fp_eq(&zero.neg()));
+            assert!(!zero.structural_eq(&zero.neg()));
+            assert_eq!(literal_fpval("NaN", 64, sb).cmp_real(&low), None);
+            assert_eq!(low.cmp_real(&FpVal { eb: 63, ..low }), None);
+        }
+    }
+
+    #[test]
+    fn indexed_classification_names_do_not_receive_builtin_semantics() {
+        let mut terms = TermStore::new();
+        let zero = terms.mk_app(
+            Symbol::indexed("+zero", vec![3, 5]),
+            [],
+            Sort::FloatingPoint(3, 5),
+        );
+        let valid = app1(&mut terms, "fp.isZero", zero, Sort::Bool);
+        validate_fp_classification(&terms, ProofId(0), &[valid]).unwrap();
+        let indexed = terms.mk_app(Symbol::indexed("fp.isZero", vec![0]), [zero], Sort::Bool);
+        assert!(validate_fp_classification(&terms, ProofId(0), &[indexed]).is_err());
+    }
+
+    #[test]
+    fn indexed_rounding_literals_do_not_prove_canonical_distinctness() {
+        let mut terms = TermStore::new();
+        let mode = Sort::Uninterpreted("RoundingMode".to_owned());
+        let rne = terms.mk_app(Symbol::named("RNE"), [], mode.clone());
+        let rna = terms.mk_app(Symbol::named("RNA"), [], mode.clone());
+        let distinct = eq(&mut terms, rne, rna);
+        let distinct = terms.mk_not_raw(distinct);
+        validate_fp_rounding_mode_domain(&terms, ProofId(0), &[distinct]).unwrap();
+        let indexed = terms.mk_app(Symbol::indexed("RNE", vec![0]), [], mode);
+        let forged = eq(&mut terms, indexed, rna);
+        let forged = terms.mk_not_raw(forged);
+        assert!(validate_fp_rounding_mode_domain(&terms, ProofId(0), &[forged]).is_err());
+    }
+
+    #[test]
+    fn wide_nan_classification_uses_the_wide_kernel_without_a_bounded_shift() {
+        let mut terms = TermStore::new();
+        let nan = terms.mk_app(
+            Symbol::indexed("NaN", vec![15, 113]),
+            [],
+            Sort::FloatingPoint(15, 113),
+        );
+        let claim = app1(&mut terms, "fp.isNaN", nan, Sort::Bool);
+        validate_fp_classification(&terms, ProofId(0), &[claim]).unwrap();
+        assert!(crate::recognize_fp_ground_eval(&terms, &[claim]));
     }
 
     #[test]

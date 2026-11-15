@@ -36,7 +36,11 @@ impl PlannerSource {
             // planner. This keeps standalone installed binaries usable without
             // creating a second Rust implementation whose policy could drift.
             Self::Embedded => {
-                command.arg("-c").arg(EMBEDDED_OOM_GUARD);
+                ay_sys::embedded_python::embed_program(
+                    &mut command,
+                    "embedded:scripts/_oom_guard.py",
+                    EMBEDDED_OOM_GUARD,
+                );
             }
         }
         command
@@ -167,6 +171,109 @@ mod tests {
     fn locates_repository_planner() {
         let planner = locate_planner(Path::new("target/debug/ay")).expect("planner");
         assert!(planner.ends_with("scripts/_oom_guard.py"));
+    }
+
+    /// THE EMBEDDED PLANNER MUST STAY ON THE INTERPRETER FLOOR IT DECLARES.
+    ///
+    /// [`PlannerSource::command`] runs the planner as a bare `python3`, and a
+    /// stock macOS resolves that to `/usr/bin/python3` == 3.9.x with nothing
+    /// newer installed. `scripts/_oom_guard.py` declares `MIN_PYTHON = (3, 9)`
+    /// for exactly that reason, and this test reads the floor back OUT of the
+    /// script so the two cannot drift.
+    ///
+    /// The failure it pins is one that happened: `CapturedRun.guard_evidence`
+    /// was annotated `dict | None`, which PARSES on 3.9 and raises
+    /// `TypeError: unsupported operand type(s) for |` when the class body
+    /// executes — so every `ay-bisect` resource plan on a stock macOS died
+    /// inside the planner, with a Python traceback for a diagnostic.
+    ///
+    /// Two checks, and both run on whatever `python3` this host has, which is
+    /// the point: the sibling test above only exercises the floor on a host
+    /// whose `python3` already IS the floor.
+    ///
+    /// * the floor's GRAMMAR, via `ast.parse(.., feature_version=MIN_PYTHON)`,
+    ///   which rejects `match`, 3.12 type parameters and anything else the
+    ///   floor cannot parse;
+    /// * PEP 604 `X | Y` inside an annotation, which the grammar accepts at
+    ///   every version and the floor's RUNTIME rejects. Skipped only when the
+    ///   module opts into lazy annotations with `from __future__ import
+    ///   annotations`, under which the expression is never evaluated.
+    ///
+    /// It fails loudly when `python3` is missing, when the floor declaration
+    /// cannot be found, or when the source does not parse. It never skips.
+    #[test]
+    fn embedded_planner_runs_on_the_declared_interpreter_floor() {
+        // Reads MIN_PYTHON out of the script under test, so the floor has ONE
+        // declaration; a script with no floor is itself a failure.
+        const CHECK: &str = r#"
+import ast, re, sys
+src = sys.stdin.read()
+m = re.search(r"^MIN_PYTHON = \((\d+), (\d+)\)$", src, re.M)
+if not m:
+    print("scripts/_oom_guard.py declares no `MIN_PYTHON = (major, minor)` floor")
+    raise SystemExit(1)
+floor = (int(m.group(1)), int(m.group(2)))
+try:
+    tree = ast.parse(src, feature_version=floor)
+except SyntaxError as e:
+    print("line %s: syntax newer than Python %d.%d: %s" % (e.lineno, floor[0], floor[1], e.msg))
+    raise SystemExit(1)
+lazy = any(
+    isinstance(n, ast.ImportFrom)
+    and n.module == "__future__"
+    and any(a.name == "annotations" for a in n.names)
+    for n in tree.body
+)
+bad = []
+if not lazy:
+    anns = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.AnnAssign):
+            anns.append(n.annotation)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if n.returns is not None:
+                anns.append(n.returns)
+            a = n.args
+            for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs) + [a.vararg, a.kwarg]:
+                if arg is not None and arg.annotation is not None:
+                    anns.append(arg.annotation)
+    for a in anns:
+        for n in ast.walk(a):
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+                bad.append(n.lineno)
+for line in sorted(set(bad)):
+    print(
+        "line %d: PEP 604 `X | Y` in an annotation is a RUNTIME expression; it "
+        "raises TypeError before 3.10. Spell it typing.Optional[X] / typing.Union[..]."
+        % line
+    )
+raise SystemExit(1 if bad else 0)
+"#;
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(CHECK)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 must be on PATH: it is the interpreter the planner runs on");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(EMBEDDED_OOM_GUARD.as_bytes())
+            .expect("feed the embedded planner to the floor check");
+        let output = child.wait_with_output().expect("floor check");
+        assert!(
+            output.status.success(),
+            "scripts/_oom_guard.py uses something its own declared interpreter floor \
+             cannot run. ay-bisect executes it as a bare `python3`, which is 3.9 on a \
+             stock macOS, so this is a broken planner and not a style question.\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]

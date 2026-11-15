@@ -27,3 +27,9 @@ mod pdr_model_verification_negative;
 mod pdr_soundness;
 #[path = "group_pdr/pdr_unbounded_loop.rs"]
 mod pdr_unbounded_loop;
+#[path = "group_pdr/spacer_cex_concretize.rs"]
+mod spacer_cex_concretize;
+#[path = "group_pdr/spacer_false_lemma_fixed_point.rs"]
+mod spacer_false_lemma_fixed_point;
+#[path = "group_pdr/spacer_verdict_lock.rs"]
+mod spacer_verdict_lock;

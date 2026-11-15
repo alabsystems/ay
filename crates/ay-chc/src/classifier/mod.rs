@@ -63,6 +63,11 @@ pub(crate) struct ProblemFeatures {
     pub(crate) has_mod_div: bool,
     /// Any if-then-else term in clause constraints
     pub(crate) has_ite: bool,
+    /// Any if-then-else term in a predicate argument, head or body. The
+    /// parser inlines a defining equality `(= v (ite c a b))` into the
+    /// argument `v` feeds, so an `ite` written in a constraint usually lands
+    /// here and is invisible to `has_ite`. See [`ite_shape`].
+    pub(crate) has_ite_in_predicate_args: bool,
     /// Fraction of transition clauses that are self-loops
     pub(crate) self_loop_ratio: f64,
     /// Maximum predicate arity across all declared predicates
@@ -244,6 +249,7 @@ impl ProblemClassifier {
             has_multiplication: clause_features.has_multiplication,
             has_mod_div: clause_features.has_mod_div,
             has_ite: clause_features.has_ite,
+            has_ite_in_predicate_args: Self::predicate_args_have_ite(problem),
             self_loop_ratio: clause_features.self_loop_ratio,
             max_predicate_arity,
             is_entry_exit_only,
@@ -413,42 +419,26 @@ impl ProblemClassifier {
     }
 
     /// Scan a clause constraint for arithmetic and control-flow operators.
+    ///
+    /// The flags are a union over nodes, so each distinct shared node is
+    /// visited once (WP-F F0b) — same result as the former tree walk.
     fn scan_constraint_features(expr: &ChcExpr) -> ConstraintFeatures {
+        use crate::expr::dag::{walk_distinct_preorder, Step};
         let mut features = ConstraintFeatures::default();
-        let mut stack = vec![expr];
-
-        while let Some(current) = stack.pop() {
-            match current {
-                ChcExpr::Op(op, args) => {
-                    match op {
-                        ChcOp::Mul => features.has_multiplication = true,
-                        ChcOp::Div | ChcOp::Mod => features.has_mod_div = true,
-                        ChcOp::Ite => features.has_ite = true,
-                        _ => {}
-                    }
-                    if features.all_set() {
-                        break;
-                    }
-                    for arg in args {
-                        stack.push(arg.as_ref());
-                    }
+        walk_distinct_preorder(expr, |current| {
+            if let ChcExpr::Op(op, _) = current {
+                match op {
+                    ChcOp::Mul => features.has_multiplication = true,
+                    ChcOp::Div | ChcOp::Mod => features.has_mod_div = true,
+                    ChcOp::Ite => features.has_ite = true,
+                    _ => {}
                 }
-                ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                    for arg in args {
-                        stack.push(arg.as_ref());
-                    }
+                if features.all_set() {
+                    return Step::Stop;
                 }
-                ChcExpr::ConstArray(_, value) => stack.push(value.as_ref()),
-                ChcExpr::Bool(_)
-                | ChcExpr::Int(_)
-                | ChcExpr::Real(_, _)
-                | ChcExpr::BitVec(_, _)
-                | ChcExpr::Var(_)
-                | ChcExpr::ConstArrayMarker(_)
-                | ChcExpr::IsTesterMarker(_) => {}
             }
-        }
-
+            Step::Descend
+        });
         features
     }
 
@@ -902,6 +892,8 @@ enum TriangleLocationTheory {
     Int,
     Bv32,
 }
+
+mod ite_shape;
 
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]

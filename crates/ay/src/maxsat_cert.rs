@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! The certificate lane for `ay maxsat bench --proof-check`: resolve the pinned
-//! VeriPB checker, decide which rows get certified, read the checker's verdict,
+//! The certificate lane for `ay maxsat bench --proof-check`: run the
+//! integrated VeriPB checker, decide which rows get certified, read the checker's verdict,
 //! and fold that verdict into a bench row.
 //!
 //! # THE RULE: a certificate may only DOWNGRADE
@@ -28,7 +28,7 @@
 //! checked nothing, and that `/usr/bin/true` could satisfy end to end". So the
 //! word VERIFIED here is earned twice:
 //!
-//! * [`self_test`] runs the resolved binary against a proof it MUST accept and
+//! * [`self_test_checker`] runs the resolved binary against a proof it MUST accept and
 //!   a proof it MUST reject before the sweep starts. `/bin/true` and
 //!   `/bin/false` fail the first; `ci/fake-checkers/parrot.sh` — which reads
 //!   the conclusion out of the proof and echoes it back — passes the first by
@@ -85,285 +85,56 @@ use std::time::Duration;
 
 use crate::cmd_maxsat::{run_cert_probe, RunStatus};
 
-/// The checker PIN: which VeriPB this binary's certified claims are made
-/// against.
-///
-/// `ay-test-support`'s copy of this reader is a DEV-dependency of `ay`
-/// (`crates/ay/Cargo.toml`) and therefore unreachable from the shipping binary,
-/// so the reader is duplicated here — but the DATA is not. Both `include_str!`
-/// the one committed `ci/veripb.pin`, so an installed `ay` resolves the same
-/// checker CI does and there is no second copy to drift. Embedding a committed
-/// file rather than reading it at runtime is the crate's existing idiom
-/// (`crates/ay-bisect/src/resource.rs` does it with `scripts/_oom_guard.py`),
-/// and `publish/manifest.txt` ships `ci/veripb.pin` precisely so the exported
-/// workspace still compiles.
-pub(crate) mod pin {
-    /// The committed pin file, embedded at compile time.
-    pub(crate) const PIN_FILE: &str = include_str!("../../../ci/veripb.pin");
+/// The integrated checker is executed through this same AY image so the existing
+/// deadline, process-group and RSS supervision contain checking as well as solving.
+/// There is no PATH lookup, cache search or external-checker environment override.
+#[derive(Debug)]
+pub(crate) struct CheckerCommand {
+    program: PathBuf,
+    arguments: &'static [&'static str],
+}
 
-    /// Repo-relative path of the pin file (for error messages).
-    pub(crate) const PIN_PATH: &str = "ci/veripb.pin";
-
-    /// Read one `KEY=VALUE` entry from the pin. `None` if absent.
-    ///
-    /// Byte-identical in behaviour to `ay_test_support::veripb::pin::get`: the
-    /// format is strict KEY=VALUE, no quoting, no expansion, `#` comments only
-    /// at line start. That is what lets POSIX `sh`, the test-support reader and
-    /// this reader agree exactly.
-    pub(crate) fn get(key: &str) -> Option<&'static str> {
-        PIN_FILE.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with('#') {
-                return None;
-            }
-            let (name, value) = line.split_once('=')?;
-            (name == key).then_some(value)
+impl CheckerCommand {
+    fn integrated() -> Result<Self, String> {
+        let program = std::env::current_exe()
+            .map_err(|error| format!("cannot resolve the running AY checker image: {error}"))?;
+        Ok(Self {
+            program,
+            arguments: &["check", "veripb"],
         })
     }
 
-    fn require(key: &str) -> &'static str {
-        // A pin missing a field is a build-time defect in a committed file, not
-        // a runtime condition; the empty string would make the cache key and
-        // the version cross-check silently wrong instead.
-        get(key).unwrap_or("")
+    pub(crate) fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        command.args(self.arguments);
+        command
     }
 
-    /// The pinned upstream commit. This, not the version string, is the
-    /// checker's identity: 3.0.2 has been many different checkers.
-    pub(crate) fn commit() -> &'static str {
-        require("VERIPB_COMMIT")
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
+        self.program.display()
     }
 
-    /// What `veripb --version` should report. A cross-check, never an identity.
-    pub(crate) fn version() -> &'static str {
-        require("VERIPB_VERSION")
+    fn probe(&self, arguments: &[&OsStr]) -> Result<crate::cmd_maxsat::CertProbeOutput, String> {
+        let prefix: Vec<&OsStr> = self.arguments.iter().map(OsStr::new).collect();
+        let arguments: Vec<&OsStr> = prefix
+            .into_iter()
+            .chain(arguments.iter().copied())
+            .collect();
+        run_cert_probe(&self.program, &arguments)
     }
 
-    /// SHA-256 of the patch applied on top of [`commit`]. The patch is part of
-    /// the pin: it is what turns an unsound upstream build into the checker AY
-    /// validated against. It is the private fork's `alab-main` delta over the
-    /// shared upstream base, carrying the fix for every one of the twenty-one
-    /// defects. (This repo previously carried a second, locally written patch;
-    /// those fixes now live in the fork — see the prose in `ci/veripb.pin`.)
-    pub(crate) fn patch_sha256() -> &'static str {
-        require("VERIPB_PATCH_SHA256")
-    }
-}
-
-/// Environment overrides consulted first, in order. Same names, same order as
-/// `ay_test_support::veripb::CHECKER_ENV_VARS`, so a machine configured for the
-/// test suites is configured for the bench lane.
-const CHECKER_ENV_VARS: [&str; 3] = ["VERIPB_BIN", "AY_PB26_VERIPB_BIN", "VERIPB"];
-
-/// Colon-separated candidate list that REPLACES the built-in known build
-/// locations. Set it to a nonexistent path to model a machine with no checker.
-const SEARCH_PATH_ENV: &str = "AY_VERIPB_SEARCH_PATH";
-
-/// Cache-key contract shared with `scripts/lib/veripb_build_id.sh` (the ONE
-/// shell-side authority, sourced by both `scripts/ci/pb_certified_gate.sh` and
-/// `scripts/cert_ci.sh`) and with `ay-test-support`.
-///
-/// This is the checker's IDENTITY: the pinned commit plus the patch-sha prefix,
-/// so a changed patch must not silently reuse a binary built from the same
-/// upstream commit. It is both the whole name of a legacy (pre-2026-08-30)
-/// cache directory and the prefix of a keyed one — the shell side appends
-/// [`RUSTC_KEY_INFIX`] plus a compiler fingerprint when it BUILDS, because
-/// compiling twice in one target dir with two compilers breaks (E0514, commit
-/// 8499748c6). This resolver never builds, and a finished binary runs the same
-/// under any of today's compilers, so resolution accepts every directory
-/// matching the identity, keyed or legacy. `ay-test-support` is a
-/// dev-dependency here, so this lane carries its own copy of the contract;
-/// `pin_reader_agrees_with_ay_test_support` pins the two together and the
-/// shell format itself is pinned by test-support's executable
-/// `shell_and_rust_agree_on_the_cache_key`.
-fn pinned_build_id() -> String {
-    let patch_sha = pin::patch_sha256();
-    let patch_prefix = patch_sha.get(..12).unwrap_or(patch_sha);
-    format!("{}-{patch_prefix}", pin::commit())
-}
-
-/// Separator between the identity prefix and the compiler fingerprint in a
-/// keyed cache-directory name. Mirrors `ay_test_support::veripb::RUSTC_KEY_INFIX`.
-const RUSTC_KEY_INFIX: &str = "-rustc";
-
-/// Whether a `~/.cache/ay-veripb` entry name denotes a build of the pinned
-/// checker: exactly the identity (legacy layout) or the identity plus a
-/// compiler fingerprint (keyed layout).
-fn is_pinned_cache_dir(name: &str, pinned_id: &str) -> bool {
-    name == pinned_id
-        || name
-            .strip_prefix(pinned_id)
-            .is_some_and(|rest| rest.starts_with(RUSTC_KEY_INFIX))
-}
-
-/// Candidate checker binaries under the shared build cache, keyed builds
-/// before the legacy unkeyed one and lexically-later fingerprints first (the
-/// order is about determinism, not preference: every match is the same pinned
-/// source, and the self-test re-proves whichever binary wins). When nothing
-/// matching exists the legacy path is still named, so a "searched:" error
-/// message points at where a build would land.
-fn pinned_cache_candidates(cache: &Path) -> Vec<PathBuf> {
-    let pinned_id = pinned_build_id();
-    let mut names: Vec<String> = std::fs::read_dir(cache)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| is_pinned_cache_dir(name, &pinned_id))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort_by(|a, b| b.cmp(a));
-    if names.is_empty() {
-        names.push(pinned_id);
-    }
-    names
-        .iter()
-        .map(|name| cache.join(name).join("target/release/veripb"))
-        .collect()
-}
-
-/// Every path a checker could be resolved from, in resolution order.
-///
-/// Pure in the environment: `env_get` is injected so the ordering and the
-/// override rules can be tested without `set_var` (which is process-global and
-/// racy under a threaded test runner).
-///
-/// An environment override that is set but does not name an existing file is a
-/// hard `Err`, never a fall-through. A typo in `VERIPB_BIN` must never silently
-/// degrade to "checker absent" — that would turn an operator mistake into a
-/// sweep-wide `Unvalidated`, which reads like a checker outage.
-pub(crate) fn candidate_paths(
-    env_get: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<PathBuf>, String> {
-    for var in CHECKER_ENV_VARS {
-        match env_get(var) {
-            // An explicitly empty override is how a caller unsets one variable
-            // without unsetting the search; skip it rather than fail on it.
-            Some(raw) if raw.is_empty() => continue,
-            Some(raw) => {
-                let candidate = PathBuf::from(raw);
-                if candidate.is_file() {
-                    return Ok(vec![candidate]);
-                }
-                return Err(format!(
-                    "${var} is set to `{}`, which is not an existing file. Unset it or \
-                     point it at the pinned VeriPB checker binary.",
-                    candidate.display()
-                ));
-            }
-            None => {}
+    #[cfg(test)]
+    fn reference(program: &Path) -> Self {
+        Self {
+            program: program.to_path_buf(),
+            arguments: &[],
         }
     }
-
-    let mut candidates = Vec::new();
-    if let Some(path) = env_get("PATH") {
-        let executable = format!("veripb{}", std::env::consts::EXE_SUFFIX);
-        if let Some(found) = std::env::split_paths(&path)
-            .map(|directory| directory.join(&executable))
-            .find(|candidate| candidate.is_file())
-        {
-            candidates.push(found);
-        }
-    }
-    if let Some(raw) = env_get(SEARCH_PATH_ENV) {
-        candidates.extend(std::env::split_paths(&raw));
-        return Ok(candidates);
-    }
-    candidates.push(PathBuf::from("/tmp/veripb-3/bin/veripb"));
-    let cache = env_get("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env_get("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    if let Some(cache) = cache {
-        let cache = cache.join("ay-veripb");
-        candidates.extend(pinned_cache_candidates(&cache));
-        // Compatibility with the original pre-pin cache layout populated by an
-        // early scripts/cert_ci.sh. The pinned paths above come first: their
-        // directory identity covers the upstream commit and the reviewed patch.
-        candidates.push(cache.join("VeriPB/target/release/veripb"));
-    }
-    if let Some(home) = env_get("HOME") {
-        candidates.push(PathBuf::from(home).join(".cargo/bin/veripb"));
-    }
-    Ok(candidates)
 }
 
-/// First candidate that exists, or an error naming every path searched.
-pub(crate) fn locate_with(env_get: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    let candidates = candidate_paths(env_get)?;
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
-        }
-    }
-    let searched: Vec<String> = candidates
-        .iter()
-        .map(|candidate| candidate.display().to_string())
-        .collect();
-    Err(format!(
-        "no VeriPB checker found. Searched, in order: {}. Build the pinned checker \
-         (scripts/ci/pb_certified_gate.sh), put `veripb` on PATH, or set VERIPB_BIN.",
-        if searched.is_empty() {
-            String::from("<nothing>")
-        } else {
-            searched.join(", ")
-        }
-    ))
-}
-
-/// [`locate_with`] over the real process environment.
-pub(crate) fn locate() -> Result<PathBuf, String> {
-    locate_with(&|key| std::env::var(key).ok())
-}
-
-/// The version string a checker reports, as the last whitespace-separated field
-/// of the last `--version` line (`veripb 3.0.2` -> `3.0.2`).
-///
-/// Spawned through [`run_cert_probe`], not `Command::output()`: this runs while
-/// the host-wide exclusive MaxSAT lease is held and must not be able to hang or
-/// to buffer unbounded output.
-///
-/// BOUNDED at the source, by the same [`DETAIL_EXCERPT_MAX`] that bounds every
-/// other checker-produced string this lane repeats. This is self-reported text
-/// from an untrusted binary and it is interpolated into three places a human
-/// reads — the startup warning, the `certificate lane:` banner and the JSON
-/// report's `checker_version` — so capping it once here covers all three.
-/// Observed: a checker printing 511-character lines.
-fn reported_version(checker: &Path) -> Option<String> {
-    let output = run_cert_probe(checker, &[OsStr::new("--version")]).ok()?;
-    let text = output.stdout + &output.stderr;
-    let field = text
-        .lines()
-        .rfind(|line| !line.trim().is_empty())?
-        .split_whitespace()
-        .next_back()?;
-    Some(excerpt(field, DETAIL_EXCERPT_MAX))
-}
-
-/// Cross-check the resolved binary against the pinned version.
-///
-/// Deliberately NON-GATING: `ci/veripb.pin` says in as many words that
-/// `--version` is not an identity ("3.0.2 has been many different checkers"),
-/// so a version mismatch is a warning, not a refusal. The gate that matters is
-/// [`self_test`], which asks the binary to behave like a checker rather than to
-/// describe itself as one.
-fn check_version(checker: &Path) -> Result<(), String> {
-    let expected = pin::version();
-    match reported_version(checker) {
-        Some(actual) if actual == expected => Ok(()),
-        Some(actual) => Err(format!(
-            "`{}` reports VeriPB version `{actual}`, but {} pins `{expected}` (commit {}). \
-             A verdict from an unpinned checker is weaker evidence than one from the pinned build.",
-            checker.display(),
-            pin::PIN_PATH,
-            pin::commit()
-        )),
-        None => Err(format!(
-            "`{}` printed no parseable `--version` output",
-            checker.display()
-        )),
-    }
-}
+/// Imported cohort identity. AY's own source revision also identifies all local
+/// integration changes; this is the original cohort, not a claim of byte identity.
+pub(crate) const IMPORTED_CHECKER_SOURCE: &str = "76491502cc031d467c02aa90d3652284b1c7a316";
 
 /// A two-variable PB optimisation instance whose optimum is exactly 1.
 const SELF_TEST_OPB: &str =
@@ -426,7 +197,7 @@ fn scratch_dir(label: &str) -> PathBuf {
 /// # Errors
 /// A description of the first failed probe, naming the verdict and exit code
 /// observed. Callers must treat it as fatal.
-pub(crate) fn self_test(checker: &Path) -> Result<(), String> {
+fn self_test_checker(checker: &CheckerCommand) -> Result<(), String> {
     let directory = scratch_dir("selftest");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("cannot create self-test directory: {error}"))?;
@@ -442,10 +213,7 @@ pub(crate) fn self_test(checker: &Path) -> Result<(), String> {
             // Bounded: a deadline, a process group, a capped capture. See
             // `run_cert_probe` — these spawns happen while the host-wide
             // exclusive MaxSAT lease is held.
-            let output = run_cert_probe(
-                checker,
-                &[OsStr::new("--opb"), opb.as_os_str(), pbp.as_os_str()],
-            )?;
+            let output = checker.probe(&[OsStr::new("--opb"), opb.as_os_str(), pbp.as_os_str()])?;
             Ok(parse_verdict(output.code, &output.stdout, 1))
         };
 
@@ -1165,11 +933,10 @@ struct Retention {
 /// first spawn and shared by every worker.
 #[derive(Debug)]
 pub(crate) struct CertPlan {
-    /// The resolved, version-checked, self-tested checker.
-    pub(crate) checker: PathBuf,
-    /// What that binary reports for `--version` (recorded in the JSON report:
-    /// a verdict from an unpinned checker is weaker evidence, and the report is
-    /// where that identity has to live).
+    /// This AY image and its integrated checker subcommand, self-tested.
+    pub(crate) checker: CheckerCommand,
+    /// The integrated library version, recorded with its imported source cohort.
+    /// AY release provenance identifies the integration changes as well.
     pub(crate) checker_version: String,
     /// Where artifacts are written.
     pub(crate) dir: PathBuf,
@@ -1199,20 +966,11 @@ impl CertPlan {
         max_instance_mib: u64,
         check_timeout: Duration,
     ) -> Result<Self, String> {
-        let checker = locate()?;
-        // Non-gating: see check_version's doc. The pin itself says `--version`
-        // is not an identity, so a mismatch is announced and the self-test
-        // decides.
-        let checker_version = match check_version(&checker) {
-            Ok(()) => pin::version().to_string(),
-            Err(why) => {
-                safe_eprintln!("c WARNING[--proof-check]: {why}");
-                reported_version(&checker).unwrap_or_else(|| String::from("<unknown>"))
-            }
-        };
-        self_test(&checker).map_err(|why| {
+        let checker = CheckerCommand::integrated()?;
+        let checker_version = format!("AY integrated VeriPB {}", ay_veripb::VERSION);
+        self_test_checker(&checker).map_err(|why| {
             format!(
-                "`{}` was resolved as the VeriPB checker but failed its self-test \
+                "`{} check veripb` failed its self-test \
                  (a real checker must verify a known-good certificate and refuse a \
                  known-bad one): {why}",
                 checker.display()
@@ -1415,7 +1173,7 @@ impl CertPlan {
 
 impl Drop for CertPlan {
     fn drop(&mut self) {
-        // Same shape as `cmd_launch.rs`'s `TempDirCleanup`, with one extra
+        // Temporary-directory cleanup with one extra
         // condition: retained artifacts are failure evidence, so a directory
         // holding any of them survives the sweep. That survival is bounded by
         // the retention caps — without them this branch is what turned a bad
@@ -1437,17 +1195,8 @@ mod tests {
 
     const BASE: &str = "reference optimum + independently verified model";
 
-    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let owned: Vec<(String, String)> = pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect();
-        move |key: &str| {
-            owned
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.clone())
-        }
+    fn self_test(checker: &Path) -> Result<(), String> {
+        self_test_checker(&CheckerCommand::reference(checker))
     }
 
     fn scratch(label: &str) -> PathBuf {
@@ -1460,7 +1209,7 @@ mod tests {
     /// arming rules and the retention ledger.
     fn test_plan(dir: &Path) -> CertPlan {
         CertPlan {
-            checker: PathBuf::from("/nonexistent/veripb"),
+            checker: CheckerCommand::reference(Path::new("/nonexistent/veripb")),
             checker_version: String::from("3.0.2"),
             dir: dir.to_path_buf(),
             owned_dir: false,
@@ -1871,9 +1620,8 @@ mod tests {
     /// line and the stderr excerpt beside it — are bounded by the same
     /// `DETAIL_EXCERPT_MAX`, so neither can swamp the other.
     ///
-    /// The `--version` string is the third such place and is bounded at its
-    /// source in `reported_version`, which is what covers the startup warning,
-    /// the `certificate lane:` banner and the report's `checker_version`.
+    /// Checker identity is compiled into AY; it no longer comes from an
+    /// external process's self-reported `--version` text.
     #[test]
     fn checker_text_is_bounded_everywhere_it_is_repeated() {
         let shout = "X".repeat(200_000);
@@ -1954,34 +1702,6 @@ mod tests {
             assert!(pbp.to_string_lossy().ends_with("case_wcnf.opb.pbp"));
         }
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn candidate_paths_treats_a_broken_override_as_an_error() {
-        let env = env_from(&[("VERIPB_BIN", "/nonexistent/veripb")]);
-        let error = candidate_paths(&env).expect_err("a set-but-missing override must be fatal");
-        assert!(error.contains("VERIPB_BIN"), "{error}");
-    }
-
-    #[test]
-    fn candidate_paths_skips_an_empty_override() {
-        let env = env_from(&[
-            ("VERIPB_BIN", ""),
-            ("PATH", "/nonexistent-path-dir"),
-            ("AY_VERIPB_SEARCH_PATH", "/nonexistent/checker"),
-        ]);
-        let paths = candidate_paths(&env).expect("an empty override falls through");
-        assert_eq!(paths, vec![PathBuf::from("/nonexistent/checker")]);
-    }
-
-    #[test]
-    fn locate_reports_every_path_it_searched() {
-        let env = env_from(&[
-            ("PATH", "/nonexistent-path-dir"),
-            ("AY_VERIPB_SEARCH_PATH", "/nonexistent/checker"),
-        ]);
-        let error = locate_with(&env).expect_err("no checker exists at that path");
-        assert!(error.contains("/nonexistent/checker"), "{error}");
     }
 
     /// Half of the non-vacuity proof: delete the GOOD probe and these two
@@ -2239,45 +1959,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// #N5: the checker's self-reported `--version` is UNTRUSTED text, and it
-    /// reaches three human-facing places (the startup warning, the
-    /// `certificate lane:` banner, the JSON report's `checker_version`).
-    /// Bounding it at the source covers all three.
-    #[cfg(unix)]
-    #[test]
-    fn a_shouting_checker_cannot_flood_the_version_string() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = scratch("version-bound");
-        let script = dir.join("shout.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nawk 'BEGIN{s=\"\";while(length(s)<511)s=s \"V\";print s}'\nexit 0\n",
-        )
-        .expect("write script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let reported = reported_version(&script).expect("the stub prints a parseable field");
-        // A LITERAL, and a TIGHT one. `DETAIL_EXCERPT_MAX + 3` would be
-        // self-referential; 512 would be loose enough for the observed
-        // 511-character line to slip through, which is the exact case this
-        // test exists for.
-        assert!(
-            reported.chars().count() < 256,
-            "an unbounded version string ({} chars) reached the banner and the report",
-            reported.chars().count()
-        );
-        // The cross-check must still fail loudly rather than accept it.
-        let error = check_version(&script).expect_err("511 `V`s is not the pinned version");
-        assert!(
-            error.chars().count() < 1024,
-            "the warning itself was unbounded: {} chars",
-            error.chars().count()
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     /// Retention is BOUNDED. `Unusable` is systemic — a checker that vanished
     /// makes every armed row unchecked — so "keep every failure" is the
     /// multi-GB blowup this lane exists to avoid. Past the cap, artifacts are
@@ -2469,41 +2150,6 @@ mod tests {
         std::fs::write(&pbp, "pbp\n").expect("write");
         assert!(precheck_artifacts(&opb, &pbp).is_none());
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// One pin, one identity. A copied or stale `include_str!` target, or a
-    /// reader that mishandles the `#` comment block at the top of the file,
-    /// shows up here.
-    #[test]
-    fn pin_reader_agrees_with_ay_test_support() {
-        assert_eq!(pin::commit(), ay_test_support::veripb::pin::commit());
-        assert_eq!(pin::version(), ay_test_support::veripb::pin::version());
-        assert_eq!(
-            pin::patch_sha256(),
-            ay_test_support::veripb::pin::patch_sha256()
-        );
-        assert_eq!(pin::commit().len(), 40);
-        // The cache-key contract is one identity too: this lane's copy must
-        // resolve exactly the directories the shared resolver resolves (the
-        // shell-side format is pinned against test-support's copy by the
-        // executable `shell_and_rust_agree_on_the_cache_key`).
-        assert_eq!(
-            pinned_build_id(),
-            ay_test_support::veripb::pinned_build_id()
-        );
-        assert_eq!(RUSTC_KEY_INFIX, ay_test_support::veripb::RUSTC_KEY_INFIX);
-        for name in [
-            pinned_build_id(),
-            format!("{}-rustc1.99.0-dev-acb08e7616", pinned_build_id()),
-            format!("{}-other", pinned_build_id()),
-            format!("{}x", pinned_build_id()),
-        ] {
-            assert_eq!(
-                is_pinned_cache_dir(&name, &pinned_build_id()),
-                ay_test_support::veripb::is_pinned_cache_dir(&name, &pinned_build_id()),
-                "the two resolvers disagree on `{name}`"
-            );
-        }
     }
 
     /// End to end against the REAL pinned checker: emit a certificate the way

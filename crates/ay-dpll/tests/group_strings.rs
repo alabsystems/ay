@@ -8,17 +8,27 @@
 #![allow(clippy::panic)]
 
 mod common;
+#[path = "group_strings/sequence_power_parameters.rs"]
+mod sequence_power_parameters;
 
 #[path = "group_strings/char_theory.rs"]
 mod char_theory;
+#[path = "group_strings/empty_eqc_normal_form.rs"]
+mod empty_eqc_normal_form;
 #[path = "group_strings/false_sat_indexof_int_var.rs"]
 mod false_sat_indexof_int_var;
 #[path = "group_strings/false_sat_isdigit_ground_6263.rs"]
 mod false_sat_isdigit_ground_6263;
 #[path = "group_strings/false_sat_str_code_6263.rs"]
 mod false_sat_str_code_6263;
+#[path = "group_strings/membership_concat_member_value.rs"]
+mod membership_concat_member_value;
 #[path = "group_strings/membership_through_concat.rs"]
 mod membership_through_concat;
+#[path = "group_strings/regex_ground_equality.rs"]
+mod regex_ground_equality;
+#[path = "group_strings/regex_length_false_unsat.rs"]
+mod regex_length_false_unsat;
 #[path = "group_strings/seq_assumptions_5994.rs"]
 mod seq_assumptions_5994;
 #[path = "group_strings/seq_pairwise_compat.rs"]
@@ -29,6 +39,8 @@ mod seq_prefixof_6035;
 mod seq_soundness_5841;
 #[path = "group_strings/seq_theory_5841.rs"]
 mod seq_theory_5841;
+#[path = "group_strings/seq_witness_completion.rs"]
+mod seq_witness_completion;
 #[path = "group_strings/slia_bridge_contradictory_value.rs"]
 mod slia_bridge_contradictory_value;
 #[path = "group_strings/slia_incompleteness_6263.rs"]

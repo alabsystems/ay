@@ -371,35 +371,12 @@ fn test_fp_max_second_arg_nan() {
 // Encoding Gap Guard Tests (#3586)
 // =========================================================================
 //
-// When an FP-sorted ITE has a non-FP condition (e.g., a BV comparison) that
-// is not in the Tseitin map, the FP solver cannot link the condition to the
-// SAT solver's variable. Previously this created a fresh unconstrained
-// variable (false-SAT risk). Now it sets an encoding gap flag and returns
-// Unknown.
-
-/// FP-sorted ITE with non-FP condition: BV comparison as ITE condition.
-/// The BV comparison (bvugt) is not an FP predicate and not in the Tseitin
-/// map (only appears inside the FP-sorted ITE, not at the Bool level).
-/// The solver cannot link the BV condition to the FP SAT encoding, so it
-/// must return Unknown rather than producing a potentially unsound result.
-#[test]
-#[timeout(30_000)]
-fn test_fp_ite_non_fp_condition_returns_unknown() {
-    let smt = r#"
-        (set-logic QF_BVFP)
-        (declare-const x (_ BitVec 8))
-        (declare-const a (_ FloatingPoint 8 24))
-        (declare-const b (_ FloatingPoint 8 24))
-        (assert (fp.lt (ite (bvugt x #x05) a b) a))
-        (check-sat)
-    "#;
-    let outputs = crate::common::solve_vec(smt);
-    assert_eq!(
-        outputs,
-        vec!["unknown"],
-        "non-FP ITE condition not in Tseitin map — must return unknown"
-    );
-}
+// When an FP-sorted ITE has a condition that is not in the Tseitin map and
+// that the FP solver cannot encode itself (Int/Real arithmetic, an
+// uninterpreted predicate), it sets an encoding gap flag and returns Unknown
+// instead of using a fresh unconstrained variable (false-SAT risk). A BV
+// relational guard is encoded as its exact comparator circuit; its tests,
+// formerly here as unknown-expecting, are in `fp_hidden_bv_conditions`.
 
 // =========================================================================
 // FP ITE Encoding Gap Adversarial Tests (P1:127)
@@ -469,29 +446,6 @@ fn test_fp_ite_fp_condition_resolves_normally() {
     assert!(
         outputs == vec!["sat"] || outputs == vec!["unknown"],
         "FP ITE with FP predicate condition should resolve normally, got: {outputs:?}"
-    );
-}
-
-/// Two FP ITEs: one with resolvable FP condition, one with non-FP BV condition.
-/// The non-FP condition should trigger the encoding gap for the entire formula.
-#[test]
-#[timeout(30_000)]
-fn test_fp_ite_mixed_conditions_one_gap_returns_unknown() {
-    let smt = r#"
-        (set-logic QF_BVFP)
-        (declare-const x (_ BitVec 8))
-        (declare-const a (_ FloatingPoint 8 24))
-        (declare-const b (_ FloatingPoint 8 24))
-        (declare-const c (_ FloatingPoint 8 24))
-        (assert (fp.lt (ite (fp.lt a b) a c) b))
-        (assert (fp.eq (ite (bvugt x #x05) a b) c))
-        (check-sat)
-    "#;
-    let outputs = crate::common::solve_vec(smt);
-    assert_eq!(
-        outputs,
-        vec!["unknown"],
-        "Mixed FP/non-FP ITE conditions: any non-FP gap forces unknown"
     );
 }
 

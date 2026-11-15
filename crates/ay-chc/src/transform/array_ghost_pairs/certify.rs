@@ -28,6 +28,9 @@
 //! is [`GhostPairCertificate::certify_and_seal`], which runs the full per-rule
 //! discharge above on every original clause.
 
+mod quantified;
+pub(crate) use quantified::{try_quantified_source, QuantifiedSourceCertificate};
+
 use std::sync::Arc;
 use std::time::Duration;
 // The workspace-wide monotonic clock shim (#wasm port): byte-identical to
@@ -69,6 +72,12 @@ const MIN_EXECUTOR_BUDGET: Duration = Duration::from_millis(1);
 /// full per-rule discharge on the ORIGINAL clauses (`certify_and_seal`).
 #[derive(Debug, Clone)]
 pub(crate) struct GhostPairCertificate {
+    checked: GhostPairModel,
+}
+
+/// Private interpretation data, not a certificate or proof authority.
+#[derive(Debug, Clone)]
+struct GhostPairModel {
     spec: GhostPairSpec,
     model: InvariantModel,
     /// Per-executor term-store ceiling used by the raw quantified executor.
@@ -101,13 +110,13 @@ impl GhostPairCertificate {
         total_budget: Option<Duration>,
         executor_term_memory_limit: Option<usize>,
     ) -> Option<Arc<Self>> {
-        let candidate = Self {
+        let candidate = GhostPairModel {
             spec,
             model,
             executor_term_memory_limit,
         };
         if discharge_all(problem, &candidate, total_budget, false) {
-            Some(Arc::new(candidate))
+            Some(Arc::new(Self { checked: candidate }))
         } else {
             None
         }
@@ -116,7 +125,7 @@ impl GhostPairCertificate {
     /// Number of ghost pairs per instrumented array argument.
     #[cfg(test)]
     pub(crate) fn ghost_pairs_per_array(&self) -> usize {
-        self.spec.n
+        self.checked.spec.n
     }
 
     /// Ghost interpretation retained by this sealed certificate.
@@ -125,7 +134,7 @@ impl GhostPairCertificate {
         &self,
         pred_id: PredicateId,
     ) -> Option<&PredicateInterpretation> {
-        self.model.get(&pred_id)
+        self.checked.model.get(&pred_id)
     }
 }
 
@@ -140,12 +149,23 @@ pub(crate) fn recheck_ghost_pair_certificate(
     total_budget: Option<Duration>,
     query_only: bool,
 ) -> bool {
-    discharge_all(problem, certificate, total_budget, query_only)
+    // Inside a CHC proof run under an effort the quantified discharge is
+    // closed, as BMC is (`BmcSolver::closed_under_effort`, P4a slice 8), and
+    // counted in `ChcRunWork::closed_route_checks`: it runs on the executor
+    // against a wall budget, outside the run's count, so its answer would be
+    // the host's. Not re-checked: the model is not validated. Without an
+    // effort this reads `false` and counts nothing.
+    if crate::run_meter::close_route() {
+        return false;
+    }
+    // INV-S2 (#horn-smt-session §7.2): certificate re-check, never a session.
+    let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+    discharge_all(problem, &certificate.checked, total_budget, query_only)
 }
 
 fn discharge_all(
     problem: &ChcProblem,
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     total_budget: Option<Duration>,
     query_only: bool,
 ) -> bool {
@@ -153,50 +173,10 @@ fn discharge_all(
     // construction, not only time spent inside the two solver rounds.
     let deadline = total_budget.map(|budget| Instant::now() + budget);
 
-    // Structural gate: every predicate needs an interpretation over exactly
-    // the ghost-extended parameter list, with no free non-parameter variables
-    // (free variables would be captured by clause variables during
-    // substitution, turning discharge queries vacuous).
-    for pred in problem.predicates() {
-        if deadline.is_some_and(|limit| Instant::now() >= limit) {
-            return false;
-        }
-        let Some(interp) = cert.model.get(&pred.id) else {
-            return false;
-        };
-        let Some(expected_sorts) = cert.spec.extended_sorts(pred.id, &pred.arg_sorts) else {
-            return false;
-        };
-        if interp.vars.len() != expected_sorts.len()
-            || interp
-                .vars
-                .iter()
-                .zip(&expected_sorts)
-                .any(|(var, expected)| var.sort != *expected)
-        {
-            return false;
-        }
-        let mut param_names: FxHashSet<&str> = FxHashSet::default();
-        if interp
-            .vars
-            .iter()
-            .any(|var| !param_names.insert(var.name.as_str()))
-        {
-            return false;
-        }
-        let params: FxHashSet<ChcVar> = interp.vars.iter().cloned().collect();
-        let Some(formula_vars) = certificate_formula_vars(&interp.formula) else {
-            return false;
-        };
-        if formula_vars.iter().any(|var| !params.contains(var)) {
-            return false;
-        }
-        if !matches!(
-            crate::pdr::validate_qf_expression(problem, &interp.vars, &interp.formula),
-            Ok(crate::ChcSort::Bool)
-        ) {
-            return false;
-        }
+    if !validate_interpretation(problem, cert, || {
+        deadline.is_some_and(|limit| Instant::now() >= limit)
+    }) {
+        return false;
     }
 
     let clauses: Vec<&HornClause> = problem
@@ -251,6 +231,60 @@ fn discharge_all(
     !deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
+fn validate_interpretation(
+    problem: &ChcProblem,
+    cert: &GhostPairModel,
+    should_stop: impl Fn() -> bool,
+) -> bool {
+    // Structural gate: every predicate needs an interpretation over exactly
+    // the ghost-extended parameter list, with no free non-parameter variables
+    // (free variables would be captured by clause variables during
+    // substitution, turning discharge queries vacuous).
+    for pred in problem.predicates() {
+        if should_stop() {
+            return false;
+        }
+        let Some(interp) = cert.model.get(&pred.id) else {
+            return false;
+        };
+        let Some(expected_sorts) = cert.spec.extended_sorts(pred.id, &pred.arg_sorts) else {
+            return false;
+        };
+        if interp.vars.len() != expected_sorts.len()
+            || interp
+                .vars
+                .iter()
+                .zip(&expected_sorts)
+                .any(|(var, expected)| var.sort != *expected)
+        {
+            return false;
+        }
+        let mut param_names: FxHashSet<&str> = FxHashSet::default();
+        if interp
+            .vars
+            .iter()
+            .any(|var| !param_names.insert(var.name.as_str()))
+        {
+            return false;
+        }
+        let params: FxHashSet<ChcVar> = interp.vars.iter().cloned().collect();
+        let Some(formula_vars) = certificate_formula_vars(&interp.formula) else {
+            return false;
+        };
+        if formula_vars.iter().any(|var| !params.contains(var)) {
+            return false;
+        }
+        if !matches!(
+            crate::pdr::validate_qf_expression(problem, &interp.vars, &interp.formula),
+            Ok(crate::ChcSort::Bool)
+        ) {
+            return false;
+        }
+    }
+
+    !should_stop()
+}
+
 /// Divide the remaining envelope fairly among the clauses still waiting.
 ///
 /// Recomputing after every successful clause lets cheap obligations donate
@@ -287,7 +321,7 @@ fn remaining_until(deadline: Instant) -> Option<Duration> {
 /// certificate skolems or quantified binders. SMT-LIB binders shadow nullary
 /// UFs in the term namespace, which would otherwise change the obligation.
 fn reserve_global_function_names(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     used: &mut FxHashSet<String>,
 ) -> Option<()> {
@@ -315,7 +349,7 @@ fn reserve_global_function_names(
 
 /// Collect every variable at the certificate boundary, failing closed instead
 /// of accepting the best-effort truncation used by general-purpose `vars()`.
-fn certificate_formula_vars(expr: &ChcExpr) -> Option<FxHashSet<ChcVar>> {
+pub(super) fn certificate_formula_vars(expr: &ChcExpr) -> Option<FxHashSet<ChcVar>> {
     let mut remaining = crate::expr::MAX_PREPROCESSING_NODES;
     let mut vars = FxHashSet::default();
     collect_certificate_vars(expr, 0, &mut remaining, &mut vars)?;
@@ -367,6 +401,7 @@ fn collect_certificate_vars(
     *remaining -= 1;
     crate::expr::maybe_grow_expr_stack(|| {
         match expr {
+            ChcExpr::ArrayLambda(_) => return None,
             ChcExpr::Var(var) => {
                 vars.insert(var.clone());
             }
@@ -412,6 +447,7 @@ fn substitute_certificate_expr(
     *remaining -= 1;
     crate::expr::maybe_grow_expr_stack(|| {
         Some(match expr {
+            ChcExpr::ArrayLambda(_) => return None,
             ChcExpr::Var(var) => subst
                 .get(var)
                 .map_or_else(|| expr.clone(), |replacement| (**replacement).clone()),
@@ -463,7 +499,7 @@ fn substitute_certificate_expr(
 /// Instantiate the certificate's interpretation of `pred_id` applied to
 /// `args`, probing the ghost slots at `ghost_idx_terms`.
 fn instantiate_interp(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     pred_id: PredicateId,
     args: &[ChcExpr],
     ghost_idx_terms: &[ChcExpr],
@@ -489,7 +525,7 @@ fn instantiate_interp(
 /// for `false` heads) plus the fresh skolem variables, or `None` when the
 /// certificate does not structurally cover the head predicate.
 fn skolemize_head(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     used: &mut FxHashSet<String>,
 ) -> Option<(Option<ChcExpr>, Vec<ChcVar>)> {
@@ -538,7 +574,7 @@ fn has_exact_forwarding_contradiction(
 /// Build and boundedly simplify one original-clause obligation without
 /// launching a solver. `None` means structural/resource failure.
 fn prepare_clause_discharge(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     deadline: Instant,
 ) -> Option<PreparedClauseDischarge> {
@@ -584,6 +620,8 @@ fn prepare_clause_discharge(
         head_negation.as_ref(),
         &mut quantified_used,
         &instances,
+        &[],
+        None,
     )?;
 
     // Pure forwarding rules commonly produce an exact `I(k) /\ !I(k)` pair.
@@ -608,7 +646,7 @@ fn prepare_clause_discharge(
 /// Return `Some(true)` for a bounded syntactic discharge, `Some(false)` when
 /// solver work remains, and `None` on structural/resource failure.
 fn preclassify_clause(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     deadline: Instant,
 ) -> Option<bool> {
@@ -621,7 +659,7 @@ fn preclassify_clause(
 /// retaining every generated formula/string until classification completed
 /// would turn a bounded 512-clause input into a second unaccounted corpus-sized
 /// memory resident set.
-fn discharge_clause(cert: &GhostPairCertificate, clause: &HornClause, deadline: Instant) -> bool {
+fn discharge_clause(cert: &GhostPairModel, clause: &HornClause, deadline: Instant) -> bool {
     let Some(prepared) = prepare_clause_discharge(cert, clause, deadline) else {
         return false;
     };
@@ -647,7 +685,12 @@ fn discharge_clause(cert: &GhostPairCertificate, clause: &HornClause, deadline: 
     // Rechecks can run after the route's thread-local guard has unwound. Carry
     // the sealed certificate's own budget into both this context and any
     // ay-dpll executor fallback it launches.
-    smt.set_term_memory_budget(cert.executor_term_memory_limit);
+    smt.set_term_memory_budget(
+        smt.term_memory_budget
+            .into_iter()
+            .chain(cert.executor_term_memory_limit)
+            .min(),
+    );
     if matches!(
         smt.check_sat_with_executor_fallback_timeout(&finite_query, round1_budget),
         SmtResult::Unsat
@@ -673,7 +716,7 @@ fn discharge_clause(cert: &GhostPairCertificate, clause: &HornClause, deadline: 
 /// conjuncts are a sound weakening of the quantified body. `None` when the
 /// certificate does not structurally cover a body atom.
 fn body_instance_conjuncts(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     fresh_exprs: &[ChcExpr],
     cands: &[ChcExpr],
@@ -702,7 +745,7 @@ fn body_instance_conjuncts(
 
 /// Reconstruct the ordinary UF declarations shared by one replay obligation.
 fn replay_uf_declarations(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     clause_vars: &[ChcVar],
     fresh_vars: &[ChcVar],
@@ -738,7 +781,7 @@ fn replay_uf_declarations(
 }
 
 fn quantified_body_instances(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     used: &mut FxHashSet<String>,
 ) -> Option<Vec<(Vec<ChcVar>, ChcExpr)>> {
@@ -793,13 +836,15 @@ fn emit_quantified_body_instances(smt: &mut String, body_instances: &[(Vec<ChcVa
 /// Returns `None` when the certificate does not structurally cover a body
 /// atom (fail-closed at the caller).
 fn quantified_discharge_smtlib(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause: &HornClause,
     clause_vars: &[ChcVar],
     fresh_vars: &[ChcVar],
     head_negation: Option<&ChcExpr>,
     used: &mut FxHashSet<String>,
     instance_hints: &[ChcExpr],
+    source_premises: &[crate::quantified::UniversalPremise],
+    source_control: Option<&super::source_premises::SourceControl<'_>>,
 ) -> Option<String> {
     let mut smt = String::with_capacity(2048);
     smt.push_str("(set-logic ALL)\n");
@@ -832,6 +877,28 @@ fn quantified_discharge_smtlib(
     emitted_expressions.extend(instance_hints);
     emitted_expressions.extend(cert.model.iter().map(|(_, interp)| &interp.formula));
     emitted_expressions.extend(body_instances.iter().map(|(_, instance)| instance));
+    if let Some(control) = source_control {
+        let mut bytes = 1024usize;
+        for expression in &emitted_expressions {
+            super::source_premises::preflight(expression, control, &mut bytes)?;
+        }
+        for premise in source_premises {
+            super::source_premises::preflight(premise.matrix(), control, &mut bytes)?;
+        }
+        for var in clause_vars
+            .iter()
+            .chain(fresh_vars.iter())
+            .chain(source_premises.iter().flat_map(|premise| premise.binders()))
+            .chain(body_instances.iter().flat_map(|(vars, _)| vars.iter()))
+        {
+            let name_bytes = var.name.len().checked_mul(4)?.checked_add(256)?;
+            bytes = bytes.checked_add(name_bytes)?;
+            control.bytes(name_bytes)?;
+        }
+        if bytes > super::source_premises::MAX_REPLAY_BYTES {
+            return None;
+        }
+    }
 
     for sort_name in certificate_uninterpreted_sort_names(
         cert,
@@ -862,6 +929,14 @@ fn quantified_discharge_smtlib(
         ));
     }
 
+    // These are original background-theory premises, not inferred invariants.
+    for premise in source_premises {
+        let binders = super::source_premises::binder_list(premise, source_control)?;
+        smt.push_str(&format!(
+            "(assert (forall ({binders}) {}))\n",
+            InvariantModel::expr_to_smtlib(premise.matrix())
+        ));
+    }
     emit_quantified_body_instances(&mut smt, &body_instances);
 
     if !instance_hints.is_empty() {
@@ -888,7 +963,7 @@ fn quantified_discharge_smtlib(
 }
 
 fn certificate_uninterpreted_sort_names(
-    cert: &GhostPairCertificate,
+    cert: &GhostPairModel,
     clause_vars: &[ChcVar],
     fresh_vars: &[ChcVar],
     declarations: &[UninterpretedFunctionDeclaration],
@@ -934,6 +1009,7 @@ fn collect_expression_uninterpreted_sort_names(
     *remaining -= 1;
     crate::expr::maybe_grow_expr_stack(|| {
         match expr {
+            ChcExpr::ArrayLambda(_) => return None,
             ChcExpr::Var(var) => collect_uninterpreted_sort_names(&var.sort, names)?,
             ChcExpr::FuncApp(_, sort, args) => {
                 collect_uninterpreted_sort_names(sort, names)?;
@@ -1027,8 +1103,9 @@ fn is_predeclared_sort_name(name: &str) -> bool {
 /// cannot hit this; it guards against model/problem mismatch).
 pub(crate) fn ghost_pair_replay_obligations(
     problem: &ChcProblem,
-    cert: &GhostPairCertificate,
+    certificate: &GhostPairCertificate,
 ) -> crate::ChcResult<Vec<crate::ChcReplayObligation>> {
+    let cert = &certificate.checked;
     use std::fmt::Write;
 
     use crate::{ChcError, ChcReplayObligation, ChcReplayObligationKind};
@@ -1078,6 +1155,8 @@ pub(crate) fn ghost_pair_replay_obligations(
                 head_negation.as_ref(),
                 &mut used,
                 &instance_hints,
+                &[],
+                None,
             )
             .ok_or_else(structural_error)?;
             smtlib.push_str(&body);

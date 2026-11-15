@@ -93,8 +93,8 @@ fn z3_500_tilde_is_exactly_unary_minus() {
         .iter()
         .all(|&assertion| ctx.terms.is_true(assertion)));
 
+    assert!(parse("(assert (~))").is_err());
     for invalid in [
-        "(assert (~))",
         "(assert (= (~ 1 2) 0))",
         "(assert (= (~ \"x\") 0))",
         "(set-option :int-real-coercions false)(assert (= (~ true) (- 1)))",
@@ -332,9 +332,10 @@ fn test_define_fun_real_sort_coerces_int_numeral() {
 // `^` (power) operator over Int/Real (#8731)
 // ---------------------------------------------------------------------------
 
-/// `(^ base 0)` must elaborate to the multiplicative identity in the base's
-/// sort. For an Int base the result is the Int literal `1`; for a Real base
-/// the result is the Real literal `1.0`.
+/// `(^ base 0)` folds to the multiplicative identity only for a nonzero
+/// numeral base: libz3 5.1.0 keeps `0^0` as the uninterpreted `^0` and
+/// answers `(= r (^ 0.0 0.0)) (not (= r 1.0))` `sat`, so `(^ x 0)` over a
+/// symbolic `x` is not `1` (T5 P0.2 Q7; see `app/arithmetic_power_zero_tests`).
 #[test]
 fn test_elaborate_power_zero_exponent_real_base() {
     let input = r#"
@@ -347,12 +348,10 @@ fn test_elaborate_power_zero_exponent_real_base() {
     for cmd in &commands {
         ctx.process_command(cmd).unwrap();
     }
-    // `(^ x 0) = 1.0` folds to `(= 1.0 1.0)` which further folds to `true`,
-    // so the assertion is trivially true.
     assert_eq!(ctx.assertions.len(), 1);
     assert!(
-        ctx.terms.is_true(ctx.assertions[0]),
-        "(^ x 0) = 1.0 must constant-fold to true"
+        !ctx.terms.is_true(ctx.assertions[0]),
+        "(^ x 0) = 1.0 must not fold: x may be 0"
     );
 }
 

@@ -113,6 +113,17 @@ impl Executor {
                         index,
                         clause,
                     )
+                })
+                // #false-disjunct-canonical: last resort, reached only when
+                // every planner above declined (`plan_canonical_false_disjunct`).
+                .or_else(|| {
+                    self.plan_canonical_false_disjunct(
+                        clause,
+                        input.originals,
+                        input.source_index,
+                        authority.planning_budget(),
+                    )
+                    .map(RecognizedTrustPlan::ProvenanceOr)
                 });
             let Some(recognized) = recognized else {
                 return false;

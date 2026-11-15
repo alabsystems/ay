@@ -51,16 +51,49 @@
 //!
 //! When the folded term is not a printed conjunct of the authored spelling at
 //! all — the surviving conjunct is itself re-spelled by canonicalization, e.g.
-//! `(and (=> p q) (= x x))` folding to `(or (not p) q)` — no `and_pos` index
-//! exists and the bridge falls back to ONE visible, countable `hole` for that
-//! single equivalence. That is the repo's honest escape hatch: carcara reports
-//! the document *holey* instead of *invalid*, `printed_unproved_steps` counts
-//! the hole, and the certificate stamp reads `trust_free=no`. A claim AY cannot
-//! discharge is never published as one it can.
+//! `(and (> x 3) (= x x))` folding to `(< 3 x)` — the bridge projects the
+//! first conjunct the authored-assume equivalence engine proves equal to the
+//! canonical term (`comp_simplify` here) and resolves through `equiv_pos2`:
+//!
+//! ```text
+//! (assume t0.a (and (> x 3) (= x x)))
+//! (step t0.p (cl (not (and (> x 3) (= x x))) (> x 3)) :rule and_pos :args (0))
+//! (step t0.o (cl (> x 3)) :rule resolution :premises (t0.a t0.p))
+//! (step t0.n (cl (= (> x 3) (< 3 x))) :rule comp_simplify)
+//! (step t0.e (cl (not (= (> x 3) (< 3 x))) (not (> x 3)) (< 3 x)) :rule equiv_pos2)
+//! (step t0 (cl (< 3 x)) :rule resolution :premises (t0.e t0.n t0.o))
+//! ```
+//!
+//! Only when no conjunct bridges does it fall back to ONE visible, countable
+//! `hole` for that single equivalence. That is the repo's honest escape hatch:
+//! carcara reports the document *holey* instead of *invalid*,
+//! `printed_unproved_steps` counts the hole, and the certificate stamp reads
+//! `trust_free=no`. A claim AY cannot discharge is never published as one it
+//! can.
+//!
+//! # The wire view
+//!
+//! Every planned term also leaves the downstream wire-rule channel
+//! (`wire_term_overrides`), exactly as the equivalence planner's commit does,
+//! and `planned_wire_term_overrides` runs this planner too. Before that, a
+//! theory lemma over the folded term was judged over the AUTHORED conjunction
+//! while the document printed the canonical atom. MEASURED at `2c356fd15` on
+//! `(assert (and (< (+ x y) 3) true))` + `(assert (and (>= x 2) (>= y 2)))`:
+//! the Farkas lemma `(cl (not (<= 2 x)) (not (<= 2 y)) (not (< (+ x y) 3)))`
+//! printed as `:rule hole` (`unproved_steps=1`, carcara `holey`), while the
+//! same query without the `true` conjunct printed a checked `la_generic`.
 
 use super::{AlethePrinter, PrintedNesting, PRINTED_NESTING_NODE_BUDGET};
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Proof, ProofId, ProofStep, Symbol, TermData, TermId};
+
+/// How a projected conjunct yields the canonical term.
+pub(super) enum ConjunctBridge {
+    /// Steps concluding `(= conjunct canonical)`.
+    Equivalence(Vec<String>),
+    /// One unit `la_generic` step `(cl (not conjunct) canonical)`.
+    LinearImplication,
+}
 
 /// Cap the planning scan. Override tables are already bounded by the collector
 /// (`surface_override_map_is_bounded`); this is the printer's own belt.
@@ -118,7 +151,7 @@ impl AlethePrinter<'_> {
                 // — it is present in every proof, so it must be named here and
                 // not left to the wildcard below.
                 ProofStep::Assume(_) => {}
-                ProofStep::TheoryLemma { .. } => {}
+                ProofStep::TheoryLemma { .. } | ProofStep::NraSos { .. } => {}
                 // `ProofStep` is #[non_exhaustive], so this crate CANNOT match it
                 // exhaustively — the compiler requires a wildcard. That makes the
                 // wildcard's polarity load-bearing: treating an unknown variant as
@@ -217,7 +250,15 @@ impl AlethePrinter<'_> {
                 }
             }
             renderings.insert(term, folded);
+            // The folded rendering is what every step prints, so the wire
+            // rules judge that text too.
+            if let Some(wire) = self.wire_term_overrides.borrow_mut().as_mut() {
+                wire.remove(&term);
+            }
         }
+        drop((renderings, surfaces, bridged));
+        // A rendering cached while planning read the authored spelling.
+        self.format_cache.borrow_mut().clear();
     }
 
     /// Emit the bridge for an `assume` whose authored conjunction folded.
@@ -247,6 +288,33 @@ impl AlethePrinter<'_> {
                  (step {id} (cl {folded}) :rule resolution :premises ({premise_id} {gate_id}))"
             ));
         }
+        let equality_id = format!("{id}.n");
+        if let Some((index, conjunct, bridge)) =
+            self.folded_conjunct_bridge(&equality_id, &surface, &folded, term)
+        {
+            let conjunct_id = format!("{id}.o");
+            let projection = format!(
+                "(assume {premise_id} {surface})\n\
+                 (step {gate_id} (cl (not {surface}) {conjunct}) :rule and_pos :args ({index}))\n\
+                 (step {conjunct_id} (cl {conjunct}) :rule resolution :premises ({premise_id} {gate_id}))"
+            );
+            return Some(match bridge {
+                ConjunctBridge::Equivalence(equality_steps) => {
+                    let equality = format!("(= {conjunct} {folded})");
+                    format!(
+                        "{projection}\n{}\n\
+                         (step {id}.e (cl (not {equality}) (not {conjunct}) {folded}) :rule equiv_pos2)\n\
+                         (step {id} (cl {folded}) :rule resolution :premises ({id}.e {equality_id} {conjunct_id}))",
+                        equality_steps.join("\n")
+                    )
+                }
+                ConjunctBridge::LinearImplication => format!(
+                    "{projection}\n\
+                     (step {id}.l (cl (not {conjunct}) {folded}) :rule la_generic :args (1 1))\n\
+                     (step {id} (cl {folded}) :rule resolution :premises ({id}.l {conjunct_id}))"
+                ),
+            });
+        }
         // No `and_pos` index exists over the PRINTED conjunction. Say so: one
         // hole, countable by `printed_unproved_steps`, rather than a step that
         // claims a derivation the document does not contain.
@@ -254,6 +322,90 @@ impl AlethePrinter<'_> {
             "(assume {premise_id} {surface})\n\
              (step {id} (cl {folded}) :rule hole :premises ({premise_id}))"
         ))
+    }
+
+    /// The first operand of the flat printed conjunction `surface` that
+    /// yields the canonical `term`, with its index and how: `refl` when
+    /// carcara's `alpha_equiv` identifies the two texts (equality operand
+    /// order), the authored-assume equivalence engine's steps concluding
+    /// `(= operand folded)` under `id`, or the checked unit `la_generic`
+    /// implication between two arithmetic comparisons (`(< y 2.5)` against
+    /// the canonical `(< y (/ 5.0 2.0))`).
+    ///
+    /// All of these read the override-free rendering of `term`, so a document
+    /// that renders the term differently (a descendant keeps its own spelling)
+    /// gets no bridge here.
+    pub(super) fn folded_conjunct_bridge(
+        &self,
+        id: &str,
+        surface: &str,
+        folded: &str,
+        term: TermId,
+    ) -> Option<(usize, String, ConjunctBridge)> {
+        /// Operands one projection may try.
+        const MAX_PROJECTED_CONJUNCTS: usize = 64;
+        if crate::render_term_canonical(self.terms, term) != folded {
+            return None;
+        }
+        let operands =
+            super::split_alethe_application_bounded(surface, "and", surface.len(), surface.len())
+                .ok()?;
+        operands
+            .iter()
+            .take(MAX_PROJECTED_CONJUNCTS)
+            .enumerate()
+            .find_map(|(index, operand)| {
+                let bridge =
+                    if super::quantifier_surface::printed_terms_alpha_equivalent(operand, folded) {
+                        ConjunctBridge::Equivalence(vec![format!(
+                            "(step {id} (cl (= {operand} {folded})) :rule refl)"
+                        )])
+                    } else if crate::printed_la_generic_unit_implication_is_supported(
+                        operand, folded,
+                    ) {
+                        ConjunctBridge::LinearImplication
+                    } else {
+                        let mut steps = Vec::new();
+                        if !self.authored_equivalence(id, operand, term, &mut 0, &mut steps) {
+                            return None;
+                        }
+                        ConjunctBridge::Equivalence(steps)
+                    };
+                Some((index, (*operand).to_string(), bridge))
+            })
+    }
+
+    /// Whether the folded-conjunction bridge above derives the canonical
+    /// `term` from its authored conjunction `surface` without a `hole`: a
+    /// conjunction over a term that is none, with an operand that is the
+    /// canonical text (directly or through nested conjunctions) or that the
+    /// equivalence engine bridges to it. Read over the override-free
+    /// rendering, as a producer preflight sees it.
+    pub(super) fn folded_conjunction_projection_supported(
+        &self,
+        term: TermId,
+        surface: &str,
+    ) -> bool {
+        if matches!(
+            self.terms.get(term),
+            TermData::App(Symbol::Named(head), _) if head == "and"
+        ) {
+            return false;
+        }
+        let Some(nesting) = PrintedNesting::build(surface, "and", PRINTED_NESTING_NODE_BUDGET)
+        else {
+            return false;
+        };
+        if nesting.operands.first().map_or(0, Vec::len) < 2 {
+            return false;
+        }
+        let folded = crate::render_term_canonical(self.terms, term);
+        self.flat_folded_and_projection("probe", surface, &folded)
+            .or_else(|| self.navigate_and_pos_gate("probe", surface, &folded))
+            .is_some()
+            || self
+                .folded_conjunct_bridge("probe", surface, &folded, term)
+                .is_some()
     }
 
     /// `and_pos` off a FLAT printed conjunction, first matching operand wins.

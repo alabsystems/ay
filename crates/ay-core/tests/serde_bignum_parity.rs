@@ -20,6 +20,8 @@
 //! The fixture was captured by running this same file against the incumbent —
 //! `num-bigint/serde` and `num-rational/serde` enabled, no local codec. Every
 //! expected value here is therefore OBSERVED, never invented.
+//! The extensible Constant variant-list prose is excluded from exact message
+//! equality; its unknown identity, rejection category and location stay checked.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -826,6 +828,26 @@ fn parity_with_incumbent_is_exact() {
                 assert_eq!(gre, lre, "re-encoding drifted for {}: {}", g.name, g.note);
             }
             (Outcome::Reject { message: gm, .. }, Outcome::Reject { message: lm, .. }) => {
+                if g.name == "decode/x/unknown_variant" {
+                    // Constant is extensible: a new supported variant changes
+                    // this prose list without changing the rejected fault.
+                    // Keep the actual unknown identity, category and location;
+                    // all bignum payload fault/precedence messages stay exact.
+                    let fault = "unknown variant `Nope`, expected one of ";
+                    assert!(gm.starts_with(fault) && lm.starts_with(fault));
+                    assert_eq!(
+                        gm.rsplit_once(" at line ")
+                            .expect("incumbent fault location")
+                            .1,
+                        lm.rsplit_once(" at line ")
+                            .expect("current fault location")
+                            .1
+                    );
+                    let error = serde_json::from_str::<Constant>(&l.json).unwrap_err();
+                    assert_eq!(error.classify(), serde_json::error::Category::Data);
+                    assert!(error.line() > 0 && error.column() > 0);
+                    continue;
+                }
                 assert_eq!(
                     gm, lm,
                     "REJECTION MESSAGE DRIFT for {}: both reject, but they say different \
@@ -858,5 +880,29 @@ fn parity_with_incumbent_is_exact() {
                 g.name, g.note
             ),
         }
+    }
+}
+
+#[test]
+fn finite_field_constant_wire_keeps_typed_payload_and_rejects_malformed_fields() {
+    let wire = r#"{"FiniteField":{"value":3,"field":7}}"#;
+    let value = serde_json::from_str::<Constant>(wire).expect("published field variant");
+    assert!(matches!(&value, Constant::FiniteField { value: 3, field } if field.modulus() == 7));
+    assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+    for malformed in [
+        r#"{"FiniteField":{"value":-1,"field":7}}"#,
+        r#"{"FiniteField":{"value":4294967296,"field":7}}"#,
+        r#"{"FiniteField":{"value":"3","field":7}}"#,
+        r#"{"FiniteField":{"value":3,"field":0}}"#,
+        r#"{"FiniteField":{"value":3,"field":15}}"#,
+        r#"{"FiniteField":{"value":3,"field":"7"}}"#,
+        r#"{"FiniteField":{"value":3}}"#,
+        r#"{"FiniteField":{"value":3,"field":7,"surplus":0}}"#,
+        r#"{"FiniteField":{"value":3,"value":4,"field":7}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<Constant>(malformed).is_err(),
+            "malformed field wire accepted: {malformed}"
+        );
     }
 }

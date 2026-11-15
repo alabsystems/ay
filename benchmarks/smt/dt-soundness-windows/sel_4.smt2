@@ -1,0 +1,7 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((T 0)) (((node (left T) (val Int) (right T)) (leaf))))
+(declare-const t T)
+(assert (is-node t))
+(assert (= (val t) 9))
+(assert (is-leaf (left t)))
+(check-sat)

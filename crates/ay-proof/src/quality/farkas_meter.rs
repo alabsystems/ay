@@ -91,6 +91,7 @@ mod tests {
             work: 1_321,
             bytes: 24_786,
             unfolded_work: 100,
+            fp_assignments: 0,
             order_assignments: 46_656,
         };
         assert_eq!(

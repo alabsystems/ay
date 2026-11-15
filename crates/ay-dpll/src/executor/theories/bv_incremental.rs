@@ -20,11 +20,10 @@ use crate::executor_types::{Result, SolveResult};
 use crate::incremental_state::IncrementalBvState;
 
 use super::super::Executor;
-use super::bv::{install_bv_sat_interrupt, BvSolveConfig};
+use super::bv::BvSolveConfig;
 use super::bv_encoding;
-
-#[path = "bv_incremental/resource_budget.rs"]
-mod resource_budget;
+use super::sat_stop::install_sat_stop;
+use super::{ChainSpend, CongruenceBail};
 
 impl Executor {
     /// Incremental BV solve: persistent SAT solver with push/pop scope management.
@@ -42,6 +41,7 @@ impl Executor {
         &mut self,
         config: &BvSolveConfig,
         proof_enabled: bool,
+        encoding: &ay_bv::BvEncodingGuard,
     ) -> Result<SolveResult> {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
@@ -54,8 +54,9 @@ impl Executor {
         // Instead, clone the Arc and copy the deadline directly.
         let sat_interrupt = self.solve_interrupt.clone();
         let sat_deadline = self.solve_deadline.get();
-        // Snapshot `:rlimit` before the persistent solver is mutably borrowed.
-        let bv_conflict_allowance = self.resource_limit;
+        // Snapshot the `:rlimit` counts before the persistent solver is mutably
+        // borrowed.
+        let bv_allowances = self.bitblast_sat_allowances();
         let interrupt_flag = sat_interrupt.clone();
         let deadline = self.solve_deadline.clone();
         let should_stop = move || {
@@ -66,6 +67,8 @@ impl Executor {
             }
             deadline.expired()
         };
+        #[cfg(test)]
+        let should_stop = super::slow_host::slow_poll(should_stop);
         let random_seed = self.current_random_seed();
 
         // Collect combined-theory axiom clauses generated in a separate borrow scope
@@ -103,10 +106,21 @@ impl Executor {
         // Initialize state if needed
         let state = self
             .incr_bv_state
-            .get_or_insert_with(IncrementalBvState::new);
+            .get_or_insert_with(|| Box::new(IncrementalBvState::new()));
         // This state is reused for the WHOLE session, across pops included:
         // `IncrementalBvState::pop()` unwinds one SAT scope and destroys
         // nothing. See its doc comment for why that is safe by construction.
+
+        // One exception: an earlier check-sat's stop (the deadline backstop,
+        // an interrupt, the memory ceiling) cut a congruence pass short and
+        // left the encoding's congruence axioms partial. That partial set is
+        // no property of the query, so this check-sat does not inherit it as
+        // an `unknown` it never hit: it re-encodes its current assertions,
+        // passes included (P4a). A count cap's partial set is the same on
+        // every host and stays.
+        if matches!(state.congruence_partial, Some(CongruenceBail::Stop(_))) {
+            state.reset_sat_encoding_for_rebuild();
+        }
 
         // Sync variable allocations to avoid overlap with SAT scope selectors.
         // sync_tseitin_next_var() ensures Tseitin vars start beyond all SAT vars
@@ -138,6 +152,7 @@ impl Executor {
         // are eagerly internalized, while bulk data-path operations can be delayed.
         let use_delayed_incr = !proof_enabled;
         let mut bv_solver = BvSolver::new(&self.ctx.terms);
+        bv_solver.inherit_encoding_guard(encoding);
         // Wire interrupt flag for cooperative cancellation during bitblasting (#8609).
         if let Some(ref flag) = self.solve_interrupt {
             bv_solver.set_interrupt(flag.clone());
@@ -214,6 +229,10 @@ impl Executor {
             let _ = bv_solver.ensure_bool_literal(arg);
         }
 
+        // The new assertions' offset equalities are counted before any is
+        // blasted, so a pair two of them read shares one difference.
+        bv_solver.count_offset_equalities(&new_assertions);
+
         // --- Predicate + Bool linking (#858, #5457) ---
         let mut linking_batch = bv_encoding::build_linking_batch(
             &state.tseitin_state.var_to_term,
@@ -222,6 +241,10 @@ impl Executor {
             &self.ctx.terms,
             Some(&state.linked_equivalence_terms),
         );
+        if !encoding.open() {
+            drop(bv_solver);
+            return self.abort_bv_encoding();
+        }
         for &term in linking_batch.newly_linked_terms() {
             state.linked_equivalence_terms.insert(term);
         }
@@ -287,7 +310,10 @@ impl Executor {
         // and persist across push/pop, so re-generating for unchanged assertions
         // would produce duplicate clauses (#7015 dedup optimization).
         if has_new_assertions && config.array_axioms {
-            self.materialize_array_bv_terms(&mut bv_solver, &[]);
+            // This route does not consume the main lane's late associations,
+            // and its Bool linking already ran. Preserve that boundary rather
+            // than import another attempt's values or mint unlinked literals.
+            self.materialize_array_bv_terms(&mut bv_solver, &[], None);
             let extra = bv_solver.take_clauses();
             bv_encoding::offset_and_push_clauses(extra, var_offset, &mut all_axiom_clauses);
         }
@@ -315,6 +341,7 @@ impl Executor {
                 saved_array_tseitin_term_to_var
                     .as_ref()
                     .expect("array Tseitin term map saved when array axioms are enabled"),
+                None,
             );
             for clause in array_axiom_result.clauses {
                 all_axiom_clauses.push(clause);
@@ -322,7 +349,9 @@ impl Executor {
             running_offset += array_axiom_result.num_vars;
         }
 
-        // EUF congruence axiom clauses (UFBV/AUFBV) — added GLOBALLY.
+        // EUF congruence axiom clauses (UFBV/AUFBV) — added GLOBALLY. A bailed
+        // pass is sound for UNSAT only; see `congruence_bail` below.
+        let mut euf_bv_congruence_bail = None;
         if has_new_assertions && config.uf_congruence {
             let euf_axiom_result = self.generate_euf_bv_axioms_debug(
                 &bv_solver,
@@ -331,6 +360,7 @@ impl Executor {
                 self.debug_ufbv,
                 &[],
             );
+            euf_bv_congruence_bail = euf_axiom_result.bail;
             for clause in euf_axiom_result.clauses {
                 all_axiom_clauses.push(clause);
             }
@@ -375,6 +405,11 @@ impl Executor {
         //    pop-rebuild wrong-model class caught by the independent gate).
         //
         // The snapshot is merged into `state` after the re-borrow below.
+        if !encoding.open() {
+            drop(bv_solver);
+            drop(saved_persistent_sat);
+            return self.abort_bv_encoding();
+        }
         let post_materialize_term_bits = bv_solver.term_to_bits().clone();
         let post_materialize_predicate_to_var = bv_solver.predicate_to_var().clone();
         let post_materialize_bool_to_var = bv_solver.bool_to_var().clone();
@@ -390,7 +425,7 @@ impl Executor {
         });
         drop(bv_solver);
 
-        let mut non_bv_congruence_bailed = false;
+        let mut congruence_bail = euf_bv_congruence_bail;
         if let Some((saved_term_to_var, saved_var_to_term)) = saved_non_bv_congruence_inputs {
             // Non-BV-return UF congruence clauses encode equality over Bool/Int/UF
             // results using Tseitin vars. They must use the stable BV offset, not
@@ -413,10 +448,14 @@ impl Executor {
             );
             // Item 4 Stage 2: a bailed (partial) congruence axiomatization
             // is sound for UNSAT only — SAT is degraded below.
-            non_bv_congruence_bailed = congruence_outcome.bailed;
+            congruence_bail = CongruenceBail::merge(congruence_bail, congruence_outcome.bail);
             running_offset += congruence_outcome.num_vars;
         }
 
+        if !encoding.open() {
+            drop(saved_persistent_sat);
+            return self.abort_bv_encoding();
+        }
         // Re-borrow state after axiom generation completes.
         let state = self
             .incr_bv_state
@@ -424,6 +463,11 @@ impl Executor {
             .expect("incremental BV state must exist after axiom generation");
         state.persistent_sat = saved_persistent_sat;
         state.pending_pushes = saved_pending_pushes;
+        // Latched for the encoding: a later check-sat that reuses a count
+        // cap's partial clause set publishes `incomplete`; a stop's is
+        // re-encoded by the next check-sat (see the session's start, P4a).
+        state.congruence_partial = CongruenceBail::merge(state.congruence_partial, congruence_bail);
+        let congruence_bail = state.congruence_partial;
 
         // Merge the POST-materialize BvSolver caches into the persistent state
         // (#7892 model soundness — see the snapshot comment above). Model
@@ -476,6 +520,7 @@ impl Executor {
             }
             if proof_enabled {
                 sat.enable_clause_trace();
+                sat.set_clause_event_capture(self.clause_event_capture);
                 sat.set_proof_bookkeeping_budget(Executor::search_proof_bookkeeping_budget_for(
                     &self.ctx,
                     self.proof_reconstruction_step_budget,
@@ -488,6 +533,7 @@ impl Executor {
             state.pending_pushes = 0;
             sat
         };
+        solver.set_clause_event_capture(self.clause_event_capture);
         solver.ensure_num_vars(total_vars);
 
         // Sync next_var allocations after solver creation
@@ -581,9 +627,13 @@ impl Executor {
             .persistent_sat
             .as_mut()
             .expect("incremental BV must store persistent SAT solver before solve");
-        let _deadline_guard = install_bv_sat_interrupt(solver, sat_interrupt, sat_deadline);
+        let _deadline_guard = install_sat_stop(solver, sat_interrupt, sat_deadline);
 
-        resource_budget::arm_persistent_sat_conflict_budget(solver, bv_conflict_allowance);
+        // This check-sat's solves are one chain: each one, the delayed-op
+        // re-solves included, is armed with what the earlier ones left
+        // (`None` clears a budget a preceding `:rlimit`-bearing check-sat
+        // left), and the chain starts afresh at every check-sat.
+        let mut spent = ChainSpend::NONE;
 
         // Iterate solve, model check, and global clause repair for delayed ops.
         const MAX_DELAY_ITERATIONS: usize = 32;
@@ -596,8 +646,10 @@ impl Executor {
         let mut delay_max_bv_next_var = 0u32;
 
         loop {
+            bv_allowances.arm(solver, spent);
             solve_result = solver.solve_interruptible(&should_stop).into_inner();
             collect_sat_stats!(self, &solver);
+            spent.debit(solver);
 
             // Check delayed operations if SAT and we have delayed ops (#7015)
             if let SatResult::Sat(ref model) = solve_result {
@@ -622,6 +674,7 @@ impl Executor {
 
                         if !needs_circuit.is_empty() {
                             let mut tmp_bv = BvSolver::new(&self.ctx.terms);
+                            tmp_bv.inherit_encoding_guard(encoding);
                             tmp_bv.set_term_to_bits(ds.term_to_bits().clone());
                             if let Some((ref ucache, ref scache, ref mut next_var)) =
                                 delay_div_caches
@@ -632,6 +685,10 @@ impl Executor {
                             tmp_bv.set_delayed_ops(ds.delayed_ops().to_vec());
                             for &idx in &needs_circuit {
                                 let circuit_clauses = tmp_bv.build_delayed_circuit(idx);
+                                if !encoding.open() {
+                                    drop(tmp_bv);
+                                    return self.abort_bv_encoding();
+                                }
                                 let new_bv_vars = tmp_bv.num_vars();
                                 let new_total = (var_offset as usize + new_bv_vars as usize)
                                     .max(solver.total_num_vars());
@@ -695,8 +752,12 @@ impl Executor {
         // Item 4 Stage 2 soundness gate: SAT under a bailed partial non-BV
         // congruence axiomatization degrades to Unknown (UNSAT stays valid —
         // partial axioms are a subset of the full axiomatization).
-        if non_bv_congruence_bailed && matches!(solve_result, SatResult::Sat(_)) {
-            return self.finalize_bv_congruence_bail();
+        if let (Some(bail), SatResult::Sat(_)) = (congruence_bail, &solve_result) {
+            return self.finalize_bv_congruence_bail(bail);
+        }
+
+        if !encoding.open() {
+            return self.abort_bv_encoding();
         }
 
         // Store model if SAT
@@ -732,6 +793,9 @@ impl Executor {
                     Err(error) => {
                         return self.finalize_bv_model_validation_failure(error);
                     }
+                }
+                if !encoding.open() {
+                    return self.abort_bv_encoding();
                 }
                 self.solve_and_store_model_full(
                     SatResult::Sat(sat_model),

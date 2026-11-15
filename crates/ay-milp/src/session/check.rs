@@ -162,18 +162,44 @@ fn panic_after_next_attempt_deadline() {
 /// Result of one optional route family.
 enum RouteOutcome {
     Continue,
-    Finished(Box<Outcome>),
+    Finished(Box<FinishedRoute>),
+}
+
+struct FinishedRoute {
+    outcome: Outcome,
+    proof: SupplementalProof,
 }
 
 impl RouteOutcome {
     fn finish(outcome: Outcome) -> Self {
-        Self::Finished(Box::new(outcome))
+        Self::finish_with_proof(outcome, SupplementalProof::None)
     }
 
+    fn finish_with_proof(outcome: Outcome, proof: SupplementalProof) -> Self {
+        Self::Finished(Box::new(FinishedRoute { outcome, proof }))
+    }
+
+    #[cfg(test)]
     fn finished(self) -> Option<Outcome> {
         match self {
             Self::Continue => None,
-            Self::Finished(outcome) => Some(*outcome),
+            Self::Finished(route) => Some(route.outcome),
+        }
+    }
+
+    /// Only the route actually selected by the orchestrator can attribute the
+    /// terminal evidence. Candidate carriers and deferred claims cannot.
+    fn publish(self, session: &mut BabSession) -> Option<Outcome> {
+        match self {
+            Self::Continue => None,
+            Self::Finished(route) => {
+                session.admitted_infeasibility_evidence = route
+                    .outcome
+                    .is_infeasible()
+                    .then(|| route.proof.infeasibility_kind())
+                    .flatten();
+                Some(route.outcome)
+            }
         }
     }
 }
@@ -198,18 +224,18 @@ pub(super) fn run(
     let mut state = CheckState::begin(session, &request);
 
     if state.ordinary_native_check {
-        if let Some(outcome) = proof_prelude::run(session, &mut state).finished() {
+        if let Some(outcome) = proof_prelude::run(session, &mut state).publish(session) {
             return publish_early(session, outcome);
         }
-        if let Some(outcome) = certified::run(session, &mut state).finished() {
+        if let Some(outcome) = certified::run(session, &mut state).publish(session) {
             return publish_early(session, outcome);
         }
     }
-    if let Some(outcome) = replay::run_sat_relu_fallback(session, &mut state).finished() {
+    if let Some(outcome) = replay::run_sat_relu_fallback(session, &mut state).publish(session) {
         return publish_early(session, outcome);
     }
     if state.ordinary_native_check {
-        if let Some(outcome) = replay::run(session, &mut state).finished() {
+        if let Some(outcome) = replay::run(session, &mut state).publish(session) {
             return publish_early(session, outcome);
         }
     }

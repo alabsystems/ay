@@ -17,7 +17,10 @@ pub(in super::super) fn sealed_propagation_environment(
     if !crate::quant_unit_authority::quant_unit_authority_enabled() {
         return FragmentPropagationEnvironment::default();
     }
-    let mut environment = FragmentPropagationEnvironment::default();
+    let mut environment = FragmentPropagationEnvironment {
+        const_array_reads: executor.ctx.datatype_iter().next().is_none(),
+        ..FragmentPropagationEnvironment::default()
+    };
     if ay_core::misc_cli_flags().debug_cert {
         eprintln!(
             "CERT/seal propagation: raw entries={} raw rewrites={}",

@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+% The fabrication is not confined to a top-level `pbc`: nesting one inside a proofgoal of an
+% ordinary `red` step reaches it just as well, so a fix that special-cased the outermost
+% subproof would miss this. The `red` here introduces the empty contradiction.
+f 2;
+red >= 1 : x1 -> 1 : subproof
+    proofgoal #1
+        pbc >= 1 : subproof
+            proofgoal 2
+                rup >= 1;
+            qed;
+        qed;
+    qed;
+qed;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

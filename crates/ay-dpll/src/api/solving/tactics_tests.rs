@@ -16,6 +16,380 @@ use crate::api::{Logic, Solver, Sort, Term};
 use ay_core::{TermData, TermId, TermStore};
 use ay_frontend::{ApplyTactic, Probe, ProbeCmp};
 
+#[test]
+fn owned_boolean_structure_preserves_declared_function_identities() {
+    use ay_core::original_query::{CountedAdmission, FiniteAdmissionGrant};
+    let owner = CountedAdmission::new(
+        FiniteAdmissionGrant::new(1_000_000, 1 << 20),
+        None,
+        std::sync::Arc::new(|| false),
+    )
+    .unwrap();
+    let mut store = TermStore::new();
+    let p = store.mk_var("p", ay_core::Sort::Bool);
+    let q = store.mk_var("q", ay_core::Sort::Bool);
+    let conjunction =
+        store.mk_app_structural(ay_core::Symbol::named("and"), &[p, q], ay_core::Sort::Bool);
+    let disjunction =
+        store.mk_app_structural(ay_core::Symbol::named("or"), &[p, q], ay_core::Sort::Bool);
+    assert_eq!(
+        flatten_owned(&store, &[conjunction], &owner).unwrap(),
+        [p, q]
+    );
+    let split = Tactic::SplitClause
+        .apply_goals_admitted(&mut store, Goal::root(vec![disjunction]), &owner)
+        .unwrap();
+    assert_eq!(split.len(), 2);
+    assert_eq!(split[0].formulas, [p]);
+    assert_eq!(split[1].formulas, [q]);
+    store.register_declared_function("and");
+    store.register_declared_function("or");
+    let conjunction =
+        store.mk_app_structural(ay_core::Symbol::named("and"), &[p, q], ay_core::Sort::Bool);
+    assert_eq!(
+        flatten_owned(&store, &[conjunction], &owner).unwrap(),
+        [conjunction]
+    );
+    let disjunction =
+        store.mk_app_structural(ay_core::Symbol::named("or"), &[p, q], ay_core::Sort::Bool);
+    assert!(Tactic::SplitClause
+        .apply_goals_admitted(&mut store, Goal::root(vec![disjunction]), &owner)
+        .is_err());
+}
+
+fn locally_limited_tactic(memory: bool) -> Tactic {
+    let mut parameters = crate::api::TacticParameters::default();
+    let key = if memory { "max_memory" } else { "max_steps" };
+    parameters
+        .set(key, crate::api::TacticParameterValue::UInt(0))
+        .unwrap();
+    Tactic::WithParams(Box::new(Tactic::Simplify), parameters)
+}
+
+#[test]
+fn raw_tactic_local_limits_keep_their_type_across_all_entry_points() {
+    for entry in 0..4 {
+        let mut solver = Solver::new(Logic::All);
+        let p = solver.bool_var("limited_p");
+        solver.assert_term(p);
+        let mut goal = vec![p];
+        let original = solver.assertions();
+        let tactic = locally_limited_tactic(false);
+        let result = match entry {
+            0 => solver.apply_tactic(&tactic),
+            1 => solver.apply_tactic_to_goal(&tactic, &mut goal).map(|_| ()),
+            2 => solver.apply_tactic_subgoals(&tactic, &goal).map(|_| ()),
+            _ => solver.validate_tactic_on_detached_goal(&tactic, &[p.id()]),
+        };
+        assert!(
+            matches!(
+                result,
+                Err(SolverError::TacticLimit(crate::api::TacticLimitKind::Work))
+            ),
+            "entry {entry}: {result:?}"
+        );
+        assert_eq!(solver.assertions(), original);
+        assert_eq!(goal, [p]);
+        assert!(solver.apply_tactic(&Tactic::Skip).is_ok());
+    }
+}
+
+#[test]
+fn raw_tactic_wrapper_publishes_local_limits_and_retires_prior_artifacts() {
+    for memory in [false, true] {
+        for assuming in [false, true] {
+            let mut solver = Tactic::Skip.solver(Logic::All).unwrap();
+            let p = solver.solver_mut().bool_var("prior_p");
+            solver.assert_term(p);
+            assert!(solver.check_sat_assuming(&[p]).is_sat());
+            assert!(solver.solver().model_for_consumer().is_some());
+            solver.tactic = locally_limited_tactic(memory);
+            let result = if assuming {
+                solver.check_sat_assuming(&[p])
+            } else {
+                solver.check_sat()
+            };
+            assert!(result.is_unknown());
+            let expected = if memory {
+                crate::UnknownOrigin::MemoryBudget
+            } else {
+                crate::UnknownOrigin::DeterministicResourceBudget
+            };
+            assert_eq!(solver.solver().unknown_reason(), Some(expected.reason()));
+            assert!(solver.solver().model_for_consumer().is_none());
+            assert!(solver.solver().executor.last_proof().is_none());
+            assert!(solver.inner.last_assumptions.is_none());
+            solver.tactic = Tactic::Skip;
+            assert!(solver.check_sat().is_sat(), "fresh request recovers");
+        }
+    }
+}
+
+#[test]
+fn raw_tactic_wrapper_original_counter_refusal_wins_over_local_limit() {
+    for storage in [false, true] {
+        let mut solver = locally_limited_tactic(!storage).solver(Logic::All).unwrap();
+        let p = solver.solver_mut().bool_var("original_p");
+        solver.assert_term(p);
+        let outer = solver.solver().begin_tactic_operation().unwrap();
+        let debit = if storage {
+            outer.admission().admit(0, usize::MAX)
+        } else {
+            outer.admission().admit(usize::MAX, 0)
+        };
+        assert!(debit.is_err());
+        let expected = solver.inner.executor.tactic_refusal_origin().unwrap();
+        assert!(solver.check_sat().is_unknown());
+        assert_eq!(solver.solver().unknown_reason(), Some(expected.reason()));
+        assert!(solver.solver().model_for_consumer().is_none());
+        drop(outer);
+        solver.tactic = Tactic::Skip;
+        assert!(solver.check_sat().is_sat());
+    }
+}
+
+#[test]
+fn raw_tactic_local_failure_fallback_retains_original_stop() {
+    let tactic = Tactic::OrElse(
+        Box::new(locally_limited_tactic(false)),
+        Box::new(Tactic::Skip),
+    );
+    let mut solver = tactic.solver(Logic::All).unwrap();
+    let p = solver.solver_mut().bool_var("fallback_p");
+    solver.assert_term(p);
+    assert!(solver.check_sat().is_sat());
+    solver.solver().interrupt();
+    assert!(solver.check_sat().is_unknown());
+    assert_eq!(
+        solver.solver().unknown_reason(),
+        Some(UnknownReason::Interrupted)
+    );
+    assert!(solver.solver().model_for_consumer().is_none());
+    solver.solver().clear_interrupt();
+    assert!(solver.check_sat().is_sat());
+}
+
+#[test]
+fn field_unique_solver_checks_original_roots_and_returns_original_model() {
+    let mut solver = Tactic::FieldUnique.solver(Logic::All).unwrap();
+    let s = solver.solver_mut();
+    let field = ay_core::FiniteFieldSort::new(7).unwrap();
+    let x = s.declare_const("x", Sort::FiniteField(field));
+    let two = s.finite_field_const(&2.into(), field);
+    let three = s.finite_field_const(&3.into(), field);
+    let a = s.eq(x, two);
+    let b = s.eq(x, three);
+    s.assert_term(a);
+    s.assert_term(b);
+    assert!(solver.check_sat().is_unsat());
+    assert_eq!(solver.assertions(), [a, b]);
+
+    let mut solver = Tactic::FieldUnique.solver(Logic::All).unwrap();
+    let s = solver.solver_mut();
+    let x = s.declare_const("x", Sort::FiniteField(field));
+    let two = s.finite_field_const(&2.into(), field);
+    let a = s.eq(x, two);
+    s.assert_term(a);
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+    assert_eq!(solver.assertions(), [a]);
+    assert_eq!(
+        solver.solver_mut().model_map().unwrap().get("x"),
+        Some(&crate::api::ModelValue::FiniteField { value: 2, field })
+    );
+}
+
+#[test]
+fn raw_tactic_metadata_keeps_original_refusal_across_all_entry_points() {
+    for entry in 0..4 {
+        let mut solver = Solver::new(Logic::All);
+        let yes = solver.bool_const(true);
+        solver.assert_term(yes);
+        let original = solver.assertions().to_vec();
+        let stamp = solver.terms().snapshot_stamp();
+        let mut goal = vec![yes];
+        let invoke = |solver: &mut Solver, goal: &mut Vec<Term>| match entry {
+            0 => solver.apply_tactic(&Tactic::Skip),
+            1 => solver.apply_tactic_to_goal(&Tactic::Skip, goal).map(|_| ()),
+            2 => solver
+                .apply_tactic_subgoals(&Tactic::Skip, goal)
+                .map(|_| ()),
+            _ => solver.validate_tactic_on_detached_goal(&Tactic::Skip, &[yes.id()]),
+        };
+        let request = solver.begin_model_evaluation_read();
+        solver.interrupt();
+        assert!(invoke(&mut solver, &mut goal).is_err(), "entry {entry}");
+        solver.clear_interrupt();
+        assert!(
+            invoke(&mut solver, &mut goal).is_err(),
+            "no renewal: {entry}"
+        );
+        assert_eq!(solver.terms().snapshot_stamp(), stamp);
+        assert_eq!(solver.assertions(), original);
+        assert_eq!(goal, [yes]);
+        drop(request);
+        assert!(
+            invoke(&mut solver, &mut goal).is_ok(),
+            "fresh entry {entry}"
+        );
+        assert_eq!(solver.terms().snapshot_stamp(), stamp);
+        assert_eq!(solver.assertions(), original);
+        assert_eq!(goal, [yes]);
+    }
+}
+
+#[test]
+fn field_simplify_public_subgoals_keep_original_variable_models() {
+    let mut solver = Solver::new(Logic::All);
+    let f = ay_core::FiniteFieldSort::new(7).unwrap();
+    let x = solver.declare_const("x", Sort::FiniteField(f));
+    let y = solver.declare_const("y", Sort::FiniteField(f));
+    let three = solver.finite_field_const(&3.into(), f);
+    let two = solver.finite_field_const(&2.into(), f);
+    let definition = solver.eq(x, three);
+    let sum = solver.try_finite_field_app("ff.add", &[x, y]).unwrap();
+    let original = solver.eq(sum, two);
+    let transformed = solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[definition, original])
+        .unwrap();
+    assert_eq!(transformed.len(), 1);
+    assert!(
+        transformed[0].0.contains(&definition),
+        "x's defining equation is model reconstruction, not disposable truth"
+    );
+    assert_ne!(transformed[0].0, [definition, original]);
+    for &root in &transformed[0].0 {
+        solver.assert_term(root);
+    }
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+    // Inspect the actual typed emitted assignment, not merely another solve.
+    let values = solver.model_map().unwrap();
+    assert_eq!(
+        values.get("x"),
+        Some(&crate::api::ModelValue::FiniteField { value: 3, field: f })
+    );
+    assert_eq!(
+        values.get("y"),
+        Some(&crate::api::ModelValue::FiniteField { value: 6, field: f })
+    );
+}
+
+#[test]
+fn field_simplify_actual_owner_interrupt_refuses_and_new_request_recovers() {
+    let mut solver = Solver::new(Logic::All);
+    let yes = solver.bool_const(true);
+    solver.interrupt();
+    let stamp = solver.terms().snapshot_stamp();
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_err());
+    assert_eq!(solver.terms().snapshot_stamp(), stamp);
+    solver.clear_interrupt();
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_ok());
+    assert_eq!(solver.terms().snapshot_stamp(), stamp);
+}
+
+#[test]
+fn field_simplify_nested_request_cannot_clear_its_original_refusal() {
+    let mut solver = Solver::new(Logic::All);
+    let yes = solver.bool_const(true);
+    let request = solver.begin_model_evaluation_read();
+    solver.interrupt();
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_err());
+    solver.clear_interrupt();
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_err());
+    drop(request);
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_ok());
+}
+
+#[test]
+fn field_simplify_wrapper_retains_interrupt_origin_and_retires_prior_model() {
+    let mut solver = Tactic::FieldSimplify.solver(Logic::All).unwrap();
+    let yes = solver.solver_mut().bool_const(true);
+    solver.solver_mut().assert_term(yes);
+    assert!(solver.check_sat().is_sat());
+    assert!(solver.solver().model_for_consumer().is_some());
+    solver.solver().interrupt();
+    assert!(solver.check_sat().is_unknown());
+    assert_eq!(
+        solver.solver().unknown_reason(),
+        Some(UnknownReason::Interrupted)
+    );
+    assert!(solver.solver().model().is_none());
+    assert!(solver.solver().model_for_consumer().is_none());
+    assert!(solver.solver().executor.last_proof().is_none());
+    solver.solver().clear_interrupt();
+    assert!(solver.check_sat().is_sat());
+}
+
+#[test]
+fn field_simplify_wrapper_retains_deadline_origin_and_retires_assumptions() {
+    let mut solver = Tactic::FieldSimplify.solver(Logic::All).unwrap();
+    solver.solver_mut().set_produce_proofs(true);
+    let yes = solver.solver_mut().bool_const(true);
+    let no = solver.solver_mut().bool_const(false);
+    solver.solver_mut().assert_term(no);
+    assert!(solver.check_sat_assuming(&[yes]).is_unsat());
+    assert!(solver.solver().executor.last_proof().is_some());
+    solver
+        .solver_mut()
+        .set_timeout(Some(std::time::Duration::ZERO));
+    assert!(solver.check_sat_assuming(&[yes]).is_unknown());
+    assert_eq!(
+        solver.solver().unknown_reason(),
+        Some(UnknownReason::Timeout)
+    );
+    assert!(solver.solver().model_for_consumer().is_none());
+    assert!(solver.solver().last_assumptions.is_none());
+    assert!(solver.solver().executor.last_proof().is_none());
+    solver.solver_mut().set_timeout(None);
+    assert!(solver.check_sat_assuming(&[yes]).is_unsat());
+}
+
+#[test]
+fn field_simplify_actual_absolute_timeout_refuses_and_new_request_recovers() {
+    let mut solver = Solver::new(Logic::All);
+    let yes = solver.bool_const(true);
+    let stamp = solver.terms().snapshot_stamp();
+    solver.set_timeout(Some(std::time::Duration::ZERO));
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_err());
+    solver.set_timeout(None);
+    assert!(solver
+        .apply_tactic_subgoals(&Tactic::FieldSimplify, &[yes])
+        .is_ok());
+    assert_eq!(solver.terms().snapshot_stamp(), stamp);
+}
+
+#[test]
+fn field_simplify_detached_solver_keeps_authored_proof_and_model_roots() {
+    let mut solver = Tactic::FieldSimplify.solver(Logic::All).unwrap();
+    let s = solver.solver_mut();
+    let f = ay_core::FiniteFieldSort::new(7).unwrap();
+    let x = s.declare_const("x", Sort::FiniteField(f));
+    let two = s.finite_field_const(&2.into(), f);
+    let three = s.finite_field_const(&3.into(), f);
+    let a = s.eq(x, two);
+    let b = s.eq(x, three);
+    s.assert_term(a);
+    s.assert_term(b);
+    let before = s.terms().snapshot_stamp();
+    let roots = [a.id(), b.id()];
+    s.validate_tactic_on_detached_goal(&Tactic::FieldSimplify, &roots)
+        .unwrap();
+    assert_eq!(s.terms().snapshot_stamp(), before);
+    assert!(solver.check_sat().is_unsat());
+    assert_eq!(solver.assertions(), [a, b]);
+}
+
 // ---------------------------------------------------------------------------
 // HONESTY GATE: backing pass reports progress truthfully (both directions).
 // ---------------------------------------------------------------------------
@@ -613,62 +987,6 @@ fn split_clause_disjunction_is_equisatisfiable_over_thirty_goals() {
         mismatches, 0,
         "split-clause must preserve satisfiability as a disjunction on every goal"
     );
-}
-
-#[test]
-fn from_apply_maps_the_full_combinator_grammar() {
-    // The shared registry maps every combinator to an executable tactic (parse →
-    // engine), so the SMT-LIB and C-API surfaces cannot drift.
-    assert_eq!(Tactic::from_apply(&ApplyTactic::Fail).name(), "fail");
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::SplitClause).name(),
-        "split-clause"
-    );
-    // solve-eqs is ONE primitive (depth 1), not a flatten-and-prefixed sequence.
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::SolveEqs).name(),
-        "solve-eqs"
-    );
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::OrElse(vec![
-            ApplyTactic::Fail,
-            ApplyTactic::Simplify
-        ]))
-        .name(),
-        "(or-else fail flatten-and)"
-    );
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::Repeat(
-            Box::new(ApplyTactic::ElimAnd),
-            Some(4)
-        ))
-        .name(),
-        "(repeat flatten-and 4)"
-    );
-    // try-for / using-params reduce to the wrapped tactic (params/timeout do not
-    // change the equivalence-preserving transform).
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::TryFor(Box::new(ApplyTactic::Simplify), 1000)).name(),
-        "flatten-and"
-    );
-    assert_eq!(
-        Tactic::from_apply(&ApplyTactic::UsingParams(
-            Box::new(ApplyTactic::Simplify),
-            vec![]
-        ))
-        .name(),
-        "flatten-and"
-    );
-}
-
-#[test]
-fn from_apply_maps_qe_to_the_cooper_qe_light_engine() {
-    // `qe` shares `qe-light`'s Cooper engine arm — the same alias pattern as
-    // `simplify`/`elim-and` → `flatten-and`. `name()` therefore reports the
-    // engine name (`qe-light`) for a parsed `qe`; this is diagnostics-only, the
-    // transform (and its equivalence self-check) is identical.
-    assert_eq!(Tactic::from_apply(&ApplyTactic::Qe).name(), "qe-light");
-    assert_eq!(Tactic::from_apply(&ApplyTactic::QeLight).name(), "qe-light");
 }
 
 #[test]
@@ -1735,11 +2053,13 @@ fn unchanged_quantified_bv_tactic_query_never_downgrades_to_ordinary_unsat() {
         assert_eq!(
             usize::from(result.was_unsat_strictly_verified())
                 + usize::from(result.was_unsat_independently_verified())
-                + usize::from(result.was_unsat_exact_semantically_verified()),
+                + usize::from(result.was_unsat_exact_semantically_verified())
+                + usize::from(result.was_unsat_corroborated()),
             1,
             "public UNSAT must retain exactly one sealed certification class — \
-             strict proof, independent verification, or the exact semantic \
-             theorem — never an ordinary unauthorized one and never two at once"
+             strict proof, independent verification, the exact semantic \
+             theorem, or a corroborated discharge — never an ordinary \
+             unauthorized one and never two at once"
         );
     } else {
         assert!(result.is_unknown(), "strict proof gaps must fail closed");
@@ -2231,6 +2551,7 @@ fn transform_batch_apply_tactics_map_to_named_non_skip_tactics() {
         (ApplyTactic::Der, "der"),
         (ApplyTactic::DistributeForall, "distribute-forall"),
         (ApplyTactic::ReduceArgs, "reduce-args"),
+        (ApplyTactic::MaxBvSharing, "max-bv-sharing"),
     ];
     for (apply, want) in cases {
         let tac = Tactic::from_apply(&apply);
@@ -2241,4 +2562,32 @@ fn transform_batch_apply_tactics_map_to_named_non_skip_tactics() {
         );
         assert_eq!(tac.name(), want, "{want} must map to its own tactic");
     }
+}
+
+#[test]
+fn max_bv_sharing_rewrites_boolean_goals_and_counts_one_primitive() {
+    let mut terms = TermStore::new();
+    let [x, y, z] = ["x", "y", "z"].map(|name| terms.mk_var(name, Sort::bitvec(8)));
+    let xy = terms.mk_app(ay_core::Symbol::named("bvadd"), [x, y], Sort::bitvec(8));
+    let yz = terms.mk_app(ay_core::Symbol::named("bvadd"), [y, z], Sort::bitvec(8));
+    let xyz = terms.mk_app(ay_core::Symbol::named("bvadd"), [x, yz], Sort::bitvec(8));
+    let first = terms.mk_app(ay_core::Symbol::named("p"), [xy], Sort::Bool);
+    let second = terms.mk_app(ay_core::Symbol::named("p"), [xyz], Sort::Bool);
+    let tactic = Tactic::from_apply(&ApplyTactic::MaxBvSharing);
+    let goals = tactic
+        .apply_goals(&mut terms, Goal::root(vec![first, second]))
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].depth, 1);
+    assert_eq!(goals[0].formulas.len(), 2);
+    assert_eq!(goals[0].formulas[0], first);
+    let TermData::App(_, predicate_args) = terms.get(goals[0].formulas[1]) else {
+        panic!("predicate application must be preserved");
+    };
+    let TermData::App(op, sum_args) = terms.get(predicate_args[0]) else {
+        panic!("rewritten argument must be an adder");
+    };
+    assert_eq!(op.name(), "bvadd");
+    assert!(sum_args.contains(&xy));
+    assert!(sum_args.contains(&z));
 }

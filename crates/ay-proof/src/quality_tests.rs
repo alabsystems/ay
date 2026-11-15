@@ -266,6 +266,12 @@ mod metering_and_pos_ledger;
 #[path = "quality_tests/metering_and_pos_identity.rs"]
 mod metering_and_pos_identity;
 
+#[path = "quality_tests/metering_literal_decode.rs"]
+mod metering_literal_decode;
+
+#[path = "quality_tests/metering_quantifier_expansion.rs"]
+mod metering_quantifier_expansion;
+
 #[test]
 fn test_premise_authentication_rejects_unauthorized_assume() {
     let mut terms = TermStore::new();
@@ -394,3 +400,6 @@ fn test_premise_authentication_rejects_reused_skolem_witness() {
 
 #[path = "quality_tests/quality_summary.rs"]
 mod quality_summary;
+
+#[path = "quality_tests/metering_and_neg_identity.rs"]
+mod metering_and_neg_identity;

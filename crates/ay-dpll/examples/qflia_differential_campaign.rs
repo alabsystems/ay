@@ -12,7 +12,8 @@
 //! cargo run -p ay-dpll --release --example qflia_differential_campaign -- --seeds 5000
 //! ```
 //!
-//! Z3 is used when it is available on `PATH`; pass `--no-z3` to disable that
+//! Z3 is used when a real z3 resolves (`Z3_PATH`, else the first identified z3
+//! on `PATH`, past reroute stubs); pass `--no-z3` to disable that
 //! cross-check or `--single-shot` to omit the incremental comparison.
 
 use ay_dpll::Executor;
@@ -20,13 +21,6 @@ use ay_dpll::Executor;
 #[allow(dead_code)]
 #[path = "../src/executor_tests/qflia_differential_fuzz.rs"]
 mod campaign;
-
-fn find_z3() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("z3"))
-        .find(|candidate| candidate.is_file())
-}
 
 fn usage() -> &'static str {
     "usage: qflia_differential_campaign [--seeds N] [--single-shot] [--no-z3]"
@@ -58,15 +52,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--seeds must be positive".into());
     }
 
-    let z3 = use_z3.then(find_z3).flatten();
+    // The z3 cross-check takes verdicts only from a z3 that proved its identity,
+    // reached by path (`ay_sys::z3_oracle`): a name lookup can land on a
+    // refusing reroute stub whose empty verdicts would blind every seed.
+    let z3 = use_z3.then(ay_sys::z3_oracle::z3_oracle);
+    let z3_label = match &z3 {
+        None => "disabled".to_string(),
+        Some(Ok(oracle)) => oracle.identity(),
+        Some(Err(reason)) => format!("unavailable: {reason}"),
+    };
     eprintln!(
-        "qflia differential campaign: seeds={seeds} incremental={check_incremental} z3={}",
-        z3.as_ref().map_or_else(
-            || "disabled/unavailable".to_string(),
-            |path| path.display().to_string()
-        )
+        "qflia differential campaign: seeds={seeds} incremental={check_incremental} z3={z3_label}"
     );
-    let (sat, unsat, unknown) = campaign::run_campaign(seeds, z3.as_deref(), check_incremental);
+    let z3_path = z3.and_then(Result::ok).map(|oracle| oracle.path());
+    let (sat, unsat, unknown) = campaign::run_campaign(seeds, z3_path, check_incremental);
     println!("completed: seeds={seeds} sat={sat} unsat={unsat} unknown={unknown}");
     Ok(())
 }

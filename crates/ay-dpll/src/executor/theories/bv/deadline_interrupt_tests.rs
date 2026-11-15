@@ -2,58 +2,11 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use super::*;
 use ay_sat::BranchSelectorMode;
-
-#[test]
-fn bv_sat_deadline_does_not_poison_external_interrupt_8961() {
-    let external_interrupt = Arc::new(AtomicBool::new(false));
-    let mut solver = SatSolver::new(1);
-
-    let _guard = install_bv_sat_interrupt(
-        &mut solver,
-        Some(external_interrupt.clone()),
-        Some(Instant::now()),
-    );
-
-    assert!(
-        !external_interrupt.load(Ordering::Relaxed),
-        "BV SAT deadline timer must not set the reusable API interrupt flag"
-    );
-}
-
-#[test]
-fn expired_bv_sat_deadline_keeps_timeout_provenance() {
-    let external_interrupt = Arc::new(AtomicBool::new(true));
-    let mut solver = SatSolver::new(1);
-    let _guard =
-        install_bv_sat_interrupt(&mut solver, Some(external_interrupt), Some(Instant::now()));
-
-    assert!(matches!(solver.solve().into_inner(), SatResult::Unknown));
-    assert_eq!(
-        solver.last_unknown_reason(),
-        Some(ay_sat::SatUnknownReason::DeadlineExceeded)
-    );
-}
-
-#[test]
-fn reused_bv_sat_solver_rebinds_query_controls() {
-    let old_interrupt = Arc::new(AtomicBool::new(true));
-    let mut solver = SatSolver::new(1);
-    {
-        let _guard = install_bv_sat_interrupt(&mut solver, Some(old_interrupt), None);
-        assert!(matches!(solver.solve().into_inner(), SatResult::Unknown));
-        assert_eq!(
-            solver.last_unknown_reason(),
-            Some(ay_sat::SatUnknownReason::Interrupted)
-        );
-    }
-
-    {
-        let _guard = install_bv_sat_interrupt(&mut solver, None, None);
-        assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
-    }
-}
 
 #[test]
 fn bv_unknown_fallback_prefers_expired_deadline_to_interrupt() {
@@ -63,6 +16,58 @@ fn bv_unknown_fallback_prefers_expired_deadline_to_interrupt() {
     executor.propagate_bv_unknown_reason(true);
 
     assert_eq!(executor.get_reason_unknown(), Some(UnknownReason::Timeout));
+}
+
+#[test]
+fn a_bitblast_cut_by_the_memory_ceiling_is_memout_after_the_reading_drops() {
+    // `bitblast_all` stopped on the memory ceiling and left a partial CNF;
+    // by the time it returns the reading is back under the ceiling. Reading
+    // memory again let the partial CNF reach SAT, whose model then failed
+    // validation as an `incomplete`-class unknown instead of `memout`.
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-fun x () (_ BitVec 8))
+        (declare-fun y () (_ BitVec 8))
+        (assert (bvult x y))
+        (check-sat)
+    "#;
+    let commands = ay_frontend::parse(script).expect("fixture parses");
+    let mut executor = Executor::new();
+    forced_blast_cut::force(Some(BlastCut::MemoryCeiling));
+    let output = executor.execute_all(&commands).expect("fixture runs");
+    forced_blast_cut::force(None);
+    assert!(!ay_sys::process_memory_exceeded());
+    assert_eq!(output, vec!["unknown"]);
+    assert_eq!(
+        executor.get_reason_unknown(),
+        Some(UnknownReason::MemoryLimit)
+    );
+    assert_eq!(executor.unknown_origin(), Some(UnknownOrigin::MemoryBudget));
+
+    // The same query with no cut is sat: only the cut stopped it.
+    let mut executor = Executor::new();
+    let output = executor.execute_all(&commands).expect("fixture runs");
+    assert_eq!(output, vec!["sat"]);
+}
+
+#[test]
+fn a_bitblast_cut_by_the_interrupt_is_interrupted() {
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-fun x () (_ BitVec 8))
+        (assert (bvult x #x10))
+        (check-sat)
+    "#;
+    let commands = ay_frontend::parse(script).expect("fixture parses");
+    let mut executor = Executor::new();
+    forced_blast_cut::force(Some(BlastCut::Interrupt));
+    let output = executor.execute_all(&commands).expect("fixture runs");
+    forced_blast_cut::force(None);
+    assert_eq!(output, vec!["unknown"]);
+    assert_eq!(
+        executor.get_reason_unknown(),
+        Some(UnknownReason::Interrupted)
+    );
 }
 
 #[test]

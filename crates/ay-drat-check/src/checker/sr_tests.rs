@@ -1,6 +1,7 @@
 // Copyright 2026 Andrew Yates
 // Unit tests for the native PR/SR checker.
 
+use super::subst::{reduce_clause_under_subst, LitImage, Reduce, ReductTally, SubImage, Subst};
 use super::SrChecker;
 use crate::cnf_parser::parse_cnf;
 use crate::drat_parser::parse_drat;
@@ -9,7 +10,17 @@ use crate::literal::Literal;
 
 #[allow(dead_code)]
 fn lits(ds: &[i32]) -> Vec<Literal> {
-    ds.iter().map(|&d| Literal::from_dimacs(d)).collect()
+    // `from_dimacs` requires a nonzero literal (0 is the DIMACS clause
+    // terminator), and that precondition is what the verifier asks this closure
+    // to establish. Every fixture below is a hand-written nonzero list; the
+    // assert makes the closure's own body carry the proof instead of the
+    // fixtures' good behaviour.
+    ds.iter()
+        .map(|&d| {
+            assert_ne!(d, 0, "test fixture literals must be nonzero DIMACS");
+            Literal::from_dimacs(d)
+        })
+        .collect()
 }
 
 /// A plain DRAT (RUP) proof must still verify through the SR driver, which
@@ -96,6 +107,45 @@ fn sr_rejects_invalid_certificate() {
     );
 }
 
+// Helpers for `reduct_single_step_soundness_holds_for_real_reduce`, over a
+// two-variable domain.
+
+/// A literal of `var` (0 or 1) with sign `neg`: DIMACS `±(var + 1)`, built
+/// from the packed encoding `2 * var + neg` so no DIMACS sum can overflow.
+fn lit_of(var: usize, neg: bool) -> Literal {
+    Literal::from_raw(((var as u32) << 1) | u32::from(neg))
+}
+
+/// The stored POSITIVE-literal image for sigma kind k in {0=Id,1=T,2=F,3=Lit}.
+fn image_of(kind: u8, lv: bool, ln: bool) -> Option<SubImage> {
+    match kind {
+        0 => None,
+        1 => Some(SubImage::True),
+        2 => Some(SubImage::False),
+        _ => Some(SubImage::Lit(lit_of(lv as usize, ln))),
+    }
+}
+
+/// Independent model truth of literal `(var,neg)` under sigma+alpha.
+/// sigma stores the positive-literal image; sigma(neg lit) = !sigma(pos lit).
+/// `None` when a variable lies outside `alpha` (never, for this domain).
+fn lit_truth(
+    var: usize,
+    neg: bool,
+    kind: u8,
+    lv: bool,
+    ln: bool,
+    alpha: [bool; 2],
+) -> Option<bool> {
+    let pos = match kind {
+        0 => return Some(*alpha.get(var)? != neg), // identity: literal truth = alpha ^ neg
+        1 => true,
+        2 => false,
+        _ => *alpha.get(usize::from(lv))? != ln,
+    };
+    Some(if neg { !pos } else { pos })
+}
+
 /// Exhaustive pin: the REAL `reduce_clause_under_subst` + `Subst::map_lit`
 /// satisfy the SAME bounded single-step soundness property that
 /// the development proof harness discharges through Trust.
@@ -114,40 +164,8 @@ fn sr_rejects_invalid_certificate() {
 /// to the verified bounded soundness property: corrupting `classify_reduct`,
 /// `Subst::map_lit`, or the reduce loop makes this test fail.
 #[test]
-fn reduct_single_step_soundness_holds_for_real_reduce() {
-    use super::{reduce_clause_under_subst, Reduce, SubImage, Subst};
-
-    // A literal of `var` (0 or 1) with sign `neg`, in DIMACS (vars are 1-based).
-    fn lit_of(var: usize, neg: bool) -> Literal {
-        let d = (var as i32) + 1;
-        Literal::from_dimacs(if neg { -d } else { d })
-    }
-    // The stored POSITIVE-literal image for sigma kind k in {0=Id,1=T,2=F,3=Lit}.
-    fn image_of(kind: u8, lv: bool, ln: bool) -> Option<SubImage> {
-        match kind {
-            0 => None,
-            1 => Some(SubImage::True),
-            2 => Some(SubImage::False),
-            _ => Some(SubImage::Lit(lit_of(lv as usize, ln))),
-        }
-    }
-    // Independent model truth of literal `(var,neg)` under sigma+alpha.
-    // sigma stores the positive-literal image; sigma(neg lit) = !sigma(pos lit).
-    fn lit_truth(var: usize, neg: bool, kind: u8, lv: bool, ln: bool, alpha: [bool; 2]) -> bool {
-        let pos = match kind {
-            0 => return alpha[var] != neg, // identity: literal truth = alpha ^ neg
-            1 => true,
-            2 => false,
-            _ => alpha[lv as usize] != ln,
-        };
-        if neg {
-            !pos
-        } else {
-            pos
-        }
-    }
-
-    let bit = |bits: u32, i: u32| (bits >> i) & 1 == 1;
+fn reduct_single_step_soundness_holds_for_real_reduce() -> Result<(), Box<dyn std::error::Error>> {
+    let bit = |bits: u32, i: u32| bits.checked_shr(i).is_some_and(|b| b & 1 == 1);
     // 14 bits: clause (p0,sv0,sn0,p1,sv1,sn1) + sigma var0 (ka,kb,lv,ln) + var1.
     for bits in 0u32..(1 << 14) {
         let (p0, sv0, sn0) = (bit(bits, 0), bit(bits, 1), bit(bits, 2));
@@ -174,7 +192,8 @@ fn reduct_single_step_soundness_holds_for_real_reduce() {
             clause.push(lit_of(var1, sn1));
         }
 
-        let class = reduce_clause_under_subst(&subst, &clause);
+        let class = reduce_clause_under_subst(&subst, &clause)
+            .expect("a bounded clause always has a representable tally");
 
         for av in 0u32..4 {
             let alpha = [av & 1 == 1, av & 2 == 2];
@@ -190,12 +209,14 @@ fn reduct_single_step_soundness_holds_for_real_reduce() {
             let mut truth_d = false;
             if p0 {
                 let (k, lv, ln) = k_of(var0);
-                truth_reduct |= lit_truth(var0, sn0, k, lv, ln, alpha);
+                truth_reduct |= lit_truth(var0, sn0, k, lv, ln, alpha)
+                    .ok_or("slot 0 variable outside the assignment")?;
                 truth_d |= alpha[var0] != sn0;
             }
             if p1 {
                 let (k, lv, ln) = k_of(var1);
-                truth_reduct |= lit_truth(var1, sn1, k, lv, ln, alpha);
+                truth_reduct |= lit_truth(var1, sn1, k, lv, ln, alpha)
+                    .ok_or("slot 1 variable outside the assignment")?;
                 truth_d |= alpha[var1] != sn1;
             }
 
@@ -216,6 +237,22 @@ fn reduct_single_step_soundness_holds_for_real_reduce() {
             }
         }
     }
+    Ok(())
+}
+
+/// A substitution map the allocator refuses rejects the step (fail closed);
+/// `vec![None; num_vars]` used to panic with a capacity overflow here.
+#[test]
+fn sr_unallocatable_substitution_map_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let witness = [Literal::from_dimacs(1)];
+    if Subst::from_witness(&witness, usize::MAX).is_ok() {
+        return Err("an unallocatable substitution map must be rejected".into());
+    }
+    let subst = Subst::from_witness(&witness, 2)?;
+    if subst.map.len() != 2 {
+        return Err(format!("substitution map has {} slots, expected 2", subst.map.len()).into());
+    }
+    Ok(())
 }
 
 /// A corrupted witness substitution that breaks the refutation must be
@@ -232,4 +269,77 @@ fn sr_rejects_corrupted_witness() {
         chk.verify(&cnf.clauses, &proof).is_err(),
         "corrupted witness must be rejected"
     );
+}
+
+/// A witness naming a variable beyond the substitution map is rejected (fail
+/// closed) instead of indexing past the map. `add_sr` grows the checker to
+/// cover every witness variable first, so this pins `from_witness` itself.
+#[test]
+fn sr_witness_variable_beyond_map_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    if Subst::from_witness(&[Literal::from_dimacs(1)], 1).is_err() {
+        return Err("an in-range pivot must be accepted".into());
+    }
+    if Subst::from_witness(&[Literal::from_dimacs(3)], 1).is_ok() {
+        return Err("a pivot beyond the map must be rejected".into());
+    }
+    let atom_beyond = [Literal::from_dimacs(1), Literal::from_dimacs(-4)];
+    if Subst::from_witness(&atom_beyond, 1).is_ok() {
+        return Err("a PR atom beyond the map must be rejected".into());
+    }
+    let pair_beyond = [
+        Literal::from_dimacs(1),
+        Literal::from_dimacs(1),
+        Literal::from_dimacs(5),
+        Literal::from_dimacs(1),
+    ];
+    if Subst::from_witness(&pair_beyond, 1).is_ok() {
+        return Err("a substituted variable beyond the map must be rejected".into());
+    }
+    Ok(())
+}
+
+/// The reduct tally fails closed: a count that would overflow yields `None`
+/// (which the kernel turns into a rejected step) instead of wrapping or
+/// panicking, and an in-range count is unchanged. This pins the checked
+/// additions in `ReductTally::record` that the verified lane proves panic-free.
+#[test]
+fn sr_reduct_tally_overflow_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let lit = Literal::from_dimacs(1);
+    let saturated = ReductTally {
+        any_true: false,
+        falsified: usize::MAX,
+        identity: usize::MAX,
+    };
+    if saturated.record(lit, LitImage::False).is_some() {
+        return Err("an overflowing falsified count must fail closed".into());
+    }
+    if saturated.record(lit, LitImage::Lit(lit)).is_some() {
+        return Err("an overflowing identity count must fail closed".into());
+    }
+    // Images that do not count are still recorded at the boundary.
+    let after_true = saturated
+        .record(lit, LitImage::True)
+        .ok_or("True is uncounted")?;
+    if !after_true.any_true || after_true.falsified != usize::MAX {
+        return Err("a True image must only set any_true".into());
+    }
+    let moved = saturated
+        .record(lit, LitImage::Lit(lit.negated()))
+        .ok_or("a non-identity literal image is uncounted")?;
+    if moved != saturated {
+        return Err("a non-identity literal image must not change the counts".into());
+    }
+    // In range: the counts advance by exactly one.
+    let one = ReductTally::default()
+        .record(lit, LitImage::False)
+        .and_then(|t| t.record(lit, LitImage::Lit(lit)))
+        .ok_or("in-range tally must be representable")?;
+    if one.falsified != 1 || one.identity != 1 || one.any_true {
+        return Err("in-range tally must count each image once".into());
+    }
+    // The classification of a complete tally is unchanged.
+    if one.classify(2) != Reduce::Reduced {
+        return Err("one false + one fixed literal reduces a 2-clause".into());
+    }
+    Ok(())
 }

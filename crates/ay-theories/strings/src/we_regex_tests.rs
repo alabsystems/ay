@@ -295,6 +295,36 @@ fn concat_emptiness_intersection_form() {
 }
 
 #[test]
+fn languages_equal_decides_by_language() {
+    // Empty intersection is `None` the language, not just structurally.
+    let disjoint = WeRegex::inter(vec![WeRegex::lit("a"), WeRegex::lit("b")]);
+    assert_eq!(languages_equal(&WeRegex::None, &disjoint), Some(true));
+    // Overlapping intersection is not empty: "a" separates them.
+    let overlap = WeRegex::inter(vec![WeRegex::lit("a"), WeRegex::star(WeRegex::AnyChar)]);
+    assert_eq!(languages_equal(&WeRegex::None, &overlap), Some(false));
+    // Algebraic identities the smart constructors do not all fold.
+    let union_none = WeRegex::union(vec![WeRegex::None, WeRegex::lit("a")]);
+    assert_eq!(languages_equal(&union_none, &WeRegex::lit("a")), Some(true));
+    assert_eq!(
+        languages_equal(&WeRegex::comp(WeRegex::None), &WeRegex::All),
+        Some(true)
+    );
+    // Range interior: [a,c] seen as singleton union, and a loop unrolling.
+    let singletons = WeRegex::union(vec![
+        WeRegex::lit("a"),
+        WeRegex::lit("b"),
+        WeRegex::lit("c"),
+    ]);
+    assert_eq!(
+        languages_equal(&WeRegex::range("a", "c"), &singletons),
+        Some(true)
+    );
+    let twice = WeRegex::loop_bounded(WeRegex::lit("a"), 2, 2);
+    assert_eq!(languages_equal(&twice, &WeRegex::lit("aa")), Some(true));
+    assert_eq!(languages_equal(&twice, &WeRegex::lit("a")), Some(false));
+}
+
+#[test]
 fn concat_emptiness_range_interior_not_missed() {
     // The witness needs a character strictly INSIDE a range ('m' ∈ [a,z]);
     // the class alphabet must cover interior representatives, so this must
@@ -589,4 +619,93 @@ fn concat_witness_empty_parts_and_ground_runs() {
         concat_membership_witness(&[], &[WeRegex::lit("a")], 8),
         None
     );
+}
+
+// ── Surrogate code points are characters, ordered by code point (D8) ─────
+//
+// The SMT-LIB alphabet is `0..=0x2FFFF`, the surrogates `U+D800..=U+DFFF`
+// included; AY stores a surrogate in its carrier `char` (`ay_core::smtlib_char`),
+// which `char`'s own order places ABOVE `U+2FFFF`. Every order these tests pin
+// is the code-point order. Each is a site whose revert to `char` order was a
+// wrong `unsat` measured by the 2026-09-23 fp-strings verifier (mutants M24,
+// M26 and M27) that no other test caught.
+
+/// The one-character string of the SMT-LIB character with code point `code`.
+fn cp(code: u32) -> String {
+    ay_core::smtlib_char(code)
+        .expect("in the SMT-LIB alphabet")
+        .to_string()
+}
+
+/// `re.range` whose LOW endpoint is a surrogate is ordered by code point
+/// (mutant M24; verifier witness `vd8_25`, a wrong `unsat` when the range
+/// read as empty).
+#[test]
+fn range_with_a_surrogate_endpoint_is_ordered_by_code_point() {
+    let r = WeRegex::range(&cp(0xD900), "\u{f000}");
+    assert!(!r.is_empty_lang(), "[U+D900, U+F000] is 26,369 characters");
+    for member in [cp(0xD900), cp(0xD901), cp(0xDFFF), cp(0xE000), cp(0xF000)] {
+        assert!(m(&r, &member), "{member:?} lies in [U+D900, U+F000]");
+    }
+    for outsider in [cp(0xD8FF), cp(0xF001), cp(0x10000)] {
+        assert!(
+            !m(&r, &outsider),
+            "{outsider:?} lies outside [U+D900, U+F000]"
+        );
+    }
+    // The reverse is REVERSED by code point, hence empty, although the
+    // carrier of `U+DFFF` sorts above `U+E000` as a `char`.
+    assert!(WeRegex::range("\u{e000}", &cp(0xDFFF)).is_empty_lang());
+
+    // vd8_25: x in [U+D000, U+DBFF] ∩ [U+D900, U+F000], x != U+D900 — sat
+    // (x = U+D901).
+    let parts = vec![vec![
+        WeRegex::range("\u{d000}", &cp(0xDBFF)),
+        WeRegex::range(&cp(0xD900), "\u{f000}"),
+        WeRegex::comp(WeRegex::lit(&cp(0xD900))),
+    ]];
+    assert!(!concat_membership_definitely_empty(&parts, &[]));
+}
+
+/// The characters outside every range are represented by `U+0000` when
+/// nothing lies above the greatest critical (mutant M26; verifier witness
+/// `m26_a`: `allchar ∩ comp(re.range "a" "\u{2ffff}")`, a wrong `unsat` when
+/// the class alphabet had no outside letter).
+#[test]
+fn outside_class_below_the_least_critical_is_represented() {
+    let r = WeRegex::inter(vec![
+        WeRegex::AnyChar,
+        WeRegex::comp(WeRegex::range("a", &cp(0x2FFFF))),
+    ]);
+    assert!(
+        !concat_membership_definitely_empty(&[vec![r.clone()]], &[]),
+        "U+0000..U+0060 satisfy allchar ∩ comp([a, U+2FFFF])"
+    );
+    let witness = find_witness(std::slice::from_ref(&r), None).expect("a one-character witness");
+    assert_eq!(witness.chars().count(), 1);
+    assert!(ay_core::smtlib_code_point(witness.chars().next().unwrap()) < u32::from('a'));
+}
+
+/// The critical characters are walked in code-point order, so the gap and
+/// outside representatives land in the right classes (mutant M27; verifier
+/// witness `fd8_0258`: `allchar ∩ comp(re.range "\u{dffe}" "\u{e000}")`, a
+/// wrong `unsat` when `char` order put the `U+DFFE` carrier after `U+E000`
+/// and every representative fell inside the range).
+#[test]
+fn criticals_are_walked_in_code_point_order() {
+    let r = WeRegex::inter(vec![
+        WeRegex::AnyChar,
+        WeRegex::comp(WeRegex::range(&cp(0xDFFE), "\u{e000}")),
+    ]);
+    assert!(
+        !concat_membership_definitely_empty(&[vec![r.clone()]], &[]),
+        "every character but U+DFFE, U+DFFF and U+E000 satisfies it"
+    );
+    // The gap between two surrogate criticals is a class of its own.
+    let gap = WeRegex::inter(vec![
+        WeRegex::range(&cp(0xD800), &cp(0xDFFF)),
+        WeRegex::comp(WeRegex::lit(&cp(0xD800))),
+        WeRegex::comp(WeRegex::lit(&cp(0xDFFF))),
+    ]);
+    assert!(!concat_membership_definitely_empty(&[vec![gap]], &[]));
 }

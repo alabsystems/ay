@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Regression test (core membership, observed directly): under `strengthening_to_core on` the
+% constraint a bare `red` introduces is a CORE constraint, so `deletion.rs` routes its deletion
+% through checked deletion and refuses it without a justification -- the same refusal a formula
+% constraint already got. While the `red` result was misclassified as derived this `del` was
+% silently accepted, which is the cheapest direct observation of the misclassification.
+f 1;
+strengthening_to_core on;
+red 1 y1 >= 1 : y1 -> 1 ;
+del id 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

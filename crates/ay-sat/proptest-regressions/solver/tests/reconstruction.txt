@@ -27,3 +27,14 @@ cc 9aec83ae5f25430ab99613488ea5b898d225fcdd70cd71650b9b8a4a1f4e298b # shrinks to
 cc cd1c7ce6bc90aac8bb5e367fb6dfe6c0c9089c7acdc3af0c0e79414c11b970e8 # shrinks to num_vars = 19, seed = 58
 cc dd3baad9b839a1bc07e36dd8babcf2cc6a2edb777334c3a74b9caba8b418138b # shrinks to seed = 326, n_gates = 3
 cc dd60a6dc5e83e127604780e1b3fa76b3d59f20900da62f54db7188eb87beabff # shrinks to num_vars = 20, seed = 405
+cc bae4be58ee418ab963e2bbe94d7d35521ba354a32b27c5854a1b070387a682ed # shrinks to grid_size = 2, seed = 31
+cc 54693fece4a6314314fdb435033ef36a8eba15e66f3dbe44c5ad0de8120d370d # shrinks to n = 2, _seed = 0
+cc e1ec4ba24c2f80503f300a2196ba41908e5fdf08b4dcf7abf6d6c439bea34d21 # shrinks to num_vars = 5, num_clauses = 14, seed = 1112
+cc 3c8bd7efff41504acf752e6ce5ae93c318b869e1f55251140059db9ffc71d3aa # shrinks to num_clauses = 1, seed = 0
+cc a0285a1fa0b5f8b4a250140852a30920df23f97ca47def4618ea719e155bd938 # shrinks to num_clauses = 4, seed = 0
+cc 75c23cd4d5f2385a39efc7c2ca60d0c125a04af3f517ca620b4dcf9cb67b77e9 # shrinks to num_vars = 3, seed = 337
+cc 3dccdf87fd3491f3887e006229d303b6d8ef81c676a740ddbedcf4e9e611da49 # shrinks to num_vars = 5, num_clauses = 5, seed = 1754
+cc e090e35c32de4801b703bacfe1542457f75f69383c0e116e0e37c20b4b157d42 # shrinks to n = 3, _seed = 0
+cc faf1e16d171286974a38ff64d81426243a15cfa9c714252b612ee51fe4caf667 # shrinks to num_vars = 17, seed = 194
+cc d806d9bd336d42f7268a6da997f07d8c9d24946ac857e1b985ca824cbd8d0754 # shrinks to num_vars = 5, seed = 1010
+cc 6beb017563fd3b4a7ebd22a1553d0ab6a1da3b9167c58a74484c3c59fe5e256f # shrinks to num_vars = 19, seed = 234

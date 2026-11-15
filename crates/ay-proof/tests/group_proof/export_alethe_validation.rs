@@ -116,7 +116,10 @@ fn exports_boolean_and_certificate_that_carcara_accepts() {
 }
 
 include!("export_alethe_validation/linear_arithmetic.rs");
+include!("export_alethe_validation/cut_chain.rs");
+include!("export_alethe_validation/equality_lattice.rs");
 include!("export_alethe_validation/let_bridge_resolution.rs");
+include!("export_alethe_validation/pinned_carcara_refusal.rs");
 
 const QF_EQ_TRANS_DISTINCT_UNSAT: &str = r#"
 (set-logic QF_UFLIA)
@@ -395,7 +398,13 @@ fn assert_carcara_accepts(label: &str, problem: &str, proof: &str) {
     assert_carcara_verdict(label, problem, proof, "valid");
 }
 
+/// Pinned carcara's exact verdict must be `expected`. A pair on which that
+/// verdict is not evidence in either direction (`ay_core::pinned_carcara`)
+/// fails first, before the checker runs, whatever `expected` is.
 fn assert_carcara_verdict(label: &str, problem: &str, proof: &str, expected: &str) {
+    if let Err(misjudged) = ay_core::pinned_carcara::pinned_carcara_can_judge(problem, proof) {
+        panic!("{label}: {misjudged}\n{proof}");
+    }
     let Some(carcara) = find_carcara() else {
         eprintln!("carcara not found, skipping external Alethe validation for {label}");
         return;

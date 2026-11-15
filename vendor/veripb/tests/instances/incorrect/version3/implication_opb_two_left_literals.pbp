@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% The OPB reification shorthand is malformed, so the FORMULA file is
+% rejected by the reader before any rule runs. Upstream ships these as
+% plain incorrect instances; this checker additionally requires an
+% incorrect instance to say WHERE it is refused, so that a proof which
+% merely stopped parsing is never mistaken for evidence of a checking
+% defect.
+f 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

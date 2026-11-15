@@ -39,7 +39,7 @@ impl Solver {
         wall_limit_ms: u64,
         tick_budget: u64,
     ) -> bool {
-        if crate::determinism::deterministic_inproc_enabled() {
+        if self.deterministic_inproc() {
             self.total_search_ticks().saturating_sub(start_ticks) >= tick_budget
         } else {
             start.elapsed().as_millis() as u64 >= wall_limit_ms
@@ -67,14 +67,27 @@ impl Solver {
     /// Run inprocessing immediately after a restart.
     ///
     /// Returns `true` if UNSAT was derived at decision level 0.
-    #[inline]
+    #[cfg(test)]
     pub(in crate::solver) fn run_restart_inprocessing(&mut self) -> bool {
+        self.run_restart_inprocessing_until(&|| false)
+    }
+
+    /// `run_restart_inprocessing`, whose round also polls the search's stop
+    /// (`inprocessing_stop_requested`); a stop it sees is left for
+    /// `run_inprocessing_round_until`.
+    #[inline]
+    pub(in crate::solver) fn run_restart_inprocessing_until(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+    ) -> bool {
         // #8477: Runtime disable flag for bisecting inprocessing soundness bugs.
         // #8506: Reads cached OnceLock instead of per-call std::env::var() syscall.
         if ay_core::sat_disable_flags().no_inprocess {
             return false;
         }
-        // Check interrupt before running any inprocessing (#3638).
+        // Check interrupt (#3638) before inprocessing. A failed proof writer
+        // is no reason to stop: every emission is a no-op on it, and the
+        // inprocessing-boundary asserts accept a latched writer.
         if self.is_interrupted() {
             return false;
         }
@@ -115,7 +128,12 @@ impl Solver {
             return false;
         }
 
-        self.run_restart_inprocessing_slow()
+        let unsat = self.run_restart_inprocessing_slow(should_stop);
+        // Kissat reclassifies after elimination and probing (`--sat-jump-reasons-kissat`).
+        if !unsat {
+            self.reclassify_jump_reasons_kissat(self.decision_level == 0);
+        }
+        unsat
     }
 
     /// Execute the broad restart inprocessing pass set after the hot gate fires.
@@ -124,7 +142,19 @@ impl Solver {
     /// inherit the instruction footprint of the full inprocessing pipeline.
     #[cold]
     #[inline(never)]
-    fn run_restart_inprocessing_slow(&mut self) -> bool {
+    fn run_restart_inprocessing_slow(&mut self, should_stop: &dyn Fn() -> bool) -> bool {
+        // A stop that has fired starts no round.
+        if self.inprocessing_stop_requested(should_stop) {
+            return false;
+        }
+        // The proof sink probes its filesystem's free space on write and on
+        // flush, so a real inprocessing round is where the disk reserve gets a
+        // look that does not wait for the byte cadence (2026-09-20). A failure
+        // is the sink's to latch, and a latched writer stops the proof and not
+        // the search (77d0e04fb), so the result is deliberately dropped.
+        let _ = self.flush_proof_writer();
+        self.promote_learned_binaries_kissat();
+
         // ── Level-0 garbage collection (deferred past inprocessing gate) ──
         // CaDiCaL runs mark_satisfied_clauses_as_garbage() inside collect()
         // which is called from reduce(), not on every restart. On large
@@ -180,6 +210,10 @@ impl Solver {
         // active, the per-round pass gates measure the tick delta against this
         // instead of `round_start.elapsed()` (wf_6503d3eb determinism harden).
         let round_start_ticks = self.total_search_ticks();
+        // Under `--sat-deterministic-inproc` the overhead is counted work, not
+        // wall time (det_work.rs); both baselines are 0 with the flag off.
+        let round_start_work = self.pass_work_baseline();
+        let pass_work_baseline = self.cold.inproc_pass_work_te;
         let pass_time_baseline: [u64; solver_stats::INPROCESS_TIMING_LABELS.len()] =
             self.stats.inprocessing_time_ns;
         let pass_yield_baseline: [u64; solver_stats::INPROCESS_ACCOUNTING_LABELS.len()] =
@@ -258,21 +292,35 @@ impl Solver {
                 irredundant_clauses,
                 formula_density,
             );
-        let skip_expensive_equivalence_passes = self.num_vars > PREPROCESS_EXPENSIVE_MAX_VARS
-            || active_clauses > PREPROCESS_EXPENSIVE_MAX_CLAUSES
-            || skip_dense_inprocessing_elim;
+        let gate_vars = self.size_gate_vars();
+        // `--sat-large-inproc`: no variable gate, and a 32M active-clause gate
+        // in place of the 3M ones, for the in-search equivalence passes.
+        let large = ay_core::sat_ab_switches().large_inproc == Some(true);
+        let (max_vars, max_clauses, max_cong_clauses) = if large {
+            (
+                usize::MAX,
+                LARGE_INPROC_MAX_CLAUSES,
+                LARGE_INPROC_MAX_CLAUSES,
+            )
+        } else {
+            (
+                PREPROCESS_EXPENSIVE_MAX_VARS,
+                PREPROCESS_EXPENSIVE_MAX_CLAUSES,
+                CONGRUENCE_MAX_CLAUSES,
+            )
+        };
+        let skip_expensive_equivalence_passes =
+            gate_vars > max_vars || active_clauses > max_clauses || skip_dense_inprocessing_elim;
         // Subsumption pays an O(clauses) occurrence-list setup cost. Large
         // sparse Main-track formulas such as spg_200_316 can also pay a large
         // transient memory cost just to build subsumption candidates, so keep
         // the hard var/active-clause gates and cool skipped/no-progress rounds
         // down with the large idle interval.
-        let skip_subsume_inproc = self.num_vars > PREPROCESS_EXPENSIVE_MAX_VARS
-            || active_clauses > PREPROCESS_EXPENSIVE_MAX_CLAUSES
-            || skip_dense_inprocessing_elim;
+        let skip_subsume_inproc =
+            gate_vars > max_vars || active_clauses > max_clauses || skip_dense_inprocessing_elim;
         // Congruence + decompose share a clause threshold (CONGRUENCE_MAX_CLAUSES = 3M).
-        let skip_congruence_inproc = self.num_vars > PREPROCESS_EXPENSIVE_MAX_VARS
-            || active_clauses > CONGRUENCE_MAX_CLAUSES
-            || skip_dense_inprocessing;
+        let skip_congruence_inproc =
+            gate_vars > max_vars || active_clauses > max_cong_clauses || skip_dense_inprocessing;
         // Giant-formula bail for the two decompose RE-RUN sites below (HTR
         // produced_binary + probe_found_failed) — 2026-07-11 dense-band
         // regression fix, guard 2. Those sites bypass skip_congruence_inproc,
@@ -371,7 +419,10 @@ impl Solver {
         // grow the interval 1.5×, productive calls reset to base.
         // On large residuals (>3M clauses), decompose's clause substitution
         // pass is O(total_literals) which is expensive (#7135).
-        let should_decompose = self.should_decompose();
+        // `--sat-subst-kissat`: Kissat substitutes after congruence and after
+        // sweeping, not at round start.
+        let subst_kissat = self.subst_kissat_active();
+        let should_decompose = !subst_kissat && self.should_decompose();
         if should_decompose {
             self.stats
                 .record_inprocessing_attempt(DiagnosticPass::Decompose);
@@ -463,7 +514,7 @@ impl Solver {
         #[cfg(debug_assertions)]
         self.validate_watch_invariants();
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -472,7 +523,8 @@ impl Solver {
         // subsumption spends 11.7s for a 0.02% subsumption rate. The density
         // guard skips this pass on large dense formulas where the O(clauses)
         // setup cost dominates with negligible benefit.
-        let should_subsume = self.should_subsume();
+        // `--sat-subsume-kissat`: only around elimination.
+        let should_subsume = !self.cold.subsume_kissat && self.should_subsume();
         if should_subsume {
             self.stats
                 .record_inprocessing_attempt(DiagnosticPass::Subsume);
@@ -503,7 +555,7 @@ impl Solver {
         #[cfg(debug_assertions)]
         self.bisect_validate_watches("after subsume");
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -517,7 +569,7 @@ impl Solver {
             // Probing returns true only on proven UNSAT (level-0 conflict).
             // Use explicit timing to capture probe() duration for overhead
             // calculation (#8099).
-            let probe_unsat = self.run_probe_inprocessing_pass();
+            let probe_unsat = self.run_probe_inprocessing_pass(should_stop);
             if probe_unsat {
                 return true;
             }
@@ -552,7 +604,12 @@ impl Solver {
                 self.stats
                     .record_inprocessing_attempt(DiagnosticPass::Decompose);
             }
-            if probe_found_failed && should_decompose && !auto_giant_decompose_rerun_bail {
+            // A stop seen while probing (or now) skips it: the round ends below.
+            if probe_found_failed
+                && should_decompose
+                && !auto_giant_decompose_rerun_bail
+                && !self.inprocessing_stop_requested(should_stop)
+            {
                 self.jit_invalidate_for_structural_pass(); // decompose: structural (#8128)
                 self.run_timed_diagnostic_inprocessing_pass(
                     DiagnosticPass::Decompose,
@@ -567,6 +624,12 @@ impl Solver {
         // BISECT: targeted validation after probe
         #[cfg(debug_assertions)]
         self.bisect_validate_watches("after probe");
+
+        // A stop probing saw ends the round here, before intree probing,
+        // congruence and decompose (`inprocessing_stop_requested`).
+        if self.inprocessing_stop_requested(should_stop) {
+            return false;
+        }
 
         // Intree probing: BFS tree-structured probe (CMS intree.cpp, #8169).
         // Runs after sequential probing for complementary coverage:
@@ -610,7 +673,13 @@ impl Solver {
         // Regression timeline: b5f8a5234 removed this guard → FlatZinc accap
         // returned false UNSAT; 3e7738b95 restored it.
         let mut congruence_found_equivalences = false;
-        let should_congruence = self.should_congruence();
+        // `--sat-subst-kissat`: every round, subject to Kissat's delay
+        // counter (`subst_kissat.rs`), with decompose after it every round.
+        let should_congruence = if subst_kissat {
+            self.inproc_ctrl.congruence.enabled
+        } else {
+            self.should_congruence()
+        };
         if should_congruence {
             self.stats
                 .record_inprocessing_attempt(DiagnosticPass::Congruence);
@@ -622,10 +691,18 @@ impl Solver {
             && !skip_congruence_inproc
         {
             // congruence: deletion-only (only adds binary clauses, no structural modification)
-            congruence_found_equivalences = self.run_timed_diagnostic_inprocessing_pass(
-                DiagnosticPass::Congruence,
-                Self::congruence,
-            );
+            if subst_kissat {
+                let outcome = self.run_timed_diagnostic_inprocessing_pass(
+                    DiagnosticPass::Congruence,
+                    Self::congruence_kissat_delayed,
+                );
+                congruence_found_equivalences = outcome.unwrap_or(false);
+            } else {
+                congruence_found_equivalences = self.run_timed_diagnostic_inprocessing_pass(
+                    DiagnosticPass::Congruence,
+                    Self::congruence,
+                );
+            }
             passes_run.push("congruence");
             if self.propagate_check_unsat() {
                 return true;
@@ -663,7 +740,13 @@ impl Solver {
         // reason-protected clauses retain pre-substitution literals (#5237).
         // Decompose stays disabled in proof modes until proof emission and
         // final model reconstruction are both safe.
-        let should_decompose = self.should_decompose();
+        // Kissat substitutes after congruence in every probe round, whether or
+        // not the delay let congruence run (probe.c:34-35).
+        let should_decompose = if subst_kissat {
+            self.inproc_ctrl.decompose.enabled
+        } else {
+            self.should_decompose()
+        };
         if should_decompose || (congruence_found_equivalences && self.inproc_ctrl.decompose.enabled)
         {
             self.stats
@@ -693,7 +776,7 @@ impl Solver {
         // graph before the rest of the round mutates clause structure further.
         self.run_fmla_decompose_lrat_preflight_route(&mut passes_run);
 
-        if self.is_interrupted() {
+        if self.inprocessing_stop_requested(should_stop) {
             return false;
         }
 
@@ -730,6 +813,10 @@ impl Solver {
             }
         }
 
+        if self.inprocessing_stop_requested(should_stop) {
+            return false;
+        }
+
         // Elimination back-half: BVE interleaved with subsumption/BCE/CCE
         // (CaDiCaL elim.cpp:1093-1098 cascade), factor, standalone BCE/CCE,
         // condition, transred, sweep + decompose, compact.
@@ -747,6 +834,10 @@ impl Solver {
         #[cfg(debug_assertions)]
         self.bisect_validate_watches("after elimination");
 
+        if self.inprocessing_stop_requested(should_stop) {
+            return false;
+        }
+
         // Backbone computation: identify literals fixed in every model.
         // Initial implementation uses bounded assumption-based probing, so run
         // it after the elimination block has simplified the formula and before
@@ -758,7 +849,9 @@ impl Solver {
         // has already consumed the wall-clock budget. Backbone bounded-CDCL
         // is the most expensive single technique (up to 200ms per call).
         let skip_wall_clock = self.inproc_round_over_budget(round_start, round_start_ticks);
-        let should_backbone = self.should_backbone();
+        // `--sat-backbone-binary-kissat`: no bounded-CDCL backbone (Kissat has the binary one only).
+        let should_backbone = self.should_backbone()
+            && ay_core::sat_ab_switches().backbone_binary_kissat != Some(true);
         let bounded_backbone_allowed = !self.bounded_backbone_zero_decompose_backoff_enabled
             || self.num_conflicts >= self.cold.next_bounded_backbone_conflict;
         if should_backbone {
@@ -778,6 +871,7 @@ impl Solver {
                 [solver_stats::inprocessing_timing_index(DiagnosticPass::Backbone).unwrap()];
             let decompose_index =
                 solver_stats::inprocessing_timing_index(DiagnosticPass::Decompose).unwrap();
+            let backbone_work_before = self.cold.inproc_pass_work_te;
             let bb_found = self
                 .run_timed_diagnostic_inprocessing_pass(DiagnosticPass::Backbone, Self::backbone);
             let backbone_time_after = self.stats.inprocessing_time_ns
@@ -802,7 +896,17 @@ impl Solver {
             let round_decompose_yields = self.stats.inprocessing_pass_yields[decompose_index]
                 .saturating_sub(pass_yield_baseline[decompose_index]);
             let bounded_units = bounded_backbone_yield_delta.max(u64::from(bb_found));
-            let bounded_ms_per_unit = bounded_backbone_ms / bounded_units.max(1);
+            // Under `--sat-deterministic-inproc` the backoff compares the
+            // pass's counted work, in milliseconds at TICKS_PER_MS.
+            let bounded_ms_per_unit = if self.deterministic_inproc() {
+                let work = self
+                    .cold
+                    .inproc_pass_work_te
+                    .saturating_sub(backbone_work_before);
+                work / crate::determinism::TICKS_PER_MS / bounded_units.max(1)
+            } else {
+                bounded_backbone_ms / bounded_units.max(1)
+            };
             if self.bounded_backbone_zero_decompose_backoff_enabled
                 && round_decompose_yields == 0
                 && bounded_ms_per_unit >= BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_MIN_MS_PER_UNIT
@@ -869,6 +973,10 @@ impl Solver {
         #[cfg(debug_assertions)]
         self.bisect_validate_watches("after backbone");
 
+        if self.inprocessing_stop_requested(should_stop) {
+            return false;
+        }
+
         // CaDiCaL probe.cpp:949: vivify runs after sweep (resets watches).
         // Vivify strengthens clauses by re-propagating their literals.
         // Running after sweep means sweep equivalences are substituted first,
@@ -921,6 +1029,9 @@ impl Solver {
             let vivify_made_progress =
                 self.inprocessing_yield_signal(DiagnosticPass::Vivify) > vivify_yield_before;
             passes_run.push("vivify");
+            if self.inprocessing_stop_requested(should_stop) {
+                return false;
+            }
 
             // Post-vivification subsumption (#7393, #8134, #8135): vivification
             // marks strengthened/deleted clause variables dirty. A follow-up
@@ -940,6 +1051,7 @@ impl Solver {
                 || vivify_made_progress
                 || self.should_subsume();
             if self.inproc_ctrl.subsume.enabled
+                && !self.cold.subsume_kissat
                 && !skip_subsume_inproc
                 && !post_vivify_subsume_wall_budget_exceeded
                 && post_vivify_subsume_due
@@ -1046,13 +1158,13 @@ impl Solver {
 
         // Always-on release-mode soundness guards (#4994):
 
-        // Fix 1: Proof I/O error check. ProofOutput::has_io_error() exists in
-        // release builds (bool field on DRAT/LRAT writer). Catches truncated or
-        // corrupted proofs from disk-full or broken-pipe mid-solve. O(1) cost.
+        // Fix 1: an LRAT structural failure here is a bug. A proof WRITE failure
+        // (disk full, broken pipe) is not: solve_stop_reason ends the solve with
+        // ProofWriteFailure, so a latched writer is excluded from this assert.
         if let Some(ref manager) = self.proof_manager {
             assert!(
-                !manager.has_inprocessing_boundary_error(),
-                "BUG: proof I/O error detected at inprocessing boundary"
+                self.proof_output_failed() || !manager.has_inprocessing_boundary_error(),
+                "BUG: LRAT structural proof failure at inprocessing boundary"
             );
         }
 
@@ -1077,7 +1189,11 @@ impl Solver {
             .map(|(now, before)| now.saturating_sub(*before))
             .sum();
         let overhead_ns = round_elapsed_ns.saturating_sub(pass_time_delta_ns);
-        self.cold.last_inprocessing_overhead_ms = overhead_ns as f64 / 1_000_000.0;
+        self.cold.last_inprocessing_overhead_ms = if self.deterministic_inproc() {
+            self.counted_round_overhead_ms(round_start_work, pass_work_baseline)
+        } else {
+            overhead_ns as f64 / 1_000_000.0
+        };
 
         // Update per-round stats (#8099).
         self.stats.inprocessing_rounds += 1;
@@ -1280,6 +1396,25 @@ impl Solver {
         };
         let delta =
             (base_delta as f64 * clause_scale * productivity_scale * lrat_zero_yield_scale) as u64;
+        // `--sat-inproc-nlogn-schedule true`: Kissat's probe schedule instead
+        // (kimits.h `UPDATE_CONFLICT_LIMIT (probe, probings, NLOGN, true)`):
+        // the interval grows as k log10(k + 9) in the number of rounds and is
+        // scaled once by the formula's size, with no productivity feedback;
+        // each pass bounds its own cost by its tick budget. On schooltt-5-3
+        // (47173e8a; 263K clauses, UNSAT) the backoff above ran 8 rounds in
+        // 8.6M conflicts, one per million, and vivification, which Kissat runs
+        // 60 times in the 2.1M conflicts it needs there, ran 8 times
+        // (2026-09-21). The LRAT probe rescue keeps its own cadence.
+        let delta = if !lrat_probe_rescue_due
+            && ay_core::sat_ab_switches().inproc_nlogn_schedule == Some(true)
+        {
+            kissat_probe_interval(
+                self.arena.irredundant_count() as u64,
+                u64::from(self.cold.inprobe_phases),
+            )
+        } else {
+            delta
+        };
         let delta = delta.max(INPROBE_INTERVAL);
         let delta = if lrat_probe_rescue_due {
             delta.min(LRAT_PROOF_CLAMP_PROBE_RESCUE_INTERVAL)
@@ -1287,6 +1422,7 @@ impl Solver {
             delta
         };
         self.cold.next_inprobe_conflict = self.total_conflicts().saturating_add(delta);
+        self.cold.last_inprobe_ticks = self.search_ticks[0] + self.search_ticks[1];
         if lrat_probe_rescue_due {
             self.inproc_ctrl.probe.reschedule(self.num_conflicts, delta);
         }
@@ -1372,5 +1508,55 @@ impl Solver {
         }
 
         false
+    }
+}
+
+/// Kissat's probe interval (`kimits.c`, `kissat_scale_delta` and
+/// `kissat_nlogpown`; `UPDATE_CONFLICT_LIMIT (probe, probings, NLOGN, true)`
+/// in `probe.c`): `probeint` (100) times `k log10(k + 9)` for the `k`-th
+/// round, times `4.5 (log10(C + 10) - 5)^2 + 25` for `C` irredundant clauses.
+/// On a 263K-clause formula the rounds fall at about 2.6K, 5.4K, 8.5K, ...,
+/// 33K (k = 10), 143K (k = 34) conflicts apart: 34 rounds inside the first
+/// 2.1M conflicts.
+pub(super) fn kissat_probe_interval(irredundant_clauses: u64, rounds: u64) -> u64 {
+    const PROBE_INTERVAL: f64 = 100.0;
+    let rounds = rounds.max(1) as f64;
+    let n_log_n = rounds * (rounds + 9.0).log10();
+    let f = ((irredundant_clauses + 10) as f64).log10() - 5.0;
+    let size_scale = 4.5 * f * f + 25.0;
+    (PROBE_INTERVAL * n_log_n * size_scale) as u64
+}
+
+#[cfg(test)]
+mod nlogn_schedule_tests {
+    use super::kissat_probe_interval;
+
+    /// The schooltt-5-3 numbers: 263,418 irredundant clauses give a size
+    /// scale of 25.8, so the first round is 2,579 conflicts away, the tenth
+    /// 32,987, and the first 34 rounds span 2.28M conflicts, which is where
+    /// Kissat's 34 probings sat when it answered (2026-09-21).
+    #[test]
+    fn the_schooltt_rounds_land_where_kissats_did() {
+        let c = 263_418;
+        assert_eq!(kissat_probe_interval(c, 1), 2_579);
+        assert_eq!(kissat_probe_interval(c, 10), 32_987);
+        let span: u64 = (1..=34).map(|k| kissat_probe_interval(c, k)).sum();
+        assert_eq!(span, 2_284_054);
+    }
+
+    /// The size scale is a parabola with its minimum of 25x at 100K clauses:
+    /// an empty formula gets 97x, a ten-million-clause one 43x; and the
+    /// interval never shrinks with the round count.
+    #[test]
+    fn the_size_scale_and_the_growth_are_monotone() {
+        assert_eq!(kissat_probe_interval(0, 1), 9_700);
+        assert_eq!(kissat_probe_interval(100_000, 1), 2_500);
+        assert_eq!(kissat_probe_interval(10_000_000, 1), 4_300);
+        let mut last = 0;
+        for k in 1..200 {
+            let next = kissat_probe_interval(50_000, k);
+            assert!(next >= last, "k {k}: {next} < {last}");
+            last = next;
+        }
     }
 }

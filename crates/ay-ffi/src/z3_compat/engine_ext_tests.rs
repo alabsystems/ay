@@ -265,6 +265,17 @@ fn update_term_rejects_null_wrapping_tagged_and_foreign_context_ast_handles() {
     }
 }
 
+/// `Z3_update_term` refused a term not stored as the caller built it (see
+/// `provenance.rs`): null, `Z3_INVALID_ARG`, the provenance message.
+unsafe fn assert_refused_for_provenance(c: Z3_context, rebuilt: Z3_ast) {
+    // SAFETY: `c` is live; the message is context-owned.
+    unsafe {
+        assert_eq!(rebuilt, 0);
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+        assert!(error_message(c).contains("may not be the term the caller built"));
+    }
+}
+
 #[test]
 fn update_term_accepts_parser_and_accessor_handles_without_sort_cache_entries() {
     unsafe {
@@ -293,9 +304,12 @@ fn update_term_accepts_parser_and_accessor_handles_without_sort_cache_entries() 
         assert_eq!(Z3_get_app_num_args(c, parsed_root), 2);
         let parsed_child = Z3_get_app_arg(c, parsed_root, 0);
         let parsed_rhs = Z3_get_app_arg(c, parsed_root, 1);
+        // They are accepted as handles (no handle or sort error), and the
+        // update is refused for provenance: AY's parser rewrites, so a parsed
+        // term may not have the structure z3's parser gives it, and keeping
+        // AY's operator could return a formula z3 would not.
         let rebuilt_root = Z3_update_term(c, parsed_root, 2, [parsed_child, parsed_rhs].as_ptr());
-        assert_eq!(rebuilt_root, parsed_root);
-        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_refused_for_provenance(c, rebuilt_root);
 
         // Children returned by application accessors have the same status.
         // Exercise both the accessor-produced source and its unrecorded
@@ -304,8 +318,7 @@ fn update_term_accepts_parser_and_accessor_handles_without_sort_cache_entries() 
         let lhs = Z3_get_app_arg(c, parsed_child, 0);
         let rhs = Z3_get_app_arg(c, parsed_child, 1);
         let rebuilt_child = Z3_update_term(c, parsed_child, 2, [lhs, rhs].as_ptr());
-        assert_eq!(rebuilt_child, parsed_child);
-        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_refused_for_provenance(c, rebuilt_child);
 
         // Quantifier-body accessors likewise return valid arena terms without
         // requiring a prior `record_ast_sort` call.
@@ -315,8 +328,7 @@ fn update_term_accepts_parser_and_accessor_handles_without_sort_cache_entries() 
         let body_lhs = Z3_get_app_arg(c, body, 0);
         let body_rhs = Z3_get_app_arg(c, body, 1);
         let rebuilt_body = Z3_update_term(c, body, 2, [body_lhs, body_rhs].as_ptr());
-        assert_eq!(rebuilt_body, body);
-        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_refused_for_provenance(c, rebuilt_body);
 
         Z3_del_context(c);
     }
@@ -390,7 +402,23 @@ fn identity_and_singleton_builders_do_not_launder_foreign_term_asts() {
         );
         assert_eq!(Z3_mk_char_to_int(local, foreign_char), 0);
         assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
-        assert_eq!(Z3_mk_char_to_int(local, local_char), local_char);
+        // The local character's code point is its own Int-sorted AST, never
+        // the Char handle re-sorted (libz3 5.1.0: `c.to_int().eq(c)` is
+        // False and `c.to_int().sort()` is Int; T5 P1).
+        let code = Z3_mk_char_to_int(local, local_char);
+        assert_ne!(code, 0);
+        assert_ne!(code, local_char);
+        assert_eq!(
+            Z3_get_sort_kind(local, Z3_get_sort(local, code)),
+            Z3_INT_SORT
+        );
+        assert_eq!(
+            Z3_get_sort_kind(local, Z3_get_sort(local, local_char)),
+            Z3_CHAR_SORT
+        );
+        assert_eq!(Z3_mk_char_to_int(local, local_char), code);
+        // Keep the two contexts' node numbering in step for the next probe.
+        assert_ne!(Z3_mk_char_to_int(foreign, foreign_char), 0);
 
         // The one-argument set-union fast path also returns its sole operand.
         // Authentication must happen before that fast path.

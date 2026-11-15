@@ -85,8 +85,16 @@ fn internal_proof_tracking_is_unconditionally_on_at_the_prepass_site() {
 /// condition, whatever that condition is spelled as — including a regression to
 /// `!produce_proofs_enabled()`, and including an `Unknown` lane that stops
 /// arming.
+///
+/// The QSAT route decides this fragment and the retry stands down behind it
+/// (`qsat_route_applied`), so the battery runs under `--no-qsat`, where the
+/// retry is the fallback it was before the route.
 #[test]
 fn deep_qe_prepass_is_entered_on_the_unknown_fallback_lane() {
+    let _no_qsat = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        no_qsat: true,
+        ..ay_core::misc_cli_flags().clone()
+    });
     const UNDECIDED_BY_THE_ORDINARY_LANES: &[&str] = &[
         // Four-level alternation with a divisibility side condition.
         r"(set-logic LIA)

@@ -32,6 +32,155 @@ impl PdrSolver {
         Some(model)
     }
 
+    /// Fallibly translate a model from the original predicate signatures
+    /// FORWARD into PDR's internally scalarized signature: the inverse of
+    /// [`Self::try_translate_array_scalarized_model`]. Used to judge an
+    /// external or back-translated original-signature model in the working
+    /// vocabulary. Fails closed when a formula mentions an array argument
+    /// the scalarization dropped in a position other than a tracked-index
+    /// `select` (whole-array equalities, stores, untracked reads): such a
+    /// model cannot be expressed over the scalarized signature at all.
+    pub(in crate::pdr) fn try_scalarize_model_forward(
+        &self,
+        mut model: InvariantModel,
+    ) -> Option<InvariantModel> {
+        for map in &self.array_scalarization_maps {
+            model = Self::scalarize_model_through_map(model, map)?;
+        }
+        Some(model)
+    }
+
+    fn scalarize_model_through_map(
+        model: InvariantModel,
+        map: &crate::problem::ArrayScalarizationMap,
+    ) -> Option<InvariantModel> {
+        let mut result = InvariantModel::new();
+        result.verification_method = model.verification_method;
+        result.individually_inductive = model.individually_inductive;
+        result.convergence_proven = model.convergence_proven;
+
+        for (pid, interp) in model.iter() {
+            let arg_map = map.pred_args.get(pid)?;
+            if interp.vars.len() != map.original_predicates.get(pid.index())?.arg_sorts.len() {
+                return None;
+            }
+            // New binders in scalarized order. Names are local to the
+            // interpretation (verification substitutes binders positionally),
+            // so they only need to be distinct within this formula.
+            let mut new_vars: Vec<ChcVar> = Vec::with_capacity(arg_map.len());
+            for (idx, entry) in arg_map.iter().enumerate() {
+                let sort = match entry {
+                    ArrayScalarizedArg::Original(original) => {
+                        interp.vars.get(*original)?.sort.clone()
+                    }
+                    ArrayScalarizedArg::Select { original_arg, .. } => {
+                        match &interp.vars.get(*original_arg)?.sort {
+                            ChcSort::Array(_, value) => (**value).clone(),
+                            _ => return None,
+                        }
+                    }
+                };
+                new_vars.push(ChcVar::new(
+                    format!("__fwd_p{}_a{}", pid.index(), idx),
+                    sort,
+                ));
+            }
+            let formula =
+                Self::scalarize_formula_forward(&interp.formula, &interp.vars, arg_map, &new_vars)?;
+            result.set(*pid, PredicateInterpretation::new(new_vars, formula));
+        }
+        Some(result)
+    }
+
+    /// Rewrite one original-signature formula over the scalarized binders.
+    /// `None` when any array-valued content survives that the scalarized
+    /// signature cannot express.
+    fn scalarize_formula_forward(
+        expr: &ChcExpr,
+        original_vars: &[ChcVar],
+        arg_map: &[ArrayScalarizedArg],
+        new_vars: &[ChcVar],
+    ) -> Option<ChcExpr> {
+        crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(_) => None,
+            ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
+                Some(expr.clone())
+            }
+            ChcExpr::Var(var) => {
+                if let Some(original) = original_vars.iter().position(|v| v == var) {
+                    arg_map
+                        .iter()
+                        .position(|entry| {
+                            matches!(entry, ArrayScalarizedArg::Original(i) if *i == original)
+                        })
+                        .map(|idx| ChcExpr::var(new_vars[idx].clone()))
+                } else {
+                    // A variable that is not an interpretation binder keeps
+                    // its identity; downstream free-variable screening in
+                    // the verifier still applies unchanged.
+                    Some(expr.clone())
+                }
+            }
+            ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
+                if let ChcExpr::Var(array_var) = args[0].as_ref() {
+                    if let Some(original) = original_vars.iter().position(|v| v == array_var) {
+                        if let Some(idx) = arg_map.iter().position(|entry| {
+                            matches!(
+                                entry,
+                                ArrayScalarizedArg::Select { original_arg, index }
+                                    if *original_arg == original && index == args[1].as_ref()
+                            )
+                        }) {
+                            return Some(ChcExpr::var(new_vars[idx].clone()));
+                        }
+                        // Untracked read of a scalarized-away array: only
+                        // expressible when the array argument itself was
+                        // retained, handled by the generic recursion below.
+                        if !arg_map.iter().any(|entry| {
+                            matches!(entry, ArrayScalarizedArg::Original(i) if *i == original)
+                        }) {
+                            return None;
+                        }
+                    }
+                }
+                let new_args = args
+                    .iter()
+                    .map(|a| {
+                        Self::scalarize_formula_forward(a, original_vars, arg_map, new_vars)
+                            .map(std::sync::Arc::new)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(ChcExpr::Op(ChcOp::Select, new_args))
+            }
+            ChcExpr::Op(op, args) => {
+                let new_args = args
+                    .iter()
+                    .map(|a| {
+                        Self::scalarize_formula_forward(a, original_vars, arg_map, new_vars)
+                            .map(std::sync::Arc::new)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(ChcExpr::Op(*op, new_args))
+            }
+            ChcExpr::FuncApp(name, sort, args) => {
+                let new_args = args
+                    .iter()
+                    .map(|a| {
+                        Self::scalarize_formula_forward(a, original_vars, arg_map, new_vars)
+                            .map(std::sync::Arc::new)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(ChcExpr::FuncApp(name.clone(), sort.clone(), new_args))
+            }
+            // Whole-array values and predicate applications have no
+            // scalarized-signature spelling.
+            ChcExpr::ConstArray(..)
+            | ChcExpr::ConstArrayMarker(_)
+            | ChcExpr::IsTesterMarker(_)
+            | ChcExpr::PredicateApp(..) => None,
+        })
+    }
+
     fn translate_model_through_array_scalarization(
         model: InvariantModel,
         map: &crate::problem::ArrayScalarizationMap,
@@ -148,7 +297,14 @@ impl PdrSolver {
             // verification. Exact original-clause validation must establish
             // that every defining body is unreachable; otherwise the Safe
             // candidate is rejected.
-            if pred.arg_sorts.is_empty() && query_relevant_predicates.contains(&pred.id) {
+            //
+            // A nullary predicate with a FACT clause (SeaHorn's `main@entry`) is
+            // not an error flag: `false` contradicts the fact, so its frame
+            // formula decides like any other predicate's.
+            if pred.arg_sorts.is_empty()
+                && query_relevant_predicates.contains(&pred.id)
+                && !self.predicate_has_facts(pred.id)
+            {
                 model.set(
                     pred.id,
                     PredicateInterpretation::new(vars, ChcExpr::Bool(false)),

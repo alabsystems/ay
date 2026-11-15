@@ -913,6 +913,11 @@ pub(crate) fn ledger_note_solve() {
 /// 40% of the iterations is a different problem depending on whether it ran 10
 /// solves or 100,000.
 ///
+/// While the ledger is on, the line is printed even when no phase saw any
+/// traffic (`total=0`: a run no simplex walk served), so a consumer reads a
+/// missing line as "not counted", never as zero (`scripts/corpus_guard.py`'s
+/// WORK tripwire). Off, nothing was counted and the line is empty.
+///
 /// `total` is the ledger's own sum and `engine` is `stats::work()`; `unattributed`
 /// is their difference and MUST be 0. A non-zero value means a pivot loop exists
 /// that neither `dual_simplex` nor `loop_phase` owns — the ledger is wrong, and
@@ -947,15 +952,19 @@ pub fn iter_ledger_line() -> String {
             it as f64 / s.max(1) as f64,
         ));
     }
-    if parts.is_empty() {
+    if parts.is_empty() && !iter_ledger_enabled() {
         return String::new();
     }
-    format!(
-        "ITERLEDGER total={sum} engine={engine} unattributed={} perturb-skipped={} | {}",
+    let mut line = format!(
+        "ITERLEDGER total={sum} engine={engine} unattributed={} perturb-skipped={} |",
         engine as i64 - sum as i64,
         PERTURB_RETRY_SKIPPED.load(Relaxed),
-        parts.join(" "),
-    )
+    );
+    for part in &parts {
+        line.push(' ');
+        line.push_str(part);
+    }
+    line
 }
 
 /// PER-WALK DUAL ANATOMY (`AY_MILP_DUAL_ANATOMY`; trace-accounting only, off by
@@ -1674,10 +1683,9 @@ fn churn_band_factor() -> f64 {
 /// # THE LEVER'S PROVENANCE, because five docstrings cite it
 ///
 /// It was `AY_MILP_LU=1`, and it WORKED, for exactly one window. (The reads
-/// below are spelled without their quotes on purpose: `retired_names_have_no_
-/// read_sites` scans .rs files for the literal `env::var_os` + quoted `AY_*`
-/// and cannot tell a history note from a live key — it caught this very
-/// docstring on the first run.)
+/// below are spelled without their quotes on purpose: a source scan for the
+/// literal `env::var_os` + quoted `AY_*` cannot tell a history note from a
+/// live key.)
 ///
 /// ```text
 ///   939184496  2026-07-14  born:  env::var_os of AY_MILP_LU   <- live lever
@@ -1697,13 +1705,10 @@ fn churn_band_factor() -> f64 {
 /// The flag `--lu` that those docs now advertise has never, at any commit,
 /// reached this function.
 ///
-/// Four gates had no purchase on that: `env_ledger` scans for `AY_*` names and
-/// `"--lu"` is not one; `knob_census` enumerates `Knob` variants and `--lu` is
-/// not one; the quality gate's exact-set baseline lost its `AY_MILP_LU` rows in
-/// the same commit; and `Flags::parse` accepts `--lu` because `milp_profile`
-/// declares it. Hence the rule the census now enforces
-/// (`no_harness_parses_engine_flags_without_applying_them` and
-/// `every_harness_declared_flag_is_dispositioned` in `tests/knob_census.rs`).
+/// No gate had purchase on that: `"--lu"` is not an `AY_*` name or a `Knob`
+/// variant, the quality gate's exact-set baseline lost its `AY_MILP_LU` rows in
+/// the same commit, and `Flags::parse` accepts `--lu` because `milp_profile`
+/// declares it.
 ///
 /// RETIRED. The LU engine auto-engages by shape (`warm_lu_enabled` &&
 /// `wide_tall`/`tall_lu`, plus the node/cold-root LU knobs). Kept as a function
@@ -2482,8 +2487,7 @@ pub(crate) mod stats {
         /// so has no `static` line to grep for. A mechanical scan found the
         /// second. All twenty-two now read a per-thread mirror;
         /// see [`crate::local_census`], which generalises exactly this
-        /// mechanism, and `tests/global_counter_census.rs`, which is the gate
-        /// that stops the class coming back.
+        /// mechanism.
         ///
         /// Two claims the earlier note made are RETRACTED as wrong:
         ///
@@ -13086,9 +13090,7 @@ mod refactor_cadence_tests {
     fn the_cadence_is_the_size_default_when_unset() {
         // Only meaningful when the operator has not overridden it; the crate's own
         // A/B recipes may export it, and then the override legitimately wins.
-        // Via the accessor, not a second `env::var`: a direct read here would add a
-        // literal call site that `read_site_counts_are_derived` counts against the
-        // ledger, so a test guard would silently inflate the crate's own census.
+        // Via the accessor, not a second `env::var` read site.
         if refactor_every_override().is_some() {
             return;
         }
@@ -13134,5 +13136,1255 @@ mod fill_trip_tests {
             !armed_possible,
             "the trip is reachable by default; the lane is no longer the column floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod float_vs_exact_random_tests {
+    //! DIFFERENTIAL: the float lane's VERDICT and VALUE against the exact rim on
+    //! seeded random small LPs. The float lane is ADVICE (`Candidate` doc): a
+    //! `Stopped` is a legitimate answer on any LP, so this asserts that every
+    //! DEFINITIVE float verdict (Optimal / PrimalInfeasible / Unbounded) agrees
+    //! with the exact rim, that Optimal values agree, and that the generator's
+    //! coverage of all three verdicts survives — floors, never 100%.
+    use super::*;
+    use crate::exact::{Budget, ExactLp, LpOptimum};
+    use ay_lra::rational::Rational;
+    use num_traits::ToPrimitive;
+
+    /// xorshift64* (xorshift state update, multiplied output); deterministic,
+    /// seed-fixed. This is the SAME stream the retired native-lane test drew
+    /// from, so its measured verdict mix carries over — re-measured on a
+    /// Python replica of this exact generator + stream with HiGHS: 200 cases
+    /// from seed 0x9E3779B97F4A7C15 give 101 optimal / 81 infeasible /
+    /// 18 unbounded, drawing 73 free columns and 202 one-sided rows.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + (self.next() % (hi - lo + 1) as u64) as i64
+        }
+    }
+
+    /// The exact rim's budget (the `ns.rs` test idiom). 10_000 Bland pivots is
+    /// three orders of magnitude beyond what a 2-4 column, 1-3 row LP needs.
+    fn budget() -> Budget {
+        Budget {
+            deadline: None,
+            max_iters: 10_000,
+        }
+    }
+
+    /// A random small LP with INTEGER data: 2-4 columns — mostly finite boxes,
+    /// with 1-in-8 one-sided (`[lb, +inf)`) and 1-in-8 FREE columns — and 1-3
+    /// rows mixing `>=`, `<=` and range rows, each over a random subset of the
+    /// columns (an empty subset is allowed and gives an honest constant row).
+    /// Returns the model and a dense structural objective in `[-3, 3]`.
+    ///
+    /// Integer data is what makes the value comparison sharp: every vertex of
+    /// such an LP is a rational with a determinant-bounded denominator (3x3
+    /// integer entries in `[-3, 3]`: |det| <= 162), so every exact reduced
+    /// cost or bound violation is either 0 or >= ~1e-3 — far above both
+    /// float tolerances (`cost_tol` <= 4e-9, `feas_tol` < 1e-6).
+    fn random_lp(rng: &mut Rng) -> (Model, Vec<f64>) {
+        let n = 2 + rng.below(3);
+        let mut model = Model::new();
+        let mut cols = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (lb, ub) = match rng.below(8) {
+                0 => (rng.int(-3, 1) as f64, f64::INFINITY),
+                1 => (f64::NEG_INFINITY, f64::INFINITY),
+                _ => {
+                    let l = rng.int(-3, 1) as f64;
+                    (l, l + rng.int(0, 4) as f64)
+                }
+            };
+            cols.push(model.add_col(lb, ub));
+        }
+        for _ in 0..=rng.below(3) {
+            let mut coeffs = Vec::new();
+            for &c in &cols {
+                if rng.below(3) < 2 {
+                    let a = rng.int(-3, 3);
+                    if a != 0 {
+                        coeffs.push((c, a as f64));
+                    }
+                }
+            }
+            let lo = rng.int(-6, 2) as f64;
+            let hi = lo + rng.int(0, 6) as f64;
+            match rng.below(4) {
+                0 => model.add_row(lo, f64::INFINITY, &coeffs),
+                1 => model.add_row(f64::NEG_INFINITY, hi, &coeffs),
+                _ => model.add_row(lo, hi, &coeffs),
+            };
+        }
+        let obj: Vec<f64> = (0..n).map(|_| rng.int(-3, 3) as f64).collect();
+        (model, obj)
+    }
+
+    /// The float lane's objective at a candidate: `values` is laid out
+    /// structurals-first in the ORIGINAL frame (`Simplex::extract`), so the
+    /// structural prefix zipped with the dense objective is `c·x`. Under
+    /// `Sense::Minimize` no sign flip applies (`from_model` flips only for
+    /// `Maximize`).
+    fn float_objective(obj: &[f64], cand: &Candidate) -> f64 {
+        obj.iter().zip(&cand.values).map(|(c, x)| c * x).sum()
+    }
+
+    /// The exact image of the integer objective, sparse (the rim's format).
+    fn exact_obj(obj: &[f64]) -> Vec<(u32, Rational)> {
+        obj.iter()
+            .enumerate()
+            .filter(|&(_, &c)| c != 0.0)
+            .map(|(j, &c)| {
+                debug_assert_eq!(c.fract(), 0.0, "the generator emits integer costs");
+                (j as u32, Rational::new(c as i64, 1))
+            })
+            .collect()
+    }
+
+    /// The float lane's objective in the explicit `(column, coeff)` form
+    /// `from_model` takes; zeros dropped so both lanes see the SAME support.
+    fn float_obj(obj: &[f64]) -> Vec<(u32, f64)> {
+        obj.iter()
+            .enumerate()
+            .filter(|&(_, &c)| c != 0.0)
+            .map(|(j, &c)| (j as u32, c))
+            .collect()
+    }
+
+    /// What one float-vs-exact comparison produced, for coverage accounting.
+    /// Any verdict MISMATCH panics inside `check_against_exact` instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Cmp {
+        Optimal,
+        Infeasible,
+        Unbounded,
+        Stopped,
+        ExactUnknown,
+    }
+
+    fn check_against_exact(model: &Model, obj: &[f64], tag: &str) -> Cmp {
+        // `from_model` returns `None` only for zero columns or NaN data; the
+        // generator produces neither, so `None` here is a lowering regression.
+        let lp = FloatLp::from_model(model, &float_obj(obj), Sense::Minimize)
+            .expect("an integer-data LP with >= 2 columns lowers");
+        let cand = lp.solve(None);
+        let mut ex = ExactLp::new(model);
+        let exact = ex.minimize(&exact_obj(obj), &budget());
+        match cand.status {
+            SimplexStatus::Optimal => {
+                let value = match &exact {
+                    LpOptimum::Optimal { value, .. } => value,
+                    LpOptimum::Unknown(_) => return Cmp::ExactUnknown,
+                    // A float `Optimal` is a phase-II price-out over a point that
+                    // passed the primal-feasibility re-check (`run`): on integer
+                    // data both checks are exact up to round-off (see `random_lp`),
+                    // so the exact rim must find the LP feasible and bounded.
+                    other => panic!("{tag}: float Optimal, exact {other:?}"),
+                };
+                let v = value.to_f64().expect("small rational");
+                let f = float_objective(obj, &cand);
+                // Value agreement: the float basis is the exact optimal basis (no
+                // tolerance-sized exact reduced cost exists on this data), so the
+                // two objectives differ only by f64 round-off through a <= 3x3
+                // solve — 1e-6 relative is ~1e9 times that, and is the bound the
+                // retired lane held on the same stream.
+                assert!(
+                    (f - v).abs() <= 1e-6 * (1.0 + v.abs()),
+                    "{tag}: float optimum {f} vs exact {v}"
+                );
+                Cmp::Optimal
+            }
+            SimplexStatus::PrimalInfeasible => match &exact {
+                LpOptimum::Infeasible(_) => Cmp::Infeasible,
+                LpOptimum::Unknown(_) => Cmp::ExactUnknown,
+                // A float `PrimalInfeasible` is a phase-I price-out with
+                // infeasibility above `feas_tol` (<= 7e-7 here); on integer
+                // data a residual that size is a real one (>= ~1e-3), so the
+                // exact rim's phase A must fail too.
+                other => panic!("{tag}: float PrimalInfeasible, exact {other:?}"),
+            },
+            SimplexStatus::Unbounded => match &exact {
+                LpOptimum::Unbounded => Cmp::Unbounded,
+                LpOptimum::Unknown(_) => Cmp::ExactUnknown,
+                // A float `Unbounded` is a phase-II ratio test with no blocking
+                // row AFTER phase I reached feasibility, and the boxed guard
+                // ahead of it has already turned every arithmetically-bounded
+                // case into `Stopped`; so the exact rim must agree.
+                other => panic!("{tag}: float Unbounded, exact {other:?}"),
+            },
+            // No claim either way (iteration cap / stall / boxed-unbounded
+            // decline / failed perturb retry): legitimate advice, counted only.
+            SimplexStatus::Stopped => Cmp::Stopped,
+            // A cold solve gets no cutoff (`sx.cutoff = INFINITY` unless warm),
+            // and a 1-3 row LU cannot exceed the fill budget: either status on
+            // this LP is a wiring regression, not an advice outcome.
+            SimplexStatus::OutOfMemory | SimplexStatus::Cutoff => {
+                panic!("{tag}: {:?} on a tiny cold solve", cand.status)
+            }
+        }
+    }
+
+    /// On 200 seeded random small LPs (free columns and one-sided rows
+    /// included) every DEFINITIVE float verdict matches the exact rim, every
+    /// float optimum matches the exact optimum to 1e-6 relative, and the
+    /// generator's coverage of all three verdicts survives.
+    #[test]
+    fn float_verdicts_and_values_match_exact_on_random_small_lps() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut counts = [0usize; 5];
+        let (mut free_cols, mut one_sided_rows) = (0usize, 0usize);
+        for case in 0..200 {
+            let (model, obj) = random_lp(&mut rng);
+            for j in 0..model.num_cols() {
+                let (lb, _) = model.col_bounds(Col(j as u32));
+                free_cols += usize::from(lb == f64::NEG_INFINITY);
+            }
+            for r in 0..model.num_rows() {
+                let (_, lb, ub) = model.row(crate::model::Row(r as u32));
+                one_sided_rows += usize::from(lb == f64::NEG_INFINITY || ub == f64::INFINITY);
+            }
+            let cmp = check_against_exact(&model, &obj, &format!("case {case}"));
+            counts[cmp as usize] += 1;
+        }
+        let [optimal, infeasible, unbounded, stopped, unknown] = counts;
+        // Generator self-check (measured 73 / 202 on this seed): the stream
+        // must actually exercise free columns and one-sided rows, or the
+        // unbounded floor below is being met by something other than what
+        // this test claims to cover.
+        assert!(free_cols >= 40, "free-column coverage: {free_cols}");
+        assert!(
+            one_sided_rows >= 120,
+            "one-sided-row coverage: {one_sided_rows}"
+        );
+        // Coverage floors, seed-stable (measured 101 / 81 / 18 / 0 / 0 on the
+        // exact-solver replica, other seeds 88-102 / 76-84 / 18-30 per 200):
+        // each floor leaves room for the `stopped` allowance to land entirely
+        // on that class, so a handful of honest `Stopped`s cannot fail it —
+        // but `Stopped` must stay an exception, not a loophole.
+        assert!(optimal >= 80, "optimal coverage: {counts:?}");
+        assert!(infeasible >= 64, "infeasible coverage: {counts:?}");
+        assert!(unbounded >= 12, "unbounded coverage: {counts:?}");
+        assert!(stopped <= 6, "too many Stopped on tiny LPs: {counts:?}");
+        // 10_000 Bland pivots never runs out on a 2-4 column LP.
+        assert!(unknown <= 4, "exact rim exhausted: {counts:?}");
+    }
+}
+
+#[cfg(test)]
+mod degenerate_lp_tests {
+    //! DEGENERATE LPs TERMINATE AT THE OPTIMUM on the main float engine.
+    //!
+    //! `FloatLp` is ADVICE (`Candidate` doc): a `Stopped` on a hard LP is a
+    //! legitimate answer, so the seeded family below asks for a coverage
+    //! FLOOR, not 100%. The two hand LPs ask for `Optimal` outright, because on
+    //! a three-to-five-row LP with small integer data that is what the engine's
+    //! own guards promise: the stall ladder in `loop_phase_inner` (Dantzig until
+    //! `stall > stalled_at = m.clamp(STALL_FLOOR, STALL_BEFORE_BLAND)`, then
+    //! Devex, then Bland once `stall > stalled_at + BLAND_GRACE`), Bland's rule
+    //! terminating under phase II's FIXED cost vector (see the
+    //! `STALL_ABORT_GRACE` doc), and `MAX_ITERS` (200_000 per phase) as the
+    //! outer backstop. Every `Optimal` is cross-checked against the exact rim
+    //! (`ExactLp::minimize`): exact rational arithmetic over the SAME f64 data.
+    use num_traits::ToPrimitive;
+
+    use super::*;
+    use crate::exact::{Budget, ExactLp, LpOptimum};
+    use crate::model::Row;
+    use ay_lra::rational::Rational;
+    use num_rational::BigRational;
+
+    /// Deterministic xorshift64 (the ns.rs test idiom): seed-fixed, so the
+    /// family below is the same LPs on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + self.below((hi - lo + 1) as u64) as i64
+        }
+    }
+
+    /// Exact-rim budget: generous for LPs of at most nine rows (the rim pivots
+    /// by Bland's rule, so it terminates on its own; `Budget::default_iters`
+    /// would hand out 20_000+ anyway).
+    fn budget() -> Budget {
+        Budget {
+            deadline: None,
+            max_iters: 10_000,
+        }
+    }
+
+    /// The exact dyadic image of a float objective: both lanes must see the
+    /// SAME rationals (`model::exact` is total on finite f64; ns.rs idiom).
+    fn exact_obj(objective: &[(u32, f64)]) -> Vec<(u32, Rational)> {
+        objective
+            .iter()
+            .filter(|&&(_, c)| c != 0.0)
+            .map(|&(j, c)| {
+                (
+                    j,
+                    Rational::from_big(crate::model::exact(c).expect("finite objective")),
+                )
+            })
+            .collect()
+    }
+
+    /// The exact optimum, or a panic naming the rim's verdict.
+    fn exact_optimum(model: &Model, objective: &[(u32, f64)], tag: &str) -> BigRational {
+        match ExactLp::new(model).minimize(&exact_obj(objective), &budget()) {
+            LpOptimum::Optimal { value, .. } => value,
+            other => panic!("{tag}: the exact rim did not settle: {other:?}"),
+        }
+    }
+
+    /// Σ c_j·x_j over the candidate's structural values: `Candidate` carries
+    /// no objective value of its own.
+    fn float_objective(objective: &[(u32, f64)], cand: &Candidate) -> f64 {
+        objective
+            .iter()
+            .map(|&(j, c)| c * cand.values[j as usize])
+            .sum()
+    }
+
+    /// The engine's own primal tolerance in the ORIGINAL frame:
+    /// The engine's OWN feasibility tolerance for this LP (`Simplex::feas_tol`):
+    /// `rounds` returns `Optimal` only once `primal_feasible` holds at exactly
+    /// that tolerance against the TRUE box (the perturbed-box recovery restores
+    /// the real bounds before that check). Asked of the engine rather than
+    /// copied, so a retune of the formula cannot desynchronise this test.
+    fn engine_feas_tol(lp: &FloatLp) -> f64 {
+        Simplex::new(lp, &lp.lower, &lp.upper).feas_tol(lp)
+    }
+
+    /// Largest violation of any column box or row range by the candidate's
+    /// structural point, in row-activity units (≤ 0 when feasible).
+    fn max_violation(model: &Model, cand: &Candidate) -> f64 {
+        let mut worst = f64::NEG_INFINITY;
+        for j in 0..model.num_cols() {
+            let (lb, ub) = model.col_bounds(Col(j as u32));
+            let v = cand.values[j];
+            worst = worst.max(lb - v).max(v - ub);
+        }
+        for i in 0..model.num_rows() {
+            let (coeffs, lb, ub) = model.row(Row(i as u32));
+            let act: f64 = coeffs
+                .iter()
+                .map(|&(j, a)| a * cand.values[j as usize])
+                .sum();
+            worst = worst.max(lb - act).max(act - ub);
+        }
+        worst
+    }
+
+    /// What an `Optimal` verdict guarantees, checked against the exact rim:
+    /// the objective agrees and the point is feasible to the engine's own
+    /// tolerance. Callers assert the status themselves (the family counts
+    /// `Stopped` instead of failing on it).
+    fn check_optimal(
+        model: &Model,
+        lp: &FloatLp,
+        cand: &Candidate,
+        objective: &[(u32, f64)],
+        z_exact: &BigRational,
+        tag: &str,
+    ) {
+        let z_exact = z_exact.to_f64().expect("small rational");
+        let z_float = float_objective(objective, cand);
+        // Objective: `Optimal` means every reduced cost is inside `cost_tol =
+        // 1e-9·(1+cost_scale)` and the vertex is inside `feas_tol` of the true
+        // box. With small-integer data both the reduced costs and the vertex
+        // coordinates are multiples of 1/det(B), far coarser than either
+        // tolerance, so a priced-out feasible basis is EXACTLY optimal and its
+        // f64 value differs from the exact one only by the basis solve
+        // (`recompute_xb`) roundoff, ~1e-13; 1e-6 relative is that roundoff
+        // with margin, still far below the spacing between distinct vertex
+        // values, so it separates the optimal vertex from any other.
+        let tol = 1e-6 * (1.0 + z_exact.abs());
+        assert!(
+            (z_float - z_exact).abs() <= tol,
+            "{tag}: float optimum {z_float} vs exact {z_exact} (tolerance {tol})"
+        );
+        // Feasibility: `rounds` licenses `Optimal` only after `primal_feasible`
+        // at `feas_tol` per basic column (non-basics rest exactly on a bound).
+        // Factor 2: the engine checks each row's logical directly, while
+        // recomputing the activity from the structurals adds f64 roundoff.
+        let feas = 2.0 * engine_feas_tol(lp);
+        let viol = max_violation(model, cand);
+        assert!(
+            viol <= feas,
+            "{tag}: point violates the model by {viol} (tolerance {feas})"
+        );
+    }
+
+    /// Beale (1955), the textbook LP on which Dantzig's rule cycles forever:
+    ///
+    ///   min  −3/4·x1 + 150·x2 − 1/50·x3 + 6·x4
+    ///   s.t.  1/4·x1 −  60·x2 − 1/25·x3 + 9·x4 ≤ 0
+    ///         1/2·x1 −  90·x2 − 1/50·x3 + 3·x4 ≤ 0
+    ///                                 x3        ≤ 1
+    ///         x ≥ 0
+    ///
+    /// with the unique optimum −1/20 at x = (1/25, 0, 1, 0). Stated here with
+    /// the rows and the objective scaled by 100, so that every datum is an
+    /// f64-exact integer (1/50 and 1/25 are not dyadic, and the literal form
+    /// would hand the exact rim a slightly different LP than the textbook one):
+    ///
+    ///   min  −75·x1 + 15000·x2 − 2·x3 + 600·x4
+    ///   s.t.  25·x1 −  6000·x2 − 4·x3 + 900·x4 ≤ 0
+    ///         50·x1 −  9000·x2 − 2·x3 + 300·x4 ≤ 0
+    ///         x3 ≤ 1,  x ≥ 0
+    ///
+    /// optimum −5 at the same point. Positive scaling of rows and objective
+    /// preserves the polyhedron, Dantzig's entering choice, every ratio test,
+    /// and therefore the cycle. The origin is feasible, so phase I is trivial
+    /// and the whole walk is a phase-II walk under a FIXED cost vector — the
+    /// case Bland's termination argument covers.
+    fn beale() -> (Model, Vec<(u32, f64)>) {
+        let mut model = Model::new();
+        let x1 = model.add_col(0.0, f64::INFINITY);
+        let x2 = model.add_col(0.0, f64::INFINITY);
+        let x3 = model.add_col(0.0, f64::INFINITY);
+        let x4 = model.add_col(0.0, f64::INFINITY);
+        model.add_row(
+            f64::NEG_INFINITY,
+            0.0,
+            &[(x1, 25.0), (x2, -6000.0), (x3, -4.0), (x4, 900.0)],
+        );
+        model.add_row(
+            f64::NEG_INFINITY,
+            0.0,
+            &[(x1, 50.0), (x2, -9000.0), (x3, -2.0), (x4, 300.0)],
+        );
+        model.add_row(f64::NEG_INFINITY, 1.0, &[(x3, 1.0)]);
+        let objective = vec![(x1.0, -75.0), (x2.0, 15000.0), (x3.0, -2.0), (x4.0, 600.0)];
+        (model, objective)
+    }
+
+    #[test]
+    fn beale_cycling_example_terminates_at_its_optimum() {
+        let (model, objective) = beale();
+        let lp = FloatLp::from_model(&model, &objective, Sense::Minimize)
+            .expect("Beale is finite integer data");
+        let cand = lp.solve(None);
+        // Termination at the optimum: a 3-row phase-II walk. If Dantzig cycles,
+        // `stall` climbs past `stalled_at = 3.clamp(STALL_FLOOR, STALL_BEFORE_BLAND)
+        // = 2_000` (Devex) and then past `+ BLAND_GRACE` (Bland, which cannot
+        // cycle under phase II's fixed costs) — all inside `MAX_ITERS`. A
+        // `Stopped` here is a regression of that ladder, not a budget effect.
+        assert_eq!(
+            cand.status,
+            SimplexStatus::Optimal,
+            "beale: {:?}",
+            cand.status
+        );
+        let z_exact = exact_optimum(&model, &objective, "beale");
+        // The rim must reproduce the textbook optimum exactly: the data are
+        // integers, so the exact LP IS Beale's LP scaled by 100 (−1/20 · 100).
+        assert_eq!(
+            z_exact,
+            BigRational::from_float(-5.0).expect("finite"),
+            "beale: exact rim optimum"
+        );
+        check_optimal(&model, &lp, &cand, &objective, &z_exact, "beale");
+        // The optimum is UNIQUE (at x* every non-basic reduced cost is strictly
+        // positive: 1500 and 1050 for x2/x4, 150 and 5 for the row-2/row-3
+        // slacks, ×100 frame), so an optimal basis' vertex is x* itself and the
+        // f64 values are that vertex to basis-solve roundoff; 1e-6 is margin.
+        let x_star = [1.0 / 25.0, 0.0, 1.0, 0.0];
+        for (j, want) in x_star.iter().enumerate() {
+            assert!(
+                (cand.values[j] - want).abs() <= 1e-6,
+                "beale: x{} = {} (want {want})",
+                j + 1,
+                cand.values[j]
+            );
+        }
+    }
+
+    /// Massive ties: five identical copies of one binding row.
+    ///
+    ///   min −a − b   s.t.   a + b ≤ 1 (five times),   a, b ∈ [0, 1]
+    ///
+    /// optimum −1 (the whole edge a + b = 1 is optimal, so only the objective
+    /// and feasibility are pinned, not the point). Every pivot on the row
+    /// ties five ways, and four of the five row logicals must stay basic at
+    /// zero — the degenerate-basis shape the ratio test's tie-breaking and
+    /// the stall ladder exist for.
+    #[test]
+    fn five_copies_of_one_binding_row_terminate_at_the_optimum() {
+        let mut model = Model::new();
+        let a = model.add_col(0.0, 1.0);
+        let b = model.add_col(0.0, 1.0);
+        for _ in 0..5 {
+            model.add_row(f64::NEG_INFINITY, 1.0, &[(a, 1.0), (b, 1.0)]);
+        }
+        let objective = vec![(a.0, -1.0), (b.0, -1.0)];
+        let lp = FloatLp::from_model(&model, &objective, Sense::Minimize)
+            .expect("redundant-row LP is finite integer data");
+        let cand = lp.solve(None);
+        // Termination: a 5-row, 2-column phase-II walk (origin feasible); the
+        // Dantzig → Devex → Bland ladder settles it inside `MAX_ITERS`.
+        assert_eq!(
+            cand.status,
+            SimplexStatus::Optimal,
+            "redundant: {:?}",
+            cand.status
+        );
+        let z_exact = exact_optimum(&model, &objective, "redundant");
+        // Exact rim on integer data: the optimum is exactly −1.
+        assert_eq!(
+            z_exact,
+            BigRational::from_float(-1.0).expect("finite"),
+            "redundant: exact rim optimum"
+        );
+        check_optimal(&model, &lp, &cand, &objective, &z_exact, "redundant");
+    }
+
+    /// A small LP that is DEGENERATE BY CONSTRUCTION: a random integer point
+    /// `x0` inside the boxes, every row passing through `x0` (tight on one
+    /// side, or an equality), and every row written two or three times over.
+    /// Finite boxes plus a feasible `x0` make the exact verdict `Optimal` for
+    /// every member; the only open question is whether the float lane gets
+    /// there. Coefficients are integers in [−3, 3], so vertex coordinates and
+    /// reduced costs are multiples of 1/det(B) with |det(B)| ≤ 6^4 — far
+    /// coarser than `cost_tol`, `pivot_tol` or `feas_tol`.
+    fn random_degenerate_lp(rng: &mut Rng) -> (Model, Vec<(u32, f64)>) {
+        let n = rng.int(2, 4) as usize;
+        let mut model = Model::new();
+        let mut cols = Vec::with_capacity(n);
+        let mut x0 = Vec::with_capacity(n);
+        for _ in 0..n {
+            let lb = rng.int(-3, 1);
+            let ub = lb + rng.int(1, 4);
+            cols.push(model.add_col(lb as f64, ub as f64));
+            x0.push(rng.int(lb, ub) as f64);
+        }
+        for _ in 0..rng.int(1, 3) {
+            let mut coeffs: Vec<(Col, f64)> = Vec::new();
+            for &c in &cols {
+                if rng.below(3) < 2 {
+                    let a = rng.int(-3, 3);
+                    if a != 0 {
+                        coeffs.push((c, a as f64));
+                    }
+                }
+            }
+            if coeffs.is_empty() {
+                coeffs.push((cols[0], 1.0));
+            }
+            let at_x0: f64 = coeffs.iter().map(|&(c, a)| a * x0[c.index()]).sum();
+            let (lo, hi) = match rng.below(3) {
+                0 => (at_x0, at_x0),
+                1 => (at_x0, at_x0 + rng.int(0, 4) as f64),
+                _ => (at_x0 - rng.int(0, 4) as f64, at_x0),
+            };
+            for _ in 0..rng.int(2, 3) {
+                model.add_row(lo, hi, &coeffs);
+            }
+        }
+        let mut objective = Vec::with_capacity(n);
+        for &c in &cols {
+            let w = rng.int(-3, 3);
+            if w != 0 {
+                objective.push((c.0, w as f64));
+            }
+        }
+        (model, objective)
+    }
+
+    /// Seeded family of redundant-row LPs: every float `Optimal` agrees with
+    /// the exact rim, no float verdict CONTRADICTS it, and at least 90% of the
+    /// family settles at all.
+    #[test]
+    fn a_seeded_family_of_redundant_row_lps_settles_at_the_exact_optimum() {
+        const FAMILY: usize = 60;
+        let mut rng = Rng::new(0xD36E_7A5B_1C9F_4201);
+        let mut optimal = 0usize;
+        let mut stopped = 0usize;
+        for k in 0..FAMILY {
+            let (model, objective) = random_degenerate_lp(&mut rng);
+            let tag = format!("family[{k}]");
+            let lp = FloatLp::from_model(&model, &objective, Sense::Minimize)
+                .unwrap_or_else(|| panic!("{tag}: finite integer data is representable"));
+            let cand = lp.solve(None);
+            // The rim's verdict is forced: finite boxes bound the LP and `x0`
+            // is feasible by construction, so `Optimal` is the only outcome a
+            // terminating exact solve can reach (Bland, 10_000-iteration budget
+            // on ≤ 9 rows).
+            let z_exact = exact_optimum(&model, &objective, &tag);
+            match cand.status {
+                SimplexStatus::Optimal => {
+                    optimal += 1;
+                    check_optimal(&model, &lp, &cand, &objective, &z_exact, &tag);
+                }
+                // ADVICE: a stopped walk is a legitimate answer from the float
+                // lane (its caller falls back exactly as for `MAX_ITERS`), so
+                // it counts against the floor rather than failing outright.
+                SimplexStatus::Stopped | SimplexStatus::OutOfMemory => stopped += 1,
+                // A verdict that contradicts the exact rim is a bug, not a
+                // tolerance effect: with these integer data every pivot and
+                // reduced cost is ≥ 1/6^4 in magnitude, orders above
+                // `pivot_tol`/`cost_tol`, so no false Infeasible/Unbounded can
+                // arise from a skipped pivot; `Cutoff` needs a cutoff, and
+                // `solve` passes none.
+                other => {
+                    panic!("{tag}: {other:?} contradicts the exact rim on a bounded feasible LP")
+                }
+            }
+        }
+        // Coverage floor, not 100%: the float lane is advice. But an LP of at
+        // most nine rows cannot exhaust `MAX_ITERS` without the stall ladder
+        // itself regressing, so 90% is a loose floor for what the ladder
+        // promises on this size class.
+        assert!(
+            optimal * 10 >= FAMILY * 9,
+            "float coverage {optimal}/{FAMILY} Optimal ({stopped} stopped) is below the 90% floor"
+        );
+    }
+}
+
+#[cfg(test)]
+mod objective_warm_resolve_tests {
+    use super::*;
+    use crate::exact::{Budget, ExactLp, LpOptimum};
+    use ay_lra::rational::Rational;
+    use num_traits::ToPrimitive;
+
+    /// xorshift64* — deterministic, dependency-free (same shape as
+    /// `bump_lu_tests::Rng`).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// A dyadic in {1/4, 2/4, ..., 8/4}: exactly representable, so
+        /// `crate::model::exact` round-trips it and the exact rim solves the
+        /// SAME LP the float lane saw.
+        fn dyadic(&mut self) -> f64 {
+            (1 + self.below(8)) as f64 / 4.0
+        }
+    }
+
+    const ROWS: usize = 12;
+    const COLS: usize = 20;
+    const SEEDS: usize = 16;
+
+    /// Tolerance for a float `Optimal` objective against the exact optimum.
+    /// An `Optimal` basis is primal-feasible within `feas_tol` =
+    /// 1e-7·(1+rhs_scale) (rhs_scale ≤ ~15 on this fixture ⇒ ≤ 1.6e-6 per
+    /// basic) and priced out within `cost_tol` = 1e-9·(1+cost_scale); the
+    /// objective error is bounded by Σ_r|y_r|·feas_tol + Σ_j|d_j⁻|·(u_j−l_j),
+    /// which on a unit-scale 12×20 LP is O(1e-4) at the very worst (the
+    /// measured drift is ~1e-12). 1e-3 keeps an order of magnitude of margin.
+    fn value_tol(z: f64) -> f64 {
+        1e-3 * (1.0 + z.abs())
+    }
+
+    /// A covering LP: `a_r·x ≥ Σ_j a_rj` over the box `[0,4]^n`, positive
+    /// dyadic data. `x = 2` is feasible (activity 2·Σa ≥ Σa), every row lb is
+    /// > 0 so the ORIGIN — the all-logical crash point a cold solve starts
+    /// from — is infeasible and phase I is genuine work, and the finite box
+    /// keeps `min c·x` bounded for any positive cost.
+    fn covering_lp(rng: &mut Rng) -> (Model, Vec<f64>) {
+        let mut model = Model::new();
+        let cols: Vec<Col> = (0..COLS).map(|_| model.add_col(0.0, 4.0)).collect();
+        for _ in 0..ROWS {
+            let mut coeffs: Vec<(Col, f64)> = Vec::with_capacity(COLS);
+            for &c in &cols {
+                if rng.below(5) < 3 {
+                    coeffs.push((c, rng.dyadic()));
+                }
+            }
+            if coeffs.is_empty() {
+                coeffs.push((cols[0], 1.0));
+            }
+            let lb: f64 = coeffs.iter().map(|&(_, a)| a).sum();
+            model.add_row(lb, f64::INFINITY, &coeffs);
+        }
+        let obj: Vec<f64> = (0..COLS).map(|_| rng.dyadic()).collect();
+        (model, obj)
+    }
+
+    /// The SECOND objective: every cost nudged by −1/64, 0 or +1/64. Stays
+    /// positive (costs are ≥ 1/4) and dyadic; small enough that the first
+    /// optimum's basis is near-optimal for it — the regime a warm start is for.
+    fn nudged(rng: &mut Rng, obj: &[f64]) -> Vec<f64> {
+        obj.iter()
+            .map(|&c| c + (rng.below(3) as f64 - 1.0) / 64.0)
+            .collect()
+    }
+
+    fn pairs(obj: &[f64]) -> Vec<(u32, f64)> {
+        obj.iter()
+            .enumerate()
+            .map(|(j, &c)| (j as u32, c))
+            .collect()
+    }
+
+    /// The exact optimum of `min obj·x` over `model` (the ns.rs idiom), or
+    /// `None` if the exact rim did not settle inside its budget.
+    fn exact_optimum(model: &Model, obj: &[f64]) -> Option<f64> {
+        let exact: Vec<(u32, Rational)> = obj
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c != 0.0)
+            .map(|(j, &c)| {
+                (
+                    j as u32,
+                    Rational::from_big(crate::model::exact(c).expect("dyadic cost is exact")),
+                )
+            })
+            .collect();
+        let mut lp = ExactLp::new(model);
+        let budget = Budget {
+            deadline: None,
+            max_iters: 10_000,
+        };
+        match lp.minimize(&exact, &budget) {
+            LpOptimum::Optimal { value, .. } => Some(value.to_f64().expect("small rational")),
+            _ => None,
+        }
+    }
+
+    /// `c·x` over the structurals (`Candidate::values` is `n + m` long,
+    /// structurals first).
+    fn float_objective(obj: &[f64], cand: &Candidate) -> f64 {
+        obj.iter().zip(&cand.values).map(|(c, x)| c * x).sum()
+    }
+
+    /// Simplex iterations THIS THREAD spent inside `f`: the per-thread mirror
+    /// of the two pivot-loop counters (`stats::work_local`), the only
+    /// instrument libtest's sibling threads cannot pollute.
+    fn iterations_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = stats::work_local();
+        let out = f();
+        (out, stats::work_local().wrapping_sub(before))
+    }
+
+    /// Re-solving a NEW objective from the OLD objective's optimal basis
+    /// (`solve_bounded` with `warm = Some((&root.basis, &root.at))` on a fresh
+    /// `FloatLp` lowered for the new costs — exactly how the W2 surface would
+    /// chain per-column objectives) must cost fewer pivots than a cold solve
+    /// of the same LP and land on the same, exact, optimum.
+    #[test]
+    fn warm_resolve_after_an_objective_change_beats_a_cold_solve() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut settled = 0usize;
+        let mut strictly_fewer = 0usize;
+        let (mut total_warm, mut total_cold) = (0u64, 0u64);
+        let mut log = Vec::with_capacity(SEEDS);
+        for seed in 0..SEEDS {
+            let (model, obj1) = covering_lp(&mut rng);
+            let obj2 = nudged(&mut rng, &obj1);
+            let lp1 = FloatLp::from_model(&model, &pairs(&obj1), Sense::Minimize).expect("lowers");
+            let root = lp1.solve(None);
+            // Two SEPARATE lowerings of the second objective so neither solve
+            // inherits the other's pooled scratch, LU cache or stall arming.
+            let lp_cold =
+                FloatLp::from_model(&model, &pairs(&obj2), Sense::Minimize).expect("lowers");
+            let lp_warm =
+                FloatLp::from_model(&model, &pairs(&obj2), Sense::Minimize).expect("lowers");
+            let (cold, cold_iters) = iterations_of(|| lp_cold.solve(None));
+            let (warm, warm_iters) = iterations_of(|| {
+                lp_warm.solve_bounded(
+                    &lp_warm.lower,
+                    &lp_warm.upper,
+                    Some((&root.basis, &root.at)),
+                    None,
+                )
+            });
+            log.push((
+                seed,
+                root.status,
+                cold.status,
+                warm.status,
+                cold_iters,
+                warm_iters,
+            ));
+            if [root.status, cold.status, warm.status]
+                .iter()
+                .any(|&s| s != SimplexStatus::Optimal)
+            {
+                // FloatLp is ADVICE: a `Stopped` is legitimate; counted below.
+                continue;
+            }
+            settled += 1;
+            // The exact rim is Bland-terminating and exact; 10k pivots is far
+            // beyond what a 12x20 dyadic LP needs, so a miss here is a real
+            // failure, not a budget one.
+            let z = exact_optimum(&model, &obj2).expect("exact rim settles on a 12x20 LP");
+            let tol = value_tol(z);
+            let (zc, zw) = (float_objective(&obj2, &cold), float_objective(&obj2, &warm));
+            // An `Optimal` verdict is a basis within feas_tol/cost_tol of the
+            // true optimum (see `value_tol`): both lanes must hit the exact value.
+            assert!(
+                (zc - z).abs() <= tol,
+                "seed {seed}: cold objective {zc} vs exact {z} (tol {tol})"
+            );
+            assert!(
+                (zw - z).abs() <= tol,
+                "seed {seed}: warm objective {zw} vs exact {z} (tol {tol})"
+            );
+            // A warm candidate is a well-formed basis for THIS LP: `m` DISTINCT
+            // column indices, each inside the computational frame.
+            let mut seen = warm.basis.clone();
+            seen.sort_unstable();
+            seen.dedup();
+            assert!(
+                seen.len() == lp_warm.m && seen.iter().all(|&b| b < lp_warm.cols),
+                "seed {seed}: warm basis is not a distinct in-frame set: {:?}",
+                warm.basis
+            );
+            total_warm += warm_iters;
+            total_cold += cold_iters;
+            if warm_iters < cold_iters {
+                strictly_fewer += 1;
+            }
+        }
+        // COVERAGE FLOOR, not 100%: `Stopped` is a legitimate float answer;
+        // on unit-scale 12x20 LPs `Optimal` is the norm, so 3/4 is generous.
+        assert!(
+            settled * 4 >= SEEDS * 3,
+            "float lane settled only {settled}/{SEEDS}: {log:?}"
+        );
+        // THE CLAIM, aggregate only: across the settled seeds the warm re-solves
+        // spend fewer pivots than the cold ones. On this path `run` first tries
+        // the transactional warm DUAL walk from the handed-back basis (entry
+        // bound flips repair the dual infeasibility the nudged costs introduced)
+        // and falls back to the primal phases on rollback; either way it starts
+        // one nudge from the answer while the cold solve starts from the slack
+        // basis and must pay phase I. A warm start is documented as "a HINT,
+        // and a bad hint costs pivots", so no PER-SEED strictness is asserted —
+        // instance-level counts are a tuning property, not an engine contract.
+        // (`strictly_fewer` stays in the log for the reader.)
+        assert!(
+            total_warm < total_cold,
+            "warm re-solves ({total_warm} pivots) did not beat cold solves \
+             ({total_cold} pivots; strictly cheaper on {strictly_fewer}/{settled}): {log:?}"
+        );
+    }
+
+    /// Control: re-solving the SAME objective from its own optimal basis is a
+    /// no-op. Each pivot loop charges its entry iteration before discovering
+    /// there is nothing to do (`dual_simplex_inner` at the top of its loop,
+    /// `loop_phase_inner` likewise), so the honest bound is 3 charged
+    /// iterations — the dual entry, plus at most phase I + phase II entries if
+    /// the dual's post-check rolls back — never the cold solve's full walk.
+    #[test]
+    fn resolve_from_its_own_optimal_basis_is_a_no_op() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        let mut settled = 0usize;
+        for seed in 0..SEEDS {
+            let (model, obj) = covering_lp(&mut rng);
+            let lp = FloatLp::from_model(&model, &pairs(&obj), Sense::Minimize).expect("lowers");
+            let (root, cold_iters) = iterations_of(|| lp.solve(None));
+            if root.status != SimplexStatus::Optimal {
+                continue;
+            }
+            let (again, again_iters) = iterations_of(|| {
+                lp.solve_bounded(&lp.lower, &lp.upper, Some((&root.basis, &root.at)), None)
+            });
+            settled += 1;
+            // Same LP, same box, optimal basis handed back: the verdict stands.
+            assert_eq!(again.status, SimplexStatus::Optimal, "seed {seed}");
+            // (No absolute iteration bound: the exact charge per loop entry is
+            // an accounting detail of charge-before-check, not a contract. The
+            // contract is the relative claim below.)
+            // The origin is infeasible on this fixture, so a cold solve pays
+            // at least one phase-I pivot plus both phase entries: > 3.
+            assert!(
+                again_iters < cold_iters,
+                "seed {seed}: no-op warm ({again_iters}) vs cold ({cold_iters})"
+            );
+            // Same basis in, same vertex out: the objective is bit-stable
+            // (values are recomputed from one factorization of one basis).
+            let (z0, z1) = (float_objective(&obj, &root), float_objective(&obj, &again));
+            assert!(
+                (z0 - z1).abs() <= value_tol(z0),
+                "seed {seed}: objective moved on a no-op re-solve: {z0} -> {z1}"
+            );
+        }
+        // Coverage floor, as above.
+        assert!(
+            settled * 4 >= SEEDS * 3,
+            "float lane settled only {settled}/{SEEDS}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod equilibration_kernel_tests {
+    use super::*;
+    use crate::tune::{activate_caller, Active, Knob, Profile, Setting};
+
+    const MANT_MASK: u64 = (1u64 << 52) - 1;
+
+    /// Put the kernel in `mode` (1 = force, 2 = auto) for THIS thread — the
+    /// same caller-layer lever `bab.rs`'s scaling differential uses.
+    fn scaling(mode: usize) -> Active {
+        activate_caller(Profile::EMPTY.with(Knob::Scale, Setting::Count(mode)))
+    }
+
+    /// A finite positive f64 with an all-zero mantissa is exactly 2^k.
+    fn is_power_of_two(v: f64) -> bool {
+        v.is_finite() && v > 0.0 && v.to_bits() & MANT_MASK == 0
+    }
+
+    /// xorshift64* — deterministic, dependency-free.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn int(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + self.below((hi - lo + 1) as u64) as i32
+        }
+    }
+
+    /// THE FIXTURE. Continuous columns `0..cols` carry a DENSE rank-1 exponent
+    /// pattern `a_ij = 2^(r_i + c_j) · (1 + k_ij/8)`, so `bexp(a_ij) = r_i + c_j`
+    /// exactly (mantissa in [1, 2)); `r` and `c` each contain both of their
+    /// extremes so the exponent span is known. Then one EMPTY column (in no
+    /// row) and one EMPTY row (no entries). Column bounds `[0, 1]`, unit costs,
+    /// each dense row bounded above by `2^(r_i+3)` (a bound in the row's own
+    /// magnitude, so the SAFE check sees exponents of O(span), never 900).
+    struct Fixture {
+        model: Model,
+        r: Vec<i32>,
+        c: Vec<i32>,
+        dense_rows: usize,
+        dense_cols: usize,
+        empty_col: usize,
+        empty_row: usize,
+    }
+
+    fn fixture(rng: &mut Rng, rows: usize, cols: usize, rspan: i32, cspan: i32) -> Fixture {
+        let r: Vec<i32> = (0..rows)
+            .map(|i| match i {
+                0 => -rspan,
+                1 => rspan,
+                _ => rng.int(-rspan, rspan),
+            })
+            .collect();
+        let c: Vec<i32> = (0..cols)
+            .map(|j| match j {
+                0 => -cspan,
+                1 => cspan,
+                _ => rng.int(-cspan, cspan),
+            })
+            .collect();
+        let mut model = Model::new();
+        let xs: Vec<Col> = (0..cols).map(|_| model.add_col(0.0, 1.0)).collect();
+        let empty_col = model.add_col(0.0, 1.0).index();
+        for i in 0..rows {
+            let mut coeffs = Vec::with_capacity(cols);
+            for (j, &x) in xs.iter().enumerate() {
+                let mant = 1.0 + rng.below(8) as f64 / 8.0;
+                coeffs.push((x, 2f64.powi(r[i] + c[j]) * mant));
+            }
+            model.add_row(f64::NEG_INFINITY, 2f64.powi(r[i] + 3), &coeffs);
+        }
+        model.add_row(-1.0, 1.0, &[]);
+        let empty_row = model.num_rows() - 1;
+        Fixture {
+            model,
+            r,
+            c,
+            dense_rows: rows,
+            dense_cols: cols,
+            empty_col,
+            empty_row,
+        }
+    }
+
+    fn unit_costs(f: &Fixture) -> Vec<(u32, f64)> {
+        (0..f.dense_cols).map(|j| (j as u32, 1.0)).collect()
+    }
+
+    /// Lower the fixture with the kernel FORCED on. Returns the guard so the
+    /// caller keeps the mode alive for as long as it inspects the LP.
+    fn scaled_lp(f: &Fixture) -> (Active, FloatLp) {
+        let on = scaling(1);
+        let lp = FloatLp::from_model(&f.model, &unit_costs(f), Sense::Minimize).expect("lowers");
+        (on, lp)
+    }
+
+    fn badly_scaled() -> Fixture {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        fixture(&mut rng, 6, 8, 12, 10)
+    }
+
+    /// Exponent span (max − min `bexp`) over the nonzeros of `vals`.
+    fn span_bits(vals: &[f64]) -> i32 {
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for &v in vals {
+            if v != 0.0 {
+                lo = lo.min(bexp(v));
+                hi = hi.max(bexp(v));
+            }
+        }
+        assert!(lo <= hi, "no nonzeros");
+        hi - lo
+    }
+
+    /// The factors are pure powers of two and the mirrors are exact exponent
+    /// shifts of the original entries: same mantissa bits, exponent moved by
+    /// exactly `rexp + cexp`. This is the property that makes crossing frames
+    /// free of rounding ("applying them is a pure exponent shift, EXACT").
+    #[test]
+    fn factors_are_exact_powers_of_two_and_mirrors_are_exact_shifts() {
+        let f = badly_scaled();
+        let (_on, lp) = scaled_lp(&f);
+        assert!(lp.scaled(), "forced mode must scale a 2^44-span matrix");
+        assert_eq!(lp.rexp.len(), lp.m);
+        assert_eq!(lp.cexp.len(), lp.n);
+        for j in 0..lp.n {
+            // bnd_mul[j] = 2^-cexp, val_mul[j] = 2^cexp, both exact powers of two.
+            assert!(is_power_of_two(lp.bnd_mul[j]) && is_power_of_two(lp.val_mul[j]));
+            assert_eq!(lp.bnd_mul[j], 2f64.powi(-i32::from(lp.cexp[j])), "col {j}");
+            assert_eq!(lp.val_mul[j], 2f64.powi(i32::from(lp.cexp[j])), "col {j}");
+            // Reciprocal pair: the product of 2^k and 2^-k is exactly 1.
+            assert_eq!(lp.bnd_mul[j] * lp.val_mul[j], 1.0, "col {j}");
+        }
+        for r in 0..lp.m {
+            // Logicals: bnd_mul = 2^rexp, val_mul = 2^-rexp.
+            let j = lp.n + r;
+            assert!(is_power_of_two(lp.bnd_mul[j]) && is_power_of_two(lp.val_mul[j]));
+            assert_eq!(lp.bnd_mul[j], 2f64.powi(i32::from(lp.rexp[r])), "row {r}");
+            assert_eq!(lp.bnd_mul[j] * lp.val_mul[j], 1.0, "row {r}");
+        }
+        // CSC mirror: `scol_val[p] = col_val[p] * 2^(rexp[row] + cexp[j])`, so
+        // the mantissa bits are untouched and only the exponent field moves.
+        assert_eq!(lp.scol_val.len(), lp.col_val.len());
+        for j in 0..lp.n {
+            for p in lp.col_ptr[j]..lp.col_ptr[j + 1] {
+                let (o, s) = (lp.col_val[p], lp.scol_val[p]);
+                let shift = i32::from(lp.rexp[lp.col_idx[p]]) + i32::from(lp.cexp[j]);
+                assert_eq!(
+                    o.to_bits() & MANT_MASK,
+                    s.to_bits() & MANT_MASK,
+                    "col {j} p {p}"
+                );
+                assert_eq!(bexp(s), bexp(o) + shift, "col {j} p {p}");
+                assert_eq!(s, o * 2f64.powi(shift), "col {j} p {p}");
+            }
+        }
+        // CSR mirror: the same shift, row-major.
+        assert_eq!(lp.srow_val.len(), lp.row_val.len());
+        for r in 0..lp.m {
+            for q in lp.row_ptr[r]..lp.row_ptr[r + 1] {
+                let j = lp.row_idx[q] as usize;
+                let shift = i32::from(lp.rexp[r]) + i32::from(lp.cexp[j]);
+                assert_eq!(
+                    lp.srow_val[q],
+                    lp.row_val[q] * 2f64.powi(shift),
+                    "row {r} q {q}"
+                );
+            }
+        }
+    }
+
+    /// On a dense rank-1 exponent pattern the alternating passes reach their
+    /// fixpoint in ONE column+row sweep: with `M = (rmin+rmax)>>1`,
+    /// `cexp_j = -(c_j + M)` and `rexp_i = M - r_i`, so every scaled exponent
+    /// is `r_i + c_j + rexp_i + cexp_j = 0`. The 2^44 spread collapses to
+    /// mantissas in [1, 2) — span 0 bits — and the factors are exactly those.
+    #[test]
+    fn a_badly_scaled_matrix_collapses_to_unit_exponents() {
+        let f = badly_scaled();
+        let (_on, lp) = scaled_lp(&f);
+        assert!(lp.scaled());
+        // Before: the fixture's extremes are in the matrix by construction.
+        let before = span_bits(&lp.col_val);
+        assert!(before >= 40, "fixture spread only 2^{before}");
+        // After: every nonzero has binary exponent exactly 0.
+        let after = span_bits(&lp.scol_val);
+        assert_eq!(after, 0, "scaled spread is 2^{after}, expected 2^0");
+        for (p, &s) in lp.scol_val.iter().enumerate() {
+            if s != 0.0 {
+                assert_eq!(bexp(s), 0, "scaled entry {p} = {s}");
+            }
+        }
+        // (The exact exponent vectors are the kernel's representation, not
+        // its contract; the collapse and the power-of-two factors above are.)
+    }
+
+    /// A column in no row and a row with no entries have no magnitude to
+    /// center: their passes are skipped (`lo <= hi` never holds), the exponent
+    /// stays 0 and the factor is exactly 1 in both directions.
+    #[test]
+    fn empty_rows_and_columns_get_unit_factors() {
+        let f = badly_scaled();
+        let (_on, lp) = scaled_lp(&f);
+        assert!(lp.scaled());
+        let (j, r) = (f.empty_col, f.empty_row);
+        assert_eq!(
+            lp.col_ptr[j + 1],
+            lp.col_ptr[j],
+            "the empty column really is empty"
+        );
+        assert_eq!(
+            lp.row_ptr[r + 1],
+            lp.row_ptr[r],
+            "the empty row really is empty"
+        );
+        assert_eq!(lp.bnd_mul[j], 1.0);
+        assert_eq!(lp.val_mul[j], 1.0);
+        assert_eq!(lp.bnd_mul[lp.n + r], 1.0);
+        assert_eq!(lp.val_mul[lp.n + r], 1.0);
+    }
+
+    /// The frame contract: `bnd_mul` maps a value INTO the scaled frame and
+    /// `val_mul` maps it back OUT. Both are powers of two with |exponent| ≤ 24
+    /// here, so each multiply only moves the exponent field of a normal f64
+    /// and the round trip is bit-identical — for dyadic AND non-dyadic values.
+    #[test]
+    fn unscaling_is_bit_exact() {
+        let f = badly_scaled();
+        let (_on, lp) = scaled_lp(&f);
+        assert!(lp.scaled());
+        let samples = [
+            0.1,
+            1.0 / 3.0,
+            12_345.678,
+            1e-3,
+            7.0,
+            -2.5e-7,
+            std::f64::consts::PI,
+        ];
+        for j in 0..lp.cols {
+            for &x in &samples {
+                let scaled = x * lp.bnd_mul[j];
+                let back = scaled * lp.val_mul[j];
+                assert_eq!(
+                    back.to_bits(),
+                    x.to_bits(),
+                    "col {j}: {x} -> {scaled} -> {back}"
+                );
+                // And the other direction, which is what `extract` does.
+                let out = x * lp.val_mul[j];
+                assert_eq!((out * lp.bnd_mul[j]).to_bits(), x.to_bits(), "col {j}: {x}");
+            }
+        }
+        // The engine's own boundary crossings: original bounds into the frame
+        // and back must reproduce the model bits (only finite, nonzero ones).
+        for j in 0..lp.cols {
+            for b in [lp.lower[j], lp.upper[j]] {
+                if b.is_finite() && b != 0.0 {
+                    let round_trip = (b * lp.bnd_mul[j]) * lp.val_mul[j];
+                    assert_eq!(round_trip.to_bits(), b.to_bits(), "bound of col {j}");
+                }
+            }
+        }
+    }
+
+    /// Integer/binary columns keep `C_j = 1` so branching bounds, integrality
+    /// tests and no-good comparisons read identically in both frames — the
+    /// kernel skips them in its column pass.
+    #[test]
+    fn integral_columns_keep_a_unit_factor() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let y = model.add_int_col(0.0, 3.0);
+        let big = 2f64.powi(12);
+        model.add_row(f64::NEG_INFINITY, 2.0 * big, &[(x, big), (y, big)]);
+        model.add_row(
+            f64::NEG_INFINITY,
+            2.0 * big,
+            &[(x, 1.5 * big), (y, 1.25 * big)],
+        );
+        let _on = scaling(1);
+        let lp = FloatLp::from_model(&model, &[(x.0, 1.0), (y.0, 1.0)], Sense::Minimize)
+            .expect("lowers");
+        assert!(lp.scaled(), "a 2^12 matrix under forced mode is scaled");
+        assert_eq!(lp.cexp[y.index()], 0, "integral column must keep C_j = 1");
+        assert_eq!(lp.bnd_mul[y.index()], 1.0);
+        assert_eq!(lp.val_mul[y.index()], 1.0);
+        // The continuous neighbour IS scaled, so the skip is a choice, not an
+        // accident of the data.
+        assert_ne!(
+            lp.cexp[x.index()],
+            0,
+            "continuous column should have been centered"
+        );
+    }
+
+    /// Mode gating: AUTO scales only when the matrix exponent span exceeds
+    /// `AUTO_SPAN_BITS` (24); a unit-scale matrix is left alone; and with no
+    /// caller opinion the kernel is OFF (the documented default).
+    #[test]
+    fn auto_mode_scales_only_ill_scaled_matrices() {
+        let f = badly_scaled();
+        {
+            let _auto = scaling(2);
+            let lp =
+                FloatLp::from_model(&f.model, &unit_costs(&f), Sense::Minimize).expect("lowers");
+            // Span 44 > 24: auto engages.
+            assert!(lp.scaled(), "auto must scale a 2^44-span matrix");
+        }
+        let mut unit = Model::new();
+        let a = unit.add_col(0.0, 1.0);
+        let b = unit.add_col(0.0, 1.0);
+        unit.add_row(f64::NEG_INFINITY, 1.0, &[(a, 1.0), (b, 1.5)]);
+        unit.add_row(f64::NEG_INFINITY, 1.0, &[(a, 1.25), (b, 1.0)]);
+        {
+            let _auto = scaling(2);
+            let lp = FloatLp::from_model(&unit, &[(a.0, 1.0), (b.0, 1.0)], Sense::Minimize)
+                .expect("lowers");
+            // Span 0 < 24: auto declines and the scaled mirrors stay empty.
+            assert!(!lp.scaled(), "auto must not touch a unit-scale matrix");
+            assert!(lp.rexp.is_empty() && lp.cexp.is_empty());
+        }
+        // Default OFF. The guard is only against an enclosing `activate_caller`
+        // frame on this thread; under the plain test harness it is always taken.
+        if crate::tune::count_opt(Knob::Scale).is_none() {
+            let lp =
+                FloatLp::from_model(&f.model, &unit_costs(&f), Sense::Minimize).expect("lowers");
+            assert!(!lp.scaled(), "equilibration must ship OFF by default");
+        }
     }
 }

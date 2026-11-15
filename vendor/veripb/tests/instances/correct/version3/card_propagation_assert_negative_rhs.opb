@@ -1,0 +1,2 @@
+* #variable= 20 #constraint= 36 #equal= 0 intsize= 3
+min: +1 cu_1 +1 cu_2 +1 cu_3 +1 cu_4  ;

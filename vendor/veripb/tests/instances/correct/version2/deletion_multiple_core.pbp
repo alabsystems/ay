@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 2.0
+f 3
+del id 2 3
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

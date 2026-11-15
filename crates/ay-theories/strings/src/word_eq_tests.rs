@@ -992,3 +992,49 @@ fn lan_replace_all2_extended_fragment_unsat() {
     };
     assert_eq!(solve(&p), WeOutcome::Unsat);
 }
+
+/// `regex_possible_chars` enumerates a `re.range` by SMT-LIB code point, the
+/// surrogates `U+D800..=U+DFFF` included (2026-09-23 fp-strings verifier,
+/// mutant M11). The set is an OVER-approximation the Nielsen search prunes
+/// with, so a range that silently lost its surrogate members would refute a
+/// word equation whose only solutions use them.
+#[test]
+fn regex_possible_chars_of_a_range_includes_its_surrogates() {
+    let cp = |code: u32| ay_core::smtlib_char(code).expect("in the SMT-LIB alphabet");
+    let across = WeRegex::range("\u{d7ff}", &cp(0xD801).to_string());
+    let expected: HashSet<char> = [cp(0xD7FF), cp(0xD800), cp(0xD801)].into_iter().collect();
+    assert_eq!(regex_possible_chars(&across), Some(expected));
+
+    let out_of = WeRegex::range(&cp(0xDFFE).to_string(), "\u{e001}");
+    let expected: HashSet<char> = [cp(0xDFFE), cp(0xDFFF), cp(0xE000), cp(0xE001)]
+        .into_iter()
+        .collect();
+    assert_eq!(regex_possible_chars(&out_of), Some(expected));
+}
+
+#[test]
+fn probe_five_segment_two_block_prefix_unsat() {
+    // Y = A·"nr"·B·"bn"·C with A,B,C ∈ n* and Y ∈ "nb"·n* — unsat:
+    // Y's second character is 'r' or 'n', never the required 'b'.
+    // (Minimized from QF_S hornstr eqdist_lstar_non_incre_equiv_trans_0_9.)
+    let nstar = || WeRegex::star(WeRegex::lit("n"));
+    let p = WeProblem {
+        equations: vec![eq(
+            word(&[&[var(3)]]),
+            word(&[&[var(0)], &lit("nr"), &[var(1)], &lit("bn"), &[var(2)]]),
+        )],
+        num_vars: 4,
+        memberships: vec![
+            member(0, nstar(), true),
+            member(1, nstar(), true),
+            member(2, nstar(), true),
+            member(3, WeRegex::concat(vec![WeRegex::lit("nb"), nstar()]), true),
+        ],
+        ..Default::default()
+    };
+    // The leaf residual-emptiness check must refute this shape: at
+    // the solved-form leaf Y's residual word has 7 symbols, so a leaf
+    // word cap of 6 silently skipped it and the search only exhausted.
+    let outcome = solve(&p);
+    assert_eq!(outcome, WeOutcome::Unsat, "got {outcome:?}");
+}

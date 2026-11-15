@@ -21,6 +21,7 @@ mod integer_and_bounds;
 mod lemma_propagation;
 mod must_reach_and_dt;
 mod pdr_construction;
+mod spacer_locks;
 
 /// Build a minimal single-predicate linear CHC problem: P(x) => P(x).
 fn test_linear_problem() -> ChcProblem {

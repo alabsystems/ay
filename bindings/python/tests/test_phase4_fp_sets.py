@@ -13,7 +13,7 @@
 # NOTE on const names: ayz3 interns consts by NAME process-wide (shared main
 # context), so FP consts here use the file-unique `fpp_` prefix.
 #
-# Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_phase4_fp_sets.py -v
+# Run:  targo --unverified build -p ay-ffi  &&  pytest bindings/python/tests/test_phase4_fp_sets.py -v
 
 import math
 import struct

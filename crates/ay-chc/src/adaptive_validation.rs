@@ -22,7 +22,7 @@ use crate::engine_config::ChcEngineConfig;
 use crate::engine_result::ValidationEvidence;
 use crate::pdr::{
     CexVerificationResult, Counterexample, InvariantModel, PdrConfig, PdrResult, PdrSolver,
-    PredicateInterpretation,
+    PredicateInterpretation, SpacerLane,
 };
 use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver};
 use crate::{BmcSolver, CancellationToken, ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
@@ -131,6 +131,8 @@ impl AdaptivePortfolio {
             solve_timeout: Some(timeout),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
+            // Validators never run the Spacer lane (Workstream B, S10).
+            spacer: SpacerLane::OFF,
             ..PdrConfig::default()
         };
         PdrSolver::new(self.problem.clone(), config)
@@ -188,27 +190,31 @@ impl AdaptivePortfolio {
         remaining_budget: Option<Duration>,
     ) -> bool {
         self.validate_final_unsafe_result_with_cancellation(cex, remaining_budget, None)
+            .is_some()
     }
 
+    /// The counterexample that passed (the one to publish), or `None`.
     pub(crate) fn validate_final_unsafe_result_with_cancellation(
         &self,
         cex: &Counterexample,
         remaining_budget: Option<Duration>,
         external_cancellation: Option<&CancellationToken>,
-    ) -> bool {
+    ) -> Option<Counterexample> {
+        // INV-S2 (#horn-smt-session §7.2).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let Some(validator) =
             self.new_verified_result_validator(remaining_budget, external_cancellation)
         else {
             tracing::debug!(
                 "Adaptive: final Unsafe result has no remaining validation budget, demoting to Unknown"
             );
-            return false;
+            return None;
         };
-        let valid =
-            validator.validate_unsafe_for_verified_result_with_budget(cex, remaining_budget);
-        valid
-            && !self.cancellation_token.is_cancelled()
-            && !external_cancellation.is_some_and(CancellationToken::is_cancelled)
+        let confirmed =
+            validator.validate_unsafe_for_verified_result_with_budget(cex, remaining_budget)?;
+        (!self.cancellation_token.is_cancelled()
+            && !external_cancellation.is_some_and(CancellationToken::is_cancelled))
+        .then_some(confirmed)
     }
 
     /// Cheap structural Safe guard for the public verified-result boundary.
@@ -380,6 +386,8 @@ impl AdaptivePortfolio {
                 solve_timeout: Some(validation_budget),
                 disable_array_scalarization: true,
                 preserve_original_clauses: true,
+                // Validators never run the Spacer lane (Workstream B, S10).
+                spacer: SpacerLane::OFF,
                 ..PdrConfig::default()
             };
             let verified = crate::engines::validate_external_invariant_model(
@@ -456,6 +464,8 @@ impl AdaptivePortfolio {
         remaining_budget: Option<Duration>,
         external_cancellation: Option<&CancellationToken>,
     ) -> bool {
+        // INV-S2 (#horn-smt-session §7.2): the BMC re-proof of a final Safe.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         // Decidable-finite acyclic only: mirrors `bmc_only_empty_safe_is_proof_grade`
         // (adaptive_engines.rs). A definite UNSAT of the fully-unrolled acyclic
         // query disjunction is a COMPLETE safety proof for any decidable
@@ -489,6 +499,10 @@ impl AdaptivePortfolio {
         }
         let depth = features.dag_depth.max(features.num_predicates).max(1);
 
+        // One budget for the BMC re-proof AND the independent check below.
+        let Some(reproof_deadline) = Instant::now().checked_add(budget) else {
+            return false;
+        };
         let mut cancellation = self.cancellation_token.child();
         if let Some(external) = external_cancellation {
             cancellation.link_upstream(external);
@@ -496,6 +510,7 @@ impl AdaptivePortfolio {
         let bmc = BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(cancellation),
@@ -510,13 +525,16 @@ impl AdaptivePortfolio {
                 enable_k_induction: false,
                 enable_adaptive_stepping: false,
                 proof_cross_check: false,
+                memory_budget: None,
                 ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
                 sweep_past_spurious_sat: true,
             },
         );
-        let reproved = matches!(bmc.solve(), PortfolioResult::Safe(_))
-            && !self.cancellation_token.is_cancelled()
-            && !external_cancellation.is_some_and(CancellationToken::is_cancelled);
+        let reproved =
+            self.final_safe_reproof_admitted(&bmc.solve(), reproof_deadline, external_cancellation);
         tracing::debug!(
             depth,
             reproved,
@@ -532,6 +550,27 @@ impl AdaptivePortfolio {
             crate::acyclic_cert_cache::record_acyclic_bmc_safe(&self.problem, depth);
         }
         reproved
+    }
+
+    /// Fix V1's admission of the BMC re-proof `bmc_verdict`. BMC re-proving
+    /// its own claim is the engine agreeing with itself (MODEL_CHECKER_CONSUMER report
+    /// §4-A1), so the engine-free check must also confirm the empty-model
+    /// SAFE, inside what is left of the re-proof's budget (`deadline`).
+    pub(crate) fn final_safe_reproof_admitted(
+        &self,
+        bmc_verdict: &PortfolioResult,
+        deadline: Instant,
+        external_cancellation: Option<&CancellationToken>,
+    ) -> bool {
+        matches!(bmc_verdict, PortfolioResult::Safe(_))
+            && !self.cancellation_token.is_cancelled()
+            && !external_cancellation.is_some_and(CancellationToken::is_cancelled)
+            && crate::empty_acyclic_safe_check::confirmed_at_finalize(
+                &self.problem,
+                Some(deadline.saturating_duration_since(Instant::now())),
+                &self.cancellation_token,
+                external_cancellation,
+            )
     }
 
     /// Returns true when bounded final-validation demotion diagnostics are enabled.
@@ -710,6 +749,8 @@ impl AdaptivePortfolio {
         safe_budget: Duration,
         external_cancellation: Option<&CancellationToken>,
     ) -> PdrResult {
+        // INV-S2 (#horn-smt-session §7.2): the direct-engine Safe/Unsafe gate.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         match &result {
             PdrResult::Safe(model) => {
                 let mut verifier = if external_cancellation.is_some() {
@@ -901,7 +942,6 @@ fn flattened_sorts_for_groups(sort: &ChcSort, dt_stack: &mut Vec<String>) -> Vec
 mod tests {
     use super::*;
     use crate::{ClauseBody, ClauseHead, HornClause};
-    use std::sync::Arc;
 
     include!("adaptive_validation/tests/acyclic_reproof.rs");
 
@@ -932,7 +972,7 @@ mod tests {
     fn bv_bit_groups_include_datatype_payloads() {
         let option_bv16 = ChcSort::Datatype {
             name: "OptBV16".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 crate::ChcDtConstructor {
                     name: "none16".to_string(),
                     selectors: Vec::new(),
@@ -956,7 +996,7 @@ mod tests {
     fn bv_bit_groups_include_nested_datatype_payloads() {
         let result_bv8 = ChcSort::Datatype {
             name: "Result8".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 crate::ChcDtConstructor {
                     name: "ok".to_string(),
                     selectors: vec![crate::ChcDtSelector {
@@ -975,7 +1015,7 @@ mod tests {
         };
         let state = ChcSort::Datatype {
             name: "State".to_string(),
-            constructors: Arc::new(vec![crate::ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
                 name: "mk_state".to_string(),
                 selectors: vec![
                     crate::ChcDtSelector {

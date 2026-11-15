@@ -1,0 +1,29 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): three lines refuted a tautology. `1 x1 >= 0`
+% is satisfied by every assignment, and this proof used to be accepted as
+% `s VERIFIED UNSATISFIABLE` at exit 0 with default flags.
+%
+% Two bugs stacked. `SubproofContext::pop_database_goal` answered `proofgoal 1`
+% inside a `pbc` -- a subproof that owes NO database obligations at all -- by
+% inventing a goal out of the database constraint itself, which is discharged
+% for free because its counterexample premise contradicts the very database it
+% is proven against. `EndSubproofChecker::end_proofgoal` then set
+% `contradiction_proven` on the enclosing subproof for ANY discharged goal
+% whenever that subproof was a proof by contradiction, and
+% `SubproofContext::finalize` treats that flag as licence to skip every
+% remaining obligation AND the top-level RUP check. So `pbc` never had to show
+% its contradiction and happily added `>= 1`.
+%
+% `contradiction_proven` may now only be set for a goal whose counterexample
+% premises the negated conclusion already entails (see
+% `rules::proofgoal::discharges_pbc_contradiction`), and a database proofgoal
+% is only reconstructed for a subproof that owes database obligations.
+f 1;
+pbc >= 1 : subproof
+  proofgoal 1
+    pol -1 1 +;
+  qed;
+qed;
+output NONE;
+conclusion UNSAT;
+end pseudo-Boolean proof;

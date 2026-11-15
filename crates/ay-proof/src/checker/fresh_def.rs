@@ -116,6 +116,11 @@ use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TermStore};
 use super::fresh_def_dispatch::recognize_fresh_definition;
 use super::ProofCheckError;
 
+#[cfg(test)]
+mod cancellation_tests;
+
+type Progress<'a> = &'a mut dyn FnMut(usize, usize) -> bool;
+
 /// One certified definitional extension: the introduced symbol and the term it
 /// was defined by.
 #[derive(Debug, Clone, Copy)]
@@ -188,11 +193,53 @@ impl FreshDefRegistry {
         terms: &TermStore,
         problem_assertions: Option<&[TermId]>,
     ) -> Result<Self, ProofCheckError> {
-        let bindings = Self::collect_bindings(proof, terms)?;
+        Self::collect_with_progress(proof, terms, problem_assertions, &mut |_, _| true)
+    }
+
+    /// Cooperatively cancel binding and name traversal without changing its
+    /// authority rules. Polls have zero work/byte charge: the caller retains
+    /// the existing aggregate accounting. Individual recognizer sort clones,
+    /// equality/hash operations, allocation, and diagnostics remain opaque;
+    /// this is not complete metering or a hard latency bound.
+    ///
+    /// Refusal is sticky, including if an inner guard catches a callback
+    /// panic. No registry escapes before the final post-scratch-cleanup poll.
+    pub(crate) fn collect_with_progress(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: Option<&[TermId]>,
+        progress: Progress<'_>,
+    ) -> Result<Self, ProofCheckError> {
+        let mut refused = false;
+        let mut control = |_, _| {
+            if refused {
+                return false;
+            }
+            refused = true;
+            if progress(0, 0) {
+                refused = false;
+                true
+            } else {
+                false
+            }
+        };
+        poll(&mut control)?;
+        let result = Self::collect_cancellable(proof, terms, problem_assertions, &mut control);
+        poll(&mut control)?;
+        result
+    }
+
+    fn collect_cancellable(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: Option<&[TermId]>,
+        progress: Progress<'_>,
+    ) -> Result<Self, ProofCheckError> {
+        let bindings = Self::collect_bindings(proof, terms, progress)?;
         if bindings.is_empty() {
             return Ok(Self { bindings });
         }
-        verify_fresh_and_independent(proof, terms, problem_assertions, &bindings)?;
+        verify_fresh_and_independent(proof, terms, problem_assertions, &bindings, progress)?;
         Ok(Self { bindings })
     }
 
@@ -203,11 +250,15 @@ impl FreshDefRegistry {
     fn collect_bindings(
         proof: &Proof,
         terms: &TermStore,
+        progress: Progress<'_>,
     ) -> Result<DetHashMap<String, FreshDefBinding>, ProofCheckError> {
+        poll(progress)?;
         let mut bindings: DetHashMap<String, FreshDefBinding> = DetHashMap::default();
         for (index, step) in proof.steps.iter().enumerate() {
+            poll(progress)?;
             let ProofStep::Step {
-                rule: rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq),
+                rule:
+                    rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq | AletheRule::DivModDef),
                 clause,
                 premises,
                 args,
@@ -216,49 +267,58 @@ impl FreshDefRegistry {
                 continue;
             };
             let step_id = ProofId(index as u32);
-            let (definiendum, definiens) =
-                recognize_fresh_definition(terms, rule, clause, premises.len(), args)
-                    .map_err(|reason| invalid(step_id, &reason))?;
-            let name = definiendum_name(terms, step_id, definiendum)?;
-            match bindings.get(&name) {
-                Some(prior) => {
-                    // Two definientia for one symbol is an EQUATION between
-                    // them, not a definition: `d := x` with `d := x + 1`
-                    // forces `x = x + 1`. Same-`TermId` repeats are the
-                    // ordinary case (an upper and a lower bound, or the same
-                    // leaf reached twice) and stay accepted.
-                    //
-                    // Only the DEFINIENS is compared. A differing definiendum
-                    // at an EQUAL definiens is unreachable by construction —
-                    // `mk_var` keys on (name, sort) and the shape gate forces
-                    // `sort(d) == sort(lin)`, so one definiens `TermId` fixes
-                    // the sort and therefore the symbol — and an unreachable
-                    // branch is not a guard, because it cannot be
-                    // mutation-checked.
-                    if prior.definiens != definiens {
-                        return Err(invalid(
-                            step_id,
-                            &format!(
+            let recognized = recognize_fresh_definition(terms, rule, clause, premises.len(), args);
+            poll(progress)?;
+            for (definiendum, definiens) in
+                recognized.map_err(|reason| invalid(step_id, &reason))?
+            {
+                let name = definiendum_name(terms, step_id, definiendum);
+                poll(progress)?;
+                let name = name?;
+                let prior = bindings.get(&name);
+                poll(progress)?;
+                match prior {
+                    Some(prior) => {
+                        // Two definientia for one symbol is an EQUATION between
+                        // them, not a definition: `d := x` with `d := x + 1`
+                        // forces `x = x + 1`. Same-`TermId` repeats are the
+                        // ordinary case (an upper and a lower bound, or the same
+                        // leaf reached twice) and stay accepted.
+                        //
+                        // Only the DEFINIENS is compared. A differing definiendum
+                        // at an EQUAL definiens is unreachable by construction —
+                        // `mk_var` keys on (name, sort) and the shape gate forces
+                        // `sort(d) == sort(lin)`, so one definiens `TermId` fixes
+                        // the sort and therefore the symbol — and an unreachable
+                        // branch is not a guard, because it cannot be
+                        // mutation-checked.
+                        if prior.definiens != definiens {
+                            return Err(invalid(
+                                step_id,
+                                &format!(
                                 "fresh definition `{name}` is given a SECOND definiens (already \
                                  bound at step {}); two definitions of one symbol equate their \
                                  defining terms and are not a conservative extension",
                                 prior.step
                             ),
-                        ));
+                            ));
+                        }
+                    }
+                    None => {
+                        bindings.insert(
+                            name,
+                            FreshDefBinding {
+                                definiens,
+                                step: step_id,
+                            },
+                        );
                     }
                 }
-                None => {
-                    bindings.insert(
-                        name,
-                        FreshDefBinding {
-                            definiens,
-                            step: step_id,
-                        },
-                    );
-                }
+                poll(progress)?;
             }
         }
 
+        poll(progress)?;
         Ok(bindings)
     }
 
@@ -314,7 +374,33 @@ impl FreshDefRegistry {
         )
     }
 
-    /// The per-step half, shared by both rules.
+    /// Validate one `divmod_def` step against this registry and return the
+    /// atom it introduces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofCheckError::InvalidTheoryLemma`] when the atom is not
+    /// valid under its definitions or either symbol is not bound to exactly
+    /// the definiens the step names.
+    pub(crate) fn validate_divmod_def(
+        &self,
+        terms: &TermStore,
+        step_id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<TermId, ProofCheckError> {
+        self.validate_introduction(
+            terms,
+            &AletheRule::DivModDef,
+            step_id,
+            clause,
+            premises,
+            args,
+        )
+    }
+
+    /// The per-step half, shared by all three rules.
     ///
     /// It re-runs the SAME recognizer `collect_bindings` ran and then confirms
     /// the step belongs to its symbol's ONE vetted binding. Consulting the
@@ -330,24 +416,25 @@ impl FreshDefRegistry {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<TermId, ProofCheckError> {
-        let (definiendum, definiens) =
-            recognize_fresh_definition(terms, rule, clause, premises.len(), args)
-                .map_err(|reason| invalid(step_id, &reason))?;
-        let name = definiendum_name(terms, step_id, definiendum)?;
-        let binding = self.bindings.get(&name).ok_or_else(|| {
-            invalid(
-                step_id,
-                &format!("fresh definition `{name}` has no vetted whole-proof binding"),
-            )
-        })?;
-        if binding.definiens != definiens {
-            return Err(invalid(
-                step_id,
-                &format!(
-                    "fresh definition `{name}` was bound to a different definiens at step {}",
-                    binding.step
-                ),
-            ));
+        let introduced = recognize_fresh_definition(terms, rule, clause, premises.len(), args)
+            .map_err(|reason| invalid(step_id, &reason))?;
+        for (definiendum, definiens) in introduced {
+            let name = definiendum_name(terms, step_id, definiendum)?;
+            let binding = self.bindings.get(&name).ok_or_else(|| {
+                invalid(
+                    step_id,
+                    &format!("fresh definition `{name}` has no vetted whole-proof binding"),
+                )
+            })?;
+            if binding.definiens != definiens {
+                return Err(invalid(
+                    step_id,
+                    &format!(
+                        "fresh definition `{name}` was bound to a different definiens at step {}",
+                        binding.step
+                    ),
+                ));
+            }
         }
         // The step's own clause literal, re-read from the recognizer rather
         // than echoed from `clause`: the recognizer is what established the
@@ -368,31 +455,41 @@ fn verify_fresh_and_independent(
     terms: &TermStore,
     problem_assertions: Option<&[TermId]>,
     bindings: &DetHashMap<String, FreshDefBinding>,
+    progress: Progress<'_>,
 ) -> Result<(), ProofCheckError> {
+    poll(progress)?;
     let mut constrained: DetHashSet<String> = DetHashSet::default();
     let mut visited: DetHashSet<TermId> = DetHashSet::default();
     for &assertion in problem_assertions.unwrap_or(&[]) {
-        collect_symbol_names(terms, assertion, &mut constrained, &mut visited);
+        poll(progress)?;
+        collect_symbol_names(terms, assertion, &mut constrained, &mut visited, progress)?;
     }
     for step in &proof.steps {
+        poll(progress)?;
         if let ProofStep::Assume(term) = step {
-            collect_symbol_names(terms, *term, &mut constrained, &mut visited);
+            collect_symbol_names(terms, *term, &mut constrained, &mut visited, progress)?;
         }
     }
 
+    poll(progress)?;
     let mut definiens_names: DetHashSet<String> = DetHashSet::default();
     let mut definiens_visited: DetHashSet<TermId> = DetHashSet::default();
     for binding in bindings.values() {
+        poll(progress)?;
         collect_symbol_names(
             terms,
             binding.definiens,
             &mut definiens_names,
             &mut definiens_visited,
-        );
+            progress,
+        )?;
     }
 
     for (name, binding) in bindings {
-        if definiens_names.contains(name) {
+        poll(progress)?;
+        let dependent = definiens_names.contains(name);
+        poll(progress)?;
+        if dependent {
             return Err(invalid(
                 binding.step,
                 &format!(
@@ -401,7 +498,9 @@ fn verify_fresh_and_independent(
                 ),
             ));
         }
-        if constrained.contains(name) {
+        let is_constrained = constrained.contains(name);
+        poll(progress)?;
+        if is_constrained {
             return Err(invalid(
                 binding.step,
                 &format!(
@@ -413,7 +512,7 @@ fn verify_fresh_and_independent(
         }
     }
 
-    Ok(())
+    poll(progress)
 }
 
 fn definiendum_name(
@@ -447,10 +546,15 @@ fn collect_symbol_names(
     root: TermId,
     names: &mut DetHashSet<String>,
     visited: &mut DetHashSet<TermId>,
-) {
+    progress: Progress<'_>,
+) -> Result<(), ProofCheckError> {
+    poll(progress)?;
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
+        poll(progress)?;
+        let fresh = visited.insert(id);
+        poll(progress)?;
+        if !fresh {
             continue;
         }
         match terms.get(id) {
@@ -459,29 +563,58 @@ fn collect_symbol_names(
             }
             TermData::App(sym, args) => {
                 names.insert(sym.name().to_string());
-                stack.extend(args.iter().copied());
+                for &arg in args {
+                    push_term(&mut stack, arg, progress)?;
+                }
             }
-            TermData::Not(inner) => stack.push(*inner),
+            TermData::Not(inner) => push_term(&mut stack, *inner, progress)?,
             TermData::Ite(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
+                push_term(&mut stack, *c, progress)?;
+                push_term(&mut stack, *t, progress)?;
+                push_term(&mut stack, *e, progress)?;
             }
             TermData::Let(bindings, body) => {
                 for (name, value) in bindings {
+                    poll(progress)?;
                     names.insert(name.clone());
-                    stack.push(*value);
+                    push_term(&mut stack, *value, progress)?;
                 }
-                stack.push(*body);
+                push_term(&mut stack, *body, progress)?;
             }
             TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
                 for (name, _) in vars {
+                    poll(progress)?;
                     names.insert(name.clone());
                 }
-                stack.push(*body);
-                stack.extend(triggers.iter().flatten().copied());
+                push_term(&mut stack, *body, progress)?;
+                for trigger in triggers {
+                    poll(progress)?;
+                    for &term in trigger {
+                        push_term(&mut stack, term, progress)?;
+                    }
+                }
             }
             _ => {}
         }
+        poll(progress)?;
+    }
+    poll(progress)
+}
+
+fn push_term(
+    stack: &mut Vec<TermId>,
+    term: TermId,
+    progress: Progress<'_>,
+) -> Result<(), ProofCheckError> {
+    poll(progress)?;
+    stack.push(term);
+    Ok(())
+}
+
+fn poll(progress: Progress<'_>) -> Result<(), ProofCheckError> {
+    if progress(0, 0) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::ResourceLimit)
     }
 }

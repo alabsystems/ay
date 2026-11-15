@@ -12,9 +12,9 @@
 //! `cfg(deductive_verify)`, so the verifier NEVER reads this file and the gate is
 //! never verified in a weakened form.
 //!
-//! `tests/smt_model_gate_conformance.rs` pins both files to the same decision
-//! expression and to the proof fixture, so a divergence fails the suite rather
-//! than silently shipping an unproven gate.
+//! `tests/gate_decision.rs` checks the truth table of whichever twin a build
+//! compiles, so a divergence fails the suite rather than silently shipping an
+//! unproven gate.
 
 /// See `gate_decision.rs` for the soundness argument and the postcondition this
 /// spelling cannot carry.

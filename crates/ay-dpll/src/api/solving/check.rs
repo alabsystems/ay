@@ -39,12 +39,13 @@ enum NativeQueryBoundary {
 /// nested executor checks from renewing the relative timeout before
 /// certification, keeps a tighter parsed RSS ceiling from being overwritten,
 /// and makes nested executor probes inherit the native term-store envelope.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct NativePublicationControls {
     deadline: Option<Instant>,
+    owner: Option<ay_core::resource::Guard>,
     effective_memory_limit: Option<usize>,
     effective_term_memory_limit: Option<usize>,
-    previous_deadline: Option<Instant>,
+    previous_interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous_memory_limit: Option<usize>,
     previous_term_memory_limit: Option<usize>,
 }
@@ -109,7 +110,7 @@ impl Solver {
     /// coexistence here would still let a caller cross a public decision boundary
     /// with an ambiguous optimization problem that other entrypoints handle
     /// differently. Fail closed until the sets have one joint representation.
-    fn reject_mixed_soft_ownership(&mut self) -> Option<VerifiedSolveResult> {
+    pub(super) fn reject_mixed_soft_ownership(&mut self) -> Option<VerifiedSolveResult> {
         if self.soft_constraints.is_empty() || self.executor.context().soft_constraints().is_empty()
         {
             return None;
@@ -130,6 +131,7 @@ impl Solver {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.last_unknown_reason = Some(UnknownReason::InternalError);
+                self.last_model_extraction_failure = None;
                 self.last_artifact_export_failure = match &error {
                     SolverError::ExecutorError(ExecutorError::ArtifactExport(detail)) => {
                         Some(detail.clone())
@@ -142,10 +144,15 @@ impl Solver {
         }
     }
 
-    /// Return the typed artifact-export failure recorded by an infallible solve
-    /// API. The `try_check_sat*` family uses this to avoid collapsing a
-    /// certificate failure into a successful `Ok(Unknown)`.
+    /// Return a typed terminal extraction or artifact-export failure recorded
+    /// by an infallible compatibility solve API. The `try_check_sat*` family
+    /// must not collapse either refusal into a successful `Ok(Unknown)`.
     pub(super) fn last_artifact_export_error(&self) -> Option<SolverError> {
+        if let Some(error) = self.last_model_extraction_failure {
+            return Some(SolverError::ExecutorError(ExecutorError::ModelExtraction(
+                error,
+            )));
+        }
         Some(SolverError::ExecutorError(ExecutorError::ArtifactExport(
             self.last_artifact_export_failure.clone()?,
         )))
@@ -153,13 +160,23 @@ impl Solver {
 
     /// Record an executor failure for the infallible compatibility APIs while
     /// retaining a typed artifact-export payload for fallible callers.
+    ///
+    /// The published reason is the error's own ([`ExecutorError::unknown_reason`]):
+    /// a theory mix with no combined decision procedure is `Incomplete`, with
+    /// the refusal as its diagnostic, and any other executor error
+    /// `InternalError` ([`crate::Executor::replace_last_result_with_executor_error`],
+    /// which the CLI publishes through too). The error text is kept either way
+    /// ([`Self::executor_error`]).
     pub(super) fn record_executor_failure_unknown(&mut self, error: &ExecutorError) {
         // An errored decision query admits no model, certificate, proof, or
         // optimum. Drop any partial artefacts left by the failed executor path.
         self.executor.begin_public_solve(false);
-        self.executor
-            .replace_last_result_with_unknown(UnknownReason::InternalError);
-        self.last_unknown_reason = Some(UnknownReason::InternalError);
+        self.executor.replace_last_result_with_executor_error(error);
+        self.last_unknown_reason = Some(error.unknown_reason());
+        self.last_model_extraction_failure = match error {
+            ExecutorError::ModelExtraction(error) => Some(*error),
+            _ => None,
+        };
         self.last_artifact_export_failure = match error {
             ExecutorError::ArtifactExport(detail) => Some(detail.clone()),
             _ => None,
@@ -204,6 +221,7 @@ impl Solver {
         self.last_unknown_reason = None;
         self.last_executor_error = None;
         self.last_artifact_export_failure = None;
+        self.last_model_extraction_failure = None;
     }
 
     pub(super) fn preflight_unknown(&mut self, reason: UnknownReason) -> VerifiedSolveResult {
@@ -216,6 +234,7 @@ impl Solver {
                 )),
                 Err(error) => error,
             };
+            self.last_model_extraction_failure = None;
             self.last_artifact_export_failure = match &error {
                 ExecutorError::ArtifactExport(detail) => Some(detail.clone()),
                 _ => None,
@@ -233,6 +252,8 @@ impl Solver {
     /// the executor first so every stale artifact is revoked and both views of
     /// the last query remain identical.
     pub(super) fn finish_verified_result(&mut self, result: SolveResult) -> VerifiedSolveResult {
+        self.executor
+            .trace_unknown_funnel("api-finish-enter", None, Some(&result), false);
         let effective_term_limit =
             Self::earliest_optional(self.executor.term_memory_limit(), self.term_memory_limit);
         let result = if !result.is_unknown()
@@ -254,7 +275,7 @@ impl Solver {
             .decline_definite_publication_on_external_stop(result);
         let sat_certificate = self.executor.take_sat_certificate();
         let unsat_certificate = self.executor.take_unsat_certificate();
-        match result {
+        let verified = match result {
             SolveResult::Sat => match sat_certificate {
                 Some(certificate) => VerifiedSolveResult::certified_sat(certificate),
                 None => {
@@ -307,7 +328,14 @@ impl Solver {
                     unreachable!("finalize_unknown_publication changed an Unknown verdict")
                 }
             },
-        }
+        };
+        self.executor.trace_unknown_funnel(
+            "api-finish-return",
+            None,
+            Some(verified.result()),
+            false,
+        );
+        verified
     }
 
     /// Reject invalid raw handles and solver-generated array witnesses before
@@ -342,14 +370,18 @@ impl Solver {
     /// condition fires, or `None` if the solve should proceed.
     pub(super) fn preflight_check(
         &mut self,
-        controls: NativePublicationControls,
+        controls: &NativePublicationControls,
     ) -> Option<VerifiedSolveResult> {
+        if let Some(origin) = self.executor.take_pending_fp_namespace_refusal() {
+            return Some(self.preflight_unknown(origin.reason()));
+        }
         if self.interrupt.load(Ordering::Relaxed) {
             return Some(self.preflight_unknown(UnknownReason::Interrupted));
         }
 
         if crate::memory::memory_exceeded(controls.effective_memory_limit)
             || ay_sys::process_memory_exceeded()
+            || ay_sys::current_memory_group_soft_tripped()
         {
             return Some(self.preflight_unknown(UnknownReason::MemoryLimit));
         }
@@ -385,7 +417,78 @@ impl Solver {
         self.native_publication_controls_at(Instant::now())
     }
 
+    pub(super) fn native_maxsmt_publication_controls_at(
+        &self,
+        now: Instant,
+    ) -> NativePublicationControls {
+        let roots: Vec<_> = self
+            .soft_constraints
+            .iter()
+            .map(|soft| soft.term.id())
+            .collect();
+        self.native_publication_controls_for_roots_at(now, &roots)
+    }
+
+    pub(super) fn native_optimization_publication_controls_at(
+        &self,
+        now: Instant,
+    ) -> NativePublicationControls {
+        let roots: Vec<_> = self
+            .soft_constraints
+            .iter()
+            .map(|soft| soft.term.id())
+            .chain(
+                self.executor
+                    .context()
+                    .soft_constraints()
+                    .iter()
+                    .map(|soft| soft.term),
+            )
+            .chain(
+                self.executor
+                    .context()
+                    .objectives()
+                    .iter()
+                    .map(|objective| objective.term),
+            )
+            .collect();
+        self.native_publication_controls_for_roots_at(now, &roots)
+    }
+
+    pub(super) fn begin_model_evaluation_read(&self) -> crate::executor::EvaluationReadScope {
+        // A model read receives its ordinary timeout; opting in to a
+        // quantified decision backstop does not enlarge getter budgets.
+        let controls = self.nominal_native_publication_controls_at(Instant::now());
+        self.executor.begin_native_evaluation_read(
+            self.interrupt.clone(),
+            controls.deadline,
+            controls.effective_memory_limit,
+            controls.effective_term_memory_limit,
+        )
+    }
+
     fn native_publication_controls_at(&self, now: Instant) -> NativePublicationControls {
+        self.native_publication_controls_for_roots_at(now, &[])
+    }
+
+    fn native_publication_controls_for_roots_at(
+        &self,
+        now: Instant,
+        extra_roots: &[ay_core::TermId],
+    ) -> NativePublicationControls {
+        let controls = self.nominal_native_publication_controls_at(now);
+        let timeout = Self::earliest_optional(self.timeout, self.executor.timeout());
+        let plan = self
+            .executor
+            .decision_deadline_at(now, timeout, extra_roots);
+        NativePublicationControls {
+            deadline: plan.deadline,
+            owner: plan.owner,
+            ..controls
+        }
+    }
+
+    fn nominal_native_publication_controls_at(&self, now: Instant) -> NativePublicationControls {
         let previous_deadline = self.executor.current_solve_deadline();
         let api_deadline = self.timeout.and_then(|timeout| now.checked_add(timeout));
         let parsed_deadline = self
@@ -404,9 +507,10 @@ impl Solver {
             Self::earliest_optional(previous_term_memory_limit, self.term_memory_limit);
         NativePublicationControls {
             deadline,
+            owner: None,
             effective_memory_limit,
             effective_term_memory_limit,
-            previous_deadline,
+            previous_interrupt: self.executor.current_solve_interrupt(),
             previous_memory_limit,
             previous_term_memory_limit,
         }
@@ -421,7 +525,13 @@ impl Solver {
     }
 
     /// Forward one precomputed control envelope to the executor.
-    pub(super) fn install_solve_controls(&mut self, controls: NativePublicationControls) {
+    pub(super) fn install_solve_controls(
+        &mut self,
+        controls: &NativePublicationControls,
+    ) -> crate::executor::CommandDeadlineScope {
+        let scope = self
+            .executor
+            .snapshot_command_publication_deadline(controls.owner.as_ref());
         self.executor
             .set_memory_limit(controls.effective_memory_limit);
         self.executor
@@ -430,23 +540,35 @@ impl Solver {
             .set_learned_clause_limit(self.learned_clause_limit);
         self.executor
             .set_clause_db_bytes_limit(self.clause_db_bytes_limit);
-        self.executor
-            .set_solve_controls(Some(self.interrupt.clone()), controls.deadline);
+        if scope.was_active() {
+            // A continuation can inherit a narrowed search slice without
+            // replacing the command's wider certification envelope.
+            self.executor.set_interrupt(self.interrupt.clone());
+        } else {
+            self.executor
+                .set_solve_controls(Some(self.interrupt.clone()), controls.deadline);
+        }
+        scope
     }
 
     /// Restore executor-owned controls after every native Result path.
-    pub(super) fn restore_solve_controls(&mut self, controls: NativePublicationControls) {
+    pub(super) fn restore_solve_controls(
+        &mut self,
+        controls: &NativePublicationControls,
+        deadline_scope: crate::executor::CommandDeadlineScope,
+    ) {
         self.executor
-            .set_solve_controls(None, controls.previous_deadline);
+            .restore_solve_interrupt(controls.previous_interrupt.clone());
         self.executor
             .set_memory_limit(controls.previous_memory_limit);
         self.executor
             .set_term_memory_limit(controls.previous_term_memory_limit);
+        drop(deadline_scope);
     }
 
     /// Classify an `Unknown` result that has no reason yet, using executor
     /// state, interrupt flag, deadline, and memory limit.
-    pub(super) fn classify_unknown_reason(&mut self, controls: NativePublicationControls) {
+    pub(super) fn classify_unknown_reason(&mut self, controls: &NativePublicationControls) {
         let reason = if let Some(reason) = self.executor.unknown_reason() {
             reason
         } else if self.interrupt.load(Ordering::Relaxed) {
@@ -455,6 +577,7 @@ impl Solver {
             UnknownReason::Timeout
         } else if crate::memory::memory_exceeded(controls.effective_memory_limit)
             || ay_sys::process_memory_exceeded()
+            || ay_sys::current_memory_group_soft_tripped()
             || controls
                 .effective_term_memory_limit
                 .is_some_and(|limit| self.terms().instance_memory_exceeded(limit))
@@ -540,7 +663,7 @@ impl Solver {
         }
 
         let controls = self.native_publication_controls();
-        if let Some(early) = self.preflight_check(controls) {
+        if let Some(early) = self.preflight_check(&controls) {
             return early;
         }
 
@@ -557,7 +680,9 @@ impl Solver {
             Vec::new()
         };
 
-        self.install_solve_controls(controls);
+        let deadline_scope = self.install_solve_controls(&controls);
+        self.executor
+            .trace_unknown_funnel("native-exec-enter", None, None, false);
         let exec_result = if authority_origin == NativeCheckAuthorityOrigin::AuthoredPlain {
             self.executor.solve_authored_plain_hard_query(&native_softs)
         } else {
@@ -572,15 +697,25 @@ impl Solver {
             }
         };
 
+        self.executor
+            .trace_unknown_funnel("native-exec-return", None, Some(&result), false);
         let result = self.executor.certify_unsat_for_publication(result, &[]);
+        self.executor
+            .trace_unknown_funnel("native-unsat-cert-return", None, Some(&result), false);
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(controls);
+            self.classify_unknown_reason(&controls);
         }
         // Certification is part of the caller's check-sat transaction. Keep
         // the original absolute deadline and interrupt installed while it runs
         // so a nested trust re-confirmation cannot escape the caller's limits.
         let verified = self.finish_verified_result(result);
-        self.restore_solve_controls(controls);
+        self.executor.trace_unknown_funnel(
+            "native-verified-return",
+            None,
+            Some(verified.result()),
+            false,
+        );
+        self.restore_solve_controls(&controls, deadline_scope);
         verified
     }
 
@@ -638,7 +773,7 @@ impl Solver {
         }
 
         let controls = self.native_publication_controls();
-        if let Some(early) = self.preflight_check(controls) {
+        if let Some(early) = self.preflight_check(&controls) {
             return early;
         }
 
@@ -654,35 +789,64 @@ impl Solver {
         } else {
             Vec::new()
         };
-        self.install_solve_controls(controls);
-        let publication_result =
-            self.executor
-                .with_interruptible_publication_controls(should_stop, |executor| {
+        let deadline_scope = self.install_solve_controls(&controls);
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::executor::with_interruptible_publication_context(
+                self,
+                |solver| &mut solver.executor,
+                should_stop,
+                |solver| {
                     let exec_result =
                         if authority_origin == NativeCheckAuthorityOrigin::AuthoredPlain {
-                            executor.solve_authored_plain_hard_query(&native_softs)
+                            solver
+                                .executor
+                                .solve_authored_plain_hard_query(&native_softs)
                         } else {
-                            executor.check_sat()
+                            solver.executor.check_sat()
                         };
-                    match exec_result {
-                        Ok(result) => Ok(executor.certify_unsat_for_publication(result, &[])),
-                        Err(error) => Err(error),
+                    let result = match exec_result {
+                        Ok(result) => solver.executor.certify_unsat_for_publication(result, &[]),
+                        Err(error) => return Err(error),
+                    };
+                    if result == SolveResult::Unknown && solver.last_unknown_reason.is_none() {
+                        solver.classify_unknown_reason(&controls);
                     }
-                });
-
-        let result = match publication_result {
-            Ok(r) => r,
-            Err(e) => {
-                self.record_executor_failure_unknown(&e);
-                SolveResult::Unknown
-            }
-        };
-        if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(controls);
+                    Ok(solver.finish_verified_result(result))
+                },
+                |solver, outcome| match outcome {
+                    Ok(verified) => solver.finish_interruptible_publication(verified),
+                    Err(error) => {
+                        if solver
+                            .executor
+                            .finalize_external_stop_for_publication()
+                            .is_none()
+                        {
+                            solver.record_executor_failure_unknown(&error);
+                        }
+                        solver.finish_verified_result(SolveResult::Unknown)
+                    }
+                },
+            )
+        }));
+        self.restore_solve_controls(&controls, deadline_scope);
+        match publication {
+            Ok(verified) => verified,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-        let verified = self.finish_verified_result(result);
-        self.restore_solve_controls(controls);
-        verified
+    }
+
+    fn finish_interruptible_publication(
+        &mut self,
+        verified: VerifiedSolveResult,
+    ) -> VerifiedSolveResult {
+        let result = self
+            .executor
+            .decline_definite_publication_on_external_stop(verified.result().clone());
+        if result.is_unknown() && !verified.is_unknown() {
+            self.finish_verified_result(result)
+        } else {
+            verified
+        }
     }
 
     /// Check satisfiability with a per-call timeout override.
@@ -789,12 +953,13 @@ impl Solver {
             return rejected;
         }
 
-        let controls = self.native_publication_controls();
-        if let Some(early) = self.preflight_check(controls) {
+        let controls =
+            self.native_publication_controls_for_roots_at(Instant::now(), &assumption_ids);
+        if let Some(early) = self.preflight_check(&controls) {
             return early;
         }
 
-        self.install_solve_controls(controls);
+        let deadline_scope = self.install_solve_controls(&controls);
 
         self.last_assumptions = Some(
             assumption_ids
@@ -824,13 +989,17 @@ impl Solver {
             .executor
             .certify_unsat_for_publication(result, &assumption_ids);
         if result == SolveResult::Unknown && self.last_unknown_reason.is_none() {
-            self.classify_unknown_reason(controls);
+            self.classify_unknown_reason(&controls);
         }
         let verified = self.finish_verified_result(result);
-        self.restore_solve_controls(controls);
+        self.restore_solve_controls(&controls, deadline_scope);
         verified
     }
 }
+
+#[cfg(test)]
+#[path = "check/fp_namespace_tests.rs"]
+mod fp_namespace_tests;
 
 #[cfg(test)]
 mod finish_verified_result_tests {
@@ -905,12 +1074,378 @@ mod finish_verified_result_tests {
         solver.set_memory_limit(Some(1));
 
         let controls = solver.native_publication_controls();
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
 
         assert_eq!(solver.executor.memory_limit(), Some(1));
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(solver.executor.memory_limit(), None);
         solver.set_memory_limit(None);
+    }
+
+    /// Model an already-elapsed nominal phase with a fixed command origin,
+    /// avoiding a machine-speed-sensitive "sleep during search" fixture.
+    #[test]
+    fn backstop_envelope_native_publication_survives_the_elapsed_nominal_phase() {
+        for (script, expected) in [
+            (
+                "(declare-fun f (Int) Int)
+                 (assert (forall ((x Int)) (> (f x) x)))
+                 (assert (not (= (f 3) 4)))",
+                SolveResult::Sat,
+            ),
+            (
+                "(declare-fun p (Int) Bool)
+                 (assert (forall ((x Int)) (p x)))
+                 (assert (not (p 0)))",
+                SolveResult::unsat(),
+            ),
+        ] {
+            let mut solver = Solver::new(Logic::All);
+            solver.parse_smtlib2(script).expect("consumer-shaped query");
+            solver.set_timeout(Some(Duration::from_secs(30)));
+            solver.set_quantifier_deadline_backstop(true);
+            solver.clear_last_solve_state(true, false);
+            solver.executor.bind_unsat_query_assumptions(&[]);
+            let origin = Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("a prior command origin");
+            let controls = solver.native_publication_controls_at(origin);
+            assert!(
+                controls.deadline.is_some_and(|wall| wall > Instant::now()),
+                "the explicit backstop must remain live after nominal time elapsed"
+            );
+            assert!(solver.preflight_check(&controls).is_none());
+            let deadline_scope = solver.install_solve_controls(&controls);
+            let proposed = solver.executor.check_sat().expect("search");
+            assert_eq!(proposed, expected);
+            assert_eq!(solver.executor.current_solve_deadline(), controls.deadline);
+            let certified = solver.executor.certify_unsat_for_publication(proposed, &[]);
+            let admitted = solver.finish_verified_result(certified);
+            assert_eq!(admitted.result(), &expected);
+            solver.restore_solve_controls(&controls, deadline_scope);
+            assert_eq!(solver.executor.current_solve_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn backstop_envelope_public_native_queries_keep_their_result_and_restore_controls() {
+        for (script, sat) in [
+            (
+                "(declare-fun f (Int) Int)
+                 (assert (forall ((x Int)) (> (f x) x)))
+                 (assert (not (= (f 3) 4)))",
+                true,
+            ),
+            (
+                "(declare-fun p (Int) Bool)
+                 (assert (forall ((x Int)) (p x)))
+                 (assert (not (p 0)))",
+                false,
+            ),
+        ] {
+            let mut solver = Solver::new(Logic::All);
+            solver.parse_smtlib2(script).expect("consumer-shaped query");
+            solver.set_timeout(Some(Duration::from_secs(10)));
+            solver.set_quantifier_deadline_backstop(true);
+            for assumptions in [false, true] {
+                let result = if assumptions {
+                    solver.check_sat_assuming(&[])
+                } else {
+                    solver.check_sat()
+                };
+                assert_eq!(result.is_sat(), sat);
+                assert_eq!(result.is_unsat(), !sat);
+                assert_eq!(solver.executor.current_solve_deadline(), None);
+            }
+        }
+    }
+
+    /// Replay the captured consumer obligation with the same complete wall
+    /// requested directly and through the explicit quantified backstop.
+    #[test]
+    #[ntest::timeout(300_000)]
+    fn backstop_envelope_captured_deductive_checks_query_certifies_through_the_public_api() {
+        let source = include_str!(
+            "../../../tests/fixtures/deductive_checks_certification_envelope/refutation_loop_push_appends_entailed.smt2"
+        );
+        let (logic, body) = crate::api::split_leading_set_logic(source, Logic::All);
+        for (seconds, backstop) in [(120, false), (30, true)] {
+            let mut solver = Solver::new(logic);
+            solver
+                .parse_smtlib2(&body)
+                .expect("captured deductive-checks query");
+            solver.set_timeout(Some(Duration::from_secs(seconds)));
+            solver.set_quantifier_deadline_backstop(backstop);
+            let started = Instant::now();
+            let result = solver.check_sat();
+            assert!(
+                result.is_unsat(),
+                "backstop={backstop}: {result:?}, reason={:?}, elapsed={:?}",
+                solver.unknown_reason(),
+                started.elapsed()
+            );
+            assert_eq!(solver.executor.current_solve_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn backstop_envelope_uses_the_tighter_relative_timeout_without_extending_getters() {
+        let mut solver = Solver::new(Logic::All);
+        solver
+            .parse_smtlib2(
+                "(set-option :timeout 1000)
+             (declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (> (f x) x)))",
+            )
+            .expect("quantified query and parsed timeout");
+        solver.set_timeout(Some(Duration::from_secs(10)));
+        solver.set_quantifier_deadline_backstop(true);
+        let now = Instant::now();
+        assert_eq!(
+            solver.native_publication_controls_at(now).deadline,
+            now.checked_add(Duration::from_secs(4))
+        );
+        assert_eq!(
+            solver.nominal_native_publication_controls_at(now).deadline,
+            now.checked_add(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn backstop_envelope_quantified_assumptions_use_one_complete_native_grant() {
+        let mut solver = Solver::new(Logic::All);
+        let assertions = solver
+            .parse_smtlib2(
+                "(declare-fun p (Int) Bool)
+                 (assert (forall ((x Int)) (p x)))
+                 (assert (not (p 0)))",
+            )
+            .expect("quantified assumption and ground contradiction");
+        solver.try_reset_assertions().expect("retain declarations");
+        solver.assert_term(assertions[1]);
+        solver.set_timeout(Some(Duration::from_secs(10)));
+        solver.set_quantifier_deadline_backstop(true);
+        let now = Instant::now();
+        assert_eq!(
+            solver.native_publication_controls_at(now).deadline,
+            Some(now + Duration::from_secs(10)),
+            "the hard query is ground"
+        );
+        assert_eq!(
+            solver
+                .native_publication_controls_for_roots_at(now, &[assertions[0].id()])
+                .deadline,
+            Some(now + Duration::from_secs(40)),
+            "the quantified assumption belongs to the decision envelope"
+        );
+        assert!(solver.check_sat_assuming(&[assertions[0]]).is_unsat());
+        assert_eq!(solver.executor.current_solve_deadline(), None);
+        assert!(solver.check_sat().is_sat(), "the assumption was temporary");
+    }
+
+    #[test]
+    fn backstop_envelope_native_cleanup_restores_the_original_interrupt_handle() {
+        let mut solver = Solver::new(Logic::All);
+        solver
+            .parse_smtlib2("(declare-fun p (Int) Bool) (assert (forall ((x Int)) (p x)))")
+            .expect("quantified query");
+        solver.set_timeout(Some(Duration::from_secs(10)));
+        solver.set_quantifier_deadline_backstop(true);
+        let original = Arc::new(AtomicBool::new(false));
+        solver.executor.set_interrupt(original.clone());
+        let controls = solver.native_publication_controls();
+        let scope = solver.install_solve_controls(&controls);
+        solver.restore_solve_controls(&controls, scope);
+        let restored = solver
+            .executor
+            .current_solve_interrupt()
+            .expect("original controller");
+        assert!(Arc::ptr_eq(&original, &restored));
+    }
+
+    #[test]
+    fn backstop_envelope_optimization_uses_only_the_formulas_it_solves() {
+        let mut native = Solver::new(Logic::All);
+        let quantified = native
+            .parse_smtlib2("(declare-fun p (Int) Bool) (assert (forall ((x Int)) (p x)))")
+            .expect("quantified soft formula")[0];
+        native.try_reset_assertions().expect("retain declarations");
+        native
+            .assert_soft(quantified, 1, None)
+            .expect("native soft");
+        native.set_timeout(Some(Duration::from_secs(10)));
+        native.set_quantifier_deadline_backstop(true);
+        let now = Instant::now();
+        assert_eq!(
+            native.native_publication_controls_at(now).deadline,
+            Some(now + Duration::from_secs(10))
+        );
+        assert_eq!(
+            native.native_maxsmt_publication_controls_at(now).deadline,
+            Some(now + Duration::from_secs(40))
+        );
+        assert_eq!(
+            native
+                .native_optimization_publication_controls_at(now)
+                .deadline,
+            Some(now + Duration::from_secs(40))
+        );
+        assert!(
+            native.check_sat().is_sat(),
+            "hard feasibility ignores the soft formula"
+        );
+
+        for formula in [
+            "(assert-soft (forall ((x Int)) (p x)))",
+            "(minimize (ite (forall ((x Int)) (p x)) 0 1))",
+        ] {
+            let mut parsed = Solver::new(Logic::All);
+            parsed
+                .parse_smtlib2(&format!("(declare-fun p (Int) Bool) {formula}"))
+                .expect("parsed optimization formula");
+            parsed.set_timeout(Some(Duration::from_secs(10)));
+            parsed.set_quantifier_deadline_backstop(true);
+            assert_eq!(
+                parsed.native_publication_controls_at(now).deadline,
+                Some(now + Duration::from_secs(10))
+            );
+            assert_eq!(
+                parsed.native_maxsmt_publication_controls_at(now).deadline,
+                Some(now + Duration::from_secs(10))
+            );
+            assert_eq!(
+                parsed
+                    .native_optimization_publication_controls_at(now)
+                    .deadline,
+                Some(now + Duration::from_secs(40))
+            );
+            parsed.set_quantifier_deadline_backstop(false);
+            assert_eq!(
+                parsed
+                    .native_optimization_publication_controls_at(now)
+                    .deadline,
+                Some(now + Duration::from_secs(10))
+            );
+        }
+    }
+
+    #[test]
+    fn backstop_envelope_interruptible_owner_lives_through_native_capability_consumption() {
+        struct Owner(Arc<AtomicBool>);
+        impl Owner {
+            fn touch(&self) {}
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let mut solver = Solver::new(Logic::QfUf);
+        solver.clear_last_solve_state(true, false);
+        solver.executor.bind_unsat_query_assumptions(&[]);
+        let controls = solver.native_publication_controls();
+        let scope = solver.install_solve_controls(&controls);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = Owner(dropped.clone());
+        let result = crate::executor::with_interruptible_publication_context(
+            &mut solver,
+            |solver| &mut solver.executor,
+            move || {
+                owner.touch();
+                false
+            },
+            |solver| {
+                let proposed = solver.executor.check_sat().expect("search");
+                assert!(!dropped.load(Ordering::Relaxed));
+                let admitted = solver.finish_verified_result(proposed);
+                assert!(admitted.is_sat());
+                assert!(
+                    !dropped.load(Ordering::Relaxed),
+                    "the per-call owner must outlive native capability consumption"
+                );
+                admitted
+            },
+            Solver::finish_interruptible_publication,
+        );
+        assert!(result.is_sat());
+        assert!(dropped.load(Ordering::Relaxed));
+        solver.restore_solve_controls(&controls, scope);
+    }
+
+    #[test]
+    fn backstop_envelope_interruptible_cleanup_cannot_escape_the_native_interrupt() {
+        struct Owner(Arc<AtomicBool>);
+        impl Owner {
+            fn touch(&self) {}
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let mut solver = Solver::new(Logic::QfUf);
+        let owner = Owner(solver.interrupt_handle());
+        let result = solver.check_sat_interruptible(move || {
+            owner.touch();
+            false
+        });
+        assert!(result.is_unknown());
+        assert_eq!(solver.unknown_reason(), Some(UnknownReason::Interrupted));
+        assert!(solver.model().is_none());
+        solver.clear_interrupt();
+        assert!(solver.check_sat().is_sat());
+    }
+
+    #[test]
+    fn backstop_envelope_interruptible_initial_callback_unwind_restores_native_controls() {
+        let mut solver = Solver::new(Logic::QfUf);
+        let original = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        solver
+            .executor
+            .set_solve_controls(Some(original.clone()), Some(deadline));
+        solver.executor.set_memory_limit(Some(usize::MAX));
+        solver.set_timeout(Some(Duration::from_secs(10)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solver.check_sat_interruptible(|| panic!("initial caller callback"));
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(solver.executor.current_solve_deadline(), Some(deadline));
+        assert_eq!(solver.executor.memory_limit(), Some(usize::MAX));
+        assert!(Arc::ptr_eq(
+            &solver
+                .executor
+                .current_solve_interrupt()
+                .expect("original interrupt"),
+            &original
+        ));
+    }
+
+    #[test]
+    fn backstop_envelope_late_cancellation_revokes_publication_without_leaking_a_deadline() {
+        let mut solver = Solver::new(Logic::All);
+        solver
+            .parse_smtlib2(
+                "(declare-fun f (Int) Int)
+             (assert (forall ((x Int)) (> (f x) x)))
+             (assert (not (= (f 3) 4)))",
+            )
+            .expect("consumer-shaped SAT query");
+        solver.set_timeout(Some(Duration::from_secs(10)));
+        solver.set_quantifier_deadline_backstop(true);
+        solver.clear_last_solve_state(true, false);
+        solver.executor.bind_unsat_query_assumptions(&[]);
+        let controls = solver.native_publication_controls();
+        let scope = solver.install_solve_controls(&controls);
+        let proposed = solver.executor.check_sat().expect("search");
+        assert_eq!(proposed, SolveResult::Sat);
+        solver.interrupt();
+        assert!(solver.finish_verified_result(proposed).is_unknown());
+        assert_eq!(solver.unknown_reason(), Some(UnknownReason::Interrupted));
+        solver.restore_solve_controls(&controls, scope);
+        assert_eq!(solver.executor.current_solve_deadline(), None);
+        solver.clear_interrupt();
+        assert!(solver.check_sat().is_sat());
     }
 
     #[test]
@@ -919,10 +1454,10 @@ mod finish_verified_result_tests {
         solver.set_term_memory_limit(Some(1));
 
         let controls = solver.native_publication_controls();
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
 
         assert_eq!(solver.executor.term_memory_limit(), Some(1));
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(solver.executor.term_memory_limit(), None);
         solver.set_term_memory_limit(None);
     }
@@ -940,9 +1475,9 @@ mod finish_verified_result_tests {
         assert_eq!(controls.deadline, now.checked_add(Duration::from_millis(7)));
         assert_eq!(solver.executor.timeout(), Some(Duration::from_millis(7)));
 
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
         assert_eq!(solver.executor.current_solve_deadline(), controls.deadline);
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(solver.executor.current_solve_deadline(), None);
         assert_eq!(
             solver.executor.timeout(),
@@ -974,17 +1509,17 @@ mod finish_verified_result_tests {
         solver.set_memory_limit(Some(128 * MIB));
         let controls = solver.native_publication_controls();
         assert_eq!(controls.effective_memory_limit, Some(64 * MIB));
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
         assert_eq!(solver.executor.memory_limit(), Some(64 * MIB));
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(solver.executor.memory_limit(), Some(64 * MIB));
 
         solver.set_memory_limit(Some(32 * MIB));
         let controls = solver.native_publication_controls();
         assert_eq!(controls.effective_memory_limit, Some(32 * MIB));
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
         assert_eq!(solver.executor.memory_limit(), Some(32 * MIB));
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(
             solver.executor.memory_limit(),
             Some(64 * MIB),
@@ -1002,7 +1537,7 @@ mod finish_verified_result_tests {
         solver.executor.bind_unsat_query_assumptions(&[]);
 
         let controls = solver.native_publication_controls();
-        solver.install_solve_controls(controls);
+        let deadline_scope = solver.install_solve_controls(&controls);
         let proposed = solver
             .executor
             .check_sat()
@@ -1026,7 +1561,7 @@ mod finish_verified_result_tests {
 
         let verified = solver.finish_verified_result(rejected);
         assert!(verified.is_unknown());
-        solver.restore_solve_controls(controls);
+        solver.restore_solve_controls(&controls, deadline_scope);
         assert_eq!(solver.executor.current_solve_deadline(), None);
         assert_eq!(solver.executor.timeout(), Some(Duration::from_mins(1)));
     }

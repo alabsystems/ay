@@ -9,14 +9,23 @@ use super::*;
 impl BvSolver<'_> {
     /// Bit-blast equality: a = b
     pub(crate) fn bitblast_eq(&mut self, a: &BvBits, b: &BvBits) -> CnfLit {
+        if !self.encoding_complete() {
+            return 0;
+        }
+
         assert_eq!(a.len(), b.len());
 
         // a = b iff all bits are equal
         // Each bit equal: (ai XOR bi) = false, i.e., ~(ai XOR bi)
-        let mut equal_bits: Vec<CnfLit> = Vec::new();
+        let Some(mut equal_bits) = self.counted_bits(a.len()) else {
+            return 0;
+        };
         for (&ai, &bi) in a.iter().zip(b.iter()) {
+            if !self.encoding_step() {
+                return 0;
+            }
             let xor = self.mk_xor(ai, bi);
-            equal_bits.push(-xor); // NOT XOR = XNOR = equal
+            equal_bits.push(neg_lit(xor)); // NOT XOR = XNOR = equal
         }
 
         // AND all equalities
@@ -25,6 +34,10 @@ impl BvSolver<'_> {
 
     /// Bit-blast unsigned less-than: a < b
     pub(crate) fn bitblast_ult(&mut self, a: &BvBits, b: &BvBits) -> CnfLit {
+        if !self.encoding_complete() {
+            return 0;
+        }
+
         assert_eq!(a.len(), b.len());
         let n = a.len();
 
@@ -45,15 +58,18 @@ impl BvSolver<'_> {
         let mut lt = self.fresh_false();
 
         for i in 0..n {
+            if !self.encoding_step() {
+                return 0;
+            }
             let ai = a[i];
             let bi = b[i];
 
             // a[i] < b[i] means a[i]=0 and b[i]=1
-            let a_lt_b = self.mk_and(-ai, bi);
+            let a_lt_b = self.mk_and(neg_lit(ai), bi);
 
             // a[i] = b[i] means XNOR
             let xor = self.mk_xor(ai, bi);
-            let eq = -xor;
+            let eq = neg_lit(xor);
 
             // New lt = a_lt_b OR (eq AND old_lt)
             let eq_and_lt = self.mk_and(eq, lt);
@@ -65,13 +81,21 @@ impl BvSolver<'_> {
 
     /// Bit-blast unsigned less-or-equal: a <= b
     pub(crate) fn bitblast_ule(&mut self, a: &BvBits, b: &BvBits) -> CnfLit {
+        if !self.encoding_complete() {
+            return 0;
+        }
+
         // a <= b iff NOT (b < a)
         let b_lt_a = self.bitblast_ult(b, a);
-        -b_lt_a
+        neg_lit(b_lt_a)
     }
 
     /// Bit-blast signed less-than: a <_s b
     pub(crate) fn bitblast_slt(&mut self, a: &BvBits, b: &BvBits) -> CnfLit {
+        if !self.encoding_complete() {
+            return 0;
+        }
+
         assert_eq!(a.len(), b.len());
         let n = a.len();
 
@@ -83,7 +107,7 @@ impl BvSolver<'_> {
         let sign_b = b[n - 1];
 
         // Case 1: a negative, b non-negative => a < b
-        let a_neg_b_pos = self.mk_and(sign_a, -sign_b);
+        let a_neg_b_pos = self.mk_and(sign_a, neg_lit(sign_b));
 
         // Case 2: signs equal, compare magnitudes
         let signs_eq = self.mk_xnor(sign_a, sign_b);
@@ -95,7 +119,11 @@ impl BvSolver<'_> {
 
     /// Bit-blast signed less-or-equal: a <=_s b
     pub(crate) fn bitblast_sle(&mut self, a: &BvBits, b: &BvBits) -> CnfLit {
+        if !self.encoding_complete() {
+            return 0;
+        }
+
         let b_lt_a = self.bitblast_slt(b, a);
-        -b_lt_a
+        neg_lit(b_lt_a)
     }
 }

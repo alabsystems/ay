@@ -151,13 +151,8 @@ impl<T: TheorySolver> DpllT<'_, T> {
         match final_result {
             TheoryResult::Sat => FinalCheckResult::Accept,
             TheoryResult::Unsat(conflict_terms) => {
-                // #8424: EUF chain minimization at the theory level.
-                let mut conflict_terms = conflict_terms;
-                if let Some(terms) = self.terms {
-                    let euf_removed =
-                        crate::theory_inference::minimize_euf_conflict(&mut conflict_terms, terms);
-                    self.theory_minimize_lits_removed += euf_removed as u64;
-                }
+                // This final-check boundary does not carry proof-row
+                // ownership; retain the complete theory explanation.
                 let mut clause: Vec<Literal> = conflict_terms
                     .iter()
                     .map(|t| self.term_to_literal_or_register(t.term, !t.value))
@@ -165,12 +160,18 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 if clause.is_empty() {
                     return FinalCheckResult::Unknown;
                 }
-                // #8424: Pre-minimize conflict clause with level-0 removal.
-                let removed =
-                    crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                        self.sat.var_level(var)
-                    });
-                self.theory_minimize_lits_removed += removed as u64;
+                match crate::theory_inference::minimize_conflict_clause(
+                    &mut clause,
+                    crate::theory_inference::ConflictClausePolicy::PreserveLiterals,
+                ) {
+                    crate::theory_inference::ConflictClauseReduction::Clause { removed } => {
+                        self.theory_minimize_lits_removed += removed as u64
+                    }
+                    crate::theory_inference::ConflictClauseReduction::Tautology
+                    | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                        return FinalCheckResult::Unknown
+                    }
+                }
                 // #8421: Bump VSIDS activity for variables in final-check conflict.
                 for lit in &clause {
                     self.sat.bump_variable_activity(lit.variable());
@@ -190,19 +191,20 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 if clause.is_empty() {
                     return FinalCheckResult::Unknown;
                 }
-                // #8424: Pre-minimize Farkas conflict clause, then level-0 removal.
-                let mut removed = if let Some(ref farkas) = conflict.farkas {
-                    let mut coeffs = farkas.coefficients.clone();
-                    crate::theory_inference::minimize_farkas_conflict(&mut clause, &mut coeffs)
-                } else {
-                    0
-                };
-                // Level-0 removal applies to both Farkas and non-Farkas paths.
-                removed +=
-                    crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                        self.sat.var_level(var)
-                    });
-                self.theory_minimize_lits_removed += removed as u64;
+                // Preserve the coefficient-aligned signed clause. The final
+                // check has no indexed proof-mode ownership to weaken it.
+                match crate::theory_inference::minimize_conflict_clause(
+                    &mut clause,
+                    crate::theory_inference::ConflictClausePolicy::PreserveLiterals,
+                ) {
+                    crate::theory_inference::ConflictClauseReduction::Clause { removed } => {
+                        self.theory_minimize_lits_removed += removed as u64
+                    }
+                    crate::theory_inference::ConflictClauseReduction::Tautology
+                    | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                        return FinalCheckResult::Unknown
+                    }
+                }
                 // #8421: Bump VSIDS activity for variables in Farkas final-check conflict.
                 for lit in &clause {
                     self.sat.bump_variable_activity(lit.variable());

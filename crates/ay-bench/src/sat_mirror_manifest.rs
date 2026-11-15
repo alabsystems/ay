@@ -439,10 +439,10 @@ fn load_labels(path: &Path) -> Result<(BTreeMap<String, String>, LabelStats)> {
     let text = fs::read_to_string(path)
         .with_bench_context(|| format!("reading labels {}", path.display()))?;
     let mut labels = BTreeMap::new();
-    let mut total_rows = 0;
-    let mut sat = 0;
-    let mut unsat = 0;
-    let mut unknown = 0;
+    let mut total_rows = 0_usize;
+    let mut sat = 0_usize;
+    let mut unsat = 0_usize;
+    let mut unknown = 0_usize;
     let mut duplicates = Vec::new();
     let mut bad_labels = Vec::new();
 
@@ -459,21 +459,24 @@ fn load_labels(path: &Path) -> Result<(BTreeMap<String, String>, LabelStats)> {
         {
             continue;
         }
-        total_rows += 1;
+        total_rows = total_rows.saturating_add(1);
         if fields.len() < 2 || fields[0].is_empty() {
-            bad_labels.push(format!("line {}: malformed label row", line_index + 1));
+            bad_labels.push(format!(
+                "line {}: malformed label row",
+                line_index.saturating_add(1)
+            ));
             continue;
         }
         let hash = fields[0].to_string();
         let result = normalize_result(fields[1]);
         match result.as_str() {
-            "sat" => sat += 1,
-            "unsat" => unsat += 1,
-            "unknown" => unknown += 1,
+            "sat" => sat = sat.saturating_add(1),
+            "unsat" => unsat = unsat.saturating_add(1),
+            "unknown" => unknown = unknown.saturating_add(1),
             _ => {
                 bad_labels.push(format!(
                     "line {} hash {}: result must be sat, unsat, or unknown, got {:?}",
-                    line_index + 1,
+                    line_index.saturating_add(1),
                     hash,
                     fields[1]
                 ));
@@ -553,7 +556,7 @@ fn load_metadata(path: &Path) -> Result<BTreeMap<String, MetadataRow>> {
                 reason: format!(
                     "metadata {} line {} must have hash filename family author",
                     path.display(),
-                    line_index + 1
+                    line_index.saturating_add(1)
                 ),
             });
         }

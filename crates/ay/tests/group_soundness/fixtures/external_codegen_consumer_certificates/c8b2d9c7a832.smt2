@@ -1,0 +1,8 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const base (_ BitVec 32))
+(declare-const src (_ BitVec 32))
+(assert (not (= (bvadd (bvmul (_ bv65536 32) src) base) (bvadd (bvshl src (_ bv16 32)) base))))
+(check-sat)
+(exit)

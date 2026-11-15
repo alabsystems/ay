@@ -195,6 +195,74 @@ fn string_contents_and_lstring() {
     }
 }
 
+/// A surrogate code point is an SMT-LIB character: `Z3_mk_u32string` accepts
+/// it and `Z3_get_string_contents` reads it back as the same code point, not
+/// as the carrier `char` AY stores it in (`ay_core::smtlib_char`). libz3
+/// accepts every code point `0..=0x2FFFF` here. (2026-09-23 fp-strings
+/// verifier: mutant M25 and the contents read-back had no test.)
+#[test]
+fn u32string_round_trips_a_surrogate_code_point() {
+    // SAFETY: all handles live within one context; the contents buffer is
+    // sized to the reported length.
+    unsafe {
+        let c = ctx();
+        let code_points: [c_uint; 4] = [0x61, 0xD800, 0xDFFF, 0xE000];
+        let s = Z3_mk_u32string(c, 4, code_points.as_ptr());
+        assert_ne!(s, 0, "a surrogate is an SMT-LIB character");
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
+        assert_eq!(Z3_get_string_length(c, s), 4);
+        let mut buf: Vec<c_uint> = vec![0; 4];
+        Z3_get_string_contents(c, s, 4, buf.as_mut_ptr());
+        assert_eq!(buf, code_points.to_vec());
+        Z3_del_context(c);
+    }
+}
+
+/// A code point in the surrogate carrier block `0x10D800..=0x10DFFF` is
+/// refused by `Z3_mk_u32string`: stored as-is it would read back as the
+/// surrogate it carries (0x10D800 as U+D800), a different character from the
+/// one the caller passed (2026-09-28 fp-strings verifier). Code points just
+/// outside the block are kept as-is. `Z3_mk_string`/`Z3_mk_lstring` read bytes
+/// as characters `0..=0xFF` (z3's `zstring`), so the UTF-8 bytes of a carrier
+/// are four ordinary characters, as in z3, never a surrogate.
+#[test]
+fn surrogate_carrier_input_is_refused_or_read_as_bytes() {
+    // SAFETY: all handles live within one context; every C string is
+    // NUL-terminated and every slice pointer is valid for its length.
+    unsafe {
+        let c = ctx();
+        for cp in [0x10_D800_u32, 0x10_DABC, 0x10_DFFF] {
+            let code_points: [c_uint; 2] = [0x61, cp];
+            let s = Z3_mk_u32string(c, 2, code_points.as_ptr());
+            assert_eq!(s, 0, "{cp:#x} must be refused");
+            assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG, "{cp:#x}");
+            Z3_set_error(c, Z3_OK);
+
+            let text = format!("a{}", char::from_u32(cp).expect("a scalar value"));
+            let s = Z3_mk_lstring(c, text.len() as c_uint, text.as_ptr().cast());
+            assert_eq!(Z3_get_string_length(c, s), 5, "{cp:#x} via Z3_mk_lstring");
+            assert_eq!(Z3_get_error_code(c), Z3_OK, "{cp:#x}");
+
+            let text = CString::new(text).expect("no interior NUL");
+            let s = Z3_mk_string(c, text.as_ptr());
+            let mut buf: [c_uint; 5] = [0; 5];
+            Z3_get_string_contents(c, s, 5, buf.as_mut_ptr());
+            let utf8: Vec<c_uint> = text.as_bytes().iter().map(|&b| c_uint::from(b)).collect();
+            assert_eq!(buf.to_vec(), utf8, "{cp:#x} via Z3_mk_string");
+            assert_eq!(Z3_get_error_code(c), Z3_OK, "{cp:#x}");
+        }
+        for cp in [0x10_D7FF_u32, 0x10_E000] {
+            let s = Z3_mk_u32string(c, 1, [cp].as_ptr());
+            assert_ne!(s, 0, "{cp:#x} is outside the carrier block");
+            assert_eq!(Z3_get_error_code(c), Z3_OK);
+            let mut buf: [c_uint; 1] = [0];
+            Z3_get_string_contents(c, s, 1, buf.as_mut_ptr());
+            assert_eq!(buf, [cp]);
+        }
+        Z3_del_context(c);
+    }
+}
+
 #[test]
 fn array_sort_n_arity_and_domains() {
     // SAFETY: all handles live within one context.

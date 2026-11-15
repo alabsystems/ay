@@ -40,12 +40,15 @@ const VAR_SUBST_HELPER_STACK_SIZE: usize = 1024 * 1024;
 /// timeout in cycle checks and select/store expansion on linked-list encodings.
 pub(crate) const VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT: usize = 32;
 
+/// Bound the total borrowed nominal-identity bytes compared in one equality.
+const VAR_SUBST_NOMINAL_IDENTITY_BYTE_LIMIT: usize = 20_000;
+
 /// Variable substitution preprocessing pass.
 ///
 /// Scope (per #1782, extended #2767):
 /// - Direct equalities `(= var term)` only
 /// - Direct substitution (no transitive chains initially)
-/// - Bool, BV, Int, Real, and Array sorts
+/// - Bool, BV, Int, Real, Array, and Datatype sorts; nominal direct equalities
 pub(crate) struct VariableSubstitution {
     /// Substitution map: variable TermId -> replacement TermId
     substitutions: HashMap<TermId, TermId>,
@@ -508,6 +511,26 @@ impl VariableSubstitution {
                 let lhs_sort = terms.sort(lhs);
                 let rhs_sort = terms.sort(rhs);
 
+                // Parsed datatype carriers are nominal, as are ordinary declared
+                // sorts. Direct equality substitution needs no constructor or
+                // selector theorem: require the exact same carrier and a Bool
+                // assertion, then retain the existing mode, budget, and cycle gates.
+                let nominal_pair = match (lhs_sort, rhs_sort) {
+                    (Sort::Uninterpreted(left), Sort::Uninterpreted(right)) => {
+                        if !matches!(sym, ay_core::term::Symbol::Named(name) if name == "=")
+                            || terms.sort(assertion) != &Sort::Bool
+                            || left.len().checked_add(right.len())?
+                                > VAR_SUBST_NOMINAL_IDENTITY_BYTE_LIMIT
+                            || left != right
+                        {
+                            return None;
+                        }
+                        true
+                    }
+                    (Sort::Uninterpreted(_), _) | (_, Sort::Uninterpreted(_)) => return None,
+                    _ => false,
+                };
+
                 // Substitute Bool, BV, Int, Real, and Array sorts.
                 // Int/Real enables elimination of equality chains like
                 // result_a = self_a + 1 that the LRA simplex can't resolve (#2767).
@@ -540,7 +563,10 @@ impl VariableSubstitution {
                     )
                 };
 
-                if !is_substitutable_sort(lhs_sort) && !is_substitutable_sort(rhs_sort) {
+                if !nominal_pair
+                    && !is_substitutable_sort(lhs_sort)
+                    && !is_substitutable_sort(rhs_sort)
+                {
                     return None;
                 }
 
@@ -1000,3 +1026,6 @@ mod apply;
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod nominal_direct_equality_tests;

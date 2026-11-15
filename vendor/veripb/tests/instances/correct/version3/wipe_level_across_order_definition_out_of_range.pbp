@@ -1,0 +1,38 @@
+pseudo-Boolean proof version 3.0
+% The other symptom of wipe_level_across_order_definition (see there for the
+% mechanism): with a single-constraint formula the scratch indices the order
+% definition recorded at the level (1-4) exceed the problem database, so the
+% same `wiplvl` was refused outright on a legitimate proof -- "Accessing the
+% database out of bound with index 3" -- instead of deleting the one constraint
+% the proof actually tagged, the `pol` sum. This proof must verify: rejected
+% before level recording was suspended across the database swap, accepted
+% after.
+f 1;
+setlvl 1;
+def_order simple
+    vars
+        left u1;
+        right v1;
+        aux;
+    end;
+    def
+        -1 u1 1 v1 >= 0;
+    end;
+    transitivity
+        vars
+            fresh_right w1;
+        end;
+        proof
+            proofgoal #1
+                pol -2 -3 + -1 +;
+            qed : -1;
+        qed;
+    end;
+end;
+pol 1 1 +;
+wiplvl 1;
+e 1 x1 1 x2 >= 1 : 1;
+is_deleted 2 x1 2 x2 >= 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

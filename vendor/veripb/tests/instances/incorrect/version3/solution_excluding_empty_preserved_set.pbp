@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 1;
+solx x1 x2;
+output NONE;
+conclusion BOUNDS 1000 1000 ;
+end pseudo-Boolean proof;

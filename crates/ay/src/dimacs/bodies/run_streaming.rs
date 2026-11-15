@@ -222,6 +222,36 @@ impl<'a> StreamingClauseLoader<'a> {
     }
 }
 
+/// Literal occurrences in a DIMACS body: every token but the `0` that ends a
+/// clause, comment lines skipped. One pass over the bytes.
+fn count_body_literals(body: &[u8]) -> usize {
+    let mut literals = 0usize;
+    let mut i = 0usize;
+    let mut line_start = true;
+    while i < body.len() {
+        let b = body[i];
+        if line_start && (b == b'c' || b == b'%') {
+            while i < body.len() && body[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        line_start = b == b'\n';
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < body.len() && !body[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !(i - start == 1 && body[start] == b'0') {
+            literals += 1;
+        }
+    }
+    literals
+}
+
 fn run_streaming_body(
     content: &str,
     stats_cfg: stats_output::StatsConfig,
@@ -229,10 +259,34 @@ fn run_streaming_body(
     variant_source: DecisionSource,
 ) {
     let bytes = content.as_bytes();
+    let mem_report = ay_core::misc_cli_flags().sat_mem_probe;
+    let mem_step = |step: &str| {
+        if mem_report {
+            safe_eprintln!(
+                "c mem-report {step} rss={}MiB live={}MiB",
+                ay_sys::current_rss_bytes() >> 20,
+                ay_sys::current_live_bytes() >> 20
+            );
+        }
+    };
+    mem_step("input-read");
     let header = require_streaming_dimacs_header(bytes);
     let (mut solver, streaming_config) = create_streaming_dimacs_solver(&header, variant);
+    mem_step("solver-built");
+    // Size the clause arena and the original ledger to the formula before
+    // loading: grown by doubling, each ended up to twice what it holds, and
+    // each doubling briefly held both buffers. The counting allocator charges
+    // both, so a 39.6M-clause formula (bb8db7af, 3.9 GB resident at its peak)
+    // breached an 8 GB `--memory` ceiling while loading; Kissat answers it in
+    // 13 s.
+    solver.reserve_clause_capacity(
+        header.num_clauses_declared,
+        count_body_literals(&bytes[header.body_offset..]),
+    );
+    mem_step("reserved");
     let (clauses_loaded, ternary_count, horn_count) =
         StreamingClauseLoader::new(bytes, header.body_offset).load(&mut solver);
+    mem_step("loaded");
     let features = SatFeatures::from_streaming_counters(
         header.num_vars,
         clauses_loaded,
@@ -249,8 +303,29 @@ fn run_streaming_body(
         "c streaming parse: {clauses_loaded} clauses loaded ({} vars)",
         header.num_vars
     );
+    if mem_report {
+        safe_eprintln!(
+            "c mem-report after-parse rss={}MiB {}",
+            ay_sys::current_rss_bytes() >> 20,
+            solver.memory_report()
+        );
+    }
     configure_dimacs_solver(&mut solver, stats_cfg);
     maybe_run_preprocess_only_route(&mut solver);
     let result = solver.solve_interruptible(is_timed_out).into_inner();
     finish_dimacs_solve(&mut solver, result, stats_cfg, content, None, None, None);
+}
+
+#[cfg(test)]
+mod count_body_literals_tests {
+    use super::count_body_literals;
+
+    #[test]
+    fn literals_are_the_tokens_other_than_clause_terminators() {
+        let body = b"1 -2 0\nc a comment 1 2 3 0\n-10 20 30\t0\n  0\n100 0";
+        assert_eq!(count_body_literals(body), 6);
+        assert_eq!(count_body_literals(b""), 0);
+        assert_eq!(count_body_literals(b"c only a comment\n"), 0);
+        assert_eq!(count_body_literals(b"10 0 1\n0"), 2);
+    }
 }

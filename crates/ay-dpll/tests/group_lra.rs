@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated lra integration tests for ay-dpll.
-//! Groups 20 test modules into a single binary to reduce link time.
+//! Groups 24 test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -11,8 +11,16 @@ mod common;
 
 #[path = "group_lra/lra_atom_normalization_soundness.rs"]
 mod lra_atom_normalization_soundness;
+#[path = "group_lra/lra_check_sat_assuming_fragile_gate.rs"]
+mod lra_check_sat_assuming_fragile_gate;
+#[path = "group_lra/lra_check_sat_assuming_no_persistent_leak.rs"]
+mod lra_check_sat_assuming_no_persistent_leak;
 #[path = "group_lra/lra_coefficient_split_6155.rs"]
 mod lra_coefficient_split_6155;
+#[path = "group_lra/lra_inc_engine_empty_clause_scope.rs"]
+mod lra_inc_engine_empty_clause_scope;
+#[path = "group_lra/lra_inc_engine_pushpop_selector_alias.rs"]
+mod lra_inc_engine_pushpop_selector_alias;
 #[path = "group_lra/lra_incremental_push_pop.rs"]
 mod lra_incremental_push_pop;
 #[path = "group_lra/lra_incremental_regression_2822.rs"]

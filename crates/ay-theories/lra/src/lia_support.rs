@@ -78,6 +78,23 @@ impl LraSolver {
     ///
     /// Returns true if an integer solution was found, false otherwise.
     /// When true, caller should re-check: the integer vars have been rounded.
+    ///
+    /// When false, the assignment is exactly the materialized entry point
+    /// (#cube-decline-no-trace). Normal push processing first applies any
+    /// pending atoms, creating their variables and rows before the snapshot;
+    /// this processing does not run a full LP check. For an already checked
+    /// caller the entry point is unchanged. The tightened bounds die with the pop, but
+    /// the re-solve under them moves the assignment and `pop` restores bounds,
+    /// not values, so a declined step used to leave the LP at a point the
+    /// test chose and then rejected. Every caller reads that point: the LIA's
+    /// branch-and-bound split, computed from the entry point, named a value
+    /// the LP no longer held, and the NIA refinement, re-reading the LP after
+    /// a tentative patch whose LIA check ran this test, cut at the moved point
+    /// and forwarded a fresh split every round — a monotone walk the split
+    /// loop's oscillation guard ends `unknown` on a satisfiable query
+    /// (`0 <= a < 1000, 0 <= b <= 2^64-1, a*b > 2^64-1`; z3: sat). z3's
+    /// `int_cube` keeps the moved point because its caller re-selects from
+    /// the current point; this solver's callers do not.
     pub fn try_cube_test(&mut self, integer_vars: &HashSet<TermId>) -> bool {
         let debug = debug_cube();
 
@@ -85,7 +102,10 @@ impl LraSolver {
             safe_eprintln!("[CUBE] Starting cube test with {} rows", self.rows.len());
         }
 
+        // Push materializes pending asserted atoms. Snapshot that complete
+        // variable set before any speculative tightening or simplex work.
         self.push();
+        let entry_values = self.snapshot_values();
 
         // Tighten bounds on each row's basic variable.
         // Delta = (1/2) * sum(|coeff_j|) for integer non-basic vars j in the row.
@@ -103,7 +123,13 @@ impl LraSolver {
                 continue;
             }
 
-            // Tighten lower bound: lower += delta
+            // Tighten lower bound: lower += delta. The bounds are asserted
+            // in the reason-free "axiom" form: they live only inside this
+            // test's push scope, and a conflict under them is discarded
+            // with the pop, never exported. (Routing through
+            // `add_direct_bound` was a silent no-op — it skips reason-free
+            // bounds since #4919 — so the tightening never happened and the
+            // "cube test" degenerated to rounding the untightened point.)
             let info = &self.vars[basic_var as usize];
             if let Some(ref lb) = info.lower {
                 let new_lower = &lb.value + &delta;
@@ -114,7 +140,14 @@ impl LraSolver {
                         break;
                     }
                 }
-                self.add_direct_bound(basic_var, new_lower.to_big(), true);
+                self.assert_var_bound_with_reasons(
+                    basic_var,
+                    new_lower,
+                    BoundType::Lower,
+                    false,
+                    &[],
+                    &[],
+                );
             }
 
             // Tighten upper bound: upper -= delta
@@ -127,7 +160,14 @@ impl LraSolver {
                         break;
                     }
                 }
-                self.add_direct_bound(basic_var, new_upper.to_big(), false);
+                self.assert_var_bound_with_reasons(
+                    basic_var,
+                    new_upper,
+                    BoundType::Upper,
+                    false,
+                    &[],
+                    &[],
+                );
             }
         }
 
@@ -136,6 +176,7 @@ impl LraSolver {
                 safe_eprintln!("[CUBE] Tightening made bounds infeasible, aborting");
             }
             self.pop();
+            self.restore_values(entry_values);
             return false;
         }
 
@@ -158,6 +199,7 @@ impl LraSolver {
                             "[CUBE] Rounded assignment violated bounds; rejecting cube step"
                         );
                     }
+                    self.restore_values(entry_values);
                     false
                 }
             }
@@ -182,6 +224,7 @@ impl LraSolver {
                             "[CUBE] Cube test failed, LP infeasible with tighter bounds"
                         );
                     }
+                    self.restore_values(entry_values);
                     false
                 }
             }
@@ -259,6 +302,7 @@ impl LraSolver {
         // #inc-guard-memo: this function rewrites variable values wholesale —
         // memo invalid and tracked-only chain broken (#inc-guard-chain).
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         // #warm-simplex: untracked value rewrites.
         self.warm_invalidate();
@@ -307,24 +351,42 @@ impl LraSolver {
         &mut self,
         integer_vars: &HashSet<TermId>,
     ) -> bool {
-        let saved_values: Vec<InfRational> =
-            self.vars.iter().map(|info| info.value.clone()).collect();
+        let saved_values = self.snapshot_values();
         self.round_integer_vars_to_nearest(integer_vars);
 
         if self.assignment_satisfies_bounds() {
             return true;
         }
 
+        self.restore_values(saved_values);
+        false
+    }
+
+    /// Every variable's current value, for [`Self::restore_values`].
+    fn snapshot_values(&self) -> Vec<InfRational> {
+        self.vars.iter().map(|info| info.value.clone()).collect()
+    }
+
+    /// Put back an assignment taken by [`Self::snapshot_values`] on the same
+    /// variable set. A snapshot of a feasible point satisfies every row in
+    /// any basis (pivoting rewrites the rows, not the system they spell), so
+    /// only the value caches need invalidating.
+    fn restore_values(&mut self, saved: Vec<InfRational>) {
+        debug_assert_eq!(
+            saved.len(),
+            self.vars.len(),
+            "BUG: restore_values: the variable set changed since the snapshot"
+        );
         // #inc-guard-memo: restoring saved values is a value mutation — memo
         // invalid and tracked-only chain broken (#inc-guard-chain).
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         // #warm-simplex: untracked value rewrites.
         self.warm_invalidate();
-        for (var, saved) in self.vars.iter_mut().zip(saved_values) {
+        for (var, saved) in self.vars.iter_mut().zip(saved) {
             var.value = saved;
         }
-        false
     }
 
     /// Check whether current variable values satisfy all active bounds.

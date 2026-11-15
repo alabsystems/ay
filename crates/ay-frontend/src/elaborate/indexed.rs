@@ -12,6 +12,7 @@ use ay_core::{Sort, Symbol, TermId};
 use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 
+use super::sorts::{FAM_BV, FAM_FP, FAM_INT, FAM_REGLAN};
 use super::{Context, ElaborateError, Result, SymbolInfo, MAX_FUN_EXPANSION_DEPTH};
 
 /// Indexed identifiers whose indices must all be u32 numerals. Used by the
@@ -63,6 +64,12 @@ impl Context {
         args: &[ParsedTerm],
         env: &HashMap<String, TermId>,
     ) -> Result<TermId> {
+        // `(_ fp.to_ieee_bv)` is SMT-LIB's zero-index indexed head: the
+        // same operator as the bare application, which the floating-point
+        // app path (with its logic-signature gate) already elaborates.
+        if name == "fp.to_ieee_bv" && parsed_indices.is_empty() {
+            return self.elaborate_app(name, args, env);
+        }
         // SMT-LIB datatype tester: (_ is Constructor) → normalize to "is-Ctor"
         // and delegate to elaborate_app which handles function defs and symbol lookup.
         if name == "is" {
@@ -104,18 +111,7 @@ impl Context {
             });
             if args.len() == 1 && sole_ctor_exists {
                 let arg_id = self.elaborate_term(&args[0], env)?;
-                let dt_name = match self.terms.sort(arg_id) {
-                    Sort::Uninterpreted(n) => Some(n.clone()),
-                    Sort::Datatype(dt) => Some(dt.name.clone()),
-                    _ => None,
-                };
-                let is_sole_ctor = dt_name.as_deref().is_some_and(|dt| {
-                    self.datatypes.get(dt).is_some_and(|ctors| {
-                        ctors.len() == 1
-                            && self.dt_surface_name(&ctors[0]).unwrap_or(&ctors[0]) == ctor_name
-                    })
-                });
-                if is_sole_ctor {
+                if self.is_sole_constructor_tester(ctor_name, arg_id) {
                     return Ok(self.terms.true_term());
                 }
             }
@@ -130,6 +126,24 @@ impl Context {
                 .is_some_and(|logic| !matches!(logic, "QF_FD" | "ALL" | "HORN"))
         {
             return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        }
+
+        // Shell-only z3 signature gate (DR-59): an indexed builtin
+        // whose sort family the declared logic does not provide is
+        // `unknown constant` in z3's shell (measured against 5.1.0:
+        // `int2bv` under QF_LIA, `+zero`/`NaN` under QF_BV,
+        // `divisible` under QF_BV).
+        let indexed_family = match name {
+            "extract" | "int2bv" | "zero_extend" | "sign_extend" | "rotate_left"
+            | "rotate_right" | "repeat" => Some(FAM_BV),
+            "to_fp" | "to_fp_unsigned" | "fp.to_ubv" | "fp.to_sbv" | "+zero" | "-zero" | "+oo"
+            | "-oo" | "NaN" => Some(FAM_FP),
+            "re.loop" | "re.^" => Some(FAM_REGLAN),
+            "divisible" => Some(FAM_INT),
+            _ => None,
+        };
+        if let Some(family) = indexed_family {
+            self.require_logic_builtin_family(name, family)?;
         }
 
         let arg_ids: Vec<TermId> = args
@@ -652,6 +666,15 @@ impl Context {
             // constructed parse tree reuses the audited `mod`/`=` elaboration and
             // keeps this purely definitional (no soundness surface of its own).
             "divisible" => {
+                // z3 (4.12.5 and 5.1.0) registers `divisible` only when
+                // `:smtlib2_compliant` is true as its session starts, and
+                // otherwise reads it as an unknown function, after its
+                // arguments.
+                if self.z3_mode && !self.z3_registers_divisible() {
+                    return Err(ElaborateError::IllSorted(
+                        "unknown constant divisible (Int)".to_string(),
+                    ));
+                }
                 if parsed_indices.len() != 1 || indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(
                         "divisible requires exactly 1 numeral index (the divisor)".to_string(),

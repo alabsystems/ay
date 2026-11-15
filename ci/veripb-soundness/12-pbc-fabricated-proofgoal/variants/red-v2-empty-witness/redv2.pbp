@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 2.0
+* The version 2.0 spelling. `red` with an EMPTY witness is treated as a proof by contradiction
+* (red_strengthening.rs), and an empty witness touches no database constraint, so
+* `database.get_proofgoals()` registers none either -- `proofgoal 1` lands in the same
+* fabrication branch. Same forged UNSAT for the same satisfiable clause.
+f 1
+red >= 1 ; ; begin
+    proofgoal 1
+        u >= 1 ;
+    end
+end
+output NONE
+conclusion UNSAT
+end pseudo-Boolean proof

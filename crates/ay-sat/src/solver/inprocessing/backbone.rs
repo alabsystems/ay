@@ -139,12 +139,27 @@ impl Solver {
         // conflict budget continues to apply in both modes.
         let backbone_start_ticks = self.total_search_ticks();
 
+        // Pass marks (`--sat-inproc-nlogn-schedule`): this loop starts at
+        // variable 0 on every call and the budgets above rarely let it reach
+        // the end, so under a frequent schedule every call re-probed the same
+        // prefix (3,106 calls for 294 units over the 146 field-solved misses,
+        // about a second per unit). A variable probed in the current pass is
+        // skipped until the pass has reached the last variable; the marks
+        // survive compaction (`compact.rs`).
+        let passes = self.backbone_passes_enabled();
+        if passes && self.cold.backbone_probed_in_pass.len() < self.num_vars {
+            self.cold.backbone_probed_in_pass.resize(self.num_vars, 0);
+        }
+        let pass = self.cold.backbone_pass;
+        let mut pass_cut = false;
+
         for var_idx in 0..self.num_vars {
             if self.has_empty_clause {
                 break;
             }
             // Stop when conflict budget is exhausted.
             if self.num_conflicts.saturating_sub(start_conflicts) >= backbone_conflict_budget {
+                pass_cut = true;
                 break;
             }
             // Stop when the wall-clock (or, in deterministic mode, search_ticks)
@@ -155,10 +170,17 @@ impl Solver {
                 BACKBONE_WALL_LIMIT_MS,
                 crate::determinism::BACKBONE_TICK_BUDGET,
             ) {
+                pass_cut = true;
                 break;
             }
             if self.var_lifecycle.is_removed(var_idx) || self.var_is_assigned(var_idx) {
                 continue;
+            }
+            if passes {
+                if self.cold.backbone_probed_in_pass[var_idx] == pass {
+                    continue;
+                }
+                self.cold.backbone_probed_in_pass[var_idx] = pass;
             }
 
             let var = Variable(var_idx as u32);
@@ -183,6 +205,11 @@ impl Solver {
                     self.backbone_materialize_unit(positive);
                 }
             }
+        }
+        if passes && !pass_cut && !self.has_empty_clause {
+            // The pass reached the last variable: the next call starts over.
+            self.cold.backbone_pass = pass.wrapping_add(1).max(1);
+            self.stats.backbone_completed_passes += 1;
         }
 
         self.suppress_phase_saving = saved_suppress_phase_saving;
@@ -223,6 +250,22 @@ impl Solver {
         found_backbone || self.has_empty_clause
     }
 
+    /// Whether `backbone()` keeps per-variable pass marks: the test override,
+    /// else `--sat-sweep-passes`, else `--sat-inproc-nlogn-schedule`.
+    fn backbone_passes_enabled(&self) -> bool {
+        self.cold.backbone_passes.unwrap_or_else(|| {
+            let switches = ay_core::sat_ab_switches();
+            switches
+                .sweep_passes
+                .unwrap_or(switches.inproc_nlogn_schedule == Some(true))
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::solver) fn set_backbone_passes(&mut self, on: bool) {
+        self.cold.backbone_passes = Some(on);
+    }
+
     /// Probe a single assumption with bounded CDCL search.
     ///
     /// Returns:
@@ -254,7 +297,9 @@ impl Solver {
                 self.conflicts_since_restart += 1;
                 self.num_conflicts += 1;
                 self.on_conflict_random_decision();
+                self.cold.kissat_probing = true;
                 self.analyze_and_backtrack(conflict_ref, "backbone probe", |_, _| {});
+                self.cold.kissat_probing = false;
                 continue;
             }
 
@@ -300,7 +345,7 @@ impl Solver {
     /// a longer learned reason. This helper turns that root assignment into an
     /// actual unit clause so later inprocessing passes and proof reconstruction
     /// can treat it as a first-class derived unit.
-    fn backbone_materialize_unit(&mut self, unit: Literal) {
+    pub(in crate::solver) fn backbone_materialize_unit(&mut self, unit: Literal) {
         let vi = unit.variable().index();
         debug_assert!(
             self.lit_val(unit) > 0,
@@ -368,6 +413,9 @@ impl Solver {
     /// Returns `true` if any backbone units were found or UNSAT was derived.
     /// CaDiCaL: `binary_clauses_backbone()` (backbone.cpp:599-629).
     pub(in crate::solver) fn backbone_binary(&mut self) -> bool {
+        if self.backbone_binary_stacked_enabled() {
+            return self.backbone_binary_stacked();
+        }
         debug_assert_eq!(self.qhead, self.trail.len());
         if !self.require_level_zero() || self.has_empty_clause {
             return false;
@@ -407,6 +455,11 @@ impl Solver {
         // wall cap below becomes a search_ticks delta budget in deterministic
         // mode (the cursor already spreads coverage across calls).
         let wall_start_ticks = self.total_search_ticks();
+        // The binary propagation below never advances search_ticks, so under
+        // `--sat-deterministic-inproc` it charges its watch scans as counted
+        // work (`charge_inproc_scan`), and the cap reads that instead.
+        let det = self.deterministic_inproc();
+        let work_start = self.inproc_work_te();
         let n = self.num_vars;
         if n == 0 {
             return false;
@@ -424,12 +477,17 @@ impl Solver {
             // closure-based `should_stop` is not threaded into inprocessing).
             if step & 63 == 0
                 && (self.is_interrupted()
-                    || self.inproc_over_budget(
-                        wall_start,
-                        wall_start_ticks,
-                        BACKBONE_BINARY_WALL_LIMIT_MS,
-                        crate::determinism::BACKBONE_BINARY_TICK_BUDGET,
-                    ))
+                    || if det {
+                        self.inproc_work_te().saturating_sub(work_start)
+                            >= crate::determinism::BACKBONE_BINARY_TICK_BUDGET
+                    } else {
+                        self.inproc_over_budget(
+                            wall_start,
+                            wall_start_ticks,
+                            BACKBONE_BINARY_WALL_LIMIT_MS,
+                            crate::determinism::BACKBONE_BINARY_TICK_BUDGET,
+                        )
+                    })
             {
                 self.cold.backbone_binary_cursor = var_idx;
                 break;
@@ -593,7 +651,9 @@ impl Solver {
     /// of the conflicting binary clause), or `None` if no conflict.
     ///
     /// CaDiCaL: `backbone_propagate2` (backbone.cpp:140-170).
-    fn backbone_binary_propagate(&mut self) -> Option<(ClauseRef, Literal, Literal)> {
+    pub(in crate::solver) fn backbone_binary_propagate(
+        &mut self,
+    ) -> Option<(ClauseRef, Literal, Literal)> {
         while self.qhead < self.trail.len() {
             let trail_lit = self.trail[self.qhead];
             self.qhead += 1;
@@ -601,6 +661,8 @@ impl Solver {
 
             // Scan binary watchers of the negated literal.
             let num_watchers = self.watches.len_of(neg_lit);
+            // Counted work under `--sat-deterministic-inproc` (det_work.rs).
+            self.charge_inproc_scan(1 + (num_watchers as u64).div_ceil(32));
             for i in 0..num_watchers {
                 if !self.watches.is_binary(neg_lit, i) {
                     // Binary entries are partitioned to the front.
@@ -617,6 +679,16 @@ impl Solver {
                 }
 
                 let clause = self.watches.clause_ref(neg_lit, i);
+
+                // Inside an inprocessing round the watch lists still carry
+                // clauses the round has deleted (the flush comes later), and
+                // one side of such a clause may already be unwatched: every
+                // conflict the stacked backbone refused on schooltt-5-3 (60
+                // of 3.1M probes, 2026-09-21) was on a dead clause reaching
+                // a lower level. A dead clause implies nothing here.
+                if self.arena.is_dead(clause.0 as usize) {
+                    continue;
+                }
 
                 if other_val < 0 {
                     // Both literals false — binary conflict.
@@ -641,7 +713,7 @@ impl Solver {
     /// true at level 0).
     ///
     /// CaDiCaL: `backbone_analyze` (backbone.cpp:215-254).
-    fn backbone_binary_analyze(
+    pub(in crate::solver) fn backbone_binary_analyze(
         &mut self,
         _conflict_clause: ClauseRef,
         lit_a: Literal,
@@ -761,7 +833,7 @@ impl Solver {
     /// Check for binary propagation conflict after a backbone unit was assigned.
     ///
     /// Returns `true` if a conflict was detected (UNSAT), `false` otherwise.
-    fn backbone_binary_check_conflict(&mut self) -> bool {
+    pub(in crate::solver) fn backbone_binary_check_conflict(&mut self) -> bool {
         // Propagate the newly assigned unit over binary clauses.
         if let Some((_clause, _lit_a, _lit_b)) = self.backbone_binary_propagate() {
             // Conflict after backbone unit propagation → UNSAT.

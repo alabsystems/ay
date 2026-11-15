@@ -30,6 +30,7 @@
 //! It complements E-matching rather than replacing it.
 
 pub(crate) mod arith;
+pub(crate) mod lra_nested;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;

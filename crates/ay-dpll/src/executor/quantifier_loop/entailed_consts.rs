@@ -258,6 +258,142 @@ fn is_ground(terms: &TermStore, t: TermId) -> bool {
     !crate::ematching::contains_quantifier(terms, t)
 }
 
+/// Every entailed constant the finite-domain expander can read: the Int
+/// consequences of [`derive_entailed_int_consts`] together with the narrow
+/// unsigned-BV ones of [`derive_entailed_bv_consts`].
+///
+/// One table because both flow through the SAME soundness gate in the caller,
+/// and because the expander reads bounds of both sorts. Keys are `TermId`s and
+/// an Int term is never a BV term, so the two halves cannot collide; each
+/// reader is sort-guarded regardless.
+pub(super) fn derive_entailed_consts(
+    terms: &TermStore,
+    assertions: &[TermId],
+) -> HashMap<TermId, BigInt> {
+    let mut consts = derive_entailed_int_consts(terms, assertions);
+    consts.extend(derive_entailed_bv_consts(terms, assertions));
+    consts
+}
+
+/// Unsigned value of a BV literal, for widths this expander can enumerate.
+fn bv_literal_value(terms: &TermStore, t: TermId) -> Option<BigInt> {
+    match terms.get(t) {
+        TermData::Const(ay_core::Constant::BitVec { value, width }) if *width <= 64 => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+fn is_narrow_bv_sorted(terms: &TermStore, t: TermId) -> bool {
+    matches!(terms.sort(t), ay_core::Sort::BitVec(bv) if bv.width <= 64)
+}
+
+/// Collect every ground narrow-BV subterm of `t` (no bound vars below).
+fn collect_bv_subterms(
+    terms: &TermStore,
+    t: TermId,
+    out: &mut Vec<TermId>,
+    seen: &mut HashSet<TermId>,
+) {
+    if !seen.insert(t) {
+        return;
+    }
+    match terms.get(t) {
+        TermData::App(_, args) => {
+            let args = args.clone();
+            for a in args {
+                collect_bv_subterms(terms, a, out, seen);
+            }
+        }
+        TermData::Not(i) => {
+            let i = *i;
+            collect_bv_subterms(terms, i, out, seen);
+        }
+        TermData::Ite(c, a, b) => {
+            let (c, a, b) = (*c, *a, *b);
+            collect_bv_subterms(terms, c, out, seen);
+            collect_bv_subterms(terms, a, out, seen);
+            collect_bv_subterms(terms, b, out, seen);
+        }
+        // Never descend into a binder: everything below may be bound.
+        TermData::Forall(..) | TermData::Exists(..) => return,
+        _ => {}
+    }
+    if is_narrow_bv_sorted(terms, t) {
+        out.push(t);
+    }
+}
+
+/// SOLVE-FREE entailed-constant deriver for narrow unsigned BIT-VECTORS.
+///
+/// The bit-vector twin of [`derive_entailed_int_consts`], and deliberately the
+/// weaker half of it: union-find over asserted ground BV equalities, seeded
+/// from BV literals, with NO arithmetic folding. A bound like
+/// `(fld_len ay_qcex_0)` is pinned by an asserted equality chain, not by
+/// computing on it, and every fold rule would need its own modular-wraparound
+/// argument to stay sound at the width. Nothing is derived that is not simply
+/// equal, through asserted ground equalities, to a literal.
+///
+/// Values are UNSIGNED, matching how the finite-domain expander reads a BV
+/// bound. Widths above 64 are skipped: that expander refuses them anyway.
+///
+/// Like its Int sibling this deriver is NOT itself the soundness argument — it
+/// walks post-E-matching assertions, so an instance of a `forall` in a
+/// DISJUNCTIVE position is not a consequence. The caller's
+/// non-conjunctive-forall gate is what makes acting on the result sound, and
+/// these constants flow through exactly that same gate.
+pub(super) fn derive_entailed_bv_consts(
+    terms: &TermStore,
+    assertions: &[TermId],
+) -> HashMap<TermId, BigInt> {
+    let facts = collect_conjunctive_ground_facts(terms, assertions);
+
+    let mut uf = Uf::default();
+    let mut all_bv: Vec<TermId> = Vec::new();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    for &f in &facts {
+        if !is_ground(terms, f) {
+            continue;
+        }
+        collect_bv_subterms(terms, f, &mut all_bv, &mut seen);
+        if let TermData::App(Symbol::Named(n), args) = terms.get(f).clone() {
+            if n == "=" && args.len() == 2 && is_narrow_bv_sorted(terms, args[0]) {
+                uf.union(args[0], args[1]);
+            }
+        }
+    }
+
+    let mut val: HashMap<TermId, BigInt> = HashMap::default();
+    let mut inconsistent = false;
+    for &t in &all_bv {
+        if let Some(c) = bv_literal_value(terms, t) {
+            let r = uf.find(t);
+            match val.get(&r) {
+                Some(prev) if *prev != c => inconsistent = true,
+                _ => {
+                    val.insert(r, c);
+                }
+            }
+        }
+    }
+    if inconsistent {
+        // Contradictory premises: derive nothing rather than "anything follows".
+        return HashMap::default();
+    }
+
+    let mut out: HashMap<TermId, BigInt> = HashMap::default();
+    for &t in &all_bv {
+        if bv_literal_value(terms, t).is_some() {
+            continue;
+        }
+        if let Some(c) = val.get(&uf.find(t)) {
+            out.insert(t, c.clone());
+        }
+    }
+    out
+}
+
 /// SOLVE-FREE entailed-constant deriver.
 ///
 /// Returns `term -> constant` for every ground Int term the CONJUNCTIVE-position
@@ -362,4 +498,70 @@ pub(super) fn derive_entailed_int_consts(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod bv_tests {
+    use super::*;
+    use ay_core::Sort;
+
+    /// The shape the finite-domain expander actually meets: a guard bound that
+    /// is a SELECTOR APPLICATION pinned to a literal by an asserted ground
+    /// equality, not a literal written in the guard.
+    #[test]
+    fn an_asserted_equality_pins_a_selector_bound_to_its_literal() {
+        let mut terms = TermStore::new();
+        let rec = terms.mk_var("v", Sort::Uninterpreted("Vec".into()));
+        let len = terms.mk_app(Symbol::named("fld_len"), vec![rec], Sort::bitvec(64));
+        let sixty_five = terms.mk_bitvec(BigInt::from(65), 64);
+        let fact = terms.mk_eq(len, sixty_five);
+
+        let derived = derive_entailed_bv_consts(&terms, &[fact]);
+        assert_eq!(derived.get(&len), Some(&BigInt::from(65)));
+        // The literal itself is not re-recorded; only terms that need resolving.
+        assert!(!derived.contains_key(&sixty_five));
+    }
+
+    /// Equality is transitive through the union-find, and a term with no
+    /// literal anywhere in its class stays underived rather than guessed.
+    #[test]
+    fn a_class_without_a_literal_derives_nothing() {
+        let mut terms = TermStore::new();
+        let a = terms.mk_var("a", Sort::bitvec(64));
+        let b = terms.mk_var("b", Sort::bitvec(64));
+        let c = terms.mk_var("c", Sort::bitvec(64));
+        let lit = terms.mk_bitvec(BigInt::from(7), 64);
+        let ab = terms.mk_eq(a, b);
+        let b_lit = terms.mk_eq(b, lit);
+        let unrelated = terms.mk_eq(c, c);
+
+        let derived = derive_entailed_bv_consts(&terms, &[ab, b_lit, unrelated]);
+        assert_eq!(derived.get(&a), Some(&BigInt::from(7)));
+        assert_eq!(derived.get(&b), Some(&BigInt::from(7)));
+        assert_eq!(derived.get(&c), None);
+    }
+
+    /// Contradictory premises derive NOTHING rather than "anything follows".
+    #[test]
+    fn contradictory_literals_in_one_class_derive_nothing() {
+        let mut terms = TermStore::new();
+        let a = terms.mk_var("a", Sort::bitvec(64));
+        let one = terms.mk_bitvec(BigInt::from(1), 64);
+        let two = terms.mk_bitvec(BigInt::from(2), 64);
+        let e1 = terms.mk_eq(a, one);
+        let e2 = terms.mk_eq(a, two);
+        assert!(derive_entailed_bv_consts(&terms, &[e1, e2]).is_empty());
+    }
+
+    /// A binder's body is never entered, so nothing below a quantifier can be
+    /// mistaken for a ground consequence.
+    #[test]
+    fn a_bound_occurrence_is_never_derived() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::bitvec(64));
+        let lit = terms.mk_bitvec(BigInt::from(3), 64);
+        let inner = terms.mk_eq(x, lit);
+        let quantified = terms.mk_forall(vec![("x".into(), Sort::bitvec(64))], inner);
+        assert!(derive_entailed_bv_consts(&terms, &[quantified]).is_empty());
+    }
 }

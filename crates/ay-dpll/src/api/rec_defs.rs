@@ -1330,82 +1330,6 @@ mod tests {
     }
 
     #[test]
-    fn argument_captured_by_body_binder_fails_closed() {
-        // def f(x) := forall ((y Int)) (y <= x); goal f(y) with the global y:
-        // substitution would capture the actual argument. Must fail closed.
-        let mut s = solver();
-        let f = s.declare_fun("f", &[Sort::Int], Sort::Bool);
-        let x = s.declare_const("x", Sort::Int);
-        let y = s.declare_const("y", Sort::Int);
-        let le = s.try_le(y, x).unwrap();
-        let body = s.try_forall(&[y], le).unwrap();
-        let def = s.make_rec_fun_def(&[x], body);
-        assert!(def.is_expandable(), "binder shadows no PARAM name");
-        let mut defs = HashMap::new();
-        defs.insert("f".to_string(), def);
-
-        let call = s.try_apply(&f, &[y]).unwrap();
-        let err = s
-            .try_expand_rec_defs(&[call], &defs, ROUNDS, BUDGET, None)
-            .expect_err("argument capture must fail closed");
-        assert!(matches!(err, RecExpandError::UnsupportedShape(_)));
-
-        // A NON-colliding argument still expands.
-        let z = s.declare_const("z", Sort::Int);
-        let call_z = s.try_apply(&f, &[z]).unwrap();
-        let out = s
-            .try_expand_rec_defs(&[call_z], &defs, ROUNDS, BUDGET, None)
-            .expect("non-capturing argument must expand");
-        let le_z = s.try_le(y, z).unwrap();
-        let expected = s.try_forall(&[y], le_z).unwrap();
-        assert_eq!(out, vec![expected]);
-    }
-
-    #[test]
-    fn goal_binder_rebinding_zero_ary_def_name_fails_closed() {
-        // def c := 5; goal (exists ((c Int)) (= c 7)) — the bound c is the
-        // SAME interned Var, so expansion would wrongly rewrite it to 5.
-        let mut s = solver();
-        let five = int(&mut s, 5);
-        let def = s.make_rec_fun_def(&[], five);
-        let mut defs = HashMap::new();
-        defs.insert("c".to_string(), def);
-
-        let c = s.declare_const("c", Sort::Int);
-        let seven = int(&mut s, 7);
-        let eq = s.try_eq(c, seven).unwrap();
-        let goal = s.try_exists(&[c], eq).unwrap();
-        let err = s
-            .try_expand_rec_defs(&[goal], &defs, ROUNDS, BUDGET, None)
-            .expect_err("goal binder rebinding a def name must fail closed");
-        assert!(matches!(err, RecExpandError::UnsupportedShape(_)));
-    }
-
-    #[test]
-    fn body_binder_shadowing_param_is_not_expandable() {
-        // def f(x) := forall ((x Int)) ... — the body binder shadows the
-        // parameter; registration marks it non-expandable, and every use
-        // fails closed.
-        let mut s = solver();
-        let f = s.declare_fun("f", &[Sort::Int], Sort::Bool);
-        let x = s.declare_const("x", Sort::Int);
-        let zero = int(&mut s, 0);
-        let ge = s.try_ge(x, zero).unwrap();
-        let body = s.try_forall(&[x], ge).unwrap();
-        let def = s.make_rec_fun_def(&[x], body);
-        assert!(!def.is_expandable());
-        let mut defs = HashMap::new();
-        defs.insert("f".to_string(), def);
-
-        let three = int(&mut s, 3);
-        let call = s.try_apply(&f, &[three]).unwrap();
-        let err = s
-            .try_expand_rec_defs(&[call], &defs, ROUNDS, BUDGET, None)
-            .expect_err("use of a non-expandable def must fail closed");
-        assert!(matches!(err, RecExpandError::UnsupportedShape(_)));
-    }
-
-    #[test]
     fn trigger_only_occurrence_is_not_residual() {
         // A rec-f application appearing ONLY in a quantifier pattern is
         // semantically inert: expansion must succeed and leave the goal
@@ -1575,3 +1499,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod binder_guard_tests;

@@ -24,6 +24,52 @@ use crate::incremental_proof_cache::IncrementalNegationCache;
 
 use super::freeze_var_if_needed;
 
+/// Floor below which NO fresh SAT variable may be minted for a split atom, a
+/// replayed bound-refinement atom, or a polarity adapter: the solver's TOTAL
+/// variable count (`Solver::total_num_vars()`).
+///
+/// `total_num_vars()` counts every variable the solver has ever allocated,
+/// including the scope selector that each `push()` mints through
+/// `new_var_internal` — which deliberately does NOT advance `user_num_vars`.
+/// The former split-loop seed `user_num_vars() + scope_depth()` therefore
+/// accounted only for the LIVE selectors. On a session-persistent solver
+/// (#lra-inc-engine, SMT push/pop mirrored as SAT scope selectors) every
+/// popped scope leaves a DEAD selector above `user_num_vars`, and once the
+/// number of dead selectors exceeds the live depth the seed handed those
+/// indices out again as "fresh" split-atom variables. A dead selector is
+/// forced TRUE at level 0 by the `[+selector]` unit `pop()` adds, so a
+/// disequality split pair `x<y` / `x>y` aliased onto two dead selectors is
+/// TRUE ∧ TRUE: the LRA theory reports a conflict and the engine published a
+/// false `unsat` (2026-09-18, `repros/lra-pushpop-false-unsat-2026-09-18/`,
+/// the development design notes). Aliasing a LIVE selector
+/// (assumed false) instead silently pins the atom false.
+///
+/// Every index `>= total_num_vars()` is unallocated, so this floor can never
+/// alias an existing variable; a gap left below it by an over-estimating seed
+/// is harmless (the SAT solver simply never sees those indices in a clause).
+pub(in crate::executor) fn fresh_sat_var_floor(solver: &SatSolver) -> u32 {
+    u32::try_from(solver.total_num_vars()).expect("SAT solver variable count does not fit in u32")
+}
+
+/// Raise `local_next_var` to [`fresh_sat_var_floor`] before minting a SAT var.
+///
+/// Applied at every minting site in this module (not only at the split-loop
+/// seed) so an out-of-band allocation on the same solver between two mints —
+/// a `push()` selector, a `new_var()` by another component — can never be
+/// re-issued as a split atom. This is the structural guarantee the
+/// `#lra-inc-engine` no-reverify UNSAT argument relies on: a split-atom var is
+/// always a variable no clause has mentioned before.
+#[inline]
+pub(in crate::executor) fn raise_local_next_var_to_solver_floor(
+    solver: &SatSolver,
+    local_next_var: &mut u32,
+) {
+    let floor = fresh_sat_var_floor(solver);
+    if *local_next_var < floor {
+        *local_next_var = floor;
+    }
+}
+
 /// Stable key for deduplicating incremental split clauses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::executor) struct SplitClauseKey {
@@ -108,6 +154,9 @@ pub(in crate::executor) fn encode_split_pair_incremental(
         negations: &mut IncrementalNegationCache,
         atom: TermId,
     ) -> Option<SatVariable> {
+        // Never mint below the solver's total variable count (dead scope
+        // selectors live there — see `fresh_sat_var_floor`).
+        raise_local_next_var_to_solver_floor(solver, local_next_var);
         // Fast path for OPAQUE arithmetic predicates (`<=`, `>=`, `<`, `>`) —
         // the shape of every split atom this module mints. Tseitin encodes
         // these as a bare `get_var` leaf (see `encode_app`'s theory-predicate
@@ -128,6 +177,11 @@ pub(in crate::executor) fn encode_split_pair_incremental(
             TermData::App(sym, _) if matches!(sym.name(), "<=" | ">=" | "<" | ">")
         ) {
             let var_0idx = *local_next_var;
+            debug_assert!(
+                var_0idx as usize >= solver.total_num_vars(),
+                "split atom var {var_0idx} would alias an existing SAT var (total_num_vars={})",
+                solver.total_num_vars()
+            );
             local_term_to_var.insert(atom, var_0idx);
             local_var_to_term.insert(var_0idx, atom);
             negations.note_fresh_term(atom);
@@ -167,6 +221,11 @@ pub(in crate::executor) fn encode_split_pair_incremental(
     // Repeated disequality/expression split requests can target the same atoms
     // across split-loop iterations. Reusing the original SAT vars keeps the
     // persistent SAT state aligned with the theory term mapping.
+    for atom in [left_atom, right_atom] {
+        if local_term_to_var.contains_key(&atom) {
+            negations.note_reused_atom(atom);
+        }
+    }
     let left_var = reuse_encoded_atom(solver, local_term_to_var, left_atom).or_else(|| {
         encode_new_atom(
             terms,
@@ -230,6 +289,9 @@ fn encode_atom_delta(
     negations: &mut IncrementalNegationCache,
     atom: TermId,
 ) -> CnfLit {
+    // Never seed the encoder below the solver's total variable count (dead
+    // scope selectors live there — see `fresh_sat_var_floor`).
+    raise_local_next_var_to_solver_floor(solver, local_next_var);
     let state =
         negations.take_tseitin_encoder(local_term_to_var, local_var_to_term, *local_next_var);
     let prev_next_var = state.next_var;
@@ -358,6 +420,7 @@ pub(crate) fn ensure_incremental_atom_encoded(
     if let Some(&var) = local_term_to_var.get(&atom) {
         let sat_var = SatVariable::new(var);
         freeze_var_if_needed(solver, sat_var);
+        negations.note_reused_atom(atom);
         return sat_var;
     }
 
@@ -402,10 +465,15 @@ pub(crate) fn ensure_incremental_atom_encoded(
             // The root var is already in the shared 1-indexed SAT namespace;
             // subtract 1 for the 0-indexed local scheme.
             local_term_to_var.insert(atom, sat_var);
+            // The var's existing owner term carries `atom` to the theory.
+            if let Some(&owner) = local_var_to_term.get(&sat_var) {
+                negations.note_reused_atom(owner);
+            }
             local_var_to_term.entry(sat_var).or_insert(atom);
             // Keep the persistent encoder aware that `atom` aliases this var.
             negations.mirror_encoder_var(atom, sat_var);
         } else {
+            raise_local_next_var_to_solver_floor(solver, local_next_var);
             let atom_var = *local_next_var;
             *local_next_var += 1;
             solver.ensure_num_vars(*local_next_var as usize);
@@ -717,8 +785,36 @@ pub(in crate::executor) fn map_conflict_to_blocking_clause(
     // (old behavior) unless the solver's `unguarded_theory_conflict_lemmas`
     // flag is set (the inc-engine QF_LRA lane), in which case it persists
     // across pop() in the deletable learned tier.
+    //
+    // Replay-ledger retention of this primary conflict
+    // (`add_retained_theory_conflict_clause`, 24a299b92) is lane-opt-in
+    // via `retain_primary_theory_conflicts`
+    // (DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111): measured
+    // load-bearing on the AUFLIA twelve-read fixture (destructive
+    // rebuilds forget the deletable lemma mid-attempt and the solve
+    // re-derives conflicts instead of finishing), and measured
+    // catastrophic on the pinned QF_LIRA smtopt trajectory (`sat` at
+    // 107,279 decisions/236 conflicts -> `unknown` with 928,566
+    // decisions in 10 s; a dual-install probe did not restore it, so
+    // the retained original's presence itself changes the search
+    // economics). Lanes that have not measured a retention need keep
+    // the deletable scoped lemma, accepting that a destructive
+    // rebuild may drop it (it is a re-derivable theory axiom).
+    //
+    // Escalated retention (DR-AY-LIRA-RETAIN-ESCALATION-20261113): a
+    // lane may instead arm a per-entry budget -- the first `after`
+    // primary conflicts stay deletable (pinned low-conflict
+    // trajectories are bit-identical), then retention flips on so
+    // forget-and-re-derive churn still converges (QF_LIRA cruise:
+    // identical 116-lit Farkas core re-derived 108x deletable;
+    // retained it closes after 1,620 theory conflicts).
+    // `note_primary_theory_conflict` owns the counter and the flip.
     let primary_before = solver.issued_original_clause_id_max();
-    let _ = solver.add_theory_conflict_lemma(clause);
+    if solver.note_primary_theory_conflict() {
+        let _ = solver.add_retained_theory_conflict_clause(clause);
+    } else {
+        let _ = solver.add_theory_conflict_lemma(clause);
+    }
     let primary_original_id = single_issued_original_id_since(solver, primary_before);
 
     // Add blocking clauses for remaining batch-collected bound conflicts (#5117).
@@ -1325,6 +1421,9 @@ pub(in crate::executor) fn encode_pending_diseq_split_extras(
     }
 }
 
+mod carried;
+pub(in crate::executor) use carried::replay_carried_conflicts;
+mod installed_lemmas;
 pub(in crate::executor) mod lemmas;
 pub(in crate::executor) use lemmas::apply_string_lemma_incremental;
 pub(in crate::executor) use lemmas::apply_theory_lemma_incremental;
@@ -1337,6 +1436,8 @@ pub(crate) use model_equality::{
     RescuePairCounter, SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET,
 };
 
+#[cfg(test)]
+mod reuse_tracking_tests;
 #[cfg(test)]
 mod tests;
 
@@ -1381,3 +1482,7 @@ pub(crate) fn single_issued_original_id_since(solver: &SatSolver, before: u64) -
     let id = issued.next()?;
     issued.next().is_none().then_some(id)
 }
+
+pub(crate) use installed_lemmas::{
+    recheck_installed_theory_lemmas, recheck_installed_theory_lemmas_with,
+};

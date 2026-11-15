@@ -86,7 +86,7 @@ pub(super) fn is_entry_inductive(
                 solver.clause_guarded_constraint(predicate, *clause_index, head_args, level);
             let mut conjuncts = vec![clause_constraint.clone(), guarded, neg_inv_on_head];
 
-            for (body_pred, body_args) in &clause.body.predicates {
+            for (occurrence, (body_pred, body_args)) in clause.body.predicates.iter().enumerate() {
                 predecessor_context::push_entry_domain_context(
                     solver,
                     &mut conjuncts,
@@ -101,6 +101,7 @@ pub(super) fn is_entry_inductive(
                         &mut conjuncts,
                         *body_pred,
                         body_args,
+                        occurrence,
                     );
                 } else {
                     predecessor_context::push_prev_level_frame_context(
@@ -111,6 +112,20 @@ pub(super) fn is_entry_inductive(
                         prev_level,
                     );
                 }
+            }
+
+            if prev_level == 0
+                && predecessor_context::append_fact_fallbacks(
+                    solver,
+                    &mut conjuncts,
+                    *clause_index,
+                    clause,
+                )
+                .is_none()
+            {
+                // A stopped, captured or incomplete rename is not an empty
+                // predecessor set and must never discharge the obligation.
+                return false;
             }
 
             let incr_query = solver.bound_int_vars(ChcExpr::and_all(

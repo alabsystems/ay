@@ -93,12 +93,14 @@ impl Solver {
 
     /// Opt in to the quantified wall-clock BACKSTOP (off by default).
     ///
-    /// When enabled, a `check-sat` whose assertions contain a quantifier
-    /// relaxes the deadline installed from [`Self::set_timeout`] to
-    /// `deadline + min(3 x remaining, 3 min)`, so the engine's deterministic
-    /// instantiation budgets decide when to stop and a verdict cannot flip
-    /// `unsat` <-> `unknown` with CPU load. In exchange such a solve may run up
-    /// to 4x the requested timeout. Ground solves are unaffected either way.
+    /// When enabled, a decision containing a quantifier receives one relative
+    /// allowance of `timeout + min(3 x timeout, 3 min)`, planned at command
+    /// entry from the tighter API or parsed timeout. Search, mandatory
+    /// certification and publication share that same absolute deadline.
+    /// This reduces sensitivity to CPU load while retaining deterministic
+    /// instantiation limits. Existing absolute caller deadlines, work grants
+    /// and cancellation remain binding; nested checks never renew them.
+    /// Ground solves, untimed calls and model getters receive no extension.
     pub fn set_quantifier_deadline_backstop(&mut self, enabled: bool) {
         self.executor.set_quantifier_deadline_backstop(enabled);
     }
@@ -232,6 +234,8 @@ impl Solver {
     ///
     /// The seed is forwarded to every SAT solver instance created during
     /// subsequent `check_sat` calls.
+    /// A later `:random-seed` option or typed call replaces the active seed;
+    /// SMT-LIB `(reset)` restores the host seed from before a script override.
     ///
     /// # Example
     ///
@@ -387,10 +391,23 @@ impl Solver {
     /// When `unknown_reason()` returns `Some(UnknownReason::InternalError)`,
     /// this method provides the underlying error message (e.g., model validation
     /// failure details). Returns `None` when the last result was not caused by
-    /// an executor error.
+    /// an executor error. A theory mix with no combined decision procedure is
+    /// not one: it is a standard `unknown` (`Incomplete`) whose
+    /// `unknown_diagnostic` (phase `theory-combination`) names the refusal.
     #[must_use]
     pub fn executor_error(&self) -> Option<&str> {
         self.last_executor_error.as_deref()
+    }
+
+    /// Exact checked model-extraction refusal from the last decision attempt.
+    ///
+    /// Compatibility `check_sat*` calls remain infallible and publish no definite
+    /// verdict on refusal; `try_check_sat*` returns the typed executor error.
+    /// Cleared by the next decision or reset. This is not an original-owner or
+    /// model-publication credential, and legacy extraction is not thereby priced.
+    #[must_use]
+    pub fn model_extraction_failure(&self) -> Option<ay_core::original_query::QueryError> {
+        self.last_model_extraction_failure
     }
 
     /// Statistics from the last check-sat call.
@@ -423,6 +440,38 @@ impl Solver {
     #[must_use]
     pub fn get_statistics(&self) -> &crate::Statistics {
         self.statistics()
+    }
+
+    /// Arm this fresh solver-internal proof-checking solver with a counted
+    /// certification grant (P4a.1, `api::proofs::CertificationEffort`):
+    /// `conflicts` and `decisions` per SAT solve, the default ground budget
+    /// off, and `backstop` as an absolute deadline every check keeps (it is
+    /// the earliest deadline `native_publication_controls` reads). Its
+    /// check-sats are `Full` children of the certification's node,
+    /// `certify` (DR-39).
+    pub(crate) fn arm_certification_grant(
+        &mut self,
+        conflicts: u64,
+        decisions: u64,
+        backstop: Option<Instant>,
+        certify: Option<ay_core::resource::Guard>,
+    ) {
+        self.executor.set_resource_limit(Some(conflicts));
+        self.executor.set_decision_limit(Some(decisions));
+        self.executor.set_ground_budget_enabled(false);
+        self.executor.set_solve_controls(None, backstop);
+        self.executor.set_certification_parent(certify);
+    }
+
+    /// The typed origin of this solver's last `Unknown`, for a certification
+    /// envelope that must tell a stop from a decline.
+    pub(crate) fn certification_unknown_origin(&self) -> Option<crate::UnknownOrigin> {
+        self.executor.unknown_origin()
+    }
+
+    /// Whether this solver's own term-store ceiling has tripped.
+    pub(crate) fn certification_term_store_tripped(&self) -> bool {
+        self.executor.term_memory_exceeded()
     }
 
     /// Check satisfiability and return structured statistics from the same solve call.
@@ -508,6 +557,8 @@ impl Solver {
             unsat_proof_strictly_verified: verified.was_unsat_strictly_verified(),
             unsat_independently_verified: verified.was_unsat_independently_verified(),
             unsat_exact_semantically_verified: verified.was_unsat_exact_semantically_verified(),
+            unsat_corroborated: verified.was_unsat_corroborated(),
+            unsat_evidence_level: verified.unsat_evidence_level(),
             unsat_proof_checker_failures: statistics.get_int("proof_checker_failures").unwrap_or(0),
             sat_independent_checks: independent,
             sat_delegated_checks: delegated,

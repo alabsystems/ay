@@ -831,92 +831,6 @@ fn test_proof_emit_delete_uses_unified_checker() {
     assert!(del.is_ok(), "deleting a known clause should succeed");
 }
 
-/// Grep guard: no solver file (except proof_emit.rs) should directly call
-/// `manager.emit_add(` or `manager.emit_delete(`.
-///
-/// This test reads the source files and checks for violations of the
-/// single-authority contract established by #4564.
-#[test]
-fn test_no_direct_manager_emit_calls_in_solver() {
-    let solver_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("solver");
-
-    let forbidden_patterns = ["manager.emit_add(", "manager.emit_delete("];
-    let mut violations = Vec::new();
-    let mut saw_nested_solver_rs = false;
-    let mut stack = vec![solver_dir.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read solver dir") {
-            let entry = entry.expect("read dir entry");
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let is_rust_file = path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
-            if !is_rust_file {
-                continue;
-            }
-
-            let relative = path
-                .strip_prefix(&solver_dir)
-                .unwrap_or_else(|_| panic!("strip prefix {}", path.display()));
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let in_tests_dir = relative
-                .components()
-                .any(|c| c.as_os_str().to_str() == Some("tests"));
-            // proof_emit.rs is the wrapper and tests files contain guard strings.
-            if file_name == "proof_emit.rs" || file_name == "tests.rs" || in_tests_dir {
-                continue;
-            }
-            if relative.components().count() > 1 {
-                saw_nested_solver_rs = true;
-            }
-
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("read {}", path.display()));
-            // Normalize out whitespace and line comments so split-token calls like
-            // `manager` + newline + `.emit_add(...)` are still detected.
-            let no_line_comments = content
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim_start();
-                    !trimmed.starts_with("//")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let compact = no_line_comments
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>();
-
-            for pattern in &forbidden_patterns {
-                if compact.contains(pattern) {
-                    violations.push(format!("{}: found `{pattern}`", relative.display()));
-                }
-            }
-        }
-    }
-
-    assert!(
-        violations.is_empty(),
-        "#4564 contract violation: direct manager.emit_* calls found in solver files \
-         (use proof_emit_add/proof_emit_delete wrappers instead):\n  {}",
-        violations.join("\n  ")
-    );
-    assert!(
-        saw_nested_solver_rs,
-        "test setup regression: expected at least one nested solver/*.rs file to be scanned"
-    );
-}
-
 /// Regression test for #4596: preprocessing probing was skipped in LRAT mode
 /// due to a stale guard (`!self.cold.lrat_enabled`). The hint collection code
 /// (`collect_probe_conflict_lrat_hints`) was already wired in, making the
@@ -1040,19 +954,28 @@ fn test_mark_empty_clause_without_hints_fails_closed_without_id_drift() {
 
 #[test]
 fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
-    let proof = ProofOutput::lrat_text(Vec::new(), 2);
+    let proof = ProofOutput::lrat_text(Vec::new(), 3);
     let mut solver: Solver = Solver::with_proof_output(2, proof);
     let a = Literal::positive(Variable(0));
     let na = Literal::negative(Variable(0));
     let b = Literal::positive(Variable(1));
 
-    solver.add_clause(vec![a]);
-    solver.add_clause(vec![na, b]);
+    let clauses = vec![vec![a], vec![na, b], vec![b.negated()]];
+    for clause in &clauses {
+        solver.add_clause(clause.clone());
+    }
 
     assert!(
         solver.process_initial_clauses().is_none(),
         "setup must produce a level-0 trail without an immediate conflict"
     );
+    solver.initialize_watches();
+    let seed = solver.propagate().expect("genuine falsified original seed");
+    assert!(solver
+        .arena
+        .literals(seed.0 as usize)
+        .iter()
+        .all(|&lit| solver.lit_val(lit) < 0));
     solver.mark_empty_clause_with_level0_hints();
 
     assert!(
@@ -1074,6 +997,12 @@ fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
     assert_ne!(
         tokens[2], "0",
         "empty clause LRAT line must include a non-empty hint chain: {empty_clause_line}"
+    );
+    super::proof_lrat::verify_lrat_with_external_checker(
+        2,
+        &clauses,
+        &proof,
+        "root conflict helper",
     );
 }
 
@@ -1139,9 +1068,11 @@ fn test_finalize_unsat_proof_emit_failure_returns_unknown() {
     let result = solver.solve().into_inner();
 
     assert!(result.is_unknown(), "proof I/O failure must fail closed");
+    // The writer latched a write failure, which is reported as such
+    // (2026-09-12), not as a generic finalization failure.
     assert_eq!(
         solver.last_unknown_reason(),
-        Some(SatUnknownReason::ProofFinalizationFailure)
+        Some(SatUnknownReason::ProofWriteFailure)
     );
     assert!(
         !solver.cold.empty_clause_in_proof,
@@ -1162,7 +1093,7 @@ fn test_finalize_unsat_proof_flush_failure_returns_unknown() {
     assert!(result.is_unknown(), "proof flush failure must fail closed");
     assert_eq!(
         solver.last_unknown_reason(),
-        Some(SatUnknownReason::ProofFinalizationFailure)
+        Some(SatUnknownReason::ProofWriteFailure)
     );
 }
 

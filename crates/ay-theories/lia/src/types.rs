@@ -15,6 +15,7 @@ use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use crate::assertion_view;
@@ -150,6 +151,16 @@ pub struct LiaModel {
     pub values: HashMap<TermId, BigInt>,
 }
 
+/// Accounting of one finite-domain search (`enumeration::finite_domain`):
+/// committed assignments, constraint evaluations, and whether a budget or the
+/// solver deadline aborted it before the box was exhausted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FdSearchStats {
+    pub(crate) nodes: u64,
+    pub(crate) work: u64,
+    pub(crate) aborted: bool,
+}
+
 /// Result from direct lattice enumeration.
 ///
 /// Used to distinguish between UNSAT (with conflict), SAT (with witness model stored
@@ -196,8 +207,9 @@ pub(crate) struct EnumRrefCache {
 #[derive(Clone)]
 pub(crate) enum EnumRrefOutcome {
     /// Completed reduced row echelon form plus its pivot columns.
-    /// `Rc` so a hit detaches from the cache slot without cloning the rows.
-    Rref(std::rc::Rc<(EnumMatrix, Vec<usize>)>),
+    /// `Arc` so a hit detaches from the cache slot without cloning the rows
+    /// (Arc not Rc: detached value caches can move between workers).
+    Rref(std::sync::Arc<(EnumMatrix, Vec<usize>)>),
     /// Deterministic mid-elimination abort: a coefficient exceeded
     /// `MAX_COEFF_BITS`. Same matrix ⇒ same abort, so this is cacheable;
     /// timeout aborts are NOT (they depend on the wall clock) and are never
@@ -278,10 +290,142 @@ pub(crate) struct CutScopeState {
     pub(crate) shared_diseq_mark: usize,
 }
 
-/// LIA theory solver using Gomory cuts, HNF cuts, and branch-and-bound over LRA
+/// LIA theory solver using Gomory cuts, HNF cuts, and branch-and-bound over LRA.
+///
+/// The borrowed store must outlive the solver, including the inner LRA read
+/// bracket. Safe code cannot return a solver backed by a local store:
+///
+/// ```compile_fail,E0597
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::LiaSolver;
+/// let (mut solver, atom) = {
+///     let mut terms = TermStore::new();
+///     let atom = terms.mk_bool(true);
+///     (LiaSolver::new(&terms), atom)
+/// };
+/// solver.register_atom(atom);
+/// ```
+///
+/// Rebinding cannot shorten that backing-store lifetime:
+///
+/// ```compile_fail,E0597
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::LiaSolver;
+/// let mut terms = TermStore::new();
+/// let atom = terms.mk_bool(true);
+/// let mut solver = LiaSolver::new(&terms);
+/// {
+///     let temporary = TermStore::new();
+///     solver.set_terms(&temporary);
+/// }
+/// solver.register_atom(atom);
+/// ```
+///
+/// The backing store also cannot be changed while the solver can read it:
+///
+/// ```compile_fail,E0502
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::LiaSolver;
+/// let mut terms = TermStore::new();
+/// let atom = terms.mk_bool(true);
+/// let mut solver = LiaSolver::new(&terms);
+/// terms.mk_bool(false);
+/// solver.register_atom(atom);
+/// ```
+///
+/// The mutable relaxation view retains the same rebind lifetime:
+///
+/// ```compile_fail,E0597
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::LiaSolver;
+/// let mut terms = TermStore::new();
+/// let atom = terms.mk_bool(true);
+/// let mut solver = LiaSolver::new(&terms);
+/// {
+///     let temporary = TermStore::new();
+///     solver.lra_solver_mut().set_terms(&temporary);
+/// }
+/// solver.register_atom(atom);
+/// ```
+///
+/// A temporary mutable view cannot coerce its owner lifetime to a shorter one:
+///
+/// ```compile_fail
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::{LiaSolver, LraSolverMut};
+/// fn rebind_short<'view, 'long: 'short, 'short>(
+///     view: LraSolverMut<'view, 'long>,
+///     terms: &'short TermStore,
+/// ) {
+///     let mut shortened: LraSolverMut<'view, 'short> = view;
+///     shortened.set_terms(terms);
+/// }
+/// let mut terms = TermStore::new();
+/// let atom = terms.mk_bool(true);
+/// let mut solver = LiaSolver::new(&terms);
+/// {
+///     let temporary = TermStore::new();
+///     rebind_short(solver.lra_solver_mut(), &temporary);
+/// }
+/// solver.register_atom(atom);
+/// ```
+///
+/// It cannot be converted into a raw mutable solver for unchecked replacement:
+///
+/// ```compile_fail,E0308
+/// use ay_core::term::TermStore;
+/// use ay_lia::LiaSolver;
+/// let terms = TermStore::new();
+/// let mut solver = LiaSolver::new(&terms);
+/// let raw: &mut ay_lra::LraSolver = solver.lra_solver_mut();
+/// ```
+///
+/// The read view cannot return a store reference beyond the solver's borrow:
+///
+/// ```compile_fail,E0515
+/// use ay_core::term::TermStore;
+/// use ay_lia::LiaSolver;
+/// fn escaped() -> &'static TermStore {
+///     let terms = TermStore::new();
+///     let solver = LiaSolver::new(&terms);
+///     solver.lra_solver().terms()
+/// }
+/// ```
+///
+/// A mutable view retains the backing store's thread-safety requirements:
+///
+/// ```compile_fail,E0277
+/// use ay_core::term::TermStore;
+/// use ay_lia::LiaSolver;
+/// fn require_send<T: Send>(_: T) {}
+/// let terms = TermStore::new();
+/// let mut solver = LiaSolver::new(&terms);
+/// require_send(solver.lra_solver_mut());
+/// ```
+///
+/// Dropping the solver ends the borrow and permits ordinary store mutation:
+///
+/// ```
+/// use ay_core::{term::TermStore, TheorySolver};
+/// use ay_lia::{LiaSolver, LraSolverMut};
+/// let mut terms = TermStore::new();
+/// let atom = terms.mk_bool(true);
+/// {
+///     let mut solver = LiaSolver::new(&terms);
+///     solver.register_atom(atom);
+///     let mut view: LraSolverMut<'_, '_> = solver.lra_solver_mut();
+///     view.set_terms(&terms);
+///     drop(view);
+///     assert_eq!(solver.lra_solver().terms().len(), terms.len());
+/// }
+/// terms.mk_bool(false);
+/// ```
 pub struct LiaSolver<'a> {
-    /// Reference to the term store for parsing expressions
-    pub(crate) terms: &'a TermStore,
+    // Reads use the inner LRA pointer, while this retained borrow prevents
+    // safe callers from dropping or mutating its backing store. Rebinding
+    // accepts the same lifetime; append-only TermId caches keep their existing
+    // same-store/superset contract.
+    pub(crate) terms_borrow: PhantomData<&'a TermStore>,
     /// Underlying LRA solver for the relaxation
     pub(crate) lra: LraSolver,
     /// Set of term IDs known to be integer variables
@@ -340,13 +484,17 @@ pub struct LiaSolver<'a> {
     /// final check (needs_final_check_after_sat == true guarantees one runs
     /// before any SAT is accepted).
     pub(crate) in_search_phase: bool,
-    /// Consecutive UNPRODUCTIVE BCP-time Dioph runs (no conflict found).
-    /// Once the streak passes the adaptive threshold, further BCP-time Dioph
-    /// solves are deferred to the post-SAT final check for the remainder of
-    /// the search (reset on pop, giving fresh contexts a fresh chance).
-    pub(crate) dioph_bcp_unproductive_streak: u32,
+    /// Arming state for the BCP-time Diophantine analysis: the
+    /// unproductive-run deferral and the periodic bound re-check. Documented
+    /// with the policy it serves, in `dioph_bcp`.
+    pub(crate) dioph_bcp: crate::dioph_bcp::BcpDiophState,
     /// Scope markers for push/pop
     pub(crate) scopes: Vec<usize>,
+    /// `scopes.len()` at each open [`LiaSolver::push_tentative`] — the scopes
+    /// an enclosing NIA opened for its model guesses (sign cuts, rounding /
+    /// patch pins, factor-split pins). Trimmed by every pop, so it can never
+    /// outlive its scope (#nonlinear-shared-reasons).
+    pub(crate) tentative_scope_marks: Vec<usize>,
     /// Scope markers for learned cut truncation on pop.
     pub(crate) cut_scopes: Vec<usize>,
     /// Saved cut state per scope level for proper restore on pop (#3685).
@@ -389,6 +537,12 @@ pub struct LiaSolver<'a> {
     /// intentionally discarded the resulting caches so the next full `check()`
     /// still reruns Dioph with persistent state.
     pub(crate) dioph_needs_full_check: bool,
+    /// Lattice-closure work budget (`lattice_refute_bridge`): work units spent
+    /// and split opportunities seen, carried across split-loop rebuilds.
+    pub(crate) lattice_budget: (u64, u64),
+    /// Whether the lattice closure runs at all (off under the NIA; see
+    /// [`LiaSolver::set_lattice_closure`]).
+    pub(crate) lattice_closure: bool,
     /// #C8: Set by `pop()` (and `soft_reset`) when the assertion trail shrank.
     /// The equality-derived Dioph caches (`dioph_cached_substitutions`,
     /// `dioph_cached_modular_gcds`, `dioph_cached_reasons`,
@@ -419,6 +573,14 @@ pub struct LiaSolver<'a> {
     /// Equality literals that justify cached substitutions.
     /// These are reused as reasons for propagated bounds.
     pub(crate) dioph_cached_reasons: Vec<(TermId, bool)>,
+    /// The bound literals of the fixed variables `try_diophantine_solve`
+    /// folded into equation constants when it built the caches above (D2,
+    /// 2026-09-23 hunt). Those caches are consequences of the equality set
+    /// AND of these bounds — a branch-and-bound atom pair `x >= v`, `x <= v`
+    /// folds `x = v` into every substitution and modulus — so the equality
+    /// key alone does not identify them: they may be reused only while every
+    /// literal here is still asserted (`dioph_fold_reasons_live`).
+    pub(crate) dioph_cached_fold_reasons: Vec<TheoryLit>,
     /// Set when Diophantine solving has added bounds to LRA. LRA Farkas
     /// conflicts may depend on these bounds and need augmentation (#8147).
     pub(crate) dioph_modified_bounds: bool,
@@ -537,7 +699,7 @@ pub struct LiaSolver<'a> {
     pub(crate) skip_shared_algebraic: bool,
     /// Optional timeout callback for cooperative interruption.
     /// When the callback returns true, the solver will return Unknown at the next check point.
-    pub(crate) timeout_callback: Option<Box<dyn Fn() -> bool>>,
+    pub(crate) timeout_callback: Option<Box<dyn Fn() -> bool + Send>>,
     /// Optional hard wall-clock deadline (#8749). Propagated to the IntSat
     /// probe so its BigInt conflict loop honours `--timeout` instead of
     /// overshooting it by seconds while exhausting its conflict budget.
@@ -545,6 +707,9 @@ pub struct LiaSolver<'a> {
     /// When direct enumeration finds a satisfying integer assignment, store it here so
     /// `check()` can return SAT without branch-and-bound and `extract_model()` can succeed.
     pub(crate) direct_enum_witness: Option<LiaModel>,
+    /// Accounting of the most recent finite-domain search (`try_finite_domain_search`
+    /// / `try_finite_domain_uflia`): diagnostics and the budget regression tests.
+    pub(crate) fd_search_stats: FdSearchStats,
     /// #probe-rref-memo: last Gaussian elimination of `try_direct_enumeration`
     /// (see `EnumRrefCache`). Content-keyed — never needs invalidation.
     pub(crate) enum_rref_cache: Option<EnumRrefCache>,
@@ -582,6 +747,12 @@ pub struct LiaSolver<'a> {
     pub(crate) check_count: u64,
     pub(crate) conflict_count: u64,
     pub(crate) propagation_count: u64,
+    /// Conflicts `check()` refused to publish because a literal was not a
+    /// live asserted atom (#nia-sign-cut-soundness exit guard): the
+    /// refutation rested on a bound that is not a consequence of the
+    /// assignment (an NIA model-derived tentative bound, or a reason
+    /// retracted by backtracking). Reported as `lia_unjustified_conflicts`.
+    pub(crate) unjustified_conflicts_dropped: u64,
     /// Minimal-core affine conflict narrowing attempts (#23 Stage 2).
     pub(crate) affine_min_core_attempts: u64,
     /// Minimal-core affine conflict narrowing successes (#23 Stage 2): a
@@ -629,6 +800,9 @@ pub struct DiophState {
     pub cached_modular_gcds: Vec<(TermId, BigInt, BigInt)>,
     /// Equality literals justifying the substitutions (for conflict analysis)
     pub cached_reasons: Vec<(TermId, bool)>,
+    /// Bound literals of the variables folded into the cached system; the
+    /// caches hold only while these are asserted (D2).
+    pub cached_fold_reasons: Vec<TheoryLit>,
     /// LIA-level equality pairs already proposed to Nelson-Oppen/DPLL(T).
     pub propagated_equality_pairs: HashSet<(TermId, TermId)>,
     /// LIA-level disequality pairs already proposed to Nelson-Oppen/DPLL(T).
@@ -637,4 +811,6 @@ pub struct DiophState {
     pub lra_propagated_equality_pairs: HashSet<(TermId, TermId)>,
     /// Embedded LRA disequality pairs already proposed by `assume_eqs`.
     pub lra_propagated_disequality_pairs: HashSet<(TermId, TermId)>,
+    /// Lattice-closure work budget: (work units spent, split opportunities).
+    pub lattice_budget: (u64, u64),
 }

@@ -6,6 +6,8 @@ use super::*;
 use ay_core::term::TermStore;
 use ay_core::Sort;
 
+#[path = "issue_6588_tests/compound_interval.rs"]
+mod compound_interval;
 #[path = "issue_6588_tests/compound_reset.rs"]
 mod compound_reset;
 

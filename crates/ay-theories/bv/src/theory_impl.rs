@@ -16,7 +16,10 @@ impl TheorySolver for BvSolver<'_> {
     }
 
     fn check(&mut self) -> TheoryResult {
-        self.check_count += 1;
+        self.check_count = self.check_count.saturating_add(1);
+        if !self.encoding_complete() {
+            return TheoryResult::Unknown;
+        }
         // All constraints are eagerly bit-blasted to CNF
         // The SAT solver will find inconsistencies
         tracing::debug!(
@@ -55,6 +58,7 @@ impl TheorySolver for BvSolver<'_> {
     }
 
     fn reset(&mut self) {
+        let _ = self.encoding_complete();
         self.term_to_bits.clear();
         self.predicate_to_var.clear();
         self.bool_to_var.clear();
@@ -66,6 +70,8 @@ impl TheorySolver for BvSolver<'_> {
         self.known_false.clear();
         self.and_cache.clear();
         self.and_children.clear();
+        self.xor_children.clear();
+        self.mux_children.clear();
         self.or_cache.clear();
         self.xor_cache.clear();
         self.mux_cache.clear();
@@ -79,7 +85,10 @@ impl TheorySolver for BvSolver<'_> {
         self.bv_ite_conditions.clear();
         self.cached_false_lit = None;
         self.eager_terms.clear();
-        self.interrupt = None;
+        // Refusal and original interrupt identity outlive encoding-data reset.
+        if !self.encoding.was_stopped() {
+            self.interrupt = None;
+        }
         // Shrink collections that may have grown during encoding (#8599).
         // Gate caches and term maps can grow very large for complex BV formulas.
         self.term_to_bits.shrink_to_fit();
@@ -88,6 +97,8 @@ impl TheorySolver for BvSolver<'_> {
         self.clauses.shrink_to_fit();
         self.and_cache.shrink_to_fit();
         self.and_children.shrink_to_fit();
+        self.xor_children.shrink_to_fit();
+        self.mux_children.shrink_to_fit();
         self.or_cache.shrink_to_fit();
         self.xor_cache.shrink_to_fit();
         self.mux_cache.shrink_to_fit();

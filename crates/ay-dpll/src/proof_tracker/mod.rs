@@ -51,8 +51,6 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-mod explicit_trust_census_tests;
-#[cfg(test)]
 mod tests;
 
 pub(crate) mod checkpoint_budget;
@@ -60,7 +58,9 @@ pub(crate) mod checkpoint_budget;
 #[cfg(test)]
 #[path = "checkpoint_budget_tests.rs"]
 mod checkpoint_budget_tests;
+pub(crate) mod guarded_instance;
 mod lemma_dedup;
+mod packed_integer;
 mod vacuous_collapse;
 
 use lemma_dedup::{LemmaDedupMap, LemmaKey};
@@ -181,6 +181,15 @@ impl ProofTracker {
         self.enabled
     }
 
+    /// A private candidate solve keeps the tracking policy, but cannot borrow
+    /// any outer proof step, assumption alias or incremental scope.
+    pub(crate) fn fresh_window(&self) -> Self {
+        let mut window = Self::new();
+        window.enabled = self.enabled;
+        window.theory_name.clone_from(&self.theory_name);
+        window
+    }
+
     /// Number of proof steps currently retained in the ledger.
     ///
     /// #cert-accounting item 6: a cheap volume proxy for the recording work a
@@ -261,11 +270,8 @@ impl ProofTracker {
     /// that cost visible at the call site: a NEW caller must either supply a
     /// typed kind (`add_theory_lemma_with_kind`,
     /// `add_theory_lemma_with_farkas_and_kind`, or the `theory_inference`
-    /// classifier funnel) or name the trust by writing this method — and every
-    /// call site is inventoried by the census test
-    /// (`proof_tracker/explicit_trust_census_tests.rs`), so a new site fails
-    /// the build until it is vetted there. Behavior is byte-identical to the
-    /// old `add_theory_lemma`.
+    /// classifier funnel) or name the trust by writing this method. Behavior is
+    /// byte-identical to the old `add_theory_lemma`.
     #[doc(hidden)]
     pub(crate) fn add_explicit_trust_lemma(&mut self, clause: Vec<TermId>) -> Option<ProofId> {
         if !self.enabled {

@@ -131,20 +131,20 @@ impl ProofComplexityFeatures {
         let mut xor_odd_parity: u64 = 0; // positives in {1, 3}
         for clause in cnf.clauses() {
             let w = clause.len() as u32;
-            total_width += u64::from(w);
+            total_width = total_width.saturating_add(u64::from(w));
             if w > max_width {
                 max_width = w;
             }
             if w == 3 {
                 let positives = clause.iter().filter(|l| l.is_positive()).count();
                 if positives % 2 == 0 {
-                    xor_even_parity += 1;
+                    xor_even_parity = xor_even_parity.saturating_add(1);
                 } else {
-                    xor_odd_parity += 1;
+                    xor_odd_parity = xor_odd_parity.saturating_add(1);
                 }
             }
             if w == 2 && clause.iter().all(|l| !l.is_positive()) {
-                amo_like += 1;
+                amo_like = amo_like.saturating_add(1);
             }
         }
         // Whichever parity dominates is the "XOR signal". A parity-true 3-XOR
@@ -218,7 +218,8 @@ fn compute_modularity_proxy(cnf: &Cnf) -> f64 {
         }
         buckets.clear();
         for lit in clause {
-            let b = lit.variable().index() as u32 % k;
+            // `k >= 2`, so the remainder always exists.
+            let b = (lit.variable().index() as u32).checked_rem(k).unwrap_or(0);
             if !buckets.contains(&b) {
                 buckets.push(b);
             }
@@ -226,11 +227,11 @@ fn compute_modularity_proxy(cnf: &Cnf) -> f64 {
         // Normalise by clause width so that a 10-literal clause touching
         // 10 buckets doesn't swamp a dozen unit clauses.
         let w = clause.len() as u64;
-        total_weight += w;
+        total_weight = total_weight.saturating_add(w);
         // Each distinct bucket beyond the first contributes "spread".
         let distinct = buckets.len() as u64;
         if distinct > 1 {
-            spread_weight += distinct - 1;
+            spread_weight = spread_weight.saturating_add(distinct - 1);
         }
     }
 
@@ -273,10 +274,8 @@ struct VariableInteractionGraph {
 impl VariableInteractionGraph {
     fn from_cnf(cnf: &Cnf) -> Self {
         let num_vars_full = cnf.num_vars();
-        let stride = num_vars_full
-            .max(1)
-            .div_ceil(VIG_SAMPLE_LIMIT.max(1))
-            .max(1);
+        let stride = num_vars_full.max(1).div_ceil(VIG_SAMPLE_LIMIT);
+        let stride = if stride == 0 { 1 } else { stride };
 
         // Deterministic sampling: keep variables whose id is a multiple
         // of `stride`. This preserves structural patterns such as the
@@ -291,7 +290,11 @@ impl VariableInteractionGraph {
             .collect();
 
         let n_local = local_to_var.len();
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_local];
+        // One adjacency list per sampled variable, reserved fallibly: a
+        // failed reservation only forgoes the pre-sizing.
+        let mut adj: Vec<Vec<u32>> = Vec::new();
+        let _ = adj.try_reserve_exact(n_local);
+        adj.extend(std::iter::repeat_n(Vec::new(), n_local));
 
         // For each clause, enumerate every pair of kept variables.
         // Clauses are short on average; for very wide clauses the
@@ -315,13 +318,19 @@ impl VariableInteractionGraph {
             if sampled.len() < 2 {
                 continue;
             }
-            for i in 0..sampled.len() {
-                for j in (i + 1)..sampled.len() {
-                    let a = sampled[i];
-                    let b = sampled[j];
-                    adj[a as usize].push(b);
-                    adj[b as usize].push(a);
+            // Every retained `lv` is below `n_local`: `v < num_vars_full` and
+            // `v % stride == 0` put `v / stride` inside the sampled range.
+            let mut rest = sampled.as_slice();
+            while let Some((&a, tail)) = rest.split_first() {
+                for &b in tail {
+                    if let Some(list) = adj.get_mut(a as usize) {
+                        list.push(b);
+                    }
+                    if let Some(list) = adj.get_mut(b as usize) {
+                        list.push(a);
+                    }
                 }
+                rest = tail;
             }
         }
 
@@ -355,11 +364,15 @@ impl VariableInteractionGraph {
         if v_full < 2 {
             return 0.0;
         }
-        let v_local = self.num_vertices().max(1);
+        let v_local = self.num_vertices();
+        let v_local = if v_local == 0 { 1 } else { v_local };
         let stride = v_full.div_ceil(v_local);
-        let stride = stride.max(1);
+        let stride = if stride == 0 { 1 } else { stride };
         let e_local = self.num_edges() as f64;
-        let e_estimated = e_local * (stride * stride) as f64;
+        // Square in floating point: the estimate is a ratio, and the product
+        // is exact wherever the integer square was representable.
+        let stride = stride as f64;
+        let e_estimated = e_local * (stride * stride);
         let max_edges = (v_full as f64) * ((v_full as f64) - 1.0) / 2.0;
         if max_edges <= 0.0 {
             0.0
@@ -388,7 +401,10 @@ impl VariableInteractionGraph {
         // we find the min-degree vertex, record its degree, and clique
         // its neighbours.
         let mut adj: Vec<Vec<u32>> = self.adj.clone();
-        let mut alive: Vec<bool> = vec![true; n];
+        // Reserved fallibly: a refused allocation yields no estimate (None).
+        let mut alive: Vec<bool> = Vec::new();
+        alive.try_reserve_exact(n).ok()?;
+        alive.extend(std::iter::repeat_n(true, n));
         let mut remaining = n;
         let mut max_elim_degree: u32 = 0;
 
@@ -431,22 +447,25 @@ impl VariableInteractionGraph {
             adj[v].clear();
 
             // Add fill-in edges so surviving neighbours form a clique.
-            for i in 0..nbrs.len() {
-                for j in (i + 1)..nbrs.len() {
-                    let a = nbrs[i] as usize;
-                    let b = nbrs[j] as usize;
-                    if !alive[a] || !alive[b] {
+            let mut rest = nbrs.as_slice();
+            while let Some((&a, tail)) = rest.split_first() {
+                rest = tail;
+                if alive.get(a as usize) != Some(&true) {
+                    continue;
+                }
+                for &b in tail {
+                    if alive.get(b as usize) != Some(&true) {
                         continue;
                     }
-                    let a_list = &mut adj[a];
-                    if a_list.binary_search(&(b as u32)).is_err() {
-                        let pos = a_list.partition_point(|&x| x < b as u32);
-                        a_list.insert(pos, b as u32);
+                    if let Some(a_list) = adj.get_mut(a as usize) {
+                        if let Err(pos) = a_list.binary_search(&b) {
+                            a_list.insert(pos, b);
+                        }
                     }
-                    let b_list = &mut adj[b];
-                    if b_list.binary_search(&(a as u32)).is_err() {
-                        let pos = b_list.partition_point(|&x| x < a as u32);
-                        b_list.insert(pos, a as u32);
+                    if let Some(b_list) = adj.get_mut(b as usize) {
+                        if let Err(pos) = b_list.binary_search(&a) {
+                            b_list.insert(pos, a);
+                        }
                     }
                 }
             }
@@ -495,7 +514,7 @@ fn compute_pigeonhole_score(cnf: &Cnf) -> f64 {
     for clause in cnf.clauses() {
         let w = clause.len();
         if w == 2 && clause.iter().all(|l| !l.is_positive()) {
-            amo_pair_count += 1;
+            amo_pair_count = amo_pair_count.saturating_add(1);
             for lit in clause {
                 let v = lit.variable().index();
                 if v < n_vars {
@@ -503,7 +522,7 @@ fn compute_pigeonhole_score(cnf: &Cnf) -> f64 {
                 }
             }
         } else if w >= 2 && clause.iter().all(|l| l.is_positive()) {
-            alo_wide_count += 1;
+            alo_wide_count = alo_wide_count.saturating_add(1);
         }
     }
 
@@ -617,22 +636,23 @@ mod tests {
     }
 
     #[test]
-    fn test_treewidth_approx_path() {
+    fn test_treewidth_approx_path() -> Result<(), Box<dyn std::error::Error>> {
         // Build a path x0-x1, x1-x2, ..., x4-x5 via width-2 clauses.
         // A path has treewidth 1; min-degree heuristic recovers 1.
         let mut cnf = Cnf::new_with_capacity(6, 5);
-        for i in 0..5 {
+        for (i, j) in (0..5).zip(1..6) {
             cnf.add_clause(&[
                 crate::Lit::positive(crate::Var::new(i)),
-                crate::Lit::positive(crate::Var::new(i + 1)),
+                crate::Lit::positive(crate::Var::new(j)),
             ]);
         }
         let f = ProofComplexityFeatures::from_cnf(&cnf);
-        let tw = f.treewidth_approx.expect("path has VIG vertices");
+        let tw = f.treewidth_approx.ok_or("path has VIG vertices")?;
         assert!(
             (tw - 1.0).abs() < 1e-9,
             "expected path treewidth upper bound = 1, got {tw}"
         );
+        Ok(())
     }
 
     #[test]

@@ -17,7 +17,7 @@
 #     argument) fail-closes to `unknown` — never a plain-UF/quantifier-luck
 #     `sat`, and never a wrong `unsat`.
 #
-# Run:  cargo build --release -p ay-ffi  &&  pytest bindings/python/tests/test_recfun.py -v
+# Run:  targo --unverified build --release -p ay-ffi  &&  pytest bindings/python/tests/test_recfun.py -v
 
 import pytest
 

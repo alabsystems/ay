@@ -84,6 +84,19 @@ impl Solver {
             } else {
                 base
             }
+        } else if super::bve_kissat_schedule_enabled() {
+            // Kissat `SET_EFFORT_LIMIT (resolution_limit, eliminate, ...)`:
+            // `eliminateeffort` 100 per mille of the search ticks since the
+            // last elimination, the reference at least `mineffort` 1e7 ticks
+            // — a tenth of ay's per-mille and a tenth of its floor, which is
+            // what keeps Kissat's rounds partial on schooltt-5-3 where ay's
+            // 10M-resolution floor let one round eliminate everything.
+            const KISSAT_ELIMINATE_EFFORT_PER_MILLE: u64 = 100;
+            const KISSAT_MIN_EFFORT_REFERENCE_TICKS: u64 = 10_000_000;
+            let ticks_now = self.search_ticks[0] + self.search_ticks[1];
+            let ticks_delta = ticks_now.saturating_sub(self.cold.last_bve_ticks);
+            let reference = ticks_delta.max(KISSAT_MIN_EFFORT_REFERENCE_TICKS);
+            (reference * KISSAT_ELIMINATE_EFFORT_PER_MILLE / 1000).min(BVE_MAX_EFFORT)
         } else {
             let ticks_now = self.search_ticks[0] + self.search_ticks[1];
             let ticks_delta = ticks_now.saturating_sub(self.cold.last_bve_ticks);
@@ -93,7 +106,11 @@ impl Solver {
         let active_vars = self
             .num_vars
             .saturating_sub(self.var_lifecycle.count_removed()) as u64;
-        let effort = effort.max(2 * active_vars);
+        let effort = if super::bve_kissat_schedule_enabled() {
+            effort
+        } else {
+            effort.max(2 * active_vars)
+        };
         // DEEP: lift the per-round resolution effort toward kissat parity so the
         // second-order budget_exhausted limiter stops throttling once the wall
         // is raised (measured: without this, deep re-plateaus at ~62K/round).
@@ -181,6 +198,7 @@ impl Solver {
             // Wall-clock guard for fastelim on large formulas (#8136).
             if round > 0
                 && self.inproc.bve.is_fastelim_mode()
+                && self.preprocess_wall_budgets_enabled()
                 && bve_wall_start.elapsed().as_secs() >= fastelim_wall_secs
             {
                 break;
@@ -188,6 +206,7 @@ impl Solver {
             // Wall-clock guard for inprocessing BVE (#8078).
             if round > 0
                 && !self.inproc.bve.is_fastelim_mode()
+                && self.preprocess_wall_budgets_enabled()
                 && bve_wall_start.elapsed().as_millis() as u64 >= BVE_INPROCESSING_WALL_LIMIT_MS
             {
                 break;
@@ -274,11 +293,25 @@ impl Solver {
             // number of candidate variables attempted per round. This bounds
             // per-round wall-clock time to ~1-2ms by processing only the cheapest
             // candidates, making BVE rounds faster and more frequent overall.
-            let candidate_attempt_cap = if self.inproc.bve.is_fastelim_mode() {
-                usize::MAX // no cap during preprocessing
-            } else {
-                BVE_PARTIAL_CANDIDATES_PER_ROUND
-            };
+            // Under Kissat's schedule the capped in-search rounds progress
+            // through the candidates instead of retrying the same cheapest
+            // ones: a candidate refused at the current bound waits for the
+            // bound to move (qwh.60.1728: three rounds of the same 5,000 at
+            // bound 0 eliminated nothing; lifting the cap instead cost
+            // schooltt-5-3 a third more conflicts).
+            self.inproc
+                .bve
+                .set_skip_rejected_at_bound(super::bve_kissat_schedule_enabled());
+            let candidate_attempt_cap =
+                if self.inproc.bve.is_fastelim_mode() || super::bve_kissat_schedule_enabled() {
+                    // No cap during preprocessing; none under Kissat's schedule
+                    // either: its rounds are effort-bounded and must be able to
+                    // exhaust the candidates (qwh.60.1728 has 53K of them after
+                    // factoring; 5,000 a round never drains them).
+                    usize::MAX
+                } else {
+                    BVE_PARTIAL_CANDIDATES_PER_ROUND
+                };
             let mut candidates_attempted: usize = 0;
             // Debug: limit total eliminations for bisection (cached at solver creation)
             let elim_cap = if let Some(limit) = self.cold.bve_limit {
@@ -303,7 +336,7 @@ impl Solver {
                 && self.cold.bve_resolutions < resolution_limit
                 && candidates_attempted < candidate_attempt_cap
             {
-                // Check external interrupt (timeout) every 64 eliminations to
+                // Check external interrupt (timeout) every 64 candidates to
                 // avoid spending seconds in BVE after the DPLL timeout fires.
                 // This fixes QF_ABV regression on try5_dwp_fmt where the
                 // reduced formula (from cached false/true literals) enabled
@@ -315,11 +348,19 @@ impl Solver {
                 // guard (FASTELIM_WALL_CLOCK_LIMIT_SECS) only fires between rounds;
                 // with max_rounds=1 for >3M clauses, it never triggers. This
                 // intra-round check caps a single round at the same limit.
-                if stats.total_eliminations & 63 == 0 {
+                // Counted in candidates, not eliminations: a run of refused
+                // candidates leaves the elimination count still, so keyed on
+                // it the check either never fired (a stats-less overrun on
+                // b54b26f3 in the K4L pilot) or fired on every candidate.
+                if candidates_attempted & 63 == 0 {
                     if self.is_interrupted() {
                         break;
                     }
+                    // Off under `--sat-deterministic-inproc`, like the round
+                    // guard above: the resolution effort, elimination and
+                    // candidate caps bound the round instead.
                     if self.inproc.bve.is_fastelim_mode()
+                        && self.preprocess_wall_budgets_enabled()
                         && bve_wall_start.elapsed().as_secs() >= fastelim_wall_secs
                     {
                         break;
@@ -391,6 +432,17 @@ impl Solver {
                 // variables themselves are ALWAYS eligible for BVE, and
                 // original variables are eligible once their co-occurring
                 // extension variables have been eliminated.
+                //
+                // `--sat-bve-ext-cooccur true` lifts the guard (A/B switch,
+                // default OFF): the reconstruction stack replays each
+                // eliminated variable's clauses with its witness in reverse
+                // order, so an original variable eliminated before a
+                // co-occurring extension variable is restored against that
+                // variable's final value, whether the solver assigned it or a
+                // later entry did. After a productive factor pass the guard
+                // refuses most of the formula to BVE (schooltt-5-3: 8 percent
+                // eliminated against Kissat's 65); the refusals are counted in
+                // `sat.bve_ext_cooccur_skips` either way.
                 if self.cold.first_extension_var_index != usize::MAX {
                     let ext_start = self.cold.first_extension_var_index;
                     // Extension variables are always eligible for BVE —
@@ -409,7 +461,10 @@ impl Solver {
                             })
                         });
                         if has_live_ext_var {
-                            continue;
+                            self.cold.bve_ext_cooccur_skips += 1;
+                            if !self.bve_ext_cooccur_allowed() {
+                                continue;
+                            }
                         }
                     }
                 }
@@ -423,6 +478,7 @@ impl Solver {
                     let pos_occs = self.inproc.bve.get_occs(Literal::positive(var));
                     let neg_occs = self.inproc.bve.get_occs(Literal::negative(var));
                     if pos_occs.len() > occ_limit || neg_occs.len() > occ_limit {
+                        self.cold.bve_rejections[0] += 1;
                         continue;
                     }
                     let has_oversized = pos_occs
@@ -430,6 +486,7 @@ impl Solver {
                         .chain(neg_occs.iter())
                         .any(|&idx| self.arena.len_of(idx) > cls_limit);
                     if has_oversized {
+                        self.cold.bve_rejections[0] += 1;
                         continue;
                     }
                 }
@@ -480,6 +537,7 @@ impl Solver {
                         .count();
                     let product = pos_binary.saturating_mul(neg_binary);
                     if product > BVE_BINARY_DEGREE_PRODUCT_LIMIT {
+                        self.cold.bve_rejections[1] += 1;
                         continue;
                     }
                 }
@@ -514,7 +572,7 @@ impl Solver {
                         defining_clauses,
                         resolve_gate_pairs,
                     }) => (Some(defining_clauses), resolve_gate_pairs),
-                    Some(BveExtraction::FailedLiteral { unit }) => {
+                    Some(BveExtraction::FailedLiteral { unit, core_lemmas }) => {
                         if self.var_is_assigned(unit.variable().index()) {
                             debug_assert!(
                                 self.lit_val(unit) > 0,
@@ -544,12 +602,56 @@ impl Solver {
                                 self.backtrack(0);
                             }
                         } else {
+                            // The unit is implied by resolution over the pivot's
+                            // occurrences, not by propagation, so under a proof
+                            // surface it is certified the way Kissat does
+                            // (definition.c, traverse_one_sided_core_lemma): each
+                            // kitten core lemma, lifted by the unit, is added
+                            // first (each RUP after the ones before it), then the
+                            // unit (RUP after all of them), then the lifted lemmas
+                            // are deleted. Without this the bare unit is a RAT
+                            // step the checker rejects whenever a clause with the
+                            // unit's negation is still in its database: VeriPB
+                            // rejected cabp-M k33's arm-C proof at `red 1 x99978
+                            // >= 1` on 2026-09-16. Under LRAT the probe above
+                            // certifies the unit instead.
+                            let lifted: Vec<Vec<Literal>> = if self.proof_manager.is_some() {
+                                core_lemmas
+                                    .iter()
+                                    .filter(|lemma| !lemma.is_empty())
+                                    .map(|lemma| {
+                                        std::iter::once(unit)
+                                            .chain(lemma.iter().map(|&l| Literal(l)))
+                                            .collect()
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            // `--sat-veripb-hints`: each step names the pivot's
+                            // occurrences and the lemmas before it (veripb_derived.rs).
+                            for (k, lits) in lifted.iter().enumerate() {
+                                self.veripb_note_occurrences(
+                                    &scratch.pos_occs,
+                                    &scratch.neg_occs,
+                                    &lifted[..k],
+                                );
+                                let _ = self.proof_emit_add(lits, &[], ProofAddKind::Derived);
+                            }
+                            self.veripb_note_occurrences(
+                                &scratch.pos_occs,
+                                &scratch.neg_occs,
+                                &lifted,
+                            );
                             // SOUNDNESS FIX (#8477): use enqueue_derived_unit
                             // instead of learn_derived_unit. During BVE, watches
                             // are disconnected and search_propagate cannot work.
                             // See the detailed comment in the backward subsumption
                             // unit path below.
                             self.enqueue_derived_unit(unit, &[]);
+                            for lits in &lifted {
+                                let _ = self.proof_emit_delete(lits, 0);
+                            }
                         }
                         continue;
                     }
@@ -567,61 +669,6 @@ impl Solver {
                     None
                 };
 
-                // GPU-accelerated path (#8349): when no gate is detected and
-                // the pair count exceeds the GPU threshold (2048), dispatch
-                // resolvent generation to the GPU. The GPU computes raw
-                // resolvents in parallel; the CPU post-processes for OTFS
-                // (on-the-fly self-subsuming resolution) and budget checking.
-                // Falls back to CPU for gate-aware restricted resolution
-                // (complex pair selection) and small pair counts (GPU launch
-                // overhead > benefit).
-                #[cfg(feature = "gpu")]
-                let result = if gate_defining.is_none()
-                    && self.should_use_gpu_bve(scratch.pos_occs.len(), scratch.neg_occs.len())
-                {
-                    match self.gpu_bve_resolve_and_check(
-                        var,
-                        &scratch.pos_occs,
-                        &scratch.neg_occs,
-                        remaining_budget,
-                    ) {
-                        Some((can_elim, resolvents, strengthened, satisfied_parents, attempts)) => {
-                            self.inproc.bve.finalize_elimination_from_resolution(
-                                var,
-                                &self.arena,
-                                can_elim,
-                                resolvents,
-                                strengthened,
-                                satisfied_parents,
-                                attempts,
-                            )
-                        }
-                        None => {
-                            // GPU dispatch failed; fall back to CPU path.
-                            self.inproc.bve.try_eliminate_with_gate_with_marks(
-                                var,
-                                &self.arena,
-                                gate_defining.as_deref(),
-                                resolve_gate_pairs,
-                                &mut self.lit_marks,
-                                &self.vals,
-                                remaining_budget,
-                            )
-                        }
-                    }
-                } else {
-                    self.inproc.bve.try_eliminate_with_gate_with_marks(
-                        var,
-                        &self.arena,
-                        gate_defining.as_deref(),
-                        resolve_gate_pairs,
-                        &mut self.lit_marks,
-                        &self.vals,
-                        remaining_budget,
-                    )
-                };
-
-                #[cfg(not(feature = "gpu"))]
                 let result = self.inproc.bve.try_eliminate_with_gate_with_marks(
                     var,
                     &self.arena,
@@ -637,7 +684,39 @@ impl Solver {
                     .bve_resolutions
                     .saturating_add(result.resolution_attempts);
 
+                self.cold.bve_rejections[3] += 1;
+                self.cold.bve_rejections[4] =
+                    self.cold.bve_rejections[4].max(self.inproc.bve.growth_bound() as u64);
+                if bve_trace_enabled() {
+                    // `--sat-bve-trace 1`: one stderr line per decision, DIMACS
+                    // numbering, for diffing against Kissat's elimination log.
+                    let ext = self.externalize_for_proof(Literal::positive(var));
+                    eprintln!(
+                        "c bve-trace {} var={} pos={} neg={} gate={} bound={}",
+                        if result.eliminated {
+                            "eliminated"
+                        } else {
+                            "refused"
+                        },
+                        ext.variable().index() + 1,
+                        scratch.pos_occs.len(),
+                        scratch.neg_occs.len(),
+                        gate_defining.is_some(),
+                        self.inproc.bve.growth_bound(),
+                    );
+                    if bve_trace_level() >= 2 && !result.eliminated {
+                        self.bve_trace_clauses(
+                            &scratch.pos_occs,
+                            &scratch.neg_occs,
+                            gate_defining.as_deref(),
+                            result.resolvents.len(),
+                            result.resolution_attempts,
+                        );
+                    }
+                }
                 if !result.eliminated {
+                    self.cold.bve_rejections[2] += 1;
+                    self.inproc.bve.note_rejected_at_bound(var);
                     self.inproc.bve.mark_failed(var);
                     continue;
                 }
@@ -719,17 +798,24 @@ impl Solver {
                 // guarantees any satisfying model of the resolvent also satisfies
                 // the subsumed clause. See #8356 for the unsoundness caused by
                 // the previous approach of pushing per-variable witness entries.
-                // #8466: Enable backward subsumption when no proof output
-                // is active. BW_SUBSUME_ENABLED is false due to DRAT proof
-                // ordering bugs (#8448), but the solver-soundness path (no
-                // proof) is correct: subsumed clauses are logically redundant
-                // and can be safely deleted. On clique_n2_k10, backward
-                // subsumption removes redundant resolvents that otherwise
-                // cause 7x clause growth.
-                if !scratch.resolvent_indices.is_empty()
-                    && !has_proof_output
-                    && !self.cold.lrat_enabled
-                {
+                // #8466 gated this block on `!has_proof_output` after the DRAT
+                // ordering bugs of #8448; proof-posture-parity (site A, 2026-09-10)
+                // re-opens it under DRAT/VeriPB because every mutation the block
+                // performs already reaches the proof stream in a checker-valid
+                // order: root-satisfied clauses are pure deletions; a
+                // strengthened clause goes through `replace_clause_core`, which
+                // emits the ADD of the strengthened clause BEFORE the DELETE of
+                // the clause it replaces; derived units are RUP additions.
+                // Deletion deferral is suspended for the duration of the block
+                // (below) so these emissions land in mutation order, and the
+                // additions deferred earlier in the round are unaffected (an
+                // extra clause in the checker's database never breaks RUP).
+                // Subsumed clauses are still NOT deleted (#8397, below).
+                // LRAT stays gated: the LRAT route clamps BVE off in the
+                // capability registry and its strengthening hints are not
+                // exercised here. The gate lives in the same shape in both
+                // arms so the no-proof and proof postures run the same BVE.
+                if !scratch.resolvent_indices.is_empty() && !self.cold.lrat_enabled {
                     // Sequential per-resolvent backward subsumption (#8448).
                     //
                     // CaDiCaL elim.cpp:731, backward.cpp:40-211: process one
@@ -910,6 +996,8 @@ impl Solver {
                                 } else {
                                     vec![]
                                 };
+                                // `--sat-veripb-hints`: the strengthening clause R.
+                                self.veripb_note_antecedent_ref(ClauseRef(r_idx as u32));
                                 match self.replace_clause_with_final_hints(
                                     idx,
                                     &scratch.new_lits_buf,
@@ -1197,8 +1285,10 @@ impl Solver {
         };
         let inst_admitted = !inst_gate
             || (self.cold.bve_instantiate_done_seq != self.cold.bve_elim_phase_seq
-                && bve_wall_start.elapsed() < inst_wall);
-        let inst_deadline = inst_gate.then(|| bve_wall_start + inst_wall);
+                && (!self.preprocess_wall_budgets_enabled()
+                    || bve_wall_start.elapsed() < inst_wall));
+        let inst_deadline = (inst_gate && self.preprocess_wall_budgets_enabled())
+            .then(|| bve_wall_start + inst_wall);
         let inst_candidates = if !self.cold.lrat_enabled
             && !derived_unsat
             && stats.total_eliminations > 0
@@ -1266,7 +1356,26 @@ impl Solver {
             }
         }
 
-        if stats.total_eliminations > 0 && candidates_exhausted {
+        // Kissat (eliminate.c `set_next_elimination_bound`) moves to the next
+        // bound after every COMPLETE phase, eliminations or not, and re-queues
+        // every variable; ay moved only after a productive one, so a phase
+        // that eliminated nothing at its bound left BVE at that bound for the
+        // rest of the solve (the fixpoint guard sees no dirty candidates).
+        // `--sat-bve-bound-progress true` takes Kissat's rule.
+        // `--sat-eliminate-cadence-kissat`: in 4.0.4 every call counts as
+        // complete (eliminate.c:529 reads `remain` after the heap is released),
+        // so the bound moves after every in-search call.
+        let raise_bound = if self.eliminate_cadence_kissat_applies() {
+            true
+        } else if super::bve_kissat_schedule_enabled() {
+            // Kissat `set_next_elimination_bound (solver, complete)`: the
+            // bound moves after every complete phase.
+            candidates_exhausted
+        } else {
+            candidates_exhausted
+                && (stats.total_eliminations > 0 || self.bve_bound_progress_allowed())
+        };
+        if raise_bound {
             self.inproc.bve.increment_growth_bound();
         }
 
@@ -1416,5 +1525,44 @@ impl Solver {
         }
 
         hints
+    }
+}
+
+/// `--sat-bve-trace 1`: trace every BVE decision to stderr (diagnostic only);
+/// `2` also prints the occurrence clauses of every refusal.
+fn bve_trace_level() -> u8 {
+    ay_core::misc_cli_flags().sat_bve_trace
+}
+
+fn bve_trace_enabled() -> bool {
+    bve_trace_level() >= 1
+}
+
+impl Solver {
+    /// `--sat-bve-trace 2`: the clauses of a refused candidate, DIMACS
+    /// numbering, gate-defining ones marked `g`.
+    fn bve_trace_clauses(
+        &self,
+        pos_occs: &[usize],
+        neg_occs: &[usize],
+        gate: Option<&[usize]>,
+        resolvents: usize,
+        attempts: u64,
+    ) {
+        eprintln!("c bve-trace   resolvents={resolvents} attempts={attempts}");
+        for &idx in pos_occs.iter().chain(neg_occs) {
+            let mut line = String::new();
+            for i in 0..self.arena.len_of(idx) {
+                let lit = self.externalize_for_proof(self.arena.literal(idx, i));
+                let v = lit.variable().index() as i64 + 1;
+                line.push_str(&format!(" {}", if lit.is_positive() { v } else { -v }));
+            }
+            let mark = if gate.is_some_and(|g| g.contains(&idx)) {
+                "g"
+            } else {
+                " "
+            };
+            eprintln!("c bve-trace   {mark}{line}");
+        }
     }
 }

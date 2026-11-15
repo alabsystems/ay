@@ -8526,7 +8526,6 @@ fn parse_seq_elt(t: &PTerm) -> Option<SeqElt> {
         PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok().map(SeqElt::Int),
         PTerm::Const(PConst::True) => Some(SeqElt::Bool(true)),
         PTerm::Const(PConst::False) => Some(SeqElt::Bool(false)),
-        PTerm::Symbol(s) => s.parse::<i64>().ok().map(SeqElt::Int),
         PTerm::App(op, args) if op == "-" && args.len() == 1 => match parse_seq_elt(&args[0]) {
             Some(SeqElt::Int(n)) => Some(SeqElt::Int(-n)),
             _ => None,
@@ -8629,12 +8628,7 @@ fn collect_seq_binds(parsed: &[PTerm]) -> Vec<(String, Vec<SeqElt>)> {
 fn resolve_index(t: &PTerm, int_binds: &[(String, i64)]) -> Option<i64> {
     match t {
         PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
-        PTerm::Symbol(s) => {
-            if let Ok(n) = s.parse::<i64>() {
-                return Some(n);
-            }
-            int_binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v)
-        }
+        PTerm::Symbol(s) => int_binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v),
         _ => None,
     }
 }
@@ -8652,12 +8646,7 @@ fn eval_read(list: &[SeqElt], idx: i64) -> Option<SeqElt> {
 fn fold_int(t: &PTerm, binds: &[(String, i64)]) -> Option<i64> {
     match t {
         PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
-        PTerm::Symbol(s) => {
-            if let Ok(n) = s.parse::<i64>() {
-                return Some(n);
-            }
-            binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v)
-        }
+        PTerm::Symbol(s) => binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v),
         PTerm::App(op, a) if op == "-" && a.len() == 1 => Some(-fold_int(&a[0], binds)?),
         PTerm::App(op, a) if op == "-" && a.len() == 2 => {
             Some(fold_int(&a[0], binds)? - fold_int(&a[1], binds)?)
@@ -11415,7 +11404,10 @@ fn word_eq_proj(vars: &[String], s: &str) -> String {
 /// Render a string literal as a concrete `StringThy.Str` (`List Nat` of Unicode
 /// codepoints) with a type ascription, e.g. `"ab"` ⟹ `([97, 98] : StringThy.Str)`.
 fn word_eq_lean_str_list(l: &str) -> String {
-    let codes: Vec<String> = l.chars().map(|c| (c as u32).to_string()).collect();
+    let codes: Vec<String> = l
+        .chars()
+        .map(|c| ay_core::smtlib_code_point(c).to_string())
+        .collect();
     format!("([{}] : StringThy.Str)", codes.join(", "))
 }
 
@@ -11828,7 +11820,7 @@ fn collect_str_binds(parsed: &[PTerm]) -> Option<std::collections::BTreeMap<&str
 fn indexof_codelist_len(s: &str) -> Option<usize> {
     let mut len = 2usize; // `[` + `]`
     let mut first = true;
-    for codepoint in s.chars().map(|c| c as u32) {
+    for codepoint in s.chars().map(ay_core::smtlib_code_point) {
         if !first {
             len = len.checked_add(2)?; // `, `
         }
@@ -11848,7 +11840,7 @@ fn indexof_codelist(s: &str, exact_len: usize) -> String {
 
     let mut out = String::with_capacity(exact_len);
     out.push('[');
-    for (index, codepoint) in s.chars().map(|c| c as u32).enumerate() {
+    for (index, codepoint) in s.chars().map(ay_core::smtlib_code_point).enumerate() {
         if index != 0 {
             out.push_str(", ");
         }
@@ -13290,7 +13282,7 @@ fn term_mentions_name(t: &PTerm, syms: &std::collections::HashSet<String>) -> bo
 /// `Val := Nat → Int`, assigning each distinct variable a stable index `(m i)`.
 /// Handles `+` (n-ary), binary/unary `-`, `*` with at least one constant operand
 /// (linearity — a `var*var` product returns `None`), and Euclidean `mod`/`div` by
-/// a constant divisor (rendered `Int.emod`/`Int.ediv`, which `omega` supports).
+/// a nonzero literal divisor (rendered `Int.emod`/`Int.ediv`, which `omega` supports).
 /// Returns `(expr, references_var)`; `None` on any non-linear or unsupported shape.
 fn render_int_lia_parsed(
     t: &PTerm,
@@ -13306,14 +13298,8 @@ fn render_int_lia_parsed(
                 });
                 return Some((format!("(m {idx})"), true));
             }
-            // SMT-LIB numerals are non-negative, so a negative literal such as
-            // `-1` in `(* -1 v0)` reaches the parser as a SYMBOL. Treat any
-            // undeclared symbol whose text is an integer as a constant (matches
-            // ay's own lenient elaboration). A declaration wins first: `|-1|`
-            // may legally name an Int/Real constant or a function.
-            if let Some(val) = firewall_undeclared_i64_symbol_literal(context, v) {
-                return Some((format!("({val} : Int)"), false));
-            }
+            // An unquoted `-1` reaches here as a signed `Numeral`; a symbol
+            // spelled `-1` is the quoted `|-1|`, never a number.
             None
         }
         PTerm::Const(PConst::Numeral(n)) => {
@@ -13348,25 +13334,40 @@ fn render_int_lia_parsed(
                 }
                 Some((format!("({a} * {b})"), ar || br))
             }
+            // Lean's `Int.emod a 0 = a` and `Int.ediv a 0 = 0`, while SMT-LIB
+            // leaves both unspecified, so only a nonzero literal divisor is
+            // rendered.
             ("mod", 2) => {
                 let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
-                if br {
-                    return None; // non-constant modulus — omega supports literals only
+                if !parsed_nonzero_int_literal(&args[1], context) {
+                    return None;
                 }
+                let (b, _) = render_int_lia_parsed(&args[1], vars, context)?;
                 Some((format!("(Int.emod {a} {b})"), ar))
             }
             ("div", 2) => {
                 let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
-                if br {
-                    return None; // non-constant divisor — omega supports literals only
+                if !parsed_nonzero_int_literal(&args[1], context) {
+                    return None;
                 }
+                let (b, _) = render_int_lia_parsed(&args[1], vars, context)?;
                 Some((format!("(Int.ediv {a} {b})"), ar))
             }
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// True if `t` is an integer literal other than 0: a numeral, an undeclared
+/// negative-literal symbol such as `-3`, or `(- n)` of one.
+fn parsed_nonzero_int_literal(t: &PTerm, context: &ay_frontend::Context) -> bool {
+    match t {
+        PTerm::Const(PConst::Numeral(_)) => parsed_numeral(t).is_some_and(|value| value != 0),
+        PTerm::App(op, args) if op == "-" && args.len() == 1 => {
+            parsed_nonzero_int_literal(&args[0], context)
+        }
+        _ => false,
     }
 }
 
@@ -13636,7 +13637,6 @@ struct EufLiaLin {
 fn euf_lia_i64_literal(t: &PTerm, context: &ay_frontend::Context) -> Option<i64> {
     match t {
         PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
-        PTerm::Symbol(n) => firewall_undeclared_i64_symbol_literal(context, n),
         _ => None,
     }
 }
@@ -13654,10 +13654,6 @@ fn euf_lia_lin_of(t: &PTerm, context: &ay_frontend::Context) -> Option<EufLiaLin
             coeffs.insert(v.clone(), 1i64);
             Some(EufLiaLin { coeffs, konst: 0 })
         }
-        PTerm::Symbol(v) => Some(EufLiaLin {
-            coeffs: BTreeMap::new(),
-            konst: firewall_undeclared_i64_symbol_literal(context, v)?,
-        }),
         PTerm::Const(PConst::Numeral(n)) => Some(EufLiaLin {
             coeffs: BTreeMap::new(),
             konst: n.parse::<i64>().ok()?,
@@ -13722,10 +13718,6 @@ fn euf_lia_render_int(t: &PTerm, context: &ay_frontend::Context) -> Option<Strin
         PTerm::Symbol(v) if cbr_is_int_constant(context, v) => {
             Some(format!("m.x_{}", euf_lia_san(v)))
         }
-        PTerm::Symbol(v) => Some(format!(
-            "({} : Int)",
-            firewall_undeclared_i64_symbol_literal(context, v)?
-        )),
         PTerm::Const(PConst::Numeral(n)) => {
             n.parse::<i64>().ok()?;
             Some(format!("({n} : Int)"))
@@ -15107,16 +15099,6 @@ fn firewall_unique_symbol_info<'a>(
 /// distinguishable here only through `Context`. One wrong-signature declaration
 /// or multiple overloaded declarations must therefore decline, not fall back to
 /// a literal.
-fn firewall_undeclared_i64_symbol_literal(
-    context: &ay_frontend::Context,
-    name: &str,
-) -> Option<i64> {
-    if context.symbols_iter().any(|(surface, _)| surface == name) {
-        return None;
-    }
-    name.parse::<i64>().ok()
-}
-
 fn cbr_is_int_constant(context: &ay_frontend::Context, name: &str) -> bool {
     firewall_unique_symbol_info(context, name)
         .is_some_and(|info| info.arg_sorts.is_empty() && info.sort == Sort::Int)
@@ -16341,11 +16323,9 @@ fn nia_lin_of(
                 }
                 return Some(NiaLin::slot(NiaSlot::Var(idx)));
             }
-            // ay's lenient elaboration keeps an undeclared signed literal such as
-            // `-1` as a Symbol; a DECLARED numeric-looking name is not a literal.
-            Some(NiaLin::constant(firewall_undeclared_i64_symbol_literal(
-                context, v,
-            )?))
+            // A symbol spelled `-1` is the quoted `|-1|`, never a number: the
+            // unquoted `-1` reaches here as a signed `Numeral`.
+            None
         }
         PTerm::Const(PConst::Numeral(n)) => Some(NiaLin::constant(n.parse::<i64>().ok()?)),
         PTerm::App(op, args) => match (op.as_str(), args.len()) {

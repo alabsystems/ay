@@ -91,6 +91,13 @@
 //! that says less than the source. Enlarging a harvest budget is never a fix
 //! for one of these; it only moves the size at which the lane starts lying.
 
+#[path = "bv_lia_query_interval/flow.rs"]
+mod flow;
+#[path = "bv_lia_query_interval/cases.rs"]
+mod remainder_cases;
+#[path = "bv_lia_query_interval/source_ites.rs"]
+mod source_ites;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};

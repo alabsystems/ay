@@ -18,6 +18,25 @@ impl Solver {
         self.executor.set_produce_proofs(enabled);
     }
 
+    /// Select the Carcara dialect this solver's Alethe documents are spelled
+    /// for (`Executor::set_alethe_dialect`). The default,
+    /// [`AletheDialect::Clean`](crate::api::AletheDialect::Clean), prints the
+    /// spellings Clean's vendored Carcara checks, and an artifact that keeps
+    /// one discloses
+    /// [`CarcaraSurface::CleanDialect`](crate::api::CarcaraSurface::CleanDialect).
+    /// [`AletheDialect::PinnedCarcara`](crate::api::AletheDialect::PinnedCarcara)
+    /// prints the spelling pinned Carcara 9a352ee accepts wherever one exists
+    /// and is true.
+    pub fn set_alethe_dialect(&mut self, dialect: crate::api::AletheDialect) {
+        self.executor.set_alethe_dialect(dialect);
+    }
+
+    /// The dialect selected by [`Self::set_alethe_dialect`].
+    #[must_use]
+    pub fn alethe_dialect(&self) -> crate::api::AletheDialect {
+        self.executor.alethe_dialect()
+    }
+
     /// Collect a diagnostic proof surface without making successful proof
     /// translation a prerequisite for publishing an independently certified
     /// verdict.
@@ -35,6 +54,20 @@ impl Solver {
     /// `unsat` result.
     pub fn set_best_effort_produce_proofs(&mut self, step_budget: u64) {
         self.executor.set_best_effort_produce_proofs(step_budget);
+    }
+
+    /// [`Solver::set_best_effort_produce_proofs`], and also keep the
+    /// solver's own refutation for Explicit-mode interpolation
+    /// ([`Solver::get_interpolants_for_masks`]).
+    ///
+    /// The artifact proof and every verdict are exactly those of best-effort
+    /// production. The extra refutation is taken before any presentation pass
+    /// re-spells, demotes or poisons it for an external checker, and its
+    /// preprocessed `assume` leaves are attributed to the caller's groups
+    /// through the sources the preprocessing recorded. It is not an
+    /// exportable artifact; callers validate what they extract.
+    pub fn set_interpolation_proofs(&mut self, step_budget: u64) {
+        self.executor.set_interpolation_proofs(step_budget);
     }
 
     /// Enable or disable unsat core production.

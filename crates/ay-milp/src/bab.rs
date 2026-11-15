@@ -22,6 +22,8 @@ use crate::simplex::{Candidate, FloatLp, NbBound, SimplexStatus, WarmSolveMode};
 
 mod affine;
 mod diagnostic_seed;
+#[path = "bab/early_propagation.rs"]
+mod early_propagation;
 mod hybrid_history;
 mod mas74_class;
 mod pump_iteration_budget;
@@ -935,7 +937,15 @@ fn propagate_branch_rows_many(
     node_lower: &mut [f64],
     node_upper: &mut [f64],
 ) -> bool {
-    propagate_branch_rows_many_t(model, col_rows, seeds, node_lower, node_upper, &mut NoDeps)
+    propagate_branch_rows_many_t(
+        model,
+        col_rows,
+        seeds,
+        node_lower,
+        node_upper,
+        &mut NoDeps,
+        &mut early_propagation::Control::Legacy,
+    )
 }
 
 fn propagate_branch_rows_t<T: PropDeps>(
@@ -953,6 +963,7 @@ fn propagate_branch_rows_t<T: PropDeps>(
         node_lower,
         node_upper,
         deps,
+        &mut early_propagation::Control::Legacy,
     )
 }
 
@@ -963,12 +974,13 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
     node_lower: &mut [f64],
     node_upper: &mut [f64],
     deps: &mut T,
+    control: &mut early_propagation::Control,
 ) -> bool {
     if seeds.is_empty() || seeds.iter().all(|&j| col_rows.get(j).is_none()) {
         return true;
     }
-    let max_sweeps = PROP_MAX_SWEEPS_CFG.load(std::sync::atomic::Ordering::Relaxed);
-    let max_queue = PROP_MAX_QUEUE_CFG.load(std::sync::atomic::Ordering::Relaxed);
+    let max_sweeps = control.rows(PROP_MAX_SWEEPS_CFG.load(std::sync::atomic::Ordering::Relaxed));
+    let max_queue = control.queue(PROP_MAX_QUEUE_CFG.load(std::sync::atomic::Ordering::Relaxed));
     // Diagnostic counters (trace-gated; `diag` is a run constant so the branch
     // predicts perfectly and the off-trace path does zero atomic RMWs).
     let diag = PROP_DIAG_ON.load(std::sync::atomic::Ordering::Relaxed);
@@ -980,7 +992,7 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
     // Deterministic FIFO worklist of columns whose bounds changed; `queued` keeps a
     // column from sitting in the list twice, and the sweep budget bounds the total
     // work regardless of how the cascade branches.
-    let mut queue: Vec<usize> = Vec::with_capacity(seeds.len());
+    let mut queue: Vec<usize> = Vec::with_capacity(control.queue_capacity(seeds.len(), max_queue));
     let mut queued = vec![false; model.num_cols()];
     for &j in seeds {
         if j < queued.len() && col_rows.get(j).is_some() && !queued[j] {
@@ -998,7 +1010,11 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
             continue;
         };
         for &r in rows {
+            if !control.before_row() {
+                return true;
+            }
             if sweeps >= max_sweeps {
+                control.row_limit();
                 if diag {
                     PROP_BUDGET_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1009,6 +1025,7 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
                 PROP_SWEEP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let (coeffs, lb, ub) = model.row(Row(r));
+            control.visit(r, coeffs.len());
             // SERIAL-3 WIDE-ROW STUDY (2026-07-23): retaining the 64-nnz cap is
             // deliberate, not an unexamined stack-size artifact. A sound
             // heap-backed path was measured through 518 nnz on every prop-on
@@ -1073,6 +1090,7 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
                 nt += 1;
             }
             if !ok || !minact.is_finite() || !maxact.is_finite() || !mags.is_finite() {
+                control.invalid_row();
                 continue;
             }
             // The sums' own accumulation error, spent once, outward on both sides.
@@ -1083,10 +1101,12 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
             // side being summed (an infinite extremum absorbs any finite bound).
             if lb.is_finite() && max_inf == 0 && maxact < lb {
                 deps.conflict();
+                control.conflict();
                 return false;
             }
             if ub.is_finite() && min_inf == 0 && minact > ub {
                 deps.conflict();
+                control.conflict();
                 return false;
             }
             // Tighten the row's columns. Over `Σ a_i x_i <= ub`, column c may use at most
@@ -1154,8 +1174,14 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
                 }
                 if node_lower[ci] > node_upper[ci] {
                     deps.conflict();
+                    control.conflict();
                     return false; // one-sided tightenings crossed: the box is rigorously empty
                 }
+                control.tightened(
+                    model.col_kind(Col(c)),
+                    (old_lo, old_up),
+                    (node_lower[ci], node_upper[ci]),
+                );
                 // Cascade on a MATERIAL move only. Integral moves are whole granules;
                 // a continuous move must clear a relative threshold so epsilon-chatter
                 // (each tightening re-inflates by ulps) can never churn the queue.
@@ -1175,8 +1201,11 @@ fn propagate_branch_rows_many_t<T: PropDeps>(
                         if queue.len() < max_queue {
                             queued[ci] = true;
                             queue.push(ci);
-                        } else if diag {
-                            PROP_QUEUE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            control.queue_limit();
+                            if diag {
+                                PROP_QUEUE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -5134,6 +5163,13 @@ fn prepare_shared_binary_prefix_relaxations(
         return frontier;
     }
 
+    let Ok(Some(mut budget)) = crate::compute::Workers::acquire(workers, || {
+        worker_deadline.is_some_and(|limit| Instant::now() >= limit)
+    }) else {
+        return frontier;
+    };
+    let workers = budget.count();
+
     struct Task {
         rank: usize,
         lower: Vec<f64>,
@@ -5193,84 +5229,74 @@ fn prepare_shared_binary_prefix_relaxations(
     // the serial path ran them from `SolveOpts`, which is the kind of
     // discrepancy that makes a measurement lie.
     let caller_tuning = crate::tune::caller_profile();
-    let (worker_results, spawn_failures, panics) = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        let mut spawn_failures = 0usize;
-        for (worker, (worker_lp, worker_jobs)) in worker_lps.into_iter().zip(jobs).enumerate() {
-            let warm = Arc::clone(&warm);
-            match std::thread::Builder::new()
-                .name(format!("ay-prefix-{worker}"))
-                .stack_size(PREFIX_WORKER_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    let _tuned = crate::tune::activate_caller(caller_tuning);
-                    let mut results = Vec::with_capacity(worker_jobs.len());
-                    let total = worker_jobs.len();
-                    for (position, task) in worker_jobs.into_iter().enumerate() {
-                        let now = Instant::now();
-                        if worker_deadline.is_some_and(|limit| now >= limit) {
-                            break;
-                        }
-                        // Fixed worker ownership plus equal remaining slices is
-                        // deterministic and guarantees every owned rank a turn.
-                        let remaining_jobs = total - position;
-                        let task_deadline = worker_deadline.map(|outer| {
-                            let left = outer.saturating_duration_since(now);
-                            now.checked_add(left.mul_f64(1.0 / remaining_jobs as f64))
-                                .unwrap_or(outer)
-                                .min(outer)
-                        });
-                        let candidate = {
-                            let _caller = crate::simplex::CallerScope::new(1);
-                            // Iteration ledger: prefix workers solve NODE LPs.
-                            // The tag is thread-local and the counters global,
-                            // so a multi-worker run reports the sum.
-                            let _ledger = crate::simplex::PhaseScope::new(crate::simplex::PH_NODE);
-                            worker_lp.solve_bounded_with_mode(
-                                &task.lower,
-                                &task.upper,
-                                Some((&warm.0, &warm.1)),
-                                WarmSolveMode::PrimalProofContinuation,
-                                task_deadline,
-                            )
-                        };
-                        let verified_empty = candidate.status == SimplexStatus::PrimalInfeasible
-                            && safe_farkas_proves_empty_before(
-                                &worker_lp,
-                                &candidate.farkas,
-                                &task.lower,
-                                &task.upper,
-                                task_deadline,
-                            );
-                        // Work finishing outside the common outer deadline has
-                        // no authority and is not retained as advice.
-                        if worker_deadline.is_none_or(|limit| Instant::now() <= limit) {
-                            results.push(WorkerResult {
-                                rank: task.rank,
-                                prepared: PreparedNodeRelaxation {
-                                    lower: task.lower,
-                                    upper: task.upper,
-                                    candidate,
-                                },
-                                verified_empty,
-                            });
-                        }
-                    }
-                    results
-                }) {
-                Ok(handle) => handles.push(handle),
-                Err(_) => spawn_failures += 1,
+    let inputs: Vec<_> = worker_lps.into_iter().zip(jobs).collect();
+    let Ok(run) = budget.run(
+        inputs,
+        "ay-prefix",
+        Some(PREFIX_WORKER_STACK_BYTES),
+        |(worker_lp, worker_jobs)| {
+            let _tuned = crate::tune::activate_caller(caller_tuning);
+            let mut results = Vec::with_capacity(worker_jobs.len());
+            let total = worker_jobs.len();
+            for (position, task) in worker_jobs.into_iter().enumerate() {
+                let now = Instant::now();
+                if worker_deadline.is_some_and(|limit| now >= limit) {
+                    break;
+                }
+                // Fixed worker ownership plus equal remaining slices is
+                // deterministic and guarantees every owned rank a turn.
+                let remaining_jobs = total - position;
+                let task_deadline = worker_deadline.map(|outer| {
+                    let left = outer.saturating_duration_since(now);
+                    now.checked_add(left.mul_f64(1.0 / remaining_jobs as f64))
+                        .unwrap_or(outer)
+                        .min(outer)
+                });
+                let candidate = {
+                    let _caller = crate::simplex::CallerScope::new(1);
+                    // Iteration ledger: prefix workers solve NODE LPs.
+                    // The tag is thread-local and the counters global,
+                    // so a multi-worker run reports the sum.
+                    let _ledger = crate::simplex::PhaseScope::new(crate::simplex::PH_NODE);
+                    worker_lp.solve_bounded_with_mode(
+                        &task.lower,
+                        &task.upper,
+                        Some((&warm.0, &warm.1)),
+                        WarmSolveMode::PrimalProofContinuation,
+                        task_deadline,
+                    )
+                };
+                let verified_empty = candidate.status == SimplexStatus::PrimalInfeasible
+                    && safe_farkas_proves_empty_before(
+                        &worker_lp,
+                        &candidate.farkas,
+                        &task.lower,
+                        &task.upper,
+                        task_deadline,
+                    );
+                // Work finishing outside the common outer deadline has
+                // no authority and is not retained as advice.
+                if worker_deadline.is_none_or(|limit| Instant::now() <= limit) {
+                    results.push(WorkerResult {
+                        rank: task.rank,
+                        prepared: PreparedNodeRelaxation {
+                            lower: task.lower,
+                            upper: task.upper,
+                            candidate,
+                        },
+                        verified_empty,
+                    });
+                }
             }
-        }
-        let mut results = Vec::new();
-        let mut panics = 0usize;
-        for handle in handles {
-            match handle.join() {
-                Ok(mut worker) => results.append(&mut worker),
-                Err(_) => panics += 1,
-            }
-        }
-        (results, spawn_failures, panics)
-    });
+            results
+        },
+        |_| {},
+    ) else {
+        return frontier;
+    };
+    let spawn_failures = run.spawn_failures;
+    let panics = run.panics;
+    let worker_results = run.results.into_iter().flatten();
 
     let mut by_rank: Vec<Option<WorkerResult>> = (0..frontier.len()).map(|_| None).collect();
     for result in worker_results {
@@ -6284,8 +6310,7 @@ fn cut_round_warm_basis(
 ///
 /// # Read LIVE, once per `add_root_cuts`, and that is deliberate
 ///
-/// This is an ARM SELECTOR, and `tests/env_ledger.rs::the_live_env_read_surface_does_not_grow`
-/// states the rule for those explicitly: caching one in a `OnceLock` latches the first
+/// This is an ARM SELECTOR: caching one in a `OnceLock` latches the first
 /// value the process happens to read, which makes the arm unswitchable inside a single
 /// process — the A/B campaign then measures one arm twice and records the result as a
 /// finding. That is the `AY_MILP_NO_CUTZ` failure mode the whole ledger exists to
@@ -13103,6 +13128,28 @@ fn set_partition_construct(
 /// against the FULL model with `check_point` (cut rows included) before it is kept; a move that
 /// fails the check is reverted, never returned. Returns the improved point, or `None` if it could
 /// not better the input (or the model is not pure set partitioning — it self-gates).
+///
+/// THE REGION-GRANULARITY STOP, as a pure predicate so it can be tested without a clock race.
+///
+/// `now >= deadline` is the pre-existing exit; `now - last_progress >= stall` is the one added on
+/// 2026-08-28 to make the documented stall policy reachable inside a descent (see the call site for
+/// why `'outer`'s head cannot reach it on a dense-row model).
+///
+/// WHAT A TEST OF THIS CAN AND CANNOT SAY. It pins the SEMANTICS — that a stall exit exists without
+/// a deadline, that a just-landed move suppresses it, and that it is a strict widening of the old
+/// deadline-only rule (one-directional: everything that used to stop still stops). It does NOT pin
+/// end-to-end reachability, because whether a real descent's single pass outlives `stall` is a
+/// property of the model. That half is measurement: nw04 at `--limit 300` and `--limit 600`, where
+/// the LNS region attempts stop growing with the caller's budget.
+fn region_stop(
+    now: Instant,
+    deadline: Option<Instant>,
+    last_progress: Instant,
+    stall: Duration,
+) -> bool {
+    deadline.is_some_and(|d| now >= d) || now.saturating_duration_since(last_progress) >= stall
+}
+
 fn set_partition_improve(
     model: &Model,
     lp_x: &[f64],
@@ -13388,11 +13435,46 @@ fn set_partition_improve(
                 // region attempts, the same tree (2,571 nodes) and the same answer (16862).
                 //
                 // Checking it here makes an EXISTING, documented policy reachable; it adds
-                // no new budget. Wherever the window is shorter than `stall` the deadline
-                // still binds first and the walk is bit-identical (that is every model at
-                // the node gate's `--limit 60`, and nw04's own `--limit 60` arm).
-                if deadline.is_some_and(|d| Instant::now() >= d) || last_progress.elapsed() >= stall
-                {
+                // no new budget. Wherever the LNS window is shorter than `stall` the
+                // deadline still binds first and the walk is bit-identical — nw04's own
+                // `--limit 60` arm is the measured case.
+                //
+                // CORRECTED 2026-08-28: this comment used to add "that is every model at
+                // the node gate's `--limit 60`". The node gate does not run at 60.
+                // `scripts/milp_node_gate.py:433` gives `--limit` a default of **300.0**,
+                // so on the gate corpus the check IS reachable on the models whose window
+                // exceeds `stall`; it simply does not fire. Gate-inertness is a
+                // MEASUREMENT (`--tier all` exact on all twenty, both before and after),
+                // not a consequence of a window bound that does not exist: nw04's own
+                // window at `--limit 300` is ~30 s, twice `stall`, and the check is
+                // reachable there — it is where the -12 s below comes from.
+                //
+                // AND THE CUT IS ITSELF LOAD-COUPLED, because it is only evaluated at
+                // REGION granularity. Re-measured 2026-08-28 on a busy box, one binary,
+                // the shipped `--splns-stall-secs` knob used to build the BASE arm
+                // (100000 s, so neither stall check can fire), arms interleaved
+                // base,cand, 2 reps, 1-minute load 34.3..132.7 — LNS exit time:
+                //
+                //   --limit  60   BASE 7.91 / 6.53 s   CAND 7.29 / 6.60 s   (control:
+                //                 window < stall, the guard cannot fire, and does not)
+                //   --limit 300   BASE 29.38 / 30.27   CAND 29.58 / 19.47   (cut 1 of 2)
+                //   --limit 600   BASE 59.81 / 60.74   CAND 17.61 / 40.18   (cut 2 of 2)
+                //
+                // BASE's exit is 0.1 x limit in 6 of 6 runs, recovering
+                // SPLNS_TIME_SHARE_FAST_TREE to two figures. But at load ~100 a single
+                // `recover_region` costs ~10 s here (tried=3 over 29 s), so a 15 s window
+                // can be STRADDLED between two region boundaries and the walk reaches its
+                // deadline anyway — which is what CAND / limit 300 / rep 1 did. On a quiet
+                // box the commit that added this measured a hard cap at 29.0..29.4 s over
+                // a 2x budget swing; under contention the honest statement is "cut in 3 of
+                // 4 runs at limits >= 300, never at limit 60". Say the range, not the best
+                // case.
+                //
+                // What did NOT move, in either arm, at limits 300 and 600: OPTIMAL 16862
+                // and 2,571 nodes, 8 of 8. The guard buys wall, not tree. And `moves=0,
+                // passes=1, kicks=0` in 11 of 12 runs — `'outer` iterated ZERO times, so
+                // the head's stall check never executed, which is the whole premise.
+                if region_stop(Instant::now(), deadline, last_progress, stall) {
                     break 'outer;
                 }
                 let mut queued_list: Vec<u32> = Vec::new();
@@ -13480,10 +13562,23 @@ fn set_partition_improve(
                     // is what makes the region-granularity stall check SAFE for a long
                     // productive pass: `recover_region` only ever returns a strictly cheaper
                     // re-cover (`new_cost < removed_cost - 1e-6` is checked above), so a walk
-                    // that is still landing moves cannot be cut, however long its single pass
-                    // runs. Without this the guard would read only `best_val` updates, which
-                    // land AFTER the whole descent converges, and a 60s-stall wide-tall walk
-                    // (air05) mid-pass would be severed exactly where it is working.
+                    // whose landed moves are less than `stall` APART cannot be cut. Without
+                    // this the guard would read only `best_val` updates, which land AFTER the
+                    // whole descent converges, and a 60s-stall wide-tall walk (air05) mid-pass
+                    // would be severed exactly where it is working.
+                    //
+                    // SAY THE QUALIFIER. An earlier draft of this comment read "a walk that is
+                    // still landing moves cannot be cut, HOWEVER LONG its single pass runs",
+                    // and that is false as written: the guarantee is about the GAP between
+                    // landed moves, not about the pass. A pass that lands a move every 20 s on
+                    // a 15 s stall IS cut, and it is cut mid-descent, where `best_val` and
+                    // `best_chosen` have not yet been synced (that happens only after the
+                    // inner loop converges, ~200 lines below), so the accumulated gain of the
+                    // current pass is DISCARDED. Which is also why "one-directional" is a
+                    // statement about quality and not only about wall: CAND's walk is a
+                    // prefix of BASE's, so `best_val` can only come back weakly WORSE, traded
+                    // for the time the caller gets back. On nw04 that trade is free because
+                    // the walk is dry (`moves=0`); on a wet walk it would not be.
                     //
                     // It touches ONLY `last_progress`. `last_gain`, which `'outer`'s head
                     // reads, keeps its exact previous meaning, so nothing that used to stop
@@ -21016,7 +21111,6 @@ pub(crate) fn solve_milp_shared_binary_prefix_proof_first(
 /// The cure is structural, not a repair: there is now exactly one place the
 /// devices live, both top-level entries call it FIRST, and a seed is data the
 /// search consumes rather than a switch that selects which search runs.
-/// `structural_prologue_is_called_by_every_top_level_entry` pins that.
 fn structural_prologue(model: &Model, opts: &SolveOpts) -> Option<Outcome> {
     // EXACT LATTICE PROOF for the market-split min-total-slack family (markshare1):
     // the LP bound is 0 and NO cut family moves it (MIR/strong-CG/GMI/cover all
@@ -22724,6 +22818,28 @@ fn solve_milp_in_with_margin_proof(
 }
 
 fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
+    let source = request.model;
+    let deadline = request.opts.deadline;
+    let mut capture = if request.mode.depth == 0 && !request.mode.cheap && !request.mode.projected {
+        request
+            .opts
+            .cut_capture
+            .as_ref()
+            .and_then(|owner| owner.enter(request.model))
+    } else {
+        None
+    };
+    let outcome = solve_milp_in_body(request, capture.as_mut());
+    if let Some(capture) = capture {
+        capture.finish(&outcome, source, deadline);
+    }
+    outcome
+}
+
+fn solve_milp_in_body(
+    request: MilpSolveRequest<'_>,
+    cut_capture: Option<&mut crate::integer_cut_capture::NativeCutLease>,
+) -> Outcome {
     let MilpSolveRequest {
         model,
         opts,
@@ -22789,6 +22905,7 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         };
     let root_formulation::RootFormulation {
         model: cut_model,
+        root_cut_rows,
         mode,
         market,
         proof_first_workers,
@@ -22804,6 +22921,9 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         bottleneck_granularity: bottleneck_gran,
         work_started: _t_pre,
     } = root_formulation;
+    if let Some(capture) = cut_capture {
+        capture.record_root(&cut_model, root_cut_rows, opts.deadline);
+    }
     let ms_shape = market.is_split();
     let proof_first_prefix = proof_first_workers.is_some();
     let model = &cut_model;
@@ -22985,9 +23105,15 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         implication_policy,
         column_rows: prop_col_rows,
         pruned: mut node_prop_pruned,
+        early: mut early_prop,
     } = search_controls::propagation_state(search_controls::PropagationRequest {
         model,
         mode,
+        activation: if margin_proof_target.is_some() {
+            early_propagation::Activation::MarkedMargin
+        } else {
+            early_propagation::Activation::Legacy
+        },
         symmetry: sym.as_ref(),
         root_lower: &root_lower,
         root_upper: &root_upper,
@@ -24430,6 +24556,32 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         // strengthens this node's LP bound and every heuristic that reads it; an emptied box
         // prunes without an LP, under the same fails-closed capture license as the discard above.
         crate::acensus::mark(4);
+        if prop_on && nodes < prop_arm {
+            let seeds = node.structural_seeds.as_deref().or_else(|| {
+                node.from_branch
+                    .as_ref()
+                    .map(|(j, _, _)| std::slice::from_ref(j))
+            });
+            if let Some(seeds) = seeds {
+                if early_prop.propagate(
+                    model,
+                    nodes,
+                    &prop_col_rows,
+                    seeds,
+                    &mut node_lower,
+                    &mut node_upper,
+                    deadline,
+                    open_bytes,
+                    mem_budget,
+                ) == Some(false)
+                {
+                    pruned += 1;
+                    // Same original-region closure; no new learning lane or sibling loss.
+                    capture.close(node.cap);
+                    continue;
+                }
+            }
+        }
         if prop_on && nodes >= prop_arm {
             let propagated = if let Some(seeds) = node.structural_seeds.as_deref() {
                 // The structural-seed cascade tightens MANY columns at once, so it
@@ -29744,8 +29896,9 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
             );
         }
     }
-    if trace && mode.depth == 0 {
+    if (trace || early_prop.report.attempts > 0) && mode.depth == 0 {
         use std::sync::atomic::Ordering::Relaxed;
+        let early = &early_prop.report;
         let calls = PROP_CALLS_TOTAL.load(Relaxed);
         let sweeps = PROP_SWEEP_TOTAL.load(Relaxed);
         let tighten = PROP_TIGHTEN_TOTAL.load(Relaxed);
@@ -29757,8 +29910,16 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         );
         eprintln!(
             "--trace prop-fixpoint-diag: nodes={nodes} caps={cs}/{cq} calls={calls} sweeps={sweeps} tightenings={tighten} \
-             budget-truncations={bhit} queue-overflows={qhit} (sweeps/call={:.1})",
-            sweeps as f64 / calls.max(1) as f64
+             budget-truncations={bhit} queue-overflows={qhit} (sweeps/call={:.1}) \
+             legacy-diag-enabled={trace} early-attempts={} early-completed={} early-rows={} \
+             early-terms={} early-wide={} early-invalid={} early-tighten={} early-binary-fixings={} \
+             early-conflicts={} early-prunes={} early-row-cap={} early-queue-cap={} early-deadline={} \
+             early-memory-decline={} early-ms={} early-stop={}",
+            sweeps as f64 / calls.max(1) as f64,
+            early.attempts, early.completed, early.visits, early.terms,
+            early.skipped_wide, early.invalid_rows, early.tightenings, early.binary_fixings,
+            early.conflicts, early.accepted_prunes, early.row_limits, early.queue_limits, early.deadline_limits,
+            early.memory_declines, early.elapsed.as_millis(), early.stop
         );
     }
     let symmetry_engaged = sym_rows_added
@@ -29863,105 +30024,6 @@ mod tests {
         (*engine)
             .with_heur_share(0.0)
             .expect("zero is a valid heuristic share")
-    }
-
-    // ---- CLAUSE A: THE STRUCTURAL PROLOGUE HAS NO BYPASS ----
-    //
-    // The `markshare_5_0` regression was not a wrong policy, it was a SECOND
-    // PATH: `solve_milp_seeded` reached `solve_milp_in` without traversing the
-    // structural block, so a lane that DECLINED the verdict could delete the
-    // lattice proof by leaving an incumbent seed behind. Repairing the policy
-    // would leave the second path in place for the next author to fall into.
-    //
-    // These two tests pin the SHAPE instead, at the source level, in the style
-    // of `outcome.rs`'s `cli_json_coverage` guard. They are deliberately crude:
-    // a crude test that fires is worth more here than a subtle one that does not.
-
-    /// Every top-level `solve_milp*` entry must reach `structural_prologue` —
-    /// either by calling it directly or by delegating to an entry that does.
-    ///
-    /// A new entry point that forgets it fails HERE, at compile-and-test time,
-    /// rather than by silently losing a proof on one instance family.
-    #[test]
-    fn structural_prologue_is_called_by_every_top_level_entry() {
-        let src = include_str!("bab.rs");
-        // Entries that own a top-level user solve. `solve_milp_in*` are the
-        // PRIVATE inner drivers and are deliberately absent: reaching one
-        // without the prologue is exactly the defect.
-        let entries = [
-            "pub(crate) fn solve_milp(",
-            "pub(crate) fn solve_milp_hinted(",
-            "pub(crate) fn solve_milp_advised(",
-            "pub(crate) fn solve_milp_shared_binary_prefix(",
-            "pub(crate) fn solve_milp_margin_proof(",
-            "pub(crate) fn solve_milp_shared_binary_prefix_proof_first(",
-            "pub(crate) fn solve_milp_seeded(",
-        ];
-        // A delegating entry is satisfied by the entry it delegates to; a
-        // terminal entry must call the prologue in its own body.
-        let delegates_to_prologue_bearer = [
-            "solve_milp_advised_with_prefix(",
-            "solve_milp_advised(",
-            "solve_milp_hinted(",
-        ];
-        for entry in entries {
-            let start = src.find(entry).unwrap_or_else(|| {
-                panic!(
-                    "top-level entry `{entry}` no longer exists; \
-                     update this guard deliberately, do not delete it"
-                )
-            });
-            // Body = from the signature to the next top-level `\n}` line.
-            let body_start = start + entry.len();
-            let end = src[body_start..]
-                .find("\n}\n")
-                .map(|o| body_start + o)
-                .unwrap_or(src.len());
-            let body = &src[body_start..end];
-            let reaches = body.contains("structural_prologue(")
-                || delegates_to_prologue_bearer
-                    .iter()
-                    .any(|d| body.contains(d));
-            assert!(
-                reaches,
-                "CLAUSE A VIOLATED: `{entry}` neither calls `structural_prologue` nor \
-                 delegates to an entry that does. That is the exact shape of the \
-                 markshare_5_0 defect: a second path to the search that skips the \
-                 exact structural devices."
-            );
-        }
-    }
-
-    /// `solve_milp_in` is the private inner driver. Every call to it from a
-    /// TOP-LEVEL entry must sit below a `structural_prologue` call in that same
-    /// body. This is the half the first test cannot see: an entry could call the
-    /// prologue and then, on some branch, reach the inner driver anyway — which
-    /// is fine — but an entry that reaches it with NO prologue call at all is
-    /// the bug.
-    #[test]
-    fn seeded_entry_runs_the_prologue_before_it_reaches_the_inner_driver() {
-        let src = include_str!("bab.rs");
-        let start = src
-            .find("pub(crate) fn solve_milp_seeded(")
-            .expect("solve_milp_seeded exists");
-        let body_start = start;
-        let end = src[body_start..]
-            .find("\n}\n")
-            .map(|o| body_start + o)
-            .expect("solve_milp_seeded has a body");
-        let body = &src[body_start..end];
-        let prologue_at = body.find("structural_prologue(").expect(
-            "CLAUSE A VIOLATED: solve_milp_seeded does not call structural_prologue at all",
-        );
-        let driver_at = body
-            .find("solve_milp_in(")
-            .expect("solve_milp_seeded reaches the inner driver");
-        assert!(
-            prologue_at < driver_at,
-            "CLAUSE A VIOLATED: solve_milp_seeded reaches `solve_milp_in` at byte {driver_at} \
-             but only calls `structural_prologue` at byte {prologue_at}. The seed would \
-             again select which search runs instead of being data the search consumes."
-        );
     }
 
     // ---- FEASIBILITY-MODE DETECTION (`feasibility_conflict_class`) ----
@@ -33696,6 +33758,66 @@ mod tests {
             );
             drop(value);
         }
+    }
+
+    /// THE REGION-GRANULARITY STALL EXIT, pinned. Before this there was NO test of it anywhere,
+    /// and the node ratchet is demonstrably blind to it: it stays green with `--splns-stall-secs`
+    /// set to 1, so "gates green" carried zero information about this code path.
+    ///
+    /// This is deliberately a test of the PREDICATE, not of a timed walk. A timed test would have
+    /// to race a real descent against a real clock on a box that runs at 1-minute load 3 to 60,
+    /// and a flaky guard is worse than none.
+    #[test]
+    fn region_stop_is_reachable_without_a_deadline_and_only_ever_stops_earlier() {
+        let t0 = Instant::now();
+        let stall = Duration::from_secs(15);
+
+        // 1. REACHABILITY. No deadline at all, and the walk still stops once it has been
+        //    `stall` without progress. This is the exit that `'outer`'s head could not deliver
+        //    on a model whose single descent pass outlives the window.
+        assert!(
+            region_stop(t0 + Duration::from_secs(15), None, t0, stall),
+            "a stalled walk with no deadline must stop"
+        );
+        assert!(
+            !region_stop(t0 + Duration::from_millis(14_999), None, t0, stall),
+            "one millisecond short of the window is not a stall"
+        );
+
+        // 2. A LANDED MOVE SUPPRESSES IT. `last_progress` is reset on every accepted move, so a
+        //    walk whose landed moves are less than `stall` apart is never cut — which is the
+        //    exact scope of the safety claim, and is NOT "however long the pass runs".
+        let landed = t0 + Duration::from_secs(14);
+        assert!(
+            !region_stop(t0 + Duration::from_secs(20), None, landed, stall),
+            "a move landed 6s ago must keep the walk alive even 20s into the pass"
+        );
+        //    ... and a walk landing moves 20s apart on a 15s stall IS cut. Stated because the
+        //    original comment claimed the opposite.
+        assert!(
+            region_stop(t0 + Duration::from_secs(20), None, t0, stall),
+            "moves 20s apart do not clear a 15s stall"
+        );
+
+        // 3. ONE-DIRECTIONAL. Everything the old deadline-only rule stopped, this still stops:
+        //    the new predicate is a strict widening, so no walk is ever allowed to run LONGER.
+        let dl = t0 + Duration::from_secs(5);
+        for at in [0u64, 1, 4, 5, 6, 100] {
+            let now = t0 + Duration::from_secs(at);
+            let old = now >= dl;
+            assert!(
+                !old || region_stop(now, Some(dl), now, stall),
+                "the deadline exit must survive: t+{at}s"
+            );
+        }
+
+        // 4. `stall == 0` degenerates to "stop at the first region", which is what
+        //    `--splns-stall-secs 0` asks for and must not panic or wrap.
+        assert!(region_stop(t0, None, t0, Duration::ZERO));
+
+        // 5. NO PANIC when the clocks are read out of order (a `last_progress` in the future
+        //    cannot happen today, but `Instant` subtraction is the classic overflow site).
+        assert!(!region_stop(t0, None, t0 + Duration::from_secs(1), stall));
     }
 
     /// The LNS improver must turn a feasible-but-DEAR cover into a cheaper one, hand back a point the

@@ -479,6 +479,13 @@ impl BVE {
             if use_dirty_filter && !self.candidate_dirty.get(var_idx).copied().unwrap_or(false) {
                 continue;
             }
+            if use_dirty_filter
+                && self.skip_rejected_at_bound
+                && self.rejected_at_bound.get(var_idx).copied()
+                    == Some(self.growth_bound.min(u8::MAX as usize) as u8)
+            {
+                continue;
+            }
             let Some((var, _, _)) = self.candidate_occurrence_counts(var_idx, vals, frozen) else {
                 continue;
             };

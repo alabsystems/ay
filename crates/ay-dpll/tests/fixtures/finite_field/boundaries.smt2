@@ -1,0 +1,7 @@
+(set-logic QF_FF)
+(declare-const x (_ FiniteField 251))
+(assert (= (ff.mul x #f250m251) (as ff-1 (_ FiniteField 251))))
+(assert (= (ff.bitsum #f1m2 #f1m2 #f1m2) #f1m2))
+(assert (= (ff.bitsum #f3m7 #f2m7 #f1m7) #f4m7))
+(check-sat)
+(get-value (x))

@@ -22,6 +22,13 @@ pub(crate) const CHC_OBLIGATION_STRICT_CERT_SCHEMA: &str =
 /// Exact checker surface whose successful complete result authorizes v2 rows.
 pub(crate) const CHC_STRICT_PROOF_BUNDLE_CHECKER: &str = "ay-proof::re_check_bundle_strict";
 
+/// Distinct commitment to the mandatory retained-v4 evidence and exact reader.
+pub(crate) const CHC_OBLIGATION_STRICT_CERT_RETAINED_SCHEMA: &str =
+    "ay.chc-obligation-strict-retained-proof-bundle-cert/v3";
+
+pub(crate) const CHC_STRICT_RETAINED_PROOF_BUNDLE_CHECKER: &str =
+    "ay-proof::re_check_retained_bundle_strict_with_resource_control";
+
 /// Wire form retained by one strict-certificate row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChcObligationStrictCertWire {
@@ -29,6 +36,8 @@ enum ChcObligationStrictCertWire {
     LegacyV1,
     /// Bundle-authoritative row with optional Alethe diagnostics.
     BundleV2,
+    /// Actual retained-v4 bundle commitment; no legacy downgrade or fallback.
+    RetainedV3,
 }
 
 /// Strict proof-bundle commitments for one UNSAT replay obligation.
@@ -40,6 +49,9 @@ enum ChcObligationStrictCertWire {
 /// is an optional presentation digest only; absence is represented explicitly
 /// and never fabricated. Legacy v1 Alethe-required rows remain parseable
 /// without changing the surrounding checked-summary/transcript v1 schemas.
+/// Retained v3 rows bind a separate checker/schema identity and mandatory v4
+/// evidence. Metadata alone never authenticates an external source or proves
+/// that any checker actually ran; fresh source-bound admission remains required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcObligationStrictCert {
@@ -47,7 +59,7 @@ pub struct ChcObligationStrictCert {
     pub alethe_sha256: Option<String>,
     /// SHA-256 commitment to the serialized proof bundle.
     pub bundle_sha256: String,
-    /// Exact serialized bundle schema checked by the v2 authority surface.
+    /// Exact serialized bundle schema checked by the selected authority surface.
     pub proof_bundle_schema: String,
     /// Strict checker verdict — `"verified"` for any recorded cert.
     pub verdict: String,
@@ -71,8 +83,31 @@ impl ChcObligationStrictCert {
         }
     }
 
+    /// Build a retained-v4 commitment AFTER independent exact retained replay.
+    /// This records metadata only; it cannot mint source or proof authority.
+    pub(crate) fn new_retained(
+        alethe_sha256: Option<String>,
+        bundle_sha256: impl Into<String>,
+        verdict: impl Into<String>,
+    ) -> Self {
+        Self {
+            alethe_sha256,
+            bundle_sha256: bundle_sha256.into(),
+            proof_bundle_schema: ay_dpll::api::RETAINED_PROOF_BUNDLE_SCHEMA.to_string(),
+            verdict: verdict.into(),
+            wire: ChcObligationStrictCertWire::RetainedV3,
+        }
+    }
+
     pub(super) fn is_current_bundle_commitment(&self) -> bool {
-        matches!(self.wire, ChcObligationStrictCertWire::BundleV2)
+        matches!(
+            self.wire,
+            ChcObligationStrictCertWire::BundleV2 | ChcObligationStrictCertWire::RetainedV3
+        )
+    }
+
+    pub(super) fn is_retained_bundle_commitment(&self) -> bool {
+        matches!(self.wire, ChcObligationStrictCertWire::RetainedV3)
     }
 
     fn new_legacy(
@@ -104,6 +139,20 @@ impl ChcObligationStrictCert {
                     "schema": CHC_OBLIGATION_STRICT_CERT_SCHEMA,
                     "schema_version": 2,
                     "proof_checker": CHC_STRICT_PROOF_BUNDLE_CHECKER,
+                    "proof_bundle_schema": self.proof_bundle_schema,
+                    "bundle_sha256": self.bundle_sha256,
+                    "verdict": self.verdict,
+                });
+                if let Some(alethe_sha256) = &self.alethe_sha256 {
+                    value["alethe_sha256"] = serde_json::Value::String(alethe_sha256.clone());
+                }
+                value
+            }
+            ChcObligationStrictCertWire::RetainedV3 => {
+                let mut value = serde_json::json!({
+                    "schema": CHC_OBLIGATION_STRICT_CERT_RETAINED_SCHEMA,
+                    "schema_version": 3,
+                    "proof_checker": CHC_STRICT_RETAINED_PROOF_BUNDLE_CHECKER,
                     "proof_bundle_schema": self.proof_bundle_schema,
                     "bundle_sha256": self.bundle_sha256,
                     "verdict": self.verdict,
@@ -162,6 +211,9 @@ impl ChcObligationStrictCert {
             (CHC_OBLIGATION_STRICT_CERT_SCHEMA, 2) => {
                 Self::parse_bundle(object, label, verdict, reasons)
             }
+            (CHC_OBLIGATION_STRICT_CERT_RETAINED_SCHEMA, 3) => {
+                Self::parse_retained(object, label, verdict, reasons)
+            }
             _ => {
                 reasons.push(format!(
                     "{label} has unsupported strict-cert schema/version {}/{}",
@@ -179,6 +231,14 @@ impl ChcObligationStrictCert {
         verdict: String,
         reasons: &mut Vec<String>,
     ) -> Option<Self> {
+        // A retained/current bundle document cannot hide its incompatible
+        // checker/schema by merely relabelling itself as historical Alethe v1.
+        if object.contains_key("proof_checker") || object.contains_key("proof_bundle_schema") {
+            reasons.push(format!(
+                "{label} legacy v1 contains bundle authority fields"
+            ));
+            return None;
+        }
         let alethe_sha256 = sha256_string_field(
             object,
             "alethe_sha256",
@@ -244,6 +304,45 @@ impl ChcObligationStrictCert {
         ))
     }
 
+    fn parse_retained(
+        object: &serde_json::Map<String, serde_json::Value>,
+        label: &str,
+        verdict: String,
+        reasons: &mut Vec<String>,
+    ) -> Option<Self> {
+        let reason_count = reasons.len();
+        expect_json_string(
+            object,
+            "proof_checker",
+            CHC_STRICT_RETAINED_PROOF_BUNDLE_CHECKER,
+            &format!("{label}.proof_checker"),
+            reasons,
+        );
+        expect_json_string(
+            object,
+            "proof_bundle_schema",
+            ay_dpll::api::RETAINED_PROOF_BUNDLE_SCHEMA,
+            &format!("{label}.proof_bundle_schema"),
+            reasons,
+        );
+        let alethe_sha256 = optional_sha256_field(
+            object,
+            "alethe_sha256",
+            &format!("{label}.alethe_sha256"),
+            reasons,
+        );
+        let bundle_sha256 = sha256_string_field(
+            object,
+            "bundle_sha256",
+            &format!("{label}.bundle_sha256"),
+            reasons,
+        )?;
+        if reasons.len() != reason_count {
+            return None;
+        }
+        Some(Self::new_retained(alethe_sha256, bundle_sha256, verdict))
+    }
+
     pub(super) fn identity_input(&self) -> String {
         match self.wire {
             ChcObligationStrictCertWire::LegacyV1 => format!(
@@ -269,6 +368,25 @@ impl ChcObligationStrictCert {
                     json_string(&self.verdict),
                 )
             }
+            ChcObligationStrictCertWire::RetainedV3 => {
+                let (alethe_present, alethe_sha256) = self
+                    .alethe_sha256
+                    .as_deref()
+                    .map_or((false, "none"), |digest| (true, digest));
+                format!(
+                    "{}\nschema_version=3\nproof_checker={}\nproof_bundle_schema={}\nbundle_sha256={}\nalethe_present={}\nalethe_sha256={}\nverdict={}\n",
+                    CHC_OBLIGATION_STRICT_CERT_RETAINED_SCHEMA,
+                    json_string(CHC_STRICT_RETAINED_PROOF_BUNDLE_CHECKER),
+                    json_string(&self.proof_bundle_schema),
+                    self.bundle_sha256,
+                    alethe_present,
+                    alethe_sha256,
+                    json_string(&self.verdict),
+                )
+            }
         }
     }
 }
+
+#[cfg(test)]
+mod retained_tests;

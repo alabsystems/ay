@@ -23,7 +23,8 @@ cover everything.
 Usage:
   scripts/solver_portfolio.py --dir <mps_dir> --timeout 60
   scripts/solver_portfolio.py <a.mps> <b.mps> ... --timeout 60
-  AY = ./target/release/examples/mps_solve  (built via: cargo build --release -p ay-milp --examples)
+  AY = ./target/release/examples/mps_solve  (built via: targo --unverified build --release -p ay-milp --examples;
+        `cargo build` with the same arguments without the Trust toolchain)
 """
 from __future__ import annotations
 import argparse, glob, json, math, os, sys, time, pathlib

@@ -104,6 +104,18 @@ pub enum SortInner {
     /// Uninterpreted sort (user-defined opaque type).
     Uninterpreted(String),
 
+    /// By-name reference to an ENCLOSING datatype declaration, for recursive
+    /// fields such as `Level { zero | succ (pred: Level) }`.
+    ///
+    /// Build it with [`Sort::datatype_ref`]. It has meaning only inside the
+    /// field sorts of a [`SortInner::Datatype`] declaration named the same
+    /// (or of a datatype that encloses that position); the datatype signature
+    /// checks resolve it to that declaration and compare structurally. It is
+    /// never equal to [`SortInner::Uninterpreted`] of the same name, and a ref
+    /// with no enclosing declaration of its name (a "dangling" ref) is refused
+    /// wherever a sort is checked or lowered.
+    DatatypeRef(String),
+
     /// Regular language sort (for string constraints).
     RegLan,
 
@@ -178,6 +190,14 @@ impl Sort {
     #[inline]
     pub(crate) fn from_inner(inner: SortInner) -> Self {
         Self(Arc::new(inner))
+    }
+
+    /// Identity of this sort's shared allocation: equal for a sort and its
+    /// clones, and stable while any clone is alive. Identity-keyed tables
+    /// (`execute_direct/memo.rs`) pin the allocation by keeping a clone.
+    #[inline]
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>() as usize
     }
 
     // Constructor methods (bool, bitvec, int, real, array, etc.)
@@ -405,7 +425,9 @@ impl Display for Sort {
             SortInner::FloatingPoint(eb, sb) => {
                 write!(f, "(_ FloatingPoint {eb} {sb})")
             }
-            SortInner::Uninterpreted(name) => write!(f, "{}", format_symbol(name)),
+            SortInner::Uninterpreted(name) | SortInner::DatatypeRef(name) => {
+                write!(f, "{}", format_symbol(name))
+            }
             SortInner::RegLan => write!(f, "RegLan"),
             SortInner::Seq(elem) => write!(f, "(Seq {elem})"),
         }
@@ -430,6 +452,9 @@ impl Display for ArraySort {
 
 #[cfg(feature = "direct")]
 mod core_conversions;
+
+mod datatype_ref;
+pub(crate) use datatype_ref::dangling_datatype_ref_in_declaration;
 
 // Note: The From impls in core_conversions are automatically available as trait impls.
 // No re-export needed.

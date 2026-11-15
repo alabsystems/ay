@@ -166,3 +166,58 @@ fn inc_engine_bmc_step_accumulation_matches_ground_truth() {
          monotone accumulation with per-step scoped properties"
     );
 }
+
+/// Base assertions refuted by three bounds (`y < x`, `x < 0`, `y >= 0`), then
+/// a check inside a push. The theory hears the root facts only once the scope
+/// selector is assumed, so its conflict lies wholly below the current level.
+/// The session solver runs without chronological backtracking, whose 1UIP
+/// found no current-level literal, failed closed and re-derived the conflict
+/// until the deadline: `unknown` after the full wall budget.
+const ROOT_REFUTED_UNDER_PUSH_SCRIPT: &str = "\
+(set-logic QF_LRA)
+(declare-const x Real)
+(declare-const y Real)
+(assert (< y x))
+(assert (< x 0.0))
+(assert (>= y 0.0))
+(push 1)
+(check-sat)
+(pop 1)
+(check-sat)
+";
+
+/// A theory conflict below the current level no longer spins the engine lane.
+/// The verdicts are exact and the work is counted (lifetime SAT conflicts of
+/// the session solver: measured 0, the refutation is found at level 0); the
+/// wall deadline is a hang guard only.
+#[test]
+fn inc_engine_conflict_below_the_current_level_is_decided() {
+    assert_eq!(
+        run_verdicts(ROOT_REFUTED_UNDER_PUSH_SCRIPT, Some(false)),
+        ["unsat", "unsat"],
+        "sanity: the from-scratch lane gives the z3 verdicts"
+    );
+    let mut exec = Executor::new();
+    exec.lra_inc_engine_override = Some(true);
+    exec.set_timeout(Some(SOLVE_TIMEOUT));
+    let mut verdicts = Vec::new();
+    for cmd in &parse(ROOT_REFUTED_UNDER_PUSH_SCRIPT).expect("script parses") {
+        if let Some(out) = exec.execute(cmd).expect("command executes") {
+            verdicts.push(out);
+        }
+    }
+    assert_eq!(
+        verdicts,
+        ["unsat", "unsat"],
+        "root-refuted base under a push"
+    );
+    let conflicts = exec
+        .incr_theory_state
+        .as_ref()
+        .and_then(|state| state.persistent_sat.as_ref())
+        .map_or(0, |sat| sat.total_num_conflicts());
+    assert!(
+        conflicts <= 1_000,
+        "{conflicts} SAT conflicts on a root-refuted base: the below-level loop is back"
+    );
+}

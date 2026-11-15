@@ -21,8 +21,8 @@
 mod check;
 #[cfg(test)]
 mod tests;
-#[cfg(kani)]
-mod verification;
+
+mod counted;
 
 use crate::clause_arena::ClauseArena;
 use crate::literal::Literal;
@@ -30,12 +30,10 @@ use crate::watched::{ClauseRef, WatchedLists};
 
 use check::CheckResult;
 
-#[cfg(not(kani))]
 fn debug_transred_trace_enabled() -> bool {
     ay_core::debug_channel_active(ay_core::DebugChannel::TransredTrace)
 }
 
-#[cfg(not(kani))]
 fn debug_transred_clause() -> Option<u32> {
     // TransredClause is a numeric parameter, not a boolean flag. The clause
     // ID comes from `--debug-transred-clause=N` (B72: the env fallback is
@@ -226,9 +224,6 @@ impl TransRed {
             "BUG: transred work queue not empty at entry (len={})",
             self.work.len(),
         );
-        #[cfg(kani)]
-        let trace = false;
-        #[cfg(not(kani))]
         let trace = debug_transred_trace_enabled();
         self.stats.rounds += 1;
         // Advance generation counter instead of re-allocating Vec<bool>.

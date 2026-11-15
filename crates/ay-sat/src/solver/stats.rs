@@ -4,6 +4,7 @@
 
 //! Solver statistics, queries, debug diagnostics, and clause database access.
 
+use super::inprocessing::BveSkipReason;
 use super::inprocessing::FactorSkipReason;
 use super::solver_stats::{
     BcpLearned1963IdentityRecord, InprocessingPassAccounting, RephaseAttribution,
@@ -114,6 +115,16 @@ pub struct BackboneScheduleStats {
     pub bounded_yields: u64,
     /// Bounded-CDCL backbone wall time in milliseconds.
     pub bounded_ms: u64,
+    /// Bounded-CDCL backbone passes completed under the pass marks.
+    pub bounded_completed_passes: u64,
+    /// Stacked binary-backbone rounds, probes and guard skips.
+    pub binary_stacked_rounds: u64,
+    pub binary_stacked_probes: u64,
+    pub binary_stacked_guard_skips: u64,
+    pub binary_stacked_skip_other_root: u64,
+    pub binary_stacked_skip_other_stack: u64,
+    pub binary_stacked_skip_dead_clause: u64,
+    pub binary_stacked_skip_uip_level: u64,
     /// Binary-backbone suppressions caused by bounded-only cooldown.
     pub bounded_binary_suppressed: u64,
     /// Whether the shared backbone row is due at the current conflict count.
@@ -561,6 +572,16 @@ impl Solver {
         self.user_num_vars
     }
 
+    /// The variables an external model line may show: `user_num_vars`, less
+    /// the linking variables an oversized-clause split allocated through
+    /// `new_var` (they advance `user_num_vars` for the theory layers, but a
+    /// DIMACS `v` line that carries them is rejected by the checkers).
+    pub fn visible_model_vars(&self) -> usize {
+        self.cold
+            .oversized_split_user_vars
+            .map_or(self.user_num_vars, |n| n.min(self.user_num_vars))
+    }
+
     /// Return the total number of variables, including internal scope selectors.
     pub fn total_num_vars(&self) -> usize {
         self.num_vars
@@ -603,6 +624,13 @@ impl Solver {
     /// `SolverStats::conflicts_from_prior_solve_clauses`.
     pub fn conflicts_from_prior_solve_clauses(&self) -> u64 {
         self.stats.conflicts_from_prior_solve_clauses
+    }
+
+    /// Conflict analyses abandoned without learning (backtrack to level 0):
+    /// trail-exhaustion and failed-lazy-reason bailouts. See
+    /// `SolverStats::trail_exhaustion_bailouts`.
+    pub fn trail_exhaustion_bailouts(&self) -> u64 {
+        self.stats.trail_exhaustion_bailouts
     }
 
     /// #unguarded-tvalid-lemmas STAGE 0: conflicts that fired within the
@@ -714,6 +742,113 @@ impl Solver {
         self.stats.level_at_conflict_sum
     }
 
+    /// Sampled decision relevance as (sampled conflicts, trail decisions,
+    /// relevant decisions) for (focused, stable) modes. Relevant = the
+    /// decision variable was in the conflict analysis seen set.
+    pub fn sampled_decision_relevance(&self) -> ((u64, u64, u64), (u64, u64, u64)) {
+        (
+            (
+                self.stats.sampled_conflicts_focused,
+                self.stats.sampled_decisions_focused,
+                self.stats.sampled_relevant_focused,
+            ),
+            (
+                self.stats.sampled_conflicts_stable,
+                self.stats.sampled_decisions_stable,
+                self.stats.sampled_relevant_stable,
+            ),
+        )
+    }
+
+    /// Descent-length histograms (decisions per restart segment, buckets
+    /// [<=64, 65..=256, 257..=1024, >1024]), (focused, stable).
+    pub fn descent_histograms(&self) -> ([u64; 4], [u64; 4]) {
+        (
+            self.stats.descent_hist_focused,
+            self.stats.descent_hist_stable,
+        )
+    }
+
+    /// Propagations-per-decision histograms (buckets
+    /// [0, 1..=16, 17..=64, 65..=256, 257..=1024, >1024]), (early, late)
+    /// split at the 1024th conflict.
+    pub fn prop_decision_histograms(&self) -> ([u64; 6], [u64; 6]) {
+        (
+            self.stats.prop_decision_hist_early,
+            self.stats.prop_decision_hist_late,
+        )
+    }
+
+    /// Zero-propagation split: (zeros by attributed level band
+    /// [0..=8, 9..=64, 65..=512, >512], zeros by mode [focused, stable],
+    /// all decisions by level band).
+    /// Decisions taken with un-consumed trail entries pending BCP.
+    pub fn decisions_with_pending_props(&self) -> u64 {
+        self.stats.decisions_with_pending_props
+    }
+
+    /// First main-driver search decisions (variable index + 1,
+    /// zero-padded) and how many were recorded (cap 128).
+    pub fn first_search_decisions(&self) -> ([u32; 128], u64) {
+        (
+            self.stats.first_search_decisions,
+            self.stats.first_search_decisions_len,
+        )
+    }
+
+    pub fn prop_zero_split(&self) -> ([u64; 4], [u64; 2], [u64; 4]) {
+        (
+            self.stats.prop_zero_by_level,
+            self.stats.prop_zero_by_mode,
+            self.stats.decisions_by_level,
+        )
+    }
+
+    /// Sampled trail composition ((focused trail_len, target_set,
+    /// target_agree), (same for stable)), summed over sampled conflicts.
+    pub fn sampled_trail_composition(&self) -> ((u64, u64, u64), (u64, u64, u64)) {
+        (
+            (
+                self.stats.sampled_trail_len_focused,
+                self.stats.sampled_target_set_focused,
+                self.stats.sampled_target_agree_focused,
+            ),
+            (
+                self.stats.sampled_trail_len_stable,
+                self.stats.sampled_target_set_stable,
+                self.stats.sampled_target_agree_stable,
+            ),
+        )
+    }
+
+    /// Sum of analyzed-set sizes at sampled conflicts, (focused, stable).
+    pub fn sampled_analyzed(&self) -> (u64, u64) {
+        (
+            self.stats.sampled_analyzed_focused,
+            self.stats.sampled_analyzed_stable,
+        )
+    }
+
+    /// Source split of the sampled decisions by bump-stamp age, as
+    /// ((focused recent decisions, focused recent relevant, focused stale
+    /// decisions, focused stale relevant), (same for stable)).
+    pub fn sampled_decision_sources(&self) -> ((u64, u64, u64, u64), (u64, u64, u64, u64)) {
+        (
+            (
+                self.stats.sampled_decisions_recent_focused,
+                self.stats.sampled_relevant_recent_focused,
+                self.stats.sampled_decisions_stale_focused,
+                self.stats.sampled_relevant_stale_focused,
+            ),
+            (
+                self.stats.sampled_decisions_recent_stable,
+                self.stats.sampled_relevant_recent_stable,
+                self.stats.sampled_decisions_stale_stable,
+                self.stats.sampled_relevant_stale_stable,
+            ),
+        )
+    }
+
     /// Get the number of cold restarts performed.
     pub fn num_cold_restarts(&self) -> u64 {
         self.stats.cold_restarts
@@ -784,6 +919,22 @@ impl Solver {
         self.search_ticks[0] + self.search_ticks[1]
     }
 
+    /// Search ticks over the solver's whole life: [`Self::total_search_ticks`]
+    /// plus those of every solve before the current one.
+    ///
+    /// Every solve entry that searches zeroes the per-solve count, so the
+    /// difference of two `total_search_ticks` readings around a fresh solve
+    /// is not what it spent (it is short by the previous solve's count, or
+    /// zero). The difference of two readings of this one is exact. A caller
+    /// that charges a solve's search ticks to a budget reads it before and
+    /// after the solve (ay-chc's CHC run node, P4a slice 8).
+    #[must_use]
+    pub fn lifetime_search_ticks(&self) -> u64 {
+        self.cold
+            .lifetime_search_ticks
+            .saturating_add(self.total_search_ticks())
+    }
+
     /// Search ticks split by stabilization mode: `(focused, stable)`.
     ///
     /// This — not the decision counts — is the mode share that the schedule
@@ -818,30 +969,6 @@ impl Solver {
         self.stats.chrono_backtracks
     }
 
-    /// Approximate-BCP filter (#8789 Phase 2): number of active clauses the
-    /// filter correctly classified as `NoopLikely` on the current trail.
-    /// Divided by total filter invocations, this is the Phase 3 skip-rate
-    /// upper bound. Always `0` when the `approx-bcp-filter` feature is off.
-    pub fn approx_bcp_noop_matched(&self) -> u64 {
-        self.stats.approx_bcp_noop_matched
-    }
-
-    /// Approximate-BCP filter (#8789 Phase 2): number of active clauses the
-    /// filter correctly classified as "maybe unit or falsified" (the exact
-    /// trail check confirmed unit/falsified). Always `0` when the
-    /// `approx-bcp-filter` feature is off.
-    pub fn approx_bcp_conflict_matched(&self) -> u64 {
-        self.stats.approx_bcp_conflict_matched
-    }
-
-    /// Approximate-BCP filter (#8789 Phase 2): **soundness alarm counter**.
-    /// Any nonzero value indicates the filter said "skip" for a clause that
-    /// was actually unit or falsified — a correctness bug. Always `0` when
-    /// the `approx-bcp-filter` feature is off.
-    pub fn approx_bcp_mismatch_detected(&self) -> u64 {
-        self.stats.approx_bcp_mismatch_detected
-    }
-
     /// Get the number of block-UIP shrink attempts during conflict analysis.
     pub fn shrink_block_attempts(&self) -> u64 {
         self.stats.shrink_block_attempts
@@ -850,6 +977,20 @@ impl Solver {
     /// Get the number of successful block-UIP replacements.
     pub fn shrink_block_successes(&self) -> u64 {
         self.stats.shrink_block_successes
+    }
+
+    /// Learned-clause shrink profile: (first-UIP literals deduced, literals
+    /// removed by block UIPs, literals removed by the minimization fallback,
+    /// block searches ending at a decision, block searches stopped by a
+    /// non-removable lower-level literal).
+    pub fn shrink_literal_profile(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.stats.shrink_lits_deduced,
+            self.stats.shrink_lits_block_removed,
+            self.stats.shrink_lits_fallback_removed,
+            self.stats.shrink_fail_decision,
+            self.stats.shrink_fail_lower,
+        )
     }
 
     /// Get learned-clause shrink/LRAT snapshot diagnostics (#9102):
@@ -908,6 +1049,21 @@ impl Solver {
     /// Get the number of MAB arm switches (branch heuristic changes via UCB1).
     pub fn mab_arm_switches(&self) -> u64 {
         self.stats.mab_arm_switches
+    }
+
+    /// Number of completed MAB-UCB1 branch epochs (zero when the selector is
+    /// not the bandit or stable mode was never entered).
+    pub fn mab_epochs(&self) -> u64 {
+        self.stats.mab_epochs
+    }
+
+    /// The branch selector in force: 0 legacy coupled, 1 fixed, 2 MAB-UCB1.
+    pub fn branch_selector_code(&self) -> u64 {
+        match self.cold.branch_selector_mode {
+            BranchSelectorMode::LegacyCoupled => 0,
+            BranchSelectorMode::Fixed(_) => 1,
+            BranchSelectorMode::MabUcb1 => 2,
+        }
     }
 
     /// Get the number of focused/stable mode switches (diagnostic).
@@ -1007,6 +1163,11 @@ impl Solver {
         self.cold.num_eager_subsumptions
     }
 
+    /// Get the number of binaries eagerly subsumed by their duplicate.
+    pub fn num_eager_subsumed_duplicate_binaries(&self) -> u64 {
+        self.cold.num_eager_subsumed_duplicate_binaries
+    }
+
     /// Get the number of OTFS trigger events during conflict analysis.
     pub fn otfs_subsumed(&self) -> u64 {
         self.stats.otfs_subsumed
@@ -1070,6 +1231,75 @@ impl Solver {
             .collect()
     }
 
+    /// In-search BVE rounds refused by `bve_skip_reason`, per reason.
+    pub fn bve_skip_breakdown(&self) -> Vec<(&'static str, u64)> {
+        BveSkipReason::TAGS
+            .iter()
+            .zip(self.cold.bve_skip_counts)
+            .map(|(&tag, n)| (tag, n))
+            .collect()
+    }
+
+    /// Due BVE rounds refused by the scheduler gates, per gate.
+    pub fn bve_gate_skip_breakdown(&self) -> Vec<(&'static str, u64)> {
+        super::inprocessing::BVE_GATE_TAGS
+            .iter()
+            .zip(self.cold.bve_gate_skip_counts)
+            .map(|(&tag, n)| (tag, n))
+            .collect()
+    }
+
+    /// The BVE schedule's state: `(next_conflict, phases, consecutive_unproductive)`.
+    pub fn bve_schedule_state(&self) -> (u64, u64, u64) {
+        (
+            self.inproc_ctrl.bve.next_conflict,
+            u64::from(self.cold.bve_phases),
+            u64::from(self.cold.bve_consecutive_unproductive),
+        )
+    }
+
+    /// Factor passes ended by the solve's stop between applications.
+    pub fn num_factor_stops(&self) -> u64 {
+        self.cold.factor_stops
+    }
+
+    /// Factor and SBVA passes refused by `--sat-factor-max-density` and
+    /// `--sat-sbva-max-density`.
+    pub fn density_band_skips(&self) -> (u64, u64) {
+        (self.cold.factor_density_skips, self.cold.sbva_density_skips)
+    }
+
+    /// BVE candidates that share a clause with a live extension variable:
+    /// refused by default, admitted under `--sat-bve-ext-cooccur true`.
+    pub fn num_bve_ext_cooccur_skips(&self) -> u64 {
+        self.cold.bve_ext_cooccur_skips
+    }
+
+    /// BVE candidate refusals: (fast-elimination limits, binary-degree
+    /// product, over the growth bound, candidates resolved, highest bound).
+    pub fn bve_rejection_profile(&self) -> [u64; 5] {
+        self.cold.bve_rejections
+    }
+
+    /// BVE gates (proved sound for restriction beside non-gate clauses,
+    /// checked and not proved by reason: shape, pairs, incomplete, budget).
+    pub fn bve_gate_profile(&self) -> (u64, [u64; 4]) {
+        let stats = self.inproc.bve.stats();
+        (stats.gates_proved_mixed, stats.gates_unproved)
+    }
+
+    /// SBVA's rounds, the groups it compressed and the extension variables
+    /// it introduced; those variables stay in the search wherever no BVE
+    /// route eliminates them (vdwb_k6_n250: 3,606 on a 250-variable
+    /// formula, 2026-09-19).
+    pub fn sbva_counts(&self) -> (u64, u64, u64) {
+        (
+            self.cold.sbva_rounds,
+            self.cold.sbva_groups_total,
+            self.cold.sbva_extension_vars_total,
+        )
+    }
+
     /// Arena compactions requested at a non-quiescent moment.
     pub fn num_arena_compaction_skips(&self) -> u64 {
         self.cold.num_arena_compaction_skips
@@ -1081,6 +1311,19 @@ impl Solver {
     }
 
     /// Get the number of reduce_db calls performed.
+    /// The dynamic tier boundaries `[tier1 focused, tier2 focused, tier1
+    /// stable, tier2 stable]` (`recompute_tier`); Kissat prints its own as
+    /// `tier1`/`tier2` per mode, and on schooltt-5-3 lands at 7/12 focused
+    /// and 9/17 stable, so the values are part of any retention comparison.
+    pub fn tier_boundaries(&self) -> [u32; 4] {
+        [
+            self.tiers.tier1_lbd[0],
+            self.tiers.tier2_lbd[0],
+            self.tiers.tier1_lbd[1],
+            self.tiers.tier2_lbd[1],
+        ]
+    }
+
     pub fn num_reductions(&self) -> u64 {
         self.cold.num_reductions
     }
@@ -1318,21 +1561,19 @@ impl Solver {
             bounded_runs: self.stats.bounded_backbone_runs,
             bounded_yields: self.stats.bounded_backbone_yields,
             bounded_ms: self.stats.bounded_backbone_ms,
+            bounded_completed_passes: self.stats.backbone_completed_passes,
+            binary_stacked_rounds: self.stats.backbone_stacked_rounds,
+            binary_stacked_probes: self.stats.backbone_stacked_probes,
+            binary_stacked_guard_skips: self.stats.backbone_stacked_guard_skips,
+            binary_stacked_skip_other_root: self.stats.backbone_stacked_skip_other_root,
+            binary_stacked_skip_other_stack: self.stats.backbone_stacked_skip_other_stack,
+            binary_stacked_skip_dead_clause: self.stats.backbone_stacked_skip_dead_clause,
+            binary_stacked_skip_uip_level: self.stats.backbone_stacked_skip_uip_level,
             bounded_binary_suppressed: self.stats.bounded_backbone_binary_suppressed,
             due: control.should_fire(self.num_conflicts),
             stalled_by_empty: self.cold.backbone_consecutive_empty >= BACKBONE_STALL_LIMIT,
             rounds_exhausted: self.cold.backbone_phases >= BACKBONE_MAX_ROUNDS,
         }
-    }
-
-    /// Get GPU BVE telemetry counters.
-    /// Returns (dispatches, ordered_pairs, tautological_resolvents).
-    pub fn gpu_bve_stats(&self) -> (u64, u64, u64) {
-        (
-            self.stats.gpu_bve_dispatches,
-            self.stats.gpu_bve_pairs,
-            self.stats.gpu_bve_tautologies,
-        )
     }
 
     /// Get the number of propagations performed via dense (occ-list) mode (#8088).
@@ -1688,6 +1929,36 @@ impl Solver {
         self.arena.active_clause_count()
     }
 
+    /// Active irredundant arena clauses (the formula's watched size, beside
+    /// Kissat's `clauses_irredundant`).
+    pub fn irredundant_clause_count(&self) -> usize {
+        self.arena.irredundant_count()
+    }
+
+    /// Active redundant (learned) arena clauses.
+    pub fn redundant_clause_count(&self) -> usize {
+        self.arena.redundant_count()
+    }
+
+    /// The active irredundant arena clauses split as Kissat reports them:
+    /// (binary, larger, literals in the larger ones). One arena pass.
+    pub fn irredundant_clause_shape(&self) -> (u64, u64, u64) {
+        let (mut binary, mut large, mut large_literals) = (0u64, 0u64, 0u64);
+        for idx in self.arena.active_indices() {
+            if self.arena.is_garbage_any(idx) || self.arena.is_learned(idx) {
+                continue;
+            }
+            let len = self.arena.len_of(idx) as u64;
+            if len <= 2 {
+                binary += 1;
+            } else {
+                large += 1;
+                large_literals += len;
+            }
+        }
+        (binary, large, large_literals)
+    }
+
     /// Arena words accounted dead, i.e. reclaimable by compaction. This is the
     /// quantity `should_compact_arena` tests, so it belongs next to
     /// [`Self::arena_words`] in any memory diagnosis.
@@ -1743,9 +2014,10 @@ impl Solver {
 
     /// Independent-support brancher observability (`solver/indep_support.rs`):
     /// `(installed_size, live_size, decidable_vars, gates, rejected_size,
-    /// restricted decisions, fallback decisions, wall nanoseconds)`.
+    /// restricted decisions, fallback decisions, wall nanoseconds,
+    /// GE free variables)`.
     #[must_use]
-    pub fn indep_support_report(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn indep_support_report(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             self.stats.indep_support_installed_size,
             self.stats.indep_support_size,
@@ -1755,6 +2027,7 @@ impl Solver {
             self.stats.indep_support_decisions,
             self.stats.indep_support_fallback_decisions,
             self.stats.indep_support_time_ns,
+            self.stats.indep_support_ge_free_vars,
         )
     }
 
@@ -1783,6 +2056,29 @@ impl Solver {
     /// Get cumulative LBD sum and count for average LBD computation.
     pub fn lbd_sum_count(&self) -> (u64, u64) {
         (self.stats.lbd_sum, self.stats.lbd_count)
+    }
+
+    /// Learned binary clauses left out of reduction (`--sat-keep-learned-binaries`).
+    pub fn learned_reduction_binary_kept(&self) -> u64 {
+        self.stats.learned_reduction_binary_kept
+    }
+
+    /// Sum of learned-clause lengths (Kissat `literals_learned`).
+    pub fn learned_literals(&self) -> u64 {
+        self.stats.learned_literals
+    }
+
+    /// The used-glue histogram the dynamic tiers are computed from, per mode
+    /// (focused, stable): bumps of learned clauses by their recomputed glue,
+    /// buckets 0..16 with the last one collecting everything above.
+    pub fn tier_usage_histogram(&self) -> [[u64; 17]; 2] {
+        let mut out = [[0u64; 17]; 2];
+        for (mode, usage) in self.tiers.tier_usage.iter().enumerate() {
+            for (glue, &count) in usage.iter().enumerate() {
+                out[mode][glue.min(16)] += count;
+            }
+        }
+        out
     }
 
     /// Get learned clause LBD distribution buckets (#8131).
@@ -2156,6 +2452,20 @@ impl Solver {
         (self.stats.focused_decisions, self.stats.stable_decisions)
     }
 
+    /// Search conflicts found in stable mode.
+    pub fn stable_conflicts(&self) -> u64 {
+        self.stats.stable_conflicts
+    }
+
+    /// `--sat-stable-lock-at`: the classifier's score x1000, and the conflict
+    /// count at which stable mode was locked (0: not locked).
+    pub fn stable_lock_stats(&self) -> (i64, u64) {
+        (
+            self.stats.stable_lock_score_milli,
+            self.stats.stable_locked_at,
+        )
+    }
+
     /// Get the number of completed inprocessing rounds.
     pub fn inprocessing_rounds(&self) -> u64 {
         self.stats.inprocessing_rounds
@@ -2409,6 +2719,17 @@ impl Solver {
         self.has_empty_clause
     }
 
+    /// Scope depth at which the current refutation was derived, or `None`
+    /// when the clause database is not refuted.
+    ///
+    /// `pop()` retracts the refutation when it pops below this depth, so
+    /// `Some(0)` is a base-level refutation that survives every pop, and the
+    /// value never exceeds `scope_depth()`.
+    pub fn empty_clause_scope_depth(&self) -> Option<usize> {
+        self.has_empty_clause
+            .then_some(self.cold.empty_clause_scope_depth)
+    }
+
     /// Pop the oldest pending theory conflict, if any (#6262).
     ///
     /// Returns `Some(clause_ref)` for immediately false clauses and mandatory
@@ -2615,8 +2936,11 @@ impl Solver {
                 gc_occ.remove_clause(idx, lits);
             }
             self.stats.clear_bcp_learned_1963_blocker_cert(idx);
+            self.record_clause_retirement(idx);
             self.arena.delete(idx);
         }
+        // No learned clause is left for the cap and byte triggers' floors.
+        self.lower_reduction_retrigger_points();
     }
 
     /// Clear the `has_empty_clause` flag for incremental solving.
@@ -2630,8 +2954,14 @@ impl Solver {
     ///
     /// Must be called AFTER `clear_learned_clauses()` to ensure the clauses
     /// that led to the empty clause derivation have been removed.
+    ///
+    /// A cleared refutation also drops its recorded scope depth and makes the
+    /// next solve rebuild its search state (see `lower_empty_clause_flag`);
+    /// with no refutation present this only drains the pending theory queues.
     pub fn clear_empty_clause(&mut self) {
-        self.has_empty_clause = false;
+        if self.has_empty_clause {
+            self.lower_empty_clause_flag();
+        }
         self.cold.empty_clause_in_proof = false;
         self.cold.empty_clause_lrat_id = None;
         self.pending_theory_conflicts.clear();
@@ -2704,6 +3034,36 @@ impl Solver {
         lits.iter().map(|&lit| self.externalize(lit)).collect()
     }
 
+    /// `externalize` for literals on their way to a proof writer
+    /// (proof-posture-parity, site C). Differs in one case: a FRESH internal
+    /// variable whose proof lines are emitted before it is installed —
+    /// factoring writes the divider / quotient lines and only then calls
+    /// `install_factor_extension_vars`. `new_var_internal` gives the j-th
+    /// pending fresh variable the external index `e2i.len() + j`, so that is
+    /// what the proof must name; the plain `externalize` would index past
+    /// `i2e`.
+    #[inline]
+    pub(crate) fn externalize_for_proof(&self, lit: Literal) -> Literal {
+        let int_var = lit.variable().index();
+        let ext_var = if int_var < self.cold.i2e.len() {
+            self.cold.i2e[int_var]
+        } else {
+            (self.cold.e2i.len() + (int_var - self.cold.i2e.len())) as u32
+        };
+        if lit.is_positive() {
+            Literal::positive(Variable(ext_var))
+        } else {
+            Literal::negative(Variable(ext_var))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn externalize_lits_for_proof(&self, lits: &[Literal]) -> Vec<Literal> {
+        lits.iter()
+            .map(|&lit| self.externalize_for_proof(lit))
+            .collect()
+    }
+
     /// Compute the SAT guidance v2 formula fingerprint for this solver.
     ///
     /// The fingerprint covers the original-clause ledger, not learned clauses.
@@ -2730,6 +3090,33 @@ impl Solver {
             return SatGuidanceImportDecision::legacy_v1();
         };
         source.classify_import(&self.guidance_fingerprint())
+    }
+
+    /// Live learned-clause composition: (hyper, non-hyper length <=2,
+    /// non-hyper length 3..=8, non-hyper length >8) over `live_indices`.
+    /// Sums to at most `num_learned_clauses`, which also counts retained
+    /// husks (garbage-kept and pending-garbage). Read-only diagnostic for
+    /// learning-economy comparisons; one arena pass.
+    pub fn learned_composition(&self) -> (u64, u64, u64, u64) {
+        let mut hyper = 0u64;
+        let mut binary = 0u64;
+        let mut short = 0u64;
+        let mut long = 0u64;
+        for idx in self.arena.live_indices() {
+            if !self.arena.is_learned(idx) {
+                continue;
+            }
+            if self.arena.is_hyper(idx) {
+                hyper += 1;
+            } else if self.arena.len_of(idx) <= 2 {
+                binary += 1;
+            } else if self.arena.len_of(idx) <= 8 {
+                short += 1;
+            } else {
+                long += 1;
+            }
+        }
+        (hyper, binary, short, long)
     }
 
     /// Get the number of learned (non-original) clauses currently retained.
@@ -3015,3 +3402,7 @@ fn format_rss_field() -> String {
     let rss_mb = rss_bytes / (1024 * 1024);
     format!("rss={rss_mb}MB")
 }
+
+#[cfg(test)]
+#[path = "stats_tests.rs"]
+mod tests;

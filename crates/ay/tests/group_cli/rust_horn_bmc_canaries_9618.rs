@@ -11,7 +11,6 @@
 //! only when available.
 
 use ntest::timeout;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -91,19 +90,18 @@ fn assert_ay_unsafe_contract(case: Canary, path: &Path) {
     );
 }
 
+/// The optional Spacer cross-check. z3 is reached by path and must prove it is
+/// z3 (`ay_test_support::z3`); with none usable the check is skipped visibly.
 fn maybe_assert_z3_spacer_unsat(case: Canary, path: &Path) {
-    let output = match Command::new("z3")
+    let Some(z3) = ay_test_support::z3::optional_z3("ay rust_horn_bmc_canaries_9618 Spacer") else {
+        return;
+    };
+    let output = z3
+        .command()
         .arg("fp.engine=spacer")
         .arg(path)
         .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            eprintln!("{}: z3 not found; skipping optional Spacer check", case.id);
-            return;
-        }
-        Err(error) => panic!("{}: failed to run z3 Spacer: {error}", case.id),
-    };
+        .unwrap_or_else(|error| panic!("{}: failed to run z3 Spacer: {error}", case.id));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

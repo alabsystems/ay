@@ -309,3 +309,28 @@ fn shared_prefix_rejects_external_incumbent_ownership_until_snapshot_replay_exis
         "typed error should identify the unsupported composition: {error}"
     );
 }
+
+#[test]
+fn held_bank_spares_preserve_complete_prefix_proof() {
+    if !ay_test_support::isolated_test::run_alone(
+        module_path!(),
+        "held_bank_spares_preserve_complete_prefix_proof",
+    )
+    .expect("fresh process")
+    {
+        return;
+    }
+    let caller = ay_sys::compute_budget::ComputeScope::enter().expect("actual caller");
+    let mut held = Vec::new();
+    while let Some(extra) = caller.try_extra().expect("actual spare") {
+        held.push(extra);
+    }
+    let (model, prefix) = fractional_triangle();
+    let tree = proof_first_tree(&model, &prefix, 8);
+    tree.verify(&model)
+        .expect("complete caller-only prefix proof");
+    assert!(caller
+        .try_extra()
+        .expect("original spares still held")
+        .is_none());
+}

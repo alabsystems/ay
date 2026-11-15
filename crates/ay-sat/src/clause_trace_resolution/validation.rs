@@ -16,55 +16,71 @@ fn validate_clause_trace_resolution_interruptible_impl(
         shape,
         unit_premises,
         retained_premise_bytes,
-    } = prepare_fixed_unit_premises(trace, entries, num_vars, fixed_unit_premises, &mut meter)?;
-    let mut entry_states = collect_entry_states(entries, &mut meter)?;
-    let terminal_empty_index = validate_entry_structure(
-        trace,
-        entries,
-        &unit_premises,
-        &entry_states,
-        shape,
-        &mut meter,
-    )?;
+    } = meter.in_phase(ConversionPhase::Preflight, |meter| {
+        prepare_fixed_unit_premises(trace, entries, num_vars, fixed_unit_premises, meter)
+    })?;
+    let mut entry_states = meter.in_phase(ConversionPhase::Namespace, |meter| {
+        collect_entry_states(entries, meter)
+    })?;
+    let structure = meter.in_phase(ConversionPhase::Namespace, |meter| {
+        validate_entry_structure(trace, entries, &unit_premises, &entry_states, shape, meter)
+    })?;
+    let shape = meter.in_phase(ConversionPhase::Preflight, |meter| {
+        admit_candidate_scheduler(
+            shape,
+            structure.max_candidate_count,
+            structure.max_candidate_literals,
+            entries.len(),
+            num_vars,
+            retained_premise_bytes,
+            meter,
+        )
+    })?;
     let OriginalConversion {
         clauses: original_clauses,
         mappings: original_mappings,
         next_canonical_id,
-    } = convert_original_clauses(entries, shape, &mut entry_states, &mut meter)?;
+    } = meter.in_phase(ConversionPhase::Originals, |meter| {
+        convert_original_clauses(entries, shape, &mut entry_states, meter)
+    })?;
     let DerivedConversion {
         steps: derived,
         empty_clause_id,
-    } = convert_derived_clauses(
-        DerivedConversionInputs {
-            entries,
-            original_clauses: &original_clauses,
-            unit_premises: &unit_premises,
-            terminal_empty_index,
-            shape,
-            num_vars,
-        },
-        &mut entry_states,
-        next_canonical_id,
-        &mut meter,
-    )?;
+    } = meter.in_phase(ConversionPhase::Derived, |meter| {
+        convert_derived_clauses(
+            DerivedConversionInputs {
+                entries,
+                original_clauses: &original_clauses,
+                unit_premises: &unit_premises,
+                terminal_empty_index: structure.terminal_empty_index,
+                shape,
+                num_vars,
+            },
+            &mut entry_states,
+            next_canonical_id,
+            meter,
+        )
+    })?;
     let FinalizedConversion {
         dag,
         original_mappings,
         retained_bytes,
         replay_additional_bytes,
-    } = finalize_converted_trace(
-        ConversionPayload {
-            num_vars,
-            original_clauses,
-            original_mappings,
-            derived,
-            empty_clause_id,
-            entry_states,
-            retained_premise_bytes,
-            source_trace_bytes: shape.source_trace_bytes,
-        },
-        &mut meter,
-    )?;
+    } = meter.in_phase(ConversionPhase::Finalize, |meter| {
+        finalize_converted_trace(
+            ConversionPayload {
+                num_vars,
+                original_clauses,
+                original_mappings,
+                derived,
+                empty_clause_id,
+                entry_states,
+                retained_premise_bytes,
+                source_trace_bytes: shape.source_trace_bytes,
+            },
+            meter,
+        )
+    })?;
 
     let conversion_work = meter.consumed_work();
     let validation_work = replay_converted_dag(
@@ -235,6 +251,12 @@ fn collect_entry_states(
     Ok(states)
 }
 
+struct CheckedTraceStructure {
+    terminal_empty_index: Option<usize>,
+    max_candidate_count: usize,
+    max_candidate_literals: usize,
+}
+
 fn validate_entry_structure(
     trace: &ClauseTrace,
     entries: TraceEntries<'_>,
@@ -242,8 +264,10 @@ fn validate_entry_structure(
     entry_states: &HashMap<u64, TraceIdState>,
     shape: TraceShape,
     meter: &mut ConversionMeter<'_>,
-) -> Result<Option<usize>, ClauseTraceResolutionError> {
+) -> Result<CheckedTraceStructure, ClauseTraceResolutionError> {
     let mut terminal_empty_index = None;
+    let mut max_candidate_count = 0;
+    let mut max_candidate_literals = 0;
     for (entry_index, entry) in entries.iter().enumerate() {
         if entry_index % CONTROL_POLL_INTERVAL == 0 {
             meter.check_controls()?;
@@ -266,7 +290,9 @@ fn validate_entry_structure(
                 id: entry.id,
             });
         }
-        validate_entry_hints(entry_index, entry, entry_states, meter)?;
+        let literals = validate_entry_hints(entry_index, entry, entries, entry_states, meter)?;
+        max_candidate_count = max_candidate_count.max(entry.resolution_hints.len());
+        max_candidate_literals = max_candidate_literals.max(literals);
         if entry.clause.is_empty() {
             terminal_empty_index = Some(entry_index);
         }
@@ -281,7 +307,11 @@ fn validate_entry_structure(
     if !trace.has_empty_clause() {
         return Err(ClauseTraceResolutionError::NoDerivedEmptyClause);
     }
-    Ok(terminal_empty_index)
+    Ok(CheckedTraceStructure {
+        terminal_empty_index,
+        max_candidate_count,
+        max_candidate_literals,
+    })
 }
 
 fn validate_original_entry(
@@ -306,9 +336,11 @@ fn validate_original_entry(
 fn validate_entry_hints(
     entry_index: usize,
     entry: crate::clause_trace::ClauseTraceEntryRef<'_>,
+    entries: TraceEntries<'_>,
     entry_states: &HashMap<u64, TraceIdState>,
     meter: &mut ConversionMeter<'_>,
-) -> Result<(), ClauseTraceResolutionError> {
+) -> Result<usize, ClauseTraceResolutionError> {
+    let mut literals = 0;
     for (hint_index, &hint_id) in entry.resolution_hints.iter().enumerate() {
         if hint_index % CONTROL_POLL_INTERVAL == 0 {
             meter.check_controls()?;
@@ -335,8 +367,23 @@ fn validate_entry_hints(
                 hint_entry_index: hint_state.trace_index,
             });
         }
+        // Count positions, not distinct ids: duplicate hints produce distinct
+        // scheduler positions and repeated occurrences. No second map needed.
+        meter.charge(1)?;
+        meter.charge(entries.lookup_work_bound())?;
+        let hinted = entries.get(hint_state.trace_index).ok_or(
+            ClauseTraceResolutionError::MissingCheckedIdentity {
+                entry_index: hint_state.trace_index,
+                id: hint_id,
+            },
+        )?;
+        literals = checked_resource_add(
+            literals,
+            hinted.clause.len(),
+            ResolutionValidationResource::Bytes,
+        )?;
     }
-    Ok(())
+    Ok(literals)
 }
 
 struct OriginalConversion {

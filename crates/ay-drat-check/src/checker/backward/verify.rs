@@ -120,9 +120,14 @@ impl BackwardChecker {
         if self.inner.inconsistent {
             return;
         }
-        self.inner.stats.original += 1;
+        self.inner.stats.original = self.inner.stats.original.saturating_add(1);
         for &lit in clause {
-            self.inner.ensure_capacity(lit.variable().index());
+            if let Err(refusal) = self.inner.ensure_capacity(lit.variable().index()) {
+                // Unrepresentable: fail the conclusion closed, as
+                // `add_clause_internal` does.
+                self.inner.record_dense_refusal(refusal);
+                return;
+            }
         }
         self.inner.add_clause_internal(clause);
         while self.active.len() < self.inner.clauses.len() {
@@ -132,31 +137,37 @@ impl BackwardChecker {
 
     /// Forward pass: add a derived clause without a RUP/RAT check.
     pub(super) fn add_derived_forward(&mut self, clause: &[Literal]) -> usize {
-        self.inner.stats.additions += 1;
+        self.inner.stats.additions = self.inner.stats.additions.saturating_add(1);
         for &lit in clause {
-            self.inner.ensure_capacity(lit.variable().index());
+            if let Err(refusal) = self.inner.ensure_capacity(lit.variable().index()) {
+                // Unrepresentable: record no clause and fail the forward
+                // conclusion closed, as `add_clause_internal` does.
+                self.inner.record_dense_refusal(refusal);
+                return usize::MAX;
+            }
         }
         let clauses_before = self.inner.clauses.len();
         self.inner.add_clause_internal(clause);
         while self.active.len() < self.inner.clauses.len() {
             self.active.push(false);
         }
-        if self.inner.clauses.len() > clauses_before {
-            self.inner.clauses.len() - 1
-        } else {
-            usize::MAX
+        // The new clause, if one was appended, is the last arena entry.
+        match self.inner.clauses.len().checked_sub(1) {
+            Some(last) if last >= clauses_before => last,
+            _ => usize::MAX,
         }
     }
 
     /// Forward pass: soft-delete a clause while retaining its arena entry.
     pub(super) fn delete_forward(&mut self, clause: &[Literal]) -> Option<usize> {
-        self.inner.stats.deletions += 1;
+        self.inner.stats.deletions = self.inner.stats.deletions.saturating_add(1);
         let Some(cidx) = self.inner.find_clause_idx(clause) else {
-            self.inner.stats.missed_deletes += 1;
+            self.inner.stats.missed_deletes = self.inner.stats.missed_deletes.saturating_add(1);
             return None;
         };
         if self.inner.is_reason_for_first_lit(cidx) {
-            self.inner.stats.pseudo_unit_skips += 1;
+            self.inner.stats.pseudo_unit_skips =
+                self.inner.stats.pseudo_unit_skips.saturating_add(1);
             return None;
         }
 
@@ -170,7 +181,8 @@ impl BackwardChecker {
             self.inner.hash_buckets[bucket].swap_remove(position);
         }
         self.inner.remove_clause_occurrences(cidx);
-        self.inner.live_clauses -= 1;
+        // A found clause is live, so the count is at least one here.
+        self.inner.live_clauses = self.inner.live_clauses.saturating_sub(1);
         Some(cidx)
     }
 
@@ -211,7 +223,22 @@ impl BackwardChecker {
             self.inner.clauses[record.cidx] = None;
             return Ok(());
         }
-        self.verify_active_addition(step_idx, record.cidx, &steps[step_idx])
+        let Some(step) = steps.get(step_idx) else {
+            // Every record was pushed while replaying `steps`; an ACTIVE
+            // addition whose proof step is gone cannot be accepted.
+            return Err(self.missing_active_step(step_idx));
+        };
+        self.verify_active_addition(step_idx, record.cidx, step)
+    }
+
+    /// Fail an ACTIVE step whose proof step is unavailable (fail closed).
+    fn missing_active_step(&mut self, step_idx: usize) -> DratCheckError {
+        self.inner.stats.failures = self.inner.stats.failures.saturating_add(1);
+        DratCheckError::NotImplied {
+            clause: "backward: ACTIVE step missing from the proof".to_string(),
+            step: step_idx.saturating_add(1) as u64,
+            kind: "RUP/RAT ",
+        }
     }
 
     fn verify_discarded_step(
@@ -226,16 +253,19 @@ impl BackwardChecker {
         }
 
         self.inner.inconsistent = false;
-        let ProofStep::Add(clause) = &steps[step_idx] else {
+        let Some(step) = steps.get(step_idx) else {
+            return Err(self.missing_active_step(step_idx));
+        };
+        let ProofStep::Add(clause) = step else {
             return Ok(());
         };
         let result = self.inner.check_rup_with_deps(clause);
         if !result.is_rup {
-            self.inner.stats.failures += 1;
+            self.inner.stats.failures = self.inner.stats.failures.saturating_add(1);
             let lits: Vec<_> = clause.iter().map(ToString::to_string).collect();
             return Err(DratCheckError::NotImplied {
                 clause: format!("backward: ACTIVE discarded {lits:?}"),
-                step: (step_idx + 1) as u64,
+                step: step_idx.saturating_add(1) as u64,
                 kind: "RUP ",
             });
         }
@@ -266,11 +296,11 @@ impl BackwardChecker {
             return Ok(());
         }
 
-        self.inner.stats.failures += 1;
+        self.inner.stats.failures = self.inner.stats.failures.saturating_add(1);
         let lits: Vec<_> = clause.iter().map(ToString::to_string).collect();
         Err(DratCheckError::NotImplied {
             clause: format!("backward: ACTIVE {lits:?}"),
-            step: (step_idx + 1) as u64,
+            step: step_idx.saturating_add(1) as u64,
             kind: "RUP/RAT ",
         })
     }
@@ -294,7 +324,11 @@ impl BackwardChecker {
 
         if !reducible_positions.is_empty() {
             let reduced = reduce_clause(clause, reducible_positions);
-            self.inner.stats.reduced_literals += reducible_positions.len() as u64;
+            self.inner.stats.reduced_literals = self
+                .inner
+                .stats
+                .reduced_literals
+                .saturating_add(reducible_positions.len() as u64);
             self.inner.clauses[cidx] = Some(reduced);
         }
     }

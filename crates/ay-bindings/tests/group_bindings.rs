@@ -11,6 +11,8 @@
 
 #[path = "group_bindings/api_canary.rs"]
 mod api_canary;
+#[path = "group_bindings/deep_store_select.rs"]
+mod deep_store_select;
 #[path = "group_bindings/expr_deep_drop.rs"]
 mod expr_deep_drop;
 #[path = "group_bindings/fold_consistency.rs"]
@@ -19,5 +21,7 @@ mod fold_consistency;
 mod incremental_execute_direct_8154;
 #[path = "group_bindings/lra_execute_direct_5405.rs"]
 mod lra_execute_direct_5405;
+#[path = "group_bindings/native_dt_project.rs"]
+mod native_dt_project;
 #[path = "group_bindings/parser_roundtrip.rs"]
 mod parser_roundtrip;

@@ -10,11 +10,26 @@
 //! unsupported term, invalid Unicode alphabet value, depth overflow, or work
 //! budget exhaustion is an error and therefore becomes `CannotConfirm` at the
 //! model gate.
+//!
+//! Membership/replacement scratch uses the evaluator's same borrowed ledger:
+//! UTF-8 inspections, matcher/probe work, counted geometric character/text
+//! growth and fixed-key memo allocation/rehash. The legacy local matcher cap
+//! remains an additional bound; it never replenishes the original owner.
 
 use ay_core::kani_compat::DetHashMap;
+use ay_core::original_query::CountedAdmissionError;
+use ay_core::smtlib_code_point as code;
+use ay_core::term::{
+    reserve_counted, reserve_map_counted, reserve_string_counted, TermConstructionAdmission,
+};
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
 
+use crate::eval::error::{EvalError, EvalResource, EvalResult};
 use crate::MAX_EVAL_DEPTH;
+
+#[cfg(test)]
+#[path = "regex/admission_tests.rs"]
+mod admission_tests;
 
 /// Each interval-matcher memo miss spends one unit.  The matcher is
 /// `O(|R| * |s|^2)` after memoization; this cap prevents a hostile regex from
@@ -32,33 +47,99 @@ pub(crate) fn matches(
     subject: &str,
     regex: TermId,
     entry_depth: usize,
-    eval_string: impl FnMut(TermId) -> Result<String, String>,
-) -> Result<bool, String> {
+    eval_string: impl FnMut(TermId) -> EvalResult<String>,
+    owner: &dyn TermConstructionAdmission,
+) -> EvalResult<bool> {
     if !matches!(terms.sort(regex), Sort::RegLan) {
-        return Err("str.in_re second argument is not RegLan-sorted".to_string());
+        return Err("str.in_re second argument is not RegLan-sorted".into());
     }
-    let subject = checked_chars(subject)?;
+    let subject = checked_chars(subject, owner)?;
     let end = subject.len();
-    Matcher {
+    let result = Matcher {
         terms,
         subject,
         eval_string,
         budget: MATCH_BUDGET,
         re_memo: DetHashMap::default(),
         loop_memo: DetHashMap::default(),
+        owner,
     }
-    .re_match(regex, 0, end, entry_depth)
+    .re_match(regex, 0, end, entry_depth)?;
+    owner.check().map_err(stopped)?;
+    Ok(result)
 }
 
-fn checked_chars(text: &str) -> Result<Vec<char>, String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.iter().any(|&c| u32::from(c) > 0x0002_FFFF) {
-        return Err("string contains a code point outside the SMT-LIB alphabet".to_string());
+fn stopped(error: impl std::fmt::Display) -> EvalError {
+    EvalError::Refused(error.to_string())
+}
+
+fn charge(owner: &dyn TermConstructionAdmission, work: usize) -> EvalResult<()> {
+    owner.admit(work, 0).map_err(stopped)
+}
+
+fn validate_alphabet(text: &str, owner: &dyn TermConstructionAdmission) -> EvalResult<()> {
+    charge(owner, text.len())?;
+    if text.chars().any(|c| code(c) > 0x0002_FFFF) {
+        return Err("string contains a code point outside the SMT-LIB alphabet".into());
     }
+    owner.check().map_err(stopped)
+}
+
+fn checked_chars(text: &str, owner: &dyn TermConstructionAdmission) -> EvalResult<Vec<char>> {
+    validate_alphabet(text, owner)?;
+    charge(owner, text.len())?;
+    let count = text.chars().count();
+    let mut chars = Vec::new();
+    reserve_counted(&mut chars, count, owner).map_err(stopped)?;
+    charge(owner, text.len())?;
+    chars.extend(text.chars());
+    owner.check().map_err(stopped)?;
     Ok(chars)
 }
 
-/// SMT-LIB 2.6 Unicode Strings `str.replace_re` (`all == false`) and
+fn append_text(
+    out: &mut String,
+    text: &str,
+    owner: &dyn TermConstructionAdmission,
+) -> EvalResult<()> {
+    charge(owner, text.len())?;
+    reserve_string_counted(out, text.len(), owner).map_err(stopped)?;
+    out.push_str(text);
+    owner.check().map_err(stopped)
+}
+
+fn append_chars(
+    out: &mut String,
+    chars: &[char],
+    owner: &dyn TermConstructionAdmission,
+) -> EvalResult<()> {
+    charge(owner, chars.len())?;
+    let bytes = chars
+        .iter()
+        .try_fold(0usize, |bytes, c| bytes.checked_add(c.len_utf8()))
+        .ok_or_else(|| stopped(owner.refuse(CountedAdmissionError::StorageExhausted)))?;
+    reserve_string_counted(out, bytes, owner).map_err(stopped)?;
+    charge(owner, bytes)?;
+    out.extend(chars.iter());
+    owner.check().map_err(stopped)
+}
+
+fn remember<K: Eq + std::hash::Hash>(
+    memo: &mut DetHashMap<K, bool>,
+    key: K,
+    value: bool,
+    owner: &dyn TermConstructionAdmission,
+) -> EvalResult<()> {
+    charge(owner, 1)?;
+    if !memo.contains_key(&key) {
+        reserve_map_counted(memo, 1, owner).map_err(stopped)?;
+    }
+    charge(owner, 1)?;
+    memo.insert(key, value);
+    owner.check().map_err(stopped)
+}
+
+/// SMT-LIB Unicode Strings `str.replace_re` (`all == false`) and
 /// `str.replace_re_all` (`all == true`).
 ///
 /// # The clause being implemented
@@ -75,27 +156,10 @@ fn checked_chars(text: &str) -> Result<Vec<char>, String> {
 ///   condition that makes the recursion well-founded — and `s` when no such
 ///   decomposition exists.
 ///
-/// # The deliberately fail-closed shape: a nullable regex
-///
-/// When `r` accepts the empty word the two clauses come apart, and that is
-/// exactly the corner this gate refuses to adjudicate:
-///
-/// * `str.replace_re` has no `w != ""` condition, so the minimal-`|x|`,
-///   then-minimal-`|w|` decomposition is `x = w = ""` and the operator
-///   degenerates to prepending `t`;
-/// * `str.replace_re_all` must skip that empty match and look for the leftmost
-///   shortest NON-empty one instead, otherwise it silently becomes the
-///   identity.
-///
-/// Both readings have been read the other way in the past (AY's own search-side
-/// evaluator carried each of those defects at some point), so a nullable `r`
-/// returns `Err` here and the gate reports `CannotConfirm`. That costs
-/// completeness — a genuine `sat` over a nullable regex stays `unknown` — and
-/// costs nothing else: the gate never assumes an assertion it cannot compute.
-///
-/// When `r` is NOT nullable the ambiguity does not arise at all: `"" ∉ [[r]]`
-/// means every decomposition already has `w != ""`, so the two clauses select
-/// the identical match and this function is exact for both operators.
+/// For a nullable language, single replacement prepends the replacement;
+/// replace-all still searches only non-empty intervals. See the Unicode
+/// Strings theory's str.replace_re and str.replace_re_all definitions:
+/// <https://smt-lib.org/theories-UnicodeStrings.shtml>.
 ///
 /// `op` names the operator for the error message.
 pub(crate) fn replace(
@@ -106,47 +170,49 @@ pub(crate) fn replace(
     replacement: &str,
     all: bool,
     entry_depth: usize,
-    eval_string: impl FnMut(TermId) -> Result<String, String>,
-) -> Result<String, String> {
+    eval_string: impl FnMut(TermId) -> EvalResult<String>,
+    owner: &dyn TermConstructionAdmission,
+) -> EvalResult<String> {
     if !matches!(terms.sort(regex), Sort::RegLan) {
-        return Err(format!("{op}: second argument is not RegLan-sorted"));
+        return Err(format!("{op}: second argument is not RegLan-sorted").into());
     }
     // The replacement is spliced in verbatim, so hold it to the same alphabet
     // the matcher enforces on the subject rather than emitting a value this
     // crate would refuse to read back.
-    checked_chars(replacement)?;
+    validate_alphabet(replacement, owner)?;
     let mut matcher = Matcher {
         terms,
-        subject: checked_chars(subject)?,
+        subject: checked_chars(subject, owner)?,
         eval_string,
         budget: MATCH_BUDGET,
         re_memo: DetHashMap::default(),
         loop_memo: DetHashMap::default(),
+        owner,
     };
 
     // Nullability is position-independent for every operator the matcher
     // supports, so probing the empty window at 0 decides it for the whole
     // subject (including the empty subject).
-    if matcher.re_match(regex, 0, 0, entry_depth)? {
-        return Err(format!(
-            "{op}: the regex accepts the empty word, whose replacement semantics this gate \
-             deliberately declines to adjudicate"
-        ));
+    if !all && matcher.re_match(regex, 0, 0, entry_depth)? {
+        let mut out = String::new();
+        append_text(&mut out, replacement, owner)?;
+        append_text(&mut out, subject, owner)?;
+        return Ok(out);
     }
 
     let len = matcher.subject.len();
     let mut out = String::new();
     let mut at = 0usize;
     while let Some((start, end)) = matcher.find_from(regex, at, entry_depth)? {
-        out.extend(matcher.subject[at..start].iter());
-        out.push_str(replacement);
+        append_chars(&mut out, &matcher.subject[at..start], owner)?;
+        append_text(&mut out, replacement, owner)?;
         // `end > start >= at` guarantees progress, so the loop terminates.
         at = end;
         if !all {
             break;
         }
     }
-    out.extend(matcher.subject[at..len].iter());
+    append_chars(&mut out, &matcher.subject[at..len], owner)?;
     Ok(out)
 }
 
@@ -154,6 +220,7 @@ struct Matcher<'a, F> {
     terms: &'a TermStore,
     subject: Vec<char>,
     eval_string: F,
+    owner: &'a dyn TermConstructionAdmission,
     budget: u64,
     /// `(regex, start, end) -> membership`.
     re_memo: DetHashMap<(TermId, usize, usize), bool>,
@@ -168,29 +235,34 @@ struct Matcher<'a, F> {
 
 impl<F> Matcher<'_, F>
 where
-    F: FnMut(TermId) -> Result<String, String>,
+    F: FnMut(TermId) -> EvalResult<String>,
 {
-    fn spend(&mut self) -> Result<(), String> {
+    fn spend(&mut self) -> EvalResult<()> {
+        charge(self.owner, 1)?;
         if self.budget == 0 {
-            return Err("regular-language model check exhausted its work budget".to_string());
+            return Err(EvalError::resource(
+                EvalResource::Work,
+                "regular-language model check exhausted its work budget",
+            ));
         }
         self.budget -= 1;
         Ok(())
     }
 
-    fn check_depth(depth: usize) -> Result<(), String> {
+    fn check_depth(depth: usize) -> EvalResult<()> {
         if depth > MAX_EVAL_DEPTH {
-            Err(format!(
-                "regular-language model check exceeded recursion depth {MAX_EVAL_DEPTH}"
+            Err(EvalError::resource(
+                EvalResource::Depth,
+                format!("regular-language model check exceeded recursion depth {MAX_EVAL_DEPTH}"),
             ))
         } else {
             Ok(())
         }
     }
 
-    fn eval_chars(&mut self, term: TermId) -> Result<Vec<char>, String> {
+    fn eval_chars(&mut self, term: TermId) -> EvalResult<Vec<char>> {
         let text = (self.eval_string)(term)?;
-        checked_chars(&text)
+        checked_chars(&text, self.owner)
     }
 
     /// The leftmost, then shortest, NON-EMPTY match of `regex` inside
@@ -206,7 +278,7 @@ where
         regex: TermId,
         from: usize,
         depth: usize,
-    ) -> Result<Option<(usize, usize)>, String> {
+    ) -> EvalResult<Option<(usize, usize)>> {
         let len = self.subject.len();
         for start in from..len {
             for end in (start + 1)..=len {
@@ -224,14 +296,15 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
+    ) -> EvalResult<bool> {
+        charge(self.owner, 1)?;
         Self::check_depth(depth)?;
         if let Some(&cached) = self.re_memo.get(&(regex, start, end)) {
             return Ok(cached);
         }
         self.spend()?;
         let result = self.re_match_uncached(regex, start, end, depth)?;
-        self.re_memo.insert((regex, start, end), result);
+        remember(&mut self.re_memo, (regex, start, end), result, self.owner)?;
         Ok(result)
     }
 
@@ -242,12 +315,21 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
-        let TermData::App(symbol, args) = self.terms.get(regex) else {
-            return Err("regular-language term is not an application".to_string());
+    ) -> EvalResult<bool> {
+        let terms = self.terms;
+        let TermData::App(symbol, args) = terms.get(regex) else {
+            return Err("regular-language term is not an application".into());
         };
-        let symbol = symbol.clone();
-        let args = args.clone();
+        for _ in 0..symbol.name().len().div_ceil(64).max(1) {
+            self.spend()?;
+        }
+        if matches!(symbol, Symbol::Named(name) if terms.is_declared_function(name)) {
+            return Err(
+                "declared function has no committed regular-language interpretation".into(),
+            );
+        }
+        // The term store is immutable for this entire evaluation. Borrow its
+        // operator/edges instead of allocating a copied argument vector.
         match (symbol.name(), args.len()) {
             ("re.none", 0) => Ok(false),
             ("re.all", 0) => Ok(true),
@@ -256,20 +338,20 @@ where
                 let lo = self.eval_chars(args[0])?;
                 let hi = self.eval_chars(args[1])?;
                 // SMT-LIB defines malformed/reversed ranges as the empty
-                // language, rather than leaving their result unspecified.
-                if lo.len() != 1 || hi.len() != 1 || lo[0] > hi[0] || end != start + 1 {
+                // language; bounds compare by code point (`smtlib_char`).
+                if lo.len() != 1 || hi.len() != 1 || end != start + 1 {
                     return Ok(false);
                 }
-                let c = self.subject[start];
-                Ok(lo[0] <= c && c <= hi[0])
+                let c = code(self.subject[start]);
+                Ok(code(lo[0]) <= c && c <= code(hi[0]))
             }
             ("str.to_re" | "str.to.re", 1) => {
                 let singleton = self.eval_chars(args[0])?;
                 Ok(self.subject[start..end] == singleton[..])
             }
-            ("re.++", n) if n > 0 => self.re_concat(regex, &args, 0, start, end, depth + 1),
+            ("re.++", n) if n > 0 => self.re_concat(regex, args, 0, start, end, depth + 1),
             ("re.union", n) if n > 0 => {
-                for child in args {
+                for &child in args {
                     if self.re_match(child, start, end, depth + 1)? {
                         return Ok(true);
                     }
@@ -277,7 +359,7 @@ where
                 Ok(false)
             }
             ("re.inter", n) if n > 0 => {
-                for child in args {
+                for &child in args {
                     if !self.re_match(child, start, end, depth + 1)? {
                         return Ok(false);
                     }
@@ -313,11 +395,11 @@ where
                 Ok(true)
             }
             ("re.loop", 1) => {
-                let Symbol::Indexed(_, indices) = &symbol else {
-                    return Err("re.loop is missing its repetition indices".to_string());
+                let Symbol::Indexed(_, indices) = symbol else {
+                    return Err("re.loop is missing its repetition indices".into());
                 };
                 let [lo, hi] = indices.as_slice() else {
-                    return Err("re.loop requires exactly two repetition indices".to_string());
+                    return Err("re.loop requires exactly two repetition indices".into());
                 };
                 self.re_loop(
                     regex,
@@ -330,16 +412,16 @@ where
                 )
             }
             ("re.^", 1) => {
-                let Symbol::Indexed(_, indices) = &symbol else {
-                    return Err("re.^ is missing its repetition index".to_string());
+                let Symbol::Indexed(_, indices) = symbol else {
+                    return Err("re.^ is missing its repetition index".into());
                 };
                 let [count] = indices.as_slice() else {
-                    return Err("re.^ requires exactly one repetition index".to_string());
+                    return Err("re.^ requires exactly one repetition index".into());
                 };
                 let count = u64::from(*count);
                 self.re_loop(regex, args[0], count, count, start, end, depth + 1)
             }
-            (name, _) => Err(format!("unsupported regular-language operator {name}")),
+            (name, _) => Err(format!("unsupported regular-language operator {name}").into()),
         }
     }
 
@@ -352,7 +434,8 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
+    ) -> EvalResult<bool> {
+        charge(self.owner, 1)?;
         Self::check_depth(depth)?;
         if index == args.len() {
             return Ok(start == end);
@@ -378,7 +461,7 @@ where
                 break;
             }
         }
-        self.loop_memo.insert(key, result);
+        remember(&mut self.loop_memo, key, result, self.owner)?;
         Ok(result)
     }
 
@@ -390,7 +473,8 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
+    ) -> EvalResult<bool> {
+        charge(self.owner, 1)?;
         Self::check_depth(depth)?;
         if start == end {
             return Ok(true);
@@ -403,7 +487,7 @@ where
         // A pending false is a conservative cycle guard: a malformed cyclic
         // term store can lose completeness but can never read back a false
         // positive.
-        self.loop_memo.insert(key, false);
+        remember(&mut self.loop_memo, key, false, self.owner)?;
         let mut result = false;
         for split in (start + 1)..=end {
             if self.re_match(body, start, split, depth + 1)?
@@ -413,7 +497,7 @@ where
                 break;
             }
         }
-        self.loop_memo.insert(key, result);
+        remember(&mut self.loop_memo, key, result, self.owner)?;
         Ok(result)
     }
 
@@ -427,7 +511,8 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
+    ) -> EvalResult<bool> {
+        charge(self.owner, 1)?;
         Self::check_depth(depth)?;
         if lo > hi {
             return Ok(false);
@@ -456,7 +541,8 @@ where
         start: usize,
         end: usize,
         depth: usize,
-    ) -> Result<bool, String> {
+    ) -> EvalResult<bool> {
+        charge(self.owner, 1)?;
         Self::check_depth(depth)?;
         if lo == 0 && start == end {
             return Ok(true);
@@ -469,7 +555,7 @@ where
             return Ok(cached);
         }
         self.spend()?;
-        self.loop_memo.insert(key, false);
+        remember(&mut self.loop_memo, key, false, self.owner)?;
         let mut result = false;
         for split in start..=end {
             if self.re_match(body, start, split, depth + 1)?
@@ -487,7 +573,7 @@ where
                 break;
             }
         }
-        self.loop_memo.insert(key, result);
+        remember(&mut self.loop_memo, key, result, self.owner)?;
         Ok(result)
     }
 }

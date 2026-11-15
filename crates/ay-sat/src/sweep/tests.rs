@@ -100,10 +100,27 @@ fn kitten_sweep_rejects_asymmetric_implication_as_equivalence() {
     );
 }
 
+/// x0 ≡ x1 and x0 ≡ ¬x1 (the second through x2, as two environments would
+/// deliver it): no map, the contradiction named, the class not collapsed.
+#[test]
+fn contradictory_equivalences_are_reported_instead_of_collapsing_a_class() {
+    let mut sweeper = Sweeper::new(3);
+    // (0,2): x0 ≡ x1; (2,4): x1 ≡ x2; (0,5): x0 ≡ ¬x2.
+    let (lit_map, contradiction) =
+        sweeper.build_lit_map_from_equivalences(&[(0, 2), (2, 4), (0, 5)], &[], 6);
+    assert!(
+        lit_map.is_empty(),
+        "a contradictory class must not produce a map"
+    );
+    assert_eq!(contradiction, Some(0));
+}
+
 #[test]
 fn kitten_lit_map_preserves_negation_invariant_for_equivalence_chain() {
     let mut sweeper = Sweeper::new(3);
-    let lit_map = sweeper.build_lit_map_from_equivalences(&[(0, 2), (2, 4)], &[], 6);
+    let (lit_map, contradiction) =
+        sweeper.build_lit_map_from_equivalences(&[(0, 2), (2, 4)], &[], 6);
+    assert_eq!(contradiction, None);
 
     assert_eq!(lit_map.len(), 6);
     for i in (0..lit_map.len()).step_by(2) {

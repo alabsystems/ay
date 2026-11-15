@@ -178,6 +178,31 @@ fn test_hnf_d_equals_1() {
     );
 }
 
+#[test]
+fn hnf_unit_scale_normalizes_the_diagonal() {
+    // The maximal minors are 6, 3 and -2, so the column lattice is Z^2.
+    // The existing determinant selector returns the valid modulus 3.
+    // At row 1, Bezout gives u=1 for (-2, 3); keeping the old diagonal
+    // would make the required exact division 3 / -2 panic.
+    let mut a = IntMatrix::new(2, 3);
+    for (row, values) in [[-3, 0, -1], [0, -2, -1]].iter().enumerate() {
+        for (col, value) in values.iter().enumerate() {
+            a.set(row, col, BigInt::from(*value));
+        }
+    }
+    let (d, basis) = determinant_of_rectangular_matrix(&a, &BigInt::from(1_000_000)).unwrap();
+    assert_eq!(d, BigInt::from(3));
+    assert_eq!(basis, vec![0, 1]);
+    let h = compute_hnf(&a, &d)
+        .expect("a valid modulus must permit unit-scale normalization")
+        .h;
+    for row in 0..2 {
+        for col in 0..3 {
+            assert_eq!(h.get(row, col), &BigInt::from(i32::from(row == col)));
+        }
+    }
+}
+
 /// Feed an equality system to the cutter exactly the way `try_hnf_cuts` does
 /// (one upper- and one lower-bound row per equality) and return the cuts.
 fn cuts_for_equalities(
@@ -209,6 +234,30 @@ fn assert_cuts_admit(cuts: &[super::cutter::HnfCut], point: &[i64], label: &str)
              of the very equalities it was derived from (lhs = {lhs})",
             cut.coeffs,
             cut.bound,
+        );
+    }
+}
+
+#[test]
+fn hnf_unit_scale_cuts_preserve_integer_witnesses() {
+    let eqs = vec![
+        (
+            vec![(0, BigInt::from(-3)), (2, BigInt::from(-1))],
+            BigInt::one(),
+        ),
+        (
+            vec![(1, BigInt::from(-2)), (2, BigInt::from(-1))],
+            BigInt::one(),
+        ),
+    ];
+    // Upper/lower rows exercise the actual basis selection and HNF caller.
+    // These points satisfy -3*x0-x2 = -2*x1-x2 = 1.
+    let cuts = cuts_for_equalities(&eqs, 3);
+    for q in -4..=4 {
+        assert_cuts_admit(
+            &cuts,
+            &[2 * q, 3 * q, -6 * q - 1],
+            "unit-scale affine witness",
         );
     }
 }
@@ -336,5 +385,36 @@ fn test_divide_r_by_diagonal_invariant_violation_behavior() {
             result.expect("release builds should not panic").is_none(),
             "release builds should return None on HNF divisibility invariant violation"
         );
+    }
+}
+
+// A valid determinant multiple still requires reducing a diagonal when the
+// Bezout coefficient is one. The old skipped store panicked on 2 % 7.
+#[test]
+fn unit_bezout_coefficient_still_installs_the_canonical_diagonal() {
+    for (pivot, diagonal) in [(2_i64, "7"), (3, "-5"), (3, "-10000000000000000007")] {
+        let mut a = IntMatrix::new(2, 3);
+        a.set(0, 0, BigInt::from(pivot));
+        a.set(0, 2, BigInt::one());
+        a.set(1, 1, diagonal.parse().unwrap());
+        a.set(1, 2, BigInt::one());
+        let (d, rows) = determinant_of_rectangular_matrix(&a, &(BigInt::one() << 250)).unwrap();
+        assert_eq!(d, BigInt::from(pivot));
+        assert_eq!(rows, [0, 1]);
+        let hnf = compute_hnf(&a, &d).expect("valid bounded matrix has canonical HNF");
+        for row in 0..2 {
+            for column in 0..3 {
+                let expected = if row == column {
+                    BigInt::one()
+                } else {
+                    BigInt::zero()
+                };
+                assert_eq!(
+                    hnf.h.get(row, column),
+                    &expected,
+                    "{pivot}/{diagonal}: {row},{column}"
+                );
+            }
+        }
     }
 }

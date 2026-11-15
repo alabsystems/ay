@@ -557,6 +557,70 @@ fn chc_worker_package_lanes_do_not_expand_to_all_track_smoke() {
     assert!(matches!(plan, ChcWorkerBenchmarkPlan::PackageOnly(_)));
 }
 
+/// The CHC gates' BenchExec XML check must still refuse malformed XML now that
+/// it runs on python3 rather than xmllint. Unix only: on Windows the gates find
+/// python3 through the MSYS2 PATH the integration tests supply.
+#[cfg(unix)]
+#[test]
+fn chc_benchexec_xml_parse_check_refuses_malformed_xml() {
+    let dir = make_temp_dir("ay-submit-benchexec-xml").expect("temp dir");
+    let parses = |name: &str, text: &str| {
+        let path = dir.join(name);
+        fs::write(&path, text).expect("write XML fixture");
+        Command::new("python3")
+            .args(["-c", CHC_BENCHEXEC_XML_PARSE])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run python3")
+            .success()
+    };
+    assert!(parses(
+        "well-formed.xml",
+        "<?xml version=\"1.0\"?>\n<benchmark tool=\"ay\"><rundefinition name=\"r\"/></benchmark>\n"
+    ));
+    assert!(!parses(
+        "unclosed.xml",
+        "<benchmark tool=\"ay\"><rundefinition name=\"r\"></benchmark>\n"
+    ));
+    assert!(!parses("empty.xml", ""));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Regression: the SMT interactive smoke killed the wrapper straight after
+/// closing stdin, racing the solver's own exit on EOF. Since ae33123fe a
+/// solver whose supervisor is SIGKILLed says so on stderr, so the smoke failed
+/// a correct package whenever the host was loaded. This stand-in has the same
+/// shape (a supervising shell over a solver child sharing stderr) and makes the
+/// race deterministic: its solver takes 0.5 s to finish after EOF and reports
+/// on stderr if its supervisor was killed first.
+#[cfg(unix)]
+#[test]
+fn smt_interactive_smoke_lets_eof_end_the_session_before_killing() {
+    let dir = make_temp_dir("ay-submit-smt-interactive-eof").expect("temp dir");
+    write_text(
+        &dir.join("run_incr.sh"),
+        r#"#!/usr/bin/env bash
+bash -c '
+  supervisor=$PPID
+  while IFS= read -r line; do
+    [ "$line" = "(check-sat)" ] && echo sat
+  done
+  sleep 0.5
+  [ "$(ps -o ppid= -p $$ | tr -d " ")" = "$supervisor" ] ||
+    echo "c supervisor killed before the solver finished" >&2
+'
+exit $?
+"#,
+        true,
+    )
+    .expect("write stand-in SMT incremental wrapper");
+    let result = smt_incremental_interactive_smoke(&dir, "run_incr.sh");
+    let _ = fs::remove_dir_all(&dir);
+    result.expect("a solver that exits on EOF must pass the interactive smoke");
+}
+
 fn chc_test_tracks_without(missing: &str) -> String {
     CHC_ALLOWED_TRACKS
         .iter()

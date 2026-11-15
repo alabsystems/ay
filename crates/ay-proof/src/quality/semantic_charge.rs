@@ -15,15 +15,57 @@ fn class_specific_semantic_charge(
 ) -> Result<Option<(usize, usize)>, ProofCheckError> {
     let charge = match class {
         SemanticChargeClass::ResolutionRoute => (0, 0),
+        SemanticChargeClass::BvBitBlastReplay => {
+            // validate_bv_bitblast_controlled first scans Bool sorts and the
+            // reachable DAG for BV content, then runs the same bounded
+            // evaluator as BoolTautology. Its possible proof-producing replay
+            // was already reserved by validate_expensive_bv_budget; charging
+            // a second, payload-squared replay estimate can reject a proof
+            // before that bounded checker is entered.
+            let (evaluation, bytes) = bounded_assignment_eval_charge(payload)?;
+            let structural = checked_mul_usize(payload.work, 4)?;
+            (
+                checked_add_usize(evaluation, structural)?
+                    .min(replaced_general_product(payload, 1 << 8)),
+                bytes,
+            )
+        }
+        // The sort checks, the BV-membership scan and the classification walk
+        // that refuses: the replay arm's structural limb, and the payload's
+        // own bytes.
+        SemanticChargeClass::BvBitBlastWithoutEvaluation => {
+            (checked_mul_usize(payload.work, 4)?, payload.bytes)
+        }
         SemanticChargeClass::BoundedAssignmentEval => bounded_assignment_eval_charge(payload)?,
+        SemanticChargeClass::ClosedBvConstantRelation => {
+            let (work, old_bytes) = bounded_assignment_eval_charge(payload)?;
+            // The exact fragment's fixed scratch bound is derived beside its
+            // syntax gate. This never changes work, semantic validation or the
+            // caller's budget, and never exceeds the previous byte charge.
+            let bytes = checked_add_usize(checked_mul_usize(payload.bytes, 4)?, 4096)?;
+            (work, old_bytes.min(bytes))
+        }
         SemanticChargeClass::UnorderedClauseMatch => unordered_clause_match_charge(step, payload)?,
         SemanticChargeClass::EufIdentityRoute => (
             checked_mul_usize(payload.work, EUF_IDENTITY_WORK_FACTOR)?,
             checked_mul_usize(payload.bytes, EUF_IDENTITY_BYTE_FACTOR)?,
         ),
         SemanticChargeClass::ClauseIdentityRoute => clause_identity_route_charge(payload)?,
+        SemanticChargeClass::AndNegIdentityShape => {
+            // Shared 32*DAG-work+32 price: the classifier and validator each
+            // perform one immediate-ID/Bool-sort scan. Payload work includes
+            // at least both the n+1 clause slots and n source-argument slots,
+            // so this bounds both scans without a tree-unfolding product.
+            and_pos_charge::and_pos_shallow_match_charge(payload)?
+        }
         SemanticChargeClass::AndPosShallowMatch => {
             and_pos_charge::and_pos_shallow_match_charge(payload)?
+        }
+        SemanticChargeClass::QuantifierProgressMetered => {
+            quantifier_charge::quantifier_progress_charge(step, payload)?
+        }
+        SemanticChargeClass::EquivPosIdentityShape => {
+            quantifier_charge::equiv_pos_identity_charge(payload)?
         }
         SemanticChargeClass::DatatypeEnumPigeonhole => (
             checked_mul_usize(payload.work.max(payload.unfolded_work), 8)?,
@@ -41,9 +83,97 @@ fn class_specific_semantic_charge(
             )
         }
         SemanticChargeClass::TrustKindProgressMetered => trust_kind_progress_charge(payload)?,
+        SemanticChargeClass::ArrayRowShape => array_row_shape_charge(payload)?,
+        SemanticChargeClass::ArrayExtensionalityShape => {
+            array_extensionality_shape_charge(payload)?
+        }
         SemanticChargeClass::General | SemanticChargeClass::ProgressFarkas => return Ok(None),
     };
     Ok(Some(charge))
+}
+
+/// Slot reads per literal that bound `validate_array_select_store`
+/// ([`SemanticChargeClass::ArrayRowShape`]).
+///
+/// Counted from the validator, for a clause of `L` literals: two non-Bool
+/// scans (`2L` sort reads), one `flatten_clause_literals` (`1` read plus a
+/// clone of the flattened literals), then the three matchers. Each matcher is
+/// a fixed program per literal — `matches_row1_conditional` is the widest at
+/// `equality_sides` (2) + `row1_eq_parts` (two `select_store_parts` at 9 each
+/// plus 2 comparisons) + `find` (2) + `matches_not_equality_pair` (4) + one
+/// sort read = 29 — and the three together stay under 64 reads per literal,
+/// including the two-literal length guards that make every wider clause fail
+/// after the scans. A flattened literal that came from a unit `or` is an
+/// argument of that `or`, i.e. a DAG node the base payload walk debited as
+/// one unit of `payload.work`, so `payload.work` bounds the literal count on
+/// both routes.
+pub(super) const ARRAY_ROW_SHAPE_WORK_FACTOR: usize = 64;
+
+/// Slot reads per reachable DAG node that bound the chain route of
+/// `validate_array_extensionality`
+/// ([`SemanticChargeClass::ArrayExtensionalityShape`]).
+///
+/// `extensionality_chain_parts` tries two literal orderings; each costs
+/// `equality_sides` (2) + three sort reads + `negated_equality_sides` (3),
+/// then `select_chain_to_array_pair` at two `well_sorted_select_parts` (5
+/// reads each) + two sort reads + four comparisons per peeled level, and then
+/// `validate_extensionality_binding` per level: one `terms.get`, one
+/// registry lookup keyed by the witness name, three comparisons. Every level
+/// is a distinct `select` node of the literal, so levels are bounded by
+/// `payload.work`, and `16 + 58 * levels <= 64 * payload.work + 64`. The
+/// folded-read fallback is NOT in this factor: it debits its own consumption
+/// through the progress callback (see [`FOLDED_READ_UNIT_WORK`]).
+pub(super) const ARRAY_EXTENSIONALITY_SHAPE_WORK_FACTOR: usize = 64;
+
+/// Work debited per folded-read budget unit the extensionality fallback
+/// consumes (`crate::checker::array_axiom::FoldedReadWorkBudget::consume`).
+///
+/// One unit is one memoized `FoldedReadMatcher::matches_target` node: a memo
+/// probe and insert keyed by a four-tuple, two `Sort` clones, a handful of
+/// sort/slot reads, and a `decode_store_fold` walk bounded by the matcher's
+/// `FOLD_BOUND` of 64 store levels. 256 covers all of it with headroom; the
+/// whole-proof cap of `FOLDED_REGISTRY_WORK_LIMIT` (100_000) units bounds
+/// the total at 25.6M, well inside any caller envelope.
+pub(crate) const FOLDED_READ_UNIT_WORK: usize = 256;
+
+/// Exact model for [`SemanticChargeClass::ArrayRowShape`]: a constant number
+/// of slot reads per literal, and the flatten clone's bytes (already inside
+/// `payload.bytes`, which the base walk debits per pushed literal and per
+/// reachable node).
+///
+/// Capped by [`replaced_general_product`] so it is a TIGHTENING at every
+/// payload; the byte limb is unchanged (the private model contributed nothing
+/// for this kind), so this cannot newly refuse on bytes.
+fn array_row_shape_charge(payload: PayloadStats) -> Result<(usize, usize), ProofCheckError> {
+    let reads = checked_mul_usize(payload.work, ARRAY_ROW_SHAPE_WORK_FACTOR)?;
+    // A `work = 0` payload must still pay for the constant-time guards.
+    let modelled = checked_add_usize(reads, ARRAY_ROW_SHAPE_WORK_FACTOR)?;
+    Ok((
+        modelled.min(replaced_general_product(payload, 1)),
+        payload.bytes,
+    ))
+}
+
+/// Exact model for [`SemanticChargeClass::ArrayExtensionalityShape`]: the
+/// chain route's reads, plus the `(array_a, array_b, witness)` binding vector
+/// (three `TermId`s per peeled level) on the byte side.
+///
+/// Work is capped by [`replaced_general_product`]; bytes are capped by the
+/// `2 * payload.bytes` the replaced private model charged. Both limbs are
+/// therefore tightenings, and the fallback's consumption arrives through the
+/// progress callback on top.
+fn array_extensionality_shape_charge(
+    payload: PayloadStats,
+) -> Result<(usize, usize), ProofCheckError> {
+    let reads = checked_mul_usize(payload.work, ARRAY_EXTENSIONALITY_SHAPE_WORK_FACTOR)?;
+    let modelled = checked_add_usize(reads, ARRAY_EXTENSIONALITY_SHAPE_WORK_FACTOR)?;
+    let binding_bytes = checked_mul_usize(payload.work, 3 * size_of::<TermId>())?;
+    let bytes = checked_add_usize(payload.bytes, binding_bytes)?;
+    let replaced_bytes = payload.bytes.saturating_mul(2);
+    Ok((
+        modelled.min(replaced_general_product(payload, 1)),
+        bytes.min(replaced_bytes),
+    ))
 }
 
 /// Exact worst case of the three syntax-only clause-identity validators —
@@ -305,23 +435,31 @@ fn private_validator_charge(
         ProofStep::TheoryLemma {
             kind: TheoryLemmaKind::FpGroundEval,
             ..
-        } => (
-            crate::checker::FP_GROUND_WORK_LIMIT,
-            checked_mul_usize(payload.bytes, 1 << 16)?,
-        ),
+        } => {
+            // The exact ground kernel now borrows this same caller and prices
+            // its structural walks, clones, enumeration and numeric scratch
+            // before work/allocation. A worst-case 65,536-assignment byte
+            // multiplier would double-charge even a one-assignment ground DAG.
+            (0, 0)
+        }
         ProofStep::TheoryLemma {
             kind: TheoryLemmaKind::FpClassification { .. },
             ..
-        } => scale_validator_charge(base_work, payload.bytes, 1 << 16)?,
+        } => {
+            // The metered unique-DAG census counts the same distinct FP
+            // variable bits as the bounded evaluator. Ground clauses have
+            // one assignment; the 16-bit enumeration ceiling is unchanged.
+            scale_validator_charge(base_work, payload.bytes, payload.fp_assignments.max(1))?
+        }
         ProofStep::TheoryLemma {
             kind: TheoryLemmaKind::OrderIteTautology,
             ..
         } => scale_validator_charge(base_work, payload.bytes, payload.order_assignments)?,
         // `BoolTautology` is NOT here: it owns
         // `SemanticChargeClass::BoundedAssignmentEval`, which charges the
-        // evaluator's exact worst case. The BV kinds keep the conservative
-        // product because they can also enter the separately budgeted
-        // proof-producing bit-blast replay.
+        // evaluator's exact worst case. Unannotated BvBitBlast owns its
+        // replay-aware class; annotated gates retain this conservative
+        // product for their additional recursive gate-matching path.
         ProofStep::TheoryLemma {
             kind: TheoryLemmaKind::BvBitBlast | TheoryLemmaKind::BvBitBlastGate { .. },
             ..

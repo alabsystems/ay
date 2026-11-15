@@ -782,7 +782,10 @@ fn test_lambda_beta_fp_pin_rejects_only_dependent_applications() {
     values.insert(dependent, pinned_result.clone());
     values.insert(independent, pinned_result.clone());
     let mut model = empty_model();
-    model.fp_model = Some(FpModel { values });
+    model.fp_model = Some(FpModel {
+        values,
+        ..Default::default()
+    });
 
     assert_eq!(
         executor.evaluate_term(&model, dependent_read),
@@ -804,10 +807,11 @@ fn test_lambda_beta_fp_bitblast_concretizes_bound_value() {
     let mut executor = Executor::new();
     let fp16 = Sort::FloatingPoint(5, 11);
     let x = executor.ctx.terms.mk_var("x", fp16.clone());
-    let rtp = executor
-        .ctx
-        .terms
-        .mk_var("RTP", Sort::Uninterpreted("RoundingMode".to_string()));
+    let rtp = executor.ctx.terms.mk_app(
+        Symbol::named("RTP"),
+        [],
+        Sort::Uninterpreted("RoundingMode".to_string()),
+    );
     let zero = executor
         .ctx
         .terms
@@ -825,7 +829,10 @@ fn test_lambda_beta_fp_bitblast_concretizes_bound_value() {
     let mut values = HashMap::default();
     values.insert(x, FpModelValue::PosInf { eb: 5, sb: 11 });
     let mut model = empty_model();
-    model.fp_model = Some(FpModel { values });
+    model.fp_model = Some(FpModel {
+        values,
+        ..Default::default()
+    });
 
     assert_eq!(
         executor.evaluate_term(&model, read),
@@ -1410,12 +1417,77 @@ fn test_finalize_sat_model_validation_delegates_array_false_with_array_model_878
     executor.last_result = Some(SolveResult::Sat);
     executor.last_model = Some(model);
 
+    // (#bv-array-delegation) Observation no longer delegates this false
+    // evaluation (see the test below). The `sat` survives because model
+    // completion repairs the partial interpretations before validation, after
+    // which the definition evaluates true independently.
     let result = executor
         .finalize_sat_model_validation()
-        .expect("array-theory-backed false evaluation should be delegated");
+        .expect("the completed array model satisfies the definition");
 
     assert_eq!(result, SolveResult::Sat);
     assert_eq!(executor.last_result, Some(SolveResult::Sat));
+    assert_eq!(
+        executor
+            .statistics()
+            .get_int("model_validation.array_delegated")
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// The #8785 arm itself, on the model before completion: the partial
+/// interpretations falsify `(= a (store b 0 1))`. Observation used to count
+/// that as a delegated array-theory check, on the premise that the array
+/// solver had checked ROW/store consistency. That check is about the solver's
+/// own assignment, not the arrays the model prints, so a concrete false is
+/// never verified now, whatever lane produced the model (#bv-array-delegation).
+/// On the old code `validate_model` returns `Ok` with one delegated check.
+#[test]
+fn test_validate_model_does_not_verify_a_false_array_definition_8785() {
+    let mut executor = Executor::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = executor.ctx.terms.mk_var("a", array_sort.clone());
+    let b = executor.ctx.terms.mk_var("b", array_sort.clone());
+    let zero = executor.ctx.terms.mk_int(BigInt::from(0));
+    let one = executor.ctx.terms.mk_int(BigInt::from(1));
+    let stored = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("store"), vec![b, zero, one], array_sort);
+    let assertion = executor.ctx.terms.mk_eq(a, stored);
+    let mut model = model_with_sat_assignments(&[(assertion, true)]);
+    let mut array_values = HashMap::default();
+    array_values.insert(a, ay_arrays::ArrayInterpretation::default());
+    array_values.insert(b, ay_arrays::ArrayInterpretation::default());
+    model.array_model = Some(ArrayModel {
+        array_values,
+        ..Default::default()
+    });
+    assert_eq!(
+        executor.evaluate_term(&model, assertion),
+        EvalValue::Bool(false)
+    );
+    executor.ctx.assertions.push(assertion);
+    executor.last_result = Some(SolveResult::Sat);
+    executor.last_model = Some(model);
+
+    match executor.validate_model() {
+        Err(ModelValidationError::Incomplete(failure)) => {
+            assert_eq!(
+                failure.boundary,
+                ay_core::VerificationBoundary::SmtGroundAssertion
+            );
+            assert!(
+                failure
+                    .detail
+                    .contains("array assertion evaluates to false; fail-closed"),
+                "unexpected detail: {}",
+                failure.detail
+            );
+        }
+        other => panic!("a false array definition must not validate, got {other:?}"),
+    }
 }
 
 #[test]

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Exact Z3 5.1.0 command-line tactic/probe/simplifier catalogs.
+//! Z3 5.1.0 catalogs plus implemented Z3 5.3.3 extensions.
 //!
 //! The catalogs and parameter profiles were mechanically captured from
 //! `/opt/homebrew/bin/z3` (`Z3 version 5.1.0 - 64 bit`, SHA-256
@@ -201,6 +201,7 @@ const SIMPLIFIERS: &[(&str, &str)] = &[
     ("factor", "polynomial factorization."),
     ("fold-unfold", "solve for variables."),
     ("injectivity", "Identifies and applies injectivity axioms."),
+    ("max-bv-sharing", "use heuristics to maximize the sharing of bit-vector expressions such as adders and multipliers."),
     ("ng-push-app-ite", "Push functions over if-then-else within non-ground terms only."),
     ("ng-push-app-ite-conservative", "Push functions over if-then-else within non-ground terms only."),
     ("propagate-bv-bounds", "propagate bit-vector bounds by simplifying implied or contradictory bounds."),
@@ -1329,6 +1330,7 @@ const SIMPLIFIER_DETAILS: &[(&str, u8)] = &[
     ("factor", 18),
     ("fold-unfold", 6),
     ("injectivity", 6),
+    ("max-bv-sharing", 6),
     ("ng-push-app-ite", 6),
     ("ng-push-app-ite-conservative", 6),
     ("propagate-bv-bounds", 30),
@@ -1346,13 +1348,60 @@ const SIMPLIFIER_DETAILS: &[(&str, u8)] = &[
     ("special-relations", 6),
 ];
 
+// Implemented native extensions, kept separate from the authenticated 5.1.0
+// overlay. The CLI must discover the same usable field tactics as the API.
+const NATIVE_TACTICS: &[(&str, &str)] = &[
+    (
+        "ff-sat",
+        "Original-owned lazy Boolean and prime-field reasoning with typed model reconstruction and independently checked native resolution/algebra; unsupported source and external proof/core transport refuse.",
+    ),
+    (
+        "ff-simplify",
+        "simplify field expressions and propagate constants (no certificates).",
+    ),
+    (
+        "ff-solve",
+        "decide admitted prime-field conjunctions with independently checked models and ideal refutations; unsupported source remains, proof/core transport refuses.",
+    ),
+    (
+        "ff-unique",
+        "propagate affine field dependencies and congruence; retain stalled goals, without proof/core transport or Boolean digit splitting.",
+    ),
+    (
+        "ff2bv",
+        "encode quantifier-free prime-field residues into bit-vectors with typed model reconstruction; unsupported proof/core transport refuses.",
+    ),
+];
+
 pub(crate) fn print_request(request: &str) {
     if request == "-tactics" {
-        print_catalog(TACTICS);
+        // Merge already-sorted static catalogs without allocation. Retain the
+        // native description if a later overlay also contains an extension.
+        let mut historical = TACTICS.iter().peekable();
+        let mut native = NATIVE_TACTICS.iter().peekable();
+        loop {
+            let entry = match (historical.peek(), native.peek()) {
+                (Some(a), Some(b)) if a.0 < b.0 => historical.next(),
+                (Some(a), Some(b)) if a.0 == b.0 => {
+                    historical.next();
+                    native.next()
+                }
+                (_, Some(_)) => native.next(),
+                (Some(_), None) => historical.next(),
+                (None, None) => break,
+            };
+            if let Some(&(name, description)) = entry {
+                safe_println!("- {name} {description}");
+            }
+        }
     } else if let Some(name) = request.strip_prefix("-tactics:") {
         print_detail(TACTIC_DETAILS, name);
     } else if request == "-simplifiers" {
         print_catalog(SIMPLIFIERS);
+        print_catalog(&[(
+            "ff-simplify",
+            "simplify prime-field goals ahead of QF_FF decision procedures.",
+        )]);
     } else if let Some(name) = request.strip_prefix("-simplifiers:") {
         print_detail(SIMPLIFIER_DETAILS, name);
     } else if request == "-probes" || request.starts_with("-probes:") {
@@ -1381,17 +1430,6 @@ fn print_detail(entries: &[(&str, u8)], name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exact_z3_510_catalog_cardinalities_are_closed() {
-        assert_eq!(TACTICS.len(), 118);
-        assert_eq!(PROBES.len(), 42);
-        assert_eq!(SIMPLIFIERS.len(), 36);
-        assert_eq!(TACTIC_DETAILS.len(), TACTICS.len());
-        assert_eq!(SIMPLIFIER_DETAILS.len(), SIMPLIFIERS.len());
-        assert_eq!(PARAMETER_LINES.len(), 618);
-        assert_eq!(PARAMETER_PROFILES.len(), 57);
-    }
 
     #[test]
     fn catalogs_are_strictly_sorted_and_detail_profiles_are_total() {

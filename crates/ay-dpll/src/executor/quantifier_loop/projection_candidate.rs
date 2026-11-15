@@ -1261,14 +1261,6 @@ mod tests {
         assert_eq!((accepted, rejected), (3, 6));
     }
 
-    // The exact 121-file production gate intentionally lives outside `cargo test`:
-    //
-    //   python3 scripts/ufbv_fixpoint_audit.py OUT.json
-    //
-    // That harness runs every case in fresh default and `--self-check` child
-    // processes, plans and enforces their memory envelope through `_oom_guard.py`,
-    // excludes concurrent builds, and records binary/corpus/resource provenance.
-    // Keep corpus execution there: an environment-gated Rust test is reported as
-    // passed when it does no work, and an in-process cooperative limit is not an
-    // enforceable per-child RSS boundary.
+    // Corpus runs belong in native benchmark execution with explicit process
+    // limits; the tests above independently check projection certificates.
 }

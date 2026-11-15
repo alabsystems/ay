@@ -3,9 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 //! End-to-end tests: ay solves a SAT problem, exports the LRAT certificate as a
-//! self-contained Lean4 checker-acceptance file, and (when `lean` is on PATH)
-//! asks Lean to evaluate that checker. This does not establish checker
-//! soundness; the production CLI uses `write_lean4_verified` for authority.
+//! self-contained Lean4 checker-acceptance file, and (under `lean-integration`)
+//! asks the Lean the repository pins in `lean-toolchain` to evaluate that
+//! checker. This does not establish checker soundness; the production CLI uses
+//! `write_lean4_verified` for authority.
 //!
 //! The tests in `ay_sat::lean_export` exercise the emitter on hand-crafted
 //! LRAT steps. These tests close the loop by driving the full pipeline:
@@ -14,7 +15,9 @@
 //! Default `cargo test` always runs the emission path (writing the Lean source
 //! and sanity-checking its structure). Kernel invocation is behind the
 //! `lean-integration` feature so the default test suite does not require a
-//! Lean4 toolchain.
+//! Lean4 toolchain. It runs `elan run <pinned toolchain> lean` through
+//! `ay_test_support::lean`, never a `lean` found on PATH: inside aterm that
+//! name reaches a reroute stub that runs Trust's `clean` instead.
 
 #![allow(clippy::print_stderr)]
 
@@ -79,7 +82,7 @@ fn solve_and_emit_lean4_kernel(dimacs: &str, label: &str) -> String {
 }
 
 /// Structural sanity checks on the emitted Lean4 source. These run on every
-/// `cargo test` invocation and do NOT require `lean` on PATH.
+/// `cargo test` invocation and do NOT require a Lean toolchain.
 fn assert_structural(source: &str, label: &str) {
     for needle in [
         "namespace AY.LratProof",
@@ -121,13 +124,16 @@ fn assert_structural(source: &str, label: &str) {
     );
 }
 
-/// When `lean-integration` is enabled, shell out to `lean` and fail the test
-/// if the kernel rejects the emitted proof. Requires `lean` on PATH.
+/// When `lean-integration` is enabled, run the pinned Lean on the emitted proof
+/// and fail the test if the kernel rejects it. Requires elan with the toolchain
+/// named in the repository's `lean-toolchain` installed; a missing one fails
+/// with the toolchain's name and its `elan toolchain install` line.
 #[cfg(feature = "lean-integration")]
 fn assert_lean_kernel_accepts(source: &str, label: &str) {
     use std::io::Write as _;
-    use std::process::Command;
 
+    let lean = ay_test_support::lean::pinned_lean(env!("CARGO_MANIFEST_DIR"))
+        .unwrap_or_else(|reason| panic!("{label}: pinned Lean unavailable: {reason}"));
     let seq = LEAN_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let tmp = std::env::temp_dir().join(format!("ay_lean_e2e_{label}_{pid}_{seq}.lean"));
@@ -138,10 +144,11 @@ fn assert_lean_kernel_accepts(source: &str, label: &str) {
             .unwrap_or_else(|e| panic!("{label}: write {tmp:?}: {e}"));
     }
 
-    let out = Command::new("lean")
+    let out = lean
+        .lean()
         .arg(&tmp)
         .output()
-        .unwrap_or_else(|e| panic!("{label}: failed to spawn `lean`: {e}"));
+        .unwrap_or_else(|e| panic!("{label}: failed to spawn {lean}: {e}"));
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -157,7 +164,7 @@ fn assert_lean_kernel_accepts(source: &str, label: &str) {
         out.status,
         &source[..source.len().min(800)]
     );
-    eprintln!("lean kernel VERIFIED ay-emitted proof ({label})");
+    eprintln!("lean kernel VERIFIED ay-emitted proof ({label}; {lean})");
 }
 
 #[cfg(not(feature = "lean-integration"))]

@@ -1,0 +1,5 @@
+pseudo-Boolean proof version 2.0
+f 1
+output NONE
+conclusion SAT
+end pseudo-Boolean proof

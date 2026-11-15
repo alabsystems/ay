@@ -6,6 +6,41 @@
 
 use super::*;
 
+fn checked_fp_stop_or_early_refutation(exec: &mut Executor, outputs: &[String], round: usize) {
+    let conflicts = exec
+        .statistics()
+        .get_int("all_lanes.conflicts")
+        .expect("the original check retains its cumulative conflict ledger");
+    assert!(
+        conflicts <= 1,
+        "round {round}: original conflict allowance exceeded: {conflicts}"
+    );
+    match outputs.first().map(String::as_str) {
+        Some("unknown") => {
+            assert_eq!(
+                outputs,
+                ["unknown", "(:reason-unknown resourceout)"],
+                "round {round}"
+            );
+            assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
+        }
+        Some("unsat") => {
+            // A proved symbolic identity may finish before the first budgeted
+            // conflict. Keep that improvement, but replay its actual proof.
+            let proof = exec
+                .last_proof()
+                .cloned()
+                .expect("early refutation has an actual proof");
+            assert!(exec
+                .check_proof_strict_with_datatypes(&proof)
+                .unwrap()
+                .is_complete());
+            assert_eq!(exec.unknown_reason(), None);
+        }
+        _ => panic!("round {round}: expected a budget stop or checked refutation, got {outputs:?}"),
+    }
+}
+
 #[test]
 fn test_executor_rlimit_governs_bv_bitblast_subsolver() {
     // Regression (#8749 BV lane): `:rlimit` armed the MAIN pipeline CDCL
@@ -50,6 +85,70 @@ fn test_executor_rlimit_governs_bv_bitblast_subsolver() {
         );
         assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
     }
+}
+
+#[test]
+fn test_executor_rlimit_governs_eager_persistent_lra_arm() {
+    // P4a (T2): QF_LRA runs on the eager-persistent split-loop arm, which
+    // armed no conflict or decision budget at all: its rounds were sliced by
+    // per-iteration WALL windows, so `:rlimit` did not bound it and a
+    // divergent query ran until the deadline backstop (`timeout`, decided by
+    // machine load). The query is the pigeonhole principle for 12 pigeons
+    // in 11 holes, posed over real positions: each pigeon sits at one of the
+    // holes 1..11 and no two share one, so every refutation step is a
+    // disequality conflict and resolution needs exponentially many of them.
+    // Under a 1-conflict `:rlimit` the arm's first search must stop on the
+    // count, as `resourceout`, deterministically and promptly; the 120 s
+    // backstop only bounds this test on an arm that ignores the count.
+    const PIGEONS: u32 = 12;
+    const HOLES: u32 = 11;
+    let mut smt =
+        String::from("(set-logic QF_LRA)\n(set-option :rlimit 1)\n(set-option :timeout 120000)\n");
+    for i in 1..=PIGEONS {
+        smt.push_str(&format!("(declare-const x{i} Real)\n"));
+    }
+    for i in 1..=PIGEONS {
+        let holes: Vec<String> = (1..=HOLES).map(|j| format!("(= x{i} {j}.0)")).collect();
+        smt.push_str(&format!("(assert (or {}))\n", holes.join(" ")));
+    }
+    for i in 1..=PIGEONS {
+        for k in (i + 1)..=PIGEONS {
+            smt.push_str(&format!("(assert (not (= x{i} x{k})))\n"));
+        }
+    }
+    smt.push_str("(check-sat)\n(get-info :reason-unknown)\n");
+    let mut stop_points = Vec::new();
+    for round in 0..3 {
+        let commands = parse(&smt).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).unwrap();
+        assert_eq!(
+            outputs,
+            vec!["unknown", "(:reason-unknown resourceout)"],
+            "round {round}: the eager-persistent arm must exhaust the :rlimit conflict \
+             budget, not run to the backstop"
+        );
+        assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
+        let stats = exec.statistics();
+        // Only the eager-persistent arm draws search allowances, so this pins
+        // the route: on any other split-loop arm the statistic is absent.
+        assert_eq!(
+            stats.get_int("dpll.eager_persistent.searches"),
+            Some(1),
+            "round {round}: the query must run on the eager-persistent arm, whose one \
+             search the count stops"
+        );
+        assert_eq!(
+            stats.get_int("dpll.eager_persistent.slice_stops"),
+            Some(0),
+            "round {round}: iteration 0 has no slice; the allowance stopped it"
+        );
+        stop_points.push((stats.conflicts, stats.decisions));
+    }
+    assert!(
+        stop_points.windows(2).all(|pair| pair[0] == pair[1]),
+        "the count stops the arm at the same point every run: {stop_points:?}"
+    );
 }
 
 #[test]
@@ -102,11 +201,11 @@ fn test_executor_rlimit_governs_fp_bitblast_subsolver() {
     // different theory. Float32 multiply commutativity refutation must push
     // `distinct` through two full 24-bit significand multipliers: measured on
     // the unbudgeted engine, 60s+ at 100% CPU with no verdict (wall-clock
-    // decided). Under a 1-conflict budget the FP sub-solve must instead stop
-    // with `resourceout` — deterministically, identically on every run, and
-    // promptly (this test burns minutes of wall clock if the budget is not
-    // threaded into the FP bit-blast SAT sub-solver).
-    let smt = "(set-logic QF_FP)\n\
+    // decided). If search is needed, its budget must still report resourceout.
+    // The independent exact commutativity schema can now finish before search;
+    // that alternative is accepted only with a complete actual proof replay.
+    let smt = "(set-option :produce-proofs true)\n\
+               (set-logic QF_FP)\n\
                (set-option :rlimit 1)\n\
                (declare-const x (_ FloatingPoint 8 24))\n\
                (declare-const y (_ FloatingPoint 8 24))\n\
@@ -117,13 +216,7 @@ fn test_executor_rlimit_governs_fp_bitblast_subsolver() {
         let commands = parse(smt).unwrap();
         let mut exec = Executor::new();
         let outputs = exec.execute_all(&commands).unwrap();
-        assert_eq!(
-            outputs,
-            vec!["unknown", "(:reason-unknown resourceout)"],
-            "round {round}: FP bit-blast sub-solve must exhaust the :rlimit \
-             conflict budget deterministically"
-        );
-        assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
+        checked_fp_stop_or_early_refutation(&mut exec, &outputs, round);
     }
 }
 
@@ -135,9 +228,11 @@ fn test_executor_rlimit_governs_fp_to_real_refinement_chain() {
     // a per-solver budget would hand every iteration a fresh allowance.
     // The pure-FP side carries the divergent Float32 multiply-commutativity
     // refutation, so an unbudgeted chain burns wall clock; under `:rlimit 1`
-    // the first chain solve exhausts the whole allowance and the verdict is
-    // `resourceout`, deterministically.
-    let smt = "(set-logic QF_FPLRA)\n\
+    // search must retain the whole-chain allowance. A proved early identity
+    // may avoid the chain entirely; replay that actual refutation rather than
+    // freezing the historical resourceout outcome.
+    let smt = "(set-option :produce-proofs true)\n\
+               (set-logic QF_FPLRA)\n\
                (set-option :rlimit 1)\n\
                (declare-const x (_ FloatingPoint 8 24))\n\
                (declare-const y (_ FloatingPoint 8 24))\n\
@@ -149,13 +244,7 @@ fn test_executor_rlimit_governs_fp_to_real_refinement_chain() {
         let commands = parse(smt).unwrap();
         let mut exec = Executor::new();
         let outputs = exec.execute_all(&commands).unwrap();
-        assert_eq!(
-            outputs,
-            vec!["unknown", "(:reason-unknown resourceout)"],
-            "round {round}: fp.to_real refinement chain must exhaust the \
-             :rlimit conflict budget deterministically"
-        );
-        assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
+        checked_fp_stop_or_early_refutation(&mut exec, &outputs, round);
     }
 }
 
@@ -181,8 +270,8 @@ fn test_executor_rlimit_huge_budget_preserves_fp_unsat() {
 
     // Proof lane twin: the verdict must stay `unsat` under `:produce-proofs`
     // and the native proof must remain strict. Pinned Carcara has no FP sort
-    // grammar, so `get-proof` must visibly decline the Alethe transport rather
-    // than emit a document its parser cannot authenticate.
+    // grammar; since D7 (2026-09-22) `get-proof` renders what the strict
+    // checker accepted and the executor DISCLOSES the unsupported surface.
     let smt_proof = "(set-logic QF_FP)\n\
                      (set-option :produce-proofs true)\n\
                      (set-option :rlimit 1000000)\n\
@@ -196,10 +285,20 @@ fn test_executor_rlimit_huge_budget_preserves_fp_unsat() {
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs[0], "unsat");
     assert!(
-        outputs[1].contains("UNVERIFIABLE PROOF")
-            && outputs[1].contains("unsupported by pinned Carcara"),
-        "the FP proof must fail closed only at the unsupported Alethe surface: {}",
+        !outputs[1].contains("UNVERIFIABLE PROOF")
+            && !outputs[1].contains("error")
+            && !outputs[1].is_empty(),
+        "huge budget must not suppress the FP UNSAT proof: {}",
         &outputs[1][..outputs[1].len().min(200)]
+    );
+    let surface = exec
+        .last_unsat_proof_carcara_surface()
+        .expect("native FP proof after UNSAT");
+    assert!(
+        surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains("FloatingPoint")),
+        "the FP sort must be disclosed as unsupported by pinned Carcara, got {surface}"
     );
     let proof = exec.last_proof().expect("native FP proof after UNSAT");
     let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)

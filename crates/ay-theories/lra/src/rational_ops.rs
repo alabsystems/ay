@@ -53,7 +53,9 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
 // are normalized. Inputs ARE normalized: `Big` backings only ever come from
 // `num_rational` ops, `from_integer`, or these helpers (audited: no external
 // `Rational::Big(..)` construction), and the `Small -> BigBacking`
-// conversion goes through `BigRational::new` which normalizes.
+// conversion (`to_rug`/`to_big`) uses `new_raw` on a pair the `Small`
+// invariant already guarantees coprime with positive denominator -- checked
+// by a debug_assert there -- so it neither normalizes nor needs to.
 
 /// Borrow the [`BigBacking`] of a `Big` value; convert (normalized) for `Small`.
 #[inline]
@@ -125,6 +127,11 @@ fn backing_mul_int_fast(a: &BigBacking, b: &BigBacking) -> Option<BigBacking> {
     };
     let d = rat_side.denom().to_u64()?;
     let g = gcd_big_u64(int_side.numer(), d);
+    // `gcd(_, d)` is non-zero for the positive denominator of a reduced
+    // rational; anything else takes the caller's general multiply.
+    if g == 0 {
+        return None;
+    }
     let numer = if g == 1 {
         int_side.numer() * rat_side.numer()
     } else {
@@ -255,23 +262,107 @@ impl Rational {
                 let (rn, rd) = normalize_small(n, *d1)?;
                 return Some(Self::Small(rn, rd));
             }
+            // Every step is checked: the operands' denominators are non-zero
+            // and the products fit i128, so none of these fails for a valid
+            // `Small` pair; any failure falls back to the caller's slow path.
             let dg = gcd_u64(d1.unsigned_abs(), d2.unsigned_abs());
-            let d1g = d1 / dg as i64;
-            let d2g = d2 / dg as i64;
-            let num = i128::from(*n1) * i128::from(d2g) + i128::from(*n2) * i128::from(d1g);
+            let d1g = d1.checked_div(dg as i64)?;
+            let d2g = d2.checked_div(dg as i64)?;
+            let num = (i128::from(*n1) * i128::from(d2g))
+                .checked_add(i128::from(*n2) * i128::from(d1g))?;
             let den = i128::from(d1g) * i128::from(*d2);
             if den == 0 {
                 return None;
             }
             let g = gcd_u128(num.unsigned_abs(), den.unsigned_abs());
-            let rn = num / g as i128;
-            let rd = den / g as i128;
-            let (rn, rd) = if rd < 0 { (-rn, -rd) } else { (rn, rd) };
+            let rn = num.checked_div(g as i128)?;
+            let rd = den.checked_div(g as i128)?;
+            let (rn, rd) = if rd < 0 {
+                (rn.checked_neg()?, rd.checked_neg()?)
+            } else {
+                (rn, rd)
+            };
             if let (Ok(n), Ok(d)) = (i64::try_from(rn), i64::try_from(rd)) {
                 return Some(Self::Small(n, d));
             }
         }
         None
+    }
+}
+
+// --- Monotone order key ------------------------------------------------------
+//
+// `discover_model_value_equalities` sorts every shared variable's model
+// value on every combined-mode check. `Big`/`Big` exact comparison
+// cross-multiplies arbitrary-precision limbs (allocating per compare),
+// which dominated that sort on wide-coefficient models (Certora
+// QF_UFDTNIA). Sorting by this key first and falling back to the exact
+// `cmp` only on key ties yields exactly the `cmp` order at integer-compare
+// cost for most pairs: one key per element instead of cross-multiplication
+// per comparison.
+
+/// `floor(log2(an / ad))` for `an > 0`, `ad > 0`.
+fn floor_log2_ratio_small(an: u64, ad: u64) -> i64 {
+    let bn = 64 - i64::from(an.leading_zeros());
+    let bd = 64 - i64::from(ad.leading_zeros());
+    // The floor is `bn - bd` or one less; decide by testing `an/ad >= 2^e`.
+    let mut e = bn - bd;
+    let ge = if e >= 0 {
+        u128::from(an) >= (u128::from(ad) << e)
+    } else {
+        (u128::from(an) << (-e)) >= u128::from(ad)
+    };
+    if !ge {
+        e -= 1;
+    }
+    e
+}
+
+/// `floor(log2(|numer| / denom))` for `numer != 0`, `denom > 0`.
+fn floor_log2_ratio_big(numer: &BigInt, denom: &BigInt) -> i64 {
+    let an: &BigUint = numer.magnitude();
+    let ad: &BigUint = denom.magnitude();
+    let mut e = numer.bits() as i64 - denom.bits() as i64;
+    let ge = if e >= 0 {
+        *an >= (ad.clone() << (e as usize))
+    } else {
+        (an.clone() << ((-e) as usize)) >= *ad
+    };
+    if !ge {
+        e -= 1;
+    }
+    e
+}
+
+impl Rational {
+    /// Cheap monotone sort key `(sign_rank, exponent)`: `sign_rank` is
+    /// -1/0/1 for negative/zero/positive values and `exponent` is
+    /// `floor(log2 |x|)` (negated for negative `x`, 0 for zero).
+    ///
+    /// The key is monotone non-decreasing in the exact value, so unequal
+    /// keys decide the exact order (`key(a) < key(b)` implies `a < b`);
+    /// equal keys are undecided and need the exact `cmp`.
+    pub(crate) fn order_key(&self) -> (i8, i64) {
+        match self {
+            Self::Small(n, d) => {
+                debug_assert!(*d > 0, "Small invariant: denom > 0");
+                if *n == 0 {
+                    (0, 0)
+                } else {
+                    let e = floor_log2_ratio_small(n.unsigned_abs(), *d as u64);
+                    if *n > 0 {
+                        (1, e)
+                    } else {
+                        (-1, -e)
+                    }
+                }
+            }
+            Self::Big(br) => match br.numer().sign() {
+                Sign::NoSign => (0, 0),
+                Sign::Plus => (1, floor_log2_ratio_big(br.numer(), br.denom())),
+                Sign::Minus => (-1, -floor_log2_ratio_big(br.numer(), br.denom())),
+            },
+        }
     }
 }
 
@@ -322,7 +413,24 @@ impl Rational {
             if den == 0 {
                 return None;
             }
-            let (num, den) = if den < 0 { (-num, -den) } else { (num, den) };
+            // `-num` / `-den` PANIC at `i128::MIN` — measured 2026-09-07 as
+            // `attempt to negate with overflow` at this line while compiler_consumer was
+            // verifying `ty`'s workspace. LRA runs IN-PROCESS inside the
+            // compiler, so the panic is not a solver verdict the caller can
+            // handle: it takes rustc down with an ICE and the crate under
+            // verification reports nothing at all.
+            //
+            // Every other arithmetic step in this function is already
+            // `checked_*` and declines with `?`; the sign normalisation was the
+            // one raw operation left. Declining is also the only CORRECT answer
+            // — `i128::MIN` has no positive counterpart, so there is no
+            // representable normalised form of this rational to return, and
+            // saturating would hand the caller a different number.
+            let (num, den) = if den < 0 {
+                (num.checked_neg()?, den.checked_neg()?)
+            } else {
+                (num, den)
+            };
             if num == 0 {
                 return Some(Self::Small(0, 1));
             }
@@ -431,6 +539,13 @@ impl Rational {
             } else {
                 **acc += &*p;
             }
+            // Demote a result that fits inline again (mirrors `AddAssign`):
+            // without this a `Big` accumulator stayed `Big` forever even at
+            // i64-representable values, and every later `try_as_i64` /
+            // `is_all_i64()` gate on the row it landed in failed (#stuck-big).
+            if let Some(s) = try_shrink(acc) {
+                *self = s;
+            }
             return product;
         }
         // Fallback: self is Small but i128 overflowed — promote to Big.
@@ -492,6 +607,10 @@ impl Rational {
                 **acc = r;
             } else {
                 **acc += &*p;
+            }
+            // Demote when the sum fits inline again (see `add_product`).
+            if let Some(s) = try_shrink(acc) {
+                *self = s;
             }
             return;
         }
@@ -647,7 +766,9 @@ impl Sub for Rational {
                 return r;
             }
         }
-        self + (-rhs)
+        // Same slow path as `&Rational - &Rational`: no negated `Big`
+        // intermediate, int fast arms, `from_rug` shrink at the end.
+        add_sub_via_backing(&self, &rhs, true)
     }
 }
 
@@ -983,6 +1104,69 @@ impl PartialOrd<BigRational> for Rational {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_key_is_monotone_and_sort_equivalent() {
+        // Mix of Small and forced-Big values across signs and octaves,
+        // including equal values in different representations.
+        let big = |n: i128, d: i128| {
+            Rational::from_big(BigRational::new(BigInt::from(n), BigInt::from(d)))
+        };
+        let huge: BigInt = BigInt::from(1i64) << 300;
+        let values: Vec<Rational> = vec![
+            Rational::zero(),
+            Rational::from(1i64),
+            Rational::from(-1i64),
+            Rational::new(1, 2),
+            Rational::new(-1, 2),
+            Rational::new(3, 2),
+            Rational::new(2, 3),
+            Rational::new(-8, 3),
+            Rational::new(8, 3),
+            Rational::new(255, 256),
+            Rational::new(256, 255),
+            Rational::new(-255, 256),
+            Rational::new(1, 1_000_000),
+            Rational::new(-1, 1_000_000),
+            Rational::from(i64::MAX),
+            Rational::from(i64::MIN + 1),
+            big(1, 2),
+            big(-3, 2),
+            big(1i128 << 100, 3),
+            big(-(1i128 << 100), 3),
+            big((1i128 << 100) - 1, 1i128 << 99),
+            Rational::from_big(BigRational::new(huge.clone(), BigInt::from(7i64))),
+            Rational::from_big(BigRational::new(-huge.clone(), BigInt::from(7i64))),
+            Rational::from_big(BigRational::new(BigInt::from(5i64), huge.clone())),
+            Rational::from_big(BigRational::new(BigInt::from(-5i64), huge)),
+        ];
+        // Pairwise: unequal keys must decide the exact order, equal
+        // values must have equal keys.
+        for a in &values {
+            for b in &values {
+                use std::cmp::Ordering;
+                match a.order_key().cmp(&b.order_key()) {
+                    Ordering::Less => assert!(a < b, "key({a:?}) < key({b:?}) but !a<b"),
+                    Ordering::Greater => assert!(a > b, "key({a:?}) > key({b:?}) but !a>b"),
+                    Ordering::Equal => {}
+                }
+                if a == b {
+                    assert_eq!(a.order_key(), b.order_key(), "equal values, unequal keys");
+                }
+            }
+        }
+        // Sort equivalence: key-then-exact must reproduce the exact order.
+        let mut by_key: Vec<((i8, i64), Rational)> =
+            values.iter().map(|v| (v.order_key(), v.clone())).collect();
+        // Deterministic scramble (reverse + rotate) so the sort does work.
+        by_key.reverse();
+        by_key.rotate_left(7);
+        let mut by_exact: Vec<Rational> = by_key.iter().map(|(_, v)| v.clone()).collect();
+        by_key.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        by_exact.sort();
+        let keyed: Vec<Rational> = by_key.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(keyed, by_exact);
+    }
 
     #[test]
     fn test_add_product_matches_separate_ops() {
@@ -1438,5 +1622,50 @@ mod tests {
         // i64::MIN cannot be negated to i64
         let r = Rational::Small(i64::MIN, 1);
         assert!(r.neg_small().is_none());
+    }
+
+    #[test]
+    fn div_add_small_declines_instead_of_panicking_on_i128_min_sign_flip() {
+        // REGRESSION (2026-09-07). The sign normalisation in `div_add_small`
+        // was a raw `(-num, -den)`, which PANICS when either operand is exactly
+        // `i128::MIN` — "attempt to negate with overflow". LRA runs in-process
+        // inside compiler_consumer, so that panic is an ICE that kills the whole
+        // compilation, not a verdict a caller can handle. It was hit for real
+        // while compiler_consumer verified `ty`'s workspace.
+        //
+        // Reaching it needs `den` to land exactly on `i128::MIN` while every
+        // `checked_mul` on the way SUCCEEDS, so the inputs are constructed, not
+        // sampled — a random sweep of extremes does not get there, which is how
+        // the first version of this test passed against the unfixed code.
+        //
+        //   den = rd_r * dn_r * ad = (-2^63) * 2^32 * 2^32 = -2^127 = i128::MIN
+        //
+        // with g1 = g2 = 1 so no pre-reduction shrinks any factor.
+        let two_32 = 1i64 << 32;
+        let r = Rational::Small(1, i64::MIN); //  1 / -2^63
+        let d = Rational::Small(two_32, 1); //  2^32 / 1
+        let a = Rational::Small(0, two_32); //  0 / 2^32
+
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.div_add_small(&d, &a)));
+        assert!(
+            outcome.is_ok(),
+            "div_add_small panicked normalising a denominator of i128::MIN — LRA \
+             runs inside compiler_consumer, so a panic here is an ICE, never a solver verdict"
+        );
+        assert!(
+            outcome.unwrap().is_none(),
+            "i128::MIN has no positive counterpart, so there is no normalised \
+             rational to return: the only sound answer is None, never a saturated \
+             value that is a different number"
+        );
+
+        // ANTI-VACUITY: a "fix" that declined everything would satisfy the two
+        // assertions above and be useless. An ordinary triple must still compute.
+        let ok = Rational::Small(1, 2)
+            .div_add_small(&Rational::Small(1, 3), &Rational::Small(1, 6))
+            .expect("ordinary rationals must still divide-and-add");
+        // (1/2) / (1/3) + 1/6 = 3/2 + 1/6 = 5/3
+        assert_eq!(ok, Rational::Small(5, 3));
     }
 }

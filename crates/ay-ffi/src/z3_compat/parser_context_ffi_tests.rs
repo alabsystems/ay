@@ -208,7 +208,7 @@ fn test_parser_context_null_and_error_paths() {
 }
 
 #[test]
-fn test_parser_context_late_semantic_error_poison_is_fail_closed() {
+fn test_parser_context_late_semantic_error_rolls_back() {
     // SAFETY: all handles allocated/freed within this block; single-threaded.
     unsafe {
         let ctx = mk_ctx();
@@ -217,16 +217,25 @@ fn test_parser_context_late_semantic_error_poison_is_fail_closed() {
         assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
         assert!(!Z3_solver_get_model(ctx, solver).is_null());
 
+        // The parse runs in a scope that is popped (`parse_binding`): a late
+        // semantic error is z3's parser error, nothing of the text remains,
+        // and other handles keep their results.
         let v = Z3_parser_context_from_string(
             ctx,
             pc,
             c"(declare-const y Int)(assert (= y 0))(assert 1)".as_ptr(),
         );
-        assert_eq!(Z3_get_error_code(ctx), Z3_EXCEPTION);
+        assert_eq!(Z3_get_error_code(ctx), Z3_PARSER_ERROR);
         assert_eq!(Z3_ast_vector_size(ctx, v), 0);
-        assert!(Z3_solver_get_model(ctx, solver).is_null());
-        assert_eq!(Z3_solver_check(ctx, solver), Z3_L_UNDEF);
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_USAGE);
+        assert!(!Z3_solver_get_model(ctx, solver).is_null());
+        assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+        let v = Z3_parser_context_from_string(
+            ctx,
+            pc,
+            c"(declare-const y Int)(assert (= y 0))".as_ptr(),
+        );
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+        assert_eq!(Z3_ast_vector_size(ctx, v), 1);
 
         Z3_del_context(ctx);
     }
@@ -293,14 +302,14 @@ fn test_datatype_sort_introspection_enum_and_struct() {
                 Z3_BOOL_SORT,
                 "recognizer range Bool"
             );
-            // The C API preserves the caller-supplied recognizer symbol; it
-            // does not replace it with AY's canonical SMT-LIB tester name.
+            // z3 names every recognizer `is`, whatever symbol the caller
+            // supplied (`r-red`, ...): the constructor is the decl's one
+            // parameter (z3py prints `is(red, x)`).
+            assert_eq!(decl_name(ctx, rd), "is", "z3's recognizer name");
             assert_eq!(
-                decl_name(ctx, rd),
-                recognizer_names[i]
-                    .to_str()
-                    .expect("recognizer name must be valid UTF-8"),
-                "caller-supplied recognizer name"
+                decl_name(ctx, Z3_get_decl_func_decl_parameter(ctx, rd, 0)),
+                decl_name(ctx, cd),
+                "the recognizer's constructor parameter"
             );
         }
 
@@ -336,7 +345,8 @@ fn test_datatype_sort_introspection_enum_and_struct() {
         assert_eq!(decl_name(ctx, cd), "mk", "struct constructor name");
         assert_eq!(Z3_get_arity(ctx, cd), 2, "struct constructor arity 2");
         let rd = Z3_get_datatype_sort_recognizer(ctx, pair, 0);
-        assert_eq!(decl_name(ctx, rd), "is_mk", "struct recognizer name");
+        // z3 names the recognizer `is` whatever symbol (`is_mk`) was given.
+        assert_eq!(decl_name(ctx, rd), "is", "struct recognizer name");
         let acc0 = Z3_get_datatype_sort_constructor_accessor(ctx, pair, 0, 0);
         let acc1 = Z3_get_datatype_sort_constructor_accessor(ctx, pair, 0, 1);
         assert_eq!(decl_name(ctx, acc0), "fst", "accessor 0 name");

@@ -208,15 +208,31 @@ impl Executor {
             // categories, so the ground solve inside the quantifier loop threw
             // away the lane check-sat's own table routes to (#5989).
             LogicCategory::Ufdtnia => self.solve_dt_uf_nia(),
-            // NRA/NIRA keep the sound `unknown`: there is no `solve_uf_nra`
-            // sibling to compose the DT axioms with. Mirrors check_sat.rs.
-            LogicCategory::Ufdtnra | LogicCategory::Ufdtnira => {
+            // Declared NIRA over DT: the lane check_sat.rs routes to when the
+            // live window is Real-free and array-free
+            // (`StaticFeatures::within_dt_uf_nia_theories`). `features` here
+            // is collected from the CURRENT window, refinement instances
+            // included, so a Real or array term admitted by a round drops back
+            // to the fail-closed arm — mirroring both ways (#5989,
+            // #ufdtnira-live-content-lane).
+            LogicCategory::Ufdtnira if features.within_dt_uf_nia_theories() => {
+                self.solve_dt_uf_nia()
+            }
+            // NRA keeps the sound `unknown` (no DT composition over
+            // `solve_uf_nra` is wired); NIRA reaches here only with a live Real
+            // or array term, which `solve_uf_nia` cannot interpret. Mirrors
+            // check_sat.rs.
+            LogicCategory::Ufdtnra => {
                 debug_assert!(
                     !category.has_ground_lane(),
                     "{category:?} has a ground lane in route_to_solver but the \
                      quantifier-loop table answers Unknown — the two dispatch \
                      tables must mirror (#5989)"
                 );
+                self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                Ok(SolveResult::Unknown)
+            }
+            LogicCategory::Ufdtnira => {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }
@@ -249,7 +265,7 @@ impl Executor {
         // interleaved loop WITHOUT setting the limit flag and could leave a
         // truncated run classified as a final Sat.
         let should_stop = self.make_should_stop();
-        if should_stop() {
+        if should_stop() || self.ematching_check_budget.exhausted() {
             return Some(EmatchingRefinementRound {
                 added: 0,
                 reached_limit: true,
@@ -258,6 +274,9 @@ impl Executor {
                 withheld: 0,
             });
         }
+        // (#guarded-nested-quantifiers) The universals guarded instances
+        // brought in; the assertions' own are collected from `original`.
+        let guarded_quantifiers = self.proxied_universals();
         let euf_model_ref = self.last_model.as_ref().and_then(|m| m.euf_model.as_ref());
         euf_model_ref?;
         // If `not B(ce)` entered the E-matching index, the same universal could
@@ -281,12 +300,29 @@ impl Executor {
         // (the seen memo persists across the epoch).
         qm.begin_round_group();
 
-        let mut ematching_result = qm.run_ematching_round(
+        let mut ematching_result = qm.run_ematching_round_with_match_roots(
             &mut self.ctx.terms,
             &combined_assertions,
+            &[],
+            &guarded_quantifiers,
             euf_model_ref,
             &should_stop,
         );
+        let new_terms = self
+            .ctx
+            .terms
+            .len()
+            .saturating_sub(relevance_watermark as usize);
+        let budget_spent = self
+            .ematching_check_budget
+            .charge(ematching_result.instantiations.len(), new_terms);
+        // (#degrade277-narrow) Record what THIS interleaved round was licensed
+        // to conjoin, before any of its instances is asserted.
+        let round_entailed = std::mem::take(&mut ematching_result.entailed_foralls);
+        self.record_entailed_forall_authority(&round_entailed);
+        self.record_matched_instances(&ematching_result.conditional_forall_instantiations);
+        self.record_matched_instances(&ematching_result.guarded_instantiations);
+        self.record_matched_instances(&ematching_result.unconditional_forall_instantiations);
         self.materialize_exact_ematching_instances(
             &mut ematching_result.instantiations,
             &mut ematching_result.unconditional_forall_roots,
@@ -297,7 +333,7 @@ impl Executor {
         );
 
         let mut existing: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
-        let mut reached_limit = ematching_result.reached_limit;
+        let mut reached_limit = ematching_result.reached_limit || budget_spent;
         let has_uninstantiated = ematching_result.has_uninstantiated;
         let instances_created = ematching_result.instantiations.len() as u64;
 
@@ -326,6 +362,12 @@ impl Executor {
 
         let withheld = admission.withheld;
         let added = self.assert_refinement_admission(admission, &mut existing);
+        // (#guarded-interleaved-instances) The guarded clauses of this round:
+        // `(or (not q) body[t̄])` holds under the abstraction whichever round
+        // found `t̄`, so a universal the problem does not entail is
+        // instantiated against each fresh model, as an entailed one is.
+        let added =
+            added + self.add_guarded_instance_clauses(&ematching_result.guarded_instantiations);
 
         Some(EmatchingRefinementRound {
             added,

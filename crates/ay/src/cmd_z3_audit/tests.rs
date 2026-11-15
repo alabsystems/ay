@@ -4,6 +4,80 @@
 use super::*;
 
 #[test]
+fn admitted_rust_child_success_and_rejection_are_observed_results() {
+    let root = resolve_repo_root(None).unwrap();
+    let success = run_repo_command(
+        "native_version",
+        &root,
+        "cargo --version",
+        "cargo",
+        &["--version"],
+    );
+    assert_eq!(success.status, CheckStatus::Pass, "{}", success.finding);
+    let rejected = run_repo_command(
+        "invalid_native_request",
+        &root,
+        "cargo --unsupported-ay-audit-control",
+        "cargo",
+        &["--unsupported-ay-audit-control"],
+    );
+    assert!(rejected.status.is_failure(), "{}", rejected.finding);
+    assert!(!rejected.status.is_pass());
+}
+
+#[test]
+fn unexecuted_checks_are_neither_successes_nor_observed_failures() {
+    for scope in [Z3AuditScope::FullReplacement, Z3AuditScope::CliSubset] {
+        let row = inventory_suppressed_check("unused", scope, "0/1 executed", "cargo test -p ay");
+        assert_eq!(row.status, CheckStatus::NotRun);
+        assert!(!row.status.is_pass());
+        assert!(!row.status.is_failure());
+    }
+    for status in [
+        CheckStatus::NotRun,
+        CheckStatus::Missing,
+        CheckStatus::Stale,
+    ] {
+        assert_eq!(CheckStatus::parse(status.as_str()).unwrap(), status);
+        assert!(!status.is_pass() && !status.is_failure());
+    }
+    let rows = [ProofInventoryRow::not_run(
+        "unrun",
+        "Replay",
+        "0/1 executed",
+        "1/1 accepted",
+        "none",
+        "not run",
+    )];
+    let surface = unsat_proof_surface(&[], &rows);
+    assert_eq!(surface.status, CheckStatus::NotRun);
+    assert!(!full_replacement_ready(
+        Z3AuditScope::FullReplacement,
+        0,
+        &[surface]
+    ));
+}
+
+#[test]
+fn absent_stale_and_corrupt_reference_evidence_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.json");
+    assert_eq!(
+        check_reference_cache(None, Some("not found"), &path).status,
+        CheckStatus::Missing
+    );
+    fs::write(&path, "old evidence").unwrap();
+    assert_eq!(
+        check_reference_cache(None, Some("schema mismatch: expected v2, got v1"), &path).status,
+        CheckStatus::Stale
+    );
+    assert_eq!(
+        check_reference_cache(None, Some("invalid JSON"), &path).status,
+        CheckStatus::FailError
+    );
+}
+
+#[test]
 fn z3_audit_requests_the_native_chc_certificate_format() {
     assert!(
         CHC_CERTIFICATE_FILENAME.ends_with(".chccert"),
@@ -390,9 +464,9 @@ fn commit_matches_audited_tree_allows_evidence_only_descendant() {
     git(repo, &["commit", "-m", "base"]);
     let base = git(repo, &["rev-parse", "HEAD"]);
 
-    fs::create_dir_all(repo.join("the development design notes")).unwrap();
-    fs::write(repo.join("the development design notes"), "{}\n").unwrap();
-    git(repo, &["add", "the development design notes"]);
+    fs::create_dir_all(repo.join("./reports/audit")).unwrap(); // "./": no export rewrite
+    fs::write(repo.join("./reports/audit/evidence.json"), "{}\n").unwrap();
+    git(repo, &["add", "./reports/audit/evidence.json"]);
     git(repo, &["commit", "-m", "evidence"]);
     let evidence_head = git(repo, &["rev-parse", "HEAD"]);
     assert!(commit_matches_audited_tree(repo, &base, &evidence_head));
@@ -1305,18 +1379,6 @@ fn latest_eval_result_ignores_scorecard_only_outputs() {
 }
 
 #[test]
-fn smtlib_surface_command_uses_native_bench_run_for_qf_abv() {
-    let command = surface_spec("smtlib_input").expect("SMT-LIB spec").command;
-
-    assert!(command.contains("cargo build --release --locked -p ay --features bench --bin ay"));
-    assert!(command.contains("./target/release/ay bench run smt-local-suite"));
-    assert!(command.contains("smt-smtcomp-qf-abv"));
-    assert!(command.contains("--reference-solver z3"));
-    assert!(!command.contains("for eval"));
-    assert!(!command.contains("scripts/"));
-}
-
-#[test]
 fn smt_refresh_plan_selects_stale_dirty_and_missing_packets() {
     fn write_packet(repo_root: &Path, eval_id: &str, commit: &str, dirty: bool) {
         let dir = repo_root
@@ -1585,7 +1647,7 @@ fn smtlib_surface_reports_ref_only_unknown_with_benchmark_examples() {
 fn dimacs_surface_reports_reference_only_as_fail_timeout() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_root = dir.path();
-    let scoreboard = repo_root.join("the development design notes");
+    let scoreboard = repo_root.join("./reports/current/matrix/scoreboard.json"); // "./": no export rewrite
     fs::create_dir_all(scoreboard.parent().unwrap()).unwrap();
     fs::write(
         &scoreboard,
@@ -1693,7 +1755,7 @@ fn surface_summary_expands_partial_rows_with_numbers() {
         .expect("proof surface");
     assert_eq!(
         proofs.current,
-        "0/1 proof/certificate rows pass in this audit; 1/1 fail"
+        "0/1 proof/certificate rows pass in this audit; 1 failed; 0 not run/missing/stale"
     );
     assert!(proofs.goal.contains("1/1 proof/certificate rows pass"));
 }
@@ -1797,28 +1859,6 @@ test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 186 filtered ou
 }
 
 #[test]
-fn rendered_repo_command_forces_live_cargo_run() {
-    assert_eq!(
-        rendered_repo_command(
-            "cargo",
-            "cargo test -p ay --features=\"cli\" --test group_cli z3_compat_args"
-        ),
-        "CARGO_SKIP_CACHE=1 cargo test -p ay --features=\"cli\" --test group_cli z3_compat_args"
-    );
-    assert_eq!(
-        rendered_repo_command(
-            "cargo",
-            "CARGO_SKIP_CACHE=1 cargo test -p ay --features=\"cli\""
-        ),
-        "CARGO_SKIP_CACHE=1 cargo test -p ay --features=\"cli\""
-    );
-    assert_eq!(
-        rendered_repo_command("bash", "bash scripts/check_doc_reality.sh"),
-        "bash scripts/check_doc_reality.sh"
-    );
-}
-
-#[test]
 fn strip_shell_quotes_dequotes_argv_tokens() {
     // The bug: splitting `--features="cli"` and passing it as raw argv made
     // cargo see the feature name `"cli"` (with quotes), which does not exist.
@@ -1848,56 +1888,6 @@ fn strip_shell_quotes_dequotes_argv_tokens() {
 }
 
 #[test]
-fn proof_inventory_commands_are_native_not_legacy_shell_authority() {
-    let args = Z3AuditArgs {
-        repo_root: None,
-        ay: None,
-        z3: "z3".to_string(),
-        reference_cache: PathBuf::from(DEFAULT_REFERENCE_CACHE),
-        write_reference_cache: None,
-        refresh_smt_evidence: false,
-        smt_refresh_dry_run: false,
-        smt_refresh_policy: SmtRefreshPolicy::StaleOrMissing,
-        smt_eval: Vec::new(),
-        smt_timeout: None,
-        smt_runs: None,
-        smt_reference_solver: None,
-        scope: Z3AuditScope::FullReplacement,
-        run_doc_reality: false,
-        run_cli_tests: false,
-        run_proof_tests: false,
-        run_alethe_replay: false,
-        inventory_only: true,
-        alethe_checker: "carcara".to_string(),
-        alethe_problem: PathBuf::from("problem.smt2"),
-        proof_work_dir: None,
-        summary_json: None,
-    };
-
-    let rows = build_proof_inventory(
-        &args,
-        Path::new("."),
-        Path::new("ay"),
-        None,
-        None,
-        Path::new(DEFAULT_REFERENCE_CACHE),
-        false,
-        false,
-    );
-    assert!(!rows.is_empty());
-    assert!(rows
-        .iter()
-        .all(|row| !row.command.contains("verify_proofs.sh")));
-    assert!(rows.iter().any(|row| row.id == "ay_sat_lrat_text_packet"
-        && row.command == "CARGO_SKIP_CACHE=1 cargo test -p ay-sat --test integration test_lrat"));
-    assert!(rows.iter().any(|row| row.id == "lrat_binary_external"
-            && row.command
-                == "CARGO_SKIP_CACHE=1 cargo build -p ay-lrat-check --bin ay-lrat-check && CARGO_SKIP_CACHE=1 cargo test -p ay-sat --test group_drat lrat_binary_external_php32"));
-    assert!(rows.iter().all(|row| row.current.contains('/')));
-    assert!(rows.iter().all(|row| row.goal.contains('/')));
-}
-
-#[test]
 fn reference_cache_loads_checked_schema_and_hashes() {
     let repo_root = resolve_repo_root(None).expect("repo root");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1907,7 +1897,17 @@ fn reference_cache_loads_checked_schema_and_hashes() {
 
     let cache = load_reference_cache(&repo_root, &path).expect("load reference cache");
 
-    assert_eq!(cache.z3_version, "Z3 version 4.test");
+    assert_eq!(
+        cache.z3_version,
+        format!(
+            "Z3 version {}",
+            reference::Pin::load(&repo_root)
+                .unwrap()
+                .identity("darwin_arm64")
+                .unwrap()
+                .version()
+        )
+    );
     assert_eq!(
         cache.basic_smt_transcript.input_sha256,
         sha256_hex(BASIC_SMT_TRANSCRIPT_INPUT.as_bytes())
@@ -2259,13 +2259,50 @@ fn chc_manifest_artifacts_require_the_requested_certificate_path() {
     );
 }
 
+#[test]
+fn the_reference_cache_records_no_machine_specific_z3_path() {
+    let repo = Path::new("/work/ay");
+    // A spelling the person gave that names no machine is kept.
+    assert_eq!(recorded_z3_command(repo, "z3"), "z3");
+    assert_eq!(
+        recorded_z3_command(repo, "tools/z3/bin/z3"),
+        "tools/z3/bin/z3"
+    );
+    // Inside the repository: repo-relative.
+    assert_eq!(
+        recorded_z3_command(repo, "/work/ay/target/z3/bin/z3"),
+        "target/z3/bin/z3"
+    );
+    // The default oracle, the checked copy under a home cache: its file name alone.
+    assert_eq!(
+        recorded_z3_command(
+            repo,
+            "/elsewhere/.cache/ay-z3/pin/z3-5.3.3-arm64-osx-13.3/bin/z3"
+        ),
+        "z3"
+    );
+    // The committed cache itself carries no absolute command.
+    let committed = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(DEFAULT_REFERENCE_CACHE);
+    let committed: Value =
+        serde_json::from_str(&std::fs::read_to_string(committed).unwrap()).unwrap();
+    let command = committed["generator"]["z3_command"].as_str().unwrap();
+    assert!(!Path::new(command).is_absolute(), "{command}");
+}
+
 fn valid_reference_cache_value(repo_root: &Path) -> Value {
+    let identity = reference::Pin::load(repo_root)
+        .unwrap()
+        .identity("darwin_arm64")
+        .unwrap();
     json!({
         "schema": REFERENCE_CACHE_SCHEMA,
         "generated_at_unix_seconds": 1,
         "generator": {
             "z3_command": "z3",
-            "z3_version": "Z3 version 4.test",
+            "z3_version": format!("Z3 version {}", identity.version()),
+            "z3_identity": identity,
             "ay": "ay",
             "ay_version": "ay test",
         },
@@ -2366,15 +2403,27 @@ fn external_tool_inventory_lists_all_audit_dependencies() {
         // Every entry must serialize to JSON for the machine-readable summary.
         assert!(tool.to_json().is_object());
     }
-    // drat-trim carries a genuineness verdict (it has a no-op-mock control);
-    // the rest are presence-only.
+    // drat-trim (a no-op-mock control) and z3 (an identity check) carry a
+    // genuineness verdict; the rest are presence-only.
     let drat = inv
         .iter()
         .find(|t| t.name == "drat-trim")
         .expect("drat-trim");
     assert!(drat.genuine.is_some());
     let z3 = inv.iter().find(|t| t.name == "z3").expect("z3");
-    assert!(z3.genuine.is_none());
+    assert_eq!(z3.genuine, Some(z3.path.is_some()));
+}
+
+/// A file that answers to the name but never proves it is z3 (the shape of a
+/// reroute stub) is reported as absent, never as a present z3.
+#[cfg(unix)]
+#[test]
+fn a_z3_that_does_not_identify_is_absent_from_the_inventory() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let stub = write_executable(dir.path(), "z3", "#!/bin/sh\necho refused >&2\nexit 2\n");
+    let inv = external_tool_inventory(dir.path(), &stub.display().to_string(), "carcara");
+    let z3 = inv.iter().find(|t| t.name == "z3").expect("z3");
+    assert_eq!((z3.path.as_ref(), z3.genuine), (None, Some(false)));
 }
 
 #[cfg(unix)]

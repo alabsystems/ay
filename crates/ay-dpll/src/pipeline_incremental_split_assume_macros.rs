@@ -21,11 +21,10 @@ macro_rules! pipeline_incremental_split_assume_arm {
         pre_theory_import: |$import_theory:ident, $import_lc:ident, $import_hc:ident, $import_ds:ident| $import_expr:expr,
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
+        $(, retain_primary_conflicts: $retain_primary:expr)?
+        $(, retain_primary_after: $retain_after:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
         use ay_sat::{AssumeResult, Literal as SatLiteral, Variable as SatVariable};
@@ -47,6 +46,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             Vec::new()
         };
         let _iaslp_assumptions: &[(TermId, TermId)] = $assumptions;
+        let _iaslp_should_stop = $self.make_should_stop();
         let random_seed = $self.current_random_seed();
         let should_record_random_seed = match $self.incr_theory_state.as_ref() {
             Some(state) => state.$sat_field.is_none(),
@@ -204,6 +204,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             .as_mut()
             .expect(concat!("incremental ", $tag, " should have persistent SAT solver"));
 
+        // Lane opt-in for replay-ledger retention of primary split
+        // conflicts, plus its escalated-budget variant (defaults off /
+        // disarmed; set on EVERY entry because the persistent solver is
+        // shared across lanes in one session) -- mirroring the lazy arm.
+        // See DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111 and
+        // DR-AY-LIRA-RETAIN-ESCALATION-20261113.
+        let _iaslp_retain_primary_conflicts = false;
+        $(let _iaslp_retain_primary_conflicts = $retain_primary;)?
+        solver.set_retain_primary_theory_conflicts(_iaslp_retain_primary_conflicts);
+        let _iaslp_retain_primary_after: Option<u64> = None;
+        $(let _iaslp_retain_primary_after: Option<u64> = Some($retain_after);)?
+        solver.set_retain_primary_escalation(_iaslp_retain_primary_after);
+
         solver.push();
         // #6853: Apply deferred activation clauses inside the private push scope.
         pipeline_apply_pending_activations!(
@@ -229,8 +242,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         );
 
         let mut local_term_to_var: HashMap<TermId, u32> = base_term_to_var;
-        let mut local_next_var: u32 = u32::try_from(solver.user_num_vars() + solver.scope_depth())
-            .expect("SAT solver variable count does not fit in u32");
+        // Seed from the solver's TOTAL variable count, never
+        // `user_num_vars() + scope_depth()`: that sum omits the DEAD scope
+        // selectors a persistent solver accumulates across pop(), and handing
+        // one of those (forced TRUE at level 0) to a split atom produced a
+        // false UNSAT — see `split_incremental::fresh_sat_var_floor`.
+        let mut local_next_var: u32 =
+            $crate::executor::theories::split_incremental::fresh_sat_var_floor(&solver);
         let base_vars: HashSet<u32> = base_var_to_term.keys().copied().collect();
         let mut _iaslp_added_split_clauses: HashSet<
             $crate::executor::theories::split_incremental::SplitClauseKey,
@@ -272,6 +290,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 state.round_trips += 1;
                 _iaslp_timing.dpll.round_trips += 1;
+                ay_core::resource::work().note_round_trip();
 
                 // #array-deadline-forward: forward the executor's live
                 // per-solve deadline into the SAT solver so the phases the
@@ -358,6 +377,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                         let _iaslp_theory_start = ay_core::time::Instant::now();
                         let theory_result = ay_core::TheorySolver::check(&mut theory);
+                        let theory_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                            &mut theory, theory_result, &_iaslp_theory_lemmas, &_iaslp_should_stop,
+                        );
                         _iaslp_timing.dpll.theory_check += _iaslp_theory_start.elapsed();
                         _iaslp_last_theory_stats = ay_core::TheorySolver::collect_statistics(&theory);
                         _iaslp_theory_snapshot = <_ as ay_core::TheorySolver>::export_structural_snapshot(&theory);

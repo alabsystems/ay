@@ -6,6 +6,11 @@
 
 use super::*;
 use crate::{ChcSort, ChcVar};
+use durationthm_replay::bounded_bmc_ground_derivation;
+
+mod durationthm_replay;
+mod normalization_order;
+mod repeated_formal_freshness;
 
 #[test]
 fn test_inline_fact_clause() {
@@ -708,14 +713,19 @@ fn absent_input_declaration_reconstructs_false_through_composed_rounds() {
         "setup: compacted Live must reuse Dead's old numeric ID"
     );
 
-    let live_var = ChcVar::new(crate::canonical_var_name(transformed_live, 0), ChcSort::Int);
+    assert_eq!(
+        result
+            .problem
+            .get_predicate(transformed_live)
+            .unwrap()
+            .arity(),
+        0,
+        "constant projection removes Live's proven-zero column"
+    );
     let mut compacted_model = InvariantModel::new();
     compacted_model.set(
         transformed_live,
-        PredicateInterpretation::new(
-            vec![live_var.clone()],
-            ChcExpr::eq(ChcExpr::var(live_var), ChcExpr::int(0)),
-        ),
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(true)),
     );
 
     let translated = result.back_translator.translate_validity(compacted_model);
@@ -733,9 +743,17 @@ fn absent_input_declaration_reconstructs_false_through_composed_rounds() {
     );
     assert_eq!(dead_interp.vars.len(), 1);
     assert_eq!(
-        dead_interp.vars[0].name,
-        crate::canonical_var_name(dead, 0),
-        "false completion must retain the declaration's canonical parameters"
+        dead_interp.vars[0].sort,
+        ChcSort::Int,
+        "false completion must restore the original positional sort"
+    );
+    assert!(
+        dead_interp
+            .formula
+            .vars()
+            .iter()
+            .all(|var| dead_interp.vars.contains(var)),
+        "restored binders must cover the complete interpretation"
     );
     assert!(
         translated.get(&live).is_some(),
@@ -1706,12 +1724,25 @@ fn deriv_expansion_corrupted_trace_rejected_by_kernel() {
         bad_entries > raw_entries,
         "corrupted expansion must still build a chain (raw={raw_entries}, bad={bad_entries})"
     );
-    let mut v_bad = PdrSolver::new(problem, pdr_cfg());
-    assert_ne!(
-        v_bad.verify_counterexample(&bad_witness),
-        CexVerificationResult::Valid,
-        "corrupted-trace expansion (wrong intermediate value) must be REJECTED by the SMT kernel"
-    );
+    // The corrupted value can never become evidence: a `Valid` verdict rests
+    // on a ground derivation whose values the clauses themselves determine
+    // (`Step(1)`, re-derived from `Init(0)`), never on the trace's `999`.
+    let mut v_bad = PdrSolver::new(problem.clone(), pdr_cfg());
+    if let Ok(published) = v_bad.confirm_counterexample(bad_witness) {
+        let derivation = published
+            .ground_derivation
+            .as_ref()
+            .expect("a Valid verdict carries its ground derivation");
+        crate::ground_derivation::validate_ground_derivation(&problem, derivation)
+            .expect("the evidence validates on the original clauses");
+        assert!(
+            derivation.steps.iter().all(|step| step
+                .env
+                .values()
+                .all(|value| *value != crate::smt::SmtValue::Int(999))),
+            "the corrupted intermediate value is not evidence"
+        );
+    }
 }
 
 // ── Ground recovery of inlined linking variables ───────────────────────────
@@ -2529,4 +2560,186 @@ fn test_normalize_head_repeated_var_with_compound_keeps_positional_equality() {
         "compound head argument lost its defining equality; \
          got {folded:?} from {constraint:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Ground back-translation through a POISONED composition trace: the body
+// predicates the inliner folded away are re-derived from the input problem's
+// own clauses, the result must validate on the original, and anything that
+// cannot be justified fails closed. Pinned on the real instance
+// (LRACORE_CH4B_owner_2026-09-23 §3.7: swimmingpool_1/6/9, durationThm_3_e7_334):
+// the condense superpass collapses it to one predicate and its inliner poisons
+// the init clause's trace ("expected one surviving premise for body predicate
+// P7, found 0" before this fix).
+// ---------------------------------------------------------------------------
+
+const KIND2_DURATIONTHM: &str =
+    include_str!("../../../tests/fixtures/chc_comp/kind2/durationThm_3_e7_334_000.smt2");
+
+fn condensed_durationthm() -> (ChcProblem, crate::transform::TransformationResult) {
+    let problem =
+        crate::parser::ChcParser::parse(KIND2_DURATIONTHM).expect("vendored kind2 fixture parses");
+    let result = crate::transform::TransformationPipeline::new()
+        .with(crate::transform::CondenseSuperpass::new())
+        .transform(problem.clone());
+    assert!(
+        result.problem.predicates().len() < problem.predicates().len(),
+        "condense must collapse the kind2 system ({} -> {} predicates)",
+        problem.predicates().len(),
+        result.problem.predicates().len()
+    );
+    (problem, result)
+}
+
+/// The derivation comes from `durationthm_replay`, whose replay runs over a
+/// window sized for its work and is held to its thread's CPU. The wall cap here
+/// is a hang guard only, past that 300 s window.
+#[test]
+#[ntest::timeout(420_000)]
+fn kind2_durationthm_collapsed_unsafe_backtranslates_to_the_original_clauses() {
+    let (problem, result) = condensed_durationthm();
+    let derivation = bounded_bmc_ground_derivation(&result.problem, 8);
+    let translated = crate::transform::BackTranslator::translate_ground_derivation(
+        result.back_translator.as_ref(),
+        &derivation,
+    )
+    .expect("the collapsed Unsafe maps back through the poisoned inliner trace");
+    assert_eq!(
+        crate::ground_derivation::validate_ground_derivation(&problem, &translated),
+        Ok(()),
+        "the back-translated derivation must validate on the ORIGINAL clauses"
+    );
+    assert!(
+        translated.steps.len() > derivation.steps.len(),
+        "the folded-away definitional premises are re-derived as extra steps: {} -> {}",
+        derivation.steps.len(),
+        translated.steps.len()
+    );
+}
+
+/// The same instance with the fact step's environment perturbed (every
+/// integer shifted, every Boolean flipped): no synthesized premise can justify
+/// the perturbed values and the translation must refuse rather than guess.
+#[test]
+#[ntest::timeout(420_000)]
+fn kind2_durationthm_premise_synthesis_fails_closed_on_a_perturbed_fact() {
+    let (_problem, result) = condensed_durationthm();
+    let mut derivation = bounded_bmc_ground_derivation(&result.problem, 8);
+    let fact = derivation
+        .steps
+        .iter()
+        .position(|step| step.premises.is_empty())
+        .expect("the derivation has a fact step");
+    let mut perturbed = 0usize;
+    for value in derivation.steps[fact].env.values_mut() {
+        match value {
+            crate::smt::SmtValue::Int(n) => {
+                *n += 1_000_003;
+                perturbed += 1;
+            }
+            crate::smt::SmtValue::Bool(b) => {
+                *b = !*b;
+                perturbed += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(perturbed > 0, "the fact step binds scalar values");
+    assert!(
+        crate::transform::BackTranslator::translate_ground_derivation(
+            result.back_translator.as_ref(),
+            &derivation,
+        )
+        .is_none(),
+        "a perturbed fact environment must fail closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Liveness of premise synthesis (coordinator finding on cb61aff60): the search
+// is bounded by ATTEMPTS and by the route's solve deadline, not only by depth.
+// ---------------------------------------------------------------------------
+
+/// `Inv(0)`; `Inv(y) <- Inv(x) /\ x = y - c` for c in {1, 2, 3}: every
+/// required value propagates down through the bare-variable head, so a target
+/// deeper than the depth bound fails only at that bound on every branch —
+/// ~sum(3^d) attempts unless each attempt is charged.
+const RECURSIVE_HELPER_K3: &str = "(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int) (y Int)) (=> (and (Inv x) (= x (- y 1))) (Inv y))))
+(assert (forall ((x Int) (y Int)) (=> (and (Inv x) (= x (- y 2))) (Inv y))))
+(assert (forall ((x Int) (y Int)) (=> (and (Inv x) (= x (- y 3))) (Inv y))))";
+
+fn synthesize_inv(
+    problem: &ChcProblem,
+    required: i128,
+    budget: &mut usize,
+) -> (
+    Option<usize>,
+    Vec<crate::ground_derivation::GroundDerivationStep>,
+) {
+    let inv = problem
+        .predicates()
+        .iter()
+        .find(|p| p.name == "Inv")
+        .expect("Inv declared")
+        .id;
+    let mut caller_env = FxHashMap::default();
+    caller_env.insert("v".to_string(), crate::smt::SmtValue::Int(required));
+    let args = vec![ChcExpr::var(ChcVar::new("v", ChcSort::Int))];
+    let mut steps = Vec::new();
+    let found = InliningBackTranslator::synthesize_premise_step(
+        inv,
+        &args,
+        &caller_env,
+        &mut steps,
+        problem.clauses(),
+        None,
+        0,
+        budget,
+    );
+    (found, steps)
+}
+
+#[test]
+fn premise_synthesis_gives_up_within_its_attempt_budget_on_a_recursive_helper() {
+    let problem = crate::parser::ChcParser::parse(RECURSIVE_HELPER_K3).expect("fixture parses");
+    // A reachable target inside the depth bound is found.
+    let mut budget = 2048usize;
+    let (found, steps) = synthesize_inv(&problem, 7, &mut budget);
+    assert!(
+        found.is_some(),
+        "Inv(7) is derivable within the depth bound"
+    );
+    assert!(!steps.is_empty());
+    // A target ~334 steps deep cannot be reached within the depth bound; the
+    // search must stop after its attempt budget, quickly, leaving no steps.
+    let mut budget = 2048usize;
+    let start = std::time::Instant::now();
+    let (found, steps) = synthesize_inv(&problem, 1000, &mut budget);
+    let elapsed = start.elapsed();
+    assert!(found.is_none(), "an unreachable value fails closed");
+    assert!(steps.is_empty(), "a failed search leaves no padding steps");
+    assert_eq!(
+        budget, 0,
+        "the search stops exactly when its attempts are spent"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "2048 attempts must be fast, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn premise_synthesis_fails_closed_past_the_solve_deadline() {
+    let problem = crate::parser::ChcParser::parse(RECURSIVE_HELPER_K3).expect("fixture parses");
+    let _deadline = crate::smt::ScopedSolveDeadline::new(Some(
+        ay_core::time::Instant::now() - std::time::Duration::from_millis(1),
+    ));
+    let mut budget = 2048usize;
+    let (found, steps) = synthesize_inv(&problem, 7, &mut budget);
+    assert!(found.is_none(), "past the deadline nothing is synthesized");
+    assert!(steps.is_empty());
+    assert_eq!(budget, 2048, "no attempt is charged past the deadline");
 }

@@ -169,3 +169,52 @@ fn test_rewrite_clause_marks_clean_between_calls() {
     assert_eq!(r2, ClauseRewriteOutcome::Unchanged);
     assert_eq!(out, vec![lit(0, false), lit(1, false)]);
 }
+
+/// Regression: marks for variables at or above the dense ceiling are kept
+/// exactly (in the sparse side table) and never grow the dense array toward
+/// 2^28 entries; tautology and duplicate detection work across the ceiling.
+#[test]
+fn test_marks_above_dense_ceiling_are_exact() -> Result<(), String> {
+    let ceiling = u32::try_from(MAX_DENSE_MARK_VARS).map_err(|e| e.to_string())?;
+    let var = Variable(ceiling.checked_add(5).ok_or("variable index overflows")?);
+    let mut marks = LitMarks::new(4);
+
+    let prev = marks.mark(Literal::negative(var));
+    if prev != 0 {
+        return Err(format!("fresh mark returned previous {prev}, want 0"));
+    }
+    if marks.get(var) != -1 {
+        return Err(format!("mark = {}, want -1", marks.get(var)));
+    }
+    marks.promote(var);
+    if marks.get(var) != -2 {
+        return Err(format!("promoted mark = {}, want -2", marks.get(var)));
+    }
+    marks.clear(Literal::negative(var));
+    if marks.get(var) != 0 {
+        return Err(format!("cleared mark = {}, want 0", marks.get(var)));
+    }
+    if marks.marks.len() != 4 {
+        return Err(format!("dense array grew to {}", marks.marks.len()));
+    }
+
+    let mut out = Vec::new();
+    let tautology = [Literal::positive(var), lit(1, true), Literal::negative(var)];
+    let result = marks.rewrite_clause(&tautology, &[], &[], &mut out);
+    if result != ClauseRewriteOutcome::Tautology {
+        return Err(format!("tautology rewrite = {result:?}"));
+    }
+
+    let duplicate = [Literal::positive(var), Literal::positive(var), lit(0, true)];
+    let result = marks.rewrite_clause(&duplicate, &[], &[], &mut out);
+    if result != ClauseRewriteOutcome::Changed {
+        return Err(format!("duplicate rewrite = {result:?}"));
+    }
+    if out != vec![Literal::positive(var), lit(0, true)] {
+        return Err(format!("duplicate rewrite out = {out:?}"));
+    }
+    if !marks.overflow.is_empty() {
+        return Err("sparse marks were not cleaned up".to_string());
+    }
+    Ok(())
+}

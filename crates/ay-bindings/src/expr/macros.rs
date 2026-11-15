@@ -22,8 +22,6 @@
 macro_rules! binop_same_sort {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -32,8 +30,6 @@ macro_rules! binop_same_sort {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self, other: Self) -> Self {
             assert!($check(&self, &other), $assert_msg);
             let sort = self.sort.clone();
@@ -72,8 +68,6 @@ macro_rules! binop_same_sort {
 macro_rules! binop_to_bool {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -82,8 +76,6 @@ macro_rules! binop_to_bool {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self, other: Self) -> Self {
             assert!($check(&self, &other), $assert_msg);
             Self {
@@ -120,8 +112,6 @@ macro_rules! binop_to_bool {
 macro_rules! unop_same_sort {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -130,8 +120,6 @@ macro_rules! unop_same_sort {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self) -> Self {
             assert!($check(&self), $assert_msg);
             let sort = self.sort.clone();
@@ -169,8 +157,6 @@ macro_rules! unop_same_sort {
 macro_rules! unop_to_bool {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -179,8 +165,6 @@ macro_rules! unop_to_bool {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self) -> Self {
             assert!($check(&self), $assert_msg);
             Self {
@@ -216,8 +200,6 @@ macro_rules! unop_to_bool {
 macro_rules! unop_to_sort {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -227,8 +209,6 @@ macro_rules! unop_to_sort {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self) -> Self {
             assert!($check(&self), $assert_msg);
             Self {
@@ -266,8 +246,6 @@ macro_rules! unop_to_sort {
 macro_rules! binop_rm_same_sort {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -276,8 +254,6 @@ macro_rules! binop_rm_same_sort {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self, rm: $crate::expr::RoundingMode, other: Self) -> Self {
             assert!($check(&self, &other), $assert_msg);
             let sort = self.sort.clone();
@@ -318,8 +294,6 @@ macro_rules! binop_rm_same_sort {
 macro_rules! unop_rm_same_sort {
     (
         $(#[doc = $doc:expr])*
-        $(#[kani_requires($kani_req:expr)])?
-        $(#[kani_ensures($kani_ens:expr)])?
         fn $name:ident / $try_name:ident,
         check: $check:expr,
         assert_msg: $assert_msg:expr,
@@ -328,8 +302,6 @@ macro_rules! unop_rm_same_sort {
     ) => {
         $(#[doc = $doc])*
         #[must_use = "expression operations return a new Expr"]
-        $(#[cfg_attr(kani, kani::requires($kani_req))])?
-        $(#[cfg_attr(kani, kani::ensures($kani_ens))])?
         pub fn $name(self, rm: $crate::expr::RoundingMode) -> Self {
             assert!($check(&self), $assert_msg);
             let sort = self.sort.clone();

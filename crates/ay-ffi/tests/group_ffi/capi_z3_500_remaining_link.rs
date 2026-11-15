@@ -2,28 +2,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-fn find_static_lib() -> Option<PathBuf> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok()?;
-    let workspace_root = Path::new(&manifest_dir).parent()?.parent()?;
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let target_dir = env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"));
-    let profile_dir = target_dir.join(profile);
-    [
-        profile_dir.join("deps").join("libay_ffi.a"),
-        profile_dir.join("libay_ffi.a"),
-    ]
-    .into_iter()
-    .find(|library| library.exists())
-}
+use super::native_link::find_static_lib;
 
 #[test]
 fn exact_z3_500_remaining_safe_calls_compile_link_and_run() {
@@ -59,20 +41,10 @@ fn exact_z3_500_remaining_safe_calls_compile_link_and_run() {
         .arg(&static_lib)
         .arg("-o")
         .arg(&binary);
-    if cfg!(target_os = "macos") {
-        command.args([
-            "-framework",
-            "Security",
-            "-framework",
-            "CoreFoundation",
-            "-lresolv",
-            "-Wl,-no_warn_duplicate_libraries",
-        ]);
-    }
     if cfg!(target_os = "linux") {
         command.arg("-ldl");
     }
-    command.args(["-lpthread", "-lm"]);
+    super::native_link::add_native_libraries(&mut command);
     let link = command.output().expect("link remaining Z3 5.0.0 probes");
     assert!(
         link.status.success(),

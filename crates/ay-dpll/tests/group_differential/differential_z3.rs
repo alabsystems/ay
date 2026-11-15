@@ -20,168 +20,33 @@
 //! ## Environment Variables
 //!
 //! - `Z3_DIFFERENTIAL_REQUIRED=1` (or `true`): Fail tests if Z3 is not available (for CI)
-//! - Without this var, tests skip gracefully when Z3 is missing
+//! - Without this var, tests skip visibly (`AY-TEST-SKIP`) when no z3 is usable
+//! - `Z3_PATH`: the z3 to use; otherwise the first z3 on `PATH` that proves it
+//!   is z3 (see `ay_test_support::z3`), never a `z3` spawned by name
 
-use anyhow::{anyhow, Context, Result};
+use crate::common::check_z3_or_skip;
+use anyhow::{anyhow, ensure, Context, Result};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;
 use std::fs;
-use std::io::Read;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Once, OnceLock,
-};
 use std::time::Duration;
-use wait_timeout::ChildExt;
+
+#[path = "differential_z3_oracle.rs"]
+mod oracle;
+use oracle::{run_z3, SolverResult};
 
 const QF_LIA_PATH: &str = "../../benchmarks/smt/QF_LIA";
 const QF_LRA_PATH: &str = "../../benchmarks/smt/QF_LRA";
 const QF_BV_PATH: &str = "../../benchmarks/smt/QF_BV";
 const QF_UF_PATH: &str = "../../benchmarks/smt/QF_UF";
 
-static Z3_AVAILABLE: OnceLock<bool> = OnceLock::new();
-static Z3_SKIP_LOGGED: Once = Once::new();
-
-/// Result of running a benchmark
-#[derive(Debug, Clone, PartialEq)]
-enum SolverResult {
-    Sat,
-    Unsat,
-    Unknown,
-    Error(String),
-}
-
-impl SolverResult {
-    fn from_str(s: &str) -> Self {
-        let s = s.trim().to_lowercase();
-        if s == "sat" {
-            Self::Sat
-        } else if s == "unsat" {
-            Self::Unsat
-        } else if s == "unknown" || s.contains("unknown") {
-            Self::Unknown
-        } else if s.contains("error") || s.contains("timeout") {
-            Self::Error(s)
-        } else {
-            Self::Unknown
-        }
-    }
-
-    fn is_definite(&self) -> bool {
-        matches!(self, Self::Sat | Self::Unsat)
-    }
-}
-
-/// Check if Z3 is available in PATH
-fn is_z3_available() -> bool {
-    *Z3_AVAILABLE.get_or_init(|| {
-        Command::new("z3")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// Check if Z3 is required (via environment variable).
-/// When Z3_DIFFERENTIAL_REQUIRED is set to `1` or `true`, tests fail instead of skip.
-fn is_z3_required() -> bool {
-    std::env::var("Z3_DIFFERENTIAL_REQUIRED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Check Z3 availability, handling required vs optional cases.
-/// Returns true if Z3 is available, false if skipping (not required),
-/// or panics if Z3 is required but not available.
-fn check_z3_or_skip() -> bool {
-    if is_z3_available() {
-        return true;
-    }
-
-    if is_z3_required() {
-        let value =
-            std::env::var("Z3_DIFFERENTIAL_REQUIRED").unwrap_or_else(|_| "<unset>".to_string());
-        panic!(
-            "Z3 not found in PATH but Z3_DIFFERENTIAL_REQUIRED is set (value={value:?}).\n\
-             Install Z3 or unset the environment variable to skip differential tests."
-        );
-    }
-
-    Z3_SKIP_LOGGED.call_once(|| {
-        eprintln!("Z3 not found in PATH; skipping differential tests");
-        eprintln!("  Set Z3_DIFFERENTIAL_REQUIRED=1 to require Z3 in CI");
-    });
-    false
-}
-
-/// Run Z3 on an SMT-LIB file
-fn run_z3(path: &Path) -> Result<SolverResult> {
-    const Z3_TIMEOUT_SECS: u64 = 10;
-    const Z3_TIMEOUT_SLACK_SECS: u64 = 2;
-
-    // Use both Z3's internal timeout and an OS-level kill timeout.
-    //
-    // Rationale: if the test harness terminates the test process (or if Z3 wedges),
-    // `-T` alone can still leave orphaned long-running Z3 subprocesses.
-    let mut child = Command::new("z3")
-        .arg(format!("-T:{Z3_TIMEOUT_SECS}"))
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn z3 - is Z3 installed and in PATH?")?;
-
-    let mut timed_out = false;
-    let timeout = Duration::from_secs(Z3_TIMEOUT_SECS + Z3_TIMEOUT_SLACK_SECS);
-    let status = match child
-        .wait_timeout(timeout)
-        .context("failed to wait for z3")?
-    {
-        Some(status) => status,
-        None => {
-            timed_out = true;
-            let _ = child.kill();
-            child.wait().context("failed to kill z3 after timeout")?
-        }
-    };
-
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut stdout)
-            .context("failed to read z3 stdout")?;
-    }
-
-    let mut stderr = Vec::new();
-    if let Some(mut err) = child.stderr.take() {
-        err.read_to_end(&mut stderr)
-            .context("failed to read z3 stderr")?;
-    }
-
-    if timed_out {
-        return Ok(SolverResult::Error(format!(
-            "timeout after {Z3_TIMEOUT_SECS}s"
-        )));
-    }
-
-    if !status.success() && stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Ok(SolverResult::Error(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&stdout);
-    // Z3 outputs "sat" or "unsat" on first line
-    let first_line = stdout.lines().next().unwrap_or("");
-    Ok(SolverResult::from_str(first_line))
-}
-
 /// Per-benchmark timeout for AY (seconds). Matches the Z3 timeout so both
 /// solvers get the same budget per instance.
-const AY_TIMEOUT_SECS: u64 = 10;
+const BENCHMARK_TIMEOUT_SECS: u64 = 10;
 
 /// Run AY on an SMT-LIB file with a per-benchmark timeout.
 ///
@@ -243,7 +108,7 @@ fn run_ay_with_timeout(path: &Path, timeout_secs: u64) -> Result<SolverResult> {
 }
 
 fn run_ay(path: &Path) -> Result<SolverResult> {
-    run_ay_with_timeout(path, AY_TIMEOUT_SECS)
+    run_ay_with_timeout(path, BENCHMARK_TIMEOUT_SECS)
 }
 
 /// A mismatch between Z3 and AY
@@ -255,6 +120,7 @@ struct Mismatch {
 }
 
 /// Aggregated differential testing results for one benchmark directory.
+#[derive(Default)]
 struct DifferentialSummary {
     total: usize,
     agreed: usize,
@@ -270,71 +136,69 @@ fn differential_test_dir(dir_path: &str) -> Result<DifferentialSummary> {
         return Err(anyhow!("benchmark directory not found: {}", path.display()));
     }
 
-    let mut total = 0;
-    let mut agreed = 0;
-    let mut mismatches = Vec::new();
-    let mut incompletes = Vec::new();
+    differential_test_directory(&path, run_z3, run_ay)
+}
 
-    let entries: Vec<_> = fs::read_dir(&path)?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "smt2"))
+type BenchmarkSolver = fn(&Path) -> Result<SolverResult>;
+
+fn differential_test_directory(
+    path: &Path,
+    oracle: BenchmarkSolver,
+    solver: BenchmarkSolver,
+) -> Result<DifferentialSummary> {
+    let entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut paths: Vec<_> = entries
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "smt2"))
         .collect();
+    paths.sort();
+    differential_test_paths(paths, oracle, solver)
+}
 
-    for entry in entries {
-        let file_path = entry.path();
-        let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
-
-        total += 1;
-
-        let z3_result = match run_z3(&file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Z3 error on {file_name}: {e}");
-                SolverResult::Error(e.to_string())
-            }
-        };
-
-        let ay_result = match run_ay(&file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("AY error on {file_name}: {e}");
-                SolverResult::Error(e.to_string())
-            }
-        };
-
-        // Only compare definite results (sat/unsat)
-        // Unknown is acceptable for AY if Z3 gives a definite answer
-        // But if both are definite and disagree, that's a bug!
-        if z3_result.is_definite() && ay_result.is_definite() {
+fn differential_test_paths(
+    paths: Vec<PathBuf>,
+    oracle: BenchmarkSolver,
+    solver: BenchmarkSolver,
+) -> Result<DifferentialSummary> {
+    ensure!(!paths.is_empty(), "empty SMT-LIB benchmark population");
+    let mut summary = DifferentialSummary::default();
+    for file_path in paths {
+        let file_name = file_path
+            .file_name()
+            .context("benchmark path has no file name")?
+            .to_string_lossy()
+            .to_string();
+        let z3_result = oracle(&file_path)
+            .with_context(|| format!("Z3 oracle failed on {}", file_path.display()))?;
+        ensure!(
+            z3_result.is_definite(),
+            "Z3 oracle returned no definite evidence on {}: {z3_result:?}",
+            file_path.display()
+        );
+        let ay_result =
+            solver(&file_path).unwrap_or_else(|error| SolverResult::Error(error.to_string()));
+        summary.total += 1;
+        if ay_result.is_definite() {
             if z3_result == ay_result {
-                agreed += 1;
+                summary.agreed += 1;
             } else {
-                mismatches.push(Mismatch {
-                    file: file_name.clone(),
-                    z3_result: z3_result.clone(),
-                    ay_result: ay_result.clone(),
+                summary.mismatches.push(Mismatch {
+                    file: file_name,
+                    z3_result,
+                    ay_result,
                 });
             }
-        } else if z3_result.is_definite() && !ay_result.is_definite() {
-            // Z3 gave definite answer, AY didn't - not a soundness bug but incomplete
-            eprintln!("AY incomplete on {file_name}: Z3={z3_result:?}, AY={ay_result:?}");
-            incompletes.push(Mismatch {
-                file: file_name.clone(),
-                z3_result: z3_result.clone(),
-                ay_result: ay_result.clone(),
-            });
         } else {
-            // Both unknown or Z3 unknown - skip
-            agreed += 1;
+            eprintln!("AY incomplete on {file_name}: Z3={z3_result:?}, AY={ay_result:?}");
+            summary.incompletes.push(Mismatch {
+                file: file_name,
+                z3_result,
+                ay_result,
+            });
         }
     }
-
-    Ok(DifferentialSummary {
-        total,
-        agreed,
-        mismatches,
-        incompletes,
-    })
+    Ok(summary)
 }
 
 // ============================================================================
@@ -342,7 +206,7 @@ fn differential_test_dir(dir_path: &str) -> Result<DifferentialSummary> {
 // ============================================================================
 
 #[test]
-// Each benchmark has a 10s per-instance timeout (AY_TIMEOUT_SECS). The test-level
+// Each benchmark has a 10s per-instance timeout (BENCHMARK_TIMEOUT_SECS). The test-level
 // timeout is a safety net for the aggregate (51 benchmarks × overhead).
 #[timeout(120_000)]
 fn differential_qf_lia_vs_z3() -> Result<()> {
@@ -493,6 +357,7 @@ fn differential_qf_lra_vs_z3() -> Result<()> {
 #[test]
 #[timeout(10_000)]
 fn differential_qf_bv_vs_z3() -> Result<()> {
+    oracle::assert_contract()?;
     if !check_z3_or_skip() {
         return Ok(());
     }
@@ -688,14 +553,14 @@ fn assert_qf_lia_benchmark_matches_z3_sat(
 #[test]
 #[timeout(10_000)]
 fn regression_qf_lia_system_16_matches_z3_sat() -> Result<()> {
-    assert_qf_lia_benchmark_matches_z3_sat("system_16.smt2", "#2657", AY_TIMEOUT_SECS)
+    assert_qf_lia_benchmark_matches_z3_sat("system_16.smt2", "#2657", BENCHMARK_TIMEOUT_SECS)
 }
 
 /// Regression for #2760: `system_11.smt2` must stay SAT and match Z3.
 #[test]
 #[timeout(10_000)]
 fn regression_qf_lia_system_11_matches_z3_sat() -> Result<()> {
-    assert_qf_lia_benchmark_matches_z3_sat("system_11.smt2", "#2760", AY_TIMEOUT_SECS)
+    assert_qf_lia_benchmark_matches_z3_sat("system_11.smt2", "#2760", BENCHMARK_TIMEOUT_SECS)
 }
 
 /// Regression for #2760: `false_unsat_20var_bb.smt2` must never regress to false UNSAT.
@@ -1312,7 +1177,7 @@ fn regression_issue_358_get_value_bv_computed() -> Result<()> {
 
 /// Scan a directory for .smt2 files with QF_S or QF_SLIA logic.
 /// Returns paths to matching files.
-fn find_qf_s_benchmarks(dir: &Path) -> Vec<std::path::PathBuf> {
+fn find_qf_s_benchmarks(dir: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -1351,59 +1216,7 @@ fn differential_test_cvc5_strings() -> Result<DifferentialSummary> {
         }
     }
 
-    let mut total = 0;
-    let mut agreed = 0;
-    let mut mismatches = Vec::new();
-    let mut incompletes = Vec::new();
-
-    for file_path in &all_paths {
-        let file_name = file_path.file_name().unwrap().to_string_lossy().to_string();
-        total += 1;
-
-        let z3_result = match run_z3(file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Z3 error on {file_name}: {e}");
-                SolverResult::Error(e.to_string())
-            }
-        };
-
-        let ay_result = match run_ay(file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("AY error on {file_name}: {e}");
-                SolverResult::Error(e.to_string())
-            }
-        };
-
-        if z3_result.is_definite() && ay_result.is_definite() {
-            if z3_result == ay_result {
-                agreed += 1;
-            } else {
-                mismatches.push(Mismatch {
-                    file: file_name.clone(),
-                    z3_result: z3_result.clone(),
-                    ay_result: ay_result.clone(),
-                });
-            }
-        } else if z3_result.is_definite() && !ay_result.is_definite() {
-            eprintln!("AY incomplete on {file_name}: Z3={z3_result:?}, AY={ay_result:?}");
-            incompletes.push(Mismatch {
-                file: file_name.clone(),
-                z3_result: z3_result.clone(),
-                ay_result: ay_result.clone(),
-            });
-        } else {
-            agreed += 1;
-        }
-    }
-
-    Ok(DifferentialSummary {
-        total,
-        agreed,
-        mismatches,
-        incompletes,
-    })
+    differential_test_paths(all_paths, run_z3, run_ay)
 }
 
 /// Differential test: QF_S and QF_SLIA vs Z3 on CVC5 regression benchmarks.
@@ -1421,7 +1234,7 @@ fn differential_qf_s_qf_slia_cvc5_vs_z3() -> Result<()> {
     // Verify CVC5 reference directory exists
     let cvc5_strings = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../reference/cvc5/test/regress/cli/regress0/strings");
-    if !cvc5_strings.exists() {
+    if !cvc5_strings.exists() && crate::common::corpus_skip_allowed(&cvc5_strings) {
         eprintln!(
             "CVC5 reference not found at {}; skipping string differential test",
             cvc5_strings.display()
@@ -1450,36 +1263,21 @@ fn differential_qf_s_qf_slia_cvc5_vs_z3() -> Result<()> {
         }
     }
 
-    // Known false-UNSAT bugs (AY=Unsat, Z3=Sat) being actively tracked.
-    // Each entry is a file name + the issue tracking the bug.
-    let known_mismatches: &[&str] = &[
-        "issue3497.smt2", // str.indexof semantics: (= (str.indexof x y 1) (str.len x)) with contains
-        "issue8481.smt2", // regex: str.in_re with str.replace
-        "issue2429-code.smt2", // str.to_code + define-fun with integer arithmetic
-    ];
-    let (known, new_bugs): (Vec<_>, Vec<_>) = summary
-        .mismatches
-        .iter()
-        .partition(|m| known_mismatches.contains(&m.file.as_str()));
-    if !known.is_empty() {
-        eprintln!(
-            "KNOWN false-UNSAT bugs (tracked):\n  {}",
-            known
-                .iter()
-                .map(|m| format!("{}: Z3={:?}, AY={:?}", m.file, m.z3_result, m.ay_result))
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
-    }
-
-    // SOUNDNESS GATE: zero NEW disagreements allowed
+    // SOUNDNESS GATE: zero disagreements. There is no exemption list: a wrong
+    // definite answer is never quarantined (tests/divergences.toml rule 1).
+    // The list this replaced (2026-05-24 import) tolerated issue8481.smt2 as
+    // a "known false-UNSAT"; by 2026-09 that unsat came from a cause written
+    // after the list (an unexplained regex length-disjointness conflict,
+    // 2026-06-23). Pinned without the corpus by
+    // group_strings/regex_length_false_unsat.rs.
     assert!(
-        new_bugs.is_empty(),
-        "NEW SOUNDNESS BUG: AY disagrees with Z3 on {} of {} QF_S/QF_SLIA benchmarks.\n\
-         New mismatches: {:?}",
-        new_bugs.len(),
+        summary.mismatches.is_empty(),
+        "SOUNDNESS BUG: AY disagrees with Z3 on {} of {} QF_S/QF_SLIA benchmarks.\n\
+         Mismatches: {:?}",
+        summary.mismatches.len(),
         summary.total,
-        new_bugs
+        summary
+            .mismatches
             .iter()
             .map(|m| format!("{}: Z3={:?}, AY={:?}", m.file, m.z3_result, m.ay_result))
             .collect::<Vec<_>>()
@@ -1493,8 +1291,10 @@ fn differential_qf_s_qf_slia_cvc5_vs_z3() -> Result<()> {
     );
 
     println!(
-        "\n[OK] {} QF_S/QF_SLIA benchmarks: {} agreed, {} incomplete, {} known bugs (no new soundness bugs)",
-        summary.total, summary.agreed, summary.incompletes.len(), known.len()
+        "\n[OK] {} QF_S/QF_SLIA benchmarks: {} agreed, {} incomplete (no soundness bugs)",
+        summary.total,
+        summary.agreed,
+        summary.incompletes.len()
     );
     Ok(())
 }

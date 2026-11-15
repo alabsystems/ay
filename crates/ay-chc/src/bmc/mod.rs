@@ -37,6 +37,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod memory;
+
 use crate::bv_util::bv_mask;
 use crate::cancellation::CancellationToken;
 use crate::engine_config::ChcEngineConfig;
@@ -63,6 +65,43 @@ use ay_frontend::{sexp::parse_sexp, SExpr};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+mod acyclic_defs;
+mod acyclic_names;
+mod exact_simplify;
+mod execution;
+mod failed_replay_memo;
+mod level_alias;
+mod polynomial_witness;
+#[cfg(test)]
+mod probe_budget_tests;
+mod query_scope;
+mod replay_search;
+mod request_stats;
+mod simplify_shared;
+mod ts_witness;
+use acyclic_names::{AcyclicNames, ExactExpansionRefused};
+use request_stats::SafeFirstRequestKind;
+
+/// Tree size from which a transition-system conjunct is printed as a DAG
+/// (`BmcSolver::append_ts_decls_and_asserts`); the executor adapter's
+/// Search-lane threshold.
+const TS_DAG_PRINT_MIN_TREE: usize = 131_072;
+
+/// Caps of one DAG print; past them the tree printer runs as before.
+const TS_DAG_PRINT_CAPS: crate::smt::dag_smtlib::DagCaps = crate::smt::dag_smtlib::DagCaps {
+    max_unique_nodes: 1 << 20,
+    max_depth: 4096,
+};
+
+#[cfg(test)]
+mod interval_compare_tests;
+#[cfg(test)]
+mod polynomial_names_tests;
+#[cfg(test)]
+mod polynomial_square_tests;
+#[cfg(test)]
+mod polynomial_typed_witness_tests;
+
 #[cfg(test)]
 std::thread_local! {
     static TRACE_OBSERVATION_COMMAND_COUNT: std::cell::Cell<usize> = const {
@@ -87,6 +126,12 @@ fn trace_observation_command_count_for_tests() -> usize {
 
 /// Exponential moving average smoothing factor for per-depth solve time.
 const EMA_ALPHA: f64 = 0.3;
+
+/// Floor of the Real-sorted TS lane's per-depth cap (`ts_real_depth_cap`).
+const REAL_TS_DEPTH_CAP_FLOOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// Multiple of the last decided depth's cost allowed to an in-session depth
+/// on a Real-sorted system before the fresh path takes over.
+const REAL_TS_DEPTH_CAP_FACTOR: u32 = 8;
 
 /// When a depth solves faster than this threshold (seconds), the depth is
 /// considered "trivially easy" and adaptive stepping may skip ahead (#7969).
@@ -117,6 +162,76 @@ const MAX_NESTED_ARRAY_CANDIDATE_TOKENS: usize = 4096;
 const MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES: usize = 8192;
 
 /// Maximum exact scalar-UF applications queried after one BMC SAT result.
+/// A proven-unreachable depth prefix handed from one BMC run to another
+/// (front probe -> portfolio BMC; BMC_probe_handoff_2026-09-19).
+///
+/// `depth` is in FLAT-LEVEL units: levels `0..depth` of the level encoding
+/// hold no counterexample, i.e. exactly the `start_depth` contract of
+/// `solve_per_depth_fresh` ("depths `0..start_depth-1` already proved
+/// UNSAT"). On the single-predicate transition-system lane TS depth `j`
+/// coincides with flat level `j` (its own `RetryFresh` hands over
+/// `start_depth: k` after TS depths `0..k`), so that lane both exports and
+/// resumes from the same number; the multipred SingleLoop lane's depths
+/// relate to flat levels only one way (`TS depths 0..k-1 ⇒ flat levels
+/// ≤ k-2`), so it neither exports nor resumes.
+///
+/// `fingerprint` is `problem_fingerprint` of the problem the prefix was
+/// decided on. A consumer honours the frontier ONLY when its own problem
+/// has the same fingerprint: identical predicates and clauses give an
+/// identical `TransitionSystem::from_chc_problem` and identical flat
+/// levels, so the skipped checks are byte-for-byte the ones the consumer
+/// would have issued. Any preprocessing between the two runs changes the
+/// fingerprint and the frontier is ignored (start at 0) — the transfer is
+/// never argued through a transformation. A frontier can only make a BMC
+/// run skip levels; every `Unsafe` it finds still passes the original-clause
+/// replay, and a `Safe` from exhaustion (`acyclic_safe`) is possible only on
+/// the identical problem where the skipped levels were really decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeFrontier {
+    /// Flat levels `0..depth` are proven free of counterexamples.
+    pub(crate) depth: usize,
+    /// `problem_fingerprint` of the problem those levels were decided on.
+    pub(crate) fingerprint: u64,
+}
+
+/// Structural identity of a CHC problem for `ProbeFrontier`: predicates
+/// (index, name, argument sorts) and clauses in order (head, body predicate
+/// applications, constraint). Anything a transformation could change
+/// changes this hash.
+pub(crate) fn problem_fingerprint(problem: &ChcProblem) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    problem.predicates().len().hash(&mut hasher);
+    for pred in problem.predicates() {
+        pred.id.index().hash(&mut hasher);
+        pred.name.hash(&mut hasher);
+        pred.arg_sorts.hash(&mut hasher);
+    }
+    problem.clauses().len().hash(&mut hasher);
+    for clause in problem.clauses() {
+        match &clause.head {
+            ClauseHead::Predicate(id, args) => {
+                1u8.hash(&mut hasher);
+                id.index().hash(&mut hasher);
+                args.hash(&mut hasher);
+            }
+            ClauseHead::False => 0u8.hash(&mut hasher),
+        }
+        clause.body.predicates.len().hash(&mut hasher);
+        for (id, args) in &clause.body.predicates {
+            id.index().hash(&mut hasher);
+            args.hash(&mut hasher);
+        }
+        clause.body.constraint.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Share of the remaining SOLVE budget a converging front-probe lane may
+/// spend on its next depth once past the soft probe budget
+/// (`BmcSolver::ts_probe_extension_fits`).
+const PROBE_EXTENSION_SHARE: f64 = 0.10;
+
 /// Exceeding the cap abandons that witness rather than truncating the finite
 /// function view used by source-clause replay.
 const MAX_UF_APPLICATION_OBSERVATIONS: usize = 4096;
@@ -155,7 +270,7 @@ const ACYCLIC_REACH_DISTRIBUTION_CAP: usize = 4096;
 /// avoiding a nonlinear integer query.
 const DAG_BOUNDED_SQUARE_MAX_UPPER: i128 = 256;
 
-/// Tree-depth clamp for the repeated-body-predicate reroute
+/// Tree-depth clamp for the shared-level-argument reroute
 /// ([`BmcSolver::resolve_unrepresentable_safe`]).
 ///
 /// The tree unfolding grows several-fold per level, so the reroute stays in the
@@ -164,7 +279,7 @@ const DAG_BOUNDED_SQUARE_MAX_UPPER: i128 = 256;
 /// `AdaptivePortfolio`, not to a `solve()` tail).
 const REPEATED_BODY_TREE_MAX_DEPTH: usize = 6;
 
-/// Wall-clock the repeated-body-predicate reroute gets when the caller
+/// Wall-clock the shared-level-argument reroute gets when the caller
 /// configured NO time budget at all (`BmcConfig::time_budget == None`, e.g. the
 /// direct-`solve()` entry points). With a budget it uses what is left of that
 /// budget instead, so this is a floor for unbudgeted callers, never an
@@ -174,11 +289,6 @@ const REPEATED_BODY_TREE_FALLBACK_BUDGET: std::time::Duration = std::time::Durat
 /// Below this the reroute is skipped outright: building one unfolding already
 /// costs more than the remaining slice, so attempting it would only overrun.
 const REPEATED_BODY_TREE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Maximum clause/body entries inspected between cooperative stop polls in
-/// the repeated-body safety preflight. The hash set itself holds at most one
-/// entry per distinct predicate in the current clause body.
-const REPEATED_BODY_SCAN_STOP_POLL_INTERVAL: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IntInterval {
@@ -342,8 +452,19 @@ fn dag_deadline_passed(deadline: Option<ay_core::time::Instant>) -> bool {
 pub(crate) struct BmcStats {
     /// Maximum depth reached during the BMC run.
     pub(crate) max_depth_reached: usize,
-    /// Number of SAT checks performed.
+    /// Legacy depth/check count; exact acyclic completion sets `max_depth + 1`.
+    /// This is coverage bookkeeping, not a count of SMT API requests.
     pub(crate) num_checks: usize,
+    /// Logical SMT requests started by the exact-acyclic safe-first decision lane.
+    /// Excludes delegated polynomial/cone/symbolic lanes and internal backend retries.
+    pub(crate) safe_first_decision_requests_started: usize,
+    /// Safe-first decision requests that returned, including `Unknown`.
+    pub(crate) safe_first_decision_requests_completed: usize,
+    /// Raw unsimplified model-completion requests started by that same lane.
+    /// Separate from decision requests; not an additional count of those requests.
+    pub(crate) safe_first_raw_model_requests_started: usize,
+    /// Safe-first raw model-completion requests that returned, including `Unknown`.
+    pub(crate) safe_first_raw_model_requests_completed: usize,
     /// Number of k-induction attempts.
     pub(crate) num_k_induction_attempts: usize,
     /// Whether k-induction proved safety.
@@ -383,6 +504,11 @@ pub(crate) struct BmcStats {
 pub struct BmcConfig {
     /// Common engine settings (verbose, cancellation).
     pub(crate) base: ChcEngineConfig,
+    /// SMT lane for this solver's contexts (Rung 0, CHC-COMP 2026). Default
+    /// `Verification` — BMC is also a verifier (acyclic empty-model re-proof,
+    /// `validate_empty_scalar_acyclic_bmc_certificate`); engine/probe launch
+    /// sites set `Search`.
+    pub(crate) smt_lane: crate::smt::SmtLane,
     /// Maximum unrolling depth (number of transitions)
     pub(crate) max_depth: usize,
     /// When true, BMC returns Safe (not Unknown) if max_depth is exhausted
@@ -403,6 +529,8 @@ pub struct BmcConfig {
     /// Overall time budget for the BMC run (#7969). When `Some`, the solver
     /// stops exploring deeper depths once the budget is exhausted.
     pub(crate) time_budget: Option<std::time::Duration>,
+    /// Per-context term-memory cap in bytes, intersected with enclosing scopes.
+    pub(crate) memory_budget: Option<usize>,
     /// Enable k-induction check after consecutive UNSAT depths (#7969).
     /// When enabled, after seeing k consecutive UNSAT depths, BMC attempts
     /// a forward k-induction check to prove safety.
@@ -442,6 +570,21 @@ pub struct BmcConfig {
     /// the multipred SingleLoop lane (inc-9) is untouched. `None` (default)
     /// = no clamp anywhere; only the front probe sets this.
     pub(crate) ts_probe_clamp: Option<(usize, std::time::Duration)>,
+    /// Soft budget of a front-probe run (BMC_probe_depth_budget_2026-09-19).
+    /// `time_budget` is the HARD stop; the transition-system lanes stop at
+    /// this soft budget instead, unless the lane is converging: the previous
+    /// depth check decided on this executor and its cost predicts the next
+    /// one fits both the hard budget and a small share of the remaining
+    /// SOLVE budget (`probe_extension_deadline`). `None` (default) = the two
+    /// budgets coincide, i.e. today's behaviour for every other BMC use.
+    pub(crate) soft_time_budget: Option<std::time::Duration>,
+    /// The enclosing solve's deadline, against which a converging lane may
+    /// extend past `soft_time_budget` (see there). `None` = never extend.
+    pub(crate) probe_extension_deadline: Option<ay_core::time::Instant>,
+    /// Resume from a proven-unreachable level prefix decided by an earlier
+    /// BMC run on the SAME problem (see [`ProbeFrontier`]); honoured only
+    /// when the fingerprints match. `None` (default) = start at level 0.
+    pub(crate) resume_frontier: Option<ProbeFrontier>,
     /// Sweep past spurious / non-strictly-confirmable shallow SATs to reach
     /// the real deeper counterexample (#chc25-bmc-sweep). Correct default for
     /// counterexample hunting. Set `false` for proof CROSS-CHECK roles
@@ -459,6 +602,7 @@ impl Default for BmcConfig {
     fn default() -> Self {
         Self {
             base: ChcEngineConfig::default(),
+            smt_lane: crate::smt::SmtLane::Verification,
             max_depth: 200,
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
@@ -467,13 +611,24 @@ impl Default for BmcConfig {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         }
     }
 }
 
 impl BmcConfig {
+    /// Builder: put this solver's SMT contexts on `lane` (engines/probes: `Search`).
+    #[must_use]
+    pub(crate) fn with_smt_lane(mut self, lane: crate::smt::SmtLane) -> Self {
+        self.smt_lane = lane;
+        self
+    }
+
     /// Create config with verbose and cancellation token (convenience for callers).
     pub fn with_engine_config(
         max_depth: usize,
@@ -485,6 +640,7 @@ impl BmcConfig {
                 verbose,
                 cancellation_token,
             },
+            smt_lane: crate::smt::SmtLane::Verification,
             max_depth,
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
@@ -493,7 +649,11 @@ impl BmcConfig {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         }
     }
@@ -502,6 +662,7 @@ impl BmcConfig {
     /// k-induction, and adaptive stepping (#7969).
     pub fn hwmcc() -> Self {
         Self {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig::default(),
             max_depth: 500,
             acyclic_safe: false,
@@ -511,7 +672,11 @@ impl BmcConfig {
             enable_k_induction: true,
             enable_adaptive_stepping: true,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         }
     }
@@ -520,6 +685,7 @@ impl BmcConfig {
     /// stepping and generous budget. No k-induction (pure counterexample search).
     pub fn deep_bug_finding() -> Self {
         Self {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig::default(),
             max_depth: 300,
             acyclic_safe: false,
@@ -529,7 +695,11 @@ impl BmcConfig {
             enable_k_induction: false,
             enable_adaptive_stepping: true,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         }
     }
@@ -548,6 +718,7 @@ impl BmcConfig {
     pub fn cross_check() -> Self {
         Self {
             base: ChcEngineConfig::default(),
+            smt_lane: crate::smt::SmtLane::Verification,
             max_depth: 200,
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
@@ -556,7 +727,11 @@ impl BmcConfig {
             enable_k_induction: false,
             enable_adaptive_stepping: true,
             proof_cross_check: true,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             // Cross-check semantics: only a strictly-validated counterexample
             // matters, and the problem was just proved Safe by another engine
             // — no witness can ever validate, so sweeping past the first
@@ -578,6 +753,19 @@ impl BmcConfig {
     #[must_use]
     pub fn with_time_budget(mut self, budget: std::time::Duration) -> Self {
         self.time_budget = Some(budget);
+        self
+    }
+
+    /// Cap each BMC and checked-replay SMT context's term memory in bytes.
+    ///
+    /// The tighter configured, adaptive, or enclosing cap wins. Zero refuses
+    /// work; the default `None` preserves any enclosing cap. This is not a
+    /// process-RSS or aggregate allocation limit: source expressions, rendering,
+    /// non-term solver data, and independent proof-bundle reconstruction are
+    /// not covered by this per-context mechanism.
+    #[must_use]
+    pub fn with_memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget = Some(bytes);
         self
     }
 
@@ -896,6 +1084,25 @@ pub struct BmcSolver {
     /// full per-depth timeout more). Timing-only: it never changes a verdict,
     /// it only converts overstayed work into Unknown earlier.
     solve_deadline: std::cell::Cell<Option<ay_core::time::Instant>>,
+    /// The HARD deadline (`time_budget`) when a soft budget is configured;
+    /// `solve_deadline` holds the SOFT one and is moved here only while a
+    /// transition-system lane is in an admitted extension
+    /// (`BmcConfig::soft_time_budget`, `enter_probe_extension`).
+    probe_hard_deadline: std::cell::Cell<Option<ay_core::time::Instant>>,
+    /// The SOFT deadline, kept to restore `solve_deadline` after an extension.
+    probe_soft_deadline: std::cell::Cell<Option<ay_core::time::Instant>>,
+    /// Whether a transition-system lane is currently extended past the soft
+    /// budget (see above).
+    probe_extension_active: std::cell::Cell<bool>,
+    /// Flat level this run starts at: the honoured `resume_frontier` depth
+    /// or 0 (resolved once at solve entry, see `resolve_resume_depth`).
+    resume_depth: std::cell::Cell<usize>,
+    /// Number of consecutive flat levels from 0 proven free of
+    /// counterexamples by this run (including a honoured resume prefix);
+    /// exported through [`BmcSolver::proven_unsat_prefix`].
+    proven_unsat_prefix: std::cell::Cell<usize>,
+    /// Attempt-level refusal survives executor cleanup and fallback routing.
+    execution_stop: std::cell::Cell<Option<execution::AttemptStop>>,
 }
 
 #[derive(Debug)]
@@ -905,6 +1112,97 @@ enum SingleExecutorOutcome {
         start_depth: usize,
         consecutive_unsat: usize,
     },
+}
+
+/// Which predicate definitions of one flat level a single-executor batch
+/// asserts (see [`SingleExecutorFrames`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameSlice {
+    All,
+    QueryPredicates,
+    OtherPredicates,
+}
+
+/// Frame schedule of the persistent single-executor BMC.
+///
+/// A level-`k` definition `P#k => OR(rules)` reads only level-`k-1`
+/// instances, and the depth-`k` query reads only the level-`k` instances of
+/// its own body predicates. So while the depth-`k` query is checked, the
+/// level-`k` definition of every OTHER predicate is guarded by a flag `P#k`
+/// that no asserted formula mentions. Such a slice is asserted at the next
+/// depth instead, ahead of the level-`k+1` query slice, which is the first
+/// formula that can reach it.
+///
+/// Each depth-`k` check therefore asserts a subset of the eager schedule's
+/// formulas, so its UNSAT implies the eager UNSAT (and with it every
+/// proven-UNSAT prefix and bounded exhaustion built on it). Conversely any
+/// model of it satisfies the deferred implications once their fresh flags are
+/// set false, leaving every symbol the check mentions unchanged: the two
+/// checks are equisatisfiable, and the witness extractor, which reads only
+/// the level-`k` query roots and fully asserted levels below `k`, reads a
+/// model of the eager encoding. Every SAT still passes the strict
+/// original-clause witness replay.
+///
+/// Measured motivation: under a CHC-COMP nullary query predicate
+/// (`END_QUERY => false`) a depth-0 violation sits at BMC depth 1, and the
+/// eager schedule asserted the whole level-1 transition frame just to check a
+/// query that reads level 0 only. On heap__swaparray_000 (in-place swap store
+/// chains) the executor spent the entire 10s counterexample-replay budget on
+/// that dead frame and answered unknown, so every witness-free Unsafe that
+/// reached the replay was rejected.
+struct SingleExecutorFrames {
+    query_predicates: FxHashSet<PredicateId>,
+    /// Levels `0..=complete_through` have every predicate definition asserted.
+    complete_through: usize,
+    /// The level whose query-predicate slice is asserted ahead of the rest.
+    query_slice_level: Option<usize>,
+}
+
+impl SingleExecutorFrames {
+    /// Level 0 is asserted whole before the depth loop starts.
+    fn new(queries: &[&HornClause]) -> Self {
+        Self {
+            query_predicates: queries
+                .iter()
+                .flat_map(|query| query.body.predicates.iter().map(|(pred, _)| *pred))
+                .collect(),
+            complete_through: 0,
+            query_slice_level: None,
+        }
+    }
+
+    /// Batches to assert before the depth-`k` query, `k > 0`. Depths only
+    /// increase between calls (adaptive stepping may skip some): every level
+    /// below `k` is completed, then the level-`k` query slice is added.
+    fn plan(&self, k: usize) -> Vec<(usize, FrameSlice)> {
+        let mut plan: Vec<(usize, FrameSlice)> = (self.complete_through + 1..k)
+            .map(|level| {
+                if self.query_slice_level == Some(level) {
+                    (level, FrameSlice::OtherPredicates)
+                } else {
+                    (level, FrameSlice::All)
+                }
+            })
+            .collect();
+        if k > self.complete_through && self.query_slice_level != Some(k) {
+            plan.push((k, FrameSlice::QueryPredicates));
+        }
+        plan
+    }
+
+    /// Record that `plan(k)` has been asserted.
+    fn advance(&mut self, k: usize) {
+        self.complete_through = self.complete_through.max(k.saturating_sub(1));
+        self.query_slice_level = Some(k);
+    }
+
+    fn includes(&self, slice: FrameSlice, pred: PredicateId) -> bool {
+        match slice {
+            FrameSlice::All => true,
+            FrameSlice::QueryPredicates => self.query_predicates.contains(&pred),
+            FrameSlice::OtherPredicates => !self.query_predicates.contains(&pred),
+        }
+    }
 }
 
 enum DepthCheckOutcome {
@@ -942,18 +1240,41 @@ impl Drop for BmcSolver {
 
 impl BmcSolver {
     /// Create a new BMC solver
-    pub(crate) fn new(problem: ChcProblem, config: BmcConfig) -> Self {
+    pub(crate) fn new(problem: ChcProblem, mut config: BmcConfig) -> Self {
+        config.base.cancellation_token = config
+            .base
+            .cancellation_token
+            .as_ref()
+            .map(CancellationToken::sticky_child);
         Self {
-            problem,
+            problem: query_scope::rename_query_sort_clashes(problem),
             config,
             stats: std::cell::RefCell::new(BmcStats::default()),
             solve_deadline: std::cell::Cell::new(None),
+            probe_hard_deadline: std::cell::Cell::new(None),
+            probe_soft_deadline: std::cell::Cell::new(None),
+            probe_extension_active: std::cell::Cell::new(false),
+            resume_depth: std::cell::Cell::new(0),
+            proven_unsat_prefix: std::cell::Cell::new(0),
+            execution_stop: std::cell::Cell::new(None),
         }
+    }
+
+    /// This solver's SMT context on its configured lane (`BmcConfig::smt_lane`).
+    pub(crate) fn make_smt_context(&self) -> crate::smt::SmtContext {
+        let mut smt = ChcProblem::make_smt_context(&self.problem);
+        smt.set_lane(self.config.smt_lane);
+        smt
     }
 
     /// Get a snapshot of the current BMC stats (for diagnosis).
     pub(crate) fn stats(&self) -> BmcStats {
-        self.stats.borrow().clone()
+        let mut stats = self.stats.borrow().clone();
+        if let Some(cause) = self.execution_stop.get() {
+            stats.exhausted_search = false;
+            stats.budget_exhausted = cause == execution::AttemptStop::Deadline;
+        }
+        stats
     }
 
     /// Update stats with depth and timing info.
@@ -974,7 +1295,7 @@ impl BmcSolver {
     /// `Safe` is only sound when every depth was discharged and no timeout /
     /// SMT `unknown` was seen along the way.
     fn finalize_bounded_search(&self, encountered_unknown: bool) -> ChcEngineResult {
-        if encountered_unknown {
+        if encountered_unknown || self.execution_stopped(None) {
             return ChcEngineResult::Unknown;
         }
 
@@ -986,64 +1307,26 @@ impl BmcSolver {
         }
     }
 
-    /// Whether any clause body applies the same predicate more than once.
-    ///
-    /// [`Self::level_arg`] names a level argument by `(predicate, level, index)`
-    /// only, so every occurrence of a predicate within one body is equated to
-    /// the *same* argument tuple. A body with `N > 1` occurrences of one
-    /// predicate is therefore encoded as "all `N` premise tuples are
-    /// identical", which is strictly stronger than the clause it stands for.
-    ///
-    /// The consequence is that per-depth UNSAT becomes vacuous: it can hold
-    /// because the collapsed encoding is self-contradictory rather than because
-    /// no counterexample exists. Depth exhaustion then proves nothing, so an
-    /// `acyclic_safe` run must not report `Safe`.
-    ///
-    /// [`Self::solve_bounded_tree_refutation`] carries the exact encoding for
-    /// these bodies and is where [`Self::resolve_unrepresentable_safe`] routes
-    /// them.
-    ///
-    /// `None` means cancellation or the authoritative solve deadline stopped
-    /// the scan. Callers must treat that as `Unknown`, never as proof that all
-    /// bodies are distinct.
-    fn has_repeated_body_predicate(&self) -> Option<bool> {
-        if self.model_extraction_should_stop() {
-            return None;
-        }
-
-        let mut seen = FxHashSet::default();
-        for clause in self.problem.clauses() {
-            // Poll at every clause boundary as well as within wide bodies, so
-            // a proof with many empty/unit clauses remains interruptible.
-            if self.model_extraction_should_stop() {
-                return None;
-            }
-            seen.clear();
-            for (index, (predicate, _)) in clause.body.predicates.iter().enumerate() {
-                if index > 0
-                    && index % REPEATED_BODY_SCAN_STOP_POLL_INTERVAL == 0
-                    && self.model_extraction_should_stop()
-                {
-                    return None;
-                }
-                if !seen.insert(*predicate) {
-                    return (!self.model_extraction_should_stop()).then_some(true);
-                }
-            }
-        }
-
-        (!self.model_extraction_should_stop()).then_some(false)
+    /// Whether distinct premise branches may share a level argument tuple.
+    /// This includes equal predicates in one body AND a shared ancestor of
+    /// otherwise distinct premises. Disjoint ancestry remains eligible under
+    /// this check; it does not establish the other completeness conditions of
+    /// a particular level encoding. Cancellation/deadline expiry is `None`.
+    fn level_flat_may_alias_ancestry(&self) -> Option<bool> {
+        level_alias::has_shared_ancestry(&self.problem, &mut || {
+            !self.model_extraction_should_stop()
+        })
     }
 
     /// Never publish a `Safe` the level-flat encoding cannot justify; try to
     /// decide the problem on the EXACT encoding instead.
     ///
     /// Applied at every [`Self::solve`] exit so no internal path can publish a
-    /// `Safe` that rests on a collapsed body (see
-    /// [`Self::has_repeated_body_predicate`]). Without this,
-    /// `P(0). P(1). false :- P(x), P(y), x != y.` — plainly unsafe — is
-    /// reported `Safe`, because the shared level argument forces `x == y` and
-    /// makes every depth UNSAT.
+    /// `Safe` that rests on collapsed premise ancestry (see
+    /// [`Self::level_flat_may_alias_ancestry`]). For example, with `P(0). P(1).`
+    /// and `Q(x) :- P(x). R(y) :- P(y).`, the query
+    /// `false :- Q(x), R(y), x != y` is unsafe, yet both level-`k` premises
+    /// share `P#(k-1)` and the flattened query forces `x == y`.
     ///
     /// The collapsed `Safe` is discarded unconditionally. Rather than stopping
     /// at `Unknown`, the problem is then handed to
@@ -1056,19 +1339,34 @@ impl BmcSolver {
     ///
     /// Budget: the tree lane runs inside what is left of `solve`'s OWN budget
     /// (the enclosing `ScopedSmtDeadline` clamps its SMT checks the same way),
-    /// and falls back to [`REPEATED_BODY_TREE_FALLBACK_BUDGET`] only when the
-    /// caller configured no deadline at all.
+    /// CAPPED at [`REPEATED_BODY_TREE_FALLBACK_BUDGET`], which is also the
+    /// value used when the caller configured no deadline at all.
     ///
-    /// Only `Safe` is affected. `Unsafe` still rests on its own witness replay
-    /// and is untouched.
+    /// The cap matters because this lane's match arms are `Unsafe => Unsafe`
+    /// and everything else `Unknown`: it structurally cannot return `Safe`. So
+    /// handing it the ENTIRE remaining wall spends the whole portfolio budget
+    /// on a lane that can only refute, and when it does not refute, every other
+    /// engine behind it is starved and the row reports budget-exhausted. That
+    /// is fail-closed but it costs verdicts, and it is the shape MODEL_CHECKER_CONSUMER
+    /// measured in the development design notes.
+    /// Capping can only turn a refutation this lane would have found into
+    /// `Unknown`; it can never publish a `Safe`, so the safety side is
+    /// unchanged.
+    ///
+    /// The ancestry guard affects only `Safe`. Attempt-level resource refusal
+    /// also prevents publishing a late `Unsafe`, regardless of witness replay.
     fn resolve_unrepresentable_safe(&self, result: ChcEngineResult) -> ChcEngineResult {
+        if self.execution_stopped(None) {
+            return ChcEngineResult::Unknown;
+        }
         if !matches!(result, ChcEngineResult::Safe(_)) {
             return result;
         }
-        match self.has_repeated_body_predicate() {
-            Some(true) => {}
+        match self.level_flat_may_alias_ancestry() {
+            Some(true) => self.stats.borrow_mut().exhausted_search = false,
             Some(false) => return result,
             None => {
+                self.stats.borrow_mut().exhausted_search = false;
                 if matches!(self.solve_deadline.get(), Some(deadline) if ay_core::time::Instant::now() >= deadline)
                 {
                     self.stats.borrow_mut().budget_exhausted = true;
@@ -1077,8 +1375,8 @@ impl BmcSolver {
             }
         }
         tracing::warn!(
-            "BMC: discarding Safe — a clause body applies one predicate more than once, \
-             which the level-flat encoding collapses into a single shared argument tuple, \
+            "BMC: discarding Safe — distinct premise branches share predicate ancestry, \
+             which the level-flat encoding can collapse into one argument tuple, \
              so depth exhaustion does not prove safety; retrying on the exact tree encoding"
         );
 
@@ -1087,7 +1385,9 @@ impl BmcSolver {
         }
         let budget = self
             .remaining_solve_budget()
-            .unwrap_or(REPEATED_BODY_TREE_FALLBACK_BUDGET);
+            .map_or(REPEATED_BODY_TREE_FALLBACK_BUDGET, |remaining| {
+                remaining.min(REPEATED_BODY_TREE_FALLBACK_BUDGET)
+            });
         if budget < REPEATED_BODY_TREE_MIN_BUDGET {
             return ChcEngineResult::Unknown;
         }
@@ -1150,7 +1450,9 @@ impl BmcSolver {
         tracing::info!(
             "BMC stats: result={} path={} max_depth={} checks={} k_ind_attempts={} \
              k_ind_proved={} ema={:.3}s total={:.3}s budget_exhausted={} \
-             exhausted_search={} adaptive={}",
+             exhausted_search={} adaptive={} safe_first_decision_requests_started={} \
+             safe_first_decision_requests_completed={} safe_first_raw_model_requests_started={} \
+             safe_first_raw_model_requests_completed={}",
             result_name,
             path,
             stats.max_depth_reached,
@@ -1162,6 +1464,10 @@ impl BmcSolver {
             stats.budget_exhausted,
             stats.exhausted_search,
             stats.used_adaptive_stepping,
+            stats.safe_first_decision_requests_started,
+            stats.safe_first_decision_requests_completed,
+            stats.safe_first_raw_model_requests_started,
+            stats.safe_first_raw_model_requests_completed,
         );
     }
 
@@ -1173,7 +1479,7 @@ impl BmcSolver {
     /// restart their own `start` clocks; without the absolute deadline each
     /// lane transition silently granted the budget again.
     fn is_over_budget(&self, start: &ay_core::time::Instant) -> bool {
-        if let Some(budget) = self.config.time_budget {
+        if let Some(budget) = self.effective_time_budget() {
             if start.elapsed() >= budget {
                 return true;
             }
@@ -1191,13 +1497,396 @@ impl BmcSolver {
     /// the absolute solve deadline so a wide expansion cannot spend the whole
     /// budget reshaping witnesses. Stopping early only costs completeness.
     fn model_extraction_should_stop(&self) -> bool {
-        self.config.base.is_cancelled()
-            || matches!(self.solve_deadline.get(), Some(deadline) if ay_core::time::Instant::now() >= deadline)
+        self.execution_stopped(None)
     }
 
     /// Check whether to continue to the next depth based on cancellation and budget.
     fn should_continue_depth(&self, start: &ay_core::time::Instant) -> bool {
-        !self.config.base.is_cancelled() && !self.is_over_budget(start)
+        !self.execution_stopped(None) && !self.is_over_budget(start)
+    }
+
+    /// Predicted wall cost of the next depth check from the last decided one.
+    /// Depth checks on the lustre class grow 1.4-2.5x per depth at the deep
+    /// end (BMC_probe_depth_budget_2026-09-19 §2), so twice the last cost is a
+    /// conservative one-step prediction.
+    fn predicted_next_depth_cost(last_depth_cost: std::time::Duration) -> std::time::Duration {
+        last_depth_cost.saturating_mul(2)
+    }
+
+    /// Per-depth deadline for a persistent transition-system check.
+    ///
+    /// The old rule capped every depth at HALF the remaining lane budget
+    /// ("insurance for the fresh fallback"). Halving compounds: with a 14 s
+    /// probe, a lane whose depth costs grow 2.1 s -> 2.9 s -> ~4 s had 3.6 s
+    /// left for the depth the previous one predicts needs 4-6 s, so it was
+    /// killed at depth 10 with the counterexample at depth 12 — and the
+    /// fallback it "insured" (a flat re-solve of the same depth from
+    /// scratch) had 3.6 s for a check the incremental lane could not finish
+    /// (metros_2, BMC_probe_depth_budget_2026-09-19). The cap now honours the
+    /// measured trend: at least the predicted cost of this depth, never more
+    /// than the whole remaining lane budget, and never below the 50 ms
+    /// floor. With no decided depth yet the old half-remaining rule stands.
+    ///
+    /// The trend is honoured only where it predicts the depth affordable. A
+    /// depth whose prediction exceeds everything left keeps the half rule:
+    /// granting it the whole remainder bets the lane on a check its own
+    /// (conservative) trend says may not finish and leaves the fresh fallback
+    /// nothing, and on a SAT-typed depth that fallback is often the far
+    /// cheaper decider. On the condensed kind2 durationThm_3 system the
+    /// persistent lane runs depth 3 15.5 s to an inconclusive resource limit
+    /// after a 7.5 s depth 2, while the fresh path decides it SAT in 0.07 s;
+    /// a replay over a 15-20 s window, or over 45 s on a host stretched 3x,
+    /// handed depth 3 the whole remainder and confirmed nothing. The front
+    /// probe's admission (`ts_probe_admit_next_depth`) already refuses a
+    /// depth whose prediction exceeds what is left, so this changes only the
+    /// budgeted BMC runs without a soft budget, e.g. the counterexample replay
+    /// (`replay_confirm_unsafe_on_problem`), `solve_bmc_only` and the adaptive
+    /// multi-predicate BMC lanes. The portfolio's BMC engines carry no time
+    /// budget or step adaptively (which turns both TS lanes off), so they
+    /// never reach this cap.
+    fn ts_depth_cap(
+        &self,
+        depth_start: ay_core::time::Instant,
+        lane_start: &ay_core::time::Instant,
+        last_depth_cost: Option<std::time::Duration>,
+    ) -> Option<ay_core::time::Instant> {
+        let budget = self.effective_time_budget()?;
+        let remaining = budget.saturating_sub(lane_start.elapsed());
+        let half = remaining.div_f64(2.0);
+        let mut cap = match last_depth_cost.map(Self::predicted_next_depth_cost) {
+            Some(predicted) if predicted <= remaining => half.max(predicted),
+            _ => half,
+        };
+        // An EXTENDED depth was admitted on its prediction alone; bound the
+        // damage of a wrong one (typically the first SAT-typed depth, whose
+        // model search does not follow the unsat-depth trend: metros_2's
+        // depth 12 ran 130 s after depths of 7.6 s and 14.6 s) to twice the
+        // prediction, i.e. at most 20 % of the remaining solve budget.
+        if self.probe_extension_active.get() {
+            if let Some(last) = last_depth_cost {
+                cap = cap.min(Self::predicted_next_depth_cost(last).saturating_mul(2));
+            }
+        }
+        let cap = cap.max(std::time::Duration::from_millis(50));
+        Some(depth_start + cap)
+    }
+
+    /// Decide depths `start_depth..=max_depth` of a transition system, each on
+    /// a FRESH executor holding `init@0 ∧ trans@0..k-1 ∧ query@k` (no push/pop),
+    /// and confirm a SAT depth from that executor's own model through
+    /// `ts_model_unsafe_at_depth` — the same witness construction and the same
+    /// original-clause replay gate as the persistent lane
+    /// (`LRA_BMC_unsafe_2026-09-22.md`).
+    ///
+    /// The Real-sorted continuation of the persistent lane's `RetryFresh`
+    /// hand-off: (a) the persistent session's later LRA scopes degrade (see
+    /// `ts_real_depth_cap`) and (b) the flat per-depth path cannot confirm a
+    /// Real SAT (its witness extraction is i128-only). Otherwise it follows
+    /// the flat fallback's contract exactly: the lane's executor policy
+    /// (`configure_cex_search_executor`), a local deadline marks the depth
+    /// inconclusive and the sweep continues deeper, unsat depths count toward
+    /// the same k-induction attempt, and exhaustion never claims Safe (the
+    /// lane is never entered under `acyclic_safe`). `None` = not applicable;
+    /// the caller then runs the flat path.
+    fn solve_ts_fresh_per_depth(
+        &self,
+        max_depth: usize,
+        start_depth: usize,
+        initial_consecutive_unsat: usize,
+    ) -> Option<ChcEngineResult> {
+        if self.execution_stopped(None) {
+            return Some(ChcEngineResult::Unknown);
+        }
+        let ts = TransitionSystem::from_chc_problem(&self.problem).ok()?;
+        if ts.find_unsupported_transition_state_sort().is_some() {
+            return None;
+        }
+        let disjuncts = TransitionSystem::clause_disjuncts(&self.problem).ok()?;
+        let logic = self.detect_bmc_logic();
+        let init0 = ts.init_at(0);
+        if !self.executor_conjuncts_supported(std::slice::from_ref(&init0), "ts-fresh init") {
+            return None;
+        }
+        let mut prefix = format!("(set-logic {logic})\n");
+        self.append_problem_uf_declarations(&mut prefix)?;
+        let mut declared: FxHashSet<String> = FxHashSet::default();
+        Self::append_ts_decls_and_asserts(&mut prefix, &init0, &mut declared, true);
+        for j in 0..start_depth {
+            let transition_j = ts.transition_at(j);
+            if !self.executor_conjuncts_supported(
+                std::slice::from_ref(&transition_j),
+                "ts-fresh prefix",
+            ) {
+                return None;
+            }
+            Self::append_ts_decls_and_asserts(&mut prefix, &transition_j, &mut declared, true);
+        }
+
+        let start = ay_core::time::Instant::now();
+        let mut ema_depth_time: f64 = 0.0;
+        let mut consecutive_unsat = initial_consecutive_unsat;
+        let mut encountered_unknown = false;
+        for k in start_depth..=max_depth {
+            if !self.should_continue_depth(&start) {
+                tracing::debug!("BMC-ts-fresh: stopped at depth {k} (budget/cancel)");
+                self.stats.borrow_mut().budget_exhausted = true;
+                return Some(ChcEngineResult::Unknown);
+            }
+            let query_k = ts.query_at(k);
+            if !self.executor_conjuncts_supported(std::slice::from_ref(&query_k), "ts-fresh query")
+            {
+                return Some(ChcEngineResult::Unknown);
+            }
+            let mut script = prefix.clone();
+            let mut query_declared = declared.clone();
+            Self::append_ts_decls_and_asserts(&mut script, &query_k, &mut query_declared, false);
+            script.push_str("(check-sat)\n");
+            let Ok(commands) = ay_frontend::parse(&script) else {
+                return Some(ChcEngineResult::Unknown);
+            };
+            let depth_start = ay_core::time::Instant::now();
+            let deadline = self.per_depth_deadline(depth_start);
+            let mut exec = crate::smt::executor_adapter::new_search_executor();
+            self.configure_cex_search_executor(&mut exec);
+            let result_str =
+                match self.execute_controlled_batch(&mut exec, &commands, deadline, |_, _| {}) {
+                    Ok(outputs) => outputs
+                        .iter()
+                        .map(|s| s.trim())
+                        .find(|s| matches!(*s, "sat" | "unsat" | "unknown"))
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    Err(execution::BatchFailure::LocalDeadline) => "unknown".to_owned(),
+                    Err(execution::BatchFailure::Stopped(_)) => {
+                        return Some(ChcEngineResult::Unknown)
+                    }
+                    Err(execution::BatchFailure::Unavailable) => return None,
+                };
+            let depth_elapsed = depth_start.elapsed().as_secs_f64();
+            ema_depth_time = EMA_ALPHA * depth_elapsed + (1.0 - EMA_ALPHA) * ema_depth_time;
+            self.record_depth(k, ema_depth_time);
+            tracing::debug!("BMC-ts-fresh: depth={k} result={result_str} time={depth_elapsed:.3}s");
+            match result_str.as_str() {
+                "sat" => {
+                    if let Some(unsafe_result) =
+                        self.ts_model_unsafe_at_depth(&mut exec, &ts, &disjuncts, k, deadline)
+                    {
+                        return Some(unsafe_result);
+                    }
+                    if self.execution_stopped(None) {
+                        return Some(ChcEngineResult::Unknown);
+                    }
+                    // Not confirmed (witness incomplete or replay refused):
+                    // like the flat sweep's `Advance`, keep going deeper and
+                    // mark the run inconclusive.
+                    tracing::debug!("BMC-ts-fresh: depth {k} SAT not confirmed; sweeping on");
+                    encountered_unknown = true;
+                    consecutive_unsat = 0;
+                }
+                "unsat" => {
+                    consecutive_unsat += 1;
+                    self.note_level_unreachable(k);
+                    if self.config.enable_k_induction
+                        && consecutive_unsat >= K_INDUCTION_MIN_CONSECUTIVE_UNSAT
+                        && k >= K_INDUCTION_MIN_CONSECUTIVE_UNSAT
+                    {
+                        self.stats.borrow_mut().num_k_induction_attempts += 1;
+                        if let Some(safe_result) = self.try_k_induction_check(consecutive_unsat) {
+                            {
+                                let mut stats = self.stats.borrow_mut();
+                                stats.k_induction_proved = true;
+                                stats.k_induction_k = Some(consecutive_unsat);
+                            }
+                            return Some(safe_result);
+                        }
+                    }
+                }
+                _ => {
+                    encountered_unknown = true;
+                    consecutive_unsat = 0;
+                }
+            }
+            if k == max_depth {
+                break;
+            }
+            let transition_k = ts.transition_at(k);
+            if !self.executor_conjuncts_supported(
+                std::slice::from_ref(&transition_k),
+                "ts-fresh transition",
+            ) {
+                return Some(ChcEngineResult::Unknown);
+            }
+            Self::append_ts_decls_and_asserts(&mut prefix, &transition_k, &mut declared, true);
+        }
+        Some(self.finalize_bounded_search(encountered_unknown))
+    }
+
+    /// Per-depth cap of the persistent transition-system lane on Real-sorted
+    /// problems (`LRA_BMC_unsafe_2026-09-22.md`).
+    ///
+    /// ay-dpll's incremental push/pop session degrades on later LRA scopes
+    /// ("scope poisoning", `MICROBENCH_QUERY_REPLAY_2026-09-18.md` §5.2): on
+    /// LRA-Lin the lane's SAT-typed counterexample depth took 53 s in-session
+    /// for a query a fresh executor decides in 7 s
+    /// (`om1_with_relays_agreement_two_faults`, depth 3) and 15.5 s vs 5–9 s
+    /// on `s3_clnt_2_BUG` (depth 8), while its unsat depths stay at 1–400 ms.
+    /// A depth running past `max(2 s, 8 × the last decided depth)` is
+    /// therefore handed to the fresh per-depth path at that depth (the
+    /// lane's existing `RetryFresh` hand-off), which decides it on a fresh
+    /// executor and confirms a SAT from its own model. Int systems keep the
+    /// lane unchanged (the LIA lanes are tuned; T6/T8). Pure scheduling: the
+    /// fresh path's verdicts go through the same original-clause replay.
+    fn ts_real_depth_cap(
+        has_real_sorts: bool,
+        depth_start: ay_core::time::Instant,
+        last_depth_cost: Option<std::time::Duration>,
+    ) -> Option<ay_core::time::Instant> {
+        if !has_real_sorts {
+            return None;
+        }
+        let cap = last_depth_cost.map_or(REAL_TS_DEPTH_CAP_FLOOR, |last| {
+            REAL_TS_DEPTH_CAP_FLOOR.max(last.saturating_mul(REAL_TS_DEPTH_CAP_FACTOR))
+        });
+        Some(depth_start + cap)
+    }
+
+    /// Honour `resume_frontier` iff it was decided on THIS problem
+    /// (fingerprint match, see [`ProbeFrontier`]); otherwise start at 0.
+    fn resolve_resume_depth(&self) {
+        let start = match self.config.resume_frontier {
+            Some(frontier) if frontier.depth > 0 => {
+                let own = problem_fingerprint(&self.problem);
+                if own == frontier.fingerprint {
+                    tracing::debug!(
+                        "BMC: resuming from hand-off frontier: levels 0..{} proven on this problem",
+                        frontier.depth
+                    );
+                    frontier.depth
+                } else {
+                    tracing::debug!(
+                        "BMC: hand-off frontier (depth {}) ignored: problem fingerprint differs                          ({:016x} vs {:016x})",
+                        frontier.depth,
+                        frontier.fingerprint,
+                        own
+                    );
+                    0
+                }
+            }
+            _ => 0,
+        };
+        self.resume_depth.set(start);
+        self.proven_unsat_prefix.set(start);
+    }
+
+    /// Record that flat level `level` was decided free of counterexamples;
+    /// the exported prefix grows only contiguously from 0.
+    fn note_level_unreachable(&self, level: usize) {
+        if self.proven_unsat_prefix.get() == level {
+            self.proven_unsat_prefix.set(level + 1);
+        }
+    }
+
+    /// Flat levels `0..n` this run proved free of counterexamples (plus a
+    /// honoured resume prefix). Paired with `problem_fingerprint` of this
+    /// solver's problem it is a [`ProbeFrontier`] a later BMC run on the
+    /// same problem may resume from.
+    pub(crate) fn proven_unsat_prefix(&self) -> usize {
+        self.proven_unsat_prefix.get()
+    }
+
+    /// The budget every path currently runs under: the soft one when a front
+    /// probe configured it and no lane is extended, the hard one otherwise.
+    fn effective_time_budget(&self) -> Option<std::time::Duration> {
+        if self.probe_extension_active.get() {
+            self.config.time_budget
+        } else {
+            self.config.soft_time_budget.or(self.config.time_budget)
+        }
+    }
+
+    /// Gate for a transition-system lane's next depth against the SOFT
+    /// budget (front probe only; see `BmcConfig::soft_time_budget`).
+    ///
+    /// Returns `true` when the depth may start. If the depth still fits the
+    /// soft budget on its one-step prediction, nothing changes. Otherwise the
+    /// lane may continue only if it is converging — the previous depth
+    /// decided on this executor and twice its cost fits both what is left of
+    /// the hard budget and `PROBE_EXTENSION_SHARE` of the remaining SOLVE
+    /// budget — in which case the lane enters the extension: the effective
+    /// deadline moves to the hard one until `leave_probe_extension`. The
+    /// share keeps this budget-relative: at a 60 s solve only cheap depths
+    /// qualify (the invariant lanes after the probe keep their slices and
+    /// the S1b clamp still stops deep no-cex lanes); at competition scale a
+    /// lane doing 5-10 s depths with a counterexample two depths away is no
+    /// longer thrown away with 29 minutes on the clock.
+    fn ts_probe_admit_next_depth(
+        &self,
+        lane_start: &ay_core::time::Instant,
+        last_depth_cost: Option<std::time::Duration>,
+    ) -> bool {
+        let Some(soft) = self.config.soft_time_budget else {
+            return true;
+        };
+        if self.probe_extension_active.get() {
+            // Already extended: the hard budget governs, `is_over_budget`
+            // and the per-depth cap bound it; re-check convergence so a
+            // depth that no longer fits is not started.
+            return last_depth_cost
+                .is_some_and(|last| self.ts_probe_extension_fits(lane_start, last));
+        }
+        let soft_left = soft.saturating_sub(lane_start.elapsed());
+        let predicted = last_depth_cost.map(Self::predicted_next_depth_cost);
+        if soft_left > std::time::Duration::ZERO && predicted.is_none_or(|p| p <= soft_left) {
+            return true;
+        }
+        let Some(last) = last_depth_cost else {
+            return false;
+        };
+        if !self.ts_probe_extension_fits(lane_start, last) {
+            return false;
+        }
+        self.enter_probe_extension();
+        true
+    }
+
+    /// The convergence test of `ts_probe_admit_next_depth`.
+    fn ts_probe_extension_fits(
+        &self,
+        lane_start: &ay_core::time::Instant,
+        last_depth_cost: std::time::Duration,
+    ) -> bool {
+        let (Some(hard), Some(reference)) = (
+            self.config.time_budget,
+            self.config.probe_extension_deadline,
+        ) else {
+            return false;
+        };
+        let predicted = Self::predicted_next_depth_cost(last_depth_cost);
+        let hard_left = hard.saturating_sub(lane_start.elapsed());
+        let solve_left = reference.saturating_duration_since(ay_core::time::Instant::now());
+        predicted <= hard_left && predicted <= solve_left.mul_f64(PROBE_EXTENSION_SHARE)
+    }
+
+    /// Move the effective deadline to the hard one for an admitted
+    /// transition-system extension.
+    fn enter_probe_extension(&self) {
+        if !self.probe_extension_active.get() {
+            tracing::debug!(
+                "BMC-ts: converging past the soft probe budget; extending to the hard budget"
+            );
+            self.probe_extension_active.set(true);
+            self.solve_deadline.set(self.probe_hard_deadline.get());
+        }
+    }
+
+    /// Restore the soft deadline when the extended lane returns without a
+    /// verdict, so the fallback and later paths do not inherit the hard
+    /// budget. A verdict returns straight to the caller, which ends the probe.
+    fn leave_probe_extension(&self) {
+        if self.probe_extension_active.get() {
+            self.probe_extension_active.set(false);
+            self.solve_deadline.set(self.probe_soft_deadline.get());
+        }
     }
 
     /// Solve using bounded model checking.
@@ -1210,12 +1899,61 @@ impl BmcSolver {
     /// Tries the per-depth fresh Executor path first (#7982/#7983), which uses
     /// ay-dpll's full DPLL(T) executor with cached SMT prefix. Falls back to
     /// the legacy IncrementalQueryContext path if the executor fails.
+    ///
+    /// Inside a CHC proof run under an effort it answers `Unknown` without
+    /// running ([`Self::closed_under_effort`]).
     pub fn solve(&self) -> ChcEngineResult {
+        if Self::closed_under_effort() {
+            return ChcEngineResult::Unknown;
+        }
+        // INV-S2 (#horn-smt-session §7.2): BMC is never served by a `HornSmt`
+        // session, whatever lane its config carries. Its Safe exits (acyclic
+        // exact expansion, polynomial-DAG / cone-level / exhaustive /
+        // symbolic-reachability lanes, BMC k-induction) return
+        // `Safe(InvariantModel::default())` straight from an SMT UNSAT, and the
+        // empty-model certificates rest on those UNSATs (design F15). Since
+        // Rung 0 the adaptive / portfolio BMC arms run on the Search lane (for
+        // the executor policy), so INV-S1 alone no longer keeps BMC off the
+        // session; this guard does, for every query on this thread for the
+        // whole solve.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
+        memory::Budget::capture(self.config.memory_budget, None)
+            .run(|| self.solve_with_memory_scope())
+            .unwrap_or(ChcEngineResult::Unknown)
+    }
+
+    /// Whether BMC is closed here, counted as a closed-route check of the run
+    /// (`ChcRunWork::closed_route_checks`): inside a CHC proof run under an
+    /// effort (P4a slice 8, guard-tree.md §14). BMC runs its depth checks as
+    /// executor batches (`new_search_executor`, `execute_controlled_batch`),
+    /// which charge the run nothing before GuardTree S6, and bounds them with
+    /// wall budgets of its own (per depth, per probe, `time_budget`), so a
+    /// BMC answer inside the run would be the host's speed, not the count's.
+    /// The proof run's BMC uses (PDR's bounded unsafe precheck, a
+    /// counterexample's bounded replay, the acyclic certificate) answer
+    /// `unknown` instead; slice 14 brings BMC back as a child of the run's
+    /// node. Without an effort it is `false` and counts nothing.
+    pub(crate) fn closed_under_effort() -> bool {
+        crate::run_meter::close_route()
+    }
+
+    fn solve_with_memory_scope(&self) -> ChcEngineResult {
         let overall_start = ay_core::time::Instant::now();
         // inc-12: pin the absolute deadline so per-depth/per-check timeouts
         // are clamped to the remaining overall budget (probe overstay fix).
-        self.solve_deadline
+        // With a soft budget configured the effective deadline is the SOFT
+        // one; the hard deadline is kept aside for an admitted extension.
+        self.solve_deadline.set(
+            self.config
+                .soft_time_budget
+                .or(self.config.time_budget)
+                .map(|b| overall_start + b),
+        );
+        self.probe_hard_deadline
             .set(self.config.time_budget.map(|b| overall_start + b));
+        self.probe_soft_deadline.set(self.solve_deadline.get());
+        self.probe_extension_active.set(false);
+        self.resolve_resume_depth();
         // Budget compliance (model-checker-consumer wishlist item 3): install the
         // thread-local SMT deadline for the whole run so SMT-side
         // preprocessing (Tseitin/bit-blast) is clamped too, not just the
@@ -1294,11 +2032,25 @@ impl BmcSolver {
         // Telemetry (#8822): record which path produced the result so
         // `--verbose`/stats can distinguish executor vs legacy-fallback runs.
         let mut result = match self.solve_via_executor(&queries) {
-            Some(result) => {
+            Err(ExactExpansionRefused) => {
+                {
+                    let mut stats = self.stats.borrow_mut();
+                    stats.used_executor_path = true;
+                    stats.exhausted_search = false;
+                    stats.total_time_secs = overall_start.elapsed().as_secs_f64();
+                }
+                self.log_stats("Unknown");
+                return ChcEngineResult::Unknown;
+            }
+            Ok(Some(result)) => {
                 self.stats.borrow_mut().used_executor_path = true;
                 result
             }
-            None => {
+            Ok(None) if self.execution_stopped(None) => {
+                self.stats.borrow_mut().used_executor_path = true;
+                ChcEngineResult::Unknown
+            }
+            Ok(None) => {
                 tracing::debug!("BMC: Executor path failed, falling back to legacy");
                 self.stats.borrow_mut().used_legacy_fallback = true;
                 self.solve_legacy(&queries)
@@ -1307,6 +2059,7 @@ impl BmcSolver {
 
         if exact_acyclic_first
             && matches!(result, ChcEngineResult::Safe(_))
+            && !self.execution_stopped(None)
             && !self.stats.borrow().budget_exhausted
             && !self.is_over_budget(&overall_start)
             && !self.config.base.is_cancelled()
@@ -1326,6 +2079,7 @@ impl BmcSolver {
 
         if exact_acyclic_first
             && matches!(result, ChcEngineResult::Unknown)
+            && !self.execution_stopped(None)
             && !self.stats.borrow().budget_exhausted
             && !self.is_over_budget(&overall_start)
             && !self.config.base.is_cancelled()
@@ -1336,6 +2090,10 @@ impl BmcSolver {
                 result = concrete_result;
                 self.stats.borrow_mut().used_legacy_fallback = true;
             }
+        }
+
+        if self.execution_stopped(None) {
+            result = ChcEngineResult::Unknown;
         }
 
         if matches!(result, ChcEngineResult::Unsafe(_))
@@ -1378,6 +2136,9 @@ impl BmcSolver {
         overall_start: &ay_core::time::Instant,
         slice: Option<std::time::Duration>,
     ) -> Option<ChcEngineResult> {
+        if self.execution_stopped(None) {
+            return Some(ChcEngineResult::Unknown);
+        }
         if !self.concrete_scalar_bmc_applicable(queries) {
             return None;
         }
@@ -2171,6 +2932,16 @@ impl BmcSolver {
 
     fn smt_value_expr_for_sort(value: &SmtValue, sort: &ChcSort) -> Option<ChcExpr> {
         match (sort, value) {
+            // Real witnesses (LRA_BMC_unsafe_2026-09-22): `ChcExpr::Real` holds
+            // an i64 fraction, so a model value outside that range fails
+            // closed (no witness) rather than being rounded.
+            (ChcSort::Real, SmtValue::Real(value)) => Some(ChcExpr::Real(
+                i64::try_from(value.numer()).ok()?,
+                i64::try_from(value.denom()).ok()?,
+            )),
+            (ChcSort::Real, SmtValue::Int(value)) => {
+                Some(ChcExpr::Real(i64::try_from(*value).ok()?, 1))
+            }
             (ChcSort::Int, SmtValue::Int(value)) => Some(ChcExpr::int(*value)),
             (ChcSort::Int, SmtValue::BigInt(value)) => {
                 Some(ChcExpr::from_bigint(value.as_ref().clone()))
@@ -2272,6 +3043,9 @@ impl BmcSolver {
     fn concrete_value_smt(sort: &ChcSort, value: i128) -> Option<SmtValue> {
         match sort {
             ChcSort::Int => Some(SmtValue::Int(value)),
+            ChcSort::Real => Some(SmtValue::Real(num_rational::BigRational::from_integer(
+                num_bigint::BigInt::from(value),
+            ))),
             ChcSort::Bool => Some(SmtValue::Bool(value != 0)),
             ChcSort::BitVec(width) => Some(SmtValue::bitvec_from_biguint(
                 num_bigint::BigUint::from(Self::concrete_bitvec_value(*width, value)?),
@@ -2793,6 +3567,7 @@ impl BmcSolver {
 
     fn expr_uses_array_features(expr: &ChcExpr) -> bool {
         match expr {
+            ChcExpr::ArrayLambda(_) => true,
             ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
                 false
             }
@@ -2853,8 +3628,11 @@ impl BmcSolver {
     ///
     /// Kept as fallback when the executor path fails.
     fn solve_legacy(&self, queries: &[&HornClause]) -> ChcEngineResult {
+        if self.execution_stopped(None) {
+            return ChcEngineResult::Unknown;
+        }
         let start = ay_core::time::Instant::now();
-        let mut smt = self.problem.make_smt_context();
+        let mut smt = self.make_smt_context();
         let mut inc = IncrementalQueryContext::new();
         let mut encountered_unknown = false;
 
@@ -2951,9 +3729,12 @@ impl BmcSolver {
     /// (declarations + level assertions) is cached and extended incrementally
     /// to avoid O(k^2) re-serialization.
     ///
-    /// Returns `Some(result)` on success, `None` if the executor path fails
-    /// (caller falls back to legacy path).
-    fn solve_via_executor(&self, queries: &[&HornClause]) -> Option<ChcEngineResult> {
+    /// Ordinary unavailability retains fallback; incomplete exact source
+    /// admission is terminal and must not retry an unguarded renaming path.
+    fn solve_via_executor(
+        &self,
+        queries: &[&HornClause],
+    ) -> Result<Option<ChcEngineResult>, ExactExpansionRefused> {
         if self.prefer_exact_acyclic_executor_first() {
             if self
                 .config
@@ -2961,11 +3742,19 @@ impl BmcSolver {
                 .is_some_and(|timeout| timeout.is_zero())
             {
                 self.stats.borrow_mut().budget_exhausted = true;
-                return Some(ChcEngineResult::Unknown);
+                return Ok(Some(ChcEngineResult::Unknown));
             }
-            return Some(self.solve_acyclic_safe_first_once(queries, self.config.max_depth));
+            return self
+                .solve_acyclic_safe_first_once(queries, self.config.max_depth)
+                .map(Some);
         }
+        Ok(self.solve_via_executor_ordinary(queries))
+    }
 
+    fn solve_via_executor_ordinary(&self, queries: &[&HornClause]) -> Option<ChcEngineResult> {
+        if self.execution_stopped(None) {
+            return Some(ChcEngineResult::Unknown);
+        }
         if self.config.acyclic_safe
             && !self.config.enable_adaptive_stepping
             && !self.config.enable_k_induction
@@ -2997,15 +3786,51 @@ impl BmcSolver {
                 start_depth,
                 consecutive_unsat,
             }) => {
+                // Real-sorted systems continue on the fresh TRANSITION-SYSTEM
+                // path: the flat path below decides the depth but can never
+                // turn a Real SAT into a replayable witness.
+                if self.problem.has_real_sorts() {
+                    if let Some(result) = self.solve_ts_fresh_per_depth(
+                        self.config.max_depth,
+                        start_depth,
+                        consecutive_unsat,
+                    ) {
+                        return Some(result);
+                    }
+                }
+                // The fresh fallback continues THIS lane's sweep on the flat
+                // encoding, so it keeps the lane's executor policy (Fix 1:
+                // LRA theory propagation off). The lane hands over at the
+                // first depth its persistent check could not decide within
+                // the per-depth cap — on an unsafe transition system that is
+                // typically the counterexample depth, i.e. exactly the
+                // sat-type flat query Fix 1 measured as livelocking under
+                // propagation. Passing `false` here re-solved that depth
+                // with propagation ON and burned the rest of the probe
+                // budget without a verdict (T8_regression_2026-09-19:
+                // MESI_i3_e1_447_e7_2194_000, base `unsat` 10 s -> `unknown`
+                // once the shed executor's depth-3 check crossed the cap).
+                // The SAT-confirmation re-solve below already passes `true`
+                // for the same query shape.
                 return self.solve_per_depth_fresh(
                     queries,
                     self.config.max_depth,
                     start_depth,
                     consecutive_unsat,
-                    false,
+                    true,
                 );
             }
             None => {}
+        }
+
+        // Hand-off resume: the multipred TS lane and the activation-literal
+        // single-executor lane start from level 0 by construction (see
+        // `ProbeFrontier` for why the multipred lane cannot resume); a run
+        // with a honoured frontier continues on the flat lane instead, whose
+        // `start_depth` contract is exactly the frontier's unit.
+        let resume = self.resume_depth.get();
+        if resume > 0 {
+            return self.solve_per_depth_fresh(queries, self.config.max_depth, resume, 0, false);
         }
 
         // inc-9: golem-style persistent-executor BMC for linear MULTIPRED
@@ -3018,12 +3843,20 @@ impl BmcSolver {
                 start_depth,
                 consecutive_unsat,
             }) => {
+                // Same policy as the single-predicate lane above: the fresh
+                // fallback keeps this lane's executor knob (LRA theory
+                // propagation off). Measured on the svcomp multipred class,
+                // where the mp-TS lane hands over at depth 0
+                // (BMC_TS_witness_2026-09-19 §4): O3_sum01_bug02 unknown ->
+                // unsat 2.3 s (with propagation on its flat depth-3 check
+                // alone took 11.6 s), O3_id_o100 reaches depth 47 vs 41 in
+                // the probe, O0_terminator_03 (sat) probe 14.9 -> 5.5 s.
                 return self.solve_per_depth_fresh(
                     queries,
                     self.config.max_depth,
                     start_depth,
                     consecutive_unsat,
-                    false,
+                    true,
                 );
             }
             None => {}
@@ -3066,7 +3899,11 @@ impl BmcSolver {
         &self,
         queries: &[&HornClause],
         max_depth: usize,
-    ) -> ChcEngineResult {
+    ) -> Result<ChcEngineResult, ExactExpansionRefused> {
+        // INV-S2 (#horn-smt-session §7.2): the acyclic UNSAT below is trusted
+        // as a safety proof (empty-model Safe certificates rest on it, design
+        // F15), so this lane never routes to a `HornSmt` session.
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         let start = ay_core::time::Instant::now();
         if self
             .config
@@ -3074,14 +3911,36 @@ impl BmcSolver {
             .is_some_and(|timeout| timeout.is_zero())
         {
             self.stats.borrow_mut().budget_exhausted = true;
-            return ChcEngineResult::Unknown;
+            return Ok(ChcEngineResult::Unknown);
         }
         let timeout = self
             .config
             .time_budget
             .unwrap_or_else(|| std::time::Duration::from_secs(30));
         let deadline = self.lane_deadline(start, timeout);
-        let defs_by_head = self.defs_by_head();
+        let mut keep_going = || !self.dag_deadline_expired(deadline);
+        let mut names =
+            AcyclicNames::new(&self.problem, &mut keep_going).ok_or(ExactExpansionRefused)?;
+        let result =
+            self.solve_acyclic_safe_first_named(queries, max_depth, start, deadline, &mut names);
+        if names.poll().is_none() {
+            self.stats.borrow_mut().exhausted_search = false;
+            return Err(ExactExpansionRefused);
+        }
+        Ok(result)
+    }
+
+    fn solve_acyclic_safe_first_named(
+        &self,
+        queries: &[&HornClause],
+        max_depth: usize,
+        start: ay_core::time::Instant,
+        deadline: ay_core::time::Instant,
+        names: &mut AcyclicNames<'_>,
+    ) -> ChcEngineResult {
+        // Without stutter rules, which the classifier already ignores: see
+        // `acyclic_defs`.
+        let defs_by_head = self.acyclic_defs_by_head();
         const ACYCLIC_EXACT_PATH_EXPANSION_CAP: u128 = 1024;
         const ACYCLIC_EXACT_PATH_POLYNOMIAL_PREFERRED_MIN: u128 = 1024;
         if let Some(path_count) =
@@ -3093,7 +3952,12 @@ impl BmcSolver {
                         "BMC: exact acyclic path expansion has {path_count} paths; using polynomial DAG encoding"
                     );
                 }
-                return self.solve_acyclic_polynomial_dag_once(queries, max_depth, &defs_by_head);
+                return self.solve_acyclic_polynomial_dag_once(
+                    queries,
+                    max_depth,
+                    &defs_by_head,
+                    names,
+                );
             }
             if self.config.base.verbose {
                 safe_eprintln!("BMC: exact acyclic path expansion within cap (paths={path_count})");
@@ -3104,7 +3968,12 @@ impl BmcSolver {
                     "BMC: exact acyclic path expansion over cap; using polynomial DAG encoding"
                 );
             }
-            return self.solve_acyclic_polynomial_dag_once(queries, max_depth, &defs_by_head);
+            return self.solve_acyclic_polynomial_dag_once(
+                queries,
+                max_depth,
+                &defs_by_head,
+                names,
+            );
         }
 
         if let Some(result) = self.solve_acyclic_safe_first_streaming_once(
@@ -3113,12 +3982,12 @@ impl BmcSolver {
             &defs_by_head,
             deadline,
             start,
+            names,
         ) {
             return result;
         }
 
         let mut visiting = FxHashSet::default();
-        let mut fresh_counter = 0usize;
         let mut query_disjuncts = Vec::new();
 
         for query in queries {
@@ -3134,7 +4003,7 @@ impl BmcSolver {
                     args,
                     &defs_by_head,
                     &mut visiting,
-                    &mut fresh_counter,
+                    names,
                     deadline,
                 ) else {
                     return ChcEngineResult::Unknown;
@@ -3156,6 +4025,7 @@ impl BmcSolver {
                         queries,
                         max_depth,
                         &defs_by_head,
+                        names,
                     );
                 }
                 let old = std::mem::take(&mut branch_conjuncts);
@@ -3178,11 +4048,20 @@ impl BmcSolver {
                 if conjuncts.is_empty() {
                     conjuncts.push(ChcExpr::Bool(true));
                 }
-                query_disjuncts.push(Self::simplify_exact_acyclic_conjuncts(conjuncts));
+                if names.check_all(&conjuncts).is_none() {
+                    return ChcEngineResult::Unknown;
+                }
+                let Some(simplified) = exact_simplify::simplify(conjuncts, names) else {
+                    return ChcEngineResult::Unknown;
+                };
+                query_disjuncts.push(simplified);
             }
         }
 
         if query_disjuncts.is_empty() {
+            if names.poll().is_none() {
+                return ChcEngineResult::Unknown;
+            }
             self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
             return ChcEngineResult::Safe(InvariantModel::default());
         }
@@ -3192,6 +4071,9 @@ impl BmcSolver {
         } else {
             ChcExpr::or_all(query_disjuncts)
         };
+        if names.check(&query).is_none() {
+            return ChcEngineResult::Unknown;
+        }
         if matches!(query, ChcExpr::Bool(false)) {
             self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
             return ChcEngineResult::Safe(InvariantModel::default());
@@ -3222,8 +4104,11 @@ impl BmcSolver {
                     self.stats.borrow_mut().budget_exhausted = true;
                     return ChcEngineResult::Unknown;
                 }
-                let mut smt = self.problem.make_smt_context();
-                match smt.check_sat_with_executor_fallback_timeout(&branch, remaining) {
+                let mut smt = self.make_smt_context();
+                let result = self.safe_first_smt_request(SafeFirstRequestKind::Decision, || {
+                    smt.check_sat_with_executor_fallback_timeout(&branch, remaining)
+                });
+                match result {
                     result if result.is_unsat() => {}
                     SmtResult::Sat(model) => {
                         // A SAT branch of the EXACT acyclic expansion is a
@@ -3270,7 +4155,12 @@ impl BmcSolver {
                      using polynomial DAG encoding"
                 );
             }
-            return self.solve_acyclic_polynomial_dag_once(queries, max_depth, &defs_by_head);
+            return self.solve_acyclic_polynomial_dag_once(
+                queries,
+                max_depth,
+                &defs_by_head,
+                names,
+            );
         }
 
         let remaining = deadline.saturating_duration_since(ay_core::time::Instant::now());
@@ -3279,8 +4169,11 @@ impl BmcSolver {
             return ChcEngineResult::Unknown;
         }
 
-        let mut smt = self.problem.make_smt_context();
-        match smt.check_sat_with_executor_fallback_timeout(&query, remaining) {
+        let mut smt = self.make_smt_context();
+        let result = self.safe_first_smt_request(SafeFirstRequestKind::Decision, || {
+            smt.check_sat_with_executor_fallback_timeout(&query, remaining)
+        });
+        match result {
             result if result.is_unsat() => {
                 self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
                 ChcEngineResult::Safe(InvariantModel::default())
@@ -3313,6 +4206,7 @@ impl BmcSolver {
         defs_by_head: &FxHashMap<PredicateId, Vec<usize>>,
         deadline: ay_core::time::Instant,
         start: ay_core::time::Instant,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<ChcEngineResult> {
         if self.config.base.verbose {
             safe_eprintln!(
@@ -3321,13 +4215,15 @@ impl BmcSolver {
         }
 
         let mut visiting = FxHashSet::default();
-        let mut fresh_counter = 0usize;
         let mut branch = Vec::new();
         let mut path: Vec<AcyclicPathNode> = Vec::new();
         let mut checked_branches = 0usize;
         let mut stop_result = None;
 
         for query in queries {
+            if names.poll().is_none() {
+                return Some(ChcEngineResult::Unknown);
+            }
             let query_clause_idx = self.query_clause_index(query);
             let mark = branch.len();
             if let Some(constraint) = &query.body.constraint {
@@ -3336,6 +4232,9 @@ impl BmcSolver {
 
             let outcome = match query.body.predicates.as_slice() {
                 [] => {
+                    if names.check_all(&branch).is_none() {
+                        return Some(ChcEngineResult::Unknown);
+                    }
                     checked_branches += 1;
                     self.check_acyclic_safe_first_branch(
                         &branch,
@@ -3346,6 +4245,7 @@ impl BmcSolver {
                         queries,
                         &[],
                         query_clause_idx,
+                        names,
                     )
                 }
                 [(pred, args)] => self.enumerate_acyclic_linear_pred_branches(
@@ -3353,11 +4253,11 @@ impl BmcSolver {
                     args,
                     defs_by_head,
                     &mut visiting,
-                    &mut fresh_counter,
+                    names,
                     deadline,
                     &mut branch,
                     &mut path,
-                    &mut |branch, path| {
+                    &mut |branch, path, names| {
                         checked_branches += 1;
                         match self.check_acyclic_safe_first_branch(
                             branch,
@@ -3368,6 +4268,7 @@ impl BmcSolver {
                             queries,
                             path,
                             query_clause_idx,
+                            names,
                         ) {
                             AcyclicBranchEnumeration::Completed => true,
                             other => {
@@ -3386,6 +4287,9 @@ impl BmcSolver {
             // Unsafe with a replay-validated counterexample) is parked in
             // `stop_result` and must take precedence.
             let outcome = stop_result.take().unwrap_or(outcome);
+            if names.poll().is_none() {
+                return Some(ChcEngineResult::Unknown);
+            }
             match outcome {
                 AcyclicBranchEnumeration::Completed => {}
                 AcyclicBranchEnumeration::Unsafe(cex) => {
@@ -3408,6 +4312,9 @@ impl BmcSolver {
                 "BMC: exact acyclic path expansion discharged {checked_branches} branches independently"
             );
         }
+        if names.poll().is_none() {
+            return Some(ChcEngineResult::Unknown);
+        }
         self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
         Some(ChcEngineResult::Safe(InvariantModel::default()))
     }
@@ -3422,13 +4329,19 @@ impl BmcSolver {
         queries: &[&HornClause],
         path: &[AcyclicPathNode],
         query_clause: Option<usize>,
+        names: &mut AcyclicNames<'_>,
     ) -> AcyclicBranchEnumeration {
         if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
             return AcyclicBranchEnumeration::TimedOut;
         }
         let mut ordered_conjuncts = raw_conjuncts.to_vec();
         ordered_conjuncts.reverse();
-        let branch = Self::simplify_exact_acyclic_conjuncts(ordered_conjuncts);
+        let Some(branch) = exact_simplify::simplify(ordered_conjuncts, names) else {
+            return AcyclicBranchEnumeration::Unsupported;
+        };
+        if names.check(&branch).is_none() {
+            return AcyclicBranchEnumeration::Unsupported;
+        }
         if matches!(branch, ChcExpr::Bool(false)) {
             return AcyclicBranchEnumeration::Completed;
         }
@@ -3443,8 +4356,11 @@ impl BmcSolver {
         if remaining.is_zero() {
             return AcyclicBranchEnumeration::TimedOut;
         }
-        let mut smt = self.problem.make_smt_context();
-        match smt.check_sat_with_executor_fallback_timeout(&branch, remaining) {
+        let mut smt = self.make_smt_context();
+        let result = self.safe_first_smt_request(SafeFirstRequestKind::Decision, || {
+            smt.check_sat_with_executor_fallback_timeout(&branch, remaining)
+        });
+        match result {
             result if result.is_unsat() => AcyclicBranchEnumeration::Completed,
             SmtResult::Sat(model) => {
                 // Counterexample candidate — trusted only after replay
@@ -3466,11 +4382,17 @@ impl BmcSolver {
                         if remaining.is_zero() {
                             model.clone()
                         } else {
-                            let mut smt = self.problem.make_smt_context();
-                            match smt.check_sat_with_executor_fallback_timeout(
-                                &ChcExpr::and_all(ordered_conjuncts),
-                                remaining,
-                            ) {
+                            let mut smt = self.make_smt_context();
+                            let raw_query = ChcExpr::and_all(ordered_conjuncts);
+                            let result = self.safe_first_smt_request(
+                                SafeFirstRequestKind::RawModelCompletion,
+                                || {
+                                    smt.check_sat_with_executor_fallback_timeout(
+                                        &raw_query, remaining,
+                                    )
+                                },
+                            );
+                            match result {
                                 SmtResult::Sat(full) => full,
                                 _ => model.clone(),
                             }
@@ -3571,17 +4493,20 @@ impl BmcSolver {
         args: &[ChcExpr],
         defs_by_head: &FxHashMap<PredicateId, Vec<usize>>,
         visiting: &mut FxHashSet<PredicateId>,
-        fresh_counter: &mut usize,
+        names: &mut AcyclicNames<'_>,
         deadline: ay_core::time::Instant,
         branch: &mut Vec<ChcExpr>,
         path: &mut Vec<AcyclicPathNode>,
         sink: &mut F,
     ) -> AcyclicBranchEnumeration
     where
-        F: FnMut(&[ChcExpr], &[AcyclicPathNode]) -> bool,
+        F: FnMut(&[ChcExpr], &[AcyclicPathNode], &mut AcyclicNames<'_>) -> bool,
     {
         if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
             return AcyclicBranchEnumeration::TimedOut;
+        }
+        if names.recursion(visiting.len()).is_none() || names.check_all(args).is_none() {
+            return AcyclicBranchEnumeration::Unsupported;
         }
         if !visiting.insert(pred) {
             return AcyclicBranchEnumeration::Unsupported;
@@ -3597,18 +4522,9 @@ impl BmcSolver {
                     return AcyclicBranchEnumeration::Unsupported;
                 }
 
-                let expansion_id = *fresh_counter;
-                *fresh_counter += 1;
-                let mut subst = FxHashMap::default();
-                for (var_idx, var) in clause.vars().into_iter().enumerate() {
-                    subst.insert(
-                        var.name.clone(),
-                        ChcExpr::Var(ChcVar::new(
-                            format!("__bmc_dag_e{expansion_id}_v{var_idx}"),
-                            var.sort,
-                        )),
-                    );
-                }
+                let Some(subst) = names.instance_vars(clause) else {
+                    return AcyclicBranchEnumeration::Unsupported;
+                };
 
                 let mark = branch.len();
                 let path_mark = path.len();
@@ -3625,35 +4541,41 @@ impl BmcSolver {
                             path.truncate(path_mark);
                             return AcyclicBranchEnumeration::Unsupported;
                         };
-                        branch.push(ChcExpr::eq(
-                            actual.clone(),
-                            head_arg.substitute_name_map(&subst),
-                        ));
+                        let Some(head_arg) = names.substitute(head_arg, &subst) else {
+                            return AcyclicBranchEnumeration::Unsupported;
+                        };
+                        branch.push(ChcExpr::eq(actual.clone(), head_arg));
                     }
                 }
                 if let Some(constraint) = &clause.body.constraint {
-                    branch.push(constraint.substitute_name_map(&subst));
+                    let Some(constraint) = names.substitute(constraint, &subst) else {
+                        return AcyclicBranchEnumeration::Unsupported;
+                    };
+                    branch.push(constraint);
                 }
 
                 let clause_outcome = match clause.body.predicates.as_slice() {
                     [] => {
-                        if sink(branch, path) {
+                        if names.check_all(branch).is_none() {
+                            return AcyclicBranchEnumeration::Unsupported;
+                        }
+                        if sink(branch, path, names) {
                             AcyclicBranchEnumeration::Completed
                         } else {
                             AcyclicBranchEnumeration::Stopped
                         }
                     }
                     [(body_pred, body_args)] => {
-                        let instantiated_args: Vec<_> = body_args
-                            .iter()
-                            .map(|arg| arg.substitute_name_map(&subst))
-                            .collect();
+                        let Some(instantiated_args) = names.substitute_all(body_args, &subst)
+                        else {
+                            return AcyclicBranchEnumeration::Unsupported;
+                        };
                         self.enumerate_acyclic_linear_pred_branches(
                             *body_pred,
                             &instantiated_args,
                             defs_by_head,
                             visiting,
-                            fresh_counter,
+                            names,
                             deadline,
                             branch,
                             path,
@@ -3780,7 +4702,7 @@ impl BmcSolver {
 
     /// Deadline/cancellation poll for the acyclic encoding loops.
     fn dag_deadline_expired(&self, deadline: ay_core::time::Instant) -> bool {
-        ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled()
+        self.execution_stopped(Some(deadline))
     }
 
     fn solve_acyclic_polynomial_dag_once(
@@ -3788,7 +4710,11 @@ impl BmcSolver {
         queries: &[&HornClause],
         max_depth: usize,
         defs_by_head: &FxHashMap<PredicateId, Vec<usize>>,
+        names: &mut AcyclicNames<'_>,
     ) -> ChcEngineResult {
+        if names.poll().is_none() {
+            return ChcEngineResult::Unknown;
+        }
         let start = ay_core::time::Instant::now();
         let timeout = self
             .config
@@ -3837,12 +4763,15 @@ impl BmcSolver {
             self.stats.borrow_mut().budget_exhausted = true;
             return ChcEngineResult::Unknown;
         };
-        let bound_conjunct_count = self.push_acyclic_dag_arg_bound_conjuncts(
+        let Some(bound_conjunct_count) = self.push_acyclic_dag_arg_bound_conjuncts(
             &ordered_cone,
             &dag_arg_bounds,
             &dag_arg_constants,
             &mut conjuncts,
-        );
+            names,
+        ) else {
+            return ChcEngineResult::Unknown;
+        };
         let mut linearized_square_count = 0usize;
         let mut interval_simplified_count = 0usize;
 
@@ -3862,8 +4791,11 @@ impl BmcSolver {
                 &mut interval_simplified_count,
                 &mut conjuncts,
                 deadline,
+                names,
             ) else {
-                self.stats.borrow_mut().budget_exhausted = true;
+                if !names.stopped() {
+                    self.stats.borrow_mut().budget_exhausted = true;
+                }
                 return ChcEngineResult::Unknown;
             };
             rule_count += pred_rule_count;
@@ -3886,8 +4818,11 @@ impl BmcSolver {
                 &mut linearized_square_count,
                 &mut interval_simplified_count,
                 deadline,
+                names,
             ) else {
-                self.stats.borrow_mut().budget_exhausted = true;
+                if !names.stopped() {
+                    self.stats.borrow_mut().budget_exhausted = true;
+                }
                 return ChcEngineResult::Unknown;
             };
             query_disjuncts.push(query_disjunct);
@@ -3938,7 +4873,7 @@ impl BmcSolver {
             return ChcEngineResult::Unknown;
         }
 
-        let smt = self.problem.make_smt_context();
+        let smt = self.make_smt_context();
         let propagated_model = FxHashMap::default();
         match smt.check_sat_via_executor(&formula, &propagated_model, remaining) {
             result if result.is_unsat() => {
@@ -3952,8 +4887,11 @@ impl BmcSolver {
                     queries,
                     defs_by_head,
                     &dag_arg_constants,
+                    names,
                 ) {
-                    self.verified_unsafe_from_witness(witness, "acyclic polynomial DAG BMC")
+                    self.verified_acyclic_dag_unsafe_from_model(
+                        witness, &model, queries, names, deadline,
+                    )
                 } else {
                     tracing::debug!(
                         "BMC: acyclic polynomial DAG SAT model has no complete derivation witness; returning Unknown"
@@ -3977,10 +4915,15 @@ impl BmcSolver {
         queries: &[&HornClause],
         defs_by_head: &FxHashMap<PredicateId, Vec<usize>>,
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<DerivationWitness> {
+        names.poll()?;
+        // Regenerate only encoding-owned names. Typed instances retain the
+        // original clause spellings; the ground-evidence landing below copies
+        // exact UF observations and independently validates the source clauses.
         let env = Self::model_i128_env(model);
         let (query_clause, root_pred, query_instances) =
-            self.acyclic_dag_root_query(model, &env, queries, dag_arg_constants)?;
+            self.acyclic_dag_root_query(model, &env, queries, dag_arg_constants, names)?;
         let mut entries = Vec::new();
         let mut visiting = FxHashSet::default();
         let root = self.acyclic_dag_derivation_entry(
@@ -3991,16 +4934,22 @@ impl BmcSolver {
             dag_arg_constants,
             &mut entries,
             &mut visiting,
+            names,
         )?;
         for (name, value) in query_instances {
+            names.poll()?;
             entries[root].instances.entry(name).or_insert(value);
         }
         Self::assign_derivation_levels(&mut entries, root);
-        Some(DerivationWitness {
+        let witness = DerivationWitness {
             query_clause,
             root,
             entries,
-        })
+        };
+        drop(visiting);
+        drop(env);
+        names.poll()?;
+        Some(witness)
     }
 
     fn acyclic_dag_root_query(
@@ -4009,23 +4958,32 @@ impl BmcSolver {
         env: &FxHashMap<String, i128>,
         queries: &[&HornClause],
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<(Option<usize>, PredicateId, FxHashMap<String, SmtValue>)> {
         for (query_idx, query) in queries.iter().enumerate() {
+            names.poll()?;
             let [(body_pred, _)] = query.body.predicates.as_slice() else {
                 continue;
             };
-            let conjuncts = self.acyclic_dag_query_conjuncts(query, query_idx, dag_arg_constants);
-            if !Self::model_conjuncts_satisfied(&conjuncts, model, env) {
+            let conjuncts =
+                self.acyclic_dag_query_conjuncts(query, query_idx, dag_arg_constants, names)?;
+            let satisfied = Self::model_conjuncts_satisfied(&conjuncts, model, env);
+            names.poll()?;
+            if !satisfied {
                 continue;
             }
-            let instances = self.acyclic_dag_query_instances(query, query_idx, env);
+            let instances =
+                self.acyclic_dag_query_instances(query, query_idx, model, env, names)?;
             return Some((self.query_clause_index(query), *body_pred, instances));
         }
         for query in queries {
+            // Only an ordinary missing/mismatching candidate may reach this
+            // legacy fallback. A naming refusal cannot try a weaker selector.
+            names.poll()?;
             let [(body_pred, _)] = query.body.predicates.as_slice() else {
                 continue;
             };
-            if Self::model_bool_expr(model, &self.dag_predicate(*body_pred)) == Some(true) {
+            if Self::model_bool_expr(model, &self.dag_predicate(*body_pred, names)?) == Some(true) {
                 return Some((
                     self.query_clause_index(query),
                     *body_pred,
@@ -4041,14 +4999,15 @@ impl BmcSolver {
         query: &HornClause,
         query_idx: usize,
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
-    ) -> Vec<ChcExpr> {
-        let subst = self.mk_dag_query_vars(query, query_idx);
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<Vec<ChcExpr>> {
+        let subst = self.mk_dag_query_vars(query, query_idx, names)?;
         let mut conjuncts = Vec::new();
         for (body_pred, body_args) in &query.body.predicates {
-            conjuncts.push(self.dag_predicate(*body_pred));
+            conjuncts.push(self.dag_predicate(*body_pred, names)?);
             for (arg_idx, body_arg) in body_args.iter().enumerate() {
                 conjuncts.push(Self::simplify_bmc_expr(ChcExpr::eq(
-                    self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants),
+                    self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants, names)?,
                     Self::simplify_bmc_expr(body_arg.substitute_name_map(&subst)),
                 )));
             }
@@ -4058,29 +5017,33 @@ impl BmcSolver {
                 constraint.substitute_name_map(&subst),
             ));
         }
-        conjuncts
+        names.poll()?;
+        Some(conjuncts)
     }
 
     fn acyclic_dag_query_instances(
         &self,
         query: &HornClause,
         query_idx: usize,
+        model: &FxHashMap<String, SmtValue>,
         env: &FxHashMap<String, i128>,
-    ) -> FxHashMap<String, SmtValue> {
-        let subst = self.mk_dag_query_vars(query, query_idx);
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<FxHashMap<String, SmtValue>> {
+        let subst = self.mk_dag_query_vars(query, query_idx, names)?;
         let mut instances = FxHashMap::default();
-        for var in query.vars() {
+        for var in names.variables(query)? {
+            names.poll()?;
             let Some(expr) = subst.get(&var.name) else {
                 continue;
             };
-            let Some(value) = Self::concrete_eval_for_sort(expr, &var.sort, env) else {
-                continue;
-            };
-            if let Some(value) = Self::concrete_value_smt(&var.sort, value) {
+            let value = Self::polynomial_model_value_for_sort(expr, &var.sort, model, env);
+            names.poll()?;
+            if let Some(value) = value {
                 instances.insert(var.name.clone(), value);
             }
         }
-        instances
+        names.poll()?;
+        Some(instances)
     }
 
     fn acyclic_dag_derivation_entry(
@@ -4092,7 +5055,9 @@ impl BmcSolver {
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
         entries: &mut Vec<DerivationWitnessEntry>,
         visiting: &mut FxHashSet<PredicateId>,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<usize> {
+        names.poll()?;
         if !visiting.insert(pred) {
             return None;
         }
@@ -4105,8 +5070,10 @@ impl BmcSolver {
             dag_arg_constants,
             entries,
             visiting,
+            names,
         );
         visiting.remove(&pred);
+        names.poll()?;
         result
     }
 
@@ -4119,9 +5086,12 @@ impl BmcSolver {
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
         entries: &mut Vec<DerivationWitnessEntry>,
         visiting: &mut FxHashSet<PredicateId>,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<usize> {
-        let values = self.acyclic_dag_pred_values(pred, env, dag_arg_constants)?;
-        let (instances, state_expr) = self.concrete_state_witness(pred, &values)?;
+        let values = self.acyclic_dag_pred_values(pred, model, env, dag_arg_constants, names)?;
+        let state = self.concrete_state_witness_smt(pred, &values);
+        names.poll()?;
+        let (instances, state_expr) = state?;
         let entry_idx = entries.len();
         entries.push(DerivationWitnessEntry {
             predicate: pred,
@@ -4133,7 +5103,8 @@ impl BmcSolver {
         });
 
         for clause_idx in defs_by_head.get(&pred).into_iter().flatten() {
-            if Self::model_bool_expr(model, &self.dag_rule_indicator(pred, *clause_idx))
+            names.poll()?;
+            if Self::model_bool_expr(model, &self.dag_rule_indicator(pred, *clause_idx, names)?)
                 != Some(true)
             {
                 continue;
@@ -4151,9 +5122,13 @@ impl BmcSolver {
                     dag_arg_constants,
                     entries,
                     visiting,
+                    names,
                 ) {
                     Some(premise_idx) => premises.push(premise_idx),
                     None => {
+                        if names.stopped() {
+                            return None;
+                        }
                         ok = false;
                         break;
                     }
@@ -4161,36 +5136,50 @@ impl BmcSolver {
             }
 
             if ok {
-                let local_instances =
-                    self.acyclic_dag_clause_instances(pred, *clause_idx, clause, env);
+                let local_instances = self.acyclic_dag_clause_instances(
+                    pred,
+                    *clause_idx,
+                    clause,
+                    model,
+                    env,
+                    names,
+                )?;
                 for (name, value) in local_instances {
+                    names.poll()?;
                     entries[entry_idx].instances.entry(name).or_insert(value);
                 }
                 entries[entry_idx].incoming_clause = Some(*clause_idx);
                 entries[entry_idx].premises = premises;
+                names.poll()?;
                 return Some(entry_idx);
             }
             entries.truncate(before_premises);
         }
 
         entries.pop();
+        names.poll()?;
         None
     }
 
     fn acyclic_dag_pred_values(
         &self,
         pred: PredicateId,
+        model: &FxHashMap<String, SmtValue>,
         env: &FxHashMap<String, i128>,
         dag_arg_constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
-    ) -> Option<Vec<i128>> {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<Vec<SmtValue>> {
+        names.poll()?;
         let pred_info = self.problem.get_predicate(pred)?;
         pred_info
             .arg_sorts
             .iter()
             .enumerate()
             .map(|(idx, sort)| {
-                let expr = self.dag_arg_with_constants(pred, idx, dag_arg_constants);
-                Self::concrete_eval_for_sort(&expr, sort, env)
+                let expr = self.dag_arg_with_constants(pred, idx, dag_arg_constants, names)?;
+                let value = Self::polynomial_model_value_for_sort(&expr, sort, model, env);
+                names.poll()?;
+                value
             })
             .collect()
     }
@@ -4200,22 +5189,25 @@ impl BmcSolver {
         pred: PredicateId,
         clause_idx: usize,
         clause: &HornClause,
+        model: &FxHashMap<String, SmtValue>,
         env: &FxHashMap<String, i128>,
-    ) -> FxHashMap<String, SmtValue> {
-        let subst = self.mk_dag_clause_vars(clause, pred, clause_idx);
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<FxHashMap<String, SmtValue>> {
+        let subst = self.mk_dag_clause_vars(clause, pred, clause_idx, names)?;
         let mut instances = FxHashMap::default();
-        for var in clause.vars() {
+        for var in names.variables(clause)? {
+            names.poll()?;
             let Some(expr) = subst.get(&var.name) else {
                 continue;
             };
-            let Some(value) = Self::concrete_eval_for_sort(expr, &var.sort, env) else {
-                continue;
-            };
-            if let Some(value) = Self::concrete_value_smt(&var.sort, value) {
+            let value = Self::polynomial_model_value_for_sort(expr, &var.sort, model, env);
+            names.poll()?;
+            if let Some(value) = value {
                 instances.insert(var.name.clone(), value);
             }
         }
-        instances
+        names.poll()?;
+        Some(instances)
     }
 
     fn assign_derivation_levels(entries: &mut [DerivationWitnessEntry], root: usize) -> usize {
@@ -4254,9 +5246,8 @@ impl BmcSolver {
         true
     }
 
-    /// Returns `None` when `deadline` expires mid-compile (model-checker-consumer wishlist
-    /// item 3); the caller must set `stats.budget_exhausted` and bail to
-    /// `Unknown` — the partially pushed `conjuncts` are discarded with it.
+    /// A deadline or sticky naming/square-admission refusal returns `None`; the
+    /// caller must discard the partially accumulated polynomial formula.
     #[allow(clippy::too_many_arguments)]
     fn compile_acyclic_dag_definition(
         &self,
@@ -4268,6 +5259,7 @@ impl BmcSolver {
         interval_simplified_count: &mut usize,
         conjuncts: &mut Vec<ChcExpr>,
         deadline: ay_core::time::Instant,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<usize> {
         let mut rule_indicators = Vec::new();
         let mut rule_count = 0usize;
@@ -4280,9 +5272,9 @@ impl BmcSolver {
                 return None;
             }
             let clause = &self.problem.clauses()[*clause_idx];
-            let rule_ind = self.dag_rule_indicator(pred, *clause_idx);
+            let rule_ind = self.dag_rule_indicator(pred, *clause_idx, names)?;
             rule_indicators.push(rule_ind.clone());
-            let subst = self.mk_dag_clause_vars(clause, pred, *clause_idx);
+            let subst = self.mk_dag_clause_vars(clause, pred, *clause_idx, names)?;
             let protected_vars = self.rule_interface_var_names(clause);
             let mut rule_conjuncts = Vec::new();
             rule_count += 1;
@@ -4290,17 +5282,17 @@ impl BmcSolver {
             if let ClauseHead::Predicate(_, head_args) = &clause.head {
                 for (arg_idx, head_arg) in head_args.iter().enumerate() {
                     rule_conjuncts.push(Self::simplify_bmc_expr(ChcExpr::eq(
-                        self.dag_arg_with_constants(pred, arg_idx, dag_arg_constants),
+                        self.dag_arg_with_constants(pred, arg_idx, dag_arg_constants, names)?,
                         Self::simplify_bmc_expr(head_arg.substitute_name_map(&subst)),
                     )));
                 }
             }
 
             for (body_pred, body_args) in &clause.body.predicates {
-                rule_conjuncts.push(self.dag_predicate(*body_pred));
+                rule_conjuncts.push(self.dag_predicate(*body_pred, names)?);
                 for (arg_idx, body_arg) in body_args.iter().enumerate() {
                     rule_conjuncts.push(Self::simplify_bmc_expr(ChcExpr::eq(
-                        self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants),
+                        self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants, names)?,
                         Self::simplify_bmc_expr(body_arg.substitute_name_map(&subst)),
                     )));
                 }
@@ -4335,10 +5327,11 @@ impl BmcSolver {
                     )
                     .ok()?
                     {
-                        *linearized_square_count += Self::linearize_bounded_squares_in_conjuncts(
+                        *linearized_square_count += exact_simplify::linearize_squares(
                             &mut rule_conjuncts,
                             &interval_env,
-                        );
+                            names,
+                        )?;
                         if Self::collect_conjunct_interval_bounds(
                             &rule_conjuncts,
                             &mut interval_env,
@@ -4360,7 +5353,7 @@ impl BmcSolver {
             conjuncts.push(ChcExpr::implies(rule_ind, ChcExpr::and_all(rule_conjuncts)));
         }
 
-        let reach = self.dag_predicate(pred);
+        let reach = self.dag_predicate(pred, names)?;
         if rule_indicators.is_empty() {
             conjuncts.push(ChcExpr::not(reach));
         } else if rule_indicators.len() == 1 {
@@ -4371,9 +5364,9 @@ impl BmcSolver {
         Some(rule_count)
     }
 
-    /// Returns `None` when `deadline` expires mid-compile (model-checker-consumer wishlist
-    /// item 3); the caller must set `stats.budget_exhausted` and bail to
-    /// `Unknown`.
+    /// Returns `None` on deadline expiry or sticky naming/square refusal.
+    /// Both stop compilation with `Unknown`; only deadline expiry sets the
+    /// time-budget statistic, and the shared naming refusal remains terminal.
     #[allow(clippy::too_many_arguments)]
     fn compile_acyclic_dag_query(
         &self,
@@ -4384,15 +5377,16 @@ impl BmcSolver {
         linearized_square_count: &mut usize,
         interval_simplified_count: &mut usize,
         deadline: ay_core::time::Instant,
+        names: &mut AcyclicNames<'_>,
     ) -> Option<ChcExpr> {
-        let subst = self.mk_dag_query_vars(query, query_idx);
+        let subst = self.mk_dag_query_vars(query, query_idx, names)?;
         let mut conjuncts = Vec::new();
 
         for (body_pred, body_args) in &query.body.predicates {
-            conjuncts.push(self.dag_predicate(*body_pred));
+            conjuncts.push(self.dag_predicate(*body_pred, names)?);
             for (arg_idx, body_arg) in body_args.iter().enumerate() {
                 conjuncts.push(Self::simplify_bmc_expr(ChcExpr::eq(
-                    self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants),
+                    self.dag_arg_with_constants(*body_pred, arg_idx, dag_arg_constants, names)?,
                     Self::simplify_bmc_expr(body_arg.substitute_name_map(&subst)),
                 )));
             }
@@ -4425,7 +5419,7 @@ impl BmcSolver {
                 .ok()?
                 {
                     *linearized_square_count +=
-                        Self::linearize_bounded_squares_in_conjuncts(&mut conjuncts, &interval_env);
+                        exact_simplify::linearize_squares(&mut conjuncts, &interval_env, names)?;
                     if Self::collect_conjunct_interval_bounds(
                         &conjuncts,
                         &mut interval_env,
@@ -4560,215 +5554,11 @@ impl BmcSolver {
     }
 
     fn simplify_bv_identities(expr: ChcExpr) -> ChcExpr {
-        match &expr {
-            ChcExpr::Op(op, args) => {
-                let args: Vec<_> = args
-                    .iter()
-                    .map(|arg| Arc::new(Self::simplify_bv_identities(arg.as_ref().clone())))
-                    .collect();
-                let expr = ChcExpr::Op(*op, args).simplify_constants();
-                let ChcExpr::Op(op, args) = &expr else {
-                    return expr;
-                };
-
-                match op {
-                    ChcOp::BvAdd if args.len() == 2 => {
-                        if Self::is_bv_zero(args[0].as_ref()) {
-                            return args[1].as_ref().clone();
-                        }
-                        if Self::is_bv_zero(args[1].as_ref()) {
-                            return args[0].as_ref().clone();
-                        }
-                    }
-                    ChcOp::BvSub if args.len() == 2 => {
-                        if Self::is_bv_zero(args[1].as_ref()) {
-                            return args[0].as_ref().clone();
-                        }
-                        if args[0] == args[1] {
-                            if let Some(width) = Self::bv_width(args[0].as_ref()) {
-                                return ChcExpr::BitVec(0, width);
-                            }
-                        }
-                        if let Some(stripped) =
-                            Self::strip_matching_bv_add_const(args[0].as_ref(), args[1].as_ref())
-                        {
-                            return stripped;
-                        }
-                    }
-                    ChcOp::BvMul if args.len() == 2 => {
-                        if Self::is_bv_zero(args[0].as_ref()) {
-                            return args[0].as_ref().clone();
-                        }
-                        if Self::is_bv_zero(args[1].as_ref()) {
-                            if let Some(width) = Self::bv_width(args[0].as_ref()) {
-                                return ChcExpr::BitVec(0, width);
-                            }
-                        }
-                        if Self::is_bv_one(args[0].as_ref()) {
-                            return args[1].as_ref().clone();
-                        }
-                        if Self::is_bv_one(args[1].as_ref()) {
-                            return args[0].as_ref().clone();
-                        }
-                    }
-                    ChcOp::BvUDiv | ChcOp::BvSDiv
-                        if args.len() == 2 && Self::is_bv_one(args[1].as_ref()) =>
-                    {
-                        return args[0].as_ref().clone();
-                    }
-                    ChcOp::BvExtract(hi, lo) if args.len() == 1 => {
-                        if let Some(extracted) =
-                            Self::extract_from_bv_concat(args[0].as_ref(), *hi, *lo)
-                        {
-                            return extracted;
-                        }
-                    }
-                    _ => {}
-                }
-
-                ChcExpr::Op(*op, args.clone())
-            }
-            ChcExpr::PredicateApp(name, pred, args) => ChcExpr::PredicateApp(
-                name.clone(),
-                *pred,
-                args.iter()
-                    .map(|arg| Arc::new(Self::simplify_bv_identities(arg.as_ref().clone())))
-                    .collect(),
-            ),
-            ChcExpr::FuncApp(name, sort, args) => ChcExpr::FuncApp(
-                name.clone(),
-                sort.clone(),
-                args.iter()
-                    .map(|arg| Arc::new(Self::simplify_bv_identities(arg.as_ref().clone())))
-                    .collect(),
-            ),
-            ChcExpr::ConstArray(key_sort, value) => ChcExpr::ConstArray(
-                key_sort.clone(),
-                Arc::new(Self::simplify_bv_identities(value.as_ref().clone())),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    fn strip_matching_bv_add_const(sum: &ChcExpr, subtrahend: &ChcExpr) -> Option<ChcExpr> {
-        let ChcExpr::Op(ChcOp::BvAdd, args) = sum else {
-            return None;
-        };
-        if args.len() != 2 {
-            return None;
-        }
-        if args[0].as_ref() == subtrahend {
-            return Some(args[1].as_ref().clone());
-        }
-        if args[1].as_ref() == subtrahend {
-            return Some(args[0].as_ref().clone());
-        }
-        None
-    }
-
-    fn extract_from_bv_concat(expr: &ChcExpr, hi: u32, lo: u32) -> Option<ChcExpr> {
-        let ChcExpr::Op(ChcOp::BvConcat, args) = expr else {
-            return None;
-        };
-        if args.len() != 2 || hi < lo {
-            return None;
-        }
-        let high = args[0].as_ref();
-        let low = args[1].as_ref();
-        let high_width = Self::bv_width(high)?;
-        let low_width = Self::bv_width(low)?;
-        let total_width = high_width.checked_add(low_width)?;
-        if hi >= total_width {
-            return None;
-        }
-
-        if hi < low_width {
-            return Some(Self::extract_or_identity(low.clone(), hi, lo));
-        }
-        if lo >= low_width {
-            return Some(Self::extract_or_identity(
-                high.clone(),
-                hi - low_width,
-                lo - low_width,
-            ));
-        }
-        None
-    }
-
-    fn extract_or_identity(expr: ChcExpr, hi: u32, lo: u32) -> ChcExpr {
-        if let Some(width) = Self::bv_width(&expr) {
-            if lo == 0 && hi + 1 == width {
-                return expr;
-            }
-        }
-        Self::simplify_bv_identities(ChcExpr::Op(ChcOp::BvExtract(hi, lo), vec![Arc::new(expr)]))
-            .simplify_constants()
-    }
-
-    fn bv_width(expr: &ChcExpr) -> Option<u32> {
-        match expr.sort() {
-            ChcSort::BitVec(width) => Some(width),
-            _ => None,
-        }
-    }
-
-    fn is_bv_zero(expr: &ChcExpr) -> bool {
-        matches!(expr, ChcExpr::BitVec(value, _) if *value == 0)
-    }
-
-    fn is_bv_one(expr: &ChcExpr) -> bool {
-        matches!(expr, ChcExpr::BitVec(value, _) if *value == 1)
+        simplify_shared::bitvector_identities(expr)
     }
 
     fn simplify_dt_selector_apps(expr: ChcExpr) -> ChcExpr {
-        match &expr {
-            ChcExpr::Op(op, args) => ChcExpr::Op(
-                *op,
-                args.iter()
-                    .map(|arg| Arc::new(Self::simplify_dt_selector_apps(arg.as_ref().clone())))
-                    .collect(),
-            ),
-            ChcExpr::PredicateApp(name, pred, args) => ChcExpr::PredicateApp(
-                name.clone(),
-                *pred,
-                args.iter()
-                    .map(|arg| Arc::new(Self::simplify_dt_selector_apps(arg.as_ref().clone())))
-                    .collect(),
-            ),
-            ChcExpr::FuncApp(name, sort, args) => {
-                let simplified_args: Vec<_> = args
-                    .iter()
-                    .map(|arg| Arc::new(Self::simplify_dt_selector_apps(arg.as_ref().clone())))
-                    .collect();
-                if simplified_args.len() == 1 {
-                    if let ChcExpr::FuncApp(
-                        ctor_name,
-                        ChcSort::Datatype { constructors, .. },
-                        ctor_args,
-                    ) = simplified_args[0].as_ref()
-                    {
-                        for ctor in constructors.iter() {
-                            if ctor.name != *ctor_name {
-                                continue;
-                            }
-                            for (selector_idx, selector) in ctor.selectors.iter().enumerate() {
-                                if selector.name == *name {
-                                    if let Some(value) = ctor_args.get(selector_idx) {
-                                        return value.as_ref().clone();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                ChcExpr::FuncApp(name.clone(), sort.clone(), simplified_args)
-            }
-            ChcExpr::ConstArray(key_sort, value) => ChcExpr::ConstArray(
-                key_sort.clone(),
-                Arc::new(Self::simplify_dt_selector_apps(value.as_ref().clone())),
-            ),
-            other => other.clone(),
-        }
+        simplify_shared::datatype_selectors(expr)
     }
 
     fn constraint_var_counts(conjuncts: &[ChcExpr]) -> FxHashMap<String, usize> {
@@ -4831,66 +5621,86 @@ impl BmcSolver {
         clause: &HornClause,
         pred: PredicateId,
         clause_idx: usize,
-    ) -> FxHashMap<String, ChcExpr> {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<FxHashMap<String, ChcExpr>> {
         let mut subst = FxHashMap::default();
-        for (var_idx, var) in clause.vars().into_iter().enumerate() {
+        for (var_idx, var) in names.variables(clause)?.into_iter().enumerate() {
             subst.insert(
                 var.name.clone(),
                 ChcExpr::Var(ChcVar::new(
-                    format!("__bmc_poly_p{}_c{}_v{}", pred.index(), clause_idx, var_idx),
-                    var.sort,
+                    names.name(format!(
+                        "__bmc_poly_p{}_c{}_v{}",
+                        pred.index(),
+                        clause_idx,
+                        var_idx
+                    ))?,
+                    var.sort.clone(),
                 )),
             );
         }
-        subst
+        names.poll()?;
+        Some(subst)
     }
 
     fn mk_dag_query_vars(
         &self,
         query: &HornClause,
         query_idx: usize,
-    ) -> FxHashMap<String, ChcExpr> {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<FxHashMap<String, ChcExpr>> {
         let mut subst = FxHashMap::default();
-        for (var_idx, var) in query.vars().into_iter().enumerate() {
+        for (var_idx, var) in names.variables(query)?.into_iter().enumerate() {
             subst.insert(
                 var.name.clone(),
                 ChcExpr::Var(ChcVar::new(
-                    format!("__bmc_poly_q{}_v{}", query_idx, var_idx),
-                    var.sort,
+                    names.name(format!("__bmc_poly_q{}_v{}", query_idx, var_idx))?,
+                    var.sort.clone(),
                 )),
             );
         }
-        subst
+        names.poll()?;
+        Some(subst)
     }
 
-    fn dag_predicate(&self, pred: PredicateId) -> ChcExpr {
-        ChcExpr::Var(ChcVar::new(
-            format!("__bmc_poly_p{}_reach", pred.index()),
+    fn dag_predicate(&self, pred: PredicateId, names: &mut AcyclicNames<'_>) -> Option<ChcExpr> {
+        Some(ChcExpr::Var(ChcVar::new(
+            names.name(format!("__bmc_poly_p{}_reach", pred.index()))?,
             ChcSort::Bool,
-        ))
+        )))
     }
 
-    fn dag_rule_indicator(&self, pred: PredicateId, clause_idx: usize) -> ChcExpr {
-        ChcExpr::Var(ChcVar::new(
-            format!("__bmc_poly_p{}_r{}", pred.index(), clause_idx),
+    fn dag_rule_indicator(
+        &self,
+        pred: PredicateId,
+        clause_idx: usize,
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
+        Some(ChcExpr::Var(ChcVar::new(
+            names.name(format!("__bmc_poly_p{}_r{}", pred.index(), clause_idx))?,
             ChcSort::Bool,
-        ))
+        )))
     }
 
-    fn dag_arg(&self, pred: PredicateId, idx: usize) -> ChcExpr {
-        let pred_info = self
+    fn dag_arg(
+        &self,
+        pred: PredicateId,
+        idx: usize,
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
+        names.poll()?;
+        let Some(sort) = self
             .problem
             .get_predicate(pred)
-            .expect("BmcSolver: predicate ID from problem should be valid");
-        let sort = pred_info
-            .arg_sorts
-            .get(idx)
-            .expect("BmcSolver: argument index should be within predicate arity")
-            .clone();
-        ChcExpr::Var(ChcVar::new(
-            format!("__bmc_poly_p{}_a{}", pred.index(), idx),
-            sort,
-        ))
+            .and_then(|info| info.arg_sorts.get(idx))
+        else {
+            return names.refuse();
+        };
+        // The shared context admitted this problem's declaration sorts before
+        // polynomial compilation. Do not reconstruct it from the model.
+        Some(ChcExpr::Var(ChcVar::new(
+            names.name(format!("__bmc_poly_p{}_a{}", pred.index(), idx))?,
+            sort.clone(),
+        )))
     }
 
     fn dag_arg_with_constants(
@@ -4898,11 +5708,15 @@ impl BmcSolver {
         pred: PredicateId,
         idx: usize,
         constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
-    ) -> ChcExpr {
-        constants
-            .get(&(pred, idx))
-            .cloned()
-            .unwrap_or_else(|| self.dag_arg(pred, idx))
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
+        if let Some(value) = constants.get(&(pred, idx)) {
+            // Inference can return a source-global application, not just a
+            // literal. Its spelling and structure are not generated names.
+            names.check(value)?;
+            return Some(value.clone());
+        }
+        self.dag_arg(pred, idx, names)
     }
 
     fn push_acyclic_dag_arg_bound_conjuncts(
@@ -4911,7 +5725,9 @@ impl BmcSolver {
         bounds: &FxHashMap<(PredicateId, usize), IntInterval>,
         constants: &FxHashMap<(PredicateId, usize), ChcExpr>,
         conjuncts: &mut Vec<ChcExpr>,
-    ) -> usize {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<usize> {
+        names.poll()?;
         let mut count = 0usize;
         for pred in ordered_cone {
             let Some(pred_info) = self.problem.get_predicate(*pred) else {
@@ -4927,7 +5743,7 @@ impl BmcSolver {
                 if !interval.has_bound() || interval.is_empty() {
                     continue;
                 }
-                let arg = self.dag_arg_with_constants(*pred, arg_idx, constants);
+                let arg = self.dag_arg_with_constants(*pred, arg_idx, constants, names)?;
                 let mut arg_bounds = Vec::new();
                 if let Some(lower) = interval.lower {
                     arg_bounds.push(Self::simplify_bmc_expr(ChcExpr::ge(
@@ -4943,12 +5759,13 @@ impl BmcSolver {
                 }
                 let bound = ChcExpr::and_all(arg_bounds);
                 if !matches!(bound, ChcExpr::Bool(true)) {
-                    conjuncts.push(ChcExpr::implies(self.dag_predicate(*pred), bound));
+                    conjuncts.push(ChcExpr::implies(self.dag_predicate(*pred, names)?, bound));
                     count += 1;
                 }
             }
         }
-        count
+        names.poll()?;
+        Some(count)
     }
 
     /// Returns `Err(DagBudgetExpired)` when `deadline` expires mid-fixpoint.
@@ -5473,6 +6290,7 @@ impl BmcSolver {
         }
     }
 
+    #[cfg(test)]
     fn linearize_bounded_squares_in_conjuncts(
         conjuncts: &mut Vec<ChcExpr>,
         env: &FxHashMap<String, IntInterval>,
@@ -5555,177 +6373,6 @@ impl BmcSolver {
         count + standalone_square_defs.len()
     }
 
-    fn simplify_exact_acyclic_conjuncts(conjuncts: Vec<ChcExpr>) -> ChcExpr {
-        // Exact-path lane: no deadline threaded here (`None` can never yield
-        // `Err`), so only a definitive `Ok(false)` infeasibility answer may
-        // poison the conjuncts to `false`.
-        let infeasible = |conjuncts: &[ChcExpr], env: &mut FxHashMap<String, IntInterval>| {
-            matches!(
-                Self::collect_conjunct_interval_bounds(conjuncts, env, None),
-                Ok(false)
-            )
-        };
-        let mut conjuncts = ChcExpr::and_all(conjuncts)
-            .propagate_equalities()
-            .collect_conjuncts_nontrivial();
-        let mut interval_env = FxHashMap::default();
-        if infeasible(&conjuncts, &mut interval_env) {
-            return ChcExpr::Bool(false);
-        }
-        let _ = Self::substitute_exact_interval_values(&mut conjuncts, &interval_env);
-        if infeasible(&conjuncts, &mut interval_env) {
-            return ChcExpr::Bool(false);
-        }
-
-        let _ = Self::linearize_bounded_squares_in_conjuncts(&mut conjuncts, &interval_env);
-        if infeasible(&conjuncts, &mut interval_env) {
-            return ChcExpr::Bool(false);
-        }
-        let _ = Self::substitute_exact_interval_values(&mut conjuncts, &interval_env);
-        if infeasible(&conjuncts, &mut interval_env) {
-            return ChcExpr::Bool(false);
-        }
-
-        let local_bool_vars = conjuncts
-            .iter()
-            .flat_map(ChcExpr::vars)
-            .filter(|var| var.sort == ChcSort::Bool)
-            .map(|var| var.name)
-            .collect();
-        let _ = Self::simplify_conjuncts_with_intervals_and_bools(
-            &mut conjuncts,
-            &mut interval_env,
-            &local_bool_vars,
-            None,
-        );
-        let _ = Self::substitute_exact_interval_values(&mut conjuncts, &interval_env);
-        if conjuncts.len() <= 512 {
-            let _ = Self::substitute_definitional_equalities(&mut conjuncts);
-        }
-        ChcExpr::and_all(conjuncts).propagate_equalities()
-    }
-
-    fn substitute_exact_interval_values(
-        conjuncts: &mut Vec<ChcExpr>,
-        env: &FxHashMap<String, IntInterval>,
-    ) -> usize {
-        let subst: FxHashMap<String, ChcExpr> = env
-            .iter()
-            .filter_map(|(name, interval)| match (interval.lower, interval.upper) {
-                (Some(lower), Some(upper)) if lower == upper => {
-                    Some((name.clone(), ChcExpr::Int(lower)))
-                }
-                _ => None,
-            })
-            .collect();
-        if subst.is_empty() {
-            return 0;
-        }
-
-        let old = std::mem::take(conjuncts);
-        let mut changed = 0usize;
-        let mut out = Vec::with_capacity(old.len());
-        for conjunct in old {
-            let simplified = Self::simplify_bmc_expr(conjunct.substitute_name_map(&subst));
-            if simplified != conjunct {
-                changed += 1;
-            }
-            match simplified {
-                ChcExpr::Bool(true) => {}
-                ChcExpr::Bool(false) => {
-                    conjuncts.clear();
-                    conjuncts.push(ChcExpr::Bool(false));
-                    return changed;
-                }
-                other => out.push(other),
-            }
-        }
-        *conjuncts = out;
-        changed
-    }
-
-    fn substitute_definitional_equalities(conjuncts: &mut Vec<ChcExpr>) -> usize {
-        let max_rounds = conjuncts.len().saturating_add(1).min(1024);
-        let mut total_changed = 0usize;
-
-        for _ in 0..max_rounds {
-            let subst = Self::collect_definitional_substitutions(conjuncts);
-            if subst.is_empty() {
-                break;
-            }
-
-            let old = std::mem::take(conjuncts);
-            let mut out = Vec::with_capacity(old.len());
-            let mut changed = false;
-            for conjunct in old {
-                let substituted = Self::simplify_bmc_expr(conjunct.substitute_name_map(&subst));
-                if substituted != conjunct {
-                    changed = true;
-                    total_changed += 1;
-                }
-                match substituted {
-                    ChcExpr::Bool(true) => {}
-                    ChcExpr::Bool(false) => {
-                        conjuncts.clear();
-                        conjuncts.push(ChcExpr::Bool(false));
-                        return total_changed;
-                    }
-                    other => out.push(other),
-                }
-            }
-            *conjuncts = out;
-            if !changed {
-                break;
-            }
-        }
-
-        total_changed
-    }
-
-    fn collect_definitional_substitutions(conjuncts: &[ChcExpr]) -> FxHashMap<String, ChcExpr> {
-        let mut candidates: FxHashMap<String, Option<ChcExpr>> = FxHashMap::default();
-
-        for conjunct in conjuncts {
-            let simplified = Self::simplify_bmc_expr(conjunct.clone());
-            let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
-                continue;
-            };
-            if args.len() != 2 {
-                continue;
-            }
-            let Some((name, expr)) =
-                Self::orient_definitional_equality(args[0].as_ref(), args[1].as_ref())
-            else {
-                continue;
-            };
-            if Self::expr_mentions_var(&expr, &name) || expr.node_count(4096) >= 4096 {
-                continue;
-            }
-            match candidates.get_mut(&name) {
-                Some(slot) if slot.as_ref() == Some(&expr) => {}
-                Some(slot) => *slot = None,
-                None => {
-                    candidates.insert(name, Some(expr));
-                }
-            }
-        }
-
-        let mut subst: FxHashMap<String, ChcExpr> = candidates
-            .into_iter()
-            .filter_map(|(name, expr)| expr.map(|expr| (name, expr)))
-            .collect();
-        let keys: Vec<_> = subst.keys().cloned().collect();
-        for name in keys {
-            let remove = subst
-                .get(&name)
-                .is_some_and(|expr| Self::substitution_depends_on(&name, expr, &subst));
-            if remove {
-                subst.remove(&name);
-            }
-        }
-        subst
-    }
-
     fn orient_definitional_equality(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(String, ChcExpr)> {
         match (lhs, rhs) {
             (ChcExpr::Var(lhs_var), ChcExpr::Var(rhs_var)) if lhs_var.sort == rhs_var.sort => {
@@ -5793,37 +6440,6 @@ impl BmcSolver {
 
     fn expr_mentions_var(expr: &ChcExpr, name: &str) -> bool {
         expr.vars().iter().any(|var| var.name == name)
-    }
-
-    fn substitution_depends_on(
-        name: &str,
-        expr: &ChcExpr,
-        subst: &FxHashMap<String, ChcExpr>,
-    ) -> bool {
-        let mut visiting = FxHashSet::default();
-        Self::substitution_depends_on_inner(name, expr, subst, &mut visiting)
-    }
-
-    fn substitution_depends_on_inner(
-        name: &str,
-        expr: &ChcExpr,
-        subst: &FxHashMap<String, ChcExpr>,
-        visiting: &mut FxHashSet<String>,
-    ) -> bool {
-        for var in expr.vars() {
-            if var.name == name {
-                return true;
-            }
-            if let Some(next) = subst.get(&var.name) {
-                if visiting.insert(var.name.clone()) {
-                    if Self::substitution_depends_on_inner(name, next, subst, visiting) {
-                        return true;
-                    }
-                    visiting.remove(&var.name);
-                }
-            }
-        }
-        false
     }
 
     /// Pure fixpoint simplifier: every completed rewrite is
@@ -6115,67 +6731,43 @@ impl BmcSolver {
     ) -> Option<bool> {
         let lhs_interval = Self::expr_int_interval(lhs, env)?;
         let rhs_interval = Self::expr_int_interval(rhs, env)?;
+        // Missing endpoints mean unbounded, not an equal singleton. Check
+        // each available bound pair independently: a missing forward bound
+        // must not suppress a proof from the reverse pair.
+        let strictly_before = matches!(
+            (lhs_interval.upper, rhs_interval.lower),
+            (Some(upper), Some(lower)) if upper < lower
+        );
+        let at_most = matches!(
+            (lhs_interval.upper, rhs_interval.lower),
+            (Some(upper), Some(lower)) if upper <= lower
+        );
+        let strictly_after = matches!(
+            (lhs_interval.lower, rhs_interval.upper),
+            (Some(lower), Some(upper)) if lower > upper
+        );
+        let at_least = matches!(
+            (lhs_interval.lower, rhs_interval.upper),
+            (Some(lower), Some(upper)) if lower >= upper
+        );
         match op {
-            ChcOp::Lt => {
-                if lhs_interval.upper? < rhs_interval.lower? {
-                    Some(true)
-                } else if lhs_interval.lower? >= rhs_interval.upper? {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            ChcOp::Le => {
-                if lhs_interval.upper? <= rhs_interval.lower? {
-                    Some(true)
-                } else if lhs_interval.lower? > rhs_interval.upper? {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            ChcOp::Gt => {
-                if lhs_interval.lower? > rhs_interval.upper? {
-                    Some(true)
-                } else if lhs_interval.upper? <= rhs_interval.lower? {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            ChcOp::Ge => {
-                if lhs_interval.lower? >= rhs_interval.upper? {
-                    Some(true)
-                } else if lhs_interval.upper? < rhs_interval.lower? {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            ChcOp::Eq => {
-                if lhs_interval.lower == lhs_interval.upper
-                    && lhs_interval.lower == rhs_interval.lower
-                    && rhs_interval.lower == rhs_interval.upper
-                {
-                    Some(true)
-                } else if lhs_interval.upper? < rhs_interval.lower?
-                    || rhs_interval.upper? < lhs_interval.lower?
-                {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            ChcOp::Ne => {
-                if lhs_interval.lower == lhs_interval.upper
-                    && lhs_interval.lower == rhs_interval.lower
-                    && rhs_interval.lower == rhs_interval.upper
-                {
-                    Some(false)
-                } else if lhs_interval.upper? < rhs_interval.lower?
-                    || rhs_interval.upper? < lhs_interval.lower?
-                {
-                    Some(true)
+            ChcOp::Lt if strictly_before => Some(true),
+            ChcOp::Lt if at_least => Some(false),
+            ChcOp::Le if at_most => Some(true),
+            ChcOp::Le if strictly_after => Some(false),
+            ChcOp::Gt if strictly_after => Some(true),
+            ChcOp::Gt if at_most => Some(false),
+            ChcOp::Ge if at_least => Some(true),
+            ChcOp::Ge if strictly_before => Some(false),
+            ChcOp::Eq | ChcOp::Ne => {
+                let equal_singletons = matches!(
+                    (lhs_interval.lower, lhs_interval.upper, rhs_interval.lower, rhs_interval.upper),
+                    (Some(a), Some(b), Some(c), Some(d)) if a == b && b == c && c == d
+                );
+                if equal_singletons {
+                    Some(op == ChcOp::Eq)
+                } else if strictly_before || strictly_after {
+                    Some(op == ChcOp::Ne)
                 } else {
                     None
                 }
@@ -6184,6 +6776,7 @@ impl BmcSolver {
         }
     }
 
+    #[cfg(test)]
     fn collect_bounded_square_terms(
         expr: &ChcExpr,
         env: &FxHashMap<String, IntInterval>,
@@ -6298,6 +6891,7 @@ impl BmcSolver {
             .collect()
     }
 
+    #[cfg(test)]
     fn replace_exprs(expr: &ChcExpr, replacements: &FxHashMap<ChcExpr, ChcExpr>) -> ChcExpr {
         if let Some(replacement) = replacements.get(expr) {
             return replacement.clone();
@@ -6515,7 +7109,7 @@ impl BmcSolver {
         let deadline = self.lane_deadline(start, timeout);
 
         let cone = self.query_dependency_cone(queries, defs_by_head);
-        if cone.is_empty() {
+        if cone.is_empty() && queries.is_empty() {
             self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
             return ChcEngineResult::Safe(InvariantModel::default());
         }
@@ -6569,7 +7163,7 @@ impl BmcSolver {
             self.stats.borrow_mut().budget_exhausted = true;
             return ChcEngineResult::Unknown;
         }
-        let mut smt = self.problem.make_smt_context();
+        let mut smt = self.make_smt_context();
         match smt.check_sat_with_timeout(&formula, remaining) {
             result if result.is_unsat() => {
                 self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
@@ -6623,7 +7217,11 @@ impl BmcSolver {
                 for clause_idx in defs_by_head.get(pred).into_iter().flatten() {
                     let clause = &self.problem.clauses()[*clause_idx];
                     let reachable = if clause.body.predicates.is_empty() {
-                        depth == 0
+                        // A fact can terminate a branch at every level, just
+                        // as in compile_level_flat. Restricting facts to zero
+                        // loses joins whose independent premises have unequal
+                        // derivation heights and can turn reachability into Safe.
+                        true
                     } else if depth == 0 {
                         false
                     } else {
@@ -6709,9 +7307,9 @@ impl BmcSolver {
                 if let Some(constraint) = &clause.body.constraint {
                     rule_conjuncts.push(constraint.substitute_name_map(&subst));
                 }
-                if !rule_conjuncts.is_empty() {
-                    rule_disjuncts.push(ChcExpr::and_all(rule_conjuncts));
-                }
+                // An empty conjunction is a true, nullary fact, not an
+                // absent defining rule.
+                rule_disjuncts.push(ChcExpr::and_all(rule_conjuncts));
             }
 
             let level_pred = self.level_predicate(*pred, level);
@@ -6734,13 +7332,15 @@ impl BmcSolver {
         args: &[ChcExpr],
         defs_by_head: &FxHashMap<PredicateId, Vec<usize>>,
         visiting: &mut FxHashSet<PredicateId>,
-        fresh_counter: &mut usize,
+        names: &mut AcyclicNames<'_>,
         deadline: ay_core::time::Instant,
     ) -> Option<ChcExpr> {
         if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
             self.stats.borrow_mut().budget_exhausted = true;
             return None;
         }
+        names.recursion(visiting.len())?;
+        names.check_all(args)?;
         if !visiting.insert(pred) {
             return None;
         }
@@ -6748,18 +7348,7 @@ impl BmcSolver {
         let mut disjuncts = Vec::new();
         for clause_idx in defs_by_head.get(&pred).into_iter().flatten() {
             let clause = &self.problem.clauses()[*clause_idx];
-            let expansion_id = *fresh_counter;
-            *fresh_counter += 1;
-            let mut subst = FxHashMap::default();
-            for (var_idx, var) in clause.vars().into_iter().enumerate() {
-                subst.insert(
-                    var.name.clone(),
-                    ChcExpr::Var(ChcVar::new(
-                        format!("__bmc_dag_e{expansion_id}_v{var_idx}"),
-                        var.sort,
-                    )),
-                );
-            }
+            let subst = names.instance_vars(clause)?;
 
             let mut branch_conjuncts = vec![Vec::new()];
             if let ClauseHead::Predicate(_, head_args) = &clause.head {
@@ -6768,8 +7357,7 @@ impl BmcSolver {
                         visiting.remove(&pred);
                         return None;
                     };
-                    let equality =
-                        ChcExpr::eq(actual.clone(), head_arg.substitute_name_map(&subst));
+                    let equality = ChcExpr::eq(actual.clone(), names.substitute(head_arg, &subst)?);
                     for conjuncts in &mut branch_conjuncts {
                         conjuncts.push(equality.clone());
                     }
@@ -6777,16 +7365,13 @@ impl BmcSolver {
             }
 
             for (body_pred, body_args) in &clause.body.predicates {
-                let instantiated_args: Vec<_> = body_args
-                    .iter()
-                    .map(|arg| arg.substitute_name_map(&subst))
-                    .collect();
+                let instantiated_args = names.substitute_all(body_args, &subst)?;
                 let body_reach = self.acyclic_reach_instance(
                     *body_pred,
                     &instantiated_args,
                     defs_by_head,
                     visiting,
-                    fresh_counter,
+                    names,
                     deadline,
                 )?;
                 let alternatives = Self::collect_disjuncts_nontrivial(body_reach);
@@ -6812,7 +7397,7 @@ impl BmcSolver {
             }
 
             if let Some(constraint) = &clause.body.constraint {
-                let constraint = constraint.substitute_name_map(&subst);
+                let constraint = names.substitute(constraint, &subst)?;
                 for conjuncts in &mut branch_conjuncts {
                     conjuncts.push(constraint.clone());
                 }
@@ -6826,13 +7411,15 @@ impl BmcSolver {
         }
 
         visiting.remove(&pred);
-        Some(if disjuncts.is_empty() {
+        let formula = if disjuncts.is_empty() {
             ChcExpr::Bool(false)
         } else if disjuncts.len() == 1 {
             disjuncts.remove(0)
         } else {
             ChcExpr::or_all(disjuncts)
-        })
+        };
+        names.check(&formula)?;
+        Some(formula)
     }
 
     fn collect_disjuncts_nontrivial(expr: ChcExpr) -> Vec<ChcExpr> {
@@ -6861,10 +7448,13 @@ impl BmcSolver {
         queries: &[&HornClause],
         max_depth: usize,
     ) -> Option<ChcEngineResult> {
-        if let Some(result) = self.solve_acyclic_symbolic_reachability_once(queries, max_depth) {
-            if !matches!(result, ChcEngineResult::Unknown) {
-                return Some(result);
+        match self.solve_acyclic_symbolic_reachability_once(queries, max_depth) {
+            Err(ExactExpansionRefused) => {
+                self.stats.borrow_mut().exhausted_search = false;
+                return Some(ChcEngineResult::Unknown);
             }
+            Ok(Some(result)) if !matches!(result, ChcEngineResult::Unknown) => return Some(result),
+            Ok(_) => {}
         }
 
         let start = ay_core::time::Instant::now();
@@ -6938,8 +7528,8 @@ impl BmcSolver {
         smt.push_str("(check-sat)\n");
 
         let commands = ay_frontend::parse(&smt).ok()?;
-        let mut exec = ay_dpll::Executor::new();
-        let outputs = Self::exec_commands_with_deadline(&mut exec, &commands, deadline)?;
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
+        let outputs = self.exec_commands_with_deadline(&mut exec, &commands, deadline)?;
         let result_str = outputs.first().map(String::as_str).unwrap_or("unknown");
         let elapsed = start.elapsed().as_secs_f64();
 
@@ -7016,24 +7606,53 @@ impl BmcSolver {
         &self,
         queries: &[&HornClause],
         max_depth: usize,
-    ) -> Option<ChcEngineResult> {
+    ) -> Result<Option<ChcEngineResult>, ExactExpansionRefused> {
         let start = ay_core::time::Instant::now();
         let deadline = self.config.time_budget.map(|budget| start + budget);
-        let mut fresh_id = 0usize;
+        let mut keep_going = || self.should_continue_depth(&start);
+        let mut names =
+            AcyclicNames::new(&self.problem, &mut keep_going).ok_or(ExactExpansionRefused)?;
+        if queries.is_empty() {
+            names.poll().ok_or(ExactExpansionRefused)?;
+            self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
+            return Ok(Some(ChcEngineResult::Safe(InvariantModel::default())));
+        }
+        let formula = self.acyclic_symbolic_query(queries, &mut names);
+        if names.stopped() {
+            return Err(ExactExpansionRefused);
+        }
+        let Some(query_formula) = formula else {
+            return Ok(None);
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        let verdict = self.check_symbolic_formula(&query_formula, deadline);
+        names.poll().ok_or(ExactExpansionRefused)?;
+        Ok(match verdict {
+            Some(Some(false)) => {
+                self.mark_acyclic_exhaustive_stats(max_depth, elapsed);
+                Some(ChcEngineResult::Safe(InvariantModel::default()))
+            }
+            Some(_) => {
+                self.record_depth(max_depth, elapsed);
+                Some(ChcEngineResult::Unknown)
+            }
+            None => None,
+        })
+    }
+
+    fn acyclic_symbolic_query(
+        &self,
+        queries: &[&HornClause],
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
         let mut visiting = FxHashSet::default();
         let mut query_disjuncts = Vec::new();
-
         for query in queries {
-            if !self.should_continue_depth(&start) {
-                self.stats.borrow_mut().budget_exhausted = true;
-                return Some(ChcEngineResult::Unknown);
-            }
-
+            names.poll()?;
             let mut conjuncts = Vec::new();
             for (pred, args) in &query.body.predicates {
-                let reach =
-                    self.acyclic_reach_formula_fresh(*pred, &mut fresh_id, &mut visiting)?;
-                conjuncts.push(self.instantiate_reach_formula(*pred, &reach, args));
+                let reach = self.acyclic_reach_formula_fresh(*pred, names, &mut visiting)?;
+                conjuncts.push(self.instantiate_reach_formula(*pred, &reach, args, names)?);
             }
             if let Some(constraint) = &query.body.constraint {
                 conjuncts.push(constraint.clone());
@@ -7041,12 +7660,12 @@ impl BmcSolver {
             if conjuncts.is_empty() {
                 conjuncts.push(ChcExpr::Bool(true));
             }
-            query_disjuncts.push(Self::simplify_exact_acyclic_conjuncts(conjuncts));
+            names.check_all(&conjuncts)?;
+            query_disjuncts.push(exact_simplify::simplify(conjuncts, names)?);
         }
 
         if query_disjuncts.is_empty() {
-            self.mark_acyclic_exhaustive_stats(max_depth, start.elapsed().as_secs_f64());
-            return Some(ChcEngineResult::Safe(InvariantModel::default()));
+            return Some(ChcExpr::Bool(false));
         }
 
         let query_formula = if query_disjuncts.len() == 1 {
@@ -7054,21 +7673,8 @@ impl BmcSolver {
         } else {
             ChcExpr::or_all(query_disjuncts)
         };
-        let elapsed = start.elapsed().as_secs_f64();
-        match self.check_symbolic_formula(&query_formula, deadline)? {
-            Some(false) => {
-                self.mark_acyclic_exhaustive_stats(max_depth, elapsed);
-                Some(ChcEngineResult::Safe(InvariantModel::default()))
-            }
-            Some(true) => {
-                self.record_depth(max_depth, elapsed);
-                Some(ChcEngineResult::Unknown)
-            }
-            None => {
-                self.record_depth(max_depth, elapsed);
-                Some(ChcEngineResult::Unknown)
-            }
-        }
+        names.check(&query_formula)?;
+        Some(query_formula)
     }
 
     fn check_symbolic_formula(
@@ -7076,15 +7682,23 @@ impl BmcSolver {
         formula: &ChcExpr,
         deadline: Option<ay_core::time::Instant>,
     ) -> Option<Option<bool>> {
+        let deadline = self.execution_deadline(deadline);
+        if self.execution_stopped(deadline) {
+            return Some(None);
+        }
         let timeout = deadline
-            .and_then(|d| d.checked_duration_since(ay_core::time::Instant::now()))
+            .map(|d| d.saturating_duration_since(ay_core::time::Instant::now()))
             .unwrap_or_else(|| std::time::Duration::from_secs(30));
         if timeout.is_zero() {
             return Some(None);
         }
 
-        let mut smt = self.problem.make_smt_context();
-        Some(match smt.check_sat_with_timeout(formula, timeout) {
+        let mut smt = self.make_smt_context();
+        let result = smt.check_sat_with_timeout(formula, timeout);
+        if self.execution_stopped(deadline) {
+            return Some(None);
+        }
+        Some(match result {
             SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {
                 Some(false)
             }
@@ -7096,55 +7710,40 @@ impl BmcSolver {
     fn acyclic_reach_formula_fresh(
         &self,
         pred: PredicateId,
-        fresh_id: &mut usize,
+        names: &mut AcyclicNames<'_>,
         visiting: &mut FxHashSet<PredicateId>,
     ) -> Option<ChcExpr> {
+        names.recursion(visiting.len())?;
         if !visiting.insert(pred) {
             return None;
         }
 
         let mut disjuncts = Vec::new();
         for (rule_idx, clause) in self.problem.clauses_defining_with_index(pred) {
-            let instance = *fresh_id;
-            *fresh_id += 1;
-            // Budget compliance: path expansion is worst-case exponential in
-            // the DAG branching, and a single un-polled construction could
-            // hold the probe far past its stage budget (observed on the
-            // condensed iterator_count DAG). Poll the solve deadline every
-            // 64 fresh rule instances; a `None` here degrades exactly like
-            // the existing unsupported-shape bail (caller falls back /
-            // returns Unknown — never a verdict).
-            if instance.is_multiple_of(64)
-                && matches!(
-                    self.solve_deadline.get(),
-                    Some(d) if ay_core::time::Instant::now() >= d
-                )
-            {
-                visiting.remove(&pred);
-                return None;
-            }
-            let subst = self.mk_fresh_rule_vars(clause, pred, rule_idx, instance);
+            let instance = names.instance()?;
+            let subst = self.mk_fresh_rule_vars(clause, pred, rule_idx, instance, names)?;
             let mut conjuncts = Vec::new();
 
             if let ClauseHead::Predicate(_, head_args) = &clause.head {
                 for (arg_idx, head_arg) in head_args.iter().enumerate() {
-                    let reach_arg = self.reach_arg(pred, arg_idx);
-                    conjuncts.push(ChcExpr::eq(reach_arg, head_arg.substitute_name_map(&subst)));
+                    let reach_arg = self.reach_arg(pred, arg_idx, names)?;
+                    conjuncts.push(ChcExpr::eq(reach_arg, names.substitute(head_arg, &subst)?));
                 }
             }
 
             if let Some(constraint) = &clause.body.constraint {
-                conjuncts.push(constraint.substitute_name_map(&subst));
+                conjuncts.push(names.substitute(constraint, &subst)?);
             }
 
             for (body_pred, body_args) in &clause.body.predicates {
-                let body_reach =
-                    self.acyclic_reach_formula_fresh(*body_pred, fresh_id, visiting)?;
-                let body_args: Vec<_> = body_args
-                    .iter()
-                    .map(|arg| arg.substitute_name_map(&subst))
-                    .collect();
-                conjuncts.push(self.instantiate_reach_formula(*body_pred, &body_reach, &body_args));
+                let body_reach = self.acyclic_reach_formula_fresh(*body_pred, names, visiting)?;
+                let body_args = names.substitute_all(body_args, &subst)?;
+                conjuncts.push(self.instantiate_reach_formula(
+                    *body_pred,
+                    &body_reach,
+                    &body_args,
+                    names,
+                )?);
             }
 
             if conjuncts.is_empty() {
@@ -7154,13 +7753,15 @@ impl BmcSolver {
         }
 
         visiting.remove(&pred);
-        Some(if disjuncts.is_empty() {
+        let formula = if disjuncts.is_empty() {
             ChcExpr::Bool(false)
         } else if disjuncts.len() == 1 {
             disjuncts.remove(0)
         } else {
             ChcExpr::or_all(disjuncts)
-        })
+        };
+        names.check(&formula)?;
+        Some(formula)
     }
 
     fn mk_fresh_rule_vars(
@@ -7169,19 +7770,23 @@ impl BmcSolver {
         pred: PredicateId,
         rule_idx: usize,
         instance: usize,
-    ) -> FxHashMap<String, ChcExpr> {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<FxHashMap<String, ChcExpr>> {
         let mut subst = FxHashMap::default();
-        for var in clause.vars() {
-            let name = format!(
+        for var in names.variables(clause)? {
+            let name = names.name(format!(
                 "__bmc_dag_p{}_r{}_i{}_{}",
                 pred.index(),
                 rule_idx,
                 instance,
                 var.name
+            ))?;
+            subst.insert(
+                var.name.clone(),
+                ChcExpr::Var(ChcVar::new(name, var.sort.clone())),
             );
-            subst.insert(var.name.clone(), ChcExpr::Var(ChcVar::new(name, var.sort)));
         }
-        subst
+        Some(subst)
     }
 
     fn instantiate_reach_formula(
@@ -7189,29 +7794,31 @@ impl BmcSolver {
         pred: PredicateId,
         formula: &ChcExpr,
         args: &[ChcExpr],
-    ) -> ChcExpr {
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
+        names.check_all(args)?;
         let mut subst = FxHashMap::default();
         for (arg_idx, arg) in args.iter().enumerate() {
-            let reach_arg = self.reach_arg(pred, arg_idx);
+            let reach_arg = self.reach_arg(pred, arg_idx, names)?;
             if let ChcExpr::Var(var) = &reach_arg {
                 subst.insert(var.name.clone(), arg.clone());
             }
         }
-        formula.substitute_name_map(&subst)
+        names.substitute(formula, &subst)
     }
 
-    fn reach_arg(&self, pred: PredicateId, idx: usize) -> ChcExpr {
-        let pred_info = self
-            .problem
-            .predicates()
-            .iter()
-            .find(|p| p.id == pred)
-            .expect("predicate id exists");
-        let sort = pred_info.arg_sorts[idx].clone();
-        ChcExpr::Var(ChcVar::new(
-            format!("__bmc_reach_p{}_a{}", pred.index(), idx),
+    fn reach_arg(
+        &self,
+        pred: PredicateId,
+        idx: usize,
+        names: &mut AcyclicNames<'_>,
+    ) -> Option<ChcExpr> {
+        let pred_info = self.problem.predicates().iter().find(|p| p.id == pred)?;
+        let sort = pred_info.arg_sorts.get(idx)?.clone();
+        Some(ChcExpr::Var(ChcVar::new(
+            names.name(format!("__bmc_reach_p{}_a{}", pred.index(), idx))?,
             sort,
-        ))
+        )))
     }
 
     fn mark_acyclic_exhaustive_stats(&self, max_depth: usize, elapsed_secs: f64) {
@@ -7253,23 +7860,27 @@ impl BmcSolver {
         }
     }
 
-    /// Add transition constraints for all levels from `from_level` to `to_level`
-    /// (inclusive) to the executor. Used by adaptive stepping when skipping
-    /// multiple levels at once.
+    /// Assert the frame batches `frames` schedules before the depth-`k` query
+    /// (see [`SingleExecutorFrames`]); covers several levels at once when
+    /// adaptive stepping skipped depths.
     fn add_levels_to_executor(
         &self,
         exec: &mut ay_dpll::Executor,
         declared_vars: &mut FxHashSet<String>,
-        from_level: usize,
-        to_level: usize,
+        frames: &mut SingleExecutorFrames,
+        k: usize,
         deadline: Option<ay_core::time::Instant>,
-    ) -> Option<()> {
-        for level in from_level..=to_level {
+    ) -> Result<(), execution::BatchFailure> {
+        for (level, slice) in frames.plan(k) {
             let mut level_smt = String::new();
             let mut level_conjuncts = Vec::new();
-            self.compile_level_flat(level, &mut level_conjuncts);
+            self.compile_level_flat_filtered(
+                level,
+                |pred| frames.includes(slice, pred),
+                &mut level_conjuncts,
+            );
             if !self.executor_conjuncts_supported(&level_conjuncts, "single-executor levels") {
-                return None;
+                return Err(execution::BatchFailure::Unavailable);
             }
             for conjunct in &level_conjuncts {
                 for var in &conjunct.vars() {
@@ -7283,11 +7894,13 @@ impl BmcSolver {
                 level_smt.push_str(&format!("(assert {s})\n"));
             }
             if !level_smt.is_empty() {
-                let cmds = ay_frontend::parse(&level_smt).ok()?;
-                Self::exec_commands_with_deadline(exec, &cmds, deadline)?;
+                let cmds = ay_frontend::parse(&level_smt)
+                    .map_err(|_| execution::BatchFailure::Unavailable)?;
+                self.execute_controlled_batch(exec, &cmds, deadline, |_, _| {})?;
             }
         }
-        Some(())
+        frames.advance(k);
+        Ok(())
     }
 
     // ============ Persistent-Executor Transition-System BMC (Phase 3 Layer B) ============
@@ -7393,7 +8006,10 @@ impl BmcSolver {
         let Ok(cmds) = ay_frontend::parse(&extend_script) else {
             return false;
         };
-        if Self::exec_commands_with_deadline(exec, &cmds, depth_deadline).is_none() {
+        if self
+            .exec_commands_with_deadline(exec, &cmds, depth_deadline)
+            .is_none()
+        {
             tracing::debug!("BMC-ts: transition extension failed at depth {k}");
             return false;
         }
@@ -7406,6 +8022,65 @@ impl BmcSolver {
     /// When `permanent` is false the new names are NOT recorded in `declared`:
     /// used for declarations made inside a `(push 1)` frame, which vanish at
     /// the matching `(pop 1)` (e.g. per-depth query locals).
+    /// The transition-system lanes' search policy for their QF_LIA depth
+    /// checks (persistent TS executor, its confirmation re-solve and
+    /// `RetryFresh` fallback, the nested-array candidate probe).
+    ///
+    /// History. Fix 1 (the development design notes
+    /// diagnosis.md) turned ALL LRA theory propagation off here: DRAGON-class
+    /// sat-type depth queries livelock under BCP-time implied-bounds
+    /// propagation (>300 s on queries z3 answers in 9 ms). That was too
+    /// coarse: it also removed the direct bound propagation that makes each
+    /// decision productive, so the search decided theory atoms one at a time
+    /// (DRAGON_5 depth 2: 154 k decisions, 2.5 implications per decision) and
+    /// the #9505 adaptive every-decision mode, tripped by that wandering
+    /// ratio, then round-robined every theory atom with LP phases.
+    ///
+    /// Policy now (BMC_T6_model_search_2026-09-19 §3-4, measured on the
+    /// lanes' own dumped scripts against z3):
+    /// 1. skip implied bounds during BCP only — direct propagation and the
+    ///    final-check cascade stay on (`set_no_lra_bcp_implied_bounds`);
+    /// 2. never enter the every-decision theory-branching mode
+    ///    (`set_no_theory_every_decision`).
+    /// Together on the incremental transcripts: DRAGON_5 3.0 -> 1.5 s,
+    /// MESI_i3 8.8 -> 4.5 s, FIREFLY_all unknown -> 5.7 s, peterson_vt
+    /// 7.6 -> 1.8 s, FIREFLY_4 unknown -> sat, metros_2's ten unsat depths
+    /// 15.9 -> 4.5 s; each half alone is mixed. Every other lane keeps the
+    /// executor defaults (the #9505 QF_LRA beneficiaries are untouched).
+    ///
+    /// Real-sorted scoping (lever L2, DPLL_LRA_perf_2026-09-23.md §2.3-§2.5,
+    /// LRA_L2_bmc_real_lane_2026-09-24.md): T6 was tuned entirely on
+    /// Int/Bool transition systems (DRAGON/FIREFLY/MESI/peterson/metros —
+    /// all QF_LIA). These same lanes also run on pure-Real (QF_LRA)
+    /// transition systems (`LRA_BMC_unsafe_2026-09-22.md`'s BMC/IMC
+    /// corpus), where the corpus knob A/B found part (2) — leaving the
+    /// #9505 every-decision mode — actively HURTS: it cuts theory
+    /// propagations to about a third and turns several LRA-Lin BMC/IMC
+    /// queries that solve under the default posture into `unknown`
+    /// (scenario2_strict, scenario3_convergence, scenario2_non_convergence,
+    /// om1 general_5_3_validity). So this policy is a no-op on Real-sorted
+    /// transition systems: they keep the executor defaults exactly as the
+    /// #9505 QF_LRA beneficiaries do. Int/BV/mixed problems (no Real sort)
+    /// are unaffected — they keep T6's policy verbatim.
+    fn configure_cex_search_executor(&self, exec: &mut ay_dpll::Executor) {
+        if self.problem.has_real_sorts() {
+            return;
+        }
+        exec.set_no_lra_bcp_implied_bounds(true);
+        exec.set_no_theory_every_decision(true);
+    }
+
+    ///
+    /// A conjunct whose tree expansion reaches [`TS_DAG_PRINT_MIN_TREE`] nodes
+    /// is printed through the DAG printer (`smt::dag_smtlib`: each node
+    /// shared inside it bound once by a `let`, the same formula). Unrolled
+    /// transitions are DAGs — `let`-expanded transitions and substituted
+    /// frames keep their sharing — and their tree text was the largest single
+    /// allocation of the LRA-Lin memouts: gigabytes of `(assert …)` per depth
+    /// for toy-bug-1, bist_cell, token_ring.1, simple_array_inversion-7 and
+    /// om1_with_relays_general_3_9, then parsed back at the same size. Smaller
+    /// conjuncts keep the tree text byte for byte (the executor is slower on
+    /// `let` scripts of small queries; `write_executor_asserts`).
     fn append_ts_decls_and_asserts(
         script: &mut String,
         expr: &ChcExpr,
@@ -7424,6 +8099,12 @@ impl BmcSolver {
                 let sort_str = sort_to_smtlib(&var.sort);
                 let name = quote_symbol(&var.name);
                 script.push_str(&format!("(declare-const {name} {sort_str})\n"));
+            }
+            if crate::expr::dag::tree_size_at_least(conjunct, TS_DAG_PRINT_MIN_TREE)
+                && crate::smt::dag_smtlib::write_asserts_dag(script, &[conjunct], TS_DAG_PRINT_CAPS)
+                    .is_ok()
+            {
+                continue;
             }
             let s = InvariantModel::expr_to_smtlib(conjunct);
             script.push_str(&format!("(assert {s})\n"));
@@ -7523,6 +8204,24 @@ impl BmcSolver {
         queries: &[&HornClause],
         max_depth: usize,
     ) -> Option<SingleExecutorOutcome> {
+        let outcome = self.solve_transition_system_incremental_inner(queries, max_depth);
+        if !matches!(
+            outcome,
+            Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unsafe(_)))
+        ) {
+            self.leave_probe_extension();
+        }
+        outcome
+    }
+
+    fn solve_transition_system_incremental_inner(
+        &self,
+        queries: &[&HornClause],
+        max_depth: usize,
+    ) -> Option<SingleExecutorOutcome> {
+        if self.execution_stopped(None) {
+            return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+        }
         if !Self::ts_incremental_enabled() {
             return None;
         }
@@ -7550,37 +8249,76 @@ impl BmcSolver {
         Self::append_ts_decls_and_asserts(&mut script, &init0, &mut declared, true);
 
         let commands = ay_frontend::parse(&script).ok()?;
-        let mut exec = ay_dpll::Executor::new();
-        // Fix 1 (sat-side-model-search diagnosis): disable LRA theory
-        // propagation for this lane's QF_LIA solves. DRAGON-class sat-type
-        // counterexample queries livelock under BCP-time implied-bounds
-        // propagation (weak learned clauses + unstable theory-hinted phases:
-        // >300s on queries z3 answers in 9ms); with propagation off the same
-        // depth checks answer in ~1s with identical verdicts. Scoped to the
-        // transition-system BMC lane only — every other lane keeps default
-        // propagation (the #9505 adaptive-mode beneficiaries are untouched).
-        exec.set_no_lra_theory_propagation(true);
-        Self::exec_commands(&mut exec, &commands)?;
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
+        self.configure_cex_search_executor(&mut exec);
+        self.exec_commands(&mut exec, &commands)?;
+
+        // Hand-off resume (`ProbeFrontier`): TS depth `j` is flat level `j`
+        // on this lane, so assert transitions `0..resume` permanently and
+        // begin the depth checks at `resume`. `consecutive_unsat` is NOT
+        // carried over: k-induction re-accumulates its own base cases.
+        let resume = self.resume_depth.get();
+        if resume > 0 {
+            let mut prefix_script = String::new();
+            for j in 0..resume {
+                let transition_j = ts.transition_at(j);
+                if !self.executor_conjuncts_supported(
+                    std::slice::from_ref(&transition_j),
+                    "ts-incremental resume prefix",
+                ) {
+                    return None;
+                }
+                Self::append_ts_decls_and_asserts(
+                    &mut prefix_script,
+                    &transition_j,
+                    &mut declared,
+                    true,
+                );
+            }
+            let prefix_cmds = ay_frontend::parse(&prefix_script).ok()?;
+            self.exec_commands(&mut exec, &prefix_cmds)?;
+            tracing::debug!("BMC-ts: resumed at depth {resume} from the hand-off frontier");
+        }
 
         let mut ema_depth_time: f64 = 0.0;
         let mut consecutive_unsat: usize = 0;
+        // Per-clause canonical disjuncts for model→clause attribution
+        // (`ts_witness`); built on the first SAT depth only.
+        let mut clause_disjuncts: Option<Option<crate::transition_system::TsClauseDisjuncts>> =
+            None;
 
-        for k in 0..=max_depth {
+        // Wall cost of the last depth this executor DECIDED (unsat/sat):
+        // drives the per-depth cap and the soft-budget extension.
+        let mut last_depth_cost: Option<std::time::Duration> = None;
+
+        for k in resume..=max_depth {
             if !self.should_continue_depth(&start) {
                 tracing::debug!("BMC-ts: Stopped at depth {} (budget/cancel)", k);
+                self.stats.borrow_mut().budget_exhausted = true;
+                return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+            }
+            if !self.ts_probe_admit_next_depth(&start, last_depth_cost) {
+                tracing::debug!(
+                    "BMC-ts: soft budget reached at depth {} ({:.1}s, last depth {:?}); stopping",
+                    k,
+                    start.elapsed().as_secs_f64(),
+                    last_depth_cost
+                );
                 self.stats.borrow_mut().budget_exhausted = true;
                 return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
             }
 
             let depth_start = ay_core::time::Instant::now();
             let mut depth_deadline = self.per_depth_deadline(depth_start);
-            // Budget insurance: a stalled persistent check must leave room
-            // for the fresh fallback (`RetryFresh`), so cap each TS depth
-            // check at half the remaining overall budget.
-            if let Some(budget) = self.config.time_budget {
-                let remaining = budget.saturating_sub(start.elapsed());
-                let cap = depth_start
-                    + (remaining.div_f64(2.0)).max(std::time::Duration::from_millis(50));
+            // Per-depth cap from the measured trend (see `ts_depth_cap`).
+            if let Some(cap) = self.ts_depth_cap(depth_start, &start, last_depth_cost) {
+                depth_deadline = Some(depth_deadline.map_or(cap, |d| d.min(cap)));
+            }
+            // Real-sorted systems: hand a slow in-session depth to the fresh
+            // path (see `ts_real_depth_cap`).
+            if let Some(cap) =
+                Self::ts_real_depth_cap(self.problem.has_real_sorts(), depth_start, last_depth_cost)
+            {
                 depth_deadline = Some(depth_deadline.map_or(cap, |d| d.min(cap)));
             }
 
@@ -7605,7 +8343,7 @@ impl BmcSolver {
                     consecutive_unsat,
                 });
             };
-            let Some(outputs) = Self::exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)
+            let Some(outputs) = self.exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)
             else {
                 tracing::debug!("BMC-ts: executor failure at depth {k}; resuming fresh fallback");
                 return Some(SingleExecutorOutcome::RetryFresh {
@@ -7622,6 +8360,9 @@ impl BmcSolver {
             let depth_elapsed = depth_start.elapsed().as_secs_f64();
             ema_depth_time = EMA_ALPHA * depth_elapsed + (1.0 - EMA_ALPHA) * ema_depth_time;
             self.record_depth(k, ema_depth_time);
+            if matches!(result_str, "sat" | "unsat") {
+                last_depth_cost = Some(depth_start.elapsed());
+            }
             tracing::debug!(
                 "BMC-ts: depth={} result={} time={:.3}s ema={:.3}s",
                 k,
@@ -7632,9 +8373,51 @@ impl BmcSolver {
 
             match result_str {
                 "sat" => {
-                    // Confirm on the existing per-depth fresh flat path: model
-                    // parsing, witness extraction, and counterexample
-                    // validation are unchanged from the non-incremental route.
+                    // First try to confirm from THIS executor's model: the
+                    // query@k frame is still pushed, so the executor holds a
+                    // model of the whole length-k path. `ts_witness` turns it
+                    // into a derivation witness over the original clauses and
+                    // runs it through the same replay gate the flat path uses;
+                    // only a witness that replays as Valid is an Unsafe here.
+                    // On the lustre class this replaces a 10-18 s flat
+                    // confirmation re-solve of a depth the lane decided in
+                    // 1-3 s (T8_regression_2026-09-19 §5, DIAG_LIA_LIN T5).
+                    let disjuncts = clause_disjuncts.get_or_insert_with(|| {
+                        TransitionSystem::clause_disjuncts(&self.problem).ok()
+                    });
+                    if let Some(disjuncts) = disjuncts.as_ref() {
+                        if let Some(unsafe_result) = self.ts_model_unsafe_at_depth(
+                            &mut exec,
+                            &ts,
+                            disjuncts,
+                            k,
+                            depth_deadline,
+                        ) {
+                            return Some(SingleExecutorOutcome::Solved(unsafe_result));
+                        }
+                    }
+                    if self.execution_stopped(None) {
+                        return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+                    }
+                    // Real-sorted systems: the flat confirmation below can never
+                    // confirm (its witness extraction is i128-only and refuses
+                    // Real problems), so re-decide this depth on the fresh
+                    // transition-system path, which confirms from its own model
+                    // (`solve_ts_fresh_per_depth`).
+                    if self.problem.has_real_sorts() {
+                        tracing::debug!(
+                            "BMC-ts: Real SAT at depth {k} not confirmed from the lane model; \
+                             re-deciding on the fresh transition-system path"
+                        );
+                        return Some(SingleExecutorOutcome::RetryFresh {
+                            start_depth: k,
+                            consecutive_unsat,
+                        });
+                    }
+                    // Otherwise confirm on the existing per-depth fresh flat
+                    // path: model parsing, witness extraction, and
+                    // counterexample validation are unchanged from the
+                    // non-incremental route.
                     tracing::debug!("BMC-ts: SAT at depth {k}; confirming on per-depth fresh path");
                     // The confirmation re-solve keeps LRA propagation off
                     // (Fix 1): the flat depth-k sat-type query is exactly the
@@ -7656,6 +8439,9 @@ impl BmcSolver {
                             return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unsafe(
                                 cex,
                             )));
+                        }
+                        if self.execution_stopped(None) {
+                            return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
                         }
                         if k == max_depth {
                             break;
@@ -7684,6 +8470,7 @@ impl BmcSolver {
                 }
                 "unsat" => {
                     consecutive_unsat += 1;
+                    self.note_level_unreachable(k);
                     // Inc-16 S1b probe clamp: depth `min_depth` verified
                     // cex-free AND `after` wall-clock elapsed → stop early
                     // (Unknown). Only the front BMC probe sets this; see
@@ -7804,6 +8591,24 @@ impl BmcSolver {
         queries: &[&HornClause],
         max_depth: usize,
     ) -> Option<SingleExecutorOutcome> {
+        let outcome = self.solve_multipred_ts_incremental_inner(queries, max_depth);
+        if !matches!(
+            outcome,
+            Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unsafe(_)))
+        ) {
+            self.leave_probe_extension();
+        }
+        outcome
+    }
+
+    fn solve_multipred_ts_incremental_inner(
+        &self,
+        queries: &[&HornClause],
+        max_depth: usize,
+    ) -> Option<SingleExecutorOutcome> {
+        if self.execution_stopped(None) {
+            return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+        }
         if !Self::ts_incremental_enabled() || !Self::multipred_ts_incremental_enabled() {
             return None;
         }
@@ -7841,12 +8646,10 @@ impl BmcSolver {
         Self::append_ts_decls_and_asserts(&mut script, &init0, &mut declared, true);
 
         let commands = ay_frontend::parse(&script).ok()?;
-        let mut exec = ay_dpll::Executor::new();
-        // Same policy as the single-predicate TS lane (Fix 1): LRA theory
-        // propagation off for this lane's QF_LIA solves; sat-type depth
-        // queries livelock under BCP-time implied-bounds propagation.
-        exec.set_no_lra_theory_propagation(true);
-        Self::exec_commands(&mut exec, &commands)?;
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
+        // Same policy as the single-predicate TS lane.
+        self.configure_cex_search_executor(&mut exec);
+        self.exec_commands(&mut exec, &commands)?;
 
         let mut ema_depth_time: f64 = 0.0;
 
@@ -7854,6 +8657,9 @@ impl BmcSolver {
         // of ≤ L+1 clause applications while TS depth k covers exactly k, so
         // sweep one extra TS depth to match the flat path's coverage.
         let ts_max_depth = max_depth.saturating_add(1);
+        // Wall cost of the last depth this executor decided (see the
+        // single-pred lane).
+        let mut last_depth_cost: Option<std::time::Duration> = None;
         for k in 0..=ts_max_depth {
             if !self.should_continue_depth(&start) {
                 tracing::debug!("BMC-mp-ts: Stopped at depth {} (budget/cancel)", k);
@@ -7861,14 +8667,22 @@ impl BmcSolver {
                 return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
             }
 
+            if !self.ts_probe_admit_next_depth(&start, last_depth_cost) {
+                tracing::debug!(
+                    "BMC-mp-ts: soft budget reached at depth {} ({:.1}s, last depth {:?}); stopping",
+                    k,
+                    start.elapsed().as_secs_f64(),
+                    last_depth_cost
+                );
+                self.stats.borrow_mut().budget_exhausted = true;
+                return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+            }
+
             let depth_start = ay_core::time::Instant::now();
             let mut depth_deadline = self.per_depth_deadline(depth_start);
-            // Budget insurance (mirrors the single-pred TS lane): a stalled
-            // persistent check must leave room for the fresh fallback.
-            if let Some(budget) = self.config.time_budget {
-                let remaining = budget.saturating_sub(start.elapsed());
-                let cap = depth_start
-                    + (remaining.div_f64(2.0)).max(std::time::Duration::from_millis(50));
+            // Per-depth cap from the measured trend (mirrors the single-pred
+            // TS lane; see `ts_depth_cap`).
+            if let Some(cap) = self.ts_depth_cap(depth_start, &start, last_depth_cost) {
                 depth_deadline = Some(depth_deadline.map_or(cap, |d| d.min(cap)));
             }
 
@@ -7894,7 +8708,7 @@ impl BmcSolver {
                     consecutive_unsat: 0,
                 });
             };
-            let Some(outputs) = Self::exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)
+            let Some(outputs) = self.exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)
             else {
                 tracing::debug!(
                     "BMC-mp-ts: executor failure at depth {k}; resuming fresh fallback"
@@ -7913,6 +8727,9 @@ impl BmcSolver {
             let depth_elapsed = depth_start.elapsed().as_secs_f64();
             ema_depth_time = EMA_ALPHA * depth_elapsed + (1.0 - EMA_ALPHA) * ema_depth_time;
             self.record_depth(k, ema_depth_time);
+            if matches!(result_str, "sat" | "unsat") {
+                last_depth_cost = Some(depth_start.elapsed());
+            }
             tracing::debug!(
                 "BMC-mp-ts: depth={} result={} time={:.3}s ema={:.3}s",
                 k,
@@ -7987,7 +8804,9 @@ impl BmcSolver {
                             consecutive_unsat: 0,
                         });
                     };
-                    if Self::exec_commands_with_deadline(&mut exec, &cmds, depth_deadline).is_none()
+                    if self
+                        .exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)
+                        .is_none()
                     {
                         tracing::debug!("BMC-mp-ts: transition extension failed at depth {k}");
                         return Some(SingleExecutorOutcome::RetryFresh {
@@ -8030,16 +8849,16 @@ impl BmcSolver {
     /// missing witness, verification failure or unknown) returns `None`, so
     /// callers keep their fail-closed behavior. The engine counterexample
     /// itself is never trusted — callers pass only its DEPTH as a hint.
-    pub(crate) fn replay_confirm_unsafe_on_problem(
+    ///
+    /// The public entry is the memoized
+    /// [`Self::replay_confirm_unsafe_on_problem`] (see [`failed_replay_memo`]).
+    fn replay_confirm_unsafe_on_problem_unmemoized(
         problem: &ChcProblem,
         depth_hint: usize,
         budget: std::time::Duration,
         cancellation_token: Option<CancellationToken>,
         verbose: bool,
     ) -> Option<Counterexample> {
-        if budget < std::time::Duration::from_millis(250) {
-            return None;
-        }
         if problem.predicates().is_empty() || problem.queries().next().is_none() {
             return None;
         }
@@ -8124,6 +8943,7 @@ impl BmcSolver {
         verbose: bool,
     ) -> ReplayConfirmAttempt {
         let config = BmcConfig {
+            smt_lane: crate::smt::SmtLane::Verification,
             base: ChcEngineConfig {
                 verbose,
                 cancellation_token: cancellation_token.clone(),
@@ -8136,11 +8956,15 @@ impl BmcSolver {
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
+            memory_budget: None,
             ts_probe_clamp: None,
+            soft_time_budget: None,
+            probe_extension_deadline: None,
+            resume_frontier: None,
             sweep_past_spurious_sat: true,
         };
         let solver = Self::new(problem.clone(), config);
-        let result = solver.solve();
+        let result = solver.solve_replay_search();
         let budget_exhausted = solver.stats().budget_exhausted;
         if verbose {
             let stats = solver.stats();
@@ -8186,25 +9010,11 @@ impl BmcSolver {
             tracing::debug!("cex-replay: BMC Unsafe lacks a derivation witness; rejecting");
             return not_confirmed();
         }
-        let verify_config = PdrConfig {
-            verbose,
-            cancellation_token,
-            solve_timeout: Some(std::time::Duration::from_secs(10)),
-            strict_proofs: true,
-            disable_array_scalarization: true,
-            preserve_original_clauses: true,
-            disable_cex_replay: true,
-            ..PdrConfig::default()
-        };
-        let mut verifier = PdrSolver::new(problem.clone(), verify_config);
-        match verifier.try_verify_counterexample(&cex) {
-            Ok(CexVerificationResult::Valid) => ReplayConfirmAttempt::Confirmed(cex),
-            other => {
-                tracing::debug!(
-                    "cex-replay: witness replay on problem clauses did not verify ({other:?}); rejecting"
-                );
-                not_confirmed()
-            }
+        // Confirm, not merely verify: the confirmed counterexample carries the
+        // ground derivation the verdict rests on.
+        match Self::confirm_replay_witness(problem, cex, verbose, cancellation_token) {
+            Some(confirmed) => ReplayConfirmAttempt::Confirmed(confirmed),
+            None => not_confirmed(),
         }
     }
 
@@ -8229,6 +9039,9 @@ impl BmcSolver {
         queries: &[&HornClause],
         max_depth: usize,
     ) -> Option<SingleExecutorOutcome> {
+        if self.execution_stopped(None) {
+            return Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown));
+        }
         let start = ay_core::time::Instant::now();
         let logic = self.detect_bmc_logic();
         let mut smt_cmds = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
@@ -8255,14 +9068,16 @@ impl BmcSolver {
 
         // Parse and create executor with level 0 assertions
         let commands = ay_frontend::parse(&smt_cmds).ok()?;
-        let mut exec = ay_dpll::Executor::new();
-        Self::exec_commands(&mut exec, &commands)?;
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
+        if let Err(failure) = self.execute_controlled_batch(&mut exec, &commands, None, |_, _| {}) {
+            return self.single_batch_failure(failure, 0, None, 0);
+        }
 
         let mut ema_depth_time: f64 = 0.0;
         let mut consecutive_unsat: usize = 0;
         let mut adaptive_step: usize = 1;
         let mut first_unchecked_depth: Option<usize> = None;
-        let mut last_added_level: usize = 0; // Track the highest level whose constraints are in the executor.
+        let mut frames = SingleExecutorFrames::new(queries);
 
         // Depth iteration: uses adaptive stepping when enabled.
         let mut k: usize = 0;
@@ -8276,17 +9091,23 @@ impl BmcSolver {
             let depth_start = ay_core::time::Instant::now();
             let depth_deadline = self.per_depth_deadline(depth_start);
 
-            // Add all levels from last_added_level+1 to k (handles adaptive skipping).
-            if k > 0 && k > last_added_level {
-                let from = last_added_level + 1;
-                self.add_levels_to_executor(
+            // Complete the levels below k, then add the level-k query slice
+            // (see `SingleExecutorFrames`; handles adaptive skipping).
+            if k > 0 {
+                if let Err(failure) = self.add_levels_to_executor(
                     &mut exec,
                     &mut declared_vars,
-                    from,
+                    &mut frames,
                     k,
                     depth_deadline,
-                )?;
-                last_added_level = k;
+                ) {
+                    return self.single_batch_failure(
+                        failure,
+                        k,
+                        first_unchecked_depth,
+                        consecutive_unsat,
+                    );
+                }
             }
 
             // Build query at depth k. Several queries are alternatives, not a
@@ -8332,7 +9153,18 @@ impl BmcSolver {
             // check-sat-assuming with only the bare activation literal
             query_smt.push_str(&format!("(check-sat-assuming ({act_name}))\n"));
             let cmds = ay_frontend::parse(&query_smt).ok()?;
-            let outputs = Self::exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)?;
+            let outputs =
+                match self.execute_controlled_batch(&mut exec, &cmds, depth_deadline, |_, _| {}) {
+                    Ok(outputs) => outputs,
+                    Err(failure) => {
+                        return self.single_batch_failure(
+                            failure,
+                            k,
+                            first_unchecked_depth,
+                            consecutive_unsat,
+                        )
+                    }
+                };
 
             // The `(declare-const ...)` commands just emitted are PERMANENT in the
             // persistent executor, but `query_declared` is per-iteration. Without
@@ -8471,11 +9303,14 @@ impl BmcSolver {
     /// When `start_depth > 0`, rebuilds only the prefix for already-proved
     /// earlier levels and resumes solving at `start_depth`.
     /// `disable_lra_propagation`: when true, each per-depth executor runs
-    /// with LRA theory propagation off (Fix 1, sat-side-model-search
-    /// diagnosis). Passed as `true` ONLY by the transition-system lane's SAT
-    /// confirmation re-solve — the flat depth-k query there has exactly the
-    /// DRAGON-class shape that livelocks under propagation. All other
-    /// callers pass `false` (default solver behavior).
+    /// with the transition-system lanes' counterexample-search policy
+    /// (`configure_cex_search_executor`; the name is historical from Fix 1,
+    /// sat-side-model-search diagnosis). Passed as `true` by both
+    /// transition-system lanes (single-predicate and multipred SingleLoop) —
+    /// their SAT confirmation re-solves and their `RetryFresh` fallbacks —
+    /// because the flat depth-k query there has exactly the DRAGON-class
+    /// shape that livelocks under default propagation. All other callers pass
+    /// `false` (default solver behavior).
     fn solve_per_depth_fresh(
         &self,
         queries: &[&HornClause],
@@ -8484,6 +9319,9 @@ impl BmcSolver {
         initial_consecutive_unsat: usize,
         disable_lra_propagation: bool,
     ) -> Option<ChcEngineResult> {
+        if self.execution_stopped(None) {
+            return Some(ChcEngineResult::Unknown);
+        }
         let start = ay_core::time::Instant::now();
         let logic = self.detect_bmc_logic();
         let mut smt_prefix = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
@@ -8586,12 +9424,29 @@ impl BmcSolver {
             smt.push_str("(check-sat)\n");
 
             let commands = ay_frontend::parse(&smt).ok()?;
-            let mut exec = ay_dpll::Executor::new();
+            let mut exec = crate::smt::executor_adapter::new_search_executor();
             if disable_lra_propagation {
-                // TS-lane confirmation re-solve: see the doc comment above.
-                exec.set_no_lra_theory_propagation(true);
+                // TS-lane confirmation re-solve / fallback: see the doc
+                // comment above.
+                self.configure_cex_search_executor(&mut exec);
             }
-            let outputs = Self::exec_commands_with_deadline(&mut exec, &commands, depth_deadline)?;
+            let outputs = match self.execute_controlled_batch(
+                &mut exec,
+                &commands,
+                depth_deadline,
+                |_, _| {},
+            ) {
+                Ok(outputs) => outputs,
+                Err(execution::BatchFailure::LocalDeadline) => {
+                    // This depth was not proved. Keep the prefix encoding but
+                    // never count it toward UNSAT exhaustion or induction.
+                    encountered_unknown = true;
+                    consecutive_unsat = 0;
+                    continue;
+                }
+                Err(execution::BatchFailure::Stopped(_)) => return Some(ChcEngineResult::Unknown),
+                Err(execution::BatchFailure::Unavailable) => return None,
+            };
 
             let result_str = outputs.first().map(String::as_str).unwrap_or("unknown");
 
@@ -8635,6 +9490,7 @@ impl BmcSolver {
                 }
             } else if result_str == "unsat" {
                 consecutive_unsat += 1;
+                self.note_level_unreachable(k);
                 // Try k-induction after consecutive UNSAT depths (#7969)
                 if self.config.enable_k_induction
                     && consecutive_unsat >= K_INDUCTION_MIN_CONSECUTIVE_UNSAT
@@ -8732,8 +9588,8 @@ impl BmcSolver {
         smt.push_str(&format!("(assert {s})\n(check-sat)\n"));
 
         let commands = ay_frontend::parse(&smt).ok()?;
-        let mut exec = ay_dpll::Executor::new();
-        let outputs = Self::exec_commands_with_deadline(&mut exec, &commands, check_deadline)?;
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
+        let outputs = self.exec_commands_with_deadline(&mut exec, &commands, check_deadline)?;
 
         let result_str = outputs.first().map(String::as_str).unwrap_or("unknown");
         tracing::debug!("BMC k-induction: k={} result={}", k, result_str);
@@ -8801,10 +9657,22 @@ impl BmcSolver {
     /// Execute commands via the executor with panic safety.
     /// Returns `Some(outputs)` on success, `None` on failure.
     fn exec_commands(
+        &self,
         exec: &mut ay_dpll::Executor,
         commands: &[ay_frontend::Command],
     ) -> Option<Vec<String>> {
-        ay_core::catch_ay_panics(
+        self.exec_commands_with_deadline(exec, commands, None)
+    }
+
+    fn exec_commands_inner(
+        exec: &mut ay_dpll::Executor,
+        commands: &[ay_frontend::Command],
+    ) -> Option<Vec<String>> {
+        let memory = memory::Budget::capture(None, None);
+        if !memory.constrain(exec) {
+            return None;
+        }
+        let result = ay_core::catch_ay_panics(
             AssertUnwindSafe(|| match exec.execute_all(commands) {
                 Ok(out) => Ok(out),
                 Err(e) => {
@@ -8817,19 +9685,22 @@ impl BmcSolver {
                 Err(())
             },
         )
-        .ok()
+        .ok();
+        if !memory.executor_open(exec) {
+            return None;
+        }
+        result
     }
 
     /// Execute commands with an optional per-batch executor deadline.
     fn exec_commands_with_deadline(
+        &self,
         exec: &mut ay_dpll::Executor,
         commands: &[ay_frontend::Command],
         deadline: Option<ay_core::time::Instant>,
     ) -> Option<Vec<String>> {
-        exec.set_deadline(deadline);
-        let result = Self::exec_commands(exec, commands);
-        exec.set_deadline(None);
-        result
+        self.execute_controlled_batch(exec, commands, deadline, |_, _| {})
+            .ok()
     }
 
     /// Convert the configured per-depth timeout into an absolute deadline.
@@ -8954,10 +9825,12 @@ impl BmcSolver {
             }
         }
 
-        // 3. Map remaining variables to level-specific variables
+        // 3. Map remaining clause variables, including nested head-only
+        // binders, to level-specific variables. vars() visits the body first,
+        // preserving the existing names before appending head-only binders.
         let mut var_idx = 0;
-        let body_vars = clause.body.vars();
-        for v in body_vars {
+        let clause_vars = clause.vars();
+        for v in clause_vars {
             if !subst.contains_key(&v.name) {
                 subst.insert(
                     v.name.clone(),
@@ -9115,6 +9988,9 @@ impl BmcSolver {
         if let Some(constraint) = &query.body.constraint {
             let substituted = constraint.substitute_name_map(&subst);
             conjuncts.push(substituted);
+        } else if query.body.predicates.is_empty() {
+            // `false :- true` is a live query, not an absent query group.
+            conjuncts.push(ChcExpr::Bool(true));
         }
     }
 
@@ -9253,6 +10129,11 @@ impl BmcSolver {
         seen: &mut FxHashSet<String>,
     ) {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                for value in lambda.captures() {
+                    Self::collect_trace_array_selects(value, values, seen);
+                }
+            }
             ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
                 if let Some((array, indices, value_sort)) =
                     Self::trace_scalar_array_select_path(expr)
@@ -9394,6 +10275,9 @@ impl BmcSolver {
 
     fn push_nested_candidate_children<'a>(expr: &'a ChcExpr, stack: &mut Vec<&'a ChcExpr>) {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                stack.extend(lambda.captures().iter().rev().map(AsRef::as_ref))
+            }
             ChcExpr::Op(_, args)
             | ChcExpr::PredicateApp(_, _, args)
             | ChcExpr::FuncApp(_, _, args) => {
@@ -9503,6 +10387,9 @@ impl BmcSolver {
                 continue;
             }
             match current {
+                ChcExpr::ArrayLambda(_) => {
+                    return Err(BmcNestedArrayCandidateAbort::UnsupportedNestedBoundary)
+                }
                 ChcExpr::Op(ChcOp::Eq | ChcOp::Ne, args) => {
                     let nested_children = args
                         .iter()
@@ -10023,12 +10910,11 @@ impl BmcSolver {
             tracing::debug!("BMC nested-array candidate at depth {depth} failed to parse");
             return None;
         };
-        let mut exec = ay_dpll::Executor::new();
+        let mut exec = crate::smt::executor_adapter::new_search_executor();
         if disable_lra_propagation {
-            exec.set_no_lra_theory_propagation(true);
+            self.configure_cex_search_executor(&mut exec);
         }
-        let Some(outputs) = Self::exec_commands_with_deadline(&mut exec, &commands, deadline)
-        else {
+        let Some(outputs) = self.exec_commands_with_deadline(&mut exec, &commands, deadline) else {
             log_nested_array_candidate(format_args!(
                 "depth={depth} candidate executor/deadline failed"
             ));
@@ -10186,7 +11072,7 @@ impl BmcSolver {
         record_trace_observation_commands_for_tests(1usize.saturating_add(trace_values.len()));
 
         let commands = ay_frontend::parse(&smt).ok()?;
-        let outputs = Self::exec_commands_with_deadline(exec, &commands, deadline)?;
+        let outputs = self.exec_commands_with_deadline(exec, &commands, deadline)?;
         let mut model = FxHashMap::default();
         let dt_ctor_names = FxHashSet::default();
         parse_model_into(&mut model, Self::model_output(&outputs), &dt_ctor_names);
@@ -11051,6 +11937,18 @@ impl BmcSolver {
     ) -> ChcEngineResult {
         let steps = self.steps_from_derivation_witness(&witness);
         let cex = Counterexample::with_witness(steps, witness);
+        self.verified_unsafe_from_counterexample(cex, source)
+    }
+
+    /// The witness soundness gate: `Unsafe` only when `cex` replays as
+    /// `Valid` against the ORIGINAL clauses (`PdrSolver::try_verify_counterexample`,
+    /// strict, no nested cex replay). An attached ground derivation is
+    /// re-validated there before it can short-circuit the SMT replay.
+    fn verified_unsafe_from_counterexample(
+        &self,
+        cex: Counterexample,
+        source: &str,
+    ) -> ChcEngineResult {
         let mut validation_config = PdrConfig::default()
             .with_verbose(self.config.base.verbose)
             .with_cancellation_token(self.config.base.cancellation_token.clone());
@@ -11061,15 +11959,15 @@ impl BmcSolver {
         // (inc-9) — this verification IS the replay's trust anchor.
         validation_config.disable_cex_replay = true;
         let mut verifier = PdrSolver::new(self.problem.clone(), validation_config);
-        match verifier.try_verify_counterexample(&cex) {
-            Ok(CexVerificationResult::Valid) => ChcEngineResult::Unsafe(cex),
-            Ok(CexVerificationResult::Spurious) => {
+        match verifier.try_confirm_counterexample(cex) {
+            Ok(Ok(confirmed)) => ChcEngineResult::Unsafe(confirmed),
+            Ok(Err(CexVerificationResult::Spurious)) => {
                 tracing::warn!(
                     "BMC: {source} witness failed original CHC replay as spurious; returning Unknown"
                 );
                 ChcEngineResult::Unknown
             }
-            Ok(CexVerificationResult::Unknown) => {
+            Ok(Err(_)) => {
                 tracing::debug!(
                     "BMC: {source} witness replay on original CHC was inconclusive; returning Unknown"
                 );
@@ -12111,7 +13009,22 @@ impl BmcSolver {
 
     /// Compile level constraints using a direct flat encoding (no rule indicators).
     fn compile_level_flat(&self, level: usize, conjuncts: &mut Vec<ChcExpr>) {
+        self.compile_level_flat_filtered(level, |_| true, conjuncts);
+    }
+
+    /// [`Self::compile_level_flat`] restricted to the predicates `include`
+    /// accepts. Each predicate's level definition is emitted independently of
+    /// the others, so the slices of one level may be asserted separately.
+    fn compile_level_flat_filtered(
+        &self,
+        level: usize,
+        include: impl Fn(PredicateId) -> bool,
+        conjuncts: &mut Vec<ChcExpr>,
+    ) {
         for pred in self.problem.predicates() {
+            if !include(pred.id) {
+                continue;
+            }
             let rules: Vec<_> = self.problem.clauses_defining_with_index(pred.id).collect();
             if rules.is_empty() {
                 // Same exact dead-lane pin as `compile_level`: no defining
@@ -12155,9 +13068,9 @@ impl BmcSolver {
                     rule_conjuncts.push(constraint.substitute_name_map(&subst));
                 }
 
-                if !rule_conjuncts.is_empty() {
-                    rule_disjuncts.push(ChcExpr::and_all(rule_conjuncts.iter().cloned()));
-                }
+                // Preserve nullary facts with no explicit body constraint:
+                // their empty conjunction is true.
+                rule_disjuncts.push(ChcExpr::and_all(rule_conjuncts));
             }
 
             let level_pred = self.level_predicate(pred.id, level);
@@ -12282,6 +13195,18 @@ struct TreeBuildOpts<'a> {
     /// straight-line program counterexamples require). See
     /// [`BmcSolver::solve_committed_chain_refutation`].
     committed: Option<&'a FxHashMap<PredicateId, usize>>,
+    /// Select one defining rule only at the root node. Descendants retain all
+    /// their rule choices, including recursive occurrences of this predicate.
+    root_choice: Option<(PredicateId, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeRefutationPolicy {
+    /// Existing datatype/raw-tree order and legacy witness fallback.
+    IterativeWithReplay,
+    /// Try the admitted bound first, retaining only native original ground
+    /// evidence. A capped build can still fall back to smaller trees.
+    BoundedGroundOnly,
 }
 
 impl BmcSolver {
@@ -12343,6 +13268,7 @@ impl BmcSolver {
                 node_cap,
                 linear_only: false,
                 committed: None,
+                root_choice: None,
             };
             for depth in 2..=max_tree_depth {
                 if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
@@ -12395,7 +13321,7 @@ impl BmcSolver {
                 if remaining.is_zero() {
                     return ChcEngineResult::Unknown;
                 }
-                let mut smt = self.problem.make_smt_context();
+                let mut smt = self.make_smt_context();
                 let model = match smt.check_sat_with_timeout(&formula, remaining) {
                     SmtResult::Sat(model) => model,
                     // UNSAT / Unknown at this depth: try a deeper unfolding.
@@ -12436,6 +13362,7 @@ impl BmcSolver {
                     &model,
                     "bounded tree refutation",
                     "__tree_q_",
+                    TreeRefutationPolicy::IterativeWithReplay,
                 ) {
                     return ChcEngineResult::Unsafe(cex);
                 }
@@ -12473,6 +13400,7 @@ impl BmcSolver {
         model: &FxHashMap<String, SmtValue>,
         source: &str,
         query_var_prefix: &str,
+        policy: TreeRefutationPolicy,
     ) -> ChcEngineResult {
         if crate::ground_derivation::ground_backtranslation_enabled() {
             let _witness_budget =
@@ -12493,13 +13421,17 @@ impl BmcSolver {
                     derivation
                 })
                 .filter(|derivation| {
-                    crate::ground_derivation::validate_ground_derivation(&self.problem, derivation)
-                        .inspect_err(|err| {
-                            crate::ground_derivation::log_ground_translation_detail(format_args!(
-                                "{source} derivation rejected on its own problem: {err}"
-                            ));
-                        })
-                        .is_ok()
+                    crate::ground_derivation::validate_ground_derivation_with_progress(
+                        &self.problem,
+                        derivation,
+                        &mut || !self.model_extraction_should_stop(),
+                    )
+                    .inspect_err(|err| {
+                        crate::ground_derivation::log_ground_translation_detail(format_args!(
+                            "{source} derivation rejected on its own problem: {err}"
+                        ));
+                    })
+                    .is_ok()
                 });
             if let Some(derivation) = ground {
                 if self.model_extraction_should_stop() {
@@ -12521,6 +13453,12 @@ impl BmcSolver {
             }
         }
 
+        if policy == TreeRefutationPolicy::BoundedGroundOnly {
+            // The bounded array lane cannot start legacy witness SMT solving
+            // after an incomplete native ground reconstruction. Its caller's
+            // original ground evidence is the only acceptance path.
+            return ChcEngineResult::Unknown;
+        }
         if level_witness.query_roots.len() != 1 {
             tracing::debug!(
                 "BMC: {source} produced a multi-body-predicate query witness that did not \
@@ -12610,8 +13548,57 @@ impl BmcSolver {
         if !self.problem.uses_datatype_features() || self.problem.has_real_sorts() {
             return ChcEngineResult::Unknown;
         }
+        self.solve_committed_tree_refutation(
+            max_tree_depth,
+            budget,
+            node_cap,
+            TreeRefutationPolicy::IterativeWithReplay,
+        )
+    }
+
+    /// Array counterpart of the existing committed-conjunction derivation
+    /// search. This remains refutation-only; callers admit its source and
+    /// require a retained original-space ground derivation before acceptance.
+    pub(crate) fn solve_array_committed_tree_refutation(
+        &self,
+        max_tree_depth: usize,
+        budget: std::time::Duration,
+        node_cap: usize,
+    ) -> ChcEngineResult {
+        if Self::closed_under_effort() {
+            return ChcEngineResult::Unknown;
+        }
+        if !self.problem.has_array_sorts()
+            || self.problem.has_real_sorts()
+            || self.problem.has_datatype_sorts()
+        {
+            return ChcEngineResult::Unknown;
+        }
+        self.solve_committed_tree_refutation(
+            max_tree_depth,
+            budget,
+            node_cap,
+            TreeRefutationPolicy::BoundedGroundOnly,
+        )
+    }
+
+    fn solve_committed_tree_refutation(
+        &self,
+        max_tree_depth: usize,
+        budget: std::time::Duration,
+        node_cap: usize,
+        policy: TreeRefutationPolicy,
+    ) -> ChcEngineResult {
         let queries: Vec<_> = self.problem.queries().collect();
         let deadline = ay_core::time::Instant::now() + budget;
+        let _deadline_guard = crate::smt::ScopedSmtDeadline::install_until(deadline);
+        let _memory_guard =
+            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+        // Root decomposition cannot multiply the previous single-tree
+        // iterative search's cumulative expansion/selection allowance.
+        let attempts = max_tree_depth.checked_add(1).unwrap_or(0);
+        let mut nodes_left = node_cap.checked_mul(attempts).unwrap_or(0);
+        let mut selections_left = DT_BMC_MAX_COMMITTED.checked_mul(attempts).unwrap_or(0);
 
         for query in &queries {
             let body_preds = query.body.predicates.clone();
@@ -12635,268 +13622,381 @@ impl BmcSolver {
                 );
             }
 
-            let opts = TreeBuildOpts {
-                node_cap,
-                linear_only: false,
-                committed: None,
-            };
-            // Iterative deepening from depth 0: at depth 0 every node may fire
-            // only FACT clauses (no recursive unfolding), so a base-case-only
-            // ADT counterexample (e.g. drop_inj1's `drop nil 0 nil ∧ drop nil 1
-            // nil`) yields a SMALL, recursion-free formula — no free
-            // recursive-datatype variables from un-fired branches — that
-            // ay-dpll's datatype theory can actually decide. Deeper unfoldings
-            // (with the disjunctive recursive branches) are attempted only if
-            // the shallow ones are UNSAT.
-            let mut consec_unknown = 0usize;
-            // PERF (PERF-3 residue): iterative deepening re-derives many
-            // committed selections that are TEXTUALLY IDENTICAL to selections
-            // already decided UNSAT at a shallower depth (a selection firing
-            // its facts at level j is unchanged by growing the unfired tail —
-            // the committed indicators collapse it to the same conjunction).
-            // Skipping an exact re-run of a definitively-UNSAT formula is
-            // sound: UNSAT is budget-independent and deterministic. SAT and
-            // Unknown outcomes are never memoized (fail-open).
-            let mut unsat_selection_memo: FxHashSet<String> = FxHashSet::default();
-            for depth in 0..=max_tree_depth {
-                if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled() {
-                    return ChcEngineResult::Unknown;
-                }
-                let mut nodes: Vec<TreeNode> = Vec::new();
-                let mut fresh: usize = 0;
-                let mut global: Vec<ChcExpr> = Vec::new();
-                // Unfold EVERY body predicate of the query. ADT-LIA queries are
-                // typically multi-body hyperedges (e.g. drop∧drop∧drop∧diseq ⇒
-                // false); the shared, fresh-renamed query variables tie the
-                // sub-derivations together in ONE SAT solve, so a model assigns
-                // globally consistent constructor values across all premises.
-                let mut root_nodes: Vec<usize> = Vec::with_capacity(body_preds.len());
-                let mut derivables: Vec<ChcExpr> = Vec::with_capacity(body_preds.len());
-                let mut capped = false;
-                for (bp, bargs) in &body_preds {
-                    let inst: Vec<ChcExpr> = bargs
-                        .iter()
-                        .map(|a| a.substitute_name_map(&qsubst))
+            // Decompose a linear query's outer rule alternatives before
+            // expanding their disjoint trees. Otherwise every committed path
+            // repeatedly rewrites all inactive query arms. Search longer
+            // fact-reaching arms first, using the existing structural minimum
+            // derivation map; this is scheduling only, never proof evidence.
+            let root_choices = if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                if let [(root, _)] = body_preds.as_slice() {
+                    let minima = self.min_node_derivation();
+                    let mut choices: Vec<_> = self
+                        .problem
+                        .clauses_defining_with_index(*root)
+                        .take(DT_BMC_MAX_COMMITTED)
+                        .map(|(index, clause)| {
+                            let length = clause
+                                .body
+                                .predicates
+                                .iter()
+                                .filter_map(|(pred, _)| minima.get(pred).map(|(size, _)| *size))
+                                .fold(0usize, usize::saturating_add);
+                            (std::cmp::Reverse(length), index)
+                        })
                         .collect();
-                    match self.build_tree_node(
-                        *bp,
-                        &inst,
-                        depth,
-                        &opts,
-                        &mut nodes,
-                        &mut fresh,
-                        &mut global,
-                    ) {
-                        Some((nid, derivable)) => {
-                            root_nodes.push(nid);
-                            derivables.push(derivable);
+                    choices.sort_by_key(|&(length, index)| (length, index));
+                    choices
+                        .into_iter()
+                        .map(|(_, index)| Some((*root, index)))
+                        .collect()
+                } else {
+                    vec![None]
+                }
+            } else {
+                vec![None]
+            };
+            for root_choice in root_choices {
+                let mut opts = TreeBuildOpts {
+                    node_cap: if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                        node_cap.min(nodes_left)
+                    } else {
+                        node_cap
+                    },
+                    linear_only: false,
+                    committed: None,
+                    root_choice,
+                };
+                // Iterative deepening from depth 0: at depth 0 every node may fire
+                // only FACT clauses (no recursive unfolding), so a base-case-only
+                // ADT counterexample (e.g. drop_inj1's `drop nil 0 nil ∧ drop nil 1
+                // nil`) yields a SMALL, recursion-free formula — no free
+                // recursive-datatype variables from un-fired branches — that
+                // ay-dpll's datatype theory can actually decide. Deeper unfoldings
+                // (with the disjunctive recursive branches) are attempted only if
+                // the shallow ones are UNSAT.
+                let mut consec_unknown = 0usize;
+                // PERF (PERF-3 residue): iterative deepening re-derives many
+                // committed selections that are TEXTUALLY IDENTICAL to selections
+                // already decided UNSAT at a shallower depth (a selection firing
+                // its facts at level j is unchanged by growing the unfired tail —
+                // the committed indicators collapse it to the same conjunction).
+                // Skipping an exact re-run of a definitively-UNSAT formula is
+                // sound: UNSAT is budget-independent and deterministic. SAT and
+                // Unknown outcomes are never memoized (fail-open).
+                let mut unsat_selection_memo: FxHashSet<String> = FxHashSet::default();
+                let depths = (0..=max_tree_depth).map(|step| {
+                    if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                        // A tree at the existing bound includes every shorter
+                        // fact-ending derivation. Avoid re-solving all property
+                        // alternatives at each shallower depth before reaching a
+                        // loop exit. No depth/node/selection cap is increased.
+                        if step == 0 {
+                            max_tree_depth
+                        } else {
+                            step - 1
                         }
-                        None => {
-                            capped = true;
-                            break;
+                    } else {
+                        step
+                    }
+                });
+                for depth in depths {
+                    if policy == TreeRefutationPolicy::BoundedGroundOnly && nodes_left == 0 {
+                        return ChcEngineResult::Unknown;
+                    }
+                    if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                        opts.node_cap = node_cap.min(nodes_left);
+                    }
+                    if ay_core::time::Instant::now() >= deadline || self.config.base.is_cancelled()
+                    {
+                        return ChcEngineResult::Unknown;
+                    }
+                    let mut nodes: Vec<TreeNode> = Vec::new();
+                    let mut fresh: usize = 0;
+                    let mut global: Vec<ChcExpr> = Vec::new();
+                    // Unfold EVERY body predicate of the query. ADT-LIA queries are
+                    // typically multi-body hyperedges (e.g. drop∧drop∧drop∧diseq ⇒
+                    // false); the shared, fresh-renamed query variables tie the
+                    // sub-derivations together in ONE SAT solve, so a model assigns
+                    // globally consistent constructor values across all premises.
+                    let mut root_nodes: Vec<usize> = Vec::with_capacity(body_preds.len());
+                    let mut derivables: Vec<ChcExpr> = Vec::with_capacity(body_preds.len());
+                    let mut capped = false;
+                    for (bp, bargs) in &body_preds {
+                        let inst: Vec<ChcExpr> = bargs
+                            .iter()
+                            .map(|a| a.substitute_name_map(&qsubst))
+                            .collect();
+                        match self.build_tree_node(
+                            *bp,
+                            &inst,
+                            depth,
+                            &opts,
+                            &mut nodes,
+                            &mut fresh,
+                            &mut global,
+                        ) {
+                            Some((nid, derivable)) => {
+                                root_nodes.push(nid);
+                                derivables.push(derivable);
+                            }
+                            None => {
+                                capped = true;
+                                break;
+                            }
                         }
                     }
-                }
-                let trace = ay_core::misc_cli_flags().chc_dt_bmc_trace;
-                if capped {
-                    // Node cap hit; deeper unfoldings are only larger.
-                    if trace {
+                    let trace = ay_core::misc_cli_flags().chc_dt_bmc_trace;
+                    if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                        nodes_left = nodes_left.saturating_sub(nodes.len());
+                    }
+                    if capped {
+                        // Node cap hit; deeper unfoldings are only larger.
+                        if trace {
+                            safe_eprintln!(
+                                "[DT-BMC] depth={depth} node cap hit ({} nodes); stop deepening",
+                                nodes.len()
+                            );
+                        }
+                        if policy == TreeRefutationPolicy::BoundedGroundOnly
+                            && depth == max_tree_depth
+                            && max_tree_depth > 0
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    let mut root_conj = global;
+                    root_conj.extend(derivables);
+                    if let Some(c) = &query.body.constraint {
+                        root_conj.push(c.substitute_name_map(&qsubst));
+                    }
+                    // Flatten to top-level conjuncts once; the raw disjunctive set
+                    // is retained and specialized per committed selection below.
+                    let raw_conjuncts: Vec<ChcExpr> = root_conj
+                        .iter()
+                        .flat_map(ChcExpr::collect_conjuncts_nontrivial)
+                        .collect();
+
+                    let remaining =
+                        deadline.saturating_duration_since(ay_core::time::Instant::now());
+                    if remaining.is_zero() {
+                        return ChcEngineResult::Unknown;
+                    }
+                    // Bound each depth to a small slice and let iterative deepening
+                    // cover more depths rather than burn the whole budget at one.
+                    let depth_deadline =
+                        ay_core::time::Instant::now() + remaining.min(DT_BMC_PER_DEPTH_CAP);
+
+                    // Resolve the indicator-gated disjunction HERE: enumerate
+                    // committed clause selections (one clause per active node),
+                    // substitute each selection's indicators to collapse the formula
+                    // to a conjunction, and ELIMINATE the intermediate node-arg vars
+                    // (the equality-defined variables — inlined at their uses, with
+                    // the substitution recovered into the SAT model for witness
+                    // reconstruction). This remains a completeness fallback for raw
+                    // disjunctions the executor cannot decide and makes the fired
+                    // clause per node explicit even when it can. Bounded by
+                    // DT_BMC_MAX_COMMITTED; SOUND regardless — every candidate is
+                    // replayed against the ORIGINAL clauses by the gate.
+                    let selections = Self::enumerate_committed_selections(
+                        &root_nodes,
+                        &nodes,
+                        DT_BMC_MAX_COMMITTED,
+                    );
+                    let all_indicators: Vec<String> = nodes
+                        .iter()
+                        .flat_map(|n| n.choices.iter().map(|c| c.indicator.clone()))
+                        .collect();
+                    if trace
+                        || (policy == TreeRefutationPolicy::BoundedGroundOnly
+                            && self.config.base.verbose)
+                    {
                         safe_eprintln!(
-                            "[DT-BMC] depth={depth} node cap hit ({} nodes); stop deepening",
-                            nodes.len()
-                        );
-                    }
-                    break;
-                }
-                let mut root_conj = global;
-                root_conj.extend(derivables);
-                if let Some(c) = &query.body.constraint {
-                    root_conj.push(c.substitute_name_map(&qsubst));
-                }
-                // Flatten to top-level conjuncts once; the raw disjunctive set
-                // is retained and specialized per committed selection below.
-                let raw_conjuncts: Vec<ChcExpr> = root_conj
-                    .iter()
-                    .flat_map(ChcExpr::collect_conjuncts_nontrivial)
-                    .collect();
-
-                let remaining = deadline.saturating_duration_since(ay_core::time::Instant::now());
-                if remaining.is_zero() {
-                    return ChcEngineResult::Unknown;
-                }
-                // Bound each depth to a small slice and let iterative deepening
-                // cover more depths rather than burn the whole budget at one.
-                let depth_deadline =
-                    ay_core::time::Instant::now() + remaining.min(DT_BMC_PER_DEPTH_CAP);
-
-                // Resolve the indicator-gated disjunction HERE: enumerate
-                // committed clause selections (one clause per active node),
-                // substitute each selection's indicators to collapse the formula
-                // to a conjunction, and ELIMINATE the intermediate node-arg vars
-                // (the equality-defined variables — inlined at their uses, with
-                // the substitution recovered into the SAT model for witness
-                // reconstruction). This remains a completeness fallback for raw
-                // disjunctions the executor cannot decide and makes the fired
-                // clause per node explicit even when it can. Bounded by
-                // DT_BMC_MAX_COMMITTED; SOUND regardless — every candidate is
-                // replayed against the ORIGINAL clauses by the gate.
-                let selections =
-                    Self::enumerate_committed_selections(&root_nodes, &nodes, DT_BMC_MAX_COMMITTED);
-                let all_indicators: Vec<String> = nodes
-                    .iter()
-                    .flat_map(|n| n.choices.iter().map(|c| c.indicator.clone()))
-                    .collect();
-                if trace {
-                    safe_eprintln!(
                         "[DT-BMC] depth={depth} nodes={} bodies={} raw_conj={} committed_selections={}",
                         nodes.len(),
                         body_preds.len(),
                         raw_conjuncts.len(),
                         selections.len(),
                     );
-                }
-                let mut any_decided = false;
-                for sel in &selections {
-                    if ay_core::time::Instant::now() >= depth_deadline
-                        || self.config.base.is_cancelled()
-                    {
-                        break;
                     }
-                    // Collapse the disjunction to this selection's conjunction.
-                    let ind_map: FxHashMap<String, ChcExpr> = all_indicators
-                        .iter()
-                        .map(|n| (n.clone(), ChcExpr::Bool(sel.contains(n))))
-                        .collect();
-                    let committed_flat: Vec<ChcExpr> = raw_conjuncts
-                        .iter()
-                        .flat_map(|c| {
-                            Self::simplify_bmc_expr(c.substitute_name_map(&ind_map))
-                                .collect_conjuncts_nontrivial()
-                        })
-                        .collect();
-                    // Inconsistent selection (some constraint simplified to
-                    // false): skip without a solver call. Counts as "decided".
-                    if committed_flat
-                        .iter()
-                        .any(|c| matches!(c, ChcExpr::Bool(false)))
-                    {
-                        any_decided = true;
-                        continue;
-                    }
-                    // Eliminate the intermediate equality-defined node-arg vars
-                    // (fail-closed; see `eliminate_dt_bmc_intermediate_defs`).
-                    let (committed, elim_vars) = if Self::dt_bmc_elim_enabled() {
-                        Self::eliminate_dt_bmc_intermediate_defs(&committed_flat)
-                    } else {
-                        (ChcExpr::and_all(committed_flat.clone()), Vec::new())
-                    };
-                    let per_check = depth_deadline
-                        .saturating_duration_since(ay_core::time::Instant::now())
-                        .min(DT_BMC_PER_COMMIT_CAP);
-                    if per_check.is_zero() {
-                        break;
-                    }
-                    // Canonical-text memo hit: this committed conjunction was
-                    // already decided UNSAT at a shallower depth. The key
-                    // strips reflexive `(= x x)` residue conjuncts (left by
-                    // unfired branches of the deeper tree) — dropping a
-                    // tautology never changes sat/unsat, so two selections
-                    // with equal keys are equisatisfiable.
-                    let committed_key = committed
-                        .collect_conjuncts_nontrivial()
-                        .iter()
-                        .filter(|c| {
-                            !matches!(
-                                c,
-                                ChcExpr::Op(ChcOp::Eq, args)
-                                    if args.len() == 2 && args[0] == args[1]
-                            )
-                        })
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if unsat_selection_memo.contains(&committed_key) {
-                        any_decided = true;
-                        continue;
-                    }
-                    // Ground definitional fold (PERF-3 residue): committed
-                    // selections whose variables chain-resolve to GROUND
-                    // constructor terms often fold to a literal `false`
-                    // (e.g. `t = leaf 42 ∧ val(t) < 0`); deciding that here
-                    // skips a full fresh-Executor SMT solve. Fail-open: any
-                    // non-`false` fold falls through to the solver unchanged.
-                    if Self::dt_bmc_ground_fold_is_false(&committed) {
-                        any_decided = true;
-                        unsat_selection_memo.insert(committed_key);
-                        continue;
-                    }
-                    let mut smt = self.problem.make_smt_context();
-                    // Force the datatype-capable executor first: the native
-                    // DPLL(T) slice has no ADT decision procedure.
-                    smt.set_executor_first_check_sat(true);
-                    let model = match smt.check_sat_with_timeout(&committed, per_check) {
-                        SmtResult::Sat(model) => {
-                            any_decided = true;
-                            model
+                    let mut any_decided = false;
+                    for (selection_index, sel) in selections.iter().enumerate() {
+                        if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                            if selections_left == 0 {
+                                return ChcEngineResult::Unknown;
+                            }
+                            selections_left -= 1;
                         }
-                        // Executor could not decide this committed conjunction
-                        // (rare — a pure conjunction): try the next selection.
-                        SmtResult::Unknown => continue,
-                        // UNSAT: this committed selection has no counterexample.
-                        _ => {
+                        if ay_core::time::Instant::now() >= depth_deadline
+                            || self.config.base.is_cancelled()
+                        {
+                            break;
+                        }
+                        // Collapse the disjunction to this selection's conjunction.
+                        let ind_map: FxHashMap<String, ChcExpr> = all_indicators
+                            .iter()
+                            .map(|n| (n.clone(), ChcExpr::Bool(sel.contains(n))))
+                            .collect();
+                        let committed_flat: Vec<ChcExpr> = raw_conjuncts
+                            .iter()
+                            .flat_map(|c| {
+                                Self::simplify_bmc_expr(c.substitute_name_map(&ind_map))
+                                    .collect_conjuncts_nontrivial()
+                            })
+                            .collect();
+                        // Inconsistent selection (some constraint simplified to
+                        // false): skip without a solver call. Counts as "decided".
+                        if committed_flat
+                            .iter()
+                            .any(|c| matches!(c, ChcExpr::Bool(false)))
+                        {
+                            any_decided = true;
+                            continue;
+                        }
+                        // Eliminate the intermediate equality-defined node-arg vars
+                        // (fail-closed; see `eliminate_dt_bmc_intermediate_defs`).
+                        let (committed, elim_vars) = if Self::dt_bmc_elim_enabled() {
+                            Self::eliminate_dt_bmc_intermediate_defs(&committed_flat)
+                        } else {
+                            (ChcExpr::and_all(committed_flat.clone()), Vec::new())
+                        };
+                        let check_remaining =
+                            depth_deadline.saturating_duration_since(ay_core::time::Instant::now());
+                        let per_check = if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                            // Fairly retain time for every still-pending finite
+                            // rule selection. One unresolved safety alternative
+                            // must not consume the complete refutation slice.
+                            check_remaining / (selections.len() - selection_index) as u32
+                        } else {
+                            check_remaining
+                        }
+                        .min(DT_BMC_PER_COMMIT_CAP);
+                        if per_check.is_zero() {
+                            break;
+                        }
+                        // Canonical-text memo hit: this committed conjunction was
+                        // already decided UNSAT at a shallower depth. The key
+                        // strips reflexive `(= x x)` residue conjuncts (left by
+                        // unfired branches of the deeper tree) — dropping a
+                        // tautology never changes sat/unsat, so two selections
+                        // with equal keys are equisatisfiable.
+                        let committed_key = committed
+                            .collect_conjuncts_nontrivial()
+                            .iter()
+                            .filter(|c| {
+                                !matches!(
+                                    c,
+                                    ChcExpr::Op(ChcOp::Eq, args)
+                                        if args.len() == 2 && args[0] == args[1]
+                                )
+                            })
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if unsat_selection_memo.contains(&committed_key) {
+                            any_decided = true;
+                            continue;
+                        }
+                        // Ground definitional fold (PERF-3 residue): committed
+                        // selections whose variables chain-resolve to GROUND
+                        // constructor terms often fold to a literal `false`
+                        // (e.g. `t = leaf 42 ∧ val(t) < 0`); deciding that here
+                        // skips a full fresh-Executor SMT solve. Fail-open: any
+                        // non-`false` fold falls through to the solver unchanged.
+                        if Self::dt_bmc_ground_fold_is_false(&committed) {
                             any_decided = true;
                             unsat_selection_memo.insert(committed_key);
                             continue;
                         }
-                    };
-                    // Reconstruct the eliminated node-arg vars from the retained
-                    // linking equalities so the witness carries the intermediate
-                    // datatype values, and inject the selection's indicator truth
-                    // values so the shared `tree_reconstruct` (which reads the
-                    // fired indicator per node) recovers this committed
-                    // derivation. A missing/defaulted value can only make the
-                    // witness fail replay (⇒ Unknown), never a wrong answer.
-                    let mut fullmodel = if elim_vars.is_empty() {
-                        model
-                    } else {
-                        Self::extend_model_via_branch_equalities(
-                            &committed_flat,
-                            &elim_vars,
-                            &model,
-                        )
-                    };
-                    for n in &all_indicators {
-                        fullmodel.insert(n.clone(), SmtValue::Bool(sel.contains(n)));
-                    }
-                    if let Some(cex) = self.dt_reconstruct_and_replay(
-                        &root_nodes,
-                        &nodes,
-                        &fullmodel,
-                        query,
-                        depth,
-                        trace,
-                    ) {
-                        return ChcEngineResult::Unsafe(cex);
-                    }
-                    // SAT but spurious/unreconstructable: try the next selection.
-                }
-                // Deepen unless the executor could not decide ANY committed
-                // conjunction across several successive depths (then bail to
-                // free budget for the safety routes). A depth with no committed
-                // selections (no derivation) or at least one decided check is
-                // progress, not an executor failure.
-                if selections.is_empty() || any_decided {
-                    consec_unknown = 0;
-                } else {
-                    consec_unknown += 1;
-                    if consec_unknown >= DT_BMC_MAX_CONSEC_UNKNOWN {
-                        if trace {
-                            safe_eprintln!(
-                                "[DT-BMC] {consec_unknown} consecutive undecidable depths; \
-                                 bailing lane (executor cannot decide these ADT conjunctions)"
-                            );
+                        let mut smt = self.make_smt_context();
+                        // Force the datatype-capable executor first: the native
+                        // DPLL(T) slice has no ADT decision procedure.
+                        smt.set_executor_first_check_sat(true);
+                        let check_started = ay_core::time::Instant::now();
+                        let checked = smt.check_sat_with_timeout(&committed, per_check);
+                        if policy == TreeRefutationPolicy::BoundedGroundOnly
+                            && self.config.base.verbose
+                        {
+                            safe_eprintln!("BMC: committed array depth={depth} selection={}/{} check={:?} slice={:.3}s elapsed={:.3}s",
+                            selection_index + 1, selections.len(), match &checked {
+                                SmtResult::Sat(_) => "sat",
+                                SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => "unsat",
+                                SmtResult::Unknown => "unknown",
+                            }, per_check.as_secs_f64(), check_started.elapsed().as_secs_f64());
                         }
+                        let model = match checked {
+                            SmtResult::Sat(model) => {
+                                any_decided = true;
+                                model
+                            }
+                            // Executor could not decide this committed conjunction
+                            // (rare — a pure conjunction): try the next selection.
+                            SmtResult::Unknown => continue,
+                            // UNSAT: this committed selection has no counterexample.
+                            _ => {
+                                any_decided = true;
+                                unsat_selection_memo.insert(committed_key);
+                                continue;
+                            }
+                        };
+                        // Reconstruct the eliminated node-arg vars from the retained
+                        // linking equalities so the witness carries the intermediate
+                        // datatype values, and inject the selection's indicator truth
+                        // values so the shared `tree_reconstruct` (which reads the
+                        // fired indicator per node) recovers this committed
+                        // derivation. A missing/defaulted value can only make the
+                        // witness fail replay (⇒ Unknown), never a wrong answer.
+                        let mut fullmodel = if elim_vars.is_empty() {
+                            model
+                        } else {
+                            Self::extend_model_via_branch_equalities(
+                                &committed_flat,
+                                &elim_vars,
+                                &model,
+                            )
+                        };
+                        for n in &all_indicators {
+                            fullmodel.insert(n.clone(), SmtValue::Bool(sel.contains(n)));
+                        }
+                        if let Some(cex) = self.dt_reconstruct_and_replay(
+                            &root_nodes,
+                            &nodes,
+                            &fullmodel,
+                            query,
+                            depth,
+                            trace,
+                            policy,
+                        ) {
+                            return ChcEngineResult::Unsafe(cex);
+                        }
+                        // SAT but spurious/unreconstructable: try the next selection.
+                    }
+                    // Deepen unless the executor could not decide ANY committed
+                    // conjunction across several successive depths (then bail to
+                    // free budget for the safety routes). A depth with no committed
+                    // selections (no derivation) or at least one decided check is
+                    // progress, not an executor failure.
+                    if policy == TreeRefutationPolicy::BoundedGroundOnly && depth == max_tree_depth
+                    {
+                        // The full admitted bound already includes shorter
+                        // derivations. Move to the next query arm instead of
+                        // repeating them. A capped bound took the earlier
+                        // smaller-tree fallback before reaching this point.
                         break;
+                    }
+                    if selections.is_empty() || any_decided {
+                        consec_unknown = 0;
+                    } else {
+                        consec_unknown += 1;
+                        if consec_unknown >= DT_BMC_MAX_CONSEC_UNKNOWN {
+                            if trace {
+                                safe_eprintln!(
+                                    "[DT-BMC] {consec_unknown} consecutive undecidable depths; \
+                                 bailing lane (executor cannot decide these ADT conjunctions)"
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -13071,6 +14171,16 @@ impl BmcSolver {
         let simplified: Vec<ChcExpr> = raw_conjuncts
             .iter()
             .map(|c| c.substitute_name_map(&subst))
+            // Unfired nodes leave only their incoming linking definition.
+            // Substitution turns it into (= t t). Keeping those tautologies
+            // exposes unused array variables to model completion and can also
+            // disable the bounded ground-false fold by inflating its input.
+            // Conflicting active definitions remain above (poisoned), and
+            // every non-reflexive equality remains a solver obligation.
+            .filter(|c| {
+                !matches!(c, ChcExpr::Op(ChcOp::Eq, args)
+                if args.len() == 2 && args[0] == args[1])
+            })
             .collect();
         (
             ChcExpr::and_all(simplified),
@@ -13173,6 +14283,7 @@ impl BmcSolver {
         query: &HornClause,
         depth: usize,
         trace: bool,
+        policy: TreeRefutationPolicy,
     ) -> Option<Counterexample> {
         let mut entries: Vec<DerivationWitnessEntry> = Vec::new();
         let mut premise_roots: Vec<usize> = Vec::with_capacity(roots.len());
@@ -13203,8 +14314,13 @@ impl BmcSolver {
         let replay = self.tree_verified_unsafe(
             level_witness,
             model,
-            "datatype committed refutation",
+            if policy == TreeRefutationPolicy::BoundedGroundOnly {
+                "array committed refutation"
+            } else {
+                "datatype committed refutation"
+            },
             "__dt_q_",
+            policy,
         );
         if trace {
             safe_eprintln!(
@@ -13244,6 +14360,7 @@ impl BmcSolver {
             node_cap: 6000,
             linear_only: false,
             committed: None,
+            root_choice: None,
         };
         let mut nodes: Vec<TreeNode> = Vec::new();
         let mut fresh: usize = 0;
@@ -13365,6 +14482,7 @@ impl BmcSolver {
             node_cap: TREE_REFUTATION_NODE_CAP,
             linear_only: true,
             committed: Some(&committed),
+            root_choice: None,
         };
 
         let queries: Vec<_> = self.problem.queries().collect();
@@ -13427,7 +14545,7 @@ impl BmcSolver {
             if remaining.is_zero() {
                 return ChcEngineResult::Unknown;
             }
-            let mut smt = self.problem.make_smt_context();
+            let mut smt = self.make_smt_context();
             let model = match smt.check_sat_with_timeout(&formula, remaining) {
                 SmtResult::Sat(model) => model,
                 _ => continue,
@@ -13464,7 +14582,7 @@ impl BmcSolver {
         fresh: &mut usize,
         global: &mut Vec<ChcExpr>,
     ) -> Option<(usize, ChcExpr)> {
-        if nodes.len() >= opts.node_cap {
+        if nodes.len() >= opts.node_cap || self.config.base.is_cancelled() {
             return None;
         }
         let arg_sorts = self.problem.get_predicate(pred)?.arg_sorts.clone();
@@ -13500,6 +14618,16 @@ impl BmcSolver {
         let mut indicators: Vec<ChcExpr> = Vec::new();
         let mut choices: Vec<TreeChoice> = Vec::new();
         for (clause_idx, clause) in &clauses {
+            if self.config.base.is_cancelled() {
+                return None;
+            }
+            if node_id == 0
+                && opts
+                    .root_choice
+                    .is_some_and(|(root, selected)| root == pred && selected != *clause_idx)
+            {
+                continue;
+            }
             if depth == 0 && !clause.body.predicates.is_empty() {
                 continue;
             }
@@ -13688,6 +14816,9 @@ impl BmcSolver {
         Some(entry_idx)
     }
 }
+
+#[cfg(test)]
+mod cone_coverage;
 
 #[cfg(test)]
 mod tests;

@@ -16,6 +16,14 @@ use num_rational::BigRational;
 
 use crate::executor::BoundRefinementReplayKey;
 
+// #lra-scope-trail: the BCP-batching scope window against the real LRA.
+#[path = "tests_lra_scope_trail.rs"]
+mod lra_scope_trail;
+
+// LIA lazy propagations at the root: the proof-tracking Level0Explained branch.
+#[path = "tests_level0_lazy.rs"]
+mod level0_lazy;
+
 /// Mock theory solver for testing TheoryExtension
 struct MockTheory {
     assertions: Vec<(TermId, bool)>,
@@ -974,12 +982,15 @@ fn propagate_returns_none_when_no_propagations() {
 
 #[test]
 fn propagate_returns_conflict_on_theory_unsat() {
-    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, _xyz) =
-        create_test_setup();
-    let x = _xyz[0];
-    let y = _xyz[1];
-
-    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(y, false)];
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, _, eqs) =
+        create_euf_test_setup();
+    let [eq_ab, eq_bc, eq_ac] = eqs;
+    // A genuinely inconsistent theory assignment: a=b, b=c, and a!=c.
+    let conflict = vec![
+        TheoryLit::new(eq_ab, true),
+        TheoryLit::new(eq_bc, true),
+        TheoryLit::new(eq_ac, false),
+    ];
     let mut theory = MockTheory::new().with_check_result(TheoryResult::Unsat(conflict));
     let mut ext = TheoryExtension::new(
         &mut theory,
@@ -990,11 +1001,22 @@ fn propagate_returns_conflict_on_theory_unsat() {
         Some(&terms),
         None,
     );
-
-    let ctx = MockContext::new();
+    let ctx = MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+        Literal::negative(Variable::new(3)),
+    ]);
     let result = ext.propagate(&ctx);
-
-    assert!(result.conflict.is_some());
+    assert!(ext.take_pending_split().is_none());
+    assert!(result.clauses.is_empty());
+    assert_eq!(
+        result.conflict,
+        Some(vec![
+            Literal::negative(Variable::new(1)),
+            Literal::negative(Variable::new(2)),
+            Literal::positive(Variable::new(3)),
+        ])
+    );
 }
 
 #[test]
@@ -1110,11 +1132,13 @@ fn check_returns_sat_when_theory_sat() {
 
 #[test]
 fn check_returns_conflict_when_theory_unsat() {
-    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, _xyz) =
-        create_test_setup();
-    let x = _xyz[0];
-
-    let conflict = vec![TheoryLit::new(x, true)];
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [ab, bc, ac]) =
+        create_euf_transitivity_setup();
+    let conflict = vec![
+        TheoryLit::new(ab, true),
+        TheoryLit::new(bc, true),
+        TheoryLit::new(ac, false),
+    ];
     let mut theory = MockTheory::new().with_check_result(TheoryResult::Unsat(conflict));
     let mut ext = TheoryExtension::new(
         &mut theory,
@@ -1126,12 +1150,16 @@ fn check_returns_conflict_when_theory_unsat() {
         None,
     );
 
-    let ctx = MockContext::new();
+    let ctx = MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+        Literal::negative(Variable::new(3)),
+    ]);
     let result = ext.check(&ctx);
 
     match result {
         ExtCheckResult::Conflict(clause) => {
-            assert_eq!(clause.len(), 1);
+            assert_eq!(clause.len(), 3);
         }
         _ => panic!("Expected Conflict, got {result:?}"),
     }
@@ -1561,32 +1589,47 @@ fn propagate_euf_semantic_check_accepts_valid_conflict() {
     let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, _, eqs) =
         create_euf_test_setup();
     let [eq_ab, eq_bc, eq_ac] = eqs;
-
-    // Transitivity conflict: a=b ∧ b=c ∧ ¬(a=c) is UNSAT
     let conflict = vec![
         TheoryLit::new(eq_ab, true),
         TheoryLit::new(eq_bc, true),
         TheoryLit::new(eq_ac, false),
     ];
-    let mut theory = EufMockTheory::new().with_check_result(TheoryResult::Unsat(conflict));
-    let mut ext = TheoryExtension::new(
-        &mut theory,
-        &var_to_term,
-        &term_to_var,
-        &theory_atoms,
-        &theory_atom_set,
-        Some(&terms),
-        None,
-    );
-
-    let ctx = MockContext::new();
-    let result = ext.propagate(&ctx);
-
-    // Should produce a conflict (not be skipped by verification)
-    assert!(
-        result.conflict.is_some(),
-        "valid EUF conflict should pass semantic check and produce conflict"
-    );
+    let run = |ctx: &MockContext| {
+        // Each call has fresh theory/extension state. Semantic validity alone
+        // does not say whether the SAT context has assigned the causes.
+        let mut theory =
+            EufMockTheory::new().with_check_result(TheoryResult::Unsat(conflict.clone()));
+        let mut ext = TheoryExtension::new(
+            &mut theory,
+            &var_to_term,
+            &term_to_var,
+            &theory_atoms,
+            &theory_atom_set,
+            Some(&terms),
+            None,
+        );
+        let result = ext.propagate(ctx);
+        assert!(
+            ext.take_pending_split().is_none(),
+            "a semantic rejection must not stand in for either delivery path"
+        );
+        result
+    };
+    let expected = vec![
+        Literal::negative(Variable::new(1)),
+        Literal::negative(Variable::new(2)),
+        Literal::positive(Variable::new(3)),
+    ];
+    let unassigned = run(&MockContext::new());
+    assert!(unassigned.conflict.is_none());
+    assert_eq!(unassigned.clauses, vec![expected.clone()]);
+    let assigned = run(&MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+        Literal::negative(Variable::new(3)),
+    ]));
+    assert!(assigned.clauses.is_empty());
+    assert_eq!(assigned.conflict, Some(expected));
 }
 
 /// Invalid EUF conflict (a=b, ¬(a=c)) fails closed to Unknown.
@@ -1644,7 +1687,11 @@ fn check_euf_semantic_check_accepts_valid_conflict() {
         None,
     );
 
-    let ctx = MockContext::new();
+    let ctx = MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+        Literal::negative(Variable::new(3)),
+    ]);
     let result = ext.check(&ctx);
 
     assert!(
@@ -1682,6 +1729,117 @@ fn check_euf_semantic_check_rejects_invalid_conflict() {
     assert!(
         matches!(result, ExtCheckResult::Unknown),
         "check() should reject the spurious conflict and degrade to Unknown, not learn a wrong-UNSAT clause"
+    );
+}
+
+/// Pure-EUF setup over an uninterpreted sort, so a conflict over these atoms
+/// classifies as the EUF domain: `(= a b)` and `(= a c)` on SAT vars 1 and 2.
+#[cfg(test)]
+fn create_uninterpreted_euf_setup() -> (
+    TermStore,
+    HashMap<u32, TermId>,
+    HashMap<TermId, u32>,
+    Vec<TermId>,
+    HashSet<TermId>,
+    [TermId; 2],
+) {
+    let mut terms = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = terms.mk_var("a", u.clone());
+    let b = terms.mk_var("b", u.clone());
+    let c = terms.mk_var("c", u);
+    let eq_ab = terms.mk_eq(a, b);
+    let eq_ac = terms.mk_eq(a, c);
+    let var_to_term: HashMap<u32, TermId> = [(1, eq_ab), (2, eq_ac)].into_iter().collect();
+    let term_to_var: HashMap<TermId, u32> = [(eq_ab, 1), (eq_ac, 2)].into_iter().collect();
+    let mut theory_atoms = vec![eq_ab, eq_ac];
+    theory_atoms.sort_unstable_by_key(|term| term.0);
+    let theory_atom_set: HashSet<TermId> = theory_atoms.iter().copied().collect();
+    (
+        terms,
+        var_to_term,
+        term_to_var,
+        theory_atoms,
+        theory_atom_set,
+        [eq_ab, eq_ac],
+    )
+}
+
+/// A conflict the direct EUF re-check REJECTS is memoized as a rejection.
+///
+/// `{a = b, a != c}` over an uninterpreted sort is satisfiable, so the mock
+/// "conflict" is spurious and the direct EUF re-check refuses it. The
+/// semantic dispatcher that runs next used to be told the EUF re-check had
+/// already run and passed (it only knew that it had RUN), skipped the EUF
+/// domain, and the per-query memo recorded the conflict as ACCEPTED -- the
+/// memo the checked-sat-refutation lane reads as premise authority, and that
+/// a later identical conflict hits when the sampled EUF re-check is skipped.
+#[test]
+fn check_memoizes_an_euf_rejected_conflict_as_rejected() {
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, eqs) =
+        create_uninterpreted_euf_setup();
+    let [eq_ab, eq_ac] = eqs;
+    let conflict = vec![TheoryLit::new(eq_ab, true), TheoryLit::new(eq_ac, false)];
+    let mut memo = crate::verification::ConflictSemanticVerifyMemo::default();
+    let mut theory = EufMockTheory::new().with_check_result(TheoryResult::Unsat(conflict));
+    {
+        let mut ext = TheoryExtension::new(
+            &mut theory,
+            &var_to_term,
+            &term_to_var,
+            &theory_atoms,
+            &theory_atom_set,
+            Some(&terms),
+            None,
+        )
+        .with_verify_memo(&mut memo);
+        let ctx = MockContext::new();
+        assert!(
+            matches!(ext.check(&ctx), ExtCheckResult::Unknown),
+            "the spurious conflict must degrade check() to Unknown"
+        );
+    }
+    assert_eq!(memo.len(), 1, "{memo:?}");
+    assert!(
+        memo.values()
+            .all(|verdict| *verdict == crate::verification::ConflictSemanticVerdict::Rejected),
+        "an EUF-rejected conflict was memoized as an acceptance: {memo:?}"
+    );
+}
+
+/// The eager `propagate()` conflict path memoizes an EUF rejection the same
+/// way (see `check_memoizes_an_euf_rejected_conflict_as_rejected`).
+#[test]
+fn propagate_memoizes_an_euf_rejected_conflict_as_rejected() {
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, eqs) =
+        create_uninterpreted_euf_setup();
+    let [eq_ab, eq_ac] = eqs;
+    let conflict = vec![TheoryLit::new(eq_ab, true), TheoryLit::new(eq_ac, false)];
+    let mut memo = crate::verification::ConflictSemanticVerifyMemo::default();
+    let mut theory = EufMockTheory::new().with_check_result(TheoryResult::Unsat(conflict));
+    {
+        let mut ext = TheoryExtension::new(
+            &mut theory,
+            &var_to_term,
+            &term_to_var,
+            &theory_atoms,
+            &theory_atom_set,
+            Some(&terms),
+            None,
+        )
+        .with_verify_memo(&mut memo);
+        let ctx = MockContext::new();
+        let result = ext.propagate(&ctx);
+        assert!(
+            result.conflict.is_none(),
+            "the spurious conflict must not be emitted"
+        );
+    }
+    assert_eq!(memo.len(), 1, "{memo:?}");
+    assert!(
+        memo.values()
+            .all(|verdict| *verdict == crate::verification::ConflictSemanticVerdict::Rejected),
+        "an EUF-rejected conflict was memoized as an acceptance: {memo:?}"
     );
 }
 
@@ -1768,7 +1926,10 @@ fn check_unsat_arm_learns_infeasible_arithmetic_conflict() {
         None,
     );
 
-    let ctx = MockContext::new();
+    let ctx = MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+    ]);
     assert!(
         matches!(ext.check(&ctx), ExtCheckResult::Conflict(_)),
         "semantically verified conflict must still be learned as a Conflict"
@@ -1825,7 +1986,10 @@ fn check_farkas_arm_learns_infeasible_conflict_without_certificate() {
         None,
     );
 
-    let ctx = MockContext::new();
+    let ctx = MockContext::new().with_trail(vec![
+        Literal::positive(Variable::new(1)),
+        Literal::positive(Variable::new(2)),
+    ]);
     assert!(
         matches!(ext.check(&ctx), ExtCheckResult::Conflict(_)),
         "valid certificate-less Farkas conflict must pass the semantic backstop and be learned"
@@ -2942,3 +3106,149 @@ fn mint_var_for_term_allocates_above_solver_var_space_and_is_stable() {
     assert_eq!(ext.mint_var_for_term(x, &ctx), Some(x_var));
     assert!(ext.var_for_term(y).is_some());
 }
+
+/// #6846 BCP parity: a BCP theory conflict naming an unencoded term
+/// must, with minting enabled, be completed by minting that term and
+/// delivered as a LEMMA clause (the minted variable is unassigned, so
+/// the clause is not falsified and cannot drive conflict analysis) —
+/// not truncated (partial-clause count must not move). With minting
+/// disabled the historical fail-closed behavior stands: no clause,
+/// partial count bumped. Farkas-origin conflicts never mint.
+#[test]
+fn bcp_conflict_with_unmapped_term_mints_to_lemma() {
+    use super::propagate::conflict::{ConflictOrigin, MappedConflict};
+    use ay_core::TheoryLit;
+
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, _y, _z]) =
+        create_test_setup();
+    let mut theory = MockTheory::new();
+    let mut ext = TheoryExtension::new(
+        &mut theory,
+        &var_to_term,
+        &term_to_var,
+        &theory_atoms,
+        &theory_atom_set,
+        Some(&terms),
+        None,
+    );
+    let unencoded = TermId(9_999);
+    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(unencoded, true)];
+    let mut ctx =
+        MockContext::new().with_trail(vec![Literal::positive(Variable::new(term_to_var[&x]))]);
+    ctx.num_vars = 40;
+
+    // Minting disabled: fail closed exactly as before.
+    let partials_before = ext.partial_clause_count;
+    assert!(
+        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, false)
+            .is_none(),
+        "minting disabled must keep the partial-clause refusal"
+    );
+    assert_eq!(ext.partial_clause_count, partials_before + 1);
+
+    // Minting enabled: complete clause delivered as a lemma, no
+    // partial counted, minted literal negated above the var space.
+    let partials_before = ext.partial_clause_count;
+    let Some(MappedConflict::Lemma(clause)) =
+        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+    else {
+        panic!("minting must complete the clause as a lemma");
+    };
+    assert_eq!(clause.len(), 2);
+    assert_eq!(ext.partial_clause_count, partials_before);
+    let minted_lit = clause[1];
+    assert!(minted_lit.variable().id() >= 40);
+    assert!(!minted_lit.is_positive(), "conflict literals negate");
+
+    // Mapped causes actually assigned true stay on the falsified/conflict path.
+    let mapped_conflict = vec![TheoryLit::new(x, true)];
+    assert!(matches!(
+        ext.map_conflict_clause_minting(&mapped_conflict, ConflictOrigin::Plain, &ctx, true),
+        Some(MappedConflict::Falsified(_))
+    ));
+
+    // Farkas origin never mints (coefficient alignment/proof path
+    // unchanged): still refuses partials. A FRESH unencoded term is
+    // required here — the Plain call above permanently mapped the
+    // first one, after which any origin maps it directly.
+    let farkas_conflict = vec![TheoryLit::new(x, true), TheoryLit::new(TermId(9_997), true)];
+    let partials_before = ext.partial_clause_count;
+    assert!(
+        ext.map_conflict_clause_minting(&farkas_conflict, ConflictOrigin::Farkas, &ctx, true)
+            .is_none(),
+        "Farkas conflicts must not mint"
+    );
+    assert_eq!(ext.partial_clause_count, partials_before + 1);
+}
+
+/// Mapped variables can remain unassigned after minting or backtracking.
+/// Only the current SAT assignment can classify a complete clause as a conflict.
+#[test]
+fn repeated_minted_conflict_is_a_lemma_until_falsified() {
+    use super::propagate::conflict::{ConflictOrigin, MappedConflict};
+
+    let (mut terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, _y, _z]) =
+        create_test_setup();
+    let unencoded = terms.mk_var("bcp_repeated_unencoded", Sort::Bool);
+    let x_var = Variable::new(term_to_var[&x]);
+    let mut theory = MockTheory::new();
+    let mut ext = TheoryExtension::new(
+        &mut theory,
+        &var_to_term,
+        &term_to_var,
+        &theory_atoms,
+        &theory_atom_set,
+        Some(&terms),
+        None,
+    );
+    let mut ctx = MockContext::new().with_trail(vec![Literal::positive(x_var)]);
+    ctx.num_vars = 40;
+    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(unencoded, false)];
+
+    let Some(MappedConflict::Lemma(first)) =
+        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+    else {
+        panic!("the first newly minted literal is unassigned");
+    };
+    let minted = first[1].variable();
+    assert!(minted.id() >= 40);
+    assert!(first[1].is_positive(), "both literal polarities matter");
+    assert_eq!(ctx.value(minted), None);
+    let minted_count = ext.minted_var_count;
+    for mint_enabled in [true, false] {
+        let Some(MappedConflict::Lemma(repeated)) =
+            ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, mint_enabled)
+        else {
+            panic!("reusing a minted mapping must not invent an assignment");
+        };
+        assert_eq!(repeated, first);
+        assert_eq!(ext.minted_var_count, minted_count);
+    }
+
+    // The native solver has now grown to include the variable and assigned
+    // both causes. Exactly this assignment makes the whole clause false.
+    ctx.num_vars = minted.index() + 1;
+    ctx.replace_trail(vec![Literal::positive(x_var), Literal::negative(minted)]);
+    let Some(MappedConflict::Falsified(falsified)) =
+        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+    else {
+        panic!("every literal is now false under the actual assignment");
+    };
+    assert_eq!(falsified, first);
+
+    for trail in [
+        vec![Literal::positive(x_var), Literal::positive(minted)],
+        vec![Literal::positive(x_var)],
+    ] {
+        ctx.replace_trail(trail);
+        let Some(MappedConflict::Lemma(clause)) =
+            ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+        else {
+            panic!("a satisfied or backtracked literal cannot drive conflict analysis");
+        };
+        assert_eq!(clause, first);
+    }
+}
+
+#[path = "tests_final_conflict_semantics.rs"]
+mod final_conflict_semantics;

@@ -55,8 +55,14 @@ use ay_core::{
 
 use super::ProofCheckError;
 
+#[cfg(test)]
+mod cancellation_tests;
 mod chain_extensions;
+mod folded_conclusions;
+#[cfg(test)]
+mod folded_conclusions_tests;
 pub(crate) mod ite_eval;
+pub(crate) mod shadowed_stores;
 
 /// Maximum number of `store` nodes the folded-default checker will traverse.
 /// This bounds work on untrusted proof bundles independently of proof size.
@@ -142,7 +148,12 @@ pub fn recognize_array_select_store(terms: &TermStore, clause: &[TermId]) -> Opt
 }
 
 /// Exact, top-level ROW shapes the Alethe printer can lower to Carcara.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` is written out rather than derived: the derived form compares
+/// discriminants first and then matches with an unreachable fallback arm,
+/// which leaves an obligation the verifier refutes per function. The manual
+/// form is the same structural equality with a total match.
+#[derive(Debug, Clone, Copy, Eq)]
 pub(crate) enum ArraySelectStorePrinterTerms {
     /// `select(store(a, i, v), j) = v`, either as a unit with `i == j` or
     /// guarded by the exact literal `not (= i j)`.
@@ -168,6 +179,81 @@ pub(crate) enum ArraySelectStorePrinterTerms {
         guard: TermId,
         packed_or: Option<TermId>,
     },
+}
+
+impl PartialEq for ArraySelectStorePrinterTerms {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Row1 {
+                    row,
+                    select,
+                    base_array,
+                    store_index,
+                    value,
+                    read_index,
+                    guard,
+                    packed_or,
+                },
+                Self::Row1 {
+                    row: other_row,
+                    select: other_select,
+                    base_array: other_base_array,
+                    store_index: other_store_index,
+                    value: other_value,
+                    read_index: other_read_index,
+                    guard: other_guard,
+                    packed_or: other_packed_or,
+                },
+            ) => {
+                row == other_row
+                    && select == other_select
+                    && base_array == other_base_array
+                    && store_index == other_store_index
+                    && value == other_value
+                    && read_index == other_read_index
+                    && guard == other_guard
+                    && packed_or == other_packed_or
+            }
+            (
+                Self::Row2 {
+                    row,
+                    select_store,
+                    select_base,
+                    base_array,
+                    store_index,
+                    value,
+                    read_index,
+                    guard,
+                    packed_or,
+                },
+                Self::Row2 {
+                    row: other_row,
+                    select_store: other_select_store,
+                    select_base: other_select_base,
+                    base_array: other_base_array,
+                    store_index: other_store_index,
+                    value: other_value,
+                    read_index: other_read_index,
+                    guard: other_guard,
+                    packed_or: other_packed_or,
+                },
+            ) => {
+                row == other_row
+                    && select_store == other_select_store
+                    && select_base == other_select_base
+                    && base_array == other_base_array
+                    && store_index == other_store_index
+                    && value == other_value
+                    && read_index == other_read_index
+                    && guard == other_guard
+                    && packed_or == other_packed_or
+            }
+            (Self::Row1 { .. }, Self::Row2 { .. }) | (Self::Row2 { .. }, Self::Row1 { .. }) => {
+                false
+            }
+        }
+    }
 }
 
 /// Return the exact primitive terms the Alethe printer may lower to Carcara's
@@ -199,10 +285,20 @@ pub(crate) fn array_select_store_printer_terms(
     {
         return None;
     }
+    // `clause` is rebound above (possibly to the packed `or`'s arguments), so
+    // its literals are read through `get` rather than a slice pattern: the
+    // pattern's element reads are not tied to the rebound slice's length.
+    let (clause_len, first_literal, second_literal) = (
+        clause.len(),
+        clause.first().copied(),
+        clause.get(1).copied(),
+    );
     if index_eq {
-        let candidates = match clause {
-            [row] => [Some((*row, None)), None],
-            [first, second] => [Some((*first, Some(*second))), Some((*second, Some(*first)))],
+        let candidates = match (clause_len, first_literal, second_literal) {
+            (1, Some(row), _) => [Some((row, None)), None],
+            (2, Some(first), Some(second)) => {
+                [Some((first, Some(second))), Some((second, Some(first)))]
+            }
             _ => return None,
         };
         for (row, guard) in candidates.into_iter().flatten() {
@@ -252,10 +348,10 @@ pub(crate) fn array_select_store_printer_terms(
         return None;
     }
 
-    let [first, second] = clause else {
+    let (2, Some(first), Some(second)) = (clause_len, first_literal, second_literal) else {
         return None;
     };
-    for (row, guard) in [(*first, *second), (*second, *first)] {
+    for (row, guard) in [(first, second), (second, first)] {
         let Some((lhs, rhs)) = equality_sides(terms, row) else {
             continue;
         };
@@ -364,7 +460,11 @@ pub(crate) struct RowChainSkip {
 }
 
 /// How a read-over-write chain walk terminates at the read index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` is written out rather than derived, for the same reason as
+/// [`ArraySelectStorePrinterTerms`]: the derived form ends in an unreachable
+/// arm the verifier refutes.
+#[derive(Debug, Clone, Copy, Eq)]
 pub(crate) enum RowChainEnd {
     /// The walk reached `(store inner x v)` whose index IS the read index, so
     /// the chain evaluates to `v` by `arrays_idx`.
@@ -375,6 +475,29 @@ pub(crate) enum RowChainEnd {
     /// The internal checker validates this SMT-LIB axiom directly; the pinned
     /// external Alethe checker currently has no corresponding primitive rule.
     Const { array: TermId, value: TermId },
+}
+
+impl PartialEq for RowChainEnd {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Value { outer, value },
+                Self::Value {
+                    outer: other_outer,
+                    value: other_value,
+                },
+            ) => outer == other_outer && value == other_value,
+            (Self::Base { base }, Self::Base { base: other_base }) => base == other_base,
+            (
+                Self::Const { array, value },
+                Self::Const {
+                    array: other_array,
+                    value: other_value,
+                },
+            ) => array == other_array && value == other_value,
+            (Self::Value { .. } | Self::Base { .. } | Self::Const { .. }, _) => false,
+        }
+    }
 }
 
 /// The intermediate array terms of one chain walk, in outermost-first order.
@@ -722,7 +845,8 @@ pub(crate) fn array_row_chain_printer_terms(
             }
         }
     }
-    None
+    // Sub-schema (M): folded (B) and folded (I).
+    folded_conclusions::under_array_eq_printer_terms(terms, &literals, packed_or)
 }
 
 /// Recognize the array theory lemma kind `clause` can be strict-validated as,
@@ -855,20 +979,15 @@ fn matches_array_default_const(terms: &TermStore, literals: &[TermId]) -> bool {
     if matches_default_const_under_equal_matched_stores(terms, literals) {
         return true;
     }
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return false;
-    }
+    };
 
-    for premise_index in 0..2 {
-        let conclusion_index = 1 - premise_index;
-        let Some((premise_lhs, premise_rhs)) =
-            negated_equality_sides(terms, literals[premise_index])
-        else {
+    for (premise, conclusion) in [(*first, *second), (*second, *first)] {
+        let Some((premise_lhs, premise_rhs)) = negated_equality_sides(terms, premise) else {
             continue;
         };
-        let Some((conclusion_lhs, conclusion_rhs)) =
-            equality_sides(terms, literals[conclusion_index])
-        else {
+        let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
             continue;
         };
 
@@ -1081,7 +1200,7 @@ fn metered_store_spine_len(
         if !progress(64, 0) {
             return Err(ProofCheckError::ResourceLimit);
         }
-        len += 1;
+        len = len.checked_add(1).ok_or(ProofCheckError::ResourceLimit)?;
         current = args[0];
     }
     Ok(len)
@@ -1126,7 +1245,7 @@ fn charge_store_permutation_validation(
     // Linear per-literal scan plus the one `PositiveEqPairs` collection.
     if !progress(
         mul(literals.len(), 64)?,
-        mul(literals.len(), 4 * size_of::<TermId>())?,
+        mul(literals.len(), mul(4, size_of::<TermId>())?)?,
     ) {
         return Err(ProofCheckError::ResourceLimit);
     }
@@ -1295,6 +1414,11 @@ pub(crate) fn validate_array_extensionality(
     step_id: ProofId,
     clause: &[TermId],
     registry: Option<&ExtDiffRegistry>,
+    // Strict-check progress envelope. The chain route is precharged by the
+    // caller (`SemanticChargeClass::ArrayExtensionalityShape`); only the
+    // folded-read fallback debits through this, one
+    // `FOLDED_READ_UNIT_WORK` per budget unit it consumes.
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
     if clause.is_empty() {
         return Err(ProofCheckError::InvalidTheoryLemma {
@@ -1333,7 +1457,7 @@ pub(crate) fn validate_array_extensionality(
     // The structural recognizer below then proves that the exact clause is the
     // fold of that binding's array pair at that binding's witness.
     if let Some(registry) = registry {
-        if validate_folded_registry_match_with_budget(terms, step_id, clause, registry)? {
+        if validate_folded_registry_match_with_budget(terms, step_id, clause, registry, progress)? {
             return Ok(());
         }
     }
@@ -1507,22 +1631,9 @@ fn recognize_folded_array_extensionality_with_budget(
     {
         return false;
     }
-    if clause.is_empty()
-        || clause
-            .iter()
-            .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
-    {
+    let Some(literals) = folded_extensionality_literal_pair(terms, clause) else {
         return false;
-    }
-
-    let literals = flatten_clause_literals(terms, clause);
-    if literals.len() != 2
-        || literals
-            .iter()
-            .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
-    {
-        return false;
-    }
+    };
 
     let mut fold_matcher = FoldedReadMatcher::new(terms, budget);
     for (root_literal, folded_literal) in [(literals[0], literals[1]), (literals[1], literals[0])] {
@@ -1544,6 +1655,42 @@ fn recognize_folded_array_extensionality_with_budget(
     false
 }
 
+/// The two Bool literals a folded-extensionality clause must consist of, or
+/// `None` when the clause cannot be one whatever the binding.
+///
+/// Exactly the conditions `flatten_clause_literals` followed by a length-2 and
+/// all-Bool check imposes — a non-empty all-Bool clause whose flattening (the
+/// arguments of a unit `or`, else the clause itself) is two Bool literals —
+/// decided in O(1) reads and WITHOUT first cloning the flattened literals.
+/// `validate_folded_registry_match_with_budget` calls the recognizer once per
+/// registry binding, and the strict-check envelope prices that scan at a
+/// constant per binding (`quality::FOLDED_READ_UNIT_WORK`); cloning a wide
+/// unit `or` per binding would have been work the envelope never saw.
+pub(super) fn folded_extensionality_literal_pair(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<[TermId; 2]> {
+    let literals = match clause {
+        [single] => match terms.get(*single) {
+            TermData::App(Symbol::Named(sym), args) if sym == "or" => match args.as_slice() {
+                [first, second] => [*first, *second],
+                _ => return None,
+            },
+            _ => return None,
+        },
+        [first, second] => [*first, *second],
+        _ => return None,
+    };
+    if clause
+        .iter()
+        .chain(literals.iter())
+        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+    {
+        return None;
+    }
+    Some(literals)
+}
+
 const FOLDED_READ_WORK_LIMIT: usize = 100_000;
 const FOLDED_REGISTRY_WORK_LIMIT: usize = FOLDED_READ_WORK_LIMIT;
 
@@ -1560,15 +1707,9 @@ impl<'a> FoldedReadWorkBudget<'a> {
         }
     }
 
-    // MODEL_CHECKER_CONSUMER's pinned compiler predates the `try_update` rename, while the
-    // current Trust compiler deprecates its semantics-identical old name.
+    // `fetch_update`: model-checker-consumer's kept Kani baseline (nightly-2025-12-03) lacks stable `try_update`.
     #[allow(deprecated)]
     fn consume(&mut self) -> bool {
-        // `fetch_update` is the stable equivalent of the unstable
-        // `atomic_try_update::try_update` (identical signature and
-        // Ok(prev)/Err(prev) semantics). Using it keeps ay-proof buildable as a
-        // dependency under model-checker-consumer's pinned nightly, which does not enable the
-        // `atomic_try_update` feature.
         if self
             .remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -1592,9 +1733,11 @@ pub(super) fn validate_folded_registry_match_with_budget(
     step_id: ProofId,
     clause: &[TermId],
     registry: &ExtDiffRegistry,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<bool, ProofCheckError> {
     let mut budget = FoldedReadWorkBudget::new(&registry.folded_work_remaining);
     for binding in registry.bindings.values() {
+        let units_before = registry.folded_work_remaining.load(Ordering::Relaxed);
         if !budget.consume() {
             return Err(ProofCheckError::InvalidTheoryLemma {
                 step: step_id,
@@ -1603,14 +1746,29 @@ pub(super) fn validate_folded_registry_match_with_budget(
                     .to_string(),
             });
         }
-        if recognize_folded_array_extensionality_with_budget(
+        let matched = recognize_folded_array_extensionality_with_budget(
             terms,
             clause,
             binding.array_a,
             binding.array_b,
             binding.witness,
             &mut budget,
+        );
+        // Debit what this binding's matcher actually consumed through the
+        // caller's strict-check envelope, so the envelope sees the fallback's
+        // work instead of a per-lemma copy of the whole-proof budget. The
+        // debit trails one binding's run, which the shared
+        // `FOLDED_REGISTRY_WORK_LIMIT` bounds for the whole proof; a refused
+        // debit fails closed exactly like every other envelope refusal.
+        let units_after = registry.folded_work_remaining.load(Ordering::Relaxed);
+        let consumed = units_before.saturating_sub(units_after);
+        if !progress(
+            consumed.saturating_mul(crate::quality::FOLDED_READ_UNIT_WORK),
+            0,
         ) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        if matched {
             return Ok(true);
         }
         if budget.exhausted {
@@ -1734,9 +1892,69 @@ impl ExtDiffRegistry {
         terms: &TermStore,
         problem_assertions: &[TermId],
     ) -> Result<Self, ProofCheckError> {
+        Self::collect_with_progress(proof, terms, problem_assertions, &mut |_, _| true)
+    }
+
+    /// Collect with one sticky cancellation callback over the whole registry.
+    ///
+    /// Polls cover introduction, name/DAG, dependency and cycle traversal,
+    /// including duplicate edges. They charge zero: this is cancellation, not
+    /// a replacement for the caller's existing work/allocation accounting.
+    /// Individual clone/hash/sort operations and destruction remain opaque.
+    /// The single returned registry retains its existing proof-wide folded
+    /// matching allowance; polling never renews that allowance.
+    pub(crate) fn collect_with_progress(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: &[TermId],
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<Self, ProofCheckError> {
+        let mut refused = false;
+        let mut poll = |_, _| {
+            if refused {
+                return false;
+            }
+            // Latch before user code so an inner panic guard cannot permit
+            // resumed collection after swallowing a callback panic.
+            refused = true;
+            let allowed = progress(0, 0);
+            refused = !allowed;
+            allowed
+        };
+        poll_ext_diff_collection(&mut poll)?;
+        let result = Self::collect_controlled(proof, terms, problem_assertions, &mut poll);
+        // Collector-local queues/name sets are destroyed before publication.
+        poll_ext_diff_collection(&mut poll)?;
+        result
+    }
+
+    fn collect_controlled(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: &[TermId],
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<Self, ProofCheckError> {
+        let bindings = Self::collect_bindings_controlled(proof, terms, progress)?;
+        if !bindings.is_empty() {
+            // Dependencies precede freshness, preserving error precedence.
+            validate_ext_diff_dependency_graph(terms, &bindings, progress)?;
+            Self::validate_freshness(proof, terms, problem_assertions, &bindings, progress)?;
+        }
+        Ok(Self {
+            bindings,
+            folded_work_remaining: AtomicUsize::new(FOLDED_REGISTRY_WORK_LIMIT),
+        })
+    }
+
+    fn collect_bindings_controlled(
+        proof: &Proof,
+        terms: &TermStore,
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<DetHashMap<String, ExtDiffBinding>, ProofCheckError> {
         let mut bindings: DetHashMap<String, ExtDiffBinding> = DetHashMap::default();
 
         for (index, step) in proof.steps.iter().enumerate() {
+            poll_ext_diff_collection(progress)?;
             let ProofStep::Step {
                 rule: AletheRule::ArrayExtDiffIntro,
                 clause,
@@ -1746,9 +1964,11 @@ impl ExtDiffRegistry {
             else {
                 continue;
             };
-            let step_id = ProofId(index as u32);
+            let step_id =
+                ProofId(u32::try_from(index).map_err(|_| ProofCheckError::ResourceLimit)?);
             let (witness, array_a, array_b, name) =
                 validate_ext_diff_intro(terms, step_id, clause, premises, args)?;
+            poll_ext_diff_collection(progress)?;
 
             // (2) bound once.
             if let Some(prior) = bindings.insert(
@@ -1772,22 +1992,16 @@ impl ExtDiffRegistry {
             }
         }
 
-        if bindings.is_empty() {
-            return Ok(Self {
-                bindings,
-                folded_work_remaining: AtomicUsize::new(FOLDED_REGISTRY_WORK_LIMIT),
-            });
-        }
+        Ok(bindings)
+    }
 
-        // (4) Dependencies between fresh witnesses must be acyclic. An edge
-        // `k -> j` means that the arrays whose difference `k` witnesses contain
-        // `j`, so `j` has to be interpreted before `k`. A DAG admits exactly
-        // that topological interpretation. A cycle does not: for Bool-indexed
-        // arrays, one clause can force `k = not j` while another forces `j = k`,
-        // making an originally satisfiable problem inconsistent. Checking only
-        // direct self-reference misses that two-witness counterexample.
-        validate_ext_diff_dependency_graph(terms, &bindings)?;
-
+    fn validate_freshness(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: &[TermId],
+        bindings: &DetHashMap<String, ExtDiffBinding>,
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<(), ProofCheckError> {
         // (3) freshness, checked against the problem itself. One traversal of
         // the problem terms and the proof's `assume` leaves collects every
         // symbol name they mention; any introduced witness in that set is not
@@ -1795,14 +2009,23 @@ impl ExtDiffRegistry {
         let mut problem_symbols: DetHashSet<String> = det_hash_set_new();
         let mut visited: DetHashSet<TermId> = det_hash_set_new();
         for &assertion in problem_assertions {
-            collect_symbol_names(terms, assertion, &mut problem_symbols, &mut visited);
+            poll_ext_diff_collection(progress)?;
+            collect_symbol_names(
+                terms,
+                assertion,
+                &mut problem_symbols,
+                &mut visited,
+                progress,
+            )?;
         }
         for step in &proof.steps {
+            poll_ext_diff_collection(progress)?;
             if let ProofStep::Assume(term) = step {
-                collect_symbol_names(terms, *term, &mut problem_symbols, &mut visited);
+                collect_symbol_names(terms, *term, &mut problem_symbols, &mut visited, progress)?;
             }
         }
-        for (name, binding) in &bindings {
+        for (name, binding) in bindings {
+            poll_ext_diff_collection(progress)?;
             if problem_symbols.contains(name) {
                 return Err(ProofCheckError::InvalidTheoryLemma {
                     step: binding.step,
@@ -1815,15 +2038,22 @@ impl ExtDiffRegistry {
             }
         }
 
-        Ok(Self {
-            bindings,
-            folded_work_remaining: AtomicUsize::new(FOLDED_REGISTRY_WORK_LIMIT),
-        })
+        Ok(())
     }
 
     #[cfg(test)]
     pub(super) fn set_folded_work_budget_for_test(&self, limit: usize) {
         self.folded_work_remaining.store(limit, Ordering::Relaxed);
+    }
+}
+
+fn poll_ext_diff_collection(
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    if progress(0, 0) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::ResourceLimit)
     }
 }
 
@@ -1837,7 +2067,9 @@ impl ExtDiffRegistry {
 fn validate_ext_diff_dependency_graph(
     terms: &TermStore,
     bindings: &DetHashMap<String, ExtDiffBinding>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
+    poll_ext_diff_collection(progress)?;
     let Some(fallback_step) = bindings.values().next().map(|binding| binding.step) else {
         return Ok(());
     };
@@ -1848,29 +2080,7 @@ fn validate_ext_diff_dependency_graph(
              refusing to certify witness provenance"
         ),
     };
-    let mut dependencies: DetHashMap<String, DetHashSet<String>> = DetHashMap::default();
-
-    for (name, binding) in bindings {
-        let mut pair_symbols: DetHashSet<String> = det_hash_set_new();
-        let mut visited: DetHashSet<TermId> = det_hash_set_new();
-        collect_symbol_names(terms, binding.array_a, &mut pair_symbols, &mut visited);
-        collect_symbol_names(terms, binding.array_b, &mut pair_symbols, &mut visited);
-
-        let deps: DetHashSet<String> = pair_symbols
-            .into_iter()
-            .filter(|candidate| bindings.contains_key(candidate))
-            .collect();
-        if deps.contains(name) {
-            return Err(ProofCheckError::InvalidTheoryLemma {
-                step: binding.step,
-                reason: format!(
-                    "array ext-diff witness `{name}` occurs inside the array pair \
-                     it is introduced for; the Skolem definition would be circular"
-                ),
-            });
-        }
-        dependencies.insert(name.clone(), deps);
-    }
+    let dependencies = collect_ext_diff_dependencies(terms, bindings, progress)?;
 
     // `remaining[k]` is the number of not-yet-eliminated witnesses that `k`
     // depends on. The reverse adjacency lets one completed dependency release
@@ -1878,8 +2088,10 @@ fn validate_ext_diff_dependency_graph(
     let mut remaining: DetHashMap<String, usize> = DetHashMap::default();
     let mut dependents: DetHashMap<String, Vec<String>> = DetHashMap::default();
     for (name, deps) in &dependencies {
+        poll_ext_diff_collection(progress)?;
         remaining.insert(name.clone(), deps.len());
         for dependency in deps {
+            poll_ext_diff_collection(progress)?;
             dependents
                 .entry(dependency.clone())
                 .or_default()
@@ -1887,17 +2099,24 @@ fn validate_ext_diff_dependency_graph(
         }
     }
 
-    let mut ready: Vec<String> = remaining
-        .iter()
-        .filter_map(|(name, &count)| (count == 0).then_some(name.clone()))
-        .collect();
+    let mut ready: Vec<String> = Vec::new();
+    for (name, &count) in &remaining {
+        poll_ext_diff_collection(progress)?;
+        if count == 0 {
+            ready.push(name.clone());
+        }
+    }
     let mut eliminated = 0usize;
     while let Some(name) = ready.pop() {
-        eliminated += 1;
+        poll_ext_diff_collection(progress)?;
+        eliminated = eliminated
+            .checked_add(1)
+            .ok_or(ProofCheckError::ResourceLimit)?;
         let Some(waiting) = dependents.get(&name) else {
             continue;
         };
         for dependent in waiting {
+            poll_ext_diff_collection(progress)?;
             let Some(count) = remaining.get_mut(dependent) else {
                 return Err(invariant_error(
                     fallback_step,
@@ -1922,11 +2141,87 @@ fn validate_ext_diff_dependency_graph(
         return Ok(());
     }
 
-    let unresolved: DetHashSet<String> = remaining
-        .iter()
-        .filter_map(|(name, &count)| (count != 0).then_some(name.clone()))
-        .collect();
-    let Some(mut current) = unresolved.iter().min().cloned() else {
+    reject_ext_diff_dependency_cycle(bindings, &dependencies, &remaining, fallback_step, progress)
+}
+
+fn collect_ext_diff_dependencies(
+    terms: &TermStore,
+    bindings: &DetHashMap<String, ExtDiffBinding>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<DetHashMap<String, DetHashSet<String>>, ProofCheckError> {
+    // `k -> j` means k's array pair mentions witness j. Such dependencies
+    // admit sequential fresh choices exactly when their graph is acyclic.
+    let mut dependencies = DetHashMap::default();
+    for (name, binding) in bindings {
+        poll_ext_diff_collection(progress)?;
+        let mut pair_symbols: DetHashSet<String> = det_hash_set_new();
+        let mut visited: DetHashSet<TermId> = det_hash_set_new();
+        collect_symbol_names(
+            terms,
+            binding.array_a,
+            &mut pair_symbols,
+            &mut visited,
+            progress,
+        )?;
+        collect_symbol_names(
+            terms,
+            binding.array_b,
+            &mut pair_symbols,
+            &mut visited,
+            progress,
+        )?;
+        let mut deps: DetHashSet<String> = det_hash_set_new();
+        for candidate in pair_symbols {
+            poll_ext_diff_collection(progress)?;
+            if bindings.contains_key(&candidate) {
+                deps.insert(candidate);
+            }
+        }
+        poll_ext_diff_collection(progress)?;
+        if deps.contains(name) {
+            return Err(ProofCheckError::InvalidTheoryLemma {
+                step: binding.step,
+                reason: format!(
+                    "array ext-diff witness `{name}` occurs inside the array pair \
+                     it is introduced for; the Skolem definition would be circular"
+                ),
+            });
+        }
+        dependencies.insert(name.clone(), deps);
+    }
+    Ok(dependencies)
+}
+
+fn reject_ext_diff_dependency_cycle(
+    bindings: &DetHashMap<String, ExtDiffBinding>,
+    dependencies: &DetHashMap<String, DetHashSet<String>>,
+    remaining: &DetHashMap<String, usize>,
+    fallback_step: ProofId,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    let invariant_error = |step: ProofId, detail: &str| ProofCheckError::InvalidTheoryLemma {
+        step,
+        reason: format!(
+            "array ext-diff dependency graph invariant failed: {detail}; \
+             refusing to certify witness provenance"
+        ),
+    };
+
+    let mut unresolved: DetHashSet<String> = det_hash_set_new();
+    for (name, &count) in remaining {
+        poll_ext_diff_collection(progress)?;
+        if count != 0 {
+            unresolved.insert(name.clone());
+        }
+    }
+    let mut first: Option<&String> = None;
+    for name in &unresolved {
+        poll_ext_diff_collection(progress)?;
+        if first.is_none_or(|prior| name < prior) {
+            first = Some(name);
+        }
+    }
+    let Some(mut current) = first.cloned() else {
         return Err(invariant_error(
             fallback_step,
             "elimination stopped without an unresolved witness",
@@ -1935,8 +2230,20 @@ fn validate_ext_diff_dependency_graph(
     let mut positions: DetHashMap<String, usize> = DetHashMap::default();
     let mut path: Vec<String> = Vec::new();
     loop {
+        poll_ext_diff_collection(progress)?;
         if let Some(&cycle_start) = positions.get(&current) {
-            let mut cycle = path[cycle_start..].to_vec();
+            let mut cycle = Vec::new();
+            let Some(cycle_path) = path.get(cycle_start..) else {
+                return Err(invariant_error(
+                    fallback_step,
+                    "cycle start lies outside the walked path",
+                ));
+            };
+            for name in cycle_path {
+                poll_ext_diff_collection(progress)?;
+                cycle.push(name.clone());
+            }
+            poll_ext_diff_collection(progress)?;
             cycle.push(current.clone());
             let Some(binding) = bindings.get(&current) else {
                 return Err(invariant_error(
@@ -1963,12 +2270,14 @@ fn validate_ext_diff_dependency_graph(
                 "registered witness has no dependency set",
             ));
         };
-        let Some(next) = current_dependencies
-            .iter()
-            .filter(|dependency| unresolved.contains(*dependency))
-            .min()
-            .cloned()
-        else {
+        let mut next: Option<&String> = None;
+        for dependency in current_dependencies {
+            poll_ext_diff_collection(progress)?;
+            if unresolved.contains(dependency) && next.is_none_or(|prior| dependency < prior) {
+                next = Some(dependency);
+            }
+        }
+        let Some(next) = next.cloned() else {
             return Err(invariant_error(
                 bindings
                     .get(&current)
@@ -2054,43 +2363,67 @@ fn collect_symbol_names(
     root: TermId,
     names: &mut DetHashSet<String>,
     visited: &mut DetHashSet<TermId>,
-) {
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    poll_ext_diff_collection(progress)?;
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
+        poll_ext_diff_collection(progress)?;
         if !visited.insert(id) {
             continue;
         }
         match terms.get(id) {
             TermData::Var(name, _) => {
+                poll_ext_diff_collection(progress)?;
                 names.insert(name.clone());
             }
             TermData::App(sym, args) => {
+                poll_ext_diff_collection(progress)?;
                 names.insert(sym.name().to_string());
-                stack.extend(args.iter().copied());
+                for &arg in args {
+                    poll_ext_diff_collection(progress)?;
+                    stack.push(arg);
+                }
             }
-            TermData::Not(inner) => stack.push(*inner),
+            TermData::Not(inner) => {
+                poll_ext_diff_collection(progress)?;
+                stack.push(*inner);
+            }
             TermData::Ite(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
+                for &child in [c, t, e] {
+                    poll_ext_diff_collection(progress)?;
+                    stack.push(child);
+                }
             }
             TermData::Let(bindings, body) => {
                 for (name, value) in bindings {
+                    poll_ext_diff_collection(progress)?;
                     names.insert(name.clone());
+                    poll_ext_diff_collection(progress)?;
                     stack.push(*value);
                 }
+                poll_ext_diff_collection(progress)?;
                 stack.push(*body);
             }
             TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
                 for (name, _) in vars {
+                    poll_ext_diff_collection(progress)?;
                     names.insert(name.clone());
                 }
+                poll_ext_diff_collection(progress)?;
                 stack.push(*body);
-                stack.extend(triggers.iter().flatten().copied());
+                for trigger in triggers {
+                    poll_ext_diff_collection(progress)?;
+                    for &term in trigger {
+                        poll_ext_diff_collection(progress)?;
+                        stack.push(term);
+                    }
+                }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 // ---------- helpers ----------
@@ -2572,6 +2905,8 @@ fn matches_row_chain(terms: &TermStore, literals: &[TermId]) -> bool {
         || matches_exact_store_idempotence_under_eq(terms, literals)
         || matches_exact_guarded_matching_outer_store_read(terms, literals)
         || chain_extensions::matches_extension_subschema(terms, literals)
+        || shadowed_stores::shadowed_stores(terms, literals).is_some()
+        || folded_conclusions::matches_folded_row_subschema(terms, literals, &eqs)
 }
 
 /// Sub-schema (D): exact, two-literal select congruence.
@@ -2579,11 +2914,11 @@ fn exact_array_read_congruence_terms(
     terms: &TermStore,
     literals: &[TermId],
 ) -> Option<ArrayReadCongruenceTerms> {
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return None;
-    }
+    };
 
-    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+    for (array_eq_lit, conclusion) in [(*first, *second), (*second, *first)] {
         let Some((left, right)) = negated_equality_sides(terms, array_eq_lit) else {
             continue;
         };
@@ -2593,7 +2928,6 @@ fn exact_array_read_congruence_terms(
         if terms.sort(right) != terms.sort(left) {
             continue;
         }
-        let conclusion = literals[1 - premise_position];
         let Some((lhs, rhs)) = equality_sides(terms, conclusion) else {
             continue;
         };
@@ -2635,11 +2969,11 @@ fn exact_array_read_congruence_terms(
 
 /// Sub-schema (E): exact read of a root equated to a const-array.
 fn matches_exact_const_array_read_under_eq(terms: &TermStore, literals: &[TermId]) -> bool {
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return false;
-    }
+    };
 
-    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+    for (array_eq_lit, conclusion) in [(*first, *second), (*second, *first)] {
         let Some((lhs, rhs)) = negated_equality_sides(terms, array_eq_lit) else {
             continue;
         };
@@ -2660,7 +2994,6 @@ fn matches_exact_const_array_read_under_eq(terms: &TermStore, literals: &[TermId
             if terms.sort(fill) != &array_sort.element_sort {
                 continue;
             }
-            let conclusion = literals[1 - premise_position];
             let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
                 continue;
             };
@@ -2686,18 +3019,17 @@ fn matches_exact_const_array_read_under_eq(terms: &TermStore, literals: &[TermId
 
 /// Sub-schema (F): exact, two-literal congruence of one `store(_, i, v)`.
 fn matches_exact_store_congruence(terms: &TermStore, literals: &[TermId]) -> bool {
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return false;
-    }
+    };
 
-    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+    for (array_eq_lit, conclusion) in [(*first, *second), (*second, *first)] {
         let Some((left, right)) = negated_equality_sides(terms, array_eq_lit) else {
             continue;
         };
         if !matches!(terms.sort(left), Sort::Array(_)) || terms.sort(right) != terms.sort(left) {
             continue;
         }
-        let conclusion = literals[1 - premise_position];
         let Some((lhs, rhs)) = equality_sides(terms, conclusion) else {
             continue;
         };
@@ -2730,11 +3062,11 @@ fn matches_exact_store_congruence(terms: &TermStore, literals: &[TermId]) -> boo
 /// Sub-schema (G): exact idempotent rewrite of a depth-one store under an
 /// equality premise.
 fn matches_exact_store_idempotence_under_eq(terms: &TermStore, literals: &[TermId]) -> bool {
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return false;
-    }
+    };
 
-    for (premise_position, &array_eq_lit) in literals.iter().enumerate() {
+    for (array_eq_lit, conclusion) in [(*first, *second), (*second, *first)] {
         let Some((lhs, rhs)) = negated_equality_sides(terms, array_eq_lit) else {
             continue;
         };
@@ -2746,7 +3078,6 @@ fn matches_exact_store_idempotence_under_eq(terms: &TermStore, literals: &[TermI
                 continue;
             }
             let (index, value) = chain.entries[0];
-            let conclusion = literals[1 - premise_position];
             let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
                 continue;
             };
@@ -2886,11 +3217,18 @@ fn matches_equal_stores_force_base_alias(terms: &TermStore, literals: &[TermId])
             let remaining: Vec<usize> = (0..literals.len())
                 .filter(|&position| position != p1 && position != p2)
                 .collect();
-            let [first, second] = remaining.as_slice() else {
+            // Read the two leftover positions through `get`: the elements of a
+            // slice pattern over a freshly built `Vec` are not tied to its
+            // length, and neither position is trusted to index `literals`.
+            let (2, Some(&first), Some(&second)) =
+                (remaining.len(), remaining.first(), remaining.get(1))
+            else {
                 continue;
             };
-            let first_lit = literals[*first];
-            let second_lit = literals[*second];
+            let (Some(&first_lit), Some(&second_lit)) = (literals.get(first), literals.get(second))
+            else {
+                continue;
+            };
             if (matches_equality_pair(terms, first_lit, i, j)
                 && matches_equality_pair(terms, second_lit, base, anchor))
                 || (matches_equality_pair(terms, second_lit, i, j)
@@ -3094,9 +3432,9 @@ fn matches_default_const_under_equal_matched_stores(
     terms: &TermStore,
     literals: &[TermId],
 ) -> bool {
-    if literals.len() != 2 {
+    let [first, second] = literals else {
         return false;
-    }
+    };
 
     // Carrier gate: refuse unless no finite store chain can reach the whole
     // index carrier. See the doc comment for the oracle measurements.
@@ -3114,10 +3452,8 @@ fn matches_default_const_under_equal_matched_stores(
         return false;
     }
 
-    for premise_position in 0..2 {
-        let Some((premise_lhs, premise_rhs)) =
-            negated_equality_sides(terms, literals[premise_position])
-        else {
+    for (premise, conclusion) in [(*first, *second), (*second, *first)] {
+        let Some((premise_lhs, premise_rhs)) = negated_equality_sides(terms, premise) else {
             continue;
         };
         let (
@@ -3152,9 +3488,7 @@ fn matches_default_const_under_equal_matched_stores(
             if terms.sort(fill) != &array_sort.element_sort {
                 continue;
             }
-            let Some((conclusion_lhs, conclusion_rhs)) =
-                equality_sides(terms, literals[1 - premise_position])
-            else {
+            let Some((conclusion_lhs, conclusion_rhs)) = equality_sides(terms, conclusion) else {
                 continue;
             };
             for (default_term, value) in [

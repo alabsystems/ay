@@ -6,6 +6,15 @@
 // Linux procfs. These success-path end-to-end tests therefore run only where
 // their required process-table capability exists; Python policy tests retain
 // explicit coverage of the unsupported-target refusal.
+//
+// The guard also refuses while ANY other Cargo build runs on the host
+// (`plan --warn-concurrent-build`). That refusal is correct for a real bisect,
+// but it made these tests a function of unrelated host activity: on a shared
+// build host all three failed whenever another worker was compiling. Each test
+// therefore runs `ay-bisect` from its temp dir, where `locate_planner` finds a
+// shim first. The shim records its argv and runs the REAL planner with every
+// argument except `--warn-concurrent-build`, and each test asserts that
+// `ay-bisect` still asked for that refusal.
 #![cfg(target_os = "linux")]
 
 //! End-to-end integration tests for `ay-bisect`.
@@ -82,6 +91,40 @@ fn write_mock_ay(
     script
 }
 
+/// Install the planner shim described at the top of this file in `dir`, and
+/// return the path of the argv log it appends to.
+fn install_planner_shim(dir: &Path) -> PathBuf {
+    let real = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/_oom_guard.py")
+        .canonicalize()
+        .expect("the repository planner exists");
+    let scripts = dir.join("scripts");
+    fs::create_dir_all(&scripts).expect("create shim dir");
+    let argv_log = dir.join("planner_argv.txt");
+    let shim = format!(
+        "import subprocess, sys\n\
+         with open({log:?}, 'a') as fh:\n    fh.write(' '.join(sys.argv[1:]) + '\\n')\n\
+         args = [a for a in sys.argv[1:] if a != '--warn-concurrent-build']\n\
+         sys.exit(subprocess.call([sys.executable, {real:?}] + args))\n",
+        log = argv_log.display().to_string(),
+        real = real.display().to_string(),
+    );
+    fs::write(scripts.join("_oom_guard.py"), shim).expect("write planner shim");
+    argv_log
+}
+
+/// `ay-bisect` must still ask the planner to refuse during a concurrent build;
+/// the shim only keeps that refusal from depending on the host.
+fn assert_requested_concurrent_build_refusal(argv_log: &Path) {
+    let calls = fs::read_to_string(argv_log).expect("ay-bisect ran the planner shim");
+    assert!(
+        calls
+            .lines()
+            .any(|call| call.starts_with("plan ") && call.contains("--warn-concurrent-build")),
+        "ay-bisect planned without --warn-concurrent-build; planner calls:\n{calls}"
+    );
+}
+
 #[test]
 fn test_bisect_finds_single_culprit_bve() {
     let tmp = TempDir::new().expect("tempdir");
@@ -90,8 +133,10 @@ fn test_bisect_finds_single_culprit_bve() {
     let smt2 = tmp.path().join("bug.smt2");
     fs::write(&smt2, "(set-logic QF_LIA)(assert true)(check-sat)\n").expect("smt2");
 
+    let argv_log = install_planner_shim(tmp.path());
     let bin = ay_bisect_binary();
     let out = Command::new(&bin)
+        .current_dir(tmp.path())
         .args([
             "--expected",
             "sat",
@@ -112,6 +157,7 @@ fn test_bisect_finds_single_culprit_bve() {
         "ay-bisect exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         out.status.code()
     );
+    assert_requested_concurrent_build_refusal(&argv_log);
     assert!(
         stdout.contains("ay binary:"),
         "expected ay binary path in report:\n{stdout}"
@@ -141,8 +187,10 @@ fn test_bisect_json_output() {
     let smt2 = tmp.path().join("bug.smt2");
     fs::write(&smt2, "(set-logic QF_LIA)(assert true)(check-sat)\n").expect("smt2");
 
+    let argv_log = install_planner_shim(tmp.path());
     let bin = ay_bisect_binary();
     let out = Command::new(&bin)
+        .current_dir(tmp.path())
         .args([
             "--expected",
             "unsat",
@@ -162,6 +210,7 @@ fn test_bisect_json_output() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_requested_concurrent_build_refusal(&argv_log);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let flags = parsed
@@ -181,8 +230,10 @@ fn test_bisect_baseline_already_correct() {
     let smt2 = tmp.path().join("bug.smt2");
     fs::write(&smt2, "(set-logic QF_LIA)(assert true)(check-sat)\n").expect("smt2");
 
+    let argv_log = install_planner_shim(tmp.path());
     let bin = ay_bisect_binary();
     let out = Command::new(&bin)
+        .current_dir(tmp.path())
         .args([
             "--expected",
             "sat",
@@ -197,7 +248,12 @@ fn test_bisect_baseline_already_correct() {
         .arg(&smt2)
         .output()
         .expect("run ay-bisect");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_requested_concurrent_build_refusal(&argv_log);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(parsed["baseline_already_correct"], true, "stdout: {stdout}");

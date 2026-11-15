@@ -115,7 +115,7 @@ fn test_explain_qf_lia_sat_emits_constraint_verdicts() {
         stdout.contains("y = "),
         "expected concrete value for y in stdout, got: {stdout}"
     );
-    // Per-constraint walk-through: original, substituted, verdict.
+    // Per-constraint walk-through uses the executor's typed model evaluation.
     assert!(
         stdout.contains("Constraint verification:"),
         "expected 'Constraint verification:' header, got: {stdout}"
@@ -124,17 +124,11 @@ fn test_explain_qf_lia_sat_emits_constraint_verdicts() {
         stdout.contains("assertion:"),
         "expected per-assertion 'assertion:' line, got: {stdout}"
     );
-    assert!(
-        stdout.contains("substituted:"),
-        "expected 'substituted:' line with model values, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("evaluates to: true"),
+    assert_eq!(
+        stdout.matches("evaluates to: true").count(),
+        3,
         "expected 'evaluates to: true' for every assertion, got: {stdout}"
     );
-    // At least one assertion should have kept the original `x` variable name
-    // in the pretty-printed form (prose), confirming we're showing both the
-    // symbolic and the substituted view.
     assert!(
         stdout.contains("All 3 constraint(s) satisfied."),
         "expected final count of satisfied constraints, got: {stdout}"
@@ -144,10 +138,8 @@ fn test_explain_qf_lia_sat_emits_constraint_verdicts() {
 /// QF_LIA UNSAT — `x < 0 ∧ x > 0` is vacuously contradictory. `--explain`
 /// must (a) print `unsat`, (b) declare that no assignment satisfies them,
 /// (c) list the conflicting assertions verbatim, (d) emit a one-sentence
-/// English conflict summary. We deliberately do not pin the Phase 1 reason
-/// code (LIA preprocessing may fold `x < 0 ∧ x > 0` to `false` before CDCL,
-/// yielding `PreprocessingDetected`; a cold path may hit CDCL and register
-/// `TheoryConflict(LIA)` or `UnitPropagationContradiction` instead). The
+/// English conflict summary. We deliberately do not pin a reasoning path:
+/// only recorded evidence can identify one. The
 /// English walk-through is what users read — that's the real contract.
 #[test]
 #[timeout(60_000)]
@@ -181,11 +173,6 @@ fn test_explain_qf_lia_unsat_emits_conflict_summary() {
     assert!(
         stdout.contains("unsat"),
         "expected unsat in stdout, got: {stdout}"
-    );
-    // Phase 1 reason-code header is present for every UNSAT under --explain.
-    assert!(
-        stdout.contains("=== Reason code (UNSAT, Phase 1) ==="),
-        "expected Phase 1 reason-code header, got: {stdout}"
     );
     // English explanation block.
     assert!(

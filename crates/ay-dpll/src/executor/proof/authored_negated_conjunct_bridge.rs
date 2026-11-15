@@ -268,7 +268,7 @@ impl Executor {
                 continue;
             }
             let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &derivation);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_ok() {
+            if self.check_proof_strict_until_stopped(&closed).is_ok() {
                 return Some((derivation.steps, plan));
             }
         }

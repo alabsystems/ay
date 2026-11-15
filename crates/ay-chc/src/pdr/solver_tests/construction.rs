@@ -185,7 +185,10 @@ fn pdr_convex_closure_generalization_can_learn_divisibility_lemmas() {
 "#;
 
     let problem = ChcParser::parse(smt2).unwrap();
-    let mut solver = PdrSolver::new(problem, PdrConfig::default());
+    let mut solver = PdrSolver::new(
+        problem,
+        PdrConfig::default().with_spacer(crate::pdr::config::SpacerLane::OFF),
+    );
 
     let inv = solver.problem.get_predicate_by_name("inv").unwrap().id;
     let x = solver.canonical_vars(inv).unwrap()[0].clone();

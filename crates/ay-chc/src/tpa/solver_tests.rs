@@ -143,7 +143,7 @@ fn test_tpa_simple_unsafe() {
         verbose_level: 2,
         ..Default::default()
     };
-    let mut solver = TpaSolver::new(problem, config);
+    let mut solver = TpaSolver::new(problem.clone(), config);
     let result = solver.solve();
 
     // TPA should either find unsafe or return unknown (not safe)
@@ -153,9 +153,31 @@ fn test_tpa_simple_unsafe() {
     );
 
     // If unsafe, verify the counterexample steps are present
-    if let TpaResult::Unsafe { steps, .. } = &result {
+    if let TpaResult::Unsafe {
+        steps,
+        counterexample,
+    } = &result
+    {
         assert!(*steps > 0, "Counterexample should have at least one step");
+        assert_tpa_ground_evidence(&problem, *steps, counterexample);
     }
+}
+
+/// A TPA Unsafe carries the recursion's concrete path as a ground derivation
+/// with exactly `steps` transitions, validating on the solved problem.
+fn assert_tpa_ground_evidence(
+    problem: &ChcProblem,
+    steps: u64,
+    counterexample: &crate::pdr::Counterexample,
+) {
+    let derivation = counterexample
+        .ground_derivation
+        .as_ref()
+        .expect("TPA Unsafe carries its concrete path as a ground derivation");
+    crate::ground_derivation::validate_ground_derivation(problem, derivation)
+        .expect("the carried derivation validates on the solved problem");
+    // fact + `steps` transitions + query
+    assert_eq!(derivation.steps.len() as u64, steps + 2);
 }
 
 // =========================================================================
@@ -341,7 +363,7 @@ fn test_tpa_multi_step_unsafe() {
         timeout_per_power: Duration::from_millis(500),
         ..Default::default()
     };
-    let mut solver = TpaSolver::new(problem, config);
+    let mut solver = TpaSolver::new(problem.clone(), config);
     let result = solver.solve();
 
     // Should find the unsafe state at x=8
@@ -350,6 +372,14 @@ fn test_tpa_multi_step_unsafe() {
         !matches!(result, TpaResult::Safe { .. }),
         "TPA should not report reachable state as safe"
     );
+    if let TpaResult::Unsafe {
+        steps,
+        counterexample,
+    } = &result
+    {
+        assert_eq!(*steps, 8, "x = 8 is reached in exactly 8 increments");
+        assert_tpa_ground_evidence(&problem, *steps, counterexample);
+    }
 }
 
 /// Regression test: Refinement on spurious model.

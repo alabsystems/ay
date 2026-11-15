@@ -106,6 +106,11 @@ define_counters! {
     // Finite-domain CSP search SKIPPED because shared equalities were present
     // (the rusthorn UFLIA regime — the flagged gate at check.rs:1164).
     FINITE_DOMAIN_SKIPS     => "finite_domain_skips",
+    // Lattice-closure refutation before an unbounded split (lattice_refute_bridge):
+    // RUNS = closure runs, HITS = refutations, SKIPS = work-budget skips.
+    LATTICE_REFUTE_RUNS     => "lattice_refute_runs",
+    LATTICE_REFUTE_HITS     => "lattice_refute_hits",
+    LATTICE_REFUTE_SKIPS    => "lattice_refute_skips",
     // try_patching() calls (each does an extract_model).
     PATCHING_CALLS          => "patching_calls",
     // Cube-test attempts.

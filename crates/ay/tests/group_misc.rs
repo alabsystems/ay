@@ -27,6 +27,12 @@ mod chc_bv_sendmail_5877;
 #[path = "group_misc/build_version_stamp_8870.rs"]
 mod build_version_stamp_8870;
 
+#[path = "group_misc/build_provenance_g9.rs"]
+mod build_provenance_g9;
+
+#[path = "group_misc/build_provenance_logic_g9.rs"]
+mod build_provenance_logic_g9;
+
 #[path = "group_misc/chc_bv64_7975.rs"]
 mod chc_bv64_7975;
 
@@ -59,9 +65,6 @@ mod incremental_core_evolution_8154;
 
 #[path = "group_misc/model_fp_string_seq_output.rs"]
 mod model_fp_string_seq_output;
-
-#[path = "group_misc/public_surface_contract_3147.rs"]
-mod public_surface_contract_3147;
 
 #[path = "group_misc/quantifier_unknown_regression.rs"]
 mod quantifier_unknown_regression;

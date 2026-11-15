@@ -53,6 +53,18 @@ pub(crate) struct CegarEngine {
     edges: Vec<AbstractEdge>,
     queue: StateQueue,
     smt: SmtContext,
+    /// Abstract-post context (feasibility, models, implications of the
+    /// expansion step): the same lane and schedule as `smt`, designated a
+    /// SEARCH context for the `HornSmt` session (#horn-smt-session Rung 4).
+    /// Interpolation, core extraction and counterexample checks stay on
+    /// `smt` (their consumers need legacy cores/Farkas; Rung 3).
+    ///
+    /// `Some` only while the session is enabled (`--chc-session` >= 1 at
+    /// construction). With the flag off every expansion query runs on `smt`
+    /// exactly as before Rung 4 — a second context would split the engine's
+    /// strike breaker, term-memory budget and BV cache in two and change the
+    /// base behaviour with the flag off (batch-1 adversarial review).
+    search_smt: Option<SmtContext>,
     iteration: usize,
     /// Last counterexample trace (edge indices), saved for template fallback.
     last_cex_trace: Option<Vec<usize>>,
@@ -101,6 +113,8 @@ impl CegarEngine {
         }
 
         let smt = problem.make_smt_context();
+        let search_smt = (crate::smt::lane::session_mode() > 0)
+            .then(|| problem.make_smt_context().with_session_opt_in());
         Self {
             problem,
             config,
@@ -113,6 +127,7 @@ impl CegarEngine {
             edges: Vec::new(),
             queue: StateQueue::new(),
             smt,
+            search_smt,
             iteration: 0,
             last_cex_trace: None,
             last_cex_expansion: None,
@@ -138,6 +153,10 @@ impl CegarEngine {
         self.seed_facts();
 
         loop {
+            if self.config.base.is_cancelled() {
+                self.log_cache_stats("cancelled");
+                return CegarResult::Unknown;
+            }
             // Stall detection: give up when postponed failures dominate and enough
             // exploration has happened. ARG restarts happen at multiples of 5, so
             // threshold of 20 allows 4 restarts before giving up.
@@ -179,7 +198,15 @@ impl CegarEngine {
                         );
                     }
 
-                    match self.analyze_counterexample(cex_edge_idx) {
+                    let analysis = self.analyze_counterexample(cex_edge_idx);
+                    // A cancelled lane answers every check Unknown, which the
+                    // analysis reports as a failure; that must not start the
+                    // template/refine path (tens of thousands of candidates).
+                    if self.config.base.is_cancelled() {
+                        self.log_cache_stats("cancelled");
+                        return CegarResult::Unknown;
+                    }
+                    match analysis {
                         CexAnalysis::Genuine(trace) => {
                             if self.config.base.verbose {
                                 safe_eprintln!(
@@ -293,10 +320,26 @@ impl CegarEngine {
         }
     }
 
+    /// The context of the abstract-post queries: the session-designated
+    /// `search_smt` while the session is enabled, else `smt` (the base
+    /// behaviour; see the field).
+    pub(super) fn expansion_smt(&mut self) -> &mut SmtContext {
+        match &mut self.search_smt {
+            Some(search) => search,
+            None => &mut self.smt,
+        }
+    }
+
     fn expand_until_counterexample(&mut self) -> ExpandResult {
         while !self.queue.is_empty() {
             // Check cancellation, memory budget (#2769), or conversion budget (#2472)
-            if self.config.base.is_cancelled() || self.smt.is_budget_exhausted() {
+            if self.config.base.is_cancelled()
+                || self.smt.is_budget_exhausted()
+                || self
+                    .search_smt
+                    .as_ref()
+                    .is_some_and(SmtContext::is_budget_exhausted)
+            {
                 return ExpandResult::Cancelled;
             }
 
@@ -484,5 +527,7 @@ mod invariants;
 mod refinement;
 
 #[allow(clippy::unwrap_used, clippy::panic)]
+#[cfg(test)]
+mod resolve_equalities_tests;
 #[cfg(test)]
 mod tests;

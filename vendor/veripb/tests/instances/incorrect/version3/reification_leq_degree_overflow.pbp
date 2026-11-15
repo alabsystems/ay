@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `is_overflow_safe_leq` guarded `degree - 1` for the
+% `... <== ... <= ...` branch, which stores `degree + 1`. At degree == i64::MAX
+% the guard passed, the increment wrapped to i64::MIN and the forcing
+% reification normalized into the trivially true `2^63 ~x1 >= 0` -- so this
+% implication obligation was discharged against a row the proof never wrote.
+% The correct constraint, `9223372036854775808 x1 >= 9223372036854775808`, is
+% not implied by `1 x1 1 x2 >= 1`.
+f 1 ;
+ia x1 <== <= 9223372036854775807 : 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

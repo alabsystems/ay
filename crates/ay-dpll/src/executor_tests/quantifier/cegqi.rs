@@ -78,6 +78,12 @@ fn test_cegqi_invalid_strict_positive() {
         (check-sat)
     "#;
 
+    // The QSAT route decides this problem first (`quantifier/qsat.rs` pins
+    // its export); CEGQI is the path behind `--no-qsat`.
+    let _no_qsat = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        no_qsat: true,
+        ..ay_core::misc_cli_flags().clone()
+    });
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
     exec.set_produce_proofs(true);
@@ -789,10 +795,17 @@ fn test_quantified_gate_certifies_vacuous_inner_exists() {
 /// GUARD: the fix must not become a blanket relaxation of the fail-closed
 /// funnel. The same shape with a LIVE inner binder — `y` really occurs, under
 /// an uninterpreted `f` the witness says nothing about — is exactly the case
-/// the gate exists for, and must still degrade to `unknown`. (Measured: HEAD
-/// `unknown`, fix `unknown`; disabling the gate site outright instead turns
+/// the gate exists for, and must never publish an UNCERTIFIED `sat`. (Measured
+/// before the model check: HEAD `unknown`, fix `unknown`; disabling the gate
+/// site outright instead turns
 /// `crates/ay-dpll/tests/fixtures/ufbv_uf_completion_strict_leg_wrong_sat.smt2`
-/// — declared `unsat` — into a WRONG `sat`.)
+/// — declared `unsat` — into a WRONG `sat`; it stays `unknown` today.)
+///
+/// Since the quantified model check (2026-09-30) this `sat` IS certified: `f`
+/// is completed to a table plus an else value and the prenexed universal is
+/// decided under it by an auxiliary refutation. z3 5.1.0 answers `sat`. So
+/// `sat` is accepted, but only with a model under which the universal holds
+/// at points the problem never names.
 #[test]
 fn test_quantified_gate_still_failcloses_live_inner_binder() {
     let input = r#"
@@ -806,12 +819,36 @@ fn test_quantified_gate_still_failcloses_live_inner_binder() {
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
-    assert_eq!(
-        outputs.last().map(String::as_str),
-        Some("unknown"),
-        "a LIVE inner binder is not vacuous: the gate must still fail closed \
-         rather than publish an uncertified `sat` (#satgate-vacuous-binder)"
-    );
+    match outputs.last().map(String::as_str) {
+        Some("unknown") => {}
+        Some("sat") => {
+            let probe = parse("(get-value ((f 7) (f 123456)))").unwrap();
+            let values = exec.execute_all(&probe).unwrap();
+            let values = values.last().map(String::as_str).unwrap_or_default();
+            for point in ["(f 7)", "(f 123456)"] {
+                let value = int_value_after(values, point)
+                    .unwrap_or_else(|| panic!("no integer for {point} in {values:?}"));
+                assert!(
+                    value < 10,
+                    "the certified model must satisfy the universal at {point}; got {values:?}"
+                );
+            }
+        }
+        other => panic!(
+            "a LIVE inner binder must never yield an uncertified or wrong verdict; got {other:?}"
+        ),
+    }
+}
+
+/// The integer printed right after `key` in a `get-value` response.
+fn int_value_after(response: &str, key: &str) -> Option<i64> {
+    let rest = response[response.find(key)? + key.len()..].trim_start();
+    if let Some(negated) = rest.strip_prefix("(- ") {
+        let digits: String = negated.chars().take_while(char::is_ascii_digit).collect();
+        return digits.parse::<i64>().ok().map(|v| -v);
+    }
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// A source declaration that reuses a map-target builtin spelling is still free.
@@ -861,3 +898,5 @@ fn test_cegqi_declared_rem_is_not_builtin_ground_evaluate() {
 }
 
 include!("cegqi/closed_universal_proof_hole.rs");
+
+include!("cegqi/ce_free_resolve.rs");

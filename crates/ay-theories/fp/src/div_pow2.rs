@@ -74,7 +74,9 @@
 use ay_core::term::{Constant, TermData, TermId};
 use num_bigint::BigInt;
 
-use super::{FpDecomposed, FpPrecision, FpSolver, RoundingMode};
+use super::construction::control::{uninterrupted, BuildControl};
+use super::construction::FpBuildStage;
+use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand};
 
 /// Recursion depth for [`FpSolver::pow2_value`].
 ///
@@ -90,7 +92,7 @@ struct FpConstFields {
     /// Sign bit: `true` is negative.
     negative: bool,
     /// Biased exponent field.
-    biased_exponent: u32,
+    biased_exponent: u64,
     /// Whether the STORED significand (hidden bit excluded) is all zero.
     significand_zero: bool,
 }
@@ -141,7 +143,7 @@ impl FpSolver<'_> {
                 }
                 let bits = self.const_bv_field(args[0], precision.total_bits())?;
                 let negative = bits.bit(u64::from(precision.total_bits()) - 1);
-                let mut biased_exponent: u32 = 0;
+                let mut biased_exponent: u64 = 0;
                 for i in 0..eb {
                     if bits.bit(u64::from(stored) + u64::from(i)) {
                         biased_exponent |= 1 << i;
@@ -159,7 +161,7 @@ impl FpSolver<'_> {
                 let significand = self.const_bv_field(args[2], stored)?;
                 Some(FpConstFields {
                     negative: sign == BigInt::from(1),
-                    biased_exponent: u32::try_from(exponent).ok()?,
+                    biased_exponent: u64::try_from(exponent).ok()?,
                     significand_zero: significand == BigInt::from(0),
                 })
             }
@@ -192,8 +194,8 @@ impl FpSolver<'_> {
         negative: bool,
         unbiased_exponent: i64,
     ) -> Option<Pow2Value> {
-        let biased = unbiased_exponent.checked_add(i64::from(precision.bias()))?;
-        if biased < 1 || biased >= i64::from(precision.max_exponent()) {
+        let biased = unbiased_exponent.checked_add(i64::try_from(precision.bias()).ok()?)?;
+        if biased < 1 || biased >= i64::try_from(precision.max_exponent()).ok()? {
             return None;
         }
         Some(Pow2Value {
@@ -226,7 +228,8 @@ impl FpSolver<'_> {
             }
             return Some(Pow2Value {
                 negative: fields.negative,
-                unbiased_exponent: i64::from(fields.biased_exponent) - i64::from(precision.bias()),
+                unbiased_exponent: i64::try_from(fields.biased_exponent).ok()?
+                    - i64::try_from(precision.bias()).ok()?,
             });
         }
         if depth == 0 {
@@ -279,34 +282,66 @@ impl FpSolver<'_> {
         &mut self,
         x_term: TermId,
         y_term: TermId,
-        rm: RoundingMode,
+        rm: RmOperand,
         precision: FpPrecision,
     ) -> Option<FpDecomposed> {
-        let divisor = self.pow2_value(y_term, precision, POW2_MAX_DEPTH)?;
+        uninterrupted(|control| {
+            self.try_make_div_by_power_of_two_with_control(x_term, y_term, rm, precision, control)
+        })
+    }
+
+    pub(crate) fn try_make_div_by_power_of_two_with_control<C: BuildControl>(
+        &mut self,
+        x_term: TermId,
+        y_term: TermId,
+        rm: RmOperand,
+        precision: FpPrecision,
+        control: &mut C,
+    ) -> Result<Option<FpDecomposed>, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Term))?;
+        // The pure recognizer retains its existing fixed depth bound; the
+        // source operand encoding below must share this attempt's control.
+        let Some(divisor) = self.pow2_value(y_term, precision, POW2_MAX_DEPTH) else {
+            return Ok(None);
+        };
         // `1/c` must itself be a normal power of two, or it is not the
         // zero-significand constant built below.
-        let reciprocal =
-            Self::normal_pow2(precision, divisor.negative, -divisor.unbiased_exponent)?;
+        let Some(reciprocal) =
+            Self::normal_pow2(precision, divisor.negative, -divisor.unbiased_exponent)
+        else {
+            return Ok(None);
+        };
         // `normal_pow2` has already established `1 <= biased < max_exponent`,
         // so this conversion cannot fail; declining rather than panicking keeps
         // the whole module total, and a decline is only ever the slower path.
-        let biased =
-            u32::try_from(reciprocal.unbiased_exponent + i64::from(precision.bias())).ok()?;
-        let constant = self.fresh_decomposed(precision);
-        self.constrain_constant(
-            &constant,
+        let Ok(bias) = i64::try_from(precision.bias()) else {
+            return Ok(None);
+        };
+        let Some(biased) = reciprocal
+            .unbiased_exponent
+            .checked_add(bias)
+            .and_then(|value| u64::try_from(value).ok())
+        else {
+            return Ok(None);
+        };
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        let constant = self.make_constant(
+            precision,
             reciprocal.negative,
             |i| biased & (1 << i) != 0,
             |_| false,
         );
-        let x = self.get_fp(x_term);
-        Some(self.make_mul(&x, &constant, rm))
+        let x = self.get_fp_with_control(x_term, control)?;
+        Ok(Some(
+            self.make_mul_with_control(&x, &constant, rm, control)?,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoundingMode;
     use ay_core::term::{Symbol, TermStore};
     use ay_core::Sort;
 
@@ -433,7 +468,7 @@ mod tests {
         let x = terms.mk_var("x", f32_sort());
         let mut solver = FpSolver::new(&terms);
         assert!(solver
-            .try_make_div_by_power_of_two(x, huge, RoundingMode::RNE, FpPrecision::Float32)
+            .try_make_div_by_power_of_two(x, huge, RoundingMode::RNE.into(), FpPrecision::Float32)
             .is_none());
     }
 

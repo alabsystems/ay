@@ -69,9 +69,12 @@ fn named_app_is_well_sorted(terms: &TermStore, sort: &Sort, name: &str, args: &[
         }
         "+" | "*" => sort == &Sort::Int && all_sort(terms, args, &Sort::Int),
         "-" => sort == &Sort::Int && !args.is_empty() && all_sort(terms, args, &Sort::Int),
-        "mod" => sort == &Sort::Int && args.len() == 2 && all_sort(terms, args, &Sort::Int),
+        "div" | "mod" => sort == &Sort::Int && args.len() == 2 && all_sort(terms, args, &Sort::Int),
         "abs" => sort == &Sort::Int && args.len() == 1 && terms.sort(args[0]) == &Sort::Int,
-        "bv2nat" => {
+        // Z3's `bv2int` is the UNSIGNED `bv2nat` (the reading
+        // `ground_evaluate` and AY's elaborator already give it); a signed
+        // reading would be `sbv_to_int`, which stays unsupported.
+        "bv2nat" | "bv2int" => {
             sort == &Sort::Int && args.len() == 1 && valid_bv_sort(terms.sort(args[0])).is_some()
         }
         "bvnot" | "bvneg" => {

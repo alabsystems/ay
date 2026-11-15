@@ -67,7 +67,12 @@ impl Executor {
         else {
             return false;
         };
-        let authority_roots = self.independent_gate_query_roots();
+        let authority_roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return false;
+            }
+        };
         if authority_roots != original {
             return false;
         }

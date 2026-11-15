@@ -270,6 +270,19 @@ impl Solver {
                 return true;
             }
 
+            if preprocess_kissat::preprocess_kissat_enabled() {
+                let gates = preprocess_kissat::KissatPreprocessGates {
+                    skip_gate_dependent_passes,
+                    skip_congruence,
+                    skip_dense_formula,
+                };
+                match self.preprocess_kissat_round(gates, should_stop) {
+                    PreprocessStageControl::Continue => break,
+                    PreprocessStageControl::ReturnFalse => return false,
+                    PreprocessStageControl::Unsat => return true,
+                }
+            }
+
             let vars_before = self.num_vars - self.count_fixed_vars();
 
             let _t0 = _preprocess_start;
@@ -324,7 +337,8 @@ impl Solver {
                             "AB_AUTO: probe_equivs={equivs} active_vars={active_vars} density={density:.4} collapse_worthy={collapse_worthy}"
                         );
                     }
-                    if !collapse_worthy {
+                    // `--sat-subst-kissat`: Kissat never turns them off.
+                    if !collapse_worthy && !self.subst_kissat_active() {
                         // General instance: bail before decompose/fixpoint;
                         // only the cheap probe round was paid. Disable the
                         // gate-dependent substitution passes for the rest of
@@ -358,6 +372,7 @@ impl Solver {
             // Larger formulas defer to inprocessing where BVE has reduced the
             // formula size.
             if self.inproc_ctrl.backbone.enabled
+                && ay_core::sat_ab_switches().backbone_binary_kissat != Some(true)
                 && !skip_expensive_preprocessing_passes
                 && self.arena.num_clauses() <= 10_000
             {
@@ -543,7 +558,7 @@ impl Solver {
             if self.bve_post_collapse_unlock_active() {
                 self.inproc_ctrl.bve.enabled = true;
                 self.enforce_inprocessing_proof_overrides();
-                if self.inproc_ctrl.bve.enabled {
+                if self.inproc_ctrl.bve.enabled && self.preprocess_wall_budgets_enabled() {
                     // Proof-aware (wf_0c7d84e9): see PROOF_WALL_BUDGET_SCALE.
                     let extension_secs = self.bve_wall_budget_scale()
                         * if self.bve_sparse_deep_active() {
@@ -594,7 +609,7 @@ impl Solver {
             if self.try_qualify_bve_giant_raw() {
                 self.inproc_ctrl.bve.enabled = true;
                 self.enforce_inprocessing_proof_overrides();
-                if self.inproc_ctrl.bve.enabled {
+                if self.inproc_ctrl.bve.enabled && self.preprocess_wall_budgets_enabled() {
                     // Proof-aware (wf_0c7d84e9): see PROOF_WALL_BUDGET_SCALE.
                     let extension_secs = self.bve_wall_budget_scale()
                         * if self.bve_sparse_deep_active() {
@@ -737,7 +752,8 @@ impl Solver {
             } else if self.should_preprocess_factor()
                 && (!skip_expensive_preprocessing_passes
                     || (factor_dense_enabled()
-                        && formula_density >= config_preprocess_policy::factor_dense_min_density()))
+                        && formula_density >= config_preprocess_policy::factor_dense_min_density())
+                    || self.factor_large_unlock_active())
             {
                 // #14 factor-dense unlock (default ON, AY_AB_FACTOR_DENSE=0
                 // disables): dense ternary formulas are the MOST factorable
@@ -806,7 +822,7 @@ impl Solver {
             if self.try_qualify_bve_post_factor() {
                 self.inproc_ctrl.bve.enabled = true;
                 self.enforce_inprocessing_proof_overrides();
-                if self.inproc_ctrl.bve.enabled {
+                if self.inproc_ctrl.bve.enabled && self.preprocess_wall_budgets_enabled() {
                     // Proof-aware (wf_0c7d84e9): see PROOF_WALL_BUDGET_SCALE.
                     let extension_secs = self.bve_wall_budget_scale()
                         * if self.bve_sparse_deep_active() {

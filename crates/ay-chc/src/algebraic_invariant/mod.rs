@@ -23,6 +23,9 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use ay_core::time::Instant;
 use std::cell::Cell;
 
+/// Byte cap on verbose `Debug` dumps of formulas (shared DAGs print as trees).
+pub(crate) const VERBOSE_EXPR_BYTES: usize = 4096;
+
 mod bv_gate;
 mod init;
 mod polynomial;
@@ -92,6 +95,8 @@ pub(super) struct SynthesisBudget {
     deadline: Option<Instant>,
     cancellation: Option<CancellationToken>,
     tripped: Cell<bool>,
+    #[cfg(test)]
+    cancellation_after_polls: Cell<Option<usize>>,
 }
 
 impl SynthesisBudget {
@@ -100,6 +105,8 @@ impl SynthesisBudget {
             deadline,
             cancellation,
             tripped: Cell::new(false),
+            #[cfg(test)]
+            cancellation_after_polls: Cell::new(None),
         }
     }
 
@@ -114,6 +121,14 @@ impl SynthesisBudget {
         self.deadline
     }
 
+    /// Deterministically cancel the real token during a test's traversal.
+    #[cfg(test)]
+    pub(super) fn cancelling_after_polls(polls: usize) -> Self {
+        let budget = Self::new(None, Some(CancellationToken::new()));
+        budget.cancellation_after_polls.set(Some(polls));
+        budget
+    }
+
     /// True once the deadline has passed or the caller cancelled.
     ///
     /// Every caller of this treats `true` as "abandon synthesis and report
@@ -124,6 +139,16 @@ impl SynthesisBudget {
     pub(super) fn expired(&self) -> bool {
         if self.tripped.get() {
             return true;
+        }
+        #[cfg(test)]
+        if let Some(remaining) = self.cancellation_after_polls.get() {
+            if remaining == 0 {
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                }
+            } else {
+                self.cancellation_after_polls.set(Some(remaining - 1));
+            }
         }
         let done = self
             .deadline
@@ -478,7 +503,11 @@ fn try_algebraic_solve_with_deadline_impl(
             return AlgebraicResult::NotApplicable;
         };
         if verbose {
-            safe_eprintln!("Algebraic: pred {} formula {:?}", pred.name, formula);
+            safe_eprintln!(
+                "Algebraic: pred {} formula {}",
+                pred.name,
+                crate::expr::dag::debug_prefix(&formula, VERBOSE_EXPR_BYTES)
+            );
         }
         model.set(pred.id, PredicateInterpretation::new(pred_vars, formula));
         model.verification_method = InvariantVerificationMethod::AlgebraicClosedForm;
@@ -766,9 +795,9 @@ fn seed_fact_predicates(
 
         if verbose {
             safe_eprintln!(
-                "Algebraic: seeded fact pred {} with {:?}",
+                "Algebraic: seeded fact pred {} with {}",
                 pred.name,
-                formula
+                crate::expr::dag::debug_prefix(&formula, VERBOSE_EXPR_BYTES)
             );
         }
         solved_invariants.insert(pred.id, formula.conjuncts().into_iter().cloned().collect());

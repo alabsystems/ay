@@ -99,6 +99,25 @@ pub(in crate::executor) struct QuantifierProcessingResult {
     /// does not construct one shared interpretation for all accepted atoms, and
     /// E-matching having produced an instance is not domain coverage.
     pub quantifiers_supported_by_uf_completion: bool,
+    /// (#quantifier-ce-free-resolve) The EXACT assertion vector the primary
+    /// dispatch was handed — after the pre-dispatch soundness passes, before
+    /// any solver touched it — recorded only for a solve that minted a
+    /// universal counterexample lemma. It is the set the guarded re-solve
+    /// rebuilds from: every member is either an authored (post-Skolem,
+    /// post-abstraction) assertion, a consequence pushed by an entailed lane
+    /// or a soundness pass, or a counterexample conjunct named in
+    /// `cegqi_ce_lemma_ids`. `None` disables the re-solve.
+    pub cegqi_ce_free_snapshot: Option<Vec<TermId>>,
+    /// (#nra-guard-seed-instances) Guard-bound seed instances this solve
+    /// asserted (`guard_seed`). Nonzero arms the counterexample-free seed
+    /// presolve at the primary dispatch.
+    pub guard_seed_instances: usize,
+    /// (#nra-guard-seed-instances) The primary dispatch was replaced by the
+    /// seed presolve's refutation of the counterexample-free vector. Such a
+    /// refutation depends on no counterexample hypothesis, so result mapping
+    /// classifies it with every CEGQI flag off, exactly as the stage-4
+    /// re-solve's refutation is classified.
+    pub guard_seed_presolve_refuted: bool,
 }
 
 impl QuantifierProcessingResult {
@@ -125,6 +144,9 @@ impl QuantifierProcessingResult {
             cegqi_state: Vec::new(),
             has_unsafe_partial_quantifiers: false,
             quantifiers_supported_by_uf_completion: false,
+            cegqi_ce_free_snapshot: None,
+            guard_seed_instances: 0,
+            guard_seed_presolve_refuted: false,
         }
     }
 

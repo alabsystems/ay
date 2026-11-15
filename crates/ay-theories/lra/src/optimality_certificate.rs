@@ -162,12 +162,18 @@ impl LinForm {
                         (false, _) => self.add_var(term, scale),
                     }
                 }
-                ("/", 2) => match eval_const(terms, args[1]) {
-                    Some(d) if !d.is_zero() => {
-                        self.add_term(terms, args[0], &(scale / d));
+                ("/", 2) => {
+                    // Match the divisor by reference: moving it out of the
+                    // `Option` would leave a partially-moved value whose drop
+                    // re-reads its discriminant on every exit path.
+                    let divisor = eval_const(terms, args[1]);
+                    match &divisor {
+                        Some(d) if !d.is_zero() => {
+                            self.add_term(terms, args[0], &(scale / d));
+                        }
+                        _ => self.add_var(term, scale),
                     }
-                    _ => self.add_var(term, scale),
-                },
+                }
                 ("to_real", 1) => self.add_term(terms, args[0], scale),
                 _ => self.add_var(term, scale),
             },

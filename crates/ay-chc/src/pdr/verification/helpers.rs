@@ -10,15 +10,51 @@
 
 use super::*;
 
+/// Depth at which the case-split surface scan gives up (answers `false`).
+const CASE_SPLIT_SURFACE_DEPTH: usize = 128;
+
+/// A node the verification case split can split on.
+fn is_case_split_surface(expr: &ChcExpr) -> bool {
+    match expr {
+        ChcExpr::Op(ChcOp::Ite | ChcOp::Or, _) => true,
+        ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
+            matches!(args[0].as_ref(), ChcExpr::Op(ChcOp::Eq, eq) if eq.len() == 2)
+        }
+        _ => false,
+    }
+}
+
 impl PdrSolver {
     pub(super) fn has_verification_case_split_surface(expr: &ChcExpr) -> bool {
+        // A large tree none of whose paths reaches the depth cap: the tree
+        // walk below can then only answer by meeting a surface node, which is
+        // an OR over the distinct nodes (the WP-F `prefer_dag_walk` rule). The
+        // tree walk was exponential in the nesting of shared sub-terms
+        // (verify_model on a shared `let` chain).
+        if crate::expr::dag::prefer_dag_walk(expr, CASE_SPLIT_SURFACE_DEPTH) {
+            let mut found = false;
+            crate::expr::dag::walk_distinct_preorder(expr, |node| {
+                if is_case_split_surface(node) {
+                    found = true;
+                    crate::expr::dag::Step::Stop
+                } else {
+                    crate::expr::dag::Step::Descend
+                }
+            });
+            return found;
+        }
         let mut stack = vec![(expr, 0usize)];
         while let Some((expr, depth)) = stack.pop() {
-            if depth >= 128 {
+            if depth >= CASE_SPLIT_SURFACE_DEPTH {
                 return false;
             }
 
             match expr {
+                ChcExpr::ArrayLambda(lambda) => {
+                    for value in lambda.captures() {
+                        stack.push((value, depth + 1));
+                    }
+                }
                 ChcExpr::Op(ChcOp::Ite | ChcOp::Or, _) => return true,
                 ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
                     if matches!(args[0].as_ref(), ChcExpr::Op(ChcOp::Eq, eq) if eq.len() == 2) {
@@ -428,3 +464,7 @@ impl PdrSolver {
         Some(true)
     }
 }
+
+#[cfg(test)]
+#[path = "helpers_tests.rs"]
+mod tests;

@@ -81,7 +81,7 @@ fn test_no_bve_cli_flag_solves_without_warning() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("SAT") || stdout.contains("sat"),
+        stdout.lines().any(|line| line.trim() == "s SATISFIABLE"),
         "expected sat output, got: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -173,7 +173,7 @@ fn test_smt_bv_stats_json_fail_closes_unsupported_jit_counters() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("sat"),
+        stdout.lines().any(|line| line.trim() == "sat"),
         "QF_BV fixture should solve as sat, got: {stdout}"
     );
 

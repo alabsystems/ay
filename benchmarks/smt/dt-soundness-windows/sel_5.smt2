@@ -1,0 +1,7 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((Inner 0) (Outer 0)) (((iC (ia Int) (ib Int)) (iN)) ((oC (oi Inner) (ol Int)) (oN))))
+(declare-const o Outer)
+(assert (is-oC o))
+(assert (is-iC (oi o)))
+(assert (= (ia (oi o)) 3))
+(check-sat)

@@ -8,17 +8,37 @@
 //! Contains SAT model verification against clause DB and original formula.
 
 use super::*;
+use crate::reconstruct::admitted::{ordinary, Ordinary};
 use crate::solver::preprocess::ModelViolation;
+
+pub(in crate::solver) mod admitted;
 
 impl Solver {
     /// Get the current model from vals[] (#3758 Phase 3).
     pub(super) fn get_model(&self) -> Vec<bool> {
-        (0..self.num_vars).map(|v| self.vals[v * 2] > 0).collect()
+        ordinary(self.current_model_admitted(&Ordinary))
     }
 
-    /// Get model from saved phases (used when walk finds SAT)
+    /// Get model from saved phases (used when walk finds SAT).
+    ///
+    /// A variable fixed at the root keeps its fixed value: the trail is the
+    /// only record of a root fact once its unit clause has left the arena (a
+    /// BVE unit resolvent that the post-BVE dense propagation deleted as
+    /// satisfied; a learned unit that reduction dropped), and the walk, which
+    /// reads the arena and the phases only, can set such a variable the other
+    /// way. The candidate then satisfies every arena clause and fails the
+    /// original-ledger check, and the solve ends `unknown` (found by the
+    /// 2026-09-17 audit on a SAT and an UNSAT generator family).
     pub(super) fn get_model_from_phases(&self) -> Vec<bool> {
-        self.phase.iter().map(|&p| p >= 0).collect()
+        (0..self.phase.len())
+            .map(|v| {
+                if v < self.num_vars && self.var_is_assigned(v) && self.var_data[v].level == 0 {
+                    self.vals[v * 2] > 0
+                } else {
+                    self.phase[v] >= 0
+                }
+            })
+            .collect()
     }
 
     /// Verify that a model satisfies all original clauses.
@@ -110,46 +130,19 @@ impl Solver {
         model: &[bool],
         skip_inprocessing: bool,
     ) -> Option<ModelViolation> {
-        for idx in self.arena.indices() {
-            if self.should_skip_clause_verification(idx, skip_inprocessing) {
-                continue;
-            }
-
-            let lits = self.arena.literals(idx);
-
-            // After reconstruction, skip clauses containing inprocessing
-            // artifacts: eliminated variables or extension variables created
-            // by factorization (index >= user_num_vars). Reconstruction
-            // restores the original formula's satisfiability -- derived
-            // arena clauses may not be satisfied. verify_against_original
-            // checks the immutable original formula as the authoritative
-            // correctness gate for reconstruction (#4999: always-on).
-            if skip_inprocessing
-                && lits.iter().any(|lit| {
-                    let vi = lit.variable().index();
-                    vi >= self.user_num_vars
-                        || (vi < self.var_lifecycle.len() && self.var_lifecycle.is_removed(vi))
-                })
-            {
-                continue;
-            }
-
-            if !Self::clause_satisfied(lits, model) {
-                return Some(ModelViolation::ClauseDb {
-                    clause_index: idx,
-                    clause_dimacs: Self::clause_dimacs(lits),
-                });
-            }
-        }
-
-        // CaDiCaL does NOT verify the model against removed (reconstruction
-        // stack) clauses after extend(). With gate-based restricted resolution,
-        // the reconstruction stack contains only gate clauses; non-gate clauses
-        // are not on the stack and their satisfaction is implied by the gate
-        // definition + resolvents. Individual gate clauses may also become
-        // unsatisfied when inter-variable reconstruction flips shared variables.
-        // `verify_against_original` checks the original formula (#4818, #4999).
-        None
+        ordinary(self.first_arena_violation_admitted(
+            model,
+            if skip_inprocessing {
+                admitted::ArenaMode::SkipInprocessing
+            } else {
+                admitted::ArenaMode::Full
+            },
+            &Ordinary,
+        ))
+        .map(|idx| ModelViolation::ClauseDb {
+            clause_index: idx,
+            clause_dimacs: Self::clause_dimacs(self.arena.literals(idx)),
+        })
     }
 
     /// Domain-aware model verification (#8473).
@@ -253,51 +246,41 @@ impl Solver {
     /// clause is satisfied; `false` otherwise. Callers (declare_sat_*) downgrade
     /// to `Unknown` on failure rather than returning an unsound SAT.
     pub(super) fn verify_external_model(&self, model: &[bool]) -> bool {
-        for (ci, clause) in self.cold.original_ledger.iter_clauses().enumerate() {
+        if let Some(ci) = ordinary(self.first_original_violation_admitted(
+            model,
+            admitted::OriginalDomain::Full,
+            &Ordinary,
+        )) {
+            #[cfg(debug_assertions)]
+            let clause = self.cold.original_ledger.clause(ci);
             #[cfg(not(debug_assertions))]
             let _ = ci;
-
-            // Skip clauses containing scope selector variables (same logic as
-            // finalize_sat_model).
-            if self.cold.has_ever_scoped {
-                let has_scope = clause.iter().any(|lit| {
-                    let vi = lit.variable().index();
-                    vi < self.cold.was_scope_selector.len() && self.cold.was_scope_selector[vi]
-                });
-                if has_scope {
-                    continue;
-                }
-            }
-            if !clause.iter().any(|&lit| {
-                let vi = lit.variable().index();
-                vi < model.len() && (model[vi] == lit.is_positive())
-            }) {
-                #[cfg(debug_assertions)]
-                {
-                    let clause_dimacs: Vec<i32> = clause
-                        .iter()
-                        .map(|&lit| {
-                            let v = lit.variable().0 as i32 + 1;
-                            if lit.is_positive() {
-                                v
-                            } else {
-                                -v
-                            }
-                        })
-                        .collect();
-                    let lit_vals: Vec<String> = clause
-                        .iter()
-                        .map(|&lit| {
-                            let vi = lit.variable().index();
-                            let model_val = if vi < model.len() {
-                                Some(model[vi])
-                            } else {
-                                None
-                            };
-                            format!("var{}=model:{:?}(pos={})", vi, model_val, lit.is_positive())
-                        })
-                        .collect();
-                    eprintln!(
+            #[cfg(debug_assertions)]
+            {
+                let clause_dimacs: Vec<i32> = clause
+                    .iter()
+                    .map(|&lit| {
+                        let v = lit.variable().0 as i32 + 1;
+                        if lit.is_positive() {
+                            v
+                        } else {
+                            -v
+                        }
+                    })
+                    .collect();
+                let lit_vals: Vec<String> = clause
+                    .iter()
+                    .map(|&lit| {
+                        let vi = lit.variable().index();
+                        let model_val = if vi < model.len() {
+                            Some(model[vi])
+                        } else {
+                            None
+                        };
+                        format!("var{}=model:{:?}(pos={})", vi, model_val, lit.is_positive())
+                    })
+                    .collect();
+                eprintln!(
                         "verify_external_model FAIL: clause {ci}/{}: dimacs={clause_dimacs:?}, lits=[{}], model_len={}, has_ever_scoped={}, scope_selectors_len={}",
                         self.cold.original_ledger.num_clauses(),
                         lit_vals.join(", "),
@@ -305,9 +288,8 @@ impl Solver {
                         self.cold.has_ever_scoped,
                         self.cold.scope_selectors.len(),
                     );
-                }
-                return false;
             }
+            return false;
         }
         true
     }

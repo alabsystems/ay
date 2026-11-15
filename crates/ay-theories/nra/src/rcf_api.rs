@@ -129,7 +129,8 @@ pub fn real_roots(coeffs: &[BigRational]) -> Option<Vec<RealScalar>> {
         return Some(Vec::new()); // non-zero constant: no real roots
     }
     let markers = isolate_roots(&sf)?;
-    let mut out = Vec::with_capacity(markers.len());
+    let mut out = Vec::new();
+    out.try_reserve_exact(markers.len()).ok()?;
     for mk in markers {
         match mk {
             RootMarker::Rational(r) => out.push(RealScalar::Rational(r)),

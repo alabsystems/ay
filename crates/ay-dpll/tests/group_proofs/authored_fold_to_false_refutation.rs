@@ -289,31 +289,37 @@ fn the_same_query_agrees_with_and_without_an_artifact_request() {
     );
 }
 
-/// THE BOUNDARY, pinned deliberately. The VerifierConsumer bare-claim obligation writes
-/// its BV literals as `(_ bv1 64)`; the override-aware printer renders them
-/// `#x0000000000000001`, so `rebuilt_root_prints_as_authored` refuses the
-/// round-trip and the promoter declines. That guard is right — a premise an
-/// external checker cannot match to the problem is strictly worse than the hole
-/// it would replace (`authored_conjunct_eval`'s own rationale) — so the honest
-/// state is a decline, and this pin records it.
-///
-/// EXPECTED TO GO RED IN THE GOOD DIRECTION once the printer and the surface
-/// agree on bit-vector literal notation. A `sat` here would be the alarm.
+/// Decimal source literals and hexadecimal wire literals denote the same
+/// exact-width values. The source round-trip now admits this contradiction;
+/// require a complete derivation whose empty clause consumes its assumption.
 #[test]
-fn a_bitvector_literal_query_declines_the_promoter_and_stays_unknown() {
-    let (outputs, _) = run_with_proofs(
-        "(set-logic QF_BV)
+fn a_bitvector_literal_query_publishes_a_checked_refutation() {
+    let script = "(set-option :produce-proofs true)
+(set-logic QF_BV)
 (declare-const x (_ BitVec 64))
 (declare-const r (_ BitVec 64))
 (assert (= r (bvlshr x (_ bv1 64))))
 (assert (not (bvule (_ bv0 64) (_ bv1 64))))
 (check-sat)
-",
-    );
+";
+    let (outputs, proof) = run(script);
     assert_eq!(
         outputs.last().map(String::as_str),
-        Some("unknown"),
-        "the round-trip guard declines BV literal notation; a `sat` here would \
-         mean the promoter published a model as a refutation: {outputs:?}"
+        Some("unsat"),
+        "the literal contradiction must retain its certified verdict: {outputs:?}"
+    );
+    let proof = proof.expect("a certified verdict must export its refutation");
+    assert!(!proof.contains("(error"), "proof export failed: {proof}");
+    assert!(!proof.contains(":rule hole"), "incomplete proof: {proof}");
+    assert!(!proof.contains(":rule trust"), "unverified proof: {proof}");
+    assert!(
+        empty_clause_support(&proof).iter().any(|id| id == "t0"),
+        "the empty clause must depend on the source assumption: {proof}"
+    );
+    println!(
+        "LITERAL_PROOF_CERTIFICATE={}",
+        serde_json::json!({
+            "type": "alethe_certificate", "version": "1.0", "problem": script, "proof": proof
+        })
     );
 }

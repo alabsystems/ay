@@ -31,6 +31,23 @@ pub const fn smt_bv_batch_template_application_count() -> u64 {
     0
 }
 
+/// Largest number of entries [`BvClauseBatch::with_capacity`] reserves up
+/// front for either buffer. Reservation is a sizing hint: a batch that outgrows
+/// it grows on push exactly as an unreserved `Vec` does.
+const MAX_RESERVED_ENTRIES: usize = 1 << 24;
+
+/// Complement of a CNF literal: `neg_lit(lit) == -lit` for every literal.
+///
+/// CNF literals are DIMACS `±var` with `var` in `1..=i32::MAX`, a domain on
+/// which negation never overflows, so `wrapping_neg` is total and identical to
+/// `-lit` there (the same form as gates.rs and ay-core's `Tseitin::negate`).
+/// `i32::MIN` is not a literal of any variable; it is the one value
+/// `wrapping_neg` maps to itself.
+#[inline]
+const fn neg_lit(lit: CnfLit) -> CnfLit {
+    lit.wrapping_neg()
+}
+
 /// A contiguous range of freshly allocated CNF variables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BvFreshVarRange {
@@ -52,7 +69,11 @@ impl BvFreshVarRange {
     /// Return the last variable in the range.
     #[must_use]
     pub fn last(&self) -> Option<CnfLit> {
-        (self.count > 0).then_some(self.first + self.count as CnfLit - 1)
+        // `count - 1` fits a `CnfLit` and `first + (count - 1)` does not
+        // overflow for every range `BvSolver::batch_fresh_vars` builds: it
+        // refuses any range reaching past `i32::MAX`.
+        let span = CnfLit::try_from(self.count.checked_sub(1)?).ok()?;
+        self.first.checked_add(span)
     }
 
     /// Return the number of variables in the range.
@@ -69,8 +90,10 @@ impl BvFreshVarRange {
 
     /// Iterate over the variables in ascending allocation order.
     pub fn iter(&self) -> impl Iterator<Item = CnfLit> {
+        // `first..=last` is exactly `first + i` for `i` in `0..count`; an
+        // empty range has no `last` and yields nothing.
         let first = self.first;
-        (0..self.count).map(move |i| first + i as CnfLit)
+        self.last().into_iter().flat_map(move |last| first..=last)
     }
 
     /// Materialize the range as bit literals.
@@ -105,14 +128,28 @@ impl BvClauseBatch {
     }
 
     /// Create an empty batch with storage reserved.
+    ///
+    /// Each reservation is capped at an internal bound (2^24 entries); a batch
+    /// that outgrows it grows on push, so the capacities stay sizing hints.
     #[must_use]
     pub fn with_capacity(num_vars: u32, clause_capacity: usize, literal_capacity: usize) -> Self {
-        let mut offsets = Vec::with_capacity(clause_capacity.saturating_add(1));
+        let offset_count = clause_capacity.saturating_add(1);
+        let offset_reserve = if offset_count <= MAX_RESERVED_ENTRIES {
+            offset_count
+        } else {
+            MAX_RESERVED_ENTRIES
+        };
+        let literal_reserve = if literal_capacity <= MAX_RESERVED_ENTRIES {
+            literal_capacity
+        } else {
+            MAX_RESERVED_ENTRIES
+        };
+        let mut offsets = Vec::with_capacity(offset_reserve);
         offsets.push(0);
         Self {
             num_vars,
             offsets,
-            literals: Vec::with_capacity(literal_capacity),
+            literals: Vec::with_capacity(literal_reserve),
         }
     }
 
@@ -187,9 +224,9 @@ impl BvClauseBatch {
         if index >= self.clause_count() {
             return None;
         }
-        let start = self.offsets[index] as usize;
-        let end = self.offsets[index + 1] as usize;
-        Some(&self.literals[start..end])
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index.checked_add(1)?)? as usize;
+        self.literals.get(start..end)
     }
 
     /// Iterate over clauses in deterministic emission order.
@@ -345,27 +382,27 @@ impl BvGateTemplate {
         let out = self.output;
         match self.kind {
             BvGateTemplateKind::And => {
-                batch.push_clause(&[-out, a]);
-                batch.push_clause(&[-out, b]);
-                batch.push_clause(&[-a, -b, out]);
+                batch.push_clause(&[neg_lit(out), a]);
+                batch.push_clause(&[neg_lit(out), b]);
+                batch.push_clause(&[neg_lit(a), neg_lit(b), out]);
             }
             BvGateTemplateKind::Or => {
-                batch.push_clause(&[-a, out]);
-                batch.push_clause(&[-b, out]);
-                batch.push_clause(&[-out, a, b]);
+                batch.push_clause(&[neg_lit(a), out]);
+                batch.push_clause(&[neg_lit(b), out]);
+                batch.push_clause(&[neg_lit(out), a, b]);
             }
             BvGateTemplateKind::Xor => {
-                batch.push_clause(&[-a, -b, -out]);
-                batch.push_clause(&[-a, b, out]);
-                batch.push_clause(&[a, -b, out]);
-                batch.push_clause(&[a, b, -out]);
+                batch.push_clause(&[neg_lit(a), neg_lit(b), neg_lit(out)]);
+                batch.push_clause(&[neg_lit(a), b, out]);
+                batch.push_clause(&[a, neg_lit(b), out]);
+                batch.push_clause(&[a, b, neg_lit(out)]);
             }
             BvGateTemplateKind::Mux => {
                 let sel = self.selector;
-                batch.push_clause(&[-sel, -a, out]);
-                batch.push_clause(&[-sel, a, -out]);
-                batch.push_clause(&[sel, -b, out]);
-                batch.push_clause(&[sel, b, -out]);
+                batch.push_clause(&[neg_lit(sel), neg_lit(a), out]);
+                batch.push_clause(&[neg_lit(sel), a, neg_lit(out)]);
+                batch.push_clause(&[sel, neg_lit(b), out]);
+                batch.push_clause(&[sel, b, neg_lit(out)]);
             }
         }
     }
@@ -433,9 +470,10 @@ impl BvTemplateBatch {
         let first_clause = u32::try_from(self.clauses.clause_count())
             .expect("BV template batch exceeds u32 clause index contract");
         template.stamp_into(&mut self.clauses);
-        let clause_count = u32::try_from(self.clauses.clause_count())
-            .expect("BV template batch clause overflow")
-            - first_clause;
+        // `stamp_into` appends exactly `template.clause_count()` clauses (3 for
+        // AND/OR, 4 for XOR/MUX), so the gate occupies that many from
+        // `first_clause` on.
+        let clause_count = template.clause_count();
         let stamped = BvStampedGate {
             template,
             first_clause,

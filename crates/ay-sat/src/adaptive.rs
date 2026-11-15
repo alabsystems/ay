@@ -131,8 +131,11 @@ fn adjust_features_for_instance_with_circuit_equiv_profile(
     // Rule 4: Industrial/large formulas — disable reorder.
     // Kissat-style clause-weighted VMTF reorder is O(n log n) and the constant
     // factor is high. On large industrial formulas the overhead exceeds benefit.
+    // `--sat-reorder-kissat` keeps it: Kissat reorders at any size, and on
+    // knight_18 (126K variables) its model follows a reorder in 6 of 7 solves.
     if (*class == InstanceClass::Industrial || features.num_vars > REORDER_MAX_VARS)
         && profile.reorder
+        && ay_core::sat_ab_switches().reorder_kissat != Some(true)
     {
         profile.reorder = false;
         changed = true;

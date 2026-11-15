@@ -51,6 +51,8 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::NraSolver;
 
+mod sos_translation;
+
 /// A dense univariate polynomial over the rationals, `coeffs[i]` is the
 /// coefficient of `x^i`. The zero polynomial is the empty vector. By
 /// construction (via [`UniPoly::normalize`]) the leading coefficient is
@@ -551,7 +553,9 @@ impl NraSolver<'_> {
                 let sign = match poly.degree() {
                     None => 0,                                 // zero polynomial
                     Some(0) => rational_sign(&poly.coeffs[0]), // constant
-                    Some(_) => unreachable!("var=None implies degree<=0"),
+                    // var=None implies degree<=0; a polynomial that breaks
+                    // that invariant is declined rather than classified.
+                    Some(_) => return AtomClass::OutOfScope,
                 };
                 if rel.holds_for_sign(sign) {
                     AtomClass::ConstTrue
@@ -2703,6 +2707,11 @@ fn integer_sqrt_exact(n: &BigInt) -> Option<BigInt> {
 ///
 /// Returns `None` if bisection exceeds a generous budget (then `unknown`).
 fn isolate_sturm(p: &UniPoly) -> Option<Vec<RootMarker>> {
+    // The square-free part and the Sturm sequence below are exact remainder
+    // sequences, costly on large coefficients; a stopped check starts none.
+    if ay_core::resource::check_stop_requested() {
+        return None;
+    }
     let sqfree = square_free_part(p)?;
     let deg = sqfree.degree()?;
     if deg == 0 {
@@ -2739,7 +2748,10 @@ fn isolate_sturm(p: &UniPoly) -> Option<Vec<RootMarker>> {
     let mut budget: usize = 200_000;
 
     while let Some((lo, hi, count)) = work.pop() {
-        if budget == 0 {
+        // A single isolation can outlast the check (sampled: the witness
+        // search's leaf decisions spent over 2 s each here past a deadline).
+        // Giving up is the same `unknown` as an exhausted budget.
+        if budget == 0 || ay_core::resource::check_stop_requested() {
             return None;
         }
         budget -= 1;
@@ -2842,7 +2854,7 @@ fn tighten_isolating(
         if &hi - &lo <= half {
             return Some(Tightened::Interval(lo, hi));
         }
-        if *budget == 0 {
+        if *budget == 0 || ay_core::resource::check_stop_requested() {
             return None;
         }
         *budget -= 1;
@@ -4252,7 +4264,13 @@ impl NraSolver<'_> {
                 continue;
             };
             for v in rational_grid(&lo, &hi) {
-                if *budget == 0 {
+                // The work budget bounds candidates, not time: one exact leaf
+                // decision can be slow. On QF_NRA meti-tarski
+                // `sin-problem-8-chunk-0061` the `--z3-mode` run was inside
+                // this search 9-12 s into `-T:10` (sampled) and ended in the
+                // watchdog's hard exit; a 1 s per-check `:timeout` was not
+                // seen at all. No witness is always a sound answer.
+                if *budget == 0 || ay_core::resource::check_stop_requested() {
                     return None;
                 }
                 *budget -= 1;

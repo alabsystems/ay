@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+% A coefficient above i64::MAX, so the whole `pol` derivation below sits one
+% width tier above the proved kernel's NARROW coefficient domain. Its purpose is
+% to pin, in tests/kernel_verify_expected.txt, that --kernel-verify covers that
+% tier: the narrow replay stands down on width, the bridge re-runs the same step
+% at the kernel's unbounded (BigInt) instantiation, and the run reports "nothing
+% outside the proved fragment" with a fully composed shadow database. Before the
+% kernel was made generic over its coefficient domain this instance pinned the
+% opposite -- a counted `constraint-not-i64-representable` skip -- and that hole
+% is where two of the three red-team wrong verdicts hid; see the development design notes
+% section 7.3. Do not "simplify" the coefficient: the instance is worthless
+% below 2^63.
+f 2;
+pol 2 2 +;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

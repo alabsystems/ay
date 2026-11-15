@@ -226,7 +226,11 @@ pub(crate) fn clause_is_falsified(clause: &[i32], trail: &[i32]) -> bool {
         // correct; it is `clause_is_valid` that refuses to certify it.
         return true;
     }
-    clause.iter().all(|&c| c != 0 && trail.contains(&-c))
+    // `i32::MIN` has no negation, so no trail literal can be its complement:
+    // that literal is not falsified (and is not a literal a trail can hold).
+    clause
+        .iter()
+        .all(|&c| c != 0 && c.checked_neg().is_some_and(|neg| trail.contains(&neg)))
 }
 
 // ============================================================================
@@ -422,7 +426,7 @@ fn sample_points(roots: &[Anum]) -> Option<Vec<Anum>> {
 
     // Strictly below every root. `lower_handle` of the smallest root is `< it`
     // when irrational; when rational, step down by one.
-    let first = &roots[0];
+    let first = roots.first()?;
     out.push(Anum::rational(match first {
         Anum::Rational(q) => q.clone() - BigRational::one(),
         Anum::Alg(_) => lower_handle(first),
@@ -430,13 +434,13 @@ fn sample_points(roots: &[Anum]) -> Option<Vec<Anum>> {
 
     for (i, r) in roots.iter().enumerate() {
         out.push(r.clone());
-        if let Some(next) = roots.get(i + 1) {
+        if let Some(next) = i.checked_add(1).and_then(|j| roots.get(j)) {
             out.push(Anum::rational(strictly_between(r, next)?));
         }
     }
 
     // Strictly above every root.
-    let last = &roots[roots.len() - 1];
+    let last = roots.last()?;
     out.push(Anum::rational(match last {
         Anum::Rational(q) => q.clone() + BigRational::one(),
         Anum::Alg(_) => upper_handle(last),
@@ -574,7 +578,15 @@ fn minimize(lits: &[ConflictLit], keep: &mut Vec<usize>) {
             break;
         }
         let trial: Vec<usize> = keep.iter().copied().filter(|&i| i != c).collect();
-        let sub: Vec<ConflictLit> = trial.iter().map(|&i| lits[i].clone()).collect();
+        // An index outside `lits` cannot be checked, so the literal is kept —
+        // the same fail-closed direction as a declined check.
+        let Some(sub) = trial
+            .iter()
+            .map(|&i| lits.get(i).cloned())
+            .collect::<Option<Vec<ConflictLit>>>()
+        else {
+            continue;
+        };
         // Only a PROVED-valid trial removes a literal. `None` and `Some(false)`
         // both keep it.
         if clause_is_valid(&sub) == Some(true) {
@@ -650,7 +662,10 @@ pub(crate) fn explain_univariate(lits: &[ConflictLit]) -> Option<Explanation> {
         minimize(lits, &mut keep);
     }
 
-    let sub: Vec<ConflictLit> = keep.iter().map(|&i| lits[i].clone()).collect();
+    let sub: Vec<ConflictLit> = keep
+        .iter()
+        .map(|&i| lits.get(i).cloned())
+        .collect::<Option<Vec<ConflictLit>>>()?;
 
     // THE GATE. Not "the producer said so" — the clause is re-derived as a
     // theory consequence by an independent decision procedure, and anything
@@ -660,8 +675,13 @@ pub(crate) fn explain_univariate(lits: &[ConflictLit]) -> Option<Explanation> {
     }
 
     let cited_lits: Vec<i32> = sub.iter().map(|l| l.lit).collect();
+    // `i32::MIN` has no negation; a clause over it cannot be spelled, so decline.
+    let lits = cited_lits
+        .iter()
+        .map(|&l| l.checked_neg())
+        .collect::<Option<Vec<i32>>>()?;
     Some(Explanation {
-        lits: cited_lits.iter().map(|&l| -l).collect(),
+        lits,
         cited: cited_lits,
     })
 }
@@ -671,7 +691,7 @@ pub(crate) fn explain_univariate(lits: &[ConflictLit]) -> Option<Explanation> {
 // ============================================================================
 
 /// Which projection factor a polynomial came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq)]
 pub(crate) enum ProjKind {
     /// Leading coefficient of `polys[i]` in the projected variable — it
     /// vanishing is what makes the degree drop and the root structure change.
@@ -683,6 +703,21 @@ pub(crate) enum ProjKind {
     /// one crosses a root of the other, which is where the ORDER of the cells
     /// changes.
     Resultant(usize, usize),
+}
+
+// Written out rather than derived: the derived `eq` compares discriminants and
+// then matches the pair with an `unreachable` arm for mismatched variants, an
+// arm Level-0 verification cannot rule out. Matching the pair directly is the
+// same relation with no unreachable arm.
+impl PartialEq for ProjKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::LeadingCoeff(a), Self::LeadingCoeff(b))
+            | (Self::Discriminant(a), Self::Discriminant(b)) => a == b,
+            (Self::Resultant(a, b), Self::Resultant(c, d)) => a == c && b == d,
+            _ => false,
+        }
+    }
 }
 
 /// One projection factor and where it came from.
@@ -828,7 +863,10 @@ pub(crate) fn project(polys: &[RPoly<MPolyZ>], pairs: &[(usize, usize)]) -> Opti
         if i >= polys.len() || j >= polys.len() || i == j {
             return None;
         }
-        let res = subresultant::resultant(&polys[i], &polys[j])?;
+        let (Some(pi), Some(pj)) = (polys.get(i), polys.get(j)) else {
+            return None;
+        };
+        let res = subresultant::resultant(pi, pj)?;
         factors.push(ProjFactor {
             kind: ProjKind::Resultant(i, j),
             poly: res,

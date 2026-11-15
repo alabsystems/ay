@@ -59,15 +59,24 @@ impl LraSolver {
         depth: usize,
     ) -> Option<(Rational, Vec<TheoryLit>)> {
         let vi = var_id as usize;
-        // Direct fixing first: asserted lo == hi with atom reasons.
+        // Direct fixing first: asserted lo == hi with atom reasons. A pin
+        // that is a guess, a hypothesis or a cut is no support.
         if let Some(info) = self.vars.get(vi) {
             if let (Some(lo), Some(hi)) = (&info.lower, &info.upper) {
-                if !lo.strict && !hi.strict && lo.value == hi.value {
+                if !lo.strict
+                    && !hi.strict
+                    && lo.value == hi.value
+                    && self.bound_reasons_all_asserted(lo)
+                    && self.bound_reasons_all_asserted(hi)
+                    && !bound_cites_sentinel(lo)
+                    && !bound_cites_sentinel(hi)
+                {
                     let mut reasons = Vec::new();
-                    for (term, val) in lo.reason_pairs().chain(hi.reason_pairs()) {
-                        if term.is_sentinel() {
-                            continue;
-                        }
+                    let complete = lo
+                        .complete_reason_pairs()
+                        .into_iter()
+                        .chain(hi.complete_reason_pairs());
+                    for (term, val) in complete {
                         let lit = TheoryLit::new(term, val);
                         if !reasons.contains(&lit) {
                             reasons.push(lit);
@@ -276,9 +285,15 @@ impl LraSolver {
         }
         let previous_key = self.fixed_term_value_members.get(&var_id).cloned();
 
+        // Both keys are read by reference; only `current_key` is moved, once,
+        // below. A key moved out on one path and not another is dropped
+        // through a discriminant re-read on every exit, and those re-reads
+        // lose the `Option`'s tag range.
         if current_key == previous_key {
-            if let Some(key) = current_key {
-                self.fixed_term_value_table.entry(key).or_insert(var_id);
+            if let Some(key) = &current_key {
+                self.fixed_term_value_table
+                    .entry(key.clone())
+                    .or_insert(var_id);
             }
             return;
         }
@@ -288,9 +303,9 @@ impl LraSolver {
                 .retain(|(lhs, rhs)| *lhs != var_id && *rhs != var_id);
         }
 
-        if let Some(old_key) = previous_key {
+        if let Some(old_key) = &previous_key {
             self.fixed_term_value_members.remove(&var_id);
-            self.reassign_fixed_term_representative(&old_key, var_id);
+            self.reassign_fixed_term_representative(old_key, var_id);
         }
 
         let Some(key) = current_key else {
@@ -309,4 +324,27 @@ impl LraSolver {
             }
         }
     }
+}
+
+/// Whether `bound` rests on a sentinel reason, directly or through its
+/// provenance. Such a bound is a hypothesis or a cut whose premises are not
+/// recorded: the atoms beside the sentinel do not entail it.
+pub(crate) fn bound_cites_sentinel(bound: &Bound) -> bool {
+    fn provenance_cites_sentinel(provenance: &BoundProvenance) -> bool {
+        match provenance {
+            BoundProvenance::Atom { term, .. } => term.is_sentinel(),
+            BoundProvenance::SharedEquality { reasons } => {
+                reasons.iter().any(|(term, _)| term.is_sentinel())
+            }
+            BoundProvenance::Join { parts } => {
+                parts.iter().any(|part| provenance_cites_sentinel(part))
+            }
+            BoundProvenance::Axiom => false,
+        }
+    }
+    bound.reason_pairs().any(|(term, _)| term.is_sentinel())
+        || bound
+            .provenance
+            .as_ref()
+            .is_some_and(provenance_cites_sentinel)
 }

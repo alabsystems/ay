@@ -334,3 +334,72 @@ fn canonical_proof_renderer_authenticates_term_handles_before_store_access() {
         );
     }
 }
+
+#[path = "test_term_inspection/fallible.rs"]
+mod fallible;
+/// The total twin of `render_term_canonical` (external-codegen-ir r11 item 5): an
+/// unauthenticated handle is a typed `InvalidTermHandle`, never a panic, and
+/// an authenticated one renders exactly what the panicking method renders.
+#[test]
+fn try_render_term_canonical_refuses_unauthenticated_handles_typed() {
+    let mut first = Solver::new(Logic::All);
+    let mut second = Solver::new(Logic::All);
+    let foreign = first.declare_const("foreign-proof-term", Sort::Bool);
+
+    for invalid in [foreign, Term::from_raw(foreign.to_raw())] {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            second.try_render_term_canonical(invalid)
+        }));
+        assert!(
+            matches!(
+                result,
+                Ok(Err(SolverError::InvalidTermHandle {
+                    operation: "render_term_canonical",
+                    ..
+                }))
+            ),
+            "an unauthenticated term is a typed refusal: {result:?}"
+        );
+    }
+
+    let own = second.declare_const("own-proof-term", Sort::Bool);
+    let negated = second.not(own);
+    assert_eq!(
+        second.try_render_term_canonical(negated).ok(),
+        Some(second.render_term_canonical(negated))
+    );
+}
+
+/// The total twin of `term_sort` (external-codegen-ir r11 review M1): an unauthenticated
+/// handle is a typed `InvalidTermHandle`, never a panic, and an authenticated
+/// one has exactly the sort the panicking method reports — for a declared
+/// variable (the `var_sorts` row) and for a built term (the store's sort).
+#[test]
+fn try_term_sort_refuses_unauthenticated_handles_typed() {
+    let mut first = Solver::new(Logic::All);
+    let mut second = Solver::new(Logic::All);
+    let foreign = first.declare_const("foreign-sort-term", Sort::Bool);
+
+    for invalid in [foreign, Term::from_raw(foreign.to_raw())] {
+        let result = catch_unwind(AssertUnwindSafe(|| second.try_term_sort(invalid)));
+        assert!(
+            matches!(
+                result,
+                Ok(Err(SolverError::InvalidTermHandle {
+                    operation: "term_sort",
+                    ..
+                }))
+            ),
+            "an unauthenticated term is a typed refusal: {result:?}"
+        );
+    }
+
+    let own = second.declare_const("own-sort-term", Sort::bitvec(8));
+    let built = second.bvadd(own, own);
+    for term in [own, built] {
+        assert_eq!(
+            second.try_term_sort(term).ok(),
+            Some(second.term_sort(term))
+        );
+    }
+}

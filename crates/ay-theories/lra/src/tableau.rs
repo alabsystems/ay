@@ -10,7 +10,7 @@ use num_rational::BigRational;
 use num_traits::{One, Zero};
 
 use crate::rational::Rational;
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use crate::types::add_sparse_term_rat;
 use crate::types::normalize_sparse_coeffs_rat;
 
@@ -211,17 +211,12 @@ impl TableauRow {
         self.coeff(var).to_big()
     }
 
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn add_coeff(&mut self, var: u32, coeff: Rational) {
         add_sparse_term_rat(&mut self.coeffs, var, coeff);
     }
 
-    #[cfg(kani)] // Only used by #[cfg(kani)] verification module
-    pub(crate) fn contains(&self, var: u32) -> bool {
-        self.coeffs.binary_search_by_key(&var, |(v, _)| *v).is_ok()
-    }
-
-    #[cfg(any(test, kani))]
+    #[cfg(test)]
     pub(crate) fn remove_coeff(&mut self, var: u32) {
         if let Ok(idx) = self.coeffs.binary_search_by_key(&var, |(v, _)| *v) {
             self.coeffs.remove(idx);

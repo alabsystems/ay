@@ -225,6 +225,23 @@ fn test_binary_lrat_invalid_marker() {
     );
 }
 
+/// The error names the marker byte's own offset, after leading whitespace
+/// and after earlier records alike.
+#[test]
+fn test_binary_lrat_invalid_marker_position() -> Result<(), Box<dyn std::error::Error>> {
+    for (data, position) in [(vec![b' ', b'\n', b'x'], 2), (vec![b'd', 2, 0, b'x', 0], 3)] {
+        let expected = LratParseError::InvalidBinary {
+            position,
+            detail: "invalid binary LRAT marker byte: 0x78".into(),
+        };
+        let parsed = parse_binary_lrat(&data);
+        if parsed != Err(expected) {
+            return Err(format!("{data:?}: got {parsed:?}").into());
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_binary_lrat_rejects_zero_or_signed_record_ids() {
     assert!(parse_binary_lrat(&[b'a', 0, 0, 0]).is_err());
@@ -407,13 +424,47 @@ fn test_parse_text_mixed_hints() {
 #[test]
 fn test_decode_binary_hint() {
     // Positive: encoded = 2*value, sign_bit=0
-    assert_eq!(decode_binary_hint(2), 1); // 2*1
-    assert_eq!(decode_binary_hint(6), 3); // 2*3
-    assert_eq!(decode_binary_hint(200), 100); // 2*100
-                                              // Negative: encoded = 2*value + 1, sign_bit=1
-    assert_eq!(decode_binary_hint(3), -1); // 2*1 + 1
-    assert_eq!(decode_binary_hint(7), -3); // 2*3 + 1
-    assert_eq!(decode_binary_hint(201), -100); // 2*100 + 1
+    assert_eq!(decode_binary_hint(2), Some(1)); // 2*1
+    assert_eq!(decode_binary_hint(6), Some(3)); // 2*3
+    assert_eq!(decode_binary_hint(200), Some(100)); // 2*100
+                                                    // Negative: encoded = 2*value + 1, sign_bit=1
+    assert_eq!(decode_binary_hint(3), Some(-1)); // 2*1 + 1
+    assert_eq!(decode_binary_hint(7), Some(-3)); // 2*3 + 1
+    assert_eq!(decode_binary_hint(201), Some(-100)); // 2*100 + 1
+}
+
+/// decode_binary_hint is total over `u64`: the extreme encodings decode to
+/// `+-i64::MAX` (the negation used to be an unchecked `-magnitude`), and the
+/// zero-magnitude encodings decode to 0, which the parser rejects.
+#[test]
+fn test_decode_binary_hint_extremes() {
+    assert_eq!(decode_binary_hint(u64::MAX - 1), Some(i64::MAX));
+    assert_eq!(decode_binary_hint(u64::MAX), Some(-i64::MAX));
+    assert_eq!(decode_binary_hint(0), Some(0));
+    assert_eq!(decode_binary_hint(1), Some(0));
+}
+
+/// A binary hint carrying the largest LEB128 `u64` parses to `-i64::MAX`
+/// (no panic), and the negative-zero hint encoding stays rejected.
+#[test]
+fn test_parse_binary_extreme_and_negative_zero_hints() {
+    // id=5 (10), clause lit(1) (2), 0, hint u64::MAX (nine 0xFF then 0x01), 0
+    let mut data = vec![b'a', 10, 2, 0];
+    data.extend_from_slice(&[0xFF; 9]);
+    data.extend_from_slice(&[0x01, 0]);
+    let steps = parse_binary_lrat(&data).unwrap();
+    assert_eq!(
+        steps,
+        vec![LratStep::Add {
+            id: 5,
+            clause: vec![lit(1)],
+            hints: vec![-i64::MAX],
+        }]
+    );
+
+    // hint encoding 1 is `-0`: rejected exactly as before.
+    let data = vec![b'a', 10, 2, 0, 1, 0];
+    assert!(parse_binary_lrat(&data).is_err());
 }
 
 /// Binary LRAT parser handles negative hint IDs for RAT.

@@ -13,7 +13,7 @@ impl Executor {
     /// `check-sat-assuming` literals. There is deliberately no fallback to
     /// `ctx.assertions`, whose live stack may contain solver-generated axioms
     /// or folded artifacts.
-    pub(super) fn exact_concrete_authored_scope(&self) -> Vec<TermId> {
+    pub(in crate::executor) fn exact_concrete_authored_scope(&self) -> Vec<TermId> {
         let source = self
             .proof_problem_assertion_provenance
             .as_ref()
@@ -72,10 +72,7 @@ impl Executor {
     /// is false, so this predicate is exactly `!produce_proofs_enabled()` —
     /// byte-identical behavior to the gates it replaced. A lane may move off
     /// this predicate only after it is individually vetted for raw
-    /// publication; it then earns its own named gate and an entry in the
-    /// `proof_gate_census_tests` vetted list (which also inventories every
-    /// call site of THIS predicate, so adding another lane here fails the
-    /// census until it is vetted).
+    /// publication; it then earns its own named gate.
     pub(in crate::executor) fn unvetted_no_proof_lane_allowed(&self) -> bool {
         !self.produce_proofs_enabled() && !self.competition_shedding_active()
     }

@@ -496,7 +496,7 @@ const DIMACS_REDUCED_EFFORT_SUBSUME: u64 = 200;
 /// braun family 0 FINALIZE_SAT_FAIL, 16/16 in-band verdict-match with all
 /// 10 SAT models externally validated, ~+1 measured flip and up-to-5x
 /// speedups now landing in default config.
-const BVE_SPARSE_MAX_DENSITY: f64 = 12.0;
+pub(crate) const BVE_SPARSE_MAX_DENSITY: f64 = 12.0;
 /// Variable-count cap for the sparse-band BVE unlock.
 ///
 /// Measured 2026-07-08 (same-binary off/on A/B over the 23 in-band
@@ -514,7 +514,7 @@ const BVE_SPARSE_MAX_DENSITY: f64 = 12.0;
 /// (vs kissat's 49-93%) — all perturbation, no payoff. 150K keeps a
 /// margin below both the 200K preprocess gate and the first measured
 /// loss (184K). Tunable via --sat-bve-sparse-max-vars.
-const BVE_SPARSE_MAX_VARS: usize = 150_000;
+pub(crate) const BVE_SPARSE_MAX_VARS: usize = 150_000;
 /// Small-circuit BVE arm: variable-count cap (second arm of
 /// `sparse_band_bve_unlock_active`, 2026-08-21 barrel6 gap fix).
 ///
@@ -559,6 +559,15 @@ const BVE_SMALL_CIRCUIT_MAX_DENSITY: f64 = 16.0;
 /// (1.69M vars / 5.96M clauses, density 3.5, kissat unsat@66s via 93%
 /// elimination, AY unknown@120s on main) sits inside with headroom.
 const BVE_GIANT_RAW_MAX_VARS: usize = 2_000_000;
+
+/// The variable ceiling of the giant raw-BVE band and of the `--sat-factor-large`
+/// band: `BVE_GIANT_RAW_MAX_VARS` unless `--sat-giant-band-max-vars` raises it
+/// (plan-2 lever 7; see `SatAbSwitches::giant_band_max_vars`).
+pub(crate) fn giant_band_max_vars() -> usize {
+    ay_core::sat_ab_switches()
+        .giant_band_max_vars
+        .unwrap_or(BVE_GIANT_RAW_MAX_VARS)
+}
 /// Clause-count ceiling for the giant raw-BVE band: 10M, re-pinned from 8M to
 /// `AUTO_CONGRUENCE_GIANT_MAX_CLAUSES` (2026-08-26).
 ///
@@ -741,6 +750,7 @@ impl VariantConfig {
         }
         config.apply_startup_policy();
         config.apply_route_profile_clamps();
+        config.apply_branch_selector_switch();
         config.apply_ab_substitution_knob();
         config.apply_ab_bve_knob();
         config.hot_path = VariantHotPathConfig::for_variant_input(variant, input);
@@ -904,9 +914,20 @@ impl VariantConfig {
     ///     than `1` disables, matching the AUTO knob's conservative parse;
     ///     unset = ON per the measured +2 flips / 0 floor losses).
     pub(crate) fn subst_auto_giant_band_active(&self) -> bool {
-        self.subst_auto_collapse_capped()
-            && matches!(self.input.proof_mode(), VariantProofMode::Disabled)
-            && Self::subst_auto_giant_env_enabled()
+        // Lever 4 of competition/proof-posture-parity/PLAN-next-sat-levers-2.md
+        // (2026-09-16): `--sat-subst-auto-giant-proof true` arms the same band
+        // under the DRAT posture, which is what the shipped VeriPB surface
+        // resolves to. Congruence and decompose emit checker-consumable proofs
+        // there; the non-proof restriction above was about the ladder's cost,
+        // not its soundness. Default off: the cost is unmeasured under a proof.
+        let posture_ok = match self.input.proof_mode() {
+            VariantProofMode::Disabled => true,
+            VariantProofMode::Drat => {
+                ay_core::sat_ab_switches().subst_auto_giant_proof == Some(true)
+            }
+            VariantProofMode::Lrat => false,
+        };
+        self.subst_auto_collapse_capped() && posture_ok && Self::subst_auto_giant_env_enabled()
     }
 
     /// Cached `AY_AB_SUBST_AUTO_GIANT` parse: ON when unset or `=1`, OFF for
@@ -1090,7 +1111,7 @@ impl VariantConfig {
     /// `--sat-bve-giant-raw` opt-in (still DEFAULT OFF: nothing here is new
     /// positive evidence, only an argument that the negative was never
     /// established).
-    fn bve_giant_raw_route_active(&self) -> bool {
+    pub(crate) fn bve_giant_raw_route_active(&self) -> bool {
         if !matches!(self.variant, SolverVariant::Default) {
             return false;
         }
@@ -1109,7 +1130,7 @@ impl VariantConfig {
         // (23.4M vars) out of band by construction. The CLAUSE ceiling is
         // re-pinned to the AUTO probe band that shipped after this predicate
         // was written; see BVE_GIANT_RAW_MAX_CLAUSES.
-        let max_vars = BVE_GIANT_RAW_MAX_VARS;
+        let max_vars = giant_band_max_vars();
         let max_clauses = BVE_GIANT_RAW_MAX_CLAUSES;
         if self.input.num_vars() <= BVE_SPARSE_MAX_VARS
             || self.input.num_vars() > max_vars
@@ -1188,6 +1209,15 @@ impl VariantConfig {
         // expensive-pass cap) when the operator raises --sat-bve-sparse-max-vars.
         // BVE-specific only: it does NOT relax skip_expensive for other passes.
         solver.set_sparse_band_bve_preprocess_unlock(self.sparse_band_bve_unlock_active());
+        // A/B switches for the backtracking policy (`SatAbSwitches::chrono`,
+        // `chrono_reuse_trail`); unset leaves the preset's values.
+        let switches = ay_core::sat_ab_switches();
+        if let Some(chrono) = switches.chrono {
+            solver.set_chrono_enabled(chrono);
+        }
+        if let Some(reuse) = switches.chrono_reuse_trail {
+            solver.set_chrono_reuse_trail(reuse);
+        }
         // Giant raw-BVE unlock ROUTE flag (lever 3, 2026-07-11 sparse-prize
         // completion round; OPT-IN via AY_AB_BVE_GIANT_RAW=1 — see
         // bve_giant_raw_route_active for the measured default-OFF call).
@@ -1273,6 +1303,32 @@ impl VariantConfig {
         proof_capability::apply_profile_permissions(&mut self.features, proof_mode);
     }
 
+    /// `--sat-branch-mab` (campaign, 2026-09-22): the official LRAT route's
+    /// MAB-UCB1 brancher on every posture of the Default variant (`true`), or
+    /// the legacy coupled brancher everywhere (`false`). Unset keeps the
+    /// per-route rule in `apply_route_profile_clamps`. This sits in `config()`
+    /// because the streaming DIMACS path applies the config before any
+    /// feature plan exists; the plan's `apply_feature_adaptive_branch_policy`
+    /// re-applies the same force with the small-dense exception.
+    fn apply_branch_selector_switch(&mut self) -> bool {
+        if !matches!(self.variant, SolverVariant::Default) {
+            return false;
+        }
+        let forced = match ay_core::sat_ab_switches().branch_mab {
+            Some(true) => VariantBranchPolicy::MabUcb1 {
+                epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
+            },
+            Some(false) => VariantBranchPolicy::LegacyCoupled,
+            None => return false,
+        };
+        if self.branch_policy == forced {
+            false
+        } else {
+            self.branch_policy = forced;
+            true
+        }
+    }
+
     fn apply_route_profile_clamps(&mut self) -> bool {
         if !self
             .input
@@ -1315,9 +1371,21 @@ impl VariantConfig {
         // route differences. Unset => current behavior. Mirrors inc7's AY_AB_*
         // knobs; cached per-process (each solver run is a fresh process).
         if matches!(self.variant, SolverVariant::Default) {
-            // B21: the AY_SAT_BRANCH_POLICY campaign force is retired; the
-            // auto decision below is the shipped rule.
-            let forced: Option<VariantBranchPolicy> = None;
+            // `--sat-branch-mab` (campaign, 2026-09-22): the official LRAT
+            // route's brancher on every posture, or the legacy brancher
+            // everywhere. Unset: the per-route rule below (the shipped
+            // VeriPB posture takes the DRAT route and so the legacy brancher).
+            let forced: Option<VariantBranchPolicy> = match ay_core::sat_ab_switches().branch_mab {
+                Some(true) => Some(if official_main_lrat_uses_legacy_branch_policy(features) {
+                    VariantBranchPolicy::LegacyCoupled
+                } else {
+                    VariantBranchPolicy::MabUcb1 {
+                        epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
+                    }
+                }),
+                Some(false) => Some(VariantBranchPolicy::LegacyCoupled),
+                None => None,
+            };
             if let Some(forced) = forced {
                 if self.branch_policy == forced {
                     return false;
@@ -1364,9 +1432,15 @@ impl VariantConfig {
     /// Kill-switch `--sat-no-midband-deep-restart` (B26: env retired): ON
     /// for any other explicit value (conservative parse matching
     /// `AY_AB_SUBST_AUTO_GIANT`).
+    ///
+    /// `--sat-restart-gate-kissat` keeps the Glucose regime here: Kissat's
+    /// restart gate lives in it, and the Luby band would leave it unreachable
+    /// (DLTM_twitter634_77_13: 0 focused EMA restarts in 9.76M focused
+    /// conflicts, 1,695 conflicts per restart against Kissat's 25).
     fn apply_midband_deep_restart_gate(&mut self, features: &SatFeatures) -> bool {
         if !matches!(self.variant, SolverVariant::Default)
             || !Self::midband_deep_restart_env_enabled()
+            || ay_core::sat_ab_switches().restart_gate_kissat == Some(true)
             || !midband_deep_restart_feature_candidate(features)
         {
             return false;
@@ -2036,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drat_input_clamps_sweep_in_variant_config() {
+    fn test_drat_input_keeps_sweep_in_variant_config() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
             VariantInput::new(32, 96, VariantProofMode::Drat),
@@ -2044,7 +2118,9 @@ mod tests {
 
         assert!(config.features.factor, "factor remains DRAT-enabled");
         assert!(config.features.sbva, "SBVA remains DRAT-enabled");
-        assert!(!config.features.sweep, "sweep must be disabled for DRAT");
+        // proof-posture-parity (2026-09-10): sweep certifies its facts with
+        // kitten core lemmas, so it stays enabled on the DRAT/VeriPB surface.
+        assert!(config.features.sweep, "sweep stays enabled for DRAT");
         assert!(
             !config.features.symmetry,
             "symmetry must be disabled for DRAT"
@@ -3369,6 +3445,53 @@ mod tests {
     const GIANT_FLOOR_4D6E18E5: (usize, usize) = (7_300_000, 40_700_000);
     const GIANT_FLOOR_00FD8AC9: (usize, usize) = (23_400_000, 63_000_000);
 
+    /// `--sat-branch-mab`: `true` puts the official route's MAB-UCB1 brancher
+    /// on every posture of the Default variant, `false` the legacy brancher,
+    /// unset keeps the per-route rule (legacy on the no-proof and DRAT
+    /// postures, the bandit on the LRAT route).
+    #[test]
+    fn test_branch_mab_switch_forces_the_brancher_on_every_posture() {
+        fn policy(switch: Option<bool>, proof: VariantProofMode) -> VariantBranchPolicy {
+            let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+                branch_mab: switch,
+                ..Default::default()
+            });
+            SolverVariant::Default
+                .config(VariantInput::new(50_000, 200_000, proof))
+                .branch_policy
+        }
+        let mab = VariantBranchPolicy::MabUcb1 {
+            epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
+        };
+        assert_eq!(
+            policy(None, VariantProofMode::Disabled),
+            VariantBranchPolicy::LegacyCoupled
+        );
+        assert_eq!(
+            policy(None, VariantProofMode::Drat),
+            VariantBranchPolicy::LegacyCoupled
+        );
+        assert_eq!(policy(Some(true), VariantProofMode::Disabled), mab);
+        assert_eq!(policy(Some(true), VariantProofMode::Drat), mab);
+        assert_eq!(
+            policy(Some(false), VariantProofMode::Disabled),
+            VariantBranchPolicy::LegacyCoupled
+        );
+        // Non-Default variants are untouched.
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            branch_mab: Some(true),
+            ..Default::default()
+        });
+        let probe = SolverVariant::Probe
+            .config(VariantInput::new(
+                50_000,
+                200_000,
+                VariantProofMode::Disabled,
+            ))
+            .branch_policy;
+        assert!(matches!(probe, VariantBranchPolicy::MabUcb1 { .. }));
+    }
+
     fn giant_raw_route_armed(counts: (usize, usize), proof: VariantProofMode) -> bool {
         let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
             bve_giant_raw: Some(true),
@@ -3377,6 +3500,59 @@ mod tests {
         SolverVariant::Default
             .config(VariantInput::new(counts.0, counts.1, proof))
             .bve_giant_raw_route_active()
+    }
+
+    fn giant_congruence_band_armed(
+        counts: (usize, usize),
+        proof: VariantProofMode,
+        switch: Option<bool>,
+    ) -> bool {
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            subst_auto_giant_proof: switch,
+            ..Default::default()
+        });
+        SolverVariant::Default
+            .config(VariantInput::new(counts.0, counts.1, proof))
+            .subst_auto_giant_band_active()
+    }
+
+    /// Lever 4 of PLAN-next-sat-levers-2.md: the giant congruence band is
+    /// non-proof only unless `--sat-subst-auto-giant-proof true`, which arms it
+    /// under DRAT (the VeriPB posture) and never under LRAT.
+    #[test]
+    fn the_giant_congruence_band_opens_under_drat_only_with_the_switch() {
+        for switch in [None, Some(false)] {
+            assert!(giant_congruence_band_armed(
+                CABP_V_NOS6_K275,
+                VariantProofMode::Disabled,
+                switch
+            ));
+            assert!(!giant_congruence_band_armed(
+                CABP_V_NOS6_K275,
+                VariantProofMode::Drat,
+                switch
+            ));
+            assert!(!giant_congruence_band_armed(
+                CABP_V_NOS6_K275,
+                VariantProofMode::Lrat,
+                switch
+            ));
+        }
+        assert!(giant_congruence_band_armed(
+            CABP_V_NOS6_K275,
+            VariantProofMode::Disabled,
+            Some(true)
+        ));
+        assert!(giant_congruence_band_armed(
+            CABP_V_NOS6_K275,
+            VariantProofMode::Drat,
+            Some(true)
+        ));
+        assert!(!giant_congruence_band_armed(
+            CABP_V_NOS6_K275,
+            VariantProofMode::Lrat,
+            Some(true)
+        ));
     }
 
     /// The arm ships OFF: with default switches the route refuses the witness

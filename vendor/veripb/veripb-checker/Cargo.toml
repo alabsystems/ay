@@ -1,0 +1,59 @@
+[package]
+name = "veripb-checker"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "VeriPB library for forwards-checking functionality."
+categories = ["data-structures"]
+
+
+[dependencies]
+ahash = "0.8.12"
+by_address = "1.2.1"
+colored = "3.1.1"
+fragile = "2.1.0"
+itertools = "0.15.0"
+log = "0.4"
+malachite-bigint = "0.10.0"
+num-traits = "0.2.19"
+spire_enum = "1.0.0"
+thiserror = "2.0.20"
+
+
+[lib]
+name = "veripb_checker"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies.veripb-formula]
+version = "0.1.2"
+path = "../veripb-formula"
+
+[dependencies.veripb-rules]
+version = "0.1.0"
+path = "../veripb-rules"
+
+[dependencies.veripb-parser]
+version = "0.1.2"
+path = "../veripb-parser"
+
+
+[dependencies.veripb-propagator]
+version = "0.1.2"
+path = "../veripb-propagator"
+
+[dependencies.veripb-core-proved]
+version = "0.1.0"
+path = "../veripb-core-proved"
+
+# The independent second reading of the formula file, used by
+# `--kernel-verify` to check that what the checker stored is what the file
+# says. It deliberately does NOT depend on `veripb-parser`; see that crate's
+# docs for why that matters.
+[dependencies.veripb-second-reader]
+version = "0.1.0"
+path = "../veripb-second-reader"

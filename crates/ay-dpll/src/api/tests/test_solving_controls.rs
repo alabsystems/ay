@@ -1156,6 +1156,84 @@ fn test_set_random_seed_unsat() {
     assert!(result.is_unsat());
 }
 
+/// Test the seed consumed by a real SAT search, including both setter orders.
+/// Merely checking the verdict would pass when the typed setter was ignored.
+#[test]
+fn typed_random_seed_reaches_sat_and_obeys_last_setter() {
+    for (before, typed, after, expected) in [
+        (None, u64::MAX, None, u64::MAX),
+        (Some(7), 42, None, 42),
+        (None, 42, Some(7), 7),
+        (Some(7), 0, None, 0),
+    ] {
+        let mut solver = Solver::new(Logic::QfBv);
+        if let Some(seed) = before {
+            solver
+                .try_set_option(":random-seed", &seed.to_string())
+                .expect("option seed installs");
+        }
+        solver.set_random_seed(typed);
+        if let Some(seed) = after {
+            solver
+                .try_set_option(":random-seed", &seed.to_string())
+                .expect("option seed installs");
+        }
+        assert_eq!(solver.executor.current_random_seed(), expected);
+        solver
+            .parse_smtlib2("(declare-const x (_ BitVec 8)) (assert (= x #x2a))")
+            .expect("BV query parses");
+        assert_eq!(solver.check_sat(), SolveResult::Sat);
+        assert_eq!(
+            solver.executor.last_applied_sat_random_seed_for_test(),
+            Some(expected),
+        );
+    }
+}
+
+#[test]
+fn typed_random_seed_reaches_theory_dpll_search() {
+    let mut solver = Solver::new(Logic::QfSlia);
+    solver.set_random_seed(91);
+    solver
+        .parse_smtlib2("(declare-const x String) (assert (= x \"abc\"))")
+        .expect("string query parses");
+    assert_eq!(solver.check_sat(), SolveResult::Sat);
+    assert_eq!(
+        solver.executor.last_applied_dpll_random_seed_for_test(),
+        Some(91),
+    );
+}
+
+#[test]
+fn random_seed_survives_a_derived_query_executor() {
+    for option in [false, true] {
+        let mut solver = Solver::new(Logic::QfBv);
+        if option {
+            solver
+                .try_set_option(":random-seed", "73")
+                .expect("option seed installs");
+        } else {
+            solver.set_random_seed(73);
+        }
+        solver
+            .parse_smtlib2("(declare-const x (_ BitVec 8)) (assert (= x #x2a))")
+            .expect("BV query parses");
+        let mut derived = solver.executor.new_derived_query_executor();
+        assert_eq!(derived.current_random_seed(), 73);
+        assert_eq!(
+            derived.check_sat().expect("derived solve"),
+            SolveResult::Sat
+        );
+        assert_eq!(derived.last_applied_sat_random_seed_for_test(), Some(73));
+        if option {
+            // The standalone proof checker receives only the source context.
+            let mut context_only = crate::Executor::new();
+            context_only.ctx = solver.executor.ctx.clone();
+            assert_eq!(context_only.current_random_seed(), 73);
+        }
+    }
+}
+
 /// Verify that set_ematching_round_limit is reflected in ematching_round_limit (#8614).
 #[test]
 fn test_set_ematching_round_limit_api_8614() {

@@ -301,6 +301,31 @@ pub(crate) fn validate_int_guarded_split_gap(
     }
 }
 
+/// Validate a [`ay_core::TheoryLemmaKind::IntCgCutChain`] lemma.
+///
+/// Delegates to `ay_core::proof_validation::recognize_int_cg_cut_chain`, which
+/// re-derives the whole Chvátal–Gomory chain from the clause — the rows its
+/// literals' negations assert, every cut's multipliers and rounding, and the
+/// final contradiction — and re-validates each step in exact rational
+/// arithmetic. Nothing is taken on the producer's word — the kind carries no
+/// annotation payload — so a forged label on any other clause is rejected
+/// here.
+pub(crate) fn validate_int_cg_cut_chain(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_int_cg_cut_chain(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "integer cut chain: no Chvátal–Gomory chain over the rows ".to_string()
+                + "this clause's negated linear literals assert refutes them",
+        })
+    }
+}
+
 pub(crate) fn validate_arith_disequality_split(
     terms: &TermStore,
     step_id: ProofId,

@@ -1,0 +1,5 @@
+(declare-const _9 Int)
+(declare-const |clamped#s1_0_s4_0_s5_0| Int)
+(declare-const col Int)
+(declare-const width Int)
+(assert (and (<= 0 |clamped#s1_0_s4_0_s5_0|) (<= |clamped#s1_0_s4_0_s5_0| 4294967295) (<= 0 _9) (<= _9 4294967295) (<= 0 col) (<= col 4294967295) (<= 0 width) (<= width 4294967295) (>= col 0) (<= col 4294967295) (>= width 0) (<= width 4294967295) (= _9 |clamped#s1_0_s4_0_s5_0|) (= |clamped#s1_0_s4_0_s5_0| (ite (not (< col width)) (ite (not (> width 0)) 0 (- width 1)) col)) (<= 0 width) (<= width 4294967295) (<= 0 1) (<= 1 4294967295) (< col width) (not (= width 0)) (not (< _9 width)) true))

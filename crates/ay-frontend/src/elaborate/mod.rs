@@ -17,7 +17,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermStoreSnapshotStamp;
 use ay_core::{Sort, TermId, TermStore};
 
+mod authored_progress;
 mod provenance;
+mod query_window_work;
 
 use provenance::ContextIdentity;
 pub use provenance::{
@@ -127,8 +129,7 @@ pub struct InternalNamespace {
 /// declaration gates and `ay-ffi`'s `reserved_name_error`; the FFI predicate
 /// delegates here rather than re-spelling the shapes, so the two paths cannot
 /// drift apart (regression-tested by
-/// `test_ffi_and_core_internal_namespace_gates_agree` in `ay-ffi` and by
-/// `test_internal_namespace_table_covers_every_ffi_minted_identity` here).
+/// `test_ffi_and_core_internal_namespace_gates_agree` in `ay-ffi`).
 pub const INTERNAL_NAMESPACES: &[InternalNamespace] = &[
     InternalNamespace {
         prefix: INTERNAL_SYMBOL_PREFIX,
@@ -225,13 +226,9 @@ fn reserved_symbol_reason(name: &str) -> &'static str {
 /// Deliberately EXCLUDED (each would reject legitimate input): see the
 /// companion table [`EXCLUDED_DECLARABLE_OP_NAMES`], which lists every
 /// elaborator-recognized name that REMAINS user-declarable together with its
-/// documented reason. The two tables are kept mutually exhaustive over the
-/// elaborator match-arm vocabulary by the drift-proof test
-/// `test_reserved_op_table_covers_all_elaborator_match_arms`, which
-/// mechanically re-extracts the matched names from the elaborator sources
-/// (`app/*.rs`, `indexed.rs`, `qualified.rs`, `term.rs`) at test time and fails
-/// on any name in neither table — so a future match-arm addition cannot
-/// silently widen the forgery surface.
+/// documented reason. The two tables must stay mutually exhaustive over the
+/// elaborator match-arm vocabulary (`app/*.rs`, `indexed.rs`, `qualified.rs`,
+/// `term.rs`): a match-arm name in neither table widens the forgery surface.
 ///
 /// Intentionally not listed in either STATIC table (they are gated
 /// DYNAMICALLY, per context state, because the vulnerable vocabulary is
@@ -260,7 +257,7 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
     "bvneg", "bvnot", "bvand", "bvor", "bvxor", "bvnand", "bvnor", "bvxnor",
     "bvshl", "bvlshr", "bvashr", "bvcomp",
     "bvult", "bvule", "bvugt", "bvuge", "bvslt", "bvsle", "bvsgt", "bvsge",
-    "concat", "bv2nat", "bv2int", "int2bv", "ubv_to_int", "sbv_to_int",
+    "concat", "mkbv", "bv2nat", "bv2int", "int2bv", "ubv_to_int", "sbv_to_int",
     "extract", "zero_extend", "sign_extend", "repeat", "rotate_left", "rotate_right",
     // BV overflow predicates (app/bitvectors.rs)
     "bvnego", "bvsaddo", "bvuaddo", "bvsdivo", "bvsmulo", "bvumulo", "bvssubo", "bvusubo",
@@ -308,7 +305,10 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
     "seq.fold_left", "seq.foldli", "seq.fold_lefti",
     "seq.in_re", "seq.in.re", "seq.indexof", "seq.last_indexof",
     "seq.len", "seq.map", "seq.mapi", "seq.nth", "seq.prefixof", "seq.replace",
-    "seq.replace_all", "seq.suffixof", "seq.to_re", "seq.to.re", "seq.unit",
+    "seq.replace_all", "seq.suffixof", "seq.to_re", "seq.to.re", "seq.unit", "seq.power",
+    "str.power",
+    "complex.make", "complex.real", "complex.imag",
+    "ff.add", "ff.mul", "ff.neg", "ff.bitsum",
     // ---- Strings (elaborate/app/strings.rs, ay-dpll str theory) ----
     "str.++", "str.<", "str.<=", "str.at", "str.contains", "str.from_code",
     "str.from_int", "str.in_re", "str.in.re", "str.indexof", "str.is_digit",
@@ -340,6 +340,19 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
 /// structurally (see [`RESERVED_OP_NAMES`]).
 pub fn is_reserved_op_name(name: &str) -> bool {
     RESERVED_OP_NAMES.contains(&name)
+}
+
+/// Whether `name` is spelled like a builtin operator of any theory the front
+/// end elaborates: a [`RESERVED_OP_NAMES`] entry (never declarable) or an
+/// [`EXCLUDED_DECLARABLE_OP_NAMES`] entry (declarable, yet recognized by the
+/// elaborator as a theory operator, an indexed identifier or a binder).
+///
+/// A consumer that reads terms by operator name (an independent proof
+/// checker, a certificate mirror) cannot tell a user declaration of such a
+/// name from the builtin it shadows or overloads, so it must refuse a script
+/// that declares one; this is the front end's own vocabulary for that gate.
+pub fn is_builtin_operator_name(name: &str) -> bool {
+    is_reserved_op_name(name) || excluded_declarable_op_class(name).is_some()
 }
 
 /// Why an elaborator-recognized operator spelling remains user-declarable.
@@ -400,12 +413,8 @@ pub fn is_canonical_theory_operator_identity(name: &str) -> bool {
 
 /// Elaborator-recognized operator names that REMAIN user-declarable, each with
 /// its documented reason. This is the explicit complement of
-/// [`RESERVED_OP_NAMES`]: the drift-proof test
-/// `test_reserved_op_table_covers_all_elaborator_match_arms` mechanically
-/// extracts every name the app elaborators (`elaborate/app/*.rs`,
-/// `elaborate/indexed.rs`) match structurally and asserts each one appears in
-/// exactly one of the two tables — adding a new match arm without classifying
-/// its name fails the test, so the forgery surface cannot silently widen.
+/// [`RESERVED_OP_NAMES`]: every name the app elaborators match structurally
+/// belongs in exactly one of the two tables.
 ///
 /// Exclusion classes:
 ///
@@ -737,6 +746,36 @@ pub enum ElaborateError {
     /// interpretation, and its finite domain, silently lost).
     #[error("unknown sort '{0}'")]
     UnknownSort(String),
+    /// An `Array` sort whose index is not a bitvector under a BV-array
+    /// logic (`QF_ABV`/`QF_AUFBV`). z3's shell rejects these with this
+    /// exact wording (the element sort is unrestricted despite the
+    /// wording — measured against z3 5.1.0 over a 50-case matrix).
+    #[error("logic supports only arrays from bitvectors to bitvectors")]
+    LogicArrayIndexNotBitVec,
+    /// A term needs integer arithmetic the declared logic's shell
+    /// signature does not provide (z3 5.1.0 wording, DR-59).
+    #[error("logic does not support integers")]
+    LogicDoesNotSupportIntegers,
+    /// A term needs real arithmetic the declared logic's shell
+    /// signature does not provide (z3 5.1.0 wording, DR-59).
+    #[error("logic does not support reals")]
+    LogicDoesNotSupportReals,
+    /// A term needs bitvectors the declared logic's shell signature
+    /// does not provide (z3 5.1.0 wording, DR-59).
+    #[error("logic does not support bitvectors")]
+    LogicDoesNotSupportBitvectors,
+    /// A nonlinear arithmetic application under a linear shell logic
+    /// (z3 5.1.0 wording, DR-59).
+    #[error("logic does not support nonlinear arithmetic")]
+    LogicNonlinearArithmetic,
+    /// A non-difference arithmetic application under a difference
+    /// shell logic (z3 5.1.0 wording, DR-59).
+    #[error("logic only supports difference arithmetic")]
+    LogicOnlyDifferenceArithmetic,
+    /// A `to_real` cast whose source family the declared logic's
+    /// shell signature does not provide (z3 5.1.0 wording, DR-59).
+    #[error("logic does not support casting operators")]
+    LogicDoesNotSupportCastingOperators,
     /// A pre-rendered ill-sorted-application error whose payload is the exact
     /// z3 4.15.4 message text (e.g. the `ite` argument-#1 sort mismatch:
     /// `Sort mismatch at argument #1 for function (declare-fun ite (Bool T T)
@@ -813,9 +852,21 @@ enum SymbolBindingOrigin {
     /// rejection tests exercise, and are also used for solver-internal
     /// bookkeeping symbols that must not leak into user models.
     NativeApiDeclaration,
+    /// Installed by a `:named` label of an authored assertion. The binding is
+    /// a nullary definition like a `define-fun`'s, but it is not one: a proof
+    /// checker reads the label by expanding it, not as a `(= NAME BODY)`
+    /// premise, so it must never gain `define-fun` proof authority
+    /// ([`Context::source_nullary_definition_for_proof`]).
+    NamedLabel,
 }
 
 impl SymbolInfo {
+    /// Opaque identity retained by scoped proof-input bindings.
+    #[doc(hidden)]
+    pub fn declaration_identity(&self) -> &DeclarationId {
+        &self.declaration_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fresh(
         term: Option<TermId>,
@@ -931,6 +982,21 @@ pub struct Objective {
     pub term: TermId,
 }
 
+/// One entry in the unified declaration order of optimization objectives.
+///
+/// Z3 optimizes arithmetic objectives and `(assert-soft ...)` groups as ONE
+/// ordered list in declaration order (lexicographic by default), rendering
+/// them interleaved from `(get-objectives)`. `objectives` and
+/// `soft_constraints` alone lose that interleaving; this sequence retains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveStep {
+    /// Index into `objectives` (one `(maximize)`/`(minimize)` command).
+    Arithmetic(usize),
+    /// One soft group, recorded when its `:id` first appears (`None` is the
+    /// anonymous group). Later softs join the existing step.
+    SoftGroup(Option<String>),
+}
+
 /// A soft (weighted) constraint from `(assert-soft ...)`.
 ///
 /// A soft assertion is *not* a hard assertion: the solver may leave it
@@ -965,6 +1031,38 @@ const OPTION_GLOBAL_DECLARATIONS: &str = "global-declarations";
 const OPTION_GLOBAL_DECLS: &str = "global-decls";
 
 type FunctionDefinition = (Vec<(String, Sort)>, Sort, ParsedTerm);
+
+/// A host-configured node budget for the check-sat-time definitional-forall
+/// pass's own parsed copy of the assertions (see
+/// [`Context::set_definitional_pass_parsed_budget`]).
+#[derive(Clone, Copy, Debug)]
+struct PassParsedBudget {
+    total: usize,
+    remaining: usize,
+}
+
+/// #defmacro-named-preuse: the check-sat-time definitional-forall pass's
+/// session state (see `definitional_check_sat`).
+#[derive(Clone, Debug, Default)]
+struct DefinitionalPassState {
+    /// The fallback chain of stacks the pass left at this check, for the
+    /// executor to restore and solve again should the live stack decide
+    /// `unknown`. Taken by the executor before it solves, so it is empty
+    /// during every solve and in every derived context.
+    retry: Vec<DefinitionalAdoptionSnapshot>,
+    /// The pass's OWN parsed copy of the hard assertions
+    /// ([`Context::set_definitional_pass_parsed_budget`]): kept only while a
+    /// budget is installed and the copy stays aligned with `assertions`
+    /// (same prefix rule as `assertions_parsed`). Read by the pass, and by
+    /// raw re-interning lanes through
+    /// [`Context::raw_reinternable_parsed_assertions`] when no proof surface
+    /// is retained; never a substitute for `assertions_parsed` in any
+    /// surface-aligned or export consumer.
+    parsed: Vec<ParsedTerm>,
+    /// The budget for `parsed` in parsed nodes, and what is left of it.
+    /// `None` means the pass relies on `assertions_parsed` alone.
+    budget: Option<PassParsedBudget>,
+}
 
 /// Which site expanded a `define-fun`.
 ///
@@ -1099,6 +1197,11 @@ enum AuthoredAssertion {
     Schematic(ParsedTerm),
 }
 
+/// The opaque parsed-AST placeholder the native API retains for an assertion
+/// it built as a term rather than as surface syntax (the solver crate owns the
+/// authoritative constant of the same spelling; the two are kept identical).
+pub(super) const NATIVE_API_ASSERTION_PLACEHOLDER: &str = "__ay_api_assertion__";
+
 /// Whether the authored source is literally `false` (modulo annotations), or
 /// the reserved native-API placeholder whose exact TermId is the entire source
 /// obligation. Proof consumers additionally require that TermId to be false.
@@ -1108,7 +1211,21 @@ fn authored_source_is_literal_false(term: &ParsedTerm) -> bool {
         term = inner;
     }
     matches!(term, ParsedTerm::Const(crate::command::Constant::False))
-        || matches!(term, ParsedTerm::Symbol(name) if name == "__ay_api_assertion__")
+        || matches!(term, ParsedTerm::Symbol(name) if name == NATIVE_API_ASSERTION_PLACEHOLDER)
+}
+
+/// Routing metadata for a bounded canonical-root proof repair.
+///
+/// This classification grants no premise or query authority. A solver must
+/// independently authenticate the current public epoch and its exact roots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAssertionSurfaces {
+    /// Bare TermId input, or exact concrete roots with only native sentinels.
+    Native,
+    /// Genuine, mixed, schematic, or unretained authored source keeps its path.
+    Other,
+    /// A native-only surface inventory is oversized, misaligned or colliding.
+    Unavailable,
 }
 
 /// One authored assertion in source order, ready for `get-assertions` display.
@@ -1177,6 +1294,34 @@ pub struct Context {
     source_revision: u64,
     /// The term store
     pub terms: TermStore,
+    shared_surface: shared_surface::Slot,
+    /// Changes whenever name resolution or elaboration policy invalidates a memo.
+    elaboration_revision: u64,
+    /// Explicit simplify retains powers until its configured owned rewrite.
+    preserve_sequence_power: bool,
+    /// Alpha-equivalence sharing index for quantifiers
+    /// (#alpha-quantifier-sharing), keyed by
+    /// `(is_forall, binder sorts, alpha-invariant shape hash)`.
+    ///
+    /// `mk_fresh_var` mints a globally unique binder name for EVERY quantifier
+    /// occurrence, so two syntactically identical authored assertions elaborate
+    /// to DIFFERENT terms and nothing downstream can see that they are the same
+    /// formula. This index lets the second occurrence reuse the first.
+    ///
+    /// It also carries quantifiers built through the NATIVE term API
+    /// (`Context::index_quantifier_for_alpha_sharing`), so re-elaborating a
+    /// retained SMT-LIB source reaches the term the native builders produced
+    /// instead of minting an unrelated alpha-variant — see
+    /// `Solver::try_assert_term_with_source`.
+    ///
+    /// The shape hash keeps one bucket to the quantifiers that could plausibly
+    /// be alpha-equivalent, so the per-key caps below are not a cliff for a
+    /// query with thousands of same-signature binders.
+    ///
+    /// An entry is only a CANDIDATE. `share_alpha_equivalent_quantifier` proves
+    /// the alpha-equivalence structurally against the LIVE store before reusing
+    /// one, so a stale or rolled-back id can only fail the check.
+    alpha_quantifier_index: HashMap<(bool, Vec<Sort>, u64), Vec<TermId>>,
     /// Symbol table: name -> info
     symbols: HashMap<String, SymbolInfo>,
     /// Names in `symbols` that are SOLVER-INTERNAL, not user-declared: the
@@ -1267,10 +1412,30 @@ pub struct Context {
     adopted_macro_interps: HashMap<String, (Vec<(String, Sort)>, TermId)>,
     /// Exact declaration identity behind each adopted macro interpretation.
     adopted_macro_declaration_ids: HashMap<String, DeclarationId>,
+    /// #defmacro-named-preuse: `(adopted head, :named label)` for every
+    /// adopted definitional assertion that carried a `:named` label. Once the
+    /// definition is discharged its meaning lives inside every expanded
+    /// application, so a harvested unsat core over the expanded assertions
+    /// is only a core of the AUTHORED problem together with the definition —
+    /// the core reporter appends these labels (an over-approximate core is
+    /// legal; omitting the definition is not). Kept in lockstep with
+    /// `adopted_macro_interps`: rollback and `reset-assertions` drop them.
+    adopted_definition_labels: Vec<(String, String)>,
+    /// #defmacro-named-preuse: whether the check-sat-time adoption pass has
+    /// been entered in this session (it runs once, at the first check).
+    definitional_check_sat_pass_entered: bool,
+    /// #defmacro-named-preuse: the check-sat-time definitional-forall pass's
+    /// session state — its fallback chain and its own parsed copy.
+    definitional_pass: DefinitionalPassState,
     /// Test-only fault injection for the transaction boundary between macro
     /// adoption and assertion re-elaboration.
     #[cfg(test)]
     fail_next_assert_after_macro_adoption: bool,
+    /// Test-only fault injection for the check-sat-time adoption pass: the
+    /// next retained-assertion re-elaboration fails after the macros were
+    /// registered, exercising the rollback.
+    #[cfg(test)]
+    fail_next_check_sat_reelaboration: bool,
     /// Names bound by `define-fun-rec` / `define-funs-rec` (a strict subset of
     /// `fun_defs`, which also holds plain `define-fun` macros). z3 treats a
     /// recursive-function declaration and a plain macro differently for
@@ -1360,6 +1525,20 @@ pub struct Context {
     /// SMT-LIB CLI enables this policy; the explicit Z3 compatibility surface
     /// leaves it disabled because Z3 accepts a wider overlay language.
     strict_logic_compliance: bool,
+    /// Reject builtin sorts outside the declared logic's signature the
+    /// way z3's SMT-LIB shell does (`unknown sort '...'`).
+    ///
+    /// This is a shell behavior in z3: its C-API parser accepts the
+    /// same scripts, so the library default stays permissive and the
+    /// CLI enables it. Strict logic compliance supersedes it (that
+    /// policy reports its own, richer diagnostics).
+    enforce_logic_sort_signatures: bool,
+    /// Whether the script is read as z3 reads it where this frontend is
+    /// otherwise more permissive ([`Context::set_z3_mode`]).
+    z3_mode: bool,
+    /// `:smtlib2_compliant` as z3's session started, once the host says it
+    /// has ([`Context::note_z3_session_started`]).
+    z3_smtlib2_compliant_at_start: Option<bool>,
     /// Whether the logic was set by a `(set-logic ...)` in the COMMAND STREAM,
     /// as opposed to being installed by an API constructor.
     ///
@@ -1389,7 +1568,8 @@ pub struct Context {
     /// exported proofs with surface syntax, and retaining a deep clone of every
     /// assertion dominated peak RSS on large parse-heavy inputs (~190 MB of a
     /// 318 MB peak on a 6 MB QF_UF instance — #rss-vs-z3 campaign). A later
-    /// `(set-option :produce-proofs true)` flips retention back ON.
+    /// `(set-option :produce-proofs true)` flips retention back ON until
+    /// `(reset)`, which restores the host policy (see [`ParsedRetention`]).
     ///
     /// INVARIANT (prefix alignment): `assertions_parsed` is always an exact
     /// parallel copy of `assertions[..assertions_parsed.len()]`. Pushes are
@@ -1398,7 +1578,7 @@ pub struct Context {
     /// stack is always a correct PREFIX, which is exactly what the proof
     /// surface-alignment consumers assume (they fall back to canonical terms
     /// for anything past the prefix, or skip alignment when it is empty).
-    retain_parsed_assertions: bool,
+    parsed_retention: ParsedRetention,
     /// Optimization objectives (from maximize/minimize)
     objectives: Vec<Objective>,
     /// Public-sort metadata aligned with `objectives`.
@@ -1407,6 +1587,9 @@ pub struct Context {
     soft_constraints: Vec<SoftAssertion>,
     /// Public-sort metadata aligned with `soft_constraints`.
     soft_finite_set_metadata: Vec<PublicAssertionMetadata>,
+    /// Unified declaration order of arithmetic objectives and soft groups
+    /// (Z3's single optimization objective list).
+    objective_sequence: Vec<ObjectiveStep>,
     /// Scope stack for push/pop
     scopes: Vec<ScopeFrame>,
     /// Whether this session ever processed a `push`, `pop`, or
@@ -1432,6 +1615,17 @@ pub struct Context {
     int_real_coercions: bool,
     /// Named formulas: name -> term_id (for get-assignment and get-unsat-core)
     named_terms: HashMap<String, TermId>,
+    /// `:named` labels of the authored assertion being elaborated.
+    label_journal: Option<named_labels::LabelJournal>,
+    /// Outcome of the last authored assertion whose labels were not all bound.
+    label_failure: Option<LabelFailure>,
+    /// Labels the last authored assertion left unbound.
+    unbound_label_names: Vec<String>,
+    /// Subterms of the authored command being elaborated that elaboration
+    /// may pass over, checked where it does.
+    skip_journal: Option<skipped_subterms::SkipJournal>,
+    /// The scratch copy those checks share; dropped with the macro memo.
+    shared_scratch: skipped_subterms::SharedScratchSlot,
     /// Z3 debug-command global AST slots (`dbg-set` / `dbg-pp-var`).
     ///
     /// The authored spelling is retained because these commands inspect the
@@ -1498,6 +1692,38 @@ pub struct Context {
     /// or `subset(A, empty) ∧ member(x, A)`). Forces the dedicated QF_SETLIA route
     /// even under a mismatched declared logic (#set-routing).
     uses_set: bool,
+    /// Set when a native `map.*` operator or `(as map.empty (Map K V))` is
+    /// elaborated. The `(Map K V)` carrier is erased to `Array(K -> V)`, so
+    /// this is the SAT funnel's only O(1) way to know that the native-map
+    /// fail-closed gate has to walk the problem (#map-value-semantics).
+    uses_map: bool,
+    /// Set when a map DOMAIN carrier was minted for a map term that is not a
+    /// declared nullary map constant: a quantifier-bound or `define-fun`
+    /// parameter, an `ite`, a `select` out of an array of maps, an
+    /// uninterpreted-function result. Such a carrier is one free array shared
+    /// by every value the term can take (a bound variable's carrier does not
+    /// even depend on the variable), and nothing ties it to an empty map or a
+    /// constructor the term equals, so a `sat` over it may ignore the map's
+    /// real domain. Sticky: a popped scope can only make the gate refuse
+    /// more, never less (#map-value-semantics).
+    map_domain_unfaithful: bool,
+    /// Set when `((as const S) v)` is elaborated at a map sort `S`. The
+    /// encoding gives such a constant array no domain of its own (it is not
+    /// the empty map), so a `sat` over it may ignore one. Sticky, like
+    /// `map_domain_unfaithful` (#map-value-semantics).
+    map_constant_array: bool,
+    /// Monomorphic `define-sort` synonyms whose body is a map sort, so
+    /// `Context::parsed_sort_is_map` sees through them after erasure.
+    map_sort_synonyms: HashSet<String>,
+    /// The value array of `(as map.empty (Map K V))`, one per map sort (keyed
+    /// by the lowered `Array(K -> V)` sort). `map.empty` is a constant, so
+    /// every occurrence must denote the same map: a fresh value per
+    /// occurrence let `(distinct (map.get E 1) (map.get E 1))`, with `E`
+    /// written twice, answer `sat`. The array itself is unconstrained — the
+    /// empty map's values are unspecified, key by key. Not scope-truncated:
+    /// a fresh variable is not a declaration, and reusing it after a `pop`
+    /// is exactly what keeps it one constant (#map-value-semantics).
+    map_empty_values: HashMap<Sort, TermId>,
     /// Memoized predicates realizing Z3's special-relations family
     /// (`(_ partial-order N)`, `(_ linear-order N)`, `(_ tree-order N)`,
     /// `(_ piecewise-linear-order N)`), keyed by `(kind, sort, index)`. Every use
@@ -1519,6 +1745,9 @@ pub struct Context {
     lenient_sort_coercions: bool,
     /// Public typing policy for Z3 5 finite-set spellings.
     finite_set_typing_mode: FiniteSetTypingMode,
+    /// Memo for the Z3 5 strict retention-shape scan of one parsed tree.
+    /// `None` outside such a scan (see `public_sorts::StrictShapeScan`).
+    strict_shape_scan: Option<public_sorts::StrictShapeScan>,
 }
 
 /// Opaque saved query view for one internal solver probe.
@@ -1544,11 +1773,13 @@ pub struct InternalQueryWindow {
     assertions: Vec<TermId>,
     assertion_finite_set_metadata: Vec<PublicAssertionMetadata>,
     assertions_parsed: Vec<ParsedTerm>,
-    retain_parsed_assertions: bool,
+    parsed_retention: ParsedRetention,
+    pass_parsed_assertions: Vec<ParsedTerm>,
     objectives: Vec<Objective>,
     objective_finite_set_metadata: Vec<PublicAssertionMetadata>,
     soft_constraints: Vec<SoftAssertion>,
     soft_finite_set_metadata: Vec<PublicAssertionMetadata>,
+    objective_sequence: Vec<ObjectiveStep>,
     named_terms: HashMap<String, TermId>,
     polymorphic_assertions: Vec<PolymorphicAssertion>,
     authored_assertions: Vec<AuthoredAssertion>,
@@ -1581,6 +1812,8 @@ struct ScopeFrame {
     objective_count: usize,
     /// Number of soft constraints before this scope
     soft_constraint_count: usize,
+    /// Number of unified objective-sequence entries before this scope
+    objective_sequence_count: usize,
     /// Named terms defined in this scope
     named_terms: Vec<String>,
     /// Datatypes defined in this scope: (internal carrier, surface declaration).
@@ -1645,8 +1878,15 @@ impl Context {
     /// the logic, or a typing policy such as `:int-real-coercions`. Entries are
     /// a pure cache, so dropping them can only cost a re-walk.
     pub(super) fn invalidate_macro_expansion_memo(&mut self) {
+        if let Some(next) = self.elaboration_revision.checked_add(1) {
+            self.elaboration_revision = next;
+        } else {
+            self.context_identity = ContextIdentity::fresh();
+            self.elaboration_revision = 0;
+        }
         self.macro_expansion_memo.clear();
         self.macro_expansion_memo_names.clear();
+        self.shared_scratch.clear();
     }
 
     /// [`Self::advance_source_revision`] for a command whose ONLY effect on name
@@ -1755,6 +1995,10 @@ impl Context {
         options.insert("produce-proofs".to_string(), OptionValue::Bool(false));
         options.insert("produce-assignments".to_string(), OptionValue::Bool(false));
         options.insert(
+            "rewriter.max_power_expansion".to_string(),
+            OptionValue::Numeral("2".to_string()),
+        );
+        options.insert(
             OPTION_GLOBAL_DECLARATIONS.to_string(),
             OptionValue::Bool(false),
         );
@@ -1768,6 +2012,10 @@ impl Context {
             context_identity: ContextIdentity::fresh(),
             source_revision: 0,
             terms: TermStore::new(),
+            shared_surface: shared_surface::Slot::default(),
+            elaboration_revision: 0,
+            preserve_sequence_power: false,
+            alpha_quantifier_index: HashMap::default(),
             symbols: HashMap::default(),
             internal_symbols: ay_core::kani_compat::DetHashSet::default(),
             overloaded_symbols: HashMap::default(),
@@ -1791,8 +2039,13 @@ impl Context {
             fun_defs: HashMap::default(),
             adopted_macro_interps: HashMap::default(),
             adopted_macro_declaration_ids: HashMap::default(),
+            adopted_definition_labels: Vec::new(),
+            definitional_check_sat_pass_entered: false,
+            definitional_pass: DefinitionalPassState::default(),
             #[cfg(test)]
             fail_next_assert_after_macro_adoption: false,
+            #[cfg(test)]
+            fail_next_check_sat_reelaboration: false,
             recursive_fun_names: ay_core::kani_compat::DetHashSet::default(),
             datatypes: HashMap::default(),
             live_datatype_carriers: HashSet::default(),
@@ -1810,15 +2063,19 @@ impl Context {
             dt_field_surface: HashMap::default(),
             logic: None,
             strict_logic_compliance: false,
+            enforce_logic_sort_signatures: false,
+            z3_mode: false,
+            z3_smtlib2_compliant_at_start: None,
             logic_set_by_command: false,
             assertions: Vec::new(),
             assertion_finite_set_metadata: Vec::new(),
             assertions_parsed: Vec::new(),
-            retain_parsed_assertions: true,
+            parsed_retention: ParsedRetention::host(true),
             objectives: Vec::new(),
             objective_finite_set_metadata: Vec::new(),
             soft_constraints: Vec::new(),
             soft_finite_set_metadata: Vec::new(),
+            objective_sequence: Vec::new(),
             scopes: Vec::new(),
             scope_commands_used: false,
             check_sat_commands: 0,
@@ -1827,6 +2084,11 @@ impl Context {
             numeral_as_real: false,
             int_real_coercions: true,
             named_terms: HashMap::default(),
+            label_journal: None,
+            label_failure: None,
+            unbound_label_names: Vec::new(),
+            skip_journal: None,
+            shared_scratch: skipped_subterms::SharedScratchSlot::default(),
             z3_debug_exprs: HashMap::default(),
             fun_expansion_depth: 0,
             fun_expansion_depth_watermark: 0,
@@ -1835,9 +2097,15 @@ impl Context {
             multivar_lambda_curry_allowed: false,
             uses_multiset: false,
             uses_set: false,
+            uses_map: false,
+            map_domain_unfaithful: false,
+            map_constant_array: false,
+            map_sort_synonyms: HashSet::default(),
+            map_empty_values: HashMap::default(),
             special_relations: HashMap::default(),
             lenient_sort_coercions: false,
             finite_set_typing_mode: FiniteSetTypingMode::default(),
+            strict_shape_scan: None,
         }
     }
 
@@ -1893,6 +2161,34 @@ impl Context {
     /// Record that a `set.*` operator was elaborated.
     pub(crate) fn mark_uses_set(&mut self) {
         self.uses_set = true;
+    }
+
+    /// Whether the elaborated problem uses a native `map.*` operator or the
+    /// empty map.
+    pub fn uses_map(&self) -> bool {
+        self.uses_map
+    }
+
+    /// Record that a native map operator was elaborated.
+    pub(crate) fn mark_uses_map(&mut self) {
+        self.uses_map = true;
+    }
+
+    /// Whether a map domain carrier was minted for a map term other than a
+    /// declared nullary map constant (see the field docs).
+    pub fn map_domain_unfaithful(&self) -> bool {
+        self.map_domain_unfaithful
+    }
+
+    /// Record that a map domain carrier cannot stand for its term's domain.
+    pub(crate) fn mark_map_domain_unfaithful(&mut self) {
+        self.map_domain_unfaithful = true;
+    }
+
+    /// Whether a constant array was elaborated at a map sort (see the field
+    /// docs).
+    pub fn map_constant_array(&self) -> bool {
+        self.map_constant_array
     }
 
     /// Get the current logic setting.
@@ -2023,6 +2319,16 @@ impl Context {
 
     /// Select whether official SMT-LIB logic declarations are enforced as
     /// language boundaries instead of being treated only as routing hints.
+    /// Select whether builtin sorts are checked against the declared
+    /// logic's signature (z3 shell behavior; see
+    /// `enforce_logic_sort_signatures`).
+    pub fn set_enforce_logic_sort_signatures(&mut self, enforce: bool) {
+        if self.enforce_logic_sort_signatures != enforce {
+            self.invalidate_macro_expansion_memo();
+            self.enforce_logic_sort_signatures = enforce;
+        }
+    }
+
     pub fn set_strict_logic_compliance(&mut self, strict: bool) {
         // Deliberately does not advance the source revision (it is a host
         // policy, not a source change), so drop the macro expansion memo here:
@@ -2034,9 +2340,86 @@ impl Context {
         self.strict_logic_compliance = strict;
     }
 
+    /// Read the script as z3 reads it where this frontend is otherwise more
+    /// permissive, for a host that answers in z3's place (`--z3-mode`):
+    ///
+    /// - a quantifier with no bound variable, and a `:pattern` term that is a
+    ///   variable or a quantifier, are rejected, as every z3 rejects them;
+    /// - a Bool beside an Int or a Real in `=`, `distinct` or `ite` is
+    ///   rejected, as z3 4.12.5 rejects it (z3 5 coerces it; rejecting only
+    ///   drops an assertion against either), and so is `(_ divisible n)`
+    ///   unless `:smtlib2_compliant` was set as z3's session started;
+    /// - an arithmetic operand that is not an Int, a Real or a Bool, and an
+    ///   operator z3 4.12.5 does not know (`min`, `set.*`, ...), are
+    ///   rejected, as z3 rejects them;
+    /// - an authored assertion's `:named` labels are taken to match z3's only
+    ///   when every subterm z3 reads before them is one it is known to
+    ///   accept (`named_labels::z3_reach`); otherwise the assertion's outcome
+    ///   is [`LabelFailure::Unvouched`] or [`LabelFailure::Diverged`].
+    pub fn set_z3_mode(&mut self, z3_mode: bool) {
+        if self.z3_mode != z3_mode {
+            // Which quantifiers and patterns are accepted changes, so a
+            // memoized macro expansion may no longer hold.
+            self.invalidate_macro_expansion_memo();
+        }
+        self.z3_mode = z3_mode;
+    }
+
+    /// Record that z3's session has started, or may have, as of the next
+    /// command: z3 reads `:smtlib2_compliant` once, as it starts, so a later
+    /// setting does not register `divisible` (`(set-option
+    /// :smtlib2_compliant true)` after a declaration leaves it unknown). A
+    /// `(reset)` starts a new session.
+    pub fn note_z3_session_started(&mut self) {
+        if self.z3_smtlib2_compliant_at_start.is_none() {
+            self.z3_smtlib2_compliant_at_start = Some(self.smtlib2_compliant());
+        }
+    }
+
+    /// Whether [`Context::note_z3_session_started`] has been called since
+    /// this context was made or reset.
+    #[must_use]
+    pub fn z3_session_start_noted(&self) -> bool {
+        self.z3_smtlib2_compliant_at_start.is_some()
+    }
+
+    /// Whether [`Context::set_z3_mode`] is in force.
+    #[must_use]
+    pub fn z3_mode(&self) -> bool {
+        self.z3_mode
+    }
+
     /// Get the parsed assertions (original surface syntax).
     pub fn assertions_parsed(&self) -> &[ParsedTerm] {
         &self.assertions_parsed
+    }
+
+    /// The parsed assertions a proof lane may RAW re-intern (intern as
+    /// written, without elaboration's folds), for a lane that judges its own
+    /// candidate strictly and needs no export alignment: the retained proof
+    /// surface ([`Self::assertions_parsed`]) when it holds any, else the
+    /// definitional pass's budgeted copy
+    /// ([`Self::set_definitional_pass_parsed_budget`]).
+    ///
+    /// Both are exact prefixes of the assertion stack under one rule: an
+    /// assertion enters both at its `assert` (or transient push) while they
+    /// are aligned, and `pop`, `reset`, `reset-assertions` and the internal
+    /// query window truncate, clear or swap both together. So every term
+    /// here is the parsed source of an assertion the stack holds now, in
+    /// either session. The copy matters in a session that retains no proof
+    /// surface but still certifies its `unsat` (a `--rigor standard` stdin
+    /// session, such as `ay --incremental`): a raw lane that read only
+    /// `assertions_parsed` found no roots there and declined, so the
+    /// session decided what the one-shot proof route decides by another,
+    /// slower lane or not at all. Every other proof consumer, in particular
+    /// the surface-aligned lanes whose choice the retention switch steers,
+    /// keeps reading `assertions_parsed` alone.
+    pub fn raw_reinternable_parsed_assertions(&self) -> &[ParsedTerm] {
+        if self.assertions_parsed.is_empty() && self.definitional_pass.budget.is_some() {
+            &self.definitional_pass.parsed
+        } else {
+            &self.assertions_parsed
+        }
     }
 
     /// Return user-authored assertions in source order for `get-assertions`.
@@ -2127,6 +2510,82 @@ impl Context {
                 })
                 .collect(),
         )
+    }
+
+    /// Classify retained assertion surfaces without cloning or re-interning.
+    ///
+    /// `originals` must be the caller's borrowed original ASSERTIONS, excluding
+    /// public assumptions and the mutable preprocessing stack. Native sentinel
+    /// rows must match their exact concrete root and parsed index. The native
+    /// spelling follows the existing provenance-surface audit convention; it
+    /// is routing metadata, never permission to assume an assertion. Callers
+    /// independently authenticate all native query roots. `progress` must
+    /// debit the original source-work envelope before each metadata visit;
+    /// refusal returns None. The row cap applies ONLY to native eligibility:
+    /// genuine/mixed source retains its legacy deduplicated proof scope.
+    #[must_use]
+    pub fn native_assertion_surfaces_for(
+        &self,
+        originals: &[TermId],
+        max_native_rows: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<NativeAssertionSurfaces> {
+        if !progress(1) {
+            return None;
+        }
+        if self.authored_assertions.is_empty() && self.assertions_parsed.is_empty() {
+            return Some(if originals.len() <= max_native_rows {
+                NativeAssertionSurfaces::Native
+            } else {
+                NativeAssertionSurfaces::Unavailable
+            });
+        }
+        // Retention-off and any genuine/mixed source preserve the existing
+        // source route. A native-looking NAME inside a real expression is not
+        // a native assertion sentinel. Meter even the search for such a row:
+        // a genuine row beyond the native cap must not be silently excluded.
+        if self.assertions_parsed.is_empty() {
+            return Some(NativeAssertionSurfaces::Other);
+        }
+        for surface in &self.assertions_parsed {
+            if !progress(1) {
+                return None;
+            }
+            if !matches!(surface, ParsedTerm::Symbol(name)
+                if name == NATIVE_API_ASSERTION_PLACEHOLDER)
+            {
+                return Some(NativeAssertionSurfaces::Other);
+            }
+        }
+        for row in &self.authored_assertions {
+            if !progress(1) {
+                return None;
+            }
+            if matches!(row, AuthoredAssertion::Schematic(_)) {
+                return Some(NativeAssertionSurfaces::Other);
+            }
+        }
+        if originals.len() > max_native_rows
+            || self.authored_assertions.len() > max_native_rows
+            || self.assertions_parsed.len() > max_native_rows
+            || self.has_symbol_binding(NATIVE_API_ASSERTION_PLACEHOLDER)
+            || self.authored_assertions.len() != originals.len()
+            || self.assertions_parsed.len() != originals.len()
+        {
+            return Some(NativeAssertionSurfaces::Unavailable);
+        }
+        for (index, (row, &original)) in self.authored_assertions.iter().zip(originals).enumerate()
+        {
+            if !progress(1) {
+                return None;
+            }
+            if !matches!(row, AuthoredAssertion::Concrete { term, parsed_index, .. }
+                if *term == original && *parsed_index == Some(index))
+            {
+                return Some(NativeAssertionSurfaces::Unavailable);
+            }
+        }
+        Some(NativeAssertionSurfaces::Native)
     }
 
     /// Exact terms whose authored source was literally `false`.
@@ -2316,9 +2775,10 @@ impl Context {
     }
 
     fn push_assertion_stacks(&mut self, term: TermId, parsed: ParsedTerm) -> Option<usize> {
-        let parsed_index = (self.retain_parsed_assertions
+        let parsed_index = (self.retains_parsed_assertions()
             && self.assertions_parsed.len() == self.assertions.len())
         .then_some(self.assertions_parsed.len());
+        self.push_pass_parsed(&parsed);
         if parsed_index.is_some() {
             self.assertions_parsed.push(parsed);
         }
@@ -2334,16 +2794,70 @@ impl Context {
     /// Turning retention OFF is a pure memory optimization: every consumer of
     /// `assertions_parsed` is a proof/lean export path that degrades gracefully
     /// on a short or empty parsed stack. `(set-option :produce-proofs true)`
-    /// forces retention back ON from that point.
+    /// forces retention back ON from that point, until `(reset)` restores the
+    /// value configured here.
     pub fn set_retain_parsed_assertions(&mut self, retain: bool) {
-        self.retain_parsed_assertions = retain;
+        self.parsed_retention = ParsedRetention::host(retain);
+    }
+
+    /// Give the check-sat-time definitional-forall pass
+    /// (`definitional_check_sat`) its own parsed copy of the hard
+    /// assertions, bounded to `nodes` parsed nodes, WITHOUT turning on
+    /// proof-surface retention.
+    ///
+    /// The host that cannot emit a proof this session turns
+    /// `assertions_parsed` retention off as a peak-RSS optimization (~190 MB
+    /// of a 318 MB peak on a 6 MB QF_UF input), and that switch is also
+    /// load-bearing for the certification funnel: with the parsed surface
+    /// present the funnel takes its surface-aligned lanes, and on some
+    /// negated-existential refutations those decline where the plain route
+    /// certifies (measured: 4 of 400 random `not exists` scripts flip
+    /// `unsat` -> `unknown` when the CLI retains). So the pass, which needs
+    /// a fully aligned parsed stack to re-elaborate, gets a copy of its own:
+    /// kept while the budget lasts (the pass's own re-elaboration is bounded
+    /// by [`definitional_check_sat::CHECK_SAT_ADOPTION_MAX_RETAINED_NODES`],
+    /// so that budget loses nothing the pass could use), dropped for the
+    /// session once it is spent. Besides the pass, only raw re-interning
+    /// lanes read it ([`Self::raw_reinternable_parsed_assertions`]), so the
+    /// surface-aligned lanes still see no surface. `(reset)` re-arms the
+    /// budget; `(set-option :produce-proofs true)` retains the full surface
+    /// as before, and the pass then reads that.
+    pub fn set_definitional_pass_parsed_budget(&mut self, nodes: usize) {
+        self.definitional_pass.budget = Some(PassParsedBudget {
+            total: nodes,
+            remaining: nodes,
+        });
+    }
+
+    /// Append `parsed` to the pass's own parsed copy while a budget is
+    /// installed, the copy is still aligned with the assertion stack (which
+    /// must not have received this assertion yet), and the budget covers it.
+    /// Over budget, the copy stops growing for the session; the budget field
+    /// stays so `(reset)` can re-arm it.
+    fn push_pass_parsed(&mut self, parsed: &ParsedTerm) {
+        let Some(budget) = self.definitional_pass.budget.as_mut() else {
+            return;
+        };
+        if self.definitional_pass.parsed.len() != self.assertions.len() {
+            return;
+        }
+        match definitional_check_sat::parsed_terms_node_count_within(
+            std::iter::once(parsed),
+            budget.remaining,
+        ) {
+            Some(nodes) => {
+                budget.remaining -= nodes;
+                self.definitional_pass.parsed.push(parsed.clone());
+            }
+            None => budget.remaining = 0,
+        }
     }
 
     /// Whether new assertions retain their parsed source trees for proof
     /// surface alignment.
     #[must_use]
     pub const fn retains_parsed_assertions(&self) -> bool {
-        self.retain_parsed_assertions
+        self.parsed_retention.effective()
     }
 
     /// Replace the complete active query view with exact internal probe roots.
@@ -2399,11 +2913,13 @@ impl Context {
                 probe_metadata,
             ),
             assertions_parsed: std::mem::take(&mut self.assertions_parsed),
-            retain_parsed_assertions: std::mem::replace(&mut self.retain_parsed_assertions, false),
+            parsed_retention: self.parsed_retention.suspend(),
+            pass_parsed_assertions: std::mem::take(&mut self.definitional_pass.parsed),
             objectives: std::mem::take(&mut self.objectives),
             objective_finite_set_metadata: std::mem::take(&mut self.objective_finite_set_metadata),
             soft_constraints: std::mem::take(&mut self.soft_constraints),
             soft_finite_set_metadata: std::mem::take(&mut self.soft_finite_set_metadata),
+            objective_sequence: std::mem::take(&mut self.objective_sequence),
             named_terms: std::mem::take(&mut self.named_terms),
             polymorphic_assertions: std::mem::take(&mut self.polymorphic_assertions),
             authored_assertions: std::mem::take(&mut self.authored_assertions),
@@ -2436,11 +2952,13 @@ impl Context {
             assertions,
             assertion_finite_set_metadata,
             assertions_parsed,
-            retain_parsed_assertions,
+            parsed_retention,
+            pass_parsed_assertions,
             objectives,
             objective_finite_set_metadata,
             soft_constraints,
             soft_finite_set_metadata,
+            objective_sequence,
             named_terms,
             polymorphic_assertions,
             authored_assertions,
@@ -2450,11 +2968,13 @@ impl Context {
         self.assertions = assertions;
         self.assertion_finite_set_metadata = assertion_finite_set_metadata;
         self.assertions_parsed = assertions_parsed;
-        self.retain_parsed_assertions = retain_parsed_assertions;
+        self.parsed_retention = parsed_retention;
+        self.definitional_pass.parsed = pass_parsed_assertions;
         self.objectives = objectives;
         self.objective_finite_set_metadata = objective_finite_set_metadata;
         self.soft_constraints = soft_constraints;
         self.soft_finite_set_metadata = soft_finite_set_metadata;
+        self.objective_sequence = objective_sequence;
         self.named_terms = named_terms;
         self.polymorphic_assertions = polymorphic_assertions;
         self.authored_assertions = authored_assertions;
@@ -2470,9 +2990,17 @@ impl Context {
 
     /// Add an optimization objective.
     pub fn add_objective(&mut self, objective: Objective) {
+        self.objective_sequence
+            .push(ObjectiveStep::Arithmetic(self.objectives.len()));
         self.objectives.push(objective);
         self.objective_finite_set_metadata
             .push(PublicAssertionMetadata::default());
+    }
+
+    /// The unified declaration order of arithmetic objectives and soft
+    /// groups (Z3's single optimization objective list).
+    pub fn objective_sequence(&self) -> &[ObjectiveStep] {
+        &self.objective_sequence
     }
 
     /// Get the soft (weighted) constraints from `(assert-soft ...)`.
@@ -2482,6 +3010,16 @@ impl Context {
 
     /// Add a soft (weighted) constraint.
     pub(crate) fn add_soft_constraint(&mut self, soft: SoftAssertion) {
+        // A soft group enters the unified objective order at its first
+        // appearance; later softs with the same `:id` join the same step.
+        if !self
+            .objective_sequence
+            .iter()
+            .any(|step| matches!(step, ObjectiveStep::SoftGroup(id) if *id == soft.id))
+        {
+            self.objective_sequence
+                .push(ObjectiveStep::SoftGroup(soft.id.clone()));
+        }
         self.soft_constraints.push(soft);
         self.soft_finite_set_metadata
             .push(PublicAssertionMetadata::default());
@@ -2499,6 +3037,23 @@ impl Context {
         soft_constraints: Vec<SoftAssertion>,
     ) -> Vec<SoftAssertion> {
         std::mem::replace(&mut self.soft_constraints, soft_constraints)
+    }
+
+    /// Like [`replace_soft_constraints`](Self::replace_soft_constraints) but
+    /// also swaps the declared objective sequence, returning both prior
+    /// values. A native-API owner that tracks its own interleaved
+    /// maximize/minimize/assert-soft declaration order installs it with its
+    /// soft set so joint (mixed soft + arithmetic) optimization sees the
+    /// caller's true order; restoring both keeps the parsed context intact.
+    pub fn replace_soft_constraints_with_sequence(
+        &mut self,
+        soft_constraints: Vec<SoftAssertion>,
+        objective_sequence: Vec<ObjectiveStep>,
+    ) -> (Vec<SoftAssertion>, Vec<ObjectiveStep>) {
+        (
+            std::mem::replace(&mut self.soft_constraints, soft_constraints),
+            std::mem::replace(&mut self.objective_sequence, objective_sequence),
+        )
     }
 
     pub(crate) fn global_declarations_enabled(&self) -> bool {
@@ -2674,6 +3229,14 @@ impl Context {
         overrides
     }
 
+    /// Whether field-surface entries exist, without allocating their rendered
+    /// override map. Stale or shadowed entries still count: a caller may use
+    /// this conservative predicate to decline unpriced rendering work.
+    #[must_use]
+    pub fn has_dt_field_surface_entries(&self) -> bool {
+        !self.dt_field_surface.is_empty()
+    }
+
     /// The term reached by following `field.path` (positional constructor-
     /// argument indices) from the exact root declaration, or `None` if that
     /// declaration is no longer present or the walk does not fit.
@@ -2811,8 +3374,14 @@ mod app;
 mod commands;
 mod datatypes;
 mod declarations;
+mod definitional_check_sat;
+pub use definitional_check_sat::{
+    DefinitionalAdoptionSnapshot, CHECK_SAT_ADOPTION_MAX_RETAINED_NODES,
+};
 mod derived_query;
+mod parsed_retention;
 pub use declarations::IntroKind;
+pub use parsed_retention::ParsedRetention;
 mod indexed;
 mod public_sorts;
 pub use public_sorts::{
@@ -2821,11 +3390,18 @@ pub use public_sorts::{
 };
 mod logic_policy;
 mod macro_memo;
+mod named_labels;
 use macro_memo::MacroExpansionWatermark;
+pub use named_labels::{term_has_named_label, LabelFailure};
 mod qualified;
+mod skipped_subterms;
 mod sort_parameters;
 mod sorts;
+mod strict_proofs_option;
+pub use strict_proofs_option::script_requests_strict_proofs;
+mod shared_surface;
 mod term;
+pub use shared_surface::{SharedSurfaceElaboration, SharedSurfaceLimits};
 
 #[allow(clippy::panic)]
 #[cfg(test)]

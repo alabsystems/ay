@@ -187,6 +187,15 @@ pub(crate) struct DpllEagerStats {
     pub props_fed_back: u64,
     /// Theory propagations converted into SAT propagation clauses.
     pub props_clause_added: u64,
+    /// Level-0 lazy propagations explained at delivery for a proof-tracking
+    /// solve (at most one explanation per level-0 literal per SAT instance).
+    pub level0_lazy_explained: u64,
+    /// Level-0 lazy propagations a proof-tracking solve could not explain, or
+    /// whose explanation the eager lane declined; each was delivered lazily.
+    pub level0_lazy_unexplained: u64,
+    /// Level-0 explanations outside the bound-axiom shape recorded as theory
+    /// lemmas with a re-verified Farkas certificate.
+    pub level0_lazy_certified: u64,
 }
 
 impl DpllEagerStats {
@@ -214,6 +223,9 @@ impl DpllEagerStats {
         self.props_already_assigned += other.props_already_assigned;
         self.props_fed_back += other.props_fed_back;
         self.props_clause_added += other.props_clause_added;
+        self.level0_lazy_explained += other.level0_lazy_explained;
+        self.level0_lazy_unexplained += other.level0_lazy_unexplained;
+        self.level0_lazy_certified += other.level0_lazy_certified;
     }
 }
 

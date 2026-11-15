@@ -2,38 +2,49 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Rule dispatch for the two fresh-definition rules.
+//! Rule dispatch for the three fresh-definition rules.
 //!
-//! `fresh_def_bound` and `fresh_def_eq` share ONE whole-proof registry (see
-//! [`super::fresh_def`] for why that sharing is a soundness requirement) but
-//! NOT a shape: each owns its own recognizer, its own error enum, and its own
-//! local guards (`<=` vs `=`, and the bound's `side`). This module is the
-//! single point where the rule chooses between them, so no `match` on the rule
-//! has to live inside a recognizer.
+//! `fresh_def_bound`, `fresh_def_eq` and `divmod_def` share ONE whole-proof
+//! registry (see [`super::fresh_def`] for why that sharing is a soundness
+//! requirement) but NOT a shape: each owns its own recognizer, its own error
+//! enum, and its own local guards (`<=` vs `=` vs a valid div/mod atom). This
+//! module is the single point where the rule chooses between them, so no
+//! `match` on the rule has to live inside a recognizer.
 
-use ay_core::proof_validation::{recognize_fresh_def_bound, recognize_fresh_def_eq};
+use ay_core::proof_validation::{
+    recognize_divmod_def, recognize_fresh_def_bound, recognize_fresh_def_eq,
+};
 use ay_core::{AletheRule, ProofId, TermId, TermStore};
 
 use super::ProofCheckError;
 
-/// Dispatch to the rule's own local shape recognizer.
+/// Dispatch to the rule's own local shape recognizer, returning every
+/// `(definiendum, definiens)` binding the step introduces: one for a bound or
+/// an equality, two (quotient and remainder) for a div/mod definition.
 ///
-/// Any rule other than the two fresh-definition rules is a caller bug and is
-/// refused rather than defaulted, so a future third rule cannot silently
-/// inherit the bound recognizer.
+/// Any other rule is a caller bug and is refused rather than defaulted, so a
+/// future rule cannot silently inherit another's recognizer.
 pub(super) fn recognize_fresh_definition(
     terms: &TermStore,
     rule: &AletheRule,
     clause: &[TermId],
     premise_count: usize,
     args: &[TermId],
-) -> Result<(TermId, TermId), String> {
+) -> Result<Vec<(TermId, TermId)>, String> {
     match rule {
         AletheRule::FreshDefBound => recognize_fresh_def_bound(terms, clause, premise_count, args)
-            .map(|shape| (shape.definiendum, shape.definiens))
+            .map(|shape| vec![(shape.definiendum, shape.definiens)])
             .map_err(|error| error.to_string()),
         AletheRule::FreshDefEq => recognize_fresh_def_eq(terms, clause, premise_count, args)
-            .map(|shape| (shape.definiendum, shape.definiens))
+            .map(|shape| vec![(shape.definiendum, shape.definiens)])
+            .map_err(|error| error.to_string()),
+        AletheRule::DivModDef => recognize_divmod_def(terms, clause, premise_count, args)
+            .map(|shape| {
+                vec![
+                    (shape.quotient, shape.quotient_definiens),
+                    (shape.remainder, shape.remainder_definiens),
+                ]
+            })
             .map_err(|error| error.to_string()),
         other => Err(format!(
             "`{}` is not a fresh-definition rule and has no definitional provenance",

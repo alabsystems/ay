@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% The cardinality boundary sits one unit FURTHER out than the general-PB one, because the
+% decrement is per literal: with two literals mapped to TRUE, `i64::MIN + 1` still wraps (on the
+% second decrement) and only `i64::MIN + 2` does not. This is that control, and it is refused by
+% the unfixed checker too.
+f 2;
+rup 1 x1 1 x2 >= -9223372036854775806 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% The same formula and the same binary, proved SATISFIABLE. `x1=0 x2=0 x3=1 x4=0` satisfies all
+% three constraints:
+%   1 x1 1 x2 >= 0    ->  0 + 0 >= 0   ok
+%   1 x3 1 x4 >= 1    ->  1 + 0 >= 1   ok
+%   1 ~x3 1 ~x4 >= 1  ->  0 + 1 >= 1   ok
+f 3;
+sol ~x1 ~x2 x3 ~x4;
+output NONE;
+conclusion SAT;
+end pseudo-Boolean proof;

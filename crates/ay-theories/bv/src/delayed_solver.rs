@@ -59,19 +59,53 @@ impl BvSolver<'_> {
         match op {
             "bvmul" | "bvudiv" | "bvurem" | "bvsdiv" | "bvsrem" | "bvsmod" => {}
             "bvadd" => {
-                let num_vars = self.count_variable_args(args);
-                if (num_vars as u32) * width <= 64 {
+                // The exact product `num_vars * width`, which no argument
+                // count or width overflows in `u64` (saturated past it).
+                let num_vars = u64::try_from(self.count_variable_args(args)).unwrap_or(u64::MAX);
+                if num_vars.saturating_mul(u64::from(width)) <= 64 {
                     return false;
                 }
             }
             _ => return false,
         }
 
-        if width <= 12 {
+        // Unsigned division removes common known-zero high input bits.
+        // Explicit zero extensions therefore cost the payload width, even
+        // when their result carrier is wide. Classify that actual circuit
+        // before replacing its outputs with delayed, unrelated variables.
+        let circuit_width = match (op, args) {
+            ("bvudiv" | "bvurem", [a, b]) => match (
+                self.zero_extended_payload_width(*a, width),
+                self.zero_extended_payload_width(*b, width),
+            ) {
+                (Some(a), Some(b)) => a.max(b),
+                _ => width,
+            },
+            _ => width,
+        };
+        if circuit_width <= 12 {
             return false;
         }
 
         self.count_variable_args(args) > 1
+    }
+
+    fn zero_extended_payload_width(&self, term: TermId, width: u32) -> Option<u32> {
+        let TermData::App(Symbol::Indexed(name, indices), args) = self.terms.get(term) else {
+            return None;
+        };
+        if name != "zero_extend" || indices.len() != 1 || args.len() != 1 {
+            return None;
+        }
+        let (Sort::BitVec(outer), Sort::BitVec(inner)) =
+            (self.terms.sort(term), self.terms.sort(args[0]))
+        else {
+            return None;
+        };
+        (outer.width == width
+            && inner.width > 0
+            && inner.width.checked_add(indices[0]) == Some(width))
+        .then_some(inner.width)
     }
 
     /// Set the eager terms set (#8142).
@@ -116,13 +150,9 @@ impl BvSolver<'_> {
 
     /// Count the number of non-constant (variable) arguments in an operation.
     fn count_variable_args(&self, args: &[TermId]) -> usize {
-        let mut count = args.len();
-        for &arg in args {
-            if let TermData::Const(_) = self.terms.get(arg) {
-                count -= 1;
-            }
-        }
-        count
+        args.iter()
+            .filter(|&&arg| !matches!(self.terms.get(arg), TermData::Const(_)))
+            .count()
     }
 
     /// Extract owned delayed state for use after BvSolver is dropped (#7015).
@@ -130,6 +160,10 @@ impl BvSolver<'_> {
     /// Returns `Some(DelayedBvState)` if there are unresolved delayed operations,
     /// `None` otherwise.
     pub fn take_delayed_state(&self) -> Option<DelayedBvState> {
+        if !self.encoding_complete() {
+            return None;
+        }
+
         if self.delayed_ops.iter().any(|op| !op.circuit_built) {
             Some(DelayedBvState::new(
                 self.delayed_ops.clone(),
@@ -153,6 +187,10 @@ impl BvSolver<'_> {
     ///
     /// Returns clauses in BV literal space.
     pub fn build_delayed_circuit(&mut self, op_idx: usize) -> Vec<CnfClause> {
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
+
         let op = self.delayed_ops[op_idx].clone();
 
         let circuit_bits = match op.op {
@@ -202,12 +240,21 @@ impl BvSolver<'_> {
             _ => return Vec::new(),
         };
 
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
         let mut equiv_clauses = Vec::new();
         for (&result_bit, &circuit_bit) in op.result_bits.iter().zip(circuit_bits.iter()) {
-            equiv_clauses.push(CnfClause::new(vec![-result_bit, circuit_bit]));
-            equiv_clauses.push(CnfClause::new(vec![result_bit, -circuit_bit]));
+            if !self.encoding_step() {
+                return Vec::new();
+            }
+            equiv_clauses.push(CnfClause::new(vec![neg_lit(result_bit), circuit_bit]));
+            equiv_clauses.push(CnfClause::new(vec![result_bit, neg_lit(circuit_bit)]));
         }
 
+        if !self.encoding_complete() {
+            return Vec::new();
+        }
         self.delayed_ops[op_idx].circuit_built = true;
 
         let mut all_clauses = self.take_clauses();

@@ -355,7 +355,8 @@ impl NraSolver<'_> {
         cover: &[TermId],
         snap: PinSnap,
     ) -> Option<Vec<(TermId, BigRational)>> {
-        let mut pins = Vec::with_capacity(cover.len());
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(cover.len()).ok()?;
         for &variable in cover {
             pins.push((variable, snap.apply(self.var_value(variable)?)));
         }

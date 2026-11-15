@@ -367,7 +367,9 @@ impl ArraySolver<'_> {
         })
     }
 
-    fn record_external_equality(&mut self, t1: TermId, t2: TermId, reasons: &[TheoryLit]) {
+    /// Returns `true` when the call changed this solver's state: the edge is
+    /// new, or the stored reasons for an existing edge grew.
+    fn record_external_equality(&mut self, t1: TermId, t2: TermId, reasons: &[TheoryLit]) -> bool {
         let key = Self::ordered_pair(t1, t2);
 
         // Persist so it survives rebuild_assign_indices() calls.
@@ -415,15 +417,22 @@ impl ArraySolver<'_> {
             self.prop_eq_snapshot = None;
             self.final_check_snapshot = None;
         }
+        edge_is_new || reasons_changed
     }
 
     /// Inject an external equality `t1 = t2` learned from another theory.
     ///
     /// This is used by the combined solver when LIA or EUF determines that
-    /// two array-relevant terms are equal. The equality is added to the
-    /// internal adjacency list so that `known_equal()` returns true (#4665).
-    pub fn assert_external_equality(&mut self, t1: TermId, t2: TermId) {
-        self.record_external_equality(t1, t2, &[]);
+    /// two array-relevant terms are equal. The equality becomes a sentinel
+    /// edge of the internal adjacency list (#4665): store-chain traversal,
+    /// weak equivalence and distinctness explanations follow such an edge
+    /// when it carries reasons. It is NOT an asserted equality atom, so the
+    /// atom-keyed index queries (`known_equal`, the asserted-path explainer)
+    /// do not see it — see `undecided_index_pairs`.
+    ///
+    /// Returns `true` when the edge was new.
+    pub fn assert_external_equality(&mut self, t1: TermId, t2: TermId) -> bool {
+        self.record_external_equality(t1, t2, &[])
     }
 
     /// Inject a reason-carrying external equality `t1 = t2`.
@@ -431,13 +440,19 @@ impl ArraySolver<'_> {
     /// The equality is represented as a sentinel edge in the equality graph, but
     /// the supplied SAT-visible reasons are preserved so store-chain conflict
     /// lemmas can guard any reasoning that traverses the edge.
+    ///
+    /// Returns `true` when the call changed this solver's state — the edge is
+    /// new or its stored reasons grew — and `false` when the same equality
+    /// with the same reasons was already recorded. The Nelson-Oppen index pass
+    /// (`propagate_array_index_info`) reads this to decide whether re-running
+    /// the fixpoint can consume anything new (#no-index-eq-livelock).
     pub fn assert_external_equality_with_reasons(
         &mut self,
         t1: TermId,
         t2: TermId,
         reasons: &[TheoryLit],
-    ) {
-        self.record_external_equality(t1, t2, reasons);
+    ) -> bool {
+        self.record_external_equality(t1, t2, reasons)
     }
 
     /// Notify the array solver that two terms have become equal.

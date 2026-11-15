@@ -42,6 +42,32 @@ fn shadow_host_matches_native_on_implication_chain() {
     assert_eq!(host.total_compared(), 1);
 }
 
+/// A formula whose row-major watch table is past the bound gets no kernel,
+/// so every compare is skipped, instead of an allocation that aborts the
+/// process (a Float64 `fp.rem` bit-blast asked for ~98 TB).
+#[test]
+fn shadow_host_skips_a_formula_whose_watch_table_is_past_the_bound() {
+    // The chain (-v_i v_{i+1}) over 8192 vars: 16386 * 8191 entries, twice
+    // the bound, from a formula the solver builds in milliseconds.
+    let vars = 8192u32;
+    let mut solver = Solver::new(vars as usize);
+    for i in 0..vars - 1 {
+        let (a, b) = (Variable::new(i), Variable::new(i + 1));
+        assert!(solver.add_clause(vec![Literal::negative(a), Literal::positive(b)]));
+    }
+    let entries = shadow_watch_entries(vars as usize, solver.cold.original_ledger.num_clauses());
+    assert!(entries.unwrap() > MAX_SHADOW_WATCH_ENTRIES);
+    solver.initialize_watches();
+    solver.decide(Literal::positive(Variable::new(0)));
+    let mut host = ExternalCodegenBcpShadowHost::build(&solver);
+    assert!(host.provider.is_none());
+    let pre = ExternalCodegenBcpShadowHost::capture_pre_state(&solver);
+    let native_conflict = solver.search_propagate();
+    let outcome = host.shadow_compare(&solver, &pre, native_conflict);
+    assert_eq!(outcome, ShadowCompareOutcome::Skipped);
+    assert_eq!(shadow_watch_entries(usize::MAX, 2), None);
+}
+
 /// Conflict verdicts must agree: deciding +1 with (-1 2)(-1 -2) conflicts.
 #[test]
 fn shadow_host_agrees_on_conflict() {

@@ -53,6 +53,38 @@ fn insert_dimacs_backbone_rescue_schedule(context: &mut DimacsStructuredStatisti
     stats.insert(SAT_BOUNDED_BACKBONE_YIELDS_KEY, schedule.bounded_yields);
     stats.insert(SAT_BOUNDED_BACKBONE_MS_KEY, schedule.bounded_ms);
     stats.insert(
+        SAT_BOUNDED_BACKBONE_COMPLETED_PASSES_KEY,
+        schedule.bounded_completed_passes,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_ROUNDS_KEY,
+        schedule.binary_stacked_rounds,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_PROBES_KEY,
+        schedule.binary_stacked_probes,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_GUARD_SKIPS_KEY,
+        schedule.binary_stacked_guard_skips,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_SKIP_OTHER_ROOT_KEY,
+        schedule.binary_stacked_skip_other_root,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_SKIP_OTHER_STACK_KEY,
+        schedule.binary_stacked_skip_other_stack,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_SKIP_DEAD_CLAUSE_KEY,
+        schedule.binary_stacked_skip_dead_clause,
+    );
+    stats.insert(
+        SAT_BACKBONE_STACKED_SKIP_UIP_LEVEL_KEY,
+        schedule.binary_stacked_skip_uip_level,
+    );
+    stats.insert(
         SAT_BOUNDED_BACKBONE_BINARY_SUPPRESSED_KEY,
         schedule.bounded_binary_suppressed,
     );
@@ -106,6 +138,10 @@ fn insert_dimacs_backbone_misc(context: &mut DimacsStructuredStatistics<'_, '_, 
     stats.insert("sat.stale_enqueue_skips", solver.stale_enqueue_skips());
     stats.insert("sat.stale_bcp_watch_skips", solver.stale_bcp_watch_skips());
     stats.insert("sat.eager_subsumed", solver.num_eager_subsumptions());
+    stats.insert(
+        "sat.eager_subsumed_duplicate_binaries",
+        solver.num_eager_subsumed_duplicate_binaries(),
+    );
     let (lookahead_rounds, failed_literals, decisions_used) = solver.lookahead_stats();
     stats.insert("sat.lookahead_rounds", lookahead_rounds);
     stats.insert("sat.lookahead_failed_literals", failed_literals);

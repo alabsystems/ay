@@ -43,7 +43,8 @@ no() { echo "  FAIL  $1"; fail=$((fail + 1)); }
 
 if [ ! -x "$AY" ]; then
   echo "verify_govern_image: no ay binary at $AY" >&2
-  echo "build it: cargo build --release -p ay --bin ay --features cli" >&2
+  echo "build it: targo --unverified build --release -p ay --bin ay --features cli" >&2
+  echo "  (without the Trust toolchain: cargo build --release -p ay --bin ay --features cli)" >&2
   exit 1
 fi
 

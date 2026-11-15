@@ -352,13 +352,9 @@ fn an_unrepresentable_format_is_refused() {
         (33, 24),
         (8, 0),
         (8, 1),
-        (8, 65),
+        (8, 130),
         (64, 64),
-        // Float128: `ModelValue::FloatingPoint` stores the fields in `u64`, so
-        // a 113-bit significand has nowhere to go. Refusing keeps the gate
-        // fail-closed; the alternative — truncating — would confirm models
-        // against a DIFFERENT number than the one the solver produced.
-        (15, 113),
+        (15, 130),
     ] {
         assert_eq!(
             round_rational(&one, eb, sb, RoundingMode::NearestTiesToEven),
@@ -367,7 +363,14 @@ fn an_unrepresentable_format_is_refused() {
         );
     }
     // Formats it CAN do, including the small ones SMT-LIB allows.
-    for (eb, sb) in [(5u32, 11u32), (8, 24), (11, 53), (2, 2), (15, 64)] {
+    for (eb, sb) in [
+        (5u32, 11u32),
+        (8, 24),
+        (11, 53),
+        (2, 2),
+        (15, 64),
+        (15, 113),
+    ] {
         assert!(
             round_rational(&one, eb, sb, RoundingMode::NearestTiesToEven).is_some(),
             "format ({eb}, {sb}) is representable"

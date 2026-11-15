@@ -1,0 +1,34 @@
+pseudo-Boolean proof version 2.0
+* Positive companion to incorrect/version2/pre_order_transitivity_before_def.
+* The same formula and the same order machinery with the blocks in the sequence
+* the format defines: `vars`, `def`, `transitivity`, `end`.
+*
+* The relation is `u1 -> v1`, a genuine preorder, and its transitivity block
+* proves the one obligation `def` gives it rather than the zero obligations an
+* empty definition gives. The formula is satisfied by `x1 = 1, x2 = 0, x3 = 0`.
+f 4
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order simple x1
+load_order
+output NONE
+conclusion SAT : x1 ~x2 ~x3
+end pseudo-Boolean proof

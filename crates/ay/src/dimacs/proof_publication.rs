@@ -2,7 +2,21 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#[cfg(test)]
+std::thread_local! {
+    /// Whole-file passes this thread made, so tests can pin the fast path's
+    /// promise that nothing reads a published proof back.
+    static WHOLE_FILE_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn whole_file_hash_passes() -> usize {
+    WHOLE_FILE_HASH_PASSES.with(std::cell::Cell::get)
+}
+
 fn hash_file(file: &mut File) -> io::Result<(u64, Sha256Digest)> {
+    #[cfg(test)]
+    WHOLE_FILE_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut len = 0_u64;
@@ -27,6 +41,7 @@ impl RetainedDimacsPublication {
         label: &'static str,
         expected: Option<PublishedDimacsProof>,
         invalidation: DimacsPublicationInvalidation,
+        recheck: DimacsPublicationRecheck,
     ) -> io::Result<Self> {
         let invalidation_descriptor = match descriptor.try_clone() {
             Ok(clone) => clone,
@@ -40,6 +55,16 @@ impl RetainedDimacsPublication {
         };
         let captured = (|| -> io::Result<Self> {
             let identity = regular_single_link_identity(&descriptor, &path)?;
+            if recheck == DimacsPublicationRecheck::Identity {
+                return Self::capture_identity(
+                    descriptor,
+                    path,
+                    label,
+                    expected,
+                    invalidation,
+                    identity,
+                );
+            }
             let (len, sha256) = hash_file(&mut descriptor)?;
             if let Some(expected) = expected {
                 if identity != expected.identity || len != expected.len || sha256 != expected.sha256
@@ -71,6 +96,7 @@ impl RetainedDimacsPublication {
                 sha256,
                 label,
                 invalidation,
+                recheck,
             })
         })();
         match captured {
@@ -83,12 +109,73 @@ impl RetainedDimacsPublication {
         }
     }
 
+    /// Capture a fast-publication proof without reading it: the descriptor and
+    /// the visible path must name the sealed inode, with one link and the
+    /// sealed length, and the sealed digest is adopted.
+    fn capture_identity(
+        descriptor: File,
+        path: PathBuf,
+        label: &'static str,
+        expected: Option<PublishedDimacsProof>,
+        invalidation: DimacsPublicationInvalidation,
+        identity: ProofFileIdentity,
+    ) -> io::Result<Self> {
+        let Some(expected) = expected else {
+            return Err(io::Error::other(format!(
+                "retained {label} has no seal to adopt an identity-only recheck from"
+            )));
+        };
+        let len = descriptor.metadata()?.len();
+        if identity != expected.identity || len != expected.len {
+            return Err(io::Error::other(format!(
+                "retained {label} descriptor does not match its same-run publication seal"
+            )));
+        }
+        let publication = Self {
+            descriptor,
+            path,
+            identity,
+            len,
+            sha256: expected.sha256,
+            label,
+            invalidation,
+            recheck: DimacsPublicationRecheck::Identity,
+        };
+        publication.check_visible_identity()?;
+        Ok(publication)
+    }
+
+    /// The visible path still names the retained inode, with one link and the
+    /// retained length.
+    fn check_visible_identity(&self) -> io::Result<()> {
+        let visible = open_dimacs_regular_file(&self.path)?;
+        if regular_single_link_identity(&visible, &self.path)? != self.identity
+            || visible.metadata()?.len() != self.len
+        {
+            return Err(io::Error::other(format!(
+                "{} path '{}' was replaced or resized",
+                self.label,
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn validate(&mut self) -> io::Result<()> {
         if regular_single_link_identity(&self.descriptor, &self.path)? != self.identity {
             return Err(io::Error::other(format!(
                 "retained {} descriptor identity changed",
                 self.label
             )));
+        }
+        if self.recheck == DimacsPublicationRecheck::Identity {
+            if self.descriptor.metadata()?.len() != self.len {
+                return Err(io::Error::other(format!(
+                    "retained {} descriptor length changed",
+                    self.label
+                )));
+            }
+            return self.check_visible_identity();
         }
         let (descriptor_len, descriptor_sha256) = hash_file(&mut self.descriptor)?;
         if descriptor_len != self.len || descriptor_sha256 != self.sha256 {

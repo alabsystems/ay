@@ -78,6 +78,61 @@ fn test_jit_invalidation_on_new_atom() {
     assert_eq!(solver.theory_prop_jit.total_atoms(), 2);
 }
 
+/// The lazy recompile in `propagate_var_atoms` is amortized: a single new
+/// atom must not trigger a full rebuild (interpreted path serves meanwhile);
+/// once growth crosses the threshold the next propagation recompiles.
+#[test]
+fn test_jit_lazy_recompile_is_amortized() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let mut solver = LraSolver::new(&terms);
+    for i in 1..=200 {
+        let c = terms.mk_rational(BigRational::from(BigInt::from(i)));
+        let atom = terms.mk_le(x, c);
+        solver.register_atom(atom);
+    }
+    solver.compile_theory_prop_jit();
+    assert!(solver.theory_prop_jit_compiled);
+    assert_eq!(solver.theory_prop_jit.total_atoms(), 200);
+    let x_var = *solver.term_to_var.get(&x).expect("x var registered");
+
+    // One new atom: lazy propagation must NOT pay a full recompile.
+    let c = terms.mk_rational(BigRational::from(BigInt::from(201)));
+    let atom = terms.mk_le(x, c);
+    solver.register_atom(atom);
+    assert!(!solver.theory_prop_jit_compiled);
+    solver.propagate_var_atoms(x_var);
+    assert!(
+        !solver.theory_prop_jit_compiled,
+        "single-atom growth must be served interpreted, not recompiled"
+    );
+    assert_eq!(solver.theory_prop_jit.total_atoms(), 200);
+
+    // The stale window is bounded: enough interpreted propagation calls
+    // force the recompile even without further growth.
+    for _ in 0..300 {
+        solver.propagate_var_atoms(x_var);
+    }
+    assert!(
+        solver.theory_prop_jit_compiled,
+        "stale propagation cap must force the lazy recompile"
+    );
+    assert_eq!(solver.theory_prop_jit.total_atoms(), 201);
+
+    // Growth past max(64, compiled/2) = 100: next propagation recompiles.
+    for i in 202..=301 {
+        let c = terms.mk_rational(BigRational::from(BigInt::from(i)));
+        let atom = terms.mk_le(x, c);
+        solver.register_atom(atom);
+    }
+    solver.propagate_var_atoms(x_var);
+    assert!(
+        solver.theory_prop_jit_compiled,
+        "threshold-crossing growth must trigger the lazy recompile"
+    );
+    assert_eq!(solver.theory_prop_jit.total_atoms(), 301);
+}
+
 /// Test SmallBound extraction from Rational::Small bounds.
 #[test]
 fn test_bound_to_small_bound_extraction() {

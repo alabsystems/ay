@@ -194,41 +194,33 @@ impl PdrSolver {
                             target_pred.index()
                         );
                     }
-                    // D1 (#1362): Weaken equality to pair of inequalities and try each half.
-                    // Reference: Z3 expand_literals in spacer_util.cpp:319-374.
-                    // When x = y fails self-inductiveness, try x >= y and x <= y independently.
-                    // Route through add_discovered_invariant to get proper init-validity
-                    // checks and frame[1] insertion (matching equality propagation in
-                    // discovery.rs:256). Direct frame[0] insertion skips init-validity
-                    // and requires push_lemmas to reach frame[1] for model building.
-                    if let ChcExpr::Op(ChcOp::Eq, ref args) = eq {
-                        if args.len() == 2 {
-                            let lhs = (*args[0]).clone();
-                            let rhs = (*args[1]).clone();
-                            // Try lhs >= rhs (expressed as rhs <= lhs)
-                            let ge_ineq = ChcExpr::le(rhs.clone(), lhs.clone());
-                            let added_ge =
-                                self.add_discovered_invariant(target_pred, ge_ineq.clone(), 1);
-                            if added_ge && self.config.verbose {
-                                safe_eprintln!(
-                                    "PDR: Propagated weakened >= from pred {} to pred {}: {}",
-                                    src_pred.index(),
-                                    target_pred.index(),
-                                    ge_ineq
-                                );
-                            }
-                            // Try lhs <= rhs
-                            let le_ineq = ChcExpr::le(lhs, rhs);
-                            let added_le =
-                                self.add_discovered_invariant(target_pred, le_ineq.clone(), 1);
-                            if added_le && self.config.verbose {
-                                safe_eprintln!(
-                                    "PDR: Propagated weakened <= from pred {} to pred {}: {}",
-                                    src_pred.index(),
-                                    target_pred.index(),
-                                    le_ineq
-                                );
-                            }
+                    // D1 (#1362): Weaken equality to its two halves and try each
+                    // independently. Reference: Z3 expand_literals in
+                    // spacer_util.cpp:319-374. Route through add_discovered_invariant
+                    // to get proper init-validity checks and frame[1] insertion
+                    // (matching equality propagation in discovery.rs:256). Direct
+                    // frame[0] insertion skips init-validity and requires push_lemmas
+                    // to reach frame[1] for model building.
+                    //
+                    // SORT-AWARE (PDR_typed_subst_2026-09-19): the halves of a
+                    // numeric equality are `x <= y` / `y <= x`; the halves of a Bool
+                    // equality are `x => y` / `y => x`. Before this, every equality —
+                    // including the Bool ones the must-summary / frame[1] scan finds
+                    // on kind2 lustre encodings — was split into `<=` halves, and the
+                    // resulting `(<= b1 b2)` over Bool canonical variables was
+                    // ill-typed: both bridge lanes refused it instantly, and the
+                    // entry/self-inductiveness checks re-issued it thousands of
+                    // times per solve (fast_2_000: 9,388 such queries in 60 s,
+                    // metros_1: 6,737).
+                    for half in Self::equality_halves(&eq) {
+                        let added = self.add_discovered_invariant(target_pred, half.clone(), 1);
+                        if added && self.config.verbose {
+                            safe_eprintln!(
+                                "PDR: Propagated weakened half from pred {} to pred {}: {}",
+                                src_pred.index(),
+                                target_pred.index(),
+                                half
+                            );
                         }
                     }
                     continue;
@@ -249,6 +241,37 @@ impl PdrSolver {
         }
     }
 
+    /// The two "halves" of an equality `lhs = rhs`, each strictly weaker than the
+    /// equality and well-typed for the operands' sort: `rhs <= lhs` and
+    /// `lhs <= rhs` for Int/Real, `lhs => rhs` and `rhs => lhs` for Bool, and
+    /// nothing for any other sort (arrays, datatypes, BV: no cheap weakening
+    /// that the bridge can express). Never mixes sorts: a Bool operand can
+    /// never appear under an arithmetic comparison.
+    pub(in crate::pdr::solver) fn equality_halves(eq: &ChcExpr) -> Vec<ChcExpr> {
+        let ChcExpr::Op(ChcOp::Eq, args) = eq else {
+            return Vec::new();
+        };
+        if args.len() != 2 {
+            return Vec::new();
+        }
+        let lhs = (*args[0]).clone();
+        let rhs = (*args[1]).clone();
+        let (ls, rs) = (lhs.sort(), rhs.sort());
+        if ls != rs {
+            return Vec::new();
+        }
+        match ls {
+            crate::ChcSort::Int | crate::ChcSort::Real => {
+                vec![ChcExpr::le(rhs.clone(), lhs.clone()), ChcExpr::le(lhs, rhs)]
+            }
+            crate::ChcSort::Bool => vec![
+                ChcExpr::implies(lhs.clone(), rhs.clone()),
+                ChcExpr::implies(rhs, lhs),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
     /// Find which head argument index corresponds to a body argument through the transition.
     ///
     /// For a clause like: P(A, B, C) ∧ guard -> Q(A, B, C)
@@ -259,11 +282,15 @@ impl PdrSolver {
         head_args: &[ChcExpr],
         clause: &HornClause,
     ) -> Option<usize> {
-        // Case 1: body_arg is a variable that appears directly in head_args
+        // Case 1: body_arg is a variable that appears directly in head_args.
+        // Match on the full `(name, sort)` identity: a clause binds one sort
+        // per name, so this is equivalent for well-formed input, and it keeps
+        // the position transfer sort-consistent by construction if a clause
+        // ever carries two same-named variables of different sorts.
         if let ChcExpr::Var(body_var) = body_arg {
             for (idx, head_arg) in head_args.iter().enumerate() {
                 if let ChcExpr::Var(head_var) = head_arg {
-                    if body_var.name == head_var.name {
+                    if body_var == head_var {
                         return Some(idx);
                     }
                 }

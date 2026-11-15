@@ -145,18 +145,47 @@ census that carries only a bound.
 ///
 /// EVIDENCE PRESERVATION sets it. `work` for an instance that CERTIFIES is the
 /// total the derivation needed, not a truncation, and it is deterministic — so
-/// the floor is exact rather than statistical. The eight instances that certify
-/// at the old 5 s default spend, in `work x nnz`:
+/// the floor is exact rather than statistical.
+///
+/// RE-DERIVED 2026-08-28 on this build, and FOUR of the eight numbers had gone
+/// stale. Each is `work_spent x nnz` for one of the eight instances that
+/// certify at the old 5 s default. `work_spent` is read off the tool's own
+/// `certificate:` line (one run each; it is a deterministic counter, so a
+/// second rep adds nothing) and `nnz` is counted independently out of the
+/// `COLUMNS` section of the `.mps`, then cross-checked against the cap the tool
+/// reports — `floor(24e6/nnz)` matched the reported cap on 8 of 8.
 ///
 /// ```text
-///   misc03 20,811,261   stein27 19,353,600   supportcase16 1,468,740
-///   f2gap40400 1,135,200   flugpl 252,678   p0033 198,254
-///   gt2 84,224   enigma 289
+///   instance        work      nnz     work x nnz    24e6 / that   was
+///   misc03          9,281    2,053    19,053,893          1.26x   20,811,261
+///   stein27        11,582      378     4,377,996          5.48x   19,353,600
+///   f2gap40400      1,419      800     1,135,200         21.14x   (same)
+///   supportcase16     259    1,076       278,684         86.12x    1,468,740
+///   p0033           2,023       98       198,254        121.06x   (same)
+///   flugpl          1,957       46        90,022        266.60x      252,678
+///   gt2               224      376        84,224        284.95x   (same)
+///   enigma              1      289           289     83,045.0x    (same)
 /// ```
 ///
-/// 24,000,000 clears the binding one (`misc03`) by 15%, which on a
-/// deterministic quantity is margin rather than hope, and every other
-/// certificate by 16x or more.
+/// So: 24,000,000 clears the BINDING instance (`misc03`) by **26%**, not the
+/// 15% this comment used to claim; `stein27` is second at 5.5x; and every one
+/// of the remaining six clears by 21x or more. The old text said "every other
+/// certificate by 16x or more", which was never true of `stein27` under the old
+/// numbers either (19,353,600 is 1.24x) — a universal that held only of the six
+/// smallest. Say the shape, not a slogan.
+///
+/// The drift is in the safe direction and is explained: the four that moved all
+/// moved DOWN, at unchanged `nnz`, i.e. later features made the same trees
+/// cheaper. Dividing the stale products by the measured `nnz` recovers the work
+/// each used to spend — `misc03` 10,137, `stein27` 51,200, `supportcase16`
+/// 1,365, `flugpl` 5,493 — so it is the WORK that fell, not the model. For
+/// `misc03` at least one cause is committed:
+/// the development design notes records the dyadic grid
+/// taking it from 285 leaves to 282, and 282 is what this build emits.
+///
+/// This is a MEASUREMENT of eight instances on one corpus, not a prediction
+/// about future models: nothing here says a model cannot need more than
+/// 19,053,893, only that none of these eight does.
 const OPT_TREE_WORK_NNZ: u64 = 24_000_000;
 
 /// The default work budget for `model`, in `OptTreeReport::work` units.
@@ -320,9 +349,13 @@ fn audit_environment() -> bool {
     let audit = ay_milp::env_audit();
     for name in &audit.unknown {
         eprintln!(
-            "ay-milp: ERROR: {name} is set but NO code reads it. If this is a typo, this run would \
-             measure the wrong arm and record the result as a finding. \
-             `ay-milp knobs --list` prints every name this build reads."
+            "ay-milp: ERROR: {name} is set and THIS BUILD does not read it. If this is a \
+             typo, this run would measure the wrong arm and record the result as a \
+             finding. `ay-milp knobs --list` prints every name this build reads; names owned \
+             by the repository's own tooling are excluded before this report. This check \
+             knows ay-milp's own knobs and the repository's tooling names, and NOTHING \
+             ELSE: a knob belonging to a SIBLING crate (ay-dpll's AY_DT_LAZY_AUFLIA, say) \
+             is unknown here and will reach this report even though it is read."
         );
     }
     for name in &audit.dead {
@@ -353,6 +386,12 @@ fn flag_or_env(flags: &Flags, flag: &str, env: &str) -> Option<String> {
 fn die(msg: &str) -> ExitCode {
     eprintln!("ay-milp: {msg}");
     ExitCode::from(2)
+}
+
+/// One `ay-milp: WARNING: ...` line on stderr: a problem the run reports and
+/// survives. `die` is the line for one it does not.
+fn warn(msg: std::fmt::Arguments<'_>) {
+    eprintln!("ay-milp: WARNING: {msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -603,12 +642,15 @@ fn cmd_solve(args: &[String]) -> ExitCode {
                     .with_deadline(
                         (secs > 0.0).then(|| Instant::now() + Duration::from_secs_f64(secs)),
                     );
-                let (derived, report) = ay_milp::derive_optimality_tree_reported(
-                    s.model(),
-                    value,
-                    model_values,
-                    &budget,
-                );
+                // STREAMED, not held. The descent writes each leaf's wire
+                // record the moment it is proved and drops the multipliers, so
+                // peak memory is the artifact rather than the object graph
+                // behind it. Measured on this box, holding the tree costs
+                // ~147 kB per leaf on `khb05250` and the 3,072 MiB jetsam bound
+                // SIGKILLed it — and `fiber` — at a raised budget, destroying
+                // even the primal witness they emit at the default.
+                let (derived, report) =
+                    ay_milp::stream_optimality_tree(s.model(), value, model_values, &budget);
                 // "declined (budget or model out of reach)" was ONE message for
                 // at least three unrelated events. Name the one that fired, and
                 // say what it cost: the difference between `deadline` and
@@ -771,7 +813,8 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
             network_design_optimality_certificate: s.network_design_optimality_certificate(),
             block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
-            milp_optimality_tree_certificate: opt_tree.as_ref(),
+            milp_optimality_tree_certificate: None,
+            milp_optimality_tree_block: opt_tree.as_ref().map(ay_milp::StreamedOptTree::body),
             root_dual_bound_certificate: root_dual.as_ref(),
             single_machine_scheduling_optimality_certificate: s
                 .single_machine_scheduling_optimality_certificate(),
@@ -792,12 +835,29 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         };
         let ayc = cert_io::emit(&ctx, &outcome);
         let bytes = ayc.len();
+        // SAY IT AT EMISSION, NOT ONLY AT VERIFY. This build's own parser
+        // refuses an input over `MAX_AYC_INPUT_BYTES` / `MAX_AYC_INPUT_LINES`,
+        // and until 2026-08-28 the emitter did not know those caps existed —
+        // so a large derivation produced a file that `ay-milp verify` would not
+        // read, and the only place that surfaced was the verify run, hours
+        // later, in someone else's harness.
+        //
+        // It is a WARNING, never a veto. Not writing the artifact would be
+        // strictly less evidence than writing it, and a bigger cap or a
+        // different reader can still consume it.
+        if let Some(why) = cert_io::parser_cap_excess(&ayc) {
+            warn(format_args!(
+                "this certificate is larger than THIS BUILD's own parser accepts \
+                 ({why}). It is still written, and it is not wrong — but \
+                 `ay-milp verify` will report UNVERIFIED without reading it."
+            ));
+        }
         match std::fs::write(cp, ayc.as_bytes()) {
             Ok(()) => eprintln!(
                 "certificate: {cp} ({bytes} bytes, {} us){opt_tree_note}{root_dual_note}",
                 t.elapsed().as_micros()
             ),
-            Err(e) => eprintln!("ay-milp: WARNING: cannot write {cp}: {e}"),
+            Err(e) => warn(format_args!("cannot write {cp}: {e}")),
         }
         ph_cert = t.elapsed();
     }
@@ -821,7 +881,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         if let Some(x) = witness_of(&outcome) {
             match write_witness(wp, x, &col_names, wfmt) {
                 Ok(()) => eprintln!("witness: {wp} ({} columns, format {wfmt})", x.len()),
-                Err(e) => eprintln!("ay-milp: WARNING: cannot write {wp}: {e}"),
+                Err(e) => warn(format_args!("cannot write {wp}: {e}")),
             }
         } else {
             eprintln!("witness: none — verdict carries no point");
@@ -1768,7 +1828,7 @@ fn cmd_knobs(args: &[String]) -> ExitCode {
         }
         println!("set but UNKNOWN:   {}", a.unknown.len());
         for k in &a.unknown {
-            println!("  {k}   <- nothing reads this; a typo here measures the wrong arm");
+            println!("  {k}   <- this build does not read it; a typo measures the wrong arm");
         }
         println!("set but DEAD:      {}", a.dead.len());
         for k in &a.dead {

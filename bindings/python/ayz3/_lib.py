@@ -29,7 +29,7 @@ from pathlib import Path
 #      self-contained and does not need the AY source tree.
 #   3. Otherwise we walk up from this file looking for a Cargo workspace root
 #      (a directory containing `target/`) and probe target/{debug,release}/.
-#      This is the in-tree dev workflow (run `cargo build -p ay-ffi` first;
+#      This is the in-tree dev workflow (run `targo --unverified build -p ay-ffi` — stock Rust: `cargo build -p ay-ffi` — first;
 #      add --release for the release build).
 
 _LIB_BASENAMES = {
@@ -82,7 +82,7 @@ def _load_library() -> ctypes.CDLL:
             return ctypes.CDLL(str(path))
     raise OSError(
         "Could not locate libay_ffi shared library. Build it with "
-        "`cargo build -p ay-ffi`, or set AYZ3_LIB to its full path.\n"
+        "`targo --unverified build -p ay-ffi` (Trust toolchain) or `cargo build -p ay-ffi`, or set AYZ3_LIB to its full path.\n"
         "Tried:\n  " + "\n  ".join(tried)
     )
 

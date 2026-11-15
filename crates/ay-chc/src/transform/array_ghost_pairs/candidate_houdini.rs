@@ -77,9 +77,66 @@ pub(crate) fn try_query_anchored_and_seal(
         return None;
     }
 
+    let QueryAnchoredModel {
+        model,
+        candidates,
+        survivors,
+        rounds,
+        smt_calls,
+    } = try_query_anchored_model(original, raw_ghost, spec, synthesis_deadline, cancellation)?;
+
+    if stopped(cancellation, certificate_deadline) || SmtContext::new().exact_term_memory_exceeded()
+    {
+        return None;
+    }
+    let certificate_budget = certificate_deadline.saturating_duration_since(Instant::now());
+    if certificate_budget.is_zero() {
+        return None;
+    }
+    let certificate = GhostPairCertificate::certify_and_seal_with_term_memory_limit(
+        original,
+        spec.clone(),
+        model,
+        Some(certificate_budget),
+        term_memory_limit,
+    )?;
+    if stopped(cancellation, certificate_deadline) || SmtContext::new().exact_term_memory_exceeded()
+    {
+        return None;
+    }
+
+    Some(QueryAnchoredSeal {
+        certificate,
+        candidates,
+        survivors,
+        rounds,
+        smt_calls,
+    })
+}
+
+/// Untrusted, complete raw-ghost candidate. Only a separate original-source
+/// certificate boundary may publish it as evidence.
+pub(super) struct QueryAnchoredModel {
+    pub(super) model: crate::InvariantModel,
+    pub(super) candidates: usize,
+    pub(super) survivors: usize,
+    pub(super) rounds: usize,
+    pub(super) smt_calls: usize,
+}
+
+pub(super) fn try_query_anchored_model(
+    original: &ChcProblem,
+    raw_ghost: &ChcProblem,
+    spec: &GhostPairSpec,
+    synthesis_deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Option<QueryAnchoredModel> {
+    if stopped(cancellation, synthesis_deadline) {
+        return None;
+    }
     let canonical =
         canonical_raw_variables(original, raw_ghost, spec, cancellation, synthesis_deadline)?;
-    let mut pools = build_candidate_pools(
+    let pools = build_candidate_pools(
         original,
         raw_ghost,
         spec,
@@ -87,6 +144,27 @@ pub(crate) fn try_query_anchored_and_seal(
         cancellation,
         synthesis_deadline,
     )?;
+    try_seeded_model(
+        raw_ghost,
+        canonical,
+        pools,
+        synthesis_deadline,
+        cancellation,
+    )
+}
+
+/// Layout-independent untrusted Houdini engine. Callers authenticate canonical
+/// signatures and scalar pools before entry; original replay remains authority.
+pub(super) fn try_seeded_model(
+    raw_ghost: &ChcProblem,
+    canonical: FxHashMap<PredicateId, Vec<ChcVar>>,
+    mut pools: FxHashMap<PredicateId, Vec<CandidateAtom>>,
+    synthesis_deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Option<QueryAnchoredModel> {
+    if stopped(cancellation, synthesis_deadline) {
+        return None;
+    }
     let candidates = candidate_count(&pools);
     if candidates == 0 || candidates > MAX_HOUDINI_CANDIDATES {
         return None;
@@ -114,28 +192,11 @@ pub(crate) fn try_query_anchored_and_seal(
     })?;
     let survivors = candidate_count(&pools);
 
-    if stopped(cancellation, certificate_deadline) || SmtContext::new().exact_term_memory_exceeded()
-    {
+    if stopped(cancellation, synthesis_deadline) {
         return None;
     }
-    let certificate_budget = certificate_deadline.saturating_duration_since(Instant::now());
-    if certificate_budget.is_zero() {
-        return None;
-    }
-    let certificate = GhostPairCertificate::certify_and_seal_with_term_memory_limit(
-        original,
-        spec.clone(),
+    Some(QueryAnchoredModel {
         model,
-        Some(certificate_budget),
-        term_memory_limit,
-    )?;
-    if stopped(cancellation, certificate_deadline) || SmtContext::new().exact_term_memory_exceeded()
-    {
-        return None;
-    }
-
-    Some(QueryAnchoredSeal {
-        certificate,
         candidates,
         survivors,
         rounds,

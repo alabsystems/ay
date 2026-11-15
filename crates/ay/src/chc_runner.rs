@@ -8,8 +8,7 @@
 
 use super::{
     exit_if_timed_out, mark_verdict_printed, print_chc_stats, stats_output, ProofConfig,
-    GLOBAL_TIMEOUT_MS, PROGRESS_ENABLED, SELF_CHECK_ENABLED, START_TIME, STRICT_PROOFS_ENABLED,
-    Z3_MODE_ENABLED,
+    GLOBAL_TIMEOUT_MS, PROGRESS_ENABLED, START_TIME, Z3_MODE_ENABLED,
 };
 use ay::chc::{
     engines, ChcExpr, ChcPdrProofRun, ChcProblem, ChcProofArtifactDigest, ChcProofEvidenceManifest,
@@ -23,12 +22,18 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 // The workspace-wide monotonic clock shim (#wasm port): byte-identical to
 // `std::time::Instant` on native targets, host-clock-backed on wasm32.
 use ay_core::time::Instant;
+
+mod proof_gates;
+mod safety_deadline;
+mod unsafe_artifacts;
+use proof_gates::ChcProofGates;
+use unsafe_artifacts::{unsafe_replay_payloads, ChcReplayPayload};
 
 #[derive(Default)]
 struct ChcCliReplayArtifacts {
@@ -166,15 +171,78 @@ impl ChcCliReplayArtifacts {
     }
 }
 
+/// `[CHC-SESSION] ...` — the HornSmt session's process totals (CHC-COMP 2026
+/// Rung 1 board), one stderr line, only when `--chc-session-stats` is set.
+/// The `[CHC-SESSION]` totals line (`--chc-session-stats`) and the
+/// `[CHC-SESSION-COVERAGE]` census lines (`--chc-session-coverage`), once
+/// per process: after a normal solve return, and from the timeout exits
+/// (`exit_if_timed_out` / `hard_timeout_fallback_exit`), which end the
+/// process without returning here — the probes the board cares about are
+/// exactly the ones that time out.
+pub(crate) fn emit_horn_session_totals() {
+    static EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if EMITTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if ay::chc::engines::horn_session_stats_requested() {
+        if let Some(line) = ay::chc::engines::horn_session_totals_report() {
+            safe_eprintln!("{line}");
+        }
+    }
+    for line in ay::chc::engines::horn_session_coverage_report() {
+        safe_eprintln!("{line}");
+    }
+}
+
 fn emit_chc_build_provenance_to_stderr() {
+    // `--z3-mode`'s stderr is z3's transcript, which carries no ay comment.
+    if z3_mode_enabled() {
+        return;
+    }
     safe_eprintln!("{}", stats_output::BUILD_PROVENANCE.comment_line());
 }
 
 fn emit_chc_unknown_stdout(stats_cfg: stats_output::StatsConfig, emitted_build_provenance: bool) {
+    emit_chc_unknowns_stdout(stats_cfg, emitted_build_provenance, owed_chc_responses());
+}
+
+/// How many `check-sat` responses the accepted CHC script owes. The parser
+/// accepts consecutive checks with no command between them that changes the
+/// clause set, so each is answered by the one solve: z3 answers
+/// `(check-sat)(check-sat)` with two lines, and ay answered it with one.
+static CHC_RESPONSES_OWED: AtomicUsize = AtomicUsize::new(1);
+
+/// Record the responses `content` owes, once the parser has accepted it.
+fn owe_chc_responses(content: &str) {
+    CHC_RESPONSES_OWED.store(
+        crate::chc_owed_responses::owed_check_sat_responses(content),
+        Ordering::SeqCst,
+    );
+}
+
+fn owed_chc_responses() -> usize {
+    CHC_RESPONSES_OWED.load(Ordering::SeqCst).max(1)
+}
+
+/// The run's status line, once per owed `check-sat`.
+fn print_chc_status_lines(status: &str) {
+    for _ in 0..owed_chc_responses() {
+        safe_println!("{status}");
+    }
+}
+
+/// `responses` lines of `unknown` (one per owed check), printed once per run.
+fn emit_chc_unknowns_stdout(
+    stats_cfg: stats_output::StatsConfig,
+    emitted_build_provenance: bool,
+    responses: usize,
+) {
     if mark_verdict_printed() {
         return;
     }
-    safe_println!("unknown");
+    for _ in 0..responses {
+        safe_println!("unknown");
+    }
     if !stats_cfg.any() && !emitted_build_provenance {
         emit_chc_build_provenance_to_stderr();
     }
@@ -186,9 +254,54 @@ fn emit_chc_fail_closed_unknown(
     diagnostic: impl std::fmt::Display,
     reason_unknown: &'static str,
 ) {
+    emit_chc_fail_closed_unknowns(
+        stats_cfg,
+        emitted_build_provenance,
+        1,
+        diagnostic,
+        reason_unknown,
+    );
+}
+
+fn emit_chc_fail_closed_unknowns(
+    stats_cfg: stats_output::StatsConfig,
+    emitted_build_provenance: bool,
+    responses: usize,
+    diagnostic: impl std::fmt::Display,
+    reason_unknown: &'static str,
+) {
     safe_eprintln!("c CHC fail-closed: {diagnostic}");
-    emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
+    emit_chc_unknowns_stdout(stats_cfg, emitted_build_provenance, responses);
     safe_eprintln!("(:reason-unknown \"{reason_unknown}\")");
+}
+
+/// A refused script answers `unknown` to each of its checks, not once: see
+/// [`crate::chc_owed_responses`].
+fn emit_chc_refused_script(
+    stats_cfg: stats_output::StatsConfig,
+    content: &str,
+    diagnostic: impl std::fmt::Display,
+    reason_unknown: &'static str,
+) {
+    emit_chc_fail_closed_unknowns(
+        stats_cfg,
+        false,
+        crate::chc_owed_responses::owed_check_sat_responses(content),
+        diagnostic,
+        reason_unknown,
+    );
+}
+
+/// Answer one streamed CHC `check-sat` with `unknown` because a command that
+/// contributes to the problem failed to parse and was dropped.
+pub(crate) fn emit_chc_unknown_after_dropped_command(stats_cfg: stats_output::StatsConfig) {
+    emit_chc_fail_closed_unknowns(
+        stats_cfg,
+        false,
+        1,
+        "a problem-contributing command was discarded",
+        "a problem-contributing command was discarded",
+    );
 }
 
 fn catch_chc_boundary<T>(context: &'static str, action: impl FnOnce() -> T) -> Result<T, String> {
@@ -281,38 +394,12 @@ fn try_validated_chc_lia_safe_synthesis(
 /// `unknown` — trading completeness for soundness
 /// ("never trade solver soundness for speed; incomplete paths prefer unknown").
 fn chc_safe_invariant_discharges(problem: &ChcProblem, model: &InvariantModel) -> bool {
-    let ms = GLOBAL_TIMEOUT_MS.load(Ordering::Relaxed);
-    let budget = if ms > 0 {
-        Duration::from_millis(ms)
-    } else {
-        Duration::from_secs(30)
-    }
-    .min(Duration::from_secs(10));
-    let mut config = PdrConfig::default().with_strict_proofs(true);
-    config.solve_timeout = Some(budget);
-    // Demote only when the model PROVABLY permits the error (a query/safety
-    // clause is violated) — the definitive false-SAFE signature. We deliberately
-    // do NOT re-run full inductiveness here: that back-translated re-verification
-    // can spuriously fail on genuinely-safe models (demoting real SAFEs), whereas
-    // a violated safety clause is an unambiguous proof the SAFE verdict is wrong.
-    if matches!(
-        engines::external_invariant_model_excludes_error(problem, model, &config),
-        Ok(true)
-    ) {
-        return true;
-    }
-    // Catamorphism-abstraction models (CHC-COMP agenda #7) interpret ADT
-    // arguments through reserved recursive-function symbols the generic gate
-    // treats as uninterpreted, so it can never discharge them. Re-run the
-    // SAME per-query-clause safety obligations with the catamorphisms' true
-    // facts instantiated. Fail-closed: `false` for anything but a full
-    // per-query `unsat` sweep, and `false` immediately for non-cata models,
-    // preserving the existing demotion behavior for every other model class.
-    engines::cata_composed_model_excludes_error(
+    safety_deadline::discharges_with_clock(
         problem,
         model,
-        Duration::from_millis(1500),
-        Some(Instant::now() + budget),
+        GLOBAL_TIMEOUT_MS.load(Ordering::Relaxed),
+        START_TIME.get().copied(),
+        Instant::now,
     )
 }
 
@@ -390,12 +477,12 @@ fn chc_strict_safe_checked_replay_discharges(proof_run: &ChcPdrProofRun) -> bool
 /// Alethe/carcara), an UNSAFE certificate is a SAT witness — it pins concrete
 /// reachable state values — so there is no UNSAT proof and no external checker
 /// applies. The sound self-contained check is
-/// [`Counterexample::ground_checks_unsafe`], which re-validates a carried
-/// concrete ground derivation of `false` against the problem's clauses
-/// (multi-predicate, a complete decision) or, failing that, ground-evaluates
-/// the single-predicate transition-system trace `init(0) ∧ transition* ∧ query`
-/// under the trace's concrete bindings. A genuine counterexample confirms
-/// `true`; a corrupted or non-ground-checkable one does not.
+/// [`Counterexample::ground_checks_unsafe`], which re-validates a concrete
+/// ground derivation of `false` (carried, or read off the derivation witness)
+/// against the problem's clauses (multi-predicate, a complete decision) or,
+/// failing that, ground-evaluates the single-predicate transition-system trace
+/// under its concrete bindings. A genuine counterexample confirms `true`
+/// whichever engine found it; a corrupted or non-ground-checkable one does not.
 ///
 /// Returns `true` ONLY when the trace ground-evaluates to a concrete `true`.
 /// A concrete `false` (trace does not witness reachability), an un-ground-
@@ -731,9 +818,9 @@ fn chccert_sibling_path(path: &str) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn validate_chc_proof_request(proof_config: Option<&ProofConfig>) {
+fn validate_chc_proof_request(proof_config: Option<&ProofConfig>, gates: ChcProofGates) {
     let Some(proof) = effective_chc_proof_config(proof_config) else {
-        if let Some(gate) = required_chc_certificate_gate_name() {
+        if let Some(gate) = gates.required_certificate_gate_name() {
             safe_eprintln!(
                 "Error: {gate} requires a persistent native CHC certificate; pass --proof FILE.chccert and do not suppress proof output with --no-proof, --z3-mode, or --competition"
             );
@@ -773,17 +860,6 @@ fn validate_chc_proof_request(proof_config: Option<&ProofConfig>) {
     }
 }
 
-fn required_chc_certificate_gate_name() -> Option<&'static str> {
-    let strict = STRICT_PROOFS_ENABLED.load(Ordering::SeqCst);
-    let self_check = SELF_CHECK_ENABLED.load(Ordering::SeqCst);
-    match (strict, self_check) {
-        (true, true) => Some("--strict-proofs/--self-check"),
-        (true, false) => Some("--strict-proofs"),
-        (false, true) => Some("--self-check"),
-        (false, false) => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChcCertificateFailureDisposition {
     Optional,
@@ -810,10 +886,11 @@ enum ChcCertificatePublication {
 
 fn handle_chc_certificate_publication_failure(
     proof: &ProofConfig,
+    gates: ChcProofGates,
     reason: impl std::fmt::Display,
 ) -> ChcCertificatePublication {
-    let required_gate = required_chc_certificate_gate_name();
-    match chc_certificate_failure_disposition(proof.synthesized_default, required_gate) {
+    let required_gate = gates.required_certificate_gate_name();
+    match chc_certificate_failure_disposition(proof.synthesized_default, required_gate.as_deref()) {
         ChcCertificateFailureDisposition::Optional => {
             safe_eprintln!(
                 "c Warning: optional synthesized CHC certificate {} was not published: {reason}; solver verdict remains authoritative",
@@ -822,7 +899,7 @@ fn handle_chc_certificate_publication_failure(
             ChcCertificatePublication::OptionalUnavailable
         }
         ChcCertificateFailureDisposition::Required => {
-            let gate = required_gate.unwrap_or("required proof gate");
+            let gate = required_gate.as_deref().unwrap_or("required proof gate");
             ChcCertificatePublication::RequiredUnavailable(format!(
                 "{gate} rejected the definitive CHC result because required synthesized certificate generation/publication failed: {reason}"
             ))
@@ -1113,12 +1190,32 @@ impl ChcArtifactScope {
     fn includes_replay_obligations(self) -> bool {
         self == Self::StatsEvidence
     }
+
+    fn for_unsafe(stats_cfg: stats_output::StatsConfig, counterexample: &Counterexample) -> Self {
+        if counterexample.has_ground_derivation() {
+            Self::StatsEvidence
+        } else {
+            Self::for_stats(stats_cfg)
+        }
+    }
 }
 
 fn publish_chc_certificate_artifacts(
     proof: &ProofConfig,
     certificate: &str,
     obligations: Vec<ChcReplayObligation>,
+) -> io::Result<ChcCliReplayArtifacts> {
+    publish_chc_certificate_payloads(
+        proof,
+        certificate,
+        obligations.into_iter().map(ChcReplayPayload::Smt).collect(),
+    )
+}
+
+fn publish_chc_certificate_payloads(
+    proof: &ProofConfig,
+    certificate: &str,
+    obligations: Vec<ChcReplayPayload>,
 ) -> io::Result<ChcCliReplayArtifacts> {
     let resolved_proof = crate::run::resolve_artifact_target(Path::new(&proof.path))?;
     let publication_lock = ChcPublicationLock::acquire(&resolved_proof)?;
@@ -1128,12 +1225,8 @@ fn publish_chc_certificate_artifacts(
         if !obligations.is_empty() {
             let obligations_dir = create_chc_obligations_dir(&resolved_proof)?;
             for obligation in obligations {
-                let kind = obligation.kind;
-                let path = obligations_dir.join(format!(
-                    "{:03}-{}.smt2",
-                    obligation.clause_index,
-                    kind.as_str()
-                ));
+                let payload = obligation.into_file()?;
+                let path = obligations_dir.join(payload.file_name);
                 let mut options = fs::OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)]
@@ -1142,18 +1235,21 @@ fn publish_chc_certificate_artifacts(
                     options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
                 }
                 let mut file = options.open(&path)?;
-                file.write_all(obligation.smtlib.as_bytes())?;
+                file.write_all(&payload.bytes)?;
                 file.sync_all()?;
                 drop(file);
-                let digest = sha256_bytes(obligation.smtlib.as_bytes());
+                let digest = sha256_bytes(&payload.bytes);
                 retained_files.push(seal_chc_published_file(&path, &digest)?);
                 let query = ChcProofArtifactDigest::from_sha256(
-                    "replay-obligation",
+                    payload.role,
                     digest,
-                    obligation.smtlib.len() as u64,
+                    payload.bytes.len() as u64,
                 )
                 .with_path(path.display().to_string());
-                replay_obligations.push(ChcReplayObligationArtifact::new(kind, query));
+                replay_obligations.push(
+                    ChcReplayObligationArtifact::new(payload.kind, query)
+                        .with_payload_format(payload.format),
+                );
             }
             #[cfg(unix)]
             fs::File::open(&obligations_dir)?.sync_all()?;
@@ -1189,6 +1285,7 @@ fn publish_chc_certificate_artifacts(
 
 fn write_chc_safe_certificate_artifacts<F>(
     proof_config: Option<&ProofConfig>,
+    gates: ChcProofGates,
     certificate: &str,
     artifact_scope: ChcArtifactScope,
     obligations: F,
@@ -1205,6 +1302,7 @@ where
             Err(error) => {
                 return handle_chc_certificate_publication_failure(
                     &proof,
+                    gates,
                     format_args!("failed to generate CHC replay obligations: {error}"),
                 );
             }
@@ -1223,6 +1321,7 @@ where
         }
         Err(error) => handle_chc_certificate_publication_failure(
             &proof,
+            gates,
             format_args!("certificate transaction failed: {error}"),
         ),
     }
@@ -1230,12 +1329,13 @@ where
 
 fn write_chc_unsafe_certificate_artifacts<F>(
     proof_config: Option<&ProofConfig>,
+    gates: ChcProofGates,
     certificate: &str,
     artifact_scope: ChcArtifactScope,
     obligations: F,
 ) -> ChcCertificatePublication
 where
-    F: FnOnce() -> ChcResult<Vec<ChcReplayObligation>>,
+    F: FnOnce() -> ChcResult<Vec<ChcReplayPayload>>,
 {
     let Some(proof) = effective_chc_proof_config(proof_config) else {
         return ChcCertificatePublication::Available(ChcCliReplayArtifacts::default());
@@ -1246,6 +1346,7 @@ where
             Err(error) => {
                 return handle_chc_certificate_publication_failure(
                     &proof,
+                    gates,
                     format_args!(
                         "failed to generate CHC unsafe trace-validity replay obligation: {error}"
                     ),
@@ -1255,7 +1356,7 @@ where
     } else {
         Vec::new()
     };
-    match publish_chc_certificate_artifacts(&proof, certificate, obligations) {
+    match publish_chc_certificate_payloads(&proof, certificate, obligations) {
         Ok(artifacts) => {
             if !crate::quiet_enabled() {
                 // Proof-write announcement only; the retained transaction is
@@ -1266,6 +1367,7 @@ where
         }
         Err(error) => handle_chc_certificate_publication_failure(
             &proof,
+            gates,
             format_args!("certificate transaction failed: {error}"),
         ),
     }
@@ -1273,6 +1375,7 @@ where
 
 fn prepare_chc_certificate_for_verdict(
     proof_config: Option<&ProofConfig>,
+    gates: ChcProofGates,
     publication: ChcCertificatePublication,
     stats_cfg: stats_output::StatsConfig,
     emitted_build_provenance: bool,
@@ -1289,6 +1392,7 @@ fn prepare_chc_certificate_for_verdict(
                 };
                 handle_chc_certificate_publication_failure(
                     &proof,
+                    gates,
                     format_args!("published certificate authentication failed: {error}"),
                 )
             }
@@ -1522,6 +1626,7 @@ fn settle_chc_stats_before_verdict(
     time_budget: Duration,
     strict_proofs: bool,
     proof_config: Option<&ProofConfig>,
+    gates: ChcProofGates,
     stats_cfg: stats_output::StatsConfig,
     emitted_build_provenance: bool,
     result_str: &str,
@@ -1543,6 +1648,7 @@ fn settle_chc_stats_before_verdict(
     let publication = ChcCertificatePublication::Available(std::mem::take(artifacts));
     let Some(validated) = prepare_chc_certificate_for_verdict(
         proof_config,
+        gates,
         publication,
         stats_cfg,
         emitted_build_provenance,
@@ -1586,52 +1692,81 @@ fn emit_safe_chc_stdout(
     wants_model: bool,
     z3_mode: bool,
 ) {
-    mark_verdict_printed();
-    safe_println!("{status}");
+    if !claim_decisive_chc_response() {
+        return;
+    }
+    print_chc_status_lines(status);
     if wants_model {
         safe_print!("{spacer_model}");
     } else if !z3_mode {
         safe_println!("{certificate}");
     }
+    crate::mark_decisive_verdict_printed();
 }
 
 fn emit_unsafe_chc_stdout(status: &str, certificate: &str, z3_mode: bool) {
-    mark_verdict_printed();
-    safe_println!("{status}");
+    if !claim_decisive_chc_response() {
+        return;
+    }
+    print_chc_status_lines(status);
     if !z3_mode {
         safe_println!("{certificate}");
     }
+    crate::mark_decisive_verdict_printed();
+}
+
+/// Claim the query's response for a decisive CHC verdict. False when a
+/// timeout or termination exit already answered it `unknown` and is ending
+/// the run: the verdict must not follow as a second response.
+///
+/// Both emitters used to latch without reading the latch, and never recorded
+/// that the response was decisive, so a solve finishing inside the SIGTERM
+/// grace printed `sat` and its certificate and then `(:reason-unknown
+/// "timeout")` with exit 124 (CHC-COMP extra-small-lia `gj2007_m_1_000`,
+/// SIGTERM at 0.4 s, `sat` at 1.63 s).
+fn claim_decisive_chc_response() -> bool {
+    !mark_verdict_printed()
 }
 
 /// Run CHC solver on content string.
 ///
 /// Routes through `AdaptivePortfolio` to ensure all results are verified
 /// via the `VerifiedChcResult` pipeline (#5811, #5747).
+///
+/// `inherited_script_strict` is `(set-option :check-proofs-strict true)` set on
+/// the caller's executor before `content` began (the incremental route); the
+/// option inside `content` is read here. See [`ChcProofGates`].
 pub(crate) fn run_chc_from_content(
     content: &str,
     verbose: bool,
     validate: bool,
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
+    inherited_script_strict: bool,
 ) -> Option<String> {
     use ay::chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
 
-    validate_chc_proof_request(proof_config);
+    let gates = ChcProofGates::for_script(content, inherited_script_strict);
+    validate_chc_proof_request(proof_config, gates);
     let solve_start = Instant::now();
+    CHC_RESPONSES_OWED.store(1, Ordering::SeqCst);
 
     let problem = match catch_chc_boundary("parse CHC input", || ChcParser::parse(content)) {
-        Ok(Ok(problem)) => problem,
+        Ok(Ok(problem)) => {
+            owe_chc_responses(content);
+            problem
+        }
         Ok(Err(error)) => {
-            emit_chc_fail_closed_unknown(
+            emit_chc_refused_script(
                 stats_cfg,
-                false,
+                content,
                 format_args!("parse error: {error}"),
                 "chc parse error",
             );
             return None;
         }
         Err(error) => {
-            emit_chc_fail_closed_unknown(stats_cfg, false, error, "chc parser panic");
+            emit_chc_refused_script(stats_cfg, content, error, "chc parser panic");
             return None;
         }
     };
@@ -1663,9 +1798,13 @@ pub(crate) fn run_chc_from_content(
     } else {
         AdaptiveConfig::with_budget(time_budget, verbose)
     };
-    config.strict_proofs = validate
-        || STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
-        || SELF_CHECK_ENABLED.load(Ordering::Relaxed);
+    config.strict_proofs = validate || gates.strict() || gates.self_check;
+    // STEP D ground-checks the published UNSAFE trace whenever the run asks
+    // for an independent recheck (strict or --self-check), and an explicitly
+    // requested certificate (or a --verify-proof temp one) must carry a
+    // concrete trace too: its export fails without one.
+    config.require_ground_unsafe_trace =
+        gates.independent_recheck() || proof_config.is_some_and(|proof| !proof.synthesized_default);
     let progress = PROGRESS_ENABLED.load(Ordering::Relaxed);
     config.progress_enabled = progress;
     let emitted_build_provenance = if progress {
@@ -1692,7 +1831,10 @@ pub(crate) fn run_chc_from_content(
             None
         };
         if let Some(engine) = try_validated_chc_lia_safe_synthesis(&problem, timeout_ms) {
-            safe_println!("{safe_str}");
+            if claim_decisive_chc_response() {
+                print_chc_status_lines(safe_str);
+                crate::mark_decisive_verdict_printed();
+            }
             if stats_cfg.any() {
                 print_chc_stats(
                     &solve_start,
@@ -1749,6 +1891,7 @@ pub(crate) fn run_chc_from_content(
     };
     let result = proof_run.result().clone();
     let chc_stats = solver.statistics();
+    emit_horn_session_totals();
 
     // Stop progress thread before printing result. Drop joins the thread.
     if let Some(handle) = progress_handle {
@@ -1777,39 +1920,44 @@ pub(crate) fn run_chc_from_content(
         // obligation that fails to discharge, or a theory that cannot be
         // re-checked, demotes SAFE to unknown rather than print an
         // independently-unchecked certificate. Default mode is unaffected.
-        // Guard on the ACTUAL `--strict-proofs` flag, NOT the `validate`-derived
-        // `strict_proofs` local (which is `validate || STRICT_PROOFS_ENABLED`, and
-        // `validate` is batteries-included ON by default). Keying on `strict_proofs`
+        // Guard on the strict REQUEST (`gates.strict()`: flag or in-script option),
+        // NOT the `validate`-derived `strict_proofs` local (`validate` is
+        // batteries-included ON by default). Keying on `strict_proofs`
         // fired this checked-replay gate on a plain `ay file.smt2` run, demoting
         // correct default-mode SAFE `sat` verdicts (e.g. the entire datatype CHC
         // corpus whose consecution obligation AY's executor cannot decide) to
         // `unknown` — a real BEST-BY-DEFAULT completeness regression. The
-        // completeness-for-soundness trade must apply ONLY under `--strict-proofs`.
+        // completeness-for-soundness trade applies only under a strict request or
+        // `--self-check` (`--rigor certified`), which ranks above strict and so must
+        // never publish a SAFE that strict demotes (it did: MODEL_CHECKER_CONSUMER report §4-A1).
         VerifiedChcResult::Safe(_)
-            if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
+            if gates.independent_recheck()
                 && !chc_strict_safe_checked_replay_discharges(&proof_run) =>
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
-            safe_eprintln!("(:reason-unknown \"CHC SAFE certificate could not be independently re-discharged under --strict-proofs; demoted to unknown for soundness\")");
+            safe_eprintln!("(:reason-unknown \"CHC SAFE certificate could not be independently re-discharged under {}; demoted to unknown for soundness\")", gates.independent_recheck_spelling());
             "unknown"
         }
         VerifiedChcResult::Safe(inv) => {
             let cert = inv.model().to_certificate(solver.problem());
             let publication = write_chc_safe_certificate_artifacts(
                 proof_config,
+                gates,
                 &cert,
                 ChcArtifactScope::for_stats(stats_cfg),
                 || {
                     // Acyclic-exhaustive (empty-model) SAFEs have no invariant
-                    // obligations; the engines helper re-validates them via the
-                    // deterministic exhaustive re-run and returns an empty set,
-                    // deferring to the standard fail-closed exporter otherwise.
+                    // obligations; the engines helper re-validates them (the
+                    // exhaustive re-run AND the engine-free empty-model check)
+                    // and returns an empty set, deferring to the standard
+                    // fail-closed exporter otherwise.
                     engines::chc_safe_replay_obligations(solver.problem(), inv.model())
                 },
             );
             match prepare_chc_certificate_for_verdict(
                 proof_config,
+                gates,
                 publication,
                 stats_cfg,
                 emitted_build_provenance,
@@ -1821,6 +1969,7 @@ pub(crate) fn run_chc_from_content(
                         time_budget,
                         strict_proofs,
                         proof_config,
+                        gates,
                         stats_cfg,
                         emitted_build_provenance,
                         safe_str,
@@ -1851,11 +2000,12 @@ pub(crate) fn run_chc_from_content(
         // checked-replay gate above). A trace that does not ground-evaluate to
         // `true`, or that cannot be fully ground-evaluated, demotes UNSAFE to
         // unknown rather than print an independently-unchecked `unsat`. Guard on
-        // the ACTUAL `--strict-proofs` flag (`STRICT_PROOFS_ENABLED`), NOT the
+        // the strict REQUEST (`gates.strict()`: flag or in-script option), NOT the
         // `validate`-derived `strict_proofs` local (batteries-included ON by
-        // default) — default-mode verdicts must be unchanged.
+        // default) — default-mode verdicts must be unchanged. `--self-check` runs
+        // it too: certified must not publish an UNSAFE that strict demotes.
         VerifiedChcResult::Unsafe(cex)
-            if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
+            if gates.independent_recheck()
                 && !chc_strict_unsafe_trace_ground_checks(
                     solver.problem(),
                     cex.counterexample(),
@@ -1863,22 +2013,21 @@ pub(crate) fn run_chc_from_content(
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
-            safe_eprintln!("(:reason-unknown \"CHC UNSAFE counterexample trace could not be independently ground-checked under --strict-proofs; demoted to unknown for soundness\")");
+            safe_eprintln!("(:reason-unknown \"CHC UNSAFE counterexample trace could not be independently ground-checked under {}; demoted to unknown for soundness\")", gates.independent_recheck_spelling());
             "unknown"
         }
         VerifiedChcResult::Unsafe(cex) => {
             let cert = cex.counterexample().to_certificate(solver.problem());
             let publication = write_chc_unsafe_certificate_artifacts(
                 proof_config,
+                gates,
                 &cert,
-                ChcArtifactScope::for_stats(stats_cfg),
-                || {
-                    cex.counterexample()
-                        .trace_validity_replay_obligations(solver.problem())
-                },
+                ChcArtifactScope::for_unsafe(stats_cfg, cex.counterexample()),
+                || unsafe_replay_payloads(solver.problem(), cex.counterexample()),
             );
             match prepare_chc_certificate_for_verdict(
                 proof_config,
+                gates,
                 publication,
                 stats_cfg,
                 emitted_build_provenance,
@@ -1890,6 +2039,7 @@ pub(crate) fn run_chc_from_content(
                         time_budget,
                         strict_proofs,
                         proof_config,
+                        gates,
                         stats_cfg,
                         emitted_build_provenance,
                         unsafe_str,
@@ -1956,17 +2106,15 @@ pub(crate) fn run_portfolio(
     path: &str,
     verbose: bool,
     validate: bool,
-    strict_proofs: bool,
     timeout_ms: Option<u64>,
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
 ) {
     use ay::chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
 
-    validate_chc_proof_request(proof_config);
     let solve_start = Instant::now();
 
-    // Read and parse CHC file
+    // Read and parse CHC file (the proof gates read the script's options too).
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(error) => {
@@ -1979,20 +2127,25 @@ pub(crate) fn run_portfolio(
             return;
         }
     };
+    let gates = ChcProofGates::for_script(&content, false);
+    validate_chc_proof_request(proof_config, gates);
 
     let problem = match catch_chc_boundary("parse CHC file", || ChcParser::parse(&content)) {
-        Ok(Ok(problem)) => problem,
+        Ok(Ok(problem)) => {
+            owe_chc_responses(&content);
+            problem
+        }
         Ok(Err(error)) => {
-            emit_chc_fail_closed_unknown(
+            emit_chc_refused_script(
                 stats_cfg,
-                false,
+                &content,
                 format_args!("parse error in {path}: {error}"),
                 "chc parse error",
             );
             return;
         }
         Err(error) => {
-            emit_chc_fail_closed_unknown(stats_cfg, false, error, "chc parser panic");
+            emit_chc_refused_script(stats_cfg, &content, error, "chc parser panic");
             return;
         }
     };
@@ -2020,7 +2173,13 @@ pub(crate) fn run_portfolio(
     } else {
         AdaptiveConfig::with_budget(time_budget, verbose)
     };
-    config.strict_proofs = validate || strict_proofs || SELF_CHECK_ENABLED.load(Ordering::Relaxed);
+    config.strict_proofs = validate || gates.strict() || gates.self_check;
+    // STEP D ground-checks the published UNSAFE trace whenever the run asks
+    // for an independent recheck (strict or --self-check), and an explicitly
+    // requested certificate (or a --verify-proof temp one) must carry a
+    // concrete trace too: its export fails without one.
+    config.require_ground_unsafe_trace =
+        gates.independent_recheck() || proof_config.is_some_and(|proof| !proof.synthesized_default);
     let progress = PROGRESS_ENABLED.load(Ordering::Relaxed);
     config.progress_enabled = progress;
     let emitted_build_provenance = if progress {
@@ -2042,7 +2201,10 @@ pub(crate) fn run_portfolio(
         proof_config,
     ) {
         if let Some(engine) = try_validated_chc_lia_safe_synthesis(&problem, timeout_ms) {
-            safe_println!("{safe_str}");
+            if claim_decisive_chc_response() {
+                print_chc_status_lines(safe_str);
+                crate::mark_decisive_verdict_printed();
+            }
             if stats_cfg.any() {
                 print_chc_stats(
                     &solve_start,
@@ -2099,6 +2261,7 @@ pub(crate) fn run_portfolio(
     };
     let result = proof_run.result().clone();
     let chc_stats = solver.statistics();
+    emit_horn_session_totals();
 
     // Stop progress thread before printing result. Drop joins the thread.
     if let Some(handle) = progress_handle {
@@ -2126,39 +2289,44 @@ pub(crate) fn run_portfolio(
         // obligation that fails to discharge, or a theory that cannot be
         // re-checked, demotes SAFE to unknown rather than print an
         // independently-unchecked certificate. Default mode is unaffected.
-        // Guard on the ACTUAL `--strict-proofs` flag, NOT the `validate`-derived
-        // `strict_proofs` local (which is `validate || STRICT_PROOFS_ENABLED`, and
-        // `validate` is batteries-included ON by default). Keying on `strict_proofs`
+        // Guard on the strict REQUEST (`gates.strict()`: flag or in-script option),
+        // NOT the `validate`-derived `strict_proofs` local (`validate` is
+        // batteries-included ON by default). Keying on `strict_proofs`
         // fired this checked-replay gate on a plain `ay file.smt2` run, demoting
         // correct default-mode SAFE `sat` verdicts (e.g. the entire datatype CHC
         // corpus whose consecution obligation AY's executor cannot decide) to
         // `unknown` — a real BEST-BY-DEFAULT completeness regression. The
-        // completeness-for-soundness trade must apply ONLY under `--strict-proofs`.
+        // completeness-for-soundness trade applies only under a strict request or
+        // `--self-check` (`--rigor certified`), which ranks above strict and so must
+        // never publish a SAFE that strict demotes (it did: MODEL_CHECKER_CONSUMER report §4-A1).
         VerifiedChcResult::Safe(_)
-            if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
+            if gates.independent_recheck()
                 && !chc_strict_safe_checked_replay_discharges(&proof_run) =>
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
-            safe_eprintln!("(:reason-unknown \"CHC SAFE certificate could not be independently re-discharged under --strict-proofs; demoted to unknown for soundness\")");
+            safe_eprintln!("(:reason-unknown \"CHC SAFE certificate could not be independently re-discharged under {}; demoted to unknown for soundness\")", gates.independent_recheck_spelling());
             "unknown"
         }
         VerifiedChcResult::Safe(inv) => {
             let cert = inv.model().to_certificate(solver.problem());
             let publication = write_chc_safe_certificate_artifacts(
                 proof_config,
+                gates,
                 &cert,
                 ChcArtifactScope::for_stats(stats_cfg),
                 || {
                     // Acyclic-exhaustive (empty-model) SAFEs have no invariant
-                    // obligations; the engines helper re-validates them via the
-                    // deterministic exhaustive re-run and returns an empty set,
-                    // deferring to the standard fail-closed exporter otherwise.
+                    // obligations; the engines helper re-validates them (the
+                    // exhaustive re-run AND the engine-free empty-model check)
+                    // and returns an empty set, deferring to the standard
+                    // fail-closed exporter otherwise.
                     engines::chc_safe_replay_obligations(solver.problem(), inv.model())
                 },
             );
             match prepare_chc_certificate_for_verdict(
                 proof_config,
+                gates,
                 publication,
                 stats_cfg,
                 emitted_build_provenance,
@@ -2170,6 +2338,7 @@ pub(crate) fn run_portfolio(
                         time_budget,
                         strict_proofs,
                         proof_config,
+                        gates,
                         stats_cfg,
                         emitted_build_provenance,
                         safe_str,
@@ -2199,11 +2368,12 @@ pub(crate) fn run_portfolio(
         // checked-replay gate above). A trace that does not ground-evaluate to
         // `true`, or that cannot be fully ground-evaluated, demotes UNSAFE to
         // unknown rather than print an independently-unchecked `unsat`. Guard on
-        // the ACTUAL `--strict-proofs` flag (`STRICT_PROOFS_ENABLED`), NOT the
+        // the strict REQUEST (`gates.strict()`: flag or in-script option), NOT the
         // `validate`-derived `strict_proofs` local (batteries-included ON by
-        // default) — default-mode verdicts must be unchanged.
+        // default) — default-mode verdicts must be unchanged. `--self-check` runs
+        // it too: certified must not publish an UNSAFE that strict demotes.
         VerifiedChcResult::Unsafe(cex)
-            if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
+            if gates.independent_recheck()
                 && !chc_strict_unsafe_trace_ground_checks(
                     solver.problem(),
                     cex.counterexample(),
@@ -2211,22 +2381,21 @@ pub(crate) fn run_portfolio(
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
-            safe_eprintln!("(:reason-unknown \"CHC UNSAFE counterexample trace could not be independently ground-checked under --strict-proofs; demoted to unknown for soundness\")");
+            safe_eprintln!("(:reason-unknown \"CHC UNSAFE counterexample trace could not be independently ground-checked under {}; demoted to unknown for soundness\")", gates.independent_recheck_spelling());
             "unknown"
         }
         VerifiedChcResult::Unsafe(cex) => {
             let cert = cex.counterexample().to_certificate(solver.problem());
             let publication = write_chc_unsafe_certificate_artifacts(
                 proof_config,
+                gates,
                 &cert,
-                ChcArtifactScope::for_stats(stats_cfg),
-                || {
-                    cex.counterexample()
-                        .trace_validity_replay_obligations(solver.problem())
-                },
+                ChcArtifactScope::for_unsafe(stats_cfg, cex.counterexample()),
+                || unsafe_replay_payloads(solver.problem(), cex.counterexample()),
             );
             match prepare_chc_certificate_for_verdict(
                 proof_config,
+                gates,
                 publication,
                 stats_cfg,
                 emitted_build_provenance,
@@ -2238,6 +2407,7 @@ pub(crate) fn run_portfolio(
                         time_budget,
                         strict_proofs,
                         proof_config,
+                        gates,
                         stats_cfg,
                         emitted_build_provenance,
                         unsafe_str,
@@ -2338,17 +2508,18 @@ struct ProgressHandle {
 impl ProgressHandle {
     /// Signal the progress thread to stop.
     fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = &self.handle {
+            handle.thread().unpark();
+        }
     }
 }
 
 impl Drop for ProgressHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop();
         if let Some(handle) = self.handle.take() {
-            // Best-effort join with a short timeout to avoid blocking on exit.
-            // The thread sleeps in 5s intervals so it will notice the stop flag
-            // within one interval.
+            // Wake the reporting wait and retain ownership through the join.
             let _ = handle.join();
         }
     }
@@ -2369,19 +2540,35 @@ fn spawn_chc_progress_thread_rich(
     let stop_clone = stop.clone();
     let handle = std::thread::Builder::new()
         .name("ay-chc-progress".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(CHC_PROGRESS_INTERVAL);
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
+        .spawn(move || {
+            let mut last_report = Instant::now();
+            loop {
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::park_timeout(
+                    CHC_PROGRESS_INTERVAL.saturating_sub(last_report.elapsed()),
+                );
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
+                // An unrelated or spurious wake must not accelerate reporting.
+                if last_report.elapsed() < CHC_PROGRESS_INTERVAL {
+                    continue;
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let report = snapshot.snapshot();
+                let line = format!("{}\n", report.format_line(elapsed));
+                let _ = Write::write_all(&mut io::stderr(), line.as_bytes());
+                last_report = Instant::now();
             }
-            let elapsed = start.elapsed().as_secs_f64();
-            let report = snapshot.snapshot();
-            let line = format!("{}\n", report.format_line(elapsed));
-            let _ = Write::write_all(&mut io::stderr(), line.as_bytes());
         })
         .ok();
     ProgressHandle { stop, handle }
 }
+
+#[cfg(test)]
+mod progress_shutdown_tests;
 
 #[cfg(test)]
 mod certificate_failure_tests {
@@ -2437,179 +2624,7 @@ mod certificate_failure_tests {
 }
 
 #[cfg(all(test, unix))]
-mod publication_tests {
-    use super::*;
-    use ay::chc::ChcReplayObligationKind;
-
-    fn proof_config(path: &Path) -> ProofConfig {
-        ProofConfig {
-            path: path.display().to_string(),
-            format: super::super::ProofFormat::Alethe,
-            binary: false,
-            artifact_path: None,
-            is_temp: false,
-            synthesized_default: false,
-            format_was_explicit: false,
-        }
-    }
-
-    fn available_artifacts(publication: ChcCertificatePublication) -> ChcCliReplayArtifacts {
-        match publication {
-            ChcCertificatePublication::Available(artifacts) => artifacts,
-            ChcCertificatePublication::OptionalUnavailable => {
-                panic!("certificate unexpectedly became optional-unavailable")
-            }
-            ChcCertificatePublication::RequiredUnavailable(diagnostic) => {
-                panic!("certificate unexpectedly became required-unavailable: {diagnostic}")
-            }
-        }
-    }
-
-    fn obligation_directories(parent: &Path) -> Vec<PathBuf> {
-        fs::read_dir(parent)
-            .expect("read publication directory")
-            .map(|entry| entry.expect("directory entry").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".chc-obligations-"))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn chc_publication_lock_excludes_a_concurrent_publisher() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let proof = temp.path().join("proof.chccert");
-        let first = ChcPublicationLock::acquire(&proof).expect("first publication lock");
-        assert!(
-            ChcPublicationLock::acquire(&proof).is_err(),
-            "a second publisher acquired the same certificate lock"
-        );
-        drop(first);
-        ChcPublicationLock::acquire(&proof).expect("lock after first publisher exits");
-    }
-
-    #[test]
-    fn chc_publication_lock_refuses_a_symlink_without_touching_its_target() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let proof = temp.path().join("proof.chccert");
-        let target = temp.path().join("unrelated");
-        fs::write(&target, b"unrelated").expect("plant lock target");
-        std::os::unix::fs::symlink(&target, temp.path().join(".proof.chccert.ay-chc.lock"))
-            .expect("plant lock symlink");
-
-        assert!(ChcPublicationLock::acquire(&proof).is_err());
-        assert_eq!(fs::read(target).expect("read target"), b"unrelated");
-    }
-
-    #[test]
-    fn chc_publication_final_gate_rejects_lock_unlink_and_recreate() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let proof = temp.path().join("proof.chccert");
-        let mut artifacts =
-            publish_chc_certificate_artifacts(&proof_config(&proof), "certificate\n", Vec::new())
-                .expect("publish CHC certificate");
-        let lock_path = temp.path().join(".proof.chccert.ay-chc.lock");
-
-        fs::remove_file(&lock_path).expect("unlink active publication lock");
-        let replacement = ChcPublicationLock::acquire(&proof)
-            .expect("replacement inode demonstrates why identity validation is required");
-
-        let error = artifacts
-            .validate()
-            .expect_err("final gate accepted an unlinked/recreated lock authority");
-        assert!(
-            error.to_string().contains("lock authority changed"),
-            "unexpected final-gate error: {error}"
-        );
-        drop(replacement);
-    }
-
-    #[test]
-    fn certificate_only_scope_skips_safe_and_unsafe_obligation_trees() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let proof = temp.path().join("proof.chccert");
-        let config = proof_config(&proof);
-
-        let safe_artifacts = available_artifacts(write_chc_safe_certificate_artifacts(
-            Some(&config),
-            "safe certificate\n",
-            ChcArtifactScope::CertificateOnly,
-            || -> ChcResult<Vec<ChcReplayObligation>> {
-                panic!("stats-off SAFE generated replay obligations")
-            },
-        ));
-        assert!(safe_artifacts.replay_obligations.is_empty());
-        assert!(obligation_directories(temp.path()).is_empty());
-        drop(safe_artifacts);
-
-        let unsafe_artifacts = available_artifacts(write_chc_unsafe_certificate_artifacts(
-            Some(&config),
-            "unsafe certificate\n",
-            ChcArtifactScope::CertificateOnly,
-            || -> ChcResult<Vec<ChcReplayObligation>> {
-                panic!("stats-off UNSAFE generated replay obligations")
-            },
-        ));
-        assert!(unsafe_artifacts.replay_obligations.is_empty());
-        assert!(obligation_directories(temp.path()).is_empty());
-    }
-
-    #[test]
-    fn chc_publication_seals_certificate_and_unique_obligations() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let proof = temp.path().join("proof.chccert");
-        let obligation = ChcReplayObligation {
-            name: "trace".to_string(),
-            kind: ChcReplayObligationKind::TraceValidity,
-            clause_index: 7,
-            smtlib: "(set-logic QF_LIA)\n(check-sat)\n".to_string(),
-        };
-        let mut artifacts = publish_chc_certificate_artifacts(
-            &proof_config(&proof),
-            "certificate\n",
-            vec![obligation],
-        )
-        .expect("publish CHC transaction");
-
-        assert_eq!(
-            fs::read_to_string(&proof).expect("certificate"),
-            "certificate\n"
-        );
-        assert_eq!(artifacts.replay_obligations.len(), 1);
-        assert!(
-            ChcPublicationLock::acquire(&proof).is_err(),
-            "the publication lease was released before the artifacts"
-        );
-        let obligation_path = Path::new(
-            artifacts.replay_obligations[0]
-                .query
-                .path
-                .as_deref()
-                .expect("obligation path"),
-        );
-        assert!(obligation_path.starts_with(temp.path()));
-        assert_ne!(obligation_path.parent(), proof.parent());
-        for artifact in &mut artifacts.retained_files {
-            artifact
-                .validate()
-                .expect("same-run artifact remains sealed");
-        }
-
-        fs::write(&proof, b"tampered\n").expect("tamper certificate");
-        assert!(
-            artifacts
-                .retained_files
-                .iter_mut()
-                .any(|artifact| artifact.path == proof && artifact.validate().is_err()),
-            "certificate replacement was not detected before verdict publication"
-        );
-        drop(artifacts);
-        ChcPublicationLock::acquire(&proof)
-            .expect("publication lease should be released with the artifacts");
-    }
-}
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {

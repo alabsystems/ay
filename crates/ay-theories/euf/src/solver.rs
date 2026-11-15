@@ -170,6 +170,24 @@ pub struct EufSolver<'a> {
     /// When `(= (f x) 100)` is asserted as true, stores (func_app_term_id, const_term_id).
     /// Used by extract_model() to provide actual values in EufModel.func_app_const_terms.
     pub(crate) func_app_values: HashMap<TermId, TermId>,
+    /// Provider equality term per tracked func-app value
+    /// (#euf-funcapp-provider): `func_app -> eq_term` for the asserted
+    /// equality that first recorded the value. Lets `pop()` validate
+    /// the few tracked entries against surviving assignments instead
+    /// of rescanning every assignment to rebuild the map — on
+    /// backtrack-heavy QF_AUFLIA (swap files: one `sk` app, ~10^5
+    /// assigns) the full rescan per pop profiled as a top cost.
+    pub(crate) func_app_value_providers: HashMap<TermId, TermId>,
+    /// Memoized shape classification for func-app value tracking
+    /// (#euf-funcapp-classify-memo): `eq_term -> Some((func_app, partner))`
+    /// when the term is a `(= theory_func_app const/var)` equality in
+    /// either orientation, else `None`. The classification is a pure
+    /// function of immutable term shape (`decode_eq`, `is_constant`,
+    /// `is_theory_func_app`), and the TermStore is append-only, so a
+    /// classification never expires. Replaces per-asserted-literal
+    /// shape re-derivation (top profile leaf on backtrack-heavy
+    /// QF_AUFLIA) with one hash lookup.
+    pub(crate) func_app_eq_memo: HashMap<TermId, Option<(TermId, TermId)>>,
     /// Optional extraction scope for model building.
     ///
     /// In incremental mode, the append-only TermStore retains terms from popped
@@ -748,9 +766,12 @@ pub struct EufSolver<'a> {
     /// `pending_propagations` ARE used as SAT theory propagations.
     pub(crate) verify_only: bool,
     /// Verification scope (#A2 PEQ perf): when set, `init_func_apps` registers
-    /// ONLY function applications inside this subterm-closed term set. Used
-    /// exclusively by `verify_only_scoped` verification instances, which
-    /// assert a handful of literals and read only the check() verdict.
+    /// ONLY function applications inside this subterm-closed term set. Set
+    /// only on fresh verification instances, which assert a handful of
+    /// literals and read one verdict: by `verify_only_scoped` (pure-EUF
+    /// verification, verify-only mode) and by `scope_func_apps_to_roots`
+    /// (the EUF of a combined verification combiner, #combiner-verify-scope:
+    /// verify-only stays off, so Nelson-Oppen reason vectors are kept).
     ///
     /// VERDICT-PRESERVATION: EUF (un)satisfiability of a conjunction of
     /// literals is decided by congruence closure over the SUBTERM-CLOSED set
@@ -763,7 +784,9 @@ pub struct EufSolver<'a> {
     /// dominant cost of per-conflict verification on congruence-heavy QF_UF
     /// (PEQ: one fresh O(all-apps) solver per theory conflict).
     ///
-    /// MUST remain `None` on the real solve-path solver.
+    /// MUST remain `None` on the real solve-path solver: neither
+    /// `verify_only_scoped` nor `scope_func_apps_to_roots` may be called on
+    /// one.
     pub(crate) func_app_scope: Option<HashSet<u32>>,
     /// #euf-prop-gap: CLI-gated (`--euf-gap-stats`) profiling counters for
     /// the eager-propagation gap. Zero-cost when disabled (one bool test on
@@ -861,14 +884,14 @@ impl PropGapStats {
         let h = Self::reason_hash(reasons);
         let dup = !self.emitted_probe.insert((term, h, path_pos));
         if path_pos {
-            self.pos_emitted += 1;
+            self.pos_emitted = self.pos_emitted.saturating_add(1);
             if dup {
-                self.pos_dup += 1;
+                self.pos_dup = self.pos_dup.saturating_add(1);
             }
         } else {
-            self.neg_emitted += 1;
+            self.neg_emitted = self.neg_emitted.saturating_add(1);
             if dup {
-                self.neg_dup += 1;
+                self.neg_dup = self.neg_dup.saturating_add(1);
             }
         }
     }
@@ -1285,7 +1308,7 @@ impl<'a> EufSolver<'a> {
                 root,
                 "BUG: {context}: node {curr} in class walk does not map to root {root}"
             );
-            count += 1;
+            count = count.saturating_add(1);
             debug_assert!(
                 count <= max_nodes,
                 "BUG: {context}: class walk exceeded enode count while traversing root {root}"
@@ -1350,6 +1373,8 @@ impl<'a> EufSolver<'a> {
             pending_propagations: Vec::new(),
             // Function application value tracking (#385)
             func_app_values: HashMap::default(),
+            func_app_value_providers: HashMap::default(),
+            func_app_eq_memo: HashMap::default(),
             model_term_scope: None,
             // Pre-indexed equality terms (#2673)
             eq_terms: Vec::new(),
@@ -1535,17 +1560,7 @@ impl<'a> EufSolver<'a> {
     #[must_use]
     pub fn verify_only_scoped(mut self, roots: impl IntoIterator<Item = TermId>) -> Self {
         self.verify_only = true;
-        let mut reachable: HashSet<u32> = HashSet::default();
-        let mut stack: Vec<TermId> = roots.into_iter().collect();
-        while let Some(term) = stack.pop() {
-            if !reachable.insert(term.0) {
-                continue;
-            }
-            for child in self.terms.children(term) {
-                stack.push(child);
-            }
-        }
-        self.func_app_scope = Some(reachable);
+        self.func_app_scope = Some(crate::congruence_scope::subterm_closure(self.terms, roots));
         self
     }
 
@@ -1594,11 +1609,8 @@ impl<'a> EufSolver<'a> {
 
     /// Restrict the next model extraction to terms reachable from `roots`.
     pub fn scope_model_to_roots(&mut self, roots: &[TermId]) {
-        #[cfg(not(kani))]
         let mut reachable =
             ay_core::kani_compat::det_hash_set_with_capacity(roots.len().saturating_mul(4));
-        #[cfg(kani)]
-        let mut reachable = HashSet::default();
         let mut stack = roots.to_vec();
         while let Some(term) = stack.pop() {
             if !reachable.insert(term) {
@@ -1640,15 +1652,22 @@ impl<'a> EufSolver<'a> {
         // Recompute whether any theory-sorted (Int/Real/BV) func app exists;
         // if not, `try_track_func_app_value` can never fire and is skipped.
         let mut any_theory_func_app = false;
-        for term_id in self.terms.term_ids() {
-            // #A2 PEQ perf: verification-scoped instances register only apps
-            // inside the asserted literals' subterm closure (see
-            // `func_app_scope` docs for the verdict-preservation argument).
-            if let Some(scope) = &self.func_app_scope {
-                if !scope.contains(&term_id.0) {
-                    continue;
-                }
-            }
+        // #A2 PEQ perf: verification-scoped instances register only apps
+        // inside the asserted literals' subterm closure (see `func_app_scope`
+        // docs for the verdict-preservation argument). They visit just the
+        // scope, in ascending id order: exactly the ids, in exactly the order,
+        // that a full scan filtered by scope membership visits.
+        let terms = self.terms;
+        let scoped_ids = self
+            .func_app_scope
+            .as_ref()
+            .map(|scope| crate::congruence_scope::ascending_scope_ids(scope, terms.len()));
+        let full_scan = scoped_ids.is_none().then(|| terms.term_ids());
+        for term_id in scoped_ids
+            .into_iter()
+            .flatten()
+            .chain(full_scan.into_iter().flatten())
+        {
             if let TermData::App(sym, args) = self.terms.get(term_id) {
                 if !Self::is_builtin_symbol(sym) && !args.is_empty() {
                     // Seq is included (#uf-app-value-seq): a Seq-returning UF

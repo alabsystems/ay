@@ -72,6 +72,9 @@ impl CubeAndConquerSolver {
     /// returns `SatResult::Unknown` for all UNSAT CnC paths, including
     /// non-proof CLI runs, until CnC has an explicit proof-ready mode.
     pub fn solve(&self, formula: &DimacsFormula) -> SatResult {
+        let Ok(compute) = ay_sys::compute_budget::ComputeScope::enter() else {
+            return SatResult::Unknown;
+        };
         // Phase 1: Generate cubes using lookahead.
         let cubes = {
             let mut cubing_solver = Solver::new(formula.num_vars);
@@ -82,7 +85,7 @@ impl CubeAndConquerSolver {
         };
 
         eprintln!(
-            "c cube-and-conquer: {} cubes generated (depth {}), {} threads",
+            "c cube-and-conquer: {} cubes generated (depth {}), requested {} workers",
             cubes.len(),
             self.depth,
             self.num_threads,
@@ -115,68 +118,89 @@ impl CubeAndConquerSolver {
         let unsat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let total_cubes = cube_queue.lock().len();
 
-        thread::scope(|scope| {
-            let handles: Vec<_> = (0..self.num_threads)
-                .map(|_| {
-                    let formula_clauses = &formula.clauses;
-                    let num_vars = formula.num_vars;
-                    let terminate = Arc::clone(&terminate);
-                    let sat_result = Arc::clone(&sat_result);
-                    let cube_queue = Arc::clone(&cube_queue);
-                    let unsat_count = Arc::clone(&unsat_count);
+        let mut extras = Vec::new();
+        for _ in 1..self.num_threads.min(total_cubes) {
+            match compute.try_extra() {
+                Ok(Some(permit)) => extras.push(permit),
+                Ok(None) => break,
+                Err(_) => return SatResult::Unknown,
+            }
+        }
+        let workers = 1 + extras.len();
 
-                    scope.spawn(move || {
-                        loop {
-                            // Check termination before dequeuing.
-                            if terminate.load(Ordering::Relaxed) {
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(extras.len());
+            let mut inline = None;
+            for worker in 0..workers {
+                let formula_clauses = &formula.clauses;
+                let num_vars = formula.num_vars;
+                let terminate = Arc::clone(&terminate);
+                let sat_result = Arc::clone(&sat_result);
+                let cube_queue = Arc::clone(&cube_queue);
+                let unsat_count = Arc::clone(&unsat_count);
+
+                let task = move || {
+                    loop {
+                        // Check termination before dequeuing.
+                        if terminate.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        // Dequeue next cube.
+                        let cube = {
+                            let mut queue = cube_queue.lock();
+                            queue.pop_front()
+                        };
+
+                        let cube = match cube {
+                            Some(c) => c,
+                            None => break, // No more cubes.
+                        };
+
+                        // Create a fresh solver for this cube.
+                        let mut solver = Solver::new(num_vars);
+                        for clause in formula_clauses {
+                            solver.add_clause(clause.clone());
+                        }
+
+                        // Solve formula under cube assumptions.
+                        let result = solver
+                            .solve_with_assumptions_interruptible(&cube, || {
+                                terminate.load(Ordering::Relaxed)
+                            })
+                            .into_inner();
+
+                        match result {
+                            AssumeResult::Sat(model) => {
+                                // SAT: store result and signal termination.
+                                let mut guard = sat_result.lock();
+                                if guard.is_none() {
+                                    *guard = Some(model);
+                                    terminate.store(true, Ordering::Relaxed);
+                                }
                                 break;
                             }
-
-                            // Dequeue next cube.
-                            let cube = {
-                                let mut queue = cube_queue.lock();
-                                queue.pop_front()
-                            };
-
-                            let cube = match cube {
-                                Some(c) => c,
-                                None => break, // No more cubes.
-                            };
-
-                            // Create a fresh solver for this cube.
-                            let mut solver = Solver::new(num_vars);
-                            for clause in formula_clauses {
-                                solver.add_clause(clause.clone());
+                            AssumeResult::Unsat(..) => {
+                                unsat_count.fetch_add(1, Ordering::Relaxed);
                             }
-
-                            // Solve formula under cube assumptions.
-                            let result = solver
-                                .solve_with_assumptions_interruptible(&cube, || {
-                                    terminate.load(Ordering::Relaxed)
-                                })
-                                .into_inner();
-
-                            match result {
-                                AssumeResult::Sat(model) => {
-                                    // SAT: store result and signal termination.
-                                    let mut guard = sat_result.lock();
-                                    if guard.is_none() {
-                                        *guard = Some(model);
-                                        terminate.store(true, Ordering::Relaxed);
-                                    }
-                                    break;
-                                }
-                                AssumeResult::Unsat(..) => {
-                                    unsat_count.fetch_add(1, Ordering::Relaxed);
-                                }
-                                AssumeResult::Unknown => {
-                                    // Cube interrupted (timeout). Continue to next cube.
-                                }
+                            AssumeResult::Unknown => {
+                                // Cube interrupted (timeout). Continue to next cube.
                             }
                         }
-                    })
-                })
-                .collect();
+                    }
+                };
+                if worker == 0 {
+                    inline = Some(task);
+                } else if let Some(permit) = extras.pop() {
+                    handles.push(scope.spawn(move || {
+                        let _ = permit.run(task);
+                    }));
+                }
+            }
+
+            if let Some(task) = inline {
+                crate::portfolio::run_isolated_inline(task);
+            }
 
             // Wait for all workers to finish.
             for handle in handles {

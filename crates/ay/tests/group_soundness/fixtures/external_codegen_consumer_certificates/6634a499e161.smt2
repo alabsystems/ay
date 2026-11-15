@@ -1,0 +1,7 @@
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BVFP)
+(declare-const a (_ FloatingPoint 8 24))
+(assert false)
+(check-sat)
+(exit)

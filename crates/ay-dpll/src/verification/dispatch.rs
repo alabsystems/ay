@@ -19,10 +19,14 @@
 //! re-verification (BV bit-blasting, String lemma-based reasoning).
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore, TheoryLit, TheoryPropagation};
 
-use super::euf::{verify_euf_conflict, verify_euf_propagation};
+use super::euf::{verify_euf_conflict_classified, verify_euf_propagation};
+use super::int_real_mix::verify_int_real_mix_conflict;
 use super::structural::{verify_theory_conflict, verify_theory_propagation};
 use super::VerificationError;
 use crate::term_helpers::{is_uf_int_equality, is_uf_real_equality};
+
+mod mixed_scope;
+pub(crate) use mixed_scope::ScopedRecheckGate;
 
 fn is_pure_arithmetic_term(terms: &TermStore, term: TermId) -> bool {
     match terms.get(term) {
@@ -1617,7 +1621,7 @@ pub(crate) fn verify_lra_full_state_satisfiable(
 pub(crate) fn verify_lra_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
-) -> Result<(), VerificationError> {
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
     use ay_lra::LraSolver;
 
@@ -1630,7 +1634,9 @@ pub(crate) fn verify_lra_conflict_semantic(
     }
 
     match verify_lra.check() {
-        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => Ok(()),
+        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
+            Ok(ConflictSemanticVerdict::Reproved)
+        }
         TheoryResult::Sat => Err(VerificationError::InvalidFarkas {
             reason: format!(
                 "LRA conflict semantic check: fresh solver says SAT for {}-literal conflict",
@@ -1638,7 +1644,7 @@ pub(crate) fn verify_lra_conflict_semantic(
             ),
         }),
         // Unknown / split: cannot verify — accept optimistically.
-        _ => Ok(()),
+        _ => Ok(ConflictSemanticVerdict::AcceptedUnchecked),
     }
 }
 
@@ -1665,7 +1671,7 @@ fn verify_solve_budget() -> std::time::Duration {
 pub(crate) fn verify_lia_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
-) -> Result<(), VerificationError> {
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
     use ay_lia::LiaSolver;
 
@@ -1691,14 +1697,16 @@ pub(crate) fn verify_lia_conflict_semantic(
     }
 
     match verify_lia.check() {
-        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => Ok(()),
+        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
+            Ok(ConflictSemanticVerdict::Reproved)
+        }
         TheoryResult::Sat => Err(VerificationError::ConflictIsSat),
         // NeedLemmas: LIA found it needs cuts but hasn't proven UNSAT yet.
         // Accept optimistically — the conflict may still be valid but require
         // branch-and-bound exploration that a single check() doesn't perform.
-        TheoryResult::NeedLemmas(_) => Ok(()),
+        TheoryResult::NeedLemmas(_) => Ok(ConflictSemanticVerdict::AcceptedUnchecked),
         // Unknown / split: cannot verify — accept optimistically.
-        _ => Ok(()),
+        _ => Ok(ConflictSemanticVerdict::AcceptedUnchecked),
     }
 }
 
@@ -1733,7 +1741,7 @@ pub(crate) fn verify_lia_conflict_semantic(
 fn verify_seq_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
-) -> Result<(), VerificationError> {
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
 
     let mut fresh = crate::combined_solvers::adapters::UfSeqSolver::new(terms);
@@ -1744,9 +1752,11 @@ fn verify_seq_conflict_semantic(
         fresh.assert_literal(lit.term, lit.value);
     }
     match fresh.check() {
-        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => Ok(()),
+        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
+            Ok(ConflictSemanticVerdict::Reproved)
+        }
         TheoryResult::Sat => Err(VerificationError::ConflictIsSat),
-        _ => Ok(()),
+        _ => Ok(ConflictSemanticVerdict::AcceptedUnchecked),
     }
 }
 
@@ -2203,12 +2213,12 @@ fn verify_strings_mixed_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
     verification_context: &[TheoryLit],
-) -> Result<(), VerificationError> {
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
 
     if conflict.is_empty() {
         // Structurally rejected upstream by `verify_theory_conflict`.
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
     debug_assert!(mixed_strings_gate_enabled());
 
@@ -2225,7 +2235,7 @@ fn verify_strings_mixed_conflict_semantic(
             "skipped-seq-sort",
             conflict.len(),
         );
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
 
     // Any Real arithmetic (including an explicit
@@ -2242,7 +2252,7 @@ fn verify_strings_mixed_conflict_semantic(
             "skipped-real-or-int-real",
             conflict.len(),
         );
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
     // `StringsLiaSolver` has no ArraySolver. A context that combines native
     // string content with select/store semantics therefore cannot use its
@@ -2256,7 +2266,7 @@ fn verify_strings_mixed_conflict_semantic(
             "skipped-string-array-mix",
             conflict.len(),
         );
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
     if conflict_involves_nonlinear(terms, verification_context) {
         tracing::debug!(
@@ -2264,7 +2274,7 @@ fn verify_strings_mixed_conflict_semantic(
             "mixed string+nonlinear conflict skipped semantic re-verification: \
              the QF_SLIA adapter carries only linear integer arithmetic"
         );
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
 
     if conflict.len() > MAX_MIXED_STRING_CONFLICT_LITS {
@@ -2329,7 +2339,7 @@ fn verify_strings_mixed_conflict_semantic(
                     "accepted-sat-ground-refuted",
                     conflict.len(),
                 );
-                return Ok(());
+                return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
             }
             SliaSatTrust::Unfaithful => {
                 observe_mixed_string_event(
@@ -2337,7 +2347,7 @@ fn verify_strings_mixed_conflict_semantic(
                     "accepted-sat-unfaithful-bridge",
                     conflict.len(),
                 );
-                return Ok(());
+                return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
             }
         }
         observe_mixed_string_event(
@@ -2358,7 +2368,18 @@ fn verify_strings_mixed_conflict_semantic(
         lit_count = conflict.len(),
         "mixed string+arith conflict passed isolated QF_SLIA re-solve verification"
     );
-    Ok(())
+    // Only a definitive fresh `Unsat` re-derives the conflict; a split or lemma
+    // request passes the fail-closed gate without establishing anything.
+    Ok(
+        if matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ) {
+            ConflictSemanticVerdict::Reproved
+        } else {
+            ConflictSemanticVerdict::AcceptedUnchecked
+        },
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2433,13 +2454,26 @@ pub(super) fn close_valid_lemma_clauses(
     }
 }
 
+/// [`verify_mixed_conflict_semantic_with_gate`] outside any query: the
+/// full-store combined re-check alone.
+#[cfg(test)]
 pub(super) fn verify_mixed_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
     support_axioms: &[TheoryLit],
-) -> Result<(), VerificationError> {
-    use ay_core::{TheoryResult, TheorySolver};
+) -> Result<ConflictSemanticVerdict, VerificationError> {
+    verify_mixed_conflict_semantic_with_gate(conflict, terms, support_axioms, None)
+}
 
+/// Re-solve a mixed / array / unknown-domain conflict (plus its support) in
+/// a fresh Nelson-Oppen combiner. `scoped_recheck` is the query's
+/// [`ScopedRecheckGate`] (`None` outside a query: full-store re-check only).
+pub(super) fn verify_mixed_conflict_semantic_with_gate(
+    conflict: &[TheoryLit],
+    terms: &TermStore,
+    support_axioms: &[TheoryLit],
+    scoped_recheck: Option<&mut ScopedRecheckGate>,
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     // Every fragment choice and every definitive `Sat` verdict must describe
     // the complete context asserted into the fresh solver. In particular, a
     // support-only String/Seq or Int<->Real bridge cannot be ignored merely
@@ -2462,7 +2496,7 @@ pub(super) fn verify_mixed_conflict_semantic(
         {
             // The conflict plus unconditional support is already
             // contradictory, so accepting the conflict is sound.
-            return Ok(());
+            return Ok(ConflictSemanticVerdict::Reproved);
         }
     }
 
@@ -2481,11 +2515,11 @@ pub(super) fn verify_mixed_conflict_semantic(
                 "skipped-unverifiable-domain",
                 conflict.len(),
             );
-            return Ok(());
+            return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
         }
     }
 
-    // Mixed int/real (LIRA) conflicts are OUTSIDE the verifiable fragment:
+    // Mixed int/real (LIRA) conflicts are OUTSIDE the combiners' fragment:
     // no combiner interprets the int<->real bridge (`to_real` / `to_int` /
     // `is_int`), and `make_verification_combiner` picks UF+LIA whenever any
     // int-sorted operand appears, which leaves Real-sorted atoms and the
@@ -2496,15 +2530,11 @@ pub(super) fn verify_mixed_conflict_semantic(
     // k <-> to_real(k) coupling is dropped, and the hard
     // `ConflictIsSat -> Unknown` gate then degrades a decidable linear
     // mixed-int/real query to `unknown` (archimedean_nat regression).
-    // Mirror the nonlinear skip (#7978): accept optimistically.
+    // The int/real verifier never rejects on a solver's `Sat` alone: only an
+    // exact integral model of the whole context refutes, and a valid
+    // conflict has none (see `int_real_mix`).
     if conflict_involves_int_real_mix(terms, &verification_context) {
-        tracing::debug!(
-            lit_count = conflict.len(),
-            "mixed int/real (LIRA-bridged) conflict skipped semantic re-verification: \
-             fresh combiners interpret a single numeric sort, so their SAT verdicts \
-             are not trustworthy here (#6853 completeness)"
-        );
-        return Ok(());
+        return verify_int_real_mix_conflict(&verification_context, terms);
     }
     if conflict_involves_nonlinear(terms, &verification_context) {
         tracing::debug!(
@@ -2512,7 +2542,7 @@ pub(super) fn verify_mixed_conflict_semantic(
             "mixed nonlinear conflict skipped semantic re-verification: the \
              verification combiner carries only linear arithmetic solvers"
         );
-        return Ok(());
+        return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
     }
 
     // Chain the support-axiom terms into the combiner-selection scan so a
@@ -2522,112 +2552,17 @@ pub(super) fn verify_mixed_conflict_semantic(
     // `atoms` argument).
     let selected_combiner_kind =
         verification_combiner_kind(terms, verification_context.iter().map(|lit| lit.term));
-    let mut combiner =
-        make_verification_combiner(terms, verification_context.iter().map(|lit| lit.term));
-    let mut verified_combiner_context = verification_context.clone();
-
-    for lit in &verification_context {
-        combiner.register_atom(lit.term);
-    }
-    // Register and assert the support axioms (#8123 datatype tautologies AND
-    // #AUFLIA-support ground instances of unconditionally-asserted Foralls) so
-    // the combined solver can reprove a conflict the isolated combiner would
-    // otherwise call spuriously-Sat. Every support literal is true in every
-    // model of the problem, so it can only CONFIRM a genuine conflict, never
-    // manufacture one.
-    for lit in &verification_context {
-        combiner.assert_literal(lit.term, lit.value);
-    }
-
-    // Array and datatype solvers DRAIN a NeedLemmas batch after returning it:
-    // the production DPLL(T) layer normally installs those clauses in SAT.
-    // A bare second check therefore does not retain the emitted disjunction.
-    // Materialize only consequences justified by this fixed trail:
-    //   * zero live literals refutes the context immediately;
-    //   * one live literal is unit-implied and may be asserted;
-    //   * multiple live literals require a SAT split, so remain inconclusive.
-    // Rechecking is sound only when every emitted clause is satisfied after
-    // this closure. Speculative model equalities and arithmetic split requests
-    // are never asserted here.
-    const MAX_VERIFY_LEMMA_BATCHES: usize = 16;
-    let mut remaining_batches = MAX_VERIFY_LEMMA_BATCHES;
-    let mut seen_clauses: ay_core::kani_compat::DetHashSet<Vec<TheoryLit>> = Default::default();
-    let mut result = combiner.check();
-
-    loop {
-        match result {
-            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => return Ok(()),
-            TheoryResult::Sat => return Err(VerificationError::ConflictIsSat),
-            TheoryResult::NeedLemmas(lemmas) => {
-                if remaining_batches == 0 || lemmas.is_empty() {
-                    return Ok(());
-                }
-                remaining_batches -= 1;
-
-                let mut clauses = Vec::with_capacity(lemmas.len());
-                let mut has_new_clause = false;
-                for lemma in lemmas {
-                    let mut clause = lemma.clause;
-                    clause.sort_unstable();
-                    clause.dedup();
-                    has_new_clause |= seen_clauses.insert(clause.clone());
-                    clauses.push(clause);
-                }
-
-                match close_valid_lemma_clauses(&clauses, &mut trail) {
-                    LemmaTrailClosure::Contradiction => return Ok(()),
-                    LemmaTrailClosure::Inconclusive => return Ok(()),
-                    LemmaTrailClosure::Complete(units) => {
-                        // A repeated, already-satisfied batch cannot change
-                        // this single-path verifier. Stop instead of spinning.
-                        if units.is_empty() && !has_new_clause {
-                            return Ok(());
-                        }
-
-                        // Lemma atoms were not part of the original combiner
-                        // selection. Before a later `Sat` can reject the
-                        // conflict, check that all materialized units remain in
-                        // the same supported fragment and require the same
-                        // concrete combiner. A support/lemma-only String,
-                        // BitVec, nonlinear, or Int<->Real bridge is therefore
-                        // inconclusive rather than a false definitive `Sat`.
-                        verified_combiner_context.extend(units.iter().copied());
-                        let still_combined = matches!(
-                            classify_mixed_verifiability(
-                                terms,
-                                verified_combiner_context.iter().map(|lit| lit.term),
-                            ),
-                            MixedVerifiability::Combined
-                        );
-                        let same_combiner = verification_combiner_kind(
-                            terms,
-                            verified_combiner_context.iter().map(|lit| lit.term),
-                        ) == selected_combiner_kind;
-                        if !still_combined
-                            || !same_combiner
-                            || conflict_involves_int_real_mix(terms, &verified_combiner_context)
-                            || conflict_involves_nonlinear(terms, &verified_combiner_context)
-                        {
-                            return Ok(());
-                        }
-
-                        for unit in units {
-                            combiner.register_atom(unit.term);
-                            combiner.assert_literal(unit.term, unit.value);
-                        }
-                        result = combiner.check();
-                    }
-                }
-            }
-            // NeedModelEquality/NeedModelEqualities are retractable model
-            // guidance, while NeedSplit/NeedDisequalitySplit/
-            // NeedExpressionSplit(s) require genuine SAT case splits. An
-            // immutable, single-path verifier cannot resolve them without
-            // choosing an unjustified branch. Unknown and string requests are
-            // likewise inconclusive. Preserve the existing optimistic policy.
-            _ => return Ok(()),
-        }
-    }
+    // When the query's gate admits it, the combined re-check registers
+    // congruence over the conflict's own subterm closure first and falls back
+    // to the whole store unless that scoped run re-proves the conflict (see
+    // `mixed_scope`).
+    mixed_scope::recheck_mixed_context(
+        terms,
+        &verification_context,
+        trail,
+        selected_combiner_kind,
+        scoped_recheck,
+    )
 }
 
 /// Verify a theory conflict semantically by dispatching to the appropriate
@@ -2645,13 +2580,92 @@ pub(crate) fn verify_conflict_semantic(
     terms: &TermStore,
     support_axioms: &[TheoryLit],
 ) -> Result<(), VerificationError> {
-    verify_conflict_semantic_impl(conflict, terms, support_axioms, false)
+    verify_conflict_semantic_impl(conflict, terms, support_axioms, None, None).map(|_| ())
 }
 
-/// Per-query memo type for fail-closed semantic conflict-verification
-/// verdicts (#4535 memoized verifier): sorted conflict literal set -> whether
-/// `verify_conflict_semantic` accepted it.
-pub(crate) type ConflictSemanticVerifyMemo = ay_core::kani_compat::DetHashMap<Vec<TheoryLit>, bool>;
+/// What a semantic conflict verification established about one literal set.
+///
+/// The fail-closed gate only needs "not refuted": it lets the search learn a
+/// conflict unless a fresh solve proved the literals jointly satisfiable, and
+/// it accepts optimistically wherever it cannot decide (nonlinear or
+/// int/real-bridged fragments, split or lemma requests, budget trips, a
+/// sampled-out EUF re-check, structural-only domains). An acceptance of that
+/// kind is permission to learn, not evidence. A certification lane that
+/// cites a verification as authority for a theory premise needs the
+/// stronger fact — that a fresh solver re-derived UNSAT for exactly this
+/// literal set — so the verdict records which of the two happened.
+///
+/// Before this distinction the memo stored a bare `true` for both, and the
+/// `checked-sat-refutation` lane read it as an exact positive verdict
+/// (2026-09-23 hunt: that lane admitted a wrong array refutation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConflictSemanticVerdict {
+    /// A fresh solve re-derived UNSAT for exactly this literal set (or the set
+    /// plus unconditional support is already syntactically contradictory).
+    Reproved,
+    /// A fresh Nelson-Oppen combiner re-derived UNSAT, but the combiner
+    /// carried the ARRAY theory solver: the same inference code that derives
+    /// array conflicts in the search re-ran on the literal set. That catches
+    /// state-dependent faults (stale caches, reasons lost across
+    /// backtracking), not a fault in the array inference itself — an
+    /// explanation that drops an index-distinctness reason is re-derived
+    /// verbatim from the reduced literal set (2026-09-23 hunt D4). The gate
+    /// accepts it; a lane that claims an independent check must not.
+    ReprovedByArrayTheory,
+    /// Accepted by the fail-closed gate without a re-derivation.
+    AcceptedUnchecked,
+    /// Rejected by the gate (memo entries only; the call returns `Err`).
+    Rejected,
+}
+
+impl ConflictSemanticVerdict {
+    /// Whether the fail-closed gate lets the search learn this conflict.
+    pub(crate) fn accepts(self) -> bool {
+        !matches!(self, Self::Rejected)
+    }
+}
+
+/// Per-query memo for fail-closed semantic conflict-verification verdicts
+/// (#4535 memoized verifier): sorted conflict literal set -> what the
+/// verification established ([`ConflictSemanticVerdict`]). It dereferences to
+/// that map.
+///
+/// It also carries the query's [`ScopedRecheckGate`] (#combiner-verify-scope),
+/// which picks only which combined re-checks run, so it shares the memo's
+/// lifecycle: cleared with it, and cloned and restored with it by the detour
+/// snapshots.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConflictSemanticVerifyMemo {
+    verdicts: ay_core::kani_compat::DetHashMap<Vec<TheoryLit>, ConflictSemanticVerdict>,
+    scoped_recheck: ScopedRecheckGate,
+}
+
+impl std::ops::Deref for ConflictSemanticVerifyMemo {
+    type Target = ay_core::kani_compat::DetHashMap<Vec<TheoryLit>, ConflictSemanticVerdict>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.verdicts
+    }
+}
+
+impl std::ops::DerefMut for ConflictSemanticVerifyMemo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.verdicts
+    }
+}
+
+impl ConflictSemanticVerifyMemo {
+    /// Forget every verdict and start a fresh scoped re-check gate.
+    pub(crate) fn clear(&mut self) {
+        self.verdicts.clear();
+        self.scoped_recheck = ScopedRecheckGate::default();
+    }
+
+    /// The query's scoped re-check gate.
+    pub(crate) fn scoped_recheck_gate(&mut self) -> &mut ScopedRecheckGate {
+        &mut self.scoped_recheck
+    }
+}
 
 /// Memoized wrapper around [`verify_conflict_semantic`] (#4535 memoized
 /// verifier).
@@ -2682,9 +2696,9 @@ pub(crate) fn verify_conflict_semantic_memoized(
 ) -> Result<(), VerificationError> {
     let mut key = conflict.to_vec();
     key.sort_unstable();
-    if let Some(&ok) = memo.get(&key) {
+    if let Some(&verdict) = memo.get(&key) {
         ay_lia::instrument::bump_verify_conflict_memoized(true);
-        return if ok {
+        return if verdict.accepts() {
             Ok(())
         } else {
             Err(VerificationError::Internal(
@@ -2695,9 +2709,21 @@ pub(crate) fn verify_conflict_semantic_memoized(
         };
     }
     ay_lia::instrument::bump_verify_conflict_memoized(false);
-    let result = verify_conflict_semantic_impl(conflict, terms, support_axioms, false);
-    memo.insert(key, result.is_ok());
-    result
+    let result = verify_conflict_semantic_impl(
+        conflict,
+        terms,
+        support_axioms,
+        None,
+        Some(memo.scoped_recheck_gate()),
+    );
+    memo.insert(
+        key,
+        match &result {
+            Ok(verdict) => *verdict,
+            Err(_) => ConflictSemanticVerdict::Rejected,
+        },
+    );
+    result.map(|_| ())
 }
 
 /// Variant of [`verify_conflict_semantic`] for callers that have ALREADY run
@@ -2720,15 +2746,48 @@ pub(crate) fn verify_conflict_semantic_euf_prechecked(
     terms: &TermStore,
     support_axioms: &[TheoryLit],
 ) -> Result<(), VerificationError> {
-    verify_conflict_semantic_impl(conflict, terms, support_axioms, true)
+    verify_conflict_semantic_impl(
+        conflict,
+        terms,
+        support_axioms,
+        Some(ConflictSemanticVerdict::AcceptedUnchecked),
+        None,
+    )
+    .map(|_| ())
+}
+
+/// [`verify_conflict_semantic`] / [`verify_conflict_semantic_euf_prechecked`]
+/// reporting WHAT the accepted verification established.
+///
+/// `euf_precheck` is `Some(verdict)` when the caller already ran
+/// `verify_euf_conflict_classified` on exactly this conflict with the same
+/// support; an Euf-domain conflict then reuses that verdict instead of
+/// re-solving (the duplicate-skip), and every other domain verifies as usual.
+/// `scoped_recheck` is the query's [`ScopedRecheckGate`], if the caller has a
+/// memo.
+pub(crate) fn verify_conflict_semantic_classified(
+    conflict: &[TheoryLit],
+    terms: &TermStore,
+    support_axioms: &[TheoryLit],
+    euf_precheck: Option<ConflictSemanticVerdict>,
+    scoped_recheck: Option<&mut ScopedRecheckGate>,
+) -> Result<ConflictSemanticVerdict, VerificationError> {
+    verify_conflict_semantic_impl(
+        conflict,
+        terms,
+        support_axioms,
+        euf_precheck,
+        scoped_recheck,
+    )
 }
 
 fn verify_conflict_semantic_impl(
     conflict: &[TheoryLit],
     terms: &TermStore,
     support_axioms: &[TheoryLit],
-    euf_prechecked: bool,
-) -> Result<(), VerificationError> {
+    euf_precheck: Option<ConflictSemanticVerdict>,
+    scoped_recheck: Option<&mut ScopedRecheckGate>,
+) -> Result<ConflictSemanticVerdict, VerificationError> {
     // Pre-check: conflicts with contradictory literals (same term, opposite
     // values) are tautological as clauses — they cannot cause false-UNSAT.
     // The fresh-solver verifiers below assert each literal in sequence,
@@ -2742,7 +2801,8 @@ fn verify_conflict_semantic_impl(
                 if prev_val != lit.value {
                     // Same term appears with both true and false — tautological
                     // clause. Harmless but useless; skip semantic verification.
-                    return Ok(());
+                    // The literal set is contradictory by itself.
+                    return Ok(ConflictSemanticVerdict::Reproved);
                 }
             }
             seen.insert(lit.term, lit.value);
@@ -2757,21 +2817,19 @@ fn verify_conflict_semantic_impl(
             // these — the NIA solver's bounded enumeration is itself exhaustive
             // and sound (#7978).
             if conflict_involves_nonlinear(terms, conflict) {
-                return Ok(());
+                return Ok(ConflictSemanticVerdict::AcceptedUnchecked);
             }
             // Mixed int/real (LIRA) conflicts: neither the pure-LIA nor the
             // pure-LRA fresh re-solve is faithful (each interprets a single
-            // numeric sort and drops the `to_real` bridge coupling), so a SAT
-            // verdict would be a false positive on a valid bridged conflict.
-            // Skip, mirroring the nonlinear skip above (#6853 completeness).
+            // numeric sort and drops the `to_real` bridge coupling), so a
+            // solver's SAT verdict alone would be a false positive on a valid
+            // bridged conflict (#6853 completeness). They used to be accepted
+            // with no check at all, which let the LIA lane's 1-literal
+            // conflict refuting the VALID `(to_real c) != (to_real c) + 1/2`
+            // through. Re-verify: LRA-relaxation UNSAT reproves, an exact
+            // integral model refutes, anything else stays unchecked.
             if conflict_involves_int_real_mix(terms, conflict) {
-                tracing::debug!(
-                    lit_count = conflict.len(),
-                    "mixed int/real arithmetic conflict skipped semantic \
-                     re-verification (single-sort LIA/LRA verifiers are not \
-                     faithful for LIRA-bridged conflicts)"
-                );
-                return Ok(());
+                return verify_int_real_mix_conflict(conflict, terms);
             }
             // If any conflict literal involves Sort::Int, use the LIA verifier
             // which correctly handles integer-gap conflicts (e.g., x > 5 AND x < 6
@@ -2786,27 +2844,35 @@ fn verify_conflict_semantic_impl(
             }
         }
         TheoryDomain::Euf => {
-            if euf_prechecked {
+            if let Some(verdict) = euf_precheck {
                 // Caller already ran the identical EUF fresh-solver re-solve
                 // (see verify_conflict_semantic_euf_prechecked docs).
-                Ok(())
+                Ok(verdict)
             } else {
-                verify_euf_conflict(conflict, terms, support_axioms)
+                verify_euf_conflict_classified(conflict, terms, support_axioms)
             }
         }
-        // BV conflicts: re-verify via fresh BV solver (#4535).
-        TheoryDomain::BitVec => verify_bv_conflict_semantic(conflict, terms),
+        // BV conflicts: structural checks only (#4535), so an acceptance
+        // establishes well-formedness, not UNSAT.
+        TheoryDomain::BitVec => verify_bv_conflict_semantic(conflict, terms)
+            .map(|()| ConflictSemanticVerdict::AcceptedUnchecked),
         // String conflicts: structural checks only (#4535).
         TheoryDomain::String => {
             if conflict_involves_seq_sort(terms, conflict) {
                 verify_seq_conflict_semantic(conflict, terms)
             } else {
                 verify_string_conflict_structural(conflict, terms)
+                    .map(|()| ConflictSemanticVerdict::AcceptedUnchecked)
             }
         }
         // Mixed, Array, and Unknown domains: use Nelson-Oppen combined solver
         // to verify the conflict across theory boundaries (#8123).
-        TheoryDomain::Array => verify_mixed_conflict_semantic(conflict, terms, support_axioms),
+        TheoryDomain::Array => verify_mixed_conflict_semantic_with_gate(
+            conflict,
+            terms,
+            support_axioms,
+            scoped_recheck,
+        ),
         TheoryDomain::Unknown => {
             // #4535: Unknown-domain conflicts are NOT skipped — they are
             // delegated to the Nelson-Oppen combined verifier below, which
@@ -2819,7 +2885,12 @@ fn verify_conflict_semantic_impl(
                 "Unknown-domain theory conflict delegated to Nelson-Oppen \
                  combined verifier (#4535)"
             );
-            verify_mixed_conflict_semantic(conflict, terms, support_axioms)
+            verify_mixed_conflict_semantic_with_gate(
+                conflict,
+                terms,
+                support_axioms,
+                scoped_recheck,
+            )
         }
     }
 }

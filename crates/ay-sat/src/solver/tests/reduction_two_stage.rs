@@ -411,3 +411,31 @@ fn every_two_stage_counter_is_zero_with_the_arm_off() {
         "the OFF arm must not be able to emit two-stage telemetry"
     );
 }
+
+/// `--sat-two-stage-warm-scores-kissat`: with the policy still off, learned
+/// clauses are born at score 1 and the periodic decay runs; `used` keeps its
+/// glue-tier meaning. The default leaves the scores at 0 until the policy is on.
+#[test]
+fn warm_scores_are_kept_before_the_policy_is_on() {
+    let run = |warm: bool| {
+        let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            two_stage_warm_scores_kissat: Some(warm),
+            ..Default::default()
+        });
+        let mut solver = Solver::new(8);
+        assert!(!solver.two_stage_clause_management_enabled());
+        let idx = add_learned(&mut solver, 0, 3, 5);
+        let born = solver.arena.two_stage_score(idx);
+        solver.two_stage_note_bcp_use(ClauseRef(idx as u32));
+        let used = solver.arena.two_stage_score(idx);
+        solver.num_conflicts = TWO_STAGE_DECAY_INTERVAL;
+        solver.two_stage_periodic_decay_if_due();
+        (born, used, solver.arena.two_stage_score(idx))
+    };
+    assert_eq!(run(true), (1, 2, 1), "born 1, +1 per use, -1 per decay");
+    assert_eq!(
+        run(false),
+        (0, 0, 0),
+        "the default does not score before the policy"
+    );
+}

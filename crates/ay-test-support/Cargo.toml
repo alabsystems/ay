@@ -9,9 +9,15 @@ readme.workspace = true
 publish = false
 
 [dependencies]
+ay-sys.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+
+# `sigpipe::run_alone` gives its re-exec SIGPIPE's default action without
+# `unsafe` (this crate forbids it).
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

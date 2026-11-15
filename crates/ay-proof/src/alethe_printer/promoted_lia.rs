@@ -60,7 +60,10 @@ impl AlethePrinter<'_> {
         if crate::checker::validate_ground_evaluate_for_printer(self.terms, id, clause, 0, &[])
             .is_ok()
         {
-            return Some(format!("(step {id} {clause_str} :rule evaluate)"));
+            return Some(
+                self.format_negative_value_evaluate(id, clause, clause_str)
+                    .unwrap_or_else(|| self.format_evaluate_step(id, clause, clause_str)),
+            );
         }
 
         let [literal] = clause else {

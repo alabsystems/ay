@@ -9,6 +9,7 @@
 //! - `analysis`: backward trail analysis for conflicts and implied literals
 
 mod analysis;
+mod kissat;
 mod tier;
 
 use super::super::*;
@@ -33,7 +34,11 @@ impl Solver {
     /// REQUIRES: decision_level == 0
     /// ENSURES: decision_level == 0
     pub(in crate::solver) fn vivify(&mut self) -> bool {
-        let result = self.vivify_body();
+        let result = if self.cold.vivify_kissat && !self.cold.has_been_incremental {
+            self.vivify_body_kissat()
+        } else {
+            self.vivify_body()
+        };
         self.inproc_ctrl
             .vivify
             .reschedule(self.num_conflicts, VIVIFY_INTERVAL);
@@ -67,7 +72,9 @@ impl Solver {
         // AY_XP_VIV_PERMILLE (default-OFF measured-infra, see xp_probe_vivify.rs):
         // unset => shipping VIVIFY_EFFORT_PERMILLE, so the default budget is
         // byte-for-byte unchanged.
-        let viv_permille = vivify_permille().unwrap_or(VIVIFY_EFFORT_PERMILLE);
+        let viv_permille = vivify_permille()
+            .or_else(|| giant_inproc_permille(self.num_vars).map(|(vivify, _)| vivify))
+            .unwrap_or(VIVIFY_EFFORT_PERMILLE);
 
         if run_learned {
             // CaDiCaL-style tick-proportional budgeting (vivify.cpp:1744).
@@ -90,7 +97,9 @@ impl Solver {
                 (VivifyTier::LearnedTier2, budget_tier2),
                 (VivifyTier::LearnedOther, budget_other),
             ] {
+                let before = self.vivify_tier_snapshot();
                 let run = self.vivify_tier(tier, &noccs, tier_budget);
+                self.vivify_tier_account(tier, before);
                 if run.conflict {
                     return true;
                 }
@@ -118,7 +127,9 @@ impl Solver {
                 .stats
                 .irred_calls_inproc
                 .saturating_add(1);
+            let before = self.vivify_tier_snapshot();
             let run = self.vivify_tier(VivifyTier::Irredundant, &noccs, irred_budget);
+            self.vivify_tier_account(VivifyTier::Irredundant, before);
             if run.conflict {
                 return true;
             }
@@ -136,31 +147,6 @@ impl Solver {
             "BUG: vivify() did not restore decision level to 0"
         );
         false
-    }
-
-    /// Compute Jeroslow-Wang literal occurrence scores used to rank candidates.
-    fn vivify_literal_scores(&self) -> Vec<i64> {
-        // nocc(L) = sum over clauses C containing L of 2^(12 - min(|C|, 12))
-        // Reference: CaDiCaL vivify.cpp:1370-1384
-        let num_lits = self.num_vars * 2;
-        let mut noccs: Vec<i64> = vec![0; num_lits];
-        for idx in self.arena.active_indices() {
-            // Skip garbage-kept husks — deleted from the live formula but
-            // still yielded by active_indices() (heuristic accuracy only;
-            // wf_ff5991a1 Defect 2 hardening).
-            if self.arena.is_garbage_any(idx) {
-                continue;
-            }
-            let shift = 12i32 - self.arena.len_of(idx) as i32;
-            let score: i64 = if shift < 1 { 1 } else { 1i64 << shift };
-            for &lit in self.arena.literals(idx) {
-                let li = lit.index();
-                if li < num_lits {
-                    noccs[li] += score;
-                }
-            }
-        }
-        noccs
     }
 
     #[inline]
@@ -189,6 +175,46 @@ impl Solver {
     }
 
     #[inline]
+    /// Whether vivification keeps per-clause generations (`VIVIFY_TRIED_BIT`):
+    /// the test override, else `--sat-vivify-generations`, else
+    /// `--sat-inproc-nlogn-schedule`.
+    fn vivify_generations_enabled(&self) -> bool {
+        self.cold.vivify_generations.unwrap_or_else(|| {
+            let switches = ay_core::sat_ab_switches();
+            switches
+                .vivify_generations
+                .unwrap_or(switches.inproc_nlogn_schedule == Some(true))
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::solver) fn set_vivify_generations(&mut self, on: bool) {
+        self.cold.vivify_generations = Some(on);
+    }
+
+    /// `(examined, vivified)` so far, for the per-tier accounting.
+    fn vivify_tier_snapshot(&self) -> (u64, u64) {
+        let s = &self.inproc.vivifier.stats;
+        (
+            s.clauses_examined,
+            s.clauses_strengthened + s.clauses_satisfied + s.inline_subsumed + s.analysis_subsumed,
+        )
+    }
+
+    /// Attribute the examinations and vivifications since `before` to `tier`.
+    fn vivify_tier_account(&mut self, tier: VivifyTier, before: (u64, u64)) {
+        let (examined, vivified) = self.vivify_tier_snapshot();
+        let slot = match tier {
+            VivifyTier::LearnedCore => 0,
+            VivifyTier::LearnedTier2 => 1,
+            VivifyTier::LearnedOther => 2,
+            VivifyTier::Irredundant => 3,
+        };
+        let s = &mut self.inproc.vivifier.stats;
+        s.tier_examined[slot] += examined.saturating_sub(before.0);
+        s.tier_vivified[slot] += vivified.saturating_sub(before.1);
+    }
+
     fn vivify_clause_score(lits: &[Literal], noccs: &[i64]) -> i64 {
         let mut best = 0i64;
         let mut second = 0i64;
@@ -394,12 +420,17 @@ impl Solver {
         let scaled = self
             .irredundant_literal_count()
             .saturating_mul(VIVIFY_CONVERGE_TICKS_PER_LITERAL);
-        let deadline = ay_core::time::Instant::now()
-            + std::time::Duration::from_secs(VIVIFY_CONVERGE_WALL_SECS);
+        // No wall-clock net under `--sat-deterministic-inproc`: the tick
+        // budget and the round cap bound the loop, and the `None` arm keeps
+        // the solve deadline.
+        let deadline = (!self.deterministic_inproc()).then(|| {
+            ay_core::time::Instant::now()
+                + std::time::Duration::from_secs(VIVIFY_CONVERGE_WALL_SECS)
+        });
         (
             scaled.clamp(shipped_budget, VIVIFY_CONVERGE_MAX_TICKS),
             VIVIFY_CONVERGE_MAX_ROUNDS,
-            Some(deadline),
+            deadline,
         )
     }
 

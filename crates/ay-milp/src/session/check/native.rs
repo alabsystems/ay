@@ -97,7 +97,7 @@ fn finish_anchor(
         session.parity_infeasibility_certificate = None;
     }
     let solved = state.take_solved(session);
-    affine::finish_native_outcome(
+    let (outcome, proof) = affine::finish_native_outcome(
         outcome,
         &session.model,
         &solved,
@@ -105,5 +105,10 @@ fn finish_anchor(
         original_margin_tree_verified,
         parity_infeasibility_verified,
         session.affine_aggregation_verification,
-    )
+    );
+    session.admitted_infeasibility_evidence = outcome
+        .is_infeasible()
+        .then(|| proof.infeasibility_kind())
+        .flatten();
+    outcome
 }

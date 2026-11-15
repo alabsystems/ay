@@ -1,0 +1,18 @@
+pseudo-Boolean proof version 3.0
+% Regression test: all four of `d`, `c`, `n` and `m` narrowed an oversized divisor to `i64::MAX`
+% before dividing the degree of a `Cardinality`. That is faithful only while `|A| < i64::MAX`: at
+% `A = -i64::MAX` it yields `ceil(A / i64::MAX) = -1` where the rule's quotient is `0`, so the
+% checker stored `>= -1`, `--kernel-verify` rejected the valid proof over the divergence, and the
+% `e` lines below -- which write down what the rule really derives -- were rejected too.
+f 1 ;
+pol x1 x2 + 9223372036854775807 - 9223372036854775808 d ;
+e 1 x1 1 x2 >= 0 : 2 ;
+pol x1 x2 + 9223372036854775807 - 9223372036854775808 c ;
+e 1 x1 1 x2 >= 0 : 3 ;
+pol x1 x2 + 9223372036854775807 - 9223372036854775808 n ;
+e 1 x1 1 x2 >= 0 : 4 ;
+pol x1 x2 + 9223372036854775807 - 9223372036854775808 m ;
+e 1 x1 1 x2 >= 0 : 5 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

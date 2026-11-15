@@ -75,6 +75,263 @@ impl LiaFarkasTemplateSurface {
     }
 }
 
+/// Oracle backend of the Spacer lane (`DESIGN_spacer_pob_lemma_pipeline.md` §3.4).
+///
+/// `Session` (R4) routes the lane's queries through the per-predicate
+/// `PredicatePropSolver::check_lits` adapter (contract A-5); it degrades to
+/// `Legacy` while `PdrSolver::incremental_pdr_enabled()` is `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleBackend {
+    /// Non-incremental `SmtContext` verdicts + proxied assumption cores (D1).
+    Legacy,
+    /// Rung-5 Horn session through `check_lits` (R4).
+    Session,
+}
+
+/// Literal order of the Phase B drop round (`DESIGN` §4.2.3, §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropOrder {
+    /// Pins (`v = c`), then var–var equalities, then bounds, Booleans last.
+    PinsFirst,
+    /// The cube's own literal order (A/B row).
+    CubeOrder,
+}
+
+/// The Spacer-faithful POB/lemma lane (Workstream B; `DESIGN` §3.7).
+///
+/// Rung 2 by default (R3, the default flip; `ab_switches::ChcAbSwitches`).
+/// When `enabled` is false every other field is ignored and the solver is
+/// behaviourally identical to the legacy pipeline (lock L-V).
+/// `PdrSolver::new` derives `spacer_core` from `enabled` and the problem's
+/// sorts (arrays / BV / datatypes bypass the lane, §7.4).
+///
+/// Owner: WP-B1-S. Flags are cumulative rung presets (`rung`) with per-flag
+/// overrides from `ab_switches` (`--chc-spacer-*`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpacerLane {
+    /// Master switch (== B1's `spacer_core`); false ⇒ every other field ignored.
+    pub enabled: bool,
+    /// R2: `CubeMode::Free` (implicant of `T ∧ post`, no augmentation, minimiser off).
+    pub free_pob: bool,
+    /// R2: BJ-exact LIA bounds path + model-based LRA projection (default = `free_pob`).
+    pub mbp_exact_lia: bool,
+    /// R1: seed = `¬core` (proxied cores); off ⇒ seed = full cube (still lemma-always).
+    pub core_lemma: bool,
+    /// R1: Phase B/D inductive generalisation; off ⇒ lemma = `¬seed`.
+    pub ind_gen: bool,
+    /// R5: Phase C weakening rounds.
+    pub ind_gen_weaken: bool,
+    /// D1 confirmation of adopted cores; default true until the retirement metric holds.
+    pub confirm_cores: bool,
+    /// Oracle-call cap per derivation: 64 legacy / 256 session.
+    pub ind_gen_max_queries: usize,
+    /// Share of the remaining solve time one derivation may spend (0.4).
+    pub ind_gen_time_share: f32,
+    /// Phase D climb depth on the legacy backend (default 1).
+    pub eager_push_levels: usize,
+    /// QuickXplain switches to a linear loop below this literal count (16).
+    pub ddmin_min_lits: usize,
+    /// Phase B literal order.
+    pub drop_order: DropOrder,
+    /// R1: the two enumeration exits (`MAX_POINT_BLOCKS_PER_LEVEL`,
+    /// `MAX_LEVEL0_BLOCKED`) become counters instead of `Unknown`.
+    pub lift_caps: bool,
+    /// Sequential lanes only: `Unknown` after this many point-block lemmas per
+    /// level (default `None`; today's code uses 25).
+    pub enum_valve: Option<usize>,
+    /// Keep the already-blocked SMT pre-check (default false; measured in R1).
+    pub already_blocked_fastpath: bool,
+    /// R2 sub-flag: keep `false` lemmas in model extraction (§7.5 test).
+    pub false_lemma_in_model: bool,
+    /// Query backend (R4).
+    pub backend: OracleBackend,
+    /// Session `Unknown` → legacy verdict path.
+    pub session_fallback: bool,
+    /// The lane also runs on NONLINEAR problems (hyperedge clauses): every
+    /// predicate is blocked by the lane, a hyperedge clause's query conjoins
+    /// every body atom's frame (Spacer's may summaries), children come from
+    /// the free MBP constructor with the other atoms' summaries as context,
+    /// and reachability is tracked by concrete reach facts (Spacer's must
+    /// summaries), from which counterexample trees are built. Requires
+    /// `free_pob`. Off ⇒ nonlinear problems bypass the lane (the legacy
+    /// profile, `lane_bypassed.nonlinear`).
+    pub nonlinear: bool,
+}
+
+impl Eq for SpacerLane {}
+
+impl SpacerLane {
+    /// Everything off; the legacy pipeline (validators are pinned to this, S10).
+    pub const OFF: Self = Self {
+        enabled: false,
+        free_pob: false,
+        mbp_exact_lia: false,
+        core_lemma: false,
+        ind_gen: false,
+        ind_gen_weaken: false,
+        confirm_cores: true,
+        ind_gen_max_queries: 64,
+        ind_gen_time_share: 0.4,
+        eager_push_levels: 1,
+        ddmin_min_lits: 16,
+        drop_order: DropOrder::PinsFirst,
+        lift_caps: false,
+        enum_valve: None,
+        already_blocked_fastpath: false,
+        false_lemma_in_model: false,
+        backend: OracleBackend::Legacy,
+        session_fallback: true,
+        nonlinear: false,
+    };
+
+    /// Cumulative rung presets (`DESIGN` §4.5 / §8.4).
+    ///
+    /// 0 = OFF; 1 = `enabled, core_lemma, ind_gen, confirm_cores, lift_caps,
+    /// false_lemma_in_model`; 2 = + `free_pob, mbp_exact_lia, nonlinear`; 3 = the same
+    /// flags (R3 is the default flip, a config-selection concern); 4 = +
+    /// `backend = Session` (256 queries); 5 = + `ind_gen_weaken`. Values above
+    /// 5 clamp to 5.
+    ///
+    /// `false_lemma_in_model` is on from rung 1 (amendment to §7.5, WP-S
+    /// 2026-09-23): every `false` lemma of the lane is backed by an observed
+    /// UNSAT of all defining clauses of its predicate (Phase 0 on the empty
+    /// seed), so `false` at level k is the proven fact "the predicate has no
+    /// state reachable in ≤ k steps". Filtering it out of the frame
+    /// hypothesis the model is built from (#3121, a legacy guard against
+    /// UNPROVEN `false` lemmas) interprets an unreachable predicate as `true`
+    /// and makes every fixed-point model fail its query clause — HOLA-44's 47
+    /// demotions (`spacer_false_lemma_fixed_point` locks the fix).
+    #[must_use]
+    pub fn rung(n: u8) -> Self {
+        let mut lane = Self::OFF;
+        if n == 0 {
+            return lane;
+        }
+        lane.enabled = true;
+        lane.core_lemma = true;
+        lane.ind_gen = true;
+        lane.confirm_cores = true;
+        lane.lift_caps = true;
+        lane.false_lemma_in_model = true;
+        if n >= 2 {
+            lane.free_pob = true;
+            lane.mbp_exact_lia = true;
+            lane.nonlinear = true;
+        }
+        if n >= 4 {
+            lane.backend = OracleBackend::Session;
+            lane.ind_gen_max_queries = 256;
+        }
+        if n >= 5 {
+            lane.ind_gen_weaken = true;
+        }
+        lane
+    }
+
+    /// The rung this flag set corresponds to (for the verbose/trace header).
+    #[must_use]
+    pub fn rung_label(&self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        if self.ind_gen_weaken {
+            5
+        } else if self.backend == OracleBackend::Session {
+            4
+        } else if self.free_pob {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Normalise an overridden flag set.
+    ///
+    /// `enabled == false` ⇒ `OFF` (every other field ignored); `lift_caps`
+    /// is refused without `enabled && core_lemma` (the caps are the legacy
+    /// pipeline's only defence against enumeration); `mbp_exact_lia` follows
+    /// `free_pob` unless set explicitly (callers pass the post-override set).
+    #[must_use]
+    pub fn validate(mut self, verbose: bool) -> Self {
+        if !self.enabled {
+            if verbose && self != Self::OFF {
+                safe_eprintln!("PDR-SPACER: lane disabled; ignoring the other spacer flags");
+            }
+            return Self::OFF;
+        }
+        if self.lift_caps && !self.core_lemma {
+            if verbose {
+                safe_eprintln!(
+                    "PDR-SPACER: refusing lift_caps without core_lemma (enumeration exits stay)"
+                );
+            }
+            self.lift_caps = false;
+        }
+        if self.ind_gen_max_queries == 0 {
+            self.ind_gen_max_queries = 1;
+        }
+        if self.nonlinear && !self.free_pob {
+            // The nonlinear lane builds every child with the free MBP
+            // constructor (the other body atoms' summaries are its context).
+            if verbose {
+                tracing::info!("PDR-SPACER: refusing nonlinear without free_pob");
+            }
+            self.nonlinear = false;
+        }
+        if !(0.0..=1.0).contains(&self.ind_gen_time_share) {
+            self.ind_gen_time_share = 0.4;
+        }
+        self
+    }
+
+    /// The lane selected by the process-wide A/B switches
+    /// (`--chc-spacer-rung N`, default 2, + per-flag overrides on top of that
+    /// rung). Rung 0 is the legacy pipeline whatever the overrides say.
+    #[must_use]
+    pub(crate) fn from_ab_switches(switches: &crate::ab_switches::ChcAbSwitches) -> Self {
+        let mut lane = Self::rung(switches.spacer_rung);
+        if !lane.enabled {
+            return Self::OFF;
+        }
+        if let Some(v) = switches.spacer_free_pob {
+            lane.free_pob = v;
+            lane.mbp_exact_lia = v;
+        }
+        if let Some(v) = switches.spacer_core_lemma {
+            lane.core_lemma = v;
+        }
+        if let Some(v) = switches.spacer_ind_gen {
+            lane.ind_gen = v;
+        }
+        if let Some(v) = switches.spacer_confirm_cores {
+            lane.confirm_cores = v;
+        }
+        if let Some(v) = switches.spacer_lift_caps {
+            lane.lift_caps = v;
+        }
+        if let Some(v) = switches.spacer_nonlinear {
+            lane.nonlinear = v;
+        }
+        if let Some(v) = switches.spacer_session {
+            lane.backend = if v {
+                OracleBackend::Session
+            } else {
+                OracleBackend::Legacy
+            };
+            if v {
+                lane.ind_gen_max_queries = lane.ind_gen_max_queries.max(256);
+            }
+        }
+        lane.validate(false)
+    }
+}
+
+impl Default for SpacerLane {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
 /// PDR solver configuration
 ///
 /// Techniques are enabled by default (except where disabled due to known
@@ -135,7 +392,35 @@ pub struct PdrConfig {
     pub(crate) give_up_on_stuck: bool,
     /// Wall-clock timeout for the entire solve() call (including startup).
     /// When set, the solver returns Unknown if this deadline is exceeded.
+    /// Under an [`effort`](Self::effort) it is a backstop: a run it ends
+    /// publishes `Deadline` as its stop, never the count's `Rlimit`. Until P4a
+    /// slices 9 and 10 it also still sizes clocks the search meets on its way
+    /// (the case split's deadline and branch budgets, the thread's solve
+    /// deadline that clamps each query's slice; the development design notes
+    /// §14).
     pub solve_timeout: Option<std::time::Duration>,
+    /// Finite per-context term-store ceiling, intersected with inherited caps.
+    /// Not aggregate PDR/AST/model memory or a hard process-RSS reservation.
+    pub(crate) memory_budget: Option<usize>,
+    /// The proof run's tick budget B, in ay-sat search ticks (the development design notes
+    /// DR-37: one tick budget, every other bound a draw on it; P4a slice 8,
+    /// the development design notes §14). `None`, the default: the run is as it
+    /// was, and its meter decides nothing.
+    ///
+    /// Read by the proof-run entry points (`engines::solve_pdr_proof` and its
+    /// forms, `engines::prove_external_invariant_model`). With `Some(B)` the
+    /// run is a GuardTree node allotted B: every SAT solve, SMT entry, DPLL(T)
+    /// round, PDR iteration and processed obligation is charged to it, the
+    /// run stops (`unknown`) once it has spent B, and the frame, iteration and
+    /// obligation caps are not armed. Its sub-checks stay on ay-chc's own
+    /// counted path (no executor route), no BMC runs in it (the bounded unsafe
+    /// precheck, the acyclic certificate, a counterexample's bounded replay:
+    /// `BmcSolver::closed_under_effort`), the frame-stall window is measured
+    /// in ticks, and a result decided within B is never discarded for a clock
+    /// that passed. The wall clocks this field does not yet remove (the
+    /// per-query slices, the case-split and validation clocks) stay; they are
+    /// P4a slices 9 and 10's. `Some(0)` stops at the first charge.
+    pub effort: Option<u64>,
     /// Disable PDR's internal array-argument scalarization.
     ///
     /// Portfolio validation uses backtranslated models over the original
@@ -361,11 +646,22 @@ pub struct PdrConfig {
     /// (`verify_inductiveness_or_fallback` → `is_inductive_blocking`) is
     /// unchanged.
     pub(crate) interpolant_first_blocking: bool,
+    /// Spacer-faithful POB/lemma lane (Workstream B, `DESIGN` §3.7). The
+    /// `Default` reads the process-wide A/B switches (`--chc-spacer-rung`,
+    /// rung 2 unless the CLI asked otherwise); validators pin
+    /// `SpacerLane::OFF` explicitly (S10) so the lane never reaches them.
+    pub(crate) spacer: SpacerLane,
     /// Route this solver's `check_sat` calls executor-first, skipping the
     /// internal-loop slice that punts ~23% on wide-Bool transition-system
     /// queries (policy point smt/check_sat/mod.rs). Per-solver option; the
     /// global default keeps the internal-first slice.
     pub(crate) executor_first_check_sat: bool,
+    /// SMT lane for this solver's context (Rung 0, CHC-COMP 2026). Default
+    /// `Verification`: every validator that builds a `PdrConfig` with
+    /// `strict_proofs: true, ..Default::default()` stays on the trusted lane
+    /// without touching this field. Engine launch sites (portfolio
+    /// `run_engine`, the adaptive LIA/Farkas solo run) set `Search`.
+    pub(crate) smt_lane: crate::smt::SmtLane,
 }
 
 impl Default for PdrConfig {
@@ -390,6 +686,8 @@ impl Default for PdrConfig {
             external_cancellation_token: None,
             give_up_on_stuck: false, // OFF: opt-in for schedulers with another lane (item 5a)
             solve_timeout: None,
+            memory_budget: None,
+            effort: None,
             disable_array_scalarization: false,
             array_scalarization_extra_indices: Vec::new(),
             array_scalarization_keep_const_keys_with_symbolic_accesses: false,
@@ -431,6 +729,9 @@ impl Default for PdrConfig {
             skip_startup_discovery: false,
             interpolant_first_blocking: false,
             executor_first_check_sat: false,
+            // Workstream B lane: rung 2 unless `--chc-spacer-rung` says (§3.7).
+            spacer: SpacerLane::from_ab_switches(&crate::ab_switches::get()),
+            smt_lane: crate::smt::SmtLane::Verification,
         }
     }
 }
@@ -553,11 +854,24 @@ impl PdrConfig {
     /// Portfolio runs PDR with both negated_equality_splits on and off (#491).
     /// This escapes local maxima where one config helps dillig-style benchmarks
     /// but hurts multi-predicate problems, and vice versa.
+    ///
+    /// On NONLINEAR problems this variant keeps the legacy technique profile
+    /// (`without_nonlinear_lane`): wherever the portfolio runs it next to
+    /// `default()`, the nonlinear Spacer lane and the legacy pipeline race.
     pub fn portfolio_variant_with_splits() -> Self {
         Self {
             use_negated_equality_splits: true,
             ..Self::default()
         }
+        .without_nonlinear_lane()
+    }
+
+    /// Builder: nonlinear problems bypass the Spacer lane (legacy profile);
+    /// linear problems are unaffected.
+    #[must_use]
+    pub fn without_nonlinear_lane(mut self) -> Self {
+        self.spacer.nonlinear = false;
+        self
     }
 
     /// Spacer-mode portfolio PDR variant (inc-12).
@@ -595,6 +909,58 @@ impl PdrConfig {
             executor_first_check_sat: true,
             ..Self::default()
         }
+        // The second portfolio PDR: legacy on nonlinear problems, racing the
+        // nonlinear lane of `default()` (see `portfolio_variant_with_splits`).
+        .without_nonlinear_lane()
+    }
+
+    /// Spacer-core profile (Workstream B, `DESIGN` §3.7 / §4.5).
+    ///
+    /// Turns the lane on over `base` (rung 1 when `base.spacer` is OFF, else
+    /// `base.spacer` as is) with Spacer's defaults: `push_pob=false`,
+    /// `restarts=false`, `global=false` (`use_may_pobs=false`,
+    /// `use_convex_closure=false`) and MBP on. Every other field of `base`
+    /// is kept. Used by the portfolio roster lane (R1–R2) and, from R3, as
+    /// the default PDR config for linear LIA/LRA/Bool problems.
+    #[must_use]
+    pub fn spacer_core_profile(base: Self) -> Self {
+        let spacer = if base.spacer.enabled {
+            base.spacer
+        } else {
+            SpacerLane::rung(1)
+        };
+        let mut config = Self { spacer, ..base };
+        config.apply_spacer_profile_flags();
+        config
+    }
+
+    /// The technique toggles of the Spacer profile (`DESIGN` §3.7): no POB
+    /// push, no Luby restarts, no global guidance (may-pobs, convex closure),
+    /// MBP on. `PdrSolver::new` applies them whenever the lane actually runs
+    /// (`spacer_core`), so `--chc-spacer-rung N` — which reaches every PDR
+    /// config through `PdrConfig::default()` — gets the profile, not only the
+    /// lane flags. A problem the lane bypasses (arrays / BV / datatypes) keeps
+    /// its config untouched (lane OFF ≡ before, lock L-V).
+    pub(crate) fn apply_spacer_profile_flags(&mut self) {
+        self.use_pob_push = false;
+        self.use_restarts = false;
+        self.use_may_pobs = false;
+        self.use_convex_closure = false;
+        self.use_mbp = true;
+    }
+
+    /// Builder: set the Spacer lane flags (validated; `enabled == false` ⇒ OFF).
+    #[must_use]
+    pub fn with_spacer(mut self, lane: SpacerLane) -> Self {
+        self.spacer = lane.validate(self.verbose);
+        self
+    }
+
+    /// Builder: put this solver's SMT context on `lane` (engines: `Search`).
+    #[must_use]
+    pub fn with_smt_lane(mut self, lane: crate::smt::SmtLane) -> Self {
+        self.smt_lane = lane;
+        self
     }
 
     /// Builder: set maximum number of frames.
@@ -644,11 +1010,53 @@ impl PdrConfig {
         self
     }
 
+    /// Builder: set the proof run's tick budget ([`Self::effort`]).
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<u64>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Whether the search runs under a budget: an effort, a cancellation
+    /// token or a solve timeout. It arms the main loop's per-query cap and the
+    /// convergence monitor. Under an effort it is true whether a backstop
+    /// clock is passed or not, so the search does not depend on the backstop.
+    pub(crate) fn search_is_budgeted(&self) -> bool {
+        self.effort.is_some() || self.cancellation_token.is_some() || self.solve_timeout.is_some()
+    }
+
+    /// The count caps a run under an effort does not arm (DR-37: a count
+    /// besides B is a draw on it or is removed): the frame, iteration and
+    /// obligation caps, and with them the obligation queue's (2 x
+    /// `max_obligations`) and the level-3 frame raise (`max(200)`). Each
+    /// PDR iteration and processed obligation costs a tick of B instead.
+    pub(crate) fn disarm_count_caps(&mut self) {
+        self.max_frames = usize::MAX;
+        self.max_iterations = usize::MAX;
+        self.max_obligations = usize::MAX;
+    }
+
     /// Builder: set cancellation token for cooperative stopping.
     #[must_use]
     pub fn with_cancellation_token(mut self, token: Option<CancellationToken>) -> Self {
         self.cancellation_token = token;
         self
+    }
+
+    /// Bound every PDR/validation SMT context's term store in bytes.
+    ///
+    /// A zero ceiling refuses solving/validation. Nested caller ceilings are
+    /// intersected; None does not erase an inherited cap. This is neither a
+    /// sum across contexts nor a bound on all PDR or process allocations.
+    #[must_use]
+    pub fn with_memory_budget(mut self, bytes: Option<usize>) -> Self {
+        self.memory_budget = bytes;
+        self
+    }
+
+    /// The requested per-context term ceiling, before inherited intersection.
+    pub fn memory_budget(&self) -> Option<usize> {
+        self.memory_budget
     }
 
     /// Cancellation token to pass to nested engines without turning an

@@ -2,9 +2,51 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+/// [`solve_or_fail_closed_and_maybe_get_proof`] for a fixture whose contract
+/// admits the printer DECLINING the spelling: an UNSAT whose `(get-proof)` is
+/// the honest `UNVERIFIABLE PROOF` refusal (no document, no `trust` fallback)
+/// returns `None` like an UNKNOWN does. A checked verdict is published
+/// whether or not its document renders (presentation never decides it), so
+/// for such a fixture the decline is the fail-closed outcome.
+#[cfg(test)]
+fn solve_and_maybe_get_printed_proof(problem: &str, label: &str) -> Option<String> {
+    let script = format!("(set-option :produce-proofs true)\n{problem}\n");
+    let commands = parse(&script).expect("parse SMT-LIB script");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute SMT-LIB script");
+    match outputs.last().map(String::as_str) {
+        Some("unknown") => None,
+        Some("unsat") => {
+            let get_proof = parse("(get-proof)").expect("parse get-proof");
+            let proof = exec
+                .execute_all(&get_proof)
+                .expect("export proof after UNSAT")
+                .last()
+                .cloned()
+                .expect("proof output");
+            if proof.contains("(error \"UNVERIFIABLE PROOF") {
+                assert!(
+                    !proof.contains("(step "),
+                    "{label}: a declined document must not ship steps:\n{proof}"
+                );
+                return None;
+            }
+            assert!(
+                proof.contains("(assume ") || proof.contains("(step "),
+                "{label}: proof output must contain Alethe commands:\n{proof}"
+            );
+            Some(proof)
+        }
+        status => panic!("{label}: expected UNSAT or fail-closed UNKNOWN, got {status:?}"),
+    }
+}
+
 /// A negated ITE condition canonicalizes by swapping branch order. Any proof
 /// that is still published must honor the authored positional surface when
 /// checked independently; declining the unsupported spelling is also sound.
+/// Since the unrewritten authored replay certifies the rhs row (strictly
+/// checked, so `unsat` is published), "declining" is the printer's honest
+/// refusal of that document rather than an `unknown` verdict.
 #[test]
 #[timeout(60_000)]
 fn test_carcara_negated_condition_ite_is_valid_or_fails_closed() {
@@ -22,7 +64,7 @@ fn test_carcara_negated_condition_ite_is_valid_or_fails_closed() {
         ),
     ] {
         let problem = arithmetic_ite_nonnegative_problem("", definition, "(assert (< I 0))");
-        let Some(proof) = solve_or_fail_closed_and_maybe_get_proof(&problem, label) else {
+        let Some(proof) = solve_and_maybe_get_printed_proof(&problem, label) else {
             continue;
         };
         assert!(!proof.contains(":rule trust"), "{label}: {proof}");
@@ -167,8 +209,7 @@ fn test_carcara_trust_free_composed_authored_roots() {
             // left-hand let before the `let` rule can validate it, so exercise
             // that rule in the ordinary parser mode, just like the dedicated
             // let-bridge regression below.
-            let (valid, diagnostic) =
-                exact_carcara_verdict(&carcara, carcara_problem, &proof);
+            let (valid, diagnostic) = exact_carcara_verdict(&carcara, carcara_problem, &proof);
             assert!(
                 valid,
                 "{label}: source-exact composed-root proof must be trust-free \
@@ -245,9 +286,11 @@ fn test_carcara_store_permutation_binder_collision_stays_holey() {
         !proof.contains("(choice ((x "),
         "{label}: no witness may capture the user symbol x:\n{proof}"
     );
-    assert!(
-        run_carcara(&carcara, label, problem, &proof),
-        "{label}: the honest hole must leave the document checkable (holey), never invalid"
+    let verdict = carcara_verdict_without_allowances(&carcara, label, problem, &proof);
+    assert_eq!(
+        verdict,
+        CarcaraVerdict::Holey,
+        "{label}: holey, not invalid"
     );
 
     // Control: the SAME schema over symbols that do not collide with the
@@ -508,8 +551,18 @@ fn crux_step_rules(proof: &str) -> Vec<String> {
 fn test_qf_bv_unsigned_compare_duality_below_ite_congruence() {
     let carcara = find_carcara();
     for (operator, dual, non_strict_rule, strict_rule) in [
-        ("bvuge", "bvult", ":rule pbblast_bvuge", ":rule pbblast_bvult"),
-        ("bvule", "bvugt", ":rule pbblast_bvule", ":rule pbblast_bvugt"),
+        (
+            "bvuge",
+            "bvult",
+            ":rule pbblast_bvuge",
+            ":rule pbblast_bvult",
+        ),
+        (
+            "bvule",
+            "bvugt",
+            ":rule pbblast_bvule",
+            ":rule pbblast_bvugt",
+        ),
     ] {
         // The three widths `run_guard_carrier_canary` actually requests.
         for width in [8u32, 32, 64] {
@@ -595,13 +648,59 @@ fn test_qf_bv_unsigned_compare_duality_below_ite_congruence() {
     }
 }
 
-/// LOCK-STEP regression: the SIGNED duality `(bvsge a b) = (not (bvslt a b))` is
-/// just as TRUE as the unsigned one, and AY decides it, but Carcara's
-/// pseudo-Boolean rules for signed comparisons carry an extra negative-weight
-/// sign summand — a DIFFERENT derivation this printer does not emit. The leaf
-/// table must therefore decline it, leaving an honest `hole` that keeps the
-/// document structurally checkable, rather than a step named after an inference
-/// the printed text does not license.
+/// CONTRACT CORRECTED 2026-09-22 — this test's name is kept deliberately (a
+/// rename would make the oracle disappear from every name-keyed ledger), but
+/// the contract below is no longer "leave a hole". It is the STRICTLY
+/// STRONGER one: the identity must be COMPLETELY derived, carrying no `hole`
+/// and no `trust`, and the REAL pinned Carcara must re-derive every step with
+/// NO `--allowed-rules` escape hatch.
+///
+/// WHY THE ORIGINAL CONTRACT WAS STALE. It read: Carcara's pseudo-Boolean
+/// rules for signed comparisons carry an extra negative-weight sign summand —
+/// "a DIFFERENT derivation this printer does not emit" — so the leaf table
+/// must decline and leave an honest `hole`. The first half is still exactly
+/// right. The second half went stale at ay `27ff4ecbd` ("Export independently
+/// checked signed comparison circuits"), which taught the general circuit lane
+/// to emit precisely that derivation:
+/// `alethe_printer/bv_packed/circuit/order.rs::signed_order` prints
+/// `pbblast_bvslt` / `pbblast_bvsge` over the low-bit sum plus the
+/// `(* 2^msb ((_ @int_of msb) ..))` sign summand, and `order_duality` checks
+/// the strict/non-strict duality with `la_generic`. That commit's own report
+/// records it updating one other hole-expecting test; this one, living in
+/// ay-dpll's integration target rather than the proof library, was missed.
+///
+/// MEASURED, ay cc1bc0a305023de643db159abf8143ae0e785287, carcara 1.1.0
+/// [git 9a352ee]: the published 671-line document answers `valid` with no
+/// `--allowed-rules`, and two tamper controls — retargeting its
+/// `bitblast_equal` step to `bitblast_or`, and dropping a premise from the
+/// final resolution — both answer `invalid`, so that `valid` is a real check
+/// and not vacuous acceptance.
+///
+/// SCOPE. Both corrected tests hand Carcara the PROBLEM'S OWN BYTES rather
+/// than `published_assumption_scope`'s synthesized scope, which is stronger:
+/// Carcara then also has to match every top-level `assume` against a real
+/// assertion of the problem. It is additionally REQUIRED here, because this is
+/// the first document reaching that helper whose `assume` steps include
+/// SUBPROOF assumptions — `(assume t1.packed.564 (not __ay_packed_1_0!532))`,
+/// naming a PROOF-LOCAL `define-fun`. `extract_assume_terms` does not
+/// distinguish a subproof assumption from a top-level one, so the helper
+/// hoists that name into the problem file, where it does not exist, and pinned
+/// Carcara answers `invalid` with `parser error: identifier
+/// '__ay_packed_1_0!532' is not defined` — a defect of the SCOPE, not of the
+/// document. The helper is left alone here: its other callers are unaffected
+/// and repairing it is a separate change.
+///
+/// The ORIGINAL INTENT is kept and sharpened rather than dropped: the UNSIGNED
+/// lowering still must not fire on a signed comparison, so no `pbblast_bvult`
+/// / `bvule` / `bvugt` / `bvuge` may appear — only the signed rules that carry
+/// the sign summand. And the property this test exists for — AY must never
+/// present a bit-blasted residue as though the external checker could
+/// discharge it — is now asserted DIRECTLY by the checker's own trust-free
+/// verdict, which strictly implies the old assertion it replaces (`hole` plus
+/// a `run_carcara` that passes `--allowed-rules trust`, under which the hole
+/// step itself was never checked). A regression in either direction fails it:
+/// falling back to a hole trips the no-`hole` assertion, and emitting an
+/// undischargeable residue makes pinned Carcara answer `invalid`.
 #[test]
 #[timeout(120_000)]
 fn test_signed_compare_duality_remains_an_honest_hole() {
@@ -616,35 +715,60 @@ fn test_signed_compare_duality_remains_an_honest_hole() {
          (check-sat)\n"
     );
     let proof = solve_unsat_and_get_proof(&problem, label);
+    for unsigned in [
+        ":rule pbblast_bvult",
+        ":rule pbblast_bvule",
+        ":rule pbblast_bvugt",
+        ":rule pbblast_bvuge",
+    ] {
+        assert!(
+            !proof.contains(unsigned),
+            "{label}: the unsigned lowering ({unsigned}) must not fire on a \
+             signed comparison:\n{proof}"
+        );
+    }
     assert!(
-        !proof.contains(":rule pbblast_"),
-        "{label}: the unsigned lowering must not fire on a signed comparison:\n{proof}"
-    );
-    assert!(
-        proof.contains(":rule hole"),
-        "{label}: the uncovered identity must stay an honest hole:\n{proof}"
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "{label}: the signed duality must be derived, never carried on an \
+         unchecked step:\n{proof}"
     );
     let Some(carcara) = find_carcara() else {
         return;
     };
-    let scope = published_assumption_scope(declarations, &proof);
     assert!(
-        run_carcara(&carcara, label, &scope, &proof),
-        "{label}: an honest hole must leave the rest of the document checkable, \
-         never make it invalid"
+        run_carcara_trust_free(&carcara, label, &problem, &proof),
+        "{label}: every step of the signed derivation must be re-derived by \
+         the pinned checker with NO allowed trust, against the problem's own \
+         bytes"
     );
 }
 
-/// NEGATIVE regression for the per-operator bit-blast lowering.
+/// POSITIVE regression for the per-operator bit-blast lowering.
 ///
-/// `(bvxor x x) = #x00` is a bit-vector identity AY certifies natively and
-/// Carcara CAN bit-blast the operator (`bitblast_xor`), but the bit-level
-/// residue is `(xor p p) = false` and no rule in the pinned build discharges
-/// that in one step (`bool_simplify`, `evaluate`, `aci_simp`, `equiv_simplify`
-/// and `not_simplify` were all measured to leave the term unchanged). So the
-/// lowering MUST decline: the step stays an honest `hole` and the document
-/// stays structurally checkable, rather than becoming `invalid` under a rule
-/// name whose inference this is not.
+/// CONTRACT CORRECTED 2026-09-22 — the name is kept deliberately, for the same
+/// reason as the test above, but the contract is the STRICTLY STRONGER one:
+/// `(bvxor x x) = #x00` must be COMPLETELY derived, with no `hole` and no
+/// `trust`, and the REAL pinned Carcara must re-derive every step with NO
+/// `--allowed-rules` escape hatch.
+///
+/// WHY THE ORIGINAL CONTRACT WAS STALE. It read: the bit-level residue of this
+/// identity is `(xor p p) = false` and "no rule in the pinned build discharges
+/// that in ONE STEP (`bool_simplify`, `evaluate`, `aci_simp`, `equiv_simplify`
+/// and `not_simplify` were all measured to leave the term unchanged)", so the
+/// lowering MUST decline to an honest `hole`. That measurement is still true
+/// and the conclusion does not follow from it: a one-step simplification is
+/// not the only way to discharge the residue. Since ay `e5f1a24d3` the general
+/// circuit lane (`format_bv_circuit_refutation`, last in
+/// `format_checked_bv_bitblast_lowering`'s dispatch) covers `bvxor`. It does
+/// emit `bitblast_xor`, and then discharges `(xor p p)` through that gate's
+/// own Tseitin clauses (`xor_pos1` / `xor_pos2` reduced by `contraction`) and
+/// a transported resolution refutation — never a one-step simplify. The
+/// per-operator leaf table `decode_idempotent_bv_gate` still carries no
+/// `bvxor` arm, which is what the original test was really guarding.
+///
+/// MEASURED, ay cc1bc0a305023de643db159abf8143ae0e785287, carcara 1.1.0
+/// [git 9a352ee]: the published 118-line document answers `valid` with no
+/// `--allowed-rules`, and the same two tamper controls answer `invalid`.
 #[test]
 #[timeout(120_000)]
 fn test_carcara_bvxor_self_cancellation_remains_an_honest_hole() {
@@ -658,18 +782,14 @@ fn test_carcara_bvxor_self_cancellation_remains_an_honest_hole() {
                    (check-sat)\n";
     let proof = solve_unsat_and_get_proof(problem, label);
     assert!(
-        !proof.contains(":rule bitblast_"),
-        "{label}: the per-operator lowering must not fire on an identity whose \
-         bit-level residue Carcara cannot discharge:\n{proof}"
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "{label}: the identity must be derived, never carried on an unchecked \
+         step:\n{proof}"
     );
     assert!(
-        proof.contains(":rule hole"),
-        "{label}: the uncovered identity must stay an honest hole:\n{proof}"
-    );
-    let scope = published_assumption_scope("(declare-const x (_ BitVec 8))\n", &proof);
-    assert!(
-        run_carcara(&carcara, label, &scope, &proof),
-        "{label}: an honest hole must leave the rest of the document checkable, \
-         never make it invalid"
+        run_carcara_trust_free(&carcara, label, problem, &proof),
+        "{label}: every step of the bit-blasted residue must be re-derived by \
+         the pinned checker with NO allowed trust, against the problem's own \
+         bytes"
     );
 }

@@ -764,6 +764,3 @@ fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

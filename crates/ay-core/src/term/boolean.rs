@@ -17,6 +17,19 @@ impl TermStore {
             "BUG: mk_not expects Bool, got {:?}",
             self.sort(arg)
         );
+        // A registered function keeps its interpretation even when it shares
+        // a connective's spelling. De Morgan would either reinterpret that
+        // source function or introduce its shadowed opposite head. Old memo
+        // entries (including ITE push-downs) may predate registration, so do
+        // not consult them in this namespace. A structural Not is interned
+        // directly: no recursive scan, cache reset, or renewed work budget.
+        if self.is_declared_function("and") || self.is_declared_function("or") {
+            return match self.get(arg) {
+                TermData::Not(inner) => *inner,
+                TermData::Const(Constant::Bool(value)) => self.mk_bool(!*value),
+                _ => self.mk_not_raw(arg),
+            };
+        }
         // Memoize: `mk_not` recursively pushes De Morgan / ITE-negation down, so
         // without a cache a shared (let-bound) subterm reached through many
         // negation contexts is re-normalized once per occurrence — the

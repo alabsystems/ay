@@ -21,7 +21,7 @@
 # process-wide main context across suites would collide when two modules declare
 # the same name at different sorts. A per-test context sidesteps that entirely.
 #
-# Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_introspect.py -v
+# Run:  targo --unverified build -p ay-ffi  &&  pytest bindings/python/tests/test_introspect.py -v
 
 import pytest
 

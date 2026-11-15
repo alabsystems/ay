@@ -22,6 +22,7 @@
 //! - `lia_eval`: LIA model evaluation and recovery helpers
 //! - `solve_harness_helpers`: Free helpers for assertion flattening and source tracking
 //! - `model_helpers`: Model storage and proof building
+//! - `sat_stop`: One query's stop, handed to a bit-blast SAT solver
 
 pub(in crate::executor) mod bv;
 mod bv_axioms_array;
@@ -30,7 +31,6 @@ mod bv_axioms_non_bv;
 mod bv_cegar_array;
 pub(in crate::executor) mod bv_cnf_dump;
 mod bv_config;
-mod bv_delayed_ext;
 mod bv_encoding;
 mod bv_eval;
 mod bv_eval_bool;
@@ -38,25 +38,38 @@ mod bv_finite_array;
 mod bv_incremental;
 mod bv_model;
 mod combined;
+pub(in crate::executor) use combined::bv_lia_aux_vars;
 mod euf;
+mod ext_read_witness;
 #[cfg(test)]
 mod incremental_conflict_gate_tests;
 mod incremental_scope;
+mod integer_separation;
 pub(crate) use euf::reachable_term_set;
 pub(in crate::executor) use incremental_scope::ProofCheckpointBudget;
 mod fp;
+pub(in crate::executor) use fp::{FpNamespace, FpStop, MemoryPollGate};
 mod fp_model;
 // pub(in crate::executor): the model-validation pipeline re-runs the #A1
 // LIA reconciliation passes after post-validation repair (#A1-repair-resync).
 pub(in crate::executor) mod lia;
 mod lia_eval;
 mod lra;
+pub(in crate::executor) use lra::preprocess_lra;
+mod congruence_bail;
 mod map;
+pub(crate) use congruence_bail::CongruenceBail;
+#[cfg(test)]
+pub(crate) use congruence_bail::TestCongruenceBail;
 mod model_helpers;
+#[cfg(test)]
+pub(in crate::executor) use model_helpers::slow_host;
+pub(in crate::executor) use model_helpers::ChainSpend;
 mod multiset;
 mod nra;
 mod propositional;
 mod rdl;
+mod sat_stop;
 mod seq;
 mod set;
 mod skolem_cache;
@@ -153,6 +166,8 @@ pub(crate) struct ArrayExtWitnessCache {
     active: ay_core::kani_compat::DetHashMap<ArrayExtWitnessKey, ArrayExtWitnessIdentity>,
     retired: ay_core::kani_compat::DetHashMap<TermId, ArrayExtWitnessIdentity>,
     generated_clauses: ay_core::kani_compat::DetHashMap<TermId, Vec<ArrayExtWitnessBinding>>,
+    /// Shared read witness per index sort (`ext_read_witness.rs`).
+    shared_read: ay_core::kani_compat::DetHashMap<Sort, ArrayExtWitnessIdentity>,
 }
 
 impl ArrayExtWitnessCache {
@@ -164,6 +179,8 @@ impl ArrayExtWitnessCache {
         }
     }
 
+    /// The name's numeric tail is `TermStore::var_counter`, never a `TermId`;
+    /// the checked-probe prune relies on it (`is_counter_only_internal_name`).
     fn mint(&mut self, terms: &mut TermStore, sort: Sort) -> Option<ArrayExtWitnessIdentity> {
         let name = loop {
             let candidate = terms.mk_internal_symbol("ext_diff");
@@ -240,6 +257,7 @@ impl ArrayExtWitnessCache {
     /// Retire the preceding public query's witnesses and clear pair reuse.
     pub(crate) fn begin_public_solve(&mut self, terms: &TermStore) {
         self.generated_clauses.clear();
+        self.shared_read.clear();
         for witness in std::mem::take(&mut self.active).into_values() {
             if witness.still_matches(terms) {
                 self.retired.insert(witness.term, witness);
@@ -252,6 +270,7 @@ impl ArrayExtWitnessCache {
         self.active.clear();
         self.retired.clear();
         self.generated_clauses.clear();
+        self.shared_read.clear();
     }
 
     /// Whether `witness` is an exact identity minted in the current public
@@ -414,6 +433,11 @@ pub(in crate::executor) struct EufAxiomResult {
     pub(in crate::executor) clauses: Vec<ay_core::CnfClause>,
     /// Number of additional variables used
     pub(in crate::executor) num_vars: u32,
+    /// Set when generation stopped early, with why (its clause or literal
+    /// budget, or an interrupt / deadline / memory stop). The clauses are
+    /// then a subset of the full axiomatization: sound for UNSAT only, so the
+    /// caller must degrade a SAT to Unknown (see [`CongruenceBail`]).
+    pub(in crate::executor) bail: Option<CongruenceBail>,
 }
 
 /// Maximum branch-and-bound split iterations for pure integer arithmetic solvers.
@@ -480,6 +504,183 @@ pub(in crate::executor) const MAX_UNPRODUCTIVE_CONFLICT_ROUNDS: usize = 128;
 /// signature. Same fail-closed exit, same `UnknownReason::SplitLimit`, same
 /// COMPLETENESS-not-soundness trade.
 pub(in crate::executor) const MAX_TOTAL_UNPRODUCTIVE_ROUNDS: usize = 1024;
+
+/// Vocabulary scaling for the two unproductive-round budgets above
+/// (#unproductive-budget-scales-with-vocabulary).
+///
+/// Both constants were calibrated on instances of at most about a thousand
+/// theory atoms, and the signature they detect does NOT separate a diverging
+/// enumeration from a converging lazy refutation on a large vocabulary.
+/// Measured 2026-09-12 with a per-round probe (`--debug-split-exit`) on the
+/// AUFDTLIRA `spark2014bench string_search.ads_35_14` refutation:
+///
+/// * lane off: 36 theory-conflict rounds over 2,870 atoms, a zero-conflict run
+///   of 32, lemmas of median length 3 -- `unsat` in 0.5 s;
+/// * `--quantifier-guarded-enumerative` on: 594 theory-conflict rounds over
+///   7,618 atoms, a zero-conflict run of **357**, the same median lemma length
+///   3 -- `unsat` at round 594 once the 128-round budget is lifted, and a
+///   fail-closed `unknown` (then 36 s of post-give-up remapping and 1.4 GB)
+///   with it;
+/// * the #7956 fixture's diverging invocation: 1,262 rounds, median lemma
+///   length 4, longest run 118 -- stopped by the cumulative bound as before.
+///
+/// The fixture's cost is POSTURE-SPECIFIC and it is not small; an earlier draft
+/// of this comment understated it by reading only the default posture.
+/// Re-measured 2026-09-12 on `QUANTIFIER_CONSUMER_EXT_EQ_TSEITIN`
+/// (`group_auflia/auflia_verification_consumer_ext_eq_7956.rs`), base build 9605 against the
+/// scaled build, both concurrent on private copies:
+///
+/// * DEFAULT posture: byte-identical. One invocation at **478 atoms**, limits
+///   128/1024 exactly, exit on the cumulative bound at iteration 1,239. Both
+///   binaries 1,240 round trips, 122.0 s against 121.8 s, 51.8 MB against
+///   52.1 MB.
+/// * `--z3-mode`: **4.5x wall and 25x round trips.** Base 24.8 s / 132 round
+///   trips; scaled 110.7 s / 3,329. Two invocations take the budget exit --
+///   the first at **1,060 atoms** (limits 132/1,060, cumulative at iteration
+///   1,298) and the second at **2,096 atoms** (limits **262/2,096**, cumulative
+///   at iteration 3,328). So the fixture's real atom range on this input is
+///   478..2,096, not the ~1,000 the constants were calibrated at, and at its
+///   top the budget is **105% wider** on both bounds, not 3.5%.
+///
+/// The mechanism is worth stating because it is how a 3% bound change buys a
+/// 25x round-trip change: lifting the consecutive bound 128 -> 132 lets the
+/// first invocation past the exit it used to take, it then runs to the
+/// cumulative bound instead, and `atoms` is re-read from `local_term_to_var`
+/// every round while the split handlers keep extending that map -- so a longer
+/// run raises its own ceiling. Both postures still fail closed to `unknown`,
+/// the verdict is unchanged, and the fixture's five fail-closed guards in
+/// `group_auflia` hold; this is a COST, not a soundness question.
+///
+/// So the shape of a zero-conflict round is identical in both cases (a short
+/// lemma the SAT solver satisfies by unit propagation rather than by conflict,
+/// because phase saving re-derives the previous model); what differs is how
+/// many such lemmas a refutation over `n` atoms legitimately needs, which is
+/// linear in `n` (one per inconsistent atom combination it must discover). A
+/// fixed-size budget is therefore a false positive on every instance whose
+/// vocabulary is large enough, and scaling the bounds with the vocabulary is
+/// the smallest change that keeps the calibrated constants exact below it:
+///
+/// * consecutive bound: `max(MAX_UNPRODUCTIVE_CONFLICT_ROUNDS, atoms / 8)`
+///   (7,618 atoms -> 952, a 2.7x margin over the measured 357; unchanged at
+///   128 up to 1,031 atoms);
+/// * cumulative bound: `max(MAX_TOTAL_UNPRODUCTIVE_ROUNDS, atoms)` -- at most
+///   one unproductive round per atom of vocabulary, which keeps the constants'
+///   8x ratio between the two bounds (7,618 -> 7,618 over the measured 592;
+///   unchanged at 1,024 up to 1,024 atoms).
+///
+/// The cumulative bound is the one the second measured loss pins: the
+/// AUFDTLIRA `R509-011 higher_order_proof why_fb578d` refutation spends
+/// **1,017** unproductive rounds over 6,130 atoms (longest run 211, median
+/// lemma length 3) before refuting at round 1,038 -- 16.6% of its vocabulary,
+/// which `atoms / 4` would clear by only 1.5x.
+///
+/// `atoms` is the split loop's theory-atom vocabulary (`local_term_to_var`),
+/// read every round so a lemma that mints new atoms grows the budget with it.
+/// Up to 1,024 atoms both bounds are byte-identical to the constants. Same
+/// fail-closed exit, same `UnknownReason::SplitLimit`, same COMPLETENESS-not-
+/// soundness trade: a longer loop reaches `sat` only through the unchanged
+/// model authority and `unsat` only through the unchanged propositional
+/// refutation. `split_loop.unproductive_legacy_rule_hits` counts invocations
+/// the unscaled rule would have stopped, so the price of the change can be
+/// attributed file by file.
+pub(in crate::executor) const UNPRODUCTIVE_CONSECUTIVE_ATOMS_PER_ROUND: usize = 8;
+
+/// The two unproductive-round bounds for a split loop whose theory-atom
+/// vocabulary currently has `atoms` entries: `(consecutive, cumulative)`.
+/// See [`UNPRODUCTIVE_CONSECUTIVE_ATOMS_PER_ROUND`].
+pub(in crate::executor) fn unproductive_round_limits(atoms: usize) -> (usize, usize) {
+    (
+        MAX_UNPRODUCTIVE_CONFLICT_ROUNDS.max(atoms / UNPRODUCTIVE_CONSECUTIVE_ATOMS_PER_ROUND),
+        MAX_TOTAL_UNPRODUCTIVE_ROUNDS.max(atoms),
+    )
+}
+
+#[cfg(test)]
+mod unproductive_round_limits_tests {
+    use super::{
+        unproductive_round_limits, MAX_TOTAL_UNPRODUCTIVE_ROUNDS, MAX_UNPRODUCTIVE_CONFLICT_ROUNDS,
+    };
+
+    /// Up to and including 1,024 atoms both bounds are the calibrated
+    /// constants, byte for byte.
+    #[test]
+    fn small_vocabularies_keep_the_calibrated_constants() {
+        for atoms in [0, 1, 127, 128, 736, 1023, 1024] {
+            assert_eq!(
+                unproductive_round_limits(atoms),
+                (
+                    MAX_UNPRODUCTIVE_CONFLICT_ROUNDS,
+                    MAX_TOTAL_UNPRODUCTIVE_ROUNDS
+                ),
+                "atoms={atoms}"
+            );
+        }
+    }
+
+    /// What the #7956 fixture actually gets, measured per invocation with
+    /// `--debug-split-exit` rather than assumed (an earlier version of this
+    /// test asserted the fixture keeps the constants across its whole range,
+    /// and was wrong by 105%).
+    ///
+    /// Default posture: one invocation at 478 atoms -- the constants exactly.
+    /// `--z3-mode`: invocations at 1,060 and 2,096 atoms, and at 2,096 both
+    /// bounds are 105% wider than the constants, which is what turns a 132 to
+    /// 3,329 round-trip difference and 4.5x wall on this fixture. It still
+    /// fails closed to `unknown` in both postures.
+    #[test]
+    fn the_7956_fixture_budget_measured_per_invocation() {
+        // Default posture, the only invocation: byte-identical constants.
+        assert_eq!(
+            unproductive_round_limits(478),
+            (
+                MAX_UNPRODUCTIVE_CONFLICT_ROUNDS,
+                MAX_TOTAL_UNPRODUCTIVE_ROUNDS
+            )
+        );
+        // Where byte-identity actually stops, per bound.
+        assert_eq!(unproductive_round_limits(1_031), (128, 1_031));
+        assert_eq!(unproductive_round_limits(1_032), (129, 1_032));
+        // `--z3-mode`, the two invocations that take the budget exit.
+        assert_eq!(unproductive_round_limits(1_060), (132, 1_060));
+        assert_eq!(unproductive_round_limits(2_096), (262, 2_096));
+        // ...which is a 105% widening of both bounds, not a few percent.
+        assert_eq!(2_096 / MAX_TOTAL_UNPRODUCTIVE_ROUNDS, 2);
+        assert!(262 > 2 * MAX_UNPRODUCTIVE_CONFLICT_ROUNDS);
+    }
+
+    /// The two measured refutations: string_search.ads_35_14 (7,618 atoms with
+    /// the enumerative lane on) needs a 357-round consecutive run and 592
+    /// unproductive rounds in total; R509-011 why_fb578d (6,130 atoms) needs a
+    /// 211-round run and 1,017 in total. Both bounds clear both with margin,
+    /// and a bound never goes below its constant.
+    #[test]
+    fn large_vocabularies_scale_linearly_and_clear_the_measured_refutations() {
+        let (consecutive, total) = unproductive_round_limits(7_618);
+        assert_eq!((consecutive, total), (952, 7_618));
+        assert!(consecutive > 357 && total > 592);
+        let (consecutive, total) = unproductive_round_limits(6_130);
+        assert_eq!((consecutive, total), (766, 6_130));
+        assert!(consecutive > 211 && total > 1_017);
+        assert_eq!(unproductive_round_limits(4_096), (512, 4_096));
+        assert_eq!(
+            unproductive_round_limits(1_025),
+            (MAX_UNPRODUCTIVE_CONFLICT_ROUNDS, 1_025)
+        );
+        assert_eq!(unproductive_round_limits(2_870), (358, 2_870));
+    }
+
+    /// Monotone in the vocabulary, so a lemma that mints new atoms can only
+    /// grow the budget it is measured against.
+    #[test]
+    fn limits_are_monotone_in_the_vocabulary() {
+        let mut prev = unproductive_round_limits(0);
+        for atoms in (0..40_000).step_by(997) {
+            let cur = unproductive_round_limits(atoms);
+            assert!(cur.0 >= prev.0 && cur.1 >= prev.1, "atoms={atoms}");
+            prev = cur;
+        }
+    }
+}
 
 /// Maximum branch-and-bound split iterations for mixed Int/Real solvers.
 ///

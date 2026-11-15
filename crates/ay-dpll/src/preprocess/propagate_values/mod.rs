@@ -32,8 +32,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 
+mod array_units;
+pub(crate) use array_units::ArrayUnitDerivation;
 mod fold_rebuild;
 mod goal;
+mod recorded_substitution;
+pub(crate) use recorded_substitution::RecordedVariableSubstitution;
 
 /// Red zone size for `stacker::maybe_grow` in propagate_values recursion (#8414).
 const PROPVAL_STACK_RED_ZONE: usize = 32 * 1024;
@@ -144,6 +148,11 @@ pub(crate) struct PropagationRecords {
     pub(crate) eq_diffvar_rewrites: Vec<PropagatedRewriteRecord>,
     /// The atom folds those rewrites are made of.
     pub(crate) eq_diffvar_atoms: Vec<EqDiffVarAtomRecord>,
+    /// Source-derived array preprocessing units. Kept outside the c7 sealed
+    /// entry/record channel; L1 consumers must freshly authenticate their
+    /// immutable fragments against the current original roots before replay.
+    /// Whole-struct reset and nested-query clone/restore own their lifetime.
+    pub(crate) array_units: Vec<ArrayUnitDerivation>,
 }
 
 /// Hard cap on retained provenance records; overflow withholds ALL records

@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `GeneralPBConstraint::add` (in-situ branch, i64) checked that the
+% *unadjusted* degree sum fits into i64 and then subtracted the merge cancellation from it
+% with a plain `-`. Here the degree sum is i64::MIN + 2 and merging `5 x1` with `5 ~x1`
+% cancels 5, so the true degree is i64::MIN - 3: it used to wrap to a huge positive number
+% and turned the trivially true sum into the empty contradiction. The formula is
+% satisfiable (x1 true, x2 false).
+f 1 ;
+pol 1 9223372036854775807 - ;
+pol 2 ~x1 5 * + ;
+pol 3 x2 w ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

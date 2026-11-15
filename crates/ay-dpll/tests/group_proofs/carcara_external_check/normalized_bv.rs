@@ -146,9 +146,16 @@ fn test_carcara_ground_bv_disequality_is_checked_not_holey() {
 }
 
 /// The lowering is shape-gated, not blanket: an `evaluate` step may only ever
-/// carry a closed constant equality, and a document that still needs a genuine
-/// theory inference must keep its honest `hole` and report `holey` — never
-/// `invalid`, and never a rule name AY cannot back.
+/// carry a closed constant equality, never a non-ground clause.
+///
+/// CONTRACT CORRECTED 2026-09-23 (the name is kept so name-keyed ledgers keep
+/// the oracle). It also said this document "must keep its honest `hole` and
+/// report `holey` — never `invalid`", checked through a runner that passed
+/// `--allowed-rules trust` and read only the exit status, which is 0 for
+/// `holey` AND `valid`. Read exactly, with no allowance, on ay `8d9e105fa`/`69efb137d` and
+/// carcara 1.1.0 [git 9a352ee], the document is `valid`: it carries no hole.
+/// The test now requires that strictly stronger verdict; falling back to a
+/// hole, or to any rule Carcara cannot re-derive, fails it.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]
@@ -172,7 +179,204 @@ fn test_carcara_symbolic_bv_conflict_keeps_its_honest_hole() {
         return;
     };
     assert!(
-        run_carcara(&carcara, "symbolic_bv_conflict", problem, &proof),
-        "a proof with honest holes must still be structurally accepted"
+        run_carcara_trust_free(&carcara, "symbolic_bv_conflict", problem, &proof),
+        "the symbolic BV conflict must be Carcara `valid` with no allowance:\n{proof}"
+    );
+}
+
+/// An authored bit-vector literal spelling inside a certified congruence
+/// PREMISE. The authored-assume override keeps `(= p0 #x10)` and
+/// `(= mem2 (store mem p0 #xAA))` verbatim, while the congruences that consume
+/// them print the canonical `#b00010000` / `#b10101010` renderings of the same
+/// constants. carcara parses both spellings to one term, so the printer must
+/// bridge each premise leg with `refl` + `trans` instead of refusing the whole
+/// document as `UNVERIFIABLE PROOF` — the shape that cost QF_ABV
+/// `csplit_repro_many_trivial_selects_unsat` its certificate once 779076535
+/// retained the native resolution.
+#[test]
+#[cfg_attr(debug_assertions, timeout(300_000))]
+#[cfg_attr(not(debug_assertions), timeout(120_000))]
+fn test_carcara_trust_free_authored_bv_literal_congruence_premise() {
+    let problem = r#"
+(set-logic QF_ABV)
+(declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))
+(declare-const p0 (_ BitVec 8))
+(declare-const p1 (_ BitVec 8))
+(declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))
+(assert (= p0 #x10))
+(assert (= p1 #x10))
+(assert (= mem2 (store mem p0 #xAA)))
+(assert (= (select mem2 p1) #xBB))
+(check-sat)
+"#;
+    let label = "authored_bv_literal_congruence_premise";
+    let proof = solve_unsat_and_get_proof(problem, label);
+    assert!(
+        proof
+            .lines()
+            .any(|line| line.contains(".r (cl (= #x10 #b00010000)) :rule refl)")),
+        "{label}: expected the authored-literal PREMISE leg (`<id>.r`) to be bridged by refl:\n{proof}"
+    );
+    // The bridge adds no hypothesis: every assume is still an authored premise.
+    let asserted = extract_asserted_terms(problem);
+    for assume in extract_assume_terms(&proof) {
+        assert!(
+            asserted.contains(&assume),
+            "{label}: assume is not a problem premise: {assume}"
+        );
+    }
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    assert!(
+        run_carcara_trust_free(&carcara, label, problem, &proof),
+        "{label}: proof must be externally VALID, not merely holey"
+    );
+}
+
+/// [`test_carcara_trust_free_authored_bv_literal_congruence_premise`]'s ROW1
+/// problem with the two uses of the index authored as caller-chosen spellings
+/// of `#x10`.
+fn row1_authored_index_problem(p0_index: &str, p1_index: &str) -> String {
+    format!(
+        "(set-logic QF_ABV)\n\
+         (declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))\n\
+         (declare-const p0 (_ BitVec 8))\n\
+         (declare-const p1 (_ BitVec 8))\n\
+         (declare-const mem2 (Array (_ BitVec 8) (_ BitVec 8)))\n\
+         (assert (= p0 {p0_index}))\n\
+         (assert (= p1 {p1_index}))\n\
+         (assert (= mem2 (store mem p0 #xAA)))\n\
+         (assert (= (select mem2 p1) #xBB))\n\
+         (check-sat)\n"
+    )
+}
+
+/// The same problem with the index authored as one CONSTANT-FOLDED term,
+/// `(bvadd #x08 #x08)`, at both uses. Elaboration folds it to `#b00010000`,
+/// and the native refutation lifts the derived `(= p0 p1)` onto the store
+/// through a `cong` whose premise prints from the authored
+/// `(= p0 (bvadd #x08 #x08))` against that constant. No literal `refl` bridge
+/// relates the two, so the printer refuses it (`InvalidCongruenceStep`).
+///
+/// The raw-root ground closure, the last wire-gap retry for a native-strict
+/// proof (`repair_wire_gap_with_authored_root_refutation`), refutes the
+/// AUTHORED roots instead: `p0` and `p1` equal one authored term, so
+/// transitivity relates them without evaluating it, and the read
+/// over the write closes by `arrays_idx`. This was the accepted-cell fixture
+/// of `api::tests::test_proof_artifact::a_rescued_authored_spelling_refusal_publishes_an_accepted_verdict`
+/// until that retry made it print directly. Counterfactual, measured with
+/// the retry disabled: `(get-proof)` answers `UNVERIFIABLE PROOF`.
+#[test]
+#[cfg_attr(debug_assertions, timeout(300_000))]
+#[cfg_attr(not(debug_assertions), timeout(120_000))]
+fn test_carcara_trust_free_authored_folded_bv_index_shared_term() {
+    let problem = row1_authored_index_problem("(bvadd #x08 #x08)", "(bvadd #x08 #x08)");
+    let label = "authored_folded_bv_index_shared_term";
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    let mut outputs = Vec::new();
+    for command in parse(&format!("{problem}(get-proof)\n")).unwrap() {
+        if let Some(output) = exec.execute_authored(&command).unwrap() {
+            outputs.push(output);
+        }
+    }
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+    let native = exec.last_proof().expect("public source proof retained");
+    assert!(ay_proof::check_proof_strict(native, exec.terms())
+        .expect("complete native derivation")
+        .is_complete());
+    let proof = outputs.last().expect("public get-proof document");
+    assert!(
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "{label}: the authored-root refutation must be trust-free:\n{proof}"
+    );
+    // Source fidelity and complete replay are the contract. Either equality
+    // orientation (or another checked derivation) may transport the read.
+    let asserted: BTreeSet<_> = extract_asserted_terms(&problem)
+        .iter()
+        .map(|term| ay_dpll::normalize_premise_surface(term))
+        .collect();
+    for assume in extract_assume_terms(proof) {
+        assert!(asserted.contains(&ay_dpll::normalize_premise_surface(&assume)));
+    }
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    assert!(
+        run_carcara_trust_free(&carcara, label, &problem, proof),
+        "{label}: proof must be externally VALID, not merely holey"
+    );
+    let source_premise = "(assert (= p0 (bvadd #x08 #x08)))\n";
+    assert_eq!(problem.matches(source_premise).count(), 1);
+    let missing = problem.replacen(source_premise, "", 1);
+    assert_ne!(
+        carcara_verdict_without_allowances(
+            &carcara,
+            "folded_index_missing_premise",
+            &missing,
+            proof
+        ),
+        CarcaraVerdict::Valid
+    );
+    // Replace a required Assume with the other authored premise against the
+    // SAME unchanged UNSAT problem. Source admission alone cannot reject this
+    // corruption; the actual derivation must refuse the missing p0 evidence.
+    let premise_line = proof
+        .lines()
+        .find(|line| line.starts_with("(assume ") && line.contains("(= p0 "))
+        .expect("actual source p0 premise");
+    let wrong_line = premise_line.replacen("(= p0 ", "(= p1 ", 1);
+    assert_ne!(wrong_line, premise_line);
+    let wrong_proof = proof.replacen(premise_line, &wrong_line, 1);
+    assert_ne!(
+        carcara_verdict_without_allowances(
+            &carcara,
+            "folded_index_wrong_assume",
+            &problem,
+            &wrong_proof
+        ),
+        CarcaraVerdict::Valid
+    );
+}
+
+/// NEGATIVE TWIN of
+/// [`test_carcara_trust_free_authored_folded_bv_index_shared_term`]: the two
+/// uses spelled `(bvudiv #x20 #x02)` and `#x10` share no authored term, and
+/// meet in the ground closure only through an `Evaluated` edge, which it does
+/// not propose for `bvudiv` (`EVALUATED_OPERATORS`; pinned Carcara refuses the
+/// divider steps that evaluation prints). Whatever `(get-proof)` answers, it
+/// must never be a document Carcara refuses. Measured today it is withheld
+/// as `UNVERIFIABLE PROOF`.
+#[test]
+#[cfg_attr(debug_assertions, timeout(300_000))]
+#[cfg_attr(not(debug_assertions), timeout(120_000))]
+fn test_carcara_unevaluated_folded_bv_index_never_publishes_a_refused_document() {
+    let problem = row1_authored_index_problem("(bvudiv #x20 #x02)", "#x10");
+    let label = "authored_unevaluated_folded_bv_index";
+    let script = format!("(set-option :produce-proofs true)\n{problem}\n(get-proof)\n");
+    let commands = parse(&script).expect("parse SMT-LIB script");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute SMT-LIB script");
+    assert_eq!(
+        outputs.first().map(String::as_str),
+        Some("unsat"),
+        "{label}: {outputs:?}"
+    );
+    let proof = outputs.last().cloned().expect("get-proof output");
+    let published = proof.contains("(assume ") || proof.contains("(step ");
+    if !published {
+        assert!(
+            proof.contains("UNVERIFIABLE PROOF"),
+            "{label}: a withheld document must say so:\n{proof}"
+        );
+        return;
+    }
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    assert!(
+        run_carcara_trust_free(&carcara, label, &problem, &proof),
+        "{label}: a published document must be Carcara `valid`:\n{proof}"
     );
 }

@@ -29,6 +29,7 @@ ay-xor = { workspace = true, optional = true }
 ay-bench = { workspace = true, optional = true }
 ay-bisect = { workspace = true, optional = true }
 ay-pb = { workspace = true, optional = true }
+ay-veripb = { workspace = true, optional = true }
 ay-lp = { workspace = true, optional = true }
 ay-fzn2smt = { workspace = true, optional = true }
 ay-flatzinc-parser = { workspace = true, optional = true }
@@ -45,6 +46,7 @@ clap = { workspace = true, optional = true }
 num-bigint.workspace = true
 num-traits.workspace = true
 num-rational.workspace = true
+proc-macro2 = { version = "1", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -66,6 +68,7 @@ cli = [
     "dep:anyhow",
     "dep:clap",
     "dep:nix",
+    "dep:proc-macro2",
     "dep:serde",
     "dep:serde_json",
     "dep:sha2",
@@ -86,6 +89,7 @@ cli = [
     "dep:ay-lrat-check",
     "dep:ay-maxsat",
     "dep:ay-pb",
+    "dep:ay-veripb",
     "dep:ay-qbf",
     "dep:ay-sat",
     "dep:ay-sys",
@@ -99,13 +103,6 @@ submission-live = ["cli", "dep:ureq"]
 # Enable active JIT support: SAT conflict processing plus SMT/CHC helper kernels.
 # SAT BCP/watch JIT was removed from the production path in #8517.
 jit = ["ay-dpll/jit", "ay-sat?/jit"]
-# GPU-accelerated inprocessing (wgpu compute: Vulkan/DX12/Metal — covers
-# NVIDIA, AMD, Intel, and Apple GPUs). Experimental; passes ay-sat's `gpu`
-# feature through so `ay --features cli,gpu` builds a GPU-capable binary and
-# `ay --features` reports `sat-gpu` truthfully. Off by default: the GPU BVE /
-# subsumption pre-passes engage only past their pair-count thresholds and
-# fall back to the CPU paths on machines without a GPU adapter.
-gpu = ["cli", "ay-sat/gpu"]
 # Opt-in Phase-2 DRAT replay cross-check against ay-replay's
 # SequentialReplayer. OFF by default. Observational only — it
 # does not change the verdict or exit code of `ay check drat`.
@@ -118,6 +115,7 @@ signal-hook = { workspace = true, optional = true }
 [dev-dependencies]
 ay-test-support.workspace = true
 criterion.workspace = true
+ay-criterion-main.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ntest = "0.9"
@@ -149,6 +147,13 @@ name = "group_cli"
 path = "tests/group_cli.rs"
 required-features = ["cli"]
 
+# Loads every core on purpose, so it runs in its own test binary: cargo runs
+# test binaries one at a time, and the load never overlaps other tests.
+[[test]]
+name = "deterministic_inproc_under_load"
+path = "tests/deterministic_inproc_under_load.rs"
+required-features = ["cli"]
+
 [[test]]
 name = "group_leetcode"
 path = "tests/group_leetcode.rs"
@@ -177,6 +182,29 @@ required-features = ["cli"]
 [[bench]]
 name = "startup_bench"
 harness = false
+
+# Files outside `src/` that this crate's shipped code embeds (`include_str!`):
+# inputs of every build-provenance stamp built from it (build_support/provenance_scope.rs).
+[package.metadata.ay-provenance]
+inputs = [
+    "z3-compatibility.json",
+    "../../ci/veripb.pin",
+    "../../scripts/_oom_guard.py",
+    "../../verification/lean/lakefile.toml",
+    "../../verification/lean/lake-manifest.json",
+    "../../verification/lean/lean-toolchain",
+    "../../verification/lean/AySoundness/Datatype.lean",
+    "../../verification/lean/AySoundness/Firewall.lean",
+    "../../verification/lean/AySoundness/FpBridge.lean",
+    "../../verification/lean/AySoundness/FpErrorBound.lean",
+    "../../verification/lean/AySoundness/FpThy.lean",
+    "../../verification/lean/AySoundness/FpUnderflow.lean",
+    "../../verification/lean/AySoundness/Lrat.lean",
+    "../../verification/lean/AySoundness/NiaProduct.lean",
+    "../../verification/lean/AySoundness/OrdField.lean",
+    "../../verification/lean/AySoundness/RegexThy.lean",
+    "../../verification/lean/AySoundness/StringThy.lean",
+]
 
 [lints]
 workspace = true

@@ -43,7 +43,7 @@ mod tests;
 pub use builder::ProgramBuilder;
 
 use crate::constraint::Constraint;
-use crate::sort::{DatatypeSort, Sort};
+use crate::sort::Sort;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
@@ -70,8 +70,10 @@ pub struct AYProgram {
     /// Function definitions (for restoration after clear_commands).
     pub(crate) defined_funs: Vec<(String, Vec<(String, Sort)>, Sort, crate::Expr)>,
 
-    /// Declared datatype definitions (full definitions for restoration, keyed by name).
-    pub(crate) declared_datatypes: BTreeMap<String, DatatypeSort>,
+    /// Declared datatype definitions, keyed by name: one closed
+    /// `SortInner::Datatype` per name, the definition every descriptor under
+    /// that name in this program was authenticated against.
+    pub(crate) declared_datatypes: crate::expr::dt::Definitions,
 
     /// Declared CHC relations (for restoration after clear_commands).
     pub(crate) declared_rels: Vec<(String, Vec<Sort>)>,

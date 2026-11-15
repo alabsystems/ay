@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% The `Cardinality` copy: all coefficients are one and the degree fits `i64`, so
+% `1 x1 1 x2 >= i64::MIN` is stored as a cardinality constraint, whose `substitute` lowered the
+% degree with an unchecked `-= 1` per literal mapped to TRUE. Same wrap, same forged UNSAT.
+f 2;
+rup 1 x1 1 x2 >= -9223372036854775808 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

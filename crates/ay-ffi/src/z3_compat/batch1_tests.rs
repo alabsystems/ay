@@ -196,7 +196,42 @@ fn eval_smtlib2_runs_a_script() {
         let text = CStr::from_ptr(out)
             .to_str()
             .expect("SMT-LIB evaluation output must be valid UTF-8");
-        assert!(text.contains("sat"), "expected sat in output, got: {text}");
+        assert!(
+            text.lines().any(|line| line.trim() == "sat"),
+            "expected sat in output, got: {text}"
+        );
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn eval_smtlib2_retains_scopes_and_recovers_command_errors() {
+    // SAFETY: this test owns the context and all strings; no handles escape
+    // context destruction and the calls occur serially on this thread.
+    unsafe {
+        let c = ctx();
+        Z3_set_error_handler(c, None);
+        let first = Z3_eval_smtlib2_string(c, c"(declare-const x Int) (assert (> x 0))".as_ptr());
+        assert_eq!(CStr::from_ptr(first).to_bytes(), b"");
+        let check = Z3_eval_smtlib2_string(c, c"(check-sat)".as_ptr());
+        assert_eq!(CStr::from_ptr(check).to_bytes(), b"sat\n");
+        let pushed = Z3_eval_smtlib2_string(c, c"(push 1) (assert (< x 0)) (check-sat)".as_ptr());
+        assert_eq!(CStr::from_ptr(pushed).to_bytes(), b"unsat\n");
+        let popped = Z3_eval_smtlib2_string(c, c"(pop 1) (check-sat)".as_ptr());
+        assert_eq!(CStr::from_ptr(popped).to_bytes(), b"sat\n");
+        let error = Z3_eval_smtlib2_string(
+            c,
+            c"(declare-const y Int) (assert) (assert (= y 7)) (check-sat)".as_ptr(),
+        );
+        let output = CStr::from_ptr(error).to_string_lossy();
+        assert!(
+            output.contains("(error ") && output.ends_with("sat\n"),
+            "{output}"
+        );
+        assert_eq!(Z3_get_error_code(c), Z3_PARSER_ERROR);
+        let retained = Z3_eval_smtlib2_string(c, c"(assert (= y 8)) (check-sat)".as_ptr());
+        assert_eq!(CStr::from_ptr(retained).to_bytes(), b"unsat\n");
+        assert_eq!(Z3_get_error_code(c), Z3_OK);
         Z3_del_context(c);
     }
 }

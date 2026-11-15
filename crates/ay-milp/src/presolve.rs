@@ -1467,7 +1467,72 @@ fn tighten(
     }
 }
 
+/// The box the rows IMPLY, as OUTWARD-rounded `f64` bounds: the exact fixpoint of
+/// [`propagate`] over the model's declared box, each side then rounded away from the
+/// feasible region and intersected with the declared bound.
+///
+/// Every feasible point of the LP relaxation lies inside the returned box. Each derived
+/// bound is an exact consequence of the rows and the declared box — the sweep treats every
+/// column as CONTINUOUS, so the result is valid for the relaxation even on an integer model
+/// (an integer floor/ceil is a consequence for the MILP, not for its relaxation) — and the
+/// `f64` commit only ever widens. That is exactly the licence
+/// [`crate::ns::rigorous_lower_bound_with_box`] needs: it prices reduced costs against a box
+/// that must contain every feasible point, and a FREE column with a nonzero float reduced
+/// cost has no finite price at all. On a layered model whose pre-activation columns are free
+/// this box is the difference between a Neumaier–Shcherbina answer in microseconds and a
+/// fall-through to the exact rational rim (`LpSession::rigorous_bound`).
+///
+/// `None` when the rows prove the box empty (the caller's exact path reports that itself),
+/// when the model carries inexact side-store coefficients (the sweep reads the `f64` matrix,
+/// so its consequences would be for a different model), or when the deadline has already
+/// passed. A deadline that expires mid-sweep leaves a partially propagated box, which is
+/// still an enclosure — every individual tightening is a consequence on its own.
+pub(crate) fn implied_box_f64(
+    model: &Model,
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if model.has_inexact_coeffs() {
+        return None;
+    }
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return None;
+    }
+    let n = model.num_cols();
+    let mut lo = Vec::with_capacity(n);
+    let mut up = Vec::with_capacity(n);
+    for j in 0..n {
+        let (l, u) = model.col_bounds(Col(j as u32));
+        lo.push(exact_small(l));
+        up.push(exact_small(u));
+    }
+    let integral = vec![false; n];
+    if !propagate(model, deadline, None, &integral, &mut lo, &mut up, false) {
+        return None;
+    }
+    let mut lower = Vec::with_capacity(n);
+    let mut upper = Vec::with_capacity(n);
+    for j in 0..n {
+        let (l, u) = model.col_bounds(Col(j as u32));
+        let lb = lo[j]
+            .as_ref()
+            .map_or(f64::NEG_INFINITY, |r| round_out(&r.to_big(), true));
+        let ub = up[j]
+            .as_ref()
+            .map_or(f64::INFINITY, |r| round_out(&r.to_big(), false));
+        lower.push(lb.max(l));
+        upper.push(ub.min(u));
+    }
+    Some((lower, upper))
+}
+
 /// A rational to an `f64` that is certainly on the outside of it.
+///
+/// OUTSIDE means: `down` gives an `f64 <= v`, `!down` an `f64 >= v`. When `v` is beyond
+/// `f64::MAX` in magnitude, `to_f64` reports the infinity of `v`'s SIGN — which is the
+/// outside only when that sign agrees with the direction asked for. A lower bound of
+/// `+10^400` must come back as `f64::MAX` (below it), never `+inf` (above it): an
+/// enclosure whose lower side is `+inf` contains nothing, and a consumer pricing a
+/// reduced cost at that corner would manufacture a finite "rigorous" number. Saturate.
 fn round_out(v: &BigRational, down: bool) -> f64 {
     let Some(f) = v.to_f64() else {
         return if down {
@@ -1477,7 +1542,11 @@ fn round_out(v: &BigRational, down: bool) -> f64 {
         };
     };
     if !f.is_finite() {
-        return f;
+        return match (down, f > 0.0) {
+            (true, true) => f64::MAX,   // v > MAX: the largest f64 is still below it
+            (false, false) => f64::MIN, // v < MIN: the smallest f64 is still above it
+            _ => f,                     // the infinity already lies outside
+        };
     }
     // `to_f64` rounds to nearest, which may land INSIDE the true bound. One ulp outward is
     // always safe and costs nothing.
@@ -2781,5 +2850,221 @@ mod tests {
             );
         }
         assert!(fired > 50, "test is vacuous: only {fired} cases fired");
+    }
+}
+
+#[cfg(test)]
+mod implied_box_tests {
+    use num_rational::BigRational;
+
+    use super::implied_box_f64;
+    use crate::exact::{Budget, ExactLp, LpOptimum};
+    use crate::model::{Col, Model};
+    use ay_lra::rational::Rational;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + (self.next() % ((hi - lo + 1) as u64)) as i64
+        }
+    }
+
+    /// Random LPs with FREE columns tied to boxed ones through equality and
+    /// range rows: the layered shape whose free pre-activation columns defeat
+    /// the plain NS tier.
+    fn random_lp_with_free_columns(rng: &mut Rng) -> Model {
+        let mut m = Model::new();
+        let boxed: Vec<Col> = (0..rng.int(1, 3))
+            .map(|_| {
+                let lb = rng.int(-3, 1) as f64;
+                m.add_col(lb, lb + rng.int(0, 4) as f64)
+            })
+            .collect();
+        let free: Vec<Col> = (0..rng.int(1, 3))
+            .map(|_| m.add_col(f64::NEG_INFINITY, f64::INFINITY))
+            .collect();
+        for &f in &free {
+            // A ±3 coefficient on the free column makes the derived bound a division by 3:
+            // non-dyadic, so the one-ulp outward step in `round_out` is exercised.
+            let own = [-3.0, -1.0, 3.0][rng.int(0, 2) as usize];
+            let mut coeffs = vec![(f, own)];
+            for &b in &boxed {
+                let a = rng.int(-3, 3);
+                if a != 0 {
+                    coeffs.push((b, a as f64));
+                }
+            }
+            if rng.int(0, 2) == 0 {
+                if let Some(&g) = free.iter().find(|&&g| g != f) {
+                    coeffs.push((g, rng.int(1, 2) as f64));
+                }
+            }
+            let lo = rng.int(-2, 0) as f64;
+            match rng.int(0, 3) {
+                0 => m.add_row(lo, lo, &coeffs),
+                1 => m.add_row(lo, f64::INFINITY, &coeffs),
+                2 => m.add_row(f64::NEG_INFINITY, lo, &coeffs),
+                _ => m.add_row(lo, lo + rng.int(0, 3) as f64, &coeffs),
+            };
+        }
+        m
+    }
+
+    fn budget() -> Budget {
+        Budget {
+            deadline: None,
+            max_iters: 20_000,
+        }
+    }
+
+    /// `round_out` steps one ulp outward on a non-dyadic and SATURATES on
+    /// overflow: a lower bound beyond `f64::MAX` is `f64::MAX`, never `+inf`
+    /// (which would be an empty enclosure), and symmetrically for an upper
+    /// bound below `f64::MIN`; an infinity that already lies outside is kept.
+    #[test]
+    fn round_out_steps_outward_and_saturates_on_overflow() {
+        use num_traits::FromPrimitive;
+        let third = BigRational::new(1.into(), 3.into());
+        let lo = super::round_out(&third, true);
+        let hi = super::round_out(&third, false);
+        assert!(BigRational::from_f64(lo).unwrap() < third && lo > 0.33);
+        assert!(BigRational::from_f64(hi).unwrap() > third && hi < 0.34);
+        assert_eq!(lo.next_up(), hi, "adjacent f64s around a non-dyadic");
+        let neg = -&third;
+        assert!(BigRational::from_f64(super::round_out(&neg, true)).unwrap() < neg);
+        assert!(BigRational::from_f64(super::round_out(&neg, false)).unwrap() > neg);
+
+        let huge = BigRational::from_integer(num_bigint::BigInt::from(10).pow(400_u32));
+        assert_eq!(
+            super::round_out(&huge, true),
+            f64::MAX,
+            "lower bound above MAX saturates"
+        );
+        assert_eq!(
+            super::round_out(&huge, false),
+            f64::INFINITY,
+            "+inf is outside from above"
+        );
+        let tiny = -&huge;
+        assert_eq!(
+            super::round_out(&tiny, false),
+            f64::MIN,
+            "upper bound below MIN saturates"
+        );
+        assert_eq!(
+            super::round_out(&tiny, true),
+            f64::NEG_INFINITY,
+            "-inf is outside from below"
+        );
+    }
+
+    /// The overflow case end to end: a free column whose only row forces it
+    /// above `f64::MAX` must get a lower side of `f64::MAX`, not `+inf` — the
+    /// box then still encloses the feasible point `x = 10^400` (it is above
+    /// every f64), and pricing `min x` at that corner yields a bound that is
+    /// BELOW the true minimum, as a lower bound must be.
+    #[test]
+    fn implied_box_saturates_instead_of_emptying_on_overflow() {
+        let mut m = Model::new();
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(1e200, f64::INFINITY, &[(x, 1e-200)]);
+        let (lower, upper) = implied_box_f64(&m, None).expect("a box");
+        assert_eq!(
+            (lower[x.index()], upper[x.index()]),
+            (f64::MAX, f64::INFINITY)
+        );
+        let b = crate::ns::rigorous_lower_bound_with_box(&m, &[1.0], &[0.0], &lower, &upper)
+            .expect("finite corner");
+        assert!(
+            b <= f64::MAX,
+            "a lower bound on 10^400 must not exceed f64::MAX"
+        );
+    }
+
+    /// Every feasible point lies in the implied box: per column, the exact
+    /// minimum is not below the box's lower side and the exact maximum not
+    /// above its upper side, and a direction the exact rim proves UNBOUNDED
+    /// must be open in the box (no finite bound is a consequence there). The
+    /// box also never widens the declared one, closes free sides often enough
+    /// to matter, and derives NON-DYADIC bounds often enough that the one-ulp
+    /// outward step is exercised (the generator divides by 3).
+    #[test]
+    fn implied_box_encloses_every_exact_column_range() {
+        let mut rng = Rng(0x5EED_5EED_5EED_5EED | 1);
+        let (mut boxes, mut checks, mut newly_finite, mut non_dyadic) =
+            (0usize, 0usize, 0usize, 0usize);
+        for _ in 0..120 {
+            let m = random_lp_with_free_columns(&mut rng);
+            let Some((lower, upper)) = implied_box_f64(&m, None) else {
+                continue;
+            };
+            boxes += 1;
+            for j in 0..m.num_cols() {
+                let (l, u) = m.col_bounds(Col(j as u32));
+                for side in [lower[j], upper[j]] {
+                    // A finite bound that is not a multiple of 1/2^k up to the ulp scale is
+                    // a non-dyadic that went through the outward step; a third is the
+                    // generator's only source of those.
+                    if side.is_finite() && side.fract() != 0.0 && (side * 3.0).fract().abs() < 1e-9
+                    {
+                        non_dyadic += 1;
+                    }
+                }
+                assert!(
+                    lower[j] >= l && upper[j] <= u && lower[j] <= upper[j],
+                    "the implied box never widens or crosses the declared one"
+                );
+                newly_finite += usize::from(!l.is_finite() && lower[j].is_finite());
+                newly_finite += usize::from(!u.is_finite() && upper[j].is_finite());
+                let obj = |c: i64| vec![(j as u32, Rational::new(c, 1))];
+                match ExactLp::new(&m).minimize(&obj(1), &budget()) {
+                    LpOptimum::Optimal { value, .. } => {
+                        checks += 1;
+                        assert!(
+                            BigRational::from_float(lower[j]).is_none_or(|b| b <= value),
+                            "lower[{j}] = {} is above the exact min {value}",
+                            lower[j]
+                        );
+                    }
+                    LpOptimum::Unbounded => {
+                        assert_eq!(lower[j], f64::NEG_INFINITY, "unbounded below yet boxed");
+                    }
+                    LpOptimum::Infeasible(_) | LpOptimum::Unknown(_) => {}
+                }
+                match ExactLp::new(&m).minimize(&obj(-1), &budget()) {
+                    LpOptimum::Optimal { value, .. } => {
+                        checks += 1;
+                        let exact_max = -value;
+                        assert!(
+                            BigRational::from_float(upper[j]).is_none_or(|b| b >= exact_max),
+                            "upper[{j}] = {} is below the exact max {exact_max}",
+                            upper[j]
+                        );
+                    }
+                    LpOptimum::Unbounded => {
+                        assert_eq!(upper[j], f64::INFINITY, "unbounded above yet boxed");
+                    }
+                    LpOptimum::Infeasible(_) | LpOptimum::Unknown(_) => {}
+                }
+            }
+        }
+        assert!(boxes >= 60, "coverage: {boxes} boxes");
+        assert!(checks >= 200, "coverage: {checks} exact checks");
+        assert!(
+            newly_finite >= 40,
+            "the box should close free sides: {newly_finite}"
+        );
+        assert!(
+            non_dyadic >= 20,
+            "the generator should derive non-dyadic bounds: {non_dyadic}"
+        );
     }
 }

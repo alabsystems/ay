@@ -674,3 +674,9 @@ fn depth_counts_primitive_applications() {
         2
     );
 }
+
+#[test]
+fn max_bv_sharing_parses_as_a_real_primitive() {
+    assert_eq!(parse("max-bv-sharing"), Ok(ApplyTactic::MaxBvSharing));
+    assert_eq!(ApplyTactic::MaxBvSharing.depth(), 1);
+}

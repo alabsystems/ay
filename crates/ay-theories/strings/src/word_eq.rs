@@ -84,6 +84,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
+use ay_core::{smtlib_char, smtlib_code_point};
 use std::collections::VecDeque;
 
 use crate::we_regex::{self, WeRegex};
@@ -1146,7 +1147,13 @@ fn leaf_res_conflict(state: &WeState) -> bool {
     if state.res.is_empty() {
         return false;
     }
-    const MAX_LEAF_WORD: usize = 6;
+    // A k-segment concatenation's residual word has up to 2k-1 symbols
+    // (variables interleaved with per-character ground symbols), so a
+    // cap of 6 silently skipped every five-segment concat — exactly
+    // the A·w1·B·w2·C shape whose refutation lives here. 16 covers
+    // five segments with multi-char blocks; the per-check cost stays
+    // bounded by the emptiness product caps either way.
+    const MAX_LEAF_WORD: usize = 16;
     // Per-variable constraint sets from singleton words + length windows.
     let mut singleton: HashMap<u32, Vec<WeRegex>> = HashMap::default();
     let mut vars: Vec<u32> = Vec::new();
@@ -1623,12 +1630,16 @@ fn regex_possible_chars(r: &WeRegex) -> Option<HashSet<char>> {
             // its character set is unbounded — no finite over-approximation.
             WeRegex::AnyChar | WeRegex::All | WeRegex::Comp(_) => return None,
             WeRegex::Lit(s) => out.extend(s.chars()),
+            // By SMT-LIB code point: a range can span the surrogate block,
+            // whose characters `char`'s own order skips (their carriers sort
+            // above the alphabet, see `ay_core::smtlib_char`).
             WeRegex::Range(lo, hi) => {
-                if (*hi as u32).saturating_sub(*lo as u32) > MAX_RANGE {
+                let (lo, hi) = (smtlib_code_point(*lo), smtlib_code_point(*hi));
+                if hi.saturating_sub(lo) > MAX_RANGE {
                     return None;
                 }
-                for c in *lo..=*hi {
-                    out.insert(c);
+                for code in lo..=hi {
+                    out.insert(smtlib_char(code)?);
                 }
             }
             WeRegex::Concat(xs) | WeRegex::Union(xs) | WeRegex::Inter(xs) => {

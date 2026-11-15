@@ -14,7 +14,7 @@
       "status": "Ready"
     },
     {
-      "surface": "Exact Z3 5.0.0 tactic/probe/simplifier discovery (`-tactics[:NAME]` / `-probes` / `-simplifiers[:NAME]`)",
+      "surface": "Exact Z3 5.0.0 tactic/probe/simplifier discovery",
       "status": "Ready"
     }
   ],
@@ -37,7 +37,7 @@
     },
     {
       "surface": "Models",
-      "status": "Ready"
+      "status": "In progress"
     },
     {
       "surface": "UNSAT proofs",

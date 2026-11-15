@@ -388,10 +388,11 @@ impl Solver {
             "BUG [Family B]: {lrat_failures} LRAT chain verification failure(s) detected",
         );
 
-        // 3. No proof I/O errors.
+        // 3. No LRAT structural failure. A latched proof WRITE failure (disk
+        // full) is excluded: solve_stop_reason ends the solve for it.
         debug_assert!(
-            !manager.has_inprocessing_boundary_error(),
-            "BUG [Family B]: proof I/O error detected at inprocessing boundary",
+            self.proof_output_failed() || !manager.has_inprocessing_boundary_error(),
+            "BUG [Family B]: LRAT structural proof failure at inprocessing boundary",
         );
 
         // 4. Forward checker live count should be ≥ solver active clause count.

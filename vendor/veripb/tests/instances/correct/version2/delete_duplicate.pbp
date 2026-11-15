@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 2.0
+f 0
+red 1 x1 >= 1 ; x1 1
+u 1 x1 >= 1 ;
+del find 1 x1 >= 1 ;
+del id 1
+is_deleted 1 x1 >= 1 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

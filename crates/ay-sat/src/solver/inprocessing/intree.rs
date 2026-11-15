@@ -98,6 +98,10 @@ impl Solver {
         let effort = (ticks_delta * INTREE_EFFORT_PERMILLE / 1000).max(INTREE_MIN_EFFORT);
         let tick_limit = tick_start.saturating_add(effort);
 
+        // Counted work under `--sat-deterministic-inproc`: the root scan reads
+        // every watch list; the BFS below is already in `probe_ticks`.
+        self.charge_inproc_scan(self.watch_scan_te());
+
         // ── Phase 1: Find roots ────────────────────────────────────────
         // A literal `l` is a root if `watches[l]` contains no binary watchers.
         // CMS intree.cpp:fill_roots(). Such literals are leaves of the binary
@@ -233,7 +237,7 @@ impl Solver {
                 // backtrack one level.
                 let had_decision = decided_at_depth.pop().unwrap_or(false);
                 if had_decision && self.decision_level > 0 {
-                    self.backtrack(self.decision_level.saturating_sub(1));
+                    self.backtrack_probe(self.decision_level.saturating_sub(1));
                 }
                 depth_failed.pop();
                 if depth_failed.is_empty() {
@@ -255,7 +259,7 @@ impl Solver {
 
         // Backtrack to level 0 if not already there.
         if self.decision_level > 0 {
-            self.backtrack(0);
+            self.backtrack_probe(0);
         }
 
         // Process any remaining failed literals.
@@ -300,19 +304,22 @@ impl Solver {
         var_states: &[VarState],
         seen: &[bool],
     ) -> bool {
-        if lit.index() >= seen.len() {
+        let li = lit.index();
+        // Out of bounds or already seen.
+        if seen.get(li) != Some(&false) {
             return false;
         }
-        if seen[lit.index()] {
-            return false;
-        }
-        if lit.index() < vals.len() && vals[lit.index()] != 0 {
-            return false;
+        if let Some(&v) = vals.get(li) {
+            if v != 0 {
+                return false;
+            }
         }
         // Skip BVE-eliminated / SCC-substituted variables (#8507).
         let vi = lit.variable().index();
-        if vi < var_states.len() && var_states[vi].is_removed() {
-            return false;
+        if let Some(state) = var_states.get(vi) {
+            if state.is_removed() {
+                return false;
+            }
         }
         true
     }
@@ -346,7 +353,9 @@ impl Solver {
         queue.push_back(IntreeQueueElem {
             propagated: Some(lit),
         });
-        seen[lit.index()] = true;
+        if let Some(slot) = seen.get_mut(lit.index()) {
+            *slot = true;
+        }
 
         // Explicit DFS stack: (node, next watch index to scan for that node).
         let mut stack: Vec<(Literal, usize)> = Vec::new();
@@ -361,25 +370,32 @@ impl Solver {
             let mut opened_child = false;
             while i < len {
                 let bi = i;
-                i += 1;
+                let Some(next_i) = i.checked_add(1) else {
+                    break;
+                };
+                i = next_i;
                 if !ws.is_binary(bi) {
                     continue;
                 }
                 let other = ws.blocker(bi);
                 let neg_other = other.negated();
-                if neg_other.index() < seen.len()
-                    && !seen[neg_other.index()]
-                    && neg_other.index() < vals.len()
-                    && vals[neg_other.index()] == 0
+                let ni = neg_other.index();
+                if seen.get(ni) == Some(&false)
+                    && vals.get(ni) == Some(&0)
                     && Self::intree_node_admits(neg_other, vals, var_states, seen)
                 {
                     // Remember where to resume scanning `cur` after this child's
                     // subtree, then descend into the child (pre-order push).
-                    stack.last_mut().expect("stack non-empty").1 = i;
+                    // The stack is non-empty: `cur` was read from its top.
+                    if let Some(top) = stack.last_mut() {
+                        top.1 = i;
+                    }
                     queue.push_back(IntreeQueueElem {
                         propagated: Some(neg_other),
                     });
-                    seen[neg_other.index()] = true;
+                    if let Some(slot) = seen.get_mut(ni) {
+                        *slot = true;
+                    }
                     stack.push((neg_other, 0));
                     opened_child = true;
                     break;
@@ -481,10 +497,10 @@ impl Solver {
     ///
     /// Used to compute accurate `intree_vars_set` stats (CMS intree.cpp:171).
     fn intree_count_free_vars(&self) -> usize {
-        let mut count = 0;
+        let mut count: usize = 0;
         for vi in 0..self.num_vars {
             if !self.var_is_assigned(vi) && !self.var_lifecycle.is_removed(vi) {
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
         count

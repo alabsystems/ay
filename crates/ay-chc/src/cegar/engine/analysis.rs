@@ -131,6 +131,7 @@ impl CegarEngine {
         let cex = Counterexample {
             steps,
             witness: None,
+            compact_derivation: None,
             ground_derivation: None,
         };
 

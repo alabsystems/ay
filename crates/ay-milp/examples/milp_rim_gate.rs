@@ -15,13 +15,18 @@
 //! - the exact rational optimum, never an `f64` approximation.
 //!
 //! Wall time is recorded to justify the fast/slow tier split, but is not a
-//! verdict currency. The gate still requires a quiet host because a deadline
-//! hit would turn an optimal pin into a machine-dependent result. Every probe
-//! child runs serially under the repository's shared OOM planner and RSS
-//! watchdog; the printed envelope is part of the persisted nightly log.
+//! verdict currency. Neither is the host's load: the probe's `--limit` (600 s
+//! by default, against seconds of solving) is only a hang backstop, and a solve
+//! short of an optimum that it ended, or that the watchdog's timeout ended, is
+//! COULD NOT RUN (exit 2), never a pin and never a drift. So the gate needs no
+//! quiet host, and reads no load average (it once read `/proc/loadavg`, which
+//! macOS lacks, so it never saw one there). Every probe child runs serially
+//! under the repository's shared OOM planner and RSS watchdog, whose build
+//! veto still refuses while a compiler runs; the printed envelope is part of
+//! the persisted nightly log.
 //!
-//! Build the probe and tool before measuring so compilation load cannot trip
-//! the quiet-host precondition:
+//! Build the probe and tool before measuring so the build veto finds no
+//! compiler running:
 //!
 //! ```text
 //! cargo test -p ay-milp --release --lib --no-run
@@ -30,7 +35,7 @@
 //! ```
 //!
 //! Exit status 0 means exact agreement, 1 means solver drift, and 2 means the
-//! harness could not make a trustworthy measurement.
+//! harness could not make a trustworthy measurement (COULD NOT RUN).
 
 #[path = "milp_rim_gate/baseline.rs"]
 mod baseline;
@@ -42,7 +47,7 @@ mod probe;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use baseline::Ratchet;
+use baseline::{Ratchet, Row};
 use cli::{Action, Args};
 use thiserror::Error;
 
@@ -86,7 +91,6 @@ fn ensure_corpora(corpora: &[PathBuf]) -> GateResult<()> {
 
 fn run_check(args: &Args, ratchet: &Ratchet, repo: &Path) -> GateResult<i32> {
     ensure_corpora(&args.corpora)?;
-    probe::require_quiet_host(args.busy_policy)?;
     let resources = probe::plan_resources(repo)?;
     resources.report();
     let probe = probe::resolve(args.probe.as_deref(), repo)?;
@@ -113,11 +117,28 @@ fn run_check(args: &Args, ratchet: &Ratchet, repo: &Path) -> GateResult<i32> {
             measured.missing.join(" ")
         )));
     }
+    // A row the wall backstop ended was decided by the clock: it neither
+    // drifts nor pins (probe::could_not_run).
+    let (unrun, decided): (Vec<Row>, Vec<Row>) =
+        measured.rows.into_iter().partition(probe::could_not_run);
     if args.action == Action::Ratchet {
+        if !unrun.is_empty() {
+            return Err(GateError::setup(format!(
+                "COULD NOT RUN: {} of {} instance(s) ended on the wall backstop ({}); \
+                 not ratcheting pins the clock decided",
+                unrun.len(),
+                wanted.len(),
+                unrun
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )));
+        }
         baseline::write(
             &baseline_path(repo),
             ratchet,
-            &measured.rows,
+            &decided,
             &wanted
                 .iter()
                 .map(|row| row.name.as_str())
@@ -125,14 +146,20 @@ fn run_check(args: &Args, ratchet: &Ratchet, repo: &Path) -> GateResult<i32> {
         )?;
         println!(
             "ratcheted {} instance(s) in .milp_rim_baseline.toml ({:.1}s of solving)",
-            measured.rows.len(),
+            decided.len(),
             started.elapsed().as_secs_f64()
         );
         return Ok(0);
     }
-    let failures = baseline::compare(wanted, &measured.rows);
-    baseline::report(args.tier, wanted, &failures, started.elapsed());
-    Ok(if failures.is_empty() { 0 } else { 1 })
+    let failures = baseline::compare(wanted, &decided);
+    baseline::report(args.tier, wanted, &failures, &unrun, started.elapsed());
+    Ok(if !failures.is_empty() {
+        1
+    } else if !unrun.is_empty() {
+        2
+    } else {
+        0
+    })
 }
 
 fn execute() -> GateResult<i32> {

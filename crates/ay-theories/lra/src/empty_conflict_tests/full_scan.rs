@@ -76,3 +76,56 @@ fn test_full_scan_detects_contradiction_on_high_index_var_9061() {
         "conflict must cite both contradictory bound reasons, got {cited:?}"
     );
 }
+
+/// Once a full pre-scan has verified every var and all later bound
+/// writes are recorded in `vars_tightened_since_simplex`, the pre-scan
+/// may scan only the tightened vars (ascending) even at full-check
+/// budgets — it must still detect a contradiction introduced through
+/// the assert paths on a high-index var, and cite the same reasons
+/// the full scan would.
+#[test]
+fn test_targeted_pre_scan_detects_contradiction_on_high_index_var() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+    let big = terms.mk_rational(BigRational::from(BigInt::from(639)));
+
+    // 70 real vars, each with a feasible bound atom asserted, so the
+    // LRA var table grows past the legacy 64-var targeted buffer.
+    let mut vars = Vec::new();
+    let mut solver = LraSolver::new(&terms);
+    for i in 0..70 {
+        let v = terms.mk_var(format!("v{i}"), Sort::Real);
+        vars.push(v);
+        let ge = terms.mk_ge(v, zero);
+        solver.assert_literal(ge, true);
+    }
+    assert!(
+        matches!(solver.check(), TheoryResult::Sat),
+        "base bounds must be SAT"
+    );
+    assert_eq!(solver.pre_scan_targeted_count, 0);
+
+    // Contradict the last var through the assert paths (recorded in
+    // vars_tightened_since_simplex): v69 >= 639 and v69 <= 0.
+    let last = vars[69];
+    let lo = terms.mk_ge(last, big);
+    let hi = terms.mk_le(last, zero);
+    solver.assert_literal(lo, true);
+    solver.assert_literal(hi, true);
+
+    let result = solver.check();
+    let lits = match result {
+        TheoryResult::UnsatWithFarkas(c) => c.literals,
+        TheoryResult::Unsat(l) => l,
+        other => panic!("tightened contradiction must be UNSAT, got {other:?}"),
+    };
+    let cited: Vec<TermId> = lits.iter().map(|l| l.term).collect();
+    assert!(
+        cited.contains(&lo) && cited.contains(&hi),
+        "conflict must cite both contradictory bound reasons, got {cited:?}"
+    );
+    assert!(
+        solver.pre_scan_targeted_count >= 1,
+        "second check must use the sorted-targeted pre-scan"
+    );
+}

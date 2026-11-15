@@ -10,10 +10,7 @@
 
 use ay_dpll::api::Sort;
 
-use super::{
-    ffi_guard_ast, lookup_ast_sort, record_ast_sort, require_term_ast_or_return, term_to_ast,
-    Z3_ast, Z3_context,
-};
+use super::{ffi_guard_mk, mk_ast, require_ast_or_return, stated_sort, Z3_ast, Z3_context};
 
 // ---- BV overflow/underflow check operations ----
 // These return Bool-sorted AST nodes that are true iff the operation
@@ -35,15 +32,13 @@ pub unsafe extern "C" fn Z3_mk_bvadd_no_overflow(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvadd_no_overflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvadd_no_overflow", "left operand", 0);
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvadd_no_overflow", "left operand", 0).term;
             let t2 =
-                require_term_ast_or_return!(ctx, t2, "Z3_mk_bvadd_no_overflow", "right operand", 0);
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvadd_no_overflow", "right operand", 0).term;
             let t = ctx.solver.bvadd_no_overflow(t1, t2, is_signed);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -59,20 +54,14 @@ pub unsafe extern "C" fn Z3_mk_bvadd_no_underflow(c: Z3_context, t1: Z3_ast, t2:
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvadd_no_underflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvadd_no_underflow", "left operand", 0);
-            let t2 = require_term_ast_or_return!(
-                ctx,
-                t2,
-                "Z3_mk_bvadd_no_underflow",
-                "right operand",
-                0
-            );
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvadd_no_underflow", "left operand", 0).term;
+            let t2 =
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvadd_no_underflow", "right operand", 0)
+                    .term;
             let t = ctx.solver.bvadd_no_underflow(t1, t2);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -88,15 +77,13 @@ pub unsafe extern "C" fn Z3_mk_bvsub_no_overflow(c: Z3_context, t1: Z3_ast, t2: 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvsub_no_overflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvsub_no_overflow", "left operand", 0);
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvsub_no_overflow", "left operand", 0).term;
             let t2 =
-                require_term_ast_or_return!(ctx, t2, "Z3_mk_bvsub_no_overflow", "right operand", 0);
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvsub_no_overflow", "right operand", 0).term;
             let t = ctx.solver.bvsub_no_overflow(t1, t2);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -117,20 +104,14 @@ pub unsafe extern "C" fn Z3_mk_bvsub_no_underflow(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvsub_no_underflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvsub_no_underflow", "left operand", 0);
-            let t2 = require_term_ast_or_return!(
-                ctx,
-                t2,
-                "Z3_mk_bvsub_no_underflow",
-                "right operand",
-                0
-            );
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvsub_no_underflow", "left operand", 0).term;
+            let t2 =
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvsub_no_underflow", "right operand", 0)
+                    .term;
             let t = ctx.solver.bvsub_no_underflow(t1, t2, is_signed);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -146,20 +127,14 @@ pub unsafe extern "C" fn Z3_mk_bvsdiv_no_overflow(c: Z3_context, t1: Z3_ast, t2:
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvsdiv_no_overflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvsdiv_no_overflow", "left operand", 0);
-            let t2 = require_term_ast_or_return!(
-                ctx,
-                t2,
-                "Z3_mk_bvsdiv_no_overflow",
-                "right operand",
-                0
-            );
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvsdiv_no_overflow", "left operand", 0).term;
+            let t2 =
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvsdiv_no_overflow", "right operand", 0)
+                    .term;
             let t = ctx.solver.bvsdiv_no_overflow(t1, t2);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -175,12 +150,10 @@ pub unsafe extern "C" fn Z3_mk_bvneg_no_overflow(c: Z3_context, t1: Z3_ast) -> Z
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvneg_no_overflow", "operand", 0);
+        ffi_guard_mk(c, "Z3_mk_bvneg_no_overflow", |ctx| {
+            let t1 = require_ast_or_return!(ctx, t1, "Z3_mk_bvneg_no_overflow", "operand", 0).term;
             let t = ctx.solver.bvneg_no_overflow(t1);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -201,15 +174,13 @@ pub unsafe extern "C" fn Z3_mk_bvmul_no_overflow(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvmul_no_overflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvmul_no_overflow", "left operand", 0);
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvmul_no_overflow", "left operand", 0).term;
             let t2 =
-                require_term_ast_or_return!(ctx, t2, "Z3_mk_bvmul_no_overflow", "right operand", 0);
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvmul_no_overflow", "right operand", 0).term;
             let t = ctx.solver.bvmul_no_overflow(t1, t2, is_signed);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -225,20 +196,14 @@ pub unsafe extern "C" fn Z3_mk_bvmul_no_underflow(c: Z3_context, t1: Z3_ast, t2:
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_bvmul_no_underflow", |ctx| {
             let t1 =
-                require_term_ast_or_return!(ctx, t1, "Z3_mk_bvmul_no_underflow", "left operand", 0);
-            let t2 = require_term_ast_or_return!(
-                ctx,
-                t2,
-                "Z3_mk_bvmul_no_underflow",
-                "right operand",
-                0
-            );
+                require_ast_or_return!(ctx, t1, "Z3_mk_bvmul_no_underflow", "left operand", 0).term;
+            let t2 =
+                require_ast_or_return!(ctx, t2, "Z3_mk_bvmul_no_underflow", "right operand", 0)
+                    .term;
             let t = ctx.solver.bvmul_no_underflow(t1, t2);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            mk_ast(ctx, t, Sort::Bool)
         })
     }
 }
@@ -256,9 +221,10 @@ pub unsafe extern "C" fn Z3_mk_bvredand(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvredand", "operand", 0);
-            let width = match lookup_ast_sort(ctx, t1) {
+        ffi_guard_mk(c, "Z3_mk_bvredand", |ctx| {
+            let operand = require_ast_or_return!(ctx, t1, "Z3_mk_bvredand", "operand", 0);
+            let term = operand.term;
+            let width = match stated_sort(ctx, operand) {
                 Some(Sort::BitVec(bv)) => bv.width,
                 _ => return 0,
             };
@@ -270,9 +236,7 @@ pub unsafe extern "C" fn Z3_mk_bvredand(c: Z3_context, t1: Z3_ast) -> Z3_ast {
             let one = ctx.solver.bv_const(1, 1);
             let zero = ctx.solver.bv_const(0, 1);
             let t = ctx.solver.ite(eq, one, zero);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(1));
-            a
+            mk_ast(ctx, t, Sort::bitvec(1))
         })
     }
 }
@@ -288,9 +252,10 @@ pub unsafe extern "C" fn Z3_mk_bvredor(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvredor", "operand", 0);
-            let width = match lookup_ast_sort(ctx, t1) {
+        ffi_guard_mk(c, "Z3_mk_bvredor", |ctx| {
+            let operand = require_ast_or_return!(ctx, t1, "Z3_mk_bvredor", "operand", 0);
+            let term = operand.term;
+            let width = match stated_sort(ctx, operand) {
                 Some(Sort::BitVec(bv)) => bv.width,
                 _ => return 0,
             };
@@ -302,9 +267,7 @@ pub unsafe extern "C" fn Z3_mk_bvredor(c: Z3_context, t1: Z3_ast) -> Z3_ast {
             let one = ctx.solver.bv_const(1, 1);
             let zero = ctx.solver.bv_const(0, 1);
             let t = ctx.solver.ite(neq, one, zero);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::bitvec(1));
-            a
+            mk_ast(ctx, t, Sort::bitvec(1))
         })
     }
 }

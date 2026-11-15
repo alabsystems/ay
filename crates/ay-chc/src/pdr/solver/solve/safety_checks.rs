@@ -110,8 +110,77 @@ impl PdrSolver {
         let mut any_unknown = false;
         // Collect queries upfront to avoid borrowing self.problem across
         // the mutable self.check_sat_via_executor_backend() call (#7984).
-        let queries: Vec<_> = self.problem.queries().cloned().collect();
-        for query in &queries {
+        let queries: Vec<(usize, crate::HornClause)> = self
+            .problem
+            .clauses()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_query())
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
+        for (query_index, query) in &queries {
+            if query.body.predicates.is_empty() {
+                // No relation needs a producing fact: this query is already
+                // a depth-zero violation exactly when its theory guard is
+                // satisfiable. Nullary expansion can expose this shape after
+                // constant projection. It must not wait for a predicate POB
+                // that this clause can never generate.
+                let constraint = query.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
+                match self.check_sat_via_executor_backend(&constraint) {
+                    SmtResult::Sat(mut env) => {
+                        // Carry the exact depth-zero clause instance. An empty
+                        // trace loses this query's satisfying local assignment
+                        // and cannot be replayed by a fresh verifier.
+                        let owner = self.input_restatement_owner();
+                        let _memory = owner.install_memory();
+                        if !owner.open() {
+                            return InitResult::Interrupted;
+                        }
+                        let complete = crate::ground_derivation::complete::complete_env_for_clause(
+                            query, &mut env,
+                        );
+                        if !owner.open() {
+                            return InitResult::Interrupted;
+                        }
+                        if !complete {
+                            any_unknown = true;
+                            continue;
+                        }
+                        let derivation = crate::ground_derivation::GroundDerivation {
+                            steps: vec![crate::ground_derivation::GroundDerivationStep {
+                                clause_index: *query_index,
+                                env,
+                                premises: Vec::new(),
+                            }],
+                            query_step: 0,
+                        };
+                        match crate::ground_derivation::validate_ground_derivation_with_progress(
+                            &self.problem,
+                            &derivation,
+                            &mut || owner.open(),
+                        ) {
+                            Ok(()) => {
+                                if !owner.open() {
+                                    return InitResult::Interrupted;
+                                }
+                                return InitResult::UnsafeWithEvidence(
+                                    Counterexample::new(Vec::new())
+                                        .with_ground_derivation(derivation),
+                                );
+                            }
+                            Err(crate::ground_derivation::GroundDerivationError::Interrupted) => {
+                                return InitResult::Interrupted;
+                            }
+                            Err(_) => any_unknown = true,
+                        }
+                    }
+                    SmtResult::Unsat
+                    | SmtResult::UnsatWithCore(_)
+                    | SmtResult::UnsatWithFarkas(_) => {}
+                    SmtResult::Unknown => any_unknown = true,
+                }
+                continue;
+            }
             if query.body.predicates.len() != 1 {
                 // Multi-predicate queries can't be checked against individual
                 // facts. Skip rather than bail — PDR will discover unsafety
@@ -122,7 +191,24 @@ impl PdrSolver {
 
             let (pred, args) = &query.body.predicates[0];
             let constraint = query.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
-            let bad_state = match self.constraint_to_canonical_state(*pred, args, &constraint) {
+            // `bad_state` meets the fact clauses below: the query clause is
+            // renamed apart first, so its locals keep fresh names in the
+            // canonical state (`rename_clause_apart`).
+            let Some(names) = self.source_names() else {
+                any_unknown = true;
+                continue;
+            };
+            let Some((constraint, args)) = self.rename_clause_apart(
+                &names,
+                &format!("__query{query_index}_"),
+                &constraint,
+                args,
+                std::iter::empty(),
+            ) else {
+                any_unknown = true;
+                continue;
+            };
+            let bad_state = match self.constraint_to_canonical_state(*pred, &args, &constraint) {
                 Some(s) => s,
                 None => {
                     any_unknown = true;
@@ -130,18 +216,32 @@ impl PdrSolver {
                 }
             };
 
-            let facts: Vec<_> = self
+            let facts: Vec<(usize, crate::HornClause)> = self
                 .problem
-                .facts()
-                .filter(|f| f.head.predicate_id() == Some(*pred))
-                .cloned()
+                .clauses()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_fact() && c.head.predicate_id() == Some(*pred))
+                .map(|(i, c)| (i, c.clone()))
                 .collect();
-            for fact in &facts {
+            for (fact_index, fact) in &facts {
                 let fact_constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
                 let head_args = match &fact.head {
                     crate::ClauseHead::Predicate(_, a) => a.as_slice(),
                     crate::ClauseHead::False => continue,
                 };
+                // The fact renamed apart as well (`rename_clause_apart`).
+                let Some((fact_constraint, head_args)) = self.rename_clause_apart(
+                    &names,
+                    &format!("__fact{fact_index}_"),
+                    &fact_constraint,
+                    head_args,
+                    [&bad_state],
+                ) else {
+                    any_unknown = true;
+                    continue;
+                };
+                let head_args = head_args.as_slice();
                 let bad_on_fact = match self.apply_to_args(*pred, &bad_state, head_args) {
                     Some(e) => e,
                     None => {
@@ -200,24 +300,45 @@ impl PdrSolver {
             .cloned()
             .collect();
 
-        let facts: Vec<_> = self.problem.facts().cloned().collect();
+        let facts: Vec<(usize, crate::HornClause)> = self
+            .problem
+            .clauses()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_fact() && !c.is_query())
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
 
         if queries.is_empty() {
             return None;
         }
 
         // Collect facts per predicate in canonical vars for model building.
-        let mut pred_fact_constraints: FxHashMap<PredicateId, Vec<ChcExpr>> = FxHashMap::default();
-        for fact in &facts {
+        let mut pred_fact_constraints: FxHashMap<PredicateId, Vec<(usize, ChcExpr)>> =
+            FxHashMap::default();
+        // Facts a query check below proved unsatisfiable on their own.
+        let mut facts_unsat_alone = ay_core::kani_compat::DetHashSet::default();
+        for (fact_index, fact) in &facts {
             if let crate::ClauseHead::Predicate(pred_id, head_args) = &fact.head {
                 let constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
+                // Renamed apart, the fact's local variables can never be
+                // captured by a clause variable of the same name; the model
+                // builder (`acyclic_model`) closes them before verification.
+                let names = self.source_names()?;
+                let (constraint, head_args) = self.rename_clause_apart(
+                    &names,
+                    &format!("__fact{fact_index}_"),
+                    &constraint,
+                    head_args,
+                    std::iter::empty(),
+                )?;
                 if let Some(canonical) =
-                    self.constraint_to_canonical_state(*pred_id, head_args, &constraint)
+                    self.constraint_to_canonical_state(*pred_id, &head_args, &constraint)
                 {
                     pred_fact_constraints
                         .entry(*pred_id)
                         .or_default()
-                        .push(canonical);
+                        .push((*fact_index, canonical));
                 }
             }
         }
@@ -286,7 +407,7 @@ impl PdrSolver {
                 // Gather relevant fact clauses for this predicate.
                 let relevant_facts: Vec<_> = facts
                     .iter()
-                    .filter(|f| f.head.predicate_id() == Some(*pred_id))
+                    .filter(|(_, f)| f.head.predicate_id() == Some(*pred_id))
                     .collect();
 
                 if relevant_facts.is_empty() {
@@ -302,7 +423,7 @@ impl PdrSolver {
 
                 // Check each fact separately. Safety holds iff ALL facts give Unsat.
                 let mut all_unsat = true;
-                for (fi, fact) in relevant_facts.iter().enumerate() {
+                for (fi, (fact_index, fact)) in relevant_facts.iter().enumerate() {
                     if self.is_cancelled() {
                         return None;
                     }
@@ -311,6 +432,18 @@ impl PdrSolver {
                     };
                     let fact_constraint =
                         fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
+                    // Fact and query are separate clauses: rename the fact
+                    // apart (`rename_clause_apart`); they meet only through the
+                    // positional argument equalities below.
+                    let names = self.source_names()?;
+                    let (fact_constraint, fact_head_args) = self.rename_clause_apart(
+                        &names,
+                        &format!("__fact{fact_index}_"),
+                        &fact_constraint,
+                        fact_head_args,
+                        [&query_constraint].into_iter().chain(query_args.iter()),
+                    )?;
+                    let fact_head_args = fact_head_args.as_slice();
 
                     if fact_head_args.len() != query_args.len() {
                         if self.config.verbose {
@@ -335,7 +468,14 @@ impl PdrSolver {
                     match self.check_sat_via_executor_backend(&bounded) {
                         SmtResult::Unsat
                         | SmtResult::UnsatWithCore(_)
-                        | SmtResult::UnsatWithFarkas(_) => {}
+                        | SmtResult::UnsatWithFarkas(_) => {
+                            // No arguments and a `true` query: the check was the fact alone.
+                            if query_args.is_empty()
+                                && matches!(query_constraint, ChcExpr::Bool(true))
+                            {
+                                facts_unsat_alone.insert(*fact_index);
+                            }
+                        }
                         SmtResult::Sat(_) => {
                             if self.config.verbose {
                                 safe_eprintln!(
@@ -389,27 +529,9 @@ impl PdrSolver {
             );
         }
 
-        // Build model: each predicate maps to its fact-based invariant.
-        let mut model = InvariantModel::new();
-        for pred in self.problem.predicates() {
-            let vars = self
-                .caches
-                .predicate_vars
-                .get(&pred.id)
-                .cloned()
-                .unwrap_or_default();
-            let formula = match pred_fact_constraints.get(&pred.id) {
-                Some(disjuncts) if !disjuncts.is_empty() => {
-                    if disjuncts.len() == 1 {
-                        disjuncts[0].clone()
-                    } else {
-                        ChcExpr::or_all(disjuncts.clone())
-                    }
-                }
-                _ => ChcExpr::Bool(false),
-            };
-            model.set(pred.id, PredicateInterpretation::new(vars, formula));
-        }
+        // Build model: each predicate maps to its fact-based invariant, with
+        // every disjunct closed over fact-local variables (`acyclic_model`).
+        let model = self.build_acyclic_safety_model(&pred_fact_constraints, &facts_unsat_alone)?;
 
         // Verify the model through normal verification pipeline.
         if self.verify_model(&model) {
@@ -427,6 +549,7 @@ impl PdrSolver {
         Counterexample {
             steps: Vec::new(),
             witness: None,
+            compact_derivation: None,
             ground_derivation: None,
         }
     }

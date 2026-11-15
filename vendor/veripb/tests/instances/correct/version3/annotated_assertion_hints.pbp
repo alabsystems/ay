@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: ignore(elaborate)
+f 1;
+a 1 ~x1 >= 1 : 2 : some_valid_identifier_name : 
+completely - arbitary ?! free 
+        text 12345
+        potentially across
+    -- multiple 
+    === lines
+;
+e 1 ~x1 >= 1 : 2;
+rup 1 ~x3 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

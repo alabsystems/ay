@@ -118,6 +118,24 @@ impl AlethePrinter<'_> {
         }
         self.write_term_into(out, term_id);
     }
+
+    /// The text [`Self::format_clause`] prints for one clause literal. A
+    /// judge of a printed clause must read THIS, not [`Self::format_term`]:
+    /// the two differ exactly when a `Not(inner)` literal carries its own
+    /// source override while `inner` has a confined bridge rendering.
+    pub(super) fn format_derived_literal(&self, term_id: TermId) -> String {
+        let mut out = String::new();
+        self.write_derived_literal_into(&mut out, term_id);
+        out
+    }
+
+    /// [`Self::format_derived_literal`] of every literal of `clause`.
+    pub(super) fn format_derived_clause_literals(&self, clause: &[TermId]) -> Vec<String> {
+        clause
+            .iter()
+            .map(|&literal| self.format_derived_literal(literal))
+            .collect()
+    }
 }
 
 /// Match the occurrence-sensitive subset accepted by AY's native explicit

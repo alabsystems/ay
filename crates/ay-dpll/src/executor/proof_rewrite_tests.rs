@@ -64,7 +64,8 @@ fn test_rewrite_proof_terms_canonicalized_leq_to_geq() {
     let mut rewrites = HashMap::default();
     rewrites.insert(leq_b_a, geq_a_b);
 
-    Executor::rewrite_proof_terms(&mut terms, &mut proof, &rewrites);
+    Executor::rewrite_proof_terms(&mut terms, &mut proof, &rewrites)
+        .expect("ordinary proof steps support term rewriting");
 
     // Assume step should now reference the surface form
     assert!(

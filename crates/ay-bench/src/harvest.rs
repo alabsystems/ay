@@ -237,8 +237,13 @@ impl BaselineStore {
     pub fn replace_campaign(&mut self, rows: &[BaselineRow]) -> Result<()> {
         self.verify_authority()?;
         validate_uniform_campaign(rows)?;
-        let corpus = &rows[0].corpus;
-        let solver = &rows[0].solver;
+        let Some(first) = rows.first() else {
+            return Err(BenchError::msg(
+                "refusing to publish an empty baseline campaign",
+            ));
+        };
+        let corpus = &first.corpus;
+        let solver = &first.solver;
         let tx = self.conn.transaction().bench_context("begin campaign tx")?;
         tx.execute(
             "DELETE FROM baselines WHERE corpus = ?1 AND solver = ?2",
@@ -709,7 +714,9 @@ pub fn cmd_harvest(args: HarvestArgs) -> Result<usize> {
             .par_iter()
             .map(|(file, benchmark_id)| {
                 let r = harvest_one(file, benchmark_id, &harvest_context);
-                let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let done = counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1);
                 if done.is_multiple_of(10) || done == total {
                     if let Ok(row) = &r {
                         eprintln!(
@@ -945,22 +952,38 @@ impl PipeCapture {
                         break;
                     }
                 };
-                hasher.update(&chunk[..read]);
+                // `Read` promises `read <= chunk.len()`; a reader that breaks
+                // that promise is a failed read, not an out-of-bounds slice.
+                let Some(bytes) = chunk.get(..read) else {
+                    read_failed = true;
+                    break;
+                };
+                hasher.update(bytes);
                 total_len = total_len.saturating_add(read);
-                let head_read = read.min(CAPTURE_HEAD_BYTES.saturating_sub(head.len()));
-                head.extend_from_slice(&chunk[..head_read]);
-                if head_read < read {
-                    let trailing = chunk[head_read..read].to_vec();
-                    tail_len += trailing.len();
-                    tail.push_back(trailing);
-                    while tail_len > CAPTURE_TAIL_BYTES {
-                        let excess = tail_len - CAPTURE_TAIL_BYTES;
+                // Everything fits in the head when the room left is at least
+                // the chunk; otherwise the chunk splits at the room left.
+                let head_room = CAPTURE_HEAD_BYTES.saturating_sub(head.len());
+                let (head_part, trailing) =
+                    bytes.split_at_checked(head_room).unwrap_or((bytes, &[]));
+                head.extend_from_slice(head_part);
+                if !trailing.is_empty() {
+                    let Some(new_tail_len) = tail_len.checked_add(trailing.len()) else {
+                        read_failed = true;
+                        break;
+                    };
+                    tail_len = new_tail_len;
+                    tail.push_back(trailing.to_vec());
+                    loop {
+                        let excess = tail_len.saturating_sub(CAPTURE_TAIL_BYTES);
+                        if excess == 0 {
+                            break;
+                        }
                         let Some(front) = tail.front_mut() else {
                             break;
                         };
                         let remove = excess.min(front.len());
                         front.drain(..remove);
-                        tail_len -= remove;
+                        tail_len = tail_len.saturating_sub(remove);
                         if front.is_empty() {
                             tail.pop_front();
                         }
@@ -1095,7 +1118,7 @@ fn run_solver(
     cmd.envs(&solver_env);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let (mut child, watchdog) = match resources.spawn_external_child(&mut cmd, "ay bench harvest") {
+    let mut child = match resources.spawn_owned_child(&mut cmd, "ay bench harvest") {
         Ok(guarded) => guarded,
         Err(e) => {
             let mut outcome = SolverOutcome::harness_error(format!("spawn failed: {e}"));
@@ -1104,10 +1127,9 @@ fn run_solver(
             return outcome;
         }
     };
-    let stdout_capture = child.stdout.take().map(PipeCapture::start);
-    let stderr_capture = child.stderr.take().map(PipeCapture::start);
-    let outcome =
-        crate::resource::wait_for_guarded_child(&mut child, watchdog, timeout, "ay bench harvest");
+    let stdout_capture = child.take_stdout().map(PipeCapture::start);
+    let stderr_capture = child.take_stderr().map(PipeCapture::start);
+    let outcome = child.wait(timeout);
     let elapsed_ms = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let stdout = stdout_capture
         .map(PipeCapture::finish)
@@ -1276,12 +1298,18 @@ pub(crate) fn read_expected_for_id(path: &Path, benchmark_id: &str) -> Result<Ex
             "benchmark expected-status conflict between SMT-LIB header {header:?} and corpus-relative path {path_label:?}: {benchmark_id}",
         )));
     }
-    let (value, source) = match (header, path_label) {
-        (Some(value), Some(_)) => (Some(value), "header+path"),
-        (Some(value), None) => (Some(value), "header"),
-        (None, Some(value)) => (Some(value), "path"),
-        (None, None) => (None, "unknown"),
+    // Decide the source on two booleans rather than on the tuple of call-
+    // returned `Option`s: the enum match ends in an `unreachable` arm that
+    // per-function verification cannot rule out, and a `bool` match has none.
+    // When both labels exist they are equal (checked above), so the header's
+    // value is the same one the path would give.
+    let source = match (header.is_some(), path_label.is_some()) {
+        (true, true) => "header+path",
+        (true, false) => "header",
+        (false, true) => "path",
+        (false, false) => "unknown",
     };
+    let value = header.or(path_label);
     Ok(ExpectedLabel { value, source })
 }
 
@@ -1324,7 +1352,12 @@ fn base_extension(path: &str) -> &str {
     let without_compression = [".xz", ".gz", ".bz2"]
         .iter()
         .find(|suffix| lower.ends_with(**suffix))
-        .map_or(path, |suffix| &path[..path.len() - suffix.len()]);
+        .map_or(path, |suffix| {
+            path.len()
+                .checked_sub(suffix.len())
+                .and_then(|stem_len| path.get(..stem_len))
+                .unwrap_or(path)
+        });
     without_compression
         .rsplit_once('.')
         .map_or("", |(_, ext)| ext)
@@ -1376,22 +1409,29 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
         if command.first().is_some_and(|value| value == "set-info")
             && command.get(1).is_some_and(|value| value == ":status")
         {
-            if command.len() != 3 || !matches!(command[2].as_str(), "sat" | "unsat" | "unknown") {
-                return Err(BenchError::msg(
-                    "invalid SMT-LIB (set-info :status ...) declaration",
-                ));
-            }
-            observe(&mut metadata.status, &command[2], ":status")?;
+            let status = match command {
+                [_, _, status] if matches!(status.as_str(), "sat" | "unsat" | "unknown") => status,
+                _ => {
+                    return Err(BenchError::msg(
+                        "invalid SMT-LIB (set-info :status ...) declaration",
+                    ));
+                }
+            };
+            observe(&mut metadata.status, status, ":status")?;
         } else if command.first().is_some_and(|value| value == "set-logic") {
-            if command.len() != 2
-                || command[1].starts_with('<')
-                || command[1].chars().any(char::is_whitespace)
-            {
-                return Err(BenchError::msg(
-                    "invalid SMT-LIB (set-logic ...) declaration",
-                ));
-            }
-            observe(&mut metadata.logic, &command[1], "set-logic")?;
+            let logic = match command {
+                [_, logic]
+                    if !logic.starts_with('<') && !logic.chars().any(char::is_whitespace) =>
+                {
+                    logic
+                }
+                _ => {
+                    return Err(BenchError::msg(
+                        "invalid SMT-LIB (set-logic ...) declaration",
+                    ));
+                }
+            };
+            observe(&mut metadata.logic, logic, "set-logic")?;
         }
         Ok(())
     }
@@ -1410,24 +1450,34 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
         }
         let mut index = 0_usize;
         while index < read {
-            let byte = buffer[index];
+            // `Read` promises `read <= buffer.len()`; a reader that breaks
+            // that promise is refused rather than indexed past the buffer.
+            let Some(&byte) = buffer.get(index) else {
+                return Err(BenchError::msg(
+                    "SMT-LIB reader reported more bytes than its buffer holds",
+                ));
+            };
+            // `index < read` bounds this below `usize::MAX`.
+            let next = index
+                .checked_add(1)
+                .ok_or_else(|| BenchError::msg("SMT-LIB scan offset overflow"))?;
             match state {
                 State::Comment => {
                     if byte == b'\n' {
                         state = State::Normal;
                     }
-                    index += 1;
+                    index = next;
                 }
                 State::String => {
                     if byte == b'"' {
                         state = State::StringQuote;
                     }
-                    index += 1;
+                    index = next;
                 }
                 State::StringQuote => {
                     if byte == b'"' {
                         state = State::String;
-                        index += 1;
+                        index = next;
                     } else {
                         state = State::Normal;
                     }
@@ -1436,7 +1486,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                     if byte == b'|' {
                         state = State::Normal;
                     }
-                    index += 1;
+                    index = next;
                 }
                 State::Normal => match byte {
                     b';' => {
@@ -1444,7 +1494,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                             push_token(&mut command, &mut token, &mut token_oversized)?;
                         }
                         state = State::Comment;
-                        index += 1;
+                        index = next;
                     }
                     b'"' | b'|' => {
                         if depth == 1 {
@@ -1458,7 +1508,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                         } else {
                             State::Quoted
                         };
-                        index += 1;
+                        index = next;
                     }
                     b'(' => {
                         if depth == 1 {
@@ -1470,7 +1520,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                         depth = depth
                             .checked_add(1)
                             .ok_or_else(|| BenchError::msg("SMT-LIB nesting depth overflow"))?;
-                        index += 1;
+                        index = next;
                     }
                     b')' => {
                         if depth == 0 {
@@ -1483,13 +1533,13 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                             finish_command(&command, &mut metadata)?;
                         }
                         depth -= 1;
-                        index += 1;
+                        index = next;
                     }
                     byte if byte.is_ascii_whitespace() => {
                         if depth == 1 {
                             push_token(&mut command, &mut token, &mut token_oversized)?;
                         }
-                        index += 1;
+                        index = next;
                     }
                     _ => {
                         if depth == 1 && command.len() < 4 {
@@ -1499,7 +1549,7 @@ fn scan_smtlib_metadata(reader: &mut impl Read) -> Result<SmtMetadata> {
                                 token_oversized = true;
                             }
                         }
-                        index += 1;
+                        index = next;
                     }
                 },
             }
@@ -1673,7 +1723,13 @@ fn hash_file(path: &Path) -> Result<String> {
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        let bytes = buffer.get(..read).ok_or_else(|| {
+            BenchError::msg(format!(
+                "reading {} reported more bytes than its buffer holds",
+                path.display()
+            ))
+        })?;
+        hasher.update(bytes);
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
@@ -1683,6 +1739,15 @@ fn hash_file(path: &Path) -> Result<String> {
 // ===================================================================
 
 fn resolve_solver(name_or_path: &str) -> Option<PathBuf> {
+    // z3 is AY's reference oracle: a baseline is only z3's when the binary
+    // proved it is z3, and a name lookup can land on a reroute stub (or an AY
+    // drop-in) instead. Take the workspace's one identity-checked resolution.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if name_or_path == "z3" {
+        return ay_sys::z3_oracle::z3_oracle()
+            .ok()
+            .map(|oracle| oracle.path().to_path_buf());
+    }
     let p = Path::new(name_or_path);
     if p.is_absolute() || name_or_path.contains('/') {
         if p.exists() {
@@ -1738,7 +1803,8 @@ fn truncate(s: &str, max: usize) -> String {
             .rev()
             .find(|index| s.is_char_boundary(*index))
             .unwrap_or(0);
-        s[..cut].to_string()
+        // `cut` is a char boundary no greater than `max < s.len()`.
+        s.get(..cut).unwrap_or_default().to_string()
     }
 }
 
@@ -1747,12 +1813,12 @@ fn truncate_head_tail(s: &str, max: usize) -> String {
         return truncate(s, max);
     }
     const MARKER: &str = "\n[... truncated ...]\n";
-    if max <= MARKER.len() {
+    let content_budget = max.saturating_sub(MARKER.len());
+    if content_budget == 0 {
         return truncate(s, max);
     }
-    let content_budget = max - MARKER.len();
     let head_budget = content_budget / 2;
-    let tail_budget = content_budget - head_budget;
+    let tail_budget = content_budget.saturating_sub(head_budget);
     let head_end = (0..=head_budget)
         .rev()
         .find(|index| s.is_char_boundary(*index))
@@ -1760,7 +1826,10 @@ fn truncate_head_tail(s: &str, max: usize) -> String {
     let tail_start = (s.len().saturating_sub(tail_budget)..s.len())
         .find(|index| s.is_char_boundary(*index))
         .unwrap_or(s.len());
-    format!("{}{MARKER}{}", &s[..head_end], &s[tail_start..])
+    // Both cuts are char boundaries within `s`.
+    let head = s.get(..head_end).unwrap_or_default();
+    let tail = s.get(tail_start..).unwrap_or_default();
+    format!("{head}{MARKER}{tail}")
 }
 
 fn current_iso8601() -> String {
@@ -2149,7 +2218,10 @@ fn extract_result_items(doc: &serde_json::Value) -> Result<Vec<VerifyResultItem>
         });
     };
 
-    let mut out = Vec::with_capacity(arr.len());
+    let mut out = Vec::new();
+    out.try_reserve(arr.len()).map_err(|_| {
+        BenchError::msg(format!("cannot allocate {} verify result items", arr.len()))
+    })?;
     for v in arr {
         let file = v
             .get("file")
@@ -2335,10 +2407,11 @@ mod tests {
         let output = capture.finish();
         assert!(output.text.len() <= CAPTURE_LIMIT_BYTES + 64);
         assert!(output.incomplete());
+        let tail_start = output.text.len().saturating_sub(32);
         assert!(
             output.text.ends_with("\nsat\n"),
             "{}",
-            &output.text[output.text.len() - 32..]
+            String::from_utf8_lossy(output.text.as_bytes().get(tail_start..).unwrap_or_default())
         );
     }
 
@@ -2604,6 +2677,43 @@ mod tests {
             .expect_err("header/path conflict must fail");
         assert!(error.to_string().contains("expected-status conflict"));
         assert!(expected_from_relative_id("sat/unsat/case.smt2").is_err());
+    }
+
+    #[test]
+    fn expected_label_names_every_source_it_used(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let with_header = dir.path().join("with-header.smt2");
+        std::fs::write(&with_header, "(set-info :status unsat)\n(check-sat)\n")?;
+        let plain = dir.path().join("plain.smt2");
+        std::fs::write(&plain, "(check-sat)\n")?;
+        let cases = [
+            (
+                &with_header,
+                "neutral/with-header.smt2",
+                Some("unsat"),
+                "header",
+            ),
+            (
+                &with_header,
+                "unsat/with-header.smt2",
+                Some("unsat"),
+                "header+path",
+            ),
+            (&plain, "sat/plain.smt2", Some("sat"), "path"),
+            (&plain, "neutral/plain.smt2", None, "unknown"),
+        ];
+        for (path, id, value, source) in cases {
+            let label = read_expected_for_id(path, id)?;
+            if label.value.as_deref() != value || label.source != source {
+                return Err(format!(
+                    "{id}: expected {value:?} from {source}, got {:?} from {}",
+                    label.value, label.source
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
 
     #[test]

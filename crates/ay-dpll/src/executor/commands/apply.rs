@@ -38,7 +38,109 @@ impl Executor {
     /// (e.g. `split-clause`) yields SEVERAL `(goal ...)` blocks whose disjunction
     /// is equisatisfiable to the input; a failing tactic (e.g. `fail`) prints an
     /// honest `(error "tactic failed: ...")`, exactly like Z3.
-    pub(crate) fn apply_tactic_goal(&mut self, tactic: &ApplyTactic) -> String {
+    pub(crate) fn apply_tactic_goal(
+        &mut self,
+        tactic: &ApplyTactic,
+    ) -> Result<String, crate::executor::ExecutorError> {
+        let _read = self.begin_external_evaluation_read();
+        let scope = match self.capture_tactic_construction() {
+            Ok(scope) => scope,
+            Err(origin) => {
+                return Ok(format!(
+                    "(error \"tactic original owner refused: {origin:?}\")"
+                ))
+            }
+        };
+        let prepared = match Tactic::prepare_apply(tactic, scope.admission()) {
+            Ok(value) => value,
+            Err(failure) => {
+                return Ok(format!(
+                    "(error \"tactic preparation refused: {}\")",
+                    failure.message
+                ))
+            }
+        };
+        if !scope.validate(self) {
+            return Ok("(error \"tactic source changed during preparation\")".into());
+        }
+        let Some(native) = prepared.get() else {
+            return Ok("(error \"tactic preparation produced no executable\")".into());
+        };
+        let (kind, decision_probe) = match native.execution_metadata_admitted(scope.admission()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Ok(format!(
+                    "(error \"tactic metadata refused: {}\")",
+                    error.message
+                ))
+            }
+        };
+        if crate::executor::theories::bv_cnf_dump::requested() && decision_probe {
+            Self::invalidate_bv_cnf_export_for_rejected_check()?;
+            return Err(crate::executor::ExecutorError::ArtifactExport("--dump-bv-cnf does not support apply with ctx-solver-simplify because it may run internal decision probes".into()));
+        }
+        Ok(self.apply_prepared_tactic_goal(&prepared, &scope, kind))
+    }
+
+    fn apply_prepared_tactic_goal(
+        &mut self,
+        prepared: &crate::api::PreparedTactic,
+        scope: &crate::executor::TacticConstructionScope,
+        kind: crate::api::TacticExecutionKind,
+    ) -> String {
+        let Some(native) = prepared.get() else {
+            return "(error \"tactic preparation unavailable\")".into();
+        };
+        if prepared.requires_owned() {
+            let Some(bytes) = self
+                .ctx
+                .assertions
+                .len()
+                .checked_mul(std::mem::size_of::<ay_core::TermId>())
+            else {
+                return "(error \"tactic root size overflow\")".into();
+            };
+            if scope
+                .admission()
+                .admit(self.ctx.assertions.len(), bytes)
+                .is_err()
+                || !scope.validate(self)
+            {
+                return "(error \"tactic original root admission refused\")".into();
+            }
+            let mut root = Goal::root(self.ctx.assertions.clone());
+            if kind == crate::api::TacticExecutionKind::OwnedModelConversion {
+                if let Err(failure) = root.capture_model_converter(
+                    &self.ctx.terms,
+                    self.ctx.symbols_iter(),
+                    scope.admission(),
+                ) {
+                    return format!(
+                        "(error \"tactic model converter refused: {}\")",
+                        failure.message
+                    );
+                }
+                if !scope.validate(self) {
+                    return "(error \"tactic source changed\")".into();
+                }
+            }
+            let result = native.apply_goals_admitted(&mut self.ctx.terms, root, scope.admission());
+            if !scope.validate(self) {
+                return "(error \"tactic original source changed\")".into();
+            }
+            let output = match result {
+                Ok(goals) => self.format_goals_owned(&goals, Some(scope.admission())),
+                Err(failure) => ay_core::render_admission::format(
+                    Some(scope.admission()),
+                    format_args!("(error \"tactic failed: {}\")", failure.message),
+                ),
+            };
+            return if scope.validate(self) {
+                output
+            } else {
+                "(error \"tactic original source changed\")".into()
+            };
+        }
         // GOAL PRESERVATION IS A SOUNDNESS PROPERTY: transform a clone so a
         // following (check-sat) still solves the ORIGINAL assertions.
         //
@@ -53,10 +155,10 @@ impl Executor {
         // Resolve through the SHARED name→transform registry so the SMT-LIB
         // `(apply ...)` surface and the C-API `Z3_mk_tactic` surface always
         // agree (see [`Tactic::from_apply`]).
-        let native = Tactic::from_apply(tactic);
         // `apply_goals` reads `self.ctx.assertions` via the clone above and may
         // intern new terms in the store; `self.ctx.assertions` is left untouched.
-        match native.apply_goals(&mut self.ctx.terms, root) {
+        let result = native.apply_goals(&mut self.ctx.terms, root);
+        match result {
             Ok(goals) => self.format_goals(&goals),
             Err(failure) => format!("(error \"tactic failed: {}\")", failure.message),
         }
@@ -69,18 +171,46 @@ impl Executor {
     /// `(goals\n(goal\n  :precision precise :depth <n>)\n)` — correct only because
     /// there genuinely are no assertions (an empty conjunction is `true`).
     fn format_goals(&self, goals: &[Goal]) -> String {
-        let mut out = String::from("(goals\n");
-        for goal in goals {
-            out.push_str("(goal\n");
-            for &id in &goal.formulas {
-                out.push_str("  ");
-                out.push_str(&self.format_term(id));
-                out.push('\n');
-            }
-            out.push_str(&format!("  :precision precise :depth {})\n", goal.depth));
+        self.format_goals_owned(goals, None)
+    }
+
+    fn format_goals_owned(
+        &self,
+        goals: &[Goal],
+        owner: ay_core::render_admission::Owner<'_>,
+    ) -> String {
+        let mut out = ay_core::render_admission::Buffer::new(owner);
+        if !out.push("(goals\n") {
+            return String::new();
         }
-        out.push(')');
-        out
+        for goal in goals {
+            if !out.push("(goal\n") {
+                return String::new();
+            }
+            for &id in &goal.formulas {
+                let text = if let Some(owner) = owner {
+                    match self.format_term_admitted(id, owner) {
+                        Ok(text) => text,
+                        Err(_) => return String::new(),
+                    }
+                } else {
+                    self.format_term(id)
+                };
+                if !out.push("  ") || !out.push(&text) || !out.character('\n') {
+                    return String::new();
+                }
+            }
+            if !out.format(format_args!(
+                "  :precision precise :depth {})\n",
+                goal.depth
+            )) {
+                return String::new();
+            }
+        }
+        if !out.character(')') {
+            return String::new();
+        }
+        out.finish()
     }
 }
 
@@ -97,6 +227,70 @@ mod tests {
         cmds.iter()
             .filter_map(|cmd| exec.execute(cmd).expect("command must execute"))
             .collect()
+    }
+
+    #[test]
+    fn field_simplify_renderer_refuses_expanded_dag_and_dense_bv_before_publication() {
+        use ay_core::Symbol;
+        let mut exec = Executor::new();
+        for command in parse("(declare-const x (_ FiniteField 7)) (declare-fun opaque ((_ FiniteField 7) (_ FiniteField 7)) (_ FiniteField 7))").unwrap() {
+            exec.execute(&command).unwrap();
+        }
+        let mut wire = exec.ctx.terms.find_var("x").unwrap();
+        let sort = exec.ctx.terms.sort(wire).clone();
+        for _ in 0..128 {
+            wire = exec.ctx.terms.mk_app_structural(
+                Symbol::named("opaque"),
+                &[wire, wire],
+                sort.clone(),
+            );
+        }
+        let scope = exec.capture_tactic_construction().unwrap();
+        assert!(exec.format_term_admitted(wire, scope.admission()).is_err());
+        assert!(!scope.validate(&exec));
+        drop(scope);
+
+        let mut exec = Executor::new();
+        let numeral = exec.ctx.terms.mk_bitvec(0.into(), 1 << 30);
+        let source_bytes = exec.ctx.terms.true_memory_bytes();
+        let scope = exec.capture_tactic_construction().unwrap();
+        assert!(exec
+            .format_term_admitted(numeral, scope.admission())
+            .is_err());
+        assert!(!scope.validate(&exec));
+        assert_eq!(exec.ctx.terms.true_memory_bytes(), source_bytes);
+        // No term builder or formatting refusal may invent new assertions.
+        assert!(exec.ctx.assertions.is_empty());
+    }
+
+    #[test]
+    fn field_simplify_admitted_renderer_preserves_namespace_unicode_and_depth() {
+        use ay_core::{Sort, Symbol};
+        let mut exec = Executor::new();
+        for command in
+            parse("(declare-const ff3 (_ FiniteField 7)) (declare-const p Bool)").unwrap()
+        {
+            exec.execute(&command).unwrap();
+        }
+        let field = ay_core::FiniteFieldSort::new(7).unwrap();
+        let literal = exec.ctx.terms.mk_finite_field(3, field);
+        let string = exec.ctx.terms.mk_string("\\u{61}\"\u{1f600}".into());
+        let mut deep = exec.ctx.terms.find_var("p").unwrap();
+        for _ in 0..128 {
+            deep = exec
+                .ctx
+                .terms
+                .mk_app_structural(Symbol::named("not"), &[deep], Sort::Bool);
+        }
+        for term in [literal, string, deep] {
+            let expected = exec.format_term(term);
+            let scope = exec.capture_tactic_construction().unwrap();
+            assert_eq!(
+                exec.format_term_admitted(term, scope.admission()).unwrap(),
+                expected
+            );
+            assert!(scope.validate(&exec));
+        }
     }
 
     /// The unsound constant goal the old stub echoed for *every* `(apply <t>)`.

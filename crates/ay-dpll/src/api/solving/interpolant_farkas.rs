@@ -24,7 +24,10 @@
 //!      factors through the shared projection (both case-split branches).
 //! - **Pure inequality conflicts**: the A-part weighted sum (each A-labeled
 //!   conflict inequality scaled by its Farkas coefficient), the standard
-//!   Farkas-based partial interpolant.
+//!   Farkas-based partial interpolant. Strict rows over Int-sorted, integral
+//!   coefficients are integer-tightened first (`tighten_strict_int_row`:
+//!   `lin < 0` -> `lin + 1 <= 0`), the same strengthening the verifier
+//!   applies, so the served sum is LIA-valid and not merely real-valid.
 //!
 //! Shared (AB-labeled) atoms follow the labeling system in use: McMillan
 //! (`Strongest`) labels them `b`, McMillan' (`Weakest`) labels them `a`, and
@@ -300,6 +303,156 @@ fn linear_difference(terms: &TermStore, lhs: TermId, rhs: TermId) -> Option<LinC
     Some(out)
 }
 
+/// `true` when `clause` is `{E, ¬E'}` for two arithmetic equalities whose
+/// linear forms are the same equation (`lin(E) = f·lin(E')`, `f ≠ 0`): the
+/// restatement lemma the LRA solver records, under a trust kind and without
+/// a certificate, when one equality atom is normalised into another (e.g.
+/// `(cl (= v 1) (not (= (- 1) (- v)))))`). `E ↔ E'` holds, so the clause is
+/// valid on its own and takes the valid-clause leaf.
+pub(crate) fn is_equality_restatement(terms: &TermStore, clause: &[TermId]) -> bool {
+    let [first, second] = clause else {
+        return false;
+    };
+    let (a, a_negated) = strip_negations(terms, *first);
+    let (b, b_negated) = strip_negations(terms, *second);
+    if a_negated == b_negated {
+        return false;
+    }
+    match (
+        equality_linear_form(terms, a),
+        equality_linear_form(terms, b),
+    ) {
+        (Some(x), Some(y)) => proportional(&x, &y),
+        _ => false,
+    }
+}
+
+fn strip_negations(terms: &TermStore, mut lit: TermId) -> (TermId, bool) {
+    let mut negated = false;
+    while let TermData::Not(inner) = terms.get(lit) {
+        lit = *inner;
+        negated = !negated;
+    }
+    (lit, negated)
+}
+
+/// `lhs - rhs` of an arithmetic equality atom `(= lhs rhs)`.
+fn equality_linear_form(terms: &TermStore, atom: TermId) -> Option<LinComb> {
+    let TermData::App(Symbol::Named(name), args) = terms.get(atom) else {
+        return None;
+    };
+    if name.as_str() != "=" || args.len() != 2 {
+        return None;
+    }
+    if !matches!(terms.sort(args[0]), Sort::Int | Sort::Real) {
+        return None;
+    }
+    linear_difference(terms, args[0], args[1])
+}
+
+/// `x = f·y` for some rational `f ≠ 0` (coefficients and constant).
+fn proportional(x: &LinComb, y: &LinComb) -> bool {
+    if x.coeffs.len() != y.coeffs.len() {
+        return false;
+    }
+    let factor = match x.coeffs.iter().next() {
+        Some((v, c)) => match y.coeffs.get(v) {
+            Some(d) => c / d,
+            None => return false,
+        },
+        // Constant equations `c = 0`: the same equation iff both hold or
+        // both fail.
+        None => return x.constant.is_zero() == y.constant.is_zero(),
+    };
+    if factor.is_zero() {
+        return false;
+    }
+    x.coeffs
+        .iter()
+        .all(|(v, c)| y.coeffs.get(v).is_some_and(|d| *c == &factor * d))
+        && x.constant == &factor * &y.constant
+}
+
+/// Literal cap of [`is_linear_arith_valid_clause`].
+const LINEAR_VALID_MAX_LITERALS: usize = 12;
+/// Row cap of the Fourier–Motzkin elimination behind it.
+const LINEAR_VALID_MAX_ROWS: usize = 256;
+
+/// `true` when `clause` is valid in linear arithmetic: the conjunction of its
+/// literals' negations (equalities and (strict) inequalities; a disequality
+/// makes the check give up) is infeasible over the rationals, decided by
+/// Fourier–Motzkin elimination over a few rows. Real infeasibility implies
+/// integer infeasibility, so the answer is sound for Int atoms too. This is
+/// the shape of an LRA theory lemma the proof records as an unannotated
+/// `assume` of its disjunction.
+pub(crate) fn is_linear_arith_valid_clause(terms: &TermStore, clause: &[TermId]) -> bool {
+    if clause.is_empty() || clause.len() > LINEAR_VALID_MAX_LITERALS {
+        return false;
+    }
+    let mut rows: Vec<(LinComb, bool)> = Vec::new();
+    for &lit in clause {
+        match decode_conflict_literal(terms, lit) {
+            Some(ConflictAtom::Inequality { lin, strict }) => rows.push((lin, strict)),
+            Some(ConflictAtom::EqualityRow(lin)) => {
+                let mut negated = LinComb::default();
+                negated.add_scaled(&lin, &(-BigRational::one()));
+                rows.push((lin, false));
+                rows.push((negated, false));
+            }
+            _ => return false,
+        }
+    }
+    fourier_motzkin_infeasible(rows)
+}
+
+/// Rows `lin <= 0` (`true`: `lin < 0`); `true` when elimination derives a
+/// violated constant row.
+fn fourier_motzkin_infeasible(mut rows: Vec<(LinComb, bool)>) -> bool {
+    loop {
+        let violated = rows.iter().any(|(lin, strict)| {
+            lin.coeffs.is_empty()
+                && (lin.constant.is_positive() || (*strict && lin.constant.is_zero()))
+        });
+        if violated {
+            return true;
+        }
+        rows.retain(|(lin, _)| !lin.coeffs.is_empty());
+        let Some(var) = rows
+            .iter()
+            .find_map(|(lin, _)| lin.coeffs.keys().next().copied())
+        else {
+            return false;
+        };
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        let mut rest = Vec::new();
+        for (lin, strict) in rows {
+            match lin.coeffs.get(&var) {
+                Some(c) if c.is_positive() => positive.push((lin, strict)),
+                Some(_) => negative.push((lin, strict)),
+                None => rest.push((lin, strict)),
+            }
+        }
+        if positive.len() * negative.len() + rest.len() > LINEAR_VALID_MAX_ROWS {
+            return false;
+        }
+        for (p, p_strict) in &positive {
+            for (n, n_strict) in &negative {
+                let (Some(cp), Some(cn)) = (p.coeffs.get(&var), n.coeffs.get(&var)) else {
+                    return false;
+                };
+                // cp > 0 > cn: (-cn)·p + cp·n cancels `var`, multipliers > 0.
+                let mut combined = LinComb::default();
+                combined.add_scaled(p, &(-cn.clone()));
+                combined.add_scaled(n, cp);
+                combined.coeffs.remove(&var);
+                rest.push((combined, *p_strict || *n_strict));
+            }
+        }
+        rows = rest;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conflict-literal decoding
 // ---------------------------------------------------------------------------
@@ -365,6 +518,34 @@ fn decode_conflict_literal(terms: &TermStore, lit: TermId) -> Option<ConflictAto
             strict: false,
         }),
         _ => None,
+    }
+}
+
+/// Integer tightening of a strict inequality row.
+///
+/// Over Int-sorted variables with integer coefficients and an integer
+/// constant, `lin < 0` entails `lin + 1 <= 0`. Integer-gap conflicts
+/// (real-SAT, int-UNSAT — e.g. `x < y, y < z, z < w, w < x + 2`) have NO
+/// rational Farkas certificate over the strict rows but a plain one over the
+/// tightened rows. The verifier (`verify_farkas_conflict_lits_full`) already
+/// strengthens integer strict rows before checking the multipliers, so the
+/// multipliers it accepts are over the TIGHTENED rows; building the A-part
+/// weighted sum over the untightened rows would then serve an interpolant
+/// that is only real-valid (`x - w < 0` where the LIA-valid one is
+/// `x - w + 3 <= 0`, which `I /\ B` needs). Sound in LIA: entailment per row,
+/// so contracts (1) and (2) are preserved.
+fn tighten_strict_int_row(terms: &TermStore, lin: &mut LinComb, strict: &mut bool) {
+    if !*strict {
+        return;
+    }
+    let integral = lin
+        .coeffs
+        .iter()
+        .all(|(v, c)| matches!(terms.sort(*v), Sort::Int) && c.denom().is_one())
+        && lin.constant.denom().is_one();
+    if integral {
+        lin.constant += BigRational::one();
+        *strict = false;
     }
 }
 
@@ -545,9 +726,28 @@ fn integerize(lin: &LinComb) -> (Vec<(BigInt, TermId)>, BigInt) {
 /// Render `lin = 0` as an equality term `sum = -constant`.
 fn row_to_eq_term(terms: &mut TermStore, lin: &LinComb) -> TermId {
     let (scaled, constant) = integerize(lin);
-    let sum = render_sum(terms, &scaled);
-    let rhs = terms.mk_int(-constant);
+    let real = row_is_real(terms, lin);
+    let sum = render_sum(terms, &scaled, real);
+    let rhs = render_const(terms, -constant, real);
     terms.mk_eq(sum, rhs)
+}
+
+/// A row is rendered over `Real` when any of its variables is Real-sorted:
+/// `mk_mul`/`mk_add` refuse mixed-sort arguments, so the coefficients and the
+/// constant must be minted in the variables' sort (an Int-sorted `-1` beside
+/// a Real `y` is a BUG panic in ay-core, not a term).
+fn row_is_real(terms: &TermStore, lin: &LinComb) -> bool {
+    lin.coeffs
+        .keys()
+        .any(|v| matches!(terms.sort(*v), Sort::Real))
+}
+
+fn render_const(terms: &mut TermStore, value: BigInt, real: bool) -> TermId {
+    if real {
+        terms.mk_rational(BigRational::from(value))
+    } else {
+        terms.mk_int(value)
+    }
 }
 
 /// Render `lin <= 0` / `lin < 0` as an inequality term `sum <= -constant`.
@@ -562,8 +762,9 @@ fn comb_to_ineq_term(terms: &mut TermStore, lin: &LinComb, strict: bool) -> Term
         .map(|(&v, c)| ((c * BigRational::from(denom_lcm.clone())).to_integer(), v))
         .collect();
     let constant = (&lin.constant * BigRational::from(denom_lcm)).to_integer();
-    let sum = render_sum(terms, &scaled);
-    let rhs = terms.mk_int(-constant);
+    let real = row_is_real(terms, lin);
+    let sum = render_sum(terms, &scaled, real);
+    let rhs = render_const(terms, -constant, real);
     if strict {
         terms.mk_lt(sum, rhs)
     } else {
@@ -571,13 +772,13 @@ fn comb_to_ineq_term(terms: &mut TermStore, lin: &LinComb, strict: bool) -> Term
     }
 }
 
-fn render_sum(terms: &mut TermStore, scaled: &[(BigInt, TermId)]) -> TermId {
+fn render_sum(terms: &mut TermStore, scaled: &[(BigInt, TermId)], real: bool) -> TermId {
     let mut parts = Vec::with_capacity(scaled.len());
     for (c, v) in scaled {
         if c == &BigInt::one() {
             parts.push(*v);
         } else {
-            let coef = terms.mk_int(c.clone());
+            let coef = render_const(terms, c.clone(), real);
             parts.push(terms.mk_mul(vec![coef, *v]));
         }
     }
@@ -591,6 +792,27 @@ fn render_sum(terms: &mut TermStore, scaled: &[(BigInt, TermId)]) -> TermId {
 // ---------------------------------------------------------------------------
 // The certificate-leaf rule
 // ---------------------------------------------------------------------------
+
+/// Why a certificate leaf produced no partial interpolant (Workstream D
+/// Explicit-mode reason codes; the Legacy wrapper maps every one to `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertLeafFailure {
+    /// A nonzero-weight literal's atom has no A/B/AB class.
+    Unclassified,
+    /// The annotation does not match the clause, or a nonzero-weight literal
+    /// is not a linear (in)equality over Int/Real variables and constants
+    /// (`linear_of` rejected a row).
+    Undecodable,
+    /// Semantic re-verification rejected the certificate (or it has no
+    /// nonzero weight at all).
+    Rejected,
+    /// Verified, but outside the supported interpolation shapes (two
+    /// disequalities, a disequality mixed with inequalities, or an affine
+    /// refutation the exact solve cannot rebuild).
+    UnsupportedShape,
+    /// The partial interpolant would mention this non-shared variable.
+    NonLocal(TermId),
+}
 
 /// Derive the partial interpolant of a Farkas-certified theory lemma.
 ///
@@ -607,9 +829,41 @@ pub(crate) fn certificate_lemma_interpolant(
     true_tid: TermId,
     false_tid: TermId,
 ) -> Option<TermId> {
+    certificate_lemma_interpolant_why(
+        terms,
+        clause,
+        farkas,
+        &|t: &TermStore, atom: TermId| part.class_of_atom(t, atom),
+        part.shared_vars,
+        strength,
+        true_tid,
+        false_tid,
+    )
+    .ok()
+}
+
+/// [`certificate_lemma_interpolant`] with an explicit atom labeller and the
+/// reason for every refusal (Workstream D Rung 1, `DESIGN_lra_interp_tpa.md`
+/// §4.1: undecodable row, certificate rejected, unsupported shape). The
+/// labeller must be the SAME function the rest of the traversal uses for
+/// leaves and pivots (Explicit mode); `shared_vars` is the cut's shared
+/// variable set. The Legacy wrapper above passes the historical
+/// `CertPartition` labeller and maps every `Err` to `None`, so its behaviour
+/// (including the leaf counters) is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn certificate_lemma_interpolant_why(
+    terms: &mut TermStore,
+    clause: &[TermId],
+    farkas: &FarkasAnnotation,
+    classify: &dyn Fn(&TermStore, TermId) -> Option<AtomClass>,
+    shared_vars: &HashSet<TermId>,
+    strength: InterpolantStrength,
+    true_tid: TermId,
+    false_tid: TermId,
+) -> Result<TermId, CertLeafFailure> {
     bump(|s| s.attempted += 1);
     if farkas.coefficients.len() != clause.len() {
-        return None;
+        return Err(CertLeafFailure::Undecodable);
     }
 
     // Decode + label the support (nonzero-weight literals).
@@ -631,7 +885,7 @@ pub(crate) fn certificate_lemma_interpolant(
             continue;
         }
         let atom = atom_of_literal(terms, lit);
-        let class = part.class_of_atom(terms, atom)?;
+        let class = classify(terms, atom).ok_or(CertLeafFailure::Unclassified)?;
         let side_a = side_is_a(class, strength);
         if side_a {
             support_a += 1;
@@ -657,11 +911,16 @@ pub(crate) fn certificate_lemma_interpolant(
             }
             Some(ConflictAtom::Disequality(lin)) => {
                 if diseq.is_some() {
-                    return None;
+                    return Err(CertLeafFailure::UnsupportedShape);
                 }
                 diseq = Some((lin, side_a));
             }
             Some(ConflictAtom::Inequality { lin, strict }) => {
+                // Integer-tighten strict rows so integer-gap conflicts are
+                // affinely refutable and the served A-part sum is LIA-valid,
+                // not merely real-valid (see `tighten_strict_int_row`).
+                let (mut lin, mut strict) = (lin, strict);
+                tighten_strict_int_row(terms, &mut lin, &mut strict);
                 ineqs += 1;
                 support_rows.push(SupportRow {
                     lin: lin.clone(),
@@ -675,12 +934,12 @@ pub(crate) fn certificate_lemma_interpolant(
                 }
             }
             None => {
-                return None;
+                return Err(CertLeafFailure::Undecodable);
             }
         }
     }
     if support_a == 0 && support_b == 0 {
-        return None;
+        return Err(CertLeafFailure::Rejected);
     }
 
     // VERIFY the conflict before trusting it (rank-4 covenant).
@@ -715,7 +974,7 @@ pub(crate) fn certificate_lemma_interpolant(
         }
     };
     if !verified {
-        return None;
+        return Err(CertLeafFailure::Rejected);
     }
     bump(|s| s.verified += 1);
 
@@ -723,27 +982,27 @@ pub(crate) fn certificate_lemma_interpolant(
     // restriction, so the partial interpolant is a constant.
     if support_b == 0 {
         bump(|s| s.served += 1);
-        return Some(false_tid);
+        return Ok(false_tid);
     }
     if support_a == 0 {
         bump(|s| s.served += 1);
-        return Some(true_tid);
+        return Ok(true_tid);
     }
 
     let result = if is_eq_shape {
         // Equality-implication shape (weighted rows + optional disequality).
-        equality_partial_interpolant(
+        Ok(equality_partial_interpolant(
             terms,
             a_rows,
             b_rows,
             diseq.map(|(_, side_a)| side_a),
-            part.shared_vars,
+            shared_vars,
             true_tid,
             false_tid,
-        )
+        ))
     } else if eq_rows == 0 && diseq.is_none() {
         // Pure inequality conflict: the A-part weighted sum.
-        inequality_partial_interpolant(terms, &a_ineqs, part.shared_vars, true_tid, false_tid)
+        inequality_partial_interpolant(terms, &a_ineqs, shared_vars, true_tid, false_tid)
     } else if diseq.is_none() {
         // Mixed equality+inequality conflict (rank-4 inc-6): the executor's
         // lia_generic conflicts mix equality rows with bound inequalities.
@@ -752,11 +1011,11 @@ pub(crate) fn certificate_lemma_interpolant(
         // verifier searches orientations; re-derive one here), then the
         // partial interpolant is the A-part weighted sum, exactly like the
         // pure-inequality rule.
-        mixed_partial_interpolant(terms, &support_rows, part.shared_vars, true_tid, false_tid)
+        mixed_partial_interpolant(terms, &support_rows, shared_vars, true_tid, false_tid)
     } else {
-        None
+        Err(CertLeafFailure::UnsupportedShape)
     };
-    if result.is_some() {
+    if result.is_ok() {
         bump(|s| s.served += 1);
     }
     result
@@ -771,7 +1030,7 @@ fn equality_partial_interpolant(
     shared_vars: &HashSet<TermId>,
     true_tid: TermId,
     false_tid: TermId,
-) -> Option<TermId> {
+) -> TermId {
     if diseq_on_a == Some(true) {
         // Disequality is A-labeled: the interpolant is the NEGATED B-side
         // shared projection. Contract (1) holds because for either case-split
@@ -781,11 +1040,11 @@ fn equality_partial_interpolant(
         match project_onto_shared(b_rows, shared_vars) {
             Projection::Inconsistent => {
                 // B-side rows alone are contradictory: `true` suffices.
-                Some(true_tid)
+                true_tid
             }
             Projection::Rows(rows) if rows.is_empty() => {
                 // No shared consequences: the refutation lives in the A side.
-                Some(false_tid)
+                false_tid
             }
             Projection::Rows(rows) => {
                 let row_terms: Vec<TermId> =
@@ -795,7 +1054,7 @@ fn equality_partial_interpolant(
                 } else {
                     terms.mk_and(row_terms)
                 };
-                Some(terms.mk_not(conj))
+                terms.mk_not(conj)
             }
         }
     } else {
@@ -805,20 +1064,20 @@ fn equality_partial_interpolant(
         match project_onto_shared(a_rows, shared_vars) {
             Projection::Inconsistent => {
                 // A-side rows alone are contradictory: `false` is exact.
-                Some(false_tid)
+                false_tid
             }
             Projection::Rows(rows) if rows.is_empty() => {
                 // No shared consequences: the refutation lives in the B side.
-                Some(true_tid)
+                true_tid
             }
             Projection::Rows(rows) => {
                 let row_terms: Vec<TermId> =
                     rows.iter().map(|r| row_to_eq_term(terms, r)).collect();
-                Some(if row_terms.len() == 1 {
+                if row_terms.len() == 1 {
                     row_terms[0]
                 } else {
                     terms.mk_and(row_terms)
-                })
+                }
             }
         }
     }
@@ -991,8 +1250,8 @@ fn mixed_partial_interpolant(
     shared_vars: &HashSet<TermId>,
     true_tid: TermId,
     false_tid: TermId,
-) -> Option<TermId> {
-    let multipliers = solve_affine_refutation(support)?;
+) -> Result<TermId, CertLeafFailure> {
+    let multipliers = solve_affine_refutation(support).ok_or(CertLeafFailure::UnsupportedShape)?;
     let mut sum = LinComb::default();
     let mut strict = false;
     for (row, m) in support.iter().zip(multipliers.iter()) {
@@ -1009,15 +1268,15 @@ fn mixed_partial_interpolant(
         } else {
             sum.constant <= BigRational::zero()
         };
-        return Some(if holds { true_tid } else { false_tid });
+        return Ok(if holds { true_tid } else { false_tid });
     }
     // Defensive locality check, same as the pure-inequality rule: any
     // non-shared variable surviving the A-part sum means the labeling
     // drifted; bail instead of emitting a non-local interpolant.
-    if !sum.coeffs.keys().all(|v| shared_vars.contains(v)) {
-        return None;
+    if let Some(&v) = sum.coeffs.keys().find(|v| !shared_vars.contains(*v)) {
+        return Err(CertLeafFailure::NonLocal(v));
     }
-    Some(comb_to_ineq_term(terms, &sum, strict))
+    Ok(comb_to_ineq_term(terms, &sum, strict))
 }
 
 /// Partial interpolant for a pure inequality conflict: the A-part weighted
@@ -1028,7 +1287,7 @@ fn inequality_partial_interpolant(
     shared_vars: &HashSet<TermId>,
     true_tid: TermId,
     false_tid: TermId,
-) -> Option<TermId> {
+) -> Result<TermId, CertLeafFailure> {
     let mut sum = LinComb::default();
     let mut strict = false;
     for (lin, s, lambda) in a_ineqs {
@@ -1042,15 +1301,15 @@ fn inequality_partial_interpolant(
         } else {
             sum.constant <= BigRational::zero()
         };
-        return Some(if holds { true_tid } else { false_tid });
+        return Ok(if holds { true_tid } else { false_tid });
     }
     // The Farkas cancellation forces every surviving variable to appear on
     // both sides; defensive check (unlabeled-coloring drift bails instead of
     // emitting a non-local interpolant).
-    if !sum.coeffs.keys().all(|v| shared_vars.contains(v)) {
-        return None;
+    if let Some(&v) = sum.coeffs.keys().find(|v| !shared_vars.contains(*v)) {
+        return Err(CertLeafFailure::NonLocal(v));
     }
-    Some(comb_to_ineq_term(terms, &sum, strict))
+    Ok(comb_to_ineq_term(terms, &sum, strict))
 }
 
 #[cfg(test)]

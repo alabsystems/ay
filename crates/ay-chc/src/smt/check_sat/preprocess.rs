@@ -14,9 +14,70 @@ use super::super::context::SmtContext;
 use super::super::executor_sort_guard::unsupported_executor_expr_reason;
 use super::super::types::{SmtResult, SmtValue, UnsatCore};
 use super::PreparedQuery;
+use crate::expr::ExprFeatures;
 use crate::{ChcExpr, ChcSort, ChcVar};
 
+/// The expression `prepare_check_sat_query` routes, and its features.
+///
+/// #6360: single-pass feature scan replaces repeated `contains_*` walks.
+/// #8664: bounded symbolic read-over-write expansion runs BEFORE feature
+/// routing so short store chains can become scalar ITEs instead of being sent
+/// to the Array executor solely because of the original syntax. `None` means
+/// the query is solved as given (no array ops, nothing to expand).
+fn routed_features(expr: &ChcExpr) -> (Option<ChcExpr>, ExprFeatures) {
+    let initial_features = expr.scan_features();
+    if initial_features.has_array_ops {
+        let expanded = expr.simplify_array_ops().expand_select_store_symbolic();
+        let features = expanded.scan_features();
+        (Some(expanded), features)
+    } else {
+        (None, initial_features)
+    }
+}
+
+/// Array and datatype queries are dispatched to ay-dpll's Executor (#6047/#7016).
+fn routes_to_executor(features: &ExprFeatures) -> bool {
+    features.has_array_ops || features.has_dt
+}
+
+/// Whether `prepare_check_sat_query` may hand `expr` to the Executor: the
+/// routed query needs it and constant propagation does not settle it first.
+///
+/// A budget-safe SUPERSET of prepare's dispatch, sharing its routing
+/// (`routed_features`/`routes_to_executor`) and its constant-propagation
+/// exit. It does not model prepare's other early exits: the conversion-strike
+/// short-circuit, the elapsed-timeout checks, bound-promotion folding, and
+/// `unsupported_executor_expr_reason` on the normalized expression. For those
+/// queries the fallback always ran the same original-expression Executor
+/// session anyway, so answering `true` only moves that session first.
+pub(super) fn dispatches_to_executor(expr: &ChcExpr) -> bool {
+    let (expanded, features) = routed_features(expr);
+    routes_to_executor(&features)
+        && !matches!(
+            expanded.as_ref().unwrap_or(expr).propagate_constants(),
+            ChcExpr::Bool(_)
+        )
+}
+
 impl SmtContext {
+    /// The per-call conversion-budget prologue of `prepare_check_sat_query`,
+    /// shared with the executor-first calls that never reach it. `true` once
+    /// too many consecutive calls exceeded the budget.
+    pub(super) fn begin_conversion_budget_session(&mut self) -> bool {
+        // Track consecutive budget exceedances (#2472). Check the flag from
+        // the PREVIOUS call before reset clears it.
+        if self.conversion_budget_exceeded {
+            self.conversion_budget_strikes = self.conversion_budget_strikes.saturating_add(1);
+        } else {
+            self.conversion_budget_strikes = 0;
+        }
+
+        // Reset per-check conversion budget (#2771).
+        self.reset_conversion_budget();
+
+        self.conversion_budget_strikes >= super::super::context::MAX_CONVERSION_STRIKES
+    }
+
     /// Preprocess a check_sat query: scan features, propagate constants,
     /// normalize, promote bounds, dispatch to executor if needed, and
     /// flatten top-level conjunctions.
@@ -30,41 +91,19 @@ impl SmtContext {
         start: Instant,
         timeout: Option<Duration>,
     ) -> Result<PreparedQuery, SmtResult> {
-        // Track consecutive budget exceedances (#2472). Check the flag from
-        // the PREVIOUS call before reset clears it.
-        if self.conversion_budget_exceeded {
-            self.conversion_budget_strikes = self.conversion_budget_strikes.saturating_add(1);
-        } else {
-            self.conversion_budget_strikes = 0;
-        }
-
-        // Reset per-check conversion budget (#2771).
-        self.reset_conversion_budget();
-
         // If too many consecutive calls exceeded the budget, short-circuit.
-        if self.conversion_budget_strikes >= super::super::context::MAX_CONVERSION_STRIKES {
+        if self.begin_conversion_budget_session() {
             return Err(SmtResult::Unknown);
         }
 
-        // #6360: Single-pass feature scan replaces repeated `contains_*` walks.
-        // #8664: Run bounded symbolic read-over-write expansion before feature
-        // routing so short store chains can become scalar ITEs instead of being
-        // sent to the Array executor solely because of the original syntax.
-        let initial_features = expr.scan_features();
-        let preprocessed_expr = if initial_features.has_array_ops {
-            expr.simplify_array_ops().expand_select_store_symbolic()
-        } else {
-            expr.clone()
-        };
-
         // Detect array ops, BV usage, UF apps, mixed-sort eq, ITE, mod/div,
         // negation, and strict comparisons in the expression actually solved.
-        let features = preprocessed_expr.scan_features();
+        let (expanded, features) = routed_features(expr);
+        let preprocessed_expr = expanded.unwrap_or_else(|| expr.clone());
         let has_array_ops = features.has_array_ops;
-        let has_dt = features.has_dt;
         let has_uf_apps = features.has_uf_apps;
         let needs_euf = has_array_ops || has_uf_apps;
-        let needs_executor = has_array_ops || has_dt;
+        let needs_executor = routes_to_executor(&features);
 
         // #5877: Early timeout check before any expression processing.
         if let Some(t) = timeout {
@@ -93,21 +132,43 @@ impl SmtContext {
             Self::collect_bv_var_const_equalities(&simplified, &mut propagated_bv_equalities);
         }
 
+        // Sort-unique model keys (Rung 0, `crate::smt::sort_unique`): a
+        // propagated `J:Int = 7` must not land under a plain `J` that `J:Bool`
+        // owns in the same query (the rank rule gives Bool the plain key), or
+        // the Int witness is lost and strict validation degrades.
+        let plain_key_owners =
+            if propagated_equalities.is_empty() && propagated_bv_equalities.is_empty() {
+                None
+            } else {
+                Some(super::super::sort_unique::PlainKeyOwners::from_vars(
+                    &expr.vars(),
+                ))
+            };
+        let propagated_key = |name: &str, sort: &ChcSort| -> String {
+            plain_key_owners
+                .as_ref()
+                .map_or_else(|| name.to_owned(), |owners| owners.key(name, sort))
+        };
         let mut propagated_model: FxHashMap<String, SmtValue> = FxHashMap::default();
         for (name, value) in &propagated_equalities {
-            propagated_model.insert(name.clone(), SmtValue::Int(*value));
+            propagated_model.insert(propagated_key(name, &ChcSort::Int), SmtValue::Int(*value));
         }
         for (name, (value, width)) in &propagated_bv_equalities {
-            propagated_model.insert(name.clone(), SmtValue::bitvec_from_u128(*value, *width));
+            propagated_model.insert(
+                propagated_key(name, &ChcSort::BitVec(*width)),
+                SmtValue::bitvec_from_u128(*value, *width),
+            );
         }
 
         // Check if simplified to a constant.
         if let ChcExpr::Bool(b) = &simplified {
             return if *b {
-                Err(Self::sat_or_unknown(
+                Err(self.finish_trivial_preprocessed_candidate(
                     expr,
                     propagated_model,
                     "constant propagation",
+                    start,
+                    timeout,
                 ))
             } else {
                 Err(SmtResult::Unsat)
@@ -142,8 +203,9 @@ impl SmtContext {
         if !bound_subst.is_empty() {
             normalized = normalized.substitute(&bound_subst).simplify_constants();
             propagated_model.clear();
+            let owners = super::super::sort_unique::PlainKeyOwners::from_vars(&expr.vars());
             for (name, value) in &propagated_equalities {
-                propagated_model.insert(name.clone(), SmtValue::Int(*value));
+                propagated_model.insert(owners.key(name, &ChcSort::Int), SmtValue::Int(*value));
             }
         }
 
@@ -153,16 +215,25 @@ impl SmtContext {
             if unsupported_executor_expr_reason(&normalized).is_some() {
                 return Err(SmtResult::Unknown);
             }
-            let remaining_timeout = timeout
-                .map(|t| {
-                    t.checked_sub(start.elapsed())
-                        .unwrap_or(Duration::from_millis(100))
-                })
-                .unwrap_or(Duration::from_secs(10));
+            let remaining_timeout = match timeout {
+                Some(limit) => match limit
+                    .checked_sub(start.elapsed())
+                    .filter(|left| !left.is_zero())
+                {
+                    Some(left) => left,
+                    None => return Err(SmtResult::Unknown),
+                },
+                None => Duration::from_secs(10),
+            };
             let executor_result =
                 self.check_sat_via_executor(&normalized, &propagated_model, remaining_timeout);
             if !matches!(executor_result, SmtResult::Unknown) {
-                return Err(executor_result);
+                return Err(self.restore_preprocessed_array_model(
+                    expr,
+                    executor_result,
+                    start,
+                    timeout,
+                ));
             }
             // Fall through to the internal DPLL(T) path if executor also returns Unknown.
         }
@@ -173,10 +244,12 @@ impl SmtContext {
 
         // Trivial conjunctions.
         if top_conjuncts.is_empty() {
-            return Err(Self::sat_or_unknown(
+            return Err(self.finish_trivial_preprocessed_candidate(
                 expr,
                 propagated_model,
                 "empty conjuncts",
+                start,
+                timeout,
             ));
         }
         if top_conjuncts
@@ -190,10 +263,12 @@ impl SmtContext {
         }
         top_conjuncts.retain(|c| !matches!(c, ChcExpr::Bool(true)));
         if top_conjuncts.is_empty() {
-            return Err(Self::sat_or_unknown(
+            return Err(self.finish_trivial_preprocessed_candidate(
                 expr,
                 propagated_model,
                 "all-true conjuncts",
+                start,
+                timeout,
             ));
         }
 

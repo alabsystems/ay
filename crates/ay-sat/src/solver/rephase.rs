@@ -76,8 +76,12 @@ impl Solver {
     /// Check if rephasing should be triggered based on conflict count.
     #[inline]
     pub(super) fn should_rephase(&self) -> bool {
+        // `--sat-rephase-kissat` reads its own flag: the variant writes
+        // `stable_only_rephase_enabled` on routes that never pass the solve
+        // entry that arms it (the theory, assumption and extension loops).
         self.cold.rephase_enabled
-            && (!self.cold.stable_only_rephase_enabled || self.stable_mode)
+            && (!(self.cold.stable_only_rephase_enabled || self.cold.rephase_kissat)
+                || self.stable_mode)
             && self.num_conflicts >= self.cold.next_rephase
     }
 
@@ -110,7 +114,19 @@ impl Solver {
         // Select strategy based on current mode with independent counters.
         // CaDiCaL: `lim.rephased[stable]++` (rephase.cpp:131).
         self.stats.record_rephase_mode(self.stable_mode);
-        let is_best_rephase = if self.stable_mode {
+        let is_best_rephase = if self.cold.rephase_kissat {
+            // Kissat `rephase.c:86-89`: best, walk, inverted, best, walk,
+            // original, counting stable rephases only (focused mode never
+            // rephases under the switch).
+            let count = self.cold.rephase_count_stable;
+            self.cold.rephase_count_stable += 1;
+            self.apply_rephase_kind(match count % 6 {
+                0 | 3 => RephaseAttribution::Best,
+                1 | 4 => RephaseAttribution::Walk,
+                2 => RephaseAttribution::Inverted,
+                _ => RephaseAttribution::Original,
+            })
+        } else if self.stable_mode {
             let count = self.cold.rephase_count_stable;
             self.cold.rephase_count_stable += 1;
             self.apply_stable_rephase_schedule(count)
@@ -144,12 +160,22 @@ impl Solver {
         // NLOG3N grows sub-quadratically, keeping rephases frequent on hard
         // instances requiring 100K+ conflicts (#8085).
         let count = self.cold.rephase_count;
-        let delta = REPHASE_INITIAL.saturating_mul(nlog3n(count));
+        // Kissat computes the NLOG3N delta in double and truncates once
+        // (kimits.h:120-123); AY truncates n*log^3 first, up to 20 percent early.
+        let delta = if self.cold.rephase_kissat {
+            let l = ((count + 9) as f64).log10();
+            (REPHASE_INITIAL as f64 * count as f64 * l * l * l) as u64
+        } else {
+            REPHASE_INITIAL.saturating_mul(nlog3n(count))
+        };
         self.cold.next_rephase = self.num_conflicts.saturating_add(delta);
 
         // Shuffle decision ordering to diversify search after rephasing.
-        // CaDiCaL: `rephase.cpp:396-399`.
-        if self.stable_mode {
+        // CaDiCaL: `rephase.cpp:396-399` (its `shuffle` option defaults to
+        // off; Kissat has none). `--sat-rephase-shuffle false` keeps the order,
+        // so a best-phase rephase keeps the decision order it was found with.
+        if ay_core::sat_ab_switches().rephase_shuffle == Some(false) || self.cold.rephase_kissat {
+        } else if self.stable_mode {
             self.vsids.shuffle_scores(self.cold.rephase_count);
         } else {
             self.vsids.shuffle_queue(self.cold.rephase_count);
@@ -271,8 +297,12 @@ impl Solver {
     fn rephase_best(&mut self) -> u64 {
         let mut changed = 0;
         for i in 0..self.num_vars {
+            // Kissat keeps the saved phase where no best phase was recorded
+            // (rephase.c:48-50); AY's default falls back to the target phase.
             let b = if self.best_phase[i] != 0 {
                 self.best_phase[i]
+            } else if self.cold.rephase_kissat {
+                0
             } else {
                 self.target_phase[i]
             };
@@ -373,7 +403,8 @@ impl Solver {
             return 0;
         }
 
-        if self.arena.active_clause_count() > rephase_walk_clause_cap(self.cold.large_rephase_walk)
+        if self.arena.active_clause_count()
+            > rephase_walk_clause_cap(self.cold.large_rephase_walk || self.cold.rephase_kissat)
         {
             self.stats.rephase_walk_gate_skips += 1;
             return 0;
@@ -382,8 +413,17 @@ impl Solver {
         // Kissat-style effort scheduling: walk budget proportional to search
         // ticks since last walk invocation.
         let total_ticks = self.search_ticks[0] + self.search_ticks[1];
-        let delta = total_ticks.saturating_sub(self.phase_init.walk_last_ticks);
-        let tick_limit = crate::walk::compute_walk_effort(delta);
+        let tick_limit = if ay_core::sat_ab_switches().inproc_nlogn_schedule == Some(true) {
+            // Kissat's reference: the search ticks since the last
+            // simplification phase, not since the last walk (a 5x to 20x
+            // longer window on the misses); see `compute_walk_effort_kissat`.
+            crate::walk::compute_walk_effort_kissat(
+                total_ticks.saturating_sub(self.cold.last_inprobe_ticks),
+            )
+        } else {
+            let delta = total_ticks.saturating_sub(self.phase_init.walk_last_ticks);
+            crate::walk::compute_walk_effort(delta)
+        };
         self.phase_init.walk_last_ticks = total_ticks;
 
         let seed = self
@@ -406,6 +446,8 @@ impl Solver {
             seed,
             tick_limit,
             filter,
+            (ay_core::sat_ab_switches().walk_kissat == Some(true) && self.stable_mode)
+                .then_some(self.target_phase.as_slice()),
         );
         self.stats.rephase_walk_runs += 1;
         self.stats.rephase_walk_ns = self

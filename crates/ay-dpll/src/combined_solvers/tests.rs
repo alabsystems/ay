@@ -1102,6 +1102,25 @@ fn test_auflia_push_pop_clears_interface_terms() {
 }
 
 #[test]
+fn test_ufnra_solver_forwards_sub_solver_statistics() {
+    let terms = setup_term_store();
+    let solver = UfNraSolver::new(&terms);
+    let stats = solver.collect_statistics();
+    for key in [
+        "nra_checks",
+        "nra_icp_calls",
+        "nra_icp_main_boxes",
+        "nra_icp_pin_boxes",
+        "nra_icp_wide_tree_caps",
+    ] {
+        assert!(
+            stats.iter().any(|(name, _)| *name == key),
+            "UF+NRA statistics must forward the NRA counter {key}"
+        );
+    }
+}
+
+#[test]
 fn test_combined_solvers_need_final_check_after_sat() {
     let terms = setup_term_store();
 

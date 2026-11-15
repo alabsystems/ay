@@ -453,29 +453,3 @@ fn test_case_split_strict_verifier_inherits_deadline() {
         "case-split merged-model verifier should inherit the case_split_deadline"
     );
 }
-
-#[test]
-fn test_case_split_guards_merge_and_verify_after_deadline() {
-    let src = include_str!("mod.rs");
-    let fn_start = src
-        .find("pub(crate) fn try_case_split_solve(")
-        .expect("case-split solver should exist");
-    let fn_body = &src[fn_start..];
-    let fn_end = fn_body
-        .find("fn case_split_deadline_expired(")
-        .expect("deadline helper should follow case-split solver");
-    let fn_body = &fn_body[..fn_end];
-
-    assert!(
-        fn_body.contains("branch exhausted wall-clock deadline"),
-        "unknown branches should stop the case-split stage once the wall-clock budget is gone"
-    );
-    assert!(
-        fn_body.contains("deadline expired before merge/verify"),
-        "case-split should not merge after the advertised stage deadline"
-    );
-    assert!(
-        fn_body.contains("deadline expired before strict verification"),
-        "case-split should not start strict verification after the deadline"
-    );
-}

@@ -27,6 +27,23 @@ struct PatchPlan {
     value: BigRational,
 }
 
+/// Bit budget (numerator bits + denominator bits) for a planned patch
+/// value. Verifying a patch runs a full exact dual-simplex check with the
+/// planned values as equality cuts; with thousand-bit operands every pivot
+/// pays that size in gcd reductions. Measured on `40f50`: 3205-bit plans
+/// made 40 patch verifications consume ~97% of a 20 s budget (265
+/// decisions); declining them gave 8246 decisions in the same budget.
+/// Patching is an accelerator, so declining only returns control to the
+/// standard lemma refinement -- it cannot change a verdict.
+const PATCH_MAX_PLAN_VALUE_BITS: u64 = 2048;
+
+/// Whether every planned value fits the verification bit budget.
+fn patch_plans_affordable(plans: &[PatchPlan]) -> bool {
+    plans.iter().all(|plan| {
+        plan.value.numer().bits() + plan.value.denom().bits() <= PATCH_MAX_PLAN_VALUE_BITS
+    })
+}
+
 impl NraSolver<'_> {
     /// Collect monomials whose auxiliary is absent or disagrees with the factor
     /// product. An absent auxiliary can occur when a nonlinear term appears
@@ -34,12 +51,15 @@ impl NraSolver<'_> {
     /// have arithmetic model values, but LRA never needed a row for the term
     /// itself. Treat that as an exact extension to materialize, not as a reason
     /// to weaken the final consistency check.
-    fn collect_inconsistent_monomials(&self) -> Vec<(Monomial, BigRational)> {
+    fn collect_inconsistent_monomials(
+        &self,
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Vec<(Monomial, BigRational)> {
         let mut patches = Vec::new();
         for mon in self.products() {
-            if let Some(product) = self.compute_monomial_product(mon) {
+            if let Some(product) = self.compute_monomial_product(mon, memo) {
                 if self
-                    .var_value(mon.aux_var)
+                    .memo_var_value(mon.aux_var, memo)
                     .is_none_or(|value| value != product)
                 {
                     patches.push((mon.clone(), product));
@@ -55,24 +75,37 @@ impl NraSolver<'_> {
     /// factor such as `(+ (* x x c) d)` is not a tableau column, and reading it
     /// as "no value" made the patcher skip exactly the monomials that most need
     /// patching.
-    fn compute_monomial_product(&self, mon: &Monomial) -> Option<BigRational> {
+    fn compute_monomial_product(
+        &self,
+        mon: &Monomial,
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Option<BigRational> {
         let mut product = BigRational::one();
         for &var in &mon.vars {
-            product *= self.monomial_factor_value(var)?;
+            product *= self.monomial_factor_value_memo(var, memo)?;
         }
         Some(mon.aux_from_product(&product))
     }
 
     /// Decide how to patch each inconsistent monomial. Returns `None` if any
     /// monomial cannot be patched.
-    fn plan_patches(&self, patches: &[(Monomial, BigRational)]) -> Option<Vec<PatchPlan>> {
+    fn plan_patches(
+        &self,
+        patches: &[(Monomial, BigRational)],
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Option<Vec<PatchPlan>> {
         let mut plans = Vec::new();
         let mut patched_vars: Vec<TermId> = Vec::new();
 
         for (mon, correct_product) in patches {
             // Strategy 1: Direct patch — set monomial aux_var to correct product
             if self.can_patch_to(mon.aux_var, correct_product)
-                && !self.would_break_other_monomials(mon.aux_var, correct_product, &patched_vars)
+                && !self.would_break_other_monomials(
+                    mon.aux_var,
+                    correct_product,
+                    &patched_vars,
+                    memo,
+                )
             {
                 plans.push(PatchPlan {
                     var: mon.aux_var,
@@ -84,7 +117,7 @@ impl NraSolver<'_> {
 
             // Strategy 2: Factor patch
             {
-                let plan = self.try_factor_patch(mon, &patched_vars)?;
+                let plan = self.try_factor_patch(mon, &patched_vars, memo)?;
                 patched_vars.push(plan.var);
                 plans.push(plan);
             }
@@ -94,21 +127,26 @@ impl NraSolver<'_> {
     }
 
     /// Try adjusting one factor of a monomial so its product matches val(m).
-    fn try_factor_patch(&self, mon: &Monomial, patched_vars: &[TermId]) -> Option<PatchPlan> {
-        let m_val = self.var_value(mon.aux_var)?;
+    fn try_factor_patch(
+        &self,
+        mon: &Monomial,
+        patched_vars: &[TermId],
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Option<PatchPlan> {
+        let m_val = self.memo_var_value(mon.aux_var, memo)?;
 
         for (idx, &var) in mon.vars.iter().enumerate() {
             if patched_vars.contains(&var) {
                 continue;
             }
-            let other_product = &mon.coeff * self.product_excluding_factor(mon, idx)?;
+            let other_product = &mon.coeff * self.product_excluding_factor(mon, idx, memo)?;
             if other_product.is_zero() {
                 continue;
             }
 
             let new_val = &m_val / &other_product;
             if self.can_patch_to(var, &new_val)
-                && !self.would_break_other_monomials(var, &new_val, patched_vars)
+                && !self.would_break_other_monomials(var, &new_val, patched_vars, memo)
             {
                 return Some(PatchPlan {
                     var,
@@ -120,13 +158,18 @@ impl NraSolver<'_> {
     }
 
     /// Compute product of all factors of a monomial except the one at `skip_idx`.
-    fn product_excluding_factor(&self, mon: &Monomial, skip_idx: usize) -> Option<BigRational> {
+    fn product_excluding_factor(
+        &self,
+        mon: &Monomial,
+        skip_idx: usize,
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Option<BigRational> {
         let mut product = BigRational::one();
         for (j, &var) in mon.vars.iter().enumerate() {
             if j == skip_idx {
                 continue;
             }
-            product *= self.var_value(var)?;
+            product *= self.memo_var_value(var, memo)?;
         }
         Some(product)
     }
@@ -174,12 +217,13 @@ impl NraSolver<'_> {
         var: TermId,
         new_value: &BigRational,
         already_patched: &[TermId],
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
     ) -> bool {
         for mon in self.products() {
             if !mon.vars.contains(&var) || already_patched.contains(&mon.aux_var) {
                 continue;
             }
-            if self.would_break_monomial(mon, var, new_value) {
+            if self.would_break_monomial(mon, var, new_value, memo) {
                 return true;
             }
         }
@@ -187,19 +231,25 @@ impl NraSolver<'_> {
     }
 
     /// Check if patching `var` to `new_value` would break a specific monomial.
-    fn would_break_monomial(&self, mon: &Monomial, var: TermId, new_value: &BigRational) -> bool {
+    fn would_break_monomial(
+        &self,
+        mon: &Monomial,
+        var: TermId,
+        new_value: &BigRational,
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> bool {
         // Compute old and new products
         let mut old_product = BigRational::one();
         let mut new_product = BigRational::one();
         for &v in &mon.vars {
-            let Some(val) = self.var_value(v) else {
+            let Some(val) = self.memo_var_value(v, memo) else {
                 return false; // Unknown value — assume safe
             };
             old_product *= &val;
             new_product *= if v == var { new_value.clone() } else { val };
         }
 
-        let Some(m_val) = self.var_value(mon.aux_var) else {
+        let Some(m_val) = self.memo_var_value(mon.aux_var, memo) else {
             return false;
         };
         let was_consistent = m_val == mon.aux_from_product(&old_product);
@@ -244,16 +294,19 @@ impl NraSolver<'_> {
     /// Collect division purifications whose model values are inconsistent:
     /// `model(denom) * model(div_term) != model(num)`.
     /// Returns list of `(div_term, correct_value)` patches.
-    fn collect_inconsistent_division_patches(&self) -> Vec<PatchPlan> {
+    fn collect_inconsistent_division_patches(
+        &self,
+        memo: &std::cell::RefCell<crate::check_loop::ValueMemo>,
+    ) -> Vec<PatchPlan> {
         let mut patches = Vec::new();
         for purif in &self.div_purifications {
-            let Some(d) = self.var_value(purif.denominator) else {
+            let Some(d) = self.memo_var_value(purif.denominator, memo) else {
                 continue;
             };
-            let Some(k) = self.var_value(purif.div_term) else {
+            let Some(k) = self.memo_var_value(purif.div_term, memo) else {
                 continue;
             };
-            let Some(num_val) = self.term_value(purif.numerator) else {
+            let Some(num_val) = self.term_value_memo(purif.numerator, memo) else {
                 continue;
             };
             if &d * &k == num_val {
@@ -278,8 +331,11 @@ impl NraSolver<'_> {
     /// and divisions are consistent, return true (scope is kept). Otherwise
     /// pop the scope to undo the patches and return false. (#4125 soundness fix)
     pub(crate) fn try_tentative_patch(&mut self) -> bool {
-        let mon_patches = self.collect_inconsistent_monomials();
-        let div_patches = self.collect_inconsistent_division_patches();
+        // One memo serves the whole read-only collect+plan phase; it is
+        // dropped before any patch cut mutates the model.
+        let memo = std::cell::RefCell::new(crate::check_loop::ValueMemo::default());
+        let mon_patches = self.collect_inconsistent_monomials(&memo);
+        let div_patches = self.collect_inconsistent_division_patches(&memo);
         if mon_patches.is_empty() && div_patches.is_empty() {
             // "Nothing to patch" is NOT the same as "the model is consistent".
             // `collect_inconsistent_monomials` can only report a monomial whose
@@ -291,13 +347,18 @@ impl NraSolver<'_> {
             return !self.has_inconsistent_monomials() && !self.has_inconsistent_divisions();
         }
 
-        let mut all_plans = match self.plan_patches(&mon_patches) {
+        let mut all_plans = match self.plan_patches(&mon_patches, &memo) {
             Some(p) => p,
             None => return false,
         };
         all_plans.extend(div_patches);
 
         if all_plans.is_empty() {
+            return false;
+        }
+
+        // Decline patches whose exact verification would dwarf their value.
+        if !patch_plans_affordable(&all_plans) {
             return false;
         }
 
@@ -403,5 +464,25 @@ mod tests {
         assert!(matches!(solver.check(), TheoryResult::Sat));
         assert!(!solver.has_inconsistent_divisions());
         assert!(!solver.zero_divisor_model_is_unsound());
+    }
+
+    #[test]
+    fn patch_affordability_uses_numerator_plus_denominator_bits() {
+        let small = || PatchPlan {
+            var: TermId(0),
+            value: BigRational::new(BigInt::from(3), BigInt::from(2)),
+        };
+        assert!(patch_plans_affordable(&[]));
+        assert!(patch_plans_affordable(&[small()]));
+        let huge_numer = PatchPlan {
+            var: TermId(1),
+            value: BigRational::new(BigInt::from(1i64) << 3000u32, BigInt::from(7)),
+        };
+        assert!(!patch_plans_affordable(&[small(), huge_numer]));
+        let huge_denom = PatchPlan {
+            var: TermId(2),
+            value: BigRational::new(BigInt::from(1), BigInt::from(1i64) << 3000u32),
+        };
+        assert!(!patch_plans_affordable(&[huge_denom]));
     }
 }

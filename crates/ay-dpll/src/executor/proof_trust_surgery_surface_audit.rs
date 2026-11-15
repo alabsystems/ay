@@ -30,14 +30,20 @@ mod tests;
 #[path = "proof_trust_surgery_surface_validate.rs"]
 mod validate;
 pub(in crate::executor) use copied::copied_structural_roles_are_static;
-pub(in crate::executor) use limits::render_roots_have_bounded_payload;
-#[cfg(test)]
 pub(in crate::executor) use limits::surface_pass_work;
+#[cfg(test)]
+pub(in crate::executor) use limits::surface_pass_work_as;
+pub use limits::SurfaceSourceRefusal;
+pub(in crate::executor) use limits::{
+    expanded_render_work_bound, render_roots_have_bounded_depth, render_roots_have_bounded_payload,
+};
 pub(in crate::executor) use limits::{
     live_proof_rendering_is_static, surface_source_is_bounded, surface_source_work,
-    surface_sources_have_bounded_work, term_child_count, ProofSourcePass, ProofSourceWorkEnvelope,
+    surface_source_work_probe, surface_sources_have_bounded_work, term_child_count,
+    ProofSourcePass, ProofSourceWorkEnvelope,
 };
-use limits::{render_roots_have_bounded_depth, MAX_REQUIREMENT_BYTES, MAX_SURFACE_DEPTH};
+pub(in crate::executor) use limits::{surface_source_work_probe_as, SurfaceWorkModel};
+use limits::{MAX_REQUIREMENT_BYTES, MAX_SURFACE_DEPTH};
 
 const MAX_AUDITED_POLARITY_PAIRS: usize = 4_096;
 const MAX_AUDITED_FARKAS_LEMMAS: usize = 512;

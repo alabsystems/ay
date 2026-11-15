@@ -13,7 +13,6 @@ pub type SignedClause = Vec<i32>;
 
 /// A variable identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct Variable(pub(crate) u32);
 
 /// A literal (variable with polarity)
@@ -23,7 +22,6 @@ pub struct Variable(pub(crate) u32);
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, bytemuck::Pod, bytemuck::Zeroable,
 )]
 #[repr(transparent)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct Literal(pub(crate) u32);
 
 /// Largest variable index representable in both internal literal encoding and
@@ -191,83 +189,5 @@ impl Variable {
     #[inline]
     pub fn index(self) -> usize {
         self.0 as usize
-    }
-}
-
-// ============================================================================
-// Kani Verification Harnesses
-// ============================================================================
-
-#[cfg(kani)]
-mod verification {
-    use super::*;
-
-    /// Negation is involutive: negating twice returns the original literal
-    #[kani::proof]
-    fn literal_negation_involutive() {
-        let lit: Literal = kani::any();
-        // Bound for tractability (half of u32::MAX due to encoding)
-        kani::assume(lit.0 < 1_000_000);
-        assert_eq!(lit.negated().negated(), lit);
-    }
-
-    /// Variable roundtrip: creating positive/negative literals preserves variable
-    #[kani::proof]
-    fn literal_variable_roundtrip() {
-        let var: Variable = kani::any();
-        // Bound to prevent overflow in shift operation
-        kani::assume(var.0 < 500_000);
-
-        let pos = Literal::positive(var);
-        let neg = Literal::negative(var);
-
-        assert_eq!(pos.variable(), var);
-        assert_eq!(neg.variable(), var);
-        assert!(pos.is_positive());
-        assert!(!neg.is_positive());
-    }
-
-    /// Encoding uniqueness: different variables have different literal encodings
-    #[kani::proof]
-    fn literal_encoding_unique() {
-        let var1: Variable = kani::any();
-        let var2: Variable = kani::any();
-        kani::assume(var1.0 < 500_000 && var2.0 < 500_000);
-
-        let pos1 = Literal::positive(var1);
-        let pos2 = Literal::positive(var2);
-
-        // Same encoding implies same variable
-        if pos1.0 == pos2.0 {
-            assert_eq!(var1, var2);
-        }
-    }
-
-    /// Positive and negative literals for the same variable are different
-    #[kani::proof]
-    fn literal_polarity_distinct() {
-        let var: Variable = kani::any();
-        kani::assume(var.0 < 500_000);
-
-        let pos = Literal::positive(var);
-        let neg = Literal::negative(var);
-
-        assert_ne!(pos, neg);
-        assert_eq!(pos.negated(), neg);
-        assert_eq!(neg.negated(), pos);
-    }
-
-    /// Index is consistent with encoding
-    #[kani::proof]
-    fn literal_index_consistent() {
-        let var: Variable = kani::any();
-        kani::assume(var.0 < 500_000);
-
-        let pos = Literal::positive(var);
-        let neg = Literal::negative(var);
-
-        // Indices should be consecutive: pos = 2*var, neg = 2*var + 1
-        assert_eq!(pos.index(), (var.0 as usize) * 2);
-        assert_eq!(neg.index(), (var.0 as usize) * 2 + 1);
     }
 }

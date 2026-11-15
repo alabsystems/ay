@@ -1,0 +1,32 @@
+pseudo-Boolean proof version 2.0
+* Positive companion to incorrect/version2/order_definition_sol: the same
+* unsatisfiable formula, proven unsatisfiable the honest way. What the
+* placement gate must not do is make the order definition itself unusable, so
+* the same `pre_order` block is defined and loaded here.
+f 2
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+end
+load_order simple x1
+load_order
+p 1 2 +
+output NONE
+conclusion UNSAT : -1
+end pseudo-Boolean proof

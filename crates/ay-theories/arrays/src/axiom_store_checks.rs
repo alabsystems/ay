@@ -282,11 +282,9 @@ impl ArraySolver<'_> {
 
         let candidate_pairs = self.select_conflict_candidate_pairs();
 
-        #[cfg(not(kani))]
-        let mut needed: HashSet<TermId> =
-            ay_core::kani_compat::det_hash_set_with_capacity(candidate_pairs.len() * 2);
-        #[cfg(kani)]
-        let mut needed: HashSet<TermId> = HashSet::default();
+        let mut needed: HashSet<TermId> = ay_core::kani_compat::det_hash_set_with_capacity(
+            candidate_pairs.len().saturating_mul(2),
+        );
         for &(s1, s2) in candidate_pairs.iter() {
             needed.insert(s1);
             needed.insert(s2);
@@ -461,7 +459,13 @@ impl ArraySolver<'_> {
         map2: &[(TermId, TermId, Vec<TheoryLit>)],
         eq_cache: &mut EqualityReasonCache,
     ) -> (Vec<TermId>, Vec<TheoryLit>) {
-        let mut used = vec![false; map2.len()];
+        // Capacity hint only: if the reservation fails, the pushes grow the
+        // vector as they go.
+        let mut used = Vec::new();
+        let _ = used.try_reserve_exact(map2.len());
+        for _ in 0..map2.len() {
+            used.push(false);
+        }
         let mut support = Vec::new();
         let mut reasons = Vec::new();
 
@@ -588,6 +592,22 @@ impl ArraySolver<'_> {
             else {
                 continue;
             };
+            // Lower-bound prune: a candidate through this alias contains
+            // every literal of `lhs_eq_reasons` (base equality paths are
+            // deduped; affine-congruence reasons may repeat one, so this
+            // is a near-lower bound), hence it cannot strictly beat an
+            // incumbent of that length and at best ties it. Every
+            // candidate is a valid explanation, so skipping only changes
+            // which valid explanation is returned (clause size / tie
+            // break), never soundness. Measured dominant on storecomm
+            // final_checks, where most alias pairs only lengthen the
+            // explanation (DR-AY-ARRAYS-ALIAS-EXPLAIN-PRUNE-20261110).
+            if best
+                .as_ref()
+                .is_some_and(|b| lhs_eq_reasons.len() >= b.len())
+            {
+                continue;
+            }
             for &rhs_alias in &rhs_aliases {
                 let Some(rhs_eq_reasons) =
                     self.explain_equal_cached(eq_cache, rhs_select, rhs_alias)
@@ -630,8 +650,6 @@ impl ArraySolver<'_> {
     }
 
     fn select_alias_diseq_candidate_pairs_uncached(&self) -> Vec<(TermId, TermId)> {
-        const MAX_SELECT_ALIASES_PER_ENDPOINT: usize = 16;
-
         // #arraytax: candidate endpoints can only be select terms (directly or
         // via `nearest_select_aliases`, which only collects `select_cache`
         // members). With no selects registered this loop provably yields no
@@ -641,67 +659,12 @@ impl ArraySolver<'_> {
             return Vec::new();
         }
 
-        let nearest_select_aliases = |endpoint: TermId| -> Vec<TermId> {
-            // M2 union-find prefilter: the asserted-edge BFS below only ever
-            // visits members of `endpoint`'s equivalence class, so a class
-            // holding no select term is a guaranteed empty answer. Positive
-            // candidates keep the exact legacy nearest-depth BFS (depth
-            // minimality is load-bearing for candidate selection).
-            if self.shadow_uf_ready() {
-                match self.shadow_uf.class_slice(endpoint) {
-                    Some(members)
-                        if members
-                            .iter()
-                            .any(|member| self.select_cache.contains_key(member)) => {}
-                    _ => return Vec::new(),
-                }
-            }
-
-            let mut queue = std::collections::VecDeque::new();
-            let mut seen = HashSet::default();
-            queue.push_back((endpoint, 0usize));
-            seen.insert(endpoint);
-
-            let mut aliases = Vec::new();
-            let mut found_depth = None;
-            while let Some((current, depth)) = queue.pop_front() {
-                if found_depth.is_some_and(|best_depth| depth > best_depth) {
-                    break;
-                }
-                if self.select_cache.contains_key(&current) {
-                    found_depth = Some(depth);
-                    aliases.push(current);
-                    if aliases.len() >= MAX_SELECT_ALIASES_PER_ENDPOINT {
-                        break;
-                    }
-                    continue;
-                }
-
-                let Some(neighbors) = self.eq_adj.get(&current) else {
-                    continue;
-                };
-                for &(other, eq_term) in neighbors {
-                    if eq_term.is_sentinel()
-                        || self.assigns.get(&eq_term) != Some(&true)
-                        || !seen.insert(other)
-                    {
-                        continue;
-                    }
-                    queue.push_back((other, depth + 1));
-                }
-            }
-
-            aliases.sort_unstable_by_key(|term| term.0);
-            aliases.dedup();
-            aliases
-        };
-
         let mut pairs = Vec::new();
         for &(lhs, rhs) in &self.diseq_set {
             let lhs_selects = if self.select_cache.contains_key(&lhs) {
                 vec![lhs]
             } else {
-                nearest_select_aliases(lhs)
+                self.nearest_select_aliases(lhs)
             };
             if lhs_selects.is_empty() {
                 continue;
@@ -710,7 +673,7 @@ impl ArraySolver<'_> {
             let rhs_selects = if self.select_cache.contains_key(&rhs) {
                 vec![rhs]
             } else {
-                nearest_select_aliases(rhs)
+                self.nearest_select_aliases(rhs)
             };
             if rhs_selects.is_empty() {
                 continue;
@@ -728,6 +691,68 @@ impl ArraySolver<'_> {
         pairs.sort_unstable_by_key(|&(lhs, rhs)| (lhs.0, rhs.0));
         pairs.dedup();
         pairs
+    }
+
+    /// The select terms nearest `endpoint` through asserted equalities: every
+    /// `select_cache` member at the minimal BFS depth, at most
+    /// `MAX_SELECT_ALIASES_PER_ENDPOINT` of them, sorted and deduplicated.
+    fn nearest_select_aliases(&self, endpoint: TermId) -> Vec<TermId> {
+        const MAX_SELECT_ALIASES_PER_ENDPOINT: usize = 16;
+
+        // M2 union-find prefilter: the asserted-edge BFS below only ever
+        // visits members of `endpoint`'s equivalence class, so a class
+        // holding no select term is a guaranteed empty answer. Positive
+        // candidates keep the exact legacy nearest-depth BFS (depth
+        // minimality is load-bearing for candidate selection).
+        if self.shadow_uf_ready() {
+            match self.shadow_uf.class_slice(endpoint) {
+                Some(members)
+                    if members
+                        .iter()
+                        .any(|member| self.select_cache.contains_key(member)) => {}
+                _ => return Vec::new(),
+            }
+        }
+
+        let mut queue = std::collections::VecDeque::new();
+        let mut seen = HashSet::default();
+        queue.push_back((endpoint, 0usize));
+        seen.insert(endpoint);
+
+        let mut aliases = Vec::new();
+        let mut found_depth = None;
+        while let Some((current, depth)) = queue.pop_front() {
+            if found_depth.is_some_and(|best_depth| depth > best_depth) {
+                break;
+            }
+            if self.select_cache.contains_key(&current) {
+                found_depth = Some(depth);
+                aliases.push(current);
+                if aliases.len() >= MAX_SELECT_ALIASES_PER_ENDPOINT {
+                    break;
+                }
+                continue;
+            }
+
+            let Some(neighbors) = self.eq_adj.get(&current) else {
+                continue;
+            };
+            for &(other, eq_term) in neighbors {
+                if eq_term.is_sentinel()
+                    || self.assigns.get(&eq_term) != Some(&true)
+                    || !seen.insert(other)
+                {
+                    continue;
+                }
+                // A BFS depth never exceeds the number of terms visited,
+                // so the saturation is never reached.
+                queue.push_back((other, depth.saturating_add(1)));
+            }
+        }
+
+        aliases.sort_unstable_by_key(|term| term.0);
+        aliases.dedup();
+        aliases
     }
 
     /// Propagate the singleton support equality for same-base finite store chains.
@@ -1391,6 +1416,15 @@ impl ArraySolver<'_> {
                 .or_else(|| self.find_func_app_via_equiv_classes(&func_name, &arg_select_terms));
 
             if let Some((func_app, equiv_eq_reasons)) = func_app_result {
+                // Every emission below is justified only under the literals
+                // that make `sel_array =_E map_term`; without an explanation
+                // the instance is not emitted (it used to fall back to an
+                // antecedent-free clause, the defect class of the
+                // default-const lemma, 2026-09-23 hunt D4).
+                let Some(path_reasons) = self.explain_equal_if_provable(sel_array, map_term) else {
+                    retained.push((select_term, map_term));
+                    continue;
+                };
                 // The select-map axiom says select_term = func_app.
                 // If they're known distinct, we have a conflict.
                 if let Some(diseq_reasons) =
@@ -1399,16 +1433,7 @@ impl ArraySolver<'_> {
                     let mut reasons = diseq_reasons;
 
                     // Add the equality justification: sel_array =_E map_term
-                    if sel_array != map_term {
-                        if let Some(eq_path) = self.asserted_equality_path_pub(sel_array, map_term)
-                        {
-                            for eq_term in eq_path {
-                                reasons.push(TheoryLit::new(eq_term, true));
-                            }
-                        } else if let Some(eq) = self.get_eq_term(sel_array, map_term) {
-                            reasons.push(TheoryLit::new(eq, true));
-                        }
-                    }
+                    reasons.extend(path_reasons.iter().copied());
 
                     // #8598: Add reasons for arg equivalence class substitutions.
                     reasons.extend(equiv_eq_reasons.iter().copied());
@@ -1433,12 +1458,26 @@ impl ArraySolver<'_> {
                         continue;
                     }
 
+                    // The instance needs every antecedent: the array equality
+                    // (direct atom when one exists, else the explained path)
+                    // AND the argument substitutions that located `func_app`.
                     let mut clause = Vec::new();
                     if sel_array != map_term {
                         if let Some(arr_eq) = self.get_eq_term(sel_array, map_term) {
                             clause.push(TheoryLit::new(arr_eq, false));
+                        } else {
+                            clause.extend(
+                                path_reasons
+                                    .iter()
+                                    .map(|lit| TheoryLit::new(lit.term, !lit.value)),
+                            );
                         }
                     }
+                    clause.extend(
+                        equiv_eq_reasons
+                            .iter()
+                            .map(|lit| TheoryLit::new(lit.term, !lit.value)),
+                    );
                     clause.push(TheoryLit::new(eq_atom, true));
 
                     if !clause.is_empty() {
@@ -1516,6 +1555,13 @@ impl ArraySolver<'_> {
                 .or_else(|| self.find_func_app_via_equiv_classes(&func_name, &[sel_index]));
 
             if let Some((func_app, equiv_eq_reasons)) = func_app_result {
+                // Justified only under the literals that make
+                // `sel_array =_E as_array_term` (see check_select_map).
+                let Some(path_reasons) = self.explain_equal_if_provable(sel_array, as_array_term)
+                else {
+                    retained.push((select_term, as_array_term));
+                    continue;
+                };
                 // The axiom says select_term = func_app.
                 // If they're known distinct, we have a conflict.
                 if let Some(diseq_reasons) =
@@ -1524,17 +1570,7 @@ impl ArraySolver<'_> {
                     let mut reasons = diseq_reasons;
 
                     // Add the equality justification: sel_array =_E as_array_term
-                    if sel_array != as_array_term {
-                        if let Some(eq_path) =
-                            self.asserted_equality_path_pub(sel_array, as_array_term)
-                        {
-                            for eq_term in eq_path {
-                                reasons.push(TheoryLit::new(eq_term, true));
-                            }
-                        } else if let Some(eq) = self.get_eq_term(sel_array, as_array_term) {
-                            reasons.push(TheoryLit::new(eq, true));
-                        }
-                    }
+                    reasons.extend(path_reasons.iter().copied());
 
                     // Add reasons for arg equivalence class substitutions.
                     reasons.extend(equiv_eq_reasons.iter().copied());
@@ -1555,12 +1591,26 @@ impl ArraySolver<'_> {
                         continue;
                     }
 
+                    // The instance needs every antecedent: the array equality
+                    // (direct atom when one exists, else the explained path)
+                    // AND the argument substitutions that located `func_app`.
                     let mut clause = Vec::new();
                     if sel_array != as_array_term {
                         if let Some(arr_eq) = self.get_eq_term(sel_array, as_array_term) {
                             clause.push(TheoryLit::new(arr_eq, false));
+                        } else {
+                            clause.extend(
+                                path_reasons
+                                    .iter()
+                                    .map(|lit| TheoryLit::new(lit.term, !lit.value)),
+                            );
                         }
                     }
+                    clause.extend(
+                        equiv_eq_reasons
+                            .iter()
+                            .map(|lit| TheoryLit::new(lit.term, !lit.value)),
+                    );
                     clause.push(TheoryLit::new(eq_atom, true));
 
                     if !clause.is_empty() {
@@ -1635,6 +1685,25 @@ impl ArraySolver<'_> {
                 continue;
             }
 
+            // The axiom instance `X = const-array(v) -> default(X) = v` holds
+            // only under the literals that make `X =_E const-array(v)`. Both
+            // the conflict and the lemma below must carry them; without an
+            // explanation the instance cannot be emitted at all.
+            //
+            // The lemma used to add only a DIRECT `(= X const-array(v))` atom
+            // and silently drop the antecedent when the two were equal through
+            // a longer path (or through an equality whose atom is absent from
+            // the term store), which emitted the UNIT clause
+            // `default(X) = v`: on 2026-09-23 hunt file const_11_0110
+            // (`--z3-mode`) `(= 1 (default (store (store K0 i0 v0) 2 0)))`
+            // was learned outright, a wrong UNSAT.
+            let Some(path_reasons) =
+                self.explain_equal_if_provable(default_array_arg, const_array_term)
+            else {
+                retained.push((default_term, const_array_term));
+                continue;
+            };
+
             // The axiom says: default(X) = v where X =_E const-array(v).
             // If default_term != default_val is provable, we have a conflict.
             if let Some(diseq_reasons) =
@@ -1643,17 +1712,7 @@ impl ArraySolver<'_> {
                 let mut reasons = diseq_reasons;
 
                 // Add the equality justification: default_array_arg =_E const_array_term
-                if default_array_arg != const_array_term {
-                    if let Some(eq_path) =
-                        self.asserted_equality_path_pub(default_array_arg, const_array_term)
-                    {
-                        for eq_term in eq_path {
-                            reasons.push(TheoryLit::new(eq_term, true));
-                        }
-                    } else if let Some(eq) = self.get_eq_term(default_array_arg, const_array_term) {
-                        reasons.push(TheoryLit::new(eq, true));
-                    }
-                }
+                reasons.extend(path_reasons.iter().copied());
 
                 reasons.sort_by_key(|lit| (lit.term.0, lit.value));
                 reasons.dedup_by_key(|lit| (lit.term, lit.value));
@@ -1665,7 +1724,9 @@ impl ArraySolver<'_> {
             }
 
             // Not a conflict yet. Try to generate a lemma:
-            // NOT(default_array_arg = const_array_term) OR default_term = default_val
+            // NOT(default_array_arg = const_array_term) OR default_term = default_val,
+            // with the direct equality atom when one exists (a valid axiom
+            // instance whatever its assignment), else the explained path.
             if let Some(eq_atom) = self.get_eq_term(default_term, default_val) {
                 if self.assigns.get(&eq_atom) == Some(&true) {
                     // Axiom already satisfied — skip.
@@ -1676,6 +1737,12 @@ impl ArraySolver<'_> {
                 if default_array_arg != const_array_term {
                     if let Some(arr_eq) = self.get_eq_term(default_array_arg, const_array_term) {
                         clause.push(TheoryLit::new(arr_eq, false));
+                    } else {
+                        clause.extend(
+                            path_reasons
+                                .iter()
+                                .map(|lit| TheoryLit::new(lit.term, !lit.value)),
+                        );
                     }
                 }
                 clause.push(TheoryLit::new(eq_atom, true));
@@ -1963,7 +2030,78 @@ impl ArraySolver<'_> {
                 return self.conflict_reasons_to_lemma(reasons);
             }
         }
-        None
+        for &(eq_term, lhs, rhs) in &self.pending_array_eqs {
+            if self.assigns.get(&eq_term) != Some(&true) || lhs == rhs {
+                continue;
+            }
+            if let Some(mut reasons) = self.store_chain_default_conflict_reasons(lhs, rhs) {
+                reasons.push(TheoryLit::new(eq_term, true));
+                if let Some(conflict) = self.conflict_reasons_to_lemma(reasons) {
+                    return Some(conflict);
+                }
+            }
+        }
+        // The same fact for chains the equality graph merges transitively.
+        self.check_store_chain_class_default_conflict()
+    }
+
+    /// Two finite store chains over const-arrays with provably distinct
+    /// defaults can never be equal when the index sort is infinite.
+    ///
+    /// `store(..store(const(d1), i1, v1).., in, vn)` agrees with `const(d1)`
+    /// everywhere except at its n written indices, and likewise for the other
+    /// chain over `const(d2)`. Over an infinite index sort some index misses
+    /// every written index of both chains, and the two arrays read `d1` and
+    /// `d2` there. So `lhs = rhs` together with the paths that reach the two
+    /// const-arrays and a provable `d1 != d2` is a theory conflict -- with NO
+    /// premise about the written indices (z3 reaches the same fact through
+    /// its `default` axioms: `default(store(a, i, v)) = default(a)`).
+    ///
+    /// Without this, `check_store_chain_equality_value_conflict` is the only
+    /// route to the contradiction, and it needs a support index provably
+    /// distinct from every written index; when the index relations are
+    /// undecided it stays silent and the search can end on an assignment that
+    /// no array model satisfies. A finite index sort (Bool, bit-vectors) can be
+    /// covered by finitely many stores, so it is excluded.
+    fn store_chain_default_conflict_reasons(
+        &self,
+        lhs: TermId,
+        rhs: TermId,
+    ) -> Option<Vec<TheoryLit>> {
+        let Sort::Array(array_sort) = self.terms.sort(lhs) else {
+            return None;
+        };
+        if !matches!(array_sort.index_sort, Sort::Int | Sort::Real) {
+            return None;
+        }
+        let lhs_base = self.structural_store_base(lhs);
+        let rhs_base = self.structural_store_base(rhs);
+        if lhs_base == lhs && rhs_base == rhs {
+            // Neither side is a store: the direct const = const case above.
+            return None;
+        }
+        let (lhs_default, lhs_reasons) = self.find_const_array_through_eq(lhs_base)?;
+        let (rhs_default, rhs_reasons) = self.find_const_array_through_eq(rhs_base)?;
+        if lhs_default == rhs_default {
+            return None;
+        }
+        let mut reasons = self.explain_distinct_if_provable(lhs_default, rhs_default)?;
+        reasons.extend(lhs_reasons);
+        reasons.extend(rhs_reasons);
+        Some(reasons)
+    }
+
+    /// The array a store chain is built on, following `store` applications
+    /// only (no equalities, so no reasons).
+    pub(crate) fn structural_store_base(&self, term: TermId) -> TermId {
+        let mut current = term;
+        for _ in 0..=self.store_cache.len() {
+            let Some(&(base, _, _)) = self.store_cache.get(&current) else {
+                break;
+            };
+            current = base;
+        }
+        current
     }
 
     /// Effective read value of a store chain `(base, map)` at index `k`.
@@ -1974,11 +2112,21 @@ impl ArraySolver<'_> {
     /// provable index relation exists for an overlapping store).
     ///
     /// The returned reasons are exactly the read-over-write justification:
-    /// for the matching store entry, `idx(entry) = k` plus the store's path
-    /// reasons; for a const-array base, the reasons reaching that const-array.
-    /// This is a logical consequence (read-over-write / const-read axiom), so
-    /// it can only constrain — it never refutes a real model.
-    fn effective_read_value_at(
+    /// for every more-recent store entry the read skips, `idx(entry) != k`;
+    /// then either, for the matching store entry, `idx(entry) = k` plus the
+    /// store's path reasons, or, for a const-array base, the reasons reaching
+    /// that const-array. This is a logical consequence (read-over-write /
+    /// const-read axiom), so it can only constrain — it never refutes a real
+    /// model.
+    ///
+    /// The skip reasons are part of the justification, not a side condition:
+    /// `select(store(a, j, v), k) = select(a, k)` holds only under `j != k`.
+    /// Dropping them made the conflict clause unconditional in the index, so
+    /// a disequality that held only under the current arithmetic assignment
+    /// (`1 != i + 1` while `i` sat at a non-zero value) was learned as a
+    /// permanent refutation of the store-chain equality (wrong UNSAT,
+    /// 2026-09-23 hunt defect D4).
+    pub(crate) fn effective_read_value_at(
         &self,
         base: TermId,
         map: &[(TermId, TermId, Vec<TheoryLit>)],
@@ -1987,22 +2135,27 @@ impl ArraySolver<'_> {
         // The map is ordered most-recent-store first (see
         // collect_complete_effective_stores). The first entry whose index is
         // provably equal to `k` wins; any entry whose index is provably
-        // distinct from `k` is skipped. If an entry's index relation to `k` is
+        // distinct from `k` is skipped, and the reasons for that distinctness
+        // join the explanation. If an entry's index relation to `k` is
         // unknown, we cannot pin the read value, so bail.
+        let mut skip_reasons: Vec<TheoryLit> = Vec::new();
         for (idx, val, store_reasons) in map {
             if let Some(idx_eq_reasons) = self.explain_equal_if_provable(*idx, k) {
                 let mut reasons = store_reasons.clone();
                 reasons.extend(idx_eq_reasons);
+                reasons.extend(skip_reasons);
                 Self::canonicalize_theory_lits(&mut reasons);
                 return Some((*val, reasons));
             }
-            self.explain_distinct_if_provable(*idx, k)?;
+            skip_reasons.extend(self.explain_distinct_if_provable(*idx, k)?);
         }
 
         // No store overlaps `k`; the read falls through to the base. We can
         // only name the value when the base resolves to a const-array.
-        let (default, base_reasons) = self.find_const_array_through_eq(base)?;
-        Some((default, base_reasons))
+        let (default, mut reasons) = self.find_const_array_through_eq(base)?;
+        reasons.extend(skip_reasons);
+        Self::canonicalize_theory_lits(&mut reasons);
+        Some((default, reasons))
     }
 
     /// Read-over-write conflict for an array equality between two finite store
@@ -2120,14 +2273,32 @@ impl ArraySolver<'_> {
                 else {
                     continue;
                 };
-                let Some((_base, base_reasons, effective_map)) =
+                let Some((base, base_reasons, effective_map)) =
                     self.collect_complete_effective_stores(chain_side)
                 else {
+                    if let Some(conflict) = self.const_chain_outermost_write_conflict(
+                        eq_term,
+                        &const_reasons,
+                        default_val,
+                        chain_side,
+                    ) {
+                        return Some(conflict);
+                    }
                     continue;
                 };
                 if effective_map.is_empty() {
                     // Pure const = const (no writes) is handled elsewhere.
                     continue;
+                }
+                if let Some(conflict) = self.const_chain_base_read_conflict(
+                    eq_term,
+                    &const_reasons,
+                    default_val,
+                    base,
+                    &base_reasons,
+                    &effective_map,
+                ) {
+                    return Some(conflict);
                 }
                 // Examine every effective written index: each carries the
                 // obligation select(arr, i_k) = d, i.e. v_k = d.
@@ -2176,7 +2347,74 @@ impl ArraySolver<'_> {
         None
     }
 
+    /// The dual of the written-index obligation above: a chain equal to
+    /// `const(d)` reads its BASE at every index it does not write, so a read
+    /// `select(base, k)` whose index is provably distinct from every written
+    /// index reads `d`. A provable `select(base, k) != d` is then a conflict
+    /// under the equality, the paths to the const-array and the base, and the
+    /// index distinctness -- no written value is involved.
+    ///
+    /// Without it nothing derives `a0[0] = 0` from `K0 = (store a0 2 0)` short
+    /// of an eager upward read-over-write term. The fresh verification
+    /// combiner (`verify_mixed_conflict_semantic`) runs this solver on the
+    /// conflict literals alone, so it called the core
+    /// `{(= K0 (store a0 2 0)), (= (select a0 0) 5)}` SATISFIABLE and the
+    /// fail-closed gate threw away a sound conflict the search had derived --
+    /// the whole first AUFLIA pass ended `unknown` (fresh storeeq_2609_0415,
+    /// `sat` at once on main and z3).
+    fn const_chain_base_read_conflict(
+        &self,
+        eq_term: TermId,
+        const_reasons: &[TheoryLit],
+        default_val: TermId,
+        base: TermId,
+        base_reasons: &[TheoryLit],
+        effective_map: &[(TermId, TermId, Vec<TheoryLit>)],
+    ) -> Option<TheoryResult> {
+        if self.const_array_cache.contains_key(&base) {
+            return None;
+        }
+        let mut reads: Vec<(TermId, TermId)> = self
+            .select_cache
+            .iter()
+            .filter(|&(_, &(array, _))| array == base)
+            .map(|(&read, &(_, index))| (read, index))
+            .collect();
+        reads.sort_unstable_by_key(|&(read, _)| read.0);
+        'reads: for (read, index) in reads {
+            let Some(value_reasons) = self.explain_distinct_if_provable(read, default_val) else {
+                continue;
+            };
+            let mut reasons = vec![TheoryLit::new(eq_term, true)];
+            reasons.extend(const_reasons.iter().copied());
+            reasons.extend(base_reasons.iter().copied());
+            for (written, _, _) in effective_map {
+                let Some(skip_reasons) = self.explain_distinct_if_provable(*written, index) else {
+                    continue 'reads;
+                };
+                reasons.extend(skip_reasons);
+            }
+            reasons.extend(value_reasons);
+            Self::canonicalize_theory_lits(&mut reasons);
+            if let Some(conflict) = self.conflict_reasons_to_lemma(reasons) {
+                return Some(conflict);
+            }
+        }
+        None
+    }
+
     pub(crate) fn check_array_equality(&mut self) -> Option<TheoryResult> {
+        // #arrays-eq-window-array-equality: this triple loop
+        // (candidates × lhs selects × rhs selects) calls
+        // explain_equal/distinct per pair; unlike its sibling scans it
+        // ran OUTSIDE the eq-paths memo window, so every call paid a
+        // fresh asserted-path BFS (measured as the top stack on QF_AX
+        // swap sf files: check_array_equality → explain_equal base).
+        // The scan only reads eq_adj/assigns/external facts and
+        // returns lemmas/conflicts for the caller to apply — the same
+        // frozen-graph contract the sibling windows rely on (lemma
+        // term creation appends terms but mutates none of those maps).
+        let _eq_paths_cache_guard = eq_paths_cache::activate_if_inactive();
         // Const-array equality is decided directly, before the select-driven
         // O(N^2) loop, because it needs no selects/stores. Non-destructive so
         // it can also be invoked from final_check's early-Sat short-circuit.

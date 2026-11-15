@@ -1,0 +1,17 @@
+pseudo-Boolean proof version 3.0
+% ONE OFF THE BOUNDARY. Byte-for-byte the proof of `../../add.pbp`, with the rup'd degree
+% raised by ONE: -9223372036854775807 instead of -9223372036854775808. The addition's true
+% degree is then -9223372036854775808 = i64::MIN exactly, which fits, so the cancellation
+% subtraction does not wrap and the derived row `1 x2 >= -9223372036854775808` is the
+% trivially true constraint it should be.
+%
+% This proof is REJECTED by the UNFIXED checker and by the fixed one alike. That is the
+% point: it pins the forgery to the WRAP and not to "large numbers confuse the checker".
+% One unit of magnitude is the entire difference between a forged
+% `s VERIFIED UNSATISFIABLE` and a correct refusal.
+f 1 ;
+rup 1 x1 1 x2 >= -9223372036854775807 ;
+pol 2 ~x1 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

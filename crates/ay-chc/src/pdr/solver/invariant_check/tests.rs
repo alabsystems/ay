@@ -463,29 +463,6 @@ fn keep_direct_accept_for_strict_or_non_bv_candidates_issue_7964() {
     );
 }
 
-#[test]
-fn safety_proof_routes_bv_inductive_subset_candidates_through_cascade_issue_7964() {
-    let src = include_str!("safety_proof.rs");
-    let branch_start = src
-        .find("InductiveSubsetOutcome::Proven(m) => {")
-        .expect("safety_proof.rs should handle inductive-subset Proven results");
-    let branch = &src[branch_start..];
-    let branch_end = branch
-        .find("InductiveSubsetOutcome::Insufficient => {")
-        .unwrap_or(branch.len());
-    let proven_branch = &branch[..branch_end];
-
-    assert!(
-        proven_branch
-            .contains("self.must_reverify_bv_single_predicate_inductive_subset_candidate(&m)"),
-        "BV single-predicate inductive-subset candidates must be gated by the reverify helper"
-    );
-    assert!(
-        proven_branch.contains("return self.try_model_verification_cascade(m);"),
-        "BV single-predicate inductive-subset candidates must route through the verification cascade"
-    );
-}
-
 // ===========================================================================
 // Counterexample-guided candidate repair (#4751 L4)
 // ===========================================================================

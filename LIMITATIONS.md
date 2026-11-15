@@ -1,484 +1,389 @@
-# Scope and limitations
+# Limitations
 
-AY is a 0.x solver workspace. Support and evidence are specific to a logic,
-entry point, proof format, and checker; the presence of a parser or API does not
-by itself mean that the full theory combination is complete or certified.
+What AY does not do, or does not do yet. If you are about to rely on AY for
+something that matters, read this first.
 
-- `sat`, `unsat`, and optimization answers are certified only when the selected
-  mode emits a documented artifact and that artifact passes its named,
-  designated checker. The trust boundary differs by path: some checkers are
-  external tools, while native APIs also expose solver-state-independent
-  in-tree verifiers. Other answers are solver results, not proof claims.
-- AY's built-in DIMACS checker fails closed when it rejects a DRAT/LRAT/PR-SR
-  proof, but warns and preserves the verdict when checking cannot run. SMT
-  `--self-check` is the fail-closed path for AY's internal proof objects: UNSAT
-  requires a strict semantic proof check and binds every reachable assumption
-  to the active problem. Independent Alethe and VeriPB replay remains a separate
-  certification step.
-- `unknown` is an expected sound outcome for unsupported or incomplete paths.
-  Callers must not reinterpret it as `sat` or `unsat`.
-- `verification/lean` is the maintained Lean project named by the public proof
-  claims. The public snapshot excludes admitted research modules and private
-  proof-factory routing, private deductive-checker harnesses, and orchestration;
-  retained proof fixtures and artifacts are not broader verification claims
-  unless they identify a completed theorem and a reproducible checker invocation.
-- The public workspace omits development-only code-generation integrations and
-  unwired prototype crates. Their absence is deliberate; supported fallback
-  solver paths remain in the exported crates and are checked under all public
-  features.
-- The Python incremental `arrays` and `arr_lia` fragments remain experimental
-  and often return `unknown`; their bounded differential tests require zero
-  verdict disagreements. `Solver` and `Optimize` fail closed with `unknown` on
-  quantified-array formulas, and Python `IsSubset` deliberately raises
-  `NotImplementedError`, because that FFI path is not soundly supported.
-- Historical wrong-answer inputs remain in the SMT regression corpus and must
-  be replayed against a reference solver before an affected logic is described
-  as release-ready.
-- Performance and coverage numbers are meaningful only with the exact commit,
-  binary provenance, corpus, timeout, enforced memory envelope, proof mode,
-  checker verdicts, and wrong/invalid counts supplied alongside them.
-- Benchmark deficits are roadmap inputs, not reasons to narrow the promised
-  Z3-compatibility surface or the specialist-performance target.
+## Answers that come back `unknown`
 
-The release bar is zero known wrong answers and zero invalid certificates on the
-advertised surface. No current public aggregate evidence packet demonstrates
-that bar across the advertised surface. Treat each claim only at the granularity
-of its named test or checker, and treat unlisted theory combinations and bindings
-as experimental.
+AY returns `unknown` rather than guess. The common reasons:
 
-These are present-state limits, not a narrowing of the project goal. AY is being
-built to become a universal Z3 replacement and to outperform mature specialist
-solvers in their domains; each step toward that goal must earn its claim with
-reproducible results and independently checked evidence.
+- **Nonlinear arithmetic.** NRA and NIA work by incremental linearization
+  (sign and tangent lemmas) plus interval constraint propagation. That decides
+  many practical problems and is incomplete in general. CAD projection is
+  implemented but is not wired into the search, so there is no complete
+  fallback.
+- **Strings.** The string solver latches to `unknown` as soon as it applies a
+  reduction it cannot fully justify, rather than risk a wrong `sat`.
+- **Quantifiers.** E-matching, CEGQI and MBQI are heuristics. Undecidable
+  fragments stay undecidable; a missing trigger means `unknown`.
+- **Resource limits.** `-t`/`--timeout` (milliseconds), z3-style `-T:`
+  (seconds), and `--memory` produce `unknown` with exit code 124.
 
-## Known limitations
+## Certificate coverage is uneven
 
-- **Quantified search remains incomplete; public SAT publication fails closed
-  unless a complete checked evidence lane succeeds.** Runtime-checked recovery
-  was implemented 2026-08-01 for the restricted quantified-UFBV projection
-  fragment; guarded external remeasurement is still pending. The 2026-07-31
-  emergency closure remains in force elsewhere: syntactic
-  UF-completion and QuantifierConsumer/sequence shapes are not SAT certificates, and a
-  quantified assertion that model validation defers or cannot check converts
-  `sat` to `unknown` in default mode as well as `--self-check`. Model-less
-  quantified SAT, incomplete E-matching, finite-domain certificates, and
-  non-conjunctive CEGQI refinement likewise fail closed unless they carry their
-  specific semantic evidence.
+| Problem | On `unsat` / optimal | Checkable by |
+| --- | --- | --- |
+| CNF (SAT) | DRAT, LRAT, DPR/SR, VeriPB, or Lean4 | `ay check drat`/`lrat`/`dpr`/`sr`, drat-trim, cake_lpr, VeriPB |
+| SMT-LIB | Alethe | carcara; AY's own strict checker re-checks it during the solve, but no `ay check` subcommand reads Alethe — and see below |
+| Pseudo-Boolean | VeriPB | VeriPB |
+| MaxSAT | OPB + VeriPB bounds | VeriPB |
+| MILP | exact rational Farkas / optimality | AY only — no external format exists |
+| CHC | quotient certificate | compiled out of public builds |
+| Model counting, QBF, AllSAT | nothing | — |
 
-  The production recovery accepts only a caller-authored, plain hard
-  `check-sat`. An untrusted projection candidate must pass the unsafe-free,
-  solver-independent implication checker and an independent positive source
-  binding. The source layer uses allocation-stable `DeclarationId`s, a closed
-  `DeclarationKind`, and a context-identity/revision stamp; only an exact live
-  primary `Uninterpreted` declaration is eligible. The query layer uses a fresh
-  pointer-identity epoch and an ordered inventory of roots, assumptions,
-  objectives, parsed/native soft constraints, scope depth, and term count. Its
-  non-`Clone` permit is captured and consumed inside one borrow-bound exclusive
-  `Executor` transaction, so generic, assumption, optimization, internal, or
-  stale query origins cannot acquire it.
+`sat` answers are not certified. They are *validated*: AY re-evaluates the
+model against the original constraints. That catches a wrong `sat`, but it is
+a check, not a proof.
 
-  Accepted semantic, source, and query evidence is sealed and non-`Clone`. The
-  emission boundary installs the exact total selector functions, boundedly
-  completes only proof-neutral output values, rechecks the frozen graph,
-  declaration identities/kinds/signatures, source and query epochs, and final
-  projection map, then mints a private one-shot SAT certificate. Assertion/model
-  evaluation, the independent model view, `get-value`, `get-model` rendering,
-  and round-trip checking all consume the same exact symbol/signature/projection
-  map. Unsupported shapes, signature conflicts, stale evidence, and resource
-  stops decline to the ordinary sound fallback or `unknown`.
+**Alethe proofs are not yet hole-free.** AY emits some theory steps as opaque
+`trust` steps that carcara cannot expand. The in-repo corpus gate explicitly
+permits those holes. Hole-free checking is demonstrated only on a small set of
+hand-written formulas.
 
-  The checked output-completion lane keeps the cached solve result revoked; it
-  does not install even a provisional `Sat` while completing the model. Only
-  the final currentness/model checks can publish cached `Sat` and mint the
-  certificate. An interrupt, deadline, or memory stop clears the incomplete
-  model, validation bit, and certificate and explicitly caches `Unknown`, so a
-  later model/API read cannot revive a stopped solve as SAT.
+**The two spellings of strict proofs do not yet admit the same UNSATs.**
+`--strict-proofs` (`--rigor strict`) refuses an UNSAT whose rendered Alethe
+document has a `hole` or `trust` step. `(set-option :check-proofs-strict true)`
+does that too, and in the library it also withholds any UNSAT whose proof a
+conservative known-wire-gap screen flags; that screen reports every
+multi-literal bit-blast lemma as a gap, even one that renders as a complete,
+hole-free blast. So some problems answer `unsat` under the flag and `unknown
+(incomplete proof-trusted)` under the in-script option: for example
+`benchmarks/smt/QF_ABV/wide_mul_unsat.smt2` (and the same problem over a 4- or
+16-bit index), whose hole-free refutation is a two-literal bit-blast lemma.
+The screen does follow `--alethe-dialect` for a datatype selector over a
+constructor (below): `(assert (not (= (fst (mk a b)) a)))` answers `unsat`
+under both spellings in the default (Clean) dialect, whose document prints
+`dt_project`, and `unknown` under both in the pinned dialect, whose document
+prints a `hole`. The screen cannot see one case the printer declines: a
+selector or constructor name that a binder anchor elsewhere in the proof
+binds. There it would admit a document that prints the hole.
 
-  The sole full-family campaign is the checked-in guarded external harness
-  `scripts/ufbv_fixpoint_audit.py`. It pins the exact 121-file family to
-  canonical manifest SHA-256
-  `ef9912b78e493410189a3bfa733987a873a1e7ca5d36a529f42426f312391dd9`
-  (sorted basename, NUL, raw bytes, NUL) and requires the exact 26/74/21 declared
-  status distribution. It launches 121 fresh default processes and 121 fresh
-  `--self-check` processes, with `-st` enabled in both lanes. The closure gate
-  exits nonzero unless **both** lanes return `sat` on all 26 declared-SAT cases
-  and every one of those 52 SAT runs exposes exactly one canonical statistics
-  block with `model_validation.checked_projection_certificate=1`. It also
-  requires neither lane to return `sat` on any of the 74 declared-UNSAT or 21
-  declared-unknown cases, both lanes to have zero wrong and zero invalid
-  results, and the fresh self-check lane to reproduce every decisive default
-  result. Self-check is reproducibility/check-policy evidence from another AY
-  process, not independent corroboration or external proof replay.
+**Strict proofs publish one default certificate per run.** Under strict
+proofs, in either spelling, an SMT-LIB `unsat` is published only once its
+certificate is, and the default certificate is the one file `<input>.alethe`,
+which AY never replaces. So a second strict `unsat` in the same run, or a rerun
+beside an earlier run's `<input>.alethe`, answers `unknown` with
+`(:reason-unknown (incomplete proof-publication-failed))`. A certificate the
+strict check refuses after writing it is invalidated in place, as an empty
+file, and blocks later strict runs the same way; delete it first. The
+in-script option behaves exactly as the flag here only since
+`fix/strict-option-single-answer`. Before it, a script that set the option
+without `--strict-proofs` answered `unsat` to both of two `unsat` queries,
+certifying only the second, and when a certificate could not be published it
+answered `unsat` and then, at the end of the run, `unknown` to the same
+`check-sat`. The option applies to the queries after it: one set after a
+`check-sat` does not judge that query's certificate. The first strict query
+keeps the file through a `(reset)` too: a later query the reset left
+non-strict answers `unsat` with no certificate, and `<input>.alethe` then
+certifies a problem the end of the script no longer contains. Without strict
+proofs the file certifies the last `unsat`, as before. When a later query
+finds the file, the warning says it was already written by this run for an
+earlier query.
 
-  The campaign is serial under the `_oom_guard.py` host lease and planned
-  per-child envelope. It passes `ay --memory`, `MEMLIMIT`, and `NBCORE`, wraps
-  each process group in the zero-grace RSS watchdog, supplies a sanitized
-  non-inherited environment, waits for build quiescence, and cancels/discards a
-  child if its continuous build monitor sees Cargo/Targo/rustc/compiler_consumer. Its JSON
-  binds the clean source HEAD, binary identity/SHA-256 and self-attested commit,
-  corpus manifest and per-file hashes, harness and OOM-guard hashes, timeouts,
-  resource plan, proof/checker modes, raw verdict evidence, and resumable
-  byte-identical checkpoint provenance. Run it only against the final aligned
-  binary:
+**Under strict proofs, an `unsat` after an error is `unknown`.** AY publishes
+no certificate for a problem in which a command printed an `(error ...)`,
+because the certificate would embed source that failed. Every such error the
+SMT-LIB solver route prints is recorded and makes the run exit 1, as z3's
+does; `echo` text is not an error.
+That covers a duplicate declaration, an unknown option, and a `(get-model)`,
+`(get-value ...)`, `(get-assignment)` or `(eval ...)` with no model, or a
+`(get-proof)` or `(get-unsat-core)` with no `unsat` to read. It lasts until
+`(reset)`. So under strict proofs, in either spelling, every `unsat` after
+such an error in the same problem answers `unknown` with `(:reason-unknown
+(incomplete proof-publication-failed))`. The script goes on, and the run
+exits 1 because it printed an error. The incremental habit of `(get-model)`
+after every `check-sat` triggers this: the `(get-model)` after the first
+`unsat` fails, and every later strict `unsat` until `(reset)` is `unknown`.
+Without strict proofs that `unsat` stands, with no certificate. The promise
+that each `check-sat` gets one response and the script goes on is the default
+certificate's: an explicit `--proof FILE` (or `--proof-artifact`,
+`--emit-firewall-lean`) instead fails the run with exit 1 at that `unsat`,
+with no response to it or to the rest of the script, as it does for any
+required certificate it cannot publish; the error names the request, its
+target and the cause. Before `fix/strict-option-single-answer`, the flag
+exited 1 at such an `unsat` with no response to it or to the rest of the
+script, and the option answered `unsat` with no certificate. `(get-assignment)`
+and `(eval ...)` with no model, and `(get-proof)` or `(get-unsat-core)` after
+`sat`, printed an unpositioned error and exited 0, and a later strict `unsat`
+was published with its certificate.
 
-  ```sh
-  python3 scripts/ufbv_fixpoint_audit.py OUT.json
-  ```
+**Without a default certificate, the strict spellings still differ.** On
+`--stdin`, `--incremental`, `--no-proof`, `--z3-mode` and `--competition`, no
+default certificate is written. There `--strict-proofs` answers a complete
+refutation `unsat`, with no certificate, while
+`(set-option :check-proofs-strict true)` answers it `unknown`
+(`proof-unavailable`), because no derivation is retained. This predates
+`fix/strict-option-single-answer`, which leaves it unchanged.
 
-  A stored v3 report is not trusted from its summary fields. Reverify its
-  integrity, raw records, statistics evidence, corpus/harness/OOM-guard binding,
-  recomputed closure, and measured source identity with:
+**The solver's own strict screens read only the in-script option.** Some
+strict checks run inside the solver, not where the answer is published:
+a screen that withholds an `unsat` whose Alethe rendering has a known wire
+gap, and strict certification of the sub-queries a quantifier lane solves.
+They read `(set-option :check-proofs-strict true)` and not `--strict-proofs`.
+So on the file route the two spellings can still differ. Measured on the
+2016 non-CHC inputs of the differential gate at `-T:5`, identically on main
+db768acbd and on `fix/strict-option-single-answer`: on two files the flag
+answers `unsat` and writes `<input>.alethe` while the option answers `unknown`
+(`proof-trusted`), the solver saying the rendering "has a known wire gap no
+external checker accepts"; on two quantified files the flag answers `sat` and
+the option `unknown` (`quantifier-unhandled`, `quantifier-ematching-exists`).
 
-  ```sh
-  python3 scripts/ufbv_fixpoint_audit.py \
-    --verify-report REPORT --expect-head SHA
-  ```
+**Some Alethe proofs need carcara's default `define-fun` handling.** A proof
+that reads a nullary `define-fun` through its definition assumes the premise
+`(= a body)`. Carcara holds that premise only when run without
+`--apply-function-defs`; with that flag it rejects such a proof at the `assume`.
+In that default reading a parameterized `define-fun` is the premise
+`(= f (lambda ..))`, and carcara 1.1.0 has no beta-reduction rule. So a step
+that needs `(f a)` unfolded to the body is published as a disclosed `hole`.
 
-  Verification requires the exact measured executable at its recorded path or
-  a byte-identical relocated copy supplied with `--binary`; it rechecks size and
-  SHA-256 and re-runs only `ay --version` under the recorded sanitized
-  environment. The report checksum and replay establish structural consistency,
-  not execution authenticity: the workspace and resumable checkpoint are
-  trusted-local inputs, `--expect-head` is a historical assertion, and pathname
-  rechecks narrow but cannot eliminate adversarial filesystem races.
+**Three Alethe spellings and one rule are checked by Clean's Carcara, not the
+pinned one.** Pinned Carcara (1.1.0, git 9a352ee, `reference/tools.toml`) and
+Clean's vendored Carcara, which external-codegen promotes on, disagree on three
+spellings and on the datatype rule `dt_project`, and by default AY prints
+Clean's. A certificate that keeps any of them says
+`carcara_surface=clean-dialect` on its `c ay.proof.certificate` line, with a
+`c warning:` naming the spelling, and the library's
+`UnsatProofArtifact::carcara_surface` is `CarcaraSurface::CleanDialect`
+(`Solver::set_alethe_dialect` selects the dialect there). It stays
+`trust_free=yes`: AY's own strict checker checks the step, and
+`--strict-proofs` still publishes it. It is not a document the pinned checker
+accepts. Only `carcara_surface=supported` claims that.
 
-  The former environment-gated, effectively skipped in-process Rust campaign
-  was removed: without its environment switch it counted as a passing test
-  while doing no work, and its cooperative in-process limits were not an
-  enforceable child RSS boundary. Always-on compact rotation checks and typed
-  source/query/evidence, model-consumer, stop-cleanup, and end-to-end regressions
-  remain in `cargo test`; full-corpus evidence comes only from the guarded
-  external harness.
+- The `bitblast_ashr` overshift layer. Pinned Carcara builds
+  `(ite y_ult_size bit false)`; Clean builds `(ite y_ult_size bit sign)`, as
+  SMT-LIB `bvashr` requires. When the sign bit is not literally `false`, no
+  spelling satisfies both. AY prints the step only where the amount cannot
+  reach the width or the sign bit is literally `false`. There the two circuits
+  are the same function, so both spellings are true. `--alethe-dialect
+  pinned-carcara` (`Executor::set_alethe_dialect`) prints the pinned zero fill,
+  which pinned Carcara accepts. Pinned Carcara's zero fill is wrong for a
+  negative operand shifted by at least the width, and it would accept that
+  false conclusion. AY's guard is what keeps it out.
+- `zero_extend`. AY relies on Clean's consumer rule
+  `dialect:expand_zero_extend` (`CleanOnlySpelling::consumer_rule` says where
+  Clean states it): Clean reads `((_ zero_extend k) x)` as its SMT-LIB
+  definition. Clean reads it so from `ba5e28ff5` on; an older `clean`, such
+  as aterm's 0.9.0, refuses these certificates. AY relies on the rule only
+  through one shape, in every lane
+  that prints the operator (the packed lane for sources wider than 8 bits,
+  the packed-circuit lane and the complete bit-blast lane): a `refl` step
+  `(= ((_ zero_extend k) x) (concat Z x))`, `Z` the all-zero word of width
+  `k`, after which standard rules check the bits.
+  `CleanOnlySpelling::consumer_rule` names the key. Pinned Carcara keeps the
+  indexed operator and has no rule that relates a symbolic word to its bits
+  (`refl`, `cong`, `evaluate` and every `bitblast_*` rule refuse;
+  `rare_rewrite` needs a RARE file the gate does not pass). It checks the word only through
+  `evaluate` on closed cases, one per assignment of its symbolic bits (such a
+  case relies on no rule: pinned Carcara computes the operator on a value);
+  every other rule reads the operator as uninterpreted. The packed lane, which
+  proves one bit-vector identity, prints those cases for a word with at most
+  eight symbolic bits: in both dialects for a source of at most 8 bits, and
+  under `--alethe-dialect pinned-carcara` for a wider source too (a closed
+  word, `(concat (_ bv0 8) b)`), which pinned Carcara then accepts. The
+  packed-circuit and complete bit-blast lanes print no cases, even within
+  that bound: two such identities under one conjunction, a byte read back
+  from an array, or two 8-bit words in the complete bit-blast lane stay
+  `concat`. Past the bound (z3_7526's two fully symbolic 16-bit words would
+  need 65,536 cases each) and in those two lanes, both dialects print
+  `concat` and disclose `clean-dialect`. The pinned cases cost up to 256
+  closed `evaluate` leaves per `zero_extend`: `((_ zero_extend 16) (concat
+  #x00 b))` grows its identity's document from about 150 KB to 1.2 MB. About
+  fifty of them in one identity exhaust the packed lane's text bound; an
+  explicit `--proof` then falls back to the complete bit-blast lane (still
+  `clean-dialect`), and the synthesized default certificate (no `--proof`)
+  is refused for its work budget, where the Clean dialect publishes one.
+- The `dt_project` rule, a datatype selector over a constructor:
+  `(= (fst (mk a b)) a)` for `(declare-datatypes ((Pair 0)) (((mk (fst Int)
+  (snd Int)))))`. This one is a RULE, not a spelling, and the difference is
+  larger. Pinned Carcara has no datatype rule at all: it answers `unknown
+  rule`, and an unknown rule makes the whole document `invalid`, not one step
+  `holey`. AY's strict checker has always validated the step
+  (`TheoryLemmaKind::DatatypeSelectorProject`), and until Clean added the
+  rule (4dc90e8ea) every dialect printed it as a `hole`. The default dialect
+  now prints `dt_project` for QF_DT, followed by a `symm` step when the
+  problem writes the value first (`(= a (fst (mk a b)))`). It does so only
+  for a non-parametric datatype (Clean refuses parametric ones), and only
+  where the printed step is exactly the projection: a plain selector and
+  constructor name that the problem can have declared (an AY-internal
+  `__ay_overload_N` name, for a selector two datatypes share, keeps the
+  hole), the constructor's full arity, and the projected argument spelled
+  exactly as the right side. Everything else keeps the `hole` in both
+  dialects. `--alethe-dialect pinned-carcara` keeps the `hole`
+  (`unproved_steps=1`, so `--strict-proofs` answers `unknown`); there is no
+  pinned spelling to print instead. `--proof-self-check` reads each document
+  in its own dialect's rule vocabulary (`ay_core::CLEAN_DIALECT_ALETHE_RULES`
+  in the Clean one). In the library, `check_alethe_document`,
+  `AletheDocumentChecker::new` and `AletheSelfCheckWriter::new` read the
+  default (Clean) vocabulary, so they accept `dt_project`; a caller that
+  screens a document for pinned Carcara asks in that dialect
+  (`check_alethe_document_in_dialect`, or `with_dialect` on either type). `dt_project` is reached through a single-assertion
+  projection such as `(assert (not (= (fst (mk a b)) a)))`, the datatype
+  solver's lemmas, and the native API (Trust's `AYProgram`). Measured on
+  2026-10-02 (Clean 4dc90e8ea, pinned Carcara 9a352ee): on the `fst`, `snd`,
+  value-first and two-constructor forms of that assertion the default
+  dialect says `unproved_steps=0 trust_free=yes carcara_surface=clean-dialect`,
+  `clean cert verify-external` says `PASSED`, and pinned Carcara refuses the
+  document at `dt_project`; the pinned dialect's document is `holey`. A QF_DT
+  stack-tower query went from 516 holes to 4 (tester lemmas, which still have
+  no rule), and both checkers then stop at an `eq_congruent_pred` step that
+  the baseline document already carried. These still answer `unknown` in
+  both dialects (`self-check-rejected`): a compound argument
+  (`(fst (mk (+ a 1) b))`), an `ite` argument, an argument that is itself a
+  constructor application (`(car (cons (leaf x) l))`), a projection under
+  `>` or `let`, and two projections under one `or`. The projection split
+  over two assertions (`(= x (mk a b))`, `(not (= (fst x) a))`) answers
+  `unsat` with no certificate, and an explicit `--proof FILE` fails the run
+  (`refusing to write unverifiable proof ... and_pos source no longer prints
+  as an and-term`). A problem that Clean's parser refuses is refused whole,
+  whatever its steps: the SMT-LIB 2.5 form `(declare-datatypes () ((Pair (mk
+  ..))))`, a selector named `cl` or `assume`, or two datatypes that share a
+  selector name. Its document can print `dt_project`, and it is disclosed
+  `carcara_surface=unsupported`, as its `hole` document was. And
+  where a problem has a second refutation that needs no datatype rule, the
+  default dialect can now publish the `dt_project` one: on a projection
+  beside `(assert (bvult x x))` it does, and Clean passes it where pinned
+  Carcara refuses it, while the baseline published the bit-vector refutation
+  both accept. The pinned dialect still publishes that one.
+- The `bitblast_udiv` / `bitblast_urem` divider. AY prints Clean's fixed long
+  division (e9b297e37), which compares against the carry out of the top bit
+  and keeps the difference `r - y`. Pinned Carcara compares against the carry
+  into the top bit and fills the remainder with ones, so it refuses every
+  such step unless the dividend is literally zero (then both build the same
+  terms). Its own divider is false for most operands: `(bvudiv #x80 #x02)`
+  comes out `#x00`, and every non-zero divisor divides some dividend wrongly.
+  It would accept those false conclusions. `--alethe-dialect pinned-carcara`
+  prints it only where it is true: a divisor whose bits are all closed and
+  `false`, or closed operands whose quotient or remainder it computes
+  correctly (AY evaluates the printed circuit). Everywhere else both dialects
+  print Clean's divider and disclose `clean-dialect`.
 
-  The current Clean/Trust campaign discharges 264/264 obligations in an
-  abstract semantic model and rejects 43/43 adversarial red cases. This is
-  design evidence only. There is no proved refinement from the live Rust/MIR to
-  that model and no hash-bound source/compiler/proof manifest, so the production
-  lane is runtime checked and source-conformance tested, **not formally
-  verified**.
+Measured on 2026-09-30 over external-codegen's 128-query consumer corpus, under
+external-codegen's own argv:
 
-  **POST-IMPLEMENTATION EXTERNAL MEASUREMENT: not yet recorded.** Do not fill in
-  final counts, binary hashes, proof/checker verdicts, or performance deltas
-  until the aligned release binary has completed the guarded 121-file sweep.
+- 14 certificates keep the `zero_extend` spelling. Pinned Carcara refuses
+  each one at `refl` or `cong`. Before this change they all said
+  `supported`. 13 are in the `and_simplify`, `or_simplify` and
+  `whole-query-hole` classes; the 14th is `bitblast_ashr` fixture
+  `d27d9c2d0fd9`.
+- 16 of the other 17 `bitblast_ashr` certificates were measured. Each keeps
+  the sign fill, and pinned Carcara refuses it at `bitblast_ashr`.
+  `0ab585e2a382` did not answer within the sweep's 35 s on this build.
+- Every certificate disclosed `supported` (97 measured) is a literal `valid`
+  for pinned Carcara.
+- In the pinned dialect, the 16 `bitblast_ashr` fixtures measured are
+  `supported` and `valid`. `d27d9c2d0fd9` still says `clean-dialect`: it
+  keeps its `zero_extend` step. `9574a9e8114b` was not measured.
+- The reviser's probes p13, a05, z01 and z02 say `clean-dialect` in both
+  dialects. p13 and a05 also carry a `bitblast_ashr` step, spelled in the
+  pinned dialect as pinned Carcara requires.
 
-  **HISTORICAL BASELINE MEASURED 2026-07-31: 0 wrong answers in the exact
-  121-file family.** This binary predates the production projection recovery.
-  Default mode, 15 seconds per file, serial, guarded by `scripts/_oom_guard.py`;
-  binary SHA-256 `e5c547f732b2a617fd13d0a839fb7424e3fb1fb9ed0a300e0ff99aacbe01eddc`;
-  corpus family SHA-256
-  `ef9912b78e493410189a3bfa733987a873a1e7ca5d36a529f42426f312391dd9`.
-  Evidence:
-  the development design notes
-  and raw JSON.
+**A `let` the problem writes is eliminated with `:rule let`, which pinned
+Carcara checks in one invocation only.** AY's canonical invocation is
+`carcara check -- PROOF PROBLEM`: there the `assume` must be the problem's own
+`(let ...)`, and the certified bridge eliminates it with `:rule let`. Under
+`--expand-let-bindings` Carcara expands that `let` at parse time and refuses
+the step (`term ... is of the wrong form, expected '(let ...)'`); the one
+alternative bridge, `refl`, is refused without the flag. No document is valid
+in both. Such a certificate says `carcara_surface=without-let-expansion`
+(`CarcaraSurface::WithoutLetExpansion` on a library `UnsatProofArtifact`), with
+a `c warning:` naming the invocation, and `--strict-proofs` still publishes it.
+Conversely an `assume` that matches a `let` premise only after expansion is
+accepted only under the flag; AY discloses it as `foreign_assumes=yes`.
 
-  | declared → AY | count |
-  | --- | ---: |
-  | `unsat` → `unsat` | 66 |
-  | `unsat` → `unknown` / timeout | 2 / 6 |
-  | `sat` → `unknown` | 26 |
-  | `unknown` → `unknown` / timeout | 16 / 5 |
-  | **known wrong polarity** | **0** |
+**Carcara misreads some problems with `:named` labels.** It expands a label
+wherever the name occurs, even under a binder of the same name, and it lets a
+binder capture a free symbol of a labelled term. Its verdict on such a
+problem is not evidence. The corpus gate refuses to count it as verified.
 
-  In that historical run, all 26 declared-SAT files returned `unknown` and 34
-  files with known status were unresolved. Default Alethe synthesis was enabled,
-  but no proof checker was run, so invalid proof count was unmeasured and the 66
-  UNSAT results were not independent certificate claims. The older UFNIRA
-  wrong-`sat` family was not re-measured; broader quantified fragments remain
-  experimental. Do not generalize either the historical baseline or the
-  restricted new certificate lane into a full-Z3-replacement claim.
+**The DRAT/LRAT checkers are not cross-validated in-repo.** They are real,
+independently written checkers, but the tests that would compare them against
+drat-trim read fixtures from a `reference/drat-trim/` checkout that this repo
+does not ship, and they skip silently when it is absent.
 
-  **Historical record below (superseded for current behavior).** It preserves the
-  2026-07-26/29 diagnosis, rejected blanket-fix measurement, and partial-fix
-  trail. Statements that the UFBV family is open or has two remaining wrong
-  files describe those historical builds, not the 2026-07-31 closure or the
-  2026-08-01 runtime-checked implementation.
+## Native maps (`map.*`)
 
-  **HISTORICAL 2026-07-29 — the class was smaller, still OPEN, and its
-  membership has fully turned over.** Full family sweep, all 121 UFBV
-  `wintersteiger fmsd13 fixpoint` files, 15s, `ay 0.5.0+build.6235` @ `de03e266`,
-  default mode. Evidence and reproduction:
-  the development design notes.
+A `(Map K V)` is a pair of arrays, its values and its domain. `map.insert`
+stores into both, `map.remove` clears the key in the domain and leaves the
+value, `map.get` reads the value whether or not the key is present, and two
+maps are equal when both arrays are. This is not an extensional finite map:
+two maps with the same entries can differ in the values outside their domains.
 
-  | | `2068d68d` | HEAD `de03e266` | after the multi-point probe fix |
-  | --- | --- | --- | --- |
-  | correct decisions | 39 | 89 | **93** |
-  | wrong `sat` | 26 | 6 | **2** |
-  | sound `unknown` | — | 5 | 5 |
-  | unverifiable (`:status unknown` → `sat`) | — | 12 | 12 |
+- **Known wrong `unsat`.** AY carries a map as its value array and gives maps
+  with equal value arrays one domain. Over a finite key sort two value arrays
+  can agree at every key, so a problem that needs two such maps with different
+  domains answers `unsat`: `(distinct a b c d e)` over `(Map Bool Bool)` (4
+  value arrays, 16 maps), or two `(Map Bool Int)` maps with equal `map.get`
+  at both keys and different `map.contains_key`. The sort is erased to
+  `Array` during elaboration, so map `=` cannot yet be told from array `=`.
+- **Ill-sorted input is accepted.** The same erasure lets array operators and
+  array terms meet maps: `(= n (store m 1 5))`, or `(= n a)` with `a` an
+  `(Array Int Int)`, elaborates instead of failing to sort-check, and the
+  answer means nothing. Measured: `(= n (store m 1 5))
+  (map.contains_key m 1) (not (map.contains_key n 1))` answers `sat`.
+- **`unknown` by design.** AY withholds `sat` where its encoding is weaker
+  than these semantics: the empty map, `map.insert` or `map.remove` used as a
+  value instead of read; a domain read of a map that is not a declared
+  constant (a quantified or `define-fun` parameter, an `ite`, a `select` from
+  an array of maps, a function result); `map.subset` of two different maps; a
+  quantifier over maps that compares maps; a constant array written at a map
+  sort, `((as const (Map K V)) v)`, which is not the empty map and has no
+  domain of its own (its values are still all `v`). The higher-order operators
+  (`map.values`, `map.fold`, ...) always answer `unknown`.
+- **`unknown` on easy `sat`.** Measured: `(distinct (map.get m 1) (map.get m
+  2))`, and `(map.contains_key m 1) (not (map.contains_key n 1))`, whose model
+  gives `m` and `n` one value array and so one domain.
 
-  **ROOT CAUSE FOUND, and the class is now down to 2 files — but not to zero.**
-  The granting authority is the STRICT UF-completion certificate:
-  `quantifiers_supported_by_uf_completion` (`quantifier_loop/mod.rs:746`) carries
-  **no coverage term**, so zero instantiations cannot block it, while its sibling
-  `..._given_sat` leg IS gated on `!has_uninstantiated && !reached_limit`
-  (`mod.rs:937`). Only one leg got the discipline. `premise_forced_binder_refutation`
-  now samples up to 8 distinct premise models instead of 1 (sound by construction —
-  it can only ever return `unsat`), which fixes 4 of the 6 and costs no correct
-  `sat`s. `sdlx-fixpoint-4/5` remain wrong: more sampling does not reach them.
+## Engines that are weaker than they look
 
-  Closing the last 2 needs the coverage premise on the strict leg, which is NOT
-  free: 24 in-tree tests assert a quantified `sat` STRICTLY off the same `deferred`
-  channel (13 in `auflia_verification_consumer_9185_reducers.rs` alone), and the decisive
-  satisfiable case `∀s. 0 ≤ seq_len(s)` is **statistically identical** to the wrong
-  answers at that gate — same `deferred`, same zero instances. The separating
-  evidence has to be constructed (a materialized completion, re-checked), not read
-  off an existing flag. A 4-line minimal witness is checked in and RED at
-  `group_quantifiers/ufbv_strict_uf_completion_coverage.rs`.
+- **`ay lp`** is a dense tableau simplex with depth-first branch-and-bound
+  capped at 4096 nodes. It is sized for small test fixtures and says so in its
+  own source. The serious branch-and-cut MILP engine (`ay-milp`) has **no `ay`
+  subcommand**; it is reached from an SMT fast path, from inside `ay maxsat`
+  and `ay pb`, and through the separate `ay-milp` binary.
+- **`ay simplify`** implements four rewriting tactics. Z3's
+  `ctx-solver-simplify` and quantifier elimination are not implemented.
+- **`ay qbf`** is a thin wrapper over a small QDIMACS solver.
+- **Compressed CNF** (`.cnf.xz`, `.cnf.gz`, `.cnf.bz2`) is not handled on the
+  solve path; decompress first.
 
-  **The 6 wrong files share no members with the 7 named at `2068d68d`.** All 7 of
-  those are now correct; 6 different files are wrong. Progress on this class has
-  been instance-shaped, not mechanism-shaped — which is evidence for the
-  saturation-signal route below and against repairing benchmarks one at a time. It
-  also means a green in-tree fixture never establishes that this class is closed;
-  only a family sweep does.
+## Z3 compatibility is partial
 
-  What the reproduction shows: AY grants `sat` with `:conflicts 0 :decisions 0
-  :ematching-instances-created 0` against an EMPTY model, in 5 ms — it never
-  instantiates the single quantifier at all. `ay bisect` reports the bug survives
-  with every known flag disabled, so the cause is in the core quantifier result
-  mapping. The granting authority is **not yet identified**; the report records
-  which candidate is already ruled out, so that work is not repeated.
+AY accepts Z3's command-line spellings and a useful subset of its SMT-LIB
+extensions, and can be symlinked as `z3`. It is not a drop-in replacement:
+the C API surface is incomplete, many Z3 parameters are accepted and ignored,
+and the full SMT-LIB competition corpus has not been run against it. From an AY
+source checkout, use the replacement qualification runner,
+`ay-z3-parity qualify`, before substituting AY for Z3. It provisions authenticated
+references and runs the registered acceptance suite; incomplete coverage and
+failed semantics remain explicit. `ay z3-audit` provides the older diagnostic
+view and is not complete replacement acceptance.
 
-  **All remaining numbers in this entry are the `2068d68d` reading** and are kept
-  for comparison only. Do not quote them as current.
+Known Z3-surface divergences (measured 2026-10-16):
 
-  **Measured at `2068d68d` (0.4.0+build.5825, 2026-07-26).** Re-running
-  the 13 scoreboard disagreements per-file found **8 still wrong**: 7 wrong `sat`
-  in UFBV (`sdlx-fixpoint-1`, `small-dyn-partition-fixpoint-3/4/10`,
-  `small-synabs-fixpoint-2/3/9`) and 1 wrong `unsat` in AUFLIA (next entry). The
-  other 5 UFBV files now return sound `unknown`. Sweeping the whole affected
-  family — 121 UFBV `wintersteiger fmsd13 fixpoint` files at 10s — found **26
-  wrong `sat`s**, so the 50-per-division sample under-counts this class by ~4x.
+- **`(get-proof)` returns an Alethe document**, not a z3 proof term. A script
+  that walks z3 proof terms cannot consume it.
+- **Optimization priorities**: grouped `(assert-soft ... :id ...)` and
+  soft constraints mixed with `(maximize)`/`(minimize)` arithmetic
+  objectives optimize lexicographically in declaration order, under
+  `:opt.priority box` (independent per-objective optima, first declared
+  objective's witness), and under `:opt.priority pareto` (stateful
+  front enumeration over the unified objective vector with certified
+  exhaustion), as in z3, on all three surfaces (SMT-LIB, native API,
+  C API). Pareto requires Int/BitVec objectives (Real falls back to
+  lex with a warning), and a single unified objective degenerates to
+  plain optimization, matching z3.
+- **Rigor-dependent routing.** Proof-gated preprocessing differs across
+  `--rigor` postures, so capability (decide vs `unknown`) can still differ
+  by posture on some inputs; the direction is fail-closed (no wrong
+  verdict observed).
+- **muZ fixedpoint commands** (`declare-rel`/`rule`/`query`) are refused
+  on the SMT stdin path; Horn problems go through the CHC engine's own
+  entry points.
+- **Unknown long options** (`--zzz`) in a z3 invocation still get clap's
+  diagnostic (exit 2); unknown single-dash options match z3 exactly
+  (exit 109).
 
-  **The class is not one benchmark family, and the corpus-wide count is not 13.**
-  A full sweep of the UFNIRA division (266 files) found **8 further wrong `sat`s**
-  — all in `20240414-funcprobs`, a family the scoreboard sample recorded ZERO
-  disagreements for. z3 4.15.4 independently confirms `unsat` on
-  `problem_U25_sol2`; the rest carry declared `:status unsat` and z3 times out at
-  20s. All 8 degrade to `unknown` under `--self-check`, i.e. same mechanism.
-  Running total at `2068d68d`: **~34 wrong answers in roughly 690 files examined**,
-  every one a wrong `sat` in this single class. No wrong `unsat` remains among
-  them since the AUFLIA fix below. Treat 13 as a floor set by sampling, not as
-  the count.
+## Build
 
-  **CURRENCY, re-measured 2026-08-02 at `608020b1ad` (build.6432) — the UFNIRA
-  half of this class is STILL LIVE, ~600 commits later.** The first 40 UFNIRA
-  files swept produced a confirmed wrong answer:
-  `20240414-funcprobs__check__problem_U25_sol2.smt2`, declared `:status unsat`,
-  z3 4.16.0 `unsat`, **AY `sat`** — the same file named above, unfixed. So the
-  UFBV progress recorded in this entry (26 → 2) did NOT generalize: the repairs
-  were UFBV-local while the shared mechanism kept its other divisions. Do not
-  read the UFBV row as the class's health.
-
-  That measurement was only possible because `scripts/soundness_sweep.py` was
-  repaired the same day (`02af05b9f0`): it had been pointed at
-  `benchmarks/smtlib-2025/non-incremental`, which holds ONE division (QF_SLIA),
-  so the tool written to sweep this class could not reach a single file of it.
-  Treat every "CLEAN" this script printed before that commit as covering 1/84 of
-  the corpus.
-
-  At that pre-gate checkout, `--self-check` degraded all of them to `unknown`,
-  while default mode did not. The current universal boundary applies that
-  fail-closed result in both modes. **Read the historical capability result
-  carefully: on this family `--self-check` answered `unknown` on 121 of 121 files
-  — including the 22 correct `unsat`s and 17 correct `sat`s that default mode
-  gets right.** Its zero-wrong-answer property here is obtained by deciding
-  nothing, so it is evidence of soundness, not of capability, and it is not a
-  usable default for this fragment. (`--self-check` is *not* vacuous in general:
-  it decides quantifier-free problems and simple quantified ones — measured on
-  trivial QF_LIA sat/unsat, QF_UF unsat, and `∀s. 0 ≤ g(s)` — and degrades on
-  quantified `unsat` where it cannot produce a checkable refutation.)
-  The two older in-tree fixtures are both answered soundly now and neither
-  reproduces the class: `ufbv_wintersteiger_fixpoint_deferred_wrong_sat.smt2`
-  (`AR-fixpoint-5`) was then decided correctly `unsat`, and
-  `ufbv_small_synabs_fixpoint_2_wrong_sat.smt2` (picked on 2026-07-26 *because* it
-  was then a live wrong `sat`) went sound after the rebase. The final historical
-  reproduction was `ufbv_small_pipeline_fixpoint_1_wrong_sat.smt2` — 17 lines,
-  7.5 KB, wrong
-  in 5 ms, with ground truth confirmed three ways (its own `:status`, z3 4.15.4 in
-  11 ms, and a hand refutation at `dataIn_64_0 = c1_64_0 = 1`). All three are
-  guarded by
-  `crates/ay-dpll/tests/group_quantifiers/ufbv_deferred_default_mode_wrong_sat.rs`,
-  where `ufbv_small_pipeline_fixpoint_1_never_default_sat` is now a green guard
-  for the mandatory publication boundary.
-
-  **A blanket fix was implemented, measured, and initially REJECTED.** Removing the
-  `self_check` condition so the deferred channel fails closed in every mode does
-  eliminate the wrong answers (26 → 0 on the family), but it costs far more than
-  it buys:
-  - all 17 correct `sat`s in that family are lost to `unknown` (correct decisions
-    39 → 22), and
-  - 22 other tests break, 21 of them in `group_auflia`'s `verification_consumer` verification-
-    condition suite. The decisive case is `∀s. 0 ≤ seq_len(s)`, which is
-    obviously satisfiable (`seq_len ≡ 0`) and which the blanket gate answers
-    `unknown`. Any quantified problem with an axiomatized function — i.e. most
-    verification workloads — stops being decidable by AY.
-  At that point the completeness cost caused the change to be reverted. The
-  current correctness-first boundary deliberately accepts that visible
-  `unknown` cost; restoring capability now requires affirmative evidence rather
-  than publishing an unchecked candidate.
-
-  **CORRECTED 2026-07-26 — the root defect is deeper than the model gate.**
-  Pinning a function to a concrete interpretation only restricts, so if
-  `assertions ∧ (f ≡ c)` is satisfiable the original is satisfiable: a successful
-  pin is a sound SAT certificate. Applying that test to
-  `small-synabs-fixpoint-2` with **all 8 arity>0 functions pinned to `#b000000`**
-  — leaving no interpretation to complete at all — z3 answered `unsat` in 60s
-  while AY's underlying procedure answered `sat`. So this class was not merely
-  model incompleteness: the quantified-BV search proposed `sat` for an
-  unsatisfiable formula. The current independent boundary withholds that
-  unconfirmed proposal in every mode.
-
-  This also rules out the obvious repair: a completion-based confirm would ask
-  AY's own solver whether `assertions ∧ (f ≡ c)` is satisfiable, get the same wrong
-  `sat`, and *confirm* it — turning a default-mode-only error into a `--self-check`
-  error too. Confirmation for this fragment must come from a procedure independent
-  of the one under test (full bit-blasting with quantifier expansion, or an
-  external checker).
-
-  **Narrowed to ONE assertion.** Delta-debugging the pinned variant removed all 8
-  pins, leaving a core of exactly one assertion: the benchmark's own single
-  `(assert (forall …))` over 12 BitVec-6 binders. So this is not an interaction,
-  combination, or gate bug — **the historical AY search answered `sat` on a
-  single unsatisfiable universally-quantified BV assertion**, whose negation is valid and for which z3
-  finds a falsifying instantiation in 60s. Minimal synthetic analogues (1/3/12
-  BV-6 binders with a pinned function and a premise chain) do not reproduce it, so
-  the body's structure still matters.
-
-  **The route is a saturation/completeness signal**, not model completion: emit a
-  quantified `sat` only when the instantiation loop actually closed, and `unknown`
-  when it ran out of candidates, budget, or applicable triggers. That is sound by
-  construction, needs no synthesis, and costs only the `sat`s that were never
-  justified — unlike the blanket gate, which also destroyed the justified ones. As
-  a parity follow-on, instantiation completeness would turn these into correct
-  `unsat` rather than `unknown`.
-
-  (Model completion remains the right idea for the *`verification_consumer` axiom-whitelist*
-  lane in `quantifier_loop/model_completion.rs`, which is a different problem:
-  generalizing fourteen hand-matched QuantifierConsumer `(Seq Int)` shapes into real synthesis.)
-
-  Reproduce the corpus set with
-  `ay-z3-parity fetch <dir> --divisions UFBV,AUFLIA`.
-- **FIXED 2026-07-26: a wrong REFUTATION in quantified AUFLIA.** AY answered
-  `unsat` on satisfiable quantified AUFLIA — the most dangerous verdict, because
-  it silently discharges an obligation that is in fact satisfiable and no consumer
-  can detect it. The corpus instance was `AUFLIA 20170829-Rodin
-  smt4579745768945200905` (z3 4.15.4 and its own `(set-info :status sat)` agree).
-
-  **Root cause: E-matching instantiated a bare `Exists` and conjoined the
-  instance.** Universal instantiation is sound (`∀x.P(x) ⊨ P(t)`); existential
-  instantiation is not (`∃x.P(x) ⊭ P(t)` — it pins an arbitrary term as the
-  witness). The E-matching loop destructured both quantifier forms as
-  instantiation targets, and every caller appends the instances to
-  `ctx.assertions` as top-level CONJUNCTS. The chain: instantiating the outer
-  guarded universal pushes the instantiated BICONDITIONAL to top level; the
-  collector's `App` arm then descends through the `=` (it tracks no polarity) and
-  reaches the `exists` inside it; that existential — a subformula whose truth
-  value is not established — was instantiated at `j := sk`, asserting
-  `(and true (tab e0 sk))` as FACT, contradicting the soundly-derived
-  `(not (tab e0 sk))` from the negated-existential goal. Hence `unsat` with
-  `:conflicts 0 :decisions 0`: no search, just an unsound instance plus unit
-  propagation. Negatively-occurring existentials are unaffected — the `Not` arm
-  already converts `¬∃x. φ` to its sound NNF dual `∀x. ¬φ`.
-
-  Fix (`832c8861ba`): `perform_ematching_with_generations` refuses to
-  destructure an `Exists` as an instantiation target.
-
-  **Fix it at that site and nowhere else.** Cutting the existential earlier, in
-  `ematching::collect_quantifiers`, looks equivalent and is not: it converts this
-  wrong `unsat` into a potential wrong `sat`. The skipped quantifier is supposed
-  to keep flowing through the collector so that it lands in
-  `uninstantiated_quantifiers` — one of the conjuncts blocking the
-  `full_ematching_coverage` SAT certificate — and so that it still feeds
-  `ematching_has_exists` and the `setup_cegqi_for_unhandled` routing. Silenced at
-  the collector, a positive-position existential becomes *invisible* rather than
-  *unhandled*, and the ground solve's `sat` can be returned as authoritative with
-  the existential never discharged. Both halves are pinned by
-  `ematching::tests::exists_is_surfaced_but_never_instantiated`.
-
-  Guards (the fix commit shipped none; these are the executable statement of it):
-  `crates/ay-dpll/tests/group_regression/false_unsat_auflia_exists_eq.rs` (with a
-  license-clean fixture re-authored from the delta-debugged 4-assertion core; the
-  CC BY-NC corpus file is not vendored), `…/false_unsat_auflia_rodin.rs` (runs the
-  real corpus benchmark, skips unless it has been fetched), and the
-  surfaced-but-never-instantiated invariant above.
-- **`(mod (to_int r) k)` over a Real variable with a negative floor returns
-  `unknown`.** In QF_LIRA, an Int-side `mod`/`div` whose dividend is `(to_int r)`
-  for a Real variable `r` that floors to a negative integer is not decided: the
-  LIA/LRA fixpoint converges but the combination does not close the branch, so
-  AY answers `unknown` rather than `sat`. (Positive floors are decided, as are
-  the same shapes with `div` instead of `mod`, and constant-folded arguments.)
-  This is an incompleteness, not a wrong answer — AY previously answered `unsat`
-  here, which is fixed and covered by
-  `crates/ay-dpll/tests/group_regression/false_unsat_to_int_mod_hnf.rs`.
-- **Array certificates: the one-sided read-over-write chain under an array
-  equality is still an unproved (`hole`) step.** The substituted-equality
-  COLLAPSE — `substitute-and-simplify` eliminates a defined array constant, so
-  the assertions justifying an entailed equality never reach the proof as
-  `assume` steps and the equality is exported premiseless — is now promoted: the
-  originals are re-introduced into the assumption prologue and the unit is
-  re-derived with the certified `eq_transitive`/`eq_congruent` toolkit
-  (`plan_substituted_equality`). `benchmarks/smt/QF_AX/storeinv_cross_1idx.smt2`
-  therefore checks `valid` in carcara with zero unproved steps.
-
-  What still does NOT promote is the array lemma
-
-  ```text
-  (or (= x i) (not (= L R)) (= (select B x) (select R x)))
-  ```
-
-  where `L = (store B i v)` — one side of the conclusion is EVALUATED through
-  the store chain and the other is left as a bare `select` of the whole array.
-  It is a true and ordinarily derivable lemma (`arrays_row` on the left,
-  `cong` from `L = R`, `symm` + `trans`), but the strict-checkable
-  `ArrayRowChain` sub-schema (B) requires BOTH sides to be greedily evaluated
-  (`eval(L,x)` and `eval(R,x)`), so the recognizer/validator pair in
-  `ay-proof`'s `array_axiom` declines it and the leaf stays `Generic` — printed
-  as `hole`. Admitting it means generalizing that schema to allow a PREFIX
-  (in particular the zero-skip identity) path on one side, in the recognizer,
-  the validator, and the printer's lowering together; that is a widening of a
-  soundness-critical accepted schema and has not been done.
-
-  Consequence: `benchmarks/smt/QF_AUFLIA/storeinv_sf_size2.smt2` (the 2-index
-  cross-swap) still exports 10 unproved steps and carcara reports the document
-  `invalid`. AY's own gate agrees — `--self-check` answers `unknown` — and the
-  CLI now says so explicitly next to the file it wrote
-  (`c ay.proof.certificate … ay_self_checkable=no`), so a zero exit status
-  cannot be read as "externally checkable".
-- **Nested-array UNSAT is published only on checked evidence, so a correct
-  refutation AY cannot certify is withheld as `unknown`.** When the public roots
-  declare an array whose index or element sort is itself an array,
-  `Executor::quarantine_unverified_nested_array_unsat`
-  (`crates/ay-dpll/src/executor/check_sat/nested_array_quarantine.rs`) publishes
-  the refutation only through one of five checked authorities: a store-flat ROW
-  reduction marker, the `seq.foldl` higher-order-unfold marker, a full-problem
-  proof that passes the strict checker, the independent checked-SAT refutation
-  sidecar, a refuted nested-array-free entailed residue, or an exact finite
-  Bool/BV bit-blast re-proof. Anything else degrades to `unknown` with
-  `:unknown.phase "array-combination-quarantine"`, in **every** posture. This is
-  deliberate and it is a completeness cost taken to protect the zero-wrong-answer
-  bar: the class has a recorded wrong-`unsat` history (`53e9ac3c07`,
-  the development design notes), and the
-  refutations still withheld are exactly those whose proof reconstructs to a bare
-  `(step t0 (cl) :rule trust)` — which `--self-check` independently rejects.
-  Measured 2026-09-06 on `9fb122a24a`: 0 quarantine events over a seeded
-  200-file sample spanning ABV, ALIA, ANIA, AUFBV, AUFLIA, AUFLIRA, AUFNIA,
-  QF_ALIA, QF_AUFLIA, QF_AUFNIA and QF_AX, so on the current corpus the ladder,
-  not the reject, is what decides these files. Do not widen the predicate to
-  recover verdicts; give the ladder another checked authority instead.
-- **Build time and running tests.** The workspace includes one very large crate
-  (`ay-dpll`, ~430,000 lines), so a from-scratch build of the whole workspace is
-  slow and is the dominant compile cost. To *use* AY, prefer the release binary
-  or build only the solver crate — and note that the `ay` binary is behind a
-  `required-features = ["cli"]` gate, so `cargo build --release -p ay` builds the
-  **library only** and silently leaves any previously built `target/release/ay`
-  in place. Always build the binary explicitly:
-  `cargo build --release -p ay --features cli --bin ay`, and check
-  `ay --version` against your checkout before trusting a measurement — a stale
-  binary reports its own older build commit, not your HEAD. **Run tests per
-  crate** — `cargo test -p ay-sat`, `cargo test -p ay-dpll`, etc. A blanket
-  `cargo test --workspace --features cli` does not currently link: the binary
-  crates statically link the mimalloc allocator, whose symbols are then pulled
-  into those crates' unit-test binaries and collide. Splitting `ay-dpll` for
-  faster, parallel compilation and smoothing the whole-workspace test invocation
-  are tracked for a soon release.
+The `ay` binary requires `--features cli`. Without it `targo --unverified build -p ay` (or `cargo build -p ay`)
+produces a library and no executable, and does not explain why.

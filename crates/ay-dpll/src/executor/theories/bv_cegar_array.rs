@@ -55,13 +55,27 @@ pub(in crate::executor) enum CegarArrayCheck {
     Incomplete,
 }
 
+/// Coverage key for one emitted FC instance: the select pair
+/// plus its guard instance (sorted guard literals and sorted
+/// avoided-store bit vectors). The same pair may need several
+/// instances — a candidate can violate it under a different
+/// equality path than the instance already emitted — so coverage
+/// is per instance, not per pair.
+type FcCoverKey = (TermId, TermId, Vec<i32>, Vec<BvBits>);
+
 struct CegarArrayBuild {
     clauses: Vec<Vec<SatLiteral>>,
     next_var: u32,
     new_vars: usize,
     inspected_bits: usize,
     pair_attempts: usize,
-    newly_covered: HashSet<(TermId, TermId)>,
+    newly_covered: HashSet<FcCoverKey>,
+    /// A pair was skipped because the per-check var/clause budget
+    /// ran out. The check then returns the clauses accumulated so
+    /// far as a (partial) refinement — every emitted clause is a
+    /// valid lemma and the next candidate is re-audited — unless
+    /// nothing was emitted, which stays incomplete.
+    budget_exhausted: bool,
 }
 
 /// One audited select with its index and result resolved to final-numbered
@@ -137,78 +151,18 @@ impl<'a> FcAuditLits<'a> {
     }
 }
 
+mod fc_axiom;
 mod fc_check;
+mod fc_collect;
+mod fc_pair;
+mod fc_stored;
+mod nested_fc;
+
+use fc_axiom::generate_fc_axiom_clauses;
+
+pub(in crate::executor) use nested_fc::NestedReadPaths;
 
 impl Executor {
-    fn append_fc_group_refinement(
-        &mut self,
-        group: &[FcConcreteSelect],
-        already_covered: &HashSet<(TermId, TermId)>,
-        build: &mut CegarArrayBuild,
-    ) -> bool {
-        for a in 0..group.len() {
-            for b in (a + 1)..group.len() {
-                build.pair_attempts = build.pair_attempts.saturating_add(1);
-                if build.pair_attempts > budget::MAX_PAIR_ATTEMPTS
-                    || (build.pair_attempts & 0xff == 0 && self.should_abort_theory_loop())
-                {
-                    return false;
-                }
-                let (left, right) = (&group[a], &group[b]);
-                if left.value == right.value || left.select == right.select {
-                    continue;
-                }
-                let pair = if left.select < right.select {
-                    (left.select, right.select)
-                } else {
-                    (right.select, left.select)
-                };
-                if already_covered.contains(&pair) {
-                    return false;
-                }
-                if !build.newly_covered.insert(pair) {
-                    continue;
-                }
-                let Some((pair_vars, pair_clauses)) = budget::pair_cost(
-                    &left.index_lits,
-                    &right.index_lits,
-                    &left.value_lits,
-                    &right.value_lits,
-                ) else {
-                    return false;
-                };
-                let Some(next_vars) = build.new_vars.checked_add(pair_vars) else {
-                    return false;
-                };
-                let Some(next_clauses) = build.clauses.len().checked_add(pair_clauses) else {
-                    return false;
-                };
-                let last_var =
-                    (build.next_var as usize).saturating_add(pair_vars.saturating_sub(1));
-                if pair_clauses == 0
-                    || next_vars > budget::MAX_NEW_VARS
-                    || next_clauses > budget::MAX_NEW_CLAUSES
-                    || (pair_vars > 0 && last_var > i32::MAX as usize)
-                {
-                    return false;
-                }
-                let clauses = generate_fc_axiom_clauses(
-                    &left.index_lits,
-                    &right.index_lits,
-                    &left.value_lits,
-                    &right.value_lits,
-                    &mut build.next_var,
-                );
-                if clauses.len() != pair_clauses {
-                    return false;
-                }
-                build.new_vars = next_vars;
-                build.clauses.extend(clauses);
-            }
-        }
-        true
-    }
-
     /// Does the encoding OWE this term a literal view the audit can read?
     ///
     /// True exactly for the sorts it can represent as a bit string: `BitVec`
@@ -335,148 +289,10 @@ impl Executor {
     }
 }
 
-/// Generate FC axiom clauses for a single pair of selects.
-///
-/// Encodes: `(idx_a == idx_b) -> (sel_a == sel_b)` as a bit-level diff-XOR
-/// encoding over literals already in final CNF numbering, producing SAT-level
-/// literals. Fresh diff/eq variables are drawn from `next_var`.
-fn generate_fc_axiom_clauses(
-    idx_a_bits: &[CnfLit],
-    idx_b_bits: &[CnfLit],
-    sel_a_bits: &[CnfLit],
-    sel_b_bits: &[CnfLit],
-    next_var: &mut u32,
-) -> Vec<Vec<SatLiteral>> {
-    let mut clauses: Vec<Vec<SatLiteral>> = Vec::new();
-
-    if idx_a_bits.len() != idx_b_bits.len() || idx_a_bits.is_empty() {
-        return clauses;
-    }
-    if sel_a_bits.len() != sel_b_bits.len() || sel_a_bits.is_empty() {
-        return clauses;
-    }
-
-    let to_sat = |cnf_lit: i32| -> SatLiteral { crate::cnf_lit_to_sat(cnf_lit) };
-
-    // Create diff variables for index bits: diff_k <-> (idx_a_k XOR idx_b_k)
-    let mut diff_vars: Vec<i32> = Vec::with_capacity(idx_a_bits.len());
-    for (&ob1, &ob2) in idx_a_bits.iter().zip(idx_b_bits.iter()) {
-        // If both bits are the same literal, they're identical - skip
-        if ob1 == ob2 {
-            continue;
-        }
-
-        let diff_var = *next_var as i32;
-        *next_var += 1;
-        diff_vars.push(diff_var);
-
-        // diff_var <-> (ob1 XOR ob2)
-        clauses.push(vec![to_sat(-diff_var), to_sat(ob1), to_sat(ob2)]);
-        clauses.push(vec![to_sat(-diff_var), to_sat(-ob1), to_sat(-ob2)]);
-        clauses.push(vec![to_sat(-ob1), to_sat(ob2), to_sat(diff_var)]);
-        clauses.push(vec![to_sat(ob1), to_sat(-ob2), to_sat(diff_var)]);
-    }
-
-    if diff_vars.is_empty() {
-        // Indices are syntactically identical - FC requires values equal.
-        for (&os1, &os2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
-            if os1 == os2 {
-                continue;
-            }
-            clauses.push(vec![to_sat(-os1), to_sat(os2)]);
-            clauses.push(vec![to_sat(os1), to_sat(-os2)]);
-        }
-        return clauses;
-    }
-
-    // eq_idx <-> NOT(OR(diff_vars))
-    let eq_idx = *next_var as i32;
-    *next_var += 1;
-
-    // eq_idx -> NOT diff_k
-    for &diff_var in &diff_vars {
-        clauses.push(vec![to_sat(-eq_idx), to_sat(-diff_var)]);
-    }
-
-    // (diff_0 OR ... OR diff_n OR eq_idx)
-    let mut eq_def: Vec<SatLiteral> = diff_vars.iter().map(|&d| to_sat(d)).collect();
-    eq_def.push(to_sat(eq_idx));
-    clauses.push(eq_def);
-
-    // FC: eq_idx -> (sel_a_k == sel_b_k)
-    for (&os1, &os2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
-        if os1 == os2 {
-            continue;
-        }
-        clauses.push(vec![to_sat(-eq_idx), to_sat(-os1), to_sat(os2)]);
-        clauses.push(vec![to_sat(-eq_idx), to_sat(os1), to_sat(-os2)]);
-    }
-
-    clauses
-}
+#[cfg(test)]
+#[path = "bv_cegar_array_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod tests {
-    use super::{generate_fc_axiom_clauses, FcAuditLits};
-    use ay_core::kani_compat::DetHashMap as HashMap;
-    use ay_core::{Sort, TermStore};
-    use num_bigint::BigInt;
-    use std::collections::BTreeMap;
-
-    /// A Bool-element select has no term bits; its value is the bit-blaster's
-    /// atom (offset into final numbering), else the skeleton's atom (already
-    /// final). A Bool term in neither map has no value to audit.
-    #[test]
-    fn bool_terms_resolve_to_their_single_atom_literal() {
-        let mut terms = TermStore::new();
-        let array_sort = Sort::array(Sort::bitvec(8), Sort::Bool);
-        let array = terms.mk_var("a", array_sort);
-        let index = terms.mk_var("i", Sort::bitvec(8));
-        let blasted = terms.mk_select(array, index);
-        let one = terms.mk_bitvec(BigInt::from(1), 8);
-        let skeleton = terms.mk_select(array, one);
-        let two = terms.mk_bitvec(BigInt::from(2), 8);
-        let unencoded = terms.mk_select(array, two);
-
-        let mut term_bits = HashMap::default();
-        term_bits.insert(index, vec![1, -2, 3, 4, 5, 6, 7, 8]);
-        let mut bv_bool_to_var = HashMap::default();
-        bv_bool_to_var.insert(blasted, -9);
-        let mut tseitin_term_to_var = BTreeMap::new();
-        tseitin_term_to_var.insert(skeleton, 4u32);
-        let var_offset = 10;
-        let lits = FcAuditLits::new(
-            &term_bits,
-            &bv_bool_to_var,
-            &tseitin_term_to_var,
-            var_offset,
-        );
-
-        assert_eq!(
-            lits.scalar_lits(&terms, index),
-            Some(vec![11, -12, 13, 14, 15, 16, 17, 18])
-        );
-        assert_eq!(lits.scalar_lits(&terms, blasted), Some(vec![-19]));
-        assert_eq!(lits.scalar_lits(&terms, skeleton), Some(vec![4]));
-        assert_eq!(lits.scalar_lits(&terms, unencoded), None);
-        assert_eq!(lits.scalar_lits(&terms, array), None);
-    }
-
-    /// A one-bit result pair yields the same shape the BitVec path produces:
-    /// per differing index bit an XOR definition, one eq_idx, and the two
-    /// implication clauses forcing the atoms equal under eq_idx.
-    #[test]
-    fn single_atom_results_get_fc_implications() {
-        let mut next_var = 100;
-        let clauses = generate_fc_axiom_clauses(&[1, 2], &[1, -3], &[7], &[-8], &mut next_var);
-        // One differing index bit: 4 XOR clauses + 1 (eq -> !diff) + 1 (diff | eq)
-        // + 2 value implications.
-        assert_eq!(clauses.len(), 8);
-        assert_eq!(next_var, 102);
-
-        let mut next_var = 100;
-        let identical = generate_fc_axiom_clauses(&[1, 2], &[1, 2], &[7], &[-8], &mut next_var);
-        assert_eq!(identical.len(), 2);
-        assert_eq!(next_var, 100);
-    }
-}
+#[path = "bv_cegar_array_partition_tests.rs"]
+mod partition_tests;

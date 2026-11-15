@@ -1,0 +1,7 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const align_log2 (_ BitVec 64))
+(assert (and (bvult align_log2 (_ bv64 64)) (not (= (_ bv0 64) (bvand (bvshl (_ bv1 64) align_log2) (bvsub (bvshl (_ bv1 64) align_log2) (_ bv1 64)))))))
+(check-sat)
+(exit)

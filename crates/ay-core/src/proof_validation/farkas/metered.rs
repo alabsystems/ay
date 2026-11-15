@@ -13,8 +13,14 @@ use num_traits::{One, Signed, Zero};
 use super::farkas::FarkasValidationError;
 use crate::{FarkasAnnotation, Symbol, TermData, TermId, TermStore, TheoryLit};
 
+#[path = "metered/affine_witness.rs"]
+mod affine_witness;
+pub use affine_witness::derive_affine_equality_farkas_with_progress;
+
 #[path = "metered/classification.rs"]
 mod classification;
+#[path = "metered/congruence.rs"]
+mod congruence;
 #[path = "metered/equality.rs"]
 mod equality;
 #[cfg(test)]
@@ -22,6 +28,11 @@ mod equality;
 mod equality_tests;
 #[path = "metered/linear.rs"]
 mod linear;
+#[path = "metered/strict.rs"]
+mod strict;
+pub use strict::{
+    farkas_conflict_lits_full_holds_with_progress, farkas_conflict_lits_linear_holds_with_progress,
+};
 #[cfg(test)]
 #[path = "metered/tests.rs"]
 mod tests;

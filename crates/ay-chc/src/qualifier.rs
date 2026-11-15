@@ -251,49 +251,37 @@ impl QualifierSet {
         Self::walk_expr(&normalized, comparisons, constants);
     }
 
+    /// Set-valued collector: each distinct shared node once (WP-F F0b), in
+    /// the tree walk's first-occurrence order.
     fn walk_expr(
         expr: &ChcExpr,
         comparisons: &mut FxHashSet<ChcExpr>,
         constants: &mut FxHashSet<i128>,
     ) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
-            ChcExpr::Bool(_) => {}
-            ChcExpr::Int(n) => {
-                constants.insert(*n);
-            }
-            ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {}
-            ChcExpr::Var(_) => {}
-            ChcExpr::Op(op, args) => {
-                if matches!(
-                    op,
-                    ChcOp::Eq | ChcOp::Ne | ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge
-                ) {
-                    comparisons.insert(expr.clone());
+        crate::expr::dag::walk_distinct_preorder(expr, |node| {
+            match node {
+                ChcExpr::Int(n) => {
+                    constants.insert(*n);
                 }
-                for a in args {
-                    Self::walk_expr(a.as_ref(), comparisons, constants);
+                ChcExpr::Op(op, _)
+                    if matches!(
+                        op,
+                        ChcOp::Eq | ChcOp::Ne | ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge
+                    ) =>
+                {
+                    comparisons.insert(node.clone());
                 }
+                _ => {}
             }
-            ChcExpr::PredicateApp(_, _, args) => {
-                for a in args {
-                    Self::walk_expr(a.as_ref(), comparisons, constants);
-                }
-            }
-            ChcExpr::FuncApp(_, _, args) => {
-                for a in args {
-                    Self::walk_expr(a.as_ref(), comparisons, constants);
-                }
-            }
-            ChcExpr::ConstArrayMarker(_) => {}
-            ChcExpr::IsTesterMarker(_) => {}
-            ChcExpr::ConstArray(_ks, v) => Self::walk_expr(v.as_ref(), comparisons, constants),
+            crate::expr::dag::Step::Descend
         });
     }
 
     /// Extract multiplication coefficients from expressions.
     /// E.g., `(* 5 C)` yields coefficient 5, `(* (- 1) B)` yields -1.
     fn collect_coefficients(expr: &ChcExpr, coefficients: &mut FxHashSet<i128>) {
-        crate::expr::maybe_grow_expr_stack(|| match expr {
+        // Set-valued collector: each distinct shared node once (WP-F F0b).
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
             ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
                 // Check for (int * var) or (var * int)
                 match (args[0].as_ref(), args[1].as_ref()) {
@@ -304,27 +292,23 @@ impl QualifierSet {
                     }
                     _ => {}
                 }
-                // Recurse into subexpressions
-                for a in args {
-                    Self::collect_coefficients(a, coefficients);
-                }
+                crate::expr::dag::Step::Descend
             }
-            ChcExpr::Op(_, args) => {
-                for a in args {
-                    Self::collect_coefficients(a, coefficients);
-                }
+            ChcExpr::Op(..) | ChcExpr::PredicateApp(..) | ChcExpr::FuncApp(..) => {
+                crate::expr::dag::Step::Descend
             }
-            ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
-                for a in args {
-                    Self::collect_coefficients(a, coefficients);
-                }
-            }
-            _ => {}
+            _ => crate::expr::dag::Step::Skip,
         });
     }
 
     fn collect_constants_from_expr(expr: &ChcExpr, constants: &mut FxHashSet<i128>) {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                Self::collect_constants_from_expr(lambda.body(), constants);
+                for value in lambda.captures() {
+                    Self::collect_constants_from_expr(value, constants);
+                }
+            }
             ChcExpr::Int(n) => {
                 constants.insert(*n);
             }

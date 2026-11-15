@@ -201,3 +201,38 @@ fn empty_shared_vars_rejects_variable_interpolant() {
         check_sat_via_smt,
     ));
 }
+
+/// A disjunctive invariant is validated disjunct by disjunct: `x ∈ {0, 1}`
+/// under `x' = 1 - x` is inductive (also strengthened by `¬query`), while
+/// `x ∈ {0, 2}` is not.
+#[test]
+fn disjunctive_invariant_is_validated_one_disjunct_at_a_time() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let x_next = ChcVar::new("x_next", ChcSort::Int);
+    let xe = ChcExpr::var(x.clone());
+    let ts = TransitionSystem::new(
+        crate::PredicateId::new(0),
+        vec![x],
+        ChcExpr::eq(xe.clone(), ChcExpr::int(0)),
+        ChcExpr::eq(
+            ChcExpr::var(x_next),
+            ChcExpr::sub(ChcExpr::int(1), xe.clone()),
+        ),
+        ChcExpr::eq(xe.clone(), ChcExpr::int(5)),
+    );
+    let is = |n: i64| ChcExpr::eq(xe.clone(), ChcExpr::int(n));
+    let inv = ChcExpr::or(is(0), is(1));
+    assert_eq!(
+        validate_inductive_invariant(&ts, &inv, check_sat_via_smt),
+        None
+    );
+    let strengthened = ChcExpr::and(inv, ChcExpr::not(is(5)));
+    assert_eq!(
+        validate_inductive_invariant(&ts, &strengthened, check_sat_via_smt),
+        None
+    );
+    assert_eq!(
+        validate_inductive_invariant(&ts, &ChcExpr::or(is(0), is(2)), check_sat_via_smt),
+        Some("inductiveness")
+    );
+}

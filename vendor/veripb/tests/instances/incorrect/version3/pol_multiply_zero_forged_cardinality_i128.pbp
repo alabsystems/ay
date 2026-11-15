@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the same forgery at the i128 representation. `multiply`
+% scales in situ at every width tier, so a coefficient that does not fit i64 is
+% no protection. Only model: x1=0 x2=1, so `conclusion UNSAT` is false.
+f 3 ;
+pol 1 0 * 2 + ;
+pol 4 3 + ;
+output NONE;
+conclusion UNSAT : 5 ;
+end pseudo-Boolean proof;

@@ -51,6 +51,36 @@ impl LiaSolver<'_> {
             return None; // Non-integer excluded value
         };
 
+        // A unique-residue conflict needs the disequality, not just the
+        // equality and the bound window. LRA also sends split requests for
+        // Nelson-Oppen shared disequalities: their premise is NOT necessarily
+        // in `self.asserted`, and `disequality_term: Some` only names a term,
+        // not a live assertion. Accept this shortcut only when an asserted
+        // atom directly proves `split.variable != excluded_int`. Otherwise
+        // leave the request as NeedDisequalitySplit; the no-residue conflicts
+        // below remain valid without any disequality.
+        let excluded_value_witness = self.asserted.iter().find_map(|&(literal, value)| {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
+                return None;
+            };
+            if args.len() != 2
+                || !matches!((name.as_str(), value), ("=", false) | ("distinct", true))
+            {
+                return None;
+            }
+            let excludes_value = (args[0] == split.variable
+                && self
+                    .terms()
+                    .extract_integer_constant(args[1])
+                    .is_some_and(|constant| constant == excluded_int))
+                || (args[1] == split.variable
+                    && self
+                        .terms()
+                        .extract_integer_constant(args[0])
+                        .is_some_and(|constant| constant == excluded_int));
+            excludes_value.then_some(TheoryLit::new(literal, value))
+        });
+
         // Re-enabled (#5970 fix): Diophantine substitution-based modular
         // unique-value check. The original bug was stale Dioph cache entries
         // from a different Boolean context (ITE branching with mod encoding
@@ -69,8 +99,8 @@ impl LiaSolver<'_> {
         // which handles both modular infeasibility and unique-value-excluded-
         // by-disequality detection. We filter to substitutions involving the
         // split variable and additionally check the split's excluded_value
-        // directly (since the disequality may come from LRA as a split request
-        // rather than from an asserted literal).
+        // directly. A unique-value conflict still needs the independent
+        // asserted-disequality witness above; a shared split alone is not one.
         for (term_id, coeffs, constant) in &self.dioph_cached_substitutions {
             if *term_id != split.variable {
                 continue;
@@ -89,8 +119,10 @@ impl LiaSolver<'_> {
                 );
             }
 
-            // Get current bounds for the split variable
-            if let Some((lb_opt, ub_opt)) = self.lra.get_bounds(*term_id) {
+            // Get current bounds for the split variable — JUSTIFIED only
+            // (#nia-sign-cut-soundness): the UNSAT below cites the whole
+            // asserted set, so no tentative (model-derived) bound may feed it.
+            if let Some((lb_opt, ub_opt)) = self.justified_bounds(*term_id) {
                 let effective_lb = lb_opt.as_ref().map(Self::effective_int_lower);
                 let effective_ub = ub_opt.as_ref().map(Self::effective_int_upper);
 
@@ -111,18 +143,22 @@ impl LiaSolver<'_> {
                                 gcd
                             );
                         }
-                        let conflict: Vec<TheoryLit> = self
-                            .asserted
-                            .iter()
-                            .map(|&(lit, val)| TheoryLit::new(lit, val))
-                            .collect();
-                        return Some(conflict);
+                        if let Some((lower, upper)) = lb_opt.as_ref().zip(ub_opt.as_ref()) {
+                            if let Some(conflict) =
+                                self.modular_cached_conflict_reasons(lower, upper)
+                            {
+                                return Some(conflict);
+                            }
+                        }
                     }
 
                     // Check if there's exactly one valid integer and it matches
                     // the excluded value from the disequality split
                     let second_valid = &first_valid + &gcd;
-                    if &second_valid > ub && first_valid == excluded_int {
+                    if &second_valid > ub
+                        && first_valid == excluded_int
+                        && excluded_value_witness.is_some()
+                    {
                         if debug {
                             safe_eprintln!(
                                 "[MOD] Dioph: disequality excludes unique valid value {} for {:?}",
@@ -130,20 +166,16 @@ impl LiaSolver<'_> {
                                 term_id
                             );
                         }
-                        // Build conflict from ALL asserted literals (both
-                        // polarities). The [lb, ub] window comes from LRA
-                        // tableau bounds which can derive from negated atoms
-                        // (e.g. !(x <= 5) => x > 5); dropping false-valued
-                        // literals would make the conflict under-inclusive
-                        // (seed-236 false-UNSAT bug class). Including extra
-                        // genuinely-asserted literals only weakens the
-                        // learned clause, which is sound.
-                        let conflict: Vec<TheoryLit> = self
-                            .asserted
-                            .iter()
-                            .map(|&(lit, val)| TheoryLit::new(lit, val))
-                            .collect();
-                        return Some(conflict);
+                        // Cite both the cached modulus and the complete LRA
+                        // window. The latter can depend on cross-theory facts
+                        // as well as negated LIA atoms (seed-236).
+                        if let Some((lower, upper)) = lb_opt.as_ref().zip(ub_opt.as_ref()) {
+                            if let Some(conflict) =
+                                self.modular_cached_conflict_reasons(lower, upper)
+                            {
+                                return Some(conflict);
+                            }
+                        }
                     }
                 }
             }
@@ -163,7 +195,8 @@ impl LiaSolver<'_> {
                     gcd
                 );
             }
-            if let Some((lb_opt, ub_opt)) = self.lra.get_bounds(*term_id) {
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness), as above.
+            if let Some((lb_opt, ub_opt)) = self.justified_bounds(*term_id) {
                 let effective_lb = lb_opt.as_ref().map(Self::effective_int_lower);
                 let effective_ub = ub_opt.as_ref().map(Self::effective_int_upper);
 
@@ -182,36 +215,35 @@ impl LiaSolver<'_> {
                                 gcd
                             );
                         }
-                        let conflict: Vec<TheoryLit> = self
-                            .asserted
-                            .iter()
-                            .map(|&(lit, val)| TheoryLit::new(lit, val))
-                            .collect();
-                        return Some(conflict);
+                        if let Some((lower, upper)) = lb_opt.as_ref().zip(ub_opt.as_ref()) {
+                            if let Some(conflict) =
+                                self.modular_cached_conflict_reasons(lower, upper)
+                            {
+                                return Some(conflict);
+                            }
+                        }
                     }
 
                     let second_valid = &first_valid + gcd;
-                    if &second_valid > ub && first_valid == excluded_int {
+                    if &second_valid > ub
+                        && first_valid == excluded_int
+                        && excluded_value_witness.is_some()
+                    {
                         if debug {
                             safe_eprintln!(
                                 "[MOD] Expanded GCD: disequality excludes unique valid value {} for {:?}",
                                 excluded_int, term_id
                             );
                         }
-                        let mut conflict: Vec<TheoryLit> = self
-                            .asserted
-                            .iter()
-                            .filter(|&&(_, v)| v)
-                            .map(|&(lit, val)| TheoryLit::new(lit, val))
-                            .collect();
-                        for &diseq_lit in &self.assertion_view().negative_equalities {
-                            if let TermData::App(Symbol::Named(n), a) = self.terms.get(diseq_lit) {
-                                if n == "=" && a.len() == 2 && a.contains(&split.variable) {
-                                    conflict.push(TheoryLit::new(diseq_lit, false));
-                                }
+                        // Same complete modulus/window premises as the
+                        // substitution branch, including shared LRA reasons.
+                        if let Some((lower, upper)) = lb_opt.as_ref().zip(ub_opt.as_ref()) {
+                            if let Some(conflict) =
+                                self.modular_cached_conflict_reasons(lower, upper)
+                            {
+                                return Some(conflict);
                             }
                         }
-                        return Some(conflict);
                     }
                 }
             }
@@ -219,7 +251,7 @@ impl LiaSolver<'_> {
 
         // Also check single equalities for modular constraints
         for &literal in &self.assertion_view().positive_equalities {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {
@@ -274,8 +306,15 @@ impl LiaSolver<'_> {
                 // conclusion below depends on BOTH lb and ub, so the conflict
                 // must include the literals that justify them. Bounds whose
                 // justification cannot be named must not be used here.
-                let lb_reasons = lb_opt.as_ref().and_then(Self::nameable_lra_bound_reasons);
-                let ub_reasons = ub_opt.as_ref().and_then(Self::nameable_lra_bound_reasons);
+                // JUSTIFIED and nameable (#nia-sign-cut-soundness): a
+                // model-derived pin has a nameable reason (the variable
+                // term itself) but is not a consequence of the assignment.
+                let lb_reasons = lb_opt
+                    .as_ref()
+                    .and_then(|b| self.justified_lra_bound_reasons(b));
+                let ub_reasons = ub_opt
+                    .as_ref()
+                    .and_then(|b| self.justified_lra_bound_reasons(b));
                 // For integers, strict bounds need adjustment:
                 // lb > v means lb >= ceil(v) for strict, lb >= ceil(v) for non-strict
                 // ub < v means ub <= floor(v)-1 for strict integer if v is integer
@@ -309,7 +348,10 @@ impl LiaSolver<'_> {
                             safe_eprintln!("[MOD]   second_valid={}, checking if second > ub ({}) and first == excluded",
                                       second_valid, ub);
                         }
-                        if &second_valid > ub && first_valid == excluded_int {
+                        if &second_valid > ub
+                            && first_valid == excluded_int
+                            && excluded_value_witness.is_some()
+                        {
                             // The excluded value is the ONLY valid integer!
                             if debug {
                                 safe_eprintln!(
@@ -329,10 +371,18 @@ impl LiaSolver<'_> {
                             let mut conflict = vec![TheoryLit::new(literal, true)];
                             let mut seen: std::collections::HashSet<(TermId, bool)> =
                                 conflict.iter().map(|l| (l.term, l.value)).collect();
+                            // Unlike the cached paths, this conflict is not
+                            // the entire asserted trail. Cite the exact
+                            // exclusion witness, including `distinct=true`.
+                            if let Some(witness) = excluded_value_witness {
+                                if seen.insert((witness.term, witness.value)) {
+                                    conflict.push(witness);
+                                }
+                            }
                             // Add any asserted disequality for this variable
                             for &diseq_lit in &self.assertion_view().negative_equalities {
                                 if let TermData::App(Symbol::Named(n), a) =
-                                    self.terms.get(diseq_lit)
+                                    self.terms().get(diseq_lit)
                                 {
                                     if n == "=" && a.len() == 2 {
                                         // Check if this is the disequality for our variable

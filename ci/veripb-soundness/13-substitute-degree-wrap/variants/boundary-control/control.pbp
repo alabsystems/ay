@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% One knob turned: the degree is `i64::MIN + 1` instead of `i64::MIN`, and nothing else changes.
+% The substituted degree is then exactly `i64::MIN`, which still fits, so no contradicting row
+% is produced and the UNFIXED checker refuses this proof as well. That is the causation
+% argument: what forged the verdict is the WRAP, not the size of the numbers.
+f 2;
+rup 1 x2 >= -9223372036854775807 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

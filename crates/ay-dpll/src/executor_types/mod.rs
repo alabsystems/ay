@@ -113,9 +113,51 @@ pub enum ExecutorError {
     /// Model validation failed — typed contract replaces previous `String`.
     #[error("model validation failed: {0}")]
     ModelValidation(ModelValidationError),
+    /// Checked model extraction refused before any candidate model was stored.
+    ///
+    /// The original query error remains typed; it is not an ordinary candidate
+    /// `Unknown` eligible for model-blocking retries. Legacy extraction has no
+    /// original-owner accounting implied by this additive terminal boundary.
+    #[error("model extraction refused: {0}")]
+    ModelExtraction(ay_core::original_query::QueryError),
     /// A requested solver/certificate artifact could not be produced faithfully.
     #[error("artifact export failed: {0}")]
     ArtifactExport(String),
+}
+
+impl ExecutorError {
+    /// The `unknown` reason a decision query that ended in this error
+    /// publishes on the native API.
+    ///
+    /// [`Self::UnsupportedLogic`] is a refusal, not a failure: ay has no
+    /// combined decision procedure for the problem's theory mix, and it says
+    /// so the same way on every run. It is [`UnknownReason::Incomplete`], the
+    /// reason the router already publishes for that refusal when the problem
+    /// declares a fail-closed combined logic (`FAIL_CLOSED_COMBINED`), so one
+    /// refusal reads the same whatever logic name the problem declared. Every
+    /// other executor error is an [`UnknownReason::InternalError`].
+    ///
+    /// Published as `InternalError`, the refusal read as a solver FAULT to an
+    /// embedder. Trust counted it as a non-reproducible `solver-fault` on two
+    /// `QF_AUFBVNIA` shapes it emits, both a bitvector term beside a nonlinear
+    /// Int product: its unsigned var*var multiply-overflow record (a bitvector
+    /// overflow predicate over fresh operand images, sharing no symbol with
+    /// the Int reading of the real operands), and a bitwise operator bridged
+    /// through `bv2nat`/`int2bv` whose result is an operand of the product (a
+    /// shared symbol). Not every such program is refused: a lane or a
+    /// simplification decides some.
+    ///
+    /// The reason is the embedder's to read, and embedders branch on it: a
+    /// caller that treats `Incomplete` as a decision procedure's verdict that
+    /// the obligation cannot be discharged (deductive-checks's `Incompleteness`) sees
+    /// this refusal as that now, where `InternalError` read as a soft unknown.
+    #[must_use]
+    pub fn unknown_reason(&self) -> UnknownReason {
+        match self {
+            Self::UnsupportedLogic(_) => UnknownReason::Incomplete,
+            _ => UnknownReason::InternalError,
+        }
+    }
 }
 
 /// Result type for executor operations
@@ -230,7 +272,10 @@ pub enum UnknownOrigin {
     MemoryBudget,
     /// The caller's interrupt flag was observed.
     InterruptFlag,
-    /// A selected solver lane could not decide the input.
+    /// A selected solver lane could not decide the input, or no lane decides
+    /// the problem's theory mix (an [`ExecutorError::UnsupportedLogic`]
+    /// refusal of a decision query, published by
+    /// `Executor::replace_last_result_with_executor_error`).
     IncompleteSolverLane,
     /// Mandatory verdict certification could not confirm the result.
     VerdictCertification,
@@ -257,7 +302,9 @@ pub enum UnknownOrigin {
     UnsupportedArithmeticFragment,
     /// The input uses an unsupported mixed collection fragment.
     UnsupportedMixedCollection,
-    /// The executor encountered an internal failure.
+    /// The executor encountered an internal failure: a decision query that
+    /// ended in any [`ExecutorError`] but `UnsupportedLogic`, a contained
+    /// solver panic, or a broken internal contract.
     ExecutorFailure,
     /// A legacy unknown path had no more specific origin.
     UntaggedSolverUnknown,

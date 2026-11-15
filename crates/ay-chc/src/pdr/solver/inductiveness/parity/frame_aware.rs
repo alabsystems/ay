@@ -606,7 +606,7 @@ impl PdrSolver {
                     {
                         if zero_vars.contains(&r.name) {
                             if let Some(k) = Self::extract_mul_constant(mul_args) {
-                                result.entry(var_name.clone()).or_default().push(k.abs());
+                                result.entry(var_name.clone()).or_default().push(k);
                             }
                         }
                     }
@@ -616,7 +616,7 @@ impl PdrSolver {
                     {
                         if zero_vars.contains(&r.name) {
                             if let Some(k) = Self::extract_mul_constant(mul_args) {
-                                result.entry(var_name.clone()).or_default().push(k.abs());
+                                result.entry(var_name.clone()).or_default().push(k);
                             }
                         }
                     }
@@ -625,7 +625,7 @@ impl PdrSolver {
                 if args.len() == 2 {
                     if let ChcExpr::Op(ChcOp::Mul, mul_args) = expr {
                         if let Some(k) = Self::extract_mul_constant(mul_args) {
-                            result.entry(var_name.clone()).or_default().push(k.abs());
+                            result.entry(var_name.clone()).or_default().push(k);
                         }
                     }
                 }
@@ -633,7 +633,7 @@ impl PdrSolver {
             // Direct k * Q pattern at top level
             if let ChcExpr::Op(ChcOp::Mul, mul_args) = expr {
                 if let Some(k) = Self::extract_mul_constant(mul_args) {
-                    result.entry(var_name.clone()).or_default().push(k.abs());
+                    result.entry(var_name.clone()).or_default().push(k);
                 }
             }
         }
@@ -671,14 +671,30 @@ impl PdrSolver {
         }
     }
 
-    /// Extract constant multiplier from a Mul expression like [Int(k), Var(q)].
+    /// Extract the MAGNITUDE of the constant multiplier from a Mul expression
+    /// like [Int(k), Var(q)].
+    ///
+    /// `None` for `i128::MIN`: its magnitude is not representable and
+    /// `i128::abs` panics on it (#chc-i128-min-magnitude). A divisibility hint
+    /// by 2^127 is simply not offered — hints are completeness-only.
+    ///
+    /// PROVENANCE, stated exactly. While compiler_consumer verified `library/core` a
+    /// fourth panic fired beside the three in `ay-nia`/`ay-dpll`:
+    /// `panic_const_neg_overflow` reported at `library/core/src/num/mod.rs:476`
+    /// (the `int_impl!` invocation for `i128`, i.e. `i128::abs`) with
+    /// `ay_chc::pdr::solver::PdrSolver::solve` on the stack, while the obligation
+    /// under verification was `core::num::<impl i128>::unchecked_mul` — whose
+    /// bound is `i128::MIN` verbatim. The exact call site was NOT isolated:
+    /// three `i128::abs` sites in `crates/ay-chc/src/pdr/` could take that
+    /// literal (here, `bounds_entry_value.rs` and `parity/increment.rs`). All
+    /// three are closed; do not read this comment as saying which one fired.
     fn extract_mul_constant(args: &[std::sync::Arc<ChcExpr>]) -> Option<i128> {
         if args.len() == 2 {
             if let ChcExpr::Int(k) = args[0].as_ref() {
-                return Some(*k);
+                return k.checked_abs();
             }
             if let ChcExpr::Int(k) = args[1].as_ref() {
-                return Some(*k);
+                return k.checked_abs();
             }
         }
         None
@@ -686,7 +702,11 @@ impl PdrSolver {
 
     /// Return prime factors of n (with multiplicity 1 each).
     fn prime_factors(n: i128) -> Vec<i128> {
-        let mut n = n.abs();
+        // Callers pass magnitudes; `i128::MIN` has none (see
+        // `extract_mul_constant`), so decline rather than panic.
+        let Some(mut n) = n.checked_abs() else {
+            return Vec::new();
+        };
         let mut factors = Vec::new();
         let mut d = 2i128;
         while d * d <= n {
@@ -702,5 +722,57 @@ impl PdrSolver {
             factors.push(n);
         }
         factors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
+    use std::sync::Arc;
+
+    fn int_var(name: &str) -> Arc<ChcExpr> {
+        Arc::new(ChcExpr::Var(ChcVar::new(name, ChcSort::Int)))
+    }
+
+    /// Regression (#chc-i128-min-magnitude): `i128::MIN` as a multiplier
+    /// constant — the lower bound a 128-bit signed overflow obligation carries
+    /// verbatim — made `extract_mul_constant`'s callers take `i128::abs` of it
+    /// and PANIC (`attempt to negate with overflow`). The magnitude is
+    /// unrepresentable, so no divisibility hint is offered; nothing panics.
+    /// See `extract_mul_constant` for what was and was not measured.
+    #[test]
+    fn i128_min_multiplier_offers_no_divisor_hint_and_does_not_panic() {
+        let min = Arc::new(ChcExpr::Int(i128::MIN));
+        assert_eq!(
+            PdrSolver::extract_mul_constant(&[min.clone(), int_var("q")]),
+            None
+        );
+        assert_eq!(
+            PdrSolver::extract_mul_constant(&[int_var("q"), min.clone()]),
+            None
+        );
+        assert_eq!(
+            PdrSolver::extract_mul_constant(&[Arc::new(ChcExpr::Int(-6)), int_var("q")]),
+            Some(6),
+            "ordinary multipliers still report their magnitude"
+        );
+        assert!(PdrSolver::prime_factors(i128::MIN).is_empty());
+        assert_eq!(PdrSolver::prime_factors(-12), vec![2, 3]);
+
+        // `v = MIN * q` through the divisor scan: no hint for `v`, no panic.
+        let mul = Arc::new(ChcExpr::Op(ChcOp::Mul, vec![min, int_var("q")]));
+        let constraint = ChcExpr::Op(ChcOp::Eq, vec![int_var("v"), mul]);
+        let divisors = PdrSolver::extract_constraint_divisors(&constraint);
+        assert!(divisors.get("v").is_none_or(|hints| hints.is_empty()));
+
+        // The representable twin still yields its hint.
+        let mul = Arc::new(ChcExpr::Op(
+            ChcOp::Mul,
+            vec![Arc::new(ChcExpr::Int(i128::MIN + 1)), int_var("q")],
+        ));
+        let constraint = ChcExpr::Op(ChcOp::Eq, vec![int_var("v"), mul]);
+        let divisors = PdrSolver::extract_constraint_divisors(&constraint);
+        assert_eq!(divisors.get("v").map(Vec::as_slice), Some(&[i128::MAX][..]));
     }
 }

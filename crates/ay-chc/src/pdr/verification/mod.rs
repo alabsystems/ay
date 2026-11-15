@@ -20,12 +20,15 @@ mod cex;
 mod cex_entries;
 mod cex_query;
 mod concrete;
+mod disjunctive_body;
+mod exact_conjunct;
 mod helpers;
 mod mod_div;
 mod model;
 mod model_fast;
 mod model_inductive;
 mod model_inductive_unknown;
+mod model_observation;
 mod model_recheck;
 mod model_safety;
 mod transition;
@@ -77,7 +80,7 @@ const VERIFY_CASE_SPLIT_TIMEOUT: std::time::Duration = std::time::Duration::from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CexVerificationResult {
-    /// Counterexample is definitely valid (all SMT checks returned Sat).
+    /// `false` is derivable: a ground derivation validated on the clauses.
     Valid,
     /// Counterexample is definitely spurious (some SMT check returned Unsat).
     Spurious,

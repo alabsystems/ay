@@ -9,6 +9,7 @@ use std::{ffi::CString, ptr};
 use super::*;
 
 mod bounded_io;
+mod ground_occurrences;
 
 /// Empty solver checks are vacuously valid SAT, not consumer-rejected UNDEF.
 /// This exercises the actual C ABI path rather than the local lbool mapper.
@@ -497,6 +498,51 @@ fn test_z3_compat_bvcomp() {
         Z3_solver_assert(ctx, solver, eq_one);
         let result = Z3_solver_check(ctx, solver);
         assert_eq!(result, Z3_L_TRUE);
+
+        Z3_del_context(ctx);
+    }
+}
+
+/// Func-decl handles are hash-consed like z3's (measured against
+/// libz3 5.1.0): repeated `Z3_mk_func_decl` of one signature returns
+/// the SAME handle, `Z3_get_app_decl` round-trips to it, and
+/// `Z3_get_func_decl_id` is stable across presentations.
+#[test]
+fn test_z3_compat_func_decl_handle_interning() {
+    // SAFETY: Test-scope unsafe block: all handles are allocated by
+    // `Z3_mk_*` calls inside this block and freed by `Z3_del_context`.
+    // No pointer escapes the block and no concurrent access can occur
+    // because this test owns the handles exclusively.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+
+        let int_sort = Z3_mk_int_sort(ctx);
+        let sym_f = Z3_mk_string_symbol(ctx, c"f".as_ptr());
+        let f1 = Z3_mk_func_decl(ctx, sym_f, 1, &raw const int_sort, int_sort);
+        let f2 = Z3_mk_func_decl(ctx, sym_f, 1, &raw const int_sort, int_sort);
+        assert!(!f1.is_null());
+        assert_eq!(f1, f2, "repeated mk_func_decl must intern");
+        assert_eq!(
+            Z3_get_func_decl_id(ctx, f1),
+            Z3_get_func_decl_id(ctx, f2),
+            "decl id must be stable across presentations"
+        );
+
+        let sym_g = Z3_mk_string_symbol(ctx, c"g".as_ptr());
+        let g = Z3_mk_func_decl(ctx, sym_g, 1, &raw const int_sort, int_sort);
+        assert_ne!(f1, g, "distinct signatures stay distinct");
+
+        let sym_x = Z3_mk_string_symbol(ctx, c"x".as_ptr());
+        let x = Z3_mk_const(ctx, sym_x, int_sort);
+        let fx = Z3_mk_app(ctx, f1, 1, &raw const x);
+        assert_ne!(fx, 0);
+        assert_eq!(
+            Z3_get_app_decl(ctx, fx),
+            f1,
+            "get_app_decl must return the interned handle"
+        );
 
         Z3_del_context(ctx);
     }
@@ -2331,8 +2377,10 @@ fn test_z3_optimize_maxsat_one_of_two() {
         let not_b = Z3_mk_not(ctx, b);
         let i0 = Z3_optimize_assert_soft(ctx, opt, not_a, c"1".as_ptr(), ptr::null_mut());
         let i1 = Z3_optimize_assert_soft(ctx, opt, not_b, c"1".as_ptr(), ptr::null_mut());
+        // z3 returns the objective index of the soft constraint's group:
+        // both are in the default group, objective 0 (measured on 5.1).
         assert_eq!(i0, 0);
-        assert_eq!(i1, 1);
+        assert_eq!(i1, 0);
         assert_eq!(Z3_get_error_code(ctx), Z3_OK);
 
         let res = Z3_optimize_check(ctx, opt, 0, ptr::null());
@@ -2464,9 +2512,10 @@ fn test_z3_optimize_soft_weight_rejects_non_integer() {
     }
 }
 
-/// Assumptions are not supported by the MaxSMT path: honest Z3_L_UNDEF + error.
+/// Check-time assumptions on the MaxSMT path hold for that check (z3's
+/// `Optimize.check(*assumptions)`), and an unsat core names them.
 #[test]
-fn test_z3_optimize_check_assumptions_unsupported() {
+fn test_z3_optimize_check_assumptions() {
     // SAFETY: see test_z3_optimize_maxsat_one_of_two.
     unsafe {
         let cfg = Z3_mk_config();
@@ -2479,22 +2528,24 @@ fn test_z3_optimize_check_assumptions_unsupported() {
         Z3_optimize_assert(ctx, opt, a);
 
         let assumptions = [a];
-        let res = Z3_optimize_check(ctx, opt, 1, assumptions.as_ptr());
         assert_eq!(
-            res, Z3_L_UNDEF,
-            "assumptions are not threaded through MaxSMT"
+            Z3_optimize_check(ctx, opt, 1, assumptions.as_ptr()),
+            Z3_L_TRUE
         );
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+        let not_a = [Z3_mk_not(ctx, a)];
+        assert_eq!(Z3_optimize_check(ctx, opt, 1, not_a.as_ptr()), Z3_L_FALSE);
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+        assert_eq!(Z3_optimize_check(ctx, opt, 0, ptr::null()), Z3_L_TRUE);
 
         Z3_del_context(ctx);
     }
 }
 
-/// AY does not implement Z3's joint arithmetic-objective + MaxSMT priority
-/// semantics. The FFI must reject the combination rather than silently optimize
-/// one class and publish that partial result as the joint optimum.
+/// Joint arithmetic-objective + MaxSMT problems optimize in registration
+/// order through the FFI (maximize declared first wins outright), with the
+/// optimum read back through `Z3_optimize_get_upper`.
 #[test]
-fn test_z3_optimize_mixed_api_objective_and_soft_is_undef() {
+fn test_z3_optimize_mixed_api_objective_and_soft_joint() {
     // SAFETY: see test_z3_optimize_maxsat_one_of_two.
     unsafe {
         let cfg = Z3_mk_config();
@@ -2502,33 +2553,39 @@ fn test_z3_optimize_mixed_api_objective_and_soft_is_undef() {
         Z3_del_config(cfg);
 
         let int_sort = Z3_mk_int_sort(ctx);
-        let bool_sort = Z3_mk_bool_sort(ctx);
         let x = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"x".as_ptr()), int_sort);
-        let soft = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"soft".as_ptr()), bool_sort);
+        let zero = Z3_mk_int(ctx, 0, int_sort);
+        let ten = Z3_mk_int(ctx, 10, int_sort);
         let opt = Z3_mk_optimize(ctx);
-        Z3_optimize_maximize(ctx, opt, x);
-        Z3_optimize_assert_soft(ctx, opt, soft, c"1".as_ptr(), ptr::null_mut());
+        Z3_optimize_assert(ctx, opt, Z3_mk_le(ctx, x, ten));
+        let obj = Z3_optimize_maximize(ctx, opt, x);
+        let x_is_zero = Z3_mk_eq(ctx, x, zero);
+        Z3_optimize_assert_soft(ctx, opt, x_is_zero, c"3".as_ptr(), ptr::null_mut());
 
         assert_eq!(
             Z3_optimize_check(ctx, opt, 0, ptr::null()),
-            Z3_L_UNDEF,
-            "an unsupported joint problem must not publish a partial optimum"
+            Z3_L_TRUE,
+            "joint API problem solves"
         );
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+        assert_eq!(
+            numeral_i64(ctx, Z3_optimize_get_upper(ctx, opt, obj)),
+            Some(10),
+            "maximize declared first takes its bound"
+        );
         assert!(
-            Z3_optimize_get_model(ctx, opt).is_null(),
-            "a rejected joint problem has no admitted model"
+            !Z3_optimize_get_model(ctx, opt).is_null(),
+            "a joint optimum publishes its witness model"
         );
 
         Z3_del_context(ctx);
     }
 }
 
-/// The same honest mixed-use rejection applies when both classes entered via
-/// SMT-LIB parsing; this lane previously routed through the parsed optimizer and
-/// could hide one class behind the other.
+/// The same joint semantics apply when both classes entered via SMT-LIB
+/// parsing.
 #[test]
-fn test_z3_optimize_mixed_parsed_objective_and_soft_is_undef() {
+fn test_z3_optimize_mixed_parsed_objective_and_soft_joint() {
     // SAFETY: see test_z3_optimize_maxsat_one_of_two.
     unsafe {
         let cfg = Z3_mk_config();
@@ -2539,13 +2596,13 @@ fn test_z3_optimize_mixed_parsed_objective_and_soft_is_undef() {
         Z3_optimize_from_string(
             ctx,
             opt,
-            c"(set-logic QF_LIA)\n(declare-const x Int)\n(declare-const s Bool)\n(maximize x)\n(assert-soft s :weight 1)"
+            c"(set-logic QF_LIA)\n(declare-const x Int)\n(assert (and (<= 0 x) (<= x 10)))\n(maximize x)\n(assert-soft (= x 0) :weight 3)"
                 .as_ptr(),
         );
         assert_eq!(Z3_get_error_code(ctx), Z3_OK);
-        assert_eq!(Z3_optimize_check(ctx, opt, 0, ptr::null()), Z3_L_UNDEF);
-        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
-        assert!(Z3_optimize_get_model(ctx, opt).is_null());
+        assert_eq!(Z3_optimize_check(ctx, opt, 0, ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+        assert!(!Z3_optimize_get_model(ctx, opt).is_null());
 
         Z3_del_context(ctx);
     }
@@ -2806,9 +2863,9 @@ fn test_z3_optimize_get_objective_out_of_range() {
 }
 
 /// Unbounded REAL objective: AY reports SAT with the optimum oo, and
-/// get_lower/get_upper return the null AST (0) — never a fabricated numeral.
+/// get_lower/get_upper return z3's `oo` constant — never a fabricated numeral.
 #[test]
-fn test_z3_optimize_unbounded_real_returns_null_ast() {
+fn test_z3_optimize_unbounded_real_returns_oo() {
     // SAFETY: see test_z3_optimize_maxsat_one_of_two.
     unsafe {
         let cfg = Z3_mk_config();
@@ -2825,11 +2882,16 @@ fn test_z3_optimize_unbounded_real_returns_null_ast() {
         let res = Z3_optimize_check(ctx, opt, 0, ptr::null());
         assert_eq!(res, Z3_L_TRUE, "unbounded Real maximize is SAT with oo");
 
-        // No finite numeral represents oo: honest null AST, no error.
+        // z3 reports the unbounded optimum as the constant `oo`.
         let lo = Z3_optimize_get_lower(ctx, opt, obj);
         let up = Z3_optimize_get_upper(ctx, opt, obj);
-        assert_eq!(lo, 0, "unbounded optimum has no finite numeral");
-        assert_eq!(up, 0);
+        for bound in [lo, up] {
+            assert!(bound != 0, "the unbounded optimum is `oo`");
+            assert_eq!(
+                std::ffi::CStr::from_ptr(Z3_ast_to_string(ctx, bound)).to_string_lossy(),
+                "oo"
+            );
+        }
 
         Z3_del_context(ctx);
     }
@@ -2837,9 +2899,9 @@ fn test_z3_optimize_unbounded_real_returns_null_ast() {
 
 /// Unbounded INT objective: Z3_optimize_check returns Z3_L_TRUE (SAT with oo),
 /// matching z3 — the audited LP relaxation proves unboundedness (see
-/// `perf(opt)`/`feat(opt)` unbounded-objectives work). The optimum is oo, for
-/// which no finite numeral exists, so get_lower/get_upper return a null AST
-/// (never a fabricated finite Int optimum). Mirrors the unbounded-Real case.
+/// `perf(opt)`/`feat(opt)` unbounded-objectives work). The optimum is oo, which
+/// get_lower/get_upper report as z3 does, the constant `oo` (never a fabricated
+/// finite Int optimum). Mirrors the unbounded-Real case.
 #[test]
 fn test_z3_optimize_unbounded_int_is_sat_with_oo() {
     // SAFETY: see test_z3_optimize_maxsat_one_of_two.
@@ -2858,19 +2920,23 @@ fn test_z3_optimize_unbounded_int_is_sat_with_oo() {
         let res = Z3_optimize_check(ctx, opt, 0, ptr::null());
         assert_eq!(res, Z3_L_TRUE, "unbounded Int maximize is SAT with oo");
 
-        // No finite numeral represents oo: honest null AST, no error.
+        // z3 reports the unbounded optimum as the constant `oo`.
         let lo = Z3_optimize_get_lower(ctx, opt, obj);
         let up = Z3_optimize_get_upper(ctx, opt, obj);
-        assert_eq!(lo, 0, "unbounded optimum has no finite numeral");
-        assert_eq!(up, 0);
+        for bound in [lo, up] {
+            assert!(bound != 0, "the unbounded optimum is `oo`");
+            assert_eq!(
+                std::ffi::CStr::from_ptr(Z3_ast_to_string(ctx, bound)).to_string_lossy(),
+                "oo"
+            );
+        }
 
         Z3_del_context(ctx);
     }
 }
 
-/// Z3_substitute: replacing a constant with a numeral yields the same interned
-/// term as building it directly, and eager-folds. `(+ x 1)[x:=5]` == `(+ 5 1)`
-/// == `6`.
+/// Replacing a constant preserves its numeric meaning whether constructors
+/// retain arithmetic syntax or fold it eagerly.
 #[test]
 fn test_z3_substitute_const_to_numeral_folds() {
     // SAFETY: see test_z3_compat_basic_lia.
@@ -2895,15 +2961,15 @@ fn test_z3_substitute_const_to_numeral_folds() {
         let got = Z3_substitute(ctx, expr, 1, from.as_ptr(), to.as_ptr());
         assert_ne!(got, 0, "Z3_substitute should return a non-null AST");
 
-        // Hash-consing identity: equals the directly-built (+ 5 1), which folds to 6.
+        // Constructor eagerness is not required: both expressions simplify to 6.
         let direct_args = [five, one];
         let direct = Z3_mk_add(ctx, 2, direct_args.as_ptr());
-        assert_eq!(got, direct, "substitute must equal directly-built term");
-        assert_eq!(got, six, "(+ x 1)[x:=5] must eager-fold to 6");
+        assert_eq!(Z3_simplify(ctx, got), six);
+        assert_eq!(Z3_simplify(ctx, direct), six);
 
         // And it numerically evaluates to 6.
         let mut v: i32 = 0;
-        assert!(Z3_get_numeral_int(ctx, got, &raw mut v));
+        assert!(Z3_get_numeral_int(ctx, Z3_simplify(ctx, got), &raw mut v));
         assert_eq!(v, 6);
 
         Z3_del_context(ctx);
@@ -4384,8 +4450,7 @@ fn test_z3_simplify_is_equivalent_to_input() {
     }
 }
 
-/// `Z3_simplify` of an already-simplified AY-built term is identity (fixpoint),
-/// and is idempotent.
+/// Explicit simplification is idempotent even when constructors retain syntax.
 #[test]
 fn test_z3_simplify_fixpoint_and_idempotent() {
     // SAFETY: see test_z3_compat_basic_lia.
@@ -4400,7 +4465,14 @@ fn test_z3_simplify_fixpoint_and_idempotent() {
         let expr = Z3_mk_add(ctx, 2, [x, one].as_ptr()); // (+ x 1)
 
         let s1 = Z3_simplify(ctx, expr);
-        assert_eq!(s1, expr, "AY-built term must be a simplify fixpoint");
+        assert_ne!(s1, 0);
+        let solver = Z3_mk_solver(ctx);
+        Z3_solver_assert(ctx, solver, Z3_mk_not(ctx, Z3_mk_eq(ctx, s1, expr)));
+        assert_eq!(
+            Z3_solver_check(ctx, solver),
+            Z3_L_FALSE,
+            "simplification preserves the expression"
+        );
         let s2 = Z3_simplify(ctx, s1);
         assert_eq!(s2, s1, "Z3_simplify must be idempotent");
 
@@ -4958,10 +5030,12 @@ fn test_model_uninterpreted_sort_elements() {
     }
 }
 
-/// Binder-containing terms are refused honestly (capture-safe substitution is
-/// not possible), never given a fabricated value.
+/// A quantifier is evaluated without substituting its bound variable: a body
+/// the evaluator cannot decide stays the quantifier itself, never a
+/// fabricated literal (z3's evaluator decides more; the publication backstop
+/// of `Z3_solver_check` treats such a residual as unconfirmed).
 #[test]
-fn test_model_eval_refuses_binder_terms_honestly() {
+fn test_model_eval_keeps_undecided_binder_terms_symbolic() {
     // SAFETY: Test-scope unsafe block: all handles are allocated by `Z3_mk_*`
     // calls inside this block and freed by `Z3_del_context`. No pointer
     // escapes and this test owns the handles exclusively.
@@ -4985,10 +5059,13 @@ fn test_model_eval_refuses_binder_terms_honestly() {
         assert_ne!(forall, 0);
 
         let mut out: Z3_ast = 0;
-        assert!(
-            !Z3_model_eval(ctx, model, forall, true, &raw mut out),
-            "binder terms must be refused honestly (false), not fabricated"
+        assert!(Z3_model_eval(ctx, model, forall, true, &raw mut out));
+        assert_eq!(
+            Z3_get_bool_value(ctx, out),
+            Z3_L_UNDEF,
+            "an undecided quantifier is not given a fabricated value"
         );
+        assert_eq!(Z3_is_quantifier_forall(ctx, out), true);
 
         Z3_del_context(ctx);
     }
@@ -6034,11 +6111,14 @@ fn test_solver_parse_late_error_poisons_context_and_retires_results() {
         let before = Z3_ast_vector_size(ctx, Z3_solver_get_assertions(ctx, solver));
 
         // The final hard assertion is syntactically valid but semantically has
-        // sort Int. The declaration and first assertion precede the error.
+        // sort Int. The declaration and first assertion precede the error. The
+        // `declare-sort-parameter` keeps the text outside the scoped,
+        // rebinding parse (`parse_binding`), whose rejected texts leave the
+        // engine as it was.
         Z3_solver_from_string(
             ctx,
             solver,
-            c"(declare-const y Int)(assert (= y 0))(assert 1)".as_ptr(),
+            c"(declare-sort-parameter A)(declare-const y Int)(assert (= y 0))(assert 1)".as_ptr(),
         );
         assert_eq!(Z3_get_error_code(ctx), Z3_EXCEPTION);
         assert!(Z3_solver_get_model(ctx, solver).is_null());
@@ -6138,7 +6218,10 @@ fn test_solver_parse_optimization_commands_are_atomic_preflight_errors() {
 #[test]
 fn test_all_solver_parse_entrypoints_fail_closed_on_late_error() {
     unsafe {
-        let bad = "(declare-const late Int)(assert (= late 1))(assert 1)";
+        // A `declare-sort-parameter` keeps the text outside the scoped,
+        // rebinding parse (`parse_binding`), whose rejected texts leave the
+        // engine as it was; this global parse can fail after mutating it.
+        let bad = "(declare-sort-parameter A)(declare-const late Int)(assert (= late 1))(assert 1)";
 
         // Global string parser.
         let cfg = Z3_mk_config();
@@ -6218,7 +6301,7 @@ fn test_add_rec_def_is_durable_for_solver_and_optimize() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
         let bool_sort = Z3_mk_bool_sort(ctx);
-        let f = Z3_mk_func_decl(
+        let f = Z3_mk_rec_func_decl(
             ctx,
             Z3_mk_string_symbol(ctx, c"f".as_ptr()),
             0,
@@ -6243,7 +6326,7 @@ fn test_add_rec_def_is_durable_for_solver_and_optimize() {
         Z3_del_config(cfg);
         let opt = Z3_mk_optimize(ctx);
         let bool_sort = Z3_mk_bool_sort(ctx);
-        let g = Z3_mk_func_decl(
+        let g = Z3_mk_rec_func_decl(
             ctx,
             Z3_mk_string_symbol(ctx, c"g".as_ptr()),
             0,
@@ -6268,7 +6351,7 @@ fn test_add_rec_def_rejects_null_nonempty_args_transactionally() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
         let bool_sort = Z3_mk_bool_sort(ctx);
-        let f = Z3_mk_func_decl(
+        let f = Z3_mk_rec_func_decl(
             ctx,
             Z3_mk_string_symbol(ctx, c"bad_rec_args".as_ptr()),
             0,
@@ -6303,7 +6386,7 @@ fn test_cross_context_translation_rejects_unportable_semantic_metadata() {
         let source = Z3_mk_context(cfg);
         Z3_del_config(cfg);
         let bool_sort = Z3_mk_bool_sort(source);
-        let f = Z3_mk_func_decl(
+        let f = Z3_mk_rec_func_decl(
             source,
             Z3_mk_string_symbol(source, c"translated_rec".as_ptr()),
             0,
@@ -6342,7 +6425,7 @@ fn test_cross_context_translation_rejects_unportable_semantic_metadata() {
         Z3_del_config(cfg);
         let opt = Z3_mk_optimize(source);
         let bool_sort = Z3_mk_bool_sort(source);
-        let g = Z3_mk_func_decl(
+        let g = Z3_mk_rec_func_decl(
             source,
             Z3_mk_string_symbol(source, c"translated_opt_rec".as_ptr()),
             0,

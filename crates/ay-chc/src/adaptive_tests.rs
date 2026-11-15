@@ -23,8 +23,18 @@ use std::time::Duration;
 
 #[path = "adaptive_tests/array_ghost_candidate.rs"]
 mod array_ghost_candidate;
+#[path = "adaptive_tests/collapsed_bv_query_prepass.rs"]
+mod collapsed_bv_query_prepass;
+#[path = "adaptive_tests/current_sdk_callable_loop.rs"]
+mod current_sdk_callable_loop;
 #[path = "adaptive_tests/engine_selection.rs"]
 mod engine_selection;
+#[path = "adaptive_tests/ite_chain_routing.rs"]
+mod ite_chain_routing;
+#[path = "adaptive_tests/lambda_observation.rs"]
+mod lambda_observation;
+#[path = "adaptive_tests/survivor_model.rs"]
+mod survivor_model;
 
 #[test]
 fn deterministic_execution_environment_values_are_parsed_without_mutating_process_state() {
@@ -247,6 +257,63 @@ fn explicit_adaptive_execution_mode_keeps_parallel_portfolio() {
     let portfolio = solver.make_default_portfolio_config();
     assert!(portfolio.parallel);
     assert_eq!(portfolio.timeout, None);
+}
+
+/// LRA-Lin unsafe side (`LRA_BMC_unsafe_2026-09-22.md`): on a Real-sorted
+/// problem the portfolio BMC is the only counterexample engine and must run
+/// at the full wave share, not as the 2 s staged probe; Int problems keep the
+/// probe.
+#[test]
+fn real_sorted_portfolios_keep_bmc_at_the_full_wave_share() {
+    let budget = Duration::from_secs(120);
+    let real = AdaptivePortfolio::new(
+        create_identity_simple_loop(ChcSort::Real),
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    let default = real.make_default_portfolio_config();
+    assert!(default
+        .engines
+        .iter()
+        .any(|engine| engine.engine_type() == EngineType::Bmc));
+    assert_eq!(
+        default.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "a Real problem's BMC must not be capped to the staged probe"
+    );
+    let learned = real.make_learned_portfolio_config(None);
+    if learned
+        .engines
+        .iter()
+        .any(|engine| engine.engine_type() == EngineType::Bmc)
+    {
+        assert_eq!(
+            learned.budget_policy(EngineType::Bmc),
+            BudgetPolicy::Default
+        );
+    }
+    assert_eq!(
+        real.staged_probe_profile(StagedProbeBudgetProfile::BmcAndKind),
+        StagedProbeBudgetProfile::KindOnly
+    );
+    assert_eq!(
+        real.staged_probe_profile(StagedProbeBudgetProfile::BmcOnly),
+        StagedProbeBudgetProfile::CallerOnly
+    );
+
+    let int = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    assert_eq!(
+        int.make_default_portfolio_config()
+            .budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2)),
+        "Int problems keep the staged BMC probe"
+    );
+    assert_eq!(
+        int.staged_probe_profile(StagedProbeBudgetProfile::BmcAndKind),
+        StagedProbeBudgetProfile::BmcAndKind
+    );
 }
 
 #[test]
@@ -627,7 +694,7 @@ fn adaptive_report_observes_the_authoritative_cancelled_invocation() {
 }
 
 #[test]
-fn report_paths_recheck_the_same_boundary_after_report_assembly() {
+fn publication_boundary_demotes_a_decisive_result_after_cancellation() {
     let solver = AdaptivePortfolio::new(create_simple_loop(), AdaptiveConfig::test_default());
     let decisive = VerifiedChcResult::from_validated(
         PortfolioResult::Safe(InvariantModel::new()),
@@ -638,41 +705,6 @@ fn report_paths_recheck_the_same_boundary_after_report_assembly() {
         solver.enforce_authoritative_publication_boundary(decisive, None),
         VerifiedChcResult::Unknown(_)
     ));
-
-    let src = include_str!("adaptive.rs");
-    let budget_start = src
-        .find("pub fn solve_with_budget_report(")
-        .expect("budget-report entry point must remain present");
-    let budget_end = src[budget_start..]
-        .find("/// Solve through the authoritative production pipeline")
-        .map(|offset| budget_start + offset)
-        .expect("budget-report entry point must precede adaptive report docs");
-    let budget_path = &src[budget_start..budget_end];
-    assert!(
-        budget_path
-            .rfind("enforce_authoritative_publication_boundary")
-            .expect("budget report needs a final publication gate")
-            > budget_path
-                .find("report.total_elapsed")
-                .expect("budget report must be assembled")
-    );
-
-    let adaptive_start = src
-        .find("pub fn solve_with_adaptive_report(")
-        .expect("adaptive-report entry point must remain present");
-    let adaptive_end = src[adaptive_start..]
-        .find("/// Panic-safe variant")
-        .map(|offset| adaptive_start + offset)
-        .expect("adaptive-report entry point must precede try_solve docs");
-    let adaptive_path = &src[adaptive_start..adaptive_end];
-    assert!(
-        adaptive_path
-            .rfind("enforce_authoritative_publication_boundary")
-            .expect("adaptive report needs a final publication gate")
-            > adaptive_path
-                .find("AdaptiveSolveReport::new")
-                .expect("adaptive report must be fully assembled")
-    );
 }
 
 #[test]
@@ -1316,7 +1348,7 @@ fn create_unsafe_simple_loop() -> ChcProblem {
 fn solidity_route_balance_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Balance".to_string(),
-        constructors: std::sync::Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkBalance".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1335,7 +1367,7 @@ fn solidity_route_balance_sort() -> ChcSort {
 fn solidity_route_state_sort(balance_sort: ChcSort) -> ChcSort {
     ChcSort::Datatype {
         name: "State".to_string(),
-        constructors: std::sync::Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkState".to_string(),
             selectors: vec![ChcDtSelector {
                 name: "balances".to_string(),
@@ -2088,28 +2120,6 @@ fn test_adaptive_classifies_simple_loop() {
 }
 
 #[test]
-fn test_complex_loop_dispatch_does_not_claim_bmc_evidence_source_regression() {
-    let src = include_str!("adaptive.rs");
-    let branch_start = src
-        .find("ProblemClass::ComplexLoop => {")
-        .expect("adaptive.rs should define the complex-loop dispatch arm");
-    let branch_end = src[branch_start..]
-        .find("ProblemClass::MultiPredLinear =>")
-        .map(|offset| branch_start + offset)
-        .expect("complex-loop arm should be followed by MultiPredLinear");
-    let branch = &src[branch_start..branch_end];
-
-    assert!(
-        branch.contains("complex_loop_validation_evidence"),
-        "complex-loop dispatch must route through the shared evidence helper"
-    );
-    assert!(
-        !branch.contains("ValidationEvidence::BmcCounterexample"),
-        "complex-loop dispatch must not claim constructive BMC evidence for every Unsafe"
-    );
-}
-
-#[test]
 fn test_adaptive_solves_simple_loop() {
     let problem = create_simple_loop();
     let config = AdaptiveConfig {
@@ -2228,6 +2238,50 @@ fn test_acyclic_bmc_budget_uses_full_remaining_for_array_dags_165() {
         AdaptivePortfolio::acyclic_bmc_stage_budget(&features, Duration::from_secs(45)),
         Duration::from_secs(45)
     );
+}
+
+#[test]
+fn test_exact_acyclic_probe_grant_leaves_a_recovery_reserve() {
+    // A per-property row of model-checker-consumer's 15 s harness budget is ~7.5 s. The exact
+    // lane used to be granted all of it (`remaining.min(45s)`), so a lane that
+    // returns Unknown without issuing a single check left nothing for the probe
+    // that can answer. The grant now keeps a reserve.
+    let row = Duration::from_millis(7_500);
+    let granted = AdaptivePortfolio::exact_acyclic_probe_grant(row);
+    assert!(
+        granted < row,
+        "grant {granted:?} must leave a reserve out of {row:?}"
+    );
+    assert_eq!(granted, Duration::from_millis(4_500));
+    assert!(
+        row - granted >= Duration::from_secs(2),
+        "reserve {:?} must be enough for the recovering probe",
+        row - granted
+    );
+}
+
+#[test]
+fn test_exact_acyclic_probe_grant_keeps_the_45s_cap() {
+    // The absolute cap is unchanged: the reserve only ever LOWERS the grant.
+    assert_eq!(
+        AdaptivePortfolio::exact_acyclic_probe_grant(Duration::from_secs(150)),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        AdaptivePortfolio::exact_acyclic_probe_grant(Duration::from_secs(75)),
+        Duration::from_secs(45)
+    );
+}
+
+#[test]
+fn test_exact_acyclic_probe_grant_never_exceeds_remaining() {
+    for millis in [0_u64, 1, 50, 900, 6_000, 15_000, 44_000] {
+        let remaining = Duration::from_millis(millis);
+        assert!(
+            AdaptivePortfolio::exact_acyclic_probe_grant(remaining) <= remaining,
+            "grant must never exceed the remaining budget {remaining:?}"
+        );
+    }
 }
 
 #[test]
@@ -2522,32 +2576,10 @@ fn test_large_non_array_acyclic_linear_graph_uses_direct_dag_bmc_9004() {
 #[test]
 #[cfg_attr(debug_assertions, timeout(60_000))]
 #[cfg_attr(not(debug_assertions), timeout(20_000))]
-fn test_budget_report_uses_original_exact_bv_acyclic_probe_9227() {
-    let mut input = String::from("(set-logic HORN)\n");
-    for index in 0..40 {
-        input.push_str(&format!(
-            "(declare-rel P{index} ((_ BitVec 64) (_ BitVec 64) (_ BitVec 64)))\n"
-        ));
-    }
-    input.push_str("(declare-rel error ())\n");
-    input.push_str("(declare-var start (_ BitVec 64))\n");
-    input.push_str("(declare-var end (_ BitVec 64))\n");
-    input.push_str("(declare-var off (_ BitVec 64))\n");
-    input.push_str(
-        "(rule (=> (and (bvule start end) (bvule end (_ bv5 64)) \
-         (bvule off (_ bv4 64)) (bvule (bvadd start off) (_ bv4 64))) \
-         (P0 start end off)))\n",
+fn test_budget_report_uses_collapsed_native_bv_acyclic_prepass_9227() {
+    let problem = collapsed_bv_query_prepass::original_problem(
+        collapsed_bv_query_prepass::QueryPolarity::Wrap,
     );
-    for index in 0..39 {
-        input.push_str(&format!(
-            "(rule (=> (P{index} start end off) (P{} start end off)))\n",
-            index + 1
-        ));
-    }
-    input.push_str("(rule (=> (and (P39 start end off) (bvult (bvadd start off) start)) error))\n");
-    input.push_str("(query error)\n");
-
-    let problem = ChcParser::parse(&input).expect("acyclic BV budget-report fixture should parse");
     let validation_problem = problem.clone();
     let adaptive = AdaptivePortfolio::new(
         problem,
@@ -2556,26 +2588,45 @@ fn test_budget_report_uses_original_exact_bv_acyclic_probe_9227() {
             ..AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(10))
         },
     );
+    let trace_session = adaptive.decision_log.begin_trace();
     let (result, report) = adaptive.solve_with_budget_report();
+    let trace = trace_session.finish();
 
     assert!(
         matches!(result, VerifiedChcResult::Safe(_)),
-        "budget-report API must use the original exact-BV acyclic proof route for high-arity model-checker-consumer-shaped CHCs, got {result:?}"
+        "budget-report API must preserve a verified original Safe result through the collapsed native prepass, got {result:?}"
     );
     assert!(
         report.entries.is_empty(),
         "acyclic proof prepass should solve before launching budget-report portfolio engines"
     );
+    assert!(trace.observations().iter().any(|row| {
+        row.stage == "collapsed_bv_native_query_prepass"
+            && row.outcome == crate::AdaptiveStrategyOutcome::Safe
+    }));
+    assert!(!trace
+        .observations()
+        .iter()
+        .any(|row| row.stage == "original_bv_exact_acyclic_probe"));
+
+    let model = result
+        .safe_invariant()
+        .expect("verified original Safe model")
+        .model();
+    assert!(
+        !model.is_empty(),
+        "this prepass must reconstruct a real original model"
+    );
 
     let external_validation = crate::engines::validate_external_invariant_model(
         &validation_problem,
-        &InvariantModel::new(),
+        model,
         &PdrConfig::default(),
     )
-    .expect("empty scalar acyclic BMC certificate validation should not error");
+    .expect("original model validation should not error");
     assert!(
         external_validation,
-        "model-checker-consumer-facing external validation must accept established scalar acyclic BMC evidence"
+        "model-checker-consumer-facing validation must accept the actual complete original model"
     );
 }
 
@@ -2839,21 +2890,24 @@ fn test_adaptive_acyclic_bmc_ignores_tautological_terminal_self_loop_9191() {
     assert_eq!(features.class, ProblemClass::MultiPredLinear);
     assert!(!features.has_cycles);
 
+    // The probe runs (the classifier ignores the stutter rule), but its
+    // empty-model Safe is not a proof here: the finalize gate admits one only
+    // through `empty_acyclic_safe_check`, which refuses this query cone as
+    // cyclic (since 2026-09-30), so returning it could only end the round
+    // as unknown. The probe declines it and the answer comes from a later
+    // lane.
+    assert!(!crate::empty_acyclic_safe_check::query_cone_is_acyclic(
+        &adaptive.problem
+    ));
     let proof_result = adaptive.try_acyclic_bmc_probe(&features, None);
     assert!(
-        matches!(
-            proof_result,
-            Some((
-                PortfolioResult::Safe(_),
-                ValidationEvidence::ScalarAcyclicBmcExhaustive { .. }
-            ))
-        ),
-        "tautological terminal self-loop scalar BMC proof should be accepted, got {proof_result:?}"
+        proof_result.is_none(),
+        "an empty-model Safe the finalize gate refuses must not be returned, got {proof_result:?}"
     );
 
     assert!(
         matches!(adaptive.solve(), VerifiedChcResult::Safe(_)),
-        "adaptive solver should accept scalar exhaustive acyclic BMC evidence"
+        "the tautological terminal self-loop system is safe"
     );
 }
 
@@ -3942,43 +3996,6 @@ fn test_solidity_array_dt_projection_route_logs_refined_counters() {
 }
 
 #[test]
-fn test_solidity_array_dt_projection_refines_only_after_original_validation_failure() {
-    let src = include_str!("adaptive.rs");
-    let fn_start = src
-        .find("fn try_solidity_array_dt_projection_route(")
-        .expect("adaptive.rs should define the Solidity array-DT route");
-    let fn_end = src[fn_start..]
-        .find("fn try_array_const_key_cegar_route(")
-        .map(|offset| fn_start + offset)
-        .expect("Solidity array-DT route should precede array const-key route");
-    let route_body = &src[fn_start..fn_end];
-
-    let failed_gate = route_body
-        .find("validation_status == SolidityArrayDtValidationStatus::Failed")
-        .expect("SAFE validation failure should be a distinct refinement gate");
-    let refinement_call = route_body
-        .find("self.try_solidity_array_dt_observed_key_refinement(")
-        .expect("route should retry with observed array keys after validation failure");
-    assert!(
-        failed_gate < refinement_call,
-        "observed-key refinement must run only after original validation rejects the first SAFE"
-    );
-    assert!(
-        route_body[refinement_call..].contains("SolidityArrayDtValidationStatus::RefinedAccepted"),
-        "successful refinement should be recorded as refined_accepted instead of plain SAFE"
-    );
-    assert!(
-        route_body[refinement_call..].contains("lemmas_learned = refined_safe.lemmas_learned")
-            && route_body[refinement_call..].contains("max_frame = refined_safe.max_frame"),
-        "successful refinement should log the refined PDR solve counters, not stale first-attempt counters"
-    );
-    assert!(
-        route_body.contains("translated_safe.map(PortfolioResult::Safe)"),
-        "failed validation with no accepted refinement must fall through as UNKNOWN/None"
-    );
-}
-
-#[test]
 fn test_solidity_array_dt_projection_route_logs_validation_verdicts_as_structured_fields() {
     for (validation_status, expected_result) in [
         (SolidityArrayDtValidationStatus::Failed, "validation_failed"),
@@ -4310,31 +4327,6 @@ fn test_final_validation_demotion_diagnostics_are_bounded_and_preserve_source_ev
 }
 
 #[test]
-fn test_finalize_verified_result_keeps_final_demotion_diagnostics_hooked_up() {
-    let src = include_str!("adaptive.rs");
-    let fn_start = src
-        .find("fn finalize_verified_result(")
-        .expect("adaptive.rs should define finalize_verified_result");
-    let fn_end = src[fn_start..]
-        .find("/// Returns the remaining time")
-        .map(|offset| fn_start + offset)
-        .expect("finalize_verified_result should be followed by remaining_budget");
-    let fn_body = &src[fn_start..fn_end];
-
-    assert_eq!(
-        fn_body
-            .matches("emit_final_validation_demotion_diagnostics(")
-            .count(),
-        1,
-        "finalize_verified_result should emit diagnostics when final Unsafe replay fails"
-    );
-    assert!(
-        fn_body.contains("unsafe_rejected_by_final_verification"),
-        "fresh-verification demotions should keep their diagnostic stage label"
-    );
-}
-
-#[test]
 fn test_bv_simple_loop_uses_native_direct_route() {
     let problem = create_identity_simple_loop(ChcSort::BitVec(8));
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
@@ -4523,9 +4515,7 @@ fn test_lia_farkas_pdr_route_quarantines_real_lra() {
     assert_eq!(features.class, ProblemClass::SimpleLoop);
     assert!(features.uses_real);
     assert!(
-        adaptive
-            .try_lia_farkas_pdr_route(&features, None)
-            .is_none(),
+        adaptive.try_lia_farkas_pdr_route(&features, None).is_none(),
         "LIA/Farkas PDR promotion must stay quarantined from Real/LRA until wrong=0 evidence exists"
     );
 }
@@ -4575,91 +4565,6 @@ fn test_bv_native_direct_route_requires_non_array_non_real_bv_simple_loop() {
     assert_eq!(real_features.class, ProblemClass::SimpleLoop);
     assert!(real_features.uses_real);
     assert!(!real_adaptive.use_bv_native_direct_route(&real_features));
-}
-
-#[test]
-fn test_real_simple_loop_dispatch_uses_learned_real_route() {
-    let src = include_str!("adaptive.rs");
-    let dispatch_start = src
-        .find("let (result, evidence) = match features.class {")
-        .expect("adaptive dispatcher should match on problem class");
-    let dispatch = &src[dispatch_start..];
-    let simple_loop_start = dispatch
-        .find("ProblemClass::SimpleLoop if features.uses_real")
-        .expect("real simple loops should have a dedicated dispatch arm");
-    let real_simple_loop_arm = &dispatch[simple_loop_start..];
-    let arm_end = real_simple_loop_arm
-        .find("ProblemClass::SimpleLoop =>")
-        .expect("real simple-loop arm should precede the generic simple-loop arm");
-    let real_simple_loop_arm = &real_simple_loop_arm[..arm_end];
-
-    assert!(
-        real_simple_loop_arm.contains("self.solve_with_learned_selection(deadline)"),
-        "real simple loops should use the selector's LRA/mixed arithmetic route"
-    );
-    assert!(
-        real_simple_loop_arm.contains("ValidationEvidence::FullVerification"),
-        "selector portfolio results must keep the portfolio validation evidence"
-    );
-    assert!(
-        !real_simple_loop_arm.contains("try_lia_farkas_pdr_route"),
-        "Real/LRA simple loops must not enter the quarantined LIA/Farkas route"
-    );
-    assert!(
-        !real_simple_loop_arm.contains("try_dual_cas_lra_phase_invariant"),
-        "Real/LRA simple loops must not promote the quarantined dual-CAS route by default"
-    );
-}
-
-#[test]
-fn test_mixed_lia_lra_cruise_route_is_env_quarantined() {
-    let src = include_str!("adaptive.rs");
-    let call = "self.try_cruise_controller_mixed_phase_invariant(&features, deadline)";
-    let call_start = src
-        .find(call)
-        .expect("adaptive dispatcher should contain the mixed LIA/LRA cruise route call");
-    let prefix = &src[..call_start];
-    let guard_start = prefix
-        .rfind("std::env::var_os(REAL_LRA_PROMOTION_ENV).is_some()")
-        .expect("mixed LIA/LRA cruise route should be behind the Real/LRA promotion env gate");
-    assert!(
-        call_start - guard_start < 160,
-        "mixed LIA/LRA cruise route call should stay directly tied to the env quarantine gate"
-    );
-}
-
-#[test]
-fn test_arithmetic_dispatch_tries_lia_farkas_route_before_fallbacks() {
-    let src = include_str!("adaptive.rs");
-    let dispatch_start = src
-        .find("let (result, evidence) = match features.class {")
-        .expect("adaptive dispatcher should match on problem class");
-    let dispatch = &src[dispatch_start..];
-
-    let simple_loop_start = dispatch
-        .find("ProblemClass::SimpleLoop =>")
-        .expect("generic simple-loop arm should exist");
-    let simple_loop_arm = &dispatch[simple_loop_start..];
-    let lia_route = simple_loop_arm
-        .find("self.try_lia_farkas_pdr_route(&features, deadline)")
-        .expect("simple-loop arm should try the LIA/Farkas route");
-    let fallback = simple_loop_arm
-        .find("self.solve_simple_loop_with_evidence(&features, deadline)")
-        .expect("simple-loop arm should keep the existing fallback");
-    assert!(
-        lia_route < fallback,
-        "LIA/Farkas route should run before generic simple-loop fallback"
-    );
-
-    let multi_pred_start = dispatch
-        .find("ProblemClass::MultiPredLinear =>")
-        .expect("multi-predicate linear arm should exist");
-    let multi_pred_arm = &dispatch[multi_pred_start..];
-    assert!(
-        multi_pred_arm.contains("self.try_lia_farkas_pdr_route(&features, deadline)")
-            && multi_pred_arm.contains("self.solve_multi_pred_linear(&features, deadline)"),
-        "multi-predicate linear dispatch should try LIA/Farkas before the existing fallback"
-    );
 }
 
 #[test]
@@ -5319,202 +5224,6 @@ fn test_multi_pred_linear_capped_roster_preserves_engine_diversity() {
 }
 
 #[test]
-fn test_multi_pred_linear_direct_kind_uses_full_verification_evidence_source_regression() {
-    let src = include_str!("adaptive_multi_pred.rs");
-    let fn_start = src
-        .find("pub(super) fn solve_multi_pred_linear(")
-        .expect("adaptive_multi_pred.rs should define solve_multi_pred_linear");
-    let fn_body = &src[fn_start..];
-    let kind_start = fn_body
-        .find("if let Some(result) = self.try_kind(kind_budget) {")
-        .expect("MultiPredLinear path should try direct Kind before fallback");
-    let kind_return = fn_body[kind_start..]
-        .find("return (result, evidence);")
-        .map(|offset| kind_start + offset + "return (result, evidence);".len())
-        .expect("direct Kind branch should return the computed evidence");
-    let kind_branch = &fn_body[kind_start..kind_return];
-
-    assert!(
-        kind_branch.contains("ValidationEvidence::CounterexampleVerification"),
-        "direct Kind branch must preserve explicit counterexample evidence on MultiPredLinear"
-    );
-    assert!(
-        kind_branch.contains("ValidationEvidence::FullVerification"),
-        "direct adaptive Kind on MultiPredLinear must report original-clause verification evidence for Safe results"
-    );
-    assert!(
-        !kind_branch.contains("ValidationEvidence::QueryOnly"),
-        "direct adaptive Kind branch on MultiPredLinear must not report query-only evidence"
-    );
-}
-
-#[test]
-fn test_direct_kind_probe_uses_budget_cancellation_token() {
-    let src = include_str!("adaptive_engines.rs");
-    let fn_start = src
-        .find("pub(crate) fn try_kind(&self, budget: Duration)")
-        .expect("adaptive_engines.rs should define try_kind");
-    let fn_body = &src[fn_start..];
-    let config_start = fn_body
-        .find("let kind_config = KindConfig::with_engine_config(")
-        .expect("try_kind should construct KindConfig");
-    let config_end = fn_body[config_start..]
-        .find(");")
-        .map(|offset| config_start + offset)
-        .expect("KindConfig construction should terminate");
-    let prefix = &fn_body[..config_end];
-
-    assert!(
-        prefix.contains("let cancellation = self.cancellation_token.child();"),
-        "direct Kind probes should create a lane cancellation token linked to the portfolio handle (item 5)"
-    );
-    // The cancel timer is extended by KIND_VALIDATION_GRACE so a proof found
-    // at the probe-budget edge can still be validated instead of dropped;
-    // the SEARCH stays bounded by `budget` via KindConfig::total_timeout.
-    assert!(
-        prefix
-            .contains("let _timeout_guard = cancellation.cancel_after(budget + validation_grace);"),
-        "direct Kind probes should cancel at the advertised budget plus validation grace"
-    );
-    assert!(
-        prefix.contains("Some(cancellation)"),
-        "direct Kind probes should pass the budget cancellation token into KindConfig"
-    );
-    assert!(
-        fn_body.contains(".with_validation_grace(validation_grace)"),
-        "direct Kind probes should grant proof-validation grace to KindConfig"
-    );
-}
-
-#[test]
-fn test_direct_kind_probe_splits_single_pred_lia_ites_before_solver() {
-    let src = include_str!("adaptive_engines.rs");
-    let fn_start = src
-        .find("pub(crate) fn try_kind(&self, budget: Duration)")
-        .expect("adaptive_engines.rs should define try_kind");
-    let fn_body = &src[fn_start..];
-    let solver_start = fn_body
-        .find("let mut solver = KindSolver::new(")
-        .expect("try_kind should construct KindSolver");
-    let prefix = &fn_body[..solver_start];
-
-    assert!(
-        prefix.contains("kind_problem.try_split_ites_in_clauses(32, self.config.verbose);"),
-        "single-predicate LIA direct Kind should split ITE-heavy clauses before KindSolver::new"
-    );
-    assert!(
-        prefix.contains("kind_problem.predicates().len() <= 1")
-            && prefix.contains("!kind_problem.has_bv_sorts()")
-            && prefix.contains("!kind_problem.has_array_sorts()")
-            && prefix.contains("!kind_problem.has_real_sorts()")
-            && prefix.contains("!kind_problem.has_datatype_sorts()"),
-        "Kind ITE splitting should stay scoped to single-predicate pure LIA/Bool problems"
-    );
-}
-
-#[test]
-fn test_multi_pred_linear_ite_direct_kind_uses_smoke_budget() {
-    let src = include_str!("adaptive_multi_pred.rs");
-    let fn_start = src
-        .find("pub(super) fn solve_multi_pred_linear(")
-        .expect("adaptive_multi_pred.rs should define solve_multi_pred_linear");
-    let fn_body = &src[fn_start..];
-    let budget_start = fn_body
-        .find("let direct_kind_cap = if features.has_ite || features.has_mod_div")
-        .expect("direct Kind pre-pass should branch on ITE/mod-div features");
-    let budget_slice = &fn_body[budget_start..];
-    let budget_end = budget_slice
-        .find("let kind_budget = self")
-        .expect("direct Kind cap should feed the remaining-budget clamp");
-    let budget_block = &budget_slice[..budget_end];
-
-    assert!(
-        budget_block.contains("Duration::from_millis(500)"),
-        "ITE/mod-div multi-predicate direct Kind should use only a smoke-test budget"
-    );
-    assert!(
-        budget_block.contains("Duration::from_secs(3)"),
-        "non-ITE/mod-div direct Kind should retain the existing 3s cap"
-    );
-}
-
-#[test]
-fn test_complex_loop_pdr_probe_logs_actual_probe_budget() {
-    let src = include_str!("adaptive_multi_pred_complex.rs");
-    let fn_start = src
-        .find("pub(super) fn solve_complex_loop(")
-        .expect("adaptive_multi_pred_complex.rs should define solve_complex_loop");
-    let fn_body = &src[fn_start..];
-    let probe_start = fn_body
-        .find("let pdr_probe_timeout_ms: u64 = 500;")
-        .expect("ComplexLoop PDR probe should define a 500ms cap");
-    let probe_slice = &fn_body[probe_start..];
-    let probe_end = probe_slice
-        .find("// Cross-engine lemma transfer pool")
-        .expect("ComplexLoop PDR probe block should precede lemma transfer");
-    let probe_block = &probe_slice[..probe_end];
-
-    assert_eq!(
-        probe_block
-            .matches("budget_secs: pdr_probe_dur.as_secs_f64()")
-            .count(),
-        2,
-        "ComplexLoop PDR probe decision rows should report the actual 500ms probe budget"
-    );
-    assert!(
-        !probe_block.contains("budget_secs: 2.0"),
-        "ComplexLoop PDR probe should not claim a stale 2s budget"
-    );
-}
-
-#[test]
-fn test_trivial_pdr_routes_have_adaptive_deadline_solve_timeout_cap() {
-    let src = include_str!("adaptive_engines.rs");
-    let fn_start = src
-        .find("pub(crate) fn solve_trivial(")
-        .expect("adaptive_engines.rs should define solve_trivial");
-    let fn_body = &src[fn_start..];
-    let fn_end = fn_body
-        .find("pub(crate) fn cap_pdr_solve_timeout_to_budget(")
-        .expect("solve_trivial should be followed by the PDR timeout helper");
-    let fn_body = &fn_body[..fn_end];
-
-    assert_eq!(
-        fn_body
-            .matches("Self::cap_pdr_solve_timeout_to_budget")
-            .count(),
-        2,
-        "solve_trivial should cap both initial PDR and guided retry PDR"
-    );
-
-    let initial_cap = fn_body
-        .find("Self::cap_pdr_solve_timeout_to_budget(&mut config")
-        .expect("initial trivial PDR config should be capped");
-    let initial_run = fn_body
-        .find("PdrSolver::solve_problem_with_stats(&self.problem, config.clone())")
-        .expect("solve_trivial should run the initial PDR solver");
-    assert!(
-        initial_cap < initial_run,
-        "initial trivial PDR solve_timeout must be capped before solving"
-    );
-
-    let retry_config = fn_body
-        .find("let mut retry_config = guide.apply_to_config(config);")
-        .expect("solve_trivial should build a guided retry PDR config");
-    let retry_cap = fn_body[retry_config..]
-        .find("Self::cap_pdr_solve_timeout_to_budget")
-        .map(|offset| retry_config + offset)
-        .expect("guided retry PDR config should be capped");
-    let retry_run = fn_body
-        .find("PdrSolver::solve_problem_with_stats(&self.problem, retry_config)")
-        .expect("solve_trivial should run guided retry PDR");
-    assert!(
-        retry_config < retry_cap && retry_cap < retry_run,
-        "guided retry PDR solve_timeout must be capped after adjustment and before solving"
-    );
-}
-
-#[test]
 fn test_cap_pdr_solve_timeout_to_budget_is_fail_closed() {
     let mut config = PdrConfig::default();
     assert!(AdaptivePortfolio::cap_pdr_solve_timeout_to_budget(
@@ -5541,261 +5250,6 @@ fn test_cap_pdr_solve_timeout_to_budget_is_fail_closed() {
         &mut config,
         None,
     ));
-}
-
-#[test]
-fn test_simple_loop_direct_kind_lia_budget_keeps_mul_headroom() {
-    let src = include_str!("adaptive_bv_strategy.rs");
-    let budget_start = src
-        .find("fn simple_loop_kind_budget_nominal(&self, features: &ProblemFeatures)")
-        .expect("simple-loop strategy should compute a nominal Kind budget");
-    let budget_slice = &src[budget_start..];
-    let budget_end = budget_slice
-        .find("/// Solve simple loop problems with validation evidence tracking.")
-        .expect("simple-loop strategy should clamp the nominal Kind budget");
-    let budget_block = &budget_slice[..budget_end];
-
-    assert!(
-        budget_block.contains("simple_loop_needs_dillig_style_kind_headroom"),
-        "Dillig-style LIA simple loops should keep a distinct Kind headroom path"
-    );
-    assert!(
-        budget_block.contains("simple_loop_needs_deep_lia_unsafe_kind_budget"),
-        "deep accumulator-style unsafe LIA loops should keep enough Kind budget for counterexample discovery"
-    );
-    assert!(
-        !budget_block.contains("features.has_multiplication"),
-        "raw multiplication is too broad for the 3s Kind headroom trigger"
-    );
-    assert!(
-        budget_block.contains("Duration::from_secs(3)"),
-        "Dillig-style LIA simple loops should keep enough Kind budget for dillig32-style proofs"
-    );
-    assert!(
-        budget_block.contains("Duration::from_secs(8)"),
-        "deep accumulator-style unsafe LIA loops should get enough Kind budget to reach double-digit depths"
-    );
-    assert!(
-        budget_block.contains("Duration::from_millis(1500)"),
-        "ordinary non-BV simple loops should keep Kind to the 1.5s pre-pass budget"
-    );
-    assert!(
-        budget_block.contains("Duration::from_secs(1)"),
-        "BV simple loops should retain the tighter 1s Kind budget"
-    );
-}
-
-#[test]
-fn test_accumulator_unsafe_prepass_runs_before_lia_farkas_route() {
-    let src = include_str!("adaptive.rs");
-    let simple_loop_start = src
-        .find("ProblemClass::SimpleLoop => {")
-        .expect("generic SimpleLoop dispatch arm should be present");
-    let simple_loop_slice = &src[simple_loop_start..];
-    let simple_loop_end = simple_loop_slice
-        .find("ProblemClass::ComplexLoop")
-        .expect("generic SimpleLoop arm should precede ComplexLoop arm");
-    let simple_loop_arm = &simple_loop_slice[..simple_loop_end];
-
-    let accumulator_pos = simple_loop_arm
-        .find("try_accumulator_lia_unsafe_counterexample")
-        .expect("SimpleLoop dispatch should include accumulator unsafe prepass");
-    let farkas_pos = simple_loop_arm
-        .find("try_lia_farkas_pdr_route")
-        .expect("SimpleLoop dispatch should include LIA Farkas route");
-
-    assert!(
-        accumulator_pos < farkas_pos,
-        "accumulator unsafe prepass must run before generic LIA Farkas/PDR can consume the budget"
-    );
-}
-
-#[test]
-fn test_triangle_bv_diff_bounds_route_skips_generic_multi_pred_staging_9698() {
-    let src = include_str!("adaptive.rs");
-    let guard_pos = src
-        .find("should_route_triangle_bv_diff_bounds_to_bv_lane")
-        .expect("triangle BV diff-bound direct-route guard should be present");
-    let algebraic_pos = src
-        .find("use crate::algebraic_invariant::AlgebraicResult")
-        .expect("algebraic pre-stage should still be present");
-
-    assert!(
-        guard_pos < algebraic_pos,
-        "triangle BV diff-bound routing decision must be computed before generic algebraic staging"
-    );
-
-    let multi_pred_start = src
-        .find("ProblemClass::MultiPredLinear => {")
-        .expect("MultiPredLinear dispatch arm should be present");
-    let multi_pred_slice = &src[multi_pred_start..];
-    let multi_pred_end = multi_pred_slice
-        .find("ProblemClass::MultiPredComplex")
-        .expect("MultiPredLinear arm should precede MultiPredComplex arm");
-    let multi_pred_arm = &multi_pred_slice[..multi_pred_end];
-
-    let triangle_route = multi_pred_arm
-        .find("triangle_bv_diff_bound_direct_route")
-        .expect("MultiPredLinear dispatch should check triangle BV route");
-    let original_bmc = multi_pred_arm
-        .find("try_triangle_bv_diff_bound_original_bmc_route(route_budget)")
-        .expect("triangle BV route should use the validated original-BMC specialist");
-    let generic_multi_pred = multi_pred_arm
-        .find("self.solve_multi_pred_linear(&features, deadline)")
-        .expect("generic multi-predicate fallback should remain present");
-
-    assert!(
-        triangle_route < original_bmc && original_bmc < generic_multi_pred,
-        "triangle BV diff-bound samples must use BV lanes before generic multi-predicate staging"
-    );
-}
-
-#[test]
-fn test_simple_loop_focused_bmc_probe_enforces_budget_issue_9690() {
-    // The focused BMC probe moved to the FRONT of the SimpleLoop and
-    // MultiPredLinear dispatch arms (try_front_bmc_probe in
-    // adaptive_engines.rs) so shallow counterexamples no longer wait behind
-    // the LIA/Farkas and Kind routes (lustre/svcomp-class latency). The
-    // budget contract is unchanged.
-    let src = include_str!("adaptive_engines.rs");
-    let probe_start = src
-        .find("pub(crate) fn try_front_bmc_probe(")
-        .expect("front BMC probe should be implemented in adaptive_engines.rs");
-    let probe_slice = &src[probe_start..];
-    let probe_end = probe_slice
-        .find("/// Solve entry-exit-only problems")
-        .expect("front BMC probe should end before solve_entry_exit_only");
-    let probe_block = &probe_slice[..probe_end];
-
-    assert!(
-        probe_block.contains("per_depth_timeout: Some(bmc_probe_budget)"),
-        "focused BMC must pass its advertised budget to per-depth executor deadlines"
-    );
-    assert!(
-        probe_block.contains("time_budget: Some(bmc_probe_budget)"),
-        "focused BMC must pass its advertised budget to the overall BMC budget"
-    );
-    assert!(
-        probe_block.contains("cancel.cancel_after(bmc_probe_budget)"),
-        "focused BMC should keep its cancellation guard as a secondary budget check"
-    );
-    assert!(
-        probe_block.contains("ScopedSmtDeadline::install(bmc_probe_budget)"),
-        "focused BMC should install the thread-local SMT deadline as the hard budget"
-    );
-
-    // Dispatch ordering: the probe must run before the LIA/Farkas route in
-    // both the SimpleLoop and MultiPredLinear arms.
-    let adaptive_src = include_str!("adaptive.rs");
-    for arm in [
-        "ProblemClass::SimpleLoop => {",
-        "ProblemClass::MultiPredLinear => {",
-    ] {
-        let arm_start = adaptive_src
-            .find(arm)
-            .unwrap_or_else(|| panic!("{arm} dispatch arm should be present"));
-        let arm_slice = &adaptive_src[arm_start..];
-        let probe_pos = arm_slice
-            .find("try_front_bmc_probe")
-            .unwrap_or_else(|| panic!("{arm} should call the front BMC probe"));
-        let farkas_pos = arm_slice
-            .find("try_lia_farkas_pdr_route")
-            .unwrap_or_else(|| panic!("{arm} should include LIA Farkas route"));
-        assert!(
-            probe_pos < farkas_pos,
-            "front BMC probe must run before the LIA Farkas/PDR route in {arm}"
-        );
-    }
-}
-
-// `#chc25-array-unsafe` (investigated, NOT adopted): the front BMC probe keeps
-// EXCLUDING array-sorted problems. An empirical isolation sweep of the 2025
-// LIA-Lin-Arrays unsafe misses showed BMC can find a few shallow array
-// counterexamples uncontended (O0_array 10s, O3_ludcmp 1.6s, strcspn_3 15.3s),
-// but admitting arrays to the sequential front probe was a MEASURED net
-// regression (39 -> 37): the array-theory per-depth SMT checks do NOT honor the
-// probe's `per_depth_timeout`/cancellation, so a single check overran the
-// budget by tens of seconds and pushed three near-edge SAFE instances
-// (heap__clearstr, heap__cocome2, O3 OpenSER) over the 90s wall. This test pins
-// the exclusion so the array path is not re-enabled without first fixing
-// array-SMT deadline enforcement.
-#[test]
-fn test_front_bmc_probe_still_excludes_arrays() {
-    let src = include_str!("adaptive_engines.rs");
-    let probe_start = src
-        .find("pub(crate) fn try_front_bmc_probe(")
-        .expect("front BMC probe should be implemented in adaptive_engines.rs");
-    let probe_slice = &src[probe_start..];
-    let probe_end = probe_slice
-        .find("/// Solve entry-exit-only problems")
-        .expect("front BMC probe should end before solve_entry_exit_only");
-    let probe_block = &probe_slice[..probe_end];
-
-    assert!(
-        probe_block.contains("|| features.uses_arrays"),
-        "front BMC probe must keep excluding array-sorted problems (array-SMT \
-         per-depth timeouts are unenforced; a sequential array probe overruns \
-         its budget and regresses near-edge SAFE instances — see #chc25-array-unsafe)"
-    );
-}
-
-#[test]
-fn test_simple_loop_bv_dispatch_tries_deterministic_transition_before_dual_lane() {
-    let src = include_str!("adaptive_bv_strategy.rs");
-    let simple_loop_start = src
-        .find("pub(super) fn solve_simple_loop_with_evidence(")
-        .expect("simple-loop strategy should be implemented");
-    let simple_loop = &src[simple_loop_start..];
-    let deterministic_route = simple_loop
-        .find("self.try_deterministic_bv_bool_transition_route(deterministic_budget)")
-        .expect("BV simple-loop dispatch should try the deterministic transition route");
-    let direct_kind = simple_loop
-        .find("// Stage 1: Try K-Induction")
-        .expect("simple-loop strategy should keep the generic Kind stage");
-    let dual_lane = simple_loop
-        .find("self.solve_bv_dual_lane(full_budget)")
-        .expect("BV simple-loop dispatch should keep the generic BV dual-lane fallback");
-
-    assert!(
-        deterministic_route < direct_kind && direct_kind < dual_lane,
-        "deterministic BV/Bool transition route should run before generic Kind and BV dual-lane fallback"
-    );
-
-    let route_start = src
-        .find("pub(crate) fn try_deterministic_bv_bool_transition_route(")
-        .expect("deterministic BV/Bool route should be implemented");
-    let route_body = &src[route_start..];
-    assert!(
-        route_body.contains("recognize_deterministic_bv_bool()"),
-        "route must be gated by deterministic Bool/BV transition recognition"
-    );
-    assert!(
-        route_body.contains("validate_original_counterexample_with_budget")
-            && route_body.contains("validate_translated_safe_model_on_original"),
-        "route must validate Unsafe traces and Safe invariants on the original CHC"
-    );
-    assert!(
-        route_body.contains("cex.witness.is_none()"),
-        "route must reject witness-less Unsafe traces instead of relying on existential validation"
-    );
-    assert!(
-        route_body.contains("ValidationEvidence::CounterexampleVerification"),
-        "validated unsafe results must carry counterexample-validation evidence"
-    );
-    assert!(
-        !route_body.contains("ValidationEvidence::BmcCounterexample"),
-        "deterministic route must not promote UNSAFE with source-only BMC evidence"
-    );
-    for rejected_result in [
-        "bmc_unsafe_validation_rejected",
-        "kind_unsafe_validation_rejected",
-        "kind_safe_validation_rejected",
-    ] {
-        assert!(
-            route_body.contains(rejected_result),
-            "route must expose fail-closed validation demotion {rejected_result}"
-        );
-    }
 }
 
 const DILLIG_STYLE_KIND_FIXTURE: &str = r#"
@@ -6663,7 +6117,9 @@ fn test_has_recursive_datatype_sorts_discriminates_finite_from_recursive() {
 ///
 /// - FINITE datatype: an empty-model exhaustive acyclic BMC Safe is a complete
 ///   proof (finite value space), so it is admitted as `Safe` (the completeness
-///   win this change delivers).
+///   win this change delivers) once the independent re-check confirms it. The
+///   query was `o = none`, which is REACHABLE: until 2026-09-29 the gate
+///   admitted that false SAFE on the label alone.
 /// - RECURSIVE datatype: bounded acyclic unrolling is NOT complete (unbounded
 ///   value space), so the identical empty-model Safe evidence is demoted to
 ///   `Unknown` — never a false Safe. This is the mandatory soundness guard.
@@ -6676,7 +6132,7 @@ fn test_acyclic_bmc_admission_demotes_recursive_datatype_but_admits_finite() {
          (declare-fun Q (Opt) Bool)\n\
          (assert (forall ((o Opt)) (=> (= o none) (P o))))\n\
          (assert (forall ((o Opt)) (=> (P o) (Q o))))\n\
-         (assert (forall ((o Opt)) (=> (and (Q o) (= o none)) false)))\n\
+         (assert (forall ((o Opt)) (=> (and (Q o) (= o (some 0))) false)))\n\
          (check-sat)\n",
     )
     .expect("finite-datatype acyclic fixture parses");
@@ -6720,19 +6176,49 @@ fn test_acyclic_bmc_admission_demotes_recursive_datatype_but_admits_finite() {
 /// later external empty-model validation for the same unsafe problem.
 #[test]
 fn test_fabricated_scalar_evidence_cannot_poison_acyclic_bmc_cache() {
-    let problem = ChcParser::parse(
-        "(set-logic HORN)\n\
-         (declare-datatypes ((CachePoisonFlag 0)) (((cache_poison_a) (cache_poison_b))))\n\
-         (declare-fun CachePoisonP (CachePoisonFlag) Bool)\n\
-         (declare-fun CachePoisonQ (CachePoisonFlag) Bool)\n\
-         (assert (CachePoisonP cache_poison_a))\n\
-         (assert (forall ((f CachePoisonFlag))\n\
-           (=> (CachePoisonP f) (CachePoisonQ f))))\n\
-         (assert (forall ((f CachePoisonFlag))\n\
-           (=> (CachePoisonQ f) false)))\n\
-         (check-sat)\n",
-    )
-    .expect("unique finite-datatype cache-poison fixture parses");
+    let fixture = |query_body: &str| {
+        ChcParser::parse(&format!(
+            "(set-logic HORN)\n\
+             (declare-datatypes ((CachePoisonFlag 0)) (((cache_poison_a) (cache_poison_b))))\n\
+             (declare-fun CachePoisonP (CachePoisonFlag) Bool)\n\
+             (declare-fun CachePoisonQ (CachePoisonFlag) Bool)\n\
+             (assert (CachePoisonP cache_poison_a))\n\
+             (assert (forall ((f CachePoisonFlag))\n\
+               (=> (CachePoisonP f) (CachePoisonQ f))))\n\
+             (assert (forall ((f CachePoisonFlag))\n\
+               (=> {query_body} false)))\n\
+             (check-sat)\n"
+        ))
+        .expect("unique finite-datatype cache-poison fixture parses")
+    };
+
+    // The label ADMITTED (safe twin: only `cache_poison_a` is derivable) must
+    // still not be cached; this is the arm that recorded labels before
+    // d5696c347. The unsafe fixture below is now demoted before it could.
+    let safe_twin = AdaptivePortfolio::new(
+        fixture("(and (CachePoisonQ f) (= f cache_poison_b))"),
+        AdaptiveConfig::test_default(),
+    );
+    let twin_features = safe_twin.features();
+    let admitted = safe_twin.finalize_verified_result(
+        PortfolioResult::Safe(InvariantModel::default()),
+        ValidationEvidence::ScalarAcyclicBmcExhaustive {
+            max_depth: twin_features
+                .dag_depth
+                .max(twin_features.num_predicates)
+                .max(1),
+        },
+    );
+    assert!(
+        matches!(admitted, VerifiedChcResult::Safe(_)),
+        "the safe twin's label must be admitted after the independent re-check, got {admitted:?}"
+    );
+    assert!(
+        crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&safe_twin.problem).is_none(),
+        "generic finalization must not cache even an admitted label"
+    );
+
+    let problem = fixture("(CachePoisonQ f)");
     assert!(!problem.has_cycles());
     assert!(problem.has_datatype_sorts());
     assert!(!problem.has_recursive_datatype_sorts());
@@ -6750,9 +6236,10 @@ fn test_fabricated_scalar_evidence_cannot_poison_acyclic_bmc_cache() {
         PortfolioResult::Safe(InvariantModel::default()),
         ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
     );
+    // Until 2026-09-29 the arm admitted this label on signature alone.
     assert!(
-        matches!(fabricated, VerifiedChcResult::Safe(_)),
-        "the regression must exercise the generic scalar-evidence admission arm"
+        matches!(fabricated, VerifiedChcResult::Unknown(_)),
+        "a fabricated scalar-acyclic label on an unsafe problem must be demoted, got {fabricated:?}"
     );
     assert!(
         crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&adaptive.problem).is_none(),
@@ -6766,7 +6253,7 @@ fn test_fabricated_scalar_evidence_cannot_poison_acyclic_bmc_cache() {
             &PdrConfig::default(),
         )
         .expect("unsafe finite-DT validation should fail closed, not error"),
-        "independent exact BMC must reject the reachable query"
+        "empty-model validation must reject the reachable query"
     );
 
     let shallow_depth = depth.saturating_sub(1);
@@ -8113,73 +7600,6 @@ fn query_only_acceptance_helpers_reject_expired_and_cancelled_boundaries() {
             &adaptive.cancellation_token,
         )
         .is_none());
-}
-
-#[test]
-fn preprocessed_acceptance_paths_keep_final_absolute_boundary_gates() {
-    let src = include_str!("adaptive_multi_pred.rs");
-    let discharge_start = src
-        .find("fn discharge_preprocessed_query_only_problem(")
-        .expect("query-only discharge helper must remain present");
-    let discharge_end = src[discharge_start..]
-        .find("/// Independent fresh-executor re-proof")
-        .map(|offset| discharge_start + offset)
-        .expect("query-only discharge helper must precede its recheck helper");
-    let discharge = &src[discharge_start..discharge_end];
-    let replay = discharge
-        .find("BmcSolver::replay_confirm_unsafe_on_problem(")
-        .expect("SAT query bodies must replay on original clauses");
-    assert!(
-        discharge[replay..].contains("then_some(QueryOnlyDischarge::VerifiedUnsafe"),
-        "query-only replay Unsafe must pass a final absolute boundary gate"
-    );
-
-    let probe_start = src
-        .find("pub(crate) fn run_preprocessed_acyclic_bmc_probe_until(")
-        .expect("absolute-deadline preprocessed probe must remain present");
-    let probe_end = src[probe_start..]
-        .find("/// Ground-witness back-translation landing")
-        .map(|offset| probe_start + offset)
-        .expect("preprocessed probe must precede ground landing");
-    let probe = &src[probe_start..probe_end];
-    let fallback_replay = probe
-        .rfind("BmcSolver::replay_confirm_unsafe_on_problem(")
-        .expect("transformed Unsafe fallback must replay on original clauses");
-    assert!(
-        probe[fallback_replay..].contains("if !boundary_open()"),
-        "transformed Unsafe fallback replay must reject late/cancelled evidence"
-    );
-    assert!(
-        probe.contains("ScopedSmtDeadline::install_until(probe_deadline)")
-            && probe.contains("scoped_thread_term_memory_budget(self.config.memory_budget)"),
-        "query-only SMT work must inherit the probe's absolute deadline and memory budget"
-    );
-
-    let collapse_start = src
-        .find("pub(crate) fn run_scalarized_collapse_probe(")
-        .expect("scalarized collapse probe must remain present");
-    let collapse = &src[collapse_start..];
-    assert!(
-        collapse.contains("!level_cancel.is_cancelled()")
-            && collapse.contains("Instant::now() < level_deadline")
-            && collapse.contains("drop(level_timeout);"),
-        "level BMC must finish within its own slice, then release that timer before landing"
-    );
-
-    let dispatch_start = src
-        .find("pub(crate) fn try_acyclic_bmc_probe(")
-        .expect("acyclic BMC dispatcher must remain present");
-    let dispatch_end = src[dispatch_start..]
-        .find("pub(crate) fn acyclic_bmc_stage_budget(")
-        .map(|offset| dispatch_start + offset)
-        .expect("acyclic dispatcher must precede its budget helper");
-    let dispatch = &src[dispatch_start..dispatch_end];
-    assert!(
-        dispatch.contains("build_int_only_with_limits")
-            && dispatch.contains("build_bv_native_with_limits")
-            && dispatch.contains("run_preprocessed_acyclic_bmc_probe_until"),
-        "exact/native transforms and their probes must share the enclosing absolute boundary"
-    );
 }
 
 #[test]

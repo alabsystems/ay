@@ -109,7 +109,7 @@ fn test_to_rational_float32_subnormal_max() {
     let val = FpModelValue::Fp {
         sign: false,
         exponent: 0,
-        significand: (1u64 << 23) - 1,
+        significand: (1u128 << 23) - 1,
         eb: 8,
         sb: 24,
     };
@@ -140,7 +140,7 @@ fn test_to_rational_float32_max_normal() {
     let val = FpModelValue::Fp {
         sign: false,
         exponent: 254,
-        significand: (1u64 << 23) - 1,
+        significand: (1u128 << 23) - 1,
         eb: 8,
         sb: 24,
     };

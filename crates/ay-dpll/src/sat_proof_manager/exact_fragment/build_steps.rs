@@ -333,10 +333,15 @@ impl SatProofManager<'_> {
         if !ay_core::misc_cli_flags().probe_cert_reject {
             return;
         }
-        for &lit in clause {
+        for &lit in clause.iter().take(32) {
             ay_core::safe_eprintln!(
-                "--probe-cert-reject: unauthenticated original clause {clause_id} literal: {}",
-                ay_proof::render_term_canonical(self.terms, lit)
+                "--probe-cert-reject: unauthenticated original clause {clause_id} literal_id={lit}"
+            );
+        }
+        if clause.len() > 32 {
+            ay_core::safe_eprintln!(
+                "--probe-cert-reject: {} literal IDs omitted",
+                clause.len() - 32
             );
         }
         let n = self.instance_derivations.map_or(0, HashMap::len);
@@ -353,9 +358,9 @@ impl SatProofManager<'_> {
             for (key, derivation) in map.iter().take(8) {
                 ay_core::safe_eprintln!(
                     "--probe-cert-reject: recorded instance key={} quantifier={} instance={}",
-                    ay_proof::render_term_canonical(self.terms, *key),
-                    ay_proof::render_term_canonical(self.terms, derivation.quantifier),
-                    ay_proof::render_term_canonical(self.terms, derivation.instance),
+                    key,
+                    derivation.quantifier,
+                    derivation.instance,
                 );
             }
         }

@@ -13,9 +13,10 @@
 //!
 //! ## Soundness contract
 //!
-//! * The pre-phase returns ONLY [`TheoryResult::Unsat`] (backed by an
+//! * The pre-phase returns [`TheoryResult::Unsat`] (backed by an
 //!   independently re-checkable degree-2 Positivstellensatz certificate, or a
-//!   syntactically-false atom) or `None`. It NEVER emits `Sat` and NEVER turns a
+//!   syntactically-false atom), terminal `Unknown` on cancellation, or `None`.
+//!   It NEVER emits `Sat` and NEVER turns a
 //!   satisfiable system into `Unsat`.
 //! * A SOS/Positivstellensatz refutation certifies infeasibility over the
 //!   **reals**; since ℤ ⊂ ℝ, real-infeasible ⇒ integer-infeasible, so the
@@ -25,15 +26,20 @@
 //!   *subset* refutes the whole conjunction — so skipping is sound *for UNSAT*.
 //!   It is never used to claim SAT (the pre-phase has no SAT path).
 //! * Any emitted certificate has already passed the module's independent
-//!   `verify` re-check ([`crate::sos::SosCertificate::verify`]) inside
-//!   [`crate::sos::search`]; a tampered certificate is rejected there.
+//!   `verify` re-check ([`crate::sos::SosCertificate::verify_with_progress`]) inside
+//!   [`crate::sos::search_with_progress`]; a tampered certificate is rejected there.
 
+#[cfg(test)]
+mod stop_tests;
 mod translation;
 
 use ay_core::term::TermId;
-use ay_core::{TheoryLit, TheoryResult};
+use ay_core::TheoryLit;
+#[cfg(test)]
+use ay_core::TheoryResult;
 
 use self::translation::is_nonlinear;
+use crate::sos::budget::SosProgress;
 use crate::sos::MultiConstraint;
 use crate::NiaSolver;
 
@@ -59,81 +65,126 @@ enum SosFragment {
     },
 }
 
+/// Keep a refused attempt distinct from ordinary incompleteness until its
+/// caller decides whether to enter another cascade phase.
+#[derive(Debug)]
+pub(crate) enum SosAttempt {
+    Declined,
+    Interrupted,
+    Refuted(Vec<TheoryLit>),
+}
+
+/// One asserted atom's cached translation outcome.
+#[derive(Clone)]
+pub(super) enum CachedSosAtom {
+    Constraint(MultiConstraint),
+    ConstTrue,
+    ConstFalse,
+    Unsupported,
+}
+
+/// Incremental SOS fragment cache: per-atom translations for a prefix
+/// of `asserted`, aligned 1:1 by index, each with the cumulative
+/// polynomial-budget counts and retained-term total AFTER that atom.
+/// Translation is a pure function of the atom, its asserted value and
+/// the cumulative budget, so a later build replays the prefix and
+/// translates only newly appended atoms, resuming the budget from
+/// the tip snapshot. `exhausted` records a deterministic budget
+/// exhaustion at the atom just past the tip. Maintained in lockstep
+/// with `asserted`: pop truncates both, reset clears both, and
+/// `tip_asserted` lets a build detect (and discard) any desync.
+#[derive(Default)]
+pub(crate) struct SosFragmentCache {
+    pub(super) entries: Vec<(CachedSosAtom, (usize, usize, usize), usize)>,
+    pub(super) exhausted: bool,
+    pub(super) tip_asserted: Option<(TermId, bool)>,
+}
+
+impl SosFragmentCache {
+    /// Truncate to the (already truncated) asserted set after a scope
+    /// pop, re-deriving the tip from the asserted entry the last cached
+    /// translation corresponds to.
+    pub(crate) fn truncate_to_asserted(&mut self, asserted: &[(TermId, bool)]) {
+        self.entries.truncate(asserted.len());
+        self.exhausted = false;
+        self.tip_asserted = self
+            .entries
+            .len()
+            .checked_sub(1)
+            .and_then(|idx| asserted.get(idx))
+            .copied();
+    }
+}
+
+enum SosWitness {
+    ConstFalse,
+    Certificate(crate::sos::SosCertificate),
+}
+
 impl NiaSolver<'_> {
-    /// Decision pre-phase: attempt to refute the current asserted set with a
-    /// degree-2 rational Positivstellensatz certificate. Returns
-    /// `Some(TheoryResult::Unsat(..))` when a certificate is found (and stored in
-    /// `self.last_unsat_certificate`) or when an asserted atom is syntactically
-    /// false; `None` otherwise. It NEVER returns `Sat`.
+    /// Test convenience preserves the pre-phase interruption as an explicit Unknown.
+    #[cfg(test)]
     pub(crate) fn try_sos_positivstellensatz_unsat(&mut self) -> Option<TheoryResult> {
-        match self.build_sos_fragment() {
-            SosFragment::Exhausted => None,
-            SosFragment::ConstFalse => {
-                // A syntactically-false asserted atom makes the whole conjunction
-                // unsatisfiable. This is a genuine UNSAT (no SOS certificate is
-                // attached for this degenerate, non-polynomial case).
-                Some(TheoryResult::Unsat(self.all_asserted_lits()))
-            }
-            SosFragment::System { constraints, vars } => {
-                if vars.is_empty() || vars.len() > MAX_SOS_VARS {
-                    return None;
-                }
-                // Nonlinearity gate: the degree-2 SOS/Positivstellensatz search
-                // only adds decision power when the system has a genuine
-                // nonlinear term. Purely linear/univariate systems are already
-                // decided completely by LIA and the univariate-integer decider,
-                // so building the LP and calling `search` on them is pure
-                // latency. Skip (return `None`) when no constraint is nonlinear.
-                if !constraints.iter().any(is_nonlinear) {
-                    return None;
-                }
-                // `search` runs the independent checker on its own output before
-                // returning, so a `Some(cert)` here is already verified.
-                let cert = crate::sos::search(&constraints, &vars)?;
-                if self.debug {
-                    safe_eprintln!("[NIA] {}", cert.summary());
-                }
-                self.last_unsat_certificate = Some(cert);
-                Some(TheoryResult::Unsat(self.all_asserted_lits()))
-            }
+        match self.try_sos_attempt() {
+            SosAttempt::Refuted(conflict) => Some(TheoryResult::Unsat(conflict)),
+            SosAttempt::Interrupted => Some(TheoryResult::Unknown),
+            SosAttempt::Declined => None,
         }
     }
 
-    /// Build a Positivstellensatz certificate for the current (already-refuted)
-    /// asserted set, or `None` if the degree-2 rational search does not find one.
-    /// Used to *attach* a replayable certificate to an UNSAT that some other NIA
-    /// path proved. Returns the certificate without emitting a verdict. The
-    /// returned certificate is guaranteed to have passed the independent checker
-    /// ([`crate::sos::SosCertificate::verify`]).
+    /// A refused callback ends this check even if a live stop later clears.
+    /// A refutation still requires a syntactically-false atom or a complete,
+    /// independently checked SOS certificate; this lane never emits SAT.
+    pub(crate) fn try_sos_attempt(&mut self) -> SosAttempt {
+        let allow = || !self.should_timeout();
+        let progress = SosProgress::new(&allow);
+        let witness = self.find_sos_witness(&progress);
+        if self.debug {
+            if let Some(SosWitness::Certificate(cert)) = &witness {
+                safe_eprintln!("[NIA] {}", cert.summary());
+            }
+        }
+        let decision = witness.map(|witness| (witness, self.full_conflict_lits()));
+        if !progress.poll() {
+            return SosAttempt::Interrupted;
+        }
+        let Some((witness, conflict)) = decision else {
+            return SosAttempt::Declined;
+        };
+        if let SosWitness::Certificate(cert) = witness {
+            self.last_unsat_certificate = Some(cert);
+        }
+        SosAttempt::Refuted(conflict)
+    }
+
+    /// Build a certificate for an UNSAT already decided by another path.
+    /// Refusal declines attachment without replacing that existing result.
     pub(crate) fn try_build_unsat_sos_certificate(&self) -> Option<crate::sos::SosCertificate> {
-        match self.build_sos_fragment() {
+        let allow = || !self.should_timeout();
+        let progress = SosProgress::new(&allow);
+        let Some(SosWitness::Certificate(cert)) = self.find_sos_witness(&progress) else {
+            return None;
+        };
+        progress.poll().then_some(cert)
+    }
+
+    fn find_sos_witness(&self, progress: &SosProgress<'_>) -> Option<SosWitness> {
+        match self.build_sos_fragment_with_progress(progress) {
             SosFragment::Exhausted => None,
-            // A degenerate constant-false UNSAT has no polynomial refutation to
-            // certify; leave the existing (non-SOS) UNSAT reason as-is.
-            SosFragment::ConstFalse => None,
+            SosFragment::ConstFalse => Some(SosWitness::ConstFalse),
             SosFragment::System { constraints, vars } => {
                 if vars.is_empty() || vars.len() > MAX_SOS_VARS {
                     return None;
                 }
-                // Same nonlinearity gate as the decision pre-phase: a linear /
-                // univariate system was decided elsewhere and carries no
-                // degree-2 Positivstellensatz certificate worth searching for.
+                // Purely linear fragments add no decision power in this lane.
                 if !constraints.iter().any(is_nonlinear) {
                     return None;
                 }
-                crate::sos::search(&constraints, &vars)
+                // No candidate reaches the caller without independent replay.
+                crate::sos::search_with_progress(&constraints, &vars, progress)
+                    .map(SosWitness::Certificate)
             }
         }
-    }
-
-    /// All asserted literals as a `TheoryResult::Unsat` conflict clause. The full
-    /// asserted set is a sound (if not necessarily minimal) UNSAT core for a
-    /// refutation that may weaken the system by skipping atoms.
-    fn all_asserted_lits(&self) -> Vec<TheoryLit> {
-        self.asserted
-            .iter()
-            .map(|&(term, value)| TheoryLit { term, value })
-            .collect()
     }
 }
 
@@ -421,6 +472,55 @@ mod tests {
         };
         assert_eq!(constraints.len(), 1);
         assert!(certificate.verify(&constraints).is_ok());
+    }
+
+    /// The incremental fragment cache translates each asserted prefix
+    /// once: repeat builds reuse it, appending translates only the new
+    /// atom, and pop truncates it in lockstep with `asserted`.
+    #[test]
+    fn sos_fragment_cache_extends_and_truncates_with_asserted() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let one = terms.mk_int(BigInt::from(1));
+        let xx = terms.mk_mul(vec![x, x]);
+        let a0 = terms.mk_ge(xx, zero); // x^2 >= 0
+        let a1 = terms.mk_ge(x, one); // x >= 1
+        let a2 = terms.mk_ge(y, one); // y >= 1
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.assert_literal(a0, true);
+        solver.assert_literal(a1, true);
+        let super::SosFragment::System { constraints, .. } = solver.build_sos_fragment() else {
+            panic!("satisfiable fragment must build");
+        };
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(solver.sos_fragment_cache.borrow().entries.len(), 2);
+
+        // Identical rebuild: no new translations.
+        let super::SosFragment::System { constraints, .. } = solver.build_sos_fragment() else {
+            panic!("cached rebuild must succeed");
+        };
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(solver.sos_fragment_cache.borrow().entries.len(), 2);
+
+        // Append under a scope: exactly one more entry.
+        solver.push();
+        solver.assert_literal(a2, true);
+        let super::SosFragment::System { constraints, .. } = solver.build_sos_fragment() else {
+            panic!("extended fragment must build");
+        };
+        assert_eq!(constraints.len(), 3);
+        assert_eq!(solver.sos_fragment_cache.borrow().entries.len(), 3);
+
+        // Pop truncates cache and asserted set together.
+        solver.pop();
+        assert_eq!(solver.sos_fragment_cache.borrow().entries.len(), 2);
+        let super::SosFragment::System { constraints, .. } = solver.build_sos_fragment() else {
+            panic!("post-pop fragment must build");
+        };
+        assert_eq!(constraints.len(), 2);
     }
 
     #[test]

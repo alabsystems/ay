@@ -150,18 +150,26 @@ impl Solver {
             }
         }
 
+        // Marked variables not yet reached by the walk: the walk ends when
+        // none is left (see `vivify_analyze_conflict`).
+        let mut pending = 0usize;
         if implied_var < num_vars {
             self.vivify_analyzed[implied_var] = true;
             self.vivify_analyzed_to_clear.push(implied_var);
+            pending += 1;
         }
 
-        for i in (0..self.trail.len()).rev() {
+        for i in (self.first_decision_trail_index()..self.trail.len()).rev() {
+            if pending == 0 {
+                break;
+            }
             let lit = self.trail[i];
             let var_idx = lit.variable().index();
             if var_idx >= num_vars || !self.vivify_analyzed[var_idx] {
                 continue;
             }
             self.vivify_analyzed[var_idx] = false;
+            pending -= 1;
 
             if self.var_data[var_idx].level == 0 {
                 continue;
@@ -253,6 +261,7 @@ impl Solver {
                         } else if !self.vivify_analyzed[rv] {
                             self.vivify_analyzed[rv] = true;
                             self.vivify_analyzed_to_clear.push(rv);
+                            pending += 1;
                         }
                     }
                 }
@@ -323,6 +332,8 @@ impl Solver {
         let mut necessary_decisions: Vec<usize> = Vec::new();
         let mut reason_chain: Vec<u64> = Vec::new();
         let mut uses_redundant = false;
+        // Marked variables not yet reached by the backward walk.
+        let mut pending = 0usize;
 
         // Mark candidate literals in backbone_seen for polarity-aware subsumption
         // detection during backward analysis (CaDiCaL vivify_analyze vivify.cpp:587).
@@ -368,22 +379,31 @@ impl Solver {
                         self.min.minimize_flags[rv] |= LRAT_A;
                         self.min.lrat_to_clear.push(rv);
                     }
-                } else {
+                } else if !self.vivify_analyzed[rv] {
                     self.vivify_analyzed[rv] = true;
                     self.vivify_analyzed_to_clear.push(rv);
+                    pending += 1;
                 }
             }
         }
 
-        // Walk trail backward (CaDiCaL vivify_analyze pattern).
+        // Walk trail backward (CaDiCaL vivify_analyze pattern), above level 0
+        // only and until no marked variable is pending. Only variables above
+        // level 0 are marked, so nothing the walk skips was work: on b54b26f3
+        // the trail starts with 3.01M root-level literals, and walking them for
+        // every vivified clause took 33 percent of vivification's time.
         let trail_len = self.trail.len();
-        for i in (0..trail_len).rev() {
+        for i in (self.first_decision_trail_index()..trail_len).rev() {
+            if pending == 0 {
+                break;
+            }
             let lit = self.trail[i];
             let var_idx = lit.variable().index();
             if var_idx >= num_vars || !self.vivify_analyzed[var_idx] {
                 continue;
             }
             self.vivify_analyzed[var_idx] = false;
+            pending -= 1;
 
             if self.var_data[var_idx].level == 0 {
                 continue;
@@ -485,6 +505,7 @@ impl Solver {
                         } else if !self.vivify_analyzed[rv] {
                             self.vivify_analyzed[rv] = true;
                             self.vivify_analyzed_to_clear.push(rv);
+                            pending += 1;
                         }
                     }
                 }
@@ -515,5 +536,12 @@ impl Solver {
         }
 
         (necessary_decisions, reason_chain, uses_redundant, None)
+    }
+
+    /// Trail index of the first decision: everything before it is a root-level
+    /// assignment. The trail length when there is no decision.
+    #[inline]
+    fn first_decision_trail_index(&self) -> usize {
+        self.trail_lim.first().copied().unwrap_or(self.trail.len())
     }
 }

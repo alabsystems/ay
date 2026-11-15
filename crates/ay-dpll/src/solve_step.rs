@@ -22,6 +22,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
         let mut refinements = 0usize;
         loop {
             self.timings.round_trips += 1;
+            ay_core::resource::work().note_round_trip();
             let result = {
                 let _t = PhaseTimer::new(&mut self.timings.sat_solve);
                 // Use a phase-hint extension so the theory solver's suggest_phase
@@ -128,6 +129,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
                 return Ok(SolveStepResult::Done(SatResult::Unknown));
             }
             self.timings.round_trips += 1;
+            ay_core::resource::work().note_round_trip();
             let result = {
                 if self.sat.scope_depth() == 0 {
                     let _t = PhaseTimer::new(&mut self.timings.sat_solve);

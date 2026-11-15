@@ -1,0 +1,16 @@
+pseudo-Boolean proof version 3.0
+% THE OPPOSITE-VERDICT COMPANION, same formula and same binary. The formula has THREE
+% solutions over its preserved set {x1,x2}; here they are, excluded one at a time with
+% `solx`, after which the database really is contradicting and the enumeration really is
+% complete. This is what `conclusion ENUMERATION_COMPLETE` is for, and it verifies before
+% and after the fix — the fix only refuses the count when an OBJECTIVE-RESTRICTING
+% constraint is doing the contradicting.
+f 1 ;
+solx x1 x2 ;
+solx x1 ~x2 ;
+solx ~x1 x2 ;
+rup 1 ~x1 >= 1 ;
+rup >= 1 ;
+output NONE ;
+conclusion ENUMERATION_COMPLETE 3 ;
+end pseudo-Boolean proof;

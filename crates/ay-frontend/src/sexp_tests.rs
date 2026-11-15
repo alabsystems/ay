@@ -63,6 +63,35 @@ fn strings_reject_non_whitespace_control_characters() {
     );
 }
 
+/// A RAW character in the surrogate carrier block `U+10D800..=U+10DFFF` is
+/// refused: stored as-is it would read back as the surrogate it carries, so
+/// `(= "<raw U+10D800>" "\u{d800}")` was `sat` (2026-09-28 fp-strings
+/// verifier, `rawcarrier_*`). The escape itself, and raw characters beside
+/// the block, still parse.
+#[test]
+fn strings_reject_a_raw_surrogate_carrier_character() {
+    for raw in ['\u{10D800}', '\u{10D801}', '\u{10DFFF}'] {
+        let error = parse_sexp(&format!("\"a{raw}b\""))
+            .expect_err("a raw carrier-block character must be refused");
+        assert!(
+            error.message.contains("reserves to carry the surrogate"),
+            "{raw:?}: {}",
+            error.message
+        );
+    }
+    let escaped = parse_sexp(r#""\u{d800}""#).expect("a surrogate escape is legal");
+    assert_eq!(
+        escaped,
+        SExpr::String(ay_core::unescape_string_contents(r"\u{d800}"))
+    );
+    for raw in ['\u{10D7FF}', '\u{10E000}', '\u{30000}'] {
+        assert_eq!(
+            parse_sexp(&format!("\"{raw}\"")).expect("outside the carrier block"),
+            SExpr::String(raw.to_string())
+        );
+    }
+}
+
 #[test]
 fn test_parse_symbol() {
     let sexp = parse_sexp("foo").unwrap();
@@ -400,3 +429,32 @@ fn test_deep_nesting_100000_succeeds() {
 }
 
 include!("sexp_tests/round_trip.rs");
+
+/// z3 5.1.0, cvc5 1.4.1 and pinned Carcara 1.1.0 scan an UNQUOTED `-1` as the
+/// negative numeral; only the quoted `|-1|` is the symbol. The parser keeps
+/// the two apart, and a symbol named `-1` prints quoted so it reads back as
+/// a symbol.
+#[test]
+fn an_unquoted_negative_literal_is_a_number_and_the_quoted_one_a_symbol() {
+    for (text, expected) in [
+        ("-1", SExpr::Numeral("-1".to_string())),
+        ("-0", SExpr::Numeral("-0".to_string())),
+        ("-007", SExpr::Numeral("-007".to_string())),
+        ("-2.5", SExpr::Decimal("-2.5".to_string())),
+        ("|-1|", SExpr::Symbol("-1".to_string())),
+        ("|-2.5|", SExpr::Symbol("-2.5".to_string())),
+        ("-1a", SExpr::Symbol("-1a".to_string())),
+        ("-.5", SExpr::Symbol("-.5".to_string())),
+        ("-5.", SExpr::Symbol("-5.".to_string())),
+        ("-1e3", SExpr::Symbol("-1e3".to_string())),
+        ("-", SExpr::Symbol("-".to_string())),
+        ("--1", SExpr::Symbol("--1".to_string())),
+    ] {
+        assert_eq!(parse_sexp(text).unwrap(), expected, "{text}");
+    }
+    let symbol = SExpr::Symbol("-1".to_string());
+    assert_eq!(symbol.to_string(), "|-1|");
+    assert_eq!(symbol.to_raw_string(), "|-1|");
+    assert_eq!(parse_sexp(&symbol.to_raw_string()).unwrap(), symbol);
+    assert_eq!(SExpr::Numeral("-1".to_string()).to_raw_string(), "-1");
+}

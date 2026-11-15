@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Regression test: normalizing `-1 x1 >= i64::MAX` flips the term to `1 ~x1` and raises
+% the degree to i64::MAX + 1, which used to wrap to i64::MIN and turned the infeasible
+% input constraint into a trivially true one. The instance has no solution.
+f 1 ;
+output NONE;
+conclusion SAT : x1 ;
+end pseudo-Boolean proof;

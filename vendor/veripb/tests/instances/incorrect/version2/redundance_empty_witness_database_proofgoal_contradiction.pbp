@@ -1,0 +1,25 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): the differential partner of
+* correct/version2/redundance_empty_witness_proofgoal_contradiction. Same
+* formula, same `red` with an empty witness, but the subproof discharges a
+* DATABASE proofgoal instead of goal `#1`.
+*
+* Discharging database goal 1 shows `DB /\ ~C /\ ~C_1 |- false`, and since
+* `C_1` is in `DB` its negation is refuted for free -- it says nothing about
+* `DB /\ ~C`. `end_proofgoal` used to set `contradiction_proven` for ANY
+* discharged goal inside a proof-by-contradiction subproof, so this bought the
+* whole subproof and `red` added the empty contradiction `>= 1`. The formula
+* here happens to be unsatisfiable, so the verdict is not itself wrong -- what
+* is wrong is that the step is licensed at all, and
+* incorrect/version2/redundance_empty_witness_proofgoal_not_contradiction shows
+* the same move refuting a SATISFIABLE formula.
+f 4
+red >= 1 ; ; begin
+	proofgoal 1
+		p -1 1 +
+	end -1
+end
+u >= 1 ;
+output NONE
+conclusion UNSAT : -1
+end pseudo-Boolean proof

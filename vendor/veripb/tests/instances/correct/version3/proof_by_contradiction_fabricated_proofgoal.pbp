@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to
+% incorrect/version3/proof_by_contradiction_fabricated_proofgoal, which refutes
+% this formula: record that `x1 = 1, x2 = 0` satisfies it.
+f 2;
+output NONE;
+conclusion SAT : x1 ~x2;
+end pseudo-Boolean proof;

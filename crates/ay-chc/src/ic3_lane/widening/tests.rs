@@ -225,3 +225,5 @@ fn property_above_resource_cap_declines_fail_closed() {
         "a property above the capped original width must decline, never prove"
     );
 }
+
+mod resources;

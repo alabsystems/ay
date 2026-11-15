@@ -51,7 +51,7 @@
 
 mod visit;
 
-use visit::{dead_pattern, first_zero, period_pattern, visit_clause, visit_xor};
+use visit::{dead_pattern, first_zero, period_pattern, visit_and, visit_clause, visit_xor};
 
 /// log2 of the number of assignments evaluated per block.
 ///
@@ -76,6 +76,9 @@ type Bits = [u64; ENUM_WORDS];
 pub(super) const KIND_CLAUSE: u8 = 0;
 /// XOR constraint: an ODD number of its literals must be true.
 pub(super) const KIND_XOR: u8 = 1;
+/// AND gate `[o, a, b]`: `o <-> a & b`, the three clauses `(¬o ∨ a)`,
+/// `(¬o ∨ b)`, `(o ∨ ¬a ∨ ¬b)` in one visit (`--sat-indep-enum-and`).
+pub(super) const KIND_AND: u8 = 2;
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +295,14 @@ impl BitEnum {
                     prop_unsat,
                     assign,
                     xbuf,
+                )
+            } else if self.kinds[cidx] == KIND_AND {
+                visit_and(
+                    &mut self.pos,
+                    &self.lits[s..e],
+                    &mut self.dirty,
+                    &mut self.touched,
+                    prop_unsat,
                 )
             } else {
                 visit_clause(

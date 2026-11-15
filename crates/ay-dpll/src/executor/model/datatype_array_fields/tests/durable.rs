@@ -403,7 +403,7 @@ fn authored_selector_observation_invalidates_free_field(fixture: &mut Fixture) {
     let read = fixture.executor.ctx.terms.mk_select(app, zero);
     let false_term = fixture.executor.ctx.terms.false_term();
     let observation = fixture.executor.ctx.terms.mk_eq(read, false_term);
-    let mut roots = fixture.executor.independent_gate_query_roots();
+    let mut roots = fixture.executor.independent_gate_query_roots().unwrap();
     roots.push(observation);
     fixture.executor.independent_gate_authored_assertions = Some(roots);
     let required = fixture

@@ -28,6 +28,22 @@ use num_traits::{One, Zero};
 
 use super::*;
 
+/// Joint justification of a McCormick facet built from two side bounds
+/// (#nia-mccormick-reasons): the union of both sides' reason atoms with
+/// their asserted polarities. Empty when EITHER side carries no reason
+/// atoms — conditioning the cut on only one side's reasons would claim
+/// the other bound holds unconditionally, which we cannot check here,
+/// so we keep the historical sentinel path in that case.
+fn joint_bound_reasons(a: &[(TermId, bool)], b: &[(TermId, bool)]) -> Vec<(TermId, bool)> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut reasons: Vec<(TermId, bool)> = a.iter().copied().chain(b.iter().copied()).collect();
+    reasons.sort_unstable_by_key(|&(t, v)| (t, v));
+    reasons.dedup();
+    reasons
+}
+
 impl NiaSolver<'_> {
     /// Add a single McCormick bound: m - a*y - b*x [cmp] -a*b
     ///
@@ -96,64 +112,52 @@ impl NiaSolver<'_> {
             None => return 0,
         };
 
-        let lra = self.lia.lra_solver_mut();
+        let mut lra = self.lia.lra_solver_mut();
         let vars = (
             lra.ensure_var_registered(m),
             lra.ensure_var_registered(x),
             lra.ensure_var_registered(y),
         );
 
-        // Joint justification of an envelope built from bounds `a` and `b`
-        // (#nia-mccormick-reasons): the union of both bounds' reason atoms
-        // with their asserted polarities. Empty when EITHER bound carries no
-        // reason atoms — conditioning the cut on only one side's reasons
-        // would claim the other bound holds unconditionally, which we cannot
-        // check here, so we keep the historical sentinel path in that case.
-        let joint_reasons = |a: &ay_lra::Bound, b: &ay_lra::Bound| -> Vec<(TermId, bool)> {
-            if a.reasons.is_empty() || b.reasons.is_empty() {
-                return Vec::new();
-            }
-            let mut reasons: Vec<(TermId, bool)> = a
-                .reasons
-                .iter()
-                .copied()
-                .zip(a.reason_values.iter().copied())
-                .chain(
-                    b.reasons
-                        .iter()
-                        .copied()
-                        .zip(b.reason_values.iter().copied()),
-                )
-                .collect();
-            reasons.sort_unstable_by_key(|&(t, v)| (t, v));
-            reasons.dedup();
-            reasons
-        };
+        let (x_contracted_lo, x_contracted_hi) = self
+            .contracted_bounds
+            .get(&x)
+            .copied()
+            .unwrap_or((None, None));
+        let (y_contracted_lo, y_contracted_hi) = self
+            .contracted_bounds
+            .get(&y)
+            .copied()
+            .unwrap_or((None, None));
+        let xl = self.pick_mccormick_side(&x_lb, x_contracted_lo, true);
+        let xu = self.pick_mccormick_side(&x_ub, x_contracted_hi, false);
+        let yl = self.pick_mccormick_side(&y_lb, y_contracted_lo, true);
+        let yu = self.pick_mccormick_side(&y_ub, y_contracted_hi, false);
 
         let mut count = 0;
 
         // Lower bound 1: m >= xL*y + yL*x - xL*yL
-        if let (Some(ref xl), Some(ref yl)) = (&x_lb, &y_lb) {
-            let reasons = joint_reasons(xl, yl);
-            self.add_mccormick_bound(m, vars, &xl.value_big(), &yl.value_big(), true, reasons);
+        if let (Some((xlv, xlr)), Some((ylv, ylr))) = (&xl, &yl) {
+            let reasons = joint_bound_reasons(xlr, ylr);
+            self.add_mccormick_bound(m, vars, xlv, ylv, true, reasons);
             count += 1;
         }
         // Lower bound 2: m >= xU*y + yU*x - xU*yU
-        if let (Some(ref xu), Some(ref yu)) = (&x_ub, &y_ub) {
-            let reasons = joint_reasons(xu, yu);
-            self.add_mccormick_bound(m, vars, &xu.value_big(), &yu.value_big(), true, reasons);
+        if let (Some((xuv, xur)), Some((yuv, yur))) = (&xu, &yu) {
+            let reasons = joint_bound_reasons(xur, yur);
+            self.add_mccormick_bound(m, vars, xuv, yuv, true, reasons);
             count += 1;
         }
         // Upper bound 1: m <= xU*y + yL*x - xU*yL
-        if let (Some(ref xu), Some(ref yl)) = (&x_ub, &y_lb) {
-            let reasons = joint_reasons(xu, yl);
-            self.add_mccormick_bound(m, vars, &xu.value_big(), &yl.value_big(), false, reasons);
+        if let (Some((xuv, xur)), Some((ylv, ylr))) = (&xu, &yl) {
+            let reasons = joint_bound_reasons(xur, ylr);
+            self.add_mccormick_bound(m, vars, xuv, ylv, false, reasons);
             count += 1;
         }
         // Upper bound 2: m <= xL*y + yU*x - xL*yU
-        if let (Some(ref xl), Some(ref yu)) = (&x_lb, &y_ub) {
-            let reasons = joint_reasons(xl, yu);
-            self.add_mccormick_bound(m, vars, &xl.value_big(), &yu.value_big(), false, reasons);
+        if let (Some((xlv, xlr)), Some((yuv, yur))) = (&xl, &yu) {
+            let reasons = joint_bound_reasons(xlr, yur);
+            self.add_mccormick_bound(m, vars, xlv, yuv, false, reasons);
             count += 1;
         }
 
@@ -166,6 +170,45 @@ impl NiaSolver<'_> {
         }
 
         count
+    }
+
+    /// Per-side bound selection for one McCormick factor
+    /// (#nia-mccormick-contracted-bounds): keep the tighter of the LRA's
+    /// stored bound and this check's interval-contracted endpoint. The
+    /// LRA bound can be strictly weaker when the tight bound flows
+    /// through a compound linear equality (`main - 3 = 0 ∧ c + main
+    /// <= 0`): the simplex keeps `c <= 0` (sentinel-reasoned) while the
+    /// contractor derives `c <= -3`, and the missing `-3*y` facet is
+    /// exactly what the VeryMax Farkas refutations need. A contracted
+    /// endpoint is justified by the asserted literals as a whole; an
+    /// LRA bound keeps its own reason atoms. Ties keep the LRA side
+    /// (narrower reasons).
+    fn pick_mccormick_side(
+        &self,
+        lra_bound: &Option<ay_lra::Bound>,
+        contracted: Option<i64>,
+        is_lower: bool,
+    ) -> Option<(BigRational, Vec<(TermId, bool)>)> {
+        let lra_side = lra_bound.as_ref().map(|b| {
+            (
+                b.value_big(),
+                b.reasons
+                    .iter()
+                    .copied()
+                    .zip(b.reason_values.iter().copied())
+                    .collect::<Vec<(TermId, bool)>>(),
+            )
+        });
+        let contracted_side =
+            contracted.map(|v| (BigRational::from_integer(v.into()), self.asserted.clone()));
+        match (lra_side, contracted_side) {
+            (Some(l), Some(c)) => {
+                let contracted_tighter = if is_lower { c.0 > l.0 } else { c.0 < l.0 };
+                Some(if contracted_tighter { c } else { l })
+            }
+            (Some(l), None) => Some(l),
+            (None, c) => c,
+        }
     }
 
     /// Add a tangent hyperplane constraint for a general degree-N monomial.
@@ -517,6 +560,11 @@ impl NiaSolver<'_> {
     /// Apply enhanced refinement: McCormick pairwise decomposition and secant
     /// cuts for monomials that the basic tangent planes cannot handle well.
     /// Returns the total number of constraints added. (#8453)
+    ///
+    /// The pairwise decomposition fixes the remaining factors at their MODEL
+    /// values, so it is a model-point guess like a tangent plane; like every
+    /// other guess it carries the monomial term as its reason and can never
+    /// reach a verdict (#nia-sign-cut-soundness, see `check_loop.rs`).
     pub(crate) fn apply_enhanced_refinement(&mut self) -> usize {
         let mut count = 0;
 

@@ -42,7 +42,7 @@ fn check_optimality_tree(
     model: &Model,
     claimed: Option<&BigRational>,
 ) -> (bool, String) {
-    let Some(root) = &certificate.opt_tree else {
+    let Some(body) = &certificate.opt_tree_body else {
         return (false, "claim names an opttree block that is absent".into());
     };
     let Some(claimed) = claimed else {
@@ -51,8 +51,10 @@ fn check_optimality_tree(
             "an optimality-tree claim has no verdict value to be priced against".into(),
         );
     };
-    match verify_optimality_tree_bound(model, claimed, root) {
-        Ok(()) => (
+    // STREAMED: one leaf resident at a time. See `Certificate::opt_tree_body`
+    // for why building the tree here was a ceiling on what could be checked.
+    match verify_opt_tree_body(model, claimed, body) {
+        Ok(_) => (
             true,
             "every leaf of the split tree was re-priced in exact rational arithmetic at a box \
              reconstructed from the re-parsed model's own column bounds intersected with the \

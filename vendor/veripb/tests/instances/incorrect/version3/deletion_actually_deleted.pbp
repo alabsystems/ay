@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+f 2;
+pol 1 2 +;
+pol 1 2 +;
+del id 3;
+e 2 x1 2 x2 2 ~x3 >= 3 : 3;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

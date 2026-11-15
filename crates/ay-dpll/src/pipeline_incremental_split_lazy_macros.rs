@@ -24,13 +24,12 @@ macro_rules! pipeline_incremental_split_lazy_arm {
         post_theory_export: |$export_theory:ident| $export_expr:expr
         $(, pre_iter_check: |$pic_self:ident| $pic_expr:expr)?
         $(, per_round_shadow: |$sh_result:ident, $sh_lits:ident, $sh_atoms:ident, $sh_lemmas:ident| $sh_expr:expr)?
+        $(, retain_primary_conflicts: $retain_primary:expr)?
+        $(, retain_primary_after: $retain_after:expr)?
         $(, max_string_lemma_requests: $max_slr:expr,
            handle_string_lemma: |$sl_lemma:ident, $sl_negations:ident| $sl_handler:expr)?
     ) => {{
-#[cfg(not(kani))]
         // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-#[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
         use ay_sat::{Literal as SatLiteral, SatResult, Solver as SatSolver, Variable as SatVariable};
@@ -105,6 +104,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             .$sat_field
             .as_mut()
             .expect(concat!("incremental ", $tag, " should initialize persistent SAT solver"));
+        // Lane opt-in for replay-ledger retention of primary split
+        // conflicts (default off; set on EVERY entry because the
+        // persistent solver is shared across lanes in one session).
+        // See DR-AY-SPLIT-PRIMARY-RETAINED-REVERT-20261111.
+        let _islp_retain_primary_conflicts = false;
+        $(let _islp_retain_primary_conflicts = $retain_primary;)?
+        solver.set_retain_primary_theory_conflicts(_islp_retain_primary_conflicts);
+        // Escalated retention budget for this entry (default disarmed;
+        // also reset on EVERY entry for the same shared-solver reason).
+        // See DR-AY-LIRA-RETAIN-ESCALATION-20261113.
+        let _islp_retain_primary_after: Option<u64> = None;
+        $(let _islp_retain_primary_after: Option<u64> = Some($retain_after);)?
+        solver.set_retain_primary_escalation(_islp_retain_primary_after);
         // SMT push/pop owns the persistent solver's outer scopes via
         // IncrementalTheoryState::{push,pop}. The lazy split loop adds exactly
         // one private frame per check-sat, and every exit-path pop below
@@ -130,8 +142,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
         // Local variable maps grow as splits are added
         let mut local_term_to_var: HashMap<TermId, u32> = base_term_to_var;
-        let mut local_next_var: u32 = u32::try_from(solver.user_num_vars() + solver.scope_depth())
-            .expect("SAT solver variable count does not fit in u32");
+        // Seed from the solver's TOTAL variable count, never
+        // `user_num_vars() + scope_depth()`: that sum omits the DEAD scope
+        // selectors a persistent solver accumulates across pop(), and handing
+        // one of those (forced TRUE at level 0) to a split atom produced a
+        // false UNSAT — see `split_incremental::fresh_sat_var_floor`.
+        let mut local_next_var: u32 =
+            $crate::executor::theories::split_incremental::fresh_sat_var_floor(&solver);
         let base_vars: HashSet<u32> = base_var_to_term.keys().copied().collect();
         let mut _islp_added_split_clauses: HashSet<
             $crate::executor::theories::split_incremental::SplitClauseKey,
@@ -151,6 +168,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // `MAX_UNPRODUCTIVE_CONFLICT_ROUNDS`).
         let mut _islp_unproductive_conflict_rounds: usize = 0;
         let mut _islp_total_unproductive_rounds: usize = 0;
+        let mut _islp_legacy_rule_counted = false;
 
         // Split value trends for unbounded oscillation detection
         let mut _islp_last_split_values: $crate::executor::theories::solve_harness::SplitOscillationMap = HashMap::default();
@@ -218,6 +236,39 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             let mut _islp_shadow_lits: Vec<(TermId, bool)> =
                 { let _ = stringify!($sh_expr); Vec::new() };
         )?
+        // Hand-over from the earlier ground solves of this query
+        // (`ground_solve_carry`): their theory conflicts as clauses and their
+        // last assignment as decision phases, so the first model here is the
+        // last solve's model wherever the new assertions allow it. Every
+        // carried conflict was refuted by the theory on its own, with no
+        // assertion, support literal or scope, so its clause holds in every
+        // theory model and this solve keeps every model it has (the module
+        // docs give the argument); phases only order the search. Off in a
+        // proof-tracked solve and in every evidence re-solve
+        // (`ground_solve_carry_active`).
+        let _islp_carry_on = $self.ground_solve_carry_active(proof_enabled);
+        let mut _islp_last_assignment: Vec<bool> = Vec::new();
+        // Conflict clauses and phases this loop was handed, for the
+        // `[split-round]` trace line.
+        let mut _islp_carried_in: (usize, usize) = (0, 0);
+        if _islp_carry_on {
+            _islp_carried_in.0 =
+                $crate::executor::theories::split_incremental::replay_carried_conflicts(
+                    &$self.ctx.terms,
+                    solver,
+                    &mut local_term_to_var,
+                    &mut local_var_to_term,
+                    &mut local_next_var,
+                    &mut _islp_negations,
+                    $self.ground_solve_carry.conflicts(&$self.ctx.terms),
+                );
+            $self.ground_solve_carry.note_replayed(_islp_carried_in.0);
+            _islp_carried_in.1 = $self.ground_solve_carry.seed_phases(
+                &$self.ctx.terms,
+                solver,
+                &local_term_to_var,
+            );
+        }
         let _islp_result: $crate::executor_types::Result<SolveResult> = 'split_loop: {
             for _iteration in 0..$max_splits {
                 // Pre-iteration check (interrupt/deadline)
@@ -236,15 +287,23 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 state.round_trips += 1;
                 _islp_timing.dpll.round_trips += 1;
+                ay_core::resource::work().note_round_trip();
 
+                // A refutation recorded below this loop's private frame is
+                // live (a depth-0 one is permanent, `ay_sat::Solver::pop`)
+                // and solve() answers UNSAT at once. One recorded at the
+                // frame's depth or deeper is stale: pop() retracts it.
                 debug_assert!(
-                    !solver.has_empty_clause(),
+                    solver
+                        .empty_clause_scope_depth()
+                        .is_none_or(|depth| depth < solver.scope_depth()),
                     "BUG: persistent SAT solver has_empty_clause=true BEFORE \
-                     solve() in split loop iteration {}. Scope depth: {}, \
-                     active scopes: {}. This indicates a stale UNSAT state \
-                     from a previous check-sat that was not cleared on pop.",
+                     solve() in split loop iteration {}, recorded at scope \
+                     depth {:?} with live scope depth {}. This indicates a \
+                     stale UNSAT state from a previous check-sat that was not \
+                     cleared on pop.",
                     _iteration,
-                    solver.scope_depth(),
+                    solver.empty_clause_scope_depth(),
                     solver.scope_depth(),
                 );
                 // #8067: Apply saved theory phase hints before SAT solve.
@@ -342,9 +401,20 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 match sat_result {
                     SatResult::Sat(model) => {
+                        if _islp_carry_on {
+                            _islp_last_assignment.clone_from(&model);
+                        }
                         _islp_negations.sync_pending(&mut $self.ctx.terms);
                         let mut theory = $create_theory;
                         ay_core::TheorySolver::set_sat_atom_terms(&mut theory, &local_term_to_var);
+                        // A Boolean variable that is the argument of an
+                        // uninterpreted function is in `base_active_atoms`
+                        // so that its truth value can reach EUF, which then
+                        // joins `(f p)` with `(f q)` when `p` and `q` agree.
+                        // It is not a theory atom by shape, so the hand-over
+                        // below names it only for a theory that asks.
+                        let _islp_bool_arg_values =
+                            ay_core::TheorySolver::reads_bool_argument_values(&theory);
                         // M-A2 shadow: reset this round's synced-literal buffer.
                         $(
                             #[cfg(debug_assertions)]
@@ -376,11 +446,24 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             );
                         }
 
-                        // Sync model to theory
+                        // Sync model to theory. One sync on an array model can outlast
+                        // a whole deadline, so each assertion polls the head's stop.
+                        let mut _islp_sync_stopped = false;
                         for (var, term) in $crate::iter_var_to_term_sorted(&local_var_to_term) {
                             let is_dynamic_split = !base_vars.contains(&var);
                             let is_active = is_dynamic_split || base_active_atoms.contains(&term);
-                            if $crate::is_theory_atom(&$self.ctx.terms, term) && is_active {
+                            let _islp_handed = $crate::is_theory_atom(&$self.ctx.terms, term)
+                                || (_islp_bool_arg_values
+                                    && !is_dynamic_split
+                                    && matches!(
+                                        $self.ctx.terms.get(term),
+                                        ay_core::term::TermData::Var(..)
+                                    ));
+                            if _islp_handed && is_active {
+                                if _islp_should_stop() {
+                                    _islp_sync_stopped = true;
+                                    break;
+                                }
                                 // Register dynamic split atoms created in prior
                                 // iterations; base atoms already registered above.
                                 if is_dynamic_split {
@@ -448,6 +531,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 }
                             }
                         }
+                        if _islp_sync_stopped {
+                            drop(theory);
+                            let _ = solver.pop();
+                            $self.last_unknown_reason = Some($crate::executor_types::UnknownReason::Interrupted);
+                            $self.last_result = Some(SolveResult::Unknown);
+                            break 'split_loop Ok(SolveResult::Unknown);
+                        }
                         theory.replay_learned_cuts();
                         // #qf-auflia-fc-diseq-sync: see the eager arm.
                         let _islp_synced_diseq_facts =
@@ -486,6 +576,25 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             ay_lia::instrument::check_calls_now();
                         let _islp_theory_start = ay_core::time::Instant::now();
                         let theory_result = ay_core::TheorySolver::check(&mut theory);
+                        let theory_result = $crate::executor::theories::split_incremental::recheck_installed_theory_lemmas(
+                            &mut theory, theory_result, &_islp_theory_lemmas, &_islp_should_stop,
+                        );
+                        // #split-walk-sat-fallback: a split the oscillation
+                        // guard is about to answer `unknown` for gets the
+                        // theory's SAT-ONLY lane first. Only an exactly
+                        // verified model of the original assertions turns the
+                        // round into `Sat` (validated like any other); every
+                        // other outcome reaches the guard unchanged.
+                        let theory_result = match theory_result {
+                            ay_core::TheoryResult::NeedSplit(split)
+                                if $crate::executor::theories::solve_harness::split_oscillation_would_trigger(
+                                    &_islp_last_split_values, split.variable, &split.value,
+                                ) && ay_core::TheorySolver::try_sat_before_split_giveup(&mut theory) =>
+                            {
+                                ay_core::TheoryResult::Sat
+                            }
+                            other => other,
+                        };
                         _islp_timing.dpll.theory_check += _islp_theory_start.elapsed();
 
                         // AY_UFLIA_PHASE=2 per-round timeline (measurement-only).
@@ -630,6 +739,40 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         // Scoped to the quantifier pipeline, where a ground
                         // `Unknown` is already expected; takes the loop's
                         // EXISTING fail-closed `SplitLimit` -> `Unknown` exit.
+                        if ay_core::misc_cli_flags().debug_split_exit {
+                            let (_islp_kind, _islp_clen) = match &theory_result {
+                                ay_core::TheoryResult::Unsat(c) => ("Unsat", c.len()),
+                                ay_core::TheoryResult::UnsatWithFarkas(c) => ("UnsatFarkas", c.literals.len()),
+                                ay_core::TheoryResult::Sat => ("Sat", 0),
+                                ay_core::TheoryResult::Unknown => ("Unknown", 0),
+                                ay_core::TheoryResult::NeedSplit(_) => ("NeedSplit", 0),
+                                ay_core::TheoryResult::NeedDisequalitySplit(_) => ("NeedDiseqSplit", 0),
+                                ay_core::TheoryResult::NeedModelEquality(_) => ("NeedModelEq", 0),
+                                ay_core::TheoryResult::NeedModelEqualities(_) => ("NeedModelEqs", 0),
+                                ay_core::TheoryResult::NeedExpressionSplit(_) => ("NeedExprSplit", 0),
+                                ay_core::TheoryResult::NeedExpressionSplits(_) => ("NeedExprSplits", 0),
+                                ay_core::TheoryResult::NeedLemmas(_) => ("NeedLemmas", 0),
+                                _ => ("Other", 0),
+                            };
+                            safe_eprintln!(
+                                "[split-round] tag={} iter={} prop_conflicts={} decisions={} propagations={} theory={} conflict_len={} consec={} total={} qpe={} atoms={} sat_vars={} sat_clauses={} carried_conflicts={} carried_phases={}",
+                                $tag,
+                                _iteration,
+                                _islp_round_prop_conflicts,
+                                solver.num_decisions(),
+                                solver.num_propagations(),
+                                _islp_kind,
+                                _islp_clen,
+                                _islp_unproductive_conflict_rounds,
+                                _islp_total_unproductive_rounds,
+                                $self.quantifier_pipeline_engaged,
+                                local_term_to_var.len(),
+                                solver.num_variables(),
+                                solver.num_clauses(),
+                                _islp_carried_in.0,
+                                _islp_carried_in.1
+                            );
+                        }
                         if $self.quantifier_pipeline_engaged
                             && matches!(
                                 theory_result,
@@ -643,11 +786,39 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             } else {
                                 _islp_unproductive_conflict_rounds = 0;
                             }
-                            if _islp_unproductive_conflict_rounds
-                                >= $crate::executor::theories::MAX_UNPRODUCTIVE_CONFLICT_ROUNDS
-                                || _islp_total_unproductive_rounds
-                                    >= $crate::executor::theories::MAX_TOTAL_UNPRODUCTIVE_ROUNDS
+                            // #unproductive-budget-scales-with-vocabulary: both
+                            // bounds grow with the theory-atom vocabulary (see
+                            // the constants' doc) so a large converging lazy
+                            // refutation is not mistaken for an enumeration.
+                            // The legacy counter records where the unscaled
+                            // rule would have stopped, once per invocation.
+                            let _islp_atoms = local_term_to_var.len();
+                            let (_islp_ub_consec, _islp_ub_total) =
+                                $crate::executor::theories::unproductive_round_limits(_islp_atoms);
+                            if !_islp_legacy_rule_counted
+                                && (_islp_unproductive_conflict_rounds
+                                    >= $crate::executor::theories::MAX_UNPRODUCTIVE_CONFLICT_ROUNDS
+                                    || _islp_total_unproductive_rounds
+                                        >= $crate::executor::theories::MAX_TOTAL_UNPRODUCTIVE_ROUNDS)
                             {
+                                _islp_legacy_rule_counted = true;
+                                $self.split_unproductive_legacy_rule_hits += 1;
+                            }
+                            if _islp_unproductive_conflict_rounds >= _islp_ub_consec
+                                || _islp_total_unproductive_rounds >= _islp_ub_total
+                            {
+                                $self.split_unproductive_budget_hits += 1;
+                                if ay_core::misc_cli_flags().debug_split_exit {
+                                    safe_eprintln!(
+                                        "[split-exit-probe] lazy #7956 unproductive budget: consecutive={} total={} iteration={} atoms={} limits={}/{}",
+                                        _islp_unproductive_conflict_rounds,
+                                        _islp_total_unproductive_rounds,
+                                        _iteration,
+                                        _islp_atoms,
+                                        _islp_ub_consec,
+                                        _islp_ub_total
+                                    );
+                                }
                                 pipeline_export_theory_state!(
                                     theory, $export_theory, $export_expr,
                                     _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
@@ -656,7 +827,42 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 let _ = solver.pop();
                                 $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
                                 $self.last_result = Some(SolveResult::Unknown);
+                                $crate::pipeline_fns::debug_split_exit(concat!($tag, "-lazy unproductive-budget"));
                                 break 'split_loop Ok(SolveResult::Unknown);
+                            }
+                        }
+                        // Keep this round's conflict for the query's later
+                        // ground solves when its literal set is refuted by the
+                        // theory alone (`ground_solve_carry`). The store
+                        // decides that itself, whatever the gate below makes
+                        // of the conflict: a Farkas certificate that passes
+                        // the semantic check, or a fresh solver given nothing
+                        // but the literals.
+                        if _islp_carry_on {
+                            let _islp_minted = |term: TermId| {
+                                local_term_to_var
+                                    .get(&term)
+                                    .is_some_and(|var| !base_vars.contains(var))
+                            };
+                            let _islp_offered = match &theory_result {
+                                ay_core::TheoryResult::Unsat(_islp_lits) => Some(
+                                    $crate::executor::ground_solve_carry::OfferedConflict::Literals(
+                                        _islp_lits,
+                                    ),
+                                ),
+                                ay_core::TheoryResult::UnsatWithFarkas(_islp_conflict) => Some(
+                                    $crate::executor::ground_solve_carry::OfferedConflict::Farkas(
+                                        _islp_conflict,
+                                    ),
+                                ),
+                                _ => None,
+                            };
+                            if let Some(_islp_offered) = _islp_offered {
+                                $self.ground_solve_carry.offer(
+                                    &$self.ctx.terms,
+                                    _islp_offered,
+                                    &_islp_minted,
+                                );
                             }
                         }
                         pipeline_incremental_split_lazy_dispatch_theory_result!(
@@ -743,6 +949,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     let _ = solver.pop();
                                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                     $self.last_result = Some(SolveResult::Unknown);
+                                    $crate::pipeline_fns::debug_split_exit(concat!($tag, "-lazy theory-unknown"));
                                     break 'split_loop Ok(SolveResult::Unknown);
                                 }
                                 other => unreachable!("unhandled TheoryResult variant in split loop: {other:?}"),
@@ -772,11 +979,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     }
                     SatResult::Unknown => {
                         $self.last_model = None;
+                        if ay_core::misc_cli_flags().debug_split_exit {
+                            safe_eprintln!(
+                                "[split-exit-probe] lazy sat_unknown_reason={:?} iteration={}",
+                                solver.last_unknown_reason(),
+                                _iteration
+                            );
+                        }
                         let _ = solver.pop();
                         if $self.last_unknown_reason.is_none() {
                             $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                         }
                         $self.last_result = Some(SolveResult::Unknown);
+                        $crate::pipeline_fns::debug_split_exit(concat!($tag, "-lazy sat-unknown"));
                         break 'split_loop Ok(SolveResult::Unknown);
                     }
                     #[allow(unreachable_patterns)]
@@ -790,9 +1005,22 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
             }
             $self.last_result = Some(SolveResult::Unknown);
+            $crate::pipeline_fns::debug_split_exit(concat!($tag, "-lazy split-limit"));
             Ok(SolveResult::Unknown)
         };
 
+        // The assignment this solve ended on is where the next one starts
+        // (`ground_solve_carry`); a refuted problem leaves none worth keeping.
+        if _islp_carry_on
+            && !_islp_last_assignment.is_empty()
+            && !matches!(&_islp_result, Ok(r) if r.is_unsat())
+        {
+            $self.ground_solve_carry.remember_assignment(
+                &$self.ctx.terms,
+                &local_var_to_term,
+                &_islp_last_assignment,
+            );
+        }
         state.scratch_var_to_term = local_var_to_term;
         pipeline_split_epilogue!(
             $self, _islp_timing, _islp_total_start,

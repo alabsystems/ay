@@ -1,0 +1,43 @@
+pseudo-Boolean proof version 3.0
+% The order-specification route to the same wrap. The `spec` row `+1 u1 >= i64::MIN` is
+% trivially true, but the `leq` scope of a `red` step substitutes the order's left variables,
+% and mapping `u1` to a TRUE literal wrapped its degree into the empty contradiction. A
+% contradicting premise discharges both scope proofgoals with empty subproofs, so
+% `red >= 1` -- the empty contradiction itself -- entered the database for free.
+def_order o
+  vars
+    left u1 ;
+    right v1 ;
+    aux $z ;
+  end vars;
+  spec
+    red +1 u1 >= -9223372036854775808 : $z -> 0;
+  end spec;
+  def
+    -1 u1 +1 v1 >= 0;
+  end def;
+  transitivity
+    vars
+      fresh_right w1 ;
+      fresh_aux_1 $b1 ;
+      fresh_aux_2 $c1 ;
+    end vars;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed #1 : -1;
+    qed proof;
+  end transitivity;
+end def_order;
+load_order o x1;
+red >= 1 : x1 -> 1 : subproof
+  scope leq
+    proofgoal #1
+    qed;
+    proofgoal #2
+    qed;
+  end scope;
+qed red;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

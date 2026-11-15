@@ -16,7 +16,9 @@ impl Solver {
     ///
     /// The flag is polled by `is_interrupted()` during preprocessing and
     /// inprocessing phases where the `should_stop` closure is not available.
-    /// The CDCL main loop still uses the closure-based check.
+    /// The CDCL main loop still uses the closure-based check, and so does a
+    /// restart's inprocessing round, at its pass checkpoints and before each
+    /// probing candidate (`inprocessing_stop_requested`).
     pub fn set_interrupt(&mut self, handle: Arc<AtomicBool>) {
         self.cold.interrupt = Some(handle);
     }
@@ -30,9 +32,29 @@ impl Solver {
         self.cold.interrupt = handle;
     }
 
+    /// Replace the flag the owner raises when the solve deadline passes,
+    /// including clearing it.
+    ///
+    /// Many passes poll only `is_interrupted()`, which never reads the clock,
+    /// so a deadline set with `set_solve_deadline` alone reaches them only
+    /// once they end, at the next check that reads it. An owner that arms a
+    /// timer to raise this flag at the deadline stops them at their next
+    /// interrupt poll.
+    /// Set the deadline too: a stop on this flag is reported as
+    /// `DeadlineExceeded` only once the solve deadline has passed.
+    ///
+    /// It is separate from the interrupt handle so a timer never writes the
+    /// caller's flag, which callers reuse across queries (#8961), and so that
+    /// flag stays visible while a deadline is armed. Persistent solvers must
+    /// rebind it per query, as they rebind the interrupt handle.
+    pub fn set_deadline_interrupt_handle(&mut self, handle: Option<Arc<AtomicBool>>) {
+        self.cold.deadline_interrupt = handle;
+    }
+
     /// Check whether an external interrupt has been requested.
     ///
-    /// Returns true if `set_interrupt()` was called and the flag was set.
+    /// Returns true if the interrupt flag or the deadline flag is set, or the
+    /// process-memory trip wire has latched.
     /// Used in preprocessing/inprocessing to honor timeout during long-running
     /// techniques where the `should_stop` closure is not threaded through.
     #[inline]
@@ -40,19 +62,26 @@ impl Solver {
         if self.cold.process_memory_interrupt {
             return true;
         }
-        self.cold
-            .interrupt
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        let raised = |handle: &Option<Arc<AtomicBool>>| {
+            handle
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        };
+        raised(&self.cold.interrupt) || raised(&self.cold.deadline_interrupt)
     }
 
     /// True when preprocessing's local budget or the whole-solve deadline has
     /// expired. Existing preprocessing internals poll this helper directly.
     #[inline]
     pub(super) fn preprocess_timed_out(&self) -> bool {
-        self.cold
-            .preprocess_deadline
-            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+        // Deterministic inprocessing (proof-posture-parity, site B): the
+        // preprocessing wall budget is not consulted; every pass keeps its own
+        // work cap. The caller's whole-solve deadline still applies.
+        (self.preprocess_wall_budgets_enabled()
+            && self
+                .cold
+                .preprocess_deadline
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline))
             || self.solve_deadline_expired()
     }
 
@@ -495,6 +524,17 @@ impl Solver {
     }
 
     /// Enable the official SAT Competition Main conflict-analysis pruning policy.
+    /// Tell a VeriPB proof writer how many clause lines the formula has, so
+    /// it deletes its derived constraints by id (`ProofOutput::set_veripb_original_clauses`).
+    /// The streaming DIMACS reader knows the count only after the last clause.
+    pub fn set_veripb_original_clauses(&mut self, num_original_clauses: u64) {
+        if let Some(manager) = self.proof_manager.as_mut() {
+            manager
+                .output_mut()
+                .set_veripb_original_clauses(num_original_clauses);
+        }
+    }
+
     pub fn set_sat_comp_main_conflict_pruning(&mut self, enabled: bool) {
         self.cold.sat_comp_main_conflict_pruning = enabled;
     }
@@ -941,12 +981,17 @@ impl Solver {
             .is_some_and(|target| self.num_decisions >= target)
     }
 
-    /// Whether ANY deterministic resource budget (conflicts or decisions)
-    /// has been reached. Shared exhaustion predicate for the deterministic
-    /// checkpoints in the solve loops (#ground-determinism).
+    /// Whether ANY deterministic resource budget (conflicts, decisions, the
+    /// caller's search-tick stop, or the head start's) has been reached.
+    /// Shared exhaustion predicate for the deterministic checkpoints in the
+    /// solve loops (#ground-determinism).
     #[inline]
     pub(crate) fn resource_budget_exhausted(&self) -> bool {
-        self.conflict_budget_exhausted() || self.decision_budget_exhausted()
+        self.counted_stop_reason().is_some()
+            || self.conflict_budget_exhausted()
+            || self.decision_budget_exhausted()
+            || self.caller_search_tick_stop_reached()
+            || self.search_tick_stop_reached()
     }
 
     /// Remove stale watchers for deleted/garbage clauses from dirty watch lists.
@@ -1311,8 +1356,7 @@ impl Solver {
     /// the objective.
     pub fn bump_variable_activity(&mut self, var: Variable) {
         if var.index() < self.num_vars {
-            self.vsids.bump(var, &self.vals, true);
-            self.vsids.bump(var, &self.vals, false);
+            self.vsids.bump_score_and_queue(var, &self.vals);
         }
     }
 
@@ -1479,6 +1523,28 @@ mod tests {
     }
 
     #[test]
+    fn deadline_flag_interrupts_beside_the_interrupt_handle() {
+        let mut solver = Solver::new(0);
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let deadline = Arc::new(AtomicBool::new(false));
+        solver.set_interrupt_handle(Some(Arc::clone(&interrupt)));
+        solver.set_deadline_interrupt_handle(Some(Arc::clone(&deadline)));
+        assert!(!solver.is_interrupted());
+        deadline.store(true, Ordering::Relaxed);
+        assert!(solver.is_interrupted());
+        deadline.store(false, Ordering::Relaxed);
+        interrupt.store(true, Ordering::Relaxed);
+        assert!(solver.is_interrupted(), "the caller's flag stays visible");
+        interrupt.store(false, Ordering::Relaxed);
+
+        // A clone answers the same stop; a rebind drops a raised flag.
+        deadline.store(true, Ordering::Relaxed);
+        assert!(solver.clone_for_incremental().is_interrupted());
+        solver.set_deadline_interrupt_handle(None);
+        assert!(!solver.is_interrupted());
+    }
+
+    #[test]
     fn test_apply_feature_profile_lrat_clamps_destructive_transforms() {
         let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
         let mut solver = Solver::with_proof_output(4, proof);
@@ -1521,8 +1587,8 @@ mod tests {
         solver.apply_feature_profile(&profile);
 
         assert!(
-            !solver.is_sweep_enabled(),
-            "sweep must stay disabled in DRAT proof mode"
+            solver.is_sweep_enabled(),
+            "sweep is DRAT-open since site S (e367fd456): kitten core lemmas certify it"
         );
         assert!(
             solver.is_decompose_enabled(),

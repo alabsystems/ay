@@ -31,6 +31,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
+use crate::rust_frontend::RustFrontend;
+
 const DEFAULT_MANIFEST: &str = "reference/tools.toml";
 
 // ---------------------------------------------------------------------------
@@ -548,7 +550,7 @@ fn expand_path(root: &Path, raw: &str) -> PathBuf {
     }
 }
 
-fn path_lookup(bin_name: &str) -> Option<PathBuf> {
+pub(crate) fn path_lookup(bin_name: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     env::split_paths(&path_var)
         .map(|dir| dir.join(bin_name))
@@ -1094,7 +1096,12 @@ fn build_in_tree(tool: &Tool, url: &str, root: &Path) -> Result<()> {
             run_step("cmake", &["--build", "build"], &[])?;
         }
         Recipe::CargoBuild => {
-            run_step("cargo", &["build", "--release"], &tool.recipe_args)?;
+            // A third-party tree built as a measurement tool: on the Trust
+            // toolchain that is `targo --unverified build`, no proof claim.
+            let frontend = RustFrontend::current();
+            let args = frontend.args(&["build", "--release"]);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            run_step(frontend.program(), &args, &tool.recipe_args)?;
         }
         Recipe::CcSingleFile => unreachable!("dispatched to build_cc_single_file"),
     }
@@ -1142,15 +1149,18 @@ fn git_fetch(tool: &Tool, url: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// cargo: `cargo install --git <url> [--tag <tag> | --rev <commit>]`.
+/// cargo: `cargo install --git <url> [--tag <tag> | --rev <commit>]`, spelled
+/// `targo --unverified install ...` on a machine with the Trust toolchain.
 fn install_from_cargo(tool: &Tool) -> Result<()> {
     let name = &tool.name;
-    if !runs_on_path("cargo") {
-        bail!("{name}: required tool \"cargo\" not found on PATH");
+    let frontend = RustFrontend::current();
+    let program = frontend.program();
+    if !runs_on_path(program) {
+        bail!("{name}: required tool \"{program}\" not found on PATH");
     }
     let url = tool.url.as_deref().expect("validate: cargo requires url");
-    let mut cmd = ProcCommand::new("cargo");
-    cmd.args(["install", "--git", url]);
+    let mut cmd = ProcCommand::new(program);
+    cmd.args(frontend.args(&["install", "--git", url]));
     let mut pin = String::new();
     if let Some(tag) = tool.tag.as_deref().filter(|t| !t.is_empty()) {
         cmd.args(["--tag", tag]);
@@ -1159,10 +1169,11 @@ fn install_from_cargo(tool: &Tool) -> Result<()> {
         cmd.args(["--rev", commit]);
         pin = format!(" --rev {commit}");
     }
-    println!("{name}: cargo install --git {url}{pin} ...");
-    let status = cmd.status().context("invoke cargo install")?;
+    let install = frontend.render("cargo install");
+    println!("{name}: {install} --git {url}{pin} ...");
+    let status = cmd.status().with_context(|| format!("invoke {install}"))?;
     if !status.success() {
-        bail!("{name}: cargo install exited with {:?}", status.code());
+        bail!("{name}: {install} exited with {:?}", status.code());
     }
     Ok(())
 }

@@ -1,0 +1,20 @@
+pseudo-Boolean proof version 3.0
+f 8 ;
+% The constraint `3 x1 2 ~x1 >= 3` is `1 x1 >= 1` once normalized, so the antecedent is carried at
+% a coefficient of 1 and not of 3.
+e 1 ~z1 1 x1 >= 1 : 1 ;
+e 1 ~x1 1 z4 >= 1 : 2 ;
+% Adding an antecedent to a trivially satisfied constraint at a degree that is not positive would
+% give a constraint that is too strong.
+e 1 x1 >= -1 : 3 ;
+e 1 ~x1 >= -4 : 4 ;
+% Here the antecedent cancels against a term of the constraint.
+e 1 x1 2 ~z2 >= 0 : 5 ;
+% Adding the literal of a left implication to a contradicting constraint at a degree that is not
+% positive would give a constraint that is too strong, so only the negation is loaded.
+e 1 ~x1 >= -3 : 6 ;
+e 1 ~x1 >= -1 : 7 ;
+e 1 x1 >= -1 : 8 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

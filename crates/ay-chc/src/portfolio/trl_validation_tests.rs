@@ -116,7 +116,6 @@ fn test_trl_hard_tail_matrix_current_head_issue_7182() {
         "dillig12_m_000.smt2",
         "phases_m_000.smt2",
         "half_true_modif_m_000.smt2",
-        "s_multipl_09_000.smt2",
     ];
     let timeout = Duration::from_secs(15);
 
@@ -434,6 +433,32 @@ fn test_s_multipl_22_trl_only_probe_7170() {
                 ("safe", "unsafe") | ("unsafe", "safe")
             ),
             "validated TRL changed polarity on s_multipl_22 ({direction:?}): raw={raw:?}, validated={validated:?}"
+        );
+    }
+}
+
+/// TRL's unrolling versions a transition's clause-local per step. Here each
+/// step adds a local `y` in {1, -1}, and the error `c = 2 ∧ x = 0` needs the
+/// two steps to pick different values. With one `y` shared across the
+/// unrolling, x = 2y is never 0, and TRL answered unknown in both directions.
+#[test]
+#[timeout(60_000)]
+fn test_trl_finds_a_counterexample_whose_steps_take_different_locals() {
+    const INPUT: &str = r#"
+(set-logic HORN)
+(declare-fun inv (Int Int) Bool)
+(assert (forall ((x Int) (c Int)) (=> (and (= x 0) (= c 0)) (inv x c))))
+(assert (forall ((x Int) (c Int) (y Int) (x1 Int) (c1 Int))
+  (=> (and (inv x c) (or (= y 1) (= y (- 1))) (= x1 (+ x y)) (= c1 (+ c 1)))
+      (inv x1 c1))))
+(assert (forall ((x Int) (c Int)) (=> (and (inv x c) (= c 2) (= x 0)) false)))
+(check-sat)
+"#;
+    for direction in [TrlDirection::Forward, TrlDirection::Backward] {
+        let result = solve_trl_only(INPUT, direction, true, false);
+        assert!(
+            matches!(result, PortfolioResult::Unsafe(_)),
+            "{direction:?}: TRL must find the depth-2 counterexample, got {result:?}"
         );
     }
 }

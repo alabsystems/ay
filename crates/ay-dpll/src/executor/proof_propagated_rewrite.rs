@@ -65,11 +65,12 @@ use ay_core::{
 };
 
 use super::Executor;
-use crate::preprocess::{PropagateValues, PropagationRecords};
+use crate::preprocess::{ArrayUnitDerivation, PropagateValues, PropagationRecords};
 use crate::sat_proof_manager::FragmentInstanceRootDerivation;
 use eq_diffvar_bridge::EqDiffVarAtomPlan;
 
 mod and_bridge;
+mod array_units;
 mod clause;
 mod connective_reorder;
 mod eq_diffvar_bridge;
@@ -85,6 +86,7 @@ mod eq_diffvar_tests;
 mod equality;
 mod ite_bridge;
 mod or_bridge;
+mod replay_candidates;
 mod splice;
 #[cfg(test)]
 mod tests;
@@ -136,6 +138,13 @@ enum EqRes {
     },
 }
 
+/// Producer-spelling retries never replace the legacy exact-target attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ScalarEqualityMode {
+    Legacy,
+    ArrayCanonical,
+}
+
 pub(crate) struct PlanCx<'a> {
     problem_set: &'a HashSet<TermId>,
     problem_roots: &'a [TermId],
@@ -157,16 +166,39 @@ pub(crate) struct PlanCx<'a> {
     /// Sealed qpf premise-forced instance roots (#ppp-c7). Empty for the
     /// rebuild lane, so every L1 plan is unchanged.
     instance_roots: &'a [FragmentInstanceRootDerivation],
+    /// Immutable structural-array derivations. L1 alone supplies this channel;
+    /// each use reauthenticates against `problem_roots`, never rewritten roots.
+    array_units: &'a [ArrayUnitDerivation],
+    /// One caller-owned array replay envelope shared across candidate plans.
+    array_progress: Option<&'a dyn Fn(usize, usize) -> bool>,
     /// Emit closed collapsing-fold bridges as one exhaustive-bounded-eval
     /// `BvBitBlast` lemma instead of the `BvLiaTautology`+`BoolTautology`
     /// pair (#ppp-c7 metering; see module docs). False for the rebuild lane.
     closed_bv_bitblast_bridge: bool,
+    /// Close a read of an array the pass replaced by a constant array with
+    /// the `ArrayRowChain` (E) lemma (`equality/array_folds.rs`). Off unless a
+    /// lane opts in ([`Self::with_const_array_reads`]).
+    ///
+    /// Pinned Carcara has no rule for that lemma, so it prints as `hole`: a
+    /// lane plans with the leg OFF first and asks it only for a target no
+    /// leg-free plan derives and whose attempt met such a read
+    /// ([`Self::deferred_const_array_read`]). A leg-closed derivation never
+    /// displaces a leg-free one: measured on `(and (bvult x #x3) (= z K))`,
+    /// `(not (= (select z #x9) (g x)))`, `(= x #x7)`, where both folds reach
+    /// `false` and the first one the conjunct scan meets used to win.
+    const_array_reads: bool,
+    /// Set when a plan with [`Self::const_array_reads`] off declined a read
+    /// the leg could close, so a lane retries only the plans it can change.
+    const_array_read_deferred: bool,
     /// Self-contained chain under construction.
     pub(crate) chain: Proof,
     /// (cl t) memo.
     clause_memo: HashMap<TermId, ProofId>,
-    /// Replay memo, keyed by (term, stamp).
-    eq_memo: HashMap<(TermId, u32), Option<EqRes>>,
+    /// Replay memo, including the producer-spelling mode even for refusals.
+    eq_memo: HashMap<(TermId, u32, ScalarEqualityMode), Option<EqRes>>,
+    /// Active equality derivations, distinct from completed memo outcomes.
+    eq_in_progress: HashSet<(TermId, u32, ScalarEqualityMode)>,
+    scalar_equality_mode: ScalarEqualityMode,
     /// Cycle guard for record chains.
     in_progress: HashSet<TermId>,
     /// Shared `(cl (not false))` tautology.
@@ -201,10 +233,16 @@ impl<'a> PlanCx<'a> {
             eqdv_by_atom: None,
             eqdv_definitions: None,
             instance_roots,
+            array_units: &[],
+            array_progress: None,
             closed_bv_bitblast_bridge,
+            const_array_reads: false,
+            const_array_read_deferred: false,
             chain: Proof::new(),
             clause_memo: HashMap::default(),
             eq_memo: HashMap::default(),
+            eq_in_progress: HashSet::default(),
+            scalar_equality_mode: ScalarEqualityMode::Legacy,
             in_progress: HashSet::default(),
             false_taut: None,
             constant_target: None,
@@ -212,10 +250,33 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    /// Opt this plan into the constant-array read leg; see
+    /// [`Self::const_array_reads`].
+    pub(crate) fn with_const_array_reads(mut self, enabled: bool) -> Self {
+        self.const_array_reads = enabled;
+        self
+    }
+
+    /// Whether a plan with the leg off declined a read the leg could close;
+    /// see [`Self::const_array_reads`].
+    pub(crate) fn deferred_const_array_read(&self) -> bool {
+        self.const_array_read_deferred
+    }
+
     /// Record that this plan's target is the literal Boolean constant
     /// `target` (#4751); see [`Self::constant_target`].
     pub(crate) fn with_constant_target(mut self, target: TermId) -> Self {
         self.constant_target = Some(target);
+        self
+    }
+
+    fn with_array_units(
+        mut self,
+        units: &'a [ArrayUnitDerivation],
+        progress: &'a dyn Fn(usize, usize) -> bool,
+    ) -> Self {
+        self.array_units = units;
+        self.array_progress = Some(progress);
         self
     }
 

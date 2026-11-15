@@ -22,7 +22,11 @@ use super::super::model::Model;
 use super::super::Executor;
 
 mod model_output;
+mod query_function_rows;
 mod resource_budget;
+#[cfg(test)]
+pub(in crate::executor) use resource_budget::slow_host;
+pub(in crate::executor) use resource_budget::ChainSpend;
 
 impl Executor {
     /// Record SAT-side `Unknown` reason if one was reported by ay-sat.
@@ -83,6 +87,42 @@ impl Executor {
         )
     }
 
+    /// Install genuine Bool leaves in a disposable output point. The ordinary
+    /// model constructor and full original-query gate still decide publication.
+    pub(in crate::executor) fn install_boolean_leaf_witness(
+        terms: &ay_core::TermStore,
+        assignment: &mut [bool],
+        term_to_var: &std::collections::BTreeMap<TermId, u32>,
+        witness: &[(TermId, bool)],
+    ) -> bool {
+        if witness.is_empty() {
+            return true;
+        }
+        for &(term, _) in witness {
+            if ay_core::resource::check_stop_requested()
+                || terms.entry_stamp(term).is_none()
+                || !matches!(terms.get(term), TermData::Var(_, _))
+                || terms.sort(term) != &Sort::Bool
+                || term_to_var
+                    .get(&term)
+                    .and_then(|v| v.checked_sub(1))
+                    .is_none_or(|v| v as usize >= assignment.len())
+            {
+                return false;
+            }
+        }
+        for &(term, value) in witness {
+            let Some(index) = term_to_var.get(&term).and_then(|v| v.checked_sub(1)) else {
+                return false;
+            };
+            let Some(slot) = assignment.get_mut(index as usize) else {
+                return false;
+            };
+            *slot = value;
+        }
+        !ay_core::resource::check_stop_requested()
+    }
+
     /// Process solve result and store model if SAT, taking a `TheoryModels`
     /// struct instead of individual model parameters.
     ///
@@ -90,10 +130,20 @@ impl Executor {
     /// 8-argument field-by-field expansion at every return point.
     pub(in crate::executor) fn solve_and_store_model_with_theories(
         &mut self,
-        result: SatResult,
+        mut result: SatResult,
         tseitin_result: &TseitinResult,
         mut models: super::solve_harness::TheoryModels,
     ) -> Result<SolveResult> {
+        if let SatResult::Sat(assignment) = &mut result {
+            if !Self::install_boolean_leaf_witness(
+                &self.ctx.terms,
+                assignment,
+                &tseitin_result.term_to_var,
+                &models.boolean_leaves,
+            ) {
+                result = SatResult::Unknown;
+            }
+        }
         // NRA irrational-root certificate (TARGET nra_irrational): the SAT was
         // proven by an exact Sturm/IVT argument and carries exact ALGEBRAIC
         // witnesses (e.g. `x*x = 2` ⇒ x = √2 as a `root-obj`). Store them so
@@ -192,11 +242,22 @@ impl Executor {
         string_model: Option<StringModel>,
         seq_model: Option<ay_seq::SeqModel>,
     ) -> Result<SolveResult> {
+        let mut euf_model = euf_model;
+        if matches!(result, SatResult::Sat(_)) {
+            if let Some(euf) = euf_model.as_mut() {
+                if self.retain_query_function_table_rows(euf).is_err() {
+                    return Ok(SolveResult::Unknown);
+                }
+            }
+        }
         // Every stored verdict invalidates any previous DT e-graph export: the
         // export is only meaningful paired with the model of the SAME accepted
         // Sat, and `solve_and_store_model_with_theories` re-attaches it after
         // this call when this verdict is a DT-lane Sat (#mv-dt-single-source).
         self.clear_dt_theory_model();
+        // A lane's exact value pins belong to the model stored NOW and to no
+        // other (#dt-fd-pin-roots).
+        self.lane_model_pin_roots = std::mem::take(&mut self.pending_lane_model_pin_roots);
 
         // Tseitin var_to_term must be consistent with term_to_var (#4661).
         // var_to_term may be larger because encode.rs creates auxiliary fresh vars
@@ -233,6 +294,24 @@ impl Executor {
                     term_to_var.values().max().unwrap_or(&0),
                     model.len()
                 );
+                // Release builds enforce it too and fail closed: a model that
+                // does not cover a variable the Tseitin map names is not a
+                // model of the formula that was solved (a split atom minted
+                // onto a variable above the returned model, bd8c45923), and
+                // every read of that term would go silently unanswered.
+                if let Some(&uncovered) =
+                    term_to_var.values().find(|&&v| (v as usize) >= model.len())
+                {
+                    tracing::error!(
+                        var = uncovered,
+                        model_len = model.len(),
+                        "SAT model does not cover a Tseitin-mapped variable; failing closed to unknown"
+                    );
+                    self.last_model = None;
+                    self.last_unknown_reason = Some(UnknownReason::InternalError);
+                    self.last_result = Some(SolveResult::Unknown);
+                    return Ok(SolveResult::Unknown);
+                }
 
                 // Store the model first with original values
                 let mut assembled_model = Model::empty();
@@ -258,6 +337,12 @@ impl Executor {
                 // emitted — fail closed to Unknown (never flips sat/unsat).
                 // See executor/model/array_reconcile.rs.
                 if !self.reconcile_array_select_entries_with_final_assignment() {
+                    if ay_core::misc_cli_flags().debug_cert {
+                        eprintln!(
+                            "CERT/model-rejected phase=array-read-reconciliation reason={:?}",
+                            self.last_unknown_reason,
+                        );
+                    }
                     self.last_model = None;
                     if self.last_unknown_reason.is_none() {
                         self.last_unknown_reason = Some(UnknownReason::Incomplete);

@@ -396,14 +396,48 @@ impl Solver {
         Ok(artifact)
     }
 
+    /// A solver under the logic an artifact RECORDED, rebuilt exactly.
+    ///
+    /// `export_native_replay_artifact` records an attested SMT-LIB logic NAME
+    /// verbatim whenever AY maps it to a category — which includes the names
+    /// that have no [`Logic`] capability variant (`FP`, `ANIA`, `ABVFP`, …; see
+    /// [`Solver::try_new_with_smtlib_logic`]), since those are mapped and so
+    /// are not `declared_logic_routes_as_all`. `Logic::from_str` has no variant
+    /// to give such a name back, and falling back to `ALL` would replay the
+    /// session under a DIFFERENT route than the one that produced the artifact
+    /// — the same substitution that cost the native `AYProgram` lane trust's
+    /// `FP` shape. So rebuild it by name.
+    ///
+    /// # Errors
+    ///
+    /// An unrecognised token keeps `Logic::from_str`'s original refusal: the
+    /// by-name constructor is deliberately as lenient about names as
+    /// `(set-logic ...)` is, so a hand-edited artifact must not use it to
+    /// install a token that parse rejected.
+    fn solver_for_recorded_logic(declared_logic: &str) -> Result<Self, SolverError> {
+        match Logic::from_str(declared_logic) {
+            Ok(logic) => Self::try_new(logic),
+            Err(error)
+                if crate::logic_detection::LogicCategory::from_logic(declared_logic)
+                    == crate::logic_detection::LogicCategory::Other =>
+            {
+                Err(error.into())
+            }
+            Err(_) => Self::try_new_with_smtlib_logic(declared_logic),
+        }
+    }
+
     fn replay_native_replay_artifact_impl(
         artifact: &NativeReplayArtifact,
         caller_timeout: Option<Duration>,
         require_proofs: bool,
     ) -> Result<(crate::api::types::SolveDetails, Self), SolverError> {
-        let logic = Logic::from_str(artifact.logic.as_deref().unwrap_or("ALL"))?;
+        // Logic first, identity tables second, exactly as when this resolved
+        // the logic with a bare `Logic::from_str`: an artifact that is wrong in
+        // both ways keeps reporting the logic.
+        let mut solver =
+            Self::solver_for_recorded_logic(artifact.logic.as_deref().unwrap_or("ALL"))?;
         validate_native_replay_identity_tables(artifact)?;
-        let mut solver = Self::try_new(logic)?;
 
         if require_proofs {
             solver.set_produce_proofs(true);

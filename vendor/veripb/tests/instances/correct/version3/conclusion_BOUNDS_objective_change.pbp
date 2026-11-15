@@ -1,0 +1,20 @@
+pseudo-Boolean proof version 3.0
+f 3;
+% derive lower bound
+pol 1 2 + 3 + 2 d;
+% Define new variables
+red 1 x4 1 ~x1 1 ~x2 1 ~x3 >= 3 : x4 1 ;
+red 1 ~x4 1 x1 1 x2 1 x3 >= 1 : x4 0 ;
+core id 5 6 ;
+% Change objective
+obju new 1 ~x4 2 ;
+% Transfer lower bound
+pol 4 6 + s ;
+% Delete constriant
+del id 1 2 3 4 ;
+del id 5 : x1 0 x2 0 x3 1 x4 1 ;
+del id 6 : x1 0 x2 0 x3 1 x4 1 ;
+% conclude bounds
+output NONE;
+conclusion BOUNDS 2 : 7 2 : x1 ~x2 ~x3;
+end pseudo-Boolean proof;

@@ -210,4 +210,24 @@ pub enum ProofCheckError {
         /// Description of which trust steps were found and their sources.
         reason: String,
     },
+    /// The bounded offset-spine primitive rejected its exact intrinsic schema.
+    /// Static fields keep even malformed/false attempts allocation-free.
+    #[error("step {step} has invalid eq_simplify_bv_offset_spines rule")]
+    InvalidBvOffsetSpines {
+        /// Rejected step ID.
+        step: ProofId,
+    },
+    /// The bounded reconstruction primitive rejected its intrinsic schema.
+    #[error("step {step} has invalid bv_reconstruct_v1 rule")]
+    InvalidBvReconstruct {
+        /// Rejected step ID.
+        step: ProofId,
+    },
+    /// Standard premise-based conjunction projection failed its exact schema.
+    /// Static fields keep malformed/false attempts free of private allocation.
+    #[error("step {step} has invalid and derivation")]
+    InvalidAnd {
+        /// Rejected step ID.
+        step: ProofId,
+    },
 }

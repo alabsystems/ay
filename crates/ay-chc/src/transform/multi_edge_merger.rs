@@ -251,12 +251,125 @@ mod tests {
                     instances: FxHashMap::default(),
                 }],
             }),
+            compact_derivation: None,
             ground_derivation: None,
         };
         let translated = result.back_translator.translate_invalidity(witness);
         let derivation = translated.witness.unwrap();
         assert_eq!(derivation.query_clause, Some(2));
         assert_eq!(derivation.entries[0].incoming_clause, None);
+    }
+
+    /// `P(x) <= x = init.  P(x) /\ x = 0 => Q(x).  P(x) /\ x = 5 => Q(x).
+    /// Q(x) /\ x > 1 => false.` The two `P -> Q` edges (input clauses 1 and
+    /// 2) merge into one clause.
+    fn two_edge_problem(init: i64) -> ChcProblem {
+        let mut problem = ChcProblem::new();
+        let p = problem.declare_predicate("P", vec![ChcSort::Int]);
+        let q = problem.declare_predicate("Q", vec![ChcSort::Int]);
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::eq(int_var("x"), ChcExpr::int(init))),
+            ClauseHead::Predicate(p, vec![int_var("x")]),
+        ));
+        for value in [0, 5] {
+            problem.add_clause(HornClause::new(
+                ClauseBody::new(
+                    vec![(p, vec![int_var("x")])],
+                    Some(ChcExpr::eq(int_var("x"), ChcExpr::int(value))),
+                ),
+                ClauseHead::Predicate(q, vec![int_var("x")]),
+            ));
+        }
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(
+                vec![(q, vec![int_var("x")])],
+                Some(ChcExpr::gt(int_var("x"), ChcExpr::int(1))),
+            ),
+            ClauseHead::False,
+        ));
+        problem
+    }
+
+    /// `P(init), Q(init), false` over the merged problem.
+    fn merged_derivation(
+        merged: &ChcProblem,
+        init: i64,
+    ) -> crate::ground_derivation::GroundDerivation {
+        use crate::ground_derivation::{GroundDerivation, GroundDerivationStep};
+        let index = |pick: &dyn Fn(&HornClause) -> bool| {
+            merged
+                .clauses()
+                .iter()
+                .position(pick)
+                .expect("the merged problem keeps every role")
+        };
+        let fact = index(&|clause| clause.body.predicates.is_empty());
+        let edge =
+            index(&|clause| matches!(clause.body.constraint, Some(ChcExpr::Op(ChcOp::Or, _))));
+        let query = index(&HornClause::is_query);
+        let env = || {
+            [("x".to_string(), crate::smt::SmtValue::Int(init.into()))]
+                .into_iter()
+                .collect::<FxHashMap<_, _>>()
+        };
+        GroundDerivation {
+            steps: vec![
+                GroundDerivationStep {
+                    clause_index: fact,
+                    env: env(),
+                    premises: vec![],
+                },
+                GroundDerivationStep {
+                    clause_index: edge,
+                    env: env(),
+                    premises: vec![0],
+                },
+                GroundDerivationStep {
+                    clause_index: query,
+                    env: env(),
+                    premises: vec![1],
+                },
+            ],
+            query_step: 2,
+        }
+    }
+
+    /// A merged step maps back to the edge its environment satisfies, even
+    /// when that edge is not the first candidate. Every candidate completes
+    /// (`x` is bound), so picking the first one that completes chose the
+    /// `x = 0` edge and the translation failed its own validation.
+    #[test]
+    fn ground_translation_takes_the_merged_edge_the_step_satisfies() {
+        let problem = two_edge_problem(5);
+        let result = Box::new(MultiEdgeMerger::new()).transform(problem.clone());
+        assert_eq!(result.problem.clauses().len(), 3, "the two edges merge");
+        let derivation = merged_derivation(&result.problem, 5);
+        crate::ground_derivation::validate_ground_derivation(&result.problem, &derivation)
+            .expect("setup: the derivation validates on the merged problem");
+
+        let translated = result
+            .back_translator
+            .translate_ground_derivation(&derivation)
+            .expect("the `x = 5` edge carries the merged step");
+        assert_eq!(translated.steps[1].clause_index, 2, "the `x = 5` edge");
+        crate::ground_derivation::validate_ground_derivation(&problem, &translated)
+            .expect("the translation validates on the input problem");
+    }
+
+    /// Negative twin: from `P(7)` neither edge fires, so no merged step is
+    /// valid, and the candidate that only completes is still refused.
+    #[test]
+    fn ground_translation_refuses_a_merged_step_no_edge_satisfies() {
+        let problem = two_edge_problem(7);
+        let result = Box::new(MultiEdgeMerger::new()).transform(problem);
+        let derivation = merged_derivation(&result.problem, 7);
+        assert!(
+            result
+                .back_translator
+                .translate_ground_derivation(&derivation)
+                .is_none(),
+            "no edge satisfies x = 7, so nothing is translated"
+        );
     }
 
     #[test]

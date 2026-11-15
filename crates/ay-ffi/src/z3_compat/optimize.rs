@@ -17,37 +17,43 @@
 //!
 //! # Objectives vs soft constraints (mixed-use behavior — honest)
 //!
-//! AY does NOT jointly optimize arithmetic objectives and soft constraints in a
-//! single solve. `Z3_optimize_check` routes as follows:
+//! `Z3_optimize_check` routes as follows:
 //!
-//! - objectives and soft constraints both registered → return honest
-//!   `Z3_L_UNDEF`/`Z3_INVALID_ARG`; AY does not yet implement Z3's joint priority
-//!   semantics and never presents a partial optimization as the joint optimum.
-//! - objectives only → run the OBJECTIVE optimizer.
-//! - no objectives, softs present → run MaxSMT (`check_sat_max`).
+//! - objectives and/or soft constraints under ONE registration style → the
+//!   executor's joint engine (declaration-order lex; `box` via
+//!   `opt.priority`), exactly as for parsed scripts.
+//! - MIXING parsed (`from_string`) softs with `Z3_optimize_assert_soft`
+//!   softs → honest `Z3_L_UNDEF`/`Z3_INVALID_ARG` (no single joint
+//!   representation yet); use one registration style.
+//! - flat (ungrouped) API softs only → MaxSMT (`check_sat_max`).
 //! - neither → plain `check_sat`.
 //!
-//! This restriction is documented rather than faked: a wrong joint optimum is
-//! never reported. Callers needing both should split the problems.
+//! The remaining restriction is documented rather than faked: a wrong joint
+//! optimum is never reported.
 //!
 //! # Handle model
 //!
 //! A `Z3_optimize` is a context-arena-owned handle. UNLIKE `Z3_solver` — whose
 //! handles each own an independent replayable assertion stack (see
-//! [`super::Z3SolverHandle`]) — an optimize handle still ALIASES the context's
-//! single `ay_dpll::api::Solver` ENGINE STATE. AY therefore ENFORCES one
-//! optimize handle per context and rejects mixing Optimize with solver/global
-//! parser semantic state (`Z3_INVALID_USAGE` + null constructor result). This is
-//! a deliberate fail-closed compatibility frontier until Optimize gains exact
-//! per-handle replay; silent union/wipe behavior is never allowed. Fixedpoint
-//! handles may coexist because they only read the shared term arena and solve in
-//! an independent CHC engine. `inc_ref`/`dec_ref` are bookkeeping-only no-ops;
-//! the handle lives until `Z3_del_context` frees the arena.
+//! [`super::Z3SolverHandle`]) — an optimize handle installs its state on the
+//! context's single `ay_dpll::api::Solver` ENGINE. Several Optimize handles and
+//! any number of Solver handles may share a context, as in z3: another
+//! handle's engine use displaces an Optimize handle's state, and the handle
+//! replays its recorded hard constraints, soft constraints, objectives and
+//! scopes before its next engine use (`restore_optimize_engine`); objective
+//! optima are snapshotted at check time. `Z3_optimize_from_string` binds the
+//! text's names to the context's declarations (`parse_binding`) and records
+//! its formulas on the handle like the API calls do. Only a text outside the
+//! rebinding fragment is parsed globally; such content is not recorded, so
+//! that handle stays alone in its context (`Z3_INVALID_USAGE`); silent
+//! union/wipe behavior is never allowed. Fixedpoint handles may coexist
+//! because they only read the shared term arena and solve in an independent
+//! CHC engine. `inc_ref`/`dec_ref` are bookkeeping-only no-ops; the handle
+//! lives until `Z3_del_context` frees the arena.
 //!
-//! Because the optimize handle aliases the one engine, soft constraints are
-//! scoped to that engine's `soft_constraints` list. A program that wants a
-//! fresh optimization problem should use a fresh context (the typical z3py
-//! pattern is one `Optimize()` per `Context`).
+//! Objectives are numbered as z3 numbers them: each `maximize` / `minimize`
+//! is one objective, and so is each soft-constraint group (one per id), whose
+//! value is the total weight of its violated soft constraints.
 //!
 //! # Model capture
 //!
@@ -58,6 +64,7 @@
 //! the certified optimum/accounting.
 //!
 use std::ffi::{c_int, c_uint, c_void};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use ay_dpll::api::{MaxSmtStatus, ObjectiveValue, Sort, Term};
@@ -65,17 +72,23 @@ use ay_frontend::Command;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
+use super::check_obligations::{
+    assert_optimize_obligations, has_loose_bound_variable, lossy_binder_refusal, recheck_due,
+    validate_wf_model, WfObligations, WfPhase, WfVerdict, UNBOUND_VARIABLES_REASON,
+};
+use super::handle_params::{EngineSettings, ParamSet};
 use super::{
-    apply_finite_set_decision_gate, apply_supported_params, assert_reachable_finite_set_axioms,
-    cache_ast_vector, cache_string, cache_symbol, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ffi_read_bounded_parser_file,
-    ffi_read_bounded_parser_text, ffi_read_bounded_text, finite_set_decision_gate,
-    flatten_statistics, public_ast_sort, record_ast_sort, require_term_ast_or_return, term_to_ast,
-    DecisionOwnerFamily, ModelHandle, OptimizeCheckOutcome, OptimizeHandle, OptimizeScopeMarker,
-    ParamDescr, ParamDescrsHandle, SoftRecord, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector,
-    Z3_context, Z3_model, Z3_optimize, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
-    Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE,
-    Z3_L_UNDEF, Z3_OK, Z3_PK_BOOL, Z3_PK_INVALID, Z3_PK_STRING, Z3_PK_UINT,
+    apply_finite_set_decision_gate, cache_ast_vector, cache_string, cache_symbol,
+    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_produced, ffi_guard_ptr, ffi_guard_uint,
+    ffi_guard_void, ffi_read_bounded_parser_file, ffi_read_bounded_parser_text,
+    ffi_read_bounded_text, finite_set_decision_gate, flatten_statistics, public_ast_sort,
+    record_ast_sort, require_term_ast_or_return, term_to_ast, DecisionOwnerFamily,
+    FiniteSetDecisionGate, ModelHandle, ObjectiveSense, ObjectiveSlot, OptimizeCheckOutcome,
+    OptimizeHandle, OptimizeScopeMarker, ParamDescr, ParamDescrsHandle, SoftRecord, StatsHandle,
+    Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_model, Z3_optimize, Z3_param_descrs,
+    Z3_params, Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG,
+    Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK, Z3_PK_BOOL, Z3_PK_INVALID,
+    Z3_PK_STRING, Z3_PK_UINT,
 };
 
 // ---- Optimize lifecycle ----
@@ -96,16 +109,28 @@ pub unsafe extern "C" fn Z3_mk_optimize(c: Z3_context) -> Z3_optimize {
     // and freed once, on context drop.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            if !ctx.optimize_handle_cache.is_empty() {
+            // Several Optimize handles share a context's engine the way
+            // Solver and Optimize handles do: each replays its recorded
+            // state before its next engine use. Content parsed through the
+            // legacy global path is not recorded and keeps its handle alone.
+            if let Some(reason) = ctx.optimize_replay_blocker() {
                 ctx.last_error = Z3_INVALID_USAGE;
-                ctx.error_msg = Some(
-                    "Z3_mk_optimize: AY supports exactly one optimize handle per context; use a separate Z3_context"
-                        .to_string(),
-                );
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_optimize: this context's Optimize handle cannot share the engine \
+                     ({reason}); use a separate Z3_context"
+                ));
                 return ptr::null_mut();
             }
+            let other_optimize = !ctx.optimize_handle_cache.is_empty();
+            // The engine may hold a Solver-family goal (a check or parse that
+            // ran before this handle existed): start displaced so the first
+            // engine use installs only this handle's (empty) state.
+            let solver_family_used = ctx.decision_owner == Some(DecisionOwnerFamily::Solver);
             if !ctx.claim_decision_owner(DecisionOwnerFamily::Optimize, "Z3_mk_optimize") {
                 return ptr::null_mut();
+            }
+            if solver_family_used || other_optimize {
+                ctx.optimize_engine_displaced = true;
             }
             let handle = Box::into_raw(Box::new(OptimizeHandle {
                 _ctx: c,
@@ -113,7 +138,13 @@ pub unsafe extern "C" fn Z3_mk_optimize(c: Z3_context) -> Z3_optimize {
                 softs: Vec::new(),
                 parsed_soft_public_terms: Vec::new(),
                 public_objectives: Vec::new(),
+                objective_senses: Vec::new(),
+                objective_slots: Vec::new(),
+                replay_blocker: None,
+                last_objective_values: Vec::new(),
+                last_objective_epsilons: Vec::new(),
                 last_model: None,
+                last_model_text: None,
                 last_check_outcome: None,
                 tracked: Vec::new(),
                 scope_markers: Vec::new(),
@@ -121,6 +152,7 @@ pub unsafe extern "C" fn Z3_mk_optimize(c: Z3_context) -> Z3_optimize {
                 last_reason_unknown: None,
                 last_statistics: None,
                 terminal_error: None,
+                params: ParamSet::default(),
             }));
             ctx.optimize_handle_cache.push(handle);
             ctx.last_error = Z3_OK;
@@ -161,10 +193,109 @@ fn optimize_handle_is_usable(ctx: &mut Z3Context, opt: &OptimizeHandle, operatio
         ctx.error_msg = Some(format!(
             "{operation}: optimize handle is unavailable: {reason}"
         ));
-        false
-    } else {
-        true
+        return false;
     }
+    if let Err(reason) = restore_optimize_engine(ctx, opt) {
+        ctx.last_error = Z3_EXCEPTION;
+        ctx.error_msg = Some(format!("{operation}: {reason}"));
+        return false;
+    }
+    true
+}
+
+/// Re-install `opt`'s state on the shared engine after a Solver-family use of
+/// the same context reset it (`Z3Context::reset_engine_for_solver_goal`).
+///
+/// Z3 runs Solver and Optimize objects side by side in one context; AY runs
+/// both on the context's single engine, and a Solver check replaces the
+/// engine's assertions with its own goal. The Optimize handle records every
+/// hard constraint, soft constraint, objective and scope marker it installed,
+/// so it replays them, scope by scope, before its next engine use. Content
+/// parsed from SMT-LIB text is not recorded; such a handle never shares its
+/// context with Solver handles (`Z3Context::claim_decision_owner`), so the
+/// error below is defence in depth.
+fn restore_optimize_engine(ctx: &mut Z3Context, opt: &OptimizeHandle) -> Result<(), String> {
+    let owner = ptr::from_ref(opt);
+    if ctx.optimize_engine_owner.is_null() && !ctx.optimize_engine_displaced {
+        // The first Optimize engine use of a context that never displaced:
+        // the engine holds exactly this handle's (initially empty) state.
+        ctx.optimize_engine_owner = owner;
+    }
+    if !ctx.optimize_engine_displaced && ctx.optimize_engine_owner == owner {
+        return Ok(());
+    }
+    if let Some(reason) = &opt.replay_blocker {
+        return Err(format!(
+            "the Optimize state was displaced by a Solver check and cannot be replayed ({reason})"
+        ));
+    }
+    ctx.solver
+        .try_reset_assertions()
+        .map_err(|e| format!("cannot reset the engine for Optimize replay: {e}"))?;
+    let (mut hard, mut soft, mut tracked, mut objective) = (0, 0, 0, 0);
+    let end = OptimizeScopeMarker {
+        hard_len: opt.hard.len(),
+        soft_len: opt.softs.len(),
+        tracked_len: opt.tracked.len(),
+        public_objective_len: opt.public_objectives.len(),
+        objective_slot_len: opt.objective_slots.len(),
+        parsed_soft_public_len: opt.parsed_soft_public_terms.len(),
+    };
+    let scopes = opt.scope_markers.len();
+    for (level, marker) in opt
+        .scope_markers
+        .iter()
+        .chain(std::iter::once(&end))
+        .enumerate()
+    {
+        for &term in &opt.hard[hard..marker.hard_len] {
+            ctx.solver
+                .try_assert_term(term)
+                .map_err(|e| format!("Optimize replay: {e}"))?;
+        }
+        // A tracking literal is an assumption of every check (z3 asserts
+        // `t => a` and assumes `t`); see `Z3_optimize_assert_and_track`.
+        for &(literal, _) in &opt.tracked[tracked..marker.tracked_len] {
+            ctx.solver
+                .try_assert_term(literal)
+                .map_err(|e| format!("Optimize replay: {e}"))?;
+        }
+        for record in &opt.softs[soft..marker.soft_len] {
+            ctx.solver
+                .assert_soft(record.term, record.weight, None)
+                .map_err(|e| format!("Optimize replay: {e}"))?;
+        }
+        for (index, &term) in opt.public_objectives[objective..marker.public_objective_len]
+            .iter()
+            .enumerate()
+        {
+            let registered = match opt
+                .objective_senses
+                .get(objective + index)
+                .copied()
+                .flatten()
+            {
+                Some(ObjectiveSense::Maximize) => ctx.solver.try_maximize(term),
+                Some(ObjectiveSense::Minimize) => ctx.solver.try_minimize(term),
+                None => return Err("an objective has no recorded direction".to_string()),
+            };
+            registered.map_err(|e| format!("Optimize replay: {e}"))?;
+        }
+        (hard, soft, tracked, objective) = (
+            marker.hard_len,
+            marker.soft_len,
+            marker.tracked_len,
+            marker.public_objective_len,
+        );
+        if level < scopes {
+            ctx.solver
+                .try_push()
+                .map_err(|e| format!("Optimize replay: {e}"))?;
+        }
+    }
+    ctx.optimize_engine_displaced = false;
+    ctx.optimize_engine_owner = owner;
+    Ok(())
 }
 
 // ---- Asserting constraints ----
@@ -198,8 +329,11 @@ pub unsafe extern "C" fn Z3_optimize_assert(c: Z3_context, o: Z3_optimize, a: Z3
             // Mirror onto the handle's clean assertion set (for get_assertions).
             opt.hard.push(term);
             opt.clear_check_artifacts();
+            release_optimize_adopted_definitions(ctx, opt);
             ctx.last_error = Z3_OK;
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
@@ -215,7 +349,8 @@ pub unsafe extern "C" fn Z3_optimize_assert(c: Z3_context, o: Z3_optimize, a: Z3
 /// `id` is an optional group symbol (may be null); it is threaded through to the
 /// engine as the soft's group label.
 ///
-/// Returns the index of the newly asserted soft constraint.
+/// Returns the index of the objective of the soft constraint's group (z3's
+/// numbering: one objective per group id, shared by its soft constraints).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `o` must be a valid optimize handle;
@@ -237,20 +372,14 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
         // a valid null-terminated C string owned by the caller for the duration of this call.
         Some(unsafe { ffi_read_bounded_text(weight) }.unwrap_or_default())
     };
-    let group: Option<String> = if id.is_null() {
-        None
-    } else {
-        // SAFETY: `id`, when non-null, is a `SymbolHandle` produced by a prior `Z3_mk_*_symbol`
-        // and kept alive in the context's `symbol_cache` for the context's lifetime. The Z3 C
-        // API is single-threaded per context, so this shared read does not race.
-        Some(unsafe { &*id }.display_name())
-    };
+    // SAFETY: `id`, when non-null, is a live symbol handle of the context.
+    let group = unsafe { soft_group(id) };
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_uint` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
-    unsafe {
+    let index = unsafe {
         ffi_guard_uint(c, 0, |ctx| {
             // Resolve `o` -> &mut OptimizeHandle. Null handle is invalid.
             let Some(opt) = o.as_mut() else {
@@ -294,14 +423,13 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
                 "formula",
                 opt.softs.len() as c_uint
             );
-            match ctx.solver.assert_soft(term, w, group.as_deref()) {
-                Ok(idx) => {
+            // The engine optimizes one group; the group stays on the handle.
+            match ctx.solver.assert_soft(term, w, None) {
+                Ok(_) => {
                     // Record the soft locally so `to_string` can render the
-                    // handle's soft set. The exact witness itself is captured
-                    // directly from the solver's admitted MaxSMT result. `idx`
-                    // is the solver-side index; it
-                    // equals `opt.softs.len()` because the optimize handle owns
-                    // the only soft constraints on this solver.
+                    // handle's soft set and the handle can replay it. The
+                    // exact witness itself is captured directly from the
+                    // solver's admitted MaxSMT result.
                     opt.softs.push(SoftRecord {
                         term,
                         weight: w,
@@ -309,7 +437,9 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
                     });
                     opt.clear_check_artifacts();
                     ctx.last_error = Z3_OK;
-                    idx as c_uint
+                    // z3 returns the index of the objective of the soft
+                    // constraint's group (one per id).
+                    soft_slot(opt, group.clone()) as c_uint
                 }
                 Err(e) => {
                     ctx.last_error = Z3_EXCEPTION;
@@ -318,7 +448,24 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
                 }
             }
         })
+    };
+    // SAFETY: the guard has returned; see `finish_optimize_operation`.
+    unsafe { finish_optimize_operation(c, o) };
+    index
+}
+
+/// The group of a soft constraint: the id symbol's name, with no symbol and
+/// the empty symbol (z3py's default) meaning the default group.
+///
+/// # Safety
+/// `id` is null or a `SymbolHandle` the context keeps alive.
+unsafe fn soft_group(id: Z3_symbol) -> Option<String> {
+    if id.is_null() {
+        return None;
     }
+    // SAFETY: non-null, and live per the contract; the Z3 C API is
+    // single-threaded per context, so this shared read does not race.
+    Some(unsafe { &*id }.display_name()).filter(|group| !group.is_empty())
 }
 
 // ---- Solving ----
@@ -334,12 +481,9 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
 /// each be optimized alone. Their unsupported combination is rejected with
 /// `Z3_L_UNDEF`/`Z3_INVALID_ARG`; neither class is ever silently ignored.
 ///
-/// `num_assumptions` MUST be 0: neither AY's MaxSMT nor its objective entry
-/// point threads check-time assumptions through the optimization loop. A
-/// non-zero `num_assumptions` is rejected honestly with `Z3_L_UNDEF` and
-/// `Z3_INVALID_ARG` on the context (we never silently ignore assumptions and
-/// return a possibly-wrong optimum). Callers needing assumptions should encode
-/// them as hard constraints via `Z3_optimize_assert`.
+/// Check-time assumptions hold for this check only: they are asserted in a
+/// scope of their own around the optimization, and an unsat core is the
+/// tracking literals and the assumptions (sound, not minimal).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `o` must be a valid optimize handle.
@@ -349,8 +493,21 @@ pub unsafe extern "C" fn Z3_optimize_check(
     c: Z3_context,
     o: Z3_optimize,
     num_assumptions: c_uint,
-    _assumptions: *const Z3_ast,
+    assumptions: *const Z3_ast,
 ) -> c_int {
+    // SAFETY: the caller's contract: `assumptions` holds `num_assumptions`
+    // handles when the count is positive.
+    if !unsafe { super::ffi_count_within_limit(c, "Z3_optimize_check", num_assumptions) } {
+        return Z3_L_UNDEF;
+    }
+    let assumption_asts: Vec<Z3_ast> = if num_assumptions > 0 && !assumptions.is_null() {
+        // SAFETY: as above; the count was range-checked.
+        (0..num_assumptions as usize)
+            .map(|i| unsafe { *assumptions.add(i) })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_int` handles the null case internally and catches any unwinding panic so it
@@ -362,252 +519,589 @@ pub unsafe extern "C" fn Z3_optimize_check(
                 ctx.error_msg = Some("null Z3_optimize handle in check".to_string());
                 return Z3_L_UNDEF;
             };
-
-            // Retire the previous query before every exit from this decision
-            // endpoint. In particular, an unsupported-assumption rejection
-            // must not leave an earlier model or optimum queryable.
-            opt.clear_check_artifacts();
-            ctx.last_error = Z3_OK;
-            ctx.error_msg = None;
-
-            if !ctx.decision_engine_is_usable("Z3_optimize_check") {
-                let reason = ctx
-                    .error_msg
-                    .clone()
-                    .unwrap_or_else(|| "context decision engine is unavailable".to_string());
-                opt.last_reason_unknown = Some(reason);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-
-            if let Some(reason) = opt.terminal_error.clone() {
-                ctx.last_error = Z3_INVALID_USAGE;
-                ctx.error_msg = Some(reason.clone());
-                opt.last_reason_unknown = Some(reason);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-
-            let mut finite_set_roots = opt.hard.clone();
-            finite_set_roots.extend(opt.softs.iter().map(|soft| soft.term));
-            finite_set_roots.extend(opt.parsed_soft_public_terms.iter().copied());
-            for &(tracking, assertion) in &opt.tracked {
-                finite_set_roots.push(tracking);
-                finite_set_roots.push(assertion);
-            }
-            finite_set_roots.extend(opt.public_objectives.iter().copied());
-            let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
-            if finite_set_gate.quantifier_reason.is_some() {
-                let _ = apply_finite_set_decision_gate(
-                    ctx,
-                    Z3_L_UNDEF,
-                    &finite_set_gate,
-                    "Z3_optimize_check",
+            if num_assumptions > 0 && assumptions.is_null() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(
+                    "Z3_optimize_check: null assumptions array for a positive count".to_string(),
                 );
-                let reason = ctx.error_msg.clone().unwrap_or_else(|| {
-                    "finite-set optimization result is not certified".to_string()
-                });
-                ctx.last_error = Z3_OK;
-                ctx.error_msg = Some(reason.clone());
-                opt.last_reason_unknown = Some(reason);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
                 return Z3_L_UNDEF;
             }
-
-            // Honest handling of assumptions: not threaded through optimization.
-            if num_assumptions > 0 {
-                let reason =
-                    "Z3_optimize_check: assumptions are not supported by AY's optimization path; \
-                     encode them as hard constraints via Z3_optimize_assert"
-                        .to_string();
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some(reason.clone());
-                opt.last_reason_unknown = Some(reason);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-
-            // Inject theory-internal background axioms (special-relation orders,
-            // Char range invariants) so they constrain the optimization solve.
-            // Unlike the plain-solver path this engine state is not reset per
-            // check, so a repeated check may re-assert them — harmless (asserting
-            // a Bool constraint twice is idempotent) and always sound (they only
-            // add constraints over fresh predicates / bounded Char code points).
-            // The Optimize engine state is incremental (asserted at
-            // `Z3_optimize_assert` time), so check-time goal expansion is not
-            // available here: the rec-def axioms are ALWAYS included (keeps
-            // the sound definitional UNSAT power), and a SAT/optimum outcome
-            // over any rec-f mention is demoted below.
-            if let Err(e) = super::assert_background_axioms(ctx, true) {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some(e.clone());
-                opt.last_reason_unknown = Some(e);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-            if let Err(e) = assert_reachable_finite_set_axioms(ctx, &finite_set_roots) {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some(e.clone());
-                opt.last_reason_unknown = Some(e);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-
-            let has_objectives = ctx.solver.num_objectives() > 0;
-            let has_parsed_softs = ctx.solver.num_parsed_soft_constraints() > 0;
-            let has_api_softs = ctx.solver.num_soft_constraints() > 0;
-            if has_objectives && (has_parsed_softs || has_api_softs) {
-                let reason = "Z3_optimize_check: joint arithmetic-objective + soft-constraint optimization is not implemented; split the problems".to_string();
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some(reason.clone());
-                opt.last_reason_unknown = Some(reason);
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-
-            // Route the solve. Three paths (see module docs):
-            //   1. arithmetic objectives registered, OR (mutually exclusively)
-            //      soft constraints parsed into the executor via
-            //      `Z3_optimize_from_string`/`_from_file` → the executor's native
-            //      `(check-sat)` dispatch for that single objective class. The
-            //      mixed case was rejected above; executor dispatch also fails it
-            //      closed as defense in depth.
-            //   2. else API-level softs (from `Z3_optimize_assert_soft`) present
-            //      → the weight-exact MaxSMT engine (`check_sat_max`).
-            //   3. else a plain check-sat.
-            let verdict = if has_objectives || has_parsed_softs {
-                optimize_check_objectives(ctx, opt)
-            } else {
-                let result = match ctx.solver.check_sat_max() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        ctx.last_error = Z3_EXCEPTION;
-                        ctx.error_msg = Some(format!("{e}"));
-                        capture_check_diagnostics(ctx, opt, Z3_L_UNDEF);
-                        return Z3_L_UNDEF;
-                    }
+            let mut assumed = Vec::with_capacity(assumption_asts.len());
+            for &ast in &assumption_asts {
+                let Some(term) =
+                    super::require_term_ast(ctx, ast, "Z3_optimize_check", "assumption")
+                else {
+                    return Z3_L_UNDEF;
                 };
-                match result.status {
-                    MaxSmtStatus::Optimal => {
-                        // Capture the exact model selected, restored, and
-                        // revalidated by the MaxSMT transaction. An Optimal
-                        // result without a consumer-admissible witness violates
-                        // the boundary contract and must fail closed.
-                        match ctx.solver.model_for_consumer() {
-                            Some(model) => {
-                                opt.last_model = Some(model.into_inner());
-                                ctx.last_error = Z3_OK;
-                                Z3_L_TRUE
-                            }
-                            None => {
-                                ctx.last_error = Z3_EXCEPTION;
-                                ctx.error_msg = Some(
-                                    "MaxSMT optimum has no consumer-admissible witnessing model"
-                                        .to_string(),
-                                );
-                                Z3_L_UNDEF
-                            }
-                        }
-                    }
-                    MaxSmtStatus::HardUnsatisfiable => {
-                        ctx.last_error = Z3_OK;
-                        Z3_L_FALSE
-                    }
-                    // `MaxSmtStatus` is `#[non_exhaustive]`; Unknown and any future
-                    // not-yet-determined variant maps to Z3_L_UNDEF.
-                    MaxSmtStatus::Unknown => Z3_L_UNDEF,
-                    _ => Z3_L_UNDEF,
-                }
-            };
-
-            capture_check_diagnostics(ctx, opt, verdict);
+                assumed.push(term);
+            }
+            // The handle's own parameters, applied in full for this check
+            // only, and a cleared interrupt (see `handle_params`).
+            let settings =
+                EngineSettings::apply(&mut ctx.solver, opt.params.over(ctx.default_params));
+            let mut verdict =
+                if let Some(refused) = refuse_undecided_optimize_goal(ctx, opt, &assumed) {
+                    refused
+                } else {
+                    optimize_check_phases(ctx, opt, &assumed)
+                };
             if verdict == Z3_L_TRUE {
-                let gated = apply_finite_set_decision_gate(
-                    ctx,
-                    verdict,
-                    &finite_set_gate,
-                    "Z3_optimize_check",
-                );
-                if gated != verdict {
-                    let reason = ctx
-                        .error_msg
-                        .clone()
-                        .unwrap_or_else(|| "finite-set optimum is not certified".to_string());
-                    opt.last_reason_unknown = Some(reason);
-                    opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                    return Z3_L_UNDEF;
+                scope_optimize_model(ctx, opt, &assumed);
+                if let Err(reason) = refuse_unconfirmed_optimize_model(ctx, opt, &assumed) {
+                    verdict = optimize_unknown(ctx, opt, None, reason);
                 }
             }
-            // Transitive-closure SAT gate: the background axioms for a
-            // `Z3_mk_transitive_closure` predicate are only PARTIAL (see
-            // `verify_transitive_closure_model` in solver.rs), so a SAT here
-            // could rest on an over-approximated TC. The optimize path has no
-            // snapshot verifier wired, so it honestly reports unknown rather
-            // than release an unverified SAT (never a fabricated verdict).
-            if verdict == Z3_L_TRUE && !ctx.transitive_closure_regs.is_empty() {
-                opt.last_reason_unknown = Some(
-                    "transitive-closure model verification is not wired into the \
-                     optimization path; refusing an unverified sat"
-                        .to_string(),
-                );
-                // The backend model and objective values were captured before
-                // this FFI trust gate. Downgrading SAT to UNKNOWN must revoke
-                // their public authority while retaining the reason/statistics
-                // for this completed query.
-                opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                return Z3_L_UNDEF;
-            }
-            // Recursive-definition SAT gate (P1.1): the Optimize path cannot
-            // expand its incremental goal at check time, so a rec-defined
-            // function reaches the engine as a quantified-axiom-constrained
-            // plain UF. UNSAT is sound (the axiom is definitional); a SAT /
-            // optimum over ANY mention of a rec-defined name is not certified
-            // and is demoted honestly (never a fabricated optimum). The scan
-            // covers hard constraints, API softs, tracked pairs, and every
-            // registered objective; parsed-in soft constraints are not
-            // individually reachable here, so their mere presence demotes.
-            if verdict == Z3_L_TRUE && !ctx.rec_fun_defs.is_empty() {
-                let mut scan: Vec<Term> = opt.hard.clone();
-                scan.extend(opt.softs.iter().map(|s| s.term));
-                for &(p, a) in &opt.tracked {
-                    scan.push(p);
-                    scan.push(a);
-                }
-                scan.extend(opt.public_objectives.iter().copied());
-                let parsed_softs_present = ctx.solver.num_parsed_soft_constraints() > 0;
-                if parsed_softs_present
-                    || ctx.solver.contains_rec_fun_apps(&scan, &ctx.rec_fun_defs)
-                {
-                    opt.last_reason_unknown = Some(
-                        "recursive definitions are not expanded on the Optimize path; \
-                         optimum not certified"
-                            .to_string(),
-                    );
-                    opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
-                    return Z3_L_UNDEF;
-                }
-            }
+            release_optimize_adopted_definitions(ctx, opt);
+            settings.restore(&mut ctx.solver);
             verdict
         })
     }
 }
 
+/// An Optimize check in the two checks of `wf_guards::WfPhase`: one that
+/// leaves the quantified well-formedness guards out (validating its optimum)
+/// and one of the replayed handle that asserts them, in the order the goal
+/// picks. Only a handle the engine can replay with at most one objective
+/// takes the relaxed check: the optimum of the relaxed goal is the optimum of
+/// the goal exactly when its witness is a model of the guards, and only one
+/// objective has one witness.
+fn optimize_check_phases(ctx: &mut Z3Context, opt: &mut OptimizeHandle, assumed: &[Term]) -> c_int {
+    let started = std::time::Instant::now();
+    let mut phase = if opt.replay_blocker.is_none() && opt.public_objectives.len() <= 1 {
+        WfPhase::default()
+    } else {
+        WfPhase::guarded()
+    };
+    let first = optimize_check_once(ctx, opt, assumed, &mut phase);
+    if !recheck_due(ctx, &phase, started) {
+        return first;
+    }
+    // The relaxed check's engine state is discarded: the handle is replayed
+    // from its own records (see `restore_optimize_engine`).
+    ctx.optimize_engine_displaced = true;
+    let configured = ctx.solver.timeout();
+    ctx.solver
+        .set_timeout(configured.map(|timeout| timeout.saturating_sub(started.elapsed())));
+    let second = optimize_check_once(ctx, opt, assumed, &mut phase.next());
+    ctx.solver.set_timeout(configured);
+    second
+}
+
+fn optimize_check_once(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    assumed: &[Term],
+    phase: &mut WfPhase,
+) -> c_int {
+    if assumed.is_empty() {
+        optimize_check_handle(ctx, opt, &[], phase)
+    } else {
+        optimize_check_assuming(ctx, opt, assumed, phase)
+    }
+}
+
+/// The FFI gates of an optimum ([`gate_optimize_sat`]), then its
+/// well-formedness (see [`optimize_check_phases`]): its model must give every
+/// reached symbol a value of its public sort, and, when its check left the
+/// quantified guards out, every objective must have an attained, finite
+/// optimum (an unbounded or unattained optimum of the relaxed goal says
+/// nothing of the goal's).
+fn validate_optimum(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    finite_set_gate: &FiniteSetDecisionGate,
+    obligations: &WfObligations,
+    phase: &mut WfPhase,
+) -> c_int {
+    if gate_optimize_sat(ctx, opt, finite_set_gate) != Z3_L_TRUE {
+        return Z3_L_UNDEF;
+    }
+    let relaxed = !phase.asserts_quantified_guards() && !obligations.lazy.is_empty();
+    if relaxed {
+        let attained = opt
+            .last_objective_values
+            .iter()
+            .all(|(_, value)| matches!(value, Some(ObjectiveValue::Finite(_))))
+            && opt.last_objective_epsilons.iter().all(Option::is_none);
+        if !attained {
+            phase.recheck = phase.may_recheck(obligations);
+            let reason = "the optimum of the goal without its well-formedness guards is not                           attained by a model"
+                .to_string();
+            return optimize_unknown(ctx, opt, None, reason);
+        }
+    }
+    let model = opt.last_model.clone();
+    let text = opt.last_model_text.clone();
+    match validate_wf_model(
+        ctx,
+        obligations,
+        model.as_ref(),
+        text.as_deref(),
+        phase.asserts_quantified_guards(),
+        phase.may_recheck(obligations),
+    ) {
+        WfVerdict::Accept => Z3_L_TRUE,
+        WfVerdict::Retry(reason) => {
+            phase.recheck = true;
+            optimize_unknown(ctx, opt, None, reason)
+        }
+        WfVerdict::Refuse(reason) => optimize_unknown(ctx, opt, None, reason),
+    }
+}
+
+/// Decide an Optimize check as `unknown` without the engine when its goal
+/// holds a loose bound variable (libz3 5.1.0: `Z3_EXCEPTION`, "Formulas
+/// should not contain unbound variables") or a binder of a lossy sort (see
+/// `check_obligations`); `None` when the goal goes to the engine.
+fn refuse_undecided_optimize_goal(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    assumed: &[Term],
+) -> Option<c_int> {
+    let mut roots = opt.hard.clone();
+    roots.extend(opt.softs.iter().map(|soft| soft.term));
+    roots.extend(opt.parsed_soft_public_terms.iter().copied());
+    roots.extend(opt.public_objectives.iter().copied());
+    roots.extend(
+        opt.tracked
+            .iter()
+            .flat_map(|&(tracking, assertion)| [tracking, assertion]),
+    );
+    roots.extend_from_slice(assumed);
+    let (code, reason) = if has_loose_bound_variable(ctx, &roots) {
+        (Z3_EXCEPTION, UNBOUND_VARIABLES_REASON.to_string())
+    } else {
+        (Z3_OK, lossy_binder_refusal(ctx, &roots)?)
+    };
+    opt.clear_check_artifacts();
+    Some(optimize_unknown(ctx, opt, Some(code), reason))
+}
+
+/// Restrict the model of `opt`'s SAT check to the symbols of its own
+/// constraints (hard, soft, tracked, objectives), closed under the context's
+/// theory axioms that mention a kept symbol, as `scope_published_model` does
+/// for a Solver: the engine's model lists every symbol declared on the shared
+/// engine, so the Optimize model listed constants only other handles (or no
+/// handle at all) use (measured: `[x = 10, z = 0, y = 0]` for `maximize x`
+/// under `x <= 10`; z3: `[x = 10]`). Restriction never changes a kept value.
+fn scope_optimize_model(ctx: &mut Z3Context, opt: &mut OptimizeHandle, assumed: &[Term]) {
+    let mut roots = opt.hard.clone();
+    roots.extend(assumed.iter().copied());
+    roots.extend(opt.softs.iter().map(|soft| soft.term));
+    roots.extend(opt.parsed_soft_public_terms.iter().copied());
+    roots.extend(opt.tracked.iter().map(|&(literal, _)| literal));
+    roots.extend(opt.public_objectives.iter().copied());
+    let Ok(mut keep) = ctx.solver.declared_symbols_in(&roots) else {
+        // The scope could not be computed: keep the whole model (it still
+        // satisfies the constraints; only extra symbols are listed).
+        return;
+    };
+    let mut axioms = ctx.background_axioms.clone();
+    axioms.extend(ctx.global_definition_axioms.iter().copied());
+    let mut pending: Vec<_> = axioms
+        .iter()
+        .filter_map(|&axiom| ctx.solver.declared_symbols_in(&[axiom]).ok())
+        .collect();
+    loop {
+        let before = pending.len();
+        pending.retain(|symbols| {
+            if symbols.is_disjoint(&keep) {
+                return true;
+            }
+            keep.extend(symbols.iter().cloned());
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
+    if let Some(model) = opt.last_model.as_mut() {
+        model.retain_names(|name| keep.contains(name));
+    }
+    if let Some(text) = opt.last_model_text.as_deref() {
+        let scoped = super::model_params::retain_model_text_symbols(text, &keep);
+        opt.last_model_text = Some(scoped);
+    }
+}
+
+/// The fail-closed backstop of `Z3_solver_check` on an Optimize SAT: the
+/// published model, with its function tables and read as `Z3_model_eval`
+/// with model completion reads it, must make every hard constraint and
+/// tracked literal literally true (measured: a model without the table of
+/// the caller's `f`, under which `f(x) == 5` read `0 == 5` with z3's
+/// completion, was published as the optimum).
+fn refuse_unconfirmed_optimize_model(
+    ctx: &mut Z3Context,
+    opt: &OptimizeHandle,
+    assumed: &[Term],
+) -> Result<(), String> {
+    let (Some(model), Some(text)) = (opt.last_model.clone(), opt.last_model_text.clone()) else {
+        return Err(
+            "the optimum's model is unavailable; sat is not published without a model".to_string(),
+        );
+    };
+    let mut obligations = opt.hard.clone();
+    obligations.extend(opt.tracked.iter().map(|&(literal, _)| literal));
+    obligations.extend(assumed.iter().copied());
+    super::solver::refuse_untransported_model_parts(
+        ctx,
+        model,
+        &text,
+        &super::solver::PublicationObligations {
+            obligations: &obligations,
+            engine_roots: &obligations,
+        },
+    )
+}
+
+/// Remove a definition the engine adopted from this handle's definitional
+/// `forall` once the operation that installed it is done (see
+/// `solver::release_adopted_definitions`): the handle replays its state before
+/// its next engine use, so the definition is back for its own checks but never
+/// rewrites terms the caller builds for another handle in between.
+///
+/// Parsed content cannot be replayed. A handle holding some keeps its engine
+/// state, unless a definition is adopted: then the definition is released
+/// all the same and the handle is retired (libz3 5.1.0 keeps a later
+/// `f(x) == 0` of another handle as built; AY's engine would rewrite it).
+fn release_optimize_adopted_definitions(ctx: &mut Z3Context, opt: &mut OptimizeHandle) {
+    if opt.replay_blocker.is_some() && ctx.solver.has_assertion_derived_definitions() {
+        opt.terminal_error = Some(
+            "the handle's parsed content installed a definition that AY cannot keep apart \
+             from other handles, and the content cannot be replayed after its release"
+                .to_string(),
+        );
+    }
+    super::solver::release_adopted_definitions(ctx, "Z3_optimize");
+}
+
+/// After an engine-mutating Optimize operation on `o` (whose guard has
+/// returned): release any definition it left adopted, including on its error
+/// paths after the handle's state was replayed.
+///
+/// # Safety
+/// `c` and `o` must be null or live and not otherwise borrowed.
+unsafe fn finish_optimize_operation(c: Z3_context, o: Z3_optimize) {
+    // SAFETY: the context pointer is null or live and unborrowed (contract);
+    // this borrow ends with the call.
+    let Some(ctx) = (unsafe { c.as_mut() }) else {
+        return;
+    };
+    // SAFETY: the optimize handle is null or live in the context arena, a
+    // separate allocation from the context itself (contract).
+    let Some(opt) = (unsafe { o.as_mut() }) else {
+        return;
+    };
+    let released = catch_unwind(AssertUnwindSafe(|| {
+        release_optimize_adopted_definitions(ctx, opt);
+    }));
+    if released.is_err() {
+        ctx.poison_decision_engine(
+            "Z3_optimize: an adopted definition could not be released".to_string(),
+        );
+    }
+}
+
+/// Record an Optimize check that ends `unknown` for `reason`, with the context
+/// error set to `code` (`None` keeps the error the caller already set).
+fn optimize_unknown(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    code: Option<c_uint>,
+    reason: String,
+) -> c_int {
+    if let Some(code) = code {
+        ctx.last_error = code;
+        ctx.error_msg = Some(reason.clone());
+    }
+    opt.last_reason_unknown = Some(reason);
+    opt.record_check_outcome(OptimizeCheckOutcome::Unknown);
+    Z3_L_UNDEF
+}
+
+/// The body of [`Z3_optimize_check`] for a live handle.
+fn optimize_check_handle(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    assumed: &[Term],
+    phase: &mut WfPhase,
+) -> c_int {
+    // Retire the previous query before every exit from this decision
+    // endpoint. In particular, an unsupported-assumption rejection
+    // must not leave an earlier model or optimum queryable.
+    opt.clear_check_artifacts();
+    ctx.last_error = Z3_OK;
+    ctx.error_msg = None;
+
+    if !ctx.decision_engine_is_usable("Z3_optimize_check") {
+        let reason = ctx
+            .error_msg
+            .clone()
+            .unwrap_or_else(|| "context decision engine is unavailable".to_string());
+        return optimize_unknown(ctx, opt, None, reason);
+    }
+    if let Some(reason) = opt.terminal_error.clone() {
+        return optimize_unknown(ctx, opt, Some(Z3_INVALID_USAGE), reason);
+    }
+    if let Err(reason) = restore_optimize_engine(ctx, opt) {
+        return optimize_unknown(ctx, opt, Some(Z3_EXCEPTION), reason);
+    }
+
+    let mut finite_set_roots = opt.hard.clone();
+    finite_set_roots.extend(assumed.iter().copied());
+    finite_set_roots.extend(opt.softs.iter().map(|soft| soft.term));
+    finite_set_roots.extend(opt.parsed_soft_public_terms.iter().copied());
+    for &(tracking, assertion) in &opt.tracked {
+        finite_set_roots.push(tracking);
+        finite_set_roots.push(assertion);
+    }
+    finite_set_roots.extend(opt.public_objectives.iter().copied());
+    let finite_set_gate = finite_set_decision_gate(ctx, &finite_set_roots);
+    if finite_set_gate.quantifier_reason.is_some() {
+        let _ =
+            apply_finite_set_decision_gate(ctx, Z3_L_UNDEF, &finite_set_gate, "Z3_optimize_check");
+        let reason = ctx
+            .error_msg
+            .clone()
+            .unwrap_or_else(|| "finite-set optimization result is not certified".to_string());
+        return optimize_unknown(ctx, opt, Some(Z3_OK), reason);
+    }
+
+    // Inject theory-internal background axioms (special-relation orders,
+    // Char range invariants) so they constrain the optimization solve.
+    // Unlike the plain-solver path this engine state is not reset per
+    // check, so a repeated check may re-assert them — harmless (asserting
+    // a Bool constraint twice is idempotent) and always sound (they only
+    // add constraints over fresh predicates / bounded Char code points).
+    // The Optimize engine state is incremental (asserted at
+    // `Z3_optimize_assert` time), so check-time goal expansion is not
+    // available here: the rec-def axioms the goal reaches are included
+    // (keeps the sound definitional UNSAT power; the unreached ones only
+    // stalled the check), and a SAT/optimum over a rec-f mention is demoted.
+    let obligations = match assert_optimize_obligations(ctx, &finite_set_roots, phase) {
+        Ok(obligations) => obligations,
+        Err(e) => return optimize_unknown(ctx, opt, Some(Z3_EXCEPTION), e),
+    };
+
+    let has_objectives = ctx.solver.num_objectives() > 0;
+    let has_parsed_softs = ctx.solver.num_parsed_soft_constraints() > 0;
+    // Joint arithmetic+soft and grouped-soft problems route to the
+    // executor's native dispatch (`optimize_check` transplants API
+    // softs with the tracked declaration sequence, so joint and
+    // lexicographic-group problems take the joint/grouped engines).
+    let native = has_objectives || has_parsed_softs || ctx.solver.has_grouped_soft_constraints();
+    let Some(verdict) = optimize_solve(ctx, opt, native) else {
+        return Z3_L_UNDEF;
+    };
+    capture_check_diagnostics(ctx, opt, verdict);
+    if verdict == Z3_L_TRUE {
+        // Snapshot the optima: a later Solver check on this context
+        // resets the engine that holds them.
+        opt.last_objective_values = (0..opt.public_objectives.len())
+            .map(|idx| {
+                (
+                    ctx.solver.objective_sort(idx),
+                    ctx.solver.get_objective_value(idx),
+                )
+            })
+            .collect();
+        opt.last_objective_epsilons = (0..opt.public_objectives.len())
+            .map(|idx| ctx.solver.get_objective_epsilon(idx))
+            .collect();
+        return validate_optimum(ctx, opt, &finite_set_gate, &obligations, phase);
+    }
+    if verdict == Z3_L_UNDEF {
+        phase.note_undecided(&obligations);
+    }
+    verdict
+}
+
+/// [`optimize_check_handle`] under check-time assumptions: they hold as hard
+/// constraints in a scope of their own, popped after the check (z3 assumes
+/// them for this check only), and an unsat core is the tracking literals and
+/// the assumptions (sound, not minimal).
+fn optimize_check_assuming(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    assumed: &[Term],
+    phase: &mut WfPhase,
+) -> c_int {
+    opt.clear_check_artifacts();
+    if let Err(reason) = restore_optimize_engine(ctx, opt) {
+        return optimize_unknown(ctx, opt, Some(Z3_EXCEPTION), reason);
+    }
+    if let Err(e) = ctx.solver.try_push() {
+        return optimize_unknown(
+            ctx,
+            opt,
+            Some(Z3_EXCEPTION),
+            format!("Z3_optimize_check: {e}"),
+        );
+    }
+    let mut verdict = Z3_L_UNDEF;
+    let mut asserted = true;
+    for &term in assumed {
+        if let Err(e) = ctx.solver.try_assert_term(term) {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(format!("Z3_optimize_check: {e}"));
+            asserted = false;
+            break;
+        }
+    }
+    if asserted {
+        verdict = optimize_check_handle(ctx, opt, assumed, phase);
+    }
+    if let Err(e) = ctx.solver.try_pop() {
+        let reason = format!("Z3_optimize_check: the assumption scope could not be closed: {e}");
+        opt.terminal_error = Some(reason.clone());
+        return optimize_unknown(ctx, opt, Some(Z3_EXCEPTION), reason);
+    }
+    if verdict == Z3_L_FALSE {
+        let mut core = opt.last_unsat_core.take().unwrap_or_default();
+        for &term in assumed {
+            if !core.contains(&term) {
+                core.push(term);
+            }
+        }
+        opt.last_unsat_core = Some(core);
+    }
+    if !asserted {
+        let reason = ctx
+            .error_msg
+            .clone()
+            .unwrap_or_else(|| "an assumption could not be asserted".to_string());
+        return optimize_unknown(ctx, opt, None, reason);
+    }
+    verdict
+}
+
+/// Route the solve. Three paths (see module docs):
+///   1. arithmetic objectives registered, soft constraints parsed
+///      into the executor via `Z3_optimize_from_string`/`_from_file`,
+///      or grouped API softs (`objectives`) → the executor's native
+///      `(check-sat)` dispatch (`optimize_check` transplants API
+///      softs, so joint soft+arithmetic and grouped problems take
+///      the joint/grouped engines).
+///   2. else flat API-level softs (from `Z3_optimize_assert_soft`)
+///      → the weight-exact MaxSMT engine (`check_sat_max`).
+///   3. else a plain check-sat.
+///
+/// `None` when the engine raised (the diagnostics are already captured).
+fn optimize_solve(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    objectives: bool,
+) -> Option<c_int> {
+    if objectives {
+        return Some(optimize_check_objectives(ctx, opt));
+    }
+    let result = match ctx.solver.check_sat_max() {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(format!("{e}"));
+            capture_check_diagnostics(ctx, opt, Z3_L_UNDEF);
+            return None;
+        }
+    };
+    Some(match result.status {
+        MaxSmtStatus::Optimal => {
+            // Capture the exact model selected, restored, and revalidated by
+            // the MaxSMT transaction. An Optimal result without a
+            // consumer-admissible witness violates the boundary contract and
+            // must fail closed.
+            match ctx.solver.model_for_consumer() {
+                Some(model) => {
+                    opt.last_model = Some(model.into_inner());
+                    opt.last_model_text = ctx.solver.model_str();
+                    ctx.last_error = Z3_OK;
+                    Z3_L_TRUE
+                }
+                None => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(
+                        "MaxSMT optimum has no consumer-admissible witnessing model".to_string(),
+                    );
+                    Z3_L_UNDEF
+                }
+            }
+        }
+        MaxSmtStatus::HardUnsatisfiable => {
+            ctx.last_error = Z3_OK;
+            Z3_L_FALSE
+        }
+        // `MaxSmtStatus` is `#[non_exhaustive]`; Unknown and any future
+        // not-yet-determined variant maps to Z3_L_UNDEF.
+        MaxSmtStatus::Unknown => Z3_L_UNDEF,
+        _ => Z3_L_UNDEF,
+    })
+}
+
+/// The FFI trust gates on an Optimize SAT whose diagnostics and optima are
+/// already captured: `Z3_L_TRUE`, or `Z3_L_UNDEF` with the SAT's public
+/// authority revoked and the reason recorded.
+fn gate_optimize_sat(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    finite_set_gate: &FiniteSetDecisionGate,
+) -> c_int {
+    let gated =
+        apply_finite_set_decision_gate(ctx, Z3_L_TRUE, finite_set_gate, "Z3_optimize_check");
+    if gated != Z3_L_TRUE {
+        let reason = ctx
+            .error_msg
+            .clone()
+            .unwrap_or_else(|| "finite-set optimum is not certified".to_string());
+        return optimize_unknown(ctx, opt, None, reason);
+    }
+    // Transitive-closure SAT gate: the background axioms for a
+    // `Z3_mk_transitive_closure` predicate are only PARTIAL (see
+    // `verify_transitive_closure_model` in solver.rs), so a SAT here
+    // could rest on an over-approximated TC. The optimize path has no
+    // snapshot verifier wired, so it honestly reports unknown rather
+    // than release an unverified SAT (never a fabricated verdict). The
+    // backend model and objective values were captured before this FFI
+    // trust gate; downgrading SAT to UNKNOWN revokes their public authority
+    // while retaining the reason/statistics for this completed query.
+    if !ctx.transitive_closure_regs.is_empty() {
+        let reason = "transitive-closure model verification is not wired into the \
+                      optimization path; refusing an unverified sat"
+            .to_string();
+        return optimize_unknown(ctx, opt, None, reason);
+    }
+    // Recursive-definition SAT gate (P1.1): the Optimize path cannot
+    // expand its incremental goal at check time, so a rec-defined
+    // function reaches the engine as a quantified-axiom-constrained
+    // plain UF. UNSAT is sound (the axiom is definitional); a SAT /
+    // optimum over ANY mention of a rec-defined name is not certified
+    // and is demoted honestly (never a fabricated optimum). The scan
+    // covers hard constraints, API softs, tracked pairs, and every
+    // registered objective; parsed-in soft constraints are not
+    // individually reachable here, so their mere presence demotes.
+    if !ctx.rec_fun_defs.is_empty() {
+        let mut scan: Vec<Term> = opt.hard.clone();
+        scan.extend(opt.softs.iter().map(|s| s.term));
+        for &(p, a) in &opt.tracked {
+            scan.push(p);
+            scan.push(a);
+        }
+        scan.extend(opt.public_objectives.iter().copied());
+        let parsed_softs_present = ctx.solver.num_parsed_soft_constraints() > 0;
+        if parsed_softs_present || ctx.solver.contains_rec_fun_apps(&scan, &ctx.rec_fun_defs) {
+            let reason = "recursive definitions are not expanded on the Optimize path; \
+                          optimum not certified"
+                .to_string();
+            return optimize_unknown(ctx, opt, None, reason);
+        }
+    }
+    Z3_L_TRUE
+}
+
 /// Capture the per-check diagnostics into the optimize handle: the reason-unknown
 /// string and the executor statistics snapshot.
 ///
-/// UNSAT-CORE — HONEST DIVERGENCE FROM Z3: `Z3_optimize_get_unsat_core` returns
-/// an EMPTY vector. AY's Optimize engine cannot extract a *participating-only*
-/// core: it does not thread check-time assumptions through the optimization loop
-/// (see `Z3_optimize_check`'s `num_assumptions == 0` requirement), the tracked
-/// hard assertions are asserted UNCONDITIONALLY (so an assumption-gated core
-/// would poison the optimum), and `Solver::reset` invalidates term handles — so
-/// there is no sound way to compute which tracked literals actually participate.
-/// Rather than return the FULL tracked set (which would include non-participating
-/// literals — a WRONG core value per Z3's contract), we return an empty core.
-/// `Z3_optimize_assert_and_track` still asserts its tracked constraint (so the
-/// verdict/optimum are correct); only the participating-core extraction is
-/// unsupported, and this is documented in `ay_z3_compat.h`. A future engine with
-/// assumption threading can populate this soundly.
+/// An unsat check's core is the full set of tracking literals (see
+/// [`Z3_optimize_get_unsat_core`]): sound, not minimal.
 fn capture_check_diagnostics(ctx: &mut Z3Context, opt: &mut OptimizeHandle, verdict: c_int) {
     opt.last_reason_unknown = if verdict == Z3_L_UNDEF {
         if ctx.last_error == Z3_OK {
@@ -621,15 +1115,23 @@ fn capture_check_diagnostics(ctx: &mut Z3Context, opt: &mut OptimizeHandle, verd
         None
     };
     opt.last_statistics = Some(ctx.solver.statistics().clone());
-    // Intentionally NOT populating last_unsat_core: see the doc above — an
-    // over-approximate full-tracked-set core would report non-participating
-    // literals (a wrong value). Empty is the sound, honest floor.
     let outcome = match verdict {
         Z3_L_TRUE => OptimizeCheckOutcome::Sat,
         Z3_L_FALSE => OptimizeCheckOutcome::Unsat,
         _ => OptimizeCheckOutcome::Unknown,
     };
     opt.record_check_outcome(outcome);
+    if outcome == OptimizeCheckOutcome::Unsat {
+        // One entry per distinct literal: a literal tracking several
+        // constraints is still one assumption (z3 reports it once).
+        let mut core: Vec<Term> = Vec::new();
+        for &(tracking, _) in &opt.tracked {
+            if !core.contains(&tracking) {
+                core.push(tracking);
+            }
+        }
+        opt.last_unsat_core = Some(core);
+    }
 }
 
 /// Run the executor's NATIVE optimization `(check-sat)` (arithmetic objectives
@@ -652,6 +1154,7 @@ fn optimize_check_objectives(ctx: &mut Z3Context, opt: &mut OptimizeHandle) -> c
         match ctx.solver.model_for_consumer() {
             Some(model) => {
                 opt.last_model = Some(model.into_inner());
+                opt.last_model_text = ctx.solver.model_str();
                 ctx.last_error = Z3_OK;
                 Z3_L_TRUE
             }
@@ -690,20 +1193,33 @@ pub unsafe extern "C" fn Z3_optimize_get_model(c: Z3_context, o: Z3_optimize) ->
             let Some(opt) = o.as_mut() else {
                 return ptr::null_mut();
             };
-            if opt.last_check_outcome != Some(OptimizeCheckOutcome::Sat) {
+            // Without a current model z3 raises; a null model without an
+            // error read in z3py as an empty, invalid one (measured: after
+            // another handle's parse retired this handle's model).
+            if opt.last_check_outcome != Some(OptimizeCheckOutcome::Sat) || opt.last_model.is_none()
+            {
+                ctx.last_error = Z3_INVALID_USAGE;
+                ctx.error_msg =
+                    Some("Z3_optimize_get_model: there is no current model".to_string());
                 return ptr::null_mut();
             }
             match opt.last_model.clone() {
                 Some(model) => {
-                    // The optimize path materializes no raw model text, so
-                    // the snapshot carries no function tables (honest
-                    // absence: UF applications stay symbolic under eval).
+                    // Function interpretations are part of the snapshot, as
+                    // for a Solver model: parsed out of the engine's model
+                    // text captured at check time.
+                    let func_interps = opt
+                        .last_model_text
+                        .as_deref()
+                        .map(|text| super::model_params::model_func_interps(&mut ctx.solver, text))
+                        .unwrap_or_default();
                     let handle = Box::into_raw(Box::new(ModelHandle {
                         model,
-                        func_interps: Vec::new(),
+                        func_interps,
                         user_const_interps: Vec::new(),
                         user_func_interps: Vec::new(),
                         rec_def_count: ctx.rec_fun_defs.len(),
+                        complete_functions: true,
                         _ctx: c,
                     }));
                     ctx.model_cache.push(handle);
@@ -733,12 +1249,12 @@ pub unsafe extern "C" fn Z3_optimize_to_string(c: Z3_context, o: Z3_optimize) ->
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
             let mut out = String::from("(optimize\n");
-            // Hard assertions, by internal term id (best-effort).
-            for t in ctx.solver.assertions() {
-                out.push_str(&format!("  (assert t!{})\n", t.to_raw()));
-            }
             // Soft constraints recorded on this optimize handle.
             if let Some(opt) = o.as_mut() {
+                // Hard assertions, by internal term id (best-effort).
+                for t in &opt.hard {
+                    out.push_str(&format!("  (assert t!{})\n", t.to_raw()));
+                }
                 for soft in &opt.softs {
                     let group = soft
                         .group
@@ -794,13 +1310,6 @@ pub unsafe extern "C" fn Z3_optimize_minimize(c: Z3_context, o: Z3_optimize, t: 
     unsafe { optimize_register_objective(c, o, t, ObjectiveSense::Minimize) }
 }
 
-/// Optimization sense for the shared registration path.
-#[derive(Clone, Copy)]
-enum ObjectiveSense {
-    Maximize,
-    Minimize,
-}
-
 /// Shared registration path for `maximize`/`minimize`.
 ///
 /// # Safety
@@ -813,7 +1322,7 @@ unsafe fn optimize_register_objective(
 ) -> c_uint {
     // SAFETY: forwarded under the caller's contract; `ffi_guard_uint` handles
     // null `c` and catches panics; `o` is null-checked below.
-    unsafe {
+    let index = unsafe {
         ffi_guard_uint(c, 0, |ctx| {
             let Some(opt) = o.as_mut() else {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -830,16 +1339,22 @@ unsafe fn optimize_register_objective(
                 "objective",
                 0
             );
-            let idx = match sense {
+            match sense {
                 ObjectiveSense::Maximize => ctx.solver.maximize(term),
                 ObjectiveSense::Minimize => ctx.solver.minimize(term),
             };
             opt.public_objectives.push(term);
+            opt.objective_senses.push(Some(sense));
+            opt.objective_slots
+                .push(ObjectiveSlot::Arith(opt.public_objectives.len() - 1));
             opt.clear_check_artifacts();
             ctx.last_error = Z3_OK;
-            idx as c_uint
+            (opt.objective_slots.len() - 1) as c_uint
         })
-    }
+    };
+    // SAFETY: the guard has returned; see `finish_optimize_operation`.
+    unsafe { finish_optimize_operation(c, o) };
+    index
 }
 
 /// Get the lower bound (`>=` side) of objective `idx`'s optimum as an AST.
@@ -854,16 +1369,17 @@ unsafe fn optimize_register_objective(
 /// Unbounded objectives (`+oo` for an unbounded `maximize`, `-oo` for an
 /// unbounded `minimize`) return the null AST (0). DIVERGENCE FROM Z3: Z3 returns
 /// a structured `oo` AST here; AY has no first-class `oo` numeral and there is no
-/// finite numeral that represents infinity, so it returns null rather than
-/// fabricate one. (Note that an unbounded INT objective already makes
+/// finite numeral that represents infinity, so it returns null with an error
+/// rather than fabricate one. (Note that an unbounded INT objective already makes
 /// `Z3_optimize_check` return `Z3_L_UNDEF`, so `get_lower`/`get_upper` are not
 /// usefully reached for it; only an unbounded REAL objective — which AY reports
 /// SAT with `oo` — reaches this null return.) A finite optimum is always an exact
 /// numeral, never fabricated.
 ///
-/// Returns the null AST (0) and sets `Z3_INVALID_ARG` if `idx` is out of range;
-/// returns 0 (with `Z3_OK`) if no optimum is available (last check not SAT) or
-/// the optimum is unbounded.
+/// Returns the null AST (0) and sets `Z3_INVALID_ARG` if `idx` is out of range,
+/// `Z3_INVALID_USAGE` if the last check was not SAT, and `Z3_EXCEPTION` if the
+/// optimum is unbounded or missing, so a binding raises instead of handing on
+/// a null AST.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `o` must be a valid optimize handle.
@@ -903,35 +1419,104 @@ pub unsafe extern "C" fn Z3_optimize_get_upper(
 unsafe fn optimize_get_objective_ast(c: Z3_context, o: Z3_optimize, idx: c_uint) -> Z3_ast {
     // SAFETY: forwarded; `ffi_guard_ast` handles null `c` and catches panics.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             let Some(opt) = o.as_ref() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("null Z3_optimize handle in get_lower/get_upper".to_string());
                 return 0;
             };
-            let idx = idx as usize;
+            let slot_index = idx as usize;
             // Validate the index against the registered objectives.
-            let Some(sort) = ctx.solver.objective_sort(idx) else {
+            let Some(slot) = opt.objective_slots.get(slot_index).cloned() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(format!(
-                    "Z3_optimize_get_lower/upper: objective index {idx} out of range"
+                    "Z3_optimize_get_lower/upper: objective index {slot_index} out of range"
                 ));
                 return 0;
             };
             if opt.last_check_outcome != Some(OptimizeCheckOutcome::Sat) {
-                ctx.last_error = Z3_OK;
+                // No optimum to report: an error, not a null AST that a binding
+                // only notices later as "AST is null".
+                ctx.last_error = Z3_INVALID_USAGE;
+                ctx.error_msg = Some(format!(
+                    "Z3_optimize_get_lower/upper: objective {idx} has no value: the last \
+                     check was not sat"
+                ));
                 return 0;
             }
-            let Some(value) = ctx.solver.get_objective_value(idx) else {
-                // No optimum available (last check not SAT, or inconclusive).
-                // Honest: return null rather than a fabricated numeral.
+            let idx = match slot {
+                ObjectiveSlot::Arith(idx) => idx,
+                ObjectiveSlot::Soft(group) => {
+                    ctx.last_error = Z3_OK;
+                    return soft_group_cost(ctx, opt, group.as_deref());
+                }
+            };
+            if let (Some((Some(sort), None)), Some(Some((value, eps)))) = (
+                opt.last_objective_values.get(idx).cloned(),
+                opt.last_objective_epsilons.get(idx).cloned(),
+            ) {
                 ctx.last_error = Z3_OK;
+                return build_epsilon_numeral(ctx, &value, &eps, &sort);
+            }
+            let Some((Some(sort), Some(value))) = opt.last_objective_values.get(idx).cloned()
+            else {
+                // SAT, yet no optimum recorded: say so instead of a silent null
+                // that a binding reads as "AST is null" much later.
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(format!(
+                    "Z3_optimize_get_lower/upper: no value is available for objective {idx}"
+                ));
                 return 0;
             };
             ctx.last_error = Z3_OK;
-            build_objective_numeral(ctx, &value, &sort)
+            let ast = build_objective_numeral(ctx, &value, &sort);
+            if ast == 0 && ctx.last_error == Z3_OK {
+                // Never a silent null: a binding would only notice it later.
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(format!(
+                    "Z3_optimize_get_lower/upper: the optimum of objective {idx} could not be \
+                     built as a term"
+                ));
+            }
+            ast
         })
     }
+}
+
+/// The cost of the soft-constraint group `group` under the last optimum's
+/// model: the sum of the weights of its soft constraints the model falsifies
+/// (z3's value of a soft objective). Null when some soft constraint does not
+/// evaluate to a Boolean value.
+fn soft_group_cost(ctx: &mut Z3Context, opt: &OptimizeHandle, group: Option<&str>) -> Z3_ast {
+    let Some(model) = opt.last_model.clone() else {
+        return 0;
+    };
+    let func_interps = opt
+        .last_model_text
+        .as_deref()
+        .map(|text| super::model_params::model_func_interps(&mut ctx.solver, text))
+        .unwrap_or_default();
+    let probe = ModelHandle {
+        model,
+        func_interps,
+        user_const_interps: Vec::new(),
+        user_func_interps: Vec::new(),
+        rec_def_count: ctx.rec_fun_defs.len(),
+        complete_functions: true,
+        _ctx: ptr::null_mut(),
+    };
+    let mut cost = BigInt::from(0);
+    for soft in opt.softs.iter().filter(|s| s.group.as_deref() == group) {
+        let value = super::model_params::eval_term_under_model(ctx, &probe, soft.term, true);
+        match value.and_then(|v| ctx.solver.bool_value(v)) {
+            Some(true) => {}
+            Some(false) => cost += BigInt::from(soft.weight),
+            None => return 0,
+        }
+    }
+    let term = ctx.solver.int_const_bigint(&cost);
+    let ast = term_to_ast(ctx, term);
+    record_ast_sort(ctx, ast, Sort::Int)
 }
 
 /// Build a Z3 numeral AST for an objective optimum in the given sort.
@@ -939,16 +1524,65 @@ unsafe fn optimize_get_objective_ast(c: Z3_context, o: Z3_optimize, idx: c_uint)
 /// Finite optima: an exact numeral in the objective's sort. Unbounded optima
 /// (`+oo` / `-oo`): AY has no first-class infinity term and there is no finite
 /// numeral that represents `oo`, so this returns the null AST (0) — honest
-/// rather than a fabricated finite value. See [`Z3_optimize_get_lower`] for the
-/// documented divergence from Z3 (which returns a structured `oo` AST).
+/// rather than a fabricated finite value; the accessor then sets
+/// `Z3_EXCEPTION` (z3 returns a structured `oo` AST).
 fn build_objective_numeral(ctx: &mut Z3Context, value: &ObjectiveValue, sort: &Sort) -> Z3_ast {
     match value {
         ObjectiveValue::Finite(r) => build_finite_numeral(ctx, r, sort),
-        // Unbounded: no representable numeral. Return null (0). The native API
-        // exposes the +oo/-oo distinction via `Solver::get_objective_value`;
-        // the C numeral surface cannot, so it returns null honestly.
-        ObjectiveValue::PosInfinity | ObjectiveValue::NegInfinity => 0,
+        // Unbounded: z3 reports the constant `oo` (an uninterpreted
+        // constant named `oo`, measured on 5.1), and `-oo` as `-1 * oo`.
+        // The constant is INT-sorted even for a Real objective (measured:
+        // `Z3_get_sort` of a Real objective's `oo` is the Int sort).
+        ObjectiveValue::PosInfinity | ObjectiveValue::NegInfinity => {
+            let oo_sort = Sort::Int;
+            let Some(oo) = super::terms::ffi_api_constant(
+                ctx,
+                &super::SymbolKey::String("oo".to_string()),
+                &oo_sort,
+            ) else {
+                return 0;
+            };
+            let term = if matches!(value, ObjectiveValue::NegInfinity) {
+                let minus_one = ctx.solver.int_const_bigint(&BigInt::from(-1));
+                match ctx.solver.try_mul(minus_one, oo) {
+                    Ok(term) => term,
+                    Err(_) => return 0,
+                }
+            } else {
+                oo
+            };
+            let ast = term_to_ast(ctx, term);
+            record_ast_sort(ctx, ast, oo_sort)
+        }
     }
+}
+
+/// z3's AST of an unattained optimum `value + eps * epsilon` (z3 prints
+/// `3 + -1*epsilon` for `maximize x` under `x < 3`): `epsilon` is a constant
+/// of that name, as `oo` is.
+fn build_epsilon_numeral(
+    ctx: &mut Z3Context,
+    value: &BigRational,
+    eps: &BigRational,
+    sort: &Sort,
+) -> Z3_ast {
+    let Some(epsilon) =
+        super::terms::ffi_api_constant(ctx, &super::SymbolKey::String("epsilon".to_string()), sort)
+    else {
+        return 0;
+    };
+    let finite = ctx
+        .solver
+        .rational_const_bigint(value.numer(), value.denom());
+    let coeff = ctx.solver.rational_const_bigint(eps.numer(), eps.denom());
+    let Ok(scaled) = ctx.solver.try_mul(coeff, epsilon) else {
+        return 0;
+    };
+    let Ok(sum) = ctx.solver.try_add(finite, scaled) else {
+        return 0;
+    };
+    let ast = term_to_ast(ctx, sum);
+    record_ast_sort(ctx, ast, sort.clone())
 }
 
 /// Build a finite numeral AST in the objective's sort.
@@ -973,16 +1607,14 @@ fn build_finite_numeral(ctx: &mut Z3Context, r: &BigRational, sort: &Sort) -> Z3
         _ => (Sort::Int, ctx.solver.int_const_bigint(&r.to_integer())),
     };
     let ast = term_to_ast(ctx, term);
-    record_ast_sort(ctx, ast, out_sort);
-    ast
+    record_ast_sort(ctx, ast, out_sort)
 }
 
 /// Build an `Int` numeral AST for the exact integer `v` and record its sort.
 fn int_numeral_ast(ctx: &mut Z3Context, v: &BigInt) -> Z3_ast {
     let term = ctx.solver.int_const_bigint(v);
     let ast = term_to_ast(ctx, term);
-    record_ast_sort(ctx, ast, Sort::Int);
-    ast
+    record_ast_sort(ctx, ast, Sort::Int)
 }
 
 // ============================================================================
@@ -1019,6 +1651,7 @@ pub unsafe extern "C" fn Z3_optimize_push(c: Z3_context, o: Z3_optimize) {
                 soft_len: opt.softs.len(),
                 tracked_len: opt.tracked.len(),
                 public_objective_len: opt.public_objectives.len(),
+                objective_slot_len: opt.objective_slots.len(),
                 parsed_soft_public_len: opt.parsed_soft_public_terms.len(),
             };
             if let Err(e) = ctx.solver.try_push() {
@@ -1031,6 +1664,8 @@ pub unsafe extern "C" fn Z3_optimize_push(c: Z3_context, o: Z3_optimize) {
             opt.clear_check_artifacts();
             ctx.last_error = Z3_OK;
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
@@ -1077,12 +1712,16 @@ pub unsafe extern "C" fn Z3_optimize_pop(c: Z3_context, o: Z3_optimize) {
             ctx.solver.truncate_soft_constraints(marker.soft_len);
             opt.tracked.truncate(marker.tracked_len);
             opt.public_objectives.truncate(marker.public_objective_len);
+            opt.objective_senses.truncate(marker.public_objective_len);
+            opt.objective_slots.truncate(marker.objective_slot_len);
             opt.parsed_soft_public_terms
                 .truncate(marker.parsed_soft_public_len);
             // The popped scope's model / core no longer apply.
             opt.clear_check_artifacts();
             ctx.last_error = Z3_OK;
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
@@ -1093,11 +1732,13 @@ pub unsafe extern "C" fn Z3_optimize_pop(c: Z3_context, o: Z3_optimize) {
 /// Assert a tracked hard constraint `a`, associated with the tracking literal
 /// `t`.
 ///
-/// `a` is asserted as a REAL hard constraint (unconditional, exactly like
-/// `Z3_optimize_assert`): it genuinely holds for every solve, so the optima and
-/// SAT/UNSAT verdict are unaffected — nothing is faked. The Boolean tracking
-/// literal `t` is retained, but participating-only Optimize core extraction is
-/// not implemented; [`Z3_optimize_get_unsat_core`] therefore returns empty.
+/// Exactly z3's encoding: the hard constraint is `t => a` and `t` is an
+/// assumption of every check. AY has no check-time assumptions on its
+/// Optimize path, so `t` is asserted as well; `t => a` with `t` is the same
+/// problem, so the verdict and optima are z3's (asserting `a` alone, as AY did,
+/// answered `sat` when another hard constraint refutes `t`). Every tracking
+/// literal is therefore part of each check, and the full set of them is a
+/// sound unsat core ([`Z3_optimize_get_unsat_core`]).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `o` a valid optimize handle; `a`/`t`
@@ -1137,27 +1778,42 @@ pub unsafe extern "C" fn Z3_optimize_assert_and_track(
                 );
                 return;
             }
-            // Assert `a` as a real hard constraint (validates its Bool sort).
-            if let Err(e) = ctx.solver.try_assert_term(a_term) {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some(format!("{e}"));
-                return;
+            // `t => a` as the hard constraint (validates `a`'s Bool sort), and
+            // `t` as the check's assumption.
+            let hard = match ctx.solver.try_implies(t_term, a_term) {
+                Ok(term) => term,
+                Err(e) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(format!("{e}"));
+                    return;
+                }
+            };
+            for term in [hard, t_term] {
+                if let Err(e) = ctx.solver.try_assert_term(term) {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(format!("{e}"));
+                    return;
+                }
             }
-            opt.hard.push(a_term);
+            opt.hard.push(hard);
             opt.tracked.push((t_term, a_term));
             opt.clear_check_artifacts();
+            release_optimize_adopted_definitions(ctx, opt);
             ctx.last_error = Z3_OK;
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
 /// Retrieve the unsat core of the last `Z3_optimize_check`.
 ///
-/// HONEST DIVERGENCE FROM Z3: always returns an empty vector. AY's Optimize path
-/// does not thread tracking literals as assumptions and therefore cannot extract
-/// a participating-only core. Returning the complete tracked set would include
-/// non-participating literals and misstate Z3's core contract, so this accessor
-/// fails to the sound empty floor. See [`capture_check_diagnostics`].
+/// The core is every tracking literal of that check: each is asserted with its
+/// `t => a` (see [`Z3_optimize_assert_and_track`]), so the hard constraints
+/// together with all of them are unsatisfiable exactly when the check was
+/// unsat. That core is sound, though not minimal. The empty core AY used to
+/// return claimed the untracked hard constraints alone were unsatisfiable,
+/// which is false whenever a tracked assertion takes part (z3: `[p1, p3]`).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `o` must be a valid optimize handle.
@@ -1222,7 +1878,10 @@ pub unsafe extern "C" fn Z3_optimize_get_objectives(
                 return cache_ast_vector(ctx, Vec::new());
             };
             let n = ctx.solver.num_objectives();
-            if opt.public_objectives.len() != n {
+            if !ctx.optimize_engine_displaced
+                && ptr::eq(ctx.optimize_engine_owner, ptr::from_ref(opt))
+                && opt.public_objectives.len() != n
+            {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg = Some(
                     "Z3_optimize_get_objectives: public objective metadata is not aligned"
@@ -1235,7 +1894,7 @@ pub unsafe extern "C" fn Z3_optimize_get_objectives(
             for term in items {
                 let ast = term_to_ast(ctx, term);
                 let sort = public_ast_sort(ctx, ast, term);
-                record_ast_sort(ctx, ast, sort);
+                let ast = record_ast_sort(ctx, ast, sort);
                 asts.push(ast);
             }
             ctx.last_error = Z3_OK;
@@ -1353,29 +2012,41 @@ unsafe fn optimize_get_objective_vector(
                     Some("null Z3_optimize handle in get_lower/upper_as_vector".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             };
-            let idx = idx as usize;
-            let Some(sort) = ctx.solver.objective_sort(idx) else {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some(format!(
-                    "Z3_optimize_get_lower/upper_as_vector: objective index {idx} out of range"
-                ));
-                return cache_ast_vector(ctx, Vec::new());
+            let idx = match opt.objective_slots.get(idx as usize) {
+                Some(ObjectiveSlot::Arith(idx)) => *idx,
+                _ => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!(
+                        "Z3_optimize_get_lower/upper_as_vector: objective index {idx} is not \
+                         an arithmetic objective"
+                    ));
+                    return cache_ast_vector(ctx, Vec::new());
+                }
             };
             if opt.last_check_outcome != Some(OptimizeCheckOutcome::Sat) {
                 ctx.last_error = Z3_OK;
                 return cache_ast_vector(ctx, Vec::new());
             }
-            let Some(value) = ctx.solver.get_objective_value(idx) else {
-                // No optimum available (last check not SAT): honest empty vector.
-                ctx.last_error = Z3_OK;
-                return cache_ast_vector(ctx, Vec::new());
+            let epsilon = opt.last_objective_epsilons.get(idx).cloned().flatten();
+            let (sort, value) = match opt.last_objective_values.get(idx).cloned() {
+                Some((Some(sort), Some(value))) => (sort, Some(value)),
+                Some((Some(sort), None)) if epsilon.is_some() => (sort, None),
+                _ => {
+                    // No optimum available (last check not SAT): honest empty vector.
+                    ctx.last_error = Z3_OK;
+                    return cache_ast_vector(ctx, Vec::new());
+                }
             };
             ctx.last_error = Z3_OK;
             // Decompose into (infinity coeff a, finite b, epsilon coeff c).
-            let (a, finite, eps) = match value {
-                ObjectiveValue::Finite(r) => (BigInt::from(0), Some(r), BigInt::from(0)),
-                ObjectiveValue::PosInfinity => (BigInt::from(1), None, BigInt::from(0)),
-                ObjectiveValue::NegInfinity => (BigInt::from(-1), None, BigInt::from(0)),
+            let (a, finite, eps) = match (value, epsilon) {
+                (Some(ObjectiveValue::Finite(r)), _) => (BigInt::from(0), Some(r), BigInt::from(0)),
+                (Some(ObjectiveValue::PosInfinity), _) => (BigInt::from(1), None, BigInt::from(0)),
+                (Some(ObjectiveValue::NegInfinity), _) => (BigInt::from(-1), None, BigInt::from(0)),
+                (None, Some((value, eps))) if eps.is_integer() => {
+                    (BigInt::from(0), Some(value), eps.to_integer())
+                }
+                _ => return cache_ast_vector(ctx, Vec::new()),
             };
             let a_ast = int_numeral_ast(ctx, &a);
             let b_ast = match &finite {
@@ -1457,6 +2128,110 @@ pub unsafe extern "C" fn Z3_optimize_get_statistics(c: Z3_context, o: Z3_optimiz
 // SMT-LIB2 parsing into the optimize context.
 // ============================================================================
 
+/// Refuse an Optimize parse while Solver handles share the context: parsed
+/// content is not recorded on the handle, so it could not be replayed after a
+/// Solver check reset the engine (`restore_optimize_engine`).
+fn parse_blocked_by_solver_handles(ctx: &mut Z3Context, operation: &str) -> bool {
+    if !ctx.has_solver_family_handles() {
+        return false;
+    }
+    ctx.last_error = Z3_INVALID_USAGE;
+    ctx.error_msg = Some(format!(
+        "{operation}: parsing into an Optimize handle whose context also has Solver \
+         handles is unsupported; use a separate Z3_context"
+    ));
+    true
+}
+
+/// The non-mutating preflight of an Optimize parse: the text's commands, or
+/// `None` with the context error set.
+fn optimize_parse_preflight(
+    ctx: &mut Z3Context,
+    input: &str,
+    operation: &str,
+) -> Option<Vec<Command>> {
+    // Fail-close reserved `map[...]` symbol capture (measured wrong-verdict
+    // channel through the core elaborator) — see `smtlib2_reserved_error`.
+    if let Some(msg) = super::smtlib2_reserved_error(input) {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!("{operation}: {msg}"));
+        return None;
+    }
+    let commands = match ay_frontend::parse(input) {
+        Ok(commands) => commands,
+        Err(e) => {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(format!("{operation}: {e}"));
+            return None;
+        }
+    };
+    if commands.iter().any(|command| {
+        matches!(
+            command,
+            Command::Push(_) | Command::Pop(_) | Command::Reset | Command::ResetAssertions
+        )
+    }) {
+        ctx.last_error = Z3_INVALID_USAGE;
+        ctx.error_msg = Some(format!(
+            "{operation}: push/pop/reset commands are not supported inside an Optimize parse transaction"
+        ));
+        return None;
+    }
+    Some(commands)
+}
+
+/// The bound parse of an Optimize text (see `parse_binding`): `None` when it
+/// decided the text (installed, or refused with the context error set), and
+/// `Some(())` when the text is outside the rebinding fragment and may take the
+/// legacy global parse.
+fn parse_optimize_bound(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    input: &str,
+    commands: &[Command],
+    operation: &str,
+) -> Option<()> {
+    // z3 parses each Optimize text in a fresh command context whose names
+    // denote the context's declarations of the same name and signature
+    // (measured: a parsed `(declare-fun a () Int)` was a second `a`, so the
+    // API's `a == 0` never constrained it: `sat [a = 0, a = 3]` where z3
+    // answers `unsat`). The bound parse installs the text's formulas through
+    // the handle's own records, so the handle stays replayable.
+    let scope = super::parse_binding::ParseScope {
+        objectives: true,
+        ..super::parse_binding::ParseScope::default()
+    };
+    match super::parse_binding::bound_parse(ctx, input, &scope) {
+        super::parse_binding::BoundParse::Parsed(content) => {
+            install_parsed_optimize_content(ctx, opt, content, operation);
+            return None;
+        }
+        super::parse_binding::BoundParse::Failed(reason) => {
+            ctx.last_error = super::Z3_PARSER_ERROR;
+            ctx.error_msg = Some(format!("{operation}: {reason}"));
+            return None;
+        }
+        super::parse_binding::BoundParse::ScopeLost(reason) => {
+            opt.terminal_error = Some(format!("{operation}: {reason}"));
+            ctx.poison_decision_engine(format!("{operation}: {reason}"));
+            return None;
+        }
+        super::parse_binding::BoundParse::Ineligible(reason) => {
+            if let Some(name) = super::solver::global_parse_collision(ctx, commands) {
+                ctx.last_error = super::Z3_PARSER_ERROR;
+                ctx.error_msg = Some(format!(
+                    "{operation}: the text declares '{name}', which this context already \
+                     declares, and AY cannot bind the text's '{name}' to it in a text with \
+                     {reason}"
+                ));
+                return None;
+            }
+        }
+    }
+
+    Some(())
+}
+
 /// Execute one Optimize parse as an atomic semantic transaction.
 ///
 /// A hidden solver scope commits successful parsed assertions/objectives/softs
@@ -1475,6 +2250,17 @@ fn parse_optimize_transaction(
     if !optimize_handle_is_usable(ctx, opt, operation) {
         return;
     }
+    let Some(commands) = optimize_parse_preflight(ctx, input, operation) else {
+        return;
+    };
+
+    if parse_optimize_bound(ctx, opt, input, &commands, operation).is_none() {
+        return;
+    }
+    // The legacy global parse: its content is not recorded on the handle.
+    if parse_blocked_by_solver_handles(ctx, operation) {
+        return;
+    }
     // Successful parse transactions intentionally retain a hidden engine
     // scope as their commit boundary. Such a scope must remain below every
     // user-visible scope; opening one after a user push would make the next
@@ -1484,35 +2270,6 @@ fn parse_optimize_transaction(
         ctx.last_error = Z3_INVALID_USAGE;
         ctx.error_msg = Some(format!(
             "{operation}: parsing while an Optimize user scope is open is unsupported; pop all user scopes before parsing"
-        ));
-        return;
-    }
-
-    // Fail-close reserved `map[...]` symbol capture (measured wrong-verdict
-    // channel through the core elaborator) — see `smtlib2_reserved_error`.
-    if let Some(msg) = super::smtlib2_reserved_error(input) {
-        ctx.last_error = Z3_INVALID_ARG;
-        ctx.error_msg = Some(format!("{operation}: {msg}"));
-        return;
-    }
-
-    let commands = match ay_frontend::parse(input) {
-        Ok(commands) => commands,
-        Err(e) => {
-            ctx.last_error = Z3_EXCEPTION;
-            ctx.error_msg = Some(format!("{operation}: {e}"));
-            return;
-        }
-    };
-    if commands.iter().any(|command| {
-        matches!(
-            command,
-            Command::Push(_) | Command::Pop(_) | Command::Reset | Command::ResetAssertions
-        )
-    }) {
-        ctx.last_error = Z3_INVALID_USAGE;
-        ctx.error_msg = Some(format!(
-            "{operation}: push/pop/reset commands are not supported inside an Optimize parse transaction"
         ));
         return;
     }
@@ -1540,7 +2297,12 @@ fn parse_optimize_transaction(
             opt.hard.extend(retained.assertions);
             opt.parsed_soft_public_terms
                 .extend(retained.soft_constraints);
+            opt.objective_senses
+                .extend(retained.objectives.iter().map(|_| None));
             opt.public_objectives.extend(retained.objectives);
+            opt.replay_blocker = Some(format!(
+                "{operation} installed SMT-LIB content the handle cannot replay"
+            ));
             opt.terminal_error = None;
             ctx.last_error = Z3_OK;
             ctx.error_msg = None;
@@ -1558,6 +2320,63 @@ fn parse_optimize_transaction(
             ctx.error_msg = Some(reason);
         }
     }
+}
+
+/// The objective index of the soft-constraint group `group`, registering it
+/// on first use.
+fn soft_slot(opt: &mut OptimizeHandle, group: Option<String>) -> usize {
+    let slot = ObjectiveSlot::Soft(group);
+    if let Some(index) = opt.objective_slots.iter().position(|s| *s == slot) {
+        return index;
+    }
+    opt.objective_slots.push(slot);
+    opt.objective_slots.len() - 1
+}
+
+/// Install the formulas of a bound Optimize parse exactly as the API calls
+/// install them (`Z3_optimize_assert`, `_assert_soft`, `_maximize`,
+/// `_minimize`), recorded on the handle so it replays them.
+fn install_parsed_optimize_content(
+    ctx: &mut Z3Context,
+    opt: &mut OptimizeHandle,
+    content: super::parse_binding::ParsedContent,
+    operation: &str,
+) {
+    for term in content.assertions {
+        if let Err(e) = ctx.solver.try_assert_term(term) {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(format!("{operation}: {e}"));
+            return;
+        }
+        opt.hard.push(term);
+    }
+    for (term, weight, group) in content.softs {
+        if let Err(e) = ctx.solver.assert_soft(term, weight, None) {
+            ctx.last_error = Z3_EXCEPTION;
+            ctx.error_msg = Some(format!("{operation}: {e}"));
+            return;
+        }
+        soft_slot(opt, group.clone());
+        opt.softs.push(SoftRecord {
+            term,
+            weight,
+            group,
+        });
+    }
+    for (term, sense) in content.objectives {
+        match sense {
+            ObjectiveSense::Maximize => ctx.solver.maximize(term),
+            ObjectiveSense::Minimize => ctx.solver.minimize(term),
+        };
+        opt.public_objectives.push(term);
+        opt.objective_senses.push(Some(sense));
+        opt.objective_slots
+            .push(ObjectiveSlot::Arith(opt.public_objectives.len() - 1));
+    }
+    opt.clear_check_artifacts();
+    release_optimize_adopted_definitions(ctx, opt);
+    ctx.last_error = Z3_OK;
+    ctx.error_msg = None;
 }
 
 /// Parse an SMT-LIB2 string (with `(assert ...)`, `(assert-soft ...)`,
@@ -1604,6 +2423,8 @@ pub unsafe extern "C" fn Z3_optimize_from_string(c: Z3_context, o: Z3_optimize, 
             };
             parse_optimize_transaction(ctx, opt, input, "Z3_optimize_from_string");
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
@@ -1645,6 +2466,8 @@ pub unsafe extern "C" fn Z3_optimize_from_file(c: Z3_context, o: Z3_optimize, s:
             };
             parse_optimize_transaction(ctx, opt, &contents, "Z3_optimize_from_file");
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 
@@ -1654,8 +2477,8 @@ pub unsafe extern "C" fn Z3_optimize_from_file(c: Z3_context, o: Z3_optimize, s:
 
 /// Set parameters on the optimization context.
 ///
-/// Routes through the same param application as `Z3_solver_set_params`: AY
-/// honors `timeout` (uint, ms), `produce-proofs` (bool), and the
+/// As `Z3_solver_set_params`, AY honors `timeout` (uint, ms) and
+/// `produce-proofs` (bool) for this handle's own checks, and the
 /// `priority`/`opt.priority` objective policy (`lex`, `box`, or `pareto`).
 /// Priority is validated before any parameter is applied, so an invalid value
 /// cannot leave a partially updated optimization configuration.
@@ -1701,7 +2524,10 @@ pub unsafe extern "C" fn Z3_optimize_set_params(c: Z3_context, o: Z3_optimize, p
                     return;
                 }
             }
-            apply_supported_params(&mut ctx.solver, &params_owned);
+            // `timeout` and proof production belong to THIS handle and are
+            // applied for its own checks only (libz3 5.1.0: an Optimize's
+            // `timeout` of 1 ms leaves a later Solver's pigeonhole `unsat`).
+            opt.params.record(&params_owned);
             // Parameters govern the next decision transaction. Retire copied
             // result artifacts so no caller can mistake a pre-configuration
             // snapshot for the outcome of the newly configured optimizer.
@@ -1709,6 +2535,8 @@ pub unsafe extern "C" fn Z3_optimize_set_params(c: Z3_context, o: Z3_optimize, p
             ctx.last_error = Z3_OK;
             ctx.error_msg = None;
         });
+        // SAFETY: the guard has returned; see `finish_optimize_operation`.
+        finish_optimize_operation(c, o);
     }
 }
 

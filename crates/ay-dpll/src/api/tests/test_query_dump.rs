@@ -7,8 +7,8 @@
 //! A dumped script must be usable as a standalone repro/oracle input: every
 //! uninterpreted sort referenced by the query must be declared, and the script
 //! must round-trip through ay's own front end. If a `z3` binary is on PATH the
-//! script is additionally checked to be z3-parseable (soft check: skipped when
-//! z3 is absent, never a hard dependency).
+//! script is additionally checked to be z3-parseable. Absence is optional unless
+//! `Z3_DIFFERENTIAL_REQUIRED` requires the oracle; skips are visible.
 
 use crate::api::*;
 use std::io::Write as _;
@@ -35,10 +35,67 @@ fn replay_through_own_frontend(script: &str) -> String {
     last
 }
 
-/// Soft z3 parse/solve check: only runs when a `z3` binary is available.
+#[derive(Clone, Copy)]
+enum Z3SpawnRequirement {
+    Optional,
+    Required,
+}
+
+fn checked_z3_spawn(
+    output: std::io::Result<std::process::Output>,
+    requirement: Z3SpawnRequirement,
+) -> Option<std::process::Output> {
+    match output {
+        Ok(output) => Some(output),
+        Err(error) => match requirement {
+            Z3SpawnRequirement::Required => panic!("required real z3 could not execute: {error}"),
+            Z3SpawnRequirement::Optional => {
+                ay_core::safe_eprintln!(
+                    "{} suite=ay-dpll api::tests::test_query_dump reason=real z3 spawn failed: {error}",
+                    ay_test_support::z3::SKIP_MARKER,
+                );
+                None
+            }
+        },
+    }
+}
+
+#[test]
+fn resolved_z3_spawn_error_is_required_or_visible_optional() {
+    let empty = tempfile::tempdir().expect("isolated nonexistent executable path");
+    let missing = empty.path().join("missing-z3");
+    let required = std::process::Command::new(&missing).output();
+    assert_eq!(
+        required.as_ref().expect_err("real OS spawn error").kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        checked_z3_spawn(required, Z3SpawnRequirement::Required)
+    }));
+    assert!(
+        caught.is_err(),
+        "a required oracle cannot silently skip a spawn error"
+    );
+    let optional = std::process::Command::new(&missing).output();
+    assert_eq!(
+        optional.as_ref().expect_err("real OS spawn error").kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(checked_z3_spawn(optional, Z3SpawnRequirement::Optional).is_none());
+}
+
+/// Soft z3 parse/solve check: only runs when a REAL z3 is available.
 /// Asserts the script produces a clean verdict (no parse errors) when z3 is
-/// present; silently skips otherwise.
+/// present; skips (with an `AY-TEST-SKIP` line) otherwise.
+///
+/// The oracle is identity-checked and reached by path: a binary named `z3`
+/// that is not z3 (a sandbox or measurement shim) exits non-zero with an empty
+/// stdout, and reading that as a verdict blames AY's dumped script for an
+/// oracle that never ran. See `ay_test_support::z3`.
 fn soft_check_z3_parseable(script: &str, expected: &[&str]) {
+    let Some(z3) = ay_test_support::z3::optional_z3("ay-dpll api::tests::test_query_dump") else {
+        return; // no real z3: soft check skipped
+    };
     // A real unique tempfile avoids collisions between equal-length scripts in
     // concurrent tests (PID + length was not a unique name).
     let mut file = tempfile::Builder::new()
@@ -49,12 +106,16 @@ fn soft_check_z3_parseable(script: &str, expected: &[&str]) {
     file.write_all(script.as_bytes())
         .expect("write z3 query-dump tempfile");
     file.flush().expect("flush z3 query-dump tempfile");
-    let output = std::process::Command::new("z3")
-        .arg("-smt2")
-        .arg(file.path())
-        .output();
-    let Ok(output) = output else {
-        return; // z3 not installed: soft check skipped
+    let requirement = if ay_test_support::z3::differential_required() {
+        Z3SpawnRequirement::Required
+    } else {
+        Z3SpawnRequirement::Optional
+    };
+    let Some(output) = checked_z3_spawn(
+        z3.command().arg("-smt2").arg(file.path()).output(),
+        requirement,
+    ) else {
+        return;
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -150,6 +150,10 @@ impl RebuildWalk<'_, '_> {
             assume,
             &plan.chain,
         );
+        // Identity consequence: the chain's `(cl chain.target)` is the unit.
+        if plan.lemma.is_empty() {
+            return self.record(index, instance);
+        }
         let coefficients = vec![1i64; plan.lemma.len()];
         let lemma = self.state.new_proof.add_step(ProofStep::TheoryLemma {
             theory: "LRA".to_string(),

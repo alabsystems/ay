@@ -2,7 +2,11 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `and_neg` and the charge class it must KEEP.
+//! Recursive `and_neg` spellings and the charge class they must KEEP.
+//!
+//! Exact ordered raw-Not introduction now has a separate checked fast path
+//! (`metering_and_neg_identity`). These recursive counterexamples do not enter
+//! it; the unrestricted rule still cannot use a DAG-only charge.
 //!
 //! # The question this file answers, and the answer
 //!

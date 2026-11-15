@@ -1716,7 +1716,7 @@ pub(crate) fn parse<R: Read>(reader: R) -> Result<DimacsFormula, DimacsError> {
 /// 0-based variable index that appears (0 if there are no literals). This is the
 /// content-driven variable count used to size the solver, independent of any
 /// declared header.
-fn max_variable_count(clauses: &[Vec<Literal>]) -> usize {
+pub(crate) fn max_variable_count(clauses: &[Vec<Literal>]) -> usize {
     clauses
         .iter()
         .flat_map(|clause| clause.iter())

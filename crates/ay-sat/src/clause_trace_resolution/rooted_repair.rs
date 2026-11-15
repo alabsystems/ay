@@ -7,9 +7,9 @@
 /// target, propagate ONLY the candidate clauses to fixpoint, and on conflict
 /// emit the combined cone — root-cone reasons in root propagation order,
 /// then candidate-cone ids in candidate propagation order, then the
-/// conflicting id. Cost is `O(row)` after the one-time root fixpoint,
-/// instead of a full-database sweep per row. `None` falls through to the
-/// full-sweep synthesis.
+/// conflicting id. Repeated passes keep candidate order, but clauses already
+/// satisfied in this row no longer need literal scans. `None` falls through
+/// to the full-sweep synthesis.
 fn compact_rup_hint_candidates_rooted(
     root: &mut RootPropagation,
     original_clauses: &[(u64, Vec<Literal>)],
@@ -17,6 +17,8 @@ fn compact_rup_hint_candidates_rooted(
     target_clause: &[Literal],
     candidate_hints: &[u64],
     max_hints: usize,
+    admitted_recorded_capacity: usize,
+    admitted_scheduler_bytes: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
     let result = rooted_repair_core(
@@ -26,6 +28,8 @@ fn compact_rup_hint_candidates_rooted(
         target_clause,
         candidate_hints,
         max_hints,
+        admitted_recorded_capacity,
+        admitted_scheduler_bytes,
         meter,
     );
     rooted_repair_cleanup(root);
@@ -39,6 +43,8 @@ fn rooted_repair_core(
     target_clause: &[Literal],
     candidate_hints: &[u64],
     max_hints: usize,
+    admitted_recorded_capacity: usize,
+    admitted_scheduler_bytes: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
     if root.premises_conflict {
@@ -66,8 +72,15 @@ fn rooted_repair_core(
         return finish_rooted_chain(root, &mut ordered, conflict_id, max_hints, meter);
     }
 
-    let Some(conflict_id) =
-        sweep_rooted_candidates(root, original_clauses, derived, candidate_hints, meter)?
+    let Some(conflict_id) = sweep_rooted_candidates(
+        root,
+        original_clauses,
+        derived,
+        candidate_hints,
+        admitted_recorded_capacity,
+        admitted_scheduler_bytes,
+        meter,
+    )?
     else {
         return Ok(None);
     };
@@ -197,6 +210,8 @@ fn sweep_rooted_candidates(
     original_clauses: &[(u64, Vec<Literal>)],
     derived: &[RupStep],
     candidate_hints: &[u64],
+    admitted_recorded_capacity: usize,
+    admitted_scheduler_bytes: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<Option<u64>, ResolutionValidationError> {
     // Row fixpoint over the combined assignment, in two escalating phases.
@@ -207,9 +222,20 @@ fn sweep_rooted_candidates(
     // row's propagation falsified (the row trail doubles as its queue),
     // still interleaved with candidate passes for the learned antecedents
     // the occurrence index does not cover.
+    // Ordinary compaction's recorded flags are already dropped. This vector
+    // reuses only that preflighted byte/header slot, not root propagation's
+    // per-variable envelope or the widening slack. It lives for one sweep:
+    // row cleanup may retract assignments, so flags must never cross rows.
+    let mut retired = rooted_retirement::RetiredCandidates::new(
+        candidate_hints.len(),
+        admitted_recorded_capacity,
+        meter,
+    )?;
     let index_absent = root.index_heads.is_none();
     let mut use_index = false;
     let mut queue_cursor = 0usize;
+    let mut first_pass = true;
+    let mut schedule = rooted_scheduler::CandidateSchedule::Pending;
     let conflict_id = 'sweep: loop {
         meter.check_controls()?;
         {
@@ -220,6 +246,7 @@ fn sweep_rooted_candidates(
                 cand_order,
                 index_heads,
                 index_items,
+                index_retired,
                 ..
             } = &mut *root;
             if let Some(heads) = index_heads.as_ref().filter(|_| use_index) {
@@ -239,8 +266,14 @@ fn sweep_rooted_candidates(
                         let Some(clause) = prior_clause_by_id(original_clauses, derived, id) else {
                             continue;
                         };
+                        if index_retired.contains(item as usize, meter)? {
+                            continue;
+                        }
                         match scan_terminal_hint_clause(clause, assign, meter)? {
-                            TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
+                            TerminalHintScan::Satisfied => {
+                                index_retired.mark(item as usize, meter)?
+                            }
+                            TerminalHintScan::Open => {}
                             TerminalHintScan::Unit(literal) => {
                                 let unit_var = literal.variable().index();
                                 meter.charge(1)?;
@@ -248,6 +281,7 @@ fn sweep_rooted_candidates(
                                 cand_reason[unit_var] = id;
                                 row_trail.push(unit_var as u32);
                                 cand_order.push(unit_var as u32);
+                                index_retired.mark(item as usize, meter)?;
                             }
                             TerminalHintScan::Conflict => break 'sweep id,
                         }
@@ -255,14 +289,61 @@ fn sweep_rooted_candidates(
                 }
             }
         }
+        // Preserve the cheap first pass, and let the original CSR find an
+        // immediate phase-2 conflict before allocating any candidate index.
+        if !first_pass
+            && !candidate_hints.is_empty()
+            && matches!(schedule, rooted_scheduler::CandidateSchedule::Pending)
+        {
+            let Some(selected) = rooted_scheduler::CandidateSchedule::select(
+                root,
+                original_clauses,
+                derived,
+                candidate_hints,
+                &retired,
+                admitted_scheduler_bytes,
+                meter,
+            )?
+            else {
+                return Ok(None);
+            };
+            schedule = selected;
+        }
+        if let Some(ready) = schedule.indexed() {
+            // Original-clause propagation still runs only at round start.
+            // Notify its completed cascade, never interleave the two queues.
+            ready.notify(root, None, &retired, meter)?;
+        }
         let mut propagated = false;
-        for &id in candidate_hints {
+        let mut position_cursor = 0usize;
+        loop {
+            if matches!(schedule, rooted_scheduler::CandidateSchedule::Exhausted) {
+                break;
+            }
+            let position = if let Some(ready) = schedule.indexed() {
+                let Some(position) = ready.pop(meter)? else {
+                    break;
+                };
+                position
+            } else {
+                if position_cursor == candidate_hints.len() {
+                    break;
+                }
+                let position = position_cursor;
+                position_cursor += 1;
+                position
+            };
+            let id = candidate_hints[position];
             meter.charge(1)?;
+            if retired.contains(position) {
+                continue;
+            }
             let Some(clause) = prior_clause_by_id(original_clauses, derived, id) else {
                 return Ok(None);
             };
             match scan_terminal_hint_clause(clause, &root.assign, meter)? {
-                TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
+                TerminalHintScan::Satisfied => retired.mark(position, meter)?,
+                TerminalHintScan::Open => {}
                 TerminalHintScan::Unit(literal) => {
                     let variable = literal.variable().index();
                     meter.charge(1)?;
@@ -270,10 +351,18 @@ fn sweep_rooted_candidates(
                     root.cand_reason[variable] = id;
                     root.row_trail.push(variable as u32);
                     root.cand_order.push(variable as u32);
+                    retired.mark(position, meter)?;
                     propagated = true;
+                    if let Some(ready) = schedule.indexed() {
+                        ready.notify(root, Some(position), &retired, meter)?;
+                    }
                 }
                 TerminalHintScan::Conflict => break 'sweep id,
             }
+        }
+        first_pass = false;
+        if let Some(ready) = schedule.indexed() {
+            ready.next_round(meter)?;
         }
         if !propagated && (use_index || !index_absent) {
             if !use_index {

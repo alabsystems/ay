@@ -50,6 +50,9 @@ impl Ic3Solver {
     /// Returns a (possibly smaller) sub-cube that is still inductive relative
     /// to frame `level - 1` and does not intersect the initial states.
     pub(super) fn generalize_cube(&mut self, cube: &Cube, level: usize) -> Cube {
+        if self.resource_exhausted() {
+            return cube.clone();
+        }
         self.stats.generalizations += 1;
 
         // Phase 1: UNSAT core-based shrinking.
@@ -119,11 +122,12 @@ impl Ic3Solver {
         self.solver.set_domain(&domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&assumptions);
+        let result = self.transition_query(&assumptions);
         self.solver.clear_domain();
+        let result = self.after_query_cleanup(result);
 
-        match result.into_inner() {
-            AssumeResult::Unsat(core, _) => {
+        match result {
+            Ok(AssumeResult::Unsat(core, _)) => {
                 self.stats.core_shrinks += 1;
                 // Map core literals back: keep only cube literals whose
                 // next-state counterpart appears in the core.
@@ -150,7 +154,7 @@ impl Ic3Solver {
                 // intersect init. If shrinking reduced too aggressively,
                 // fall back to the original cube.
                 if shrunk_lits.is_empty()
-                    || self.cube_intersects_init(&Cube::new(shrunk_lits.clone()))
+                    || !self.cube_is_disjoint_from_init(&Cube::new(shrunk_lits.clone()))
                 {
                     return cube.clone();
                 }
@@ -177,6 +181,9 @@ impl Ic3Solver {
 
         let mut i = current.len();
         while i > 0 {
+            if self.resource_exhausted() {
+                return cube.clone();
+            }
             i -= 1;
             if current.len() <= 1 {
                 break; // Must keep at least one literal.
@@ -187,7 +194,7 @@ impl Ic3Solver {
             let candidate = Cube::new(current.clone());
 
             // Check: does candidate intersect init?
-            if self.cube_intersects_init(&candidate) {
+            if !self.cube_is_disjoint_from_init(&candidate) {
                 // Must keep this literal to avoid blocking initial states.
                 current.insert(i, removed);
                 continue;
@@ -223,7 +230,7 @@ impl Ic3Solver {
                         None => break,
                     };
                     // Never block an initial state (would be unsound).
-                    if self.cube_intersects_init(&pred) {
+                    if !self.cube_is_disjoint_from_init(&pred) {
                         break;
                     }
                     // Recursively block the predecessor at level - 1.
@@ -287,9 +294,10 @@ impl Ic3Solver {
         self.solver.set_domain(&domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&assumptions);
+        let result = self.transition_query(&assumptions);
         self.solver.clear_domain();
-        result.is_unsat()
+        let result = self.after_query_cleanup(result);
+        matches!(result, Ok(AssumeResult::Unsat(..)))
     }
 
     /// Like [`is_inductive_relative`], but on a SAT result also returns the
@@ -327,12 +335,13 @@ impl Ic3Solver {
         self.solver.set_domain(&domain);
 
         self.stats.sat_calls += 1;
-        let result = self.solver.solve_incremental_ic3(&assumptions);
+        let result = self.transition_query(&assumptions);
         self.solver.clear_domain();
+        let result = self.after_query_cleanup(result);
 
-        match result.into_inner() {
-            AssumeResult::Unsat(..) => (true, None),
-            AssumeResult::Sat(model) => {
+        match result {
+            Ok(AssumeResult::Unsat(..)) => (true, None),
+            Ok(AssumeResult::Sat(model)) => {
                 let pred = self.ts.extract_state_cube(&model);
                 (false, Some(Cube::new(pred)))
             }
@@ -354,15 +363,18 @@ impl Ic3Solver {
     /// the generalized cube does not intersect Init. The generalization itself
     /// runs the independent-consecution cross-check via `generalize_cube`.
     pub(super) fn trivial_block(&mut self, cube: &Cube, level: usize, limit: &mut usize) -> bool {
-        if level == 0 || *limit == 0 {
+        if self.resource_exhausted() || level == 0 || *limit == 0 {
             return false;
         }
         // Never block an initial state.
-        if self.cube_intersects_init(cube) {
+        if !self.cube_is_disjoint_from_init(cube) {
             return false;
         }
         *limit -= 1;
         loop {
+            if self.resource_exhausted() {
+                return false;
+            }
             if self.is_inductive_relative(cube, level) {
                 // Generalize, raising ctg_depth so the inner CTG loop in mic()
                 // is disabled (mirrors the reference implementation's recursive `mic` at raised depth).
@@ -371,7 +383,7 @@ impl Ic3Solver {
                 self.ctg_depth -= 1;
 
                 // Reject init-intersecting generalizations (unsound).
-                if self.cube_intersects_init(&generalized) {
+                if !self.cube_is_disjoint_from_init(&generalized) || self.resource_exhausted() {
                     return false;
                 }
                 self.add_blocked_clause_to_frames(&generalized.to_clause(), level);
@@ -406,10 +418,17 @@ impl Ic3Solver {
     ///
     /// Returns `true` if consecution is confirmed (UNSAT), `false` otherwise.
     fn verify_consecution_independent(&self, cube: &Cube, level: usize) -> bool {
+        if self.resource_exhausted() {
+            return false;
+        }
         let mut solver = ay_sat::Solver::new(self.ts.total_vars);
+        solver.set_solve_deadline(self.deadline());
 
         // Transition relation T.
         for clause in &self.ts.trans_clauses {
+            if self.resource_exhausted() {
+                return false;
+            }
             solver.add_clause(clause.clone());
         }
 
@@ -421,7 +440,13 @@ impl Ic3Solver {
         // property the engine relied on when it accepted the drop.
         if level >= 1 {
             for frame in self.frames.iter().skip(level - 1) {
+                if self.resource_exhausted() {
+                    return false;
+                }
                 for clause in &frame.blocked_clauses {
+                    if self.resource_exhausted() {
+                        return false;
+                    }
                     solver.add_clause(clause.clone());
                 }
             }
@@ -429,16 +454,22 @@ impl Ic3Solver {
 
         // cube' (next-state literals) as assumptions.
         let next_cube = self.ts.cube_to_next_state(&cube.literals);
-        let result = solver.solve_with_assumptions(&next_cube);
-        result.is_unsat()
+        let result =
+            solver.solve_with_assumptions_interruptible(&next_cube, || self.resource_exhausted());
+        // The independent solver remains a fresh, full-BCP validation. Its
+        // destruction belongs to the same original deadline as the query.
+        drop(solver);
+        matches!(self.admit_query(result), Ok(AssumeResult::Unsat(..)))
     }
 
-    /// Check if a cube intersects the initial states.
-    /// Returns true if Init /\ cube is SAT.
-    pub(super) fn cube_intersects_init(&mut self, cube: &Cube) -> bool {
+    /// Establish that Init /\ cube is UNSAT. Unknown is NOT disjointness:
+    /// callers may strengthen a frame only after this positive proof check.
+    pub(super) fn cube_is_disjoint_from_init(&mut self, cube: &Cube) -> bool {
         let assumptions: Vec<Literal> = cube.literals.clone();
         self.stats.sat_calls += 1;
-        let result = self.init_solver.solve_incremental_ic3(&assumptions);
-        result.is_sat()
+        matches!(self.init_query(&assumptions), Ok(AssumeResult::Unsat(..)))
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;

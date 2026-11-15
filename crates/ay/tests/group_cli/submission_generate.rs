@@ -40,6 +40,12 @@ fn chc_solver_smoke_guard() -> MutexGuard<'static, ()> {
 }
 
 #[cfg(unix)]
+#[path = "submission_generate/chc_worker_repo_root.rs"]
+mod chc_worker_repo_root;
+#[cfg(unix)]
+use chc_worker_repo_root::WorkerRepoRoot;
+
+#[cfg(unix)]
 const CHC_TEST_ALL_TRACKS: [&str; 11] = [
     "BOOL",
     "BV",
@@ -344,7 +350,6 @@ fn windows_submission_toolchain_available() -> bool {
         && Path::new(r"C:\msys64\usr\bin\gzip.exe").is_file()
         && Path::new(r"C:\msys64\usr\bin\bash.exe").is_file()
         && Path::new(r"C:\msys64\usr\bin\python3.exe").is_file()
-        && Path::new(r"C:\msys64\usr\bin\xmllint.exe").is_file()
 }
 
 #[cfg(windows)]
@@ -1076,236 +1081,6 @@ fn submission_package_all_windows_skip_smoke_gates_and_writes_archive_modes() {
 }
 
 #[test]
-fn submission_preflight_chc_baseline_compare_fast_proxy_requires_timeout() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args([
-            "submission",
-            "preflight",
-            "chc-baseline-compare",
-            "--profile",
-            "fast-proxy",
-        ])
-        .output()
-        .expect("run CHC baseline compare without fast-proxy timeout");
-    assert!(
-        !output.status.success(),
-        "fast-proxy without timeout must fail; stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--profile fast-proxy requires --timeout-sec"));
-}
-
-#[test]
-#[cfg(unix)]
-fn submission_preflight_chc_baseline_compare_runs_same_timeout_evidence() {
-    // The compare harness takes a host-wide non-blocking oom-guard lease;
-    // serialize the two baseline-compare runs so they refuse concurrent
-    // sweeps (the guard's job) without refusing each other.
-    let _serial = chc_solver_smoke_guard();
-    let temp = tempdir().expect("temp dir");
-    let benchmark_root = temp.path().join("chc-bench");
-    let baseline_path = temp.path().join("baseline.json");
-    let output_dir = temp.path().join("evidence");
-    let ay_stub = temp.path().join("ay-compare-stub");
-    write_minimal_chc_comp_root(&benchmark_root, &["BV-Lin"], trivial_sat_chc());
-    fs::write(
-        &baseline_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&json!({
-                "suite": "test-chc-baseline",
-                "benchmarks_dir": benchmark_root.display().to_string(),
-                "timeout_sec": 2,
-                "baseline_commit": "test-baseline",
-                "baseline_date": "2026-05-04",
-                "benchmarks_total": 1,
-                "solved_total": 1,
-                "benchmarks": [{
-                    "file": "smoke/BV_Lin.smt2",
-                    "status": "sat",
-                    "elapsed_ms": 100,
-                    "expected_status": "sat"
-                }]
-            }))
-            .expect("serialize baseline")
-        ),
-    )
-    .expect("write baseline");
-    fs::write(
-        &ay_stub,
-        "#!/usr/bin/env bash\n\
-         if [[ \"$*\" == *--version* ]]; then\n\
-           printf 'ay compare stub\\n'\n\
-           printf 'build.stamp=compare-stub\\n'\n\
-           exit 0\n\
-         fi\n\
-         printf 'sat\\n'\n",
-    )
-    .expect("write ay compare stub");
-    fs::set_permissions(&ay_stub, fs::Permissions::from_mode(0o755))
-        .expect("chmod ay compare stub");
-
-    // The same-timeout gate also requires the baseline's recorded resource
-    // plan to match the current host's plan; that plan is host-specific, so
-    // harvest it from a first (non-comparable, expected-fail) compare run and
-    // embed it into the baseline before the gating run.
-    let probe = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args(["submission", "preflight", "chc-baseline-compare"])
-        .args(["--baseline"])
-        .arg(&baseline_path)
-        .args(["--bench-dir"])
-        .arg(&benchmark_root)
-        .args(["--ay"])
-        .arg(&ay_stub)
-        .args(["--output-dir"])
-        .arg(&output_dir)
-        .output()
-        .expect("run CHC baseline compare resource-plan probe");
-    assert!(
-        !probe.status.success(),
-        "compare without a recorded resource plan must be non-comparable and fail; stdout={} stderr={}",
-        String::from_utf8_lossy(&probe.stdout),
-        String::from_utf8_lossy(&probe.stderr)
-    );
-    let probe_payload: Value = serde_json::from_str(
-        &fs::read_to_string(output_dir.join("chc-baseline-compare.json"))
-            .expect("probe evidence JSON"),
-    )
-    .expect("probe evidence JSON parses");
-    assert_eq!(
-        probe_payload["summary"]["non_comparable_baseline"], 1,
-        "probe run must fail solely on baseline comparability: {probe_payload}"
-    );
-    let resource_plan = probe_payload["resource_plan"].clone();
-    assert!(
-        resource_plan.is_object(),
-        "probe evidence must record the host resource plan: {probe_payload}"
-    );
-    let mut baseline: Value = serde_json::from_str(
-        &fs::read_to_string(&baseline_path).expect("read baseline for plan embedding"),
-    )
-    .expect("baseline JSON parses");
-    baseline["resource_plan"] = resource_plan;
-    fs::write(
-        &baseline_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&baseline).expect("serialize comparable baseline")
-        ),
-    )
-    .expect("rewrite baseline with host resource plan");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args(["submission", "preflight", "chc-baseline-compare"])
-        .args(["--baseline"])
-        .arg(&baseline_path)
-        .args(["--bench-dir"])
-        .arg(&benchmark_root)
-        .args(["--ay"])
-        .arg(&ay_stub)
-        .args(["--output-dir"])
-        .arg(&output_dir)
-        .output()
-        .expect("run CHC baseline compare through Rust CLI");
-    assert_command_success(&output, "CHC baseline compare");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("status=pass evidence=chc-baseline-compare"));
-    assert!(stdout.contains("profile=same-timeout"));
-    assert!(stdout.contains("run_type=same-timeout-gate"));
-    assert!(stdout.contains("direct_regressions=0"));
-
-    let payload_text =
-        fs::read_to_string(output_dir.join("chc-baseline-compare.json")).expect("evidence JSON");
-    let payload: Value = serde_json::from_str(&payload_text).expect("evidence JSON parses");
-    assert_eq!(
-        payload["run_classification"]["run_type"],
-        "same-timeout-gate"
-    );
-    assert_eq!(payload["summary"]["current_solved_checked"], 1);
-    assert_eq!(payload["summary"]["direct_regressions"], 0);
-    assert!(output_dir.join("chc-baseline-compare.csv").is_file());
-}
-
-#[test]
-#[cfg(unix)]
-fn submission_preflight_chc_baseline_compare_direct_regression_reports_fail() {
-    // See submission_preflight_chc_baseline_compare_runs_same_timeout_evidence:
-    // serialized against the shared host-wide oom-guard lease.
-    let _serial = chc_solver_smoke_guard();
-    let temp = tempdir().expect("temp dir");
-    let benchmark_root = temp.path().join("chc-bench");
-    let baseline_path = temp.path().join("baseline.json");
-    let output_dir = temp.path().join("evidence");
-    let ay_stub = temp.path().join("ay-unknown-stub");
-    write_minimal_chc_comp_root(&benchmark_root, &["BV-Lin"], trivial_sat_chc());
-    fs::write(
-        &baseline_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&json!({
-                "suite": "test-chc-baseline",
-                "benchmarks_dir": benchmark_root.display().to_string(),
-                "timeout_sec": 2,
-                "baseline_commit": "test-baseline",
-                "baseline_date": "2026-05-04",
-                "benchmarks_total": 1,
-                "solved_total": 1,
-                "benchmarks": [{
-                    "file": "smoke/BV_Lin.smt2",
-                    "status": "sat",
-                    "elapsed_ms": 100,
-                    "expected_status": "sat"
-                }]
-            }))
-            .expect("serialize baseline")
-        ),
-    )
-    .expect("write baseline");
-    fs::write(
-        &ay_stub,
-        "#!/usr/bin/env bash\n\
-         if [[ \"$*\" == *--version* ]]; then\n\
-           printf 'ay unknown stub\\n'\n\
-           printf 'build.stamp=unknown-stub\\n'\n\
-           exit 0\n\
-         fi\n\
-         printf 'unknown\\n'\n",
-    )
-    .expect("write ay unknown stub");
-    fs::set_permissions(&ay_stub, fs::Permissions::from_mode(0o755))
-        .expect("chmod ay unknown stub");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args(["submission", "preflight", "chc-baseline-compare"])
-        .args(["--baseline"])
-        .arg(&baseline_path)
-        .args(["--bench-dir"])
-        .arg(&benchmark_root)
-        .args(["--ay"])
-        .arg(&ay_stub)
-        .args(["--output-dir"])
-        .arg(&output_dir)
-        .output()
-        .expect("run failing CHC baseline compare through Rust CLI");
-    assert!(
-        !output.status.success(),
-        "direct regression compare must fail; stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("status=fail evidence=chc-baseline-compare"));
-    assert!(!stdout.contains("status=pass evidence=chc-baseline-compare"));
-
-    let payload_text =
-        fs::read_to_string(output_dir.join("chc-baseline-compare.json")).expect("evidence JSON");
-    let payload: Value = serde_json::from_str(&payload_text).expect("evidence JSON parses");
-    assert_eq!(payload["summary"]["direct_regressions"], 1);
-}
-
-#[test]
 #[cfg(unix)]
 fn submission_preflight_chc_comp_verify_rejects_manifest_archive_sha_mismatch() {
     let temp = tempdir().expect("temp dir");
@@ -1593,49 +1368,6 @@ fn submission_package_chc_canonicalizes_public_nonlin_aliases_in_all_track_set()
     for alias in ["BV-Nonlin", "LIA-Nonlin", "LIA-Nonlin-Arrays"] {
         assert!(!chc_xml.contains(&format!(r#"<tasks name="{alias}">"#)));
     }
-}
-
-#[test]
-#[cfg(unix)]
-fn submission_package_chc_accepts_late_entry_artifact_replay_tracks() {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(
-            r#"
-import importlib.util
-import sys
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location(
-    "artifact_check",
-    Path("scripts/chccomp_late_entry_artifact_build_check.py"),
-)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-print(",".join(module.TRACKS))
-"#,
-        )
-        .current_dir(workspace_root())
-        .output()
-        .expect("read CHC artifact replay tracks");
-    assert_command_success(&output, "read CHC artifact replay tracks");
-
-    let tracks = String::from_utf8(output.stdout).expect("tracks are utf8");
-    let temp = tempdir().expect("temp dir");
-    let package_output = Command::new(env!("CARGO_BIN_EXE_ay"))
-        .args(["submission", "package", "chc", "--output"])
-        .arg(temp.path().join("replay-chc"))
-        .args([
-            "--ay-bin",
-            env!("CARGO_BIN_EXE_ay"),
-            "--tracks",
-            tracks.trim(),
-        ])
-        .output()
-        .expect("run ay submission package chc with artifact replay tracks");
-
-    assert_command_success(&package_output, "package chc with artifact replay tracks");
 }
 
 #[test]
@@ -2017,6 +1749,9 @@ fn submission_worker_chc_comp_run_writes_report_and_audit_accepts() {
     // full group_cli binary runs in parallel.
     let _serial = chc_solver_smoke_guard();
     let temp = tempdir().expect("temp dir");
+    // The worker records its workspace root's git state and fails closed on a
+    // root without HEAD; give it a clean `main` checkout, not the build tree.
+    let (repo_root, head) = WorkerRepoRoot::with_clean_main_commit(&temp.path().join("repo"));
     let package_dir = temp.path().join("chc-package");
     let benchmark_root = temp.path().join("chc-comp26-benchmarks");
     let worker_json = temp.path().join("worker-run.json");
@@ -2033,7 +1768,8 @@ fn submission_worker_chc_comp_run_writes_report_and_audit_accepts() {
         .expect("run ay submission package chc");
     assert_command_success(&package_output, "package chc");
 
-    let worker_output = Command::new(env!("CARGO_BIN_EXE_ay"))
+    let worker_output = repo_root
+        .ay_command()
         .args([
             "submission",
             "worker",
@@ -2049,7 +1785,6 @@ fn submission_worker_chc_comp_run_writes_report_and_audit_accepts() {
             "1",
             "--benchmark-timeout-ms",
             "60000",
-            "--allow-dirty",
             "--no-gh",
             "--package",
         ])
@@ -2069,6 +1804,9 @@ fn submission_worker_chc_comp_run_writes_report_and_audit_accepts() {
     assert_eq!(payload["schema_version"], "ay.chccomp-worker-report/v1");
     assert_eq!(payload["kind"], "run");
     assert_eq!(payload["issue"], 9692);
+    assert_eq!(payload["repo"]["commit"], head.as_str());
+    assert_eq!(payload["repo"]["branch"], "main");
+    assert_eq!(payload["repo"]["dirty"], false);
     assert_eq!(payload["summary"]["total_cases"], 1);
     assert_eq!(payload["summary"]["failed_cases"], 0);
     assert_eq!(payload["summary"]["solved"], 1);
@@ -2086,10 +1824,11 @@ fn submission_worker_chc_comp_run_writes_report_and_audit_accepts() {
     assert!(worker_markdown.contains("Local chc-comp26 set-file categories used by this CLI: 11"));
     assert!(worker_markdown.contains("| Local category | Input | Expected | Actual | Timeout |"));
 
-    let audit_output = Command::new(env!("CARGO_BIN_EXE_ay"))
+    let audit_output = repo_root
+        .ay_command()
         .args(["submission", "worker", "chc-comp", "audit"])
         .arg(&worker_json)
-        .args(["--allow-dirty", "--allow-stale-package", "--json"])
+        .args(["--allow-stale-package", "--json"])
         .arg(&audit_json)
         .args(["--report"])
         .arg(&audit_report)
@@ -2209,31 +1948,6 @@ fn direct_chc_frontend_parse_failure_emits_competition_status() {
     );
 }
 
-#[test]
-#[cfg(unix)]
-fn submission_preflight_python_wrapper_delegates_to_rust_cli() {
-    let temp = tempdir().expect("temp dir");
-    let json_path = temp.path().join("wrapper-preflight.json");
-    let report_path = temp.path().join("wrapper-preflight.md");
-    let output = Command::new("python3")
-        .arg(workspace_root().join("scripts/chccomp_late_entry_preflight.py"))
-        .args(["--work-dir"])
-        .arg(temp.path().join("wrapper-work"))
-        .args(["--json"])
-        .arg(&json_path)
-        .args(["--report"])
-        .arg(&report_path)
-        .env("AY_CLI", env!("CARGO_BIN_EXE_ay"))
-        .output()
-        .expect("run CHC preflight compatibility wrapper");
-    assert_command_success(&output, "Python CHC preflight wrapper");
-    let payload_text = fs::read_to_string(&json_path).expect("wrapper preflight JSON");
-    let payload: Value =
-        serde_json::from_str(&payload_text).expect("wrapper preflight JSON parses");
-    assert_eq!(payload["validation_mode"], "local-stub-archive");
-    assert!(report_path.is_file());
-}
-
 /// The generated SMT wrappers must RUN, not merely exist.
 ///
 /// `run_solver_incr.sh` used to forward the benchmark as `"$@"` alongside `-in`.
@@ -2281,11 +1995,12 @@ fn generated_smt_wrappers_actually_solve_a_benchmark() {
         fs::copy(&src, &staged).unwrap_or_else(|e| panic!("stage {wrapper}: {e}"));
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
 
-        let run = Command::new(&staged)
-            .arg(&bench)
-            .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
-            .output()
-            .unwrap_or_else(|e| panic!("run {wrapper}: {e}"));
+        let run = output_tolerating_text_busy(
+            Command::new(&staged)
+                .arg(&bench)
+                .env("STAREXEC_WALLCLOCK_LIMIT", "1200"),
+        )
+        .unwrap_or_else(|e| panic!("run {wrapper}: {e}"));
 
         let stdout = String::from_utf8_lossy(&run.stdout);
         let stderr = String::from_utf8_lossy(&run.stderr);
@@ -2342,11 +2057,12 @@ fn generated_mv_wrapper_emits_a_model() {
     fs::copy(out_dir.join("run_solver_mv.sh"), &staged).expect("stage mv wrapper");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
 
-    let run = Command::new(&staged)
-        .arg(&bench)
-        .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
-        .output()
-        .expect("run run_solver_mv.sh");
+    let run = output_tolerating_text_busy(
+        Command::new(&staged)
+            .arg(&bench)
+            .env("STAREXEC_WALLCLOCK_LIMIT", "1200"),
+    )
+    .expect("run run_solver_mv.sh");
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
@@ -2402,11 +2118,12 @@ fn generated_wrapper_emits_a_minimal_unsat_core() {
     fs::copy(out_dir.join("run_solver.sh"), &staged).expect("stage wrapper");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
 
-    let run = Command::new(&staged)
-        .arg(&bench)
-        .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
-        .output()
-        .expect("run run_solver.sh");
+    let run = output_tolerating_text_busy(
+        Command::new(&staged)
+            .arg(&bench)
+            .env("STAREXEC_WALLCLOCK_LIMIT", "1200"),
+    )
+    .expect("run run_solver.sh");
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
@@ -2432,4 +2149,30 @@ fn generated_wrapper_emits_a_minimal_unsat_core() {
         "core must be minimal — a1 is not needed for the contradiction, and UC scores \
          asserts-minus-core-size, so padding scores zero; got {core}"
     );
+}
+
+/// Run a freshly staged wrapper, tolerating a transient `ETXTBSY`.
+///
+/// The wrapper tests copy a generated script and immediately `execve` it.
+/// `fs::copy` closes its own descriptor, but any other test thread in this
+/// binary that forks in that window (many tests here spawn processes) hands
+/// its child an inherited copy of the still-open write descriptor. Until that
+/// child reaches its own `execve` the kernel refuses our exec with
+/// `ETXTBSY` ("Text file busy", `ErrorKind::ExecutableFileBusy`). The race
+/// is inherent to fork/exec (rust-lang/rust#97590); the remedy, as in
+/// ay-bisect's runner tests, is to retry the exec, which runs exactly the
+/// same command and so weakens no assertion.
+fn output_tolerating_text_busy(command: &mut Command) -> std::io::Result<std::process::Output> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }

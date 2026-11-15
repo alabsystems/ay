@@ -65,9 +65,10 @@ use super::*;
 /// Maximum number of full fixpoint rounds over the asserted atoms.
 const MAX_CONTRACT_ROUNDS: usize = 8;
 
-/// Skip contraction entirely when there are more asserted atoms than this
-/// (keeps the pass trivially cheap on large industrial instances; bounded
-/// enumeration itself scans all atoms per point, so this bound is generous).
+/// Above this many asserted atoms, contraction is restricted to atoms
+/// mentioning a monomial factor/aux variable (keeps the pass cheap on
+/// large industrial instances without disabling it outright;
+/// #nia-contract-relevant-atoms).
 const MAX_CONTRACT_ATOMS: usize = 64;
 
 /// Recursion depth cap for the forward/backward passes.
@@ -492,9 +493,127 @@ struct Contractor<'a, 'b> {
     bounds: HashMap<TermId, Iv>,
     /// Whether any variable interval changed in the current round.
     changed: bool,
+    /// Atom currently being contracted (premise for derived bounds).
+    current_atom: Option<(TermId, bool)>,
+    /// Product-sum-derived endpoints with narrow premise literals:
+    /// `(var, is_lower, premises)`. Exported so factor split can cite
+    /// them instead of every asserted literal.
+    derived: Vec<(TermId, bool, Vec<(TermId, bool)>)>,
+    /// Subset re-derivation filter (#nia-contract-subset-refutes): when
+    /// set, alias/definition/sign lookups over `solver.asserted` see
+    /// only these literals, so an emptiness result is justified by the
+    /// subset alone and the subset is a sound conflict.
+    lit_filter: Option<std::collections::BTreeSet<(TermId, bool)>>,
+    /// Eqdv definition terms per variable (#nia-contract-definitions):
+    /// `var -> X` where `var <= X` and `var >= X` are both asserted
+    /// true (filter-respecting). Precomputed once per contraction —
+    /// depends only on `solver.asserted` and `lit_filter`, both
+    /// fixed for the Contractor's lifetime — replacing an
+    /// O(|asserted|) rescan inside every `linear_form` variable
+    /// expansion (top contractor leaf on VeryMax trails).
+    var_definitions: HashMap<TermId, TermId>,
+    /// Memoized `linear_form` results (#nia-contract-form-cache).
+    /// A form depends on the term DAG, `var_definitions` (both fixed
+    /// for the Contractor's lifetime), and the point shortcut over
+    /// `bounds` — so the cache is cleared at the one bounds-tightening
+    /// site in `bwd`. Entries are depth-independent: a `Some` form is
+    /// exact at any depth, and a `None` is only stored from a depth-0
+    /// computation (monotone: less depth budget cannot succeed where
+    /// depth 0 failed). Without this, premise scans
+    /// (`sign_premise`/`point_premise` via `single_var_atom_bound`)
+    /// recompute the same forms for every product-sum contraction,
+    /// multiplied by every subset-shrink re-derivation.
+    form_cache: std::cell::RefCell<HashMap<TermId, Option<std::rc::Rc<LinearForm>>>>,
+    /// Monotone counter bumped whenever a computation takes the
+    /// point-bound shortcut or consumes an impure cached form; a
+    /// computation is pure iff the counter did not move during it.
+    form_taint: std::cell::Cell<usize>,
+    /// Memoized normalized atom difference forms (`form(lhs) -
+    /// form(rhs)`, zero coefficients retained out), keyed by atom
+    /// term (polarity only selects the comparison operator at use
+    /// sites). Premise scans (`sign_premise`/`point_premise`) walk
+    /// every asserted literal per derivation; without this each
+    /// scan rebuilt every atom's merged coefficient map. Same
+    /// purity/retain discipline as `form_cache`. (#nia-form-retain)
+    atom_form_cache: std::cell::RefCell<HashMap<TermId, Option<std::rc::Rc<LinearForm>>>>,
+}
+
+/// An exact integer linear form: `term == sum(coeffs * var) + constant`.
+struct LinearForm {
+    coeffs: HashMap<TermId, BigInt>,
+    constant: BigInt,
+    /// True when computing this form never read `bounds` through the
+    /// point shortcut (transitively), so the form is a pure term
+    /// identity given the Contractor's fixed `var_definitions`.
+    pure: bool,
 }
 
 impl Contractor<'_, '_> {
+    fn lit_allowed(&self, term: TermId, positive: bool) -> bool {
+        self.lit_filter
+            .as_ref()
+            .is_none_or(|set| set.contains(&(term, positive)))
+    }
+
+    /// One-pass build of `var_definitions`, byte-identical to the
+    /// per-variable scan it replaces: per variable, upper/lower
+    /// candidate X terms in asserted order, keeping the first upper
+    /// X that also appears as a lower X (the `a == b` self-atom
+    /// contributes only from the args[0] perspective, matching the
+    /// original match-arm priority).
+    fn build_var_definitions(
+        solver: &NiaSolver<'_>,
+        lit_filter: &Option<std::collections::BTreeSet<(TermId, bool)>>,
+    ) -> HashMap<TermId, TermId> {
+        let allowed = |term: TermId, positive: bool| {
+            lit_filter
+                .as_ref()
+                .is_none_or(|set| set.contains(&(term, positive)))
+        };
+        let mut upper: HashMap<TermId, Vec<TermId>> = HashMap::default();
+        let mut lower: HashMap<TermId, Vec<TermId>> = HashMap::default();
+        for &(term, positive) in &solver.asserted {
+            if !positive || !allowed(term, positive) {
+                continue;
+            }
+            let TermData::App(Symbol::Named(name), args) = solver.terms.get(term) else {
+                continue;
+            };
+            if args.len() != 2 {
+                continue;
+            }
+            let (a, b) = (args[0], args[1]);
+            if a == b {
+                // Self-atom: the original match tries the upper arm
+                // group first for both ops, so only an upper entry.
+                if matches!(name.as_str(), "<=" | ">=") {
+                    upper.entry(a).or_default().push(b);
+                }
+                continue;
+            }
+            match name.as_str() {
+                "<=" => {
+                    upper.entry(a).or_default().push(b);
+                    lower.entry(b).or_default().push(a);
+                }
+                ">=" => {
+                    lower.entry(a).or_default().push(b);
+                    upper.entry(b).or_default().push(a);
+                }
+                _ => {}
+            }
+        }
+        let mut definitions = HashMap::default();
+        for (var, uppers) in &upper {
+            if let Some(lowers) = lower.get(var) {
+                if let Some(def) = uppers.iter().find(|x| lowers.contains(x)) {
+                    definitions.insert(*var, *def);
+                }
+            }
+        }
+        definitions
+    }
+
     /// Forward pass: over-approximate the integer range of `term`.
     fn fwd(&self, term: TermId, depth: usize) -> Iv {
         if depth > MAX_CONTRACT_DEPTH {
@@ -558,11 +677,27 @@ impl Contractor<'_, '_> {
                 if tightened != cur {
                     self.changed = true;
                     self.bounds.insert(term, tightened);
+                    // Forms read bounds through the point shortcut.
+                    // Retain pure forms not mentioning `term`: their
+                    // recomputation cannot take a new shortcut (every
+                    // Var leaf was either pinned, tainting purity, or
+                    // appears as a coefficient), so it is identical.
+                    // `None` entries and entries mentioning `term`
+                    // drop, preserving pin-makes-product-linear
+                    // precision. (#nia-form-retain)
+                    self.form_cache.borrow_mut().retain(|_, entry| {
+                        matches!(entry, Some(form) if form.pure && !form.coeffs.contains_key(&term))
+                    });
+                    self.atom_form_cache.borrow_mut().retain(|_, entry| {
+                        matches!(entry, Some(form) if form.pure && !form.coeffs.contains_key(&term))
+                    });
                 }
                 Ok(())
             }
             TermData::App(Symbol::Named(name), args) => match name.as_str() {
                 "+" => {
+                    self.contract_product_sum(args, &refined, depth)?;
+                    self.contract_product_sum_linear(args, &refined, depth)?;
                     for (i, &arg) in args.iter().enumerate() {
                         let mut others = Iv::point(BigInt::zero());
                         for (j, &other) in args.iter().enumerate() {
@@ -614,6 +749,758 @@ impl Contractor<'_, '_> {
             },
             _ => Ok(()),
         }
+    }
+
+    /// Exact integer linear form of `term`: `(coeffs, constant)` with
+    /// `term == sum(coeff * var) + constant`, or `None` for shapes outside
+    /// `+`/`-`/constant-scaled products.
+    fn linear_form(&self, term: TermId, depth: usize) -> Option<std::rc::Rc<LinearForm>> {
+        if depth > MAX_CONTRACT_DEPTH {
+            return None;
+        }
+        if let Some(hit) = self.form_cache.borrow().get(&term).cloned() {
+            if let Some(form) = &hit {
+                if !form.pure {
+                    self.form_taint.set(self.form_taint.get() + 1);
+                }
+            }
+            return hit;
+        }
+        let taint0 = self.form_taint.get();
+        let computed = self.linear_form_compute(term, depth);
+        let result = computed.map(|(coeffs, constant)| {
+            std::rc::Rc::new(LinearForm {
+                coeffs,
+                constant,
+                pure: self.form_taint.get() == taint0,
+            })
+        });
+        // `Some` is exact at any depth; `None` is only monotone-safe
+        // to reuse when computed with the full depth budget.
+        if result.is_some() || depth == 0 {
+            self.form_cache.borrow_mut().insert(term, result.clone());
+        }
+        if let Some(form) = &result {
+            if !form.pure {
+                // Consuming an impure form taints any enclosing
+                // computation (already counted via taint0 delta for
+                // the direct caller, but a hit path needs the bump
+                // above; keep symmetric for nested computes).
+                self.form_taint.set(self.form_taint.get() + 1);
+            }
+        }
+        result
+    }
+
+    fn linear_form_compute(
+        &self,
+        term: TermId,
+        depth: usize,
+    ) -> Option<(HashMap<TermId, BigInt>, BigInt)> {
+        match self.solver.terms.get(term) {
+            TermData::Var(_, _) => {
+                // An eqdv-style difference variable (executor
+                // preprocessing replaces a nested equality atom by
+                // `d = rhs` with `d` a fresh var and the definition
+                // asserted as a `<=`/`>=` pair): expand to its
+                // definition so alias detection sees the real equality.
+                // This must precede the point-bound shortcut below: an
+                // asserted `(= 0 d)` also pins `d` to the point 0 in
+                // LIA, and returning the constant would erase exactly
+                // the equality being recovered.
+                if let Some(form) = self.var_definition_form(term, depth) {
+                    return Some((form.coeffs.clone(), form.constant.clone()));
+                }
+                // A variable the contractor has already pinned to a
+                // point interval is a constant for form purposes: this
+                // keeps `(* a v)` linear when an asserted `a = 1` was
+                // not substituted into the term DAG (e.g. the fixing
+                // assertion comes last in the file), so alias detection
+                // still sees the equality as `u = v + d`.
+                if let Some(iv) = self.bounds.get(&term) {
+                    if let (Ep::Fin(lo), Ep::Fin(hi)) = (&iv.lo, &iv.hi) {
+                        if lo == hi {
+                            self.form_taint.set(self.form_taint.get() + 1);
+                            return Some((HashMap::default(), lo.clone()));
+                        }
+                    }
+                }
+                let mut coeffs = HashMap::default();
+                coeffs.insert(term, BigInt::one());
+                Some((coeffs, BigInt::zero()))
+            }
+            TermData::Const(Constant::Int(n)) => Some((HashMap::default(), n.clone())),
+            TermData::Const(Constant::Rational(r)) if r.0.denom().is_one() => {
+                Some((HashMap::default(), r.0.numer().clone()))
+            }
+            TermData::App(Symbol::Named(name), args) => match name.as_str() {
+                "+" => {
+                    let mut coeffs: HashMap<TermId, BigInt> = HashMap::default();
+                    let mut constant = BigInt::zero();
+                    for &arg in args {
+                        let f = self.linear_form(arg, depth + 1)?;
+                        for (v, coeff) in &f.coeffs {
+                            *coeffs.entry(*v).or_insert_with(BigInt::zero) += coeff;
+                        }
+                        constant += &f.constant;
+                    }
+                    Some((coeffs, constant))
+                }
+                "-" if args.len() == 1 => {
+                    let f = self.linear_form(args[0], depth + 1)?;
+                    Some((
+                        f.coeffs
+                            .iter()
+                            .map(|(v, coeff)| (*v, -coeff.clone()))
+                            .collect(),
+                        -f.constant.clone(),
+                    ))
+                }
+                "-" if args.len() == 2 => {
+                    let f0 = self.linear_form(args[0], depth + 1)?;
+                    let mut coeffs = f0.coeffs.clone();
+                    let mut constant = f0.constant.clone();
+                    let f1 = self.linear_form(args[1], depth + 1)?;
+                    for (v, coeff) in &f1.coeffs {
+                        *coeffs.entry(*v).or_insert_with(BigInt::zero) -= coeff;
+                    }
+                    constant -= &f1.constant;
+                    Some((coeffs, constant))
+                }
+                "*" => self.linear_form_mul(args, depth),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Linear form of a product: only constant scaling stays linear.
+    fn linear_form_mul(
+        &self,
+        args: &[TermId],
+        depth: usize,
+    ) -> Option<(HashMap<TermId, BigInt>, BigInt)> {
+        let mut scale: Option<BigInt> = None;
+        let mut form: Option<(HashMap<TermId, BigInt>, BigInt)> = None;
+        for &arg in args {
+            let f = self.linear_form(arg, depth + 1)?;
+            if f.coeffs.is_empty() {
+                scale = Some(match scale {
+                    Some(s) => s * &f.constant,
+                    None => f.constant.clone(),
+                });
+            } else if form.is_none() {
+                form = Some((f.coeffs.clone(), f.constant.clone()));
+            } else {
+                return None;
+            }
+        }
+        let s = scale.unwrap_or_else(BigInt::one);
+        match form {
+            Some((c, k)) => Some((
+                c.into_iter().map(|(v, coeff)| (v, coeff * &s)).collect(),
+                k * &s,
+            )),
+            None => Some((HashMap::default(), s)),
+        }
+    }
+
+    /// Definition of an auxiliary difference variable: asserted atoms
+    /// `var <= X` and `var >= X` (either argument order) with the same
+    /// `X` term, both true, force `var = X`; returns `X`'s linear form.
+    fn var_definition_form(&self, var: TermId, depth: usize) -> Option<std::rc::Rc<LinearForm>> {
+        // #nia-contract-definitions: definition terms are
+        // precomputed in `build_var_definitions` (identical
+        // selection); only the expansion stays per call because it
+        // reads the tightening bounds.
+        let def = self.var_definitions.get(&var)?;
+        self.linear_form(*def, depth + 1)
+    }
+
+    /// Whether an asserted equality atom forces `u == v`: its normalized
+    /// linear form is `k*u - k*v = 0` for some nonzero integer `k`.
+    fn vars_asserted_equal(&self, u: TermId, v: TermId) -> bool {
+        self.vars_asserted_equal_premise(u, v).is_some()
+    }
+
+    /// As [`Self::vars_asserted_equal`], returning the justifying
+    /// literal: `Some(None)` for the same variable, `Some(Some(lit))`
+    /// via an asserted equality atom, `None` when not equal.
+    fn vars_asserted_equal_premise(&self, u: TermId, v: TermId) -> Option<Option<(TermId, bool)>> {
+        if u == v {
+            return Some(None);
+        }
+        for &(term, positive) in &self.solver.asserted {
+            if !self.lit_allowed(term, positive) {
+                continue;
+            }
+            let TermData::App(Symbol::Named(name), args) = self.solver.terms.get(term) else {
+                continue;
+            };
+            let is_equality =
+                (name.as_str() == "=" && positive) || (name.as_str() == "distinct" && !positive);
+            if !is_equality || args.len() != 2 {
+                continue;
+            }
+            let _ = args;
+            let Some(diff) = self.atom_diff_form(term) else {
+                continue;
+            };
+            if !diff.constant.is_zero() {
+                continue;
+            }
+            let coeffs = &diff.coeffs;
+            if coeffs.len() == 2 {
+                if let (Some(cu), Some(cv)) = (coeffs.get(&u), coeffs.get(&v)) {
+                    if !cu.is_zero() && cu == &-cv.clone() {
+                        return Some(Some((term, positive)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Normalized comparison operator of an asserted atom, mirroring
+    /// `contract_atom`'s polarity handling.
+    fn comparison_op(name: &str, positive: bool) -> Option<&'static str> {
+        match (name, positive) {
+            ("=", true) | ("distinct", false) => Some("="),
+            ("<", true) | (">=", false) => Some("<"),
+            ("<=", true) | (">", false) => Some("<="),
+            (">", true) | ("<=", false) => Some(">"),
+            (">=", true) | ("<", false) => Some(">="),
+            _ => None,
+        }
+    }
+
+    /// Normalized difference form of a binary atom: `form(lhs) -
+    /// form(rhs)` with zero coefficients removed, so the atom reads
+    /// `sum(coeffs * var) + constant (op) 0` for its normalized
+    /// comparison operator. Memoized in `atom_form_cache`.
+    fn atom_diff_form(&self, term: TermId) -> Option<std::rc::Rc<LinearForm>> {
+        if let Some(hit) = self.atom_form_cache.borrow().get(&term).cloned() {
+            if let Some(form) = &hit {
+                if !form.pure {
+                    self.form_taint.set(self.form_taint.get() + 1);
+                }
+            }
+            return hit;
+        }
+        let result = (|| {
+            let TermData::App(Symbol::Named(_), args) = self.solver.terms.get(term) else {
+                return None;
+            };
+            if args.len() != 2 {
+                return None;
+            }
+            let lf = self.linear_form(args[0], 0)?;
+            let rf = self.linear_form(args[1], 0)?;
+            let mut coeffs = lf.coeffs.clone();
+            for (v, coeff) in &rf.coeffs {
+                *coeffs.entry(*v).or_insert_with(BigInt::zero) -= coeff;
+            }
+            coeffs.retain(|_, coeff| !coeff.is_zero());
+            Some(std::rc::Rc::new(LinearForm {
+                coeffs,
+                constant: &lf.constant - &rf.constant,
+                pure: lf.pure && rf.pure,
+            }))
+        })();
+        self.atom_form_cache
+            .borrow_mut()
+            .insert(term, result.clone());
+        if let Some(form) = &result {
+            if !form.pure {
+                self.form_taint.set(self.form_taint.get() + 1);
+            }
+        }
+        result
+    }
+
+    /// Implied integer bound `(lo, hi)` on `var` from one asserted
+    /// comparison atom whose normalized form is a single variable with
+    /// coefficient `±1`; `None` outside that shape.
+    fn single_var_atom_bound(
+        &self,
+        term: TermId,
+        positive: bool,
+        var: TermId,
+    ) -> Option<(Option<BigInt>, Option<BigInt>)> {
+        let TermData::App(Symbol::Named(name), args) = self.solver.terms.get(term) else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let op = Self::comparison_op(name.as_str(), positive)?;
+        let _ = args;
+        let diff = self.atom_diff_form(term)?;
+        if diff.coeffs.len() != 1 {
+            return None;
+        }
+        let k = diff.coeffs.get(&var)?.clone();
+        if !k.is_one() && k != -BigInt::one() {
+            return None;
+        }
+        // Form: k*var + c (op) 0; solve for var.
+        let c = diff.constant.clone();
+        let neg_c = -&c;
+        // var bound when k == 1: var (op) -c; k == -1 flips the op.
+        let eff = if k.is_one() {
+            op
+        } else {
+            match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                other => other,
+            }
+        };
+        let one = BigInt::one();
+        Some(match eff {
+            "=" => (Some(neg_c.clone()), Some(neg_c)),
+            ">=" => (Some(neg_c), None),
+            ">" => (Some(neg_c + &one), None),
+            "<=" => (None, Some(neg_c)),
+            "<" => (None, Some(neg_c - &one)),
+            _ => return None,
+        })
+    }
+
+    /// Asserted literal implying `var >= 0` (`want_nonneg`) or
+    /// `var <= 0`, for product-sum provenance.
+    fn sign_premise(&self, var: TermId, want_nonneg: bool) -> Option<(TermId, bool)> {
+        for &(term, positive) in &self.solver.asserted {
+            if !self.lit_allowed(term, positive) {
+                continue;
+            }
+            let Some((lo, hi)) = self.single_var_atom_bound(term, positive, var) else {
+                continue;
+            };
+            let ok = if want_nonneg {
+                lo.is_some_and(|b| !b.is_negative())
+            } else {
+                hi.is_some_and(|b| !b.is_positive())
+            };
+            if ok {
+                return Some((term, positive));
+            }
+        }
+        None
+    }
+
+    /// Asserted literal implying `var == p`, for product-sum provenance.
+    fn point_premise(&self, var: TermId, p: &BigInt) -> Option<(TermId, bool)> {
+        for &(term, positive) in &self.solver.asserted {
+            if !self.lit_allowed(term, positive) {
+                continue;
+            }
+            let Some((lo, hi)) = self.single_var_atom_bound(term, positive, var) else {
+                continue;
+            };
+            if lo.as_ref() == Some(p) && hi.as_ref() == Some(p) {
+                return Some((term, positive));
+            }
+        }
+        None
+    }
+
+    /// `term` as `k * var` (a lone variable counts as `k = 1`).
+    fn scaled_var(&self, term: TermId) -> Option<(BigInt, TermId)> {
+        match self.solver.terms.get(term) {
+            TermData::Var(_, _) => Some((BigInt::one(), term)),
+            TermData::App(Symbol::Named(name), args) if name.as_str() == "*" => {
+                let (c, groups) = group_product_args(self.solver, args);
+                match groups.as_slice() {
+                    [(child, 1)]
+                        if matches!(self.solver.terms.get(*child), TermData::Var(_, _)) =>
+                    {
+                        Some((c, *child))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `term` as an unscaled binary product of two variables.
+    fn binary_var_product(&self, term: TermId) -> Option<(TermId, TermId)> {
+        match self.solver.terms.get(term) {
+            TermData::App(Symbol::Named(name), args) if name.as_str() == "*" => {
+                let (c, groups) = group_product_args(self.solver, args);
+                if !c.is_one() {
+                    return None;
+                }
+                match groups.as_slice() {
+                    [(a, 1), (b, 1)]
+                        if matches!(self.solver.terms.get(*a), TermData::Var(_, _))
+                            && matches!(self.solver.terms.get(*b), TermData::Var(_, _)) =>
+                    {
+                        Some((*a, *b))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Product-sum threshold rule (#nia-product-sum-bound): a sum child
+    /// pair `k*u` and `c*v` with `u == v` asserted (or the same variable)
+    /// is `(k + c) * v`. When the sum's remaining children leave
+    /// `(k + c) * v ∈ t` with a finite endpoint past zero and `v` is
+    /// sign-definite, `k + c` must share that sign strictly: e.g.
+    /// `t.lo >= 1` and `v >= 0` force `c >= 1 - k` (otherwise
+    /// `(k + c) * v <= 0`). This is the correlation plain HC4 loses
+    /// (it treats `k*u` and `c*v` independently), and it is what bounds
+    /// the shared Farkas factor below (`(6 + C) * v > 1` gives
+    /// `C >= -5`) so bounded factor split can enumerate it.
+    fn contract_product_sum(
+        &mut self,
+        args: &[TermId],
+        refined: &Iv,
+        depth: usize,
+    ) -> Result<(), StopContraction> {
+        for (i, &lin) in args.iter().enumerate() {
+            let Some((k, u)) = self.scaled_var(lin) else {
+                continue;
+            };
+            for (j, &prod) in args.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let Some((f1, f2)) = self.binary_var_product(prod) else {
+                    continue;
+                };
+                for (v, c) in [(f1, f2), (f2, f1)] {
+                    let Some(alias_lit) = self.vars_asserted_equal_premise(u, v) else {
+                        continue;
+                    };
+                    let v_iv = self.bounds.get(&v).cloned().unwrap_or_else(Iv::top);
+                    let v_nonneg = matches!(&v_iv.lo, Ep::Fin(n) if !n.is_negative());
+                    let v_nonpos = matches!(&v_iv.hi, Ep::Fin(n) if !n.is_positive());
+                    if !v_nonneg && !v_nonpos {
+                        continue;
+                    }
+                    let mut rest = Iv::point(BigInt::zero());
+                    let mut premises = self.base_premises(alias_lit, v, v_nonneg);
+                    for (m, &other) in args.iter().enumerate() {
+                        if m != i && m != j {
+                            rest = rest.add(&self.fwd(other, depth + 1));
+                            if let Some(p) = &mut premises {
+                                match self.child_point_premise(other) {
+                                    Some(lits) => p.extend(lits),
+                                    None => premises = None,
+                                }
+                            }
+                        }
+                    }
+                    let t = refined.sub(&rest);
+                    self.apply_product_threshold(c, &k, &v_iv, &t, depth, premises)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Narrow premises shared by both product-sum rules: the atom
+    /// being contracted, the alias equality (when via an atom), and a
+    /// sign literal for `w`. `None` when any piece is unavailable
+    /// (callers then record no derivation; factor split falls back to
+    /// citing every asserted literal).
+    fn base_premises(
+        &self,
+        alias_lit: Option<(TermId, bool)>,
+        w: TermId,
+        w_nonneg: bool,
+    ) -> Option<Vec<(TermId, bool)>> {
+        let mut premises = vec![self.current_atom?];
+        if let Some(lit) = alias_lit {
+            premises.push(lit);
+        }
+        premises.push(self.sign_premise(w, w_nonneg)?);
+        Some(premises)
+    }
+
+    /// Premise literals for one rest child of a product-sum: constants
+    /// need none; a point-bounded variable needs its fixing literal;
+    /// anything else has no narrow provenance.
+    fn child_point_premise(&self, other: TermId) -> Option<Vec<(TermId, bool)>> {
+        if self.solver.terms.extract_integer_constant(other).is_some() {
+            return Some(Vec::new());
+        }
+        if matches!(self.solver.terms.get(other), TermData::Var(_, _)) {
+            if let Some(iv) = self.bounds.get(&other) {
+                if let (Ep::Fin(lo), Ep::Fin(hi)) = (&iv.lo, &iv.hi) {
+                    if lo == hi {
+                        return self.point_premise(other, lo).map(|lit| vec![lit]);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Integer sign threshold for `(k + f) * w ∈ t` with `w`
+    /// sign-definite: a finite endpoint of `t` past zero forces
+    /// `k + f` to that side strictly (e.g. `t.lo >= 1` and `w >= 0`
+    /// give `f >= 1 - k`, since `k + f <= 0` would make the product
+    /// `<= 0`). Tightens `f` in place.
+    fn apply_product_threshold(
+        &mut self,
+        f: TermId,
+        k: &BigInt,
+        w_iv: &Iv,
+        t: &Iv,
+        depth: usize,
+        premises: Option<Vec<(TermId, bool)>>,
+    ) -> Result<(), StopContraction> {
+        let w_nonneg = matches!(&w_iv.lo, Ep::Fin(n) if !n.is_negative());
+        let w_nonpos = matches!(&w_iv.hi, Ep::Fin(n) if !n.is_positive());
+        if !w_nonneg && !w_nonpos {
+            return Ok(());
+        }
+        let cur = self.bounds.get(&f).cloned().unwrap_or_else(Iv::top);
+        let one = BigInt::one();
+        if let Ep::Fin(tl) = &t.lo {
+            if *tl >= one {
+                let (bound, is_lower) = if w_nonneg {
+                    (
+                        Iv {
+                            lo: Ep::Fin(&one - k),
+                            hi: Ep::PosInf,
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        Iv {
+                            lo: Ep::NegInf,
+                            hi: Ep::Fin(-&one - k),
+                        },
+                        false,
+                    )
+                };
+                self.record_derived(f, is_lower, &bound, &cur, &premises);
+                self.bwd(f, &bound, depth + 1)?;
+            }
+        }
+        if let Ep::Fin(th) = &t.hi {
+            if *th <= -one.clone() {
+                let (bound, is_lower) = if w_nonneg {
+                    (
+                        Iv {
+                            lo: Ep::NegInf,
+                            hi: Ep::Fin(-&one - k),
+                        },
+                        false,
+                    )
+                } else {
+                    (
+                        Iv {
+                            lo: Ep::Fin(&one - k),
+                            hi: Ep::PosInf,
+                        },
+                        true,
+                    )
+                };
+                self.record_derived(f, is_lower, &bound, &cur, &premises);
+                self.bwd(f, &bound, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a product-sum derivation when `bound` actually tightens
+    /// `f` past `cur` and narrow premises are available.
+    fn record_derived(
+        &mut self,
+        f: TermId,
+        is_lower: bool,
+        bound: &Iv,
+        cur: &Iv,
+        premises: &Option<Vec<(TermId, bool)>>,
+    ) {
+        let Some(premises) = premises else {
+            return;
+        };
+        let tightens = if is_lower {
+            match (&bound.lo, &cur.lo) {
+                (Ep::Fin(n), Ep::Fin(c)) => n > c,
+                (Ep::Fin(_), Ep::NegInf) => true,
+                _ => false,
+            }
+        } else {
+            match (&bound.hi, &cur.hi) {
+                (Ep::Fin(n), Ep::Fin(c)) => n < c,
+                (Ep::Fin(_), Ep::PosInf) => true,
+                _ => false,
+            }
+        };
+        if tightens {
+            self.derived.push((f, is_lower, premises.clone()));
+        }
+    }
+
+    /// Asserted offset equality `u = v + d`: an asserted equality atom
+    /// whose normalized linear form is `k0*u - k0*v + c0 = 0` with
+    /// `k0 != 0` and `k0 | c0`, giving `d = -c0 / k0`.
+    fn vars_asserted_offset(&self, u: TermId, v: TermId) -> Option<BigInt> {
+        self.vars_asserted_offset_premise(u, v).map(|(d, _)| d)
+    }
+
+    /// As [`Self::vars_asserted_offset`], also returning the justifying
+    /// literal (`None` for the same variable).
+    fn vars_asserted_offset_premise(
+        &self,
+        u: TermId,
+        v: TermId,
+    ) -> Option<(BigInt, Option<(TermId, bool)>)> {
+        if u == v {
+            return Some((BigInt::zero(), None));
+        }
+        for &(term, positive) in &self.solver.asserted {
+            if !self.lit_allowed(term, positive) {
+                continue;
+            }
+            let TermData::App(Symbol::Named(name), args) = self.solver.terms.get(term) else {
+                continue;
+            };
+            let is_equality =
+                (name.as_str() == "=" && positive) || (name.as_str() == "distinct" && !positive);
+            if !is_equality || args.len() != 2 {
+                continue;
+            }
+            let _ = args;
+            let Some(diff) = self.atom_diff_form(term) else {
+                continue;
+            };
+            let coeffs = &diff.coeffs;
+            if coeffs.len() != 2 {
+                continue;
+            }
+            let (Some(cu), Some(cv)) = (coeffs.get(&u), coeffs.get(&v)) else {
+                continue;
+            };
+            if cu.is_zero() || *cu != -cv.clone() {
+                continue;
+            }
+            let c0 = diff.constant.clone();
+            if (&c0 % cu).is_zero() {
+                return Some((-(&c0 / cu), Some((term, positive))));
+            }
+        }
+        None
+    }
+
+    /// Interval range of a linear form's remainder under current bounds.
+    fn linear_form_interval(&self, coeffs: &HashMap<TermId, BigInt>, constant: &BigInt) -> Iv {
+        let mut acc = Iv::point(constant.clone());
+        for (var, coeff) in coeffs {
+            let var_iv = self.bounds.get(var).cloned().unwrap_or_else(Iv::top);
+            acc = acc.add(&Iv::point(coeff.clone()).mul(&var_iv));
+        }
+        acc
+    }
+
+    /// Linear-form product-sum rule (#nia-product-sum-bound, offset
+    /// form): for a monomial child `f * v` whose sibling sum children
+    /// are all linear with joint form `L`, substitute an asserted
+    /// offset equality `u = v + d` for a variable `u` in `L`
+    /// (coefficient `k`, with any `v` coefficient folded in). The sum
+    /// is `(k + f) * u + (l - d) * f + R`, where `l` is `f`'s own
+    /// linear coefficient in `L` and `R` the remaining linear part.
+    /// When `l == d` the stray `f` term cancels — the A1 Farkas shape
+    /// (`6u + Cv - 1 - (C + 3a)` with `u = v - 1` becomes
+    /// `(6 + C) * u - 2` at `a = 1`) — and the sign threshold on
+    /// `(k + f) * u ∈ refined - R` bounds `f`.
+    fn contract_product_sum_linear(
+        &mut self,
+        args: &[TermId],
+        refined: &Iv,
+        depth: usize,
+    ) -> Result<(), StopContraction> {
+        for (j, &prod) in args.iter().enumerate() {
+            let Some((f1, f2)) = self.binary_var_product(prod) else {
+                continue;
+            };
+            // Joint linear form of every other child; bail on any
+            // nonlinear sibling (the child-pair rule covers that case).
+            let mut coeffs: HashMap<TermId, BigInt> = HashMap::default();
+            let mut constant = BigInt::zero();
+            let mut linear = true;
+            for (i, &other) in args.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let Some(f) = self.linear_form(other, depth + 1) else {
+                    linear = false;
+                    break;
+                };
+                for (var, coeff) in &f.coeffs {
+                    *coeffs.entry(*var).or_insert_with(BigInt::zero) += coeff;
+                }
+                constant += &f.constant;
+            }
+            if !linear {
+                continue;
+            }
+            coeffs.retain(|_, coeff| !coeff.is_zero());
+            for (v, f) in [(f1, f2), (f2, f1)] {
+                let l = coeffs.get(&f).cloned().unwrap_or_else(BigInt::zero);
+                let kv = coeffs.get(&v).cloned().unwrap_or_else(BigInt::zero);
+                // Candidate alias targets: v itself (d = 0) and every
+                // other variable in the linear form.
+                let mut us: Vec<TermId> = coeffs.keys().copied().collect();
+                if !us.contains(&v) {
+                    us.push(v);
+                }
+                for u in us {
+                    if u == f {
+                        continue;
+                    }
+                    let Some((d, alias_lit)) = self.vars_asserted_offset_premise(u, v) else {
+                        continue;
+                    };
+                    if l != d {
+                        continue;
+                    }
+                    let ku = coeffs.get(&u).cloned().unwrap_or_else(BigInt::zero);
+                    let k_total = if u == v { kv.clone() } else { &ku + &kv };
+                    if k_total.is_zero() && u != v {
+                        continue;
+                    }
+                    // R: L with u, v, f removed; substituting v = u - d
+                    // in kv*v contributes the constant -kv*d.
+                    let mut rest_coeffs = coeffs.clone();
+                    rest_coeffs.remove(&u);
+                    rest_coeffs.remove(&v);
+                    rest_coeffs.remove(&f);
+                    let rest_const = &constant - &(&kv * &d);
+                    let rest_iv = self.linear_form_interval(&rest_coeffs, &rest_const);
+                    let t = refined.sub(&rest_iv);
+                    let u_iv = self.bounds.get(&u).cloned().unwrap_or_else(Iv::top);
+                    let u_nonneg = matches!(&u_iv.lo, Ep::Fin(n) if !n.is_negative());
+                    let mut premises = self.base_premises(alias_lit, u, u_nonneg);
+                    if let Some(p) = &mut premises {
+                        for var in rest_coeffs.keys() {
+                            match self.child_point_premise(*var) {
+                                Some(lits) => p.extend(lits),
+                                None => {
+                                    premises = None;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.apply_product_threshold(f, &k_total, &u_iv, &t, depth, premises)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Contract from one asserted atom. Unsupported shapes are skipped.
@@ -740,14 +1627,80 @@ impl NiaSolver<'_> {
     /// bounded enumeration's exhaustive UNSAT over the tightened box remains
     /// sound, and any SAT witness it finds is independently re-verified by
     /// exact substitution anyway.
+    /// Seed `bounds` with justified LIA bounds for every Int variable
+    /// occurring in the asserted atoms (#nia-product-sum-bound):
+    /// alias/definition reasoning inside the contractor needs
+    /// point-bounded factors (e.g. an asserted `a = 1` whose effect
+    /// reaches LIA as a direct bound) even when they are not
+    /// enumeration variables. Extra seeds only ever tighten the
+    /// contractor's internal map; exported bounds still cover exactly
+    /// the requested `vars`.
+    fn seed_extra_atom_vars(&self, bounds: &mut HashMap<TermId, Iv>) {
+        let mut extra: Vec<TermId> = Vec::new();
+        for &(term, _) in &self.asserted {
+            self.collect_int_var_leaves(term, &mut extra);
+            if extra.len() >= 256 {
+                break;
+            }
+        }
+        for v in extra {
+            if bounds.contains_key(&v) {
+                continue;
+            }
+            let (lo, hi) = match self.get_integer_bounds(v) {
+                Some((lo, hi)) => (Some(lo), Some(hi)),
+                None => self.get_partial_integer_bounds(v),
+            };
+            if lo.is_some() || hi.is_some() {
+                bounds.insert(
+                    v,
+                    Iv {
+                        lo: lo.map(Ep::fin).unwrap_or(Ep::NegInf),
+                        hi: hi.map(Ep::fin).unwrap_or(Ep::PosInf),
+                    },
+                );
+            }
+        }
+    }
+
+    /// #nia-contract-relevant-atoms: above MAX_CONTRACT_ATOMS asserted
+    /// atoms the contractor used to return empty, which on searched
+    /// trails (VeryMax: 103 atoms asserted to the theory) left the
+    /// shared monomial factor with no contracted bounds at all and
+    /// factor split with no candidate — while the same components
+    /// refute as ground files under the cap. Above the threshold,
+    /// contract only atoms whose term mentions a monomial factor or
+    /// aux variable: an atom touching none of them cannot tighten a
+    /// tracked bound in one step (multi-step chains through such
+    /// atoms are the only loss, and only where today there is no
+    /// contraction at all). At or below the threshold behavior is
+    /// unchanged (every atom contracted), signaled by `None`.
+    fn contract_relevant_set(&self, vars: &[TermId]) -> Option<std::collections::BTreeSet<TermId>> {
+        if self.asserted.len() <= MAX_CONTRACT_ATOMS {
+            return None;
+        }
+        let mut set: std::collections::BTreeSet<TermId> = Default::default();
+        set.extend(vars.iter().copied());
+        set.extend(self.monomials.values().map(|m| m.aux_var));
+        Some(set)
+    }
+
+    /// Returns `(derived endpoint premises, refuted)`. In the
+    /// relevant-filtered mode only, `refuted` is set when some asserted
+    /// atom's contraction produced an empty interval: every tightening
+    /// is an interval consequence of asserted literals over
+    /// verdict-grade seed bounds, so emptiness refutes the asserted
+    /// set as a whole (#nia-contract-empty-refutes).
     pub(crate) fn contract_enum_bounds(
         &self,
         vars: &[TermId],
         var_bounds: &mut HashMap<TermId, (Option<i64>, Option<i64>)>,
-    ) {
-        if self.asserted.len() > MAX_CONTRACT_ATOMS {
-            return;
-        }
+    ) -> (HashMap<(TermId, bool), Vec<(TermId, bool)>>, bool) {
+        let relevant = self.contract_relevant_set(vars);
+        let atom_relevant = |solver: &Self, term: TermId| -> bool {
+            let Some(set) = &relevant else { return true };
+            solver.atom_mentions_any(term, set)
+        };
         // Seed the working map from the incoming i64 bounds.
         let mut bounds: HashMap<TermId, Iv> = HashMap::default();
         for &v in vars {
@@ -760,11 +1713,20 @@ impl NiaSolver<'_> {
                 },
             );
         }
+        self.seed_extra_atom_vars(&mut bounds);
         let mut ctr = Contractor {
             solver: self,
             bounds,
             changed: true,
+            current_atom: None,
+            derived: Vec::new(),
+            lit_filter: None,
+            var_definitions: Contractor::build_var_definitions(self, &None),
+            form_cache: std::cell::RefCell::new(HashMap::default()),
+            form_taint: std::cell::Cell::new(0),
+            atom_form_cache: std::cell::RefCell::new(HashMap::default()),
         };
+        let mut refuted = false;
         for _round in 0..MAX_CONTRACT_ROUNDS {
             if !ctr.changed {
                 break;
@@ -772,11 +1734,23 @@ impl NiaSolver<'_> {
             ctr.changed = false;
             let mut stopped = false;
             for &(term, positive) in &self.asserted {
+                if !atom_relevant(self, term) {
+                    continue;
+                }
+                ctr.current_atom = Some((term, positive));
                 if ctr.contract_atom(term, positive).is_err() {
-                    // Empty intersection (or an equivalent stop signal):
-                    // keep tightenings applied so far (each one is
-                    // independently sound) but stop deriving more. No
-                    // verdict is drawn from emptiness here.
+                    // Empty intersection: keep tightenings applied so far
+                    // (each independently sound) but stop deriving more.
+                    // In the relevant-filtered mode (> MAX_CONTRACT_ATOMS,
+                    // where contraction was previously disabled outright)
+                    // this also refutes the asserted set; below the
+                    // threshold the historical contract stands — no
+                    // verdict is drawn from emptiness and exhaustive
+                    // enumeration remains the decider (pinned by the
+                    // Phase-2 isolation tests in bounded_enum).
+                    if relevant.is_some() {
+                        refuted = true;
+                    }
                     stopped = true;
                     break;
                 }
@@ -785,10 +1759,33 @@ impl NiaSolver<'_> {
                 break;
             }
         }
-        // Export: only ACCEPT contracted endpoints that fit i64 (otherwise
-        // keep the original bound — sound, merely looser). By construction
-        // (pure intersections) the contracted interval is a subset of the
-        // seed, so this only ever tightens.
+        Self::export_contracted_bounds(&ctr, vars, var_bounds);
+        if self.debug {
+            for &v in vars {
+                safe_eprintln!(
+                    "[NIA] interval-contract: {:?} -> {:?}",
+                    v,
+                    var_bounds.get(&v)
+                );
+            }
+        }
+        let mut derived: HashMap<(TermId, bool), Vec<(TermId, bool)>> = HashMap::default();
+        for (var, is_lower, premises) in ctr.derived {
+            derived.entry((var, is_lower)).or_insert(premises);
+        }
+        (derived, refuted)
+    }
+
+    /// Export contracted endpoints back to i64 bounds: only ACCEPT
+    /// endpoints that fit i64 (otherwise keep the original bound —
+    /// sound, merely looser). By construction (pure intersections)
+    /// the contracted interval is a subset of the seed, so this
+    /// only ever tightens.
+    fn export_contracted_bounds(
+        ctr: &Contractor<'_, '_>,
+        vars: &[TermId],
+        var_bounds: &mut HashMap<TermId, (Option<i64>, Option<i64>)>,
+    ) {
         for &v in vars {
             let Some(iv) = ctr.bounds.get(&v) else {
                 continue;
@@ -804,15 +1801,88 @@ impl NiaSolver<'_> {
             };
             var_bounds.insert(v, (new_lo, new_hi));
         }
-        if self.debug {
-            for &v in vars {
-                safe_eprintln!(
-                    "[NIA] interval-contract: {:?} -> {:?}",
-                    v,
-                    var_bounds.get(&v)
-                );
+    }
+
+    /// Whether `term`'s DAG contains any term from `set`.
+    pub(crate) fn atom_mentions_any(
+        &self,
+        term: TermId,
+        set: &std::collections::BTreeSet<TermId>,
+    ) -> bool {
+        let mut stack = vec![term];
+        let mut seen: std::collections::BTreeSet<TermId> = Default::default();
+        while let Some(t) = stack.pop() {
+            if set.contains(&t) {
+                return true;
+            }
+            if !seen.insert(t) {
+                continue;
+            }
+            match self.terms.get(t) {
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                _ => {}
             }
         }
+        false
+    }
+
+    /// Whether interval contraction over ONLY `lits` (subset seeds from
+    /// var-vs-constant literals in `lits`, alias/definition lookups
+    /// filtered to `lits`, no LIA bounds) empties some interval. When
+    /// true, `lits` alone are unsatisfiable and form a sound conflict
+    /// (#nia-contract-subset-refutes) — the shrinking oracle for the
+    /// full-cover emptiness conflicts, whose ~100 literals block
+    /// exactly one Boolean trail each in the CEGAR loop.
+    pub(crate) fn contract_subset_refutes(&self, lits: &[(TermId, bool)]) -> bool {
+        let mut bounds: HashMap<TermId, Iv> = HashMap::default();
+        for &(term, positive) in lits {
+            let Some((var, lo, hi)) = self.asserted_integer_bound(term, positive) else {
+                continue;
+            };
+            let seed = Iv {
+                lo: lo.map(Ep::fin).unwrap_or(Ep::NegInf),
+                hi: hi.map(Ep::fin).unwrap_or(Ep::PosInf),
+            };
+            let entry = bounds.entry(var).or_insert_with(Iv::top);
+            *entry = entry.intersect(&seed);
+            if entry.is_empty() {
+                return true;
+            }
+        }
+        let lit_filter: Option<std::collections::BTreeSet<(TermId, bool)>> =
+            Some(lits.iter().copied().collect());
+        let var_definitions = Contractor::build_var_definitions(self, &lit_filter);
+        let mut ctr = Contractor {
+            solver: self,
+            bounds,
+            changed: true,
+            current_atom: None,
+            derived: Vec::new(),
+            lit_filter,
+            var_definitions,
+            form_cache: std::cell::RefCell::new(HashMap::default()),
+            form_taint: std::cell::Cell::new(0),
+            atom_form_cache: std::cell::RefCell::new(HashMap::default()),
+        };
+        for _round in 0..MAX_CONTRACT_ROUNDS {
+            if !ctr.changed {
+                break;
+            }
+            ctr.changed = false;
+            for &(term, positive) in lits {
+                ctr.current_atom = Some((term, positive));
+                if ctr.contract_atom(term, positive).is_err() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1055,6 +2125,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Form-cache invalidation (#nia-contract-form-cache): a form
+    /// computed while `x` is free must not survive `x` being tightened
+    /// to a point, because the point shortcut changes the form.
+    #[test]
+    fn linear_form_cache_invalidated_on_tighten() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let v = terms.mk_var("v", Sort::Int);
+        let prod = terms.mk_mul(vec![x, v]);
+        let solver = NiaSolver::new(&terms);
+        let mut ctr = Contractor {
+            solver: &solver,
+            bounds: HashMap::default(),
+            changed: false,
+            current_atom: None,
+            derived: Vec::new(),
+            lit_filter: None,
+            var_definitions: HashMap::default(),
+            form_cache: std::cell::RefCell::new(HashMap::default()),
+            form_taint: std::cell::Cell::new(0),
+            atom_form_cache: std::cell::RefCell::new(HashMap::default()),
+        };
+        // `x*v` is not linear while both factors are free.
+        assert!(ctr.linear_form(prod, 0).is_none());
+        assert!(
+            ctr.form_cache.borrow().contains_key(&prod),
+            "top-level form must be memoized"
+        );
+        // Tighten `x` to the point 1 through the normal backward pass.
+        assert!(
+            ctr.bwd(x, &Iv::point(BigInt::one()), 0).is_ok(),
+            "tightening to a point cannot empty the interval"
+        );
+        let form = ctr
+            .linear_form(prod, 0)
+            .expect("with x pinned to 1 the product is linear in v");
+        assert_eq!(form.coeffs.get(&v), Some(&BigInt::one()));
+        assert!(form.constant.is_zero());
+    }
+
+    #[test]
+    fn pure_form_survives_unrelated_tighten() {
+        // #nia-form-retain: tightening a variable retains pure forms
+        // that do not mention it (their recomputation is identical),
+        // while forms mentioning it and `None` entries drop.
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let v = terms.mk_var("v", Sort::Int);
+        let w = terms.mk_var("w", Sort::Int);
+        let sum = terms.mk_add(vec![v, w]);
+        let solver = NiaSolver::new(&terms);
+        let mut ctr = Contractor {
+            solver: &solver,
+            bounds: HashMap::default(),
+            changed: false,
+            current_atom: None,
+            derived: Vec::new(),
+            lit_filter: None,
+            var_definitions: HashMap::default(),
+            form_cache: std::cell::RefCell::new(HashMap::default()),
+            form_taint: std::cell::Cell::new(0),
+            atom_form_cache: std::cell::RefCell::new(HashMap::default()),
+        };
+        let before = ctr.linear_form(sum, 0).expect("v + w is linear");
+        assert!(before.pure, "no bounds were read");
+        // Tighten the unrelated variable x to a point.
+        assert!(ctr.bwd(x, &Iv::point(BigInt::one()), 0).is_ok());
+        let after = ctr.linear_form(sum, 0).expect("v + w is linear");
+        assert!(
+            std::rc::Rc::ptr_eq(&before, &after),
+            "pure form not mentioning x must be retained, not recomputed"
+        );
+        // Tightening a mentioned variable drops the entry: the form
+        // is recomputed (with the point shortcut available).
+        assert!(ctr.bwd(v, &Iv::point(BigInt::from(3)), 0).is_ok());
+        let pinned = ctr.linear_form(sum, 0).expect("v + w is linear");
+        assert!(!std::rc::Rc::ptr_eq(&before, &pinned));
+        assert_eq!(pinned.constant, BigInt::from(3));
+        assert_eq!(pinned.coeffs.get(&w), Some(&BigInt::one()));
+        assert!(!pinned.pure, "point shortcut was used");
     }
 
     #[test]

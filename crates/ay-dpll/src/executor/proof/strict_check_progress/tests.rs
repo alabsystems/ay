@@ -36,7 +36,8 @@ fn control_is_polled_on_every_charge_including_zero_delta() {
             polls.set(polls.get() + 1);
             false
         },
-        || "test".to_string()
+        || "test".to_string(),
+        || None
     ));
     assert!(!meter.charge_while_running(
         0,
@@ -45,7 +46,8 @@ fn control_is_polled_on_every_charge_including_zero_delta() {
             polls.set(polls.get() + 1);
             true
         },
-        || "test".to_string()
+        || "test".to_string(),
+        || None
     ));
     assert_eq!(polls.get(), 2);
 }
@@ -257,7 +259,7 @@ fn want_quality_selects_which_walk_runs() {
 /// WITHOUT stripping inline `#[cfg(test)]` modules. A fixture is no reason
 /// to spend a vetted trust site, and none is needed here.
 #[cfg(feature = "proof-checker")]
-fn valid_empty_clause_proof(exec: &mut Executor) -> Proof {
+pub(super) fn valid_empty_clause_proof(exec: &mut Executor) -> Proof {
     let p = exec.ctx.terms.mk_var("p", Sort::Bool);
     let not_p = exec.ctx.terms.mk_not(p);
     let mut proof = Proof::new();

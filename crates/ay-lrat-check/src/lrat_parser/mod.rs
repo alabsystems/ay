@@ -95,7 +95,9 @@ fn parse_text_deletion_body(rest: &[&str]) -> Result<LratStep, LratParseError> {
         })?;
         if id == 0 {
             terminated = true;
-            if index + 1 != rest.len() {
+            // `index < rest.len()`, so the successor always exists; `None`
+            // would equally mean "not the last token".
+            if index.checked_add(1) != Some(rest.len()) {
                 return Err(LratParseError::InvalidStep {
                     detail: "tokens after deletion terminator".into(),
                 });
@@ -126,7 +128,7 @@ fn parse_text_addition_body(id: u64, rest: &[&str]) -> Result<LratStep, LratPars
             })?;
             if hint == 0 {
                 hints_terminated = true;
-                if index + 1 != rest.len() {
+                if index.checked_add(1) != Some(rest.len()) {
                     return Err(LratParseError::InvalidStep {
                         detail: "tokens after hint terminator".into(),
                     });
@@ -256,12 +258,17 @@ fn decode_binary_id(encoded: u64) -> u64 {
 /// RUP chain references; negative hints mark RAT witness clause boundaries.
 ///
 /// Reference: drat-trim `compress.c` and `lrat-check.c:getRATs()`.
-fn decode_binary_hint(encoded: u64) -> i64 {
-    let magnitude = (encoded >> 1) as i64;
+///
+/// `encoded >> 1` is at most `i64::MAX`, so for every `u64` input both the
+/// conversion and the negation succeed and this returns `Some`. Both steps are
+/// nonetheless checked, so the decoder is total by construction rather than
+/// by an unstated range argument; a `None` is a malformed hint to the caller.
+fn decode_binary_hint(encoded: u64) -> Option<i64> {
+    let magnitude = i64::try_from(encoded >> 1).ok()?;
     if encoded & 1 == 0 {
-        magnitude
+        Some(magnitude)
     } else {
-        -magnitude
+        magnitude.checked_neg()
     }
 }
 
@@ -292,7 +299,16 @@ fn decode_binary_lit(encoded: u64) -> Result<Literal, LratParseError> {
         position: 0,
         detail: format!("binary LRAT literal var {var_u64} exceeds i32 range"),
     })?;
-    let dimacs = if encoded & 1 == 0 { var } else { -var };
+    // `var` is in `1..=MAX_LRAT_VAR`, so its negation always exists.
+    let dimacs = if encoded & 1 == 0 {
+        var
+    } else {
+        var.checked_neg()
+            .ok_or_else(|| LratParseError::InvalidBinary {
+                position: 0,
+                detail: format!("binary LRAT literal var {var_u64} cannot be negated"),
+            })?
+    };
     Literal::try_from_dimacs(dimacs).map_err(LratParseError::from)
 }
 
@@ -307,9 +323,15 @@ pub fn parse_binary_lrat(data: &[u8]) -> Result<Vec<LratStep>, LratParseError> {
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(data.len());
 
-    while pos < data.len() {
-        let marker = data[pos];
-        pos += 1;
+    while let Some(&marker) = data.get(pos) {
+        let marker_pos = pos;
+        // `pos` indexes a byte of `data`, so `pos + 1 <= data.len()`.
+        pos = pos
+            .checked_add(1)
+            .ok_or_else(|| LratParseError::InvalidBinary {
+                position: marker_pos,
+                detail: "binary LRAT position overflows usize".into(),
+            })?;
 
         match marker {
             b'a' => {
@@ -350,13 +372,15 @@ pub fn parse_binary_lrat(data: &[u8]) -> Result<Vec<LratStep>, LratParseError> {
                     if val == 0 {
                         break;
                     }
-                    let hint = decode_binary_hint(val);
-                    if hint == 0 {
-                        return Err(LratParseError::InvalidBinary {
-                            position: pos,
-                            detail: format!("invalid encoded hint ID {val}"),
-                        });
-                    }
+                    let hint = match decode_binary_hint(val) {
+                        Some(hint) if hint != 0 => hint,
+                        _ => {
+                            return Err(LratParseError::InvalidBinary {
+                                position: pos,
+                                detail: format!("invalid encoded hint ID {val}"),
+                            });
+                        }
+                    };
                     hints.push(hint);
                 }
 
@@ -390,7 +414,7 @@ pub fn parse_binary_lrat(data: &[u8]) -> Result<Vec<LratStep>, LratParseError> {
             }
             _ => {
                 return Err(LratParseError::InvalidBinary {
-                    position: pos - 1,
+                    position: marker_pos,
                     detail: format!("invalid binary LRAT marker byte: 0x{marker:02x}"),
                 });
             }

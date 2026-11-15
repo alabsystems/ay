@@ -4,16 +4,49 @@
 //! Deterministic CHC proof/transcript metadata for replay consumers.
 
 use crate::pdr::{ChcReplayObligationKind, PdrConfig};
+#[cfg(test)]
+use crate::{ChcExpr, HornClause};
 use crate::{
-    ChcExpr, ChcOp, ChcProblem, ChcSort, ClauseHead, HornClause, PredicateId, VerifiedChcResult,
-    VerifiedUnknownReason,
+    ChcProblem, ChcSort, ClauseHead, PredicateId, VerifiedChcResult, VerifiedUnknownReason,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-/// Schema tag for normalized CHC/PDR replay input material.
+/// Schema tag for normalized CHC/PDR replay input material that references no
+/// datatype sort. Such input is spelled exactly as it always was.
 pub const NORMALIZED_CHC_INPUT_SCHEMA: &str = "ay.chc.normalized-input/v1";
+
+/// Schema tag for normalized CHC/PDR replay input that references a datatype
+/// sort. Every occurrence spells `Datatype("name";@<id>)`, where `<id>` is the
+/// content address of the constructor list ([`crate::ChcDtId`]), and a
+/// `datatype-constructors` section defines each referenced list once. Under
+/// v1 every occurrence carried the whole nested definition inline.
+pub const NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA: &str = "ay.chc.normalized-input/v2";
+
+/// The schema tag a normalized-input schema label names, if it is one this
+/// build produces. Readers use it to accept either schema and keep the tag.
+pub fn normalized_chc_input_schema(label: &str) -> Option<&'static str> {
+    [
+        NORMALIZED_CHC_INPUT_SCHEMA,
+        NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA,
+    ]
+    .into_iter()
+    .find(|schema| *schema == label)
+}
+
+/// The schema tag on the first line of normalized CHC input text, if any.
+pub fn normalized_chc_input_schema_of(normalized_input: &str) -> Option<&'static str> {
+    normalized_input
+        .split_once('\n')
+        .and_then(|(label, _)| normalized_chc_input_schema(label))
+}
+
+/// Schema of normalized input this build produced: always one of the two, so
+/// only text that is not normalized input at all reads as v1 here.
+fn produced_schema(normalized_input: &str) -> &'static str {
+    normalized_chc_input_schema_of(normalized_input).unwrap_or(NORMALIZED_CHC_INPUT_SCHEMA)
+}
 
 /// Schema tag for CHC proof/transcript metadata.
 pub const CHC_PROOF_TRANSCRIPT_SCHEMA: &str = "ay.chc-proof-transcript/v1";
@@ -89,6 +122,10 @@ pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2: &str = "ay-chc-certificate-repla
 /// this new schema binds the new row representation explicitly.
 pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3: &str = "ay-chc-certificate-replay/v3";
 
+/// Checked replay carrying complete, source-bound datatype value DAGs.
+/// Existing v1-v3 summaries retain their original identity and interpretation.
+pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4: &str = "ay-chc-certificate-replay/v4";
+
 /// Schema tag for checked replay checker identity rows.
 pub(crate) const CHC_REPLAY_CHECKER_IDENTITY_SCHEMA: &str = "ay.chc-replay-checker-identity/v1";
 
@@ -97,6 +134,18 @@ pub(crate) const CHC_REPLAY_CHECK_RESULT_SCHEMA: &str = "ay.chc-replay-check-res
 
 mod strict_cert;
 pub use strict_cert::ChcObligationStrictCert;
+
+mod artifact_digest;
+mod normalization;
+#[cfg(test)]
+pub(crate) use normalization::normalized_chc_input_sha256_with_progress;
+pub use normalization::prepared::{
+    prepare_normalized_chc_input_with_work, PreparedNormalizedChcInput,
+};
+pub(crate) use normalization::{
+    normalized_chc_input_identity, normalized_chc_input_identity_with_progress,
+    ordered_chc_clause_sequence_sha256_with_progress, IdentityHashInterrupted,
+};
 
 /// Schema tag for binding a checked replay summary to one evidence manifest.
 pub const CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA: &str =
@@ -1000,6 +1049,8 @@ pub enum ChcReplayPayloadFormat {
     /// A canonical source-bound ground derivation with exact finite ordinary-UF
     /// observations and derivation-wide congruence validation.
     GroundDerivationV2,
+    /// A complete source-bound ground derivation with shared datatype values.
+    CompactGroundDerivationV1,
 }
 
 impl ChcReplayPayloadFormat {
@@ -1009,6 +1060,7 @@ impl ChcReplayPayloadFormat {
             Self::SmtlibV1 => "smtlib-v1",
             Self::GroundDerivationV1 => "ground-derivation-v1",
             Self::GroundDerivationV2 => "ground-derivation-v2",
+            Self::CompactGroundDerivationV1 => "compact-ground-derivation-v1",
         }
     }
 
@@ -1017,6 +1069,7 @@ impl ChcReplayPayloadFormat {
             "smtlib-v1" => Some(Self::SmtlibV1),
             "ground-derivation-v1" => Some(Self::GroundDerivationV1),
             "ground-derivation-v2" => Some(Self::GroundDerivationV2),
+            "compact-ground-derivation-v1" => Some(Self::CompactGroundDerivationV1),
             _ => None,
         }
     }
@@ -1031,13 +1084,18 @@ pub(super) fn replay_payload_role(format: ChcReplayPayloadFormat) -> &'static st
         ChcReplayPayloadFormat::GroundDerivationV2 => {
             crate::ground_derivation::CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE
         }
+        ChcReplayPayloadFormat::CompactGroundDerivationV1 => {
+            crate::CHC_COMPACT_GROUND_DERIVATION_ROLE
+        }
     }
 }
 
 fn is_ground_derivation_payload(format: ChcReplayPayloadFormat) -> bool {
     matches!(
         format,
-        ChcReplayPayloadFormat::GroundDerivationV1 | ChcReplayPayloadFormat::GroundDerivationV2
+        ChcReplayPayloadFormat::GroundDerivationV1
+            | ChcReplayPayloadFormat::GroundDerivationV2
+            | ChcReplayPayloadFormat::CompactGroundDerivationV1
     )
 }
 
@@ -1679,6 +1737,10 @@ impl ChcCheckedReplaySummary {
         obligations: Vec<ChcCheckedReplayObligation>,
     ) -> Result<Self, ChcCheckedReplaySummaryError> {
         let schema = if obligations.iter().any(|obligation| {
+            obligation.payload_format == ChcReplayPayloadFormat::CompactGroundDerivationV1
+        }) {
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4
+        } else if obligations.iter().any(|obligation| {
             obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV2
         }) {
             CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
@@ -1731,6 +1793,7 @@ impl ChcCheckedReplaySummary {
             Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, 1),
             Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2, 2),
             Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3, 3),
+            Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4, 4),
             Some(other) => {
                 reasons.push(format!(
                     "schema={} is not a supported checked replay summary schema",
@@ -1795,10 +1858,14 @@ impl ChcCheckedReplaySummary {
         let obligations = obligations_from_json(object.get("obligations"), &mut reasons);
         if matches!(
             schema,
-            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
+                | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+                | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4
         ) {
             require_v2_checked_replay_obligation_fields(object.get("obligations"), &mut reasons);
-            let expected_ground_format = if schema == CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3 {
+            let expected_ground_format = if schema == CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4 {
+                ChcReplayPayloadFormat::CompactGroundDerivationV1
+            } else if schema == CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3 {
                 ChcReplayPayloadFormat::GroundDerivationV2
             } else {
                 ChcReplayPayloadFormat::GroundDerivationV1
@@ -1854,7 +1921,9 @@ impl ChcCheckedReplaySummary {
         };
         if matches!(
             schema,
-            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
+                | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+                | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4
         ) {
             let expected = summary.identity_sha256();
             if let Some(actual) =
@@ -1899,6 +1968,7 @@ impl ChcCheckedReplaySummary {
         serde_json::json!({
             "schema": self.schema,
             "schema_version": match self.schema {
+                CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4 => 4,
                 CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3 => 3,
                 CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 => 2,
                 _ => 1,
@@ -2888,6 +2958,9 @@ pub struct ChcPdrProofRun {
     problem: std::sync::Arc<proof_run::IterativeDropProblem>,
     result: VerifiedChcResult,
     metadata: ChcProofTranscriptMetadata,
+    /// The run's metered work (`None`: the run was not metered), outside the
+    /// metadata and every digest (guard-tree.md §13).
+    work: Option<crate::ChcRunWork>,
 }
 
 /// Why the authoritative proof-and-telemetry invocation stopped.
@@ -2896,13 +2969,19 @@ pub struct ChcPdrProofRun {
 pub enum ChcProofRunStopReason {
     /// A verified Safe or Unsafe verdict was produced.
     Definitive,
-    /// The configured whole-run budget elapsed before a verdict.
+    /// The configured whole-run budget elapsed before a verdict. Under an
+    /// effort this is the backstop (`ChcRunWork::stop` reads `Deadline`), never
+    /// the count.
     BudgetExhausted,
     /// The embedding caller's cooperative-cancellation token was set when the
     /// invocation returned without a definitive verdict.
     ExternallyCancelled,
     /// Search ended without a verdict for another reason.
     Inconclusive,
+    /// The caller's effort (`PdrConfig::effort`), the run's one count, was
+    /// spent before a verdict (`ChcRunWork::stop` reads `Rlimit`): the same
+    /// stop on every host (P4a slice 8).
+    EffortExhausted,
 }
 
 /// Atomic, problem-bound proof result and telemetry bundle.
@@ -2943,11 +3022,27 @@ pub struct ChcProofEvidenceOptions {
     pub memory_limit_bytes: Option<u64>,
     /// Whether strict proof mode was enabled.
     pub strict_proofs: bool,
+    /// The proof run's effort B, its one count (`PdrConfig::effort`, P4a
+    /// slice 8): what bounded the run, so it is bound into the option
+    /// identity (and every key built on it) when present. `None` leaves the
+    /// identity and the JSON exactly as they were before the field existed.
+    pub effort: Option<u64>,
 }
 
 impl ChcProofEvidenceOptions {
     /// Capture the proof-relevant public PDR resource limits and proof mode.
+    ///
+    /// Under an effort the run arms no count cap beside B
+    /// (`PdrConfig::disarm_count_caps`), so the caps read `u64::MAX`, as the
+    /// run ran, and B is recorded.
     pub fn pdr(config: &PdrConfig) -> Self {
+        let cap = |cap: usize| {
+            if config.effort.is_some() {
+                u64::MAX
+            } else {
+                cap as u64
+            }
+        };
         Self {
             proof_mode: if config.strict_proofs {
                 "pdr-strict"
@@ -2955,12 +3050,13 @@ impl ChcProofEvidenceOptions {
                 "pdr"
             }
             .to_string(),
-            max_frames: config.max_frames as u64,
-            max_iterations: config.max_iterations as u64,
-            max_obligations: config.max_obligations as u64,
+            max_frames: cap(config.max_frames),
+            max_iterations: cap(config.max_iterations),
+            max_obligations: cap(config.max_obligations),
             solve_timeout_ms: config.solve_timeout.map(duration_millis_u64),
             memory_limit_bytes: None,
             strict_proofs: config.strict_proofs,
+            effort: config.effort,
         }
     }
 
@@ -3005,7 +3101,7 @@ impl ChcProofEvidenceOptions {
 
     /// Render the stable options as JSON for manifests and stats envelopes.
     pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "schema": "ay.chc-proof-options/v1",
             "proof_mode": self.proof_mode,
             "max_frames": self.max_frames,
@@ -3015,7 +3111,11 @@ impl ChcProofEvidenceOptions {
             "memory_limit_bytes": self.memory_limit_bytes,
             "strict_proofs": self.strict_proofs,
             "identity_sha256": self.identity_sha256(),
-        })
+        });
+        if let (Some(effort), Some(object)) = (self.effort, value.as_object_mut()) {
+            object.insert("effort".to_string(), serde_json::json!(effort));
+        }
+        value
     }
 
     /// Parse proof/resource options from a manifest/cache snapshot.
@@ -3065,6 +3165,7 @@ impl ChcProofEvidenceOptions {
             "options.strict_proofs",
             &mut reasons,
         );
+        let effort = optional_u64_field(object, "effort", "options.effort", &mut reasons);
         if !reasons.is_empty() {
             return Err(ChcProofEvidenceParseError::new(reasons));
         }
@@ -3076,6 +3177,7 @@ impl ChcProofEvidenceOptions {
             solve_timeout_ms,
             memory_limit_bytes,
             strict_proofs: strict_proofs.expect("strict proofs parsed without reasons"),
+            effort,
         };
         check_optional_identity_sha256(
             object,
@@ -3110,6 +3212,11 @@ impl ChcProofEvidenceOptions {
                 .unwrap_or_else(|| "none".to_string())
         ));
         out.push_str(&format!("strict_proofs={}\n", self.strict_proofs));
+        // Only when present: an identity recorded with no effort keeps its
+        // bytes (P4a slice 8).
+        if let Some(effort) = self.effort {
+            out.push_str(&format!("effort={effort}\n"));
+        }
         out
     }
 }
@@ -4542,6 +4649,7 @@ impl ChcProofEvidenceManifest {
     ) -> Self {
         let problem = run.problem();
         let normalized = normalized_chc_input(problem);
+        let problem_schema = produced_schema(&normalized);
         let problem_sha256 = sha256_hex(normalized.as_bytes());
         let source_clause_sequence_sha256 = Some(ordered_chc_clause_sequence_sha256(problem));
         let problem_bytes = normalized.len() as u64;
@@ -4584,7 +4692,7 @@ impl ChcProofEvidenceManifest {
 
         Self {
             schema: CHC_EVIDENCE_MANIFEST_SCHEMA,
-            problem_schema: NORMALIZED_CHC_INPUT_SCHEMA,
+            problem_schema,
             problem_sha256,
             source_clause_sequence_sha256,
             problem_bytes,
@@ -5001,10 +5109,9 @@ impl ChcProofEvidenceManifest {
                 "manifest.problem is not an object".to_string(),
             ]));
         };
-        expect_json_string(
+        let problem_schema = normalized_input_schema_field(
             problem_object,
             "normalized_input_schema",
-            NORMALIZED_CHC_INPUT_SCHEMA,
             "manifest.problem.normalized_input_schema",
             &mut reasons,
         );
@@ -5088,13 +5195,13 @@ impl ChcProofEvidenceManifest {
                 )
             })
             .unwrap_or_default();
-        if !reasons.is_empty() {
+        let (true, Some(problem_schema)) = (reasons.is_empty(), problem_schema) else {
             return Err(ChcProofEvidenceParseError::new(reasons));
-        }
+        };
 
         let manifest = Self {
             schema: CHC_EVIDENCE_MANIFEST_SCHEMA,
-            problem_schema: NORMALIZED_CHC_INPUT_SCHEMA,
+            problem_schema,
             problem_sha256: problem_sha256.expect("problem hash parsed without reasons"),
             source_clause_sequence_sha256,
             problem_bytes: problem_bytes.expect("problem bytes parsed without reasons"),
@@ -5241,6 +5348,7 @@ impl ChcProofTranscriptMetadata {
         engine: impl Into<String>,
     ) -> Self {
         let normalized = normalized_chc_input(problem);
+        let normalized_input_schema = produced_schema(&normalized);
         let normalized_input_sha256 = sha256_hex(normalized.as_bytes());
         let normalized_input_bytes = normalized.len() as u64;
 
@@ -5287,7 +5395,7 @@ impl ChcProofTranscriptMetadata {
 
         Self {
             schema: CHC_PROOF_TRANSCRIPT_SCHEMA,
-            normalized_input_schema: NORMALIZED_CHC_INPUT_SCHEMA,
+            normalized_input_schema,
             normalized_input_sha256,
             normalized_input_bytes,
             engine: engine.into(),
@@ -5493,10 +5601,9 @@ impl ChcProofTranscriptMetadata {
             "transcript_metadata.schema_version",
             &mut reasons,
         );
-        expect_json_string(
+        let normalized_input_schema = normalized_input_schema_field(
             object,
             "normalized_input_schema",
-            NORMALIZED_CHC_INPUT_SCHEMA,
             "transcript_metadata.normalized_input_schema",
             &mut reasons,
         );
@@ -5567,12 +5674,13 @@ impl ChcProofTranscriptMetadata {
                     &mut reasons,
                 )
             });
-        if !reasons.is_empty() {
+        let (true, Some(normalized_input_schema)) = (reasons.is_empty(), normalized_input_schema)
+        else {
             return Err(ChcProofEvidenceParseError::new(reasons));
-        }
+        };
         Ok(Self {
             schema: CHC_PROOF_TRANSCRIPT_SCHEMA,
-            normalized_input_schema: NORMALIZED_CHC_INPUT_SCHEMA,
+            normalized_input_schema,
             normalized_input_sha256: normalized_input_sha256
                 .expect("normalized input hash parsed without reasons"),
             normalized_input_bytes: normalized_input_bytes
@@ -5680,161 +5788,21 @@ impl ChcProblem {
 
 /// Return deterministic normalized CHC/PDR input text for replay binding.
 pub fn normalized_chc_input(problem: &ChcProblem) -> String {
-    let pred_names = canonical_predicate_names(problem);
-    let mut out = String::new();
-    out.push_str(NORMALIZED_CHC_INPUT_SCHEMA);
-    out.push('\n');
-    out.push_str(&format!(
-        "fixedpoint={}\n",
-        if problem.is_fixedpoint_format() {
-            "true"
-        } else {
-            "false"
-        }
-    ));
-
-    out.push_str("datatypes\n");
-    for (name, constructors) in sorted_datatypes(problem) {
-        let ctor_parts: Vec<_> = constructors
-            .iter()
-            .map(|(ctor, selectors)| {
-                let selector_parts: Vec<_> = selectors
-                    .iter()
-                    .map(|(selector, sort)| {
-                        format!("{}:{}", json_string(selector), normalized_sort(sort))
-                    })
-                    .collect();
-                format!("{}({})", json_string(ctor), selector_parts.join(","))
-            })
-            .collect();
-        out.push_str(&format!(
-            "datatype {}={}\n",
-            json_string(&name),
-            ctor_parts.join("|")
-        ));
-    }
-
-    out.push_str("actions\n");
-    let mut actions: Vec<_> = problem
-        .action_names()
-        .iter()
-        .map(|name| json_string(name))
-        .collect();
-    actions.sort();
-    for action in actions {
-        out.push_str(&format!("action {action}\n"));
-    }
-
-    out.push_str("predicates\n");
-    let mut predicates: Vec<_> = problem
-        .predicates()
-        .iter()
-        .map(|predicate| {
-            let canonical = pred_names
-                .get(&predicate.id.index())
-                .cloned()
-                .unwrap_or_else(|| fallback_predicate_name(predicate.id));
-            let sorts: Vec<_> = predicate.arg_sorts.iter().map(normalized_sort).collect();
-            format!(
-                "predicate {canonical} name={} args=[{}]",
-                json_string(&predicate.name),
-                sorts.join(",")
-            )
-        })
-        .collect();
-    predicates.sort();
-    for predicate in predicates {
-        out.push_str(&predicate);
-        out.push('\n');
-    }
-
-    out.push_str("clauses\n");
-    let mut clauses: Vec<_> = problem
-        .clauses()
-        .iter()
-        .map(|clause| normalized_clause(problem, clause, &pred_names))
-        .collect();
-    clauses.sort();
-    for clause in clauses {
-        out.push_str(&clause);
-        out.push('\n');
-    }
-
-    out
+    normalization::input(problem)
 }
 
 /// Return SHA-256 of [`normalized_chc_input`], lowercase hex.
 pub fn normalized_chc_input_sha256(problem: &ChcProblem) -> String {
-    sha256_hex(normalized_chc_input(problem).as_bytes())
+    normalization::input_hash(problem)
 }
 
 /// Return an order-sensitive SHA-256 overlay for source-clause indices.
 ///
-/// [`normalized_chc_input`] intentionally sorts clauses and each clause's body
-/// predicate applications because its identity is semantic. Ground derivations
-/// instead name clauses and premises positionally, so their durable artifact
-/// additionally binds this indexed, position-preserving view.
+/// [`normalized_chc_input`] sorts clauses and body applications. Ground
+/// derivations additionally bind their original positional order with this
+/// overlay, including source-query ordinals.
 pub(crate) fn ordered_chc_clause_sequence_sha256(problem: &ChcProblem) -> String {
-    let pred_names = canonical_predicate_names(problem);
-    let mut digest = Sha256::new();
-    digest.update(b"ay.chc-source-clause-sequence/v1\0");
-    digest.update((problem.clauses().len() as u64).to_le_bytes());
-
-    fn update_field(digest: &mut Sha256, value: &str) {
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
-    }
-
-    for (clause_index, clause) in problem.clauses().iter().enumerate() {
-        digest.update((clause_index as u64).to_le_bytes());
-        match clause.source_query_ordinal {
-            Some(ordinal) => {
-                digest.update([1]);
-                digest.update((ordinal as u64).to_le_bytes());
-            }
-            None => digest.update([0]),
-        }
-        match clause
-            .action_id
-            .and_then(|action| problem.action_name(action))
-        {
-            Some(action) => {
-                digest.update([1]);
-                update_field(&mut digest, action);
-            }
-            None => digest.update([0]),
-        }
-        digest.update((clause.body.predicates.len() as u64).to_le_bytes());
-        for (predicate, arguments) in &clause.body.predicates {
-            update_field(
-                &mut digest,
-                &normalized_predicate_app(*predicate, arguments, &pred_names),
-            );
-        }
-        let constraint = clause
-            .body
-            .constraint
-            .as_ref()
-            .map(|expression| normalized_expr(expression, &pred_names))
-            .unwrap_or_else(|| "true".to_string());
-        let head = match &clause.head {
-            ClauseHead::False => "false".to_string(),
-            ClauseHead::Predicate(predicate, arguments) => {
-                normalized_predicate_app(*predicate, arguments, &pred_names)
-            }
-        };
-        update_field(&mut digest, &constraint);
-        update_field(&mut digest, &head);
-    }
-
-    let digest = digest.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for byte in digest {
-        hex.push(DIGITS[(byte >> 4) as usize] as char);
-        hex.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    hex
+    normalization::ordered_hash(problem)
 }
 
 fn unknown_reason_label(reason: VerifiedUnknownReason) -> &'static str {
@@ -6240,7 +6208,12 @@ fn validate_checked_replay_summary_status(
         .obligations
         .iter()
         .any(|obligation| obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV2);
-    let expected_schema = if has_ground_v2 {
+    let has_compact = summary.obligations.iter().any(|obligation| {
+        obligation.payload_format == ChcReplayPayloadFormat::CompactGroundDerivationV1
+    });
+    let expected_schema = if has_compact {
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V4
+    } else if has_ground_v2 {
         CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
     } else if has_ground_v1 {
         CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
@@ -6251,6 +6224,9 @@ fn validate_checked_replay_summary_status(
         reasons.push(
             "summary cannot mix ground-derivation-v1 and ground-derivation-v2 payloads".to_string(),
         );
+    }
+    if has_compact && (has_ground_v1 || has_ground_v2) {
+        reasons.push("summary cannot mix compact and recursive ground payloads".to_string());
     }
     if summary.schema != expected_schema {
         reasons.push(format!(
@@ -6579,7 +6555,8 @@ fn validate_checked_replay_obligations(
             ("safe", ChcReplayPayloadFormat::SmtlibV1)
             | ("unsafe", ChcReplayPayloadFormat::SmtlibV1)
             | ("unsafe", ChcReplayPayloadFormat::GroundDerivationV1)
-            | ("unsafe", ChcReplayPayloadFormat::GroundDerivationV2) => {}
+            | ("unsafe", ChcReplayPayloadFormat::GroundDerivationV2)
+            | ("unsafe", ChcReplayPayloadFormat::CompactGroundDerivationV1) => {}
             (result, format) => reasons.push(format!(
                 "{label}.payload_format={} is not valid for {result} CHC replay",
                 json_string(format.as_str())
@@ -6882,206 +6859,8 @@ fn validate_artifact_digest(
     }
 }
 
-fn canonical_predicate_names(problem: &ChcProblem) -> BTreeMap<usize, String> {
-    let mut signatures: Vec<_> = problem
-        .predicates()
-        .iter()
-        .map(|predicate| {
-            let sorts: Vec<_> = predicate.arg_sorts.iter().map(normalized_sort).collect();
-            (
-                json_string(&predicate.name),
-                sorts.join(","),
-                predicate.id.index(),
-            )
-        })
-        .collect();
-    signatures.sort();
-
-    signatures
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (_, _, original_idx))| (original_idx, format!("p{idx}")))
-        .collect()
-}
-
-fn sorted_datatypes(problem: &ChcProblem) -> Vec<(String, Vec<(String, Vec<(String, ChcSort)>)>)> {
-    let mut datatypes: Vec<_> = problem
-        .datatype_defs()
-        .iter()
-        .map(|(name, constructors)| (name.clone(), constructors.clone()))
-        .collect();
-    datatypes.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    datatypes
-}
-
-fn normalized_clause(
-    problem: &ChcProblem,
-    clause: &HornClause,
-    pred_names: &BTreeMap<usize, String>,
-) -> String {
-    let mut body_predicates: Vec<_> = clause
-        .body
-        .predicates
-        .iter()
-        .map(|(pred, args)| normalized_predicate_app(*pred, args, pred_names))
-        .collect();
-    body_predicates.sort();
-
-    let constraint = clause
-        .body
-        .constraint
-        .as_ref()
-        .map(|expr| normalized_expr(expr, pred_names))
-        .unwrap_or_else(|| "true".to_string());
-    let head = match &clause.head {
-        ClauseHead::False => "false".to_string(),
-        ClauseHead::Predicate(pred, args) => normalized_predicate_app(*pred, args, pred_names),
-    };
-    let action = clause
-        .action_id
-        .and_then(|action| problem.action_name(action).map(json_string))
-        .unwrap_or_else(|| "none".to_string());
-
-    format!(
-        "clause action={action} body=[{}] constraint={constraint} head={head}",
-        body_predicates.join(",")
-    )
-}
-
-fn normalized_predicate_app(
-    pred: PredicateId,
-    args: &[ChcExpr],
-    pred_names: &BTreeMap<usize, String>,
-) -> String {
-    let pred = pred_names
-        .get(&pred.index())
-        .cloned()
-        .unwrap_or_else(|| fallback_predicate_name(pred));
-    let args: Vec<_> = args
-        .iter()
-        .map(|arg| normalized_expr(arg, pred_names))
-        .collect();
-    format!("{pred}({})", args.join(","))
-}
-
-fn normalized_expr(expr: &ChcExpr, pred_names: &BTreeMap<usize, String>) -> String {
-    match expr {
-        ChcExpr::Bool(value) => format!("bool:{value}"),
-        ChcExpr::Int(value) => format!("int:{value}"),
-        ChcExpr::Real(numer, denom) => format!("real:{numer}/{denom}"),
-        ChcExpr::BitVec(value, width) => format!("bv{width}:{value}"),
-        ChcExpr::Var(var) => {
-            format!(
-                "var:{}:{}",
-                json_string(&var.name),
-                normalized_sort(&var.sort)
-            )
-        }
-        ChcExpr::Op(op, args) => {
-            let mut children: Vec<_> = args
-                .iter()
-                .map(|arg| normalized_expr(arg, pred_names))
-                .collect();
-            if is_commutative_op(*op) {
-                children.sort();
-            }
-            format!("op:{op:?}({})", children.join(","))
-        }
-        ChcExpr::PredicateApp(name, pred, args) => {
-            let pred = pred_names
-                .get(&pred.index())
-                .cloned()
-                .unwrap_or_else(|| fallback_predicate_name(*pred));
-            let args: Vec<_> = args
-                .iter()
-                .map(|arg| normalized_expr(arg, pred_names))
-                .collect();
-            format!("pred-expr:{pred}:{}({})", json_string(name), args.join(","))
-        }
-        ChcExpr::FuncApp(name, sort, args) => {
-            let args: Vec<_> = args
-                .iter()
-                .map(|arg| normalized_expr(arg, pred_names))
-                .collect();
-            format!(
-                "func:{}:{}({})",
-                json_string(name),
-                normalized_sort(sort),
-                args.join(",")
-            )
-        }
-        ChcExpr::ConstArrayMarker(sort) => {
-            format!("const-array-marker:{}", normalized_sort(sort))
-        }
-        ChcExpr::IsTesterMarker(name) => format!("is-tester:{}", json_string(name)),
-        ChcExpr::ConstArray(key_sort, value) => format!(
-            "const-array:{}:{}",
-            normalized_sort(key_sort),
-            normalized_expr(value, pred_names)
-        ),
-    }
-}
-
-fn is_commutative_op(op: ChcOp) -> bool {
-    matches!(
-        op,
-        ChcOp::And
-            | ChcOp::Or
-            | ChcOp::Iff
-            | ChcOp::Add
-            | ChcOp::Mul
-            | ChcOp::Eq
-            | ChcOp::Ne
-            | ChcOp::BvAdd
-            | ChcOp::BvMul
-            | ChcOp::BvAnd
-            | ChcOp::BvOr
-            | ChcOp::BvXor
-            | ChcOp::BvNand
-            | ChcOp::BvNor
-            | ChcOp::BvXnor
-    )
-}
-
 fn normalized_sort(sort: &ChcSort) -> String {
-    match sort {
-        ChcSort::Bool => "Bool".to_string(),
-        ChcSort::Int => "Int".to_string(),
-        ChcSort::Real => "Real".to_string(),
-        ChcSort::BitVec(width) => format!("BitVec({width})"),
-        ChcSort::Array(key, value) => {
-            format!("Array({},{})", normalized_sort(key), normalized_sort(value))
-        }
-        ChcSort::Uninterpreted(name) => format!("Uninterpreted({})", json_string(name)),
-        ChcSort::Datatype { name, constructors } => {
-            let ctor_parts: Vec<_> = constructors
-                .iter()
-                .map(|constructor| {
-                    let selectors: Vec<_> = constructor
-                        .selectors
-                        .iter()
-                        .map(|selector| {
-                            format!(
-                                "{}:{}",
-                                json_string(&selector.name),
-                                normalized_sort(&selector.sort)
-                            )
-                        })
-                        .collect();
-                    format!(
-                        "{}({})",
-                        json_string(&constructor.name),
-                        selectors.join(",")
-                    )
-                })
-                .collect();
-            format!("Datatype({};{})", json_string(name), ctor_parts.join("|"))
-        }
-    }
-}
-
-fn fallback_predicate_name(pred: PredicateId) -> String {
-    format!("p?{}", pred.index())
+    normalization::sort(sort)
 }
 
 fn string_field(
@@ -7691,6 +7470,30 @@ fn expect_json_string(
     }
 }
 
+/// Either normalized-input schema this build produces; any other value, or
+/// none, is a reason.
+fn normalized_input_schema_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    label: &str,
+    reasons: &mut Vec<String>,
+) -> Option<&'static str> {
+    let Some(actual) = object.get(key).and_then(serde_json::Value::as_str) else {
+        reasons.push(format!("{label} is missing"));
+        return None;
+    };
+    let schema = normalized_chc_input_schema(actual);
+    if schema.is_none() {
+        reasons.push(format!(
+            "{label}={} does not match expected {} or {}",
+            json_string(actual),
+            json_string(NORMALIZED_CHC_INPUT_SCHEMA),
+            json_string(NORMALIZED_CHC_INPUT_DATATYPE_REFERENCE_SCHEMA)
+        ));
+    }
+    schema
+}
+
 fn expect_json_u64(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -7780,8 +7583,9 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+mod compact_summary;
 mod proof_run;
-mod replay_check;
+pub(crate) mod replay_check;
 mod sealed_evidence;
 pub use replay_check::{ChcCheckedReplayObligationPayload, ChcCheckedReplayRun};
 

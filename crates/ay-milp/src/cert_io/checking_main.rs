@@ -77,6 +77,25 @@ pub fn check(cert_text: &str, model_text: &str) -> CheckReport {
 }
 
 fn malformed_report(error: CertIoError) -> CheckReport {
+    // AN INPUT THIS BUILD WILL NOT READ IS NOT A REFUTED CERTIFICATE. The
+    // preflight caps fire before a single record is parsed, so no claim has
+    // been examined and none can have been disproved. Reporting REFUTED there
+    // published a verdict the checker had not earned, next to a CLAIMS census
+    // naming nothing refuted. UNVERIFIED (exit 10) is the honest aggregate:
+    // non-zero, and unreachable from VERIFIED.
+    if let CertIoError::InputTooLarge { .. } = error {
+        return CheckReport::new(
+            CheckReportSeal::new(),
+            CheckStatus::Unverified,
+            Vec::new(),
+            vec![
+                format!("certificate NOT READ: {error}"),
+                "this is a limit of THIS CHECKER, not a finding about the certificate: \
+                 nothing was parsed, so nothing was refuted"
+                    .into(),
+            ],
+        );
+    }
     CheckReport::new(
         CheckReportSeal::new(),
         CheckStatus::Refuted,

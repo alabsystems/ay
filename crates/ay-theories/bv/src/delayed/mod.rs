@@ -17,6 +17,18 @@ mod checks;
 
 use super::*;
 
+/// 0-based SAT model index of a BV literal's variable: `|lit| + var_offset - 1`.
+///
+/// Computed in `i64`, where no literal and offset overflow. `None` for an index
+/// below 0, which no model has: callers read that variable as unassigned, as
+/// they did when the negative `i32` index was cast to an out-of-range `usize`.
+fn model_var_index(lit: CnfLit, var_offset: i32) -> Option<usize> {
+    let idx = i64::from(lit.unsigned_abs())
+        .checked_add(i64::from(var_offset))?
+        .checked_sub(1)?;
+    usize::try_from(idx).ok()
+}
+
 /// A BV operation whose circuit construction was delayed (#7015).
 ///
 /// Z3's delayed internalization strategy: for expensive operations (mul, div,
@@ -83,8 +95,9 @@ impl DelayedBvState {
     /// Evaluate a single BV literal's truth value from the SAT model.
     fn eval_lit(&self, lit: CnfLit, model: &[bool], var_offset: i32) -> bool {
         let positive = lit > 0;
-        let var_idx = (lit.unsigned_abs() as i32 + var_offset - 1) as usize;
-        let assigned = model.get(var_idx).copied().unwrap_or(false);
+        let assigned = model_var_index(lit, var_offset)
+            .and_then(|var_idx| model.get(var_idx).copied())
+            .unwrap_or(false);
         positive == assigned
     }
 
@@ -153,7 +166,11 @@ impl DelayedBvState {
         width: u32,
     ) -> num_bigint::BigInt {
         use num_bigint::BigInt;
-        let half = BigInt::from(1) << (width - 1);
+        // A 0-bit vector has the single value 0, whatever the operation.
+        let Some(sign_pos) = width.checked_sub(1) else {
+            return BigInt::from(0);
+        };
+        let half = BigInt::from(1) << sign_pos;
         let modulus = BigInt::from(1) << width;
 
         let a_signed = if a >= &half { a - &modulus } else { a.clone() };
@@ -215,19 +232,19 @@ impl DelayedBvState {
     ) -> bool {
         // Check result bits
         for &bit in &op.result_bits {
-            let var_idx = (bit.unsigned_abs() as i32 + var_offset - 1) as usize;
-            if var_idx >= assigned.len() || assigned[var_idx].is_none() {
+            let slot = model_var_index(bit, var_offset).and_then(|i| assigned.get(i));
+            let Some(Some(_)) = slot else {
                 return false;
-            }
+            };
         }
         // Check argument bits
         for &arg in &op.args {
             if let Some(bits) = self.term_to_bits.get(&arg) {
                 for &bit in bits {
-                    let var_idx = (bit.unsigned_abs() as i32 + var_offset - 1) as usize;
-                    if var_idx >= assigned.len() || assigned[var_idx].is_none() {
+                    let slot = model_var_index(bit, var_offset).and_then(|i| assigned.get(i));
+                    let Some(Some(_)) = slot else {
                         return false;
-                    }
+                    };
                 }
             } else {
                 return false; // Argument bits not available
@@ -400,7 +417,8 @@ impl DelayedBvState {
 
             // Try cheap axioms if we haven't exhausted attempts
             if self.delayed_ops[idx].cheap_tries < Self::MAX_CHEAP_TRIES {
-                self.delayed_ops[idx].cheap_tries += 1;
+                let tries = &mut self.delayed_ops[idx].cheap_tries;
+                *tries = tries.saturating_add(1);
 
                 let cheap = match op_name {
                     "bvmul" => {

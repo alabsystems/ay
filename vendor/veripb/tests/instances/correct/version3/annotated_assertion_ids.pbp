@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% INTEGRATION-TEST: ignore(elaborate)
+f 1;
+@label a 1 ~x2 >= 1;
+a 1 ~x1 >= 1 : 1 @label;
+e 1 ~x1 >= 1 : 3;
+rup 1 ~x3 >= 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

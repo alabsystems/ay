@@ -17,6 +17,7 @@ pub(crate) fn compute_interpolant_from_lia_farkas(
     b_constraints: &[ChcExpr],
     shared_vars: &FxHashSet<String>,
 ) -> Option<ChcExpr> {
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
     let a_flat = flatten_constraints(a_constraints);
     let b_flat = flatten_constraints(b_constraints);
     if a_flat.is_empty() || b_flat.is_empty() {

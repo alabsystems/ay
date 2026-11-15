@@ -307,3 +307,85 @@ pub(super) fn visit_xor(
         all_refuted: refuted == !0,
     }
 }
+
+/// OR `set_true` into a literal's TRUE bitset and `set_false` into its FALSE
+/// bitset (both masks already exclude assigned columns).
+fn write_and_lit(pos: &mut [u64], lit: u32, set_true: &Bits, set_false: &Bits) -> bool {
+    lit_pair_mut!(pos, lit, t, f, {
+        let mut wrote = 0u64;
+        for w in 0..ENUM_WORDS {
+            wrote |= set_true[w] | set_false[w];
+            t[w] |= set_true[w];
+            f[w] |= set_false[w];
+        }
+        wrote != 0
+    })
+}
+
+/// One AND-gate visit over all columns: `lits = [o, a, b]` with `o <-> a & b`.
+///
+/// Exactly the unit propagation of the gate's three clauses from one read of
+/// the state: `(¬o ∨ a)` and `(¬o ∨ b)` force `a`/`b` true under `o` and `o`
+/// false under `¬a`/`¬b`; `(o ∨ ¬a ∨ ¬b)` forces `o` true under `a ∧ b` and
+/// `¬a`/`¬b` under `¬o` with the other input true. A column is refuted if
+/// any of the three is falsified, and requeued (`invalid`) if any is
+/// unsatisfied with two literals unassigned, the clause visits' own rule. In
+/// a consistent column no two forced writes contradict each other (each pair
+/// would need a variable both true and false), so one visit reaches the same
+/// fixpoint the three clause visits would, in one pass over three literals.
+pub(super) fn visit_and(
+    pos: &mut [u64],
+    lits: &[u32],
+    dirty: &mut [bool],
+    touched: &mut Vec<u32>,
+    prop_unsat: &mut Bits,
+) -> Step {
+    let (o, a, b) = (lits[0], lits[1], lits[2]);
+    let mut m = [[0u64; ENUM_WORDS]; 6]; // o_t, o_f, a_t, a_f, b_t, b_f
+    let mut assign_any = 0u64;
+    let mut invalid_any = 0u64;
+    let mut refuted = !0u64;
+    {
+        let (po_, no_) = (blk(pos, o), blk(pos, o ^ 1));
+        let (pa_, na_) = (blk(pos, a), blk(pos, a ^ 1));
+        let (pb_, nb_) = (blk(pos, b), blk(pos, b ^ 1));
+        for w in 0..ENUM_WORDS {
+            let (po, no) = (po_[w], no_[w]);
+            let (pa, na) = (pa_[w], na_[w]);
+            let (pb, nb) = (pb_[w], nb_[w]);
+            let (uo, ua, ub) = (!(po | no), !(pa | na), !(pb | nb));
+            let unsat = (po & (na | nb)) | (no & pa & pb);
+            let pu = prop_unsat[w] | unsat;
+            prop_unsat[w] = pu;
+            refuted &= pu;
+            let sat3 = po | na | nb;
+            let invalid = (uo & ua) | (uo & ub) | (((ua & ub) | (uo & (ua | ub))) & !sat3);
+            let o_t = pa & pb & uo;
+            let o_f = (na | nb) & uo;
+            let a_t = po & ua;
+            let a_f = no & pb & ua;
+            let b_t = po & ub;
+            let b_f = no & pa & ub;
+            m[0][w] = o_t;
+            m[1][w] = o_f;
+            m[2][w] = a_t;
+            m[3][w] = a_f;
+            m[4][w] = b_t;
+            m[5][w] = b_f;
+            assign_any |= o_t | o_f | a_t | a_f | b_t | b_f;
+            invalid_any |= invalid;
+        }
+    }
+    if assign_any != 0 {
+        for (lit, (t, f)) in [(o, (0, 1)), (a, (2, 3)), (b, (4, 5))] {
+            if write_and_lit(pos, lit, &m[t], &m[f]) {
+                touch(dirty, touched, lit);
+            }
+        }
+    }
+    Step {
+        assigned: assign_any != 0,
+        invalid: invalid_any != 0,
+        all_refuted: refuted == !0,
+    }
+}

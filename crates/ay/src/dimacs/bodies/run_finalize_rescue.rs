@@ -13,7 +13,9 @@ fn create_finalize_rescue_solver(
         .and_then(|file| solver_proof_output_writer(file, proof))
     {
         Ok(writer) => match (proof.format, proof.binary) {
-            (ProofFormat::Veripb, _) => ProofOutput::veripb(writer),
+            (ProofFormat::Veripb, _) => {
+                ProofOutput::veripb_with_original_clauses(writer, num_original_clauses)
+            }
             (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
             (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
             (ProofFormat::Lrat, false) => ProofOutput::lrat_text(writer, num_original_clauses),
@@ -31,7 +33,15 @@ fn create_finalize_rescue_solver(
             return None;
         }
     };
-    Some(SatSolver::with_proof_output(formula.num_vars, output))
+    let mut solver = SatSolver::with_proof_output(formula.num_vars, output);
+    if proof.format == ProofFormat::Veripb && ay_core::sat_ab_switches().veripb_hints == Some(true)
+    {
+        // `--sat-veripb-hints`: the formula's clause lines, as VeriPB numbers them.
+        for (i, clause) in formula.clauses.iter().enumerate() {
+            solver.note_veripb_original(clause, i as u64 + 1);
+        }
+    }
+    Some(solver)
 }
 
 fn run_finalize_rescue_body(

@@ -7,6 +7,7 @@
 //! restore that runs after the strict commit gate.
 
 use super::*;
+use crate::executor::proof_repair::proof_trust_surgery_surface_audit::surface_source_is_bounded;
 
 // Route tags cannot collide with an `and` operand index: the source
 // audit bounds every authored connective far below `u32::MAX`.
@@ -129,6 +130,11 @@ impl Executor {
             let Some(source) = parsed.get(index) else {
                 return;
             };
+            // Realification re-elaborates subtrees; the gate prices only a
+            // traversal, so this per-subtree site bounds itself.
+            if !surface_source_is_bounded(source) {
+                return;
+            }
             super::super::proof_surface_syntax::collect_root_surface_term_override(
                 &mut self.ctx,
                 root,
@@ -387,6 +393,28 @@ fn collect_theory_candidates(
         // needed nor appropriate for this rational certificate.
         theory_candidates.push((TheoryLemmaKind::LraFarkas, farkas, None));
     }
+    // Read-over-write is a checked theory lemma with its own kind, which the
+    // Alethe printer lowers to `arrays_idx`/`arrays_row`. The gate is the
+    // strict checker's `validate_array_select_store`, and
+    // `recognize_array_select_store` is that validator's EXACT inverse — its
+    // own doc comment says so, "no classifier/checker drift" — so a kind read
+    // off it can only be offered for a clause strict mode already accepts.
+    // `commit_if_strictly_checked` re-checks the assembled candidate anyway,
+    // so a clause that merely LOOKS like a ROW schema is refused there.
+    //
+    // WHY IT IS NEEDED. One authored
+    // `(not (=> (not (= i j)) (= (select (store a i v) j) (select a j))))`
+    // decomposes to exactly the two ROW2 literals, so the blocking clause over
+    // its leaves IS the guarded ROW2 lemma. Until this candidate existed the
+    // composed QF_AUFLIA root had no theory step to offer at all — the Farkas
+    // arm sees no arithmetic and the clause is not an equality chain — so the
+    // cascade fell through, a later round lost the authored root, and a
+    // genuine UNSAT was published as `unknown`. The separately-authored ROW2
+    // shape (`replace_with_exact_authored_array_row2_refutation`) needs its two
+    // literals to be two authored ROOTS and never covered this one.
+    if let Some(index_eq) = ay_proof::recognize_array_select_store(terms, blocking_clause) {
+        theory_candidates.push((TheoryLemmaKind::ArraySelectStore { index_eq }, None, None));
+    }
     // EUF equality transitivity is an Alethe rule rather than a
     // TheoryLemma kind. The strict checker decides whether this exact
     // blocking clause is a valid chain; non-EUF lookalikes fail closed.
@@ -432,8 +460,15 @@ fn build_theory_resolution_candidate(
             Vec::new(),
         )
     } else {
+        // Name the theory the kind actually belongs to. The field is a label,
+        // not authority — `kind` is what the strict checker reads — but a ROW
+        // lemma recorded as `LIA` misreports every census that groups by it.
+        let theory = match kind {
+            TheoryLemmaKind::ArraySelectStore { .. } => "array",
+            _ => "LIA",
+        };
         candidate.add_step(ProofStep::TheoryLemma {
-            theory: "LIA".to_string(),
+            theory: theory.to_string(),
             clause: skeleton.blocking_clause.clone(),
             farkas,
             kind,

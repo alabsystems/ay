@@ -15,6 +15,7 @@ const MAX_RENDERED_DT_IDENTIFIER_BYTES: usize = 256;
 pub(super) struct SchemaSourceBudget {
     bytes: usize,
     sort_nodes: usize,
+    aggregate: Option<super::recovery_admission::RecoveryAdmission>,
 }
 
 impl SchemaSourceBudget {
@@ -22,21 +23,36 @@ impl SchemaSourceBudget {
         Self {
             bytes: 0,
             sort_nodes: 0,
+            aggregate: super::recovery_admission::RecoveryAdmission::current(),
         }
     }
 
     pub(super) fn charge_name(&mut self, amount: usize) -> bool {
+        if self
+            .aggregate
+            .as_ref()
+            .is_some_and(|budget| !budget.pay(amount, amount))
+        {
+            return false;
+        }
         match self.bytes.checked_add(amount) {
             Some(next) if next <= MAX_RENDERED_DT_BYTES => {
                 self.bytes = next;
                 true
             }
-            _ => false,
+            _ => {
+                super::recovery_admission::refuse_current();
+                false
+            }
         }
     }
 
     pub(super) fn charge_identifier(&mut self, name: &str) -> bool {
-        name.len() <= MAX_RENDERED_DT_IDENTIFIER_BYTES && self.charge_name(name.len())
+        if name.len() > MAX_RENDERED_DT_IDENTIFIER_BYTES {
+            super::recovery_admission::refuse_current();
+            return false;
+        }
+        self.charge_name(name.len())
     }
 
     /// Conservative clone/comparison work for the bounded descriptor seen so
@@ -49,13 +65,20 @@ impl SchemaSourceBudget {
     /// Bound borrowed sort descriptors before any schema clone. Inline
     /// datatype descriptors can contain arbitrarily large trees and names.
     pub(super) fn charge_sort(&mut self, sort: &Sort) -> bool {
-        self.charge_sort_at_depth(sort, 0)
+        let admitted = self.charge_sort_at_depth(sort, 0);
+        if !admitted {
+            super::recovery_admission::refuse_current();
+        }
+        admitted
     }
 
     /// Bound a synthetic array descriptor without first cloning its borrowed
     /// index/element sorts. The outer node and depth offset are part of the
     /// same envelope as an ordinary [`Self::charge_sort`] walk.
     pub(super) fn charge_array_sort(&mut self, index: &Sort, element: &Sort) -> bool {
+        if !self.charge_node() {
+            return false;
+        }
         self.sort_nodes = match self.sort_nodes.checked_add(1) {
             Some(next) if next <= MAX_RENDERED_DT_NODES => next,
             _ => return false,
@@ -66,7 +89,7 @@ impl SchemaSourceBudget {
     fn charge_sort_at_depth(&mut self, sort: &Sort, initial_depth: usize) -> bool {
         let mut stack = vec![(sort, initial_depth)];
         while let Some((sort, depth)) = stack.pop() {
-            if depth > MAX_RENDERED_DT_DEPTH {
+            if depth > MAX_RENDERED_DT_DEPTH || !self.charge_node() {
                 return false;
             }
             self.sort_nodes = match self.sort_nodes.checked_add(1) {
@@ -74,6 +97,16 @@ impl SchemaSourceBudget {
                 _ => return false,
             };
             match sort {
+                Sort::BitVec(sort) => {
+                    if self.aggregate.as_ref().is_some_and(|budget| {
+                        !budget.pay(
+                            (sort.width as usize).div_ceil(8),
+                            (sort.width as usize).div_ceil(8),
+                        )
+                    }) {
+                        return false;
+                    }
+                }
                 Sort::Array(array) => {
                     if stack.len().checked_add(2).is_none_or(|pending| {
                         pending > MAX_RENDERED_DT_NODES.saturating_sub(self.sort_nodes)
@@ -99,6 +132,9 @@ impl SchemaSourceBudget {
                         return false;
                     }
                     for constructor in &datatype.constructors {
+                        if !self.charge_node() {
+                            return false;
+                        }
                         self.sort_nodes = match self.sort_nodes.checked_add(1) {
                             Some(next) if next <= MAX_RENDERED_DT_NODES => next,
                             _ => return false,
@@ -107,6 +143,9 @@ impl SchemaSourceBudget {
                             return false;
                         }
                         for field in &constructor.fields {
+                            if !self.charge_node() {
+                                return false;
+                            }
                             self.sort_nodes = match self.sort_nodes.checked_add(1) {
                                 Some(next) if next <= MAX_RENDERED_DT_NODES => next,
                                 _ => return false,
@@ -126,15 +165,28 @@ impl SchemaSourceBudget {
         }
         true
     }
+
+    fn charge_node(&self) -> bool {
+        // Same conservative per-node descriptor envelope as `work()`, paid
+        // before any caller can clone the admitted sort/schema node.
+        self.aggregate
+            .as_ref()
+            .is_none_or(|budget| budget.pay(1, 272))
+    }
 }
 
 /// Exact bounded node/payload work for aggregate callers.
 pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
+    if !super::recovery_admission::pay_current(0, std::mem::size_of::<(&ModelValue, usize)>()) {
+        return None;
+    }
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
     let mut bytes = 0usize;
     while let Some((value, depth)) = stack.pop() {
-        if depth > MAX_RENDERED_DT_DEPTH {
+        if depth > MAX_RENDERED_DT_DEPTH
+            || !super::recovery_admission::pay_current(1, std::mem::size_of::<ModelValue>())
+        {
             return None;
         }
         nodes += 1;
@@ -171,6 +223,13 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 {
                     return None;
                 }
+                if !super::recovery_admission::pay_current(
+                    args.len(),
+                    args.len()
+                        .checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                ) {
+                    return None;
+                }
                 stack.extend(args.iter().map(|arg| (arg, depth + 1)));
                 ctor.len().saturating_add(2)
             }
@@ -190,6 +249,12 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 {
                     return None;
                 }
+                if !super::recovery_admission::pay_current(
+                    extra,
+                    extra.checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                ) {
+                    return None;
+                }
                 stack.push((&array.default, depth + 1));
                 for (index, cell) in &array.store {
                     stack.push((index, depth + 1));
@@ -205,11 +270,24 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 {
                     return None;
                 }
+                if !super::recovery_admission::pay_current(
+                    elements.len(),
+                    elements
+                        .len()
+                        .checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                ) {
+                    return None;
+                }
                 stack.extend(elements.iter().map(|element| (element, depth + 1)));
                 1
             }
-            ModelValue::FloatingPoint { .. } | ModelValue::Algebraic(_) => return None,
+            ModelValue::FloatingPoint { .. }
+            | ModelValue::FloatingPointExact { .. }
+            | ModelValue::Algebraic(_) => return None,
         };
+        if !super::recovery_admission::pay_current(payload, payload) {
+            return None;
+        }
         bytes = match bytes.checked_add(payload) {
             Some(total) if total <= MAX_RENDERED_DT_BYTES => total,
             _ => return None,
@@ -221,6 +299,9 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
 /// Iterative resource preflight before recursive S-expression parsing.
 pub(super) fn rendered_sexp_within_limits(input: &str) -> bool {
     if input.is_empty() || input.len() > MAX_RENDERED_DT_BYTES {
+        return false;
+    }
+    if !super::recovery_admission::pay_current(input.len(), 0) {
         return false;
     }
     let bytes = input.as_bytes();

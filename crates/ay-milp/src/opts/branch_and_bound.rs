@@ -111,14 +111,14 @@ impl EngineEconomics {
         self
     }
 
-    /// Opt-in bound-branch gate (B37; measured net-negative on its own gate).
+    /// Opt-in bound-branch gate (measured net-negative on its own gate).
     #[must_use]
     pub fn with_bound_branch(mut self, enabled: bool) -> Self {
         self.bound_branch = Some(enabled);
         self
     }
 
-    /// Child-order force: `0` away, `1` up, `2` dn, `3` lp (B37; unset keeps
+    /// Child-order force: `0` away, `1` up, `2` dn, `3` lp (unset keeps
     /// the shape auto decision).
     pub fn with_child_order(mut self, mode: usize) -> Result<Self, EngineConfigError> {
         if mode > 3 {
@@ -133,14 +133,14 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Root cuts-per-round force (B37; unset keeps the shape-gated default).
+    /// Root cuts-per-round force (unset keeps the shape-gated default).
     #[must_use]
     pub fn with_cuts_per_round(mut self, cuts: usize) -> Self {
         self.cuts_per_round = Some(cuts);
         self
     }
 
-    /// Root cut-efficacy floor force (B37; `0` disables; unset keeps the
+    /// Root cut-efficacy floor force (`0` disables; unset keeps the
     /// aspect-ratio auto decision).
     pub fn with_cut_eff_floor(mut self, floor: f64) -> Result<Self, EngineConfigError> {
         if !floor.is_finite() || floor < 0.0 {
@@ -155,7 +155,7 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Forrest-Tomlin spike arm force: `1` dense, `2` sparse (B37; unset
+    /// Forrest-Tomlin spike arm force: `1` dense, `2` sparse (unset
     /// keeps the measured auto rule).
     pub fn with_ft_spike(mut self, arm: usize) -> Result<Self, EngineConfigError> {
         if !(1..=2).contains(&arm) {
@@ -170,21 +170,21 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Strong GUB branching force (B37; unset = on iff wide).
+    /// Strong GUB branching force (unset = on iff wide).
     #[must_use]
     pub fn with_gub_sb(mut self, enabled: bool) -> Self {
         self.gub_sb = Some(enabled);
         self
     }
 
-    /// Box no-good widening force (B37; unset = structural gate).
+    /// Box no-good widening force (unset = structural gate).
     #[must_use]
     pub fn with_ng_box(mut self, enabled: bool) -> Self {
         self.ng_box = Some(enabled);
         self
     }
 
-    /// No-good branching band in percent (B37; `0` kills; unset = 25 iff
+    /// No-good branching band in percent (`0` kills; unset = 25 iff
     /// ng_up armed).
     pub fn with_ng_branch_pct(mut self, pct: f64) -> Result<Self, EngineConfigError> {
         if !pct.is_finite() || pct < 0.0 {
@@ -199,63 +199,63 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Branch-row propagation force (B37; unset = mixed-lever default).
+    /// Branch-row propagation force (unset = mixed-lever default).
     #[must_use]
     pub fn with_node_prop(mut self, enabled: bool) -> Self {
         self.node_prop = Some(enabled);
         self
     }
 
-    /// Strong-branching sustain force (B37; unset = mixed-lever default).
+    /// Strong-branching sustain force (unset = mixed-lever default).
     #[must_use]
     pub fn with_sb_sustain(mut self, enabled: bool) -> Self {
         self.sb_sustain = Some(enabled);
         self
     }
 
-    /// Plunge-class arming (B37; unset = the qiu/mas74 structural classes).
+    /// Plunge-class arming (unset = the qiu/mas74 structural classes).
     #[must_use]
     pub fn with_plunge(mut self, enabled: bool) -> Self {
         self.plunge = Some(enabled);
         self
     }
 
-    /// Full GMI/MIR separation rounds at the root (B38; was --gmi-rounds).
+    /// Full GMI/MIR separation rounds at the root (was --gmi-rounds).
     #[must_use]
     pub fn with_gmi_rounds(mut self, rounds: usize) -> Self {
         self.gmi_rounds = Some(rounds);
         self
     }
 
-    /// Cuts retained per round at the root (B38).
+    /// Cuts retained per round at the root.
     #[must_use]
     pub fn with_root_cuts_per_round(mut self, cuts: usize) -> Self {
         self.root_cuts_per_round = Some(cuts);
         self
     }
 
-    /// Implication probing at the root (B38).
+    /// Implication probing at the root.
     #[must_use]
     pub fn with_root_probe(mut self, enabled: bool) -> Self {
         self.root_probe = Some(enabled);
         self
     }
 
-    /// Depth-first node selection (B38).
+    /// Depth-first node selection.
     #[must_use]
     pub fn with_dfs(mut self, enabled: bool) -> Self {
         self.dfs = Some(enabled);
         self
     }
 
-    /// Cut separation at nodes below the root (B38).
+    /// Cut separation at nodes below the root.
     #[must_use]
     pub fn with_node_cuts(mut self, enabled: bool) -> Self {
         self.node_cuts = Some(enabled);
         self
     }
 
-    /// Symmetry-branch band force in `[0, 1]` (B39; out-of-domain reads as
+    /// Symmetry-branch band force in `[0, 1]` (out-of-domain reads as
     /// the tiebreak default).
     #[must_use]
     pub fn with_sym_branch_band(mut self, band: f64) -> Self {
@@ -263,7 +263,7 @@ impl EngineEconomics {
         self
     }
 
-    /// Pin one RINS ladder arm: `1` pump, `2` submip, `3` fj (B39).
+    /// Pin one RINS ladder arm: `1` pump, `2` submip, `3` fj.
     pub fn with_rins_arm(mut self, arm: usize) -> Result<Self, EngineConfigError> {
         if !(1..=3).contains(&arm) {
             return Err(EngineConfigError::OutOfRange {
@@ -277,14 +277,14 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Offer dual fixing on every model shape (B39 opt-in widening).
+    /// Offer dual fixing on every model shape (opt-in widening).
     #[must_use]
     pub fn with_dualfix_all(mut self, enabled: bool) -> Self {
         self.dualfix_all = Some(enabled);
         self
     }
 
-    /// Implied-bound separator (B39 opt-in; measured to separate nothing on
+    /// Implied-bound separator (opt-in; measured to separate nothing on
     /// the corpus, kept as the sound separator a probing source would feed).
     #[must_use]
     pub fn with_implied_bound(mut self, enabled: bool) -> Self {
@@ -292,35 +292,35 @@ impl EngineEconomics {
         self
     }
 
-    /// Lifted-cover separator (B39 opt-in; measured neutral).
+    /// Lifted-cover separator (opt-in; measured neutral).
     #[must_use]
     pub fn with_lifted_cover(mut self, enabled: bool) -> Self {
         self.lifted_cover = Some(enabled);
         self
     }
 
-    /// Lift-and-project CGLP budget per root round; `0` disables (B39).
+    /// Lift-and-project CGLP budget per root round; `0` disables.
     #[must_use]
     pub fn with_lnp_budget(mut self, budget: usize) -> Self {
         self.lnp_budget = Some(budget);
         self
     }
 
-    /// Lattice BKZ block-size override; `< 3` selects plain LLL (B39).
+    /// Lattice BKZ block-size override; `< 3` selects plain LLL.
     #[must_use]
     pub fn with_lattice_bkz_beta(mut self, beta: usize) -> Self {
         self.lattice_bkz_beta = Some(beta);
         self
     }
 
-    /// Dual cost-perturbation magnitude; `0` (the default) is off (B39).
+    /// Dual cost-perturbation magnitude; `0` (the default) is off.
     #[must_use]
     pub fn with_dual_perturb(mut self, magnitude: f64) -> Self {
         self.dual_perturb = Some(magnitude);
         self
     }
 
-    /// Certificate grace budget in seconds; `0` selects uncapped (B39).
+    /// Certificate grace budget in seconds; `0` selects uncapped.
     ///
     /// # Errors
     ///
@@ -331,15 +331,15 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Anchor first-refusal window in milliseconds; `0` disables deferral
-    /// (B39).
+    /// Anchor first-refusal window in milliseconds; `0` disables
+    /// deferral.
     #[must_use]
     pub fn with_anchor_first_refusal_ms(mut self, ms: usize) -> Self {
         self.anchor_first_refusal_ms = Some(ms);
         self
     }
 
-    /// RINS cadence base, in nodes (B39b; `0` is nonsense and reads as the
+    /// RINS cadence base, in nodes (`0` is nonsense and reads as the
     /// tuned default).
     #[must_use]
     pub fn with_rins_every(mut self, nodes: usize) -> Self {
@@ -347,15 +347,15 @@ impl EngineEconomics {
         self
     }
 
-    /// RINS wide-gap dry-spell cap; `0` disables the backoff (B39b).
+    /// RINS wide-gap dry-spell cap; `0` disables the backoff.
     #[must_use]
     pub fn with_rins_drycap(mut self, cap: usize) -> Self {
         self.rins_drycap = Some(cap);
         self
     }
 
-    /// Pin the feasibility-pump share in `[0, 1]` (bypasses the work cap;
-    /// B39b).
+    /// Pin the feasibility-pump share in `[0, 1]` (bypasses the work
+    /// cap).
     ///
     /// # Errors
     ///
@@ -365,29 +365,29 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Pin the set-partition constructor share in `[0, 1]` (B39b).
+    /// Pin the set-partition constructor share in `[0, 1]`.
     #[must_use]
     pub fn with_setpart_share(mut self, share: f64) -> Self {
         self.setpart_share = Some(share);
         self
     }
 
-    /// Enlight-parity exact route (B39b; default on).
+    /// Enlight-parity exact route (default on).
     #[must_use]
     pub fn with_parity(mut self, enabled: bool) -> Self {
         self.parity = Some(enabled);
         self
     }
 
-    /// Margin reframing (B39b; default on).
+    /// Margin reframing (default on).
     #[must_use]
     pub fn with_margin_reframe(mut self, enabled: bool) -> Self {
         self.margin_reframe = Some(enabled);
         self
     }
 
-    /// Symmetry handling mode: `0` orbital (default), `1` rows, `2` off
-    /// (B39b).
+    /// Symmetry handling mode: `0` orbital (default), `1` rows,
+    /// `2` off.
     pub fn with_sym_mode(mut self, mode: usize) -> Result<Self, EngineConfigError> {
         if mode > 2 {
             return Err(EngineConfigError::OutOfRange {
@@ -401,7 +401,7 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Pin the root heuristic share in `[0, 1]` (B39b; unset =
+    /// Pin the root heuristic share in `[0, 1]` (unset =
     /// shape-dependent default).
     ///
     /// # Errors
@@ -412,56 +412,56 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Strong-branching reliability threshold force (B39c).
+    /// Strong-branching reliability threshold force.
     #[must_use]
     pub fn with_sb_rel(mut self, rel: usize) -> Self {
         self.sb_rel = Some(rel);
         self
     }
 
-    /// Strong-branching candidate count force (B39c).
+    /// Strong-branching candidate count force.
     #[must_use]
     pub fn with_sb_cands(mut self, cands: usize) -> Self {
         self.sb_cands = Some(cands);
         self
     }
 
-    /// Strong-branching total probe budget pin (B39c).
+    /// Strong-branching total probe budget pin.
     #[must_use]
     pub fn with_sb_total(mut self, total: usize) -> Self {
         self.sb_total = Some(total);
         self
     }
 
-    /// Presolve (B39c; default on).
+    /// Presolve (default on).
     #[must_use]
     pub fn with_presolve(mut self, enabled: bool) -> Self {
         self.presolve = Some(enabled);
         self
     }
 
-    /// Presolve scout plan (B39c; default on).
+    /// Presolve scout plan (default on).
     #[must_use]
     pub fn with_presolve_scout(mut self, enabled: bool) -> Self {
         self.presolve_scout = Some(enabled);
         self
     }
 
-    /// VSIDS branching force (B39c; unset = the feasibility-class gate).
+    /// VSIDS branching force (unset = the feasibility-class gate).
     #[must_use]
     pub fn with_vsids(mut self, enabled: bool) -> Self {
         self.vsids = Some(enabled);
         self
     }
 
-    /// Probe every binary at the root (B39c opt-in widening).
+    /// Probe every binary at the root (opt-in widening).
     #[must_use]
     pub fn with_root_probe_all(mut self, enabled: bool) -> Self {
         self.root_probe_all = Some(enabled);
         self
     }
 
-    /// Separation-statistics census dump (B40 diagnostic).
+    /// Separation-statistics census dump (diagnostic).
     #[must_use]
     pub fn with_sepstat(mut self, enabled: bool) -> Self {
         self.sepstat = Some(enabled);
@@ -494,28 +494,28 @@ impl EngineEconomics {
         self
     }
 
-    /// Per-solve LP statistics line (B40 diagnostic).
+    /// Per-solve LP statistics line (diagnostic).
     #[must_use]
     pub fn with_lp_stats(mut self, enabled: bool) -> Self {
         self.lp_stats = Some(enabled);
         self
     }
 
-    /// Trace the first `n` simplex steps (B40 diagnostic).
+    /// Trace the first `n` simplex steps (diagnostic).
     #[must_use]
     pub fn with_step_trace(mut self, n: usize) -> Self {
         self.step_trace = Some(n);
         self
     }
 
-    /// BUMP-LU factor diagnostics (B40 diagnostic).
+    /// BUMP-LU factor diagnostics.
     #[must_use]
     pub fn with_bump_diag(mut self, enabled: bool) -> Self {
         self.bump_diag = Some(enabled);
         self
     }
 
-    /// bumpdiff lane pair, lanes `0..=2`, `a != b` (B40 diagnostic).
+    /// bumpdiff lane pair, lanes `0..=2`, `a != b` (diagnostic).
     pub fn with_bumpdiff_lanes(mut self, a: usize, b: usize) -> Result<Self, EngineConfigError> {
         if a > 2 || b > 2 || a == b {
             return Err(EngineConfigError::OutOfRange {
@@ -529,21 +529,21 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Plain-cold LP diagnostic arm (B40 diagnostic).
+    /// Plain-cold LP diagnostic arm.
     #[must_use]
     pub fn with_diag_plain_cold(mut self, enabled: bool) -> Self {
         self.diag_plain_cold = Some(enabled);
         self
     }
 
-    /// Root vertex dump (B40 diagnostic).
+    /// Root vertex dump (diagnostic).
     #[must_use]
     pub fn with_dump_vertex(mut self, enabled: bool) -> Self {
         self.dump_vertex = Some(enabled);
         self
     }
 
-    /// MEASUREMENT-ONLY node cap (B48; was a retired never-set env
+    /// MEASUREMENT-ONLY node cap (was a retired never-set env
     /// override): stop the tree after `n` processed nodes with the
     /// interrupted-but-valid Feasible/dual-bound outcome.
     #[must_use]
@@ -552,70 +552,70 @@ impl EngineEconomics {
         self
     }
 
-    /// Opt in to the structure-attack elimination arm (B49).
+    /// Opt in to the structure-attack elimination arm.
     #[must_use]
     pub fn with_struct_elim(mut self, enabled: bool) -> Self {
         self.struct_elim = Some(enabled);
         self
     }
 
-    /// Enable/disable the dual-bound cover pass (B49; default on).
+    /// Enable/disable the dual-bound cover pass (default on).
     #[must_use]
     pub fn with_bound_cover(mut self, enabled: bool) -> Self {
         self.bound_cover = Some(enabled);
         self
     }
 
-    /// Pin the feasibility-pump iteration-cap multiplier (B49).
+    /// Pin the feasibility-pump iteration-cap multiplier.
     #[must_use]
     pub fn with_pump_iter_mult(mut self, mult: f64) -> Self {
         self.pump_iter_mult = Some(mult);
         self
     }
 
-    /// Enable/disable the pump iteration cap (B49; default on).
+    /// Enable/disable the pump iteration cap (default on).
     #[must_use]
     pub fn with_pump_iter_cap(mut self, enabled: bool) -> Self {
         self.pump_iter_cap = Some(enabled);
         self
     }
 
-    /// Pin nogood upward propagation off/force (B49; unset = auto arm).
+    /// Pin nogood upward propagation off/force (unset = auto arm).
     #[must_use]
     pub fn with_ng_up(mut self, force: bool) -> Self {
         self.ng_up = Some(force);
         self
     }
 
-    /// Cut-shadow audit mode: 1 = binding, 2 = slack (B49).
+    /// Cut-shadow audit mode: 1 = binding, 2 = slack.
     #[must_use]
     pub fn with_cut_shadow(mut self, mode: u8) -> Self {
         self.cut_shadow = Some(mode);
         self
     }
 
-    /// Opt in to MIR chain aggregation (B49).
+    /// Opt in to MIR chain aggregation.
     #[must_use]
     pub fn with_chain_agg(mut self, enabled: bool) -> Self {
         self.chain_agg = Some(enabled);
         self
     }
 
-    /// Opt in to automatic margin-row detection (B49).
+    /// Opt in to automatic margin-row detection.
     #[must_use]
     pub fn with_auto_margin(mut self, enabled: bool) -> Self {
         self.auto_margin = Some(enabled);
         self
     }
 
-    /// Pin the implication lane off/force (B50; unset = class auto).
+    /// Pin the implication lane off/force (unset = class auto).
     #[must_use]
     pub fn with_impl_lane(mut self, force: bool) -> Self {
         self.impl_lane = Some(force);
         self
     }
 
-    /// Override the implication-lane arming node (B50).
+    /// Override the implication-lane arming node.
     #[must_use]
     pub fn with_impl_arm(mut self, node: usize) -> Self {
         self.impl_arm = Some(node);
@@ -632,28 +632,28 @@ impl EngineEconomics {
         self
     }
 
-    /// Pin propagation-conflict learning off/force (B50; unset = auto).
+    /// Pin propagation-conflict learning off/force (unset = auto).
     #[must_use]
     pub fn with_prop_conflict(mut self, force: bool) -> Self {
         self.prop_conflict = Some(force);
         self
     }
 
-    /// Bound-prune conflict learning: 1 = class, 2 = force (B50).
+    /// Bound-prune conflict learning: 1 = class, 2 = force.
     #[must_use]
     pub fn with_lb_conflict(mut self, mode: u8) -> Self {
         self.lb_conflict = Some(mode);
         self
     }
 
-    /// Override the bound-prune learning arming node (B50).
+    /// Override the bound-prune learning arming node.
     #[must_use]
     pub fn with_lb_arm(mut self, node: usize) -> Self {
         self.lb_arm = Some(node);
         self
     }
 
-    /// Strict bound-prune admission (B50; default true).
+    /// Strict bound-prune admission (default true).
     #[must_use]
     pub fn with_lb_strict(mut self, strict: bool) -> Self {
         self.lb_strict = Some(strict);
@@ -661,7 +661,7 @@ impl EngineEconomics {
     }
 
     /// External dual bound delivered as a cutoff, in the MODEL objective
-    /// frame (B71; the mps_solve example maps file-frame values in).
+    /// frame (the mps_solve example maps file-frame values in).
     #[must_use]
     pub fn with_dual_cutoff(mut self, cutoff: f64) -> Self {
         self.dual_cutoff = Some(cutoff);
@@ -669,7 +669,7 @@ impl EngineEconomics {
     }
 
     /// Force the ay-dpll SMT lowering lane instead of native branch-and-bound
-    /// (B40b A/B lever).
+    /// (A/B lever).
     #[must_use]
     pub fn with_smt_lane(mut self, enabled: bool) -> Self {
         self.smt_lane = Some(enabled);

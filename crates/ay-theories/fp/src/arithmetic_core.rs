@@ -4,9 +4,12 @@
 
 //! Core FP arithmetic encodings: add/sub/mul.
 
-use ay_core::CnfClause;
+use ay_core::{CnfClause, CnfLit};
 
-use super::{FpDecomposed, FpSolver, RoundingMode};
+use crate::construction::control::{uninterrupted, BuildControl};
+use crate::construction::FpBuildStage;
+
+use super::{FpDecomposed, FpSolver, RmOperand, RoundingMode};
 
 impl FpSolver<'_> {
     /// Add two FP values with IEEE 754 rounding.
@@ -14,8 +17,9 @@ impl FpSolver<'_> {
         &mut self,
         x: &FpDecomposed,
         y: &FpDecomposed,
-        rm: RoundingMode,
+        rm: impl Into<RmOperand>,
     ) -> FpDecomposed {
+        let rm = rm.into();
         let precision = x.precision;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
@@ -106,9 +110,14 @@ impl FpSolver<'_> {
         let c_exp_s = self.make_ite_bits(d_larger, &d_exp, &c_exp);
         let d_exp_s = self.make_ite_bits(d_larger, &c_exp, &d_exp);
 
+        // `exp_delta = c_exp - d_exp >= 0` fits `eb` unsigned bits. The cap
+        // `sb + 2` need not (`(3,6)`: 8 does not fit 3 bits, and read as 0 it
+        // disabled alignment), so compare at a width that holds both.
         let exp_delta = self.bv_sub(&c_exp_s, &d_exp_s);
         let cap_val = (sb + 2) as u64;
-        let cap_bv = self.const_bv(cap_val, eb);
+        let delta_w = eb.max(Self::bits_to_hold(cap_val));
+        let exp_delta = self.zero_extend(&exp_delta, delta_w - eb);
+        let cap_bv = self.const_bv(cap_val, delta_w);
         let delta_too_large = self.make_unsigned_lt(&cap_bv, &exp_delta);
         let capped_delta = self.make_ite_bits(delta_too_large, &cap_bv, &exp_delta);
 
@@ -119,7 +128,8 @@ impl FpSolver<'_> {
         let big_d_sig = Self::bv_concat(&dz, &d_sig_grs);
 
         let shift_width = 2 * (sb + 3);
-        let shift_amount = self.zero_extend(&capped_delta, shift_width - eb);
+        // `capped_delta <= sb + 2 < 2^shift_width`, so resizing is exact.
+        let shift_amount = self.resize_unsigned(&capped_delta, shift_width);
         let shifted_big = self.bv_lshr(&big_d_sig, &shift_amount);
         let aligned_d: Vec<_> = shifted_big[sb + 3..shift_width].to_vec();
         let sticky_bits: Vec<_> = shifted_big[..sb + 3].to_vec();
@@ -154,7 +164,10 @@ impl FpSolver<'_> {
         let neg_sum = self.bv_neg(&sum);
         let sig_abs = self.make_ite_bits(sum_msb, &neg_sum, &sum);
         let res_sig: Vec<_> = sig_abs[..sb + 4].to_vec();
-        let res_exp = self.sign_extend(&c_exp_s, 2);
+        // Signed, `eb + 2` bits (z3's) unless `fp_round` needs more for a
+        // cancellation's leading zeros (`add_exponent_width`).
+        let aw = Self::add_exponent_width(eb, sb);
+        let res_exp = self.sign_extend(&c_exp_s, aw - eb);
 
         let normal_result = self.fp_round(precision, rm, res_sgn, &res_sig, &res_exp);
         let either_special = {
@@ -166,7 +179,7 @@ impl FpSolver<'_> {
         let not_special_add = -special_add;
         let exact_cancel = self.make_and(-same_sign, same_magnitude);
         let cancel_zero = self.make_and(not_special_add, exact_cancel);
-        let cancel_zero_result = self.make_zero(precision, rm == RoundingMode::RTN);
+        let cancel_zero_result = self.make_rm_signed_zero(precision, rm);
         self.constrain_fp_when(cancel_zero, &result, &cancel_zero_result);
         let normal_applies = self.make_and(not_special_add, -cancel_zero);
         self.constrain_fp_when(normal_applies, &result, &normal_result);
@@ -188,10 +201,19 @@ impl FpSolver<'_> {
             let ds = self.make_and(both_zero, diff_sign);
             self.make_and(not_result_nan, ds)
         };
-        if rm == RoundingMode::RTN {
-            self.add_clause(CnfClause::new(vec![-bz_diff, sign]));
-        } else {
-            self.add_clause(CnfClause::new(vec![-bz_diff, -sign]));
+        match rm {
+            RmOperand::Literal(RoundingMode::RTN) => {
+                self.add_clause(CnfClause::new(vec![-bz_diff, sign]));
+            }
+            RmOperand::Literal(_) => {
+                self.add_clause(CnfClause::new(vec![-bz_diff, -sign]));
+            }
+            RmOperand::Symbolic(_) => {
+                // The zero is negative exactly toward negative.
+                let rtn = self.rm_is(rm, RoundingMode::RTN);
+                self.add_clause(CnfClause::new(vec![-bz_diff, -rtn, sign]));
+                self.add_clause(CnfClause::new(vec![-bz_diff, rtn, -sign]));
+            }
         }
 
         result
@@ -202,7 +224,7 @@ impl FpSolver<'_> {
         &mut self,
         x: &FpDecomposed,
         y: &FpDecomposed,
-        rm: RoundingMode,
+        rm: impl Into<RmOperand>,
     ) -> FpDecomposed {
         let neg_y = self.make_neg(y);
         self.make_add(x, &neg_y, rm)
@@ -213,8 +235,37 @@ impl FpSolver<'_> {
         &mut self,
         x: &FpDecomposed,
         y: &FpDecomposed,
-        rm: RoundingMode,
+        rm: impl Into<RmOperand>,
     ) -> FpDecomposed {
+        let rm = rm.into();
+        uninterrupted(|control| self.make_mul_with_control(x, y, rm, control))
+    }
+
+    /// The four bits `fp_round` reads below the product's high half, LSB first:
+    /// the OR of the low half's lower bits (sticky), then the low half's top
+    /// three bits. With `sb < 4` the low half's `sb` bits are the TOP of the four
+    /// (z3: `concat(extract(sb-1, 0, product), 0^(4-sb))`) and the zero padding
+    /// goes BELOW them, at the least significant end.
+    fn product_round_bits(&mut self, product: &[CnfLit], sb: usize) -> Vec<CnfLit> {
+        if sb >= 4 {
+            let sticky = self.bv_or_reduce(&product[..sb - 3]);
+            vec![sticky, product[sb - 3], product[sb - 2], product[sb - 1]]
+        } else {
+            let zero = self.const_false();
+            let mut r = vec![zero; 4 - sb];
+            r.extend_from_slice(&product[..sb]);
+            r
+        }
+    }
+
+    pub(crate) fn make_mul_with_control<C: BuildControl>(
+        &mut self,
+        x: &FpDecomposed,
+        y: &FpDecomposed,
+        rm: RmOperand,
+        control: &mut C,
+    ) -> Result<FpDecomposed, C::Error> {
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let precision = x.precision;
         let sb = precision.significand_bits() as usize;
 
@@ -232,6 +283,7 @@ impl FpSolver<'_> {
         let result_nan = self.make_or(either_nan, inf_times_zero);
         let result_sign_xor = self.make_xor(x.sign, y.sign);
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let result = self.fresh_decomposed(precision);
         let sign = result.sign;
         let not_nan = -result_nan;
@@ -251,39 +303,37 @@ impl FpSolver<'_> {
         let special = self.constrain_nan_inf(&result, result_nan, result_inf);
         let either_zero = self.make_or(x_zero, y_zero);
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let (_a_sgn, a_sig, a_exp, a_lz) = self.unpack(x, true);
         let (_b_sgn, b_sig, b_exp, b_lz) = self.unpack(y, true);
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let a_sig_ext = self.zero_extend(&a_sig, sb);
         let b_sig_ext = self.zero_extend(&b_sig, sb);
-        let product = self.bv_mul(&a_sig_ext, &b_sig_ext);
+        let product = self.bv_mul_with_control(&a_sig_ext, &b_sig_ext, control)?;
 
-        let a_exp_ext = self.sign_extend(&a_exp, 2);
-        let b_exp_ext = self.sign_extend(&b_exp, 2);
-        let a_lz_ext = self.zero_extend(&a_lz, 2);
-        let b_lz_ext = self.zero_extend(&b_lz, 2);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        // The product's exponent reaches `2(3 - E - S)`: signed, and `eb + 2`
+        // bits wide unless the format needs more (`mul_exponent_width`).
+        let eb = precision.exponent_bits() as usize;
+        let ew = Self::mul_exponent_width(eb, sb);
+        let a_exp_ext = self.sign_extend(&a_exp, ew - eb);
+        let b_exp_ext = self.sign_extend(&b_exp, ew - eb);
+        let a_lz_ext = self.zero_extend(&a_lz, ew - a_lz.len());
+        let b_lz_ext = self.zero_extend(&b_lz, ew - b_lz.len());
         let a_effective = self.bv_sub(&a_exp_ext, &a_lz_ext);
         let b_effective = self.bv_sub(&b_exp_ext, &b_lz_ext);
         let res_exp = self.bv_add(&a_effective, &b_effective);
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let h_p: Vec<_> = product[sb..2 * sb].to_vec();
-        let rbits = if sb >= 4 {
-            let sticky = self.bv_or_reduce(&product[..sb - 3]);
-            vec![sticky, product[sb - 3], product[sb - 2], product[sb - 1]]
-        } else {
-            let mut r = product[..sb].to_vec();
-            let zero = self.const_false();
-            while r.len() < 4 {
-                r.push(zero);
-            }
-            r
-        };
-
-        let mut res_sig = rbits;
+        let mut res_sig = self.product_round_bits(&product, sb);
         res_sig.extend_from_slice(&h_p);
         debug_assert_eq!(res_sig.len(), sb + 4);
 
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let normal_result = self.fp_round(precision, rm, result_sign_xor, &res_sig, &res_exp);
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
         let special_or_zero = self.make_or(special, either_zero);
         let not_special = -special_or_zero;
         self.constrain_fp_when(not_special, &result, &normal_result);
@@ -296,6 +346,7 @@ impl FpSolver<'_> {
             self.add_clause(CnfClause::new(vec![-not_nan_and_zero, -sig_bit]));
         }
 
-        result
+        control.checkpoint(self.construction_progress(FpBuildStage::Operation))?;
+        Ok(result)
     }
 }

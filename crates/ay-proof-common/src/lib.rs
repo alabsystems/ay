@@ -3,6 +3,14 @@
 // Depends on thiserror for typed error enums.
 
 #![forbid(unsafe_code)]
+// `trust::contract_panic` (on `literal::Variable::new`) is a TOOL attribute —
+// unlike the native `requires`/`ensures` clauses, which are builtin grammar — so
+// the `trust` tool namespace must be registered for the verifier build (the
+// convention downstream proof consumer uses: `#![cfg_attr(deductive_verify, register_tool(trust))]`).
+// Gated on the cfg that selects `literal.rs` below, so a stock compiler reading
+// the `literal_stock.rs` twin sees neither the feature gate nor the tool.
+#![cfg_attr(deductive_verify, feature(register_tool))]
+#![cfg_attr(deductive_verify, register_tool(trust))]
 
 //! Shared types and parsers for the `ay` proof-checker crates.
 //!

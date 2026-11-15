@@ -12,7 +12,7 @@
 //! matching — it only says what a term's normal form is.
 
 use ay_core::kani_compat::DetHashMap;
-use ay_core::{TermData, TermId, TermStore};
+use ay_core::{Symbol, TermData, TermId, TermStore};
 
 /// Owned normal form for the checked-normalization leg. Built pure from the
 /// term store (no interning); comparison is structural on the normal forms.
@@ -32,7 +32,8 @@ pub(super) enum Norm {
     Le(Box<Norm>, Box<Norm>),
     /// Orientation-normalized equality (smaller normal form first).
     Eq(Box<Norm>, Box<Norm>),
-    App(String, Vec<Norm>),
+    /// Exact symbol identity: `None` is named, `Some` retains all indices.
+    App(String, Option<Vec<u32>>, Vec<Norm>),
     Ite(Box<Norm>, Box<Norm>, Box<Norm>),
 }
 
@@ -126,7 +127,6 @@ pub(super) fn normalize_with_substitution(
             })
         }
         TermData::App(symbol, args) => {
-            let name = symbol.name().to_string();
             let args = args.clone();
             let all_int_sorted = args
                 .iter()
@@ -135,6 +135,19 @@ pub(super) fn normalize_with_substitution(
             for &arg in &args {
                 normalized.push(normalize_with_substitution(terms, arg, map, budget)?);
             }
+            // Only named builtins have the equivalences below. In particular,
+            // two extracts at different positions are different functions.
+            let name = match symbol {
+                Symbol::Named(name) => name.to_string(),
+                Symbol::Indexed(name, indices) => {
+                    return Ok(Norm::App(
+                        name.to_string(),
+                        Some(indices.clone()),
+                        normalized,
+                    ));
+                }
+                _ => return Err(()),
+            };
             Ok(match (name.as_str(), normalized.len()) {
                 ("or", _) => norm_junction(normalized, true),
                 ("and", _) => norm_junction(normalized, false),
@@ -174,7 +187,7 @@ pub(super) fn normalize_with_substitution(
                     let a = normalized.pop().expect("len checked");
                     norm_not(norm_le(a, b))
                 }
-                _ => Norm::App(name, normalized),
+                _ => Norm::App(name, None, normalized),
             })
         }
         // Binders and unexpanded lets: fail closed.

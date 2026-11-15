@@ -19,7 +19,7 @@ impl AYProgram {
             declared_vars: BTreeMap::new(),
             declared_funs: Vec::new(),
             defined_funs: Vec::new(),
-            declared_datatypes: BTreeMap::new(),
+            declared_datatypes: crate::expr::dt::Definitions::new(),
             declared_rels: Vec::new(),
             declared_chc_vars: Vec::new(),
             context_level: 0,

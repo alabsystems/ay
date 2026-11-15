@@ -75,6 +75,54 @@ fn unsupported_regex_operator_fails_closed() {
 }
 
 #[test]
+fn reglan_equality_uses_language_not_syntax() {
+    let mut ts = TermStore::new();
+    let leaf = ts.mk_var("leaf", Sort::String);
+    let a_text = ts.mk_string("a".to_string());
+    let b_text = ts.mk_string("b".to_string());
+    let z_text = ts.mk_string("z".to_string());
+    let aa_text = ts.mk_string("aa".to_string());
+    let a_re = app(&mut ts, "str.to_re", &[a_text], Sort::RegLan);
+    let leaf_re = app(&mut ts, "str.to_re", &[leaf], Sort::RegLan);
+    let b_re = app(&mut ts, "str.to_re", &[b_text], Sort::RegLan);
+    let aa_re = app(&mut ts, "str.to_re", &[aa_text], Sort::RegLan);
+    let none = app(&mut ts, "re.none", &[], Sort::RegLan);
+    let all = app(&mut ts, "re.all", &[], Sort::RegLan);
+    let allchar = app(&mut ts, "re.allchar", &[], Sort::RegLan);
+    let star_allchar = app(&mut ts, "re.*", &[allchar], Sort::RegLan);
+    let disjoint = app(&mut ts, "re.inter", &[a_re, b_re], Sort::RegLan);
+    let overlap = app(&mut ts, "re.inter", &[a_re, star_allchar], Sort::RegLan);
+    let union_none_a = app(&mut ts, "re.union", &[none, a_re], Sort::RegLan);
+    let complement_none = app(&mut ts, "re.comp", &[none], Sort::RegLan);
+    let reversed_range = app(&mut ts, "re.range", &[z_text, a_text], Sort::RegLan);
+    let twice_a = ts.mk_app(Symbol::indexed("re.^", vec![2]), [a_re], Sort::RegLan);
+    let future = app(&mut ts, "re.future", &[], Sort::RegLan);
+
+    let eq_disjoint = app(&mut ts, "=", &[none, disjoint], Sort::Bool);
+    let eq_overlap = app(&mut ts, "=", &[none, overlap], Sort::Bool);
+    let distinct_overlap = app(&mut ts, "distinct", &[none, overlap], Sort::Bool);
+    let distinct_disjoint = app(&mut ts, "distinct", &[none, disjoint], Sort::Bool);
+    let eq_union = app(&mut ts, "=", &[union_none_a, a_re], Sort::Bool);
+    let eq_leaf = app(&mut ts, "=", &[leaf_re, a_re], Sort::Bool);
+    let eq_complement = app(&mut ts, "=", &[complement_none, all], Sort::Bool);
+    let eq_reversed_range = app(&mut ts, "=", &[reversed_range, none], Sort::Bool);
+    let eq_loop = app(&mut ts, "=", &[twice_a, aa_re], Sort::Bool);
+    let eq_future = app(&mut ts, "=", &[future, none], Sort::Bool);
+
+    let model = StubModel::new().with(leaf, ModelValue::Str("a".to_string()));
+    assert_confirmed(&verdict(&ts, &model, &[eq_disjoint]));
+    assert_violates(&verdict(&ts, &model, &[eq_overlap]));
+    assert_confirmed(&verdict(&ts, &model, &[distinct_overlap]));
+    assert_violates(&verdict(&ts, &model, &[distinct_disjoint]));
+    assert_confirmed(&verdict(&ts, &model, &[eq_union]));
+    assert_confirmed(&verdict(&ts, &model, &[eq_leaf]));
+    assert_confirmed(&verdict(&ts, &model, &[eq_complement]));
+    assert_confirmed(&verdict(&ts, &model, &[eq_reversed_range]));
+    assert_confirmed(&verdict(&ts, &model, &[eq_loop]));
+    assert_cannot(&verdict(&ts, &model, &[eq_future]));
+}
+
+#[test]
 fn sat_fp_to_real_uses_exact_ieee_fields() {
     let mut ts = TermStore::new();
     let fp16 = Sort::FloatingPoint(5, 11);

@@ -114,7 +114,8 @@ impl Solver {
         let mut from_ids: Vec<TermId> = Vec::with_capacity(to.len());
         let mut to_ids: Vec<TermId> = Vec::with_capacity(to.len());
         for (i, &replacement_id) in replacement_ids.iter().enumerate() {
-            if let Some(var_id) = self.terms().lookup(&format!("__db{i}")) {
+            let sort = self.terms().sort(replacement_id).clone();
+            if let Some(var_id) = self.de_bruijn_var_of_sort(i, &sort) {
                 from_ids.push(var_id);
                 to_ids.push(replacement_id);
             }
@@ -171,7 +172,12 @@ impl Solver {
                 to_ids.push(var_ids[n - 1 - k]);
             } else {
                 let sort = self.terms().sort(id).clone();
-                let shifted = self.declare_const(&format!("__db{}", k - n), sort);
+                // `try_de_bruijn_var` fails only for a sort no constant can
+                // take; `declare_const` then raises that error as before.
+                let shifted = match self.try_de_bruijn_var(k - n, sort.clone()) {
+                    Ok(var) => var,
+                    Err(_) => self.declare_const(&format!("__db{}", k - n), sort),
+                };
                 to_ids.push(shifted.id());
             }
         }
@@ -193,10 +199,7 @@ impl Solver {
         }
         match self.terms().get(term) {
             TermData::Var(name, _) => {
-                if let Some(k) = name
-                    .strip_prefix("__db")
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
+                if let Some(k) = super::de_bruijn_index(name) {
                     out.push((k, term));
                 }
             }
@@ -303,7 +306,8 @@ impl Solver {
                     let mut from_ids: Vec<TermId> = Vec::with_capacity(new_args.len());
                     let mut to_ids: Vec<TermId> = Vec::with_capacity(new_args.len());
                     for (j, &arg) in new_args.iter().enumerate() {
-                        if let Some(db) = self.terms().lookup(&format!("__db{j}")) {
+                        let sort = self.terms().sort(arg).clone();
+                        if let Some(db) = self.de_bruijn_var_of_sort(j, &sort) {
                             from_ids.push(db);
                             to_ids.push(arg);
                         }
@@ -389,6 +393,102 @@ impl Solver {
     #[must_use]
     pub fn update_term(&mut self, term: Term, args: &[Term]) -> Option<Term> {
         self.try_update_term(term, args).ok()
+    }
+
+    /// The Boolean value of a CLOSED term (no free constants, no
+    /// uninterpreted function applications) according to AY's independent
+    /// model checker (`ay_model_check`), evaluated against the empty model.
+    ///
+    /// `Some(b)` only when the checker computes the exact Boolean `b`; an
+    /// operator it does not implement, an under-specified result (a division
+    /// by zero, `fp.min` of zeros of opposite sign), a free leaf, or an
+    /// unbounded quantifier gives `None`. This is the independent evaluator
+    /// the SAT model gates use, so a compatibility layer that has substituted
+    /// a published model's values into a formula can confirm what remains
+    /// without trusting the term simplifier (which leaves, for example,
+    /// floating-point operations over literals unevaluated).
+    #[must_use]
+    pub fn independent_closed_bool(&self, term: Term) -> Option<bool> {
+        struct ClosedView;
+        impl ay_model_check::ModelView for ClosedView {
+            fn leaf_value(&self, _: TermId) -> Option<ay_model_check::ModelValue> {
+                None
+            }
+        }
+        let id = self.resolve_term("independent_closed_bool", term).ok()?;
+        match ay_model_check::evaluate_term(self.terms(), &ClosedView, id) {
+            ay_model_check::EvalOutcome::Value(ay_model_check::ModelValue::Bool(value)) => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    /// The floating-point VALUE of a closed term (`fp.add` of literals, ...)
+    /// under AY's independent model checker's exact semantics, as a literal
+    /// term; `None` when the term is not a closed floating-point term the
+    /// checker evaluates exactly.
+    pub fn independent_closed_fp(&mut self, term: Term) -> Option<Term> {
+        struct ClosedView;
+        impl ay_model_check::ModelView for ClosedView {
+            fn leaf_value(&self, _: TermId) -> Option<ay_model_check::ModelValue> {
+                None
+            }
+        }
+        let id = self.resolve_term("independent_closed_fp", term).ok()?;
+        let ay_core::Sort::FloatingPoint(expected_eb, expected_sb) = self.terms().sort(id) else {
+            return None;
+        };
+        let (expected_eb, expected_sb) = (*expected_eb, *expected_sb);
+        self.checked_fp_total_width("independent_closed_fp", expected_eb, expected_sb)
+            .ok()?;
+        match ay_model_check::evaluate_term(self.terms(), &ClosedView, id) {
+            ay_model_check::EvalOutcome::Value(
+                ay_model_check::ModelValue::FloatingPointExact {
+                    sign,
+                    exponent,
+                    significand,
+                    exponent_bits,
+                    significand_bits,
+                },
+            ) => {
+                if (exponent_bits, significand_bits) != (expected_eb, expected_sb) {
+                    return None;
+                }
+                let fields = ay_fp::FpFields::from_shared(
+                    sign,
+                    exponent,
+                    significand,
+                    exponent_bits,
+                    significand_bits,
+                )?;
+                let (bits, _) = ay_fp::FpModelValue::Exact(fields).to_ieee_bv();
+                self.try_fp_const_from_bits_bigint(&bits, exponent_bits, significand_bits)
+                    .ok()
+            }
+            ay_model_check::EvalOutcome::Value(ay_model_check::ModelValue::FloatingPoint {
+                sign,
+                exponent,
+                significand,
+                exponent_bits,
+                significand_bits,
+            }) => {
+                if (exponent_bits, significand_bits) != (expected_eb, expected_sb) {
+                    return None;
+                }
+                let stored = significand_bits.checked_sub(1)?;
+                let all_ones = (1u64 << exponent_bits) - 1;
+                if exponent == all_ones && significand != 0 {
+                    return Some(self.fp_nan(exponent_bits, significand_bits));
+                }
+                let mut bits = num_bigint::BigInt::from(u8::from(sign));
+                bits = (bits << exponent_bits) + num_bigint::BigInt::from(exponent);
+                bits = (bits << stored) + num_bigint::BigInt::from(significand);
+                self.try_fp_const_from_bits_bigint(&bits, exponent_bits, significand_bits)
+                    .ok()
+            }
+            _ => None,
+        }
     }
 
     /// Return whether an opaque native-API term handle names an entry in this
@@ -652,19 +752,6 @@ impl Solver {
     #[must_use]
     pub fn as_array(&mut self, func_name: &str, array_sort: Sort) -> Term {
         let result = self.terms_mut().mk_as_array(func_name, array_sort);
-        self.wrap_term(result)
-    }
-
-    /// Build the single-variable lambda array `(lambda ((x T)) body)` with
-    /// bound variable `var` and `body`, i.e. an array with
-    /// `select(arr, i) = body[x := i]`. Multi-variable lambdas are curried in
-    /// the FFI layer. Exposes `TermArena::mk_lambda_array`. Backs `Z3_mk_lambda`
-    /// / `Z3_mk_lambda_const`.
-    #[must_use]
-    pub fn lambda_array(&mut self, var: Term, body: Term) -> Term {
-        let var_id = self.require_term("lambda_array", var);
-        let body_id = self.require_term("lambda_array", body);
-        let result = self.terms_mut().mk_lambda_array(var_id, body_id);
         self.wrap_term(result)
     }
 

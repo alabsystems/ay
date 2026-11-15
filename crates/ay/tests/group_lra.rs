@@ -21,3 +21,6 @@ mod qf_lra_cli_release_soundness_6582;
 
 #[path = "group_lra/qf_lra_cli_release_sweep_6564.rs"]
 mod qf_lra_cli_release_sweep_6564;
+
+#[path = "group_lra/deep_let_chain_memory.rs"]
+mod deep_let_chain_memory;

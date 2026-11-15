@@ -151,21 +151,27 @@ impl RingProducer {
             let quantum =
                 FULL_WAIT_QUANTUM.min(self.stall_budget.checked_sub(self.stall_used).unwrap());
             let start = std::time::Instant::now();
-            {
+            ay_sys::compute_budget::with_suspended_current(|| {
                 let guard = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
                 // Re-check under the lock so a concurrent pop cannot slip
                 // between the check above and the wait below.
                 let head_now = shared.head.load(Ordering::Acquire);
                 let used_now = tail.wrapping_sub(head_now);
                 if capacity - used_now >= total || shared.consumer_closed.load(Ordering::Acquire) {
-                    continue;
+                    return;
                 }
-                let _ = shared
+                let waited = shared
                     .cond
                     .wait_timeout(guard, quantum)
                     .unwrap_or_else(|e| e.into_inner());
-            }
+                // Never reacquire CPU occupancy while holding the ring lock.
+                drop(waited);
+            })
+            .map_err(|_| RingPushError::ConsumerGone)?;
             self.stall_used += start.elapsed();
+            if self.stall_used >= self.stall_budget {
+                return Err(RingPushError::StallBudgetExhausted);
+            }
         }
     }
 }
@@ -226,18 +232,25 @@ impl RingConsumer {
             if closed {
                 return false;
             }
-            let guard = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
-            // Re-check under the lock (a push may have landed since).
-            let tail_now = shared.tail.load(Ordering::Acquire);
-            if tail_now.wrapping_sub(self.head) > 0
-                || shared.producer_closed.load(Ordering::Acquire)
+            if ay_sys::compute_budget::with_suspended_current(|| {
+                let guard = shared.lock.lock().unwrap_or_else(|e| e.into_inner());
+                // Re-check under the lock (a push may have landed since).
+                let tail_now = shared.tail.load(Ordering::Acquire);
+                if tail_now.wrapping_sub(self.head) > 0
+                    || shared.producer_closed.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let waited = shared
+                    .cond
+                    .wait_timeout(guard, EMPTY_WAIT_QUANTUM)
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(waited);
+            })
+            .is_err()
             {
-                continue;
+                return false;
             }
-            let _ = shared
-                .cond
-                .wait_timeout(guard, EMPTY_WAIT_QUANTUM)
-                .unwrap_or_else(|e| e.into_inner());
         }
     }
 }

@@ -2,11 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Kani-compatible type aliases for HashMap and HashSet (ay-sat local).
-//!
-//! Under `#[cfg(kani)]`, uses `BTreeMap`/`BTreeSet` to avoid CBMC-intractable
-//! `hashbrown::RawTable` operations. Under normal builds, uses `hashbrown`
-//! with `foldhash::fast::FixedState` for deterministic iteration order.
+//! Deterministic hash map and set aliases (ay-sat local).
 //!
 //! #8529: Previously used `std::collections::HashMap`/`HashSet` which delegate
 //! to `hashbrown` with `foldhash::fast::RandomState`. RandomState seeds from
@@ -16,54 +12,20 @@
 //! conflicts, producing false-SAT results.
 //!
 //! Fix: use `hashbrown` with `foldhash::fast::FixedState` (compile-time-fixed
-//! global seed), matching ay-core's `kani_compat` module.
-//!
-//! See also: `ay_core::kani_compat` for the shared cross-crate version.
+//! global seed), matching ay-core's `kani_compat` module. The module keeps its
+//! historical name; it no longer has a model-checking variant.
 
-// ── cfg(kani): BTreeMap/BTreeSet ──────────────────────────────────────────────
-
-#[cfg(kani)]
-pub(crate) type DetHashMap<K, V> = std::collections::BTreeMap<K, V>;
-#[cfg(kani)]
-pub(crate) type DetHashSet<T> = std::collections::BTreeSet<T>;
-
-// ── cfg(not(kani)): hashbrown with FixedState ────────────────────────────────
-
-#[cfg(not(kani))]
 pub(crate) type DetHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;
-#[cfg(not(kani))]
 pub(crate) type DetHashSet<T> = hashbrown::HashSet<T, foldhash::fast::FixedState>;
 
-// ── Constructor helpers ───────────────────────────────────────────────────────
-
 /// Create an empty `DetHashSet`.
-///
-/// Under Kani, `HashSet::new()` may be unavailable for custom hashers.
-/// `Default::default()` works for all backends.
 #[inline]
-pub(crate) fn det_hash_set_new<T>() -> DetHashSet<T>
-where
-    T: Ord,
-{
+pub(crate) fn det_hash_set_new<T>() -> DetHashSet<T> {
     Default::default()
 }
 
 /// Create a `DetHashSet` with pre-allocated capacity.
 #[inline]
-pub(crate) fn det_hash_set_with_capacity<T>(capacity: usize) -> DetHashSet<T>
-where
-    T: Ord + std::hash::Hash + Eq,
-{
-    #[cfg(kani)]
-    {
-        let _ = capacity;
-        std::collections::BTreeSet::new()
-    }
-    #[cfg(not(kani))]
-    {
-        hashbrown::HashSet::with_capacity_and_hasher(
-            capacity,
-            foldhash::fast::FixedState::default(),
-        )
-    }
+pub(crate) fn det_hash_set_with_capacity<T>(capacity: usize) -> DetHashSet<T> {
+    hashbrown::HashSet::with_capacity_and_hasher(capacity, foldhash::fast::FixedState::default())
 }

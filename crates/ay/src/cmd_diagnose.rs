@@ -30,12 +30,12 @@
 //!   3 — ay returned `unknown` where a declared or reference verdict was available
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ay_sys::metadata_capture::{capture, CaptureLimits, DEFAULT_OUTPUT_BYTES};
 use clap::{Args, ValueEnum};
 
 use crate::cmd_bisect::{
@@ -55,13 +55,16 @@ struct BinaryIdentity {
 }
 
 impl BinaryIdentity {
-    fn probe(path: &Path) -> Self {
+    fn probe(path: &Path, mut limits: CaptureLimits) -> Self {
         let mut identity = Self {
             path: canonical_display_path(path),
             ..Self::default()
         };
 
-        let output = match Command::new(path).arg("--version").output() {
+        limits.timeout = limits.timeout.min(Duration::from_secs(5));
+        let mut command = Command::new(path);
+        command.arg("--version");
+        let output = match capture(command, limits, "diagnostic binary identity") {
             Ok(output) if output.status.success() => output,
             _ => return identity,
         };
@@ -103,13 +106,20 @@ pub(crate) struct DiagnoseCommand {
 
     /// Reference solver binary to cross-check against (must accept the same
     /// input file and print `sat`/`unsat`/`unknown`). Use `none` to skip.
-    /// Defaults to `z3` if found on PATH, else `none`.
+    /// Defaults to `z3` when a real z3 resolves, else `none`. `z3` means the
+    /// z3 oracle: `Z3_PATH`, else the first z3 on PATH that proves it is z3,
+    /// run by its path.
     #[arg(long, value_name = "BIN")]
     pub(crate) reference: Option<String>,
 
     /// Per-solve timeout in seconds.
     #[arg(long, default_value_t = 30)]
     pub(crate) timeout: u64,
+
+    /// Per-child sampled resident memory ceiling in MiB. The default uses AY's
+    /// governed/available-memory budget. Kernel bounds still restrict it.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) memory_mb: Option<u64>,
 
     /// Explicit ay binary path. Defaults to the currently-executing ay binary.
     #[arg(long, value_name = "PATH")]
@@ -143,6 +153,7 @@ struct SolveRun {
     #[allow(dead_code)]
     stderr: String,
     timed_out: bool,
+    memout: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,21 +206,54 @@ pub(crate) fn run(cmd: &DiagnoseCommand) -> Result<i32> {
         Some(p) => p,
         None => std::env::current_exe().context("locating the current ay executable")?,
     };
-    let ay_identity = BinaryIdentity::probe(&ay_binary);
-
     let timeout = Duration::from_secs(cmd.timeout);
+    anyhow::ensure!(!timeout.is_zero(), "diagnostic timeout must be positive");
+    let native_budget = ay_sys::default_standalone_memory_limit();
+    anyhow::ensure!(
+        native_budget > 0,
+        "no positive diagnostic memory budget is available"
+    );
+    // The native default already incorporates its peer share. Restrict it by
+    // current kernel bounds without dividing that same share a second time.
+    let native_budget = ay_sys::memory_ceiling::limit_under_ceiling_from(
+        native_budget,
+        ay_sys::memory_ceiling::KernelMemoryBounds::detect(),
+        1,
+    )
+    .bound_bytes;
+    let resident_bytes = match cmd.memory_mb {
+        Some(mib) => {
+            let bytes = mib
+                .checked_mul(1024 * 1024)
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .context("diagnostic memory ceiling exceeds this platform's range")?;
+            anyhow::ensure!(bytes > 0, "diagnostic memory ceiling must be positive");
+            bytes.min(native_budget)
+        }
+        None => native_budget,
+    };
+    anyhow::ensure!(
+        resident_bytes > 0,
+        "no positive diagnostic memory budget is available"
+    );
+    let limits = CaptureLimits {
+        timeout,
+        output_bytes: DEFAULT_OUTPUT_BYTES,
+        resident_bytes: Some(u64::try_from(resident_bytes).context("diagnostic memory range")?),
+    };
+    let ay_identity = BinaryIdentity::probe(&ay_binary, limits);
     let input_text = fs::read_to_string(&cmd.file).unwrap_or_default();
     let expected = cmd
         .expected
         .or_else(|| parse_status_annotation(&input_text));
 
     // 1. Run ay with --validate to force model checking.
-    let ay_run = run_ay_with_validate(&ay_binary, &cmd.file, timeout)?;
+    let ay_run = run_ay_with_validate(&ay_binary, &cmd.file, limits)?;
 
     // 2. Optionally run reference solver.
-    let reference_binary = resolve_reference_binary(cmd.reference.as_deref());
-    let reference_run = match reference_binary.as_deref() {
-        Some(bin) => Some(run_reference(bin, &cmd.file, timeout)?),
+    let reference = resolve_reference_binary(cmd.reference.as_deref())?;
+    let reference_run = match &reference {
+        Some(reference) => Some(run_reference(&reference.program, &cmd.file, limits)?),
         None => None,
     };
 
@@ -245,7 +289,13 @@ pub(crate) fn run(cmd: &DiagnoseCommand) -> Result<i32> {
     // useful whether or not there's a disagreement.
     let explain_output: Option<String> = if matches!(ay_run.verdict, Verdict::Sat | Verdict::Unsat)
     {
-        run_ay_explain(&ay_binary, &cmd.file, timeout).ok()
+        match run_ay_explain(&ay_binary, &cmd.file, limits) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                eprintln!("ay diagnose: explanation unavailable: {error:#}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -256,12 +306,13 @@ pub(crate) fn run(cmd: &DiagnoseCommand) -> Result<i32> {
             &cmd.file,
             &ay_identity,
             &ay_run,
-            reference_binary.as_deref(),
+            reference.as_ref(),
             reference_run.as_ref(),
             expected,
             declared_expected,
             explain_output.as_deref(),
             exit_code,
+            limits,
         );
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -269,12 +320,13 @@ pub(crate) fn run(cmd: &DiagnoseCommand) -> Result<i32> {
             &cmd.file,
             &ay_identity,
             &ay_run,
-            reference_binary.as_deref(),
+            reference.as_ref(),
             reference_run.as_ref(),
             expected,
             declared_expected,
             explain_output.as_deref(),
             exit_code,
+            limits,
         );
     }
 
@@ -306,23 +358,32 @@ fn parse_status_annotation(text: &str) -> Option<ExpectedArg> {
     None
 }
 
-/// Locate a reference solver on PATH. Returns `None` when disabled.
-fn resolve_reference_binary(requested: Option<&str>) -> Option<String> {
+/// The reference solver a diagnosis runs: the program, and how reports name it.
+struct Reference {
+    program: String,
+    label: String,
+}
+
+/// Locate the reference solver; `None` when disabled, or when auto-detection
+/// finds no z3. `z3` (the default, or named) is the z3 oracle: resolved by
+/// path and identity-checked (`ay_sys::z3_oracle`), never spawned by name —
+/// under a sandbox the name can reach a refusing stub, whose silence would read
+/// as "no reference verdict", and a drop-in install can make it AY itself.
+fn resolve_reference_binary(requested: Option<&str>) -> Result<Option<Reference>> {
+    let z3 = |oracle: &ay_sys::z3_oracle::Z3Oracle| Reference {
+        program: oracle.path().display().to_string(),
+        label: oracle.identity(),
+    };
     match requested {
-        Some("none") => None,
-        Some(bin) => Some(bin.to_string()),
-        None => {
-            // Auto-detect z3.
-            if let Ok(output) = Command::new("which").arg("z3").output() {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Some("z3".to_string());
-                    }
-                }
-            }
-            None
-        }
+        Some("none") => Ok(None),
+        None => Ok(ay_sys::z3_oracle::z3_oracle().ok().map(z3)),
+        Some("z3") => ay_sys::z3_oracle::z3_oracle()
+            .map(|oracle| Some(z3(oracle)))
+            .map_err(|reason| anyhow::anyhow!("--reference z3: no usable z3: {reason}")),
+        Some(bin) => Ok(Some(Reference {
+            program: bin.to_string(),
+            label: bin.to_string(),
+        })),
     }
 }
 
@@ -331,84 +392,91 @@ fn resolve_reference_binary(requested: Option<&str>) -> Option<String> {
 /// Passes `--no-verify-proof` to defeat the debug-build default that would
 /// otherwise synthesize a DRAT proof path and reject SMT input with
 /// "SMT-LIB mode requires Alethe output" (crates/ay/src/main.rs:1893).
-fn run_ay_with_validate(ay: &Path, file: &Path, timeout: Duration) -> Result<SolveRun> {
+fn run_ay_with_validate(ay: &Path, file: &Path, limits: CaptureLimits) -> Result<SolveRun> {
     let mut cmd = Command::new(ay);
     cmd.arg("solve")
         .arg("--validate")
         .arg("--no-verify-proof")
         .arg("--stats-json")
         .arg(file);
-    spawn_and_parse(&mut cmd, timeout)
+    spawn_and_parse(cmd, limits)
 }
 
 /// Run ay with `--explain` on the input file to get human-readable constraint
 /// verification for SAT and a core summary for UNSAT.
 ///
 /// Passes `--no-verify-proof` for the same reason as `run_ay_with_validate`.
-fn run_ay_explain(ay: &Path, file: &Path, timeout: Duration) -> Result<String> {
+fn run_ay_explain(ay: &Path, file: &Path, limits: CaptureLimits) -> Result<String> {
     let mut cmd = Command::new(ay);
     cmd.arg("solve")
         .arg("--explain")
         .arg("--no-verify-proof")
         .arg(file);
-    let run = spawn_and_parse(&mut cmd, timeout)?;
+    let run = spawn_and_parse(cmd, limits)?;
+    anyhow::ensure!(
+        matches!(run.verdict, Verdict::Sat | Verdict::Unsat),
+        "explanation child did not supply a definite result (timeout={}, memout={}): {}",
+        run.timed_out,
+        run.memout,
+        run.stderr
+    );
     Ok(run.stdout)
 }
 
 /// Run a reference solver and capture verdict.
-fn run_reference(bin: &str, file: &Path, timeout: Duration) -> Result<SolveRun> {
+fn run_reference(bin: &str, file: &Path, limits: CaptureLimits) -> Result<SolveRun> {
     let mut cmd = Command::new(bin);
     cmd.arg(file);
-    spawn_and_parse(&mut cmd, timeout)
+    spawn_and_parse(cmd, limits)
 }
 
-fn spawn_and_parse(cmd: &mut Command, timeout: Duration) -> Result<SolveRun> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn {cmd:?}"))?;
-
-    // Cooperative polling keeps timeout handling platform-neutral.
-    let deadline = std::time::Instant::now() + timeout;
-    let mut timed_out = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(anyhow::anyhow!("wait failed: {e}")),
+fn spawn_and_parse(cmd: Command, limits: CaptureLimits) -> Result<SolveRun> {
+    // The shared native capture drains both pipes while the original child
+    // runs, bounds retained output/RSS and retires that original isolated
+    // group. These restrictions are not machine admission or a reservation.
+    let output = match capture(cmd, limits, "diagnostic solver") {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return Ok(SolveRun {
+                verdict: Verdict::Unknown,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                timed_out: true,
+                memout: false,
+            });
         }
-    }
-
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-
-    let verdict = if timed_out {
-        Verdict::Unknown
-    } else {
-        parse_verdict(&stdout)
+        Err(error) if ay_sys::metadata_capture::is_resident_limit(&error) => {
+            return Ok(SolveRun {
+                verdict: Verdict::Unknown,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                timed_out: false,
+                memout: true,
+            });
+        }
+        Err(error) => return Err(error).context("capturing diagnostic solver"),
     };
+    parse_captured_run(output)
+}
 
+fn parse_captured_run(output: std::process::Output) -> Result<SolveRun> {
+    let stdout = String::from_utf8(output.stdout).context("diagnostic stdout is not UTF-8")?;
+    let stderr = String::from_utf8(output.stderr).context("diagnostic stderr is not UTF-8")?;
+    // A failed executable cannot supply a definite reference verdict even
+    // when it printed a plausible answer before failing.
+    let parsed = parse_verdict(&stdout);
+    let verdict = match (output.status.code(), parsed) {
+        (Some(0), verdict) => verdict,
+        (Some(10), Verdict::Sat) => Verdict::Sat,
+        (Some(20), Verdict::Unsat) => Verdict::Unsat,
+        _ => Verdict::Error,
+    };
     Ok(SolveRun {
         verdict,
         stdout,
         stderr,
-        timed_out,
+        timed_out: false,
+        memout: false,
     })
 }
 
@@ -468,21 +536,34 @@ fn print_text_report(
     file: &Path,
     ay_identity: &BinaryIdentity,
     ay_run: &SolveRun,
-    reference_bin: Option<&str>,
+    reference: Option<&Reference>,
     reference_run: Option<&SolveRun>,
     expected: Option<ExpectedArg>,
     declared_expected: Option<Verdict>,
     explain_output: Option<&str>,
     exit_code: i32,
+    limits: CaptureLimits,
 ) {
     println!("=== ay diagnose: {} ===", file.display());
     println!();
     println!("  ay binary:       {}", ay_identity.path);
     println!("  ay build:        {}", ay_identity.display_build());
     println!(
+        "  child limits:    {:.3}s, {} bytes sampled group RSS, {} bytes/stream retained",
+        limits.timeout.as_secs_f64(),
+        limits.resident_bytes.unwrap_or(0),
+        limits.output_bytes,
+    );
+    println!(
         "  ay verdict:      {}{}",
         ay_run.verdict.as_str(),
-        if ay_run.timed_out { " (timeout)" } else { "" }
+        if ay_run.memout {
+            " (memory limit)"
+        } else if ay_run.timed_out {
+            " (timeout)"
+        } else {
+            ""
+        }
     );
     if let Some(exp) = expected {
         println!(
@@ -490,13 +571,19 @@ fn print_text_report(
             exp.as_str()
         );
     }
-    if let Some(bin) = reference_bin {
+    if let Some(reference) = reference {
         if let Some(r) = reference_run {
             println!(
                 "  reference ({}): {}{}",
-                bin,
+                reference.label,
                 r.verdict.as_str(),
-                if r.timed_out { " (timeout)" } else { "" }
+                if r.memout {
+                    " (memory limit)"
+                } else if r.timed_out {
+                    " (timeout)"
+                } else {
+                    ""
+                }
             );
         }
     } else {
@@ -614,6 +701,12 @@ fn plain_english_summary(
     reference_run: Option<&SolveRun>,
     declared_expected: Option<Verdict>,
 ) -> String {
+    if ay_run.memout {
+        return "ay exceeded the diagnostic sampled process-group RSS restriction. \
+        Its original child group was retired without accepting a verdict; \
+        any reference result is reported separately."
+            .to_string();
+    }
     if ay_run.timed_out {
         return "ay exceeded the configured timeout. Either increase --timeout or \
         look for a performance regression — run with --stats to see decisions, \
@@ -750,18 +843,21 @@ fn build_json_report(
     file: &Path,
     ay_identity: &BinaryIdentity,
     ay_run: &SolveRun,
-    reference_bin: Option<&str>,
+    reference: Option<&Reference>,
     reference_run: Option<&SolveRun>,
     expected: Option<ExpectedArg>,
     declared_expected: Option<Verdict>,
     explain_output: Option<&str>,
     exit_code: i32,
+    limits: CaptureLimits,
 ) -> serde_json::Value {
     let ref_json = reference_run.map(|r| {
         serde_json::json!({
-            "binary": reference_bin,
+            "binary": reference.map(|reference| &reference.program),
+            "identity": reference.map(|reference| &reference.label),
             "verdict": r.verdict.as_str(),
             "timed_out": r.timed_out,
+            "memout": r.memout,
         })
     });
 
@@ -780,6 +876,11 @@ fn build_json_report(
 
     serde_json::json!({
         "file": file.display().to_string(),
+        "restrictions": {
+            "timeout_seconds_per_child": limits.timeout.as_secs_f64(),
+            "sampled_group_resident_bytes_per_child": limits.resident_bytes,
+            "retained_output_bytes_per_stream": limits.output_bytes,
+        },
         "ay": {
             "binary": ay_identity.path.as_str(),
             "build": {
@@ -792,6 +893,7 @@ fn build_json_report(
             },
             "verdict": ay_run.verdict.as_str(),
             "timed_out": ay_run.timed_out,
+            "memout": ay_run.memout,
             "stats": extract_stats_json(&ay_run.stderr),
         },
         "reference": ref_json,
@@ -875,6 +977,80 @@ mod tests {
         assert_eq!(parse_verdict(""), Verdict::Error);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_or_non_utf8_output_cannot_supply_a_reference_verdict() {
+        use std::os::unix::process::ExitStatusExt as _;
+        for (code, stdout, expected) in [
+            (1, "sat\n", Verdict::Error),
+            (0, "sat\n", Verdict::Sat),
+            (10, "s SATISFIABLE\n", Verdict::Sat),
+            (20, "s UNSATISFIABLE\n", Verdict::Unsat),
+            (10, "unsat\n", Verdict::Error),
+            (20, "sat\n", Verdict::Error),
+        ] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(parse_captured_run(output).unwrap().verdict, expected);
+        }
+        let malformed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![0xff, b'\n', b's', b'a', b't', b'\n'],
+            stderr: Vec::new(),
+        };
+        assert!(parse_captured_run(malformed).is_err());
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    #[test]
+    fn diagnostic_capture_drains_output_larger_than_a_pipe_while_the_child_runs() {
+        let mut command = Command::new("/usr/bin/seq");
+        command.args(["1", "50000"]);
+        let run = spawn_and_parse(
+            command,
+            CaptureLimits {
+                timeout: Duration::from_secs(5),
+                output_bytes: 1 << 20,
+                resident_bytes: Some(256 << 20),
+            },
+        )
+        .unwrap();
+        assert!(!run.timed_out);
+        assert!(run.stdout.len() > 64 * 1024);
+        assert_eq!(run.stdout.lines().count(), 50000);
+        assert_eq!(run.stdout.lines().last(), Some("50000"));
+        assert_eq!(run.verdict, Verdict::Error);
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    #[test]
+    fn diagnostic_memory_stop_is_unknown_but_spawn_failure_stays_an_error() {
+        let limits = CaptureLimits {
+            timeout: Duration::from_secs(5),
+            output_bytes: DEFAULT_OUTPUT_BYTES,
+            resident_bytes: Some(1),
+        };
+        let mut command = Command::new("/bin/sleep");
+        command.arg("10");
+        let run = spawn_and_parse(command, limits).unwrap();
+        assert_eq!(run.verdict, Verdict::Unknown);
+        assert!(run.memout);
+        assert!(!run.timed_out);
+        assert!(run.stdout.is_empty());
+        assert!(
+            spawn_and_parse(Command::new("/no-such-ay-diagnostic-executable"), limits,).is_err()
+        );
+    }
+
     #[test]
     fn test_verdict_matches_expected() {
         assert!(Verdict::Sat.matches_expected(ExpectedArg::Sat));
@@ -904,6 +1080,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let summary = plain_english_summary(&ay_run, None, Some(Verdict::Unsat));
         assert!(summary.contains("evidence conflict"));
@@ -916,6 +1093,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let summary = plain_english_summary(&ay_run, None, Some(Verdict::Sat));
         assert!(summary.contains("evidence conflict"));
@@ -928,6 +1106,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let summary = plain_english_summary(&ay_run, None, Some(Verdict::Sat));
         assert!(summary.contains("matches the declared"));
@@ -940,12 +1119,14 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let reference_run = SolveRun {
             verdict: Verdict::Unsat,
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let summary = plain_english_summary(&ay_run, Some(&reference_run), None);
         assert!(summary.contains("Treat this as a dispute"));
@@ -959,12 +1140,14 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let reference_run = SolveRun {
             verdict: Verdict::Unsat,
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            memout: false,
         };
         let summary = plain_english_summary(&ay_run, Some(&reference_run), Some(Verdict::Sat));
         assert!(summary.contains("evidence sources conflict"));

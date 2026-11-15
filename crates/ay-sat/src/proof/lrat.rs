@@ -29,6 +29,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+mod bounded;
+
 const LRAT_PENDING_DELETIONS_INITIAL_CAPACITY: usize = 64;
 const LRAT_PENDING_DELETIONS_MAX_RETAINED_CAPACITY: usize = 32 * 1024;
 const LRAT_TEXT_LINE_INITIAL_CAPACITY: usize = 256;
@@ -211,6 +213,8 @@ pub struct LratWriter<W: Write> {
     deleted_count: u64,
     /// Set on first I/O error; subsequent writes become no-ops
     io_failed: bool,
+    /// A borrowed emission callback refused (or unwound) in this stream.
+    bounded_cancelled: bool,
 }
 
 impl<W: Write> LratWriter<W> {
@@ -280,6 +284,7 @@ impl<W: Write> LratWriter<W> {
             added_count: 0,
             deleted_count: 0,
             io_failed: next_id.is_none(),
+            bounded_cancelled: false,
         }
     }
 
@@ -579,39 +584,7 @@ impl<W: Write> LratWriter<W> {
         clause: &[Literal],
         hints: &[u64],
     ) -> io::Result<u64> {
-        if self.io_failed {
-            return Ok(0);
-        }
-        if let Err(error) = self.flush_deletions() {
-            self.io_failed = true;
-            return Err(error);
-        }
-        let id = self.next_id;
-        if id > i64::MAX as u64 {
-            self.io_failed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "LRAT clause ID exceeds the signed/binary encoding limit",
-            ));
-        }
-        let result = if self.binary {
-            self.write_binary_add(id, clause, hints)
-        } else {
-            self.write_text_add(id, clause, hints)
-        };
-        match result {
-            Ok(()) => {
-                self.next_id = id + 1;
-                self.io_failed |= self.next_id > i64::MAX as u64;
-                self.latest_id = id;
-                self.added_count += 1;
-                Ok(id)
-            }
-            Err(error) => {
-                self.io_failed = true;
-                Err(error)
-            }
-        }
+        self.add_bounded_prevalidated_rup_with_cancellation(clause, hints, &|| true)
     }
 
     /// Emit a pre-assigned caller-prevalidated positive-RUP addition without
@@ -622,36 +595,12 @@ impl<W: Write> LratWriter<W> {
         clause: &[Literal],
         hints: &[i64],
     ) -> io::Result<()> {
-        if self.io_failed {
-            return Ok(());
-        }
-        if clause_id == 0
-            || clause_id > i64::MAX as u64
-            || clause_id >= self.next_id
-            || clause_id <= self.latest_id
-        {
-            self.io_failed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid or non-monotonic pre-assigned bounded LRAT addition",
-            ));
-        }
-        let result = if self.binary {
-            self.write_binary_add_i64_hints(clause_id, clause, hints)
-        } else {
-            self.write_text_add_i64_hints(clause_id, clause, hints)
-        };
-        match result {
-            Ok(()) => {
-                self.latest_id = clause_id;
-                self.added_count += 1;
-                Ok(())
-            }
-            Err(error) => {
-                self.io_failed = true;
-                Err(error)
-            }
-        }
+        self.add_with_id_bounded_prevalidated_rup_with_cancellation(
+            clause_id,
+            clause,
+            hints,
+            &|| true,
+        )
     }
 
     /// Write addition in text format: "id lit1 lit2 ... 0 hint1 hint2 ... 0"
@@ -929,32 +878,18 @@ impl<W: Write> LratWriter<W> {
 
     /// Flush the writer (including any pending deletions; no-op after I/O failure)
     pub fn flush(&mut self) -> io::Result<()> {
-        if self.io_failed {
-            return Ok(());
-        }
-        if let Err(e) = self.flush_deletions() {
-            self.io_failed = true;
-            return Err(e);
-        }
-        match self.writer.flush() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.io_failed = true;
-                Err(e)
-            }
-        }
+        self.flush_with_cancellation(&|| true)
+    }
+    /// The underlying sink, for reading what it recorded (for example the
+    /// first write failure a `BoxedWriter` kept).
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.writer
     }
 
     /// Finalize the proof by flushing pending deletions and returning the inner writer
     ///
     /// Returns an error if an I/O failure occurred during proof writing.
-    pub fn into_inner(mut self) -> io::Result<W> {
-        if self.io_failed {
-            return Err(io::Error::other(
-                "LRAT proof writer encountered I/O error during solve",
-            ));
-        }
-        self.flush_deletions()?;
-        Ok(self.writer)
+    pub fn into_inner(self) -> io::Result<W> {
+        self.into_inner_with_cancellation(&|| true)
     }
 }

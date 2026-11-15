@@ -67,10 +67,60 @@ impl PortfolioSolver {
     /// 5. Mandatory Safe full validation (#6787, #6824)
     pub(crate) fn accept_or_reject(
         &self,
+        result: PortfolioResult,
+        needs_validation: bool,
+        engine_name: &str,
+        engine_idx: usize,
+    ) -> AcceptDecision {
+        let mut inconclusive = false;
+        self.accept_or_reject_impl(
+            result,
+            needs_validation,
+            engine_name,
+            engine_idx,
+            None,
+            &mut inconclusive,
+        )
+    }
+
+    /// [`accept_or_reject`](Self::accept_or_reject) with a bounded wall-clock
+    /// slice for Unsafe counterexample validation (the parallel receive loop's
+    /// eager witness-less validation).
+    ///
+    /// Returns the decision plus whether a `Reject` was merely INCONCLUSIVE
+    /// inside `validation_budget` (the replay ran out of its slice) rather than
+    /// definitive. An inconclusive rejection is never accepted; it tells the
+    /// caller the candidate may be re-validated later with a larger budget.
+    /// The acceptance pipeline itself is identical — same translation, same
+    /// `verify_counterexample` replay, same soundness gates.
+    pub(crate) fn accept_or_reject_bounded(
+        &self,
+        result: PortfolioResult,
+        needs_validation: bool,
+        engine_name: &str,
+        engine_idx: usize,
+        validation_budget: std::time::Duration,
+    ) -> (AcceptDecision, bool) {
+        let mut inconclusive = false;
+        let decision = self.accept_or_reject_impl(
+            result,
+            needs_validation,
+            engine_name,
+            engine_idx,
+            Some(validation_budget),
+            &mut inconclusive,
+        );
+        (decision, inconclusive)
+    }
+
+    fn accept_or_reject_impl(
+        &self,
         mut result: PortfolioResult,
         mut needs_validation: bool,
         engine_name: &str,
         engine_idx: usize,
+        validation_budget: Option<std::time::Duration>,
+        inconclusive: &mut bool,
     ) -> AcceptDecision {
         let profile = crate::transform::accept_profile_enabled();
         let t_accept = ay_core::time::Instant::now();
@@ -136,21 +186,27 @@ impl PortfolioSolver {
         // an already-translated counterexample.
         if let PortfolioResult::Unsafe(cex) = &result {
             if cex.witness.is_none() && cex.steps.iter().all(|s| s.assignments.is_empty()) {
-                match self.validate_unsafe_translating(cex) {
+                match self.validate_unsafe_translating_optionally_bounded(cex, validation_budget) {
                     Ok(translated_cex) => {
                         // Skeleton verified — accept the translated witness.
                         result = PortfolioResult::Unsafe(translated_cex);
                         needs_validation = false;
                     }
-                    Err(reason) => {
+                    Err(rejection) => {
                         if self.config.verbose {
                             safe_eprintln!(
-                                "Portfolio: Engine {} ({}) skeleton Unsafe rejected: {}",
+                                "Portfolio: Engine {} ({}) skeleton Unsafe rejected: {}{}",
                                 engine_idx,
                                 engine_name,
-                                reason
+                                rejection.reason,
+                                if validation_budget.is_some() && rejection.inconclusive {
+                                    " (inconclusive inside the eager slice; retry deferred)"
+                                } else {
+                                    ""
+                                }
                             );
                         }
+                        *inconclusive = validation_budget.is_some() && rejection.inconclusive;
                         return AcceptDecision::Reject;
                     }
                 }
@@ -172,18 +228,19 @@ impl PortfolioSolver {
         // and be demoted to Unknown.
         if needs_validation {
             if let PortfolioResult::Unsafe(cex) = &result {
-                match self.validate_unsafe_translating(cex) {
+                match self.validate_unsafe_translating_optionally_bounded(cex, validation_budget) {
                     Ok(translated_cex) => {
                         // Validation passed — accept the translated witness.
                         result = PortfolioResult::Unsafe(translated_cex);
                     }
-                    Err(reason) => {
+                    Err(rejection) => {
                         if self.config.verbose {
                             safe_eprintln!(
                                 "Portfolio: Engine {} ({}) Unsafe result failed validation: {}, continuing",
-                                engine_idx, engine_name, reason
+                                engine_idx, engine_name, rejection.reason
                             );
                         }
+                        *inconclusive = validation_budget.is_some() && rejection.inconclusive;
                         return AcceptDecision::Reject;
                     }
                 }
@@ -349,8 +406,7 @@ impl PortfolioSolver {
         // Query-only validation only checks that the candidate blocks bad
         // states; it does not re-check initiation or transitions.
         if let Some(translated) = translated_for_validation {
-            match self.validate_safe_with_mode_pre_translated(translated, ValidationBudget::PerRule)
-            {
+            match self.validate_safe_per_rule_with_retry(translated, engine_name, engine_idx) {
                 Ok(translated_model) => {
                     // Fix B1 (stop discarding verified Safe results): the
                     // artifact that passed verification on the ORIGINAL
@@ -381,5 +437,46 @@ impl PortfolioSolver {
         }
 
         AcceptDecision::Accept(result)
+    }
+
+    /// Step 5's validation: `PerRule`, and when that fails only after using
+    /// its budget (an undecided clause rather than a quick refutation), one
+    /// `PerRuleExtended` re-run of the same checks with more time per clause.
+    /// Both runs are full strict validations against the original clauses;
+    /// the re-run only gives an undecided clause the time to be decided, and
+    /// the portfolio's cancellation token still bounds it.
+    ///
+    /// LRA-Lin: IMC's reached-set invariants (a disjunction of interpolants)
+    /// left a transition clause undecided past the 2 s per-clause budget while
+    /// every other clause passed (tte_synchro.sm_clock_distance, safe).
+    fn validate_safe_per_rule_with_retry(
+        &self,
+        translated: crate::pdr::InvariantModel,
+        engine_name: &str,
+        engine_idx: usize,
+    ) -> Result<crate::pdr::InvariantModel, String> {
+        let started = ay_core::time::Instant::now();
+        let first = self
+            .validate_safe_with_mode_pre_translated(translated.clone(), ValidationBudget::PerRule);
+        let reason = match first {
+            Ok(model) => return Ok(model),
+            Err(reason) => reason,
+        };
+        if started.elapsed() < super::validation::PER_RULE_RETRY_MIN_ELAPSED
+            || self.cancellation_token.is_cancelled()
+        {
+            return Err(reason);
+        }
+        if self.config.verbose {
+            safe_eprintln!(
+                "Portfolio: Engine {} ({}) Safe result undecided by per-rule validation after {:.1}s ({}); re-validating with {:?} per clause",
+                engine_idx,
+                engine_name,
+                started.elapsed().as_secs_f64(),
+                reason,
+                super::validation::PER_RULE_EXTENDED_BUDGET
+            );
+        }
+        self.validate_safe_with_mode_pre_translated(translated, ValidationBudget::PerRuleExtended)
     }
 }

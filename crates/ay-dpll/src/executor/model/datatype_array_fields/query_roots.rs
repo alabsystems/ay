@@ -19,7 +19,7 @@ impl Executor {
         // a model; letting those terms exhaust this certificate would make its
         // authority depend on solver history rather than on the obligation it
         // authenticates.
-        let mut stack = self.independent_gate_query_roots();
+        let mut stack = self.independent_gate_query_roots().ok()?;
         if stack.len() > MAX_EXACT_ARRAY_FIELD_TERMS {
             return None;
         }

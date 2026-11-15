@@ -77,7 +77,7 @@ function loadLibrary() {
   }
   throw new Error(
     "Could not locate libay_ffi shared library. Build it with " +
-      "`cargo build -p ay-ffi`, or set AYSEARCH_LIB/AYZ3_LIB to its full path.\nTried:\n  " +
+      "`targo --unverified build -p ay-ffi` (Trust toolchain) or `cargo build -p ay-ffi`, or set AYSEARCH_LIB/AYZ3_LIB to its full path.\nTried:\n  " +
       tried.join("\n  "),
   );
 }

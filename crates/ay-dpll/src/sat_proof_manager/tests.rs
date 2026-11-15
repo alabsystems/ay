@@ -7,12 +7,17 @@ use super::*;
 use ay_core::{Sort, Symbol, TermStore};
 use ay_sat::{ClauseTrace, Literal, Variable};
 
+mod equivalence_clausification;
+mod failed_literal_probe;
 mod finite_select_unit_authority;
 mod folded_unit_authority;
+mod ground_substitution_projection;
 mod intrinsic_array_clause_authority;
 mod intrinsic_datatype_clause_authority;
 mod intrinsic_euf_clause_authority;
 mod propagation_unit_authority;
+mod refutation_tail;
+mod unjustified_rederivation_scope;
 
 fn setup_test_terms() -> (TermStore, HashMap<u32, TermId>, HashMap<TermId, TermId>) {
     let mut terms = TermStore::new();
@@ -171,6 +176,71 @@ fn test_process_trace_ample_step_budget_still_derives() {
         }
         other => panic!("expected resolution/step, got {other:?}"),
     }
+}
+
+#[test]
+fn test_process_trace_rederives_generic_annotated_original() {
+    // An original whose only annotation is a `Generic` theory lemma (no
+    // checker-replayable authority) but which is a resolution consequence
+    // of earlier originals must be re-derived by the bridge instead of
+    // emitting the Generic leaf: `p` follows from `p ∨ q` and `¬q`.
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let p = var_to_term[&0];
+    let mut lemma_proofs: HashMap<Vec<TermId>, TheoryLemmaProof> = HashMap::default();
+    lemma_proofs.insert(
+        vec![p],
+        TheoryLemmaProof {
+            clause: vec![p],
+            kind: TheoryLemmaKind::Generic,
+            farkas: None,
+            lia: None,
+        },
+    );
+    let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+    manager.set_theory_lemma_proofs(&lemma_proofs);
+
+    let mut proof = Proof::new();
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(
+        1,
+        vec![
+            Literal::positive(Variable::new(0)),
+            Literal::positive(Variable::new(1)),
+        ],
+        true,
+    );
+    trace.add_clause(2, vec![Literal::negative(Variable::new(1))], true);
+    trace.add_clause(3, vec![Literal::positive(Variable::new(0))], true);
+    trace.add_clause(4, vec![Literal::negative(Variable::new(0))], true);
+    trace.add_clause_with_hints(5, Vec::new(), false, vec![3, 4]);
+
+    let empty_id = manager
+        .process_trace(&trace, &mut proof)
+        .expect("expected empty clause derivation");
+    assert!(matches!(
+        proof.get_step(empty_id),
+        Some(ProofStep::Resolution { clause, .. }) if clause.is_empty()
+    ));
+    assert!(
+        proof.steps.iter().all(|step| !matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                clause,
+                ..
+            } if clause == &vec![p]
+        )),
+        "the Generic lemma leaf must be replaced by a certified derivation"
+    );
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Resolution { clause, .. } if clause == &vec![p]
+        )),
+        "expected a resolution step deriving [p]"
+    );
 }
 
 #[test]
@@ -2150,4 +2220,165 @@ fn test_process_trace_empty_clause_rup_replay_no_trust() {
         })
         .count();
     assert_eq!(trust_steps, 0, "no Trust holes in the reconstructed proof");
+}
+
+/// Diagnostic attribution cannot replay the remaining failed entries against
+/// the caller's live meter/store; the next valid build uses that SAME allowance.
+#[test]
+fn rejection_probe_preserves_failfast_meter_store_and_next_fragment() {
+    fn run(
+        debug_cert: bool,
+        probe_cert_reject: bool,
+    ) -> (
+        ExactOriginalProofError,
+        Vec<(usize, usize)>,
+        usize,
+        usize,
+        String,
+    ) {
+        let _flags = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+            debug_cert,
+            probe_cert_reject,
+            ..Default::default()
+        });
+        let mut terms = TermStore::new();
+        let false_term = terms.mk_bool(false);
+        let mut var_to_term = HashMap::default();
+        var_to_term.insert(0, false_term);
+        // Both remain residual after the normal authentication passes. The
+        // first error must end the final pass even with the probe enabled.
+        let mut rejected = ClauseTrace::new();
+        rejected.add_clause(1, vec![Literal::positive(Variable::new(7))], true);
+        rejected.add_clause(2, vec![Literal::positive(Variable::new(8))], true);
+        let annotations = vec![
+            None,
+            None,
+            Some(ay_core::ClausificationProof {
+                rule: AletheRule::False,
+                source_term: false_term,
+            }),
+        ];
+        let mut valid = ClauseTrace::new();
+        valid.add_clause(3, vec![Literal::negative(Variable::new(0))], true);
+        let mut charges = Vec::new();
+        let mut work_used = 0usize;
+        let mut bytes_used = 0usize;
+        let mut progress = |work: usize, bytes: usize| {
+            charges.push((work, bytes));
+            work_used = work_used
+                .checked_add(work)
+                .expect("small finite fixture work");
+            bytes_used = bytes_used
+                .checked_add(bytes)
+                .expect("small finite fixture bytes");
+            for (resource, actual) in [
+                (ay_sat::ResolutionValidationResource::Work, work_used),
+                (ay_sat::ResolutionValidationResource::Bytes, bytes_used),
+            ] {
+                if actual > 1_000_000 {
+                    return Err(ay_sat::ResolutionValidationError::LimitExceeded {
+                        resource,
+                        limit: 1_000_000,
+                        actual: actual as u128,
+                    });
+                }
+            }
+            Ok(())
+        };
+        let mut diagnostics = Vec::new();
+        let mut diagnostic = |message: String| diagnostics.push(message);
+        let (error, next) = {
+            let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+            let error = manager
+                .build_exact_original_proof_fragment_metered_with_diagnostic(
+                    &rejected,
+                    &[],
+                    None,
+                    &mut progress,
+                    &mut diagnostic,
+                )
+                .expect_err("unmapped originals still have no proof authority");
+            assert_eq!(
+                error,
+                ExactOriginalProofError::UnmappedVariable {
+                    clause_id: 1,
+                    variable: 7,
+                }
+            );
+            manager.set_clausification_proofs(&annotations);
+            let next = manager
+                .build_exact_original_proof_fragment_metered_with_diagnostic(
+                    &valid,
+                    &[],
+                    None,
+                    &mut progress,
+                    &mut diagnostic,
+                )
+                .expect("the valid false-clausification proof uses the unreset allowance");
+            assert_eq!(next.binding_count(), 1);
+            (error, format!("{next:?}"))
+        };
+        assert_eq!(!diagnostics.is_empty(), probe_cert_reject);
+        (error, charges, terms.len(), terms.true_memory_bytes(), next)
+    }
+    let ordinary = run(false, false);
+    for (debug, probe) in [(true, false), (false, true), (true, true)] {
+        assert_eq!(run(debug, probe), ordinary);
+    }
+}
+
+#[test]
+fn exact_original_fragment_growth_precharge_follows_selected_cone() {
+    fn run(selected: bool) -> Result<ExactOriginalProofFragment, ExactOriginalProofError> {
+        let mut terms = TermStore::new();
+        let false_term = terms.mk_bool(false);
+        let limit = terms.true_memory_bytes() + 64 * 1024;
+        let mut var_to_term = HashMap::default();
+        var_to_term.insert(0, false_term);
+        let annotations = vec![Some(ay_core::ClausificationProof {
+            rule: AletheRule::False,
+            source_term: false_term,
+        })];
+        let mut trace = ClauseTrace::new();
+        for id in 1..=1024 {
+            trace.add_clause(id, vec![Literal::negative(Variable::new(0))], true);
+        }
+        let cone = HashSet::from_iter([1]);
+        let mut used = 0usize;
+        let mut progress = |_: usize, bytes: usize| {
+            used = used.checked_add(bytes).expect("bounded fixture");
+            if used > limit {
+                return Err(ay_sat::ResolutionValidationError::LimitExceeded {
+                    resource: ay_sat::ResolutionValidationResource::Bytes,
+                    limit: limit as u128,
+                    actual: used as u128,
+                });
+            }
+            Ok(())
+        };
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_clausification_proofs(&annotations);
+        manager.build_exact_original_proof_fragment_metered(
+            &trace,
+            &[],
+            selected.then_some(&cone),
+            &mut progress,
+        )
+    }
+    let fragment = run(true).expect("only the selected original can grow terms");
+    assert_eq!(fragment.binding_count(), 1);
+    assert!(fragment.binding(1).is_some());
+    assert!(fragment.binding(2).is_none());
+    assert!(
+        matches!(
+            run(false),
+            Err(ExactOriginalProofError::Resource(
+                ay_sat::ResolutionValidationError::LimitExceeded {
+                    resource: ay_sat::ResolutionValidationResource::Bytes,
+                    ..
+                }
+            ))
+        ),
+        "the full trace must still precharge every original"
+    );
 }

@@ -234,3 +234,40 @@ fn test_get_interpolant_equality_contradiction() {
         }
     }
 }
+
+/// The cascade honours this context's per-check timeout and global solve
+/// deadline, as `check_sat` does: a spent budget refuses before interpolating.
+#[test]
+fn test_get_interpolant_refuses_on_a_spent_context_budget() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let a = vec![ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::Int(10))];
+    let b = vec![ChcExpr::le(ChcExpr::var(x), ChcExpr::Int(5))];
+    let shared: FxHashSet<String> = ["x".to_string()].into_iter().collect();
+
+    // Twin: with budget left the query yields an interpolant, so each refusal
+    // below is the budget's doing.
+    let mut live = SmtContext::new();
+    let _live_timeout = live.scoped_check_timeout(Some(std::time::Duration::from_mins(1)));
+    match live.get_interpolant(&a, &b) {
+        InterpolationResult::Unsat(interp) => assert_valid_interpolant(&a, &b, &interp, &shared),
+        InterpolationResult::Unknown => panic!("expected an interpolant with budget left"),
+    }
+
+    let mut spent_timeout = SmtContext::new();
+    let _spent = spent_timeout.scoped_check_timeout(Some(std::time::Duration::ZERO));
+    assert!(matches!(
+        spent_timeout.get_interpolant(&a, &b),
+        InterpolationResult::Unknown
+    ));
+    assert!(matches!(
+        spent_timeout.get_interpolant_with_shared_vars(&a, &b, &shared),
+        InterpolationResult::Unknown
+    ));
+
+    let mut past_deadline = SmtContext::new();
+    past_deadline.set_global_solve_deadline(Some(ay_core::time::Instant::now()));
+    assert!(matches!(
+        past_deadline.get_interpolant(&a, &b),
+        InterpolationResult::Unknown
+    ));
+}

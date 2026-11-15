@@ -164,3 +164,31 @@ fn test_som_idempotent() {
 
     assert_eq!(norm1, norm2, "SOM normalization should be idempotent");
 }
+
+#[test]
+fn arithmetic_scan_visits_a_shared_boolean_dag_once() {
+    // t_{i+1} = (and (or t_i q) (or t_i r)): 2^64 paths, 3 * 64 distinct
+    // nodes. The pass must decline (no arithmetic) without walking paths,
+    // and must still see arithmetic placed below the shared chain.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Bool);
+    let r = terms.mk_var("r", Sort::Bool);
+    let mut t = terms.mk_var("p", Sort::Bool);
+    for _ in 0..64 {
+        let left = terms.mk_app(Symbol::named("or"), vec![t, q], Sort::Bool);
+        let right = terms.mk_app(Symbol::named("or"), vec![t, r], Sort::Bool);
+        t = terms.mk_app(Symbol::named("and"), vec![left, right], Sort::Bool);
+    }
+    let mut assertions = vec![t];
+    assert!(!NormalizeArithSom::new().apply(&mut terms, &mut assertions));
+    assert_eq!(assertions, vec![t]);
+
+    let x = terms.mk_var("x", Sort::Real);
+    let zero = mk_rat(&mut terms, 0, 1);
+    let deep_atom = terms.mk_app(Symbol::named("<="), vec![x, zero], Sort::Bool);
+    let with_atom = terms.mk_app(Symbol::named("or"), vec![t, deep_atom], Sort::Bool);
+    assert!(NormalizeArithSom::any_has_arithmetic(
+        &terms,
+        &[t, with_atom]
+    ));
+}

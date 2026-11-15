@@ -15,15 +15,100 @@
 
 use super::*;
 
+mod cross_chain;
+use cross_chain::CrossChainInput;
+
+/// Process-wide counters for `propagate_equalities_impl` (`--stats-full`
+/// `arrays_prop_eq_*`). Process-wide rather than per-instance because the
+/// combined lanes construct a fresh `ArraySolver` per split-loop round and
+/// the statistics block reports the LAST instance only (2026-09-17 trap);
+/// these accumulate across every instance so they measure the solve.
+pub(crate) mod prop_eq_stats {
+    // The statics are named after the `--stats-full` keys they print.
+    #![allow(non_upper_case_globals)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub(crate) static $name: AtomicU64 = AtomicU64::new(0);)*
+            pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
+                vec![$((concat!("arrays_prop_eq_", stringify!($name)), $name.load(Ordering::Relaxed)),)*]
+            }
+        };
+    }
+
+    counters!(
+        calls,
+        interrupted,
+        snapshot_hits,
+        scans,
+        selects_scanned,
+        sent_seed_size,
+        discovered,
+        suppressed_known,
+        suppressed_dup,
+        distinct_uncached,
+        equal_uncached,
+        paths_bfs,
+        resolve_base_uncached,
+        seed_empty,
+        first_scan,
+        delta_eq_adj,
+        delta_select_cache,
+        delta_store_cache,
+        delta_external_diseqs,
+        delta_external_eqs,
+        delta_diseq_set,
+        delta_only_external_diseqs,
+        cross_chain_eq_pairs,
+        cross_chain_indices,
+        store_perm_chain_maps,
+        store_perm_pairs,
+        ns_store_perm_collect,
+        ns_cross_chain_candidates,
+        cross_chain_visits,
+        ns_effective_store_collect,
+        ns_select_scan,
+        ns_store_chain,
+        ns_array_congruence,
+        ns_read_congruence,
+        ns_transitive,
+        ns_injectivity,
+        ns_effective_store,
+        ns_cross_chain,
+        ns_store_perm,
+        ns_total,
+        disc_select_scan,
+        disc_store_chain,
+        disc_array_congruence,
+        disc_read_congruence,
+        disc_transitive,
+        disc_injectivity,
+        disc_effective_store,
+        disc_cross_chain,
+        disc_store_perm,
+    );
+
+    #[inline]
+    pub(crate) fn add(counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 struct StorePermutationForest {
     parent: Vec<usize>,
 }
 
 impl StorePermutationForest {
     fn new(len: usize) -> Self {
-        Self {
-            parent: (0..len).collect(),
+        // Every node starts as its own root. The reservation is a capacity
+        // hint only: if it fails, the pushes grow the vector as they go.
+        let mut parent = Vec::new();
+        let _ = parent.try_reserve_exact(len);
+        for idx in 0..len {
+            parent.push(idx);
         }
+        Self { parent }
     }
 
     fn find(&mut self, idx: usize) -> usize {
@@ -70,6 +155,7 @@ impl ArraySolver<'_> {
                 .push(DiscoveredEquality::new(lhs, rhs, reason));
             true
         } else {
+            prop_eq_stats::add(&prop_eq_stats::suppressed_dup, 1);
             false
         }
     }
@@ -79,6 +165,9 @@ impl ArraySolver<'_> {
         lhs: TermId,
         rhs: TermId,
     ) -> bool {
+        // Not counted: this is the hottest call in the function (523 M
+        // lookups per 60 s on s3_srvr.06 before the pair filters), and an
+        // atomic per call would cost more than the lookup.
         if lhs == rhs {
             return true;
         }
@@ -96,6 +185,38 @@ impl ArraySolver<'_> {
         self.eq_pair_index
             .get(&key)
             .is_some_and(|eq_term| self.assigns.get(eq_term) == Some(&true))
+    }
+
+    /// Consume the per-scan representative slot of `idx_l`'s equality class
+    /// for a select pair whose indices are `known_equal`, returning whether the
+    /// caller may emit the pair.
+    ///
+    /// The #8785 "one representative select equality per (array pair, index
+    /// class)" bound is sound because EUF derives every other pair of the class
+    /// from the representative by congruence over the index equalities it
+    /// already holds. That argument names the FIRST pair the scan meets, sent
+    /// or not: an already-sent pair therefore consumes the slot exactly as a
+    /// freshly pushed one does. Skipping already-sent pairs without marking
+    /// the class made `propagate_equalities` non-idempotent — every re-scan
+    /// of an unchanged assignment elected one more representative per class,
+    /// so the N-O loop's drain and the Sat-time convergence re-drain answered
+    /// differently on the same state whenever the `prop_eq_snapshot` cache
+    /// was invalidated in between (always-on `AX fixpoint violation` abort on
+    /// QF_AUFLIA `swap_invalid_t1_pp_sf_ai_00010_002`, 2026-09-21).
+    ///
+    /// Returns `true` when the indices are not class-equal (affine or other
+    /// provable equalities keep their own propagation) or when this is the
+    /// first pair of the class; `false` when the class slot is already taken.
+    fn note_index_class_covered(
+        &self,
+        propagated_index_classes: &mut HashSet<TermId>,
+        idx_l: TermId,
+        idx_r: TermId,
+    ) -> bool {
+        if !self.known_equal(idx_l, idx_r) {
+            return true;
+        }
+        propagated_index_classes.insert(self.equiv_class_representative(idx_l))
     }
 
     fn store_map_indices_are_decided(
@@ -214,9 +335,12 @@ impl ArraySolver<'_> {
         // propagation can be very expensive on seq push_back chains; returning
         // an empty result allows the DPLL(T) loop to check the interrupt flag
         // and return Unknown.
+        prop_eq_stats::add(&prop_eq_stats::calls, 1);
         if self.is_interrupted() {
+            prop_eq_stats::add(&prop_eq_stats::interrupted, 1);
             return EqualityPropagationResult::default();
         }
+        let prop_eq_t0 = std::time::Instant::now();
 
         self.populate_caches();
         // (#6820) Ensure equiv class cache is fresh for select_pair_index lookups.
@@ -237,9 +361,52 @@ impl ArraySolver<'_> {
             self.diseq_set.len(),
         );
         if self.prop_eq_snapshot == Some(current_snapshot) {
+            prop_eq_stats::add(&prop_eq_stats::snapshot_hits, 1);
+            prop_eq_stats::add(
+                &prop_eq_stats::ns_total,
+                prop_eq_t0.elapsed().as_nanos() as u64,
+            );
             return EqualityPropagationResult::default();
         }
-
+        prop_eq_stats::add(&prop_eq_stats::scans, 1);
+        prop_eq_stats::add(
+            &prop_eq_stats::selects_scanned,
+            self.select_cache.len() as u64,
+        );
+        prop_eq_stats::add(
+            &prop_eq_stats::sent_seed_size,
+            self.sent_equalities.len() as u64,
+        );
+        if self.sent_equalities.is_empty() {
+            prop_eq_stats::add(&prop_eq_stats::seed_empty, 1);
+        }
+        if self.prop_eq_snapshot.is_none() {
+            prop_eq_stats::add(&prop_eq_stats::first_scan, 1);
+        }
+        match self.prop_eq_last_scan_snapshot {
+            None => {}
+            Some(prev) => {
+                let cur = current_snapshot;
+                if prev.0 != cur.0 {
+                    prop_eq_stats::add(&prop_eq_stats::delta_eq_adj, 1);
+                }
+                let grow = |a: usize, b: usize| b.saturating_sub(a) as u64;
+                prop_eq_stats::add(&prop_eq_stats::delta_select_cache, grow(prev.1, cur.1));
+                prop_eq_stats::add(&prop_eq_stats::delta_store_cache, grow(prev.2, cur.2));
+                prop_eq_stats::add(&prop_eq_stats::delta_external_diseqs, grow(prev.3, cur.3));
+                prop_eq_stats::add(&prop_eq_stats::delta_external_eqs, grow(prev.4, cur.4));
+                prop_eq_stats::add(&prop_eq_stats::delta_diseq_set, grow(prev.5, cur.5));
+                if prev.0 == cur.0
+                    && prev.1 == cur.1
+                    && prev.2 == cur.2
+                    && prev.3 != cur.3
+                    && prev.4 == cur.4
+                    && prev.5 == cur.5
+                {
+                    prop_eq_stats::add(&prop_eq_stats::delta_only_external_diseqs, 1);
+                }
+            }
+        }
         // Enable `equality_reason_paths_from` memoization for the duration of the
         // (read-only w.r.t. the equality graph / assigns / external facts) select
         // scan below (#no-cross-flood). The RAII guard restores the prior cache
@@ -249,6 +416,22 @@ impl ArraySolver<'_> {
         let _eq_paths_cache_guard = eq_paths_cache::activate();
 
         let mut result = EqualityPropagationResult::default();
+        let mut prop_eq_section = std::time::Instant::now();
+        let mut prop_eq_section_disc = 0usize;
+        macro_rules! section_done {
+            ($counter:ident, $disc:ident) => {
+                prop_eq_stats::add(
+                    &prop_eq_stats::$counter,
+                    prop_eq_section.elapsed().as_nanos() as u64,
+                );
+                prop_eq_stats::add(
+                    &prop_eq_stats::$disc,
+                    (result.equalities.len() - prop_eq_section_disc) as u64,
+                );
+                prop_eq_section_disc = result.equalities.len();
+                prop_eq_section = std::time::Instant::now();
+            };
+        }
         // Seed seen set with previously-sent equalities to prevent re-discovery
         // across N-O fixpoint iterations (#5121).
         let mut seen_equalities = self.sent_equalities.clone();
@@ -265,6 +448,8 @@ impl ArraySolver<'_> {
                         $rhs,
                         $reason,
                     );
+                } else {
+                    prop_eq_stats::add(&prop_eq_stats::suppressed_known, 1);
                 }
             };
         }
@@ -361,6 +546,7 @@ impl ArraySolver<'_> {
             }
         }
 
+        section_done!(ns_select_scan, disc_select_scan);
         // #8615: Check interrupt before store-chain resolution loop.
         if self.is_interrupted() {
             return result;
@@ -402,6 +588,7 @@ impl ArraySolver<'_> {
                 push_equality!(store_chain_base_group, group[0].0, group[i].0, reasons);
             }
         }
+        section_done!(ns_store_chain, disc_store_chain);
 
         // Array congruence propagation (#5086).
         let mut array_to_selects: HashMap<TermId, Vec<(TermId, TermId)>> = HashMap::default();
@@ -429,6 +616,18 @@ impl ArraySolver<'_> {
                 for &(idx_r, sel_r) in &rhs_selects {
                     if sel_l != sel_r {
                         if Self::equality_already_discovered(&seen_equalities, sel_l, sel_r) {
+                            // A pair sent on an earlier scan is STILL the
+                            // class representative: consume the slot exactly
+                            // as pushing it would (see
+                            // `note_index_class_covered`), or every re-scan
+                            // of an unchanged state elects one more
+                            // representative per class and the drain never
+                            // reaches a fixpoint.
+                            self.note_index_class_covered(
+                                &mut propagated_index_classes,
+                                idx_l,
+                                idx_r,
+                            );
                             continue;
                         }
                         let Some(mut reasons) = proven_equal_reasons(lhs, rhs) else {
@@ -444,10 +643,11 @@ impl ArraySolver<'_> {
                         // EUF-congruent to that representative, while affine
                         // or otherwise non-class equal indices still keep
                         // their own propagation below.
-                        if self.known_equal(idx_l, idx_r)
-                            && !propagated_index_classes
-                                .insert(self.equiv_class_representative(idx_l))
-                        {
+                        if !self.note_index_class_covered(
+                            &mut propagated_index_classes,
+                            idx_l,
+                            idx_r,
+                        ) {
                             continue;
                         }
                         reasons.extend(idx_reasons);
@@ -456,6 +656,7 @@ impl ArraySolver<'_> {
                 }
             }
         }
+        section_done!(ns_array_congruence, disc_array_congruence);
         // Same-array READ CONGRUENCE (#seed-1213-case-187): for two selects
         // over the SAME array term with PROVABLY EQUAL indices, propagate
         // `select(a,i) = select(a,j)` with the index-equality reasons. The
@@ -511,12 +712,19 @@ impl ArraySolver<'_> {
                     if !legacy_known_equal && leaf_congruence_reasons.is_none() {
                         continue;
                     }
-                    if Self::equality_already_discovered(&seen_equalities, sel_l, sel_r) {
+                    // One representative per index equality class (same
+                    // reasoning as the #8785 dedup above). The slot is
+                    // consumed BEFORE the already-sent test: a pair sent on an
+                    // earlier scan is the representative this scan would have
+                    // elected, and skipping it without marking the class made
+                    // every re-scan of an unchanged state elect one more
+                    // representative per class (the AX fixpoint-violation
+                    // abort on the PDPAR'05 swap family; see
+                    // `note_index_class_covered`).
+                    if !propagated_index_classes.insert(self.equiv_class_representative(idx_l)) {
                         continue;
                     }
-                    // One representative per index equality class (same
-                    // reasoning as the #8785 dedup above).
-                    if !propagated_index_classes.insert(self.equiv_class_representative(idx_l)) {
+                    if Self::equality_already_discovered(&seen_equalities, sel_l, sel_r) {
                         continue;
                     }
                     let reasons = if legacy_known_equal {
@@ -531,6 +739,7 @@ impl ArraySolver<'_> {
                 }
             }
         }
+        section_done!(ns_read_congruence, disc_read_congruence);
 
         // Transitive array equalities via eq_adj
         let array_terms: Vec<TermId> = array_to_selects.keys().copied().collect();
@@ -552,6 +761,13 @@ impl ArraySolver<'_> {
                             if sel_a != sel_o {
                                 if Self::equality_already_discovered(&seen_equalities, sel_a, sel_o)
                                 {
+                                    // Already-sent pairs keep their class
+                                    // slot (see `note_index_class_covered`).
+                                    self.note_index_class_covered(
+                                        &mut propagated_index_classes,
+                                        idx_a,
+                                        idx_o,
+                                    );
                                     continue;
                                 }
                                 let Some(mut reasons) = proven_equal_reasons(arr, other_arr) else {
@@ -560,10 +776,11 @@ impl ArraySolver<'_> {
                                 let Some(idx_reasons) = proven_equal_reasons(idx_a, idx_o) else {
                                     continue;
                                 };
-                                if self.known_equal(idx_a, idx_o)
-                                    && !propagated_index_classes
-                                        .insert(self.equiv_class_representative(idx_a))
-                                {
+                                if !self.note_index_class_covered(
+                                    &mut propagated_index_classes,
+                                    idx_a,
+                                    idx_o,
+                                ) {
                                     continue;
                                 }
                                 reasons.extend(idx_reasons);
@@ -574,6 +791,7 @@ impl ArraySolver<'_> {
                 }
             }
         }
+        section_done!(ns_transitive, disc_transitive);
 
         // #8615: Check interrupt before expensive O(n^2) propagation sections.
         if self.is_interrupted() {
@@ -618,45 +836,89 @@ impl ArraySolver<'_> {
                 }
             }
         }
+        section_done!(ns_injectivity, disc_injectivity);
 
         // Effective store map decomposition (#5086).
+        //
+        // Two passes: gather the effective maps of every true array equality
+        // first (memoized per array for the window, so the store-permutation
+        // section below re-uses them), partition every index term that
+        // occurs with `index_conflict_partition` — the standing sound
+        // over-approximation of `explain_equal_if_provable`, every provably
+        // equal pair shares a block — and then pair only entries whose index
+        // blocks agree: a pair with different blocks could never pass the
+        // `proven_equal_reasons(idx_a, idx_b)` gate below. Pairs are visited
+        // in the original (lhs entry, rhs entry) order, so the emission is
+        // byte-identical.
+        type SharedChain = Rc<store_chain::StoreChainCollection>;
+        let effective_collect_t0 = std::time::Instant::now();
+        let mut effective_pairs: Vec<(TermId, TermId, SharedChain, SharedChain)> = Vec::new();
         for (&_eq_term, &(lhs, rhs)) in &self.equality_cache {
-            // #8615: Check interrupt in effective store map decomposition.
-            if self.is_interrupted() {
-                return result;
-            }
             if self.assigns.get(&_eq_term) != Some(&true) {
                 continue;
             }
             if !matches!(self.terms.sort(lhs), Sort::Array(_)) {
                 continue;
             }
-            let lhs_map = self.collect_effective_stores(lhs);
-            let rhs_map = self.collect_effective_stores(rhs);
-            if let (
-                Some((_base_a, _base_reasons_a, map_a)),
-                Some((_base_b, _base_reasons_b, map_b)),
-            ) = (lhs_map, rhs_map)
-            {
-                for (idx_a, val_a, store_reasons_a) in &map_a {
-                    for (idx_b, val_b, store_reasons_b) in &map_b {
-                        if Self::equality_already_discovered(&seen_equalities, *val_a, *val_b) {
-                            continue;
-                        }
-                        let Some(mut reasons) = proven_equal_reasons(lhs, rhs) else {
-                            continue;
-                        };
-                        let Some(idx_reasons) = proven_equal_reasons(*idx_a, *idx_b) else {
-                            continue;
-                        };
-                        reasons.extend(store_reasons_a.iter().copied());
-                        reasons.extend(store_reasons_b.iter().copied());
-                        reasons.extend(idx_reasons);
-                        push_equality!(effective_store, *val_a, *val_b, reasons);
+            let lhs_map = self.collect_effective_stores_shared(lhs);
+            let rhs_map = self.collect_effective_stores_shared(rhs);
+            if let (Some(chain_a), Some(chain_b)) = (lhs_map, rhs_map) {
+                effective_pairs.push((lhs, rhs, chain_a, chain_b));
+            }
+        }
+        prop_eq_stats::add(
+            &prop_eq_stats::ns_effective_store_collect,
+            effective_collect_t0.elapsed().as_nanos() as u64,
+        );
+        let effective_index_blocks: HashMap<TermId, TermId> = {
+            let mut terms: Vec<TermId> = effective_pairs
+                .iter()
+                .flat_map(|(_, _, chain_a, chain_b)| {
+                    chain_a
+                        .2
+                        .iter()
+                        .map(|(idx, _, _)| *idx)
+                        .chain(chain_b.2.iter().map(|(idx, _, _)| *idx))
+                })
+                .collect();
+            terms.sort_unstable_by_key(|t| t.0);
+            terms.dedup();
+            self.index_conflict_partition(&terms)
+        };
+        for (lhs, rhs, chain_a, chain_b) in &effective_pairs {
+            // #8615: Check interrupt in effective store map decomposition.
+            if self.is_interrupted() {
+                return result;
+            }
+            let (lhs, rhs) = (*lhs, *rhs);
+            let (map_a, map_b) = (&chain_a.2, &chain_b.2);
+            for (idx_a, val_a, store_reasons_a) in map_a {
+                let block_a = effective_index_blocks[idx_a];
+                for (idx_b, val_b, store_reasons_b) in map_b {
+                    if effective_index_blocks[idx_b] != block_a {
+                        debug_assert!(
+                            proven_equal_reasons(*idx_a, *idx_b).is_none(),
+                            "arrays: effective-store index block filter skipped a provable pair"
+                        );
+                        continue;
                     }
+                    if Self::equality_already_discovered(&seen_equalities, *val_a, *val_b) {
+                        continue;
+                    }
+                    let Some(mut reasons) = proven_equal_reasons(lhs, rhs) else {
+                        continue;
+                    };
+                    let Some(idx_reasons) = proven_equal_reasons(*idx_a, *idx_b) else {
+                        continue;
+                    };
+                    reasons.extend(store_reasons_a.iter().copied());
+                    reasons.extend(store_reasons_b.iter().copied());
+                    reasons.extend(idx_reasons);
+                    push_equality!(effective_store, *val_a, *val_b, reasons);
                 }
             }
         }
+        section_done!(ns_effective_store, disc_effective_store);
 
         // #8615: Check interrupt before cross-chain resolution.
         if self.is_interrupted() {
@@ -693,117 +955,44 @@ impl ArraySolver<'_> {
                 }
             }
 
-            for (lhs, rhs) in eq_pairs {
-                // #8615: Check interrupt in cross-chain resolution O(n^2) loop.
-                if self.is_interrupted() {
-                    return result;
-                }
-                let Some(array_eq_reasons) = proven_equal_reasons(lhs, rhs) else {
-                    continue;
-                };
-                for &idx in &select_indices {
-                    let (lhs_res, lhs_res_reasons) =
-                        self.resolve_select_base_for_propagation_with_reasons(lhs, idx);
-                    let (rhs_res, rhs_res_reasons) =
-                        self.resolve_select_base_for_propagation_with_reasons(rhs, idx);
-
-                    let selects_at_idx = index_to_selects.get(&idx).cloned().unwrap_or_default();
-
-                    match (lhs_res, rhs_res) {
-                        (SelectResolution::Base(base_l), SelectResolution::Base(base_r)) => {
-                            if base_l == base_r {
-                                continue;
-                            }
-                            let lhs_sels: Vec<(TermId, Vec<TheoryLit>)> = selects_at_idx
-                                .iter()
-                                .filter_map(|&(sel, arr)| {
-                                    if arr == base_l {
-                                        Some((sel, Vec::new()))
-                                    } else {
-                                        proven_equal_reasons(arr, base_l)
-                                            .map(|reasons| (sel, reasons))
-                                    }
-                                })
-                                .collect();
-                            let rhs_sels: Vec<(TermId, Vec<TheoryLit>)> = selects_at_idx
-                                .iter()
-                                .filter_map(|&(sel, arr)| {
-                                    if arr == base_r {
-                                        Some((sel, Vec::new()))
-                                    } else {
-                                        proven_equal_reasons(arr, base_r)
-                                            .map(|reasons| (sel, reasons))
-                                    }
-                                })
-                                .collect();
-                            for (sel_l, sel_l_reasons) in &lhs_sels {
-                                for (sel_r, sel_r_reasons) in &rhs_sels {
-                                    if Self::equality_already_discovered(
-                                        &seen_equalities,
-                                        *sel_l,
-                                        *sel_r,
-                                    ) {
-                                        continue;
-                                    }
-                                    let mut reasons = array_eq_reasons.clone();
-                                    reasons.extend(lhs_res_reasons.clone());
-                                    reasons.extend(rhs_res_reasons.clone());
-                                    reasons.extend(sel_l_reasons.clone());
-                                    reasons.extend(sel_r_reasons.clone());
-                                    push_equality!(cross_chain_base_base, *sel_l, *sel_r, reasons);
-                                }
-                            }
-                        }
-                        (SelectResolution::Value(val_l), SelectResolution::Base(base_r)) => {
-                            for &(sel, arr) in &selects_at_idx {
-                                if Self::equality_already_discovered(&seen_equalities, sel, val_l) {
-                                    continue;
-                                }
-                                let Some(mut reasons) = (if arr == base_r {
-                                    Some(Vec::new())
-                                } else {
-                                    proven_equal_reasons(arr, base_r)
-                                }) else {
-                                    continue;
-                                };
-                                reasons.extend(array_eq_reasons.clone());
-                                reasons.extend(lhs_res_reasons.clone());
-                                reasons.extend(rhs_res_reasons.clone());
-                                push_equality!(cross_chain_value_base, sel, val_l, reasons);
-                            }
-                        }
-                        (SelectResolution::Base(base_l), SelectResolution::Value(val_r)) => {
-                            for &(sel, arr) in &selects_at_idx {
-                                if Self::equality_already_discovered(&seen_equalities, sel, val_r) {
-                                    continue;
-                                }
-                                let Some(mut reasons) = (if arr == base_l {
-                                    Some(Vec::new())
-                                } else {
-                                    proven_equal_reasons(arr, base_l)
-                                }) else {
-                                    continue;
-                                };
-                                reasons.extend(array_eq_reasons.clone());
-                                reasons.extend(lhs_res_reasons.clone());
-                                reasons.extend(rhs_res_reasons.clone());
-                                push_equality!(cross_chain_base_value, sel, val_r, reasons);
-                            }
-                        }
-                        (SelectResolution::Value(val_l), SelectResolution::Value(val_r)) => {
-                            if Self::equality_already_discovered(&seen_equalities, val_l, val_r) {
-                                continue;
-                            }
-                            let mut reasons = array_eq_reasons.clone();
-                            reasons.extend(lhs_res_reasons.clone());
-                            reasons.extend(rhs_res_reasons.clone());
-                            push_equality!(cross_chain_value_value, val_l, val_r, reasons);
-                        }
-                        _ => {}
-                    }
-                }
+            prop_eq_stats::add(&prop_eq_stats::cross_chain_eq_pairs, eq_pairs.len() as u64);
+            prop_eq_stats::add(
+                &prop_eq_stats::cross_chain_indices,
+                select_indices.len() as u64,
+            );
+            let input = CrossChainInput {
+                select_indices: &select_indices,
+                index_to_selects: &index_to_selects,
+                eq_pairs: &eq_pairs,
+            };
+            let cross_chain_cand_t0 = std::time::Instant::now();
+            // Use the actual per-index resolutions and the emitter's exact
+            // alias predicate. The standing unfiltered oracle stays active.
+            let Some(candidates) = self.cross_chain_candidates(&input) else {
+                return result;
+            };
+            prop_eq_stats::add(
+                &prop_eq_stats::ns_cross_chain_candidates,
+                cross_chain_cand_t0.elapsed().as_nanos() as u64,
+            );
+            #[cfg(debug_assertions)]
+            let (seen_before, result_before_len) =
+                (seen_equalities.clone(), result.equalities.len());
+            if self.cross_chain_emit(&input, Some(&candidates), &mut seen_equalities, &mut result) {
+                return result;
             }
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                self.debug_cross_chain_matches_unfiltered(
+                    &input,
+                    &seen_before,
+                    result_before_len,
+                    &result
+                ),
+                "arrays: cross-chain candidate filter changed what is propagated"
+            );
         }
+        section_done!(ns_cross_chain, disc_cross_chain);
 
         // #8615: Check interrupt before store permutation equality detection.
         if self.is_interrupted() {
@@ -825,32 +1014,122 @@ impl ArraySolver<'_> {
             chain_candidates.sort();
             chain_candidates.dedup();
 
-            type ReasonedStoreMap = Vec<(TermId, TermId, Vec<TheoryLit>)>;
-            type ReasonedStoreChainEntry = (StoreChainEntry, Vec<TheoryLit>, ReasonedStoreMap);
+            /// `(array, base, plain map)` plus the shared
+            /// `(base, base reasons, reasoned map)` it was cut from.
+            type ReasonedStoreChainEntry = (StoreChainEntry, Rc<store_chain::StoreChainCollection>);
 
+            let store_perm_collect_t0 = std::time::Instant::now();
             let mut chain_maps: Vec<ReasonedStoreChainEntry> = Vec::new();
             for array_term in &chain_candidates {
-                if let Some((base, base_reasons, effective_map)) =
-                    self.collect_effective_stores(*array_term)
-                {
+                if let Some(chain) = self.collect_effective_stores_shared(*array_term) {
+                    let (base, _, effective_map) = &*chain;
                     if !effective_map.is_empty() {
                         let plain_effective_map = effective_map
                             .iter()
                             .map(|(idx, val, _)| (*idx, *val))
                             .collect();
-                        chain_maps.push((
-                            (*array_term, base, plain_effective_map),
-                            base_reasons,
-                            effective_map,
-                        ));
+                        chain_maps.push(((*array_term, *base, plain_effective_map), chain));
                     }
                 }
             }
 
+            prop_eq_stats::add(
+                &prop_eq_stats::store_perm_chain_maps,
+                chain_maps.len() as u64,
+            );
+            prop_eq_stats::add(
+                &prop_eq_stats::ns_store_perm_collect,
+                store_perm_collect_t0.elapsed().as_nanos() as u64,
+            );
             let mut store_perm_forest = StorePermutationForest::new(chain_maps.len());
 
             // Group by base array and compare effective maps
-            chain_maps.sort_by_key(|&((_, base, _), _, _)| base.0);
+            chain_maps.sort_by_key(|((_, base, _), _)| base.0);
+            // Exact pre-filter for `effective_stores_match_with_reasons`: a
+            // match pairs every (index, value) of one map with an (index,
+            // value) of the other whose index AND value
+            // `explain_equal_if_provable` proves equal. `index_conflict_partition`
+            // is the standing sound over-approximation of that relation (every
+            // provably-equal pair shares a block), so two maps whose sorted
+            // (index block, value block) multisets differ cannot match and the
+            // matcher would return `None`. Only signature-equal pairs run it.
+            // Measured on QF_AUFNIA s3_srvr.06 (--z3-mode -T:10): 49.8 M pair
+            // visits per 10 s, 23.5 M of them with same-length maps handed to
+            // the O(m^2) reason-cloning matcher, for 1 store-permutation
+            // equality.
+            let store_perm_signatures: Vec<Vec<(TermId, TermId)>> = {
+                let mut terms: Vec<TermId> = chain_maps
+                    .iter()
+                    .flat_map(|entry| (entry.0).2.iter().flat_map(|&(idx, val)| [idx, val]))
+                    .collect();
+                terms.sort_unstable_by_key(|t| t.0);
+                terms.dedup();
+                let blocks = self.index_conflict_partition(&terms);
+                chain_maps
+                    .iter()
+                    .map(|entry| {
+                        let mut sig: Vec<(TermId, TermId)> = (entry.0)
+                            .2
+                            .iter()
+                            .map(|&(idx, val)| (blocks[&idx], blocks[&val]))
+                            .collect();
+                        sig.sort_unstable();
+                        sig
+                    })
+                    .collect()
+            };
+            // The two pair loops below used to enumerate every pair of chain
+            // maps (O(n^2), 578 k visits per call on s3_srvr.06) to do three
+            // things per pair: union the forest when the pair was already
+            // sent, skip it when the forest already connects it, and run the
+            // matcher. Only two kinds of pair can change anything: a pair in
+            // `seen_equalities` (its union), and a pair with equal signatures
+            // (the only ones the matcher can accept). Every other pair is a
+            // no-op, so they are never visited; the two event kinds are
+            // merged per `a` in ascending `b` order, exactly the order the
+            // full enumeration visited them, and the "already sent" check
+            // keeps priority over the matcher as before. `seen_equalities`
+            // only grows by the pair being pushed, which is never revisited,
+            // so the partner index built here is the section-long truth.
+            let store_perm_pos: HashMap<TermId, usize> = chain_maps
+                .iter()
+                .enumerate()
+                .map(|(pos, entry)| ((entry.0).0, pos))
+                .collect();
+            let mut store_perm_partners: Vec<Vec<usize>> = vec![Vec::new(); chain_maps.len()];
+            for &(x, y) in seen_equalities.iter() {
+                if let (Some(&p), Some(&q)) = (store_perm_pos.get(&x), store_perm_pos.get(&y)) {
+                    let (p, q) = if p < q { (p, q) } else { (q, p) };
+                    if p != q {
+                        store_perm_partners[p].push(q);
+                    }
+                }
+            }
+            let mut store_perm_sig_groups: HashMap<&Vec<(TermId, TermId)>, Vec<usize>> =
+                HashMap::default();
+            for (pos, sig) in store_perm_signatures.iter().enumerate() {
+                store_perm_sig_groups.entry(sig).or_default().push(pos);
+            }
+            // Events for `a`: ascending `b > a` within `[a + 1, upper)`, each
+            // tagged already-sent (true) or signature candidate (false); a
+            // pair that is both is already-sent.
+            let store_perm_events = |a: usize, upper: usize| -> Vec<(usize, bool)> {
+                let mut events: Vec<(usize, bool)> = store_perm_partners[a]
+                    .iter()
+                    .copied()
+                    .filter(|&b| b < upper)
+                    .map(|b| (b, true))
+                    .collect();
+                for &b in &store_perm_sig_groups[&store_perm_signatures[a]] {
+                    if b > a && b < upper && !store_perm_partners[a].contains(&b) {
+                        events.push((b, false));
+                    }
+                }
+                events.sort_unstable();
+                events.dedup();
+                events
+            };
+
             let mut i = 0;
             while i < chain_maps.len() {
                 // #8615: Check interrupt in store permutation O(n^2) loop.
@@ -863,31 +1142,41 @@ impl ArraySolver<'_> {
                     j += 1;
                 }
                 for a in i..j {
-                    for b in (a + 1)..j {
+                    for (b, already) in store_perm_events(a, j) {
                         let base_a = (chain_maps[a].0).1;
                         let base_b = (chain_maps[b].0).1;
-                        if Self::equality_already_discovered(
-                            &seen_equalities,
-                            (chain_maps[a].0).0,
-                            (chain_maps[b].0).0,
-                        ) {
+                        if already {
+                            debug_assert!(Self::equality_already_discovered(
+                                &seen_equalities,
+                                (chain_maps[a].0).0,
+                                (chain_maps[b].0).0,
+                            ));
                             store_perm_forest.union(a, b);
                             continue;
                         }
                         if store_perm_forest.connected(a, b) {
                             continue;
                         }
-                        let Some(mut reasons) = self.effective_stores_match_with_reasons(
-                            &chain_maps[a].2,
-                            &chain_maps[b].2,
-                        ) else {
+                        prop_eq_stats::add(&prop_eq_stats::store_perm_pairs, 1);
+                        // The partial maps only nominate the pair; the
+                        // equality itself is emitted from the COMPLETE maps
+                        // (`complete_store_permutation_reasons`).
+                        if self
+                            .effective_stores_match_with_reasons(
+                                &(chain_maps[a].1).2,
+                                &(chain_maps[b].1).2,
+                            )
+                            .is_none()
+                        {
                             continue;
-                        };
-                        let Some(base_reasons) = proven_equal_reasons(base_a, base_b) else {
+                        }
+                        if proven_equal_reasons(base_a, base_b).is_none() {
                             continue;
-                        };
-                        let indices_decided =
-                            self.store_map_indices_are_decided(&chain_maps[a].2, &chain_maps[b].2);
+                        }
+                        let indices_decided = self.store_map_indices_are_decided(
+                            &(chain_maps[a].1).2,
+                            &(chain_maps[b].1).2,
+                        );
                         if indices_decided {
                             let lhs_array = (chain_maps[a].0).0;
                             let rhs_array = (chain_maps[b].0).0;
@@ -909,41 +1198,13 @@ impl ArraySolver<'_> {
                                 store_perm_forest.union(a, b);
                                 continue;
                             }
-
-                            let Some((complete_base_a, mut complete_reasons_a, complete_map_a)) =
-                                self.collect_complete_effective_stores(lhs_array)
-                            else {
-                                continue;
-                            };
-                            let Some((complete_base_b, mut complete_reasons_b, complete_map_b)) =
-                                self.collect_complete_effective_stores(rhs_array)
-                            else {
-                                continue;
-                            };
-                            let Some(mut complete_base_reasons) =
-                                self.explain_equal_if_provable(complete_base_a, complete_base_b)
-                            else {
-                                continue;
-                            };
-                            let Some(mut complete_map_reasons) = self
-                                .effective_stores_match_with_reasons(
-                                    &complete_map_a,
-                                    &complete_map_b,
-                                )
-                            else {
-                                continue;
-                            };
-
-                            reasons.clear();
-                            reasons.append(&mut complete_reasons_a);
-                            reasons.append(&mut complete_reasons_b);
-                            reasons.append(&mut complete_base_reasons);
-                            reasons.append(&mut complete_map_reasons);
-                        } else {
-                            reasons.extend(chain_maps[a].1.clone());
-                            reasons.extend(chain_maps[b].1.clone());
-                            reasons.extend(base_reasons);
                         }
+                        let Some(reasons) = self.complete_store_permutation_reasons(
+                            (chain_maps[a].0).0,
+                            (chain_maps[b].0).0,
+                        ) else {
+                            continue;
+                        };
                         push_equality!(
                             store_permutation_same_base,
                             (chain_maps[a].0).0,
@@ -962,34 +1223,43 @@ impl ArraySolver<'_> {
                 if self.is_interrupted() {
                     return result;
                 }
-                for b in (a + 1)..chain_maps.len() {
+                for (b, already) in store_perm_events(a, chain_maps.len()) {
                     let base_a = (chain_maps[a].0).1;
                     let base_b = (chain_maps[b].0).1;
                     if base_a == base_b {
                         continue;
                     }
-                    if Self::equality_already_discovered(
-                        &seen_equalities,
-                        (chain_maps[a].0).0,
-                        (chain_maps[b].0).0,
-                    ) {
+                    if already {
+                        debug_assert!(Self::equality_already_discovered(
+                            &seen_equalities,
+                            (chain_maps[a].0).0,
+                            (chain_maps[b].0).0,
+                        ));
                         store_perm_forest.union(a, b);
                         continue;
                     }
                     if store_perm_forest.connected(a, b) {
                         continue;
                     }
-                    let Some(mut reasons) = self
-                        .effective_stores_match_with_reasons(&chain_maps[a].2, &chain_maps[b].2)
-                    else {
+                    prop_eq_stats::add(&prop_eq_stats::store_perm_pairs, 1);
+                    if self
+                        .effective_stores_match_with_reasons(
+                            &(chain_maps[a].1).2,
+                            &(chain_maps[b].1).2,
+                        )
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    if proven_equal_reasons(base_a, base_b).is_none() {
+                        continue;
+                    }
+                    let Some(reasons) = self.complete_store_permutation_reasons(
+                        (chain_maps[a].0).0,
+                        (chain_maps[b].0).0,
+                    ) else {
                         continue;
                     };
-                    let Some(base_reasons) = proven_equal_reasons(base_a, base_b) else {
-                        continue;
-                    };
-                    reasons.extend(chain_maps[a].1.clone());
-                    reasons.extend(chain_maps[b].1.clone());
-                    reasons.extend(base_reasons);
                     push_equality!(
                         store_permutation_cross_base,
                         (chain_maps[a].0).0,
@@ -1000,6 +1270,14 @@ impl ArraySolver<'_> {
                 }
             }
         }
+
+        section_done!(ns_store_perm, disc_store_perm);
+        let _ = (prop_eq_section, prop_eq_section_disc);
+        prop_eq_stats::add(&prop_eq_stats::discovered, result.equalities.len() as u64);
+        prop_eq_stats::add(
+            &prop_eq_stats::ns_total,
+            prop_eq_t0.elapsed().as_nanos() as u64,
+        );
 
         // Remember which equalities were sent so fresh AUFLIA combiners can
         // replay them and seed the array duplicate filter. Empty reasons are
@@ -1013,6 +1291,7 @@ impl ArraySolver<'_> {
         self.sent_equalities = seen_equalities;
         // #6546: Save snapshot so the next call short-circuits if nothing changed.
         self.prop_eq_snapshot = Some(current_snapshot);
+        self.prop_eq_last_scan_snapshot = Some(current_snapshot);
         result
     }
 }

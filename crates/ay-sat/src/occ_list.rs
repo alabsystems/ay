@@ -10,7 +10,12 @@
 //! Position maps (`pos_map`) give O(1) clause-index-to-position lookup,
 //! replacing the O(n) `iter().position()` scan in `remove_clause`.
 //! This matters on high-occurrence literals (hundreds of entries) during
-//! BVE, BCE, and subsumption passes. See #3036 Finding 3.
+//! BVE, BCE, and subsumption passes. See #3036 Finding 3. A literal gets its
+//! map only once its list outgrows [`POS_MAP_MIN_LEN`]; shorter lists are
+//! scanned, which finds the same position. A map per literal slot cost 20-40
+//! bytes per occurrence on top of the list's 8: factoring's occurrence list
+//! alone took over 4 GB on a 1.5M-variable, 8.6M-clause formula (da34db9e),
+//! which ended in a memout 4 s after parsing (Kissat answers it in 1,029 s).
 
 use crate::literal::Literal;
 
@@ -19,6 +24,10 @@ use crate::literal::Literal;
 /// Uses `hashbrown::HashMap` with `foldhash` for fast integer hashing,
 /// matching the rest of ay-sat's hash map usage (see `kani_compat.rs`).
 type PosMap = hashbrown::HashMap<usize, usize, foldhash::fast::FixedState>;
+
+/// Occurrence lists up to this length are searched linearly instead of
+/// through a position map (a map is built when a list outgrows it).
+const POS_MAP_MIN_LEN: usize = 32;
 
 /// Sentinel partner literal stored in `partner` for occurrence entries whose
 /// clause is NOT binary (size != 2). Keeps `partner[lit]` positionally aligned
@@ -35,9 +44,11 @@ pub(crate) const PARTNER_SENTINEL: Literal = Literal(u32::MAX);
 pub(crate) struct OccList {
     /// For each literal index, the list of clause indices containing that literal.
     pub(crate) occ: Vec<Vec<usize>>,
-    /// For each literal index, maps clause_idx -> position in `occ[lit_index]`.
-    /// Maintained in sync with `occ` for O(1) position lookup in `remove_clause`.
-    pos_map: Vec<PosMap>,
+    /// For each literal index with a long list, maps clause_idx -> position in
+    /// `occ[lit_index]`, maintained in sync with `occ` for O(1) position
+    /// lookup in `remove_clause`. `None` for lists that never outgrew
+    /// [`POS_MAP_MIN_LEN`], which are scanned.
+    pos_map: Vec<Option<Box<PosMap>>>,
     /// Optional parallel array to `occ` (factor pass only): `partner[l][i]` is
     /// the OTHER literal of `occ[l][i]`'s clause when that clause is binary,
     /// else [`PARTNER_SENTINEL`]. Lets `find_next_factor` read a binary
@@ -68,7 +79,7 @@ impl OccList {
         let n = num_vars * 2;
         Self {
             occ: vec![Vec::new(); n],
-            pos_map: (0..n).map(|_| PosMap::default()).collect(),
+            pos_map: (0..n).map(|_| None).collect(),
             partner: Vec::new(),
             track_partners: false,
             track_pos_map: true,
@@ -128,9 +139,8 @@ impl OccList {
             self.occ.resize_with(target, Vec::new);
         }
         if self.track_pos_map {
-            while self.pos_map.len() < target {
-                self.pos_map.push(PosMap::default());
-            }
+            self.pos_map
+                .resize_with(target.max(self.pos_map.len()), || None);
         }
         if self.track_partners {
             // Keep `partner` length equal to `occ` length (both index literal
@@ -150,9 +160,8 @@ impl OccList {
         let target = idx + 1;
         self.occ.resize_with(target, Vec::new);
         if self.track_pos_map {
-            while self.pos_map.len() < target {
-                self.pos_map.push(PosMap::default());
-            }
+            self.pos_map
+                .resize_with(target.max(self.pos_map.len()), || None);
         }
         if self.track_partners {
             self.partner.resize_with(self.occ.len(), Vec::new);
@@ -179,7 +188,15 @@ impl OccList {
                 let pos = self.occ[idx].len();
                 self.occ[idx].push(clause_idx);
                 if self.track_pos_map {
-                    self.pos_map[idx].insert(clause_idx, pos);
+                    match &mut self.pos_map[idx] {
+                        Some(map) => {
+                            map.insert(clause_idx, pos);
+                        }
+                        None if pos >= POS_MAP_MIN_LEN => {
+                            self.pos_map[idx] = Some(Self::build_pos_map(&self.occ[idx]));
+                        }
+                        None => {}
+                    }
                 }
                 if track {
                     // Store the other literal for binaries (partner scan reads
@@ -211,13 +228,19 @@ impl OccList {
         for &lit in literals {
             let idx = lit.index();
             if idx < self.occ.len() {
-                if let Some(pos) = self.pos_map[idx].remove(&clause_idx) {
+                let found = match &mut self.pos_map[idx] {
+                    Some(map) => map.remove(&clause_idx),
+                    None => self.occ[idx].iter().position(|&c| c == clause_idx),
+                };
+                if let Some(pos) = found {
                     let last = self.occ[idx].len() - 1;
                     if pos < last {
                         // swap_remove moves the last element into `pos`.
                         // Update the moved element's position in the map first.
                         let moved_clause = self.occ[idx][last];
-                        self.pos_map[idx].insert(moved_clause, pos);
+                        if let Some(map) = &mut self.pos_map[idx] {
+                            map.insert(moved_clause, pos);
+                        }
                     }
                     self.occ[idx].swap_remove(pos);
                     if track {
@@ -247,7 +270,20 @@ impl OccList {
             "contains requires the pos_map index (not built for occ-only lists)"
         );
         let idx = lit.index();
-        idx < self.pos_map.len() && self.pos_map[idx].contains_key(&clause_idx)
+        match self.pos_map.get(idx) {
+            Some(Some(map)) => map.contains_key(&clause_idx),
+            Some(None) => self.occ[idx].contains(&clause_idx),
+            None => false,
+        }
+    }
+
+    /// Position index of `list`, built when it outgrows [`POS_MAP_MIN_LEN`].
+    fn build_pos_map(list: &[usize]) -> Box<PosMap> {
+        let mut map = PosMap::with_capacity_and_hasher(list.len() * 2, Default::default());
+        for (pos, &clause_idx) in list.iter().enumerate() {
+            map.insert(clause_idx, pos);
+        }
+        Box::new(map)
     }
 
     /// Get number of clauses containing a literal.
@@ -274,8 +310,10 @@ impl OccList {
             let clause_at_0 = self.occ[idx][0];
             let clause_at_pos = self.occ[idx][pos];
             self.occ[idx].swap(0, pos);
-            self.pos_map[idx].insert(clause_at_0, pos);
-            self.pos_map[idx].insert(clause_at_pos, 0);
+            if let Some(map) = &mut self.pos_map[idx] {
+                map.insert(clause_at_0, pos);
+                map.insert(clause_at_pos, 0);
+            }
         }
     }
 
@@ -299,10 +337,8 @@ impl OccList {
             if list.len() > 1 {
                 list.sort_unstable_by_key(|&clause_idx| key_fn(clause_idx));
                 // Rebuild position map for this literal after sorting.
-                let map = &mut self.pos_map[lit_idx];
-                map.clear();
-                for (pos, &clause_idx) in list.iter().enumerate() {
-                    map.insert(clause_idx, pos);
+                if self.pos_map[lit_idx].is_some() {
+                    self.pos_map[lit_idx] = Some(Self::build_pos_map(list));
                 }
             }
         }
@@ -329,15 +365,13 @@ impl OccList {
         self.occ.clear();
         self.occ.resize_with(other.occ.len(), Vec::new);
         self.pos_map.clear();
-        self.pos_map.resize_with(other.occ.len(), PosMap::default);
+        self.pos_map.resize_with(other.occ.len(), || None);
         for (lit_idx, (dst, src)) in self.occ.iter_mut().zip(other.occ.iter()).enumerate() {
             dst.clear();
             dst.extend_from_slice(src);
-            // Rebuild position map from the copied vec.
-            let map = &mut self.pos_map[lit_idx];
-            map.clear();
-            for (pos, &clause_idx) in dst.iter().enumerate() {
-                map.insert(clause_idx, pos);
+            // Rebuild the position map of a long copied list.
+            if dst.len() > POS_MAP_MIN_LEN {
+                self.pos_map[lit_idx] = Some(Self::build_pos_map(dst));
             }
         }
     }
@@ -348,7 +382,7 @@ impl OccList {
             list.clear();
         }
         for map in &mut self.pos_map {
-            map.clear();
+            *map = None;
         }
         if self.track_partners {
             for list in &mut self.partner {

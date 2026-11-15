@@ -337,7 +337,7 @@ impl Solver {
                 // Level-0 conflict during reset means formula is UNSAT.
                 // Set the empty clause flag so the caller detects it.
                 self.record_level0_conflict_chain(conflict_ref);
-                self.has_empty_clause = true;
+                self.raise_empty_clause_flag();
             }
         }
     }
@@ -768,9 +768,8 @@ impl Solver {
             .wrapping_mul(31)
             .wrapping_add(self.num_original_clauses as u64);
 
-        // Run walk to find good phases (written to self.phase only).
-        // During preprocessing, no learned clauses exist yet, so
-        // irredundant_only is the correct filter.
+        // Walk for good phases (self.phase only); preprocessing has no learned
+        // clauses yet, so irredundant_only is the right filter.
         crate::walk::walk(
             &self.arena,
             self.num_vars,
@@ -780,6 +779,7 @@ impl Solver {
             seed,
             self.phase_init.walk_limit,
             crate::walk::WalkFilter::irredundant_only(),
+            None,
         )
     }
 

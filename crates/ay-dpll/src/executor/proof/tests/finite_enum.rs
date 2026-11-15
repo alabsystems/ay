@@ -201,6 +201,18 @@ fn oversized_finite_enum_exception_is_internal_strict_and_second_build_stable() 
     assert!(exec
         .finite_enum_surface_overrides_for_proof(&original)
         .is_some());
+    // D7: the paired export renders on the sealed finite-enum table and
+    // reports that table's surface, the one the artifact discloses.
+    let (document, surface) = exec
+        .try_export_last_proof_alethe_for_problem_scope_with_carcara_surface()
+        .expect("sealed finite-enum proof exports")
+        .expect("within the bounded rendering envelope");
+    assert_eq!(
+        Some(document),
+        exec.try_export_last_proof_alethe_for_problem_scope()
+            .and_then(Result::ok)
+    );
+    assert_eq!(Some(surface), exec.carcara_surface_for_last_export(false));
 
     // Even a byte-for-byte proof clone loses the capability after a new public
     // decision rotates the opaque query epoch. The raw diagnostic remains so
@@ -212,6 +224,9 @@ fn oversized_finite_enum_exception_is_internal_strict_and_second_build_stable() 
     assert!(exec.last_proof.is_some(), "staling retains the raw proof");
     assert!(exec
         .try_export_last_proof_alethe_for_problem_scope()
+        .is_none());
+    assert!(exec
+        .try_export_last_proof_alethe_for_problem_scope_with_carcara_surface()
         .is_none());
     let mut stale_output = Vec::new();
     assert!(exec

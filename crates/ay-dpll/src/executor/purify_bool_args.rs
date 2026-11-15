@@ -23,6 +23,8 @@ use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::term::{Symbol, TermData, TermId, TermStore};
 use ay_core::Sort;
 
+mod closure;
+
 /// Builtin Boolean/term operators whose applications are owned by the SAT
 /// layer rather than treated as uninterpreted functions.
 fn is_builtin(name: &str) -> bool {
@@ -83,12 +85,14 @@ fn needs_proxy(terms: &TermStore, arg: TermId) -> bool {
 
 /// Collect every compound Boolean term that appears as an argument to a
 /// (non-builtin) uninterpreted function application. Does not descend into
-/// quantifier bodies, so collected terms are closed (capture-safe to hoist).
+/// quantifier bodies. These are candidates: retained raw binders require the
+/// complete occurrence-sensitive closure admission before global hoisting.
 fn collect(
     terms: &TermStore,
     root: TermId,
     seen: &mut DetHashSet<TermId>,
     targets: &mut DetHashSet<TermId>,
+    retained_binders: &mut bool,
 ) {
     if !seen.insert(root) {
         return;
@@ -101,29 +105,30 @@ fn collect(
                 if uf && needs_proxy(terms, a) {
                     targets.insert(a);
                 }
-                collect(terms, a, seen, targets);
+                collect(terms, a, seen, targets, retained_binders);
             }
         }
-        TermData::Not(x) => collect(terms, x, seen, targets),
+        TermData::Not(x) => collect(terms, x, seen, targets, retained_binders),
         TermData::Ite(c, t, e) => {
-            collect(terms, c, seen, targets);
-            collect(terms, t, seen, targets);
-            collect(terms, e, seen, targets);
+            collect(terms, c, seen, targets, retained_binders);
+            collect(terms, t, seen, targets, retained_binders);
+            collect(terms, e, seen, targets, retained_binders);
         }
         TermData::Let(binds, body) => {
+            *retained_binders = true;
             for (_, v) in binds {
-                collect(terms, v, seen, targets);
+                collect(terms, v, seen, targets, retained_binders);
             }
-            collect(terms, body, seen, targets);
+            collect(terms, body, seen, targets, retained_binders);
         }
         // Do not descend into quantifier bodies: a compound Bool arg there may
         // reference bound variables (not a closed term) and must not be hoisted
         // to a global proxy. The target divisions (QF_UF / QF_UFLIA) are
         // quantifier-free.
-        TermData::Forall(..) | TermData::Exists(..) => {}
-        // TermData is #[non_exhaustive]; unknown constructs are left
-        // un-purified (conservative — never unsound).
-        _ => {}
+        TermData::Forall(..) | TermData::Exists(..) => *retained_binders = true,
+        // Unknown binding syntax requires the closure analysis to decline the
+        // whole rewrite; it must not be mistaken for a free-name-empty term.
+        _ => *retained_binders = true,
     }
 }
 
@@ -148,12 +153,26 @@ pub(crate) fn purify_bool_args(
 ) -> DetHashMap<TermId, TermId> {
     let mut seen = DetHashSet::default();
     let mut targets = DetHashSet::default();
+    let mut retained_binders = false;
     for &root in assertions.iter() {
-        collect(terms, root, &mut seen, &mut targets);
+        collect(terms, root, &mut seen, &mut targets, &mut retained_binders);
     }
     if targets.is_empty() {
         return DetHashMap::default();
     }
+    // Ground inputs retain the existing allocation/rewrite path. Raw binders
+    // require one complete immutable admission before any proxy is allocated.
+    let binder_names = if retained_binders {
+        let Some(names) = closure::retain_closed(terms, assertions, &mut targets) else {
+            return DetHashMap::default();
+        };
+        if targets.is_empty() {
+            return DetHashMap::default();
+        }
+        names
+    } else {
+        DetHashSet::default()
+    };
 
     // Deterministic order for fresh-var allocation.
     let mut ordered: Vec<TermId> = targets.iter().copied().collect();
@@ -162,7 +181,19 @@ pub(crate) fn purify_bool_args(
     let mut map: DetHashMap<TermId, TermId> = DetHashMap::default();
     let mut defs: Vec<TermId> = Vec::with_capacity(ordered.len());
     for b in ordered {
-        let p = terms.mk_fresh_var("boolarg", Sort::Bool);
+        let p = loop {
+            let proxy = terms.mk_fresh_var("boolarg", Sort::Bool);
+            let TermData::Var(name, _) = terms.get(proxy) else {
+                // Constructor shape is not permission to rewrite on an
+                // unexpected future representation. No root has changed yet.
+                return DetHashMap::default();
+            };
+            // Unused raw binder strings need not occur in the variable-name
+            // registry mk_fresh_var checks. Do not insert a captured proxy.
+            if !binder_names.contains(name.as_str()) {
+                break proxy;
+            }
+        };
         map.insert(b, p);
         // Defining constraint p = b (uses the original, un-rewritten b).
         defs.push(terms.mk_eq(p, b));
@@ -192,6 +223,63 @@ pub(crate) fn purify_bool_args(
             )
     });
     rewritten
+}
+
+/// [`purify_bool_args`] over the assertions NOT in `settled` only.
+///
+/// For assertions added after the check-sat purification (quantifier
+/// instances). The settled assertions, already purified, are left exactly as
+/// they are: the new proxies are substituted into the new assertions alone,
+/// so no earlier assertion or proxy definition is rewritten. Returns the
+/// orphan index of the new rewrites, for the caller to add to its own.
+pub(crate) fn purify_new_bool_args(
+    terms: &mut TermStore,
+    assertions: &mut Vec<TermId>,
+    settled: &DetHashSet<TermId>,
+) -> DetHashMap<TermId, TermId> {
+    let fresh: Vec<usize> = (0..assertions.len())
+        .filter(|&i| !settled.contains(&assertions[i]))
+        .collect();
+    if fresh.is_empty() {
+        return DetHashMap::default();
+    }
+    let mut window: Vec<TermId> = fresh.iter().map(|&i| assertions[i]).collect();
+    let orphans = purify_bool_args(terms, &mut window);
+    for (slot, &i) in fresh.iter().enumerate() {
+        assertions[i] = window[slot];
+    }
+    assertions.extend_from_slice(&window[fresh.len()..]);
+    orphans
+}
+
+impl crate::executor::Executor {
+    /// [`Self::process_quantifiers`], then, in a solve that publishes without
+    /// a proof, [`purify_new_bool_args`] over the assertions it added.
+    ///
+    /// The instances quantifier preprocessing adds are built after check-sat's
+    /// Boolean-argument purification, so a compound Boolean argument of an
+    /// instance (`(B (< 10 (%I t)))` from a definition's body) would reach EUF
+    /// as an argument it cannot congruence-close over. The already-purified
+    /// assertions are left untouched, and the new rewrites join the orphan
+    /// index the model gate reads.
+    ///
+    /// A proof-carrying solve keeps the instances as they are: a refutation
+    /// through an instance's proxy rests on an EUF lemma the strict proof
+    /// checker rejects (`EufCongruentPred` over a proxy predicate), so that
+    /// solve would end `unknown` on queries it refutes unpurified.
+    pub(in crate::executor) fn process_quantifiers_purifying_bool_args(
+        &mut self,
+    ) -> crate::executor::quantifier_loop::QuantifierProcessingResult {
+        if !self.competition_shedding_active() {
+            return self.process_quantifiers();
+        }
+        let settled: DetHashSet<TermId> = self.ctx.assertions.iter().copied().collect();
+        let processed = self.process_quantifiers();
+        let instance_orphans =
+            purify_new_bool_args(&mut self.ctx.terms, &mut self.ctx.assertions, &settled);
+        self.bool_arg_orphan_index.extend(instance_orphans);
+        processed
+    }
 }
 
 #[cfg(test)]

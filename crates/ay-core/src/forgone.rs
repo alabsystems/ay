@@ -91,6 +91,14 @@ pub const SITES: &[Site] = &[
         // largest problems rather than the smallest.
         unit: "mean constraint nodes above the ceiling",
     },
+    Site {
+        gate: "PHASE_EPOCH_MIN_ATOMS (ay-nra theory_impl)",
+        unit: "SAT-registered atoms below the floor",
+    },
+    Site {
+        gate: "PHASE_EPOCH_MIN_ATOMS (ay-nia theory_impl)",
+        unit: "SAT-registered atoms below the floor",
+    },
 ];
 
 /// Index of the ay-dpll combiner's phase-epoch gate.
@@ -106,8 +114,14 @@ pub const PB_ONE_ROW_KNAP: usize = 3;
 pub const PB_PERSISTENT_BOUND: usize = 4;
 /// Index of ay-chc's condense gate.
 pub const CHC_CONDENSE: usize = 5;
+/// Index of the ay-nra phase-epoch gate — the third and fourth declarations of
+/// the SAME constant (#nonlinear-phase-hints), charged apart so the duplication
+/// stays visible in the report.
+pub const PHASE_EPOCH_NRA: usize = 6;
+/// Index of the ay-nia phase-epoch gate.
+pub const PHASE_EPOCH_NIA: usize = 7;
 
-const N: usize = 6;
+const N: usize = 8;
 
 /// Summed cost charged to the cheap branch, per site.
 static COSTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -170,10 +184,16 @@ mod tests {
             PB_ONE_ROW_KNAP,
             PB_PERSISTENT_BOUND,
             CHC_CONDENSE,
+            PHASE_EPOCH_NRA,
+            PHASE_EPOCH_NIA,
         ];
         let mut seen = idx;
         seen.sort_unstable();
-        assert_eq!(seen, [0, 1, 2, 3, 4, 5], "site indices must be distinct");
+        assert_eq!(
+            seen,
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            "site indices must be distinct"
+        );
     }
 
     /// Hits and cost are separate because they answer different questions: hits is a

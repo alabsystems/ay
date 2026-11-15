@@ -219,6 +219,12 @@ impl BVE {
         );
     }
 
+    /// The budget mode `restore_budget_mode` takes back: the growth bound,
+    /// whether it is fastelim's and whether the quick pass is on.
+    pub(crate) fn budget_mode(&self) -> (usize, bool, bool) {
+        (self.growth_bound, self.fastelim_mode, self.quick_elim_mode)
+    }
+
     /// Restore a caller's BVE budget mode after a bounded private route.
     pub(crate) fn restore_budget_mode(
         &mut self,

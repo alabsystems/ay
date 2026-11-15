@@ -111,6 +111,41 @@ pub(crate) fn build_linear_inequality(
     })
 }
 
+/// [`build_linear_inequality`] in the constraint's own arithmetic sort.
+///
+/// Workstream D (CHC-COMP 2026, `DESIGN_lra_interp_tpa.md` §4.1): a combination
+/// of `Real` rows must be emitted over `Real` variables with exact rational
+/// coefficients (`farkas::build_linear_inequality_sorted`, no denominator
+/// clearing, no rounding). Emitting it as an `Int` atom mis-types the Craig
+/// validation query and silently loses the candidate. `Int` (and any
+/// non-`Real` sort) keeps the historical emission byte for byte.
+pub(crate) fn build_linear_inequality_in_sort(
+    coeffs: &FxHashMap<String, Rational64>,
+    bound: Rational64,
+    strict: bool,
+    sort: &ChcSort,
+) -> Option<ChcExpr> {
+    if matches!(sort, ChcSort::Real) {
+        crate::farkas::build_linear_inequality_sorted(coeffs, bound, strict, ChcSort::Real)
+    } else {
+        build_linear_inequality(coeffs, bound, strict)
+    }
+}
+
+/// The sort of a combination of rows: `Real` as soon as one row is `Real`.
+pub(crate) fn combined_row_sort<'c>(
+    rows: impl IntoIterator<Item = &'c LinearConstraint>,
+) -> ChcSort {
+    if rows
+        .into_iter()
+        .any(|row| matches!(row.var_sort, ChcSort::Real))
+    {
+        ChcSort::Real
+    } else {
+        ChcSort::Int
+    }
+}
+
 /// Check if an expression is an equality constraint (not a disequality).
 pub(super) fn is_equality_constraint(expr: &ChcExpr) -> bool {
     match expr {
@@ -126,9 +161,13 @@ pub(super) fn is_equality_constraint(expr: &ChcExpr) -> bool {
 /// For integer arithmetic, `t < c` is equivalent to `t <= c - 1`.
 /// This mirrors OpenSMT's LIA interpolator strengthening pass and keeps
 /// decomposition in the non-strict domain.
+///
+/// Only `Int` rows: over the reals `x < 5` does not imply `x <= 4` (x = 4.5),
+/// so a `Real` row with integral coefficients is returned unchanged
+/// (Workstream D sort fix).
 pub(crate) fn strengthen_strict_lia_constraint(mut c: LinearConstraint) -> LinearConstraint {
     let is_integer_linear = *c.bound.denom() == 1 && c.coeffs.values().all(|v| *v.denom() == 1);
-    if c.strict && is_integer_linear {
+    if c.strict && is_integer_linear && matches!(c.var_sort, ChcSort::Int) {
         c.bound -= Rational64::from_integer(1);
         c.strict = false;
     }
@@ -178,3 +217,8 @@ pub(super) fn weighted_sum_linear_constraints(
     combined_coeffs.retain(|_, c| *c != Rational64::from_integer(0));
     Some((combined_coeffs, combined_bound, combined_strict))
 }
+
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[cfg(test)]
+#[path = "linear_tests.rs"]
+mod tests;

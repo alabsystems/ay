@@ -83,24 +83,39 @@ pub(crate) struct MinimizationState {
     pub minimize_level_seen: Vec<LevelSeen>,
     /// Sparse cleanup list for minimize_level_seen.
     pub minimize_levels_to_clear: Vec<u32>,
+    /// `--sat-shrink-removable-kissat`: variables the current block-UIP walk
+    /// popped, the UIP last (Kissat's `shrinkable` stack). Cleared per walk.
+    pub shrink_walked: Vec<usize>,
 }
 
 impl MinimizationState {
     /// Create minimization state for `num_vars` variables.
     pub(crate) fn new(num_vars: usize) -> Self {
-        Self {
-            minimize_flags: vec![0u8; num_vars],
-            minimize_to_clear: Vec::with_capacity(num_vars),
+        match Self::build_admitted(num_vars, &super::construction::Ordinary) {
+            Ok(state) => state,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(super) fn build_admitted<A: super::construction::Construction>(
+        num_vars: usize,
+        a: &A,
+    ) -> Result<Self, A::Error> {
+        a.metadata::<Self>()?;
+        Ok(Self {
+            minimize_flags: a.filled(num_vars, 0u8)?,
+            minimize_to_clear: a.reserved(num_vars)?,
             level_seen: Vec::new(),
             level_seen_to_clear: Vec::new(),
             level_seen_repeated_non_uip: false,
             level_seen_flag_valid: false,
-            lrat_to_clear: Vec::with_capacity(num_vars),
+            lrat_to_clear: a.reserved(num_vars)?,
             lrat_original_learned_buf: Vec::new(),
             minimize_depth_limit: 1000, // CaDiCaL default
-            minimize_level_seen: vec![LevelSeen::EMPTY; num_vars + 1],
-            minimize_levels_to_clear: Vec::with_capacity(64),
-        }
+            minimize_level_seen: a.filled(num_vars + 1, LevelSeen::EMPTY)?,
+            minimize_levels_to_clear: a.reserved(64)?,
+            shrink_walked: Vec::new(),
+        })
     }
 
     /// Grow the analysis-phase per-level tracking to cover `lvl`.

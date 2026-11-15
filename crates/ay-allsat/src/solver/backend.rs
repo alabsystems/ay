@@ -6,7 +6,17 @@
 
 use ay_sat::{Literal, Solver as SatSolver};
 
-use super::{AllSatInputError, AllSatSolver, Solution, SolutionIndexing, SolverBackend};
+use super::{
+    AllSatInputError, AllSatSolver, Solution, SolutionIndexing, SolverBackend,
+    MAX_INTERNAL_VARIABLE_INDEX,
+};
+
+/// Exclusive bound on the external variable list `default_vars` materializes.
+///
+/// An external solver with this many user variables already holds dense
+/// per-variable state far larger than the list itself; the explicit bound
+/// keeps the list allocation bounded for every backend size.
+const MAX_EXTERNAL_DEFAULT_VARS: u32 = 1 << 28;
 
 impl AllSatSolver {
     /// Return the default set of variables for blocking clauses.
@@ -15,11 +25,27 @@ impl AllSatSolver {
     /// External backend: 0-indexed (0..num_vars).
     pub(super) fn default_vars(&self) -> Result<Vec<u32>, AllSatInputError> {
         match &self.backend {
-            SolverBackend::Internal { max_var, .. } => Ok((1..=*max_var).collect()),
+            SolverBackend::Internal { max_var, .. } => {
+                // `try_add_clause` and `try_ensure_num_vars` already keep
+                // `max_var` within this limit; restate it where the list is
+                // allocated.
+                if *max_var > MAX_INTERNAL_VARIABLE_INDEX {
+                    return Err(AllSatInputError::InternalVariableIndexExceedsLimit {
+                        variable: *max_var,
+                        max_variable: MAX_INTERNAL_VARIABLE_INDEX,
+                    });
+                }
+                Ok((1..=*max_var).collect())
+            }
             SolverBackend::External(solver) => {
                 let count = u32::try_from(solver.user_num_vars()).map_err(|_| {
                     AllSatInputError::BackendVariableCountOutOfRange(solver.user_num_vars())
                 })?;
+                if count >= MAX_EXTERNAL_DEFAULT_VARS {
+                    return Err(AllSatInputError::BackendVariableCountOutOfRange(
+                        solver.user_num_vars(),
+                    ));
+                }
                 Ok((0..count).collect())
             }
         }

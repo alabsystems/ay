@@ -29,6 +29,13 @@ use ay_chc::{
 use crate::proof::ProofRun;
 use crate::verdict::AyVerdict;
 
+mod query_replay;
+
+#[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
+mod proof_cancellation_tests;
+
 pub use crate::query_proof_report::{
     QueryObligationBatchProofReport, QueryObligationBatchVerdict, QueryObligationProofReportRow,
     CHC_QUERY_BATCH_PROOF_REPORT_SCHEMA, CHC_QUERY_OBLIGATION_SET_SCHEMA,
@@ -119,11 +126,33 @@ pub struct EncodeConfig {
     /// regression measurements: engines run in the canonical fixed order and
     /// receive deterministic shares of the total timeout.
     pub execution_mode: AdaptiveExecutionMode,
-    /// Per-portfolio term-store budget in bytes.
+    /// Per-context term-store budget in bytes for portfolio and PDR/proof runs.
     ///
     /// Set this when multiple model-checker jobs may coexist in one process;
     /// `None` uses AY's process-level default.
     pub memory_budget: Option<usize>,
+    /// The proof run's tick budget B, in ay-sat search ticks
+    /// ([`ay_chc::PdrConfig::effort`]; default `None`: no change).
+    ///
+    /// Honoured by the [`ProofMode::Strict`] path, which threads it onto the
+    /// PDR proof run: the run stops on its count, and a run that
+    /// [`timeout`](Self::timeout) ends reports it as its backstop
+    /// (`ChcRunWork::stop` reads `Deadline`, the stop reason
+    /// `BudgetExhausted`), never as the count's (`Rlimit`,
+    /// `EffortExhausted`). Until P4a slices 9 and 10 the timeout also still
+    /// sizes clocks that steer the search on its way: the case split's
+    /// deadline and branch budgets, and the thread's solve deadline that
+    /// clamps each query's slice (the development design notes §14 lists
+    /// them). The adaptive portfolio ([`ProofMode::None`]) has no count
+    /// before GuardTree S5 gives its workers nodes, so a solve there with an
+    /// effort is refused (`EncodeError::Unimplemented`) rather than run on
+    /// clocks the caller asked to replace.
+    pub effort: Option<u64>,
+    /// Maximum PDR frames for the proof path.
+    ///
+    /// `None` preserves the production profile. An explicit value is forwarded
+    /// unchanged, including zero, to [`PdrConfig::with_max_frames`].
+    pub pdr_max_frames: Option<usize>,
 }
 
 impl Default for EncodeConfig {
@@ -139,6 +168,8 @@ impl Default for EncodeConfig {
             lemma_hints: Vec::new(),
             execution_mode,
             memory_budget: None,
+            effort: None,
+            pdr_max_frames: None,
         }
     }
 }
@@ -197,11 +228,40 @@ impl EncodeConfig {
         self
     }
 
-    /// Bound term-store memory for each adaptive portfolio invocation.
+    /// Bound term-store memory for portfolio and PDR/proof invocations.
+    ///
+    /// A zero ceiling refuses solving or validation. This is not an aggregate
+    /// process-memory bound; a tighter inherited context ceiling still applies.
     #[must_use]
     pub fn with_memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget = Some(bytes);
         self
+    }
+
+    /// Give the PDR proof run a tick budget of `ticks` ay-sat search ticks
+    /// ([`Self::effort`]): honoured under [`ProofMode::Strict`] only.
+    #[must_use]
+    pub fn with_effort(mut self, ticks: u64) -> Self {
+        self.effort = Some(ticks);
+        self
+    }
+
+    /// Set the PDR proof path's frame cap without changing other controls.
+    #[must_use]
+    pub fn with_pdr_max_frames(mut self, frames: usize) -> Self {
+        self.pdr_max_frames = Some(frames);
+        self
+    }
+
+    /// `Err` when an effort is set on the adaptive portfolio path, which has
+    /// no count to honour it with ([`Self::effort`]).
+    fn refuse_portfolio_effort(&self) -> crate::Result<()> {
+        match self.effort {
+            Some(_) => Err(crate::EncodeError::Unimplemented(
+                "an effort on the adaptive portfolio path (it gains a count with GuardTree S5)",
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Lower to an [`ay_chc::AdaptiveConfig`] for the portfolio path.
@@ -246,7 +306,9 @@ impl EncodeConfig {
     /// entry-CEGAR discharge). Behavior preservation requires the *same*
     /// `PdrConfig`, so the shared path adopts the production profile.
     ///
-    /// Applies the timeout as PDR's `solve_timeout`. `strict_proofs` is *not*
+    /// Applies the timeout as PDR's `solve_timeout`, and the effort, if any,
+    /// as its `effort`, and retains the requested per-context term-memory
+    /// ceiling, including zero. `strict_proofs` is *not*
     /// set here on purpose: [`ay_chc::engines::solve_pdr_proof`] forces it on
     /// internally (see its contract), so setting it twice would be redundant.
     /// The [`Engine`] selection does not apply to this path — `solve_pdr_proof`
@@ -255,11 +317,15 @@ impl EncodeConfig {
     pub fn to_pdr_config(&self) -> PdrConfig {
         // `production(verbose)` builds a full owned config (it already sets every
         // technique toggle and falls back to `..Self::default()` for the rest),
-        // so the only public knob we layer on is the timeout. We pass
+        // so we layer only the explicit invocation controls on it. We pass
         // `verbose = false` to match model-checker-consumer's `PdrConfig::production(false)`
         // call sites on the proof path.
-        let mut cfg = PdrConfig::production(false);
+        let mut cfg = PdrConfig::production(false).with_memory_budget(self.memory_budget);
         cfg.solve_timeout = self.timeout;
+        cfg.effort = self.effort;
+        if let Some(frames) = self.pdr_max_frames {
+            cfg = cfg.with_max_frames(frames);
+        }
         // Candidate hints ride user_hints; `apply_lemma_hints` inductively
         // validates each one before installing (production profile keeps
         // `use_lemma_hints: true`).
@@ -277,7 +343,10 @@ impl EncodeConfig {
 ///
 /// In both cases the raw AY verdict is normalized by [`crate::verdict`]. On the
 /// [`ProofMode::Strict`] Safe path the proof run's transcript is captured into a
-/// [`crate::proof::Certificate`] and threaded onto [`AyVerdict::Proved`].
+/// [`crate::proof::Certificate`] and threaded onto [`AyVerdict::Proved`]. The
+/// proof run's metered work ([`ProofRun::work`]) is not in the verdict: to
+/// have both, call [`solve_with_proof`] and [`ProofRun::verdict`], the same
+/// verdict.
 pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerdict> {
     solve_impl(problem, config, None)
 }
@@ -303,6 +372,7 @@ fn solve_impl(
 ) -> crate::Result<AyVerdict> {
     match config.proof_mode {
         ProofMode::None => {
+            config.refuse_portfolio_effort()?;
             // Catch AY-classified solver panics on the portfolio path and map
             // them to `EncodeError::SolverPanicked` (G3). Non-AY (programmer
             // error) panics re-propagate. The `Strict` path already runs under
@@ -323,20 +393,11 @@ fn solve_impl(
                 })?;
             Ok(crate::verdict::from_verified(raw, None))
         }
-        ProofMode::Strict => {
-            let run: ProofRun = solve_with_proof_impl(problem, config, cancellation)?;
-            // On the Safe path attach the re-checkable certificate built from
-            // the proof run's transcript; on Unsafe/Unknown there is no proof
-            // artifact and `from_verified` ignores the `None`. Mirror the raw
-            // AY verdict either way.
-            let raw: VerifiedChcResult = run.result().clone();
-            let certificate = if run.accepted_as_proof() && raw.is_safe() {
-                Some(Box::new(run.certificate()))
-            } else {
-                None
-            };
-            Ok(crate::verdict::from_verified(raw, certificate))
-        }
+        // On the Safe path the verdict carries the re-checkable certificate
+        // built from the proof run's transcript; on Unsafe/Unknown there is no
+        // proof artifact. The run's metered work is dropped here: a caller
+        // that wants it calls `solve_with_proof` and `ProofRun::verdict`.
+        ProofMode::Strict => Ok(solve_with_proof_impl(problem, config, cancellation)?.verdict()),
     }
 }
 
@@ -482,18 +543,22 @@ pub fn solve_query_obligations_with_checked_proof_report(
 /// [`solve_query_obligations_with_checked_proof_report`] with the cooperative
 /// cancellation behavior of
 /// [`solve_query_obligations_with_proof_report_with_cancellation`]. The parent
-/// token reaches the row currently being solved and is checked again before a
-/// checked-replay pass or any later row is started. Consequently a caller may
+/// token reaches the row currently being solved and its checked-replay pass,
+/// and is checked before any later row is started. Consequently a caller may
 /// arm one batch-wide deadline with [`CancellationToken::cancel_after`]
 /// without losing any source-ordered row identities: work not started after
 /// cancellation is recorded as [`crate::EncodeError::Cancelled`].
 ///
 /// `EncodeConfig::timeout` and `replay_budget` remain separate per-obligation
-/// limits. Once a replay pass has started, its own `replay_budget` is the
-/// synchronous bound; a cancellation request is observed at the next batch
-/// stage boundary. A replay that fails, or is not launched because cancellation
-/// was already observed, cannot upgrade a row to Trust-full-verifier-admissible
-/// evidence.
+/// limits. During checked replay the same parent token is polled alongside
+/// the original replay allowance; an observed refusal is sticky, even if the
+/// caller later resets the token. Ground export/validation is cooperative;
+/// the full token also reaches active SMT search and mandatory certification.
+/// Offline checking, metadata, source slicing and allocation/destruction still
+/// contain opaque intervals. This is not a hard deadline or a 100 ms
+/// cancellation bound. A failed or pre-cancelled replay cannot newly upgrade
+/// a row to Trust-full-verifier-admissible evidence. The report's cancellation
+/// snapshot and stop reason still describe the original solve completion.
 pub fn solve_query_obligations_with_checked_proof_report_with_cancellation(
     problem: &ChcProblem,
     config: &EncodeConfig,
@@ -575,14 +640,17 @@ fn solve_query_obligations_with_proof_report_impl(
                 Err(crate::EncodeError::Cancelled)
             } else {
                 solve_with_proof_report_impl(problem, config, cancellation).map(|report| {
-                    match replay {
-                        QueryProofReplay::Checked(replay_budget)
-                            if !cancellation.is_some_and(CancellationToken::is_cancelled) =>
-                        {
-                            report.with_checked_replay(replay_budget)
-                        }
-                        QueryProofReplay::MetadataOnly | QueryProofReplay::Checked(_) => report,
-                    }
+                    query_replay::checked_replay_if_requested(
+                        report,
+                        replay,
+                        cancellation,
+                        |report, budget, progress| match cancellation {
+                            Some(token) => {
+                                report.with_checked_replay_with_cancellation(budget, token)
+                            }
+                            None => report.with_checked_replay_with_progress(budget, progress),
+                        },
+                    )
                 })
             };
             QueryObligationProofReportRow::new(id, outcome)
@@ -659,6 +727,7 @@ fn solve_with_proof_report_impl(
 ) -> crate::Result<ChcProofRunWithBudgetReport> {
     match config.proof_mode {
         ProofMode::None => {
+            config.refuse_portfolio_effort()?;
             let adaptive_config = config.to_adaptive_config();
             let portfolio = match cancellation {
                 Some(parent) => AdaptivePortfolio::new_for_solve_with_cancellation(
@@ -690,12 +759,35 @@ fn solve_with_proof_report_impl(
 /// fresh re-validation.
 ///
 /// The [`ay_chc::PdrConfig`] is built from `config` via
-/// [`EncodeConfig::to_pdr_config`] (currently just the timeout → `solve_timeout`
-/// mapping). Parse/IO/internal AY failures surface as [`crate::EncodeError::Chc`];
+/// [`EncodeConfig::to_pdr_config`] (production profile, timeout, effort, memory
+/// and candidate hints). Parse/IO/internal AY failures surface as [`crate::EncodeError::Chc`];
 /// an inconclusive or unvalidated search comes back as a `ProofRun` whose result
 /// is `Unknown` (and `accepted_as_proof() == false`).
 pub fn solve_with_proof(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<ProofRun> {
     solve_with_proof_impl(problem, config, None)
+}
+
+/// [`solve_with_proof`] linked to a caller-owned cancellation token, as
+/// [`solve_with_cancellation`] is to [`solve`]: the run's PDR token is a
+/// child of `parent`, so a cancel winds the run down as `Unknown`.
+///
+/// It uses the same private implementation, production profile, timeout,
+/// effort, memory budget, candidate hints, independent validation and
+/// problem-bound certificate as [`solve_with_proof`]. No separate solve,
+/// reporting rerun or resource grant is introduced. A cancellation observed
+/// by AY returns a non-accepted `Unknown` proof run; parse/IO/internal
+/// failures retain the existing error behavior.
+///
+/// Passing an attempt created with [`CancellationToken::sticky_child`] also
+/// preserves its observed cancellation across resets of the raw parent or
+/// descendants. Start an explicit new solve from the uncancelled original
+/// parent for a fresh attempt; this entry never resets the supplied token.
+pub fn solve_with_proof_with_cancellation(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    parent: &CancellationToken,
+) -> crate::Result<ProofRun> {
+    solve_with_proof_impl(problem, config, Some(parent))
 }
 
 fn solve_with_proof_impl(
@@ -727,7 +819,7 @@ fn solve_with_proof_impl(
 /// re-validation gate strictly in the way of any accepting verdict.
 ///
 /// The [`ay_chc::PdrConfig`] is built from `config` via
-/// [`EncodeConfig::to_pdr_config`] (the same production profile / timeout mapping
+/// [`EncodeConfig::to_pdr_config`] (the same production profile / resource mapping
 /// `solve_with_proof` uses).
 pub fn prove_with_external_model(
     problem: ChcProblem,

@@ -158,9 +158,12 @@ impl BoundedBackend for AyBoundedBackend {
             })
             .map(map_pb_decision)
         } else if general_integer_columns == 0 {
-            crate::hybrid_pb_lp::try_solve_certified_interruptible(model, Some(deadline), || {
-                should_stop()
-            })
+            crate::hybrid_pb_lp::try_solve_certified_interruptible(
+                model,
+                Some(deadline),
+                crate::hybrid_pb_lp::HybridGoal::Solve,
+                || should_stop(),
+            )
             .map(map_certified_hybrid_decision)
         } else {
             crate::hybrid_integer_lift::try_solve_certified_interruptible(
@@ -265,6 +268,8 @@ pub(crate) fn try_prove_infeasibility(
     model: &Model,
     trial_deadline: Instant,
 ) -> Option<OpenDomainRouteDecision> {
+    use crate::hybrid_pb_lp::CertifiedHybridPbLpDecision;
+
     if Instant::now() >= trial_deadline {
         return None;
     }
@@ -298,24 +303,34 @@ pub(crate) fn try_prove_infeasibility(
         }
     }
 
-    if let Some(crate::hybrid_pb_lp::CertifiedHybridPbLpDecision::Infeasible(certificate)) =
-        crate::hybrid_pb_lp::try_solve_certified(projection.residual(), Some(trial_deadline))
-    {
-        if verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
-            model,
-            &certificate,
-            Some(trial_deadline),
-        ) {
-            return Some(OpenDomainRouteDecision::CertifiedHybridPbLpInfeasible { certificate });
+    match crate::hybrid_pb_lp::try_refute_certified(projection.residual(), Some(trial_deadline)) {
+        Some(CertifiedHybridPbLpDecision::Infeasible(certificate)) => {
+            if verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+                model,
+                &certificate,
+                Some(trial_deadline),
+            ) {
+                return Some(OpenDomainRouteDecision::CertifiedHybridPbLpInfeasible {
+                    certificate,
+                });
+            }
+            return None;
         }
-        return None;
+        // A checked feasible point rules out a refutation of this projection.
+        // Integer lifting would only repeat a search whose answer is known.
+        Some(
+            CertifiedHybridPbLpDecision::Feasible { .. }
+            | CertifiedHybridPbLpDecision::Optimal { .. },
+        ) => return None,
+        None => {}
     }
 
     if let Some(crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision::Infeasible(
         certificate,
-    )) =
-        crate::hybrid_integer_lift::try_solve_certified(projection.residual(), Some(trial_deadline))
-    {
+    )) = crate::hybrid_integer_lift::try_refute_certified(
+        projection.residual(),
+        Some(trial_deadline),
+    ) {
         if verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
             model,
             &certificate,
@@ -331,14 +346,17 @@ pub(crate) fn try_prove_infeasibility(
 
 /// Rebuild the source-model projection and independently replay a single-row
 /// residual certificate against that freshly reconstructed exact residual.
-pub(crate) fn verify_single_row_infeasibility_certificate(
+pub fn verify_single_row_infeasibility_certificate(
     model: &Model,
     certificate: &SingleRowDpInfeasibilityCertificate,
 ) -> bool {
     verify_single_row_infeasibility_certificate_with_deadline(model, certificate, None)
 }
 
-fn verify_single_row_infeasibility_certificate_with_deadline(
+/// Rebuild from the caller's source model and replay under its original
+/// absolute deadline. Returns false on expiry, unsupported input, or invalid
+/// evidence; the deadline is cooperative and grants no fresh time allowance.
+pub fn verify_single_row_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &SingleRowDpInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -358,14 +376,17 @@ fn verify_single_row_infeasibility_certificate_with_deadline(
 
 /// Rebuild the source-model projection and independently replay a multi-row
 /// residual decision DAG against that freshly reconstructed exact residual.
-pub(crate) fn verify_multi_row_infeasibility_certificate(
+pub fn verify_multi_row_infeasibility_certificate(
     model: &Model,
     certificate: &MultiRowBddInfeasibilityCertificate,
 ) -> bool {
     verify_multi_row_infeasibility_certificate_with_deadline(model, certificate, None)
 }
 
-fn verify_multi_row_infeasibility_certificate_with_deadline(
+/// Rebuild from the caller's source model and replay under its original
+/// absolute deadline. Returns false on expiry, unsupported input, or invalid
+/// evidence; the deadline is cooperative and grants no fresh time allowance.
+pub fn verify_multi_row_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &MultiRowBddInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -385,14 +406,17 @@ fn verify_multi_row_infeasibility_certificate_with_deadline(
 
 /// Rebuild the open-domain projection and replay a hybrid PB/LP cut ledger
 /// against that exact residual.
-pub(crate) fn verify_hybrid_pb_lp_infeasibility_certificate(
+pub fn verify_hybrid_pb_lp_infeasibility_certificate(
     model: &Model,
     certificate: &HybridPbLpInfeasibilityCertificate,
 ) -> bool {
     verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(model, certificate, None)
 }
 
-fn verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
+/// Rebuild from the caller's source model and replay under its original
+/// absolute deadline. Returns false on expiry, unsupported input, or invalid
+/// evidence; the deadline is cooperative and grants no fresh time allowance.
+pub fn verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &HybridPbLpInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -414,14 +438,17 @@ fn verify_hybrid_pb_lp_infeasibility_certificate_with_deadline(
 
 /// Rebuild the open-domain projection and its bounded-integer radix lift before
 /// replaying the nested hybrid certificate.
-pub(crate) fn verify_hybrid_integer_lift_infeasibility_certificate(
+pub fn verify_hybrid_integer_lift_infeasibility_certificate(
     model: &Model,
     certificate: &HybridIntegerLiftInfeasibilityCertificate,
 ) -> bool {
     verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(model, certificate, None)
 }
 
-fn verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
+/// Rebuild from the caller's source model and replay under its original
+/// absolute deadline. Returns false on expiry, unsupported input, or invalid
+/// evidence; the deadline is cooperative and grants no fresh time allowance.
+pub fn verify_hybrid_integer_lift_infeasibility_certificate_with_deadline(
     model: &Model,
     certificate: &HybridIntegerLiftInfeasibilityCertificate,
     deadline: Option<Instant>,
@@ -652,6 +679,10 @@ where
 {
     should_stop() || Instant::now() >= deadline
 }
+
+#[cfg(test)]
+#[path = "open_domain_route/refute_tests.rs"]
+mod refute_tests;
 
 #[cfg(test)]
 mod tests {

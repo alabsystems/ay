@@ -102,7 +102,17 @@ impl LinearExpr {
     }
 
     /// Scale the entire expression (Rational factor, no allocation)
+    ///
+    /// A ZERO factor clears every coefficient: `coeffs` is sparse (no zero
+    /// entries — `add_sparse_term_rat` drops them), and `(* 0 x)` does not
+    /// depend on `x`. Keeping `(x, 0)` entries made consumers that divide by
+    /// a coefficient (`is_expression_forced_to_value`) divide by zero.
     pub fn scale_rat(&mut self, factor: &Rational) {
+        if factor.is_zero() {
+            self.coeffs.clear();
+            self.constant = Rational::zero();
+            return;
+        }
         for (_, c) in &mut self.coeffs {
             *c = &*c * factor;
         }
@@ -154,16 +164,7 @@ impl LinearExpr {
     /// Check if two expressions have the same coefficients (ignoring constant term).
     /// Both expressions should be normalized first for reliable comparison.
     pub fn same_coefficients(&self, other: &Self) -> bool {
-        if self.coeffs.len() != other.coeffs.len() {
-            return false;
-        }
-        // Assumes both are normalized (sorted by var_id)
-        for (a, b) in self.coeffs.iter().zip(&other.coeffs) {
-            if a.0 != b.0 || a.1 != b.1 {
-                return false;
-            }
-        }
-        true
+        same_coeff_slices(&self.coeffs, &other.coeffs)
     }
 
     /// Check if `self`'s coefficients are a scalar multiple of `other`'s.
@@ -171,29 +172,54 @@ impl LinearExpr {
     /// or `None` if no such constant ratio exists.
     /// Both expressions should be normalized first. `k` is guaranteed non-zero.
     pub fn proportional_coefficient_ratio(&self, other: &Self) -> Option<BigRational> {
-        if self.coeffs.len() != other.coeffs.len() || self.coeffs.is_empty() {
-            return None;
-        }
-        // Compute ratio from first pair; verify all others match.
-        let mut ratio: Option<BigRational> = None;
-        for (a, b) in self.coeffs.iter().zip(&other.coeffs) {
-            if a.0 != b.0 {
-                return None; // Different variables
-            }
-            let b_big = b.1.to_big();
-            if b_big.is_zero() {
-                return None; // Can't divide by zero
-            }
-            let r = a.1.to_big() / &b_big;
-            if r.is_zero() {
-                return None; // Zero ratio means self has a zero coefficient
-            }
-            match &ratio {
-                None => ratio = Some(r),
-                Some(prev) if prev != &r => return None,
-                _ => {}
-            }
-        }
-        ratio
+        proportional_coeff_slice_ratio(&self.coeffs, &other.coeffs)
     }
+}
+
+/// Whether a coefficient slice is already in the canonical form
+/// [`LinearExpr::normalize`] produces: strictly increasing variable ids
+/// (sorted, no duplicates) and no zero coefficients. Tableau rows are
+/// constructed and pivot-maintained in this form, so callers scanning
+/// rows can test it in O(len) with no allocation and skip the
+/// clone+normalize `normalize` would otherwise repeat per row.
+pub(crate) fn coeffs_are_normalized(coeffs: &[(u32, Rational)]) -> bool {
+    coeffs.iter().all(|(_, c)| !c.is_zero()) && coeffs.windows(2).all(|w| w[0].0 < w[1].0)
+}
+
+/// Slice form of [`LinearExpr::same_coefficients`]; both slices must be
+/// normalized (see [`coeffs_are_normalized`]).
+pub(crate) fn same_coeff_slices(a: &[(u32, Rational)], b: &[(u32, Rational)]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0 && x.1 == y.1)
+}
+
+/// Slice form of [`LinearExpr::proportional_coefficient_ratio`]; both
+/// slices must be normalized.
+pub(crate) fn proportional_coeff_slice_ratio(
+    a: &[(u32, Rational)],
+    b: &[(u32, Rational)],
+) -> Option<BigRational> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    // Compute ratio from first pair; verify all others match.
+    let mut ratio: Option<BigRational> = None;
+    for (x, y) in a.iter().zip(b) {
+        if x.0 != y.0 {
+            return None; // Different variables
+        }
+        let y_big = y.1.to_big();
+        if y_big.is_zero() {
+            return None; // Can't divide by zero
+        }
+        let r = x.1.to_big() / &y_big;
+        if r.is_zero() {
+            return None; // Zero ratio means `a` has a zero coefficient
+        }
+        match &ratio {
+            None => ratio = Some(r),
+            Some(prev) if prev != &r => return None,
+            _ => {}
+        }
+    }
+    ratio
 }

@@ -4,13 +4,26 @@
 
 //! Resource-bounded bit-width widening for the IC3 candidate lane.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use super::resources::Resources;
+use crate::smt::replay_control::ScopedReplayControl;
+use crate::smt::resource_observation::ScopedResourceObservation;
+use crate::PdrConfig;
+use ay_core::resource::ResourceGuard;
+use ay_core::time::Instant;
 
 use crate::ic3::solver::{Ic3Result, Ic3Solver};
 use crate::pdr::model::InvariantModel;
 use crate::{ChcProblem, ChcSort};
 
-use super::{back_translate, lift_header_to_full_model, lower_loop, Lowering};
+#[cfg(test)]
+use super::{back_translate, lower_loop};
+use super::{
+    back_translate_controlled, lift_header_to_full_model_controlled, lower_loop_controlled,
+    Control, Lowering,
+};
 
 #[cfg(test)]
 mod tests;
@@ -54,11 +67,14 @@ impl BlastWidth {
 /// width, so its final abstraction is 64 bits. Bit-vectors add their original
 /// width, capped at [`MAX_EXACT_BV_BLAST_WIDTH`]. Duplicate effective rungs are
 /// removed (for example, a BV12 problem tries 8 then 12).
-fn widening_widths(problem: &ChcProblem) -> Vec<usize> {
+fn widening_widths_controlled(problem: &ChcProblem, control: &Control<'_>) -> Option<Vec<usize>> {
+    control.poll()?;
     let mut target = INT_WIDTH;
     let mut has_int = false;
     for predicate in problem.predicates() {
+        control.poll()?;
         for sort in &predicate.arg_sorts {
+            control.poll()?;
             match sort {
                 ChcSort::Int => has_int = true,
                 ChcSort::BitVec(width) => {
@@ -82,16 +98,67 @@ fn widening_widths(problem: &ChcProblem) -> Vec<usize> {
             break;
         }
     }
-    widths
+    control.poll()?;
+    Some(widths)
+}
+
+#[cfg(test)]
+fn widening_widths(problem: &ChcProblem) -> Vec<usize> {
+    let mut live = || true;
+    let control = Control::new(
+        ay_core::time::Instant::now() + Duration::from_secs(3600),
+        &mut live,
+    );
+    widening_widths_controlled(problem, &control).unwrap_or_default()
 }
 
 /// Try the IC3 width ladder and return only a candidate independently accepted
 /// by the original word-level validator. The public caller still repeats its
 /// mandatory admission validation before any `Safe` result is trusted.
 pub fn try_prove_chc_loop(problem: &ChcProblem, timeout: Duration) -> Option<InvariantModel> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    try_prove_chc_loop_with_resources(
+        problem,
+        deadline,
+        &PdrConfig::production(false),
+        &ResourceGuard::new(),
+    )
+}
+
+/// Additive IC3 candidate entry under the caller's absolute wall and owner.
+///
+/// Cloning the guard shares its ticks/cancel flag, never a renewed allowance.
+/// Caller/ambient walls and per-SMT-context term caps only tighten; Some(0)
+/// refuses before lowering or context construction. One sticky cancellation
+/// attempt spans all rungs. Local rung expiry does not poison a live parent.
+/// Polls debit one guard tick; opaque lowering/SAT/GC/validation operations are
+/// cooperative, not exact work accounting or a process-RSS reservation.
+/// The returned model remains a candidate, not a Safe/proof credential.
+pub fn try_prove_chc_loop_with_resources(
+    problem: &ChcProblem,
+    original_deadline: Instant,
+    config: &PdrConfig,
+    owner: &ResourceGuard,
+) -> Option<InvariantModel> {
+    let mut deadline = owner
+        .effective_deadline()
+        .map_or(original_deadline, |d| d.min(original_deadline));
+    if let Some(timeout) = config.solve_timeout {
+        deadline = deadline.min(Instant::now().checked_add(timeout)?);
+    }
+    let caller = config.effective_cancellation_token();
+    let replay = ScopedReplayControl::install_until(deadline, caller.as_ref());
+    let resources = Arc::new(Resources::capture(owner, config, &replay));
+    let mut live = || resources.poll();
+    let control = Control::new(replay.deadline(), &mut live);
+    control.poll()?;
     let debug = ay_core::misc_cli_flags().ic3_lane_debug;
     maybe_dump_problem(problem);
-    try_widening_ladder(problem, timeout, debug)
+    control.poll()?;
+    let _memory = resources.install_memory();
+    let result = try_widening_ladder(problem, debug, &control, &resources)?;
+    control.poll()?;
+    Some(result)
 }
 
 fn maybe_dump_problem(problem: &ChcProblem) {
@@ -175,20 +242,27 @@ fn add_forward_carry(base: RungBudget, carry: Duration, available: Duration) -> 
 
 fn try_widening_ladder(
     problem: &ChcProblem,
-    timeout: Duration,
     debug: bool,
+    control: &Control<'_>,
+    resources: &Arc<Resources>,
 ) -> Option<InvariantModel> {
-    let deadline = ay_core::time::Instant::now() + timeout;
-    let widths = widening_widths(problem);
-    let base_budgets = allocate_rung_budgets(timeout, widths.len())?;
+    control.poll()?;
+    let deadline = control.deadline();
+    let widths = widening_widths_controlled(problem, control)?;
+    let available = deadline.saturating_duration_since(ay_core::time::Instant::now());
+    let base_budgets = allocate_rung_budgets(available, widths.len())?;
     let mut carry = Duration::ZERO;
     for (index, width) in widths.iter().copied().enumerate() {
+        control.poll()?;
         let rung_start = ay_core::time::Instant::now();
         let available = deadline.saturating_duration_since(rung_start);
         let budget = add_forward_carry(base_budgets[index], carry, available)?;
-        let search_deadline = rung_start + budget.search;
-        let rung_deadline = search_deadline + budget.validation;
-        let Some(candidate) = ic3_candidate_at_width(problem, width, search_deadline, debug) else {
+        let search_deadline = rung_start.checked_add(budget.search)?;
+        let rung_deadline = search_deadline.checked_add(budget.validation)?;
+        let Some(candidate) =
+            ic3_candidate_at_width(problem, width, search_deadline, debug, control, resources)
+        else {
+            control.poll()?;
             carry = budget.total().saturating_sub(rung_start.elapsed());
             continue;
         };
@@ -202,11 +276,28 @@ fn try_widening_ladder(
             carry = budget.total().saturating_sub(rung_start.elapsed());
             continue;
         }
-        let accepted = candidate_validates_original(problem, &candidate, validation_budget);
+        let accepted = match candidate_validates_original(
+            problem,
+            &candidate,
+            rung_deadline,
+            control,
+            resources,
+        ) {
+            Some(accepted) => accepted,
+            None => {
+                // Local expiry does not spend another rung's reserved slice.
+                // A refused parent, however, remains terminal for the lane.
+                control.poll()?;
+                carry = budget.total().saturating_sub(rung_start.elapsed());
+                continue;
+            }
+        };
         if debug {
             eprintln!("IC3_LANE: width={width} original_validation={accepted}");
         }
-        if accepted {
+        control.poll()?;
+        let in_rung = ay_core::time::Instant::now() < rung_deadline;
+        if accepted && in_rung {
             return Some(candidate);
         }
         carry = budget.total().saturating_sub(rung_start.elapsed());
@@ -219,8 +310,24 @@ fn ic3_candidate_at_width(
     width: usize,
     deadline: ay_core::time::Instant,
     debug: bool,
+    parent: &Control<'_>,
+    resources: &Arc<Resources>,
 ) -> Option<InvariantModel> {
-    let low = lower_loop(problem, BlastWidth::new(width));
+    let mut live = || parent.poll().is_some();
+    let control = Control::new(deadline, &mut live);
+    let result = ic3_candidate_inner(problem, width, debug, &control, resources)?;
+    control.poll()?;
+    Some(result)
+}
+
+fn ic3_candidate_inner(
+    problem: &ChcProblem,
+    width: usize,
+    debug: bool,
+    control: &Control<'_>,
+    resources: &Arc<Resources>,
+) -> Option<InvariantModel> {
+    let low = lower_loop_controlled(problem, BlastWidth::new(width), control);
     if debug {
         eprintln!(
             "IC3_LANE: lower_loop width={width} result={} (preds={})",
@@ -235,25 +342,31 @@ fn ic3_candidate_at_width(
         latches,
         orig_header,
     } = low?;
-
-    let mut solver = Ic3Solver::new(ts, false).with_deadline(Some(deadline));
+    control.poll()?;
+    let owner = resources.clone();
+    let mut solver = Ic3Solver::new(ts, false)
+        .with_deadline(Some(control.deadline()))
+        .with_resource_poll(Arc::new(move || owner.poll()));
+    control.poll()?;
     let Ic3Result::Safe { invariant_level } = solver.solve() else {
         if debug {
             eprintln!("IC3_LANE: solve_safe=false width={width}");
         }
         return None;
     };
+    control.poll()?;
     let clauses = solver.invariant_clauses(invariant_level);
-    let model = back_translate(pred, &params, &latches, &clauses)?;
+    control.poll()?;
+    let model = back_translate_controlled(pred, &params, &latches, &clauses, control)?;
     match orig_header {
         None => Some(model),
         Some(header) => model.get(&pred).and_then(|interp| {
-            lift_header_to_full_model(
+            lift_header_to_full_model_controlled(
                 problem,
                 header,
                 &interp.vars,
                 &interp.formula,
-                deadline.saturating_duration_since(ay_core::time::Instant::now()),
+                control,
             )
         }),
     }
@@ -262,12 +375,30 @@ fn ic3_candidate_at_width(
 fn candidate_validates_original(
     problem: &ChcProblem,
     candidate: &InvariantModel,
-    budget: Duration,
-) -> bool {
-    let mut validation_config = crate::PdrConfig::production(false);
-    validation_config.solve_timeout = Some(budget);
-    matches!(
-        crate::engines::validate_external_invariant_model(problem, candidate, &validation_config),
-        Ok(true)
-    )
+    deadline: ay_core::time::Instant,
+    parent: &Control<'_>,
+    resources: &Arc<Resources>,
+) -> Option<bool> {
+    let mut live = || parent.poll().is_some();
+    let control = Control::new(deadline, &mut live);
+    control.poll()?;
+    let validation_config = resources.validation_config(deadline);
+    let smt_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
+    // No whole-ladder observer: a local rung wall is not the original wall.
+    // Existing ambient first-refusal semantics remain intact, including on Err.
+    let observation = ScopedResourceObservation::install();
+    let result = crate::engines::validate_external_invariant_model_typed(
+        problem,
+        candidate,
+        &validation_config,
+    );
+    drop(validation_config);
+    drop(smt_deadline);
+    resources.observe_validation(observation.first(), &result);
+    drop(observation);
+    control.poll()?;
+    Some(matches!(
+        result,
+        Ok(crate::engines::ExternalInvariantValidation::Valid)
+    ))
 }

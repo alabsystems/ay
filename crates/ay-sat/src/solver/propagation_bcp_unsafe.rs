@@ -499,6 +499,10 @@ impl Solver {
         // the O(clause_len) assignment_level scan + lifecycle checks.
         let chrono = self.chrono_enabled;
         let trail_lookahead_prefetch = self.cold.bcp_trail_lookahead_prefetch;
+        // `--sat-bcp-move-on-true`: Kissat's policy (proplit.h:137-147), move
+        // the watch to a replacement literal that is already true, where
+        // CaDiCaL's (AY's default) keeps it and makes that literal the blocker.
+        let move_on_true = MODE == bcp_mode::SEARCH && self.cold.bcp_move_on_true;
         // Jump-reasons gate hoist (#shave5): `decision_level` and the cold
         // flag are invariant for the whole propagate call (BCP never opens a
         // decision level), so evaluate the enqueue-route predicate once here
@@ -576,6 +580,18 @@ impl Solver {
                 self.num_vars,
             );
             let false_lit = p.negated();
+            // Level of the propagating literal, once per trail literal, for the
+            // chrono fast enqueue: every clause watched by `false_lit` contains
+            // it, false, so a binary unit's level is `min(level[p], dl)` and a
+            // long unit's is `dl` whenever `level[p] >= dl`.
+            let p_level = if MODE == bcp_mode::SEARCH && chrono {
+                // SAFETY: trail variables index var_data (#8359 assert above).
+                unsafe { self.var_data.get_unchecked(p.variable().index()) }
+                    .level
+                    .min(self.decision_level)
+            } else {
+                0
+            };
 
             // Lookahead prefetch (#8465): prefetch the NEXT trail literal's
             // watch list data while we process the current literal. This hides
@@ -706,11 +722,17 @@ impl Solver {
                     // assignment_level() would do to discover the clause
                     // is binary.
                     if chrono {
-                        self.enqueue_bcp_binary_with_other(
-                            Literal(blocker_raw),
-                            clause_ref,
-                            false_lit,
-                        );
+                        debug_assert_eq!(p_level, self.assignment_level_binary(false_lit));
+                        // SAFETY: an unassigned blocker of a live binary watch
+                        // indexes var_data; reserve_trail_for_bcp ran on entry.
+                        unsafe {
+                            self.enqueue_bcp_chrono_fast(
+                                Literal(blocker_raw),
+                                clause_ref,
+                                p_level,
+                                VarData::FLAG_BINARY_REASON_PUB,
+                            );
+                        }
                     } else {
                         self.enqueue_bcp_binary_nochrono_fast(Literal(blocker_raw), clause_ref);
                     }
@@ -1792,7 +1814,7 @@ impl Solver {
                 }
 
                 if replacement_val > 0 {
-                    if relocate_true_tail_watch {
+                    if relocate_true_tail_watch || move_on_true {
                         debug_assert!(
                             replacement_k >= 2 && replacement_k < clause_len,
                             "BUG: replacement index {replacement_k} outside [2, {clause_len})"
@@ -1879,7 +1901,18 @@ impl Solver {
                 // O(clause_len) assignment_level scan.
                 if MODE == bcp_mode::SEARCH {
                     if chrono {
-                        self.enqueue_bcp::<true>(first, clause_ref);
+                        let dl = self.decision_level;
+                        let level = if p_level >= dl {
+                            dl
+                        } else {
+                            self.assignment_level(first, clause_ref)
+                        };
+                        debug_assert_eq!(level, self.assignment_level(first, clause_ref));
+                        // SAFETY: `first` is an unassigned literal of a live
+                        // clause; reserve_trail_for_bcp ran on entry.
+                        unsafe {
+                            self.enqueue_bcp_chrono_fast(first, clause_ref, level, 0);
+                        }
                     } else {
                         self.enqueue_bcp_nochrono_fast(first, clause_ref);
                     }
@@ -1912,7 +1945,7 @@ impl Solver {
             // found (common for short watch lists or mostly-binary formulas).
             if !self.deferred_replacement_watches.is_empty() {
                 for &(lit, watcher) in &self.deferred_replacement_watches {
-                    self.watches.add_watch(lit, watcher);
+                    self.watches.add_long_watch(lit, watcher);
                 }
                 self.deferred_replacement_watches.clear();
             }
@@ -1978,7 +2011,7 @@ impl Solver {
         // Flush deferred replacement watches on conflict path (#8041).
         if !self.deferred_replacement_watches.is_empty() {
             for &(lit, watcher) in &self.deferred_replacement_watches {
-                self.watches.add_watch(lit, watcher);
+                self.watches.add_long_watch(lit, watcher);
             }
             self.deferred_replacement_watches.clear();
         }
@@ -2075,6 +2108,47 @@ impl Solver {
         self.watches.prefetch_first(lit.negated());
     }
 
+    /// Chrono twin of the #shave7 fast enqueue. The caller supplies the
+    /// assignment level (see `p_level` in the watch loop), so the checked
+    /// `enqueue_bcp::<true>` / `enqueue_bcp_binary_with_other` work (checked
+    /// phase and VarData indexing, the level scan, the Vec push) is skipped.
+    /// Same final state: level-0 bookkeeping, phase, vals, VarData (SEEN kept,
+    /// `extra_flags` added), trail, watch prefetch. With chrono on by default,
+    /// the unchecked tail was otherwise never reached.
+    ///
+    /// # Safety
+    /// As `assign_bcp_unchecked`: `lit` indexes the per-variable arrays and the
+    /// trail has spare capacity.
+    #[inline(always)]
+    pub(super) unsafe fn enqueue_bcp_chrono_fast(
+        &mut self,
+        lit: Literal,
+        reason: ClauseRef,
+        level: u32,
+        extra_flags: u8,
+    ) {
+        let vi = lit.variable().index();
+        debug_assert!(
+            vi < self.num_vars,
+            "BUG: enqueue_bcp_chrono_fast variable index {vi} >= num_vars {} (lit={lit:?})",
+            self.num_vars,
+        );
+        debug_assert!(self.chrono_enabled);
+        debug_assert!(level <= self.decision_level);
+        if level == 0 && !self.var_lifecycle.is_inactive(vi) {
+            self.fixed_count += 1;
+            self.var_lifecycle.mark_fixed(vi);
+            self.l0_gc_dirty[vi] = true;
+        }
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829): this clause just
+        // forced a literal. No-op unless the two-stage arm is armed.
+        self.two_stage_note_bcp_use(reason);
+        // SAFETY: forwarded from the caller's contract.
+        unsafe {
+            self.assign_bcp_unchecked(lit, level, reason.0, extra_flags);
+        }
+    }
+
     /// Fast-path twin of `enqueue_bcp_nochrono` (#shave7). Unsafe-BCP loop
     /// only; the safe loop keeps the bounds-checked original.
     #[inline(always)]
@@ -2141,7 +2215,7 @@ impl Solver {
         let other_var = reason_lit.variable().index();
         if other_var < self.num_vars {
             let other_vd = self.var_data[other_var];
-            if other_vd.is_binary_reason() {
+            if other_vd.is_binary_reason() && is_binary_literal_reason(other_vd.reason) {
                 reason_lit = Literal(binary_reason_lit(other_vd.reason));
                 self.stats.jumped_reasons += 1;
             }

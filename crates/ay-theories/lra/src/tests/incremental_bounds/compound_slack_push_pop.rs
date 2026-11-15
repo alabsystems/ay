@@ -243,7 +243,7 @@ fn test_nested_push_pop_compound_slack_7772() {
     solver.pop();
 }
 
-/// bland_mode and basis_repeat_count must be reset on pop (#7772 F1).
+/// bland_mode and pivots_before_bland must be reset on pop (#7772 F1).
 ///
 /// If bland_mode is activated during a pushed scope's simplex solve and not
 /// reset on pop, subsequent simplex calls at the outer scope use Bland's rule
@@ -260,14 +260,14 @@ fn test_bland_mode_reset_on_pop_7772() {
 
     assert!(!solver.bland_mode, "bland_mode should start false");
     assert_eq!(
-        solver.basis_repeat_count, 0,
-        "basis_repeat_count should start at 0"
+        solver.pivots_before_bland, 0,
+        "pivots_before_bland should start at 0"
     );
 
     // Push, manually set bland_mode (simulates activation during simplex)
     solver.push();
     solver.bland_mode = true;
-    solver.basis_repeat_count = 42;
+    solver.pivots_before_bland = 42;
 
     // Pop should reset these
     solver.pop();
@@ -276,8 +276,8 @@ fn test_bland_mode_reset_on_pop_7772() {
         "bland_mode must be reset to false on pop (#7772 F1)"
     );
     assert_eq!(
-        solver.basis_repeat_count, 0,
-        "basis_repeat_count must be reset to 0 on pop (#7772 F1)"
+        solver.pivots_before_bland, 0,
+        "pivots_before_bland must be reset to 0 on pop (#7772 F1)"
     );
 }
 

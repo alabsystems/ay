@@ -42,7 +42,7 @@ fn probe_triage_matches(lits: &[Literal]) -> bool {
 impl Solver {
     /// Drain pending root-level propagations before probe decisions.
     #[inline]
-    fn probe_has_root_conflict(&mut self) -> bool {
+    pub(super) fn probe_has_root_conflict(&mut self) -> bool {
         if self.qhead == self.trail.len() {
             return false;
         }
@@ -146,6 +146,44 @@ impl Solver {
         }
         self.backtrack(0);
         conflict
+    }
+
+    /// `is_rup_binary_under_negation`, also reading the annotated-RUP hint ids
+    /// of (lit0 ∨ lit1) off the probe's contradiction (`--sat-veripb-hints`;
+    /// `None` when off or unreadable). A probe for the proof alone
+    /// (`frozen_rup_probe`): it propagates through `rungs` as well, and leaves
+    /// the search exactly as a run without a proof has it.
+    #[track_caller]
+    pub(super) fn rup_binary_with_veripb_hints(
+        &mut self,
+        lit0: Literal,
+        lit1: Literal,
+        rungs: &[usize],
+    ) -> (bool, Option<Vec<u64>>) {
+        self.rup_clause_with_veripb_hints(&[lit0, lit1], rungs)
+    }
+
+    /// `is_rup_clause_under_negation`, also reading the clause's annotated-RUP
+    /// hint ids off the probe's contradiction: a conflict, or a clause literal
+    /// the earlier assumptions made true, or one the propagation that stopped
+    /// the probe made true before it stopped (`veripb_clause_probe_hints`).
+    /// Like `rup_binary_with_veripb_hints`, a `frozen_rup_probe`.
+    #[track_caller]
+    pub(super) fn rup_clause_with_veripb_hints(
+        &mut self,
+        lits: &[Literal],
+        rungs: &[usize],
+    ) -> (bool, Option<Vec<u64>>) {
+        self.frozen_rup_probe(lits, rungs)
+    }
+
+    /// The annotated-RUP ids of `lits` read at its RUP probe, leaving the
+    /// search as it found it (`frozen_rup_probe`: no watch moved, no phase
+    /// saved, no tick charged). For hints alone (proof text), where a probe
+    /// must not steer the search away from the one a run without a proof makes.
+    #[track_caller]
+    pub(super) fn veripb_hints_by_probe(&mut self, lits: &[Literal]) -> Option<Vec<u64>> {
+        self.frozen_rup_probe(lits, &[]).1
     }
 
     /// Return true if clause `lits` is RUP under the current state: assume

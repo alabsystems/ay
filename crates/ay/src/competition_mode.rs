@@ -24,10 +24,11 @@ pub(crate) static COMPETITION_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `--emit-firewall-lean`, and an in-script `(set-option :produce-proofs
 /// true)` each re-arm the certified lanes regardless of this latch.
 ///
-/// Distinct from [`COMPETITION_MODE_ENABLED`] on purpose: shedding the proof
-/// cycle is the z3 posture for an SMT-LIB solve and must not drag the
-/// SAT-competition verdict grammar or the CHC/DIMACS validation batteries
-/// along with it. Selected by [`proof_cycle_shed`].
+/// Distinct from [`COMPETITION_MODE_ENABLED`] on purpose: an explicit proof
+/// opt-out is not a request for the SAT-competition verdict grammar or for
+/// the CHC/DIMACS validation batteries to be switched off. Selected by
+/// [`proof_cycle_shed`], which a PLAIN solve never trips — proofs and
+/// certificates are the product, so the default keeps the cycle armed.
 pub(crate) static PROOF_CYCLE_SHED_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a benchmark harness requested competition behavior.
@@ -64,38 +65,48 @@ pub(crate) fn competition_mode(args: &SolveArgs) -> bool {
 /// memouts). Both now shed exactly what `--rigor fast` sheds. Nothing else
 /// changes for them: the CHC validation battery, the DIMACS proof re-check,
 /// and the verdict grammar stay as they were.
+///
+/// A PLAIN solve is deliberately NOT in this set. Between 2026-09-06 and this
+/// commit it was — `ay FILE.smt2` ran at the `fast` rung's proof posture, z3's
+/// own default — and the owner reversed that decision: proofs and certificates
+/// are what AY is for, and they are the signal that development is making
+/// progress, so a flagless solve records a proof, mints and strict-checks its
+/// certificate, and writes the `<input>.alethe` sidecar. `--z3-mode` is the
+/// explicit escape hatch for z3-exact behaviour (`--no-proof` and
+/// `--rigor fast` reach the same proof posture by their own routes).
 pub(crate) fn proof_cycle_shed(args: &SolveArgs) -> bool {
-    competition_mode(args) || args.no_proof || args.z3_mode || !certification_requested(args)
+    competition_mode(args) || args.no_proof || args.z3_mode
 }
 
-/// Whether this invocation asked AY to certify its own answer: any `--rigor`
-/// rung above `fast`, a legacy rigor alias (`--strict-proofs`,
-/// `--self-check`), an explicit proof artifact (`--proof` / `--drat` /
-/// `--lrat` / `--proof-artifact`), or a checker gate (`--verify-proof`,
-/// `--verify-firewall`, `--emit-firewall-lean`, `--lean-verify`).
+/// Whether the executors a library engine builds for its own SEARCH queries
+/// (`ay_core::MiscCliFlags::search_executor_sheds_proof_cycle`; today the CHC
+/// engines' SMT queries) shed the internal proof cycle.
 ///
-/// A plain solve (`ay FILE.smt2`, `ay solve FILE.smt2`, `ay -in`) asks for
-/// none of these and therefore runs at the `fast` rung's proof posture —
-/// z3's own default: no proof recorded during search, no certificate minted
-/// or re-checked, nothing written next to the input. Measured on the SMT-COMP
-/// corpus, the certified default cost 2.7x–20x the search time on UNSAT
-/// instances (gensys_icl161: search 0.23 s, mint 4.34 s; vlsat3_c35: 0.11 s
-/// vs 17.95 s) for sidecars that were frequently 26-byte `hole` files, and
-/// it left 46 stray `.alethe` files in the benchmark corpus in one day.
-/// Certification stays one flag away and is unchanged when asked for.
-pub(crate) fn certification_requested(args: &SolveArgs) -> bool {
-    args.assurance
-        .is_some_and(|level| level != super::CliAssuranceLevel::Fast)
-        || args.strict_proofs
-        || args.self_check
-        || args.proof.is_some()
-        || args.drat.is_some()
-        || args.drat_binary.is_some()
-        || args.lrat.is_some()
-        || args.lrat_binary.is_some()
-        || args.proof_artifact.is_some()
-        || args.verify_proof
-        || args.verify_firewall
-        || args.emit_firewall_lean.is_some()
-        || args.lean_verify
+/// This is the posture `run::new_executor`'s own executor EFFECTIVELY ends up
+/// in: [`proof_cycle_shed`] selects `set_competition_mode(true)`, and the
+/// executor-side precedence then re-arms the certified lanes for any proof
+/// demand (`--proof`, `--strict-proofs`, `--self-check`, `--verify-firewall`,
+/// `--emit-firewall-lean`, `--verify-proof`). Search executors get no such
+/// demand wired in (they never did — the CHC certificate lanes build their own
+/// proof-producing `api::Solver`), so the demand set is folded in HERE: under
+/// any of those flags they keep the default proof-carrying posture, exactly as
+/// before, and `--chc-checked-replay` (the opt-in checked replay that
+/// re-executes certificate obligations on a fresh search executor) is treated
+/// as a demand for the same reason. Measured on the LIA-Lin lustre consecution
+/// class (T8): 11.68 s default vs 6.48 s shed for identical verdicts.
+///
+/// One search sheds in every posture, whatever this returns: the CHC
+/// counterexample replay's bounded search (ay-chc `ScopedVerdictOnlySearch`).
+/// No claim and no certificate rests on its verdicts: its Safe and Unknown
+/// mean "not confirmed", and its Unsafe is accepted only by ground evaluation
+/// of a derivation, after the search, in the default posture.
+pub(crate) fn search_executor_sheds_proof_cycle(args: &SolveArgs) -> bool {
+    proof_cycle_shed(args)
+        && args.proof.is_none()
+        && !args.strict_proofs
+        && !args.self_check
+        && !args.verify_firewall
+        && args.emit_firewall_lean.is_none()
+        && !args.verify_proof
+        && !args.ab_switches.chc_checked_replay_requested()
 }

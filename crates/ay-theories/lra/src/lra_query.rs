@@ -36,13 +36,27 @@ impl LraSolver {
     /// Record that variable bounds may have changed (see `bound_revision`).
     #[inline]
     pub(crate) fn bump_bound_revision(&mut self) {
-        self.bound_revision += 1;
+        // The revision is only ever compared for equality against a stamp, so
+        // modular arithmetic is the intended semantics (like the crate's other
+        // epochs): a saturated counter would stop invalidating, a wrapped one
+        // could alias only after 2^64 bumps.
+        self.bound_revision = self.bound_revision.wrapping_add(1);
     }
 
     /// Get the current lower/upper bounds for a variable term, if known.
     ///
     /// This is primarily used by LIA to detect immediate integer infeasibility
     /// from bounds (e.g. `x > 5` and `x < 6` with `x : Int`).
+    /// Number of tableau rows (slack definitions) currently held. Rows are
+    /// never retracted on `pop`, so this is a monotone measure of the
+    /// tableau growth a scoped search (e.g. the NIA factor split) leaves
+    /// behind — exposed for measurement (#nia-factor-split-rows).
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Clone the current lower/upper bounds for a variable term (allocates;
+    /// prefer [`Self::get_bounds_ref`] on hot paths).
     pub fn get_bounds(&self, term: TermId) -> Option<(Option<Bound>, Option<Bound>)> {
         let &var = self.term_to_var.get(&term)?;
         let info = self.vars.get(var as usize)?;
@@ -304,13 +318,25 @@ impl LraSolver {
             let basic_info = &self.vars[basic_var as usize];
 
             // Check if fractional
-            if basic_info.value.rational().denom().is_one() {
-                continue; // Already integer
+            if basic_info.value.x().is_integer() {
+                continue; // Already integer (rational part; no BigRational built)
             }
 
-            // Extract bound information
-            let lower_bound = basic_info.lower.as_ref().map(Bound::value_big);
-            let upper_bound = basic_info.upper.as_ref().map(Bound::value_big);
+            // Extract bound information — JUSTIFIED bounds only
+            // (#nia-sign-cut-soundness): the LIA's GCD tests fold a fixed
+            // basic variable into the row constant and decide UNSAT from the
+            // remainder, so a model-derived NIA pin (reason = the variable
+            // term, never asserted) must read as no bound at all here.
+            let lower_bound = basic_info
+                .lower
+                .as_ref()
+                .filter(|b| self.bound_reasons_all_asserted(b))
+                .map(Bound::value_big);
+            let upper_bound = basic_info
+                .upper
+                .as_ref()
+                .filter(|b| self.bound_reasons_all_asserted(b))
+                .map(Bound::value_big);
             let is_fixed =
                 lower_bound.is_some() && upper_bound.is_some() && lower_bound == upper_bound;
             let is_bounded = lower_bound.is_some() && upper_bound.is_some();
@@ -395,8 +421,20 @@ impl LraSolver {
 
             let basic_info = &self.vars[basic_var as usize];
 
-            let lower_bound = basic_info.lower.as_ref().map(Bound::value_big);
-            let upper_bound = basic_info.upper.as_ref().map(Bound::value_big);
+            // JUSTIFIED bounds only (#nia-sign-cut-soundness): the Dioph row
+            // tightening derives a DIRECT bound from these values under the
+            // substitution reasons, so an unjustified (model-derived) bound
+            // here would be laundered into a bound with clean reasons.
+            let lower_bound = basic_info
+                .lower
+                .as_ref()
+                .filter(|b| self.bound_reasons_all_asserted(b))
+                .map(Bound::value_big);
+            let upper_bound = basic_info
+                .upper
+                .as_ref()
+                .filter(|b| self.bound_reasons_all_asserted(b))
+                .map(Bound::value_big);
 
             // Skip unbounded rows — no tightening possible
             if lower_bound.is_none() && upper_bound.is_none() {

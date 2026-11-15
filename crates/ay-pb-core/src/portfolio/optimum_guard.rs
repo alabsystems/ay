@@ -10,8 +10,7 @@
 // runs after parsing, so no `cfg` can hide one and a compiler without the extension
 // rejects the WHOLE FILE it appears in — here, 10k lines of portfolio solver.
 // `optimum_guard_stock.rs` is this fragment minus the clause; `portfolio.rs` selects
-// between them on `cfg(deductive_verify)`, and `tests/native_contract_twins.rs` pins the
-// two together.
+// between them on `cfg(deductive_verify)`.
 
 /// VIG-backed soundness guard for the `OptimumFound` upgrade.
 ///
@@ -33,7 +32,7 @@
 /// implementation to that exact gate.
 ///
 /// It is written in the native clause grammar, which the default
-/// (Trust) toolchain parses unconditionally — no `cfg` gate and no
+/// (`channel = "trust"`) toolchain parses unconditionally — no `cfg` gate and no
 /// `--extern trust` overlay, so unlike the ``
 /// spelling it replaced, this contract is present in every build that can read
 /// this file at all.
@@ -42,12 +41,6 @@
 /// (`result == verify_all_constraints(..)`, i.e. upgrading any feasible incumbent
 /// to OPTIMUM regardless of `value` vs `floor`) is UNSOUND and MUST be rejected
 /// by this gate's negative-control tests.
-///
-/// The `deductive_checks_fixture_conformance` pin on this body is RED, and has been since
-/// `fe36913a0` — see `eval/vig_core.rs` for the measured cause (rule 6 reaches a
-/// clause only WITHIN a signature line, and `trustfmt` reflows that form onto its
-/// own line unconditionally). It is a defect in the fixture normalization, not in
-/// this body, and it is not repaired here.
 fn optimum_upgrade_guard(
     value: i128,
     floor: i128,

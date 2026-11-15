@@ -18,13 +18,13 @@
 //!
 //! Based on Z3's `nla_tangent_lemmas.cpp`.
 
-#[cfg(any(test, kani))]
+#[cfg(test)]
 use num_rational::BigRational;
 
 /// Compute tangent plane value at point (a, b) for input (x, y)
 ///
 /// T(x, y) = a*y + b*x - a*b
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub(crate) fn tangent_plane(
     a: &BigRational,
     b: &BigRational,
@@ -39,7 +39,7 @@ pub(crate) fn tangent_plane(
 /// At point (a, b):
 /// - If (x-a) and (y-b) have same sign: underestimate (m >= T)
 /// - If (x-a) and (y-b) have opposite signs: overestimate (m <= T)
-#[cfg(any(test, kani))]
+#[cfg(test)]
 pub(crate) fn is_underestimate(
     a: &BigRational,
     b: &BigRational,

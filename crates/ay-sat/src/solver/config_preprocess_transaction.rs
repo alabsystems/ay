@@ -13,7 +13,9 @@ impl Solver {
     where
         F: Fn() -> bool + ?Sized,
     {
-        let reason = self.solve_stop_reason(should_stop)?;
+        let reason = self
+            .counted_step_stop_reason()
+            .or_else(|| self.solve_stop_reason(should_stop))?;
         let result = self.declare_unknown_with_reason(reason);
         self.trace_sat_result(&result);
         self.finish_tla_trace();
@@ -28,7 +30,9 @@ impl Solver {
     where
         F: Fn() -> bool + ?Sized,
     {
-        let reason = self.optional_solve_stop_reason(should_stop)?;
+        let reason = self
+            .counted_step_stop_reason()
+            .or_else(|| self.optional_solve_stop_reason(should_stop))?;
         let result = self.declare_assume_unknown_with_reason(reason);
         self.emit_diagnostic_assumption_result(&result);
         self.trace_result(SolveOutcome::Unknown);
@@ -37,22 +41,65 @@ impl Solver {
         Some(result)
     }
 
+    /// True once the attached proof writer latched a write or flush failure
+    /// (a full disk, a broken pipe). No certificate can be produced after
+    /// that: an UNSAT is answered unknown with
+    /// [`SatUnknownReason::ProofWriteFailure`] at finalization. The search goes
+    /// on (owner, 2026-09-19): a SAT answer is certified by its model, not by
+    /// the proof. The search after the latch is a degraded one — a proof
+    /// manager that cannot write rejects the planned forward adds that carry
+    /// hints, so some techniques add nothing — but it is sound, and it answers.
+    /// Writer-only on purpose: an LRAT structural fail-close downgrades at
+    /// finalize and must not stop search either.
+    #[inline]
+    pub(super) fn proof_output_failed(&self) -> bool {
+        self.proof_writer().is_some_and(ProofOutput::has_io_error)
+    }
+
+    /// The proof write failure the writer latched, as a caller-facing detail
+    /// (`proof write failed: <OS error>`), or `None` while the writer is
+    /// healthy. A SAT answer given after it is a real answer without a proof.
+    #[must_use]
+    pub fn proof_write_failure(&self) -> Option<String> {
+        self.proof_output_failed()
+            .then(|| self.proof_write_failure_detail())
+    }
+
+    /// The unknown detail for [`SatUnknownReason::ProofWriteFailure`], naming
+    /// the OS error the proof sink reported.
+    pub(super) fn proof_write_failure_detail(&self) -> String {
+        match self.proof_writer().and_then(ProofOutput::first_io_error) {
+            Some(error) => format!("proof write failed: {error}"),
+            None => "proof write failed (the writer reported no OS error)".to_string(),
+        }
+    }
+
     /// Classify a whole-solve cooperative stop in stable priority order.
     ///
     /// The shared interrupt covers both the external `Arc<AtomicBool>` and the
     /// process-memory trip wire. A real solve deadline is kept distinct from a
     /// callback stop so DPLL(T) can preserve timeout provenance.
+    ///
+    /// The search work made so far is reported first (`work_report.rs`), so a
+    /// work ceiling that `should_stop` reads counts every conflict before it.
     #[inline]
     pub(super) fn solve_stop_reason<F>(&self, should_stop: &F) -> Option<SatUnknownReason>
     where
         F: Fn() -> bool + ?Sized,
     {
-        if self.solve_deadline_expired() {
-            Some(SatUnknownReason::DeadlineExceeded)
-        } else if self.is_interrupted() || should_stop() {
-            Some(SatUnknownReason::Interrupted)
+        self.report_work_to_ledger();
+        if let Some(reason) = self.counted_stop_reason() {
+            Some(reason)
+        } else if self.solve_deadline_expired() {
+            Some(self.counted_latch_stop(SatUnknownReason::DeadlineExceeded))
+        } else if self.is_interrupted() {
+            Some(self.counted_latch_stop(SatUnknownReason::Interrupted))
+        } else if let Some(reason) = self.counted_callback_stop(should_stop) {
+            Some(reason)
+        } else if self.original_ledger_replay_failed() {
+            Some(SatUnknownReason::ProofFinalizationFailure)
         } else {
-            None
+            self.counted_stop_reason()
         }
     }
 
@@ -75,12 +122,14 @@ impl Solver {
     /// interrupt poll fires.
     #[inline]
     pub(super) fn active_interrupt_reason(&self) -> Option<SatUnknownReason> {
-        if !self.is_interrupted() {
+        if let Some(reason) = self.counted_stop_reason() {
+            Some(reason)
+        } else if !self.is_interrupted() {
             None
         } else if self.solve_deadline_expired() {
-            Some(SatUnknownReason::DeadlineExceeded)
+            Some(self.counted_latch_stop(SatUnknownReason::DeadlineExceeded))
         } else {
-            Some(SatUnknownReason::Interrupted)
+            Some(self.counted_latch_stop(SatUnknownReason::Interrupted))
         }
     }
 

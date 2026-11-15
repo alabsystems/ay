@@ -55,18 +55,42 @@ fn quantprod_a_guarded_forall_linear_bound_sat() {
     );
 }
 
+const GUARDED_LINEAR_BOUND_TWIN: &str = r#"(set-logic LIA)
+(declare-const a Int)
+(assert (forall ((x Int)) (=> (and (<= 0 x) (<= x 100)) (<= a (+ (* -5 x) 4)))))
+(assert (>= a -495))
+(check-sat)"#;
+
 /// Twin: tightening the free bound past the true minimum (-496) must refute.
 #[test]
 fn quantprod_a_guarded_forall_linear_bound_twin_unsat() {
     expect(
-        r#"(set-logic LIA)
-(declare-const a Int)
-(assert (forall ((x Int)) (=> (and (<= 0 x) (<= x 100)) (<= a (+ (* -5 x) 4)))))
-(assert (>= a -495))
-(check-sat)"#,
+        GUARDED_LINEAR_BOUND_TWIN,
         SolverOutcome::Unsat,
         "A guarded-forall wrong-fact twin",
     );
+}
+
+#[test]
+fn quantprod_a_guarded_forall_linear_bound_twin_strict_proof() {
+    let smt = format!(
+        "(set-option :produce-proofs true)\n(set-option :check-proofs-strict true)\n{GUARDED_LINEAR_BOUND_TWIN}\n(get-proof)"
+    );
+    let commands = ay_frontend::parse(&smt).expect("valid guarded bound script");
+    let mut executor = ay_dpll::Executor::new();
+    executor.set_timeout(Some(std::time::Duration::from_secs(60)));
+    let output = executor
+        .execute_all(&commands)
+        .expect("strict proof output");
+    assert_eq!(
+        output.first().map(String::as_str),
+        Some("unsat"),
+        "{output:?}"
+    );
+    let proof = output.last().expect("proof output");
+    assert!(proof.contains(":rule forall_inst"), "{proof}");
+    assert!(!proof.contains(":rule hole"), "{proof}");
+    println!("{proof}");
 }
 
 // ---------------------------------------------------------------- family F
@@ -245,6 +269,16 @@ fn quantprod_g3_definitional_forall_twin_unsat() {
 /// The g3 model must carry the DEFINITIONAL interpretation (z3 parity): a
 /// finite table cannot satisfy `forall x. f(x) = x*x`, so `(get-model)` has
 /// to emit the adopted `define-fun` body.
+///
+/// The binder's SPELLING is not part of the pin. This test used to match
+/// the literal `(* x_0 x_0)` — the binder the assert-time adoption minted
+/// when that adoption was the only elaboration of the definition. The first
+/// `check-sat` now rolls every assert-time macro back to build the raw
+/// fallback stack and adopts the definition again for the live stack
+/// (#defmacro-named-preuse, `ay_frontend`'s `definitional_check_sat`), and
+/// each elaboration mints a fresh binder (`x_3` today). Every such model
+/// is the same interpretation `λx. x*x`; the property is the body over the
+/// binder the printed `define-fun` declares, whatever it is called.
 #[test]
 fn quantprod_g3_model_emits_definitional_interp() {
     use ay_dpll::Executor;
@@ -267,10 +301,21 @@ fn quantprod_g3_model_emits_definitional_interp() {
         .iter()
         .find(|l| l.contains("(model"))
         .expect("model output");
+    let binder = definitional_binder(model, "f").unwrap_or_else(|| {
+        panic!("g3 model must define f by a one-binder define-fun, got: {model}")
+    });
     assert!(
-        model.contains("define-fun f") && model.contains("(* x_0 x_0)"),
+        model.contains(&format!("(* {binder} {binder})")),
         "g3 model must define f by its definitional body, got: {model}"
     );
+}
+
+/// The binder of `(define-fun <name> ((<binder> <sort>)) …)` in a printed
+/// model, if the model defines `name` by a `define-fun` with a binder list.
+fn definitional_binder<'a>(model: &'a str, name: &str) -> Option<&'a str> {
+    let head = format!("(define-fun {name} ((");
+    let start = model.find(&head)? + head.len();
+    model[start..].split_whitespace().next()
 }
 
 /// Adoption must FAIL CLOSED when the symbol was already used by an earlier

@@ -14,9 +14,15 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 use super::super::types::RelationType;
 
+mod scans;
+use scans::{
+    contains_all_checked, contains_any_checked, has_bv2nat_constant_contradiction_checked,
+};
+
 /// Returns true when `expr` is variable-free and therefore denotes a ground term.
 fn is_var_free(expr: &ChcExpr) -> bool {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(lambda) => lambda.captures().iter().all(|value| is_var_free(value)),
         ChcExpr::Var(_) => false,
         ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
             args.iter().all(|arg| is_var_free(arg))
@@ -96,195 +102,95 @@ pub(in crate::pdr) fn collect_equalities_for_point_check(
 
 /// Check if a formula contains a trivial contradiction: A AND NOT(A)
 pub(crate) fn is_trivial_contradiction(expr: &ChcExpr) -> bool {
-    let conjuncts = expr.collect_conjuncts();
-    let mut positive_conjuncts: FxHashSet<&ChcExpr> = FxHashSet::default();
-    let mut negated_conjuncts: FxHashSet<&ChcExpr> = FxHashSet::default();
+    is_trivial_contradiction_checked(expr, || false).unwrap_or(false)
+}
 
-    // Track seen conjuncts and negated forms in O(C) time.
+/// A cancelled scan returns no mathematical answer, never a partial
+/// contradiction result. The ordinary wrapper retains the complete scan.
+pub(crate) fn is_trivial_contradiction_checked(
+    expr: &ChcExpr,
+    mut stop: impl FnMut() -> bool,
+) -> Option<bool> {
+    let result = trivial_contradiction_inner(expr, &mut stop)?;
+    if stop() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn trivial_contradiction_inner(expr: &ChcExpr, mut stop: &mut dyn FnMut() -> bool) -> Option<bool> {
+    let conjuncts = expr.collect_conjuncts_checked(&mut stop)?;
+    let mut positive: FxHashSet<&ChcExpr> = FxHashSet::default();
+    let mut negated: FxHashSet<&ChcExpr> = FxHashSet::default();
     for conjunct in &conjuncts {
+        if stop() {
+            return None;
+        }
         match conjunct {
             ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
                 let inner = args[0].as_ref();
-                if positive_conjuncts.contains(inner) {
-                    return true;
+                if positive.contains(inner) {
+                    return Some(true);
                 }
                 if let ChcExpr::Op(ChcOp::Or, disjuncts) = inner {
-                    if disjuncts
-                        .iter()
-                        .any(|disjunct| positive_conjuncts.contains(disjunct.as_ref()))
-                    {
-                        return true;
+                    if contains_any_checked(&positive, disjuncts, &mut stop)? {
+                        return Some(true);
                     }
                 }
-                negated_conjuncts.insert(inner);
+                negated.insert(inner);
             }
             _ => {
-                if negated_conjuncts.contains(conjunct) {
-                    return true;
+                if negated.contains(conjunct) {
+                    return Some(true);
                 }
-                if negated_conjuncts.iter().any(|negated| {
-                    matches!(
-                        negated,
-                        ChcExpr::Op(ChcOp::Or, disjuncts)
-                            if disjuncts.iter().any(|disjunct| disjunct.as_ref() == conjunct)
-                    )
-                }) {
-                    return true;
+                for prior in &negated {
+                    if stop() {
+                        return None;
+                    }
+                    if let ChcExpr::Op(ChcOp::Or, disjuncts) = prior {
+                        for disjunct in disjuncts {
+                            if stop() {
+                                return None;
+                            }
+                            if disjunct.as_ref() == conjunct {
+                                return Some(true);
+                            }
+                        }
+                    }
                 }
-                positive_conjuncts.insert(conjunct);
+                positive.insert(conjunct);
             }
         }
     }
-
-    for negated in &negated_conjuncts {
-        match negated {
-            ChcExpr::Op(ChcOp::Or, disjuncts)
-                if disjuncts
-                    .iter()
-                    .any(|disjunct| positive_conjuncts.contains(disjunct.as_ref())) =>
-            {
-                return true;
+    for prior in &negated {
+        if stop() {
+            return None;
+        }
+        match prior {
+            ChcExpr::Op(ChcOp::Or, disjuncts) => {
+                if contains_any_checked(&positive, disjuncts, &mut stop)? {
+                    return Some(true);
+                }
             }
-            ChcExpr::Op(ChcOp::And, inner_conjuncts)
-                if inner_conjuncts
-                    .iter()
-                    .all(|inner| positive_conjuncts.contains(inner.as_ref())) =>
-            {
-                return true;
+            ChcExpr::Op(ChcOp::And, inner) => {
+                if contains_all_checked(&positive, inner, &mut stop)? {
+                    return Some(true);
+                }
             }
             _ => {}
         }
     }
-
-    // Check for relational contradictions: (a <= b) and (a > b), etc.
-    // Also handle patterns like (a >= b) and (not (= a b)) and (a <= b) which implies a > b
-    if has_relational_contradiction(&conjuncts) {
-        return true;
+    if has_relational_contradiction_checked(&conjuncts, &mut stop)? {
+        return Some(true);
     }
-
-    if has_bv2nat_constant_contradiction(&conjuncts) {
-        return true;
+    if has_bv2nat_constant_contradiction_checked(&conjuncts, &mut stop)? {
+        return Some(true);
     }
-
-    false
-}
-
-fn has_bv2nat_constant_contradiction(conjuncts: &[ChcExpr]) -> bool {
-    let mut bv_equalities: FxHashMap<ChcVar, u128> = FxHashMap::default();
-
-    for conjunct in conjuncts {
-        if let Some((var, bits)) = extract_bv_var_const_equality(conjunct) {
-            if let Some(previous) = bv_equalities.insert(var, bits) {
-                if previous != bits {
-                    return true;
-                }
-            }
-        }
-    }
-
-    for conjunct in conjuncts {
-        let Some((var, int_value, is_equality)) = extract_bv2nat_int_literal(conjunct) else {
-            continue;
-        };
-        let Some(&bits) = bv_equalities.get(&var) else {
-            continue;
-        };
-        let Some(int_bits) = non_negative_int_to_u128(int_value) else {
-            if is_equality {
-                return true;
-            }
-            continue;
-        };
-
-        let equal = bits == int_bits;
-        if (is_equality && !equal) || (!is_equality && equal) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn extract_bv_var_const_equality(expr: &ChcExpr) -> Option<(ChcVar, u128)> {
-    let ChcExpr::Op(ChcOp::Eq, args) = expr else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    bv_var_const_pair(args[0].as_ref(), args[1].as_ref())
-        .or_else(|| bv_var_const_pair(args[1].as_ref(), args[0].as_ref()))
-}
-
-fn bv_var_const_pair(lhs: &ChcExpr, rhs: &ChcExpr) -> Option<(ChcVar, u128)> {
-    let ChcExpr::Var(var) = lhs else {
-        return None;
-    };
-    let ChcSort::BitVec(var_width) = var.sort else {
-        return None;
-    };
-    let ChcExpr::BitVec(bits, value_width) = rhs else {
-        return None;
-    };
-    if var_width != *value_width {
-        return None;
-    }
-    Some((var.clone(), *bits))
-}
-
-fn extract_bv2nat_int_literal(expr: &ChcExpr) -> Option<(ChcVar, i128, bool)> {
-    match expr {
-        ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
-            bv2nat_int_pair(args[0].as_ref(), args[1].as_ref(), true)
-                .or_else(|| bv2nat_int_pair(args[1].as_ref(), args[0].as_ref(), true))
-        }
-        ChcExpr::Op(ChcOp::Ne, args) if args.len() == 2 => {
-            bv2nat_int_pair(args[0].as_ref(), args[1].as_ref(), false)
-                .or_else(|| bv2nat_int_pair(args[1].as_ref(), args[0].as_ref(), false))
-        }
-        ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => match args[0].as_ref() {
-            ChcExpr::Op(ChcOp::Eq, eq_args) if eq_args.len() == 2 => {
-                bv2nat_int_pair(eq_args[0].as_ref(), eq_args[1].as_ref(), false)
-                    .or_else(|| bv2nat_int_pair(eq_args[1].as_ref(), eq_args[0].as_ref(), false))
-            }
-            ChcExpr::Op(ChcOp::Ne, ne_args) if ne_args.len() == 2 => {
-                bv2nat_int_pair(ne_args[0].as_ref(), ne_args[1].as_ref(), true)
-                    .or_else(|| bv2nat_int_pair(ne_args[1].as_ref(), ne_args[0].as_ref(), true))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn bv2nat_int_pair(
-    lhs: &ChcExpr,
-    rhs: &ChcExpr,
-    is_equality: bool,
-) -> Option<(ChcVar, i128, bool)> {
-    let ChcExpr::Op(ChcOp::Bv2Nat, args) = lhs else {
-        return None;
-    };
-    if args.len() != 1 {
-        return None;
-    }
-    let ChcExpr::Var(var) = args[0].as_ref() else {
-        return None;
-    };
-    if !matches!(var.sort, ChcSort::BitVec(_)) {
-        return None;
-    }
-    let ChcExpr::Int(value) = rhs else {
-        return None;
-    };
-    Some((var.clone(), *value, is_equality))
-}
-
-fn non_negative_int_to_u128(value: i128) -> Option<u128> {
-    if value < 0 {
+    if stop() {
         None
     } else {
-        Some(value as u128)
+        Some(false)
     }
 }
 
@@ -293,8 +199,15 @@ fn non_negative_int_to_u128(value: i128) -> Option<u128> {
 /// - (a <= b) and (a > b) → contradiction
 /// - (a <= b) and (a >= b) and (a != b) → contradiction (since a <= b && a >= b implies a = b)
 pub(in crate::pdr) fn has_relational_contradiction(conjuncts: &[ChcExpr]) -> bool {
+    has_relational_contradiction_checked(conjuncts, &mut || false).unwrap_or(false)
+}
+
+pub(in crate::pdr) fn has_relational_contradiction_checked(
+    conjuncts: &[ChcExpr],
+    stop: &mut dyn FnMut() -> bool,
+) -> Option<bool> {
     // Extract relational constraints from conjuncts
-    let relations = extract_implied_relations_from_conjuncts(conjuncts);
+    let relations = extract_implied_relations_from_conjuncts_checked(conjuncts, stop)?;
 
     // O(R) HashMap-based contradiction check (#3036).
     // For each normalized variable pair, accumulate all relations seen so far.
@@ -305,6 +218,9 @@ pub(in crate::pdr) fn has_relational_contradiction(conjuncts: &[ChcExpr]) -> boo
     let mut seen: FxHashMap<(String, String), Vec<RelationType>> = FxHashMap::default();
 
     for (v1, v2, rel) in &relations {
+        if stop() {
+            return None;
+        }
         // Normalize to canonical order (v1 <= v2 lexicographically) so
         // (a,b) and (b,a) map to the same bucket.
         let (key, normalized_rel) = if v1 <= v2 {
@@ -317,25 +233,38 @@ pub(in crate::pdr) fn has_relational_contradiction(conjuncts: &[ChcExpr]) -> boo
         // Check new relation against all previously seen relations for this pair.
         // At most 4 distinct relation types exist, so this is O(1).
         for &existing in entry.iter() {
+            if stop() {
+                return None;
+            }
             if relations_contradict(existing, normalized_rel) {
-                return true;
+                return Some(true);
             }
         }
         entry.push(normalized_rel);
     }
 
-    false
+    Some(false)
 }
 
 /// Extract implied relations from a list of conjuncts.
 pub(super) fn extract_implied_relations_from_conjuncts(
     conjuncts: &[ChcExpr],
 ) -> Vec<(String, String, RelationType)> {
+    extract_implied_relations_from_conjuncts_checked(conjuncts, &mut || false).unwrap_or_default()
+}
+
+pub(super) fn extract_implied_relations_from_conjuncts_checked(
+    conjuncts: &[ChcExpr],
+    stop: &mut dyn FnMut() -> bool,
+) -> Option<Vec<(String, String, RelationType)>> {
     let mut result = Vec::new();
     let mut disequalities: FxHashSet<(String, String)> = FxHashSet::default();
 
     // Single pass: collect direct relations and disequality pairs.
     for conjunct in conjuncts {
+        if stop() {
+            return None;
+        }
         if let Some(rel) = extract_relational_constraint(conjunct) {
             result.push(rel);
         }
@@ -347,6 +276,9 @@ pub(super) fn extract_implied_relations_from_conjuncts(
     // Add strengthened bounds for (a >= b /\ a != b) and (a <= b /\ a != b).
     let direct_len = result.len();
     for idx in 0..direct_len {
+        if stop() {
+            return None;
+        }
         let (v1, v2, rel) = &result[idx];
         if disequalities.contains(&normalize_var_pair(v1, v2)) {
             let strengthened = match rel {
@@ -360,7 +292,7 @@ pub(super) fn extract_implied_relations_from_conjuncts(
         }
     }
 
-    result
+    Some(result)
 }
 
 /// Extract a relational constraint from an expression.

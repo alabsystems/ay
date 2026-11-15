@@ -314,10 +314,12 @@ impl PdrSolver {
                 let canonical_cond = ite_cond.substitute(&subst);
 
                 // Collect facts for this predicate
-                for fact in self
+                for (fact_index, fact) in self
                     .problem
-                    .facts()
-                    .filter(|f| f.head.predicate_id() == Some(body_pred))
+                    .clauses()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.is_fact() && f.head.predicate_id() == Some(body_pred))
                 {
                     let fact_constraint =
                         fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
@@ -329,6 +331,22 @@ impl PdrSolver {
                     if head_args.len() != canonical_vars.len() {
                         continue;
                     }
+                    // `canonical_cond` keeps the step clause's non-argument
+                    // variables; rename the fact apart so a shared letter
+                    // cannot equate them with the fact's locals.
+                    let Some((fact_constraint, head_args)) =
+                        self.source_names().and_then(|names| {
+                            self.rename_clause_apart(
+                                &names,
+                                &format!("__fact{fact_index}_"),
+                                &fact_constraint,
+                                &head_args,
+                                [&canonical_cond],
+                            )
+                        })
+                    else {
+                        continue;
+                    };
 
                     candidates.push(IteCandidate {
                         body_pred,

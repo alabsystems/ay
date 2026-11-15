@@ -40,13 +40,20 @@ struct RootPropagation {
     cone_stack: Vec<u32>,
     /// Literal-keyed occurrence index over the ORIGINAL canonical clauses
     /// (CSR: `heads[code]..heads[code + 1]` are 0-based clause positions
-    /// whose clause contains the literal with that code). Scanning the
+    /// whose clause contains the literal with that code). Root-satisfied
+    /// clauses and root-assigned occurrences are omitted: rooted rows only
+    /// extend the root assignment, and opposed targets use full synthesis.
+    /// Original clauses and reason ids remain unchanged for replay. Scanning the
     /// bucket of a literal the row's propagation just falsified visits
     /// exactly the original clauses that can newly become unit, so per-row
     /// repair costs the propagation cascade instead of a database sweep.
     /// `None` when the namespace exceeds the `u32` build guard.
     index_heads: Option<Vec<u32>>,
     index_items: Vec<u32>,
+    /// Reuses the CSR build cursor, whose full capacity/header remains in the
+    /// conservative root-index allowance throughout conversion. Marks are
+    /// row-local; only monotone satisfied/unit originals may be retired.
+    index_retired: rooted_retirement::RetiredOriginals,
 }
 
 /// Occurrence-index code of a literal: `2 * var + polarity`.
@@ -61,6 +68,7 @@ fn compute_root_propagation(
     original_clauses: &[(u64, Vec<Literal>)],
     fixed_unit_premises: &[Literal],
     num_vars: usize,
+    admitted_index_bytes: usize,
     meter: &mut ConversionMeter<'_>,
 ) -> Result<RootPropagation, ResolutionValidationError> {
     let mut root = RootPropagation {
@@ -77,6 +85,7 @@ fn compute_root_propagation(
         cone_stack: Vec::new(),
         index_heads: None,
         index_items: Vec::new(),
+        index_retired: rooted_retirement::RetiredOriginals::default(),
     };
     reserve_root_propagation_buffers(&mut root, num_vars, meter)?;
 
@@ -89,7 +98,13 @@ fn compute_root_propagation(
         return Ok(root);
     }
 
-    build_root_occurrence_index(&mut root, original_clauses, num_vars, meter)?;
+    root_occurrence_index::build(
+        &mut root,
+        original_clauses,
+        num_vars,
+        admitted_index_bytes,
+        meter,
+    )?;
     Ok(root)
 }
 
@@ -315,6 +330,7 @@ fn propagate_root_clauses(
 /// point that mutates per-row scratch runs this on ALL exits (including `?`
 /// failures) via [`compact_rup_hint_candidates_rooted`]'s single-exit shape.
 fn rooted_repair_cleanup(root: &mut RootPropagation) {
+    root.index_retired.clear();
     while let Some(variable) = root.row_trail.pop() {
         root.assign[variable as usize] = None;
         root.cand_reason[variable as usize] = 0;
@@ -324,86 +340,4 @@ fn rooted_repair_cleanup(root: &mut RootPropagation) {
         root.cone_mark[variable as usize] = 0;
     }
     root.cone_stack.clear();
-}
-
-fn build_root_occurrence_index(
-    root: &mut RootPropagation,
-    original_clauses: &[(u64, Vec<Literal>)],
-    num_vars: usize,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<(), ResolutionValidationError> {
-    // Build the literal-keyed occurrence index over the originals (two-pass
-    // CSR). Skipped — leaving the index `None` and the per-row lane to its
-    // candidate passes plus the full-sweep fallback — when the namespace
-    // exceeds the u32 build guard.
-    let total_literals: usize = original_clauses.iter().map(|(_, c)| c.len()).sum();
-    let code_count = num_vars.checked_mul(2).and_then(|n| n.checked_add(1));
-    if let Some(code_count) = code_count {
-        if u32::try_from(total_literals).is_ok() && u32::try_from(original_clauses.len()).is_ok() {
-            let mut heads: Vec<u32> = Vec::new();
-            reserve_exact(
-                &mut heads,
-                code_count,
-                ResolutionValidationResource::AssignmentScratch,
-                meter,
-            )?;
-            let mut filled = 0usize;
-            while filled < code_count {
-                let chunk = (code_count - filled).min(CONTROL_POLL_INTERVAL);
-                meter.charge(chunk)?;
-                filled += chunk;
-                heads.resize(filled, 0);
-            }
-            for (_, clause) in original_clauses {
-                for &literal in clause {
-                    meter.charge(1)?;
-                    heads[literal_code(literal.variable().index(), literal.is_positive())] += 1;
-                }
-            }
-            let mut running = 0u32;
-            for head in heads.iter_mut() {
-                meter.charge(1)?;
-                let count = *head;
-                *head = running;
-                running = running.saturating_add(count);
-            }
-            let mut items: Vec<u32> = Vec::new();
-            reserve_exact(
-                &mut items,
-                total_literals,
-                ResolutionValidationResource::AssignmentScratch,
-                meter,
-            )?;
-            let mut fill = 0usize;
-            while fill < total_literals {
-                let chunk = (total_literals - fill).min(CONTROL_POLL_INTERVAL);
-                meter.charge(chunk)?;
-                fill += chunk;
-                items.resize(fill, 0);
-            }
-            let mut cursor: Vec<u32> = Vec::new();
-            reserve_exact(
-                &mut cursor,
-                heads.len(),
-                ResolutionValidationResource::AssignmentScratch,
-                meter,
-            )?;
-            meter.charge(heads.len())?;
-            cursor.extend_from_slice(&heads);
-            for (position, (_, clause)) in original_clauses.iter().enumerate() {
-                for &literal in clause {
-                    meter.charge(1)?;
-                    let code = literal_code(literal.variable().index(), literal.is_positive());
-                    items[cursor[code] as usize] = position as u32;
-                    cursor[code] += 1;
-                }
-            }
-            // After the prefix sum, `heads[code]..heads[code + 1]` is the
-            // bucket of `code` (codes occupy 0..2 * num_vars, and the extra
-            // trailing slot holds the total as the sentinel).
-            root.index_heads = Some(heads);
-            root.index_items = items;
-        }
-    }
-    Ok(())
 }

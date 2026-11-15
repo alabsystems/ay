@@ -102,8 +102,7 @@ fn exports_symbolic_linear_identity_as_poly_simp_not_la_generic() {
     assert!(!alethe.contains(":rule hole"), "{alethe}");
     assert_carcara_accepts("lia_symbolic_linear_identity_poly_simp", PROBLEM, &alethe);
 
-    let old_la_generic =
-        alethe.replacen(":rule poly_simp", ":rule la_generic :args (1)", 1);
+    let old_la_generic = alethe.replacen(":rule poly_simp", ":rule la_generic :args (1)", 1);
     assert_carcara_verdict(
         "lia_symbolic_linear_identity_old_la_generic",
         PROBLEM,
@@ -248,13 +247,22 @@ fn pinned_carcara_accepts_a_shared_opaque_nonlinear_product() {
 
     let sum_two = terms.mk_app(ay_core::Symbol::named("*"), [sum, two], Sort::Int);
     let i_three = terms.mk_app(ay_core::Symbol::named("*"), [i, three], Sort::Int);
-    let bound_lhs =
-        terms.mk_app(ay_core::Symbol::named("+"), [sum_two, i_three, one], Sort::Int);
+    let bound_lhs = terms.mk_app(
+        ay_core::Symbol::named("+"),
+        [sum_two, i_three, one],
+        Sort::Int,
+    );
     let i_two = terms.mk_app(ay_core::Symbol::named("*"), [i, two], Sort::Int);
-    let bound_rhs =
-        terms.mk_app(ay_core::Symbol::named("+"), [i_two, i_squared, one], Sort::Int);
-    let bound =
-        terms.mk_app(ay_core::Symbol::named("<="), [bound_lhs, bound_rhs], Sort::Bool);
+    let bound_rhs = terms.mk_app(
+        ay_core::Symbol::named("+"),
+        [i_two, i_squared, one],
+        Sort::Int,
+    );
+    let bound = terms.mk_app(
+        ay_core::Symbol::named("<="),
+        [bound_lhs, bound_rhs],
+        Sort::Bool,
+    );
     let not_eq1 = terms.mk_not_raw(eq1);
     let not_eq2 = terms.mk_not_raw(eq2);
     let not_bound = terms.mk_not_raw(bound);
@@ -273,8 +281,7 @@ fn pinned_carcara_accepts_a_shared_opaque_nonlinear_product() {
     proof.add_resolution(Vec::new(), bound, h2, bound_unit);
 
     check_proof_strict(&proof, &terms).expect("opaque-product Farkas proof validates strictly");
-    let alethe =
-        export_alethe_with_problem_scope(&proof, &terms, &[eq1, eq2, not_bound]);
+    let alethe = export_alethe_with_problem_scope(&proof, &terms, &[eq1, eq2, not_bound]);
     assert!(
         alethe.contains(":rule la_generic :args (-1 -1 1)"),
         "{alethe}"

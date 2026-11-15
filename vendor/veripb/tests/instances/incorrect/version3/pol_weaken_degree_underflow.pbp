@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `w` used to decrement the degree of a general PB constraint with a
+% plain `-=`, so a legal degree of i64::MIN wrapped to a huge positive number and the
+% weakened constraint became the empty contradiction. The formula is satisfiable.
+f 2 ;
+rup 2 x1 >= -9223372036854775808 ;
+pol 3 x1 w ;
+output NONE;
+conclusion UNSAT : 4 ;
+end pseudo-Boolean proof;

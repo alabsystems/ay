@@ -12,8 +12,13 @@
 // subset of it.
 mod common;
 
+#[path = "group_proofs/native_choice_named_goal.rs"]
+mod native_choice_named_goal;
+
 #[path = "group_proofs/array_collapse_promotion.rs"]
 mod array_collapse_promotion;
+#[path = "group_proofs/authored_bv_bitblast_fold_refutation.rs"]
+mod authored_bv_bitblast_fold_refutation;
 #[path = "group_proofs/authored_fold_to_false_refutation.rs"]
 mod authored_fold_to_false_refutation;
 #[path = "group_proofs/carcara_external_check.rs"]
@@ -32,14 +37,26 @@ mod combined_proof_provenance_6759;
 mod complementary_literal_rebuild;
 #[path = "group_proofs/congruence_collapse_rebuild.rs"]
 mod congruence_collapse_rebuild;
+#[path = "group_proofs/cross_sort_bridge_equality.rs"]
+mod cross_sort_bridge_equality;
 #[path = "group_proofs/ematching_forall_farkas_rebuild.rs"]
 mod ematching_forall_farkas_rebuild;
+#[path = "group_proofs/exact_division_sweep_memo.rs"]
+mod exact_division_sweep_memo;
+#[path = "group_proofs/fold_identity_refutation.rs"]
+mod fold_identity_refutation;
+#[path = "group_proofs/in_script_strict_bitblast_publication.rs"]
+mod in_script_strict_bitblast_publication;
 #[path = "group_proofs/incremental_clausification_proofs.rs"]
 mod incremental_clausification_proofs;
 #[path = "group_proofs/incremental_proof_quality_8154.rs"]
 mod incremental_proof_quality_8154;
 #[path = "group_proofs/ite_lift_substituted_bound_rebuild.rs"]
 mod ite_lift_substituted_bound_rebuild;
+#[path = "group_proofs/lattice_closure_level0_refutation.rs"]
+mod lattice_closure_level0_refutation;
+#[path = "group_proofs/level0_lazy_implied_bound_proof.rs"]
+mod level0_lazy_implied_bound_proof;
 #[path = "group_proofs/linear_and_collapse_rebuild.rs"]
 mod linear_and_collapse_rebuild;
 #[path = "group_proofs/multi_equality_farkas_rebuild.rs"]
@@ -60,3 +77,7 @@ mod proof_tracking_e2e;
 mod proof_tracking_incremental_6716;
 #[path = "group_proofs/proof_tracking_lia_assumptions_6725.rs"]
 mod proof_tracking_lia_assumptions_6725;
+#[path = "group_proofs/shared_quantifier_fold_refutation.rs"]
+mod shared_quantifier_fold_refutation;
+#[path = "group_proofs/urem_bound_before_division.rs"]
+mod urem_bound_before_division;

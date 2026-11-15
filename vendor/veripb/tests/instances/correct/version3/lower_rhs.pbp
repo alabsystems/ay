@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+f 1;
+pol 1 5 -;
+e 1 x1 3 x2 5 x3 >= 3 : 2;
+pol 2 5 -;
+e 1 x1 3 x2 5 x3 >= -2 : 3;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

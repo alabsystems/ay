@@ -264,9 +264,7 @@ impl Executor {
     /// (#select roots × max chain depth); `cap` bounds emission on top.
     /// Returns the number of clauses emitted.
     pub(in crate::executor) fn add_array_row_deep_peel_clauses(&mut self, cap: usize) -> usize {
-        let should_stop = self.make_should_stop();
-        let top_level_disequalities = self.collect_top_level_disequalities();
-        let mut worklist: Vec<(TermId, TermId, TermId)> = Vec::new();
+        let mut roots: Vec<(TermId, TermId, TermId)> = Vec::new();
         for (select_term, base_array, store_index, store_value, sel_index) in
             self.collect_array_row_patterns()
         {
@@ -275,8 +273,41 @@ impl Executor {
                 continue;
             };
             debug_assert!(sym.name() == "select" && args.len() == 2);
-            worklist.push((select_term, args[0], sel_index));
+            roots.push((select_term, args[0], sel_index));
         }
+        self.add_array_row_deep_peel_clauses_from(roots, cap)
+    }
+
+    /// The deep peel of [`Self::add_array_row_deep_peel_clauses`] started
+    /// from the given `select` terms only (each `select(store(..), k)` is
+    /// peeled layer by layer down to its chain's base); a `select` over a
+    /// non-store is skipped. Used where only a few reads are new, so the peel
+    /// does not re-expand every read in the problem.
+    pub(in crate::executor) fn add_array_row_deep_peel_clauses_for_selects(
+        &mut self,
+        selects: &[TermId],
+        cap: usize,
+    ) -> usize {
+        let roots: Vec<(TermId, TermId, TermId)> = selects
+            .iter()
+            .filter_map(|&select_term| match self.ctx.terms.get(select_term) {
+                TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
+                    Some((select_term, args[0], args[1]))
+                }
+                _ => None,
+            })
+            .collect();
+        self.add_array_row_deep_peel_clauses_from(roots, cap)
+    }
+
+    fn add_array_row_deep_peel_clauses_from(
+        &mut self,
+        roots: Vec<(TermId, TermId, TermId)>,
+        cap: usize,
+    ) -> usize {
+        let should_stop = self.make_should_stop();
+        let top_level_disequalities = self.collect_top_level_disequalities();
+        let mut worklist = roots;
         let mut visited: HashSet<TermId> = HashSet::default();
         let mut emitted = 0_usize;
         while let Some((select_term, array, sel_index)) = worklist.pop() {

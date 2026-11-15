@@ -147,7 +147,7 @@ fn transform_accepts_unused_datatype_prelude_and_preserves_metadata() {
 #[test]
 fn transform_is_identity_when_a_datatype_is_actively_used() {
     let mut problem = const_zero_array_problem();
-    let constructors = std::sync::Arc::new(vec![crate::ChcDtConstructor {
+    let constructors = crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
         name: "active-model-checker-consumer-box".to_string(),
         selectors: vec![crate::ChcDtSelector {
             name: "active-model-checker-consumer-value".to_string(),
@@ -1669,6 +1669,7 @@ fn invalidity_backtranslation_strips_ghost_assignments() {
     let cex = Counterexample {
         steps: vec![CounterexampleStep::new(p, assignments)],
         witness: None,
+        compact_derivation: None,
         ground_derivation: None,
     };
 

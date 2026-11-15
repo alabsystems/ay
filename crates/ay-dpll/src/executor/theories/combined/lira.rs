@@ -7,7 +7,7 @@
 //! Non-LIRA theory combinations (UF+LRA, UF+NRA, AUFLIA, AUFLRA, BV+LIA)
 //! are in the parent module.
 
-use crate::combined_solvers::{AufLiraSolver, LiraSolver};
+use crate::combined_solvers::{AufLiraSolver, LiraSolver, SplitLoopReads};
 use crate::executor::theories::solve_harness::{ProofProblemAssertionProvenance, TheoryModels};
 use crate::executor_types::{Result, SolveResult};
 use ay_core::term::TermData;
@@ -15,6 +15,18 @@ use ay_core::{Sort, TermId};
 
 use super::super::super::Executor;
 use super::super::MAX_SPLITS_MIXED;
+
+/// Escalated primary-conflict retention budget for the lazy LIRA lanes
+/// (DR-AY-LIRA-RETAIN-ESCALATION-20261113). The pinned smtopt trajectory
+/// decides at 111 theory conflicts, so 512 keeps it -- and every shorter
+/// trajectory -- bit-identical, while cruise-class forget-and-re-derive
+/// churn (identical 116-lit Farkas core re-derived 108x) flips to
+/// retained cores past the budget and converges (unsat after 1,620
+/// retained-routed theory conflicts, ~31 s from conflict #1).
+const LIRA_RETAIN_PRIMARY_AFTER: u64 = 512;
+
+mod ite_lift;
+mod root_congruence;
 
 impl Executor {
     /// Solve using combined LIA + LRA theory with assumptions (QF_LIRA).
@@ -87,7 +99,8 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                         || solve_deadline.expired()
-                }
+                },
+                retain_primary_after: LIRA_RETAIN_PRIMARY_AFTER
             )
         })
     }
@@ -238,18 +251,28 @@ impl Executor {
                         let ds = theory.take_dioph_state();
                         (lc, hc, ds)
                     },
-                    // #5462: LIRA stays on lazy path. Cross-sort NeedSplit requires
-                    // the N-O fixpoint to run inside the SAT solve (extension check),
-                    // but the eager arm's theory recreation loses cross-sort state
-                    // between iterations. The extension fix (returning Sat for
-                    // NeedSplit) helps but doesn't fully resolve multi-split SAT
-                    // problems that depend on cross-sort bound propagation.
+                    // #5462: LIRA stays on the lazy path — now by measurement,
+                    // not just by the recreation argument. The eager-PERSISTENT
+                    // arm (theory created once, `soft_reset_warm` per
+                    // iteration, so cross-sort state survives) was implemented
+                    // on top of the LiraSolver lifetime-drop and A/B'd
+                    // (DR-AY-LIRA-PERSISTENT-REJECTED-20261107): 216-file
+                    // stratum, 155 vs 154 decided, 0 wrong, but it LOSES the
+                    // pinned smtopt trajectory (`sat` 3.0s at 107,279
+                    // decisions/236 conflicts lazy -> `unknown` at 20s,
+                    // 57,824 decisions/3,197 conflicts eager). One loss on a
+                    // pinned file fails the no-loss bar, so the flip was
+                    // reverted. The adapter retains its store-borrow lifetime;
+                    // detached Arc caches and `soft_reset_warm` plumbing stay.
+                    // Any future persistent owner must preserve that lifetime
+                    // and its auto-traits rather than erase them for boxing.
                     pre_iter_check: |_s| {
                         solve_interrupt
                             .as_ref()
                             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                             || solve_deadline.expired()
-                    }
+                    },
+                    retain_primary_after: LIRA_RETAIN_PRIMARY_AFTER
                 )
             })?;
         if !matches!(result, SolveResult::Unknown) {
@@ -340,7 +363,8 @@ impl Executor {
                             .as_ref()
                             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                             || solve_deadline.expired()
-                    }
+                    },
+                    retain_primary_after: LIRA_RETAIN_PRIMARY_AFTER
                 )
             });
         // #div0: mod/div elimination of a (possibly) zero divisor introduces an
@@ -585,8 +609,8 @@ impl Executor {
         let (mut preprocessed_assertions, mut proof_provenance) =
             self.preprocess_mod_div_assertions_with_proof_provenance(&self.ctx.assertions.clone());
 
-        // NOTE: expand_select_store is NOT applied here — solve_auflira does not
-        // have ITE lifting. See solve_auf_lia for the full pipeline (#6282).
+        // NOTE: expand_select_store is NOT applied here. See solve_auf_lia for
+        // the full pipeline (#6282).
 
         // Eager array axioms for soundness (#4304, #5086, #6282)
         {
@@ -601,20 +625,88 @@ impl Executor {
         }
         preprocessed_assertions =
             self.close_finite_arrays_in_owned_assertion_window(preprocessed_assertions, &[]);
+        // A solve that publishes no proof reads the window over the
+        // representatives of its root-level congruence classes
+        // (#auflira-root-congruence): two atoms about one quantity written
+        // with two terms the window equates become one atom. The rewritten
+        // window is equivalent to this one; a proof-publishing solve keeps
+        // the window its provenance names.
+        if self.competition_shedding_active() {
+            let canonical = root_congruence::canonicalize_window(
+                &mut self.ctx.terms,
+                preprocessed_assertions.clone(),
+            );
+            if canonical.rounds > 0 {
+                let window = self
+                    .ctx
+                    .terms
+                    .lift_arithmetic_ite_all(&canonical.assertions);
+                let provenance = ProofProblemAssertionProvenance::from_sources(
+                    proof_provenance.original_problem_assertions.clone(),
+                    &window,
+                    Default::default(),
+                );
+                let result = self.solve_auflira_window(window, provenance)?;
+                if !self.rewritten_window_model_is_refused(&result) {
+                    return Ok(result);
+                }
+                self.last_model = None;
+                self.last_result = None;
+            }
+        }
+        // Lift arithmetic ITEs, as the AUFLIA and UFNIA preprocessors do, so the
+        // theory receives the atoms the split loop's encoding uses.
+        let mut assertion_sources = proof_provenance.assertion_sources;
+        preprocessed_assertions = ite_lift::lift_arithmetic_ites_keeping_sources(
+            &mut self.ctx.terms,
+            preprocessed_assertions,
+            &mut assertion_sources,
+        );
         proof_provenance = ProofProblemAssertionProvenance::from_sources(
             proof_provenance.original_problem_assertions,
             &preprocessed_assertions,
-            proof_provenance.assertion_sources,
+            assertion_sources,
         );
+        self.solve_auflira_window(preprocessed_assertions, proof_provenance)
+    }
 
+    /// `true` when a ground query was found satisfiable on the rewritten
+    /// window and the model does not satisfy the assertions as written.
+    ///
+    /// The two windows have the same models, but the model the theory hands
+    /// back names only the terms of the window it solved, and the evaluator
+    /// cannot always reach a term the rewrite removed through the function
+    /// tables. A ground `sat` is published with its model, so such a query
+    /// is solved again on the window as written, as it was before the
+    /// rewrite existed. With quantifiers in play the ground model is a
+    /// candidate the quantifier loop works from, not a verdict, and stays.
+    fn rewritten_window_model_is_refused(&self, result: &SolveResult) -> bool {
+        result.is_sat() && !self.quantifier_pipeline_engaged && !self.model_satisfies_assertions()
+    }
+
+    /// The lazy split loop of the AUFLIRA route on one preprocessed window.
+    fn solve_auflira_window(
+        &mut self,
+        window: Vec<TermId>,
+        proof_provenance: ProofProblemAssertionProvenance,
+    ) -> Result<SolveResult> {
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
-        self.with_deferred_postprocessing(preprocessed_assertions, proof_provenance, |this| {
+        // What the loop reads off the theory between two rounds changes the
+        // order of the search, and with it which satisfying assignment a
+        // ground query ends on. A solve that checks its verdict keeps the
+        // order it had (#auflira-root-congruence).
+        let reads = if self.competition_shedding_active() {
+            SplitLoopReads::EverySolver
+        } else {
+            SplitLoopReads::RealSolver
+        };
+        self.with_deferred_postprocessing(window, proof_provenance, |this| {
             this.configure_sat_search_tuning(100.0, 1.1, 0.01);
             solve_incremental_split_loop_pipeline!(this,
                 tag: "AUFLIRA",
                 persistent_sat_field: persistent_sat,
-                create_theory: AufLiraSolver::new(&this.ctx.terms),
+                create_theory: AufLiraSolver::new(&this.ctx.terms).split_loop_reading(reads),
                 extract_models: |theory| {
                     let (euf, arr, lia, lra) = theory.extract_all_models();
                     TheoryModels {

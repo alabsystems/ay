@@ -1,0 +1,13 @@
+; Authored free names must survive model conversion, including binder-like names.
+(set-logic QF_LIA)
+(set-option :produce-models true)
+(declare-const __db0 Int)
+(assert (= __db0 3))
+(check-sat-using (then solve-eqs propagate-values))
+(get-model)
+(push)
+(assert (not (= __db0 3)))
+(check-sat-using (then solve-eqs propagate-values))
+(pop)
+(check-sat-using (then solve-eqs propagate-values))
+(get-value (__db0))

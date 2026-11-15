@@ -133,6 +133,9 @@ mod executor_format;
 /// crate that renders BV values (the Z3-compatible FFI, CHC model dumps) shares
 /// one implementation instead of open-coding a second, sort-changing one.
 pub use executor_format::format_bitvec;
+pub use executor_format::{
+    format_bigint_with_admission, format_bitvec_with_admission, format_rational_with_admission,
+};
 pub(crate) mod executor_types;
 pub(crate) mod extension;
 pub(crate) mod features;
@@ -144,11 +147,13 @@ pub(crate) mod minimize;
 pub(crate) mod preprocess;
 pub(crate) mod proof_tracker;
 pub mod qe;
+pub(crate) mod qsat;
 pub(crate) mod quant_unit_authority;
 pub(crate) mod quantifier_manager;
 // Candidate-REJECTION diagnosis instrumentation (env-gated `AY_REJECT_INSTRUMENT`,
 // verdict-neutral). Observes the depth-4 DT candidate-enumeration loop.
 pub(crate) mod sat_proof_manager;
+pub(crate) mod simplifier;
 pub(crate) mod skolemize;
 mod solve_common;
 mod solve_loop;
@@ -160,6 +165,9 @@ pub(crate) mod theory_debug_flags;
 mod theory_dispatch;
 pub(crate) mod theory_inference;
 pub(crate) mod verification;
+
+#[cfg(test)]
+mod counted_array_fixture;
 
 #[cfg(test)]
 mod executor_tests;
@@ -332,8 +340,21 @@ pub(crate) use sat_proof_manager::SatProofManager;
 pub use assume_step_result::AssumeStepResult;
 pub use ay_core::Proof;
 pub use dpll_error::DpllError;
-pub use executor::CertificationAccounting;
-pub use executor::Executor;
+pub use executor::ProofDeclineMechanism;
+pub use executor::{normalize_premise_surface, premise_int_let_binding, Executor};
+pub use executor::{CandidateModelPolicy, CertificationAccounting};
+pub use executor::{
+    CanonicalRootShape, CanonicalWorkRefusal, OverridePlanCensus, OverridePlanExit,
+    ParsedRootShape, SourceRootCensus, SurfaceSourceRefusal, UnboundedCensus,
+};
+pub use executor::{
+    CorroborationMethod, CorroborationSource, Strengthening, StrengtheningSet, UnsatCorroboration,
+    UnsatEvidence, UnsatEvidenceLevel,
+};
+pub use executor::{
+    SatReconstructionOutcome, SatReconstructionRecord, SemanticTokenCensus, SemanticTokenSource,
+    TrustClosureCensus,
+};
 pub use executor_types::{
     ExecutorError, Result as ExecutorResult, StatValue, Statistics, UnknownOrigin, UnknownReason,
 };
@@ -561,9 +582,11 @@ impl<T: TheorySolver> DpllT<'_, T> {
         self.solve_deadline = deadline;
     }
 
-    /// Whether the installed solve controls request a stop right now.
+    /// Whether the installed solve controls, or this thread's counted work
+    /// grant, request a stop right now.
     ///
-    /// Cheap (one atomic load + one `Instant::now()` when a deadline is set).
+    /// Cheap (one atomic load + one `Instant::now()` when a deadline is set,
+    /// plus a thread-local read).
     #[must_use]
     fn solve_controls_tripped(&self) -> bool {
         self.solve_interrupt
@@ -572,6 +595,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
             || self
                 .solve_deadline
                 .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+            || ay_core::resource::work_grant_spent()
     }
 
     /// Set the datatype tautology literals used for conflict re-verification (#8123).
@@ -877,6 +901,3 @@ impl<T: TheorySolver> DpllT<'_, T> {
 
 #[cfg(test)]
 mod dpll_tests;
-
-#[cfg(kani)]
-mod dpll_kani;

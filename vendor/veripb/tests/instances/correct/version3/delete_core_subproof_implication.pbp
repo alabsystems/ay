@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+f 2 ;
+del id 2 : : subproof
+    ia 1 x1 1 x2 1 ~x3 >= 1 : 1 ;
+    pol -1 -2 + ;
+qed : -1 ;
+is_deleted 1 x1 1 x2 2 ~x3 >= 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -46,6 +46,11 @@ pub(crate) struct IncrementalNegationCache {
     /// back with `put_tseitin_encoder`.
     tseitin_encoder: Option<TseitinState>,
     pending_original_authorities: Vec<PendingOriginalClauseAuthority>,
+    /// #inc-dead-atoms: when armed, atoms the split machinery mapped onto an
+    /// EXISTING SAT var since the last `take_reused_atoms` (the session-
+    /// persistent lanes revive such an atom if it was withheld as dead).
+    track_atom_reuse: bool,
+    reused_atoms: Vec<TermId>,
 }
 
 impl IncrementalNegationCache {
@@ -65,6 +70,8 @@ impl IncrementalNegationCache {
             pending_set: HashSet::default(),
             tseitin_encoder: None,
             pending_original_authorities: Vec::new(),
+            track_atom_reuse: false,
+            reused_atoms: Vec::new(),
         };
         if enabled {
             for term in initial_terms {
@@ -75,6 +82,26 @@ impl IncrementalNegationCache {
             }
         }
         cache
+    }
+
+    /// Arm (or disarm) recording of atoms re-used from the existing SAT maps.
+    pub(crate) fn set_track_atom_reuse(&mut self, track: bool) {
+        self.track_atom_reuse = track;
+        if !track {
+            self.reused_atoms.clear();
+        }
+    }
+
+    /// Record that `atom` was mapped onto its existing SAT var (no fresh var).
+    pub(crate) fn note_reused_atom(&mut self, atom: TermId) {
+        if self.track_atom_reuse {
+            self.reused_atoms.push(atom);
+        }
+    }
+
+    /// Drain the atoms recorded by [`Self::note_reused_atom`].
+    pub(crate) fn take_reused_atoms(&mut self) -> Vec<TermId> {
+        std::mem::take(&mut self.reused_atoms)
     }
 
     /// Record a newly SAT-visible term whose negation may be needed later.

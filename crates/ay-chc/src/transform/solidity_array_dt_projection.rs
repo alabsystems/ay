@@ -534,6 +534,7 @@ fn translate_projected_formula(
     observed_keys: &mut Vec<ObservedProjectedArrayKey>,
 ) -> Result<ChcExpr, ()> {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(_) => Err(()),
         ChcExpr::Var(v) => {
             if let Some((_, replacement)) = direct_subst.iter().find(|(from, _)| from == v) {
                 Ok(replacement.clone())
@@ -817,6 +818,11 @@ fn collect_source_projected_array_keys_from_expr(
     keys: &mut Vec<ObservedProjectedArrayKey>,
 ) {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            for value in lambda.captures() {
+                collect_source_projected_array_keys_from_expr(value, keys);
+            }
+        }
         ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
             remember_source_array_key(args[0].as_ref(), args[1].as_ref(), keys);
             collect_source_projected_array_keys_from_expr(args[0].as_ref(), keys);
@@ -905,8 +911,21 @@ fn project_predicate_args(
     Ok(out)
 }
 
+fn unsupported_array_expression(
+    context: &'static str,
+    expr: &ChcExpr,
+) -> ProjectionResult<ChcExpr> {
+    Err(
+        SolidityArrayDtProjectionRejection::UnsupportedArrayExpression {
+            context,
+            sort: expr.sort(),
+        },
+    )
+}
+
 fn rewrite_expr(expr: &ChcExpr) -> ProjectionResult<ChcExpr> {
     crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::ArrayLambda(_) => unsupported_array_expression("array lambda", expr),
         ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
             Ok(expr.clone())
         }
@@ -1346,7 +1365,7 @@ mod tests {
     fn pair_sort() -> ChcSort {
         ChcSort::Datatype {
             name: "Pair".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mkPair".to_string(),
                 selectors: vec![
                     ChcDtSelector {
@@ -1365,7 +1384,7 @@ mod tests {
     fn option_sort() -> ChcSort {
         ChcSort::Datatype {
             name: "OptionPair".to_string(),
-            constructors: Arc::new(vec![
+            constructors: crate::ChcDtConstructors::new(vec![
                 ChcDtConstructor {
                     name: "None".to_string(),
                     selectors: vec![],
@@ -1388,7 +1407,7 @@ mod tests {
     fn erc777_key_sort() -> ChcSort {
         ChcSort::Datatype {
             name: "ecrecover_input_type".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "ecrecover_input_type".to_string(),
                 selectors: vec![
                     ChcDtSelector {
@@ -1415,7 +1434,7 @@ mod tests {
     fn erc777_mapping_value_sort() -> ChcSort {
         ChcSort::Datatype {
             name: "mapping$addressuint256$_tuple".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mapping$addressuint256$_tuple".to_string(),
                 selectors: vec![
                     ChcDtSelector {
@@ -2060,7 +2079,7 @@ mod tests {
     fn rejects_nested_array_dt_argument() {
         let wrapped_sort = ChcSort::Datatype {
             name: "State".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: "mkState".to_string(),
                 selectors: vec![ChcDtSelector {
                     name: "items".to_string(),

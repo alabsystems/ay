@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% NOT a forgery: an honest `red` step whose witness touches the variable of a degree-`i64::MIN`
+% row, so the checker really does substitute into it. It is ACCEPTED before and after.
+%
+% This is the guard against the lazy fix. Refusing rows whose degree is extreme, or clamping the
+% substituted degree to the type's range instead of escalating to arbitrary precision, would
+% pass every negative case in this fixture and break this one.
+f 2;
+red 1 x3 >= 1 : x2 -> 1 x3 -> 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

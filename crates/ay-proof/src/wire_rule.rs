@@ -11,7 +11,7 @@ use ay_core::{
 };
 use num_traits::Zero;
 
-use crate::alethe_printer::ClauseSurfaceAgreement;
+use crate::alethe_printer::{ClauseSurfaceAgreement, CompleteBlastAsk};
 
 /// Whether the exact clause authenticated against AY's term DAG is also the
 /// exact clause the Alethe printer will expose to an external checker.
@@ -35,8 +35,9 @@ pub fn exact_clause_surface_preserved(
 /// expensive `poly_simp` wire lowering.
 ///
 /// The lowering is a completeness-only presentation repair. A proof above
-/// this cap keeps honest `hole` spellings instead of multiplying the two
-/// recognizers' large local work envelopes by its step count.
+/// this cap keeps honest `hole` spellings for general promotions instead of
+/// multiplying the two recognizers' large local work envelopes by its step
+/// count. Fully inspected small linear BV decisions do not run that search.
 pub const MAX_ARITH_POLY_SIMP_PROMOTIONS_PER_PROOF: usize = 16;
 
 /// Proof-wide admission and attempt budget for `poly_simp` wire promotion.
@@ -102,7 +103,13 @@ impl ArithPolySimpPromotionBudget {
         self.proof_admitted
     }
 
-    fn spend_attempt(&mut self) -> bool {
+    /// Attempts left, for tests.
+    #[cfg(test)]
+    pub(crate) const fn remaining_attempts(&self) -> usize {
+        self.remaining
+    }
+
+    pub(crate) fn spend_attempt(&mut self) -> bool {
         let Some(remaining) = self.remaining.checked_sub(1) else {
             return false;
         };
@@ -125,6 +132,15 @@ pub fn arith_poly_simp_lowering_supported(
     term_overrides: Option<&DetHashMap<TermId, String>>,
     budget: &mut ArithPolySimpPromotionBudget,
 ) -> bool {
+    // A fully inspected <=32-occurrence linear BV identity has no expensive
+    // promotion search. Reuse the wire checker's exact bounded grammar and
+    // decision, shared by this screen and printer. Inspect the bounded source
+    // BEFORE any surface walk; declined large DAGs preserve the old early
+    // budget refusal. The general promotion cap/recognizers are unchanged.
+    if crate::checker::bv_affine::small_linear_wire_identity(terms, clause) {
+        return crate::alethe_printer::clause_surface_agreement(terms, clause, term_overrides)
+            == ClauseSurfaceAgreement::Identical;
+    }
     budget.spend_attempt()
         && crate::alethe_printer::clause_surface_agreement(terms, clause, term_overrides)
             == ClauseSurfaceAgreement::Identical
@@ -158,6 +174,46 @@ pub fn theory_lemma_poly_simp_lowering_supported(
         // spends a poly_simp attempt, so their rule precedence cannot drift.
         && !(lia_linear_identity && lia_ground_evaluate_is_supported(terms, clause))
         && arith_poly_simp_lowering_supported(terms, clause, term_overrides, budget)
+}
+
+/// Whether a bounded complement-sum or guarded-mask derivation can publish this exact
+/// arithmetic clause. This fallback consumes another attempt from the same
+/// proof-wide arithmetic budget after the direct polynomial lane declined.
+#[must_use]
+pub fn theory_lemma_bv_arithmetic_lowering_supported(
+    terms: &TermStore,
+    kind: &TheoryLemmaKind,
+    clause: &[TermId],
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+    budget: &mut ArithPolySimpPromotionBudget,
+) -> bool {
+    theory_lemma_bv_arithmetic_lowering_supported_asking(
+        terms,
+        kind,
+        clause,
+        term_overrides,
+        budget,
+        CompleteBlastAsk::Asked,
+    )
+}
+
+/// [`theory_lemma_bv_arithmetic_lowering_supported`], asking the complete
+/// bit-blast that ends the structural lanes only as `complete_blast` says.
+#[must_use]
+pub fn theory_lemma_bv_arithmetic_lowering_supported_asking(
+    terms: &TermStore,
+    kind: &TheoryLemmaKind,
+    clause: &[TermId],
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+    budget: &mut ArithPolySimpPromotionBudget,
+    complete_blast: CompleteBlastAsk<'_>,
+) -> bool {
+    crate::alethe_printer::dialect::discarding_notes(|| {
+        crate::alethe_printer::AlethePrinter::new_with_overrides(terms, term_overrides)
+            .asking_complete_blast(complete_blast)
+            .format_bv_structural_arithmetic(ProofId(0), clause, kind, budget)
+            .is_some()
+    })
 }
 
 /// Whether an exact integer bounds tautology has the checked `la_generic`
@@ -300,7 +356,7 @@ fn la_generic_farkas_lowering_supported_with_policy(
     }
     match agreement {
         ClauseSurfaceAgreement::Identical | ClauseSurfaceAgreement::OrderReversed => true,
-        ClauseSurfaceAgreement::EqualityReversed => {
+        ClauseSurfaceAgreement::EqualityReversed | ClauseSurfaceAgreement::LinearRespelled => {
             effective_printed_farkas_is_valid(terms, clause, farkas, term_overrides)
         }
         ClauseSurfaceAgreement::Divergent => {
@@ -578,15 +634,83 @@ pub fn arith_eq_implies_bound_lowering_supported(
 /// `evaluate` is directional and recursively interprets its left-hand term.
 /// A surface override on the equality or any reachable subterm can therefore
 /// change the external proposition without changing the internal DAG. Both
-/// the printer and publication gate use this conservative identity test.
+/// the printer and publication gate use this conservative identity test, up
+/// to bit-vector literal spelling (the parser's own identity; see
+/// `alethe_printer::surface_literal::spelled_alike`).
 #[must_use]
 pub fn evaluate_step_lowering_supported(
     terms: &TermStore,
     clause: &[TermId],
     term_overrides: Option<&DetHashMap<TermId, String>>,
 ) -> bool {
-    crate::alethe_printer::clause_surface_agreement(terms, clause, term_overrides)
+    crate::alethe_printer::clause_surface_agreement_admitting(terms, clause, term_overrides, true)
         == ClauseSurfaceAgreement::Identical
+}
+
+/// Whether a native bounded BV `EqSimplify` step has the exact Clean-dialect
+/// wire meaning. The standard rule name exists in pinned Carcara, but these
+/// modular cancellation cases require the separately disclosed Clean
+/// `eq_simplify_bv_offsets` capability. No generic polynomial promotion or
+/// bit-blast classification is involved.
+#[must_use]
+pub fn bv_eq_simplify_step_lowering_supported(
+    dialect: crate::AletheDialect,
+    terms: &TermStore,
+    clause: &[TermId],
+    premise_count: usize,
+    argument_count: usize,
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+) -> bool {
+    dialect == crate::AletheDialect::Clean
+        && premise_count == 0
+        && argument_count == 0
+        && crate::checker::bv_eq_simplify::recognizes(terms, clause)
+        && exact_clause_surface_preserved(terms, clause, term_overrides)
+}
+
+/// Exact version-one spine semantics, separately disclosed from the older
+/// immediate-addend EqSimplify contract. No polynomial promotion is attempted.
+#[must_use]
+pub fn bv_offset_spines_step_lowering_supported(
+    dialect: crate::AletheDialect,
+    terms: &TermStore,
+    clause: &[TermId],
+    premise_count: usize,
+    argument_count: usize,
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+) -> bool {
+    dialect == crate::AletheDialect::Clean
+        && premise_count == 0
+        && argument_count == 0
+        && crate::checker::bv_offset_spines::recognizes(terms, clause)
+        // BV literal spellings are one term to the consumer's parser. Reuse
+        // evaluate's existing literal identity and certified-channel policy;
+        // introduce no arithmetic rewrite or new nonliteral exception here.
+        && crate::alethe_printer::clause_surface_agreement_admitting(
+            terms, clause, term_overrides, true,
+        ) == ClauseSurfaceAgreement::Identical
+}
+
+/// Version-one reconstruction with parser-identical BV literal spellings.
+#[must_use]
+pub fn bv_reconstruct_step_lowering_supported(
+    dialect: crate::AletheDialect,
+    terms: &TermStore,
+    clause: &[TermId],
+    premise_count: usize,
+    argument_count: usize,
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+) -> bool {
+    dialect == crate::AletheDialect::Clean
+        && premise_count == 0
+        && argument_count == 0
+        && crate::checker::bv_reconstruct::recognizes(terms, clause)
+        && crate::alethe_printer::clause_surface_agreement_admitting(
+            terms,
+            clause,
+            term_overrides,
+            true,
+        ) == ClauseSurfaceAgreement::Identical
 }
 
 /// Whether one native `Divisibility` lemma has the exact checked external
@@ -738,6 +862,97 @@ mod tests {
         let upper = terms.mk_app(Symbol::named("<="), [upper_form, zero], Sort::Bool);
         let lower = terms.mk_app(Symbol::named("<="), [one, lower_form], Sort::Bool);
         [terms.mk_not_raw(upper), terms.mk_not_raw(lower)]
+    }
+
+    #[test]
+    fn small_linear_wire_decisions_do_not_probe_general_promotions() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("bounded_wire_x", Sort::bitvec(64));
+        let zero = terms.mk_bitvec(BigInt::from(0), 64);
+        let sum = terms.mk_app(Symbol::named("bvadd"), [x, zero], Sort::bitvec(64));
+        let identity = terms.mk_app(Symbol::named("="), [sum, x], Sort::Bool);
+        let mut proof = Proof::new();
+        for _ in 0..160 {
+            proof.add_theory_lemma_with_kind(
+                "bv",
+                vec![identity],
+                TheoryLemmaKind::ArithClauseTautology,
+            );
+        }
+        let mut budget = ArithPolySimpPromotionBudget::for_proof(&proof);
+        assert!(!budget.proof_admitted());
+        for _ in 0..160 {
+            assert!(arith_poly_simp_lowering_supported(
+                &terms,
+                &[identity],
+                None,
+                &mut budget
+            ));
+        }
+        assert_eq!(budget.remaining_attempts(), 0);
+        let one = terms.mk_bitvec(BigInt::from(1), 64);
+        let wrong = terms.mk_app(Symbol::named("="), [sum, one], Sort::Bool);
+        assert!(!arith_poly_simp_lowering_supported(
+            &terms,
+            &[wrong],
+            None,
+            &mut budget
+        ));
+        let product = terms.mk_app(Symbol::named("bvmul"), [x, one], Sort::bitvec(64));
+        let general = terms.mk_app(Symbol::named("="), [product, x], Sort::Bool);
+        assert!(!arith_poly_simp_lowering_supported(
+            &terms,
+            &[general],
+            None,
+            &mut budget
+        ));
+        let mut overrides = DetHashMap::default();
+        overrides.insert(x, "(_ bv42 64)".to_owned());
+        assert!(!arith_poly_simp_lowering_supported(
+            &terms,
+            &[identity],
+            Some(&overrides),
+            &mut budget
+        ));
+    }
+
+    #[test]
+    fn small_linear_wire_grammar_preserves_wrap_and_occurrence_refusals() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("bounded_wire_bit", Sort::bitvec(1));
+        let zero = terms.mk_bitvec(BigInt::from(0), 1);
+        let doubled = terms.mk_app(Symbol::named("bvadd"), [x, x], Sort::bitvec(1));
+        let wrapped = terms.mk_app(Symbol::named("="), [doubled, zero], Sort::Bool);
+        // Native modular arithmetic accepts this; wire poly_simp must still
+        // refuse its disappearing nonconstant monomial.
+        assert!(!crate::checker::bv_affine::small_linear_wire_identity(
+            &terms,
+            &[wrapped]
+        ));
+        let mut nested = x;
+        for _ in 0..16 {
+            nested = terms.mk_app(Symbol::named("bvadd"), [nested, zero], Sort::bitvec(1));
+        }
+        let long = terms.mk_app(Symbol::named("="), [nested, x], Sort::Bool);
+        assert!(!crate::checker::bv_affine::small_linear_wire_identity(
+            &terms,
+            &[long]
+        ));
+        let mut proof = Proof::new();
+        for _ in 0..17 {
+            proof.add_theory_lemma_with_kind(
+                "bv",
+                vec![long],
+                TheoryLemmaKind::ArithClauseTautology,
+            );
+        }
+        let mut budget = ArithPolySimpPromotionBudget::for_proof(&proof);
+        assert!(!arith_poly_simp_lowering_supported(
+            &terms,
+            &[long],
+            None,
+            &mut budget
+        ));
     }
 
     #[test]
@@ -1371,6 +1586,83 @@ mod tests {
             clause_surface_agreement(&terms, &clause, Some(&divergent)),
             ClauseSurfaceAgreement::Divergent,
             "a changed operand is a changed clause"
+        );
+
+        // An exact linear respelling (a literal-zero summand, the lenient
+        // negative literal) is the same atom, replay-gated: pinned Carcara
+        // parses the two spellings as different terms.
+        let mut zero_summand = DetHashMap::default();
+        zero_summand.insert(lower, "(<= 0 (+ wire_agree_x 0))".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&zero_summand)),
+            ClauseSurfaceAgreement::LinearRespelled,
+            "a literal-zero summand is the same atom"
+        );
+        let minus_one = terms.mk_int(BigInt::from(-1));
+        let below = terms.mk_app(Symbol::named("<="), [minus_one, x], Sort::Bool);
+        let below_clause = [terms.mk_not_raw(below)];
+        let mut lenient = DetHashMap::default();
+        lenient.insert(below, "(>= wire_agree_x -1)".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &below_clause, Some(&lenient)),
+            ClauseSurfaceAgreement::LinearRespelled,
+            "the lenient literal under the converse operator is the same atom"
+        );
+        let mut shifted = DetHashMap::default();
+        shifted.insert(below, "(>= wire_agree_x -2)".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &below_clause, Some(&shifted)),
+            ClauseSurfaceAgreement::Divergent,
+            "a different constant is a changed clause"
+        );
+    }
+
+    /// The Skolem channel's entries, as the effective judgement table
+    /// carries them (2026-09-13): a witness resugared to its `choice` is the
+    /// same atom at every occurrence and never a divergence; an authored
+    /// converse spelling of a literal that MENTIONS the witness is the same
+    /// atom (compared against a canonical rendering that spells the witness
+    /// the same way); and the ninth shape's `(ite (= c c) c 0)` for `c` is a
+    /// changed clause — which is what holes `la_generic` at the table
+    /// readers, beside the printed replay.
+    #[test]
+    fn clause_surface_agreement_reads_the_skolem_channel_as_the_printer_spells_it() {
+        use crate::alethe_printer::{clause_surface_agreement, ClauseSurfaceAgreement};
+
+        let mut terms = TermStore::new();
+        let witness = terms.mk_var("sk!agree_z", Sort::Int);
+        terms.mark_skolem_symbol("sk!agree_z");
+        let g_w = terms.mk_app(Symbol::named("g"), [witness], Sort::Int);
+        // The store's canonical `(>= (g z) z)` is `(<= z (g z))`.
+        let instance = terms.mk_app(Symbol::named("<="), [witness, g_w], Sort::Bool);
+        let clause = [instance];
+        let choice = "(choice ((z Int)) (not (or (< z 0) (>= (g z) z))))";
+
+        let mut witness_only = DetHashMap::default();
+        witness_only.insert(witness, choice.to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&witness_only)),
+            ClauseSurfaceAgreement::Identical,
+            "a witness spelled as its choice term is the same atom everywhere"
+        );
+
+        let mut reversed = witness_only.clone();
+        reversed.insert(instance, format!("(>= (g {choice}) {choice})"));
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&reversed)),
+            ClauseSurfaceAgreement::OrderReversed,
+            "the authored converse over the choice-spelled witness is the same atom"
+        );
+
+        let mut ninth = witness_only.clone();
+        ninth.insert(
+            instance,
+            format!("(>= (g {choice}) (ite (= {choice} {choice}) {choice} 0))"),
+        );
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&ninth)),
+            ClauseSurfaceAgreement::Divergent,
+            "the ninth shape's simplified operand is a changed clause"
         );
     }
 }

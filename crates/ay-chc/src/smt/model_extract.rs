@@ -91,6 +91,7 @@ impl SmtContext {
                 TermData::App(sym, args) => {
                     let name = sym.name();
                     match name {
+                        "lambda-array" => return None,
                         "and" => args
                             .iter()
                             .copied()
@@ -310,7 +311,9 @@ impl SmtContext {
                         }
                         _ => {
                             // Check if this is a DT constructor/selector/tester (#7016).
-                            ctx.try_dt_app_to_chc_expr(name, args, |a| go(ctx, a, memo))?
+                            ctx.try_dt_app_to_chc_expr(name, args, ctx.terms.sort(term), |a| {
+                                go(ctx, a, memo)
+                            })?
                         }
                     }
                 }

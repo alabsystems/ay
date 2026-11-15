@@ -109,6 +109,18 @@ fn insert_dimacs_code_cache_and_native(context: &mut DimacsStructuredStatistics<
     stats.insert("sat.arena_dead_words", solver.arena_dead_words() as u64);
     stats.insert("sat.arena_clause_slots", solver.arena_clause_slots() as u64);
     stats.insert("sat.active_clauses", solver.active_clause_count() as u64);
+    stats.insert(
+        "sat.irredundant_clauses",
+        solver.irredundant_clause_count() as u64,
+    );
+    stats.insert(
+        "sat.redundant_clauses",
+        solver.redundant_clause_count() as u64,
+    );
+    let (binary, large, large_literals) = solver.irredundant_clause_shape();
+    stats.insert("sat.irredundant_binary", binary);
+    stats.insert("sat.irredundant_large", large);
+    stats.insert("sat.irredundant_large_literals", large_literals);
 }
 
 fn insert_dimacs_structured_runtime(context: &mut DimacsStructuredStatistics<'_, '_, '_>) {

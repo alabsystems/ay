@@ -15,35 +15,47 @@
 #   2. Independently cross-checks a representative subset against the **z3 CLI**
 #      (the `z3` binary), by emitting the equivalent SMT-LIB and comparing the
 #      verdict. This is a *different oracle* from z3py: it needs no Python z3
-#      module, only the `z3` executable on PATH, so it runs in environments
-#      where z3py is absent.
+#      module, only a z3 executable, so it runs in environments where z3py is
+#      absent. The executable is the repo's z3 oracle (scripts/_z3_oracle.py:
+#      Z3_PATH, else the first z3 on PATH that PROVES it is z3), never
+#      `shutil.which("z3")`: that accepts a refusing reroute stub whose silence
+#      parses as `unknown` everywhere and makes every cross-check vacuous.
 #
 # SOUNDNESS: every cross-checked case asserts ayz3's verdict EQUALS z3's. A
 # disagreement (sat-vs-unsat) is a hard failure. Cases where ayz3 honestly
 # returns `unknown` are asserted as accepted incompleteness -- ayz3 must never
 # report a verdict that contradicts z3.
 #
-# Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_z3cli_crosscheck.py -v
+# Run:  targo --unverified build -p ay-ffi  &&  pytest bindings/python/tests/test_z3cli_crosscheck.py -v
 
-import shutil
+import os
 import subprocess
+import sys
 from fractions import Fraction
 
 import pytest
 
 import ayz3 as z
 
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "scripts")
+)
+import _z3_oracle  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # z3 CLI oracle (independent of the z3py Python module)
 # ---------------------------------------------------------------------------
 
-_Z3_BIN = shutil.which("z3")
-if _Z3_BIN is None:
+try:
+    _Z3 = _z3_oracle.z3_oracle()
+except _z3_oracle.Z3Unavailable as _error:
     raise RuntimeError(
         "the z3 CLI is a required oracle for test_z3cli_crosscheck.py; "
-        "install z3 and ensure it is on PATH"
+        f"install z3 or set Z3_PATH to its path: {_error}"
     )
+_Z3_BIN = _Z3.path
+print(f"z3 oracle: {_Z3.identity()}", file=sys.stderr)
 
 
 def _z3_cli_verdict(smt2: str) -> str:

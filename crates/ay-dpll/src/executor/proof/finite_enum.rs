@@ -4,6 +4,10 @@
 
 //! Bounded, query-sealed proof path for direct finite-enum pigeonholes.
 
+mod declarations;
+#[cfg(all(test, feature = "proof-checker"))]
+mod stop_tests;
+
 use ay_core::term::TermEntryStamp;
 use ay_core::{AletheRule, Proof, ProofStep, Sort, Symbol, TermData, TermId};
 use ay_frontend::SourceContextStamp;
@@ -232,26 +236,21 @@ impl Executor {
         selector_decls: &[(String, Vec<String>)],
         member_signatures: &[ay_proof::DatatypeMemberSignature],
     ) -> Result<ay_proof::ProofQuality, ay_proof::ProofCheckError> {
-        let (mut work, mut bytes) = (0usize, 0usize);
-        let mut progress = |work_delta: usize, byte_delta: usize| {
-            let Some(next_work) = work.checked_add(work_delta) else {
-                return false;
-            };
-            let Some(next_bytes) = bytes.checked_add(byte_delta) else {
-                return false;
-            };
-            work = next_work;
-            bytes = next_bytes;
-            work <= MAX_CHECK_WORK && bytes <= MAX_CHECK_BYTES
-        };
-        ay_proof::check_proof_strict_with_typed_context_and_progress(
-            proof,
-            &self.ctx.terms,
-            Some(datatype_decls),
-            Some(selector_decls),
-            member_signatures,
-            Some(assumptions),
-            &mut progress,
+        super::check::check_bounded_with_executor_progress(
+            self,
+            MAX_CHECK_WORK,
+            MAX_CHECK_BYTES,
+            |progress| {
+                ay_proof::check_proof_strict_with_typed_context_and_progress(
+                    proof,
+                    &self.ctx.terms,
+                    Some(datatype_decls),
+                    Some(selector_decls),
+                    member_signatures,
+                    Some(assumptions),
+                    progress,
+                )
+            },
         )
     }
 

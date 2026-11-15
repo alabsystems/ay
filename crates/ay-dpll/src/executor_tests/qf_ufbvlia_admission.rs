@@ -3,7 +3,8 @@
 
 //! `QF_UFBVLIA` live-root admission and certificate publication tests.
 
-use crate::{Executor, UnknownReason};
+use crate::Executor;
+use ay_core::{ProofStep, TheoryLemmaKind};
 use ay_frontend::parse;
 
 fn execute(input: &str) -> (Executor, Vec<String>) {
@@ -292,8 +293,10 @@ fn qf_ufbvlia_strict_mode_publishes_only_a_trust_free_unsat_proof() {
     );
 }
 
+/// Spelled `ubv_to_int` (AY elaborates it exactly as `bv2nat`): strict proofs
+/// claim an external check, and pinned Carcara parses only this spelling.
 #[test]
-fn qf_ufbvlia_strict_mode_withholds_native_only_bv_lia_refutation() {
+fn qf_ufbvlia_strict_mode_publishes_native_bv_lia_bundle_refutation() {
     let input = r#"
         (set-option :produce-proofs true)
         (set-option :check-proofs-strict true)
@@ -302,21 +305,36 @@ fn qf_ufbvlia_strict_mode_withholds_native_only_bv_lia_refutation() {
         (declare-const x (_ BitVec 16))
         (assert (= x #x9c40))
         (assert (= x result))
-        (assert (<= (* (bv2nat x) 2) 65535))
+        (assert (<= (* (ubv_to_int x) 2) 65535))
         (check-sat)
     "#;
     let (executor, output) = execute(input);
 
-    assert_eq!(output, vec!["unknown"]);
-    assert_eq!(executor.unknown_reason(), Some(UnknownReason::ProofTrusted));
+    assert_eq!(output, vec!["unsat"]);
     assert_eq!(
         executor
             .statistics()
             .get_string("solver.bv_lia_bounded_source"),
         Some("unsat")
     );
+    assert!(executor.last_command_unsat_was_strictly_verified());
+    let proof = executor.last_proof().expect("native strict BV/LIA proof");
+    let quality = ay_proof::check_proof_strict(proof, executor.terms())
+        .expect("native BV/LIA proof must replay strictly");
     assert!(
-        executor.last_proof().is_none(),
-        "a native-only BV/LIA certificate must not cross the strict Alethe boundary"
+        quality.is_complete(),
+        "native proof must be complete: {quality}"
+    );
+    assert_eq!(quality.trust_count, 0);
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::BvLiaTautology,
+            ..
+        }
+    )));
+    assert!(
+        executor.unsat_proof_has_known_wire_gap(),
+        "native admission must leave the unsupported Alethe rule visible"
     );
 }

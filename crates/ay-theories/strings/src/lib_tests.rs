@@ -1492,173 +1492,60 @@ fn nf_closure_5_is_not_enabled_by_the_master_switch_alone() {
     );
 }
 
-#[cfg(kani)]
-mod verification {
-    use super::*;
-    use crate::normal_form::{ExplainEntry, NormalForm};
+/// The NF-vs-constant walk compares component constants BYTE-wise.
+///
+/// 2026-09-23 hunt panic p01: `process_nf_against_constant` sliced the target
+/// constant as a `str` at `offset..offset + s.len()` — byte offsets — and a
+/// one-byte component ending inside a multi-byte character of the target
+/// (`"0" ++ "0"` against `"0\u{663}"`, whose `U+0663` occupies bytes 1..3)
+/// panicked with "end byte index 2 is not a char boundary". The walk must
+/// instead decide the mismatch: `"00" != "0\u{663}"`, a conflict.
+#[test]
+fn nf_vs_constant_with_multibyte_target_is_a_conflict_not_a_panic() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::String);
+    let y = terms.mk_var("y", Sort::String);
+    let zero = terms.mk_string("0".to_string());
+    let target = terms.mk_string("0\u{663}".to_string());
+    let concat = terms.mk_app(Symbol::named("str.++"), vec![x, y], Sort::String);
+    let x_is_zero = terms.mk_eq(x, zero);
+    let y_is_zero = terms.mk_eq(y, zero);
+    let concat_is_target = terms.mk_eq(concat, target);
 
-    // --- StringSolver contract proofs ---
+    let mut solver = StringSolver::new(&terms);
+    solver.assert_literal(x_is_zero, true);
+    solver.assert_literal(y_is_zero, true);
+    solver.assert_literal(concat_is_target, true);
 
-    /// Empty solver must return Sat (no constraints = trivially satisfiable).
-    #[kani::proof]
-    fn proof_check_empty_sat() {
-        let terms = TermStore::new();
-        let mut solver = StringSolver::new(&terms);
-        assert!(matches!(solver.check(), TheoryResult::Sat));
-    }
+    let result = solver.check();
+    assert!(
+        matches!(result, TheoryResult::Unsat(_)),
+        "x=\"0\", y=\"0\", x++y=\"0\\u{{663}}\" must be a conflict, got {result:?}"
+    );
+}
 
-    /// push/pop round-trip is safe and preserves Sat result.
-    #[kani::proof]
-    fn proof_push_pop_preserves_sat() {
-        let terms = TermStore::new();
-        let mut solver = StringSolver::new(&terms);
-        assert!(matches!(solver.check(), TheoryResult::Sat));
-        solver.push();
-        assert!(matches!(solver.check(), TheoryResult::Sat));
-        solver.pop();
-        assert!(
-            matches!(solver.check(), TheoryResult::Sat),
-            "Sat must be preserved after push/pop on empty solver"
-        );
-    }
+/// The same walk still MATCHES a multi-byte target component by component.
+#[test]
+fn nf_vs_constant_with_multibyte_components_matches() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::String);
+    let y = terms.mk_var("y", Sort::String);
+    let first = terms.mk_string("0".to_string());
+    let second = terms.mk_string("\u{663}".to_string());
+    let target = terms.mk_string("0\u{663}".to_string());
+    let concat = terms.mk_app(Symbol::named("str.++"), vec![x, y], Sort::String);
+    let x_is_first = terms.mk_eq(x, first);
+    let y_is_second = terms.mk_eq(y, second);
+    let concat_is_target = terms.mk_eq(concat, target);
 
-    /// reset restores to clean state.
-    #[kani::proof]
-    fn proof_reset_restores_sat() {
-        let terms = TermStore::new();
-        let mut solver = StringSolver::new(&terms);
-        solver.push();
-        solver.push();
-        solver.reset();
-        assert!(
-            matches!(solver.check(), TheoryResult::Sat),
-            "reset must restore to initial Sat state"
-        );
-    }
+    let mut solver = StringSolver::new(&terms);
+    solver.assert_literal(x_is_first, true);
+    solver.assert_literal(y_is_second, true);
+    solver.assert_literal(concat_is_target, true);
 
-    // --- NormalForm invariant proofs ---
-
-    /// Singleton NF has exactly one base term equal to the input, for all TermId values.
-    #[kani::proof]
-    fn proof_nf_singleton_invariant() {
-        let id: u32 = kani::any();
-        let t = TermId(id);
-        let nf = NormalForm::singleton(t);
-        assert_eq!(
-            nf.base.len(),
-            1,
-            "singleton must have exactly one base term"
-        );
-        assert_eq!(nf.base[0], t, "singleton base[0] must equal input term");
-        assert_eq!(nf.rep, Some(t), "singleton rep must be the input term");
-        assert!(nf.deps.is_empty(), "singleton must have no deps");
-    }
-
-    /// add_dep preserves prior deps and appends new entry.
-    #[kani::proof]
-    fn proof_nf_add_dep_preserves() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        let d: u32 = kani::any();
-
-        let mut nf = NormalForm::singleton(TermId(a));
-        nf.add_dep(TermId(a), TermId(b));
-        assert_eq!(nf.deps.len(), 1);
-
-        nf.add_dep(TermId(c), TermId(d));
-        assert_eq!(nf.deps.len(), 2, "add_dep must append");
-        assert_eq!(
-            nf.deps[0],
-            ExplainEntry {
-                lhs: TermId(a),
-                rhs: TermId(b)
-            }
-        );
-        assert_eq!(
-            nf.deps[1],
-            ExplainEntry {
-                lhs: TermId(c),
-                rhs: TermId(d)
-            }
-        );
-    }
-
-    /// merge_deps concatenates exactly — total deps = |nf1.deps| + |nf2.deps|.
-    #[kani::proof]
-    fn proof_nf_merge_deps_preserves_all() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        let d: u32 = kani::any();
-        let e: u32 = kani::any();
-        let f: u32 = kani::any();
-
-        let mut nf1 = NormalForm::singleton(TermId(a));
-        nf1.add_dep(TermId(a), TermId(b));
-
-        let mut nf2 = NormalForm::singleton(TermId(c));
-        nf2.add_dep(TermId(c), TermId(d));
-        nf2.add_dep(TermId(e), TermId(f));
-
-        let pre_count = nf1.deps.len();
-        let other_count = nf2.deps.len();
-        nf1.merge_deps(&nf2);
-
-        assert_eq!(
-            nf1.deps.len(),
-            pre_count + other_count,
-            "merge_deps must concatenate all deps"
-        );
-        // Verify nf2's deps are at the tail of nf1.
-        assert_eq!(
-            nf1.deps[1],
-            ExplainEntry {
-                lhs: TermId(c),
-                rhs: TermId(d)
-            }
-        );
-        assert_eq!(
-            nf1.deps[2],
-            ExplainEntry {
-                lhs: TermId(e),
-                rhs: TermId(f)
-            }
-        );
-    }
-
-    /// ExplainEntry equality is reflexive for all TermId pairs.
-    #[kani::proof]
-    fn proof_explain_entry_eq_reflexive() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let entry = ExplainEntry {
-            lhs: TermId(a),
-            rhs: TermId(b),
-        };
-        assert_eq!(entry, entry, "ExplainEntry equality must be reflexive");
-    }
-
-    /// str.contains("", x) iff x = "".
-    ///
-    /// The predicate evaluator should use emptiness facts from equalities and
-    /// disequalities to detect contradictions without requiring concrete models.
-    #[test]
-    fn contains_empty_haystack_tracks_needle_emptiness() {
-        let mut terms = TermStore::new();
-        let x = terms.mk_var("x", Sort::String);
-        let empty = terms.mk_string(String::new());
-        let contains = terms.mk_app(Symbol::named("str.contains"), vec![empty, x], Sort::Bool);
-        let x_eq_empty = terms.mk_eq(x, empty);
-
-        let mut solver = StringSolver::new(&terms);
-        solver.assert_literal(contains, true);
-        solver.assert_literal(x_eq_empty, false); // x != ""
-
-        let result = solver.check();
-        assert!(
-            matches!(result, TheoryResult::Unsat(_)),
-            "str.contains(\"\", x) with x != \"\" should be UNSAT, got {result:?}"
-        );
-    }
+    let result = solver.check();
+    assert!(
+        !matches!(result, TheoryResult::Unsat(_)),
+        "x=\"0\", y=\"\\u{{663}}\", x++y=\"0\\u{{663}}\" is consistent, got {result:?}"
+    );
 }

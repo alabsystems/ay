@@ -6,14 +6,15 @@
 
 use ay_core::CnfLit;
 
-use super::{FpDecomposed, FpPrecision, FpSolver, RoundingMode};
+use super::gates::neg_lit;
+use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand, RoundingMode};
 
 struct RoundToIntegralMainInput<'a> {
     x: &'a FpDecomposed,
     a_sig: &'a [CnfLit],
     eff_exp: &'a [CnfLit],
     precision: FpPrecision,
-    rm: RoundingMode,
+    rm: RmOperand,
 }
 
 struct RoundToIntegralVariants<'a> {
@@ -24,7 +25,12 @@ struct RoundToIntegralVariants<'a> {
 
 impl FpSolver<'_> {
     /// Round to integral value in FP format.
-    pub fn make_round_to_integral(&mut self, x: &FpDecomposed, rm: RoundingMode) -> FpDecomposed {
+    pub fn make_round_to_integral(
+        &mut self,
+        x: &FpDecomposed,
+        rm: impl Into<RmOperand>,
+    ) -> FpDecomposed {
+        let rm = rm.into();
         let precision = x.precision;
         let sb = precision.significand_bits() as usize;
         let eb = precision.exponent_bits() as usize;
@@ -77,30 +83,40 @@ impl FpSolver<'_> {
         eb: usize,
     ) -> (Vec<CnfLit>, Vec<CnfLit>, CnfLit, CnfLit) {
         let (_a_sgn, a_sig, a_exp, a_lz) = self.unpack(x, true);
-        let a_exp_ext = self.sign_extend(&a_exp, 2);
-        let a_lz_ext = self.zero_extend(&a_lz, 2);
+        // Signed, `eb + 2` bits (z3's) unless the normalised exponent or `sb`
+        // needs more (`round_to_integral_exponent_width`).
+        let eb2 = Self::round_to_integral_exponent_width(eb, sb);
+        let a_exp_ext = self.sign_extend(&a_exp, eb2 - eb);
+        let a_lz_ext = self.zero_extend(&a_lz, eb2 - a_lz.len());
         let eff_exp = self.bv_sub(&a_exp_ext, &a_lz_ext);
-        let sb_minus_1 = self.const_bv((sb - 1) as u64, eb + 2);
-        let already_integral = -self.bv_slt(&eff_exp, &sb_minus_1);
-        let zero_eb2 = self.const_bv(0, eb + 2);
+        // SMT-LIB FP sorts have `eb, sb >= 2` (crates/ay-dpll/src/api/
+        // model_parse/typed/sorts.rs:16), so the saturating form equals
+        // `sb - 1` for every real caller.
+        let sb_minus_1 = self.const_bv(sb.saturating_sub(1) as u64, eb2);
+        let already_integral = neg_lit(self.bv_slt(&eff_exp, &sb_minus_1));
+        let zero_eb2 = self.const_bv(0, eb2);
         let exp_negative = self.bv_slt(&eff_exp, &zero_eb2);
         (a_sig, eff_exp, already_integral, exp_negative)
     }
 
-    fn round_to_integral_shift(&mut self, eff_exp: &[CnfLit], sb: usize, eb: usize) -> Vec<CnfLit> {
-        let sb_m1_bv = self.const_bv((sb - 1) as u64, eb + 2);
+    fn round_to_integral_shift(&mut self, eff_exp: &[CnfLit], sb: usize) -> Vec<CnfLit> {
+        // `eff_exp`'s width, `round_to_integral_exponent_width`.
+        let eb2 = eff_exp.len();
+        let sb_m1_bv = self.const_bv(sb.saturating_sub(1) as u64, eb2);
         let shift_raw = self.bv_sub(&sb_m1_bv, eff_exp);
-        let shift_neg = shift_raw[shift_raw.len() - 1];
-        let sb_bv_ext = self.const_bv(sb as u64, eb + 2);
+        // The sign bit is the MSB of the `eb2`-bit difference; a zero-width
+        // value would be 0, which is not negative.
+        let shift_neg = match shift_raw.last() {
+            Some(&msb) => msb,
+            None => self.const_false(),
+        };
+        let sb_bv_ext = self.const_bv(sb as u64, eb2);
         let shift_too_big = self.bv_slt(&sb_bv_ext, &shift_raw);
-        let zero_shift = self.const_bv(0, eb + 2);
+        let zero_shift = self.const_bv(0, eb2);
         let capped = self.make_ite_bits(shift_neg, &zero_shift, &shift_raw);
         let capped = self.make_ite_bits(shift_too_big, &sb_bv_ext, &capped);
-        if eb + 2 >= sb {
-            capped[..sb].to_vec()
-        } else {
-            self.zero_extend(&capped, sb - (eb + 2))
-        }
+        // `0 <= capped <= sb < 2^sb`: resizing is exact.
+        self.resize_unsigned(&capped, sb)
     }
 
     fn mask_bits(&mut self, bits: &[CnfLit], mask: &[CnfLit]) -> Vec<CnfLit> {
@@ -121,8 +137,8 @@ impl FpSolver<'_> {
         let rm = input.rm;
         let sb = precision.significand_bits() as usize;
         let eb = precision.exponent_bits() as usize;
-        let shift_sb = self.round_to_integral_shift(eff_exp, sb, eb);
-        let all_ones = self.const_bv(u64::MAX, sb);
+        let shift_sb = self.round_to_integral_shift(eff_exp, sb);
+        let all_ones = self.const_bv_signed(-1, sb);
         let mask = self.bv_shl(&all_ones, &shift_sb);
         let trunc_sig = self.mask_bits(a_sig, &mask);
 
@@ -149,11 +165,22 @@ impl FpSolver<'_> {
         let inc_ext = self.zero_extend(&inc_masked, 1);
         let rounded_sig_ext = self.bv_add(&trunc_ext, &inc_ext);
 
-        let sig_ovf = rounded_sig_ext[sb];
-        let rounded_sig = rounded_sig_ext[..sb].to_vec();
+        // `rounded_sig_ext` is `sb + 1` bits wide: bit `sb` is the carry out
+        // of the significand. A sum without that bit cannot have overflowed.
+        let mut rounded_sig = rounded_sig_ext;
+        let sig_ovf = match rounded_sig.get(sb) {
+            Some(&carry) => carry,
+            None => self.const_false(),
+        };
+        rounded_sig.truncate(sb);
         let mut sig_after_ovf = vec![self.const_false(); sb];
-        sig_after_ovf[sb - 1] = self.const_true();
-        let final_sig = self.make_ite_bits(sig_ovf, &sig_after_ovf, &rounded_sig);
+        let one = self.const_true();
+        if let Some(msb) = sig_after_ovf.last_mut() {
+            *msb = one;
+        }
+        let mut final_sig = self.make_ite_bits(sig_ovf, &sig_after_ovf, &rounded_sig);
+        // Drop the hidden bit: keep the low `sb - 1` of the `sb` result bits.
+        final_sig.truncate(sb.saturating_sub(1));
 
         let one_eb = self.const_bv(1, eb);
         let exp_plus_one = self.bv_add(&x.exponent, &one_eb);
@@ -161,7 +188,7 @@ impl FpSolver<'_> {
         FpDecomposed {
             sign: x.sign,
             exponent: final_exp,
-            significand: final_sig[..sb - 1].to_vec(),
+            significand: final_sig,
             precision,
         }
     }
@@ -174,11 +201,12 @@ impl FpSolver<'_> {
         result: &FpDecomposed,
         variants: &RoundToIntegralVariants<'_>,
     ) {
-        let not_special = -special;
+        let not_special = neg_lit(special);
+        let not_already = neg_lit(already_integral);
         let use_already = self.make_and(not_special, already_integral);
-        let small_inner = self.make_and(-already_integral, exp_negative);
+        let small_inner = self.make_and(not_already, exp_negative);
         let use_small = self.make_and(not_special, small_inner);
-        let normal_inner = self.make_and(-already_integral, -exp_negative);
+        let normal_inner = self.make_and(not_already, neg_lit(exp_negative));
         let use_normal = self.make_and(not_special, normal_inner);
         self.constrain_fp_when(use_already, result, variants.original);
         self.constrain_fp_when(use_small, result, variants.small);
@@ -191,39 +219,48 @@ impl FpSolver<'_> {
         x: &FpDecomposed,
         a_sig: &[CnfLit],
         eff_exp: &[CnfLit],
-        rm: RoundingMode,
+        rm: RmOperand,
         precision: FpPrecision,
     ) -> FpDecomposed {
         let sb = precision.significand_bits() as usize;
         let eb = precision.exponent_bits() as usize;
         let bias = precision.bias();
 
-        let sig_is_half = {
-            let lower_zero = self.make_all_zero(&a_sig[..sb - 1]);
-            self.make_and(a_sig[sb - 1], lower_zero)
+        // `a_sig` is `sb` bits wide: the significand is one half exactly when
+        // its MSB is set and every lower bit is clear. With no MSB it is not.
+        let halves = sb
+            .checked_sub(1)
+            .and_then(|top| Some((*a_sig.get(top)?, a_sig.get(..top)?)));
+        let sig_is_half = match halves {
+            Some((msb, lower)) => {
+                let lower_zero = self.make_all_zero(lower);
+                self.make_and(msb, lower_zero)
+            }
+            None => self.const_false(),
         };
-        let minus_one_eb2 = self.const_bv(u64::MAX, eb + 2);
+        let minus_one_eb2 = self.const_bv_signed(-1, eff_exp.len());
         let exp_is_minus1 = self.make_bv_eq(eff_exp, &minus_one_eb2);
         let tie = self.make_and(sig_is_half, exp_is_minus1);
 
-        let one_eb2 = self.const_bv(1, eb + 2);
+        let one_eb2 = self.const_bv(1, eff_exp.len());
         let minus_two_eb2 = self.bv_sub(&minus_one_eb2, &one_eb2);
         let exp_le_minus2 = self.bv_sle(eff_exp, &minus_two_eb2);
 
-        let round_to_one = match rm {
+        let round_to_one = self.rm_select(rm, |solver, mode| match mode {
             RoundingMode::RNE => {
-                let not_tie = -tie;
-                let not_small = -exp_le_minus2;
-                self.make_and(not_tie, not_small)
+                let not_tie = neg_lit(tie);
+                let not_small = neg_lit(exp_le_minus2);
+                solver.make_and(not_tie, not_small)
             }
-            RoundingMode::RNA => -exp_le_minus2,
-            RoundingMode::RTP => -x.sign,
+            RoundingMode::RNA => neg_lit(exp_le_minus2),
+            RoundingMode::RTP => neg_lit(x.sign),
             RoundingMode::RTN => x.sign,
-            RoundingMode::RTZ => self.const_false(),
-        };
+            RoundingMode::RTZ => solver.const_false(),
+        });
 
         let one_exp = self.const_bv(u64::from(bias), eb);
-        let zero_sig: Vec<CnfLit> = (0..sb - 1).map(|_| self.const_false()).collect();
+        // `sb - 1` false bits, as `const_bv(0, ..)` builds them (`sb >= 2`).
+        let zero_sig = self.const_bv(0, sb.saturating_sub(1));
         let zero_exp = self.const_bv(0, eb);
         let small_exp = self.make_ite_bits(round_to_one, &one_exp, &zero_exp);
         FpDecomposed {

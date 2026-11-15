@@ -155,16 +155,30 @@ impl SatProofManager<'_> {
         // The whole bounded plan walk is covered before it runs; the exact
         // spend is bounded by PLAN_NODE_BUDGET per unit.
         progress(PLAN_NODE_BUDGET, 0)?;
-        let mut cx = PlanCx::new(
-            authored_terms,
-            authored_problem_terms,
-            &env.record_by_after,
-            &env.entry_by_expr,
-            &augmented_roots,
-            true,
-        );
+        let roots = augmented_roots.as_slice();
+        let plan_cx = move |const_array_reads: bool| {
+            PlanCx::new(
+                authored_terms,
+                authored_problem_terms,
+                &env.record_by_after,
+                &env.entry_by_expr,
+                roots,
+                true,
+            )
+            .with_const_array_reads(const_array_reads)
+        };
+        let mut cx = plan_cx(false);
         let mut planner = PropagationChainPlanner { terms: self.terms };
-        let Some(conclusion) = planner.plan_derive_clause(&mut cx, unit) else {
+        let mut conclusion = planner.plan_derive_clause(&mut cx, unit);
+        // The constant-array read leg only for a unit no leg-free plan
+        // derives (`PlanCx::const_array_reads`); the retry is a second
+        // bounded walk, covered the same way.
+        if conclusion.is_none() && env.const_array_reads && cx.deferred_const_array_read() {
+            progress(PLAN_NODE_BUDGET, 0)?;
+            cx = plan_cx(true);
+            conclusion = planner.plan_derive_clause(&mut cx, unit);
+        }
+        let Some(conclusion) = conclusion else {
             return Ok(None);
         };
         let chain = cx.chain;

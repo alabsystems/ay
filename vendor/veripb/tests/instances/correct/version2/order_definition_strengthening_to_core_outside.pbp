@@ -1,0 +1,20 @@
+pseudo-Boolean proof version 2.0
+* Positive companion to
+* incorrect/version2/order_definition_strengthening_to_core: the mode switch
+* where it belongs, on the same formula.
+*
+* At the top level `strengthening_to_core on` moves the real database to core,
+* and that move is exactly what makes `add_derived_goals = false` sound for
+* every `red` after it -- there is no longer a derived set for the mode to
+* drop. Inside the order definition it moved the empty order sub-database
+* while setting the same global flag, leaving the outer derived set unmoved
+* and the promise unkept. Ordered this way the `red` is legitimate and the
+* proof verifies; ordered the other way round, with `1 y1 >= 1` already in the
+* derived set, the mode switch cannot rescue it -- see
+* incorrect/version2/strengthening_to_core_bare_red_derived.
+f 1
+strengthening_to_core on
+red 1 y1 >= 1 ; y1 -> 1 ;
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

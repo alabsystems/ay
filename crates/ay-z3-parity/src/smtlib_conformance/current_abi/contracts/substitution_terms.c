@@ -1,0 +1,107 @@
+// Copyright 2026 Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+int main(void) {
+    Z3_context c = contract_context();
+    CHECK("substitution.terms.context-created", c != NULL);
+    Z3_sort integer = parsing_sort(c, Z3_mk_int_sort(c));
+    CHECK("substitution.terms.sort-created", integer != NULL);
+    Z3_ast x = parsing_hold(c, Z3_mk_const(c, Z3_mk_string_symbol(c, "subst_x"), integer));
+    Z3_ast y = parsing_hold(c, Z3_mk_const(c, Z3_mk_string_symbol(c, "subst_y"), integer));
+    Z3_ast one = parsing_hold(c, Z3_mk_int(c, 1, integer));
+    Z3_ast two = parsing_hold(c, Z3_mk_int(c, 2, integer));
+    Z3_ast three = parsing_hold(c, Z3_mk_int(c, 3, integer));
+    Z3_ast seven = parsing_hold(c, Z3_mk_int(c, 7, integer));
+    Z3_ast ten = parsing_hold(c, Z3_mk_int(c, 10, integer));
+    Z3_ast eleven = parsing_hold(c, Z3_mk_int(c, 11, integer));
+    CHECK("substitution.terms.atoms-created", x && y && one && two && three && seven && ten && eleven);
+    Z3_ast operands[2] = {x, y};
+    Z3_ast difference = parsing_hold(c, Z3_mk_sub(c, 2, operands));
+    CHECK("substitution.terms.setup", integer && x && y && one && two && three && seven && ten && eleven && difference);
+    Z3_ast from[2] = {x, y}, to[2] = {y, one};
+    Z3_ast simultaneous = parsing_hold(c, Z3_substitute(c, difference, 2, from, to));
+    CHECK("substitution.terms.first-substitution-created", simultaneous != NULL);
+    Z3_ast y_from[1] = {y}, y_to[1] = {seven};
+    Z3_ast closed = parsing_hold(c, Z3_substitute(c, simultaneous, 1, y_from, y_to));
+    CHECK("substitution.terms.simultaneous-not-sequential", simultaneous && closed && parsing_integer_is(c, closed, 6) && !parsing_integer_is(c, closed, 0));
+    Z3_ast sum = parsing_hold(c, Z3_mk_add(c, 2, operands));
+    CHECK("substitution.terms.compound-created", sum != NULL);
+    Z3_ast factors[2] = {sum, sum};
+    Z3_ast square = parsing_hold(c, Z3_mk_mul(c, 2, factors));
+    CHECK("substitution.terms.repeated-compound-created", square != NULL);
+    Z3_ast compound_from[1] = {sum}, compound_to[1] = {eleven};
+    Z3_ast replaced_square = parsing_hold(c, Z3_substitute(c, square, 1, compound_from, compound_to));
+    CHECK("substitution.terms.repeated-compound-subexpression", replaced_square && parsing_integer_is(c, replaced_square, 121));
+    Z3_ast unchanged = parsing_hold(c, Z3_substitute(c, difference, 0, NULL, NULL));
+    CHECK("substitution.terms.empty-map-preserves-term", unchanged && Z3_is_eq_ast(c, unchanged, difference));
+    Z3_ast truth = parsing_hold(c, Z3_mk_true(c));
+    CHECK("substitution.terms.boolean-replacement-created", truth != NULL);
+    Z3_ast bad_to[1] = {truth}, bad_from[1] = {x};
+    contract_last_error = Z3_OK;
+    Z3_ast bad = Z3_substitute(c, difference, 1, bad_from, bad_to);
+    Z3_error_code bad_error = Z3_get_error_code(c);
+    CHECK("substitution.terms.sort-mismatch-refused", !bad && bad_error == Z3_SORT_ERROR && contract_last_error == Z3_SORT_ERROR);
+    Z3_ast both_from[2] = {x, y}, both_to[2] = {seven, two};
+    Z3_ast recovered = parsing_hold(c, Z3_substitute(c, difference, 2, both_from, both_to));
+    CHECK("substitution.terms.valid-map-recovers", recovered && Z3_get_error_code(c) == Z3_OK && parsing_integer_is(c, recovered, 5));
+    /* The quantifier owner tests creation/reflection. Here the two variables
+       are only inputs to the substitution API's documented index ordering. */
+    Z3_ast b0 = parsing_hold(c, Z3_mk_bound(c, 0, integer));
+    Z3_ast b1 = parsing_hold(c, Z3_mk_bound(c, 1, integer));
+    CHECK("substitution.terms.variable-inputs-created", b0 && b1);
+    Z3_ast ten_b1_factors[2] = {ten, b1};
+    Z3_ast ten_b1 = parsing_hold(c, Z3_mk_mul(c, 2, ten_b1_factors));
+    CHECK("substitution.terms.indexed-product-created", ten_b1 != NULL);
+    Z3_ast indexed_args[2] = {ten_b1, b0};
+    Z3_ast indexed = parsing_hold(c, Z3_mk_add(c, 2, indexed_args));
+    CHECK("substitution.terms.indexed-input-created", indexed != NULL);
+    Z3_ast replacements[2] = {two, three};
+    Z3_ast instantiated = parsing_hold(c, Z3_substitute_vars(c, indexed, 2, replacements));
+    CHECK("substitution.terms.debruijn-index-order", instantiated && parsing_integer_is(c, instantiated, 32) && !parsing_integer_is(c, instantiated, 23));
+    Z3_sort domains[2] = {integer, integer};
+    Z3_func_decl f = Z3_mk_func_decl(c, Z3_mk_string_symbol(c, "subst_f"), 2, domains, integer);
+    if (f) parsing_hold(c, Z3_func_decl_to_ast(c, f));
+    CHECK("substitution.terms.function-created", f != NULL);
+    Z3_ast application = parsing_hold(c, Z3_mk_app(c, f, 2, operands));
+    Z3_ast ten_b0_args[2] = {ten, b0};
+    Z3_ast ten_b0 = parsing_hold(c, Z3_mk_mul(c, 2, ten_b0_args));
+    CHECK("substitution.terms.function-inputs-created", application && ten_b0);
+    Z3_ast body_args[2] = {ten_b0, b1};
+    Z3_ast body = parsing_hold(c, Z3_mk_add(c, 2, body_args));
+    CHECK("substitution.terms.function-body-created", body != NULL);
+    Z3_func_decl functions[1] = {f}; Z3_ast bodies[1] = {body};
+    Z3_ast expanded = parsing_hold(c, Z3_substitute_funs(c, application, 1, functions, bodies));
+    CHECK("substitution.terms.function-substitution-created", expanded != NULL);
+    Z3_ast arguments[2] = {two, three};
+    Z3_ast evaluated = parsing_hold(c, Z3_substitute(c, expanded, 2, both_from, arguments));
+    CHECK("substitution.terms.function-argument-order", expanded && evaluated && parsing_integer_is(c, evaluated, 23) && !parsing_integer_is(c, evaluated, 32));
+    Z3_symbol names[1] = {Z3_mk_string_symbol(c, "supplied_x")};
+    Z3_func_decl constants[1] = {Z3_get_app_decl(c, Z3_to_app(c, x))};
+    Z3_ast_vector quantified = Z3_parse_smtlib2_string(c,
+        "(assert (forall ((q Int)) (and (= supplied_x 7) (= q q))))",
+        0, NULL, NULL, 1, names, constants);
+    if (quantified) Z3_ast_vector_inc_ref(c, quantified);
+    CHECK("substitution.terms.capture-fixture-created", quantified && Z3_ast_vector_size(c, quantified) == 1);
+    Z3_ast quantifier = parsing_hold(c, Z3_ast_vector_get(c, quantified, 0));
+    CHECK("substitution.terms.capture-fixture-retains-binder", quantifier && Z3_is_quantifier_forall(c, quantifier) && Z3_get_quantifier_num_bound(c, quantifier) == 1);
+    Z3_ast external_from[1] = {x}, external_to[1] = {b0};
+    Z3_ast lifted = parsing_hold(c, Z3_substitute(c, quantifier, 1, external_from, external_to));
+    CHECK("substitution.terms.lifted-replacement-created", lifted != NULL);
+    Z3_ast close_external[1] = {seven};
+    Z3_ast closed_quantifier = parsing_hold(c, Z3_substitute_vars(c, lifted, 1, close_external));
+    Z3_ast zero = parsing_hold(c, Z3_mk_int(c, 0, integer));
+    CHECK("substitution.terms.closed-inputs-created", closed_quantifier && zero);
+    Z3_ast x_zero = parsing_hold(c, Z3_mk_eq(c, x, zero));
+    CHECK("substitution.terms.zero-constraint-created", x_zero != NULL);
+    Z3_ast good_args[2] = {closed_quantifier, x_zero};
+    Z3_ast good = parsing_hold(c, Z3_mk_and(c, 2, good_args));
+    CHECK("substitution.terms.replacement-avoids-binder-capture", lifted && closed_quantifier && good && parsing_solver_is(c, good, Z3_L_TRUE));
+    Z3_ast wrong_args[2] = {quantifier, x_zero};
+    Z3_ast wrong = parsing_hold(c, Z3_mk_and(c, 2, wrong_args));
+    CHECK("substitution.terms.ignored-replacement-negative-control", wrong && parsing_solver_is(c, wrong, Z3_L_FALSE));
+    Z3_ast protected = parsing_hold(c, Z3_substitute_vars(c, quantifier, 1, close_external));
+    CHECK("substitution.terms.bound-variables-are-not-free-slots", protected && Z3_is_eq_ast(c, protected, quantifier));
+    Z3_ast_vector_dec_ref(c, quantified);
+    parsing_release(c); Z3_del_context(c);
+    return 0;
+}

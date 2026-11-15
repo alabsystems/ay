@@ -20,7 +20,7 @@ use super::TheoryExtension;
 mod axioms;
 mod batching;
 mod check_result;
-mod conflict;
+pub(crate) mod conflict;
 mod farkas_conflict;
 mod propagation;
 mod propagation_lazy;
@@ -164,6 +164,14 @@ enum LazyResolution {
         reason_data: u64,
     },
     Materialized(TheoryPropagation),
+    /// A level-0 propagation explained for a proof-tracking solve. The eager
+    /// lane delivers it with its reason clause; if that lane declines it, it
+    /// is delivered lazily (`sat_literal`, `reason_data`), never dropped.
+    Level0Explained {
+        explained: TheoryPropagation,
+        sat_literal: Literal,
+        reason_data: u64,
+    },
 }
 
 impl<T: TheorySolver> TheoryExtension<'_, T> {
@@ -198,7 +206,8 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             TheoryResult::Sat
         } else {
             self.total_bcp_checks += 1;
-            self.theory.check_during_propagate()
+            let result = self.theory.check_during_propagate();
+            self.recheck_installed_theory_lemmas(result, T::check_during_propagate)
         }
     }
 }

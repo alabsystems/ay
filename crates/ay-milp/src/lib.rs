@@ -16,7 +16,7 @@
 //!
 //! ## API guarantees
 //!
-//! 1. **Witnesses are checked before publication.** Session-produced primal
+//! 1. **Witnesses are checked before publication.** Verdict-bearing primal
 //!    points, objective values, and attached certificates are re-checked
 //!    against the caller's [`Model`]. A failed check becomes
 //!    [`Outcome::Unknown`] with [`UnknownReason::WitnessRejected`]. This does
@@ -38,13 +38,14 @@
 //!    stated per claim (`SUCCINCT` / `REPLAY` / `NONE`). The kind is derived
 //!    from the Rust type that is present, never chosen; [`cert_io::check`]
 //!    re-parses the model itself and reserves the word "verified".
-//! 7. **Session validation is always on.** Every session exit crosses a
+//! 7. **Verdict validation is always on.** Every verdict-bearing exit crosses a
 //!    fail-closed validation boundary; the general path is `finish` ->
 //!    `validate_witnesses`, while typed sibling finalizers enforce the
 //!    corresponding checks. Primal points and objective values are re-derived,
 //!    attached certificates are verified, and bounds may not contradict their
 //!    witnesses. Public or recombined outcomes cross the same kind of boundary
-//!    explicitly through [`Outcome::check_against`].
+//!    explicitly through [`Outcome::check_against`]. Raw [`FloatLpAdvice`]
+//!    and float dual vectors are untrusted hints, outside this verdict boundary.
 //!
 //! ## Solver paths
 //!
@@ -62,6 +63,7 @@ pub mod attrib;
 mod bab;
 mod block_angular_route;
 mod cardinality_branch;
+mod compute;
 /// Decision census for MECHANISM D (node-rate steering). Inert without `--features dcensus`.
 pub mod dcensus;
 pub mod debug_flags;
@@ -182,12 +184,26 @@ pub use block_angular_route::{
     verify_optimality_certificate as verify_block_angular_optimality_certificate,
     BlockAngularOptimalityCertificate,
 };
-pub use hybrid_integer_lift::HybridIntegerLiftInfeasibilityCertificate;
-pub use hybrid_pb_lp::HybridPbLpInfeasibilityCertificate;
+pub use hybrid_integer_lift::{
+    verify_hybrid_integer_lift_infeasibility_certificate,
+    verify_hybrid_integer_lift_infeasibility_certificate_interruptible,
+    verify_hybrid_integer_lift_infeasibility_certificate_with_deadline,
+    HybridIntegerLiftCertificateVerificationError, HybridIntegerLiftInfeasibilityCertificate,
+};
+pub use hybrid_pb_lp::{
+    verify_hybrid_pb_lp_infeasibility_certificate,
+    verify_hybrid_pb_lp_infeasibility_certificate_interruptible,
+    verify_hybrid_pb_lp_infeasibility_certificate_with_deadline,
+    HybridPbLpCertificateVerificationError, HybridPbLpInfeasibilityCertificate,
+};
+mod integer_cut;
+mod integer_cut_capture;
+pub use integer_cut::{CertifiedIntegerCut, IntegerCutProof, IntegerCutVerificationError};
+pub use integer_cut_capture::CutHarvestSummary;
 mod knobs;
 pub use knobs::{
-    env_audit, Bucket, Deprecation, EnvAudit, Knob, Route, Routed, ZeroIgnored, ALLOW_UNKNOWN_ENV,
-    DEPRECATED, KNOBS, ROUTED, ZERO_IGNORED,
+    env_audit, is_repo_tooling_env, tooling_env_names, Bucket, Deprecation, EnvAudit, Knob, Route,
+    Routed, ZeroIgnored, ALLOW_UNKNOWN_ENV, DEPRECATED, KNOBS, ROUTED, ZERO_IGNORED,
 };
 mod lattice;
 mod local_census;
@@ -202,16 +218,33 @@ mod network_design_pb;
 mod network_design_route;
 pub use network_design_route::{
     verify_infeasibility_certificate as verify_network_design_infeasibility_certificate,
+    verify_infeasibility_certificate_with_deadline as verify_network_design_infeasibility_certificate_with_deadline,
     verify_optimality_certificate as verify_network_design_optimality_certificate,
     NetworkDesignInfeasibilityCertificate, NetworkDesignOptimalityCertificate,
 };
 mod ns;
 mod open_domain;
 mod open_domain_route;
+/// Source-model replay for artifacts from the four open-domain residual lanes.
+/// These entry points rebuild the exact monotone projection; callers must pass
+/// their original model rather than an artifact's embedded residual.
+pub use open_domain_route::{
+    verify_hybrid_integer_lift_infeasibility_certificate as verify_open_domain_hybrid_integer_lift_infeasibility_certificate,
+    verify_hybrid_integer_lift_infeasibility_certificate_with_deadline as verify_open_domain_hybrid_integer_lift_infeasibility_certificate_with_deadline,
+    verify_hybrid_pb_lp_infeasibility_certificate as verify_open_domain_hybrid_pb_lp_infeasibility_certificate,
+    verify_hybrid_pb_lp_infeasibility_certificate_with_deadline as verify_open_domain_hybrid_pb_lp_infeasibility_certificate_with_deadline,
+    verify_multi_row_infeasibility_certificate as verify_open_domain_multi_row_bdd_infeasibility_certificate,
+    verify_multi_row_infeasibility_certificate_with_deadline as verify_open_domain_multi_row_bdd_infeasibility_certificate_with_deadline,
+    verify_single_row_infeasibility_certificate as verify_open_domain_single_row_dp_infeasibility_certificate,
+    verify_single_row_infeasibility_certificate_with_deadline as verify_open_domain_single_row_dp_infeasibility_certificate_with_deadline,
+};
 mod opts;
 mod outcome;
 mod parity;
-pub use parity::{verify_parity_infeasibility_certificate, ParityInfeasibilityCertificate};
+pub use parity::{
+    verify_parity_infeasibility_certificate, verify_parity_infeasibility_certificate_with_deadline,
+    ParityInfeasibilityCertificate,
+};
 // The first pattern-count tranche is deliberately classifier-only.  Production
 // wiring follows only after exact pricing/frontier proof support exists.
 #[allow(dead_code)]
@@ -229,7 +262,9 @@ mod pb_route;
 /// instead of a self-report.
 pub use pb_route::{
     verify_multi_row_infeasibility_certificate as verify_multi_row_bdd_infeasibility_certificate,
+    verify_multi_row_infeasibility_certificate_with_deadline as verify_multi_row_bdd_infeasibility_certificate_with_deadline,
     verify_single_row_infeasibility_certificate as verify_single_row_dp_infeasibility_certificate,
+    verify_single_row_infeasibility_certificate_with_deadline as verify_single_row_dp_infeasibility_certificate_with_deadline,
 };
 mod pb_translate;
 mod presolve;
@@ -275,9 +310,10 @@ pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
 pub use mps::{read_mps, MpsError, MpsProblem};
 pub use opt_cert::{
-    derive_optimality_tree, derive_optimality_tree_reported, verify_optimality_tree_bound,
-    MilpOptimalityCertificate, OptTreeBranch, OptTreeDecline, OptTreeNode, OptTreeReport,
-    OptimalityTreeBudget, OPT_TREE_FLOAT_ITERS_PER_UNIT, OPT_TREE_RIM_BUILD_COST,
+    derive_optimality_tree, derive_optimality_tree_reported, stream_optimality_tree,
+    verify_optimality_tree_block, verify_optimality_tree_bound, MilpOptimalityCertificate,
+    OptTreeBranch, OptTreeDecline, OptTreeNode, OptTreeReport, OptimalityTreeBudget,
+    StreamedOptTree, OPT_TREE_FLOAT_ITERS_PER_UNIT, OPT_TREE_RIM_BUILD_COST,
     OPT_TREE_RIM_ITER_COST,
 };
 pub use opts::{
@@ -294,13 +330,20 @@ pub use presolve::{
 /// no ladder and whose status and objective are not solver behaviour.
 #[doc(hidden)]
 pub use session::diag_shipped_float_lp;
+/// Per-phase wall clock for the W2 ledger shape; see
+/// [`session::diag_w2_tier_timing`]. Exposed for `examples/w2_tier_timing.rs`
+/// so the instrument is a runnable target rather than an `#[ignore]`d test
+/// that never runs.
+#[doc(hidden)]
+pub use session::diag_w2_tier_timing;
 pub use session::{
     AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,
     CertifiedAdaptiveFourLeafComb, CertifiedAdaptiveThreeLeafHarvest,
     CertifiedAdaptiveThreeLeafTree, CertifiedBinaryAssignmentTree, CertifiedBinaryTreeHarvest,
-    CertifiedSplitHarvest, LpSession, ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbPrefixOpts,
-    TargetFsbReport, MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
+    CertifiedSplitHarvest, FloatLpAdvice, InfeasibilityEvidenceKind, LpSession, ObbtOpts,
+    ObbtReport, TargetFsbOpts, TargetFsbPrefixOpts, TargetFsbReport,
+    MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
     MAX_TARGET_FSB_PREFIX_CANDIDATES,
 };
 pub use simplex::{

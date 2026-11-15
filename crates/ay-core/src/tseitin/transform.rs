@@ -62,6 +62,32 @@ impl Tseitin<'_> {
 
     // ==================== Incremental API ====================
 
+    /// Consume the currently retained assertion database without copying it.
+    ///
+    /// Includes all clauses, even those previously returned by an extraction
+    /// method, and preserves the variable maps and parallel proof annotations.
+    /// A malformed nonparallel proof ledger is discarded, as in
+    /// `TseitinResult::with_parallel_proof_annotations`.
+    /// Like `all_clauses`, this does not reconstruct clauses from a prior saved
+    /// state; an incremental caller must retain those in its existing solver.
+    /// This does not encode or assert another term, allocate a variable, or
+    /// activate any terms that were only encoded as assumptions.
+    ///
+    /// The result's `root` is the unused sentinel `0`: callers must submit the
+    /// existing clauses and any assumption literals separately, not assert it
+    /// as a DIMACS literal. To encode and assert a new root, use `transform`.
+    #[must_use = "the consumed assertion database must be used"]
+    pub fn into_assertion_result(self) -> TseitinResult {
+        TseitinResult::new(
+            self.clauses,
+            self.term_to_var,
+            self.var_to_term,
+            0,
+            self.next_var.saturating_sub(1),
+        )
+        .with_parallel_proof_annotations(self.proof_annotations)
+    }
+
     /// Encode and assert a term, returning the root literal
     ///
     /// This is the incremental version that doesn't consume self.

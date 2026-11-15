@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `L1 L2 ==> C` pushed a big-M term whose coefficient is C's
+% normalized degree. For a negative degree -- exactly when C is trivially true,
+% so the reification is a tautology -- `normalize()` flipped each pushed term to
+% `|degree| * Lj` and raised the degree to `(k-1) * |degree|`. With two premise
+% literals `x2 x3 ==> 1 x1 >= -1` was stored as the clause `1 x1 1 x2 1 x3 >= 1`,
+% which this `e` used to match. It must now parse to the tautology `1 x1 >= -1`.
+f 1 ;
+e x2 x3 ==> 1 x1 >= -1 : 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

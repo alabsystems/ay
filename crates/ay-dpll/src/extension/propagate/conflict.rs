@@ -14,14 +14,35 @@ use ay_sat::{ExtPropagateResult, Literal};
 use super::*;
 use crate::theory_inference::record_theory_conflict_unsat;
 use crate::verification::{
-    log_conflict_debug, verify_euf_conflict, verify_lra_full_state_satisfiable,
-    verify_theory_conflict,
+    log_conflict_debug, verify_lra_full_state_satisfiable, verify_theory_conflict,
 };
 
 #[derive(Clone, Copy)]
-pub(super) enum ConflictOrigin {
+pub(crate) enum ConflictOrigin {
     Plain,
     Farkas,
+}
+
+/// Result of mapping a validated theory conflict to SAT literals.
+/// `Falsified` requires every literal to be false in the current SAT context.
+/// A named variable can still be unassigned after minting or backtracking;
+/// a complete mapping alone grants no conflict-analysis authority.
+pub(crate) enum MappedConflict {
+    Falsified(Vec<Literal>),
+    Lemma(Vec<Literal>),
+}
+
+impl MappedConflict {
+    fn from_clause(clause: Vec<Literal>, ctx: &dyn ay_sat::SolverContext) -> Self {
+        if clause
+            .iter()
+            .all(|literal| ctx.value(literal.variable()) == Some(!literal.is_positive()))
+        {
+            Self::Falsified(clause)
+        } else {
+            Self::Lemma(clause)
+        }
+    }
 }
 
 impl<T: TheorySolver> TheoryExtension<'_, T> {
@@ -46,15 +67,43 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             let _ =
                 record_theory_conflict_unsat(proof.tracker, self.terms, proof.negations, &conflict);
         }
-        if let Some(terms) = self.terms {
-            let removed = crate::theory_inference::minimize_euf_conflict(&mut conflict, terms);
-            self.eager_stats.theory_minimize_lits_removed += removed as u64;
+        if self.proof.is_none() {
+            if let Some(terms) = self.terms {
+                let removed = crate::theory_inference::minimize_euf_conflict(&mut conflict, terms);
+                self.eager_stats.theory_minimize_lits_removed += removed as u64;
+            }
         }
-        let Some(mut clause) = self.map_conflict_clause(&conflict, ConflictOrigin::Plain) else {
+        let Some(mapped) = self.map_conflict_clause(&conflict, ConflictOrigin::Plain, round.ctx)
+        else {
             self.emit_conflict_unknown(round);
             return ExtPropagateResult::none();
         };
-        self.minimize_context_conflict(&conflict, &mut clause, round.ctx);
+        let mut clause = match mapped {
+            MappedConflict::Falsified(clause) => clause,
+            MappedConflict::Lemma(clause) => {
+                // A complete theory clause can still contain a satisfied or
+                // unassigned literal, including a retained minted mapping.
+                // Deliver it as a lemma, never as a falsified conflict.
+                self.emit_eager_event(
+                    round.sat_level,
+                    round.asserted_atoms,
+                    "lemma",
+                    0,
+                    round.started_at,
+                );
+                let mut result = ExtPropagateResult::default();
+                result.clauses = vec![clause];
+                return result;
+            }
+        };
+        if !matches!(
+            self.minimize_context_conflict(&conflict, &mut clause, round.ctx),
+            crate::theory_inference::ConflictClauseReduction::Clause { .. }
+        ) {
+            self.pending_split = Some(TheoryResult::Unknown);
+            self.emit_conflict_unknown(round);
+            return ExtPropagateResult::none();
+        }
         self.finish_theory_conflict(clause, round, ConflictOrigin::Plain)
     }
 
@@ -68,23 +117,31 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 "BUG(#4666): theory conflict verification failed in propagate(); escalating to Unknown"
             );
         }
-        let mut euf_prechecked = false;
+        // `Some(verdict)` only when the direct EUF re-check ran AND accepted;
+        // a rejection leaves it `None` so the dispatcher re-derives the exact
+        // error (and the memo records the rejection, not an acceptance).
+        let mut euf_precheck = None;
         if self.theory.supports_euf_semantic_check() {
             if let Some(terms) = self.terms {
-                euf_prechecked = true;
-                if let Err(error) = verify_euf_conflict(conflict, terms, &self.support_axioms) {
-                    verified = false;
-                    tracing::warn!(
-                        error = %error,
-                        conflict_len = conflict.len(),
-                        "BUG(#4704): EUF semantic verification failed in propagate(); escalating to Unknown"
-                    );
+                match crate::verification::verify_euf_conflict_classified(
+                    conflict,
+                    terms,
+                    &self.support_axioms,
+                ) {
+                    Ok(verdict) => euf_precheck = Some(verdict),
+                    Err(error) => {
+                        verified = false;
+                        tracing::warn!(
+                            error = %error,
+                            conflict_len = conflict.len(),
+                            "BUG(#4704): EUF semantic verification failed in propagate(); escalating to Unknown"
+                        );
+                    }
                 }
             }
         }
         if let Some(terms) = self.terms {
-            if let Err(error) = self.verify_conflict_semantic_memo(conflict, terms, euf_prechecked)
-            {
+            if let Err(error) = self.verify_conflict_semantic_memo(conflict, terms, euf_precheck) {
                 verified = false;
                 tracing::warn!(
                     error = %error,
@@ -169,13 +226,55 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         &mut self,
         conflict: &[TheoryLit],
         origin: ConflictOrigin,
-    ) -> Option<Vec<Literal>> {
+        ctx: &dyn ay_sat::SolverContext,
+    ) -> Option<MappedConflict> {
+        self.map_conflict_clause_minting(
+            conflict,
+            origin,
+            ctx,
+            super::super::check::mint_theory_vars_enabled(),
+        )
+    }
+
+    /// Map a theory conflict to SAT literals, optionally minting
+    /// variables for unencoded terms (#6846 BCP parity with the
+    /// `check()` path in `extension/check.rs`). Farkas-origin
+    /// conflicts never mint: their coefficient vector is aligned to
+    /// the original literal list and the proof path is unchanged, so
+    /// a partial Farkas mapping keeps failing closed.
+    pub(crate) fn map_conflict_clause_minting(
+        &mut self,
+        conflict: &[TheoryLit],
+        origin: ConflictOrigin,
+        ctx: &dyn ay_sat::SolverContext,
+        mint_enabled: bool,
+    ) -> Option<MappedConflict> {
         let clause: Vec<Literal> = conflict
             .iter()
             .filter_map(|term| self.term_to_literal(term.term, !term.value))
             .collect();
         if clause.len() == conflict.len() {
-            return Some(clause);
+            return Some(MappedConflict::from_clause(clause, ctx));
+        }
+        if mint_enabled && matches!(origin, ConflictOrigin::Plain) {
+            let mut minted_clause = Vec::with_capacity(conflict.len());
+            let mut complete = true;
+            for term in conflict {
+                match self.term_to_literal_minting(term.term, !term.value, ctx, true) {
+                    Some(literal) => minted_clause.push(literal),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                tracing::debug!(
+                    lits = minted_clause.len(),
+                    "#6846: minted SAT variables for an otherwise-partial BCP theory conflict"
+                );
+                return Some(MappedConflict::from_clause(minted_clause, ctx));
+            }
         }
         self.partial_clause_count += 1;
         crate::combined_solvers::theory_stats::inc_partial_clauses();

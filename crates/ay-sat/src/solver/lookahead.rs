@@ -40,7 +40,10 @@ enum ProbeResult {
     /// Successful propagation; value is trail length after propagation.
     PropCount(usize),
     /// The literal is a failed literal (conflict under this polarity).
-    Failed,
+    /// Carries the LRAT hint chain collected from the level-1 conflict
+    /// BEFORE backtracking (empty unless LRAT is enabled), so the forced
+    /// unit can be learned through the proof-emitting derived-unit path.
+    Failed(Vec<u64>),
 }
 
 impl Solver {
@@ -81,17 +84,16 @@ impl Solver {
         let mut best_score: u64 = 0;
         let mut best_literal: Option<Literal> = None;
 
-        // When LRAT/DRAT proof generation is enabled, we cannot use the
-        // bare `enqueue(lit, None)` path for failed-literal forcing because
-        // it emits no proof line, sets no `unit_proof_id`, and does not mark
-        // the variable as fixed in `var_lifecycle`. The proper fix would be
-        // to collect LRAT hints from the conflict and call
-        // `learn_derived_unit`, but that is complex. Instead, we simply skip
-        // the failed-literal optimisation when proofs are active. The unit
-        // will be discovered later by normal probing or search. Lookahead is
-        // a heuristic — skipping this optimisation does not affect
-        // correctness.
-        let proof_active = self.proof_manager.is_some();
+        // Failed-literal units go through `learn_derived_unit` in BOTH the
+        // proof and the no-proof arm: it emits the unit (RUP-derivable, since
+        // asserting the failed literal propagates to a conflict over the live
+        // clause database), records it in the clause DB, marks the variable
+        // fixed and propagates. Under LRAT the hint chain collected at the
+        // conflict is required; an empty chain is uncertifiable and the unit
+        // is skipped, exactly as probe.rs does. Before this the whole
+        // optimisation was skipped whenever a proof was being emitted, which
+        // made the proof posture search a different formula than the
+        // no-proof posture (proof-posture-parity, site 1).
 
         // Effort budget (#8322): bound lookahead propagations per round.
         // Without a budget, probing all ~35K variables on FmlaEquivChain
@@ -101,6 +103,9 @@ impl Solver {
         let props_start = self.num_propagations;
         let prop_budget = LOOKAHEAD_MAX_PROPAGATIONS;
         let wall_start = ay_core::time::Instant::now();
+        // Under `--sat-deterministic-inproc` the 500 ms wall is a search-tick
+        // budget (`inproc_over_budget`); the probes' BCP lands in search_ticks.
+        let ticks_start = self.total_search_ticks();
 
         for var_idx in 0..self.num_vars {
             if self.is_interrupted() {
@@ -122,7 +127,12 @@ impl Solver {
             // granularity catches these cases with minimal overhead
             // (~0.1us per Instant::now()).
             if var_idx & 3 == 0
-                && wall_start.elapsed().as_millis() as u64 >= LOOKAHEAD_WALL_LIMIT_MS
+                && self.inproc_over_budget(
+                    wall_start,
+                    ticks_start,
+                    LOOKAHEAD_WALL_LIMIT_MS,
+                    crate::determinism::LOOKAHEAD_TICK_BUDGET,
+                )
             {
                 break;
             }
@@ -137,16 +147,15 @@ impl Solver {
             // Probe positive polarity.
             let pos_result = self.lookahead_probe(pos_lit, base_trail_len);
             match pos_result {
-                ProbeResult::Failed => {
+                ProbeResult::Failed(hints) => {
                     // pos_lit is a failed literal; neg_lit must be true.
                     // backtrack already done inside lookahead_probe.
-                    if proof_active {
-                        // Cannot enqueue without proof justification — skip
-                        // and let normal probing discover this unit later.
+                    if self.cold.lrat_enabled && hints.is_empty() {
+                        // No checker-visible LRAT chain: skip the unit rather
+                        // than emit a hidden TrustedTransform (see probe.rs).
                         continue;
                     }
-                    self.enqueue(neg_lit, None);
-                    if self.search_propagate().is_some() {
+                    if self.learn_derived_unit(neg_lit, &hints) {
                         // Propagating the forced unit caused UNSAT.
                         return None;
                     }
@@ -157,7 +166,12 @@ impl Solver {
                     // Failed literal chains (FmlaEquivChain: 772 in one round)
                     // accumulate BCP costs that the top-of-loop wall check
                     // misses because `continue` skips it for the current var.
-                    if wall_start.elapsed().as_millis() as u64 >= LOOKAHEAD_WALL_LIMIT_MS {
+                    if self.inproc_over_budget(
+                        wall_start,
+                        ticks_start,
+                        LOOKAHEAD_WALL_LIMIT_MS,
+                        crate::determinism::LOOKAHEAD_TICK_BUDGET,
+                    ) {
                         break;
                     }
                     continue;
@@ -172,20 +186,23 @@ impl Solver {
                     // Probe negative polarity.
                     let neg_result = self.lookahead_probe(neg_lit, base_trail_len);
                     match neg_result {
-                        ProbeResult::Failed => {
+                        ProbeResult::Failed(hints) => {
                             // neg_lit is a failed literal; pos_lit must be true.
-                            if proof_active {
-                                // Cannot enqueue without proof justification.
+                            if self.cold.lrat_enabled && hints.is_empty() {
                                 continue;
                             }
-                            self.enqueue(pos_lit, None);
-                            if self.search_propagate().is_some() {
+                            if self.learn_derived_unit(pos_lit, &hints) {
                                 return None;
                             }
                             // Update base_trail_len after forcing a unit.
                             base_trail_len = self.trail.len();
                             // (#8448) Wall check after failed literal BCP.
-                            if wall_start.elapsed().as_millis() as u64 >= LOOKAHEAD_WALL_LIMIT_MS {
+                            if self.inproc_over_budget(
+                                wall_start,
+                                ticks_start,
+                                LOOKAHEAD_WALL_LIMIT_MS,
+                                crate::determinism::LOOKAHEAD_TICK_BUDGET,
+                            ) {
                                 break;
                             }
                             continue;
@@ -241,10 +258,14 @@ impl Solver {
         );
 
         self.decide(lit);
-        let result = if self.search_propagate().is_some() {
-            // Conflict: failed literal.
+        let result = if let Some(conflict_ref) = self.search_propagate() {
+            // Conflict: failed literal. Collect the LRAT hint chain BEFORE
+            // backtracking, while the level-1 trail and its reason clauses
+            // are still accessible (no-op unless LRAT is enabled).
+            let hints =
+                self.collect_probe_conflict_lrat_hints(conflict_ref, lit, Some(lit.negated()));
             self.backtrack(0);
-            ProbeResult::Failed
+            ProbeResult::Failed(hints)
         } else {
             let trail_len = self.trail.len();
             self.backtrack(0);

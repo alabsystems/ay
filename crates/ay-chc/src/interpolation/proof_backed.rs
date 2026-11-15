@@ -24,9 +24,23 @@
 //! BUDGET: the proof-mode solve + extraction + validation are bounded by the
 //! caller-provided budget (IMC passes its per-query timeout), so the proof
 //! attempt never exceeds the cascade's own budget for the same query.
+//!
+//! QF_LRA (CHC-COMP 2026 Workstream D Rung 1, WP-D1-P): a query the QF_LIA
+//! gate refuses because it is Real (QF_LRA+Bool, no Int variables) goes
+//! through the multi-group substrate instead (`proof_groups`: ONE proof
+//! solve, fail-closed Explicit extraction of Pudlák / McMillan / McMillan′,
+//! size-sorted, first candidate that passes the Verification-lane Craig
+//! check wins). The QF_LIA route below is unchanged, so LIA scripts,
+//! candidates and verdicts are byte-identical to the pre-Rung-1 path.
 
 use super::fallback::is_valid_interpolant_until;
 use super::proof_eq_diffvar;
+use super::proof_groups::{
+    proof_check_groups, GroupMask, ItpFail, ItpRecipe, ItpUnknown, ProofCheck, ValidatePolicy,
+    DEFAULT_DAG_CAPS,
+};
+use super::proof_script::{self, ProofLogic};
+use super::stats::{self, Source};
 use super::{
     interpolating_sat_constraints, interpolating_sat_constraints_until, InterpolatingSatResult,
 };
@@ -144,6 +158,7 @@ pub(crate) fn interpolating_sat_constraints_with_proof_provenance(
     proof_budget: Option<Duration>,
     cascade_budget: Option<Duration>,
 ) -> (InterpolatingSatResult, bool) {
+    let _census_role = crate::smt::lane::ScopedCensusRole::set("interp");
     if let Some(budget) = proof_budget {
         if let Some(interpolant) =
             try_proof_derived_interpolant(a_constraints, b_constraints, shared_vars, budget)
@@ -210,6 +225,13 @@ pub(crate) fn try_proof_derived_interpolant(
     let mut var_sorts: FxHashMap<String, ChcSort> = FxHashMap::default();
     for constraint in a_constraints.iter().chain(b_constraints.iter()) {
         if !collect_supported_vars(constraint, &mut var_sorts, &mut scan_budget) {
+            // Workstream D Rung 1: Real queries take the multi-group proof
+            // substrate; everything else keeps the legacy refusal.
+            if let Some(result) =
+                try_lra_proof_groups(a_constraints, b_constraints, shared_vars, deadline)
+            {
+                return result;
+            }
             PROOF_ITP_NOT_APPLICABLE.fetch_add(1, Ordering::Relaxed);
             trace_event("not_applicable_fragment");
             return None;
@@ -340,6 +362,240 @@ pub(crate) fn try_proof_derived_interpolant(
 }
 
 // ---------------------------------------------------------------------------
+// QF_LRA route (Workstream D Rung 1): the multi-group proof substrate
+// ---------------------------------------------------------------------------
+
+/// Distinct-node cap for sorting candidates by size.
+const LRA_SORT_NODE_CAP: usize = 100_000;
+
+/// Serve a QF_LRA(+Bool) query from `proof_groups`.
+///
+/// Returns `None` when the query is not QF_LRA (the caller keeps the legacy
+/// not-applicable path), otherwise `Some(result)` where `result` is a
+/// candidate that passed the Verification-lane Craig check, or `None` (the
+/// caller falls back to the cascade).
+fn try_lra_proof_groups(
+    a_constraints: &[ChcExpr],
+    b_constraints: &[ChcExpr],
+    shared_vars: &FxHashSet<String>,
+    deadline: Instant,
+) -> Option<Option<ChcExpr>> {
+    let roots: Vec<&ChcExpr> = a_constraints.iter().chain(b_constraints.iter()).collect();
+    if proof_script::scan_logic(&roots, DEFAULT_DAG_CAPS.max_unique_nodes) != Ok(ProofLogic::QfLra)
+    {
+        return None;
+    }
+    let stats_on = proof_itp_stats_enabled();
+    // Solve equalities on both sides of the cut and move A's shared
+    // equalities into B (`unit_transfer`): the proof solve then refutes the
+    // collapsed unrolling instead of searching B's disjunctions, and the
+    // served interpolant is `I' ∧ units`.
+    let imc = matches!(stats::current_engine(), stats::EngineTag::Imc);
+    let transfer =
+        super::unit_transfer::simplify_partition(a_constraints, b_constraints, shared_vars, imc);
+    let no_units: &[ChcExpr] = &[];
+    let (a_constraints, b_constraints, units): (&[ChcExpr], &[ChcExpr], &[ChcExpr]) =
+        match &transfer {
+            Some(super::unit_transfer::Transfer::Units(units)) => {
+                let itp = super::unit_transfer::conjoin(units);
+                if itp.vars().iter().all(|v| shared_vars.contains(&v.name)) {
+                    PROOF_ITP_SERVED.fetch_add(1, Ordering::Relaxed);
+                    trace_event("served_units");
+                    if stats_on {
+                        safe_eprintln!(
+                            "[PROOF-ITP] lra unit transfer: B refuted by {} units",
+                            units.len()
+                        );
+                    }
+                    return Some(Some(itp));
+                }
+                (a_constraints, b_constraints, no_units)
+            }
+            Some(super::unit_transfer::Transfer::Split { a, b, units }) => {
+                if stats_on {
+                    safe_eprintln!(
+                        "[PROOF-ITP] lra unit transfer: a {}->{} b {}->{} units {}",
+                        a_constraints.len(),
+                        a.len(),
+                        b_constraints.len(),
+                        b.len(),
+                        units.len()
+                    );
+                }
+                // IMC: the moved facts may refute B' without a proof (a
+                // Search-lane check, equalities solved first); then they
+                // interpolate. B' is B ∧ U with B's locals eliminated, so B'
+                // UNSAT means U ∧ B is UNSAT, and A ⊨ U. (The generalising
+                // engines keep the proof's more general interpolant.)
+                let refuted = if imc {
+                    units_refute(b, units, shared_vars, deadline)
+                } else {
+                    None
+                };
+                if let Some(itp) = refuted {
+                    PROOF_ITP_SERVED.fetch_add(1, Ordering::Relaxed);
+                    trace_event("served_units_checked");
+                    if stats_on {
+                        safe_eprintln!(
+                            "[PROOF-ITP] lra unit transfer: B' refuted under {} moved facts",
+                            units.len()
+                        );
+                    }
+                    return Some(Some(itp));
+                }
+                (a.as_slice(), b.as_slice(), units.as_slice())
+            }
+            None => (a_constraints, b_constraints, no_units),
+        };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let groups: [&[ChcExpr]; 2] = [a_constraints, b_constraints];
+    let mut refutation = match proof_check_groups(&groups, remaining, DEFAULT_DAG_CAPS) {
+        ProofCheck::Unsat(refutation) => refutation,
+        ProofCheck::Sat => {
+            PROOF_ITP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            trace_event("lra_sat_pair");
+            return Some(None);
+        }
+        ProofCheck::Unknown(unknown) => {
+            match unknown {
+                ItpUnknown::Budget => {
+                    PROOF_ITP_SOLVE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    PROOF_ITP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    trace_event("lra_fallback");
+                }
+                ItpUnknown::Panic => {
+                    PROOF_ITP_PANICS.fetch_add(1, Ordering::Relaxed);
+                    trace_event("panic");
+                }
+                ItpUnknown::SolverUnknown => {
+                    PROOF_ITP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    trace_event("lra_fallback");
+                }
+                ItpUnknown::Fragment | ItpUnknown::Size | ItpUnknown::ParseMismatch => {
+                    PROOF_ITP_NOT_APPLICABLE.fetch_add(1, Ordering::Relaxed);
+                    trace_event("not_applicable_lra");
+                }
+            }
+            if stats_on {
+                safe_eprintln!("[PROOF-ITP] lra proof solve: {}", unknown.name());
+            }
+            return Some(None);
+        }
+    };
+    // Extract every recipe unvalidated (cheap: one proof, three traversals),
+    // then validate small candidates first (the Pudlák root can be a large
+    // DAG; a compact McMillan′ should not wait behind it).
+    let mut candidates: Vec<(ItpRecipe, ChcExpr, usize)> = Vec::new();
+    for recipe in [
+        ItpRecipe::Pudlak,
+        ItpRecipe::McMillan,
+        ItpRecipe::McMillanPrime,
+    ] {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match refutation.interpolant(
+            GroupMask(1),
+            recipe,
+            shared_vars,
+            ValidatePolicy::OracleGuarded,
+        ) {
+            // A constant cannot satisfy both Craig checks on a
+            // non-degenerate split (legacy rule; the cascade handles the
+            // degenerate ones).
+            Ok(ChcExpr::Bool(_)) => {}
+            Ok(candidate) => {
+                let size = proof_script::dag_node_count(&candidate, LRA_SORT_NODE_CAP);
+                let duplicate = candidates
+                    .iter()
+                    .any(|(_, c, n)| *n == size && size < 5_000 && *c == candidate);
+                if !duplicate {
+                    candidates.push((recipe, candidate, size));
+                }
+            }
+            Err(fail) => {
+                if stats_on {
+                    safe_eprintln!(
+                        "[PROOF-ITP] lra extract {}: {} (trust_steps={})",
+                        recipe.name(),
+                        fail.name(),
+                        refutation.trust_steps()
+                    );
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|(_, _, size)| *size);
+    for (recipe, candidate, _) in candidates {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match refutation.craig_valid(GroupMask(1), &candidate, shared_vars) {
+            Ok(()) => {
+                PROOF_ITP_SERVED.fetch_add(1, Ordering::Relaxed);
+                trace_event("served");
+                if units.is_empty() {
+                    return Some(Some(candidate));
+                }
+                // Craig-valid for (A', B'); `candidate ∧ units` is the
+                // interpolant of the caller's (A, B) (`unit_transfer`).
+                let mut parts = Vec::with_capacity(units.len() + 1);
+                parts.push(candidate);
+                parts.extend(units.iter().cloned());
+                return Some(Some(super::unit_transfer::conjoin(&parts)));
+            }
+            Err(fail) => {
+                if fail == ItpFail::CraigInvalid {
+                    stats::record_pre_validation_invalid(
+                        stats::current_engine(),
+                        Source::ProofGroups,
+                        Some(recipe),
+                    );
+                }
+                if stats_on {
+                    safe_eprintln!(
+                        "[PROOF-ITP] lra candidate {} failed validation: {}",
+                        recipe.name(),
+                        fail.name()
+                    );
+                }
+            }
+        }
+    }
+    PROOF_ITP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    trace_event("fallback");
+    Some(None)
+}
+
+/// Cap on the Search-lane check of [`units_refute`].
+const UNITS_REFUTE_CAP: Duration = Duration::from_secs(2);
+
+/// `and(units)` when the simplified `B'` (which contains the moved `units`)
+/// is refuted by a Search-lane check within half the remaining budget.
+fn units_refute(
+    b_simplified: &[ChcExpr],
+    units: &[ChcExpr],
+    shared_vars: &FxHashSet<String>,
+    deadline: Instant,
+) -> Option<ChcExpr> {
+    if units.is_empty() {
+        return None;
+    }
+    let itp = super::unit_transfer::conjoin(units);
+    if !itp.vars().iter().all(|v| shared_vars.contains(&v.name)) {
+        return None;
+    }
+    let budget = (deadline.saturating_duration_since(Instant::now()) / 2).min(UNITS_REFUTE_CAP);
+    if budget.is_zero() {
+        return None;
+    }
+    let b_expr = super::unit_transfer::conjoin(b_simplified);
+    crate::engine_utils::search_check_sat_with_timeout(&b_expr, budget)
+        .is_unsat()
+        .then_some(itp)
+}
+
+// ---------------------------------------------------------------------------
 // Proof solve + extraction
 // ---------------------------------------------------------------------------
 
@@ -368,7 +624,8 @@ fn proof_solve_and_extract(
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
         return Vec::new();
     };
-    if remaining.is_zero() {
+    // A cancelled portfolio lane has no time left (`ScopedLaneCancellation`).
+    if remaining.is_zero() || crate::smt::deadline::lane_cancelled() {
         return Vec::new();
     }
 
@@ -515,6 +772,13 @@ fn proof_solve_and_extract(
             candidates.push(candidate);
         }
     }
+    // Inc-20 (inc-19 followup): validate SMALL candidates first across
+    // strengths — each candidate costs the caller two Craig validation
+    // solves, and a compact McMillan' (KBs) should not wait behind a
+    // megabyte Pudlak root that wedges or times out the checks. The sort is
+    // stable, so equal-size candidates keep the balanced-first order.
+    const NODE_COUNT_SORT_CAP: usize = 100_000;
+    candidates.sort_by_key(|c| c.node_count(NODE_COUNT_SORT_CAP));
     candidates
 }
 
@@ -538,6 +802,7 @@ fn collect_supported_vars(
         }
         *budget -= 1;
         match expr {
+            ChcExpr::ArrayLambda(_) => false,
             ChcExpr::Bool(_) | ChcExpr::Int(_) => true,
             ChcExpr::Real(..)
             | ChcExpr::BitVec(..)

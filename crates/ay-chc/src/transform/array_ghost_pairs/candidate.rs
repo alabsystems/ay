@@ -32,8 +32,16 @@ use super::candidate_query::bounded_query_slice;
 #[cfg(test)]
 use super::candidate_usage::exact_scalar_walk;
 pub(super) use super::candidate_usage::scalar_candidate_node_count;
-use super::candidate_usage::{query_argument_positions, required_original_positions};
+use super::candidate_usage::{
+    local_index_reads, query_argument_positions, required_original_positions, LocalIndexRead,
+};
 use super::{GhostPairSpec, GhostPredSpec};
+
+#[path = "candidate_read_over_write.rs"]
+pub(super) mod read_over_write;
+
+#[path = "candidate_anchors.rs"]
+pub(super) mod anchors;
 
 /// One meter shared by every query/target rewrite in a generation attempt.
 const MAX_TOTAL_REWRITE_NODES: usize = crate::expr::MAX_PREPROCESSING_NODES;
@@ -62,7 +70,8 @@ pub(super) struct QueryCandidateBatch {
 ///
 /// Each accepted query has exactly one body predicate, distinct variable
 /// arguments with the declared sorts, and only supported array accesses that
-/// fit the configured ghost slots. Unsupported queries are skipped as candidate
+/// fit the configured ghost slots, either together or in every positive OR
+/// branch. Unsupported queries are skipped as candidate
 /// sources; Houdini still checks every raw query before any model can be sealed.
 pub(crate) fn query_anchored_ghost_candidates(
     problem: &ChcProblem,
@@ -116,6 +125,8 @@ fn query_anchored_ghost_candidates_impl(
     let mut candidates = Vec::new();
     let mut seen: FxHashSet<(PredicateId, ChcExpr)> = FxHashSet::default();
     let mut rewrite_nodes_remaining = total_rewrite_nodes;
+    let mut census_remaining = MAX_TOTAL_REWRITE_NODES;
+    let mut normalization_remaining = MAX_TOTAL_REWRITE_NODES;
     for query in query_slice.anchors {
         if control.is_some_and(CandidateControl::stopped) {
             return None;
@@ -138,58 +149,44 @@ fn query_anchored_ghost_candidates_impl(
             continue;
         };
 
-        let identity = CandidateTransport {
-            predicate: *source_predicate,
-            source_to_target: (0..source_decl.arg_sorts.len()).map(Some).collect(),
-        };
-        let Some(source_candidate) = rewrite_query_for_target(
-            problem,
-            spec,
-            constraint,
-            *source_predicate,
-            &source_arg_positions,
-            source_layout,
-            source_decl.id,
-            &source_decl.arg_sorts,
-            source_layout,
-            &identity.source_to_target,
-            &mut rewrite_nodes_remaining,
-            control,
-        ) else {
-            if rewrite_nodes_remaining == 0 || control.is_some_and(CandidateControl::stopped) {
+        // Normalize only the candidate source, never the raw query used by
+        // Houdini or the original clauses authenticated by the certificate.
+        // This once-per-query meter does not renew the per-target allowance.
+        let mut normalization_stopped = false;
+        let Some(normalized) =
+            read_over_write::normalize(constraint, &mut normalization_remaining, &mut || {
+                normalization_stopped |= control.is_some_and(CandidateControl::stopped);
+                normalization_stopped
+            })
+        else {
+            // Preserve an observed stop even if a live memory signal clears
+            // between the callback and this admission boundary.
+            if normalization_stopped
+                || normalization_remaining == 0
+                || control.is_some_and(CandidateControl::stopped)
+            {
                 return None;
             }
             continue;
         };
-        let required = required_original_positions(
-            &source_candidate.vars,
-            &source_candidate.formula,
-            source_layout,
-            spec.n,
-        )?;
+        let constraint = normalized.as_ref();
 
-        let transports = propagated_transports(
-            problem,
-            spec,
-            *source_predicate,
-            source_layout,
-            &required,
-            control,
-        )?;
-        let query_candidates = rewrite_transports_for_query(
-            QueryTransportSource {
+        let Some(query_candidates) = anchors::candidates_for_constraint(
+            anchors::Source {
                 problem,
                 spec,
-                constraint,
                 predicate: *source_predicate,
                 arg_positions: &source_arg_positions,
                 layout: source_layout,
                 control,
             },
-            source_candidate,
-            transports,
+            constraint,
+            &mut census_remaining,
             &mut rewrite_nodes_remaining,
-        )?;
+        )?
+        else {
+            continue;
+        };
         append_unique_candidates(&mut candidates, &mut seen, query_candidates)?;
     }
     (!candidates.is_empty() || !query_slice.sink_predicates.is_empty()).then_some(
@@ -224,6 +221,7 @@ struct QueryTransportSource<'a> {
     predicate: PredicateId,
     arg_positions: &'a FxHashMap<ChcVar, usize>,
     layout: &'a GhostPredSpec,
+    local_reads: &'a [LocalIndexRead],
     control: Option<CandidateControl<'a>>,
 }
 
@@ -253,6 +251,7 @@ fn rewrite_transports_for_query(
             &target_decl.arg_sorts,
             target_layout,
             &transport.source_to_target,
+            source.local_reads,
             rewrite_nodes_remaining,
             source.control,
         ) else {
@@ -279,6 +278,7 @@ fn rewrite_query_for_target(
     target_sorts: &[ChcSort],
     target_layout: &GhostPredSpec,
     source_to_target: &[Option<usize>],
+    local_reads: &[LocalIndexRead],
     rewrite_nodes_remaining: &mut usize,
     control: Option<CandidateControl<'_>>,
 ) -> Option<QueryAnchoredGhostCandidate> {
@@ -304,10 +304,12 @@ fn rewrite_query_for_target(
         target_vars: &vars,
         pairs_per_array: spec.n,
         accesses: FxHashMap::default(),
+        local_indices: FxHashMap::default(),
         guards: Vec::new(),
         remaining: rewrite_nodes_remaining,
         control,
     };
+    rewrite.bind_local_indices(local_reads)?;
     let safe = rewrite.rewrite(&ChcExpr::not(constraint.clone()), 0, false)?;
     if rewrite.accesses.is_empty() {
         return None;
@@ -332,6 +334,9 @@ struct CandidateRewrite<'a> {
     pairs_per_array: usize,
     /// Distinct access term -> local slot within one array's ghost pairs.
     accesses: FxHashMap<(usize, ChcExpr), usize>,
+    /// Query-local direct BV indices are bound to a fresh ghost index, never
+    /// invented scalar parameters. All guards share this exact substitution.
+    local_indices: FxHashMap<ChcVar, ChcVar>,
     guards: Vec<ChcExpr>,
     /// Shared across every target and query in one generation attempt.
     remaining: &'a mut usize,
@@ -339,6 +344,52 @@ struct CandidateRewrite<'a> {
 }
 
 impl CandidateRewrite<'_> {
+    fn bind_local_indices(&mut self, reads: &[LocalIndexRead]) -> Option<()> {
+        for read in reads {
+            if *self.remaining == 0 || self.control.is_some_and(CandidateControl::stopped) {
+                return None;
+            }
+            *self.remaining -= 1;
+            let target_position = self
+                .source_to_target
+                .get(read.array_position)
+                .copied()
+                .flatten()?;
+            let target_array = self
+                .target_layout
+                .array_positions
+                .iter()
+                .position(|p| *p == target_position)?;
+            let slot = target_array
+                .checked_mul(self.pairs_per_array)?
+                .checked_add(read.slot)?;
+            let position = self
+                .target_layout
+                .original_arity
+                .checked_add(slot.checked_mul(2)?)?;
+            let ghost = self.target_vars.get(position)?;
+            if ghost.sort != read.index.sort {
+                return None;
+            }
+            if !self.local_indices.contains_key(&read.index)
+                && self.local_indices.values().any(|prior| prior == ghost)
+            {
+                // A transport may alias original array columns. It must not
+                // also identify two independent quantified query indices.
+                return None;
+            }
+            let index = self
+                .local_indices
+                .entry(read.index.clone())
+                .or_insert_with(|| ghost.clone());
+            self.accesses.insert(
+                (read.array_position, ChcExpr::var(index.clone())),
+                read.slot,
+            );
+        }
+        Some(())
+    }
+
     fn rewrite(&mut self, expr: &ChcExpr, depth: usize, inside_index: bool) -> Option<ChcExpr> {
         if depth >= crate::expr::MAX_EXPR_RECURSION_DEPTH
             || *self.remaining == 0
@@ -349,7 +400,11 @@ impl CandidateRewrite<'_> {
         *self.remaining -= 1;
         crate::expr::maybe_grow_expr_stack(|| {
             Some(match expr {
+                ChcExpr::ArrayLambda(_) => return None,
                 ChcExpr::Var(var) => {
+                    if let Some(index) = self.local_indices.get(var) {
+                        return Some(ChcExpr::var(index.clone()));
+                    }
                     let source_position = *self.source_arg_positions.get(var)?;
                     let target_position = self
                         .source_to_target
@@ -477,3 +532,7 @@ fn scalar_candidate_is_well_formed(
 #[cfg(test)]
 #[path = "candidate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "candidate_local_index_tests.rs"]
+mod local_index_tests;

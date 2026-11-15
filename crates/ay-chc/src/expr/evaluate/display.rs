@@ -209,6 +209,10 @@ impl fmt::Display for ChcExpr {
                 }
                 write!(f, ")")
             }
+            Self::ArrayLambda(lambda) => {
+                let values: Vec<_> = lambda.captures().iter().map(ToString::to_string).collect();
+                write!(f, "{}", lambda.render(&values, &lambda.body().to_string()))
+            }
             Self::ConstArrayMarker(_) => write!(f, "(as const)"),
             Self::IsTesterMarker(name) => write!(f, "(_ is {name})"),
             Self::ConstArray(key_sort, val) => {

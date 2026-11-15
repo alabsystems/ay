@@ -1,0 +1,11 @@
+; z3 5.1.0: sat
+(set-logic QF_UFLIA)
+(declare-sort U 0)
+(declare-const x U)
+(declare-const c0 U)
+(declare-const c1 U)
+(declare-const c2 U)
+(assert (distinct c0 c1 c2))
+(assert (or (= x c0) (= x c1) (= x c2)))
+(minimize (ite (= x c0) 1 0))
+(check-sat)

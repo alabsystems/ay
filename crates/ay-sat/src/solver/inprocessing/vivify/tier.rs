@@ -7,6 +7,8 @@
 use super::super::super::mutate::{DeleteResult, ReasonPolicy, ReplaceResult};
 use super::super::super::*;
 use super::super::VivifyTierRun;
+#[cfg(feature = "jit")]
+use crate::kani_compat::DetHashMap;
 use crate::kani_compat::DetHashSet as HashSet;
 
 #[cfg(feature = "jit")]
@@ -15,6 +17,18 @@ const SIMD_VIVIFY_SUBSUME_THRESHOLD: usize = 64;
 const SIMD_VIVIFY_SUBSUME_MAX_LEN: usize = 32;
 #[cfg(feature = "jit")]
 const SIMD_VIVIFY_SUBSUME_MAX_PAIRS: usize = 200_000;
+/// Only the first `SIMD_VIVIFY_SUBSUME_MAX_PAIRS + 1` length-sorted
+/// candidates can appear in a generated pair: candidate 0 pairs with every
+/// later candidate (they are sorted by ascending length), so the pair budget
+/// is exhausted by `(0, 1) ..= (0, SIMD_VIVIFY_SUBSUME_MAX_PAIRS)` before any
+/// later candidate is reached. Dropping the rest changes no result and bounds
+/// every allocation below.
+#[cfg(feature = "jit")]
+const SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES: usize = SIMD_VIVIFY_SUBSUME_MAX_PAIRS + 1;
+/// Upper bound on the literal total of the retained candidates.
+#[cfg(feature = "jit")]
+const SIMD_VIVIFY_SUBSUME_MAX_TOTAL_LITS: usize =
+    SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES * SIMD_VIVIFY_SUBSUME_MAX_LEN;
 
 fn retain_best_candidates(candidates: &mut Vec<(usize, i64)>, limit: usize) {
     if limit < candidates.len() {
@@ -31,15 +45,19 @@ fn simd_vivify_subsumed_candidates(sorted_lits: &[Vec<Literal>], eligible: &[boo
         eligible,
         SIMD_VIVIFY_SUBSUME_THRESHOLD,
     )
+    .0
 }
 
+/// Marks candidates subsumed by an earlier (length-sorted) candidate.
+/// The second return value is the number of pairs actually checked,
+/// mirroring `SimdSubsumeResult::pairs_checked` in the subsume prepass.
 #[cfg(feature = "jit")]
 fn simd_vivify_subsumed_candidates_with_threshold(
     sorted_lits: &[Vec<Literal>],
     eligible: &[bool],
     min_candidates: usize,
-) -> Vec<bool> {
-    let mut candidate_data: Vec<(usize, usize)> = Vec::new();
+) -> (Vec<bool>, usize) {
+    let mut candidate_data: Vec<(usize, &[Literal])> = Vec::new();
     for (ci, lits) in sorted_lits.iter().enumerate() {
         if !eligible.get(ci).copied().unwrap_or(false) {
             continue;
@@ -47,48 +65,108 @@ fn simd_vivify_subsumed_candidates_with_threshold(
         if lits.len() < 2 || lits.len() > SIMD_VIVIFY_SUBSUME_MAX_LEN {
             continue;
         }
-        candidate_data.push((ci, lits.len()));
+        candidate_data.push((ci, lits.as_slice()));
     }
 
     let mut subsumed = vec![false; sorted_lits.len()];
     if candidate_data.len() < min_candidates {
-        return subsumed;
+        return (subsumed, 0);
     }
 
-    candidate_data.sort_unstable_by_key(|&(ci, len)| (len, ci));
+    candidate_data.sort_unstable_by_key(|&(ci, lits)| (lits.len(), ci));
+    // Candidates past the pair budget never reach a pair (see
+    // `SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES`); drop them before scanning.
+    if candidate_data.len() > SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES {
+        candidate_data.truncate(SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES);
+    }
 
-    let total_lits: usize = candidate_data.iter().map(|&(_, len)| len).sum();
+    let num_candidates = candidate_data.len();
+    let total_lits: usize = candidate_data
+        .iter()
+        .fold(0usize, |acc, &(_, lits)| acc.saturating_add(lits.len()));
+    // Both bounds hold after the truncation above; stating them here keeps
+    // every allocation size below provably bounded.
+    if num_candidates > SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES
+        || total_lits > SIMD_VIVIFY_SUBSUME_MAX_TOTAL_LITS
+    {
+        return (subsumed, 0);
+    }
     let mut scanner =
-        ay_jit::simd_inprocess::SimdClauseScanner::with_capacity(candidate_data.len(), total_lits);
-    let mut candidate_indices = Vec::with_capacity(candidate_data.len());
+        ay_jit::simd_inprocess::SimdClauseScanner::with_capacity(num_candidates, total_lits);
+    let mut candidate_indices = Vec::with_capacity(num_candidates);
 
-    for &(ci, _) in &candidate_data {
-        let raw_lits: Vec<i32> = sorted_lits[ci].iter().map(|lit| lit.raw() as i32).collect();
+    // Pack candidates into the scanner, building a literal-occurrence
+    // index (literal -> packed candidate positions containing it).
+    let mut occ: DetHashMap<i32, Vec<u32>> = DetHashMap::default();
+    for (a, &(ci, lits)) in candidate_data.iter().enumerate() {
+        let raw_lits: Vec<i32> = lits.iter().map(|lit| lit.raw() as i32).collect();
         scanner.push(&raw_lits);
         candidate_indices.push(ci);
+        for &raw in &raw_lits {
+            let list = occ.entry(raw).or_default();
+            // Candidate literal lists are sets; guard anyway so a repeat
+            // cannot emit duplicate candidate pairs below.
+            if list.last() != Some(&(a as u32)) {
+                list.push(a as u32);
+            }
+        }
     }
 
-    let mut pairs = Vec::new();
-    'pair_gen: for a in 0..candidate_data.len() {
-        let a_len = candidate_data[a].1;
-        for (b, &(_, b_len)) in candidate_data.iter().enumerate().skip(a + 1) {
-            if a_len > b_len {
+    // Generate candidate pairs through the occurrence index, keeping the
+    // legacy triangular enumeration's marks exactly: A can subsume B
+    // only if B contains every literal of A, in particular A's rarest
+    // literal (CaDiCaL subsume.cpp candidate generation), so pairs
+    // outside the rarest literal's occurrence list cannot subsume and
+    // checking them is pure waste. Each surviving candidate is ranked
+    // by its position in the legacy enumeration over the length-sorted
+    // candidates — rank(a, b) = a*(2n − a − 1)/2 + (b − a − 1) for
+    // a < b — admitted only under the same SIMD_VIVIFY_SUBSUME_MAX_PAIRS
+    // cap, and checked in rank order. (Admitting filtered pairs past
+    // the legacy cap instead changes which clauses get marked and was
+    // measured, in the subsume prepass, to lose decided files through
+    // perturbed search trajectories; DR-AY-SAT-SIMD-SUBSUME-OCC-RANK-20261114.)
+    let n = num_candidates as u64;
+    let mut ranked: Vec<(u64, usize, usize)> = Vec::new();
+    for (a, &(_, a_lits)) in candidate_data.iter().enumerate() {
+        let Some(rarest) = a_lits
+            .iter()
+            .map(|lit| lit.raw() as i32)
+            .min_by_key(|raw| occ.get(raw).map_or(usize::MAX, Vec::len))
+        else {
+            continue;
+        };
+        let Some(candidates) = occ.get(&rarest) else {
+            continue;
+        };
+        for &b in candidates {
+            let b = b as usize;
+            if b <= a {
                 continue;
             }
-            pairs.push((a, b));
-            if pairs.len() >= SIMD_VIVIFY_SUBSUME_MAX_PAIRS {
-                break 'pair_gen;
+            let (a64, b64) = (a as u64, b as u64);
+            let rank = a64 * (2 * n - a64 - 1) / 2 + (b64 - a64 - 1);
+            if rank < SIMD_VIVIFY_SUBSUME_MAX_PAIRS as u64 {
+                ranked.push((rank, a, b));
             }
         }
     }
+    ranked.sort_unstable();
+    let pairs: Vec<(usize, usize)> = ranked.into_iter().map(|(_, a, b)| (a, b)).collect();
 
+    let pairs_checked = pairs.len();
     for (_, b, is_subsumed) in scanner.batch_subsumption_check(&pairs) {
-        if is_subsumed {
-            subsumed[candidate_indices[b]] = true;
+        if !is_subsumed {
+            continue;
+        }
+        if let Some(slot) = candidate_indices
+            .get(b)
+            .and_then(|&ci| subsumed.get_mut(ci))
+        {
+            *slot = true;
         }
     }
 
-    subsumed
+    (subsumed, pairs_checked)
 }
 
 impl Solver {
@@ -109,6 +187,127 @@ impl Solver {
         stats.irred_strengthened = stats.irred_strengthened.saturating_add(strengthened);
         stats.irred_literals_removed = stats.irred_literals_removed.saturating_add(literals);
         stats.irred_deleted = stats.irred_deleted.saturating_add(deleted);
+    }
+
+    /// Order a candidate's literals for vivification: most occurrences first;
+    /// under `--sat-vivify-order-kissat` equal counts go to the larger literal
+    /// (Kissat vivify.c:24-35), so the order is total, on the first visit and
+    /// on every retry alike.
+    fn sort_vivify_literals(&self, lits: &mut [Literal], noccs: &[i64]) {
+        let kissat_ties = self.cold.vivify_order_kissat;
+        lits.sort_unstable_by(|a, b| {
+            let sa = noccs.get(a.index()).copied().unwrap_or(0);
+            let sb = noccs.get(b.index()).copied().unwrap_or(0);
+            let by_count = sb.cmp(&sa); // descending by nocc
+            if kissat_ties {
+                by_count.then(b.0.cmp(&a.0))
+            } else {
+                by_count
+            }
+        });
+    }
+
+    /// `--sat-vivify-asym-kissat`: whether a probe that ended in a conflict
+    /// needing every literal of the candidate deletes it. Under the negation
+    /// of the candidate, propagation without it reached a conflict, so when
+    /// the candidate is irredundant and no learned clause (binary or larger)
+    /// is in the conflict's cone, the other irredundant clauses imply it: an
+    /// asymmetric tautology (Kissat vivify.c:1181-1186). Each deletion is
+    /// tested against the clauses still live, so deleting several stays
+    /// equivalence-preserving.
+    #[inline]
+    fn vivify_asym_deletes(&self, tier: VivifyTier, uses_redundant: bool) -> bool {
+        self.cold.vivify_asym_kissat && tier == VivifyTier::Irredundant && !uses_redundant
+    }
+
+    /// `--sat-veripb-hints`: the reason clauses that make `implied` true, or
+    /// every literal of `conflict` false, on the current trail, in trail
+    /// order with `conflict` last; empty when annotated RUP is off. The walk
+    /// stops at decisions (vivification decides only negated candidate
+    /// literals, and the strengthened clause keeps each one its derivation
+    /// rests on: the RUP check assumes it false) and at root literals (the
+    /// funnel states a unit for each root-false literal a used antecedent
+    /// has). Named with `veripb_note_antecedent_ref` right before the
+    /// replacement, they are written only if `veripb_derived_refutation`
+    /// refutes the replacement's negation over them by unit propagation, so
+    /// a wrong or partial cone costs a `red` step, never validity.
+    fn vivify_veripb_cone(
+        &mut self,
+        conflict: Option<ClauseRef>,
+        implied: Option<Literal>,
+    ) -> Vec<ClauseRef> {
+        let mut cone = Vec::new();
+        if !self.veripb_hints_active() {
+            return cone;
+        }
+        let num_vars = self.num_vars;
+        if let Some(t) = implied {
+            let v = t.variable().index();
+            if v < num_vars && self.var_data[v].level == 0 {
+                // Root-true: its root reason, whose other literals are all
+                // root-false, is falsified by the RUP assumption alone.
+                cone.extend(self.var_reason(v));
+                return cone;
+            }
+        }
+        if self.vivify_analyzed.len() < num_vars {
+            self.vivify_analyzed.resize(num_vars, false);
+        }
+        debug_assert!(
+            self.vivify_analyzed_to_clear.is_empty(),
+            "BUG: vivify_analyzed_to_clear not empty at VeriPB cone start"
+        );
+        let mut seeds: Vec<Literal> = match conflict {
+            Some(c) => self.arena.literals(c.0 as usize).to_vec(),
+            None => Vec::new(),
+        };
+        seeds.extend(implied);
+        // Marked variables not yet reached (as in `vivify_analyze_conflict`);
+        // marks stay set until the end, so no variable is walked twice.
+        let mut pending = 0usize;
+        for lit in seeds {
+            let v = lit.variable().index();
+            if v < num_vars && self.var_data[v].level > 0 && !self.vivify_analyzed[v] {
+                self.vivify_analyzed[v] = true;
+                self.vivify_analyzed_to_clear.push(v);
+                pending += 1;
+            }
+        }
+        let first_decision = self.trail_lim.first().copied().unwrap_or(self.trail.len());
+        for i in (first_decision..self.trail.len()).rev() {
+            if pending == 0 {
+                break;
+            }
+            let v = self.trail[i].variable().index();
+            if v >= num_vars || !self.vivify_analyzed[v] {
+                continue;
+            }
+            pending -= 1;
+            // A decision (or a reason with no clause) ends the walk.
+            let Some(reason) = self.var_reason(v) else {
+                continue;
+            };
+            cone.push(reason);
+            let idx = reason.0 as usize;
+            for j in 0..self.arena.len_of(idx) {
+                let u = self.arena.literal(idx, j).variable().index();
+                if u < num_vars && u != v && self.var_data[u].level > 0 && !self.vivify_analyzed[u]
+                {
+                    self.vivify_analyzed[u] = true;
+                    self.vivify_analyzed_to_clear.push(u);
+                    pending += 1;
+                }
+            }
+        }
+        for i in 0..self.vivify_analyzed_to_clear.len() {
+            let v = self.vivify_analyzed_to_clear[i];
+            self.vivify_analyzed[v] = false;
+        }
+        self.vivify_analyzed_to_clear.clear();
+        // Forward trail order: the funnel's check then needs one pass.
+        cone.reverse();
+        cone.extend(conflict);
+        cone
     }
 
     pub(super) fn vivify_tier(
@@ -163,7 +362,7 @@ impl Solver {
                 continue;
             }
 
-            let clause_tier = self.clause_tier(idx);
+            let clause_tier = self.vivify_clause_tier(idx);
             let in_tier = match tier {
                 VivifyTier::LearnedCore => {
                     self.arena.is_learned(idx) && clause_tier == ClauseTier::Core
@@ -199,6 +398,27 @@ impl Solver {
         // copies and visit-order state. A full sort used to make a small
         // vivification budget cost O(N log N) time and O(N) extra storage on
         // the entire learned database.
+        // Generations (Kissat's `vivify` clause flag): take the clauses this
+        // generation has not tried; when none is left, re-flag the tier and
+        // take it whole. Without this the best-scored candidates — the same
+        // ones every call, on schooltt-5-3 the same 7K irredundant clauses
+        // 29 times for 4 strengthenings — were re-tried on every call.
+        let generations = self.vivify_generations_enabled();
+        if generations && !candidates.is_empty() {
+            let pending: Vec<(usize, i64)> = candidates
+                .iter()
+                .copied()
+                .filter(|&(idx, _)| !self.arena.is_vivify_tried(idx))
+                .collect();
+            if pending.is_empty() {
+                for &(idx, _) in &candidates {
+                    self.arena.set_vivify_tried(idx, false);
+                }
+                self.inproc.vivifier.stats.generations += 1;
+            } else {
+                candidates = pending;
+            }
+        }
         let candidate_limit = usize::try_from(tick_budget)
             .unwrap_or(usize::MAX)
             .min(candidates.len());
@@ -240,18 +460,14 @@ impl Solver {
                 sorted.push(lit);
             }
             if !sat {
-                sorted.sort_unstable_by(|a, b| {
-                    let sa = noccs.get(a.index()).copied().unwrap_or(0);
-                    let sb = noccs.get(b.index()).copied().unwrap_or(0);
-                    sb.cmp(&sa) // descending by nocc
-                });
+                self.sort_vivify_literals(&mut sorted, noccs);
             }
             // CaDiCaL vivify.cpp:907: no duplicate variables in sorted list.
             debug_assert!(
                 has_removed_literal || {
                     let mut vars: Vec<u32> = sorted.iter().map(|l| l.variable().0).collect();
                     vars.sort_unstable();
-                    vars.windows(2).all(|w| w[0] != w[1])
+                    vars.windows(2).all(|w| w.first() != w.get(1))
                 },
                 "BUG: vivify sorted literals contain duplicate variables for clause {clause_idx}",
             );
@@ -358,7 +574,7 @@ impl Solver {
                         None
                     };
                     if matches!(
-                        self.delete_clause_checked(clause_idx, ReasonPolicy::Skip),
+                        self.delete_clause_checked_skip_direct(clause_idx),
                         DeleteResult::Deleted
                     ) && is_irredundant
                     {
@@ -427,6 +643,11 @@ impl Solver {
 
             let clause_idx = candidates[ci].0;
             let clause_ref = ClauseRef(clause_idx as u32);
+            if generations {
+                // Tried in this generation (after the budget check above, so
+                // a cut pass leaves the rest pending for the next call).
+                self.arena.set_vivify_tried(clause_idx, true);
+            }
 
             // Re-check validity (clause may have been deleted by a prior iteration)
             let clause_len = self.arena.len_of(clause_idx);
@@ -466,9 +687,7 @@ impl Solver {
                 } else {
                     None
                 };
-                if self.delete_clause_checked(clause_idx, ReasonPolicy::Skip)
-                    == DeleteResult::Deleted
-                {
+                if self.delete_clause_checked_skip_direct(clause_idx) == DeleteResult::Deleted {
                     run.strengthened += 1;
                     if is_irredundant {
                         self.note_irredundant_clause_removed_for_bve(
@@ -606,7 +825,7 @@ impl Solver {
                 }
                 // lit is true — check if this clause is its reason
                 let var_idx = lit.variable().index();
-                if self.var_data[var_idx].reason == clause_ref.0 {
+                if self.var_data[var_idx].has_clause_reason(clause_ref) {
                     // Must backtrack below this level
                     let forced_level = self.var_data[var_idx].level;
                     if forced_level > 0 {
@@ -621,6 +840,11 @@ impl Solver {
             let mut is_subsumed = false;
             let mut conflict_found = false;
             let mut probe_lrat_hints: Vec<u64> = Vec::new();
+            // `--sat-veripb-hints`: the strengthened clause's ids, read at its conflict.
+            let mut veripb_ids: Option<Vec<u64>> = None;
+            // `--sat-veripb-hints`, where no ids are read: the reasons the
+            // strengthened clause is RUP by, named before its replacement.
+            let mut veripb_cone: Vec<ClauseRef> = Vec::new();
             let mut captured_removed_reasons: Vec<u64> = Vec::new();
             // LRAT hint infrastructure (#4360): track trail position for
             // complete BCP reason chain capture (CaDiCaL vivify.cpp:1094-1098).
@@ -634,6 +858,9 @@ impl Solver {
             // resolution chain is redundant (learned). Phase 3 (#3310) will
             // use this to gate irredundant clause subsumption decisions.
             let mut _vivify_uses_redundant = false;
+            // `--sat-vivify-asym-kissat`: the candidate is deleted as an
+            // asymmetric tautology found on the conflict path.
+            let mut asym_deleted = false;
 
             let start_level = self.decision_level;
             let _probe_trail_start = self.trail.len();
@@ -672,6 +899,10 @@ impl Solver {
                             }
                             if kept.len() < clause_len {
                                 probe_lrat_hints = lrat_chain;
+                                // `--sat-veripb-hints`: under the negation of
+                                // `kept` the reasons behind `implied_lit`
+                                // imply it, falsifying its own reason.
+                                veripb_cone = self.vivify_veripb_cone(None, Some(implied_lit));
                                 strengthened = Some(kept);
                             } else {
                                 if tier == VivifyTier::Irredundant && uses_redundant {
@@ -741,7 +972,15 @@ impl Solver {
                                     }
                                 }
                                 if kept.len() < clause_len {
+                                    // `--sat-veripb-hints`: under the negation
+                                    // of `kept` the drain's reasons falsify
+                                    // `drain_conflict`.
+                                    veripb_cone =
+                                        self.vivify_veripb_cone(Some(drain_conflict), None);
                                     strengthened = Some(kept);
+                                } else if self.vivify_asym_deletes(tier, uses_redundant) {
+                                    is_subsumed = true;
+                                    asym_deleted = true;
                                 }
                             }
                         }
@@ -816,7 +1055,12 @@ impl Solver {
                                 }
                             }
                             if kept.len() < clause_len {
+                                veripb_ids =
+                                    self.veripb_probe_hints(&kept, Some(conflict_ref), None);
                                 strengthened = Some(kept);
+                            } else if self.vivify_asym_deletes(tier, uses_redundant) {
+                                is_subsumed = true;
+                                asym_deleted = true;
                             }
                         }
                     }
@@ -872,6 +1116,14 @@ impl Solver {
                             // Instantiation succeeded: the last literal is redundant
                             let kept: Vec<Literal> = sorted[..sorted.len() - 1].to_vec();
                             if kept.len() < clause_len {
+                                // `--sat-veripb-hints`: under the negation of
+                                // `kept` the clause itself implies `last_lit`.
+                                veripb_ids = self.veripb_probe_hints_through(
+                                    &kept,
+                                    conflict_ref,
+                                    last_lit,
+                                    clause_ref,
+                                );
                                 strengthened = Some(kept);
                             }
                         }
@@ -1001,6 +1253,13 @@ impl Solver {
                     self.inproc.vivifier.stats.inline_subsumed += 1;
                 } else if used_analysis_subsumption {
                     self.inproc.vivifier.stats.analysis_subsumed += 1;
+                } else if asym_deleted {
+                    self.inproc.vivifier.stats.asym_deleted += 1;
+                }
+                if self.cold.vivify_asym_kissat {
+                    // A deletion is a vivified clause for the round's yield, as
+                    // Kissat counts it (vivify.c:1307, 1454-1457).
+                    run.strengthened += 1;
                 }
                 self.inproc.vivifier.stats.clauses_satisfied += 1;
                 // CaDiCaL vivify.cpp mark_removed: mark dirty before delete (#7393).
@@ -1013,7 +1272,7 @@ impl Solver {
                     None
                 };
                 if matches!(
-                    self.delete_clause_checked(clause_idx, ReasonPolicy::Skip),
+                    self.delete_clause_checked_skip_direct(clause_idx),
                     DeleteResult::Deleted
                 ) && is_irredundant
                 {
@@ -1082,7 +1341,7 @@ impl Solver {
                 {
                     let mut vars: Vec<u32> = final_lits.iter().map(|l| l.variable().0).collect();
                     vars.sort_unstable();
-                    vars.windows(2).all(|w| w[0] != w[1])
+                    vars.windows(2).all(|w| w.first() != w.get(1))
                 },
                 "BUG: vivify final_lits has duplicate variables for clause {clause_idx}",
             );
@@ -1110,6 +1369,19 @@ impl Solver {
                 None
             };
 
+            // The ids prove any superset of the strengthened clause, so the
+            // frozen literals merged back keep them valid.
+            if let Some(ids) = &veripb_ids {
+                self.veripb_ready_hints(&final_lits, ids);
+            } else {
+                // Implied-literal and drain-conflict strengthenings: the funnel
+                // writes these reasons' ids (with the old clause the
+                // replacement names after them, and root units) only once they
+                // refute the negation of `final_lits` by unit propagation.
+                for &reason in &veripb_cone {
+                    self.veripb_note_antecedent_ref(reason);
+                }
+            }
             match self.replace_clause_checked_with_lrat_hints(
                 clause_idx,
                 &final_lits,
@@ -1154,7 +1426,11 @@ impl Solver {
                     self.attribute_irred_vivify_delta(is_irred_tier, irred_snapshot);
                     return run;
                 }
-                ReplaceResult::Skipped => {}
+                ReplaceResult::Skipped => {
+                    // Nothing was added: keep this candidate's ready ids and
+                    // named reasons off the next, unrelated addition.
+                    self.veripb_drop_antecedents();
+                }
             }
 
             // CaDiCaL vivify.cpp:1598-1608: retry successfully vivified
@@ -1192,11 +1468,7 @@ impl Solver {
                     visit_idx += 1;
                     retry_count = 0;
                 } else {
-                    resorted.sort_unstable_by(|a, b| {
-                        let sa = noccs.get(a.index()).copied().unwrap_or(0);
-                        let sb = noccs.get(b.index()).copied().unwrap_or(0);
-                        sb.cmp(&sa)
-                    });
+                    self.sort_vivify_literals(&mut resorted, noccs);
                     sorted_lits[ci] = resorted;
                     level0_satisfied[ci] = false;
                     contains_removed_literal[ci] = false;
@@ -1280,7 +1552,8 @@ mod tests {
         ];
         let eligible = vec![true; sorted_lits.len()];
 
-        let subsumed = simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
+        let (subsumed, _) =
+            simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
 
         assert_eq!(subsumed, vec![false, true, false]);
     }
@@ -1293,7 +1566,8 @@ mod tests {
         ];
         let eligible = vec![true; sorted_lits.len()];
 
-        let subsumed = simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
+        let (subsumed, _) =
+            simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
 
         assert_eq!(subsumed, vec![false, true]);
     }
@@ -1306,8 +1580,117 @@ mod tests {
         ];
         let eligible = vec![true, false];
 
-        let subsumed = simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
+        let (subsumed, _) =
+            simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
 
         assert_eq!(subsumed, vec![false, false]);
+    }
+
+    /// Independent reimplementation of the legacy candidate-pair
+    /// enumeration (length-sorted triangular product, 200k pair cap),
+    /// returning the subsumed marks it produces. The production
+    /// occurrence-indexed generation must match these marks exactly.
+    fn legacy_vivify_subsumed_reference(
+        sorted_lits: &[Vec<Literal>],
+        eligible: &[bool],
+    ) -> Vec<bool> {
+        let mut candidate_data: Vec<(usize, &[Literal])> = Vec::new();
+        for (ci, lits) in sorted_lits.iter().enumerate() {
+            if !eligible.get(ci).copied().unwrap_or(false) {
+                continue;
+            }
+            if lits.len() < 2 || lits.len() > SIMD_VIVIFY_SUBSUME_MAX_LEN {
+                continue;
+            }
+            candidate_data.push((ci, lits.as_slice()));
+        }
+        candidate_data.sort_unstable_by_key(|&(ci, lits)| (lits.len(), ci));
+        if candidate_data.len() > SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES {
+            candidate_data.truncate(SIMD_VIVIFY_SUBSUME_MAX_CANDIDATES);
+        }
+        let mut subsumed = vec![false; sorted_lits.len()];
+        let mut checked = 0usize;
+        'legacy: for (a, &(_, a_lits)) in candidate_data.iter().enumerate() {
+            for (b, &(b_ci, b_lits)) in candidate_data.iter().enumerate().skip(a + 1) {
+                let _ = b;
+                if a_lits.len() > b_lits.len() {
+                    continue;
+                }
+                if a_lits.iter().all(|l| b_lits.contains(l)) {
+                    subsumed[b_ci] = true;
+                }
+                checked += 1;
+                if checked >= SIMD_VIVIFY_SUBSUME_MAX_PAIRS {
+                    break 'legacy;
+                }
+            }
+        }
+        subsumed
+    }
+
+    #[test]
+    fn simd_vivify_subsumption_matches_legacy_enumeration() {
+        let mut sorted_lits: Vec<Vec<Literal>> = vec![
+            vec![lit(0, true), lit(1, true), lit(2, true)],
+            vec![
+                lit(0, true),
+                lit(1, true),
+                lit(2, true),
+                lit(3, true),
+                lit(4, true),
+            ],
+            vec![lit(5, true), lit(6, true)],
+            vec![lit(5, true), lit(6, true), lit(7, true), lit(8, true)],
+            vec![lit(20, true), lit(21, true), lit(22, true)],
+            vec![lit(20, true), lit(21, true), lit(22, true)],
+            vec![lit(0, true), lit(1, true), lit(9, true)],
+        ];
+        // Pad to ~600 candidates over disjoint variables, lengths spread
+        // so the triangular pair count stays under the 200k cap.
+        let mut var = 100u32;
+        for i in 0..593u32 {
+            let len = 2 + (i % 29);
+            let lits: Vec<_> = (0..len).map(|k| lit(var + k, true)).collect();
+            sorted_lits.push(lits);
+            var += len;
+        }
+        let eligible = vec![true; sorted_lits.len()];
+        let (subsumed, _) =
+            simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
+        let expected = legacy_vivify_subsumed_reference(&sorted_lits, &eligible);
+        assert!(
+            expected[1] && expected[3],
+            "reference must find planted pairs"
+        );
+        assert_eq!(subsumed, expected);
+    }
+
+    #[test]
+    fn simd_vivify_subsumption_over_cap_checks_only_plausible_pairs() {
+        let mut sorted_lits: Vec<Vec<Literal>> = vec![
+            vec![lit(0, true), lit(1, true), lit(2, true)],
+            vec![
+                lit(0, true),
+                lit(1, true),
+                lit(2, true),
+                lit(3, true),
+                lit(4, true),
+            ],
+        ];
+        // 700 disjoint binaries: 245k+ triangular pairs, over the cap;
+        // the legacy enumeration spends it inside the binary block.
+        for i in 0..700u32 {
+            let v = 10 + 2 * i;
+            sorted_lits.push(vec![lit(v, true), lit(v + 1, true)]);
+        }
+        let eligible = vec![true; sorted_lits.len()];
+        let (subsumed, pairs_checked) =
+            simd_vivify_subsumed_candidates_with_threshold(&sorted_lits, &eligible, 1);
+        let expected = legacy_vivify_subsumed_reference(&sorted_lits, &eligible);
+        assert_eq!(subsumed, expected);
+        assert!(
+            pairs_checked < 50_000,
+            "occurrence-indexed generation must stay far below the pair cap, got {pairs_checked}"
+        );
     }
 }

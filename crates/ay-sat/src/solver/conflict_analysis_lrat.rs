@@ -11,10 +11,37 @@
 
 mod resolution_chain;
 
+pub(in crate::solver) mod admitted;
+
 use super::*;
 use crate::solver_log::solver_log;
 
+static LEARNED_TRIAGE_TARGET: std::sync::OnceLock<Option<Vec<i64>>> = std::sync::OnceLock::new();
+
+fn learned_triage_target() -> &'static Option<Vec<i64>> {
+    LEARNED_TRIAGE_TARGET.get_or_init(|| {
+        ay_core::misc_cli_flags()
+            .ab_triage_clause
+            .as_deref()
+            .map(|text| {
+                let mut target: Vec<i64> = text
+                    .split(',')
+                    .filter_map(|part| part.trim().parse().ok())
+                    .collect();
+                target.sort_unstable();
+                target
+            })
+    })
+}
+
 impl Solver {
+    fn counted_learned_triage_inactive(&self) -> bool {
+        if ay_core::captured_misc_cli_flags().is_none_or(|flags| flags.ab_triage_clause.is_some()) {
+            return false;
+        }
+        LEARNED_TRIAGE_TARGET.get_or_init(|| None).is_none()
+    }
+
     #[allow(clippy::ptr_arg)]
     pub(super) fn add_learned_clause_inner(
         &mut self,
@@ -22,48 +49,54 @@ impl Solver {
         lbd: u32,
         resolution_chain: &[u64],
     ) -> ClauseRef {
-        self.add_learned_clause_inner_with_proof_hints(lits, lbd, resolution_chain, None)
+        match self.add_learned_clause_inner_with_proof_hints(
+            lits,
+            lbd,
+            resolution_chain,
+            None,
+            &mut admitted::Ordinary,
+        ) {
+            Ok(reference) => reference,
+            Err(never) => match never {},
+        }
     }
 
     #[allow(clippy::ptr_arg)]
-    fn add_learned_clause_inner_with_proof_hints(
+    fn add_learned_clause_inner_with_proof_hints<P: admitted::Policy>(
         &mut self,
         lits: &mut Vec<Literal>,
         lbd: u32,
         resolution_chain: &[u64],
         precomputed_lrat_hints: Option<&[u64]>,
-    ) -> ClauseRef {
+        p: &mut P,
+    ) -> Result<ClauseRef, P::Error> {
+        p.begin(self, lits, resolution_chain)?;
         // CaDiCaL analyze.cpp:521: learned clause must be non-empty
         debug_assert!(
             !lits.is_empty(),
             "BUG: add_learned_clause called with empty clause"
         );
+        // Kissat's `literals_learned`: the learned clause's length after
+        // minimization and shrinking, summed, so the average learned clause
+        // size is comparable across solvers.
+        self.stats.learned_literals = self
+            .stats
+            .learned_literals
+            .saturating_add(lits.len() as u64);
+        if lits.len() >= 3 {
+            self.record_learned_shape(lbd, lits.len());
+        }
         // No duplicate literals in learned clause
+        #[cfg(debug_assertions)]
         debug_assert!(
-            {
-                let mut sorted = lits.iter().map(|l| l.0).collect::<Vec<_>>();
-                sorted.sort_unstable();
-                sorted.windows(2).all(|w| w[0] != w[1])
-            },
+            { p.no_duplicates(lits)? },
             "BUG: learned clause contains duplicate literals"
         );
 
         // Soundness-triage (--sat-ab-triage-clause): dump the resolution chain
         // with arena content + garbage flags when learning the target clause.
         {
-            use std::sync::OnceLock;
-            static TARGET: OnceLock<Option<Vec<i64>>> = OnceLock::new();
-            let target = TARGET.get_or_init(|| {
-                ay_core::misc_cli_flags()
-                    .ab_triage_clause
-                    .as_deref()
-                    .map(|s| {
-                        let mut v: Vec<i64> =
-                            s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-                        v.sort_unstable();
-                        v
-                    })
-            });
+            let target = learned_triage_target();
             if target.is_some() {
                 let mut mine: Vec<i64> = lits
                     .iter()
@@ -158,8 +191,10 @@ impl Solver {
         }
         // Reorder so lits[1] is the highest-level non-UIP literal (#3785).
         // Matches CaDiCaL analyze.cpp:826-841.
+        p.watch_order(self, lits.len())?;
         let watched = self.prepare_watched_literals(lits, WatchOrderPolicy::LearnedBacktrack);
         self.maybe_reorder_learned_tail_at_creation(lits);
+        p.reserve_tail(self, lits, watched)?;
 
         // Log the learned clause to proof if enabled.
         // #8105: With backward LRAT reconstruction as the primary proof path,
@@ -201,6 +236,9 @@ impl Solver {
             } else {
                 Some(0)
             }
+        } else if !self.cold.lrat_enabled && self.veripb_emit_learned_hinted(lits) {
+            // `--sat-veripb-hints`: written as annotated RUP (veripb_hints.rs).
+            Some(0)
         } else {
             // DRAT mode or forward LRAT fallback (non-empty resolution chain).
             let reversed_chain: Vec<u64>;
@@ -208,7 +246,7 @@ impl Solver {
                 if let Some(hints) = precomputed_lrat_hints {
                     hints
                 } else {
-                    reversed_chain = Self::lrat_reverse_hints(resolution_chain);
+                    reversed_chain = p.reverse_hints(resolution_chain)?;
                     &reversed_chain[..]
                 }
             } else {
@@ -239,7 +277,7 @@ impl Solver {
         // The LRAT-mode forward DRUP skip is handled inside add_clause_db_checked
         // (#7108) to avoid conflating the forward check flag with LRAT ID
         // assignment and ProofManager registration.
-        let clause_idx = self.add_clause_db_checked(lits, true, true, resolution_chain);
+        let clause_idx = p.insert(self, lits, resolution_chain)?;
         let clause_ref = ClauseRef(clause_idx as u32);
         self.arena.set_lbd(clause_idx, lbd);
         // CaDiCaL clause.cpp:140: mark_added only for likely_to_be_kept (#7393).
@@ -260,7 +298,7 @@ impl Solver {
         } else {
             clause_id
         };
-        self.trace_learn(trace_clause_id);
+        p.learn_event(self, trace_clause_id)?;
         solver_log!(
             self,
             "learn clause #{} lbd={} size={}",
@@ -286,7 +324,7 @@ impl Solver {
             self.cold.learned_clause_trail.drain(..drain);
         }
 
-        clause_ref
+        Ok(clause_ref)
     }
 
     /// Add a learned clause and return its reference (test-only convenience).
@@ -329,12 +367,16 @@ impl Solver {
             && self.cold.diagnostic_trace.is_none();
         let clause_ref = if can_reuse_chain_for_lrat_hints {
             resolution_chain.reverse();
-            self.add_learned_clause_inner_with_proof_hints(
+            match self.add_learned_clause_inner_with_proof_hints(
                 &mut lits,
                 lbd,
                 &resolution_chain,
                 Some(&resolution_chain),
-            )
+                &mut admitted::Ordinary,
+            ) {
+                Ok(reference) => reference,
+                Err(never) => match never {},
+            }
         } else {
             self.add_learned_clause_inner(&mut lits, lbd, &resolution_chain)
         };
@@ -539,43 +581,20 @@ impl Solver {
             let Some(cand_len) = candidate else {
                 continue;
             };
+            // Each candidate literal matches at most one marked literal, so a
+            // strictly shorter candidate cannot be subsumed (Kissat learn.c
+            // skips it too). Equal lengths stay: duplicates are garbage.
+            if cand_len < new_len {
+                continue;
+            }
 
             // Check if the new clause subsumes this candidate:
             // all literals of new_clause must appear in candidate.
             // Slice iteration: one bounds check for the whole clause instead
-            // of one per literal (CaDiCaL's range-for over `*d`).
-            let subsumed = {
-                let mut needed = new_len as i32;
-                for &lit in self.arena.literals(cand_off) {
-                    if self.lit_marks.get(lit.variable()) == lit.sign_i8() {
-                        needed -= 1;
-                        if needed == 0 {
-                            break;
-                        }
-                    }
-                }
-                needed == 0
-            };
-            #[cfg(debug_assertions)]
-            {
-                // Parity check against the original indexed subsumption scan.
-                let mut needed_ref = new_len as i32;
-                for j in 0..cand_len {
-                    let lit = self.arena.literal(cand_off, j);
-                    if self.lit_marks.get(lit.variable()) == lit.sign_i8() {
-                        needed_ref -= 1;
-                        if needed_ref == 0 {
-                            break;
-                        }
-                    }
-                }
-                debug_assert_eq!(
-                    subsumed,
-                    needed_ref == 0,
-                    "eager_subsume subsumption-decision parity (shave #2)"
-                );
-            }
-
+            // of one per literal (CaDiCaL's range-for over `*d`). The scan stops
+            // once the literals left cannot cover `needed` (Kissat's
+            // `--remain < needed`): the verdict is already false there.
+            let subsumed = self.eager_candidate_subsumed(cand_off, new_len);
             if subsumed {
                 // New clause subsumes candidate — mark as garbage.
                 // Keep data intact so it can still serve as a reason clause.
@@ -592,6 +611,8 @@ impl Solver {
                         self.dirty_watches[w1.index()] = true;
                         self.dirty_watch_list.push(w1.index() as u32);
                     }
+                } else if new_len == 2 {
+                    self.note_eagerly_subsumed_duplicate_binary(cand_off);
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(cand_off);
                 self.arena.mark_garbage_keep_data(cand_off);
@@ -607,4 +628,76 @@ impl Solver {
         let lits = self.arena.literals(new_clause_off);
         self.lit_marks.clear_clause(lits);
     }
+}
+
+impl Solver {
+    /// Same ordinary bounded-window predicate and debug reference scan.
+    pub(in crate::solver) fn eager_candidate_subsumed(
+        &self,
+        cand_off: usize,
+        new_len: usize,
+    ) -> bool {
+        #[cfg(debug_assertions)]
+        let cand_len = self.arena.len_of(cand_off);
+        let subsumed = {
+            let lits = self.arena.literals(cand_off);
+            let mut needed = new_len;
+            for (k, &lit) in lits.iter().enumerate() {
+                if needed > lits.len() - k {
+                    break;
+                }
+                if self.lit_marks.get(lit.variable()) == lit.sign_i8() {
+                    needed -= 1;
+                    if needed == 0 {
+                        break;
+                    }
+                }
+            }
+            needed == 0
+        };
+        #[cfg(debug_assertions)]
+        {
+            // Parity check against the original indexed subsumption scan.
+            let mut needed_ref = new_len as i32;
+            for j in 0..cand_len {
+                let lit = self.arena.literal(cand_off, j);
+                if self.lit_marks.get(lit.variable()) == lit.sign_i8() {
+                    needed_ref -= 1;
+                    if needed_ref == 0 {
+                        break;
+                    }
+                }
+            }
+            debug_assert_eq!(
+                subsumed,
+                needed_ref == 0,
+                "eager_subsume subsumption-decision parity (shave #2)"
+            );
+        }
+
+        subsumed
+    }
+
+    /// A binary eagerly subsumed by a binary is its duplicate. Optional eager
+    /// unlinking removes both watches together, preserving contraposition.
+    fn note_eagerly_subsumed_duplicate_binary(&mut self, cand_off: usize) {
+        self.cold.num_eager_subsumed_duplicate_binaries += 1;
+        if eager_subsume_unlinks_binaries() {
+            let cref = ClauseRef(cand_off as u32);
+            let (lit0, lit1) = (
+                self.arena.literal(cand_off, 0),
+                self.arena.literal(cand_off, 1),
+            );
+            self.remove_watch(lit0, cref);
+            self.remove_watch(lit1, cref);
+        }
+    }
+}
+
+/// `--sat-eager-subsume-unlink-binaries` (default OFF). Read per event, not
+/// cached: a duplicate binary is subsumed rarely, and tests scope the switch.
+fn eager_subsume_unlinks_binaries() -> bool {
+    ay_core::sat_ab_switches()
+        .eager_subsume_unlink_binaries
+        .unwrap_or(false)
 }

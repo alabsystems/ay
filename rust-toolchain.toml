@@ -1,17 +1,12 @@
-# Public toolchain pin, installed over the export's rust-toolchain.toml by
-# publish/transforms.sh (T3). Stock upstream, pinned rather than floating so
-# the snapshot is reproducible: the publication check runs plain `cargo`
-# against exactly this compiler ("Plain Cargo is load-bearing" —
-# publish/config.sh), and the components below are what the public
-# fmt/clippy lanes need. Byte-for-byte the pin this repo carried before the
-# 2026-08 toolchain move.
+# Development uses ALab's sealed Trust toolchain.
+# .cargo/config.toml requires certify policy, level 2, unix_hardened,
+# strict frontend lowering and authenticated dependency MIR for host/target
+# compiler units, with rustdoc verification required as well. No build-script
+# or dependency exemptions are part of the default route.
+# Required configuration is not evidence that the complete build passes.
 #
-# NOTE (private-side, this comment ships and must stay export-clean): keep
-# this header free of the tokens publish/forbidden-extra.txt bans — the T2f
-# residue scan and the central guard both run over the export AFTER T3 copies
-# this file into it. The full rationale for the swap lives in
-# publish/DECISIONS.md (private) and the flip bundle's transforms-patch.md.
+# Public snapshots keep this pin (a public user installs aterm, and atpkg
+# installs Trust); publish/transforms.sh (T3) requires the `channel` line below
+# to stay exactly as written.
 [toolchain]
-channel = "1.97.1"
-profile = "minimal"
-components = ["clippy", "rustfmt"]
+channel = "trust"

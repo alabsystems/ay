@@ -1905,6 +1905,91 @@ fn nested_pop_collapsed_diseq_regression(force_diseq_undo: bool) {
     assert!(matches!(euf.check(), TheoryResult::Sat));
 }
 
+/// Regression for #euf-inc-diseq-undo-absorbed: a disequality asserted in an
+/// OUTER scope but first synchronized in an INNER one, at a moment when its
+/// endpoint classes are already merged, lands on a key another disequality
+/// already owns. `sync_diseq_index` keeps the resident witness and drops this
+/// literal — its only remaining representation is a key it shares only while
+/// the merge holds. Popping the inner scope SPLITS those classes, so this
+/// literal's `(min_rep,max_rep)` becomes a different pair, and the incremental
+/// undo replay must not leave that pair absent from the index: the restored
+/// index has to hold exactly the pairs a from-scratch rebuild over the
+/// surviving assignments derives.
+///
+/// Before the fix the absorbed literal left no record at all, so the pop
+/// restored only the resident witness's pre-merge key and `(rep b, rep c)` was
+/// silently gone. The in-tree `debug_assert_diseq_index_matches_rebuild` oracle
+/// catches it in debug builds; the index assertions below catch it in every
+/// build.
+fn absorbed_diseq_survives_pop_regression(force_diseq_undo: bool) {
+    let mut store = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = store.mk_var("a", u.clone());
+    let b = store.mk_var("b", u.clone());
+    let c = store.mk_var("c", u);
+    let eq_ac = store.mk_eq(a, c);
+    let eq_bc = store.mk_eq(b, c);
+    let eq_ab = store.mk_eq(a, b);
+
+    let mut euf = EufSolver::new(&store);
+    if force_diseq_undo {
+        // Exercise the production fast path on this deliberately small test.
+        euf.diseq_undo_min_func_apps = 0;
+    }
+    // Authoritative depth-0 index holding `(rep a, rep c)` for `a != c`.
+    euf.assert_literal(eq_ac, false);
+    let _ = euf.propagate();
+
+    euf.push();
+    // Asserted HERE, so it survives the inner pop below, but left PENDING:
+    // no propagate runs at this scope, so it is not indexed yet.
+    euf.assert_literal(eq_bc, false);
+
+    euf.push();
+    euf.assert_literal(eq_ab, true);
+    // Positive closure merges a and b BEFORE the pending `b != c` is
+    // synchronized, so the sync lands on the key `a != c` was just rekeyed
+    // onto and is absorbed by that resident witness.
+    let _ = euf.propagate();
+
+    euf.pop();
+    let _ = euf.propagate();
+
+    let (ar, br, cr) = (
+        euf.enode_find_const(a.0),
+        euf.enode_find_const(b.0),
+        euf.enode_find_const(c.0),
+    );
+    assert_ne!(ar, br, "the inner pop must split a and b again");
+    assert_eq!(
+        euf.assigns.get(&eq_bc),
+        Some(&false),
+        "the outer-scope disequality must survive the inner pop"
+    );
+    assert!(
+        euf.diseq_pair_index.contains_key(&(ar.min(cr), ar.max(cr))),
+        "the base disequality must be indexed after the pop: {:?}",
+        euf.diseq_pair_index
+    );
+    assert!(
+        euf.diseq_pair_index.contains_key(&(br.min(cr), br.max(cr))),
+        "the ABSORBED outer-scope disequality must be indexed under its own \
+         post-split pair, not lost with the merge that absorbed it: {:?}",
+        euf.diseq_pair_index
+    );
+    assert!(matches!(euf.check(), TheoryResult::Sat));
+}
+
+#[test]
+fn test_absorbed_diseq_survives_pop_baseline() {
+    absorbed_diseq_survives_pop_regression(false);
+}
+
+#[test]
+fn test_absorbed_diseq_survives_pop_forced_undo() {
+    absorbed_diseq_survives_pop_regression(true);
+}
+
 #[test]
 fn test_nested_pop_collapsed_diseq_baseline() {
     nested_pop_collapsed_diseq_regression(false);

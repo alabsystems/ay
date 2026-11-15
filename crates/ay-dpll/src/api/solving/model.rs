@@ -14,6 +14,10 @@ use crate::api::model_parse;
 use crate::api::types::{ModelValue, SolverError, Term, VerifiedModel};
 use crate::api::Solver;
 
+#[cfg(test)]
+#[path = "model/evaluation_reads.rs"]
+mod evaluation_reads;
+
 impl Solver {
     pub(crate) fn ensure_last_sat_model_accepted_for_consumer(&self) -> Result<(), SolverError> {
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
@@ -173,6 +177,10 @@ impl Solver {
     /// - [`SolverError::ModelGenerationFailed`] — executor returned empty or error model
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_model_str(&self) -> Result<String, SolverError> {
+        self.with_model_evaluation_read(|| self.try_get_model_str_in_read())
+    }
+
+    fn try_get_model_str_in_read(&self) -> Result<String, SolverError> {
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
         if !last_result.is_sat() {
             return Err(SolverError::NotSat);
@@ -228,8 +236,10 @@ impl Solver {
     /// - [`SolverError::ModelGenerationFailed`] — executor returned empty or error model
     #[must_use = "consumer model extraction must fail closed"]
     pub fn try_get_model_for_consumer(&self) -> Result<VerifiedModel, SolverError> {
-        self.ensure_last_sat_model_accepted_for_consumer()?;
-        self.try_get_model()
+        self.with_model_evaluation_read(|| {
+            self.ensure_last_sat_model_accepted_for_consumer()?;
+            self.try_get_model()
+        })
     }
 
     /// Fallible version of [`model`](Self::model).
@@ -240,10 +250,12 @@ impl Solver {
     /// - [`SolverError::ModelGenerationFailed`] — executor returned empty or error model
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_model(&self) -> Result<VerifiedModel, SolverError> {
-        let model_str = self.try_get_model_str()?;
-        Ok(VerifiedModel::from_validated(model_parse::parse_model_str(
-            &model_str,
-        )))
+        self.with_model_evaluation_read(|| {
+            let model_str = self.try_get_model_str()?;
+            Ok(VerifiedModel::from_validated(model_parse::parse_model_str(
+                &model_str,
+            )))
+        })
     }
 
     /// Iterate variables declared through [`Self::declare_const`].
@@ -271,8 +283,14 @@ impl Solver {
     /// - [`SolverError::NoResult`] — no `check_sat` has been called
     /// - [`SolverError::NotSat`] — last result was not Sat
     /// - [`SolverError::ModelGenerationFailed`] — value extraction failed
+    ///
+    /// Uses the exact typed batch decoder in [`Self::try_get_values`].
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_model_map(&self) -> Result<HashMap<String, ModelValue>, SolverError> {
+        self.with_model_evaluation_read(|| self.try_get_model_map_in_read())
+    }
+
+    fn try_get_model_map_in_read(&self) -> Result<HashMap<String, ModelValue>, SolverError> {
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
         if !last_result.is_sat() {
             return Err(SolverError::NotSat);
@@ -383,8 +401,18 @@ impl Solver {
     /// - [`SolverError::NoResult`] — no `check_sat` has been called
     /// - [`SolverError::NotSat`] — last result was not Sat
     /// - [`SolverError::ModelGenerationFailed`] — value extraction failed
+    ///
+    /// Compound values are decoded against the exact requested sorts, including
+    /// array keys/defaults/stores and registered datatype fields. Unsupported,
+    /// malformed or over-budget output fails the whole batch; it is not replaced
+    /// with opaque strings or guessed defaults. This typed decoding does not
+    /// itself establish SAT model validation or independent trace replay.
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_values(&self, terms: &[Term]) -> Result<Vec<ModelValue>, SolverError> {
+        self.with_model_evaluation_read(|| self.try_get_values_in_read(terms))
+    }
+
+    fn try_get_values_in_read(&self, terms: &[Term]) -> Result<Vec<ModelValue>, SolverError> {
         let term_ids = self.resolve_terms("get_value", terms)?;
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
         if !last_result.is_sat() {
@@ -393,6 +421,11 @@ impl Solver {
 
         if terms.is_empty() {
             return Ok(Vec::new());
+        }
+        if terms.len() > model_parse::MAX_GET_VALUE_TERMS {
+            return Err(SolverError::ModelGenerationFailed(
+                "get-value batch exceeds the typed extraction limit".into(),
+            ));
         }
 
         // The typed builder API has no original SMT-LIB source text, so echo the
@@ -407,11 +440,11 @@ impl Solver {
             return Err(SolverError::ModelGenerationFailed(output));
         }
 
-        model_parse::parse_get_value_output(&output, terms, self.terms()).ok_or_else(|| {
-            SolverError::ModelGenerationFailed(format!(
-                "failed to parse get-value output: {output}"
-            ))
-        })
+        model_parse::parse_get_value_output(
+            &output, &pairs, self.terms(), self.executor.context(),
+        ).ok_or_else(|| SolverError::ModelGenerationFailed(
+            "get-value output is malformed, unsupported, ill-sorted or exceeds typed decoding limits".into(),
+        ))
     }
 
     /// Raw SMT-LIB output from `(get-value ...)`.
@@ -419,6 +452,13 @@ impl Solver {
     /// Returns the unparsed output string, useful for debugging or custom parsing.
     #[must_use]
     pub fn values_smtlib(&self, terms: &[Term]) -> Option<String> {
+        let _evaluation_read = self.begin_model_evaluation_read();
+        let result = self.values_smtlib_in_read(terms);
+        self.executor.check_evaluation_read().ok()?;
+        result
+    }
+
+    fn values_smtlib_in_read(&self, terms: &[Term]) -> Option<String> {
         let term_ids = self.resolve_terms("values_smtlib", terms).ok()?;
         let last_result = self.executor.last_result()?;
         if !last_result.is_sat() {
@@ -442,5 +482,33 @@ impl Solver {
         }
 
         Some(output)
+    }
+
+    /// A native getter owns one read through nested accessors and decoding.
+    /// Keep decision evidence intact; cancellation refuses only this read.
+    pub(super) fn with_model_evaluation_read<T>(
+        &self,
+        read: impl FnOnce() -> Result<T, SolverError>,
+    ) -> Result<T, SolverError> {
+        let _evaluation_read = self.begin_model_evaluation_read();
+        let result = read();
+        // Preserve an already-specific input/state error, but never return
+        // successfully decoded data after evaluation observed a resource stop.
+        let value = result?;
+        self.executor
+            .check_evaluation_read()
+            .map_err(SolverError::ModelGenerationFailed)?;
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+impl Solver {
+    pub(crate) fn model_construction_metadata_steps_for_test(&self) -> Option<usize> {
+        self.executor.model_construction_metadata_steps_for_test()
+    }
+
+    pub(crate) fn model_construction_work_for_test(&self) -> Option<usize> {
+        self.executor.model_construction_work_for_test()
     }
 }

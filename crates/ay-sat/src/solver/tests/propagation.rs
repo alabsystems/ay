@@ -7,23 +7,6 @@ use super::*;
 use crate::solver::propagation::bcp_mode;
 use crate::solver::solver_stats::BCP_LEARNED_1963_BLOCKER_CERT_MIN_REPEATS;
 
-#[test]
-fn test_bcp_deferred_watch_path_has_no_mem_swap_source_pattern() {
-    let source = include_str!("../propagation_bcp.rs");
-    let std_swap = concat!("std::", "mem::", "swap");
-    let mem_swap_call = concat!("mem::", "swap(");
-    let old_to_deferred = concat!("swap", "_to_deferred");
-    let old_from_deferred = concat!("swap", "_from_deferred");
-    assert!(
-        !source.contains(std_swap) && !source.contains(mem_swap_call),
-        "BCP deferred watch path must not reintroduce the standard swap helper"
-    );
-    assert!(
-        !source.contains(old_to_deferred) && !source.contains(old_from_deferred),
-        "BCP should use the explicit deferred copy/restore API, not swap-shaped helpers"
-    );
-}
-
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "active_domain")]

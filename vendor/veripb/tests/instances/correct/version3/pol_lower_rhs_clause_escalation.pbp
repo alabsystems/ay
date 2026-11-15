@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `Clause::lower_rhs` escalated by calling `lower_rhs` on a
+% `GeneralPBConstraint::<BigInt>` *temporary*. A BigInt `checked_sub` never
+% fails, so the callee lowered the temporary in place and returned `None` --
+% the caller's signal that the receiver was already mutated -- and the `-` step
+% was silently a no-op that left the un-lowered `>= 1` on the stack.
+f 1 ;
+pol 1 18446744073709551616 - ;
+e 1 x1 1 x2 >= -18446744073709551615 : 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

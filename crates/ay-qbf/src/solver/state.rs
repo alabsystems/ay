@@ -37,17 +37,23 @@ impl QbfSolver {
     }
 
     /// Assign a variable
+    ///
+    /// Variable ids are 1-based. Id 0 has no slot, and [`Self::value`]
+    /// already reports it as unassigned, so assigning it records nothing.
     pub(super) fn assign(&mut self, lit: Literal, reason: Reason) {
         let var = lit.variable().id();
+        let Some(slot) = (var as usize).checked_sub(1) else {
+            return;
+        };
         let value = if lit.is_positive() {
             Assignment::True
         } else {
             Assignment::False
         };
 
-        self.assignments[var as usize - 1] = value;
-        self.levels[var as usize - 1] = self.decision_level;
-        self.reasons[var as usize - 1] = reason;
+        self.assignments[slot] = value;
+        self.levels[slot] = self.decision_level;
+        self.reasons[slot] = reason;
         self.trail.push(lit);
     }
 
@@ -58,8 +64,11 @@ impl QbfSolver {
                 .trail
                 .pop()
                 .expect("loop guard checked trail.len() > pos");
-            let var = lit.variable().id();
-            self.assignments[var as usize - 1] = Assignment::Unassigned;
+            // `assign` never puts slot-less variable 0 on the trail.
+            let Some(slot) = (lit.variable().id() as usize).checked_sub(1) else {
+                continue;
+            };
+            self.assignments[slot] = Assignment::Unassigned;
         }
     }
 

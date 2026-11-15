@@ -4,8 +4,12 @@
 
 //! `set.card` refutations must be certifiable, not merely correct.
 //!
-//! `--self-check` is the observable: it WITHHOLDS a verdict AY cannot certify,
-//! so `unsat` there means the refutation passed strict validation end to end.
+//! The observable is the certificate's `unsat_admission=strict-proof`: AY's
+//! strict checker re-derived every step of the in-memory refutation, which a
+//! trusted bridge axiom fails. `--self-check` used to be the observable, but it
+//! claims an external-style check and pinned Carcara has no set theory, so it
+//! withholds every one of these verdicts (owner decision D7; the certificate
+//! discloses `carcara_surface=unsupported`, sort `Set`).
 //!
 //! Note that grepping the emitted `.alethe` for `:rule hole` is NOT the right
 //! criterion. The Alethe printer renders any kind the external checker cannot
@@ -27,13 +31,17 @@ impl Drop for CleanupGuard {
     }
 }
 
-fn solve(args: &[&str], script: &str) -> String {
+fn fresh_path() -> PathBuf {
     static ID: AtomicUsize = AtomicUsize::new(0);
-    let path = std::env::temp_dir().join(format!(
+    std::env::temp_dir().join(format!(
         "ay_set_card_cert_{}_{}.smt2",
         std::process::id(),
         ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    ))
+}
+
+fn solve(args: &[&str], script: &str) -> String {
+    let path = fresh_path();
     std::fs::write(&path, script).unwrap();
     let _guard = CleanupGuard(path.clone());
 
@@ -43,6 +51,30 @@ fn solve(args: &[&str], script: &str) -> String {
         .output()
         .expect("failed to spawn ay");
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The refutation passed AY's strict validation end to end, and
+/// `--self-check` withholds it for its surface alone.
+fn assert_strictly_certified(script: &str, why: &str) {
+    let path = fresh_path();
+    let sidecar = path.with_extension("smt2.alethe");
+    std::fs::write(&path, script).unwrap();
+    let _guards = (CleanupGuard(path.clone()), CleanupGuard(sidecar));
+    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
+        .arg(&path)
+        .output()
+        .expect("failed to spawn ay");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("c ay.proof.certificate "))
+        .unwrap_or_else(|| panic!("{why}: no certificate; stderr={stderr}"));
+    assert!(
+        line.contains(" unsat_admission=strict-proof"),
+        "{why}: {line}"
+    );
+    assert!(line.contains(" carcara_surface=unsupported "), "{line}");
+    assert_eq!(solve(&["--self-check"], script).trim(), "unknown", "{why}");
 }
 
 const CARD_IS_NEGATIVE: &str = "(set-logic ALL)\n\
@@ -63,10 +95,9 @@ fn a_cardinality_refutation_is_strictly_certified() {
         "unsat",
         "cardinality is never negative"
     );
-    assert_eq!(
-        solve(&["--self-check"], CARD_IS_NEGATIVE).trim(),
-        "unsat",
-        "the refutation must pass strict certification, not just be correct"
+    assert_strictly_certified(
+        CARD_IS_NEGATIVE,
+        "the refutation must pass strict certification, not just be correct",
     );
 }
 
@@ -98,10 +129,9 @@ fn a_membership_lower_bound_refutation_is_strictly_certified() {
          (assert (set.member 1 s))\n\
          (check-sat)\n";
     assert_eq!(solve(&[], script).trim(), "unsat");
-    assert_eq!(
-        solve(&["--self-check"], script).trim(),
-        "unsat",
-        "the membership lower bound must be certified, not trusted"
+    assert_strictly_certified(
+        script,
+        "the membership lower bound must be certified, not trusted",
     );
 }
 
@@ -128,10 +158,9 @@ fn an_empty_set_cardinality_refutation_is_strictly_certified() {
          (assert (= (set.card (as set.empty (Set Int))) 2))\n\
          (check-sat)\n";
     assert_eq!(solve(&[], script).trim(), "unsat");
-    assert_eq!(
-        solve(&["--self-check"], script).trim(),
-        "unsat",
-        "the empty set plainly has cardinality 0, and that must be certified"
+    assert_strictly_certified(
+        script,
+        "the empty set plainly has cardinality 0, and that must be certified",
     );
 }
 
@@ -160,10 +189,9 @@ fn a_counted_membership_refutation_is_strictly_certified() {
          (assert (set.member 2 s))\n\
          (check-sat)\n";
     assert_eq!(solve(&[], script).trim(), "unsat");
-    assert_eq!(
-        solve(&["--self-check"], script).trim(),
-        "unsat",
-        "the counted-membership bound must be certified, not trusted"
+    assert_strictly_certified(
+        script,
+        "the counted-membership bound must be certified, not trusted",
     );
 }
 
@@ -193,10 +221,9 @@ fn an_empty_by_assertion_refutation_is_strictly_certified() {
          (assert (= s (as set.empty (Set Int))))\n\
          (check-sat)\n";
     assert_eq!(solve(&[], script).trim(), "unsat");
-    assert_eq!(
-        solve(&["--self-check"], script).trim(),
-        "unsat",
-        "an asserted-empty set's cardinality must be certified, not trusted"
+    assert_strictly_certified(
+        script,
+        "an asserted-empty set's cardinality must be certified, not trusted",
     );
 }
 

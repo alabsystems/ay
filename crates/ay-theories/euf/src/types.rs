@@ -56,6 +56,19 @@ pub struct EufModel {
     /// values wins over a fabricated read, which only remains as the final
     /// fallback for terms constrained by nothing but EUF disequalities.
     pub speculative_int_terms: ay_core::kani_compat::DetHashSet<TermId>,
+    /// Per-model single-shot marker of the executor's asserted-array-read
+    /// repair (`repair_asserted_array_read_pins`): set once that repair has
+    /// run on THIS model, cleared when a retry must reopen it. It travels
+    /// with the model (clones included) so a new model always gets exactly
+    /// one repair.
+    ///
+    /// It used to be a sentinel KEY (`TermId(u32::MAX - 7)`) in
+    /// `term_values`, a map every consumer reads as "real term -> value";
+    /// any consumer that forgot to filter it indexed the term store out of
+    /// bounds (the enum-sort model repair panicked on a 2-constructor
+    /// datatype stored in a BV-indexed array, 2026-09-23 hunt A1). Keeping
+    /// bookkeeping out of the term map removes the hazard at its source.
+    pub array_read_pins_repaired: bool,
 }
 
 // ============================================================================
@@ -126,8 +139,13 @@ fn compute_signature(func_hash: u64, args: &[u32], enodes: &[ENode]) -> Signatur
     for &arg in args {
         // Follow root pointers to get representative
         let mut curr = arg;
-        while enodes[curr as usize].root != curr {
-            curr = enodes[curr as usize].root;
+        // An id with no e-node is its own representative (the signature is
+        // only a hash hint; callers verify real congruence before trusting it).
+        while let Some(node) = enodes.get(curr as usize) {
+            if node.root == curr {
+                break;
+            }
+            curr = node.root;
         }
         // Mix representative into hash
         h = h.wrapping_mul(0x517CC1B727220A95_u128) ^ u128::from(curr);
@@ -154,8 +172,13 @@ fn compute_signature_mapped(
     h = h.wrapping_mul(0x9E3779B97F4A7C15_u128) ^ (args.len() as u128);
     for &arg in args {
         let mut curr = arg;
-        while enodes[curr as usize].root != curr {
-            curr = enodes[curr as usize].root;
+        // An id with no e-node is its own representative (the signature is
+        // only a hash hint; callers verify real congruence before trusting it).
+        while let Some(node) = enodes.get(curr as usize) {
+            if node.root == curr {
+                break;
+            }
+            curr = node.root;
         }
         curr = map(curr);
         h = h.wrapping_mul(0x517CC1B727220A95_u128) ^ u128::from(curr);
@@ -322,10 +345,23 @@ pub(crate) enum UndoRecord {
     /// under its pre-merge key by the paired `DiseqSet`, so this is a pure
     /// removal. See `DiseqSet`.
     DiseqRemove { key: (u32, u32) },
-    /// Undo a `sync_diseq_index` insertion that moved a disequality from the
-    /// pending queue into the index (#euf-inc-diseq-undo). Unlike `DiseqRemove`
-    /// (a merge rekey), the diseq's ONLY home is this index entry, so undoing it
-    /// must also put it BACK on `pending_neg_eqs` — but ONLY if the disequality
+    /// Undo a `sync_diseq_index` insertion that moved a disequality OUT of the
+    /// pending queue (#euf-inc-diseq-undo). Two shapes of that move, both
+    /// recorded here because both leave the literal with no home of its own:
+    ///
+    ///  * a BRAND-NEW key — the diseq's only home is this index entry;
+    ///  * an ABSORBED literal (`#euf-inc-diseq-undo-absorbed`) — the key was
+    ///    already live, so this literal is represented only by another
+    ///    literal's witness under a key it shares only while the two endpoint
+    ///    classes are merged. A pop that splits them changes THIS literal's
+    ///    `(min_rep,max_rep)` and no other record re-establishes it. There the
+    ///    paired `DiseqSet` pushed immediately BEFORE this record restores the
+    ///    resident witness, and the reverse replay order (this record first)
+    ///    makes the two compose to the exact pre-sync state.
+    ///
+    /// Unlike `DiseqRemove` (a merge rekey, whose disequality is restored under
+    /// its pre-merge key by its own paired `DiseqSet`), undoing this must also
+    /// put the literal BACK on `pending_neg_eqs` — but ONLY if the disequality
     /// assignment itself survived the pop (a deferred sync: the diseq was
     /// asserted at a shallower scope than it was indexed, e.g. its terms entered
     /// the e-graph late). If the assignment was retracted by this same pop, the
@@ -345,7 +381,6 @@ pub(crate) enum UndoRecord {
 /// Union-Find structure for equivalence classes
 pub(crate) struct UnionFind {
     pub(crate) parent: Vec<u32>,
-    pub(crate) rank: Vec<u32>,
 }
 
 impl UnionFind {
@@ -353,27 +388,36 @@ impl UnionFind {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // n is bounded by term count which fits in u32
     pub(crate) fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n as u32).collect(),
-            rank: vec![0; n],
+        // Built by push behind a fallible reservation (a capacity hint only:
+        // on reservation failure `push` still grows the vectors), so no bulk
+        // allocation of an unchecked size is requested.
+        let mut parent: Vec<u32> = Vec::new();
+        let _ = parent.try_reserve_exact(n);
+        for idx in 0..n as u32 {
+            parent.push(idx);
         }
+        Self { parent }
     }
 
     pub(crate) fn reset(&mut self) {
         for (idx, p) in self.parent.iter_mut().enumerate() {
             *p = idx as u32;
         }
-        self.rank.fill(0);
     }
 
     pub(crate) fn ensure_size(&mut self, n: usize) {
         if n <= self.parent.len() {
             return;
         }
-        let start = self.parent.len() as u32;
-        self.parent
-            .extend(start..start + (n - self.parent.len()) as u32);
-        self.rank.resize(n, 0);
+        // Grow by push behind a fallible reservation: the same ids
+        // `len, len + 1, .., n - 1` as before, with no unchecked bulk size.
+        let _ = self
+            .parent
+            .try_reserve_exact(n.saturating_sub(self.parent.len()));
+        while self.parent.len() < n {
+            let next = self.parent.len() as u32;
+            self.parent.push(next);
+        }
     }
 
     /// Find the representative of an element (with path compression)
@@ -382,27 +426,6 @@ impl UnionFind {
             self.parent[x as usize] = self.find(self.parent[x as usize]);
         }
         self.parent[x as usize]
-    }
-
-    /// Union two elements
-    #[cfg_attr(not(kani), allow(dead_code))]
-    pub(crate) fn union(&mut self, x: u32, y: u32) {
-        let rx = self.find(x);
-        let ry = self.find(y);
-        if rx != ry {
-            match self.rank[rx as usize].cmp(&self.rank[ry as usize]) {
-                std::cmp::Ordering::Less => {
-                    self.parent[rx as usize] = ry;
-                }
-                std::cmp::Ordering::Greater => {
-                    self.parent[ry as usize] = rx;
-                }
-                std::cmp::Ordering::Equal => {
-                    self.parent[ry as usize] = rx;
-                    self.rank[rx as usize] += 1;
-                }
-            }
-        }
     }
 }
 
@@ -434,9 +457,9 @@ pub(crate) enum EqualityReason {
     /// ITE axiom: `ite(c, t, e) = t` when `c = true`, or `ite(c, t, e) = e` when `c = false`.
     /// The condition term is stored so explain() can produce the reason. (#5081)
     Ite {
-        /// The condition term that was assigned
+        /// The SAT-owned condition atom (unwrapped when the ITE guard is `not p`)
         condition: TermId,
-        /// The truth value of the condition
+        /// The truth value of that atom
         value: bool,
     },
 }

@@ -11,6 +11,8 @@ use super::super::mutate::ReasonPolicy;
 use super::super::*;
 #[cfg(debug_assertions)]
 use crate::kani_compat::DetHashSet as HashSet;
+use crate::kitten::{CoreLemmas, Terminator};
+use crate::sweep::SweepProofFact;
 
 /// Sweep effort as per-mille of search ticks since last sweep call.
 /// CaDiCaL: `sweepeffort = 100` (options.hpp). 100 per-mille = 10%.
@@ -41,11 +43,27 @@ impl Solver {
     ///
     /// Returns true if UNSAT was detected.
     pub(in crate::solver) fn sweep(&mut self) -> bool {
+        // `--sat-probe-round-kissat`: Kissat's sweep delay (sweep.c:1655,
+        // 1718-1721), with the variables kitten swept and the backbones and
+        // equivalences it found standing in for Kissat's swept and eliminated.
+        if self.cold.probe_round_kissat && self.cold.sweep_kissat_delay.delaying() {
+            return false;
+        }
+        let kitten_before = self.sweep_kitten_counts();
         let rewrites_before = self.inproc.sweeper.stats().clauses_rewritten;
         self.defer_stale_reason_cleanup = true;
         let result = self.sweep_body();
         self.defer_stale_reason_cleanup = false;
         self.clear_stale_reasons();
+        if self.cold.probe_round_kissat {
+            let (swept, found) = self.sweep_kitten_counts();
+            let (swept, found) = (swept - kitten_before.0, found - kitten_before.1);
+            if super::super::subst_kissat::kissat_unproductive(found, swept) {
+                self.cold.sweep_kissat_delay.bump();
+            } else {
+                self.cold.sweep_kissat_delay.reduce();
+            }
+        }
         let productive = self.inproc.sweeper.stats().clauses_rewritten > rewrites_before;
         if productive {
             // Productive: reset to base interval (CaDiCaL reduce_delay).
@@ -77,6 +95,16 @@ impl Solver {
         result
     }
 
+    /// Kitten's environments (one per swept variable) and the backbones and
+    /// equivalences it found, for the Kissat sweep delay.
+    fn sweep_kitten_counts(&self) -> (u64, u64) {
+        let stats = self.inproc.sweeper.stats();
+        (
+            stats.kitten_environments,
+            stats.kitten_backbone + stats.kitten_equivalences,
+        )
+    }
+
     /// Sweep body — early returns are safe; wrapper handles rescheduling.
     ///
     /// Uses kitten sub-solver to find backbone literals and literal equivalences
@@ -99,6 +127,17 @@ impl Solver {
         }
         // Sweep substitutes and deletes irredundant clauses — maintained
         // incrementally via apply_decompose_mutation's BVE occ hooks (#8096).
+
+        // The solve's interrupt and deadline end sweep too: here, and inside
+        // it before every environment and probe and while kitten propagates.
+        // Preprocessing polls them only before and after the pass.
+        if self.is_interrupted() || self.solve_deadline_expired() {
+            return false;
+        }
+        self.inproc.sweeper.set_terminator(Terminator::new(
+            self.cold.interrupt.clone(),
+            self.cold.solve_deadline,
+        ));
 
         #[cfg(debug_assertions)]
         let recon_steps_before = self.inproc.reconstruction.len();
@@ -176,7 +215,34 @@ impl Solver {
             .min(SWEEP_MAX_EFFORT);
 
         // Run kitten-based sweep (COI + backbone + equivalence probing).
-        let outcome = self.inproc.sweeper.sweep_with_kitten(
+        // Under a proof surface, ask for the kitten core lemmas that certify
+        // every derived fact (proof-posture-parity: sweep is now proof-logged
+        // like Kissat's, so it runs in both postures).
+        self.inproc
+            .sweeper
+            .set_proof_facts_wanted(self.proof_manager.is_some());
+        // Under Kissat's schedule every in-search pass is bounded by its tick
+        // budget; the first sweep keeps its unbudgeted work, where the
+        // equivalences preprocessing finds come from.
+        // `--sat-sweep-env-kissat`: Kissat's growing environment, which
+        // charges every in-search pass fully too (Kissat's kitten counts a
+        // tick for each clause it is given, kitten.c:876-889).
+        let (sweep_passes, env_kissat) = {
+            let switches = ay_core::sat_ab_switches();
+            (
+                switches
+                    .sweep_passes
+                    .unwrap_or(switches.inproc_nlogn_schedule == Some(true)),
+                switches.sweep_env_kissat == Some(true),
+            )
+        };
+        self.inproc.sweeper.set_env_kissat(env_kissat);
+        let counted = self.deterministic_inproc();
+        self.inproc.sweeper.set_deterministic(counted);
+        self.inproc
+            .sweeper
+            .set_charge_all_work(!is_first_sweep && (sweep_passes || env_kissat));
+        let outcome = self.inproc.sweeper.sweep_counting_kitten_work(
             &self.arena,
             &self.vals,
             &self.cold.freeze_counts,
@@ -184,14 +250,14 @@ impl Solver {
         );
 
         if outcome.unsat {
-            // Kitten proved UNSAT on a COI subset. In proof mode, we cannot
-            // derive an empty clause directly from kitten's internal proof
-            // (kitten doesn't produce DRAT steps). Let normal search re-derive
-            // the empty clause with a proper proof chain.
-            if self.proof_manager.is_some() {
+            // Kitten refuted a COI environment outright. Both postures mark
+            // UNSAT; under a proof surface the kitten core certifies it (see
+            // `sweep_environment_unsat`, which falls back to search only when
+            // no core was recorded).
+            let facts = self.inproc.sweeper.take_proof_facts();
+            if !self.sweep_environment_unsat(facts) {
                 return false;
             }
-            self.mark_empty_clause();
             #[cfg(debug_assertions)]
             {
                 let recon_steps_after = self.inproc.reconstruction.len();
@@ -209,6 +275,10 @@ impl Solver {
                 "BUG: sweep() did not restore decision level to 0"
             );
             return true;
+        }
+
+        if let Some(lit) = outcome.contradiction {
+            return self.sweep_contradictory_equivalences(Literal(lit));
         }
 
         // Check if any variable was actually merged (not identity mapping)
@@ -237,6 +307,15 @@ impl Solver {
             );
             return false;
         }
+
+        // Certify every sweep-derived fact BEFORE any clause is rewritten or
+        // deleted, while the checker's database still holds everything the
+        // kitten cores rest on. Units get their proof line now (enqueued
+        // below with that id); equivalence binaries stay in the proof until
+        // the rewrites that depend on them have been emitted, then are
+        // deleted at the end of this call. No-proof posture: nothing to do.
+        let sweep_facts = self.inproc.sweeper.take_proof_facts();
+        let (sweep_unit_pids, sweep_binaries) = self.emit_sweep_proof_facts(sweep_facts);
 
         // Record the equivalence mapping for reconstruction if non-trivial.
         // Convert internal lit_map to external index space (#5250).
@@ -282,13 +361,9 @@ impl Solver {
             let rewrite = rewrite_clauses(&self.arena, &outcome.lit_map, &self.vals);
 
             if rewrite.is_unsat {
-                // Sweep-derived UNSAT from clause rewriting (empty clause after
-                // substitution). In proof mode, let normal search re-derive it.
-                if self.proof_manager.is_some() {
-                    return false;
-                }
-                self.mark_empty_clause();
-                return true;
+                // A clause rewrote to the empty clause: certified in both
+                // postures, see `sweep_rewrite_empty_clause`.
+                return self.sweep_rewrite_empty_clause();
             }
 
             // ── DRAT proof emission for clause mutations (#7913) ─────────
@@ -328,11 +403,17 @@ impl Solver {
                 // Phase 1: emit all ADD steps while original formula is intact.
                 // CaDiCaL sweep.cpp:1127-1152.
                 let mut unit_pids: Vec<(Literal, u64)> = Vec::new();
+                // `--sat-veripb-hints`: each rewrite names its old clause and
+                // the equivalence binaries to each representative.
+                let veripb_next = self.veripb_sweep_hops(&sweep_binaries); // veripb_derived.rs
                 for (mutation, &cid) in rewrite.actions.iter().zip(mutation_ids.iter()) {
                     match mutation {
                         crate::decompose::ClauseMutation::Replaced {
-                            new, clause_idx, ..
+                            new,
+                            clause_idx,
+                            old,
                         } => {
+                            self.veripb_note_substitution(old, &outcome.lit_map, &veripb_next);
                             // In DRAT mode, the rewritten clause is RUP: it
                             // follows from the original clause (with one literal
                             // substituted by its equivalent representative).
@@ -351,7 +432,8 @@ impl Solver {
                                 self.cold.clause_ids[*clause_idx] = new_id;
                             }
                         }
-                        crate::decompose::ClauseMutation::Unit { unit, .. } => {
+                        crate::decompose::ClauseMutation::Unit { unit, old, .. } => {
+                            self.veripb_note_substitution(old, &outcome.lit_map, &veripb_next);
                             let hints: Vec<u64> = if cid != 0 { vec![cid] } else { Vec::new() };
                             let kind = if hints.is_empty() {
                                 ProofAddKind::TrustedTransform
@@ -399,14 +481,9 @@ impl Solver {
                 let vi = unit.variable().index();
                 if let Some(val) = self.var_value_from_vals(vi) {
                     if val != unit.is_positive() {
-                        // Contradicting unit: formula is UNSAT.
-                        // In proof mode, let BCP derive the conflict with a
-                        // proper proof chain (#4596).
-                        if self.proof_manager.is_some() {
-                            return false;
-                        }
-                        self.mark_empty_clause();
-                        return true;
+                        // Contradicting unit: certified in both postures, see
+                        // `sweep_contradicting_unit`.
+                        return self.sweep_contradicting_unit(*unit);
                     }
                     // Same polarity: already assigned, skip.
                 } else if !self.var_lifecycle.is_inactive(vi) {
@@ -506,10 +583,16 @@ impl Solver {
                 if self.has_empty_clause {
                     return false;
                 }
+                // A unit certified above (core lemmas + RUP unit already in
+                // the proof) needs no direct-RUP replay.
+                let pre_emitted_pid = sweep_unit_pids
+                    .iter()
+                    .find(|(l, _)| *l == unit_lit)
+                    .map(|(_, pid)| *pid);
                 // DRAT has no explicit hint channel for kitten-derived backbone
                 // units, so proof mode must only keep units that can be replayed
                 // as direct RUP under `¬unit`.
-                if hints.is_empty() && self.proof_manager.is_some() {
+                if pre_emitted_pid.is_none() && hints.is_empty() && self.proof_manager.is_some() {
                     if !self.is_rup_unit_under_negation(unit_lit) {
                         #[cfg(debug_assertions)]
                         proof_skipped_units.insert(vi);
@@ -528,8 +611,17 @@ impl Solver {
                 {
                     continue;
                 }
-                self.enqueue_derived_unit(unit_lit, &hints);
+                match pre_emitted_pid {
+                    Some(pid) => self.enqueue_derived_unit_with_proof_id(unit_lit, pid),
+                    None => self.enqueue_derived_unit(unit_lit, &hints),
+                }
             }
+        }
+        // The equivalence binaries have done their job (every rewrite that
+        // needed them is in the proof); drop them so the checker's database
+        // matches the solver's again.
+        for binary in &sweep_binaries {
+            let _ = self.proof_emit_delete(binary, 0);
         }
 
         // Final watch finalization: backbone unit processing above may add new
@@ -584,7 +676,203 @@ impl Solver {
             self.decision_level, 0,
             "BUG: sweep() did not restore decision level to 0"
         );
-
         false
+    }
+
+    /// Kitten refuted a whole COI environment (`SweepOutcome::unsat`). The
+    /// environment is a subset of the live clause database, so by
+    /// monotonicity the formula is UNSAT.
+    ///
+    /// No proof surface: mark the empty clause. Under a proof surface the
+    /// sweeper recorded the kitten core lemmas that refute the environment
+    /// (`SweepProofFact::Unsat`); each is RUP over the environment clauses
+    /// plus the lemmas before it, so once they are added in order the empty
+    /// clause is RUP too and is added as the terminal step (Kissat sweep.c
+    /// add_core for a `kitten_status == 20` environment). An empty core is
+    /// the case where kitten's root propagation alone refuted the
+    /// environment, and the empty clause is RUP directly. Nothing is deleted
+    /// afterwards: the proof is terminal.
+    ///
+    /// With no core recorded under a proof surface the verdict cannot be
+    /// certified here, so the call hands the formula back to search, which
+    /// re-derives UNSAT with a proper proof chain; the reason is logged and
+    /// counted. Returns whether UNSAT was established.
+    pub(in crate::solver) fn sweep_environment_unsat(
+        &mut self,
+        facts: Vec<SweepProofFact>,
+    ) -> bool {
+        if self.proof_manager.is_none() {
+            self.mark_empty_clause();
+            return true;
+        }
+        let core = facts.into_iter().find_map(|fact| match fact {
+            SweepProofFact::Unsat { lemmas } => Some(lemmas),
+            _ => None,
+        });
+        let Some(lemmas) = core else {
+            self.inproc.sweeper.stats_mut().unsat_uncertified_fallbacks += 1;
+            tracing::debug!(
+                "sweep: kitten refuted a COI environment but recorded no core under a \
+                 proof surface; falling back to search to certify UNSAT"
+            );
+            return false;
+        };
+        // The empty clause is the terminal step below; kitten's own empty
+        // clause, if it is in the core, is not replayed as a lemma.
+        let mut emitted: Vec<Vec<Literal>> = Vec::new();
+        self.emit_sweep_lemmas(&lemmas, &mut emitted);
+        self.mark_empty_clause();
+        true
+    }
+
+    /// The sweep equivalences put `lit` in one class with its negation
+    /// (`SweepOutcome::contradiction`). Each equivalence was proved by kitten
+    /// in its own COI environment, so all hold and together refute the
+    /// formula. Under DRAT/VeriPB the equivalence binaries are added with
+    /// their cores as usual; then `lit` and `¬lit` are each RUP over those
+    /// binaries (assuming the other polarity propagates around the class to
+    /// both values of some member), and the empty clause is RUP over the two
+    /// units. Under LRAT the hints are not assembled here: the call falls
+    /// back to search, as an uncertified environment does. Nothing is
+    /// rewritten or deleted.
+    pub(in crate::solver) fn sweep_contradictory_equivalences(&mut self, lit: Literal) -> bool {
+        if self.proof_manager.is_none() {
+            self.mark_empty_clause();
+            return true;
+        }
+        if self.cold.lrat_enabled {
+            self.inproc.sweeper.stats_mut().unsat_uncertified_fallbacks += 1;
+            let _ = self.inproc.sweeper.take_proof_facts();
+            return false;
+        }
+        let facts = self.inproc.sweeper.take_proof_facts();
+        let _ = self.emit_sweep_proof_facts(facts);
+        let _ = self.proof_emit_add(&[lit], &[], ProofAddKind::Derived);
+        let _ = self.proof_emit_add(&[lit.negated()], &[], ProofAddKind::Derived);
+        self.mark_empty_clause();
+        true
+    }
+
+    /// Rewriting under the sweep equivalences turned a clause into the empty
+    /// clause: every literal maps to a representative that is false at
+    /// level 0. Certified in both postures: the equivalence binaries added by
+    /// `emit_sweep_proof_facts` are still in the proof database and
+    /// propagate each literal from its representative's level-0 value, so
+    /// the empty clause is RUP (LRAT: the level-0 unit hints). Nothing has
+    /// been rewritten or deleted yet; the plan is discarded. Always returns
+    /// true.
+    ///
+    /// Reachability: the sweeper forms classes over unassigned variables
+    /// only, and a literal is dropped only when its representative is false
+    /// at level 0, so with a propagated level-0 trail no live clause maps
+    /// entirely to false literals. The handler stays sound should that
+    /// change.
+    pub(in crate::solver) fn sweep_rewrite_empty_clause(&mut self) -> bool {
+        self.inproc.sweeper.stats_mut().unsat_rewrite_empty += 1;
+        self.mark_empty_clause_with_level0_hints();
+        true
+    }
+
+    /// A rewrite-derived unit contradicts the level-0 assignment (CaDiCaL
+    /// sweep.cpp:1210-1217 learn_empty_clause). The unit is already in the
+    /// proof (phase 1 above: RUP from its clause plus the equivalence
+    /// binaries) and its negation is a level-0 fact of the proof database,
+    /// either an input or derived unit or one propagation away, so the empty
+    /// clause is RUP. LRAT: resolve the two unit chains, as decompose does
+    /// (#7108). Always returns true.
+    pub(in crate::solver) fn sweep_contradicting_unit(&mut self, unit: Literal) -> bool {
+        self.inproc.sweeper.stats_mut().unsat_contradicting_units += 1;
+        if self.cold.lrat_enabled {
+            let new_unit_pid = self.visible_unit_proof_id_for_lit(unit).unwrap_or(0);
+            let hints = self.collect_empty_clause_hints_for_unit_contradiction(new_unit_pid, unit);
+            self.mark_empty_clause_with_hints(&hints);
+        } else {
+            self.mark_empty_clause();
+        }
+        true
+    }
+
+    /// Emit the certificate for sweep-derived facts (Kissat sweep.c
+    /// save_core / add_core / clear_core): for each fact, add its kitten core
+    /// lemmas in derivation order (each RUP over the environment plus the
+    /// lemmas before it), add the fact itself as a RUP step, then delete the
+    /// non-unit lemmas again. Returns the proof ids of the emitted units and
+    /// the equivalence binaries left in the proof for the caller to delete
+    /// once the rewrites that depend on them are emitted.
+    fn emit_sweep_proof_facts(
+        &mut self,
+        facts: Vec<SweepProofFact>,
+    ) -> (Vec<(Literal, u64)>, Vec<Vec<Literal>>) {
+        let mut unit_pids: Vec<(Literal, u64)> = Vec::new();
+        let mut binaries: Vec<Vec<Literal>> = Vec::new();
+        if self.proof_manager.is_none() || facts.is_empty() {
+            return (unit_pids, binaries);
+        }
+        let mut emitted: Vec<Vec<Literal>> = Vec::new();
+        for fact in facts {
+            match fact {
+                SweepProofFact::Unit { lit, lemmas } => {
+                    self.emit_sweep_lemmas(&lemmas, &mut emitted);
+                    self.veripb_note_core_lemmas(&lemmas);
+                    let pid = self.proof_emit_unit(Literal(lit), &[], ProofAddKind::Derived);
+                    unit_pids.push((Literal(lit), pid));
+                    self.delete_sweep_lemmas(&mut emitted);
+                }
+                SweepProofFact::Equivalence {
+                    rep,
+                    lit,
+                    forward,
+                    backward,
+                } => {
+                    // forward: lit ∧ ¬rep UNSAT  ⇒  (¬lit ∨ rep)
+                    self.emit_sweep_lemmas(&forward, &mut emitted);
+                    self.veripb_note_core_lemmas(&forward);
+                    let bin_f = vec![Literal(lit ^ 1), Literal(rep)];
+                    let _ = self.proof_emit_add(&bin_f, &[], ProofAddKind::Derived);
+                    self.delete_sweep_lemmas(&mut emitted);
+                    // backward: ¬lit ∧ rep UNSAT  ⇒  (lit ∨ ¬rep)
+                    self.emit_sweep_lemmas(&backward, &mut emitted);
+                    self.veripb_note_core_lemmas(&backward);
+                    let bin_b = vec![Literal(lit), Literal(rep ^ 1)];
+                    let _ = self.proof_emit_add(&bin_b, &[], ProofAddKind::Derived);
+                    self.delete_sweep_lemmas(&mut emitted);
+                    binaries.push(bin_f);
+                    binaries.push(bin_b);
+                }
+                // An UNSAT environment is handled by `sweep_environment_unsat`
+                // before any rewrite; the sweeper records it only together
+                // with `SweepOutcome::unsat`, so it never reaches this point.
+                SweepProofFact::Unsat { .. } => {
+                    debug_assert!(false, "BUG: sweep Unsat fact reached fact emission");
+                }
+            }
+        }
+        (unit_pids, binaries)
+    }
+
+    /// Add kitten core lemmas to the proof. Lemmas of size >= 2 are recorded
+    /// in `emitted` for deletion afterwards; a unit lemma is a root fact that
+    /// stays (VeriPB obeys unit deletions, DRAT ignores them — never delete a
+    /// unit, see b2875b3b6); an empty lemma (kitten's own empty clause) is
+    /// skipped: the caller adds the empty clause as its terminal step.
+    /// `--sat-veripb-hints`: each names its antecedents (veripb_derived.rs).
+    fn emit_sweep_lemmas(&mut self, core: &CoreLemmas, emitted: &mut Vec<Vec<Literal>>) {
+        for (k, lemma) in core.lemmas.iter().enumerate() {
+            if lemma.is_empty() {
+                continue;
+            }
+            let lits: Vec<Literal> = lemma.iter().map(|&l| Literal(l)).collect();
+            self.veripb_note_core_antecedents(core, k);
+            let _ = self.proof_emit_add(&lits, &[], ProofAddKind::Derived);
+            if lits.len() >= 2 {
+                emitted.push(lits);
+            }
+        }
+    }
+
+    fn delete_sweep_lemmas(&mut self, emitted: &mut Vec<Vec<Literal>>) {
+        for lits in emitted.drain(..) {
+            let _ = self.proof_emit_delete(&lits, 0);
+        }
     }
 }

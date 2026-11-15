@@ -23,9 +23,11 @@
 mod contradiction;
 mod equality;
 mod eval;
+/// Literal-indexed cube view (Workstream B, `DESIGN` §3.1; owner WP-B1-L).
+pub(crate) mod literals;
 
 // Re-export public API used outside cube/
-pub(crate) use contradiction::is_trivial_contradiction;
+pub(crate) use contradiction::{is_trivial_contradiction, is_trivial_contradiction_checked};
 pub(super) use equality::{
     augment_model_from_equalities, extract_equalities_from_formula, is_point_cube_for_vars,
 };
@@ -132,5 +134,7 @@ impl PointCubeUnionFind {
     }
 }
 
+#[cfg(test)]
+mod equality_tests;
 #[cfg(test)]
 mod tests;

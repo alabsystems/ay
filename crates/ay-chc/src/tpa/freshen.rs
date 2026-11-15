@@ -21,28 +21,6 @@ use super::solver::TpaSolver;
 /// Global counter for freshening body-local variables in TPA compositions.
 static TPA_FRESHEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Split a variable name into its base name and time index.
-///
-/// Examples: "x" → ("x", 0), "x_1" → ("x", 1), "x_2" → ("x", 2)
-fn split_base_and_time(name: &str) -> (&str, i32) {
-    if let Some((base, suffix)) = name.rsplit_once('_') {
-        let bytes = suffix.as_bytes();
-        let is_canonical_pos_int = !bytes.is_empty()
-            && bytes[0].is_ascii_digit()
-            && (bytes[0] != b'0' || bytes.len() == 1)
-            && bytes.iter().all(u8::is_ascii_digit);
-
-        if is_canonical_pos_int {
-            if let Ok(t) = suffix.parse::<i32>() {
-                if t > 0 {
-                    return (base, t);
-                }
-            }
-        }
-    }
-    (name, 0)
-}
-
 impl TpaSolver {
     /// Shift expression by given number of time steps.
     ///
@@ -93,8 +71,7 @@ impl TpaSolver {
             .into_iter()
             .filter(|v| {
                 // Keep only variables that are NOT state variables at any time step.
-                let (base, _) = split_base_and_time(&v.name);
-                !state_bases.contains(base)
+                crate::transition_system::state_var_time(&v.name, &state_bases).is_none()
             })
             .map(|v| {
                 let fresh_name = format!("{}_f{}", v.name, tag);
@@ -122,5 +99,38 @@ impl TpaSolver {
         // Only shift variables at position 1 to position 2
         // Variables at position 0 stay at position 0
         ts.rename_state_vars_at(expr, 1, 2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChcSort, PredicateId};
+
+    /// SingleLoop state names end in `_<digits>`; only the clause locals of
+    /// the shifted copy may be freshened.
+    #[test]
+    fn single_loop_state_names_are_never_freshened() {
+        let state = |name: &str| ChcVar::new(name, ChcSort::Int);
+        let ts = TransitionSystem::new(
+            PredicateId::new(0),
+            vec![state(".loc_0"), state(".loc_1"), state(".arg_1_2")],
+            ChcExpr::Bool(true),
+            ChcExpr::Bool(true),
+            ChcExpr::Bool(true),
+        );
+        let expr = ChcExpr::and_all([
+            ChcExpr::eq(
+                ChcExpr::var(state(".loc_1")),
+                ChcExpr::var(state(".arg_1_2_1")),
+            ),
+            ChcExpr::eq(ChcExpr::var(state(".loc_0_2")), ChcExpr::var(state("J"))),
+        ]);
+        let freshened = TpaSolver::freshen_body_locals(&expr, &ts);
+        let mut names: Vec<String> = freshened.vars().into_iter().map(|v| v.name).collect();
+        names.sort();
+        assert_eq!(names.len(), 4);
+        assert_eq!(&names[..3], [".arg_1_2_1", ".loc_0_2", ".loc_1"]);
+        assert!(names[3].starts_with("J_f"), "{names:?}");
     }
 }

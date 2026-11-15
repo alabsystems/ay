@@ -335,6 +335,7 @@ impl TermStore {
                     term: TermData::Not(TermId(0)),
                     sort: Sort::Bool,
                     stamp: placeholder_stamp,
+                    field_presence: None,
                 },
             );
 
@@ -349,9 +350,9 @@ impl TermStore {
 
         // Phase 4: swap in the compacted arena.
         self.terms = new_terms;
-        // Memoized checker verdicts are keyed by `TermId` and every id has just
-        // been remapped, so the memo cannot be carried across compaction.
-        self.strict_bv_semantics_ok.get_mut().clear();
+        // Checker verdicts are keyed by `TermId` and every id has just moved:
+        // acceptances go, refusals over surviving terms are relabelled.
+        self.strict_bv_semantics.remap(&mapping);
 
         // Phase 5: remap TermStore-owned pins.
         //
@@ -480,6 +481,7 @@ impl TermStore {
             self.skolem_choice
                 .extend(std::iter::once((new_witness, choice)));
         }
+        self.remap_divmod_purifications(remap);
     }
 
     /// Compaction phase 6: rebuild the hash-cons map from the live arena.

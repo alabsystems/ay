@@ -10,6 +10,8 @@ use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 #[path = "entry_failure_tests.rs"]
 mod entry_failure_tests;
+#[path = "fact_freshness_tests.rs"]
+mod fact_freshness_tests;
 #[path = "get_constant_tests.rs"]
 mod get_constant_tests;
 #[path = "issue_5877_tests.rs"]

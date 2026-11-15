@@ -1,0 +1,24 @@
+pseudo-Boolean proof version 2.0
+* Regression test (wrong verdict): the version 2.0 spelling of the
+* `contradiction_proven` defect. A `red` with an EMPTY witness is treated as a
+* proof by contradiction, and unlike a version 3.0 `pbc` it does generate
+* database obligations -- so `proofgoal 1` is a legitimate obligation here. What
+* was not legitimate is what discharging it bought: `end_proofgoal` set
+* `contradiction_proven` for any goal at all, and `finalize` then skipped the
+* remaining obligations and the top-level RUP check, so `+1 ~x1 >= 1` was added
+* without a contradiction from `1 x1 >= 1` and the following `u >= 1` closed a
+* proof of UNSAT for a formula that `x1 = 1, x2 = 0` satisfies.
+*
+* The legitimate use of the flag -- discharging goal `#1`, whose counterexample
+* premise IS the negated constraint -- still works; see
+* correct/version2/proof_by_contradiction_proofgoal.
+f 2
+red +1 ~x1 >= 1 ; ; begin
+	proofgoal 1
+		pol -1 1 +
+	end
+end
+u >= 1 ;
+output NONE
+conclusion UNSAT : -1
+end pseudo-Boolean proof

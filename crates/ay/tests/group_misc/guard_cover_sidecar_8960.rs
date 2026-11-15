@@ -614,9 +614,17 @@ fn dimacs_cli_separator_cover_sidecar_fails_closed_in_proof_mode() {
         ),
         "expected fail-closed proof-mode reason, got {stderr}"
     );
-    assert!(
-        !proof_path.exists(),
-        "proof-mode fail-closed run must remove stale proof artifact at {}",
+    // The pre-existing file at the proof path was not created by this solve.
+    // Since 1f06a7e59 the hardened publication boundary never unlinks a
+    // foreign path on a non-UNSAT route -- it may be an unrelated hard-linked
+    // file (`cleanup_dimacs_non_unsat_proof_paths` removes only an OWNED
+    // generation), and 8a571f488 moved the group_cli twins of this assertion
+    // to byte-identical preservation. Pin that: the fail-closed run must
+    // neither delete the foreign file nor write a single proof byte over it.
+    assert_eq!(
+        std::fs::read(&proof_path).expect("the foreign pre-existing proof file must be preserved"),
+        b"stale proof",
+        "proof-mode fail-closed run must leave the foreign file at {} untouched",
         proof_path.display()
     );
 }

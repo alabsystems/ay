@@ -70,6 +70,7 @@ impl Executor {
             crate::executor::unsat_cert::probe_cert_reject(|| {
                 format!("assembly gate STOPPED before certification: {mechanism:?}")
             });
+            self.capture_interpolation_proof_without_assembly();
             self.install_uncertifiable_proof_poison(mechanism);
             return AssemblyGate::Stop;
         }

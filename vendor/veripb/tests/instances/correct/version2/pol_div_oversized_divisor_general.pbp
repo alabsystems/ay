@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 2.0
+* Version 2 spelling: normalized-form division reaches the same clamp at `A = i64::MIN`,
+* `d = 2^63`, where the true quotient is `-1` and the fallback stored `0`.
+f 1
+p 1 9223372036854775808 d
+e 1 x1 1 x2 >= -1 ; 2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

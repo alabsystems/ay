@@ -38,6 +38,8 @@ use crate::ematching::subst_vars;
 use crate::executor_types::{Result, SolveResult};
 use crate::logic_detection::LogicCategory;
 
+#[cfg(test)]
+mod entailment_trust_tests;
 mod false_instance;
 
 /// Maximum BV-MBQI refinement rounds.
@@ -66,9 +68,10 @@ const BV_EXHAUSTIVE_TOTAL_CAP: u64 = 1 << 16;
 /// but an ordinary bit-blasted query to refute.
 enum BvForallCheck {
     /// The ground premise conjoined with the skolemized negation has a sealed,
-    /// strict-proof UNSAT decision, so the premise entails the `forall` over
-    /// the binder's entire domain.
-    Holds,
+    /// checked UNSAT decision, so the premise entails the `forall` over the
+    /// binder's entire domain. The class is what that decision rests on:
+    /// `DischargedTrust` only where the rigor accepts it as grant authority.
+    Holds(crate::executor::unsat_cert::ProbeUnsatAuthority),
     /// Undecided; fail closed to the enumeration path.
     Unknown,
 }
@@ -86,6 +89,10 @@ pub(in crate::executor) struct CheckedBvFullDomainSatAuthority {
     source_context_stamp: ay_frontend::SourceContextStamp,
     roots: Box<[TermId]>,
     root_entries: Box<[Option<ay_core::term::TermEntryStamp>]>,
+    /// What the proof rests on: `DischargedTrust` when a symbolic entailment
+    /// it consumed was admitted only on that class. The grant carries it so
+    /// the publication gate records it, never as certified.
+    admission: crate::executor::unsat_cert::ProbeUnsatAuthority,
 }
 
 impl CheckedBvFullDomainSatAuthority {
@@ -99,7 +106,21 @@ impl CheckedBvFullDomainSatAuthority {
             source_context_stamp: executor.ctx.source_context_stamp(),
             roots: roots.into(),
             root_entries,
+            admission: crate::executor::unsat_cert::ProbeUnsatAuthority::Checked,
         })
+    }
+
+    /// The same authority, resting on `admission`.
+    fn resting_on(mut self, admission: crate::executor::unsat_cert::ProbeUnsatAuthority) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The class the proof behind this authority rests on.
+    pub(in crate::executor) const fn admission(
+        &self,
+    ) -> crate::executor::unsat_cert::ProbeUnsatAuthority {
+        self.admission
     }
 
     pub(in crate::executor) fn into_current_roots(
@@ -451,8 +472,11 @@ impl Executor {
     /// Prove one BV `forall` from the current ground consequence set.
     ///
     /// Skolemize the binders and check `G ∧ ¬body[skolems]`, where `G` is the
-    /// quantifier-free slice of the current assertions. A sealed strict-proof
-    /// UNSAT decision proves `G ⊨ forall binders. body`, over the full BV domain.
+    /// quantifier-free slice of the current assertions. A sealed checked UNSAT
+    /// decision ([`Self::checked_sat_authority_ground_solve`], which admits
+    /// `discharged-trust` only where the rigor accepts it as grant authority
+    /// and reports the class) proves `G ⊨ forall binders. body`, over the full
+    /// BV domain.
     ///
     /// SAT is intentionally non-authoritative here. The old implementation
     /// transported its nested model to extract a counterexample, but that model
@@ -505,20 +529,26 @@ impl Executor {
         }
         sub_assertions.push(neg);
 
-        // Only a strict, sealed UNSAT decision establishes the entailment. The
-        // former in-place solve also extracted a SAT counterexample model, but
-        // that model had no checked transport back into the enclosing query.
-        // A SAT/Unknown probe therefore falls through to sound enumeration.
-        if self
-            .checked_ground_solve(sub_assertions.clone(), fallback_category, 2_000)
-            .is_some_and(|decision| match decision {
-                CheckedGroundDecision::Unsat(checked) => checked.consume(self, &sub_assertions),
-                CheckedGroundDecision::Sat(_) => false,
-            })
-        {
-            BvForallCheck::Holds
-        } else {
-            BvForallCheck::Unknown
+        // Only a checked, sealed UNSAT decision establishes the entailment, and
+        // it installs the full-domain grant a published `sat` defers to, so it
+        // rests on `discharged-trust` only where the rigor accepts that class
+        // as grant authority, and the class travels with the grant. The former
+        // in-place solve also extracted a SAT counterexample model, but that
+        // model had no checked transport back into the enclosing query. A
+        // SAT/Unknown probe therefore falls through to sound enumeration.
+        match self.checked_sat_authority_ground_solve(
+            sub_assertions.clone(),
+            fallback_category,
+            2_000,
+        ) {
+            Some((CheckedGroundDecision::Unsat(checked), class)) => {
+                if checked.consume(self, &sub_assertions) {
+                    BvForallCheck::Holds(class)
+                } else {
+                    BvForallCheck::Unknown
+                }
+            }
+            _ => BvForallCheck::Unknown,
         }
     }
 
@@ -586,6 +616,9 @@ impl Executor {
             // opposed to enumeration, which is model-relative). Only an
             // all-entailed pass may emit Sat upstream.
             let mut all_entailed = true;
+            // Whether an entailment this pass consumed rests on
+            // `discharged-trust`: the proof's evidence then carries that class.
+            let mut entailed_on_trust = false;
 
             for &quant in bv_quantifiers {
                 let (vars, body) = match self.ctx.terms.get(quant) {
@@ -637,9 +670,11 @@ impl Executor {
 
                 if !enumerable && !model_less {
                     match self.bv_symbolic_entailment_check(&vars, body, category) {
-                        BvForallCheck::Holds => {
+                        BvForallCheck::Holds(class) => {
                             // Proven over the binders' entire domain — the same
                             // authority an exhaustive enumeration would carry.
+                            entailed_on_trust |= class
+                                == crate::executor::unsat_cert::ProbeUnsatAuthority::DischargedTrust;
                             continue;
                         }
                         BvForallCheck::Unknown => {
@@ -851,9 +886,15 @@ impl Executor {
                         authority_roots,
                         bv_quantifiers,
                     );
+                let admission = if entailed_on_trust {
+                    crate::executor::unsat_cert::ProbeUnsatAuthority::DischargedTrust
+                } else {
+                    crate::executor::unsat_cert::ProbeUnsatAuthority::Checked
+                };
                 let evidence = full_domain_proof
                     .then(|| CheckedBvFullDomainSatAuthority::for_current(self, authority_roots))
-                    .flatten();
+                    .flatten()
+                    .map(|evidence| evidence.resting_on(admission));
                 self.bv_quantifier_full_domain_proof = evidence.is_some();
                 self.bv_quantifier_full_domain_pending_evidence = evidence;
                 if all_satisfied && all_exhaustive && !model_less && full_domain_proof {
@@ -862,6 +903,22 @@ impl Executor {
                 break;
             }
 
+            // (#degrade277-narrow) MBQI counterexample instances are conjoined
+            // as TOP-LEVEL FACTS, and their source list
+            // (`unhandled_quantifiers`) deliberately INCLUDES universals
+            // `setup_cegqi_for_unhandled` refused as non-entailed
+            // (`should_process == false` still pushes a `forall` onto
+            // `unhandled_quantifier_list`). So this lane is NOT covered by the
+            // `entailed_forall_set` licence that every E-matching and
+            // enumerative conjoin passes through.
+            //
+            // Record the event rather than argue from call ordering: these
+            // instances outlive the `process_quantifiers` call that made them,
+            // so a later `classify_quantifier_result` could otherwise narrow
+            // `degrade@277` on a premise this push falsified. The marker makes
+            // that gate fall back to its unnarrowed behaviour for the rest of
+            // the query.
+            self.unlicensed_instance_conjoined = true;
             // Add counterexample instantiations and re-solve
             for inst in &new_instantiations {
                 self.ctx.assertions.push(*inst);

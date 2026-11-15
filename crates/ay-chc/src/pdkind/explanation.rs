@@ -8,7 +8,7 @@
 //! generalization via MBP.
 
 use super::reachability::ReachabilityChecker;
-use crate::engine_utils::check_sat_with_timeout;
+use crate::engine_utils::search_check_sat_with_timeout;
 use crate::mbp::Mbp;
 use crate::smt::{SmtResult, SmtValue};
 use crate::{ChcExpr, ChcSort, ChcVar};
@@ -46,7 +46,7 @@ impl ReachabilityChecker {
         // Phase 1: Confirm UNSAT via assumption-based SAT and get B-side core.
         let result = self
             .smt
-            .check_sat_with_assumption_conjuncts(a_constraints, b_constraints);
+            .check_sat_with_assumption_conjuncts_search(a_constraints, b_constraints);
 
         let b_core: Vec<ChcExpr> = match result {
             SmtResult::Sat(_) | SmtResult::Unknown => return None,
@@ -98,8 +98,11 @@ impl ReachabilityChecker {
             };
 
             let query = ChcExpr::and(a_conj.clone(), b_without_i);
+            // Search check (#horn-smt-session Rung 4): drop-literal
+            // generalization; an over-general explanation can only cost the
+            // solve (every Safe is re-validated on pinned checks).
             let check = if let Some(timeout) = self.smt_timeout {
-                check_sat_with_timeout(&query, timeout)
+                search_check_sat_with_timeout(&query, timeout)
             } else {
                 self.smt.check_sat(&query)
             };

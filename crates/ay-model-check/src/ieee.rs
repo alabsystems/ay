@@ -66,7 +66,7 @@ pub struct FpFields {
     /// Biased exponent field.
     pub exponent: u64,
     /// Stored fraction, without the hidden bit.
-    pub significand: u64,
+    pub significand: u128,
 }
 
 /// `2^e` exactly, or `None` when the shift would be absurd.
@@ -201,9 +201,9 @@ impl IsEven for BigInt {
 /// `CannotConfirm` instead.
 #[must_use]
 pub fn round_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -> Option<FpFields> {
-    // The fields are returned in a `u64` each, and `1 << (eb - 1)` must not
-    // wrap; every SMT-LIB format in practice is far inside this.
-    if !(2..=32).contains(&eb) || !(2..=64).contains(&sb) {
+    // The exponent arithmetic retains its separate bound; every stored
+    // fraction bit is supported without a native-word-width shift.
+    if !((2..=32).contains(&eb) && (2..=129).contains(&sb)) {
         return None;
     }
     let negative = value.is_negative();
@@ -245,7 +245,7 @@ pub fn round_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -
         return Some(FpFields {
             sign: negative,
             exponent: 0,
-            significand: u64::try_from(rounded).ok()?,
+            significand: u128::try_from(rounded).ok()?,
         });
     }
 
@@ -277,7 +277,7 @@ pub fn round_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -
     Some(FpFields {
         sign: negative,
         exponent: u64::try_from(exponent + bias).ok()?,
-        significand: u64::try_from(rounded - hidden).ok()?,
+        significand: u128::try_from(rounded - hidden).ok()?,
     })
 }
 
@@ -295,7 +295,7 @@ pub fn round_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -
 /// `4*n*d*2^j  vs  ((2m+1)*d)^2`.
 #[must_use]
 pub fn sqrt_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -> Option<FpFields> {
-    if !(2..=32).contains(&eb) || !(2..=64).contains(&sb) || !value.is_positive() {
+    if (!((2..=32).contains(&eb) && (2..=129).contains(&sb))) || !value.is_positive() {
         return None;
     }
     let bias = (1i64 << (eb - 1)) - 1;
@@ -371,13 +371,13 @@ pub fn sqrt_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) ->
         return Some(FpFields {
             sign: false,
             exponent: 0,
-            significand: u64::try_from(rounded).ok()?,
+            significand: u128::try_from(rounded).ok()?,
         });
     }
     Some(FpFields {
         sign: false,
         exponent: u64::try_from(exponent + bias).ok()?,
-        significand: u64::try_from(rounded - hidden).ok()?,
+        significand: u128::try_from(rounded - hidden).ok()?,
     })
 }
 
@@ -394,7 +394,7 @@ fn overflow(negative: bool, rm: RoundingMode, sb: u32, max_field: u64) -> FpFiel
         FpFields {
             sign: negative,
             exponent: max_field - 1,
-            significand: (1u64 << (sb - 1)) - 1,
+            significand: u128::MAX >> (129 - sb),
         }
     } else {
         FpFields {

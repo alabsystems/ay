@@ -10,7 +10,7 @@
 #   * A JDK 22+ (java.lang.foreign is stable). This repo uses openjdk 26.
 #     A JDK is installed but may not be on PATH; this script prepends the
 #     Homebrew openjdk location if present.
-#   * libay_ffi built:  cargo build -p ay-ffi   (debug) producing
+#   * libay_ffi built:  targo --unverified build -p ay-ffi (stock Rust: cargo build -p ay-ffi)   (debug) producing
 #     target/{debug,release}/libay_ffi.{dylib,so}.
 #
 # Usage:  bash bindings/java/run.sh [--release]
@@ -38,7 +38,7 @@ if ! command -v javac >/dev/null 2>&1; then
   exit 2
 fi
 if [[ ! -e "$LIBDIR/$LIBNAME" ]]; then
-  echo "ERROR: $LIBNAME not found in $LIBDIR. Run: cargo build -p ay-ffi" >&2
+  echo "ERROR: $LIBNAME not found in $LIBDIR. Run: targo --unverified build -p ay-ffi (Trust toolchain) or cargo build -p ay-ffi" >&2
   exit 2
 fi
 

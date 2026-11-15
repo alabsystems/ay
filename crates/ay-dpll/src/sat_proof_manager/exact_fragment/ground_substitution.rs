@@ -12,6 +12,8 @@ use crate::sat_proof_manager::{
     ExactOriginalProofError, FragmentInstanceDerivation, SatProofManager,
 };
 
+mod image;
+
 const MAX_BRIDGE_DERIVATIONS: usize = 32;
 
 struct GroundSubstitutionState<'a> {
@@ -96,7 +98,7 @@ impl SatProofManager<'_> {
             let TermData::App(symbol, args) = self.terms.get(candidate) else {
                 continue;
             };
-            if symbol.name() != "=" || args.len() != 2 {
+            if !matches!(symbol, ay_core::Symbol::Named(name) if name == "=") || args.len() != 2 {
                 continue;
             }
             let (key, value) = (args[0], args[1]);
@@ -147,7 +149,7 @@ impl SatProofManager<'_> {
         let Some(pairs) = self.ground_equality_pairs(&used) else {
             return Ok(GroundSubstitutionAttempt::Continue);
         };
-        if !ay_proof::ground_substitution_image_matches(self.terms, instance, state.unit, &pairs) {
+        let Some(image) = self.ground_image_plan(instance, &pairs, state)? else {
             if ay_core::misc_cli_flags().probe_cert_reject {
                 ay_core::safe_eprintln!(
                     "--probe-cert-reject: gs-bridge DECLINED (image mismatch) pairs={}",
@@ -155,7 +157,7 @@ impl SatProofManager<'_> {
                 );
             }
             return Ok(GroundSubstitutionAttempt::Continue);
-        }
+        };
         let (work, bytes) = Self::unit_chain_charge(used.len() + 3, 2 * used.len() + 4)?;
         (state.progress)(work, bytes)?;
         let mut lemma: Vec<TermId> = used
@@ -163,7 +165,7 @@ impl SatProofManager<'_> {
             .map(|&(equality, _)| self.terms.mk_not_raw(equality))
             .collect();
         lemma.push(self.terms.mk_not_raw(instance));
-        lemma.push(state.unit);
+        lemma.push(image.term);
         debug_assert!(ay_proof::recognize_ground_equality_substitution(
             self.terms, &lemma
         ));
@@ -195,9 +197,11 @@ impl SatProofManager<'_> {
         current = state
             .proof
             .add_resolution(residual.clone(), instance, current, instance_unit);
-        if residual != [state.unit] {
+        if residual != [image.term] {
             return Ok(GroundSubstitutionAttempt::Abort);
         }
+        let current =
+            image.emit_projection(self.terms, state.proof, current, state.unit, state.progress)?;
         self.reconcile_term_store_growth(
             state.term_store_baseline,
             state.charged_term_store_growth,
@@ -240,8 +244,7 @@ impl SatProofManager<'_> {
             let Some(pairs) = self.ground_equality_pairs(&used) else {
                 continue;
             };
-            if !ay_proof::ground_substitution_image_matches(self.terms, source, state.unit, &pairs)
-            {
+            let Some(image) = self.ground_image_plan(source, &pairs, state)? else {
                 if ay_core::misc_cli_flags().probe_cert_reject {
                     ay_core::safe_eprintln!(
                         "--probe-cert-reject: gs-bridge authored-source DECLINED pairs={} source={} UNIT={}",
@@ -251,7 +254,7 @@ impl SatProofManager<'_> {
                     );
                 }
                 continue;
-            }
+            };
             let (work, bytes) = Self::unit_chain_charge(used.len() + 3, 2 * used.len() + 4)?;
             (state.progress)(work, bytes)?;
             let source_assume = state.proof.add_assume(source, None);
@@ -260,7 +263,7 @@ impl SatProofManager<'_> {
                 .map(|&(equality, _)| self.terms.mk_not_raw(equality))
                 .collect();
             lemma.push(self.terms.mk_not_raw(source));
-            lemma.push(state.unit);
+            lemma.push(image.term);
             debug_assert!(ay_proof::recognize_ground_equality_substitution(
                 self.terms, &lemma
             ));
@@ -286,9 +289,16 @@ impl SatProofManager<'_> {
             current = state
                 .proof
                 .add_resolution(residual.clone(), source, current, source_assume);
-            if residual != [state.unit] {
+            if residual != [image.term] {
                 return Ok(None);
             }
+            let current = image.emit_projection(
+                self.terms,
+                state.proof,
+                current,
+                state.unit,
+                state.progress,
+            )?;
             self.reconcile_term_store_growth(
                 state.term_store_baseline,
                 state.charged_term_store_growth,

@@ -32,6 +32,10 @@ set -o nounset
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd -P)"
+# Cargo-family commands run through scripts/lib/cargo_frontend.sh: `targo`
+# (unverified lane) on a host with the Trust toolchain, plain `cargo` on a
+# public clone without it.
+. "$REPO_ROOT/scripts/lib/cargo_frontend.sh"
 AY_BIN="${AY_BIN:-$REPO_ROOT/target/release/ay}"
 LEAN_PROJECT="$REPO_ROOT/verification/lean"
 
@@ -48,7 +52,7 @@ fi
 
 if [[ ! -x "$AY_BIN" ]]; then
   echo "firewall-selfcert-check: building ay (release) ..." >&2
-  ( cd "$REPO_ROOT" && cargo build --release --bin ay --features cli ) || exit 1
+  ( cd "$REPO_ROOT" && ay_cargo build --release --bin ay --features cli ) || exit 1
 fi
 
 if ! ( cd "$LEAN_PROJECT" && "$LAKE" build +AySoundness.Firewall ); then

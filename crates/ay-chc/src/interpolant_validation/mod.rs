@@ -80,15 +80,71 @@ where
 
     // 1-inductive: UNSAT(inv@0 ∧ T@0 ∧ ¬inv@1)
     let inv_t1 = TransitionSystem::version_expr(inv, ts.state_vars(), 1);
-    let ind_check = ChcExpr::and(
-        ChcExpr::and(inv.clone(), ts.transition_at(0)),
-        ChcExpr::not(inv_t1),
-    );
+    let not_inv_t1 = ChcExpr::not(inv_t1);
+    let transition = ts.transition_at(0);
+    // A disjunctive invariant (IMC's reached set: init ∨ I1 ∨ …, each image
+    // pinning its own constants) is checked one disjunct at a time: each
+    // query then carries top-level units that the Search lane's equality
+    // solving propagates through T, where the monolithic query hides them
+    // under the disjunction. Every disjunct refuted ⇔ the whole query
+    // refuted; any undecided disjunct falls back to the monolithic query.
+    if let Some((disjuncts, rest)) = split_disjunctive(inv) {
+        let mut all_refuted = true;
+        for d in disjuncts {
+            let mut parts = vec![d, transition.clone(), not_inv_t1.clone()];
+            parts.extend(rest.iter().cloned());
+            let result = check_sat(&ChcExpr::and_all(parts));
+            if result.is_sat() {
+                return Some("inductiveness");
+            }
+            if !is_unsat_result(&result) {
+                all_refuted = false;
+                break;
+            }
+        }
+        if all_refuted {
+            return None;
+        }
+    }
+    let ind_check = ChcExpr::and(ChcExpr::and(inv.clone(), transition), not_inv_t1);
     if !is_unsat_result(&check_sat(&ind_check)) {
         return Some("inductiveness");
     }
 
     None
+}
+
+/// `(disjuncts, rest)` when `inv` is `D_1 ∨ … ∨ D_n` (nested `or`s flattened,
+/// `n ≥ 2`), or `(D_1 ∨ … ∨ D_n) ∧ rest…`.
+fn split_disjunctive(inv: &ChcExpr) -> Option<(Vec<ChcExpr>, Vec<ChcExpr>)> {
+    fn flatten_or(e: &ChcExpr, out: &mut Vec<ChcExpr>) {
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            match e {
+                ChcExpr::Op(ChcOp::Or, args) => stack.extend(args.iter().rev().map(|a| a.as_ref())),
+                other => out.push(other.clone()),
+            }
+        }
+    }
+    let (disjunction, rest): (&ChcExpr, Vec<ChcExpr>) = match inv {
+        ChcExpr::Op(ChcOp::Or, _) => (inv, Vec::new()),
+        ChcExpr::Op(ChcOp::And, args) => {
+            let pos = args
+                .iter()
+                .position(|a| matches!(a.as_ref(), ChcExpr::Op(ChcOp::Or, _)))?;
+            let rest = args
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != pos)
+                .map(|(_, a)| a.as_ref().clone())
+                .collect();
+            (args[pos].as_ref(), rest)
+        }
+        _ => return None,
+    };
+    let mut disjuncts = Vec::new();
+    flatten_or(disjunction, &mut disjuncts);
+    (disjuncts.len() >= 2).then_some((disjuncts, rest))
 }
 
 /// Flatten conjuncts for interpolation, expanding numeric equalities.

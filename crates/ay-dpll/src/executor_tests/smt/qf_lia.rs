@@ -495,4 +495,31 @@ fn test_nia_memory_guard_fails_closed_to_unknown() {
     );
 }
 
+/// A CHC portfolio lane that outgrew its memory share (`ay_sys::MemoryGroup`
+/// soft trip) has only its own cancellation token cancelled, which no
+/// executor interrupt handle observes; the executor polls the trip itself
+/// (theory loop, SAT stop closure, preflight) and answers `unknown` for the
+/// rest of that lane, never a verdict.
+#[test]
+fn executor_on_a_soft_tripped_memory_lane_answers_unknown() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let script = "(set-logic QF_LIA)(declare-const x Int)(declare-const y Int)\
+                  (assert (= (+ x y) 12))(assert (> x 1))(assert (> y 1))\
+                  (assert (< x y))(check-sat)";
+    assert_eq!(solve_one(script), "sat");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let group = ay_sys::MemoryGroup::new(1, 1 << 40, Arc::clone(&cancel));
+    let scope = ay_sys::enter_memory_group(Arc::clone(&group));
+    ay_sys::charge_current_for_testing(2);
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    let on_tripped_lane = solve_one(script);
+    drop(scope);
+    assert_eq!(
+        on_tripped_lane, "unknown",
+        "an over-share lane's check must stop, not run to a verdict"
+    );
+    assert_eq!(solve_one(script), "sat", "the trip is scoped to the lane");
+}
+
 // QF_UFLIA (Uninterpreted Functions with Linear Integer Arithmetic) Tests

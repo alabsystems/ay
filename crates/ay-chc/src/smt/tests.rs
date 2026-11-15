@@ -1569,7 +1569,7 @@ fn test_datatype_pair_selector_via_executor_7016() {
     // Build Pair(Int, Int) datatype sort with full constructor/selector metadata.
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk".to_string(),
             selectors: vec![
                 ChcDtSelector {

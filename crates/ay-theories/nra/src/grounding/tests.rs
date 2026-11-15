@@ -77,12 +77,14 @@ fn candidate_covers_are_unique_nonempty_and_valid() {
     let monomials = vec![monomial(&[1, 10]), monomial(&[2, 10])];
     let covers = grounding_covers(&monomials);
     assert!(!covers.is_empty());
-    for (position, cover) in covers.iter().enumerate() {
+    let mut remaining = covers.as_slice();
+    while let Some((cover, later)) = remaining.split_first() {
         assert!(!cover.is_empty());
         assert!(monomials
             .iter()
             .all(|item| free_factor_count(item, cover) <= 1));
-        assert!(!covers[position + 1..].contains(cover));
+        assert!(!later.contains(cover));
+        remaining = later;
     }
 }
 
@@ -412,8 +414,12 @@ fn model_guided_grounding_turns_bilinear_template_system_sat() {
     let normalize = terms.mk_eq(multiplier_sum, one);
     let mut template_atoms = Vec::new();
     for shift in 0..7 {
-        let products: Vec<TermId> = (0..7)
-            .map(|index| terms.mk_mul(vec![multipliers[index], templates[(index + shift) % 7]]))
+        // Pair multiplier `index` with template `(index + shift) % 7`.
+        let rotated = templates.iter().cycle().skip(shift);
+        let products: Vec<TermId> = multipliers
+            .iter()
+            .zip(rotated)
+            .map(|(&multiplier, &template)| terms.mk_mul(vec![multiplier, template]))
             .collect();
         let sum = terms.mk_add(products);
         let target = terms.mk_rational(BigRational::from_integer(BigInt::from((shift + 1) as i64)));

@@ -27,16 +27,15 @@
 //!   the same single-buffer contract.
 //!
 //! DIVERGENCE (documented, verdict-irrelevant): of z3's module registries
-//! (hundreds of `smt.*`/`sat.*`/... entries) AY carries only the `pp` module
-//! (18 params, measured via `z3 -pm:pp`). A set/get on a real z3 module AY
+//! (hundreds of `smt.*`/`sat.*`/... entries) AY carries the `pp` module
+//! and the implemented 5.3.3 `rewriter.max_power_expansion` option. A set/get on a real z3 module AY
 //! does not know (e.g. `smt.arith.solver`) is refused/`false` where z3 would
 //! store/answer. Replicating those registries wholesale would be a drift
 //! liability for zero soundness gain.
 //!
-//! HONESTY: this is a readable STORE — exactly what the get/set API
-//! contracts. AY's solving honors none of these process-global keys (all AY
-//! configuration is per-context); no behavior is faked, and the store is never
-//! consulted by any solve path, so it cannot affect a verdict by construction.
+//! Most entries remain readable configuration DATA. The encoding check and
+//! simplify tactic's sequence-power rewriting consume their actual settings;
+//! none of these settings supplies a resource grant or changes word semantics.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -140,7 +139,191 @@ fn registry_entry(norm_key: &str) -> Option<(&'static str, ParamKind)> {
             .iter()
             .find(|(k, _, _)| *k == param)
             .map(|(_, d, t)| (*d, *t)),
+        Some(("rewriter", "max_power_expansion")) => Some(("2", ParamKind::UInt)),
+        Some(("rewriter", "som" | "expand_power" | "mul_to_power" | "sort_sums")) => {
+            Some(("false", ParamKind::Bool))
+        }
+        Some(("rewriter", "flat" | "push_to_real")) => Some(("true", ParamKind::Bool)),
+        Some(("rewriter", "som_blowup")) => Some(("10", ParamKind::UInt)),
+        Some(("rewriter", "max_degree")) => Some(("64", ParamKind::UInt)),
         Some(_) => None,
+    }
+}
+
+pub(crate) fn polynomial_parameters(
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<ay_dpll::api::PolynomialParameters, &'static str> {
+    let mut result = ay_dpll::api::PolynomialParameters::default();
+    for key in [
+        "rewriter.som",
+        "rewriter.som_blowup",
+        "rewriter.flat",
+        "rewriter.expand_power",
+        "rewriter.mul_to_power",
+        "rewriter.max_degree",
+        "rewriter.sort_sums",
+        "rewriter.push_to_real",
+    ] {
+        owner
+            .admit(key.len(), 0)
+            .map_err(|_| "polynomial parameter owner stopped")?;
+        let bytes = {
+            let values = STORE
+                .lock()
+                .map_err(|_| "global parameter store unavailable")?;
+            values
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .map_or(0, String::len)
+        };
+        owner
+            .admit(
+                bytes
+                    .checked_add(key.len())
+                    .ok_or("parameter work overflow")?,
+                0,
+            )
+            .map_err(|_| "polynomial parameter owner stopped")?;
+        let value = {
+            let values = STORE
+                .lock()
+                .map_err(|_| "global parameter store unavailable")?;
+            match values.as_ref().and_then(|v| v.get(key)) {
+                Some(value) if value.len() <= bytes => {
+                    let (_, kind) = registry_entry(key).ok_or("parameter registry missing")?;
+                    Some(match kind {
+                        ParamKind::Bool => ay_dpll::api::TacticParameterValue::Bool(
+                            value.parse().map_err(|_| "invalid Boolean parameter")?,
+                        ),
+                        ParamKind::UInt => ay_dpll::api::TacticParameterValue::UInt(
+                            value.parse().map_err(|_| "invalid unsigned parameter")?,
+                        ),
+                        ParamKind::Str => return Err("invalid polynomial registry type"),
+                    })
+                }
+                Some(_) => return Err("global parameter changed during admission"),
+                None => None,
+            }
+        };
+        owner
+            .check()
+            .map_err(|_| "polynomial parameter owner stopped")?;
+        if let Some(value) = value {
+            result
+                .set(key.trim_start_matches("rewriter."), value)
+                .map_err(|_| "invalid polynomial parameter")?;
+        }
+    }
+    Ok(result)
+}
+
+/// A configuration choice, not an admission grant. The actual sequence
+/// rewriter retains its original operation's work/storage/deadline owner.
+pub(crate) fn sequence_power_expansion(
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<u32, &'static str> {
+    sequence_power_from(&STORE, owner)
+}
+
+fn sequence_power_from(
+    store: &Mutex<Option<HashMap<String, String>>>,
+    owner: &dyn ay_core::term::TermConstructionAdmission,
+) -> Result<u32, &'static str> {
+    const KEY: &str = "rewriter.max_power_expansion";
+    const STOPPED: &str = "original global parameter read refused";
+    owner.admit(KEY.len(), 0).map_err(|_| STOPPED)?;
+    let bytes = {
+        let values = store
+            .lock()
+            .map_err(|_| "global parameter store unavailable")?;
+        values
+            .as_ref()
+            .and_then(|v| v.get(KEY))
+            .map_or(0, String::len)
+    };
+    // A valid UInt can retain arbitrarily many leading zeros. Debit the real
+    // borrowed bytes, not a scalar-width guess. No mutex spans this callback.
+    owner
+        .admit(bytes.checked_add(KEY.len()).ok_or(STOPPED)?, 0)
+        .map_err(|_| STOPPED)?;
+    let result = {
+        let values = store
+            .lock()
+            .map_err(|_| "global parameter store unavailable")?;
+        match values.as_ref().and_then(|v| v.get(KEY)) {
+            Some(value) if value.len() <= bytes => value
+                .parse()
+                .map_err(|_| "invalid sequence expansion parameter"),
+            Some(_) => Err("global parameter changed during admission"),
+            None => Ok(2),
+        }
+    };
+    owner.check().map_err(|_| STOPPED)?;
+    result
+}
+
+#[cfg(test)]
+mod sequence_power_read_tests {
+    use super::*;
+    use ay_core::original_query::{CountedAdmission, CountedAdmissionError, FiniteAdmissionGrant};
+    use ay_core::term::TermConstructionAdmission;
+    use std::{cell::Cell, sync::Arc};
+
+    fn data(value: String) -> Mutex<Option<HashMap<String, String>>> {
+        Mutex::new(Some(HashMap::from([(
+            "rewriter.max_power_expansion".into(),
+            value,
+        )])))
+    }
+
+    #[test]
+    fn sequence_power_global_read_prices_actual_bytes_cumulatively() {
+        let store = data(format!("{}4", "0".repeat(4096)));
+        let owner = CountedAdmission::new(
+            FiniteAdmissionGrant::new(6000, 4096),
+            None,
+            Arc::new(|| false),
+        )
+        .unwrap();
+        assert_eq!(sequence_power_from(&store, &owner), Ok(4));
+        assert!(sequence_power_from(&store, &owner).is_err());
+        assert_eq!(owner.check(), Err(CountedAdmissionError::WorkExhausted));
+        assert!(sequence_power_from(&store, &owner).is_err());
+    }
+
+    #[test]
+    fn sequence_power_global_read_allows_callback_reentry_but_not_unpaid_growth() {
+        struct Reenter<'a> {
+            store: &'a Mutex<Option<HashMap<String, String>>>,
+            calls: Cell<usize>,
+        }
+        impl TermConstructionAdmission for Reenter<'_> {
+            fn admit(&self, _: usize, _: usize) -> Result<(), CountedAdmissionError> {
+                let n = self.calls.get() + 1;
+                self.calls.set(n);
+                if n == 2 {
+                    self.store
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .insert("rewriter.max_power_expansion".into(), "00004".into());
+                }
+                Ok(())
+            }
+            fn refuse(&self, e: CountedAdmissionError) -> CountedAdmissionError {
+                e
+            }
+        }
+        let store = data("4".into());
+        let owner = Reenter {
+            store: &store,
+            calls: Cell::new(0),
+        };
+        assert_eq!(
+            sequence_power_from(&store, &owner),
+            Err("global parameter changed during admission")
+        );
     }
 }
 
@@ -154,13 +337,41 @@ fn value_ok(kind: ParamKind, value: &str) -> bool {
     }
 }
 
+/// Whether z3's `encoding` global is its default `unicode`.
+///
+/// `encoding` is the one stored parameter that changes z3's SEMANTICS: under
+/// `bmp` or `ascii` z3's character alphabet ends at 0xFFFF or 255, which
+/// changes `Z3_mk_string`'s escape decoding, `str.from_code`, `str.to_code`
+/// and every character bound. AY implements the unicode alphabet only, so
+/// under any other value the string builders refuse instead of answering
+/// with unicode semantics (see `ffi_guard_mk`).
+pub(crate) fn string_encoding_is_unicode() -> bool {
+    let store = match STORE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    encoding_is_unicode(
+        store
+            .as_ref()
+            .and_then(|map| map.get("encoding"))
+            .map(String::as_str),
+    )
+}
+
+/// Whether a stored `encoding` value (`None`: never set) is `unicode`.
+pub(crate) fn encoding_is_unicode(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value == "unicode")
+}
+
 /// Set a process-global configuration parameter (Z3's `Z3_global_param_set`).
 ///
 /// Stores the value for later `Z3_global_param_get` readback iff the key is in
 /// the registry and the value parses at the registered type; otherwise it is
 /// refused silently (z3 refuses too, with a stderr warning AY does not print —
 /// see the module doc for the full measured contract). Store-only: AY's
-/// solving never consults this store, so it can never affect a verdict.
+/// solving never consults this store, so it can never affect a verdict; the
+/// one semantic parameter, `encoding`, makes the string builders refuse when
+/// it is not `unicode` ([`string_encoding_is_unicode`]).
 ///
 /// # Safety
 /// `param_id` and `param_value` may be null (refused) or must point to valid

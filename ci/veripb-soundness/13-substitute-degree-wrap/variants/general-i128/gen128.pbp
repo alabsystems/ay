@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% The same defect one width up. `i128::MIN` does not fit `i64`, so the row is stored as
+% `GeneralPBConstraint<i128>` and the wrap simply moves to that type's boundary. This is why the
+% fix is checked arithmetic plus escalation and not a wider integer type: widening moves the
+% threshold, it does not close the hole.
+f 2;
+rup 1 x2 >= -170141183460469231731687303715884105728 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

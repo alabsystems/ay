@@ -40,6 +40,17 @@ pub struct EmitCtx<'a> {
     /// a name that neither IS nor EXTENDS `dual` -- so it can never stand in
     /// for, or be grepped as, the dual half it does not prove.
     pub root_dual_bound_certificate: Option<&'a OptimalityCertificate>,
+    /// The SAME artifact in its streamed wire form: the `opttree` block BODY,
+    /// produced leaf-by-leaf without the tree ever being held.
+    ///
+    /// Two fields rather than one because they are two ways to HOLD the same
+    /// evidence, not two kinds of evidence: a producer that can afford the
+    /// object graph passes the certificate, and one that cannot passes the
+    /// body. Emission prefers this one when both are present. See
+    /// [`crate::opt_cert::stream_optimality_tree`] for why the distinction
+    /// exists at all — it is the difference between a certificate and a
+    /// SIGKILL on the trees this feature most wants to cover.
+    pub milp_optimality_tree_block: Option<&'a str>,
     /// Model-bound exact optimum of a recognized single-machine scheduling model.
     pub single_machine_scheduling_optimality_certificate:
         Option<&'a SingleMachineSchedulingOptimalityCertificate>,

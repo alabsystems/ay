@@ -1906,3 +1906,59 @@ fn membership_accepts_literal_between_allchar_stars() {
         Some(true)
     );
 }
+
+// ── Surrogate code points are characters, ordered by code point (D8) ─────
+//
+// A surrogate is stored in its carrier `char` (`ay_core::smtlib_char`), which
+// `char` order places above `U+2FFFF`. The two `re.range` sites below read the
+// endpoints by code point; reverting either to `char` order was a site no test
+// caught (2026-09-23 fp-strings verifier, mutants M28 and M13).
+
+/// The one-character string of the SMT-LIB character with code point `code`.
+fn cp(code: u32) -> String {
+    ay_core::smtlib_char(code)
+        .expect("in the SMT-LIB alphabet")
+        .to_string()
+}
+
+/// A `re.range` straddling the surrogate block accepts exactly length 1
+/// (mutant M28: under `char` order its length set read as EMPTY, a wrong
+/// `unsat` on the verifier's `wd8_11`, `wd8_16`, `fd8_0012` and `fd8_0342`).
+#[test]
+fn accepted_lengths_range_spanning_the_surrogates_is_one() {
+    let mut terms = TermStore::new();
+    let spans = mk_re_range(&mut terms, &cp(0xD800), "\u{e000}");
+    assert_eq!(
+        RegExpSolver::accepted_lengths(&terms, spans),
+        Some(lenset(&[1]))
+    );
+    // Reversed BY CODE POINT, hence empty, although the carrier of `U+DFFF`
+    // sorts above `U+E000` as a `char`.
+    let reversed = mk_re_range(&mut terms, "\u{e000}", &cp(0xDFFF));
+    assert_eq!(
+        RegExpSolver::accepted_lengths(&terms, reversed),
+        Some(BTreeSet::new())
+    );
+}
+
+/// The exact ground evaluator reads the SUBJECT character by code point too
+/// (mutant M13: a surrogate subject compared by its carrier's scalar value
+/// fell outside every range that holds it).
+#[test]
+fn ground_range_membership_of_a_surrogate_is_by_code_point() {
+    let mut terms = TermStore::new();
+    let block = mk_re_range(&mut terms, "\u{d7ff}", "\u{e000}");
+    for member in [cp(0xD7FF), cp(0xD800), cp(0xDBFF), cp(0xDFFF), cp(0xE000)] {
+        assert_eq!(
+            RegExpSolver::evaluate_fallback(&terms, &member, block),
+            Some(true),
+            "{member:?} lies in [U+D7FF, U+E000]"
+        );
+    }
+    let low = mk_re_range(&mut terms, "a", "\u{d7ff}");
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, &cp(0xD800), low),
+        Some(false),
+        "U+D800 lies above [a, U+D7FF]"
+    );
+}

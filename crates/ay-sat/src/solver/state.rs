@@ -69,6 +69,11 @@ pub struct Solver {
     /// FREQUENCY score. See `solver/reduction_two_stage.rs` for the whole
     /// policy and for the exact list of semantic differences.
     pub(super) two_stage_clause_management: bool,
+    /// `--sat-two-stage-warm-scores-kissat`: the two-stage scores are kept
+    /// from conflict 1, as kissat-eda keeps its clause stamps (clause.c,
+    /// proplit.h, search.c), so the policy starts from real scores when the
+    /// stable lock switches it on; `used` and the glue tiers are untouched.
+    pub(super) two_stage_warm: bool,
     /// Whether ghost literal guards are needed in conflict analysis (#8466, #8489).
     /// Ghost literals are unassigned variables with stale var_data.level values.
     ///
@@ -271,6 +276,13 @@ pub struct Solver {
     /// batch completes. This reduces bulk-deletion cost from
     /// O(deleted × num_vars) to O(stale_count).
     pub(super) defer_stale_reason_cleanup: bool,
+    /// Level-0 GC deletes satisfied binaries in bulk: while set, deleting a
+    /// binary marks its two watch lists dirty instead of unlinking it with a
+    /// linear `remove_watch` scan per list, and the GC flushes the dirty lists
+    /// once before it propagates. Eager unlinking was quadratic: 23.1M
+    /// root-satisfied binaries over watch lists averaging 2,200 entries cost
+    /// 120-150 s on 2c458ef3 (about 7e10 entry visits).
+    pub(super) defer_binary_unlink: bool,
     /// When true, `delete_clause_observed` buffers proof deletion emissions
     /// (both forward checker and proof manager) instead of emitting them
     /// immediately. Used during BVE to ensure all resolvent additions appear

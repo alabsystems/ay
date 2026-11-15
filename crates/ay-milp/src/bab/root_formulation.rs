@@ -44,6 +44,8 @@ pub(super) struct RootFormulationRequest<'a> {
 /// Formulation and structural advice derived before constructing the LP state.
 pub(super) struct RootFormulation {
     pub(super) model: Model,
+    /// Exactly the final root-cut rows adopted after the pre-cut formulation.
+    pub(super) root_cut_rows: std::ops::Range<usize>,
     pub(super) mode: SearchMode,
     pub(super) market: MarketProfile,
     /// Nonzero worker count is also the proof-first route's authority token.
@@ -181,11 +183,19 @@ pub(super) fn prepare_root_formulation(
         } else {
             RootCutPolicy::Separate
         };
+    let first_cut_row = tightened.num_rows();
     let model = apply_root_cuts(tightened, opts, mode, root_cut_policy);
+    let root_cut_rows = if super::shadow_arm().is_some() {
+        // Diagnostic information-free replacement rows are not adopted cuts.
+        first_cut_row..first_cut_row
+    } else {
+        first_cut_row..model.num_rows()
+    };
     record_root_preparation(attribution_started, work_started, cuts_started, mode);
 
     Ok(RootFormulation {
         model,
+        root_cut_rows,
         mode,
         market,
         proof_first_workers,

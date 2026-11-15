@@ -8,13 +8,40 @@ use crate::{
     ChcDtConstructor, ChcError, ChcExpr, ChcProblem, ChcResult, ChcSort, ChcVar, ClauseHead,
 };
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
+use std::sync::Arc;
+
+#[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
+mod sort_scan_tests;
+mod variable_sorts;
 
 pub(super) const MAX_DT_DECLARATIONS: usize = 256;
 pub(super) const MAX_DT_CONSTRUCTORS: usize = 4_096;
 pub(super) const MAX_DT_SELECTORS: usize = 16_384;
 const MAX_DT_SORT_NODES: usize = 32_768;
+/// Distinct expression nodes (pointer identity) one executor query may carry.
+///
+/// Workstream D bridge item D-1 (CHC-COMP 2026, `DESIGN_lra_interp_tpa.md`
+/// §4.1): the admission walks below are pointer-memoised, so this caps UNIQUE
+/// nodes. It used to cap the TREE expansion, which refused every IMC k-query
+/// of the wide `oral_messages` systems at k = 1 (a 168 k–280 k-node let tree
+/// that is a small DAG) although the executor decides it in ~23 ms.
 pub(super) const MAX_DT_EXPR_NODES: usize = 131_072;
-const MAX_DT_NESTING_DEPTH: usize = 512;
+pub(super) const MAX_DT_NESTING_DEPTH: usize = 512;
+/// Tree expansion (occurrences, sharing unfolded) of an admitted executor
+/// query.
+///
+/// The executor's script printers other than the Search-lane DAG printer
+/// (`InvariantModel::expr_to_smtlib` on the Verification lane, in the
+/// DAG-printer fallback, and in the PDR/persistent/ADT executor backends)
+/// follow the tree, not the DAG. This separate cap keeps them bounded. It is
+/// enforced by the single-query executor admission
+/// ([`collect_dt_declarations_for_expr_sized`] and its wrapper) only: the
+/// multi-root walk behind problem validation and the UF surface
+/// ([`collect_dt_declarations_for_exprs`]) prints nothing and stays
+/// DAG-linear end to end (WP-F, `problem_validate_is_linear_on_shared_constraints`).
+pub(super) const MAX_EXECUTOR_TREE_NODES: usize = 4_194_304;
 const MAX_DT_NAME_BYTES: usize = 1024 * 1024;
 const MAX_DT_DEFINITION_COMPARE_WORK: usize = 131_072;
 const MAX_DT_DECLARATION_BYTES: usize = 8 * 1024 * 1024;
@@ -63,8 +90,7 @@ pub(super) fn collect_dt_declarations(
 ) -> Result<Vec<(&str, &[ChcDtConstructor])>, DatatypeDeclarationError> {
     let mut collector = DatatypeDeclarationCollector::default();
     for var in vars {
-        collector.charge_name_bytes(var.name.len())?;
-        collector.visit_sort(&var.sort)?;
+        collector.visit_variable(var)?;
     }
     Ok(collector.finish())
 }
@@ -75,13 +101,126 @@ pub(crate) fn collect_dt_declarations_for_expr<'a>(
     vars: &'a [ChcVar],
     expr: &'a ChcExpr,
 ) -> Result<Vec<(&'a str, &'a [ChcDtConstructor])>, DatatypeDeclarationError> {
+    collect_dt_declarations_for_expr_sized(vars, expr).map(|(declarations, _)| declarations)
+}
+
+/// Sizes an admission walk measured (bridge item D-1 board counters).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExprAdmissionSizes {
+    /// Distinct nodes (pointer identity).
+    pub(crate) unique_nodes: usize,
+    /// Tree expansion.
+    pub(crate) tree_nodes: usize,
+}
+
+/// [`collect_dt_declarations_for_expr`] that also reports the admitted sizes.
+pub(crate) fn collect_dt_declarations_for_expr_sized<'a>(
+    vars: &'a [ChcVar],
+    expr: &'a ChcExpr,
+) -> Result<(Vec<(&'a str, &'a [ChcDtConstructor])>, ExprAdmissionSizes), DatatypeDeclarationError>
+{
     let mut collector = DatatypeDeclarationCollector::default();
     for var in vars {
-        collector.charge_name_bytes(var.name.len())?;
-        collector.visit_sort(&var.sort)?;
+        collector.visit_variable(var)?;
     }
     collector.visit_expr(expr)?;
-    Ok(collector.finish())
+    let sizes = collector.sizes();
+    if sizes.tree_nodes > MAX_EXECUTOR_TREE_NODES {
+        return Err(DatatypeDeclarationError::ResourceLimit(
+            "executor expression tree nodes",
+        ));
+    }
+    Ok((collector.finish(), sizes))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExprMemo {
+    /// Longest path below the node, in edges.
+    height: u32,
+    /// Tree expansion, saturated at `MAX_EXECUTOR_TREE_NODES + 1`.
+    tree: u64,
+}
+
+/// Tree size at or below which the admission walk and the sort scans run as
+/// plain tree walks, without the pointer memo / visited set of bridge item
+/// D-1. Those structures exist for DAG-shared queries whose TREE is large
+/// (the wide `oral_messages` IMC k-queries, 10^5..10^8 tree nodes); on the
+/// small queries that dominate the query stream (PDR, Houdini, the persistent
+/// executor contexts: hundreds of nodes) their hashing is pure overhead —
+/// measured on lustre `metros_4_e2_968_e3_931`, where it pushed the Houdini
+/// prepass past its 10 s route budget (sat 16.9 s -> 33.8 s, 3/3 paired).
+/// Below this size a plain walk has the same depth, the same tree size and,
+/// as the tree has at most this many occurrences, cannot reach the
+/// unique-node cap either; per-occurrence name charging is batch 3's
+/// behaviour for shared leaves (WP-F charges a leaf per DAG edge).
+const DAG_WALK_MIN_TREE_NODES: usize = 4_096;
+
+/// Tree expansion of `root` when it is at most `limit` nodes, else `None`.
+/// A plain counting walk (no hashing) that stops as soon as the count
+/// passes `limit`, so its cost is bounded by `limit` whatever the DAG.
+fn bounded_tree_size(root: &ChcExpr, limit: usize) -> Option<usize> {
+    let mut stack = vec![root];
+    let mut nodes = 1usize;
+    while let Some(node) = stack.pop() {
+        let children = expr_children(node);
+        nodes = nodes.saturating_add(children.len());
+        if nodes > limit {
+            return None;
+        }
+        stack.extend(children.iter().map(AsRef::as_ref));
+    }
+    Some(nodes)
+}
+
+/// Pointer identity of an expression node. Every walk here borrows its
+/// roots for the whole walk, so addresses are stable and unique.
+pub(super) fn expr_key(expr: &ChcExpr) -> usize {
+    std::ptr::from_ref(expr) as usize
+}
+
+/// Semantic children used by metadata, sort and resource inspection only.
+/// A lambda's closed body is code and its captures are the environment; both
+/// count here. Free-variable substitution continues to use expr::dag::children.
+#[derive(Clone, Copy)]
+pub(super) struct ExprChildren<'a> {
+    body: Option<&'a Arc<ChcExpr>>,
+    arguments: &'a [Arc<ChcExpr>],
+}
+
+impl<'a> ExprChildren<'a> {
+    pub(super) fn len(self) -> usize {
+        self.arguments.len() + usize::from(self.body.is_some())
+    }
+
+    fn get(self, index: usize) -> Option<&'a Arc<ChcExpr>> {
+        match (self.body, index) {
+            (Some(body), 0) => Some(body),
+            (Some(_), index) => self.arguments.get(index - 1),
+            (None, index) => self.arguments.get(index),
+        }
+    }
+
+    pub(super) fn iter(self) -> impl DoubleEndedIterator<Item = &'a Arc<ChcExpr>> {
+        self.body.into_iter().chain(self.arguments.iter())
+    }
+}
+
+pub(super) fn expr_children(expr: &ChcExpr) -> ExprChildren<'_> {
+    let (body, arguments) = match expr {
+        ChcExpr::ArrayLambda(lambda) => (Some(lambda.body()), lambda.captures()),
+        ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) => {
+            (None, args.as_slice())
+        }
+        ChcExpr::ConstArray(_, value) => (None, std::slice::from_ref(value)),
+        ChcExpr::Bool(_)
+        | ChcExpr::Int(_)
+        | ChcExpr::Real(_, _)
+        | ChcExpr::BitVec(_, _)
+        | ChcExpr::Var(_)
+        | ChcExpr::ConstArrayMarker(_)
+        | ChcExpr::IsTesterMarker(_) => (None, &[][..]),
+    };
+    ExprChildren { body, arguments }
 }
 
 pub(crate) fn collect_dt_declarations_for_exprs<'a>(
@@ -104,15 +243,24 @@ pub(crate) fn collect_dt_declarations_for_exprs<'a>(
 #[derive(Default)]
 struct DatatypeDeclarationCollector<'a> {
     definitions: FxHashMap<&'a str, &'a [ChcDtConstructor]>,
+    checked_variable_sorts: FxHashMap<&'a str, &'a ChcSort>,
+    checked_definition_pairs: FxHashSet<(&'a str, usize, usize, usize, usize)>,
     expanded_definition_instances: FxHashSet<(usize, usize)>,
     sort_nodes: usize,
+    /// Distinct expression nodes visited (capped by `MAX_DT_EXPR_NODES`).
     expr_nodes: usize,
+    /// Tree expansion of every visited root (saturating just above
+    /// `MAX_EXECUTOR_TREE_NODES`; enforced by the single-query admission).
+    tree_nodes: usize,
+    /// Completed nodes: pointer -> (height, tree size).
+    expr_memo: FxHashMap<usize, ExprMemo>,
     constructors: usize,
     selectors: usize,
     expanded_constructors: usize,
     expanded_selectors: usize,
     name_bytes: usize,
     definition_compare_work: usize,
+    variable_sort_compare_work: usize,
 }
 
 impl<'a> DatatypeDeclarationCollector<'a> {
@@ -124,6 +272,69 @@ impl<'a> DatatypeDeclarationCollector<'a> {
             "executor surface name bytes",
         )?;
         Ok(())
+    }
+
+    fn visit_variable(&mut self, variable: &'a ChcVar) -> Result<(), DatatypeDeclarationError> {
+        // Name hashing/comparison remains charged for EVERY visited variable
+        // node, even a hit (the expression walk visits each distinct node
+        // once, so a variable node shared by pointer is charged once).
+        // Different clauses may use one name with different sorts.
+        self.charge_name_bytes(variable.name.len())?;
+        if let Some(previous) = self.checked_variable_sorts.get(variable.name.as_str()) {
+            if variable_sorts::same_metadata_shape(
+                previous,
+                &variable.sort,
+                &mut self.variable_sort_compare_work,
+                &mut self.name_bytes,
+            )? {
+                return Ok(());
+            }
+        }
+        self.visit_sort(&variable.sort)?;
+        // Each new entry has paid at least one sort node, so the unchanged
+        // aggregate sort-node cap also bounds this borrowed table's size.
+        self.checked_variable_sorts
+            .entry(variable.name.as_str())
+            .or_insert(&variable.sort);
+        Ok(())
+    }
+
+    fn definition_matches(
+        &mut self,
+        name: &'a str,
+        previous: &'a [ChcDtConstructor],
+        current: &'a [ChcDtConstructor],
+    ) -> Result<bool, DatatypeDeclarationError> {
+        if std::ptr::eq(previous.as_ptr(), current.as_ptr()) && previous.len() == current.len() {
+            return Ok(true);
+        }
+        let pair = (
+            name,
+            previous.as_ptr() as usize,
+            previous.len(),
+            current.as_ptr() as usize,
+            current.len(),
+        );
+        if self.checked_definition_pairs.contains(&pair) {
+            return Ok(true);
+        }
+        if !datatype_definitions_equivalent_bounded(
+            previous,
+            current,
+            &mut self.definition_compare_work,
+        )? {
+            return Ok(false);
+        }
+        // This memo records ONLY a completed emitted-signature comparison.
+        // visit_sort still expands every distinct metadata allocation below.
+        // Borrowed input remains live throughout this collector's lifetime.
+        if self.checked_definition_pairs.len() >= MAX_DT_SORT_NODES {
+            return Err(DatatypeDeclarationError::ResourceLimit(
+                "datatype comparison memo entries",
+            ));
+        }
+        self.checked_definition_pairs.insert(pair);
+        Ok(true)
     }
 
     fn visit_sort(&mut self, root: &'a ChcSort) -> Result<(), DatatypeDeclarationError> {
@@ -145,14 +356,8 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                         MAX_DT_NAME_BYTES,
                         "datatype name bytes",
                     )?;
-                    if let Some(previous) = self.definitions.get(name.as_str()) {
-                        if !std::ptr::eq(previous.as_ptr(), constructors.as_ptr())
-                            && !datatype_definitions_equivalent_bounded(
-                                previous,
-                                constructors,
-                                &mut self.definition_compare_work,
-                            )?
-                        {
+                    if let Some(previous) = self.definitions.get(name.as_str()).copied() {
+                        if !self.definition_matches(name, previous, constructors)? {
                             return Err(DatatypeDeclarationError::ConflictingDefinition(
                                 name.clone(),
                             ));
@@ -195,7 +400,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                     // each metadata allocation once so a conflicting nested
                     // definition cannot be hidden behind a same-signature
                     // outer sort or make output depend on variable order.
-                    let instance_key = (constructors.as_ptr() as usize, constructors.len());
+                    let instance_key = (constructors.node_addr() as usize, constructors.len());
                     if !self.expanded_definition_instances.insert(instance_key) {
                         continue;
                     }
@@ -263,74 +468,155 @@ impl<'a> DatatypeDeclarationCollector<'a> {
         Ok(())
     }
 
+    /// Admit one root. Pointer-memoised (bridge item D-1; WP-F's DAG-linear
+    /// admission): each distinct node is visited and charged once against
+    /// `MAX_DT_EXPR_NODES`; the nesting depth stays exact (a shared node met
+    /// again is charged at its deeper occurrence through its memoised
+    /// height); the root's tree expansion is accumulated (saturating) for the
+    /// single-query executor admission's `MAX_EXECUTOR_TREE_NODES` check.
     fn visit_expr(&mut self, root: &'a ChcExpr) -> Result<(), DatatypeDeclarationError> {
+        if let Some(memo) = self.expr_memo.get(&expr_key(root)) {
+            let tree = memo.tree;
+            self.charge_tree(tree);
+            return Ok(());
+        }
+        if let Some(tree) = bounded_tree_size(root, DAG_WALK_MIN_TREE_NODES) {
+            // Small tree: one `enter_expr` per occurrence, pre-order
+            // left-to-right like the memoised walk, depth exact.
+            let mut stack: Vec<(&'a ChcExpr, usize)> = vec![(root, 0)];
+            while let Some((node, depth)) = stack.pop() {
+                self.enter_expr(node, depth)?;
+                stack.extend(
+                    expr_children(node)
+                        .iter()
+                        .rev()
+                        .map(|child| (child.as_ref(), depth + 1)),
+                );
+            }
+            self.charge_tree(u64::try_from(tree).unwrap_or(u64::MAX));
+            return Ok(());
+        }
+        self.enter_expr(root, 0)?;
+        let mut stack: Vec<(&'a ChcExpr, usize)> = vec![(root, 0)];
+        loop {
+            let Some(top) = stack.last_mut() else {
+                break;
+            };
+            let node: &'a ChcExpr = top.0;
+            let children = expr_children(node);
+            if top.1 < children.len() {
+                let Some(child) = children.get(top.1) else {
+                    return Err(DatatypeDeclarationError::ResourceLimit(
+                        "semantic child position",
+                    ));
+                };
+                let child: &'a ChcExpr = child.as_ref();
+                top.1 += 1;
+                // The stack is the path root..parent, so the child sits at
+                // depth `stack.len()`.
+                let depth = stack.len();
+                if let Some(memo) = self.expr_memo.get(&expr_key(child)) {
+                    if depth.saturating_add(memo.height as usize) > MAX_DT_NESTING_DEPTH {
+                        return Err(DatatypeDeclarationError::ResourceLimit(
+                            "datatype expression nesting depth",
+                        ));
+                    }
+                    continue;
+                }
+                self.enter_expr(child, depth)?;
+                stack.push((child, 0));
+            } else {
+                stack.pop();
+                self.leave_expr(node, children);
+            }
+        }
+        let tree = self
+            .expr_memo
+            .get(&expr_key(root))
+            .map_or(1, |memo| memo.tree);
+        self.charge_tree(tree);
+        Ok(())
+    }
+
+    /// First visit of a distinct node: depth and unique-node caps, then the
+    /// node's own name/sort charges.
+    fn enter_expr(
+        &mut self,
+        expr: &'a ChcExpr,
+        depth: usize,
+    ) -> Result<(), DatatypeDeclarationError> {
+        if depth > MAX_DT_NESTING_DEPTH {
+            return Err(DatatypeDeclarationError::ResourceLimit(
+                "datatype expression nesting depth",
+            ));
+        }
         self.expr_nodes = bounded_add(
             self.expr_nodes,
             1,
             MAX_DT_EXPR_NODES,
             "datatype expression nodes",
         )?;
-        let mut stack = vec![(root, 0usize)];
-        while let Some((expr, depth)) = stack.pop() {
-            if depth > MAX_DT_NESTING_DEPTH {
-                return Err(DatatypeDeclarationError::ResourceLimit(
-                    "datatype expression nesting depth",
-                ));
+        match expr {
+            ChcExpr::Bool(_)
+            | ChcExpr::Int(_)
+            | ChcExpr::Real(_, _)
+            | ChcExpr::BitVec(_, _)
+            | ChcExpr::Op(_, _) => {}
+            ChcExpr::IsTesterMarker(name) | ChcExpr::PredicateApp(name, _, _) => {
+                self.charge_name_bytes(name.len())?;
             }
-            match expr {
-                ChcExpr::Bool(_)
-                | ChcExpr::Int(_)
-                | ChcExpr::Real(_, _)
-                | ChcExpr::BitVec(_, _) => {}
-                ChcExpr::IsTesterMarker(name) => self.charge_name_bytes(name.len())?,
-                ChcExpr::Var(var) => {
-                    self.charge_name_bytes(var.name.len())?;
-                    self.visit_sort(&var.sort)?;
-                }
-                ChcExpr::Op(_, args) => {
-                    self.expr_nodes = bounded_add(
-                        self.expr_nodes,
-                        args.len(),
-                        MAX_DT_EXPR_NODES,
-                        "datatype expression nodes",
-                    )?;
-                    stack.extend(args.iter().rev().map(|arg| (arg.as_ref(), depth + 1)));
-                }
-                ChcExpr::PredicateApp(name, _, args) => {
-                    self.charge_name_bytes(name.len())?;
-                    self.expr_nodes = bounded_add(
-                        self.expr_nodes,
-                        args.len(),
-                        MAX_DT_EXPR_NODES,
-                        "datatype expression nodes",
-                    )?;
-                    stack.extend(args.iter().rev().map(|arg| (arg.as_ref(), depth + 1)));
-                }
-                ChcExpr::FuncApp(name, sort, args) => {
-                    self.charge_name_bytes(name.len())?;
-                    self.visit_sort(sort)?;
-                    self.expr_nodes = bounded_add(
-                        self.expr_nodes,
-                        args.len(),
-                        MAX_DT_EXPR_NODES,
-                        "datatype expression nodes",
-                    )?;
-                    stack.extend(args.iter().rev().map(|arg| (arg.as_ref(), depth + 1)));
-                }
-                ChcExpr::ConstArrayMarker(sort) => self.visit_sort(sort)?,
-                ChcExpr::ConstArray(key_sort, value) => {
-                    self.visit_sort(key_sort)?;
-                    self.expr_nodes = bounded_add(
-                        self.expr_nodes,
-                        1,
-                        MAX_DT_EXPR_NODES,
-                        "datatype expression nodes",
-                    )?;
-                    stack.push((value.as_ref(), depth + 1));
+            ChcExpr::Var(var) => self.visit_variable(var)?,
+            ChcExpr::FuncApp(name, sort, _) => {
+                self.charge_name_bytes(name.len())?;
+                self.visit_sort(sort)?;
+            }
+            ChcExpr::ConstArrayMarker(sort) | ChcExpr::ConstArray(sort, _) => {
+                self.visit_sort(sort)?;
+            }
+            ChcExpr::ArrayLambda(lambda) => {
+                self.visit_variable(lambda.binder())?;
+                for formal in lambda.formals() {
+                    self.visit_variable(formal)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Post-order completion: every child is memoised, so height and tree
+    /// size are final.
+    fn leave_expr(&mut self, expr: &'a ChcExpr, children: ExprChildren<'a>) {
+        let mut height = 0u32;
+        let mut tree = 1u64;
+        for child in children.iter() {
+            if let Some(memo) = self.expr_memo.get(&expr_key(child)) {
+                height = height.max(memo.height.saturating_add(1));
+                tree = tree.saturating_add(memo.tree);
+            }
+        }
+        // Saturate just above the cap: the exact value past it is never read.
+        let tree = tree.min(MAX_EXECUTOR_TREE_NODES as u64 + 1);
+        self.expr_memo
+            .insert(expr_key(expr), ExprMemo { height, tree });
+    }
+
+    /// Accumulate a visited root's tree expansion, saturating just above
+    /// `MAX_EXECUTOR_TREE_NODES` (the exact value past it is never read).
+    /// Never fails: only the single-query executor admission enforces the
+    /// cap (see [`MAX_EXECUTOR_TREE_NODES`]).
+    fn charge_tree(&mut self, tree: u64) {
+        let tree = usize::try_from(tree).unwrap_or(usize::MAX);
+        self.tree_nodes = self
+            .tree_nodes
+            .saturating_add(tree)
+            .min(MAX_EXECUTOR_TREE_NODES + 1);
+    }
+
+    fn sizes(&self) -> ExprAdmissionSizes {
+        ExprAdmissionSizes {
+            unique_nodes: self.expr_nodes,
+            tree_nodes: self.tree_nodes,
+        }
     }
 
     fn finish(self) -> Vec<(&'a str, &'a [ChcDtConstructor])> {
@@ -744,11 +1030,25 @@ fn collect_uninterpreted_function_surface<'a>(
     let mut applications = Vec::new();
     let mut seen_applications = FxHashSet::default();
     let mut signatures: FxHashMap<String, (ChcSort, Vec<ChcSort>)> = FxHashMap::default();
-    let mut stack = exprs;
+    let mut stack: Vec<_> = exprs.into_iter().map(|expr| (expr, false)).collect();
     let mut expr_nodes = 0usize;
     let mut ordinary_application_occurrences = 0usize;
     let mut uf_argument_occurrences = 0usize;
-    while let Some(current) = stack.pop() {
+    // DAG-linear admission (WP-F): a shared inner node is expanded once.
+    // Its UF declaration/signature/application-occurrence charges were
+    // already recorded at the first visit (`signatures`/`seen_applications`
+    // are idempotent), so a repeat visit is skipped before it can inflate
+    // any of this loop's resource counters by its tree-occurrence count.
+    // This is the "original expression-DAG admission" the alias-emission
+    // budget above is deliberately kept separate from. (Workstream D bridge
+    // item D-1 needs exactly this: unique-node charging of shared subterms.)
+    let mut seen: FxHashSet<(*const ChcExpr, bool)> = FxHashSet::default();
+    while let Some((current, bound_body)) = stack.pop() {
+        if expr_children(current).len() != 0
+            && !seen.insert((current as *const ChcExpr, bound_body))
+        {
+            continue;
+        }
         expr_nodes = expr_nodes
             .checked_add(1)
             .filter(|nodes| *nodes <= MAX_DT_EXPR_NODES)
@@ -765,7 +1065,7 @@ fn collect_uninterpreted_function_surface<'a>(
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
-                stack.extend(args.iter().rev().map(AsRef::as_ref));
+                stack.extend(args.iter().rev().map(|arg| (arg.as_ref(), bound_body)));
                 let datatype_tester = name
                     .strip_prefix("is-")
                     .is_some_and(|constructor| datatype_constructors.contains(constructor));
@@ -805,7 +1105,7 @@ fn collect_uninterpreted_function_surface<'a>(
                     });
                 }
 
-                if seen_applications.insert((*current).clone()) {
+                if !bound_body && seen_applications.insert((*current).clone()) {
                     applications.push((*current).clone());
                 }
             }
@@ -820,7 +1120,7 @@ fn collect_uninterpreted_function_surface<'a>(
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
-                stack.extend(args.iter().rev().map(AsRef::as_ref));
+                stack.extend(args.iter().rev().map(|arg| (arg.as_ref(), bound_body)));
             }
             ChcExpr::ConstArray(_, value) => {
                 if expr_nodes
@@ -830,7 +1130,31 @@ fn collect_uninterpreted_function_surface<'a>(
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
-                stack.push(value.as_ref());
+                stack.push((value.as_ref(), bound_body));
+            }
+            ChcExpr::ArrayLambda(lambda) => {
+                let pending = stack
+                    .len()
+                    .checked_add(lambda.captures().len())
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| executor_resource_limit("pending expression nodes"))?;
+                if expr_nodes
+                    .checked_add(pending)
+                    .is_none_or(|nodes| nodes > MAX_DT_EXPR_NODES)
+                {
+                    return Err(executor_resource_limit("expression nodes"));
+                }
+                // Captures are evaluated in their enclosing scope. The closed
+                // body contains private binders and must never yield a global
+                // observation alias such as alias = f(private_index).
+                stack.extend(
+                    lambda
+                        .captures()
+                        .iter()
+                        .rev()
+                        .map(|arg| (arg.as_ref(), bound_body)),
+                );
+                stack.push((lambda.body().as_ref(), true));
             }
             ChcExpr::Bool(_)
             | ChcExpr::Int(_)
@@ -1029,19 +1353,58 @@ pub(crate) fn detect_logic(vars: &[ChcVar], expr: &ChcExpr) -> &'static str {
     }
 }
 
+/// Whether any variable, function result or const-array key sort in `expr`
+/// satisfies `pred`. A plain tree walk while the walk stays within
+/// `DAG_WALK_MIN_TREE_NODES` visits (no allocation beyond the stack; this runs
+/// up to six times per executor query in `detect_logic`), else the DAG walk
+/// that visits each distinct node once (bridge item D-1). Same answer either
+/// way: the predicate only reads node sorts.
 fn expr_sort_has(expr: &ChcExpr, pred: fn(&ChcSort) -> bool) -> bool {
-    match expr {
-        ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => false,
+    let mut stack = vec![expr];
+    let mut budget = DAG_WALK_MIN_TREE_NODES;
+    while let Some(node) = stack.pop() {
+        if budget == 0 {
+            return expr_sort_has_dag(expr, pred);
+        }
+        budget -= 1;
+        if node_sort_has(node, pred) {
+            return true;
+        }
+        stack.extend(expr_children(node).iter().map(AsRef::as_ref));
+    }
+    false
+}
+
+/// [`expr_sort_has`] over the DAG: each distinct node (pointer identity) once.
+fn expr_sort_has_dag(expr: &ChcExpr, pred: fn(&ChcSort) -> bool) -> bool {
+    let mut visited: FxHashSet<usize> = FxHashSet::default();
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        if !visited.insert(expr_key(node)) {
+            continue;
+        }
+        if node_sort_has(node, pred) {
+            return true;
+        }
+        stack.extend(expr_children(node).iter().map(AsRef::as_ref));
+    }
+    false
+}
+
+/// The node's own sort-bearing field satisfies `pred`.
+fn node_sort_has(node: &ChcExpr, pred: fn(&ChcSort) -> bool) -> bool {
+    match node {
         ChcExpr::Var(var) => pred(&var.sort),
-        ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
-            args.iter().any(|arg| expr_sort_has(arg, pred))
-        }
-        ChcExpr::FuncApp(_, sort, args) => {
-            pred(sort) || args.iter().any(|arg| expr_sort_has(arg, pred))
-        }
-        ChcExpr::ConstArrayMarker(sort) => pred(sort),
-        ChcExpr::IsTesterMarker(_) => false,
-        ChcExpr::ConstArray(key_sort, value) => pred(key_sort) || expr_sort_has(value, pred),
+        ChcExpr::FuncApp(_, sort, _) | ChcExpr::ConstArrayMarker(sort) => pred(sort),
+        ChcExpr::ConstArray(key_sort, _) => pred(key_sort),
+        ChcExpr::ArrayLambda(lambda) => pred(&lambda.sort()),
+        ChcExpr::Bool(_)
+        | ChcExpr::Int(_)
+        | ChcExpr::Real(_, _)
+        | ChcExpr::BitVec(_, _)
+        | ChcExpr::Op(_, _)
+        | ChcExpr::PredicateApp(_, _, _)
+        | ChcExpr::IsTesterMarker(_) => false,
     }
 }
 

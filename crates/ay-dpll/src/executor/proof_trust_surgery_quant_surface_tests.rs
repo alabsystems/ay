@@ -377,3 +377,75 @@ fn quant_source_pivot_remap_does_not_forgive_invalid_conclusion() {
     assert_eq!(format!("{:?}", fixture.proof), proof_before);
     assert_eq!(fixture.executor.last_proof_term_overrides, overrides_before);
 }
+
+/// An IDENTITY quantifier-expansion consequence: the trust leaf `(cl L)` is
+/// the folded expansion instance `L` itself (F03 in `ay`'s
+/// `provenance_assume_gate_leak2`: 23 of its 25 leaves). The planner used to
+/// pair the instance chain with the degenerate lemma `(cl (not L) L)`, which
+/// the surface audit's `unique_atoms` guard (c25240fc9) refuses, and that one
+/// refusal discarded the WHOLE surgery. The chain alone must now replace the
+/// leaf, and the rebuilt proof must be strict and trust-free.
+#[test]
+fn identity_quant_expansion_consequence_rebuilds_without_a_lemma() {
+    use ay_core::{FarkasAnnotation, ProofStep, TheoryLemmaKind};
+
+    let (mut executor, parsed_forall, forall, instance) = direct_forall_fixture();
+    let zero = executor.ctx.terms.mk_int(0.into());
+    let parsed_support = FrontendTerm::App(
+        "<=".to_string(),
+        vec![
+            FrontendTerm::Symbol("quant_surface_y".to_string()),
+            FrontendTerm::Const(Constant::Numeral("0".to_string())),
+        ],
+    );
+    let support = executor
+        .ctx
+        .elaborate_surface_subterm(&parsed_support)
+        .expect("conflicting support elaborates");
+    executor
+        .quant_expansion_records
+        .push(crate::executor::QuantExpansionRecord {
+            original: forall,
+            assertion_index: 0,
+            expanded: instance,
+            instances: vec![(vec![zero], instance)],
+        });
+
+    let not_instance = executor.ctx.terms.mk_not_raw(instance);
+    let not_support = executor.ctx.terms.mk_not_raw(support);
+    let mut proof = Proof::new();
+    let _forall_assume = proof.add_assume(forall, None);
+    let leaf = proof.add_rule_step(AletheRule::Trust, vec![instance], Vec::new(), Vec::new());
+    let support_assume = proof.add_assume(support, None);
+    let lemma = proof.add_step(ProofStep::TheoryLemma {
+        theory: "LRA".to_string(),
+        clause: vec![not_instance, not_support],
+        farkas: Some(FarkasAnnotation::from_ints(&[1, 1])),
+        kind: TheoryLemmaKind::LraFarkas,
+        lia: None,
+    });
+    let unit = proof.add_resolution(vec![not_support], instance, lemma, leaf);
+    proof.add_resolution(Vec::new(), support, unit, support_assume);
+    let originals = vec![(forall, parsed_forall), (support, parsed_support)];
+
+    assert!(
+        executor.try_rebuild_with_trust_surgery(&mut proof, &originals),
+        "an identity consequence must not discard the surgery"
+    );
+    let quality = ay_proof::check_proof_strict(&proof, &executor.ctx.terms)
+        .expect("the rebuilt identity-consequence proof must be strict");
+    assert_eq!(quality.trust_count, 0);
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::ForallInst,
+            ..
+        }
+    )));
+    // No degenerate `(cl (not L) L)` lemma may be emitted for the leaf.
+    assert!(!proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::TheoryLemma { clause, .. }
+            if clause.contains(&instance) && clause.contains(&not_instance)
+    )));
+}

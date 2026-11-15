@@ -12,7 +12,7 @@ use std::time::Duration;
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
 use crate::interpolant_validation::is_valid_interpolant_with_check_sat;
-use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
+use crate::interpolation::{interpolating_sat_constraints_lra_proof_first, InterpolatingSatResult};
 use crate::{ChcExpr, ChcSort, ChcVar};
 
 use super::super::solver::{flatten_to_constraints, TpaSolver};
@@ -222,10 +222,11 @@ impl TpaSolver {
                         return None;
                     }
 
-                    match interpolating_sat_constraints(
+                    match interpolating_sat_constraints_lra_proof_first(
                         &normalized_a.constraints,
                         &normalized_b.constraints,
                         &branch_shared_vars,
+                        None,
                     ) {
                         InterpolatingSatResult::Unsat(interpolant) => {
                             beta_interpolants.push(interpolant);

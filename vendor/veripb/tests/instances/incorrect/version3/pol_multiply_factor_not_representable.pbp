@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `GeneralPBConstraint::multiply` took its in-situ branch whenever the two
+% products `coeff_sum * factor` and `degree * factor` fit into the constraint's integer type
+% and then unwrapped the factor itself into that type. For the empty, degree-0 constraint
+% the `2 n` MIR step leaves behind, both products are 0 for *any* factor, so multiplying by
+% 2^64 aborted the checker (SIGABRT, exit 134) instead of producing a verdict. `0 >= 0`
+% scaled by 2^64 is still `0 >= 0`, so constraint 2 is trivially true and the conclusion
+% below is wrong.
+f 1 ;
+pol x1 2 * 2 n 18446744073709551616 * ;
+output NONE;
+conclusion UNSAT : 2 ;
+end pseudo-Boolean proof;

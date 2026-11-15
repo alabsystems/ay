@@ -1,0 +1,13 @@
+pseudo-Boolean proof version 3.0
+% `output DERIVABLE` used to be guarded by `context.solution_logged` alone,
+% which `obji` does not set: it stores the same non-input-entailed
+% objective-improving constraint into core without logging a solution. The
+% core then contains `~x2`, the output file matches it constraint for
+% constraint, and the checker certified `min: x2; x1 v x2` as DERIVING
+% `{x1 v x2, ~x2}` — false at x1=0, x2=1. Same proxy-vs-hazard failure mode
+% as output_equienumerable_sol_then_obji (ay patch 0002, defect 20 there).
+f 1;
+obji 1;
+output DERIVABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

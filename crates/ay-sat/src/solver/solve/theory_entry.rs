@@ -27,7 +27,8 @@ impl Solver {
     where
         F: FnMut(&mut Self) -> TheoryPropResult,
     {
-        SolverSatResult::from_solver_result(self.solve_with_theory_raw(theory_check))
+        let result = self.solve_with_theory_raw(theory_check);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
     /// Internal theory solve returning raw `SatResult`.

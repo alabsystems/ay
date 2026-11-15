@@ -141,6 +141,81 @@ fn test_lira_solver_soft_reset_clears_conflict_state() {
     );
 }
 
+/// Warm reset (eager-persistent arm) must be verdict-equivalent to a
+/// fresh LiraSolver across the cross-sort (`to_real`) bridge — the
+/// #5462 hazard is exactly cross-sort state leaking or being lost
+/// between iterations. Round 1 refutes through the bridge, round 2
+/// (after warm reset) is satisfiable through the same bridge, and
+/// round 3 (after another warm reset) refutes again.
+#[test]
+fn test_lira_solver_soft_reset_warm_cross_sort_verdicts_match_fresh() {
+    let mut terms = setup_term_store();
+    let relu = terms.mk_fresh_var("relu", Sort::Real);
+    let phase = terms.mk_fresh_var("phase", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one_int = terms.mk_int(BigInt::from(1));
+    let one_real = terms.mk_rational(num_rational::Ratio::new(BigInt::from(1), BigInt::from(1)));
+
+    let phase_real = terms.mk_to_real(phase);
+    let phase_eq_zero = terms.mk_eq(phase, zero);
+    let phase_eq_one = terms.mk_eq(phase, one_int);
+    let relu_le_phase = terms.mk_le(relu, phase_real);
+    let relu_ge_one = terms.mk_ge(relu, one_real);
+
+    let mut solver = LiraSolver::new(&terms);
+    for atom in [phase_eq_zero, phase_eq_one, relu_le_phase, relu_ge_one] {
+        solver.register_atom(atom);
+    }
+
+    // Round 1: phase = 0, relu <= to_real(phase) = 0, relu >= 1 → UNSAT.
+    solver.assert_literal(phase_eq_zero, true);
+    solver.assert_literal(relu_le_phase, true);
+    solver.assert_literal(relu_ge_one, true);
+    let result = solver.check();
+    assert!(
+        matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "cross-sort contradiction must refute before warm reset, got {result:?}"
+    );
+
+    // Round 2: phase = 1, relu <= 1, relu >= 1 → SAT (relu = 1). The
+    // round-1 contradiction must not stick across the warm reset.
+    // The warm reset fires at NON-ZERO scope depth, exactly as the
+    // eager-persistent arm calls it (the SAT extension still holds
+    // decision-level theory scopes at iteration boundaries): it must
+    // collapse the scopes instead of panicking, and a later pop at
+    // the collapsed depth 0 stays a graceful no-op.
+    solver.push();
+    solver.push();
+    solver.soft_reset_warm();
+    solver.pop();
+    solver.assert_literal(phase_eq_one, true);
+    solver.assert_literal(relu_le_phase, true);
+    solver.assert_literal(relu_ge_one, true);
+    let result = solver.check();
+    assert!(
+        matches!(result, TheoryResult::Sat),
+        "warm reset must clear the cross-sort conflict, got {result:?}"
+    );
+
+    // Round 3: the original contradiction must refute again — the
+    // warm reset must not have lost cross-sort propagation ability.
+    solver.soft_reset_warm();
+    solver.assert_literal(phase_eq_zero, true);
+    solver.assert_literal(relu_le_phase, true);
+    solver.assert_literal(relu_ge_one, true);
+    let result = solver.check();
+    assert!(
+        matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "cross-sort contradiction must refute again after warm reset, got {result:?}"
+    );
+}
+
 /// Regression test: StringsLiaSolver::soft_reset clears conflict state (#3510).
 #[test]
 fn test_strings_lia_solver_soft_reset_clears_conflict_state() {

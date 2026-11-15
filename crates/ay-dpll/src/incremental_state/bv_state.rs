@@ -95,6 +95,19 @@ pub(crate) struct IncrementalBvState {
     /// (get_bits returns immediately). Without this persistence, the result bits remain
     /// unconstrained by any circuit, leading to spurious SAT models.
     pub(crate) delayed_ops: Vec<DelayedBvOp>,
+    /// Set once a congruence pass stopped early and left only part of the
+    /// congruence axioms in the persistent solver, with why
+    /// (`CongruenceBail::merge` of every bail so far). The passes run only
+    /// when a check-sat brings new assertions, so a later check-sat can reuse
+    /// the partial clause set; while this is set, a SAT answer is degraded to
+    /// Unknown, published as this cause.
+    ///
+    /// A count cap's partial set is a property of the query and stays for
+    /// the life of the encoding. A stop's (deadline, interrupt, memory
+    /// ceiling) is not: the next check-sat rebuilds the encoding instead of
+    /// inheriting a stop it never hit (`solve_bv_incremental_inner`, P4a),
+    /// and the rebuild clears this.
+    pub(crate) congruence_partial: Option<crate::executor::theories::CongruenceBail>,
 }
 
 impl IncrementalBvState {
@@ -116,6 +129,7 @@ impl IncrementalBvState {
             linked_equivalence_terms: HashSet::default(),
             bv_ite_conditions: HashSet::default(),
             delayed_ops: Vec::new(),
+            congruence_partial: None,
         }
     }
 
@@ -156,9 +170,12 @@ impl IncrementalBvState {
     /// Drop the persistent SAT solver and all BV/Tseitin caches, but preserve
     /// frontend scope depth so the next check-sat can rebuild the solver stack.
     ///
-    /// This is the FULL teardown, reserved for `reset()` (`(reset)` /
+    /// This is the FULL teardown, used after a stopped/incomplete encoding
+    /// transaction and for `reset()` (`(reset)` /
     /// `(reset-assertions)`), where the assertion set itself is discarded and
-    /// no cached encoding can be reused.
+    /// no cached encoding can be reused, and for an encoding whose congruence
+    /// axioms an earlier check-sat's stop left partial (`congruence_partial`),
+    /// which the next check-sat re-encodes from its current assertions.
     ///
     /// It is deliberately NOT the `pop()` path — see `pop()` for why a scope
     /// retraction needs no teardown at all.
@@ -178,6 +195,7 @@ impl IncrementalBvState {
         self.linked_equivalence_terms.clear();
         self.bv_ite_conditions.clear();
         self.delayed_ops.clear();
+        self.congruence_partial = None;
     }
 }
 

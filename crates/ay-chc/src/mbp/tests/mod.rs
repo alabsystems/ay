@@ -11,9 +11,14 @@ use std::sync::Arc;
 
 mod bv_interval;
 mod core_implicant;
+mod cross_multiplication;
+mod dag_linear;
 mod datatype;
 mod eval_bv;
 mod extended_theories;
+mod fm_resolvent_cap;
+mod sort_correct_substitution;
+mod under_approx;
 
 /// Helper: create a simple Option-like DT sort with None and Some(Int).
 fn option_int_sort() -> ChcSort {
@@ -21,7 +26,7 @@ fn option_int_sort() -> ChcSort {
     use crate::expr::ChcDtSelector;
     ChcSort::Datatype {
         name: "OptionInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "None".to_string(),
                 selectors: vec![],
@@ -43,7 +48,7 @@ fn pair_int_sort() -> ChcSort {
     use crate::expr::ChcDtSelector;
     ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mkpair".to_string(),
             selectors: vec![
                 ChcDtSelector {

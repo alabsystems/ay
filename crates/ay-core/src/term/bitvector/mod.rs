@@ -12,8 +12,14 @@ mod bitwise;
 mod comparison;
 mod conversion;
 mod division;
+mod extract;
 mod extract_concat;
+mod offset_equality;
+mod offset_sharing;
 mod shift;
+
+pub use offset_equality::BvOffsetEquality;
+pub use offset_sharing::BvOffsetShares;
 
 use super::*;
 

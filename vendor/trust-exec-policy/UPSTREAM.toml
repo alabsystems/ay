@@ -1,0 +1,7 @@
+repository = "development-only integration"
+revision = "cae6f4b58466174749dde6f0d7d0bbf1fcc5e052"
+path = "crates/trust-exec-policy"
+tree = "d1cfacc4858045d6b10f933be5bd2c0867d10aff"
+license_files = ["LICENSE-APACHE", "LICENSE-MIT"]
+# Cargo.toml, Cargo.lock, README.md and src/ are byte-exact canonical exports.
+# The two licenses come from the same immutable repository revision.

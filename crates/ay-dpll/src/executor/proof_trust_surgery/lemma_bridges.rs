@@ -265,6 +265,9 @@ impl Executor {
                 if let Some(hit) = self.surface_linear_raw_term(surf, canonical) {
                     return Some(hit);
                 }
+                if self.raw_intern_surface(surf) != Some(raw) {
+                    return None;
+                }
                 Some((raw, None))
             }
             Some(hit) => Some(hit),

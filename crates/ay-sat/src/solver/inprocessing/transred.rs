@@ -41,8 +41,18 @@ impl Solver {
             .num_vars
             .saturating_sub(self.var_lifecycle.count_removed()) as u64;
         let ticks_now = self.search_ticks[0] + self.search_ticks[1];
-        let ticks_delta = ticks_now.saturating_sub(self.cold.last_transred_ticks);
-        let effort = (ticks_delta * TRANSRED_EFFORT_PERMILLE / 1000)
+        // The engine charges propagations against the budget, and CaDiCaL's
+        // 100 per mille is of search propagations; the search-tick delta is
+        // several times larger (knight_18: 41 runs, 55 s, 76 clauses removed,
+        // where Kissat's transitive reduction takes 0.9 s in all).
+        // `--sat-transred-propagation-effort true` budgets in propagations.
+        let base_delta = if ay_core::sat_ab_switches().transred_propagation_effort == Some(true) {
+            self.num_propagations
+                .saturating_sub(self.inproc.transred_engine.last_propagations())
+        } else {
+            ticks_now.saturating_sub(self.cold.last_transred_ticks)
+        };
+        let effort = (base_delta * TRANSRED_EFFORT_PERMILLE / 1000)
             .clamp(TRANSRED_MIN_EFFORT, TRANSRED_MAX_EFFORT);
         let effort = effort.max(2 * active_vars);
 
@@ -82,7 +92,7 @@ impl Solver {
                         probe_lit,
                         Some(*unit),
                     );
-                    self.backtrack(0);
+                    self.backtrack_probe(0);
                     // LRAT soundness gate: only learn the derived unit when we
                     // have a complete, checker-visible hint chain. With empty
                     // hints, learn_derived_unit emits a hidden TrustedTransform
@@ -106,7 +116,7 @@ impl Solver {
                     // a prior unit's level-0 propagation resolved intermediate
                     // clauses in the BFS chain. Skip this unit; normal probing
                     // will discover and properly certify it later.
-                    self.backtrack(0);
+                    self.backtrack_probe(0);
                 }
             } else {
                 self.proof_emit_unit(*unit, &[], ProofAddKind::Derived);

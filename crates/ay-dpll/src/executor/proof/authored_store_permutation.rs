@@ -13,13 +13,17 @@ mod scalar_select;
 #[path = "authored_store_permutation_scalar_tests.rs"]
 mod scalar_tests;
 #[cfg(test)]
+#[path = "authored_store_permutation_shadowed_tests.rs"]
+mod shadowed_tests;
+#[cfg(test)]
 #[path = "authored_store_permutation_tests.rs"]
 mod tests;
 
 impl Executor {
     /// Rebuild a STORE-PERMUTATION refutation from exact authored roots.
     ///
-    /// The direct arm discharges authored index disequalities against the
+    /// The direct arm first recognizes unconditional shadowed-store identities,
+    /// then discharges authored index disequalities against the
     /// checker's `ArrayStorePermutation` schema. The alias/select arm also
     /// transports that chain equality through authored array aliases and an
     /// `ArrayRowChain` read equality. The scalar/select arm transports that

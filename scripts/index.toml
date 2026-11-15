@@ -21,37 +21,9 @@ exempt = [
   "bindings/python/examples/**", # README-documented examples
   "bindings/python/conftest.py",
   "bindings/python/setup.py",    # packaging convention
-  "scripts/tests/fixtures/python_skip_gate/**", # literal zero-skip gate fixtures
   "third_party/**",              # vendored
   "publish/**",                  # publication-repo shim
 ]
-
-[[script]]
-name    = "flag-baseline-reconcile"
-path    = "scripts/flag_baseline_reconcile.py"
-lang    = "python"
-group   = "audit.flags"
-summary = "Reconcile the env-flag exact-set baseline after deleting flags: prune entries, rebuild the key-site section sorted from the failing gate's own report."
-publish = "public"
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "quality-baseline-reconcile"
-path    = "scripts/quality_baseline_reconcile.py"
-lang    = "python"
-group   = "audit.flags"
-summary = "Reconcile the file/function/construct size ratchets and file_size waiver ceilings from the quality gate's own report; seeds new construct sites so a second pass can pick up the true fingerprint."
-publish = "public"
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "flag-audit"
-path    = "scripts/flag_audit.py"
-lang    = "python"
-group   = "audit.flags"
-summary = "Compatibility/listing audit for the historical regex count (338 after B1); the Rust ay-quality-gate exact-set scanner is the build ratchet."
-publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "sat-sweep"
@@ -62,35 +34,26 @@ summary = "Lightweight SAT sweep harness: one or more solvers over a DIMACS corp
 publish = "public"
 tools   = ["kissat"]
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
-name    = "lever-eligibility"
-path    = "scripts/lever_eligibility.py"
+name    = "proof-manifest-verifier"
+path    = "scripts/verify_proof_manifest.py"
 lang    = "python"
 group   = "bench.sat"
-summary = "Compute each default-OFF SAT lever's eligible population from CNF headers, applying that lever's own gate arithmetic."
+summary = "Verify retained SAT certificates with dsr-trim outside the solve budget, then score a sweep with competition-mode SOLVED and certificate-accepted SCORED counts kept apart."
 publish = "public"
-cli_note = "no fronting subcommand yet"
+tools   = ["dsr-trim"]
+cli_note = "legacy certificate manifest utility; paired SAT comparisons belong to ay bench sat-delta"
 
 [[script]]
-name    = "lever-ab-verdict"
-path    = "scripts/lever_ab_verdict.py"
+name    = "proof-manifest-verifier-tests"
+path    = "scripts/tests/test_verify_proof_manifest.py"
 lang    = "python"
-group   = "bench.sat"
-summary = "Score one paired lever A/B sweep per arm (certificates joined on the arm, never collapsed) and print a FLIP / NO-FLIP verdict."
+group   = "test"
+summary = "Locks the deferred-certificate contract: only a checker-accepted certificate scores as a win, rejected, timed-out or missing proofs never count, PAR-2 is priced at the solver clock, and the out-of-repo proof-mode wrapper (checked only when present) never runs the checker inside the timed region."
 publish = "public"
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "run-lever-ab"
-path    = "scripts/run_lever_ab.sh"
-lang    = "bash"
-group   = "bench.sat"
-summary = "One command: build the lever binary off the main target dir, sweep each default-OFF lever's eligible population with both arms paired in one run, drain certificates, print a flip verdict per lever."
-publish = "public"
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["proof-manifest-verifier"]
+entrypoint = "test"
 
 [[script]]
 name    = "smt-diff-sweep"
@@ -100,8 +63,7 @@ group   = "bench.smt"
 summary = "Differential SMT sweep: AY vs a field of competitor solvers over an .smt2 corpus."
 publish = "public"
 tools   = ["z3", "cvc5", "smtinterpol"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["oom-guard", "z3-oracle"]
 
 [[script]]
 name    = "smtcomp-restage"
@@ -110,8 +72,7 @@ lang    = "python"
 group   = "compare.smt"
 summary = "SMT-COMP 2025 restage harness: AY and the real 2025 entrants on the exact 2025 selection."
 publish = "public"
-requires = ["oom-guard"]
-cli     = "ay bench compare run smtcomp-2025"
+requires = ["oom-guard", "z3-oracle"]
 
 [[script]]
 name    = "smt-ab-interleaved"
@@ -120,18 +81,16 @@ lang    = "python"
 group   = "compare.smt"
 summary = "Order-balanced same-binary A/B harness for incremental SMT levers, with order-effect and verdict-agreement checks."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
-name    = "chccomp-harness"
-path    = "scripts/chccomp_harness.py"
+name    = "z3-division-scan"
+path    = "scripts/z3_division_scan.py"
 lang    = "python"
-group   = "compare.chc"
-summary = "CHC-COMP multi-solver harness: AY vs Golem/Eldarica/Spacer with ground-truth cross-validation."
+group   = "compare.smt"
+summary = "Stratified AY-vs-z3 division scan: N seeded files per division of an SMT-LIB corpus root, both solvers at the same -T, one provenance-stamped JSON line per file, and a per-division decided/only/disagreement summary."
 publish = "public"
-tools   = ["golem", "eldarica", "z3"]
-requires = ["oom-guard"]
-cli     = "ay bench compare run chccomp-2025"
+tools   = ["z3"]
+cli_note = "set AY= (the default is a dev-local build); dev-local campaign scripts import it as a module, so keep its function names stable"
 
 [[script]]
 name    = "pbcomp-harness"
@@ -141,18 +100,6 @@ group   = "compare.pb"
 summary = "PB-COMP harness: ay pb solve over OPB/WBO instances under competition budgets."
 publish = "public"
 requires = ["oom-guard"]
-cli     = "ay bench compare run pbcomp-2026"
-
-[[script]]
-name    = "pb-sweep"
-path    = "scripts/pb_sweep.py"
-lang    = "python"
-group   = "bench.pb"
-summary = "Pseudo-Boolean sweep: AY-PB vs a reference (RoundingSat) on OPB/WBO with verdict cross-checks."
-publish = "public"
-tools   = ["roundingsat"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "wind-tunnel"
@@ -162,18 +109,6 @@ group   = "bench.core"
 summary = "The Wind Tunnel: full-corpus PAR-2 evaluation with an independent output checker."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "campaign M0 methodology"
-
-[[script]]
-name    = "continuous-benchmark"
-path    = "scripts/continuous_benchmark.py"
-lang    = "python"
-group   = "campaign.core"
-summary = "Four-hour branch integration, correctness gates, rotating competition benchmarks, repair, and progress publication."
-publish = "public"
-requires = ["oom-guard"]
-docs    = "the development design notes"
-cli_note = "systemd campaign driver; native ay bench remains the scoring and resource-enforcement owner"
 
 [[script]]
 name    = "sat-compare"
@@ -183,7 +118,6 @@ group   = "compare.sat"
 summary = "Head-to-head SAT comparison harness: AY vs a reference (e.g. Kissat) with verdict cross-validation."
 publish = "public"
 requires = ["oom-guard"]
-cli     = "ay bench compare run satcomp-2025"
 docs    = "scripts/sat_bench/README.md"
 
 [[script]]
@@ -193,7 +127,6 @@ lang    = "python"
 group   = "bench.sat"
 summary = "Classify a sat_compare results JSON: bucket instances and attribute the gap by family."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 docs    = "scripts/sat_bench/README.md"
 
 [[script]]
@@ -204,17 +137,6 @@ group   = "bench.sat"
 summary = "Soundness audit for the BVE-enabled build: flag wrong answers on known-verdict instances."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-docs    = "scripts/sat_bench/README.md"
-
-[[script]]
-name    = "sat-combine-threeway"
-path    = "scripts/sat_bench/combine_threeway.py"
-lang    = "python"
-group   = "bench.sat"
-summary = "Combine the split three-way @300s result JSONs into the full-set verdict."
-publish = "public"
-cli_note = "no fronting subcommand yet"
 docs    = "scripts/sat_bench/README.md"
 
 [[script]]
@@ -224,7 +146,16 @@ lang    = "python"
 group   = "corpus.fetch"
 summary = "Download a stratified sample of SAT-COMP main_2025 from GBD by content hash."
 publish = "public"
-cli_note = "no fronting subcommand yet; absorb into corpora.toml (gbd) post-0.1.0"
+
+[[script]]
+name    = "satcomp26-official-fetch"
+path    = "scripts/sat_bench/fetch_satcomp2026_official.py"
+lang    = "python"
+group   = "corpus.fetch"
+summary = "Provision the 400 instances SAT-COMP 2026 actually scored (the instanceid column of the official scores.csv) from the GBD mirror, binding each file to its instanceid by recomputing the GBD hash, and write SC2026.official.csv."
+publish = "public"
+cli_note = "named by benchmarks/corpora.toml satcomp-2026-main-official; stays until `ay corpus` can read instanceid-keyed manifests"
+docs    = "benchmarks/sat/satcomp2026-main/README.md"
 
 [[script]]
 name    = "mzn-run"
@@ -235,7 +166,6 @@ summary = "Run AY over the MiniZinc Challenge 2025 corpus; emit a results vector
 publish = "public"
 tools   = ["minizinc"]
 requires = ["oom-guard"]
-cli     = "ay bench compare run mznc-2025"
 
 [[script]]
 name    = "mzn-score"
@@ -254,7 +184,6 @@ group   = "compare.mzn"
 summary = "Score an AY results vector against the real MiniZinc Challenge 2025 field."
 publish = "public"
 requires = ["mzn-score"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "mzn-setup"
@@ -264,7 +193,6 @@ group   = "compare.mzn"
 summary = "Reconstitute the MiniZinc Challenge 2025 harness on a fresh machine (minizinc, corpus, fzn-exec)."
 publish = "public"
 tools   = ["minizinc"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "oom-guard"
@@ -276,6 +204,53 @@ publish = "public"
 entrypoint = "library"
 
 [[script]]
+name    = "cargo-frontend-lib"
+path    = "scripts/lib/cargo_frontend.sh"
+lang    = "sh"
+group   = "lib"
+summary = "The Cargo-family frontend for scripts that ship publicly: `targo` (unverified lane for compiling subcommands) where the Trust toolchain is installed, plain `cargo` on a host without it."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "z3-oracle"
+path    = "scripts/_z3_oracle.py"
+lang    = "python"
+group   = "lib"
+summary = "The one z3 oracle resolver for scripts (mirrors ay-sys z3_oracle): Z3_PATH, else the first z3 on PATH that proves it is z3 (banner plus a negative control), reached by path past aterm reroute stubs."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "z3-oracle-tests"
+path    = "scripts/tests/test_z3_oracle.py"
+lang    = "python"
+group   = "test"
+summary = "Tests the script-side z3 oracle resolver against fake z3 programs: reroute stubs and impostors are passed over, a wrong Z3_PATH never falls back."
+publish = "public"
+requires = ["z3-oracle"]
+entrypoint = "test"
+
+[[script]]
+name    = "z3-reference"
+path    = "scripts/_z3_reference.py"
+lang    = "python"
+group   = "lib"
+summary = "Reads ci/z3.pin (the one statement of which z3 bytes the differential gate is measured against) and provisions this host's row of the pinned upstream release asset into a read-only, content-addressed user cache (ay-z3 under XDG_CACHE_HOME, else ~/.cache): archive size and sha256, members and bin/z3 sha256 checked; --path is offline. Provisions z3, so it requires none."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "z3-reference-tests"
+path    = "scripts/tests/test_z3_reference.py"
+lang    = "python"
+group   = "test"
+summary = "Tests the ci/z3.pin reader and provisioner with fabricated pins and fake archives, offline: malformed pins, archives or binaries that differ from the pin, oversized downloads and members outside the one top directory are refused; the installed tree is read-only, idempotent and never overwritten."
+publish = "public"
+requires = ["z3-reference", "z3-oracle-tests"]
+entrypoint = "test"
+
+[[script]]
 name    = "nra-oracle-shards"
 path    = "scripts/nra_oracle_shards.py"
 lang    = "python"
@@ -283,7 +258,7 @@ group   = "oracle.nra"
 summary = "Run resource-enveloped ay-nra-oracle fuzz shards with bounded concurrency and durable abandonment evidence."
 publish = "public"
 requires = ["oom-guard", "nra-oracle-campaign", "nra-oracle-shards-lib"]
-cli_note = "no fronting subcommand yet; requires a prebuilt ay-nra-oracle binary and an explicit trusted Z3 path"
+cli_note = "requires a prebuilt ay-nra-oracle binary and an explicit trusted Z3 path"
 
 [[script]]
 name    = "nra-oracle-campaign"
@@ -325,6 +300,16 @@ requires = ["nra-oracle-shards", "nra-oracle-campaign", "nra-oracle-shards-lib"]
 entrypoint = "test"
 
 [[script]]
+name    = "cargo-frontend-tests"
+path    = "scripts/tests/test_cargo_frontend.py"
+lang    = "python"
+group   = "test"
+summary = "Drive cargo_frontend.sh with recording stubs (Trust host, public host, stock Cargo under the targo name), and scan the exported shell scripts for a direct targo command."
+publish = "public"
+requires = ["cargo-frontend-lib"]
+entrypoint = "test"
+
+[[script]]
 name    = "oom-guard-tests"
 path    = "scripts/tests/test_oom_guard.py"
 lang    = "python"
@@ -332,15 +317,6 @@ group   = "test"
 summary = "Tests for _oom_guard.py resource planning and the harness wiring."
 publish = "public"
 entrypoint = "test"
-
-[[script]]
-name    = "no-python-test-skips"
-path    = "scripts/check_no_python_test_skips.py"
-lang    = "python"
-group   = "test"
-summary = "Fail-closed AST gate forbidding active skips and expected failures in first-party Python."
-publish = "public"
-cli_note = "no fronting subcommand yet; run the gate directly via `ay scripts run no-python-test-skips`"
 
 [[script]]
 name    = "sat-soundness-gate-resource-tests"
@@ -352,75 +328,16 @@ publish = "public"
 entrypoint = "test"
 
 [[script]]
-name    = "no-python-test-skips-tests"
-path    = "scripts/tests/test_no_python_test_skips.py"
-lang    = "python"
-group   = "test"
-summary = "Adversarial self-tests and repository-cleanliness pin for the Python zero-skip gate."
-publish = "public"
-entrypoint = "test"
-
-[[script]]
-name    = "continuous-benchmark-tests"
-path    = "scripts/tests/test_continuous_benchmark.py"
-lang    = "python"
-group   = "test"
-summary = "Unit and disposable-Git-worktree tests for the continuous benchmark campaign driver."
-publish = "public"
-entrypoint = "test"
-
-[[script]]
-name    = "chccomp-campaign-oom-guard-tests"
-path    = "scripts/tests/test_chccomp_campaign_oom_guard.py"
-lang    = "python"
-group   = "test"
-summary = "Resource-envelope recording checks for the CHC campaign scripts."
-publish = "public"
-entrypoint = "test"
-
-[[script]]
-name    = "chc-parity-diff"
-path    = "scripts/chc_parity_diff.py"
+name    = "chc-session-replay"
+path    = "scripts/chc_session_replay.py"
 lang    = "python"
 group   = "bench.chc"
-summary = "CHC parity differential: ay --chc vs z3 fp.engine=spacer on a benchexec .set."
+summary = "Pack, unpack, replay and summarize HornSmt session query dumps: the crates/ay-chc/tests/fixtures/session_replay corpus format, a Rust-harness replay (warm session vs fresh context vs z3 vs the recorded verdict), and a z3 verdict census."
 publish = "public"
+requires = ["z3-oracle"]
 tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chc-flag-ab"
-path    = "scripts/chc_flag_ab.py"
-lang    = "python"
-group   = "bench.chc"
-summary = "A/B a set of ay --chc env configs on the ref_only instances from a baseline JSON."
-publish = "public"
-tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chc-refonly-time"
-path    = "scripts/chc_refonly_time.py"
-lang    = "python"
-group   = "bench.chc"
-summary = "Measure how many ref_only instances AY closes at a longer, competition-realistic timeout."
-publish = "public"
-tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chc-disagreement-audit"
-path    = "scripts/chc_disagreement_audit.py"
-lang    = "python"
-group   = "bench.chc"
-summary = "Arbitrate every AY-vs-ground-truth disagreement in a harness run."
-publish = "public"
-tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+cli_note = "`run` drives ay-chc's replay_dir_from_env test through AY_REPLAY_DIR"
+docs    = "crates/ay-chc/tests/fixtures/session_replay/README.md"
 
 [[script]]
 name    = "proof-checkability-sweep"
@@ -429,18 +346,60 @@ lang    = "python"
 group   = "audit.proof"
 summary = "Sweep a corpus for AY UNSAT verdicts that are independently kernel-checkable via the complete-conflict Lean firewall, cross-checking each verdict against z3 and :status."
 publish = "public"
+requires = ["z3-oracle"]
 tools   = ["z3"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
-name    = "ufbv-fixpoint-audit"
-path    = "scripts/ufbv_fixpoint_audit.py"
+name    = "check-proofs"
+path    = "scripts/check_proofs.sh"
+lang    = "bash"
+group   = "audit.proof"
+summary = "Run AY over a corpus or selection and put every emitted Alethe proof through carcara, failing on any invalid proof, counting holey ones, and refusing a run that checked nothing."
+publish = "public"
+tools   = ["carcara"]
+cli_note = "its classifications are pinned by selftest-proof-harness"
+
+[[script]]
+name    = "selftest-proof-harness"
+path    = "scripts/selftest_proof_harness.py"
+lang    = "python"
+group   = "test"
+summary = "Regression test for the proof instruments: runs check_proofs.sh and soundness_sweep.py unmodified over benchmarks/proof-fixtures with a stub solver, and under --seed-fault re-introduces each historical harness defect to prove the suite goes red."
+publish = "public"
+tools   = ["carcara", "z3"]
+requires = ["check-proofs", "smt-soundness-sweep", "z3-oracle"]
+cli_note = "documented in benchmarks/proof-fixtures/README.md"
+docs    = "benchmarks/proof-fixtures/README.md"
+
+[[script]]
+name    = "unsat-cert-census"
+path    = "scripts/unsat_cert_census.sh"
+lang    = "bash"
+group   = "audit.proof"
+summary = "Run `ay solve --no-proof -T:10` once per file over a .smt2 list with bounded parallelism and a hard per-file wall, writing the verdict/exit-code/wall ledger that makes UNSAT-certification census runs comparable."
+publish = "public"
+cli_note = "the AY_CENSUS=1 rejection-path probe that yields census rows is not committed, so a stock build yields the ledger only"
+
+[[script]]
+name    = "smt-soundness-sweep"
+path    = "scripts/soundness_sweep.py"
 lang    = "python"
 group   = "audit.smt"
-summary = "Guarded two-lane production and self-check audit of the exact 121-file quantified UFBV fixpoint family."
+summary = "Sweep an SMT-LIB corpus through `ay --z3-mode` on stdin for wrong answers and definite-but-undecided output, confirming a hit only when z3 and cvc5 --finite-model-find agree against AY."
 publish = "public"
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["z3-oracle"]
+tools   = ["z3", "cvc5"]
+cli_note = "self-tested by scripts/selftest_proof_harness.py against benchmarks/proof-fixtures"
+docs    = "benchmarks/proof-fixtures/README.md"
+
+[[script]]
+name    = "quantifier-census"
+path    = "scripts/quantifier_census.py"
+lang    = "python"
+group   = "audit.smt"
+summary = "Z3-parity quantifier-bucket census: select quantifier-reason rows from division-scan records, run AY under --stats-full --debug-cert to attribute the declining gate and :quantifier.* counters, record how z3 routes the same files, and histogram the result."
+publish = "public"
+tools   = ["z3"]
 
 [[script]]
 name    = "chc-cert-check"
@@ -450,69 +409,6 @@ group   = "audit.chc"
 summary = "Independent CHC SAFE-certificate checker (external SMT arbiter)."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chc-baseline-compare"
-path    = "scripts/chc_baseline_compare.py"
-lang    = "python"
-group   = "gate.chc"
-summary = "Compare current AY CHC results against a checked-in baseline snapshot."
-publish = "public"
-requires = ["oom-guard"]
-cli     = "ay submission"
-
-[[script]]
-name    = "chccomp-build-baseline"
-path    = "scripts/chccomp_build_baseline.py"
-lang    = "python"
-group   = "bench.chc"
-summary = "Assemble a CHC regression baseline from prior AY harness runs."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs); delete after one release"
-
-[[script]]
-name    = "chccomp-regression"
-path    = "scripts/chccomp_regression.py"
-lang    = "python"
-group   = "gate.chc"
-summary = "Regression safety net: re-run every baselined CHC solve; fail on wrong answers or regressions."
-publish = "public"
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chccomp-track-sweep"
-path    = "scripts/chccomp_track_sweep.py"
-lang    = "python"
-group   = "bench.chc"
-summary = "Stratified-sample standings sweep across CHC-COMP tracks."
-publish = "public"
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "chccomp-late-preflight"
-path    = "scripts/chccomp_late_entry_preflight.py"
-lang    = "python"
-group   = "compat.chc"
-summary = "Compatibility wrapper for the Rust CHC-COMP late-entry preflight."
-publish = "public"
-status  = "deprecated"
-replaced_by = "ay submission"
-cli_note = "compat shim for ay submission"
-
-[[script]]
-name    = "chccomp-late-artifact-check"
-path    = "scripts/chccomp_late_entry_artifact_build_check.py"
-lang    = "python"
-group   = "compat.chc"
-summary = "Compatibility metadata for CHC-COMP late-entry artifact checks."
-publish = "public"
-status  = "deprecated"
-replaced_by = "ay submission"
-cli_note = "compat shim for ay submission"
 
 [[script]]
 name    = "rewrite-oracle-build"
@@ -521,7 +417,6 @@ lang    = "python"
 group   = "oracle.rewrite"
 summary = "Regenerate the fast-core rewrite golden oracle from AY harness results."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "rewrite-oracle-check"
@@ -531,7 +426,6 @@ group   = "oracle.rewrite"
 summary = "Regression oracle for the hash-consing / fast-core rewrite: run a binary on the golden verdict set."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "sat-soundness-gate"
@@ -540,26 +434,14 @@ lang    = "bash"
 group   = "gate.soundness"
 summary = "SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts."
 publish = "public"
-cli     = "ay gate"
 
 [[script]]
 name    = "smt-soundness-gate"
 path    = "scripts/ci/smt_soundness_gate.sh"
 lang    = "bash"
 group   = "gate.soundness"
-summary = "SMT soundness-differential gate; the in-tree pre-push net."
+summary = "SMT soundness-differential gate: hermetic declared-status regressions, and a 2-solver diff against libz3 where it is present."
 publish = "public"
-cli     = "ay gate"
-
-[[script]]
-name    = "pre-push-hook"
-path    = "scripts/git-hooks/pre-push"
-lang    = "bash"
-group   = "hook"
-summary = "In-tree pre-push hook: enforces zero active Python test skips, then runs the SMT soundness gate."
-publish = "public"
-entrypoint = "hook"
-docs    = "scripts/git-hooks/README.md"
 
 [[script]]
 name    = "string-ground-diff-fuzz"
@@ -568,7 +450,6 @@ lang    = "bash"
 group   = "fuzz"
 summary = "Scale runner for the differential fuzz harness guarding the proof checker's independent ground string/regex evaluator (string_ground.rs)."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "smt-diff-fuzz"
@@ -578,8 +459,7 @@ group   = "fuzz"
 summary = "Differential SMT fuzzer: random well-typed formulas in a declared logic, AY vs Z3."
 publish = "public"
 tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["oom-guard", "z3-oracle"]
 
 [[script]]
 name    = "smt-diff-fuzz-dt"
@@ -589,8 +469,16 @@ group   = "fuzz"
 summary = "Differential SMT fuzzer for datatypes (QF_DT, QF_UFDT, QF_UFDTLIA, AUFDTLIA)."
 publish = "public"
 tools   = ["z3"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["oom-guard", "z3-oracle"]
+
+[[script]]
+name    = "lia-mod-diff-fuzz"
+path    = "scripts/fuzz/lia_mod_diff_fuzz.py"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential fuzzer for QF_LIA with mod/div by small constants (parity/lattice obligations), AY vs Z3."
+publish = "public"
+tools   = ["z3"]
 
 [[script]]
 name    = "word-eq-diff-fuzz"
@@ -600,7 +488,6 @@ group   = "fuzz"
 summary = "Differential soundness fuzz for word-equation (string) solving."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "planted-sat-fuzz"
@@ -610,7 +497,6 @@ group   = "fuzz"
 summary = "Differential soundness fuzz for SCC equivalent-literal substitution on planted-SAT CNFs."
 publish = "public"
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "z3py-cascade-check"
@@ -619,7 +505,6 @@ lang    = "python"
 group   = "audit.z3"
 summary = "Stock-z3py cascade verification against AY's libz3-compatible dylib."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "smtcomp-fetch"
@@ -628,7 +513,16 @@ lang    = "bash"
 group   = "corpus.fetch"
 summary = "Fetch SMT-LIB non-incremental benchmarks for a logic into benchmarks/smtcomp/<LOGIC>/."
 publish = "public"
-cli_note = "fold into corpora.toml http entries post-0.1.0"
+
+[[script]]
+name    = "smtlib2025-fetch"
+path    = "scripts/fetch_smtlib2025_corpus.py"
+lang    = "python"
+group   = "corpus.fetch"
+summary = "Fetch the SMT-LIB 2025 archives SMT-COMP 2025 used (Zenodo 15493090 non-incremental, 15493096 incremental) into benchmarks/smtlib-2025/<kind>/<LOGIC>/, prefix-safe, resumable and reporting logics the record lacks."
+publish = "public"
+tools   = ["zstd"]
+cli_note = "reads the division list from an smtcomp.github.io checkout at .competitors/smtcomp-io"
 
 [[script]]
 name    = "smtcomp-fixtures"
@@ -637,45 +531,6 @@ lang    = "bash"
 group   = "corpus.prepare"
 summary = "Populate flat SMT-COMP fixture paths by linking already-downloaded SMT-LIB 2025 files into benchmarks/smtcomp/."
 publish = "public"
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "satlib-fetch"
-path    = "scripts/download_satlib_benchmarks.sh"
-lang    = "bash"
-group   = "corpus.fetch"
-summary = "Fetch the SATLIB uniform-random 3-SAT sets the ay-sat soundness/DRAT tests resolve."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs); convert to corpora.toml entries post-0.1.0"
-
-[[script]]
-name    = "mzn-fetch"
-path    = "scripts/download_minizinc_benchmarks.sh"
-lang    = "bash"
-group   = "corpus.fetch"
-summary = "Fetch and compile the MiniZinc Challenge 2024 FlatZinc instances the ay-flatzinc tests resolve."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs); convert to corpora.toml entries post-0.1.0"
-
-[[script]]
-name    = "satcomp24-sample-fetch"
-path    = "scripts/fetch_satcomp_sample.sh"
-lang    = "bash"
-group   = "corpus.fetch"
-summary = "Fetch the SAT-COMP 2024 sample corpus from the public GBD mirror."
-publish = "public"
-cli     = "ay corpus download satcomp2024-sample"
-
-[[script]]
-name    = "satcomp25-sample-fetch"
-path    = "scripts/_fetch_sat2025_sample.sh"
-lang    = "bash"
-group   = "corpus.fetch"
-summary = "Fetch a size-bounded SAT-COMP 2025 main-track sample for local iteration benchmarking."
-publish = "public"
-cli_note = "no corpora.toml entry yet"
 
 [[script]]
 name    = "milp-compare"
@@ -686,7 +541,6 @@ summary = "ay-milp vs HiGHS verdict agreement on the real .milp corpus."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet; rename file to milp_compare.py post-0.1.0"
 
 [[script]]
 name    = "milp2mps"
@@ -697,7 +551,6 @@ summary = "Convert the .milp serialization to standard MPS (bit-exact f64 fields
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "milp-refsolve"
@@ -708,7 +561,6 @@ summary = "HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS 
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "lp-bench"
@@ -718,8 +570,7 @@ group   = "bench.milp"
 summary = "Time LP/MILP solvers on a corpus and compare verdicts."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
+requires = ["oom-guard", "z3-oracle"]
 
 [[script]]
 name    = "miplib-bench"
@@ -730,7 +581,6 @@ summary = "Run ay-milp and HiGHS on the same MPS files and compare verdicts."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
 requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "milp-corpus"
@@ -741,7 +591,6 @@ summary = "Fetch and index the MIPLIB 2017 corpus (+ .solu reference optima) the
 publish = "public"
 tools   = []
 requires = []
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "milp-w0"
@@ -752,7 +601,6 @@ summary = "W0 attribution harness: root closure, solver baselines, per-knob abla
 publish = "public"
 tools   = ["highs", "gurobi"]
 requires = ["milp-corpus"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "solver-portfolio"
@@ -762,36 +610,135 @@ group   = "bench.milp"
 summary = "Run AY against a portfolio of reference MILP solvers at matched single-thread budgets."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
-name    = "maxsat-retro-report"
-path    = "scripts/maxsat_retro_report.py"
+name    = "milp-limit-invariance"
+path    = "scripts/milp_limit_invariance.py"
 lang    = "python"
-group   = "report.maxsat"
-summary = "Summarize ay maxsat bench JSON reports into the retroactive MSE leaderboard markdown."
+group   = "bench.milp"
+summary = "Load-free wall-coupling instrument: solve each gate-corpus model at two --limit values and flag any model whose proved objective or node count differs, with --check against the recorded partition."
 publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs); candidate `ay maxsat bench --report` absorption"
+requires = ["milp-gate-corpus"]
 
 [[script]]
-name    = "maxsat-tournament-report"
-path    = "scripts/maxsat_tournament_report.py"
+name    = "milp-decision-census"
+path    = "scripts/milp_decision_census.py"
 lang    = "python"
-group   = "report.maxsat"
-summary = "Merge ay maxsat bench --solver JSON reports into a same-hardware tournament leaderboard."
+group   = "bench.milp"
+summary = "Node-rate steering census: drive an mps_solve built with --features dcensus at ambient and spinner-induced load and report per-site evals and fires, the wall coupling limit-invariance cannot see."
 publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs); candidate `ay maxsat bench --report` absorption"
+requires = ["milp-gate-corpus"]
+cli_note = "needs an mps_solve built with --features dcensus"
 
 [[script]]
-name    = "pb-bench"
-path    = "scripts/pb_bench.sh"
-lang    = "sh"
-group   = "bench.pb"
-summary = "Parallel PB benchmark runner for AY."
+name    = "milp-portfolio"
+path    = "scripts/milp_portfolio.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Measure ay-milp configuration arms per instance, a single-thread Gurobi baseline, and the oracle-minus-default coverage gap: the evidence a tune::select rule must carry."
 publish = "public"
-cli_note = "no fronting subcommand yet"
+tools   = ["gurobi"]
+requires = ["rebuild-milp-bench"]
+
+[[script]]
+name    = "milp-lp-gap"
+path    = "scripts/milp_lp_gap.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Three-arm LP-gap harness: run the diag lp-only scaffold, the diag shipped-lp lane and HiGHS on the same LPs, interleaved, to separate the solver's LP gap from the measurement scaffold's."
+publish = "public"
+tools   = ["highs"]
+requires = ["lp-gap-highs", "rebuild-milp-bench"]
+
+[[script]]
+name    = "lp-gap-highs"
+path    = "scripts/lp_gap_highs.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Solve one LP relaxation through highspy in a fresh process and print one timed `highs_lp:` line, the reference arm of milp-lp-gap."
+publish = "public"
+tools   = ["highs"]
+cli_note = "invoked as a subprocess by milp-lp-gap's highs arm"
+
+[[script]]
+name    = "rebuild-milp-bench"
+path    = "scripts/rebuild_milp_bench.py"
+lang    = "python"
+group   = "corpus.fetch"
+summary = "Rebuild ~/ay-bench/milp (MIPLIB 2017 instances, .solu and a tiered manifest.json) from the name list embedded in the script, for the MILP harnesses that read that corpus."
+publish = "public"
+requires = ["milp-corpus"]
+
+[[script]]
+name    = "milp-gate-corpus"
+path    = "scripts/milp_gate_corpus.py"
+lang    = "python"
+group   = "corpus.fetch"
+summary = "Verify or rebuild the sha256-pinned MILP gate corpus (.milp_gate_corpus.tsv) under ~/ay-bench/milp-gate/instances, so the MILP gates are reproducible from the repository alone."
+publish = "public"
+cli_note = "run by the MILP nightly (--verify); the MILP gates import its DEFAULT_CORPUS and point here to rebuild"
+
+[[script]]
+name    = "milp-node-gate"
+path    = "scripts/milp_node_gate.py"
+lang    = "python"
+group   = "gate.milp"
+summary = "Exact node-count ratchet: re-solve the twenty deterministic MIPLIB pins in .milp_node_baseline.toml and fail on any node, objective or status drift, so a node-economy regression is caught at push time."
+publish = "public"
+requires = ["milp-gate-corpus"]
+cli_note = "run by the landing lanes' milp-node leg and the MILP nightly; `ay gate` does not invoke it"
+
+[[script]]
+name    = "milp-corpus-guard"
+path    = "scripts/corpus_guard.py"
+lang    = "python"
+group   = "gate.milp"
+summary = "Broad MILP drift guard decided by counts: re-measure shipped ay-milp defaults on the gate corpus against reports/corpus-baseline.json, catching work-only (simplex iterations at unchanged nodes) and limit-invariance regressions the exact node ratchet cannot see; a wall time decides nothing, and a solve its wall limit ended is COULD NOT RUN unless the counts it reached are already past the baseline's."
+publish = "public"
+requires = ["milp-gate-corpus"]
+cli_note = "run by the private landing driver and the MILP nightly; `ay gate` does not invoke it"
+
+[[script]]
+name    = "milp-corpus-guard-provenance-tests"
+path    = "scripts/tests/test_corpus_guard_provenance.py"
+lang    = "python"
+group   = "test"
+summary = "Validates corpus_guard's provenance overrides against the committed reports/corpus-baseline.json and refuses an override that names no result or records a measurement time that is neither a string nor null."
+publish = "public"
+requires = ["milp-corpus-guard"]
+entrypoint = "test"
+cli_note = "reads the committed reports/corpus-baseline.json; no solver or corpus"
+
+[[script]]
+name    = "gate-load-precondition-tests"
+path    = "scripts/tests/test_gate_load_precondition.py"
+lang    = "python"
+group   = "test"
+summary = "Pins the MILP node ratchet's quiet-box precondition, and holds corpus_guard's verdicts to counts on synthetic records: a wall-only slowdown decides nothing, moved nodes or work fail, a solve its wall limit ended could not run unless its counts already decided, the clock-steered instance decides only its answer and status, and a baseline the clock decided is not written."
+publish = "public"
+requires = ["milp-corpus-guard", "milp-node-gate"]
+entrypoint = "test"
+
+[[script]]
+name    = "milp-nightly-guard"
+path    = "scripts/nightly_corpus_guard.sh"
+lang    = "zsh"
+group   = "gate.milp"
+summary = "Nightly MILP wrapper: build ay-milp at HEAD, verify the gate corpus, then run the node ratchet, the banded corpus guard and the exact-rim ratchet, leaving a dated log under the development design notes"
+publish = "public"
+requires = ["milp-gate-corpus", "milp-node-gate", "milp-corpus-guard"]
+cli_note = "run by the LaunchAgent milp-nightly-guard-install writes; no fronting subcommand"
+
+[[script]]
+name    = "milp-nightly-guard-install"
+path    = "scripts/install_nightly_guard.sh"
+lang    = "zsh"
+group   = "gate.milp"
+summary = "Install, remove or report the macOS LaunchAgent that runs the MILP nightly guard at 03:17 local time, so the guard runs when no session is open."
+publish = "public"
+tools   = ["launchctl"]
+requires = ["milp-nightly-guard"]
+cli_note = "macOS-only launchd installer; no fronting subcommand"
 
 [[script]]
 name    = "pb-cert-coverage"
@@ -801,7 +748,6 @@ group   = "bench.pb"
 summary = "PB certificate coverage probe: solve with --proof and check emitted proofs with VeriPB."
 publish = "public"
 tools   = ["veripb"]
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "pb-results-analyze"
@@ -810,46 +756,6 @@ lang    = "python"
 group   = "report.pb"
 summary = "Consolidate a PB competition results mirror into clean structured data."
 publish = "public"
-cli_note = "no fronting subcommand yet; seed for `bench compare import` parsers"
-
-[[script]]
-name    = "proof-overhead-gate"
-path    = "scripts/proof_overhead.py"
-lang    = "python"
-group   = "gate.pb"
-summary = "Proof Tap overhead gate: dense-tap proof-on vs plain, median <= 2x."
-publish = "public"
-requires = ["oom-guard"]
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "pb-audit"
-path    = "scripts/pb_audit.sh"
-lang    = "sh"
-group   = "bench.pb"
-summary = "PB soundness audit: verify SAT/OPTIMUM models with an external OPB model checker named by $MODEL_CHECKER (still broken: no validator is tracked in-repo)."
-publish = "public"
-status  = "broken"
-cli_note = "broken; needs MODEL_CHECKER=<check_opb.py>. Now exits 2 when unset, requires checker exit 0, and compares exact VALID/INVALID tokens"
-
-[[script]]
-name    = "pb-ab-compare"
-path    = "scripts/pb_ab_compare.py"
-lang    = "python"
-group   = "bench.pb"
-summary = "A/B compare two ay-pb binaries over a PB corpus."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs)"
-
-[[script]]
-name    = "pb-package"
-path    = "scripts/pb_package.sh"
-lang    = "sh"
-group   = "competition.pb"
-summary = "Build a PB-COMP submission tarball from the current git HEAD."
-publish = "public"
-cli     = "ay submission"
 
 [[script]]
 name    = "cert-ci-gate"
@@ -859,7 +765,7 @@ group   = "gate.pb"
 summary = "CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1)."
 publish = "public"
 tools   = ["veripb"]
-cli_note = "switch to `ay tool which veripb` post-0.1.0"
+requires = ["veripb-verdict-lib", "veripb-build-id-lib"]
 
 [[script]]
 name    = "veripb-verdict-lib"
@@ -871,6 +777,15 @@ publish = "public"
 entrypoint = "library"
 
 [[script]]
+name    = "veripb-build-id-lib"
+path    = "scripts/lib/veripb_build_id.sh"
+lang    = "sh"
+group   = "gate.pb"
+summary = "The one shell-side authority for the pinned VeriPB cache key: resolves the compiler cargo will run and keys the checker cache by VeriPB commit, patch hash and that compiler, byte-for-byte with the Rust resolvers."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
 name    = "veripb-fake-checker-gate"
 path    = "scripts/ci/veripb_fake_checker_gate.sh"
 lang    = "sh"
@@ -878,18 +793,30 @@ group   = "gate.pb"
 summary = "Runs every VeriPB-backed gate against the four fake checkers in ci/fake-checkers/ and fails if any gate passes."
 publish = "public"
 tools   = ["veripb"]
-requires = ["veripb-verdict-lib"]
-cli_note = "no fronting subcommand yet; needs a real veripb for the delegate + control case"
+requires = ["veripb-verdict-lib", "veripb-build-id-lib"]
+cli_note = "needs a real veripb for the delegate + control case"
 
 [[script]]
 name    = "pb-certified-gate"
 path    = "scripts/ci/pb_certified_gate.sh"
 lang    = "sh"
 group   = "gate.pb"
-summary = "PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the six known wrong-verdict fixtures."
+summary = "PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the twenty-two known wrong-verdict fixtures."
 publish = "public"
 tools   = ["veripb"]
+requires = ["veripb-verdict-lib", "veripb-build-id-lib"]
 cli_note = "run directly; builds/runs ay-pb from the exact checkout and builds the pinned checker on demand; AY_PB_BIN explicitly opts into an external solver"
+
+[[script]]
+name    = "pb-cli-manifest-gate"
+path    = "scripts/pb_cli_manifest_gate.sh"
+lang    = "bash"
+group   = "gate.pb"
+summary = "Run the certified-track manifest (ci/cert-instances/manifest.tsv) through the shipped `ay pb solve --proof` and require the manifest status plus the exact pinned-VeriPB `s VERIFIED` conclusion on every row, counting documented refusals separately."
+publish = "public"
+tools   = ["veripb"]
+requires = ["veripb-verdict-lib"]
+cli_note = "run directly as <ay-bin> <veripb> [timeout_ms]; not yet wired into pb_certified_gate.sh or the private landing driver"
 
 [[script]]
 name    = "linux-static-build"
@@ -950,27 +877,6 @@ entrypoint = "library"
 cli_note = "wired into .cargo/config.toml — do not move"
 
 [[script]]
-name    = "satcomp-matrix-shim"
-path    = "scripts/run_satcomp_matrix.sh"
-lang    = "bash"
-group   = "compat.sat"
-summary = "Legacy SAT-COMP matrix wrapper; superseded by native ay verbs."
-publish = "public"
-status  = "deprecated"
-replaced_by = "ay"
-cli_note = "compat shim"
-
-[[script]]
-name    = "chccomp-docker-env"
-path    = "scripts/docker_test_env.sh"
-lang    = "bash"
-group   = "dev"
-summary = "Docker test environment for CHC-COMP runs."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs)"
-
-[[script]]
 name    = "public-clone-check"
 path    = "scripts/public-clone-check.sh"
 lang    = "bash"
@@ -989,33 +895,24 @@ publish = "public"
 cli_note = "run directly; intentionally uses a fresh release target directory"
 
 [[script]]
-name    = "setup-audit-tools"
-path    = "scripts/setup-audit-tools.sh"
-lang    = "bash"
-group   = "dev"
-summary = "Install the external checkers/solvers the z3-audit full-replacement replay needs."
-publish = "public"
-status  = "deprecated"
-replaced_by = "ay tool install --group audit"
-cli_note = "retired once tools.toml recipes land"
-
-[[script]]
-name    = "critical-solver-policy-gate"
-path    = "scripts/check_critical_solver_policy.sh"
+name    = "govern-armed-gate"
+path    = "scripts/check_govern_armed.sh"
 lang    = "bash"
 group   = "gate.release"
-summary = "Enforce that changes to critical solver files land with native solver gate evidence."
+summary = "Fail unless every workspace bin target's main (found through include!) opens with ay_sys::govern::arm(), so no binary can allocate without the in-image kernel memory bound."
 publish = "public"
-cli     = "ay gate"
+cli_note = "run directly (cargo metadata + python3); also step [8] of govern-image-check; not yet wired into the private landing driver"
 
 [[script]]
-name    = "doc-reality-gate"
-path    = "scripts/check_doc_reality.sh"
+name    = "govern-image-check"
+path    = "scripts/verify_govern_image.sh"
 lang    = "bash"
 group   = "gate.release"
-summary = "Check that local Markdown links in AY's public documentation resolve inside the checkout."
+summary = "Prove on macOS that a release ay's in-image memory bound holds: normal solves are unaffected, an unarmed control runs unbounded, and a 192 MB GOVERN_AY_MB budget stops a pigeonhole hog for the binary, a renamed copy, a copy at a new path and an orphan."
 publish = "public"
-cli     = "ay gate"
+tools   = ["timeout"]
+requires = ["govern-armed-gate"]
+cli_note = "run directly; takes several minutes; without GNU timeout on PATH the control and budget steps mis-score (rc 127)"
 
 [[script]]
 name    = "prof-hotspots"
@@ -1024,7 +921,6 @@ lang    = "zsh"
 group   = "dev"
 summary = "Profile AY on a benchmark with macOS sample; print top-of-stack self-time."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "lra-bmc-validate"
@@ -1033,7 +929,6 @@ lang    = "bash"
 group   = "audit.smt"
 summary = "File-aligned soundness + coverage validation for QF_LRA .bmc files."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "lra-ind-validate"
@@ -1042,7 +937,6 @@ lang    = "bash"
 group   = "audit.smt"
 summary = "File-aligned soundness + coverage validation for QF_LRA .ind files."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "sat-portfolio-driver"
@@ -1052,17 +946,6 @@ group   = "competition.sat"
 summary = "Competition portfolio driver (SAT parallel/cloud track): race full ay solve --competition configs."
 publish = "public"
 entrypoint = "convention"
-
-[[script]]
-name    = "maxsat-driver"
-path    = "competition/maxsat_run.sh"
-lang    = "sh"
-group   = "competition.maxsat"
-summary = "Competition driver for the weighted/unweighted MaxSAT track."
-publish = "public"
-status  = "deprecated"
-entrypoint = "convention"
-cli_note = "deprecated pending human review (zero refs)"
 
 [[script]]
 name    = "mc2026-build"
@@ -1121,13 +1004,13 @@ publish = "public"
 cli_note = "shipped caller cmd_submission.rs"
 
 [[script]]
-name    = "sat26-package"
-path    = "competition/prepare_sat26_submission.sh"
+name    = "sat26-memory-limit"
+path    = "competition/sat26_memory_limit.sh"
 lang    = "bash"
 group   = "competition.sat"
-summary = "Prepare the SAT-COMP 2026 submission package."
+summary = "SAT-COMP 2026 memory limit (32,000,000,000 bytes) every SAT-COMP launcher passes as ay's --memory-ceiling-bytes ceiling and GOVERN_AY_MB budget."
 publish = "public"
-cli_note = "no fronting subcommand yet"
+entrypoint = "library"
 
 [[script]]
 name    = "fzn-exec"
@@ -1140,32 +1023,12 @@ entrypoint = "convention"
 cli_note = "declared in ay.msc"
 
 [[script]]
-name    = "chccomp-slurm-worker"
-path    = "deploy/cluster/chccomp_slurm_worker.sh"
-lang    = "bash"
-group   = "competition.chc"
-summary = "SLURM array worker driving CHC-COMP harness shards on the cluster."
-publish = "public"
-entrypoint = "convention"
-
-[[script]]
 name    = "mzn-gen-community"
 path    = "benchmarks/minizinc/gen_community.py"
 lang    = "python"
 group   = "corpus.gen"
 summary = "Generate a FlatZinc community-detection benchmark (mexican.s26.k4-like)."
 publish = "public"
-cli_note = "no fronting subcommand yet"
-
-[[script]]
-name    = "mzn-local-bench"
-path    = "benchmarks/minizinc/run_benchmarks.sh"
-lang    = "bash"
-group   = "bench.mzn"
-summary = "Run local FlatZinc benchmarks through the competition CLI surface."
-publish = "public"
-status  = "deprecated"
-cli_note = "deprecated (zero refs)"
 
 [[script]]
 name    = "java-binding-smoke"
@@ -1201,7 +1064,6 @@ lang    = "bash"
 group   = "audit.smt"
 summary = "End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones."
 publish = "public"
-cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "resource-harness-tests"

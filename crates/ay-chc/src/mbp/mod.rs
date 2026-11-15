@@ -21,6 +21,9 @@
 //! - `theory_bounds`: Arithmetic bound extraction and linear coefficient normalization
 //! - `theory_bv`: BV-specific variable projection (Fourier-Motzkin analogue for bitvectors)
 //! - `mbqi`: MBQI-style term substitution for unprojectable variables
+//! - `exact`: exact under-approximating projection (Bjørner–Janota LIA,
+//!   model-based Loos–Weispfenning LRA) for the Spacer lane's free POBs
+//! - `ite_split`: model-based splitting of arithmetic ITE terms
 
 // Note: Some methods have &self only for method-call syntax consistency.
 // Per-function #[allow(clippy::only_used_in_recursion)] is used where needed.
@@ -29,7 +32,9 @@ mod array;
 mod datatype;
 mod eval;
 mod eval_bv;
+pub(crate) mod exact;
 mod implicant;
+mod ite_split;
 mod mbqi;
 mod project;
 mod project_residuals;

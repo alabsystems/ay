@@ -12,6 +12,7 @@ use crate::proof_tracker::ProofTracker;
 
 #[path = "funnel_integer.rs"]
 mod integer;
+pub(super) use integer::integer_lattice_kind;
 
 use super::{
     arith_conflict_is_integer, blocking_clause_to_conflict_lits, classify_arith_conflict_kind,
@@ -227,7 +228,7 @@ fn infer_theory_lemma_kind_in_caller_order(
         // negation is satisfiable over ℚ — `2q >= 1 ∧ 2q <= 1` at `q = 1/2`).
         // Ordered here and at the terminal `Generic` below — never ahead of a
         // rational arm. See `funnel_integer.rs` for the priority argument and
-        // for how the two certificate-bearing second-chance passes stay ahead.
+        // for which second-chance passes run ahead of which integer arm.
         if let Some(kind) = integer::integer_lattice_kind(terms, clause) {
             return kind;
         }

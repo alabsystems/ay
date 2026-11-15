@@ -187,7 +187,7 @@ impl LraSolver {
             );
             self.dirty = true;
             self.bounds_tightened_since_simplex = true;
-            self.last_simplex_feasible = false;
+            self.set_last_simplex_feasible(false);
             self.discard_lra_basis_region_candidate();
             // #warm-simplex: a violation slipped past the incremental
             // candidate tracking — fail safe by forcing the next simplex
@@ -250,8 +250,9 @@ impl LraSolver {
         // completion sites — any cascade after this point should re-arm it.
         self.post_simplex_bounds_added = false;
         self.vars_tightened_since_simplex.clear();
+        self.note_tightened_cleared();
         let result = self.dual_simplex_propagate();
-        self.last_simplex_feasible = matches!(result, TheoryResult::Sat);
+        self.set_last_simplex_feasible(matches!(result, TheoryResult::Sat));
         if self.last_simplex_feasible {
             self.save_feasible_snapshot();
             // #warm-simplex: anchor the last-feasible value delta here.

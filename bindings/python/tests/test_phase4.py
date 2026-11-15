@@ -12,7 +12,7 @@
 # sat-or-unknown, never loosened to hide a wrong verdict. No such divergence was
 # observed for the snippets below; all agree exactly.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import pytest
 

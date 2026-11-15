@@ -1,0 +1,53 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): the wrong-length spelling of the
+% `fresh_right` defect (see def_order_transitivity_fresh_right_empty for the
+% full story). `OrderContext::get_transitivity_substitution` zips the variable
+% lists with `izip!`, so a `fresh_right` SHORTER than `right` silently leaves
+% the remaining right variables unsubstituted: the transitivity goals for those
+% components degenerate into their own premises and "transitivity" is proven by
+% `rup >= 1` for a relation that orders x1 < x2 < x3 < x1. The formula is
+% satisfied by `x1 = 1, x2 = 0, x3 = 0`, yet this used to verify as
+% `s VERIFIED UNSATISFIABLE`. The list must have exactly as many variables as
+% `right`, and the grammar documents that ("Must contain the same number of
+% variables as in `right'").
+f 4;
+def_order cyc
+  vars
+    left u1 u2 u3;
+    right v1 v2 v3;
+    aux;
+  end;
+  def
+    1 ~u1 1 v1 1 v2 >= 1;
+    1 ~u2 1 v2 1 v3 >= 1;
+    1 ~u3 1 v3 1 v1 >= 1;
+  end;
+  transitivity
+    vars
+      fresh_right w1;
+    end;
+    proof
+      proofgoal #1
+        rup >= 1;
+      qed;
+      proofgoal #2
+        rup >= 1;
+      qed;
+      proofgoal #3
+        rup >= 1;
+      qed;
+    qed;
+  end;
+end;
+load_order cyc x1 x2 x3;
+dom >= 1 : x1 -> x2 x2 -> x3 x3 -> x1 : subproof
+  proofgoal #4
+    rup 1 ~x1 >= 1;
+    rup 1 ~x2 >= 1;
+    rup 1 ~x3 >= 1;
+    rup >= 1;
+  qed;
+qed;
+output NONE;
+conclusion UNSAT;
+end pseudo-Boolean proof;

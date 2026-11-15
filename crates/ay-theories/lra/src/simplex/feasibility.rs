@@ -155,9 +155,9 @@ impl LraSolver {
             return;
         }
         let violation = self.violates_bounds(var);
-        // Ensure membership bitvec is large enough
-        if vi >= self.in_infeasible_heap.len() {
-            self.in_infeasible_heap.resize(vi + 1, 0);
+        // Ensure membership bitvec is large enough: one stamp per variable id.
+        while self.in_infeasible_heap.len() <= vi {
+            self.in_infeasible_heap.push(0);
         }
         if violation.is_some() && self.in_infeasible_heap[vi] != self.heap_epoch {
             self.in_infeasible_heap[vi] = self.heap_epoch;
@@ -174,8 +174,9 @@ impl LraSolver {
     pub(super) fn rebuild_infeasible_heap(&mut self) {
         self.infeasible_heap.clear();
         let needed = self.vars.len();
-        if self.in_infeasible_heap.len() < needed {
-            self.in_infeasible_heap.resize(needed, 0);
+        // One membership stamp per variable that already exists.
+        while self.in_infeasible_heap.len() < needed {
+            self.in_infeasible_heap.push(0);
         }
         // #inc-heap-epoch: O(1) logical clear of all membership stamps.
         self.bump_heap_epoch();

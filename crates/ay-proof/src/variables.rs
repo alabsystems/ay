@@ -84,9 +84,17 @@ pub(crate) fn collect_proof_variables(
                 }
                 collect_term_vars(*pivot, terms, &mut vars, &mut visited)?;
             }
-            ProofStep::TheoryLemma { clause, .. } => {
+            ProofStep::TheoryLemma { clause, .. } | ProofStep::FiniteFieldLinear { clause, .. } => {
                 for t in clause {
                     collect_term_vars(*t, terms, &mut vars, &mut visited)?;
+                }
+            }
+            ProofStep::NraSos {
+                clause,
+                certificate,
+            } => {
+                for term in clause.iter().chain(certificate.basis.iter().flatten()) {
+                    collect_term_vars(*term, terms, &mut vars, &mut visited)?;
                 }
             }
             ProofStep::Step { clause, args, .. } => {
@@ -275,7 +283,7 @@ pub(crate) fn application_symbol_names(
     names
 }
 
-fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
+pub(crate) fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
     let mut roots = Vec::new();
     for step in &proof.steps {
         match step {
@@ -284,7 +292,16 @@ fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
                 roots.extend(clause.iter().copied());
                 roots.push(*pivot);
             }
-            ProofStep::TheoryLemma { clause, .. } => roots.extend(clause.iter().copied()),
+            ProofStep::TheoryLemma { clause, .. } | ProofStep::FiniteFieldLinear { clause, .. } => {
+                roots.extend(clause.iter().copied())
+            }
+            ProofStep::NraSos {
+                clause,
+                certificate,
+            } => {
+                roots.extend(clause.iter().copied());
+                roots.extend(certificate.basis.iter().flatten().copied());
+            }
             ProofStep::Step { clause, args, .. } => {
                 roots.extend(clause.iter().copied());
                 roots.extend(args.iter().copied());

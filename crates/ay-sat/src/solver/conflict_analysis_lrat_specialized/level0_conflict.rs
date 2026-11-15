@@ -8,6 +8,8 @@ use super::super::*;
 use crate::kani_compat::det_hash_set_new;
 use crate::solver::solve::theory_callback::TheoryCallback;
 
+mod terminal;
+
 impl Solver {
     /// Record the BCP resolution chain for a level-0 conflict (#4176).
     pub(in crate::solver) fn record_level0_conflict_chain(&mut self, conflict_ref: ClauseRef) {
@@ -26,15 +28,21 @@ impl Solver {
 
         // The bounded ResolutionDag route reconstructs the terminal proof
         // postsolve, before any of the unbounded legacy allocations below.
+        // The one level-0 conflict with a fixed-size chain, a unit falsified
+        // by a file-visible unit, is emitted here instead, the way
+        // `add_original_empty_clause` emits an original empty clause, so the
+        // postsolve walk finds an authenticated terminal and allocates nothing.
         if self.cold.backward_proof_limits.is_some() {
-            self.mark_empty_clause_deferred_for_bounded_proof();
+            if !self.emit_complementary_unit_terminal(conflict_ref) {
+                self.mark_empty_clause_deferred_for_bounded_proof();
+            }
             return;
         }
         if !self.has_live_clause_trace() && !self.cold.lrat_enabled {
-            self.has_empty_clause = true;
-            if self.cold.empty_clause_scope_depth == 0 {
-                self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
-            }
+            // Proof-free posture (`--competition`, `--no-proof`): no chain to
+            // record, only the refutation and the scope depth it was derived
+            // at, which `pop()` uses to decide whether it survives.
+            self.raise_empty_clause_flag();
             return;
         }
         if self.cold.lrat_enabled {
@@ -45,51 +53,61 @@ impl Solver {
         }
     }
 
-    fn record_lrat_level0_conflict_chain(&mut self, conflict_ref: ClauseRef) {
-        self.materialize_level0_unit_proofs();
-        let conflict_lits = self.arena.literals(conflict_ref.0 as usize).to_vec();
-        self.seed_level0_conflict_unit_chain(&conflict_lits);
-        let unit_chain = self.collect_level0_unit_chain();
-        let conflict_id = self.materialize_level0_conflict_clause_id(conflict_ref, &conflict_lits);
-
-        let mut proof_hints: Vec<u64> = unit_chain
-            .into_iter()
-            .rev()
-            .filter(|&hint| hint != 0)
-            .collect();
-        if conflict_id != 0 {
-            proof_hints.push(conflict_id);
+    /// Emit the terminal chain of a unit clause falsified by a file-visible
+    /// level-0 unit: two producer-prevalidated hints, `[unit, conflict]`, in
+    /// the order the bounded walk would replay them. Returns `false`, leaving
+    /// the conflict to the metered postsolve walk, for every other shape and
+    /// for a failed emission (the bounded output is then already poisoned).
+    fn emit_complementary_unit_terminal(&mut self, conflict_ref: ClauseRef) -> bool {
+        let Some(deadline) = self
+            .cold
+            .backward_proof_limits
+            .as_ref()
+            .map(|limits| limits.deadline)
+        else {
+            return false;
+        };
+        let &[lit] = self.arena.literals(conflict_ref.0 as usize) else {
+            return false;
+        };
+        let conflict_id = self.clause_id(conflict_ref);
+        if !self.lrat_hint_id_visible(conflict_id) {
+            return false;
         }
-        let trace_chain = self.collect_level0_conflict_trace_chain(conflict_ref);
-        let proof_complete =
-            self.level0_conflict_proof_chain_complete(&conflict_lits, &proof_hints, conflict_id);
-        let trace_complete =
-            self.level0_conflict_trace_chain_complete(trace_chain.as_deref(), conflict_id);
-        if !proof_complete || !trace_complete {
-            // Never attach a partial terminal chain. The semantic UNSAT result
-            // remains valid, while every certificate consumer fails closed.
-            if let Some(trace) = self.live_clause_trace_mut() {
-                trace.mark_proof_work_exhausted();
-            }
-            self.refresh_proof_consumer_state();
-            self.mark_empty_clause_deferred_for_bounded_proof();
-            return;
-        }
-        self.mark_empty_clause_with_hints_and_trace(&proof_hints, trace_chain.unwrap_or_default());
+        let Some(unit_id) = self.visible_unit_proof_id_for_lit(lit.negated()) else {
+            return false;
+        };
+        self.mark_empty_clause_with_bounded_prevalidated_hints(&[unit_id, conflict_id], deadline)
+            .is_ok()
     }
 
-    fn seed_level0_conflict_unit_chain(&mut self, conflict_lits: &[Literal]) {
-        for &idx in &self.min.lrat_to_clear {
-            self.min.minimize_flags[idx] &= !LRAT_A;
+    fn record_lrat_level0_conflict_chain(&mut self, conflict_ref: ClauseRef) {
+        match self.record_lrat_level0_conflict_admitted(
+            conflict_ref,
+            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+        ) {
+            Ok(()) => (),
+            Err(never) => match never {},
         }
-        self.min.lrat_to_clear.clear();
-        for &lit in conflict_lits {
-            let var_idx = lit.variable().index();
-            if var_idx < self.var_data.len() && self.min.minimize_flags[var_idx] & LRAT_A == 0 {
-                self.min.minimize_flags[var_idx] |= LRAT_A;
-                self.min.lrat_to_clear.push(var_idx);
-            }
-        }
+    }
+
+    /// Root (level-0) assignments that carry neither a reason clause nor a
+    /// unit proof ID, so no derivation exists for them. A level-0 lazy theory
+    /// reason the theory could not reconstruct later is demoted to exactly
+    /// this shape (`materialize_lazy_reasons_for_level_range`). Diagnostic
+    /// only; `tracing` evaluates it only when the debug event is enabled.
+    pub(in crate::solver) fn unjustified_root_assignment_count(&self) -> usize {
+        let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
+        self.trail[..level0_end]
+            .iter()
+            .filter(|&&lit| {
+                let vd = self.var_data[lit.variable().index()];
+                let clause_justified = is_clause_reason(vd.reason) && !vd.is_lazy_theory_reason();
+                !clause_justified
+                    && self.visible_unit_proof_id_for_lit(lit).is_none()
+                    && self.level0_var_proof_id(lit.variable().index()).is_none()
+            })
+            .count()
     }
 
     /// Record a level-0 theory model conflict, then declare UNSAT
@@ -166,18 +184,6 @@ impl Solver {
         conflict_id
     }
 
-    fn collect_level0_conflict_trace_chain(&mut self, conflict_ref: ClauseRef) -> Option<Vec<u64>> {
-        // ClauseTrace is independently replayed as positive RUP, so publish
-        // root reasons first and the all-false conflict clause last.
-        self.collect_complete_resolution_chain(conflict_ref, None, &det_hash_set_new())
-            .map(|mut chain| {
-                chain.reverse();
-                let mut seen = det_hash_set_new();
-                chain.retain(|id| seen.insert(*id));
-                chain
-            })
-    }
-
     fn level0_conflict_proof_chain_complete(
         &self,
         conflict_lits: &[Literal],
@@ -195,31 +201,5 @@ impl Solver {
                 self.level0_var_proof_id_for_lit(lit.negated())
                     .is_some_and(|id| proof_hint_ids.contains(&id))
             })
-    }
-
-    fn level0_conflict_trace_chain_complete(
-        &self,
-        trace_chain: Option<&[u64]>,
-        conflict_id: u64,
-    ) -> bool {
-        let Some(trace) = self.live_clause_trace() else {
-            return true;
-        };
-        let Some(chain) = trace_chain else {
-            return false;
-        };
-        let mut missing_ids = det_hash_set_new();
-        missing_ids.extend(chain.iter().copied());
-        for entry in trace.entries() {
-            missing_ids.remove(&entry.id);
-            if missing_ids.is_empty() {
-                break;
-            }
-        }
-        !trace.is_truncated()
-            && !trace.proof_work_exhausted()
-            && chain.last() == Some(&conflict_id)
-            && chain.iter().all(|&id| id != 0)
-            && missing_ids.is_empty()
     }
 }

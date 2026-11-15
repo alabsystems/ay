@@ -14,10 +14,10 @@
 //! AY returning "unknown" when Z3 is definite is a completeness gap,
 //! not a soundness issue.
 
+use crate::common::{check_z3_or_skip, z3_oracle};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use proptest::prelude::*;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,7 +206,11 @@ fn run_ay_on_smt(smt: &str, timeout_secs: u64) -> String {
 
 /// Run Z3 on an SMT-LIB string with a timeout. Returns "sat", "unsat", "unknown", or "error".
 fn run_z3_on_smt(smt: &str, timeout_secs: u64) -> String {
-    let mut child = match Command::new("z3")
+    let Some(z3) = z3_oracle() else {
+        return "error".to_string();
+    };
+    let mut child = match z3
+        .command()
         .arg(format!("-T:{timeout_secs}"))
         .arg("-in")
         .stdin(std::process::Stdio::piped())
@@ -238,14 +242,6 @@ fn run_z3_on_smt(smt: &str, timeout_secs: u64) -> String {
     "unknown".to_string()
 }
 
-fn z3_available() -> bool {
-    Command::new("z3")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
@@ -255,7 +251,7 @@ proptest! {
     /// AY returning "unknown" is always acceptable (completeness gap, not soundness).
     #[test]
     fn qf_s_soundness_vs_z3(formula in arb_qf_s_formula()) {
-        if !z3_available() {
+        if !check_z3_or_skip() {
             return Ok(());
         }
 
@@ -281,7 +277,7 @@ proptest! {
     /// on QF_SLIA formulas (strings + integer length constraints).
     #[test]
     fn qf_slia_soundness_vs_z3(formula in arb_qf_slia_formula()) {
-        if !z3_available() {
+        if !check_z3_or_skip() {
             return Ok(());
         }
 

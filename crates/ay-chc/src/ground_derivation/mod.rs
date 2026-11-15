@@ -41,6 +41,9 @@
 //!   REJECTION. There is no "assume ok" branch.
 //! - Rejection is never a soundness event; it only means the caller must fall
 //!   back to its previous behavior.
+//! - Caller-requested interruption is distinct from proof rejection. It is
+//!   terminal for that validation attempt and must not trigger more replay or
+//!   solver work under the cancelled budget.
 
 use crate::clause::{ClauseHead, HornClause};
 use crate::expr::evaluate_expr;
@@ -49,8 +52,19 @@ use crate::{ChcExpr, ChcProblem, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 mod artifact;
+pub(crate) mod compact;
+pub(crate) use artifact::compact_artifact;
+mod control;
+use control::GroundValidationControl;
 pub(crate) mod clause_map;
 pub(crate) mod complete;
+mod exact_bindings;
+pub(crate) mod forward;
+mod lambda_replay;
+mod lambda_scope;
+pub(crate) mod linear_trace;
+pub(crate) mod propositional;
+pub(crate) mod reresolve;
 pub(crate) mod witness;
 
 /// Maximum derivation-wide work spent authenticating source-clause surfaces.
@@ -67,6 +81,22 @@ pub(crate) mod witness;
 /// cannot multiply source walks, datatype lookup, aggregate comparison, or
 /// evaluator allocation outside this envelope.
 pub const CHC_GROUND_DERIVATION_MAX_SOURCE_WORK: usize = 4_194_304;
+/// The per-derivation source-surface envelope for NATIVE validation
+/// (`validate_ground_derivation`, i.e. derivations AY built in-process and
+/// re-checks on a problem it holds in memory), 64× the wire cap — the same
+/// factor the whole-problem preflight already uses in native mode
+/// (`artifact::source_identity::NATIVE_WHOLE_SOURCE_WORK`). The wire cap
+/// prices hostile artifacts; the native envelope keeps the walk finite while
+/// admitting the tree-expanded transition clauses of preprocessed
+/// (inlined / local-variable-eliminated) problems, whose derivations the
+/// back-translation passes self-check on their input problems and every
+/// acceptance site re-validates on the original clauses
+/// (LRACORE_CH4B_owner_2026-09-23 §3.4: 16 kind2 counterexamples per LIA
+/// 100-sample were refused at the wire cap, never on semantics). Wire
+/// callers (`validate_ground_derivation_with_control` with a wire control)
+/// are unchanged.
+pub(crate) const CHC_GROUND_DERIVATION_NATIVE_SOURCE_WORK: usize =
+    CHC_GROUND_DERIVATION_MAX_SOURCE_WORK * 64;
 pub(crate) const CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH: usize = 512;
 const CHC_GROUND_DERIVATION_MAX_VALUE_DEPTH: usize = 128;
 
@@ -78,10 +108,14 @@ fn bitvector_width_replay_work(width: u32) -> Result<usize, GroundSourceSurfaceE
         .map_err(|_| GroundSourceSurfaceError::SourceWorkLimitExceeded)
 }
 
-fn source_sort_typecheck_work(root: &crate::ChcSort) -> Result<usize, GroundSourceSurfaceError> {
+fn source_sort_typecheck_work(
+    root: &crate::ChcSort,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<usize, GroundSourceSurfaceError> {
     let mut work = 0usize;
     let mut stack = vec![(root, 1usize)];
     while let Some((sort, depth)) = stack.pop() {
+        control.poll()?;
         if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
             return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
         }
@@ -113,6 +147,7 @@ fn source_sort_typecheck_work(root: &crate::ChcSort) -> Result<usize, GroundSour
                     .checked_add(1)
                     .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
                 for constructor in constructors.iter() {
+                    control.poll()?;
                     add(constructor
                         .name
                         .len()
@@ -120,6 +155,7 @@ fn source_sort_typecheck_work(root: &crate::ChcSort) -> Result<usize, GroundSour
                         .and_then(|amount| amount.checked_mul(depth))
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?)?;
                     for selector in &constructor.selectors {
+                        control.poll()?;
                         add(selector
                             .name
                             .len()
@@ -139,12 +175,15 @@ fn source_sort_typecheck_work(root: &crate::ChcSort) -> Result<usize, GroundSour
             | crate::ChcSort::BitVec(_) => add(depth)?,
         }
     }
+    control.poll()?;
     Ok(work.max(1))
 }
 
 pub use artifact::{
     validate_chc_ground_derivation_artifact, validate_chc_ground_derivation_artifact_v2,
-    ChcGroundDerivationArtifactError, ChcGroundDerivationArtifactErrorReason,
+    validate_chc_ground_derivation_artifact_v2_with_progress,
+    validate_chc_ground_derivation_artifact_with_progress, ChcGroundDerivationArtifactError,
+    ChcGroundDerivationArtifactErrorReason, ChcGroundDerivationStepView,
     ChcValidatedGroundDerivation, CHC_GROUND_DERIVATION_ARTIFACT_MAX_BINDINGS,
     CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES, CHC_GROUND_DERIVATION_ARTIFACT_MAX_CLAUSES,
     CHC_GROUND_DERIVATION_ARTIFACT_MAX_NESTING_DEPTH,
@@ -159,6 +198,16 @@ pub use artifact::{
 
 #[cfg(test)]
 mod tests;
+
+/// Bound playback source using unchanged wire-artifact admission.
+/// This grants no cumulative storage or native solver authority.
+pub(crate) fn preflight_playback_source_with_progress(
+    problem: &ChcProblem,
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<(), ChcGroundDerivationArtifactError> {
+    let mut control = GroundValidationControl::new(progress);
+    artifact::validate_problem_bounds_with_control(problem, &mut control)
+}
 
 /// One step of a [`GroundDerivation`]: a single original clause fired under a
 /// completely concrete variable assignment.
@@ -201,9 +250,12 @@ impl GroundDerivation {
 
 /// Why a candidate ground derivation was rejected.
 ///
-/// Carried for logging only; every variant is a hard rejection.
+/// No variant grants proof authority. Interruption is distinct from an invalid
+/// derivation and must remain terminal for the caller's cancelled attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GroundDerivationError {
+    /// The caller refused cooperative progress. This is not a proof rejection.
+    Interrupted,
     /// The derivation has no steps.
     Empty,
     /// `query_step` is out of range.
@@ -274,6 +326,7 @@ pub(crate) enum GroundDerivationError {
 impl std::fmt::Display for GroundDerivationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Interrupted => write!(f, "ground derivation validation interrupted"),
             Self::Empty => write!(f, "empty derivation"),
             Self::RootOutOfRange => write!(f, "root step index out of range"),
             Self::ClauseOutOfRange { step, clause_index } => write!(
@@ -353,8 +406,9 @@ impl std::fmt::Display for GroundDerivationError {
             ),
             Self::SourceWorkLimitExceeded => write!(
                 f,
-                "ground derivation source-surface work exceeds {}",
-                CHC_GROUND_DERIVATION_MAX_SOURCE_WORK
+                "ground derivation source-surface work exceeds its validation envelope (wire cap {}, native {})",
+                CHC_GROUND_DERIVATION_MAX_SOURCE_WORK,
+                CHC_GROUND_DERIVATION_NATIVE_SOURCE_WORK
             ),
             Self::InvalidSourceProblem => write!(
                 f,
@@ -366,11 +420,18 @@ impl std::fmt::Display for GroundDerivationError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroundSourceSurfaceError {
+    Interrupted,
     ClauseOutOfRange,
     SourceWorkLimitExceeded,
     InvalidVariableSurface,
     PrivateSourceNamespace,
     InvalidUfSurface,
+}
+
+impl From<control::GroundValidationInterrupted> for GroundSourceSurfaceError {
+    fn from(_: control::GroundValidationInterrupted) -> Self {
+        Self::Interrupted
+    }
 }
 
 pub(crate) struct GroundClauseSurface {
@@ -452,9 +513,20 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         Ok(())
     }
 
+    /// Work charged so far (diagnostics only).
+    pub(crate) fn work_used(&self) -> usize {
+        self.work_used
+    }
+
+    /// This cache's envelope (diagnostics only).
+    pub(crate) fn work_limit(&self) -> usize {
+        self.work_limit
+    }
+
     fn reserve_unique_clause_walks(
         &mut self,
         clause: &HornClause,
+        control: &mut GroundValidationControl<'_>,
     ) -> Result<(usize, Vec<ChcVar>, Vec<usize>, usize), GroundSourceSurfaceError> {
         const UNIQUE_NODE_WALKS: usize = 4;
 
@@ -477,16 +549,38 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         let mut variables_by_name: FxHashMap<String, crate::ChcSort> = FxHashMap::default();
         let mut unique_variable_name_bytes = 0usize;
         if let Some(constraint) = &clause.body.constraint {
-            self.push_pending_source_expr(&mut stack, constraint, 0, 1, UNIQUE_NODE_WALKS)?;
+            self.push_pending_source_expr(
+                &mut stack,
+                constraint,
+                0,
+                1,
+                UNIQUE_NODE_WALKS,
+                control,
+            )?;
         }
         for (_, arguments) in &clause.body.predicates {
+            control.poll()?;
             for argument in arguments {
-                self.push_pending_source_expr(&mut stack, argument, 0, 1, UNIQUE_NODE_WALKS)?;
+                self.push_pending_source_expr(
+                    &mut stack,
+                    argument,
+                    0,
+                    1,
+                    UNIQUE_NODE_WALKS,
+                    control,
+                )?;
             }
         }
         if let ClauseHead::Predicate(_, arguments) = &clause.head {
             for argument in arguments {
-                self.push_pending_source_expr(&mut stack, argument, 0, 1, UNIQUE_NODE_WALKS)?;
+                self.push_pending_source_expr(
+                    &mut stack,
+                    argument,
+                    0,
+                    1,
+                    UNIQUE_NODE_WALKS,
+                    control,
+                )?;
             }
         }
         let mut expression_occurrences = 0usize;
@@ -494,7 +588,9 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         let mut function_occurrences = 0usize;
         let mut nested_identity_work = 0usize;
         let mut bounded_expression_sorts = Vec::new();
-        while let Some((expression, function_ancestors, depth)) = stack.pop() {
+        let mut bounded_lambdas = Vec::new();
+        while let Some((expression, function_ancestors, depth, binding_scope)) = stack.pop() {
+            control.poll()?;
             if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
                 return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
             }
@@ -525,6 +621,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
             }
             let identity_unit = match expression {
+                ChcExpr::ArrayLambda(_) => Some(64),
                 ChcExpr::Var(variable) => variable.name.len().checked_add(64),
                 ChcExpr::FuncApp(name, _, arguments) => name
                     .len()
@@ -544,12 +641,19 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 .checked_add(identity_work)
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
             match expression {
+                ChcExpr::ArrayLambda(lambda) => {
+                    let cost = self.reserve_lambda_metadata(lambda, control)?;
+                    replay_work = replay_work
+                        .checked_add(cost)
+                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+                    bounded_lambdas.push(lambda.as_ref());
+                }
                 ChcExpr::Var(variable) => {
                     self.charge(variable.name.len())?;
                     replay_work = replay_work
                         .checked_add(variable.name.len())
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    let sort_work = self.reserve_source_sort(&variable.sort)?;
+                    let sort_work = self.reserve_source_sort(&variable.sort, control)?;
                     let nested_sort_work = sort_work
                         .checked_mul(function_memberships)
                         .and_then(|work| work.checked_mul(32))
@@ -558,7 +662,9 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     nested_identity_work = nested_identity_work
                         .checked_add(nested_sort_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    if let Some(previous_sort) = variables_by_name.get(&variable.name) {
+                    if let Some(lambda) = binding_scope {
+                        self.reserve_bound_variable(lambda, variable, sort_work)?;
+                    } else if let Some(previous_sort) = variables_by_name.get(&variable.name) {
                         if previous_sort != &variable.sort {
                             return Err(GroundSourceSurfaceError::InvalidVariableSurface);
                         }
@@ -570,6 +676,11 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     }
                 }
                 ChcExpr::FuncApp(name, return_sort, arguments) => {
+                    // Bound-code observations need instantiated argument keys.
+                    // Until that accounting exists, keep this path closed.
+                    if binding_scope.is_some() {
+                        return Err(GroundSourceSurfaceError::InvalidUfSurface);
+                    }
                     let signature_work = name
                         .len()
                         .checked_add(arguments.len())
@@ -579,7 +690,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     replay_work = replay_work
                         .checked_add(signature_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    let sort_work = self.reserve_source_sort(return_sort)?;
+                    let sort_work = self.reserve_source_sort(return_sort, control)?;
                     let nested_sort_work = sort_work
                         .checked_mul(function_memberships)
                         .and_then(|work| work.checked_mul(32))
@@ -596,7 +707,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
                 }
                 ChcExpr::ConstArray(key_sort, _) | ChcExpr::ConstArrayMarker(key_sort) => {
-                    let sort_work = self.reserve_source_sort(key_sort)?;
+                    let sort_work = self.reserve_source_sort(key_sort, control)?;
                     let nested_sort_work = sort_work
                         .checked_mul(function_memberships)
                         .and_then(|work| work.checked_mul(32))
@@ -616,6 +727,11 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 ChcExpr::Op(_, arguments)
                 | ChcExpr::PredicateApp(_, _, arguments)
                 | ChcExpr::FuncApp(_, _, arguments) => arguments,
+                ChcExpr::ArrayLambda(lambda) => {
+                    self.charge(UNIQUE_NODE_WALKS)?;
+                    stack.push((lambda.body(), function_memberships, depth + 1, Some(lambda)));
+                    lambda.captures()
+                }
                 ChcExpr::ConstArray(_, value) => std::slice::from_ref(value),
                 ChcExpr::Bool(_)
                 | ChcExpr::Int(_)
@@ -635,21 +751,39 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 .and_then(|work| self.work_used.checked_add(work))
                 .filter(|projected| *projected <= self.work_limit)
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-            stack.extend(
-                children
-                    .iter()
-                    .map(|child| (child.as_ref(), function_memberships, child_depth)),
-            );
+            for child in children {
+                control.poll()?;
+                stack.push((
+                    child.as_ref(),
+                    function_memberships,
+                    child_depth,
+                    binding_scope,
+                ));
+            }
         }
 
+        for lambda in &bounded_lambdas {
+            control.poll()?;
+            let typed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lambda.captures_are_well_typed()
+            }))
+            .map_err(|_| GroundSourceSurfaceError::InvalidVariableSurface)?;
+            control.poll()?;
+            if !typed {
+                return Err(GroundSourceSurfaceError::InvalidVariableSurface);
+            }
+        }
         // Only derive recursive operator sorts after the complete iterative
         // source walk has established every expression/sort depth bound.
         // `catch_unwind` contains malformed typed nodes; it is not relied on
         // for stack safety.
         for expression in bounded_expression_sorts {
+            control.poll()?;
             let expression_sort =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expression.sort()))
-                    .map_err(|_| GroundSourceSurfaceError::InvalidUfSurface)?;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expression.sort()));
+            control.poll()?;
+            let expression_sort =
+                expression_sort.map_err(|_| GroundSourceSurfaceError::InvalidUfSurface)?;
             if let crate::ChcSort::BitVec(width) = expression_sort {
                 let width_work = bitvector_width_replay_work(width)?;
                 self.charge(width_work)?;
@@ -659,6 +793,32 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             }
         }
 
+        if !bounded_lambdas.is_empty() {
+            let profile = self.reserve_lambda_replay(clause, control)?;
+            // Every UF observation can reevaluate an argument subtree, then
+            // native replay has two evaluator and four normalization phases.
+            // Keep expanded aggregate reads under the same per-step envelope.
+            let rounds = function_occurrences
+                .checked_add(1)
+                .and_then(|rounds| rounds.checked_mul(6))
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+            replay_work = replay_work
+                .checked_add(
+                    profile
+                        .work
+                        .checked_mul(rounds)
+                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
+                )
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+            expression_occurrences = expression_occurrences
+                .checked_add(
+                    profile
+                        .value_occurrences
+                        .checked_mul(rounds)
+                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
+                )
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+        }
         let function_sort_rounds = function_occurrences
             .checked_sub(1)
             .map_or(0, |maximum_index| {
@@ -692,7 +852,9 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             .and_then(|work| work.checked_mul(sort_rounds))
             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
         self.charge(sort_work)?;
+        control.poll()?;
         variables.sort_by(|left, right| left.name.cmp(&right.name));
+        control.poll()?;
         // Codec/native type validation scans datatype constructor tables and
         // nested selector sorts once per variable value and per reused step.
         // Cache an aligned cost now, after the bounded iterative source walk,
@@ -700,7 +862,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         // outside the fixed envelope.
         let mut variable_typecheck_work = Vec::with_capacity(variables.len());
         for variable in &variables {
-            let work = source_sort_typecheck_work(&variable.sort)?;
+            let work = source_sort_typecheck_work(&variable.sort, control)?;
             self.charge(work)?;
             variable_typecheck_work.push(work);
         }
@@ -712,6 +874,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
             )
             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+        control.poll()?;
         Ok((
             expression_occurrences,
             variables,
@@ -723,10 +886,12 @@ impl<'a> GroundSourceSurfaceCache<'a> {
     fn reserve_source_sort(
         &mut self,
         root: &crate::ChcSort,
+        control: &mut GroundValidationControl<'_>,
     ) -> Result<usize, GroundSourceSurfaceError> {
         let starting_work = self.work_used;
         let mut stack = vec![(root, 1usize)];
         while let Some((sort, depth)) = stack.pop() {
+            control.poll()?;
             if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
                 return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
             }
@@ -768,6 +933,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
                     )?;
                     for constructor in constructors.iter() {
+                        control.poll()?;
                         self.charge(
                             constructor
                                 .name
@@ -777,6 +943,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
                         )?;
                         for selector in &constructor.selectors {
+                            control.poll()?;
                             self.charge(
                                 selector
                                     .name
@@ -801,6 +968,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 crate::ChcSort::Bool | crate::ChcSort::Int | crate::ChcSort::Real => {}
             }
         }
+        control.poll()?;
         self.work_used
             .checked_sub(starting_work)
             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)
@@ -808,12 +976,19 @@ impl<'a> GroundSourceSurfaceCache<'a> {
 
     fn push_pending_source_expr<'b>(
         &self,
-        stack: &mut Vec<(&'b ChcExpr, usize, usize)>,
+        stack: &mut Vec<(
+            &'b ChcExpr,
+            usize,
+            usize,
+            Option<&'b crate::expr::ChcArrayLambda>,
+        )>,
         expression: &'b ChcExpr,
         function_ancestors: usize,
         depth: usize,
         work_per_node: usize,
+        control: &mut GroundValidationControl<'_>,
     ) -> Result<(), GroundSourceSurfaceError> {
+        control.poll()?;
         if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
             return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
         }
@@ -824,7 +999,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             .and_then(|work| self.work_used.checked_add(work))
             .filter(|projected| *projected <= self.work_limit)
             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-        stack.push((expression, function_ancestors, depth));
+        stack.push((expression, function_ancestors, depth, None));
         Ok(())
     }
 
@@ -832,6 +1007,18 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         &mut self,
         clause_index: usize,
     ) -> Result<&GroundClauseSurface, GroundSourceSurfaceError> {
+        self.surface_with_control(
+            clause_index,
+            &mut GroundValidationControl::new(&mut || true),
+        )
+    }
+
+    fn surface_with_control(
+        &mut self,
+        clause_index: usize,
+        control: &mut GroundValidationControl<'_>,
+    ) -> Result<&GroundClauseSurface, GroundSourceSurfaceError> {
+        control.poll()?;
         if clause_index >= self.problem.clauses().len() {
             return Err(GroundSourceSurfaceError::ClauseOutOfRange);
         }
@@ -842,35 +1029,43 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             let problem = self.problem;
             let clause = &problem.clauses()[clause_index];
             let (expression_occurrences, variables, variable_typecheck_work, replay_work) =
-                self.reserve_unique_clause_walks(clause)?;
-            if variables
-                .iter()
-                .any(|variable| variable.name.starts_with('\0'))
-            {
-                return Err(GroundSourceSurfaceError::PrivateSourceNamespace);
+                self.reserve_unique_clause_walks(clause, control)?;
+            for variable in &variables {
+                control.poll()?;
+                if variable.name.starts_with('\0') {
+                    return Err(GroundSourceSurfaceError::PrivateSourceNamespace);
+                }
             }
-            let uf_applications = clause_ordinary_uf_applications(clause)
-                .map_err(|_| GroundSourceSurfaceError::InvalidUfSurface)?;
+            let uf_applications = clause_ordinary_uf_applications(clause);
+            control.poll()?;
+            let uf_applications =
+                uf_applications.map_err(|_| GroundSourceSurfaceError::InvalidUfSurface)?;
             let uf_key_structure_work =
                 uf_applications
                     .iter()
-                    .try_fold(0usize, |work, application| match application {
-                        ChcExpr::FuncApp(name, _, arguments) => work
-                            .checked_add(name.len())
-                            .and_then(|work| work.checked_add(arguments.len()))
-                            .and_then(|work| work.checked_add(2))
-                            .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded),
-                        _ => Err(GroundSourceSurfaceError::InvalidUfSurface),
+                    .try_fold(0usize, |work, application| {
+                        control.poll()?;
+                        match application {
+                            ChcExpr::FuncApp(name, _, arguments) => work
+                                .checked_add(name.len())
+                                .and_then(|work| work.checked_add(arguments.len()))
+                                .and_then(|work| work.checked_add(2))
+                                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded),
+                            _ => Err(GroundSourceSurfaceError::InvalidUfSurface),
+                        }
                     })?;
-            let uf_argument_occurrences = uf_applications.iter().try_fold(
-                0usize,
-                |count, application| match application {
-                    ChcExpr::FuncApp(_, _, arguments) => count
-                        .checked_add(arguments.len())
-                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded),
-                    _ => Err(GroundSourceSurfaceError::InvalidUfSurface),
-                },
-            )?;
+            let uf_argument_occurrences =
+                uf_applications
+                    .iter()
+                    .try_fold(0usize, |count, application| {
+                        control.poll()?;
+                        match application {
+                            ChcExpr::FuncApp(_, _, arguments) => count
+                                .checked_add(arguments.len())
+                                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded),
+                            _ => Err(GroundSourceSurfaceError::InvalidUfSurface),
+                        }
+                    })?;
             let replay_work = replay_work
                 .checked_add(uf_key_structure_work)
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
@@ -890,6 +1085,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 self.walked_clauses += 1;
             }
         }
+        control.poll()?;
         self.entries
             .get(&clause_index)
             .ok_or(GroundSourceSurfaceError::InvalidVariableSurface)
@@ -899,8 +1095,19 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         &mut self,
         clause_index: usize,
     ) -> Result<(usize, usize), GroundSourceSurfaceError> {
+        self.charge_step_reuse_with_control(
+            clause_index,
+            &mut GroundValidationControl::new(&mut || true),
+        )
+    }
+
+    fn charge_step_reuse_with_control(
+        &mut self,
+        clause_index: usize,
+        control: &mut GroundValidationControl<'_>,
+    ) -> Result<(usize, usize), GroundSourceSurfaceError> {
         let (variables, applications, replay_work) = {
-            let surface = self.surface(clause_index)?;
+            let surface = self.surface_with_control(clause_index, control)?;
             (
                 surface.variables.len(),
                 surface.uf_applications.len(),
@@ -913,6 +1120,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 .and_then(|work| work.checked_add(applications))
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
         )?;
+        control.poll()?;
         Ok((variables, applications))
     }
 
@@ -1035,7 +1243,32 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                 .checked_mul(argument_fanout)
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
         )?;
-        self.charge_scalar_replay(0, 0, argument_fanout, env, &[])
+        // Each incoming use compares the whole head tuple: every binding it
+        // reads, once per use.
+        self.charge_each_binding(env, argument_fanout).map(|_| ())
+    }
+
+    /// Charge every binding (name and value) `multiplier` times; returns the
+    /// widest value's work.
+    fn charge_each_binding(
+        &mut self,
+        env: &FxHashMap<String, SmtValue>,
+        multiplier: usize,
+    ) -> Result<usize, GroundSourceSurfaceError> {
+        let mut widest = 0usize;
+        for (name, value) in env {
+            let value_work = ground_value_replay_work(value)?
+                .checked_add(1)
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+            widest = widest.max(value_work);
+            let entry_work = name
+                .len()
+                .checked_add(value_work)
+                .and_then(|work| work.checked_mul(multiplier))
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
+            self.charge(entry_work)?;
+        }
+        Ok(widest)
     }
 
     pub(crate) fn charge_scalar_replay(
@@ -1046,28 +1279,34 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         env: &FxHashMap<String, SmtValue>,
         additional_results: &[SmtValue],
     ) -> Result<(), GroundSourceSurfaceError> {
-        let multiplier = application_count
+        // A UF application or argument occurrence may clone or hash ANY
+        // binding into an observation key, so each binding is charged once per
+        // such occurrence (at least once). Every other expression occurrence
+        // reads ONE value, so the expression surface costs its occurrence
+        // count times the widest value. (Charging every binding per expression
+        // occurrence priced a plain 250-variable, 100k-node transition at
+        // gigabytes and refused its ground derivations.)
+        let uf_multiplier = application_count
             .checked_add(argument_occurrences)
-            .and_then(|work| work.checked_add(value_replay_occurrences))
             .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?
             .max(1);
-        for (name, value) in env {
-            let entry_work = name
-                .len()
-                .checked_add(ground_value_replay_work(value)?)
-                .and_then(|work| work.checked_add(1))
-                .and_then(|work| work.checked_mul(multiplier))
-                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-            self.charge(entry_work)?;
-        }
+        let mut widest = self.charge_each_binding(env, uf_multiplier)?;
         for result in additional_results {
             let result_work = ground_value_replay_work(result)?
                 .checked_add(1)
-                .and_then(|work| work.checked_mul(multiplier))
                 .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-            self.charge(result_work)?;
+            widest = widest.max(result_work);
+            self.charge(
+                result_work
+                    .checked_mul(uf_multiplier)
+                    .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
+            )?;
         }
-        Ok(())
+        self.charge(
+            widest
+                .checked_mul(value_replay_occurrences)
+                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
+        )
     }
 }
 
@@ -1199,11 +1438,53 @@ fn ground_value_replay_work(value: &SmtValue) -> Result<usize, GroundSourceSurfa
 /// have no set bits outside that width, and aggregates are checked recursively
 /// against their source index/field sorts. The value and source preflights run
 /// before this walk, so both sides already satisfy fixed depth/work bounds.
+///
+/// A recursive datatype's sort is a finite snapshot: the parser cuts the
+/// cycle, so past the first unfolding a selector names its datatype by an
+/// uninterpreted placeholder (`Uninterpreted("Nat")` inside `succ`'s field).
+/// Such a placeholder stands for the enclosing datatype of that name, whose
+/// constructors this walk has already seen; without resolving it every
+/// value nested two constructors deep (`succ(succ(zero))`) was refused.
 fn canonical_ground_value_matches_sort(root_value: &SmtValue, root_sort: &crate::ChcSort) -> bool {
+    let mut enclosing: FxHashMap<&str, &[crate::ChcDtConstructor]> = FxHashMap::default();
     let mut stack = vec![(root_value, root_sort, 1usize)];
     while let Some((value, sort, depth)) = stack.pop() {
         if depth > CHC_GROUND_DERIVATION_MAX_VALUE_DEPTH {
             return false;
+        }
+        let placeholder_constructors = match (value, sort) {
+            (SmtValue::Datatype(..), crate::ChcSort::Uninterpreted(name)) => {
+                enclosing.get(name.as_str()).copied()
+            }
+            _ => None,
+        };
+        if let crate::ChcSort::Datatype { name, constructors } = sort {
+            enclosing
+                .entry(name.as_str())
+                .or_insert(constructors.as_slice());
+        }
+        if let (SmtValue::Datatype(constructor, fields), Some(constructors)) =
+            (value, placeholder_constructors)
+        {
+            let Some(definition) = constructors
+                .iter()
+                .find(|definition| definition.name == *constructor)
+            else {
+                return false;
+            };
+            if fields.len() != definition.selectors.len() {
+                return false;
+            }
+            let Some(child_depth) = depth.checked_add(1) else {
+                return false;
+            };
+            stack.extend(
+                fields
+                    .iter()
+                    .zip(&definition.selectors)
+                    .map(|(field, selector)| (field, &selector.sort, child_depth)),
+            );
+            continue;
         }
         match (value, sort) {
             (value, sort) if canonical_scalar_value_matches_sort(value, sort) => {}
@@ -1446,12 +1727,14 @@ fn validate_step_uf_observations(
     applications: &[ChcExpr],
     env: &FxHashMap<String, SmtValue>,
     congruence: &mut FxHashMap<GroundUfCongruenceKey, SmtValue>,
+    control: &mut GroundValidationControl<'_>,
 ) -> Result<(), GroundDerivationError> {
     for (application_index, application) in applications.iter().enumerate() {
+        control.poll()?;
         let ChcExpr::FuncApp(_, return_sort, arguments) = application else {
             return Err(GroundDerivationError::UfSurfaceInvalid { step: step_index });
         };
-        let Some(result) = eval_ground(application, env) else {
+        let Some(result) = eval_ground_with_control(application, env, control)? else {
             return Err(GroundDerivationError::UfObservationNotGround {
                 step: step_index,
                 application: application_index,
@@ -1463,30 +1746,35 @@ fn validate_step_uf_observations(
                 application: application_index,
             });
         }
-        let argument_values = arguments
-            .iter()
-            .map(|argument| eval_ground(argument, env))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(GroundDerivationError::UfObservationNotGround {
-                step: step_index,
-                application: application_index,
-            })?;
-        let Some(key) = ground_uf_congruence_key(application, &argument_values) else {
+        let mut argument_values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            argument_values.push(eval_ground_with_control(argument, env, control)?.ok_or(
+                GroundDerivationError::UfObservationNotGround {
+                    step: step_index,
+                    application: application_index,
+                },
+            )?);
+        }
+        let key = ground_uf_congruence_key(application, &argument_values);
+        control.poll()?;
+        let Some(key) = key else {
             return Err(GroundDerivationError::UfObservationNotGround {
                 step: step_index,
                 application: application_index,
             });
         };
-        if congruence
+        let conflicts = congruence
             .get(&key)
-            .is_some_and(|previous| !smt_values_equal(previous, &result))
-        {
+            .is_some_and(|previous| !smt_values_equal(previous, &result));
+        control.poll()?;
+        if conflicts {
             return Err(GroundDerivationError::UfCongruenceViolation {
                 step: step_index,
                 application: application_index,
             });
         }
         congruence.entry(key).or_insert(result);
+        control.poll()?;
     }
     Ok(())
 }
@@ -1538,23 +1826,48 @@ pub(crate) fn log_ground_translation_detail(args: std::fmt::Arguments<'_>) {
 /// Returns `None` whenever the result is not a single concrete value; callers
 /// treat that as rejection.
 fn eval_ground(expr: &ChcExpr, env: &FxHashMap<String, SmtValue>) -> Option<SmtValue> {
-    let value = match evaluate_expr(expr, env) {
+    eval_ground_with_control(expr, env, &mut GroundValidationControl::new(&mut || true))
+        .ok()
+        .flatten()
+}
+
+/// Cancellation is an error, never an indeterminate value that could trigger
+/// another simplification/evaluation attempt. Individual evaluator and
+/// simplifier calls remain opaque cooperative-cancellation intervals.
+fn eval_ground_with_control(
+    expr: &ChcExpr,
+    env: &FxHashMap<String, SmtValue>,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<Option<SmtValue>, GroundDerivationError> {
+    control.poll()?;
+    let direct = evaluate_expr(expr, env);
+    control.poll()?;
+    let value = match direct {
         Some(value) => value,
         None => {
-            let normalized = expr
-                .clone()
-                .simplify_array_ops()
-                .simplify_constants()
-                .simplify_array_ops()
-                .simplify_constants();
-            evaluate_expr(&normalized, env)?
+            let normalized = expr.clone();
+            control.poll()?;
+            let normalized = normalized.simplify_array_ops();
+            control.poll()?;
+            let normalized = normalized.simplify_constants();
+            control.poll()?;
+            let normalized = normalized.simplify_array_ops();
+            control.poll()?;
+            let normalized = normalized.simplify_constants();
+            control.poll()?;
+            let value = evaluate_expr(&normalized, env);
+            control.poll()?;
+            let Some(value) = value else { return Ok(None) };
+            value
         }
     };
     // `SmtValue::Opaque` is a solver placeholder, not a value. Letting one
     // through would make two unrelated placeholders compare equal and a
     // constraint "evaluate" without ever being decided, so it is rejected here
     // rather than at each use site.
-    is_concrete(&value).then_some(value)
+    let concrete = is_concrete(&value);
+    control.poll()?;
+    Ok(concrete.then_some(value))
 }
 
 /// Crate-visible wrapper around [`eval_ground`] for transform back-translators.
@@ -1600,10 +1913,53 @@ fn head_args(clause: &HornClause) -> Option<&[ChcExpr]> {
 ///
 /// The check is deliberately structural about well-foundedness: premises must
 /// point strictly backwards, so no step can (transitively) justify itself.
+/// Whether `problem` passes the whole-source preflight that native
+/// [`validate_ground_derivation`] runs first. `false` means that function
+/// refuses EVERY derivation on `problem`, so a search for ground evidence on it
+/// can stop before it starts. Bounded by the preflight's native work envelope.
+pub(crate) fn problem_admits_native_ground_validation(problem: &ChcProblem) -> bool {
+    let mut progress = || true;
+    let mut control = GroundValidationControl::new_native(&mut progress);
+    control
+        .with_native_whole_source_scope(|control| {
+            artifact::validate_ground_source_problem_with_control(problem, control)
+        })
+        .is_ok()
+}
+
 pub(crate) fn validate_ground_derivation(
     problem: &ChcProblem,
     derivation: &GroundDerivation,
 ) -> Result<(), GroundDerivationError> {
+    validate_ground_derivation_with_progress(problem, derivation, &mut || true)
+}
+
+/// Native ground validation under a borrowed existing stop owner.
+///
+/// The native finite source envelope and semantic checks are unchanged; this
+/// is not wire-artifact admission and conveys no retained proof authority.
+pub(crate) fn validate_ground_derivation_with_progress(
+    problem: &ChcProblem,
+    derivation: &GroundDerivation,
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<(), GroundDerivationError> {
+    let mut control = GroundValidationControl::new_native(progress);
+    let result = validate_ground_derivation_with_control(problem, derivation, &mut control);
+    // The validator's evaluator/cache temporaries have now been released.
+    // Keep its sticky control for this final caller observation.
+    control.poll()?;
+    result
+}
+
+/// Cooperatively check ground evidence without converting cancellation into
+/// proof rejection. Source authentication, aggregate comparisons and each
+/// evaluator/normalizer call remain opaque phases; this is not a hard deadline.
+fn validate_ground_derivation_with_control(
+    problem: &ChcProblem,
+    derivation: &GroundDerivation,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(), GroundDerivationError> {
+    control.poll()?;
     if derivation.steps.is_empty() {
         return Err(GroundDerivationError::Empty);
     }
@@ -1613,18 +1969,37 @@ pub(crate) fn validate_ground_derivation(
     if derivation.steps.len() > CHC_GROUND_DERIVATION_MAX_SOURCE_WORK {
         return Err(GroundDerivationError::SourceWorkLimitExceeded);
     }
-    derivation
-        .steps
-        .iter()
-        .try_fold(derivation.steps.len(), |work, step| {
-            work.checked_add(step.premises.len())
-                .filter(|work| *work <= CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
-        })
-        .ok_or(GroundDerivationError::SourceWorkLimitExceeded)?;
-    artifact::validate_ground_source_problem(problem).map_err(|source_error| {
-        if source_error.reason == ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded {
+    let mut work = derivation.steps.len();
+    for step in &derivation.steps {
+        control.poll()?;
+        work = work
+            .checked_add(step.premises.len())
+            .filter(|work| *work <= CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
+            .ok_or(GroundDerivationError::SourceWorkLimitExceeded)?;
+    }
+    // Native mode: the same depth guard and semantic validators, but the
+    // larger, still FINITE native work envelope instead of the wire artifact's
+    // (`source_identity::NATIVE_WHOLE_SOURCE_WORK`). Artifact callers ran the
+    // wire-limited preflight on this problem before reaching here.
+    let source_result = control.with_native_whole_source_scope(|control| {
+        artifact::validate_ground_source_problem_with_control(problem, control)
+    });
+    control.poll()?;
+    source_result.map_err(|source_error| match source_error.reason {
+        ChcGroundDerivationArtifactErrorReason::Interrupted => GroundDerivationError::Interrupted,
+        ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded => {
+            log_ground_translation_detail(format_args!(
+                "validator: whole-source preflight exceeded the native envelope ({} clauses, native={})",
+                problem.clauses().len(),
+                control.is_native()
+            ));
             GroundDerivationError::SourceWorkLimitExceeded
-        } else {
+        }
+        reason => {
+            log_ground_translation_detail(format_args!(
+                "validator: whole-source check refused the problem ({reason:?}): {}",
+                source_error.detail
+            ));
             GroundDerivationError::InvalidSourceProblem
         }
     })?;
@@ -1633,6 +2008,7 @@ pub(crate) fn validate_ground_derivation(
     // Pass 1: structural well-formedness. Resolving every clause up front means
     // the value checks below can index without re-validating.
     for (idx, step) in derivation.steps.iter().enumerate() {
+        control.poll()?;
         let Some(clause) = clauses.get(step.clause_index) else {
             return Err(GroundDerivationError::ClauseOutOfRange {
                 step: idx,
@@ -1640,6 +2016,7 @@ pub(crate) fn validate_ground_derivation(
             });
         };
         for &premise in &step.premises {
+            control.poll()?;
             // Strictly-backwards premises make the premise graph a DAG by
             // construction; an entry can never justify itself, directly or
             // through a cycle. This is the adversarial-witness defense the SMT
@@ -1670,15 +2047,20 @@ pub(crate) fn validate_ground_derivation(
     let mut stack = vec![derivation.query_step];
     reachable[derivation.query_step] = true;
     while let Some(idx) = stack.pop() {
+        control.poll()?;
         for &premise in &derivation.steps[idx].premises {
+            control.poll()?;
             if !reachable[premise] {
                 reachable[premise] = true;
                 stack.push(premise);
             }
         }
     }
-    if let Some(step) = reachable.iter().position(|hit| !hit) {
-        return Err(GroundDerivationError::UnreachableStep { step });
+    for (step, hit) in reachable.iter().enumerate() {
+        control.poll()?;
+        if !hit {
+            return Err(GroundDerivationError::UnreachableStep { step });
+        }
     }
 
     // One cached producer head can feed many consumer arguments. Equality of
@@ -1688,8 +2070,10 @@ pub(crate) fn validate_ground_derivation(
     let mut premise_head_argument_fanout = vec![0usize; derivation.steps.len()];
     let mut total_head_argument_fanout = 0usize;
     for step in &derivation.steps {
+        control.poll()?;
         let clause = &clauses[step.clause_index];
         for ((_, arguments), premise) in clause.body.predicates.iter().zip(&step.premises) {
+            control.poll()?;
             total_head_argument_fanout = total_head_argument_fanout
                 .checked_add(arguments.len())
                 .filter(|fanout| *fanout <= CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
@@ -1703,39 +2087,83 @@ pub(crate) fn validate_ground_derivation(
     // Authenticate and budget every distinct source surface before evaluating
     // any step. Repeated references use one clause-indexed cache entry, while
     // their per-step variable/UF processing is charged up front.
-    let mut source_surfaces = GroundSourceSurfaceCache::new(problem);
+    // Native validation admits the derivation's clause surfaces against the
+    // native envelope; a wire control keeps the wire cap.
+    let native = control.is_native();
+    let mut source_surfaces = GroundSourceSurfaceCache::with_work_limit(
+        problem,
+        if native {
+            CHC_GROUND_DERIVATION_NATIVE_SOURCE_WORK
+        } else {
+            CHC_GROUND_DERIVATION_MAX_SOURCE_WORK
+        },
+    );
     for (step_index, step) in derivation.steps.iter().enumerate() {
+        control.poll()?;
         let map_surface_error = |surface_error| match surface_error {
+            GroundSourceSurfaceError::Interrupted => GroundDerivationError::Interrupted,
             GroundSourceSurfaceError::SourceWorkLimitExceeded => {
                 GroundDerivationError::SourceWorkLimitExceeded
             }
             _ => GroundDerivationError::UfSurfaceInvalid { step: step_index },
         };
-        source_surfaces
-            .charge_step_reuse(step.clause_index)
-            .map_err(map_surface_error)?;
-        source_surfaces
-            .charge_step_scalar_replay(step.clause_index, &step.env, &[])
-            .map_err(map_surface_error)?;
-        source_surfaces
-            .charge_step_head_fanout_replay(
-                step.clause_index,
-                premise_head_argument_fanout[step_index],
-                &step.env,
-            )
-            .map_err(map_surface_error)?;
+        // A surface refusal names its budget (`--chc-ground-bt-debug`): the
+        // error variant is shared with the whole-source preflight above.
+        let refuse = |cache: &GroundSourceSurfaceCache<'_>,
+                      phase: &str,
+                      surface_error: GroundSourceSurfaceError| {
+            if matches!(
+                surface_error,
+                GroundSourceSurfaceError::SourceWorkLimitExceeded
+            ) {
+                log_ground_translation_detail(format_args!(
+                    "validator: source-surface work {} of {} exhausted in {phase} at step {step_index} (clause {}, native={native})",
+                    cache.work_used(),
+                    cache.work_limit(),
+                    step.clause_index
+                ));
+            }
+            map_surface_error(surface_error)
+        };
+        if let Err(surface_error) =
+            source_surfaces.charge_step_reuse_with_control(step.clause_index, control)
+        {
+            return Err(refuse(&source_surfaces, "clause walk", surface_error));
+        }
+        control.poll()?;
+        if let Err(surface_error) =
+            source_surfaces.charge_step_scalar_replay(step.clause_index, &step.env, &[])
+        {
+            return Err(refuse(&source_surfaces, "scalar replay", surface_error));
+        }
+        control.poll()?;
+        if let Err(surface_error) = source_surfaces.charge_step_head_fanout_replay(
+            step.clause_index,
+            premise_head_argument_fanout[step_index],
+            &step.env,
+        ) {
+            return Err(refuse(
+                &source_surfaces,
+                "head fan-out replay",
+                surface_error,
+            ));
+        }
+        control.poll()?;
         let variables = &source_surfaces
             .surface(step.clause_index)
             .map_err(map_surface_error)?
             .variables;
         for (variable_index, variable) in variables.iter().enumerate() {
+            control.poll()?;
             let Some(value) = step.env.get(&variable.name) else {
                 return Err(GroundDerivationError::VariableBindingMissing {
                     step: step_index,
                     variable: variable_index,
                 });
             };
-            if !canonical_ground_value_matches_sort(value, &variable.sort) {
+            let matches_sort = canonical_ground_value_matches_sort(value, &variable.sort);
+            control.poll()?;
+            if !matches_sort {
                 return Err(GroundDerivationError::VariableBindingSortMismatch {
                     step: step_index,
                     variable: variable_index,
@@ -1754,10 +2182,12 @@ pub(crate) fn validate_ground_derivation(
     let mut evaluated_heads: Vec<Option<Vec<Option<SmtValue>>>> =
         vec![None; derivation.steps.len()];
     for (idx, step) in derivation.steps.iter().enumerate() {
+        control.poll()?;
         let clause = &clauses[step.clause_index];
         let applications = &source_surfaces
             .surface(step.clause_index)
             .map_err(|surface_error| match surface_error {
+                GroundSourceSurfaceError::Interrupted => GroundDerivationError::Interrupted,
                 GroundSourceSurfaceError::SourceWorkLimitExceeded => {
                     GroundDerivationError::SourceWorkLimitExceeded
                 }
@@ -1765,10 +2195,10 @@ pub(crate) fn validate_ground_derivation(
             })?
             .uf_applications;
 
-        validate_step_uf_observations(idx, applications, &step.env, &mut uf_congruence)?;
+        validate_step_uf_observations(idx, applications, &step.env, &mut uf_congruence, control)?;
 
         if let Some(constraint) = &clause.body.constraint {
-            match eval_ground(constraint, &step.env) {
+            match eval_ground_with_control(constraint, &step.env, control)? {
                 Some(SmtValue::Bool(true)) => {}
                 Some(SmtValue::Bool(false)) => {
                     diagnose_false_constraint(idx, step.clause_index, constraint, &step.env);
@@ -1787,6 +2217,7 @@ pub(crate) fn validate_ground_derivation(
         }
 
         for (position, (pred, args)) in clause.body.predicates.iter().enumerate() {
+            control.poll()?;
             let premise_idx = step.premises[position];
             let premise = &derivation.steps[premise_idx];
             let premise_clause = &clauses[premise.clause_index];
@@ -1824,9 +2255,11 @@ pub(crate) fn validate_ground_derivation(
                 .zip(premise_head_values)
                 .enumerate()
             {
-                let (Some(use_value), Some(def_value)) =
-                    (eval_ground(use_arg, &step.env), def_value.as_ref())
-                else {
+                control.poll()?;
+                let (Some(use_value), Some(def_value)) = (
+                    eval_ground_with_control(use_arg, &step.env, control)?,
+                    def_value.as_ref(),
+                ) else {
                     return Err(GroundDerivationError::ArgumentNotGround {
                         step: idx,
                         position,
@@ -1839,16 +2272,19 @@ pub(crate) fn validate_ground_derivation(
                         position,
                     });
                 };
-                if !canonical_ground_value_matches_sort(&use_value, expected_sort)
-                    || !canonical_ground_value_matches_sort(def_value, expected_sort)
-                {
+                let sorts_match = canonical_ground_value_matches_sort(&use_value, expected_sort)
+                    && canonical_ground_value_matches_sort(def_value, expected_sort);
+                control.poll()?;
+                if !sorts_match {
                     return Err(GroundDerivationError::ArgumentNotGround {
                         step: idx,
                         position,
                         argument,
                     });
                 }
-                if !smt_values_equal(&use_value, &def_value) {
+                let equal = smt_values_equal(&use_value, &def_value);
+                control.poll()?;
+                if !equal {
                     if ground_backtranslation_debug() {
                         log_ground_translation_detail(format_args!(
                             "step {idx} (clause {}) body position {position} argument {argument}: \
@@ -1865,14 +2301,20 @@ pub(crate) fn validate_ground_derivation(
                 }
             }
         }
-        evaluated_heads[idx] = head_args(clause).map(|arguments| {
-            arguments
-                .iter()
-                .map(|argument| eval_ground(argument, &step.env))
-                .collect()
-        });
+        evaluated_heads[idx] = if let Some(arguments) = head_args(clause) {
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                values.push(eval_ground_with_control(argument, &step.env, control)?);
+            }
+            Some(values)
+        } else {
+            None
+        };
     }
 
+    // #completed-check-accepted: no poll here. Every step has been decided;
+    // a stop that arrives now cannot un-decide it, and the verdict on a
+    // finished check must not depend on when the caller's deadline landed.
     Ok(())
 }
 

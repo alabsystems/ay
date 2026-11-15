@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(declare-const a (_ BitVec 4))
+(declare-const b (_ BitVec 4))
+(declare-const c (_ BitVec 4))
+(assert (and (or (bvult a c) (= (not (= (bvadd a (_ bv1 4)) b)) (= (bvadd b (_ bv15 4)) a))) (not (bvult a c))))
+(check-sat)

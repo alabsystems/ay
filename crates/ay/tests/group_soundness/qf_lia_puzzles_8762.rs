@@ -12,22 +12,18 @@
 // (acceptance criteria <1s still open on #8762; n-queens n=8 and 9x9 Sudoku
 // remain timeouts pending the LIA check-loop latency follow-up).
 
-use std::path::PathBuf;
 use std::process::Command;
+
+use crate::corpus::tracked_fixture;
 
 /// Invoke the ay binary with a wall-clock timeout and return the first line of
 /// stdout (normalized to `sat` / `unsat` / `unknown`).
-fn run_ay_puzzle(puzzle_file: &str, timeout_ms: u32) -> Option<String> {
+///
+/// `benchmarks/puzzles` is committed, so a missing puzzle is a broken tree and
+/// fails here; it used to be a silent skip that the target read as a pass.
+fn run_ay_puzzle(puzzle_file: &str, timeout_ms: u32) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let benchmark_path = workspace_root.join("benchmarks/puzzles").join(puzzle_file);
-    if !benchmark_path.is_file() {
-        eprintln!(
-            "SKIP: optional puzzle benchmark not found: {}",
-            benchmark_path.display()
-        );
-        return None;
-    }
+    let benchmark_path = tracked_fixture(&format!("benchmarks/puzzles/{puzzle_file}"));
 
     let output = Command::new(ay_path)
         .arg(format!("-t:{timeout_ms}"))
@@ -36,7 +32,7 @@ fn run_ay_puzzle(puzzle_file: &str, timeout_ms: u32) -> Option<String> {
         .expect("Failed to spawn ay");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Some(stdout.trim().lines().next().unwrap_or("").to_string())
+    stdout.trim().lines().next().unwrap_or("").to_string()
 }
 
 /// SEND+MORE=MONEY cryptarithmetic: regression for #8762.
@@ -52,9 +48,7 @@ fn run_ay_puzzle(puzzle_file: &str, timeout_ms: u32) -> Option<String> {
 /// tracked separately.
 #[test]
 fn test_send_more_money_sat_8762() {
-    let Some(result) = run_ay_puzzle("send_more_money.smt2", 30_000) else {
-        return;
-    };
+    let result = run_ay_puzzle("send_more_money.smt2", 30_000);
     assert_eq!(
         result, "sat",
         "SEND+MORE=MONEY must return sat (regression for #8762, disequality \

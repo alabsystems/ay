@@ -25,3 +25,7 @@ mod frame0;
 mod loop_closure;
 mod reach_facts;
 mod symbolic;
+#[allow(clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+#[path = "typed_subst_tests.rs"]
+mod typed_subst_tests;

@@ -69,18 +69,19 @@ pub(super) fn finish_native_outcome(
     original_margin_tree_verified: bool,
     parity_infeasibility_verified: bool,
     affine_verification: Option<crate::AffineAggregationVerification>,
-) -> Outcome {
+) -> (Outcome, SupplementalProof) {
     if original_margin_tree_verified {
-        return outcome;
+        return (outcome, SupplementalProof::None);
     }
     if parity_infeasibility_verified {
-        return finish_exact_reduction_with_supplemental_proof(
+        let outcome = finish_exact_reduction_with_supplemental_proof(
             outcome,
             model,
             solved,
             opts,
             SupplementalProof::VerifiedParityInfeasibility,
         );
+        return (outcome, SupplementalProof::VerifiedParityInfeasibility);
     }
     let supplemental = affine_verification.and_then(|verification| {
         if outcome.is_infeasible() && verification.infeasibility_verified {
@@ -92,9 +93,13 @@ pub(super) fn finish_native_outcome(
         }
     });
     match supplemental {
-        Some(proof) => {
-            finish_exact_reduction_with_supplemental_proof(outcome, model, solved, opts, proof)
-        }
-        None => finish(outcome, model, solved, opts),
+        Some(proof) => (
+            finish_exact_reduction_with_supplemental_proof(outcome, model, solved, opts, proof),
+            proof,
+        ),
+        None => (
+            finish(outcome, model, solved, opts),
+            SupplementalProof::None,
+        ),
     }
 }

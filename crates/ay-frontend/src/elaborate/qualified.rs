@@ -6,7 +6,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 
 use crate::command::{self, QualifiedIdentifier, Term as ParsedTerm};
-use ay_core::{Sort, Symbol, TermId};
+use ay_core::{Sort, Symbol, TermData, TermId};
 
 use super::{Context, ElaborateError, Result};
 
@@ -95,27 +95,18 @@ impl Context {
                 let zero = self.terms.mk_int(num_bigint::BigInt::from(0));
                 Ok(self.terms.mk_const_array(index_sort, zero))
             }
-            // `(as map.empty (Map K V))` is the empty map. Its value carrier is a
-            // const array over an arbitrary V default (never observed: the empty
-            // map's domain is all-false, so `(map.dom empty) = const-false` gates
-            // every read). A const-array value carrier marks the empty map so
-            // `map.dom` elaborates its domain to the constant-false array. Sound
-            // and array-decidable with no quantifier instantiation.
+            // `(as map.empty (Map K V))` is the empty map: the sort's one
+            // unconstrained value array, whose domain `map.dom` elaborates to
+            // the constant-false array (see `Context::native_empty_map`).
             "map.empty" => {
                 self.expect_exact_arity("map.empty", &arg_ids, 0)?;
-                let index_sort = sort.array_index().cloned().ok_or_else(|| {
-                    ElaborateError::InvalidConstant(format!(
+                if sort.array_index().is_none() {
+                    return Err(ElaborateError::InvalidConstant(format!(
                         "map.empty requires a (Map K V) / Array sort annotation, got: {sort:?}"
-                    ))
-                })?;
-                let value_sort = sort.array_element().cloned().ok_or_else(|| {
-                    ElaborateError::InvalidConstant(format!(
-                        "map.empty requires a (Map K V) / Array sort annotation, got: {sort:?}"
-                    ))
-                })?;
-                // Arbitrary default value of sort V: unobserved (dom is false).
-                let default = self.terms.mk_fresh_var("map_empty_default", value_sort);
-                Ok(self.terms.mk_const_array(index_sort, default))
+                    )));
+                }
+                self.mark_uses_map();
+                Ok(self.native_empty_map(sort))
             }
             // Constant array: ((as const (Array T1 T2)) value).
             //
@@ -160,6 +151,12 @@ impl Context {
                         actual: actual.to_string(),
                     });
                 }
+                // At a map sort this is no map the encoding has a domain for
+                // (it is not the empty map); the native-map gate withholds a
+                // `sat` that rests on it (#map-value-semantics).
+                if self.parsed_sort_is_map(parsed_sort) {
+                    self.map_constant_array = true;
+                }
                 Ok(self.terms.mk_const_array(index_sort, arg_ids[0]))
             }
             _ => {
@@ -180,13 +177,30 @@ impl Context {
                 // This covers ordinary declarations and datatype members. It is
                 // also what preserves the selected private identity for native
                 // aliases and instance-mangled parametric constructors.
-                let info = self
-                    .resolve_qualified_declared_symbol(name, &sort, &arg_ids)?
-                    .ok_or_else(|| {
-                        ElaborateError::InvalidConstant(format!(
-                            "no declaration of '{name}' matches qualified result {sort} and the supplied arguments"
-                        ))
-                    })?;
+                let declared = self.resolve_qualified_declared_symbol(name, &sort, &arg_ids)?;
+                if declared.is_none() {
+                    if let Sort::FiniteField(field) = sort {
+                        if let Some(value) = name.strip_prefix("ff") {
+                            if !arg_ids.is_empty() {
+                                return Err(ElaborateError::InvalidConstant(
+                                    "field numeral requires no arguments".into(),
+                                ));
+                            }
+                            let n: num_bigint::BigInt = value
+                                .parse()
+                                .map_err(|_| ElaborateError::InvalidConstant(name.into()))?;
+                            let p = num_bigint::BigInt::from(field.modulus());
+                            use num_traits::ToPrimitive;
+                            let residue = ((n % &p + &p) % &p)
+                                .to_u32()
+                                .ok_or_else(|| ElaborateError::InvalidConstant(name.into()))?;
+                            return Ok(self.terms.mk_finite_field(residue, field));
+                        }
+                    }
+                }
+                let info=declared.ok_or_else(||ElaborateError::InvalidConstant(format!(
+                    "no declaration of '{name}' matches qualified result {sort} and the supplied arguments"
+                )))?;
                 self.validate_application_signature(name, &info.arg_sorts, &mut arg_ids)?;
 
                 // A qualified nullary constructor/constant denotes the exact
@@ -205,6 +219,13 @@ impl Context {
                     self.terms.mark_is_int_shadowed();
                 }
                 let internal = info.internal_name.as_deref().unwrap_or(name);
+                // Preserve the fully validated, result-qualified identity. Fold
+                // only a constructor-owned selector; wrong constructors and
+                // ordinary functions stay opaque. Restrict this to App arguments
+                // so the helper cannot enter its recursive ITE-distribution path.
+                if arg_ids.len() == 1 && matches!(self.terms.get(arg_ids[0]), TermData::App(..)) {
+                    return Ok(self.mk_datatype_selector(internal, &sort, arg_ids[0]));
+                }
                 Ok(self.terms.mk_app(Symbol::named(internal), arg_ids, sort))
             }
         }

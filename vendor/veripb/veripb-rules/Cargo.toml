@@ -1,0 +1,28 @@
+[package]
+name = "veripb-rules"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Data structures for VeriPB rules."
+
+[dependencies]
+itertools = "0.15.0"
+# Rendering LaTeX in docs.
+katexit = "0.1.5"
+logos = "0.16.1"
+malachite-bigint = "0.10.0"
+thiserror = "2.0.20"
+
+[dependencies.veripb-formula]
+version = "0.1.2"
+path = "../veripb-formula"
+
+
+[lib]
+name = "veripb_rules"
+path = "src/lib.rs"
+crate-type = ["rlib"]

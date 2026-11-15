@@ -600,17 +600,20 @@ impl Term {
                 ));
             }
             if !head_items.is_empty() && head_items[0].is_symbol("_") {
-                if head_items.len() < 3 {
-                    return Err(ParseError::new(
-                        "indexed application requires a name and at least one index",
-                    ));
-                }
-                // Indexed function: produce IndexedApp directly
+                // Indexed function: produce IndexedApp directly.
+                // `(_ fp.to_ieee_bv)` is the one zero-index indexed head
+                // SMT-LIB/z3 accept, so it alone may omit indices; every
+                // other indexed head requires at least one.
                 let name = head_items
                     .get(1)
                     .and_then(|s| s.as_symbol())
                     .ok_or_else(|| ParseError::new("indexed identifier name must be symbol"))?
                     .to_string();
+                if head_items.len() < 3 && name != "fp.to_ieee_bv" {
+                    return Err(ParseError::new(
+                        "indexed application requires a name and at least one index",
+                    ));
+                }
                 let indices: Vec<Index> = head_items[2..]
                     .iter()
                     .map(|sexp| {
@@ -641,6 +644,14 @@ impl Term {
                 .as_symbol()
                 .ok_or_else(|| ParseError::new("function name must be symbol"))?
                 .to_string();
+            // `(x)`: an application has at least one argument. z3 rejects the
+            // command here; reading it as the constant `x` would keep an
+            // assertion z3 drops.
+            if items.len() == 1 {
+                return Err(ParseError::new(
+                    "invalid function application, arguments missing",
+                ));
+            }
             (name, 1)
         };
 

@@ -271,46 +271,20 @@ pub(crate) fn build_trace(
             }
         };
 
-        // Build composed step model M_d mapping base names to values
-        let mut step_model: FxHashMap<String, SmtValue> = FxHashMap::default();
-
-        // For each state var x:
-        //   x := value of x@d in the SMT model
-        //   x_next := value of x@(d+1) in the SMT model
-        for var_name in state_var_names {
-            // Current state: x@d
-            let var_at_d = versioned_name(var_name, d);
-            if let Some(val) = model.get(&var_at_d) {
-                step_model.insert(var_name.clone(), val.clone());
-            }
-
-            // Next state: x@(d+1)
-            let next_var_name = format!("{var_name}_next");
-            let var_at_d_plus_1 = versioned_name(var_name, d + 1);
-            if let Some(val) = model.get(&var_at_d_plus_1) {
-                step_model.insert(next_var_name, val.clone());
-            }
-        }
-
-        // Also include trace_var itself
-        step_model.insert(trace_var_name.to_string(), SmtValue::Int(_transition_id));
-
-        // TRP-learned transitions keep `__trp_n` free and `version_transition`
-        // versions it per step exactly like `trace_id`, so the SMT model
-        // carries `__trp_n@d`. Read it in like `trace_id`; otherwise every
-        // composed model in TRL `compress()` lacks the value the chained
-        // formula needs (debug: the "missing snd model value" assert; release:
-        // an under-specified model feeding `implicant_cube`).
-        let trp_n_at_d = versioned_name(crate::trl::TRP_N_VAR_NAME, d);
-        if let Some(val) = model.get(&trp_n_at_d) {
-            step_model.insert(crate::trl::TRP_N_VAR_NAME.to_string(), val.clone());
-        }
-
         // Get the rule formula for this transition
         let rule = match rule_map.get(&_transition_id) {
             Some(r) => r,
             None => continue, // Unknown transition, skip
         };
+
+        let step_model = step_model_at(
+            model,
+            d,
+            trace_var_name,
+            state_var_names,
+            _transition_id,
+            rule,
+        );
 
         // Compute implicant cube
         let cube = mbp.implicant_cube(rule, &step_model);
@@ -359,6 +333,71 @@ fn versioned_name(base: &str, time: usize) -> String {
     } else {
         format!("{base}_{time}")
     }
+}
+
+/// The name a transition's clause-local `name` takes in the step that leaves
+/// timestep `step`: each step gets its own copy (#6789), with the suffix
+/// `TransitionSystem::version_transition_expr` uses.
+pub(crate) fn step_local_name(name: &str, step: usize) -> String {
+    format!("{name}__t{step}")
+}
+
+/// The composed step model M_d, mapping base names to values: each state var
+/// `x` and `x_next` from `x@d` and `x@(d+1)`, the trace var, `__trp_n@d`, and
+/// the rule's clause-locals.
+fn step_model_at(
+    model: &FxHashMap<String, SmtValue>,
+    d: usize,
+    trace_var_name: &str,
+    state_var_names: &[String],
+    transition_id: i128,
+    rule: &ChcExpr,
+) -> FxHashMap<String, SmtValue> {
+    let mut step_model: FxHashMap<String, SmtValue> = FxHashMap::default();
+
+    // For each state var x:
+    //   x := value of x@d in the SMT model
+    //   x_next := value of x@(d+1) in the SMT model
+    for var_name in state_var_names {
+        // Current state: x@d
+        let var_at_d = versioned_name(var_name, d);
+        if let Some(val) = model.get(&var_at_d) {
+            step_model.insert(var_name.clone(), val.clone());
+        }
+
+        // Next state: x@(d+1)
+        let next_var_name = format!("{var_name}_next");
+        let var_at_d_plus_1 = versioned_name(var_name, d + 1);
+        if let Some(val) = model.get(&var_at_d_plus_1) {
+            step_model.insert(next_var_name, val.clone());
+        }
+    }
+
+    // Also include trace_var itself
+    step_model.insert(trace_var_name.to_string(), SmtValue::Int(transition_id));
+
+    // TRP-learned transitions keep `__trp_n` free and `version_transition`
+    // versions it per step exactly like `trace_id`, so the SMT model
+    // carries `__trp_n@d`. Read it in like `trace_id`; otherwise every
+    // composed model in TRL `compress()` lacks the value the chained
+    // formula needs (debug: the "missing snd model value" assert; release:
+    // an under-specified model feeding `implicant_cube`).
+    let trp_n_at_d = versioned_name(crate::trl::TRP_N_VAR_NAME, d);
+    if let Some(val) = model.get(&trp_n_at_d) {
+        step_model.insert(crate::trl::TRP_N_VAR_NAME.to_string(), val.clone());
+    }
+
+    // The rule's clause-locals, which the unrolling versions per step
+    // (`step_local_name`): read back under their base names, or the
+    // implicant cube and the step model are missing them.
+    for v in rule.vars() {
+        if !step_model.contains_key(&v.name) {
+            if let Some(val) = model.get(&step_local_name(&v.name, d)) {
+                step_model.insert(v.name.clone(), val.clone());
+            }
+        }
+    }
+    step_model
 }
 
 #[allow(clippy::unwrap_used)]

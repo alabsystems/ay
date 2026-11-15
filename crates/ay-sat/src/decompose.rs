@@ -18,13 +18,16 @@
 
 mod rewrite;
 mod scc;
+mod single_step;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use rewrite::{rewrite_clauses, ClauseMutation};
+pub(crate) use scc::BinaryGraph;
+
+mod counted;
 
 use crate::literal::Literal;
-use crate::watched::WatchedLists;
 
 /// Maximum number of decompose rounds per invocation.
 const MAX_ROUNDS: usize = 2;
@@ -115,6 +118,12 @@ pub struct DecomposeStats {
     pub substituted: u64,
     /// Number of unit literals discovered during decomposition.
     pub units: u64,
+    /// Binary watch entries the SCC skipped because their clause was not live.
+    pub stale_binary_watches_skipped: u64,
+    /// Literals the single-step guard re-pointed at their final representative.
+    pub chained_representatives: u64,
+    /// Rounds the single-step guard refused (LRAT chain, cycle, polarity clash).
+    pub chained_rounds_refused: u64,
 }
 
 /// One checker-facing equivalence derivation planned by an LRAT decompose dry run.
@@ -902,19 +911,19 @@ impl Decompose {
     /// passes `true`.
     pub(crate) fn run(
         &mut self,
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         num_vars: usize,
         vals: &[i8],
         frozen: &[u32],
         var_states: &[crate::solver::lifecycle::VarState],
         need_chains: bool,
     ) -> DecomposeResult {
-        self.run_inner(watches, num_vars, vals, frozen, var_states, need_chains)
+        self.run_inner(graph, num_vars, vals, frozen, var_states, need_chains)
     }
 
     fn run_inner(
         &mut self,
-        watches: &WatchedLists,
+        graph: BinaryGraph<'_>,
         num_vars: usize,
         vals: &[i8],
         frozen: &[u32],
@@ -953,7 +962,7 @@ impl Decompose {
         };
 
         for _round in 0..MAX_ROUNDS {
-            let result = self.run_round(watches, num_vars, vals, frozen, var_states, need_chains);
+            let result = self.run_round(graph, num_vars, vals, frozen, var_states, need_chains);
             self.stats.rounds += 1;
             self.stats.substituted += u64::from(result.substituted);
             self.stats.units += u64::from(result.new_units);
@@ -989,6 +998,7 @@ impl Decompose {
             }
         }
 
+        self.make_representatives_single_step(num_lits, need_chains, &mut combined);
         combined.reprs = self.reprs[..num_lits].to_vec();
         combined
     }

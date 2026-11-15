@@ -6,7 +6,8 @@
 # Metadata lives in pyproject.toml (PEP 621). This setup.py exists ONLY to add a
 # build step: before the package files are collected, it runs
 #
-#     cargo build -p ay-ffi --release
+#     targo --unverified build -p ay-ffi --release   (Trust toolchain on PATH)
+#     cargo build -p ay-ffi --release                (otherwise: stock Rust)
 #
 # from the Cargo workspace root and copies the produced cdylib
 # (libay_ffi.{dylib,so} / ay_ffi.dll) into the `ayz3/` package directory. The
@@ -39,6 +40,19 @@ _LIB_BASENAMES = {
     "linux": "libay_ffi.so",
     "win32": "ay_ffi.dll",
 }
+
+
+def _cargo_build_command():
+    """The build command for libay_ffi.
+
+    Where the Trust toolchain's `targo` is on PATH (ALab development hosts),
+    Rust is spelled `targo` and the build names its unverified lane: the
+    library is packaged, not proved. Elsewhere (a public install with stock
+    Rust) it is plain `cargo`.
+    """
+    if shutil.which("targo"):
+        return ["targo", "--unverified", "build", "-p", "ay-ffi", "--release"]
+    return ["cargo", "build", "-p", "ay-ffi", "--release"]
 
 
 def _platform_basename() -> str:
@@ -80,13 +94,10 @@ def _build_and_stage_cdylib() -> Path:
         raise
 
     if not skip:
-        print(f"[ayz3] building libay_ffi (release): cargo build -p ay-ffi "
-              f"--release  (cwd={workspace})")
-        subprocess.run(
-            ["cargo", "build", "-p", "ay-ffi", "--release"],
-            cwd=str(workspace),
-            check=True,
-        )
+        command = _cargo_build_command()
+        print(f"[ayz3] building libay_ffi (release): {' '.join(command)}  "
+              f"(cwd={workspace})")
+        subprocess.run(command, cwd=str(workspace), check=True)
 
     src = workspace / "target" / "release" / basename
     if not src.is_file():
@@ -105,7 +116,8 @@ def _build_and_stage_cdylib() -> Path:
         else:
             raise RuntimeError(
                 f"[ayz3] expected built cdylib at {src} but it is missing. "
-                f"Build it with `cargo build -p ay-ffi --release`."
+                f"Build it with `targo --unverified build -p ay-ffi --release` "
+                f"(Trust toolchain) or `cargo build -p ay-ffi --release`."
             )
 
     shutil.copy2(src, dest)

@@ -1,0 +1,7 @@
+(set-logic QF_FF)
+(declare-const |#f1m7| (_ FiniteField 7))
+(declare-const ff1 (_ FiniteField 7))
+(assert (= #f1m7 #f2m7))
+(assert (= (as ff1 (_ FiniteField 7)) #f3m7))
+(assert (= (let ((|#f2m7| #f4m7)) |#f2m7|) #f4m7))
+(check-sat)

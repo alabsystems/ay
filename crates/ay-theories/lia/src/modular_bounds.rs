@@ -14,9 +14,55 @@ use num_bigint::BigInt;
 use num_traits::{One, Signed, Zero};
 use tracing::{debug, info};
 
-use crate::{gcd_of_abs, positive_mod, LiaSolver};
+// #8529: Use deterministic hash sets in all builds.
+use ay_core::kani_compat::DetHashSet as HashSet;
+
+use crate::{gcd_of_abs, positive_mod, Bound, LiaSolver};
 
 impl LiaSolver<'_> {
+    /// Premises for a cached Dioph modulus combined with this exact LRA
+    /// window. The modulus depends on the asserted equation system and any
+    /// bounds folded into it; the window depends on its two LRA bounds. All
+    /// those reasons must be live and nameable before publishing a clause.
+    pub(crate) fn modular_cached_conflict_reasons(
+        &self,
+        lower: &Bound,
+        upper: &Bound,
+    ) -> Option<Vec<TheoryLit>> {
+        let lower_reasons = self.justified_lra_bound_reasons(lower)?;
+        let upper_reasons = self.justified_lra_bound_reasons(upper)?;
+        let cached_reasons: Vec<_> = self
+            .dioph_cached_reasons
+            .iter()
+            .map(|&(term, value)| TheoryLit::new(term, value))
+            .collect();
+        if !self.conflict_reasons_all_live(&lower_reasons)
+            || !self.conflict_reasons_all_live(&upper_reasons)
+            || !self.conflict_reasons_all_live(&cached_reasons)
+            || !self.dioph_fold_reasons_live()
+        {
+            return None;
+        }
+
+        let mut conflict: Vec<_> = self
+            .asserted
+            .iter()
+            .map(|&(term, value)| TheoryLit::new(term, value))
+            .collect();
+        let mut seen: HashSet<_> = conflict.iter().copied().collect();
+        for reason in lower_reasons
+            .into_iter()
+            .chain(upper_reasons)
+            .chain(cached_reasons)
+            .chain(self.dioph_cached_fold_reasons.iter().copied())
+        {
+            if seen.insert(reason) {
+                conflict.push(reason);
+            }
+        }
+        Some(conflict)
+    }
+
     /// Propagate bounds through cached substitutions.
     ///
     /// For each cached substitution `var = c + Σ(a_i * dep_i)`, uses current
@@ -401,8 +447,12 @@ impl LiaSolver<'_> {
             );
         }
 
-        // Get current bounds for the variable
-        let (lb_opt, ub_opt) = self.lra.get_bounds(term_id)?;
+        // Get current bounds for the variable. JUSTIFIED bounds only
+        // (#nia-sign-cut-soundness): a bound that is not a consequence of
+        // live asserted or cross-theory atoms (an NIA tentative sign cut or
+        // rounding pin) must be invisible here. Any conflict below also
+        // cites the exact nameable reasons of both bounds.
+        let (lb_opt, ub_opt) = self.justified_bounds(term_id)?;
         // For integers, effective bounds are ceil(lb) to floor(ub)
         let effective_lb = lb_opt.as_ref().map(Self::effective_int_lower);
         let effective_ub = ub_opt.as_ref().map(Self::effective_int_upper);
@@ -438,13 +488,7 @@ impl LiaSolver<'_> {
                     gcd
                 );
             }
-            // Return conflict: all asserted literals
-            let conflict: Vec<TheoryLit> = self
-                .asserted
-                .iter()
-                .map(|&(lit, val)| TheoryLit::new(lit, val))
-                .collect();
-            return Some(conflict);
+            return self.modular_cached_conflict_reasons(lb_opt.as_ref()?, ub_opt.as_ref()?);
         }
 
         // If bounds are tight enough, we can derive exact value
@@ -455,9 +499,13 @@ impl LiaSolver<'_> {
             }
 
             // Check if there's a disequality that excludes this unique value
-            if let Some(conflict) =
-                self.check_disequality_excludes_unique(term_id, &first_valid, debug)
-            {
+            if let Some(conflict) = self.check_disequality_excludes_unique(
+                term_id,
+                &first_valid,
+                lb_opt.as_ref()?,
+                ub_opt.as_ref()?,
+                debug,
+            ) {
                 return Some(conflict);
             }
         }
@@ -470,21 +518,23 @@ impl LiaSolver<'_> {
         &self,
         term_id: TermId,
         unique_value: &BigInt,
+        lower: &Bound,
+        upper: &Bound,
         debug: bool,
     ) -> Option<Vec<TheoryLit>> {
         for &diseq_lit in &self.assertion_view().negative_equalities {
-            if let TermData::App(Symbol::Named(n), a) = self.terms.get(diseq_lit) {
+            if let TermData::App(Symbol::Named(n), a) = self.terms().get(diseq_lit) {
                 if n == "=" && a.len() == 2 {
                     let (lhs, rhs) = (a[0], a[1]);
                     let mut excluded_val = None;
 
                     if lhs == term_id {
-                        if let TermData::Const(Constant::Int(c)) = self.terms.get(rhs) {
+                        if let TermData::Const(Constant::Int(c)) = self.terms().get(rhs) {
                             excluded_val = Some(c.clone());
                         }
                     }
                     if rhs == term_id {
-                        if let TermData::Const(Constant::Int(c)) = self.terms.get(lhs) {
+                        if let TermData::Const(Constant::Int(c)) = self.terms().get(lhs) {
                             excluded_val = Some(c.clone());
                         }
                     }
@@ -503,13 +553,16 @@ impl LiaSolver<'_> {
                                     diseq_lit
                                 );
                             }
-                            let mut conflict: Vec<TheoryLit> = self
-                                .asserted
-                                .iter()
-                                .filter(|&&(_, v)| v)
-                                .map(|&(lit, val)| TheoryLit::new(lit, val))
-                                .collect();
-                            conflict.push(TheoryLit::new(diseq_lit, false));
+                            // The window may come from a shared LRA fact, not
+                            // just LIA's own asserted atoms. Cite its exact
+                            // justification and the Dioph cache's folded
+                            // premises; decline if either cannot be named.
+                            let mut conflict =
+                                self.modular_cached_conflict_reasons(lower, upper)?;
+                            let diseq = TheoryLit::new(diseq_lit, false);
+                            if !conflict.contains(&diseq) {
+                                conflict.push(diseq);
+                            }
                             return Some(conflict);
                         }
                     }

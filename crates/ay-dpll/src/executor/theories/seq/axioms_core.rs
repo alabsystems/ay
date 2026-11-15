@@ -1573,6 +1573,12 @@ impl Executor {
         if froms.is_empty() {
             return;
         }
+        // This rewrite eliminates public model points as well as syntax.
+        // Retain their defining RHS for the ordinary completion fixpoint and
+        // the outer original-root gap sweep after the fresh elements are valued.
+        for (&from, &to) in froms.iter().zip(&tos) {
+            self.recorded_var_substitutions.insert(from, to);
+        }
         let new_assertions: Vec<TermId> = self
             .ctx
             .assertions
@@ -1717,6 +1723,9 @@ impl Executor {
             }
             let froms: Vec<TermId> = binding.keys().copied().collect();
             let tos: Vec<TermId> = froms.iter().map(|v| binding[v]).collect();
+            for (&from, &to) in froms.iter().zip(&tos) {
+                self.recorded_var_substitutions.insert(from, to);
+            }
             let new_assertions: Vec<TermId> = self
                 .ctx
                 .assertions

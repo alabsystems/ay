@@ -23,6 +23,7 @@
 
 mod accept;
 mod bv_unsafe;
+pub(crate) mod engine_memory;
 mod engines;
 pub(crate) mod features;
 mod preprocess;
@@ -39,6 +40,7 @@ use preprocess::problem_contains_recursive_bv_sorts;
 pub(crate) use preprocess::PreprocessSummary;
 #[cfg(test)]
 use schedule::panic_message;
+pub(crate) use schedule::VERDICT_REAP_BOUND;
 #[cfg(test)]
 use types::EngineResult;
 pub use types::{
@@ -98,10 +100,19 @@ pub struct PortfolioSolver {
     /// preprocessing. Unlike the deterministic scheduler field, this applies
     /// to adaptive/parallel portfolios as a fail-closed construction boundary.
     construction_deadline: Option<ay_core::time::Instant>,
+    /// The parallel completion window starts before preprocessing. Its existing
+    /// grace period may still validate a candidate completed within the window;
+    /// unlike `construction_deadline`, this is not a publication deadline.
+    parallel_deadline: Option<ay_core::time::Instant>,
     /// Constructor preprocessing observed cancellation/deadline at a stage
     /// boundary and deliberately returned an identity shell instead of a
     /// partially transformed solver.
     construction_aborted: bool,
+    /// Safe candidates an engine proposed that full validation REJECTED,
+    /// back-translated to the ORIGINAL problem's vocabulary (CH4b). Never a
+    /// verdict: a caller that continues on the same problem may offer their
+    /// conjuncts to PDR as lemma hints, which PDR re-validates like any hint.
+    rejected_safe_candidates: std::sync::Mutex<Vec<crate::pdr::InvariantModel>>,
     /// Local engine override used only by scheduler unit tests.
     #[cfg(test)]
     sequential_test_engine: Option<SequentialTestEngine>,
@@ -111,6 +122,9 @@ pub struct PortfolioSolver {
     /// Deterministic parallel-worker limit used only by scheduler unit tests.
     #[cfg(test)]
     parallel_worker_limit_override: Option<usize>,
+    /// Lane memory shares used only by scheduler unit tests.
+    #[cfg(test)]
+    engine_memory_limits_override: Option<engine_memory::LaneMemoryLimits>,
 }
 
 impl Drop for PortfolioSolver {
@@ -137,6 +151,52 @@ impl PortfolioSolver {
                 .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
     }
 
+    fn effective_solve_deadline(&self) -> Option<ay_core::time::Instant> {
+        [
+            self.construction_deadline,
+            self.parallel_deadline,
+            self.deterministic_global_deadline,
+            crate::smt::current_thread_solve_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    fn parallel_deadline_expired(&self) -> bool {
+        self.parallel_deadline
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
+    fn enforce_pre_engine_deadline(&self, result: PortfolioResult) -> PortfolioResult {
+        if self.parallel_deadline_expired() {
+            return PortfolioResult::Unknown;
+        }
+        self.enforce_deterministic_deadline(result)
+    }
+
+    fn uses_parallel_schedule(&self) -> bool {
+        // A timed parallel portfolio still needs completion timestamps and
+        // grace when only one engine remains. An explicit deterministic
+        // schedule always retains its fixed sequential allocations.
+        !self.deterministic_sequential_schedule
+            && self.config.parallel
+            && (self.config.engines.len() > 1 || self.config.parallel_timeout.is_some())
+    }
+
+    /// Discard a definitive candidate produced at or after the authoritative
+    /// boundary (external cancellation, the construction/solve deadline, or
+    /// the deterministic whole-run deadline).
+    ///
+    /// This gate is deliberately strict and is NOT the place to grant late
+    /// validation a reserve: the adaptive layer re-checks the same whole-run
+    /// deadline on the verified result (`adaptive.rs`,
+    /// `finalize_verified_result_candidate`), so anything accepted here after
+    /// the boundary would be demoted to Unknown one level up anyway. Deferred
+    /// witness-less Unsafe candidates are therefore validated INSIDE the
+    /// window, in a tail reserved before the boundary
+    /// (`schedule.rs`, `witnessless_validation_reserve`), and this gate stays
+    /// a pure boundary check.
     fn enforce_deterministic_deadline(&self, result: PortfolioResult) -> PortfolioResult {
         if (self.cancellation_token.is_cancelled()
             || self.construction_boundary_exhausted()
@@ -343,9 +403,13 @@ impl PortfolioSolver {
                 .any(|s| matches!(s, ChcSort::Array(_, _) | ChcSort::BitVec(_)))
         });
         if !has_complex_preds {
+            // The scalar algebraic prepass solves `original_problem` and
+            // already returns an original-signature model. Applying the
+            // preprocessing back-translator again can restore projected
+            // columns twice or reject its already-restored arity.
             debug_assert!(
                 !matches!(
-                    self.validate_safe_query_only(&model),
+                    self.validate_safe_query_only_pre_translated(&model),
                     SafePrecheckResult::Invalid(_)
                 ),
                 "BUG: algebraic synthesis model failed portfolio query-only validation"
@@ -377,7 +441,24 @@ impl PortfolioSolver {
     ///
     /// Budget policies (#8418) are applied during construction: disabled
     /// engines are removed from the engine list before any solving begins.
-    pub(crate) fn new(problem: ChcProblem, mut config: PortfolioConfig) -> Self {
+    pub(crate) fn new(problem: ChcProblem, config: PortfolioConfig) -> Self {
+        // The parallel-only setting must not constrain a sequential run.
+        if let Some(budget) = config.parallel_timeout.filter(|_| config.parallel) {
+            let requested = ay_core::time::Instant::now() + budget;
+            let enclosing = crate::smt::current_thread_solve_deadline();
+            let deadline = enclosing.map_or(requested, |limit| limit.min(requested));
+            let mut solver = Self::new_with_solve_limits(problem, config, Some(deadline));
+            // Use the same window for preprocessing and engine completion,
+            // while retaining the scheduler's pre-deadline completion grace.
+            // An independently supplied caller deadline remains authoritative.
+            solver.construction_deadline = enclosing;
+            solver.parallel_deadline = Some(requested);
+            return solver;
+        }
+        Self::new_without_solve_limits(problem, config)
+    }
+
+    fn new_without_solve_limits(problem: ChcProblem, mut config: PortfolioConfig) -> Self {
         // Apply budget policies: remove disabled engines (#8418).
         let disabled = config.apply_budget_policies();
         if config.verbose && !disabled.is_empty() {
@@ -405,13 +486,17 @@ impl PortfolioSolver {
                 deterministic_sequential_schedule: false,
                 deterministic_global_deadline: None,
                 construction_deadline: None,
+                parallel_deadline: None,
                 construction_aborted: false,
+                rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
                 #[cfg(test)]
                 sequential_test_engine: None,
                 #[cfg(test)]
                 sequential_test_publish_delay: None,
                 #[cfg(test)]
                 parallel_worker_limit_override: None,
+                #[cfg(test)]
+                engine_memory_limits_override: None,
             }
         }
     }
@@ -461,13 +546,17 @@ impl PortfolioSolver {
             deterministic_sequential_schedule: false,
             deterministic_global_deadline: None,
             construction_deadline: None,
+            parallel_deadline: None,
             construction_aborted: false,
+            rejected_safe_candidates: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             sequential_test_engine: None,
             #[cfg(test)]
             sequential_test_publish_delay: None,
             #[cfg(test)]
             parallel_worker_limit_override: None,
+            #[cfg(test)]
+            engine_memory_limits_override: None,
         }
     }
 
@@ -501,7 +590,7 @@ impl PortfolioSolver {
         };
 
         if !config.enable_preprocessing {
-            let mut solver = Self::new(problem, config);
+            let mut solver = Self::new_without_solve_limits(problem, config);
             solver.construction_deadline = deadline;
             solver.construction_aborted = exhausted();
             return solver;
@@ -517,7 +606,7 @@ impl PortfolioSolver {
                 // original clauses solely for diagnostics/drop and is sealed by
                 // `construction_aborted` before any pre-engine path can run.
                 config.enable_preprocessing = false;
-                let mut solver = Self::new(fallback_problem, config);
+                let mut solver = Self::new_without_solve_limits(fallback_problem, config);
                 solver.construction_deadline = deadline;
                 solver.construction_aborted = true;
                 solver
@@ -575,6 +664,12 @@ impl PortfolioSolver {
         self
     }
 
+    #[cfg(test)]
+    fn with_engine_memory_limits(mut self, soft: usize, hard: usize) -> Self {
+        self.engine_memory_limits_override = Some(engine_memory::LaneMemoryLimits { soft, hard });
+        self
+    }
+
     /// Solve the CHC problem using the portfolio strategy.
     ///
     /// Returns the raw `PortfolioResult` (a type alias for `ChcEngineResult`).
@@ -583,12 +678,26 @@ impl PortfolioSolver {
     ///
     /// For the verified public API, use `AdaptivePortfolio::solve()` which
     /// wraps results in `VerifiedChcResult`. Part of #5746.
+    /// Drain the Safe candidates full validation rejected during this solve
+    /// (CH4b), in ORIGINAL-problem vocabulary. Search hints only — never a
+    /// verdict.
+    pub(crate) fn take_rejected_safe_candidates(&self) -> Vec<crate::pdr::InvariantModel> {
+        std::mem::take(
+            &mut *self
+                .rejected_safe_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     pub fn solve(&self) -> PortfolioResult {
+        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(self.effective_solve_deadline());
         if self.config.engines.is_empty() {
             return PortfolioResult::Unknown;
         }
         if self.cancellation_token.is_cancelled()
             || self.construction_boundary_exhausted()
+            || self.parallel_deadline_expired()
             || self.deterministic_deadline_expired()
         {
             return PortfolioResult::Unknown;
@@ -596,7 +705,7 @@ impl PortfolioSolver {
 
         // Check for trivial problems (e.g., all predicates inlined away)
         if let Some(result) = self.try_solve_trivial() {
-            return self.enforce_deterministic_deadline(result);
+            return self.enforce_pre_engine_deadline(result);
         }
 
         if ay_core::TermStore::global_memory_exceeded() {
@@ -615,11 +724,12 @@ impl PortfolioSolver {
         // Part of #7170, #5651, #1753.
         if self.should_try_algebraic_prepass() {
             if let Some(result) = self.try_algebraic_prepass() {
-                return self.enforce_deterministic_deadline(result);
+                return self.enforce_pre_engine_deadline(result);
             }
         }
 
-        let result = if self.config.parallel && self.config.engines.len() > 1 {
+        drop(_solve_deadline);
+        let result = if self.uses_parallel_schedule() {
             self.solve_parallel()
         } else {
             self.solve_sequential()
@@ -667,6 +777,7 @@ impl PortfolioSolver {
     /// This is the primary API for callers that need post-solve budget
     /// observability (e.g., model-checker-consumer's invariant synthesis pipeline).
     pub fn solve_with_budget_report(&self) -> (PortfolioResult, BudgetReport) {
+        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(self.effective_solve_deadline());
         let start = ay_core::time::Instant::now();
         let mut report = BudgetReport::new();
         self.append_disabled_budget_rows(&mut report);
@@ -677,6 +788,7 @@ impl PortfolioSolver {
         }
         if self.cancellation_token.is_cancelled()
             || self.construction_boundary_exhausted()
+            || self.parallel_deadline_expired()
             || self.deterministic_deadline_expired()
         {
             self.append_unstarted_active_rows(&mut report);
@@ -688,7 +800,7 @@ impl PortfolioSolver {
         if let Some(result) = self.try_solve_trivial() {
             self.append_unstarted_active_rows(&mut report);
             report.total_elapsed = start.elapsed();
-            return (self.enforce_deterministic_deadline(result), report);
+            return (self.enforce_pre_engine_deadline(result), report);
         }
 
         if ay_core::TermStore::global_memory_exceeded() {
@@ -702,11 +814,12 @@ impl PortfolioSolver {
             if let Some(result) = self.try_algebraic_prepass() {
                 self.append_unstarted_active_rows(&mut report);
                 report.total_elapsed = start.elapsed();
-                return (self.enforce_deterministic_deadline(result), report);
+                return (self.enforce_pre_engine_deadline(result), report);
             }
         }
 
-        let result = if self.config.parallel && self.config.engines.len() > 1 {
+        drop(_solve_deadline);
+        let result = if self.uses_parallel_schedule() {
             self.solve_parallel_with_report(&mut report)
         } else {
             self.solve_sequential_with_report(&mut report)

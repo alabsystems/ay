@@ -24,25 +24,11 @@
 
 use ntest::timeout;
 
-/// #8736: `ring_2exp16_5vars_cascade_v2_unsat` must resolve to UNSAT.
-///
-/// This benchmark is a 16-bit ring cascade whose UNSAT proof requires
-/// the LIA solver to observe "sum divisible by 3 vs. residue 1 (mod
-/// 65536)" via the `NeedModelEqualities` handler plus integer-var
-/// splitting. Previously it hit `UnknownReason::Incomplete` when the
-/// model-equality round counter capped out before the SAT solver
-/// learned theory conflicts. The #8727 + #8594 fixes ensure the round
-/// counter resets on real progress, so the solver reaches UNSAT in
-/// ~20ms.
-///
-/// The SMT2 below is copied verbatim from
-/// `benchmarks/smt/QF_LIA/ring_2exp16_5vars_cascade_v2_unsat.smt2`.
-/// Keep the assertions byte-identical to the benchmark; if the
-/// benchmark changes, update both.
-#[test]
-#[timeout(5_000)]
-fn test_8736_cascade_v2_unsat() {
-    let smt = r#"
+/// The `ring_2exp16_5vars_cascade_v2_unsat` benchmark, copied verbatim from
+/// `benchmarks/smt/QF_LIA/ring_2exp16_5vars_cascade_v2_unsat.smt2`. Keep the
+/// assertions byte-identical to the benchmark; if the benchmark changes,
+/// update both.
+const CASCADE_V2_SMT: &str = r#"
         (set-logic QF_LIA)
         (declare-const x1 Int) (declare-const x2 Int) (declare-const x3 Int)
         (declare-const x4 Int) (declare-const x5 Int)
@@ -87,7 +73,26 @@ fn test_8736_cascade_v2_unsat() {
 
         (check-sat)
     "#;
-    let result = crate::common::solve(smt);
+
+/// #8736: `ring_2exp16_5vars_cascade_v2_unsat` must resolve to UNSAT.
+///
+/// This benchmark is a 16-bit ring cascade whose UNSAT proof requires
+/// the LIA solver to observe "sum divisible by 3 vs. residue 1 (mod
+/// 65536)" via the `NeedModelEqualities` handler plus integer-var
+/// splitting. Previously it hit `UnknownReason::Incomplete` when the
+/// model-equality round counter capped out before the SAT solver
+/// learned theory conflicts. The #8727 + #8594 fixes ensure the round
+/// counter resets on real progress, so the solver reaches UNSAT in
+/// ~20ms.
+///
+/// The SMT2 below is copied verbatim from
+/// `benchmarks/smt/QF_LIA/ring_2exp16_5vars_cascade_v2_unsat.smt2`.
+/// Keep the assertions byte-identical to the benchmark; if the
+/// benchmark changes, update both.
+#[test]
+#[timeout(5_000)]
+fn test_8736_cascade_v2_unsat() {
+    let result = crate::common::solve(CASCADE_V2_SMT);
     assert_eq!(
         result.trim(),
         "unsat",
@@ -97,6 +102,42 @@ fn test_8736_cascade_v2_unsat() {
          crates/ay-dpll/src/pipeline_incremental_split_eager_macros.rs \
          has regressed — the `note_theory_progress` reset or the \
          `_islp_seen_model_eq_requests` dedup is no longer firing."
+    );
+}
+
+/// #lia-bcp-dioph-bound-recheck: the SAME benchmark under
+/// `(set-option :produce-proofs true)` must reach a verdict PROMPTLY.
+///
+/// Proof production disables the second variable-substitution round, so the
+/// `(mod x 3)` divmod encoding survives into the theory and the BCP-time
+/// Diophantine analysis is the only pass that can refute the system. That
+/// analysis was armed on the EQUALITY KEY alone, but its second half
+/// (`check_substitution_bound_feasibility` / the joint case split) reads the
+/// CURRENT integer bounds, and an unbounded variable evaluates to
+/// `ValueSetEval::Unknown`, which the feasibility test must read as
+/// "feasible". This benchmark's equalities are all top level, so that half ran
+/// exactly ONCE — before branch-and-bound had bounded the `_divmod_q_*`
+/// quotient variables — and its "feasible" answer stood for the rest of the
+/// solve. Measured at the base of this fix: the query ran 298 s before
+/// answering `unknown`; with the periodic bound re-check in `ay_lia::dioph_bcp`
+/// it answers in 0.4 s.
+///
+/// The VERDICT is deliberately not pinned to `unsat`: mandatory strict
+/// certification legitimately rejects this refutation's unsupported theory
+/// lemma / trust steps and degrades it to a fail-closed `unknown`, exactly as
+/// it does for the `ring_2exp16_5vars_cascade` sibling. What is pinned is that
+/// the query TERMINATES quickly and never answers `sat`.
+#[test]
+#[timeout(30_000)]
+fn test_cascade_v2_proof_mode_terminates_promptly() {
+    let smt = format!("(set-option :produce-proofs true)\n{CASCADE_V2_SMT}");
+    let outputs = crate::common::solve_vec(&smt);
+    let verdict = outputs.first().map_or("", String::as_str).trim();
+    assert!(
+        matches!(verdict, "unsat" | "unknown"),
+        "#lia-bcp-dioph-bound-recheck: cascade_v2 under :produce-proofs must \
+         reach a definite or fail-closed verdict, got {verdict:?} \
+         (full output: {outputs:?})"
     );
 }
 

@@ -628,7 +628,7 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
     let mut suite_dirs_indent = None;
 
     for (zero_based_line, line) in text.lines().enumerate() {
-        let line_number = zero_based_line + 1;
+        let line_number = zero_based_line.saturating_add(1);
         if line.contains('\0') {
             return Err(eval_yaml_error(
                 path,
@@ -637,7 +637,14 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
             ));
         }
         let content = line.trim_start_matches([' ', '\t']);
-        let leading = &line[..line.len() - content.len()];
+        // `content` is a suffix of `line`, so stripping it always succeeds.
+        let Some(leading) = line.strip_suffix(content) else {
+            return Err(eval_yaml_error(
+                path,
+                line_number,
+                "indentation is not a prefix of the line",
+            ));
+        };
         if leading.contains('\t') {
             return Err(eval_yaml_error(
                 path,
@@ -859,6 +866,17 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
 }
 
 fn find_solver(name_or_path: &str) -> Option<PathBuf> {
+    // z3 is AY's reference oracle. A name lookup can land on a reroute stub
+    // (whose empty answer reads as a blind reference leg) or on an AY drop-in
+    // (AY compared with itself), so the bare name takes the workspace's one
+    // identity-checked resolution and fails closed; it never falls back to
+    // the walk below.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if name_or_path == "z3" {
+        return ay_sys::z3_oracle::z3_oracle()
+            .ok()
+            .map(|oracle| oracle.path().to_path_buf());
+    }
     let resolve = |candidate: &Path| {
         if !is_executable_file(candidate) {
             return None;
@@ -1364,7 +1382,7 @@ fn run_single_eval(
             published_dir.display()
         );
     }
-    let verification = verification_summary(&results);
+    let verification = verification_summary(&results)?;
     let evidence = serde_json::json!({
         "results_path": results_path,
         "verified": verification.verified,
@@ -1373,6 +1391,15 @@ fn run_single_eval(
         "non_definitive": verification.non_definitive,
         "total": verification.total,
     });
+    if verification.wrong != 0 {
+        return Err(BenchError::ScoringFailed {
+            reason: format!(
+                "{eval_id}: {} wrong answer(s); complete evidence retained at {}",
+                verification.wrong,
+                published_dir.display()
+            ),
+        });
+    }
     Ok((score, shard, evidence))
 }
 
@@ -1557,7 +1584,7 @@ fn build_rows(
     results: &crate::native::NativeResults,
     with_features: bool,
 ) -> Result<Vec<ResultRow>> {
-    let comp_index = comparison_index(results);
+    let scoring_items = scoring::native_scoring_items(results)?;
 
     let timestamp = results.environment.timestamp.clone();
     let resource_plan = results
@@ -1579,8 +1606,9 @@ fn build_rows(
     results
         .items
         .iter()
-        .map(|item| -> Result<ResultRow> {
-            let verifier_ok = classify_verifier(item, &comp_index);
+        .zip(scoring_items.iter())
+        .map(|(item, scored)| -> Result<ResultRow> {
+            let verifier_ok = match scored.correct { Some(true)=>1, Some(false)=>0, None=>-1 };
             let runtime = std::time::Duration::try_from_secs_f64(item.time_sec).map_err(|_| {
                 BenchError::msg(format!(
                     "{eval_id}: invalid runtime evidence for {}: {:?}",
@@ -1636,7 +1664,7 @@ fn build_rows(
                 commit_hash: commit_hash.to_string(),
                 eval_name: eval_id.to_string(),
                 benchmark_path: item.benchmark_path.clone(),
-                result: item.result.clone(),
+                result: scored.result.clone().unwrap_or_else(|| "error".to_string()),
                 runtime_ms,
                 // NativeResultItem does not currently capture per-benchmark
                 // peak RSS; leave the column as zero until we add that.
@@ -1664,32 +1692,6 @@ fn build_rows(
         .collect()
 }
 
-fn comparison_index(results: &crate::native::NativeResults) -> BTreeMap<&str, Vec<&'static str>> {
-    // Index comparison items (if present) by file path so we can look up
-    // agreement quickly.
-    let mut comp_index: BTreeMap<&str, Vec<&'static str>> = BTreeMap::new();
-    if let Some(reference_comparisons) = results.reference_comparisons.as_deref() {
-        for reference in reference_comparisons {
-            for comparison in &reference.items {
-                comp_index
-                    .entry(comparison.file.as_str())
-                    .or_default()
-                    .push(comparison.agreement);
-            }
-        }
-    } else {
-        // Backward compatibility for in-memory/legacy results that only carry
-        // the first reference's rows.
-        for comparison in results.comparisons.as_deref().unwrap_or(&[]) {
-            comp_index
-                .entry(comparison.file.as_str())
-                .or_default()
-                .push(comparison.agreement);
-        }
-    }
-    comp_index
-}
-
 #[derive(Debug)]
 struct VerificationSummary {
     verified: usize,
@@ -1699,65 +1701,16 @@ struct VerificationSummary {
     total: usize,
 }
 
-fn verification_summary(results: &crate::native::NativeResults) -> VerificationSummary {
-    let comp_index = comparison_index(results);
-    let mut summary = VerificationSummary {
-        verified: 0,
-        wrong: 0,
-        unverified_definitive: 0,
-        non_definitive: 0,
-        total: results.items.len(),
-    };
-    for item in &results.items {
-        match classify_verifier(item, &comp_index) {
-            1 => summary.verified += 1,
-            0 => summary.wrong += 1,
-            _ if matches!(item.result.to_ascii_lowercase().as_str(), "sat" | "unsat") => {
-                summary.unverified_definitive += 1;
-            }
-            _ => summary.non_definitive += 1,
-        }
-    }
-    summary
-}
-
-/// Classify a `NativeResultItem` against the comparison index and expected
-/// label to produce `verifier_ok` (-1 / 0 / 1).
-fn classify_verifier(
-    item: &crate::native::NativeResultItem,
-    comp_index: &BTreeMap<&str, Vec<&'static str>>,
-) -> i32 {
-    if let Some(agreements) = comp_index.get(item.file.as_str()) {
-        // Any definite contradictory reference invalidates the result. A
-        // first-reference agreement must never hide a later disagreement.
-        if agreements.contains(&"disagree") {
-            return 0;
-        }
-        if agreements.contains(&"agree") {
-            return 1;
-        }
-        // ay_only / ref_only mean one side timed out — not a wrong answer, but
-        // also not verified. Continue to an expected-label check if available.
-    }
-    // No comparison available. Fall back to `expected` label (when present).
-    let authoritative_expected = matches!(
-        item.expected_source.as_str(),
-        "header" | "path" | "header+path"
-    );
-    if authoritative_expected {
-        if let Some(expected) = item.expected.as_deref() {
-            let got = item.result.to_ascii_lowercase();
-            let exp = expected.to_ascii_lowercase();
-            if got == exp {
-                return 1;
-            }
-            // Only call it wrong if the solver claimed a verdict.
-            if got == "sat" || got == "unsat" {
-                return 0;
-            }
-        }
-    }
-    -1
+fn verification_summary(results: &crate::native::NativeResults) -> Result<VerificationSummary> {
+    let items = scoring::native_scoring_items(results)?;
+    let counts = scoring::verification_counts(&items);
+    Ok(VerificationSummary {
+        verified: counts.checked,
+        wrong: counts.wrong,
+        unverified_definitive: counts.not_checked,
+        non_definitive: counts.non_definitive,
+        total: items.len(),
+    })
 }
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
@@ -2554,7 +2507,13 @@ pub fn preflight_eval_benchmark_inventory(eval_id: &str) -> Result<EvalBenchmark
         Competition::ChcComp => Some(infer_track(eval_id)),
         Competition::HwmccComp => Some(infer_hwmcc_track(eval_id)),
     };
-    let mut items = Vec::with_capacity(files.len());
+    let mut items = Vec::new();
+    items.try_reserve(files.len()).map_err(|_| {
+        BenchError::msg(format!(
+            "cannot allocate {} benchmark inventory items",
+            files.len()
+        ))
+    })?;
     let mut inventory = Sha256::new();
     inventory.update(b"ay-eval-benchmark-content-inventory-v1\0");
     update_inventory_field(&mut inventory, domain.as_bytes())?;
@@ -2652,8 +2611,9 @@ fn yaml_value_without_comment(raw: &str) -> &str {
         }
         index += 1;
     }
+    // `offset` is the byte index of an ASCII `#`, so it is a char boundary.
     comment_at
-        .map(|offset| &trimmed[..offset])
+        .and_then(|offset| trimmed.get(..offset))
         .unwrap_or(trimmed)
         .trim()
 }
@@ -2666,15 +2626,17 @@ fn yaml_value_without_comment(raw: &str) -> &str {
 #[cfg(test)]
 fn strip_yaml_value(raw: &str) -> String {
     let no_comment = yaml_value_without_comment(raw);
-    // Strip surrounding quotes
-    if no_comment.len() >= 2
-        && ((no_comment.starts_with('"') && no_comment.ends_with('"'))
-            || (no_comment.starts_with('\'') && no_comment.ends_with('\'')))
-    {
-        no_comment[1..no_comment.len() - 1].to_string()
-    } else {
-        no_comment.to_string()
-    }
+    // Strip surrounding quotes: a lone quote character is not a quoted value.
+    no_comment
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            no_comment
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(no_comment)
+        .to_string()
 }
 
 // ===================================================================
@@ -3272,7 +3234,7 @@ inputs:
         assert!(first
             .items
             .windows(2)
-            .all(|pair| pair[0].benchmark_id < pair[1].benchmark_id));
+            .all(|pair| matches!(pair, [a, b] if a.benchmark_id < b.benchmark_id)));
         assert!(first.items.iter().all(|item| {
             Path::new(&item.canonical_path).is_absolute()
                 && item.source_size_bytes > 0
@@ -3409,60 +3371,6 @@ inputs:
     }
 
     #[test]
-    fn test_discover_sat_par2_registry_specs() {
-        let evals = discover_evals().unwrap();
-        let dev = evals
-            .iter()
-            .find(|(id, _)| id == "sat-par2-dev")
-            .expect("sat-par2-dev registry spec should exist");
-        let heldout = evals
-            .iter()
-            .find(|(id, _)| id == "sat-par2-heldout")
-            .expect("sat-par2-heldout registry spec should exist");
-
-        for (eval_id, spec) in [dev, heldout] {
-            assert_eq!(infer_domain(eval_id), "sat");
-            assert_eq!(infer_competition(eval_id), Competition::SatComp);
-            assert_eq!(scoring_label(eval_id, spec), "sat-comp");
-            assert_eq!(standard_timeout_sec(eval_id, spec), 5000.0);
-        }
-    }
-
-    #[test]
-    fn test_select_sat_domain_evals_for_run() {
-        let evals = discover_evals().unwrap();
-        let args = RunArgs {
-            eval_ids: Vec::new(),
-            all: false,
-            domain: Some("sat".to_string()),
-            competition: false,
-            ay: PathBuf::from("target/debug/ay"),
-            timeout: None,
-            output: None,
-            runs: None,
-            shard_index: None,
-            shard_size: None,
-            reference_solvers: Vec::new(),
-            run_class: None,
-            quiet: true,
-            with_features: false,
-            sat_track: None,
-            sat_ai_class: None,
-            sat_variant: None,
-            resource_memory_cap_mib: None,
-            resource_core_cap: None,
-        };
-
-        let selected = select_evals_for_run(evals, &args).unwrap();
-        let ids: Vec<_> = selected.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(ids.contains(&"sat-par2-dev"));
-        assert!(ids.contains(&"sat-par2-heldout"));
-        assert!(selected
-            .iter()
-            .all(|(eval_id, _)| infer_domain(eval_id) == "sat"));
-    }
-
-    #[test]
     fn test_validate_run_class_rejects_unrecognized_library_value() {
         assert!(validate_run_class(None).is_ok());
         assert!(validate_run_class(Some("replay")).is_ok());
@@ -3504,37 +3412,6 @@ inputs:
             shard_selection(&selected).unwrap(),
             Some(crate::native::NativeShardSelection { index: 7, size: 64 })
         );
-    }
-
-    #[test]
-    fn test_later_reference_disagreement_overrides_first_agreement() {
-        let mut item = crate::native::NativeResultItem {
-            file: "case.smt2".to_string(),
-            benchmark_path: "case.smt2".to_string(),
-            benchmark_content_hash: None,
-            solver_input_hash: None,
-            solver_input_path: None,
-            expected: None,
-            expected_source: "unknown".to_string(),
-            result: "sat".to_string(),
-            harness_error: None,
-            time_sec: 0.1,
-            cpu_time_sec: 0.1,
-            cpu_time_source: "test".to_string(),
-            exit_code: Some(0),
-            solver_argv: Vec::new(),
-            solver_env: Default::default(),
-            artifacts: None,
-            sat_run: None,
-            extracted_features: None,
-        };
-        let comparisons = BTreeMap::from([("case.smt2", vec!["agree", "disagree"])]);
-        assert_eq!(classify_verifier(&item, &comparisons), 0);
-
-        item.expected = Some("sat".to_string());
-        assert_eq!(classify_verifier(&item, &BTreeMap::new()), -1);
-        item.expected_source = "header".to_string();
-        assert_eq!(classify_verifier(&item, &BTreeMap::new()), 1);
     }
 
     #[test]
@@ -3611,7 +3488,7 @@ inputs:
             sat_run: None,
             extracted_features: None,
         };
-        let results = crate::native::NativeResults {
+        let mut results = crate::native::NativeResults {
             environment: crate::environment::Environment {
                 timestamp: "2026-04-25T00:00:00Z".to_string(),
                 git_commit: "commit".to_string(),
@@ -3707,6 +3584,65 @@ inputs:
         assert_eq!(rows[1].proof_bytes, None);
         assert_eq!(rows[1].proof_hash, None);
         assert_eq!(rows[1].proof_validation.as_deref(), Some("not-emitted"));
+
+        results.items[0].expected = None;
+        results.items[0].solver_input_hash = Some("sha256:exact-input".into());
+        results.comparisons = Some(vec![crate::native::ComparisonItem {
+            file: results.items[0].file.clone(),
+            solver_input_hash: "sha256:exact-input".into(),
+            ay_result: "unsat".into(),
+            ay_time_sec: 0.25,
+            ay_cpu_time_sec: 0.25,
+            ay_cpu_time_source: "test".into(),
+            ref_result: "sat".into(),
+            ref_time_sec: 0.1,
+            ref_cpu_time_sec: 0.1,
+            ref_cpu_time_source: "test".into(),
+            agreement: "disagree",
+            reference_runs: vec![crate::native::ReferenceRunEvidence {
+                result: "sat".into(),
+                time_sec: 0.1,
+                cpu_time_sec: 0.1,
+                cpu_time_source: "test".into(),
+                exit_code: Some(0),
+                solver_input_path: "private-input".into(),
+                solver_input_hash: "sha256:exact-input".into(),
+                solver_argv: vec![],
+                solver_env: Default::default(),
+                stdout_excerpt: "sat".into(),
+                stderr_excerpt: String::new(),
+                stdout_sha256: "recorded-output".into(),
+                stderr_sha256: "recorded-empty".into(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                harness_error: None,
+            }],
+        }]);
+        let native = scoring::native_scoring_items(&results).unwrap();
+        let serialized: ResultsFile =
+            serde_json::from_value(serde_json::to_value(&results).unwrap()).unwrap();
+        assert_eq!(native[0].correct, Some(false));
+        assert_eq!(serialized.items()[0].correct, native[0].correct);
+        assert_eq!(verification_summary(&results).unwrap().wrong, 1);
+        assert_eq!(
+            build_rows("commit", "sat-main", &results, false).unwrap()[0].verifier_ok,
+            0
+        );
+        assert_eq!(
+            scoring::score_smt(serialized.items(), 5.0, "test").errors,
+            1
+        );
+        results.items[0].expected = Some("unsat".into());
+        results.items[0].expected_source = "header".into();
+        assert_eq!(verification_summary(&results).unwrap().wrong, 0);
+        assert_eq!(
+            build_rows("commit", "sat-main", &results, false).unwrap()[0].verifier_ok,
+            1
+        );
+        results.items[0].exit_code = None;
+        let rows = build_rows("commit", "sat-main", &results, false).unwrap();
+        assert_eq!(rows[0].result, "error");
+        assert_eq!(rows[0].verifier_ok, -1);
     }
 
     #[test]

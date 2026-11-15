@@ -3,11 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::generator::AcceptedClause;
-use std::ffi::OsStr;
+use ay_test_support::z3::{optional_z3, Z3Oracle};
 use std::fmt::Write as _;
 use std::io::{Read, Write as IoWrite};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt as _;
@@ -23,22 +22,22 @@ pub(super) enum ClauseVerdict {
     Invalid,
 }
 
+/// The z3 this audit takes verdicts from: identity-checked and reached by
+/// path (`ay_test_support::z3`: `Z3_PATH`, else the first z3 on `PATH` that
+/// proves it is z3, past reroute stubs). The leg is optional; absence is a
+/// visible skip, and a failure under `Z3_DIFFERENTIAL_REQUIRED`.
 pub(super) struct Oracle {
-    path: PathBuf,
+    z3: &'static Z3Oracle,
 }
 
 impl Oracle {
-    pub(super) fn resolve() -> Option<Self> {
-        resolve_z3_from(
-            std::env::var_os("Z3_PATH").as_deref(),
-            std::env::var_os("PATH").as_deref(),
-            Path::is_file,
-        )
-        .map(|path| Self { path })
+    pub(super) fn resolve(label: &str) -> Option<Self> {
+        optional_z3(&format!("ay-proof fp_ground_adversarial_audit [{label}]"))
+            .map(|z3| Self { z3 })
     }
 
-    pub(super) fn path(&self) -> &Path {
-        &self.path
+    pub(super) fn identity(&self) -> String {
+        self.z3.identity()
     }
 
     pub(super) fn check_clauses(
@@ -49,7 +48,9 @@ impl Oracle {
             return Err("refusing to run a vacuous Z3 batch".to_string());
         }
         let script = render_script(clauses);
-        let mut child = Command::new(&self.path)
+        let mut child = self
+            .z3
+            .command()
             .args(["-in", "-smt2"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -80,37 +81,6 @@ impl Oracle {
         write_result?;
         validate_transcript(status.success(), &stdout, &stderr, clauses.len())
     }
-}
-
-pub(super) fn differential_required() -> bool {
-    std::env::var("Z3_DIFFERENTIAL_REQUIRED")
-        .map(|value| is_truthy(&value))
-        .unwrap_or(false)
-}
-
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn resolve_z3_from(
-    configured: Option<&OsStr>,
-    path: Option<&OsStr>,
-    exists: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
-    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
-        let candidate = PathBuf::from(configured);
-        if exists(&candidate) {
-            return Some(candidate);
-        }
-    }
-    let executable = if cfg!(windows) { "z3.exe" } else { "z3" };
-    std::env::split_paths(path?).find_map(|directory| {
-        let candidate = directory.join(executable);
-        exists(&candidate).then_some(candidate)
-    })
 }
 
 fn render_script(clauses: &[AcceptedClause]) -> String {
@@ -248,36 +218,6 @@ fn parse_verdicts(stdout: &str, expected: usize) -> Result<Vec<ClauseVerdict>, S
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truthy_values_are_explicit() {
-        for value in ["1", "TRUE", " yes ", "On"] {
-            assert!(is_truthy(value), "{value:?} should be truthy");
-        }
-        for value in ["", "0", "false", "required", "2"] {
-            assert!(!is_truthy(value), "{value:?} should not be truthy");
-        }
-    }
-
-    #[test]
-    fn resolver_prefers_existing_configured_path_then_path() {
-        let search = std::env::join_paths([Path::new("first"), Path::new("second")])
-            .expect("join test PATH");
-        let executable = if cfg!(windows) { "z3.exe" } else { "z3" };
-        let configured = Path::new("configured-z3");
-        assert_eq!(
-            resolve_z3_from(Some(configured.as_os_str()), Some(&search), |candidate| {
-                candidate == configured || candidate == Path::new("second").join(executable)
-            }),
-            Some(configured.to_path_buf())
-        );
-        assert_eq!(
-            resolve_z3_from(Some(OsStr::new("missing")), Some(&search), |candidate| {
-                candidate == Path::new("second").join(executable)
-            }),
-            Some(Path::new("second").join(executable))
-        );
-    }
 
     #[test]
     fn parser_requires_one_framed_definite_verdict_per_case() {

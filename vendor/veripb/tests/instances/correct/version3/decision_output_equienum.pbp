@@ -1,0 +1,19 @@
+pseudo-Boolean proof version 3.0
+f 3;
+red 1 ~x4 1 x1 >= 1 : x4 0 ;
+core id -1;
+red 1 x4 1 ~x1 >= 1 : x4 1 ;
+core id -1;
+preserved_add x4 : 1 x1 >= 1 ;
+pol 1 4 +;
+core id -1;
+pol 2 4 +;
+core id -1;
+preserved_rm x1 : 1 x4 >= 1 ;
+del id 1;
+del id 2;
+del id 4 : x1 1 ;
+del id 5 : x1 0 ;
+output EQUIENUMERABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

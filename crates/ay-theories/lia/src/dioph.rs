@@ -15,6 +15,7 @@
 mod bound_analysis;
 mod elimination;
 mod equation;
+mod expansion;
 mod solver;
 
 pub(crate) use equation::IntEquation;
@@ -23,3 +24,6 @@ pub(crate) use solver::{DiophResult, DiophSolver};
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod expansion_tests;

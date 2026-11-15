@@ -81,6 +81,11 @@ pub(crate) struct KeptThresholds {
     pub kept_glue: u32,
     /// Max size among clauses kept at last reduce (CaDiCaL `lim.keptsize`).
     pub kept_size: u32,
+    /// `--sat-subsume-kissat`: learned clauses of three or more literals are
+    /// neither candidates nor subsumers, as in Kissat's forward subsumption
+    /// (forward.c:140-142), which sees only irredundant clauses (and every
+    /// binary is irredundant there).
+    pub irredundant_only: bool,
 }
 
 impl KeptThresholds {
@@ -90,6 +95,7 @@ impl KeptThresholds {
             tier2_lbd: u32::MAX,
             kept_glue: u32::MAX,
             kept_size: u32::MAX,
+            irredundant_only: false,
         }
     }
 }

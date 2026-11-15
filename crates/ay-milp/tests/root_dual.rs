@@ -382,6 +382,7 @@ fn emit(
         network_design_optimality_certificate: session.network_design_optimality_certificate(),
         block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: None,
+        milp_optimality_tree_block: None,
         root_dual_bound_certificate: root_dual,
         single_machine_scheduling_optimality_certificate: session
             .single_machine_scheduling_optimality_certificate(),
@@ -637,6 +638,7 @@ fn emit_with_tree(
         network_design_optimality_certificate: session.network_design_optimality_certificate(),
         block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: Some(tree),
+        milp_optimality_tree_block: None,
         root_dual_bound_certificate: Some(root_dual),
         single_machine_scheduling_optimality_certificate: session
             .single_machine_scheduling_optimality_certificate(),

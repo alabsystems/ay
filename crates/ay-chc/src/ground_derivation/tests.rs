@@ -14,6 +14,11 @@ use crate::clause::{ClauseBody, ClauseHead};
 use crate::{ActionId, ChcDtConstructor, ChcDtSelector, ChcSort, ChcVar, PredicateId};
 use std::sync::Arc;
 
+mod lambda_replay_checks;
+mod lambda_source;
+mod lambda_source_scope;
+mod progress;
+
 fn var(name: &str) -> ChcExpr {
     ChcExpr::Var(ChcVar::new(name, ChcSort::Int))
 }
@@ -106,6 +111,68 @@ fn ground_derivation_validates_a_real_counterexample() {
     assert_eq!(
         validate_ground_derivation(&problem, &counting_derivation()),
         Ok(())
+    );
+}
+
+#[test]
+fn native_validation_is_not_capped_by_the_whole_problem_wire_envelope() {
+    // An unreachable chain never enters the derivation, yet the WIRE
+    // whole-problem envelope used to reject the NATIVE check for it: the
+    // 150-clause BitVec-8 hub analogue (and anything past ~85 such clauses)
+    // lost its ground landing. Native validation keeps a finite envelope, the
+    // depth guard and every semantic validator; the wire artifact keeps its
+    // own envelope.
+    let mut problem = counting_problem();
+    let mut previous = problem.declare_predicate("Pad0", vec![ChcSort::Int]);
+    for index in 1..1_000 {
+        let next = problem.declare_predicate(format!("Pad{index}"), vec![ChcSort::Int]);
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(
+                vec![(previous, vec![var("x")])],
+                Some(ChcExpr::eq(
+                    var("y"),
+                    ChcExpr::add(var("x"), ChcExpr::Int(1)),
+                )),
+            ),
+            ClauseHead::Predicate(next, vec![var("y")]),
+        ));
+        previous = next;
+    }
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &counting_derivation()),
+        Ok(())
+    );
+    let wire = artifact::encode_ground_derivation_artifact(&problem, &counting_derivation())
+        .expect_err("the wire artifact keeps its whole-problem work envelope");
+    assert_eq!(
+        wire.reason,
+        ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded
+    );
+}
+
+#[test]
+fn native_validation_keeps_a_finite_envelope_for_shared_dags() {
+    // `ChcExpr` children are shared `Arc`s, but the whole-problem preflight and
+    // the live validators behind it walk TREES. This 33-node DAG unfolds into
+    // more than 2^31 tree occurrences, so native validation must refuse
+    // promptly instead of walking (and allocating) without limit on a clause
+    // no derivation selects (cf. 25e6683cf).
+    let mut shared = ChcExpr::ge(var("x"), ChcExpr::Int(0));
+    for _ in 0..30 {
+        let child = Arc::new(shared);
+        shared = ChcExpr::Op(crate::ChcOp::And, vec![child.clone(), child]);
+    }
+    let mut problem = counting_problem();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+        true,
+    ))));
+    // Installed after `add_clause`, whose constant simplification is not under
+    // test.
+    problem.clauses_mut()[3].body.constraint = Some(shared);
+    assert_eq!(
+        validate_ground_derivation(&problem, &counting_derivation()),
+        Err(GroundDerivationError::SourceWorkLimitExceeded)
     );
 }
 
@@ -545,7 +612,7 @@ fn source_surface_cache_charges_wide_datatype_lookup_on_every_reuse() {
         .collect();
     let datatype_sort = ChcSort::Datatype {
         name: "Wide".to_string(),
-        constructors: Arc::new(constructors),
+        constructors: crate::ChcDtConstructors::new(constructors),
     };
     let constructor = ChcExpr::FuncApp("ctor_255".to_string(), datatype_sort.clone(), Vec::new());
     let value = ChcExpr::var(ChcVar::new("value", datatype_sort));
@@ -585,7 +652,7 @@ fn source_surface_cache_charges_wide_datatype_lookup_on_every_reuse() {
 fn ground_derivation_rejects_wrong_datatype_bindings_before_equality() {
     let datatype_sort = ChcSort::Datatype {
         name: "Singleton".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "only".to_string(),
             selectors: Vec::new(),
         }]),
@@ -769,10 +836,37 @@ fn ground_derivation_precharges_aggregate_premise_fanout() {
         Ok(()),
         "one aggregate premise comparison must fit the fixed envelope"
     );
+    // The fanout multiplication is a WIRE-envelope refusal: six aggregate
+    // consumers of the 400-entry array exceed the 4 Mi artifact cap. Native
+    // validation (`validate_ground_derivation`) admits the same derivation
+    // against its 64× envelope, so the wire expectation is asserted through a
+    // wire control, and the multiplication is shown to bite natively too once
+    // the fanout is scaled past that envelope (128×).
+    assert_eq!(
+        validate_ground_derivation_with_control(
+            &problem,
+            &derivation,
+            &mut super::control::GroundValidationControl::new(&mut || true),
+        ),
+        Err(GroundDerivationError::SourceWorkLimitExceeded),
+        "aggregate comparison work must be multiplied by incoming argument fanout (wire envelope)"
+    );
     assert_eq!(
         validate_ground_derivation(&problem, &derivation),
+        Ok(()),
+        "the native envelope admits six aggregate consumers"
+    );
+    let wide_fanout = 6 * 128;
+    let mut wide_problem = problem.clone();
+    wide_problem.clauses_mut()[1].body.predicates = (0..wide_fanout)
+        .map(|_| (predicate, vec![consumer_value.clone()]))
+        .collect();
+    let mut wide_derivation = derivation.clone();
+    wide_derivation.steps[1].premises = vec![0; wide_fanout];
+    assert_eq!(
+        validate_ground_derivation(&wide_problem, &wide_derivation),
         Err(GroundDerivationError::SourceWorkLimitExceeded),
-        "aggregate comparison work must be multiplied by incoming argument fanout"
+        "aggregate comparison work must be multiplied by incoming argument fanout (native envelope)"
     );
 }
 
@@ -1542,7 +1636,7 @@ fn ground_derivation_rejects_wrong_pin_value() {
 fn completion_decomposes_a_known_datatype_constructor_into_fields() {
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),
-        constructors: Arc::new(vec![ChcDtConstructor {
+        constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
             name: "mk-pair".to_string(),
             selectors: vec![
                 ChcDtSelector {
@@ -1593,7 +1687,7 @@ fn completion_decomposes_a_known_datatype_constructor_into_fields() {
 fn completion_does_not_decompose_a_different_constructor() {
     let option_sort = ChcSort::Datatype {
         name: "OptionInt".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "none".to_string(),
                 selectors: vec![],
@@ -1905,7 +1999,7 @@ fn ground_bound_completion_rejects_symbolic_or_ambiguous_bounds() {
 fn option_int_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "OptionInt".to_string(),
-        constructors: std::sync::Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             crate::ChcDtConstructor {
                 name: "none".to_string(),
                 selectors: vec![],
@@ -2410,5 +2504,157 @@ fn completion_propagates_known_array_alias_before_defaulting() {
     assert_eq!(
         eval_ground_pub(&equality, &completed),
         Some(SmtValue::Bool(true))
+    );
+}
+
+/// A clause whose constraint is a shared doubling tower `x + x`, `(x+x)+(x+x)`, …
+/// of the given depth: a tiny DAG in memory, a `2^depth`-leaf TREE to every
+/// walker that charges per occurrence — the shape preprocessing (inlining,
+/// local-variable elimination of `let`-shared terms) hands the validator.
+fn shared_tower_problem(depth: u32) -> ChcProblem {
+    let mut tower = var("x");
+    for _ in 0..depth {
+        tower = ChcExpr::add(tower.clone(), tower);
+    }
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Int]);
+    // clause 0: v = tower(x) => P(v)
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(var("v"), tower)),
+        ClauseHead::Predicate(p, vec![var("v")]),
+    ));
+    // clause 1: P(v) /\ v = 0 => false
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p, vec![var("v")])],
+            Some(ChcExpr::eq(var("v"), ChcExpr::Int(0))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+fn shared_tower_derivation(x: i128, v: i128) -> GroundDerivation {
+    GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: env(&[("x", x), ("v", v)]),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: env(&[("v", v)]),
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    }
+}
+
+/// Native validation admits a wide (tree-expanded) clause the wire cap
+/// refuses, with the semantic checks unchanged (LRACORE_CH4B_owner §3.4–3.5).
+///
+/// Two envelopes bound the native side: the per-derivation surface cache
+/// (64× the wire cap) and, ABOVE it, the whole-problem preflight, whose native
+/// envelope is the same 64× at ≥128 units per occurrence — i.e. at most ~2M
+/// tree occurrences per problem (`source_identity::NATIVE_WHOLE_SOURCE_WORK`).
+/// So the test does not hard-code a depth: it takes the first tower depth the
+/// WIRE control refuses (per-derivation phase) and shows the native entry
+/// admits that same derivation, which must happen below the preflight
+/// ceiling (2^21 occurrences). A 2^20-leaf tower, by contrast, has 2^21 − 1
+/// occurrences and is refused by the preflight in BOTH modes.
+#[test]
+fn native_validation_admits_a_wide_shared_clause_the_wire_cap_refuses() {
+    let wire_refuses = |depth: u32| {
+        validate_ground_derivation_with_control(
+            &shared_tower_problem(depth),
+            &shared_tower_derivation(0, 0),
+            &mut super::control::GroundValidationControl::new(&mut || true),
+        ) == Err(GroundDerivationError::SourceWorkLimitExceeded)
+    };
+    let depth = (10..=20)
+        .find(|depth| wire_refuses(*depth))
+        .expect("a shared tower below 2^21 occurrences must exhaust the 4 Mi wire cap");
+    assert!(
+        depth <= 19,
+        "wire refusal must leave room under the preflight ceiling (2^21 occurrences); first refused depth {depth}"
+    );
+    let problem = shared_tower_problem(depth);
+    assert_eq!(
+        validate_ground_derivation(&problem, &shared_tower_derivation(0, 0)),
+        Ok(()),
+        "native validation admits the derivation the wire cap refuses (tower depth {depth})"
+    );
+    // The native envelope changes admission, not semantics: `tower(0) = 0`,
+    // so `v = 1` is a false constraint and the fact step is refuted.
+    assert!(
+        validate_ground_derivation(&problem, &shared_tower_derivation(0, 1)).is_err(),
+        "native validation still refutes a wrong derivation on the wide clause"
+    );
+    // And the preflight ceiling is real in both modes.
+    assert_eq!(
+        validate_ground_derivation(&shared_tower_problem(20), &shared_tower_derivation(0, 0)),
+        Err(GroundDerivationError::SourceWorkLimitExceeded),
+        "2^21 − 1 occurrences exceed the native whole-source preflight"
+    );
+}
+
+/// A plain (UF-free) clause reads one value per expression occurrence: 4096
+/// bindings under a 12k-occurrence constraint validate. Charging every binding
+/// per occurrence priced this at ~0.8 G and refused it (vmt `s3_srvr_2_BUG`).
+#[test]
+fn wide_plain_clause_is_priced_per_occurrence_not_per_binding() {
+    let count = 4096;
+    let mut env = FxHashMap::default();
+    let conjuncts: Vec<ChcExpr> = (0..count)
+        .map(|index| {
+            let name = format!("x_{index:04}");
+            env.insert(name.clone(), SmtValue::Int(i128::from(index)));
+            ChcExpr::eq(var(&name), ChcExpr::Int(i128::from(index)))
+        })
+        .collect();
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::and_all(
+        conjuncts,
+    ))));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+    assert_eq!(validate_ground_derivation(&problem, &derivation), Ok(()));
+}
+
+/// The preflight answer the PDR replay gate reads agrees with validation: a
+/// problem it refuses refuses every derivation, and a small one is admitted.
+#[test]
+fn preflight_admission_matches_validation_on_shared_towers() {
+    assert!(problem_admits_native_ground_validation(
+        &shared_tower_problem(4)
+    ));
+    assert!(!problem_admits_native_ground_validation(
+        &shared_tower_problem(20)
+    ));
+    assert_eq!(
+        validate_ground_derivation(&shared_tower_problem(20), &shared_tower_derivation(0, 0)),
+        Err(GroundDerivationError::SourceWorkLimitExceeded)
+    );
+}
+
+/// Native preflight prices a node as a constant plus its depth, not as its
+/// rendered wire ancestry: a depth-16 tower (2^17 − 1 occurrences, ~21 M
+/// units) validates. Ancestry pricing (128 units per node per level, ~270 M
+/// before the identity walk) put it at the 256 Mi native envelope; the
+/// 2^21-occurrence ceiling above still holds. (Depth 17 would instead meet the executor surface's separate
+/// 131,072-occurrence admission, which counts leaf occurrences.)
+#[test]
+fn native_preflight_prices_nodes_by_depth_not_rendered_ancestry() {
+    assert_eq!(
+        validate_ground_derivation(&shared_tower_problem(16), &shared_tower_derivation(0, 0)),
+        Ok(())
     );
 }

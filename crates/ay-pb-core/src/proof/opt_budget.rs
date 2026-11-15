@@ -183,8 +183,7 @@ pub fn compute_cert_opt_budget_split(
         };
     }
 
-    let huge = instance.num_vars >= OPT_CERT_HUGE_MIN_VARS
-        || instance.constraints.len() >= OPT_CERT_HUGE_MIN_CONSTRAINTS;
+    let huge = instance_is_huge(instance);
     let (slice_div, ceil_div) = if huge {
         (
             OPT_CERT_NATIVE_SLICE_DIV_HUGE,
@@ -222,18 +221,125 @@ pub fn native_cap_expired(deadline: &Cell<Option<Instant>>) -> bool {
     deadline.get().is_some_and(|dl| Instant::now() >= dl)
 }
 
+/// Whether an instance counts as "huge" for the budget split — the one
+/// definition, so a caller that has to REPORT the divisor cannot disagree with
+/// the one [`compute_cert_opt_budget_split`] applied.
+#[must_use]
+pub fn instance_is_huge(instance: &PbInstance) -> bool {
+    instance.num_vars >= OPT_CERT_HUGE_MIN_VARS
+        || instance.constraints.len() >= OPT_CERT_HUGE_MIN_CONSTRAINTS
+}
+
+/// Where the length of the proof-logging slice actually came from.
+///
+/// THIS EXISTS BECAUSE THE NOTE PRINTED FALSE ARITHMETIC. The first version
+/// hardcoded [`OPT_CERT_NATIVE_SLICE_DIV`] into its text, but the slice has
+/// three provenances, and two of them are not that divisor:
+/// [`OPT_CERT_NATIVE_SLICE_DIV_HUGE`] on a huge instance, and no divisor at all
+/// when `--cert-native-cap-ms` pins the slice. Measured: on
+/// `normalized-simp-nonunif-100_100.02.opb` (21566 vars / 1_314_050
+/// constraints, one of 30 huge instances in `census/optlin-555.list`) the
+/// hardcoded form printed
+///
+/// ```text
+///   cut after 5121 ms by the certificate BUDGET SPLIT (declared --timeout 60000 ms / 6)
+/// ```
+///
+/// and `60000 / 6 = 10000`, not 5121. A diagnostic whose arithmetic does not
+/// check out is worse than no diagnostic, so the provenance is now passed in
+/// rather than assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofSliceOrigin {
+    /// The default policy: `remaining / div` of the budget left when the split
+    /// was taken. `huge` records which of the two divisors applied.
+    Divisor {
+        /// The divisor actually applied.
+        div: u32,
+        /// Whether it was the huge-instance divisor.
+        huge: bool,
+    },
+    /// The slice was pinned by `--cert-native-cap-ms`; no divisor applied.
+    CapOverride {
+        /// The pinned value, in milliseconds.
+        cap_ms: u64,
+    },
+}
+
+impl ProofSliceOrigin {
+    /// The provenance [`compute_cert_opt_budget_split`] will apply for this
+    /// policy and instance size. Derived from the same inputs as the split
+    /// itself so the two cannot drift.
+    #[must_use]
+    pub fn from_policy(policy: CertOptBudgetPolicy, huge: bool) -> Self {
+        match policy.native_cap_ms {
+            Some(cap_ms) => Self::CapOverride { cap_ms },
+            None if huge => Self::Divisor {
+                div: OPT_CERT_NATIVE_SLICE_DIV_HUGE,
+                huge: true,
+            },
+            None => Self::Divisor {
+                div: OPT_CERT_NATIVE_SLICE_DIV,
+                huge: false,
+            },
+        }
+    }
+}
+
+/// The slice the proof-logging phase actually received, and where its length
+/// came from. Built by the caller that owns the split, so the note never has to
+/// guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofSliceProvenance {
+    /// How much wall clock the phase actually got.
+    pub slice: Duration,
+    /// Where that length came from.
+    pub origin: ProofSliceOrigin,
+    /// `Some(initial)` when an improvement grace extended the slice, so the
+    /// note reports the extension rather than misattributing the final length
+    /// to the divisor alone.
+    pub grace_extended_from: Option<Duration>,
+}
+
+impl ProofSliceProvenance {
+    /// The clause naming where the slice came from, in the note's voice.
+    fn origin_clause(&self, timeout_ms: u128) -> String {
+        let base = match self.origin {
+            ProofSliceOrigin::Divisor { div, huge: false } => format!(
+                "the default split hands this phase remaining/{div} of the declared \
+                 --timeout {timeout_ms} ms"
+            ),
+            ProofSliceOrigin::Divisor { div, huge: true } => format!(
+                "the HUGE-instance split hands this phase remaining/{div} of the declared \
+                 --timeout {timeout_ms} ms"
+            ),
+            ProofSliceOrigin::CapOverride { cap_ms } => format!(
+                "the slice was pinned to {cap_ms} ms by --cert-native-cap-ms, no divisor \
+                 applied; the declared --timeout is {timeout_ms} ms"
+            ),
+        };
+        match self.grace_extended_from {
+            Some(initial) => format!(
+                "{base}, and an improvement grace extended it from {} ms",
+                initial.as_millis()
+            ),
+            None => base,
+        }
+    }
+}
+
 /// Renders the one-line diagnostic for the pathology this split can cause, or
 /// `None` when it did not occur.
 ///
 /// # The pathology
 ///
-/// The proof-logging phase is the ONLY phase that can emit a refutation, and it
-/// is handed `remaining / OPT_CERT_NATIVE_SLICE_DIV` — a sixth of the DECLARED
-/// budget. So whether an instance certifies is a function of `budget / 6`, not
-/// of `budget`, and the declared `--timeout` is therefore a SEARCH PARAMETER
-/// and not merely a stopping condition. Measured on
-/// `normalized-50-750-false-45-90-4-8000opt` (decision form), one frozen
-/// binary, one input, only `--timeout` varying:
+/// The proof-logging phase is handed a FRACTION of the declared budget (see
+/// [`ProofSliceOrigin`]), and on the decision path it is the only phase that can
+/// emit a refutation. So on that path whether an instance certifies is a
+/// function of the SLICE, not of the declared budget, and `--timeout` acts as a
+/// search parameter rather than as a stopping condition. Measured on
+/// `normalized-50-750-false-45-90-4-8000opt` (DECISION form — this instance has
+/// no objective; see the scope note below), one frozen binary, one input, only
+/// `--timeout` varying:
 ///
 /// ```text
 ///    60000 ms -> slice 10.0 s -> ran the full 60.1 s, 0 proof bytes, s UNKNOWN
@@ -249,14 +355,23 @@ pub fn native_cap_expired(deadline: &Cell<Option<Instant>>) -> bool {
 /// the certificate in 17.3 s, which isolates the cause to this split and
 /// exonerates the memory governor.
 ///
-/// A miss under these conditions is a property of the SPLIT, not of the
-/// deadline, and it was previously SILENT: the run exits `s UNKNOWN` at the
-/// declared budget with nothing to distinguish it from an honest timeout. This
-/// note is the distinguishing signal. It is diagnostic only — no caller may
-/// branch on it, and emitting it cannot change a verdict.
+/// # Scope
+///
+/// That measurement is a DECISION-path measurement. Every one of the 555
+/// instances in `census/optlin-555.list` has an objective, so none of them reach
+/// the decision path, and the note fires on the OPT-LIN path for a different
+/// reason: there the slice bounds the native proof-logging CDCL that runs BEFORE
+/// the certified fallback, and a miss recorded while the slice was spent and the
+/// declared budget was not is likewise not a statement about the declared
+/// budget.
+///
+/// The note is the distinguishing signal for a cut that was previously SILENT —
+/// the run exits at the declared budget with nothing to separate it from an
+/// honest timeout. It is diagnostic only: no caller may branch on it, and
+/// emitting it cannot change a verdict.
 #[must_use]
 pub fn proof_slice_cut_note(
-    slice: Duration,
+    provenance: ProofSliceProvenance,
     native_deadline: Option<Instant>,
     timeout_dur: Option<Duration>,
     start: Instant,
@@ -274,6 +389,20 @@ pub fn proof_slice_cut_note(
     if unused.is_zero() {
         return None;
     }
+    // The lever only helps while it would actually WIDEN the slice; suggesting
+    // a cap below the one already in force would be advice to make it worse.
+    let timeout_ms = timeout.as_millis();
+    let suggested = timeout.as_millis().saturating_sub(5_000).max(1);
+    let advice = match provenance.origin {
+        ProofSliceOrigin::CapOverride { cap_ms } if u128::from(cap_ms) >= suggested => format!(
+            "The slice is already pinned at {cap_ms} ms, so raise BOTH --cert-native-cap-ms \
+             and the declared --timeout to hand the proof phase more wall clock."
+        ),
+        _ => format!(
+            "Re-run with --cert-native-cap-ms {suggested} to hand the proof phase the whole \
+             budget."
+        ),
+    };
     // The claim is deliberately the WEAKEST one that is always true. Saying
     // "this miss is caused by the split" would overclaim on an instance the
     // full budget could not certify either. What is always true is the
@@ -281,16 +410,12 @@ pub fn proof_slice_cut_note(
     // a miss on this run is not evidence about the declared budget.
     Some(format!(
         "PROOF-SLICE-EXPIRED: the proof-logging phase was cut after {} ms by the certificate \
-         BUDGET SPLIT (declared --timeout {} ms / {}), with {} ms of the declared budget still \
-         unused. The proof phase did NOT receive the declared budget, so if this run reports no \
-         certificate that is not evidence that {} ms is insufficient. Re-run with \
-         --cert-native-cap-ms {} to hand the proof phase the whole budget.",
-        slice.as_millis(),
-        timeout.as_millis(),
-        OPT_CERT_NATIVE_SLICE_DIV,
+         BUDGET SPLIT ({}), with {} ms of the declared budget still unused. The proof phase did \
+         NOT receive the declared budget, so if this run reports no certificate that is not \
+         evidence that {timeout_ms} ms is insufficient. {advice}",
+        provenance.slice.as_millis(),
+        provenance.origin_clause(timeout_ms),
         unused.as_millis(),
-        timeout.as_millis(),
-        timeout.as_millis().saturating_sub(5_000).max(1),
     ))
 }
 
@@ -602,18 +727,30 @@ mod tests {
         ))));
     }
 
+    /// Convenience: the default (small-instance) provenance.
+    fn default_prov(slice: Duration) -> ProofSliceProvenance {
+        ProofSliceProvenance {
+            slice,
+            origin: ProofSliceOrigin::Divisor {
+                div: OPT_CERT_NATIVE_SLICE_DIV,
+                huge: false,
+            },
+            grace_extended_from: None,
+        }
+    }
+
     /// The note must fire on exactly the pathology and on nothing else: the
     /// slice is spent while the DECLARED budget still has time on it.
     #[test]
     fn proof_slice_cut_note_fires_only_when_the_slice_outran_the_deadline() {
-        let slice = Duration::from_secs(10);
+        let prov = default_prov(Duration::from_secs(10));
         let budget = Duration::from_secs(60);
         let expired = Some(Instant::now() - Duration::from_secs(1));
         let live = Some(Instant::now() + Duration::from_secs(30));
 
         // THE PATHOLOGY: slice spent 1 s ago, 50 s of the declared budget left.
         let start = Instant::now() - Duration::from_secs(10);
-        let note = proof_slice_cut_note(slice, expired, Some(budget), start)
+        let note = proof_slice_cut_note(prov, expired, Some(budget), start)
             .expect("slice spent with budget remaining must produce the note");
         assert!(note.starts_with("PROOF-SLICE-EXPIRED:"), "{note}");
         assert!(note.contains("10000 ms"), "reports the slice: {note}");
@@ -627,14 +764,161 @@ mod tests {
         );
 
         // NOT the pathology: the slice has not been reached.
-        assert!(proof_slice_cut_note(slice, live, Some(budget), start).is_none());
+        assert!(proof_slice_cut_note(prov, live, Some(budget), start).is_none());
         // NOT the pathology: no slice at all (uncapped run).
-        assert!(proof_slice_cut_note(slice, None, Some(budget), start).is_none());
+        assert!(proof_slice_cut_note(prov, None, Some(budget), start).is_none());
         // NOT the pathology: no declared budget, so nothing was cut short of one.
-        assert!(proof_slice_cut_note(slice, expired, None, start).is_none());
+        assert!(proof_slice_cut_note(prov, expired, None, start).is_none());
         // NOT the pathology: an HONEST timeout — the declared budget is spent
         // too, so the slice is not what stopped the phase.
         let long_ago = Instant::now() - Duration::from_secs(90);
-        assert!(proof_slice_cut_note(slice, expired, Some(budget), long_ago).is_none());
+        assert!(proof_slice_cut_note(prov, expired, Some(budget), long_ago).is_none());
+    }
+
+    /// THE DEFECT THIS PAIRS WITH: the note used to hardcode
+    /// `OPT_CERT_NATIVE_SLICE_DIV`, so on a HUGE instance it printed
+    /// "60000 ms / 6" over a slice of ~5000 ms — arithmetic that does not check
+    /// out. The note must name the divisor that was actually applied, and it
+    /// must never name a divisor the run did not use.
+    #[test]
+    fn proof_slice_cut_note_reports_the_huge_divisor_not_the_default() {
+        let budget = Duration::from_secs(60);
+        let start = Instant::now() - Duration::from_secs(6);
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let prov = ProofSliceProvenance {
+            slice: Duration::from_millis(5_121),
+            origin: ProofSliceOrigin::Divisor {
+                div: OPT_CERT_NATIVE_SLICE_DIV_HUGE,
+                huge: true,
+            },
+            grace_extended_from: None,
+        };
+        let note = proof_slice_cut_note(prov, expired, Some(budget), start).expect("fires");
+        assert!(note.contains("remaining/12"), "names /12: {note}");
+        assert!(note.contains("HUGE-instance"), "says why /12: {note}");
+        assert!(
+            !note.contains("remaining/6"),
+            "must not claim the default divisor on a huge instance: {note}"
+        );
+        assert!(note.contains("5121 ms"), "reports the real slice: {note}");
+    }
+
+    /// The second uncovered case: `--cert-native-cap-ms` pins the slice and NO
+    /// divisor applies, so the note may not describe the length as a fraction
+    /// of the declared budget.
+    #[test]
+    fn proof_slice_cut_note_reports_a_pinned_slice_as_pinned() {
+        let budget = Duration::from_secs(60);
+        let start = Instant::now() - Duration::from_secs(6);
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let prov = ProofSliceProvenance {
+            slice: Duration::from_millis(5_000),
+            origin: ProofSliceOrigin::CapOverride { cap_ms: 5_000 },
+            grace_extended_from: None,
+        };
+        let note = proof_slice_cut_note(prov, expired, Some(budget), start).expect("fires");
+        assert!(note.contains("pinned to 5000 ms"), "{note}");
+        assert!(note.contains("no divisor applied"), "{note}");
+        assert!(
+            !note.contains("remaining/"),
+            "a pinned slice is not a fraction of the budget: {note}"
+        );
+        // The lever advice must still widen the slice.
+        assert!(note.contains("--cert-native-cap-ms 55000"), "{note}");
+
+        // ...and it must NOT advise a value below the pin already in force.
+        let pinned_high = ProofSliceProvenance {
+            slice: Duration::from_millis(58_000),
+            origin: ProofSliceOrigin::CapOverride { cap_ms: 58_000 },
+            grace_extended_from: None,
+        };
+        let note = proof_slice_cut_note(pinned_high, expired, Some(budget), start).expect("fires");
+        assert!(
+            !note.contains("--cert-native-cap-ms 55000"),
+            "must not advise shrinking a 58000 ms pin to 55000: {note}"
+        );
+        assert!(note.contains("already pinned at 58000 ms"), "{note}");
+    }
+
+    /// Third case: an improvement grace extended the slice, so the final length
+    /// is not the divisor's output and the note says so.
+    #[test]
+    fn proof_slice_cut_note_reports_a_grace_extension() {
+        let budget = Duration::from_secs(60);
+        let start = Instant::now() - Duration::from_secs(21);
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let prov = ProofSliceProvenance {
+            slice: Duration::from_millis(20_000),
+            origin: ProofSliceOrigin::Divisor {
+                div: OPT_CERT_NATIVE_SLICE_DIV,
+                huge: false,
+            },
+            grace_extended_from: Some(Duration::from_millis(10_000)),
+        };
+        let note = proof_slice_cut_note(prov, expired, Some(budget), start).expect("fires");
+        assert!(
+            note.contains("20000 ms"),
+            "reports the slice it got: {note}"
+        );
+        assert!(
+            note.contains("improvement grace extended it from 10000 ms"),
+            "attributes the extra: {note}"
+        );
+    }
+
+    /// The provenance a caller reports must be the one the split applied. This
+    /// is the cross-check that keeps the note honest without the caller having
+    /// to re-derive the rule.
+    #[test]
+    fn slice_origin_tracks_the_split_it_describes() {
+        let obj = lin_objective(4);
+        let now = Instant::now();
+        let budget = Duration::from_secs(600);
+
+        for (vars, huge) in [(10u32, false), (OPT_CERT_HUGE_MIN_VARS, true)] {
+            let inst = instance(vars, 4);
+            assert_eq!(instance_is_huge(&inst), huge);
+            let split = compute_cert_opt_budget_split(
+                &inst,
+                &obj,
+                Some(budget),
+                now,
+                CertOptBudgetPolicy::default(),
+            );
+            let origin = ProofSliceOrigin::from_policy(
+                CertOptBudgetPolicy::default(),
+                instance_is_huge(&inst),
+            );
+            let ProofSliceOrigin::Divisor { div, huge: h } = origin else {
+                panic!("default policy must be a divisor origin");
+            };
+            assert_eq!(h, huge);
+            // The reported divisor must reproduce the slice the split handed out.
+            let slice = split.native_deadline.unwrap() - now;
+            let expected = budget / div;
+            let skew = if slice > expected {
+                slice - expected
+            } else {
+                expected - slice
+            };
+            assert!(
+                skew < Duration::from_millis(50),
+                "reported divisor {div} does not reproduce the slice: {slice:?} vs {expected:?}"
+            );
+        }
+
+        // A pin is a pin, on any instance size.
+        let policy = CertOptBudgetPolicy {
+            enabled: true,
+            native_cap_ms: Some(1_500),
+        };
+        assert_eq!(
+            ProofSliceOrigin::from_policy(policy, true),
+            ProofSliceOrigin::CapOverride { cap_ms: 1_500 }
+        );
+        assert_eq!(
+            ProofSliceOrigin::from_policy(policy, false),
+            ProofSliceOrigin::CapOverride { cap_ms: 1_500 }
+        );
     }
 }

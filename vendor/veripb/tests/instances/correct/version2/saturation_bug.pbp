@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 2.0
+f 1
+pol 1 s
+e >= -5 ; 2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

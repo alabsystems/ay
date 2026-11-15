@@ -1,0 +1,50 @@
+pseudo-Boolean proof version 3.0
+% `fresh_right ;` is grammatically legal and used to be stored verbatim, so
+% `get_transitivity_substitution`'s `izip!` stopped at the shortest iterator and BOTH
+% substitutions came out empty. Each transitivity proofgoal `D_i|x->z` was then literally
+% `D_i`, which is already among the premises, so an EMPTY `proof ... qed;` discharged all of
+% them and the relation installed as a preorder. It is not one: the four `def` rows below make
+% the strict part a 4-cycle over (x1,x2), so `dom`'s descent argument is vacuous and the
+% satisfiable formula is reported UNSAT.
+f 3;
+
+def_order bogus
+    vars
+        left u1 u2;
+        right v1 v2;
+        aux;
+    end;
+
+    def
+        1 u1 1 u2 1 v1 1 ~v2 >= 1;
+        1 u1 1 ~u2 1 ~v1 1 ~v2 >= 1;
+        1 ~u1 1 ~u2 1 ~v1 1 v2 >= 1;
+        1 ~u1 1 u2 1 v1 1 v2 >= 1;
+    end;
+
+    transitivity
+        vars
+            fresh_right ;
+        end;
+        proof
+        qed;
+    end;
+end;
+
+load_order bogus x1 x2;
+
+dom >= 1 : x1 -> x2 x2 -> ~x1 : subproof
+    proofgoal #5
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 2 d;
+        pol -4 -3 + s;
+        pol -3 -2 + s;
+        pol -1 -2 +;
+    qed : -1;
+qed;
+
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

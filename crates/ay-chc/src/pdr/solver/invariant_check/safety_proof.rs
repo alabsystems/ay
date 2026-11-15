@@ -6,6 +6,10 @@
 
 use super::*;
 
+/// Most disequalities `check_invariants_prove_safety` splits (two SMT checks
+/// each) before it gives up on the split.
+const MAX_SAFETY_DISEQ_SPLITS: usize = 64;
+
 impl PdrSolver {
     pub(super) fn must_reverify_bv_single_predicate_inductive_subset_candidate(
         &self,
@@ -107,47 +111,22 @@ impl PdrSolver {
                     _ => return None,
                 }
             }
-            // Get the predicate from the error clause body.
-            // Multi-body queries (multiple predicates in error clause) are not
-            // supported — conservatively bail rather than silently skipping.
-            if query.body.predicates.len() != 1 {
+            // The error region over the body predicate's canonical variables.
+            // A query this cannot translate (a multi-body one among them) is
+            // one this check has not shown unreachable, so it declines rather
+            // than skip it.
+            let Some((pred, canonical_vars, error_constraint)) = self.canonical_query_error(query)
+            else {
                 return None;
-            }
-            let (pred_id, body_args) = &query.body.predicates[0];
-            let pred = *pred_id;
-
-            // Get canonical variables for this predicate
-            let canonical_vars = match self.canonical_vars(pred) {
-                Some(v) => v.to_vec(),
-                None => continue,
             };
-
-            // Build variable mapping from body args to canonical vars
-            // #2492: Also extract constituent vars from expression body args
-            let mut var_map: FxHashMap<String, ChcVar> = FxHashMap::default();
-            for (arg, canon) in body_args.iter().zip(canonical_vars.iter()) {
-                match arg {
-                    ChcExpr::Var(v) => {
-                        var_map.insert(v.name.clone(), canon.clone());
-                    }
-                    expr => {
-                        for v in expr.vars() {
-                            var_map
-                                .entry(v.name.clone())
-                                .or_insert_with(|| canon.clone());
-                        }
-                    }
-                }
+            // A query's body predicate is in the query slice, and the model
+            // builder completes a nullary one there as `false`, which blocks
+            // every query on it (candidate completion only: exact-clause
+            // validation decides). Frame[1] has nothing to prove for it, and
+            // usually no lemma to prove it with, as in `error_p0 => error`.
+            if canonical_vars.is_empty() {
+                continue;
             }
-
-            // Convert error constraint to canonical form
-            let error_constraint = match &query.body.constraint {
-                Some(c) => match Self::to_canonical(c, &var_map) {
-                    Some(ec) => ec,
-                    None => continue,
-                },
-                None => continue,
-            };
 
             // Collect all invariants from frame 1 for this predicate
             let mut invariants: Vec<ChcExpr> = Vec::new();
@@ -178,16 +157,14 @@ impl PdrSolver {
                             pred.index()
                         );
                     }
-                    // #1306: Derive an invariant for this predicate from the
-                    // backward-chain proof. The backward-chain proved that the
-                    // error constraint is unreachable, so ¬error is a valid
-                    // invariant. Push it to frame 1 so the model builder picks
-                    // it up. Without this, the model has `true` for this predicate,
-                    // and query-only verification fails because `true ∧ error` is SAT.
-                    let not_error = ChcExpr::not(error_constraint.clone());
-                    let lemma = Lemma::new(pred, not_error, 1);
-                    if self.frames.len() > 1 {
-                        self.frames[1].add_lemma(lemma);
+                    // #1306: push ¬error to frame 1 so the model builder picks
+                    // it up (else the model is `true` here and `true ∧ error` is
+                    // SAT) — only when error is closed over the canonical vars:
+                    // a free query local is captured downstream (#5805,
+                    // `backward_chain_lemma`).
+                    let not_error = self.backward_chain_lemma(&error_constraint, &canonical_vars);
+                    if let (Some(not_error), Some(frame)) = (not_error, self.frames.get_mut(1)) {
+                        frame.add_lemma(Lemma::new(pred, not_error, 1));
                     }
                     continue;
                 }
@@ -332,8 +309,14 @@ impl PdrSolver {
                         );
                     }
 
-                    // Extract disequalities and replace with strict inequalities
-                    let diseqs = Self::extract_disequalities(&check_error);
+                    // Extract disequalities and replace with strict inequalities.
+                    // Two checks per disequality: past the cap the split is
+                    // not attempted (no claim, as for an unknown split).
+                    let diseqs =
+                        Self::extract_disequalities(&check_error, MAX_SAFETY_DISEQ_SPLITS + 1);
+                    if diseqs.len() > MAX_SAFETY_DISEQ_SPLITS {
+                        return None;
+                    }
                     if diseqs.is_empty() {
                         if self.config.verbose {
                             safe_eprintln!(

@@ -13,7 +13,11 @@ use super::{
     ObjectiveDirection, OptionValue, Result, ScopeFrame, SoftAssertion, SymbolInfo,
 };
 
+mod function_lookup;
+mod proof_definition_lookup;
+mod sort_surface;
 mod symbol_registration;
+mod value_lookup;
 
 /// Builtin sort names supplied by enabled SMT theories.
 ///
@@ -60,6 +64,7 @@ impl Context {
         // sorts.
         if is_builtin_theory_sort(name)
             || (self.logic.is_none() && matches!(name, "bool" | "Proof"))
+            || (name == "Complex" && matches!(self.logic(), None | Some("ALL")))
         {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
@@ -84,7 +89,10 @@ impl Context {
         let adopted = if self.elaborating_polymorphic_instance {
             None
         } else {
-            self.try_adopt_definitional_forall(term)
+            self.try_adopt_definitional_forall(
+                term,
+                super::definitional_check_sat::DefinitionalAdoptionTiming::AtAssert,
+            )
         };
         #[cfg(test)]
         if adopted.is_some() && std::mem::take(&mut self.fail_next_assert_after_macro_adoption) {
@@ -134,7 +142,9 @@ impl Context {
         };
         // Retain the original parsed AST only under the retention policy and
         // while the parallel assertion stacks remain prefix-aligned.
-        if self.retain_parsed_assertions && self.assertions_parsed.len() == self.assertions.len() {
+        self.push_pass_parsed(term);
+        if self.retains_parsed_assertions() && self.assertions_parsed.len() == self.assertions.len()
+        {
             self.assertions_parsed.push(term.clone());
         }
         self.assertions.push(id);
@@ -149,6 +159,7 @@ impl Context {
             assertion_count: self.assertions.len(),
             objective_count: self.objectives.len(),
             soft_constraint_count: self.soft_constraints.len(),
+            objective_sequence_count: self.objective_sequence.len(),
             named_terms: Vec::new(),
             datatypes: Vec::new(),
             constructors: Vec::new(),
@@ -191,6 +202,9 @@ impl Context {
             self.assertion_finite_set_metadata
                 .truncate(frame.assertion_count);
             self.assertions_parsed.truncate(frame.assertion_count);
+            self.definitional_pass
+                .parsed
+                .truncate(frame.assertion_count);
             // Remove objectives from this scope
             self.objectives.truncate(frame.objective_count);
             self.objective_finite_set_metadata
@@ -199,6 +213,8 @@ impl Context {
             self.soft_constraints.truncate(frame.soft_constraint_count);
             self.soft_finite_set_metadata
                 .truncate(frame.soft_constraint_count);
+            self.objective_sequence
+                .truncate(frame.objective_sequence_count);
             // Remove named terms defined in this scope
             for name in frame.named_terms {
                 self.named_terms.remove(&name);
@@ -221,6 +237,7 @@ impl Context {
                 self.sort_defs.remove(&name);
                 self.public_sort_defs.remove(&name);
                 self.parametric_sort_defs.remove(&name);
+                self.forget_sort_synonym(&name);
             }
             // Remove function definitions defined in this scope (#8621)
             for name in frame.fun_defs {
@@ -277,6 +294,7 @@ impl Context {
         self.assertions.truncate(len);
         self.assertion_finite_set_metadata.truncate(len);
         self.assertions_parsed.truncate(len);
+        self.definitional_pass.parsed.truncate(len);
     }
 
     /// Remove a set of declared symbols by name (e.g. internal relaxation /
@@ -415,6 +433,35 @@ impl Context {
         self.adopted_macro_interps.get(name)
     }
 
+    /// #defmacro-named-preuse: the `:named` labels of every adopted
+    /// definitional assertion whose macro is currently live. A harvested unsat
+    /// core over the expanded assertions must carry these to be a core of the
+    /// authored problem (see the field docs).
+    pub fn adopted_definition_labels(&self) -> impl Iterator<Item = &str> {
+        self.adopted_definition_labels
+            .iter()
+            .map(|(_, label)| label.as_str())
+    }
+
+    /// Record that the adopted definition of `head` was asserted under
+    /// `label`. Public only for the native API's named-assertion adoption;
+    /// a label for a head that is not an adopted macro is ignored.
+    #[doc(hidden)]
+    pub fn note_adopted_definition_label(&mut self, head: &str, label: String) {
+        if !self.adopted_macro_interps.contains_key(head) {
+            return;
+        }
+        if self
+            .adopted_definition_labels
+            .iter()
+            .any(|(adopted, existing)| adopted == head && *existing == label)
+        {
+            return;
+        }
+        self.adopted_definition_labels
+            .push((head.to_string(), label));
+    }
+
     /// Register the model interpretation for a pure definitional macro that
     /// was recognized by the native Rust API after term construction.
     ///
@@ -489,7 +536,17 @@ impl Context {
         self.assertions
             .iter()
             .copied()
-            .chain(self.soft_constraints.iter().map(|s| s.term))
+            .any(|t| self.term_mentions_symbol(t, name))
+            || self.unretained_constraints_mention_symbol(name)
+    }
+
+    /// #defmacro-named-preuse: is `name` referenced by a constraint the
+    /// check-sat-time adoption pass cannot re-elaborate — a soft assertion or
+    /// an objective (neither retains its parsed AST)?
+    pub(super) fn unretained_constraints_mention_symbol(&self, name: &str) -> bool {
+        self.soft_constraints
+            .iter()
+            .map(|s| s.term)
             .chain(self.objectives.iter().map(|o| o.term))
             .any(|t| self.term_mentions_symbol(t, name))
     }
@@ -497,7 +554,7 @@ impl Context {
     /// #quantprod-g3: does `body`'s DAG reference symbol `name` anywhere
     /// (application head or variable/constant leaf)? Used to refuse a
     /// recursive "definition" — fail-closed on any occurrence.
-    fn term_mentions_symbol(&self, term: TermId, name: &str) -> bool {
+    pub(super) fn term_mentions_symbol(&self, term: TermId, name: &str) -> bool {
         let mut seen = ay_core::kani_compat::DetHashSet::default();
         let mut stack = vec![term];
         while let Some(t) = stack.pop() {
@@ -583,11 +640,36 @@ impl Context {
     /// Satisfiability is preserved in both directions and the argument never
     /// mentions k. The distinctness loop is dead code at k=1: the function was
     /// written for the k-ary case.
-    fn try_adopt_definitional_forall(&mut self, term: &ParsedTerm) -> Option<String> {
+    ///
+    /// # `:named` definitions and pre-use (#defmacro-named-preuse)
+    ///
+    /// The assertion may be wrapped in `(! … :named L)` (and the label-only
+    /// `:lblpos`/`:lblneg`): SMT-LIB 2.6 §3.6.5 gives annotations no meaning,
+    /// so peeling them is semantically null, and the caller's ordinary
+    /// elaboration still runs `record_named_term`, so `L` resolves for
+    /// `get-unsat-core`/`get-assignment` (on the discharged tautology). Any
+    /// OTHER attribute — `:pattern`, `:no-pattern`, `:weight`, `:qid` — is a
+    /// user trigger or quantifier hint that asks for E-matching semantics, and
+    /// such a forall is never adopted (a `:pattern` sits INSIDE the binder on
+    /// the body, which the `(= …)` shape match below already refuses).
+    ///
+    /// `timing` selects the pre-use rule. At assert time an earlier constraint
+    /// mentioning `f` refuses adoption (a raw pre-macro occurrence would
+    /// constrain a DIFFERENT, disconnected `f`). At check-sat time the caller
+    /// ([`Self::adopt_definitional_foralls_at_check_sat`]) RE-ELABORATES every
+    /// retained hard assertion after adoption, so earlier hard-assertion
+    /// mentions expand too and only the constraints it cannot re-elaborate —
+    /// soft assertions and objectives — still refuse.
+    pub(super) fn try_adopt_definitional_forall(
+        &mut self,
+        term: &ParsedTerm,
+        timing: super::definitional_check_sat::DefinitionalAdoptionTiming,
+    ) -> Option<String> {
         use crate::command::Term as PT;
         if !self.scopes.is_empty() {
             return None;
         }
+        let (term, labels) = super::definitional_check_sat::peel_definitional_annotations(term)?;
         let PT::Forall(pvars, pbody) = term else {
             return None;
         };
@@ -667,8 +749,19 @@ impl Context {
         }
         // A pre-adoption raw occurrence of `f` in any existing constraint
         // would stay a disconnected uninterpreted symbol while later
-        // occurrences expand — refuse (wrong-verdict source).
-        if self.constraints_mention_symbol(&fname) {
+        // occurrences expand — refuse (wrong-verdict source). At check-sat
+        // time the retained hard assertions are re-elaborated after adoption
+        // (see `timing`), so only the constraints that CANNOT be re-elaborated
+        // keep refusing.
+        let pre_use_mention = match timing {
+            super::definitional_check_sat::DefinitionalAdoptionTiming::AtAssert => {
+                self.constraints_mention_symbol(&fname)
+            }
+            super::definitional_check_sat::DefinitionalAdoptionTiming::AtCheckSat => {
+                self.unretained_constraints_mention_symbol(&fname)
+            }
+        };
+        if pre_use_mention {
             return None;
         }
         let ret_sort = info.sort.clone();
@@ -736,14 +829,19 @@ impl Context {
             .insert(fname.clone(), (evars, def_body));
         self.adopted_macro_declaration_ids
             .insert(fname.clone(), declaration_id);
+        for label in labels {
+            self.note_adopted_definition_label(&fname, label);
+        }
         self.advance_source_revision();
         Some(fname)
     }
 
-    fn rollback_adopted_macro(&mut self, name: &str) {
+    pub(super) fn rollback_adopted_macro(&mut self, name: &str) {
         self.fun_defs.remove(name);
         let removed = self.adopted_macro_interps.remove(name).is_some();
         self.adopted_macro_declaration_ids.remove(name);
+        self.adopted_definition_labels
+            .retain(|(adopted, _)| adopted != name);
         if removed {
             self.advance_source_revision();
         }
@@ -772,6 +870,50 @@ impl Context {
         self.symbols.contains_key(name)
             || self.overloaded_symbols.contains_key(name)
             || self.fun_defs.contains_key(name)
+    }
+
+    /// Bind the sort NAME `name` to the existing core `sort` in the current
+    /// scope, for a native API whose caller made the sort itself (the Z3 C
+    /// API's `Z3_mk_uninterpreted_sort` sort, or a sort the caller of
+    /// `Z3_parse_smtlib2_string` names). z3 identifies an uninterpreted sort
+    /// by its name, so a parsed `(declare-sort U 0)` denotes the caller's `U`;
+    /// declaring it again here would mint a nominal identity of its own after
+    /// the first scoped incarnation. A later `pop` removes the binding, never
+    /// the sort.
+    ///
+    /// # Errors
+    ///
+    /// The name is reserved or already names a sort in this scope.
+    pub fn bind_native_sort_name(&mut self, name: &str, sort: Sort) -> Result<()> {
+        self.ensure_sort_name_available(name)?;
+        self.sort_defs.insert(name.to_string(), sort.clone());
+        self.public_sort_defs
+            .insert(name.to_string(), super::PublicSort::Core(sort));
+        self.track_scoped_sort_def(name.to_string());
+        self.advance_source_revision();
+        Ok(())
+    }
+
+    /// The core sort the sort name `name` denotes in the current scope.
+    pub fn resolve_native_sort_name(&mut self, name: &str) -> Option<Sort> {
+        self.elaborate_sort(&crate::command::Sort::Simple(name.to_string()))
+            .ok()
+    }
+
+    /// Every declared signature: surface name, core identity, argument sorts,
+    /// result sort, and whether it is a `define-fun` macro.
+    pub fn native_symbol_signatures(&self) -> Vec<(String, String, Vec<Sort>, Sort, bool)> {
+        self.symbol_iter()
+            .map(|(name, info)| {
+                (
+                    name.clone(),
+                    self.symbol_identity_name(name, info).to_string(),
+                    info.arg_sorts.clone(),
+                    info.sort.clone(),
+                    self.fun_defs.contains_key(name),
+                )
+            })
+            .collect()
     }
 
     /// Register a symbol directly (for native API use)
@@ -1193,7 +1335,9 @@ impl Context {
 
     /// Mint and reserve a private declaration core spelling. Ordinary
     /// overloads and datatype members share this source so their private
-    /// identities cannot collide with each other.
+    /// identities cannot collide with each other. The numeric tail is this
+    /// counter, never a `TermId`; `ay-dpll`'s checked-probe prune relies on it
+    /// (`is_counter_only_internal_name`).
     pub(super) fn fresh_private_declaration_core_identity(&mut self) -> String {
         loop {
             let candidate = format!(
@@ -1294,108 +1438,28 @@ impl Context {
     /// internal re-elaboration and therefore keeps the live source spelling;
     /// external formatting applies declaration-epoch disambiguation separately.
     pub fn surface_sort(&self, sort: &Sort) -> Option<crate::command::Sort> {
-        self.surface_sort_with_mode(sort, SortSurfaceMode::Source)
+        sort_surface::build(self, sort, SortSurfaceMode::Source)
     }
 
-    fn surface_sort_with_mode(
+    /// The canonical native serializer borrows exact carrier metadata rather
+    /// than cloning an intermediate ParsedSort tree.
+    pub fn format_sort_surface(&self, sort: &Sort) -> Option<String> {
+        sort_surface::format(self, sort, None)
+    }
+
+    /// The SAME native serializer under an original caller's byte/work owner.
+    /// Refusal produces no partial sort; no allowance or source grant is made.
+    pub fn format_sort_surface_admitted(
         &self,
         sort: &Sort,
-        mode: SortSurfaceMode,
-    ) -> Option<crate::command::Sort> {
-        use crate::command::{Index, Sort as ParsedSort};
-
-        Some(match sort {
-            Sort::Bool => ParsedSort::Simple("Bool".to_string()),
-            Sort::Int => ParsedSort::Simple("Int".to_string()),
-            Sort::Real => ParsedSort::Simple("Real".to_string()),
-            Sort::String => ParsedSort::Simple("String".to_string()),
-            Sort::RegLan => ParsedSort::Simple("RegLan".to_string()),
-            Sort::BitVec(bit_vector) => ParsedSort::Indexed(
-                "BitVec".to_string(),
-                vec![Index::Numeral(bit_vector.width.to_string())],
-            ),
-            Sort::FloatingPoint(exponent, significand) => ParsedSort::Indexed(
-                "FloatingPoint".to_string(),
-                vec![
-                    Index::Numeral(exponent.to_string()),
-                    Index::Numeral(significand.to_string()),
-                ],
-            ),
-            Sort::Array(array) => ParsedSort::Parameterized(
-                "Array".to_string(),
-                vec![
-                    self.surface_sort_with_mode(&array.index_sort, mode)?,
-                    self.surface_sort_with_mode(&array.element_sort, mode)?,
-                ],
-            ),
-            Sort::Seq(element) => ParsedSort::Parameterized(
-                "Seq".to_string(),
-                vec![self.surface_sort_with_mode(element, mode)?],
-            ),
-            Sort::Uninterpreted(internal)
-                if matches!(mode, SortSurfaceMode::ExternalOutput)
-                    && self.nominal_sort_surface_is_ambiguous(internal) =>
-            {
-                ParsedSort::Simple(internal.clone())
-            }
-            Sort::Uninterpreted(internal) => match self.nominal_sort_surfaces.get(internal) {
-                Some(super::NominalSortSurface::Simple(surface)) => {
-                    ParsedSort::Simple(surface.clone())
-                }
-                Some(super::NominalSortSurface::ParametricDatatype {
-                    template,
-                    arguments,
-                    ..
-                }) => ParsedSort::Parameterized(
-                    template.clone(),
-                    arguments
-                        .iter()
-                        .map(|argument| self.surface_sort_with_mode(argument, mode))
-                        .collect::<Option<Vec<_>>>()?,
-                ),
-                None => ParsedSort::Simple(internal.clone()),
-            },
-            Sort::Datatype(datatype) => ParsedSort::Simple(datatype.name.clone()),
-            Sort::Char => ParsedSort::Simple("Char".to_string()),
-            Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => ParsedSort::Simple(name.clone()),
-            _ => return None,
-        })
-    }
-
-    /// SMT-LIB rendering of [`Self::surface_sort`]. This is the external
-    /// formatting boundary for exact engine sorts owned by this context.
-    pub fn format_sort_surface(&self, sort: &Sort) -> Option<String> {
-        use crate::command::{Index, Sort as ParsedSort};
-
-        fn render(sort: &ParsedSort) -> Option<String> {
-            let quote = ay_core::quote_symbol;
-            Some(match sort {
-                ParsedSort::Simple(name) => quote(name),
-                ParsedSort::Parameterized(name, arguments) => {
-                    let arguments = arguments.iter().map(render).collect::<Option<Vec<_>>>()?;
-                    if arguments.is_empty() {
-                        format!("({})", quote(name))
-                    } else {
-                        format!("({} {})", quote(name), arguments.join(" "))
-                    }
-                }
-                ParsedSort::Indexed(name, indices) => {
-                    let indices = indices
-                        .iter()
-                        .map(|index| match index {
-                            Index::Numeral(value)
-                            | Index::Decimal(value)
-                            | Index::Hexadecimal(value)
-                            | Index::Binary(value) => Some(value.clone()),
-                            Index::Symbol(value) => Some(quote(value)),
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    format!("(_ {} {})", quote(name), indices.join(" "))
-                }
-            })
+        owner: &dyn ay_core::term::TermConstructionAdmission,
+    ) -> Option<String> {
+        let result = sort_surface::format(self, sort, Some(owner));
+        if owner.check().is_ok() {
+            result
+        } else {
+            None
         }
-
-        render(&self.surface_sort_with_mode(sort, SortSurfaceMode::ExternalOutput)?)
     }
 
     /// The internal symbol name to use when BUILDING an application of `name`
@@ -1749,7 +1813,7 @@ impl Context {
                 ))
             }
             Command::Assert(term) => {
-                self.assert_authored(term)?;
+                self.assert_authored_with_labels(term)?;
                 Ok(None)
             }
             Command::AssertSoft {
@@ -1761,7 +1825,8 @@ impl Context {
                 // recorded separately and is NOT pushed onto the hard assertion
                 // stack — the solver may leave it violated. It must still be a
                 // Bool, mirroring the hard-assert sort contract.
-                let term_id = self.elaborate_term(term, &HashMap::default())?;
+                let term_id = self
+                    .with_skip_journal(term, |ctx| ctx.elaborate_term(term, &HashMap::default()))?;
                 let sort = self.terms.sort(term_id);
                 if *sort != Sort::Bool {
                     return Err(ElaborateError::SortMismatch {
@@ -1781,8 +1846,11 @@ impl Context {
                 Ok(None)
             }
             Command::Maximize(term) => {
-                let id = self.elaborate_term(term, &HashMap::default())?;
+                let id = self
+                    .with_skip_journal(term, |ctx| ctx.elaborate_term(term, &HashMap::default()))?;
                 let public_metadata = self.validate_public_assertion(term, id)?;
+                self.objective_sequence
+                    .push(super::ObjectiveStep::Arithmetic(self.objectives.len()));
                 self.objectives.push(Objective {
                     direction: ObjectiveDirection::Maximize,
                     term: id,
@@ -1791,8 +1859,11 @@ impl Context {
                 Ok(None)
             }
             Command::Minimize(term) => {
-                let id = self.elaborate_term(term, &HashMap::default())?;
+                let id = self
+                    .with_skip_journal(term, |ctx| ctx.elaborate_term(term, &HashMap::default()))?;
                 let public_metadata = self.validate_public_assertion(term, id)?;
+                self.objective_sequence
+                    .push(super::ObjectiveStep::Arithmetic(self.objectives.len()));
                 self.objectives.push(Objective {
                     direction: ObjectiveDirection::Minimize,
                     term: id,
@@ -1846,14 +1917,20 @@ impl Context {
                 Ok(None)
             }
             Command::CheckSat => {
+                // #defmacro-named-preuse: before the query's schematic
+                // instances and any assumption are elaborated, so both see
+                // the adopted macros.
+                self.adopt_definitional_foralls_at_check_sat();
                 self.materialize_polymorphic_assertions()?;
                 self.check_sat_commands = self.check_sat_commands.saturating_add(1);
+                self.drop_shared_scratch();
                 Ok(Some(CommandResult::CheckSat))
             }
             Command::CheckSatAssuming(terms) => {
                 // The assumptions are NOT part of `assertions_parsed`, so a
                 // surface-syntax consumer cannot see the full query. Treated
                 // exactly like a scope command: not a single-shot query.
+                self.adopt_definitional_foralls_at_check_sat();
                 self.check_sat_commands = self.check_sat_commands.saturating_add(1);
                 self.scope_commands_used = true;
                 self.materialize_polymorphic_assertions()?;
@@ -1864,15 +1941,19 @@ impl Context {
                     self.polymorphic_instantiation_complete = false;
                     return Ok(Some(CommandResult::CheckSatAssuming(Vec::new())));
                 }
-                // Elaborate each assumption term to get its TermId
+                // Elaborate each assumption term (a formula) to get its TermId
                 let term_ids: Vec<TermId> = terms
                     .iter()
                     .map(|term| {
-                        let id = self.elaborate_term(term, &HashMap::default())?;
+                        let id = self.with_skip_journal(term, |ctx| {
+                            ctx.elaborate_term(term, &HashMap::default())
+                        })?;
                         self.validate_public_term(term)?;
+                        self.expect_bool_operands("check-sat-assuming", &[id])?;
                         Ok(id)
                     })
                     .collect::<Result<Vec<_>>>()?;
+                self.drop_shared_scratch();
                 Ok(Some(CommandResult::CheckSatAssuming(term_ids)))
             }
             Command::GetModel => Ok(Some(CommandResult::GetModel)),
@@ -1884,7 +1965,9 @@ impl Context {
                 let pairs: Vec<(String, TermId)> = terms
                     .iter()
                     .map(|(text, t)| {
-                        let id = self.elaborate_term(t, &HashMap::default())?;
+                        let id = self.with_skip_journal(t, |ctx| {
+                            ctx.elaborate_term(t, &HashMap::default())
+                        })?;
                         self.validate_public_term(t)?;
                         Ok((text.clone(), id))
                     })
@@ -1930,7 +2013,7 @@ impl Context {
             Command::Labels => Ok(Some(CommandResult::Labels)),
             Command::GetAssertions => Ok(Some(CommandResult::GetAssertions)),
             Command::SetOption(keyword, value) => {
-                self.set_option(keyword, value);
+                self.set_option(keyword, value)?;
                 Ok(None)
             }
             Command::SetOptionAttribute(keyword) => Err(ElaborateError::Unsupported(format!(
@@ -1938,16 +2021,43 @@ impl Context {
             ))),
             Command::Exit => Ok(Some(CommandResult::Exit)),
             Command::Reset => {
-                // Preserve the host-configured parsed-assertion retention
-                // policy across `(reset)` — it reflects the session's proof
-                // configuration (e.g. `--no-proof`), not per-script state.
-                let retain_parsed = self.retain_parsed_assertions;
+                // Keep the host-configured parsed-assertion retention policy
+                // across `(reset)` (the session's proof configuration, e.g.
+                // `--no-proof`); a script's `:produce-proofs` arm is discarded.
+                let parsed_retention = self.parsed_retention.after_reset();
+                // A bounded budget is host configuration too; the stack is
+                // empty again, so it is re-armed in full.
+                let pass_budget = self.definitional_pass.budget.map(|budget| budget.total);
                 let finite_set_typing_mode = self.finite_set_typing_mode;
                 let strict_logic_compliance = self.strict_logic_compliance;
+                let z3_mode = self.z3_mode;
+                // This implemented module parameter is global rewriter
+                // configuration, not solver assertion-stack state. Pinned
+                // Z3 preserves the latest script/argv value across reset.
+                let mut rewriter = std::mem::take(&mut self.options);
+                rewriter.retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "rewriter.max_power_expansion"
+                            | "rewriter.som"
+                            | "rewriter.som_blowup"
+                            | "rewriter.flat"
+                            | "rewriter.expand_power"
+                            | "rewriter.mul_to_power"
+                            | "rewriter.max_degree"
+                            | "rewriter.sort_sums"
+                            | "rewriter.push_to_real"
+                    )
+                });
                 *self = Self::new();
-                self.retain_parsed_assertions = retain_parsed;
+                self.options = rewriter;
+                self.parsed_retention = parsed_retention;
+                if let Some(nodes) = pass_budget {
+                    self.set_definitional_pass_parsed_budget(nodes);
+                }
                 self.finite_set_typing_mode = finite_set_typing_mode;
                 self.strict_logic_compliance = strict_logic_compliance;
+                self.z3_mode = z3_mode;
                 Ok(None)
             }
             Command::ResetAssertions => {
@@ -1969,6 +2079,7 @@ impl Context {
                 self.assertions.clear();
                 self.assertion_finite_set_metadata.clear();
                 self.assertions_parsed.clear();
+                self.definitional_pass.parsed.clear();
                 self.objectives.clear();
                 self.objective_finite_set_metadata.clear();
                 self.soft_constraints.clear();
@@ -1986,6 +2097,8 @@ impl Context {
                 }
                 self.adopted_macro_interps.clear();
                 self.adopted_macro_declaration_ids.clear();
+                self.adopted_definition_labels.clear();
+                self.definitional_pass.retry.clear();
                 self.polymorphic_assertions
                     .retain(|assertion| assertion.persistent_definition);
                 self.authored_assertions.clear();
@@ -2051,6 +2164,7 @@ impl Context {
                     let elaborated = self.elaborate_sort(sort)?;
                     self.sort_defs.insert(name.clone(), elaborated);
                     self.public_sort_defs.insert(name.clone(), public_sort);
+                    self.record_sort_synonym(name, sort);
                 } else {
                     // Parameterized synonym: keep the body as a template so each
                     // ground use `(Name A1 .. An)` substitutes the type parameters
@@ -2111,8 +2225,14 @@ impl Context {
                 })?;
                 Ok(Some(CommandResult::Display(source)))
             }
-            Command::Simplify(term) => {
-                let term_id = self.elaborate_term(term, &HashMap::default())?;
+            Command::Simplify(term) | Command::SimplifyWithParams(term, _) => {
+                let previous = self.preserve_sequence_power;
+                self.invalidate_macro_expansion_memo();
+                self.preserve_sequence_power = true;
+                let elaborated = self.elaborate_term(term, &HashMap::default());
+                self.preserve_sequence_power = previous;
+                self.invalidate_macro_expansion_memo();
+                let term_id = elaborated?;
                 self.validate_public_term(term)?;
                 Ok(Some(CommandResult::Simplify(term_id)))
             }
@@ -2165,22 +2285,72 @@ impl Context {
     }
 
     /// Set a solver option
-    fn set_option(&mut self, keyword: &str, value: &crate::sexp::SExpr) {
+    fn set_option(&mut self, keyword: &str, value: &crate::sexp::SExpr) -> Result<()> {
         use crate::sexp::SExpr;
-        let key = keyword.trim_start_matches(':').to_string();
+        let raw_key = keyword.trim_start_matches(':');
+        // Z3 gparams::normalize canonicalizes module names and parameter
+        // spellings. Store aliases in ONE entry, so a later valid spelling
+        // replaces the previous value actually consumed by the rewriter.
+        let key: String = if raw_key.contains('.') {
+            raw_key
+                .chars()
+                .map(|ch| {
+                    if ch == '-' {
+                        '_'
+                    } else {
+                        ch.to_ascii_lowercase()
+                    }
+                })
+                .collect()
+        } else {
+            raw_key.to_owned()
+        };
         // `set-option` deliberately does not advance the source revision (it is
         // session configuration, not a declaration), but `:int-real-coercions`
         // and `:numeral-as-real` decide how a `define-fun` body TYPES. Drop the
         // macro expansion memo so a body elaborated under the old policy is
         // never replayed under the new one.
         self.invalidate_macro_expansion_memo();
+        // `|true|` and `true` are the same SMT-LIB symbol; only the lexer
+        // gives the unquoted spelling its own token.
         let opt_value = match value {
             SExpr::True => OptionValue::Bool(true),
             SExpr::False => OptionValue::Bool(false),
+            SExpr::Symbol(s) if s == "true" => OptionValue::Bool(true),
+            SExpr::Symbol(s) if s == "false" => OptionValue::Bool(false),
             SExpr::Numeral(n) => OptionValue::Numeral(n.clone()),
             SExpr::String(s) | SExpr::Symbol(s) => OptionValue::String(s.clone()),
-            _ => return, // Ignore unsupported value types
+            _ => return Ok(()), // Preserve unrelated option behavior.
         };
+        let polynomial_type = match key.as_str() {
+            "rewriter.som"
+            | "rewriter.flat"
+            | "rewriter.expand_power"
+            | "rewriter.mul_to_power"
+            | "rewriter.sort_sums"
+            | "rewriter.push_to_real" => Some(true),
+            "rewriter.som_blowup" | "rewriter.max_degree" => Some(false),
+            _ => None,
+        };
+        if let Some(boolean) = polynomial_type {
+            let valid = if boolean {
+                matches!(opt_value, OptionValue::Bool(_))
+            } else {
+                matches!(&opt_value, OptionValue::Numeral(n) if n.parse::<u32>().is_ok())
+            };
+            if !valid {
+                return Err(ElaborateError::InvalidConstant(format!(
+                    "invalid parameter type/value for {key}"
+                )));
+            }
+        }
+        // z3 rejects any other value for the scope option and keeps the old
+        // one; a string or symbol here must not silently mean `false`.
+        if (key == "global-declarations" || key == "global-decls")
+            && !matches!(opt_value, OptionValue::Bool(_))
+        {
+            return Ok(());
+        }
         // Proofs explicitly requested mid-session: parsed-assertion retention
         // must be back ON so proof export can align surface syntax for every
         // assertion from this point (SMT-LIB scripts set :produce-proofs before
@@ -2188,7 +2358,7 @@ impl Context {
         // aligned; a nonstandard late enable is handled by the prefix-alignment
         // guard at the push sites).
         if key == "produce-proofs" && matches!(opt_value, OptionValue::Bool(true)) {
-            self.retain_parsed_assertions = true;
+            self.parsed_retention.arm_for_proofs();
         }
         if key == "numeral-as-real" {
             if let OptionValue::Bool(enabled) = &opt_value {
@@ -2207,6 +2377,23 @@ impl Context {
         } else {
             self.options.insert(key, opt_value);
         }
+        Ok(())
+    }
+
+    /// Whether z3 knows `(_ divisible n)`: it registers it only when
+    /// `:smtlib2_compliant` is true as its session starts. A setting made
+    /// after that is ignored by z3; one set to false after it is read here
+    /// as unknown too, which only drops an assertion z3 keeps.
+    pub(super) fn z3_registers_divisible(&self) -> bool {
+        self.smtlib2_compliant() && self.z3_smtlib2_compliant_at_start != Some(false)
+    }
+
+    /// Whether z3's `:smtlib2_compliant` (also spelled `:smtlib2-compliant`)
+    /// is set to true.
+    pub(super) fn smtlib2_compliant(&self) -> bool {
+        ["smtlib2_compliant", "smtlib2-compliant"]
+            .iter()
+            .any(|key| self.options.get(*key) == Some(&OptionValue::Bool(true)))
     }
 
     /// Get an option value
@@ -2381,6 +2568,41 @@ impl Context {
         self.symbols.get(name)
     }
 
+    /// A bounded ownership check for a canonical operator used by an optional
+    /// structural theorem recognizer. Ambiguous overload inventories decline;
+    /// a collision-safe private declaration does not own the canonical core.
+    /// This checks metadata only and grants no assertion or model authority.
+    pub fn canonical_operator_binding_is_unambiguous(&self, identity: &str) -> bool {
+        if identity.len() > 256 || !super::is_canonical_theory_operator_identity(identity) {
+            return false;
+        }
+        let coherent = |surface: &str| {
+            if surface.len() > 256 {
+                return false;
+            }
+            match self.symbol_candidates(surface) {
+                None => true,
+                Some([info]) => {
+                    self.symbol_identity_name(surface, info) != identity
+                        || (info.declaration_kind() == super::DeclarationKind::Theory
+                            && self
+                                .adopted_macro_declaration_ids
+                                .get(surface)
+                                .is_none_or(|adopted| adopted != info.declaration_id())
+                            && self
+                                .adopted_macro_declaration_ids
+                                .get(identity)
+                                .is_none_or(|adopted| adopted != info.declaration_id()))
+                }
+                Some(_) => false,
+            }
+        };
+        coherent(identity)
+            && self
+                .dt_surface_name(identity)
+                .is_none_or(|surface| coherent(surface))
+    }
+
     /// Resolve one core term identity to its exact declaration signature.
     /// Unlike [`Self::symbol_info`], this accepts private overload/datatype
     /// identities and never substitutes the most recently declared signature.
@@ -2389,5 +2611,47 @@ impl Context {
         self.symbol_candidates(surface_name)?
             .iter()
             .find(|info| self.symbol_identity_name(surface_name, info) == identity)
+    }
+    /// Borrow adopted declaration identities without cloning/scanning the whole
+    /// signature inventory once per application. The caller meters iteration.
+    #[doc(hidden)]
+    pub fn model_recovery_adopted_declarations(
+        &self,
+    ) -> impl Iterator<Item = &super::DeclarationId> {
+        self.adopted_macro_declaration_ids.values()
+    }
+
+    /// Positive nominal-sort registry membership, with sticky datatype
+    /// semantics excluded even after source pop. Builtin encoded carriers such
+    /// as RoundingMode have no ordinary nominal registration and cannot pass.
+    #[doc(hidden)]
+    pub fn is_model_recovery_free_carrier(&self, name: &str) -> bool {
+        matches!(
+            self.nominal_sort_surfaces.get(name),
+            Some(super::NominalSortSurface::Simple(_))
+        ) && !self.datatypes.contains_key(name)
+            && !self.monomorphic_datatype_decs.contains_key(name)
+    }
+
+    /// Original backing-store scan sizes; no walk/allocation is performed.
+    #[doc(hidden)]
+    pub fn model_recovery_scan_capacities(&self) -> [usize; 3] {
+        [
+            self.symbols.capacity(),
+            self.overloaded_symbols.capacity(),
+            self.adopted_macro_declaration_ids.capacity(),
+        ]
+    }
+
+    /// Borrow all current metadata without a name-hashing filter before caller
+    /// admission. Primary entries may repeat exact overloads; consumers must
+    /// check exact identity/signature coherence rather than pick a last writer.
+    #[doc(hidden)]
+    pub fn model_recovery_symbol_iter(&self) -> impl Iterator<Item = (&String, &SymbolInfo)> {
+        self.symbols.iter().chain(
+            self.overloaded_symbols
+                .iter()
+                .flat_map(|(name, infos)| infos.iter().map(move |info| (name, info))),
+        )
     }
 }

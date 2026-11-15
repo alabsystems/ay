@@ -39,6 +39,16 @@ pub(crate) fn contains_quantifier(terms: &TermStore, term: TermId) -> bool {
     contains_quantifier_memo(terms, term, &mut visited)
 }
 
+/// Whether any of `roots` contains a quantifier, walking the shared DAG of
+/// all of them once: one visited set across the roots, so a subterm several
+/// roots share is visited once, not once per root.
+pub(crate) fn contains_quantifier_in_any(terms: &TermStore, roots: &[TermId]) -> bool {
+    let mut visited = HashSet::default();
+    roots
+        .iter()
+        .any(|&root| contains_quantifier_memo(terms, root, &mut visited))
+}
+
 fn contains_quantifier_memo(
     terms: &TermStore,
     term: TermId,
@@ -72,8 +82,13 @@ fn contains_quantifier_memo(
     })
 }
 
+#[cfg(test)]
+mod collect_quantifiers_dag_tests;
+#[cfg(feature = "ematching-differential")]
+mod differential;
 mod ground_terms;
 mod matching;
+mod occurrences;
 mod pattern;
 mod pattern_helpers;
 mod persistent;
@@ -83,13 +98,15 @@ mod substitution;
 mod test_support;
 pub(crate) use ground_terms::{
     collect_bool_uf_arg_terms, collect_ground_terms_by_sort, contains_fixed_interpreted_arithmetic,
-    enumerative_instantiation,
+    enumerative_instantiation, GroundTermsRound,
 };
 use matching::{match_multi_trigger, match_pattern};
 #[cfg(test)]
 use pattern::extract_patterns;
+use pattern::extract_patterns_with_fallback;
 pub(crate) use pattern::EqualityClasses;
-use pattern::{extract_patterns_with_fallback, TermIndex};
+#[cfg(any(test, feature = "ematching-differential"))]
+use pattern::TermIndex;
 #[cfg(test)]
 use pattern::{EMatchArg, EMatchPattern};
 #[cfg(test)]
@@ -391,6 +408,44 @@ pub(crate) struct EMatchingResult {
     /// A downstream proof producer still must authenticate the source as a
     /// direct problem assertion and re-check the exact substitution.
     pub unconditional_forall_instantiations: Vec<ForallInstantiationProvenance>,
+    /// (#degrade277-narrow) The universals THIS round treated as ENTAILED by
+    /// the assertion set it was handed — i.e. exactly the set the
+    /// instantiation gate below consulted before it was permitted to conjoin
+    /// an instance as a top-level fact.
+    ///
+    /// It is returned rather than recomputed by the caller because it is a
+    /// function of the round's own (growing) assertion slice, not of the
+    /// pre-instantiation snapshot: round `k` sees the instances rounds
+    /// `0..k` added, and a new ground unit can unlock a universal that was
+    /// not entailed in round 0. A gate that wants to know "could any lane
+    /// have conjoined an instance of this universal?" must read the union of
+    /// what the lanes actually consulted, never a re-derivation over a
+    /// different assertion set.
+    pub entailed_foralls: HashSet<TermId>,
+    /// (#quantifier-guarded-instances) Ground instances of Foralls the
+    /// assertion set does NOT entail — the ones the refusal below used to drop
+    /// outright. These are NOT consequences of the problem, so they may never
+    /// be conjoined; the caller asserts each only as the GUARDED clause
+    /// `(or (not q) body[t̄])`, where `q` is the fresh Boolean proxy
+    /// `purify_quantifier_atoms` minted for the source quantifier and the
+    /// clause is therefore valid at any polarity and in any position.
+    ///
+    /// A SEPARATE vector, deliberately: `instantiations` is appended to
+    /// `ctx.assertions` as top-level conjuncts by every caller, and
+    /// `unconditional_forall_roots` is the conflict-verification support
+    /// subset. A guarded record reaches neither, and its quantifier is never
+    /// marked `instantiated`, so `has_uninstantiated`,
+    /// `uninstantiated_quantifiers` and every SAT-side gate downstream read
+    /// exactly the value they read with the guarded lane off.
+    pub guarded_instantiations: Vec<ForallInstantiationProvenance>,
+    /// (#conjunctive-closure) Source quantifier and binding of every instance in
+    /// [`Self::instantiations`] whose universal the round treated as entailed
+    /// but that is NOT an unconditionally asserted conjunct: a universal under
+    /// an `or`/`=>` that a unit fact settled. Provenance only. The
+    /// `degrade@277` gate replays these, and only for universals it can show
+    /// entailed on its own, to find the guards such instances make true (see
+    /// `conjunctive_closure.rs`).
+    pub conditional_forall_instantiations: Vec<ForallInstantiationProvenance>,
     /// M0' demand-campaign instrumentation for THIS round (pure observation; see
     /// [`DemandStats`]). Never consulted by any solver decision.
     pub demand: DemandStats,
@@ -436,6 +491,12 @@ pub(crate) struct ParkedInstance {
     /// Shadow-staged (M2+M3): consumed once the demand lane goes live.
     #[allow(dead_code)]
     pub head: String,
+    /// Whether the source forall is unconditionally asserted (the exact
+    /// `quant_is_unconditional_forall` predicate the eager path tags
+    /// support axioms with), captured at park time — by flush time the
+    /// ground lane has stripped the foralls from `ctx.assertions`, so
+    /// the predicate cannot be recomputed there (#demand-flush-provenance).
+    pub unconditional: bool,
 }
 
 /// One round's demand-lane gate (SHADOW-ONLY; M2+M3). Passed into
@@ -537,9 +598,30 @@ impl ParkedInstance {
 /// On stop the round sets `reached_limit = true` and breaks out, which the
 /// caller routes to `Unknown` (never to a final `Sat`). Removing instantiations
 /// can only weaken the conjunction, so this can never produce a false UNSAT.
+///
+/// (#guarded-instance-match-terms) `match_only_roots` feed the ground-term
+/// index and nothing else: they are not searched for quantifiers, not
+/// harvested for unit facts, not read by the entailed-universal walk and not
+/// folded into the equality classes. So they only widen the set of ground
+/// terms a trigger can bind to.
+///
+/// That is sound whatever the roots are. The licence to CONJOIN an instance is
+/// that its universal is entailed (`entailed_forall_set`, computed from
+/// `assertions` alone), and `∀x̄.B ⊨ B[t̄]` holds for EVERY ground tuple `t̄` —
+/// where the tuple's terms came from plays no part in it. An instance of a
+/// universal that is not entailed is still only ever recorded as a guarded
+/// record, never conjoined.
+///
+/// (#guarded-nested-quantifiers) `guarded_quantifiers` are closed universals
+/// that occur in no assertion: the quantifiers nested in guarded instances.
+/// They join the matched set after the assertions' own, and since the
+/// entailed set is computed from `assertions` alone, an instance of one is
+/// only ever a guarded record unless the very same term is entailed there.
 pub(crate) fn perform_ematching_with_generations(
     terms: &mut TermStore,
     assertions: &[TermId],
+    match_only_roots: &[TermId],
+    guarded_quantifiers: &[TermId],
     config: &EMatchingConfig,
     mut tracker: GenerationTracker,
     euf_model: Option<&EufModel>,
@@ -560,6 +642,11 @@ pub(crate) fn perform_ematching_with_generations(
     for &assertion in assertions {
         collect_quantifiers(terms, assertion, &mut quantifiers);
     }
+    for &quantifier in guarded_quantifiers {
+        if !quantifiers.contains(&quantifier) {
+            quantifiers.push(quantifier);
+        }
+    }
 
     if quantifiers.is_empty() {
         return EMatchingResult {
@@ -572,6 +659,9 @@ pub(crate) fn perform_ematching_with_generations(
             generation_tracker: tracker,
             unconditional_forall_roots: HashSet::default(),
             unconditional_forall_instantiations: Vec::new(),
+            entailed_foralls: HashSet::default(),
+            guarded_instantiations: Vec::new(),
+            conditional_forall_instantiations: Vec::new(),
             demand: DemandStats::default(),
         };
     }
@@ -597,13 +687,31 @@ pub(crate) fn perform_ematching_with_generations(
     // that; `quantifiers` above is NOT (it flattens through `or`/`ite`/`=>`
     // without polarity and deliberately also surfaces `Exists`).
     let entailed_foralls: HashSet<TermId> = entailed_forall_set(terms, assertions);
+    // (#derived-entailment-depth) The universals entailed only through a
+    // derived unit fact (#unit-bool-eq, #unit-bcp), not through the bare
+    // harvest of asserted atoms and conjunctions.
+    let derived_only: HashSet<TermId> = if entailed_foralls.is_empty() {
+        HashSet::default()
+    } else {
+        let harvested = entailed_forall_set_deriving(terms, assertions, false);
+        entailed_foralls
+            .iter()
+            .copied()
+            .filter(|q| !harvested.contains(q))
+            .collect()
+    };
 
     tracker.next_round();
 
     // Incrementally refresh the persisted ground-term index by walking only NEW
     // assertion roots (LI-1/LI-2). Equivalent to `TermIndex::new(terms, assertions)`
     // — the cfg(debug_assertions) differential canary asserts this every round.
-    state.refresh_index(terms, assertions);
+    if match_only_roots.is_empty() {
+        state.refresh_index(terms, assertions);
+    } else {
+        let index_roots: Vec<TermId> = assertions.iter().chain(match_only_roots).copied().collect();
+        state.refresh_index(terms, &index_roots);
+    }
 
     // Incrementally fold only NEW explicit `(= a b)`/`(and ...)` atoms into the
     // persisted assertion-only equality classes (#3325 Gap 1, LI-7/LI-8), then
@@ -612,7 +720,7 @@ pub(crate) fn perform_ematching_with_generations(
     // because the model changes per interleaved round and union-find cannot
     // un-merge.
     state.refresh_eqclasses(terms, assertions);
-    let eqclasses = state.working_eqclasses(euf_model);
+    let eqclasses = state.working_eqclasses(terms, euf_model);
     let eqclasses_opt = if eqclasses.is_empty() {
         None
     } else {
@@ -637,6 +745,12 @@ pub(crate) fn perform_ematching_with_generations(
     let mut deferred = Vec::new();
     let mut instantiated_quantifiers: HashSet<TermId> = HashSet::default();
     let mut unconditional_forall_instantiations = Vec::new();
+    let mut guarded_instantiations: Vec<ForallInstantiationProvenance> = Vec::new();
+    let mut conditional_forall_instantiations: Vec<ForallInstantiationProvenance> = Vec::new();
+    // (#quantifier-guarded-instances) Read ONCE per round, on a cold path, so
+    // an in-process test can toggle the switch without `OnceLock` staleness and
+    // the binding loop below pays nothing for it.
+    let guarded_lane_enabled = crate::quant_unit_authority::quantifier_guarded_instances_enabled();
     let mut per_quantifier_count: HashMap<TermId, usize> = HashMap::default();
     let mut reached_limit = false;
     // M0' demand-campaign instrumentation for this round. Written ONLY at the
@@ -716,7 +830,23 @@ pub(crate) fn perform_ematching_with_generations(
         // guarded lemma would be discarded rather than used. Recovering these
         // instances therefore needs a real quantifier abstraction in the ground
         // solver; refusing to instantiate is the soundness floor until then.
-        if !entailed_foralls.contains(&quant) {
+        //
+        // (#quantifier-guarded-instances) The refusal is now three-way, and the
+        // floor above is unchanged: an unentailed `forall` is still never
+        // CONJOINED. When the guarded lane is on it is instead instantiated
+        // into `guarded_instantiations`, which the caller asserts only as
+        // `(or (not q) body[t̄])` against the Boolean proxy the abstraction
+        // minted for `quant`. That clause is valid in every model — if the
+        // proxy is true the universal holds, so its instance holds; if it is
+        // false the clause holds on the guard — so no position or polarity
+        // condition is needed for it, which is exactly what the unconditional
+        // conjunct could not have.
+        //
+        // With the lane off, or for a quantifier with no proxy, the record is
+        // dropped by the caller and the solve is byte-identical to baseline.
+        let quant_is_entailed = entailed_foralls.contains(&quant);
+        let quant_is_guarded = !quant_is_entailed && guarded_lane_enabled;
+        if !quant_is_entailed && !quant_is_guarded {
             continue;
         }
         // Only ground instances of an UNCONDITIONALLY-asserted Forall are sound
@@ -753,7 +883,14 @@ pub(crate) fn perform_ematching_with_generations(
             for old_binding in state.epoch_matched_bindings_for(quant) {
                 let cost = tracker.instantiation_cost(old_binding, quantifier_weight);
                 if cost <= config.lazy_threshold {
-                    instantiated_quantifiers.insert(quant);
+                    // A guarded quantifier is NOT "instantiated" for any
+                    // downstream purpose: its instance is never asserted as a
+                    // fact, so the SAT-side firewall must keep seeing it in
+                    // `uninstantiated_quantifiers` exactly as the baseline
+                    // `continue` left it.
+                    if !quant_is_guarded {
+                        instantiated_quantifiers.insert(quant);
+                    }
                     quantifier_instantiated_this_round = true;
                     break;
                 }
@@ -910,7 +1047,11 @@ pub(crate) fn perform_ematching_with_generations(
                     // uninstantiated_quantifiers HEAD-identical, which is the
                     // input to the conservative Unknown firewall. The persistent
                     // seen gate below then only skips the duplicated WORK.
-                    instantiated_quantifiers.insert(quant);
+                    // See the epoch-replay branch above: a guarded quantifier
+                    // stays UNINSTANTIATED for every downstream consumer.
+                    if !quant_is_guarded {
+                        instantiated_quantifiers.insert(quant);
+                    }
                     quantifier_instantiated_this_round = true;
                     // LI-INC-3: remember this matched binding (it passed the cost
                     // gate) so a later stable round — which skips this now-OLD
@@ -918,8 +1059,17 @@ pub(crate) fn perform_ematching_with_generations(
                     // the quantifier HEAD-identically without re-running the matcher.
                     state.record_epoch_matched_binding(quant, binding.clone());
 
+                    // (#guarded-then-entailed) A guarded binding is NOT entered in
+                    // the persistent memo. Its universal can become entailed in a
+                    // later round (a unit fact appears through an instance, see
+                    // #unit-bool-eq), and the memo would then suppress the one
+                    // production that matters, the conjoined instance, because
+                    // the guarded record was produced first. Guarded records are
+                    // deduplicated by the round campaign instead
+                    // (`EmatchingCampaign::seen_guarded`), so leaving them out of
+                    // the memo only repeats their instantiation work.
                     let key = (quant, binding.clone());
-                    if !state.seen_insert(key) {
+                    if !quant_is_guarded && !state.seen_insert(key) {
                         // Already produced (this round or an earlier same-state
                         // round). instantiate_body is idempotent (hash-consed), so
                         // re-deriving contributes no new TermId. Skip the work.
@@ -942,7 +1092,25 @@ pub(crate) fn perform_ematching_with_generations(
                     // conjunction, never produce a false UNSAT; and because parking
                     // sets `has_deferred` (LAW #3) via the parked queue, a Sat is
                     // never finalized while instances remain parked.
-                    if let Some(gate) = demand_gate.as_deref_mut() {
+                    // A guarded record is no citizen of the demand lane: the
+                    // flush and the fence assert a parked instance as a
+                    // top-level FACT, which an unentailed universal may not
+                    // license (the rule that keeps it out of the deferred
+                    // queue). Over the frontier it is dropped, which bounds a
+                    // guarded self-chaining family as parking bounds an
+                    // entailed one; at or under it, it goes on to the guarded
+                    // lane below. Dropping a guarded record only weakens the
+                    // abstraction.
+                    let guarded_over_frontier = quant_is_guarded
+                        && demand_gate.as_deref().is_some_and(|gate| {
+                            gate.gated.contains(&quant.0)
+                                && tracker.max_generation(&binding).saturating_add(1).max(1)
+                                    > gate.frontier
+                        });
+                    if guarded_over_frontier {
+                        continue;
+                    }
+                    if let Some(gate) = demand_gate.as_deref_mut().filter(|_| !quant_is_guarded) {
                         let would_be_gen =
                             tracker.max_generation(&binding).saturating_add(1).max(1);
                         if gate.gated.contains(&quant.0) {
@@ -968,6 +1136,7 @@ pub(crate) fn perform_ematching_with_generations(
                                 var_names: vars.clone(),
                                 generation: would_be_gen,
                                 head: head_sym.to_string(),
+                                unconditional: quant_is_unconditional_forall,
                             });
                             gate.frontier_parked += 1;
                             demand.record_parked(quant, head_sym);
@@ -983,14 +1152,41 @@ pub(crate) fn perform_ematching_with_generations(
                         }
                     }
 
-                    if cost > config.eager_threshold {
-                        // M0': parked (deferred, eager < cost <= lazy threshold).
+                    // (#derived-entailment-depth) An instance of a universal
+                    // entailed only through a derived fact, over a term an
+                    // instance minted, is deferred once the check-sat's
+                    // budget for such instances is spent. The deferred queue
+                    // conjoins it when a model falsifies it, and keeps SAT
+                    // from being published while it waits.
+                    if derived_only.contains(&quant)
+                        && tracker.max_generation(&binding) >= DERIVED_ENTAILMENT_FREE_GENERATION
+                        && !state.admit_derived_deep_instance()
+                    {
                         demand.record_parked(quant, head_sym);
                         deferred.push(DeferredInstantiation {
                             quantifier: quant,
                             binding: binding.clone(),
                             var_names: vars.clone(),
                         });
+                        continue;
+                    }
+
+                    if cost > config.eager_threshold {
+                        // M0': parked (deferred, eager < cost <= lazy threshold).
+                        demand.record_parked(quant, head_sym);
+                        // (#quantifier-guarded-instances) A guarded record must
+                        // never enter the deferred queue: `promote_deferred_
+                        // conflicts` asserts a promoted instance as a top-level
+                        // FACT, which is precisely what an unentailed universal
+                        // may not license. Dropping it is fail-closed — fewer
+                        // clauses, never a stronger problem.
+                        if !quant_is_guarded {
+                            deferred.push(DeferredInstantiation {
+                                quantifier: quant,
+                                binding: binding.clone(),
+                                var_names: vars.clone(),
+                            });
+                        }
                         continue;
                     }
 
@@ -1034,6 +1230,32 @@ pub(crate) fn perform_ematching_with_generations(
                         }
                     }
 
+                    if quant_is_guarded {
+                        // (#quantifier-guarded-instances) NOT an assertion.
+                        // The record carries the source quantifier and the
+                        // positional binding so the caller can rebuild the
+                        // EXACT instance and emit `(or (not q) body[t̄])`; it
+                        // reaches neither `instantiations` nor the support
+                        // subset, so nothing downstream can conjoin it.
+                        debug_assert!(
+                            matches!(terms.get(quant), TermData::Forall(..)),
+                            "guarded instantiation source must be a Forall \
+                             (Exists is refused above)"
+                        );
+                        debug_assert!(
+                            !quant_is_unconditional_forall,
+                            "a guarded quantifier cannot be an unconditionally \
+                             asserted forall: the entailed set is wider"
+                        );
+                        guarded_instantiations.push(ForallInstantiationProvenance {
+                            quantifier: quant,
+                            binding: binding.clone(),
+                            instance: inst,
+                        });
+                        demand.record_asserted(quant, head_sym, new_gen);
+                        *quant_count += 1;
+                        continue;
+                    }
                     instantiations.push(inst);
                     // M0': asserted (eager instantiation) at generation `new_gen`.
                     demand.record_asserted(quant, head_sym, new_gen);
@@ -1053,6 +1275,12 @@ pub(crate) fn perform_ematching_with_generations(
                             binding: binding.clone(),
                             instance: inst,
                         });
+                    } else {
+                        conditional_forall_instantiations.push(ForallInstantiationProvenance {
+                            quantifier: quant,
+                            binding: binding.clone(),
+                            instance: inst,
+                        });
                     }
                     *quant_count += 1;
                 }
@@ -1063,33 +1291,24 @@ pub(crate) fn perform_ematching_with_generations(
     #[cfg(debug_assertions)]
     state.assert_seen_consistent();
 
-    // MANDATORY incremental-matching differential canary. Recompute the
-    // firewall-critical `instantiated_quantifiers` set with a FULL per-round
-    // re-match (every candidate, no new-candidate skip, no epoch replay) over the
-    // SAME quantifiers + working eqclasses, and assert it equals the incrementally
-    // computed set. A divergence here would mean the new-candidate skip dropped a
-    // match the full path finds (the only way incremental matching could change a
-    // result), so this MUST hold. Gated behind the `ematching-differential` feature
-    // so production builds keep the perf win; enabled by the verification suite.
-    // Only run the canary when the round completed normally: the instantiation
-    // budget limits (`max_total`/`max_per_quantifier`) and the deadline/`should_stop`
-    // break out of the loop early and skip the marking for later quantifiers, which
-    // the unlimited full recomputation would still mark — a benign, expected
-    // difference under truncation, not a matching divergence.
+    // The MANDATORY differential canary (see `differential`), only on a round
+    // that no budget or deadline cut short.
     #[cfg(feature = "ematching-differential")]
     if !reached_limit {
-        let full_instantiated = compute_full_instantiated_quantifiers(
+        let full = differential::compute_full_instantiated_quantifiers(
             terms,
             &quantifiers,
+            &entailed_foralls,
             &tracker,
             config,
             eqclasses_opt,
             state.index(),
         );
         debug_assert_eq!(
-            instantiated_quantifiers, full_instantiated,
-            "incremental matching diverged from full re-match: instantiated_quantifiers \
-             differs (new-candidate skip / epoch replay dropped or added a match)"
+            instantiated_quantifiers,
+            full,
+            "{}",
+            differential::DIVERGENCE
         );
     }
 
@@ -1116,74 +1335,11 @@ pub(crate) fn perform_ematching_with_generations(
         generation_tracker: tracker,
         unconditional_forall_roots,
         unconditional_forall_instantiations,
+        entailed_foralls,
+        guarded_instantiations,
+        conditional_forall_instantiations,
         demand,
     }
-}
-
-/// Differential-canary helper: recompute the `instantiated_quantifiers` set the
-/// way the HEAD full-rematch path would — matching EVERY candidate for every
-/// quantifier (no new-candidate skip, no epoch replay), marking a quantifier
-/// instantiated for any binding whose cost is `<= lazy_threshold`, and applying
-/// the same primary/fallback phase rule. Used only under the
-/// `ematching-differential` feature to assert the incremental path is identical.
-#[cfg(feature = "ematching-differential")]
-fn compute_full_instantiated_quantifiers(
-    terms: &TermStore,
-    quantifiers: &[TermId],
-    tracker: &GenerationTracker,
-    config: &EMatchingConfig,
-    eqclasses_opt: Option<&EqualityClasses>,
-    index: &TermIndex,
-) -> HashSet<TermId> {
-    let mut instantiated: HashSet<TermId> = HashSet::default();
-    for &quant in quantifiers {
-        let quantifier_weight = effective_quantifier_weight(terms, quant, config);
-        let trigger_groups = extract_patterns_with_fallback(terms, quant);
-        let var_sorts: Vec<Sort> = match terms.get(quant) {
-            TermData::Forall(v, _, _) | TermData::Exists(v, _, _) => {
-                v.iter().map(|(_, sort)| sort.clone()).collect()
-            }
-            _ => continue,
-        };
-        let mut quantifier_instantiated_this_round = false;
-        for (phase_idx, groups) in [&trigger_groups.primary, &trigger_groups.fallback]
-            .iter()
-            .enumerate()
-        {
-            if phase_idx == 1 && quantifier_instantiated_this_round {
-                break;
-            }
-            for trigger_group in *groups {
-                let bindings: Vec<Vec<TermId>> = if trigger_group.patterns.len() == 1 {
-                    let pattern = &trigger_group.patterns[0];
-                    index
-                        .get_by_symbol(pattern.symbol.name())
-                        .iter()
-                        .filter_map(|&gt| {
-                            match_pattern(terms, pattern, gt, &var_sorts, eqclasses_opt)
-                        })
-                        .collect()
-                } else {
-                    match_multi_trigger(
-                        terms,
-                        &trigger_group.patterns,
-                        index,
-                        &var_sorts,
-                        eqclasses_opt,
-                    )
-                };
-                for binding in bindings {
-                    let cost = tracker.instantiation_cost(&binding, quantifier_weight);
-                    if cost > config.lazy_threshold {
-                        continue;
-                    }
-                    instantiated.insert(quant);
-                    quantifier_instantiated_this_round = true;
-                }
-            }
-        }
-    }
-    instantiated
 }
 
 /// Set generation for all subterms of a term (if they don't already have one).
@@ -1387,6 +1543,30 @@ pub(crate) fn collect_entailed_foralls(
     collect_entailed_foralls_with_units(terms, term, positive, &UnitFacts::default(), out);
 }
 
+/// (#derived-entailment-depth) A universal entailed only through a derived
+/// unit fact is instantiated freely over bindings below this generation, the
+/// terms of the input and of no instance.
+///
+/// Deriving the fuel guards (#unit-bool-eq, #unit-bcp) enables every vstd
+/// broadcast lemma a Verus query's groups name, as z3 does, and their instances
+/// feed each other: on `double_scoped_updates_match` the E-matching rounds
+/// asserted 1,353 instances up to generation 4 instead of 756 up to 2, and
+/// the solve went from 10 CPU s to no answer in 97. The refutations the
+/// derivation recovers need at most a few instances past the input terms.
+pub(crate) const DERIVED_ENTAILMENT_FREE_GENERATION: u32 = 1;
+
+/// (#derived-entailment-depth) Instances past
+/// [`DERIVED_ENTAILMENT_FREE_GENERATION`] admitted per check-sat; later ones
+/// are deferred. The row-D refutations that need such instances admit at
+/// most three.
+pub(crate) const DERIVED_ENTAILMENT_DEEP_BUDGET: usize = 8;
+
+/// (#unit-bcp) Rounds of harvesting and propagation in
+/// [`UnitFacts::from_assertions`]. Each round that does not reach a fixpoint
+/// has asserted at least one new formula; a Verus broadcast chain needs three.
+/// Stopping early only leaves facts out.
+const UNIT_BCP_MAX_PASSES: usize = 16;
+
 /// Top-level unit facts of an assertion list: atom -> its asserted truth value.
 ///
 /// A bare atom assertion is a FACT, and the entailment test has to be taken
@@ -1440,36 +1620,210 @@ impl UnitFacts {
     /// guard can occur in many conjuncts), and `and` nesting is flattened by
     /// `mk_and` but not guaranteed flat for terms built by other routes.
     pub(crate) fn from_assertions(terms: &TermStore, assertions: &[TermId]) -> Self {
+        Self::from_assertions_deriving(terms, assertions, true)
+    }
+
+    /// [`Self::from_assertions`] with the derivation steps (#unit-bool-eq,
+    /// #unit-bcp) switched by `derive`; without them the facts are the bare
+    /// harvest of asserted atoms and conjunctions.
+    pub(crate) fn from_assertions_deriving(
+        terms: &TermStore,
+        assertions: &[TermId],
+        derive: bool,
+    ) -> Self {
         let mut facts = Self::default();
         let mut stack: Vec<TermId> = assertions.iter().rev().copied().collect();
         let mut seen: HashSet<TermId> = HashSet::default();
-        while let Some(a) = stack.pop() {
-            if !seen.insert(a) {
-                continue;
+        // (#unit-bcp) Asserted implications and clauses not yet decided by the
+        // facts; see `propagate_asserted_clauses`.
+        let mut pending: Vec<TermId> = Vec::new();
+        for _ in 0..UNIT_BCP_MAX_PASSES {
+            while let Some(a) = stack.pop() {
+                if !seen.insert(a) {
+                    continue;
+                }
+                match terms.get(a) {
+                    TermData::Not(inner) => {
+                        let inner = *inner;
+                        if is_unit_atom(terms, inner) {
+                            facts.record(terms, inner, false);
+                        }
+                    }
+                    // An asserted conjunction asserts every conjunct. Only `and`
+                    // is descended: `or`/`=>`/`ite`/`xor` conjuncts are NOT
+                    // entailed, and a `Not` is handled by the arm above
+                    // (`mk_not` already pushed De Morgan through `and`/`or`, so
+                    // a surviving `Not` wraps an atom, a quantifier or an
+                    // uninterpreted application).
+                    TermData::App(ay_core::Symbol::Named(name), args) if name == "and" => {
+                        stack.extend(args.iter().copied());
+                    }
+                    TermData::App(ay_core::Symbol::Named(name), _)
+                        if name == "=>" || name == "or" =>
+                    {
+                        pending.push(a);
+                    }
+                    _ => {
+                        if is_unit_atom(terms, a) {
+                            facts.record(terms, a, true);
+                        }
+                    }
+                }
             }
-            match terms.get(a) {
-                TermData::Not(inner) => {
-                    let inner = *inner;
-                    if is_unit_atom(terms, inner) {
-                        facts.record(terms, inner, false);
-                    }
-                }
-                // An asserted conjunction asserts every conjunct. Only `and` is
-                // descended: `or`/`=>`/`ite`/`xor` conjuncts are NOT entailed,
-                // and a `Not` is handled by the arm above (`mk_not` already
-                // pushed De Morgan through `and`/`or`, so a surviving `Not`
-                // wraps an atom, a quantifier or an uninterpreted application).
-                TermData::App(ay_core::Symbol::Named(name), args) if name == "and" => {
-                    stack.extend(args.iter().copied());
-                }
-                _ => {
-                    if is_unit_atom(terms, a) {
-                        facts.record(terms, a, true);
-                    }
-                }
+            if !derive {
+                break;
+            }
+            facts.propagate_bool_equalities(terms);
+            facts.propagate_asserted_clauses(terms, &mut pending, &mut stack);
+            if stack.is_empty() {
+                break;
             }
         }
         facts
+    }
+
+    /// (#unit-bcp) Forward chaining through the asserted implications and
+    /// clauses in `pending`: an implication `(=> a₁ … aₙ b)` whose premises are
+    /// all true facts asserts `b`, and a clause `(or (not a₁) … (not aₙ) b)`
+    /// whose `aᵢ` are all true facts asserts `b`. The asserted formula is
+    /// pushed on `stack`, so it is harvested like an assertion (an atom becomes
+    /// a fact, an `and` is descended, another implication or clause waits here).
+    /// A formula already satisfied by the facts is dropped; the rest stay.
+    ///
+    /// Verus derives the fuel of every broadcast lemma this way:
+    /// `(fuel_bool_default group)` is asserted and
+    /// `(=> (fuel_bool_default group) (and (fuel_bool_default lemma) ...))`
+    /// gives each member's default, which #unit-bool-eq then carries to the
+    /// lemma's guard `(fuel_bool lemma)`.
+    ///
+    /// Sound: this is modus ponens over formulas every model satisfies, so each
+    /// asserted formula holds in every model.
+    fn propagate_asserted_clauses(
+        &self,
+        terms: &TermStore,
+        pending: &mut Vec<TermId>,
+        stack: &mut Vec<TermId>,
+    ) {
+        pending.retain(|&formula| {
+            let TermData::App(ay_core::Symbol::Named(name), args) = terms.get(formula) else {
+                return false;
+            };
+            if name == "=>" {
+                let Some((&consequent, premises)) = args.split_last() else {
+                    return false;
+                };
+                if self.value(terms, consequent) == Some(true)
+                    || premises
+                        .iter()
+                        .any(|&p| self.value(terms, p) == Some(false))
+                {
+                    return false;
+                }
+                if premises.iter().all(|&p| self.value(terms, p) == Some(true)) {
+                    stack.push(consequent);
+                    return false;
+                }
+                return true;
+            }
+            if args.iter().any(|&d| self.value(terms, d) == Some(true)) {
+                return false;
+            }
+            // Forward chaining only (#unit-bcp-forward): the clause is read as
+            // the implication `a₁ ∧ … ∧ aₙ ⇒ b` it encodes once `=>` has been
+            // desugared, and fires only when every falsified disjunct is a
+            // negated TRUE fact `(not aᵢ)`. A disjunct falsified by a FALSE
+            // fact would be the contrapositive (modus tollens), which this
+            // pass does not take: it made a universal behind a two-step chain
+            // `(or c Q)`, `(or (not c) d)`, `(not d)` entailed, moving it off
+            // the guarded lanes whose refutations the downstream certifiers
+            // accept, and cost the verdict (measured: the only-route
+            // enumerative fixture went unsat -> unknown).
+            let mut live = args
+                .iter()
+                .filter(|&&d| self.value(terms, d) != Some(false));
+            let (Some(&survivor), None) = (live.next(), live.next()) else {
+                return true;
+            };
+            let forward = args.iter().filter(|&&d| d != survivor).all(|&d| {
+                matches!(terms.get(d), TermData::Not(premise)
+                    if self.value(terms, *premise) == Some(true))
+            });
+            if forward {
+                stack.push(survivor);
+                return false;
+            }
+            true
+        });
+    }
+
+    /// (#unit-bool-eq) Close the facts under asserted Boolean equalities: if
+    /// `(= a b)` is a fact and `b` has a known value, `a` has the same value
+    /// (the opposite one when the equality is asserted false), and the other
+    /// way round.
+    ///
+    /// Verus derives every fuel guard this way. `(assert (fuel_bool_default
+    /// f))` is a unit, and the prelude axiom `fuel_bool(id) =
+    /// fuel_bool_default(id)` gives the instance `(= (fuel_bool f)
+    /// (fuel_bool_default f))` in the first E-matching round. Without this
+    /// step the guard `(fuel_bool f)` of `(=> (fuel_bool f) (forall ...))` is
+    /// never a unit, so the definition behind it is never instantiated
+    /// (Verus fix queue, row D1).
+    ///
+    /// Sound: each derived value holds in every model in which the equality
+    /// and the known side hold, which is every model of the assertions. A
+    /// value already known is never overwritten. Runs to a fixpoint; every
+    /// pass either derives a new value or stops, so it takes at most one pass
+    /// per equality plus one.
+    fn propagate_bool_equalities(&mut self, terms: &TermStore) {
+        let mut equalities: Vec<(TermId, TermId, bool)> = self
+            .values
+            .iter()
+            .filter_map(|(&atom, &truth)| match terms.get(atom) {
+                TermData::App(ay_core::Symbol::Named(name), args)
+                    if name == "="
+                        && args.len() == 2
+                        && matches!(terms.sort(args[0]), Sort::Bool) =>
+                {
+                    Some((args[0], args[1], truth))
+                }
+                _ => None,
+            })
+            .collect();
+        if equalities.is_empty() {
+            return;
+        }
+        equalities.sort_unstable();
+        loop {
+            let mut changed = false;
+            for &(lhs, rhs, equal) in &equalities {
+                match (self.value(terms, lhs), self.value(terms, rhs)) {
+                    (Some(v), None) => {
+                        self.record_literal(terms, rhs, v == equal);
+                        changed = true;
+                    }
+                    (None, Some(v)) => {
+                        self.record_literal(terms, lhs, v == equal);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Record the truth of a Boolean term, stripping one negation so the value
+    /// lands on the atom `value` looks up first.
+    fn record_literal(&mut self, terms: &TermStore, term: TermId, truth: bool) {
+        match terms.get(term) {
+            TermData::Not(inner) => {
+                let inner = *inner;
+                self.record(terms, inner, !truth);
+            }
+            _ => self.record(terms, term, truth),
+        }
     }
 
     /// Record `atom = truth`, on BOTH keys the lookup can arrive by: the atom's
@@ -1489,7 +1843,7 @@ impl UnitFacts {
     /// canonical bound (which is how the SAME fact reaches this lookup after
     /// `tighten_int_strict_term` has rewritten `(not (<= a c))` into the
     /// positive atom `(<= (c+1) a)`).
-    fn value(&self, terms: &TermStore, t: TermId) -> Option<bool> {
+    pub(crate) fn value(&self, terms: &TermStore, t: TermId) -> Option<bool> {
         if let Some(&v) = self.values.get(&t) {
             return Some(v);
         }
@@ -1736,7 +2090,17 @@ pub(crate) fn collect_entailed_foralls_with_units(
 /// Every assertion root is walked at positive polarity (asserted = true), taken
 /// modulo the list's own top-level unit facts.
 pub(crate) fn entailed_forall_set(terms: &mut TermStore, assertions: &[TermId]) -> HashSet<TermId> {
-    let units = UnitFacts::from_assertions(terms, assertions);
+    entailed_forall_set_deriving(terms, assertions, true)
+}
+
+/// [`entailed_forall_set`] with the unit facts' derivation steps switched by
+/// `derive` (see [`UnitFacts::from_assertions_deriving`]).
+pub(crate) fn entailed_forall_set_deriving(
+    terms: &mut TermStore,
+    assertions: &[TermId],
+    derive: bool,
+) -> HashSet<TermId> {
+    let units = UnitFacts::from_assertions_deriving(terms, assertions, derive);
     let mut acc: Vec<TermId> = Vec::new();
     for &assertion in assertions {
         collect_entailed_foralls_with_units(terms, assertion, true, &units, &mut acc);
@@ -1745,6 +2109,38 @@ pub(crate) fn entailed_forall_set(terms: &mut TermStore, assertions: &[TermId]) 
 }
 
 pub(crate) fn collect_quantifiers(terms: &mut TermStore, term: TermId, out: &mut Vec<TermId>) {
+    collect_quantifiers_skipping(terms, term, out, &mut HashSet::default());
+}
+
+/// [`collect_quantifiers`], skipping subterms already walked without finding
+/// a quantifier. The walk is a tree walk; on a shared DAG it re-walked every
+/// shared subterm once per path, which on AUFBV Alive2 `ph7__532_ph7` kept
+/// the solve in this walk past its deadline until the watchdog's hard exit
+/// (sampled, 448 of 787 samples). A subterm that pushed nothing contains no
+/// quantifier, so walking it again would push nothing and build nothing:
+/// the output, its order and duplicates included, is unchanged.
+fn collect_quantifiers_skipping(
+    terms: &mut TermStore,
+    term: TermId,
+    out: &mut Vec<TermId>,
+    quantifier_free: &mut HashSet<TermId>,
+) {
+    if quantifier_free.contains(&term) {
+        return;
+    }
+    let pushed_before = out.len();
+    collect_quantifiers_node(terms, term, out, quantifier_free);
+    if out.len() == pushed_before {
+        quantifier_free.insert(term);
+    }
+}
+
+fn collect_quantifiers_node(
+    terms: &mut TermStore,
+    term: TermId,
+    out: &mut Vec<TermId>,
+    quantifier_free: &mut HashSet<TermId>,
+) {
     stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
         match terms.get(term).clone() {
             // An `Exists` IS surfaced here, and that is deliberate — do not
@@ -1791,25 +2187,25 @@ pub(crate) fn collect_quantifiers(terms: &mut TermStore, term: TermId, out: &mut
                         terms.copy_quantifier_metadata(inner, converted);
                         out.push(converted);
                     }
-                    _ => collect_quantifiers(terms, inner, out),
+                    _ => collect_quantifiers_skipping(terms, inner, out, quantifier_free),
                 }
             }
             TermData::App(_, args) => {
                 for arg in args {
-                    collect_quantifiers(terms, arg, out);
+                    collect_quantifiers_skipping(terms, arg, out, quantifier_free);
                 }
             }
             TermData::Ite(c, t, e) => {
-                collect_quantifiers(terms, c, out);
-                collect_quantifiers(terms, t, out);
-                collect_quantifiers(terms, e, out);
+                collect_quantifiers_skipping(terms, c, out, quantifier_free);
+                collect_quantifiers_skipping(terms, t, out, quantifier_free);
+                collect_quantifiers_skipping(terms, e, out, quantifier_free);
             }
             TermData::Let(bindings, body) => {
                 let vals: Vec<TermId> = bindings.iter().map(|(_, v)| *v).collect();
                 for val in vals {
-                    collect_quantifiers(terms, val, out);
+                    collect_quantifiers_skipping(terms, val, out, quantifier_free);
                 }
-                collect_quantifiers(terms, body, out);
+                collect_quantifiers_skipping(terms, body, out, quantifier_free);
             }
             TermData::Const(_) | TermData::Var(_, _) => {}
             // Future TermData variants: skip (no quantifiers to collect).
@@ -1866,6 +2262,8 @@ pub(crate) fn collect_unconditional_foralls(
     }) // stacker::maybe_grow
 }
 
+#[cfg(test)]
+mod derived_depth_tests;
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;

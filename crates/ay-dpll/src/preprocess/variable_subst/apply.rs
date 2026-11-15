@@ -182,6 +182,21 @@ impl VariableSubstitution {
                         // This ensures flattening, constant folding (#1708, #2767),
                         // and read-over-write simplification for arrays (#8140).
                         match sym.name() {
+                            "and" | "or"
+                                if terms.sort(term) == &Sort::Bool
+                                    && new_args
+                                        .iter()
+                                        .all(|&arg| terms.sort(arg) == &Sort::Bool) =>
+                            {
+                                // Keep the actual recorded image aligned with
+                                // the canonical Boolean spelling independently
+                                // reconstructed by propagation proof replay.
+                                if sym.name() == "and" {
+                                    terms.mk_and(new_args)
+                                } else {
+                                    terms.mk_or(new_args)
+                                }
+                            }
                             "=" if new_args.len() == 2 => {
                                 terms.mk_eq_coerce_no_ite_expand(new_args[0], new_args[1])
                             }

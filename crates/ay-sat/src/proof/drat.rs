@@ -366,6 +366,11 @@ impl<W: Write> DratWriter<W> {
             }
         }
     }
+    /// The underlying sink, for reading what it recorded (for example the
+    /// first write failure a `BoxedWriter` kept).
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.writer
+    }
 
     /// Get the inner writer back
     ///

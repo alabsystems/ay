@@ -226,6 +226,32 @@ impl RebuildWalk<'_, '_> {
                 }
                 return true;
             }
+            AndDistinctKind::EqFlip => {
+                let Some(&conjunct) = conjs.get(*position) else {
+                    return false;
+                };
+                let (pivot, bridge) =
+                    self.executor
+                        .add_eq_flip_bridge(&mut self.state.new_proof, unit.raw, conjunct);
+                emitted.push(self.state.new_proof.add_resolution(
+                    vec![conjunct],
+                    pivot,
+                    raw_unit,
+                    bridge,
+                ));
+            }
+            AndDistinctKind::Transport(plan) => {
+                let Some(&conjunct) = conjs.get(*position) else {
+                    return false;
+                };
+                emitted.push(self.executor.emit_conjunct_transport(
+                    &mut self.state.new_proof,
+                    raw_unit,
+                    unit.raw,
+                    conjunct,
+                    plan,
+                ));
+            }
             AndDistinctKind::OrPerm { lits } => {
                 let Some(&conjunct) = conjs.get(*position) else {
                     return false;

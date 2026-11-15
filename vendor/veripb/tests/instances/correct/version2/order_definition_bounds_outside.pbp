@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 2.0
+* Positive companion to incorrect/version2/order_definition_bounds: the same
+* optimisation instance with its true optimum. `x1 = 1, x2 = 0` is feasible
+* with objective value 1, and `1 x1 >= 1` -- the sum of the two constraints,
+* saturated -- bounds the objective below by 1.
+f 2
+sol x1 ~x2
+p 1 2 + s
+output NONE
+conclusion BOUNDS 1 1 : x1 ~x2
+end pseudo-Boolean proof

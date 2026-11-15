@@ -29,9 +29,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rayon::prelude::*;
-
-use crate::error::Result;
+use crate::error::{BisectError, Result};
 use crate::runner::{Expected, SolveResult, TrialRunner};
 
 /// Outcome classification used internally and exported via [`BisectResult`].
@@ -98,39 +96,34 @@ fn shrink(
     }
 
     let mid = current.len() / 2;
-    let (left, right) = current.split_at(mid);
+    let (left, right) = current.split_at_checked(mid).ok_or(BisectError::Internal {
+        message: "bisect midpoint exceeds the flag set length",
+    })?;
 
-    // Probe both halves in parallel. Collecting into `Result<Vec<_>>` short-
-    // circuits on the first error, so callers see the original runner error
-    // without having to unwrap indexed elements.
-    let left_vec = left.to_vec();
-    let right_vec = right.to_vec();
-    let probes: Vec<Vec<&'static str>> = vec![left_vec, right_vec];
-    let verdicts: Vec<TrialVerdict> = probes
-        .par_iter()
-        .map(|subset| trial(runner, subset.as_slice(), expected, trials))
-        .collect::<Result<Vec<_>>>()?;
-    let left_verdict = verdicts[0];
-    let right_verdict = verdicts[1];
+    // Probe both halves in parallel. `rayon::join` hands back each probe's
+    // own `Result`, so callers see the original runner error (left first)
+    // without indexing into a collected vector.
+    let (left_probe, right_probe) = rayon::join(
+        || trial(runner, left, expected, trials),
+        || trial(runner, right, expected, trials),
+    );
+    let left_verdict = left_probe?;
+    let right_verdict = right_probe?;
 
-    match (left_verdict, right_verdict) {
-        (TrialVerdict::Fixes, _) => {
-            // Left alone suffices — recurse into left.
-            shrink(runner, left, expected, trials)
-        }
-        (_, TrialVerdict::Fixes) => {
-            // Right alone suffices — recurse into right.
-            shrink(runner, right, expected, trials)
-        }
-        (TrialVerdict::DoesNotFix, TrialVerdict::DoesNotFix) => {
-            // Neither half is enough on its own: we need contributions from
-            // both halves. Minimise each half while keeping the other fixed.
-            let left_min = shrink_with_context(runner, left, right, expected, trials)?;
-            let right_min = shrink_with_context(runner, right, &left_min, expected, trials)?;
-            let mut combined = left_min;
-            combined.extend(right_min);
-            Ok(combined)
-        }
+    if matches!(left_verdict, TrialVerdict::Fixes) {
+        // Left alone suffices — recurse into left.
+        shrink(runner, left, expected, trials)
+    } else if matches!(right_verdict, TrialVerdict::Fixes) {
+        // Right alone suffices — recurse into right.
+        shrink(runner, right, expected, trials)
+    } else {
+        // Neither half is enough on its own: we need contributions from
+        // both halves. Minimise each half while keeping the other fixed.
+        let left_min = shrink_with_context(runner, left, right, expected, trials)?;
+        let right_min = shrink_with_context(runner, right, &left_min, expected, trials)?;
+        let mut combined = left_min;
+        combined.extend(right_min);
+        Ok(combined)
     }
 }
 
@@ -151,41 +144,51 @@ fn shrink_with_context(
     }
 
     let mid = focus.len() / 2;
-    let (left, right) = focus.split_at(mid);
+    let (left, right) = focus.split_at_checked(mid).ok_or(BisectError::Internal {
+        message: "bisect midpoint exceeds the flag set length",
+    })?;
 
-    let combined_left = combine(left, context);
-    let combined_right = combine(right, context);
-    let probes: Vec<Vec<&'static str>> = vec![combined_left, combined_right];
-    let verdicts: Vec<TrialVerdict> = probes
-        .par_iter()
-        .map(|subset| trial(runner, subset.as_slice(), expected, trials))
-        .collect::<Result<Vec<_>>>()?;
-    let left_verdict = verdicts[0];
-    let right_verdict = verdicts[1];
+    let combined_left = combine(left, context)?;
+    let combined_right = combine(right, context)?;
+    let (left_probe, right_probe) = rayon::join(
+        || trial(runner, &combined_left, expected, trials),
+        || trial(runner, &combined_right, expected, trials),
+    );
+    let left_verdict = left_probe?;
+    let right_verdict = right_probe?;
 
-    match (left_verdict, right_verdict) {
-        (TrialVerdict::Fixes, _) => shrink_with_context(runner, left, context, expected, trials),
-        (_, TrialVerdict::Fixes) => shrink_with_context(runner, right, context, expected, trials),
-        (TrialVerdict::DoesNotFix, TrialVerdict::DoesNotFix) => {
-            // Both halves contribute. Recurse on each, fixing the other +
-            // context.
-            let left_ctx: Vec<&'static str> = right.iter().chain(context.iter()).copied().collect();
-            let left_min = shrink_with_context(runner, left, &left_ctx, expected, trials)?;
-            let right_ctx: Vec<&'static str> =
-                left_min.iter().chain(context.iter()).copied().collect();
-            let right_min = shrink_with_context(runner, right, &right_ctx, expected, trials)?;
-            let mut combined = left_min;
-            combined.extend(right_min);
-            Ok(combined)
-        }
+    if matches!(left_verdict, TrialVerdict::Fixes) {
+        shrink_with_context(runner, left, context, expected, trials)
+    } else if matches!(right_verdict, TrialVerdict::Fixes) {
+        shrink_with_context(runner, right, context, expected, trials)
+    } else {
+        // Both halves contribute. Recurse on each, fixing the other +
+        // context.
+        let left_ctx: Vec<&'static str> = right.iter().chain(context.iter()).copied().collect();
+        let left_min = shrink_with_context(runner, left, &left_ctx, expected, trials)?;
+        let right_ctx: Vec<&'static str> = left_min.iter().chain(context.iter()).copied().collect();
+        let right_min = shrink_with_context(runner, right, &right_ctx, expected, trials)?;
+        let mut combined = left_min;
+        combined.extend(right_min);
+        Ok(combined)
     }
 }
 
-fn combine(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
+/// Concatenate `a` and `b` into a fresh probe set. The length sum is checked
+/// and the buffer is reserved fallibly, so an impossible size surfaces as a
+/// typed error instead of a panic or an abort.
+fn combine(a: &[&'static str], b: &[&'static str]) -> Result<Vec<&'static str>> {
+    let len = a.len().checked_add(b.len()).ok_or(BisectError::Internal {
+        message: "probe flag set length overflows usize",
+    })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| BisectError::Internal {
+            message: "probe flag set allocation failed",
+        })?;
     out.extend_from_slice(a);
     out.extend_from_slice(b);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

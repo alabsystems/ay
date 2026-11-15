@@ -27,6 +27,7 @@ pub(crate) use super::*;
 
 mod array_completion;
 mod array_witness_soundness;
+mod bv_array_delegation;
 mod cegar_array_signature;
 mod cegar_qfax_refinement;
 mod cert_default_row_key;
@@ -41,7 +42,9 @@ mod dt_opaque_completion_scope;
 mod dt_opaque_parser_scope;
 mod dt_opaque_resource_scope;
 mod dt_recursive_model_faithfulness;
+mod euf_datatype_constructor_aliases;
 mod eval_term_array_select;
+mod eval_term_array_select_ite;
 mod eval_term_bitvec_array;
 mod eval_term_bv_compound;
 mod eval_term_core;
@@ -52,10 +55,20 @@ mod eval_term_misc;
 mod eval_term_theory_validation;
 mod eval_term_validation_regressions;
 mod free_dt_array_residual_gate;
+mod gate_array_alias_order;
+mod gate_decision;
+mod ground_array_equality;
 mod ite_fixup;
+mod native_map_gate;
+mod nested_record_array_witness;
 mod no_fabricated_output;
+mod nonnullary_constructor_eval;
 mod projection_uf;
+mod published_model_agreement;
+mod select_asserted_equality_anchors;
 mod seq_array_uf_def;
+mod structured_datatype_completion;
+mod typed_array_read_residual;
 mod uflia_uninterp_eq;
 
 // ==========================================================================
@@ -70,6 +83,7 @@ pub(super) fn empty_model() -> Model {
         term_to_var: HashMap::default(),
         bool_overrides: HashMap::default(),
         euf_model: None,
+        materialized_scalar_functions: Default::default(),
         array_model: None,
         lra_model: None,
         lia_model: None,
@@ -82,9 +96,14 @@ pub(super) fn empty_model() -> Model {
         certified_const_interps: CertifiedConstInterpModel::default(),
         formula_neutral_function_defaults: FormulaNeutralFunctionDefaults::default(),
         completed_values: HashMap::default(),
+        field_assignments: Default::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),
         dt_array_field_classes: Vec::new(),
+        residual_arrays: None,
+        functional_arrays: None,
+        _scalar_candidate_memory: None,
+        construction_owner: None,
     }
 }
 
@@ -121,6 +140,7 @@ pub(super) fn model_with_sat_assignments(assignments: &[(TermId, bool)]) -> Mode
         term_to_var,
         bool_overrides: HashMap::default(),
         euf_model: None,
+        materialized_scalar_functions: Default::default(),
         array_model: None,
         lra_model: None,
         lia_model: None,
@@ -133,8 +153,13 @@ pub(super) fn model_with_sat_assignments(assignments: &[(TermId, bool)]) -> Mode
         certified_const_interps: CertifiedConstInterpModel::default(),
         formula_neutral_function_defaults: FormulaNeutralFunctionDefaults::default(),
         completed_values: HashMap::default(),
+        field_assignments: Default::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),
         dt_array_field_classes: Vec::new(),
+        residual_arrays: None,
+        functional_arrays: None,
+        _scalar_candidate_memory: None,
+        construction_owner: None,
     }
 }

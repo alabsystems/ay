@@ -129,8 +129,11 @@ fn flat_surface_and_pos_handles_strings_and_standard_quoted_symbols_in_real_expo
     );
 }
 
+/// D7 (2026-09-22): a Z3-escaped symbol renders in AY's lossless escape
+/// spelling, and the surface verdict discloses that pinned Carcara rejects
+/// that spelling — the document is no longer refused at the printer.
 #[test]
-fn flat_surface_and_pos_rejects_z3_escaped_symbol_before_publication() {
+fn flat_surface_and_pos_renders_z3_escaped_symbol_and_discloses_unsupported_surface() {
     let mut terms = TermStore::new();
     let escaped = terms.mk_var("a|b\\c", Sort::Bool);
     let p = terms.mk_var("flat_and_escaped_p", Sort::Bool);
@@ -144,10 +147,18 @@ fn flat_surface_and_pos_rejects_z3_escaped_symbol_before_publication() {
         vec![source],
     );
 
-    assert!(matches!(
-        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[source], None),
-        Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
-    ));
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[source], None)
+            .expect("an escaped symbol renders in the lossless AY spelling");
+    assert!(output.contains(r"|a\|b\\c|"), "{output}");
+    let surface = crate::carcara_proof_surface(&proof, &terms, None);
+    assert!(
+        surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains(r"symbol `a|b\c`")),
+        "{surface}"
+    );
+    assert!(!surface.is_supported());
 }
 
 #[test]

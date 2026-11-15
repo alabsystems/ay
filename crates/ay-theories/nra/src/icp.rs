@@ -155,6 +155,26 @@ const MAX_BOXES: usize = 2048;
 /// collapses the box in a handful of contractions).
 const PIN_SEARCH_MAX_BOXES: usize = 128;
 
+/// Widest-variable root depth (bisections to `MIN_WIDTH`, in bits) above
+/// which the main tree is capped to [`WIDE_TREE_MAX_BOXES`].
+///
+/// Exhaustive refutation of one variable spanning `2^200 * MIN_WIDTH`
+/// (QF_UFNRA sqrtStep: `x` in `[1, ~7.3e59]`) needs ~215 bisection
+/// levels on that axis alone, so within [`MAX_BOXES`] the tree can
+/// only descend and re-descend: measured at 96.7% of a 12 s sampling
+/// profile (8,736/9,163 samples in `branch_and_prune`) while every
+/// call returns `Unknown`. Shallow contraction refutation — the only
+/// verdict such a tree could plausibly reach — is retained through
+/// the smaller probe budget; anything deeper was already
+/// budget-exhausted `Unknown`. The threshold sits far above any
+/// geometry-scale box (width `2^112` at `MIN_WIDTH = 2^-16`).
+const WIDE_VAR_DEPTH_BITS: i64 = 128;
+
+/// Main-tree box budget when the widest root variable exceeds
+/// [`WIDE_VAR_DEPTH_BITS`]: a shallow-contraction probe at the
+/// pin-search scale.
+const WIDE_TREE_MAX_BOXES: usize = 128;
+
 /// Total pinned (pin-variable, pin-value) attempts per call. Sized so a
 /// typical pinned system exhausts its pin-variable choices against the whole
 /// [`PIN_VALUE_LADDER`] rather than truncating the ladder after the first few
@@ -357,6 +377,30 @@ fn interval_width(iv: &Interval) -> Option<BigRational> {
         (Endpoint::Finite(l, _), Endpoint::Finite(h, _)) => Some(h - l),
         _ => None,
     }
+}
+
+/// Approximate bisection depth of the widest finite root interval:
+/// `max` over variables of `ceil(log2(width / MIN_WIDTH))`, from
+/// numerator/denominator bit lengths (exact within one bit, no float).
+/// Variables without a finite width are skipped — the tree clamps them
+/// to `2^UNBOUNDED_CLAMP_LOG2`, a depth of ~36. Returns 0 when no
+/// variable has a finite width.
+fn widest_root_depth_bits(vars: &[TermId], root: &VarBox) -> i64 {
+    let mut widest = 0i64;
+    for &var in vars {
+        let Some(interval) = root.get(&var) else {
+            continue;
+        };
+        let Some(width) = interval_width(interval) else {
+            continue;
+        };
+        let depth = i64::try_from(width.numer().bits()).unwrap_or(i64::MAX)
+            - i64::try_from(width.denom().bits()).unwrap_or(0)
+            + i64::from(-MIN_WIDTH_LOG2)
+            + 1;
+        widest = widest.max(depth);
+    }
+    widest
 }
 
 /// Midpoint of a finite interval.
@@ -1410,6 +1454,7 @@ impl NraSolver<'_> {
     /// polynomial systems. SAT requires an exact model or existence certificate;
     /// UNSAT requires exhaustive refutation of the complete search region.
     pub(crate) fn try_icp_branch_and_prune(&self) -> UniResult {
+        self.icp_call_count.set(self.icp_call_count.get() + 1);
         let problem = match self.prepare_icp_problem() {
             ProblemPreparation::Ready(problem) => problem,
             ProblemPreparation::Decided(result) => return result,
@@ -1457,13 +1502,30 @@ impl NraSolver<'_> {
             }
         }
 
+        // Wide-box cap (see WIDE_VAR_DEPTH_BITS): past that depth the
+        // full budget only re-descends one axis toward a refutation it
+        // arithmetically cannot finish, so probe shallowly instead.
+        let root_depth = widest_root_depth_bits(&problem.vars, &root);
+        let tree_budget = if root_depth > WIDE_VAR_DEPTH_BITS {
+            self.icp_wide_tree_cap_count
+                .set(self.icp_wide_tree_cap_count.get() + 1);
+            diag!(
+                "NRA-DIAG wide_tree_cap depth={} budget={}",
+                root_depth,
+                WIDE_TREE_MAX_BOXES
+            );
+            WIDE_TREE_MAX_BOXES
+        } else {
+            MAX_BOXES
+        };
         let result = self.branch_and_prune(
             &problem.constraints,
             &problem.vars,
             root.clone(),
             problem.coverage,
             SearchAuthority::Exhaustive,
-            MAX_BOXES,
+            tree_budget,
+            &self.icp_main_box_count,
         );
         diag!(
             "NRA-DIAG tree={} all_parsed={}",
@@ -1540,6 +1602,7 @@ impl NraSolver<'_> {
         coverage: ParseCoverage,
         mut authority: SearchAuthority,
         max_boxes: usize,
+        box_counter: &std::cell::Cell<u64>,
     ) -> UniResult {
         if coverage.allows_sat() {
             if let Some(result) = self.ladder_model(vars, &root) {
@@ -1554,7 +1617,12 @@ impl NraSolver<'_> {
 
         while let Some(mut bx) = stack.pop() {
             processed += 1;
-            if processed > max_boxes {
+            box_counter.set(box_counter.get() + 1);
+            // A stopped check ends the traversal like a spent box budget: not
+            // exhaustive, so never UNSAT. The box budget bounds nodes, not
+            // time (QF_NRA meti-tarski `atan-vega-3` under a 1 s per-check
+            // `:timeout` spent over a second here after the deadline).
+            if processed > max_boxes || ay_core::resource::check_stop_requested() {
                 exhaustive = false;
                 break;
             }
@@ -2161,6 +2229,7 @@ impl NraSolver<'_> {
                     ParseCoverage::Complete,
                     SearchAuthority::SatOnly,
                     PIN_SEARCH_MAX_BOXES,
+                    &self.icp_pin_box_count,
                 ) {
                     UniResult::Sat(model) => return Some(UniResult::Sat(model)),
                     UniResult::SatAlgebraic(w) => return Some(UniResult::SatAlgebraic(w)),

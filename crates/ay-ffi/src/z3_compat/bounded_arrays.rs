@@ -88,8 +88,8 @@
 use ay_dpll::api::{Sort, Term, TermKind};
 
 use super::{
-    bounded_sort_hi, finite_set_engine_public_sort, lookup_ast_sort, sort_mentions_finite_set,
-    term_to_ast, Z3Context,
+    bounded_sort_hi, engine_pub, finite_set_engine_public_sort, sort_mentions_finite_set,
+    stated_sort, Z3Context,
 };
 
 /// Subterm visits allowed to one canonicity scan before it fails closed.
@@ -209,9 +209,11 @@ fn selected_array_at(ctx: &Z3Context, term: Term, index: Term) -> Option<Term> {
 }
 
 /// Public sort of an array operand, preferring the recorded public sort over
-/// the (Char-erased) engine sort.
+/// the (Char-erased) engine sort: the sort stated for the node the term reads
+/// as.
 fn public_array_sort(ctx: &Z3Context, array: Term) -> Option<Sort> {
-    lookup_ast_sort(ctx, term_to_ast(ctx, array)).cloned()
+    let node = engine_pub(ctx, array)?;
+    stated_sort(ctx, node).cloned()
 }
 
 /// Whether `index` provably ranges inside `[0, hi]`.

@@ -618,6 +618,91 @@ fn test_storecomm_deep_extensionality_witness_no_false_sat() {
     );
 }
 
+/// Two same-base store chains whose write sets differ at exactly one
+/// index (chain A never writes i6, chain B does) must admit the
+/// extensionality-witness model: selects at the Skolem index differ.
+/// Verdict pin for the alias-explanation prune in
+/// `explain_distinct_select_aliases` (explanation choice must remain
+/// sound on the minimized storecomm shape).
+#[test]
+fn test_storecomm_singleton_difference_witness_is_sat() {
+    let input = r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun a1 () (Array Int Int))
+        (declare-fun a_0 () (Array Int Int))
+        (declare-fun a_1 () (Array Int Int))
+        (declare-fun a_2 () (Array Int Int))
+        (declare-fun a_3 () (Array Int Int))
+        (declare-fun a_4 () (Array Int Int))
+        (declare-fun a_5 () (Array Int Int))
+        (declare-fun b_0 () (Array Int Int))
+        (declare-fun b_1 () (Array Int Int))
+        (declare-fun b_2 () (Array Int Int))
+        (declare-fun b_3 () (Array Int Int))
+        (declare-fun b_4 () (Array Int Int))
+        (declare-fun b_5 () (Array Int Int))
+        (declare-fun i1 () Int)
+        (declare-fun i2 () Int)
+        (declare-fun i3 () Int)
+        (declare-fun i4 () Int)
+        (declare-fun i5 () Int)
+        (declare-fun i6 () Int)
+        (declare-fun e1 () Int)
+        (declare-fun e2 () Int)
+        (declare-fun e3 () Int)
+        (declare-fun e4 () Int)
+        (declare-fun e5 () Int)
+        (declare-fun e6 () Int)
+        (declare-fun w () Int)
+        (declare-fun x () Int)
+        (declare-fun y () Int)
+        (declare-fun sk ((Array Int Int) (Array Int Int)) Int)
+        (assert (= a_0 (store a1 i1 e1)))
+        (assert (= a_1 (store a_0 i2 e2)))
+        (assert (= a_2 (store a_1 i3 e3)))
+        (assert (= a_3 (store a_2 i4 e4)))
+        (assert (= a_4 (store a_3 i5 e5)))
+        (assert (= a_5 (store a_4 i1 e1)))
+        (assert (= b_0 (store a1 i1 e1)))
+        (assert (= b_1 (store b_0 i3 e3)))
+        (assert (= b_2 (store b_1 i5 e5)))
+        (assert (= b_3 (store b_2 i2 e2)))
+        (assert (= b_4 (store b_3 i4 e4)))
+        (assert (= b_5 (store b_4 i6 e6)))
+        (assert (= x (select a_5 w)))
+        (assert (= y (select b_5 w)))
+        (assert (= w (sk a_5 b_5)))
+        (assert (not (= i1 i2)))
+        (assert (not (= i1 i3)))
+        (assert (not (= i1 i4)))
+        (assert (not (= i1 i5)))
+        (assert (not (= i1 i6)))
+        (assert (not (= i2 i3)))
+        (assert (not (= i2 i4)))
+        (assert (not (= i2 i5)))
+        (assert (not (= i2 i6)))
+        (assert (not (= i3 i4)))
+        (assert (not (= i3 i5)))
+        (assert (not (= i3 i6)))
+        (assert (not (= i4 i5)))
+        (assert (not (= i4 i6)))
+        (assert (not (= i5 i6)))
+        (assert (not (= x y)))
+        (check-sat)
+    "#;
+
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+
+    assert_eq!(
+        outputs[0], "sat",
+        "singleton-difference storecomm witness shape must be sat"
+    );
+}
+
 /// QF_AUFBV soundness regression: store(const(false), P, true)[P] must be true.
 ///
 /// Formula: P = bv0, V = store(const_array(false), P, true), assert not(select(V, P)).
@@ -1202,6 +1287,101 @@ fn test_nested_array_dependent_unsat_uses_strict_full_problem_authority() {
         exec.last_command_unsat_was_strictly_verified(),
         "the satisfiable residue cannot authorize this nested-array-dependent refutation"
     );
+}
+
+/// Solve `input` in the shed posture (`--rigor fast`, `--no-proof`,
+/// `--z3-mode`): no search-time proof, so the quarantine's strict full-problem
+/// proof rung has nothing to check. Returns the first verdict and the
+/// `unknown.phase` statistic.
+fn solve_one_shed(input: &str) -> (String, Option<String>) {
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    exec.set_competition_mode(true);
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    let phase = exec
+        .statistics()
+        .get_string("unknown.phase")
+        .map(str::to_string);
+    (outputs[0].clone(), phase)
+}
+
+/// The congruence refutation behind the array-to-UF abstraction rung.
+const NESTED_ARRAY_CONGRUENCE_UNSAT: &str = r#"
+    (declare-const u (Array Int (Array Int Int)))
+    (declare-const v (Array Int Int))
+    (declare-const w (Array Int Int))
+    (assert (= (select u 0) v))
+    (assert (= (select u 0) w))
+    (assert (not (= v w)))
+    (check-sat)
+"#;
+
+/// #nested-array-uf-abstraction: in the shed posture this used to answer
+/// `unknown` / `array-combination-quarantine` although z3 refutes it and the
+/// default posture publishes it on a strict proof. `v = (select u 0) = w`
+/// contradicts `v != w` by congruence alone, so the checked array-to-UF
+/// abstraction rung (`check_sat/nested_array_uf_abstraction.rs`) refutes the
+/// abstraction under a checked certificate and the quarantine retains the
+/// verdict.
+#[test]
+fn test_nested_array_congruence_unsat_publishes_in_shed_posture() {
+    let (verdict, phase) = solve_one_shed(NESTED_ARRAY_CONGRUENCE_UNSAT);
+    assert_eq!(
+        verdict, "unsat",
+        "the congruence refutation needs no array axiom (phase {phase:?})"
+    );
+}
+
+/// The satisfiable siblings: dropping the disequality, or one of the two
+/// equalities, leaves a problem z3 answers `sat`. Neither may become `unsat`.
+#[test]
+fn test_nested_array_congruence_sat_siblings_stay_sat_in_shed_posture() {
+    for input in [
+        r#"
+        (declare-const u (Array Int (Array Int Int)))
+        (declare-const v (Array Int Int))
+        (declare-const w (Array Int Int))
+        (assert (= (select u 0) v))
+        (assert (= (select u 0) w))
+        (check-sat)
+        "#,
+        r#"
+        (declare-const u (Array Int (Array Int Int)))
+        (declare-const v (Array Int Int))
+        (declare-const w (Array Int Int))
+        (assert (= (select u 0) v))
+        (assert (not (= v w)))
+        (check-sat)
+        "#,
+    ] {
+        assert_eq!(solve_one_shed(input).0, "sat", "{input}");
+    }
+}
+
+/// #nested-array-checked-rung RE-PIN (was `..._stays_quarantined_in_shed_posture`,
+/// the rung's negative control while it appended no axiom): nested read-over-write.
+/// The abstraction now carries the checked instance `(select' (store' u i v) i) = v`,
+/// so `i = j` refutes it on a strict proof and the shed posture publishes (z3:
+/// `unsat`). The negative control is now an UNSAT needing outer extensionality:
+/// `nested_array_uf_abstraction::tests::instance::an_extensionality_refutation_stays_withheld`.
+#[test]
+fn test_nested_array_row_dependent_unsat_publishes_on_a_checked_instance() {
+    let (verdict, phase) = solve_one_shed(
+        r#"
+        (declare-const u (Array Int (Array Int Int)))
+        (declare-const v (Array Int Int))
+        (declare-const w (Array Int Int))
+        (declare-const i Int)
+        (declare-const j Int)
+        (assert (= (select (store u i v) j) w))
+        (assert (= i j))
+        (assert (not (= v w)))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(verdict, "unsat", "phase {phase:?}");
 }
 
 /// The same authorization boundary covers `check-sat-assuming`. A direct

@@ -16,14 +16,16 @@ impl BvSolver<'_> {
     }
 
     pub(super) fn and_children_of(&self, lit: CnfLit) -> Option<(CnfLit, CnfLit)> {
-        self.and_children.get(&lit.abs()).copied()
+        // `checked_abs` is `abs` on every literal; `i32::MIN` is no variable's
+        // literal, so it has no AND children.
+        self.and_children.get(&lit.checked_abs()?).copied()
     }
 
     pub(super) fn simplify_and_level1(&mut self, a: CnfLit, b: CnfLit) -> Option<CnfLit> {
         if a == b {
             return Some(a);
         }
-        if a == -b {
+        if a == neg_lit(b) {
             return Some(self.fresh_false());
         }
         if self.is_known_true(a) {
@@ -48,16 +50,16 @@ impl BvSolver<'_> {
         let (a, b) = left;
         let (c, d) = right;
 
-        if a == c && b == -d {
+        if a == c && b == neg_lit(d) {
             return Some(a);
         }
-        if a == d && b == -c {
+        if a == d && b == neg_lit(c) {
             return Some(a);
         }
-        if b == c && a == -d {
+        if b == c && a == neg_lit(d) {
             return Some(b);
         }
-        if b == d && a == -c {
+        if b == d && a == neg_lit(c) {
             return Some(b);
         }
         None
@@ -71,7 +73,7 @@ impl BvSolver<'_> {
         if (a < 0) == (b < 0) {
             Some(common)
         } else {
-            Some(-common)
+            Some(neg_lit(common))
         }
     }
 
@@ -85,30 +87,30 @@ impl BvSolver<'_> {
 
         if other == x {
             return Some(if and_is_negated {
-                self.mk_or(-x, y)
+                self.mk_or(neg_lit(x), y)
             } else {
-                self.mk_and(x, -y)
+                self.mk_and(x, neg_lit(y))
             });
         }
         if other == y {
             return Some(if and_is_negated {
-                self.mk_or(x, -y)
+                self.mk_or(x, neg_lit(y))
             } else {
-                self.mk_and(-x, y)
+                self.mk_and(neg_lit(x), y)
             });
         }
-        if other == -x {
+        if other == neg_lit(x) {
             return Some(if and_is_negated {
-                self.mk_and(x, -y)
+                self.mk_and(x, neg_lit(y))
             } else {
-                self.mk_or(-x, y)
+                self.mk_or(neg_lit(x), y)
             });
         }
-        if other == -y {
+        if other == neg_lit(y) {
             return Some(if and_is_negated {
-                self.mk_and(-x, y)
+                self.mk_and(neg_lit(x), y)
             } else {
-                self.mk_or(x, -y)
+                self.mk_or(x, neg_lit(y))
             });
         }
 

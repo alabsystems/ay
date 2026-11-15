@@ -12,6 +12,12 @@
 
 #![allow(clippy::upper_case_acronyms)]
 
+mod counted;
+pub(crate) mod counted_analysis;
+mod counted_backtrack;
+mod counted_selection;
+pub(crate) use counted_backtrack::BacktrackReservation;
+
 use crate::literal::Variable;
 
 use self::bucket_queue::BucketQueue;
@@ -126,6 +132,8 @@ pub(crate) struct VSIDS {
     /// (vmtf_prev/vmtf_next) is stale. Must be resolved via
     /// `rebuild_vmtf_from_bump_order()` before arena compaction or mode switch.
     vmtf_deferred: bool,
+    /// `--sat-queue-freeze-kissat`: stable bumps leave the queue alone.
+    queue_freeze: bool,
 
     // Bucket queue for IC3 domain-restricted queries (#8476)
     /// O(1) amortized variable selection queue for small domain-restricted
@@ -318,6 +326,7 @@ impl VSIDS {
             vmtf_unassigned,
             vmtf_unassigned_bumped,
             vmtf_deferred: false,
+            queue_freeze: ay_core::sat_ab_switches().queue_freeze_kissat == Some(true),
             bucket_queue: BucketQueue::new(),
         }
     }
@@ -396,10 +405,31 @@ impl VSIDS {
     /// calls `rebuild_vmtf_from_bump_order()` to restore list consistency.
     /// This eliminates ~5 scattered cache-line writes per analyzed variable
     /// per conflict in stable mode.
+    /// Score + queue bump without the deferred-list side effect: EVSIDS
+    /// score bump followed by the full queue bump (bump_order + move to
+    /// front), leaving queue order and `bump_order` mutually consistent.
+    ///
+    /// For heuristic-agnostic single-variable boosts
+    /// (`Solver::bump_variable_activity`). The previous implementation
+    /// composed `bump(stable=true)` + `bump(stable=false)`, whose first
+    /// half set `vmtf_deferred` permanently (until a restart rebuild) even
+    /// though the second half restored list order — measured on Certora
+    /// QF_UFDTLIA, theory-conflict activity bumps disabled the VMTF queue
+    /// walk for ~70% of frontier decisions. Relative bump order is
+    /// preserved: the counter is monotonic per bump event either way.
+    #[inline]
+    pub(crate) fn bump_score_and_queue(&mut self, var: Variable, vals: &[i8]) {
+        self.bump_score(var);
+        self.bump_queue(var, vals);
+    }
+
     #[inline]
     pub(crate) fn bump(&mut self, var: Variable, vals: &[i8], stable: bool) {
         if stable {
             self.bump_score(var);
+            if self.queue_freeze {
+                return;
+            }
             // Lightweight VMTF maintenance: update bump_order + counter (2 writes)
             // but skip linked-list manipulation. The deferred flag signals that
             // the list needs rebuilding before arena compaction or mode switch.
@@ -432,8 +462,21 @@ impl VSIDS {
     ///
     /// Reference: Issue #8350 — batch VSIDS/CHB score updates.
     pub(crate) fn batch_bump(&mut self, vars: &[usize], vals: &[i8], stable: bool) {
+        match self.batch_bump_admitted(vars, vals, stable, &counted_analysis::HeapOrdinary) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+
+    pub(in crate::vsids) fn batch_bump_admitted<P: counted_analysis::HeapPolicy>(
+        &mut self,
+        vars: &[usize],
+        vals: &[i8],
+        stable: bool,
+        policy: &P,
+    ) -> Result<(), P::Error> {
         if vars.is_empty() {
-            return;
+            return Ok(());
         }
 
         if stable {
@@ -468,6 +511,9 @@ impl VSIDS {
 
                 // Deferred VMTF maintenance: bump_order + cursor only
                 // (O(1) writes, no linked-list manipulation; #7998).
+                if self.queue_freeze {
+                    continue;
+                }
                 self.bump_order[idx] = self.bump_counter;
                 self.bump_counter += 1;
                 if vals[idx * 2] == 0 {
@@ -494,8 +540,8 @@ impl VSIDS {
                 );
             }
 
-            self.repair_heap_after_evsids_batch(update, vars);
-            self.vmtf_deferred = true;
+            self.repair_heap_after_evsids_batch_admitted(update, vars, policy)?;
+            self.vmtf_deferred |= !self.queue_freeze;
         } else {
             // VMTF mode: insertion order matters for recency ranking.
             // Caller must provide variables sorted by ascending bump_order.
@@ -503,6 +549,7 @@ impl VSIDS {
                 self.bump_queue(Variable(idx as u32), vals);
             }
         }
+        Ok(())
     }
 
     /// VMTF batch bump from pre-sorted `(old bump_order, var index)` pairs.
@@ -526,6 +573,9 @@ impl VSIDS {
     /// `bump()`: O(1) writes, no linked-list manipulation.
     #[inline]
     pub(crate) fn bump_vmtf_order_only(&mut self, var: Variable, vals: &[i8]) {
+        if self.queue_freeze {
+            return;
+        }
         let idx = var.index();
         self.bump_order[idx] = self.bump_counter;
         self.bump_counter += 1;
@@ -544,66 +594,6 @@ impl VSIDS {
     #[inline]
     pub(crate) fn vmtf_is_deferred(&self) -> bool {
         self.vmtf_deferred
-    }
-
-    /// Rebuild the VMTF linked list from bump_order values.
-    ///
-    /// Called before arena compaction or when switching from stable to focused
-    /// mode, to restore VMTF list consistency after deferred stable-mode bumps.
-    /// Cost: O(n log n) for the sort, but runs infrequently.
-    pub(crate) fn rebuild_vmtf_from_bump_order(&mut self, vals: &[i8]) {
-        if !self.vmtf_deferred {
-            return;
-        }
-        let n = self.activities.len();
-        if n == 0 {
-            self.vmtf_deferred = false;
-            return;
-        }
-
-        // Sort variables by ascending bump_order (oldest first -> newest last).
-        let mut vars_by_order: Vec<u32> = (0..n as u32).collect();
-        vars_by_order.sort_unstable_by_key(|&v| self.bump_order[v as usize]);
-
-        // Rebuild doubly-linked list.
-        self.vmtf_first = INVALID_VAR;
-        self.vmtf_last = INVALID_VAR;
-        self.vmtf_prev.fill(INVALID_VAR);
-        self.vmtf_next.fill(INVALID_VAR);
-
-        for (i, &var) in vars_by_order.iter().enumerate() {
-            if i == 0 {
-                self.vmtf_first = var;
-                self.vmtf_prev[var as usize] = INVALID_VAR;
-            } else {
-                let prev = vars_by_order[i - 1];
-                self.vmtf_prev[var as usize] = prev;
-                self.vmtf_next[prev as usize] = var;
-            }
-            self.vmtf_next[var as usize] = INVALID_VAR;
-        }
-        if let Some(&last) = vars_by_order.last() {
-            self.vmtf_last = last;
-        }
-
-        // Reset unassigned cursor to the most recently bumped unassigned variable.
-        self.vmtf_unassigned = INVALID_VAR;
-        self.vmtf_unassigned_bumped = 0;
-        // Walk from newest (vmtf_last) to oldest to find highest-bumped unassigned.
-        let mut cur = self.vmtf_last;
-        while cur != INVALID_VAR {
-            if vals[cur as usize * 2] == 0 && !self.buried[cur as usize] {
-                self.vmtf_unassigned = cur;
-                self.vmtf_unassigned_bumped = self.bump_order[cur as usize];
-                break;
-            }
-            cur = self.vmtf_prev[cur as usize];
-        }
-
-        self.vmtf_deferred = false;
-
-        #[cfg(debug_assertions)]
-        self.debug_assert_vmtf_consistent();
     }
 
     /// Decay all activities
@@ -765,6 +755,16 @@ impl VSIDS {
     #[inline]
     pub(crate) fn bump_order(&self, var: Variable) -> u64 {
         self.bump_order[var.index()]
+    }
+
+    /// Bumps issued since `var` was last bumped (0 = most recent bump).
+    /// Never-bumped original variables start at `num_vars + 1 - stamp`,
+    /// so their age grows from a small offset; sampled relevance buckets
+    /// use a wide threshold where that offset is negligible.
+    #[inline]
+    pub(crate) fn bump_age(&self, var: Variable) -> u64 {
+        self.bump_counter
+            .saturating_sub(self.bump_order[var.index()])
     }
 
     /// Notify the VMTF queue that `var` became unassigned (during backtracking).
@@ -1126,7 +1126,6 @@ impl VSIDS {
 }
 
 #[cfg(test)]
+mod queue_freeze_tests;
+#[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod verification;

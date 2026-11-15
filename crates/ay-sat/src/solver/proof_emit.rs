@@ -45,7 +45,28 @@ use std::io;
 
 use super::Solver;
 
+static EMISSION_TRIAGE_TARGET: std::sync::OnceLock<Option<Vec<i64>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+mod counted_triage_tests;
+
+fn counted_triage_inactive(target: &std::sync::OnceLock<Option<Vec<i64>>>) -> bool {
+    if let Some(cached) = target.get() {
+        return cached.is_none();
+    }
+    if !ay_core::captured_misc_cli_flags().is_some_and(|flags| flags.ab_triage_clause.is_none()) {
+        return false;
+    }
+    // Never parse a target or capture first-use environment inside an owner.
+    // A concurrent ordinary initializer may win with Some: that still refuses.
+    target.get_or_init(|| None).is_none()
+}
+
 impl Solver {
+    pub(in crate::solver) fn counted_emission_triage_inactive(&self) -> bool {
+        counted_triage_inactive(&EMISSION_TRIAGE_TARGET)
+    }
+
     /// Assert that proof mode has not changed mid-solve.
     ///
     /// `solve_proof_mode` is snapshotted at solve entry (`reset_search_state`).
@@ -100,6 +121,13 @@ impl Solver {
     /// - DRAT does not need the step at all, and its byte stream must stay
     ///   identical, so nothing is emitted there.
     pub(crate) fn proof_emit_level0_unit_for_lost_reason(&mut self, lit: Literal) {
+        self.proof_emit_level0_unit_supported(lit, None);
+    }
+
+    /// `proof_emit_level0_unit_for_lost_reason` with `support`, a live clause
+    /// deriving `lit` at root (the one about to be deleted), as the source of
+    /// its annotated-RUP hints when it is not `lit`'s reason edge.
+    fn proof_emit_level0_unit_supported(&mut self, lit: Literal, support: Option<&[Literal]>) {
         if self.cold.lrat_enabled || !self.proof_honors_strict_deletion() {
             return;
         }
@@ -128,12 +156,17 @@ impl Solver {
         {
             return;
         }
-        // `Derived` (not `TrustedTransform`): the unit is genuinely RUP here,
-        // so debug builds run it through the forward checker's RUP check
-        // rather than trusting it.
-        if self
-            .proof_emit_add(&[lit], &[], ProofAddKind::Derived)
-            .is_ok()
+        // `--sat-veripb-hints`: annotated from the reason about to be deleted
+        // (veripb_hints.rs); as a plain `red` unit the checker proved a goal
+        // for every clause holding the literal's negation (on
+        // aes_equiv_encry_3_rounds most of what its elaboration spent time on).
+        // Otherwise `Derived` (not `TrustedTransform`): the unit is genuinely
+        // RUP here, so debug builds run it through the forward checker's RUP
+        // check rather than trusting it.
+        if self.veripb_state_root_unit(lit, support)
+            || self
+                .proof_emit_add(&[lit], &[], ProofAddKind::Derived)
+                .is_ok()
         {
             if self.cold.veripb_stated_root_units.len() <= word {
                 self.cold.veripb_stated_root_units.resize(word + 1, 0);
@@ -192,7 +225,7 @@ impl Solver {
             return;
         }
         if let Some(lit) = self.root_derived_literal(clause) {
-            self.proof_emit_level0_unit_for_lost_reason(lit);
+            self.proof_emit_level0_unit_supported(lit, Some(clause));
         }
     }
 
@@ -221,6 +254,40 @@ impl Solver {
         true_lit
     }
 
+    /// Soundness-triage tripwire (--sat-ab-triage-clause "d1,d2,..." DIMACS
+    /// lits): dump the live DB, and the call stack that wrote it, the moment
+    /// this exact clause is emitted.
+    pub(super) fn triage_on_emission(&mut self, clause: &[Literal]) {
+        let target = EMISSION_TRIAGE_TARGET.get_or_init(|| {
+            ay_core::misc_cli_flags()
+                .ab_triage_clause
+                .as_deref()
+                .map(|s| {
+                    let mut v: Vec<i64> =
+                        s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                    v.sort_unstable();
+                    v
+                })
+        });
+        if target.is_some() {
+            let mut mine: Vec<i64> = clause
+                .iter()
+                .map(|l| {
+                    let v = i64::from(l.variable().0) + 1;
+                    if l.is_positive() {
+                        v
+                    } else {
+                        -v
+                    }
+                })
+                .collect();
+            mine.sort_unstable();
+            if target.as_ref() == Some(&mine) {
+                self.dump_live_db_for_triage("target_clause_emission");
+            }
+        }
+    }
+
     /// Emit a proof addition without mutating the forward checker.
     ///
     /// This is for call sites that already update checker state through a
@@ -233,46 +300,14 @@ impl Solver {
     /// The caller **must** route the same clause through
     /// `add_clause_db_checked` before the next `proof_emit_*` call.
     /// Debug builds enforce this via `pending_forward_check` (#4641).
+    #[track_caller]
     pub(crate) fn proof_emit_add_prechecked(
         &mut self,
         clause: &[Literal],
         hints: &[u64],
         kind: ProofAddKind,
     ) -> io::Result<u64> {
-        // Soundness-triage tripwire (--sat-ab-triage-clause "d1,d2,..." DIMACS
-        // lits): dump the live DB the moment this exact clause is emitted.
-        {
-            use std::sync::OnceLock;
-            static TARGET: OnceLock<Option<Vec<i64>>> = OnceLock::new();
-            let target = TARGET.get_or_init(|| {
-                ay_core::misc_cli_flags()
-                    .ab_triage_clause
-                    .as_deref()
-                    .map(|s| {
-                        let mut v: Vec<i64> =
-                            s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-                        v.sort_unstable();
-                        v
-                    })
-            });
-            if target.is_some() {
-                let mut mine: Vec<i64> = clause
-                    .iter()
-                    .map(|l| {
-                        let v = i64::from(l.variable().0) + 1;
-                        if l.is_positive() {
-                            v
-                        } else {
-                            -v
-                        }
-                    })
-                    .collect();
-                mine.sort_unstable();
-                if target.as_ref() == Some(&mine) {
-                    self.dump_live_db_for_triage("target_clause_emission");
-                }
-            }
-        }
+        self.triage_on_emission(clause);
         #[cfg(debug_assertions)]
         self.assert_proof_mode_stable();
 
@@ -283,11 +318,40 @@ impl Solver {
             self.cold.pending_forward_check
         );
 
-        let id = if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_add(clause, hints, kind)?
+        // proof-posture-parity (site C): after a compaction under a proof
+        // surface, proof lines carry external literals (`i2e`).
+        let proof_lits;
+        let proof_clause: &[Literal] = if self.cold.proof_vars_compacted {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            &proof_lits
         } else {
-            0
+            clause
         };
+        // `--sat-veripb-hints`: a derivation whose antecedents were named is
+        // written as annotated RUP (veripb_derived.rs), trusted transforms
+        // included: the ids are written only once they are checked to refute
+        // the clause's negation.
+        let hinted = if !matches!(kind, ProofAddKind::Axiom) {
+            self.veripb_emit_derived_hinted(clause, proof_clause)
+        } else {
+            self.veripb_drop_antecedents();
+            None
+        };
+        let id = match hinted {
+            Some(written) => {
+                written?;
+                0
+            }
+            None => {
+                self.note_unhinted_add();
+                if let Some(ref mut manager) = self.proof_manager {
+                    manager.emit_add(proof_clause, hints, kind)?
+                } else {
+                    0
+                }
+            }
+        };
+        self.note_proof_add();
 
         // Synchronize solver's clause ID counter with proof writer's ID space.
         // Without this, techniques that emit proof steps (proof_emit_add) BEFORE
@@ -317,6 +381,7 @@ impl Solver {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    #[track_caller]
     pub(crate) fn proof_emit_add_prechecked_with_decompose_context(
         &mut self,
         clause: &[Literal],
@@ -334,11 +399,21 @@ impl Solver {
             self.cold.pending_forward_check
         );
 
+        let proof_lits;
+        let proof_clause: &[Literal] = if self.cold.proof_vars_compacted {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            &proof_lits
+        } else {
+            clause
+        };
+        self.veripb_drop_antecedents();
+        self.note_unhinted_add();
         let id = if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_add_with_decompose_context(clause, hints, kind, context)?
+            manager.emit_add_with_decompose_context(proof_clause, hints, kind, context)?
         } else {
             0
         };
+        self.note_proof_add();
 
         if id != 0 && self.cold.next_clause_id <= id {
             self.cold.next_clause_id = id + 1;
@@ -358,6 +433,7 @@ impl Solver {
     /// 2. Emits the addition through `ProofManager` (if present).
     ///
     /// Returns the LRAT clause ID (or 0 if no proof output configured).
+    #[track_caller]
     pub(crate) fn proof_emit_add(
         &mut self,
         clause: &[Literal],
@@ -403,10 +479,11 @@ impl Solver {
     /// limits. Keeping this as a distinct funnel prevents ordinary empty
     /// clauses found during search from being mistaken for prevalidated
     /// backward output merely because bounded reconstruction is configured.
-    pub(crate) fn proof_emit_bounded_terminal_rup(
+    pub(crate) fn proof_emit_bounded_terminal_rup_with_cancellation(
         &mut self,
         hints: &[u64],
         deadline: Option<Instant>,
+        keep_going: &dyn Fn() -> bool,
     ) -> io::Result<u64> {
         #[cfg(debug_assertions)]
         self.assert_proof_mode_stable();
@@ -426,7 +503,7 @@ impl Solver {
         }
 
         let id = if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_bounded_empty_rup_step(hints, deadline)?
+            manager.emit_bounded_empty_rup_step_with_cancellation(hints, deadline, keep_going)?
         } else {
             0
         };
@@ -470,6 +547,7 @@ impl Solver {
     /// chain (`dsr-trim → drat/lsr → cake_lpr`) is the certificate-mode trust
     /// anchor. No-op when no proof manager is attached; in that mode soundness
     /// rests on the family recognizer and constructor before trusted insertion.
+    #[track_caller]
     pub(crate) fn proof_emit_add_sr(
         &mut self,
         clause: &[Literal],
@@ -497,13 +575,24 @@ impl Solver {
             checker.add_trusted_transform(clause);
         }
 
+        let (proof_lits, proof_witness);
+        let (proof_clause, proof_wit): (&[Literal], &[Literal]) = if self.cold.proof_vars_compacted
+        {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            proof_witness = self.externalize_lits_for_proof(witness);
+            (&proof_lits, &proof_witness)
+        } else {
+            (clause, witness)
+        };
+        self.note_unhinted_add();
         if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_add_sr(clause, witness)?;
+            manager.emit_add_sr(proof_clause, proof_wit)?;
         }
         Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    #[track_caller]
     pub(crate) fn proof_emit_add_with_decompose_context(
         &mut self,
         clause: &[Literal],
@@ -566,8 +655,15 @@ impl Solver {
             self.cold.pending_forward_check
         );
 
+        let proof_lits;
+        let proof_clause: &[Literal] = if self.cold.proof_vars_compacted {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            &proof_lits
+        } else {
+            clause
+        };
         let id = if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_add_signed_lrat_hints(clause, hints, kind)?
+            manager.emit_add_signed_lrat_hints(proof_clause, hints, kind)?
         } else {
             0
         };
@@ -585,6 +681,7 @@ impl Solver {
     /// This is the canonical pattern for inprocessing-derived units:
     /// emit the proof step, then record its LRAT clause ID so that
     /// `collect_level0_lrat_chain` can reference it in future derivations.
+    #[track_caller]
     pub(crate) fn proof_emit_unit(
         &mut self,
         unit: Literal,
@@ -609,6 +706,24 @@ impl Solver {
             }
         }
         proof_id
+    }
+
+    /// Optional collection can drop an arena row while its exact input proof
+    /// row remains live for a later rebuild. Required deletes never use this seam.
+    #[cfg(test)]
+    pub(super) fn proof_emit_delete_optional_gc(
+        &mut self,
+        clause: &[Literal],
+        clause_id: u64,
+    ) -> io::Result<()> {
+        if self
+            .proof_manager
+            .as_ref()
+            .is_some_and(|manager| manager.retainable_ledger_original_id(clause_id))
+        {
+            return Ok(());
+        }
+        self.proof_emit_delete(clause, clause_id)
     }
 
     /// Emit a proof deletion and forward-check the clause removal.
@@ -649,8 +764,15 @@ impl Solver {
             }
         }
 
+        let proof_lits;
+        let proof_clause: &[Literal] = if self.cold.proof_vars_compacted {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            &proof_lits
+        } else {
+            clause
+        };
         if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_delete(clause, clause_id)
+            manager.emit_delete(proof_clause, clause_id)
         } else {
             Ok(())
         }
@@ -681,11 +803,34 @@ impl Solver {
             }
         }
 
+        let proof_lits;
+        let proof_clause: &[Literal] = if self.cold.proof_vars_compacted {
+            proof_lits = self.externalize_lits_for_proof(clause);
+            &proof_lits
+        } else {
+            clause
+        };
         if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_delete_with_decompose_context(clause, clause_id, context)
+            manager.emit_delete_with_decompose_context(proof_clause, clause_id, context)
         } else {
             Ok(())
         }
+    }
+
+    /// Optional satisfied-arena collection retains only a live input proof row.
+    pub(super) fn proof_emit_delete_arena_optional_gc(
+        &mut self,
+        clause_idx: usize,
+        clause_id: u64,
+    ) -> io::Result<()> {
+        if self
+            .proof_manager
+            .as_ref()
+            .is_some_and(|manager| manager.retainable_ledger_original_id(clause_id))
+        {
+            return Ok(());
+        }
+        self.proof_emit_delete_arena(clause_idx, clause_id)
     }
 
     /// Like [`proof_emit_delete`] but reads literals directly from the arena,
@@ -716,11 +861,12 @@ impl Solver {
             let lits = self.arena.literals(clause_idx);
             let derived = if lits.len() >= 2 {
                 self.root_derived_literal(lits)
+                    .map(|lit| (lit, lits.to_vec()))
             } else {
                 None
             };
-            if let Some(lit) = derived {
-                self.proof_emit_level0_unit_for_lost_reason(lit);
+            if let Some((lit, support)) = derived {
+                self.proof_emit_level0_unit_supported(lit, Some(&support));
             }
         }
 
@@ -731,8 +877,16 @@ impl Solver {
             }
         }
 
+        let proof_lits = if self.cold.proof_vars_compacted {
+            Some(self.externalize_lits_for_proof(self.arena.literals(clause_idx)))
+        } else {
+            None
+        };
         if let Some(ref mut manager) = self.proof_manager {
-            let lits = self.arena.literals(clause_idx);
+            let lits = match proof_lits.as_deref() {
+                Some(ext) => ext,
+                None => self.arena.literals(clause_idx),
+            };
             manager.emit_delete(lits, clause_id)
         } else {
             Ok(())
@@ -784,6 +938,26 @@ impl Solver {
         // Store proof ID for both LRAT and clause-trace resolution chain
         // collection (#6368). Without this, collect_resolution_chain misses
         // unit clause antecedents when clause_trace is enabled but lrat is not.
+        if pid != 0 {
+            self.record_unit_proof_id_for_lit(unit, pid);
+        }
+        self.enqueue(unit, None);
+        if !self.var_lifecycle.is_inactive(unit.variable().index()) {
+            self.fixed_count += 1;
+            self.var_lifecycle.mark_fixed(unit.variable().index());
+            self.l0_gc_dirty[unit.variable().index()] = true;
+        }
+    }
+
+    /// Like [`Self::enqueue_derived_unit`] for a unit whose proof line was
+    /// already emitted (proof id `pid`, 0 when there is no proof surface):
+    /// clause DB, unit proof id, enqueue and fixed marking, but no emission.
+    /// Sweep uses it: backbone units are certified (core lemmas + RUP unit)
+    /// before the clause rewrites, while the clauses the lemmas rest on are
+    /// still in the checker's database.
+    pub(crate) fn enqueue_derived_unit_with_proof_id(&mut self, unit: Literal, pid: u64) {
+        let unit_idx = self.add_clause_db(&[unit], true);
+        self.mark_subsume_dirty_if_kept(unit_idx);
         if pid != 0 {
             self.record_unit_proof_id_for_lit(unit, pid);
         }

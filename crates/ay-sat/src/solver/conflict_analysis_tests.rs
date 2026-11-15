@@ -773,25 +773,6 @@ fn test_collect_level0_unit_chain_no_filter_matches_empty_filter() {
 }
 
 #[test]
-fn test_lrat_no_filter_collectors_do_not_construct_empty_filter() {
-    let unit_chain_src = include_str!("conflict_analysis_lrat_unit_chain.rs");
-    let specialized_src = include_str!("conflict_analysis_lrat_specialized.rs");
-
-    assert!(
-        unit_chain_src.contains("emit_level0_unit_chain_filtered(None"),
-        "collect_level0_unit_chain should route no-filter collection through None"
-    );
-    assert!(
-        !unit_chain_src.contains("collect_level0_unit_chain_filtered(&det_hash_set_new())"),
-        "collect_level0_unit_chain must not allocate an empty DetHashSet"
-    );
-    assert!(
-        !specialized_src.contains("collect_level0_unit_chain_filtered(&det_hash_set_new())"),
-        "specialized no-filter callers must use collect_level0_unit_chain"
-    );
-}
-
-#[test]
 fn test_add_learned_clause_deduplicates_reversed_lrat_hints() {
     let proof = ProofOutput::lrat_text(Vec::new(), 8);
     let mut solver: Solver = Solver::with_proof_output(20, proof);

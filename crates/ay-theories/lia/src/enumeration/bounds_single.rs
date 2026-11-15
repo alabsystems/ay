@@ -23,7 +23,7 @@ impl LiaSolver<'_> {
         debug: bool,
     ) {
         for &(literal, value) in &self.assertion_view().inequalities {
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
 

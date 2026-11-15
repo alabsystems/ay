@@ -7,6 +7,8 @@
 //! Display formatting is in `display.rs`. SmtValue comparison and array
 //! evaluation helpers are in `value_ops.rs`.
 
+mod array_equality;
+mod array_read;
 mod display;
 mod eval_bv;
 mod value_ops;
@@ -14,12 +16,13 @@ mod value_ops;
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::sync::Arc;
 
+use super::dag::eval_memo;
 use super::{maybe_grow_expr_stack, ChcExpr, ChcOp, ExprDepthGuard};
 use crate::bv_util::bv_mask;
 use crate::smt::SmtValue;
 use eval_bv::{
     big_bv_modulus, bigint_to_bv, eval_bv_ashr, eval_bv_big_val, eval_bv_binop, eval_bv_cmp,
-    eval_bv_signed_div, eval_bv_signed_rem, eval_bv_smod, eval_bv_val, BvBinOp, BvCmpOp,
+    eval_bv_operand, eval_bv_signed_div, eval_bv_signed_rem, eval_bv_smod, BvBinOp, BvCmpOp,
 };
 
 pub(crate) use value_ops::{eval_array_select, eval_int_big, eval_real_big, smt_values_equal};
@@ -269,10 +272,86 @@ fn eval_observed_uf_application(
 ///
 /// This is the single canonical evaluator for `ChcExpr`; all call sites in
 /// PDR verification, model verification, and cube extraction delegate here.
+/// Sort-aware model lookup (Rung 0, `crate::smt::sort_unique`).
+///
+/// A model is keyed by variable NAME, but one query can carry `J:Int` and
+/// `J:Bool`. The plain entry belongs to the rank-winning sort; the other sorts
+/// live under `name!<tag>`. Resolution: the plain entry when its value matches
+/// `v`'s sort (or the sort is not a checkable scalar), else the qualified
+/// entry, else whatever the plain entry holds (the pre-Rung-0 behavior, kept so
+/// models without qualified entries evaluate exactly as before).
+pub(crate) fn lookup_model_value<'m>(
+    model: &'m FxHashMap<String, SmtValue>,
+    v: &crate::ChcVar,
+) -> Option<&'m SmtValue> {
+    let plain = model.get(&v.name);
+    if let Some(value) = plain {
+        if value_matches_sort(value, &v.sort) != Some(false) {
+            return Some(value);
+        }
+    }
+    model.get(&v.sort_qualified_name()).or(plain)
+}
+
+/// `Some(true)` / `Some(false)` for scalar value/sort pairs, `None` when the
+/// pair is not one this check understands (arrays, datatypes, ...).
+fn value_matches_sort(value: &SmtValue, sort: &crate::ChcSort) -> Option<bool> {
+    use crate::ChcSort;
+    Some(match (value, sort) {
+        (SmtValue::Bool(_), ChcSort::Bool)
+        | (SmtValue::Int(_) | SmtValue::BigInt(_), ChcSort::Int)
+        | (SmtValue::Real(_), ChcSort::Real) => true,
+        (SmtValue::BitVec(_, w) | SmtValue::BigBitVec(_, w), ChcSort::BitVec(sw)) => w == sw,
+        (
+            SmtValue::Bool(_)
+            | SmtValue::Int(_)
+            | SmtValue::BigInt(_)
+            | SmtValue::Real(_)
+            | SmtValue::BitVec(..)
+            | SmtValue::BigBitVec(..),
+            ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_),
+        ) => false,
+        _ => return None,
+    })
+}
+
 pub(crate) fn evaluate_expr(
     expr: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
+    // Memoised per distinct node over shared DAGs (WP-F, `expr::dag::eval_memo`);
+    // the plain walk below recurses once per incoming edge.
+    eval_memo::memoised(
+        expr,
+        model,
+        eval_memo::EvalKind::Canonical,
+        eval_memo::wrap_value,
+        eval_memo::unwrap_value,
+        || evaluate_expr_plain(expr, model).or_else(|| real_arith_value(expr, model)),
+    )
+}
+
+/// The exact rational value of a Real-valued arithmetic term (`+ - * /`,
+/// negation, `ite`) the structural arms abstain on: they fold integers only,
+/// so `(+ 1.0 x)` over a Real `x` read `None` even when every leaf is
+/// assigned, and a ground derivation whose head argument is such a term could
+/// not be evaluated (sally LRA transition systems). [`eval_real_big`] is exact
+/// and abstains on division by zero; Int-only terms keep their i128 lanes.
+fn real_arith_value(expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) -> Option<SmtValue> {
+    let ChcExpr::Op(
+        ChcOp::Add | ChcOp::Sub | ChcOp::Mul | ChcOp::Neg | ChcOp::Div | ChcOp::Ite,
+        args,
+    ) = expr
+    else {
+        return None;
+    };
+    if !args.iter().any(|arg| arg.sort() == super::ChcSort::Real) {
+        return None;
+    }
+    eval_real_big(expr, model).map(SmtValue::Real)
+}
+
+fn evaluate_expr_plain(expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) -> Option<SmtValue> {
     maybe_grow_expr_stack(|| {
         ExprDepthGuard::check()?;
         match expr {
@@ -285,7 +364,7 @@ pub(crate) fn evaluate_expr(
             ChcExpr::Real(num, den) if *den != 0 && real_eval_enabled() => Some(SmtValue::Real(
                 num_rational::BigRational::new((*num).into(), (*den).into()),
             )),
-            ChcExpr::Var(v) => model.get(&v.name).cloned(),
+            ChcExpr::Var(v) => lookup_model_value(model, v).cloned(),
 
             // Boolean connectives
             ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
@@ -362,7 +441,11 @@ pub(crate) fn evaluate_expr(
                     evaluate_expr(&args[0], model),
                     evaluate_expr(&args[1], model),
                 ) {
-                    (Some(a), Some(b)) => Some(SmtValue::Bool(smt_values_equal(&a, &b)?)),
+                    (Some(a), Some(b)) => {
+                        Some(SmtValue::Bool(smt_values_equal(&a, &b).or_else(|| {
+                            array_equality::typed_array_equality(&args[0], &args[1], &a, &b)
+                        })?))
+                    }
                     // Real (LRA) lane: an operand is a Real arithmetic tree the
                     // generic evaluator cannot fold to a value. Compare exactly
                     // as rationals. Reached only when the generic path abstains.
@@ -377,7 +460,11 @@ pub(crate) fn evaluate_expr(
                     evaluate_expr(&args[0], model),
                     evaluate_expr(&args[1], model),
                 ) {
-                    (Some(a), Some(b)) => Some(SmtValue::Bool(!smt_values_equal(&a, &b)?)),
+                    (Some(a), Some(b)) => {
+                        Some(SmtValue::Bool(!smt_values_equal(&a, &b).or_else(|| {
+                            array_equality::typed_array_equality(&args[0], &args[1], &a, &b)
+                        })?))
+                    }
                     _ => real_eq(&args[0], &args[1], model, false),
                 }
             }
@@ -509,10 +596,11 @@ pub(crate) fn evaluate_expr(
                 eval_bv_smod(&args[0], &args[1], model)
             }
             ChcExpr::Op(ChcOp::BvNeg, args) if args.len() == 1 => {
-                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                let operand = eval_bv_operand(&args[0], model)?;
+                if let Some((v, w)) = operand.narrow() {
                     return Some(SmtValue::BitVec((!v).wrapping_add(1) & bv_mask(w), w));
                 }
-                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let (v, w) = operand.wide();
                 let result = if v == num_bigint::BigUint::from(0u8) {
                     v
                 } else {
@@ -541,10 +629,11 @@ pub(crate) fn evaluate_expr(
                 eval_bv_binop(&args[0], &args[1], model, BvBinOp::Xnor)
             }
             ChcExpr::Op(ChcOp::BvNot, args) if args.len() == 1 => {
-                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                let operand = eval_bv_operand(&args[0], model)?;
+                if let Some((v, w)) = operand.narrow() {
                     return Some(SmtValue::BitVec((!v) & bv_mask(w), w));
                 }
-                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let (v, w) = operand.wide();
                 Some(SmtValue::bitvec_from_biguint(
                     (big_bv_modulus(w) - num_bigint::BigUint::from(1u8)) ^ v,
                     w,
@@ -553,9 +642,9 @@ pub(crate) fn evaluate_expr(
 
             // BV shifts
             ChcExpr::Op(ChcOp::BvShl, args) if args.len() == 2 => {
-                if let (Some((av, aw)), Some((bv, bw))) =
-                    (eval_bv_val(&args[0], model), eval_bv_val(&args[1], model))
-                {
+                let lhs = eval_bv_operand(&args[0], model)?;
+                let rhs = eval_bv_operand(&args[1], model)?;
+                if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
                     if aw != bw {
                         return None;
                     }
@@ -566,8 +655,8 @@ pub(crate) fn evaluate_expr(
                     };
                     return Some(SmtValue::BitVec(result, aw));
                 }
-                let (av, aw) = eval_bv_big_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_big_val(&args[1], model)?;
+                let (av, aw) = lhs.wide();
+                let (bv, bw) = rhs.wide();
                 if aw != bw {
                     return None;
                 }
@@ -579,17 +668,17 @@ pub(crate) fn evaluate_expr(
                 Some(SmtValue::bitvec_from_biguint(result, aw))
             }
             ChcExpr::Op(ChcOp::BvLShr, args) if args.len() == 2 => {
-                if let (Some((av, aw)), Some((bv, bw))) =
-                    (eval_bv_val(&args[0], model), eval_bv_val(&args[1], model))
-                {
+                let lhs = eval_bv_operand(&args[0], model)?;
+                let rhs = eval_bv_operand(&args[1], model)?;
+                if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
                     if aw != bw {
                         return None;
                     }
                     let result = if bv >= u128::from(aw) { 0 } else { av >> bv };
                     return Some(SmtValue::BitVec(result, aw));
                 }
-                let (av, aw) = eval_bv_big_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_big_val(&args[1], model)?;
+                let (av, aw) = lhs.wide();
+                let (bv, bw) = rhs.wide();
                 if aw != bw {
                     return None;
                 }
@@ -712,7 +801,8 @@ pub(crate) fn evaluate_expr(
 
             // BV rotate
             ChcExpr::Op(ChcOp::BvRotateLeft(n), args) if args.len() == 1 => {
-                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                let operand = eval_bv_operand(&args[0], model)?;
+                if let Some((v, w)) = operand.narrow() {
                     if w == 0 {
                         return Some(SmtValue::BitVec(0, w));
                     }
@@ -723,7 +813,7 @@ pub(crate) fn evaluate_expr(
                     let result = ((v << rot) | (v >> (w - rot))) & bv_mask(w);
                     return Some(SmtValue::BitVec(result, w));
                 }
-                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let (v, w) = operand.wide();
                 if w == 0 {
                     return Some(SmtValue::bitvec_from_biguint(v, w));
                 }
@@ -735,7 +825,8 @@ pub(crate) fn evaluate_expr(
                 Some(SmtValue::bitvec_from_biguint(result, w))
             }
             ChcExpr::Op(ChcOp::BvRotateRight(n), args) if args.len() == 1 => {
-                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                let operand = eval_bv_operand(&args[0], model)?;
+                if let Some((v, w)) = operand.narrow() {
                     if w == 0 {
                         return Some(SmtValue::BitVec(0, w));
                     }
@@ -746,7 +837,7 @@ pub(crate) fn evaluate_expr(
                     let result = ((v >> rot) | (v << (w - rot))) & bv_mask(w);
                     return Some(SmtValue::BitVec(result, w));
                 }
-                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let (v, w) = operand.wide();
                 if w == 0 {
                     return Some(SmtValue::bitvec_from_biguint(v, w));
                 }
@@ -790,11 +881,9 @@ pub(crate) fn evaluate_expr(
                 Some(SmtValue::bitvec_from_biguint(bigint_to_bv(value, *w), *w))
             }
 
-            // Array select: select(arr, idx) → look up idx in array value
+            // Functional arrays can be read without materializing their domain.
             ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
-                let arr_val = evaluate_expr(&args[0], model)?;
-                let idx_val = evaluate_expr(&args[1], model)?;
-                eval_array_select(&arr_val, &idx_val)
+                array_read::select(&args[0], &args[1], model)
             }
 
             // Array store: store(arr, idx, val) → insert/overwrite in array value
@@ -820,5 +909,7 @@ pub(crate) fn evaluate_expr(
     })
 }
 
+#[cfg(test)]
+mod operand_once_tests;
 #[cfg(test)]
 mod tests;

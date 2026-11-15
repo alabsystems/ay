@@ -772,29 +772,53 @@ fn division_of(root: &Path, file: &Path) -> String {
     format!("{root_name}/{sub}")
 }
 
-/// Recursively collect `.smt2` files under each root, tagged with divisions.
-fn collect(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        if dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    walk(&e.path(), out);
-                }
-            }
-        } else if dir.extension().and_then(|e| e.to_str()) == Some("smt2") {
+fn collect_entries(
+    dir: &Path,
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("cannot read corpus entry in {}: {e}", dir.display()))?;
+        collect_path(&entry.path(), out)?;
+    }
+    Ok(())
+}
+fn collect_path(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let metadata = std::fs::metadata(dir)
+        .map_err(|e| format!("cannot inspect corpus path {}: {e}", dir.display()))?;
+    if metadata.is_dir() {
+        let children = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot enumerate corpus directory {}: {e}", dir.display()))?;
+        collect_entries(dir, children, out)?;
+    } else if metadata.is_file() {
+        if dir.extension().and_then(|e| e.to_str()) == Some("smt2") {
             out.push(dir.to_path_buf());
         }
+    } else {
+        return Err(format!(
+            "unsupported non-regular corpus path {}",
+            dir.display()
+        ));
     }
+    Ok(())
+}
+/// Recursively collect `.smt2` files under each root, tagged with divisions.
+fn collect(roots: &[PathBuf]) -> Result<Vec<(String, PathBuf)>, String> {
     let mut tagged = Vec::new();
     for root in roots {
         let mut files = Vec::new();
-        walk(root, &mut files);
+        // Corpus roots must really be directories, even when another supplied
+        // root is valid. A partial discovery never becomes a reduced campaign.
+        let children = std::fs::read_dir(root)
+            .map_err(|e| format!("cannot enumerate corpus root {}: {e}", root.display()))?;
+        collect_entries(root, children, &mut files)?;
         files.sort();
         for f in files {
             tagged.push((division_of(root, &f), f));
         }
     }
-    tagged
+    Ok(tagged)
 }
 
 // ---------------------------------------------------------------------------
@@ -997,81 +1021,215 @@ fn is_symbol_char(c: char) -> bool {
 /// usable ([`DeclaredStatus::Unknown`]) rather than accusing a solver on a coin
 /// flip.
 pub(crate) fn parse_declared_status(text: &str) -> DeclaredStatus {
-    const KEYWORD: &str = ":status";
-    let bytes = text.as_bytes();
-    let mut found: Option<DeclaredStatus> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            // Comment: skip to end of line.
-            b';' => {
-                i += bytes[i..]
-                    .iter()
-                    .position(|b| *b == b'\n')
-                    .unwrap_or(bytes.len() - i);
-            }
-            // |quoted symbol| — the shape of a (set-info :source | ... |) blob.
-            b'|' => {
-                i += 1;
-                i += bytes[i..]
-                    .iter()
-                    .position(|b| *b == b'|')
-                    .map_or(bytes.len() - i, |n| n + 1);
-            }
-            // "string literal", in which "" is an escaped quote (SMT-LIB 2.6).
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        i += 1;
-                        if bytes.get(i) != Some(&b'"') {
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-            }
-            // `:` is ASCII, so `text[i..]` is always on a char boundary here.
-            b':' if text[i..].starts_with(KEYWORD) => {
-                i += KEYWORD.len();
-                let rest = &text[i..];
-                if rest.starts_with(is_symbol_char) {
-                    continue; // a longer keyword, e.g. `:status-bits`
-                }
-                let token = rest
-                    .trim_start()
-                    .split(|c: char| c.is_whitespace() || "()|\";".contains(c))
-                    .next()
-                    .unwrap_or_default();
-                let declared = match token {
-                    "sat" => Some(DeclaredStatus::Sat),
-                    "unsat" => Some(DeclaredStatus::Unsat),
-                    "unknown" => Some(DeclaredStatus::Unknown),
-                    // Not a status we can read; contribute no judgement.
-                    _ => None,
-                };
-                if let Some(d) = declared {
-                    found = Some(match found {
-                        None => d,
-                        Some(prev) if prev == d => d,
-                        Some(_) => DeclaredStatus::Unknown,
-                    });
-                }
-            }
-            _ => i += 1,
+    let mut scanner = DeclaredStatusScanner::new();
+    scanner.feed(text);
+    scanner.finish()
+}
+
+const DECLARED_STATUS_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum DeclaredStatusState {
+    Normal,
+    Comment,
+    QuotedSymbol,
+    String,
+    StringQuote,
+    Keyword(usize),
+    KeywordBoundary,
+    BeforeValue,
+    Value { candidates: u8, length: usize },
+}
+
+/// This deliberately preserves the metadata reader's tolerant lexical
+/// contract, rather than requiring a complete SMT-LIB parse. It collects every
+/// unquoted :status and does not buffer arbitrary tokens or source prose.
+struct DeclaredStatusScanner {
+    state: DeclaredStatusState,
+    found: Option<DeclaredStatus>,
+}
+
+impl DeclaredStatusScanner {
+    fn new() -> Self {
+        Self {
+            state: DeclaredStatusState::Normal,
+            found: None,
         }
     }
-    found.unwrap_or(DeclaredStatus::Absent)
+
+    fn value(&mut self, candidates: u8, length: usize) {
+        let declared = match (candidates, length) {
+            (1, 3) => DeclaredStatus::Sat,
+            (2, 5) => DeclaredStatus::Unsat,
+            (4, 7) => DeclaredStatus::Unknown,
+            _ => return,
+        };
+        self.found = Some(match self.found {
+            None => declared,
+            Some(previous) if previous == declared => declared,
+            Some(_) => DeclaredStatus::Unknown,
+        });
+    }
+
+    fn feed(&mut self, text: &str) {
+        const KEYWORD: &[u8] = b":status";
+        const VALUES: [&[u8]; 3] = [b"sat", b"unsat", b"unknown"];
+        for ch in text.chars() {
+            // Delimiters and mismatched keyword characters must also enter the
+            // ordinary lexer. For example an unknown value can itself contain
+            // another :status, while a quote starts a skipped string.
+            loop {
+                match self.state {
+                    DeclaredStatusState::Normal => {
+                        self.state = match ch {
+                            ';' => DeclaredStatusState::Comment,
+                            '|' => DeclaredStatusState::QuotedSymbol,
+                            '"' => DeclaredStatusState::String,
+                            ':' => DeclaredStatusState::Keyword(1),
+                            _ => DeclaredStatusState::Normal,
+                        };
+                    }
+                    DeclaredStatusState::Comment => {
+                        if ch == '\n' {
+                            self.state = DeclaredStatusState::Normal;
+                        }
+                    }
+                    DeclaredStatusState::QuotedSymbol => {
+                        if ch == '|' {
+                            self.state = DeclaredStatusState::Normal;
+                        }
+                    }
+                    DeclaredStatusState::String => {
+                        if ch == '"' {
+                            self.state = DeclaredStatusState::StringQuote;
+                        }
+                    }
+                    DeclaredStatusState::StringQuote => {
+                        if ch == '"' {
+                            self.state = DeclaredStatusState::String;
+                        } else {
+                            self.state = DeclaredStatusState::Normal;
+                            continue;
+                        }
+                    }
+                    DeclaredStatusState::Keyword(matched) => {
+                        if ch.is_ascii() && ch as u8 == KEYWORD[matched] {
+                            self.state = if matched + 1 == KEYWORD.len() {
+                                DeclaredStatusState::KeywordBoundary
+                            } else {
+                                DeclaredStatusState::Keyword(matched + 1)
+                            };
+                        } else {
+                            self.state = DeclaredStatusState::Normal;
+                            continue;
+                        }
+                    }
+                    DeclaredStatusState::KeywordBoundary => {
+                        self.state = if is_symbol_char(ch) {
+                            DeclaredStatusState::Normal
+                        } else {
+                            DeclaredStatusState::BeforeValue
+                        };
+                        continue;
+                    }
+                    DeclaredStatusState::BeforeValue => {
+                        if ch.is_whitespace() {
+                            break;
+                        }
+                        self.state = if "()|\";".contains(ch) {
+                            DeclaredStatusState::Normal
+                        } else {
+                            DeclaredStatusState::Value {
+                                candidates: 7,
+                                length: 0,
+                            }
+                        };
+                        continue;
+                    }
+                    DeclaredStatusState::Value { candidates, length } => {
+                        if ch.is_whitespace() || "()|\";".contains(ch) {
+                            self.value(candidates, length);
+                            self.state = DeclaredStatusState::Normal;
+                            continue;
+                        }
+                        if ch == ':' {
+                            self.state = DeclaredStatusState::Keyword(1);
+                        } else {
+                            let mut remaining = candidates;
+                            for (index, expected) in VALUES.iter().enumerate() {
+                                if !ch.is_ascii() || expected.get(length) != Some(&(ch as u8)) {
+                                    remaining &= !(1 << index);
+                                }
+                            }
+                            self.state = DeclaredStatusState::Value {
+                                candidates: remaining,
+                                length: length.saturating_add(1).min(8),
+                            };
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    fn finish(mut self) -> DeclaredStatus {
+        if let DeclaredStatusState::Value { candidates, length } = self.state {
+            self.value(candidates, length);
+        }
+        self.found.unwrap_or(DeclaredStatus::Absent)
+    }
+}
+
+/// Leave only an incomplete final UTF-8 sequence for the next read. Invalid
+/// complete sequences are decoded lossily, as the original file reader did.
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    loop {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                offset += error.valid_up_to();
+                if let Some(length) = error.error_len() {
+                    offset += length;
+                } else {
+                    return offset;
+                }
+            }
+        }
+    }
+}
+
+fn declared_status_from_reader(mut reader: impl std::io::Read) -> std::io::Result<DeclaredStatus> {
+    let mut scanner = DeclaredStatusScanner::new();
+    let mut buffer = [0u8; DECLARED_STATUS_BUFFER_BYTES + 4];
+    let mut carry = 0;
+    loop {
+        let read = match reader.read(&mut buffer[carry..DECLARED_STATUS_BUFFER_BYTES]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let length = carry + read;
+        if read == 0 {
+            scanner.feed(&String::from_utf8_lossy(&buffer[..length]));
+            return Ok(scanner.finish());
+        }
+        let complete = complete_utf8_prefix(&buffer[..length]);
+        scanner.feed(&String::from_utf8_lossy(&buffer[..complete]));
+        buffer.copy_within(complete..length, 0);
+        carry = length - complete;
+    }
 }
 
 /// Declared `:status` of a benchmark file. An unreadable file declares nothing;
 /// invalid UTF-8 is read lossily rather than discarded, so one stray byte deep
-/// in a benchmark cannot hide its `:status` header.
+/// in a benchmark cannot hide its `:status` header. The fixed-buffer scan reaches
+/// EOF to catch conflicting late annotations without allocating the whole file.
 pub(crate) fn declared_status_of_file(file: &Path) -> DeclaredStatus {
-    match std::fs::read(file) {
-        Ok(bytes) => parse_declared_status(&String::from_utf8_lossy(&bytes)),
-        Err(_) => DeclaredStatus::Absent,
-    }
+    std::fs::File::open(file)
+        .and_then(declared_status_from_reader)
+        .unwrap_or(DeclaredStatus::Absent)
 }
 
 /// Declared `:status` token of a benchmark file, `None` when unannotated.
@@ -1153,7 +1311,13 @@ pub(crate) struct BenchConfig {
 }
 
 pub(crate) fn run(cfg: &BenchConfig) -> i32 {
-    let files = collect(&cfg.roots);
+    let files = match collect(&cfg.roots) {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 2;
+        }
+    };
     if files.is_empty() {
         eprintln!("error: no .smt2 files found under {:?}", cfg.roots);
         return 2;
@@ -1592,6 +1756,39 @@ fn build_certificate(
 mod tests {
     use super::*;
 
+    #[test]
+    fn discovery_refuses_missing_or_non_directory_roots_without_publishing_partial_corpus() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        std::fs::create_dir(&good).unwrap();
+        let input = good.join("case.smt2");
+        std::fs::write(&input, "(check-sat)").unwrap();
+        assert_eq!(collect(std::slice::from_ref(&good)).unwrap()[0].1, input);
+        let missing = root.path().join("missing");
+        assert!(collect(&[good.clone(), missing]).is_err());
+        let ordinary = root.path().join("not-a-directory");
+        std::fs::write(&ordinary, "data").unwrap();
+        assert!(collect(&[good, ordinary]).is_err());
+    }
+
+    #[test]
+    fn discovery_propagates_native_entry_errors_after_real_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("case.smt2"), "(check-sat)").unwrap();
+        let entries = std::fs::read_dir(root.path())
+            .unwrap()
+            .chain(std::iter::once(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected native entry failure",
+            ))));
+        let mut files = Vec::new();
+        assert!(collect_entries(root.path(), entries, &mut files).is_err());
+        assert!(
+            !files.is_empty(),
+            "failure occurs after an actual readable entry"
+        );
+    }
+
     fn verdicts(v: &[Verdict]) -> BenchOutcome {
         BenchOutcome {
             kind: OutcomeKind::Verdicts(v.to_vec()),
@@ -1957,6 +2154,209 @@ also emits (set-info :status sat) for the companion family.
         assert_eq!(declared_status(&missing), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Prior slice-based reader is an independent migration oracle for malformed
+    // as well as valid metadata. Production uses only the bounded reader.
+    fn legacy_declared_status(text: &str) -> DeclaredStatus {
+        const KEYWORD: &str = ":status";
+        let bytes = text.as_bytes();
+        let mut found: Option<DeclaredStatus> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                // Comment: skip to end of line.
+                b';' => {
+                    i += bytes[i..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .unwrap_or(bytes.len() - i);
+                }
+                // |quoted symbol| — the shape of a (set-info :source | ... |) blob.
+                b'|' => {
+                    i += 1;
+                    i += bytes[i..]
+                        .iter()
+                        .position(|b| *b == b'|')
+                        .map_or(bytes.len() - i, |n| n + 1);
+                }
+                // "string literal", in which "" is an escaped quote (SMT-LIB 2.6).
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            i += 1;
+                            if bytes.get(i) != Some(&b'"') {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                // `:` is ASCII, so `text[i..]` is always on a char boundary here.
+                b':' if text[i..].starts_with(KEYWORD) => {
+                    i += KEYWORD.len();
+                    let rest = &text[i..];
+                    if rest.starts_with(is_symbol_char) {
+                        continue; // a longer keyword, e.g. `:status-bits`
+                    }
+                    let token = rest
+                        .trim_start()
+                        .split(|c: char| c.is_whitespace() || "()|\";".contains(c))
+                        .next()
+                        .unwrap_or_default();
+                    let declared = match token {
+                        "sat" => Some(DeclaredStatus::Sat),
+                        "unsat" => Some(DeclaredStatus::Unsat),
+                        "unknown" => Some(DeclaredStatus::Unknown),
+                        // Not a status we can read; contribute no judgement.
+                        _ => None,
+                    };
+                    if let Some(d) = declared {
+                        found = Some(match found {
+                            None => d,
+                            Some(prev) if prev == d => d,
+                            Some(_) => DeclaredStatus::Unknown,
+                        });
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        found.unwrap_or(DeclaredStatus::Absent)
+    }
+
+    #[test]
+    fn streaming_declared_status_matches_prior_tolerant_semantics() {
+        let pieces = [
+            ":status", ":sta", "sat", "unsat", "unknown", "-bits", " ", "\n", "\r", ";", "\"", "|",
+            ":", "x", "\u{2003}", "\"\"", "(", ")",
+        ];
+        for first in pieces {
+            for second in pieces {
+                for third in pieces {
+                    let text = format!("{first}{second}{third}");
+                    assert_eq!(
+                        parse_declared_status(&text),
+                        legacy_declared_status(&text),
+                        "{text:?}"
+                    );
+                    let annotation = format!("{text} :status unsat");
+                    assert_eq!(
+                        parse_declared_status(&annotation),
+                        legacy_declared_status(&annotation),
+                        "{annotation:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_declared_status_preserves_lexical_boundaries() {
+        struct Chunks<'a> {
+            bytes: &'a [u8],
+            maximum: usize,
+        }
+        impl std::io::Read for Chunks<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = buffer.len().min(self.maximum).min(self.bytes.len());
+                buffer[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        for (text, expected) in [
+            (":status sat", DeclaredStatus::Sat),
+            (":status\u{2003}unsat", DeclaredStatus::Unsat),
+            (":status-bits sat", DeclaredStatus::Absent),
+            (":status sat-extra", DeclaredStatus::Absent),
+            (":status :status unsat", DeclaredStatus::Unsat),
+            (":status unknown:status sat", DeclaredStatus::Sat),
+            (":status ; ignored\nsat", DeclaredStatus::Absent),
+            (
+                "; :status sat\r:status sat\n:status unsat",
+                DeclaredStatus::Unsat,
+            ),
+            ("|:status sat| :status unsat", DeclaredStatus::Unsat),
+            (
+                "\":status sat\"\" still :status sat\" :status unsat",
+                DeclaredStatus::Unsat,
+            ),
+            (
+                ":status sat\"unterminated :status unsat",
+                DeclaredStatus::Sat,
+            ),
+            ("\"unterminated :status sat", DeclaredStatus::Absent),
+            (":status sat\n:status unknown", DeclaredStatus::Unknown),
+        ] {
+            assert_eq!(parse_declared_status(text), expected, "{text:?}");
+            for maximum in 1..=23 {
+                let input = Chunks {
+                    bytes: text.as_bytes(),
+                    maximum,
+                };
+                assert_eq!(
+                    declared_status_from_reader(input).unwrap(),
+                    expected,
+                    "chunk {maximum}, {text:?}"
+                );
+            }
+        }
+        for bytes in [
+            b"\xff :status sat".as_slice(),
+            b":status\xffsat :status unsat".as_slice(),
+            b"\xe2\x80 :status unsat".as_slice(),
+            b":status sat\xf0\x9f\xa6".as_slice(),
+        ] {
+            let expected = parse_declared_status(&String::from_utf8_lossy(bytes));
+            for maximum in 1..=7 {
+                assert_eq!(
+                    declared_status_from_reader(Chunks { bytes, maximum }).unwrap(),
+                    expected,
+                    "invalid UTF-8 with chunk {maximum}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_declared_status_reads_late_conflicts_with_fixed_storage() {
+        use std::io::Read as _;
+        struct BoundedRequest<R>(R);
+        impl<R: std::io::Read> std::io::Read for BoundedRequest<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= DECLARED_STATUS_BUFFER_BYTES);
+                self.0.read(buffer)
+            }
+        }
+        let input = std::io::Cursor::new(b"(set-info :status sat)\n")
+            .chain(std::io::repeat(b' ').take(1024 * 1024))
+            .chain(std::io::Cursor::new(b"(set-info :status unsat)\n"));
+        assert_eq!(
+            declared_status_from_reader(BoundedRequest(input)).unwrap(),
+            DeclaredStatus::Unknown
+        );
+        let long_token = std::io::Cursor::new(b":status ")
+            .chain(std::io::repeat(b'x').take(1024 * 1024))
+            .chain(std::io::Cursor::new(b":status unsat"));
+        assert_eq!(
+            declared_status_from_reader(BoundedRequest(long_token)).unwrap(),
+            DeclaredStatus::Unsat
+        );
+    }
+
+    #[test]
+    fn streaming_declared_status_does_not_accept_partial_io() {
+        use std::io::Read as _;
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("incomplete source"))
+            }
+        }
+        let input = std::io::Cursor::new(b":status sat\n").chain(FailedRead);
+        assert!(declared_status_from_reader(input).is_err());
     }
 
     #[test]

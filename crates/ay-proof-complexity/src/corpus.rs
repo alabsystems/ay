@@ -80,7 +80,13 @@ pub fn generate_default_corpus() -> Vec<CorpusEntry> {
     for n in [4usize, 6, 8] {
         let graph = cycle_graph(n);
         // Odd number of "1" charges on even-length cycle is unsatisfiable.
-        let charges: Vec<bool> = (0..n).map(|i| i == 0).collect();
+        // Reserved fallibly and filled by push: a failed reservation only
+        // means the pushes grow the vector.
+        let mut charges: Vec<bool> = Vec::new();
+        let _ = charges.try_reserve_exact(n);
+        for i in 0..n {
+            charges.push(i == 0);
+        }
         out.push(CorpusEntry {
             family: "tseitin",
             name: format!("tseitin-cycle-n{n}"),
@@ -93,7 +99,8 @@ pub fn generate_default_corpus() -> Vec<CorpusEntry> {
         out.push(CorpusEntry {
             family: "random-k-cnf",
             name: format!("random-3sat-n{n}-m{m}-seed{i}"),
-            cnf: random_k_cnf(3, n, m, Some(i as u64 + 1)),
+            // `i` indexes a two-element list, so the seed never saturates.
+            cnf: random_k_cnf(3, n, m, Some((i as u64).saturating_add(1))),
         });
     }
 
@@ -118,7 +125,9 @@ fn cycle_graph(n: usize) -> Graph {
         return g;
     }
     for i in 0..n {
-        let j = (i + 1) % n;
+        // `i < n` and `n >= 2`: the successor never saturates and the
+        // divisor is nonzero.
+        let j = i.saturating_add(1) % n;
         g.add_edge(i, j);
     }
     g

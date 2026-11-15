@@ -13,7 +13,7 @@
 //   Z3_get_tuple_sort_num_fields / _field_decl / _mk_decl.
 //
 // This single source compiles and runs against BOTH ay-ffi (default) and libz3
-// 4.15.4 (`-DAY_TWIN_USE_Z3 -lz3`). Every non-guarded assertion is a value that
+// pinned reference (`-DAY_TWIN_USE_Z3 -lz3`). Every non-guarded assertion is a value that
 // libz3 itself returns for the SAME input, so passing on both engines is the
 // cross-check. Blocks guarded by `#ifndef AY_TWIN_USE_Z3` are AY-specific
 // documented divergences:
@@ -263,6 +263,38 @@ static void test_seq_re_finite(Z3_context c) {
     CHECK_B(str_basis != NULL, 1, "String-sort basis exists");
     CHECK_U(Z3_get_sort_kind(c, str_basis), Z3_CHAR_SORT,
             "String-sort basis is the Char sort");
+
+    CHECK_U(Z3_OP_SEQ_POWER, 1573, "5.3.3 sequence-power enum ABI");
+    CHECK_U(Z3_OP_CHAR_CONST, 1599, "5.3.3 character enum ABI");
+    Z3_ast ch = Z3_mk_char(c, 'a');
+    CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, ch))),
+            Z3_OP_CHAR_CONST, "character declaration uses current enum ABI");
+    Z3_ast base = Z3_mk_string(c, "ab");
+    Z3_ast count = Z3_mk_int(c, 2, int_s);
+    Z3_ast repeated = Z3_mk_seq_power(c, base, count);
+    CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, repeated))),
+            Z3_OP_SEQ_POWER, "sequence power has its actual operator kind");
+    Z3_app power_app = Z3_to_app(c, repeated);
+    CHECK_U(Z3_get_app_num_args(c, power_app), 2, "power retains its two arguments");
+    CHECK_B(Z3_is_eq_ast(c, Z3_get_app_arg(c, power_app, 0), base) &&
+            Z3_is_eq_ast(c, Z3_get_app_arg(c, power_app, 1), count),
+            1, "power retains the actual base and count");
+    Z3_ast expanded = Z3_mk_string(c, "abab");
+    CHECK_B(Z3_is_eq_ast(c, repeated, expanded), 0,
+            "power constructor remains distinct from its simplified value");
+    CHECK_B(Z3_is_eq_ast(c, Z3_simplify(c, repeated), expanded), 1,
+            "explicit simplification folds constant power");
+    Z3_ast word = Z3_mk_const(c, Z3_mk_string_symbol(c, "sequence_decl_identity"), str_s);
+    Z3_ast length = Z3_mk_seq_length(c, word);
+    CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, length))),
+            Z3_OP_SEQ_LENGTH, "string length has its actual sequence operator kind");
+    Z3_sort domain[2] = { str_s, int_s };
+    Z3_func_decl user = Z3_mk_func_decl(c, Z3_mk_string_symbol(c, "seq.power"),
+                                     2, domain, str_s);
+    Z3_ast args[2] = { base, count };
+    Z3_ast call = Z3_mk_app(c, user, 2, args);
+    CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, call))),
+            Z3_OP_UNINTERPRETED, "same-name user function keeps its own identity");
 }
 
 static void test_tuple_introspection(Z3_context c) {
@@ -332,6 +364,100 @@ static void test_error_code_lifecycle(Z3_context c) {
     CHECK_U(Z3_get_error_code(c), Z3_OK, "a later successful call clears the error");
 }
 
+// Exact rational input is rounded once to binary32, nearest with ties to even.
+// Check the encoding rather than a decimal rendering or host double conversion.
+static void test_fp_rational_text(Z3_context c) {
+    Z3_ast third = Z3_mk_numeral(c, "1/3p0", Z3_mk_fpa_sort_32(c));
+    CHECK_U(Z3_get_error_code(c), Z3_OK, "FP rational text is accepted");
+    CHECK_B(third != 0, 1, "FP rational text creates an AST");
+    if (third == 0) return;
+    Z3_ast raw = Z3_mk_fpa_to_ieee_bv(c, third);
+    CHECK_U(Z3_get_decl_kind(c, Z3_get_app_decl(c, Z3_to_app(c, raw))),
+            Z3_OP_FPA_TO_IEEE_BV, "FP conversion constructor retains its operator");
+    Z3_ast encoding = Z3_simplify(c, raw);
+    uint64_t bits = 0;
+    CHECK_B(Z3_get_numeral_uint64(c, encoding, &bits), 1,
+            "FP rational text has a concrete IEEE encoding");
+    CHECK_U(bits, 0x3eaaaaabU, "one third rounds to the nearest binary32");
+    Z3_ast expected = Z3_mk_numeral(c, "1051372203", Z3_mk_bv_sort(c, 32));
+    CHECK_U(Z3_get_bool_value(c, Z3_simplify(c, Z3_mk_eq(c, raw, expected))),
+            Z3_L_TRUE, "FP folding simplifies the surrounding equality");
+
+    Z3_sort single = Z3_mk_fpa_sort_32(c);
+    Z3_ast nan = Z3_mk_fpa_nan(c, single);
+    CHECK_B(Z3_is_numeral_ast(c, Z3_simplify(c, Z3_mk_fpa_to_ieee_bv(c, nan))),
+            0, "NaN IEEE encoding remains unspecified");
+    Z3_ast symbolic = Z3_mk_const(c, Z3_mk_string_symbol(c, "fp_symbol"), single);
+    CHECK_B(Z3_is_numeral_ast(c, Z3_simplify(c, Z3_mk_fpa_to_ieee_bv(c, symbolic))),
+            0, "symbolic FP encoding remains symbolic");
+
+    Z3_sort wide = Z3_mk_fpa_sort(c, 11, 200);
+    Z3_ast one = Z3_mk_numeral(c, "1", wide);
+    Z3_ast wide_bits = Z3_simplify(c, Z3_mk_fpa_to_ieee_bv(c, one));
+    char wide_expected[210];
+    memset(wide_expected, '1', 10);
+    memset(wide_expected + 10, '0', 199);
+    wide_expected[209] = '\0';
+    CHECK_S(Z3_get_numeral_binary_string(c, wide_bits), wide_expected,
+            "FP encoding wider than u128 preserves every bit");
+    Z3_ast components = Z3_mk_fpa_fp(c,
+        Z3_mk_numeral(c, "0", Z3_mk_bv_sort(c, 1)),
+        Z3_mk_numeral(c, "1023", Z3_mk_bv_sort(c, 11)),
+        Z3_mk_numeral(c, "0", Z3_mk_bv_sort(c, 199)));
+    CHECK_S(Z3_get_numeral_binary_string(c,
+                Z3_simplify(c, Z3_mk_fpa_to_ieee_bv(c, components))), wide_expected,
+            "wide FP component construction has the same IEEE encoding");
+}
+
+// Structural constructors need not fold eagerly. Substitution/update must
+// preserve the actual retained arithmetic, and explicit simplification must
+// retain its value. This source runs against AY and the pinned reference.
+static void test_retained_arithmetic_patterns(Z3_context c) {
+    Z3_sort integer = Z3_mk_int_sort(c);
+    Z3_ast a = Z3_mk_const(c, Z3_mk_string_symbol(c, "pattern_a"), integer);
+    Z3_ast b = Z3_mk_const(c, Z3_mk_string_symbol(c, "pattern_b"), integer);
+    Z3_ast one = Z3_mk_int(c, 1, integer);
+    Z3_ast a1 = Z3_mk_add(c, 2, (Z3_ast[]){a, one});
+    // Keep the actual compound application, without an equality constructor
+    // that may canonically reorder its arguments and require refusal.
+    Z3_ast target = Z3_mk_add(c, 2, (Z3_ast[]){a1, one});
+    Z3_ast replaced = Z3_substitute(c, target, 1, &a1, &b);
+    if (!replaced) {
+        Z3_error_code error = Z3_get_error_code(c);
+        fprintf(stderr, "compound substitution refused: %u %s\n",
+            (unsigned)error, Z3_get_error_msg(c, error));
+        fprintf(stderr, "pattern: %s\n", Z3_ast_to_string(c, a1));
+        fprintf(stderr, "target: %s\n", Z3_ast_to_string(c, target));
+    }
+    CHECK_B(replaced != 0, 1, "retained compound pattern substitutes");
+    if (!replaced) return;
+    Z3_ast four = Z3_mk_int(c, 4, integer);
+    Z3_ast three = Z3_mk_int(c, 3, integer);
+    int value = 0;
+    CHECK_B(Z3_get_numeral_int(c, Z3_simplify(c,
+        Z3_substitute(c, replaced, 1, &b, &four)), &value), 1,
+        "compound substitution closes at b=4");
+    CHECK_U(value, 5, "compound substitution replaces the occurrence at b=4");
+    CHECK_B(Z3_get_numeral_int(c, Z3_simplify(c,
+        Z3_substitute(c, replaced, 1, &b, &three)), &value), 1,
+        "compound substitution closes at b=3");
+    CHECK_U(value, 4, "compound substitution does not leave the source a at b=3");
+    Z3_ast plus_zero = Z3_mk_add(c, 2,
+        (Z3_ast[]){a, Z3_mk_int(c, 0, integer)});
+    Z3_ast updated = Z3_update_term(c, plus_zero, 2, (Z3_ast[]){b, one});
+    Z3_ast five = Z3_mk_int(c, 5, integer);
+    value = 0;
+    CHECK_B(Z3_get_numeral_int(c, Z3_simplify(c,
+        Z3_substitute(c, updated, 1, &b, &five)), &value), 1,
+        "update retains an interpretable addition");
+    CHECK_U(value, 6, "update uses the retained addition operator");
+    Z3_ast closed = Z3_substitute(c, a1, 1, &a, &five);
+    value = 0;
+    CHECK_B(Z3_get_numeral_int(c, Z3_simplify(c, closed), &value), 1,
+        "closed substitution simplifies to a numeral");
+    CHECK_U(value, 6, "closed substitution has the correct value");
+}
+
 int main(void) {
     Z3_config cfg = Z3_mk_config();
     Z3_context c = Z3_mk_context(cfg);
@@ -347,6 +473,8 @@ int main(void) {
     test_seq_re_finite(c);
     test_tuple_introspection(c);
     test_error_code_lifecycle(c);
+    test_fp_rational_text(c);
+    test_retained_arithmetic_patterns(c);
 
     Z3_del_context(c);
 

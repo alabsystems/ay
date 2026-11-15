@@ -11,6 +11,8 @@
 
 use super::*;
 
+pub(in crate::solver) mod terminal;
+
 /// Maximum number of literals a clause may contain before the solver splits it
 /// into an equisatisfiable chain of sub-clauses (#oversized).
 ///
@@ -30,6 +32,39 @@ pub(super) fn oversized_clause_split_enabled() -> bool {
 }
 
 impl Solver {
+    /// Set `has_empty_clause`, recording the scope depth on the false -> true
+    /// transition.
+    ///
+    /// This is the only way the flag may be raised. `pop()` retracts the flag
+    /// exactly when the recorded depth exceeds the depth it pops to, so the
+    /// record must be the scope depth at which THIS refutation was derived: a
+    /// depth left over from an earlier, already-retracted refutation either
+    /// keeps a scoped refutation alive after its scope is popped, or retracts
+    /// a base-level (depth 0) one that must survive every pop.
+    pub(super) fn raise_empty_clause_flag(&mut self) {
+        if !self.has_empty_clause {
+            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
+        }
+        self.has_empty_clause = true;
+    }
+
+    /// Clear `has_empty_clause` together with every piece of state that
+    /// describes the refutation (proof markers and the recorded scope depth).
+    ///
+    /// The refutation was derived from the current level-0 trail and watch
+    /// state, so that state cannot be reused by the next solve: an
+    /// incremental reset keeps both, and the next search would resume from a
+    /// trail whose conflict has already been consumed. If the refutation did
+    /// not depend on what was retracted it must be derived again, which only
+    /// a full reset guarantees, so the next reset is forced to be a full one.
+    pub(super) fn lower_empty_clause_flag(&mut self) {
+        self.has_empty_clause = false;
+        self.cold.empty_clause_in_proof = false;
+        self.cold.empty_clause_lrat_id = None;
+        self.cold.empty_clause_scope_depth = 0;
+        self.cold.full_reset_after_empty_clause_retraction = true;
+    }
+
     /// Mark that an empty clause was derived (UNSAT), with optional LRAT
     /// resolution hints.
     ///
@@ -54,15 +89,25 @@ impl Solver {
         hints: &[u64],
         deadline: Option<ay_core::time::Instant>,
     ) -> std::io::Result<()> {
+        self.mark_empty_clause_with_bounded_prevalidated_hints_and_cancellation(
+            hints,
+            deadline,
+            &|| true,
+        )
+    }
+
+    pub(super) fn mark_empty_clause_with_bounded_prevalidated_hints_and_cancellation(
+        &mut self,
+        hints: &[u64],
+        deadline: Option<ay_core::time::Instant>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> std::io::Result<()> {
         assert!(
             self.cold.solution_witness.is_none(),
             "BUG: derived empty clause (UNSAT) but a satisfying assignment was configured"
         );
 
-        if !self.has_empty_clause {
-            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
-        }
-        self.has_empty_clause = true;
+        self.raise_empty_clause_flag();
 
         // A stale marker must not license UNSAT if this new terminal write
         // fails after bounded learned steps have already been appended.
@@ -72,7 +117,8 @@ impl Solver {
             .proof_manager
             .as_ref()
             .map_or(0, ProofManager::added_count);
-        let clause_id = self.proof_emit_bounded_terminal_rup(hints, deadline)?;
+        let clause_id =
+            self.proof_emit_bounded_terminal_rup_with_cancellation(hints, deadline, keep_going)?;
         let added_after = self
             .proof_manager
             .as_ref()
@@ -101,98 +147,90 @@ impl Solver {
         hints: &[u64],
         trace_hints: Vec<u64>,
     ) {
+        match self.mark_empty_clause_admitted(
+            hints,
+            trace_hints,
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        ) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+
+    /// Shared ordinary emission, ID allocation and exact derived trace row.
+    /// Counted callers retain exclusive ownership until a final owner fence.
+    pub(in crate::solver) fn mark_empty_clause_admitted<P: terminal::Policy>(
+        &mut self,
+        hints: &[u64],
+        trace_hints: Vec<u64>,
+        p: &P,
+    ) -> Result<(), P::Error> {
+        p.empty(self)?;
+        self.publish_empty_clause(hints, trace_hints, |solver, id, hints| {
+            p.add_trace(solver, id, hints)
+        })
+    }
+
+    /// The exact ordinary empty publication kernel. The caller admits selected
+    /// proof effects first; only trace storage/publication is parameterized.
+    pub(in crate::solver) fn publish_empty_clause<E>(
+        &mut self,
+        hints: &[u64],
+        trace_hints: Vec<u64>,
+        append: impl FnOnce(&mut Self, u64, Vec<u64>) -> Result<(), E>,
+    ) -> Result<(), E> {
         if self.cold.backward_proof_limits.is_some() {
             self.mark_empty_clause_deferred_for_bounded_proof();
-            return;
+            return Ok(());
         }
-
-        // Solution-guided debugging (#4615): if a known satisfying assignment
-        // exists, deriving the empty clause is a soundness bug. CaDiCaL parity:
-        // check_no_solution_after_learning_empty_clause.
         assert!(
             self.cold.solution_witness.is_none(),
             "BUG: derived empty clause (UNSAT) but a satisfying assignment was \
              configured via set_solution — solver incorrectly claims unsatisfiable"
         );
-
-        let first_empty_clause = !self.has_empty_clause;
-        // Only record the scope depth on the first occurrence; a base-level
-        // empty clause (depth 0) must never be overwritten by a scoped one.
-        if first_empty_clause {
-            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
+        self.raise_empty_clause_flag();
+        // Preserve first-derivation behavior, writer ID synchronization and
+        // the ordinary trace-only zero writer-ID fallback.
+        if self.cold.empty_clause_in_proof {
+            return Ok(());
         }
-        self.has_empty_clause = true;
-
-        // Write empty clause to proof writer and allocate LRAT ID atomically.
-        // Guard: only on the first derivation — repeated calls must NOT
-        // advance next_clause_id (Fix 1 of #4475: ID drift on repeated calls).
-        if !self.cold.empty_clause_in_proof {
-            let proof_steps_before = self
-                .proof_manager
-                .as_ref()
-                .map_or(0, ProofManager::added_count);
-            // proof_emit_add handles both forward checking (#4483) and proof
-            // emission, satisfying the single-authority contract (#4564).
-            // For LRAT mode, proof_emit_add also prepends level-0 unit proof
-            // IDs (#7108). This is safe even when the caller already includes
-            // level-0 IDs because the hint chain deduplicates.
-            let proof_clause_id = match self.proof_emit_add(&[], hints, ProofAddKind::Derived) {
-                Ok(id) if id != 0 => Some(id),
-                _ => None,
+        let before = self
+            .proof_manager
+            .as_ref()
+            .map_or(0, ProofManager::added_count);
+        let proof_id = match self.proof_emit_add(&[], hints, ProofAddKind::Derived) {
+            Ok(id) if id != 0 => Some(id),
+            _ => None,
+        };
+        let after = self
+            .proof_manager
+            .as_ref()
+            .map_or(before, ProofManager::added_count);
+        if after > before {
+            self.cold.empty_clause_in_proof = true;
+            self.cold.empty_clause_lrat_id = proof_id;
+        }
+        if self.cold.lrat_enabled {
+            let id = if let Some(id) = proof_id.filter(|&id| id != 0) {
+                self.cold.next_clause_id = id + 1;
+                id
+            } else {
+                let id = self.cold.next_clause_id;
+                self.cold.next_clause_id += 1;
+                id
             };
-            let proof_steps_after = self
-                .proof_manager
-                .as_ref()
-                .map_or(proof_steps_before, ProofManager::added_count);
-            if proof_steps_after > proof_steps_before {
-                self.cold.empty_clause_in_proof = true;
-                self.cold.empty_clause_lrat_id = proof_clause_id;
-            }
-
-            // Assign clause ID and record to clause trace.
-            // When LRAT is enabled, resync with proof writer's ID if deletion
-            // steps consumed IDs (#4398). In fail-close mode, non-empty LRAT
-            // writes are intentionally suppressed, so writer IDs may lag solver
-            // IDs. Keep solver IDs monotonic to avoid duplicate IDs in ClauseTrace.
-            //
-            // When LRAT is disabled but clause_trace is enabled (SMT proof path),
-            // still allocate a clause ID and record the empty clause with its
-            // resolution hints so that process_trace can reconstruct the proof
-            // chain (#6368).
-            if self.cold.lrat_enabled {
-                let clause_id = if let Some(pid) = proof_clause_id.filter(|&id| id != 0) {
-                    // Guard: LRAT returns Ok(0) as io_failed sentinel (#4434, #4572).
-                    // Only sync when the writer returned a real ID.
-                    // NOTE: uses pid+1 (not pid) because no add_clause_db follows.
-                    // Contrast with enqueue_derived_unit which sets pid and lets
-                    // add_clause_db increment (#4886).
-                    self.cold.next_clause_id = pid + 1;
-                    pid
-                } else {
-                    let id = self.cold.next_clause_id;
-                    self.cold.next_clause_id += 1;
-                    id
-                };
-                self.cold.empty_clause_lrat_id = Some(clause_id);
-                // Record to clause trace if enabled — hints attached atomically
-                if let Some(trace) = self.live_clause_trace_mut() {
-                    trace.add_clause_with_hints(clause_id, vec![], false, trace_hints);
-                }
-            } else if self.has_live_clause_trace() {
-                // SMT proof path: clause trace enabled without LRAT. Allocate a
-                // local clause ID and record the empty clause with resolution
-                // hints so process_trace can build a proper derivation (#6368).
-                let clause_id = self.cold.empty_clause_lrat_id.unwrap_or_else(|| {
-                    let id = self.cold.next_clause_id;
-                    self.cold.next_clause_id += 1;
-                    id
-                });
-                self.cold.empty_clause_lrat_id = Some(clause_id);
-                if let Some(trace) = self.live_clause_trace_mut() {
-                    trace.add_clause_with_hints(clause_id, vec![], false, trace_hints);
-                }
-            }
+            self.cold.empty_clause_lrat_id = Some(id);
+            append(self, id, trace_hints)?;
+        } else if self.has_live_clause_trace() {
+            let id = self.cold.empty_clause_lrat_id.unwrap_or_else(|| {
+                let id = self.cold.next_clause_id;
+                self.cold.next_clause_id += 1;
+                id
+            });
+            self.cold.empty_clause_lrat_id = Some(id);
+            append(self, id, trace_hints)?;
         }
+        Ok(())
     }
 
     /// Record semantic UNSAT while deferring every proof/trace allocation to
@@ -202,10 +240,7 @@ impl Solver {
             self.cold.solution_witness.is_none(),
             "BUG: derived empty clause (UNSAT) but a satisfying assignment was configured"
         );
-        if !self.has_empty_clause {
-            self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
-        }
-        self.has_empty_clause = true;
+        self.raise_empty_clause_flag();
     }
 
     /// Mark that an empty clause was derived (UNSAT) with no resolution hints.
@@ -222,8 +257,13 @@ impl Solver {
     pub(super) fn mark_empty_clause_with_level0_hints(&mut self) {
         if self.cold.lrat_enabled {
             self.ensure_level0_unit_proof_ids();
-            let hints = self.build_finalize_empty_clause_hints();
-            self.mark_empty_clause_with_hints(&hints);
+            if let Some(hints) = self.build_finalize_empty_clause_hints() {
+                self.mark_empty_clause_with_hints(&hints);
+            } else {
+                // Keep the semantic conflict but emit no partial certificate.
+                // Finalization must independently refuse this missing chain.
+                self.raise_empty_clause_flag();
+            }
         } else {
             self.mark_empty_clause();
         }
@@ -272,34 +312,16 @@ impl Solver {
     /// Register an empty input clause in every original-clause authority
     /// without trying to place it in the non-empty clause arena.
     fn add_original_empty_clause(&mut self, global: bool) -> bool {
-        if global {
-            self.cold.original_ledger.push_clause_global(&[]);
-        } else {
-            self.cold.original_ledger.push_clause(&[]);
-        }
+        let clause_id = self.register_ledger_original(
+            &[],
+            if global {
+                original_clause_ids::OriginalLifetime::Global
+            } else {
+                original_clause_ids::OriginalLifetime::Scoped
+            },
+        );
         self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         self.cold.uniform_formula_cache = None;
-
-        if let Some(ref mut checker) = self.cold.forward_checker {
-            checker.add_original(&[]);
-        }
-        if let Some(ref mut manager) = self.proof_manager {
-            manager.register_original_clause(&[]);
-        }
-
-        let clause_id = self.allocate_original_clause_id();
-
-        if self.cold.lrat_enabled {
-            if let Some(ref mut manager) = self.proof_manager {
-                manager.register_clause_id(clause_id);
-            }
-            if self.has_live_clause_trace() {
-                let _ = self.charge_proof_bookkeeping(16);
-            }
-            if let Some(trace) = self.live_clause_trace_mut() {
-                trace.add_clause_with_hints(clause_id, Vec::new(), true, Vec::new());
-            }
-        }
 
         if self.cold.lrat_enabled {
             if let Some(deadline) = self
@@ -327,7 +349,7 @@ impl Solver {
         false
     }
 
-    fn reserve_skipped_original_lrat_id(&mut self, literals: &[Literal]) {
+    pub(in crate::solver) fn reserve_skipped_original_lrat_id(&mut self, literals: &[Literal]) {
         if !self.cold.lrat_enabled {
             return;
         }
@@ -380,11 +402,12 @@ impl Solver {
         }
 
         // Record in original ledger (same as add_clause_unscoped).
-        self.cold.original_ledger.push_clause(&deduped);
+        let clause_id =
+            self.register_ledger_original(&deduped, original_clause_ids::OriginalLifetime::Scoped);
         self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         self.cold.uniform_formula_cache = None;
 
-        let _ = self.add_clause_db(&deduped, false);
+        let _ = self.add_registered_original_clause_db(&deduped, clause_id);
         true
     }
 
@@ -426,11 +449,12 @@ impl Solver {
         }
 
         // Record in original ledger.
-        self.cold.original_ledger.push_clause(&deduped);
+        let clause_id =
+            self.register_ledger_original(&deduped, original_clause_ids::OriginalLifetime::Scoped);
         self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         self.cold.uniform_formula_cache = None;
 
-        let offset = self.add_clause_db(&deduped, false);
+        let offset = self.add_registered_original_clause_db(&deduped, clause_id);
 
         // Return offset only for ternary+ clauses (JIT-compilable).
         if deduped.len() >= 3 {
@@ -486,7 +510,11 @@ impl Solver {
         literals.push(Literal::positive(selector));
 
         self.set_diagnostic_pass(DiagnosticPass::Input);
+        let ledger_start = self.cold.original_ledger.num_clauses();
         let result = self.add_clause_unscoped(literals, false);
+        self.cold
+            .original_ledger
+            .keep_until_scope_pop(ledger_start, scope_depth);
         self.clear_diagnostic_pass();
         result
     }
@@ -620,15 +648,19 @@ impl Solver {
         // the ledger must reflect the true user input formula only.
         // #5031: original_clauses needed in release for incremental-solve
         // clause_db rebuild in reset_search_state.
+        let registered_original_id = if !learned {
+            Some(self.register_ledger_original(
+                literals.as_slice(),
+                if global {
+                    original_clause_ids::OriginalLifetime::Global
+                } else {
+                    original_clause_ids::OriginalLifetime::Scoped
+                },
+            ))
+        } else {
+            None
+        };
         if !learned {
-            // Global clauses use push_clause_global to survive pop_scope (#9378).
-            if global {
-                self.cold
-                    .original_ledger
-                    .push_clause_global(literals.as_slice());
-            } else {
-                self.cold.original_ledger.push_clause(literals.as_slice());
-            }
             // New irredundant clause invalidates the uniform formula cache.
             self.cold.uniform_formula_cache = None;
 
@@ -666,7 +698,11 @@ impl Solver {
             self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         }
 
-        let _ = self.add_clause_db(literals.as_slice(), learned);
+        if let Some(clause_id) = registered_original_id {
+            let _ = self.add_registered_original_clause_db(literals.as_slice(), clause_id);
+        } else {
+            let _ = self.add_clause_db(literals.as_slice(), learned);
+        }
 
         literals.clear();
         true
@@ -745,12 +781,15 @@ impl Solver {
         // `user_num_vars`, those theory variables would alias our auxiliaries,
         // corrupting the variable space and yielding a spurious `unknown`
         // (#oversized).
+        if self.cold.oversized_split_user_vars.is_none() {
+            self.cold.oversized_split_user_vars = Some(self.user_num_vars);
+        }
         let mut aux_vars: Vec<Variable> = Vec::with_capacity(num_chunks - 1);
         for _ in 0..num_chunks - 1 {
             aux_vars.push(self.new_var());
         }
 
-        let mut all_added = true;
+        let mut links: Vec<Vec<Literal>> = Vec::with_capacity(num_chunks);
         for c in 0..num_chunks {
             let start = c * chunk;
             let end = ((c + 1) * chunk).min(body.len());
@@ -766,6 +805,53 @@ impl Solver {
             }
             // Replicate scope selectors into every link.
             sub.extend_from_slice(&selectors);
+            links.push(sub);
+        }
+
+        // Under a DRAT/VeriPB surface the checker holds the input clause whole
+        // and must be told about the links, or the first step that touches a
+        // link (a deletion, a RUP through it) is rejected (2026-09-17 audit).
+        // The links are derived as extension definitions, last link first:
+        // `a_{c-1} <-> (chunk_c v a_c)` is the link `(¬a_{c-1} v chunk_c v a_c)`,
+        // redundant on its fresh first literal, plus the reverse binaries
+        // `(a_{c-1} v ¬l)` for every `l` of the chunk and `(a_{c-1} v ¬a_c)`,
+        // each RAT on `a_{c-1}` (the only resolvent, with the link, is a
+        // tautology). The first link `(chunk_0 v a_0)` is then RUP: its
+        // negation runs the reverse binaries down the chain and falsifies the
+        // input clause. The reverse binaries and the input clause are deleted
+        // afterwards, so the checker's database is the solver's. Not under
+        // LRAT, which would need the hint chains, and not for a learned
+        // clause (never oversized in practice).
+        let proof_side = self.proof_manager.is_some() && !self.cold.lrat_enabled && !learned;
+        if proof_side {
+            let mut reverse: Vec<Vec<Literal>> = Vec::new();
+            for c in (1..num_chunks).rev() {
+                let _ = self.proof_emit_add(&links[c], &[], ProofAddKind::Derived);
+                let head = Literal::positive(aux_vars[c - 1]);
+                let start = c * chunk;
+                let end = ((c + 1) * chunk).min(body.len());
+                for &lit in &body[start..end] {
+                    let binary = vec![head, lit.negated()];
+                    let _ = self.proof_emit_add(&binary, &[], ProofAddKind::Derived);
+                    reverse.push(binary);
+                }
+                if c + 1 < num_chunks {
+                    let binary = vec![head, Literal::negative(aux_vars[c])];
+                    let _ = self.proof_emit_add(&binary, &[], ProofAddKind::Derived);
+                    reverse.push(binary);
+                }
+            }
+            let _ = self.proof_emit_add(&links[0], &[], ProofAddKind::Derived);
+            for binary in &reverse {
+                let _ = self.proof_emit_delete(binary, 0);
+            }
+            let mut whole: Vec<Literal> = body.clone();
+            whole.extend_from_slice(&selectors);
+            let _ = self.proof_emit_delete(&whole, 0);
+        }
+
+        let mut all_added = true;
+        for mut sub in links {
             // Each sub-clause is within the split threshold, so this recursive
             // call cannot re-enter the oversized path.
             if !self.add_clause_unscoped_inner(&mut sub, learned, global) {

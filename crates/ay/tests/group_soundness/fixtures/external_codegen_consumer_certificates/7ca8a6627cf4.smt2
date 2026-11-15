@@ -1,0 +1,8 @@
+(set-option :timeout 180000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const narrow_a (_ BitVec 8))
+(declare-const narrow_b (_ BitVec 8))
+(assert (not (= ((_ zero_extend 24) (bvsub narrow_a narrow_b)) (bvand (_ bv255 32) (bvsub ((_ zero_extend 24) narrow_a) ((_ zero_extend 24) narrow_b))))))
+(check-sat)
+(exit)

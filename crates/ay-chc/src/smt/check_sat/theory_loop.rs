@@ -13,13 +13,16 @@ use ay_core::{Sort, TermStore};
 use super::super::context::SmtContext;
 use super::super::model_verify::is_theory_atom;
 use super::super::types::{FarkasConflict, SmtResult, UnsatCore};
-use super::support::{build_theory_solvers, LiaReusableState};
+use super::support::{build_theory_solvers, LiaReusableState, LoopSat};
 use super::term_growth;
 use super::{CnfState, PreparedQuery, TermGrowthAction};
 use crate::ChcExpr;
 
 #[cfg(test)]
-use super::record_sat_model_iteration_for_tests;
+use super::{
+    record_sat_model_iteration_for_tests, record_unsat_recovery_for_tests,
+    record_unsat_replay_for_tests,
+};
 
 impl SmtContext {
     /// Run the DPLL(T) theory loop for a check_sat query.
@@ -53,13 +56,16 @@ impl SmtContext {
             mut term_to_var,
             mut var_to_term,
             mut num_vars,
-            mut sat,
+            sat,
             assumptions,
             assumption_map,
             bv_var_offset,
             bv_term_to_bits,
             roots,
         } = cnf_state;
+        // Every clause the loop adds from here on is logged for the #5384
+        // UNSAT replay (see `LoopSat`).
+        let mut sat = LoopSat::new(sat);
 
         let debug = crate::debug_chc_smt_enabled();
         // Inc-10 overstay-attribution trace: level 1 = log loop phases once
@@ -99,6 +105,12 @@ impl SmtContext {
         // fix — extending blocking clauses with the frontier-selecting gate
         // literals — is tracked in the Phase 3 plan.)
         const RELEVANCY_ITERATION_CAP: usize = 200;
+        // #5384 recoveries allowed per query. The defense replaces the SAT
+        // solver when a replay of the input clauses without learned clauses is
+        // SAT; a second such verdict on one query cannot be told apart from a
+        // lemma the replay missed, so the loop fails closed instead of cycling.
+        const MAX_UNSAT_RECOVERIES: usize = 1;
+        let mut unsat_recoveries: usize = 0;
 
         // Detect Real-sorted theory atoms. DPLL(T) without theory propagation
         // is incomplete for LRA: it may return false-UNSAT when no Boolean
@@ -189,6 +201,14 @@ impl SmtContext {
                         return SmtResult::Unknown;
                     }
                 }
+                // A cancelled portfolio lane is an expired deadline (the
+                // winner no longer needs this check).
+                if crate::smt::deadline::lane_cancelled() {
+                    if debug {
+                        safe_eprintln!("[CHC-SMT] Portfolio lane cancelled");
+                    }
+                    return SmtResult::Unknown;
+                }
                 if TermStore::global_memory_exceeded() {
                     if debug {
                         safe_eprintln!("[CHC-SMT] Global term memory budget exceeded");
@@ -217,6 +237,9 @@ impl SmtContext {
                     return SmtResult::Unknown;
                 }
                 dt_iterations += 1;
+                if crate::run_meter::charge(crate::run_meter::Step::TheoryRound).is_err() {
+                    return SmtResult::Unknown;
+                }
                 if debug && dt_iterations.is_multiple_of(10_000) {
                     safe_eprintln!("[CHC-SMT] DPLL(T) iteration {}", dt_iterations);
                 }
@@ -226,24 +249,28 @@ impl SmtContext {
                 // deadline, so a `timeout = None` query is still interrupted at
                 // the solve deadline instead of spinning in BCP/conflict search.
                 let should_stop = || {
+                    ay_core::resource::note_sat_stop_poll();
                     timeout.is_some_and(|t| start.elapsed() >= t)
                         || global_deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
+                        || crate::smt::deadline::lane_cancelled()
                 };
                 overstayed("pre_sat_solve");
-                let sat_result = if let Some(assumptions) = &assumptions {
-                    sat.solve_with_assumptions_interruptible(assumptions, should_stop)
-                        .into_inner()
-                } else {
-                    match sat.solve_interruptible(should_stop).into_inner() {
-                        ay_sat::SatResult::Sat(model) => ay_sat::AssumeResult::Sat(model),
-                        ay_sat::SatResult::Unsat(_) => {
-                            ay_sat::AssumeResult::Unsat(Vec::new(), None)
+                let sat_result = crate::run_meter::sat_solve(&mut sat, |sat| {
+                    if let Some(assumptions) = &assumptions {
+                        sat.solve_with_assumptions_interruptible(assumptions, should_stop)
+                            .into_inner()
+                    } else {
+                        match sat.solve_interruptible(should_stop).into_inner() {
+                            ay_sat::SatResult::Sat(model) => ay_sat::AssumeResult::Sat(model),
+                            ay_sat::SatResult::Unsat(_) => {
+                                ay_sat::AssumeResult::Unsat(Vec::new(), None)
+                            }
+                            ay_sat::SatResult::Unknown => ay_sat::AssumeResult::Unknown,
+                            #[allow(unreachable_patterns)]
+                            _ => ay_sat::AssumeResult::Unknown,
                         }
-                        ay_sat::SatResult::Unknown => ay_sat::AssumeResult::Unknown,
-                        #[allow(unreachable_patterns)]
-                        _ => ay_sat::AssumeResult::Unknown,
                     }
-                };
+                });
 
                 overstayed("post_sat_solve");
                 match sat_result {
@@ -579,7 +606,13 @@ impl SmtContext {
                                             .collect::<Vec<_>>()
                                     );
                                     }
-                                    sat.add_clause(blocking_clause);
+                                    // A model-based block, not a lemma: the
+                                    // disagreement may come from `get_term_value`
+                                    // recomputing an opaque `*`/`div`/`mod` column
+                                    // the theory model already assigned. Kept out
+                                    // of the UNSAT replay (`LoopSat`): an UNSAT
+                                    // that rests on it is answered `Unknown`.
+                                    sat.add_model_block(blocking_clause);
                                     continue;
                                 }
 
@@ -926,18 +959,38 @@ impl SmtContext {
                             );
                         }
 
-                        // #5384 defense: verify UNSAT by replaying original clauses in a
+                        // #5384 defense: verify UNSAT by replaying the INPUT clauses in a
                         // fresh solver (no learned clauses). If the fresh solver returns
                         // SAT, the main solver's UNSAT was caused by an incorrect learned
                         // clause. We recover by replacing the main solver with the fresh
                         // one and re-running the SAT check on the next iteration.
+                        //
+                        // The input clauses are the initial CNF (the first trace
+                        // originals) AND every clause this loop added since — the theory
+                        // blocking clauses and the split / model-equality encodings
+                        // logged by `LoopSat`. Replaying the initial CNF alone dropped the
+                        // theory lemmas: a query that is UNSAT only modulo them came back
+                        // SAT from the fresh solver, the recovery installed that solver,
+                        // and the loop re-derived the same lemmas from the same models
+                        // forever (2026-09-23, 3 h 40 min observed on a 12-atom ground
+                        // LIA query; LIA_finite_domain_deadline_2026-09-23.md). The
+                        // recovery is also capped at `MAX_UNSAT_RECOVERIES` per query.
+                        //
+                        // The model-based `violated_constraint` blocks are in the
+                        // solver (and the trace's originals) but deliberately NOT in the
+                        // replay (`LoopSat::replay_clauses`): they are not lemmas and can
+                        // exclude a satisfiable assignment.
+                        // Whenever any is present the replay runs even without
+                        // learned clauses, and a SAT replay then means the UNSAT
+                        // rested on a block — answered `Unknown`, never confirmed.
                         overstayed("pre_unsat_replay");
+                        let has_model_blocks = !sat.model_blocks().is_empty();
                         if let Some(trace) = sat.clause_trace() {
-                            if trace.learned_clauses().next().is_some() {
-                                let orig_clauses: Vec<Vec<ay_sat::Literal>> = trace
-                                    .original_clauses()
-                                    .map(|e| e.clause.to_vec())
-                                    .collect();
+                            if trace.learned_clauses().next().is_some() || has_model_blocks {
+                                #[cfg(test)]
+                                record_unsat_replay_for_tests();
+                                let replay = sat.replay_clauses().unwrap_or_default();
+                                let loop_added = sat.added_clauses().len();
                                 let mut fresh = ay_sat::Solver::new(num_vars as usize);
                                 fresh.enable_clause_trace();
                                 // Internal CHC queries never consume the UNSAT
@@ -948,7 +1001,7 @@ impl SmtContext {
                                 // must replay the original clause trace without
                                 // preprocessing rewrites.
                                 fresh.set_preprocess_enabled(false);
-                                for cl in &orig_clauses {
+                                for cl in &replay {
                                     fresh.add_clause(cl.clone());
                                 }
                                 // Inc-10: the replay must honor the per-check
@@ -960,16 +1013,18 @@ impl SmtContext {
                                 // refute the UNSAT — returning Unknown is the
                                 // only sound answer.
                                 let (fresh_is_sat, fresh_is_unknown) =
-                                    if let Some(ref assumptions) = assumptions {
-                                        let r = fresh.solve_with_assumptions_interruptible(
-                                            assumptions,
-                                            should_stop,
-                                        );
-                                        (r.is_sat(), r.is_unknown())
-                                    } else {
-                                        let r = fresh.solve_interruptible(should_stop);
-                                        (r.is_sat(), r.is_unknown())
-                                    };
+                                    crate::run_meter::sat_solve(&mut fresh, |fresh| {
+                                        if let Some(ref assumptions) = assumptions {
+                                            let r = fresh.solve_with_assumptions_interruptible(
+                                                assumptions,
+                                                should_stop,
+                                            );
+                                            (r.is_sat(), r.is_unknown())
+                                        } else {
+                                            let r = fresh.solve_interruptible(should_stop);
+                                            (r.is_sat(), r.is_unknown())
+                                        }
+                                    });
                                 overstayed("post_unsat_replay_solve");
                                 if fresh_is_unknown {
                                     if debug {
@@ -981,17 +1036,56 @@ impl SmtContext {
                                     return SmtResult::Unknown;
                                 }
                                 if fresh_is_sat {
+                                    if has_model_blocks {
+                                        if debug {
+                                            safe_eprintln!(
+                                                "[CHC-SMT] UNSAT rested on {} model-based \
+                                                 violated-constraint block(s): the replay without \
+                                                 them is SAT; returning Unknown",
+                                                sat.model_blocks().len()
+                                            );
+                                        }
+                                        return SmtResult::Unknown;
+                                    }
+                                    if unsat_recoveries >= MAX_UNSAT_RECOVERIES {
+                                        if debug {
+                                            safe_eprintln!(
+                                                "[CHC-SMT] UNSAT recovery: fresh solver SAT again \
+                                                 after {} recover(y/ies) on this query; cannot \
+                                                 converge, returning Unknown",
+                                                unsat_recoveries
+                                            );
+                                        }
+                                        return SmtResult::Unknown;
+                                    }
+                                    unsat_recoveries += 1;
+                                    #[cfg(test)]
+                                    record_unsat_recovery_for_tests();
                                     if debug {
                                         safe_eprintln!(
-                                        "[CHC-SMT] UNSAT recovery: fresh solver SAT on {} orig clauses, \
-                                         discarding bad learned clauses",
-                                        orig_clauses.len(),
-                                    );
+                                            "[CHC-SMT] UNSAT recovery: fresh solver SAT on {} input \
+                                             clauses ({} initial + {} loop-added), discarding bad \
+                                             learned clauses",
+                                            replay.len(),
+                                            replay.len().saturating_sub(loop_added),
+                                            loop_added
+                                        );
                                     }
-                                    sat = fresh;
+                                    sat.replace_solver(fresh);
                                     continue;
                                 }
                             }
+                        } else if has_model_blocks {
+                            // No clause trace to replay from: the UNSAT cannot be
+                            // separated from the model-based blocks. Fail closed.
+                            if debug {
+                                safe_eprintln!(
+                                    "[CHC-SMT] UNSAT with {} model-based block(s) and no clause \
+                                     trace to verify against; returning Unknown",
+                                    sat.model_blocks().len()
+                                );
+                            }
+                            return SmtResult::Unknown;
                         }
 
                         // #5925 soundness guard: DPLL(T) without theory propagation

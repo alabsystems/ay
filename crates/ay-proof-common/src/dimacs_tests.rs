@@ -91,9 +91,19 @@ fn test_parse_with_ids_sequential() {
     let input = b"p cnf 3 4\n1 2 0\n-1 3 0\n2 -3 0\n-2 -3 0\n";
     let cnf = parse_cnf_with_ids(&input[..]).unwrap();
     assert_eq!(cnf.clauses.len(), 4);
-    for (i, (id, _)) in cnf.clauses.iter().enumerate() {
-        assert_eq!(*id, (i + 1) as u64);
-    }
+    // The expected IDs are written out rather than derived as `(i + 1) as u64`
+    // from `enumerate()`: the Trust hardened-boundary lane has no range fact
+    // for an `enumerate` index (it is a fresh symbolic, not bounded by the
+    // slice length), so that `i + 1` was REFUTED at `i == usize::MAX`
+    // (MEASURED 2026-09-22 on trust 3e7b7b15b: `[hardened_panic_boundary]
+    // mir_assert::Overflow(Add) FAILED (ay-in-process) counterexample:
+    // i = 18446744073709551615`) while the sibling `[overflow:add]` row for
+    // the same expression was PROVED. The value can never exceed
+    // `isize::MAX - 1` at runtime, so the refutation is an encoding gap, not a
+    // reachable overflow; the check is the same either way and this spelling
+    // carries no arithmetic for the verifier to guess about.
+    let ids: Vec<u64> = cnf.clauses.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, [1, 2, 3, 4]);
 }
 
 #[test]

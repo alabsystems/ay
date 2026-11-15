@@ -15,49 +15,9 @@ impl PdrSolver {
     /// invalid problem, startup discovery proved safety). Returns `None` to
     /// proceed to the main PDR loop.
     pub(super) fn solve_init(&mut self) -> Option<PdrResult> {
-        // Set the solve deadline. A caller-supplied timeout takes precedence;
-        // otherwise a generous DEFAULT SAFETY deadline is ALWAYS installed. This
-        // is load-bearing: panic-freedom (and other proof-seeking) obligations
-        // run WITHOUT a timeout — they want a proof, not Unknown — so without a
-        // default the wall-clock deadline is never set, the propagate-level
-        // deadline poll (TheoryExtension::propagate_impl) can never fire, and a
-        // divergent conflict-free/decision-free level-0 theory-propagation churn
-        // spins at 100% CPU forever, hanging the whole verification gate. With
-        // the default, such a solve terminates fail-closed to Unknown (never a
-        // fabricated Sat/Unsat) after DEFAULT_SAFETY_DEADLINE, which is set far
-        // above any legitimate proof time so it only ever kills a true spin.
-        const DEFAULT_SAFETY_DEADLINE: std::time::Duration = std::time::Duration::from_mins(5);
-        let config_deadline = ay_core::time::Instant::now()
-            + self.config.solve_timeout.unwrap_or(DEFAULT_SAFETY_DEADLINE);
-        // Honor any TIGHTER ambient absolute deadline the embedding lane already
-        // installed for this obligation, taking the MINIMUM (fail-closed — this
-        // only ever SHORTENS the deadline). Two sources are consulted:
-        //   * `current_thread_solve_deadline()` — a thread-scoped deadline the
-        //     embedder installs ONCE at obligation entry (`ScopedSolveDeadline`).
-        //     Because it is ABSOLUTE and thread-wide, every INNER `PdrSolver::solve`
-        //     the engine spawns for this obligation (portfolio/validation/probe
-        //     sub-solves) inherits the SAME wall-clock ceiling instead of being
-        //     re-granted a fresh full budget each time it re-enters `solve_init`
-        //     (the per-round fresh-budget regression class, cf. 88c66631).
-        //   * `self.smt.current_global_deadline()` — a deadline already pushed
-        //     onto THIS `SmtContext` by an enclosing solve; without the min the
-        //     line below (`set_global_solve_deadline`) would CLOBBER a tighter
-        //     enclosing deadline with our looser (up to 300s default) one.
-        // A caller that wants the full default simply installs neither.
-        self.solve_deadline = [
-            Some(config_deadline),
-            crate::smt::current_thread_solve_deadline(),
-            self.smt.current_global_deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
-        // Plumb the absolute solve deadline down to the SMT context so EVERY
-        // check_sat (startup discovery, portfolio engines, proof validation —
-        // not just the main blocking loop) honors it, even when invoked without
-        // a per-query timeout. Without this a single unbounded query on an
-        // integer-modulo CHC could spin for minutes/hours past solve_timeout.
-        self.smt.set_global_solve_deadline(self.solve_deadline);
+        if self.establish_original_solve_deadline().is_none() {
+            return Some(self.finish_with_result_trace(PdrResult::Unknown));
+        }
 
         // Import cross-engine lemma pool hints (#7919).
         // Convert SharedLemma entries to LemmaHint and merge into user_hints
@@ -129,9 +89,52 @@ impl PdrSolver {
             "PDR: max_obligations must be >= 1"
         );
 
+        // `validate` has already distinguished a genuinely query-free invalid
+        // problem from one whose every query was pruned or retained with a
+        // body simplified to `false`. In either case there is no live safety
+        // obligation left to search for: interpreting every predicate as
+        // `true` satisfies each remaining defining clause (its head is a
+        // predicate), and the strict Safe boundary below still verifies the
+        // model clause by clause. Without this exit, the main loop has no
+        // query from which to seed an obligation and can only time out.
+        if self
+            .problem
+            .queries()
+            .all(|query| matches!(query.body.constraint, Some(ChcExpr::Bool(false))))
+        {
+            let mut model = InvariantModel::new();
+            for pred in self.problem.predicates() {
+                let vars = self
+                    .caches
+                    .predicate_vars
+                    .get(&pred.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        pred.arg_sorts
+                            .iter()
+                            .enumerate()
+                            .map(|(index, sort)| {
+                                crate::ChcVar::new(format!("x{index}"), sort.clone())
+                            })
+                            .collect()
+                    });
+                model.set(
+                    pred.id,
+                    PredicateInterpretation::new(vars, ChcExpr::Bool(true)),
+                );
+            }
+            return Some(self.finish_safe_with_result_trace(model, "all queries vacuously false"));
+        }
+
         // Initialize: check if initial states satisfy safety
         match self.init_safe() {
             InitResult::Safe => {}
+            InitResult::Interrupted => {
+                return Some(self.finish_with_result_trace(PdrResult::Unknown));
+            }
+            InitResult::UnsafeWithEvidence(counterexample) => {
+                return Some(self.finish_with_result_trace(PdrResult::Unsafe(counterexample)));
+            }
             InitResult::Unsafe => {
                 if self.config.verbose {
                     safe_eprintln!("PDR: Initial state violates safety");
@@ -239,6 +242,7 @@ impl PdrSolver {
         );
         config.per_depth_timeout = Some(std::time::Duration::from_millis(250));
         config.time_budget = Some(std::time::Duration::from_secs(2));
+        config.smt_lane = self.config.smt_lane;
 
         if self.config.verbose {
             safe_eprintln!("PDR: Running bounded unsafe precheck to depth {max_depth}");
@@ -378,7 +382,9 @@ impl PdrSolver {
 
     /// Initialize must-summaries at level 0 from fact clauses.
     /// Returns `true` on success, `false` if reach-fact capacity was exceeded.
-    fn init_must_summaries_from_facts(&mut self) -> bool {
+    pub(in crate::pdr::solver) fn init_must_summaries_from_facts(&mut self) -> bool {
+        // Source-name census for renaming each fact apart (see below).
+        let names = self.source_names();
         for (clause_index, clause) in self.problem.clauses().iter().enumerate() {
             // Fact clause: no body predicates, just a constraint leading to head
             if clause.body.predicates.is_empty() {
@@ -393,11 +399,35 @@ impl PdrSolver {
                     // Map clause variables to canonical predicate variables
                     if let Some(canonical_vars) = self.canonical_vars(*pred) {
                         if head_args.len() == canonical_vars.len() {
-                            let rewritten = fact_summary::rewrite_fact_summary(
-                                &constraint,
-                                head_args,
+                            // The summary is applied to OTHER clauses' body
+                            // arguments (must reachability, entry checks,
+                            // forward propagation, mixed summaries): the
+                            // fact's local (non-head) variables must not keep
+                            // names a step clause may also use. Rename the
+                            // fact apart first; the head variables become the
+                            // canonical ones either way (`rename_clause_apart`).
+                            // A failed rename skips this summary (must
+                            // summaries only ever add reachability evidence).
+                            let Some((renamed_constraint, renamed_head_args)) =
+                                names.as_ref().and_then(|names| {
+                                    self.rename_clause_apart(
+                                        names,
+                                        &format!("__fact{clause_index}_"),
+                                        &constraint,
+                                        head_args,
+                                        std::iter::empty(),
+                                    )
+                                })
+                            else {
+                                continue;
+                            };
+                            let Some(rewritten) = fact_summary::rewrite_fact_summary(
+                                &renamed_constraint,
+                                &renamed_head_args,
                                 canonical_vars,
-                            );
+                            ) else {
+                                continue;
+                            };
                             if self.config.verbose {
                                 safe_eprintln!(
                                     "PDR: Init must-summary for pred {} at level 0: {}",
@@ -405,9 +435,22 @@ impl PdrSolver {
                                     rewritten
                                 );
                             }
+                            // Witness instances keep the fact clause's own
+                            // names: the counterexample verifier substitutes
+                            // them into THIS fact clause (same scope).
+                            let Some(instances_source) = fact_summary::rewrite_fact_summary(
+                                &constraint,
+                                head_args,
+                                canonical_vars,
+                            ) else {
+                                continue;
+                            };
                             // Create ReachFact FIRST to get id for backed must-summary
                             let mut instances = FxHashMap::default();
-                            cube::extract_equalities_from_formula(&rewritten, &mut instances);
+                            cube::extract_equalities_from_formula(
+                                &instances_source,
+                                &mut instances,
+                            );
                             let Some(id) = Self::insert_reach_fact_bounded(
                                 &mut self.reachability,
                                 self.config.verbose,

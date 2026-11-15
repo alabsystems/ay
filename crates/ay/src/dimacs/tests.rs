@@ -15,11 +15,11 @@ use super::{
     inject_dimacs_proof_identity_failure_once, inject_dimacs_rename_noreplace_error_once,
     inject_dimacs_status_lock_identity_failure_once, inject_optional_dimacs_writer_failure_once,
     mark_synthesized_default_dimacs_proof_current, mark_synthesized_default_dimacs_proof_stale,
-    owned_dimacs_proof_write_failure_flag, proof_output_writer,
-    publish_dimacs_descriptor_noreplace, read_published_dimacs_proof, remove_owned_dimacs_proof,
-    rename_dimacs_noreplace, retain_published_dimacs_proof, seal_owned_dimacs_proof,
-    DimacsProofRequirement, DimacsPublicationInvalidation, DimacsUnsatPublicationTransaction,
-    RetainedDimacsPublication, SolverDimacsProofWriter, DIMACS_PROOF_STAGING_PREFIX,
+    owned_dimacs_proof_write_failure_flag, publish_dimacs_descriptor_noreplace,
+    read_published_dimacs_proof, remove_owned_dimacs_proof, rename_dimacs_noreplace,
+    retain_published_dimacs_proof, seal_owned_dimacs_proof, DimacsProofRequirement,
+    DimacsPublicationInvalidation, DimacsUnsatPublicationTransaction, RetainedDimacsPublication,
+    SolverDimacsProofWriter, DIMACS_PROOF_STAGING_PREFIX,
 };
 use super::{
     checked_lrat_original_clause_count, clique_n2_k10_original_order_witness,
@@ -2976,8 +2976,15 @@ fn test_dimacs_stats_json_exports_tail_reorder_gate_as_boolean() {
     );
 }
 
+/// A timed-out solve's proof is discarded, never completed (2026-09-13). Under
+/// #2971 this test pinned the opposite, a flush of the buffered bytes before
+/// the timeout exit. No consumer relies on the proof of an unanswered run, and
+/// a completed one is what the SAT-COMP runner found left behind on 166e1e5a.
+/// The proof is staged under a visible name on every platform (Linux would
+/// otherwise stage anonymously), so the empty-directory check can fail there.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-fn test_dimacs_timeout_exit_flushes_buffered_proof_output_2971() {
+fn test_dimacs_timeout_exit_discards_buffered_proof_output_2971() {
     struct TimeoutFlagGuard;
     impl Drop for TimeoutFlagGuard {
         fn drop(&mut self) {
@@ -2986,34 +2993,56 @@ fn test_dimacs_timeout_exit_flushes_buffered_proof_output_2971() {
         }
     }
 
-    let proof_path = std::env::temp_dir().join(format!(
-        "ay_dimacs_timeout_flush_{}.drat",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&proof_path);
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(proof_path.clone());
-
-    let file = std::fs::File::create(&proof_path).expect("create proof fixture");
-    let proof_output = ProofOutput::drat_text(BufWriter::new(file));
-    let mut solver = SatSolver::with_proof_output(1, proof_output);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof = ProofConfig {
+        path: dir.path().join("proof.drat").to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: false,
+        format_was_explicit: true,
+    };
+    #[cfg(target_os = "linux")]
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+    let file = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    let custody = super::owned_dimacs_proof_custody(&proof.path).expect("proof custody");
+    let sink = super::solver_proof_output_writer(file, &proof).expect("production proof sink");
+    let mut solver = SatSolver::with_proof_output(1, ProofOutput::drat_text(sink));
     solver.add_clause(Vec::new());
 
     TIMED_OUT.store(true, Ordering::SeqCst);
     VERDICT_PRINTED.store(true, Ordering::SeqCst);
     let _guard = TimeoutFlagGuard;
 
-    let code = dimacs_timeout_exit_code_for_policy(Some(&mut solver), false);
+    let code = dimacs_timeout_exit_code_for_policy(Some(&mut solver), Some(&proof), false);
     assert_eq!(code, Some(DIMACS_TIMEOUT_EXIT_CODE));
+    assert!(
+        solver.proof_writer().is_none(),
+        "the timeout exit must detach the proof writer"
+    );
+    assert!(
+        custody.is_abandoned(),
+        "the timed-out generation is abandoned"
+    );
+    let left: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read proof parent")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
     assert_eq!(
-        std::fs::read_to_string(&proof_path).expect("read flushed proof fixture"),
-        "0\n",
-        "timeout exit preparation must flush buffered DRAT/LRAT output before propagating 124",
+        left,
+        Vec::<String>::new(),
+        "a timed-out solve leaves no proof, no stage and no quarantine behind"
+    );
+    assert!(
+        super::owned_dimacs_proof_custody(&proof.path).is_err(),
+        "the registry no longer holds the timed-out generation"
     );
 }
 
@@ -3052,7 +3081,7 @@ fn test_dimacs_timeout_exit_retains_fmla_learned_lrat_fail_closed_diagnostic() {
     VERDICT_PRINTED.store(true, Ordering::SeqCst);
     let _guard = TimeoutFlagGuard;
 
-    let code = dimacs_timeout_exit_code_for_policy(Some(&mut solver), false);
+    let code = dimacs_timeout_exit_code_for_policy(Some(&mut solver), None, false);
     assert_eq!(code, Some(DIMACS_TIMEOUT_EXIT_CODE));
     let artifact_json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&artifact_path).expect("read retained Fmla dry-run artifact"),
@@ -3184,7 +3213,7 @@ fn test_satcomp_dimacs_timeout_exit_code_is_unknown_success() {
     VERDICT_PRINTED.store(true, Ordering::SeqCst);
     let _guard = TimeoutFlagGuard;
 
-    let code = dimacs_timeout_exit_code_for_policy(None, true);
+    let code = dimacs_timeout_exit_code_for_policy(None, None, true);
     assert_eq!(
         code,
         Some(0),
@@ -3746,6 +3775,14 @@ fn private_dimacs_staging_debris_bytes(parent: &Path) -> Vec<Vec<u8>> {
     debris
 }
 
+/// What an inode held open across its authenticated removal now holds.
+#[cfg(target_os = "linux")]
+fn held_dimacs_inode_bytes(mut held: std::fs::File) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut held, &mut bytes).expect("read the held DIMACS inode");
+    bytes
+}
+
 #[cfg(target_os = "linux")]
 fn retained_test_transaction(
     proof: &ProofConfig,
@@ -4019,15 +4056,16 @@ fn named_fallback_seal_collision_preserves_the_raced_target() {
         std::fs::read(&path).expect("read target"),
         b"raced target\n"
     );
+    let stages = private_dimacs_staging_entries(dir.path());
+    assert_eq!(stages.len(), 1, "one fallback sibling stage");
+    let held = std::fs::File::open(&stages[0]).expect("hold the owned stage inode");
     assert!(remove_owned_dimacs_proof(path_text).expect("discard fallback staging"));
     assert_eq!(
         std::fs::read(&path).expect("read target"),
         b"raced target\n"
     );
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![b"invalidated-by-ay\n".to_vec()]
-    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert_eq!(held_dimacs_inode_bytes(held), b"invalidated-by-ay\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -4041,6 +4079,7 @@ fn named_fallback_cleanup_preserves_replacement_after_quarantine() {
     proof.write_all(b"0\n").expect("write proof");
     drop(proof);
     seal_owned_dimacs_proof(path_text).expect("publish fallback proof");
+    let held = std::fs::File::open(&path).expect("hold the published inode");
     inject_dimacs_proof_cleanup_replacement_once();
 
     assert!(remove_owned_dimacs_proof(path_text).expect("remove authenticated fallback proof"));
@@ -4048,10 +4087,8 @@ fn named_fallback_cleanup_preserves_replacement_after_quarantine() {
         std::fs::read(&path).expect("read raced replacement"),
         b"raced replacement\n"
     );
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![b"invalidated-by-ay\n".to_vec()]
-    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert_eq!(held_dimacs_inode_bytes(held), b"invalidated-by-ay\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -4071,13 +4108,13 @@ fn named_fallback_enosys_fails_before_target_exposure() {
         .expect_err("missing renameat2 must fail before publishing the named stage");
     assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSYS));
     assert!(!path.exists(), "ENOSYS must precede target exposure");
-    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+    let stages = private_dimacs_staging_entries(dir.path());
+    assert_eq!(stages.len(), 1);
+    let held = std::fs::File::open(&stages[0]).expect("hold the owned stage inode");
     assert!(remove_owned_dimacs_proof(path_text).expect("invalidate failed named stage"));
     assert!(!path.exists());
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![b"invalidated-by-ay\n".to_vec()]
-    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert_eq!(held_dimacs_inode_bytes(held), b"invalidated-by-ay\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -4209,9 +4246,12 @@ fn status_lock_post_create_identity_failure_cleans_exact_owned_path() {
     assert!(!proof_path.exists());
     assert!(!status_path.exists());
     assert!(!lock_path.exists(), "owned lock pathname must be removed");
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![Vec::<u8>::new()]
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read proof parent")
+            .next()
+            .is_none(),
+        "the released lock must leave no private quarantine behind"
     );
 }
 
@@ -4376,6 +4416,7 @@ fn status_failure_cleans_retained_artifact_without_touching_replacement() {
         "DIMACS proof artifact",
         None,
         DimacsPublicationInvalidation::Empty,
+        super::DimacsPublicationRecheck::Bytes,
     )
     .expect("retain artifact authority");
     let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
@@ -4598,6 +4639,7 @@ fn retained_artifact_replacement_invalidates_proof_and_exact_artifact() {
         "DIMACS proof artifact",
         None,
         DimacsPublicationInvalidation::Empty,
+        super::DimacsPublicationRecheck::Bytes,
     )
     .expect("retain artifact authority");
     let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
@@ -4809,8 +4851,13 @@ fn optional_writer_failure_is_visible_to_seal_and_never_publishes_partial_bytes(
     let path_text = path.to_str().expect("UTF-8 path");
     let file = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
     let failed = owned_dimacs_proof_write_failure_flag(path_text).expect("failure flag");
+    let custody = super::owned_dimacs_proof_custody(path_text).expect("proof custody");
     let mut writer = SolverDimacsProofWriter::Optional {
-        writer: proof_output_writer(file),
+        writer: super::ProofWriteBuffer::new(
+            file,
+            custody,
+            super::ProofSpaceGuard::for_proof(path_text),
+        ),
         path: path_text.to_string(),
         failed,
     };
@@ -4900,12 +4947,11 @@ fn dimacs_published_proof_is_bound_to_owned_generation() {
         read_published_dimacs_proof(path_text, seal.sha256).expect("authenticated read"),
         b"0\n"
     );
+    let held = std::fs::File::open(&path).expect("hold the published inode");
     assert!(remove_owned_dimacs_proof(path_text).expect("remove owned proof"));
     assert!(!path.exists());
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![b"invalidated-by-ay\n".to_vec()]
-    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert_eq!(held_dimacs_inode_bytes(held), b"invalidated-by-ay\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -4944,6 +4990,7 @@ fn dimacs_cleanup_preserves_replacement_raced_after_quarantine() {
     std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
     drop(proof);
     seal_owned_dimacs_proof(path_text).expect("seal proof");
+    let held = std::fs::File::open(&path).expect("hold the published inode");
     inject_dimacs_proof_cleanup_replacement_once();
 
     assert!(remove_owned_dimacs_proof(path_text).expect("remove quarantined owned proof"));
@@ -4951,10 +4998,8 @@ fn dimacs_cleanup_preserves_replacement_raced_after_quarantine() {
         std::fs::read(&path).expect("read raced replacement"),
         b"raced replacement\n"
     );
-    assert_eq!(
-        private_dimacs_staging_debris_bytes(dir.path()),
-        vec![b"invalidated-by-ay\n".to_vec()]
-    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert_eq!(held_dimacs_inode_bytes(held), b"invalidated-by-ay\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -4980,7 +5025,7 @@ fn dimacs_cleanup_restores_replacement_found_before_quarantine() {
         std::fs::read(&displaced).expect("read displaced proof"),
         b"invalidated-by-ay\n"
     );
-    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
 }
 
 #[test]
@@ -5005,4 +5050,81 @@ fn authenticated_dimacs_source_rejects_replacement() {
 fn explicit_proof_verification_never_accepts_a_skipped_check() {
     assert!(verification_skip_is_acceptable(false));
     assert!(!verification_skip_is_acceptable(true));
+}
+
+/// Exercise the actual global allocator → run settlement → proof retirement
+/// path after real proof bytes exist, without calibrating solver search/RSS.
+#[cfg(all(feature = "cli", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn allocator_ceiling_discards_a_byte_bearing_proof_generation() {
+    const CHILD: &str = "AY_TEST_BYTE_BEARING_PROOF_CEILING";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let proof = ProofConfig {
+            path: std::path::PathBuf::from(directory)
+                .join("proof.drat")
+                .to_string_lossy()
+                .into_owned(),
+            format: ProofFormat::Drat,
+            binary: false,
+            artifact_path: None,
+            is_temp: false,
+            synthesized_default: false,
+            format_was_explicit: true,
+        };
+        #[cfg(target_os = "linux")]
+        inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+        let file = create_configured_dimacs_proof_file(&proof).expect("reserve original proof");
+        let custody = super::owned_dimacs_proof_custody(&proof.path).expect("original custody");
+        let mut writer = super::solver_proof_output_writer(file, &proof).expect("original writer");
+        writer
+            .write_all(b"1 -2 0\n")
+            .expect("write actual proof bytes");
+        writer.flush().expect("flush actual proof bytes");
+        assert!(custody.descriptor.metadata().unwrap().len() > 0);
+        crate::owe_response_for_new_query();
+        ay_sys::set_hard_memory_ceiling_settlement(crate::settle_run_at_memory_ceiling);
+        let ceiling = ay_sys::current_live_bytes().checked_add(64 * 1024).unwrap();
+        ay_sys::arm_hard_memory_ceiling(ceiling, &crate::HARD_CEILING_SAT_COMPETITION);
+        let allocation = vec![0x5au8; 256 * 1024];
+        std::hint::black_box(&allocation);
+        panic!("the real allocation ceiling did not terminate the child");
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "dimacs::tests::allocator_ceiling_discards_a_byte_bearing_proof_generation",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD, directory.path());
+    let output = ay_sys::metadata_capture::capture(
+        command,
+        ay_sys::metadata_capture::CaptureLimits {
+            timeout: std::time::Duration::from_secs(10),
+            output_bytes: 64 * 1024,
+            resident_bytes: None,
+        },
+        "allocator proof settlement control",
+    )
+    .expect("bounded original child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.lines().any(|line| line == "s UNKNOWN"),
+        "{stdout}\n{stderr}"
+    );
+    let settlement = stderr
+        .lines()
+        .find(|line| line.starts_with("c memout: the allocator's memory ceiling ended the run"))
+        .expect("actual allocator settlement must discard the proof");
+    let counts: Vec<u64> = settlement
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert_eq!(counts.len(), 2, "{settlement}");
+    assert!(counts[0] > 0 && counts[1] > 0, "{settlement}");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }

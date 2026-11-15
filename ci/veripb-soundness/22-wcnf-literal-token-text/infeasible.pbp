@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% THE OPPOSITE-VERDICT COMPANION, same formula and same binary: what the instance actually
+% is. The two hard clauses are `(x1)` and `(~x1)` — the second is written `-01`, which is
+% the DIMACS literal -1 — so they resolve to the empty clause and the instance is
+% INFEASIBLE. `conclusion BOUNDS INF INF` is the MaxSAT verdict for that.
+%
+% This proof only checks once the parser reads the literal's VALUE: with the token-text
+% naming the two clauses were about DIFFERENT variables, so `pol 1 2 +` produced
+% `+1 x1 +1 ~x01 >= 1` rather than the empty contradiction.
+f 2;
+pol 1 2 +;
+output NONE;
+conclusion BOUNDS INF : 3 INF;
+end pseudo-Boolean proof;

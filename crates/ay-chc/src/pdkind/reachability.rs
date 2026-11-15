@@ -6,7 +6,7 @@
 
 use super::types::*;
 use crate::engine_utils::check_sat_with_timeout;
-use crate::interpolation::{interpolating_sat_constraints_until, InterpolatingSatResult};
+use crate::interpolation::{interpolating_sat_constraints_lra_proof_first, InterpolatingSatResult};
 use crate::smt::{IncrementalCheckResult, IncrementalQueryContext, SmtContext, SmtResult};
 use crate::transition_system::TransitionSystem;
 use crate::ChcExpr;
@@ -53,12 +53,15 @@ pub(super) struct ReachabilityChecker {
     /// state space is all-Bool and we use SAT-native UNSAT core extraction
     /// instead of the arithmetic interpolation cascade.
     pub(super) bv_to_bool_applied: bool,
+    /// PDKIND's cancellation (portfolio winner, lane budget, memory): a
+    /// cancelled checker is past its deadline.
+    cancellation: crate::engine_config::ChcEngineConfig,
 }
 
 impl ReachabilityChecker {
     pub(super) fn new(ts: &TransitionSystem, config: &PdkindConfig) -> Self {
         let one_step_transition = ts.k_transition(1);
-        let mut smt = SmtContext::new();
+        let mut smt = SmtContext::new_search();
 
         // Pre-encode transition into incremental feasibility solver.
         // The transition relation is expensive to encode for SingleLoop problems
@@ -87,6 +90,7 @@ impl ReachabilityChecker {
             smt_timeout: None,
             deadline: None,
             bv_to_bool_applied: config.bv_to_bool_applied,
+            cancellation: config.base.clone(),
         }
     }
 
@@ -101,24 +105,36 @@ impl ReachabilityChecker {
         self.deadline = Some(deadline);
     }
 
-    /// Check if the reachability deadline has passed.
+    /// Check if the reachability deadline has passed or PDKIND was cancelled.
+    ///
+    /// The reachability loops (`reachable`, `check_reachability`) poll this at
+    /// every step; before the cancellation arm, a cancelled PDKIND kept
+    /// issuing interpolation calls until the per-push reachability deadline
+    /// (6 × the obligation timeout, 30 s by default) — the post-cancel reap of
+    /// S-reap and `metros_4_e2_968_e3_931`. SOUND: Unknown only.
     fn past_deadline(&self) -> bool {
-        self.deadline
-            .is_some_and(|d| ay_core::time::Instant::now() >= d)
+        self.cancellation.is_cancelled()
+            || self
+                .deadline
+                .is_some_and(|d| ay_core::time::Instant::now() >= d)
     }
 
     /// Wall-clock deadline for an interpolation call (#421). The interpolation
     /// cascade is otherwise UNBOUNDED — it ignores `smt_timeout` and runs tens of
     /// seconds on hard instances (e.g. dillig01), which is the real reason PDKIND
     /// hung past the 60s test budget at iteration 0. Bound it by the reachability
-    /// deadline, or `now + smt_timeout` as a fallback. SOUND: a hit deadline only
-    /// yields Unknown (the cex stays unrefuted), never a wrong verdict.
+    /// deadline, or `now + smt_timeout` as a fallback; a cancelled checker gets
+    /// an already-expired deadline. SOUND: a hit deadline only yields Unknown
+    /// (the cex stays unrefuted), never a wrong verdict.
     fn interpolation_deadline(&self) -> ay_core::time::Instant {
+        let now = ay_core::time::Instant::now();
+        if self.cancellation.is_cancelled() {
+            return now;
+        }
         self.deadline.unwrap_or_else(|| {
-            ay_core::time::Instant::now()
-                + self
-                    .smt_timeout
-                    .unwrap_or(std::time::Duration::from_secs(10))
+            now + self
+                .smt_timeout
+                .unwrap_or(std::time::Duration::from_secs(10))
         })
     }
 
@@ -208,11 +224,11 @@ impl ReachabilityChecker {
                     }
                 } else {
                     // Arithmetic state space: existing interpolation cascade.
-                    match interpolating_sat_constraints_until(
+                    match interpolating_sat_constraints_lra_proof_first(
                         std::slice::from_ref(&self.ts.init),
                         std::slice::from_ref(state),
                         &state_vars,
-                        self.interpolation_deadline(),
+                        Some(self.interpolation_deadline()),
                     ) {
                         InterpolatingSatResult::Unsat(interp) => ReachabilityResult::Unreachable {
                             explanation: interp,
@@ -397,11 +413,11 @@ impl ReachabilityChecker {
                         }
                     } else {
                         // Arithmetic state space: interpolation cascade.
-                        match interpolating_sat_constraints_until(
+                        match interpolating_sat_constraints_lra_proof_first(
                             &a_constraints,
                             &b_constraints,
                             &boundary_vars,
-                            self.interpolation_deadline(),
+                            Some(self.interpolation_deadline()),
                         ) {
                             InterpolatingSatResult::Unsat(interp_time1) => {
                                 self.ts.shift_versioned_state_vars(&interp_time1, -1)

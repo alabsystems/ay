@@ -14,7 +14,7 @@
 # 4.15.4 is importable, the same programs are cross-checked against z3py; absent
 # z3py, the cross-check is skipped gracefully (and the skip is reported).
 #
-# Run:  cargo build -p ay-ffi  &&  \
+# Run:  targo --unverified build -p ay-ffi  &&  \
 #       AYZ3_LIB=target/debug/libay_ffi.dylib pytest bindings/python/tests/test_tactics.py -v
 
 import pytest

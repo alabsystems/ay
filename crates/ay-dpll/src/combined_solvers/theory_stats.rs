@@ -45,10 +45,30 @@ thread_local! {
     static REPLAY_COVERED_BY_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
+/// Process-wide totals that are never drained (`smt.*_total`). The drained
+/// thread-local counters above are reset per executor invocation and the
+/// statistics block reports the LAST one, so on a lane that re-enters the
+/// executor per split-loop round they read 0 while the profile says the
+/// combiner is the whole wall (2026-09-17 trap). These accumulate across
+/// every invocation on every thread.
+pub(crate) static NO_ROUNDS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMBINER_CHECKS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CHECKS_ARRAYS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Increment the N-O round counter by the given amount.
 #[inline]
 pub(crate) fn inc_no_rounds(n: u64) {
     NO_ROUNDS.with(|c| c.set(c.get() + n));
+    NO_ROUNDS_TOTAL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one `TheoryCombiner::check` (full Nelson-Oppen check) entry.
+#[inline]
+pub(crate) fn inc_combiner_check() {
+    COMBINER_CHECKS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Increment the Unknown return counter.
@@ -106,6 +126,7 @@ pub(crate) fn inc_check_euf() {
 #[inline]
 pub(crate) fn inc_check_arrays() {
     CHECKS_ARRAYS.with(|c| c.set(c.get() + 1));
+    CHECKS_ARRAYS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Increment per-theory propagation counters.

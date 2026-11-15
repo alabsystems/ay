@@ -645,6 +645,7 @@ impl Solver {
             // Delete from arena. Between solves, proof emission is not active,
             // so skip proof-related hooks.
             self.stats.clear_bcp_learned_1963_blocker_cert(idx);
+            self.record_clause_retirement(idx);
             self.arena.delete(idx);
             self.cold.clause_db_changes += 1;
             deleted += 1;
@@ -664,6 +665,8 @@ impl Solver {
                 }
                 self.compact_arena_locality();
             }
+            // The in-search cap and byte triggers' floors.
+            self.lower_reduction_retrigger_points();
         }
 
         deleted

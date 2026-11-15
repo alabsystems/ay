@@ -169,13 +169,13 @@ impl EufSolver<'_> {
         let mut da: u32 = 0;
         let mut x = a;
         while let Some(t) = parent(self, x) {
-            da += 1;
+            da = da.saturating_add(1);
             x = t;
         }
         let mut db: u32 = 0;
         let mut y = b;
         while let Some(t) = parent(self, y) {
-            db += 1;
+            db = db.saturating_add(1);
             y = t;
         }
         // Lift the deeper node until both are at equal depth.
@@ -186,14 +186,14 @@ impl EufSolver<'_> {
                 Some(t) => ca = t,
                 None => break,
             }
-            da -= 1;
+            da = da.saturating_sub(1);
         }
         while db > da {
             match parent(self, cb) {
                 Some(t) => cb = t,
                 None => break,
             }
-            db -= 1;
+            db = db.saturating_sub(1);
         }
         // Advance both in lockstep until they converge on the LCA.
         while ca != cb {
@@ -387,8 +387,12 @@ impl EufSolver<'_> {
                 if ok_a && ok_b {
                     // Cache only on FULL success: `true` guarantees the complete
                     // reason set for (a, b) is now the slice `reasons[start..]`.
+                    // `start` was `reasons.len()` before the appends, so the
+                    // slice is always present.
                     if self.explain_memo_enabled {
-                        memo.insert(a.0, b.0, &reasons[start..]);
+                        if let Some(appended) = reasons.get(start..) {
+                            memo.insert(a.0, b.0, appended);
+                        }
                     }
                     return true;
                 }
@@ -444,8 +448,17 @@ impl EufSolver<'_> {
             k.dedup();
             k
         };
+        let cached = reasons.get(start..);
+        debug_assert!(
+            cached.is_some(),
+            "cached explain for ({}, {}): start {} past the {} reasons",
+            a.0,
+            b.0,
+            start,
+            reasons.len()
+        );
         debug_assert_eq!(
-            norm(&reasons[start..]),
+            norm(cached.unwrap_or_default()),
             norm(&fresh),
             "cached explain reasons diverged from fresh recompute for ({}, {})",
             a.0,

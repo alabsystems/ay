@@ -76,6 +76,9 @@ impl Justification {
         snapshot: Option<&[TermId]>,
         category: LogicCategory,
     ) -> Option<Self> {
+        // Cleared first so a leg invoked from OUTSIDE the registry cannot leave
+        // a shape the registry would read as its own.
+        exec.justified_obligation_has_nested_arrays = None;
         if exec.authored_ground_core_refutes() {
             return Some(Self::AuthoredGroundCore);
         }
@@ -150,8 +153,26 @@ impl Justification {
         category: LogicCategory,
     ) -> Option<crate::executor_types::SolveResult> {
         let established = Self::establish(exec, snapshot, category)?;
+        // NESTED-ARRAY ADMISSION (a computed invariant, never a flag a producer
+        // sets). `quarantine_unverified_nested_array_unsat` fail-closes an UNSAT
+        // whose refutation MAY have come from the distrusted nested-array theory
+        // combination. When the obligation this registry just refuted contains
+        // no nested array at all, that refutation demonstrably did not: it was
+        // re-decided from scratch on a disposable executor, through the ordinary
+        // `check_sat` pipeline (the quarantine included), against a checked
+        // exact-query certificate. That is the same argument the two shipped
+        // exemptions carry, so the marker is minted here and CONSUMED ONCE at
+        // the quarantine. `Some(true)` (a nested-array obligation) and `None`
+        // (no leg recorded a shape) both leave the quarantine exactly as it was.
+        if exec.justified_obligation_has_nested_arrays == Some(false) {
+            exec.nested_array_free_justification_unsat = true;
+        }
         if ay_core::misc_cli_flags().debug_cert {
-            eprintln!("CERT/justified: {}", established.tag());
+            eprintln!(
+                "CERT/justified: {} nested_array_free={}",
+                established.tag(),
+                exec.nested_array_free_justification_unsat
+            );
         }
         exec.last_unknown_reason = None;
         Some(crate::executor_types::SolveResult::unsat())
@@ -263,6 +284,81 @@ mod tests {
             "the registry must not install an UNSAT certificate: its evidence is a \
              disposable-probe bit, and the mandatory publication funnel must still \
              mint — or refuse to mint — its own token for the enclosing query"
+        );
+    }
+
+    /// Build the same query with a NESTED-ARRAY atom conjoined to the authored
+    /// scope. The ground core still refutes (on `p` and `(not p)` alone), but
+    /// the obligation the leg re-solves now CONTAINS a nested array.
+    fn contradictory_ground_core_with_a_nested_array() -> Executor {
+        let mut exec = Executor::new();
+        let p = exec
+            .ctx
+            .terms
+            .mk_fresh_var("justify_nested_p", ay_core::Sort::Bool);
+        let not_p = exec.ctx.terms.mk_not(p);
+        let inner = ay_core::Sort::array(ay_core::Sort::Int, ay_core::Sort::Int);
+        let nested = ay_core::Sort::array(ay_core::Sort::Int, inner);
+        let a = exec
+            .ctx
+            .terms
+            .mk_fresh_var("justify_nested_a", nested.clone());
+        let b = exec.ctx.terms.mk_fresh_var("justify_nested_b", nested);
+        let arrays_equal = exec.ctx.terms.mk_eq(a, b);
+        let arrays_differ = exec.ctx.terms.mk_not(arrays_equal);
+        let q = exec
+            .ctx
+            .terms
+            .mk_fresh_var("justify_nested_q", ay_core::Sort::Bool);
+        let forall = exec.ctx.terms.mk_forall(
+            vec![("justify_nested_x".to_string(), ay_core::Sort::Int)],
+            q,
+        );
+        let roots = vec![p, not_p, arrays_differ, forall];
+        exec.ctx.assertions = roots.clone();
+        exec.begin_unsat_query_epoch(&roots);
+        exec.bind_unsat_query_assumptions(&[]);
+        exec
+    }
+
+    /// The nested-array admission is a COMPUTED INVARIANT over the obligation
+    /// the winning leg actually re-solved, not a property of the justification
+    /// variant. Array-free obligation -> the quarantine exemption is minted;
+    /// nested-array obligation -> it is not, and
+    /// `quarantine_unverified_nested_array_unsat` keeps failing closed exactly
+    /// as it did before.
+    ///
+    /// MUTATION (both halves are load-bearing): mint on `is_some()` instead of
+    /// `== Some(false)` and the second assertion fails; drop the
+    /// `note_justified_obligation_shape` call in `authored_ground_core_refutes`
+    /// and the first fails (the slot stays `None`).
+    #[test]
+    fn the_quarantine_exemption_is_minted_only_for_an_array_free_obligation() {
+        let mut free = contradictory_ground_core_with_a_forall();
+        assert_eq!(
+            Justification::publish_if_established(&mut free, None, LogicCategory::QfUf),
+            Some(SolveResult::unsat())
+        );
+        assert_eq!(free.justified_obligation_has_nested_arrays, Some(false));
+        assert!(
+            free.nested_array_free_justification_unsat,
+            "an array-free obligation must exempt the verdict from the nested-array quarantine"
+        );
+
+        let mut nested = contradictory_ground_core_with_a_nested_array();
+        assert_eq!(
+            Justification::publish_if_established(&mut nested, None, LogicCategory::QfUf),
+            Some(SolveResult::unsat()),
+            "the same contradiction still publishes; only the exemption differs"
+        );
+        assert_eq!(
+            nested.justified_obligation_has_nested_arrays,
+            Some(true),
+            "the obligation carries a nested array"
+        );
+        assert!(
+            !nested.nested_array_free_justification_unsat,
+            "a nested-array obligation must NOT exempt the verdict"
         );
     }
 

@@ -19,7 +19,8 @@ fn non_false_authored_boolean_cannot_authorize_the_false_rewrite() {
 
 #[test]
 fn bv_promotion_caps_cumulative_proof_producer_attempts() {
-    let mut terms = TermStore::new();
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
     let bv = terms.mk_var("bv-promotion-budget", Sort::bitvec(32));
     let doubled = terms.mk_app(Symbol::named("bvadd"), vec![bv, bv], Sort::bitvec(32));
     let one = terms.mk_bitvec(BigInt::from(1), 32);
@@ -30,7 +31,7 @@ fn bv_promotion_caps_cumulative_proof_producer_attempts() {
         proof.add_theory_lemma("generic", vec![equality]);
     }
 
-    Executor::promote_semantically_checked_bv_lemmas(&terms, &mut proof);
+    exec.promote_semantically_checked_bv_lemmas(&mut proof);
 
     assert_eq!(
         proof

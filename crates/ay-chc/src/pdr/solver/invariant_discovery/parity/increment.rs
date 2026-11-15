@@ -21,7 +21,9 @@ impl PdrSolver {
     /// first clause increments by 1 and breaks the invariant.
     pub(in crate::pdr::solver) fn discover_increment_divisibility_invariants(&mut self) {
         let predicates: Vec<_> = self.problem.predicates().to_vec();
-        let mut candidates: Vec<(PredicateId, ChcExpr)> = Vec::new();
+        // (pred, formula, var, modulus, remainder): the last three gate the
+        // algebraic admission on `is_parity_preserved_by_transitions`.
+        let mut candidates: Vec<(PredicateId, ChcExpr, ChcVar, i128, i128)> = Vec::new();
 
         for pred in &predicates {
             let canonical_vars = match self.canonical_vars(pred.id) {
@@ -153,12 +155,38 @@ impl PdrSolver {
                     );
                 }
 
-                candidates.push((pred.id, invariant));
+                candidates.push((pred.id, invariant, var.clone(), g, remainder));
             }
         }
 
-        for (pred_id, formula) in candidates {
+        for (pred_id, formula, var, modulus, remainder) in candidates {
+            self.admit_modular_candidate(pred_id, formula, Some((&var, modulus, remainder)));
+        }
+    }
+
+    /// Admit a discovered modular candidate `var mod k = r` (or a formula that
+    /// has no single-variable modular gate).
+    ///
+    /// The discovery routines above look only at self-loop clauses, and skip a
+    /// self-loop whose update they cannot read. `algebraically_verified`
+    /// admission skips the SMT self-inductiveness check, so a candidate is
+    /// tagged algebraic only when `is_parity_preserved_by_transitions` accepts
+    /// EVERY transition into the predicate, cross-predicate ones included.
+    /// Anything else goes through the ordinary SMT-checked admission, which
+    /// keeps an inductive candidate and rejects or defers the rest.
+    fn admit_modular_candidate(
+        &mut self,
+        pred_id: PredicateId,
+        formula: ChcExpr,
+        gate: Option<(&ChcVar, i128, i128)>,
+    ) {
+        let preserved = gate.is_some_and(|(var, modulus, remainder)| {
+            self.is_parity_preserved_by_transitions(pred_id, var, modulus, remainder)
+        });
+        if preserved {
             self.add_discovered_invariant_algebraic(pred_id, formula, 1);
+        } else {
+            self.add_discovered_invariant(pred_id, formula, 1);
         }
     }
 
@@ -191,7 +219,10 @@ impl PdrSolver {
     /// F-C is even, so C's parity (starting from 2*A, even) is preserved.
     pub(in crate::pdr::solver) fn discover_branch_accumulator_parity_invariants(&mut self) {
         let predicates: Vec<_> = self.problem.predicates().to_vec();
-        let mut candidates: Vec<(PredicateId, ChcExpr)> = Vec::new();
+        // (pred, formula, gate): `gate` is the single-variable parity the
+        // algebraic admission is checked against; sum-parity candidates span
+        // several variables and have none, so they always take SMT admission.
+        let mut candidates: Vec<(PredicateId, ChcExpr, Option<(ChcVar, i128, i128)>)> = Vec::new();
 
         for pred in &predicates {
             let canonical_vars = match self.canonical_vars(pred.id) {
@@ -554,7 +585,11 @@ impl PdrSolver {
                                 );
                             }
 
-                            candidates.push((pred.id, invariant));
+                            candidates.push((
+                                pred.id,
+                                invariant,
+                                Some((acc_var.clone(), 2, acc_init)),
+                            ));
                         }
                     }
 
@@ -589,7 +624,7 @@ impl PdrSolver {
                                     );
                                 }
 
-                                candidates.push((pred.id, invariant));
+                                candidates.push((pred.id, invariant, None));
                             }
                         }
                     }
@@ -597,8 +632,11 @@ impl PdrSolver {
             }
         }
 
-        for (pred_id, formula) in candidates {
-            self.add_discovered_invariant_algebraic(pred_id, formula, 1);
+        for (pred_id, formula, gate) in candidates {
+            let gate = gate
+                .as_ref()
+                .map(|(var, modulus, rem)| (var, *modulus, *rem));
+            self.admit_modular_candidate(pred_id, formula, gate);
         }
     }
 
@@ -660,7 +698,8 @@ impl PdrSolver {
     /// for benchmarks like s_mutants_21 where C != 78 requires C mod 10 = 0.
     pub(in crate::pdr::solver) fn discover_constant_accumulator_modular_invariants(&mut self) {
         let predicates: Vec<_> = self.problem.predicates().to_vec();
-        let mut candidates: Vec<(PredicateId, ChcExpr)> = Vec::new();
+        // (pred, formula, var, modulus); the remainder is always 0 here.
+        let mut candidates: Vec<(PredicateId, ChcExpr, ChcVar, i128)> = Vec::new();
 
         for pred in &predicates {
             let canonical_vars = match self.canonical_vars(pred.id) {
@@ -804,7 +843,12 @@ impl PdrSolver {
                                 );
                             }
 
-                            candidates.push((pred.id, invariant));
+                            candidates.push((
+                                pred.id,
+                                invariant,
+                                canonical_vars[acc_idx].clone(),
+                                k,
+                            ));
                         }
                     }
                 }
@@ -812,8 +856,8 @@ impl PdrSolver {
         }
 
         candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-        for (pred_id, formula) in candidates {
-            self.add_discovered_invariant_algebraic(pred_id, formula, 1);
+        for (pred_id, formula, var, modulus) in candidates {
+            self.admit_modular_candidate(pred_id, formula, Some((&var, modulus, 0)));
         }
     }
 
@@ -889,17 +933,23 @@ impl PdrSolver {
     }
 
     /// Extract a modulus from an init expression of the form `k * var`.
+    ///
+    /// `checked_abs`, not `abs`: `i128::MIN` is a literal a CHC problem really
+    /// carries (it is the lower bound of a 128-bit signed overflow obligation)
+    /// and `i128::abs` PANICS on it — `attempt to negate with overflow`
+    /// (#chc-i128-min-magnitude). Declining the modulus hint is
+    /// completeness-only: the parity pass simply proposes no candidate for that
+    /// coefficient.
     fn extract_modulus_from_init_expr(expr: &ChcExpr) -> Option<i128> {
         match expr {
             ChcExpr::Op(ChcOp::Mul, args) if args.len() == 2 => {
-                if let ChcExpr::Int(k) = args[0].as_ref() {
-                    if k.abs() >= 2 {
-                        return Some(k.abs());
-                    }
-                }
-                if let ChcExpr::Int(k) = args[1].as_ref() {
-                    if k.abs() >= 2 {
-                        return Some(k.abs());
+                for arg in args {
+                    if let ChcExpr::Int(k) = arg.as_ref() {
+                        if let Some(magnitude) = k.checked_abs() {
+                            if magnitude >= 2 {
+                                return Some(magnitude);
+                            }
+                        }
                     }
                 }
                 None

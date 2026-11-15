@@ -262,7 +262,7 @@ fn the_pin_recognizer_declines_reflexive_and_foreign_sorted_operands() {
 
 /// A literal spelling the strict checker does not read yields NO pin.
 ///
-/// `rm_literal_mode` accepts a `Var`-form mode and the long SMT-LIB spellings;
+/// Free variables remain symbolic; long SMT-LIB spellings are literals but
 /// the checker's `mode_index` accepts only a nullary `App` at the RoundingMode
 /// sort under one of the five SHORT names. The pass must not emit an axiom that
 /// falls in that gap — it would be one AY asserts and then refuses to check.
@@ -284,16 +284,15 @@ fn an_unreadable_literal_spelling_yields_no_unchecked_pin() {
                 )
             }
         };
-        // The recognizer accepts it: both operands ARE mode literals at the
-        // RoundingMode sort, and the modes differ.
-        assert!(
+        assert_eq!(
             literal_pins::rm_literal_disequality_operands(
                 &executor.ctx.terms,
                 &Symbol::named("="),
                 &[left, right]
             )
             .is_some(),
-            "{spelling}: the fixture must reach the checker gate to test it"
+            spelling == "long-name",
+            "free variables grant no literal pin; long literals reach the checker gate"
         );
         let atom = executor
             .ctx
@@ -303,7 +302,7 @@ fn an_unreadable_literal_spelling_yields_no_unchecked_pin() {
         let axioms = axioms_of(&mut executor, &[atom]);
         assert_eq!(
             axioms.len(),
-            1,
+            if spelling == "var" { 3 } else { 1 },
             "{spelling}: a spelling the strict checker cannot read must add no pin: {:?}",
             axioms
                 .iter()
@@ -317,6 +316,25 @@ fn an_unreadable_literal_spelling_yields_no_unchecked_pin() {
                 executor.format_term(axiom)
             );
         }
+    }
+}
+
+#[test]
+fn rounding_names_cannot_change_the_generated_domain_namespace() {
+    for name in ["RNE", "=", "and", "or"] {
+        let mut executor = rm_pin_executor();
+        let terms = &mut executor.ctx.terms;
+        let free = terms.mk_var("free_mode", rm_sort());
+        let mode = rm_literal_term(terms, RoundingMode::RTP);
+        let equality = terms.mk_eq(free, mode);
+        terms.register_declared_function(name);
+        assert!(
+            matches!(
+                executor.rm_domain_axioms(&[equality]),
+                RmDomainAxioms::FailClose
+            ),
+            "{name}"
+        );
     }
 }
 

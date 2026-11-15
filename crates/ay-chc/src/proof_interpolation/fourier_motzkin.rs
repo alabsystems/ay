@@ -204,14 +204,16 @@ pub(crate) fn try_fourier_motzkin_elimination(
 
                 // Build new constraint expression
                 let new_strict = lb_lin.strict || ub_lin.strict;
-                if let Some(new_expr) = build_linear_inequality(&new_coeffs, new_bound, new_strict)
+                let new_sort = combined_row_sort([lb_lin, ub_lin]);
+                if let Some(new_expr) =
+                    build_linear_inequality_in_sort(&new_coeffs, new_bound, new_strict, &new_sort)
                 {
                     let new_lin = LinearConstraint {
                         coeffs: new_coeffs,
                         bound: new_bound,
                         strict: new_strict,
-                        // Int-only proof-interpolation path (#chc25-lra-convergence).
-                        var_sort: crate::ChcSort::Int,
+                        // The rows' own sort (Workstream D sort fix).
+                        var_sort: new_sort.clone(),
                     };
                     new_constraints.push((new_expr, Some(new_lin)));
                 }
@@ -268,14 +270,16 @@ pub(crate) fn try_fourier_motzkin_elimination(
                 new_coeffs.retain(|_, c| *c != Rational64::from_integer(0));
 
                 let new_strict = lb_lin.strict || ub_lin.strict;
-                if let Some(new_expr) = build_linear_inequality(&new_coeffs, new_bound, new_strict)
+                let new_sort = combined_row_sort([lb_lin, ub_lin]);
+                if let Some(new_expr) =
+                    build_linear_inequality_in_sort(&new_coeffs, new_bound, new_strict, &new_sort)
                 {
                     let new_lin = LinearConstraint {
                         coeffs: new_coeffs,
                         bound: new_bound,
                         strict: new_strict,
-                        // Int-only proof-interpolation path (#chc25-lra-convergence).
-                        var_sort: crate::ChcSort::Int,
+                        // The rows' own sort (Workstream D sort fix).
+                        var_sort: new_sort.clone(),
                     };
                     new_constraints.push((new_expr, Some(new_lin)));
                 }

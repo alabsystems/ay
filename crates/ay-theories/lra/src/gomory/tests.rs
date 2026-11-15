@@ -420,6 +420,59 @@ fn test_generate_gomory_cuts_skips_row_when_numerator_exceeds_big_number() {
 }
 
 #[test]
+fn test_generate_gomory_cuts_admits_fractional_tableau_row() {
+    // Pivot-normalized tableau rows carry fractional coefficients whose
+    // numerators hold the pivot denominator. The explosion guard's scale
+    // must therefore be the row's numerator scale: with a magnitude
+    // (ceil) scale abs_max collapses to 1 and every real cut is rejected
+    // (the v20_problem__019 split walk generated 0 cuts in 7 attempts,
+    // each skipped with "numerator > 1").
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Real);
+    let z = terms.mk_var("z", Sort::Int);
+
+    let mut solver = LraSolver::new(&terms);
+    let x_var = solver.ensure_var_registered(x);
+    let y_var = solver.ensure_var_registered(y);
+    let z_var = solver.ensure_var_registered(z);
+
+    solver.rows.push(TableauRow::new(
+        x_var,
+        vec![
+            (y_var, BigRational::new(BigInt::from(1), BigInt::from(5))),
+            (z_var, BigRational::new(BigInt::from(2), BigInt::from(5))),
+        ],
+        BigRational::zero(),
+    ));
+    solver.vars[x_var as usize].status = Some(VarStatus::Basic(0));
+    solver.vars[x_var as usize].value = crate::types::InfRational::from_rational(BigRational::new(
+        BigInt::from(2),
+        BigInt::from(5),
+    ));
+
+    for var in [y_var, z_var] {
+        solver.vars[var as usize].status = Some(VarStatus::NonBasic);
+        solver.vars[var as usize].value =
+            crate::types::InfRational::from_rational(BigRational::zero());
+        solver.vars[var as usize].lower = Some(crate::Bound::without_reasons(
+            BigRational::zero().into(),
+            false,
+        ));
+    }
+
+    let mut integer_vars = HashSet::default();
+    integer_vars.insert(x);
+    integer_vars.insert(z);
+
+    let cuts = solver.generate_gomory_cuts(&integer_vars);
+    assert!(
+        !cuts.is_empty(),
+        "fractional tableau row must yield a Gomory cut under the numerator-scale guard"
+    );
+}
+
+#[test]
 fn test_current_solution_violates_cut_for_lower_and_upper_bounds() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);

@@ -10,8 +10,10 @@ use super::{
 };
 use crate::PredicateId;
 
+mod arith_contains;
 mod conjuncts;
 mod constructors;
+mod definitions;
 mod drop_safety;
 mod expr_contains;
 mod feature_scan;

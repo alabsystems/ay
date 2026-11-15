@@ -45,23 +45,81 @@ fn trust_lemma_chain_is_valid_when_an_assumption_is_repeated() {
         matches!(proof.steps.last(), Some(ProofStep::Step { clause, .. }) if clause.is_empty()),
         "trust-lemma fallback must still close on the empty clause"
     );
-    // One resolution per DISTINCT assumption term, not per collected entry.
-    let resolutions = proof
+    // One resolution, whose leaves are the DISTINCT assumption terms, not
+    // every collected entry.
+    let resolution_premises: Vec<usize> = proof
         .steps
         .iter()
-        .filter(|s| {
-            matches!(
-                s,
-                ProofStep::Step {
-                    rule: AletheRule::ThResolution,
-                    ..
-                }
-            )
+        .filter_map(|s| match s {
+            ProofStep::Step {
+                rule: AletheRule::ThResolution,
+                premises,
+                ..
+            } => Some(premises.len()),
+            _ => None,
         })
-        .count();
+        .collect();
     assert_eq!(
-        resolutions, 2,
-        "expected one th_resolution per distinct assumption term"
+        resolution_premises,
+        vec![3],
+        "expected one th_resolution over the head and each distinct assumption term"
+    );
+}
+
+/// #parity-memout — the closer's resolution must cost O(leaves), not
+/// O(leaves^2).
+///
+/// It used to resolve the head against one leaf per BINARY step, and every
+/// step restated the head literals still left: N leaves held N(N-1)/2
+/// literals. QF_IDL `parity__13.400.graph` (one authored `and` of 36,440
+/// conjuncts) put ~663M `TermId`s — 2.65 GB — into that triangle and the
+/// default-posture solve ended `unknown (memout)`. One n-ary step with the
+/// same premises and the same empty conclusion holds none of them.
+#[test]
+fn trust_lemma_resolution_is_linear_in_the_number_of_leaves() {
+    const LEAVES: usize = 2_000;
+    let mut terms = TermStore::new();
+    let mut proof = Proof::new();
+    for index in 0..LEAVES {
+        let leaf = terms.mk_var(&format!("p{index}"), Sort::Bool);
+        let leaf = if index % 2 == 0 {
+            leaf
+        } else {
+            terms.mk_not(leaf)
+        };
+        proof.add_assume(leaf, Some(format!("h{index}")));
+    }
+    let before = proof.steps.len();
+
+    crate::executor::proof_resolution::empty_clause::derive_empty_via_trust_lemma(
+        &mut terms, &mut proof,
+    );
+
+    let added = &proof.steps[before..];
+    let literals: usize = added
+        .iter()
+        .map(|step| match step {
+            ProofStep::Step { clause, .. } | ProofStep::TheoryLemma { clause, .. } => clause.len(),
+            _ => 0,
+        })
+        .sum();
+    // The head restates each leaf once; the resolution concludes `(cl)`.
+    assert_eq!(
+        literals, LEAVES,
+        "the closer must hold the head's literals once, not a shrinking copy per leaf"
+    );
+    assert!(
+        matches!(
+            proof.steps.last(),
+            Some(ProofStep::Step { rule: AletheRule::ThResolution, clause, premises, .. })
+                if clause.is_empty() && premises.len() == LEAVES + 1
+        ),
+        "one th_resolution over the head and every leaf must close the empty clause"
+    );
+    let (_summary, error) = check_proof_partial(&proof, &terms);
+    assert!(
+        error.is_none(),
+        "the n-ary closure must check, got {error:?}"
     );
 }
 

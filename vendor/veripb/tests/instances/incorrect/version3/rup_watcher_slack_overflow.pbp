@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the general PB watcher computed its slack as `coeff_sum - degree` in the
+% constraint's own integer type. The type is chosen so that the coefficient sum and the
+% degree each fit, not their difference: for the trivially true `2 ~x1 >= i64::MIN` the true
+% slack is 2^63 + 1, which wrapped to a large negative number, so every coefficient compared
+% greater than it and the watcher reported ~x1 as an assignment-independent propagation.
+% Together with the unit `1 x1 >= 1` that made the level-zero trail conflict, after which
+% every `rup` -- including the empty contradiction below -- was accepted. The formula is
+% satisfiable (x1 true).
+f 2 ;
+rup >= 1 ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

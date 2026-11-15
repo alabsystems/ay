@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Truth: the input has ONE solution over its preserved set {x1} (x1 must be 1).
+% After the preserved_add below the checker's preserved set is {x1,x2} and the
+% same core has TWO solutions over it, so `OUTPUT EQUIENUMERABLE` is false.
+% Unfixed: `preserved_add` proof goal #2 (constraint ==> x2) has reified degree
+% coeff_sum - degree + 1 = 2^63 + 1, computed in the row's own i64 width. It
+% wraps negative, which flips the reification literal and leaves the goal
+% trivially true, so it is auto-discharged and x2 joins the preserved set with
+% no proof at all. x2 is in fact unconstrained.
+f 1 ;
+preserved_add x2 4611686018427387904 x1 >= -4611686018427387904 ;
+output EQUIENUMERABLE IMPLICIT ;
+conclusion ENUMERATION_PARTIAL 0 ;
+end pseudo-Boolean proof;

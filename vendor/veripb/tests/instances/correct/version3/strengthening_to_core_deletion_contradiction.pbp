@@ -1,0 +1,15 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to
+% incorrect/version3/strengthening_to_core_deletion_proofgoal_not_contradiction:
+% a checked deletion under `strengthening_to_core on` is a proof by
+% contradiction with no database obligations, and this is what discharging it
+% legitimately looks like. Deleting `1 x1 1 x2 >= 1` leaves `1 x1 >= 1`, which
+% together with the negated deleted constraint propagates to conflict, so the
+% subproof's top-level RUP check succeeds and the deletion is licensed.
+f 2;
+strengthening_to_core on;
+del id 2 : : subproof
+qed;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

@@ -408,3 +408,259 @@ fn test_cert_leaf_labeling_moves_shared_diseq() {
     let expected_strong = terms.mk_eq(x, five);
     assert_eq!(itp_strong, expected_strong);
 }
+
+/// Integer-gap conflict (real-SAT, int-UNSAT): `x < y, y < z, z < w` on the
+/// A side and `w < x + 2` on the B side. Over the rationals the strict rows
+/// are satisfiable (`x = 0, y = 1/2, z = 1, w = 3/2`); the verifier accepts
+/// the unit multipliers only after integer-strengthening every strict row
+/// (`lin < 0` -> `lin + 1 <= 0`), so the served A-part sum must be built
+/// over the TIGHTENED rows: `x - w + 3 <= 0`. The untightened sum `x - w < 0`
+/// is not a LIA interpolant — `I /\ B` (`x < w < x + 2`) has the integer
+/// model `w = x + 1`.
+#[test]
+fn test_cert_leaf_integer_gap_strict_rows_are_tightened() {
+    let mut terms = TermStore::new();
+    let true_tid = terms.mk_bool(true);
+    let false_tid = terms.mk_bool(false);
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let two = terms.mk_int(2.into());
+    let x_plus_2 = terms.mk_add(vec![x, two]);
+
+    let xy = terms.mk_lt(x, y);
+    let yz = terms.mk_lt(y, z);
+    let zw = terms.mk_lt(z, w);
+    let wx = terms.mk_lt(w, x_plus_2);
+    let clause: Vec<TermId> = [xy, yz, zw, wx].iter().map(|&a| terms.mk_not(a)).collect();
+    let farkas = FarkasAnnotation::from_ints(&[1, 1, 1, 1]);
+
+    let a_atoms: HashSet<TermId> = [xy, yz, zw].into_iter().collect();
+    let b_atoms: HashSet<TermId> = [wx].into_iter().collect();
+    let a_vars: HashSet<TermId> = [x, y, z, w].into_iter().collect();
+    let b_vars: HashSet<TermId> = [x, w].into_iter().collect();
+    let shared_vars: HashSet<TermId> = [x, w].into_iter().collect();
+    let part = CertPartition {
+        a_atoms: &a_atoms,
+        b_atoms: &b_atoms,
+        a_vars: &a_vars,
+        b_vars: &b_vars,
+        shared_vars: &shared_vars,
+    };
+
+    reset_cert_leaf_stats();
+    let itp = certificate_lemma_interpolant(
+        &mut terms,
+        &clause,
+        &farkas,
+        &part,
+        InterpolantStrength::Strongest,
+        true_tid,
+        false_tid,
+    )
+    .expect("integer-gap certificate leaf must interpolate over the tightened rows");
+
+    // Tightened A-part sum: (x - y + 1) + (y - z + 1) + (z - w + 1) <= 0,
+    // i.e. x - w + 3 <= 0, rendered as `x + (-1 * w) <= -3`.
+    let minus_one = terms.mk_int((-1).into());
+    let neg_w = terms.mk_mul(vec![minus_one, w]);
+    let sum = terms.mk_add(vec![x, neg_w]);
+    let minus_three = terms.mk_int((-3).into());
+    let expected = terms.mk_le(sum, minus_three);
+    // The untightened, real-only sum `x - w < 0` must NOT be served.
+    let zero = terms.mk_int(0.into());
+    let untightened = terms.mk_lt(sum, zero);
+    assert_ne!(
+        itp, untightened,
+        "served interpolant must not be the real-only sum x - w < 0"
+    );
+    assert_eq!(
+        itp, expected,
+        "A-part weighted sum must be over the tightened rows: x - w + 3 <= 0"
+    );
+    let stats = last_cert_leaf_stats();
+    assert_eq!(stats.attempted, 1);
+    assert_eq!(
+        stats.verified, 1,
+        "the verifier accepts the unit multipliers over the TIGHTENED rows"
+    );
+    assert_eq!(stats.served, 1);
+}
+
+/// The fail-closed side of the tightening gate: a strict row over REAL
+/// variables must NOT be tightened. `A = {x < y}`, `B = {y <= x}` (unit
+/// multipliers) is a real refutation whose A-part interpolant is the strict
+/// row itself, `x - y < 0`; tightening it to `x - y + 1 <= 0` would serve a
+/// formula A does not entail (`x = 0, y = 1/2`).
+#[test]
+fn test_cert_leaf_real_strict_row_is_not_tightened() {
+    let mut terms = TermStore::new();
+    let true_tid = terms.mk_bool(true);
+    let false_tid = terms.mk_bool(false);
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+
+    let xy = terms.mk_lt(x, y);
+    let yx = terms.mk_le(y, x);
+    let clause: Vec<TermId> = [xy, yx].iter().map(|&a| terms.mk_not(a)).collect();
+    let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+
+    let a_atoms: HashSet<TermId> = [xy].into_iter().collect();
+    let b_atoms: HashSet<TermId> = [yx].into_iter().collect();
+    let a_vars: HashSet<TermId> = [x, y].into_iter().collect();
+    let b_vars: HashSet<TermId> = [x, y].into_iter().collect();
+    let shared_vars: HashSet<TermId> = [x, y].into_iter().collect();
+    let part = CertPartition {
+        a_atoms: &a_atoms,
+        b_atoms: &b_atoms,
+        a_vars: &a_vars,
+        b_vars: &b_vars,
+        shared_vars: &shared_vars,
+    };
+
+    reset_cert_leaf_stats();
+    let itp = certificate_lemma_interpolant(
+        &mut terms,
+        &clause,
+        &farkas,
+        &part,
+        InterpolantStrength::Strongest,
+        true_tid,
+        false_tid,
+    )
+    .expect("real strict-row certificate leaf must interpolate");
+
+    // Untightened, as decoded: x - y < 0, rendered over Real as
+    // `x + ((- 1) * y) < 0` — Real coefficients and constant, since ay-core's
+    // `mk_mul`/`mk_add` refuse an Int constant beside a Real variable.
+    let minus_one = terms.mk_rational(BigRational::from(BigInt::from(-1)));
+    let neg_y = terms.mk_mul(vec![minus_one, y]);
+    let sum = terms.mk_add(vec![x, neg_y]);
+    let zero = terms.mk_rational(BigRational::from(BigInt::from(0)));
+    let expected = terms.mk_lt(sum, zero);
+    assert_eq!(
+        itp, expected,
+        "a Real strict row is served untightened: x - y < 0"
+    );
+    let stats = last_cert_leaf_stats();
+    assert_eq!((stats.attempted, stats.verified, stats.served), (1, 1, 1));
+}
+
+/// The LRA solver's trust-kind restatement lemma `(cl (= v 1) (not (= -1 (- v))))`
+/// is recognised as valid (the two equalities are the same linear equation);
+/// different equations, or the same polarity twice, are not.
+#[test]
+fn test_equality_restatement_recognised() {
+    let mut terms = TermStore::new();
+    let v = terms.mk_var("v", Sort::Real);
+    let one = terms.mk_rational(BigRational::one());
+    let two = terms.mk_rational(BigRational::from_integer(BigInt::from(2)));
+    let minus_one = terms.mk_rational(-BigRational::one());
+    let eq = |terms: &mut TermStore, l: TermId, r: TermId| {
+        terms.mk_app(Symbol::named("="), [l, r], Sort::Bool)
+    };
+    let neg_v = terms.mk_app(Symbol::named("-"), [v], Sort::Real);
+    let v_is_1 = eq(&mut terms, v, one);
+    let restated = eq(&mut terms, minus_one, neg_v);
+    let v_is_2 = eq(&mut terms, v, two);
+    let not_restated = terms.mk_not(restated);
+    let not_v_is_2 = terms.mk_not(v_is_2);
+    assert!(is_equality_restatement(&terms, &[v_is_1, not_restated]));
+    assert!(is_equality_restatement(&terms, &[not_restated, v_is_1]));
+    assert!(!is_equality_restatement(&terms, &[v_is_1, not_v_is_2]));
+    assert!(!is_equality_restatement(&terms, &[v_is_1, restated]));
+    assert!(!is_equality_restatement(&terms, &[v_is_1]));
+}
+
+#[test]
+fn test_linear_arith_valid_clause_by_elimination() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let num = |terms: &mut TermStore, n: i64| {
+        terms.mk_rational(BigRational::from_integer(BigInt::from(n)))
+    };
+    let (one, two, three) = (num(&mut terms, 1), num(&mut terms, 2), num(&mut terms, 3));
+    let app = |terms: &mut TermStore, op: &str, l: TermId, r: TermId, sort: Sort| {
+        terms.mk_app(Symbol::named(op), [l, r], sort)
+    };
+    let x_le_1 = app(&mut terms, "<=", x, one, Sort::Bool);
+    let y_le_2 = app(&mut terms, "<=", y, two, Sort::Bool);
+    let sum = app(&mut terms, "+", x, y, Sort::Real);
+    let sum_le_3 = app(&mut terms, "<=", sum, three, Sort::Bool);
+    let sum_le_2 = app(&mut terms, "<=", sum, two, Sort::Bool);
+    let not_x_le_1 = terms.mk_not(x_le_1);
+    let not_y_le_2 = terms.mk_not(y_le_2);
+    // x <= 1 ∧ y <= 2 ⊨ x + y <= 3, but not x + y <= 2.
+    assert!(is_linear_arith_valid_clause(
+        &terms,
+        &[not_x_le_1, not_y_le_2, sum_le_3]
+    ));
+    assert!(!is_linear_arith_valid_clause(
+        &terms,
+        &[not_x_le_1, not_y_le_2, sum_le_2]
+    ));
+    // Strictness: x <= 1 ∨ x >= 1 is valid, x < 1 ∨ x > 1 is not (x = 1).
+    let x_ge_1 = app(&mut terms, ">=", x, one, Sort::Bool);
+    let x_lt_1 = app(&mut terms, "<", x, one, Sort::Bool);
+    let x_gt_1 = app(&mut terms, ">", x, one, Sort::Bool);
+    assert!(is_linear_arith_valid_clause(&terms, &[x_le_1, x_ge_1]));
+    assert!(!is_linear_arith_valid_clause(&terms, &[x_lt_1, x_gt_1]));
+    // A positive equality asserts a disequality: not decided.
+    let x_is_1 = app(&mut terms, "=", x, one, Sort::Bool);
+    assert!(!is_linear_arith_valid_clause(
+        &terms,
+        &[x_is_1, x_lt_1, x_gt_1]
+    ));
+    assert!(!is_linear_arith_valid_clause(&terms, &[]));
+}
+
+/// A valid exact arithmetic witness is not partition authority. Conflicting
+/// coloring that claims x is local to both sides but absent from the shared
+/// symbols must not serve a partial interpolant from that witness.
+#[test]
+fn retained_certificate_refuses_a_conflicting_shared_partition() {
+    let mut terms = TermStore::new();
+    let true_tid = terms.mk_bool(true);
+    let false_tid = terms.mk_bool(false);
+    let x = terms.mk_var("retained_partition_x", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let one = terms.mk_int(1.into());
+    let low = terms.mk_le(x, zero);
+    let high = terms.mk_ge(x, one);
+    let clause = vec![terms.mk_not(low), terms.mk_not(high)];
+    let witness = FarkasAnnotation::from_ints(&[1, 1]);
+    let a_atoms: HashSet<TermId> = [low].into_iter().collect();
+    let b_atoms: HashSet<TermId> = [high].into_iter().collect();
+    let a_vars: HashSet<TermId> = [x].into_iter().collect();
+    let b_vars: HashSet<TermId> = [x].into_iter().collect();
+    let shared_vars = HashSet::default();
+    let part = CertPartition {
+        a_atoms: &a_atoms,
+        b_atoms: &b_atoms,
+        a_vars: &a_vars,
+        b_vars: &b_vars,
+        shared_vars: &shared_vars,
+    };
+    reset_cert_leaf_stats();
+    assert!(certificate_lemma_interpolant(
+        &mut terms,
+        &clause,
+        &witness,
+        &part,
+        InterpolantStrength::Strongest,
+        true_tid,
+        false_tid
+    )
+    .is_none());
+    let stats = last_cert_leaf_stats();
+    assert_eq!(
+        stats.verified, 1,
+        "the certificate itself is a real contradiction"
+    );
+    assert_eq!(
+        stats.served, 0,
+        "inconsistent partition ownership grants nothing"
+    );
+}

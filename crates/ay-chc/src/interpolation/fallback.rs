@@ -201,7 +201,11 @@ pub(super) fn compute_unsat_core_interpolant_until(
 
     // Build labeled conjunction: each A constraint gets a unique label.
     // We need to identify which core conjuncts came from A vs B.
-    let a_set: FxHashSet<String> = a_constraints.iter().map(|c| format!("{c:?}")).collect();
+    // Structural set (`ChcExpr`'s Eq/Hash are linear in the DAG): the former
+    // Debug-string keys printed each constraint as a tree, and on the
+    // LRA-Lin `let` DAGs (cav12 transmitter.2) that string alone exhausted
+    // memory.
+    let a_set: FxHashSet<&ChcExpr> = a_constraints.iter().collect();
 
     let all_constraints: Vec<ChcExpr> = a_constraints
         .iter()
@@ -211,13 +215,10 @@ pub(super) fn compute_unsat_core_interpolant_until(
 
     let full = ChcExpr::and_all(all_constraints);
 
-    let mut smt = SmtContext::new();
-    let result = if deadline.is_some() {
-        let timeout = timeout_for_deadline(deadline, std::time::Duration::from_secs(2))?;
-        smt.check_sat_with_timeout(&full, timeout)
-    } else {
-        smt.check_sat(&full)
-    };
+    // Capped like every Craig validation check, with or without a deadline.
+    let cap = std::time::Duration::from_secs(2);
+    let timeout = timeout_for_deadline(deadline, cap).or(deadline.is_none().then_some(cap))?;
+    let result = SmtContext::new().check_sat_with_timeout(&full, timeout);
 
     let core_conjuncts = match result {
         SmtResult::UnsatWithCore(core) => {
@@ -259,8 +260,7 @@ pub(super) fn compute_unsat_core_interpolant_until(
     // Partition core conjuncts: keep only A-side conjuncts with shared-only vars.
     let mut a_core_shared: Vec<ChcExpr> = Vec::new();
     for conjunct in &core_conjuncts {
-        let repr = format!("{conjunct:?}");
-        if !a_set.contains(&repr) {
+        if !a_set.contains(conjunct) {
             continue; // B-side conjunct, skip
         }
         let vars: FxHashSet<String> = conjunct.vars().into_iter().map(|v| v.name).collect();

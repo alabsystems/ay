@@ -1,0 +1,18 @@
+; Exact field-selection reference: no rounded arithmetic.
+(set-logic QF_FP)
+(define-fun lo () (_ FloatingPoint 8 200) (fp #b0 #x7f (_ bv401734511064747568885490523085290650630550748445698208825344 199)))
+(define-fun hi () (_ FloatingPoint 8 200) (fp #b0 #x7f (_ bv401734511064747568885490523085290650630550748445698208825345 199)))
+(define-fun pz () (_ FloatingPoint 8 200) (_ +zero 8 200))
+(define-fun nz () (_ FloatingPoint 8 200) (_ -zero 8 200))
+(define-fun nan () (_ FloatingPoint 8 200) (_ NaN 8 200))
+(assert (not (and
+  (= (fp.min lo hi) lo)
+  (= (fp.max lo hi) hi)
+  (= (fp.min (fp.neg lo) (fp.neg hi)) (fp.neg hi))
+  (= (fp.max (fp.neg lo) (fp.neg hi)) (fp.neg lo))
+  (= (fp.min nan lo) lo)
+  (= (fp.max hi nan) hi)
+  (fp.isNaN (fp.min nan nan))
+  (or (= (fp.min pz nz) pz) (= (fp.min pz nz) nz))
+  (or (= (fp.max pz nz) pz) (= (fp.max pz nz) nz)))))
+(check-sat)

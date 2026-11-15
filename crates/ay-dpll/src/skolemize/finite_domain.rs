@@ -296,6 +296,37 @@ pub(crate) fn derived_bound_unlocks_expansion(
                     }
                 }
             }
+            // Same question for a narrow unsigned-BV binder. Without this arm a
+            // BV bound that only the entailed table can read never reports as
+            // unlockable, so the expansion is never attempted and the derived
+            // values might as well not exist.
+            if vars.len() == 1 {
+                if let Sort::BitVec(bv) = &vars[0].1 {
+                    if bv.width <= 64 {
+                        if let TermData::App(Symbol::Named(op), or_args) = terms.get(body).clone() {
+                            if op == "or" {
+                                let with = probe_bv_range(
+                                    terms,
+                                    &or_args,
+                                    &vars[0].0,
+                                    bv.width,
+                                    Some(consts),
+                                );
+                                let without =
+                                    probe_bv_range(terms, &or_args, &vars[0].0, bv.width, None);
+                                if with.is_some() && without.is_none() {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // And for a MULTI-binder BV block; see
+            // [`multi_bv_binder_unlocks`] for why one readable bound suffices.
+            if multi_bv_binder_unlocks(terms, &vars, body, consts) {
+                return true;
+            }
         }
         match terms.get(t).clone() {
             TermData::App(_, args) => args.iter().any(|&a| walk(terms, a, consts, seen)),
@@ -313,6 +344,44 @@ pub(crate) fn derived_bound_unlocks_expansion(
     assertions
         .iter()
         .any(|&a| walk(terms, a, consts, &mut seen))
+}
+
+/// Would the entailed table unlock [`peel_bounded_bv_forall`] on this
+/// MULTI-binder all-BV `forall` (#bv-binder-peel)?
+///
+/// ONE readable bound is enough: instantiating that binder folds the
+/// selector/read chain the next bound hangs off, so the rest become literal in
+/// turn. Without this the table is withheld from exactly the shape the peel
+/// exists for — measured on a nested-`Vec` replay obligation whose outer bound
+/// is a destructured datatype FIELD (`outer!fld_len`), readable only from the
+/// entailed table, where the whole query stayed
+/// `unknown (quantifier-unhandled)`.
+fn multi_bv_binder_unlocks(
+    terms: &TermStore,
+    vars: &[(String, Sort)],
+    body: TermId,
+    consts: &HashMap<TermId, BigInt>,
+) -> bool {
+    if vars.len() < 2
+        || !vars
+            .iter()
+            .all(|(_, sort)| matches!(sort, Sort::BitVec(bv) if bv.width <= 64))
+    {
+        return false;
+    }
+    let TermData::App(Symbol::Named(op), or_args) = terms.get(body).clone() else {
+        return false;
+    };
+    if op != "or" {
+        return false;
+    }
+    vars.iter().any(|(name, sort)| {
+        let Sort::BitVec(bv) = sort else {
+            return false;
+        };
+        probe_bv_range(terms, &or_args, name, bv.width, Some(consts)).is_some()
+            && probe_bv_range(terms, &or_args, name, bv.width, None).is_none()
+    })
 }
 
 /// Range an OR-body's guard disjuncts pin the binder to, reading bounds either
@@ -579,6 +648,16 @@ fn analyze_bounded_int_forall(
 /// verdict.
 const MAX_GUARDED_INT_BOX_COMBOS: u64 = 4096;
 
+/// Term-store growth a single multi-binder BV peel (#bv-binder-peel) may
+/// charge before it abandons the expansion.
+///
+/// Each peel level enumerates a range the extractor already bounded by
+/// [`MAX_FINITE_DOMAIN_COMBOS`], but levels MULTIPLY, so two admissible ranges
+/// still compose into a 65536-instance product. This is the pass's own cost
+/// ceiling; crossing it is a refusal, not a partial expansion, so the verdict
+/// is unchanged and only the work is bounded.
+const MAX_BV_PEEL_TERM_GROWTH: usize = 500_000;
+
 /// The operand of a recognized guard comparison: a bound variable of THIS
 /// quantifier (by binder index) or an evaluable integer constant.
 enum BoxOperand {
@@ -835,14 +914,42 @@ struct BoundedBvInfo {
     body: TermId,
 }
 
-/// Unsigned-BV constant value of `t` as `i128` (widths <= 64 only).
+/// Unsigned-BV constant value of `t` as `i128` (widths <= 64 only): a syntactic
+/// literal, OR a value the problem's quantifier-free consequences PROVABLY
+/// ENTAIL, exactly as the Int reader [`const_value`] already does.
+///
+/// Without the second source a guard bound that is pinned by an asserted
+/// equality rather than written as a literal — `(fld_len v)` where
+/// `(= (fld_len v) #x41)` is asserted — read as "not a constant", so
+/// `bounds_from_bv_guard` returned `(None, None)`, `#guard-must-bind` rejected
+/// the WHOLE expansion, and the universal survived with no lane able to
+/// certify it.
+///
+/// The entailed table is only ever populated behind the caller's
+/// non-conjunctive-`forall` gate, so a value found here is a genuine
+/// consequence of the ground facts, not merely an instance of some disjunctive
+/// quantifier.
 fn bv_const_value(terms: &TermStore, t: TermId) -> Option<i128> {
     if let TermData::Const(Constant::BitVec { value, width }) = terms.get(t) {
         if *width <= 64 {
             return value.to_i128();
         }
     }
-    None
+    // Sort-guarded: the shared table also holds Int entries, and an Int value
+    // must never be read as this term's bit pattern.
+    let Sort::BitVec(bv) = terms.sort(t) else {
+        return None;
+    };
+    if bv.width > 64 {
+        return None;
+    }
+    let derived = DERIVED.with(|d| d.borrow().get(&t).cloned())?;
+    // An entailed BV value is recorded UNSIGNED; reject anything that cannot be
+    // this term's value rather than truncating it into range.
+    if derived.sign() == num_bigint::Sign::Minus || derived.bits() > u64::from(bv.width) {
+        return None;
+    }
+    derived.to_i128()
 }
 
 /// Bounds contributed by ONE POSITIVE unsigned-BV guard `(op lhs rhs)` on the
@@ -851,6 +958,67 @@ fn bv_const_value(terms: &TermStore, t: TermId) -> Option<i128> {
 /// `(None, None)` and the caller REJECTS the expansion (#guard-must-bind —
 /// dropping an unevaluable guard would demand the body at exempted points, a
 /// false-UNSAT).
+/// Would a narrow unsigned-BV binder's guards bind a finite range, given (or
+/// withheld) the entailed-constant table?
+///
+/// The bit-vector twin of [`probe_range`], and it answers the same question the
+/// expander itself asks, including `#guard-must-bind`: a recognized guard that
+/// binds NEITHER side must make the whole probe fail, because the expander
+/// rejects that case too. Reporting a range the expander would then refuse
+/// would arm the derived table for an expansion that cannot happen.
+fn probe_bv_range(
+    terms: &TermStore,
+    or_args: &[TermId],
+    var: &str,
+    width: u32,
+    consts: Option<&HashMap<TermId, BigInt>>,
+) -> Option<(i128, i128)> {
+    if width > 64 {
+        return None;
+    }
+    let _derived_scope = scoped_derived_consts(consts.cloned().unwrap_or_default());
+    let mut lo: Option<i128> = None;
+    let mut hi: Option<i128> = None;
+    let mut any = false;
+    for &arg in or_args {
+        if let Some((l, h)) = bounds_from_bv_forall_disjunct(terms, arg, var) {
+            if l.is_none() && h.is_none() {
+                return None;
+            }
+            any = true;
+            if let Some(l) = l {
+                lo = Some(lo.map_or(l, |p: i128| p.max(l)));
+            }
+            if let Some(h) = h {
+                hi = Some(hi.map_or(h, |p: i128| p.min(h)));
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    // The UNSIGNED BV domain supplies whichever end no guard named, exactly as
+    // [`extract_bounded_bv_forall`] does. Demanding both ends here made the
+    // probe STRICTER than the expander it speaks for, so the single commonest
+    // guard shape -- a lone `(bvult i N)` upper bound, which the expander
+    // completes with `lo = 0` -- reported "no range" and the entailed table was
+    // withheld from an expansion that would have succeeded. Measured on a
+    // nested-Vec replay obligation: three correct constants were derived, the
+    // binder's bound was one of them, and `unlocks` was still false.
+    let domain_max: i128 = if width == 64 {
+        i128::from(u64::MAX)
+    } else {
+        (1i128 << width) - 1
+    };
+    let lo = lo.unwrap_or(0).max(0);
+    let hi = hi.unwrap_or(domain_max).min(domain_max);
+    if hi >= lo && (hi - lo + 1) as u128 <= u128::from(MAX_FINITE_DOMAIN_COMBOS) {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
 fn bounds_from_bv_guard(
     terms: &TermStore,
     op: &str,
@@ -1211,6 +1379,130 @@ pub(crate) fn finite_domain_expand_with_instances(
     Some((expanded, recorder.unwrap_or_default()))
 }
 
+/// Expand a MULTI-binder BV `forall` by peeling one binder at a time
+/// (#bv-binder-peel).
+///
+/// The single-binder BV path handles `forall i. (=> (bvult i c) B)` for a
+/// LITERAL `c`, and the guarded-box path handles multiple Int binders whose
+/// ranges are all statically derivable. Neither
+/// covers the shape a nested-aggregate replay obligation actually produces:
+///
+/// ```text
+/// (forall ((r (_ BitVec 64)) (c (_ BitVec 64)))
+///   (=> (and (bvult r (fld_len outer))
+///            (bvult c (fld_len (select (fld_data outer) r))))
+///       (= (select (fld_data (select (fld_data outer) r)) c) (_ bv7 8))))
+/// ```
+///
+/// Here `r`'s bound folds to a literal once `outer`'s defining equality is
+/// in place (#defn-fold-under-forall), but `c`'s bound is a SELECTOR over a
+/// select whose index is the other binder, so no static box exists and the
+/// generic finite-sort path refuses every BV wider than 8. The quantifier then
+/// survives to the fall-through lane, which invents the datatype fields it
+/// cannot read and leaves the strict model-validation oracles to degrade an
+/// otherwise decided query to `unknown`.
+///
+/// Peeling fixes exactly that: instantiate the binder whose bound IS
+/// already literal, and each instance makes the remaining bound literal in
+/// turn (`(select (store d (_ bv33 64) row) (_ bv5 64))` folds by ROW2 and
+/// `fld_len` folds over the resulting constructor), so
+/// [`expand_finite_domain_subterms`] grounds the residual binder.
+///
+/// # Soundness
+///
+/// Reordering binders inside one same-quantifier block is a logical
+/// identity, so `forall x⃗. B` is `forall x_k. forall (x⃗ minus x_k). B`.
+/// The peel then applies the single-binder argument to `x_k` VERBATIM:
+/// `extract_bounded_bv_forall` enforces `#guard-must-bind`, so every point
+/// outside `[lo, hi]` makes a recognized guard disjunct true and the body
+/// vacuously true, while inside it the same disjunct is false and the
+/// residual `body` is exactly what remains. That argument never mentions
+/// the other binders, which stay universally quantified in each instance,
+/// so the conjunction is EQUIVALENT to the original in both directions --
+/// it admits no model and removes none, at either polarity.
+///
+/// # Fail-closed
+///
+/// Refusal is free: the peel commits only when every instance comes back
+/// quantifier-FREE. If any residual binder survives, this returns `None`
+/// and the caller proceeds exactly as before with the untouched original,
+/// so a partial peel can neither multiply a surviving quantifier across the
+/// outer range nor change which lane decides the query.
+fn peel_bounded_bv_forall(
+    terms: &mut TermStore,
+    vars: &[(String, Sort)],
+    body: TermId,
+    is_forall: bool,
+    recorder: &mut Option<Vec<FiniteDomainInstance>>,
+) -> Option<TermId> {
+    if !is_forall || vars.len() < 2 || !vars.iter().all(|(_, s)| matches!(s, Sort::BitVec(_))) {
+        return None;
+    }
+    for peel_idx in 0..vars.len() {
+        let (ref var_name, ref var_sort) = vars[peel_idx];
+        let Sort::BitVec(bv) = var_sort else {
+            continue;
+        };
+        let width = bv.width;
+        let Some(info) =
+            extract_bounded_bv_forall(terms, body, var_name, width, MAX_FINITE_DOMAIN_COMBOS)
+        else {
+            continue;
+        };
+        if info.hi < info.lo {
+            // Provably-empty guard range for this binder: vacuously true
+            // whatever the remaining binders range over.
+            return Some(terms.mk_bool(true));
+        }
+        let rest: Vec<(String, Sort)> = vars
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != peel_idx)
+            .map(|(_, binder)| binder.clone())
+            .collect();
+        let mut instances: Vec<TermId> = Vec::with_capacity((info.hi - info.lo + 1) as usize);
+        let mut recorded: Vec<FiniteDomainInstance> = Vec::new();
+        let mut grounded = true;
+        let terms_before = terms.len();
+        for v in info.lo..=info.hi {
+            let value = terms.mk_bitvec(BigInt::from(v), width);
+            let mut subst: HashMap<String, TermId> = Default::default();
+            subst.insert(var_name.clone(), value);
+            let instance_body = subst_vars(terms, info.body, &subst);
+            // The residual binder block, re-expanded: the substitution
+            // above folds this instance's selector/read chains, which is
+            // what turns the next binder's bound into a literal.
+            let residual = terms.mk_forall(rest.clone(), instance_body);
+            let expanded = expand_finite_domain_subterms(terms, residual);
+            if contains_quantifier(terms, expanded) {
+                grounded = false;
+                break;
+            }
+            // Each peel level multiplies the one below it, so the ranges
+            // the extractor admits individually (<= MAX_FINITE_DOMAIN_COMBOS
+            // apiece) still compose into a product this pass must bound
+            // itself. Charge the actual term growth and abandon the peel
+            // once it passes the budget: refusing leaves the untouched
+            // original for the ordinary lanes, exactly as a residual
+            // binder does.
+            if terms.len().saturating_sub(terms_before) > MAX_BV_PEEL_TERM_GROWTH {
+                grounded = false;
+                break;
+            }
+            recorded.push((vec![value], expanded));
+            instances.push(expanded);
+        }
+        if !grounded {
+            continue;
+        }
+        if let Some(rec) = recorder.as_mut() {
+            rec.extend(recorded);
+        }
+        return Some(terms.mk_and(instances));
+    }
+    None
+}
+
 fn finite_domain_expand_impl(
     terms: &mut TermStore,
     term: TermId,
@@ -1369,6 +1661,13 @@ fn finite_domain_expand_impl(
                 return Some(terms.mk_and(instances));
             }
         }
+    }
+
+    // MULTI-binder BV `forall`: peel one binder at a time
+    // (#bv-binder-peel). See [`peel_bounded_bv_forall`] for the shape this
+    // covers, the equivalence argument and the two fail-closed refusals.
+    if let Some(peeled) = peel_bounded_bv_forall(terms, &vars, body, is_forall, recorder) {
+        return Some(peeled);
     }
 
     // A conjunctively bounded-looking `forall` does NOT make Int a finite

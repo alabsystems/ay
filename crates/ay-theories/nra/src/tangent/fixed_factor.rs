@@ -48,7 +48,11 @@ impl NraSolver<'_> {
         let mut pins: Vec<(TermId, BigRational)> = Vec::new();
 
         for &(atom, value) in &self.asserted {
-            let Some(MultiAtom::Constraint(c)) = self.atom_to_multi(atom, value) else {
+            // Borrow the constraint instead of moving it out of the
+            // `Option<MultiAtom>`: a partial move leaves a drop that switches
+            // on the niche-encoded discriminant. The atom is dropped whole.
+            let multi = self.atom_to_multi(atom, value);
+            let Some(MultiAtom::Constraint(c)) = multi.as_ref() else {
                 continue;
             };
             let mut var: Option<(TermId, BigRational)> = None;
@@ -67,20 +71,20 @@ impl NraSolver<'_> {
             if !in_fragment {
                 continue;
             }
-            let Some((v, a)) = var else { continue };
+            let Some((v, a)) = var.as_ref() else { continue };
             if a.is_zero() {
                 continue;
             }
-            let value = -(&constant) / &a;
-            let flip = a < BigRational::zero();
+            let value = -(&constant) / a;
+            let flip = *a < BigRational::zero();
             match c.rel {
-                Rel::Eq => pins.push((v, value)),
+                Rel::Eq => pins.push((*v, value)),
                 Rel::Le | Rel::Ge => {
                     let is_upper = matches!(c.rel, Rel::Le) != flip;
                     if is_upper {
-                        upper.push((v, value));
+                        upper.push((*v, value));
                     } else {
-                        lower.push((v, value));
+                        lower.push((*v, value));
                     }
                 }
                 Rel::Lt | Rel::Gt | Rel::Ne => {}

@@ -526,6 +526,11 @@ fn expr_has_array_sort(expr: &ChcExpr) -> bool {
 /// `select(_, idx)` subexpressions of `expr`.
 fn collect_array_index_terms(expr: &ChcExpr, out: &mut Vec<ChcExpr>) {
     match expr {
+        ChcExpr::ArrayLambda(lambda) => {
+            for value in lambda.captures() {
+                collect_array_index_terms(value, out);
+            }
+        }
         ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
             collect_array_index_terms(args[0].as_ref(), out);
             push_index_term(args[1].as_ref(), out);

@@ -121,15 +121,15 @@ impl DtSplitOnDemand {
     /// (fail-closed for that base — no clause will ever be emitted for it).
     pub fn register_base(&mut self, terms: &TermStore, t: TermId, atoms: &[TermId]) {
         let Some(dt_name) = Self::dt_sort_name(terms.sort(t)) else {
-            self.rejected_bases += 1;
+            self.rejected_bases = self.rejected_bases.saturating_add(1);
             return;
         };
         let Some(ctors) = self.enum_ctors.get(dt_name) else {
-            self.rejected_bases += 1;
+            self.rejected_bases = self.rejected_bases.saturating_add(1);
             return;
         };
         if ctors.len() != atoms.len() {
-            self.rejected_bases += 1;
+            self.rejected_bases = self.rejected_bases.saturating_add(1);
             tracing::warn!(
                 base = t.0,
                 "dt-d2: split base atom family incomplete; base rejected"
@@ -138,11 +138,11 @@ impl DtSplitOnDemand {
         }
         for (atom, ctor) in atoms.iter().zip(ctors.iter()) {
             let TermData::App(Symbol::Named(eq), args) = terms.get(*atom) else {
-                self.rejected_bases += 1;
+                self.rejected_bases = self.rejected_bases.saturating_add(1);
                 return;
             };
             if eq != "=" || args.len() != 2 {
-                self.rejected_bases += 1;
+                self.rejected_bases = self.rejected_bases.saturating_add(1);
                 return;
             }
             // One side is t; the other is the j-th constructor CONSTANT of
@@ -152,7 +152,7 @@ impl DtSplitOnDemand {
             } else if args[1] == t {
                 args[0]
             } else {
-                self.rejected_bases += 1;
+                self.rejected_bases = self.rejected_bases.saturating_add(1);
                 return;
             };
             let is_ctor_const = match terms.get(other) {
@@ -160,7 +160,7 @@ impl DtSplitOnDemand {
                 _ => false,
             };
             if !is_ctor_const || Self::dt_sort_name(terms.sort(other)) != Some(dt_name) {
-                self.rejected_bases += 1;
+                self.rejected_bases = self.rejected_bases.saturating_add(1);
                 tracing::warn!(
                     base = t.0,
                     ctor = %ctor,
@@ -269,7 +269,7 @@ impl DtSplitOnDemand {
             out.push(TheoryLemma::new(clause));
             self.emitted.insert(idx);
         }
-        self.emitted_total += out.len() as u64;
+        self.emitted_total = self.emitted_total.saturating_add(out.len() as u64);
         if self.emitted_total >= D2_MAX_SPLITS_TOTAL {
             tracing::warn!(
                 total = self.emitted_total,
@@ -318,12 +318,12 @@ pub fn occurrence_relevant_dt_terms(
 ) -> Vec<TermId> {
     let mut relevant: Vec<TermId> = Vec::new();
     let mut seen: HashSet<TermId> = HashSet::default();
-    let mut bound: Vec<String> = Vec::new();
+    let mut scope = RelevanceScope::default();
     for &root in assertions {
         collect_relevant(
             terms,
             root,
-            &mut bound,
+            &mut scope,
             dt_sort_names,
             tester_names,
             selector_names,
@@ -390,18 +390,39 @@ fn note_relevant(
     }
 }
 
+/// The binder names in force during [`collect_relevant`], and the subterms
+/// already walked under exactly those names.
+#[derive(Default)]
+struct RelevanceScope {
+    bound: Vec<String>,
+    visited: HashSet<TermId>,
+}
+
 /// Pre-order walk collecting UNION-relevant ground DT terms.
+///
+/// A subterm already walked under the same binder names is skipped: every
+/// effect of a walk is a `note_relevant` deduplicated by `seen`, so a second
+/// walk adds nothing. A nested quantifier gets a fresh visited set, since the
+/// bound names decide groundness. The walk without it re-walked shared
+/// subterms once per path, exponential on a DAG: on QF_UFBVDT Certora
+/// `83314_a702bf8b823398c9e37a_4` the `--z3-mode` run was inside it 9-12 s
+/// into a `-T:10` run (sampled), polling no stop, and ended in the
+/// watchdog's hard exit.
 #[allow(clippy::too_many_arguments)]
 fn collect_relevant(
     terms: &TermStore,
     t: TermId,
-    bound: &mut Vec<String>,
+    scope: &mut RelevanceScope,
     dt_sort_names: &HashSet<String>,
     tester_names: &HashSet<String>,
     selector_names: &HashSet<String>,
     relevant: &mut Vec<TermId>,
     seen: &mut HashSet<TermId>,
 ) {
+    if !scope.visited.insert(t) {
+        return;
+    }
+    let bound = &scope.bound;
     match terms.get(t) {
         TermData::App(Symbol::Named(name), args) => {
             if args.len() == 1
@@ -420,7 +441,7 @@ fn collect_relevant(
                 collect_relevant(
                     terms,
                     a,
-                    bound,
+                    scope,
                     dt_sort_names,
                     tester_names,
                     selector_names,
@@ -435,7 +456,7 @@ fn collect_relevant(
                 collect_relevant(
                     terms,
                     a,
-                    bound,
+                    scope,
                     dt_sort_names,
                     tester_names,
                     selector_names,
@@ -449,7 +470,7 @@ fn collect_relevant(
             collect_relevant(
                 terms,
                 a,
-                bound,
+                scope,
                 dt_sort_names,
                 tester_names,
                 selector_names,
@@ -462,7 +483,7 @@ fn collect_relevant(
                 collect_relevant(
                     terms,
                     a,
-                    bound,
+                    scope,
                     dt_sort_names,
                     tester_names,
                     selector_names,
@@ -481,7 +502,7 @@ fn collect_relevant(
                 collect_relevant(
                     terms,
                     a,
-                    bound,
+                    scope,
                     dt_sort_names,
                     tester_names,
                     selector_names,
@@ -491,22 +512,24 @@ fn collect_relevant(
             }
         }
         TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
-            let added = vars.len();
+            let outer_len = scope.bound.len(); // the recursion restores `bound`
             let body = *body;
             for (n, _) in vars {
-                bound.push(n.clone());
+                scope.bound.push(n.clone());
             }
+            let outer_visited = std::mem::take(&mut scope.visited);
             collect_relevant(
                 terms,
                 body,
-                bound,
+                scope,
                 dt_sort_names,
                 tester_names,
                 selector_names,
                 relevant,
                 seen,
             );
-            bound.truncate(bound.len() - added);
+            scope.visited = outer_visited;
+            scope.bound.truncate(outer_len);
         }
         TermData::Var(_, _) | TermData::Const(_) => {}
         // Unknown future variant: no descent (fail-open; the depth-1 floor and

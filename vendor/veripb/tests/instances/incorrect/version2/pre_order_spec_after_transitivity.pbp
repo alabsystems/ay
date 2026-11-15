@@ -1,0 +1,37 @@
+pseudo-Boolean proof version 2.0
+* Regression test: a `spec` block after `transitivity`.
+*
+* Not a wrong verdict, and this too used to be ACCEPTED at exit 0. The order's
+* specification is what its auxiliary variables mean, and `order_proof` pushes
+* it as a premise of the transitivity and reflexivity proofs. Written after
+* those proofs have run, it enters the order without ever having been a premise
+* of the proofs that are supposed to hold under it -- so the order's side
+* conditions were established for a different specification than the one
+* `load_order` goes on to use. Found by the same sweep; see
+* incorrect/version2/pre_order_transitivity_before_def.
+f 4
+pre_order simple
+    vars
+        left u1
+        right v1
+        aux
+    end
+    def
+        -1 u1 1 v1 >= 0 ;
+    end
+    transitivity
+        vars
+            fresh_right w1
+        end
+        proof
+            proofgoal #1
+                p -2 -3 + -1 +
+            end -1
+        end
+    end
+    spec
+    end
+end
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

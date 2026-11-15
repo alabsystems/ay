@@ -19,6 +19,19 @@ pub(super) use result_protocol::{
     triage_lra_result_deferred,
 };
 
+/// Pairs already forwarded during one combined `check()` call.
+///
+/// A source whose check internally pushes/pops scopes (NRA/NIA tentative
+/// patches) restores its exported-pair set on pop, so the same tight-bound
+/// equalities are re-exported on every Nelson-Oppen iteration. Counting
+/// those as new each round starves the fixpoint (and any deferred split)
+/// until the iteration cap — measured at 174 re-reported pairs/round on
+/// QF_UFNRA CLEARSY goals. Within one `check()` the target only grows, so
+/// a pair forwarded once never needs forwarding again; callers keep one
+/// of these per direction per check and pass it to
+/// [`propagate_all_to_dedup`].
+pub(super) type ForwardedPairs = ay_core::kani_compat::DetHashSet<(TermId, TermId)>;
+
 /// Result of draining equalities and disequalities from a theory solver (#8455).
 pub(super) struct PropagationCounts {
     /// Number of equalities propagated.
@@ -72,6 +85,53 @@ pub(super) fn propagate_all_to(
         target.assert_shared_disequality(diseq.lhs, diseq.rhs, &diseq.reason);
     }
 
+    Ok(PropagationCounts {
+        equalities: eq_count,
+        disequalities: diseq_count,
+    })
+}
+
+/// Like [`propagate_all_to`], but forwards (and counts) only pairs not
+/// already in `forwarded` during this `check()` call. See
+/// [`ForwardedPairs`] for why re-exports must not count as new. The
+/// conflict is boxed so this helper needs no `result_large_err` allow.
+pub(super) fn propagate_all_to_dedup(
+    source: &mut dyn TheorySolver,
+    target: &mut dyn TheorySolver,
+    forwarded: &mut ForwardedPairs,
+    debug: bool,
+    label: &str,
+    iteration: usize,
+) -> Result<PropagationCounts, Box<TheoryResult>> {
+    let eq_result =
+        drain_equalities_for_propagation(source, debug, label, iteration).map_err(Box::new)?;
+    let mut eq_count = 0usize;
+    for eq in eq_result.equalities {
+        let pair = if eq.lhs <= eq.rhs {
+            (eq.lhs, eq.rhs)
+        } else {
+            (eq.rhs, eq.lhs)
+        };
+        if forwarded.insert(pair) {
+            target.assert_shared_equality(eq.lhs, eq.rhs, &eq.reason);
+            eq_count += 1;
+        }
+    }
+    let mut diseq_count = 0usize;
+    for diseq in eq_result.disequalities {
+        let pair = if diseq.lhs <= diseq.rhs {
+            (diseq.lhs, diseq.rhs)
+        } else {
+            (diseq.rhs, diseq.lhs)
+        };
+        // Equal and disequal forwards of the same pair in one check would
+        // have conflicted in the source; keying both by the unordered pair
+        // is safe because at most one direction can be live.
+        if forwarded.insert(pair) {
+            target.assert_shared_disequality(diseq.lhs, diseq.rhs, &diseq.reason);
+            diseq_count += 1;
+        }
+    }
     Ok(PropagationCounts {
         equalities: eq_count,
         disequalities: diseq_count,
@@ -149,8 +209,10 @@ pub(super) fn debug_nelson_oppen() -> bool {
 /// discover ROW1/ROW2 equalities, and forward them to EUF (#4665).
 ///
 /// `get_value_with_reasons` evaluates an index term to an optional `(value, reasons)`
-/// pair using the arithmetic solver (LIA or LRA). The reasons are `TheoryLit`s from
-/// tight bounds that justify the value. When disequalities are found, the merged
+/// pair using the arithmetic solver (LIA or LRA). `reasons` is `Some` only when the
+/// value is JUSTIFIED -- every arithmetic leaf is a constant or pinned by tight
+/// asserted bounds, and the `TheoryLit`s are those bounds -- and `None` when some
+/// leaf's value is a bare model choice. When disequalities are found, the merged
 /// reasons from both indices are stored in the array solver so that
 /// `explain_distinct_if_provable()` can justify ROW2 conflicts (#6546).
 ///
@@ -167,10 +229,21 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
     terms: &TermStore,
     arrays: &mut ArraySolver<'_>,
     euf: &mut EufSolver<'_>,
-    get_value_with_reasons: impl Fn(TermId) -> Option<(V, Vec<TheoryLit>)>,
+    get_value_with_reasons: impl Fn(TermId) -> Option<(V, Option<Vec<TheoryLit>>)>,
     act_on_read_congruence_pairs: bool,
 ) -> Option<TheoryResult> {
     let undecided = arrays.undecided_index_pairs();
+    let debug = debug_nelson_oppen();
+    if debug {
+        safe_eprintln!(
+            "[N-O ARR-IDX] {} undecided index pairs: {:?}",
+            undecided.len(),
+            undecided
+                .iter()
+                .map(|p| (p.idx1, p.idx2, p.sels.is_some()))
+                .collect::<Vec<_>>()
+        );
+    }
     let mut propagated_new = false;
     // Track pairs where the arithmetic model couldn't determine the relationship:
     // either both values are equal (trivial model) or one/both have no value
@@ -238,14 +311,39 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
         // representative substitution has no SAT premise; that pair falls
         // through to the ordinary equality/disequality split below rather
         // than installing an unconditional array edge.
+        //
+        // #no-index-eq-livelock: the edge is a sentinel edge of the array
+        // solver's equality graph, NOT an asserted atom, and the atom-keyed
+        // `known_equal` behind `undecided_index_pairs` never sees it — so the
+        // pair stays in every later snapshot. Claiming progress on every
+        // snapshot ran the Nelson-Oppen loop to its 100-iteration cap on a
+        // two-assertion QF_ALIA problem (`select(store^3(t, i0, k4, i2), k0)
+        // > 3` with `k0 = i0 = k4 = i2` decided through `k0`: EUF proves the
+        // store-index pairs equal transitively, the array solver holds no
+        // atom for them). Restart the loop ONLY when the edge or its reasons
+        // are new; an edge already recorded falls through to the model-value
+        // path, where the pair gets its SAT-level `(= idx1 idx2)` split like
+        // any other undecided pair — the atom the array solver's ROW checks
+        // can actually consume.
         if let Some(reasons) = affine_euf_equality_reasons(terms, euf, pair.idx1, pair.idx2) {
-            arrays.assert_external_equality_with_reasons(pair.idx1, pair.idx2, &reasons);
-            // `undecided_index_pairs` excludes relationships already present
-            // in the array equality graph, so this snapshot entry witnesses a
-            // newly inserted edge.  Restart once to let ROW checks consume it;
-            // the next snapshot omits the now-known pair, preventing thrash.
-            propagated_new = true;
-            continue;
+            let changed =
+                arrays.assert_external_equality_with_reasons(pair.idx1, pair.idx2, &reasons);
+            if debug {
+                safe_eprintln!(
+                    "[N-O ARR-IDX] affine EUF equality {:?} = {:?} (reasons {:?}) -> external equality changed={}",
+                    pair.idx1,
+                    pair.idx2,
+                    reasons
+                        .iter()
+                        .map(|r| (r.term, r.value, format!("{:?}", terms.get(r.term))))
+                        .collect::<Vec<_>>(),
+                    changed
+                );
+            }
+            if changed {
+                propagated_new = true;
+                continue;
+            }
         }
         if let (Some((v1, r1)), Some((v2, r2))) = (
             get_value_with_reasons(pair.idx1),
@@ -253,9 +351,24 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
         ) {
             if v1 != v2 {
                 // The model assigns distinct values to the two indices. Merge the
-                // reasons from both evaluations (#6546).
-                let mut reasons = r1;
-                reasons.extend(r2);
+                // reasons from both evaluations (#6546) -- but only when BOTH
+                // values are justified (#index-diseq-justified). A pinned `j = 5`
+                // against a free `i` the model happens to put at 0 used to be
+                // asserted as `i != j` under `j`'s bounds alone: `i = 5` stays
+                // possible under those reasons, so every ROW conflict built on
+                // the disequality was a false theorem. On the verifier's
+                // `variants2/d4b/d4b_029` (z3 `sat`) this answered `unsat` in
+                // 0.01 s on a 2026-09-28 branch tip that also reported the
+                // written indices of store-chain equalities here. A non-empty
+                // union of the two reason sets says nothing about the side
+                // that has none.
+                let mut reasons = match (r1, r2) {
+                    (Some(mut r1), Some(r2)) => {
+                        r1.extend(r2);
+                        r1
+                    }
+                    _ => Vec::new(),
+                };
                 reasons.sort_by_key(|lit| (lit.term.0, lit.value));
                 reasons.dedup_by_key(|lit| (lit.term, lit.value));
                 if reasons.is_empty() {
@@ -269,15 +382,27 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
                     // UNSAT. This is the disequality-direction mirror of the
                     // `v1 == v2` guard below (#5086); defer to a SAT case split.
                     unresolved_pairs.push((pair.idx1, pair.idx2));
-                } else if arrays
-                    .assert_external_disequality_with_reasons(pair.idx1, pair.idx2, reasons)
-                {
+                } else {
+                    let n_reasons = reasons.len();
+                    let is_new = arrays
+                        .assert_external_disequality_with_reasons(pair.idx1, pair.idx2, reasons);
+                    if debug {
+                        safe_eprintln!(
+                            "[N-O ARR-IDX] model-distinct {:?} != {:?} ({} reasons) -> external disequality new={}",
+                            pair.idx1,
+                            pair.idx2,
+                            n_reasons,
+                            is_new
+                        );
+                    }
                     // Only count as new propagation if the disequality was not
                     // already known (#6546 Packet 4). Without this, re-asserting
                     // known disequalities returns Some(Sat) which restarts the N-O
                     // loop indefinitely — the root cause of storeinv 3+ index
                     // timeouts.
-                    propagated_new = true;
+                    if is_new {
+                        propagated_new = true;
+                    }
                 }
             } else {
                 // Do NOT assert equality when v1 == v2 (#5086). Model-based value
@@ -292,7 +417,16 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
             }
         } else if distinct_by_affine_offset(terms, pair.idx1, pair.idx2) {
             // Syntactic affine offset — tautological, no reasons needed.
-            if arrays.assert_external_disequality(pair.idx1, pair.idx2) {
+            let is_new = arrays.assert_external_disequality(pair.idx1, pair.idx2);
+            if debug {
+                safe_eprintln!(
+                    "[N-O ARR-IDX] affine-offset {:?} != {:?} -> external disequality new={}",
+                    pair.idx1,
+                    pair.idx2,
+                    is_new
+                );
+            }
+            if is_new {
                 propagated_new = true;
             }
         } else {
@@ -304,6 +438,17 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
     let arr_eq = arrays.propagate_equalities();
     if let Some(conflict) = arr_eq.conflict {
         return Some(array_equality_propagation_conflict_result(conflict));
+    }
+    if debug && !arr_eq.equalities.is_empty() {
+        safe_eprintln!(
+            "[N-O ARR-IDX] {} array ROW equalities -> EUF: {:?}",
+            arr_eq.equalities.len(),
+            arr_eq
+                .equalities
+                .iter()
+                .map(|eq| (eq.lhs, eq.rhs, eq.reason.len()))
+                .collect::<Vec<_>>()
+        );
     }
     for eq in &arr_eq.equalities {
         // Self-equality guard: array ROW equalities should have distinct terms.
@@ -356,6 +501,13 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
         for &(idx1, idx2) in &new_pairs {
             arrays.mark_model_equality_requested(idx1, idx2);
         }
+        if debug && !new_pairs.is_empty() {
+            safe_eprintln!(
+                "[N-O ARR-IDX] {} unresolved index pairs -> model equality split(s): {:?}",
+                new_pairs.len(),
+                new_pairs
+            );
+        }
         let requests: Vec<ay_core::ModelEqualityRequest> = new_pairs
             .into_iter()
             .map(|(idx1, idx2)| ay_core::ModelEqualityRequest {
@@ -375,6 +527,13 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
         } else if requests.len() > 1 {
             return Some(TheoryResult::NeedModelEqualities(requests));
         }
+    }
+    if debug {
+        safe_eprintln!(
+            "[N-O ARR-IDX] {} unresolved index pairs already requested; propagated_new={}",
+            unresolved_pairs.len(),
+            propagated_new
+        );
     }
     if !propagated_new {
         return None;

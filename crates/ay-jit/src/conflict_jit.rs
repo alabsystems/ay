@@ -73,6 +73,9 @@ const LEARNED_COUNT_IDX: usize = 1;
 const RESOLVENT_SIZE_IDX: usize = 2;
 const LEARNED_BUF_START_IDX: usize = 3;
 
+#[cfg(test)]
+mod counted_resize_tests;
+
 impl ConflictProcessorOutput {
     /// Create a zeroed output buffer with the given capacity.
     ///
@@ -86,6 +89,73 @@ impl ConflictProcessorOutput {
             buf: vec![0u32; total_u32s],
             capacity,
         }
+    }
+
+    /// Construct the same output layout under the original invocation owner.
+    /// This admits only buffer construction, not subsequent JIT compilation.
+    pub fn try_new_counted(
+        capacity: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::CountedAdmissionError;
+        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        let capacity = capacity.max(64);
+        let total = capacity
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        let bytes = total
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        owner.admit(total, bytes)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(total)
+            .map_err(|_| owner.refuse(CountedAdmissionError::Memory))?;
+        for _ in 0..total {
+            owner.admit(1, 0)?;
+            buf.push(0);
+        }
+        owner.check()?;
+        Ok(Self { buf, capacity })
+    }
+
+    /// Reserve and debit the actual subsequent resize/reset operation. The
+    /// caller still invokes resize; no native/interpreter route is replaced.
+    pub fn prepare_counted_resize(
+        &mut self,
+        new_capacity: usize,
+        owner: &ay_core::original_query::CountedAdmission,
+    ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
+        use ay_core::original_query::CountedAdmissionError;
+        let capacity = new_capacity.max(64);
+        if capacity == self.capacity {
+            return owner.admit(4, 0);
+        }
+        let total = capacity
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        let growth = total.saturating_sub(self.buf.len());
+        let work = total
+            .checked_add(growth)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
+        owner.admit(work, 0)?;
+        if total > self.buf.capacity() {
+            let target = total.max(
+                self.buf
+                    .capacity()
+                    .checked_mul(2)
+                    .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?,
+            );
+            let bytes = target
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+            owner.admit(self.buf.len(), bytes)?;
+            self.buf
+                .try_reserve_exact(target - self.buf.len())
+                .map_err(|_| owner.refuse(CountedAdmissionError::Memory))?;
+        }
+        Ok(())
     }
 
     /// Resize the buffer to a new capacity (e.g., after adding variables).

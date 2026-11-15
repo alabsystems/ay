@@ -68,3 +68,45 @@ fn guarded_scaled_equality_is_discovered_on_the_dillig12_loop() {
             .collect::<Vec<_>>())
     );
 }
+
+/// Mode-guard atoms on a DAG whose tree has `2^60` copies of `(= j 1)`: the
+/// distinct walk visits the one node a bounded number of times (the tree walk
+/// never returned).
+#[test]
+#[ntest::timeout(60_000)]
+fn constant_equality_atoms_of_a_shared_dag_are_collected_once() {
+    use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
+    use std::sync::Arc;
+
+    let j = ChcExpr::var(ChcVar::new("j", ChcSort::Int));
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let mut c = Arc::new(ChcExpr::eq(j.clone(), ChcExpr::int(1)));
+    for i in 0..60i64 {
+        let left = ChcExpr::Op(
+            ChcOp::And,
+            vec![
+                Arc::clone(&c),
+                Arc::new(ChcExpr::le(x.clone(), ChcExpr::int(i))),
+            ],
+        );
+        let right = ChcExpr::Op(
+            ChcOp::And,
+            vec![
+                Arc::clone(&c),
+                Arc::new(ChcExpr::ge(x.clone(), ChcExpr::int(-i))),
+            ],
+        );
+        c = Arc::new(ChcExpr::Op(
+            ChcOp::Or,
+            vec![Arc::new(left), Arc::new(right)],
+        ));
+    }
+
+    // The distinct walk skips repeats only after its first 512 pops; the
+    // caller keeps first occurrences.
+    let mut atoms = Vec::new();
+    PdrSolver::collect_constant_equality_atoms(&c, &mut atoms);
+    assert!(atoms.len() < 600, "{} visits", atoms.len());
+    atoms.dedup();
+    assert_eq!(atoms, vec![(j, 1)]);
+}

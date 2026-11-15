@@ -202,20 +202,36 @@ fn test_arrays_row2_batches_multiple_lemmas() {
         clauses.contains(&vec![(eq_kl, true), (eq_sel2, true)]),
         "second ROW2 clause should assert k=l or select(store(a,k,v2),l)=select(a,l)"
     );
-    // After emitting lemmas, axioms are drained — second call returns None.
-    // DpllT applies NeedLemmas as permanent SAT clauses in-place, so
-    // re-emitting is redundant (#6546).
+    // Returning a request is not installation. This component intentionally
+    // has no SAT solver: only the real production callback simulates the
+    // acknowledgment that an installing caller may supply. Separate DPLL
+    // controls exercise actual scoped installation and replay ownership.
+    let Some(TheoryResult::NeedLemmas(repeated)) = solver.check_row2() else {
+        panic!("unacknowledged ROW2 requests must remain requestable");
+    };
+    let repeated: HashSet<_> = repeated.into_iter().map(|lemma| lemma.clause).collect();
+    let expected: HashSet<_> = lemmas.iter().map(|lemma| lemma.clause.clone()).collect();
+    assert_eq!(repeated, expected);
+
+    // A callback for just one exact clause does not complete the other pair.
+    solver.note_applied_theory_lemma(&lemmas[0].clause);
+    let Some(TheoryResult::NeedLemmas(remaining)) = solver.check_row2() else {
+        panic!("one unacknowledged member of the batch must remain");
+    };
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].clause, lemmas[1].clause);
+    solver.note_applied_theory_lemma(&remaining[0].clause);
+    solver.generate_all_lazy_row2_axioms();
     assert!(
         solver.check_row2().is_none(),
-        "emitted ROW2 axioms should be drained after first lemma emit"
+        "both exact callbacks suppress repeated emission without completing the pairs permanently"
     );
 }
 
-/// Verify that check_row2 drains axioms after emitting their lemma clause.
-/// DpllT applies NeedLemmas as permanent clauses in-place, so re-emitting
-/// is redundant. The drain avoids O(total_axioms) re-scanning (#6546).
+/// Emission remains a proposal until an installing caller acknowledges it.
+/// This is component callback simulation, not actual SAT installation.
 #[test]
-fn test_arrays_row2_drains_after_lemma_emit() {
+fn test_arrays_row2_suppresses_only_after_exact_applied_callback() {
     let mut store = TermStore::new();
     let arr_sort = make_array_sort();
 
@@ -244,18 +260,28 @@ fn test_arrays_row2_drains_after_lemma_emit() {
         panic!("expected NeedLemmas from ROW2 check");
     };
     assert_eq!(lemmas.len(), 1, "expected one ROW2 lemma clause");
+    let mut expected = vec![TheoryLit::new(eq_ij, true), TheoryLit::new(eq_sels, true)];
+    expected.sort_by_key(|lit| (lit.term.0, lit.value));
+    assert_eq!(lemmas[0].clause, expected);
 
-    // After emitting the lemma, the axiom is drained — second call returns None.
-    // The lazy generator won't re-queue because the fingerprint is already set.
+    // A generator pass and a second emission cannot acknowledge themselves.
+    solver.generate_all_lazy_row2_axioms();
+    let Some(TheoryResult::NeedLemmas(repeated)) = solver.check_row2() else {
+        panic!("returning the clause did not install it");
+    };
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0].clause, lemmas[0].clause);
+
+    solver.note_applied_theory_lemma(&repeated[0].clause);
     solver.generate_all_lazy_row2_axioms();
     assert!(
         solver.check_row2().is_none(),
-        "emitted ROW2 axiom should be drained after first lemma emit"
+        "the exact applied callback must suppress an unchanged current request"
     );
 }
 
 #[test]
-fn test_arrays_row2_dirty_rebuild_does_not_requeue_emitted_axiom() {
+fn test_arrays_row2_dirty_rebuild_rederives_before_current_clause_reacknowledgment() {
     let mut store = TermStore::new();
     let arr_sort = make_array_sort();
 
@@ -285,25 +311,47 @@ fn test_arrays_row2_dirty_rebuild_does_not_requeue_emitted_axiom() {
         panic!("expected NeedLemmas from ROW2 check");
     };
     assert_eq!(lemmas.len(), 1, "expected one emitted ROW2 lemma clause");
-    assert!(
-        solver.pending_axioms.is_empty(),
-        "emitted ROW2 axiom should be drained before the rebuild"
-    );
-
-    // Simulate the split-loop dirty rebuild that repopulates array caches
-    // after the SAT solver has already installed the permanent clause.
-    solver.dirty = true;
-    solver.populate_caches();
-    // Even with lazy generation, re-running should not requeue emitted axioms.
-    solver.generate_all_lazy_row2_axioms();
-
-    assert!(
-        solver.pending_axioms.is_empty(),
-        "dirty rebuild must not requeue a ROW2 axiom whose fingerprint already exists"
-    );
+    let mut expected = vec![TheoryLit::new(eq_ij, true), TheoryLit::new(eq_sels, true)];
+    expected.sort_by_key(|lit| (lit.term.0, lit.value));
+    assert_eq!(lemmas[0].clause, expected);
+    // Simulate only the production callback, after observing the exact
+    // component request. This test does not itself own a SAT installation.
+    solver.note_applied_theory_lemma(&lemmas[0].clause);
     assert!(
         solver.check_row2().is_none(),
-        "dirty rebuild must not re-emit an already-applied ROW2 lemma"
+        "an acknowledged current clause should be suppressed before teardown"
+    );
+    assert!(solver.applied_theory_lemmas.contains(&expected));
+
+    // A structural dirty rebuild retires the current-work records. The old
+    // bounded fast memo remains populated, but is not new-work authority.
+    solver.dirty = true;
+    solver.populate_caches();
+    solver.generate_all_lazy_row2_axioms();
+    assert!(solver.applied_theory_lemmas.contains(&expected));
+    let Some(TheoryResult::NeedLemmas(rebuilt)) = solver.check_row2() else {
+        panic!("teardown must rederive the exact clause before current-ledger replay");
+    };
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].clause, expected);
+    let Some(TheoryResult::NeedLemmas(still_unacknowledged)) = solver.check_row2() else {
+        panic!("post-rebuild emission still does not acknowledge itself");
+    };
+    assert_eq!(still_unacknowledged.len(), 1);
+    assert_eq!(still_unacknowledged[0].clause, expected);
+
+    // The installing caller must replay its existing ledger against newly
+    // derived current work, not pretend to add the clause again. This uses
+    // the typed callback without faking private state; separate DPLL tests
+    // independently bind replay to a real current SAT scope.
+    assert_eq!(
+        solver.reacknowledge_applied_theory_lemma(&still_unacknowledged[0].clause),
+        ay_core::TheoryLemmaReplay::CurrentWorkAcknowledged,
+    );
+    solver.generate_all_lazy_row2_axioms();
+    assert!(
+        solver.check_row2().is_none(),
+        "current exact re-acknowledgment must suppress the rebuilt request"
     );
 }
 
@@ -959,8 +1007,8 @@ fn test_row2_fingerprint_dedup_is_backtrack_safe() {
             .get(&stored)
             .cloned()
             .unwrap_or_default(),
-        vec![j, k],
-        "persistent fingerprint history should retain both exact indices once they are queued in distinct branches"
+        vec![k],
+        "the queue index must contain only current work after the old branch is retired"
     );
 }
 
@@ -1166,8 +1214,8 @@ fn test_array_var_tracking_assert_literal_true_queues_cross_equal_row2() {
         "direct array equality should queue the cross-array ROW2 axiom"
     );
     assert!(
-        solver.axiom_fingerprints.contains(&(store_on_b, j)),
-        "queued direct-equality ROW2 work should record its fingerprint"
+        solver.row2_down_work.contains(&(store_on_b, select_on_a)),
+        "queued cross-array ROW2 work should record its exact read obligation"
     );
 }
 

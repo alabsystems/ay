@@ -5,7 +5,8 @@
 use num_rational::Rational64;
 
 use super::{
-    printed_la_generic_unit_implication_is_supported, resolve_printed_la_generic_coefficients,
+    carcara_printed_la_generic_literal_supported, printed_la_generic_unit_implication_is_supported,
+    resolve_printed_la_generic_coefficients,
 };
 
 fn r(n: i64, d: i64) -> Rational64 {
@@ -142,5 +143,64 @@ fn authored_non_implication_is_rejected() {
     assert!(!printed_la_generic_unit_implication_is_supported(
         "(< x 0)",
         "(< (+ x 1) 0)",
+    ));
+}
+
+/// Carcara's `LinearComb::from_term` makes a product with no direct numeric
+/// coefficient ONE opaque atom, and so does AY's linearizer once it meets a
+/// second nonconstant factor. The printed grammar that decides whether a
+/// published `la_generic` row is checkable must read it the same way, or the
+/// exporter degrades a provable step to `hole`.
+///
+/// MEASURED on pinned carcara 1.1.0 (git 9a352ee): the three-row Farkas
+/// conflict over `sum`, `i`, `sq` that shares `(* i i)` between two literals
+/// checks `valid` under `:rule la_generic :args (-1 -1 1)`. The exported
+/// document is pinned end to end by
+/// `group_proof::export_alethe_validation::pinned_carcara_accepts_a_shared_opaque_nonlinear_product`.
+#[test]
+fn shared_opaque_nonlinear_product_is_one_printed_la_generic_atom() {
+    assert!(carcara_printed_la_generic_literal_supported(
+        "(not (= sq (* i i)))"
+    ));
+    assert!(carcara_printed_la_generic_literal_supported(
+        "(<= (+ (* sum 2) (* i 3) 1) (+ (* i 2) (* i i) 1))"
+    ));
+    // Three nonconstant factors are still one atom.
+    assert!(carcara_printed_la_generic_literal_supported(
+        "(<= (* i i i) x)"
+    ));
+}
+
+/// The opaque-atom reading is admitted only for factors whose nonconstancy is
+/// STRUCTURALLY certain, exactly as `wire_rule::carcara_linear_term_supported`
+/// requires: a computed constant must never be mistaken for the first of the
+/// two nonconstant factors, because AY and Carcara scale such a product
+/// differently.
+#[test]
+fn computed_coefficient_is_still_refused_by_the_printed_grammar() {
+    assert!(!carcara_printed_la_generic_literal_supported(
+        "(<= (* (+ 1 1) x) 0)"
+    ));
+    assert!(!carcara_printed_la_generic_literal_supported(
+        "(<= (* (/ x y) z) 0)"
+    ));
+    // A direct numeric coefficient is the ordinary linear shape and stays
+    // supported on either side.
+    assert!(carcara_printed_la_generic_literal_supported(
+        "(<= (* 2 x) 0)"
+    ));
+    assert!(carcara_printed_la_generic_literal_supported(
+        "(<= (* x (- 2)) 0)"
+    ));
+}
+
+/// The authored-assume implication bridge keeps its narrow grammar: it needs
+/// only sums and direct numeric scaling, and its own coefficient replay
+/// declines nonlinear products anyway.
+#[test]
+fn the_authored_assume_bridge_still_refuses_nonlinear_products() {
+    assert!(!printed_la_generic_unit_implication_is_supported(
+        "(<= (* i i) 0)",
+        "(<= (* i i) 1)",
     ));
 }

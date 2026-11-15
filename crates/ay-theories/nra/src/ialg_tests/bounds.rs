@@ -3,11 +3,16 @@
 // Licensed under the Apache License, Version 2.0
 
 #[test]
-fn ialg_bounds() {
+fn ialg_bounds() -> Result<(), Box<dyn std::error::Error>> {
     // Normalisation refuses more than MAX_INTERVALS inputs before any work.
     let many: Vec<AInterval> = (0..=(MAX_INTERVALS as i64))
-        .map(|i| iv(fin(ri(3 * i)), false, fin(ri(3 * i + 1)), false))
-        .collect();
+        .map(|i| {
+            let lo = i.checked_mul(3)?;
+            let hi = lo.checked_add(1)?;
+            Some(iv(fin(ri(lo)), false, fin(ri(hi)), false))
+        })
+        .collect::<Option<_>>()
+        .ok_or("interval endpoints fit i64")?;
     assert_eq!(many.len(), MAX_INTERVALS + 1);
     assert_eq!(IntervalSet::normalize(many), None);
 
@@ -26,4 +31,5 @@ fn ialg_bounds() {
         from_sign_condition(&p, &roots, SignCond::Lt, Just::none()),
         None
     );
+    Ok(())
 }

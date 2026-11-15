@@ -196,7 +196,7 @@ impl Executor {
         // Guard 3: the whole fragment is closed and replayed, so no step of it
         // enters the proof on this lane's word.
         let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &repacked);
-        if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+        if self.check_proof_strict_until_stopped(&closed).is_err() {
             return None;
         }
         Some(repacked.steps)
@@ -221,7 +221,7 @@ impl Executor {
                 clause: children.to_vec(),
             };
             let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &candidate);
-            if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_ok() {
+            if self.check_proof_strict_until_stopped(&closed).is_ok() {
                 return Some(rule);
             }
         }

@@ -1,0 +1,8 @@
+(set-option :produce-unsat-cores true)
+(set-logic ALL)
+(declare-const y (_ BitVec 32))
+(assert (! (not (= y #x00000000)) :named dn0))
+(assert (! (= #x00000000 (bvudiv #x00000000 y)) :named dn1))
+(assert (! (not (= y #x00000000)) :named dn2))
+(assert (! (not (= (bvudiv y y) #x00000001)) :named dn3))
+(check-sat)

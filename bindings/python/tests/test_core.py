@@ -5,7 +5,7 @@
 # C ABI. Where real z3py is installed, the SAME snippet is cross-checked against
 # z3py and the verdicts (and determinate model values) must agree.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 from fractions import Fraction
 

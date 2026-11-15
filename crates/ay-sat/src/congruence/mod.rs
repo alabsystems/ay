@@ -19,6 +19,8 @@ mod delay_tests;
 #[cfg(test)]
 mod tests;
 
+mod counted;
+
 use crate::clause_arena::ClauseArena;
 use crate::gates::{Gate, GateExtractor, GateType};
 use crate::lit_marks::LitMarks;
@@ -90,7 +92,7 @@ pub struct CongruenceStats {
     /// Non-RUP equivalences skipped
     pub non_rup_equivalences: u64,
     /// XOR full-collapse units accepted without RUP because their polarity is
-    /// the machine-checked-exact parity proven in the development proof harness
+    /// the machine-checked-exact parity proven in `crates/ay-sat-congruence-core`
     /// (only counted under the default-off `--sat-congruence-parity-trust` knob).
     pub parity_certified_units_applied: u64,
     /// XOR matching ladders successfully emitted for equivalence edges in
@@ -169,6 +171,10 @@ pub(crate) struct CongruenceClosure {
     forward_subsumption_matchable: Vec<bool>,
     /// Reused representative-literal marks for equivalence-aware forward subsumption.
     forward_subsumption_marked: Vec<bool>,
+    /// The owning solver's `--sat-deterministic-inproc`: gate extraction's
+    /// wall is off and its counted budgets alone bound it
+    /// (`set_deterministic`).
+    deterministic: bool,
 }
 
 impl CongruenceClosure {
@@ -184,7 +190,15 @@ impl CongruenceClosure {
             cached_binary_adj: Vec::new(),
             forward_subsumption_matchable: vec![false; num_vars],
             forward_subsumption_marked: vec![false; num_vars * 2],
+            deterministic: crate::determinism::deterministic_inproc_enabled(),
         }
+    }
+
+    /// Whether the next runs are bounded by counted work only, the owning
+    /// solver's `--sat-deterministic-inproc`
+    /// (`Solver::set_deterministic_inproc`).
+    pub(crate) fn set_deterministic(&mut self, on: bool) {
+        self.deterministic = on;
     }
 
     /// Ensure internal buffers can handle `num_vars` variables.
@@ -506,7 +520,8 @@ impl CongruenceClosure {
         self.cached_ternary_count.resize(num_lits, 0);
 
         for idx in clauses.indices() {
-            if clauses.is_empty_clause(idx) {
+            // Live clauses only: no gate (and no logged equivalence) may rest on garbage.
+            if clauses.is_dead(idx) {
                 continue;
             }
             let lits = clauses.literals(idx);
@@ -542,6 +557,18 @@ impl CongruenceClosure {
         // to prevent congruence from dominating preprocessing time.
         let extract_start = ay_core::time::Instant::now();
         const GATE_EXTRACT_TIME_BUDGET_MS: u128 = 2000;
+        // Under `--sat-deterministic-inproc` the wall is off: the XOR group
+        // pass is bounded by `effort_budget`, which it charges per candidate,
+        // and the per-pivot loop by `det_work` against
+        // `GATE_EXTRACT_DET_WORK_BUDGET`. `effort_spent` does not charge the
+        // quadratic ITE base-pair scan, so `det_work` adds its clause visits.
+        let det = self.deterministic;
+        let wall_budget_ms = if det {
+            u128::MAX
+        } else {
+            GATE_EXTRACT_TIME_BUDGET_MS
+        };
+        let mut det_work: u64 = 0;
 
         // ITE gate extraction was O(pos_ternary² × neg) per variable, which
         // blew up on dense-ternary formulas (e.g. shuffling-2: 729K ternary).
@@ -579,7 +606,7 @@ impl CongruenceClosure {
             &mut effort_spent,
             effort_budget,
             extract_start,
-            GATE_EXTRACT_TIME_BUDGET_MS,
+            wall_budget_ms,
             &mut gates,
         );
 
@@ -592,14 +619,21 @@ impl CongruenceClosure {
         // FmlaEquivChain: first 13K vars have no gates, gates start at
         // ~15K). This caused preprocessing congruence to find 0 gates
         // while CaDiCaL found 11K+ (#7423).
+        // The extractor may carry ITE visits from other callers (BVE).
+        extractor.take_ite_scan_visits();
         for var_idx in 0..self.num_vars {
             if effort_spent >= effort_budget {
                 break;
             }
-            // Wall-clock check every 1024 variables to limit overhead.
+            // Wall-clock check every 1024 variables to limit overhead; the
+            // counted work bound at the same cadence under the flag.
             if var_idx & 0x3FF == 0
                 && var_idx > 0
-                && extract_start.elapsed().as_millis() >= GATE_EXTRACT_TIME_BUDGET_MS
+                && if det {
+                    det_work >= crate::determinism::GATE_EXTRACT_DET_WORK_BUDGET
+                } else {
+                    extract_start.elapsed().as_millis() >= GATE_EXTRACT_TIME_BUDGET_MS
+                }
             {
                 break;
             }
@@ -637,6 +671,11 @@ impl CongruenceClosure {
                     &mut shared_marks,
                 )
             };
+            if det {
+                det_work = det_work
+                    .saturating_add(var_effort as u64)
+                    .saturating_add(extractor.take_ite_scan_visits());
+            }
             if let Some(gate) = gate {
                 gates.push(gate);
             }
@@ -701,7 +740,7 @@ pub(crate) struct CongruenceResult {
     pub new_binary_clauses: Vec<(usize, Literal, Literal)>,
     /// Subset of `units` that were emitted by a full XOR-gate collapse (arity-0)
     /// whose polarity is the machine-checked-exact parity proven in
-    /// the development proof harness (`xor_collapse_parity_verified`,
+    /// `crates/ay-sat-congruence-core` (`xor_collapse_parity`,
     /// order-independent and single-flip-sensitive). These units are sound by
     /// construction — correct extraction, valid UF/level-0 substitutions, and
     /// now machine-checked parity — so the `#7137` RUP guard may accept them

@@ -58,7 +58,35 @@ impl Executor {
             || const_interp_owner_current
             || bv_owner_current
             || cegqi_owner_current;
-        !quantified_owner_current && self.try_finite_model_sat_certificate()
+        !quantified_owner_current
+            && (self.try_finite_model_sat_certificate()
+                || self.try_unclaimed_model_check_sat_certificate(publication_roots))
+    }
+
+    /// The generic quantified model check, consulted only where the funnel
+    /// would otherwise downgrade: no quantified producer has claimed this
+    /// query (a stale routing bit keeps its fail-closed cleanup), the window
+    /// has a quantifier, and the independent gate cannot confirm the
+    /// candidate by itself (a candidate it confirms keeps its exact path).
+    fn try_unclaimed_model_check_sat_certificate(&mut self, publication_roots: &[TermId]) -> bool {
+        let claimed = self.finite_table_cert_grant_active
+            || self.const_interp_cert_grant_active
+            || self.bv_quantifier_full_domain_proof
+            || self.dt_cert_grant_active
+            || self.mbqi_sat_cert_grant_active
+            || self.cegqi_uf_recompletion_grant.is_some();
+        if claimed
+            || !publication_roots
+                .iter()
+                .any(|&root| crate::ematching::contains_quantifier(&self.ctx.terms, root))
+            || matches!(
+                self.confirm_sat_with_independent_gate(),
+                ay_model_check::GateVerdict::ConfirmedSat
+            )
+        {
+            return false;
+        }
+        self.try_model_check_sat_certificate()
     }
 }
 

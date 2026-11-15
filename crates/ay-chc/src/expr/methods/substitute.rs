@@ -75,6 +75,15 @@ impl ChcExpr {
                     Self::FuncApp(name.clone(), sort.clone(), new_args)
                 }
             }
+            Self::ArrayLambda(lambda) => Self::ArrayLambda(
+                lambda.with_captures(
+                    lambda
+                        .captures()
+                        .iter()
+                        .map(|value| Arc::new(map_child(value)))
+                        .collect(),
+                ),
+            ),
             Self::ConstArray(ks, val) => {
                 let new_val = Arc::new(map_child(val.as_ref()));
                 if val.as_ref() == new_val.as_ref() {
@@ -93,6 +102,29 @@ impl ChcExpr {
         }
         let map: FxHashMap<&ChcVar, &Self> = subst.iter().map(|(v, e)| (v, e)).collect();
         self.substitute_map(&map)
+    }
+
+    /// Parallel variable substitution with explicit cancellation. Node/depth
+    /// limits keep their existing behavior, but cancellation returns no expression.
+    pub(crate) fn substitute_checked(
+        &self,
+        subst: &[(ChcVar, Self)],
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        if should_stop() {
+            return None;
+        }
+        let mut map = FxHashMap::default();
+        for (var, value) in subst {
+            if should_stop() {
+                return None;
+            }
+            map.insert(var, value);
+        }
+        self.substitute_with_lookup_checked(
+            &|var| map.get(var).map(|value| (*value).clone()),
+            should_stop,
+        )
     }
 
     /// Substitute variables using a pre-built map (O(1) lookup per variable).
@@ -205,6 +237,15 @@ impl ChcExpr {
                     Arc::new(Self::ConstArray(ks.clone(), new_val))
                 }
             }
+            Self::ArrayLambda(lambda) => Arc::new(Self::ArrayLambda(
+                lambda.with_captures(
+                    lambda
+                        .captures()
+                        .iter()
+                        .map(|value| Self::subst_shared_inner(value, map, memo))
+                        .collect(),
+                ),
+            )),
             // Leaves other than Var (handled above): nothing to substitute.
             _ => Arc::clone(node),
         });
@@ -214,11 +255,32 @@ impl ChcExpr {
 
     /// Substitute variables by variable name (O(1) lookup per variable name).
     /// If the expression tree exceeds 1M nodes, returns `self` unchanged (#2774).
+    ///
+    /// Name-keyed substitution is sort-safe only while the map's keys and the
+    /// expression's variables come from ONE clause (one sort per name) or from
+    /// the canonical `__p<i>_a<j>` vocabulary (unique per predicate position),
+    /// so no PDR frame lemma may keep a clause local under its source name: the
+    /// 2026-09-19 audit (PDR_typed_subst_2026-09-19.md) missed three that did
+    /// (#5805). The debug tripwire below turns such a misuse into a test failure.
     pub(crate) fn substitute_name_map(&self, map: &FxHashMap<String, Self>) -> Self {
         if map.is_empty() {
             return self.clone();
         }
-        self.substitute_with_lookup(&|v| map.get(&v.name).cloned())
+        self.substitute_with_lookup(&|v| {
+            let replacement = map.get(&v.name).cloned();
+            #[cfg(debug_assertions)]
+            if let Some(e) = &replacement {
+                debug_assert!(
+                    e.sort() == v.sort,
+                    "substitute_name_map: `{}:{}` replaced by `{e}` of sort {} — a name-keyed \
+                     substitution mixed two sorts (cross-clause map?)",
+                    v.name,
+                    v.sort,
+                    e.sort()
+                );
+            }
+            replacement
+        })
     }
 
     /// Rename variables by name, preserving sorts (#3577).
@@ -339,6 +401,20 @@ impl ChcExpr {
                         Self::FuncApp(name.clone(), sort.clone(), new_args)
                     }
                 }
+                Self::ArrayLambda(lambda) => Self::ArrayLambda(
+                    lambda.with_captures(
+                        lambda
+                            .captures()
+                            .iter()
+                            .map(|value| {
+                                Arc::new(
+                                    Self::subst_expr_inner(value, budget, depth + 1, pairs)
+                                        .unwrap_or_else(|| value.as_ref().clone()),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
                 Self::ConstArray(ks, val) => {
                     let new_val = Arc::new(
                         Self::subst_expr_inner(val, budget, depth + 1, pairs)
@@ -358,8 +434,66 @@ impl ChcExpr {
     where
         F: Fn(&ChcVar) -> Option<Self>,
     {
-        use std::cell::Cell;
-        let budget = Cell::new(MAX_PREPROCESSING_NODES);
+        self.substitute_with_lookup_checked(lookup, || false)
+            .unwrap_or_else(|| self.clone())
+    }
+
+    fn substitute_with_lookup_checked<F>(
+        &self,
+        lookup: &F,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Option<Self>
+    where
+        F: Fn(&ChcVar) -> Option<Self>,
+    {
+        let budget = crate::expr::rewrite_budget::RewriteBudget::new(
+            MAX_PREPROCESSING_NODES,
+            &mut should_stop,
+        );
+        self.substitute_with_budget(lookup, &budget)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_at_node_limit(
+        &self,
+        subst: &[(ChcVar, Self)],
+        nodes: usize,
+    ) -> Option<Self> {
+        let mut never_stop = || false;
+        let budget = crate::expr::rewrite_budget::RewriteBudget::new(nodes, &mut never_stop);
+        self.substitute_with_budget(
+            &|var| {
+                subst
+                    .iter()
+                    .find(|(key, _)| key == var)
+                    .map(|(_, value)| value.clone())
+            },
+            &budget,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_with_poll_count(
+        &self,
+        mut stop: impl FnMut() -> bool,
+    ) -> (Option<Self>, usize) {
+        let budget =
+            crate::expr::rewrite_budget::RewriteBudget::new(MAX_PREPROCESSING_NODES, &mut stop);
+        let result = self.substitute_with_budget(&|_| Some(Self::Int(7)), &budget);
+        (result, budget.poll_count())
+    }
+
+    fn substitute_with_budget<F>(
+        &self,
+        lookup: &F,
+        budget: &crate::expr::rewrite_budget::RewriteBudget<'_>,
+    ) -> Option<Self>
+    where
+        F: Fn(&ChcVar) -> Option<Self>,
+    {
+        if budget.stopped() {
+            return None;
+        }
         // `Arc`-pointer memo so shared input subtrees (a DAG, as produced by
         // nested-`let` expansion or a prior substitution) are substituted ONCE
         // and reused, instead of being re-walked and deep-cloned into a distinct
@@ -374,21 +508,27 @@ impl ChcExpr {
         // shallow clone (child `Arc`s are shared, refcount-bumped); the only
         // fresh node is the root itself, so intra-input sharing is fully kept.
         let root = Arc::new(self.clone());
-        match Self::subst_inner(&root, &budget, 0, lookup, &mut memo) {
+        let result = match Self::subst_inner(&root, &budget, 0, lookup, &mut memo) {
             Some(result) => Arc::try_unwrap(result).unwrap_or_else(|arc| (*arc).clone()),
+            None if budget.stopped() => return None,
             None => self.clone(),
+        };
+        if budget.stopped() {
+            None
+        } else {
+            Some(result)
         }
     }
 
     /// Memoized, sharing-preserving variable substitution (see
-    /// `substitute_with_lookup`). Returns `None` only when the per-call node
-    /// budget or recursion-depth cap is hit AT THIS node; callers substitute the
-    /// original (unchanged) child in that case and continue — a local best-effort
-    /// bail identical to the prior behavior, but reached far less often because
-    /// shared subtrees no longer each re-spend the budget.
-    fn subst_inner<F>(
+    /// `substitute_with_lookup`). A node/depth limit retains the original child;
+    /// explicit cancellation instead propagates through `subst_arg` immediately.
+    /// Shared subtrees no longer each re-spend the node budget.
+    // A resource-limit fallback keeps this original child; cancellation
+    // propagates immediately and stops its parent's remaining siblings.
+    fn subst_arg<F>(
         node: &Arc<Self>,
-        budget: &std::cell::Cell<usize>,
+        budget: &crate::expr::rewrite_budget::RewriteBudget<'_>,
         depth: usize,
         lookup: &F,
         memo: &mut FxHashMap<*const Self, Arc<Self>>,
@@ -396,6 +536,47 @@ impl ChcExpr {
     where
         F: Fn(&ChcVar) -> Option<Self>,
     {
+        let rewritten = Self::subst_inner(node, budget, depth, lookup, memo);
+        if budget.stopped() {
+            None
+        } else {
+            Some(rewritten.unwrap_or_else(|| Arc::clone(node)))
+        }
+    }
+
+    fn subst_args<F>(
+        args: &[Arc<Self>],
+        budget: &crate::expr::rewrite_budget::RewriteBudget<'_>,
+        depth: usize,
+        lookup: &F,
+        memo: &mut FxHashMap<*const Self, Arc<Self>>,
+    ) -> Option<(bool, Vec<Arc<Self>>)>
+    where
+        F: Fn(&ChcVar) -> Option<Self>,
+    {
+        let mut changed = false;
+        let mut rewritten = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = Self::subst_arg(arg, budget, depth + 1, lookup, memo)?;
+            changed |= !Arc::ptr_eq(&value, arg);
+            rewritten.push(value);
+        }
+        Some((changed, rewritten))
+    }
+
+    fn subst_inner<F>(
+        node: &Arc<Self>,
+        budget: &crate::expr::rewrite_budget::RewriteBudget<'_>,
+        depth: usize,
+        lookup: &F,
+        memo: &mut FxHashMap<*const Self, Arc<Self>>,
+    ) -> Option<Arc<Self>>
+    where
+        F: Fn(&ChcVar) -> Option<Self>,
+    {
+        if budget.stopped() {
+            return None;
+        }
         // `Var` is the only leaf that can change; handle before the memo so the
         // substituted value is shared without a per-occurrence tree walk.
         if let Self::Var(v) = node.as_ref() {
@@ -420,65 +601,57 @@ impl ChcExpr {
         }
         budget.set(remaining - 1);
 
-        let result = maybe_grow_expr_stack(|| match node.as_ref() {
-            Self::Op(op, args) => {
-                let mut changed = false;
-                let mut new_args: Vec<Arc<Self>> = Vec::with_capacity(args.len());
-                for a in args {
-                    let n = Self::subst_inner(a, budget, depth + 1, lookup, memo)
-                        .unwrap_or_else(|| Arc::clone(a));
-                    changed |= !Arc::ptr_eq(&n, a);
-                    new_args.push(n);
+        let result = maybe_grow_expr_stack(|| {
+            Some(match node.as_ref() {
+                Self::Op(op, args) => {
+                    let (changed, new_args) = Self::subst_args(args, budget, depth, lookup, memo)?;
+                    if changed {
+                        Arc::new(Self::Op(*op, new_args))
+                    } else {
+                        Arc::clone(node)
+                    }
                 }
-                if changed {
-                    Arc::new(Self::Op(*op, new_args))
-                } else {
-                    Arc::clone(node)
+                Self::PredicateApp(name, id, args) => {
+                    let (changed, new_args) = Self::subst_args(args, budget, depth, lookup, memo)?;
+                    if changed {
+                        Arc::new(Self::PredicateApp(name.clone(), *id, new_args))
+                    } else {
+                        Arc::clone(node)
+                    }
                 }
-            }
-            Self::PredicateApp(name, id, args) => {
-                let mut changed = false;
-                let mut new_args: Vec<Arc<Self>> = Vec::with_capacity(args.len());
-                for a in args {
-                    let n = Self::subst_inner(a, budget, depth + 1, lookup, memo)
-                        .unwrap_or_else(|| Arc::clone(a));
-                    changed |= !Arc::ptr_eq(&n, a);
-                    new_args.push(n);
+                Self::FuncApp(name, sort, args) => {
+                    let (changed, new_args) = Self::subst_args(args, budget, depth, lookup, memo)?;
+                    if changed {
+                        Arc::new(Self::FuncApp(name.clone(), sort.clone(), new_args))
+                    } else {
+                        Arc::clone(node)
+                    }
                 }
-                if changed {
-                    Arc::new(Self::PredicateApp(name.clone(), *id, new_args))
-                } else {
-                    Arc::clone(node)
+                Self::ConstArray(ks, val) => {
+                    let new_val = Self::subst_arg(val, budget, depth + 1, lookup, memo)?;
+                    if Arc::ptr_eq(&new_val, val) {
+                        Arc::clone(node)
+                    } else {
+                        Arc::new(Self::ConstArray(ks.clone(), new_val))
+                    }
                 }
-            }
-            Self::FuncApp(name, sort, args) => {
-                let mut changed = false;
-                let mut new_args: Vec<Arc<Self>> = Vec::with_capacity(args.len());
-                for a in args {
-                    let n = Self::subst_inner(a, budget, depth + 1, lookup, memo)
-                        .unwrap_or_else(|| Arc::clone(a));
-                    changed |= !Arc::ptr_eq(&n, a);
-                    new_args.push(n);
+                Self::ArrayLambda(lambda) => {
+                    let (changed, values) =
+                        Self::subst_args(lambda.captures(), budget, depth, lookup, memo)?;
+                    if changed {
+                        Arc::new(Self::ArrayLambda(lambda.with_captures(values)))
+                    } else {
+                        Arc::clone(node)
+                    }
                 }
-                if changed {
-                    Arc::new(Self::FuncApp(name.clone(), sort.clone(), new_args))
-                } else {
-                    Arc::clone(node)
-                }
-            }
-            Self::ConstArray(ks, val) => {
-                let new_val = Self::subst_inner(val, budget, depth + 1, lookup, memo)
-                    .unwrap_or_else(|| Arc::clone(val));
-                if Arc::ptr_eq(&new_val, val) {
-                    Arc::clone(node)
-                } else {
-                    Arc::new(Self::ConstArray(ks.clone(), new_val))
-                }
-            }
-            // Non-`Var` leaves (Bool/Int/Real/BitVec/markers): nothing to
-            // substitute. `Var` was handled before the memo above.
-            _ => Arc::clone(node),
-        });
+                // Non-`Var` leaves (Bool/Int/Real/BitVec/markers): nothing to
+                // substitute. `Var` was handled before the memo above.
+                _ => Arc::clone(node),
+            })
+        })?;
+        if budget.stopped() {
+            return None;
+        }
         memo.insert(key, Arc::clone(&result));
         Some(result)
     }
@@ -486,12 +659,33 @@ impl ChcExpr {
     /// Replace a disequality (not (= lhs rhs)) with a replacement expression.
     ///
     /// This is used for disequality splitting: (not (= a b)) -> (< a b) or (> a b).
+    ///
+    /// When no path reaches the recursion cap (so the tree rewrite would never
+    /// truncate) it rewrites each distinct node once and keeps the sharing
+    /// (`replace_diseq_shared`); the tree rewrite rebuilt every occurrence of
+    /// a shared subterm and compared old and new structurally at each, which
+    /// is exponential on the DAG-shaped PDR queries of LRA-Lin (token_ring.1,
+    /// toy-bug-1).
     pub(crate) fn replace_diseq(
         &self,
         target_lhs: &Self,
         target_rhs: &Self,
         replacement: Self,
     ) -> Self {
+        if !crate::expr::dag::longest_path_at_least(self, MAX_EXPR_RECURSION_DEPTH) {
+            let replacement = Arc::new(replacement);
+            let mut memo = FxHashMap::default();
+            return match Self::replace_diseq_shared(
+                self,
+                target_lhs,
+                target_rhs,
+                &replacement,
+                &mut memo,
+            ) {
+                Some(rewritten) => Arc::unwrap_or_clone(rewritten),
+                None => self.clone(),
+            };
+        }
         fn replace_diseq_inner(
             expr: &ChcExpr,
             depth: usize,
@@ -556,5 +750,56 @@ impl ChcExpr {
         }
 
         replace_diseq_inner(self, 0, target_lhs, target_rhs, &replacement)
+    }
+
+    /// The DAG form of [`ChcExpr::replace_diseq`]: `Some(rewritten)` when the
+    /// node changed, `None` when it did not; memoised by node address (every
+    /// node stays alive: the root is borrowed for the whole walk).
+    fn replace_diseq_shared(
+        node: &Self,
+        target_lhs: &Self,
+        target_rhs: &Self,
+        replacement: &Arc<Self>,
+        memo: &mut FxHashMap<*const Self, Option<Arc<Self>>>,
+    ) -> Option<Arc<Self>> {
+        let Self::Op(op, args) = node else {
+            return None;
+        };
+        let key: *const Self = node;
+        if let Some(known) = memo.get(&key) {
+            return known.clone();
+        }
+        let result = maybe_grow_expr_stack(|| {
+            if *op == ChcOp::Not && args.len() == 1 {
+                if let Self::Op(ChcOp::Eq, eq_args) = args[0].as_ref() {
+                    if eq_args.len() == 2 {
+                        let lhs = &*eq_args[0];
+                        let rhs = &*eq_args[1];
+                        if (lhs == target_lhs && rhs == target_rhs)
+                            || (lhs == target_rhs && rhs == target_lhs)
+                        {
+                            return Some(Arc::clone(replacement));
+                        }
+                    }
+                }
+            }
+            let mut changed = false;
+            let new_args: Vec<Arc<Self>> = args
+                .iter()
+                .map(|arg| {
+                    match Self::replace_diseq_shared(arg, target_lhs, target_rhs, replacement, memo)
+                    {
+                        Some(rewritten) => {
+                            changed = true;
+                            rewritten
+                        }
+                        None => Arc::clone(arg),
+                    }
+                })
+                .collect();
+            changed.then(|| Arc::new(Self::Op(*op, new_args)))
+        });
+        memo.insert(key, result.clone());
+        result
     }
 }

@@ -36,6 +36,11 @@ const ACCEPTANCE_WINDOW_SIZE: u32 = 1000;
 /// Minimum acceptance rate. Below this, Tier 0 is disabled.
 const ACCEPTANCE_RATE_THRESHOLD: f64 = 0.50;
 
+/// Most variables the f64 shadow mirrors (16M; 128 MiB per shadow vector).
+/// A larger problem is left unmirrored: every check on it answers
+/// `Uncertain`, which defers to exact arithmetic.
+const MAX_SHADOW_VARS: usize = 1 << 24;
+
 /// Three-way decision from speculative f64 feasibility check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloatDecision {
@@ -69,10 +74,22 @@ impl FloatSimplex {
         !self.disabled
     }
 
+    /// Mirror the first `var_count` exact values into the f64 shadow with
+    /// zero accumulated error.
+    ///
+    /// The shadow is left empty — so every [`Self::check_feasibility`] answers
+    /// `Uncertain` and defers to exact arithmetic — when `var_count` exceeds
+    /// [`MAX_SHADOW_VARS`] or names more values than `approx_values` holds.
     pub(crate) fn sync_from_exact(&mut self, var_count: usize, approx_values: &[f64]) {
         self.values.clear();
         self.errors.clear();
-        self.values.extend_from_slice(&approx_values[..var_count]);
+        if var_count > MAX_SHADOW_VARS {
+            return;
+        }
+        let Some(prefix) = approx_values.get(..var_count) else {
+            return;
+        };
+        self.values.extend_from_slice(prefix);
         self.errors.resize(var_count, 0.0);
     }
 
@@ -260,9 +277,10 @@ impl FloatSimplex {
     }
 
     fn record_decision(&mut self, accepted: bool) {
-        self.ops_attempted += 1;
+        // Both counters reset at `ACCEPTANCE_WINDOW_SIZE`, far below `u32::MAX`.
+        self.ops_attempted = self.ops_attempted.saturating_add(1);
         if accepted {
-            self.ops_accepted += 1;
+            self.ops_accepted = self.ops_accepted.saturating_add(1);
         }
         if self.ops_attempted >= ACCEPTANCE_WINDOW_SIZE {
             let rate = f64::from(self.ops_accepted) / f64::from(self.ops_attempted);
@@ -567,17 +585,19 @@ pub(crate) fn float_solve(
 }
 
 /// Recompute every basic variable's value from the current non-basic values.
-/// Returns `None` if any value becomes non-finite.
+/// Returns `None` if any value becomes non-finite, or if a row names a
+/// variable outside `val` (a malformed shadow; the caller falls back to the
+/// exact simplex either way).
 fn recompute_basics(frows: &[FRow], val: &mut [f64]) -> Option<()> {
     for fr in frows {
         let mut acc = fr.constant;
         for &(v, c) in &fr.coeffs {
-            acc += c * val[v as usize];
+            acc += c * *val.get(v as usize)?;
         }
         if !acc.is_finite() {
             return None;
         }
-        val[fr.basic_var as usize] = acc;
+        *val.get_mut(fr.basic_var as usize)? = acc;
     }
     Some(())
 }
@@ -650,6 +670,23 @@ fn pivot_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `var_count` longer than the exact values it names used to panic on
+    /// the slice; the shadow now stays empty and every check defers to exact
+    /// arithmetic.
+    #[test]
+    fn test_float_simplex_sync_with_short_values_defers_to_exact() -> Result<(), String> {
+        let mut fs = FloatSimplex::new();
+        fs.sync_from_exact(1, &[5.0]);
+        fs.sync_from_exact(2, &[5.0]);
+        for var in 0..2 {
+            let decision = fs.check_feasibility(var, Some(2.0), Some(8.0));
+            if decision != FloatDecision::Uncertain {
+                return Err(format!("var {var}: expected Uncertain, got {decision:?}"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_float_simplex_feasible() {

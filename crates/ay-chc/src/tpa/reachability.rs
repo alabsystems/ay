@@ -14,7 +14,7 @@ use ay_core::kani_compat::DetHashMap as FxHashMap;
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, SmtResult, SmtValue};
 
-use super::solver::{PowerKind, ReachResult, TpaSolver};
+use super::solver::{ConcretePath, PowerKind, ReachResult, TpaSolver};
 
 impl TpaSolver {
     /// Check reachability in exactly 2^{power+1} steps.
@@ -87,8 +87,8 @@ impl TpaSolver {
                         let refined = self.refine_two_step_target(&model, ts);
                         let result = ReachResult::Reachable {
                             steps: 2,
-                            model,
                             refined_target: Some(refined),
+                            path: Some(self.exact_base_path(&model, ts)),
                         };
                         self.store_exact_query_cache(power, from, to, &result);
                         return result;
@@ -153,8 +153,8 @@ impl TpaSolver {
         if from == to {
             return ReachResult::Reachable {
                 steps: 0,
-                model: FxHashMap::default(),
                 refined_target: Some(to.clone()),
+                path: Some(ConcretePath::point(ts)),
             };
         }
 
@@ -203,8 +203,8 @@ impl TpaSolver {
                             let refined = ChcExpr::and(from.clone(), to.clone());
                             return ReachResult::Reachable {
                                 steps: 0,
-                                model,
                                 refined_target: Some(refined),
+                                path: Some(self.identity_base_path(&model, ts)),
                             };
                         }
 
@@ -227,8 +227,8 @@ impl TpaSolver {
                             let refined = self.refine_two_step_target(&model, ts);
                             return ReachResult::Reachable {
                                 steps: 1,
-                                model,
                                 refined_target: Some(refined),
+                                path: Some(self.composed_base_path(&model, ts)),
                             };
                         }
 
@@ -286,7 +286,7 @@ impl TpaSolver {
         label: &str,
         ts: &TransitionSystem,
     ) -> Option<ReachResult> {
-        let (first_steps, second_half_from, fallback_model) = match first_half {
+        let (first_steps, second_half_from, first_path) = match first_half {
             ReachResult::Unreachable | ReachResult::Unknown => {
                 if self.config.verbose_level > 2 {
                     safe_eprintln!(
@@ -300,13 +300,13 @@ impl TpaSolver {
             ReachResult::Reachable {
                 steps,
                 refined_target: Some(refined_mid),
-                ..
-            } => (steps, refined_mid, None),
+                path,
+            } => (steps, refined_mid, path),
             ReachResult::Reachable {
                 steps,
-                model,
                 refined_target: None,
-            } => (steps, midpoint.clone(), Some(model)),
+                path,
+            } => (steps, midpoint.clone(), path),
         };
 
         let second_half = self.reachability_exact(&second_half_from, to, power, ts);
@@ -323,19 +323,15 @@ impl TpaSolver {
             }
             ReachResult::Reachable {
                 steps: second_steps,
-                model: second_model,
                 refined_target,
-            } => {
-                let model = match fallback_model {
-                    Some(fm) if second_model.is_empty() => fm,
-                    _ => second_model,
-                };
-                Some(ReachResult::Reachable {
-                    steps: first_steps + second_steps,
-                    model,
-                    refined_target,
-                })
-            }
+                path: second_path,
+            } => Some(ReachResult::Reachable {
+                steps: first_steps + second_steps,
+                refined_target,
+                path: first_path
+                    .zip(second_path)
+                    .and_then(|(first, second)| first.join(second)),
+            }),
         }
     }
 

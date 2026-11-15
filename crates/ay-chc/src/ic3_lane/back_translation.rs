@@ -12,7 +12,7 @@ use ay_sat::Literal;
 use crate::pdr::model::{InvariantModel, PredicateInterpretation};
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
 
-use super::LatchMeaning;
+use super::{control::Control, LatchMeaning};
 
 #[cfg(test)]
 mod tests;
@@ -20,29 +20,75 @@ mod tests;
 /// Translate the bit-level inductive invariant (CNF over current-state latches)
 /// into a word-level candidate. Structurally complementary implication clauses
 /// are reconstructed as one exact `Iff`; every other clause stays in CNF.
+#[cfg(test)]
 pub(super) fn back_translate(
     pred: PredicateId,
     params: &[ChcVar],
     latches: &[LatchMeaning],
     clauses: &[Vec<Literal>],
 ) -> Option<InvariantModel> {
-    let partners = exact_iff_partners(clauses);
+    let mut keep_going = || true;
+    let control = Control::new(
+        ay_core::time::Instant::now() + std::time::Duration::from_secs(30),
+        &mut keep_going,
+    );
+    back_translate_controlled(pred, params, latches, clauses, &control)
+}
+
+/// Carry the search rung's original wall through reconstruction. Every clause,
+/// literal and parameter copy polls; opaque allocation, hashing and metadata
+/// cloning are checked at their surrounding boundaries, not preempted.
+pub(super) fn back_translate_controlled(
+    pred: PredicateId,
+    params: &[ChcVar],
+    latches: &[LatchMeaning],
+    clauses: &[Vec<Literal>],
+    control: &Control<'_>,
+) -> Option<InvariantModel> {
+    control.poll()?;
+    let model = build_model(pred, params, latches, clauses, control)?;
+    // build_model's scratch vectors/maps have been dropped before publication.
+    control.poll()?;
+    Some(model)
+}
+
+fn build_model(
+    pred: PredicateId,
+    params: &[ChcVar],
+    latches: &[LatchMeaning],
+    clauses: &[Vec<Literal>],
+    control: &Control<'_>,
+) -> Option<InvariantModel> {
+    let partners = exact_iff_partners(clauses, control)?;
+    control.poll()?;
     let mut conjuncts = Vec::with_capacity(clauses.len());
     for (index, clause) in clauses.iter().enumerate() {
+        control.poll()?;
         match partners[index] {
             Some(partner) if partner < index => continue,
             Some(_) => conjuncts.push(translate_iff(clause, params, latches)?),
-            None => conjuncts.push(translate_clause(clause, params, latches)?),
+            None => conjuncts.push(translate_clause(clause, params, latches, control)?),
         }
     }
 
-    let formula = match conjuncts.len() {
+    let mut terms = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        control.poll()?;
+        terms.push(Arc::new(conjunct));
+    }
+    let formula = match terms.len() {
         0 => ChcExpr::Bool(true),
-        1 => conjuncts.pop()?,
-        _ => ChcExpr::Op(ChcOp::And, conjuncts.into_iter().map(Arc::new).collect()),
+        1 => Arc::try_unwrap(terms.pop()?).ok()?,
+        _ => ChcExpr::Op(ChcOp::And, terms),
     };
+    let mut variables = Vec::with_capacity(params.len());
+    for param in params {
+        control.poll()?;
+        variables.push(param.clone());
+    }
+    control.poll()?;
     let mut model = InvariantModel::new();
-    model.set(pred, PredicateInterpretation::new(params.to_vec(), formula));
+    model.set(pred, PredicateInterpretation::new(variables, formula));
     Some(model)
 }
 
@@ -67,10 +113,16 @@ fn binary_implication_key(clause: &[Literal]) -> Option<(usize, usize, bool)> {
 
 /// Pair only structural `(!a | b)` / `(a | !b)` complements. Lookup order is
 /// deterministic; the map is never iterated, and duplicate clauses pair LIFO.
-fn exact_iff_partners(clauses: &[Vec<Literal>]) -> Vec<Option<usize>> {
-    let mut partners = vec![None; clauses.len()];
+fn exact_iff_partners(
+    clauses: &[Vec<Literal>],
+    control: &Control<'_>,
+) -> Option<Vec<Option<usize>>> {
+    control.poll()?;
+    let mut partners = Vec::with_capacity(clauses.len());
     let mut pending: HashMap<(usize, usize, bool), Vec<usize>> = HashMap::new();
     for (index, clause) in clauses.iter().enumerate() {
+        control.poll()?;
+        partners.push(None);
         let Some((low, high, low_positive)) = binary_implication_key(clause) else {
             continue;
         };
@@ -85,7 +137,8 @@ fn exact_iff_partners(clauses: &[Vec<Literal>]) -> Vec<Option<usize>> {
                 .push(index);
         }
     }
-    partners
+    control.poll()?;
+    Some(partners)
 }
 
 fn translate_iff(
@@ -143,20 +196,24 @@ fn translate_clause(
     clause: &[Literal],
     params: &[ChcVar],
     latches: &[LatchMeaning],
+    control: &Control<'_>,
 ) -> Option<ChcExpr> {
+    control.poll()?;
     let mut disjuncts = Vec::with_capacity(clause.len());
     for literal in clause {
+        control.poll()?;
         let atom = latch_to_expr(latches.get(literal.variable().index())?, params)?;
-        disjuncts.push(if literal.is_positive() {
+        disjuncts.push(Arc::new(if literal.is_positive() {
             atom
         } else {
             ChcExpr::Op(ChcOp::Not, vec![Arc::new(atom)])
-        });
+        }));
     }
+    control.poll()?;
     Some(match disjuncts.len() {
         0 => ChcExpr::Bool(false),
-        1 => disjuncts.pop()?,
-        _ => ChcExpr::Op(ChcOp::Or, disjuncts.into_iter().map(Arc::new).collect()),
+        1 => Arc::try_unwrap(disjuncts.pop()?).ok()?,
+        _ => ChcExpr::Op(ChcOp::Or, disjuncts),
     })
 }
 

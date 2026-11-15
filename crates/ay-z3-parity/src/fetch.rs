@@ -148,6 +148,18 @@ ay-z3-parity fetch <dest-dir> [--sample N | --all] [--max-mb M]
 /// Entry point for `ay-z3-parity fetch ...`. Parses its own flags (they diverge
 /// from the shared parser) and returns a process exit code.
 pub(crate) fn run(rest: &[String]) -> i32 {
+    if rest
+        .first()
+        .is_some_and(|arg| arg == "--provision-division")
+    {
+        return match provision_division_child(&rest[1..]) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        };
+    }
     if rest.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
         return 0;
@@ -300,6 +312,418 @@ pub(crate) fn run(rest: &[String]) -> i32 {
     }
 }
 
+/// Retain all archive bytes and metadata needed by the closed official-corpus
+/// validator. Unlike the interactive sampler, this path cannot narrow or skip
+/// a division. The existing extraction/flattening implementation runs inside
+/// one admitted, bounded child per archive, including its decompressor tree.
+pub(crate) fn provision_official(
+    destination: &Path,
+    archive_root: &Path,
+    metadata_path: &Path,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    let repo = provision_repo_root()?;
+    let resources = ay_bench::PlannedResources::plan(&repo, 1, "official SMT-LIB acquisition")
+        .map_err(|error| error.to_string())?;
+    for directory in [destination, archive_root] {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    let metadata_parent = metadata_path
+        .parent()
+        .ok_or("metadata path has no parent")?;
+    std::fs::create_dir_all(metadata_parent).map_err(|error| error.to_string())?;
+    if !metadata_path.exists() {
+        provision_download(
+            &resources,
+            "https://zenodo.org/api/records/11061097",
+            metadata_path,
+            64 * 1024 * 1024,
+        )?;
+    }
+    let size = std::fs::symlink_metadata(metadata_path).map_err(|error| error.to_string())?;
+    if !size.file_type().is_file() || size.len() > 64 * 1024 * 1024 {
+        return Err("official metadata must be a bounded regular file".to_string());
+    }
+    let metadata = std::fs::read(metadata_path).map_err(|error| error.to_string())?;
+    let mut entries = parse_records(&metadata)?;
+    entries.sort_by(|a, b| a.div.cmp(&b.div));
+    let value: serde_json::Value =
+        serde_json::from_slice(&metadata).map_err(|error| error.to_string())?;
+    if value.get("id").and_then(serde_json::Value::as_u64) != Some(11061097)
+        || value.get("doi").and_then(serde_json::Value::as_str) != Some("10.5281/zenodo.11061097")
+        || entries.len() != 84
+    {
+        return Err(
+            "official corpus source must be all 84 archives of record 11061097".to_string(),
+        );
+    }
+    // Match the official validator's immutable archive-row digest before any
+    // multi-gigabyte download. API statistics may vary; archive identities may
+    // not. Declaration order here is the canonical row encoding.
+    #[derive(serde::Serialize)]
+    struct ArchiveRow<'a> {
+        division: &'a str,
+        key: String,
+        size: u64,
+        checksum: String,
+    }
+    let mut hash = Sha256::new();
+    for entry in &entries {
+        let row = ArchiveRow {
+            division: &entry.div,
+            key: format!("{}.tar.zst", entry.div),
+            size: entry.size,
+            checksum: format!("md5:{}", entry.md5),
+        };
+        hash.update(serde_json::to_vec(&row).map_err(|error| error.to_string())?);
+        hash.update(b"\n");
+    }
+    if format!("{:x}", hash.finalize())
+        != "337c6b0468e5f08175773c21864ed2712299678132f6204d8b5b08f8ad51a942"
+    {
+        return Err(
+            "official corpus archive inventory does not match the pinned profile".to_string(),
+        );
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    for (index, entry) in entries.iter().enumerate() {
+        println!("corpus acquisition {}/84: {}", index + 1, entry.div);
+        let archive = archive_root.join(format!("{}.tar.zst", entry.div));
+        if !archive.exists() {
+            provision_download(
+                &resources,
+                &format!(
+                    "https://zenodo.org/api/records/11061097/files/{}.tar.zst/content",
+                    entry.div
+                ),
+                &archive,
+                entry.size,
+            )?;
+        }
+        let args: Vec<OsString> = vec![
+            "fetch".into(),
+            "--provision-division".into(),
+            archive.into_os_string(),
+            destination.as_os_str().to_owned(),
+            entry.div.clone().into(),
+            entry.size.to_string().into(),
+            entry.md5.clone().into(),
+        ];
+        let output = resources
+            .run_external_transcript(
+                &executable,
+                args,
+                b"",
+                Duration::from_secs(3600),
+                "authenticated archive extraction",
+            )
+            .map_err(|error| error.to_string())?;
+        provision_child_success(output, "authenticated archive extraction")?;
+    }
+    Ok(())
+}
+
+fn provision_repo_root() -> Result<PathBuf, String> {
+    let mut path = std::env::current_dir().map_err(|error| error.to_string())?;
+    loop {
+        if path.join("crates/ay-z3-parity/Cargo.toml").is_file() {
+            return Ok(path);
+        }
+        if !path.pop() {
+            return Err("official corpus acquisition needs an AY source checkout".to_string());
+        }
+    }
+}
+
+fn provision_child_success(
+    output: ay_bench::GuardedTranscriptOutput,
+    label: &str,
+) -> Result<(), String> {
+    if output.timed_out
+        || output.memout
+        || output.stdout_truncated
+        || output.stderr_truncated
+        || !output.status.is_some_and(|status| status.success())
+    {
+        return Err(format!(
+            "{label} failed (timeout={}, memout={}, truncated={}): {}",
+            output.timed_out,
+            output.memout,
+            output.stdout_truncated || output.stderr_truncated,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn provision_download(
+    resources: &ay_bench::PlannedResources,
+    url: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::time::Duration;
+    let parent = path.parent().ok_or("download path has no parent")?;
+    let temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    let args: Vec<OsString> = vec![
+        "--fail".into(),
+        "--location".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--proto".into(),
+        "=https".into(),
+        "--proto-redir".into(),
+        "=https".into(),
+        "--connect-timeout".into(),
+        "30".into(),
+        "--max-time".into(),
+        "1800".into(),
+        "--max-filesize".into(),
+        max_bytes.to_string().into(),
+        "--output".into(),
+        temporary.path().as_os_str().to_owned(),
+        url.into(),
+    ];
+    let output = resources
+        .run_external_transcript(
+            "curl",
+            args,
+            b"",
+            Duration::from_secs(1860),
+            "official corpus download",
+        )
+        .map_err(|error| error.to_string())?;
+    provision_child_success(output, "official corpus download")?;
+    if temporary
+        .as_file()
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len()
+        > max_bytes
+    {
+        return Err("corpus download exceeds its declared byte limit".to_string());
+    }
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn provision_division_child(args: &[String]) -> Result<(), String> {
+    if args.len() != 5 || !valid_division_name(&args[2]) {
+        return Err("invalid internal archive extraction arguments".to_string());
+    }
+    let archive = Path::new(&args[0]);
+    let destination = Path::new(&args[1]);
+    let size = args[3].parse::<u64>().map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(archive).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_file() || metadata.len() != size {
+        return Err(
+            "cached official archive is linked, non-regular, or has wrong size".to_string(),
+        );
+    }
+    if md5_of(archive)? != args[4] {
+        return Err("cached official archive checksum mismatch".to_string());
+    }
+    // A killed worker cannot run TempDir::drop. Keep all decompression,
+    // replacement staging and old backups outside the enumerated corpus, so
+    // those owned leftovers cannot become extra benchmark files on a retry.
+    // Never infer ownership of older `.tmp*` paths and delete them by name.
+    let workspace = official_workspace(destination)?;
+    let extracted = workspace.path().join("extracted");
+    std::fs::create_dir(&extracted).map_err(|error| error.to_string())?;
+    extract_official_native(archive, &extracted)?;
+    let mut keys = collect_smt2(&extracted)?;
+    sort_keys(&mut keys);
+    if keys.is_empty() {
+        return Err("official archive has no SMT-LIB files".to_string());
+    }
+    let indices = (0..keys.len()).collect::<Vec<_>>();
+    install_sample_at(
+        &extracted,
+        destination,
+        &args[2],
+        &keys,
+        &indices,
+        workspace.path(),
+    )?;
+    Ok(())
+}
+
+fn official_workspace(destination: &Path) -> Result<tempfile::TempDir, String> {
+    let destination = std::fs::canonicalize(destination)
+        .map_err(|error| format!("canonicalize official corpus destination: {error}"))?;
+    let parent = destination
+        .parent()
+        .ok_or("official corpus cannot use the filesystem root")?;
+    tempfile::Builder::new()
+        .prefix(".ay-official-work-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("create official corpus workspace: {error}"))
+}
+
+/// Native decompression shared by official archive materialization and the
+/// independent archive-to-manifest replay. The existing corpus expansion
+/// budget bounds all uncompressed bytes, including padding and ignored files.
+pub(crate) struct OfficialArchiveReader {
+    decoder: zstd::stream::read::Decoder<'static, std::io::BufReader<std::fs::File>>,
+    consumed: u64,
+    limit: u64,
+}
+
+impl OfficialArchiveReader {
+    pub(crate) fn byte_limit(&self) -> u64 {
+        self.limit
+    }
+}
+
+impl Read for OfficialArchiveReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.decoder.read(buffer)?;
+        self.consumed = self.consumed.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive expansion overflow",
+            )
+        })?;
+        if self.consumed > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive exceeds its uncompressed byte budget",
+            ));
+        }
+        Ok(read)
+    }
+}
+
+pub(crate) fn open_official_archive(path: &Path) -> Result<OfficialArchiveReader, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("official archive must be a regular, non-symlink file".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("open native zstd decoder for {}: {error}", path.display()))?;
+    Ok(OfficialArchiveReader {
+        decoder,
+        consumed: 0,
+        limit: expansion_budget(metadata.len()),
+    })
+}
+
+/// Consume trailing frames and padding after a tar reader reaches its EOF.
+/// This is required to observe truncated/corrupt zstd trailers instead of
+/// accepting only the successfully decoded prefix of an archive.
+pub(crate) fn finish_official_archive(reader: &mut OfficialArchiveReader) -> Result<(), String> {
+    std::io::copy(reader, &mut std::io::sink())
+        .map_err(|error| format!("finish native zstd archive: {error}"))?;
+    Ok(())
+}
+
+fn extract_official_native(archive: &Path, destination: &Path) -> Result<(), String> {
+    const MAX_ENTRIES: usize = 1_000_000;
+    let mut reader = open_official_archive(archive)?;
+    let payload_budget = reader.byte_limit();
+    let mut declared_payload = 0u64;
+    let mut seen = BTreeSet::new();
+    {
+        let mut tar = tar::Archive::new(&mut reader);
+        let entries = tar
+            .entries()
+            .map_err(|error| format!("read tar entries: {error}"))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| format!("read tar entry: {error}"))?;
+            let kind = entry.header().entry_type();
+            if !kind.is_file() && !kind.is_dir() {
+                return Err("official archive contains a link or special entry".to_string());
+            }
+            let path = entry
+                .path()
+                .map_err(|error| error.to_string())?
+                .into_owned();
+            let path = normalized_official_member(&path)?;
+            if !seen.insert(path.clone()) {
+                return Err(format!(
+                    "duplicate normalized archive path: {}",
+                    path.display()
+                ));
+            }
+            if seen.len() > MAX_ENTRIES {
+                return Err("official archive exceeds its member count bound".to_string());
+            }
+            let size = entry.size();
+            account_official_payload(&mut declared_payload, size, payload_budget, &path)?;
+            let target = destination.join(path);
+            if kind.is_dir() {
+                if size != 0 {
+                    return Err("directory tar entry has nonzero payload".to_string());
+                }
+                std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+            } else {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map_err(|error| format!("create {}: {error}", target.display()))?;
+                let copied =
+                    std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+                if copied != size {
+                    return Err("truncated tar entry".to_string());
+                }
+            }
+        }
+    }
+    finish_official_archive(&mut reader)?;
+    validate_extracted_tree(destination)
+}
+
+fn account_official_payload(
+    total: &mut u64,
+    bytes: u64,
+    budget: u64,
+    path: &Path,
+) -> Result<(), String> {
+    let next = total
+        .checked_add(bytes)
+        .ok_or("official archive declared payload overflows u64")?;
+    if next > budget {
+        return Err(format!(
+            "official archive declared payload exceeds its {budget}-byte expansion budget at {}",
+            path.display()
+        ));
+    }
+    *total = next;
+    Ok(())
+}
+
+fn normalized_official_member(path: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            _ => return Err(format!("unsafe archive path: {}", path.display())),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        // A tar archive may explicitly name its own root directory. It does
+        // not escape the staging root; a regular file at this path still
+        // fails create_new because the staging directory already exists.
+        if !path.as_os_str().is_empty() && path.components().all(|part| part == Component::CurDir) {
+            return Ok(PathBuf::from("."));
+        }
+        return Err("empty normalized archive path".to_string());
+    }
+    Ok(normalized)
+}
+
 fn parse_args(rest: &[String]) -> Result<FetchArgs, String> {
     let mut dest = None;
     let mut sample = DEFAULT_SAMPLE;
@@ -418,6 +842,12 @@ fn selected_entries<'a>(
 /// per-byte ratio, floored so tiny-but-legitimately-expansive divisions fit, and
 /// capped absolutely so the ratio cannot authorize filling the disk.
 fn expansion_budget(archive_bytes: u64) -> u64 {
+    official_archive_expansion_budget(archive_bytes)
+}
+
+/// Shared full-archive bound, also used by manifest intake. There is no smaller
+/// per-member ceiling: authenticated SMT-LIB members may exceed one GiB.
+pub(crate) fn official_archive_expansion_budget(archive_bytes: u64) -> u64 {
     archive_bytes
         .saturating_mul(MAX_ARCHIVE_EXPANSION_RATIO)
         .clamp(MIN_ARCHIVE_EXPANSION_BUDGET, MAX_ARCHIVE_EXPANSION_BYTES)
@@ -583,6 +1013,26 @@ fn install_sample(
     keys: &[String],
     idxs: &[usize],
 ) -> Result<(), String> {
+    install_sample_at(extracted, dest, div, keys, idxs, dest)
+}
+
+/// The official closed-corpus path supplies a private sibling workspace.
+/// Interactive sampling retains its historical in-root transaction layout.
+/// Both copies and renames belong to this invocation; abandoned workspaces
+/// are not glob-deleted or adopted by a later worker.
+/// Official extraction streams at most its expansion budget to disk and this
+/// flat snapshot copies at most that payload once more. Thus one live official
+/// workspace uses at most twice the archive expansion budget (256 GB at the
+/// absolute ceiling), plus directory metadata, excluding the input archive and
+/// any previous installed snapshot. Interrupted outside workspaces are retained.
+fn install_sample_at(
+    extracted: &Path,
+    dest: &Path,
+    div: &str,
+    keys: &[String],
+    idxs: &[usize],
+    workspace: &Path,
+) -> Result<(), String> {
     let mut outputs = BTreeSet::new();
     for &i in idxs {
         let key = keys
@@ -597,11 +1047,11 @@ fn install_sample(
     }
 
     let nonce = unique_nonce();
-    let staging = dest.join(format!(
+    let staging = workspace.join(format!(
         ".{div}.fetch-staging-{}-{nonce}",
         std::process::id()
     ));
-    let backup = dest.join(format!(
+    let backup = workspace.join(format!(
         ".{div}.fetch-backup-{}-{nonce}",
         std::process::id()
     ));
@@ -618,6 +1068,9 @@ fn install_sample(
         return Err(err);
     }
 
+    #[cfg(test)]
+    pause_official_installation_for_test(workspace, "copied")?;
+
     let dest_div = dest.join(div);
     let had_old = std::fs::symlink_metadata(&dest_div).is_ok();
     if had_old {
@@ -629,6 +1082,8 @@ fn install_sample(
             ));
         }
     }
+    #[cfg(test)]
+    pause_official_installation_for_test(workspace, "backed-up")?;
     if let Err(err) = std::fs::rename(&staging, &dest_div) {
         if had_old {
             let _ = std::fs::rename(&backup, &dest_div);
@@ -636,18 +1091,48 @@ fn install_sample(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(format!("install sample {}: {err}", dest_div.display()));
     }
+    #[cfg(test)]
+    pause_official_installation_for_test(workspace, "installed")?;
     if had_old {
         if let Err(err) = remove_path_retrying(&backup) {
-            eprintln!(
-                "warning: installed {}, but could not remove backup {} after retries: {err}. \
+            if workspace == dest {
+                eprintln!(
+                    "warning: installed {}, but could not remove backup {} after retries: {err}. \
                  It will be swept at the start of the next fetch into this root; until then, \
                  corpus scanners that do not skip dot-directories may double-count its files.",
-                dest_div.display(),
-                backup.display()
-            );
+                    dest_div.display(),
+                    backup.display()
+                );
+            } else {
+                eprintln!(
+                    "warning: installed {}, but backup cleanup failed after retries: {err}; \
+                     {} is outside the official corpus enumeration",
+                    dest_div.display(),
+                    backup.display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn pause_official_installation_for_test(workspace: &Path, phase: &str) -> Result<(), String> {
+    if std::env::var("AY_TEST_OFFICIAL_INTERRUPT_PHASE").as_deref() != Ok(phase) {
+        return Ok(());
+    }
+    let Some(ready) = std::env::var_os("AY_TEST_OFFICIAL_INTERRUPT_READY") else {
+        return Ok(());
+    };
+    let ready = PathBuf::from(ready);
+    let pending = ready.with_extension("pending");
+    std::fs::write(&pending, workspace.to_string_lossy().as_bytes())
+        .map_err(|error| error.to_string())?;
+    std::fs::rename(pending, ready).map_err(|error| error.to_string())?;
+    // The test kills its own worker after this checkpoint. The finite fallback
+    // also prevents an orphaned test process if its test parent exits first.
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    Err("interruption regression did not kill its worker".to_string())
 }
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
@@ -871,19 +1356,19 @@ struct TarRun {
 /// weakened: the caller verifies the archive's published md5 before extracting,
 /// a truncated or corrupt stream still makes `tar` fail on a short archive, and
 /// a decompressor failure that is NOT a broken pipe is still reported even when
-/// `tar` is happy.
+/// `tar` is happy ([`decompressor_lost_its_reader`]).
 fn tar_over_zstd(
     archive: &Path,
     tar_args: &[&str],
     capture_stdout: bool,
 ) -> Result<TarRun, String> {
-    let mut decompressor = Command::new("unzstd")
-        .arg("-c")
+    let mut decompressor = Command::new("zstd")
+        .args(["-d", "-c"])
         .arg(archive)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("failed to run unzstd: {err}"))?;
+        .map_err(|err| format!("failed to run zstd decompressor: {err}"))?;
     let decompressed = decompressor
         .stdout
         .take()
@@ -914,12 +1399,12 @@ fn tar_over_zstd(
         .map_err(|err| format!("failed to wait for tar: {err}"))?;
     let decompressor = decompressor
         .wait_with_output()
-        .map_err(|err| format!("failed to wait for unzstd: {err}"))?;
+        .map_err(|err| format!("failed to wait for zstd decompressor: {err}"))?;
     if !decompressor.status.success() {
         let stderr = String::from_utf8_lossy(&decompressor.stderr)
             .trim()
             .to_string();
-        if !stderr.to_ascii_lowercase().contains("broken pipe") {
+        if !decompressor_lost_its_reader(decompressor.status, &stderr) {
             return Err(format!(
                 "decompressor failed ({}): {stderr}",
                 decompressor.status
@@ -930,6 +1415,30 @@ fn tar_over_zstd(
         stdout: tar.stdout,
         status: tar.status,
     })
+}
+
+/// Whether the decompressor stopped only because `tar` closed the pipe after
+/// the end-of-archive marker, which `tar`'s own status already judges.
+///
+/// A decompressor that ignores SIGPIPE reports that as an `EPIPE` error
+/// ("Broken pipe"); one with SIGPIPE at its default action dies of the signal
+/// with nothing on stderr. Every decompressor this process spawns is the second
+/// kind: std gives the children it spawns SIGPIPE's default action, and under
+/// `unix_hardened` (`-Zon-broken-pipe=kill`) they inherit it from AY itself.
+/// Measured 2026-10-08 on macOS under load: 6 of 25 runs of this crate's tests
+/// lost `listing_a_valid_archive_is_not_defeated_by_a_decompressor_broken_pipe`
+/// as "decompressor failed (signal: 13 (SIGPIPE))".
+fn decompressor_lost_its_reader(status: std::process::ExitStatus, stderr: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if status.signal() == Some(libc::SIGPIPE) {
+            return true;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = status;
+    stderr.to_ascii_lowercase().contains("broken pipe")
 }
 
 /// Validate member paths, extract, then reject links and special files.
@@ -955,13 +1464,13 @@ fn extract(archive: &Path, into: &Path, max_expanded_bytes: u64) -> Result<(), S
 /// Stream every regular member to stdout without writing it, bounding the
 /// total expanded payload before the real extraction mutates disk.
 fn validate_expanded_size(archive: &Path, max_expanded_bytes: u64) -> Result<(), String> {
-    let mut decompressor = Command::new("unzstd")
-        .arg("-c")
+    let mut decompressor = Command::new("zstd")
+        .args(["-d", "-c"])
         .arg(archive)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| format!("failed to run unzstd: {err}"))?;
+        .map_err(|err| format!("failed to run zstd decompressor: {err}"))?;
     let decompressed = decompressor
         .stdout
         .take()
@@ -1179,6 +1688,315 @@ fn parse_records(json: &[u8]) -> Result<Vec<DivEntry>, String> {
 
 #[cfg(test)]
 mod tests {
+    fn native_archive_fixture(directory: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let archive = directory.join("native.tar.zst");
+        std::fs::write(
+            &archive,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        archive
+    }
+
+    #[test]
+    fn native_official_extraction_preserves_members_without_system_zstd() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = native_archive_fixture(
+            directory.path(),
+            &[
+                ("non-incremental/QF_UF/a.smt2", b"(check-sat)\n"),
+                (
+                    "non-incremental/QF_UF/b.smt2",
+                    b"(assert false)\n(check-sat)\n",
+                ),
+            ],
+        );
+        let destination = directory.path().join("out");
+        std::fs::create_dir(&destination).unwrap();
+        extract_official_native(&archive, &destination).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("non-incremental/QF_UF/a.smt2")).unwrap(),
+            b"(check-sat)\n"
+        );
+        assert_eq!(collect_smt2(&destination).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_official_extraction_rejects_duplicate_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = native_archive_fixture(
+            directory.path(),
+            &[("a.smt2", b"first"), ("a.smt2", b"second")],
+        );
+        let destination = directory.path().join("out");
+        std::fs::create_dir(&destination).unwrap();
+        assert!(extract_official_native(&archive, &destination)
+            .unwrap_err()
+            .contains("duplicate"));
+        assert_eq!(std::fs::read(destination.join("a.smt2")).unwrap(), b"first");
+    }
+
+    #[test]
+    fn native_official_extraction_rejects_links_and_parent_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        builder
+            .append_link(&mut header, "link", "../outside")
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let archive = directory.path().join("link.tar.zst");
+        std::fs::write(
+            &archive,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        let destination = directory.path().join("out");
+        std::fs::create_dir(&destination).unwrap();
+        assert!(extract_official_native(&archive, &destination)
+            .unwrap_err()
+            .contains("link"));
+        assert!(!destination.join("link").exists());
+        assert!(normalized_official_member(Path::new("a/../../escape")).is_err());
+        assert!(normalized_official_member(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn native_official_reader_rejects_truncated_frame_and_expansion() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = native_archive_fixture(directory.path(), &[("a.smt2", b"(check-sat)\n")]);
+        let mut reader = open_official_archive(&archive).unwrap();
+        reader.limit = 10;
+        assert!(finish_official_archive(&mut reader).is_err());
+        let mut bytes = std::fs::read(&archive).unwrap();
+        bytes.truncate(bytes.len() - 2);
+        std::fs::write(&archive, bytes).unwrap();
+        let mut reader = open_official_archive(&archive).unwrap();
+        assert!(finish_official_archive(&mut reader).is_err());
+    }
+
+    fn declared_member_archive(directory: &Path, size: u64) -> PathBuf {
+        let mut header = tar::Header::new_gnu();
+        header.set_path("huge.smt2").unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let archive = directory.join("declared-size.tar.zst");
+        // Deliberately omit the payload. This exercises huge declared sizes
+        // without allocating a GiB or writing a GiB of test data.
+        fs::write(
+            &archive,
+            zstd::stream::encode_all(header.as_bytes().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        archive
+    }
+
+    #[test]
+    fn official_large_member_stream_reaches_payload_instead_of_one_gib_refusal() {
+        // Declared size observed in the pinned QF_ABV ridecore header on M2.
+        const QF_ABV_MEMBER_BYTES: u64 = 1_169_487_267;
+        let directory = tempfile::tempdir().unwrap();
+        let archive = declared_member_archive(directory.path(), QF_ABV_MEMBER_BYTES);
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        // The header fits the unchanged total archive budget; reaching EOF in
+        // its missing payload must fail, after opening the streamed output.
+        assert!(extract_official_native(&archive, &destination).is_err());
+        assert!(destination.join("huge.smt2").is_file());
+        assert_eq!(
+            fs::metadata(destination.join("huge.smt2")).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn official_declared_payload_cannot_exceed_the_existing_total_budget() {
+        let budget = official_archive_expansion_budget(1);
+        let mut total = 0;
+        account_official_payload(
+            &mut total,
+            1024 * 1024 * 1024 + 1,
+            budget,
+            Path::new("large.smt2"),
+        )
+        .unwrap();
+        let remaining = budget - total;
+        account_official_payload(&mut total, remaining, budget, Path::new("rest.smt2")).unwrap();
+        assert_eq!(total, budget);
+        assert!(
+            account_official_payload(&mut total, 1, budget, Path::new("overflow.smt2")).is_err()
+        );
+        assert_eq!(total, budget);
+        let mut overflowing = u64::MAX;
+        assert!(account_official_payload(
+            &mut overflowing,
+            1,
+            u64::MAX,
+            Path::new("overflow.smt2")
+        )
+        .is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let archive = declared_member_archive(directory.path(), budget + 1);
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        assert!(extract_official_native(&archive, &destination)
+            .unwrap_err()
+            .contains("declared payload"));
+        assert!(!destination.join("huge.smt2").exists());
+    }
+
+    #[test]
+    fn closed_provisioner_refuses_wrong_archive_size_before_extraction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("QF_UF.tar.zst");
+        std::fs::write(&archive, b"not an archive").unwrap();
+        let result = super::provision_division_child(&[
+            archive.display().to_string(),
+            temporary.path().display().to_string(),
+            "QF_UF".to_string(),
+            "1".to_string(),
+            "00000000000000000000000000000000".to_string(),
+        ]);
+        assert!(result.unwrap_err().contains("wrong size"));
+        assert!(!temporary.path().join("QF_UF").exists());
+    }
+
+    #[test]
+    fn closed_provisioner_rejects_path_traversal() {
+        let result = super::provision_division_child(&[
+            "archive".to_string(),
+            "destination".to_string(),
+            "../outside".to_string(),
+            "1".to_string(),
+            "00000000000000000000000000000000".to_string(),
+        ]);
+        assert!(result.unwrap_err().contains("invalid internal"));
+    }
+
+    fn provision_fixture_division(root: &Path) -> Result<(), String> {
+        let archive = root.join("native.tar.zst");
+        provision_division_child(&[
+            archive.display().to_string(),
+            root.join("corpus").display().to_string(),
+            "QF_UF".to_string(),
+            fs::metadata(&archive).unwrap().len().to_string(),
+            md5_of(&archive).unwrap(),
+        ])
+    }
+
+    // This test is also the child entry point for the interruption regression.
+    // With no explicit test-only root it performs no work.
+    #[test]
+    fn official_install_interruption_worker() {
+        let Some(root) = std::env::var_os("AY_TEST_OFFICIAL_INTERRUPT_ROOT") else {
+            return;
+        };
+        provision_fixture_division(Path::new(&root)).unwrap();
+    }
+
+    fn stop_test_worker(child: &mut std::process::Child) -> std::process::ExitStatus {
+        let _ = child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed test worker did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn official_resume_after_killed_install_preserves_exact_population() {
+        for phase in ["copied", "backed-up", "installed"] {
+            let root = tempfile::tempdir().unwrap();
+            let corpus = root.path().join("corpus");
+            fs::create_dir_all(corpus.join("QF_UF")).unwrap();
+            fs::write(corpus.join("QF_UF/old.smt2"), b"old snapshot").unwrap();
+            native_archive_fixture(root.path(), &[("nested/a.smt2", b"(check-sat)\n")]);
+            let ready = root.path().join("ready");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fetch::tests::official_install_interruption_worker",
+                    "--nocapture",
+                ])
+                .env("AY_TEST_OFFICIAL_INTERRUPT_ROOT", root.path())
+                .env("AY_TEST_OFFICIAL_INTERRUPT_PHASE", phase)
+                .env("AY_TEST_OFFICIAL_INTERRUPT_READY", &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("interruption worker exited before {phase}: {status}");
+                }
+                if std::time::Instant::now() >= deadline {
+                    stop_test_worker(&mut child);
+                    panic!("interruption worker did not reach {phase}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let orphan = PathBuf::from(fs::read_to_string(&ready).unwrap());
+            assert_eq!(
+                orphan.parent().unwrap(),
+                root.path().canonicalize().unwrap()
+            );
+            assert!(!orphan.starts_with(&corpus));
+            let status = stop_test_worker(&mut child);
+            assert!(!status.success());
+            // SIGKILL did not run the worker's TempDir destructor. The old
+            // transaction really remains, but outside the benchmark tree.
+            assert!(orphan.is_dir());
+            assert!(!collect_smt2(&orphan).unwrap().is_empty());
+            provision_fixture_division(root.path()).unwrap();
+            assert_eq!(collect_smt2(&corpus).unwrap(), ["QF_UF/nested__a.smt2"]);
+            assert_eq!(
+                fs::read(corpus.join("QF_UF/nested__a.smt2")).unwrap(),
+                b"(check-sat)\n"
+            );
+            // A new worker never claims an abandoned tree solely from its name.
+            assert!(orphan.is_dir());
+        }
+    }
+
+    #[test]
+    fn official_resume_does_not_delete_foreign_temporary_content() {
+        let root = tempfile::tempdir().unwrap();
+        let corpus = root.path().join("corpus");
+        fs::create_dir_all(corpus.join(".tmp-foreign")).unwrap();
+        let foreign = corpus.join(".tmp-foreign/user.smt2");
+        fs::write(&foreign, b"foreign input").unwrap();
+        native_archive_fixture(root.path(), &[("a.smt2", b"(check-sat)\n")]);
+        provision_fixture_division(root.path()).unwrap();
+        assert_eq!(fs::read(foreign).unwrap(), b"foreign input");
+        let mut observed = collect_smt2(&corpus).unwrap();
+        sort_keys(&mut observed);
+        assert_eq!(observed, [".tmp-foreign/user.smt2", "QF_UF/a.smt2"]);
+        // The unchanged closed-manifest bijection therefore still refuses this
+        // foreign extra file instead of treating it as owned scratch garbage.
+    }
+
     use super::*;
     use std::fs;
 
@@ -1245,6 +2063,50 @@ mod tests {
         for attempt in 0..4 {
             validate_archive_members(&archive)
                 .unwrap_or_else(|err| panic!("validation attempt {attempt}: {err}"));
+        }
+    }
+
+    /// The race above, made certain: 8 MiB of zero padding after the
+    /// end-of-archive marker keeps the decompressor writing into a full pipe
+    /// after `tar` has listed everything and exited, so it dies of SIGPIPE
+    /// (the default action every child of this process has) every time. That
+    /// is `tar` closing its input, not a decompressor failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_decompressor_killed_by_sigpipe_after_the_end_marker_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stage = dir.path().join("stage");
+        fs::create_dir_all(&stage).expect("stage dir");
+        fs::write(stage.join("a.smt2"), b"(check-sat)\n").expect("member");
+        let tar = Command::new("tar")
+            .args(["-cf", "-", "-C"])
+            .arg(&stage)
+            .arg("a.smt2")
+            .output()
+            .expect("tar -cf");
+        assert!(tar.status.success(), "creating the fixture tar failed");
+        let mut padded = tar.stdout;
+        padded.extend(std::iter::repeat_n(0u8, 8 << 20));
+        let padded_tar = dir.path().join("padded.tar");
+        fs::write(&padded_tar, &padded).expect("write padded tar");
+        let archive = dir.path().join("padded.tar.zst");
+        let compressed = Command::new("zstd")
+            .arg("-q")
+            .arg("-o")
+            .arg(&archive)
+            .arg(&padded_tar)
+            .status()
+            .expect("zstd");
+        assert!(compressed.success(), "compressing the fixture failed");
+        for attempt in 0..3 {
+            let run = tar_over_zstd(&archive, &["-tf", "-"], true)
+                .unwrap_or_else(|err| panic!("attempt {attempt}: {err}"));
+            assert!(run.status.success(), "attempt {attempt}: {:?}", run.status);
+            assert_eq!(
+                String::from_utf8(run.stdout).expect("utf-8 listing").trim(),
+                "a.smt2",
+                "attempt {attempt}"
+            );
         }
     }
 

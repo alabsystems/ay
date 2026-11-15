@@ -30,9 +30,10 @@ impl CegarEngine {
         let sat = if let Some(cached) = self.cache.check_feasibility(assumptions) {
             !matches!(cached, CachedFeasibility::Unsat)
         } else {
+            let query_timeout = self.config.query_timeout;
             let result = self
-                .smt
-                .check_sat_with_timeout(assumptions, self.config.query_timeout);
+                .expansion_smt()
+                .check_sat_with_timeout(assumptions, query_timeout);
             let feasibility = match &result {
                 SmtResult::Sat(_) => CachedFeasibility::Sat,
                 SmtResult::Unknown => CachedFeasibility::Unknown,
@@ -87,7 +88,7 @@ impl CegarEngine {
         // Phase 1: Get a model of the assumptions and use it to partition
         // predicates into definitely-false (exclude), definitely-true (include
         // via model), and unknown (need SMT check).
-        let model = self.smt.get_model(assumptions);
+        let model = self.expansion_smt().get_model(assumptions);
         let eval_model = model.as_ref().map(SmallModel::from_smt_model);
 
         let mut implied = Vec::new();
@@ -136,7 +137,9 @@ impl CegarEngine {
             {
                 cached
             } else {
-                let result = self.smt.check_implies(assumptions, concrete_pred);
+                let result = self
+                    .expansion_smt()
+                    .check_implies(assumptions, concrete_pred);
                 self.cache
                     .store_implication(assumptions.clone(), concrete_pred.clone(), result);
                 result
@@ -248,9 +251,10 @@ impl CegarEngine {
                     {
                         !matches!(cached, CachedFeasibility::Unsat)
                     } else {
+                        let query_timeout = self.config.query_timeout;
                         let result = self
-                            .smt
-                            .check_sat_with_timeout(&assumptions, self.config.query_timeout);
+                            .expansion_smt()
+                            .check_sat_with_timeout(&assumptions, query_timeout);
                         let feasibility = match &result {
                             SmtResult::Sat(_) => CachedFeasibility::Sat,
                             SmtResult::Unknown => CachedFeasibility::Unknown,
@@ -382,9 +386,10 @@ impl CegarEngine {
         if let Some(cached) = self.cache.check_feasibility(&assumptions) {
             return !matches!(cached, CachedFeasibility::Unsat);
         }
+        let query_timeout = self.config.query_timeout;
         let result = self
-            .smt
-            .check_sat_with_timeout(&assumptions, self.config.query_timeout);
+            .expansion_smt()
+            .check_sat_with_timeout(&assumptions, query_timeout);
         let feasibility = match &result {
             SmtResult::Sat(_) => CachedFeasibility::Sat,
             SmtResult::Unknown => CachedFeasibility::Unknown,

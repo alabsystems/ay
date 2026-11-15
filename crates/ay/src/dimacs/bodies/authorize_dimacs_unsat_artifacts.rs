@@ -136,6 +136,7 @@ fn retain_dimacs_artifact(
                     "DIMACS proof artifact",
                     None,
                     DimacsPublicationInvalidation::Empty,
+                    DimacsPublicationRecheck::Bytes,
                 )
             })
             .transpose()

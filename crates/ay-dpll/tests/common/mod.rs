@@ -7,22 +7,24 @@
 // Shared helpers are compiled into each integration-test binary separately, so
 // any given test target legitimately uses only a subset of this module.
 
+pub(crate) mod incremental_script;
+
 use anyhow::{anyhow, Context, Result};
 use ay_dpll::Executor;
 use ay_frontend::{parse, Command as SmtCommand, Sort};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Once, OnceLock,
+    Arc,
 };
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
-static Z3_AVAILABLE: OnceLock<bool> = OnceLock::new();
-static Z3_SKIP_LOGGED: Once = Once::new();
+mod z3;
+pub(crate) use z3::{
+    assert_z3_sat_or_known_status, check_z3_or_skip, run_z3_file, solve_with_z3,
+    solve_with_z3_file, z3_oracle,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SolverOutcome {
@@ -48,9 +50,52 @@ impl SolverOutcome {
 }
 
 pub(crate) fn workspace_path(relative: impl AsRef<Path>) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let relative = relative.as_ref();
+    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join(relative)
+        .join(relative);
+    if local.exists() {
+        return local;
+    }
+    // A git WORKTREE does not contain the gitignored corpora, so every
+    // corpus-reading test in a worktree resolves to a path that does not exist
+    // and skip-passes. That has now cost this workspace two attribution rounds
+    // (see `corpus_skip_allowed`) and, separately, let a worktree agent report
+    // a false-UNSAT guard as passing when it checked nothing.
+    //
+    // A worktree's `.git` is a file pointing into the main checkout, so git can
+    // name the real repository: `--git-common-dir` is `<main>/.git`, whose
+    // parent is the checkout that does hold the corpus. Falling back to it
+    // makes a worktree see the same benchmarks as the main tree, with no
+    // environment variable to remember and nothing to configure.
+    if let Some(main) = git_common_checkout() {
+        let shared = main.join(relative);
+        if shared.exists() {
+            return shared;
+        }
+    }
+    local
+}
+
+/// The checkout that owns this repository's `.git`, which for a worktree is the
+/// main checkout rather than the worktree itself. `None` when git is
+/// unavailable or the answer is not a directory we can use.
+fn git_common_checkout() -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(dir)
+    };
+    dir.parent().map(Path::to_path_buf)
 }
 
 /// Whether an optional corpus file may be silently skipped.
@@ -80,121 +125,6 @@ pub(crate) fn corpus_skip_allowed(path: &Path) -> bool {
         path.display()
     );
     true
-}
-
-pub(crate) fn check_z3_or_skip() -> bool {
-    let available = *Z3_AVAILABLE.get_or_init(|| {
-        ProcessCommand::new("z3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    });
-    if available {
-        return true;
-    }
-
-    Z3_SKIP_LOGGED.call_once(|| {
-        eprintln!("Z3 not found in PATH; skipping differential SMT benchmark tests");
-    });
-    false
-}
-
-pub(crate) fn run_z3_file(path: &Path, timeout_secs: u64) -> Result<SolverOutcome> {
-    let mut child = ProcessCommand::new("z3")
-        .arg(format!("-T:{timeout_secs}"))
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn z3 for {}", path.display()))?;
-
-    let timeout = Duration::from_secs(timeout_secs + 2);
-    let mut timed_out = false;
-    let status = match child
-        .wait_timeout(timeout)
-        .context("failed waiting for z3")?
-    {
-        Some(status) => status,
-        None => {
-            timed_out = true;
-            let _ = child.kill();
-            child.wait().context("failed to kill timed out z3")?
-        }
-    };
-
-    let mut stdout = Vec::new();
-    if let Some(mut handle) = child.stdout.take() {
-        handle
-            .read_to_end(&mut stdout)
-            .context("failed reading z3 stdout")?;
-    }
-
-    let mut stderr = Vec::new();
-    if let Some(mut handle) = child.stderr.take() {
-        handle
-            .read_to_end(&mut stderr)
-            .context("failed reading z3 stderr")?;
-    }
-
-    if timed_out {
-        return Ok(SolverOutcome::Timeout);
-    }
-
-    let first_line = String::from_utf8_lossy(&stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if first_line.is_empty() && !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Ok(SolverOutcome::Error(stderr));
-    }
-
-    Ok(SolverOutcome::from_output_line(&first_line))
-}
-
-pub(crate) fn assert_z3_sat_or_known_status(
-    path: &Path,
-    timeout_secs: u64,
-    label: &str,
-) -> Result<()> {
-    if !check_z3_or_skip() {
-        return Ok(());
-    }
-
-    match run_z3_file(path, timeout_secs)? {
-        SolverOutcome::Sat => Ok(()),
-        SolverOutcome::Unknown | SolverOutcome::Timeout => {
-            let status = smtlib_status(path)?;
-            if status == Some(SolverOutcome::Sat) {
-                eprintln!(
-                    "Z3 did not confirm SAT for {label} within {timeout_secs}s; trusting SMT-LIB :status sat"
-                );
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "Z3 did not confirm SAT for {label}; SMT-LIB status was {status:?}"
-                ))
-            }
-        }
-        other => Err(anyhow!(
-            "Z3 disagrees on expected SAT for {label}: got {other:?}"
-        )),
-    }
-}
-
-fn smtlib_status(path: &Path) -> Result<Option<SolverOutcome>> {
-    let smt = fs::read_to_string(path)
-        .with_context(|| format!("failed reading benchmark {}", path.display()))?;
-    let commands = parse(&smt).with_context(|| format!("failed parsing {}", path.display()))?;
-    Ok(commands.into_iter().find_map(|command| match command {
-        SmtCommand::SetInfo(keyword, value) if keyword == ":status" => {
-            Some(SolverOutcome::from_output_line(&value.to_string()))
-        }
-        _ => None,
-    }))
 }
 
 pub(crate) fn run_executor_smt_with_timeout(smt: &str, timeout_secs: u64) -> Result<SolverOutcome> {
@@ -404,6 +334,31 @@ pub(crate) fn solve_authored_vec(smt: &str) -> Vec<String> {
 /// Like [`solve_authored_vec`], with the CLI's fail-closed self-check mode.
 pub(crate) fn solve_authored_selfcheck_vec(smt: &str) -> Vec<String> {
     solve_authored_with_self_check(smt, true)
+}
+
+/// Execute through the authored boundary and also report the SAT-evidence
+/// signal (`model_check_gate.result`) the last `check-sat` published.
+///
+/// The signal names WHICH independent authority confirmed a `sat`, so a test
+/// that only inspects output lines cannot tell a confirmed verdict from one
+/// that shipped with no confirmation recorded at all.
+pub(crate) fn solve_authored_vec_with_gate_result(smt: &str) -> (Vec<String>, Option<String>) {
+    let commands = parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"));
+    let mut exec = Executor::new();
+    let mut output = Vec::new();
+    for command in &commands {
+        if let Some(line) = exec
+            .execute_authored(command)
+            .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
+        {
+            output.push(line);
+        }
+    }
+    let gate = exec
+        .statistics()
+        .get_string("model_check_gate.result")
+        .map(str::to_owned);
+    (output, gate)
 }
 
 fn solve_authored_with_self_check(smt: &str, self_check: bool) -> Vec<String> {

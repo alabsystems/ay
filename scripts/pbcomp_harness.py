@@ -58,7 +58,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -70,6 +69,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import (  # noqa: E402
     guarded_popen,
+    wait_guarded_exit,
     plan_solver_resources,
     warn_concurrent_build,
 )
@@ -485,13 +485,6 @@ def stream_reached_limit(stream, limit_bytes: int) -> bool:
     return stream.tell() >= limit_bytes
 
 
-def kill_process_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def executable_provenance(command: str) -> dict:
     """Canonical identity (resolved path + size + sha256) of an executable.
 
@@ -746,16 +739,15 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
             # RSS enforcement is mandatory even when the environment is set.
             try:
                 try:
-                    rc = proc.wait(timeout=timeout_s + grace_s)
+                    wait_guarded_exit(proc, guard, timeout_s + grace_s)
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    kill_process_group(proc)
-                    rc = proc.wait()
             finally:
-                kill_process_group(proc)
-                if proc.poll() is None:
-                    proc.wait()
-                guard.stop()
+                # Completion keeps the monitor armed through authenticated
+                # whole-group quiescence, then kills/reaps remaining descendants.
+                # A lost monitor must raise before any answer is interpreted.
+                guard.finish(proc, "pbcomp_harness.py")
+            rc = proc.returncode
             # A complete v-line can be large. Parse and verify under the same
             # lock, then discard it before another worker builds a model in
             # parent memory.
@@ -848,16 +840,12 @@ def check_solution_via_ay(checker_bin_path, inst_path, best_obj, v_tokens,
                 timed_out = False
                 try:
                     try:
-                        returncode = proc.wait(timeout=120)
+                        wait_guarded_exit(proc, guard, 120)
                     except subprocess.TimeoutExpired:
                         timed_out = True
-                        kill_process_group(proc)
-                        returncode = proc.wait()
                 finally:
-                    kill_process_group(proc)
-                    if proc.poll() is None:
-                        proc.wait()
-                    guard.stop()
+                    guard.finish(proc, "pbcomp_harness.py[verify]")
+                returncode = proc.returncode
                 if guard.breached:
                     return False, None, "ay verify exceeded memory envelope"
                 if timed_out:

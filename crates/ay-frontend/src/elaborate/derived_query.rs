@@ -105,7 +105,13 @@ impl Context {
         let Context {
             context_identity: _,
             source_revision: _,
+            // The invalidation above retires transient canonical entries;
+            // they supply no roots and cannot survive arena compaction.
+            shared_surface: _,
+            elaboration_revision: _,
             terms: _,
+            preserve_sequence_power: _,
+            alpha_quantifier_index: _,
             symbols,
             internal_symbols: _,
             overloaded_symbols,
@@ -132,8 +138,14 @@ impl Context {
             fun_defs: _,
             adopted_macro_interps,
             adopted_macro_declaration_ids: _,
+            // Head names and `:named` labels, no `TermId`.
+            adopted_definition_labels: _,
+            definitional_check_sat_pass_entered: _,
+            definitional_pass,
             #[cfg(test)]
                 fail_next_assert_after_macro_adoption: _,
+            #[cfg(test)]
+                fail_next_check_sat_reelaboration: _,
             recursive_fun_names: _,
             datatypes: _,
             live_datatype_carriers: _,
@@ -151,16 +163,21 @@ impl Context {
             dt_field_surface,
             logic: _,
             strict_logic_compliance: _,
+            enforce_logic_sort_signatures: _,
+            z3_mode: _,
+            z3_smtlib2_compliant_at_start: _,
             logic_set_by_command: _,
             assertions,
             assertion_finite_set_metadata,
             // Parsed assertion ASTs carry no `TermId`.
             assertions_parsed: _,
-            retain_parsed_assertions: _,
+            parsed_retention: _,
             objectives,
             objective_finite_set_metadata,
             soft_constraints,
             soft_finite_set_metadata,
+            // Objective order bookkeeping: indices and group labels, no `TermId`.
+            objective_sequence: _,
             scopes,
             scope_commands_used: _,
             check_sat_commands: _,
@@ -169,6 +186,13 @@ impl Context {
             numeral_as_real: _,
             int_real_coercions: _,
             named_terms,
+            // Live only while an authored assertion elaborates; a derived
+            // query is built outside that window.
+            label_journal: _,
+            label_failure: _,
+            unbound_label_names: _,
+            skip_journal: _,
+            shared_scratch: _,
             // Retained as authored SPELLINGS precisely so no `TermId` is stored.
             z3_debug_exprs: _,
             fun_expansion_depth: _,
@@ -184,9 +208,19 @@ impl Context {
             multivar_lambda_curry_allowed: _,
             uses_multiset: _,
             uses_set: _,
+            // Booleans; no `TermId` to relabel.
+            uses_map: _,
+            map_domain_unfaithful: _,
+            map_constant_array: _,
+            // Sort names; no `TermId` to relabel.
+            map_sort_synonyms: _,
+            map_empty_values,
             special_relations: _,
             lenient_sort_coercions: _,
             finite_set_typing_mode: _,
+            // Live only inside one assertion's strict-shape scan, and holds
+            // public sorts, never `TermId`s.
+            strict_shape_scan: _,
         } = self;
 
         let mut ok = true;
@@ -206,8 +240,39 @@ impl Context {
         for term in nullary_ctor_terms.values_mut() {
             ok &= f(term);
         }
+        // Keyed by sort, so only the values are ids.
+        for term in map_empty_values.values_mut() {
+            ok &= f(term);
+        }
         for (_, body) in adopted_macro_interps.values_mut() {
             ok &= f(body);
+        }
+        // The executor drains the retry snapshot before any solve, so no
+        // derived context should carry one; if one ever does, it is relabelled
+        // like the live stack it mirrors rather than left stale.
+        // The pass's parsed copy and budget hold parser ASTs and a count, no
+        // `TermId`; only its fallback chain carries terms.
+        for snapshot in definitional_pass.retry.iter_mut() {
+            for term in snapshot.assertions.iter_mut() {
+                ok &= f(term);
+            }
+            for term in snapshot.named_terms.values_mut() {
+                ok &= f(term);
+            }
+            for authored in snapshot.authored_assertions.iter_mut() {
+                match authored {
+                    AuthoredAssertion::Concrete { term, .. } => ok &= f(term),
+                    AuthoredAssertion::Schematic(_) => {}
+                }
+            }
+            for meta in snapshot.assertion_finite_set_metadata.iter_mut() {
+                ok &= walk_public_assertion_metadata(meta, f);
+            }
+            // The macro definition is a parser AST (no `TermId`); its
+            // elaborated interpretation body is a term.
+            for record in snapshot.macros.iter_mut() {
+                ok &= f(&mut record.interp.1);
+            }
         }
         for authored in authored_assertions.iter_mut() {
             match authored {
@@ -290,6 +355,7 @@ fn walk_scope_frame(scope: &mut ScopeFrame, f: &mut dyn FnMut(&mut TermId) -> bo
         assertion_count: _,
         objective_count: _,
         soft_constraint_count: _,
+        objective_sequence_count: _,
         // Scope bookkeeping records NAMES to un-bind on pop, not terms.
         named_terms: _,
         datatypes: _,

@@ -247,11 +247,20 @@ fn open_cell_samples(
         return Ok(vec![BigRational::zero()]);
     }
     let m = cauchy_bound(s)?;
-    let mut out = Vec::with_capacity(locs.len() + 1);
+    let cells = locs
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "internal: open-cell count overflow".to_string())?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(cells)
+        .map_err(|_| "open-cell sample allocation failed".to_string())?;
     out.push(-m.clone());
     for w in locs.windows(2) {
-        let hi_prev = w[0].hi();
-        let lo_next = w[1].lo();
+        let [prev, next] = w else {
+            return Err("internal: root window is not a pair".to_string());
+        };
+        let hi_prev = prev.hi();
+        let lo_next = next.lo();
         // Both are non-roots of S in the open gap between the two roots; any
         // rational in [hi_prev, lo_next] lies strictly between the roots.
         let sample = if hi_prev <= lo_next {
@@ -468,13 +477,17 @@ fn to_univariate(poly: &MPoly, var: TermId) -> Result<UPoly, String> {
     let mut coeffs = vec![BigRational::zero(); deg + 1];
     for (m, c) in &poly.terms {
         match m.as_slice() {
-            [] => coeffs[0] += c,
-            [(v, k)] if *v == var => {
-                let k = *k as usize;
-                if k >= coeffs.len() {
+            [] => {
+                let Some(constant) = coeffs.get_mut(0) else {
                     return Err("internal: univariate degree mismatch".to_string());
-                }
-                coeffs[k] += c;
+                };
+                *constant += c;
+            }
+            [(v, k)] if *v == var => {
+                let Some(coeff) = coeffs.get_mut(*k as usize) else {
+                    return Err("internal: univariate degree mismatch".to_string());
+                };
+                *coeff += c;
             }
             _ => return Err("monomial mentions a foreign variable".to_string()),
         }
@@ -525,11 +538,19 @@ fn poly_mul(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, St
         return Ok(Vec::new());
     }
     let bits = max_coeff_bits(a.iter()).max(max_coeff_bits(b.iter()));
-    meter.charge_ops(bit_scaled((a.len() * b.len()) as u64, bits))?;
-    let mut out = vec![BigRational::zero(); a.len() + b.len() - 1];
+    meter.charge_ops(bit_scaled(a.len().saturating_mul(b.len()) as u64, bits))?;
+    let len = a
+        .len()
+        .checked_add(b.len())
+        .and_then(|n| n.checked_sub(1))
+        .ok_or_else(|| "internal: product degree overflow".to_string())?;
+    let mut out = vec![BigRational::zero(); len];
     for (i, ca) in a.iter().enumerate() {
         for (j, cb) in b.iter().enumerate() {
-            out[i + j] += ca * cb;
+            let Some(slot) = i.checked_add(j).and_then(|k| out.get_mut(k)) else {
+                return Err("internal: product coefficient out of range".to_string());
+            };
+            *slot += ca * cb;
         }
     }
     poly_trim(&mut out);
@@ -537,11 +558,13 @@ fn poly_mul(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, St
 }
 
 fn poly_derivative(p: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
-    meter.charge_ops(p.len() as u64 + 1)?;
-    if p.len() <= 1 {
+    meter.charge_ops((p.len() as u64).saturating_add(1))?;
+    let Some(len) = p.len().checked_sub(1).filter(|&len| len > 0) else {
         return Ok(Vec::new());
-    }
-    let mut out = Vec::with_capacity(p.len() - 1);
+    };
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| "derivative allocation failed".to_string())?;
     for (i, c) in p.iter().enumerate().skip(1) {
         out.push(c * BigRational::from_integer(BigInt::from(i)));
     }
@@ -568,12 +591,16 @@ fn poly_rem(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, St
         // Euclidean remainder coefficients grow step over step; charge each
         // elimination row by the widths actually being multiplied so crafted
         // inputs trip the budget instead of grinding.
-        let bits = super::nra_poly::rat_bits(&factor) + super::nra_poly::rat_bits(lb);
-        meter.charge_ops(bit_scaled(db as u64 + 2, bits))?;
+        let bits = super::nra_poly::rat_bits(&factor).saturating_add(super::nra_poly::rat_bits(lb));
+        meter.charge_ops(bit_scaled((db as u64).saturating_add(2), bits))?;
         let shift = dr - db;
-        for i in 0..=db {
-            let delta = &factor * &b[i];
-            r[shift + i] -= delta;
+        // `b` has exactly `db + 1` coefficients.
+        for (i, bi) in b.iter().enumerate() {
+            let delta = &factor * bi;
+            let Some(slot) = shift.checked_add(i).and_then(|k| r.get_mut(k)) else {
+                return Err("internal: remainder coefficient out of range".to_string());
+            };
+            *slot -= delta;
         }
         poly_trim(&mut r);
     }
@@ -593,7 +620,10 @@ fn poly_div_exact(p: &UPoly, d: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPo
         Some(dp) => dp,
     };
     let mut r = p.clone();
-    let mut q = vec![BigRational::zero(); dp - dd + 1];
+    let q_len = (dp - dd)
+        .checked_add(1)
+        .ok_or_else(|| "internal: quotient degree overflow".to_string())?;
+    let mut q = vec![BigRational::zero(); q_len];
     while let Some(dr) = poly_deg(&r) {
         if dr < dd {
             break;
@@ -602,13 +632,17 @@ fn poly_div_exact(p: &UPoly, d: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPo
             .last()
             .map(|lr| lr / ld)
             .ok_or_else(|| "internal: empty remainder".to_string())?;
-        let bits = super::nra_poly::rat_bits(&factor) + super::nra_poly::rat_bits(ld);
-        meter.charge_ops(bit_scaled(dd as u64 + 2, bits))?;
+        let bits = super::nra_poly::rat_bits(&factor).saturating_add(super::nra_poly::rat_bits(ld));
+        meter.charge_ops(bit_scaled((dd as u64).saturating_add(2), bits))?;
         let shift = dr - dd;
         q[shift] = factor.clone();
-        for i in 0..=dd {
-            let delta = &factor * &d[i];
-            r[shift + i] -= delta;
+        // `d` has exactly `dd + 1` coefficients.
+        for (i, di) in d.iter().enumerate() {
+            let delta = &factor * di;
+            let Some(slot) = shift.checked_add(i).and_then(|k| r.get_mut(k)) else {
+                return Err("internal: remainder coefficient out of range".to_string());
+            };
+            *slot -= delta;
         }
         poly_trim(&mut r);
     }
@@ -709,8 +743,9 @@ fn sturm_chain(s: &UPoly, meter: &mut WorkMeter<'_>) -> Result<Vec<UPoly>, Strin
     let mut chain = vec![s0, s1];
     let mut bits: u64 = 0;
     loop {
-        let n = chain.len();
-        let (prev, cur) = (&chain[n - 2], &chain[n - 1]);
+        let [.., prev, cur] = chain.as_slice() else {
+            return Err("internal: sturm chain shorter than two".to_string());
+        };
         if poly_is_zero(cur) {
             return Err("sturm chain degenerated (input not square-free)".to_string());
         }
@@ -722,7 +757,7 @@ fn sturm_chain(s: &UPoly, meter: &mut WorkMeter<'_>) -> Result<Vec<UPoly>, Strin
             return Err("sturm chain degenerated (input not square-free)".to_string());
         }
         let next = content_normalize(&poly_neg(&r), meter)?;
-        bits += poly_bits(&next);
+        bits = bits.saturating_add(poly_bits(&next));
         if bits > MAX_STURM_CHAIN_BITS {
             return Err("sturm chain coefficient budget exceeded".to_string());
         }
@@ -732,7 +767,9 @@ fn sturm_chain(s: &UPoly, meter: &mut WorkMeter<'_>) -> Result<Vec<UPoly>, Strin
 }
 
 fn poly_bits(p: &UPoly) -> u64 {
-    p.iter().map(|c| c.numer().bits() + c.denom().bits()).sum()
+    p.iter().fold(0u64, |total, c| {
+        total.saturating_add(c.numer().bits().saturating_add(c.denom().bits()))
+    })
 }
 
 /// Number of sign variations of the chain at `x`, zeros skipped. Only valid
@@ -752,7 +789,9 @@ fn sign_variations(
         let pos = v.is_positive();
         if let Some(prev) = last {
             if prev != pos {
-                count += 1;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| "internal: sign variation count overflow".to_string())?;
             }
         }
         last = Some(pos);
@@ -764,12 +803,12 @@ fn sign_variations(
 /// polynomial satisfies `|x| < M` STRICTLY, so `±M` are safe non-root
 /// counting points.
 fn cauchy_bound(p: &UPoly) -> Result<BigRational, String> {
-    let lead = p
-        .last()
-        .filter(|c| !c.is_zero())
+    let (lead, rest) = p
+        .split_last()
+        .filter(|(c, _)| !c.is_zero())
         .ok_or_else(|| "cauchy bound of zero polynomial".to_string())?;
     let mut max = BigRational::zero();
-    for c in &p[..p.len() - 1] {
+    for c in rest {
         let ratio = (c / lead).abs();
         if ratio > max {
             max = ratio;

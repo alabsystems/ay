@@ -10,6 +10,9 @@ use ay_core::TermId;
 use super::{checked_datatype_root_augmentation, EvalValue, Model};
 use crate::executor::Executor;
 
+#[cfg(test)]
+mod tests;
+
 /// Authenticated roots and carrier candidates for completion phases 3, 5, and
 /// 6. Owned augmentations are retained only when the corresponding bounded
 /// producer succeeds; otherwise `roots` falls back to the caller's slice.

@@ -145,57 +145,13 @@ fn write_problem_and_proof(label: &str, problem: &str, proof: &str) -> (PathBuf,
     (problem_path, proof_path)
 }
 
-/// Run Carcara on an Alethe proof and assert it validates.
-/// Panics with diagnostic info if Carcara rejects the proof.
+/// Run Carcara on an Alethe proof and assert it is externally VERIFIED:
+/// the trust-free runner's literal `valid`, never an exit-0 `holey`.
 fn verify_alethe_with_carcara(carcara: &Path, label: &str, problem: &str, proof: &str) {
     assert!(
-        run_carcara(carcara, label, problem, proof),
-        "carcara rejected Alethe proof ({label})"
+        run_carcara_trust_free(carcara, label, problem, proof),
+        "carcara did not verify Alethe proof ({label}): only `valid` is verification"
     );
-}
-
-/// Run Carcara on an Alethe proof. Returns `true` if the proof validates,
-/// `false` if Carcara rejects it (with diagnostic output to stderr).
-#[cfg(test)]
-fn run_carcara(carcara: &Path, label: &str, problem: &str, proof: &str) -> bool {
-    let (problem_path, proof_path) = write_problem_and_proof(label, problem, proof);
-
-    // --allowed-rules trust: AY uses `trust` for theory lemmas that haven't
-    // been fully reconstructed (BV bit-blast, arrays, strings). Carcara treats
-    // these as unchecked holes but still validates all other proof structure.
-    let output = std::process::Command::new(carcara)
-        .arg("check")
-        .arg("--expand-let-bindings")
-        .args(["--allowed-rules", "trust", "--"])
-        .arg(&proof_path)
-        .arg(&problem_path)
-        .output()
-        .expect("run carcara check");
-
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let keep_artifacts = keep_alethe_artifacts() || !output.status.success();
-    if keep_artifacts {
-        eprintln!(
-            "Preserving Alethe artifacts ({label}): smt2={} alethe={}",
-            problem_path.display(),
-            proof_path.display()
-        );
-    } else {
-        let _ = std::fs::remove_file(&problem_path);
-        let _ = std::fs::remove_file(&proof_path);
-    }
-
-    if !output.status.success() {
-        eprintln!(
-            "carcara REJECTED ({label}): status={:?} stderr={}",
-            output.status.code(),
-            stderr.trim()
-        );
-        return false;
-    }
-
-    true
 }
 
 #[test]
@@ -220,54 +176,131 @@ fn test_carcara_external_unsat_smoke_corpus() {
 }
 
 // ============================================================================
-// Trust-free Alethe verification (no --allowed-rules trust)
+// Carcara verdicts — no allowance, ever
 // ============================================================================
+//
+// There is deliberately NO runner here that passes `--allowed-rules trust` (or
+// `-i`) or reads Carcara's exit status alone. Pinned Carcara exits 0 on a
+// `holey` document: under `--allowed-rules trust` a `trust` step is a hole,
+// and a `hole` step is one even without the flag. Measured with carcara 1.1.0
+// [git 9a352ee]: a proof refuting the SATISFIABLE `(assert (> x 0))` through
+// `(step t1 (cl (not (> x 0))) :rule trust)` exits 0 and prints `holey` under
+// that flag, and the same proof with `:rule hole` does so with no flag at all.
+// An exit-0 runner therefore "verified" a false refutation. Only the literal
+// `valid` is external verification; `holey` must be asserted as exactly that.
 
-/// Run Carcara WITHOUT `--allowed-rules trust`. Returns `true` if the proof
-/// is fully verified with no trust holes.
+/// Pinned Carcara's one-word verdict on stdout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarcaraVerdict {
+    /// Every step re-derived. The only verdict that is external verification.
+    Valid,
+    /// Every step re-derived EXCEPT disclosed `hole` steps. Never verification.
+    /// With no allowance a `trust` step is an unknown rule, hence `Invalid`.
+    Holey,
+    /// Refused, or no exact verdict (a crash, a non-zero exit, extra output).
+    /// Never a stand-in for "not evidence": a pair resting on an `evaluate`
+    /// step pinned Carcara misjudges, or read with a rebound or captured
+    /// variable, fails the test before the checker runs
+    /// (`refuse_pinned_carcara_misjudgments`), so a refusal-direction
+    /// assertion cannot pass on it.
+    Invalid,
+}
+
+/// Run pinned Carcara with NO allowance and return its exact verdict. A pair
+/// on which that verdict is not evidence (`ay_core::pinned_carcara`) fails the
+/// test first, before the checker runs.
+///
+/// The verdict is the one in AY's canonical invocation,
+/// `carcara check -- PROOF PROBLEM`, the same as `exact_carcara_verdict`'s.
+/// This runner used to pass `--expand-let-bindings`, which only changes the
+/// verdict when a document or its problem spells a `let`, and there it
+/// contradicts the certificate: it refuses the `:rule let` step AY eliminates
+/// a problem `let` with (`carcara_surface=without-let-expansion`), and it
+/// accepts an `assume` that matches a `let` premise only after expansion,
+/// which AY discloses as `foreign_assumes=yes`. Measured with carcara 1.1.0
+/// (git 9a352ee) on `QF_BV_extract_concat/ext_con_004_001_0016`: plain
+/// `valid`, under the flag `checking failed on step 't0.l' with rule 'let'`.
+///
+/// The old invocation stays as a second check: a `valid` document that prints
+/// no `:rule let` step must be `valid` under `--expand-let-bindings` too, as
+/// `carcara_surface=supported` promises. A failure is an invocation-dependent
+/// step the certificate does not disclose.
 #[cfg(test)]
-fn run_carcara_trust_free(carcara: &Path, label: &str, problem: &str, proof: &str) -> bool {
+fn carcara_verdict_without_allowances(
+    carcara: &Path,
+    label: &str,
+    problem: &str,
+    proof: &str,
+) -> CarcaraVerdict {
+    refuse_pinned_carcara_misjudgments(label, problem, proof);
     let (problem_path, proof_path) = write_problem_and_proof(label, problem, proof);
 
-    let output = std::process::Command::new(carcara)
-        .arg("check")
-        .arg("--expand-let-bindings")
-        .arg("--")
-        .arg(&proof_path)
-        .arg(&problem_path)
-        .output()
-        .expect("run carcara check (trust-free)");
+    let run = |flags: &[&str]| {
+        std::process::Command::new(carcara)
+            .arg("check")
+            .args(flags)
+            .arg("--")
+            .arg(&proof_path)
+            .arg(&problem_path)
+            .output()
+            .expect("run carcara check (no allowance)")
+    };
+    let output = run(&[]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let valid = trust_free_carcara_verdict_is_valid(output.status.success(), &stdout);
-    let keep_artifacts = keep_alethe_artifacts() || !valid;
-    if keep_artifacts {
+    let verdict = carcara_stdout_verdict(output.status.success(), &stdout);
+    if verdict == CarcaraVerdict::Valid && !proof.contains(":rule let") {
+        let expanding = run(&["--expand-let-bindings"]);
+        let expanding_stdout = String::from_utf8_lossy(&expanding.stdout);
+        assert_eq!(
+            carcara_stdout_verdict(expanding.status.success(), &expanding_stdout),
+            CarcaraVerdict::Valid,
+            "{label}: `valid` in `carcara check -- PROOF PROBLEM` but not under \
+             `--expand-let-bindings`, and the document prints no `:rule let` step: \
+             smt2={} alethe={} stdout={} stderr={}",
+            problem_path.display(),
+            proof_path.display(),
+            expanding_stdout.trim(),
+            String::from_utf8_lossy(&expanding.stderr).trim()
+        );
+    }
+    if keep_alethe_artifacts() || verdict != CarcaraVerdict::Valid {
         eprintln!(
-            "Preserving Alethe artifacts ({label} trust-free): smt2={} alethe={}",
+            "Preserving Alethe artifacts ({label}, carcara {verdict:?}): smt2={} alethe={}",
             problem_path.display(),
             proof_path.display()
+        );
+        eprintln!(
+            "carcara {verdict:?} ({label}): status={:?} stdout={} stderr={}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
         );
     } else {
         let _ = std::fs::remove_file(&problem_path);
         let _ = std::fs::remove_file(&proof_path);
     }
+    verdict
+}
 
-    if !valid {
-        eprintln!(
-            "carcara REJECTED trust-free ({label}): status={:?} stdout={} stderr={}",
-            output.status.code(),
-            stdout.trim(),
-            stderr.trim()
-        );
-        return false;
+/// Run Carcara with NO allowance. Returns `true` only for the literal `valid`:
+/// the proof is fully verified, with no `trust` and no `hole` step.
+#[cfg(test)]
+fn run_carcara_trust_free(carcara: &Path, label: &str, problem: &str, proof: &str) -> bool {
+    carcara_verdict_without_allowances(carcara, label, problem, proof) == CarcaraVerdict::Valid
+}
+
+fn carcara_stdout_verdict(status_success: bool, stdout: &str) -> CarcaraVerdict {
+    match (status_success, stdout.trim()) {
+        (true, "valid") => CarcaraVerdict::Valid,
+        (true, "holey") => CarcaraVerdict::Holey,
+        _ => CarcaraVerdict::Invalid,
     }
-
-    true
 }
 
 fn trust_free_carcara_verdict_is_valid(status_success: bool, stdout: &str) -> bool {
-    status_success && stdout.trim() == "valid"
+    carcara_stdout_verdict(status_success, stdout) == CarcaraVerdict::Valid
 }
 
 #[test]
@@ -275,6 +308,56 @@ fn trust_free_carcara_verdict_rejects_holey_success() {
     assert!(trust_free_carcara_verdict_is_valid(true, "valid\n"));
     assert!(!trust_free_carcara_verdict_is_valid(true, "holey\n"));
     assert!(!trust_free_carcara_verdict_is_valid(false, "valid\n"));
+    assert_eq!(
+        carcara_stdout_verdict(true, "holey\n"),
+        CarcaraVerdict::Holey
+    );
+    assert_eq!(
+        carcara_stdout_verdict(false, "holey\n"),
+        CarcaraVerdict::Invalid
+    );
+    assert_eq!(
+        carcara_stdout_verdict(false, "invalid\n"),
+        CarcaraVerdict::Invalid
+    );
+    assert_eq!(carcara_stdout_verdict(true, ""), CarcaraVerdict::Invalid);
+    assert_eq!(
+        carcara_stdout_verdict(true, "valid\nholey\n"),
+        CarcaraVerdict::Invalid
+    );
+}
+
+/// The defect the permissive runner had, pinned against the REAL checker: a
+/// "refutation" of a SATISFIABLE problem through one unchecked step is never
+/// verification. Pinned Carcara exits 0 on it (so an exit-code runner passed
+/// it); the no-allowance verdict is `Invalid` for a `trust` step and `Holey`
+/// for a `hole` step, and neither is `Valid`.
+#[test]
+#[timeout(60_000)]
+fn carcara_unchecked_refutation_of_a_satisfiable_problem_is_never_verified() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let problem = "(set-logic QF_LIA)\n(declare-const x Int)\n(assert (> x 0))\n(check-sat)\n";
+    for (rule, expected) in [
+        ("trust", CarcaraVerdict::Invalid),
+        ("hole", CarcaraVerdict::Holey),
+    ] {
+        let label = format!("unchecked_{rule}_refutes_sat");
+        let proof = format!(
+            "(assume h1 (> x 0))\n(step t1 (cl (not (> x 0))) :rule {rule})\n\
+             (step t2 (cl) :rule resolution :premises (h1 t1))\n"
+        );
+        assert_eq!(
+            carcara_verdict_without_allowances(&carcara, &label, problem, &proof),
+            expected,
+            "{label}"
+        );
+        assert!(
+            !run_carcara_trust_free(&carcara, &label, problem, &proof),
+            "{label}"
+        );
+    }
 }
 
 /// QF_BOOL proofs should be fully verifiable without trust steps.

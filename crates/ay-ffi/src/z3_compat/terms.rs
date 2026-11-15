@@ -15,10 +15,12 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 use num_bigint::BigInt;
 
+use super::arithmetic::coerce_mixed_int_real;
+use super::provenance::StructuralRefusal;
 use super::{
     activate_finite_set_sat_gate, cache_func_decl_with_symbol, ffi_count_within_limit,
-    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr, ffi_read_bounded_text,
-    ffi_try_declare_function, finite_set_engine_public_sort,
+    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_mk, ffi_guard_produced, ffi_guard_ptr,
+    ffi_read_bounded_text, ffi_try_declare_function, finite_set_engine_public_sort,
     has_unsupported_finite_set_datatype_embedding, public_ast_sort, record_ast_sort,
     require_term_ast, require_term_asts, sort_mentions_finite_set, term_to_ast, DatatypeOp,
     SymbolKey, Z3_ast, Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG,
@@ -135,7 +137,7 @@ pub unsafe extern "C" fn Z3_mk_const(c: Z3_context, s: Z3_symbol, ty: Z3_sort) -
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_const", |ctx| {
             // Fail-close reserved-namespace capture — see `reserved_name_error`
             // (a `!ay.*` constant can alias an internal engine witness).
             if matches!(&symbol, SymbolKey::String(_)) {
@@ -145,43 +147,56 @@ pub unsafe extern "C" fn Z3_mk_const(c: Z3_context, s: Z3_symbol, ty: Z3_sort) -
                     return 0;
                 }
             }
-            let cache_key = (symbol.clone(), sort.clone());
-            if let Some(term) = ctx.ffi_const_cache.get(&cache_key).copied() {
-                let ast = term_to_ast(ctx, term);
-                record_ast_sort(ctx, ast, sort.clone());
-                return ast;
-            }
-            if has_unsupported_finite_set_datatype_embedding(ctx, &sort) {
-                ctx.last_error = Z3_SORT_ERROR;
-                ctx.error_msg = Some(
-                    "Z3_mk_const: a datatype containing FiniteSet fields cannot be lowered \
-                     without changing the datatype identity"
-                        .to_string(),
-                );
+            let Some(term) = ffi_api_constant(ctx, &symbol, &sort) else {
                 return 0;
-            }
-            let identity = format!("!ay.z3-const!{}", ctx.next_ffi_fresh_id);
-            ctx.next_ffi_fresh_id += 1;
-            let needs_finite_set_gate = sort_mentions_finite_set(ctx, &sort);
-            let engine_sort = finite_set_engine_public_sort(ctx, &sort);
-            let term =
-                ctx.solver
-                    .declare_const_with_fresh_identity(&display_name, &identity, engine_sort);
-            if needs_finite_set_gate {
-                activate_finite_set_sat_gate(ctx, term, "Z3_mk_const");
-                ctx.finite_set_decl_signatures
-                    .insert(identity.clone(), (Vec::new(), sort.clone()));
-            }
-            ctx.ffi_const_cache.insert(cache_key, term);
-            ctx.ffi_const_metadata
-                .insert(term, (identity.clone(), symbol.clone()));
-            ctx.ffi_const_terms_by_identity.insert(identity, term);
-            ctx.ffi_used_decl_names.insert(display_name.clone());
+            };
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, sort);
-            ast
+            record_ast_sort(ctx, ast, sort)
         })
     }
+}
+
+/// The context's constant for `symbol` at `sort`, declaring it on first use
+/// (the core of [`Z3_mk_const`]). z3 identifies a constant by its name and
+/// sort, so every request for the same pair returns the same term. `None`
+/// (with the context error set) when the sort cannot be lowered.
+pub(crate) fn ffi_api_constant(
+    ctx: &mut super::Z3Context,
+    symbol: &SymbolKey,
+    sort: &Sort,
+) -> Option<Term> {
+    let display_name = symbol.display_name();
+    let cache_key = (symbol.clone(), sort.clone());
+    if let Some(term) = ctx.ffi_const_cache.get(&cache_key).copied() {
+        return Some(term);
+    }
+    if has_unsupported_finite_set_datatype_embedding(ctx, sort) {
+        ctx.last_error = Z3_SORT_ERROR;
+        ctx.error_msg = Some(
+            "Z3_mk_const: a datatype containing FiniteSet fields cannot be lowered \
+             without changing the datatype identity"
+                .to_string(),
+        );
+        return None;
+    }
+    let identity = format!("!ay.z3-const!{}", ctx.next_ffi_fresh_id);
+    ctx.next_ffi_fresh_id += 1;
+    let needs_finite_set_gate = sort_mentions_finite_set(ctx, sort);
+    let engine_sort = finite_set_engine_public_sort(ctx, sort);
+    let term = ctx
+        .solver
+        .declare_const_with_fresh_identity(&display_name, &identity, engine_sort);
+    if needs_finite_set_gate {
+        activate_finite_set_sat_gate(ctx, term, "Z3_mk_const");
+        ctx.finite_set_decl_signatures
+            .insert(identity.clone(), (Vec::new(), sort.clone()));
+    }
+    ctx.ffi_const_cache.insert(cache_key, term);
+    ctx.ffi_const_metadata
+        .insert(term, (identity.clone(), symbol.clone()));
+    ctx.ffi_const_terms_by_identity.insert(identity, term);
+    ctx.ffi_used_decl_names.insert(display_name);
+    Some(term)
 }
 
 /// Create a fresh constant with a unique name.
@@ -217,7 +232,7 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fresh_const", |ctx| {
             let pfx = match &pfx {
                 Ok(pfx) => pfx,
                 Err(error) => {
@@ -266,8 +281,7 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
                 .insert(term, (identity.clone(), symbol));
             ctx.ffi_const_terms_by_identity.insert(identity, term);
             let ast = term_to_ast(ctx, term);
-            record_ast_sort(ctx, ast, sort);
-            ast
+            record_ast_sort(ctx, ast, sort)
         })
     }
 }
@@ -300,7 +314,7 @@ pub unsafe extern "C" fn Z3_mk_app(
     // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
     // `.decl`/`.dt_op` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
-    let (decl, dt_op) = unsafe { ((*d).decl.clone(), (*d).dt_op.clone()) };
+    let (decl, dt_op, value) = unsafe { ((*d).decl.clone(), (*d).dt_op.clone(), (*d).value) };
     let arg_asts: Vec<_> = (0..num_args as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `args` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
@@ -313,7 +327,13 @@ pub unsafe extern "C" fn Z3_mk_app(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_app", |ctx| {
+            if ctx.proof_declarations.contains_key(&d) {
+                ctx.last_error = super::Z3_INVALID_USAGE;
+                ctx.error_msg =
+                    Some("Z3_mk_app: proof applications require a native derivation".to_owned());
+                return 0;
+            }
             let Some(term_args) = require_term_asts(ctx, &arg_asts, "Z3_mk_app") else {
                 return 0;
             };
@@ -355,6 +375,13 @@ pub unsafe extern "C" fn Z3_mk_app(
                         return 0;
                     }
                 }
+            }
+            // The decl of a literal (`Z3_get_app_decl` on a value) applied to
+            // no arguments is that literal, as in z3.
+            if let Some(value) = value {
+                let ast = term_to_ast(ctx, value.term);
+                let ast = record_ast_sort(ctx, ast, public_range);
+                return ast;
             }
             // Datatype constructor/recognizer/accessor applications route through
             // AY's verified datatype builders so the resulting term matches the
@@ -415,7 +442,7 @@ pub unsafe extern "C" fn Z3_mk_app(
                                 match ctx.solver.try_apply(&inst, &term_args) {
                                     Ok(t) => {
                                         let ast = term_to_ast(ctx, t);
-                                        record_ast_sort(ctx, ast, range);
+                                        let ast = record_ast_sort(ctx, ast, range);
                                         return ast;
                                     }
                                     Err(e) => {
@@ -432,17 +459,55 @@ pub unsafe extern "C" fn Z3_mk_app(
                             }
                         }
                     }
-                    ctx.solver.apply(&decl, &term_args)
+                    if term_args.is_empty() {
+                        if let Some(ast) = declared_const_for_decl(ctx, &decl, &public_range) {
+                            return ast;
+                        }
+                    }
+                    match ctx.solver.try_apply(&decl, &term_args) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            ctx.last_error = Z3_INVALID_ARG;
+                            ctx.error_msg = Some(format!("Z3_mk_app: {e}"));
+                            return 0;
+                        }
+                    }
                 }
             };
             let ast = term_to_ast(ctx, result);
             if sort_mentions_finite_set(ctx, &public_range) {
                 activate_finite_set_sat_gate(ctx, result, "Z3_mk_app result");
             }
-            record_ast_sort(ctx, ast, public_range);
-            ast
+            record_ast_sort(ctx, ast, public_range)
         })
     }
+}
+
+/// The constant a nullary decl names when the decl came back from AY rather
+/// than from `Z3_mk_func_decl`: `Z3_get_app_decl` of a `Z3_mk_const` constant
+/// and `Z3_model_get_const_decl` both name the constant by its internal
+/// identity (`!ay.z3-const!N`, a reserved name no user declaration can take).
+/// Applying such a decl is the constant itself, as in z3 (z3py's model
+/// enumeration builds `d() != m[d]`); before this, `Z3_mk_app` panicked on it
+/// as an unregistered declaration. `Some(0)` with `Z3_SORT_ERROR` when the
+/// decl's range is not the constant's sort.
+fn declared_const_for_decl(
+    ctx: &mut super::Z3Context,
+    decl: &ay_dpll::api::FuncDecl,
+    range: &Sort,
+) -> Option<Z3_ast> {
+    let term = ctx.ffi_const_terms_by_identity.get(decl.name()).copied()?;
+    let ast = term_to_ast(ctx, term);
+    let sort = public_ast_sort(ctx, ast, term);
+    if sort != *range {
+        ctx.last_error = Z3_SORT_ERROR;
+        ctx.error_msg = Some(format!(
+            "Z3_mk_app: declaration '{}' ranges over {range}, but that constant has sort {sort}",
+            decl.name()
+        ));
+        return Some(0);
+    }
+    Some(ast)
 }
 
 // ---- Polymorphic declaration instantiation (#poly-inst) ----
@@ -564,11 +629,10 @@ pub unsafe extern "C" fn Z3_mk_true(c: Z3_context) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_true", |ctx| {
             let t = ctx.solver.bool_const(true);
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -584,11 +648,10 @@ pub unsafe extern "C" fn Z3_mk_false(c: Z3_context) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_false", |ctx| {
             let t = ctx.solver.bool_const(false);
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -603,31 +666,53 @@ pub unsafe extern "C" fn Z3_mk_eq(c: Z3_context, l: Z3_ast, r: Z3_ast) -> Z3_ast
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
-    unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let l_ast = l;
-            let r_ast = r;
-            let Some(l) = require_term_ast(ctx, l_ast, "Z3_mk_eq", "left operand") else {
-                return 0;
-            };
-            let Some(r) = require_term_ast(ctx, r_ast, "Z3_mk_eq", "right operand") else {
-                return 0;
-            };
-            let left_sort = public_ast_sort(ctx, l_ast, l);
-            let right_sort = public_ast_sort(ctx, r_ast, r);
-            if left_sort != right_sort {
-                ctx.last_error = Z3_SORT_ERROR;
-                ctx.error_msg = Some(format!(
-                    "Z3_mk_eq: public operand sorts differ ({left_sort} vs {right_sort})"
-                ));
-                return 0;
-            }
-            let t = ctx.solver.eq(l, r);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
-        })
-    }
+    unsafe { ffi_guard_mk(c, "Z3_mk_eq", |ctx| mk_equality(ctx, "Z3_mk_eq", l, r)) }
+}
+
+/// `(= l r)` for `Z3_mk_eq` and `Z3_mk_iff` (z3's iff is `=`, also over
+/// non-Bool operands: `Z3_mk_iff(x:Int, y:Int)` is `(= x y)`, measured). The
+/// public operand sorts must agree, except Int beside Real, which z3 coerces
+/// to `(= (to_real x) y)` (measured; T5 P0.2 Q4). Every refusal is
+/// `Z3_SORT_ERROR`, never a panic.
+fn mk_equality(ctx: &mut super::Z3Context, entry: &str, l_ast: Z3_ast, r_ast: Z3_ast) -> Z3_ast {
+    let Some(l) = require_term_ast(ctx, l_ast, entry, "left operand") else {
+        return 0;
+    };
+    let Some(r) = require_term_ast(ctx, r_ast, entry, "right operand") else {
+        return 0;
+    };
+    let left_sort = public_ast_sort(ctx, l_ast, l);
+    let right_sort = public_ast_sort(ctx, r_ast, r);
+    let (l, r) = match coerce_mixed_int_real(
+        ctx,
+        entry,
+        &[l, r],
+        &[left_sort.clone(), right_sort.clone()],
+    ) {
+        Some(Ok(lifted)) => match lifted.as_slice() {
+            [l, r] => (*l, *r),
+            _ => return 0,
+        },
+        Some(Err(())) => return 0,
+        None if left_sort != right_sort => {
+            ctx.last_error = Z3_SORT_ERROR;
+            ctx.error_msg = Some(format!(
+                "{entry}: public operand sorts differ ({left_sort} vs {right_sort})"
+            ));
+            return 0;
+        }
+        None => (l, r),
+    };
+    let t = match ctx.solver.try_eq(l, r) {
+        Ok(t) => t,
+        Err(e) => {
+            ctx.last_error = Z3_SORT_ERROR;
+            ctx.error_msg = Some(format!("{entry}: {e}"));
+            return 0;
+        }
+    };
+    let a = term_to_ast(ctx, t);
+    record_ast_sort(ctx, a, Sort::Bool)
 }
 
 /// Create a distinct constraint.
@@ -660,28 +745,43 @@ pub unsafe extern "C" fn Z3_mk_distinct(
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_distinct", |ctx| {
             let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_distinct") else {
                 return 0;
             };
-            let Some((&first_ast, &first_term)) = arg_asts.first().zip(terms.first()) else {
-                return 0;
+            let sorts: Vec<Sort> = arg_asts
+                .iter()
+                .zip(&terms)
+                .map(|(&arg_ast, &term)| public_ast_sort(ctx, arg_ast, term))
+                .collect();
+            // Int beside Real: z3's `(distinct (to_real x) y)` (measured).
+            let terms = match coerce_mixed_int_real(ctx, "Z3_mk_distinct", &terms, &sorts) {
+                Some(Ok(lifted)) => lifted,
+                Some(Err(())) => return 0,
+                None => {
+                    let Some(expected) = sorts.first() else {
+                        return 0;
+                    };
+                    if let Some(actual) = sorts.iter().find(|sort| *sort != expected) {
+                        ctx.last_error = Z3_SORT_ERROR;
+                        ctx.error_msg = Some(format!(
+                            "Z3_mk_distinct: public operand sorts differ ({expected} vs {actual})"
+                        ));
+                        return 0;
+                    }
+                    terms
+                }
             };
-            let expected = public_ast_sort(ctx, first_ast, first_term);
-            for (&arg_ast, &term) in arg_asts.iter().zip(&terms).skip(1) {
-                let actual = public_ast_sort(ctx, arg_ast, term);
-                if actual != expected {
+            let t = match ctx.solver.try_distinct(&terms) {
+                Ok(t) => t,
+                Err(e) => {
                     ctx.last_error = Z3_SORT_ERROR;
-                    ctx.error_msg = Some(format!(
-                        "Z3_mk_distinct: public operand sorts differ ({expected} vs {actual})"
-                    ));
+                    ctx.error_msg = Some(format!("Z3_mk_distinct: {e}"));
                     return 0;
                 }
-            }
-            let t = ctx.solver.distinct(&terms);
+            };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -697,14 +797,16 @@ pub unsafe extern "C" fn Z3_mk_not(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_not", |ctx| {
             let Some(a) = require_term_ast(ctx, a, "Z3_mk_not", "operand") else {
                 return 0;
             };
-            let t = ctx.solver.not(a);
+            let t = match ctx.solver.try_not(a) {
+                Ok(t) => t,
+                Err(e) => return bool_operand_error(ctx, "Z3_mk_not", &e),
+            };
             let r = term_to_ast(ctx, t);
-            record_ast_sort(ctx, r, Sort::Bool);
-            r
+            record_ast_sort(ctx, r, Sort::Bool)
         })
     }
 }
@@ -720,7 +822,7 @@ pub unsafe extern "C" fn Z3_mk_ite(c: Z3_context, t1: Z3_ast, t2: Z3_ast, t3: Z3
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_ite", |ctx| {
             let condition_ast = t1;
             let then_ast = t2;
             let else_ast = t3;
@@ -740,17 +842,38 @@ pub unsafe extern "C" fn Z3_mk_ite(c: Z3_context, t1: Z3_ast, t2: Z3_ast, t3: Z3
             }
             let then_sort = public_ast_sort(ctx, then_ast, t2_term);
             let else_sort = public_ast_sort(ctx, else_ast, t3);
-            if then_sort != else_sort {
-                ctx.last_error = Z3_SORT_ERROR;
-                ctx.error_msg = Some(format!(
-                    "Z3_mk_ite: branch public sorts differ ({then_sort} vs {else_sort})"
-                ));
-                return 0;
-            }
-            let t = ctx.solver.ite(t1, t2_term, t3);
+            // Int beside Real: z3's `(ite c (to_real x) y)`, of sort Real
+            // (measured).
+            let (t2_term, t3, result_sort) = match coerce_mixed_int_real(
+                ctx,
+                "Z3_mk_ite",
+                &[t2_term, t3],
+                &[then_sort.clone(), else_sort.clone()],
+            ) {
+                Some(Ok(lifted)) => match lifted.as_slice() {
+                    [t2, t3] => (*t2, *t3, Sort::Real),
+                    _ => return 0,
+                },
+                Some(Err(())) => return 0,
+                None if then_sort != else_sort => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some(format!(
+                        "Z3_mk_ite: branch public sorts differ ({then_sort} vs {else_sort})"
+                    ));
+                    return 0;
+                }
+                None => (t2_term, t3, then_sort),
+            };
+            let t = match ctx.solver.try_ite(t1, t2_term, t3) {
+                Ok(t) => t,
+                Err(e) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    ctx.error_msg = Some(format!("Z3_mk_ite: {e}"));
+                    return 0;
+                }
+            };
             let r = term_to_ast(ctx, t);
-            record_ast_sort(ctx, r, then_sort);
-            r
+            record_ast_sort(ctx, r, result_sort)
         })
     }
 }
@@ -765,20 +888,21 @@ pub unsafe extern "C" fn Z3_mk_iff(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z3_
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
-    unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_iff", "left operand") else {
-                return 0;
-            };
-            let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_iff", "right operand") else {
-                return 0;
-            };
-            let t = ctx.solver.eq(t1, t2);
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
-        })
-    }
+    unsafe { ffi_guard_mk(c, "Z3_mk_iff", |ctx| mk_equality(ctx, "Z3_mk_iff", t1, t2)) }
+}
+
+/// Report a non-Bool operand of a Boolean connective as z3 does
+/// (`Z3_SORT_ERROR`; measured on libz3 5.1.0, `q4_bool_pins.py`: "Sort
+/// mismatch at argument #1 for function (declare-fun not (Bool) Bool)").
+/// AY's builders used to panic on it ("panic in FFI").
+fn bool_operand_error(
+    ctx: &mut super::Z3Context,
+    entry: &str,
+    error: &ay_dpll::api::SolverError,
+) -> Z3_ast {
+    ctx.last_error = Z3_SORT_ERROR;
+    ctx.error_msg = Some(format!("{entry}: {error}"));
+    0
 }
 
 /// Create boolean implication.
@@ -792,17 +916,19 @@ pub unsafe extern "C" fn Z3_mk_implies(c: Z3_context, t1: Z3_ast, t2: Z3_ast) ->
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_implies", |ctx| {
             let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_implies", "antecedent") else {
                 return 0;
             };
             let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_implies", "consequent") else {
                 return 0;
             };
-            let t = ctx.solver.implies(t1, t2);
+            let t = match ctx.solver.try_implies(t1, t2) {
+                Ok(t) => t,
+                Err(e) => return bool_operand_error(ctx, "Z3_mk_implies", &e),
+            };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -818,17 +944,19 @@ pub unsafe extern "C" fn Z3_mk_xor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z3_
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_xor", |ctx| {
             let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_xor", "left operand") else {
                 return 0;
             };
             let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_xor", "right operand") else {
                 return 0;
             };
-            let t = ctx.solver.xor(t1, t2);
+            let t = match ctx.solver.try_xor(t1, t2) {
+                Ok(t) => t,
+                Err(e) => return bool_operand_error(ctx, "Z3_mk_xor", &e),
+            };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -861,7 +989,7 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_and", |ctx| {
             let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_and") else {
                 return 0;
             };
@@ -869,10 +997,12 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
                 let t = ctx.solver.bool_const(true);
                 return term_to_ast(ctx, t);
             }
-            let t = ctx.solver.and_many(&terms);
+            let t = match ctx.solver.try_and_many(&terms) {
+                Ok(t) => t,
+                Err(e) => return bool_operand_error(ctx, "Z3_mk_and", &e),
+            };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -905,7 +1035,7 @@ pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_or", |ctx| {
             let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_or") else {
                 return 0;
             };
@@ -913,10 +1043,12 @@ pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const 
                 let t = ctx.solver.bool_const(false);
                 return term_to_ast(ctx, t);
             }
-            let t = ctx.solver.or_many(&terms);
+            let t = match ctx.solver.try_or_many(&terms) {
+                Ok(t) => t,
+                Err(e) => return bool_operand_error(ctx, "Z3_mk_or", &e),
+            };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -951,20 +1083,20 @@ unsafe fn mk_pb_ast(
     // handles the null case internally and catches any unwinding panic so it cannot
     // cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "mk_pb_ast", |ctx| {
             let Some(terms) = require_term_asts(ctx, &term_asts, "pseudo-Boolean constructor")
             else {
                 return 0;
             };
             let zero = ctx.solver.int_const(0);
-            let summands: Vec<Term> = terms
-                .iter()
-                .zip(&coeffs)
-                .map(|(&t, coeff)| {
-                    let coeff_term = ctx.solver.int_const_bigint(coeff);
-                    ctx.solver.ite(t, coeff_term, zero)
-                })
-                .collect();
+            let mut summands: Vec<Term> = Vec::with_capacity(terms.len());
+            for (&t, coeff) in terms.iter().zip(&coeffs) {
+                let coeff_term = ctx.solver.int_const_bigint(coeff);
+                match ctx.solver.try_ite(t, coeff_term, zero) {
+                    Ok(summand) => summands.push(summand),
+                    Err(e) => return bool_operand_error(ctx, "pseudo-Boolean constructor", &e),
+                }
+            }
             let sum = if summands.is_empty() {
                 ctx.solver.int_const(0)
             } else {
@@ -977,8 +1109,7 @@ unsafe fn mk_pb_ast(
                 PbCmp::Eq => ctx.solver.eq(sum, bound),
             };
             let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::Bool);
-            a
+            record_ast_sort(ctx, a, Sort::Bool)
         })
     }
 }
@@ -1196,15 +1327,11 @@ pub unsafe extern "C" fn Z3_mk_pbeq(
 
 /// Simplify an AST, returning a logically equivalent simplified term.
 ///
-/// Rebuilds `a` bottom-up through AY's simplifying constructors, re-applying
-/// AY's eager constant-folding and identity simplification to every node. AY
-/// already folds eagerly during term construction, so a term assembled entirely
-/// through the `Z3_mk_*` API is a fixpoint of this rewrite (the result is the
-/// same interned term). The value-add is for terms whose constant/identity
-/// subexpressions were not folded at build time (e.g. parser-built terms, or
-/// terms a consumer assembled through a path that bypassed the folding builders):
-/// `(+ 2 3)` -> `5`, `(and true p)` -> `p`, `(+ x 0)` -> `x`,
-/// `(ite true a b)` -> `a`, `(select (store a i v) i)` -> `v`, etc.
+/// Runs the shared counted word and fact-free expression rewrites under one
+/// retained operation. Supported closed expressions are evaluated independently;
+/// unsupported expressions remain unchanged. Global word-expansion settings
+/// apply here as they do in the owned tactic path. Resource refusal returns null
+/// with an exception instead of publishing a partial rewrite.
 ///
 /// The result is **logically equivalent** to `a`: every step is a
 /// semantics-preserving simplification, so `simplify(a)` denotes the same
@@ -1223,31 +1350,109 @@ pub unsafe extern "C" fn Z3_simplify(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // on this extern "C" function requires it to be a valid, non-aliased pointer
     // (or null). `ffi_guard_ast` handles the null case internally and catches any
     // unwinding panic so it cannot cross the FFI boundary.
-    unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(target) = require_term_ast(ctx, a, "Z3_simplify", "input") else {
-                return 0;
-            };
-            let result = ctx.solver.simplify(target);
-            term_to_ast(ctx, result)
-        })
-    }
+    unsafe { ffi_guard_ast(c, |ctx| simplify_owned(ctx, a, ptr::null_mut())) }
 }
 
-/// Simplify an AST with simplifier parameters; equivalent to [`Z3_simplify`].
-///
-/// AY's simplifier is parameter-free (it applies the same eager folding used at
-/// term construction), so the `Z3_params` argument is accepted for API
-/// compatibility and ignored. The result is logically equivalent to `a`, the
-/// same as [`Z3_simplify`].
+/// Simplify an AST with supported local settings under the same original
+/// source/counter/output operation as plain simplification. Local settings
+/// override actual globals; unsupported settings explicitly refuse.
 ///
 /// # Safety
 /// `c` must be a valid context pointer. `a` must be a valid `Z3_ast` produced by
-/// this context (or null/0, returned unchanged). `p` is ignored and may be null.
+/// this context (or null/0, returned unchanged). `p` may be null for defaults.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_simplify_ex(c: Z3_context, a: Z3_ast, _p: Z3_params) -> Z3_ast {
-    // SAFETY: forwards to Z3_simplify under the same caller contract on `c`/`a`.
-    unsafe { Z3_simplify(c, a) }
+pub unsafe extern "C" fn Z3_simplify_ex(c: Z3_context, a: Z3_ast, p: Z3_params) -> Z3_ast {
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: caller supplies this live non-aliased context; the guard catches
+    // panics and the owned body authenticates input/parameter handles.
+    unsafe { ffi_guard_ast(c, |ctx| simplify_owned(ctx, a, p)) }
+}
+
+fn simplify_owned(ctx: &mut super::Z3Context, a: Z3_ast, p: Z3_params) -> Z3_ast {
+    let operation = match ctx.solver.begin_tactic_operation_for_check() {
+        Ok(operation) => operation,
+        Err(error) => {
+            ctx.last_error = super::Z3_EXCEPTION;
+            ctx.error_msg = Some(error.to_string());
+            return 0;
+        }
+    };
+    let result = (|| -> Result<Z3_ast, ay_dpll::api::SolverError> {
+        let target = require_term_ast(ctx, a, "Z3_simplify", "input").ok_or_else(|| {
+            ay_dpll::api::SolverError::TacticFailed("invalid simplifier input".into())
+        })?;
+        let mut parameters = ay_dpll::api::SimplifyParameters::default();
+        if !p.is_null() {
+            super::tactics::visit_parameters(ctx, p, &operation, &mut |name, value| {
+                parameters.set(name, value).map_err(|e| e.to_string())
+            })
+            .map_err(ay_dpll::api::SolverError::TacticFailed)?;
+        }
+        let global = super::global_params::sequence_power_expansion(operation.admission())
+            .map_err(|e| ay_dpll::api::SolverError::TacticFailed(e.into()))?;
+        parameters = parameters.with_global_sequence_power(global);
+        parameters = parameters.with_global_polynomial(
+            super::global_params::polynomial_parameters(operation.admission())
+                .map_err(|e| ay_dpll::api::SolverError::TacticFailed(e.into()))?,
+        );
+        let value = ctx
+            .solver
+            .simplify_in_operation(&operation, target, parameters)?;
+        let owner = operation.admission();
+        // A source public sort can differ from its engine carrier (Char/FD/
+        // native sets). Keep the exact handle on identity; never reinterpret
+        // a changed carrier as a newly minted ordinary engine-sorted AST.
+        let output = if value == target {
+            a
+        } else {
+            if let Some(stated) = super::lookup_ast_sort(ctx, a) {
+                if !ctx
+                    .solver
+                    .term_has_sort_in_operation(&operation, value, stated)?
+                {
+                    return Err(ay_dpll::api::SolverError::TacticFailed(
+                        "changed aliased public sort is unsupported".into(),
+                    ));
+                }
+            }
+            let id = ctx
+                .pub_ast
+                .engine_node_owned(value, Some(owner))
+                .ok_or_else(|| {
+                    ay_dpll::api::SolverError::TacticFailed("simplifier public AST refused".into())
+                })?;
+            super::pub_id_to_ast(ctx, id)
+        };
+        owner
+            .admit(1, 0)
+            .map_err(|e| ay_dpll::api::SolverError::TacticFailed(e.to_string()))?;
+        if !matches!(ctx.solver.term_kind(value), ay_dpll::api::TermKind::Const) {
+            ctx.provenance
+                .mark_ambiguous_owned(value, owner)
+                .map_err(|e| ay_dpll::api::SolverError::TacticFailed(e.into()))?;
+        }
+        if !operation.validate(&ctx.solver) {
+            return Err(ay_dpll::api::SolverError::TacticFailed(
+                "simplifier publication source changed".into(),
+            ));
+        }
+        Ok(output)
+    })();
+    match result {
+        Ok(ast) => {
+            ctx.last_error = super::Z3_OK;
+            ast
+        }
+        Err(error) => {
+            let message = error.to_string();
+            operation.publish_failure(&mut ctx.solver, &error);
+            ctx.last_error = super::Z3_EXCEPTION;
+            ctx.error_msg = Some(message);
+            0
+        }
+    }
 }
 
 // ---- Substitution ----
@@ -1261,6 +1466,14 @@ pub unsafe extern "C" fn Z3_simplify_ex(c: Z3_context, a: Z3_ast, _p: Z3_params)
 /// `Z3_SORT_ERROR` and returns `a` unchanged.
 ///
 /// Guards: a null `from`/`to` array or `num_exprs == 0` returns `a` unchanged.
+/// Unless every `from[i]` is an uninterpreted constant, or `a` and every
+/// `from[i]` are stored exactly as the caller built them, sets
+/// `Z3_INVALID_ARG` and returns null: AY's construction-time rewrites would
+/// otherwise make the structural match differ from z3's (see `provenance.rs`).
+/// It is refused the same way when a `from`/`to` term mentions a variable the
+/// input binds, or the input contains a `let`: AY binds by name, so the
+/// substitution would rewrite bound occurrences or capture free ones
+/// (`provenance::check_binders`).
 ///
 /// # Safety
 /// `c` must be a valid context pointer. When `num_exprs > 0`, `from` and `to`
@@ -1326,7 +1539,39 @@ pub unsafe extern "C" fn Z3_substitute(
                     return a;
                 }
             }
+            if let Err(refusal) = super::provenance::check_substitution(ctx, target, &from_terms) {
+                let which = match refusal {
+                    StructuralRefusal::Input => "the input".to_string(),
+                    StructuralRefusal::Pattern(i) => format!("from[{i}]"),
+                };
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(format!(
+                    "Z3_substitute: {which} may not be the term the caller built. AY rewrites \
+                     terms at construction (Not(Not(p)) is stored as p, (x + 1) + 1 as x + 2, \
+                     x > y as y < x), and z3 substitutes by structure, so AY substitutes only \
+                     uninterpreted constants (Z3_mk_const) or terms it stores exactly as built; \
+                     refusing rather than returning a formula z3 would not"
+                ));
+                return 0;
+            }
+            if let Err(refusal) =
+                super::provenance::check_binders(ctx, target, &from_terms, &to_terms)
+            {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(super::provenance::binder_refusal_message(
+                    ctx,
+                    "Z3_substitute",
+                    refusal,
+                ));
+                return 0;
+            }
             let result = ctx.solver.substitute(target, &from_terms, &to_terms);
+            // AY rebuilt the changed nodes through its rewriting constructors;
+            // z3 rebuilt them as written. Unchanged input or an exact
+            // replacement is the same term in both.
+            if result != target && !to_terms.contains(&result) {
+                ctx.provenance.mark_ambiguous(result);
+            }
             term_to_ast(ctx, result)
         })
     }

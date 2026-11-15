@@ -245,7 +245,8 @@ fn research() {
     print_block(
         r#"Worked workflow: turn a surprising answer into a reproducible experiment
 
-  cargo build -p ay --features bench
+  targo --unverified build -p ay --features bench
+      (`cargo build -p ay --features bench` without the Trust toolchain)
 
   ay diagnose --reference z3 --json candidate.smt2 > diagnosis.json
 
@@ -255,7 +256,7 @@ fn research() {
     --clause-provenance \
     candidate.smt2
 
-  ay bench run MY-EVAL --reference-solver "$(command -v z3)" \
+  ay bench run MY-EVAL --reference-solver z3 \
     --output scorecard.json
 
 Bind every claim to AY/reference provenance, corpus hash/manifest, timeout,

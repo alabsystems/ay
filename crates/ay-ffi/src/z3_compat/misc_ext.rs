@@ -25,15 +25,14 @@ use std::io::{BufWriter, Write};
 use std::ptr;
 use std::sync::Mutex;
 
-use ay_dpll::api::{Sort, Term, TermKind};
-use ay_dpll::Executor;
+use ay_dpll::api::{FuncDecl, Sort, Term, TermKind};
 use ay_frontend::parse;
 
 use super::model_params::eval_term_under_model;
 use super::{
     apply_supported_params, cache_ast_vector, cache_string, checked_ast_to_term,
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_guard_const_ptr, ffi_guard_produced, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
     record_ast_sort, require_term_ast_or_return, require_term_asts_or_return, sort_handle_to_ast,
     term_to_ast, transfer_cross_context_ffi_metadata, ModelHandle, ParamDescr, ParamDescrsHandle,
@@ -118,10 +117,9 @@ pub unsafe extern "C" fn Z3_sort_to_ast(c: Z3_context, s: Z3_sort) -> Z3_ast {
 /// Convert an AST back to a func_decl (Z3's `Z3_to_func_decl`).
 ///
 /// A FUNC-DECL-AST handle (from `Z3_func_decl_to_ast`) decodes to the
-/// CANONICAL `Z3_func_decl` for that declaration — usable in `Z3_mk_app` etc.
-/// It may differ pointer-wise from the handle the ast was minted from (AY does
-/// not hash-cons `Z3_mk_func_decl`); `Z3_is_eq_func_decl` value-compares, and
-/// no z3py flow compares decl pointers raw. Anything else — including a TERM
+/// canonical `Z3_func_decl` for that declaration — usable in `Z3_mk_app` etc.
+/// Decl handles are hash-consed at mint, so this is the same pointer every
+/// presentation of the declaration yields. Anything else — including a TERM
 /// ast, where z3 performs an unchecked identity cast (UB we refuse to copy) —
 /// sets `Z3_INVALID_ARG` and returns null: a strictly-safer documented
 /// divergence.
@@ -222,7 +220,11 @@ pub unsafe extern "C" fn Z3_update_param_value(
                     ctx.error_msg = Some(format!("Z3_update_param_value: {e}"));
                     return;
                 }
-                apply_supported_params(&mut ctx.solver, &[(normalized.to_string(), v)]);
+                // A context default: each check applies it under its handle's
+                // own parameters (see `handle_params`).
+                let param = [(normalized.to_string(), v)];
+                apply_supported_params(&mut ctx.solver, &param);
+                ctx.default_params.record(&param);
                 ctx.clear_decision_check_artifacts();
                 ctx.last_error = Z3_OK;
                 ctx.error_msg = None;
@@ -318,7 +320,8 @@ pub unsafe extern "C" fn Z3_translate(source: Z3_context, a: Z3_ast, target: Z3_
             }
             let ast = term_to_ast(tgt, new_term);
             let sort = src.solver.term_sort(src_term);
-            record_ast_sort(tgt, ast, sort);
+            let ast = record_ast_sort(tgt, ast, sort);
+            super::provenance::mark_produced_term(tgt, new_term);
             tgt.last_error = Z3_OK;
             ast
         })
@@ -413,91 +416,125 @@ pub unsafe extern "C" fn Z3_add_rec_def(
                 return;
             }
             let name = decl.name().to_string();
-            let display_name = api_name.as_deref().unwrap_or(&name);
-            // BUILTIN-NAME GUARD (skeptic finding: '+' := '*' made 2+3==6 sat
-            // with an invalid model). AY represents builtin operators as
-            // `App(Symbol::Named("+"), ..)`, so BOTH the defining axiom
-            // (`∀x,y. x+y = body`) and the check-time expander would rewrite
-            // builtin semantics. Registering NOTHING and erroring honestly is
-            // the only sound option (z3 accepts these names because its decls
-            // are nominal objects; AY's are name-matched).
-            if ay_dpll::api::rec_def_name_conflates_with_builtin(display_name) {
+            let display_name = api_name.unwrap_or(name);
+            // Only a `Z3_mk_rec_func_decl` declaration takes a definition
+            // (libz3 5.1.0: `Z3_INVALID_ARG`, "function ... needs to be
+            // declared using rec_func_decl"); defining an uninterpreted
+            // function would rewrite every handle's use of it.
+            if !super::is_rec_func_decl(ctx, &decl) {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(format!(
-                    "Z3_add_rec_def: '{display_name}' is a builtin operator name in AY; a recursive \
-                     definition of it would rewrite builtin semantics and is rejected"
+                    "Z3_add_rec_def: function {display_name} needs to be declared using \
+                     rec_func_decl"
                 ));
                 return;
             }
-            // REDEFINITION GUARD (z3 parity: "function ... has already been
-            // given a definition"). Rejecting keeps the registry
-            // add-only, which is what makes live model handles' stale-eval
-            // protection (`ModelHandle::rec_def_count`) sound: a model can
-            // never outlive a definition CHANGE, only predate an addition.
-            if ctx.rec_fun_defs.contains_key(&name) || ctx.rec_def_axiom_index.contains_key(&name) {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some(format!(
-                    "Z3_add_rec_def: function '{name}' has already been given a definition"
-                ));
+            if let Err((code, message)) =
+                register_rec_def(ctx, &decl, &display_name, &arg_terms, body_term)
+            {
+                ctx.last_error = code;
+                ctx.error_msg = Some(message);
                 return;
             }
-            // lhs = f(args...)
-            let lhs = match ctx.solver.try_apply(&decl, &arg_terms) {
-                Ok(t) => t,
-                Err(e) => {
-                    ctx.last_error = Z3_EXCEPTION;
-                    ctx.error_msg = Some(format!("Z3_add_rec_def: {e}"));
-                    return;
-                }
-            };
-            // eq = (= (f args...) body)
-            let eq = match ctx.solver.try_eq(lhs, body_term) {
-                Ok(t) => t,
-                Err(e) => {
-                    ctx.last_error = Z3_EXCEPTION;
-                    ctx.error_msg = Some(format!("Z3_add_rec_def: {e}"));
-                    return;
-                }
-            };
-            // Universally close over the bound variables (if any).
-            let axiom = if arg_terms.is_empty() {
-                eq
-            } else {
-                match ctx.solver.try_forall(&arg_terms, eq) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        // Cannot build the quantified definition soundly (args are
-                        // not proper bound variables). Do NOT assert a free-var
-                        // formula — report honestly and assert nothing.
-                        ctx.last_error = Z3_INVALID_ARG;
-                        ctx.error_msg = Some(format!(
-                            "Z3_add_rec_def: cannot universally close definition ({e}); \
-                             arguments must be bound variables"
-                        ));
-                        return;
-                    }
-                }
-            };
-            // Register the definition for check-time expansion (P1.1). The
-            // builder computes the capture-relevant name sets; a body whose
-            // binders shadow a parameter is registered NON-expandable, so its
-            // uses are still detected at every solve site (residual mode:
-            // axiom-only, `sat` demoted) without ever being mis-substituted.
-            let def = ctx.solver.make_rec_fun_def(&arg_terms, body_term);
-            // First (and, per the redefinition guard above, ONLY) definition
-            // of this name: the registry and axiom list are add-only.
-            ctx.rec_def_axiom_index
-                .insert(name.clone(), ctx.global_definition_axioms.len());
-            ctx.global_definition_axioms.push(axiom);
-            ctx.rec_fun_defs.insert(name, def);
-            // A new definition changes every handle's semantic problem. Models,
-            // cores, reasons, proofs, bounds, and statistics copied before this
-            // point are no longer authoritative.
-            ctx.clear_decision_check_artifacts();
             ctx.last_error = Z3_OK;
             ctx.error_msg = None;
         });
     }
+}
+
+/// Register the recursive definition `decl(args) = body` on the context, as
+/// `Z3_add_rec_def` does: the definitional axiom and the check-time expander.
+/// A parsed `define-fun-rec` registers its definition here too (z3 adds a
+/// text's recursive definitions to the context's recursive-function plugin).
+/// `display_name` is the caller's name of `decl`.
+///
+/// # Errors
+///
+/// The error code and message, with nothing registered.
+pub(crate) fn register_rec_def(
+    ctx: &mut Z3Context,
+    decl: &FuncDecl,
+    display_name: &str,
+    arg_terms: &[Term],
+    body_term: Term,
+) -> Result<(), (c_uint, String)> {
+    let name = decl.name().to_string();
+    // BUILTIN-NAME GUARD (skeptic finding: '+' := '*' made 2+3==6 sat
+    // with an invalid model). AY represents builtin operators as
+    // `App(Symbol::Named("+"), ..)`, so BOTH the defining axiom
+    // (`∀x,y. x+y = body`) and the check-time expander would rewrite
+    // builtin semantics. Registering NOTHING and erroring honestly is
+    // the only sound option (z3 accepts these names because its decls
+    // are nominal objects; AY's are name-matched).
+    if ay_dpll::api::rec_def_name_conflates_with_builtin(display_name) {
+        return Err((
+            Z3_INVALID_ARG,
+            format!(
+                "Z3_add_rec_def: '{display_name}' is a builtin operator name in AY; a recursive \
+                 definition of it would rewrite builtin semantics and is rejected"
+            ),
+        ));
+    }
+    // REDEFINITION GUARD (z3 parity: "function ... has already been
+    // given a definition"). Rejecting keeps the registry
+    // add-only, which is what makes live model handles' stale-eval
+    // protection (`ModelHandle::rec_def_count`) sound: a model can
+    // never outlive a definition CHANGE, only predate an addition.
+    if ctx.rec_fun_defs.contains_key(&name) || ctx.rec_def_axiom_index.contains_key(&name) {
+        return Err((
+            Z3_INVALID_ARG,
+            format!(
+                "Z3_add_rec_def: function '{display_name}' has already been given a definition"
+            ),
+        ));
+    }
+    // lhs = f(args...)
+    let lhs = ctx
+        .solver
+        .try_apply(decl, arg_terms)
+        .map_err(|e| (Z3_EXCEPTION, format!("Z3_add_rec_def: {e}")))?;
+    // eq = (= (f args...) body)
+    let eq = ctx
+        .solver
+        .try_eq(lhs, body_term)
+        .map_err(|e| (Z3_EXCEPTION, format!("Z3_add_rec_def: {e}")))?;
+    // Universally close over the bound variables (if any).
+    let axiom = if arg_terms.is_empty() {
+        eq
+    } else {
+        // Cannot build the quantified definition soundly (args are not
+        // proper bound variables)? Do NOT assert a free-var formula —
+        // report honestly and assert nothing.
+        ctx.solver.try_forall(arg_terms, eq).map_err(|e| {
+            (
+                Z3_INVALID_ARG,
+                format!(
+                    "Z3_add_rec_def: cannot universally close definition ({e}); \
+                     arguments must be bound variables"
+                ),
+            )
+        })?
+    };
+    // Register the definition for check-time expansion (P1.1). The
+    // builder computes the capture-relevant name sets; a body whose
+    // binders shadow a parameter is registered NON-expandable, so its
+    // uses are still detected at every solve site (residual mode:
+    // axiom-only, `sat` demoted) without ever being mis-substituted.
+    let def = ctx.solver.make_rec_fun_def(arg_terms, body_term);
+    // First (and, per the redefinition guard above, ONLY) definition
+    // of this name: the registry and axiom list are add-only.
+    ctx.rec_def_axiom_index
+        .insert(name.clone(), ctx.global_definition_axioms.len());
+    ctx.global_definition_axioms.push(axiom);
+    if !ay_dpll::api::rec_def_name_conflates_with_builtin(display_name) {
+        ctx.rec_declared_names.insert(name.clone());
+    }
+    ctx.rec_fun_defs.insert(name, def);
+    // A new definition changes every handle's semantic problem. Models,
+    // cores, reasons, proofs, bounds, and statistics copied before this
+    // point are no longer authoritative.
+    ctx.clear_decision_check_artifacts();
+    Ok(())
 }
 
 // ============================================================================
@@ -848,7 +885,7 @@ pub unsafe extern "C" fn Z3_model_extrapolate(c: Z3_context, m: Z3_model, fml: Z
     // is a separate live allocation owned by the context arena, null-checked
     // below.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_produced(c, |ctx| {
             if m.is_null() || fml == 0 {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_model_extrapolate: null model or formula".to_string());
@@ -868,8 +905,7 @@ pub unsafe extern "C" fn Z3_model_extrapolate(c: Z3_context, m: Z3_model, fml: Z
                 ctx.solver.bool_const(false)
             };
             let ast = term_to_ast(ctx, result);
-            record_ast_sort(ctx, ast, Sort::Bool);
-            ast
+            record_ast_sort(ctx, ast, Sort::Bool)
         })
     }
 }
@@ -924,9 +960,10 @@ pub unsafe extern "C" fn Z3_apply_result_to_string(c: Z3_context, r: Z3_apply_re
                             "subgoal formula",
                             ptr::null()
                         );
-                        ctx.solver
-                            .format_term_checked(term)
-                            .unwrap_or_else(|| "?".to_string())
+                        match super::finite_field::format_public_term(ctx, term) {
+                            Some(text) => text,
+                            None => return ptr::null(),
+                        }
                     };
                     s.push_str("\n  ");
                     s.push_str(&rendered);
@@ -988,7 +1025,7 @@ pub unsafe extern "C" fn Z3_pattern_to_ast(c: Z3_context, p: Z3_pattern) -> Z3_a
                 // Multi-trigger: the real `(pattern t1 t2 ...)` grouping node.
                 let t = ctx.solver.pattern_term(&terms);
                 let ast = term_to_ast(ctx, t);
-                record_ast_sort(ctx, ast, Sort::Bool);
+                let ast = record_ast_sort(ctx, ast, Sort::Bool);
                 ctx.last_error = Z3_OK;
                 ast
             }
@@ -1024,10 +1061,10 @@ pub unsafe extern "C" fn Z3_pattern_to_string(c: Z3_context, p: Z3_pattern) -> Z
             let terms = slices.pop().unwrap_or_default();
             let mut s = String::from("(pattern");
             for &t in &terms {
-                let rendered = ctx
-                    .solver
-                    .format_term_checked(t)
-                    .unwrap_or_else(|| "?".to_string());
+                let rendered = match super::finite_field::format_public_term(ctx, t) {
+                    Some(text) => text,
+                    None => return ptr::null(),
+                };
                 s.push(' ');
                 s.push_str(&rendered);
             }
@@ -1056,13 +1093,60 @@ pub unsafe extern "C" fn Z3_simplify_get_help(c: Z3_context) -> Z3_string {
         ffi_guard_const_ptr(c, |ctx| {
             let help = "\
 Parameters honored by the AY simplifier:
+  som (bool)             sum-of-monomials Int/Real normalization
+  som_blowup (uint)      Cartesian expansion growth factor (default 10)
+  flat (bool)            flatten ring operations; false disables SOM
+  expand_power (bool)    expand positive powers up to max_degree
+  mul_to_power (bool)    compress repeated factors, unless expand_power
+  max_degree (uint)      maximum expanded power degree (default 64)
+  sort_sums (bool)       canonical monomial ordering
+  push_to_real (bool)    distribute integer-to-real coercion over rings
   elim_and (bool)         rewrite (and a b) as (not (or (not a) (not b)))
-  local_ctx (bool)        use local context simplification
-  som (bool)              put polynomials in sum-of-monomials form
-Other z3 simplify parameters are accepted for API compatibility but ignored;
-they never change the simplified term's meaning (equivalence is preserved).\n";
-            ctx.last_error = Z3_OK;
-            cache_string(ctx, help.to_string())
+  max_steps (uint)        native rewrite-step restriction
+  max_memory (uint)       native memory checkpoint restriction in MiB
+  max_power_expansion (uint) sequence expansion threshold, local over global
+  timeout (uint)          additional deadline from original request start
+Original owner controls always remain binding. Zero timeout disables only its
+local timer. Unknown or unimplemented settings refuse; ctrl_c=true is not
+installed. Wrong types for supported keys fall back as in the direct Z3 API.\n";
+            let result = (|| -> Result<Z3_string, String> {
+                let operation = ctx
+                    .solver
+                    .begin_tactic_operation()
+                    .map_err(|e| e.to_string())?;
+                let owner = operation.admission();
+                owner
+                    .admit(
+                        help.len().checked_mul(2).ok_or("help work overflow")?,
+                        help.len().checked_add(1).ok_or("help storage overflow")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                ay_core::term::reserve_counted(&mut ctx.string_cache, 1, owner)
+                    .map_err(|e| e.to_string())?;
+                if !operation.validate(&ctx.solver) {
+                    return Err("help source changed".into());
+                }
+                let mut text = String::new();
+                text.try_reserve_exact(help.len() + 1)
+                    .map_err(|_| "help allocation refused")?;
+                text.push_str(help);
+                let pointer = cache_string(ctx, text);
+                if pointer.is_null() || !operation.validate(&ctx.solver) {
+                    return Err("help publication refused".into());
+                }
+                Ok(pointer)
+            })();
+            match result {
+                Ok(value) => {
+                    ctx.last_error = Z3_OK;
+                    value
+                }
+                Err(error) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(error);
+                    ptr::null()
+                }
+            }
         })
     }
 }
@@ -1082,33 +1166,28 @@ pub unsafe extern "C" fn Z3_simplify_get_param_descrs(c: Z3_context) -> Z3_param
     // SAFETY: `ffi_guard_ptr` handles a null context and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let entries = vec![
-                ParamDescr {
-                    name: "elim_and".to_string(),
-                    kind: Z3_PK_BOOL,
-                    doc: "rewrite (and a b) as (not (or (not a) (not b)))".to_string(),
-                },
-                ParamDescr {
-                    name: "local_ctx".to_string(),
-                    kind: Z3_PK_BOOL,
-                    doc: "use local context simplification".to_string(),
-                },
-                ParamDescr {
-                    name: "som".to_string(),
-                    kind: Z3_PK_BOOL,
-                    doc: "put polynomials in sum-of-monomials form".to_string(),
-                },
-                ParamDescr {
-                    name: "sort_sums".to_string(),
-                    kind: Z3_PK_BOOL,
-                    doc: "sort the arguments of + application; accepted for compatibility"
-                        .to_string(),
-                },
-            ];
-            let handle = Box::into_raw(Box::new(ParamDescrsHandle { entries }));
-            ctx.param_descrs_cache.push(handle);
-            ctx.last_error = Z3_OK;
-            handle
+            let result = ctx
+                .solver
+                .begin_tactic_operation()
+                .map_err(|e| e.to_string())
+                .and_then(|operation| {
+                    super::tactics::parameter_descriptions(
+                        ctx,
+                        super::tactics::SIMPLIFIER_DESCRIPTIONS,
+                        &operation,
+                    )
+                });
+            match result {
+                Ok(handle) => {
+                    ctx.last_error = Z3_OK;
+                    handle
+                }
+                Err(error) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(error);
+                    ptr::null_mut()
+                }
+            }
         })
     }
 }
@@ -1199,7 +1278,9 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
             );
             // Real serialization of exactly these assertions (decls + asserts, no
             // script wrapper) — never fabricated.
-            let body = ctx.solver.assertions_sexpr(&all_terms);
+            let Some(body) = super::finite_field::format_public_assertions(ctx, &all_terms) else {
+                return ptr::null();
+            };
 
             let mut out = String::new();
             if !name.is_empty() {
@@ -1241,23 +1322,23 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
 /// State-control commands are rejected before execution. A late semantic error
 /// permanently fails the shared decision engine closed because declarations and
 /// options cannot yet be fully rolled back.
-/// The `sort_names`/`sorts` and `decl_names`/`decls` pre-declaration arrays are
-/// accepted for signature compatibility and ignored (all declarations must be in
-/// the file). A file-read failure sets `Z3_EXCEPTION` and returns an empty vector.
+/// The `sort_names`/`sorts` and `decl_names`/`decls` arrays name the caller's
+/// sorts and declarations for the text, as for `Z3_parse_smtlib2_string`. A
+/// file-read failure sets `Z3_EXCEPTION` and returns an empty vector.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `file_name`, when non-null, a valid C
-/// string; the array pointers are unused.
+/// string; each non-null array holds its count of handles of `c`.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_parse_smtlib2_file(
     c: Z3_context,
     file_name: Z3_string,
-    _num_sorts: c_uint,
-    _sort_names: *const Z3_symbol,
-    _sorts: *const Z3_sort,
-    _num_decls: c_uint,
-    _decl_names: *const Z3_symbol,
-    _decls: *const Z3_func_decl,
+    num_sorts: c_uint,
+    sort_names: *const Z3_symbol,
+    sorts: *const Z3_sort,
+    num_decls: c_uint,
+    decl_names: *const Z3_symbol,
+    decls: *const Z3_func_decl,
 ) -> Z3_ast_vector {
     // Decode the path outside the guard (raw deref).
     // SAFETY: `file_name`, when non-null, is a valid C string per the contract.
@@ -1279,9 +1360,28 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_file(
                     return cache_ast_vector(ctx, Vec::new());
                 }
             };
-            let terms =
-                super::solver::parse_solver_transaction(ctx, &content, "Z3_parse_smtlib2_file")
-                    .unwrap_or_default();
+            // The caller-named sorts and declarations bind as they do for
+            // `Z3_parse_smtlib2_string`.
+            // (The enclosing unsafe block covers it: the caller guarantees
+            // each array holds its count of handles of this context.)
+            let scope = super::solver::caller_parse_scope(
+                ctx, num_sorts, sort_names, sorts, num_decls, decl_names, decls,
+            );
+            let terms = match scope {
+                Ok(scope) => super::solver::parse_solver_transaction_scoped(
+                    ctx,
+                    &content,
+                    "Z3_parse_smtlib2_file",
+                    &scope,
+                )
+                .map(|content| content.assertions)
+                .unwrap_or_default(),
+                Err(message) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_parse_smtlib2_file: {message}"));
+                    Vec::new()
+                }
+            };
             let asts = terms
                 .into_iter()
                 .map(|term| term_to_ast(ctx, term))
@@ -1294,17 +1394,10 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_file(
 /// Parse and evaluate an SMT-LIB2 command sequence, returning the concatenated
 /// command output (Z3's `Z3_eval_smtlib2_string`).
 ///
-/// Parses `str` into commands and runs them through a fresh `ay_dpll::Executor`
-/// (the same engine the `ay` CLI drives), joining each command's output with
-/// newlines. Parse/execution errors set `Z3_EXCEPTION` and the return value is an
-/// `(error "...")` string.
-///
-/// DIVERGENCE: Z3 keeps the evaluation state across successive
-/// `Z3_eval_smtlib2_string` calls (each builds on the previous). AY runs each
-/// call on a FRESH executor, so state does NOT persist across calls — every call
-/// is self-contained. Results for a single self-contained script are exact; a
-/// multi-call script relying on carried-over declarations must pass them in each
-/// call. This is documented, not faked.
+/// Executes commands in the context-owned persistent SMT-LIB session, retaining
+/// declarations, options and assertion scopes across calls. Malformed commands
+/// produce diagnostics while later commands continue, as in Z3's command parser.
+/// The ordinary C solver handles retain their separate assertion state.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `str`, when non-null, a valid C string.
@@ -1319,47 +1412,34 @@ pub unsafe extern "C" fn Z3_eval_smtlib2_string(c: Z3_context, str: Z3_string) -
         // contract; the parser helper enforces the larger explicit source cap.
         unsafe { ffi_read_bounded_parser_text(str) }.ok()
     };
-    // SAFETY: `ffi_guard_const_ptr` handles a null context and catches panics.
-    unsafe {
-        ffi_guard_const_ptr(c, |ctx| {
-            let Some(input) = input else {
+    let Some(input) = input else {
+        // SAFETY: guard authenticates the context and catches panics.
+        return unsafe {
+            ffi_guard_const_ptr(c, |ctx| {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg =
                     Some("Z3_eval_smtlib2_string: null/invalid input string".to_string());
-                return cache_string(ctx, "(error \"null input\")".to_string());
-            };
-            // Fail-close reserved `map[...]` symbol capture before the text
-            // reaches the core parser/executor (where a quoted `|map[f]|`
-            // declaration silently acquires internal array-map semantics — a
-            // measured wrong-verdict channel). See `smtlib2_reserved_error`.
-            if let Some(msg) = super::smtlib2_reserved_error(&input) {
+                cache_string(ctx, "(error \"null input\")".to_string())
+            })
+        };
+    };
+    // Fail-close reserved `map[...]` symbol capture before the text
+    // reaches the core parser/executor (where a quoted `|map[f]|`
+    // declaration silently acquires internal array-map semantics — a
+    // measured wrong-verdict channel). See `smtlib2_reserved_error`.
+    if let Some(msg) = super::smtlib2_reserved_error(&input) {
+        // SAFETY: this short guard ends before any command/client code.
+        return unsafe {
+            ffi_guard_const_ptr(c, |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(format!("Z3_eval_smtlib2_string: {msg}"));
-                return cache_string(ctx, format!("(error \"{msg}\")"));
-            }
-            match parse(&input) {
-                Ok(commands) => {
-                    let mut executor = Executor::new();
-                    match executor.execute_all(&commands) {
-                        Ok(outputs) => {
-                            ctx.last_error = Z3_OK;
-                            cache_string(ctx, outputs.join("\n"))
-                        }
-                        Err(e) => {
-                            ctx.last_error = Z3_EXCEPTION;
-                            ctx.error_msg = Some(format!("{e}"));
-                            cache_string(ctx, format!("(error \"{e}\")"))
-                        }
-                    }
-                }
-                Err(e) => {
-                    ctx.last_error = Z3_EXCEPTION;
-                    ctx.error_msg = Some(format!("{e}"));
-                    cache_string(ctx, format!("(error \"{e}\")"))
-                }
-            }
-        })
+                cache_string(ctx, format!("(error \"{msg}\")"))
+            })
+        };
     }
+    // SAFETY: c is caller-owned/live; evaluation releases its context borrows
+    // before invoking client callbacks. The owned input outlives execution.
+    unsafe { super::proof_callback::evaluate(c, &input) }
 }
 
 #[cfg(test)]

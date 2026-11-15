@@ -1321,6 +1321,19 @@ pub(super) const SBVA_INTERVAL: u64 = 10_000;
 /// reduction from 15K to 10K (#8099).
 pub(super) const SBVA_MAX_INTERVAL: u64 = 100_000;
 
+/// Density above which SBVA is refused (`--sat-sbva-max-density`, default 12
+/// since 2026-09-22). SBVA buries an extension variable per compressed group
+/// on the assumption BVE will remove it later, but the pass is skipped
+/// wherever BVE has eliminated anything (the #8397 guard), so it fires exactly
+/// on the dense band, where nothing removes its variables and every conflict
+/// then propagates through their definition clauses. Measured on the miss
+/// sample: QuasiGroup-4-12_c18 answers in 64.2-64.6 s against the tip's one
+/// answer in three at 297.05 s, and at 1500 s in 124.63 s against 654.00 s —
+/// a 5.2x speed-up, with nothing lost on either sample
+/// (competition/proof-posture-parity/l8-sbva-cap-verdict.tsv). A value above
+/// any real density opts out.
+pub(in crate::solver) const SBVA_DEFAULT_MAX_DENSITY: f64 = 12.0;
+
 /// SBVA effort as per-mille of search ticks since last SBVA call.
 /// Conservative: 30 per-mille = 3% (less than factor's 5%, since SBVA
 /// has higher per-candidate cost from subset intersection).
@@ -1430,6 +1443,12 @@ pub(super) const PREPROCESS_EXPENSIVE_MAX_CLAUSES: usize = 3_000_000;
 /// congruence is ~1.3s on shuffling-2 but AY's is ~2s — not competitive
 /// enough to justify the time spent.
 pub(super) const CONGRUENCE_MAX_CLAUSES: usize = 3_000_000;
+
+/// Active-clause gate for the in-search equivalence passes under
+/// `--sat-large-inproc` (no variable gate): covers the 2026 set's large
+/// circuits (cc42cc7a 14.1M clauses, 82cad197 13.0M) and still keeps the
+/// 35M-82M-clause giants out.
+pub(super) const LARGE_INPROC_MAX_CLAUSES: usize = 32_000_000;
 
 /// Raised congruence caps under --sat-no-subst-auto (#15, 2026-07-03). The
 /// clause-driven XOR extraction made congruence cheap enough (15ms/70da) to

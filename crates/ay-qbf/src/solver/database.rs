@@ -8,9 +8,10 @@ impl QbfSolver {
     /// Store a learned clause and set up its watches.
     pub(super) fn add_learned_clause(&mut self, clause: Vec<Literal>) {
         if !clause.is_empty() {
+            // The clause lands at the current length.
+            let idx = self.learned.len();
             self.learned.push(clause);
             self.clause_used.push(true);
-            let idx = self.learned.len() - 1;
             self.add_learned_watches(idx);
         }
     }
@@ -28,8 +29,9 @@ impl QbfSolver {
         if self.conflicts >= self.next_reduce {
             self.reduce_learned_clauses();
             self.reduce_cubes();
-            self.next_reduce = self.conflicts + REDUCE_DB_INC;
-            self.reductions += 1;
+            // A schedule pinned at u64::MAX simply never reduces again.
+            self.next_reduce = self.conflicts.saturating_add(REDUCE_DB_INC);
+            self.reductions = self.reductions.saturating_add(1);
         }
     }
 
@@ -74,7 +76,7 @@ impl QbfSolver {
         let num_to_delete = candidates.len() / 2;
         for &idx in candidates.iter().take(num_to_delete) {
             self.learned[idx].clear();
-            self.clauses_deleted += 1;
+            self.clauses_deleted = self.clauses_deleted.saturating_add(1);
         }
 
         // Reset all used flags
@@ -108,7 +110,7 @@ impl QbfSolver {
         let num_to_delete = candidates.len() / 2;
         for &idx in candidates.iter().take(num_to_delete) {
             self.cubes[idx].clear();
-            self.cubes_deleted += 1;
+            self.cubes_deleted = self.cubes_deleted.saturating_add(1);
         }
 
         // Reset all used flags

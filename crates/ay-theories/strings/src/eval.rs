@@ -130,16 +130,17 @@ pub fn eval_str_replace_all(s: &str, t: &str, u: &str) -> String {
     s.replace(t, u)
 }
 
-/// Evaluate `str.to_code(s)`: Unicode code point of single-character string.
+/// Evaluate `str.to_code(s)`: the code point of a single-character string.
 ///
 /// SMT-LIB semantics: returns -1 if |s| != 1; otherwise the code point
-/// (in the SMT-LIB character universe [0, 196607]).
+/// (in the SMT-LIB character universe [0, 196607], surrogates included — a
+/// surrogate is stored in its carrier, see [`ay_core::smtlib_char`]).
 pub fn eval_str_to_code(s: &str) -> BigInt {
     let mut chars = s.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) => {
-            let cp = c as u32;
-            if cp <= 196_607 {
+            let cp = ay_core::smtlib_code_point(c);
+            if cp <= ay_core::SMTLIB_MAX_CODE_POINT {
                 BigInt::from(cp)
             } else {
                 BigInt::from(-1)
@@ -149,22 +150,17 @@ pub fn eval_str_to_code(s: &str) -> BigInt {
     }
 }
 
-/// Evaluate `str.from_code(n)`: character from Unicode code point.
+/// Evaluate `str.from_code(n)`: the one-character string with code point `n`.
 ///
-/// SMT-LIB semantics: returns "" if n < 0 or n > 196607 or n is not a
-/// valid Unicode scalar value.
+/// SMT-LIB semantics: returns "" if n < 0 or n > 196607. Every code point in
+/// between is a character, the 2,048 surrogates `U+D800..=U+DFFF` included:
+/// `(str.len (str.from_code 55296))` is 1, not 0.
 pub fn eval_str_from_code(n: &BigInt) -> String {
-    let val: i64 = match n.try_into() {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    if !(0..=196_607).contains(&val) {
-        return String::new();
-    }
-    match char::from_u32(val as u32) {
-        Some(c) => c.to_string(),
-        None => String::new(),
-    }
+    u32::try_from(n)
+        .ok()
+        .and_then(ay_core::smtlib_char)
+        .map(String::from)
+        .unwrap_or_default()
 }
 
 /// Evaluate `str.is_digit(s)`: whether s is a single ASCII digit character.

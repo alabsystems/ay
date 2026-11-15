@@ -8,7 +8,7 @@
 #
 # Prereqs:
 #   * OCaml native compiler (ocamlopt) on PATH  -- findlib/ctypes NOT required.
-#   * libay_ffi built:  cargo build -p ay-ffi   (debug) producing
+#   * libay_ffi built:  targo --unverified build -p ay-ffi (stock Rust: cargo build -p ay-ffi)   (debug) producing
 #     target/debug/libay_ffi.{a,dylib,so}.
 #
 # Usage:  bash bindings/ocaml/run.sh [--release]
@@ -27,7 +27,7 @@ if ! command -v ocamlopt >/dev/null 2>&1; then
   exit 2
 fi
 if [[ ! -e "$LIBDIR/libay_ffi.a" && ! -e "$LIBDIR/libay_ffi.dylib" && ! -e "$LIBDIR/libay_ffi.so" ]]; then
-  echo "ERROR: libay_ffi not found in $LIBDIR. Run: cargo build -p ay-ffi" >&2
+  echo "ERROR: libay_ffi not found in $LIBDIR. Run: targo --unverified build -p ay-ffi (Trust toolchain) or cargo build -p ay-ffi" >&2
   exit 2
 fi
 

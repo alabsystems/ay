@@ -126,13 +126,27 @@ impl Solver {
     /// before they snapshot clauses for reconstruction metadata.
     #[inline]
     pub(super) fn can_delete_clause(&self, clause_idx: usize, reason_policy: ReasonPolicy) -> bool {
+        self.can_delete_clause_given(
+            clause_idx,
+            reason_policy,
+            self.is_reason_clause_marked(clause_idx),
+        )
+    }
+
+    /// `can_delete_clause` with the clause's reason status already known.
+    pub(super) fn can_delete_clause_given(
+        &self,
+        clause_idx: usize,
+        reason_policy: ReasonPolicy,
+        is_reason: bool,
+    ) -> bool {
         if !self.arena.is_active(clause_idx) {
             return false;
         }
         if self.is_pending_theory_conflict_clause(clause_idx) {
             return false;
         }
-        if !self.is_reason_clause_marked(clause_idx) {
+        if !is_reason {
             return true;
         }
         matches!(reason_policy, ReasonPolicy::ClearLevel0)
@@ -203,8 +217,29 @@ impl Solver {
         let clause_ref = ClauseRef(clause_idx as u32);
         let lit0 = self.arena.literal(clause_idx, 0);
         let lit1 = self.arena.literal(clause_idx, 1);
+        if self.defer_binary_unlink {
+            // Bulk deletion (level-0 GC): `flush_watches` drops the entries of
+            // every dead clause from the dirty lists in one pass.
+            for lit in [lit0, lit1] {
+                let li = lit.index();
+                if li < self.dirty_watches.len() && !self.dirty_watches[li] {
+                    self.dirty_watches[li] = true;
+                    self.dirty_watch_list.push(li as u32);
+                }
+            }
+            return;
+        }
         self.remove_watch(lit0, clause_ref);
         self.remove_watch(lit1, clause_ref);
+    }
+
+    /// End a bulk-deletion window: flush the watch lists it left dirty, so BCP
+    /// never meets a binary entry of a deleted clause.
+    pub(super) fn end_deferred_binary_unlink(&mut self) {
+        if self.defer_binary_unlink {
+            self.defer_binary_unlink = false;
+            self.flush_watches();
+        }
     }
 
     fn add_clause_watched_impl(

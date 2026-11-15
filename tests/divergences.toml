@@ -134,11 +134,12 @@ These rows are FAIL-CLOSED (`unsat` demoted to `unknown`). No wrong verdict is
 published, which is why they are quarantinable at all.
 """
 why_not_fixed_now = """
-Re-enabling the validators is an owner decision plus the resource and
-stack-safety work the removal commit explicitly deferred — it is not a
-test-triage edit. The capability was withdrawn on purpose and has its own
-pinning tests asserting it stays withdrawn; "fixing" these five rows without
-that work would mean re-landing code its author removed for stated reasons.
+Re-enabling the validators waits on the resource and stack-safety work the
+removal commit explicitly deferred (decided 2026-10-02: they come back only
+with that work) — it is not a test-triage edit. The capability was withdrawn
+on purpose and has its own pinning tests asserting it stays withdrawn;
+"fixing" these five rows without that work would mean re-landing code its
+author removed for stated reasons.
 """
 required_action = """
 Restore the three validators with the iterative, progress-polled implementation

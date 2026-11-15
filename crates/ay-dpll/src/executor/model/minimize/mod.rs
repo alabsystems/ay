@@ -19,9 +19,12 @@ use {ay_arrays::ArrayInterpretation, num_traits::One, num_traits::Zero};
 use super::{EvalValue, Model};
 use crate::executor::Executor;
 
+mod budget;
 mod bv_dependents;
 mod candidates;
+pub(super) mod function_rows;
 mod scalar_passes;
+use budget::MinimizationBudget;
 use bv_dependents::BvDependentIndex;
 use candidates::*;
 
@@ -69,7 +72,10 @@ impl Executor {
     /// Call this after `self.last_model` is populated and before
     /// `finalize_sat_model_validation`.
     pub(in crate::executor) fn minimize_model_sat_preserving(&mut self) {
-        self.minimize_model_sat_preserving_with_stop(|executor| executor.solve_deadline.expired());
+        let mut budget = MinimizationBudget::for_executor(self);
+        self.minimize_model_sat_preserving_with_stop(&mut budget, |executor| {
+            executor.solve_deadline.expired()
+        });
     }
 
     /// Implementation of [`Self::minimize_model_sat_preserving`] with an
@@ -80,8 +86,12 @@ impl Executor {
     /// deadline above.
     fn minimize_model_sat_preserving_with_stop(
         &mut self,
+        budget: &mut MinimizationBudget,
         mut should_stop: impl FnMut(&Self) -> bool,
     ) {
+        if should_stop(self) || !self.materialize_scalar_function_rows() {
+            return;
+        }
         // Gate-consistency snapshot (#minimize-gate-consistent, 2026-07-11):
         // the per-candidate accept check evaluates through the TOLERANT
         // model evaluator, which resolves a UF application's self-row via
@@ -117,7 +127,7 @@ impl Executor {
             .set_int("model_minimization.runs", runs.saturating_add(1));
 
         let Some((pre_minimization, scalar_changed, stopped)) =
-            self.minimize_scalar_model_values(&mut should_stop)
+            self.minimize_scalar_model_values(budget, &mut should_stop)
         else {
             return;
         };
@@ -301,7 +311,12 @@ impl Executor {
     }
 
     /// Try replacing a LIA variable with smaller candidates. Returns true if changed.
-    fn try_lia_candidates(&mut self, term_id: TermId, candidates: Vec<BigInt>) -> bool {
+    fn try_lia_candidates(
+        &mut self,
+        term_id: TermId,
+        candidates: Vec<BigInt>,
+        budget: &mut MinimizationBudget,
+    ) -> bool {
         let original = match self
             .last_model
             .as_ref()
@@ -317,7 +332,7 @@ impl Executor {
                 break;
             }
             // Deadline bail (#42): keeping the current valid value is sound.
-            if self.solve_deadline.expired() {
+            if self.solve_deadline.expired() || !budget.take_check() {
                 break;
             }
             // Mutate
@@ -341,7 +356,12 @@ impl Executor {
     }
 
     /// Try replacing a LRA variable with smaller candidates. Returns true if changed.
-    fn try_lra_candidates(&mut self, term_id: TermId, candidates: Vec<BigRational>) -> bool {
+    fn try_lra_candidates(
+        &mut self,
+        term_id: TermId,
+        candidates: Vec<BigRational>,
+        budget: &mut MinimizationBudget,
+    ) -> bool {
         let original = match self
             .last_model
             .as_ref()
@@ -357,7 +377,7 @@ impl Executor {
                 break;
             }
             // Deadline bail (#42): keeping the current valid value is sound.
-            if self.solve_deadline.expired() {
+            if self.solve_deadline.expired() || !budget.take_check() {
                 break;
             }
             if let Some(ref mut model) = self.last_model {
@@ -386,6 +406,7 @@ impl Executor {
         term_id: TermId,
         candidates: Vec<BigInt>,
         dependents: &BvDependentIndex,
+        budget: &mut MinimizationBudget,
     ) -> bool {
         let original = match self
             .last_model
@@ -429,7 +450,7 @@ impl Executor {
             // (every rejected iteration reverts it) and falls through to the
             // verbatim stale-cache restore below — the same state as "every
             // candidate rejected". Keeping the current valid value is sound.
-            if self.solve_deadline.expired() {
+            if self.solve_deadline.expired() || !budget.take_check() {
                 break;
             }
             if let Some(ref mut model) = self.last_model {
@@ -520,6 +541,10 @@ impl Executor {
     pub(in crate::executor) fn aggressive_minimize_model(&mut self) {
         const AGGRESSIVE_PASSES: usize = 10;
 
+        if self.solve_deadline.expired() || !self.materialize_scalar_function_rows() {
+            return;
+        }
+
         let has_arrays = self
             .last_model
             .as_ref()
@@ -529,6 +554,9 @@ impl Executor {
             return;
         }
 
+        // Asked for explicitly, so not held to the check budget; still never
+        // allowed to spend the time the verdict's validation needs.
+        let mut budget = MinimizationBudget::for_executor(self).without_check_limit();
         for _pass in 0..AGGRESSIVE_PASSES {
             let Some((mut attempts, dependents)) = self.collect_min_attempts_and_dependents()
             else {
@@ -545,13 +573,13 @@ impl Executor {
             for attempt in attempts {
                 let changed = match attempt {
                     MinAttempt::Lia(term_id, candidates) => {
-                        self.try_lia_candidates(term_id, candidates)
+                        self.try_lia_candidates(term_id, candidates, &mut budget)
                     }
                     MinAttempt::Lra(term_id, candidates) => {
-                        self.try_lra_candidates(term_id, candidates)
+                        self.try_lra_candidates(term_id, candidates, &mut budget)
                     }
                     MinAttempt::Bv(term_id, candidates) => {
-                        self.try_bv_candidates(term_id, candidates, &dependents)
+                        self.try_bv_candidates(term_id, candidates, &dependents, &mut budget)
                     }
                 };
                 any_changed |= changed;
@@ -586,10 +614,16 @@ impl Executor {
             None => return,
         };
 
+        let protected = &array_model.read_conflicted;
+        let pending = &array_model.pending_definitions;
+        let dependents = &array_model.pending_definition_dependents;
         for (term, interp) in array_model.array_values.iter_mut() {
             // #select-read-conflict-fail-closed: a read-conflicted interp is
             // deliberately partial — no default may be invented for it.
-            minimize_array_interpretation(interp, array_model.read_conflicted.contains(term));
+            minimize_array_interpretation(
+                interp,
+                protected.contains(term) || pending.contains_key(term) || dependents.contains(term),
+            );
         }
     }
 }

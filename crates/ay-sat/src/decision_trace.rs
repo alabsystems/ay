@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+pub(crate) mod counted_decision;
+
 const MAGIC: &[u8; 8] = b"AYDTRC1\0";
 const VERSION: u8 = 1;
 
@@ -663,6 +665,18 @@ impl DecisionTraceWriter {
         })
     }
 
+    /// Retire a raw trace rejected by the final public resource boundary.
+    ///
+    /// Consume the exact retained descriptor without an implicit buffered
+    /// flush. A replaced pathname is not authority to touch a different file.
+    /// No global recording policy or replay input is changed here.
+    pub(crate) fn invalidate_exact_owned(self) -> io::Result<()> {
+        let (file, pending) = self.writer.into_parts();
+        drop(pending);
+        file.set_len(0)?;
+        file.sync_all()
+    }
+
     /// Append one event to the trace.
     pub(crate) fn write_event(&mut self, event: &TraceEvent) -> io::Result<()> {
         event.write_to(&mut self.writer)?;
@@ -878,17 +892,16 @@ impl ReplayTrace {
 
     /// Validate the next observed event.
     pub(crate) fn expect(&mut self, event: &TraceEvent) -> Result<(), ReplayMismatch> {
-        let expected = self.events.get(self.cursor).cloned();
-        match expected {
-            Some(exp) if exp == *event => {
-                self.cursor += 1;
-                Ok(())
-            }
-            other => Err(ReplayMismatch {
+        let expected = self.events.get(self.cursor);
+        if expected == Some(event) {
+            self.cursor += 1;
+            Ok(())
+        } else {
+            Err(ReplayMismatch {
                 position: self.cursor,
-                expected: other,
+                expected: expected.cloned(),
                 actual: Some(event.clone()),
-            }),
+            })
         }
     }
 

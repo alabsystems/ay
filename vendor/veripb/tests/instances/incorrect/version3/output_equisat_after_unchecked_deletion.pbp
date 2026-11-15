@@ -1,0 +1,19 @@
+pseudo-Boolean proof version 3.0
+% Regression: the input formula is UNSATISFIABLE (x1 must be both true and
+% false). Constraint 2 cannot be derived from constraint 1, so `del id 2`
+% falls back to unchecked deletion, and the output formula is then just
+% `1 x1 >= 1` -- which IS satisfiable. `output EQUISATISFIABLE` is therefore a
+% false claim in the sharpest possible way: unsatisfiable in, satisfiable out.
+%
+% This is the backward direction of an equivalence failing, and it is the leg
+% the kernel's `DbBack` development isolates: `dbBack_append` is
+% unconditional, `dbBack_delete_checked` is the ONLY leg carrying an
+% obligation, and there is deliberately no unchecked-delete leg because the
+% invariant genuinely does not survive one. The live guard is
+% `Context::strong_solution_guarantees`, cleared on the fallback in
+% `rules/deletion.rs` and required by `rules/output.rs`.
+f 2;
+del id 2;
+output EQUISATISFIABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

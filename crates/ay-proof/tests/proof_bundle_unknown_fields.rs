@@ -81,6 +81,7 @@ fn bundle_root_and_datatype_signature_reject_unknown_fields() {
         datatype_declarations: Vec::new(),
         constructor_selectors: Vec::new(),
         datatype_member_signatures: Vec::new(),
+        declared_function_identities: Vec::new(),
     };
     assert_struct_rejects_unknown(&bundle, "SerializableProofBundle");
 
@@ -134,6 +135,7 @@ fn bundle_decode_recursively_rejects_every_nested_authority_object() {
         obligation_assertions: Vec::new(),
         datatype_declarations: Vec::new(),
         constructor_selectors: Vec::new(),
+        declared_function_identities: Vec::new(),
         datatype_member_signatures: vec![DatatypeMemberSignature {
             identity: "Some#0".to_string(),
             argument_sorts: vec![Sort::Int],

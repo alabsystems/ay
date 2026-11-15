@@ -932,25 +932,25 @@ mod tests {
 
     // ----- Lean4 kernel end-to-end verification (#8697, feature-gated) -----
     //
-    // These tests require `lean` on PATH. They are behind the `lean-integration`
-    // feature so that default `cargo test` does not depend on Lean4 being
-    // installed. Run with:
+    // These tests run the Lean the repository pins in `lean-toolchain`, through
+    // elan (`ay_test_support::lean`), never a `lean` found on PATH. They are
+    // behind the `lean-integration` feature so that default `cargo test` does
+    // not depend on Lean4 being installed. Run with:
     //     cargo test -p ay-sat --features lean-integration lean4_kernel_
     #[cfg(feature = "lean-integration")]
     mod lean_integration {
         use super::*;
-        use std::process::Command;
 
         fn run_lean(source: &str) -> (std::process::ExitStatus, String) {
+            let lean = ay_test_support::lean::pinned_lean(env!("CARGO_MANIFEST_DIR"));
+            let lean = lean.unwrap_or_else(|reason| panic!("pinned Lean unavailable: {reason}"));
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("proof.lean");
             let mut f = std::fs::File::create(&path).expect("create tmp");
             f.write_all(source.as_bytes()).expect("write tmp");
             drop(f);
-            let out = Command::new("lean")
-                .arg(&path)
-                .output()
-                .expect("failed to spawn `lean`; install via elan");
+            let out = lean.lean().arg(&path).output();
+            let out = out.unwrap_or_else(|error| panic!("{lean}: failed to spawn: {error}"));
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),

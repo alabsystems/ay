@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+@C2 rup <= 0;
+e <= 0 : @C1;
+e <= 0 : @C2;
+e >= 0 : @C1;
+e >= 0 : @C2;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

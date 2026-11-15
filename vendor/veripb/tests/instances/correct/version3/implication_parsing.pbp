@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 3.0
+f 0;
+red x1 ==> 1 x2 2 x3 >= 3 : x1 0 ;
+red x1 <== 1 x2 2 x3 >= 3 : x1 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

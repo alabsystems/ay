@@ -1,0 +1,46 @@
+pseudo-Boolean proof version 2.0
+f 3
+pol 1 2 + 3 + 2 d
+core id 4
+red 1 ~x1 1 ~x2 1 ~x3 3 ~y1 >= 3 ; y1 -> 0 ; begin
+	* autoproven: trivial constraint
+	proofgoal #1
+	end 6
+	* autoproven: trivial constraint
+	proofgoal #2
+	end 7
+end
+red 1 x1 1 x2 1 x3 1 y1 >= 1 ; y1 -> 1 ; begin
+	* autoproven: goal is implied by negated constraint
+	proofgoal 8
+		pol 10 9 +
+	end 11
+	* autoproven: goal is implied by negated constraint
+	proofgoal #1
+		pol 12 9 +
+	end 13
+	* autoproven: goal is implied by negated constraint
+	proofgoal #2
+		pol 14 9 +
+	end 15
+end
+core id 16
+pol 4 2 * 8 + 3 d
+core id 17
+obju new 1 y1 2 ; begin
+	* autoproven: found in database
+	proofgoal #1
+		pol 18 16 +
+	end 19
+	* autoproven: found in database
+	proofgoal #2
+		pol 20 17 +
+	end 21
+end
+soli x1 ~x2 ~x3 ~y1
+red 1 y1 >= 0 ;  ; begin
+	pol  22
+end 24
+output NONE
+conclusion BOUNDS 2 : 25 2
+end pseudo-Boolean proof

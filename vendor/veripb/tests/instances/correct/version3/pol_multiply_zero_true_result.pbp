@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 3.0
+% Positive-direction companion to `pol_multiply_zero_forged_cardinality`:
+% multiplying by 0 is a sound cutting-planes step and must keep working. It
+% yields the empty `0 >= 0`, so `pol 1 0 * 2 +` must derive constraint 2
+% unchanged -- the true, weaker result that the forgery replaced with
+% `1 x1 1 x2 >= 2`. The fix must not be satisfiable by rejecting `0 *`.
+f 3 ;
+pol 1 0 * ;
+e >= 0 : 4 ;
+pol 1 0 * 2 + ;
+e 2 x2 >= 2 : 5 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

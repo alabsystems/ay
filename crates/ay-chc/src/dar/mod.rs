@@ -22,12 +22,15 @@
 
 use crate::engine_config::ChcEngineConfig;
 use crate::engine_result::build_single_pred_model;
-use crate::engine_utils::{check_sat_with_timeout, search_budget_exhausted};
+use crate::engine_utils::{
+    check_sat_with_timeout, search_budget_exhausted, search_check_sat_with_timeout,
+};
 use crate::interpolant_validation::{
     collect_conjuncts_for_interpolation, is_valid_interpolant_with_check_sat,
     validate_inductive_invariant,
 };
-use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
+use crate::interpolation::stats::{self, EngineTag, ExitReason};
+use crate::interpolation::{interpolating_sat_constraints_lra_proof_first, InterpolatingSatResult};
 use crate::smt::SmtResult;
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcProblem, ChcSort};
@@ -295,7 +298,7 @@ impl DarSolver {
         // due to variable encoding differences in TransitionSystem). Instead we
         // just check unsatisfiability to decide whether interpolation can proceed.
         let init_and_query = ChcExpr::and(ts.init.clone(), ts.query.clone());
-        if !self.check_sat(&init_and_query).is_unsat() {
+        if !self.search_check_sat(&init_and_query).is_unsat() {
             // Init intersects Query or unknown — BMC will find the real counterexample.
             return DarResult::Unknown;
         }
@@ -310,8 +313,15 @@ impl DarSolver {
         let b_first = ts.query_at(1);
         let check_first = ChcExpr::and(a_first.clone(), b_first.clone());
 
-        if !self.check_sat(&check_first).is_unsat() {
+        let first_result = self.search_check_sat(&check_first);
+        if !first_result.is_unsat() {
             // 1-step reachability SAT or unknown — let BMC handle counterexample generation.
+            let (reason, detail) = if first_result.is_sat() {
+                (ExitReason::Other, "one_step=sat")
+            } else {
+                (ExitReason::BaseUnknown, "one_step=unknown")
+            };
+            stats::record_engine_exit_detail(EngineTag::Dar, reason, 1, detail);
             return DarResult::Unknown;
         }
 
@@ -322,10 +332,11 @@ impl DarSolver {
         let mut b_constraints = Vec::new();
         collect_conjuncts_for_interpolation(&b_first, &mut b_constraints);
 
-        let fwd_itp = match interpolating_sat_constraints(
+        let fwd_itp = match interpolating_sat_constraints_lra_proof_first(
             &a_constraints,
             &b_constraints,
             &boundary_vars_t1,
+            None,
         ) {
             InterpolatingSatResult::Unsat(i) => i,
             InterpolatingSatResult::Unknown => return DarResult::Unknown,
@@ -342,10 +353,11 @@ impl DarSolver {
         collect_conjuncts_for_interpolation(&ts.transition_at(0), &mut tb_constraints);
         collect_conjuncts_for_interpolation(&b_first, &mut tb_constraints);
 
-        let bwd_itp = match interpolating_sat_constraints(
+        let bwd_itp = match interpolating_sat_constraints_lra_proof_first(
             &tb_constraints,
             &init_constraints,
             &boundary_vars_t0,
+            None,
         ) {
             InterpolatingSatResult::Unsat(i) => i,
             InterpolatingSatResult::Unknown => {
@@ -386,6 +398,21 @@ impl DarSolver {
                             forward.len()
                         );
                     }
+                    let reason = if search_budget_exhausted(
+                        &self.config.base,
+                        start,
+                        self.config.total_timeout,
+                    ) {
+                        ExitReason::Budget
+                    } else {
+                        ExitReason::ItpFail
+                    };
+                    stats::record_engine_exit_detail(
+                        EngineTag::Dar,
+                        reason,
+                        forward.len(),
+                        "at=local_and_global_strengthening",
+                    );
                     return DarResult::Unknown;
                 }
             }
@@ -425,7 +452,7 @@ impl DarSolver {
             let b = ts.send_through_time(&backward[j], 1);
             let check = ChcExpr::and(a.clone(), b.clone());
 
-            let result = self.check_sat(&check);
+            let result = self.search_check_sat(&check);
             if result.is_unsat() {
                 // Found separable pair at (i, j). Propagate.
                 return self.iterative_local_strengthen(
@@ -535,7 +562,12 @@ impl DarSolver {
         let mut b_constraints = Vec::new();
         collect_conjuncts_for_interpolation(&b, &mut b_constraints);
 
-        match interpolating_sat_constraints(&a_constraints, &b_constraints, boundary_vars_t1) {
+        match interpolating_sat_constraints_lra_proof_first(
+            &a_constraints,
+            &b_constraints,
+            boundary_vars_t1,
+            None,
+        ) {
             InterpolatingSatResult::Unsat(itp) => {
                 // Validate Craig conditions
                 let a_flat = ChcExpr::and_all(a_constraints.iter().cloned());
@@ -582,7 +614,12 @@ impl DarSolver {
         collect_conjuncts_for_interpolation(&a_part, &mut a_constraints);
         let b_constraints = vec![b_part];
 
-        match interpolating_sat_constraints(&a_constraints, &b_constraints, &boundary_vars_t0) {
+        match interpolating_sat_constraints_lra_proof_first(
+            &a_constraints,
+            &b_constraints,
+            &boundary_vars_t0,
+            None,
+        ) {
             InterpolatingSatResult::Unsat(itp) => Some(itp),
             InterpolatingSatResult::Unknown => None,
         }
@@ -622,7 +659,7 @@ impl DarSolver {
             let suffix = ts.send_through_time(&backward[backward_idx], k);
             let check = ChcExpr::and(prefix.clone(), suffix.clone());
 
-            let result = self.check_sat(&check);
+            let result = self.search_check_sat(&check);
             if result.is_unsat() {
                 // Multi-step UNSAT found at depth k. Extract path interpolants.
                 let boundary_vars_tk = ts.state_var_names_at(k);
@@ -633,7 +670,12 @@ impl DarSolver {
                 collect_conjuncts_for_interpolation(&suffix, &mut b_constraints);
 
                 if let InterpolatingSatResult::Unsat(itp) =
-                    interpolating_sat_constraints(&a_constraints, &b_constraints, &boundary_vars_tk)
+                    interpolating_sat_constraints_lra_proof_first(
+                        &a_constraints,
+                        &b_constraints,
+                        &boundary_vars_tk,
+                        None,
+                    )
                 {
                     // Shift interpolant back to time-0
                     let itp_t0 = ts.shift_versioned_state_vars(&itp, -(k as i32));
@@ -669,7 +711,7 @@ impl DarSolver {
             // Check: F[i] ∧ ¬(F[0] ∨ ... ∨ F[i-1]) is UNSAT
             // i.e., F[i] ⊆ F[0] ∨ ... ∨ F[i-1]
             let check = ChcExpr::and(sequence[i].clone(), ChcExpr::not(disjunction.clone()));
-            if self.check_sat(&check).is_unsat() {
+            if self.search_check_sat(&check).is_unsat() {
                 if self.config.base.verbose {
                     safe_eprintln!("DAR: Forward fixpoint at index {}", i);
                 }
@@ -685,7 +727,7 @@ impl DarSolver {
         for i in 1..sequence.len() {
             let disjunction = ChcExpr::or_all(sequence[..i].to_vec());
             let check = ChcExpr::and(sequence[i].clone(), ChcExpr::not(disjunction.clone()));
-            if self.check_sat(&check).is_unsat() {
+            if self.search_check_sat(&check).is_unsat() {
                 if self.config.base.verbose {
                     safe_eprintln!("DAR: Backward fixpoint at index {}", i);
                 }
@@ -708,8 +750,17 @@ impl DarSolver {
             .map_or(DarResult::Unknown, DarResult::Safe)
     }
 
+    /// Pinned check (INV-S2): Craig validation and `build_safe_result`'s
+    /// inductive validation.
     fn check_sat(&self, constraint: &ChcExpr) -> SmtResult {
         check_sat_with_timeout(constraint, self.config.query_timeout)
+    }
+
+    /// Search check (#horn-smt-session Rung 4): prechecks, reachability and
+    /// fixpoint checks. A wrong answer here can only cost the solve — every
+    /// Safe is re-validated by [`Self::check_sat`] in `build_safe_result`.
+    fn search_check_sat(&self, constraint: &ChcExpr) -> SmtResult {
+        search_check_sat_with_timeout(constraint, self.config.query_timeout)
     }
 }
 

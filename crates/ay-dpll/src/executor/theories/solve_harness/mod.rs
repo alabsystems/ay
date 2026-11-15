@@ -20,9 +20,12 @@ use ay_core::{Sort, TermId, TermStore};
 use ay_euf::EufModel;
 use ay_lia::LiaModel;
 use ay_lra::LraModel;
+
+pub(super) mod ite_definitions;
+#[cfg(test)]
+mod substitution_provenance_tests;
 use ay_seq::SeqModel;
 use ay_strings::StringModel;
-use num_traits::Zero;
 
 fn eliminate_mod_div_assertions_with_optional_sources(
     terms: &mut TermStore,
@@ -176,12 +179,10 @@ fn substitute_int_const_terms(
                     "+" => terms.mk_add(new_args),
                     "-" => terms.mk_sub(new_args),
                     "*" => terms.mk_mul(new_args),
-                    "div" if new_args.len() == 2 && int_term_is_zero(terms, new_args[1]) => {
-                        terms.mk_int(num_bigint::BigInt::zero())
-                    }
-                    "mod" if new_args.len() == 2 && int_term_is_zero(terms, new_args[1]) => {
-                        new_args[0]
-                    }
+                    // A divisor substituted to 0 stays a `div`/`mod` term: SMT-LIB
+                    // leaves `(div t 0)` and `(mod t 0)` unspecified, so the
+                    // constructors keep them symbolic and the mod/div elimination
+                    // gives them a zero-divisor variable per dividend.
                     "div" if new_args.len() == 2 => terms.mk_intdiv(new_args[0], new_args[1]),
                     "mod" if new_args.len() == 2 => terms.mk_mod(new_args[0], new_args[1]),
                     _ => {
@@ -257,10 +258,6 @@ fn substitute_int_const_terms(
         cache.insert(term, result);
     }
     result
-}
-
-fn int_term_is_zero(terms: &TermStore, term: TermId) -> bool {
-    matches!(terms.get(term), TermData::Const(Constant::Int(value)) if value.is_zero())
 }
 
 fn replacement_visible_in_scope(
@@ -543,6 +540,9 @@ fn substitute_int_constants_preserving_definitions(
 /// `Option<T>` parameters to `solve_and_store_model_full`.
 #[derive(Default)]
 pub(in crate::executor) struct TheoryModels {
+    /// Genuine Boolean leaves of a separately verified theory SAT candidate.
+    /// Applied only to the output assignment, never to the live CDCL trail.
+    pub(in crate::executor) boolean_leaves: Vec<(TermId, bool)>,
     pub(in crate::executor) euf: Option<EufModel>,
     pub(in crate::executor) array: Option<ArrayModel>,
     pub(in crate::executor) lra: Option<LraModel>,
@@ -903,8 +903,7 @@ impl Executor {
         // the reconstructed proof's leaves from the original assertions and
         // forces Trust-step fallbacks (fatal for proof-based interpolation).
         // See Executor::proof_no_varsubst_enabled (option or env knob).
-        let skip_subst_for_proofs =
-            self.produce_proofs_enabled() && self.proof_no_varsubst_enabled();
+        let skip_subst_for_proofs = self.skip_varsubst_for_proofs();
         // (#4751) Snapshot the pre-substitution stack so the IN-PLACE rewrite
         // below can be REPLAYED into proof steps. Without it the rewritten
         // assume is not in the authored stack and demotes to a premiseless
@@ -1208,7 +1207,34 @@ impl Executor {
         VariableSubstitution,
     ) {
         let original_assertions = self.ctx.assertions.clone();
-        let flattened = flatten_assertions_with_sources(&self.ctx.terms, &original_assertions);
+        let definition_namespace_clear =
+            !ite_definitions::contains_definition_symbol(&self.ctx.terms, &original_assertions);
+        let original_roots: HashSet<_> = original_assertions.iter().copied().collect();
+        let prefer_definitions = self.detect_logic_category(&original_assertions).0
+            == crate::logic_detection::LogicCategory::QfUflia
+            && !crate::features::StaticFeatures::collect(&self.ctx.terms, &original_assertions)
+                .has_bv_int_conversion
+            && definition_namespace_clear
+            && ite_definitions::has_uf_argument_ite(
+                &self.ctx.terms,
+                &original_assertions,
+                &self.make_should_stop(),
+            );
+        // Purify shared arguments before propagation, so the fixpoint can use
+        // both the argument aliases and their branch guards together. New
+        // roots are not authored assumptions; their provenance stays empty.
+        let initial_assertions = if prefer_definitions {
+            let mut definitions = Vec::new();
+            let mut named = self
+                .ctx
+                .terms
+                .name_non_bool_ites_all(&original_assertions, &mut definitions);
+            named.extend(definitions);
+            named
+        } else {
+            original_assertions.clone()
+        };
+        let flattened = flatten_assertions_with_sources(&self.ctx.terms, &initial_assertions);
         let mut preprocessed_assertions = Vec::new();
         let mut source_sets: Vec<Option<Vec<Vec<TermId>>>> = Vec::new();
 
@@ -1221,6 +1247,7 @@ impl Executor {
             &original_assertions,
         );
 
+        let mut branch_assign_rewrite_fired = false;
         for (assertion, sources) in flattened {
             let mut normalized_sources = sources;
             normalized_sources.sort_by_key(|term| term.index());
@@ -1235,8 +1262,30 @@ impl Executor {
             preprocessed_assertions.extend(mod_elim.constraints);
             source_sets.extend(std::iter::repeat_with(|| None).take(constraint_count));
             for rewritten in mod_elim.rewritten {
-                preprocessed_assertions.push(rewritten);
-                source_sets.push(Some(vec![normalized_sources.clone()]));
+                let proof_sources = normalized_sources
+                    .iter()
+                    .all(|source| original_roots.contains(source))
+                    .then(|| vec![normalized_sources.clone()]);
+                // Two-branch assignment blocks (conditional store chains)
+                // become unconditional ite definitions; the definitions
+                // retain checked-rewrite hints only from original authored
+                // roots, just like the unchanged mod/div result below.
+                match crate::executor::branch_assign_elim::rewrite_branch_assignment_block(
+                    &mut self.ctx.terms,
+                    rewritten,
+                ) {
+                    Some(definitions) => {
+                        branch_assign_rewrite_fired = true;
+                        for definition in definitions {
+                            preprocessed_assertions.push(definition);
+                            source_sets.push(proof_sources.clone());
+                        }
+                    }
+                    None => {
+                        preprocessed_assertions.push(rewritten);
+                        source_sets.push(proof_sources);
+                    }
+                }
             }
         }
 
@@ -1279,27 +1328,52 @@ impl Executor {
         // Assume leaves stay aligned with the original assertions (required
         // for proof-based Craig interpolation). See
         // Executor::proof_no_varsubst_enabled (option or env knob).
-        let skip_subst_for_proofs =
-            self.produce_proofs_enabled() && self.proof_no_varsubst_enabled();
+        let skip_subst_for_proofs = self.skip_varsubst_for_proofs();
         if features.has_uf {
             // #qfuflia-const-subst: full substitution stays gated off with UF
-            // present (#7884), but VAR := CONSTANT folds are always safe (no
-            // UF application moves anywhere) and are exactly the preprocessing
-            // z3 applies to the SMT-COMP xs family's fact blocks.
+            // present (#7884), but VAR := CONSTANT does not inline UF
+            // applications into arithmetic. Retain its defining source below:
+            // later array axioms can mention the original variable again.
             var_subst = VariableSubstitution::new_constants_only();
         }
-        // Substitution runs in BOTH the UF and no-UF configurations (with the
-        // constants-only substituter selected above when UF is present); only
-        // the proof-provenance knob skips it.
-        if !skip_subst_for_proofs {
+        // The array fixpoint can reintroduce pre-substitution UF applications
+        // from the term store. Their eliminated arguments still need their
+        // defining equalities in EUF: recovering arithmetic values only after
+        // search leaves congruent array results in disequal classes. On this
+        // mixed route, use the definition-preserving propagation below instead
+        // of deleting those equalities in the early substitution pass.
+        let preserve_array_uf_definitions = features.has_arrays && features.has_uf;
+        if !skip_subst_for_proofs && !preserve_array_uf_definitions {
+            let before = preprocessed_assertions.clone();
             let var_subst_changed =
                 var_subst.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
             // Record eliminated-variable definitions for model completion at
             // finalize time (model/completion.rs).
             self.record_var_substitutions(&var_subst);
             if var_subst_changed {
+                // Array axioms can reintroduce original UF arguments after
+                // constants-only substitution. Keep their accepted defining
+                // assertions in the same slots, with the same provenance, so
+                // EUF sees the binding before choosing array equalities.
+                // Model recovery alone would restore the scalar too late.
+                let retained_sources: HashSet<TermId> = if features.has_uf {
+                    var_subst.substitution_sources().values().copied().collect()
+                } else {
+                    HashSet::default()
+                };
                 // Invalidate provenance for assertions that changed due to substitution.
                 // Substituted assertions no longer correspond 1:1 to their original sources.
+                for ((old, new), sources) in before
+                    .iter()
+                    .zip(preprocessed_assertions.iter_mut())
+                    .zip(&mut source_sets)
+                {
+                    if retained_sources.contains(old) {
+                        *new = *old;
+                    } else if *old != *new {
+                        *sources = None;
+                    }
+                }
                 let new_len = preprocessed_assertions.len();
                 source_sets.resize_with(new_len, || None);
             }
@@ -1368,9 +1442,9 @@ impl Executor {
         let axiom_start = self.ctx.assertions.len();
         // #7890 diagnostic: instrument AUFLIA preprocess blow-up (ios/qlock/pointer-safe)
         let _diag_terms_before_fixpoint = self.ctx.terms.len();
-        // #arraylazy-eager-row: the lemmas-on-demand A/B arm for the AUFLIA
-        // route (z3-parity r3 rank 11 / r1 rank 9). `AY_AUFLIA_EAGER_ROW=0`
-        // withholds the pre-search ROW/structural axiom fixpoint entirely,
+        // #arraylazy-eager-row: lemmas-on-demand for the AUFLIA route
+        // (z3-parity r3 rank 11 / r1 rank 9). Withholding the
+        // pre-search ROW/structural axiom fixpoint output entirely
         // leaving the live `ArraySolver` inside the AUFLIA combiner — which
         // already instantiates ROW2 on demand from its own parent lists
         // (`generate_lazy_row2_axioms`, 64 per `check()`, drained WITHOUT a
@@ -1390,28 +1464,72 @@ impl Executor {
         // other-side congruence, shadowed-store equalities, disjunctive
         // store-index axioms, and store-store base decomposition.
         //
-        // Default is EAGER (unchanged). Measured at `-T:20` over seeded
-        // 20-file samples of ALIA / QF_ALIA / QF_AUFLIA / QF_AX against
-        // z3 5.1.0, the arm is net +1 on QF_AUFLIA (16 -> 17) and flat
-        // everywhere else, with zero sat/unsat disagreements: it converts
-        // `storecomm_invalid_t1_pp_sf_ni_00030_003` (unknown -> sat, 7.1 s)
-        // and `swap_invalid_t3_pp_sf_ai_00010_004` (unknown -> sat, 4.8 s) —
-        // two of the files r1 rank 9 names — and loses
-        // `storecomm_invalid_t3_pp_sf_ni_00060_009` (sat -> unknown, the
-        // fail-closed direction). +2/-1 on twenty files is not enough to
-        // move a default on a no-regression control division, so the arm
-        // ships as the A/B lever the wider sample needs.
-        let eager_row_axioms =
-            std::env::var_os("AY_AUFLIA_EAGER_ROW").is_none_or(|value| value != "0");
-        if eager_row_axioms {
+        // Default is AUTO; `AY_AUFLIA_EAGER_ROW=1` always keeps the
+        // fixpoint output and `=0` withholds the fixpoint entirely.
+        // AUTO runs the fixpoint but discards its axioms when it
+        // generates more than `EAGER_ROW_KEEP_CAP`: generation itself
+        // is fast (preprocess checkpoint lands in ~0.02s on the anchor
+        // files in both arms), so the eager harm is the generated
+        // axioms poisoning the search, not producing them.
+        // Full-corpus A/B at 8s on the 7a82a5484 binary with the
+        // fixpoint fully withheld (DR-AY-AUFLIA-LAZY-ROW-DEFAULT-
+        // 20261111): QF_AX 551 files — all 522 eager-decided
+        // re-decided (1.5% faster), plus one gain; QF_AUFLIA
+        // storecomm+swap+storeinv 988 files — all 752 eager-decided
+        // re-decided (30s-adjudicated; 32.5% faster), plus 110 of the
+        // 236 eager-undecided files decided (all z3-agreeing),
+        // including the sampled `storecomm_invalid_t1_pp_sf_ai_
+        // 00020_009` (`unknown` -> `sat` 0.21s). But unconditional
+        // withholding loses five pinned small shapes the runtime
+        // solver does not cover (free datatype/BV64-element alias
+        // reads, a nested store-through-equality refutation, and
+        // pinned-read proof folds); those ground fixtures generate
+        // 2-9 fixpoint axioms while all 109 checkpoint-measured
+        // gained files generate 160-433, so AUTO keeps small
+        // generations eager-complete and discards only explosive
+        // ones. Originally-quantified problems are exempt (always
+        // keep): the gained corpus is quantifier-free, while the
+        // quantified pinned-read fold re-enters this harness per
+        // instantiation round and legitimately generates up to 149
+        // axioms in a round it needs.
+        const EAGER_ROW_KEEP_CAP: usize = 128;
+        enum EagerRowMode {
+            Always,
+            Never,
+            Auto,
+        }
+        let eager_row_mode = match std::env::var_os("AY_AUFLIA_EAGER_ROW") {
+            Some(value) if value == "1" => EagerRowMode::Always,
+            Some(value) if value == "0" => EagerRowMode::Never,
+            _ => EagerRowMode::Auto,
+        };
+        if !matches!(eager_row_mode, EagerRowMode::Never) {
+            // On a branch-assignment-rewritten window the original
+            // conditional store equalities are intentionally unreachable;
+            // scope this one fixpoint call to the live window so it does
+            // not saturate axioms over them from the whole term store.
+            let previous_scope_flag = std::mem::replace(
+                &mut self.branch_assign_scoped_fixpoint,
+                branch_assign_rewrite_fired,
+            );
             self.run_array_axiom_fixpoint_at(
                 axiom_start,
                 super::euf::ArrayAxiomMode::LazyRow2FinalCheck,
             );
+            self.branch_assign_scoped_fixpoint = previous_scope_flag;
         }
         let _diag_terms_after_fixpoint = self.ctx.terms.len();
-        let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
+        let mut generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
         let _diag_axioms_post_fixpoint = generated_axioms.len();
+        if matches!(eager_row_mode, EagerRowMode::Auto)
+            && !self.original_problem_had_quantifiers
+            && generated_axioms.len() > EAGER_ROW_KEEP_CAP
+        {
+            // Explosive generation: the axioms are valid facts, so
+            // discarding them can only cost completeness; the live
+            // ArraySolver still instantiates ROW2 on demand.
+            generated_axioms.clear();
+        }
         preprocessed_assertions = std::mem::replace(&mut self.ctx.assertions, saved_assertions);
         debug_assert!(preprocessed_assertions.len() >= source_backed_assertions);
         // Exact-closure axioms are valid generated facts, not rewrites of a
@@ -1545,12 +1663,29 @@ impl Executor {
         // hand the arena back the ~200k dead terms it minted; see the rollback
         // call for the retention argument.
         let lift_checkpoint = self.ctx.terms.rollback_checkpoint();
-        let (lifted, lift_budget_exhausted) = self
-            .ctx
-            .terms
-            .lift_arithmetic_ite_all_with_status(&preprocessed_assertions);
+        // Preserve shared UF arguments with a linear definitional encoding.
+        // Shannon expansion duplicates applications across branch combinations;
+        // the resulting ground UF+LIA search can lose the useful shared
+        // argument equalities long before the expansion reaches its term cap.
+        // Reuse the checked definition encoding below for this scalar fragment.
+        let use_definitional_ites = self.detect_logic_category(&pre_lift_assertions).0
+            == crate::logic_detection::LogicCategory::QfUflia
+            && !features.has_bv_int_conversion
+            && definition_namespace_clear
+            && ite_definitions::has_uf_argument_ite(
+                &self.ctx.terms,
+                &pre_lift_assertions,
+                &self.make_should_stop(),
+            );
+        let (lifted, lift_budget_exhausted) = if use_definitional_ites {
+            (preprocessed_assertions.clone(), false)
+        } else {
+            self.ctx
+                .terms
+                .lift_arithmetic_ite_all_with_status(&preprocessed_assertions)
+        };
         preprocessed_assertions = lifted;
-        if lift_budget_exhausted {
+        if definition_namespace_clear && (use_definitional_ites || lift_budget_exhausted) {
             // Shannon expansion hit its new-term budget (#8414), so the lifted
             // formula still contains term-level ITEs that LRA/LIA would mark
             // unsupported (unknown). Fall back to the LINEAR definitional
@@ -1589,6 +1724,17 @@ impl Executor {
                 .ctx
                 .terms
                 .name_non_bool_ites_all(&pre_lift_assertions, &mut ite_defs);
+            // A rewritten root is equivalent only in the presence of its
+            // fresh definitions. It cannot borrow the old root's Assume
+            // authority alone; the ordinary checked definition/rewrite proof
+            // lanes must derive it from the original problem instead.
+            for ((&before, &after), sources) in
+                pre_lift_assertions.iter().zip(&named).zip(&mut source_sets)
+            {
+                if before != after {
+                    *sources = None;
+                }
+            }
             preprocessed_assertions = named;
             let n_defs = ite_defs.len();
             preprocessed_assertions.extend(ite_defs);
@@ -1601,8 +1747,10 @@ impl Executor {
             tracing::info!(
                 ite_defs = n_defs,
                 still_exhausted,
+                use_definitional_ites,
+                lift_budget_exhausted,
                 terms_after_definitional = self.ctx.terms.len(),
-                "#7890 AUFLIA ITE lift budget exhausted; applied definitional ITE naming"
+                "#7890 AUFLIA applied definitional ITE naming"
             );
         }
         // #8961: PropagateValues and ITE lifting can expose constant divisors
@@ -1950,13 +2098,16 @@ pub(super) use super::solve_harness_helpers::substitute_store_flat_equalities;
 // Re-export substitute_array_var_aliases (#auflia-alias) for the same path.
 pub(super) use super::solve_harness_helpers::substitute_array_var_aliases;
 
+mod model_extraction;
+pub(in crate::executor) use model_extraction::model_extraction_result;
+
 mod mod_elim_var_subst;
 mod reflatten_provenance;
 
 mod split_atoms;
 pub(in crate::executor) use split_atoms::{
     check_split_oscillation, create_disequality_split_atoms, create_int_split_atoms,
-    DisequalitySplitAtoms, SplitOscillationMap,
+    split_oscillation_would_trigger, DisequalitySplitAtoms, SplitOscillationMap,
 };
 
 #[allow(clippy::panic)]

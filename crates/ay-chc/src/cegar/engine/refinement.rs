@@ -310,20 +310,41 @@ impl CegarEngine {
         result
     }
 
-    /// Build substitution pairs from a name→expr map, inferring sorts from values.
+    /// Build substitution pairs from a name→expr map. A variable and its
+    /// definition share a sort, and `ChcVar` equality includes the sort, so
+    /// the pair is keyed on the definition's own sort: guessing `Int` for
+    /// every composite value left a BitVec variable unsubstituted in the
+    /// remaining parts after its defining equality had been consumed into the
+    /// map, silently dropping that constraint (model-checker-consumer
+    /// `safe_symbolic_from_elem`: splits whose A∧B was UNSAT came back
+    /// satisfiable, so no interpolant was ever attempted).
     fn build_subst_pairs(subst_map: &FxHashMap<String, ChcExpr>) -> Vec<(ChcVar, ChcExpr)> {
         subst_map
             .iter()
-            .map(|(name, expr)| {
-                let sort = match expr {
-                    ChcExpr::Int(_) => ChcSort::Int,
-                    ChcExpr::Bool(_) => ChcSort::Bool,
-                    ChcExpr::Var(v) => v.sort.clone(),
-                    _ => ChcSort::Int,
-                };
-                (ChcVar::new(name, sort), expr.clone())
-            })
+            .map(|(name, expr)| (ChcVar::new(name, expr.sort()), expr.clone()))
             .collect()
+    }
+
+    /// Whether `name` occurs in `value` once every mapped variable is expanded
+    /// through `subst_map` (to any depth). Mapping `name` to such a value would
+    /// close a cycle, which the transitive resolution in
+    /// [`Self::resolve_equalities`] unfolds until a substitution budget gives
+    /// out.
+    fn occurs_through(value: &ChcExpr, name: &str, subst_map: &FxHashMap<String, ChcExpr>) -> bool {
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut pending: Vec<ChcVar> = value.vars();
+        while let Some(var) = pending.pop() {
+            if var.name == name {
+                return true;
+            }
+            if !seen.insert(var.name.clone()) {
+                continue;
+            }
+            if let Some(definition) = subst_map.get(&var.name) {
+                pending.extend(definition.vars());
+            }
+        }
+        false
     }
 
     /// Extract equalities from an expression and classify them for resolution.
@@ -341,26 +362,31 @@ impl CegarEngine {
             }
             ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
                 let (lhs, rhs) = (args[0].as_ref(), args[1].as_ref());
-                match (lhs, rhs) {
-                    // var = expr: substitute the non-shared var
-                    (ChcExpr::Var(v), rhs_expr) if !shared_vars.contains(&v.name) => {
-                        if let Some(existing) = subst_map.get(&v.name) {
-                            // var already mapped: add implied equality between existing and new
-                            remaining.push(ChcExpr::eq(existing.clone(), rhs_expr.clone()));
-                        } else {
-                            subst_map.insert(v.name.clone(), rhs_expr.clone());
-                        }
+                // var = expr: substitute the non-shared var, the left side
+                // first. A side whose variable occurs in the other side (after
+                // expanding the map) is not a definition: `v = (v * 4) / 4`
+                // resolved to a 250-deep `(bvsdiv (bvmul ...))` chain that cost
+                // the constraint itself and stalled model evaluation.
+                for (side, value) in [(lhs, rhs), (rhs, lhs)] {
+                    let ChcExpr::Var(v) = side else {
+                        continue;
+                    };
+                    if shared_vars.contains(&v.name) {
+                        continue;
                     }
-                    (lhs_expr, ChcExpr::Var(v)) if !shared_vars.contains(&v.name) => {
-                        if let Some(existing) = subst_map.get(&v.name) {
-                            remaining.push(ChcExpr::eq(existing.clone(), lhs_expr.clone()));
-                        } else {
-                            subst_map.insert(v.name.clone(), lhs_expr.clone());
-                        }
+                    if let Some(existing) = subst_map.get(&v.name) {
+                        // var already mapped: add implied equality between existing and new
+                        remaining.push(ChcExpr::eq(existing.clone(), value.clone()));
+                        return;
                     }
-                    // Both shared or both non-var: keep as constraint
-                    _ => remaining.push(expr.clone()),
+                    if Self::occurs_through(value, &v.name, subst_map) {
+                        continue;
+                    }
+                    subst_map.insert(v.name.clone(), value.clone());
+                    return;
                 }
+                // Both shared, both non-var, or cyclic: keep as constraint
+                remaining.push(expr.clone());
             }
             _ => remaining.push(expr.clone()),
         }
@@ -388,13 +414,22 @@ impl CegarEngine {
         relations
     }
 
+    /// Comparison atoms under the Boolean skeleton, in first-occurrence
+    /// order. A shared node (same `Arc`) is visited once (WP-F F0b): its
+    /// repeats could only contribute atoms already listed, which the one
+    /// consumer (`generate_template_predicates`) deduplicates anyway.
     pub(super) fn extract_comparison_atoms(expr: &ChcExpr) -> Vec<ChcExpr> {
         let mut atoms = Vec::new();
-        Self::collect_atoms(expr, &mut atoms);
+        let mut seen: FxHashSet<*const ChcExpr> = FxHashSet::default();
+        Self::collect_atoms(expr, &mut atoms, &mut seen);
         atoms
     }
 
-    fn collect_atoms(expr: &ChcExpr, atoms: &mut Vec<ChcExpr>) {
+    fn collect_atoms(
+        expr: &ChcExpr,
+        atoms: &mut Vec<ChcExpr>,
+        seen: &mut FxHashSet<*const ChcExpr>,
+    ) {
         crate::expr::maybe_grow_expr_stack(|| {
             if let ChcExpr::Op(op, args) = expr {
                 match op {
@@ -403,12 +438,16 @@ impl CegarEngine {
                     }
                     ChcOp::And | ChcOp::Or => {
                         for arg in args {
-                            Self::collect_atoms(arg, atoms);
+                            if seen.insert(std::sync::Arc::as_ptr(arg)) {
+                                Self::collect_atoms(arg, atoms, seen);
+                            }
                         }
                     }
                     ChcOp::Not => {
                         if let Some(inner) = args.first() {
-                            Self::collect_atoms(inner, atoms);
+                            if seen.insert(std::sync::Arc::as_ptr(inner)) {
+                                Self::collect_atoms(inner, atoms, seen);
+                            }
                         }
                     }
                     _ => {}
@@ -425,6 +464,13 @@ impl CegarEngine {
         // (#2735).
         let mut actually_new: Vec<(PredicateId, ChcExpr)> = Vec::new();
         for (rel, formula) in &new_predicates {
+            // The structural dedup below is quadratic in the batch (a template
+            // batch reached 24,400 candidates on `metros_4_e2_968_e3_931`, where
+            // this loop ran past the whole 60 s window): poll cancellation per
+            // candidate so a cancelled CEGAR stops here (Unknown).
+            if self.config.base.is_cancelled() {
+                return false;
+            }
             // Skip trivial predicates
             if let ChcExpr::Bool(_) = formula {
                 continue;

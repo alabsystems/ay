@@ -78,11 +78,9 @@ impl Executor {
                 .then_some(CheckedOptimizationDecision::Sat),
             Ok(result @ SolveResult::Unsat(_)) => {
                 let published = probe.certify_unsat_for_publication(result, &[]);
-                let certified = probe.take_unsat_certificate().is_some_and(|certificate| {
-                    certificate.strict_proof_verified()
-                        || certificate.independently_verified()
-                        || certificate.exact_semantic_verified()
-                });
+                let certified = probe
+                    .take_unsat_certificate()
+                    .is_some_and(|certificate| certificate.confirms_checked_unsat_emission());
                 (published.is_unsat() && certified).then_some(CheckedOptimizationDecision::Unsat)
             }
             Ok(SolveResult::Unknown) | Err(_) => None,
@@ -112,7 +110,7 @@ impl Executor {
         {
             return false;
         }
-        self.ctx.terms.true_memory_bytes() <= ay_core::TermStore::per_engine_budget() / 2
+        self.ctx.terms.true_memory_bytes() <= self.predictive_term_clone_budget()
     }
 
     /// Build a public-query transaction over exactly `roots`, without carrying
@@ -124,6 +122,7 @@ impl Executor {
 
         let mut probe = Executor::new();
         probe.ctx = probe_ctx;
+        probe.random_seed = self.random_seed;
         probe.set_verification_level(self.verification_level());
         probe.set_self_check(self.self_check());
         probe.set_learned_clause_limit(self.learned_clause_limit());

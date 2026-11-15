@@ -20,6 +20,10 @@ cli = ["dep:clap"]
 #   cargo test -p ay-core --features regen-serde-fixtures \
 #       --test serde_bignum_golden regenerate_golden_fixture -- --nocapture
 regen-serde-fixtures = []
+# Test-only determinism seams (`ay_core::resource::test_seams`): sleep inside
+# solver work so a test can run one query on a "slow host" and show its
+# verdict does not move. Dev-dependency only; no production build enables it.
+determinism-seams = []
 
 [dependencies]
 clap = { workspace = true, optional = true }
@@ -40,6 +44,12 @@ serial_test.workspace = true
 # Only for tests/serde_bignum_golden.rs, which pins the on-disk encoding of the
 # bignum-bearing proof artifacts. ay-core itself does not depend on serde_json.
 serde_json.workspace = true
+
+# M2 of the development design notes: GuardTree tick and poll cost against the
+# pre-S0 ResourceGuard; `--bench` enforces the bound.
+[[bench]]
+name = "guard_tree"
+harness = false
 
 [lints]
 workspace = true

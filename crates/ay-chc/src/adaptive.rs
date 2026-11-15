@@ -24,9 +24,11 @@
 //! See the development design notes for full design.
 
 mod array_ghost_candidate;
+mod compact_datatype_dispatch;
 
 use crate::adaptive_decision_log::DecisionEntry;
 use crate::adaptive_decision_log::{AdaptiveSolveReport, DecisionLog};
+use crate::adaptive_ladder_race::{LadderMember, FRONT_BMC_MEMBER};
 use crate::adaptive_prestage_budget::algebraic_prestage_budget;
 #[cfg(test)]
 use crate::adaptive_prestage_budget::{
@@ -35,8 +37,9 @@ use crate::adaptive_prestage_budget::{
 };
 use crate::adaptive_route_admission::{
     admit_dt_flatten_fanout, admit_dt_flatten_projection, admit_problem_clone_fanout,
-    scan_predicate_surface, scan_problem_surface, DtFlattenFanoutCaps, DtFlattenProjectionCaps,
-    RouteAdmissionFailure, RouteSurfaceCaps, RouteSurfaceStats,
+    scan_const_key_problem_surface, scan_predicate_surface, scan_problem_surface,
+    DtFlattenFanoutCaps, DtFlattenProjectionCaps, RouteAdmissionFailure, RouteSurfaceCaps,
+    RouteSurfaceStats,
 };
 use crate::chc_statistics::ChcStatistics;
 use crate::classifier::{ProblemClass, ProblemClassifier, ProblemFeatures};
@@ -439,7 +442,7 @@ fn should_prioritize_acyclic_bv_proof_prepass(
         && !features.has_cycles
         && !features.uses_arrays
         && problem.has_bv_sorts()
-        && (features.num_predicates >= 32 || features.dag_depth >= 32 || features.has_ite)
+        && features.acyclic_bv_proof_scale_or_ite()
 }
 
 fn complex_query_only_vacuous_safety_must_fail_closed(
@@ -675,6 +678,19 @@ pub(crate) enum StagedProbeBudgetProfile {
     CallerOnly,
     BmcOnly,
     BmcAndKind,
+    /// `BmcAndKind` without the BMC probe: the Real-sort roster
+    /// (`AdaptivePortfolio::staged_probe_profile`).
+    KindOnly,
+}
+
+impl StagedProbeBudgetProfile {
+    /// The same profile with its BMC staged probe removed.
+    fn without_bmc(self) -> Self {
+        match self {
+            Self::CallerOnly | Self::BmcOnly => Self::CallerOnly,
+            Self::BmcAndKind | Self::KindOnly => Self::KindOnly,
+        }
+    }
 }
 
 /// Adaptive portfolio solver configuration.
@@ -728,6 +744,13 @@ pub struct AdaptiveConfig {
     /// silent fallbacks where proof generation or verification failures are
     /// accepted without error.
     pub strict_proofs: bool,
+    /// The caller ground-checks a published Unsafe's counterexample step by
+    /// step (the CLI's strict request, STEP D), so a ladder race must not let
+    /// a witness-free Unsafe decide while a ground witness can still be
+    /// derived (`adaptive_ladder_race::witness`). Not `strict_proofs`, which
+    /// the CLI's default `validate` also sets. Default off: such an Unsafe
+    /// decides at once and the final boundary validates it as before.
+    pub require_ground_unsafe_trace: bool,
     /// Per-engine budget policies (#8418).
     ///
     /// When non-empty, these policies are forwarded to the underlying
@@ -761,6 +784,13 @@ pub struct AdaptiveConfig {
     pub(crate) memory_budget: Option<usize>,
     /// Portfolio scheduling policy.
     pub(crate) execution_mode: AdaptiveExecutionMode,
+    /// CH4b: this solve is the collapse-first route's nested run on a
+    /// completely collapsed nonlinear system (`adaptive_collapse_first`).
+    /// Internal, never user-set. It only drops the SimpleLoop ladder's solo
+    /// production-PDR probe (0 of 16 kind2 wins over the LIA 100-sample,
+    /// 8 s in front of the roster whose late answers the nested deadline was
+    /// dropping); everything the ladder accepts is validated as before.
+    pub(crate) collapse_first_nested: bool,
 }
 
 impl Default for AdaptiveConfig {
@@ -769,6 +799,7 @@ impl Default for AdaptiveConfig {
             time_budget: DEFAULT_SOLVE_BUDGET,
             verbose: false,
             strict_proofs: false,
+            require_ground_unsafe_trace: false,
             skip_classification: false,
             trace_mode: false,
             user_hints: Vec::new(),
@@ -784,6 +815,7 @@ impl Default for AdaptiveConfig {
             } else {
                 AdaptiveExecutionMode::default()
             },
+            collapse_first_nested: false,
         }
     }
 }
@@ -999,6 +1031,23 @@ pub struct AdaptivePortfolio {
     /// Structured decision logger for observability. Active only when
     /// `AY_DECISION_LOG` environment variable is set.
     pub(crate) decision_log: DecisionLog,
+    /// T1/T9: the background validation of the query-flag candidate invariant
+    /// for the current SimpleLoop round (`adaptive_query_flag_race`); `None`
+    /// outside that ladder.
+    pub(crate) query_flag_race: Mutex<Option<crate::adaptive_query_flag_race::QueryFlagRace>>,
+    /// CH4b: lemmas and rejected invariant candidates this solve learned
+    /// without reaching a verdict (solo PDR probe, demoted Kind candidate,
+    /// portfolio-rejected Safe models), in this problem's canonical PDR
+    /// vocabulary. Read by a caller that continues on the same problem
+    /// (`adaptive_collapse_first`); never a verdict.
+    pub(crate) search_seeds: Mutex<crate::lemma_pool::LemmaPool>,
+    /// CH4b: seeds the collapse-first route hands to the fallback
+    /// multi-predicate portfolio (collapsed-problem vocabulary).
+    pub(crate) fallback_seed_pool: Mutex<Option<crate::lemma_pool::LemmaPool>>,
+    /// CH4b: the collapse-first route's standard preprocessing, reused by the
+    /// next preprocessing-enabled portfolio on this problem instead of
+    /// re-running the identical pipeline.
+    pub(crate) handed_off_preprocess: Mutex<Option<crate::portfolio::PreprocessSummary>>,
     /// Serializes authoritative invocations on this portfolio instance.
     ///
     /// Besides protecting shared progress/statistics state, this binds an
@@ -1042,6 +1091,15 @@ pub struct AdaptivePortfolio {
 struct AuthoritativeSolveContext {
     started_at: Instant,
     deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConstructionStage {
+    Start,
+    DeadEndsPruned,
+    ArraysScalarized,
+    Profiled,
+    Finished,
 }
 
 impl AuthoritativeSolveContext {
@@ -1136,22 +1194,60 @@ impl AdaptivePortfolio {
     }
 
     fn new_impl(
+        problem: ChcProblem,
+        config: AdaptiveConfig,
+        authoritative_context: Option<AuthoritativeSolveContext>,
+        cancellation_parent: Option<&crate::cancellation::CancellationToken>,
+    ) -> Self {
+        Self::new_impl_observed(
+            problem,
+            config,
+            authoritative_context,
+            cancellation_parent,
+            &mut |_| true,
+        )
+    }
+
+    /// Direct BMC has an optional absolute boundary: unlike adaptive zero,
+    /// `Some(started_at)` means an already exhausted budget, never unbounded.
+    pub(crate) fn new_for_bmc_until(
+        problem: ChcProblem,
+        started_at: Instant,
+        deadline: Option<Instant>,
+        cancellation: &crate::CancellationToken,
+        progress: &mut dyn FnMut(ConstructionStage) -> bool,
+    ) -> Self {
+        Self::new_impl_observed(
+            problem,
+            AdaptiveConfig::default(),
+            Some(AuthoritativeSolveContext {
+                started_at,
+                deadline,
+            }),
+            Some(cancellation),
+            progress,
+        )
+    }
+
+    fn new_impl_observed(
         mut problem: ChcProblem,
         config: AdaptiveConfig,
         authoritative_context: Option<AuthoritativeSolveContext>,
         cancellation_parent: Option<&crate::cancellation::CancellationToken>,
+        progress: &mut dyn FnMut(ConstructionStage) -> bool,
     ) -> Self {
         let mut cancellation_token = crate::cancellation::CancellationToken::new();
         if let Some(parent) = cancellation_parent {
             cancellation_token.link_upstream(parent);
         }
-        let construction_exhausted = || {
-            cancellation_token.is_cancelled()
+        let mut construction_exhausted = |stage| {
+            !progress(stage)
+                || cancellation_token.is_cancelled()
                 || authoritative_context
                     .and_then(|context| context.deadline)
                     .is_some_and(|deadline| Instant::now() >= deadline)
         };
-        let mut construction_aborted = construction_exhausted();
+        let mut construction_aborted = construction_exhausted(ConstructionStage::Start);
 
         // Strip provably-dead-end predicates (no path to any query) when — and
         // only when — that removes the sole dependency cycle blocking the
@@ -1165,7 +1261,7 @@ impl AdaptivePortfolio {
         // `strip_dead_end_cycle_predicates`).
         if !construction_aborted {
             problem.strip_dead_end_cycle_predicates();
-            construction_aborted = construction_exhausted();
+            construction_aborted = construction_exhausted(ConstructionStage::DeadEndsPruned);
         }
 
         // Part of #6047: keep the original (non-scalarized) problem for PDR,
@@ -1178,7 +1274,7 @@ impl AdaptivePortfolio {
         } else {
             let mut scalarized = problem.clone();
             scalarized.try_scalarize_const_array_selects();
-            construction_aborted = construction_exhausted();
+            construction_aborted = construction_exhausted(ConstructionStage::ArraysScalarized);
             if construction_aborted {
                 None
             } else if scalarized
@@ -1200,14 +1296,19 @@ impl AdaptivePortfolio {
             initial_stats.record_tla_transition_cluster_applications(
                 profile_tla_transition_cluster_applications(&problem),
             );
-            construction_aborted = construction_exhausted();
+            construction_aborted = construction_exhausted(ConstructionStage::Profiled);
         }
+        construction_aborted |= construction_exhausted(ConstructionStage::Finished);
 
         Self {
             problem,
             scalarized_problem,
             config,
             decision_log: DecisionLog::from_env(),
+            query_flag_race: Mutex::new(None),
+            search_seeds: Mutex::new(crate::lemma_pool::LemmaPool::new()),
+            fallback_seed_pool: Mutex::new(None),
+            handed_off_preprocess: Mutex::new(None),
             solve_invocation_lock: Mutex::new(()),
             accumulated_stats: Mutex::new(initial_stats),
             progress_snapshot: Arc::new(crate::progress::ChcProgressSnapshot::new(num_predicates)),
@@ -1463,11 +1564,11 @@ impl AdaptivePortfolio {
         // unbounded stage observes the same handle through the separate external
         // token, preserving its historical no-token/no-timeout search policy.
         if let Some(token) = &mut pdr.cancellation_token {
-            token.link_upstream(&self.cancellation_token);
+            token.link_upstream(&self.lane_token());
         } else if pdr.solve_timeout.is_some() {
-            pdr.cancellation_token = Some(self.cancellation_token.child());
+            pdr.cancellation_token = Some(self.lane_token());
         } else if pdr.external_cancellation_token.is_none() {
-            pdr.external_cancellation_token = Some(self.cancellation_token.child());
+            pdr.external_cancellation_token = Some(self.lane_token());
         }
     }
 
@@ -1604,7 +1705,37 @@ impl AdaptivePortfolio {
                         default_share,
                     );
                 }
+                StagedProbeBudgetProfile::KindOnly => Self::install_staged_probe_default(
+                    config,
+                    EngineType::Kind,
+                    KIND_STAGED_PROBE_BUDGET,
+                    default_share,
+                ),
             }
+        }
+    }
+
+    /// The staged-probe profile this problem's portfolios use.
+    ///
+    /// Real-sorted problems keep BMC at the portfolio's full wave share
+    /// (`LRA_BMC_unsafe_2026-09-22.md`). On the Real route the portfolio BMC is
+    /// the only counterexample engine — no adaptive front BMC probe runs before
+    /// it (that probe is the Int SimpleLoop arm's), Kind is not applicable on
+    /// Real (#5856), and all engines of the Real roster run in one parallel
+    /// wave, so the 2 s cap strands nothing. It stopped BMC at depth 0–1 on
+    /// every LRA-Lin instance, while the unsafe misses need depth 1–8 (z3's
+    /// counterexample depth), each depth costing 0.3–1 s of transition
+    /// re-elaboration on the wide cav12 systems. Sequential portfolios never
+    /// install staged probes (`staged_probe_default_share`), so this changes
+    /// parallel waves only.
+    pub(crate) fn staged_probe_profile(
+        &self,
+        profile: StagedProbeBudgetProfile,
+    ) -> StagedProbeBudgetProfile {
+        if self.problem.has_real_sorts() {
+            profile.without_bmc()
+        } else {
+            profile
         }
     }
 
@@ -1615,7 +1746,7 @@ impl AdaptivePortfolio {
     ) {
         Self::reconcile_staged_probe_budget_defaults(
             config,
-            profile,
+            self.staged_probe_profile(profile),
             &self.config.engine_budgets,
             None,
         );
@@ -1655,6 +1786,16 @@ impl AdaptivePortfolio {
         profile: StagedProbeBudgetProfile,
     ) {
         self.apply_user_hints_portfolio(config);
+        // A portfolio started on a ladder-race lane (`adaptive_ladder_race`)
+        // stops with that lane: the race's winner cancels it.
+        if let Some(lane) = crate::smt::deadline::current_lane_token() {
+            let mut external = config
+                .external_cancellation
+                .take()
+                .unwrap_or_else(|| self.cancellation_token.child());
+            external.link_upstream(&lane);
+            config.external_cancellation = Some(external);
+        }
         // Disabled roles do not consume the caller's active-engine cap. This
         // is idempotent with the constructor's final policy filter.
         let _ = config.apply_budget_policies();
@@ -1682,8 +1823,14 @@ impl AdaptivePortfolio {
             self.progress_snapshot.set_active_engine(first_engine, 0);
         }
 
-        self.make_portfolio_solver(config, deterministic_deadline)
-            .solve()
+        let solver = self.make_portfolio_solver(config, deterministic_deadline);
+        let result = solver.solve();
+        // CH4b: a Safe candidate full validation rejected is still a seed
+        // for a caller that continues on this problem.
+        for candidate in solver.take_rejected_safe_candidates() {
+            self.record_search_seed_model(&candidate);
+        }
+        result
     }
 
     fn make_portfolio_solver(
@@ -1703,11 +1850,37 @@ impl AdaptivePortfolio {
         .into_iter()
         .flatten()
         .min();
-        let mut solver = PortfolioSolver::new_with_solve_limits(
-            self.problem.clone(),
-            config,
-            construction_deadline,
-        );
+        // CH4b: the collapse-first route already ran the standard pipeline on
+        // this very problem; the first preprocessing-enabled portfolio reuses
+        // it instead of re-running it (identical output by construction).
+        let handed_off = if config.enable_preprocessing {
+            self.take_handed_off_preprocess()
+        } else {
+            None
+        };
+        let mut solver = match handed_off {
+            Some(summary) => {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Adaptive: portfolio reuses the collapse-first preprocessing ({} clauses -> {}, {} predicates -> {})",
+                        summary.original_problem.clauses().len(),
+                        summary.transformed_problem.clauses().len(),
+                        summary.original_problem.predicates().len(),
+                        summary.transformed_problem.predicates().len()
+                    );
+                }
+                PortfolioSolver::from_summary_with_solve_limits(
+                    summary,
+                    config,
+                    construction_deadline,
+                )
+            }
+            None => PortfolioSolver::new_with_solve_limits(
+                self.problem.clone(),
+                config,
+                construction_deadline,
+            ),
+        };
         // Constructor preprocessing consumes the same absolute row budget.
         // Reconcile once more against the actual remainder and the constructor's
         // final roster (after Disabled policies were removed) so a nominal
@@ -1716,7 +1889,7 @@ impl AdaptivePortfolio {
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         Self::reconcile_staged_probe_budget_defaults(
             solver.config_mut_for_budget_reconciliation(),
-            StagedProbeBudgetProfile::BmcAndKind,
+            self.staged_probe_profile(StagedProbeBudgetProfile::BmcAndKind),
             &self.config.engine_budgets,
             authoritative_cap,
         );
@@ -1793,7 +1966,7 @@ impl AdaptivePortfolio {
             PdrConfig {
                 verbose: self.config.verbose,
                 strict_proofs: true,
-                cancellation_token: Some(self.cancellation_token.child()),
+                cancellation_token: Some(self.lane_token()),
                 solve_timeout: Some(Duration::from_secs(30)),
                 disable_array_scalarization: true,
                 ..PdrConfig::default()
@@ -1971,21 +2144,17 @@ impl AdaptivePortfolio {
         Ok(())
     }
 
-    /// Tier-1 query-flag candidate-invariant prepass (lustre-class).
-    ///
-    /// Transition-system encodings (e.g. the vmt-chc lustre family) often
-    /// have a single `state` predicate and a query of the form
-    /// `state(a_0..a_n) ∧ ¬a_i ⇒ false` where Bool argument `a_i` is the
-    /// "property holds" flag. For roughly half of the sat instances in that
-    /// family the inductive invariant is literally `state(args) := a_i`.
-    /// Guess that candidate and accept ONLY if every original clause's
-    /// violation query is proven UNSAT by AY's own executor-backed SMT
-    /// (guess-and-check; fail-closed on Sat/Unknown).
-    pub(crate) fn try_query_flag_invariant_prepass(
+    /// The query-flag candidate invariant `state(args) := flag` (or `¬flag`)
+    /// when the problem has the lustre shape the prepass targets: a single
+    /// predicate, no arrays / datatypes / BV, and exactly one query of the
+    /// form `state(args) ∧ ¬flag ⇒ false` (or `∧ flag`) for a Bool argument
+    /// `flag`. Pure construction — validating it against every original
+    /// clause is the caller's job (`try_query_flag_invariant_prepass`
+    /// synchronously, `start_query_flag_candidate_race` in the background).
+    pub(crate) fn query_flag_candidate_model(
         &self,
         features: &ProblemFeatures,
-        deadline: Option<Instant>,
-    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+    ) -> Option<InvariantModel> {
         if !features.is_single_predicate
             || features.uses_arrays
             || features.uses_datatypes
@@ -1993,7 +2162,6 @@ impl AdaptivePortfolio {
         {
             return None;
         }
-        let route_start = Instant::now();
         let mut queries = self.problem.queries();
         let query = queries.next()?;
         if queries.next().is_some() {
@@ -2020,6 +2188,36 @@ impl AdaptivePortfolio {
         if !matches!(pred.arg_sorts.get(flag_idx), Some(ChcSort::Bool)) {
             return None;
         }
+        let vars: Vec<ChcVar> = pred
+            .arg_sorts
+            .iter()
+            .enumerate()
+            .map(|(i, sort)| ChcVar::new(format!("__qf{}_a{i}", pred.id.index()), sort.clone()))
+            .collect();
+        let flag = ChcExpr::Var(vars[flag_idx].clone());
+        let formula = if positive { flag } else { ChcExpr::not(flag) };
+        let mut model = InvariantModel::new();
+        model.set(pred.id, PredicateInterpretation::new(vars, formula));
+        Some(model)
+    }
+
+    /// Tier-1 query-flag candidate-invariant prepass (lustre-class).
+    ///
+    /// Transition-system encodings (e.g. the vmt-chc lustre family) often
+    /// have a single `state` predicate and a query of the form
+    /// `state(a_0..a_n) ∧ ¬a_i ⇒ false` where Bool argument `a_i` is the
+    /// "property holds" flag. For roughly half of the sat instances in that
+    /// family the inductive invariant is literally `state(args) := a_i`.
+    /// Guess that candidate and accept ONLY if every original clause's
+    /// violation query is proven UNSAT by AY's own executor-backed SMT
+    /// (guess-and-check; fail-closed on Sat/Unknown).
+    pub(crate) fn try_query_flag_invariant_prepass(
+        &self,
+        features: &ProblemFeatures,
+        deadline: Option<Instant>,
+    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+        let model = self.query_flag_candidate_model(features)?;
+        let route_start = Instant::now();
 
         // Scaled with the global budget (#phase0c); per-clause cap scales too.
         let route_budget =
@@ -2032,19 +2230,11 @@ impl AdaptivePortfolio {
         // instances (MOESI: the guessed flag invariant IS golem's invariant,
         // but the proof needed >3s). Give each clause up to half the route
         // budget with a 6s floor; the route budget still bounds the total.
+        // T1: this synchronous slot is now the FALLBACK for the modes where
+        // the background race (`adaptive_query_flag_race`) does not run; the
+        // race validates the same candidate with the whole remaining budget.
         let per_clause_cap =
             (route_budget / 2).clamp(Duration::from_secs(6), Duration::from_secs(30));
-
-        let vars: Vec<ChcVar> = pred
-            .arg_sorts
-            .iter()
-            .enumerate()
-            .map(|(i, sort)| ChcVar::new(format!("__qf{}_a{i}", pred.id.index()), sort.clone()))
-            .collect();
-        let flag = ChcExpr::Var(vars[flag_idx].clone());
-        let formula = if positive { flag } else { ChcExpr::not(flag) };
-        let mut model = InvariantModel::new();
-        model.set(pred.id, PredicateInterpretation::new(vars, formula));
 
         // Validate the candidate against EVERY original clause: each
         // violation query must be UNSAT under AY's executor-backed SMT.
@@ -2226,7 +2416,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
-            cancellation_token: Some(self.cancellation_token.child()),
+            cancellation_token: Some(self.lane_token()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -2625,6 +2815,11 @@ impl AdaptivePortfolio {
         &self,
         deadline: Option<Instant>,
     ) -> crate::VerifiedChcResult {
+        // Capture original thread-local authority before the ordinary worker
+        // spawn and before classification expands product datatype fields.
+        if let Some(published) = self.try_compact_datatype_route(deadline) {
+            return published;
+        }
         // Single choke point for the body-`forall` over-approximation. The
         // parser strips a body-position `forall`, which WEAKENS the antecedent:
         // proofs survive a fortiori, but a counterexample may be fabricated by
@@ -2645,7 +2840,14 @@ impl AdaptivePortfolio {
         result: crate::VerifiedChcResult,
         deadline: Option<Instant>,
     ) -> crate::VerifiedChcResult {
-        if self.budget_exhausted(deadline)
+        let compact_stopped = match &result {
+            crate::VerifiedChcResult::Unsafe(cex) => cex
+                .counterexample()
+                .compact_evidence()
+                .is_some_and(|evidence| evidence.owner().poll().is_err()),
+            _ => false,
+        };
+        if (self.budget_exhausted(deadline) || compact_stopped)
             && matches!(
                 &result,
                 crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
@@ -2991,7 +3193,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
-            cancellation_token: Some(self.cancellation_token.child()),
+            cancellation_token: Some(self.lane_token()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -3631,7 +3833,7 @@ impl AdaptivePortfolio {
         // steps after preprocessing. Keep the probe bounded above that depth;
         // the lane-level deadline still prevents a hard instance from
         // consuming the later PDR/acceptance budget.
-        let bmc_cancel = self.cancellation_token.child();
+        let bmc_cancel = self.lane_token();
         let _bmc_timeout_guard = bmc_cancel.cancel_after(bmc_budget);
         let bmc = crate::bmc::BmcConfig::default()
             .with_max_depth(REDUCED_LIA_ARRAY_BMC_MAX_DEPTH)
@@ -3691,7 +3893,7 @@ impl AdaptivePortfolio {
         if pdr_budget < Duration::from_millis(250) {
             return None;
         }
-        let pdr_cancel = self.cancellation_token.child();
+        let pdr_cancel = self.lane_token();
         let _pdr_timeout_guard = pdr_cancel.cancel_after(pdr_budget);
         let mut pdr = PdrConfig::lia_farkas_profile(self.config.verbose);
         pdr.solve_timeout = Some(pdr_budget);
@@ -3975,7 +4177,7 @@ impl AdaptivePortfolio {
         if !has_array_sorts {
             return None;
         }
-        let surface = match scan_problem_surface(
+        let surface = match scan_const_key_problem_surface(
             &self.problem,
             surface_caps,
             &self.cancellation_token,
@@ -4169,9 +4371,14 @@ impl AdaptivePortfolio {
 
         let mut pdr_config = PdrConfig::production(self.config.verbose);
         pdr_config.solve_timeout = Some(solve_budget);
-        pdr_config.cancellation_token = Some(self.cancellation_token.child());
+        pdr_config.cancellation_token = Some(self.lane_token());
         pdr_config.strict_proofs = true;
         pdr_config.array_scalarization_keep_const_keys_with_symbolic_accesses = true;
+        // This bounded probe needs its search window for obligation blocking.
+        // Wide BV/array predicates can spend the whole slice in optional startup
+        // candidate discovery before reaching PDR. Reuse the short-probe policy;
+        // original-clause validation below remains mandatory for every Safe.
+        pdr_config.skip_startup_discovery = true;
         self.apply_user_hints(&mut pdr_config);
 
         let result_with_stats = PdrSolver::solve_problem_with_stats(&self.problem, pdr_config);
@@ -4179,6 +4386,8 @@ impl AdaptivePortfolio {
         let result_name = Self::pdr_result_to_str(&result_with_stats.result);
         let lemmas_learned = result_with_stats.learned_lemmas.len();
         let max_frame = result_with_stats.stats.max_frame;
+        let search_iterations = result_with_stats.stats.iterations;
+        let processed_obligations = result_with_stats.stats.spacer_pobs_processed;
         let validation_budget = route_deadline
             .saturating_duration_since(Instant::now())
             .min(validation_reserve);
@@ -4189,7 +4398,7 @@ impl AdaptivePortfolio {
                 let validation_config = PdrConfig {
                     verbose: self.config.verbose,
                     strict_proofs: true,
-                    cancellation_token: Some(self.cancellation_token.child()),
+                    cancellation_token: Some(self.lane_token()),
                     solve_timeout: Some(validation_budget),
                     disable_array_scalarization: true,
                     preserve_original_clauses: true,
@@ -4222,7 +4431,7 @@ impl AdaptivePortfolio {
                 stage: "array_const_key_cegar",
                 gate_result: true,
                 gate_reason: format!(
-                    "finite constant array keys retained despite symbolic accesses; original_max_arity={original_max_arity}; transformed_max_arity={transformed_max_arity}; alias_rewrites={alias_rewrites}; original_validation={original_validation}; boundary_open={boundary_open}; evidence={} ",
+                    "finite constant array keys retained despite symbolic accesses; original_max_arity={original_max_arity}; transformed_max_arity={transformed_max_arity}; alias_rewrites={alias_rewrites}; search_iterations={search_iterations}; processed_obligations={processed_obligations}; original_validation={original_validation}; boundary_open={boundary_open}; evidence={} ",
                     if accepted {
                         "strict original-clause invariant validation"
                     } else {
@@ -4240,6 +4449,9 @@ impl AdaptivePortfolio {
                 "transformed_max_arity": transformed_max_arity,
                 "alias_rewrites": alias_rewrites,
                 "keep_const_keys_with_symbolic_accesses": true,
+                "skip_startup_discovery": true,
+                "search_iterations": search_iterations,
+                "processed_obligations": processed_obligations,
                 "original_validation": original_validation,
                 "solve_budget_secs": solve_budget.as_secs_f64(),
                 "validation_budget_secs": validation_budget.as_secs_f64(),
@@ -4603,6 +4815,14 @@ impl AdaptivePortfolio {
         }
     }
 
+    /// Cheap applicability gate of [`Self::try_array_ghost_pair_route`]
+    /// (its first checks), deciding whether the dispatch races it.
+    fn array_ghost_pair_route_applies(&self) -> bool {
+        std::env::var_os(ARRAY_GHOST_PAIR_DISABLE_ENV).is_none()
+            && self.problem.has_array_sorts()
+            && !self.problem.uses_datatype_features()
+    }
+
     /// FORALL-ARR ghost-pair lane (agenda #16, Eldarica `-arrayQuans:n` idea).
     ///
     /// Instruments every `(Array K V)` predicate argument with `n` typed ghost
@@ -4623,10 +4843,7 @@ impl AdaptivePortfolio {
         use crate::transform::{ArrayGhostPairTransformer, GhostPairCertificate, GhostPairSpec};
 
         let route_start = Instant::now();
-        if std::env::var_os(ARRAY_GHOST_PAIR_DISABLE_ENV).is_some() {
-            return None;
-        }
-        if !self.problem.has_array_sorts() || self.problem.uses_datatype_features() {
+        if !self.array_ghost_pair_route_applies() {
             return None;
         }
         let route_budget = self.scaled_probe_budget(
@@ -4649,6 +4866,8 @@ impl AdaptivePortfolio {
             return None;
         }
         let route_deadline = route_start + route_budget;
+        // Also observes the ladder-race lane this route runs on.
+        let route_cancellation = self.lane_token();
         let _route_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(route_deadline);
         let _term_budget_guard =
             crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
@@ -4684,7 +4903,7 @@ impl AdaptivePortfolio {
             &self.problem,
             array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY),
             ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
-            &self.cancellation_token,
+            &route_cancellation,
             route_deadline,
         ) {
             log_admission_failure(failure, "source");
@@ -4746,7 +4965,7 @@ impl AdaptivePortfolio {
                 &raw_ghost_problem,
                 array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_TRANSFORMED_ARITY),
                 ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
-                &self.cancellation_token,
+                &route_cancellation,
                 route_deadline,
             ) {
                 log_admission_failure(failure, "transformed");
@@ -4783,10 +5002,10 @@ impl AdaptivePortfolio {
                 raw_ghost_problem.clone(),
                 self.config.verbose,
                 Some(route_deadline),
-                &self.cancellation_token,
+                &route_cancellation,
             ) else {
                 log_admission_failure(
-                    if self.cancellation_token.is_cancelled() {
+                    if route_cancellation.is_cancelled() {
                         RouteAdmissionFailure::Cancelled
                     } else {
                         RouteAdmissionFailure::Deadline
@@ -4800,7 +5019,7 @@ impl AdaptivePortfolio {
             let preprocessed_clauses = preprocess_candidate.transformed_problem.clauses().len();
             let preprocessed_surface_admitted = match array_ghost_pair_preprocessed_surface_admitted(
                 &preprocess_candidate.transformed_problem,
-                &self.cancellation_token,
+                &route_cancellation,
                 route_deadline,
             ) {
                 Ok(admitted) => admitted,
@@ -4927,7 +5146,7 @@ impl AdaptivePortfolio {
                                 summary.back_translator.as_ref(),
                                 &raw_ghost_problem,
                                 &cex,
-                                &self.cancellation_token,
+                                &route_cancellation,
                             )
                         }
                         None => cex,
@@ -4937,7 +5156,7 @@ impl AdaptivePortfolio {
                             ghost_back_translator.as_ref(),
                             &self.problem,
                             &raw_ghost_cex,
-                            &self.cancellation_token,
+                            &route_cancellation,
                         );
                     let replayed = self
                         .validate_final_unsafe_result(&translated, self.remaining_budget(deadline));
@@ -5215,7 +5434,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
-            cancellation_token: Some(self.cancellation_token.child()),
+            cancellation_token: Some(self.lane_token()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -5264,11 +5483,13 @@ impl AdaptivePortfolio {
 
         // Child of the portfolio handle (item 5): the lane budget timer
         // cancels only this lane; an external cancel reaches it too.
-        let cancel = self.cancellation_token.child();
+        let cancel = self.lane_token();
         let _timeout_guard = cancel.cancel_after(solve_budget);
         let mut pdr_config = PdrConfig::lia_farkas_profile(self.config.verbose);
         pdr_config.solve_timeout = Some(solve_budget);
         pdr_config.cancellation_token = Some(cancel);
+        // Rung 0: solo engine run -> Search lane (result re-validated below).
+        pdr_config.smt_lane = crate::smt::SmtLane::Search;
         self.apply_user_hints(&mut pdr_config);
 
         let mut solver = PdrSolver::new(self.problem.clone(), pdr_config);
@@ -5772,12 +5993,31 @@ impl AdaptivePortfolio {
         }
 
         // FORALL-ARR ghost-pair lane (agenda #16): quantified array invariants
-        // via ghost index/value pairs. Kill switch:
-        // AY_CHC_DISABLE_ARRAY_GHOST_PAIRS.
-        if let Some(result) = self.try_array_ghost_pair_route(deadline) {
-            return result;
+        // via ghost index/value pairs (Safe-only; kill switch
+        // AY_CHC_DISABLE_ARRAY_GHOST_PAIRS). Item #2
+        // (PERF_vs_winners_2026-09-25): it runs as a concurrent ladder-race
+        // member next to the rest of the dispatch instead of before it — on
+        // strcspn_2 its 30 %-of-budget window (~17 s) held back a 0.1 s BMC
+        // replay of an Unsafe found at 0.02 s.
+        if self.array_ghost_pair_route_applies() {
+            let members = vec![LadderMember::new("array_ghost_pairs", || {
+                self.try_array_ghost_pair_route(deadline)
+            })];
+            return self.race_ladder("array_ghost_pairs", members, || {
+                self.solve_internal_dispatch(&features, class_name, deadline)
+            });
         }
+        self.solve_internal_dispatch(&features, class_name, deadline)
+    }
 
+    /// The part of [`Self::solve_internal`] after the array routes: the
+    /// pre-algebraic probes, algebraic synthesis and the class dispatch.
+    fn solve_internal_dispatch(
+        &self,
+        features: &ProblemFeatures,
+        class_name: String,
+        deadline: Option<Instant>,
+    ) -> (PortfolioResult, ValidationEvidence) {
         if std::env::var_os(REAL_LRA_PROMOTION_ENV).is_some() {
             if let Some(result) =
                 self.try_cruise_controller_mixed_phase_invariant(&features, deadline)
@@ -6033,35 +6273,28 @@ impl AdaptivePortfolio {
                 ValidationEvidence::FullVerification,
             ),
             ProblemClass::SimpleLoop => {
-                if let Some(result) = self.try_accumulator_lia_unsafe_counterexample(&features) {
-                    result
-                // Cheap shallow-counterexample probe BEFORE invariant-directed
-                // routes: unsafe transition systems (lustre-class) usually
-                // fall to BMC in <1s, while farkas/Kind burn whole budgets.
-                } else if let Some(result) = self.try_front_bmc_probe(&features, deadline) {
-                    result
-                // Guess-and-check the query-flag invariant (lustre-class sat
-                // instances) before the heavier invariant routes.
-                } else if let Some(result) =
-                    self.try_query_flag_invariant_prepass(&features, deadline)
+                // T1/T9: the query-flag candidate is validated in the
+                // BACKGROUND for the whole round (`adaptive_query_flag_race`).
+                // Item #2 (PERF_vs_winners_2026-09-25): the pre-stages (front
+                // BMC, Houdini, Farkas-PDR, Kind, solo PDR) run as concurrent
+                // members next to the portfolio from t=0
+                // (`adaptive_ladder_race`), not serially for 27-39 s of 57 s.
+                let race_started = self.start_query_flag_candidate_race(&features, deadline);
+                let outcome = if let Some(result) =
+                    self.try_accumulator_lia_unsafe_counterexample(&features)
                 {
-                    result
-                // Conjunctive Houdini over the extracted transition system
-                // (lustre-class sat instances the single-flag guess misses).
-                // BV problems run this prepass INSIDE the simple-loop strategy
-                // instead (#11 QUAL-MINE): there it sits AFTER the cheap
-                // unsafe routes (deterministic BV transition, Kind), so
-                // already-solved BV unsafes keep their fast path.
-                } else if let Some(result) = (!self.problem.has_bv_sorts())
-                    .then(|| self.try_houdini_conjunctive_prepass(&features, deadline))
-                    .flatten()
-                {
-                    result
-                } else if let Some(result) = self.try_lia_farkas_pdr_route(&features, deadline) {
                     result
                 } else {
-                    self.solve_simple_loop_with_evidence(&features, deadline)
-                }
+                    let members =
+                        self.simple_loop_ladder_members(&features, deadline, race_started);
+                    // The portfolio drops its own BMC exactly when the front
+                    // BMC member races (it does not in an unbounded solve).
+                    let bmc_member = members.iter().any(|member| member.name == FRONT_BMC_MEMBER);
+                    self.race_ladder("simple_loop", members, || {
+                        self.solve_simple_loop_with_evidence(&features, deadline, bmc_member)
+                    })
+                };
+                self.conclude_query_flag_candidate_race(outcome)
             }
             ProblemClass::ComplexLoop => {
                 // All complex loops use the full staging pipeline. For multi-
@@ -6084,35 +6317,50 @@ impl AdaptivePortfolio {
                                 ValidationEvidence::FullVerification,
                             )
                         })
-                } else if StructuralSynthesizer::new(&self.problem)
+                } else if let Some(result) = StructuralSynthesizer::new(&self.problem)
                     .has_fast_mod1000_split_triangle_chc_shape()
+                    .then(|| self.try_synthesis())
+                    .flatten()
                 {
-                    if let Some(result) = self.try_synthesis() {
-                        (result, ValidationEvidence::FullVerification)
-                    } else if let Some(result) = self.try_front_bmc_probe(&features, deadline) {
-                        result
-                    } else if let Some(result) = self.try_lia_farkas_pdr_route(&features, deadline)
-                    {
-                        result
-                    } else {
-                        self.solve_multi_pred_linear(&features, deadline)
-                    }
-                // Cheap shallow-counterexample probe BEFORE invariant-directed
-                // routes (svcomp/CFG-class): linear multi-predicate unsafe
-                // encodings usually fall to BMC fast, while farkas/PDR
-                // staging can burn the whole budget first.
-                } else if let Some(result) = self.try_front_bmc_probe(&features, deadline) {
-                    result
-                } else if let Some(result) = self.try_lia_farkas_pdr_route(&features, deadline) {
-                    result
+                    (result, ValidationEvidence::FullVerification)
                 } else {
-                    self.solve_multi_pred_linear(&features, deadline)
+                    // Shallow-counterexample probe and Farkas-PDR as concurrent
+                    // ladder members (item #2): linear multi-predicate unsafe
+                    // encodings (svcomp/CFG-class) usually fall to BMC fast,
+                    // and neither waits for the other or holds back the
+                    // multi-predicate staging any more.
+                    let mut members = Vec::new();
+                    if self.front_bmc_probe_applies(&features) {
+                        members.push(LadderMember::new("front_bmc", || {
+                            self.front_bmc_probe_member(&features, deadline)
+                        }));
+                    }
+                    members.push(LadderMember::new("lia_farkas_pdr", || {
+                        self.try_lia_farkas_pdr_route(&features, deadline)
+                    }));
+                    self.race_ladder("multi_pred_linear", members, || {
+                        self.solve_multi_pred_linear(&features, deadline)
+                    })
                 }
             }
-            ProblemClass::MultiPredComplex => (
-                self.solve_multi_pred_complex(&features, deadline),
-                ValidationEvidence::FullVerification,
-            ),
+            ProblemClass::MultiPredComplex => {
+                // CH4/K3: a nonlinear system that the standard preprocessing
+                // collapses COMPLETELY to a single-predicate linear transition
+                // system (kind2: MAIN ← step ∧ MAIN) is solved as that system
+                // first — the whole SimpleLoop ladder on the collapsed problem
+                // with the full budget, the verdict re-verified on the
+                // ORIGINAL clauses — instead of paying the multi-predicate
+                // pre-stages before the portfolio's own inliner reaches it.
+                // Anything not verified falls through to today's ladder.
+                if let Some(result) = self.try_collapse_first_nonlinear(&features, deadline) {
+                    result
+                } else {
+                    (
+                        self.solve_multi_pred_complex(&features, deadline),
+                        ValidationEvidence::FullVerification,
+                    )
+                }
+            }
         };
 
         // Log the overall strategy decision.
@@ -6317,10 +6565,19 @@ impl AdaptivePortfolio {
                     // bounded acyclic unrolling covers them exhaustively. RECURSIVE
                     // datatypes (unbounded value space) stay demoted: bounded unrolling
                     // is not complete for them, so admitting would be a false proof.
+                    // The label is BMC's own claim, so it is re-established on the
+                    // original clauses without BMC (`empty_acyclic_safe_check`);
+                    // anything short of `unsat` demotes (MODEL_CHECKER_CONSUMER report §4-A1).
                     if model.is_empty()
                         && !self.problem.has_array_sorts()
                         && !self.problem.has_real_sorts()
                         && !self.problem.has_recursive_datatype_sorts()
+                        && crate::empty_acyclic_safe_check::confirmed_at_finalize(
+                            &self.problem,
+                            self.remaining_budget(deadline),
+                            &self.cancellation_token,
+                            external_cancellation,
+                        )
                     {
                         tracing::debug!(
                             max_depth,
@@ -6339,7 +6596,7 @@ impl AdaptivePortfolio {
                         has_real_sorts = self.problem.has_real_sorts(),
                         has_datatype_sorts = self.problem.has_datatype_sorts(),
                         has_recursive_datatype_sorts = self.problem.has_recursive_datatype_sorts(),
-                        "Adaptive: acyclic BMC evidence did not satisfy scalar admission preconditions, demoting to Unknown"
+                        "Adaptive: acyclic BMC evidence failed scalar admission or the independent re-check, demoting to Unknown"
                     );
                     return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
@@ -6352,13 +6609,32 @@ impl AdaptivePortfolio {
                 // depth: both are complete evidence ONLY for acyclic
                 // problems, so re-derive acyclicity here and demote
                 // fail-closed if a cyclic problem ever carries them.
+                // Both re-proofs re-decide the TRANSFORMED problem, so they
+                // share the transform chain's encoding with the claim; where
+                // the engine-free check decides the original's theory, an
+                // empty model must also pass it (MODEL_CHECKER_CONSUMER report §4-A1).
+                // Outside that theory (arrays: every EquisatAcyclic original)
+                // the arm is unchanged; no publication gate accepts those
+                // empty models (the CLI discharge gate and
+                // `validate_external_invariant_model` refuse an empty model
+                // outside the certificate class).
                 if matches!(
                     &evidence,
                     ValidationEvidence::CheckedQueryOnlyDischarge { .. }
                         | ValidationEvidence::EquisatAcyclicBmcExhaustive { .. }
                 ) {
                     let acyclic = !ProblemClassifier::classify(&self.problem).has_cycles;
-                    if acyclic {
+                    let independently_rechecked = || {
+                        !model.is_empty()
+                            || !crate::empty_acyclic_safe_check::decides_theory_of(&self.problem)
+                            || crate::empty_acyclic_safe_check::confirmed_at_finalize(
+                                &self.problem,
+                                self.remaining_budget(deadline),
+                                &self.cancellation_token,
+                                external_cancellation,
+                            )
+                    };
+                    if acyclic && independently_rechecked() {
                         tracing::debug!(
                             ?evidence,
                             "Adaptive: accepting double-run acyclic discharge/exhaustion Safe evidence"
@@ -6370,8 +6646,9 @@ impl AdaptivePortfolio {
                     }
                     tracing::warn!(
                         ?evidence,
-                        "Adaptive: double-run acyclic evidence carried by a CYCLIC problem; \
-                         demoting to Unknown fail-closed"
+                        acyclic,
+                        "Adaptive: double-run acyclic evidence carried by a CYCLIC problem or \
+                         refused by the independent re-check; demoting to Unknown fail-closed"
                     );
                     return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
@@ -6520,13 +6797,13 @@ impl AdaptivePortfolio {
                         PortfolioResult::Unsafe(cex),
                         ValidationEvidence::TrivialProblem,
                     )
-                } else if self.validate_final_unsafe_result_with_cancellation(
+                } else if let Some(confirmed) = self.validate_final_unsafe_result_with_cancellation(
                     &cex,
                     self.remaining_budget(deadline),
                     external_cancellation,
                 ) {
                     crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unsafe(cex),
+                        PortfolioResult::Unsafe(confirmed),
                         ValidationEvidence::CounterexampleVerification,
                     )
                 } else {
@@ -6558,7 +6835,9 @@ impl AdaptivePortfolio {
     /// Unknown, never flip a verdict.
     #[allow(clippy::single_option_map)]
     pub(crate) fn remaining_budget(&self, deadline: Option<Instant>) -> Option<Duration> {
-        if self.cancellation_token.is_cancelled() {
+        // A cancelled lane (a decided ladder race, `adaptive_ladder_race`) has
+        // no budget left either: every stage boundary becomes a stop point.
+        if self.cancellation_token.is_cancelled() || crate::smt::deadline::lane_cancelled() {
             return Some(Duration::ZERO);
         }
         deadline.map(|d| d.saturating_duration_since(Instant::now()))
@@ -6625,6 +6904,7 @@ impl AdaptivePortfolio {
     pub(crate) fn budget_exhausted(&self, deadline: Option<Instant>) -> bool {
         self.construction_aborted
             || self.cancellation_token.is_cancelled()
+            || crate::smt::deadline::lane_cancelled()
             || deadline.is_some_and(|d| Instant::now() >= d)
     }
 
@@ -6798,7 +7078,7 @@ impl AdaptivePortfolio {
         let timeout_guard = if !self.config.time_budget.is_zero() {
             // Child of the portfolio handle (item 5): the watchdog cancels
             // only this lane; an external cancel also reaches it.
-            let token = self.cancellation_token.child();
+            let token = self.lane_token();
             let budget = self.config.time_budget;
             let guard = token.cancel_after(budget);
             pdr_config = pdr_config.with_cancellation_token(Some(token));
@@ -6807,7 +7087,7 @@ impl AdaptivePortfolio {
             // An unbounded trace solve still observes the embedding caller's
             // cancellation handle. There is no lane-local watchdog in this
             // branch, so the child can only be cancelled by its adaptive parent.
-            pdr_config = pdr_config.with_cancellation_token(Some(self.cancellation_token.child()));
+            pdr_config = pdr_config.with_cancellation_token(Some(self.lane_token()));
             None
         };
 

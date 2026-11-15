@@ -9,10 +9,52 @@
 //! - `extract_conjuncts`: leaf-level AND-tree conjunct extraction
 //! - `negate_atomic_constraint`: negate a comparison to produce candidate lemma
 //! - `check_backward_chain_safety`: backward-chain safety for predicates without invariants
+//! - `backward_chain_lemma`: the frame lemma a backward-chain proof earns, if closed
 
 use super::*;
 
 impl PdrSolver {
+    /// `¬error` as a frame[1] lemma of the query predicate after
+    /// `check_backward_chain_safety` proved `error` unreachable (#1306), or
+    /// `None` when `error` is not closed over `canonical_vars`.
+    ///
+    /// The proof quantifies the query clause's local variables existentially,
+    /// so what it earns is `∀ locals. ¬error`. A frame lemma has no binder for
+    /// them: kept free under their source names, they are captured by
+    /// whatever clause the lemma is later conjoined with. That happened on
+    /// O3_id_o20 (#5805): the query's `J:Bool` rode frame[1] of
+    /// `main@tailrecurse.i` into `check_single_body_predecessor`, whose step
+    /// clause's head argument is `J:Int`, and the name-keyed canonical
+    /// translation mapped the query's Bool onto the Int slot `__p2_a0` — the
+    /// `substitute_name_map` sort tripwire in debug; in release the blocking
+    /// query carries `J` at both sorts and the interpolation A-side puts an
+    /// Int variable in a Bool position. Where the sorts agree the capture is
+    /// silent: an unrelated step variable is equated with the query's local
+    /// and the query is over-constrained. The lemma was never model material:
+    /// `filter_non_canonical_conjuncts` drops it. Only a closed `error`, every
+    /// variable one of the predicate's canonical variables by name AND sort,
+    /// is a lemma.
+    pub(super) fn backward_chain_lemma(
+        &self,
+        error_constraint: &ChcExpr,
+        canonical_vars: &[ChcVar],
+    ) -> Option<ChcExpr> {
+        self.closed_over(error_constraint, canonical_vars)
+            .then(|| ChcExpr::not(error_constraint.clone()))
+    }
+
+    /// Whether every variable of `expr` is one of `canonical_vars`, name AND
+    /// sort: the condition for `expr` to be a frame lemma at all (see
+    /// [`Self::backward_chain_lemma`]). A cancelled census answers `false`.
+    pub(in crate::pdr::solver) fn closed_over(
+        &self,
+        expr: &ChcExpr,
+        canonical_vars: &[ChcVar],
+    ) -> bool {
+        let mut open = || !self.is_cancelled();
+        crate::pdr::solver::fact_names::mentions_only(expr, canonical_vars, &mut open)
+    }
+
     /// Check if a model built from ONLY algebraically-verified lemmas blocks
     /// all error queries. Used as a fast path in check_invariants_prove_safety
     /// to avoid the expensive verify_model cascade (#5401).
@@ -224,13 +266,24 @@ impl PdrSolver {
         error_constraint: &ChcExpr,
         query_canonical_vars: &[ChcVar],
     ) -> bool {
-        let clauses: Vec<_> = self.problem.clauses_defining(query_pred).cloned().collect();
+        let clauses: Vec<(usize, crate::HornClause)> = self
+            .problem
+            .clauses_defining_with_index(query_pred)
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
         if clauses.is_empty() {
             return false;
         }
 
+        // `error_constraint` keeps the query clause's local variables and
+        // every check below conjoins it with ANOTHER clause (a fact or a
+        // step): that clause is renamed apart first (`rename_clause_apart`),
+        // or a shared letter would equate a query local with an unrelated
+        // fact/step variable and make the check spuriously UNSAT (a false
+        // "error unreachable").
+
         let mut checked_any = false;
-        for clause in &clauses {
+        for (clause_index, clause) in &clauses {
             if clause.body.predicates.is_empty() {
                 // Fact clause for query pred: check error against init constraint
                 let constraint = clause
@@ -242,6 +295,19 @@ impl PdrSolver {
                     crate::ClauseHead::Predicate(_, a) => a.as_slice(),
                     crate::ClauseHead::False => continue,
                 };
+                // The fact renamed apart as well (`rename_clause_apart`).
+                let Some((constraint, head_args)) = self.source_names().and_then(|names| {
+                    self.rename_clause_apart(
+                        &names,
+                        &format!("__fact{clause_index}_"),
+                        &constraint,
+                        head_args,
+                        [error_constraint],
+                    )
+                }) else {
+                    return false;
+                };
+                let head_args = head_args.as_slice();
                 // Map head args to canonical vars for error_constraint
                 let mut canon_to_head: FxHashMap<String, ChcExpr> = FxHashMap::default();
                 for (head_arg, canon) in head_args.iter().zip(query_canonical_vars.iter()) {
@@ -274,10 +340,41 @@ impl PdrSolver {
                 crate::ClauseHead::False => continue,
             };
 
-            // Self-loop of query pred: skip (would need own invariants)
+            // A self-loop of the query predicate. This check proves the error
+            // unreachable at frame[1], i.e. within one step. When the
+            // predicate has no facts it has no level-0 states, so its
+            // self-loop produces no level-1 state and is correctly skipped
+            // (dillig12_m, #1306). With facts, one self-loop step from a fact
+            // state IS a level-1 state this check does not examine (fact
+            // x = 0, step x + 1, error x = 1 is unsafe at level 1), so it
+            // declines rather than claim the error unreachable.
             if *source_pred == query_pred {
+                if self.predicate_has_facts(query_pred) {
+                    return false;
+                }
                 continue;
             }
+
+            // The step clause renamed apart from the query's locals (see above).
+            let clause_constraint = clause
+                .body
+                .constraint
+                .clone()
+                .unwrap_or(ChcExpr::Bool(true));
+            let mut step_args: Vec<ChcExpr> = body_args.clone();
+            step_args.extend(head_args.iter().cloned());
+            let Some((clause_constraint, step_args)) = self.source_names().and_then(|names| {
+                self.rename_clause_apart(
+                    &names,
+                    &format!("__step{clause_index}_"),
+                    &clause_constraint,
+                    &step_args,
+                    [error_constraint],
+                )
+            }) else {
+                return false;
+            };
+            let (body_args, head_args) = step_args.split_at(body_args.len());
 
             // Get source predicate's invariants
             let source_canonical = match self.canonical_vars(*source_pred) {
@@ -311,12 +408,6 @@ impl PdrSolver {
                 canon_to_head.insert(canon.name.clone(), head_arg.clone());
             }
             let error_on_head = error_constraint.substitute_name_map(&canon_to_head);
-
-            let clause_constraint = clause
-                .body
-                .constraint
-                .clone()
-                .unwrap_or(ChcExpr::Bool(true));
 
             // Full check: source_invariants(body) ∧ clause_constraint ∧ error(head) is SAT?
             let query = ChcExpr::and_all(vec![inv_on_body, clause_constraint, error_on_head]);

@@ -19,6 +19,14 @@ use crate::sat_proof_manager::{
 
 mod context_derivation;
 use context_derivation::CheckedContextDerivation;
+mod propagation_entry;
+
+/// Rounds allowed when closing a seeded substitution map under itself in
+/// [`CheckedPropagationDerivation::close_seeded_substitution`]. Each round
+/// resolves one more link of a chained replacement, so the bound is the
+/// longest entry chain the seal will reproduce; it exists to terminate on a
+/// cyclic map rather than to ration work.
+const MAX_SEED_CLOSURE_ROUNDS: usize = 8;
 
 #[must_use = "checked instantiation evidence must be consumed or discarded"]
 pub(super) struct CheckedInstanceDerivation {
@@ -263,10 +271,31 @@ impl CheckedPropagationDerivation {
                 seeded.entry(entry.expr).or_insert(entry.value);
             }
         }
-        let mut throwaway = PropagateValues::new();
-        throwaway.seed_substitution(&seeded);
-        if throwaway.rewrite_seeded(&mut executor.ctx.terms, record.before) != record.after {
-            return None;
+        // The VERBATIM replay stays the first attempt, so every record that
+        // seals today seals by exactly the same route.
+        if !Self::seeded_replay_reaches(&mut executor.ctx.terms, &seeded, record) {
+            // The producer may be `VariableSubstitution`, whose
+            // `substitute_term` applies its map to FIXPOINT: on a map hit it
+            // returns `substitute_term(replacement)`, so a replacement that
+            // itself mentions a substituted key is chased before it lands.
+            // `PropagateValues::rewrite` does NOT chase — it returns the
+            // stored value verbatim — so the verbatim replay above
+            // reconstructs a term the pass never wrote whenever the recorded
+            // entries CHAIN, and the record is dropped before the planner
+            // ever sees it. Re-run the replay under the map closed under
+            // itself, which is the same function on an acyclic map.
+            //
+            // This is the seal catching up with the planner: `plan_derive_eq`
+            // already composes a chained entry with `trans`
+            // (`plan_compose_entry_value`, #4751 `_mod_q`), and
+            // `plan_record_bridge` re-derives `before -> after` itself and
+            // refuses unless it reaches the recorded `after`. The record is a
+            // HINT — a pair worth trying — so sealing one more of them grants
+            // no authority; the strict checker still re-validates every step.
+            let closed = Self::close_seeded_substitution(&mut executor.ctx.terms, &seeded)?;
+            if !Self::seeded_replay_reaches(&mut executor.ctx.terms, &closed, record) {
+                return None;
+            }
         }
         Some(Self {
             query_epoch: executor.query_authority_epoch.clone(),
@@ -277,6 +306,61 @@ impl CheckedPropagationDerivation {
             after_entry: executor.ctx.terms.entry_stamp(record.after)?,
             stamp: record.stamp,
         })
+    }
+
+    /// Replay `record.before` under `seeded` and report whether it lands
+    /// exactly on `record.after`.
+    fn seeded_replay_reaches(
+        terms: &mut ay_core::TermStore,
+        seeded: &HashMap<TermId, TermId>,
+        record: &PropagatedRewriteRecord,
+    ) -> bool {
+        let mut throwaway = PropagateValues::new();
+        throwaway.seed_substitution(seeded);
+        throwaway.rewrite_seeded(terms, record.before) == record.after
+    }
+
+    /// Close a seeded substitution map under itself: rewrite every value
+    /// under the map until no value changes, mirroring
+    /// `VariableSubstitution::substitute_term`'s fixpoint application of its
+    /// own map. On an acyclic map the closed map is the same function, so a
+    /// replay through the non-chasing `PropagateValues::rewrite` then
+    /// reproduces what the chasing producer wrote.
+    ///
+    /// Bounded and fail-closed on both sides: a map that has not stabilised
+    /// within [`MAX_SEED_CLOSURE_ROUNDS`] (the shape a cyclic `x |-> f(x)`
+    /// entry would produce, which the producer's own cycle check is supposed
+    /// to have refused) returns `None` and the record is dropped, exactly as
+    /// it is today.
+    fn close_seeded_substitution(
+        terms: &mut ay_core::TermStore,
+        seeded: &HashMap<TermId, TermId>,
+    ) -> Option<HashMap<TermId, TermId>> {
+        // Deterministic visit order: the term store is shared, so a
+        // hash-order-dependent closure would make sealing (and therefore
+        // which proofs certify) vary run to run.
+        let mut keys: Vec<TermId> = seeded.keys().copied().collect();
+        keys.sort_unstable_by_key(|term| term.index());
+        let mut closed = seeded.clone();
+        for _round in 0..MAX_SEED_CLOSURE_ROUNDS {
+            let mut pass = PropagateValues::new();
+            pass.seed_substitution(&closed);
+            let mut changed = false;
+            let mut next = closed.clone();
+            for &key in &keys {
+                let value = *closed.get(&key)?;
+                let rewritten = pass.rewrite_seeded(terms, value);
+                if rewritten != value {
+                    next.insert(key, rewritten);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Some(closed);
+            }
+            closed = next;
+        }
+        None
     }
 
     pub(super) fn into_current(self, executor: &Executor) -> Option<(TermId, (TermId, u32))> {
@@ -308,14 +392,7 @@ pub(super) struct CheckedPropagationEntry {
 
 impl CheckedPropagationEntry {
     pub(super) fn seal(executor: &Executor, entry: &PropagatedEntrySource) -> Option<Self> {
-        // Independent harvest replay through the pass's own classifier: the
-        // asserted defining equality must decompose to exactly this
-        // `expr ↦ value` pair.
-        let (expr, value) =
-            PropagateValues::extract_value_equality(&executor.ctx.terms, entry.source_assertion)?;
-        if expr != entry.expr || value != entry.value {
-            return None;
-        }
+        let (expr, value) = propagation_entry::checked_pair(&executor.ctx.terms, entry)?;
         Some(Self {
             query_epoch: executor.query_authority_epoch.clone(),
             source_context_stamp: executor.ctx.source_context_stamp(),

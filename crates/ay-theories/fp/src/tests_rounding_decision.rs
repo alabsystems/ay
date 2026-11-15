@@ -27,7 +27,7 @@ fn test_rounding_decision(
     let sticky = solver.fresh_var();
     solver.add_clause(CnfClause::unit(if sticky_val { sticky } else { -sticky }));
 
-    let inc = solver.make_rounding_decision(rm, sgn, last, round, sticky);
+    let inc = solver.make_rounding_decision(rm.into(), sgn, last, round, sticky);
     let model = solve_fp_clauses(&solver);
     extract_lit(&model, inc)
 }

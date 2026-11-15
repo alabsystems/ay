@@ -69,6 +69,37 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         })
     }
 
+    /// `term_to_literal` with optional mid-search minting (#6846 BCP
+    /// parity): when `mint_enabled` and the term has no variable yet,
+    /// mint one via `mint_var_for_term` instead of returning `None`.
+    /// Callers that build clauses from the result must treat a clause
+    /// completed this way as a lemma, not a falsified conflict — the
+    /// minted variable is unassigned. The explicit `mint_enabled`
+    /// parameter (production callers pass
+    /// `check::mint_theory_vars_enabled()`) keeps the behavior
+    /// unit-testable without the global flag.
+    pub(super) fn term_to_literal_minting(
+        &mut self,
+        term: TermId,
+        value: bool,
+        ctx: &dyn ay_sat::SolverContext,
+        mint_enabled: bool,
+    ) -> Option<Literal> {
+        if let Some(literal) = self.term_to_literal(term, value) {
+            return Some(literal);
+        }
+        if !mint_enabled {
+            return None;
+        }
+        self.mint_var_for_term(term, ctx).map(|var| {
+            if value {
+                Literal::positive(var)
+            } else {
+                Literal::negative(var)
+            }
+        })
+    }
+
     /// Check if a variable corresponds to a theory atom.
     ///
     /// Uses a dense bitset for O(1) lookup without hashing, falling back to
@@ -148,14 +179,18 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     /// verdict is recorded for both outcomes; `false` entries still serve
     /// the lazy arms' fail-closed memo hits.
     ///
-    /// `euf_prechecked` selects the duplicate-EUF-skip dispatcher variant;
-    /// both variants return identical verdicts for identical inputs (see
-    /// `verify_conflict_semantic_euf_prechecked`), so they share one memo.
+    /// `euf_precheck` carries the verdict of a `verify_euf_conflict_classified`
+    /// the caller already ran on exactly this conflict (the duplicate-EUF-skip
+    /// dispatcher variant); both variants return identical accept/reject
+    /// verdicts for identical inputs, so they share one memo. The memo keeps
+    /// WHAT was established (`ConflictSemanticVerdict`): the
+    /// checked-sat-refutation lane reads only `Reproved` entries as premise
+    /// authority.
     pub(super) fn verify_conflict_semantic_memo(
         &mut self,
         conflict: &[ay_core::TheoryLit],
         terms: &ay_core::TermStore,
-        euf_prechecked: bool,
+        euf_precheck: Option<crate::verification::ConflictSemanticVerdict>,
     ) -> Result<(), crate::verification::VerificationError> {
         let key: Option<Vec<ay_core::TheoryLit>> = self.verify_memo.as_ref().map(|_memo| {
             let mut key = conflict.to_vec();
@@ -163,7 +198,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             key
         });
         if let (Some(memo), Some(key)) = (self.verify_memo.as_deref_mut(), key.as_ref()) {
-            if memo.get(key) == Some(&true) {
+            if memo.get(key).is_some_and(|verdict| verdict.accepts()) {
                 ay_lia::instrument::bump_verify_conflict_ext(true);
                 return Ok(());
             }
@@ -171,19 +206,25 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         // #verify-memo instrumentation: full fail-closed re-verification runs
         // (memo miss, memoized-false, or no memo wired).
         ay_lia::instrument::bump_verify_conflict_ext(false);
-        let result = if euf_prechecked {
-            crate::verification::verify_conflict_semantic_euf_prechecked(
-                conflict,
-                terms,
-                &self.support_axioms,
-            )
-        } else {
-            crate::verification::verify_conflict_semantic(conflict, terms, &self.support_axioms)
-        };
+        let result = crate::verification::verify_conflict_semantic_classified(
+            conflict,
+            terms,
+            &self.support_axioms,
+            euf_precheck,
+            self.verify_memo
+                .as_deref_mut()
+                .map(|memo| memo.scoped_recheck_gate()),
+        );
         if let (Some(memo), Some(key)) = (self.verify_memo.as_deref_mut(), key) {
-            memo.insert(key, result.is_ok());
+            memo.insert(
+                key,
+                match &result {
+                    Ok(verdict) => *verdict,
+                    Err(_) => crate::verification::ConflictSemanticVerdict::Rejected,
+                },
+            );
         }
-        result
+        result.map(|_| ())
     }
 
     pub(super) fn filter_stale_model_equalities(

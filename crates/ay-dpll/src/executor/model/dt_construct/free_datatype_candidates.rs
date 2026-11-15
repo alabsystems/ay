@@ -45,6 +45,15 @@ impl DtBuilder<'_> {
                 return None;
             }
             let cand = self.free_candidate(root, &sort_name, k, excluded)?;
+            // Occurs-guard (#dt-occurs-guard): a candidate whose root
+            // constructor is self-referential for this class can never
+            // satisfy datatype acyclicity under class-uniform selector
+            // projection; skip to the next candidate.
+            if let ModelValue::Datatype { ctor, .. } = &cand {
+                if self.ctor_self_referential(root, ctor) {
+                    continue;
+                }
+            }
             // Honor pinned fields (#dt-pin-selector). `free_candidate` fills a
             // constructor's scalar fields with base defaults; when a member of
             // this class has a selector application `(sel member)` the raw model

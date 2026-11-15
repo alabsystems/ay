@@ -1,0 +1,30 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% Regression test (wrong verdict): the DIMACS CNF header parser read its two
+% counts and dropped the rest of the line.
+%
+% Clause data in DIMACS is a stream -- clauses may legally share a line and
+% span lines -- but the `p cnf <vars> <clauses>` header is not clause data, and
+% this file's header line carries the clause `1 0` after the counts. Under a
+% line-oriented reading the header is malformed and the file must be refused;
+% under the stream reading the clauses are {x1}, {~x1}, {~x1}, three where the
+% header declares two, so the count check must refuse it. Under NEITHER reading
+% is the file satisfiable-as-declared. The parser invented a third reading:
+% `parse_header` returned after two integers, the trailing clause vanished, the
+% formula became {~x1}, {~x1} -- satisfiable -- and the declared count of 2
+% matched the 2 clauses that survived, so nothing caught it.
+%
+% `sol ~x1` then verified an unsatisfiable file as `s VERIFIED SATISFIABLE` at
+% exit 0 under default flags. The independent second reader was written to the
+% same shape and inherited the same lenience, so `--kernel-verify` reported
+% "2 formula constraint(s) cross-checked against the file on disk". The same
+% one-item-per-line class as wrong verdict 25, in the one DIMACS line that is
+% line-oriented.
+%
+% Found by a ninth red team, from a probe left in flight when it was cut off;
+% the header line was its last experiment.
+f 2;
+sol ~x1;
+output NONE;
+conclusion SAT : ~x1;
+end pseudo-Boolean proof;

@@ -394,6 +394,70 @@ fn test_add_clause_at_scope_depth_targets_ancestor_scope() {
     );
 }
 
+/// A clause added for an ancestor scope must survive the pop of the scope it
+/// was added in, also when the next solve rebuilds the clause database from
+/// the original-clause ledger (the pop's clause GC triggers that rebuild).
+/// Before the fix the ledger dropped it with the inner scope, and the second
+/// solve returned a model with `v` false.
+#[test]
+fn test_ancestor_scoped_clause_survives_ledger_rebuild_after_inner_pop() {
+    // v <-> (p or q), defined globally; v forced at depth 1 from depth 2.
+    let mut solver = Solver::new(3);
+    let v = Literal::positive(Variable(0));
+    let p = Literal::positive(Variable(1));
+    let q = Literal::positive(Variable(2));
+    solver.push();
+    solver.push();
+    solver.add_clause_global(vec![v.negated(), p, q]);
+    solver.add_clause_global(vec![v, p.negated()]);
+    solver.add_clause_global(vec![v, q.negated()]);
+    solver.add_clause_at_scope_depth(vec![v], 1);
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+    assert!(solver.pop());
+    solver.add_clause(vec![p.negated()]);
+    solver.add_clause(vec![q.negated()]);
+    let second = solver.solve().into_inner();
+    assert!(
+        second.is_unsat(),
+        "the depth-1 clause must survive the pop of depth 2: {second:?}"
+    );
+    assert!(solver.pop());
+    assert!(
+        matches!(solver.solve().into_inner(), SatResult::Sat(_)),
+        "the depth-1 clause must go with depth 1"
+    );
+}
+
+/// The same across two inner pops: a clause added at depth 3 for depth 1 is
+/// in force until depth 1 itself is popped.
+#[test]
+fn test_ancestor_scoped_clause_survives_every_inner_pop() {
+    let mut solver = Solver::new(3);
+    let v = Literal::positive(Variable(0));
+    let p = Literal::positive(Variable(1));
+    let q = Literal::positive(Variable(2));
+    solver.add_clause_global(vec![v.negated(), p, q]);
+    solver.add_clause_global(vec![v, p.negated()]);
+    solver.add_clause_global(vec![v, q.negated()]);
+    solver.push();
+    solver.push();
+    solver.push();
+    solver.add_clause_at_scope_depth(vec![v], 1);
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+    assert!(solver.pop());
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+    assert!(solver.pop());
+    solver.add_clause(vec![p.negated()]);
+    solver.add_clause(vec![q.negated()]);
+    let result = solver.solve().into_inner();
+    assert!(
+        result.is_unsat(),
+        "depth-1 clause lost after two inner pops: {result:?}"
+    );
+    assert!(solver.pop());
+    assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+}
+
 #[test]
 fn test_pop_clears_scoped_empty_clause_unsat_flag() {
     let mut solver = Solver::new(1);
@@ -1139,17 +1203,12 @@ fn test_solve_with_extension_panics_with_scope_selectors() {
     );
 }
 
-/// Verify that pop() emits an LRAT delete step for the empty clause when
-/// retracting scoped UNSAT (#4475 Fix 2).
-///
-/// The original version of this test used Solver::new (no proof_manager),
-/// so emit_delete was never called — the test verified field cleanup only.
-/// This version uses a proof-enabled solver and inspects the LRAT output.
+/// Historical identity retained: scoped UNSAT is conditional, so there is no
+/// persistent base empty clause to delete when pop() retracts the selector.
 #[test]
 fn test_push_pop_emits_lrat_delete_for_scoped_empty_clause() {
-    // Build the contradiction inside the scope. The guarded input clauses and
-    // the scope-selector assumption give the proof manager a checker-visible
-    // LRAT chain for the scoped empty clause.
+    // The guarded base is satisfiable with the selector true. Its implicit
+    // negative-selector query can be UNSAT without refuting that base.
     let proof = ProofOutput::lrat_text(Vec::new(), 0);
     let mut solver: Solver = Solver::with_proof_output(2, proof);
     let a = Literal::positive(Variable(0));
@@ -1161,16 +1220,10 @@ fn test_push_pop_emits_lrat_delete_for_scoped_empty_clause() {
         solver.solve().into_inner().is_unsat(),
         "scoped contradiction must be UNSAT"
     );
-    assert!(
-        solver.cold.empty_clause_in_proof,
-        "empty clause must be in proof after scoped solve"
-    );
-    let ec_id = solver
-        .cold
-        .empty_clause_lrat_id
-        .expect("empty_clause_lrat_id must be set after scoped LRAT solve");
+    assert!(!solver.has_empty_clause);
+    assert!(!solver.cold.empty_clause_in_proof);
+    assert_eq!(solver.cold.empty_clause_lrat_id, None);
 
-    // Pop must emit an LRAT delete step for the empty clause.
     assert!(solver.pop());
     assert!(
         solver.cold.empty_clause_lrat_id.is_none(),
@@ -1181,27 +1234,28 @@ fn test_push_pop_emits_lrat_delete_for_scoped_empty_clause() {
         "pop must clear has_empty_clause for scoped UNSAT"
     );
 
-    // Extract proof text and verify the delete step references the empty clause ID.
+    assert!(
+        solver.solve().is_sat(),
+        "pop must recover the satisfiable base"
+    );
+
+    // Parse every emitted step: neither a scoped empty addition nor a guessed
+    // empty-clause deletion can be used to close/reopen the persistent stream.
     let proof_output = solver.take_proof_writer().expect("proof writer must exist");
     let proof_text = String::from_utf8(proof_output.into_vec().expect("flush")).expect("UTF-8");
 
-    // LRAT delete format: "<step_id> d <deleted_id1> ... 0"
-    let ec_id_str = ec_id.to_string();
-    let has_delete = proof_text.lines().any(|line| {
-        line.contains(" d ")
-            && line
-                .split_whitespace()
-                .skip(2) // skip step_id and "d"
-                .any(|tok| tok == ec_id_str)
-    });
+    let steps = ay_lrat_check::lrat_parser::parse_text_lrat(&proof_text).expect("LRAT prefix");
     assert!(
-        has_delete,
-        "LRAT proof must contain a delete step for empty clause (ID {ec_id})\nproof:\n{proof_text}",
+        steps.iter().all(|step| !matches!(
+            step,
+            ay_lrat_check::lrat_parser::LratStep::Add { clause, .. } if clause.is_empty()
+        )),
+        "scoped result must not close the base stream: {proof_text}"
     );
 }
 
-/// Repeated scoped UNSAT cycles in LRAT mode must emit a fresh empty-clause
-/// proof step on each solve.
+/// Historical identity retained: repeated scoped UNSAT cycles must never emit
+/// a base empty clause, and each pop must recover a satisfiable base.
 #[test]
 fn test_lrat_repeated_scoped_unsat_cycles_emit_empty_clause_each_time() {
     let proof = ProofOutput::lrat_text(Vec::new(), 0);
@@ -1214,7 +1268,10 @@ fn test_lrat_repeated_scoped_unsat_cycles_emit_empty_clause_each_time() {
     solver.add_clause(vec![x0.negated()]);
     let first = solver.solve().into_inner();
     assert!(first.is_unsat(), "first scoped contradiction must be UNSAT");
+    assert!(!solver.has_empty_clause);
+    assert!(!solver.cold.empty_clause_in_proof);
     assert!(solver.pop(), "first pop must succeed");
+    assert!(solver.solve().is_sat());
 
     solver.push();
     solver.add_clause(vec![x1]);
@@ -1224,22 +1281,26 @@ fn test_lrat_repeated_scoped_unsat_cycles_emit_empty_clause_each_time() {
         second.is_unsat(),
         "second scoped contradiction must remain UNSAT after pop/push reuse"
     );
+    assert!(!solver.has_empty_clause);
+    assert!(!solver.cold.empty_clause_in_proof);
+    assert!(solver.pop(), "second pop must succeed");
+    assert!(solver.solve().is_sat());
 
     let proof_output = solver.take_proof_writer().expect("proof writer must exist");
     let proof_text = String::from_utf8(proof_output.into_vec().expect("flush")).expect("UTF-8");
-    let empty_clause_adds = proof_text
-        .lines()
-        .filter(|line| {
-            !line.contains(" d ")
-                && line
-                    .split_whitespace()
-                    .nth(1)
-                    .is_some_and(|token| token == "0")
+    let steps = ay_lrat_check::lrat_parser::parse_text_lrat(&proof_text).expect("LRAT prefix");
+    let empty_clause_adds = steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step,
+                ay_lrat_check::lrat_parser::LratStep::Add { clause, .. } if clause.is_empty()
+            )
         })
         .count();
     assert_eq!(
-        empty_clause_adds, 2,
-        "each scoped UNSAT must emit its own empty clause proof step\nproof:\n{proof_text}"
+        empty_clause_adds, 0,
+        "neither scoped UNSAT may refute the persistent base\nproof:\n{proof_text}"
     );
 }
 

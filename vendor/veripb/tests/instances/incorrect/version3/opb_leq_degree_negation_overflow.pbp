@@ -1,0 +1,8 @@
+pseudo-Boolean proof version 3.0
+% Regression test: the OPB parser negated the degree of a `<=` constraint in the same
+% integer width, so `<= i64::MIN` wrapped and the infeasible input constraint was stored
+% as the trivially true `1 ~x1 >= -9223372036854775807`. The instance has no solution.
+f 1 ;
+output NONE;
+conclusion SAT : ~x1 ;
+end pseudo-Boolean proof;

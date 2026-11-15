@@ -132,6 +132,7 @@ fn mixed_order_identity(pruned_first: bool) -> (String, String, usize, usize) {
         .map(|obligation| obligation.into_parts().0)
         .collect();
     let identity = obligation_set_sha256(
+        ay_chc::NORMALIZED_CHC_INPUT_SCHEMA,
         &source_sha256,
         source_bytes,
         &pruned_ids,

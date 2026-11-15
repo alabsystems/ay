@@ -17,6 +17,7 @@ fn array_clause_schema_charge_is_quadratic_not_cubic() {
         work: 14_134,
         bytes: 206_455,
         unfolded_work: 1_488,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     for kind in [
@@ -77,6 +78,7 @@ fn rebounded_charges_still_exhaust_a_genuinely_wide_lemma() {
         work: 1,
         bytes: 1,
         unfolded_work: 40_000,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (work, _) =
@@ -94,6 +96,7 @@ fn rebounded_charges_still_exhaust_a_genuinely_wide_lemma() {
         work: 1,
         bytes: 1024 * 1024 * 1024,
         unfolded_work: 1,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (_, bytes) =
@@ -106,6 +109,7 @@ fn rebounded_charges_still_exhaust_a_genuinely_wide_lemma() {
         work: usize::MAX,
         bytes: usize::MAX,
         unfolded_work: usize::MAX,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     assert_eq!(
@@ -127,6 +131,7 @@ fn rebounded_charges_are_levied_once_per_step() {
         work: 14_134,
         bytes: 206_455,
         unfolded_work: 1_488,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let step = ProofStep::TheoryLemma {
@@ -168,6 +173,7 @@ fn strict_step_charge_meters_both_array_schemas_without_a_quadratic_precharge() 
         work: 1,
         bytes: 1,
         unfolded_work: 40_000,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let make = |kind| ProofStep::TheoryLemma {
@@ -342,6 +348,7 @@ fn test_datatype_registry_meter_covers_active_declaration_backed_kinds() {
         work: 11,
         bytes: 128,
         unfolded_work: 7,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let datatype_registry = RegistryPayloadStats {
@@ -388,6 +395,7 @@ fn test_string_ground_meter_covers_decoding_clones_and_tables() {
         work: 23,
         bytes: 4096,
         unfolded_work: 23,
+        fp_assignments: 0,
         order_assignments: 0,
     };
     let (work, bytes) = semantic_validator_charge(&step, payload, SemanticChargeClass::General)
@@ -417,6 +425,7 @@ fn test_order_ite_meter_uses_complete_preorder_enumeration_factor() {
         work: 17,
         bytes: 31,
         unfolded_work: 13,
+        fp_assignments: 0,
         order_assignments: crate::checker::order_ite_assignment_count(3),
     };
     let base_work =
@@ -447,11 +456,231 @@ fn test_ext_diff_meter_multiplies_reachable_payload_per_binding() {
         work: 100,
         bytes: 200,
         unfolded_work: 100,
+        fp_assignments: 0,
         order_assignments: 0,
     };
 
-    let (work, bytes) = ext_diff_registry_charge(&proof, &terms, payload)
+    let (work, bytes) = ext_diff_registry_charge(&proof, &terms, payload, &mut |_, _| true)
         .expect("small checked products should fit usize");
     assert!(work > 2 * payload.work);
     assert!(bytes >= 2 * payload.bytes);
+}
+
+/// The read-over-write and extensionality classes charge a constant number of
+/// slot reads per reachable-DAG node and are capped by the `General` product
+/// they replace, so they are tightenings at every payload.
+///
+/// The payloads are the ones `--probe-strict-check` reported on
+/// `QF_AX/swap/swap_t3_np_nf_ai_00008_005` (unbudgeted, explicit proof
+/// demand): the widest `ArraySelectStore` lemma and one `ArrayExtensionality`
+/// lemma. Under the `General` product those two steps alone precharged
+/// 22_335_076 and 89_151_364 work; 268 such lemmas summed 2.68G against a
+/// 350M envelope and withheld a complete, trust-free refutation.
+#[test]
+fn array_row_and_extensionality_shape_charges_are_linear_and_capped() {
+    let terms = TermStore::new();
+    let lemma = |kind| ProofStep::TheoryLemma {
+        theory: "AX".to_string(),
+        clause: Vec::new(),
+        farkas: None,
+        kind,
+        lia: None,
+    };
+
+    let row_payload = PayloadStats {
+        work: 1_278,
+        bytes: 15_553,
+        unfolded_work: 4_726,
+        fp_assignments: 0,
+        order_assignments: 0,
+    };
+    for index_eq in [true, false] {
+        let step = lemma(TheoryLemmaKind::ArraySelectStore { index_eq });
+        assert_eq!(
+            select_semantic_charge_class(&step, &terms),
+            SemanticChargeClass::ArrayRowShape
+        );
+        let (work, bytes) =
+            semantic_validator_charge(&step, row_payload, SemanticChargeClass::ArrayRowShape)
+                .expect("linear charge fits usize");
+        assert_eq!(
+            work,
+            row_payload.work * semantic_charge::ARRAY_ROW_SHAPE_WORK_FACTOR
+                + semantic_charge::ARRAY_ROW_SHAPE_WORK_FACTOR
+        );
+        assert_eq!(bytes, row_payload.bytes);
+        // The product this replaces is the probe's reported 22_335_076.
+        assert_eq!(
+            semantic_charge::replaced_general_product(row_payload, 1),
+            22_335_076
+        );
+        assert!(work < 100_000, "{work}");
+    }
+
+    let ext_payload = PayloadStats {
+        work: 2_146,
+        bytes: 25_777,
+        unfolded_work: 9_442,
+        fp_assignments: 0,
+        order_assignments: 0,
+    };
+    let step = lemma(TheoryLemmaKind::ArrayExtensionality);
+    assert_eq!(
+        select_semantic_charge_class(&step, &terms),
+        SemanticChargeClass::ArrayExtensionalityShape
+    );
+    let (work, bytes) = semantic_validator_charge(
+        &step,
+        ext_payload,
+        SemanticChargeClass::ArrayExtensionalityShape,
+    )
+    .expect("linear charge fits usize");
+    assert_eq!(
+        work,
+        ext_payload.work * semantic_charge::ARRAY_EXTENSIONALITY_SHAPE_WORK_FACTOR
+            + semantic_charge::ARRAY_EXTENSIONALITY_SHAPE_WORK_FACTOR
+    );
+    // Bytes: the binding vector on top of the payload, capped by the private
+    // model's `2 * bytes` it replaces.
+    assert_eq!(
+        bytes,
+        ext_payload.bytes + ext_payload.work * 3 * size_of::<TermId>()
+    );
+    assert!(bytes <= ext_payload.bytes * 2, "{bytes}");
+    assert_eq!(
+        semantic_charge::replaced_general_product(ext_payload, 1),
+        89_151_364
+    );
+    assert!(work < 200_000, "{work}");
+
+    // The cap: where the `General` product is already below the linear model
+    // the class charges the product, never more.
+    let tiny = PayloadStats {
+        work: 1,
+        bytes: 8,
+        unfolded_work: 1,
+        fp_assignments: 0,
+        order_assignments: 0,
+    };
+    let (work, _) = semantic_validator_charge(
+        &lemma(TheoryLemmaKind::ArraySelectStore { index_eq: true }),
+        tiny,
+        SemanticChargeClass::ArrayRowShape,
+    )
+    .expect("tiny charge fits usize");
+    assert_eq!(work, semantic_charge::replaced_general_product(tiny, 1));
+}
+
+/// Mutation differential for the `ArrayRowShape` class, end to end through
+/// the metered strict walk.
+///
+/// A twelve-level swap chain cites the previous array twice per level, so the
+/// literal's TREE unfolds about 2^12-fold while its DAG grows by three nodes
+/// per level — the shape of every `QF_AX/swap` file. Under the `General`
+/// product the ROW1 lemma's precharge alone exceeds a 1M envelope by two
+/// orders of magnitude (asserted below from the same payload meter the walk
+/// uses), so on the previous charge model this walk is refused with
+/// `ResourceLimit`. With the class the whole refutation checks inside 1M —
+/// and the SAME envelope still refuses the forged twin (the read-back equated
+/// with an unrelated `w`) with a typed `InvalidTheoryLemma`, i.e. the
+/// validator ran and the meter did not decide the verdict.
+#[test]
+fn shared_store_chain_row_lemma_checks_under_a_tight_envelope_and_a_forgery_is_refused() {
+    use ay_core::{ArraySort, Proof, ProofId};
+
+    const ENVELOPE: usize = 1_000_000;
+
+    let mut terms = TermStore::new();
+    let array_sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+    let mut chain = terms.mk_var("a", array_sort.clone());
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    for _ in 0..12 {
+        let read = terms.mk_app(Symbol::named("select"), vec![chain, j], Sort::Int);
+        chain = terms.mk_app(
+            Symbol::named("store"),
+            vec![chain, i, read],
+            array_sort.clone(),
+        );
+    }
+    let v = terms.mk_var("v", Sort::Int);
+    let w = terms.mk_var("w", Sort::Int);
+    let stored = terms.mk_app(Symbol::named("store"), vec![chain, i, v], array_sort);
+    let read_back = terms.mk_app(Symbol::named("select"), vec![stored, i], Sort::Int);
+    let row1 = terms.mk_app(Symbol::named("="), vec![read_back, v], Sort::Bool);
+    let forged = terms.mk_app(Symbol::named("="), vec![read_back, w], Sort::Bool);
+
+    let refutation = |terms: &mut TermStore, lemma: TermId| -> Proof {
+        let negated = terms.mk_not_raw(lemma);
+        let mut proof = Proof::new();
+        proof.steps.push(ProofStep::Assume(negated));
+        proof.steps.push(ProofStep::TheoryLemma {
+            theory: "arrays".to_string(),
+            clause: vec![lemma],
+            farkas: None,
+            kind: TheoryLemmaKind::ArraySelectStore { index_eq: true },
+            lia: None,
+        });
+        proof.steps.push(ProofStep::Resolution {
+            clause: Vec::new(),
+            pivot: lemma,
+            clause1: ProofId(0),
+            clause2: ProofId(1),
+        });
+        proof
+    };
+    let run = |proof: &Proof, terms: &TermStore, budget: usize| {
+        let mut spent = 0usize;
+        let outcome = check_proof_strict_with_context_and_progress(
+            proof,
+            terms,
+            None,
+            None,
+            None,
+            &mut |work, _bytes| {
+                spent += work;
+                spent <= budget
+            },
+        );
+        (outcome.map(|_| ()), spent)
+    };
+
+    let valid = refutation(&mut terms, row1);
+
+    // The replaced product for the lemma step, from the walk's own payload
+    // meter: far above the envelope the whole walk fits in below.
+    let negated_row1 = terms.mk_not_raw(row1);
+    let derived: Vec<Option<Vec<TermId>>> = vec![Some(vec![negated_row1])];
+    let payload = meter_step_term_payload(
+        &valid.steps[1],
+        &terms,
+        &derived,
+        &mut TermCostMemo::default(),
+        &mut |_, _| true,
+    )
+    .expect("payload meter fits usize");
+    assert!(
+        semantic_charge::replaced_general_product(payload, 1) > 100 * ENVELOPE,
+        "the fixture must be one the General product refuses: {payload:?}"
+    );
+
+    let (outcome, spent) = run(&valid, &terms, usize::MAX);
+    assert!(
+        outcome.is_ok(),
+        "the ROW1 refutation must check: {outcome:?}"
+    );
+    assert!(
+        spent < ENVELOPE,
+        "whole walk must fit the envelope: {spent}"
+    );
+    let (outcome, _) = run(&valid, &terms, ENVELOPE);
+    assert!(outcome.is_ok(), "under the envelope: {outcome:?}");
+
+    // Mutation: same shape, same envelope, wrong stored value.
+    let forged_proof = refutation(&mut terms, forged);
+    let (outcome, _) = run(&forged_proof, &terms, ENVELOPE);
+    assert!(
+        matches!(outcome, Err(ProofCheckError::InvalidTheoryLemma { .. })),
+        "the forged ROW1 lemma must be refused by the validator, not the meter: {outcome:?}"
+    );
 }

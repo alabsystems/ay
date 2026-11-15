@@ -243,6 +243,13 @@ fn check_clone_fanout(
 /// fixed one-unit charge would undercount wide opaque enum subjects.
 fn shallow_expr_clone_work(expr: &ChcExpr, cap: usize) -> Result<usize, RouteAdmissionFailure> {
     let direct_entries = match expr {
+        ChcExpr::ArrayLambda(_) => {
+            return Err(cap_failure(
+                "unsupported array lambda projection",
+                usize::MAX,
+                cap,
+            ))
+        }
         ChcExpr::Op(_, arguments)
         | ChcExpr::PredicateApp(_, _, arguments)
         | ChcExpr::FuncApp(_, _, arguments) => arguments.len(),
@@ -585,6 +592,7 @@ impl DtProjectionMeter<'_> {
         loop {
             self.charge_work(1)?;
             match current {
+                ChcExpr::ArrayLambda(_) => return Ok(None),
                 ChcExpr::Var(variable) => {
                     return self.datatype_sort_after_array_layers(&variable.sort, array_layers);
                 }
@@ -721,6 +729,13 @@ impl DtProjectionMeter<'_> {
         while let Some(expr) = expression_stack.pop() {
             self.charge_work(1)?;
             match expr {
+                ChcExpr::ArrayLambda(_) => {
+                    return Err(cap_failure(
+                        "unsupported array lambda projection",
+                        usize::MAX,
+                        self.caps.max_expansion_work,
+                    ))
+                }
                 ChcExpr::FuncApp(_, _, arguments) => {
                     expression_stack.extend(arguments.iter().map(AsRef::as_ref));
                 }
@@ -929,7 +944,7 @@ impl SortSurface<'_> {
                             )
                         })?;
                     charge_name_bytes(stats, self.caps, name.len())?;
-                    let metadata_id = std::sync::Arc::as_ptr(constructors) as usize;
+                    let metadata_id = constructors.node_addr() as usize;
                     if self
                         .expanded_datatypes
                         .get(&metadata_id)
@@ -1024,6 +1039,7 @@ struct ClauseSurface<'a> {
     clause_index: usize,
     clause_nodes: usize,
     variable_occurrences: usize,
+    allow_lambda_observations: bool,
 }
 
 impl ClauseSurface<'_> {
@@ -1075,6 +1091,62 @@ impl ClauseSurface<'_> {
             }
 
             match current {
+                ChcExpr::ArrayLambda(lambda) => {
+                    if !self.allow_lambda_observations {
+                        return Err(cap_failure(
+                            "unsupported array lambda route",
+                            usize::MAX,
+                            self.caps.max_variable_occurrences_per_clause,
+                        ));
+                    }
+                    let extra = ChcProblem::lambda_observation_work(
+                        lambda,
+                        self.caps
+                            .max_expr_nodes_per_clause
+                            .saturating_sub(self.clause_nodes),
+                        self.caps
+                            .max_total_name_bytes
+                            .saturating_sub(stats.total_name_bytes),
+                        self.caps.max_expr_depth.saturating_sub(depth),
+                        || check_boundary(self.cancellation, self.deadline).is_err(),
+                    );
+                    check_boundary(self.cancellation, self.deadline)?;
+                    let (extra, copied_name_bytes) = extra.ok_or_else(|| {
+                        RouteAdmissionFailure::Cap(
+                            "unsupported or over-budget scalar lambda observation".to_string(),
+                        )
+                    })?;
+                    charge_name_bytes(stats, self.caps, copied_name_bytes)?;
+                    self.clause_nodes = self.clause_nodes.checked_add(extra).ok_or_else(|| {
+                        cap_failure(
+                            "lambda observation nodes",
+                            usize::MAX,
+                            self.caps.max_expr_nodes_per_clause,
+                        )
+                    })?;
+                    stats.total_expr_nodes =
+                        stats.total_expr_nodes.checked_add(extra).ok_or_else(|| {
+                            cap_failure(
+                                "lambda observation nodes",
+                                usize::MAX,
+                                self.caps.max_total_expr_nodes,
+                            )
+                        })?;
+                    if stats.total_expr_nodes > self.caps.max_total_expr_nodes {
+                        return Err(cap_failure(
+                            "lambda observation nodes",
+                            stats.total_expr_nodes,
+                            self.caps.max_total_expr_nodes,
+                        ));
+                    }
+                    self.push_children(
+                        std::iter::once(lambda.body().as_ref())
+                            .chain(lambda.captures().iter().map(|value| value.as_ref())),
+                        depth,
+                        &mut stack,
+                        stats,
+                    )?;
+                }
                 ChcExpr::Var(var) => {
                     charge_name_bytes(stats, self.caps, var.name.len())?;
                     self.variable_occurrences =
@@ -1219,6 +1291,27 @@ pub(super) fn scan_problem_surface(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<RouteSurfaceStats, RouteAdmissionFailure> {
+    scan_problem_surface_impl(problem, caps, cancellation, deadline, false)
+}
+
+/// Only the finite-key route has a closed-template observation translation.
+/// Other transforms retain their existing functional-array refusal.
+pub(super) fn scan_const_key_problem_surface(
+    problem: &ChcProblem,
+    caps: RouteSurfaceCaps,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<RouteSurfaceStats, RouteAdmissionFailure> {
+    scan_problem_surface_impl(problem, caps, cancellation, deadline, true)
+}
+
+fn scan_problem_surface_impl(
+    problem: &ChcProblem,
+    caps: RouteSurfaceCaps,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    allow_lambda_observations: bool,
+) -> Result<RouteSurfaceStats, RouteAdmissionFailure> {
     let mut stats = RouteSurfaceStats::default();
     let mut sort_surface = SortSurface {
         caps,
@@ -1269,6 +1362,7 @@ pub(super) fn scan_problem_surface(
             clause_index,
             clause_nodes: 0,
             variable_occurrences: 0,
+            allow_lambda_observations,
         };
         for (_, args) in &clause.body.predicates {
             for arg in args {
@@ -1591,7 +1685,7 @@ mod tests {
         for level in 1..=depth {
             child = ChcSort::Datatype {
                 name: format!("BinaryDt{level}"),
-                constructors: Arc::new(vec![ChcDtConstructor {
+                constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                     name: format!("mk-BinaryDt{level}"),
                     selectors: vec![
                         ChcDtSelector {
@@ -1612,7 +1706,7 @@ mod tests {
     fn nullary_enum(constructor_count: usize) -> ChcSort {
         ChcSort::Datatype {
             name: "NullaryEnum".to_string(),
-            constructors: Arc::new(
+            constructors: crate::ChcDtConstructors::new(
                 (0..constructor_count)
                     .map(|index| ChcDtConstructor {
                         name: format!("Nullary{index}"),
@@ -2037,7 +2131,7 @@ mod tests {
         let constructor_name = "make-Shared";
         let datatype = ChcSort::Datatype {
             name: "Shared".to_string(),
-            constructors: Arc::new(vec![ChcDtConstructor {
+            constructors: crate::ChcDtConstructors::new(vec![ChcDtConstructor {
                 name: constructor_name.to_string(),
                 selectors: vec![ChcDtSelector {
                     name: selector_name.clone(),
@@ -2593,5 +2687,55 @@ mod tests {
         assert!(
             matches!(failure, RouteAdmissionFailure::Cap(reason) if reason.contains("total surface name bytes 4096 > cap 4095"))
         );
+    }
+    fn scalar_lambda_problem() -> ChcProblem {
+        let index = crate::ChcVar::new("i", ChcSort::Int);
+        let capture = crate::ChcVar::new("capture", ChcSort::Int);
+        let body = ChcExpr::Op(
+            ChcOp::Add,
+            vec![
+                std::sync::Arc::new(ChcExpr::Var(index.clone())),
+                std::sync::Arc::new(ChcExpr::Var(capture.clone())),
+            ],
+        );
+        let lambda = ChcExpr::array_lambda(index, body).expect("typed scalar lambda");
+        constraint_problem(ChcExpr::eq(
+            ChcExpr::select(lambda, ChcExpr::Int(0)),
+            ChcExpr::Var(capture),
+        ))
+    }
+
+    #[test]
+    fn lambda_observation_is_scoped_to_const_key_admission() {
+        let problem = scalar_lambda_problem();
+        let token = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            matches!(scan_problem_surface(&problem, caps(), &token, deadline), Err(RouteAdmissionFailure::Cap(reason)) if reason.contains("unsupported array lambda route"))
+        );
+        let observed = scan_const_key_problem_surface(&problem, caps(), &token, deadline)
+            .expect("finite observations have explicit admission");
+        assert!(observed.total_expr_nodes > 10);
+        assert!(observed.total_name_bytes > "capture".len());
+    }
+
+    #[test]
+    fn lambda_observation_surface_preserves_node_and_name_caps() {
+        let problem = scalar_lambda_problem();
+        let token = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let measured = scan_const_key_problem_surface(&problem, caps(), &token, deadline)
+            .expect("measured surface");
+        let mut exact = caps();
+        exact.max_total_expr_nodes = measured.total_expr_nodes;
+        exact.max_total_name_bytes = measured.total_name_bytes;
+        scan_const_key_problem_surface(&problem, exact, &token, deadline)
+            .expect("exact existing envelope");
+        let mut below = exact;
+        below.max_total_expr_nodes -= 1;
+        assert!(scan_const_key_problem_surface(&problem, below, &token, deadline).is_err());
+        below = exact;
+        below.max_total_name_bytes -= 1;
+        assert!(scan_const_key_problem_surface(&problem, below, &token, deadline).is_err());
     }
 }

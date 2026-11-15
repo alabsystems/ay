@@ -29,6 +29,27 @@ pub use crate::combined_solvers::TheoryCombiner;
 // Attributed reason for a refutation that carries no derivation. Public
 // because `Executor::last_proof_decline` returns it; diagnostic only.
 pub use proof::ProofDeclineMechanism;
+// What the proof held when the last-resort closer ran. Public because
+// `Executor::last_trust_closure_census` returns it; diagnostic only.
+pub use proof::{
+    CanonicalRootShape, CanonicalWorkRefusal, OverridePlanCensus, OverridePlanExit,
+    ParsedRootShape, SourceRootCensus, SurfaceSourceRefusal, UnboundedCensus,
+};
+pub use proof::{
+    SatReconstructionOutcome, SatReconstructionRecord, SemanticTokenCensus, SemanticTokenSource,
+    TrustClosureCensus,
+};
+// Which independent re-decision authorised a published `unsat` that has no
+// derivation, and the evidence level of the published `unsat`. Public because
+// `Executor::last_unsat_corroboration` / `last_command_unsat_evidence` return
+// them; diagnostic only.
+pub use proof::{
+    CorroborationMethod, CorroborationSource, UnsatCorroboration, UnsatEvidence, UnsatEvidenceLevel,
+};
+// The satisfiability-preserving strengthenings a checking re-solve runs without.
+pub use strengthening::{Strengthening, StrengtheningSet};
+// Public because `Executor::set_candidate_model_policy` takes it.
+pub use model::unknown_candidate::CandidateModelPolicy;
 // Format helpers - format_sort, format_symbol now used in executor/commands.rs
 
 // Incremental state types
@@ -54,9 +75,18 @@ mod core_minimize;
 mod diff_logic;
 pub(crate) mod dl_theory;
 mod dt_axioms;
+mod engine_route;
+// `--engine=own:<families>` (measurement only): the CLI names the families
+// the CDCL(T) kernel owns.
+pub use engine_route::{set_kernel_owned_families, KernelFamily};
+mod branch_assign_elim;
+mod engine_shadow;
 mod exact_exists_bounds;
 mod exact_forall_exists;
+mod expansion;
 mod finite_model_mbqi;
+pub(crate) mod ground_solve_carry;
+mod guard_nodes;
 pub(crate) mod ite_lift;
 pub(crate) mod lean_firewall;
 pub(crate) mod lemma_cache;
@@ -65,16 +95,24 @@ mod logic_detect;
 mod mbqi;
 mod mod_div_elim;
 mod model;
+pub(crate) use model::evaluation_copies::{TacticConstructionScope, TacticDeclarationScope};
+pub(crate) use model::EvaluationReadScope;
 mod nra_model_state;
 pub(crate) mod optimization;
 mod partition_rescue;
+mod premise_surface;
 mod proof;
 mod proof_array_ext;
+pub use premise_surface::{normalize_premise_surface, premise_int_let_binding};
+mod proof_authored_assume_spelling;
 mod proof_euf_lemma;
 mod proof_fresh_def;
 mod proof_original_rebuild;
 mod proof_repair;
+/// The extension certifies its level-0 explanations with it (propagation.rs).
+pub(crate) use proof_repair::proof_farkas::try_lra_farkas_reconstruction;
 use proof_repair::*;
+mod eq_qe_lane;
 pub(crate) mod proof_propagated_rewrite;
 mod proof_resolution;
 mod proof_rewrite;
@@ -85,16 +123,20 @@ mod purify_bool_args;
 mod purify_int_uf_arith;
 mod qe_prepass;
 mod qe_route;
+mod qlra_lane;
+mod qsat_route;
 mod quantified_sat;
 mod quantifier_loop;
 mod query_authority;
 mod query_role;
 pub(crate) use query_role::QueryPublicationRole;
+mod complex_product;
 mod query_state;
 mod rewrite_const_array_reads;
 mod rm_domain;
+mod simplifier_stage;
 mod solve_deadline;
-mod stats_contract;
+mod strengthening;
 pub(crate) mod theories;
 mod uflia_model_repair;
 mod unsat_cert;
@@ -107,7 +149,10 @@ pub(in crate::executor) use query_authority::AuthoredPlainHardQueryPermit;
 pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
 pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
 include!("executor/query_state_exports.rs");
-pub(crate) use solve_deadline::SolveDeadlineCell;
+pub(crate) use check_sat::with_interruptible_publication_context;
+#[cfg(test)]
+pub(crate) use proof::{set_expansion_cert_mutation, ExpansionCertMutation};
+pub(crate) use solve_deadline::{CommandDeadlineScope, CommandDeadlineState, SolveDeadlineCell};
 pub(crate) use unsat_cert::{probe_cert_reject_raw, UnsatCertificate};
 
 /// Red zone for `stacker::maybe_grow` at the executor entry points
@@ -159,6 +204,7 @@ pub(crate) use theories::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET};
 pub struct Executor {
     /// Frontend context for elaboration
     pub(crate) ctx: Context,
+    pub(crate) clause_event_capture: ay_sat::ClauseEventCapture,
     /// Opaque identity of the currently active public decision attempt.
     /// Rotated by `begin_public_solve` before preflight/elaboration so a permit
     /// from an earlier, textually identical query can never become current.
@@ -242,6 +288,17 @@ pub struct Executor {
     /// re-solve fires AT MOST ONCE per public check-sat; a still-rejected
     /// re-solve stays the fail-closed Unknown.
     pub(crate) qfax_isolated_retry_done: bool,
+    /// #array-refutation-retry: the independent gate refuted a model
+    /// that falsifies an array assertion this public check-sat (see
+    /// `array_refutation_resolve`).
+    pub(crate) array_model_refuted: bool,
+    /// #array-refutation-retry: retry-once latch (loop guard).
+    pub(crate) array_refutation_retry_done: bool,
+    /// #array-refutation-retry: fixpoint-facing flag for that re-solve;
+    /// the array axiom fixpoint asserts the written-index read instances
+    /// while it is set. Deliberately NOT cleared at `check_sat_internal`
+    /// entry: the re-solve re-enters that fn and must preserve it.
+    pub(crate) array_refutation_instances_armed: bool,
     /// #qfax-isolated-lane-retry: route-facing flag for that re-solve — it
     /// suppresses the isolated ladder so the QfAuflia arm goes straight to
     /// `solve_auf_lia`, whose `has_substantive_int_constraints` clause
@@ -250,6 +307,13 @@ pub struct Executor {
     /// `check_sat_internal` entry: the re-solve re-enters that fn and must
     /// preserve it.
     pub(crate) qfax_force_combiner: bool,
+    /// Set only around the AUFLIA preprocessing fixpoint call for a window
+    /// where the branch-assignment rewrite fired: the rewritten window no
+    /// longer reaches the original conditional store equalities, and the
+    /// fixpoint must not saturate axioms over them from the whole term
+    /// store (measured: 22k terms / 229k decisions vs 2.6k / 1.2k scoped).
+    /// Arms `live_array_axiom_scope_wanted` for that one call.
+    pub(crate) branch_assign_scoped_fixpoint: bool,
     /// #uflia-cong-repair-arm: enable-flag threaded into the UFLIA
     /// `TheoryCombiner` for the accept-point UF function-graph consistency
     /// scan. Set `true` ONLY inside `check_sat_guarded` for the single armed
@@ -377,6 +441,49 @@ pub struct Executor {
     /// defensively at `check_sat` entry. Can only be `true` under both
     /// `AY_DT_LAZY_AUFLIA` and `AY_DT_LAZY_AUFLIA_EAGER`.
     pub(crate) dt_lazy_auflia_eager_arm: bool,
+    /// `true` only inside the DT+BV bit-blast routes
+    /// (`solve_dt_ufbv`/`solve_dt_aufbv`): permits
+    /// `dt_selector_axioms_to_depth` to omit exhaustiveness (D) and
+    /// tester-exclusion (G) clauses for final-frontier selector terms
+    /// (#dt-frontier-tester-diet). Their tester atoms are otherwise
+    /// unreferenced on a quantifier-free bit-blast route, so the clauses
+    /// only constrain atoms nothing reads. The generator additionally
+    /// requires a quantifier-free live term set: in quantified rounds
+    /// frontier terms become E-matching/demand seeds for the next round
+    /// (measured loss: AUFBVDTLIA rec-fun QuickSort `unsat` -> `unknown`
+    /// when unscoped), and combiner-hosted DT routes can read tester
+    /// atoms as theory literals. Set/restored around those two routes'
+    /// solves; never a verdict change where it applies.
+    pub(crate) dt_frontier_tester_diet_armed: bool,
+    /// `true` while a SCOPED, budget-capped internal probe owns the solve, so
+    /// the optional lazy-DT-AUFLIA lane must stand down.
+    ///
+    /// The lane takes HALF the remaining budget for its speculative attempt and
+    /// falls through on a miss. That trade is right for a public query, whose
+    /// budget is the whole `-T:`; it is wrong inside a probe that was already
+    /// capped precisely so it cannot eat the obligation envelope — there the
+    /// half it spends is half of an 8 s cap, and the eager authority that
+    /// actually produces the probe's candidate is left with the remainder. The
+    /// DT-MBQI-Sat certificate's re-sequence probe
+    /// (`dt_cert_resequence_probe`) is that case: with the lane reachable on
+    /// its route the MIN1 grant is lost and a published `sat` degrades to
+    /// `unknown` (`dt_cert_grants_min1_under_on` and its two siblings).
+    ///
+    /// Set and restored around the probe's scoped `route_to_solver`, and reset
+    /// defensively at `check_sat_guarded` entry. Never a verdict change of its
+    /// own: it only withholds an optional speculative lane, leaving the eager
+    /// authority — which is terminal on every route that consults the lane —
+    /// exactly as it would run without it.
+    pub(crate) dt_lazy_lane_suppressed_for_scoped_probe: bool,
+    /// #dt-lazy-pre-attempt: `true` once the current DT+LIA dispatch has run
+    /// its speculative lazy-lane attempt on the array-enabled residual
+    /// (`try_dt_auf_lazy_pre_attempt`, invoked ahead of `solve_dt_uf_lia`).
+    /// `solve_dt_auflia` consults it to skip re-running the IDENTICAL attempt
+    /// (same residual, same acceptance) after the UF route's eager authority
+    /// has already spent the budget the attempt needed. Set only inside the
+    /// `route_to_solver` DT+LIA arms and reset at `check_sat_guarded` entry,
+    /// so it can never suppress a later independent query's first attempt.
+    pub(crate) dt_auflia_lazy_pre_attempted: bool,
     /// #abv-subst-model-retry: `true` while the current check-sat's eager BV
     /// lane solve (QF_BV/QF_ABV/QF_UFBV/QF_AUFBV single-shot) ran preprocessing
     /// with VariableSubstitution. Scopes the model-rejection retry signal to
@@ -386,14 +493,20 @@ pub struct Executor {
     /// preprocessor substitution map was actually created.
     pub(crate) bv_subst_lane: bool,
     /// #abv-subst-model-retry: set when a model built after BV variable
-    /// substitution recovery was REFUTED — either by the in-loop semantic BV
-    /// validator (`finalize_bv_model_validation_failure`) or by the independent
-    /// model gate's `ModelViolates` arm while `bv_subst_lane`. Read once by
-    /// `check_sat_guarded` to re-solve with preprocessing disabled. Reset at
-    /// `check_sat_guarded` entry.
+    /// substitution recovery was REFUTED — by the in-loop semantic BV
+    /// validator (`finalize_bv_model_validation_failure`) or the strict oracle
+    /// — or withheld by any independent-gate or SAT-emission downgrade
+    /// (`downgrade_sat_after_gate`) while `bv_subst_lane`. Read once by
+    /// `check_sat_guarded` (`bv_subst_retry_armed`, which also counts every
+    /// validation-pipeline rejection) to re-solve with preprocessing disabled.
+    /// Reset at `check_sat_guarded` entry.
     pub(crate) bv_subst_model_rejected: bool,
     /// Permit-bound semantic routing state for exact definitional-UF rejection recovery.
     pub(in crate::executor) ite_uf_definition_recovery: ExactIteUfDefinitionRecovery,
+    /// Authored ground-value candidates and ground evaluability for one
+    /// substitution-bridge planning run; empty between runs.
+    pub(in crate::executor) ground_candidate_memo:
+        proof_original_rebuild::ground_candidates::GroundCandidateMemo,
     /// #abv-subst-model-retry: retry-once latch (loop guard). The
     /// preprocessing-free re-solve fires AT MOST ONCE per public check-sat; a
     /// still-rejected re-solve stays the fail-closed Unknown.
@@ -426,6 +539,121 @@ pub struct Executor {
     /// CLEARED at the top of `process_quantifiers` (per check-sat); empty for
     /// quantifier-free problems, making the gates byte-identical to before.
     pub(crate) active_support_axioms: Vec<ay_core::TheoryLit>,
+    /// #quantifier-proxy-abstraction: `quantifier TermId -> fresh Bool proxy`
+    /// for every quantifier occurrence `purify_quantifier_atoms` replaced in
+    /// the CURRENT check-sat.
+    ///
+    /// `flatten_and_strip_quantifiers` used to delete every assertion that
+    /// mentioned a quantifier, which threw away the GROUND disjuncts of a
+    /// disjunct-position `forall` goal along with the quantifier. The pass
+    /// replaces the maximal quantifier subterms of such an assertion by fresh
+    /// Boolean variables so the rewritten, quantifier-free assertion survives
+    /// the strip and the ground solver sees the goal.
+    ///
+    /// CLEARED at the top of `process_quantifiers` (per check-sat), next to
+    /// `active_support_axioms`, so a proxy minted for an earlier query can
+    /// never be read back. Empty whenever the pass did not fire, which makes
+    /// every consumer byte-identical to baseline.
+    pub(crate) quantifier_proxies: ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    /// #quantifier-proxy-abstraction: the ground problem solved in the CURRENT
+    /// check-sat is an OVER-APPROXIMATION of the authored one.
+    ///
+    /// Set when `purify_quantifier_atoms` actually rewrote an assertion. A
+    /// model of the abstracted problem assigns the fresh proxies freely and
+    /// nothing ties `M(q_i)` to `⟦Q_i⟧`, so such a solve may be satisfiable
+    /// when the authored problem is not: **`sat` may never be published while
+    /// this is set**, while `unsat` transfers unchanged (a refutation of an
+    /// over-approximation refutes the original at any polarity, in any
+    /// position, under any lemma subset).
+    ///
+    /// Enforced at the head of `classify_quantifier_result` (`Ok(Sat)` becomes
+    /// a fail-closed `Unknown`), on `full_ematching_coverage`, and by the
+    /// publication sweep at the tail of `map_quantifier_result`, which is
+    /// computed where it is consumed so a later SAT-granting arm cannot be
+    /// added past it. CLEARED per check-sat next to `quantifier_proxies`.
+    pub(crate) quantifier_abstraction_active: bool,
+    /// (#degrade277-narrow) Union, over the CURRENT check-sat, of every
+    /// universal that an instantiation lane treated as ENTAILED by the
+    /// assertion set it was handed — the E-matching rounds
+    /// (`EMatchingResult::entailed_foralls`, one per round, including the
+    /// interleaved and post-CEGQI passes) and `setup_cegqi_for_unhandled`'s
+    /// own `entailed_forall_set`.
+    ///
+    /// `None` means NOTHING recorded it yet, which is NOT the same as "the
+    /// empty set": it is the fail-closed state, and the only consumer
+    /// (`nonconjunctive_forall_may_have_been_conjoined`) treats it as "assume
+    /// anything could have been conjoined".
+    ///
+    /// Why a recorded union and not a re-derivation: `entailed_forall_set` is
+    /// a function of its assertion argument, and the lanes run it against
+    /// DIFFERENT, growing assertion sets. Unit propagation through `or`/`=>`
+    /// is not monotone in the assertion set (a new unit can make a disjunct
+    /// TRUE and thereby DISABLE a propagation that fired earlier), so no
+    /// single recomputation at gate time is guaranteed to be a superset of
+    /// what the lanes consulted. Recording is the only exact answer.
+    ///
+    /// RESET per check-sat in `prepare_check_sat_internal_state`, NOT at the
+    /// top of `process_quantifiers`: instances pushed into `ctx.assertions`
+    /// survive across `process_quantifiers` calls within one query, so the
+    /// record of what licensed them must survive with them.
+    pub(crate) entailed_forall_authority: Option<ay_core::kani_compat::DetHashSet<TermId>>,
+    /// (#degrade277-narrow) Set when a lane conjoined a ground instance of a
+    /// universal WITHOUT the `entailed_forall_set` gate having licensed it —
+    /// today only the MBQI counterexample-refinement push sites
+    /// (`mbqi.rs`, `bv_mbqi.rs`, `finite_model_mbqi.rs`), which instantiate
+    /// members of `unhandled_quantifiers` — a list that deliberately INCLUDES
+    /// universals `setup_cegqi_for_unhandled` refused as non-entailed.
+    ///
+    /// It poisons `nonconjunctive_forall_may_have_been_conjoined` for the
+    /// rest of the query, which is the mechanical form of the audit
+    /// obligation "MBQI cannot reach the `degrade@277` arm": instead of
+    /// resting on the call ordering inside `classify_quantifier_result`, the
+    /// gate observes the event directly and falls back to the unnarrowed
+    /// behaviour. RESET per check-sat alongside the field above.
+    pub(crate) unlicensed_instance_conjoined: bool,
+    /// (#conjunctive-closure) Bindings the `degrade@277` gate may replay (conjunctive_closure.rs).
+    pub(crate) matched_instance_records: quantifier_loop::MatchedInstanceRecords,
+    /// #skolem-guarded-proxy-instances: the abstracted, guarded assertion
+    /// vector exactly as `flatten_and_strip_quantifiers` left it, recorded ONLY
+    /// when at least one guarded clause was asserted.
+    ///
+    /// This set is an over-approximation of the post-Skolemization assertion
+    /// set on its own — purify's model extension plus the guard clauses' own
+    /// argument — so its refutation refutes the query WITHOUT depending on any
+    /// instance a later lane conjoined. That independence is exactly the
+    /// premise `CERT/degrade@277` distrusts, which is why the rescue leg there
+    /// may consult it. EMPTY on every solve where no guarded clause was
+    /// asserted, so every existing path reads its baseline value. CLEARED per
+    /// check-sat next to `quantifier_proxies`.
+    pub(crate) quantifier_guarded_abstraction_snapshot: Vec<TermId>,
+    /// #quantifier-guarded-instances: the GUARDED instance clauses
+    /// `(or (not qproxy) body[t̄])` this check-sat asserted.
+    ///
+    /// Each is a consequence of the ABSTRACTION (`qproxy` true means the
+    /// abstracted universal holds, so its instance does), never of the authored
+    /// problem entailing that universal. Recorded so a downstream gate can ask
+    /// which clauses in the assertion vector are guarded WITHOUT trusting a
+    /// producer-set boolean, and so the fail-closed proof discipline is
+    /// testable: not one of these is ever an authored problem assertion, so the
+    /// proof exporter must demote it rather than label it `h{idx}`.
+    ///
+    /// CLEARED per check-sat next to `quantifier_proxies`.
+    pub(crate) guarded_instance_clauses: ay_core::kani_compat::DetHashSet<TermId>,
+    /// The `(quantifier, binding, instance)` provenance of every clause in
+    /// `guarded_instance_clauses`: a HINT consequence replay turns into a
+    /// checked `forall_inst` derivation of the clause's resolvent against the
+    /// authored clause that carries the universal. CLEARED next to it.
+    pub(crate) guarded_instance_records: Vec<crate::ematching::ForallInstantiationProvenance>,
+    /// (#guarded-existential-duals) The NNF dual `∀x̄.¬φ` of each proxied
+    /// existential `∃x̄.φ` the guarded pass has met, mapped to that
+    /// existential's proxy, which guards the dual's instances. CLEARED next
+    /// to `quantifier_proxies`.
+    pub(crate) guarded_existential_duals: ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    /// (#guarded-nested-quantifiers) The universals no assertion carries
+    /// that a guarded instance brought in: each nested universal, and the
+    /// dual of each nested existential. Interleaved E-matching rounds match
+    /// them as guarded-only quantifiers. CLEARED next to `quantifier_proxies`.
+    pub(crate) guarded_nested_universals: Vec<TermId>,
     /// Per-check-sat memo of fail-closed semantic conflict-verification
     /// verdicts (#4535 memoized verifier), keyed by the SORTED literal set of
     /// the (already deduped) theory conflict. The verdict of
@@ -440,6 +668,13 @@ pub struct Executor {
     /// re-admits a conflict already proven jointly-UNSAT (sound to learn); a
     /// memoized Err keeps the fail-closed bail (conservative, never learns).
     pub(crate) conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
+    /// What the ground solves of one public query hand to each other: the
+    /// theory conflicts that hold in the theory alone and the last SAT
+    /// assignment, so a re-solve starts where the solve before it ended (see
+    /// [`ground_solve_carry`]). Emptied at `begin_public_solve`, and by itself
+    /// whenever the term store stops being an append-only extension of the
+    /// one it read from.
+    pub(crate) ground_solve_carry: ground_solve_carry::GroundSolveCarry,
     /// #verify-memo (`--verify-memo=1`): sampled semantic PROPAGATION
     /// verification memo — see [`crate::verification::PropSemanticVerifyMemo`]
     /// for the key/trust-true-only/lifecycle contract. Populated only while
@@ -448,6 +683,7 @@ pub struct Executor {
     pub(crate) prop_semantic_verify_memo: crate::verification::PropSemanticVerifyMemo,
     /// Last assumptions from check-sat-assuming (for get-unsat-assumptions)
     last_assumptions: Option<Vec<TermId>>,
+    model_construction_assumptions: Option<check_sat_assuming::OriginalModelAssumptions>,
     /// Minimal UNSAT core from last check-sat-assuming (subset of assumptions)
     /// This is populated when using the SAT solver's assumption-based solving.
     ///
@@ -485,6 +721,10 @@ pub struct Executor {
     named_assert_rewrites: HashMap<TermId, TermId>,
     /// Last proof (for get-proof when UNSAT)
     last_proof: Option<Proof>,
+    /// Conservative paid DATA for every admitted proof in this query. A proof
+    /// may survive replacement in interpolation/presentation records; release
+    /// these arenas only when the whole query is invalidated.
+    proof_construction_memory: Vec<model::evaluation_copies::RetainedEvaluationMemory>,
     /// The current UNSAT verdict was independently certified semantically, but
     /// no proof was translated back to the authored problem scope.
     ///
@@ -493,6 +733,18 @@ pub struct Executor {
     /// re-solve could otherwise attach a CE-contaminated proof to a sound
     /// verdict established from different premises.
     last_unsat_proof_reconstruction_suppressed: bool,
+    /// #certify-before-presentation. The proof `build_unsat_proof` last
+    /// assembled is a derivation KEPT behind a presentation bound
+    /// (`withhold_surface_presentation`) instead of being replaced by the
+    /// one-line `(cl)` poison; holds the bound, which the decline line
+    /// reports. Whether its document is withheld is the separate
+    /// `last_unsat_proof_reconstruction_suppressed`. Read by the authored
+    /// cascade (a kept derivation is not a publishable presentation), by the
+    /// certification funnel and the step-(4) twin screen (a kept derivation
+    /// that cannot be certified reverts to, or is screened as, the poison it
+    /// replaced). Cleared at the head of every assembly and by every session
+    /// reset.
+    last_proof_surface_withheld: Option<crate::executor::ProofDeclineMechanism>,
     /// One aggregate parsed-source work envelope shared by every proof pass of
     /// the query in flight. Each pass charges the traversal/clone/format work
     /// it is about to perform; the ceiling is the same
@@ -518,9 +770,11 @@ pub struct Executor {
     /// authored shapes that could still decide the solve.
     deep_qe_retry_armed: bool,
     /// The #quantified-trace-arming `Unknown`-fallback lane is active for the
-    /// solve currently in flight. Set ONLY by
+    /// solve currently in flight. Set by
     /// [`Executor::quantified_trace_arming_unknown_retry`], which owns the
-    /// one-attempt-per-public-solve contract.
+    /// one-attempt-per-public-solve contract, and — after that retry has
+    /// already run — by the incremental qlra fallback
+    /// (`qlra_lane/incremental.rs`), whose pass is the trace-armed one.
     quantified_trace_retry_armed: bool,
     measured_negative_quantifier_routes: qe_route::MeasuredNegativeRoutes,
     /// Monotone check-sat pre-pass reachability counters (#prepass-reachability).
@@ -571,6 +825,41 @@ pub struct Executor {
     /// `consequence_replay_attempts` so the two lanes cannot starve each
     /// other. Cleared per check-sat alongside `ematching_proof_records`.
     pub(crate) negated_exists_ground_inst_attempts: Cell<u8>,
+    /// The nested-CEGQI lane's per-executor state (#qlra-nested-cegqi): the
+    /// public solve's search memo and the probe-role flags.
+    pub(in crate::executor) qlra_lane: qlra_lane::QlraLaneState,
+    /// The QSAT route's per-executor state (roadmap component QS).
+    pub(in crate::executor) qsat_route: qsat_route::QsatRouteState,
+    /// Session-lifetime equality-QE lane outcomes (#eq-qe-lane); never reset.
+    pub(in crate::executor) eq_qe_lane_counters: eq_qe_lane::EqQeLaneCounters,
+    /// Roots the eq-QE lane declined this public solve; retries skip it.
+    pub(in crate::executor) eq_qe_lane_declined: Option<Vec<TermId>>,
+    /// Closed binder values the CEGQI refinement rounds instantiated an
+    /// admitted universal with during the CURRENT check-sat, keyed by binder
+    /// sort (#negated-exists-cegqi-witness-hints). Recorded at the
+    /// `append_cegqi_ground_instance` chokepoint only after the instance's
+    /// sort and exact-substitution checks passed. PURE HINTS: the only
+    /// consumer is the negated-existential ground-instantiation firewall
+    /// lane, which re-filters every entry for problem-closedness and whose
+    /// strict `forall_inst` validator re-derives the substitution; a wrong
+    /// value can only cost a declined candidate. LIFECYCLE: one PUBLIC
+    /// decision — cleared by `begin_public_solve` and `reset`, deliberately
+    /// NOT by `clear_preprocessing_proof_records` (the CEGAR refinement loop
+    /// re-prepares the executor between iterations, and the firewall reads
+    /// the ledger in a later iteration than the round that filled it);
+    /// nested same-executor scopes take/restore it with the
+    /// consequence-replay state.
+    pub(crate) cegqi_witness_hints: Vec<(Sort, TermId)>,
+    /// Binder values of the instances the CURRENT public decision enumerated
+    /// for an entailed universal or E-matched in any lane
+    /// (#iff-split-implied-authority). Kept apart from `cegqi_witness_hints`
+    /// so these producers, which run before CEGQI, can never crowd the CEGQI
+    /// values out of that bounded ledger. PURE
+    /// HINTS with the same contract and the same lifecycle: the only consumer
+    /// is the implied-universal firewall lane, which re-filters every entry
+    /// for closedness over the authored symbols, and its strict `forall_inst`
+    /// validator re-derives the substitution.
+    pub(crate) instance_witness_hints: Vec<(Sort, TermId)>,
     /// Probe attempts consumed by the implied-universal ground-instantiation
     /// artifact-firewall translation for the CURRENT check-sat
     /// (#implied-forall-ground-inst). Counted separately from
@@ -578,6 +867,17 @@ pub struct Executor {
     /// lanes cannot starve each other. Cleared per check-sat alongside
     /// `ematching_proof_records`.
     pub(crate) implied_forall_ground_inst_attempts: Cell<u8>,
+    /// Probe attempts consumed by the exists-bridge chain translation for
+    /// the CURRENT check-sat (#exists-bridge-chain). Counted separately
+    /// from the sibling firewall lanes so none can starve another.
+    /// Cleared per check-sat alongside `ematching_proof_records`.
+    pub(crate) exists_bridge_chain_attempts: Cell<u8>,
+    /// Attempts consumed by the authored BOOLEAN-SKELETON refutation
+    /// artifact-firewall translation for the CURRENT check-sat
+    /// (#authored-skeleton-refutation). Counted separately from the sibling
+    /// firewall lanes so none of them can starve another. Cleared per
+    /// check-sat alongside `ematching_proof_records`.
+    pub(crate) authored_skeleton_refutation_attempts: Cell<u8>,
     /// Single-binder Skolemization provenance for assertions REPLACED in place
     /// by `skolemize_existentials` (#skolem-unit-authority). Each record binds
     /// the authored source (`exists x. B` or `not (forall x. B)`), the exact
@@ -674,6 +974,8 @@ pub struct Executor {
     /// retaining the override. Cleared and rolled back with the other proof
     /// rebuild state.
     pub(crate) last_proof_expanded_let_sources: Vec<(TermId, usize, String)>,
+    /// Pinned Carcara's parse of the authored commands (certificate surface).
+    authored_problem_surface: proof::problem_surface::AuthoredProblemSurface,
     /// Why the last refutation carries no derivation, when it carries none.
     ///
     /// Diagnostic only: nothing consults this to decide a verdict, mint a
@@ -682,6 +984,52 @@ pub struct Executor {
     /// can produce — is attributable in a corpus census instead of collapsing
     /// every cause into one label. See `executor::proof::decline`.
     pub(crate) last_proof_decline: Option<ProofDeclineMechanism>,
+    /// What the proof held when the last-resort empty-clause closer last ran.
+    ///
+    /// Diagnostic only, on the same terms as `last_proof_decline`: it exists so
+    /// a census can tell a closer that had a derivation and could not chain it
+    /// from one that had nothing but the authored assumptions. Set at the
+    /// closure site, before a step is added; `None` when the closer did not run.
+    pub(crate) last_trust_closure_census: Option<TrustClosureCensus>,
+    /// What the exact semantic-certificate mint held at publication.
+    ///
+    /// #semantic-token census. Diagnostic only, on the same terms as
+    /// `last_proof_decline`: it exists so a census can tell whether the
+    /// object behind `checked-semantic-certificate-unrendered` is a derivation
+    /// over the authored assertion or a leaf token over a construction-time
+    /// residue. Set at the mint, before the token is wrapped; `None` when no
+    /// exact semantic certificate was minted.
+    pub(crate) last_semantic_token_census: Option<SemanticTokenCensus>,
+    /// What was on the other side of the bound when one of the two "unbounded"
+    /// declines fired. Diagnostic only, on the same terms as
+    /// `last_trust_closure_census`; `None` when neither fired.
+    pub(crate) last_unbounded_census: Option<UnboundedCensus>,
+    /// The furthest SAT-trace reconstruction attempt on the current query.
+    ///
+    /// Diagnostic only. Kept as a high-water mark rather than a last-write
+    /// because the reconstruction consumes the clause trace and the pipeline
+    /// can run twice; see `SatReconstructionRecord::keep_furthest`.
+    pub(crate) last_sat_reconstruction: SatReconstructionRecord,
+    /// Which arm of the deferred-trust discharge re-decided the last published
+    /// `unsat`, when one did — directly, or (set at the command boundary from
+    /// the consumed certificate) inside a nested probe a theorem sealed.
+    ///
+    /// Diagnostic only, and `Cell` because
+    /// `discharge_trust_steps_for_certification` takes `&self`. This is
+    /// REPRODUCIBILITY evidence and never checkability evidence — see
+    /// `executor::proof::corroboration` for what it is and is not worth.
+    pub(crate) last_unsat_corroboration: Cell<Option<UnsatCorroboration>>,
+    /// The typed stop a metered strict walk OBSERVED during the current UNSAT
+    /// certification, if one did (P4a.1). A walk that a stop cancelled reached
+    /// no verdict about the proof, so `stop_declines_unsat_publication`
+    /// publishes this stop even after its signal has cleared (RSS that fell
+    /// back under its ceiling), instead of reading the cancelled walk as a
+    /// rejection. First stop wins; reset when certification starts.
+    pub(in crate::executor) certification_stop: Cell<Option<crate::api::proofs::EnvelopeStop>>,
+    /// Conflicts the last certification's deferred-trust pool spent (P4a.1),
+    /// published as `cert.discharge_effort_spent`. A count of the query alone,
+    /// so two runs of one query report the same figure at any host load.
+    pub(in crate::executor) certification_effort_spent: Cell<u64>,
     /// Quality metrics from last proof validation (#4420)
     last_proof_quality: Option<ay_proof::ProofQuality>,
     /// M0(a) attribution counter (the development design notes):
@@ -722,6 +1070,9 @@ pub struct Executor {
     /// the memo this publication. Real walks = invocations - hits. Dumped as
     /// `proof.strict_check_memo_hits`.
     pub(in crate::executor) strict_check_memo_hits: Cell<u64>,
+    /// The wire-gap screen's unstopped complete-blast declines in the current
+    /// public decision (`proof/terminal_trust/screen_declines.rs`).
+    pub(in crate::executor) wire_gap_screen_declines: proof::WireGapScreenDeclines,
     /// #cert-accounting item 3: the DECLARED consumer of the decision query
     /// currently executing on this executor.
     ///
@@ -758,6 +1109,31 @@ pub struct Executor {
     /// admitted identically. Set by `record_unsafe_partial_unknown`, cleared at
     /// the top of every `classify_quantifier_result`.
     pub(in crate::executor) unsafe_partial_quantifier_unknown: bool,
+    /// Set when this pass COMPUTED a quantified refutation and withheld it only
+    /// for want of a translated proof (`translated_unsat_proof_or_downgrade`):
+    /// the SAT-certificate producers then decline instead of re-solving a
+    /// refuted query. Cleared per public solve and per `classify_quantifier_result`.
+    pub(in crate::executor) quantified_refutation_withheld: bool,
+    /// The authored quantifier-free core `authored_ground_core_refutes` refuted
+    /// in this public solve; deferred-trust step (4) re-decides it before the
+    /// quantified scope (`unsat_cert/ground_core_corroboration.rs`, which holds
+    /// the subset soundness argument). Cleared per public solve.
+    authored_ground_core_refutation: Option<Box<[TermId]>>,
+    /// Ground-first scheduling (`check_sat/ground_first.rs`): set once this
+    /// public decision's ground part has been decided, so nested re-entries
+    /// and unknown retries of the same decision do not pay for it again.
+    /// Cleared per public solve.
+    ground_first_spent: bool,
+    /// Ground-first probes that ran out of budget without a verdict over this
+    /// executor's lifetime; the pass stands down once they reach its cap.
+    ground_first_indecisive: u32,
+    /// Ground-first counters of the current public decision.
+    ground_first_stats: check_sat::GroundFirstStats,
+    /// Set while a check-sat runs on a stack that a definitional-adoption
+    /// fallback stack will re-solve if it answers `unknown`: ground-first's
+    /// fallback slot waits for the last stack, so a verdict the chain decides
+    /// keeps the evidence it had without the pass.
+    ground_first_awaits_fallback_stack: bool,
     /// Exact production boundary that published the last Unknown result.
     ///
     /// Internal solver lanes may tentatively classify an Unknown by reason;
@@ -765,6 +1141,10 @@ pub struct Executor {
     last_unknown_origin: Option<UnknownOrigin>,
     /// Statistics from last check-sat call
     last_statistics: Statistics,
+    /// The `rlimit-count` work of every solve this executor has recorded,
+    /// summed. `last_statistics` describes one check-sat and starts again at
+    /// each one; this total never decreases.
+    rlimit_work_total: u64,
     /// Debug flag for QF_UFBV solving
     debug_ufbv: bool,
     /// Whether incremental mode is enabled.
@@ -835,14 +1215,31 @@ pub struct Executor {
     /// [`Executor::set_no_lra_theory_propagation`]; default off so all other
     /// lanes (and the #9505 theory-decision beneficiaries) keep propagation.
     pub(crate) no_lra_theory_propagation: bool,
+    /// Per-executor counterpart of `LraSolver::set_no_bcp_implied_bounds`:
+    /// LIA theory solvers this executor constructs skip BCP-time implied
+    /// bounds (direct propagation and the final-check cascade stay on). Set
+    /// by the CHC BMC transition-system lanes; default off.
+    pub(crate) no_lra_bcp_implied_bounds: bool,
+    /// Forbid the #9505 adaptive every-decision theory-branching mode in the
+    /// theory extensions this executor builds (`TheoryExtension::
+    /// with_theory_every_decision(false)`). Set by the CHC BMC
+    /// transition-system lanes; default off (mode allowed).
+    pub(crate) no_theory_every_decision: bool,
     /// Persistent state for incremental BV solving with rebuild-on-pop invalidation
-    incr_bv_state: Option<IncrementalBvState>,
+    ///
+    /// Boxed, like `incr_fp_state` and `scoped_window_lanes`: the state embeds
+    /// an `ay_sat::Solver` (~19 KB), and every inline byte of `Executor` is
+    /// paid twice on the caller's thread by the by-value [`Executor::new`]
+    /// (`EXECUTOR_INLINE_SIZE_CEILING`, group_api's
+    /// `solver_construct_stack_safety`).
+    incr_bv_state: Option<Box<IncrementalBvState>>,
     /// Persistent state for the incremental FP lane (fifth incremental subsystem).
     ///
     /// Only ever populated while [`Self::fp_persistent_armed`] authorized the
     /// current `solve_fp`; every other FP entry point runs the untouched
-    /// stateless pipeline and never observes this field.
-    pub(crate) incr_fp_state: Option<IncrementalFpState>,
+    /// stateless pipeline and never observes this field. Boxed for the reason
+    /// given on `incr_bv_state` (bd69cda64 added it inline, +19 KB).
+    pub(crate) incr_fp_state: Option<Box<IncrementalFpState>>,
     /// One-shot authorization for the persistent FP lane.
     ///
     /// FAIL-SAFE POLARITY, and that is the whole point. `solve_fp` is reachable
@@ -864,6 +1261,36 @@ pub struct Executor {
     pub(crate) fp_persistent_armed: bool,
     /// Persistent state for incremental theory solving (UF/LRA/LIA)
     pub(crate) incr_theory_state: Option<IncrementalTheoryState>,
+    /// The session's persistent lanes, set aside for the rest of a check whose
+    /// solve-time assertions carry LNH symmetry clauses (`lnh_symmetry`, C4):
+    /// those clauses are sound for that one check only, and a persistent lane
+    /// would keep them active for every later check of the scope. `None`
+    /// outside such a check. Boxed for the reason given on `incr_bv_state`.
+    lnh_set_aside_lanes: Option<Box<lnh_symmetry::LnhSetAsideLanes>>,
+    /// Whether the current query's solve carried LNH symmetry clauses
+    /// (`lnh_symmetry`). Reset at the query's outermost entry. Read by the
+    /// deferred-trust certification re-solve, which may carry them only for a
+    /// refutation that did (C4).
+    pub(crate) lnh_carried_by_query: bool,
+    /// Set on the fresh executor of the deferred-trust certification re-solve
+    /// (`unsat_cert.rs`, step (4)) when the refutation it re-decides carried
+    /// LNH symmetry clauses: the one executor running inside another's query
+    /// that may carry them (`lnh_symmetry`, C4).
+    pub(crate) lnh_reconfirms_carried_symmetry: bool,
+    /// Whether a check of this session ran with the session's lanes set aside
+    /// for LNH symmetry clauses and dropped the lanes it built (`lnh_symmetry`,
+    /// C4). From then on the append-only term store holds terms no lane of
+    /// the session ever encoded; see [`Self::store_mirrors_session_lanes`].
+    /// `(reset)` rebuilds the executor and clears it.
+    pub(crate) lnh_dropped_check_lanes: bool,
+    /// Push depth of every scope-tracked root, captured for one query by
+    /// `with_scope_root_depths`; `None` outside a query (D10(c)).
+    pub(crate) scope_root_depths: Option<Arc<HashMap<TermId, usize>>>,
+    /// The lanes the current query's scoped window was solved on (D10(a)).
+    /// Boxed for the reason given on `incr_bv_state`: 0027a7b70 stored it
+    /// inline, a theory and a BV lane holding three `ay_sat::Solver`s
+    /// (57,864 B), and that overflowed the 192 KiB `Executor::new` stack test.
+    scoped_window_lanes: Option<Box<check_sat_assuming::ScopedWindowLanes>>,
     /// Style for counterexample generation (model minimization)
     counterexample_style: crate::CounterexampleStyle,
     /// Proof tracker for collecting proof steps during solving
@@ -880,6 +1307,7 @@ pub struct Executor {
     /// explicit policy state; a reconstruction budget must never silently
     /// downgrade an API caller's `set_produce_proofs(true)` request.
     proof_artifact_required: bool,
+    interpolation: lifecycle::InterpolationRecords,
     /// Deterministic step budget for post-UNSAT SAT-proof reconstruction
     /// (RUP replay clause scans). `None` = unlimited (explicit `--proof`,
     /// `--strict-proofs`, `:produce-proofs` scripts). `Some(n)` = best-effort:
@@ -888,6 +1316,10 @@ pub struct Executor {
     /// "no proof certificate emitted" warning — the verdict is computed before
     /// reconstruction and never depends on the budget (#A2b).
     pub(crate) proof_reconstruction_step_budget: Option<u64>,
+    /// The Carcara dialect this executor's Alethe documents are spelled for
+    /// (`Executor::set_alethe_dialect`). Host configuration: kept across
+    /// `(reset)`, never changed by a script.
+    alethe_dialect: ay_proof::AletheDialect,
     /// Last clause trace from SAT solver (for SAT resolution proof reconstruction)
     last_clause_trace: Option<ClauseTrace>,
     /// Last var_to_term mapping from Tseitin (for SAT proof reconstruction)
@@ -935,11 +1367,31 @@ pub struct Executor {
     clause_db_bytes_limit: Option<usize>,
     /// Interrupt flag propagated from API-level `check_sat`/`check_sat_assuming`.
     solve_interrupt: Option<Arc<AtomicBool>>,
-    /// Test hook: force the non-BV EUF congruence pass to bail immediately
-    /// (as if the deadline expired at pair 0), exercising the
+    /// The Certify node this executor's checks run under, when it was armed
+    /// for a certification (`arm_certification_grant`, DR-39): each of its
+    /// check-sats is a `Full` child of it (`guard_nodes.rs`). Held weakly:
+    /// the certification keeps it open, the executor never does.
+    certification_parent: ay_core::resource::WeakGuard,
+    /// The Certify node the proof assembly running on this executor is in
+    /// (`build_unsat_proof`), which its stop polls read; empty outside one.
+    assembly_certify: ay_core::resource::WeakGuard,
+    /// The exact-division sweeps this executor's proof build saw fail, so
+    /// the build's other spellings of one divider obligation do not sweep it
+    /// again; shared with the executors derived from it for certification
+    /// (`ay_proof::ExactDivisionSweepMemo`).
+    exact_division_sweeps: ay_proof::ExactDivisionSweepMemo,
+    /// Test hook: force the non-BV EUF congruence pass to bail at pair 0,
+    /// either on a count cap or on a deadline (share) that passes inside the
+    /// pass (`theories::TestCongruenceBail`), exercising the
     /// SAT-under-partial-axiomatization degrade path deterministically.
     #[cfg(test)]
-    pub(crate) test_force_non_bv_congruence_bail: bool,
+    pub(crate) test_force_non_bv_congruence_bail: Option<theories::TestCongruenceBail>,
+    /// Test hook: panic inside the #quantified-trace-arming retry pass.
+    #[cfg(test)]
+    pub(crate) test_panic_in_quantified_trace_retry: bool,
+    /// Test hook: panic inside the deep-QE `Unknown` retry pass.
+    #[cfg(test)]
+    pub(crate) test_panic_in_deep_qe_retry: bool,
     /// Re-entrancy guard for the alternation MBQI validation sub-solve, so its
     /// own (forall ...) over-approximation solve does not recurse into it.
     in_alternation_validation: bool,
@@ -1048,42 +1500,31 @@ pub struct Executor {
     /// Session-scoped spend/yield account for the finite-model lane
     /// (#witness-check-cost). See `finite_model_mbqi::LaneAccount`.
     pub(in crate::executor) finite_model_lane: finite_model_mbqi::LaneAccount,
-    /// Live API deadline cell (#quantifier-determinism). Stop closures poll a
-    /// cloned handle, so backstop extension and alternation sub-deadline
+    /// Live API deadline cell. Stop closures poll a
+    /// cloned handle, so command allowances and alternation sub-deadline
     /// windows remain visible; value snapshots use `.get()`.
     solve_deadline: SolveDeadlineCell,
     /// Command deadline untouched by inner-lane halving (#dt-context-derivation).
     /// Certification may spend this outer envelope on a found refutation;
     /// search lanes narrow only `solve_deadline`, never this cell.
     certification_deadline: SolveDeadlineCell,
-    /// One-shot marker: the quantified-solve wall-clock backstop extension has
-    /// been applied for the current check-sat call (#quantifier-determinism,
-    /// see `install_quantifier_deadline_backstop`). Re-armed per call in
-    /// `install_timeout_deadline_for_call`; prevents nested quantified
-    /// re-entries (alternation validation sub-solves) from compounding the
-    /// extension.
-    quantifier_deadline_backstop_installed: bool,
-    /// Deadline policy for this executor. Public solves use the ordinary
-    /// quantified backstop; accepting certification probes select `Exact` so a
+    /// Lifetime of one command's precomputed relative allowance and original
+    /// caller boundary. Nested checks inherit it without starting a new window.
+    command_deadline: CommandDeadlineState,
+    /// Deadline policy for this executor. Public solves can explicitly opt in
+    /// to a quantified allowance; accepting certification probes select `Exact` so a
     /// caller's absolute deadline can only stop work, never be extended.
     quantifier_deadline_policy: QuantifierDeadlinePolicy,
     /// Whether the caller has OPTED IN to the quantified wall-clock backstop
     /// (#honest-timeout). `false` by default, which is what makes
     /// `set_timeout(d)` an actual bound: without it,
-    /// `install_quantifier_deadline_backstop` is a no-op and every stop path
-    /// polls the caller's own deadline.
+    /// command planning retains the caller's ordinary deadline.
     ///
-    /// WHY IT IS STILL HERE. The backstop buys DETERMINISM, and that is a real
-    /// capability, not a bug: the quantifier pipeline's termination is governed
-    /// by deterministic instantiation budgets (E-matching round/instance caps,
-    /// interleaved/CEGQI/MBQI round caps), so a proof whose instantiation chain
-    /// converges just inside the budget on an idle machine used to be cut short
-    /// on a loaded one and the verdict flipped Verified <-> Unknown with CPU
-    /// load. A caller that wants that guarantee — a verification driver
-    /// replaying a fixed obligation set, where a load-dependent verdict is
-    /// worse than a long one — turns it on with
-    /// `set_quantifier_deadline_backstop(true)` and accepts a wall of up to 4x
-    /// the remaining budget (capped at +3 min).
+    /// A caller can trade latency for reduced load sensitivity while the
+    /// quantifier pipeline keeps its deterministic instantiation budgets.
+    /// Command entry grants at most 4x the relative timeout (extra time capped
+    /// at 3 min), with one absolute deadline through final publication. It
+    /// never extends an existing absolute caller wall or a nested search slice.
     ///
     /// WHY IT IS OFF BY DEFAULT. It was silently ON for every caller, so a
     /// 60 s `set_timeout` bought a ~240 s wall with nothing in the API saying
@@ -1101,6 +1542,59 @@ pub struct Executor {
     /// read-congruence index-pair obligations — see
     /// `TheoryCombiner::set_read_congruence_pairs_enabled`.
     pub(in crate::executor) quantifier_pipeline_engaged: bool,
+    /// Instances and terms the E-matching rounds of the current check-sat
+    /// have created; reset per check-sat in
+    /// `install_timeout_deadline_for_call`.
+    pub(in crate::executor) ematching_check_budget:
+        quantifier_loop::ematching_budget::EmatchingCheckBudget,
+    /// Split-loop invocations this check-sat stopped at the unproductive-round
+    /// budget (#7956, vocabulary-scaled), and the invocations the UNSCALED rule
+    /// would have stopped -- exported as `split_loop.unproductive_budget_hits`
+    /// and `split_loop.unproductive_legacy_rule_hits` so the price of the
+    /// scaling can be attributed per file.
+    pub(in crate::executor) split_unproductive_budget_hits: u64,
+    pub(in crate::executor) split_unproductive_legacy_rule_hits: u64,
+    /// (#quantifier-ce-free-resolve) Counterexample-free consequence re-solves
+    /// this check-sat ran, and how many of them refuted -- exported as
+    /// `quantifier.cegqi.ce_free_resolves` and
+    /// `quantifier.cegqi.ce_free_resolve_refutations` so a file that took the
+    /// stage-4 route can be told apart from one that never reached it.
+    pub(in crate::executor) cegqi_ce_free_resolves: u64,
+    pub(in crate::executor) cegqi_ce_free_refutations: u64,
+    /// (#quantifier-ce-free-resolve) This check-sat's primary dispatch was
+    /// refused because a counterexample constant sat under integer
+    /// `div`/`mod` (`check_sat.rs`); result mapping received `Unknown` in its
+    /// place. One of the two conditions under which the CE-free re-solve is
+    /// tried on a fail-closed `unknown` (the other is a live refutation).
+    pub(in crate::executor) cegqi_lane_refused_counterexample: bool,
+    /// (#quantifier-ce-free-resolve) A CEGQI refinement round's live re-solve
+    /// refuted and the refutation was then handed to the disambiguation
+    /// apparatus (`cegqi_refinement.rs`). Read by the same hook.
+    pub(in crate::executor) cegqi_refinement_round_refuted: bool,
+    /// (#quantifier-ce-free-resolve) `classify_quantifier_result` reached its
+    /// tail with a fail-closed `unknown` on a solve whose ground result was a
+    /// refutation (live, a refinement round's, or the div/mod exit's
+    /// refusal): the counterexample-free probe is ARMED. Arming is not
+    /// firing, and this field never fires anything: the tail of
+    /// `map_quantifier_result` reads it to decide whether to PARK
+    /// [`Self::cegqi_ce_free_stash`]. Reset at the top of every
+    /// `map_quantifier_result` and at every check-sat.
+    pub(in crate::executor) cegqi_ce_free_resolve_armed: bool,
+    /// (#quantifier-ce-free-resolve) The armed probe's inputs, parked by the
+    /// tail of `map_quantifier_result` and fired at exactly one point:
+    /// `check_sat_guarded`, after EVERY pass of the solve that could still
+    /// publish a verdict has declined -- the quantifier loop's own arms, the
+    /// CEGAR pending-lemma loop, `deep_qe_unknown_retry`,
+    /// `quantified_trace_arming_unknown_retry`, `finite_model_last_chance`
+    /// and all four model-rejection re-solves. A refutation-only probe that
+    /// ran before any of them spent the deadline they needed: measured, that
+    /// withdrew a `sat` `main` answers in 3.6 s
+    /// (`starve/impl2_ex36_none.smt2`, `--z3-mode`; report #2.7.2). Parking
+    /// rather than firing is what makes the probe the last resort of the
+    /// SOLVE rather than of the loop. A nested retry solve re-enters
+    /// `map_quantifier_result` and re-parks, so this always holds the newest
+    /// solve's facts or nothing.
+    pub(in crate::executor) cegqi_ce_free_stash: Option<quantifier_loop::CeFreeResolveStash>,
     /// TermStore length at the last `(reset-assertions)`, i.e. the boundary
     /// between the assertion epoch now in flight and everything before it.
     ///
@@ -1127,11 +1621,92 @@ pub struct Executor {
     active_solve_cost_center: Option<String>,
     /// Relative timeout applied to subsequent executor solve commands.
     timeout: Option<Duration>,
+    /// This executor decides a solver-DERIVED query (a certification
+    /// re-solve over a cloned session context) whose core nobody reads, so
+    /// the deletion minimizer's subset re-solves and the harvest recheck
+    /// (`certify_assumption_core`) are pure waste here. Set only by
+    /// [`Self::new_derived_query_executor`]; the named-core redirect
+    /// itself stays live because it is the faster engine on some shapes
+    /// (see its doc for why the redirect must stay).
+    pub(crate) core_shrinking_suppressed: bool,
+    /// A private core-subset nomination whose caller adopts only UNSAT after
+    /// an exact checked re-solve. Reconstructing a fresh ground model solely
+    /// for a SAT completion cannot nominate a smaller core. Scoped only around
+    /// the nomination solve, never the adoption check or enclosing query.
+    pub(in crate::executor) core_subset_nomination: bool,
+    /// This executor is a deferred-trust re-decision whose proof feeds only
+    /// a screen that accepts trust (steps (4) and (4a), the ground core), so
+    /// its proof assembly skips the trust-elimination members: the BV guarded
+    /// collapses, the semantic BV promotion, the pure-BV ground closure, the
+    /// authored cascade and the two wire-gap repairs. Set only by
+    /// `arm_reconfirmation_posture` (`unsat_cert/screened_reconfirmation.rs`,
+    /// which also names what still runs).
+    pub(in crate::executor) trust_accepting_reconfirmation: bool,
+    /// Set by `new_derived_query_executor`: this executor re-solves, for
+    /// certification, an obligation the outer solve already refuted, and only
+    /// its UNSAT is read. Lanes that can publish nothing but SAT in this
+    /// posture skip it (#dt-fd-reentry).
+    pub(crate) certification_resolve: bool,
+    /// Whether satisfiability-preserving strengthenings may run here
+    /// (`strengthening.rs`). `ForcedOff` only on executors whose verdict is
+    /// used as evidence for another solve's: every certification re-solve and
+    /// certifying probe (evidence policy P1, 2026-10-02).
+    pub(crate) strengthening_policy: strengthening::StrengtheningPolicy,
+    /// The strengthenings that added a fact during the current public query.
+    /// Read when a corroborating re-solve is labelled: those are the
+    /// strengthenings it ran without (`disabled=`).
+    strengthenings_applied: StrengtheningSet,
+    /// Demand strictly checked evidence for authority GRANTS — today the
+    /// closed-sentence certificates (`ClosedSentenceEvidence`): a nested
+    /// refutation accepted only under the deferred-trust discharge screen
+    /// (`ProbeUnsatAuthority::DischargedTrust`) is not grant authority while
+    /// this is set. The CLI sets it under `--rigor strict|certified`, whose
+    /// UNSAT screen withholds that same refutation when published directly;
+    /// `check-proofs-strict` implies it (`accepts_discharged_trust_grant`).
+    pub(in crate::executor) strict_grant_evidence_required: bool,
     /// Deterministic conflict budget backing the SMT-LIB `:rlimit` option
     /// (#8749). Each SAT solve in a check-sat is bounded by this many
     /// conflicts; with the theory split caps this guarantees machine-
     /// independent termination on otherwise-diverging fragments (e.g. NIA).
     /// `None` means unbounded. See [`Self::set_resource_limit`].
+    ///
+    /// The bit-blast path (P4a): every SAT solve of the BV lanes (the fresh
+    /// chain and its assumption arm, the persistent incremental solver, the
+    /// array-FC re-solves), the FP lanes (stateless, incremental, the
+    /// FP-to-Real chain, model evaluation) and the EUF enum-SAT lane is
+    /// bounded by these conflicts AND a decision allowance beside them, and a
+    /// check-sat's re-solves (refinement rounds, delayed-op and array-FC
+    /// re-solves, on a fresh solver or the same one) share one allowance
+    /// (`theories::model_helpers::resource_budget`). Each such solve also
+    /// runs ay-sat's counted schedules (`SatSolver::set_deterministic_inproc`):
+    /// its preprocessing, inprocessing and startup probes (lucky, GF(p),
+    /// independent-support enumeration) are sized by work, not by the time
+    /// left before the deadline. So under `:rlimit` the path is decided by
+    /// counts. The clock reads that remain on it are backstops: each only
+    /// stops, and is published as the stop it is (`timeout`, `interrupted`,
+    /// `memout`), never as a verdict input or as `incomplete`:
+    /// - the per-solve `DeadlineAlarm` timer and the SAT solver's own
+    ///   deadline reads (`theories::sat_stop::install_sat_stop`); under the
+    ///   counted schedules an UNSAT reached after the deadline or an
+    ///   interrupt is not published either;
+    /// - the deadline read of each lane's `should_stop` closure
+    ///   (`make_should_stop`, the incremental BV closure, `FpStop`), polled
+    ///   every 100 conflicts and every 1,000 decisions;
+    /// - the encoding-phase polls: `should_abort_theory_loop` before
+    ///   bit-blasting, before the re-solve that checks a first-pass UNSAT
+    ///   with unresolved delayed ops (a stop there publishes the stop, not
+    ///   that UNSAT) and between delayed-op and array-FC rounds; the check
+    ///   after bit-blasting (`bitblast_all`'s own record of a cut, then
+    ///   `encoding_phase_stop`) and after the axiom phases; the FP lanes'
+    ///   phase checkpoints;
+    /// - the congruence pair loops' poll, every 1,024 pairs
+    ///   (`theories::congruence_bail`).
+    ///
+    /// Not a clock read of the check-sat itself, but worth knowing: an
+    /// incremental session keeps its learned clauses from one check-sat to
+    /// the next, so a check-sat after one that a backstop stopped starts from
+    /// wherever that stop fell. A congruence clause set such a stop left
+    /// partial is not inherited: the next check-sat re-encodes.
     pub(crate) resource_limit: Option<u64>,
     /// Explicit per-SAT-solve DECISION budget (#ground-determinism), the
     /// decision-count companion of `resource_limit`. `None` means "use the
@@ -1141,15 +1716,24 @@ pub struct Executor {
     /// Whether the DEFAULT deterministic ground-phase budget is in force
     /// (#ground-determinism). When true (the default) and no explicit
     /// `:rlimit` is set, the pipeline SAT solves that carry `:rlimit` wiring
-    /// (incremental x2, lazy split, eager split, assume split, DPLL(T)
-    /// assumption solving) are armed with the generous built-in conflict +
-    /// decision allowances ([`Self::DEFAULT_GROUND_CONFLICT_ALLOWANCE`] /
+    /// (incremental x2, lazy split, eager split, eager-persistent split,
+    /// assume split, DPLL(T) assumption solving) are armed with the generous
+    /// built-in conflict + decision allowances
+    /// ([`Self::DEFAULT_GROUND_CONFLICT_ALLOWANCE`] /
     /// [`Self::DEFAULT_GROUND_DECISION_ALLOWANCE`]), so ground-phase
     /// CDCL work terminates on a machine-independent COUNT rather than the
-    /// load-sensitive wall clock. (The eager-PERSISTENT arm keeps its own
-    /// per-iteration wall budget system (#8256), and the BV/FP bit-blast
-    /// arms keep their caller-side tight-watchdog profile — both documented
-    /// residuals, unchanged by this mechanism.) `(set-option :rlimit 0)` or
+    /// load-sensitive wall clock. (The eager-persistent arm draws them per
+    /// SAT search, which its rounds resume or continue on per-round DECISION
+    /// slices that replaced its #8256 wall windows; see
+    /// `crate::pipeline_fns::eager_persistent_rounds`. The BV/FP bit-blast
+    /// arms take no ground default: an explicit `:rlimit` bounds them by its
+    /// conflicts and a decision allowance, an explicit decision limit by
+    /// itself, see `resource_limit`, and under `:rlimit` their solves run
+    /// ay-sat's counted inprocessing schedule. In the other SAT solves, ay-sat
+    /// still caps restart inprocessing rounds and lookahead by wall time
+    /// unless `--sat-deterministic-inproc` is on (off by default): a residual
+    /// that can move where a count stops a search, though it never ends one.)
+    /// `(set-option :rlimit 0)` or
     /// [`set_ground_budget_enabled(false)`](Self::set_ground_budget_enabled)
     /// (or the `AY_NO_GROUND_BUDGET` env knob) restores the pre-budget
     /// wall-clock-only behavior. See
@@ -1168,6 +1752,8 @@ pub struct Executor {
     /// executor's own capacity-aware `TermStore` accounting at theory-loop and
     /// publication boundaries. `None` means unbounded.
     pub(crate) term_memory_limit: Option<usize>,
+    /// One retained evaluation refusal per external decision or model read.
+    evaluation_control: model::EvaluationControl,
     /// Re-entry guard for pivot-bounded word equation enumeration (#3826).
     /// When > 0, the pivot enumeration pre-pass in solve_strings_lia is
     /// skipped to prevent infinite recursion.
@@ -1285,6 +1871,35 @@ pub struct Executor {
     /// semantics-preserving, so pre-lift-derived units stay sound post-lift.
     /// Empty on non-DT routes.
     dt_pre_lift_assertions: Vec<TermId>,
+    /// Term-index ranges `[start, end)` the eager datatype axiom scans treat
+    /// as session history, skipping the ones the current query cannot reach
+    /// (`dt_axioms/live_terms.rs`, #dt-live-scan): whatever an undecided
+    /// finite-domain lane attempt left behind, and, once the lane
+    /// (`dt_finite`) has decided a decision command, every term each decision
+    /// command from that one on created.
+    dt_history_term_ranges: Vec<(usize, usize)>,
+    /// TermStore length when the outermost decision command began.
+    dt_query_entry_term_len: usize,
+    /// Term-store length when the last outermost decision command finished:
+    /// a term at or past it was interned afterwards (a `(get-value)` term),
+    /// so no model of that command valued it (#get-value-wrong-ctor-congruence).
+    model_term_len: usize,
+    /// The finite-domain lane decided the current outermost decision command.
+    dt_fd_decided_command: bool,
+    /// Assertion windows (sorted) the finite-domain lane left undecided in
+    /// the current outermost decision command: the same window is never
+    /// re-run (#dt-fd-session: a `check-sat-assuming` asked it first and
+    /// again from the scoped fallback).
+    dt_fd_undecided_windows: Vec<Vec<TermId>>,
+    /// The finite-domain lane has decided a decision command of this session.
+    dt_fd_decided_session: bool,
+    /// Every datatype axiom the DT solve paths appended during the current
+    /// outermost decision command (drained from `dt_solver_added_axiom_terms`
+    /// whenever a round truncates its axioms). The axiom scans treat terms
+    /// reachable from them as live: hash-consing hands a regenerated selector
+    /// chain the id an EARLIER command created, so creation time alone would
+    /// call it history (#dt-live-scan).
+    dt_command_axiom_roots: Vec<TermId>,
     /// Lazy DT lane registry (`DESIGN_lazy_dt.md` stage D2): datatype
     /// registry with all-nullary markers plus the executor-materialized
     /// domain-closure split bases `(t, [(= t C1), .., (= t Ck)])`. `Some`
@@ -1329,6 +1944,12 @@ pub struct Executor {
     /// restores the original assertion set. Used by standalone preprocessing
     /// lanes whose temporary reduced assertions are not the user-facing formula.
     defer_counterexample_minimization: bool,
+    /// Formulas whose uninterpreted applications are model points beside the
+    /// query's own, for `retain_query_function_table_rows`: the kernel route
+    /// sets the window its model was read over (its applications over named
+    /// term-level `ite`s are not terms of the authored assertions) for the
+    /// one store of that model, and clears it after.
+    function_row_roots: Vec<TermId>,
     /// True when the last SAT witness passed ordinary final model validation or
     /// the independently checked total-projection evidence lane. Reset to
     /// `false` at the start of each `check_sat`. Used by the API layer to report
@@ -1355,11 +1976,24 @@ pub struct Executor {
     /// interning.  It is never a certificate on its own: final publication
     /// must bind it to a freshly authenticated public-query scope.
     pending_nested_array_bool_bv_unsat: Option<unsat_cert::PendingNestedArrayBoolBvUnsat>,
+    /// Affine route identity produced only by the exact bounded Bool/BV/LIA
+    /// decision lane and consumed by the common UNSAT mint.
+    pending_bounded_bv_lia_unsat: Option<unsat_cert::PendingBoundedBvLiaUnsat>,
+    /// Exact proof/bundle identity retained after the one-shot strict-native
+    /// BV/LIA publication certificate is consumed.
+    last_strict_native_bv_lia_bundle: Option<unsat_cert::StrictNativeBvLiaBundleState>,
+    /// Immutable exact-source polynomial bundle, distinct from Alethe support.
+    last_strict_native_nra_sos_bundle:
+        Option<std::sync::Arc<unsat_cert::StrictNativeNraSosBundleState>>,
     /// Certification class consumed by the most recent SMT-LIB command
     /// boundary. This is separate from the one-shot token so later diagnostics
     /// cannot relabel an exact semantic certificate as a strict proof merely
     /// because the admitted result is `Unsat`.
     last_command_unsat_admission: Option<unsat_cert::CommandUnsatAdmission>,
+    /// Evidence level and corroboration of the certificate the most recent
+    /// SMT-LIB command boundary consumed for an `unsat` (`evidence=` on the
+    /// certificate line). Recorded beside `last_command_unsat_admission`.
+    last_command_unsat_evidence: Option<UnsatEvidence>,
     /// Frozen authored assertion and assumption authority for the active public
     /// decision. Solver-generated preprocessing terms never enter this epoch.
     unsat_query_epoch: Option<unsat_cert::UnsatQueryEpoch>,
@@ -1431,6 +2065,26 @@ pub struct Executor {
     /// every stored solve verdict; set only when the accepted `Sat` came
     /// from the DT lane.
     dt_theory_model: Option<ay_dt::DtModel>,
+    /// Exact ground-value commitments `(= t v)` of the lane whose model is
+    /// stored, `v` a ground constructor term naming the value the lane gave
+    /// `t` (the finite-domain datatype lane, `dt_finite`). Read ONLY by
+    /// datatype model construction (`datatype_model_collection_roots`), which
+    /// otherwise guesses well-founded defaults for datatype classes no
+    /// collected term forces, and can guess values that falsify the query the
+    /// lane's model satisfies (#dt-fd-pin-roots). Candidate-construction
+    /// input only: every gate still re-checks the authored assertions.
+    /// Cleared with `clear_dt_theory_model`, so they never outlive the model.
+    lane_model_pin_roots: Vec<TermId>,
+    /// Pins a lane hands to the NEXT stored model: moved into
+    /// `lane_model_pin_roots` by `solve_and_store_model_full` right after it
+    /// clears the previous verdict's state.
+    pending_lane_model_pin_roots: Vec<TermId>,
+    /// The finite-domain lane's published model as one total structure
+    /// (`model/lane_ground_model.rs`, #dt-fd-ground-model): installed only
+    /// after the lane's model passed every gate, read only by the value
+    /// printers, and dropped with the model (`clear_dt_theory_model`,
+    /// `invalidate_last_check_result`).
+    lane_ground_model: Option<Box<model::lane_ground_model::LaneGroundModel>>,
     /// Set by `finalize_sat_model_validation` when it degraded a Sat to
     /// Unknown on a DATATYPE ground-assertion incompleteness gap (the
     /// #dt-completion-gate-handoff case) while the DT lane's e-graph export
@@ -1451,6 +2105,20 @@ pub struct Executor {
     /// Reentrancy latch for the assignment builder: while building, nested
     /// evaluation must not consult the (incomplete) assignment.
     dt_egraph_building: Cell<bool>,
+    /// Snapshot-keyed census of authored ground UF applications for the
+    /// printed-table authored-point completion
+    /// (#dt-uf-table-authored-points): the traversal is
+    /// O(assertions x term size) and the gate/printer ask per symbol per
+    /// round, so it is memoized against the exact (assertions, expanded
+    /// roots) snapshot and rebuilt on any difference.
+    uf_authored_apps_cache: RefCell<
+        Option<(
+            Vec<TermId>,
+            Vec<TermId>,
+            Arc<ay_core::kani_compat::DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>>>,
+            std::collections::HashMap<String, bool>,
+        )>,
+    >,
     /// Exact-snapshot-keyed index for array definitional-equality lookups
     /// (`array_variable_definition*` / `unique_array_constructor_definition_
     /// excluding`): maps each side TermId of every asserted binary `=` to the
@@ -1463,6 +2131,9 @@ pub struct Executor {
     /// ~N²/2 assertions, so validation cost exploded to tens of seconds by
     /// N≈400 on instances whose solve took 0.1s.
     array_def_index: RefCell<Option<model::ArrayDefIndexCache>>,
+    // Negative-only declaration classification, valid for this exact source
+    // revision. It never authenticates a positive function interpretation.
+    array_functions_absent: RefCell<Option<ay_frontend::SourceContextStamp>>,
     /// Exact-snapshot structural index of reserved integer div/mod witnesses.
     ///
     /// Zero-divisor evaluation remains keyed by independently evaluated
@@ -1516,6 +2187,17 @@ pub struct Executor {
     /// produced spurious UNSAT, e.g. `forall x. select c x = f x` with
     /// `(= a c)`). Set fresh each solve in `check_sat`.
     original_problem_had_quantifiers: bool,
+    /// Declared constants that the quantifier preprocessing's rewrites removed
+    /// from every assertion of a solve in this public decision
+    /// ([`Executor::record_preprocess_eliminated_constants`]). The rewritten
+    /// formula does not mention one — the affine elimination turns `(forall
+    /// v. (or (= (* v w) 0) (= (+ (* 2 v) z) 1)))` into `(= w 0)`, and `z`
+    /// used to reach `(get-model)` with no value (2026-09-25 verify, B3) — so
+    /// a certificate lane's pre-seal completion gives it the canonical
+    /// default, and the SAT funnel refuses a model that still leaves it open.
+    /// Cleared by `begin_public_solve`; nested solves only add to it, and the
+    /// gates check every value it leads to.
+    preprocess_eliminated_constants: Vec<TermId>,
     /// #quantified-trace-arming: the internal proof trace is armed for the
     /// RETRY pass of the solve currently in flight, even though competition
     /// shedding is otherwise active.
@@ -1559,6 +2241,40 @@ pub struct Executor {
     /// exempt from that quarantine. Set only by that pass, consumed once at the
     /// quarantine boundary, and reset at each check-sat entry.
     ho_seq_unfold_array_free_unsat: bool,
+    /// This solve's UNSAT is the quantifier pipeline's rewriting-only refutation
+    /// (`simplifier_stage`), so no theory combination ran: quarantine-exempt.
+    simplifier_refutation_unsat: bool,
+    /// The quantifier pipeline adopted a rewritten window during this public
+    /// check-sat (`simplifier_stage`); arms the unrewritten fallback
+    /// (#simplifier-sat-fallback). Scoped to one `check_sat_with_authority`
+    /// call.
+    simplifier_rewrite_adopted: bool,
+    /// The unrewritten fallback is running: the stage leaves every window
+    /// unchanged until the public call that installed it returns.
+    simplifier_stage_suspended: bool,
+    /// When true, this solve's UNSAT was published by the quantifier loop's
+    /// justification registry (`Justification::publish_if_established`) off an
+    /// obligation that contains NO nested array at all.
+    ///
+    /// Every registry leg re-decides its obligation from scratch on a
+    /// DISPOSABLE executor through the ordinary `check_sat` pipeline, and
+    /// accepts the answer only against a checked exact-query certificate. When
+    /// that obligation carries no nested array, the refutation cannot have used
+    /// the nested-array theory combination
+    /// `quarantine_unverified_nested_array_unsat` distrusts -- the same
+    /// "no array-combination reasoning" argument that exempts
+    /// `nested_array_row_reduction_unsat` and `ho_seq_unfold_array_free_unsat`.
+    /// It is therefore authoritative at that boundary. Set only at the
+    /// registry's publication point, consumed once at the quarantine, and reset
+    /// at each check-sat entry.
+    nested_array_free_justification_unsat: bool,
+    /// Whether the obligation a justification leg JUST refuted carries a nested
+    /// array. Written only by the three registry legs, immediately beside the
+    /// obligation vector they handed to `checked_ground_solve`; cleared by
+    /// `Justification::establish` before each attempt and read only by
+    /// `Justification::publish_if_established`, so no other caller of a leg can
+    /// leave a value the registry would read.
+    justified_obligation_has_nested_arrays: Option<bool>,
     /// Re-entrancy latch for the nested-array-free entailed-residue rescue
     /// (`nested_array_free_residue_unsat`, #nested-array-residue-rescue). That
     /// rescue re-solves a filtered subset of the hard assertions through the
@@ -1571,6 +2287,8 @@ pub struct Executor {
     /// the aggregate cost across many check-sats without ever limiting
     /// successful conversions; see `RESIDUE_MAX_FAILURES`.
     residue_probe_failures: u32,
+    /// FAILED array-to-UF abstraction attempts this session; see `ABSTRACTION_MAX_FAILURES`.
+    array_uf_abstraction_failures: u32,
     /// When true, `has_negated_string_equivalence_tautology` is bypassed.
     /// Set during incremental SLIA pipeline where `self.ctx.assertions` is
     /// temporarily replaced with preprocessed assertions that may falsely
@@ -1671,6 +2389,30 @@ pub struct Executor {
     /// one fused 8-literal `Generic` array+EUF+LIA conflict it must refuse.
     /// With the scope armed the same probe answers in 30 ms.
     pub(in crate::executor) shared_store_derived_query: bool,
+    /// The same-context consequence-replay probe exists ONLY to produce a
+    /// strict-complete proof over its window, so its preprocessing must not
+    /// run variable substitution: an in-place `x := t` rewrite of a
+    /// consequence detaches the proof's assume leaves and lands as a
+    /// premiseless `trust` step the strict checker refuses (measured on the
+    /// deductive-checks `seq_contains` needle shape: `needle := (select s sk)` turned
+    /// a 4 ms propositional refutation into `unknown`). Set by
+    /// `checked_same_context_unsat_proof` on the probe; read together with the
+    /// `:ay-proof-no-varsubst` option by `skip_varsubst_for_proofs`. Proof
+    /// shape only — never a verdict.
+    pub(in crate::executor) proof_probe_skips_varsubst: bool,
+    /// The QF_LRA preprocessing of a proof probe skips sum-of-monomials
+    /// normalization (#qlra-nested-cegqi M3a). SOM rebuilds an assertion
+    /// whose arithmetic it distributes through the simplifying constructors
+    /// (operands reordered, `=` sides swapped); that rewrite is no probe
+    /// assertion, so its leaf demotes to a premiseless `trust` and the
+    /// probe's strict check refuses a correct refutation (measured on the
+    /// expansion certificate's instance bodies, `(* (+ (* sk 23/81) 20/27)
+    /// 81)` and kin, on RND_3_5 / RNDPRE_4_18). The LRA solver ingests the
+    /// undistributed linear terms directly. Set on the OUTER executor only
+    /// for the duration of one expansion-certificate probe call and copied
+    /// onto the probe by `checked_same_context_unsat_proof`. Proof shape only
+    /// — never a verdict.
+    pub(in crate::executor) proof_probe_skips_som: bool,
     /// Dead engine-minted witnesses the array-axiom generators must not index.
     ///
     /// Every `Var` in here predates the assertion epoch in flight
@@ -1722,6 +2464,8 @@ pub struct Executor {
     /// When `Some(seed)`, the seed is applied to every SAT solver instance
     /// before solving. Different seeds produce different search paths.
     random_seed: Option<u64>,
+    /// Host values of script-overridden resource options, for `(reset)`.
+    script_resource_options: lifecycle::ScriptOverriddenResourceOptions,
     /// E-matching round limit override (#7893).
     ematching_round_limit: Option<usize>,
     /// When true, SAT solvers created during solving emit periodic progress
@@ -1749,6 +2493,11 @@ pub struct Executor {
     /// consulted from `finalize_sat_model_validation` or anything it calls.
     /// See `model_output_is_demanded`.
     model_output_shed: bool,
+    /// The candidate model `(get-model)` may print after `unknown`, and the
+    /// policy that decides whether it is kept (see `CandidateModelPolicy`).
+    unknown_candidate: model::unknown_candidate::UnknownCandidate,
+    /// The outermost decision command's stderr diagnostics, for statistics.
+    stderr_diagnostics: model::stderr_diagnostics::StderrDiagnostics,
     /// Test-only trace of the last seed applied to a raw SAT solver instance.
     #[cfg(test)]
     last_applied_sat_random_seed: Cell<Option<u64>>,
@@ -1861,6 +2610,13 @@ pub struct Executor {
     /// the public model evaluator cannot decide. Present only alongside
     /// `last_soft_cost` and cleared with every last-result invalidation.
     last_soft_violations: Option<Vec<usize>>,
+    /// Per-group violated weights from the last grouped `(assert-soft ...)`
+    /// solve, in first-appearance group order (Z3 `:id` semantics).
+    ///
+    /// `Some` whenever a MaxSMT witness is admitted; the renderer prints
+    /// these in Z3's per-group `(get-objectives)` shape. Cleared with
+    /// `last_soft_cost`.
+    last_soft_group_costs: Option<Vec<optimization::SoftGroupCost>>,
     /// Per-objective finite outcomes from the last admitted optimization solve.
     ///
     /// Lex entries are captured during the optimizing query and authenticated
@@ -1886,6 +2642,9 @@ pub struct Executor {
     /// Records the EAGER `__ay_ext_diff` witnesses emitted this solve so the
     /// finalizer can surface `auflia.ext.*` on `-st`. Measurement only.
     pub(crate) array_ext_shadow: ArrayExtShadow,
+    /// `--engine=shadow`: the CDCL(T) kernel beside the lane (measurement
+    /// only; `executor/engine_shadow.rs`).
+    pub(crate) engine_shadow: engine_shadow::EngineShadow,
     /// Per-public-query array-extensionality witness provenance and pair cache.
     ///
     /// Active entries are reused across internal retries only. Public query
@@ -1932,7 +2691,7 @@ pub struct Executor {
 #[cfg(test)]
 impl Executor {
     pub(crate) fn incremental_bv_state(&self) -> Option<&IncrementalBvState> {
-        self.incr_bv_state.as_ref()
+        self.incr_bv_state.as_deref()
     }
 }
 
@@ -2055,6 +2814,11 @@ impl Executor {
         cmd: &Command,
         boundary: CommandExecutionBoundary,
     ) -> Result<Option<String>> {
+        // Whatever this command builds and runs is not the caller's query
+        // (`lnh_symmetry`, C4).
+        let _lnh_owner = self.lnh_claim_query_ownership();
+        // Before elaboration: a command AY refuses is still one Carcara reads.
+        self.authored_problem_surface.observe(cmd);
         // `check_sat` installs/restores its own solve-phase deadline internally,
         // but public UNSAT certification runs after that solve returns. Hold one
         // absolute deadline across the complete command so certification and
@@ -2071,15 +2835,48 @@ impl Executor {
             self.decision_command_depth.set(1);
         }
         let decision_timer = outermost_decision_command.then(cert_accounting::DecisionTimer::start);
-        let publication_deadline =
-            is_decision_command.then(|| self.install_command_publication_deadline());
-        let result = self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
-        if let Some(previous_deadlines) = publication_deadline {
-            self.restore_command_publication_deadline_after_call(previous_deadlines);
+        let publication_deadline = is_decision_command.then(|| {
+            if matches!(cmd, Command::CheckSat) {
+                self.install_text_optimization_publication_deadline()
+            } else {
+                self.install_command_publication_deadline()
+            }
+        });
+        if outermost_decision_command {
+            self.begin_candidate_window(cmd);
+            self.stderr_diagnostics.clear();
+            self.dt_query_entry_term_len = self.ctx.terms.len();
+            self.dt_fd_decided_command = false;
+            self.dt_fd_undecided_windows.clear();
+            // A lane's value pins belong to a model of the command that
+            // produced them, never to a later command's (#dt-fd-pin-roots).
+            self.lane_model_pin_roots.clear();
+            self.pending_lane_model_pin_roots.clear();
+            self.dt_command_axiom_roots.clear();
         }
+        let result = self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
+        if outermost_decision_command {
+            self.unknown_candidate.finish_check(
+                result
+                    .is_ok()
+                    .then_some(self.last_result.as_ref())
+                    .flatten(),
+            );
+        }
+        drop(publication_deadline);
         drop(decision_timer);
         if outermost_decision_command {
+            self.model_term_len = self.ctx.terms.len();
             self.decision_command_depth.set(0);
+            if std::mem::take(&mut self.dt_fd_decided_command) {
+                self.dt_fd_decided_session = true;
+            }
+            if self.dt_fd_decided_session {
+                self.record_dt_history_term_range(
+                    self.dt_query_entry_term_len,
+                    self.ctx.terms.len(),
+                );
+            }
         }
         result
     }
@@ -2091,6 +2888,11 @@ impl Executor {
         cmd: &Command,
         boundary: CommandExecutionBoundary,
     ) -> Result<Option<String>> {
+        let _evaluation_read = matches!(
+            cmd,
+            Command::GetModel | Command::GetValue(_) | Command::Eval(_)
+        )
+        .then(|| self.begin_external_evaluation_read());
         if boundary == CommandExecutionBoundary::NativeOptimization
             && !matches!(cmd, Command::CheckSat)
         {
@@ -2112,6 +2914,10 @@ impl Executor {
                 CommandExecutionBoundary::NativeMaxSmtTextContinuation
                 | CommandExecutionBoundary::NativeOptimization => self.begin_public_solve(true),
             }
+            if let Some(result) = self.reject_pending_fp_namespace_refusal() {
+                Self::invalidate_bv_cnf_export_for_rejected_check()?;
+                return Ok(Some(result.to_string()));
+            }
         }
         // Query-local SMT-LIB 2.7 schematic instances are rebuilt by the
         // frontend at each check.  Remove them before incremental subsystems
@@ -2127,11 +2933,6 @@ impl Executor {
         let internal_probe_command = match cmd {
             Command::GetConsequences(_, _) => Some("get-consequences"),
             Command::GetAbduct(_, _) => Some("get-abduct"),
-            Command::Apply(tactic)
-                if crate::api::Tactic::from_apply(tactic).may_invoke_solver() =>
-            {
-                Some("apply with ctx-solver-simplify")
-            }
             _ => None,
         };
         if theories::bv_cnf_dump::requested() {
@@ -2141,6 +2942,13 @@ impl Executor {
                     "--dump-bv-cnf does not support {probe} because it may run internal decision probes"
                 )));
             }
+        }
+
+        // `Context` would clone the entire Apply AST into CommandResult.
+        // The owned entry prepares the borrowed AST once and performs the same
+        // decision-probe/CNF refusal under that original owner before execution.
+        if let Command::Apply(tactic) = cmd {
+            return self.apply_tactic_goal(tactic).map(Some);
         }
 
         // Track incremental mode: enabled on first push, disabled on reset
@@ -2189,19 +2997,6 @@ impl Executor {
                     self.lemma_cache.pop_to_level(new_depth);
                 }
             }
-            Command::Reset => {
-                self.incremental_mode = false;
-                self.clear_query_scoped_authority();
-                // `(reset)` is strictly stronger than `(reset-assertions)`, so
-                // anything the latter clears this must clear too. The lane
-                // account was missed: review measured `(reset)` between two
-                // identical problems carrying session_certificates=2 across the
-                // boundary, where `(reset-assertions)` correctly restarts at 1.
-                // Costs lost answers only (a carried-over deficit closes the
-                // lane early), never a wrong one.
-                self.finite_model_lane.reset();
-                for_each_incremental_subsystem!(reset self);
-            }
             // reset-assertions clears assertions and scopes in the frontend
             // (Context::process_command), but the executor's persistent SAT
             // solvers, incremental state, and quantifier manager also need
@@ -2227,7 +3022,7 @@ impl Executor {
                 if key == "random-seed" {
                     if let ay_frontend::sexp::SExpr::Numeral(ref n) = *value {
                         if let Ok(seed) = n.parse::<u64>() {
-                            self.random_seed = Some(seed);
+                            self.apply_random_seed_option(seed);
                         }
                     }
                 } else if key == "timeout" {
@@ -2240,7 +3035,7 @@ impl Executor {
                     // ran forever. `0` means "no timeout" per Z3 convention.
                     if let ay_frontend::sexp::SExpr::Numeral(ref n) = *value {
                         if let Ok(ms) = n.parse::<u64>() {
-                            self.set_timeout((ms != 0).then(|| Duration::from_millis(ms)));
+                            self.apply_timeout_option(ms);
                         }
                     }
                 } else if key == "rlimit" {
@@ -2268,8 +3063,7 @@ impl Executor {
                     // that set a memory bound through SMT-LIB got none.
                     if let ay_frontend::sexp::SExpr::Numeral(ref n) = *value {
                         if let Ok(megabytes) = n.parse::<usize>() {
-                            let bytes = megabytes.saturating_mul(1024 * 1024);
-                            self.set_memory_limit((bytes != 0).then_some(bytes));
+                            self.apply_max_memory_option(megabytes);
                         }
                     }
                 }
@@ -2314,6 +3108,21 @@ impl Executor {
                 return Err(error.into());
             }
         };
+        if matches!(cmd, Command::Reset) {
+            // `(reset)` rebuilds the whole executor, and only once the frontend
+            // has accepted the command: it has just replaced its context and
+            // term store, and every executor field that described the old
+            // problem goes with them (`lifecycle/session_reset.rs`).
+            let ctx = std::mem::replace(&mut self.ctx, Context::new());
+            let authored = boundary == CommandExecutionBoundary::AuthoredText;
+            self.reset_keeping_authored_surface(ctx, authored);
+        }
+        // #defmacro-named-preuse: the raw stack the check-sat-time
+        // definitional-forall pass replaced at THIS check, if it adopted
+        // anything. Taken out of the context here — before any solve, so no
+        // derived context ever carries it and no later command finds a stale
+        // one — and consulted only after the verdict below.
+        let definitional_adoption_retry = self.ctx.take_definitional_adoption_retry();
         if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {
             // `begin_public_solve` intentionally ran before elaboration to
             // revoke stale artifacts on every failure path. Rebind its exact
@@ -2349,35 +3158,36 @@ impl Executor {
                 }
                 let has_softs = !self.ctx.soft_constraints().is_empty();
                 let has_objectives = !self.ctx.objectives().is_empty();
+                let fallback_budget =
+                    self.reserve_budget_for_fallback_stacks(definitional_adoption_retry.len());
+                self.ground_first_awaits_fallback_stack = !definitional_adoption_retry.is_empty();
                 let sat_result = if has_softs && has_objectives {
-                    // Joint arithmetic-objective + soft optimization is not yet
-                    // implemented. Prioritizing either branch silently drops
-                    // half of the declared problem and can publish a non-joint
-                    // model value as an optimum. Refuse the mixed problem until
-                    // one engine certifies both objective classes together.
-                    self.invalidate_last_check_result();
-                    self.record_unknown_from_origin(UnknownOrigin::UnsupportedFeature);
-                    SolveResult::Unknown
+                    // Joint arithmetic-objective + soft optimization: one
+                    // lexicographic engine over the unified declaration
+                    // order (see `joint_optimize_lex`); it fails closed to
+                    // `unknown` outside its exact envelope.
+                    self.optimize_check_sat()
                 } else if has_softs {
                     // `(assert-soft ...)` present: solve the MaxSMT problem.
                     // Soundness: a soft constraint is NOT a hard constraint, so
                     // this minimizes the total weight of violated softs subject
                     // to the hard assertions rather than asserting them hard.
-                    self.maxsmt_check_sat()?
+                    self.maxsmt_check_sat()
                 } else if !has_objectives {
                     // Route through check_sat() which calls finalize_sat_model_validation().
                     // Previously called check_sat_internal() directly, bypassing model
                     // validation — an escape hatch that violated the verification invariant.
                     // Part of #5787 (Phase 6).
                     if boundary == CommandExecutionBoundary::AuthoredText {
-                        self.solve_authored_plain_hard_query(&[])?
+                        self.solve_authored_plain_hard_query(&[])
                     } else {
-                        self.check_sat()?
+                        self.check_sat()
                     }
                 } else {
-                    self.optimize_check_sat()?
+                    self.optimize_check_sat()
                 };
-                let sat_result = self.certify_unsat_for_publication(sat_result, &[]);
+                self.ground_first_awaits_fallback_stack = false;
+                let sat_result = self.certify_unsat_for_publication(sat_result?, &[]);
                 let sat_result = match boundary {
                     CommandExecutionBoundary::GenericText
                     | CommandExecutionBoundary::AuthoredText
@@ -2386,6 +3196,14 @@ impl Executor {
                     }
                     CommandExecutionBoundary::NativeOptimization => sat_result,
                 };
+                if !definitional_adoption_retry.is_empty()
+                    && self.fallback_retry_is_due(fallback_budget, &sat_result)
+                {
+                    self.restore_next_stack_for_retry(definitional_adoption_retry);
+                    return self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
+                }
+                // `--engine=shadow` (measurement only): the verdict is final.
+                self.engine_shadow_flush(&sat_result);
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
@@ -2418,7 +3236,10 @@ impl Executor {
                             .to_string(),
                     ));
                 }
-                let sat_result = self.check_sat_assuming_with_named_cores(&assumptions)?;
+                let fallback_budget =
+                    self.reserve_budget_for_fallback_stacks(definitional_adoption_retry.len());
+                // `--engine=shadow` notes the stack and the assumptions here.
+                let sat_result = self.check_sat_assuming_shadowed(&assumptions)?;
                 let sat_result = self.certify_unsat_for_publication(sat_result, &assumptions);
                 let sat_result = match boundary {
                     CommandExecutionBoundary::GenericText
@@ -2430,6 +3251,14 @@ impl Executor {
                         unreachable!("the native optimization boundary was rejected before solve")
                     }
                 };
+                if !definitional_adoption_retry.is_empty()
+                    && self.fallback_retry_is_due(fallback_budget, &sat_result)
+                {
+                    self.restore_next_stack_for_retry(definitional_adoption_retry);
+                    return self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
+                }
+                // `--engine=shadow` (measurement only): the verdict is final.
+                self.engine_shadow_flush(&sat_result);
                 let display = sat_result.to_string();
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
@@ -2456,13 +3285,105 @@ impl Executor {
             Some(CommandResult::GetUnsatAssumptions) => Ok(Some(self.unsat_assumptions())),
             Some(CommandResult::GetProof) => Ok(Some(self.get_proof())),
             Some(CommandResult::Exit) => Ok(Some("exit".to_string())),
-            Some(CommandResult::Simplify(term_id)) => Ok(Some(self.simplify(term_id))),
-            Some(CommandResult::Apply(tactic)) => Ok(Some(self.apply_tactic_goal(&tactic))),
+            Some(CommandResult::Simplify(term_id)) => Ok(Some(self.simplify(
+                term_id,
+                match cmd {
+                    Command::SimplifyWithParams(_, parameters) => parameters,
+                    _ => &[],
+                },
+            ))),
+            Some(CommandResult::Apply(tactic)) => self.apply_tactic_goal(&tactic).map(Some),
             Some(CommandResult::GetAbduct(name, goal)) => Ok(Some(self.get_abduct(&name, goal)?)),
             #[allow(unreachable_patterns)]
             Some(_) => Ok(Some("unsupported".to_string())),
             None => Ok(None),
         }
+    }
+
+    /// #defmacro-named-preuse: with `fallbacks` stacks still to try after
+    /// this one, hold back half of the remaining command budget for them —
+    /// otherwise an expanded stack the quantifier engines churn on until the
+    /// deadline would leave the raw stack, which the solver may refute in
+    /// milliseconds, no time at all (measured: a post-use named pair the
+    /// raw solve refutes in 4-9 s published `unknown` at a 20 s wall). The
+    /// half is a deadline share (GT6, GuardTree step S3) of the solve
+    /// deadline and the certification deadline, open until the returned
+    /// share drops, i.e. for this attempt's solve and certification only;
+    /// the command's deadline is never written, so the last stack of the
+    /// chain gets everything that is left. Without a command deadline there
+    /// is nothing to divide.
+    fn reserve_budget_for_fallback_stacks(
+        &self,
+        fallbacks: usize,
+    ) -> Option<guard_nodes::DeadlineShare> {
+        if fallbacks == 0 {
+            return None;
+        }
+        self.open_deadline_share(guard_nodes::ShareOf::SearchAndCertification)
+    }
+
+    /// #defmacro-named-preuse: end one attempt of the fallback chain and ask
+    /// whether the next stack earns a solve.
+    ///
+    /// The attempt's narrowed budget is given back FIRST, so the question is
+    /// asked of the command's deadline, the one the chain divides. Asked while
+    /// the narrowed deadline was still installed, an attempt that spent its
+    /// half read as an expired command: the next stack never ran, and the
+    /// command published `unknown` (`:unknown.reason timeout`) at half its
+    /// budget. That is the early-stop class of the D7 held-out scoreboard:
+    /// quantified files ending at 5.0 s of a `-T:10` budget.
+    fn fallback_retry_is_due(
+        &self,
+        attempt_budget: Option<guard_nodes::DeadlineShare>,
+        verdict: &SolveResult,
+    ) -> bool {
+        // The share counts itself spent as it closes (GT6).
+        drop(attempt_budget);
+        self.raw_stack_retry_is_due(verdict)
+    }
+
+    /// #defmacro-named-preuse: does the verdict decided on the live stack
+    /// earn the next stack of the fallback chain a solve? Only an `unknown`
+    /// does — a `sat`/`unsat` decided on any of the stacks is final (they are
+    /// all equisatisfiable, `ay_frontend`'s `definitional_check_sat` module)
+    /// — and only while the command still has budget: an expired command
+    /// deadline or a raised interrupt would make the retry another `unknown`
+    /// for the same reason, never an answer.
+    fn raw_stack_retry_is_due(&self, verdict: &SolveResult) -> bool {
+        if !matches!(verdict, SolveResult::Unknown) {
+            return false;
+        }
+        let interrupted = self
+            .solve_interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        let deadline_expired = self
+            .solve_deadline
+            .get()
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline);
+        !interrupted && !deadline_expired
+    }
+
+    /// #defmacro-named-preuse: restore the next stack of the fallback chain,
+    /// hand the rest back for the re-entered check to take, and account the
+    /// re-run as the same query. The previous solve's artifacts are
+    /// superseded by the re-entry's `begin_external_decision_query`, exactly
+    /// as any new decision command supersedes its predecessor.
+    fn restore_next_stack_for_retry(
+        &mut self,
+        mut chain: Vec<ay_frontend::DefinitionalAdoptionSnapshot>,
+    ) {
+        let next = chain.remove(0);
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!(
+                "c phase-trace defmacro-retry: live stack decided unknown; restoring the next \
+                 stack for another solve ({} more after it)",
+                chain.len()
+            );
+        }
+        self.ctx.restore_definitional_adoption_snapshot(next);
+        self.ctx.set_definitional_adoption_retry(chain);
+        self.ctx.uncount_check_sat_for_retry();
     }
 
     /// Set the maximum number of E-matching rounds per check-sat call.
@@ -2480,11 +3401,19 @@ impl Executor {
     }
 
     pub(crate) fn current_random_seed(&self) -> u64 {
-        match self.ctx.get_option("random-seed") {
-            Some(OptionValue::Numeral(seed)) => seed.parse::<u64>().unwrap_or(0),
-            Some(OptionValue::String(seed)) => seed.parse::<u64>().unwrap_or(0),
-            _ => 0,
-        }
+        // Both the typed setter and SMT-LIB option handler update this field.
+        // Give it precedence so a later typed override and a host seed
+        // restored by `(reset)` are also applied to search.
+        self.random_seed.unwrap_or_else(|| {
+            // Context-only proof checkers inherit the source options without
+            // executor configuration; preserve their option-based seed too.
+            match self.ctx.get_option("random-seed") {
+                Some(OptionValue::Numeral(seed) | OptionValue::String(seed)) => {
+                    seed.parse::<u64>().unwrap_or(0)
+                }
+                _ => 0,
+            }
+        })
     }
 
     pub(crate) fn record_applied_sat_random_seed_for_test(&self, seed: u64) {
@@ -2578,3 +3507,5 @@ impl Executor {
         }
     }
 }
+
+pub(crate) mod finite_field;

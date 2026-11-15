@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% `i128::MIN + 1`: the substituted degree is exactly `i128::MIN`, which still fits, so nothing
+% wraps and the unfixed checker refuses this too.
+f 2;
+rup 1 x2 >= -170141183460469231731687303715884105727 ;
+red 1 ~x1 >= 1 : x1 -> 1 ;
+pol 1 4 +;
+output NONE;
+conclusion UNSAT : 5;
+end pseudo-Boolean proof;

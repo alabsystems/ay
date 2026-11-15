@@ -105,6 +105,19 @@ impl ChcProblem {
         cache: &mut Vec<(String, i128, ChcExpr, ChcExpr)>,
     ) -> ChcExpr {
         match expr {
+            ChcExpr::ArrayLambda(lambda) => ChcExpr::ArrayLambda(
+                lambda.with_captures(
+                    lambda
+                        .captures()
+                        .iter()
+                        .map(|value| {
+                            std::sync::Arc::new(Self::expand_mod_div_expr(
+                                value, counter, axioms, cache,
+                            ))
+                        })
+                        .collect(),
+                ),
+            ),
             ChcExpr::Bool(_)
             | ChcExpr::Int(_)
             | ChcExpr::Real(_, _)
@@ -248,6 +261,36 @@ impl ChcProblem {
         }
     }
 
+    /// Query clauses whose body is exactly one argument-free predicate
+    /// application under no constraint (`fail => false`), paired with that
+    /// predicate.
+    ///
+    /// This is the shape
+    /// [`expand_nullary_fail_queries`](Self::expand_nullary_fail_queries)
+    /// rewrites (`nullary_fail_query_indices` selects it by index); model
+    /// validation uses the same predicate set to decide when that rewrite is
+    /// exact for a submitted model.
+    pub(crate) fn nullary_fail_query_clauses(
+        &self,
+    ) -> impl Iterator<Item = (PredicateId, &HornClause)> + '_ {
+        self.queries()
+            .filter_map(|query| Self::nullary_fail_query_predicate(query).map(|pred| (pred, query)))
+    }
+
+    /// The nullary predicate of `fail => false`, the query expansion rewrites.
+    ///
+    /// Only an unconstrained query: expansion turns each `body => fail` into
+    /// `body => false` and drops the query's own constraint `φ`, which is
+    /// exact only when `φ` holds. `fail ∧ φ => false` with an unsatisfiable
+    /// `φ` never fires; dropping `φ` would make a safe problem unsafe.
+    fn nullary_fail_query_predicate(query: &HornClause) -> Option<PredicateId> {
+        let unconstrained = matches!(query.body.constraint, None | Some(ChcExpr::Bool(true)));
+        match query.body.predicates.as_slice() {
+            [(pred_id, args)] if args.is_empty() && unconstrained => Some(*pred_id),
+            _ => None,
+        }
+    }
+
     /// Expand nullary "fail" predicate queries into direct queries.
     ///
     /// CHC-COMP benchmarks often use a pattern with a nullary `fail` predicate:
@@ -265,21 +308,61 @@ impl ChcProblem {
     ///
     /// Returns true if any transformation was performed.
     pub fn expand_nullary_fail_queries(&mut self, verbose: bool) -> bool {
-        // Find query clauses with nullary predicates in body
-        let mut nullary_fail_queries: Vec<(PredicateId, HornClause)> = Vec::new();
+        self.expand_nullary_fail_queries_recorded(verbose).is_some()
+    }
 
-        for query in self.queries() {
-            if query.body.predicates.len() == 1 {
-                let (pred_id, args) = &query.body.predicates[0];
-                if args.is_empty() {
-                    // This is a query with a nullary predicate (like `fail => false`)
-                    nullary_fail_queries.push((*pred_id, query.clone()));
+    /// The `fail => false` queries (the shape of
+    /// `nullary_fail_query_clauses`), by clause index.
+    fn nullary_fail_query_indices(&self) -> Vec<(PredicateId, usize)> {
+        self.clauses
+            .iter()
+            .enumerate()
+            .filter(|(_, clause)| clause.is_query())
+            .filter_map(|(index, query)| {
+                Self::nullary_fail_query_predicate(query).map(|pred| (pred, index))
+            })
+            .collect()
+    }
+
+    /// For each `fail => false` query, every clause `body => fail` rewritten to
+    /// the query `body => false`, with its origin.
+    fn nullary_expanded_queries(
+        &self,
+        nullary_fail_queries: &[(PredicateId, usize)],
+    ) -> (Vec<HornClause>, Vec<ExpandedClauseOrigin>) {
+        let mut new_queries: Vec<HornClause> = Vec::new();
+        let mut origins: Vec<ExpandedClauseOrigin> = Vec::new();
+        for &(fail_pred, source_index) in nullary_fail_queries {
+            let source_query = &self.clauses[source_index];
+            for (index, clause) in self.clauses.iter().enumerate() {
+                if matches!(&clause.head, ClauseHead::Predicate(head_pred, _) if *head_pred == fail_pred)
+                {
+                    new_queries.push(
+                        HornClause::query(clause.body.clone())
+                            .with_inherited_provenance(clause)
+                            .with_inherited_provenance(source_query),
+                    );
+                    origins.push(ExpandedClauseOrigin::Expanded {
+                        into_fail: index,
+                        fail_query: source_index,
+                    });
                 }
             }
         }
+        (new_queries, origins)
+    }
 
+    /// [`expand_nullary_fail_queries`](Self::expand_nullary_fail_queries),
+    /// returning the input problem and each expanded clause's origin, which a
+    /// ground derivation over the expanded problem is translated back through
+    /// (`None`: nothing was expanded and `self` is unchanged).
+    pub(crate) fn expand_nullary_fail_queries_recorded(
+        &mut self,
+        verbose: bool,
+    ) -> Option<NullaryExpansion> {
+        let nullary_fail_queries = self.nullary_fail_query_indices();
         if nullary_fail_queries.is_empty() {
-            return false;
+            return None;
         }
 
         if verbose {
@@ -294,26 +377,10 @@ impl ChcProblem {
             );
         }
 
-        // For each nullary fail predicate, find clauses that transition to it
-        let mut new_queries: Vec<HornClause> = Vec::new();
-
-        for (fail_pred, source_query) in &nullary_fail_queries {
-            // Find all clauses `body => fail_pred`
-            for clause in &self.clauses {
-                if let ClauseHead::Predicate(head_pred, _) = &clause.head {
-                    if head_pred == fail_pred {
-                        // Convert `body => fail_pred` to `body => false`
-                        let new_query = HornClause::query(clause.body.clone())
-                            .with_inherited_provenance(clause)
-                            .with_inherited_provenance(source_query);
-                        new_queries.push(new_query);
-                    }
-                }
-            }
-        }
+        let (new_queries, expanded_origins) = self.nullary_expanded_queries(&nullary_fail_queries);
 
         if new_queries.is_empty() {
-            return false;
+            return None;
         }
 
         const MAX_EXPANDED_NULLARY_FAIL_QUERIES: usize = 512;
@@ -325,7 +392,7 @@ impl ChcProblem {
                     MAX_EXPANDED_NULLARY_FAIL_QUERIES
                 );
             }
-            return false;
+            return None;
         }
 
         if verbose {
@@ -340,27 +407,33 @@ impl ChcProblem {
             .iter()
             .map(|(predicate, _)| *predicate)
             .collect();
-
-        self.clauses.retain(|clause| {
-            // Remove `fail => false` queries
+        let removed = |clause: &HornClause| {
+            // `fail => false` queries
             if clause.is_query() && clause.body.predicates.len() == 1 {
                 let (pred_id, args) = &clause.body.predicates[0];
                 if args.is_empty() && nullary_set.contains(pred_id) {
-                    return false;
+                    return true;
                 }
             }
-            // Remove clauses with nullary fail predicate in head
-            if let ClauseHead::Predicate(head_pred, _) = &clause.head {
-                if nullary_set.contains(head_pred) {
-                    return false;
-                }
+            // Clauses with nullary fail predicate in head
+            matches!(&clause.head, ClauseHead::Predicate(head_pred, _) if nullary_set.contains(head_pred))
+        };
+
+        let input = self.clone();
+        let mut origins: Vec<ExpandedClauseOrigin> = Vec::with_capacity(self.clauses.len());
+        let mut kept: Vec<HornClause> = Vec::with_capacity(self.clauses.len());
+        for (index, clause) in std::mem::take(&mut self.clauses).into_iter().enumerate() {
+            if !removed(&clause) {
+                origins.push(ExpandedClauseOrigin::Kept(index));
+                kept.push(clause);
             }
-            true
-        });
+        }
+        self.clauses = kept;
 
         // Add the expanded queries
         self.clauses.extend(new_queries);
+        origins.extend(expanded_origins);
 
-        true
+        Some(NullaryExpansion::new(input, origins))
     }
 }

@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Companion, NOT run by the gate: the same checker and `plain.opb`, with a
+% logged model. It answers `s VERIFIED SATISFIABLE`, exit 0. One checker, one
+% formula, both verdicts -- so no external solver is needed to see that
+% `plain.pbp`'s verdict is false.
+f 1 ;
+sol x1 x2 ;
+output NONE;
+conclusion SAT ;
+end pseudo-Boolean proof;

@@ -29,7 +29,7 @@ pub(super) fn execute_incremental_impl(
         ));
     }
     let logic = parse_logic(program)?;
-    let mut ctx = ExecutionContext::new(logic)?;
+    let mut ctx = ExecutionContext::new(logic, program)?;
     for (name, value) in program.options() {
         let option = Constraint::set_option(name.clone(), value.clone());
         execute_constraint_safe(&mut ctx, &option)?;
@@ -42,13 +42,21 @@ pub(super) fn execute_incremental_impl(
         match constraint {
             Constraint::CheckSat => {
                 flush_pending_outcome(&mut outcomes, &mut pending_outcome);
-                pending_outcome = Some(run_check_sat(&mut ctx, check_sat_index)?);
+                pending_outcome = Some(run_check_sat(
+                    &mut ctx,
+                    check_sat_index,
+                    ArtifactTransport::WithProblem,
+                )?);
                 check_sat_index += 1;
             }
             Constraint::CheckSatAssuming(_) => {
                 flush_pending_outcome(&mut outcomes, &mut pending_outcome);
                 execute_constraint_safe(&mut ctx, constraint)?;
-                pending_outcome = Some(run_check_sat(&mut ctx, check_sat_index)?);
+                pending_outcome = Some(run_check_sat(
+                    &mut ctx,
+                    check_sat_index,
+                    ArtifactTransport::WithProblem,
+                )?);
                 ctx.check_sat_assumptions.clear();
                 check_sat_index += 1;
             }
@@ -75,7 +83,7 @@ fn flush_pending_outcome(
     }
 }
 
-fn execute_constraint_safe(
+pub(super) fn execute_constraint_safe(
     ctx: &mut ExecutionContext,
     constraint: &Constraint,
 ) -> Result<(), ExecuteError> {
@@ -150,9 +158,19 @@ fn append_get_values(
     }
 }
 
-fn run_check_sat(
+/// Whether an UNSAT outcome's proof artifact renders its own problem text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ArtifactTransport {
+    /// `alethe_problem_smt2` carries the proof's problem (one-shot programs).
+    WithProblem,
+    /// The caller holds the problem as its session transcript.
+    SessionTranscript,
+}
+
+pub(super) fn run_check_sat(
     ctx: &mut ExecutionContext,
     check_sat_index: usize,
+    transport: ArtifactTransport,
 ) -> Result<CheckSatOutcome, ExecuteError> {
     let check_result = if ctx.check_sat_assumptions.is_empty() {
         catch_execute_stage(
@@ -197,7 +215,12 @@ fn run_check_sat(
 
     match solve_details.result.accept_for_consumer() {
         Ok(SolveResult::Unsat(_)) => {
-            let unsat_proof = ctx.solver.export_last_unsat_artifact();
+            let unsat_proof = match transport {
+                ArtifactTransport::WithProblem => ctx.solver.export_last_unsat_artifact(),
+                ArtifactTransport::SessionTranscript => ctx
+                    .solver
+                    .export_last_unsat_artifact_without_problem_transport(),
+            };
             let unsat_core = ctx.solver.try_get_unsat_core().ok();
             Ok(CheckSatOutcome {
                 result: ExecuteTypedResult::Verified,

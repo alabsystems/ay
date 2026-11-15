@@ -12,12 +12,51 @@ use super::empty_clause::{
     derive_empty_via_trust_lemma, try_derive_empty_via_contradictory_assumptions,
     try_derive_empty_via_equality_contradiction, try_derive_empty_via_euf_transitivity,
     try_derive_empty_via_th_resolution, try_derive_empty_via_theory_packet_resolution,
+    TrustClosure,
 };
-use crate::executor::Executor;
+use crate::executor::{Executor, ProofDeclineMechanism};
 
 mod arith_ite_farkas;
 mod relaxation_farkas;
 mod trace_replay;
+
+/// Count what the proof holds, for the closure census.
+///
+/// #closer-population. The classification mirrors
+/// `derive_empty_via_trust_lemma`'s own leaf collection exactly — `Assume`
+/// steps and premiseless unit `Trust` steps are the ASSUME FAMILY; a
+/// `TheoryLemma` is a recorded theory fact; everything else is derived on top
+/// — so a reader can reconstruct which branch of that function ran.
+fn trust_closure_census(
+    proof: &Proof,
+    reconstruction: crate::executor::SatReconstructionRecord,
+) -> crate::executor::TrustClosureCensus {
+    use ay_core::TheoryLemmaKind;
+    let mut census = crate::executor::TrustClosureCensus {
+        steps: u32::try_from(proof.steps.len()).unwrap_or(u32::MAX),
+        reconstruction,
+        ..Default::default()
+    };
+    for step in proof.steps.iter() {
+        match step {
+            ProofStep::Assume(_) => census.assumes += 1,
+            ProofStep::Step {
+                rule: ay_core::AletheRule::Trust,
+                clause,
+                premises,
+                ..
+            } if clause.len() == 1 && premises.is_empty() => census.unit_trust_leaves += 1,
+            ProofStep::TheoryLemma { kind, .. } => {
+                census.theory_lemmas += 1;
+                if !matches!(kind, TheoryLemmaKind::Generic) {
+                    census.typed_theory_lemmas += 1;
+                }
+            }
+            _ => census.derived_steps += 1,
+        }
+    }
+    census
+}
 
 /// Extract theory lemma annotations from the accumulated proof (#6031 Phase 4).
 fn extract_theory_lemma_proofs(proof: &Proof) -> HashMap<Vec<TermId>, TheoryLemmaProof> {
@@ -54,7 +93,10 @@ impl Executor {
         if Self::proof_derives_empty_clause(proof) {
             return;
         }
-        if try_derive_empty_via_th_resolution(&self.ctx.terms, proof) {
+        // A stop returns with no empty clause derived; the assembly this
+        // ladder serves then discards the proof (build_unsat_assembly/stop.rs).
+        let stopped = self.make_proof_assembly_should_stop();
+        if stopped() || try_derive_empty_via_th_resolution(&self.ctx.terms, proof) {
             return;
         }
         // QF_UF transitivity: synthesize an `eq_transitive` lemma directly from
@@ -62,19 +104,19 @@ impl Executor {
         // chain. Runs before the SAT-trace reconstruction because eager EUF
         // congruence axioms in the SAT trace are not recorded as theory lemmas
         // and would otherwise fall back to `trust`.
-        if try_derive_empty_via_euf_transitivity(&mut self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_euf_transitivity(&mut self.ctx.terms, proof) {
             return;
         }
-        if try_derive_empty_via_theory_packet_resolution(&self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_theory_packet_resolution(&self.ctx.terms, proof) {
             return;
         }
-        if try_derive_empty_via_congruence_bridging(&mut self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_congruence_bridging(&mut self.ctx.terms, proof) {
             return;
         }
         // (#7913) Try equality contradiction before SAT resolution: the SAT
         // trace for preprocessed equality contradictions yields only trust
         // fallbacks. This strategy produces a proper LiaGeneric theory lemma.
-        if try_derive_empty_via_equality_contradiction(&mut self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_equality_contradiction(&mut self.ctx.terms, proof) {
             return;
         }
         // Level-0 disjunctive arithmetic refutation (trust-cert-diag). A guarded
@@ -89,13 +131,13 @@ impl Executor {
         // by genuine resolution. Runs before the SAT-trace closer (which would
         // otherwise accept a `trust`-hole empty clause) and is fail-closed: any
         // gap leaves the proof untouched for the strategies below.
-        if self.try_derive_empty_via_disjunct_refutation(proof) {
+        if stopped() || self.try_derive_empty_via_disjunct_refutation(proof) {
             return;
         }
-        if self.try_derive_empty_via_sat_resolution(proof) {
+        if stopped() || self.try_derive_empty_via_sat_resolution(proof) {
             return;
         }
-        if try_derive_empty_via_contradictory_assumptions(&self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_contradictory_assumptions(&self.ctx.terms, proof) {
             return;
         }
         // (#4751) Last resort before the trust head: close through the BOOLEAN
@@ -103,10 +145,68 @@ impl Executor {
         // only ever runs where `derive_empty_via_trust_lemma` would otherwise
         // assert an unproved head, so it can replace a hole and can never
         // pre-empt a strategy that already derives.
-        if try_derive_empty_via_boolean_disjunction(&mut self.ctx.terms, proof) {
+        if stopped() || try_derive_empty_via_boolean_disjunction(&mut self.ctx.terms, proof) {
             return;
         }
-        derive_empty_via_trust_lemma(&mut self.ctx.terms, proof);
+        // #evidence-stage-3. THE LAST RESORT IS ALSO THE MOST COMMON, and it
+        // said nothing. Everything above this line derives; this line closes on
+        // the solver's own word. Which of the two happened is the single most
+        // load-bearing fact about whether the resulting artifact can ever be
+        // evidence, and until now the only trace of it was the shape of the
+        // emitted document — indistinguishable from three other poisons.
+        //
+        // Recording is diagnostic ONLY. The steps added are byte-identical, the
+        // certification funnel is untouched, and a later repair pass that
+        // replaces this head leaves the record stale on purpose: the CLI screens
+        // a recorded decline against the retained proof before reporting it, so
+        // a proof that stops carrying a trust step stops carrying the decline.
+        // #closer-population. Census the proof BEFORE the closer touches it.
+        // Afterwards the closer's own head-plus-resolution chain is in there
+        // too, so no downstream reader — and no emitted artifact — can tell
+        // whether this closer restated a verdict over a proof that already
+        // held a derivation or over one that held only the authored
+        // assumptions. Those two have opposite remedies and the census is the
+        // only place the difference is visible. Write-only.
+        if stopped() {
+            return;
+        }
+        self.last_trust_closure_census =
+            Some(trust_closure_census(proof, self.last_sat_reconstruction));
+        let closure = derive_empty_via_trust_lemma(&mut self.ctx.terms, proof);
+        let mechanism = match closure {
+            // Both of these close with steps the strict checker re-derives.
+            // Nothing declined, so nothing is recorded.
+            TrustClosure::NoLeaves
+            | TrustClosure::DerivedFalseLeaf
+            | TrustClosure::ValidatedHead => None,
+            TrustClosure::AssumeFamilyTrustHead => {
+                Some(ProofDeclineMechanism::AssumeFamilyTrustClosure)
+            }
+            // Whether a self-verified finite-enum pigeonhole witness was in
+            // hand separates "there is nothing to reconstruct" from "there is a
+            // verified refutation and the RECOGNISER is the gate" — the QF_UFDT
+            // `vlsat3` split, and the difference between a weeks-long producer
+            // project and a routing fix.
+            //
+            // The predicate is the DETECTOR's witness, not the sealed
+            // capability: `last_finite_enum_pigeonhole` holds a clique the
+            // detector re-verified against the disequality graph before
+            // recording it (`finite_enum_pigeonhole_disjunction` refuses
+            // otherwise), and it is set during theory solving, i.e. before this
+            // closer runs. `last_checked_finite_enum_pigeonhole` is the wrong
+            // question: it is the seal on a pigeonhole proof ALREADY installed
+            // in `last_proof`, so it is empty in exactly the failing lane this
+            // flag is meant to identify.
+            TrustClosure::DerivedLeafTrustStep => {
+                Some(ProofDeclineMechanism::DerivedLeafTrustClosure {
+                    verified_finite_enum_witness: self.last_finite_enum_pigeonhole.is_some()
+                        || self.last_checked_finite_enum_pigeonhole.is_some(),
+                })
+            }
+        };
+        if let Some(mechanism) = mechanism {
+            self.record_proof_decline(mechanism);
+        }
     }
 
     /// Close a level-0 arithmetic disjunction by independently refuting each

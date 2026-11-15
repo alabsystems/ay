@@ -679,6 +679,76 @@ fn test_dioph_cache_clears_when_no_equalities_remain() {
 }
 
 #[test]
+fn test_detached_linear_parse_cache_is_send() {
+    // Detached exact-value caches can move between workers. The solver keeps
+    // its shared TermStore borrow and therefore its store's auto-traits;
+    // the owner/view compile-fail controls require that it remains non-Send.
+    fn assert_send<T: Send>() {}
+    assert_send::<crate::LiaLinearParseCache>();
+}
+
+#[test]
+fn test_soft_reset_warm_matches_fresh_solver_verdicts() {
+    // Warm reset (persistent-theory arm) must be verdict-equivalent
+    // to a fresh solver: everything assertion-derived clears, only
+    // the simplex warm start survives. Exercises the Diophantine
+    // cache revalidation across the reset as well: 2x=6 is integer
+    // SAT, then after the warm reset 2x=7 must still refute.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let two = terms.mk_int(BigInt::from(2));
+    let six = terms.mk_int(BigInt::from(6));
+    let seven = terms.mk_int(BigInt::from(7));
+    let two_x = terms.mk_mul(vec![two, x]);
+    let eq6 = terms.mk_eq(two_x, six);
+    let eq7 = terms.mk_eq(two_x, seven);
+    let x_ge_1 = terms.mk_ge(x, one);
+
+    let mut warm = LiaSolver::new(&terms);
+    warm.assert_literal(eq6, true);
+    let first = warm.check();
+    assert!(
+        matches!(
+            first,
+            TheoryResult::Sat | TheoryResult::NeedSplit(_) | TheoryResult::NeedDisequalitySplit(_)
+        ),
+        "2x=6 must not refute, got {first:?}"
+    );
+    warm.soft_reset_warm();
+    warm.assert_literal(eq7, true);
+    let second = warm.check();
+    assert!(
+        matches!(
+            second,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "2x=7 must refute over integers after warm reset, got {second:?}"
+    );
+
+    // And the other direction: a contradiction does not stick.
+    warm.soft_reset_warm();
+    warm.assert_literal(x_ge_1, true);
+    warm.assert_literal(eq6, true);
+    let third = warm.check();
+    assert!(
+        matches!(
+            third,
+            TheoryResult::Sat | TheoryResult::NeedSplit(_) | TheoryResult::NeedDisequalitySplit(_)
+        ),
+        "x>=1 with 2x=6 must not refute after warm reset, got {third:?}"
+    );
+
+    // Fresh-solver oracle agrees on the refuting middle system.
+    let mut fresh = LiaSolver::new(&terms);
+    fresh.assert_literal(eq7, true);
+    assert!(matches!(
+        fresh.check(),
+        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+    ));
+}
+
+#[test]
 fn test_is_integer() {
     assert!(LiaSolver::is_integer(&BigRational::from(BigInt::from(5))));
     assert!(LiaSolver::is_integer(&BigRational::from(BigInt::from(0))));
@@ -1454,7 +1524,7 @@ fn test_lia_direct_enumeration_system_05_returns_sat_witness() {
     let model = solver.extract_model().expect("SAT should have a model");
 
     for &(lit, asserted_value) in &solver.asserted {
-        let TermData::App(Symbol::Named(name), args) = solver.terms.get(lit) else {
+        let TermData::App(Symbol::Named(name), args) = solver.terms().get(lit) else {
             panic!("Expected app term for asserted literal");
         };
         assert_eq!(args.len(), 2);
@@ -1850,4 +1920,310 @@ fn test_dioph_state_preserves_lia_and_lra_model_equality_proposals_8785() {
     let restored_state = restored.take_dioph_state();
     assert!(restored_state.propagated_equality_pairs.contains(&pair));
     assert!(restored_state.lra_propagated_equality_pairs.contains(&pair));
+}
+
+/// Pigeonhole 17-into-16 as pairwise disequalities over `[0, 15]`: the
+/// finite-domain search cannot find a witness (there is none) and its
+/// forward-checking backtracks through an exponential tree.
+fn pigeonhole_17_in_16(terms: &mut TermStore) -> Vec<(TermId, bool)> {
+    let pigeons: Vec<_> = (0..17)
+        .map(|idx| terms.mk_var(format!("p{idx}"), Sort::Int))
+        .collect();
+    let zero = terms.mk_int(BigInt::zero());
+    let fifteen = terms.mk_int(BigInt::from(15));
+    let mut atoms = Vec::new();
+    for &p in &pigeons {
+        atoms.push((terms.mk_ge(p, zero), true));
+        atoms.push((terms.mk_le(p, fifteen), true));
+    }
+    add_pairwise_disequalities(terms, &mut atoms, &pigeons);
+    atoms
+}
+
+/// Regression (2026-09-23, LIA_finite_domain_deadline report): the
+/// finite-domain search was bounded in committed NODES only. One node's MRV
+/// scan evaluates every constraint for every value of every unassigned
+/// column, so the 2·10^6-node budget admitted ~10^12 BigInt evaluations —
+/// hours inside one theory `check()` with no deadline installed (the
+/// ay-chc test livelock burned 3 h 40 min of machine lease). The search now
+/// also carries a WORK budget (constraint evaluations) and polls the solver
+/// deadline inside a node. This instance trips the work budget after a few
+/// thousand nodes; before the fix it ran until the node budget, i.e. hours.
+#[test]
+fn test_lia_finite_domain_search_is_bounded_by_work_not_only_nodes() {
+    use crate::enumeration::finite_domain::{MAX_FD_SEARCH_NODES, MAX_FD_SEARCH_WORK};
+
+    let mut terms = TermStore::new();
+    let atoms = pigeonhole_17_in_16(&mut terms);
+    let mut solver = LiaSolver::new(&terms);
+    for (atom, value) in atoms {
+        solver.assert_literal(atom, value);
+    }
+    // Belt and braces: the pre-fix code polls this callback once per node,
+    // so a regression fails this test in about a minute instead of hanging.
+    let started = std::time::Instant::now();
+    solver.set_timeout_callback(move || started.elapsed() > std::time::Duration::from_secs(60));
+
+    // The probe is driven directly: `check()` runs other bounded probes
+    // first, and what is under test is this search's own bound.
+    let result = solver.try_finite_domain_search();
+
+    // Never a witness for pigeonhole; a tripped budget is "no conclusion",
+    // so the ordinary procedure decides.
+    assert!(
+        matches!(result, crate::types::DirectEnumResult::NoConclusion),
+        "pigeonhole 17-in-16 is UNSAT, got {result:?}"
+    );
+    let stats = solver.fd_search_stats;
+    assert!(
+        stats.aborted,
+        "the finite-domain search must trip its budget on pigeonhole: {stats:?}"
+    );
+    assert!(
+        stats.work < MAX_FD_SEARCH_WORK + 2 * 4096,
+        "work budget overrun: {stats:?} (budget {MAX_FD_SEARCH_WORK})"
+    );
+    // Require the WORK bound itself to fire. A premature deadline/abort
+    // would satisfy a wall-speed assertion without exercising this bound;
+    // shared-machine scheduling says nothing about which budget stopped us.
+    assert!(
+        stats.work >= MAX_FD_SEARCH_WORK && stats.nodes < MAX_FD_SEARCH_NODES,
+        "search did not exhaust its work budget before the node/deadline bounds: {stats:?}"
+    );
+}
+
+/// The solver deadline is honoured INSIDE a finite-domain node, not just at
+/// node boundaries: an already-expired deadline aborts the search before it
+/// has finished even one MRV scan (a scan is up to vars × domain ×
+/// constraints evaluations — here 17 × 16 × 170 ≈ 46 000 per node).
+#[test]
+fn test_lia_finite_domain_search_polls_deadline_inside_a_node() {
+    let mut terms = TermStore::new();
+    let atoms = pigeonhole_17_in_16(&mut terms);
+    let mut solver = LiaSolver::new(&terms);
+    for (atom, value) in atoms {
+        solver.assert_literal(atom, value);
+    }
+    // Trip after the search has started: the first poll (at the root node's
+    // entry) sees `false`, every poll inside the root's MRV scan sees `true`.
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&polls);
+    solver.set_timeout_callback(move || {
+        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 > 1
+    });
+
+    let result = solver.try_finite_domain_search();
+    assert!(
+        matches!(result, crate::types::DirectEnumResult::NoConclusion),
+        "expected no conclusion on timeout, got {result:?}"
+    );
+    let stats = solver.fd_search_stats;
+    assert!(
+        stats.aborted,
+        "the deadline must abort the search: {stats:?}"
+    );
+    // Honoured inside the root's scan: no node was ever committed. A search
+    // that polls only at node boundaries finishes the whole scan (≈ 46 000
+    // evaluations), commits a node and stops at the next entry (nodes = 1).
+    assert_eq!(
+        stats.nodes,
+        0,
+        "the deadline was only honoured at a node boundary: {stats:?} (polls={})",
+        polls.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(
+        stats.work < 3 * 4096,
+        "the deadline poll inside a node is late: {stats:?}"
+    );
+}
+
+#[test]
+fn test_lia_stored_witness_revalidated_at_check() {
+    // #lia-dive-repair: a stored direct-enumeration/dive witness is
+    // re-validated exactly at `check()` instead of being dropped at
+    // entry (the executor's final check re-asks right after the
+    // giveup lane stored one).
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let one = terms.mk_int(BigInt::one());
+    let two = terms.mk_int(BigInt::from(2));
+    let sum = terms.mk_add(vec![x, y]);
+    let eq_sum = terms.mk_eq(sum, two);
+    let zero = terms.mk_int(BigInt::zero());
+    let x_ge_0 = terms.mk_ge(x, zero);
+    let y_ge_0 = terms.mk_ge(y, zero);
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.assert_literal(eq_sum, true);
+    solver.assert_literal(x_ge_0, true);
+    solver.assert_literal(y_ge_0, true);
+
+    // x=1, y=1 satisfies every asserted literal.
+    let mut values = HashMap::default();
+    values.insert(x, BigInt::one());
+    values.insert(y, BigInt::one());
+    solver.direct_enum_witness = Some(LiaModel { values });
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert!(
+        solver.direct_enum_witness.is_some(),
+        "witness restored for extract_model"
+    );
+
+    // A witness violating an asserted literal is declined (the
+    // normal check path decides; here it also finds Sat on its own,
+    // but the stale witness must be gone).
+    let mut bad = HashMap::default();
+    bad.insert(x, BigInt::from(3));
+    bad.insert(y, BigInt::one());
+    solver.direct_enum_witness = Some(LiaModel { values: bad });
+    let stored = solver
+        .direct_enum_witness
+        .as_ref()
+        .expect("witness stored")
+        .clone();
+    assert!(
+        !solver.stored_witness_still_valid(&stored),
+        "x=3, y=1 violates x + y = 2"
+    );
+
+    // A fresh assertion clears the witness via the mutator path.
+    let _ = one;
+    solver.assert_literal(x_ge_0, true);
+    assert!(solver.direct_enum_witness.is_none());
+}
+
+#[test]
+fn test_lia_violated_disequalities_and_repair_fixing() {
+    // #lia-dive-repair helpers: only disequality violations are
+    // reported as steerable, and the repair fixing steps a
+    // difference variable off its witness value.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let one = terms.mk_int(BigInt::one());
+    let two = terms.mk_int(BigInt::from(2));
+    let sum = terms.mk_add(vec![x, y]);
+    let eq_sum = terms.mk_eq(sum, two);
+    let zero = terms.mk_int(BigInt::zero());
+    let x_ge_0 = terms.mk_ge(x, zero);
+    let y_ge_0 = terms.mk_ge(y, zero);
+    let eq_xy = terms.mk_eq(x, y);
+    let _ = one;
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.assert_literal(eq_sum, true);
+    solver.assert_literal(x_ge_0, true);
+    solver.assert_literal(y_ge_0, true);
+    solver.assert_literal(eq_xy, false); // x != y on the trail
+
+    let (term_to_idx, idx_to_term) = solver.build_var_index();
+    let mut solution: Vec<(usize, BigInt)> = Vec::new();
+    let mut values: HashMap<TermId, BigInt> = HashMap::default();
+    for var in [x, y] {
+        solution.push((term_to_idx[&var], BigInt::one()));
+        values.insert(var, BigInt::one());
+    }
+    // x=1, y=1 satisfies the bounds and the sum but violates x != y.
+    let violated = solver
+        .violated_disequalities(&solution, &idx_to_term)
+        .expect("all literals evaluate");
+    assert_eq!(violated, vec![eq_xy]);
+
+    let (fix_var, fix_val) = solver
+        .disequality_repair_fixing(eq_xy, &values, &[])
+        .expect("difference has a steerable variable");
+    assert!(fix_var == x || fix_var == y);
+    assert_eq!(fix_val, BigInt::from(2), "one step above the witness value");
+
+    // With x pre-fixed, the repair must offer the other variable.
+    let (fix_var2, _) = solver
+        .disequality_repair_fixing(eq_xy, &values, &[(x, BigInt::from(2))])
+        .expect("second variable remains");
+    assert_eq!(fix_var2, if fix_var == x { y } else { x });
+
+    // A violated non-disequality declines the whole report.
+    let mut bad_solution: Vec<(usize, BigInt)> = Vec::new();
+    bad_solution.push((term_to_idx[&x], BigInt::from(3)));
+    bad_solution.push((term_to_idx[&y], BigInt::one()));
+    assert!(solver
+        .violated_disequalities(&bad_solution, &idx_to_term)
+        .is_none());
+}
+
+#[test]
+fn test_lia_witness_cleared_by_new_shared_equality() {
+    // #lia-dive-repair soundness: a stored witness must not survive
+    // a NEW Nelson-Oppen obligation. Regression for the differential
+    // gate finding (arrays/witness/w2_const/class/d07_i0 answered
+    // `unsat`): the finite-domain witness from one check was
+    // revalidated on the next check while EUF had asserted new
+    // shared equalities in between, skipping their propagation.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let zero = terms.mk_int(BigInt::zero());
+    let x_ge_0 = terms.mk_ge(x, zero);
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.assert_literal(x_ge_0, true);
+    let mut values = HashMap::default();
+    values.insert(x, BigInt::one());
+    solver.direct_enum_witness = Some(LiaModel { values });
+
+    // A new shared equality clears the witness.
+    solver.assert_shared_equality(x, y, &[]);
+    assert!(solver.direct_enum_witness.is_none());
+
+    // Re-asserting the same (already known) pair keeps a witness
+    // stored after it (idempotent fixpoint traffic).
+    let mut values = HashMap::default();
+    values.insert(x, BigInt::one());
+    values.insert(y, BigInt::one());
+    solver.direct_enum_witness = Some(LiaModel { values });
+    solver.assert_shared_equality(y, x, &[]);
+    assert!(solver.direct_enum_witness.is_some());
+
+    // Strict revalidation: a shared pair the witness cannot
+    // evaluate does not pass.
+    solver.assert_shared_equality(x, z, &[]);
+    assert!(
+        solver.direct_enum_witness.is_none(),
+        "new pair clears again"
+    );
+    let mut values = HashMap::default();
+    values.insert(x, BigInt::one());
+    values.insert(y, BigInt::one());
+    let stale = LiaModel { values };
+    assert!(
+        !solver.stored_witness_still_valid(&stale),
+        "shared pair (x, z) is unverifiable without z in the witness"
+    );
+}
+
+#[test]
+fn count_fixed_integer_vars_counts_only_tight_vars() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let five = terms.mk_int(BigInt::from(5));
+    let seven = terms.mk_int(BigInt::from(7));
+
+    // x fixed at 5, z fixed at 0, y only upper-bounded.
+    let atoms = [
+        terms.mk_le(x, five),
+        terms.mk_ge(x, five),
+        terms.mk_le(y, seven),
+        terms.mk_ge(z, zero),
+        terms.mk_le(z, zero),
+    ];
+    let mut solver = LiaSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    assert_eq!(solver.count_fixed_integer_vars(), 2);
 }

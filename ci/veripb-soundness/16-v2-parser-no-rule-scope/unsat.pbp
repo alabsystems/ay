@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 4;
+rup >= 1;
+output NONE;
+conclusion UNSAT : -1;
+end pseudo-Boolean proof;

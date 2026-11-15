@@ -6,6 +6,8 @@ use ay_sat::{Literal, Variable};
 
 use super::*;
 
+mod cancellation;
+
 fn literal(index: u32, positive: bool) -> Literal {
     let variable = Variable::new(index);
     if positive {

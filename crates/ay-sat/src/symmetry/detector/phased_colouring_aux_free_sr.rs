@@ -137,7 +137,9 @@ fn phased_colouring_group_grid(
     if cls.len() != width {
         return None;
     }
-    let grp: Vec<usize> = (0..nrows).filter(|&r| row_classes[r] == row_classes[0]).collect();
+    let grp: Vec<usize> = (0..nrows)
+        .filter(|&r| row_classes[r] == row_classes[0])
+        .collect();
     let m = grp.len();
     if m <= width {
         return None; // needs strictly more vertices than colours to be UNSAT

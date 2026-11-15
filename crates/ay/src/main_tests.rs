@@ -454,6 +454,110 @@ fn test_preprocess_argv0_z3_does_not_affect_non_solve_commands() {
 }
 
 #[test]
+fn test_preprocess_z3_context_unknown_option_is_invalid_carrier() {
+    // In a z3 invocation (argv0 `z3` or `--z3-mode`), an option z3's parser
+    // does not know becomes the invalid-option carrier (z3 message, exit
+    // 109) instead of reaching clap.
+    let by_argv0 = preprocess_args(strings(&["/tmp/z3", "-zzz", "input.smt2"]));
+    assert!(
+        by_argv0
+            .windows(2)
+            .any(|pair| pair == ["--invalid-z3-option", "-zzz"]),
+        "{by_argv0:?}"
+    );
+    let by_flag = preprocess_args(strings(&["ay", "--z3-mode", "-zzz"]));
+    assert!(
+        by_flag
+            .windows(2)
+            .any(|pair| pair == ["--invalid-z3-option", "-zzz"]),
+        "{by_flag:?}"
+    );
+    // Natively, the same spelling is left for clap to diagnose.
+    let native = preprocess_args(strings(&["ay", "-zzz"]));
+    assert!(
+        !native.iter().any(|arg| arg == "--invalid-z3-option"),
+        "{native:?}"
+    );
+    // AY's own short flags are never "invalid", even in z3 context.
+    for ok in ["-q", "-t", "-t500", "-t=500", "-h", "-V"] {
+        let processed = preprocess_args(strings(&["/tmp/z3", ok, "input.smt2"]));
+        assert!(
+            !processed.iter().any(|arg| arg == "--invalid-z3-option"),
+            "{ok} must stay valid: {processed:?}"
+        );
+    }
+    // Unknown `--long` spellings take the same carrier in z3 context
+    // (z3: `Error: invalid command line option: --zzz`, exit 109), while
+    // AY's own long flags — bare or `=value`-joined — pass through.
+    for bad in ["--zzz", "--zzz=1"] {
+        let processed = preprocess_args(strings(&["/tmp/z3", bad, "input.smt2"]));
+        assert!(
+            processed
+                .windows(2)
+                .any(|pair| pair == ["--invalid-z3-option", bad]),
+            "{bad} must be invalid: {processed:?}"
+        );
+    }
+    let native_long = preprocess_args(strings(&["ay", "--zzz"]));
+    assert!(
+        !native_long.iter().any(|arg| arg == "--invalid-z3-option"),
+        "{native_long:?}"
+    );
+    for ok in ["--z3-mode", "--timeout=500", "--help", "--version"] {
+        let processed = preprocess_args(strings(&["/tmp/z3", ok, "input.smt2"]));
+        assert!(
+            !processed.iter().any(|arg| arg == "--invalid-z3-option"),
+            "{ok} must stay valid: {processed:?}"
+        );
+    }
+}
+
+#[test]
+fn test_preprocess_z3_context_second_input_is_duplicate_carrier() {
+    // z3 warns `WARNING: input file was already specified.` and solves the
+    // first file; the second becomes a carrier, never the positional FILE.
+    let processed = preprocess_args(strings(&["/tmp/z3", "a.smt2", "b.smt2"]));
+    assert!(
+        processed
+            .windows(2)
+            .any(|pair| pair == ["--z3-duplicate-input", "b.smt2"]),
+        "{processed:?}"
+    );
+    assert!(
+        processed
+            .iter()
+            .filter(|arg| arg.as_str() == "a.smt2")
+            .count()
+            == 1,
+        "{processed:?}"
+    );
+    // The `-file:` spelling counts as the input too.
+    let by_file = preprocess_args(strings(&["/tmp/z3", "-file:a.smt2", "b.smt2"]));
+    assert!(
+        by_file
+            .windows(2)
+            .any(|pair| pair == ["--z3-duplicate-input", "b.smt2"]),
+        "{by_file:?}"
+    );
+    // Files after `--` are positional for clap, so carriers must be placed
+    // before the separator.
+    let after_sep = preprocess_args(strings(&["/tmp/z3", "--", "a.smt2", "b.smt2"]));
+    let sep = after_sep.iter().position(|arg| arg == "--").unwrap();
+    assert!(
+        after_sep[..sep]
+            .windows(2)
+            .any(|pair| pair == ["--z3-duplicate-input", "b.smt2"]),
+        "{after_sep:?}"
+    );
+    // Natively, two files keep reaching clap (which rejects the second).
+    let native = preprocess_args(strings(&["ay", "a.smt2", "b.smt2"]));
+    assert!(
+        !native.iter().any(|arg| arg == "--z3-duplicate-input"),
+        "{native:?}"
+    );
+}
+
+#[test]
 fn test_preprocess_z3_in_selects_live_incremental_stdin() {
     let processed = preprocess_args(strings(&["ay", "-smt2", "-in"]));
 
@@ -540,6 +644,39 @@ fn test_solve_quiet_requested_detection() {
     ])));
     // Not a solve invocation → never requested.
     assert!(!solve_quiet_requested(&strings(&["ay", "bench", "-q"])));
+}
+
+/// `--memory-ceiling-bytes` parses as bytes, conflicts with the `--memory`
+/// override, and refuses 0, which would disable the limit (2026-09-12).
+#[test]
+fn test_memory_ceiling_bytes_parses_and_is_never_an_override() {
+    let parse = |args: &[&str]| <Cli as Parser>::try_parse_from(strings(args));
+    let cli = parse(&[
+        "ay",
+        "solve",
+        "f.cnf",
+        "--memory-ceiling-bytes",
+        "32000000000",
+    ])
+    .expect("parse the ceiling");
+    match cli.command {
+        Some(Command::Solve(args)) => {
+            assert_eq!(args.memory_ceiling_bytes, Some(32_000_000_000));
+            assert_eq!(args.memory, None);
+        }
+        _ => panic!("expected a solve command"),
+    }
+    assert!(parse(&[
+        "ay",
+        "solve",
+        "f.cnf",
+        "--memory-ceiling-bytes",
+        "1",
+        "--memory",
+        "4096"
+    ])
+    .is_err());
+    assert!(parse(&["ay", "solve", "f.cnf", "--memory-ceiling-bytes", "0"]).is_err());
 }
 
 #[test]
@@ -650,39 +787,13 @@ fn test_bench_run_rejects_out_of_range_shard_size() {
     }
 }
 
+/// clap validates a command definition only when debug assertions are on, and
+/// then a malformed argument panics on EVERY parse, while release builds accept
+/// it silently (`--no-probe-ite-lift-promoter` was once a positional). Check the
+/// whole command tree here instead of waiting for a spawned test to crash.
 #[test]
-fn test_preprocess_preserves_launch_gate_subcommand() {
-    let raw = strings(&[
-        "ay",
-        "launch-gate",
-        "--launch-mode",
-        "metadata-only",
-        "--summary-json",
-        "/tmp/ay-release-gate-summary.json",
-    ]);
-
-    let processed = preprocess_args(raw.clone());
-
-    assert_eq!(processed, raw);
-    assert!(!processed.iter().any(|arg| arg == "solve"));
-}
-
-#[test]
-fn test_launch_gate_help_classifies_external_evidence() {
-    let mut cmd = Cli::command();
-    let help = cmd
-        .find_subcommand_mut("launch-gate")
-        .expect("launch-gate subcommand")
-        .render_long_help()
-        .to_string();
-
-    assert!(help.contains("The native command validates launch evidence"));
-    assert!(help.contains("scripts/launch_benchmark_packet.sh"));
-    assert!(help.contains("ay consumer-smoke run --json"));
-    assert!(help.contains("ay release generate-manifest"));
-    assert!(help.contains("ay z3-audit"));
-    assert!(help.contains("public_mirror blocker is publication evidence only"));
-    assert!(help.contains("not classified as a solver blocker"));
+fn cli_definition_passes_clap_debug_asserts() {
+    Cli::command().debug_assert();
 }
 
 #[test]
@@ -876,9 +987,10 @@ fn test_default_proofs_suppressed_by_competition() {
     assert!(default_proofs_suppressed(false, false, true));
 }
 
-/// `--no-proof`, `--z3-mode`, `--rigor fast` (`--competition`) and a PLAIN
-/// solve shed the executor's proof cycle; every certification request keeps
-/// it armed.
+/// `--no-proof`, `--z3-mode` and `--rigor fast` (`--competition`) shed the
+/// executor's proof cycle. A PLAIN solve does NOT: batteries are on by
+/// default, so a flagless run keeps the tracker armed, mints its certificate
+/// and writes the sidecar.
 #[test]
 fn test_proof_cycle_shed_follows_the_opt_outs() {
     let bare = SolveArgs::default();
@@ -924,20 +1036,28 @@ fn test_proof_cycle_shed_follows_the_opt_outs() {
     if crate::competition_mode::competition_env_active() {
         return;
     }
-    // Shed: the opt-outs and the plain default (z3's posture).
-    for args in [&bare, &no_proof, &z3_mode, &competition, &rigor_fast] {
-        assert!(!certification_requested(args));
+    // Shed: the explicit opt-outs, and nothing else. `--rigor fast` gets
+    // there through its documented projection onto `--competition`, so the
+    // dial has to be resolved the way `run_solve` resolves it.
+    let mut rigor_fast = rigor_fast;
+    rigor_fast.resolve_assurance();
+    assert!(
+        rigor_fast.competition,
+        "--rigor fast projects onto --competition"
+    );
+    for args in [&no_proof, &z3_mode, &competition, &rigor_fast] {
         assert!(proof_cycle_shed(args));
     }
-    // Armed: every way of asking for certification.
+    // Armed: the PLAIN default (`ay FILE.smt2` — proofs and certificates are
+    // the product, not overhead) and every explicit certification request.
     for args in [
+        &bare,
         &rigor_standard,
         &strict,
         &self_check,
         &explicit_proof,
         &verify_proof,
     ] {
-        assert!(certification_requested(args));
         assert!(!proof_cycle_shed(args));
     }
     // A certification request combined with an opt-out still sheds at the CLI
@@ -948,8 +1068,77 @@ fn test_proof_cycle_shed_follows_the_opt_outs() {
         no_proof: true,
         ..SolveArgs::default()
     };
-    assert!(certification_requested(&strict_no_proof));
     assert!(proof_cycle_shed(&strict_no_proof));
+}
+
+/// A memout names the ceiling's origin (2026-09-12): the govern default is
+/// called out as a machine guard with the setting that raises both bounds, an
+/// explicit flag is credited as such, the unarmed default names RAM, and
+/// `--memory 0` (the ceiling off) never claims the flag.
+#[test]
+fn test_memory_limit_origin_names_the_posture() {
+    let gib3 = Some(3072usize * 1024 * 1024);
+    let guard = memory_limit_origin(None, gib3);
+    assert!(guard.starts_with("90% of the kernel-held govern budget of 3072 MiB"));
+    assert!(guard.contains("physical RAM / 16 as a machine guard"));
+    // The setting that moves BOTH bounds: `--memory` alone would sit above
+    // the kernel's kill line wherever the solve runs unsupervised.
+    assert!(guard.contains("raise both with GOVERN_AY_MB=<MiB>"));
+    assert_eq!(memory_limit_origin(Some(32768), gib3), "--memory flag");
+    assert_eq!(memory_limit_origin(Some(32768), None), "--memory flag");
+    assert!(memory_limit_origin(None, None).starts_with("85% of physical RAM"));
+    assert_ne!(memory_limit_origin(Some(0), gib3), "--memory flag");
+    assert_ne!(memory_limit_origin(Some(0), None), "--memory flag");
+}
+
+/// The note states the ceiling in MiB as one `c` line, and is written only in
+/// the SAT-competition grammar outside Z3 mode.
+#[test]
+fn test_memory_limit_note_is_one_sat_comment_line_outside_z3_mode() {
+    let note = memory_limit_note(2764 * 1024 * 1024, "origin text");
+    assert_eq!(
+        note,
+        "c memout: process memory limit 2764 MiB (origin text)\n"
+    );
+    assert!(memory_limit_note_applies(
+        MEMOUT_STDERR_SAT_COMPETITION,
+        false
+    ));
+    assert!(!memory_limit_note_applies(
+        MEMOUT_STDERR_SAT_COMPETITION,
+        true
+    ));
+    assert!(!memory_limit_note_applies(MEMOUT_STDERR_SMTLIB, false));
+}
+
+/// The allocator ceiling's breach action carries the note after the
+/// SAT-competition reason line, keeps the verdict and exit code, and is the
+/// untouched static action in Z3 mode, on the SMT-LIB grammar, or with no
+/// note set — the burst path is the one a big formula's memout takes.
+#[test]
+fn test_hard_ceiling_action_bakes_in_the_note_only_where_it_applies() {
+    let note = "c memout: process memory limit 2764 MiB (origin)\n";
+    let sat = &HARD_CEILING_SAT_COMPETITION;
+    let with = hard_ceiling_action_with_note(sat, Some(note), false);
+    assert_eq!(with.stdout_line, MEMOUT_STDOUT_SAT_COMPETITION);
+    assert_eq!(with.exit_code, sat.exit_code);
+    assert_eq!(
+        with.stderr_line,
+        b"c memout\nc memout: process memory limit 2764 MiB (origin)\n".as_slice()
+    );
+    assert!(std::ptr::eq(
+        hard_ceiling_action_with_note(sat, Some(note), true),
+        sat
+    ));
+    assert!(std::ptr::eq(
+        hard_ceiling_action_with_note(sat, None, false),
+        sat
+    ));
+    let smt = &HARD_CEILING_SMTLIB;
+    assert!(std::ptr::eq(
+        hard_ceiling_action_with_note(smt, Some(note), false),
+        smt
+    ));
 }
 
 /// The memory-budget verdict LINES follow the input format at every posture;
@@ -1257,7 +1446,8 @@ fn memory_watchdog_signals_then_waits_out_the_grace_period() {
             polls += 1;
             polls > 3
         },
-        Duration::from_millis(100),
+        || false,
+        Duration::from_millis(500),
         Duration::from_secs(2),
         || breached.set(true),
         |waited| slept.push(waited),
@@ -1270,14 +1460,32 @@ fn memory_watchdog_signals_then_waits_out_the_grace_period() {
     assert_eq!(polls, 4, "the watchdog polls until the budget is breached");
     assert_eq!(
         slept,
-        vec![
-            Duration::from_millis(100),
-            Duration::from_millis(100),
-            Duration::from_millis(100),
-            Duration::from_secs(2),
-        ],
-        "one sleep per under-budget poll, then the grace period"
+        vec![Duration::from_millis(500); 7],
+        "one sleep per under-budget poll, then the grace period in poll steps"
     );
+}
+
+/// Past the breach, pressure at the critical share ends the grace at once:
+/// the process is about to be killed from outside, which would lose the
+/// verdict line.
+#[test]
+fn memory_watchdog_cuts_the_grace_short_at_critical_pressure() {
+    let mut slept: Vec<Duration> = Vec::new();
+    let mut checks = 0_u32;
+
+    run_memory_watchdog(
+        || true,
+        || {
+            checks += 1;
+            checks > 2
+        },
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+        || {},
+        |waited| slept.push(waited),
+    );
+
+    assert_eq!(slept, vec![Duration::from_millis(10); 2]);
 }
 
 /// A run that is already over budget when the watchdog arms escalates without
@@ -1289,7 +1497,8 @@ fn memory_watchdog_escalates_immediately_when_already_over_budget() {
 
     run_memory_watchdog(
         || true,
-        Duration::from_millis(100),
+        || false,
+        Duration::from_secs(1),
         Duration::from_secs(2),
         || breached.set(true),
         |waited| slept.push(waited),
@@ -1298,7 +1507,7 @@ fn memory_watchdog_escalates_immediately_when_already_over_budget() {
     assert!(breached.get());
     assert_eq!(
         slept,
-        vec![Duration::from_secs(2)],
+        vec![Duration::from_secs(1); 2],
         "no poll sleep before the breach is observed"
     );
 }
@@ -1424,4 +1633,46 @@ fn z3_mode_is_detected_before_the_fork_including_argv0_injection() {
         "--",
         "--z3-mode"
     ])));
+}
+
+/// T8 (the development design notes): the executors ay-chc builds for its
+/// SEARCH queries inherit the CLI executor's EFFECTIVE proof-cycle posture —
+/// shed under `--competition` / `--no-proof` / `--z3-mode`, never under a proof
+/// or certificate demand, never on a plain solve.
+#[test]
+fn test_search_executor_sheds_proof_cycle_mirrors_the_cli_executor() {
+    let sheds = |extra: &[&str]| -> bool {
+        let mut argv = vec!["ay", "solve", "f.smt2"];
+        argv.extend_from_slice(extra);
+        match <Cli as Parser>::try_parse_from(strings(&argv))
+            .expect("parse solve args")
+            .command
+        {
+            Some(Command::Solve(args)) => {
+                competition_mode::search_executor_sheds_proof_cycle(&args)
+            }
+            _ => panic!("expected a solve command"),
+        }
+    };
+    // A plain solve is proof-carrying; the three opt-outs shed.
+    assert!(!sheds(&[]));
+    assert!(sheds(&["--competition"]));
+    assert!(sheds(&["--no-proof"]));
+    assert!(sheds(&["--z3-mode"]));
+    // Every proof / certificate demand keeps the default posture, exactly as
+    // executor-side precedence does for the CLI's own executor.
+    assert!(!sheds(&["--competition", "--strict-proofs"]));
+    assert!(!sheds(&["--competition", "--self-check"]));
+    assert!(!sheds(&["--competition", "--proof", "out.chccert"]));
+    assert!(!sheds(&["--competition", "--verify-firewall"]));
+    assert!(!sheds(&[
+        "--competition",
+        "--emit-firewall-lean",
+        "lean-out"
+    ]));
+    assert!(!sheds(&["--competition", "--verify-proof"]));
+    // The opt-in checked replay re-executes certificate obligations on a
+    // fresh search executor, so a positive budget is a demand too.
+    assert!(!sheds(&["--competition", "--chc-checked-replay", "5"]));
+    assert!(sheds(&["--competition", "--chc-checked-replay", "0"]));
 }

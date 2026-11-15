@@ -8,7 +8,7 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 fn next_owner() -> Result<u64, Z3Error> {
     NEXT_OWNER
-        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
+        .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| Z3Error::OwnerExhausted)

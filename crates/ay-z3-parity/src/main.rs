@@ -29,6 +29,7 @@ mod diff;
 mod fetch;
 mod inprocess;
 mod loader;
+mod release_inventory;
 mod scoreboard;
 mod smtlib_conformance;
 mod symbols;
@@ -38,7 +39,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const DEFAULT_AY: &str = "target/debug/libay_ffi.dylib";
-const DEFAULT_Z3: &str = "/opt/homebrew/opt/z3/lib/libz3.dylib";
 const DEFAULT_DIFF_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_BENCH_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_BENCH_JSON: &str = "ay-z3-bench.json";
@@ -73,7 +73,7 @@ struct Parsed {
 fn parse(rest: &[String]) -> Result<Parsed, String> {
     let mut ay = PathBuf::from(DEFAULT_AY);
     let mut ay_cli = None;
-    let mut z3 = PathBuf::from(DEFAULT_Z3);
+    let mut z3 = None;
     let mut json = false;
     let mut timeout = None;
     let mut jobs = 1usize;
@@ -95,7 +95,7 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
         match arg.as_str() {
             "--ay" => ay = PathBuf::from(it.next().ok_or("--ay needs a path")?),
             "--ay-cli" => ay_cli = Some(PathBuf::from(it.next().ok_or("--ay-cli needs a path")?)),
-            "--z3" => z3 = PathBuf::from(it.next().ok_or("--z3 needs a path")?),
+            "--z3" => z3 = Some(PathBuf::from(it.next().ok_or("--z3 needs a path")?)),
             "--json" => json = true,
             "--json-out" => {
                 json_out = PathBuf::from(it.next().ok_or("--json-out needs a path")?);
@@ -168,6 +168,12 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
             other => positionals.push(PathBuf::from(other)),
         }
     }
+    // Resolve only the default: an explicit caller-selected library remains
+    // usable even when this machine has no canonical reference cache root.
+    let z3 = match z3 {
+        Some(path) => path,
+        None => smtlib_conformance::reference_library_path()?,
+    };
     Ok(Parsed {
         ay,
         ay_cli,
@@ -210,10 +216,18 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // `fetch` has a divergent flag set (--sample/--all/--max-mb/--record/--list)
-    // and needs no dylibs, so it parses its own args ahead of the shared parser.
+    // Discovery commands have independent options and need no loaded dylibs;
+    // dispatch them before the shared compatibility parser.
+    if cmd == "release-inventory" {
+        return ExitCode::from(release_inventory::run(rest) as u8);
+    }
     if cmd == "fetch" {
         return ExitCode::from(fetch::run(rest) as u8);
+    }
+    if cmd == "qualify" {
+        let mut args = vec!["qualify".to_string()];
+        args.extend_from_slice(rest);
+        return ExitCode::from(smtlib_conformance::run(&args) as u8);
     }
     if cmd == "z3-abi-probe" {
         return ExitCode::from(z3_abi_500::run_probe_child(rest) as u8);
@@ -349,4 +363,17 @@ fn main() -> ExitCode {
     };
 
     ExitCode::from(code as u8)
+}
+
+#[cfg(test)]
+mod release_inventory_argument_tests {
+    #[test]
+    fn explicit_reference_library_is_preserved() {
+        let args = ["--z3".to_owned(), "caller-selected-library".to_owned()];
+        let parsed = super::parse(&args).unwrap();
+        assert_eq!(
+            parsed.z3,
+            std::path::PathBuf::from("caller-selected-library")
+        );
+    }
 }

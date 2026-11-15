@@ -189,6 +189,7 @@ pub(crate) fn walk(
     seed: u64,
     tick_limit: u64,
     filter: WalkFilter,
+    seed_phases: Option<&[i8]>,
 ) -> bool {
     debug_assert!(
         phases.len() >= num_vars,
@@ -206,12 +207,20 @@ pub(crate) fn walk(
 
     // CaDiCaL walk.cpp:834: initialize from prev phases (walk continuity).
     // First walk uses current phases; subsequent walks build on prior walk results.
-    let use_prev = stats.walk_count > 1 && prev_phases.len() >= num_vars;
+    // `--sat-walk-kissat`: Kissat walks from the current phases every time and
+    // keeps them unless the walk improved on where it started (walk.c).
+    let kissat = ay_core::sat_ab_switches().walk_kissat == Some(true);
+    let use_prev = !kissat && stats.walk_count > 1 && prev_phases.len() >= num_vars;
     for i in 0..num_vars {
+        // `seed_phases` (Kissat's stable-mode walk, walk.c:196-224): start
+        // from the decision phase, the target where it is set.
         let val = if use_prev {
             prev_phases[i]
         } else {
-            phases[i] >= 0 // 0 (unset) defaults to true
+            match seed_phases {
+                Some(t) if t[i] != 0 => t[i] > 0,
+                _ => phases[i] >= 0, // 0 (unset) defaults to true
+            }
         };
         walker.values[i] = val;
         walker.best_values[i] = val;
@@ -254,6 +263,13 @@ pub(crate) fn walk(
         walker.ticks += lits.len() as u64;
     }
 
+    // `--sat-walk-kissat`: Kissat never charges the setup to the walk's
+    // budget (walk.c:407-420); charged, it can eat the whole budget on a
+    // multi-million-clause formula and leave the walk no flips.
+    if kissat {
+        walker.limit = walker.limit.saturating_add(walker.ticks);
+    }
+
     // Compute average clause size for CB parameter
     let avg_size = if num_clauses > 0 {
         total_lits as f64 / num_clauses as f64
@@ -264,6 +280,7 @@ pub(crate) fn walk(
 
     // Save initial minimum
     walker.minimum = walker.broken.len();
+    let initial_broken = walker.minimum;
     stats.initial_broken = walker.minimum as u64;
     stats.best_minimum = walker.minimum as u64;
 
@@ -362,13 +379,16 @@ pub(crate) fn walk(
     // Finalize best model from trail
     walker.save_final_minimum();
 
-    // Copy best phases back to phases array
-    for (phase, &best) in phases
-        .iter_mut()
-        .zip(walker.best_values.iter())
-        .take(num_vars)
-    {
-        *phase = if best { 1 } else { -1 };
+    // Copy best phases back to phases array (under `--sat-walk-kissat` only
+    // when the walk improved on its starting assignment).
+    if !kissat || walker.minimum < initial_broken {
+        for (phase, &best) in phases
+            .iter_mut()
+            .zip(walker.best_values.iter())
+            .take(num_vars)
+        {
+            *phase = if best { 1 } else { -1 };
+        }
     }
 
     // Save to prev_phases for next walk round continuity (CaDiCaL walk.cpp:228).
@@ -418,4 +438,34 @@ pub(crate) fn compute_walk_effort(propagation_delta: u64) -> u64 {
     let raw = propagation_delta.saturating_mul(WALK_EFFORT_PER_MILLE) / 1000;
     raw.max(WALK_MIN_EFFORT)
         .min(WALK_MAX_EFFORT.saturating_mul(1000))
+}
+
+/// Kissat's walk effort (`kimits.h`, `SET_EFFORT_LIMIT (limit, walk,
+/// walk_steps)`): the search ticks since the last simplification phase,
+/// floored at `mineffort` (10M), times `walkeffort` (50 per mille). The floor
+/// is on the reference, so the smallest walk is 500K ticks, not
+/// `WALK_MIN_EFFORT`'s 10M; `compute_walk_effort` above put Kissat's floor on
+/// the effort, twenty times Kissat's smallest walk. Used under
+/// `--sat-inproc-nlogn-schedule true`, whose caller passes the ticks since
+/// the last inprocessing round rather than since the last walk (schooltt-5-3:
+/// 19 walks of about 600 ms each, 6 percent of the run, against Kissat's
+/// 10 walks of 18 ms, 2026-09-21).
+pub(crate) fn compute_walk_effort_kissat(search_ticks_since_last_round: u64) -> u64 {
+    let reference = search_ticks_since_last_round.max(WALK_MIN_EFFORT);
+    (reference.saturating_mul(WALK_EFFORT_PER_MILLE) / 1000)
+        .min(WALK_MAX_EFFORT.saturating_mul(1000))
+}
+
+#[cfg(test)]
+mod kissat_effort_tests {
+    use super::*;
+
+    #[test]
+    fn the_floor_is_on_the_reference_and_the_rate_is_fifty_per_mille() {
+        assert_eq!(compute_walk_effort_kissat(0), 500_000);
+        assert_eq!(compute_walk_effort_kissat(10_000_000), 500_000);
+        assert_eq!(compute_walk_effort_kissat(1_000_000_000), 50_000_000);
+        assert_eq!(compute_walk_effort_kissat(u64::MAX), WALK_MAX_EFFORT * 1000);
+        assert_eq!(compute_walk_effort(0), WALK_MIN_EFFORT);
+    }
 }

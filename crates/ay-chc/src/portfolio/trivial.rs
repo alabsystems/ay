@@ -36,6 +36,18 @@ impl PortfolioSolver {
             return None; // Not a trivial problem
         }
 
+        // A flattened query can still be expensive. Give this pre-engine
+        // probe the existing eager-validation slice, shared by every query
+        // and original-clause confirmation, so it cannot consume or renew the
+        // whole parallel grant before witnessed engines get a chance.
+        let budget = Self::witnessless_eager_validation_slice(self.effective_solve_deadline());
+        if budget.is_zero() {
+            return None;
+        }
+        let deadline = ay_core::time::Instant::now() + budget;
+        let _query_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
+        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(Some(deadline));
+
         // All clauses have empty body predicates. Run one more local-var pass
         // before checking queries: clause inlining can leave Array-valued local
         // equalities in predicate-free formulas, and eliminating them exposes
@@ -142,6 +154,7 @@ impl PortfolioSolver {
                     return Some(PortfolioResult::Unsafe(Counterexample {
                         steps: Vec::new(),
                         witness: None,
+                        compact_derivation: None,
                         ground_derivation: None,
                     }));
                 }
@@ -279,6 +292,7 @@ impl PortfolioSolver {
                     return Some(PortfolioResult::Unsafe(Counterexample {
                         steps: Vec::new(),
                         witness: None,
+                        compact_derivation: None,
                         ground_derivation: None,
                     }));
                 }

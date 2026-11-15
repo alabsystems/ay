@@ -41,6 +41,75 @@ fn metered_store_chain_len(
     Ok(len)
 }
 
+/// What [`charge_row_chain_validation`] learns about a clause while it measures
+/// every store spine a sub-schema could parse.
+struct LiteralCensus {
+    pos_eq_all: usize,
+    pos_eq_with_select: usize,
+    /// Negated equalities between two arrays of one sort.
+    premises: usize,
+    /// Folded Bool-element reads `P` / `(not P)` of a well-sorted `select`, the
+    /// literals the `folded_conclusions` sub-schemas start from.
+    bool_reads: usize,
+    n_max: usize,
+}
+
+/// Classify each literal and measure every store spine any sub-schema could
+/// parse. `metered_store_chain_len` debits PER NODE, so the SUM of all spine
+/// walks — Θ(L·N) for `L` literals sharing one length-`N` chain — is charged as
+/// it happens and fails closed, instead of being walked for free while the
+/// formula prices only the maximum spine length.
+fn census_literals(
+    terms: &TermStore,
+    literals: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<LiteralCensus, ProofCheckError> {
+    let mut pos_eq_all = 0usize;
+    let mut pos_eq_with_select = 0usize;
+    let mut premises = 0usize;
+    let mut bool_reads = 0usize;
+    let mut n_max = 0usize;
+    for &lit in literals {
+        if let Some((lhs, rhs)) = equality_sides(terms, lit) {
+            pos_eq_all += 1;
+            let mut has_select = false;
+            for side in [lhs, rhs] {
+                n_max = n_max.max(metered_store_chain_len(terms, side, progress)?);
+                if let Some((array, _)) = well_sorted_select_parts(terms, side) {
+                    has_select = true;
+                    n_max = n_max.max(metered_store_chain_len(terms, array, progress)?);
+                }
+            }
+            if has_select {
+                pos_eq_with_select += 1;
+            }
+        } else if let Some((left, right)) = negated_equality_sides(terms, lit) {
+            for side in [left, right] {
+                n_max = n_max.max(metered_store_chain_len(terms, side, progress)?);
+                if let Some((array, _)) = well_sorted_select_parts(terms, side) {
+                    n_max = n_max.max(metered_store_chain_len(terms, array, progress)?);
+                }
+            }
+            if matches!(terms.sort(left), Sort::Array(_)) && terms.sort(left) == terms.sort(right) {
+                premises += 1;
+            }
+        } else if let Some((array, _)) = folded_conclusions::bool_read_literal(terms, lit)
+            .and_then(|(atom, _)| well_sorted_select_parts(terms, atom))
+        {
+            // Folded (A) parses and evaluates the read's own chain once.
+            n_max = n_max.max(metered_store_chain_len(terms, array, progress)?);
+            bool_reads += 1;
+        }
+    }
+    Ok(LiteralCensus {
+        pos_eq_all,
+        pos_eq_with_select,
+        premises,
+        bool_reads,
+        n_max,
+    })
+}
+
 /// Debit the strict-check meter for the ACTUAL work
 /// [`validate_array_row_chain`] is about to perform on `literals`, failing
 /// closed if the caller's envelope cannot absorb it.
@@ -70,6 +139,12 @@ fn metered_store_chain_len(
 ///    cheap premise-loop pass per positive equality: `64*(pos_eq_all*premises +
 ///    pos_eq_with_select*premises*n_max)`.
 ///
+///  * Sub-schema (M) (see `folded_conclusions`): folded (B) re-walks both
+///    premise sides in both orientations per folded Bool-read literal,
+///    `64*4*bool_reads*premises*(n_max+1)`; folded (A) walks only the read's own
+///    chain, which [`census_literals`] measures per node; folded ROW1 and folded
+///    (I) are two-literal and `O(1)`.
+///
 /// `n_max` is the maximum store-spine length over every array term any parse
 /// could reach, so no single premise re-walk in the (B) cross product exceeds it.
 ///
@@ -92,42 +167,13 @@ fn charge_row_chain_validation(
         return Err(ProofCheckError::ResourceLimit);
     }
 
-    let mut pos_eq_all = 0usize;
-    let mut pos_eq_with_select = 0usize;
-    let mut premises = 0usize;
-    let mut n_max = 0usize;
-
-    // Classify each literal and measure every store spine any sub-schema could
-    // parse. `metered_store_chain_len` debits PER NODE, so the SUM of all spine
-    // walks — Θ(L·N) for `L` literals sharing one length-`N` chain — is charged
-    // as it happens and fails closed, instead of being walked for free while the
-    // formula prices only the maximum spine length.
-    for &lit in literals {
-        if let Some((lhs, rhs)) = equality_sides(terms, lit) {
-            pos_eq_all += 1;
-            let mut has_select = false;
-            for side in [lhs, rhs] {
-                n_max = n_max.max(metered_store_chain_len(terms, side, progress)?);
-                if let Some((array, _)) = well_sorted_select_parts(terms, side) {
-                    has_select = true;
-                    n_max = n_max.max(metered_store_chain_len(terms, array, progress)?);
-                }
-            }
-            if has_select {
-                pos_eq_with_select += 1;
-            }
-        } else if let Some((left, right)) = negated_equality_sides(terms, lit) {
-            for side in [left, right] {
-                n_max = n_max.max(metered_store_chain_len(terms, side, progress)?);
-                if let Some((array, _)) = well_sorted_select_parts(terms, side) {
-                    n_max = n_max.max(metered_store_chain_len(terms, array, progress)?);
-                }
-            }
-            if matches!(terms.sort(left), Sort::Array(_)) && terms.sort(left) == terms.sort(right) {
-                premises += 1;
-            }
-        }
-    }
+    let LiteralCensus {
+        pos_eq_all,
+        pos_eq_with_select,
+        premises,
+        bool_reads,
+        n_max,
+    } = census_literals(terms, literals, progress)?;
 
     // Sub-schema (B): cheap premise-loop overhead per positive equality, plus the
     // expensive cross-product re-walks of premise chains. This multiplicity is
@@ -143,9 +189,26 @@ fn charge_row_chain_validation(
         return Err(ProofCheckError::ResourceLimit);
     }
 
+    // Unit shadowed-store equality keeps both bounded spines, two ordered
+    // normal forms and an index set. Reserve their linear scratch and walks
+    // separately from the older read-chain schema before matching either.
+    if l == 1
+        && equality_sides(terms, literals[0])
+            .is_some_and(|(left, _)| matches!(terms.sort(left), Sort::Array(_)))
+        && !progress(mul(n_max, 256)?, mul(n_max, 256)?)
+    {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+
     let cheap_b = mul(pos_eq_all, premises)?;
     let expensive_b = mul(mul(pos_eq_with_select, premises)?, n_max)?;
-    let cross = mul(add(cheap_b, expensive_b)?, 64)?;
+    // Folded (B) walks both premise sides, in both orientations, once per
+    // folded Bool-read literal: four `eval_chain_at` walks of at most
+    // `n_max + 1` nodes per (literal, premise) pair, on top of the per-node
+    // walks above. Folded (A) re-walks only the read's own chain, which the
+    // census measured per node; folded ROW1 and folded (I) are `O(1)`.
+    let bool_read_b = mul(mul(mul(bool_reads, premises)?, add(n_max, 1)?)?, 4)?;
+    let cross = mul(add(add(cheap_b, expensive_b)?, bool_read_b)?, 64)?;
     // Peak transient scratch: the premise vector and positive-equality pair set
     // are O(L); one parsed store chain of ≤ n_max entries is live at a time.
     let bytes = mul(add(l, n_max)?, 4 * size_of::<(TermId, TermId)>())?;
@@ -165,7 +228,7 @@ fn charge_row_chain_validation(
 /// exhausted the result is the term `(select base x)`. Every `store` node and
 /// the final `select` must be well-sorted array operations.
 ///
-/// The clause is accepted when either sub-schema holds:
+/// The clause is accepted when one of the following sub-schemas holds:
 ///
 /// (A) CHAIN EVALUATION. A POSITIVE literal `(= P Q)` where `P` is a well-
 ///     sorted `(select C x)` and `eval(C, x)` denotes exactly `Q` (or the
@@ -276,7 +339,22 @@ fn charge_row_chain_validation(
 /// `select(store(a, i, v), j) = ite((= i j), v, select(a, j))` — which holds
 /// with NO side condition — plus `select(const-array(f), j) = f`. That is why
 /// (K) needs no `(= x i)` literal: it never assumes a disequality at all.
-/// (C)/(D)/(E)/(F)/(G)/(H)/(I)/(J)/(K) are intentionally exact.
+/// (L) SHADOWED WRITES. A unit array equality whose two well-sorted store
+/// chains share a base and the same ordered last writes, after removing only
+/// writes at an identical index term seen later in that chain. The surviving
+/// writes remain ordered; no distinct-index or distinct-address assumption is
+/// needed. At least one write must be removed, and each spine is bounded by
+/// `MAX_SHADOWED_STORES`. See `shadowed_stores` for the extensional argument.
+/// (M) FOLDED BOOL-ELEMENT CONCLUSIONS. Over `Array(I, Bool)` the term store
+///     folds `(= P true)` to the atom `P` and `(= P false)` to `(not P)`, so
+///     the following are accepted with that conclusion spelled as the folded
+///     literal, `b` being the constant its polarity names: sub-schema (B) whose
+///     constant side evaluates to exactly `b`; sub-schema (A) whose non-empty
+///     chain evaluates to exactly `b`; the exact two-literal conditional ROW1
+///     `(not (= i k)) OR (= (select (store A i b) k) b)`; and sub-schema (I)
+///     with one written value the atom and the other `b`. See
+///     `folded_conclusions` for the conditions and the soundness arguments.
+/// (C)/(D)/(E)/(F)/(G)/(H)/(I)/(J)/(K)/(L) are intentionally exact.
 pub(crate) fn validate_array_row_chain(
     terms: &TermStore,
     step_id: ProofId,
@@ -306,7 +384,9 @@ pub(crate) fn validate_array_row_chain(
                  store skipped while evaluating the chain at the read index must be justified \
                  by a positive `(= x i)` literal in the same clause, and the conclusion must be \
                  the evaluated equality (optionally under a `(not (= L R))` array-equality \
-                 premise whose conclusion carries a top-level select at the read index)"
+                 premise whose conclusion carries a top-level select at the read index); over a \
+                 Bool element sort an equality with a Boolean constant may be folded to the \
+                 literal it denotes"
             .to_string(),
     })
 }

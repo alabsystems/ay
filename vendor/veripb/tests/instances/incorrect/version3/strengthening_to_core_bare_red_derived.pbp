@@ -1,0 +1,16 @@
+pseudo-Boolean proof version 3.0
+% Regression test (wrong verdict): `RedundanceBasedStrengtheningRule` never overrode
+% `Checkable::add_constraints_to_core`, so under `strengthening_to_core on` a `red` written
+% without an explicit subproof stored its constraint in the DERIVED set. That set is exactly
+% what the mode's shortcut drops: `red` calls `Database::get_proofgoals` with
+% `add_derived_goals = false`, which is only sound while everything derived is entailed by the
+% core. So the second `red` below never had to preserve `1 y1 >= 1`, and two contradictory
+% witnesses refuted a satisfiable formula (x1 alone satisfies it).
+f 1;
+strengthening_to_core on;
+red 1 y1 >= 1 : y1 -> 1 ;
+red 1 ~y1 >= 1 : y1 -> 0 ;
+rup >= 1;
+output NONE;
+conclusion UNSAT;
+end pseudo-Boolean proof;

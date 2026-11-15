@@ -1,0 +1,7 @@
+pseudo-Boolean proof version 2.0
+f 1
+p 1 x1 w
+e 1 ~x2 1 x3 >= 0 ; 2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

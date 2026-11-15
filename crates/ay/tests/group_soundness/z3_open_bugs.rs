@@ -71,6 +71,18 @@ fn test_fp_z3_6633_expected() {
     assert_eq!(result, "sat", "Z3#6633: expected sat, got {result}");
 }
 
+/// Z3 #7135 — z3 refutes a QF_BVFP input that cvc5 validates as sat.
+/// ay answers sat (expected), with a model the independent gate confirms. Its
+/// `(_ repeat 2)` over a symbolic operand had no arm in the FP route's BV
+/// value encoder, so ay answered `unknown` until 2026-10-16.
+#[test]
+#[timeout(30_000)]
+fn test_fp_z3_7135_expected() {
+    let path = repro_path("fp", "z3_soundness", "z3_7135.smt2");
+    let result = run_ay(&path);
+    assert_eq!(result, "sat", "Z3#7135: expected sat, got {result}");
+}
+
 /// Z3 #7162 — invalid model on FP fma chain.
 /// Expected: sat. ay currently answers `unknown` (partial FP completeness).
 /// This reproducer is slow inside ay (>30s); the test runs with an internal
@@ -201,12 +213,14 @@ fn test_fp_z3_8185_sound() {
 // ---------------------------------------------------------------------------
 
 /// Z3 #9140 — rem collapses to mod on zero divisor.
-/// Expected: sat. ay implements `rem` via mk_rem (see #8730); for the
-/// zero-divisor case we keep `rem` as its own uninterpreted symbol, so
-/// `(distinct (rem x 0) (mod x 0))` is satisfiable. The LIA theory does not
-/// yet know how to assign a concrete model to the uninterpreted `rem x 0`
-/// application, so ay returns `unknown` (incomplete) here rather than `sat`.
-/// The soundness contract is preserved: ay must not claim `unsat`.
+/// The reproducer writes `(rem x y)` with a symbolic divisor under
+/// `QF_LIA`; z3's own shell rejects that at parse time ("logic does
+/// not support nonlinear arithmetic", measured on 5.1.0) and answers
+/// sat on the emptied problem, so the issue's false-unsat only ever
+/// appeared on z3's permissive library path. Since DR-59 ay's shell
+/// rejects it identically and then answers `unknown` (fail-closed
+/// after a discarded command) — the soundness contract (never
+/// `unsat`) is preserved on every path.
 #[test]
 #[timeout(30_000)]
 fn test_lia_z3_9140_observed() {
@@ -217,8 +231,8 @@ fn test_lia_z3_9140_observed() {
         "Z3#9140: must not claim unsat under SMT-LIB mod0/rem0 semantics, got {result}"
     );
     assert!(
-        result == "sat" || result == "unknown",
-        "Z3#9140: expected sat or unknown after rem support lands, got {result}"
+        result == "sat" || result == "unknown" || result.contains("does not support nonlinear"),
+        "Z3#9140: expected z3-shaped shell rejection, sat, or unknown, got {result}"
     );
 }
 
@@ -284,17 +298,58 @@ fn test_nra_z3_9139_expected() {
 }
 
 /// Z3 #9319 — invalid model on (^ (* x 2.0) (/ 1.0 x)) with x = 0.
-/// AY elaborates `^` under SMT-LIB Reals_Ints §3.8 partial semantics
-/// (integer-literal exponents are unfolded to multiplication; symbolic
-/// exponents become an uninterpreted application). The under-specified
-/// `0^(1/x)` term permits `sat`; Z3 also returns sat (after first
-/// printing its `unknown constant ^` error). Expected: sat.
+/// Expected: sat under partial semantics (Z3 prints its `unknown constant ^`
+/// error and then answers for the remaining assertion).
+///
+/// OBSERVED since 02c6fb98d ("feat(elab): Z3 5.0.0 signature, public-sort,
+/// and Char semantics"): AY no longer elaborates a symbolic or non-integral
+/// `^` exponent as an uninterpreted application, because "treating a
+/// surviving `^` application as an uninterpreted function is unsound:
+/// constraints on the exponent can make Z3 prove facts that EUF alone cannot
+/// see" (`elaborate_power`). Both `^` terms here have symbolic exponents, so
+/// the assertion is rejected as unsupported, and the discarded
+/// problem-contributing command makes `check-sat` answer `unknown` rather
+/// than decide a partially-read problem (a152df2ff / ede55c9a1). The old
+/// `sat` came from the unsound uninterpreted-`^` encoding.
+///
+/// Pins the observed answer so any change surfaces: the rejection must name
+/// the operator, the verdict must be `unknown`, and neither `sat` nor `unsat`
+/// (Z3's inconsistent-model class) may appear.
 #[test]
 #[timeout(30_000)]
-fn test_nra_z3_9319_expected() {
+fn test_nra_z3_9319_observed() {
     let path = repro_path("nra", "z3_soundness", "z3_9319.smt2");
-    let result = run_ay(&path);
-    assert_eq!(result, "sat", "Z3#9319: expected sat, got {result}");
+    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
+        .arg(&path)
+        .output_timeout(DEFAULT_CHILD_TIMEOUT)
+        .expect("Failed to spawn ay");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(
+        lines.first().is_some_and(|line| line.starts_with("(error")
+            && line.contains("unsupported: symbolic or non-integral exponentiation with `^`")),
+        "Z3#9319: the symbolic `^` must be rejected as unsupported, not encoded as an \
+         uninterpreted function.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("unknown"),
+        "Z3#9319: check-sat after a discarded assertion must answer unknown.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !lines.iter().any(|&line| line == "sat" || line == "unsat"),
+        "Z3#9319: no verdict may be decided over a partially-read problem.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("a problem-contributing command was discarded"),
+        "Z3#9319: the unknown must be attributed to the discarded assertion.\nstderr:\n{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

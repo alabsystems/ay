@@ -39,14 +39,16 @@
 # cert_ci.sh and both Rust resolvers still computed the legacy one, so the
 # same pinned checker lived at two paths depending on who built it).
 #
-# WHICH COMPILER KEYS THE CACHE: the one cargo will actually run, resolved as
-#   1. $RUSTC        — cargo honours it, so the key must too;
-#   2. rustc on PATH — cargo's default resolution;
-#   3. $(compiler_consumer --print sysroot)/bin/rustc — the Trust toolchain ships rustc
-#      as a sysroot compat entry without putting a bare `rustc` on PATH, so on
-#      a Trust-only machine step 2 finds nothing. This step is deliberate, not
-#      a convenience: without it the key computation would fail on the very
-#      machines this repo is developed on.
+# WHICH COMPILER KEYS THE CACHE: the one the build will actually run. Builds
+# go through veripb_cargo (below): `targo --unverified` wherever the Trust
+# toolchain is installed (owner ruling 2026-09-23: Rust here is targo), plain
+# `cargo` on a host without it. Resolved as
+#   1. $RUSTC        — both frontends honour it, so the key must too;
+#   2. $(compiler_consumer --print sysroot)/bin/rustc — the compiler targo runs. It
+#      outranks a PATH rustc: inside aterm a bare `rustc` is a reroute stub,
+#      and on a Trust machine it is not what builds the checker;
+#   3. rustc on PATH — plain cargo's default resolution, for a host without
+#      the Trust toolchain.
 # No compiler at all is a loud, fail-closed error: a cache keyed blindly is a
 # cache that will hand a foreign-compiler build to a gate that compiles in it.
 # Callers that BUILD with the resolved compiler must pass it to cargo as
@@ -63,13 +65,8 @@ veripb_rustc_path() {
             return 0
         fi
         echo "ERROR: \$RUSTC is set to '$RUSTC', which is not executable." >&2
-        echo "       cargo would fail on it too; unset RUSTC or fix the path." >&2
+        echo "       the build would fail on it too; unset RUSTC or fix the path." >&2
         return 2
-    fi
-    _vbi_rustc=$(command -v rustc 2>/dev/null) || _vbi_rustc=
-    if [ -n "$_vbi_rustc" ]; then
-        printf '%s\n' "$_vbi_rustc"
-        return 0
     fi
     if command -v compiler_consumer >/dev/null 2>&1; then
         _vbi_sysroot=$(compiler_consumer --print sysroot 2>/dev/null) || _vbi_sysroot=
@@ -78,10 +75,32 @@ veripb_rustc_path() {
             return 0
         fi
     fi
-    echo "ERROR: no compiler to key the veripb cache: \$RUSTC is unset, no 'rustc'" >&2
-    echo "       is on PATH, and no compiler_consumer sysroot supplies one. Refusing to key a" >&2
+    _vbi_rustc=$(command -v rustc 2>/dev/null) || _vbi_rustc=
+    if [ -n "$_vbi_rustc" ]; then
+        printf '%s\n' "$_vbi_rustc"
+        return 0
+    fi
+    echo "ERROR: no compiler to key the veripb cache: \$RUSTC is unset, no compiler_consumer" >&2
+    echo "       sysroot supplies one, and no 'rustc' is on PATH. Refusing to key a" >&2
     echo "       cache blindly — install a toolchain or set RUSTC=/path/to/rustc." >&2
     return 2
+}
+
+# The Cargo-family frontend for the pinned-checker builds (and the ay-pb
+# solver pb_certified_gate.sh certifies): `targo` where the Trust toolchain is
+# installed, in its unverified lane for a compilation command — these builds
+# are measurement subjects, not proof claims — and plain `cargo` on a host
+# without it. The discriminator is the only one that holds: the real targo
+# accepts `--unverified --version`, stock Cargo refuses the flag.
+veripb_cargo() {
+    if targo --unverified --version >/dev/null 2>&1; then
+        case "${1:-}" in
+            build|check|test|run|bench|rustc|install) targo --unverified "$@" ;;
+            *) targo "$@" ;;
+        esac
+    else
+        cargo "$@"
+    fi
 }
 
 # `release[-commithash10]` of the keying compiler, sanitised for use in a

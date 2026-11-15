@@ -5,6 +5,10 @@
 
 use super::*;
 
+/// Trace entries replayed between two stop polls. One poll is an atomic load,
+/// a lock and a clock read; one entry is at least a clause translation.
+const STOP_POLL_STRIDE: usize = 64;
+
 impl<'a> SatProofManager<'a> {
     pub(crate) fn new(var_to_term: &'a HashMap<u32, TermId>, terms: &'a mut TermStore) -> Self {
         Self {
@@ -19,10 +23,12 @@ impl<'a> SatProofManager<'a> {
             propagation_environment: None,
             instance_root_derivations: None,
             trust_fallback_count: 0,
+            materialized_lemma_versions: Default::default(),
             untranslatable_entries: 0,
             unmapped_var_min: None,
             unmapped_var_max: None,
             step_budget: None,
+            should_stop: None,
             dt_registry_data: None,
             context_derivations: None,
             context_discharge_failures: Default::default(),
@@ -51,6 +57,18 @@ impl<'a> SatProofManager<'a> {
 
     pub(crate) fn set_step_budget(&mut self, budget: Option<u64>) {
         self.step_budget = budget;
+    }
+
+    /// Stop the trace replay once `should_stop` reports the caller's interrupt
+    /// or deadline; the replay then returns `None`, as on budget exhaustion.
+    pub(crate) fn set_should_stop(&mut self, should_stop: &'a dyn Fn() -> bool) {
+        self.should_stop = Some(should_stop);
+    }
+
+    /// Whether the replay must stop before trace entry `entry_index`: the stop
+    /// predicate is consulted once per [`STOP_POLL_STRIDE`] entries.
+    pub(super) fn stop_requested_at(&self, entry_index: usize) -> bool {
+        entry_index % STOP_POLL_STRIDE == 0 && self.should_stop.is_some_and(|stop| stop())
     }
 
     /// Validate and install solver-minted active-scope premises.
@@ -144,3 +162,7 @@ impl<'a> SatProofManager<'a> {
         self.theory_lemma_proofs = Some(proofs);
     }
 }
+
+#[cfg(test)]
+#[path = "configuration_stop_tests.rs"]
+mod stop_tests;

@@ -15,9 +15,9 @@ use crate::executor::Executor;
 ///
 /// The ground fact is deliberately an INEQUALITY, not a literal-valued
 /// equality: a value pin would route the refutation through
-/// `try_distinct_ground_pin`, whose `GroundEqualitySubstitution` kind AY's own
-/// strict checker accepts but the Alethe printer must spell `hole`. An
-/// inequality forces the same-context probe route, whose every step has a
+/// `try_distinct_ground_pin`, whose substitution and normalization use a
+/// separately bounded external lowering. An inequality forces the
+/// same-context probe route, whose every step has a
 /// checked wire spelling — which is what lets this test pin exact wire text.
 fn implied_forall_conflict_executor() -> Executor {
     let commands = ay_frontend::parse(
@@ -102,13 +102,27 @@ fn an_implied_universal_is_instantiated_through_an_implies_pos_prologue() {
     // authored antecedent, which no `and`-spine provenance path could reach.
     // Every rule here is in `CHECKABLE_ALETHE_RULES` with a strict validator —
     // no `trust`, no `hole`.
+    //
+    // t2 ships as `or_pos`, not `implies_pos`, and that is the point of the
+    // step rather than an accident of it. The proof OBJECT is an `implies_pos`
+    // (asserted above, on `proof.steps`) but the authored implication is STORED
+    // and PRINTED as the or-term it was desugared into, and `implies_pos` over
+    // a printed `or` is not spec-valid Alethe. MEASURED on the pinned carcara
+    // 1.1.0, on this exact document: the `implies_pos` spelling this test used
+    // to assert is `invalid` — "term '(not (or (forall ((x_2 Int)) (< 10 x_2))
+    // (not p)))' is of the wrong form, expected '(not(=> phi_1 phi_2))'" —
+    // while `or_pos` over the identical clause is accepted. The rule is not
+    // relabelled to whatever the checker likes: `or_pos` over `(or A B)` states
+    // exactly the inference `implies_pos` states over the implication it
+    // desugars, so this is the same derivation, spelled for the surface it
+    // actually printed.
     assert_eq!(
         alethe,
         concat!(
             "(assume t0 (or (forall ((x_2 Int)) (< 10 x_2)) (not p)))\n",
             "(assume t1 p)\n",
-            "(step t2 (cl (not (or (forall ((x_2 Int)) (< 10 x_2)) (not p))) (not p) ",
-            "(forall ((x_2 Int)) (< 10 x_2))) :rule implies_pos)\n",
+            "(step t2 (cl (not (or (forall ((x_2 Int)) (< 10 x_2)) (not p))) ",
+            "(forall ((x_2 Int)) (< 10 x_2)) (not p)) :rule or_pos)\n",
             "(step t3 (cl (not p) (forall ((x_2 Int)) (< 10 x_2))) :rule resolution ",
             ":premises (t2 t0))\n",
             "(step t4 (cl (forall ((x_2 Int)) (< 10 x_2))) :rule resolution :premises (t3 t1))\n",

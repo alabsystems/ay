@@ -1,0 +1,6 @@
+pseudo-Boolean proof version 3.0
+f 4;
+red 1 x1 >= 1 : x1 1 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

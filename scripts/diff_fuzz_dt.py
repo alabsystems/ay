@@ -15,6 +15,7 @@
 import argparse, json, os, random, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _z3_oracle  # noqa: E402
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
     run_captured,
@@ -431,12 +432,23 @@ def main():
     ap.add_argument("--n", type=int, default=2500)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ay", default="target/release/examples/smt_run")
-    ap.add_argument("--z3", default="z3")
+    ap.add_argument("--z3", default="z3",
+                    help="z3 path; the default `z3` is the z3 oracle (Z3_PATH, else "
+                         "the first z3 on PATH that proves it is z3)")
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--out-dir", default="/tmp/fuzz_dt_witnesses")
     args = ap.parse_args()
     if args.n <= 0 or args.timeout <= 0:
         ap.error("--n and --timeout must be positive")
+    # A by-name `z3` can reach a refusing reroute stub (every verdict empty, so
+    # the fuzzer silently finds nothing) or an AY drop-in (AY vs AY). Take
+    # verdicts only from a z3 that proved it is z3, run by its path.
+    try:
+        oracle = _z3_oracle.resolve_z3_spelling(args.z3)
+    except _z3_oracle.Z3Unavailable as error:
+        ap.error(f"--z3 {args.z3}: no usable z3: {error}")
+    args.z3 = oracle.path
+    print(f"z3 oracle: {oracle.identity()}", file=sys.stderr)
 
     warn_concurrent_build()
     RESOURCE_PLAN = plan_solver_resources(1, label="diff_fuzz_dt.py")

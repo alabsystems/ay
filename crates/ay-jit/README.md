@@ -103,7 +103,7 @@ the only propagation/proof authority.
 ## Testing
 
 ```bash
-cargo test -p ay-jit --lib learned_clause_emit   # profile descriptor + oracle API
-cargo test -p ay-jit --lib batch_recompile       # profile batch scheduler
-cargo test -p ay-jit                             # full suite
+targo --unverified test -p ay-jit --lib learned_clause_emit   # profile descriptor + oracle API
+targo --unverified test -p ay-jit --lib batch_recompile       # profile batch scheduler
+targo --unverified test -p ay-jit                             # full suite
 ```

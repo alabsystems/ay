@@ -18,14 +18,92 @@ use num_rational::BigRational;
 use num_traits::{One, ToPrimitive, Zero};
 use std::collections::BTreeMap;
 
-use ay_core::{TheoryLit, TheoryResult};
+use ay_core::TheoryResult;
 
 use super::*;
 
 /// Maximum total domain size for bounded enumeration (product of all variable ranges).
 const MAX_ENUM_DOMAIN: i64 = 10_000;
 
+/// Points between wall-clock deadline polls inside a point-enumeration loop
+/// (#nia-enum-deadline).
+///
+/// The enumeration loops in this file and in `factor_split.rs` evaluate every
+/// asserted atom by EXACT BigInt substitution at every point, so one point is
+/// already tens of microseconds on a dense atom set; 256 of them bound the
+/// post-deadline overshoot to well under a millisecond while making the clock
+/// read itself (a `checked_duration_since` on a cached `Instant`) unmeasurable
+/// against the evaluation cost.
+const ENUM_DEADLINE_POLL_POINTS: i64 = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of deadline polls actually performed by
+    /// [`NiaSolver::enum_deadline_expired`] on the current thread
+    /// (#nia-enum-deadline).
+    ///
+    /// ANTI-VACUITY INSTRUMENT. The property this module has to hold is that
+    /// the clock is read *while* a box is being walked, not merely once on
+    /// entry: an entry-only poll is exactly the shape that spun for 7h12m
+    /// inside a single `try_capped_model_search` activation. Wall-clock
+    /// assertions do not pin that — under `--release` the full 10_000-point
+    /// box takes tens of microseconds here, so a 1 ms budget is never reached
+    /// and any timing assertion passes vacuously. Counting the polls pins it
+    /// exactly and without a clock: an entry-only poll counts 1, a correctly
+    /// polling walk counts `ceil(points / ENUM_DEADLINE_POLL_POINTS)`.
+    pub(crate) static ENUM_DEADLINE_POLLS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Reset the thread's poll counter and return the previous value (test-only).
+#[cfg(test)]
+pub(crate) fn reset_enum_deadline_polls() -> u64 {
+    ENUM_DEADLINE_POLLS.with(|n| n.replace(0))
+}
+
+/// Polls performed on this thread since the last reset (test-only).
+#[cfg(test)]
+pub(crate) fn enum_deadline_polls() -> u64 {
+    ENUM_DEADLINE_POLLS.with(std::cell::Cell::get)
+}
+
 impl NiaSolver<'_> {
+    /// Wall-clock poll for the point-enumeration loops (#nia-enum-deadline).
+    ///
+    /// `visited` is the number of points ALREADY examined in the current loop,
+    /// so the very first call (`visited == 0`) polls, and an already-expired
+    /// deadline aborts before a single point is evaluated.
+    ///
+    /// ## Why the enumerations must poll at all
+    ///
+    /// `NiaSolver::deadline` was polled in exactly ONE place
+    /// (`check_loop.rs`, at each refinement-iteration boundary), which is only
+    /// sound as a budget if every call made from that loop returns quickly.
+    /// The enumerations do not: `try_capped_model_search` alone walks up to
+    /// [`MAX_ENUM_DOMAIN`] points and is re-entered on every `NeedSplit`, and
+    /// an odometer that overflowed past its bound walked ~2^64 of them —
+    /// measured 2026-09-11 as 7h12m of silent full-CPU spinning inside
+    /// `compiler_consumer`, on a 15 s per-obligation budget, with the deadline sitting
+    /// live and unread in `self.deadline` the whole time.
+    ///
+    /// ## Why aborting is always sound here
+    ///
+    /// Every caller of this helper returns `None` on expiry. `None` is each
+    /// enumeration's EXISTING "no claim" answer — "not applicable" for the
+    /// exhaustive decider, "no witness found" for the SAT-only searches — so
+    /// an abort can never manufacture `Sat` or `Unsat`; it can only lose
+    /// completeness, and the caller reports the `Unknown` it would otherwise
+    /// have reported. In particular the exhaustive decider must NOT fall out
+    /// of its loop on expiry: falling out means "box exhausted", which is its
+    /// `Unsat` claim.
+    pub(crate) fn enum_deadline_expired(&self, visited: i64) -> bool {
+        if visited % ENUM_DEADLINE_POLL_POINTS != 0 {
+            return false;
+        }
+        #[cfg(test)]
+        ENUM_DEADLINE_POLLS.with(|n| n.set(n.get() + 1));
+        self.should_timeout()
+    }
     /// True if any asserted atom contains a SCALED nonlinear product
     /// (`(* c x y)` with a constant factor, hence not registered as a monomial —
     /// see #nia-const-factor). Such problems have no registered monomials, so the
@@ -49,6 +127,7 @@ impl NiaSolver<'_> {
     /// or `None` if enumeration is not applicable (missing bounds, domain too large).
     pub(crate) fn try_bounded_enumeration(&mut self) -> Option<TheoryResult> {
         self.bounded_enum_model = None;
+        self.bounded_enum_bool_model.clear();
 
         // SOUNDNESS (#nia-enum-tentative): bounded enumeration is a standalone
         // decision procedure that reasons over the variables' *genuine* integer
@@ -95,16 +174,16 @@ impl NiaSolver<'_> {
             return None;
         }
 
-        // Phase 1: Get direct integer bounds from LRA
-        let lra = self.lia.lra_solver();
+        // Phase 1: Get direct integer bounds from LRA — JUSTIFIED bounds only
+        // (see `get_integer_bounds`).
         let mut var_bounds: HashMap<TermId, (Option<i64>, Option<i64>)> = HashMap::default();
 
         for &var in &vars {
-            let (lo, hi) = match self.get_integer_bounds(var, lra) {
+            let (lo, hi) = match self.get_integer_bounds(var) {
                 Some((lo, hi)) => (Some(lo), Some(hi)),
                 None => {
                     // Try partial bounds
-                    let (lo_opt, hi_opt) = self.get_partial_integer_bounds(var, lra);
+                    let (lo_opt, hi_opt) = self.get_partial_integer_bounds(var);
                     (lo_opt, hi_opt)
                 }
             };
@@ -129,7 +208,7 @@ impl NiaSolver<'_> {
                 // Get bounds on the auxiliary variable (the product term).
                 // Also check if an asserted equality links the monomial to
                 // another variable that has bounds (e.g., area = w*h).
-                let (aux_lo, aux_hi) = self.get_monomial_bounds(mon, lra);
+                let (aux_lo, aux_hi) = self.get_monomial_bounds(mon);
 
                 // For each variable in the monomial, try to derive missing bounds
                 for (i, &var) in mon.vars.iter().enumerate() {
@@ -209,8 +288,35 @@ impl NiaSolver<'_> {
                                     };
                                 if let Some(other_product) = all_others_upper {
                                     if other_product > 0 {
-                                        // var >= ceil(l / other_product)
-                                        let inferred_lo = (l + other_product - 1) / other_product;
+                                        // var >= ceil(l / other_product).
+                                        //
+                                        // Both operands are guarded `> 0` above, so the
+                                        // quotient lies in `[1, l]` and always fits an
+                                        // i64 — but the textbook `(l + d - 1) / d` does
+                                        // NOT: its intermediate sum PANICS ("attempt to
+                                        // add with overflow") once `l` sits within `d`
+                                        // of i64::MAX. A refuter reached exactly that
+                                        // with a 3-assertion QF_NIA input (the
+                                        // regression test rebuilds the shape: `x*y =
+                                        // i64::MAX`, `y ∈ [1, 2]`, `x <= 10`), and NIA
+                                        // runs IN-PROCESS inside compiler_consumer, so the panic
+                                        // is an ICE that kills the compilation, not a
+                                        // verdict. `(l - 1) / d + 1` is the same ceiling
+                                        // (`l - 1 >= 0`, quotient `<= l - 1`, `+ 1 <=
+                                        // l`) and cannot overflow for `l >= 1`,
+                                        // `d >= 1`. Unlike the domain-size check below
+                                        // there is nothing uncomputable here — only the
+                                        // intermediate was mis-shaped — so the bound is
+                                        // computed exactly rather than declined or
+                                        // saturated. A saturated `i64::MAX / d` is the
+                                        // FLOOR at the rim, one below the ceiling: still
+                                        // sound (weaker, never model-excising) but
+                                        // incomplete — it widens the box by a point,
+                                        // which is enough to push a domain sitting at
+                                        // MAX_ENUM_DOMAIN over the cap, turning a
+                                        // provable Unsat into a decline (the regression
+                                        // test's exactness companion pins that).
+                                        let inferred_lo = (l - 1) / other_product + 1;
                                         let new_lo = cur_lo
                                             .map(|old| old.max(inferred_lo))
                                             .unwrap_or(inferred_lo);
@@ -234,7 +340,43 @@ impl NiaSolver<'_> {
         // decider below can run. Sound: pure bounds tightening (every removed
         // value provably violates some asserted atom); never produces a
         // verdict by itself.
-        self.contract_enum_bounds(&vars, &mut var_bounds);
+        let (derived_reasons, contract_refuted) = self.contract_enum_bounds(&vars, &mut var_bounds);
+        // Deadline discipline (#nia-enum-deadline): an expired budget
+        // forbids claiming any verdict out of this decider, the
+        // contraction refutation included — poll before claiming it.
+        if contract_refuted && !self.enum_deadline_expired(0) {
+            // #nia-contract-empty-refutes: interval contraction over the
+            // justified seed bounds produced an empty interval — the
+            // asserted literals are jointly unsatisfiable. This decides
+            // searched trails whose refutation is pure bound propagation
+            // through nonlinear atoms (VeryMax: a sibling disjunct's
+            // negated Farkas atom pushes the shared factor's seed bound
+            // against the compound-equality bound), where no complete
+            // factor box ever forms. Conflict cites every asserted
+            // literal, the same cover exhaustive enumeration uses.
+            // Conflict shrinking (#nia-contract-subset-refutes): the
+            // full cover (~100 literals on searched trails) blocks
+            // exactly one Boolean trail in the CEGAR loop. Try to
+            // re-derive emptiness from the relevant literals alone
+            // (subset seeds, subset-filtered lookups — sound by
+            // construction), then greedy-delete while it still
+            // refutes. Any failure falls back to the full cover.
+            let conflict = self
+                .minimized_contract_conflict(&vars)
+                .unwrap_or_else(|| self.full_conflict_lits());
+            if self.enum_deadline_expired(0) {
+                return None;
+            }
+            return Some(TheoryResult::Unsat(conflict));
+        }
+        // #nia-mccormick-contracted-bounds: stash the contracted box for
+        // the McCormick envelopes added later in this check. The seeds
+        // above are justified bounds only (Phase 1) plus algebraic
+        // consequences of asserted atoms (Phase 2 / contraction), and
+        // tentative scopes were undone at entry, so every endpoint here
+        // is implied by the current asserted literals.
+        self.contracted_bounds.clone_from(&var_bounds);
+        self.contracted_bound_reasons = derived_reasons;
 
         // Phase 3: Convert to var_ranges, checking all variables have complete bounds
         let mut var_ranges: Vec<(TermId, i64, i64)> = Vec::new();
@@ -261,7 +403,27 @@ impl NiaSolver<'_> {
         // Compute total domain size, checking for overflow
         let mut domain_size: i64 = 1;
         for &(_, lo, hi) in &var_ranges {
-            let range = hi - lo + 1;
+            // `hi - lo + 1` in `i64` PANICS on a wide bound pair — measured
+            // 2026-09-07 as `attempt to subtract with overflow` at this line,
+            // 20 times, while compiler_consumer was verifying `ty`'s workspace. The solver
+            // runs IN-PROCESS inside the compiler, so an arithmetic panic here
+            // is not a solver error the caller can handle: it takes the whole
+            // rustc process down with an ICE, and the crate under verification
+            // reports nothing at all.
+            //
+            // The bounds come from the LRA layer and are attacker-shaped in the
+            // sense that matters here — they are whatever the input formula
+            // implies, including `i64::MIN`/`i64::MAX`. The very next line
+            // already uses `checked_mul`, so the intent was overflow-safe; the
+            // subtraction and the `+ 1` were simply missed.
+            //
+            // Declining (`None`) is the right answer, not saturating: this
+            // function is an admission test for enumerating a bounded domain,
+            // and a range too wide to compute is exactly a domain too wide to
+            // enumerate. Saturating would hand the loop below a fabricated size.
+            let Some(range) = hi.checked_sub(lo).and_then(|d| d.checked_add(1)) else {
+                return None;
+            };
             if range <= 0 {
                 // Empty range — already handled by LRA
                 return None;
@@ -294,8 +456,42 @@ impl NiaSolver<'_> {
         // Enumerate all integer points
         let n = var_ranges.len();
         let mut assignment: Vec<i64> = var_ranges.iter().map(|&(_, lo, _)| lo).collect();
+        // Points examined so far: drives the deadline poll and the defensive
+        // visit bound below.
+        let mut visited: i64 = 0;
 
         loop {
+            // Wall-clock abort (#nia-enum-deadline). MUST be a `return None`,
+            // not a `break`: breaking out of this loop is the "box exhausted"
+            // exit and claims Unsat. `None` means "enumeration not applicable"
+            // and leaves the caller at the sound `unknown`.
+            if self.enum_deadline_expired(visited) {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] Bounded enum: wall-clock deadline exceeded after {visited} \
+                         points — returning None (unknown), no UNSAT claim"
+                    );
+                }
+                return None;
+            }
+            // Defensive visit bound (#nia-enum-visit-bound). A correct odometer
+            // exhausts the admitted box in exactly `domain_size` points and
+            // leaves through the `carry` break below, so this is unreachable;
+            // it exists so that a future odometer defect costs a declined
+            // enumeration rather than an unbounded spin. Declining (not
+            // breaking) is the sound choice: fewer than `domain_size` DISTINCT
+            // points may have been seen, so no UNSAT claim is available.
+            if visited >= domain_size {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] Bounded enum: visit bound {domain_size} reached without the \
+                         odometer signalling exhaustion — returning None (unknown)"
+                    );
+                }
+                return None;
+            }
+            visited += 1;
+
             // Check if this assignment satisfies all active constraints. If
             // any asserted atom is opaque to this evaluator, enumeration is
             // not a sound decision procedure for this formula.
@@ -324,16 +520,28 @@ impl NiaSolver<'_> {
                 }
             }
 
-            // Advance to next point (odometer-style increment)
+            // Advance to next point (odometer-style increment).
+            //
+            // Compare BEFORE incrementing. The previous shape — `+= 1`, then
+            // `> hi` — overflowed on a digit whose `hi == i64::MAX`: the last
+            // step computes `i64::MAX + 1` before it ever looks at the bound,
+            // and under `overflow-checks = true` (every profile here) that is
+            // a panic inside compiler_consumer, i.e. an ICE. Such a box IS admitted: the
+            // domain-size check above only caps `hi - lo + 1`, so `[i64::MAX -
+            // 3, i64::MAX]` (width 4) passes. Same points, same order — a
+            // digit `a` in `[lo, hi]` advances to `a + 1` exactly when `a <
+            // hi` (the old `a + 1 > hi` test negated) and otherwise wraps to
+            // `lo` and carries, and the invariant `a ∈ [lo, hi]` holds because
+            // the box was checked non-empty (`range > 0`) above.
             let mut carry = true;
             for i in (0..n).rev() {
                 if carry {
-                    assignment[i] += 1;
-                    if assignment[i] > var_ranges[i].2 {
+                    if assignment[i] < var_ranges[i].2 {
+                        assignment[i] += 1;
+                        carry = false;
+                    } else {
                         assignment[i] = var_ranges[i].1;
                         // carry continues
-                    } else {
-                        carry = false;
                     }
                 }
             }
@@ -351,12 +559,51 @@ impl NiaSolver<'_> {
             );
         }
 
-        let conflict: Vec<TheoryLit> = self
+        Some(TheoryResult::Unsat(self.full_conflict_lits()))
+    }
+
+    /// Shrink an interval-contraction refutation to a relevant subset
+    /// of the asserted literals (#nia-contract-subset-refutes), or
+    /// `None` when the subset alone does not refute (caller falls back
+    /// to the full cover). Greedy deletion is capped in oracle calls;
+    /// every accepted subset is re-verified by
+    /// `contract_subset_refutes`, so the result is sound regardless of
+    /// where the cap stops.
+    fn minimized_contract_conflict(&self, vars: &[TermId]) -> Option<Vec<TheoryLit>> {
+        const MAX_SHRINK_CALLS: usize = 96;
+        let mut relevant: std::collections::BTreeSet<TermId> = Default::default();
+        relevant.extend(vars.iter().copied());
+        relevant.extend(self.monomials.values().map(|m| m.aux_var));
+        let mut subset: Vec<(TermId, bool)> = self
             .asserted
             .iter()
-            .map(|(term, val)| TheoryLit::new(*term, *val))
+            .copied()
+            .filter(|&(term, _)| self.atom_mentions_any(term, &relevant))
             .collect();
-        Some(TheoryResult::Unsat(conflict))
+        if subset.len() >= self.asserted.len() || !self.contract_subset_refutes(&subset) {
+            return None;
+        }
+        let mut calls = 1usize;
+        let mut i = 0usize;
+        while i < subset.len() && calls < MAX_SHRINK_CALLS {
+            if self.enum_deadline_expired(calls as i64) {
+                break;
+            }
+            let removed = subset.remove(i);
+            calls += 1;
+            if self.contract_subset_refutes(&subset) {
+                // Still refutes without it: keep the deletion.
+            } else {
+                subset.insert(i, removed);
+                i += 1;
+            }
+        }
+        Some(
+            subset
+                .into_iter()
+                .map(|(term, value)| TheoryLit { term, value })
+                .collect(),
+        )
     }
 
     /// Capped finite-domain search for a SATISFYING assignment ONLY
@@ -388,6 +635,7 @@ impl NiaSolver<'_> {
     /// `unsat`, and never produces an `unsat` at all.
     pub(crate) fn try_capped_model_search(&mut self) -> Option<TheoryResult> {
         self.bounded_enum_model = None;
+        self.bounded_enum_bool_model.clear();
 
         // Soundness mirror of try_bounded_enumeration: speculative tentative
         // patch scopes must not narrow the (already artificial) window further,
@@ -428,12 +676,11 @@ impl NiaSolver<'_> {
         }
 
         // Gather whatever genuine integer bounds exist for each variable.
-        let lra = self.lia.lra_solver();
         let mut var_bounds: HashMap<TermId, (Option<i64>, Option<i64>)> = HashMap::default();
         for &var in &vars {
-            let (lo, hi) = match self.get_integer_bounds(var, lra) {
+            let (lo, hi) = match self.get_integer_bounds(var) {
                 Some((lo, hi)) => (Some(lo), Some(hi)),
-                None => self.get_partial_integer_bounds(var, lra),
+                None => self.get_partial_integer_bounds(var),
             };
             var_bounds.insert(var, (lo, hi));
         }
@@ -470,7 +717,18 @@ impl NiaSolver<'_> {
         // `cap` chosen this way the search box never exceeds MAX_ENUM_DOMAIN, so
         // the search is always small regardless of how many variables are
         // unbounded; if even `cap == 1` would not fit, we bail (None/unknown).
-        let cap = {
+        let cap = if capped_count == 0 {
+            // Every variable has genuine two-sided bounds, so no artificial
+            // window is ever built: each `var_ranges` entry below takes the
+            // `(Some(lo), Some(hi))` arm and `cap` is never read. Without this
+            // short-circuit the probe below still runs — its inner
+            // `for _ in 0..capped_count` body never executes, so `fits` stays
+            // true and the loop exits only on `c > MAX_ENUM_DOMAIN`: 10_000
+            // unpolled iterations computing a value nobody uses, inside the
+            // very routine this file is hardening against unpolled loops
+            // (#nia-enum-cap-probe).
+            0
+        } else {
             let mut best: i64 = 0;
             let mut c: i64 = 1;
             loop {
@@ -563,7 +821,34 @@ impl NiaSolver<'_> {
         // Enumerate the capped box; return SAT only on a verified witness.
         let n = var_ranges.len();
         let mut assignment: Vec<i64> = var_ranges.iter().map(|&(_, lo, _)| lo).collect();
+        let mut visited: i64 = 0;
         loop {
+            // Wall-clock abort (#nia-enum-deadline). THIS is the loop that hung
+            // compiler_consumer for 7h12m: it is re-entered on every `NeedSplit` and never
+            // read the clock. `None` is this routine's ordinary "no witness"
+            // answer, so aborting is verdict-neutral by construction.
+            if self.enum_deadline_expired(visited) {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] Capped search: wall-clock deadline exceeded after {visited} \
+                         points — returning None (unknown)"
+                    );
+                }
+                return None;
+            }
+            // Defensive visit bound (#nia-enum-visit-bound), as in
+            // `try_bounded_enumeration`. Unreachable with a correct odometer.
+            if visited >= domain_size {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] Capped search: visit bound {domain_size} reached without the \
+                         odometer signalling exhaustion — returning None (unknown)"
+                    );
+                }
+                return None;
+            }
+            visited += 1;
+
             // Anything other than `Some(true)` (constraint violation, or an
             // atom opaque to the exact evaluator) keeps scanning — it means
             // only that THIS point is not a provable witness, not that the
@@ -582,14 +867,20 @@ impl NiaSolver<'_> {
                 return Some(TheoryResult::Sat);
             }
 
+            // Compare before incrementing — same odometer as
+            // `try_bounded_enumeration`, for the same reason: a genuine bound
+            // `hi == i64::MAX` is admitted here whenever the box is narrow,
+            // and `+= 1` before the `> hi` test overflows (ICE inside compiler_consumer)
+            // on the last step. `a < hi` is exactly `!(a + 1 > hi)` for `a ∈
+            // [lo, hi]`, so the visit order is unchanged.
             let mut carry = true;
             for i in (0..n).rev() {
                 if carry {
-                    assignment[i] += 1;
-                    if assignment[i] > var_ranges[i].2 {
-                        assignment[i] = var_ranges[i].1;
-                    } else {
+                    if assignment[i] < var_ranges[i].2 {
+                        assignment[i] += 1;
                         carry = false;
+                    } else {
+                        assignment[i] = var_ranges[i].1;
                     }
                 }
             }
@@ -696,6 +987,178 @@ impl NiaSolver<'_> {
         None
     }
 
+    /// The `Sat` verdict the check loop may return for the CURRENT state, or
+    /// `None` when it may not (#nia-sign-cut-soundness, the SAT side of the
+    /// stale-point defect).
+    ///
+    /// The inner LIA's `Sat` can come from its direct-enumeration witness — a
+    /// solution of the LINEAR atoms only — while the tableau point the NIA
+    /// verifies its monomials against is left fractional or was relaxed by an
+    /// unjustified-bound retraction. Returning `Sat` for such a point served
+    /// a model the executor's gate rejected (`MODEL-UNCONFIRMED` ->
+    /// `unknown`) on satisfiable inputs. So a `Sat` is claimed only for:
+    ///
+    /// 1. the tableau point when the exact evaluator confirms it against
+    ///    every asserted atom;
+    /// 2. else the LIA's own model when the exact evaluator confirms THAT
+    ///    (the witness with the products computed for real), recorded as the
+    ///    model to serve;
+    /// 3. else the tableau point when it is integral on every Int leaf and
+    ///    the evaluator is merely inconclusive (an opaque atom — the
+    ///    historical acceptance, unchanged).
+    ///
+    /// A provably wrong or fractional point yields `None`: the caller keeps
+    /// refining (rounding pins the fractional factors; `fractional_int_split`
+    /// hands the rest to branch-and-bound). Pure completeness: every served
+    /// model is re-validated downstream.
+    pub(crate) fn sat_verdict_for_current_point(&mut self) -> Option<TheoryResult> {
+        match self.current_model_point_status() {
+            // Record the exact-verified point as the model to serve
+            // (#nia-record-verified-point): extraction otherwise reads
+            // the tableau at extraction time, which can drift from the
+            // point verified here (tentative scopes popped, LIA
+            // re-solved during model merging) and serve values the
+            // gate rejects — measured on VeryMax a=1, where the served
+            // candidate falsified the very disjunct the trail chose.
+            // `try_model_point_sat` recomputes the same point and
+            // records it; the fallback preserves the verdict if the
+            // recomputation somehow cannot reproduce it.
+            Some(true) => self.try_model_point_sat().or(Some(TheoryResult::Sat)),
+            Some(false) => self.try_lia_model_point_sat(),
+            None => {
+                if let Some(result) = self.try_lia_model_point_sat() {
+                    return Some(result);
+                }
+                let asserted_terms: Vec<TermId> = self.asserted.iter().map(|&(t, _)| t).collect();
+                let mut vars: Vec<TermId> = Vec::new();
+                for &t in &asserted_terms {
+                    self.collect_int_var_leaves(t, &mut vars);
+                }
+                let integral = vars
+                    .iter()
+                    .all(|&v| self.var_value(v).is_none_or(|val| val.denom().is_one()));
+                if integral {
+                    // #nia-record-verified-point: pin the leaves that
+                    // carry i64 tableau values as the model to serve,
+                    // so extraction cannot drift from the accepted
+                    // point on those leaves.
+                    let (mut rec_vars, mut rec_values): (Vec<TermId>, Vec<i64>) =
+                        (Vec::new(), Vec::new());
+                    for &v in &vars {
+                        if let Some(val) = self.var_value(v) {
+                            if let Some(iv) = val.numer().to_i64() {
+                                rec_vars.push(v);
+                                rec_values.push(iv);
+                            }
+                        }
+                    }
+                    if !rec_vars.is_empty() {
+                        self.record_bounded_enum_model(&rec_vars, &rec_values);
+                    }
+                    if self.debug {
+                        safe_eprintln!(
+                            "[NIA] Sat on an integral tableau point the exact evaluator cannot                              judge (opaque atom) — historical acceptance"
+                        );
+                    }
+                    Some(TheoryResult::Sat)
+                } else {
+                    if self.debug {
+                        safe_eprintln!(
+                            "[NIA] LIA Sat on a FRACTIONAL tableau point — not a model; refining"
+                        );
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Exact verification of the LIA's OWN model (its direct-enumeration
+    /// witness when one exists, else the tableau) against every asserted atom
+    /// with the products computed for real. `Some(Sat)` records that point
+    /// as the model to serve; `None` proves nothing.
+    pub(crate) fn try_lia_model_point_sat(&mut self) -> Option<TheoryResult> {
+        let lia_model = self.lia.extract_model()?;
+        let asserted_terms: Vec<TermId> = self.asserted.iter().map(|&(t, _)| t).collect();
+        let mut vars: Vec<TermId> = Vec::new();
+        for &t in &asserted_terms {
+            self.collect_int_var_leaves(t, &mut vars);
+        }
+        if vars.is_empty() {
+            return None;
+        }
+        vars.sort_by_key(|t| t.0);
+        let mut values: Vec<i64> = Vec::with_capacity(vars.len());
+        for v in &vars {
+            values.push(lia_model.values.get(v)?.to_i64()?);
+        }
+        if self.check_assignment(&vars, &values) == Some(true) {
+            self.record_bounded_enum_model(&vars, &values);
+            if self.debug {
+                safe_eprintln!(
+                    "[NIA] Model point verification: SAT at the LIA's own model point {:?}",
+                    vars.iter()
+                        .zip(values.iter())
+                        .map(|(v, a)| format!("{v:?}={a}"))
+                        .collect::<Vec<_>>()
+                );
+            }
+            return Some(TheoryResult::Sat);
+        }
+        None
+    }
+
+    /// The branch-and-bound split for the first Int variable (of the asserted
+    /// atoms) whose tableau value is fractional AND inside the variable's
+    /// current bounds, if any (#nia-sign-cut-soundness). The inner LIA
+    /// answered `Sat` on its direct-enumeration witness and left the tableau
+    /// fractional on a variable that is not a monomial factor, so the loop's
+    /// rounding never touches it and no refinement can make the point a
+    /// model; this is the split LIA itself would have requested for that
+    /// variable.
+    ///
+    /// A value OUTSIDE the variable's bounds is not the LP's answer to them:
+    /// the assignment is stale — an exact fallback (the factor split's
+    /// branches, a popped tentative scope) left the tableau where its last
+    /// pivot stopped. A split there proposes a literal that is already
+    /// asserted or already refuted, so the branch instance is the same
+    /// problem again and the split loop walks (signfuzz p066: `y = 1/170`
+    /// split 1,940 times under an asserted `y <= 0`). Inside the bounds both
+    /// branches are new information (`lb <= val < ceil`, `floor < val <= ub`).
+    pub(crate) fn fractional_int_split(&self) -> Option<ay_core::SplitRequest> {
+        let asserted_terms: Vec<TermId> = self.asserted.iter().map(|&(t, _)| t).collect();
+        let mut vars: Vec<TermId> = Vec::new();
+        for &t in &asserted_terms {
+            self.collect_int_var_leaves(t, &mut vars);
+        }
+        vars.sort_by_key(|t| t.0);
+        let lra = self.lia.lra_solver();
+        for v in vars {
+            let Some(val) = self.var_value(v) else {
+                continue;
+            };
+            if val.denom().is_one() {
+                continue;
+            }
+            if let Some((lb, ub)) = lra.get_bounds_ref(v) {
+                if lb.is_some_and(|b| b.value_big() > val)
+                    || ub.is_some_and(|b| b.value_big() < val)
+                {
+                    continue;
+                }
+            }
+            let floor = val.floor().to_integer();
+            let ceil = val.ceil().to_integer();
+            return Some(ay_core::SplitRequest {
+                variable: v,
+                value: val,
+                floor,
+                ceil,
+            });
+        }
+        None
+    }
+
     /// Tri-state exact verification of the CURRENT LIA model point against
     /// every asserted atom (#nia-scaled-patch-verify).
     ///
@@ -739,6 +1202,7 @@ impl NiaSolver<'_> {
     /// (the box is an arbitrary neighborhood, exhausting it proves nothing).
     pub(crate) fn try_model_repair_search(&mut self) -> Option<TheoryResult> {
         self.bounded_enum_model = None;
+        self.bounded_enum_bool_model.clear();
         // Mirror of try_bounded_enumeration: speculative tentative-patch scopes
         // pin variables to guessed points; drop them so the anchor is the real
         // relaxation model. (SAT-only, so this is purely about search quality.)
@@ -836,16 +1300,36 @@ impl NiaSolver<'_> {
             .collect();
         let centers: Vec<i64> = suspect_idx.iter().map(|&i| values[i]).collect();
         let mut offsets: Vec<i64> = vec![-cap; suspect_idx.len()];
+        // `cap` was chosen above so this power fits `MAX_ENUM_DOMAIN`.
+        let box_points = (2 * cap + 1).checked_pow(k)?;
         if self.debug {
             safe_eprintln!(
                 "[NIA] Repair search: {} suspects of {} vars, cap={} (box {})",
                 suspects.len(),
                 vars.len(),
                 cap,
-                (2 * cap + 1).pow(k)
+                box_points
             );
         }
+        let mut visited: i64 = 0;
         loop {
+            // Wall-clock abort (#nia-enum-deadline). SAT-only search: `None` is
+            // its ordinary "no witness in the neighbourhood" answer.
+            if self.enum_deadline_expired(visited) {
+                if self.debug {
+                    safe_eprintln!(
+                        "[NIA] Repair search: wall-clock deadline exceeded after {visited} \
+                         points — returning None (unknown)"
+                    );
+                }
+                return None;
+            }
+            // Defensive visit bound (#nia-enum-visit-bound).
+            if visited >= box_points {
+                return None;
+            }
+            visited += 1;
+
             for (j, &i) in suspect_idx.iter().enumerate() {
                 values[i] = centers[j].checked_add(offsets[j])?;
             }
@@ -977,6 +1461,7 @@ impl NiaSolver<'_> {
             }
         }
 
+        self.bounded_enum_bool_model.clear();
         self.bounded_enum_model = Some(model);
     }
 
@@ -984,15 +1469,11 @@ impl NiaSolver<'_> {
     ///
     /// Checks: (1) direct LRA bounds on the aux variable, (2) equality constraints
     /// in the asserted atoms like `(= area (* w h))` where `area` has bounds.
-    fn get_monomial_bounds(
-        &self,
-        mon: &Monomial,
-        lra: &ay_lra::LraSolver,
-    ) -> (Option<i64>, Option<i64>) {
+    fn get_monomial_bounds(&self, mon: &Monomial) -> (Option<i64>, Option<i64>) {
         // First try direct bounds on the monomial's auxiliary variable
-        let (mut lo, mut hi) = match self.get_integer_bounds(mon.aux_var, lra) {
+        let (mut lo, mut hi) = match self.get_integer_bounds(mon.aux_var) {
             Some((lo, hi)) => (Some(lo), Some(hi)),
-            None => self.get_partial_integer_bounds(mon.aux_var, lra),
+            None => self.get_partial_integer_bounds(mon.aux_var),
         };
 
         // If we still don't have both bounds, check asserted equality constraints.
@@ -1017,11 +1498,9 @@ impl NiaSolver<'_> {
                                 .terms
                                 .extract_integer_constant(other_term)
                                 .and_then(|n| n.to_i64().map(|i| (Some(i), Some(i))))
-                                .unwrap_or_else(|| {
-                                    match self.get_integer_bounds(other_term, lra) {
-                                        Some((lo, hi)) => (Some(lo), Some(hi)),
-                                        None => self.get_partial_integer_bounds(other_term, lra),
-                                    }
+                                .unwrap_or_else(|| match self.get_integer_bounds(other_term) {
+                                    Some((lo, hi)) => (Some(lo), Some(hi)),
+                                    None => self.get_partial_integer_bounds(other_term),
                                 });
                             if lo.is_none() {
                                 lo = other_lo;
@@ -1042,12 +1521,8 @@ impl NiaSolver<'_> {
     ///
     /// Unlike `get_integer_bounds` which requires both bounds, this returns
     /// whatever bounds are available.
-    fn get_partial_integer_bounds(
-        &self,
-        var: TermId,
-        lra: &ay_lra::LraSolver,
-    ) -> (Option<i64>, Option<i64>) {
-        let bounds = match lra.get_bounds(var) {
+    pub(crate) fn get_partial_integer_bounds(&self, var: TermId) -> (Option<i64>, Option<i64>) {
+        let bounds = match self.lia.justified_bounds(var) {
             Some(b) => b,
             None => return (None, None),
         };
@@ -1085,11 +1560,21 @@ impl NiaSolver<'_> {
 
     /// Get the integer lower and upper bounds for a variable.
     ///
+    /// JUSTIFIED bounds only (`LiaSolver::justified_bounds`,
+    /// #nia-sign-cut-soundness): the box these helpers build decides an
+    /// exhaustive-search `Unsat`, and a verdict may rest only on bounds whose
+    /// reasons are asserted atoms or cross-theory reasons (or sentinel
+    /// axioms). `undo_tentative_patch` already pops the NIA's own guess
+    /// scopes; reading through the accessor makes the box independent of
+    /// which scope any model-derived bound lives in. An unjustified side is
+    /// absent, so the box can only widen (fewer enumerations, never a wrong
+    /// one).
+    ///
     /// Returns `Some((lower, upper))` as i64 integers if the variable has
     /// finite bounds. For strict bounds on integers, adjusts to the nearest
     /// valid integer (e.g., x > 0 strict becomes x >= 1).
-    fn get_integer_bounds(&self, var: TermId, lra: &ay_lra::LraSolver) -> Option<(i64, i64)> {
-        let (lb_opt, ub_opt) = lra.get_bounds(var)?;
+    pub(crate) fn get_integer_bounds(&self, var: TermId) -> Option<(i64, i64)> {
+        let (lb_opt, ub_opt) = self.lia.justified_bounds(var)?;
 
         let lower = {
             let bound = lb_opt?;
@@ -1195,7 +1680,7 @@ impl NiaSolver<'_> {
     ///
     /// For each assertion, evaluates it under the given assignment and checks
     /// if the constraint holds.
-    fn check_assignment(&self, vars: &[TermId], values: &[i64]) -> Option<bool> {
+    pub(crate) fn check_assignment(&self, vars: &[TermId], values: &[i64]) -> Option<bool> {
         // Build a lookup map from variable -> value
         let var_map: HashMap<TermId, i64> =
             vars.iter().copied().zip(values.iter().copied()).collect();
@@ -1240,11 +1725,28 @@ impl NiaSolver<'_> {
         positive: bool,
         var_map: &HashMap<TermId, i64>,
     ) -> Option<bool> {
-        match self.terms.get(term) {
-            TermData::Not(inner) => self.eval_constraint_exact(*inner, !positive, var_map),
+        self.eval_constraint_exact_with_progress(term, positive, var_map, &mut || true)
+    }
+
+    /// The same arithmetic semantics with a cooperative caller-owned check.
+    /// A false progress result makes this evaluation inconclusive.
+    pub(crate) fn eval_constraint_exact_with_progress(
+        &self,
+        term: TermId,
+        positive: bool,
+        var_map: &HashMap<TermId, i64>,
+        progress: &mut impl FnMut() -> bool,
+    ) -> Option<bool> {
+        if !progress() {
+            return None;
+        }
+        let result = match self.terms.get(term) {
+            TermData::Not(inner) => {
+                self.eval_constraint_exact_with_progress(*inner, !positive, var_map, progress)
+            }
             TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-                let lhs_val = self.eval_term(args[0], var_map);
-                let rhs_val = self.eval_term(args[1], var_map);
+                let lhs_val = self.eval_term_with_progress(args[0], var_map, progress);
+                let rhs_val = self.eval_term_with_progress(args[1], var_map, progress);
 
                 match (lhs_val, rhs_val) {
                     (Some(l), Some(r)) => {
@@ -1263,6 +1765,11 @@ impl NiaSolver<'_> {
                 }
             }
             _ => None,
+        };
+        if progress() {
+            result
+        } else {
+            None
         }
     }
 
@@ -1273,7 +1780,21 @@ impl NiaSolver<'_> {
     /// Shared with the univariate-integer decider (`univariate_int.rs`) to
     /// materialize monomial aux-var values for the witness model.
     pub(crate) fn eval_term(&self, term: TermId, var_map: &HashMap<TermId, i64>) -> Option<BigInt> {
-        match self.terms.get(term) {
+        self.eval_term_with_progress(term, var_map, &mut || true)
+    }
+
+    /// Exact BigInt substitution, polling before/after each recursive visit.
+    /// It cannot preempt an individual BigInt operation or allocation.
+    pub(crate) fn eval_term_with_progress(
+        &self,
+        term: TermId,
+        var_map: &HashMap<TermId, i64>,
+        progress: &mut impl FnMut() -> bool,
+    ) -> Option<BigInt> {
+        if !progress() {
+            return None;
+        }
+        let result = match self.terms.get(term) {
             TermData::Var(_, _) => var_map.get(&term).map(|&v| BigInt::from(v)),
             TermData::Const(Constant::Int(n)) => Some(n.clone()),
             TermData::Const(Constant::Rational(r)) => {
@@ -1288,29 +1809,34 @@ impl NiaSolver<'_> {
                 "+" => {
                     let mut sum = BigInt::zero();
                     for &arg in args {
-                        sum += self.eval_term(arg, var_map)?;
+                        sum += self.eval_term_with_progress(arg, var_map, progress)?;
                     }
                     Some(sum)
                 }
                 "-" if args.len() == 1 => {
-                    let val = self.eval_term(args[0], var_map)?;
+                    let val = self.eval_term_with_progress(args[0], var_map, progress)?;
                     Some(-val)
                 }
                 "-" if args.len() == 2 => {
-                    let l = self.eval_term(args[0], var_map)?;
-                    let r = self.eval_term(args[1], var_map)?;
+                    let l = self.eval_term_with_progress(args[0], var_map, progress)?;
+                    let r = self.eval_term_with_progress(args[1], var_map, progress)?;
                     Some(l - r)
                 }
                 "*" => {
                     let mut prod = BigInt::one();
                     for &arg in args {
-                        prod *= self.eval_term(arg, var_map)?;
+                        prod *= self.eval_term_with_progress(arg, var_map, progress)?;
                     }
                     Some(prod)
                 }
                 _ => None,
             },
             _ => None,
+        };
+        if progress() {
+            result
+        } else {
+            None
         }
     }
 }
@@ -1830,5 +2356,606 @@ mod tests {
     fn test_rational_floor_large_negative_ratio() {
         let r = BigRational::new(BigInt::from(-1_000_000_002i64), BigInt::from(7));
         assert_eq!(rational_floor(&r), BigInt::from(-142_857_144i64));
+    }
+
+    // ====================================================================
+    // i64-rim regressions. Every raw i64 arithmetic site in this file that
+    // an asserted bound can drive to the edge of i64. NIA runs IN-PROCESS
+    // inside compiler_consumer, so an arithmetic panic here is an ICE that kills the
+    // compilation, never a verdict the caller can handle. Each input below
+    // is CONSTRUCTED to land on the exact overflowing operation (a random
+    // sweep of extremes does not get there), and each carries a companion on
+    // the same path over a small box that must still reach a real verdict —
+    // a "fix" that declined everything would pass the no-panic assertion
+    // alone and be useless.
+    // ====================================================================
+
+    /// Which enumeration entry point a constructed box is driven through.
+    #[derive(Clone, Copy)]
+    enum EnumEntry {
+        /// `try_bounded_enumeration`: exact decider, may answer Unsat.
+        Exhaustive,
+        /// `try_capped_model_search`: SAT-only search, never answers Unsat.
+        Capped,
+    }
+
+    /// Build `lo <= x <= hi`, `lo <= y <= hi`, `x*y != f` for each `f` in
+    /// `forbidden`, and `x*y = c` when `required` is `Some(c)`, all through
+    /// the real `assert_literal` ingestion path, then drive `entry`.
+    /// Returns the verdict and the recorded witness (if any).
+    fn enum_xy_box(
+        entry: EnumEntry,
+        lo: i64,
+        hi: i64,
+        forbidden: &[i64],
+        required: Option<i64>,
+    ) -> (Option<TheoryResult>, Option<HashMap<TermId, BigInt>>) {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let xy = terms.mk_mul(vec![x, y]);
+        let lo_c = terms.mk_int(BigInt::from(lo));
+        let hi_c = terms.mk_int(BigInt::from(hi));
+        let mut atoms = vec![
+            terms.mk_ge(x, lo_c),
+            terms.mk_le(x, hi_c),
+            terms.mk_ge(y, lo_c),
+            terms.mk_le(y, hi_c),
+        ];
+        for &f in forbidden {
+            let f_c = terms.mk_int(BigInt::from(f));
+            atoms.push(terms.mk_distinct(vec![xy, f_c]));
+        }
+        if let Some(c) = required {
+            let c_c = terms.mk_int(BigInt::from(c));
+            atoms.push(terms.mk_eq(xy, c_c));
+        }
+        let mut solver = NiaSolver::new(&terms);
+        for atom in atoms {
+            solver.assert_literal(atom, true);
+        }
+        let verdict = match entry {
+            EnumEntry::Exhaustive => solver.try_bounded_enumeration(),
+            EnumEntry::Capped => solver.try_capped_model_search(),
+        };
+        let model = solver.bounded_enum_model.clone();
+        (verdict, model)
+    }
+
+    /// Read the witness values of the two enumeration variables `x` and `y`
+    /// (by their term ids) as plain i64.
+    fn xy_witness(model: &HashMap<TermId, BigInt>, terms_x: TermId, terms_y: TermId) -> (i64, i64) {
+        let get = |t: TermId| {
+            model
+                .get(&t)
+                .and_then(|v| v.to_i64())
+                .expect("witness must assign every enumeration variable")
+        };
+        (get(terms_x), get(terms_y))
+    }
+
+    #[test]
+    fn domain_size_declines_instead_of_panicking_on_full_i64_range() {
+        // REGRESSION (2026-09-07, fixed in f5cfe26a9 WITHOUT a test). The
+        // domain-size admission check computed `hi - lo + 1` in raw i64,
+        // which PANICS ("attempt to subtract with overflow") for a variable
+        // bounded to the full i64 range — measured 20 times while compiler_consumer
+        // verified `ty`'s workspace. The bounds come straight from the
+        // asserted formula, so `[i64::MIN, i64::MAX]` is an ordinary input.
+        //
+        // The atom is `3*x*x != 27` on purpose: a positive `distinct` is
+        // opaque to the interval contractor (Phase 2.5), so nothing shrinks
+        // the box before it reaches the admission check. (`3*x*x = 27` would
+        // be contracted to `x ∈ [-3, 3]` and never touch the site.) The
+        // scaled product also routes `x` in as a scaled-product factor, not a
+        // registered monomial (#nia-const-factor), which is the shape the
+        // linearization cannot handle and enumeration exists for.
+        fn enumerate_scaled_square(lo: i64, hi: i64) -> (Option<TheoryResult>, Option<i64>) {
+            let mut terms = TermStore::new();
+            let x = terms.mk_var("x", Sort::Int);
+            let three = terms.mk_int(BigInt::from(3));
+            let sq3 = terms.mk_mul(vec![three, x, x]);
+            let c27 = terms.mk_int(BigInt::from(27));
+            let lo_c = terms.mk_int(BigInt::from(lo));
+            let hi_c = terms.mk_int(BigInt::from(hi));
+            let atoms = [
+                terms.mk_ge(x, lo_c),
+                terms.mk_le(x, hi_c),
+                terms.mk_distinct(vec![sq3, c27]),
+            ];
+            let mut solver = NiaSolver::new(&terms);
+            for atom in atoms {
+                solver.assert_literal(atom, true);
+            }
+            let verdict = solver.try_bounded_enumeration();
+            let witness = solver
+                .bounded_enum_model
+                .as_ref()
+                .and_then(|m| m.get(&x))
+                .and_then(|v| v.to_i64());
+            (verdict, witness)
+        }
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enumerate_scaled_square(i64::MIN, i64::MAX)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "try_bounded_enumeration panicked sizing the domain of x ∈ [i64::MIN, i64::MAX] \
+             — NIA runs inside compiler_consumer, so a panic here is an ICE, never a solver verdict"
+        );
+        let (verdict, _) = outcome.unwrap();
+        assert!(
+            verdict.is_none(),
+            "a range too wide to size is a domain too wide to enumerate: the only sound \
+             answer is None (not applicable), never a verdict from a saturated size; got \
+             {verdict:?}"
+        );
+
+        // ANTI-VACUITY: the same path over a small box still decides.
+        // x ∈ [-3, 3]: x = ±3 gives 3*9 = 27 (violates), anything else is a
+        // witness — enumeration must find one.
+        let (verdict, witness) = enumerate_scaled_square(-3, 3);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "small box must still be enumerated to a real verdict, got {verdict:?}"
+        );
+        let w = witness.expect("Sat must record an exact integer witness");
+        assert!(
+            (-3..=3).contains(&w) && 3 * w * w != 27,
+            "witness {w} is not a model"
+        );
+        // x ∈ [3, 3]: the single point violates the atom, so exhaustive
+        // enumeration proves UNSAT.
+        let (verdict, _) = enumerate_scaled_square(3, 3);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "exhausting a box with no model must answer Unsat, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn lower_bound_inference_computes_ceil_without_overflow_near_i64_max() {
+        // REGRESSION (2026-09-10). Phase 2's lower-bound inference computed
+        // `ceil(l / d)` as `(l + d - 1) / d` in raw i64. With `l` (the
+        // monomial's lower bound) near i64::MAX and `d` (the product of the
+        // other factors' upper bounds) above 1, the intermediate sum PANICS —
+        // "attempt to add with overflow" — a refuter reproduced it with a
+        // 3-assertion QF_NIA input; the atoms below rebuild that shape. The
+        // quotient itself always fits
+        // (`1 <= ceil(l/d) <= l`), so the fix computes it as `(l - 1) / d + 1`.
+        //
+        // Reaching the site needs: `x` with NO lower bound (so the inference
+        // fires), `y` strictly positive with `d = 2`, and the aux bound
+        // `x*y = i64::MAX` read through `get_monomial_bounds`. With the exact
+        // ceiling, `x >= 2^62` contradicts `x <= 10`, so the box is empty and
+        // the decider correctly declines (None) — it never claims a verdict.
+        fn infer_lower(
+            aux_value: i64,
+            x_hi: i64,
+            leading_atom: Option<fn(&mut TermStore, TermId) -> TermId>,
+        ) -> (Option<TheoryResult>, Option<(i64, i64)>) {
+            let mut terms = TermStore::new();
+            let x = terms.mk_var("x", Sort::Int);
+            let y = terms.mk_var("y", Sort::Int);
+            let xy = terms.mk_mul(vec![x, y]);
+            let mut atoms = Vec::new();
+            if let Some(mk) = leading_atom {
+                atoms.push(mk(&mut terms, y));
+            }
+            let one = terms.mk_int(BigInt::from(1));
+            let two = terms.mk_int(BigInt::from(2));
+            let x_hi_c = terms.mk_int(BigInt::from(x_hi));
+            let aux_c = terms.mk_int(BigInt::from(aux_value));
+            atoms.push(terms.mk_eq(xy, aux_c));
+            atoms.push(terms.mk_ge(y, one));
+            atoms.push(terms.mk_le(y, two));
+            atoms.push(terms.mk_le(x, x_hi_c));
+            let mut solver = NiaSolver::new(&terms);
+            for atom in atoms {
+                solver.assert_literal(atom, true);
+            }
+            let verdict = solver.try_bounded_enumeration();
+            let witness = solver
+                .bounded_enum_model
+                .as_ref()
+                .map(|m| xy_witness(m, x, y));
+            (verdict, witness)
+        }
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            infer_lower(i64::MAX, 10, None)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "try_bounded_enumeration panicked inferring x >= ceil(i64::MAX / 2) — NIA runs \
+             inside compiler_consumer, so a panic here is an ICE, never a solver verdict"
+        );
+        let (verdict, _) = outcome.unwrap();
+        assert!(
+            verdict.is_none(),
+            "x >= 2^62 ∧ x <= 10 leaves no box to enumerate; the decider must decline \
+             (None), got {verdict:?}"
+        );
+
+        // ANTI-VACUITY 1: the same inference over small numbers still
+        // completes the box and reaches a real verdict. `x*y = 6`, `y ∈ [1,2]`,
+        // `x <= 10` infers `x >= ceil(6/2) = 3`; the box `[3,10]×[1,2]` holds
+        // the model (3, 2).
+        let (verdict, witness) = infer_lower(6, 10, None);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "small-number inference must still complete the box to Sat, got {verdict:?}"
+        );
+        let (wx, wy) = witness.expect("Sat must record an exact integer witness");
+        assert!((3..=10).contains(&wx) && (1..=2).contains(&wy) && wx * wy == 6);
+
+        // ANTI-VACUITY 2 (isolates Phase 2 from the interval contractor,
+        // which can derive the same `x >= 3` on its own): a LEADING atom
+        // `y*y = 5` is unsatisfiable on `y ∈ [1,2]`, so the contractor hits
+        // an empty intersection on it and stops before touching `x*y = 6`
+        // (it keeps prior tightenings, derives no more, draws no verdict).
+        // Only Phase 2 then supplies `x >= 3`; with it the box is complete and
+        // exhaustive enumeration PROVES Unsat. A Phase 2 that skipped the
+        // inference would leave `x` unbounded below and answer None instead.
+        fn y_squared_is_5(terms: &mut TermStore, y: TermId) -> TermId {
+            let yy = terms.mk_mul(vec![y, y]);
+            let five = terms.mk_int(BigInt::from(5));
+            terms.mk_eq(yy, five)
+        }
+        let (verdict, _) = infer_lower(6, 10, Some(y_squared_is_5));
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "Phase 2 alone must complete the box so enumeration proves Unsat, got {verdict:?}"
+        );
+
+        // EXACTNESS AT THE RIM: the no-panic check above cannot tell the exact
+        // ceiling from a saturated `(l.saturating_add(d - 1)) / d`, because
+        // with `x <= 10` both `x >= 2^62` (exact) and `x >= 2^62 - 1` (the
+        // saturated floor) empty the box and decline. So put the domain
+        // exactly AT the cap: `x <= 2^62 + 4999` with `d = 2` gives the exact
+        // box `[2^62, 2^62 + 4999] × [1, 2]`, 10_000 points = MAX_ENUM_DOMAIN,
+        // admitted and exhausted to a PROVEN Unsat (`x*y = i64::MAX` needs
+        // `y = 1`, `x = i64::MAX`, outside the box; `y = 2` cannot produce an
+        // odd product — and `y*y = 5` is false throughout anyway). The
+        // saturated floor is one point lower, 5001 × 2 = 10_002 > cap, and
+        // the decider declines (None) instead. Same leading atom, so the
+        // contractor stays out of it and only Phase 2 supplies the bound.
+        // `MAX_ENUM_DOMAIN / 2 - 1` = 4999: the x-width that makes the 2-wide box
+        // exactly MAX_ENUM_DOMAIN points, so the test moves with the cap.
+        let (verdict, _) = infer_lower(
+            i64::MAX,
+            (1i64 << 62) + (MAX_ENUM_DOMAIN / 2 - 1),
+            Some(y_squared_is_5),
+        );
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "the exact ceiling x >= 2^62 keeps the box at MAX_ENUM_DOMAIN so enumeration \
+             proves Unsat; a floor/saturated bound widens it past the cap and declines — \
+             got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn exhaustive_odometer_reaches_i64_max_without_overflow() {
+        // REGRESSION (2026-09-10). The odometer in `try_bounded_enumeration`
+        // did `assignment[i] += 1` BEFORE comparing against `hi`, so a digit
+        // with `hi == i64::MAX` computed `i64::MAX + 1` on the last step —
+        // "attempt to add with overflow", an ICE inside compiler_consumer. Such a box is
+        // admitted: the domain-size check only caps the WIDTH, so
+        // `[i64::MAX - 1, i64::MAX]²` (4 points) passes. `x*y = 2` has no
+        // model there (both factors exceed 2), so enumeration must walk to the
+        // last point and then step past it to conclude Unsat. The contractor
+        // cannot pre-empt this: its forward interval for `x*y` excludes 2, an
+        // empty intersection, which stops it without tightening anything.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enum_xy_box(EnumEntry::Exhaustive, i64::MAX - 1, i64::MAX, &[], Some(2))
+        }));
+        assert!(
+            outcome.is_ok(),
+            "try_bounded_enumeration panicked stepping the odometer past x = y = i64::MAX \
+             — NIA runs inside compiler_consumer, so a panic here is an ICE, never a solver verdict"
+        );
+        let (verdict, _) = outcome.unwrap();
+        match verdict {
+            Some(TheoryResult::Unsat(conflict)) => assert_eq!(
+                conflict.len(),
+                5,
+                "the Unsat conflict must cite every asserted atom (4 bounds + x*y = 2)"
+            ),
+            other => panic!(
+                "exhausting [i64::MAX-1, i64::MAX]² with x*y = 2 must be Unsat, got {other:?}"
+            ),
+        }
+
+        // ANTI-VACUITY: the same odometer over `[1,2]²` visits every point in
+        // order. `x*y != 1` and `x*y != 2` reject (1,1), (1,2) and (2,1); the
+        // witness must be the LAST point (2,2), proving the odometer walked the
+        // whole box rather than short-circuiting.
+        let (verdict, model) = enum_xy_box(EnumEntry::Exhaustive, 1, 2, &[1, 2], None);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "got {verdict:?}"
+        );
+        let model = model.expect("Sat must record an exact integer witness");
+        let mut vals: Vec<i64> = model.values().filter_map(|v| v.to_i64()).collect();
+        vals.sort_unstable();
+        assert_eq!(
+            vals,
+            vec![2, 2, 4],
+            "witness must be x = 2, y = 2 (x*y = 4)"
+        );
+        // And forbidding 4 as well exhausts the box to Unsat.
+        let (verdict, _) = enum_xy_box(EnumEntry::Exhaustive, 1, 2, &[1, 2, 4], None);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "exhausting [1,2]² with every product forbidden must be Unsat, got {verdict:?}"
+        );
+    }
+
+    // ====================================================================
+    // Wall-clock deadline regressions (#nia-enum-deadline).
+    //
+    // MEASURED 2026-09-11: a `offline deductive checker check` obligation from
+    // `ay_sat::symmetry::detector::cc_vertex_classes` pinned one rustc thread
+    // at 100% CPU for 7h12m under a 15 s per-function budget. Every sample
+    // landed inside ONE `try_capped_model_search` activation. The deadline had
+    // reached `NiaSolver::deadline` intact; nothing on the enumeration path
+    // ever read it. These tests fix the contract: with an expired deadline
+    // every enumeration returns its "no claim" answer promptly, and with a
+    // live deadline the same query still reaches its real verdict.
+    // ====================================================================
+
+    /// Build the same `x, y ∈ [lo, hi] ∧ x*y = c` box as [`enum_xy_box`] but
+    /// install `deadline` on the solver before driving `entry`.
+    fn enum_xy_box_with_deadline(
+        entry: EnumEntry,
+        lo: i64,
+        hi: i64,
+        required: i64,
+        deadline: ay_core::time::Instant,
+    ) -> Option<TheoryResult> {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let xy = terms.mk_mul(vec![x, y]);
+        let lo_c = terms.mk_int(BigInt::from(lo));
+        let hi_c = terms.mk_int(BigInt::from(hi));
+        let c_c = terms.mk_int(BigInt::from(required));
+        let atoms = [
+            terms.mk_ge(x, lo_c),
+            terms.mk_le(x, hi_c),
+            terms.mk_ge(y, lo_c),
+            terms.mk_le(y, hi_c),
+            terms.mk_eq(xy, c_c),
+        ];
+        let mut solver = NiaSolver::new(&terms);
+        for atom in atoms {
+            solver.assert_literal(atom, true);
+        }
+        solver.set_deadline(deadline);
+        match entry {
+            EnumEntry::Exhaustive => solver.try_bounded_enumeration(),
+            EnumEntry::Capped => solver.try_capped_model_search(),
+        }
+    }
+
+    /// An instant already in the past — an exhausted budget.
+    fn expired() -> ay_core::time::Instant {
+        ay_core::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the monotonic clock is more than a second past its epoch")
+    }
+
+    /// A budget that cannot plausibly expire during a 10k-point enumeration.
+    fn far_future() -> ay_core::time::Instant {
+        ay_core::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn capped_search_returns_none_promptly_on_expired_deadline() {
+        // A box at the full MAX_ENUM_DOMAIN budget: `[1, 100]²` is 10_000
+        // points, each one an exact BigInt evaluation of five atoms. With the
+        // deadline already gone the search must decline before walking it.
+        let start = ay_core::time::Instant::now();
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Capped, 1, 100, 7, expired());
+        let took = start.elapsed();
+        assert!(
+            verdict.is_none(),
+            "an expired deadline must abort the capped search at its existing \
+             no-witness answer (None), never a verdict — got {verdict:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "the capped search must abort at the FIRST poll, not after the box \
+             — took {took:?}"
+        );
+
+        // ANTI-VACUITY: the identical query under a live deadline still walks
+        // the box and finds the witness (1*7 = 7 is inside `[1,100]²`). A
+        // "fix" that declined whenever a deadline was installed would pass the
+        // assertion above and be useless.
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Capped, 1, 100, 7, far_future());
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "with budget left the capped search must still verify x*y = 7 — got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn exhaustive_enumeration_declines_instead_of_claiming_unsat_on_expired_deadline() {
+        // `x, y ∈ [1, 100] ∧ x*y = 9973` (prime, > 100²-reachable only as
+        // 1*9973) is UNSAT over the box, so the decider's normal answer is
+        // Unsat after 10_000 points. Aborting must NOT fall out of the loop —
+        // that exit IS the Unsat claim — so the verdict must be None.
+        let start = ay_core::time::Instant::now();
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Exhaustive, 1, 100, 9973, expired());
+        let took = start.elapsed();
+        assert!(
+            verdict.is_none(),
+            "an expired deadline must abort the exhaustive decider at None \
+             (not applicable); exhausting the box is the ONLY licence for its \
+             Unsat — got {verdict:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "the exhaustive decider must abort at the FIRST poll — took {took:?}"
+        );
+
+        // ANTI-VACUITY: with budget left the same box IS exhausted and the
+        // genuine Unsat comes back.
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Exhaustive, 1, 100, 9973, far_future());
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "with budget left the box must still be exhausted to Unsat — got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn capped_search_polls_the_deadline_while_walking_the_box() {
+        // The poll must fire INSIDE the walk, not only on entry. Calibrate
+        // first: walk the full 10_000-point box with no usable budget pressure
+        // and measure it, then re-run with a budget that is a small fraction of
+        // that and require the answer back near the budget rather than near the
+        // full walk.
+        let start = ay_core::time::Instant::now();
+        let full = enum_xy_box_with_deadline(EnumEntry::Capped, 1, 100, 9973, far_future());
+        let full_took = start.elapsed();
+        assert!(
+            full.is_none(),
+            "x*y = 9973 (prime, > 100) has no witness in [1,100]²; the capped \
+             window proves nothing, so the answer is None — got {full:?}"
+        );
+
+        let budget = std::time::Duration::from_millis(1);
+        let start = ay_core::time::Instant::now();
+        let verdict = enum_xy_box_with_deadline(
+            EnumEntry::Capped,
+            1,
+            100,
+            9973,
+            ay_core::time::Instant::now() + budget,
+        );
+        let took = start.elapsed();
+        assert!(verdict.is_none(), "got {verdict:?}");
+
+        // Only assert the cut when the full walk is long enough for a 1 ms
+        // budget to be distinguishable at all; on a machine fast enough to
+        // finish the whole box inside a few budgets there is nothing to
+        // measure. On THIS hardware the full walk is tens of microseconds, so
+        // the guard never fires and this assertion alone would be vacuous —
+        // which is why the poll COUNT below, not the clock, is what pins the
+        // contract.
+        if full_took >= budget * 4 {
+            assert!(
+                took <= budget + full_took / 4 + std::time::Duration::from_millis(2),
+                "the mid-walk poll must cut the walk short: budget {budget:?}, \
+                 unbounded walk {full_took:?}, aborted walk {took:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enumerations_poll_the_deadline_once_per_256_points_not_only_on_entry() {
+        // REGRESSION (2026-09-11, review of the deadline commit). The two
+        // expired-deadline tests above are both discharged by the ENTRY poll
+        // alone (`visited == 0`), and the calibration test's cut assertion is
+        // gated behind a 4 ms floor that a 10_000-point box never reaches here
+        // — so weakening `enum_deadline_expired` to poll once and never again
+        // left the whole suite green. That weakened shape IS the defect: the
+        // 7h12m hang was ONE `try_capped_model_search` activation that had
+        // already passed its entry.
+        //
+        // Counting polls pins the property exactly and without a clock: an
+        // entry-only poll counts 1, the real thing counts one per
+        // ENUM_DEADLINE_POLL_POINTS points walked.
+        let min_polls = (10_000 / ENUM_DEADLINE_POLL_POINTS) as u64;
+
+        // `x*y = 9973` (prime, > 100) has no witness anywhere in `[1,100]²`,
+        // so both entries walk all 10_000 points with a budget that never
+        // expires — the longest walk either routine admits.
+        reset_enum_deadline_polls();
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Capped, 1, 100, 9973, far_future());
+        let capped_polls = enum_deadline_polls();
+        assert!(verdict.is_none(), "got {verdict:?}");
+        assert!(
+            capped_polls >= min_polls,
+            "try_capped_model_search must read the clock every \
+             {ENUM_DEADLINE_POLL_POINTS} points of the 10_000-point box \
+             (>= {min_polls} polls), got {capped_polls} — an entry-only poll \
+             counts 1 and is exactly what spun for 7h12m"
+        );
+
+        // The exhaustive decider first CONTRACTS the box (its intervals are
+        // derived from the real constraints), so the walk it actually performs
+        // is smaller than 10_000 points and its poll count is the contracted
+        // box's, not the nominal one: `x*y = 2003` (prime) leaves ~2_000 points
+        // here. The property under test is the same — more than the single
+        // entry poll — so assert against the walk it really does.
+        reset_enum_deadline_polls();
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Exhaustive, 1, 100, 2003, far_future());
+        let exhaustive_polls = enum_deadline_polls();
+        assert!(
+            matches!(verdict, Some(TheoryResult::Unsat(_))),
+            "x*y = 2003 (prime, > 100) has no model in [1,100]², so the box must \
+             be exhausted to Unsat — got {verdict:?}"
+        );
+        assert!(
+            exhaustive_polls >= 4,
+            "try_bounded_enumeration must read the clock every \
+             {ENUM_DEADLINE_POLL_POINTS} points of the box it walks (>= 1_024 \
+             points here), got {exhaustive_polls} polls — 1 means entry-only"
+        );
+
+        // ANTI-VACUITY for the counter itself: it counts polls, not calls, so
+        // a routine that never enumerates registers none.
+        reset_enum_deadline_polls();
+        let verdict = enum_xy_box_with_deadline(EnumEntry::Capped, 1, 1, 7, far_future());
+        assert!(verdict.is_none(), "1*1 != 7, got {verdict:?}");
+        assert_eq!(
+            enum_deadline_polls(),
+            1,
+            "a single-point box polls exactly once (its entry poll)"
+        );
+    }
+
+    #[test]
+    fn capped_search_odometer_reaches_i64_max_without_overflow() {
+        // REGRESSION (2026-09-10). Same defect, second odometer:
+        // `try_capped_model_search` incremented before comparing, so a
+        // genuine bound `hi == i64::MAX` overflowed on the last step. Its
+        // admission is the same width cap, so `[i64::MAX - 1, i64::MAX]²`
+        // is searched in full. This entry is SAT-only: exhausting the window
+        // without a witness must answer None (unknown), never Unsat.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enum_xy_box(EnumEntry::Capped, i64::MAX - 1, i64::MAX, &[], Some(2))
+        }));
+        assert!(
+            outcome.is_ok(),
+            "try_capped_model_search panicked stepping the odometer past x = y = i64::MAX \
+             — NIA runs inside compiler_consumer, so a panic here is an ICE, never a solver verdict"
+        );
+        let (verdict, _) = outcome.unwrap();
+        assert!(
+            verdict.is_none(),
+            "the capped window is artificial, so exhausting it proves nothing: None, got \
+             {verdict:?}"
+        );
+
+        // ANTI-VACUITY: the capped odometer over `[1,2]²` still walks to the
+        // last point (2,2) and returns the verified witness.
+        let (verdict, model) = enum_xy_box(EnumEntry::Capped, 1, 2, &[1, 2], None);
+        assert!(
+            matches!(verdict, Some(TheoryResult::Sat)),
+            "got {verdict:?}"
+        );
+        let model = model.expect("Sat must record an exact integer witness");
+        let mut vals: Vec<i64> = model.values().filter_map(|v| v.to_i64()).collect();
+        vals.sort_unstable();
+        assert_eq!(
+            vals,
+            vec![2, 2, 4],
+            "witness must be x = 2, y = 2 (x*y = 4)"
+        );
     }
 }

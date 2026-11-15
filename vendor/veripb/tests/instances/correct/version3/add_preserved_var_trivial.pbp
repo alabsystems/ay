@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+f 5;
+preserved_add x5 : 1 x1 >= -1 ;
+preserved_add x6 : 1 x1 >= 10 ;
+preserved_add x7 : 1 x1 >= 0 ;
+preserved_add x8 : 1 x1 >= 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

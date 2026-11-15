@@ -7,6 +7,8 @@
 //! Verifies DRAT and LRAT proofs against DIMACS CNF formulas.
 //! Replaces the standalone ay-drat-check and ay-lrat-check binaries.
 
+mod veripb;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +47,11 @@ const CHC_QUOTIENT_CHECK_REPORT_SCHEMA: &str = "ay.chc.quotient-certificate-chec
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub(crate) enum CheckCommand {
+    /// Verify a pseudo-Boolean certificate with the integrated VeriPB checker.
+    ///
+    /// Only a substantive conclusion with fully checked guarantees succeeds.
+    /// Results under assertions or weakened guarantees are reported and refused.
+    Veripb(ay_veripb::args::Args),
     #[cfg(ay_internal_tools)]
     /// Run the fail-closed recursive-LIA CHC quotient certificate checker.
     ///
@@ -67,6 +74,23 @@ pub(crate) enum CheckCommand {
         /// Emit the quotient checker JSON report.
         #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
         json: bool,
+    },
+
+    /// Refuse an Alethe proof whose pinned-Carcara verdict is not evidence.
+    ///
+    /// Scans PROOF and PROBLEM (the exact files handed to `carcara check`)
+    /// for an `evaluate` step pinned carcara 1.1.0 computes wrongly, or a
+    /// binder it misreads through a `:named` label or `define-fun`. Prints
+    /// `pinned-carcara-guard: clean` (exit 0), or `pinned-carcara-guard:
+    /// refused` and one line per flagged step or binder (exit 1). For the
+    /// scripts that run Carcara themselves; every Rust gate calls the same
+    /// scan (`ay_core::pinned_carcara`).
+    #[command(hide = true)]
+    CarcaraGuard {
+        /// Alethe proof file (Carcara's first operand)
+        proof: PathBuf,
+        /// SMT-LIB problem file (Carcara's second operand)
+        problem: PathBuf,
     },
 
     /// Verify a DRAT/DRUP proof against a DIMACS CNF formula.
@@ -307,6 +331,7 @@ struct FmlaPostcheckAdmissionOutcome {
 /// Entry point for `ay check` subcommands.
 pub(crate) fn run(command: CheckCommand) -> anyhow::Result<()> {
     match command {
+        CheckCommand::Veripb(args) => veripb::run(args),
         #[cfg(ay_internal_tools)]
         CheckCommand::ChcQuotient {
             problem,
@@ -314,6 +339,7 @@ pub(crate) fn run(command: CheckCommand) -> anyhow::Result<()> {
             emit,
             json: _,
         } => run_chc_quotient_check(&problem, &certificate, &emit),
+        CheckCommand::CarcaraGuard { proof, problem } => carcara_guard::run(&proof, &problem),
         CheckCommand::Drat {
             formula,
             proof,
@@ -2045,6 +2071,8 @@ fn run_lrat_check(formula: &Path, proof: &Path, evidence: EvidenceConfig) -> any
         std::process::exit(1);
     }
 }
+
+mod carcara_guard;
 
 #[cfg(test)]
 mod tests {

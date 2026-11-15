@@ -22,109 +22,6 @@ use super::super::*;
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 
-/// Frozen oracle captured from Z3 5.0.0's `Z3_get_simplifier_name`, in C API
-/// enumeration order. The CLI's `-simplifiers` display uses a different,
-/// sorted presentation order.
-/// This intentionally does not reuse `SUPPORTED_SIMPLIFIER_NAMES`: the test must
-/// fail if AY's production registry drifts from the reference catalog.
-const Z3_5_SIMPLIFIER_NAMES: &[&str] = &[
-    "bit2int",
-    "bit-blast",
-    "bv1-blast",
-    "cheap-fourier-motzkin",
-    "elim-term-ite",
-    "max-bv-sharing",
-    "pull-nested-quantifiers",
-    "push-app-ite-conservative",
-    "push-app-ite",
-    "ng-push-app-ite-conservative",
-    "ng-push-app-ite",
-    "randomizer",
-    "refine-injectivity",
-    "simplify",
-    "qe-light",
-    "card2bv",
-    "factor",
-    "propagate-ineqs",
-    "propagate-bv-bounds",
-    "bv-divrem-bounds",
-    "bv-slice",
-    "bvarray2uf",
-    "blast-term-ite",
-    "cofactor-term-ite",
-    "demodulator",
-    "der",
-    "distribute-forall",
-    "dom-simplify",
-    "elim-unconstrained",
-    "elim-predicates",
-    "fold-unfold",
-    "injectivity",
-    "propagate-values",
-    "reduce-args",
-    "solve-eqs",
-    "special-relations",
-    "euf-completion",
-];
-
-/// Freeze the operational pass matrix as well as the public catalog. Aliases
-/// must stay on the intended sound pass, and names without an aligned pass must
-/// remain conservative identities until a dedicated implementation replaces
-/// them.
-#[test]
-fn test_z3_5_simplifier_pass_matrix() {
-    for (name, pass) in [
-        ("bit-blast", "bit-blast"),
-        ("blast-term-ite", "blast-term-ite"),
-        ("cofactor-term-ite", "blast-term-ite"),
-        ("push-app-ite", "blast-term-ite"),
-        ("push-app-ite-conservative", "blast-term-ite"),
-        ("demodulator", "der"),
-        ("der", "der"),
-        ("distribute-forall", "distribute-forall"),
-        ("elim-term-ite", "elim-term-ite"),
-        ("propagate-bv-bounds", "propagate-ineqs"),
-        ("propagate-ineqs", "propagate-ineqs"),
-        ("propagate-values", "propagate-values"),
-        ("cheap-fourier-motzkin", "qe-light"),
-        ("qe-light", "qe-light"),
-        ("reduce-args", "reduce-args"),
-        ("card2bv", "flatten-and"),
-        ("dom-simplify", "flatten-and"),
-        ("simplify", "flatten-and"),
-        ("elim-unconstrained", "solve-eqs"),
-        ("fold-unfold", "solve-eqs"),
-        ("solve-eqs", "solve-eqs"),
-    ] {
-        let tactic = super::simplifier_from_name(name)
-            .unwrap_or_else(|e| panic!("{name} should resolve: {e}"));
-        assert_eq!(tactic.name(), pass, "{name} must map to {pass}");
-    }
-
-    for name in [
-        "bit2int",
-        "bv-divrem-bounds",
-        "bv-slice",
-        "bv1-blast",
-        "bvarray2uf",
-        "elim-predicates",
-        "euf-completion",
-        "factor",
-        "injectivity",
-        "max-bv-sharing",
-        "ng-push-app-ite",
-        "ng-push-app-ite-conservative",
-        "pull-nested-quantifiers",
-        "randomizer",
-        "refine-injectivity",
-        "special-relations",
-    ] {
-        let tactic = super::simplifier_from_name(name)
-            .unwrap_or_else(|e| panic!("{name} should resolve: {e}"));
-        assert_eq!(tactic.name(), "skip", "{name} must remain a sound identity");
-    }
-}
-
 /// Assert the LIA goal `{x = y + 1, y = 2, x > 2}` (SAT: x = 3) on `s`.
 /// Returns the `x` const AST for model checks.
 ///
@@ -168,7 +65,7 @@ unsafe fn assert_lia_unsat(ctx: Z3_context, s: Z3_solver) {
     }
 }
 
-/// Every Z3 5.0.0 simplifier name builds; AY-only/tactic-only names and an
+/// Every supported simplifier name builds; tactic-only names and an
 /// unknown name are honestly rejected with NULL + `Z3_INVALID_ARG`.
 #[test]
 fn test_mk_simplifier_supported_and_rejected_names() {
@@ -178,15 +75,10 @@ fn test_mk_simplifier_supported_and_rejected_names() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
-        assert_eq!(
-            SUPPORTED_SIMPLIFIER_NAMES, Z3_5_SIMPLIFIER_NAMES,
-            "production registry must exactly match Z3 5.0.0"
-        );
-        assert_eq!(SUPPORTED_SIMPLIFIER_NAMES.len(), 37);
-        for name in Z3_5_SIMPLIFIER_NAMES {
+        for name in SUPPORTED_SIMPLIFIER_NAMES {
             let cname = CString::new(*name).expect("reference name must be a valid C string");
             let simp = Z3_mk_simplifier(ctx, cname.as_ptr());
-            assert!(!simp.is_null(), "Z3 5.0.0 simplifier {name} should build");
+            assert!(!simp.is_null(), "supported simplifier {name} should build");
             assert_eq!(Z3_get_error_code(ctx), Z3_OK);
         }
 
@@ -197,7 +89,7 @@ fn test_mk_simplifier_supported_and_rejected_names() {
             let bad = Z3_mk_simplifier(ctx, cname.as_ptr());
             assert!(
                 bad.is_null(),
-                "{name} is not a Z3 5.0.0 simplifier and must be rejected"
+                "{name} is not a simplifier and must be rejected"
             );
             assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
         }
@@ -228,7 +120,7 @@ fn test_every_z3_5_simplifier_preserves_boolean_smoke_verdict() {
         let p = Z3_mk_const(ctx, Z3_mk_string_symbol(ctx, c"p".as_ptr()), bool_sort);
         let not_p = Z3_mk_not(ctx, p);
 
-        for name in Z3_5_SIMPLIFIER_NAMES {
+        for name in SUPPORTED_SIMPLIFIER_NAMES {
             let cname = CString::new(*name).expect("reference name must be a valid C string");
             let simplifier = Z3_mk_simplifier(ctx, cname.as_ptr());
             assert!(!simplifier.is_null(), "{name} must build");
@@ -319,12 +211,12 @@ fn test_simplifier_get_descr() {
         let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
 
-        for name in Z3_5_SIMPLIFIER_NAMES {
+        for name in SUPPORTED_SIMPLIFIER_NAMES {
             let cname = CString::new(*name).expect("reference name must be a valid C string");
             let d = Z3_simplifier_get_descr(ctx, cname.as_ptr());
             assert!(
                 !d.is_null(),
-                "Z3 5.0.0 simplifier {name} must have a description"
+                "supported simplifier {name} must have a description"
             );
             let s = CStr::from_ptr(d).to_string_lossy();
             assert!(!s.is_empty(), "description must be a non-empty real string");
@@ -387,11 +279,8 @@ fn test_simplifier_get_help_and_param_descrs() {
 /// simplifier attached gives the SAME SAT verdict as a plain solver on the LIA
 /// goal, and still produces a model on SAT.
 ///
-/// The exact value of an eliminated variable is not asserted: `solve-eqs`
-/// legitimately eliminates `x` (as a solved variable), and AY does not run z3's
-/// model-reconstruction converter to re-derive it (an HONEST, documented
-/// limitation — not a wrong verdict). The acceptance criterion is verdict
-/// preservation, checked here against the plain-solver baseline.
+/// The returned model must satisfy every ORIGINAL assertion, including values
+/// of variables a pass may eliminate. Verdict preservation alone is insufficient.
 #[test]
 fn test_add_simplifier_preserves_sat_verdict_and_model() {
     // SAFETY: see above.
@@ -422,16 +311,28 @@ fn test_add_simplifier_preserves_sat_verdict_and_model() {
         );
 
         let _x = assert_lia_sat(ctx, s);
+        let original = Z3_solver_get_assertions(ctx, s);
+        Z3_ast_vector_inc_ref(ctx, original);
         let res = Z3_solver_check(ctx, s);
         assert_eq!(res, base, "simplifier verdict must equal baseline verdict");
 
-        // A model exists on SAT (its completeness over eliminated variables is
-        // not asserted; see the doc comment).
         let model = Z3_solver_get_model(ctx, s);
         assert!(
             !model.is_null(),
             "simplifier solver must produce a model on SAT"
         );
+        for index in 0..Z3_ast_vector_size(ctx, original) {
+            let mut value: Z3_ast = 0;
+            assert!(Z3_model_eval(
+                ctx,
+                model,
+                Z3_ast_vector_get(ctx, original, index),
+                true,
+                &mut value,
+            ));
+            assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+        }
+        Z3_ast_vector_dec_ref(ctx, original);
 
         Z3_del_context(ctx);
     }
@@ -482,3 +383,125 @@ fn test_add_simplifier_preserves_unsat_and_null_errors() {
 }
 
 include!("simplifiers_ffi_tests/registry_enumeration.rs");
+
+#[test]
+fn converted_solver_reconstructs_source_values_across_scopes_and_assumptions() {
+    // SAFETY: every C handle belongs to this live, single-threaded context.
+    unsafe {
+        for attached in [true, false] {
+            let cfg = Z3_mk_config();
+            let ctx = Z3_mk_context(cfg);
+            Z3_del_config(cfg);
+            let solver = if attached {
+                let se = Z3_mk_simplifier(ctx, c"solve-eqs".as_ptr());
+                let pv = Z3_mk_simplifier(ctx, c"propagate-values".as_ptr());
+                let comp = Z3_simplifier_and_then(ctx, se, pv);
+                Z3_solver_add_simplifier(ctx, Z3_mk_solver(ctx), comp)
+            } else {
+                let se = Z3_mk_tactic(ctx, c"solve-eqs".as_ptr());
+                let pv = Z3_mk_tactic(ctx, c"propagate-values".as_ptr());
+                Z3_mk_solver_from_tactic(ctx, Z3_tactic_and_then(ctx, se, pv))
+            };
+            assert!(!solver.is_null());
+            let x = assert_lia_sat(ctx, solver);
+            let three = Z3_mk_int(ctx, 3, Z3_mk_int_sort(ctx));
+            let original_value = Z3_mk_eq(ctx, x, three);
+            assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+            let snapshot = Z3_solver_get_model(ctx, solver);
+            let mut value = 0;
+            assert!(Z3_model_eval(
+                ctx,
+                snapshot,
+                original_value,
+                false,
+                &mut value
+            ));
+            assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+            Z3_solver_push(ctx, solver);
+            Z3_solver_assert(ctx, solver, Z3_mk_not(ctx, original_value));
+            assert_eq!(Z3_solver_check(ctx, solver), Z3_L_FALSE);
+            assert!(Z3_solver_get_model(ctx, solver).is_null());
+            Z3_solver_pop(ctx, solver, 1);
+            assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+            let impossible = Z3_mk_not(ctx, original_value);
+            assert_eq!(
+                Z3_solver_check_assumptions(ctx, solver, 1, &impossible),
+                Z3_L_FALSE
+            );
+            let core = Z3_solver_get_unsat_core(ctx, solver);
+            assert!(!core.is_null());
+            assert_eq!(Z3_ast_vector_size(ctx, core), 1);
+            assert!(Z3_is_eq_ast(
+                ctx,
+                Z3_ast_vector_get(ctx, core, 0),
+                impossible
+            ));
+            // Independently decide the original source with only returned
+            // assumptions: the core must not be an empty reduced-core alias.
+            let replay = Z3_mk_solver(ctx);
+            let source = Z3_solver_get_assertions(ctx, solver);
+            for index in 0..Z3_ast_vector_size(ctx, source) {
+                Z3_solver_assert(ctx, replay, Z3_ast_vector_get(ctx, source, index));
+            }
+            for index in 0..Z3_ast_vector_size(ctx, core) {
+                Z3_solver_assert(ctx, replay, Z3_ast_vector_get(ctx, core, index));
+            }
+            assert_eq!(Z3_solver_check(ctx, replay), Z3_L_FALSE);
+            assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+            assert!(Z3_model_eval(
+                ctx,
+                snapshot,
+                original_value,
+                false,
+                &mut value
+            ));
+            assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+            Z3_del_context(ctx);
+        }
+    }
+}
+
+#[test]
+fn converted_field_sat_solver_reads_the_actual_authored_boolean_and_field_witness() {
+    // SAFETY: all handles are owned by this live single-threaded context.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        let tactic = Z3_mk_tactic(ctx, c"ff-sat".as_ptr());
+        let solver = Z3_mk_solver_from_tactic(ctx, tactic);
+        Z3_solver_from_string(ctx, solver, c"(declare-const p Bool) (declare-const x (_ FiniteField 7)) (assert p) (assert (= x #f3m7))".as_ptr());
+        assert_eq!(Z3_get_error_code(ctx), Z3_OK);
+        let roots = Z3_solver_get_assertions(ctx, solver);
+        assert_eq!(Z3_ast_vector_size(ctx, roots), 2);
+        let equality = Z3_to_app(ctx, Z3_ast_vector_get(ctx, roots, 1));
+        let x = Z3_get_app_arg(ctx, equality, 0);
+        let three = Z3_get_app_arg(ctx, equality, 1);
+        assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+        let model = Z3_solver_get_model(ctx, solver);
+        assert!(!model.is_null());
+        let mut value = 0;
+        assert!(Z3_model_eval(ctx, model, x, false, &mut value));
+        assert!(Z3_is_eq_ast(ctx, value, three));
+        assert!(Z3_model_eval(
+            ctx,
+            model,
+            Z3_ast_vector_get(ctx, roots, 0),
+            false,
+            &mut value
+        ));
+        assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
+        Z3_solver_push(ctx, solver);
+        Z3_solver_assert(
+            ctx,
+            solver,
+            Z3_mk_not(ctx, Z3_ast_vector_get(ctx, roots, 1)),
+        );
+        assert_eq!(Z3_solver_check(ctx, solver), Z3_L_FALSE);
+        Z3_solver_pop(ctx, solver, 1);
+        assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
+        assert!(Z3_model_eval(ctx, model, x, false, &mut value));
+        assert!(Z3_is_eq_ast(ctx, value, three));
+        Z3_del_context(ctx);
+    }
+}

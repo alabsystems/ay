@@ -19,11 +19,13 @@
 /// `Executor::pending_sat_unknown_reason` fields and to call the SAT solver's
 /// by-value getters here (so a disjoint `&mut` borrow of the solver at the call
 /// site is preserved). It must remain a write-only snapshot with NO assertions
-/// (guarded by `test_collect_sat_stats_macro_contains_no_assertions`, #4756,
-/// #4804): phase-sensitive checks belong in the `stats_contract.rs` finalize
-/// helpers.
+/// (#4756, #4804): it expands at many call sites where intermediate states are
+/// valid, so phase-sensitive checks belong after a solve path finishes.
 macro_rules! collect_sat_stats {
-    ($self:ident, $sat:expr) => {
+    ($self:ident, $sat:expr) => {{
+        // The lane's statistics overwrite the last lane's; the process-wide
+        // ledger keeps the sum over lanes (`ay_core::resource`).
+        ($sat).report_work_to_ledger();
         $crate::pipeline_fns::collect_sat_stats_snapshot(
             &mut $self.last_statistics,
             &mut $self.pending_sat_unknown_reason,
@@ -48,7 +50,7 @@ macro_rules! collect_sat_stats {
                 unknown_reason: ($sat).last_unknown_reason(),
             },
         );
-    };
+    }};
 }
 
 /// Thin shim over [`crate::incremental_state::collect_theory_stats_incremental`].
@@ -157,7 +159,7 @@ macro_rules! pipeline_incremental_setup {
         };
         let _pis_new_assertions: Vec<TermId> =
             $new_assertion_set.iter().copied().collect();
-        let _pis_assertion_depths = $self.ctx.active_assertion_min_scope_depths();
+        let _pis_assertion_depths = $self.scope_root_depths.clone().unwrap_or_default();
 
         // Lift arithmetic ITEs from new assertions
         let _pis_lifted = $self.ctx.terms.lift_arithmetic_ite_all(&_pis_new_assertions);
@@ -236,6 +238,7 @@ macro_rules! pipeline_incremental_setup {
             }
             sat
         };
+        $solver_out.set_clause_event_capture($self.clause_event_capture);
         $solver_out.ensure_num_vars(_pis_total_vars as usize);
         // Rebind the exact public query's cooperative interrupt on every use.
         // The SAT solver is persistent across SMT queries; retaining an older

@@ -8,9 +8,19 @@ use super::*;
 use crate::executor::{proof_surface_syntax, NATIVE_API_ASSERTION_PLACEHOLDER};
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 
+#[path = "authored_congruence_support/confined_spelling.rs"]
+mod confined_spelling;
+use confined_spelling::{ConfinedSpelling, ConfinedSpellingKind};
 #[path = "authored_congruence_support/source_resolution.rs"]
 mod source_resolution;
 use source_resolution::{AuthoredSourceResolutionFailure, ReachableAuthoredSource};
+
+#[cfg(test)]
+#[path = "authored_congruence_support/equality_expansion_tests.rs"]
+mod equality_expansion_tests;
+#[cfg(test)]
+#[path = "authored_congruence_support/nra_sos_tests.rs"]
+mod nra_sos_tests;
 
 const MAX_REACHABLE_AUTHORED_ASSUMES: usize = 8_192;
 // `pub(super)` only so the sibling regression module can pin the cap by name
@@ -41,7 +51,9 @@ fn reachable_authored_assume_roots(proof: &Proof) -> Option<Vec<TermId>> {
         let derives_empty = match step {
             ProofStep::Step { clause, .. }
             | ProofStep::Resolution { clause, .. }
-            | ProofStep::TheoryLemma { clause, .. } => clause.is_empty(),
+            | ProofStep::TheoryLemma { clause, .. }
+            | ProofStep::FiniteFieldLinear { clause, .. }
+            | ProofStep::NraSos { clause, .. } => clause.is_empty(),
             ProofStep::Assume(_) | ProofStep::Anchor { .. } => false,
             _ => return None,
         };
@@ -82,7 +94,12 @@ fn reachable_authored_assume_roots(proof: &Proof) -> Option<Vec<TermId>> {
                     return None;
                 }
             }
-            ProofStep::Assume(_) | ProofStep::TheoryLemma { .. } => {}
+            // SOS origin positions address literals within its own clause,
+            // not proof steps; the certificate has no external premises.
+            ProofStep::Assume(_)
+            | ProofStep::TheoryLemma { .. }
+            | ProofStep::FiniteFieldLinear { .. }
+            | ProofStep::NraSos { .. } => {}
             _ => return None,
         }
     }
@@ -125,14 +142,27 @@ fn reachable_authored_assume_roots(proof: &Proof) -> Option<Vec<TermId>> {
 ///
 /// Measured shape, `qfax_store_permutation_*`: `(assert (! (distinct i j)
 /// :named neq))` elaborates to `(not (= i j))`. Restoring `(distinct i j)` on
-/// that root prints the assume literal as an opaque `distinct` atom while the
-/// resolution's other premise still prints `(= i j)`, and the printer's own
-/// pre-existing guard `surface_resolution_needs_distinct_bridge` correctly
-/// refuses the document with "a printed distinct/equality pivot cannot be
-/// bridged to the authored operands". Withholding restores nothing and
-/// removes nothing: the root keeps the canonical spelling the strict checker
-/// validated, exactly the state
-/// `purge_surface_overrides_for_certified_proof` established.
+/// that root used to print the assume literal as an opaque `distinct` atom
+/// while the resolution's other premise still printed `(= i j)`, and the
+/// printer's own guard `surface_resolution_needs_distinct_bridge` correctly
+/// refused the document with "a printed distinct/equality pivot cannot be
+/// bridged to the authored operands". The printer now confines a BINARY
+/// authored `distinct` over a canonical `(not (= x y))` to its own `assume`
+/// with `distinct_elim` (+ `not_symm` when AY's argument order swapped the
+/// pair) and prints the canonical literal everywhere else, so that head
+/// rewrite is admitted below.
+///
+/// Withholding a spelling restores nothing and removes nothing: the root keeps
+/// the canonical text `purge_surface_overrides_for_certified_proof` left, which
+/// is NOT an assertion of the problem file `(get-proof)` is checked against.
+/// MEASURED on `model_checker_consumer_quantified_models/signed_range64_fill_unsat.smt2`
+/// before the `distinct` arm: the consequence-replay cascade published
+/// `(assume t0 (not (= #b00000111 (select a #b1..1))))` for the authored
+/// `(distinct (select a #xffffffffffffffff) #x07)`, the strict checker (which
+/// compares interned roots) accepted it, and pinned carcara 1.1.0 refused the
+/// document at `t0`: "could not match term to any of the original problem
+/// premises". Every head rewrite the printer can bridge must therefore be
+/// admitted here, not withheld.
 ///
 /// This is a NARROWING of a presentation-only pass, never a relaxation of an
 /// authority check: an unconfinable root is still required to have exactly one
@@ -166,20 +196,91 @@ fn authored_surface_is_assume_confinable(
         //   the published document is byte-identical to the base -- `(assume
         //   t0.a (and (not p) (= x x)))` bridged onto `(not p)` with `and_pos`
         //   (`folded_authored_conjunction_assume_is_the_problem_assertion`).
-        // * `(assert (and (= a b) (= x x)))` + `(assert (not (= a b)))`: at the
-        //   base this pass DECLINED that root and the query published `(error
-        //   "proof was not generated for this independently certified result")`
-        //   with no transport at all. Withheld, it publishes `(assume t0
-        //   (= a b))` ... `(cl)` and the exported problem transport carries
-        //   `(assert (= a b))`. Withholding is what lets that refutation be
-        //   published, not a spelling this pass gives up.
+        // * `(assert (and (= a b) (= x x)))` + `(assert (not (= a b)))`: at
+        //   `dacc7939c7` this pass DECLINED that root and the query published
+        //   `(error "proof was not generated for this independently certified
+        //   result")` with no transport at all. Withheld (with nothing earlier
+        //   on the root), it published `(assume t0 (= a b))` ... `(cl)` under
+        //   `foreign_assumes=yes`, which pinned carcara 1.1.0 refused. The
+        //   withheld root is now restored from its row when the printer
+        //   derives the folded term from that exact spelling
+        //   (`ReachableAuthoredSource::Folded`, `confined_spelling.rs`): here
+        //   the conjunction projection `and_pos`, and the document is `valid`.
         _ => return true,
     };
-    let FrontendTerm::App(operator, _) = proof_surface_syntax::strip_frontend_annotations(source)
+    let FrontendTerm::App(operator, source_args) =
+        proof_surface_syntax::strip_frontend_annotations(source)
     else {
         return false;
     };
-    operator == canonical_operator || is_comparison_reversal(operator, canonical_operator)
+    operator == canonical_operator
+        || is_comparison_reversal(operator, canonical_operator)
+        || is_binary_distinct_elimination(terms, root, operator, source_args.len())
+        || is_equality_conjunction_expansion(terms, root, operator, source_args.len())
+}
+
+/// An authored binary equality whose canonical root is a conjunction of
+/// binary equalities: a datatype equality `(= v7 v6)` that elaboration
+/// expanded field by field into `(and (= v6!ptr v7!ptr) .. (= v6!data
+/// v7!data))`. Withheld, the root published that expansion as its `assume`,
+/// which is no assertion of the problem file. MEASURED on
+/// `model_checker_consumer_quantified_counterexample/deep_vec_iteration_premise_false_unsat`:
+/// `(assume t1 (and (= (ptr v6) (ptr v7)) ..))` and pinned carcara 1.1.0
+/// refused the document at `t1` ("could not match term to any of the original
+/// problem premises").
+///
+/// The printer confines the authored spelling with one `cong` per conjunct
+/// when every conjunct is a unary congruence over the authored pair
+/// (`alethe_printer/authored_assume/document_canonical.rs`), and declines
+/// anything else -- a constructor equation expanded into selector VALUES is
+/// related to its authored root only by the datatype theory, which pinned
+/// carcara does not implement. A declined bridge leaves the authored spelling
+/// document-wide, so the export is judged over the problem's own text and the
+/// printer's step judgements refuse it rather than publish a premise the
+/// problem never asserts. This is the head/arity admission only.
+fn is_equality_conjunction_expansion(
+    terms: &TermStore,
+    root: TermId,
+    operator: &str,
+    arity: usize,
+) -> bool {
+    if operator != "=" || arity != 2 {
+        return false;
+    }
+    let TermData::App(symbol, conjuncts) = terms.get(root) else {
+        return false;
+    };
+    symbol.name() == "and"
+        && !conjuncts.is_empty()
+        && conjuncts.iter().all(|&conjunct| {
+            matches!(
+                terms.get(conjunct),
+                TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2
+            )
+        })
+}
+
+/// The one negation-head rewrite the printer bridges, with `distinct_elim`:
+/// a binary authored `(distinct a b)` whose canonical root is `(not (= x y))`.
+/// The printer re-checks the operand pairing on the text it prints
+/// (`alethe_printer/authored_assume/distinct.rs`) and declines the bridge on
+/// any mismatch; this is only the head/arity admission.
+fn is_binary_distinct_elimination(
+    terms: &TermStore,
+    root: TermId,
+    operator: &str,
+    arity: usize,
+) -> bool {
+    if operator != "distinct" || arity != 2 {
+        return false;
+    }
+    let TermData::Not(equality) = terms.get(root) else {
+        return false;
+    };
+    matches!(
+        terms.get(*equality),
+        TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2
+    )
 }
 
 /// The one top-level head rewrite the printer bridges, with `comp_simplify`.
@@ -410,24 +511,35 @@ impl Executor {
     }
 
     /// Build the replacement map transactionally. Identity/raw roots remove
-    /// stale overrides; parsed roots must produce exactly one root spelling and
-    /// may not conflict with an already authenticated spelling.
+    /// stale root overrides here; their complete rendering is sealed after
+    /// the final forall pass. Parsed roots must produce exactly one root
+    /// spelling and may not conflict with an already authenticated spelling.
+    ///
+    /// Spellings installed only because the printer confines them are
+    /// returned for the final re-judgement (`confined_spelling.rs`).
     fn restored_authored_override_map(
         &mut self,
         sources: Vec<ReachableAuthoredSource>,
-    ) -> Option<(DetHashMap<TermId, String>, bool)> {
+    ) -> Option<(DetHashMap<TermId, String>, bool, Vec<ConfinedSpelling>)> {
         let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
         if !proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
             return None;
         }
         let mut changed = false;
+        let mut confined = Vec::new();
         for source in sources {
             let (root, source, replaces_stale) = match source {
-                ReachableAuthoredSource::Identity(root) => {
+                ReachableAuthoredSource::Identity(root)
+                | ReachableAuthoredSource::RawIdentity(root) => {
                     changed |= overrides.remove(&root).is_some();
                     continue;
                 }
                 ReachableAuthoredSource::Untouched => continue,
+                ReachableAuthoredSource::Folded(root, source) => {
+                    changed |=
+                        self.install_folded_spelling(root, &source, &mut overrides, &mut confined);
+                    continue;
+                }
                 ReachableAuthoredSource::ExpandedLet(root, surface) => {
                     if overrides
                         .get(&root)
@@ -443,28 +555,59 @@ impl Executor {
                     (root, source, replaces_stale)
                 }
             };
-            let mut root_override = DetHashMap::default();
-            proof_surface_syntax::collect_root_surface_term_override(
-                &mut self.ctx,
-                root,
-                &source,
-                &mut root_override,
-            );
-            let surface = root_override.remove(&root)?;
-            if overrides
-                .get(&root)
-                .is_some_and(|existing| existing != &surface)
-                && !replaces_stale
-            {
-                return None;
+            let (surface, guarded) =
+                self.parsed_root_spelling(root, &source, overrides.get(&root), replaces_stale)?;
+            let previous = overrides.insert(root, surface);
+            if guarded {
+                confined.push(ConfinedSpelling {
+                    root,
+                    previous,
+                    kind: ConfinedSpellingKind::Guarded,
+                });
+            } else {
+                self.spell_connective_quantifier_operand(root, &source, &mut overrides);
             }
-            overrides.insert(root, surface);
             changed = true;
         }
         if changed && !proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
             return None;
         }
-        Some((overrides, changed))
+        Some((overrides, changed, confined))
+    }
+
+    /// The universal operand of an authored `(= A F)` / `(=> A F)` root whose
+    /// whole spelling was just installed: without its own spelling (and its
+    /// body's, under the recovered binder), the root prints the authored
+    /// universal while every step that reasons about the universal
+    /// (`equiv_pos2`, `implies_pos`, `forall_inst`) prints the canonical one,
+    /// and the export is refused (`no equiv_pos2 instance over the printed
+    /// surface reproduces this clause`). MEASURED on w1_51 file 121. The
+    /// ordinary override plan never spells this universal (it declines any
+    /// root with a binder below a non-quantifier head), so this pass is the
+    /// only one that does (#iff-split-implied-authority). The entries are
+    /// keyed on the
+    /// quantifier and on terms under its binder, so no ground step of an
+    /// independently certified theory lemma is re-spelled; a quantifier past
+    /// the collection bound keeps its canonical text and the printer judges
+    /// the result.
+    fn spell_connective_quantifier_operand(
+        &mut self,
+        root: TermId,
+        source: &FrontendTerm,
+        overrides: &mut DetHashMap<TermId, String>,
+    ) {
+        let Some((quantifier, parsed)) =
+            proof_surface_syntax::connective_quantifier_pair(&self.ctx.terms, root, source)
+        else {
+            return;
+        };
+        let parsed = parsed.clone();
+        let _bounded = proof_surface_syntax::collect_surface_term_overrides(
+            &mut self.ctx,
+            quantifier,
+            &parsed,
+            overrides,
+        );
     }
 
     /// Restore exact source spellings for reachable authored assumptions after
@@ -484,12 +627,23 @@ impl Executor {
     /// authenticates identity spelling or every emitted source spelling is
     /// identical. Other duplicate presentations suppress only Alethe; the
     /// independently checked native proof and portable bundle remain usable.
-    pub(in crate::executor::proof) fn restore_reachable_authored_assume_surface_overrides(
+    ///
+    /// Every installer that REPLACES `last_proof` after this pass ran owes the
+    /// same restoration for the proof it installs; the native SOS lane calls
+    /// it from its bind (see `native_nra_sos.rs`).
+    pub(in crate::executor) fn restore_reachable_authored_assume_surface_overrides(
         &mut self,
         proof: &Proof,
     ) {
         let Some(roots) = reachable_authored_assume_roots(proof) else {
             self.suppress_unsat_proof_reconstruction();
+            // #evidence-stage-3, second pass. Every suppression in this
+            // function keeps a DERIVATION and drops only its authored-scope
+            // spelling, which is a different repair from every producer-side
+            // decline and was indistinguishable from them in the census.
+            self.record_proof_decline(
+                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
+            );
             return;
         };
         if roots.is_empty() {
@@ -506,23 +660,218 @@ impl Executor {
         if !self.ctx.retains_parsed_assertions() {
             if self.is_producing_proofs() || self.proof_artifact_required {
                 self.suppress_unsat_proof_reconstruction();
+                self.record_proof_decline(
+                    crate::executor::ProofDeclineMechanism::RetentionOffWithoutAuthoredText,
+                );
             }
             return;
         }
         let sources = match self.resolve_reachable_authored_sources(&roots) {
-            Ok(sources) => sources,
+            Ok(sources) => self.respell_nullary_macro_raw_roots(sources),
             Err(AuthoredSourceResolutionFailure::AletheSurfaceUnavailable) => return,
             Err(AuthoredSourceResolutionFailure::InvalidAuthority) => {
                 self.suppress_unsat_proof_reconstruction();
+                self.record_proof_decline(
+                    crate::executor::ProofDeclineMechanism::AuthoredSourceAuthorityInvalid,
+                );
                 return;
             }
         };
-        let Some((overrides, changed)) = self.restored_authored_override_map(sources) else {
+        let authored_foralls = authored_forall_sources(&self.ctx.terms, &sources);
+        let identity_roots: Vec<TermId> = sources
+            .iter()
+            .filter_map(ReachableAuthoredSource::canonical_row_root)
+            .collect();
+        let Some((mut overrides, mut changed, confined)) =
+            self.restored_authored_override_map(sources)
+        else {
             self.suppress_unsat_proof_reconstruction();
+            self.record_proof_decline(
+                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
+            );
             return;
         };
+        changed |=
+            self.spell_forall_instances_on_final_proof(proof, &authored_foralls, &mut overrides);
+        // A later Parsed root or forall instance can re-spell a descendant
+        // of an earlier Identity root. Seal only after both passes finish.
+        let Some(sealed) = self.seal_authored_identity_surfaces(&identity_roots, &mut overrides)
+        else {
+            self.suppress_unsat_proof_reconstruction();
+            self.record_proof_decline(
+                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
+            );
+            return;
+        };
+        changed |= sealed;
+        // Only the finished map says which descendants are re-spelled
+        // document-wide, and the printer declines a fold bridge above one.
+        let Some(withdrawn) = self.withdraw_unconfined_spellings(proof, confined, &mut overrides)
+        else {
+            self.suppress_unsat_proof_reconstruction();
+            self.record_proof_decline(ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable);
+            return;
+        };
+        changed |= withdrawn;
         if changed {
             self.last_proof_term_overrides = Some(overrides);
         }
     }
+
+    /// Give every `forall_inst` of the FINAL proof the exact source spelling
+    /// of its instance, where the instantiated quantifier is a reachable
+    /// authored root.
+    ///
+    /// The ordinary pass (`add_forall_instance_surface_overrides`) runs inside
+    /// `apply_input_syntax_rewrites_to_proof`, on the proof as it stood
+    /// BEFORE the rebuild lanes of `finish_input_syntax_rewrite` and the
+    /// authored replacement cascade. A lane that replaces the proof purges
+    /// every spelling of a term its candidate prints
+    /// (`purge_surface_overrides_for_certified_proof`) and re-collects only
+    /// the authored ROOTS and their subterms; a `forall_inst` instance is a
+    /// distinct `TermId` the collector never visits, so it reaches the
+    /// printer with its CANONICAL rendering under an AUTHORED quantifier —
+    /// `(< c (f c))` under `(forall ((w Int)) (> (f w) w))`. MEASURED
+    /// 2026-09-13 on the eighth false green's `sko_ex` sibling: on main that
+    /// step shipped as `forall_inst` under a green flag and pinned carcara
+    /// refused it (`expected term .. to be ..`); after the printed
+    /// `forall_inst` judgement it declines to an honest `hole`. This pass is
+    /// what makes the derivation, which exists, printable: the same
+    /// rendering the ordinary pass produces, computed over the proof that
+    /// ships.
+    ///
+    /// Semantics are the ordinary pass's, restricted to what it has not
+    /// already decided: an instance that carries a spelling from an earlier
+    /// pass keeps it (today's documents are byte-identical), an instance
+    /// spelled twice by THIS pass with two different texts is the same
+    /// conflict the ordinary pass declines (`ForallInstanceSurfaceConflict`),
+    /// and the printer's own `forall_inst` judgement still reads the bytes
+    /// that ship, so nothing here can turn a mismatch into a claim. Unlike
+    /// the ordinary pass, an instance the store folded to a variable or
+    /// constant under a composite authored body keeps its canonical text
+    /// (`forall_instance_would_hijack_atom`): this pass also runs for the
+    /// expansion certificate, whose `(forall ((q Bool)) (and q q))` instance
+    /// is the shared `false`.
+    ///
+    /// Returns whether `overrides` changed.
+    fn spell_forall_instances_on_final_proof(
+        &mut self,
+        proof: &Proof,
+        authored_foralls: &DetHashMap<TermId, FrontendTerm>,
+        overrides: &mut DetHashMap<TermId, String>,
+    ) -> bool {
+        if authored_foralls.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut spelled_here: DetHashSet<TermId> = DetHashSet::default();
+        let debug = ay_core::misc_cli_flags().debug_cert;
+        for (index, step) in proof.steps.iter().enumerate() {
+            let ProofStep::Step {
+                rule: AletheRule::ForallInst,
+                clause,
+                args,
+                ..
+            } = step
+            else {
+                continue;
+            };
+            let [implication] = clause.as_slice() else {
+                continue;
+            };
+            let TermData::App(Symbol::Named(name), disjuncts) = self.ctx.terms.get(*implication)
+            else {
+                continue;
+            };
+            if name != "or" || disjuncts.len() != 2 {
+                continue;
+            }
+            let TermData::Not(quantifier) = self.ctx.terms.get(disjuncts[0]) else {
+                continue;
+            };
+            let Some(parsed) = authored_foralls.get(quantifier) else {
+                continue;
+            };
+            let instance = disjuncts[1];
+            if overrides.contains_key(&instance) && !spelled_here.contains(&instance) {
+                // An earlier pass already spelled this instance; its decision
+                // stands, and the printed judgement reads the result.
+                continue;
+            }
+            if proof_surface_syntax::forall_instance_would_hijack_atom(
+                &self.ctx.terms,
+                instance,
+                parsed,
+            ) {
+                // A composite body folded to a shared atom: the entry would
+                // re-spell every occurrence of it (the `false` axiom first).
+                continue;
+            }
+            let Some(surface) = proof_surface_syntax::format_forall_instance_surface(
+                &self.ctx.terms,
+                parsed,
+                args,
+                overrides,
+            ) else {
+                if debug {
+                    ay_core::safe_eprintln!(
+                        "c !! final forall-inst surface at t{index}: authored body does not render under the substitution"
+                    );
+                }
+                self.decline_forall_instance_surface();
+                return changed;
+            };
+            if let Some(existing) = overrides.get(&instance) {
+                if existing != &surface {
+                    if debug {
+                        ay_core::safe_eprintln!(
+                            "c !! final forall-inst surface at t{index}: instance already spelled another way"
+                        );
+                    }
+                    self.decline_forall_instance_surface();
+                    return changed;
+                }
+                continue;
+            }
+            if debug {
+                ay_core::safe_eprintln!("c !! final forall-inst surface at t{index}: {surface}");
+            }
+            overrides.insert(instance, surface);
+            spelled_here.insert(instance);
+            changed = true;
+            if !proof_surface_syntax::surface_override_map_is_bounded(overrides) {
+                self.decline_forall_instance_surface();
+                return changed;
+            }
+        }
+        changed
+    }
+
+    /// A `forall_inst` instance with no faithful authored spelling withholds
+    /// the whole reconstruction rather than print a guess.
+    fn decline_forall_instance_surface(&mut self) {
+        self.suppress_unsat_proof_reconstruction();
+        self.record_proof_decline(
+            crate::executor::ProofDeclineMechanism::ForallInstanceSurfaceConflict,
+        );
+    }
+}
+
+/// The reachable authored roots that are `forall` assertions, paired with
+/// their parsed source: the quantifiers whose `forall_inst` instances
+/// [`Executor::spell_forall_instances_on_final_proof`] can spell.
+fn authored_forall_sources(
+    terms: &TermStore,
+    sources: &[ReachableAuthoredSource],
+) -> DetHashMap<TermId, FrontendTerm> {
+    sources
+        .iter()
+        .filter_map(|source| match source {
+            ReachableAuthoredSource::Parsed(root, parsed, _) => {
+                proof_surface_syntax::authored_forall_of_root(terms, *root, parsed)
+                    .map(|(forall, parsed)| (forall, parsed.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }

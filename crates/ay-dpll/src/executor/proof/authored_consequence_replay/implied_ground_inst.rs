@@ -69,6 +69,12 @@
 //! wrong witness or a still-satisfiable consequence set can only cost a
 //! declined candidate.
 //!
+//! BOOLEAN EQUALITIES AND CEGQI WITNESSES. An authored `(= A F)` is read as
+//! the implication it contains (`equiv_pos2`/`equiv_pos1` in place of
+//! `implies_pos`), and a body with no ground slot witness draws the CEGQI and
+//! E-matched binder values of the decision before the authored scan — see
+//! `implied_ground_inst_roots.rs` (#iff-split-implied-authority).
+//!
 //! UNSAT-ONLY. Consulted at exactly one place — the artifact firewall's
 //! downgrade — so its only reachable transition is `unknown -> unsat`, and it
 //! installs `last_proof` only through the shared consequence-replay
@@ -132,8 +138,16 @@ impl Executor {
             return false;
         };
         self.implied_forall_ground_inst_attempts.set(attempts + 1);
-        let installed =
+        let snapshot = crate::executor::qsat_route::ProofStateSnapshot::take(self);
+        let mut installed =
             self.try_translate_authored_consequence_replay_unsat_with_implied(&records, &implied);
+        if installed {
+            if let Some(reason) = self.implied_lane_presentation_refusal() {
+                note(|| format!("decline: installed certificate {reason}"));
+                snapshot.restore(self);
+                installed = false;
+            }
+        }
         note(|| {
             format!(
                 "translate: implied={} instances={} installed={installed}",
@@ -176,22 +190,8 @@ impl Executor {
             let slots = Self::binder_argument_slots(&self.ctx.terms, body, &bindings);
             let mut per_binder: Vec<Vec<TermId>> = Vec::with_capacity(bindings.len());
             for (name, sort) in &bindings {
-                // Trigger discipline, MEASURED: the generic subterm scan
-                // proposes every Int-sorted authored subterm, and on #7956
-                // that is 8 witnesses — 7 junk instances whose nested
-                // select/offset terms push the same-context probe past its
-                // unchanged 2000 ms grant (2003 ms, `Ok(Unknown)`). Witnesses
-                // drawn from ground ARGUMENT positions of the very symbols
-                // the body applies to the binder (here `seq_index_logic _ 0`,
-                // giving exactly `0`) leave the probe the 31-formula load
-                // measured to close in 317 ms. The generic scan remains only
-                // as a fallback when no slot witness exists.
-                let mut candidates =
-                    self.slot_ground_witnesses(authored, &slots, name, sort, &bound_names);
-                if candidates.is_empty() {
-                    candidates = self.ground_witnesses_for_sort(authored, sort, &bound_names);
-                    Self::order_witnesses_smallest_first(&self.ctx.terms, &mut candidates);
-                }
+                let candidates =
+                    self.implied_binder_witnesses(authored, &slots, name, sort, &bound_names);
                 if candidates.is_empty() {
                     break;
                 }
@@ -252,8 +252,10 @@ impl Executor {
     }
 
     /// Authored roots of shape `(=> A F)` — or the desugared two-literal
-    /// `(or F (not A))` the frontend actually stores — whose consequent `F` is
-    /// a `Forall` and whose antecedent `A` is ITSELF an exact authored root.
+    /// `(or F (not A))` the frontend actually stores — or the Boolean
+    /// equality `(= A F)` / `(= F A)` (#iff-split-implied-authority), whose
+    /// consequent `F` is a `Forall` and whose antecedent `A` is ITSELF an
+    /// exact authored root.
     ///
     /// Requiring `A` to be an authored root (rather than merely entailed) is
     /// the narrow, checkable version of the `#unit-conjunctive` rule: it is
@@ -269,15 +271,15 @@ impl Executor {
         let mut out = Vec::new();
         for &root in authored {
             let Some((antecedent, consequent)) =
-                Self::decode_implication_local(&self.ctx.terms, root)
+                Self::implied_forall_root_orientations(&self.ctx.terms, root)
+                    .into_iter()
+                    .find(|(antecedent, consequent)| {
+                        authored_set.contains(antecedent)
+                            && matches!(self.ctx.terms.get(*consequent), TermData::Forall(..))
+                    })
             else {
                 continue;
             };
-            if !authored_set.contains(&antecedent)
-                || !matches!(self.ctx.terms.get(consequent), TermData::Forall(..))
-            {
-                continue;
-            }
             out.push((root, antecedent, consequent));
         }
         out
@@ -461,16 +463,22 @@ impl Executor {
             instance_plan,
             unit_ids,
         )?;
-        Some(self.apply_implication_unit(
+        self.apply_implied_root_unit(
             candidate,
             implication,
             implication_unit,
             antecedent,
             antecedent_unit,
             consequent,
-        ))
+        )
     }
 }
+
+#[path = "implied_ground_inst_roots.rs"]
+mod roots;
+
+#[path = "implied_ground_inst_presentation.rs"]
+mod presentation;
 
 #[cfg(test)]
 #[path = "implied_ground_inst_tests.rs"]

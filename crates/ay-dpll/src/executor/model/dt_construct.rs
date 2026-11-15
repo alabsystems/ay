@@ -106,7 +106,7 @@ use crate::executor_format::{format_bigint, format_bitvec, format_rational};
 use super::datatype_array_fields::{
     DatatypeArrayConstructionAuthorization, ExactDatatypeArrayClassAuthority,
 };
-use super::dt_construct_budget::OpaqueDtConstructionBudget;
+use super::dt_construct_budget::{OpaqueDtCollectionBudget, OpaqueDtConstructionBudget};
 use super::{EvalValue, Model};
 use crate::executor::Executor;
 
@@ -129,8 +129,8 @@ const MAX_DEPTH: u32 = 512;
 enum DtTermKind {
     /// Plain variable / constant.
     Var,
-    /// Constructor application `(C a0 .. ak)` (or a nullary-constructor
-    /// constant stored as a `Var` whose name is the constructor).
+    /// Constructor application `(C a0 .. ak)`, a nullary constructor stored
+    /// as a `Var`, or an eliminated variable's checked ground definition.
     CtorApp { ctor: String, args: Vec<TermId> },
     /// Selector application `(sel t)` whose RESULT is datatype-sorted.
     SelApp { sel: String, arg: TermId },
@@ -154,6 +154,20 @@ pub(super) fn dt_canonical_string(mv: &ModelValue) -> String {
         ModelValue::Int(i) => format_bigint(i),
         ModelValue::Real(r) => format_rational(r),
         ModelValue::BitVec { width, value } => format_bitvec(value, *width),
+        ModelValue::FloatingPointExact {
+            sign,
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+        } => format!(
+            "(#fp {} {} {} {} {})",
+            u8::from(*sign),
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+        ),
         ModelValue::FloatingPoint {
             sign,
             exponent,
@@ -234,9 +248,10 @@ pub(super) fn mv_to_eval(mv: &ModelValue) -> EvalValue {
         // Not pinnable. `EvalValue` has no algebraic variant, so pinning one
         // would require collapsing it to a rational -- which is exactly the
         // lossy step that loses `sqrt(2)`. Fail closed, as FP and arrays do.
-        ModelValue::FloatingPoint { .. } | ModelValue::Array(_) | ModelValue::Algebraic(_) => {
-            EvalValue::Unknown
-        }
+        ModelValue::FloatingPoint { .. }
+        | ModelValue::FloatingPointExact { .. }
+        | ModelValue::Array(_)
+        | ModelValue::Algebraic(_) => EvalValue::Unknown,
     }
 }
 
@@ -260,6 +275,7 @@ fn dt_canonical_pin_supported(value: &ModelValue) -> bool {
             ModelValue::Array(_)
             | ModelValue::Seq(_)
             | ModelValue::FloatingPoint { .. }
+            | ModelValue::FloatingPointExact { .. }
             | ModelValue::Algebraic(_) => return false,
         }
     }
@@ -352,6 +368,17 @@ struct ClassInfo {
     /// Set when committed evidence conflicts (two different forced
     /// constructors); the class is never constructed (fail closed).
     conflicted: bool,
+    /// True when any force/exclusion for this class came from
+    /// authored-hard evidence (a hard literal of the authored query
+    /// window, an authored-reachable constructor application, or a
+    /// producing lane's value pin). A class whose conflicting evidence
+    /// is entirely candidate-soft — SAT readings on generated atoms
+    /// from a candidate model that need not be datatype-coherent
+    /// (bit-blast assignments have no occurs-check) — is reset to a
+    /// free choice instead of failing closed: construction is a
+    /// candidate the unchanged validation gates still decide, and
+    /// authored facts are never relaxed. (#dt-soft-conflict)
+    hard_evidence: bool,
 }
 
 struct DtBuilder<'a> {
@@ -372,12 +399,32 @@ struct DtBuilder<'a> {
     diseq: HashMap<usize, Vec<usize>>,
     /// ALL selector applications (any result sort): (app term, selector, arg).
     sel_apps: Vec<(TermId, String, TermId)>,
+    /// Selector names that loop within one class: a selector application
+    /// whose own class equals its argument's class. A constructor using
+    /// such a selector as a field cannot be the class value — class-
+    /// uniform projection would make the round-trip reflexive, which
+    /// datatype acyclicity (occurs-check) forbids. Measured: a blast
+    /// candidate merged `d`, `(f1 d)` and `(f2 d)` into one class, and
+    /// every acyclicity lemma then evaluated true against ANY value with
+    /// constructor `mk`; choosing the non-self-referential `leaf`
+    /// constructor is the coherent construction. (#dt-occurs-guard)
+    self_loop_selectors: HashMap<usize, Vec<String>>,
     /// Tester applications: (app term, ctor, arg).
     tester_apps: Vec<(TermId, String, TermId)>,
     /// Literal truth forced by the exact assertion/assumption/root window.
     /// Built once so constructor testers use the same provenance as equality
     /// and distinct atoms even after preprocessing replaced `ctx.assertions`.
     hard_literal_truth: HashMap<TermId, bool>,
+    /// Hard literal truth over the AUTHORED window only (independent-gate
+    /// query roots plus caller assumptions), for evidence tiering in
+    /// `force_constructors`: `None` when the bounded computation was
+    /// unavailable, in which case every reading counts as hard and the
+    /// soft-conflict relaxation never fires.
+    authored_hard_truth: Option<HashMap<TermId, bool>>,
+    /// Subterm-reachable set of the authored window, for tiering
+    /// constructor-application forces. `None` = walk unavailable
+    /// (every applied force counts as hard).
+    authored_reachable: Option<HashSet<TermId>>,
     /// Constructed value per class root; `None` = construction failed
     /// (cyclic / conflicting / unrepresentable): the class stays unpinned and
     /// validation fails closed exactly as today.
@@ -398,6 +445,10 @@ struct DtBuilder<'a> {
     /// selectors may be construction roots, but they are not field
     /// observations and must not suppress finite-function candidates.
     datatype_array_required_terms: Option<HashSet<TermId>>,
+    /// Every term of the producing lane's value pins (#dt-fd-pin-roots). A
+    /// constructor application there is the ground value the lane committed,
+    /// so it forces its class exactly like an authored constructor term.
+    lane_pin_terms: HashSet<TermId>,
 }
 
 /// Recover only unconditional literal truth from the exact construction-root
@@ -455,6 +506,84 @@ fn clear_total_datatype_model(model: &mut Model) -> bool {
 }
 
 impl Executor {
+    /// A scoped eliminated variable's closed constructor definition is a
+    /// candidate shape, rather than free default slack. Check the whole new
+    /// dependency slice before the collector clones any constructor arguments.
+    /// No UF, selector, array, binder or scalar expression is admitted here;
+    /// their model/field authority remains with the existing producers.
+    fn ground_datatype_definition(
+        &self,
+        from: TermId,
+        budget: &mut OpaqueDtCollectionBudget,
+    ) -> Option<TermId> {
+        let &target = self.recorded_var_substitutions.get(&from)?;
+        if self.ctx.terms.sort(from) != self.ctx.terms.sort(target)
+            || self.datatype_sort_name(self.ctx.terms.sort(from)).is_none()
+        {
+            return None;
+        }
+        let mut seen = HashSet::default();
+        if !budget.record_roots(1) {
+            return None;
+        }
+        let mut pending = vec![target];
+        while let Some(term) = pending.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if !budget.visit_term() {
+                return None;
+            }
+            let datatype = self.datatype_sort_name(self.ctx.terms.sort(term)).is_some();
+            if datatype && !budget.record_dt_term() {
+                return None;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::Const(_) if !datatype => {}
+                TermData::Var(name, _) if datatype => {
+                    if name.len() > 256 {
+                        return None;
+                    }
+                    let (datatype, ctor) = self.ctx.is_constructor(name)?;
+                    if self
+                        .datatype_sort_name(self.ctx.terms.sort(term))
+                        .as_deref()
+                        != Some(datatype.as_str())
+                        || !self.ctx.constructor_selector_info(&ctor)?.is_empty()
+                        || !budget.record_constructor(0, name.len())
+                    {
+                        return None;
+                    }
+                }
+                TermData::App(symbol, args) if datatype => {
+                    if symbol.name().len() > 256
+                        || !budget.visit_app(args.len())
+                        || !budget.record_constructor(args.len(), symbol.name().len())
+                    {
+                        return None;
+                    }
+                    let (datatype, ctor) = self.ctx.is_constructor(symbol.name())?;
+                    let fields = self.ctx.constructor_selector_info(&ctor)?;
+                    if self
+                        .datatype_sort_name(self.ctx.terms.sort(term))
+                        .as_deref()
+                        != Some(datatype.as_str())
+                        || fields.len() != args.len()
+                        || fields
+                            .iter()
+                            .zip(args)
+                            .any(|((_, sort), &arg)| sort != self.ctx.terms.sort(arg))
+                    {
+                        return None;
+                    }
+                    pending.extend(args.iter().copied());
+                }
+                _ => return None,
+            }
+        }
+        Some(target)
+    }
+
     /// Defense-in-depth for the W6 e-graph override: construction must have
     /// produced a class that contains at least one exact authorization cell
     /// with the same current birth stamp and sort. The full certificate later
@@ -520,6 +649,16 @@ impl Executor {
             if clear_total_datatype_model(model) {
                 super::eval_memo_clear();
             }
+            return 0;
+        }
+        // Eager EUF synthesis can also produce the checked assignment the
+        // printer publishes. Do not overlay its values with a second free-slack
+        // construction: certificate, getters and printer must read one model.
+        // Preserve the exact W6/array owner and retain legacy construction on
+        // every unavailable, stopped or failed synthesized self-check.
+        if array_field_authorization.cells().is_empty()
+            && self.prefer_checked_synthesized_datatype_model(model, extra_roots)
+        {
             return 0;
         }
         // Idempotency: rebuild from scratch on every completion pass so pins
@@ -611,8 +750,48 @@ impl Executor {
             }
         };
 
-        let roots = self.datatype_model_collection_roots(extra_roots);
+        let roots = self.datatype_model_collection_roots(extra_roots)?;
         let hard_literal_truth = bounded_hard_literal_truth(terms_store, &roots)?;
+        // Authored-window hard truth for evidence tiering: generated
+        // assertions in `ctx.assertions` must not make their atoms count
+        // as authored-hard. Unavailable (budget) ⇒ `None`, and every
+        // reading then counts as hard (no relaxation).
+        let authored_roots = {
+            let mut authored_roots = self.independent_gate_query_roots().ok()?;
+            authored_roots.extend_from_slice(extra_roots);
+            authored_roots
+        };
+        let authored_hard_truth = bounded_hard_literal_truth(terms_store, &authored_roots);
+        // Subterm reachability from the authored window, for tiering
+        // constructor-application forces: a generated round-trip term
+        // `(mk (field x))` is candidate-soft evidence even though its
+        // force applies when the bounded authored inventory is
+        // unavailable. `None` on walk exhaustion (all forces hard).
+        let authored_reachable: Option<HashSet<TermId>> = {
+            let mut seen_r: HashSet<TermId> = HashSet::default();
+            let mut stack_r: Vec<TermId> = authored_roots.clone();
+            let mut exhausted = false;
+            while let Some(t) = stack_r.pop() {
+                if !seen_r.insert(t) {
+                    continue;
+                }
+                if seen_r.len() > 1_000_000 {
+                    exhausted = true;
+                    break;
+                }
+                match terms_store.get(t) {
+                    TermData::App(_, args) => stack_r.extend(args.iter().copied()),
+                    TermData::Not(a) => stack_r.push(*a),
+                    TermData::Ite(a, b, c) => stack_r.extend([*a, *b, *c]),
+                    _ => {}
+                }
+            }
+            if exhausted {
+                None
+            } else {
+                Some(seen_r)
+            }
+        };
 
         let mut seen: HashSet<TermId> = HashSet::default();
         let mut stack: Vec<TermId> = roots.clone();
@@ -622,6 +801,7 @@ impl Executor {
         let mut distinct_atoms: Vec<(TermId, Vec<TermId>)> = Vec::new();
         let mut sel_apps: Vec<(TermId, String, TermId)> = Vec::new();
         let mut tester_apps: Vec<(TermId, String, TermId)> = Vec::new();
+        let mut definition_budget = OpaqueDtCollectionBudget::new();
 
         while let Some(t) = stack.pop() {
             if !seen.insert(t) {
@@ -630,32 +810,55 @@ impl Executor {
             match terms_store.get(t) {
                 TermData::Var(name, _) => {
                     if is_dt_sort(t) {
-                        // A nullary-constructor constant is stored as a Var
-                        // whose name is the constructor (#1745).
-                        let kind = match (
-                            if strict_opaque_scope {
-                                datatype_members.get(name).copied()
-                            } else {
-                                self.ctx
-                                    .exact_datatype_member_info(name)
-                                    .map(|info| info.declaration_kind())
-                            },
-                            self.ctx.is_constructor(name),
-                        ) {
-                            (
-                                Some(ay_frontend::DeclarationKind::DatatypeConstructor),
-                                Some((_dt, ctor)),
-                            ) if self
-                                .ctx
-                                .constructor_selector_info(&ctor)
-                                .map_or(true, |f| f.is_empty()) =>
-                            {
-                                DtTermKind::CtorApp {
-                                    ctor,
-                                    args: Vec::new(),
+                        // Preserve a scoped, closed definition before choosing
+                        // free-class defaults. Otherwise recognize nullary
+                        // constructor constants stored as Vars (#1745).
+                        let definition = self.ground_datatype_definition(t, &mut definition_budget);
+                        let kind = if let Some(target) = definition {
+                            match terms_store.get(target) {
+                                TermData::App(symbol, args) => {
+                                    let (_, ctor) = self.ctx.is_constructor(symbol.name())?;
+                                    stack.extend(args.iter().copied());
+                                    DtTermKind::CtorApp {
+                                        ctor,
+                                        args: args.clone(),
+                                    }
                                 }
+                                TermData::Var(name, _) => {
+                                    let (_, ctor) = self.ctx.is_constructor(name)?;
+                                    DtTermKind::CtorApp {
+                                        ctor,
+                                        args: Vec::new(),
+                                    }
+                                }
+                                _ => return None,
                             }
-                            _ => DtTermKind::Var,
+                        } else {
+                            match (
+                                if strict_opaque_scope {
+                                    datatype_members.get(name).copied()
+                                } else {
+                                    self.ctx
+                                        .exact_datatype_member_info(name)
+                                        .map(|info| info.declaration_kind())
+                                },
+                                self.ctx.is_constructor(name),
+                            ) {
+                                (
+                                    Some(ay_frontend::DeclarationKind::DatatypeConstructor),
+                                    Some((_dt, ctor)),
+                                ) if self
+                                    .ctx
+                                    .constructor_selector_info(&ctor)
+                                    .map_or(true, |f| f.is_empty()) =>
+                                {
+                                    DtTermKind::CtorApp {
+                                        ctor,
+                                        args: Vec::new(),
+                                    }
+                                }
+                                _ => DtTermKind::Var,
+                            }
                         };
                         dt_terms.push(t);
                         if dt_terms.len() > MAX_DT_TERMS {
@@ -840,23 +1043,117 @@ impl Executor {
                 _ => {}
             }
         }
-        // Shared EUF element => committed equal.
+        // Shared EUF element => committed equal — but only between terms
+        // whose committed tester evidence is compatible. A candidate
+        // model from a lane that treated the datatype as a plain carrier
+        // can collapse every datatype term onto ONE element (observed:
+        // `@D!0` for all collected terms on the Certora DT+BV family),
+        // while committed tester readings for those same terms (from the
+        // SAT/BV side of the merged model) genuinely distinguish them.
+        // Merging on the element alone fused those terms into one class
+        // whose tester evidence then conflicted (`forced = mk`,
+        // `excluded = [leaf, mk]`), construction failed closed for the
+        // whole class, and the strict oracle read the leftover mixed
+        // readings as a violation. Genuine EUF classes have consistent
+        // tester evidence, so bucketing by compatible tester signature
+        // keeps those merges and splits only incoherent collapses;
+        // construction then assigns each split class its own coherent
+        // value and the unchanged gates decide acceptance.
         if let Some(euf) = model.euf_model.as_ref() {
-            let mut by_elem: HashMap<(String, String), usize> = HashMap::default();
-            for (i, &t) in dt_terms.iter().enumerate() {
-                if let Some(elem) = euf.term_values.get(&t) {
-                    let sort_name = self
-                        .exact_collected_datatype_sort_name(terms_store.sort(t), &datatype_names)
-                        .unwrap_or_default();
-                    let key = (sort_name, elem.clone());
-                    match by_elem.get(&key) {
-                        Some(&j) => {
-                            uf_union(&mut parent, i, j);
-                        }
-                        None => {
-                            by_elem.insert(key, i);
-                        }
+            // Per-term committed tester signature: (forced ctor, excluded
+            // ctors, self-conflicting). Self-conflicting terms (two true
+            // testers, or a forced ctor also excluded) never merge.
+            let mut tester_sig: HashMap<TermId, (Option<String>, Vec<String>, bool)> =
+                HashMap::default();
+            for (atom, ctor, arg) in &tester_apps {
+                let Some(truth) = committed(*atom) else {
+                    continue;
+                };
+                let entry = tester_sig
+                    .entry(*arg)
+                    .or_insert_with(|| (None, Vec::new(), false));
+                if truth {
+                    match &entry.0 {
+                        Some(prev) if prev != ctor => entry.2 = true,
+                        _ => entry.0 = Some(ctor.clone()),
                     }
+                } else if !entry.1.contains(ctor) {
+                    entry.1.push(ctor.clone());
+                }
+            }
+            for entry in tester_sig.values_mut() {
+                if let Some(forced) = &entry.0 {
+                    if entry.1.contains(forced) {
+                        entry.2 = true;
+                    }
+                }
+                entry.1.sort();
+            }
+            let sig_of = |t: TermId| -> (Option<String>, Vec<String>, bool) {
+                tester_sig
+                    .get(&t)
+                    .cloned()
+                    .unwrap_or_else(|| (None, Vec::new(), false))
+            };
+            let compatible = |a: &(Option<String>, Vec<String>, bool),
+                              b: &(Option<String>, Vec<String>, bool)|
+             -> bool {
+                if a.2 || b.2 {
+                    return false;
+                }
+                if let (Some(x), Some(y)) = (&a.0, &b.0) {
+                    if x != y {
+                        return false;
+                    }
+                }
+                if let Some(x) = &a.0 {
+                    if b.1.contains(x) {
+                        return false;
+                    }
+                }
+                if let Some(y) = &b.0 {
+                    if a.1.contains(y) {
+                        return false;
+                    }
+                }
+                true
+            };
+            // Buckets per (sort, element): representative term index plus
+            // the merged tester signature of the bucket so far.
+            let mut buckets: HashMap<
+                (String, String),
+                Vec<(usize, (Option<String>, Vec<String>, bool))>,
+            > = HashMap::default();
+            for (i, &t) in dt_terms.iter().enumerate() {
+                let Some(elem) = euf.term_values.get(&t) else {
+                    continue;
+                };
+                let sort_name = self
+                    .exact_collected_datatype_sort_name(terms_store.sort(t), &datatype_names)
+                    .unwrap_or_default();
+                let sig = sig_of(t);
+                if sig.2 {
+                    continue; // self-conflicting tester evidence: never merge
+                }
+                let group = buckets.entry((sort_name, elem.clone())).or_default();
+                let mut joined = false;
+                for (rep, bucket_sig) in group.iter_mut() {
+                    if compatible(bucket_sig, &sig) {
+                        uf_union(&mut parent, i, *rep);
+                        if bucket_sig.0.is_none() {
+                            bucket_sig.0.clone_from(&sig.0);
+                        }
+                        for ex in &sig.1 {
+                            if !bucket_sig.1.contains(ex) {
+                                bucket_sig.1.push(ex.clone());
+                            }
+                        }
+                        joined = true;
+                        break;
+                    }
+                }
+                if !joined {
+                    group.push((i, sig));
                 }
             }
         }
@@ -965,7 +1262,22 @@ impl Executor {
             // validation degrades (fail closed) — nothing to record here.
         }
 
+        // Occurs-guard inventory: selector applications whose result
+        // class equals their argument class loop within the class.
+        let mut self_loop_selectors: HashMap<usize, Vec<String>> = HashMap::default();
+        for (app, sel, arg) in &sel_apps {
+            let (Some(&ai), Some(&gi)) = (index.get(app), index.get(arg)) else {
+                continue;
+            };
+            if class_of[ai] == class_of[gi] {
+                let entry = self_loop_selectors.entry(class_of[ai]).or_default();
+                if !entry.contains(sel) {
+                    entry.push(sel.clone());
+                }
+            }
+        }
         let datatype_array_required_terms = self.datatype_array_field_required_terms();
+        let lane_pin_terms = self.lane_model_pin_terms();
         Some(DtBuilder {
             exec: self,
             model,
@@ -977,14 +1289,18 @@ impl Executor {
             info: HashMap::default(),
             diseq,
             sel_apps,
+            self_loop_selectors,
             tester_apps,
             hard_literal_truth,
+            authored_hard_truth,
+            authored_reachable,
             values: HashMap::default(),
             work_budget,
             exact_array_classes: HashMap::default(),
             exact_array_class_rejected: false,
             exact_array_field_work: 0,
             datatype_array_required_terms,
+            lane_pin_terms,
         })
     }
 
@@ -1022,7 +1338,7 @@ impl Executor {
 
         let mut blocked = HashSet::default();
         let mut seen = HashSet::default();
-        let mut stack = self.datatype_model_collection_roots(extra_roots);
+        let mut stack = self.datatype_model_collection_roots(extra_roots)?;
         while let Some(term) = stack.pop() {
             if !seen.insert(term) {
                 continue;
@@ -1193,12 +1509,28 @@ impl DtBuilder<'_> {
                     // an authored-query-reachable constructor application is
                     // an exact force. If the bounded authored inventory is
                     // unavailable, retain the old conservative exact force.
+                    // A producing lane's value pin is such an exact force too:
+                    // its constructor terms are the committed value itself.
                     if self
                         .datatype_array_required_terms
                         .as_ref()
                         .is_some_and(|required| !required.contains(&term))
+                        && !self.lane_pin_terms.contains(&term)
                     {
                         continue;
+                    }
+                    // Tier: lane pins are exact; otherwise the force is
+                    // authored-hard only when the application term is
+                    // reachable from the authored window (a generated
+                    // round-trip application is candidate-soft even on
+                    // the conservative inventory-unavailable path).
+                    if self.lane_pin_terms.contains(&term)
+                        || self
+                            .authored_reachable
+                            .as_ref()
+                            .is_none_or(|set| set.contains(&term))
+                    {
+                        ci.hard_evidence = true;
                     }
                     match &ci.forced {
                         Some(force) if &force.ctor != ctor => ci.conflicted = true,
@@ -1225,6 +1557,17 @@ impl DtBuilder<'_> {
                 continue;
             };
             let ci = self.info.entry(root).or_default();
+            // Tier: authored-hard iff the authored-window computation is
+            // unavailable (conservative) or proves this atom. A reading
+            // sourced only from the candidate's SAT assignment on a
+            // generated atom is candidate-soft.
+            if self
+                .authored_hard_truth
+                .as_ref()
+                .is_none_or(|hard| hard.contains_key(&atom))
+            {
+                ci.hard_evidence = true;
+            }
             if truth {
                 match &ci.forced {
                     Some(force) if force.ctor != ctor => ci.conflicted = true,
@@ -1330,7 +1673,66 @@ impl DtBuilder<'_> {
                 _ => {}
             }
         }
+        // Soft-conflict relaxation (#dt-soft-conflict): a class whose
+        // conflicting constructor evidence is entirely candidate-soft
+        // (no authored-hard force or exclusion participated) resets to
+        // a free choice instead of failing closed. The candidate model
+        // being repaired need not be datatype-coherent — bit-blast
+        // assignments have no occurs-check and can pin generated
+        // deepening testers inconsistently across one merged class —
+        // while authored facts must never be relaxed. Validation
+        // still decides acceptance of the constructed candidate.
+        for class in self.info.values_mut() {
+            if class.conflicted && !class.hard_evidence {
+                class.forced = None;
+                class.excluded.clear();
+                class.conflicted = false;
+            }
+        }
+        // Occurs-guard (#dt-occurs-guard): a forced constructor that is
+        // self-referential for its class (one of its field selectors
+        // loops within the class) can never be the class value under
+        // datatype acyclicity. With authored-hard evidence that is a
+        // genuine conflict — fail closed as before. With only
+        // candidate-soft evidence, drop the force: the free choice
+        // avoids self-referential constructors, and validation still
+        // decides acceptance.
+        let forced_roots: Vec<usize> = self.info.keys().copied().collect();
+        for root in forced_roots {
+            let Some(class) = self.info.get(&root) else {
+                continue;
+            };
+            if class.conflicted {
+                continue;
+            }
+            let Some(force) = class.forced.clone() else {
+                continue;
+            };
+            if self.ctor_self_referential(root, &force.ctor) {
+                let Some(class) = self.info.get_mut(&root) else {
+                    continue;
+                };
+                if class.hard_evidence {
+                    class.conflicted = true;
+                } else {
+                    class.forced = None;
+                }
+            }
+        }
         true
+    }
+
+    /// True when `ctor` has a field whose selector loops within class
+    /// `root` (see `self_loop_selectors`): no acyclic value of this
+    /// class can carry that constructor.
+    pub(super) fn ctor_self_referential(&self, root: usize, ctor: &str) -> bool {
+        let Some(loops) = self.self_loop_selectors.get(&root) else {
+            return false;
+        };
+        let Some(fields) = self.bounded_constructor_fields(ctor) else {
+            return false;
+        };
+        fields.iter().any(|(fname, _)| loops.contains(fname))
     }
 
     /// Collect the committed SELECTOR OBSERVATIONS of class `root` into `out`

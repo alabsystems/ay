@@ -75,8 +75,7 @@ impl RelevancyFrontier {
     pub(super) fn fold_assign(&mut self, s: &Solver, lit: Literal) {
         let v = lit.variable().index();
         if v < self.buf.len() && self.buf[v] {
-            self.buf[v] = false;
-            self.size -= 1;
+            self.member_remove(v);
         }
         let li = lit.index();
         if li >= self.occ.len() {
@@ -100,8 +99,7 @@ impl RelevancyFrontier {
                 }
                 self.var_unsat[u] -= 1;
                 if self.var_unsat[u] == 0 && self.buf[u] {
-                    self.buf[u] = false;
-                    self.size -= 1;
+                    self.member_remove(u);
                 }
             }
         }
@@ -153,8 +151,7 @@ impl RelevancyFrontier {
             && self.var_unsat[v] > 0
             && !s.var_lifecycle.is_removed(v)
         {
-            self.buf[v] = true;
-            self.size += 1;
+            self.member_insert(v);
         }
     }
 
@@ -173,8 +170,7 @@ impl RelevancyFrontier {
             && ay_prefetch::val_at(&s.vals, v * 2) == 0
             && !s.var_lifecycle.is_removed(v)
         {
-            self.buf[v] = true;
-            self.size += 1;
+            self.member_insert(v);
         }
     }
 }

@@ -41,7 +41,7 @@ they remain data across the JSON ABI and are never passed to Python `eval`.
 examples for Sudoku, an LLM token router, and Minesweeper live in
 `examples/search_*.py`.
 
-From the repository root, after `cargo build -p ay-ffi`:
+From the repository root, after `targo --unverified build -p ay-ffi` (stock Rust: `cargo build -p ay-ffi`):
 
 ```bash
 PYTHONPATH=bindings/python python3 bindings/python/examples/search_sudoku.py
@@ -63,7 +63,7 @@ Building the wheel requires a Rust toolchain (`cargo`), because the build step c
 pip install .
 ```
 
-This runs `cargo build -p ay-ffi --release` and folds the resulting
+This runs `targo --unverified build -p ay-ffi --release` when the Trust toolchain's `targo` is on PATH, else `cargo build -p ay-ffi --release`, and folds the resulting
 `libay_ffi.{dylib,so}` into the wheel. Then, from anywhere:
 
 ```python
@@ -82,7 +82,7 @@ print(s.model())
 2. The cdylib **bundled in the package directory** (next to `ayz3/_lib.py`) — this is the installed-wheel path.
 3. The in-tree dev fallback: walk up to the Cargo workspace root and probe `target/release/` then `target/debug/`.
 
-So both workflows work: an installed wheel uses (2); a source checkout with `cargo build -p ay-ffi` uses (3).
+So both workflows work: an installed wheel uses (2); a source checkout with `targo --unverified build -p ay-ffi` (or `cargo build -p ay-ffi`) uses (3).
 The `aysearch` loader follows the same bundled/source paths and additionally
 honors `AYSEARCH_LIB` before the shared `AYZ3_LIB` fallback.
 
@@ -115,7 +115,7 @@ implemented C-ABI route raise `NotImplementedError` naming the gap.
 - **Misc:** `is_true`, `is_false`, `simplify`, `set_param`/`get_param`, `parse_smtlib2_string`/`parse_smtlib2_file`.
 
 The suite in `tests/` contains representative verdict and value cross-checks
-against the required `z3-solver==5.1.0.0` oracle. It does not establish
+against the required `z3-solver==5.3.3.0` oracle. It does not establish
 equivalence over every input in the operation domains above.
 
 ### Example applications
@@ -161,10 +161,10 @@ To use `ayz3` on another OS/arch, build the wheel on that platform from an AY ch
 
 ## Development
 
-Run the in-tree test suite against a local `cargo build -p ay-ffi`:
+Run the in-tree test suite against a local `targo --unverified build -p ay-ffi` (stock Rust: `cargo build -p ay-ffi`):
 
 ```bash
-cargo build -p ay-ffi          # builds target/debug/libay_ffi.{dylib,so}
+targo --unverified build -p ay-ffi   # builds target/debug/libay_ffi.{dylib,so} (stock Rust: cargo build -p ay-ffi)
 cd bindings/python
 python3 -m pip install -e '.[dev]'
 python3 -m pytest tests/       # cross-checked vs real z3py

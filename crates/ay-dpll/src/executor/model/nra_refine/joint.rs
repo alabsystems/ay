@@ -41,7 +41,8 @@
 //!        meets it again in a RATIONAL point, for every rational slope. Slopes
 //!        come from the exact isolating interval of the true chord slope, so
 //!        the proposed points converge on the model point and eventually
-//!        satisfy the instance's strict inequalities too.
+//!        satisfy the instance's strict inequalities too. Only after every
+//!        plain sweep declines, `scaled.rs` retries quartics that `v = z·w` makes conic.
 //!
 //! A fourth sample rejects every cubic but not every higher-degree restriction;
 //! it is a candidate-budget filter, not proof of quadraticity. Every proposed
@@ -67,6 +68,7 @@ use crate::executor::Executor;
 
 mod math;
 mod plan;
+mod scaled;
 
 /// Cap on positive equalities harvested from the assertion set.
 const MAX_EQUALITIES: usize = 64;
@@ -164,12 +166,15 @@ impl Executor {
             .filter(|term| !matches!(self.ctx.terms.sort(*term), Sort::Int))
             .take(MAX_PARTNER_CHOICES)
             .collect();
-        for beta in partners {
+        for &beta in &partners {
+            if self.poll_evaluation_stop().is_err() {
+                return false;
+            }
             if self.joint_chord_rounds(&plan, state, beta) {
                 return true;
             }
         }
-        false
+        self.joint_scaled_chords(&plan, state, &partners)
     }
 
     /// FREE mode: the algebraic value moves to the simplest nearby rational
@@ -181,6 +186,9 @@ impl Executor {
         }
         let mut last: Option<BigRational> = None;
         for round in 0..MAX_JOINT_ROUNDS {
+            if self.poll_evaluation_stop().is_err() {
+                return false;
+            }
             if round > 0 && !narrow(state) {
                 return false;
             }
@@ -219,6 +227,9 @@ impl Executor {
         // The denominator's enclosure must exclude 0: `ᾱ` is irrational and
         // `u₀` rational, so bisection always separates them.
         for _ in 0..MAX_SEPARATION_ROUNDS {
+            if self.poll_evaluation_stop().is_err() {
+                return false;
+            }
             if state[0].lo > seed_u || state[0].hi < seed_u {
                 break;
             }
@@ -231,6 +242,9 @@ impl Executor {
         }
         let mut last: Option<BigRational> = None;
         for round in 0..MAX_JOINT_ROUNDS {
+            if self.poll_evaluation_stop().is_err() {
+                return false;
+            }
             if round > 0 && !narrow(state) {
                 return false;
             }

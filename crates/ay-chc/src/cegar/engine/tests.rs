@@ -221,18 +221,6 @@ fn create_multi_predicate_fact_problem() -> (ChcProblem, PredicateId, PredicateI
     (problem, p, q)
 }
 
-fn make_deep_conjunction(depth: usize) -> ChcExpr {
-    let x = ChcVar::new("x", ChcSort::Int);
-    let mut expr = ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(0));
-    for _ in 0..depth {
-        // Keep an exponentially large occurrence graph without routing it
-        // through canonical conjunction deduplication or the simplifier's
-        // reflexive-equality fold.
-        expr = ChcExpr::eq(expr.clone(), ChcExpr::not(expr));
-    }
-    expr
-}
-
 #[test]
 fn test_analyze_counterexample_reports_genuine_for_feasible_trace() {
     let problem = create_immediate_fact_to_false_problem();
@@ -293,24 +281,26 @@ fn test_analyze_counterexample_reports_spurious_for_infeasible_trace() {
 
 #[test]
 fn test_try_generate_edge_treats_smt_unknown_as_feasible() {
-    // Depth 20 exceeds the SMT conversion-node budget and deterministically
-    // returns Unknown in check_sat.
-    let deep_constraint = make_deep_conjunction(20);
+    // The SMT answer is forced to Unknown. (This test used to reach Unknown via
+    // the conversion-node budget on a 2^20-occurrence DAG; since WP-F F0c the
+    // budget counts distinct nodes and that DAG converts, and a query with
+    // enough distinct nodes is capped by query routing before conversion.)
+    let x = ChcVar::new("x", ChcSort::Int);
+    let constraint = ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(0));
 
     let mut problem = ChcProblem::new();
     problem.add_clause(HornClause::new(
-        ClauseBody::constraint(deep_constraint.clone()),
+        ClauseBody::constraint(constraint.clone()),
         ClauseHead::False,
     ));
 
     let mut engine = CegarEngine::new(problem, CegarConfig::default());
+    engine
+        .smt
+        .push_forced_check_sat_result_for_tests(SmtResult::Unknown);
     let edge = engine
-        .try_generate_edge(&[], 0, &deep_constraint)
+        .try_generate_edge(&[], 0, &constraint)
         .expect("Unknown must be treated as feasible and produce an edge");
-    assert!(
-        engine.smt.conversion_budget_exceeded(),
-        "precondition: deep constraint should exceed conversion budget and produce Unknown"
-    );
     assert_eq!(edge.clause_index, 0);
     assert!(
         edge.from.is_empty(),
@@ -1243,4 +1233,32 @@ fn test_cegar_no_false_unsafe_multi_predicate_6047() {
         !matches!(result, CegarResult::Unsafe(_)),
         "CEGAR must not return false-Unsafe on safe multi-predicate problem (#6047), got: {result:?}"
     );
+}
+
+/// Rung 4 is inert with the flag off: the abstract-post context exists only
+/// while the session is enabled (batch-1 adversarial review: an unconditional
+/// second context split CEGAR's strike breaker, term-memory budget and BV cache
+/// in two with `--chc-session` unset).
+#[test]
+fn abstract_post_context_exists_only_while_the_session_is_enabled() {
+    {
+        let _mode = crate::smt::lane::ScopedSessionMode::set(0);
+        let mut engine = CegarEngine::new(create_safe_problem(), CegarConfig::default());
+        assert!(
+            engine.search_smt.is_none(),
+            "flag off: one legacy context, exactly as before Rung 4"
+        );
+        let expansion = engine.expansion_smt() as *const SmtContext;
+        assert!(std::ptr::eq(expansion, &engine.smt));
+    }
+    {
+        let _mode = crate::smt::lane::ScopedSessionMode::set(2);
+        let mut engine = CegarEngine::new(create_safe_problem(), CegarConfig::default());
+        assert!(engine
+            .search_smt
+            .as_ref()
+            .is_some_and(SmtContext::session_designated));
+        let expansion = engine.expansion_smt() as *const SmtContext;
+        assert!(!std::ptr::eq(expansion, &engine.smt));
+    }
 }

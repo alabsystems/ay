@@ -1331,10 +1331,12 @@ fn validate_track_id(
 pub fn is_canonical_track_id(track_id: &str) -> bool {
     let mut previous_hyphen = true;
     for byte in track_id.bytes() {
-        match byte {
-            b'a'..=b'z' | b'0'..=b'9' => previous_hyphen = false,
-            b'-' if !previous_hyphen => previous_hyphen = true,
-            _ => return false,
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            previous_hyphen = false;
+        } else if byte == b'-' && !previous_hyphen {
+            previous_hyphen = true;
+        } else {
+            return false;
         }
     }
     !previous_hyphen
@@ -1656,7 +1658,7 @@ fn validate_official_score_ranking(
         return;
     };
     let denominator = leaderboard.denominator.filter(|value| *value > 0);
-    let mut scores = Vec::with_capacity(leaderboard.competitors.len());
+    let mut scores = Vec::new();
     for competitor in &leaderboard.competitors {
         if !competitor.eligible {
             issues.push(CampaignValidationIssue::UnsupportedScoredEligibility {
@@ -1691,8 +1693,8 @@ fn validate_official_score_ranking(
         }
     }
 
-    for (index, competitor) in leaderboard.competitors.iter().enumerate() {
-        let Some(score) = scores[index] else {
+    for (competitor, score) in leaderboard.competitors.iter().zip(&scores) {
+        let Some(score) = *score else {
             continue;
         };
         let better = scores
@@ -2240,17 +2242,22 @@ fn is_strict_utc_rfc3339(value: &str) -> bool {
         return false;
     }
     for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        if !bytes[index].is_ascii_digit() {
-            return false;
+        match bytes.get(index) {
+            Some(byte) if byte.is_ascii_digit() => {}
+            _ => return false,
         }
     }
 
-    let year = decimal_component(bytes, 0, 4);
-    let month = decimal_component(bytes, 5, 7);
-    let day = decimal_component(bytes, 8, 10);
-    let hour = decimal_component(bytes, 11, 13);
-    let minute = decimal_component(bytes, 14, 16);
-    let second = decimal_component(bytes, 17, 19);
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        decimal_component(bytes, 0, 4),
+        decimal_component(bytes, 5, 7),
+        decimal_component(bytes, 8, 10),
+        decimal_component(bytes, 11, 13),
+        decimal_component(bytes, 14, 16),
+        decimal_component(bytes, 17, 19),
+    ) else {
+        return false;
+    };
     let Some(days_in_month) = days_in_month(year, month) else {
         return false;
     };
@@ -2258,10 +2265,15 @@ fn is_strict_utc_rfc3339(value: &str) -> bool {
     year > 0 && (1..=days_in_month).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
 }
 
-fn decimal_component(bytes: &[u8], start: usize, end: usize) -> u32 {
-    bytes[start..end]
-        .iter()
-        .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0'))
+/// The decimal value of `bytes[start..end]`, or `None` when the range is out
+/// of bounds, holds a byte below `b'0'`, or overflows `u32`.
+fn decimal_component(bytes: &[u8], start: usize, end: usize) -> Option<u32> {
+    let mut value = 0_u32;
+    for byte in bytes.get(start..end)? {
+        let digit = byte.checked_sub(b'0')?;
+        value = value.checked_mul(10)?.checked_add(u32::from(digit))?;
+    }
+    Some(value)
 }
 
 fn days_in_month(year: u32, month: u32) -> Option<u32> {
@@ -2309,10 +2321,10 @@ mod tests {
             winner,
             tied: false,
             score: json!({
-                "solved": 10 - rank,
-                "cpu_seconds": rank * 100,
+                "solved": 10_u64.saturating_sub(rank),
+                "cpu_seconds": rank.saturating_mul(100),
             }),
-            metrics: json!({"solved": 10 - rank}),
+            metrics: json!({"solved": 10_u64.saturating_sub(rank)}),
         }
     }
 

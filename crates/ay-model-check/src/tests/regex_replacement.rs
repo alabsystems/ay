@@ -284,55 +284,66 @@ fn replace_re_reads_its_subject_from_the_model() {
     assert_cannot(&verdict(&ts, &StubModel::new(), &[eq]));
 }
 
-// ── deliberately fail-closed shapes ──────────────────────────────────────
-//
-// Each of these returns CannotConfirm. That is a completeness cost only: the
-// gate never assumes an assertion it cannot compute, so a refusal can only
-// leave a verdict at `unknown`, never publish a wrong `sat`.
+// Nullable languages distinguish single replacement from replace-all.
 
 #[test]
-fn replace_re_fails_closed_on_a_star_regex() {
-    // `re.*` accepts the empty word. `str.replace_re`'s clause has no
-    // `w != ""` side condition and `str.replace_re_all`'s does, so the two
-    // disagree about what the empty match means; the gate declines both.
-    for op in ["str.replace_re", "str.replace_re_all"] {
-        assert_cannot(&replace_re_verdict(
-            op,
-            |ts| {
-                let a = re_lit(ts, "a");
-                app(ts, "re.*", &[a], Sort::RegLan)
-            },
-            "bbb",
-            "X",
-            "Xbbb",
-        ));
+fn replace_re_star_preserves_the_distinct_empty_match_rules() {
+    let build = |ts: &mut TermStore| {
+        let a = re_lit(ts, "a");
+        app(ts, "re.*", &[a], Sort::RegLan)
+    };
+    for (op, subject, correct, wrong) in [
+        ("str.replace_re", "bbb", "Xbbb", "bbb"),
+        ("str.replace_re_all", "bbb", "bbb", "Xbbb"),
+        ("str.replace_re", "aabaaa", "Xaabaaa", "Xabaaa"),
+        ("str.replace_re_all", "aabaaa", "XXbXXX", "XbX"),
+        ("str.replace_re", "αa", "Xαa", "αX"),
+        ("str.replace_re_all", "αa", "αX", "Xαa"),
+    ] {
+        assert_confirmed(&replace_re_verdict(op, build, subject, "X", correct));
+        assert_violates(&replace_re_verdict(op, build, subject, "X", wrong));
     }
 }
 
 #[test]
-fn replace_re_fails_closed_on_an_empty_literal_regex() {
-    for op in ["str.replace_re", "str.replace_re_all"] {
-        assert_cannot(&replace_re_verdict(
+fn replace_re_empty_language_word_handles_empty_and_nonempty_subjects() {
+    for (op, subject, correct, wrong) in [
+        ("str.replace_re", "abc", "Xabc", "abc"),
+        ("str.replace_re_all", "abc", "abc", "Xabc"),
+        ("str.replace_re", "", "X", ""),
+        ("str.replace_re_all", "", "", "X"),
+    ] {
+        assert_confirmed(&replace_re_verdict(
             op,
             |ts| re_lit(ts, ""),
-            "abc",
+            subject,
             "X",
-            "Xabc",
+            correct,
+        ));
+        assert_violates(&replace_re_verdict(
+            op,
+            |ts| re_lit(ts, ""),
+            subject,
+            "X",
+            wrong,
         ));
     }
 }
 
 #[test]
-fn replace_re_fails_closed_on_re_all_and_re_opt() {
-    for op in ["str.replace_re", "str.replace_re_all"] {
-        assert_cannot(&replace_re_verdict(
+fn replace_re_nullable_all_and_optional_take_only_the_specified_matches() {
+    for (op, all_result, optional_result) in [
+        ("str.replace_re", "Xabc", "Xabc"),
+        ("str.replace_re_all", "XXX", "Xbc"),
+    ] {
+        assert_confirmed(&replace_re_verdict(
             op,
             |ts| app(ts, "re.all", &[], Sort::RegLan),
             "abc",
             "X",
-            "Xabc",
+            all_result,
         ));
-        assert_cannot(&replace_re_verdict(
+        assert_confirmed(&replace_re_verdict(
             op,
             |ts| {
                 let a = re_lit(ts, "a");
@@ -340,7 +351,7 @@ fn replace_re_fails_closed_on_re_all_and_re_opt() {
             },
             "abc",
             "X",
-            "Xabc",
+            optional_result,
         ));
     }
 }
@@ -349,7 +360,7 @@ fn replace_re_fails_closed_on_re_all_and_re_opt() {
 fn replace_re_detects_nullability_below_the_top_level() {
     // The union is nullable only because one alternative is; the check is a
     // real emptiness probe of the whole regex, not a syntactic top-level test.
-    assert_cannot(&replace_re_verdict(
+    assert_confirmed(&replace_re_verdict(
         "str.replace_re",
         |ts| {
             let a = re_lit(ts, "a");

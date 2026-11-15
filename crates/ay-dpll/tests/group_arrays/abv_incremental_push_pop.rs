@@ -225,5 +225,8 @@ fn test_abv_model_extraction_consistency() {
 (get-value (idx (select (store a idx #xFF) idx)))
 "#,
     );
-    assert!(output.contains("sat"), "should be sat: {output}");
+    assert!(
+        output.lines().any(|line| line.trim() == "sat"),
+        "should be sat: {output}"
+    );
 }

@@ -7,10 +7,13 @@ use std::collections::BTreeMap;
 use ay_dpll::api::{Sort as ApiSort, Term};
 
 use super::context::{expr_solver_op, ExecutionContext};
+use super::datatypes::{self, translate_sort};
 use super::translate_bridge;
 use super::ExecuteError;
 use crate::expr::{Expr, ExprValue};
-use crate::sort::{Sort, SortInner};
+use crate::sort::Sort;
+
+mod range_copy;
 
 /// Red zone size for `stacker::maybe_grow` in expression translation.
 ///
@@ -26,45 +29,6 @@ const TRANSLATE_STACK_RED_ZONE: usize = if cfg!(debug_assertions) {
 /// Stack size to allocate when the red zone is hit during translation.
 const TRANSLATE_STACK_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
-/// Translate ay_bindings::Sort to ay_dpll::api::Sort.
-///
-/// Uses the From impl from sort.rs for supported sorts. Datatype sorts
-/// are translated to `Sort::Uninterpreted(name)` which is how the SMT-LIB
-/// parser represents declared datatypes internally.
-pub(super) fn translate_sort(sort: &Sort) -> Result<ApiSort, ExecuteError> {
-    match sort.inner() {
-        // Datatype sorts map to Uninterpreted(name) — the DeclareDatatype
-        // constraint registers the actual DT structure with the solver.
-        SortInner::Datatype(dt) => Ok(ay_core::Sort::Uninterpreted(dt.name.clone())),
-        _ => Ok(ay_core::Sort::from(sort)),
-    }
-}
-
-/// Bridge a ay_bindings DatatypeSort to ay_core DatatypeSort.
-///
-/// Both crates define identical DatatypeSort structures but with different
-/// Sort types for fields. This function converts by translating each field sort.
-pub(super) fn bridge_datatype(
-    dt: &crate::sort::DatatypeSort,
-) -> Result<ay_core::DatatypeSort, ExecuteError> {
-    let constructors = dt
-        .constructors
-        .iter()
-        .map(|ctor| {
-            let fields: Result<Vec<_>, _> = ctor
-                .fields
-                .iter()
-                .map(|f| {
-                    let sort = translate_sort(&f.sort)?;
-                    Ok(ay_core::DatatypeField::new(&f.name, sort))
-                })
-                .collect();
-            Ok(ay_core::DatatypeConstructor::new(&ctor.name, fields?))
-        })
-        .collect::<Result<Vec<_>, ExecuteError>>()?;
-    Ok(ay_core::DatatypeSort::new(&dt.name, constructors))
-}
-
 /// Translate ay_bindings::Expr to ay_dpll::api::Term.
 ///
 /// Uses `stacker::maybe_grow` for stack safety on deeply nested expressions (#8414).
@@ -72,13 +36,29 @@ pub(super) fn translate_expr(
     ctx: &mut ExecutionContext,
     expr: &Expr,
 ) -> Result<Term, ExecuteError> {
-    stacker::maybe_grow(TRANSLATE_STACK_RED_ZONE, TRANSLATE_STACK_SIZE, || {
+    // A node already lowered outside every binder overlay is the same term
+    // again (#session-translation-memo): a DAG-shaped expression lowers once
+    // per node, and a node shared by several assertions lowers once.
+    let memoizable = ctx.bound_var_scopes.is_empty();
+    if memoizable {
+        if let Some(term) = ctx.translation_memo.get(expr) {
+            return Ok(term);
+        }
+    }
+    let term = stacker::maybe_grow(TRANSLATE_STACK_RED_ZONE, TRANSLATE_STACK_SIZE, || {
         translate_expr_inner(ctx, expr)
-    })
+    })?;
+    if memoizable && ctx.bound_var_scopes.is_empty() {
+        ctx.translation_memo.insert(expr, term);
+    }
+    Ok(term)
 }
 
 /// Inner translation logic, called within stacker guard.
 fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term, ExecuteError> {
+    if matches!(expr.value(), ExprValue::ArrayRangeCopy { .. }) {
+        return range_copy::translate(ctx, expr);
+    }
     if let Some(result) = translate_bridge::maybe_translate_expr(ctx, expr) {
         return result;
     }
@@ -144,6 +124,7 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
         | ExprValue::BvSLt(_, _)
         | ExprValue::Select { .. }
         | ExprValue::Store { .. }
+        | ExprValue::ArrayRangeCopy { .. }
         | ExprValue::ConstArray { .. }
         | ExprValue::BvUDiv(_, _)
         | ExprValue::BvSDiv(_, _)
@@ -221,48 +202,11 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
             expr_solver_op(ctx.solver.try_bv2int(t), "bv2int")
         }
 
-        // Datatype operations — bridged to ay_dpll DT API (#5404)
-        ExprValue::DatatypeConstructor {
-            datatype_name,
-            constructor_name,
-            args,
-        } => {
-            let core_dt = ctx
-                .declared_datatypes
-                .get(datatype_name)
-                .ok_or_else(|| {
-                    ExecuteError::ExprTranslation(format!(
-                        "undeclared datatype '{datatype_name}' in constructor application"
-                    ))
-                })?
-                .clone();
-            let translated_args: Result<Vec<_>, _> =
-                args.iter().map(|a| translate_expr(ctx, a)).collect();
-            ctx.solver
-                .try_datatype_constructor(&core_dt, constructor_name, &translated_args?)
-                .map_err(|e| ExecuteError::ExprTranslation(e.to_string()))
-        }
-        ExprValue::DatatypeSelector {
-            selector_name,
-            expr: inner,
-            ..
-        } => {
-            let translated = translate_expr(ctx, inner)?;
-            let result_sort = translate_sort(expr.sort())?;
-            ctx.solver
-                .try_datatype_selector(selector_name, translated, result_sort)
-                .map_err(|e| ExecuteError::ExprTranslation(e.to_string()))
-        }
-        ExprValue::DatatypeTester {
-            constructor_name,
-            expr: inner,
-            ..
-        } => {
-            let translated = translate_expr(ctx, inner)?;
-            ctx.solver
-                .try_datatype_tester(constructor_name, translated)
-                .map_err(|e| ExecuteError::ExprTranslation(e.to_string()))
-        }
+        // Datatype operations — bridged to ay_dpll DT API (#5404), under the
+        // definition registry (see `datatypes`).
+        ExprValue::DatatypeConstructor { .. }
+        | ExprValue::DatatypeSelector { .. }
+        | ExprValue::DatatypeTester { .. } => datatypes::translate_datatype_op(ctx, expr),
 
         // Quantifiers — supported via ay_dpll forall/exists API (#5406)
         ExprValue::Forall {
@@ -461,7 +405,7 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
             let te = translate_expr(ctx, exp)?;
             let tg = translate_expr(ctx, sig)?;
             // Infer eb/sb from the expression's sort.
-            let fp_sort = translate_sort(expr.sort())?;
+            let fp_sort = translate_sort(ctx, expr.sort())?;
             match fp_sort {
                 ay_core::Sort::FloatingPoint(eb, sb) => expr_solver_op(
                     ctx.solver.try_fp_from_bvs(ts, te, tg, eb, sb),
@@ -557,6 +501,14 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
             let t = translate_expr(ctx, inner)?;
             expr_solver_op(ctx.solver.try_fp_sqrt(rm_term, t), "fp_sqrt")
         }
+        ExprValue::FpTruncatingRem(a, b) => {
+            let ta = translate_expr(ctx, a)?;
+            let tb = translate_expr(ctx, b)?;
+            expr_solver_op(
+                super::truncating::lower(&mut ctx.solver, ta, tb),
+                "fp_truncating_rem",
+            )
+        }
         ExprValue::FpRem(a, b) => {
             let ta = translate_expr(ctx, a)?;
             let tb = translate_expr(ctx, b)?;
@@ -576,18 +528,61 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
     }
 }
 
+/// Return `true` if a binder requesting `requested` may NOT reuse an existing
+/// declaration of sort `existing`.
+///
+/// Mirrors the acceptance arms of `Solver::try_declare_const`: an equal sort is
+/// fine, and so is the deliberately narrow `Uninterpreted(name)` ⇄
+/// `Datatype{name}` placeholder-upgrade pair. Everything else is the embedder
+/// mistake this bridge reports as a recoverable error.
+fn binder_shadow_conflicts(existing: &ApiSort, requested: &ApiSort) -> bool {
+    if existing == requested {
+        return false;
+    }
+    let placeholder_pair = match (existing, requested) {
+        (ApiSort::Uninterpreted(opaque), ApiSort::Datatype(datatype))
+        | (ApiSort::Datatype(datatype), ApiSort::Uninterpreted(opaque)) => datatype.name == *opaque,
+        _ => false,
+    };
+    !placeholder_pair
+}
+
 /// Translate a quantifier (forall or exists) to ay_dpll terms.
 ///
-/// Creates bound variables via `try_declare_const`, translates the body with
-/// those variables in scope, then builds the quantifier term (with optional
+/// Creates bound variables via `try_fresh_var`, translates the body with those
+/// variables in scope, then builds the quantifier term (with optional
 /// triggers). Restores the variable scope afterward to avoid leaking bound
 /// variables.
+///
+/// BINDERS ARE NOT DECLARED CONSTANTS. `try_declare_const` registers the name
+/// in `Solver::var_names`, which is exactly what `declared_variables()`
+/// enumerates and what `try_get_model_map` then demands a value for. Popping
+/// `bound_var_scopes` does not undo that registration, so every quantified
+/// query used to leak its binders into the model: a harmless junk entry when
+/// the binder happened to have an interpretation, and a LOST SAT VERDICT when
+/// it did not — `(error "value of q is not available: no model value available
+/// for term of sort (_ BitVec 8)")` became `ModelGenerationFailed`, which
+/// `execute_incremental` reported as `model extraction failed: …` in place of
+/// the `sat` the solver had already decided (trust shape `ABVFP`).
+/// `Solver::fresh_var` is documented for precisely this use — "constructing
+/// quantified formulas, where bound variables should not appear as top-level
+/// symbols in models" — and `declared_variables()` documents fresh variables as
+/// intentionally excluded. It also removes a latent capture hazard:
+/// `try_declare_const` RETURNS THE EXISTING TERM for a repeated name+sort, so a
+/// binder that shadowed a same-sorted declared constant shared its `TermId`;
+/// `mk_forall` binds by name, so the two were indistinguishable. A fresh
+/// identity per binder cannot alias anything.
+///
+/// This changes only which names are enumerated for model extraction. It has no
+/// verdict authority: the quantifier term, its binder sorts, and every solving
+/// path over it are unchanged.
 ///
 /// A binder whose name collides with an existing declaration of a DIFFERENT
 /// sort is a recoverable embedder mistake and must surface as `ExecuteError`:
 /// the panicking `Solver::declare_const` here unwound into whatever process
 /// embeds ay — in compiler_consumer, a full ICE for any contract whose quantifier binder
-/// shadows a variable of another type.
+/// shadows a variable of another type. `fresh_var` cannot collide at all, so
+/// that check is now made explicitly, ahead of minting.
 fn translate_quantifier(
     ctx: &mut ExecutionContext,
     vars: &[(String, Sort)],
@@ -599,17 +594,23 @@ fn translate_quantifier(
     // translate_sort can fail before any scope mutation, so do it first.
     let api_sorts: Vec<_> = vars
         .iter()
-        .map(|(_, sort)| translate_sort(sort))
+        .map(|(_, sort)| translate_sort(ctx, sort))
         .collect::<Result<_, _>>()?;
 
     let mut scope = BTreeMap::new();
     let mut var_terms = Vec::with_capacity(vars.len());
 
     for ((name, _), api_sort) in vars.iter().zip(api_sorts) {
-        let term = expr_solver_op(
-            ctx.solver.try_declare_const(name, api_sort),
-            "declare_const",
-        )?;
+        if let Some(existing) = ctx.translation_state.get_var(name) {
+            let existing_sort = ctx.solver.term_sort(existing);
+            if binder_shadow_conflicts(&existing_sort, &api_sort) {
+                return Err(ExecuteError::ExprTranslation(format!(
+                    "declare_const: constant '{name}' is already declared with \
+                     sort {existing_sort}, not {api_sort}"
+                )));
+            }
+        }
+        let term = expr_solver_op(ctx.solver.try_fresh_var(name, api_sort), "fresh_var")?;
         scope.insert(name.clone(), term);
         var_terms.push(term);
     }

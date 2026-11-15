@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d95ae9b87c7e5f679fd0e7746be884252eecafc659e590d2fc495ff122a30fc5 # shrinks to formula = "(set-logic QF_SLIA)\n(declare-const x String)\n(declare-const y String)\n(declare-const z String)\n(assert (= (str.len x) 0))\n(assert (= (str.len x) 1))\n(check-sat)\n"
+cc 540c97a31688186321f0d4a297ce800ee6dd27843775204ea631ded6b9781b24 # shrinks to formula = "(set-logic QF_S)\n(declare-const x String)\n(declare-const y String)\n(declare-const z String)\n(assert (str.contains y \"xab\"))\n(assert (str.prefixof \"cc\" y))\n(assert (str.contains y \"byaa\"))\n(assert (str.prefixof \"by\" y))\n(assert (str.prefixof \"aaa\" z))\n(check-sat)\n"

@@ -15,6 +15,13 @@ fn ab_focused_margin() -> f64 {
     RESTART_MARGIN_FOCUSED
 }
 
+/// Which phase array `save_assigned_values_into` writes.
+#[derive(Clone, Copy)]
+pub(super) enum PhaseArray {
+    Target,
+    Best,
+}
+
 impl Solver {
     /// Equiticks progress-gate window in conflicts (`--sat-eqt-progress`),
     /// read once per solve and cached. Returns 0 when disabled (the default),
@@ -87,13 +94,65 @@ impl Solver {
             // gate is enabled, so this is inert for the default build.
             self.cold.last_target_improve_conflicts = self.num_conflicts;
             // CaDiCaL phases.cpp:5-12: copy from saved phase, not current assignment.
-            self.target_phase[..self.num_vars].copy_from_slice(&self.phase[..self.num_vars]);
+            // `--sat-target-kissat`: Kissat phases.c:48-68 saves the values of
+            // the assigned variables and keeps the rest of the target.
+            if self.cold.target_kissat {
+                self.save_assigned_values_into(PhaseArray::Target);
+            } else {
+                self.target_phase[..self.num_vars].copy_from_slice(&self.phase[..self.num_vars]);
+            }
         }
 
-        if conflict_free_len > self.best_trail_len {
+        if conflict_free_len > self.best_trail_len
+            && (self.stable_mode || !self.cold.best_stable_kissat)
+        {
             self.best_trail_len = conflict_free_len;
-            self.best_phase[..self.num_vars].copy_from_slice(&self.phase[..self.num_vars]);
+            if self.cold.target_kissat {
+                self.save_assigned_values_into(PhaseArray::Best);
+            } else {
+                self.best_phase[..self.num_vars].copy_from_slice(&self.phase[..self.num_vars]);
+            }
         }
+    }
+
+    /// Kissat `save_phases`: copy the value of every assigned variable into the
+    /// target or best phases; unassigned variables keep theirs.
+    /// `--sat-target-kissat-pop`: after a conflict (the trail runs past the
+    /// last conflict-free propagation), the conflict level's variables are
+    /// left out, as Kissat pops that level before it saves.
+    pub(super) fn save_assigned_values_into(&mut self, which: PhaseArray) {
+        let pop = ay_core::sat_ab_switches().target_kissat_pop == Some(true)
+            && self.no_conflict_until < self.trail.len();
+        let top = self.decision_level;
+        let phases = match which {
+            PhaseArray::Target => &mut self.target_phase,
+            PhaseArray::Best => &mut self.best_phase,
+        };
+        for (v, slot) in phases[..self.num_vars].iter_mut().enumerate() {
+            let value = self.vals[2 * v];
+            if value != 0 && !(pop && self.var_data[v].level >= top) {
+                *slot = value;
+            }
+        }
+    }
+
+    /// The target and best marks after compaction: the root trail length, or
+    /// under `--sat-target-kissat` Kissat's compact_best_and_target_values
+    /// (compact.c:290-318), the number of active variables with such a phase,
+    /// which on c8cde50f raises them and freezes the target.
+    pub(super) fn phase_marks_after_compaction(&self) -> (usize, usize) {
+        if !self.cold.target_kissat {
+            return (self.trail.len(), self.trail.len());
+        }
+        let (mut target, mut best) = (0usize, 0usize);
+        for v in 0..self.num_vars {
+            if self.var_lifecycle.is_inactive(v) {
+                continue;
+            }
+            target += usize::from(self.target_phase[v] != 0);
+            best += usize::from(self.best_phase[v] != 0);
+        }
+        (target, best)
     }
 
     /// Compute the i-th element of the Luby sequence: 1,1,2,1,1,2,4,1,1,2,1,1,2,4,8,...
@@ -149,6 +208,32 @@ impl Solver {
     ///
     /// Uses CaDiCaL-style stabilization: alternates between focused mode (frequent
     /// Glucose restarts) and stable mode (infrequent reluctant doubling restarts).
+    /// Advance Knuth's (u, v) reluctant-doubling state (Luby sequence) and
+    /// return the next stable restart interval, v x `RELUCTANT_INIT`.
+    ///
+    /// The cap keeps intervals bounded (CaDiCaL `reluctantmax`): AY resets once
+    /// v reaches `RELUCTANT_MAX`. `--sat-reluctant-cap-kissat` caps the
+    /// interval instead, as Kissat does: reset once v x period would exceed
+    /// 2^20 (reluctant.c:44-49).
+    pub(super) fn advance_reluctant(&mut self) -> u64 {
+        if (self.cold.reluctant_u & self.cold.reluctant_u.wrapping_neg()) == self.cold.reluctant_v {
+            self.cold.reluctant_u += 1;
+            self.cold.reluctant_v = 1;
+        } else {
+            self.cold.reluctant_v *= 2;
+        }
+        let cap_hit = if self.cold.reluctant_cap_kissat {
+            self.cold.reluctant_v.saturating_mul(RELUCTANT_INIT) > RELUCTANT_MAX
+        } else {
+            self.cold.reluctant_v >= RELUCTANT_MAX
+        };
+        if cap_hit {
+            self.cold.reluctant_u = 1;
+            self.cold.reluctant_v = 1;
+        }
+        self.cold.reluctant_v * RELUCTANT_INIT
+    }
+
     pub(super) fn should_restart(&mut self) -> bool {
         self.should_restart_impl::<true>()
     }
@@ -241,7 +326,7 @@ impl Solver {
                 // switch at the equal-effort budget exactly as plain equiticks.
                 // The hardcap bounds the deferral so it can never run unbounded,
                 // and the stable EMA is never touched (avoids the prior negative
-                // from AY_AB_STABLE_EMA_GATE=MAX).
+                // from the retired AY_AB_STABLE_EMA_GATE=MAX experiment).
                 false
             } else {
                 stable_ticks >= self.cold.stabilize_tick_limit
@@ -372,10 +457,15 @@ impl Solver {
                 // NEXT stable phase can be budgeted with this phase's delta.
                 self.cold.focused_ticks_at_entry = self.search_ticks[usize::from(false)];
                 let focused_phase = self.cold.stable_phase_count.max(1);
-                let next_delta = self
-                    .cold
-                    .stable_phase_length
-                    .saturating_mul(rephase::nlogpow4(focused_phase));
+                let next_delta = if ay_core::sat_ab_switches().mode_delta_kissat == Some(true) {
+                    let l = ((focused_phase + 9) as f64).log10();
+                    (self.cold.stable_phase_length as f64 * focused_phase as f64 * l * l * l * l)
+                        as u64
+                } else {
+                    self.cold
+                        .stable_phase_length
+                        .saturating_mul(rephase::nlogpow4(focused_phase))
+                };
                 let base_conflicts = self.num_conflicts;
                 self.cold.stabilize_tick_limit = base_conflicts.saturating_add(next_delta);
                 if self.cold.stabilize_tick_limit <= base_conflicts {
@@ -387,10 +477,31 @@ impl Solver {
             self.stable_mode = !self.stable_mode;
             self.cold.stable_mode_start_conflicts = self.num_conflicts;
             self.cold.mode_switch_count += 1;
+            // `--sat-restart-gate-kissat`: entering focused mode sets a fresh
+            // restart limit (Kissat mode.c), so the stable phase's conflicts
+            // do not count toward the first focused restart.
+            if self.cold.restart_gate_kissat && !self.stable_mode {
+                self.conflicts_since_restart = 0;
+            }
+            // `--sat-bump-reasons-kissat`: the entered mode's rate counts only
+            // its own decisions (Kissat mode.c:212).
+            let decisions = self.cold.search_decisions;
+            self.cold.kissat_decision_rate[usize::from(self.stable_mode)]
+                .restart_count_at(decisions);
+            // `--sat-stable-lock-at` decided in focused mode: this switch into
+            // stable is the last one.
+            if self.stable_mode && self.cold.stable_lock_pending {
+                self.cold.stable_lock_pending = false;
+                self.cold.mode_lock = cold::ModeLock::Stable;
+            }
 
             // When entering focused mode, rebuild deferred VMTF linked list
             // so focused-mode decisions have a consistent queue (#7998).
-            if !self.stable_mode && self.vsids.vmtf_is_deferred() {
+            // `--sat-queue-freeze-kissat`: the queue did not move; search it
+            // from its end.
+            if !self.stable_mode && self.vsids.queue_frozen_in_stable() {
+                self.vsids.reset_vmtf_search_to_last();
+            } else if !self.stable_mode && self.vsids.vmtf_is_deferred() {
                 self.vsids.rebuild_vmtf_from_bump_order(&self.vals);
             }
 
@@ -456,8 +567,12 @@ impl Solver {
                 // inflated target_trail_len carried over from a prior phase
                 // would otherwise lock this stable phase out of ever updating
                 // its target, defeating target phasing on deep structured
-                // instances.
-                self.target_trail_len = 0;
+                // instances. `--sat-target-kissat` keeps it, as Kissat does
+                // (mode.c leaves it; only a rephase resets it): with AY's reset
+                // Kissat needs 21x the conflicts on c8cde50f.
+                if !self.cold.target_kissat {
+                    self.target_trail_len = 0;
+                }
                 // Equiticks progress gate: a fresh stable phase counts as
                 // "just improved" so it is not immediately treated as plateaued
                 // before its first target update (which lands within a few
@@ -470,7 +585,13 @@ impl Solver {
 
             // Start a random decision burst after every mode switch (Kissat mode.c:214).
             // Diversifies the search space at mode boundaries.
-            self.start_random_sequence();
+            // `--sat-randec-kissat`: only on entering focused mode, and never
+            // over a running sequence (Kissat decide.c:57-84).
+            if ay_core::sat_ab_switches().randec_kissat != Some(true) {
+                self.start_random_sequence();
+            } else if !self.stable_mode && self.cold.randomized_deciding == 0 {
+                self.start_random_sequence();
+            }
         }
 
         // --- Restart decision logic (guards already checked at function entry). ---
@@ -546,7 +667,7 @@ impl Solver {
             // reluctant doubling alone lets stable mode run too deep without
             // quality gating, causing timeouts on benchmarks that previously
             // solved quickly (1.2s → timeout). The fix: gate the stable-mode EMA
-            // behind a minimum conflict count (STABLE_EMA_MIN_CONFLICTS=50) that
+            // behind a minimum conflict count (STABLE_EMA_MIN_CONFLICTS) that
             // prevents the pathological high-frequency firing on small dense
             // formulas while still providing quality-based restart triggering on
             // larger instances where reluctant doubling intervals become too long.
@@ -556,31 +677,19 @@ impl Solver {
                 self.cold.reluctant_countdown.saturating_sub(new_conflicts);
             let reluctant_fires = self.cold.reluctant_countdown == 0;
             if reluctant_fires {
-                // Advance Knuth's (u, v) state: produces Luby sequence values
-                if (self.cold.reluctant_u & self.cold.reluctant_u.wrapping_neg())
-                    == self.cold.reluctant_v
-                {
-                    self.cold.reluctant_u += 1;
-                    self.cold.reluctant_v = 1;
-                } else {
-                    self.cold.reluctant_v *= 2;
-                }
-                // Cap v to prevent unbounded interval growth (CaDiCaL reluctantmax)
-                if self.cold.reluctant_v >= RELUCTANT_MAX {
-                    self.cold.reluctant_u = 1;
-                    self.cold.reluctant_v = 1;
-                }
-                self.cold.reluctant_countdown = self.cold.reluctant_v * RELUCTANT_INIT;
+                self.cold.reluctant_countdown = self.advance_reluctant();
                 self.stats.stable_reluctant_fires += 1;
             }
 
             // Glucose EMA check for stable mode (wider margin than focused).
-            // Gated by stable_ema_gate (default STABLE_EMA_MIN_CONFLICTS=50)
+            // Gated by stable_ema_gate (default STABLE_EMA_MIN_CONFLICTS)
             // to prevent pathological high-frequency firing on small dense
             // formulas (#8135, #8448). On small dense UNSAT formulas
-            // (clique_n2_k10: 180 vars, density 17.5), stable_ema_gate is
-            // set to u64::MAX to disable EMA entirely, relying on pure
-            // reluctant doubling (matching CaDiCaL's stable-mode behavior).
+            // (clique_n2_k10: 180 vars, density 17.5) and on >1M-clause
+            // formulas, stable_ema_gate is set to u64::MAX post-init to
+            // disable EMA entirely, relying on pure reluctant doubling
+            // (matching CaDiCaL's stable-mode behavior) — unless the EMA
+            // is explicitly forced on with `--sat-stable-ema true`.
             // This reduces restarts from 93K to ~14K (#8466).
             let ema_fires = if self.cold.glucose_restarts
                 && self.conflicts_since_restart >= self.cold.stable_ema_gate
@@ -614,13 +723,31 @@ impl Solver {
             // constants.rs). AY_AB_FOCUSED_MARGIN overrides it for A/B sweeps.
             let margin = ab_focused_margin();
             self.stats.focused_ema_checks += 1;
-            let ema_condition = self.cold.lbd_ema_fast > margin * self.cold.lbd_ema_slow;
+            let kissat = self.cold.restart_gate_kissat;
+            let ema_condition = if kissat {
+                self.cold.lbd_ema_fast >= margin * self.cold.lbd_ema_slow
+            } else {
+                self.cold.lbd_ema_fast > margin * self.cold.lbd_ema_slow
+            };
             // CaDiCaL restart.cpp:101: `stats.conflicts <= lim.restart` with
             // `lim.restart = stats.conflicts + restartint` (restartint=2). The `<=`
             // gate means CaDiCaL needs strictly MORE than restartint conflicts past
             // the last restart, i.e., > 2 = at least 3 conflicts. AY previously used
             // `>= 2` which allowed restart after only 2 conflicts — 33% more frequent.
-            let conflict_gate = self.conflicts_since_restart > self.cold.focused_restart_gate;
+            let conflict_gate = if kissat {
+                // Kissat restart.c:18-20, 39-51: `restartint` (1) before the
+                // first restart, then trunc(log10(restarts + 9)); never at the
+                // root.
+                let restarts = self.cold.restarts;
+                let gate = if restarts == 0 {
+                    1
+                } else {
+                    ((restarts + 9) as f64).log10() as u64
+                };
+                self.decision_level > 0 && self.conflicts_since_restart >= gate
+            } else {
+                self.conflicts_since_restart > self.cold.focused_restart_gate
+            };
             if ema_condition && !conflict_gate {
                 self.stats.focused_ema_blocked_by_conflict_gate += 1;
             }
@@ -754,6 +881,25 @@ impl Solver {
         self.do_restart_impl::<true>();
     }
 
+    /// Descent-length diagnostic: bucket the decisions made since the
+    /// previous restart. Read-only; called once per restart.
+    fn record_descent_segment(&mut self) {
+        let decisions_now = self.stats.focused_decisions + self.stats.stable_decisions;
+        let segment = decisions_now.saturating_sub(self.stats.decisions_at_last_restart);
+        self.stats.decisions_at_last_restart = decisions_now;
+        let bucket = match segment {
+            0..=64 => 0,
+            65..=256 => 1,
+            257..=1024 => 2,
+            _ => 3,
+        };
+        if self.stable_mode {
+            self.stats.descent_hist_stable[bucket] += 1;
+        } else {
+            self.stats.descent_hist_focused[bucket] += 1;
+        }
+    }
+
     /// Restart from the pure SAT main loop.
     ///
     /// This follows the same restart mechanics as theory/extension mode, but
@@ -763,23 +909,9 @@ impl Solver {
     }
 
     fn do_restart_impl<const USE_THEORY_RESTARTS: bool>(&mut self) {
+        self.report_work_to_ledger();
         self.trace_restart();
         self.emit_diagnostic_restart();
-
-        // Approximate-BCP filter Phase 2 (#8789): feature-gated pure
-        // observer sampled once per restart. The prefilter scans every
-        // active clause (O(clauses)), so the restart boundary — not the
-        // BCP inner loop — is the highest-frequency spot where the
-        // measurement cost is tolerable, while still sampling a diverse
-        // set of trail states across the solve. Updates only the
-        // `approx_bcp_*` SolverStats counters; a nonzero
-        // `approx_bcp_mismatch_detected` indicates a filter soundness bug
-        // (2026-07-14 triage: this call was missing entirely, so the
-        // Phase-2 observer had never produced data).
-        #[cfg(feature = "approx-bcp-filter")]
-        {
-            let _ = self.run_approx_bcp_prefilter();
-        }
 
         // Complete MAB epoch FIRST; may switch heuristic arm.
         // AE-Kissat-MAB restart.c:188-189.
@@ -807,6 +939,7 @@ impl Solver {
         self.conflicts_since_restart = 0;
         self.cold.luby_idx += 1;
         self.cold.restarts += 1;
+        self.record_descent_segment();
 
         // Kissat-style focused-mode restart limit growth (#8655).
         // Kissat restart.c:39-51: `kissat_update_focused_restart_limit`:

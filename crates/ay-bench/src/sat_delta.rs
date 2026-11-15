@@ -599,7 +599,7 @@ fn load_manifest(path: &Path) -> Result<Vec<Benchmark>> {
                 reason: format!(
                     "manifest {} line {} missing path",
                     path.display(),
-                    line_no + 2
+                    line_no.saturating_add(2)
                 ),
             });
         };
@@ -871,26 +871,21 @@ fn run_one(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let start = Instant::now();
-    let (mut child, watchdog) = resources
-        .spawn_external_child(&mut command, "ay bench sat-delta")
+    let mut child = resources
+        .spawn_owned_child(&mut command, "ay bench sat-delta")
         .with_bench_context(|| format!("spawning solver {}", solver_path.display()))?;
-    let Some(stdout_pipe) = child.stdout.take() else {
-        crate::resource::terminate_guarded_child(&mut child, watchdog, "ay bench sat-delta")?;
+    let Some(stdout_pipe) = child.take_stdout() else {
+        child.cancel()?;
         return Err(BenchError::msg("sat-delta solver stdout pipe missing"));
     };
-    let Some(stderr_pipe) = child.stderr.take() else {
-        crate::resource::terminate_guarded_child(&mut child, watchdog, "ay bench sat-delta")?;
+    let Some(stderr_pipe) = child.take_stderr() else {
+        child.cancel()?;
         return Err(BenchError::msg("sat-delta solver stderr pipe missing"));
     };
     let stdout_capture = crate::resource::BoundedFileCapture::start(stdout_pipe, stdout_file);
     let stderr_capture = crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
     let wait_timeout = wait_timeout_for_solver(kind, args.timeout_sec);
-    let outcome = crate::resource::wait_for_guarded_child(
-        &mut child,
-        watchdog,
-        wait_timeout,
-        "ay bench sat-delta",
-    )?;
+    let outcome = child.wait(wait_timeout)?;
     let externally_timed_out = outcome.timed_out;
     let status = outcome.status;
     let memout = outcome.memout;
@@ -1042,15 +1037,11 @@ fn prepare_input(
             .stdin(Stdio::null())
             .env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string())
             .env("NBCORE", resources.plan.nbcore_per_child.to_string());
-        let (mut child, watchdog) = resources
-            .spawn_external_child(&mut command, "ay bench sat-delta decompress")
+        let mut child = resources
+            .spawn_owned_child(&mut command, "ay bench sat-delta decompress")
             .with_bench_context(|| format!("decompressing {}", path.display()))?;
-        let Some(stdout_pipe) = child.stdout.take() else {
-            crate::resource::terminate_guarded_child(
-                &mut child,
-                watchdog,
-                "ay bench sat-delta decompress",
-            )?;
+        let Some(stdout_pipe) = child.take_stdout() else {
+            child.cancel()?;
             fs::remove_file(&output)
                 .with_bench_context(|| format!("removing {}", output.display()))?;
             return Err(BenchError::msg(
@@ -1063,29 +1054,21 @@ fn prepare_input(
             crate::resource::MAX_DECOMPRESSED_BYTES,
         );
         let capture_breach = capture.breach_flag();
-        let outcome = crate::resource::wait_for_guarded_child_with_limits(
-            &mut child,
-            watchdog,
+        let outcome = child.wait_with_limits(
             std::time::Duration::from_secs_f64(timeout_sec),
-            "ay bench sat-delta decompress",
             None,
             Some(capture_breach.as_ref()),
         );
         let capture = capture.finish();
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let _ = fs::remove_file(&output);
-                return Err(error);
-            }
-        };
-        let capture = match capture {
-            Ok(capture) => capture,
-            Err(error) => {
-                let _ = fs::remove_file(&output);
-                return Err(error);
-            }
-        };
+        // `inspect_err` + `?` consume each `Result` whole; a `match` moving
+        // out of both arms rejoins at a drop that switches on the niche-encoded
+        // discriminant, whose `unreachable` default the verifier refutes.
+        let outcome = outcome.inspect_err(|_| {
+            let _ = fs::remove_file(&output);
+        })?;
+        let capture = capture.inspect_err(|_| {
+            let _ = fs::remove_file(&output);
+        })?;
         if capture.exceeded {
             let _ = fs::remove_file(&output);
             return Err(BenchError::msg(format!(
@@ -1124,7 +1107,10 @@ fn collect_command_argv(program: &Path, command: &Command) -> Vec<String> {
     let solver_args = args
         .iter()
         .position(|arg| *arg == program.as_os_str())
-        .map_or(args.as_slice(), |index| &args[index + 1..]);
+        // `index` comes from `position`, so `index + 1 <= args.len()`.
+        .map_or(args.as_slice(), |index| {
+            args.get(index.saturating_add(1)..).unwrap_or_default()
+        });
     std::iter::once(program.display().to_string())
         .chain(
             solver_args
@@ -1524,7 +1510,7 @@ fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
     let mut saw_terminator = false;
 
     for (line_index, line) in stdout.lines().enumerate() {
-        let line_no = line_index + 1;
+        let line_no = line_index.saturating_add(1);
         if !line.starts_with('v') {
             continue;
         }
@@ -1552,8 +1538,13 @@ fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
                 return format!("malformed:{line_no}");
             };
             if lit == 0 {
-                if token_index != tokens.len() - 1 {
-                    for trailing in &tokens[token_index + 1..] {
+                // `token_index < tokens.len()`, so the tail always exists; it is
+                // empty exactly when the terminator is the last token.
+                let trailing_tokens = tokens
+                    .get(token_index.saturating_add(1)..)
+                    .unwrap_or_default();
+                if !trailing_tokens.is_empty() {
+                    for trailing in trailing_tokens {
                         let Ok(trailing_lit) = trailing.parse::<i64>() else {
                             return format!("malformed:{line_no}");
                         };
@@ -1668,23 +1659,15 @@ fn verify_unsat_proof(
     command.stderr(Stdio::piped());
     command.env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string());
     command.env("NBCORE", resources.plan.nbcore_per_child.to_string());
-    match resources.spawn_external_child(&mut command, "ay bench sat-delta proof checker") {
-        Ok((mut child, watchdog)) => {
-            let Some(stdout_pipe) = child.stdout.take() else {
-                crate::resource::terminate_guarded_child(
-                    &mut child,
-                    watchdog,
-                    "ay bench sat-delta proof checker",
-                )?;
+    match resources.spawn_owned_child(&mut command, "ay bench sat-delta proof checker") {
+        Ok(mut child) => {
+            let Some(stdout_pipe) = child.take_stdout() else {
+                child.cancel()?;
                 validation.proof_status = "checker-capture-error".to_string();
                 return Ok(validation);
             };
-            let Some(stderr_pipe) = child.stderr.take() else {
-                crate::resource::terminate_guarded_child(
-                    &mut child,
-                    watchdog,
-                    "ay bench sat-delta proof checker",
-                )?;
+            let Some(stderr_pipe) = child.take_stderr() else {
+                child.cancel()?;
                 validation.proof_status = "checker-capture-error".to_string();
                 return Ok(validation);
             };
@@ -1693,12 +1676,7 @@ fn verify_unsat_proof(
             let stderr_capture =
                 crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
             let timeout = std::time::Duration::from_secs_f64(args.timeout_sec.max(1.0));
-            let outcome = crate::resource::wait_for_guarded_child(
-                &mut child,
-                watchdog,
-                timeout,
-                "ay bench sat-delta proof checker",
-            )?;
+            let outcome = child.wait(timeout)?;
             let stdout_output = stdout_capture.finish()?;
             let stderr_output = stderr_capture.finish()?;
             validation.proof_checker_exit_code = outcome.status.as_ref().and_then(ExitStatus::code);
@@ -1891,7 +1869,7 @@ fn bcp_relocation_gate_failure(records: &[RunRecord], args: &SatDeltaArgs) -> Op
         .collect::<Vec<_>>()
         .join("; ");
     let suffix = if failures.len() > 5 {
-        format!("; ... {} more", failures.len() - 5)
+        format!("; ... {} more", failures.len().saturating_sub(5))
     } else {
         String::new()
     };
@@ -1956,7 +1934,7 @@ fn bcp_search_inplace_watch_scan_gate_failure(
         .collect::<Vec<_>>()
         .join("; ");
     let suffix = if failures.len() > 5 {
-        format!("; ... {} more", failures.len() - 5)
+        format!("; ... {} more", failures.len().saturating_sub(5))
     } else {
         String::new()
     };
@@ -2034,7 +2012,7 @@ fn dense_mutex_focused_restart_gate_failure(
         .collect::<Vec<_>>()
         .join("; ");
     let suffix = if failures.len() > 5 {
-        format!("; ... {} more", failures.len() - 5)
+        format!("; ... {} more", failures.len().saturating_sub(5))
     } else {
         String::new()
     };
@@ -2069,7 +2047,7 @@ fn summarize_rows(rows: &[&RunRecord]) -> Summary {
         .iter()
         .filter(|row| row.actual == "unsat" && !row.wrong && !row.invalid)
         .count();
-    let solved = solved_sat + solved_unsat;
+    let solved = solved_sat.saturating_add(solved_unsat);
     let wrong = rows.iter().filter(|row| row.wrong).count();
     let invalid = rows.iter().filter(|row| row.invalid).count();
     let timeout = rows.iter().filter(|row| row.timeout).count();
@@ -2737,7 +2715,14 @@ fn sha256_file(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        let chunk = buf.get(..n).ok_or_else(|| {
+            BenchError::msg(format!(
+                "reading {} reported {n} bytes for a {}-byte buffer",
+                path.display(),
+                buf.len()
+            ))
+        })?;
+        hasher.update(chunk);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -2759,16 +2744,25 @@ fn git_provenance() -> GitProvenance {
 }
 
 fn run_text<const N: usize>(args: [&str; N]) -> String {
+    // An empty argv names no program; it reads as `unknown`, like a failed run.
+    let Some((&program, rest)) = args.split_first() else {
+        return "unknown".to_string();
+    };
     let output = crate::resource::capture_local_output(
-        args[0],
-        args[1..].iter().copied(),
+        program,
+        rest.iter().copied(),
         std::time::Duration::from_secs(10),
-        args[0],
+        program,
     );
-    match output {
-        Ok(output) if output.status.success() => output.stdout.trim().to_string(),
-        _ => "unknown".to_string(),
-    }
+    // Consumed whole through `ok`/`filter` rather than a guarded match that
+    // moves out of the `Result` and rejoins at a discriminant-switching drop.
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || "unknown".to_string(),
+            |output| output.stdout.trim().to_string(),
+        )
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -2787,16 +2781,11 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
+/// The shared bench resolver: from the working directory, then from the `ay`
+/// binary's own location, so a run started outside the tree (a temp dir, as
+/// the CLI tests do) still finds `scripts/_oom_guard.py`.
 fn repo_root() -> PathBuf {
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    loop {
-        if dir.join("Cargo.toml").exists() && dir.join("crates").exists() {
-            return dir;
-        }
-        if !dir.pop() {
-            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        }
-    }
+    crate::runner::repo_root_public()
 }
 
 fn sanitize(value: &str) -> String {
@@ -4003,7 +3992,17 @@ printf 's SATISFIABLE\n'
         assert_eq!(summary.memout, 1);
         assert_eq!(summary.timeout, 0);
         assert_eq!(summary.unknown, 0);
-        assert_eq!(summary.total, summary.solved + summary.memout);
+        assert_eq!(
+            Some(summary.total),
+            summary.solved.checked_add(summary.memout)
+        );
+    }
+
+    #[test]
+    fn run_text_reads_an_empty_argv_as_unknown() {
+        // No program to run: the provenance probe reports `unknown`, as it
+        // does for any failed command, instead of indexing past the argv.
+        assert_eq!(run_text::<0>([]), "unknown");
     }
 
     #[cfg(unix)]

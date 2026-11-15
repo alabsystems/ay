@@ -45,7 +45,7 @@ impl Executor {
     pub(in crate::executor::model) fn datatype_array_hard_equalities(
         &self,
     ) -> Option<Vec<AuthoredHardEquality>> {
-        let mut stack = self.independent_gate_query_roots();
+        let mut stack = self.independent_gate_query_roots().ok()?;
         if stack.len() > MAX_EXACT_ARRAY_FIELD_TERMS {
             return None;
         }

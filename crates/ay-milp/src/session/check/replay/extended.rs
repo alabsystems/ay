@@ -217,13 +217,14 @@ fn finish_mapped(
         MappedDecision::Certified { outcome, proof } => {
             restore_claims(lane_frame.take_lane_claims());
             let solved = state.take_solved(session);
-            RouteOutcome::finish(finish_exact_reduction_with_supplemental_proof(
+            let outcome = finish_exact_reduction_with_supplemental_proof(
                 outcome,
                 &session.model,
                 &solved,
                 &session.opts,
                 proof,
-            ))
+            );
+            RouteOutcome::finish_with_proof(outcome, proof)
         }
         MappedDecision::Replay { outcome, floor } => {
             let claims = lane_frame.take_lane_claims();

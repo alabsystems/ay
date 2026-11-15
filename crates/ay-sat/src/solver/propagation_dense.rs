@@ -58,6 +58,12 @@ impl Solver {
             let lit = self.trail[self.qhead];
             self.qhead += 1;
             let neg_lit = lit.negated();
+            // Counted work under `--sat-deterministic-inproc`: one te per
+            // occurrence visited (det_work.rs).
+            self.charge_inproc_scan(
+                (self.inproc.bve.get_occs(neg_lit).len() + self.inproc.bve.get_occs(lit).len())
+                    as u64,
+            );
 
             // -- Phase 1: Negative occurrences (clauses containing ~lit) --
             // These clauses lost a literal (now false). Check for unit/empty.

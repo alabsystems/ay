@@ -18,8 +18,11 @@ use ay_frontend::{Context, SExpr};
 mod atom_override;
 #[path = "proof_surface_syntax_realify.rs"]
 mod realify;
-pub(super) use atom_override::collect_root_surface_term_override;
-use atom_override::override_would_hijack_atom;
+pub(super) use atom_override::{
+    authored_root_surface, collect_root_surface_term_override, forall_instance_would_hijack_atom,
+};
+use atom_override::{names_nullary_macro, records_descendant_spelling};
+pub(super) use realify::holds_numeral_beyond_realify;
 use realify::realify_real_context_numerals;
 
 pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
@@ -57,16 +60,7 @@ pub(super) fn surface_override_collection_work(
     canonical: TermId,
 ) -> Option<usize> {
     const MAX_COLLECTION_WORK: usize = 8 * 1024 * 1024;
-    let (root, traversals) = match terms.get(canonical) {
-        TermData::Forall(bindings, body, _) | TermData::Exists(bindings, body, _) => {
-            (*body, bindings.len().checked_add(2)?)
-        }
-        TermData::Not(inner) => match terms.get(*inner) {
-            TermData::Forall(bindings, body, _) => (*body, bindings.len().checked_add(3)?),
-            _ => (canonical, 2),
-        },
-        _ => (canonical, 2),
-    };
+    let (root, traversals) = crate::executor::proof::override_collection_root(terms, canonical);
     super::proof_trust_surgery_provenance::canonical_term_work(terms, root)?
         .max(1)
         .checked_mul(traversals)
@@ -118,7 +112,7 @@ pub(super) fn collect_surface_term_overrides(
     if surface_override_collection_work(&ctx.terms, canonical).is_none() {
         return false;
     }
-    collect_surface_term_overrides_prechecked(ctx, canonical, parsed, overrides);
+    collect_surface_term_overrides_prechecked(ctx, canonical, parsed, false, overrides);
     true
 }
 
@@ -126,30 +120,59 @@ fn collect_surface_term_overrides_prechecked(
     ctx: &mut Context,
     canonical: TermId,
     parsed: &FrontendTerm,
+    descendant: bool,
     overrides: &mut HashMap<TermId, String>,
 ) {
-    collect_root_surface_term_override(ctx, canonical, parsed, overrides);
+    if !descendant || !names_nullary_macro(ctx, parsed) {
+        collect_root_surface_term_override(ctx, canonical, parsed, overrides);
+    }
     let parsed = strip_frontend_annotations(parsed);
 
     if let (FrontendTerm::App(op, args), TermData::Not(inner)) = (parsed, ctx.terms.get(canonical))
     {
         if op == "not" && args.len() == 1 {
             let inner = *inner;
-            collect_surface_term_overrides_prechecked(ctx, inner, &args[0], overrides);
+            collect_surface_term_overrides_prechecked(ctx, inner, &args[0], true, overrides);
             return;
         }
     }
 
-    // Certified `sko_forall` export must use one surface identity for the
-    // quantified body, its Hilbert-choice predicate, and the instantiated
-    // body.  The generic collector intentionally skips open subterms, but here
-    // the already-elaborated binder gives us the exact local environment, so
-    // descending is deterministic and does not create a fresh quantifier.
-    if let (
-        FrontendTerm::Forall(parsed_bindings, parsed_body),
-        TermData::Forall(canonical_bindings, canonical_body, _),
-    ) = (parsed, ctx.terms.get(canonical).clone())
-    {
+    // Certified `sko_forall` / `sko_ex` export must use one surface identity
+    // for the quantified body, its Hilbert-choice predicate, and the
+    // instantiated body.  The generic collector intentionally skips open
+    // subterms, but here the already-elaborated binder gives us the exact
+    // local environment, so descending is deterministic and does not create a
+    // fresh quantifier.
+    //
+    // A positive authored `exists` is descended exactly like a `forall`.
+    // Until 2026-09-13 only `forall` bodies were, so the body of a
+    // Skolemized `(exists ((z Int)) (and (>= z 0) (< (g z) z)))` — whose
+    // binder elaboration renames (`z` to `z_3`) and whose atoms it
+    // canonicalizes (`(>= z 0)` to `(<= 0 z_3)`) — had no authored spelling
+    // below the root: the printer's `register_substituted_surface_overrides`
+    // found nothing to carry across `binder := choice`, so the instance and
+    // its `and_pos` projections printed the CANONICAL atoms under an
+    // anchored `refl` over the AUTHORED body, and the pinned checker refused
+    // the `sko_ex` (the eighth false green's `sko_ex` sibling). The work
+    // bound (`override_collection_root`) already priced a positive `exists`
+    // root; only the descent was missing.
+    let quantified = match (parsed, ctx.terms.get(canonical).clone()) {
+        (
+            FrontendTerm::Forall(parsed_bindings, parsed_body),
+            TermData::Forall(canonical_bindings, canonical_body, _),
+        )
+        | (
+            FrontendTerm::Exists(parsed_bindings, parsed_body),
+            TermData::Exists(canonical_bindings, canonical_body, _),
+        ) => Some((
+            parsed_bindings,
+            parsed_body,
+            canonical_bindings,
+            canonical_body,
+        )),
+        _ => None,
+    };
+    if let Some((parsed_bindings, parsed_body, canonical_bindings, canonical_body)) = quantified {
         if parsed_bindings.len() == canonical_bindings.len() {
             let mut env = Vec::with_capacity(parsed_bindings.len());
             let mut recovered_all_bindings = true;
@@ -181,6 +204,91 @@ fn collect_surface_term_overrides_prechecked(
     }
 
     collect_subterm_surface_overrides(ctx, parsed, overrides);
+}
+
+/// The authored universal whose `forall_inst` instances an authored root
+/// licenses: the root itself, or its one quantified operand under a Boolean
+/// `=` / `=>` / `or` ([`connective_quantifier_pair`]), paired with the
+/// canonical quantifier. The final-proof instance pass reads this, so an
+/// instance of `(= q (forall ...))` is spelled from the authored body exactly
+/// as an instance of an authored root universal is.
+pub(super) fn authored_forall_of_root<'p>(
+    terms: &ay_core::TermStore,
+    canonical: TermId,
+    parsed: &'p FrontendTerm,
+) -> Option<(TermId, &'p FrontendTerm)> {
+    if matches!(strip_frontend_annotations(parsed), FrontendTerm::Forall(..)) {
+        return Some((canonical, parsed));
+    }
+    connective_quantifier_pair(terms, canonical, parsed)
+        .filter(|(_, quantifier)| matches!(quantifier, FrontendTerm::Forall(..)))
+}
+
+/// The authored quantifier operand of a two-operand Boolean `=` / `or` / `=>`
+/// root, paired with the canonical quantifier it elaborated to
+/// (#iff-split-implied-authority).
+///
+/// Neither override collector spells a quantifier below a root: the generic
+/// one never descends into a binder (a quantifier re-elaborates with a fresh
+/// binder name, so it has no `TermId` to key on), and the restoration pass
+/// spells roots only. So a certificate that assumes an authored
+/// `(= q (forall ((v Int)) (> e (- 2))))` and then reasons about the
+/// universal (`equiv_pos2`, `forall_inst`) printed the root as written beside
+/// the canonical `(forall ((v_5 Int)) (< (- 2) e'))` — an export the printer
+/// refuses — or, with no root spelling either, AY's normalised assertion,
+/// which pinned carcara refuses at the first `assume`.
+///
+/// The pairing is by shape, never by position (the frontend stores `(=> q F)`
+/// as `(or F (not q))`): the canonical root must carry exactly one quantified
+/// operand, and the authored root exactly one operand that is a quantifier of
+/// the same kind and binder count. A wrong pairing could only print a document
+/// an external checker refuses; it never authorizes a proof step.
+pub(super) fn connective_quantifier_pair<'p>(
+    terms: &ay_core::TermStore,
+    canonical: TermId,
+    parsed: &'p FrontendTerm,
+) -> Option<(TermId, &'p FrontendTerm)> {
+    let TermData::App(symbol, operands) = terms.get(canonical) else {
+        return None;
+    };
+    if !matches!(symbol.name(), "=" | "or")
+        || operands.len() != 2
+        || !matches!(terms.sort(operands[0]), ay_core::Sort::Bool)
+    {
+        return None;
+    }
+    let mut canonical_quantified = operands.iter().copied().filter(|&operand| {
+        matches!(
+            terms.get(operand),
+            TermData::Forall(..) | TermData::Exists(..)
+        )
+    });
+    let canonical_quantifier = canonical_quantified.next()?;
+    if canonical_quantified.next().is_some() {
+        return None;
+    }
+    let FrontendTerm::App(op, args) = strip_frontend_annotations(parsed) else {
+        return None;
+    };
+    if !matches!(op.as_str(), "=" | "or" | "=>") || args.len() != 2 {
+        return None;
+    }
+    let mut quantified = args
+        .iter()
+        .map(strip_frontend_annotations)
+        .filter(|arg| matches!(arg, FrontendTerm::Forall(..) | FrontendTerm::Exists(..)));
+    let parsed_quantifier = quantified.next()?;
+    if quantified.next().is_some() {
+        return None;
+    }
+    let same_shape = match (parsed_quantifier, terms.get(canonical_quantifier)) {
+        (FrontendTerm::Forall(parsed_bindings, _), TermData::Forall(bindings, ..))
+        | (FrontendTerm::Exists(parsed_bindings, _), TermData::Exists(bindings, ..)) => {
+            parsed_bindings.len() == bindings.len()
+        }
+        _ => false,
+    };
+    same_shape.then_some((canonical_quantifier, parsed_quantifier))
 }
 
 /// Recover the exact fresh variable identity used by an elaborated binder.
@@ -455,7 +563,7 @@ fn collect_subterm_surface_overrides(
         // re-spell every unrelated occurrence of that atom (see
         // `override_would_hijack_atom`). Still descend — deeper subterms
         // that survived elaboration keep their own faithful spellings.
-        if !override_would_hijack_atom(&ctx.terms, child, arg) && !overrides.contains_key(&child) {
+        if records_descendant_spelling(ctx, child, arg, overrides) {
             let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
             overrides.insert(child, format_frontend_term(&echo));
         }
@@ -493,9 +601,7 @@ pub(super) fn collect_deep_arith_surface_overrides(
         if let Some(child) = ctx.elaborate_surface_subterm(arg) {
             // Same fold guard as the connective collector: an override on a
             // folded-to-atom subterm re-spells the atom everywhere.
-            if !override_would_hijack_atom(&ctx.terms, child, arg)
-                && !overrides.contains_key(&child)
-            {
+            if records_descendant_spelling(ctx, child, arg, overrides) {
                 let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
                 overrides.insert(child, format_frontend_term(&echo));
             }
@@ -569,12 +675,110 @@ pub(super) fn format_authored_frontend_term(term: &FrontendTerm) -> String {
     format_frontend_term_impl(term, true)
 }
 
+/// The surface of `term` under the name-keyed simultaneous `substitution`
+/// (see [`format_forall_instance_surface`]).
+fn render_instance_surface(
+    term: &FrontendTerm,
+    substitution: &HashMap<String, String>,
+) -> Option<String> {
+    match strip_frontend_annotations(term) {
+        FrontendTerm::Const(constant) => Some(format_frontend_constant(constant)),
+        FrontendTerm::Symbol(name) => Some(
+            substitution
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| format_frontend_symbol(name)),
+        ),
+        FrontendTerm::App(name, args) => {
+            let rendered = args
+                .iter()
+                .map(|arg| render_instance_surface(arg, substitution))
+                .collect::<Option<Vec<_>>>()?;
+            let head = format_frontend_symbol(name);
+            Some(if rendered.is_empty() {
+                head
+            } else {
+                format!("({head} {})", rendered.join(" "))
+            })
+        }
+        FrontendTerm::IndexedApp(name, indices, args) => {
+            let rendered = args
+                .iter()
+                .map(|arg| render_instance_surface(arg, substitution))
+                .collect::<Option<Vec<_>>>()?;
+            let head = format_indexed_head(name, indices);
+            Some(if rendered.is_empty() {
+                head
+            } else {
+                format!("({head} {})", rendered.join(" "))
+            })
+        }
+        FrontendTerm::QualifiedApp(identifier, sort, args) => {
+            let rendered = args
+                .iter()
+                .map(|arg| render_instance_surface(arg, substitution))
+                .collect::<Option<Vec<_>>>()?;
+            let head = format_qualified_head(identifier, sort);
+            Some(if rendered.is_empty() {
+                head
+            } else {
+                format!("({head} {})", rendered.join(" "))
+            })
+        }
+        FrontendTerm::Forall(bindings, body) => {
+            render_nested_quantifier_surface("forall", bindings, body, substitution)
+        }
+        FrontendTerm::Exists(bindings, body) => {
+            render_nested_quantifier_surface("exists", bindings, body, substitution)
+        }
+        _ => None,
+    }
+}
+
+/// A nested binder under the substitution: the names it binds are shadowed
+/// (removed from the substitution for its body), and it fails closed when a
+/// value still substituted under it mentions one of those names, which the
+/// binder would capture. This is the capture rule of the strict `forall_inst`
+/// validator, read over the printed values.
+fn render_nested_quantifier_surface(
+    keyword: &str,
+    bindings: &[(String, FrontendSort)],
+    body: &FrontendTerm,
+    substitution: &HashMap<String, String>,
+) -> Option<String> {
+    let mut inner = substitution.clone();
+    for (name, _) in bindings {
+        inner.remove(name);
+    }
+    let bound: HashSet<String> = bindings
+        .iter()
+        .map(|(name, _)| quote_symbol(name))
+        .collect();
+    let captures = inner.values().any(|value| {
+        value
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .any(|token| bound.contains(token))
+    });
+    if captures {
+        return None;
+    }
+    let body = render_instance_surface(body, &inner)?;
+    let binders = bindings
+        .iter()
+        .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_frontend_sort(sort)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("({keyword} ({binders}) {body})"))
+}
+
 /// Render the exact surface substitution used by a `forall_inst` step.
 ///
 /// Binder values are rendered through the same override-aware Alethe printer
-/// as the step's `:args`.  The body walk accepts only the binder-free fragment
-/// supported by the strict quantifier checker; nested binding constructs fail
-/// closed.  This keeps a source spelling such as `(> x 0)` aligned with its
+/// as the step's `:args`.  The body walk accepts the fragment supported by the
+/// strict quantifier checker: applications, and nested `forall`/`exists`
+/// binders under shadowing with a capture check (an alternation's instance
+/// still carries its inner quantifier); `let` and other binding constructs
+/// fail closed.  This keeps a source spelling such as `(> x 0)` aligned with its
 /// ground instance even though the internal canonical term is `(< 0 x)`.
 pub(super) fn format_forall_instance_surface(
     terms: &ay_core::TermStore,
@@ -582,55 +786,6 @@ pub(super) fn format_forall_instance_surface(
     values: &[TermId],
     overrides: &HashMap<TermId, String>,
 ) -> Option<String> {
-    fn render(term: &FrontendTerm, substitution: &HashMap<String, String>) -> Option<String> {
-        match strip_frontend_annotations(term) {
-            FrontendTerm::Const(constant) => Some(format_frontend_constant(constant)),
-            FrontendTerm::Symbol(name) => Some(
-                substitution
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| format_frontend_symbol(name)),
-            ),
-            FrontendTerm::App(name, args) => {
-                let rendered = args
-                    .iter()
-                    .map(|arg| render(arg, substitution))
-                    .collect::<Option<Vec<_>>>()?;
-                let head = format_frontend_symbol(name);
-                Some(if rendered.is_empty() {
-                    head
-                } else {
-                    format!("({head} {})", rendered.join(" "))
-                })
-            }
-            FrontendTerm::IndexedApp(name, indices, args) => {
-                let rendered = args
-                    .iter()
-                    .map(|arg| render(arg, substitution))
-                    .collect::<Option<Vec<_>>>()?;
-                let head = format_indexed_head(name, indices);
-                Some(if rendered.is_empty() {
-                    head
-                } else {
-                    format!("({head} {})", rendered.join(" "))
-                })
-            }
-            FrontendTerm::QualifiedApp(identifier, sort, args) => {
-                let rendered = args
-                    .iter()
-                    .map(|arg| render(arg, substitution))
-                    .collect::<Option<Vec<_>>>()?;
-                let head = format_qualified_head(identifier, sort);
-                Some(if rendered.is_empty() {
-                    head
-                } else {
-                    format!("({head} {})", rendered.join(" "))
-                })
-            }
-            _ => None,
-        }
-    }
-
     let FrontendTerm::Forall(bindings, body) = strip_frontend_annotations(parsed_forall) else {
         return None;
     };
@@ -651,78 +806,94 @@ pub(super) fn format_forall_instance_surface(
             return None;
         }
     }
-    render(body, &substitution)
+    render_instance_surface(body, &substitution)
 }
 
+/// Render into one buffer, so one rendering costs its length. A `format!`
+/// per node copied every subtree's text into its parent's: tokens x depth.
 fn format_frontend_term_impl(term: &FrontendTerm, preserve_annotations: bool) -> String {
+    let mut out = String::new();
+    write_frontend_term(&mut out, term, preserve_annotations);
+    out
+}
+
+fn write_frontend_term(out: &mut String, term: &FrontendTerm, preserve_annotations: bool) {
     let term = if preserve_annotations {
         term
     } else {
         strip_frontend_annotations(term)
     };
     match term {
-        FrontendTerm::Const(c) => format_frontend_constant(c),
-        FrontendTerm::Symbol(name) => format_frontend_symbol(name),
-        FrontendTerm::App(name, args) => {
-            format_frontend_application(name, args, preserve_annotations)
-        }
-        FrontendTerm::IndexedApp(name, indices, args) => format_frontend_head_application(
+        FrontendTerm::Const(c) => out.push_str(&format_frontend_constant(c)),
+        FrontendTerm::Symbol(name) => out.push_str(&format_frontend_symbol(name)),
+        FrontendTerm::App(name, args) => write_frontend_head_application(
+            out,
+            &format_frontend_symbol(name),
+            args,
+            preserve_annotations,
+        ),
+        FrontendTerm::IndexedApp(name, indices, args) => write_frontend_head_application(
+            out,
             &format_indexed_head(name, indices),
             args,
             preserve_annotations,
         ),
-        FrontendTerm::QualifiedApp(name, sort, args) => format_frontend_head_application(
+        FrontendTerm::QualifiedApp(name, sort, args) => write_frontend_head_application(
+            out,
             &format_qualified_head(name, sort),
             args,
             preserve_annotations,
         ),
         FrontendTerm::Let(bindings, body) => {
-            format_frontend_let(bindings, body, preserve_annotations)
+            write_frontend_let(out, bindings, body, preserve_annotations);
         }
         FrontendTerm::Forall(bindings, body) => {
-            format_frontend_quantifier("forall", bindings, body, preserve_annotations)
+            write_frontend_quantifier(out, "forall", bindings, body, preserve_annotations);
         }
         FrontendTerm::Exists(bindings, body) => {
-            format_frontend_quantifier("exists", bindings, body, preserve_annotations)
+            write_frontend_quantifier(out, "exists", bindings, body, preserve_annotations);
         }
         FrontendTerm::Lambda(bindings, body) => {
-            format_frontend_quantifier("lambda", bindings, body, preserve_annotations)
+            write_frontend_quantifier(out, "lambda", bindings, body, preserve_annotations);
         }
         FrontendTerm::Match(scrutinee, cases) => {
-            format_frontend_match(scrutinee, cases, preserve_annotations)
+            write_frontend_match(out, scrutinee, cases, preserve_annotations);
         }
         FrontendTerm::Annotated(inner, attributes) => {
-            let mut rendered = vec![format_frontend_term_impl(inner, true)];
+            out.push_str("(! ");
+            write_frontend_term(out, inner, true);
             for (keyword, value) in attributes {
-                rendered.push(keyword.clone());
-                rendered.push(format_annotation_value(keyword, value));
+                out.push(' ');
+                out.push_str(keyword);
+                out.push(' ');
+                out.push_str(&format_annotation_value(keyword, value));
             }
-            format!("(! {})", rendered.join(" "))
+            out.push(')');
         }
         other => unreachable!("unsupported frontend term in proof export override: {other:?}"),
     }
 }
 
-fn format_frontend_match(
+fn write_frontend_match(
+    out: &mut String,
     scrutinee: &FrontendTerm,
     cases: &[(FrontendMatchPattern, FrontendTerm)],
     preserve_annotations: bool,
-) -> String {
-    let rendered_cases: Vec<String> = cases
-        .iter()
-        .map(|(pattern, body)| {
-            format!(
-                "({} {})",
-                format_frontend_match_pattern(pattern),
-                format_frontend_term_impl(body, preserve_annotations)
-            )
-        })
-        .collect();
-    format!(
-        "(match {} ({}))",
-        format_frontend_term_impl(scrutinee, preserve_annotations),
-        rendered_cases.join(" ")
-    )
+) {
+    out.push_str("(match ");
+    write_frontend_term(out, scrutinee, preserve_annotations);
+    out.push_str(" (");
+    for (index, (pattern, body)) in cases.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        out.push_str(&format_frontend_match_pattern(pattern));
+        out.push(' ');
+        write_frontend_term(out, body, preserve_annotations);
+        out.push(')');
+    }
+    out.push_str("))");
 }
 
 fn format_frontend_match_pattern(pattern: &FrontendMatchPattern) -> String {
@@ -745,28 +916,23 @@ fn format_frontend_match_pattern(pattern: &FrontendMatchPattern) -> String {
     }
 }
 
-fn format_frontend_application(
-    name: &str,
-    args: &[FrontendTerm],
-    preserve_annotations: bool,
-) -> String {
-    format_frontend_head_application(&format_frontend_symbol(name), args, preserve_annotations)
-}
-
-fn format_frontend_head_application(
+fn write_frontend_head_application(
+    out: &mut String,
     head: &str,
     args: &[FrontendTerm],
     preserve_annotations: bool,
-) -> String {
+) {
     if args.is_empty() {
-        head.to_string()
-    } else {
-        let rendered_args: Vec<String> = args
-            .iter()
-            .map(|term| format_frontend_term_impl(term, preserve_annotations))
-            .collect();
-        format!("({head} {})", rendered_args.join(" "))
+        out.push_str(head);
+        return;
     }
+    out.push('(');
+    out.push_str(head);
+    for term in args {
+        out.push(' ');
+        write_frontend_term(out, term, preserve_annotations);
+    }
+    out.push(')');
 }
 
 fn format_indexed_head(name: &str, indices: &[FrontendIndex]) -> String {
@@ -791,43 +957,51 @@ fn format_qualified_head(identifier: &FrontendQualifiedIdentifier, sort: &Fronte
     )
 }
 
-fn format_frontend_let(
+fn write_frontend_let(
+    out: &mut String,
     bindings: &[(String, FrontendTerm)],
     body: &FrontendTerm,
     preserve_annotations: bool,
-) -> String {
-    let rendered_bindings: Vec<String> = bindings
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "({} {})",
-                quote_symbol(name),
-                format_frontend_term_impl(value, preserve_annotations)
-            )
-        })
-        .collect();
-    format!(
-        "(let ({}) {})",
-        rendered_bindings.join(" "),
-        format_frontend_term_impl(body, preserve_annotations)
-    )
+) {
+    out.push_str("(let (");
+    for (index, (name, value)) in bindings.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        out.push_str(&quote_symbol(name));
+        out.push(' ');
+        write_frontend_term(out, value, preserve_annotations);
+        out.push(')');
+    }
+    out.push_str(") ");
+    write_frontend_term(out, body, preserve_annotations);
+    out.push(')');
 }
 
-fn format_frontend_quantifier(
+fn write_frontend_quantifier(
+    out: &mut String,
     keyword: &str,
     bindings: &[(String, FrontendSort)],
     body: &FrontendTerm,
     preserve_annotations: bool,
-) -> String {
-    let rendered_bindings: Vec<String> = bindings
-        .iter()
-        .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_frontend_sort(sort)))
-        .collect();
-    format!(
-        "({keyword} ({}) {})",
-        rendered_bindings.join(" "),
-        format_frontend_term_impl(body, preserve_annotations)
-    )
+) {
+    out.push('(');
+    out.push_str(keyword);
+    out.push_str(" (");
+    for (index, (name, sort)) in bindings.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push('(');
+        out.push_str(&quote_symbol(name));
+        out.push(' ');
+        out.push_str(&format_frontend_sort(sort));
+        out.push(')');
+    }
+    out.push_str(") ");
+    write_frontend_term(out, body, preserve_annotations);
+    out.push(')');
 }
 
 fn format_annotation_value(keyword: &str, value: &SExpr) -> String {
@@ -898,3 +1072,7 @@ fn format_frontend_constant(constant: &FrontendConstant) -> String {
 #[cfg(test)]
 #[path = "proof_surface_syntax_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "proof_surface_syntax_negative_literal_tests.rs"]
+mod negative_literal_tests;

@@ -65,6 +65,9 @@ use super::proof_surface_syntax::{
 use super::proof_trust_surgery_provenance::OriginalSourceIndex;
 use super::Executor;
 
+pub(in crate::executor) mod ground_candidates;
+#[path = "proof_original_rebuild_scalar_conjuncts.rs"]
+mod scalar_conjuncts;
 mod substitution_leaf;
 
 /// Does every term reachable from `root` stay inside the independent BV/LIA
@@ -123,7 +126,7 @@ fn bv_lia_scalar_sorted_subset(terms: &TermStore, roots: &[TermId]) -> Option<Ve
     (!subset.is_empty() && subset.len() < roots.len()).then_some(subset)
 }
 
-fn collect_bounded_bv_lia_roots(
+pub(in crate::executor) fn collect_bounded_bv_lia_roots(
     terms: &TermStore,
     authored_roots: &[TermId],
 ) -> Option<Vec<TermId>> {
@@ -751,7 +754,10 @@ impl Executor {
         // here untouched. Keep the exported resolution SKELETON and replace
         // just those leaves with an `eq_congruent_pred` bridge from the
         // AUTHORED assertion plus the defining equalities. Fail-closed.
+        // The bridge planner's candidate memo lives for this one run.
+        self.ground_candidate_memo.clear();
         self.try_rebuild_with_substitution_bridge(proof, &originals);
+        self.ground_candidate_memo.clear();
 
         // A premise-bound trust step is useful only when every checkable
         // reconstruction in this pass has declined. In particular, committing
@@ -859,14 +865,28 @@ impl Executor {
                     // certificate for the whole query. Retry on the in-fragment
                     // subset; see `bv_lia_scalar_sorted_subset` for why a
                     // subset certificate is sound.
-                    let Some(scalar) = bv_lia_scalar_sorted_subset(&self.ctx.terms, &roots) else {
+                    let scalar =
+                        bv_lia_scalar_sorted_subset(&self.ctx.terms, &roots).filter(|subset| {
+                            ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, subset, None)
+                                .is_ok()
+                        });
+                    let Some(scalar) = scalar else {
+                        // A mixed positive conjunction is one authored root,
+                        // so whole-root filtering can also discard the scalar
+                        // contradiction inside it. Derive those conjuncts with
+                        // checked and_pos steps; never assume them directly.
+                        if error.is_unsupported_fragment() {
+                            if let Some(candidate) = self
+                                .build_authenticated_scalar_conjunct_refutation(
+                                    authenticated_authored_roots,
+                                )
+                            {
+                                *proof = candidate;
+                                return true;
+                            }
+                        }
                         return false;
                     };
-                    if ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &scalar, None)
-                        .is_err()
-                    {
-                        return false;
-                    }
                     roots = scalar;
                     TheoryLemmaKind::BvLiaTautology
                 }
@@ -891,7 +911,7 @@ impl Executor {
     /// `roots` is the independently recognized, load-bearing theorem subset.
     /// Requiring every selected root to remain reachable prevents a recognizer
     /// bug from silently authorizing a proof over a weaker subset.
-    fn build_authenticated_bv_lia_refutation(
+    pub(in crate::executor) fn build_authenticated_bv_lia_refutation(
         &mut self,
         roots: &[TermId],
         kind: TheoryLemmaKind,
@@ -948,7 +968,7 @@ impl Executor {
                 return None;
             }
         }
-        let Ok(quality) = ay_proof::check_proof_strict(&candidate, &self.ctx.terms) else {
+        let Ok(quality) = self.check_proof_strict_until_stopped(&candidate) else {
             return None;
         };
         if !quality.is_complete() || !Self::proof_derives_empty_clause(&candidate) {
@@ -1099,7 +1119,7 @@ impl Executor {
         {
             return false;
         }
-        let Ok(quality) = ay_proof::check_proof_strict(&candidate, &self.ctx.terms) else {
+        let Ok(quality) = self.check_proof_strict_until_stopped(&candidate) else {
             return false;
         };
         if !quality.is_complete() || !Self::proof_derives_empty_clause(&candidate) {
@@ -2776,7 +2796,7 @@ impl Executor {
         // (4) Whole-proof revert gate: keep the rebuild ONLY if the strict
         // checker (unchanged — it re-verifies the Farkas combination
         // semantically) accepts it with zero trust steps.
-        match ay_proof::check_proof_strict(&new_proof, &self.ctx.terms) {
+        match self.check_proof_strict_until_stopped(&new_proof) {
             Ok(q) if q.trust_count == 0 => {}
             _ => return false,
         }
@@ -3214,7 +3234,7 @@ impl Executor {
         originals: &[(TermId, FrontendTerm)],
         used_originals: &[usize],
     ) -> bool {
-        match ay_proof::check_proof_strict(&new_proof, &self.ctx.terms) {
+        match self.check_proof_strict_until_stopped(&new_proof) {
             Ok(q) if q.trust_count == 0 => {}
             _ => return false,
         }
@@ -4181,6 +4201,13 @@ impl Executor {
             return None;
         }
         *budget -= 1;
+        // `(= a b)` across two sorts has no derivation, and interning it
+        // leaves an ill-sorted equality in the shared store for whole-store
+        // scans to read (the substitution bridge pairs a polymorphic head's
+        // arguments positionally: `(= nil (tl a))` against `(= u (hd b))`).
+        if self.ctx.terms.sort(a) != self.ctx.terms.sort(b) {
+            return None;
+        }
         let eq = self
             .ctx
             .terms
@@ -4951,71 +4978,6 @@ impl Executor {
             && ay_proof::recognize_ground_evaluate(&self.ctx.terms, eq)
     }
 
-    /// Whether the strict ground evaluator closes `x` on its own.
-    ///
-    /// Asked by running the recognizer on `(= x x)`: the evaluator descends
-    /// `x` exactly as it would inside a real conclusion, so this agrees with
-    /// the checker by construction (including its work, depth and value-size
-    /// envelopes) instead of re-implementing a groundness predicate that could
-    /// drift from it. The cheap shape pre-filter keeps the common variable /
-    /// uninterpreted case from interning a term at all.
-    fn term_is_ground_evaluable(&mut self, x: TermId) -> bool {
-        if !matches!(self.ctx.terms.sort(x), Sort::Bool | Sort::Int | Sort::Real) {
-            return false;
-        }
-        match self.ctx.terms.get(x) {
-            TermData::Const(Constant::Bool(_) | Constant::Int(_) | Constant::Rational(_))
-            | TermData::Not(_)
-            | TermData::Ite(_, _, _) => {}
-            TermData::App(Symbol::Named(_), args) if !args.is_empty() => {}
-            _ => return false,
-        }
-        let self_eq = self
-            .ctx
-            .terms
-            .mk_app(Symbol::named("="), [x, x], Sort::Bool);
-        ay_proof::recognize_ground_evaluate(&self.ctx.terms, self_eq)
-    }
-
-    /// Ground terms the ORIGINAL assertions offer as a value for `x`.
-    ///
-    /// Only sides of authored binary equalities are considered — the same
-    /// non-laundering rule the definition leg follows. This does NOT decide
-    /// that `x` equals any of them: each candidate is handed to `plan_eq`,
-    /// which must derive `(= x c)` from the originals (typically `symm`, or
-    /// `trans` along an authored definition chain) or the candidate is dropped.
-    fn authored_ground_candidates(&mut self, x: TermId, original_terms: &[TermId]) -> Vec<TermId> {
-        /// Cap the per-argument candidate fan-out. `EQ_PLAN_BUDGET` already
-        /// terminates the search; this only keeps a constant-rich problem from
-        /// spending most of it on one argument position.
-        const MAX_CANDIDATES: usize = 64;
-        let sort = self.ctx.terms.sort(x).clone();
-        let mut sides: Vec<TermId> = Vec::new();
-        for &original in original_terms {
-            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
-                continue;
-            };
-            if name != "=" || args.len() != 2 {
-                continue;
-            }
-            for side in [args[0], args[1]] {
-                if side != x && *self.ctx.terms.sort(side) == sort && !sides.contains(&side) {
-                    sides.push(side);
-                }
-            }
-        }
-        let mut candidates = Vec::new();
-        for side in sides {
-            if candidates.len() >= MAX_CANDIDATES {
-                break;
-            }
-            if self.term_is_ground_evaluable(side) {
-                candidates.push(side);
-            }
-        }
-        candidates
-    }
-
     /// Resolve `x` to a term the strict ground evaluator closes, together with
     /// a certified derivation of `(= x ground)`.
     ///
@@ -5706,8 +5668,14 @@ enum SurfaceCanonicalization {
 }
 
 #[cfg(test)]
+mod cross_sort_tests;
+#[cfg(test)]
 #[path = "proof_original_rebuild_tests.rs"]
 mod proof_original_rebuild_tests;
+
+#[cfg(test)]
+#[path = "proof_original_rebuild_sort_tests.rs"]
+mod sort_plan_tests;
 
 #[path = "proof_original_rebuild_bv_lia_recovery_state.rs"]
 pub(in crate::executor) mod bv_lia_recovery_state;

@@ -28,6 +28,8 @@ mod bounds_scaled_diff_verify;
 mod bounds_sum;
 
 #[cfg(test)]
+mod bounds_dag_tests;
+#[cfg(test)]
 mod bounds_tests;
 
 /// Candidate bounds are checked from high to low to find the tightest valid invariant.

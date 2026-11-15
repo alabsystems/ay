@@ -11,18 +11,28 @@
 
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
 
-use super::{BvExpr, ProofProducingLowerer};
+use super::{BvExpr, ProofProducingLowerer, Request};
 
 pub(super) fn lower_same_array_read_disequalities(
     terms: &TermStore,
     roots: &[TermId],
-    lowerer: &mut ProofProducingLowerer<'_>,
+    lowerer: &mut ProofProducingLowerer<'_, '_>,
 ) -> Result<Option<Vec<BvExpr>>, String> {
     let mut lowered = Vec::new();
     if let Err(error) = lowered.try_reserve_exact(roots.len()) {
         lowerer.resource_exhausted = true;
         return Err(format!("array-congruence root allocation failed: {error}"));
     }
+    // Every root's requests are counted before any is lowered: a replaced
+    // root requests its two read indices, any other root itself.
+    lowerer.census_requests(roots.iter().flat_map(|&root| {
+        match exact_same_array_read_disequality(terms, root) {
+            Some((left, right)) => [Some(Request::Lower(left)), Some(Request::Lower(right))],
+            None => [Some(Request::Lower(root)), None],
+        }
+        .into_iter()
+        .flatten()
+    }))?;
     let mut replaced = false;
     for &root in roots {
         if let Some((left_index, right_index)) = exact_same_array_read_disequality(terms, root) {

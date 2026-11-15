@@ -326,8 +326,11 @@ impl TrlSolver {
             &mut self.smt_helper,
             Some(TRL_PER_CHECK_TIMEOUT),
         );
-        // #7165: Executor fallback for path existence when incremental returns Unknown.
-        if matches!(path_result, IncrementalCheckResult::Unknown) {
+        // #7165: Executor fallback for path existence when incremental returns
+        // Unknown (not after cancellation: every check answers Unknown then).
+        if matches!(path_result, IncrementalCheckResult::Unknown)
+            && !self.config.base.is_cancelled()
+        {
             let fresh = self.build_error_reachability_formula(
                 depth,
                 &ChcExpr::Bool(true), // no query constraint — just check path existence
@@ -462,6 +465,11 @@ impl TrlSolver {
                         self.reset_loop_streak();
                     }
 
+                    // Loop specialization and TRP are MBP/projection work with
+                    // no deadline of their own: do not start them cancelled.
+                    if self.config.base.is_cancelled() {
+                        return Some(ChcEngineResult::Unknown);
+                    }
                     if !self.handle_loop(start, end) {
                         if self.config.base.verbose {
                             safe_eprintln!(
@@ -493,7 +501,3 @@ impl interleaved::StepwiseTrl for TrlSolver {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "verification.rs"]
-mod verification;

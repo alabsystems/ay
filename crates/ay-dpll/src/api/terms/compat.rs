@@ -141,6 +141,7 @@ impl Solver {
         let id = self.resolve_term("numeral_string", t).ok()?;
         match self.terms().get(id) {
             TermData::Const(c) => match c {
+                ay_core::term::Constant::FiniteField { value, .. } => Some(value.to_string()),
                 ay_core::term::Constant::Int(n) => Some(n.to_string()),
                 ay_core::term::Constant::Rational(r) => {
                     Some(format!("{}/{}", r.0.numer(), r.0.denom()))

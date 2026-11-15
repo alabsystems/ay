@@ -24,6 +24,10 @@ impl Mbp {
         model: &FxHashMap<String, SmtValue>,
     ) -> Vec<Literal> {
         let mut literals = Vec::new();
+        // One evaluation memo for the whole extraction: every `eval_bool` below
+        // evaluates nodes of `formula` under `model` (WP-F; measured per
+        // occurrence on `bist_cell`, where PDKIND's projection ran out of memory).
+        let _memo = crate::expr::dag::eval_memo::EvalScope::enter(std::iter::once(formula), model);
         self.collect_implicant(formula, model, &mut literals);
         literals
     }

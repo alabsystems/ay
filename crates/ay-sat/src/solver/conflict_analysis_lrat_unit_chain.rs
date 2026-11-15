@@ -11,6 +11,8 @@
 
 use super::*;
 use crate::kani_compat::DetHashSet;
+pub(in crate::solver) mod admitted;
+use super::conflict_analysis_minimize_lrat::root;
 
 impl Solver {
     /// Reverse LRAT hints and drop zeros.
@@ -318,10 +320,14 @@ impl Solver {
     /// replace_clause to skip new clause literals the RUP checker already knows).
     ///
     /// Does NOT clean up `LRAT_A` or `lrat_to_clear`; caller is responsible.
-    fn bfs_level0_transitive_closure(&mut self) {
+    fn bfs_level0_transitive_closure<P: admitted::Policy>(
+        &mut self,
+        p: &P,
+    ) -> Result<(), P::Error> {
         let num_vars = self.var_data.len();
         let mut head = 0;
         while head < self.min.lrat_to_clear.len() {
+            p.work(8)?;
             let vi = self.min.lrat_to_clear[head];
             head += 1;
             let Some(reason_ref) = self.var_reason(vi) else {
@@ -336,6 +342,7 @@ impl Solver {
             }
             let clen = self.arena.len_of(ci);
             for i in 0..clen {
+                p.work(32)?;
                 let reason_lit = self.arena.literal(ci, i);
                 let rv = reason_lit.variable().index();
                 if rv != vi
@@ -344,11 +351,13 @@ impl Solver {
                     && self.min.minimize_flags[rv] & (LRAT_A | LRAT_B) == 0
                     && self.has_any_proof_id(rv)
                 {
+                    p.mark(self)?;
                     self.min.minimize_flags[rv] |= LRAT_A;
                     self.min.lrat_to_clear.push(rv);
                 }
             }
         }
+        Ok(())
     }
 
     /// BFS transitive closure on level-0 variables, then reverse-trail scan
@@ -367,7 +376,13 @@ impl Solver {
     /// CaDiCaL reference: analyze.cpp:253-268 (analyze_literal) + 1240-1246.
     pub(super) fn collect_level0_unit_chain(&mut self) -> Vec<u64> {
         let mut chain: Vec<u64> = Vec::new();
-        self.emit_level0_unit_chain_filtered(None, |_, id| chain.push(id));
+        match self.emit_level0_unit_chain_filtered(None, &root::Ordinary, |_, id| {
+            chain.push(id);
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
         chain
     }
 
@@ -382,24 +397,35 @@ impl Solver {
         rup_satisfied: &DetHashSet<Literal>,
     ) -> Vec<u64> {
         let mut chain: Vec<u64> = Vec::new();
-        self.emit_level0_unit_chain_filtered(Some(rup_satisfied), |_, id| chain.push(id));
+        match self.emit_level0_unit_chain_filtered(Some(rup_satisfied), &root::Ordinary, |_, id| {
+            chain.push(id);
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
         chain
     }
 
     #[inline]
-    fn lrat_unit_chain_root_scan_window(&self, level0_end: usize) -> (usize, usize) {
+    fn lrat_unit_chain_root_scan_window<P: admitted::Policy>(
+        &self,
+        level0_end: usize,
+        p: &P,
+    ) -> Result<(usize, usize), P::Error> {
         let mut saw_marked = false;
         let mut min_pos = usize::MAX;
         let mut max_pos = 0usize;
 
         for &var_idx in &self.min.lrat_to_clear {
+            p.work(8)?;
             if var_idx >= self.var_data.len() || self.min.minimize_flags[var_idx] & LRAT_A == 0 {
                 continue;
             }
 
             let trail_pos = self.var_data[var_idx].trail_pos as usize;
             if trail_pos >= level0_end || self.trail[trail_pos].variable().index() != var_idx {
-                return (0, level0_end);
+                return Ok((0, level0_end));
             }
 
             saw_marked = true;
@@ -408,9 +434,9 @@ impl Solver {
         }
 
         if saw_marked {
-            (min_pos, max_pos + 1)
+            Ok((min_pos, max_pos + 1))
         } else {
-            (0, 0)
+            Ok((0, 0))
         }
     }
 
@@ -418,13 +444,16 @@ impl Solver {
     /// selected unit proof ID in chain order. This lets hot conflict analysis
     /// append directly to its persistent proof buffer without materializing a
     /// temporary `Vec<u64>`.
-    fn emit_level0_unit_chain_filtered<F>(
+    pub(in crate::solver) fn emit_level0_unit_chain_filtered<P: admitted::Policy, F>(
         &mut self,
         rup_satisfied: Option<&DetHashSet<Literal>>,
+        p: &P,
         mut emit: F,
-    ) where
-        F: FnMut(&mut Self, u64),
+    ) -> Result<(), P::Error>
+    where
+        F: FnMut(&mut Self, u64) -> Result<(), P::Error>,
     {
+        p.work(8)?;
         let num_vars = self.var_data.len();
         let record_lrat_stats = self.cold.lrat_enabled;
         if record_lrat_stats {
@@ -432,7 +461,7 @@ impl Solver {
         }
 
         // Phase 1: BFS transitive closure on level-0 variables.
-        self.bfs_level0_transitive_closure();
+        self.bfs_level0_transitive_closure(p)?;
 
         // Phase 2: Scan the trail in REVERSE order for level-0 variables.
         // Collect proof IDs via 3-tier fallback: reason → unit_proof_id → level0_proof_id.
@@ -451,12 +480,13 @@ impl Solver {
         // CaDiCaL reference: analyze.cpp unit_chain has no RUP filter — unit
         // IDs are always included unconditionally.
         let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
-        let (scan_start, scan_end) = self.lrat_unit_chain_root_scan_window(level0_end);
+        let (scan_start, scan_end) = self.lrat_unit_chain_root_scan_window(level0_end, p)?;
         if record_lrat_stats {
             self.stats.lrat_unit_chain_root_trail_entries += (scan_end - scan_start) as u64;
         }
         let mut emitted_hints = 0_u64;
         for i in (scan_start..scan_end).rev() {
+            p.work(32)?;
             let lit = self.trail[i];
             let var_idx = lit.variable().index();
             if var_idx < num_vars && self.min.minimize_flags[var_idx] & LRAT_A != 0 {
@@ -464,6 +494,9 @@ impl Solver {
                 // itself is RUP-satisfied (already true under the RUP assumption).
                 // If so, skip it — the checker already knows this variable.
                 // In DRAT mode, check if the reason clause is RUP-satisfied.
+                if let Some(filter) = rup_satisfied {
+                    p.filter(filter)?;
+                }
                 let skip = match rup_satisfied {
                     None => false,
                     Some(rup_satisfied) if self.cold.lrat_enabled => {
@@ -481,7 +514,7 @@ impl Solver {
                         if record_lrat_stats {
                             emitted_hints += 1;
                         }
-                        emit(self, id);
+                        emit(self, id)?;
                     } else if record_lrat_stats {
                         self.stats.lrat_unit_chain_missing_hints += 1;
                     }
@@ -495,10 +528,12 @@ impl Solver {
         }
 
         // Sparse cleanup: reset only touched indices.
+        p.work(self.min.lrat_to_clear.len())?;
         for &idx in &self.min.lrat_to_clear {
             self.min.minimize_flags[idx] &= !LRAT_A;
         }
         self.min.lrat_to_clear.clear();
+        Ok(())
     }
 
     /// Append LRAT unit chain for conflict analysis learned clause.
@@ -513,6 +548,20 @@ impl Solver {
         level0_vars: &[usize],
         rup_satisfied: &DetHashSet<Literal>,
     ) {
+        match self.append_lrat_unit_chain_admitted(level0_vars, rup_satisfied, &root::Ordinary) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    pub(in crate::solver) fn append_lrat_unit_chain_admitted<P: admitted::Policy>(
+        &mut self,
+        level0_vars: &[usize],
+        rup_satisfied: &DetHashSet<Literal>,
+        p: &P,
+    ) -> Result<(), P::Error> {
+        p.enter_chain(self, level0_vars)?;
+        p.work(level0_vars.len())?;
         // CaDiCaL analyze.cpp:433: all level-0 vars must actually be at level 0
         debug_assert!(
             level0_vars
@@ -527,7 +576,9 @@ impl Solver {
 
         // Seed LRAT_A from level0_vars.
         for &v in level0_vars {
+            p.work(32)?;
             if v < num_vars && self.min.minimize_flags[v] & LRAT_A == 0 {
+                p.mark(self)?;
                 self.min.minimize_flags[v] |= LRAT_A;
                 self.min.lrat_to_clear.push(v);
                 if can_fast_path {
@@ -544,6 +595,7 @@ impl Solver {
                         can_fast_path = false;
                         continue;
                     };
+                    p.reserve(&mut fast_path_units, 1)?;
                     fast_path_units.push((trail_pos, lit, id));
                 }
             }
@@ -553,32 +605,36 @@ impl Solver {
         // has its own visible unit clause. Then the transitive BFS is redundant:
         // the checker can use those standalone unit IDs directly.
         if can_fast_path {
-            fast_path_units.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+            p.sort(&mut fast_path_units)?;
 
             self.stats.lrat_unit_chain_calls += 1;
             let mut emitted_hints = 0_u64;
             for (_, lit, id) in fast_path_units {
+                p.work(2)?;
+                p.filter(rup_satisfied)?;
                 if rup_satisfied.is_empty() || !rup_satisfied.contains(&lit) {
                     emitted_hints += 1;
-                    self.conflict.add_to_chain(id);
+                    p.chain(self, id)?;
                 }
             }
             self.stats.lrat_unit_chain_hints += emitted_hints;
             self.stats.lrat_unit_chain_max_hints =
                 self.stats.lrat_unit_chain_max_hints.max(emitted_hints);
 
+            p.work(self.min.lrat_to_clear.len())?;
             for &idx in &self.min.lrat_to_clear {
                 self.min.minimize_flags[idx] &= !LRAT_A;
             }
             self.min.lrat_to_clear.clear();
-            return;
+            return Ok(());
         }
 
         // Append directly to the persistent conflict proof chain while
         // preserving the same BFS + reverse-trail-scan hint order (#5271).
-        self.emit_level0_unit_chain_filtered(Some(rup_satisfied), |solver, id| {
-            solver.conflict.add_to_chain(id)
-        });
+        self.emit_level0_unit_chain_filtered(Some(rup_satisfied), p, |solver, id| {
+            p.chain(solver, id)
+        })?;
+        Ok(())
     }
 
     /// Materialize level-0 unit proof IDs before LRAT hint collection.

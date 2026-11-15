@@ -192,3 +192,101 @@ fn retiring_eliminations_refuses_a_whitelist_that_stopped_reducing() {
     assert_eq!(s.indep_support, vec![0, 1]);
     assert_eq!(s.stats.indep_support_size, 2);
 }
+
+/// `a ^ b ^ c = 1` as its four parity clauses (the XNOR group).
+fn xnor3(cls: &mut Vec<Vec<Literal>>, a: i32, b: i32, c: i32) {
+    cls.push(vec![lit(a), lit(b), lit(c)]);
+    cls.push(vec![lit(a), lit(-b), lit(-c)]);
+    cls.push(vec![lit(-a), lit(b), lit(-c)]);
+    cls.push(vec![lit(-a), lit(-b), lit(c)]);
+}
+
+/// `a ^ b ^ c = rhs` clause group.
+fn xor3(cls: &mut Vec<Vec<Literal>>, a: i32, b: i32, c: i32, rhs: bool) {
+    if rhs {
+        xnor3(cls, a, b, c);
+    } else {
+        xor_gate(cls, a, b, c);
+    }
+}
+
+/// GE candidate (DR-AY-SAT-GE-SUPPORT-20261111): ten 3-XOR equations over
+/// 12 variables with GF(2) rank 10 (2 free variables) whose determination
+/// structure defeats the acyclic-removal greedy — every shipped order
+/// keeps at least 5 variables, because breaking the system down requires
+/// combining equations, not peeling single definitions. The computed
+/// support must be the GE candidate. (System found by offline search
+/// against the same greedy/orders; see the DR.)
+#[test]
+fn ge_basis_recovers_free_vars_the_greedy_cannot() {
+    let eqs: [(i32, i32, i32, bool); 10] = [
+        (2, 6, 10, true),
+        (1, 5, 12, false),
+        (1, 5, 11, false),
+        (4, 5, 7, true),
+        (4, 6, 7, false),
+        (7, 9, 11, false),
+        (1, 2, 12, true),
+        (3, 8, 10, true),
+        (1, 8, 9, false),
+        (3, 7, 8, true),
+    ];
+    let mut cls = Vec::new();
+    for (a, b, c, rhs) in eqs {
+        xor3(&mut cls, a, b, c, rhs);
+    }
+    let mut s = solver_with(12, &cls);
+    let decidable = vec![true; 12];
+    let fixed = vec![false; 12];
+    let graph = s
+        .collect_definitions(12, &decidable, &fixed)
+        .expect("definitions");
+    assert_eq!(
+        graph.ge_free.len(),
+        2,
+        "rank-10 XOR system over 12 variables leaves 2 free"
+    );
+    for order in Solver::support_orders(12, &graph, &decidable) {
+        let in_set = Solver::greedy_support(&order, &graph, &decidable, &fixed);
+        let kept = in_set.iter().filter(|&&b| b).count();
+        assert!(
+            kept >= 5,
+            "the greedy cannot break this XOR system (kept {kept})"
+        );
+    }
+    let mut s = solver_with(12, &cls);
+    let support = s.compute_indep_support().expect("GE support installs");
+    assert_eq!(
+        support.len(),
+        2,
+        "support must be the two GE free variables"
+    );
+    assert_eq!(s.stats.indep_support_ge_free_vars, 2);
+}
+
+/// An inconsistent XOR subsystem (both parities of the same equation
+/// present) refuses the GE candidate instead of concluding anything: no
+/// basis expressions are recorded and no wrong restriction is installed.
+#[test]
+fn ge_basis_refuses_an_inconsistent_xor_subsystem() {
+    let mut cls = Vec::new();
+    // x1 ^ x2 ^ x3 = 0 (x3 = x1 ^ x2) and x1 ^ x2 ^ x3 = 1 (x3 = !(x1 ^ x2)).
+    xor_gate(&mut cls, 3, 1, 2);
+    cls.push(vec![lit(1), lit(2), lit(3)]);
+    cls.push(vec![lit(1), lit(-2), lit(-3)]);
+    cls.push(vec![lit(-1), lit(2), lit(-3)]);
+    cls.push(vec![lit(-1), lit(-2), lit(3)]);
+    // A satisfiable tail so the formula as a whole is not the subject.
+    xor_gate(&mut cls, 6, 4, 5);
+    let mut s = solver_with(6, &cls);
+    let decidable = vec![true; 6];
+    let fixed = vec![false; 6];
+    let graph = s
+        .collect_definitions(6, &decidable, &fixed)
+        .expect("definitions");
+    assert!(
+        graph.ge_exprs.is_empty(),
+        "inconsistent XOR subsystem must refuse the GE candidate"
+    );
+    assert_eq!(s.stats.indep_support_ge_free_vars, 0);
+}

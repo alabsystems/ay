@@ -41,13 +41,19 @@ done
 STAGE="$WORK/source"
 mkdir -p "$STAGE"
 
+# The packaging host's Cargo-family frontend (scripts/lib/cargo_frontend.sh):
+# `targo` where the Trust toolchain is installed, plain `cargo` elsewhere.
+# metadata, generate-lockfile and vendor take no lane.
+. "$REPO/scripts/lib/cargo_frontend.sh"
+
 echo "== staging trimmed workspace (shared by all entries)"
-python3 - "$REPO" "$STAGE" <<'PYEOF'
+python3 - "$REPO" "$STAGE" "$(ay_cargo_argv metadata)" <<'PYEOF'
 import re, sys, json, shutil, subprocess, pathlib
 repo, dest = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+cargo = sys.argv[3].split()
 
 meta = json.loads(subprocess.run(
-    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+    [*cargo, "metadata", "--format-version", "1", "--no-deps"],
     cwd=repo, capture_output=True, text=True, check=True).stdout)
 packages = {p["name"]: p for p in meta["packages"]}
 members = {p["name"]: pathlib.Path(p["manifest_path"]).parent for p in meta["packages"]}
@@ -125,7 +131,7 @@ PYEOF
 
 echo "== resolving + vendoring (network used HERE only)"
 cd "$STAGE"
-cargo generate-lockfile --quiet
+ay_cargo generate-lockfile --quiet
 if grep -q 'git+' Cargo.lock; then
     echo "G1 VIOLATION — git sources in packaged Cargo.lock:" >&2
     grep 'git+' Cargo.lock >&2
@@ -135,7 +141,7 @@ echo "G1b OK: packaged lockfile is git-free"
 mkdir -p .cargo
 # NOTE: no --quiet — it would suppress the source-replacement config snippet
 # cargo vendor prints to stdout (a smoke gate once caught exactly that).
-cargo vendor --locked vendor > .cargo/config.toml 2> /dev/null
+ay_cargo vendor --locked vendor > .cargo/config.toml 2> /dev/null
 grep -q 'vendored-sources' .cargo/config.toml || {
     echo "G2 VIOLATION — vendor config missing source replacement" >&2; exit 1; }
 
@@ -211,6 +217,7 @@ while IFS='|' read -r SLUG NAME CMDLINE CATS UNCHECKED; do
     if [ "$FIRST_BUILD_DONE" -eq 0 ]; then
         SMOKEHOME="$WORK/smokehome"
         mkdir -p "$SMOKEHOME/cargo"
+        # STOCK EXCEPTION (build-host oracle): Trust seal 9192 has no Linux std (2026-09-28: E0463).
         CARGO_BIN_DIR=$(dirname "$(rustup which cargo 2>/dev/null || command -v cargo)")
         env -i \
             PATH="$CARGO_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \

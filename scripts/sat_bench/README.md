@@ -1,8 +1,7 @@
 # SAT-COMP campaign benchmark harness
 
 Reusable AY-vs-Kissat measurement + attribution tools for the SAT-COMP improvement
-campaign. See the development design notes and memory
-`sat-comp-win-goal` / `sat-improvement-loop-state`.
+campaign.
 
 - `sat_compare.py <dir|list> <timeout_s> <out.json> [jobs]` — run AY (`--no-proof -t`)
   + Kissat on a CNF set, cross-check verdicts (flags soundness disagreements),
@@ -13,7 +12,6 @@ campaign. See the development design notes and memory
 - `attribute.py <results.json>` — bucket instances, gap-by-family, slowdown ratios.
 - `audit.py` — BVE-soundness audit (known-verdict corpus; flags wrong answers,
   counts Unknown regressions).
-- `baseline_sat2025_t40.json` — session-01 baseline (AY 11 vs Kissat 15 @40s, 0 wrong).
 
 Env: AY_BIN, KISSAT_BIN. Reference Kissat: build arminbiere/kissat. Independent
 proof checkers: marijnheule/drat-trim (lrat-check).

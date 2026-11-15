@@ -1,0 +1,14 @@
+pseudo-Boolean proof version 2.0
+* The version 2.0 spelling of the same fabrication: `red` with an EMPTY witness is a proof by
+* contradiction, and an empty witness touches nothing, so it registers no database proofgoals
+* either. `proofgoal 1` fabricated `C_1` and closing it discharged the redundance obligation,
+* forging `s VERIFIED UNSATISFIABLE` for the satisfiable clause `x1 OR x2`.
+f 1
+red >= 1 ; ; begin
+    proofgoal 1
+        u >= 1 ;
+    end
+end
+output NONE
+conclusion UNSAT
+end pseudo-Boolean proof

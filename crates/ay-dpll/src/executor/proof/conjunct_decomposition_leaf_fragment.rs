@@ -256,7 +256,7 @@ impl Executor {
         // Guard 6: the untouched strict checker replays the congruence half,
         // closed, before any step of it may enter the proof.
         let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &bridge.derivation);
-        if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+        if self.check_proof_strict_until_stopped(&closed).is_err() {
             return None;
         }
         let sub = self.assemble_bridge_fragment(&bridge, leaf_of, goal)?;
@@ -284,7 +284,7 @@ impl Executor {
                 };
                 let closed =
                     ay_proof::close_congruence_derivation(&mut self.ctx.terms, &derivation);
-                ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_ok()
+                self.check_proof_strict_until_stopped(&closed).is_ok()
             })
     }
 
@@ -320,7 +320,7 @@ impl Executor {
             clause: clause.clone(),
         };
         let closed = ay_proof::close_congruence_derivation(&mut self.ctx.terms, &derivation);
-        if ay_proof::check_proof_strict(&closed, &self.ctx.terms).is_err() {
+        if self.check_proof_strict_until_stopped(&closed).is_err() {
             return None;
         }
         fragment.push(step);

@@ -13,58 +13,15 @@
 //! Mod/div fallback strategies are in the `mod_div` sibling module.
 
 mod budget;
+mod counted;
+mod free_vars;
+mod structural;
+
+use counted::PerRule;
 
 use super::*;
 
 impl PdrSolver {
-    /// Reject ill-formed models whose interpretations mention FREE variables.
-    ///
-    /// SOUNDNESS: An invariant interpretation must be closed over its binder
-    /// vars (`interp.vars`). If the formula references other variables, the
-    /// substitution performed by `apply_interp_to_args` leaves them free in
-    /// the verification query, where they are CAPTURED by same-named
-    /// clause-local variables. Clause constraints can then contradict the
-    /// captured conjuncts, making consecution checks vacuously UNSAT and
-    /// letting a non-invariant "pass" full validation (022c-horn_000
-    /// false-SAT: synthesized `INV1 := ¬(... ∧ (= G H) ∧ (= I J))` with free
-    /// G/H/I/J was validated against clauses whose own G/H/I/J satisfied
-    /// `(>= (- G H) 1)`, discharging every check).
-    ///
-    /// Returns `true` (reject) when any interpretation used by the problem
-    /// has free variables.
-    pub(super) fn model_has_free_interpretation_vars(&self, model: &InvariantModel) -> bool {
-        for pred in self.problem.predicates() {
-            let Some(interp) = model.get(&pred.id) else {
-                continue;
-            };
-            let param_names: ay_core::kani_compat::DetHashSet<&str> =
-                interp.vars.iter().map(|v| v.name.as_str()).collect();
-            if let Some(free_var) = interp
-                .formula
-                .vars()
-                .iter()
-                .find(|v| !param_names.contains(v.name.as_str()))
-            {
-                if self.config.verbose {
-                    safe_eprintln!(
-                        "PDR: verify_model: rejecting ill-formed model — pred {} interpretation \
-                         has free variable `{}` not among its binder vars (capture-unsound)",
-                        pred.id.index(),
-                        free_var.name
-                    );
-                }
-                tracing::warn!(
-                    pred = pred.id.index(),
-                    free_var = %free_var.name,
-                    "verify_model: rejecting model with free interpretation variable \
-                     (substitution capture would make clause checks vacuous)"
-                );
-                return true;
-            }
-        }
-        false
-    }
-
     /// Verify that a model satisfies all CHC clauses
     ///
     /// REQUIRES: `self.problem` is the CHC problem the `model` was constructed for.
@@ -78,7 +35,8 @@ impl PdrSolver {
     ///
     /// This is the main entry point for external invariant validation.
     pub fn verify_model(&mut self, model: &InvariantModel) -> bool {
-        self.verify_model_impl(model, None, false, false).is_none()
+        self.verify_model_impl(model, None, false, PerRule::Shared)
+            .is_none()
     }
 
     /// Panic-safe variant of [`verify_model`](Self::verify_model).
@@ -90,13 +48,6 @@ impl PdrSolver {
             std::panic::AssertUnwindSafe(|| Ok(self.verify_model(model))),
             |reason| Err(crate::ChcError::Internal(reason)),
         )
-    }
-
-    /// Number of transition clauses skipped by BV soft degradation (#5643).
-    /// Non-zero means the model was not fully verified for inductiveness.
-    #[cfg(test)]
-    pub(crate) fn bv_soft_degradation_skips(&self) -> usize {
-        self.telemetry.bv_soft_degradation_skips
     }
 
     /// Verify a model using a **fresh** SMT context (#5922).
@@ -112,6 +63,11 @@ impl PdrSolver {
     /// If fresh verification fails, the warm context was incorrect and the model
     /// should not be returned as Safe.
     pub(in crate::pdr) fn verify_model_fresh(&mut self, model: &InvariantModel) -> bool {
+        let memory = self.validation_memory();
+        let _memory_scope = memory.install();
+        if !memory.open() {
+            return false;
+        }
         let warm_smt = std::mem::take(&mut self.smt);
         let per_rule_budget = std::time::Duration::from_secs(2);
         let result = self.verify_model_per_rule(model, per_rule_budget);
@@ -132,9 +88,14 @@ impl PdrSolver {
         &mut self,
         model: &InvariantModel,
     ) -> Option<(PredicateId, ChcExpr, PredicateId, ChcExpr)> {
+        let memory = self.validation_memory();
+        let _memory_scope = memory.install();
+        if !memory.open() {
+            return Some(Self::unconfirmed_model());
+        }
         let warm_smt = std::mem::take(&mut self.smt);
         let per_rule_budget = std::time::Duration::from_secs(2);
-        let result = self.verify_model_impl(model, Some(per_rule_budget), false, true);
+        let result = self.verify_model_impl(model, Some(per_rule_budget), false, PerRule::Wall);
         self.smt = warm_smt;
         result
     }
@@ -146,6 +107,11 @@ impl PdrSolver {
     /// context proved full inductiveness and the fresh context can independently
     /// confirm safety (query clauses UNSAT), the model is sound.
     pub(in crate::pdr) fn verify_model_fresh_query_only(&mut self, model: &InvariantModel) -> bool {
+        let memory = self.validation_memory();
+        let _memory_scope = memory.install();
+        if !memory.open() {
+            return false;
+        }
         let warm_smt = std::mem::take(&mut self.smt);
         let result = self.verify_model_query_only(model);
         self.smt = warm_smt;
@@ -163,7 +129,7 @@ impl PdrSolver {
         model: &InvariantModel,
         budget: std::time::Duration,
     ) -> bool {
-        self.verify_model_impl(model, Some(budget), false, false)
+        self.verify_model_impl(model, Some(budget), false, PerRule::Shared)
             .is_none()
     }
 
@@ -178,7 +144,8 @@ impl PdrSolver {
     /// checked with Duration::ZERO. This replaces the pre-#5745 Duration::ZERO
     /// convention that was broken by the budget-expiry rejection logic (#5825).
     pub(crate) fn verify_model_query_only(&mut self, model: &InvariantModel) -> bool {
-        self.verify_model_impl(model, None, true, false).is_none()
+        self.verify_model_impl(model, None, true, PerRule::Shared)
+            .is_none()
     }
 
     /// Verify a model with independent per-rule budgets.
@@ -199,28 +166,74 @@ impl PdrSolver {
         model: &InvariantModel,
         per_rule_budget: std::time::Duration,
     ) -> bool {
-        self.verify_model_impl(model, Some(per_rule_budget), false, true)
+        self.verify_model_impl(model, Some(per_rule_budget), false, PerRule::Wall)
             .is_none()
     }
 
     fn verify_model_impl(
         &mut self,
         model: &InvariantModel,
-        budget: Option<std::time::Duration>,
+        mut budget: Option<std::time::Duration>,
         query_only: bool,
-        per_rule_budget: bool,
+        per_rule: PerRule,
     ) -> Option<(PredicateId, ChcExpr, PredicateId, ChcExpr)> {
+        // A solver constructed for search may have replaced its working
+        // problem with an array-scalarized signature, while a back-translated
+        // model still speaks the retained pre-scalarization
+        // (`model_problem`) signature. `verify_model`'s contract is the
+        // working vocabulary: an original-signature model that HAS a
+        // scalarized spelling (tracked-index selects only) is simply not in
+        // that vocabulary and takes the ordinary path, which rejects it on
+        // binder mismatch — callers wanting original-signature judgement use
+        // the external-validation entry, which disables scalarization.
+        //
+        // A model with NO scalarized spelling (whole-array equalities or
+        // untracked reads over dropped array arguments) is the shape the
+        // solver's own backtranslation produces, and its designated judge is
+        // the retained original problem — exactly the Safe-boundary
+        // validation in `finish_safe_with_result_trace`. Forward
+        // scalarization is used purely as the expressibility oracle.
+        if !self.array_scalarization_maps.is_empty()
+            && Self::model_matches_problem_signature(model, &self.model_problem)
+            && !Self::model_matches_problem_signature(model, &self.problem)
+            && self.try_scalarize_model_forward(model.clone()).is_none()
+        {
+            let mut config = self.config.clone();
+            config.disable_array_scalarization = true;
+            let mut verifier = Self::new(self.model_problem.clone(), config);
+            verifier.solve_deadline = self.solve_deadline;
+            let result = verifier.verify_model_impl(model, budget, query_only, per_rule);
+            self.telemetry
+                .add_anchored_search(verifier.telemetry.concrete_anchored_search);
+            return result;
+        }
+
+        // INV-S2 (#horn-smt-session §7.2): every `verify_model*` entry funnels
+        // here; while this guard is alive no `check_sat` on this thread routes
+        // to a `HornSmt` session — including on THIS solver's own Search-lane
+        // context (the in-engine Safe exits, design F14).
+        let _verification_pin = crate::smt::lane::ScopedVerificationMode::install();
         self.telemetry.verification_queries = self.telemetry.verification_queries.saturating_add(1);
         self.telemetry.bv_soft_degradation_skips = 0;
+        self.telemetry.model_validation_failure = None;
+        let memory = self.validation_memory();
+        let _memory_scope = memory.install();
+        if !memory.open() || self.smt.exact_term_memory_exceeded() {
+            return Some(Self::unconfirmed_model());
+        }
 
-        // Empty model is valid for a vacuous empty problem (no predicates, no clauses).
-        // For non-empty problems with empty models (can happen when PDR finds a fixpoint
-        // with empty frames for array problems where SMT returns Unknown), return a
-        // verification failure rather than panicking. (#4757, #6047)
-        if model.is_empty() {
-            if self.problem.predicates().is_empty() && self.problem.clauses().is_empty() {
-                return None;
-            }
+        // One original allowance spans all structural clause proofs.
+        let mut exact_owner = match self.structural_verification_owner() {
+            Ok(owner) => owner,
+            Err(_) => return Some(Self::unconfirmed_model()),
+        };
+        let _exact_scope = exact_owner.enter();
+
+        // An empty model cannot interpret declared predicates (#4757, #6047).
+        // A predicate-free problem needs no interpretations, but its clauses
+        // still require the completeness census and per-clause checks below.
+        if model.is_empty() && !self.problem.predicates().is_empty() {
+            self.note_model_rejection();
             return Some((
                 PredicateId::new(0),
                 ChcExpr::Bool(false),
@@ -233,6 +246,7 @@ impl PdrSolver {
         // validated by substitution — same-named clause variables capture them,
         // turning clause checks into vacuous UNSAT queries (022c-horn_000).
         if self.model_has_free_interpretation_vars(model) {
+            self.note_model_rejection();
             return Some((
                 PredicateId::new(0),
                 ChcExpr::Bool(false),
@@ -288,6 +302,7 @@ impl PdrSolver {
                 _ => None,
             };
             if let Some(pred) = missing_body.or(missing_head) {
+                self.note_model_rejection();
                 if self.config.verbose {
                     safe_eprintln!(
                         "PDR: verify_model: rejecting incomplete model — predicate {} \
@@ -308,7 +323,7 @@ impl PdrSolver {
         // #3225: Cap per-clause SMT timeouts at the remaining solve deadline.
         // Without this, a single 30s VERIFY_RETRY_TIMEOUT can run past the
         // solve_deadline, preventing cooperative cancellation from taking effect.
-        let verify_timeout = self.cap_timeout(VERIFY_INITIAL_TIMEOUT);
+        let mut verify_timeout = self.cap_timeout(VERIFY_INITIAL_TIMEOUT);
         // Track whether any transition clause used filtered invariant (#73 soundness fix).
         // If so, we must re-verify query clauses with the same filtered invariant.
         let mut used_filtered_invariant = false;
@@ -319,8 +334,7 @@ impl PdrSolver {
         // #5653: Budget for concrete_transition_check to avoid cumulative overhead.
         // verify_model_impl has a larger budget (1000ms) than verify_model_fast (200ms)
         // since this path has longer overall deadlines.
-        let concrete_budget = std::time::Duration::from_secs(1);
-        let mut concrete_elapsed = std::time::Duration::ZERO;
+        let mut concrete = self.concrete_budget(std::time::Duration::from_secs(1));
         // #7410: Rate-limit concrete cross-checks to 1-in-100 UNSAT results
         // to avoid overhead on query-heavy benchmarks (const_mod_3,
         // menlo_park_term_simpl_2).
@@ -330,13 +344,17 @@ impl PdrSolver {
         for clause_idx in 0..num_clauses {
             // #5653 Phase 1: Per-rule budget mode resets the timer at the start of
             // each clause. This gives each clause its own full budget allocation
-            // instead of sharing a single budget across all clauses.
-            if per_rule_budget {
-                budget_start = budget.map(|_| ay_core::time::Instant::now());
-            }
+            // instead of sharing a single budget across all clauses. A counted
+            // allowance installs a fresh executor work allowance instead.
+            let _rule_work = self.open_rule_allotment(
+                per_rule,
+                &mut budget,
+                &mut budget_start,
+                &mut verify_timeout,
+            );
             // #3225: Check cooperative cancellation between clauses.
             // Return Some (model not verified) to avoid unsound Safe claims.
-            if self.is_cancelled() {
+            if self.is_cancelled() || exact_owner.poll().is_err() {
                 return Some((
                     PredicateId::new(0),
                     ChcExpr::Bool(false),
@@ -405,8 +423,7 @@ impl PdrSolver {
                         budget_start,
                         budget,
                         &mut query_clause_info,
-                        concrete_budget,
-                        &mut concrete_elapsed,
+                        &mut concrete,
                         &mut concrete_unsat_count,
                     ) {
                         return Some(failure);
@@ -424,18 +441,30 @@ impl PdrSolver {
                         budget_start,
                         budget,
                         &mut used_filtered_invariant,
-                        concrete_budget,
-                        &mut concrete_elapsed,
+                        &mut concrete,
                         &mut concrete_unsat_count,
+                        &mut exact_owner,
                     ) {
                         return Some(failure);
                     }
                 }
             }
+            // Anchored search time is not the clauses' to lose: move the budget past it.
+            let anchored = concrete.take_anchored_spent(&mut self.telemetry);
+            budget_start = budget_start.map(|s| s.checked_add(anchored).unwrap_or(s));
         }
 
         // Post-loop: re-verify query clauses if filtered invariant was used (#73 soundness fix).
         if used_filtered_invariant && !query_clause_info.is_empty() {
+            // Under a counted allowance the re-check is one more rule.
+            let _recheck_work = matches!(per_rule, PerRule::Counted(_)).then(|| {
+                self.open_rule_allotment(
+                    per_rule,
+                    &mut budget,
+                    &mut budget_start,
+                    &mut verify_timeout,
+                )
+            });
             if let Some(failure) = self.reverify_queries_with_filtered_invariant(
                 &query_clause_info,
                 verify_timeout,
@@ -446,10 +475,8 @@ impl PdrSolver {
             }
         }
 
-        // #5643: Log summary when BV soft degradation skipped transition clauses.
-        // A non-zero count means inductiveness was not fully verified — only query
-        // clauses (safety properties) were hard-checked. PDR engines produce
-        // inductive invariants by construction, so this is defense-in-depth only.
+        // Report any skipped-clause telemetry; sound-by-default paths reject
+        // unverified transitions rather than accepting a partial model.
         if self.telemetry.bv_soft_degradation_skips > 0 {
             tracing::warn!(
                 skipped_clauses = self.telemetry.bv_soft_degradation_skips,
@@ -465,6 +492,9 @@ impl PdrSolver {
             }
         }
 
+        if exact_owner.poll().is_err() {
+            return Some(Self::unconfirmed_model());
+        }
         None
     }
 }

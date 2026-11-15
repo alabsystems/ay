@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+f 1;
+% Lowering the RHS of a literal axiom and then adding it must contribute the
+% lowered degree. The literal-axiom stash used to swallow the "3 -" here,
+% deriving 1 x1 2 x2 >= 1 instead of >= -2 (sound, but not the constraint
+% this derivation states). Found by the proved-kernel shadow replay.
+pol 1 x2 3 - +;
+e 1 x1 2 x2 >= -2 : 2;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

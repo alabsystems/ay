@@ -5,6 +5,11 @@
 
 mod rup_fixpoint;
 
+mod conservative_work;
+pub use conservative_work::{conservative_rup_validation_work_bound, ConservativeRupSourceShape};
+
+mod premised;
+
 use crate::literal::Literal;
 use crate::resolution_dag::{ResolutionDag, RupStep};
 use ay_core::time::Instant;
@@ -212,6 +217,27 @@ struct WorkMeter<'a> {
     work: u64,
 }
 
+/// Shared by prefix admission and later debits, only after Work exhaustion.
+#[cold]
+#[inline(never)]
+fn replay_work_limit_error(
+    limit: u64,
+    actual: u64,
+    debit: u64,
+    site: &'static str,
+) -> ResolutionValidationError {
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        ay_core::safe_eprintln!(
+            "--probe-cert-reject: work-limit owner=sat-replay site={site} limit={limit} actual={actual} debit={debit}"
+        );
+    }
+    ResolutionValidationError::LimitExceeded {
+        resource: ResolutionValidationResource::Work,
+        limit: u128::from(limit),
+        actual: u128::from(actual),
+    }
+}
+
 impl<'a> WorkMeter<'a> {
     fn new(
         limits: &'a ResolutionValidationLimits,
@@ -224,11 +250,12 @@ impl<'a> WorkMeter<'a> {
             work: initial_work,
         };
         if initial_work > limits.max_work {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: u128::from(limits.max_work),
-                actual: u128::from(initial_work),
-            });
+            return Err(replay_work_limit_error(
+                limits.max_work,
+                initial_work,
+                initial_work,
+                "initial-prefix",
+            ));
         }
         meter.check_controls()?;
         Ok(meter)
@@ -257,11 +284,12 @@ impl<'a> WorkMeter<'a> {
                     resource: ResolutionValidationResource::Work,
                 })?;
         if self.work > self.limits.max_work {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: u128::from(self.limits.max_work),
-                actual: u128::from(self.work),
-            });
+            return Err(replay_work_limit_error(
+                self.limits.max_work,
+                self.work,
+                amount,
+                "charge",
+            ));
         }
         // Clock reads are amortized across deterministic replay work.
         if old / 1024 != self.work / 1024 {
@@ -282,6 +310,14 @@ impl<'a> WorkMeter<'a> {
         self.work
     }
 }
+
+#[cfg(test)]
+#[path = "resolution_validate/work_limit_tests.rs"]
+mod work_limit_tests;
+
+#[cfg(test)]
+#[path = "resolution_validate/work_reporting_tests.rs"]
+mod work_reporting_tests;
 
 fn checked_add(
     lhs: usize,
@@ -403,6 +439,45 @@ impl ResolutionDag {
         let mut never_stop = || false;
         self.validate_with_limits_interruptible(limits, &[], 0, 0, &mut never_stop)
             .map(|_| ())
+    }
+
+    /// Independently replay the complete DAG with caller-owned cancellation.
+    /// The callback returns true to continue; refusal is terminal for this call.
+    pub fn validate_with_limits_and_cancellation(
+        &self,
+        limits: &ResolutionValidationLimits,
+        keep_going: &mut dyn FnMut() -> bool,
+    ) -> Result<(), ResolutionValidationError> {
+        self.validate_with_limits_and_cancellation_work(limits, keep_going)
+            .map(|_| ())
+    }
+
+    /// Independently replay the complete DAG and report its consumed validation work.
+    ///
+    /// This is the same replay and cancellation contract as
+    /// [`Self::validate_with_limits_and_cancellation`], without discarding the
+    /// existing deterministic work counter. Success reports only this replay's
+    /// work, after its final control check; it excludes proof production, SAT
+    /// search and transport. Errors return no usage and must not be interpreted
+    /// as an unused grant or authorize retrying under a refreshed allowance.
+    pub fn validate_with_limits_and_cancellation_work(
+        &self,
+        limits: &ResolutionValidationLimits,
+        keep_going: &mut dyn FnMut() -> bool,
+    ) -> Result<u64, ResolutionValidationError> {
+        let mut stopped = false;
+        let mut should_stop = || {
+            if stopped {
+                return true;
+            }
+            // Latch before invoking caller code, including unwinding callbacks.
+            stopped = true;
+            if keep_going() {
+                stopped = false;
+            }
+            stopped
+        };
+        self.validate_with_limits_interruptible(limits, &[], 0, 0, &mut should_stop)
     }
 
     /// Replay under `limits`, accounting bytes retained and deterministic work
@@ -1020,6 +1095,47 @@ mod compatibility_tests {
     #[test]
     fn legacy_error_remains_exhaustive() {
         exhaust_legacy_error(ResolutionDagValidateError::NoSteps);
+    }
+
+    #[test]
+    fn public_controlled_replay_honors_every_refusal_and_rejects_invalid_hints() {
+        let mut dag = ResolutionDag {
+            num_vars: 1,
+            original_clauses: vec![
+                (1, vec![Literal::from_dimacs(1)]),
+                (2, vec![Literal::from_dimacs(-1)]),
+            ],
+            derived: vec![RupStep {
+                id: 3,
+                clause: vec![],
+                rup_hints: vec![1, 2],
+            }],
+            empty_clause_id: 3,
+        };
+        let limits = ResolutionValidationLimits::default();
+        let mut polls = 0;
+        dag.validate_with_limits_and_cancellation(&limits, &mut || {
+            polls += 1;
+            true
+        })
+        .unwrap();
+        for stop in 1..=polls {
+            let mut calls = 0;
+            assert_eq!(
+                dag.validate_with_limits_and_cancellation(&limits, &mut || {
+                    calls += 1;
+                    calls != stop
+                }),
+                Err(ResolutionValidationError::Cancelled)
+            );
+            assert_eq!(calls, stop);
+        }
+        dag.validate_with_limits_and_cancellation(&limits, &mut || true)
+            .unwrap();
+        dag.derived[0].rup_hints = vec![1];
+        assert!(dag
+            .validate_with_limits_and_cancellation(&limits, &mut || true)
+            .is_err());
     }
 
     #[test]

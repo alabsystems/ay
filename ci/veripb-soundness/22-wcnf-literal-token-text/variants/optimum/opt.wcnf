@@ -1,0 +1,4 @@
+c hard: (x1)                     -- forces x1 true
+c soft: (~x1) with weight 5, spelled `-0001` -- must be paid, so the optimum is 5
+h 1 0
+5 -0001 0

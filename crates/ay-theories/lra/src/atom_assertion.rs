@@ -84,6 +84,7 @@ impl LraSolver {
 
         let new_slack = self.next_var;
         self.next_var += 1;
+        self.note_phase_state_change(); // a new column (#nonlinear-phase-hints)
         while self.vars.len() <= new_slack as usize {
             self.vars.push(VarInfo::default());
         }
@@ -269,16 +270,23 @@ impl LraSolver {
             return 0;
         }
 
-        let mut seen = HashSet::default();
+        // Persistent scratch (taken, cleared, restored) instead of a fresh
+        // `HashSet` per call and a cloned `Vec` per dirty variable: same
+        // visiting order and the same first-occurrence filter.
+        let mut seen = std::mem::take(&mut self.compound_wake_seen_scratch);
+        seen.clear();
+        let mut compounds = std::mem::take(&mut self.compound_wake_refs_scratch);
         let mut queued = 0usize;
         let mut dirty_hits = 0usize;
         let mut candidates = 0usize;
         for &var in dirty {
-            let Some(compounds) = self.compound_use_index.get(&var).cloned() else {
+            compounds.clear();
+            let Some(refs) = self.compound_use_index.get(&var) else {
                 continue;
             };
+            compounds.extend_from_slice(refs);
             dirty_hits += 1;
-            for compound in compounds {
+            for &compound in &compounds {
                 if !seen.insert(compound.term) {
                     continue;
                 }
@@ -288,10 +296,24 @@ impl LraSolver {
                 }
             }
         }
+        compounds.clear();
+        self.compound_wake_refs_scratch = compounds;
+        self.compound_wake_seen_scratch = seen;
         self.last_compound_propagations_queued = queued;
         self.last_compound_wake_dirty_hits = dirty_hits;
         self.last_compound_wake_candidates = candidates;
         queued
+    }
+
+    /// `(is_le, interval)` of a compound atom's cached `expr <= 0` /
+    /// `expr >= 0` form under the current bounds, or `None` when the atom has
+    /// no cached arithmetic form. Borrows the cached expression instead of
+    /// cloning it.
+    fn compound_expr_interval(&self, term: TermId) -> Option<(bool, ExprInterval)> {
+        match self.atom_cache.get(&term) {
+            Some(Some(info)) => Some((info.is_le, self.compute_expr_interval(&info.expr))),
+            _ => None,
+        }
     }
 
     pub(crate) fn try_queue_compound_propagation(&mut self, compound: CompoundAtomRef) -> bool {
@@ -308,33 +330,20 @@ impl LraSolver {
         // atom over that same slack, and it must stay available when source-var
         // interval reconstruction comes back empty.
 
-        // #8064: Extract (value, strict, reasons) from direct bounds eagerly.
-        // Reasons are collected now to avoid losing propagations when bounds
-        // are backtracked between check() and propagate().
+        // The slack's direct bounds, value and strictness only. A direct-bound
+        // propagation is queued with `DeferredReason::DirectBound`, and
+        // `propagate_impl` reads its reasons from the slack's bound when it
+        // drains the queue (#8511), so none are collected here.
         let direct_upper = self
             .vars
             .get(slack_vi)
             .and_then(|info| info.upper.as_ref())
-            .map(|bound| {
-                let reasons: Vec<TheoryLit> = bound
-                    .reason_pairs()
-                    .filter(|(term, _)| !term.is_sentinel())
-                    .map(|(term, val)| TheoryLit::new(term, val))
-                    .collect();
-                (bound.value.clone(), bound.strict, reasons)
-            });
+            .map(|bound| (bound.value.clone(), bound.strict));
         let direct_lower = self
             .vars
             .get(slack_vi)
             .and_then(|info| info.lower.as_ref())
-            .map(|bound| {
-                let reasons: Vec<TheoryLit> = bound
-                    .reason_pairs()
-                    .filter(|(term, _)| !term.is_sentinel())
-                    .map(|(term, val)| TheoryLit::new(term, val))
-                    .collect();
-                (bound.value.clone(), bound.strict, reasons)
-            });
+            .map(|bound| (bound.value.clone(), bound.strict));
         // #9031: Re-enabled with stale-reason safety filter in propagate_impl().
         let implied_upper: Option<(Rational, bool, usize)> = if slack_vi < self.implied_bounds.len()
         {
@@ -357,9 +366,9 @@ impl LraSolver {
             None
         };
 
-        // #8064: Check if direct bound implies truth, with eagerly-collected reasons.
+        // #8064: Check if a direct bound implies truth.
         let direct_true_implied = if atom.is_upper {
-            direct_upper.as_ref().is_some_and(|(value, strict, _)| {
+            direct_upper.as_ref().is_some_and(|(value, strict)| {
                 if atom.strict {
                     value < &atom.bound_value || (value == &atom.bound_value && *strict)
                 } else {
@@ -367,7 +376,7 @@ impl LraSolver {
                 }
             })
         } else {
-            direct_lower.as_ref().is_some_and(|(value, strict, _)| {
+            direct_lower.as_ref().is_some_and(|(value, strict)| {
                 if atom.strict {
                     value > &atom.bound_value || (value == &atom.bound_value && *strict)
                 } else {
@@ -398,14 +407,17 @@ impl LraSolver {
             })
         };
 
+        // The atom expression's interval, computed at most once for both the
+        // TRUE and the FALSE probe below: the TRUE arm returns as soon as it
+        // queues anything, so nothing between the two probes changes the
+        // bounds the interval is computed from.
+        let mut interval: Option<Option<(bool, ExprInterval)>> = None;
         if !self.propagated_atoms.contains(&(compound.term, true)) {
             // #8467: Check if interval bounds imply TRUE, but defer reason collection.
             let interval_true_implied = if !direct_true_implied && implied_true_row.is_none() {
-                match self.atom_cache.get(&compound.term) {
-                    Some(Some(info)) => {
-                        let expr = info.expr.clone();
-                        let (lb, ub) = self.compute_expr_interval(&expr);
-                        if info.is_le {
+                match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term)) {
+                    Some((is_le, (lb, ub))) => {
+                        if *is_le {
                             ub.as_ref().is_some_and(|ep| {
                                 Self::endpoint_implies_le_zero(ep, compound.strict)
                             })
@@ -415,7 +427,7 @@ impl LraSolver {
                             })
                         }
                     }
-                    _ => false,
+                    None => false,
                 }
             } else {
                 false
@@ -478,9 +490,9 @@ impl LraSolver {
             }
         }
 
-        // #8064: Check if direct bound implies falsity, with eagerly-collected reasons.
+        // #8064: Check if a direct bound implies falsity.
         let direct_false_implied = if atom.is_upper {
-            direct_lower.as_ref().is_some_and(|(value, strict, _)| {
+            direct_lower.as_ref().is_some_and(|(value, strict)| {
                 if atom.strict {
                     value >= &atom.bound_value
                 } else {
@@ -488,7 +500,7 @@ impl LraSolver {
                 }
             })
         } else {
-            direct_upper.as_ref().is_some_and(|(value, strict, _)| {
+            direct_upper.as_ref().is_some_and(|(value, strict)| {
                 if atom.strict {
                     value <= &atom.bound_value
                 } else {
@@ -522,11 +534,9 @@ impl LraSolver {
         if !self.propagated_atoms.contains(&(compound.term, false)) {
             // #8467: Check if interval bounds imply FALSE, but defer reason collection.
             let interval_false_implied = if !direct_false_implied && implied_false_row.is_none() {
-                match self.atom_cache.get(&compound.term) {
-                    Some(Some(info)) => {
-                        let expr = info.expr.clone();
-                        let (lb, ub) = self.compute_expr_interval(&expr);
-                        if info.is_le {
+                match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term)) {
+                    Some((is_le, (lb, ub))) => {
+                        if *is_le {
                             lb.as_ref().is_some_and(|ep| {
                                 Self::endpoint_implies_not_le_zero(ep, compound.strict)
                             })
@@ -536,7 +546,7 @@ impl LraSolver {
                             })
                         }
                     }
-                    _ => false,
+                    None => false,
                 }
             } else {
                 false

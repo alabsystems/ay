@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "datatype_signatures.rs"]
+mod datatype_signatures;
+
 impl ChcProblem {
     /// Detect a phase-bounded execution depth for acyclic-safe BMC (#7897).
     ///
@@ -517,6 +520,7 @@ impl ChcProblem {
                 | ChcExpr::PredicateApp(_, _, arguments)
                 | ChcExpr::FuncApp(_, _, arguments) => arguments,
                 ChcExpr::ConstArray(_, value) => std::slice::from_ref(value),
+                ChcExpr::ArrayLambda(lambda) => lambda.captures(),
                 ChcExpr::Bool(_)
                 | ChcExpr::Int(_)
                 | ChcExpr::Real(_, _)
@@ -564,6 +568,12 @@ impl ChcProblem {
                     )));
                 }
                 ChcExpr::FuncApp(_, return_sort, _) => return_sort.clone(),
+                ChcExpr::ArrayLambda(lambda) => {
+                    if !lambda.captures_are_well_typed() {
+                        return Err(crate::ChcError::Verification("array lambda capture sort mismatch".into()));
+                    }
+                    lambda.sort()
+                }
                 ChcExpr::ConstArray(index_sort, _) => {
                     let element_sort = child_sorts.first().ok_or_else(|| {
                         crate::ChcError::Verification(format!(
@@ -610,8 +620,10 @@ impl ChcProblem {
     /// surface used by ground-artifact authentication.
     ///
     /// The caller must first run the iterative whole-source preflight. It bounds
-    /// all declaration sorts and expression trees before the sort derivations
-    /// and comparisons below recurse through them.
+    /// every declaration sort's spelling (array depth, names, and each distinct
+    /// datatype definition once) and the expression trees before the sort
+    /// derivations and comparisons below recurse through them. Datatype sorts
+    /// compare by reference, so no comparison here descends into a definition.
     pub(crate) fn validate_live_predicate_applications(&self) -> ChcResult<()> {
         use crate::ChcError;
 
@@ -703,36 +715,11 @@ impl ChcProblem {
         &'a self,
         clauses: impl IntoIterator<Item = &'a HornClause>,
     ) -> ChcResult<()> {
-        type FunctionSignature = (ChcSort, Vec<ChcSort>);
-
         let predicate_names: FxHashSet<&str> = self
             .predicates
             .iter()
             .map(|predicate| predicate.name.as_str())
             .collect();
-        let mut datatype_symbols = FxHashSet::default();
-        for constructors in self.datatype_defs.values() {
-            for (constructor, selectors) in constructors {
-                datatype_symbols.insert(constructor.clone());
-                datatype_symbols.insert(format!("is-{constructor}"));
-                datatype_symbols.extend(selectors.iter().map(|(selector, _)| selector.clone()));
-            }
-        }
-
-        let mut datatype_signatures: FxHashMap<String, Vec<FunctionSignature>> =
-            FxHashMap::default();
-        let mut seen_datatypes = FxHashSet::default();
-        for predicate in &self.predicates {
-            for sort in &predicate.arg_sorts {
-                Self::collect_datatype_function_signatures_from_sort(
-                    sort,
-                    &mut seen_datatypes,
-                    &mut datatype_symbols,
-                    &mut datatype_signatures,
-                );
-            }
-        }
-
         let mut expressions = Vec::new();
         for clause in clauses {
             if let Some(constraint) = &clause.body.constraint {
@@ -749,174 +736,39 @@ impl ChcProblem {
                 expressions.extend(args.iter());
             }
         }
-        for expression in &expressions {
-            Self::collect_datatype_function_signatures_from_expr(
-                expression,
-                &mut seen_datatypes,
-                &mut datatype_symbols,
-                &mut datatype_signatures,
-            );
-        }
+        // Recursive datatype signatures carry finite metadata snapshots, not
+        // structurally identical recursive trees. Authenticate every declared
+        // and embedded definition before using nominal sort compatibility.
+        let mut authenticated_datatypes =
+            datatype_signatures::AuthenticatedDatatypes::new(self, &expressions)?;
 
         for expression in expressions {
             Self::validate_function_applications_in_expr(
                 expression,
                 &predicate_names,
-                &datatype_symbols,
-                &datatype_signatures,
+                &mut authenticated_datatypes,
             )?;
         }
         Ok(())
     }
 
-    fn collect_datatype_function_signatures_from_sort(
-        sort: &ChcSort,
-        seen_datatypes: &mut FxHashSet<usize>,
-        datatype_symbols: &mut FxHashSet<String>,
-        signatures: &mut FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
-    ) {
-        match sort {
-            ChcSort::Datatype { constructors, .. } => {
-                let identity = Arc::as_ptr(constructors) as usize;
-                if !seen_datatypes.insert(identity) {
-                    return;
-                }
-                let datatype_sort = sort.clone();
-                for constructor in constructors.iter() {
-                    let constructor_arguments = constructor
-                        .selectors
-                        .iter()
-                        .map(|selector| selector.sort.clone())
-                        .collect();
-                    Self::insert_datatype_function_signature(
-                        &constructor.name,
-                        datatype_sort.clone(),
-                        constructor_arguments,
-                        datatype_symbols,
-                        signatures,
-                    );
-                    Self::insert_datatype_function_signature(
-                        &format!("is-{}", constructor.name),
-                        ChcSort::Bool,
-                        vec![datatype_sort.clone()],
-                        datatype_symbols,
-                        signatures,
-                    );
-                    for selector in &constructor.selectors {
-                        Self::insert_datatype_function_signature(
-                            &selector.name,
-                            selector.sort.clone(),
-                            vec![datatype_sort.clone()],
-                            datatype_symbols,
-                            signatures,
-                        );
-                        Self::collect_datatype_function_signatures_from_sort(
-                            &selector.sort,
-                            seen_datatypes,
-                            datatype_symbols,
-                            signatures,
-                        );
-                    }
-                }
-            }
-            ChcSort::Array(index, element) => {
-                Self::collect_datatype_function_signatures_from_sort(
-                    index,
-                    seen_datatypes,
-                    datatype_symbols,
-                    signatures,
-                );
-                Self::collect_datatype_function_signatures_from_sort(
-                    element,
-                    seen_datatypes,
-                    datatype_symbols,
-                    signatures,
-                );
-            }
-            ChcSort::Bool
-            | ChcSort::Int
-            | ChcSort::Real
-            | ChcSort::BitVec(_)
-            | ChcSort::Uninterpreted(_) => {}
-        }
-    }
-
-    fn insert_datatype_function_signature(
-        name: &str,
-        return_sort: ChcSort,
-        argument_sorts: Vec<ChcSort>,
-        datatype_symbols: &mut FxHashSet<String>,
-        signatures: &mut FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
-    ) {
-        datatype_symbols.insert(name.to_string());
-        let signature = (return_sort, argument_sorts);
-        let overloads = signatures.entry(name.to_string()).or_default();
-        if !overloads.contains(&signature) {
-            overloads.push(signature);
-        }
-    }
-
-    fn collect_datatype_function_signatures_from_expr(
-        expression: &ChcExpr,
-        seen_datatypes: &mut FxHashSet<usize>,
-        datatype_symbols: &mut FxHashSet<String>,
-        signatures: &mut FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
-    ) {
-        let mut stack = vec![expression];
-        while let Some(current) = stack.pop() {
-            match current {
-                ChcExpr::Var(var) => Self::collect_datatype_function_signatures_from_sort(
-                    &var.sort,
-                    seen_datatypes,
-                    datatype_symbols,
-                    signatures,
-                ),
-                ChcExpr::FuncApp(_, return_sort, args) => {
-                    Self::collect_datatype_function_signatures_from_sort(
-                        return_sort,
-                        seen_datatypes,
-                        datatype_symbols,
-                        signatures,
-                    );
-                    stack.extend(args.iter().map(AsRef::as_ref));
-                }
-                ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
-                    stack.extend(args.iter().map(AsRef::as_ref));
-                }
-                ChcExpr::ConstArray(index_sort, value) => {
-                    Self::collect_datatype_function_signatures_from_sort(
-                        index_sort,
-                        seen_datatypes,
-                        datatype_symbols,
-                        signatures,
-                    );
-                    stack.push(value);
-                }
-                ChcExpr::ConstArrayMarker(sort) => {
-                    Self::collect_datatype_function_signatures_from_sort(
-                        sort,
-                        seen_datatypes,
-                        datatype_symbols,
-                        signatures,
-                    );
-                }
-                ChcExpr::Bool(_)
-                | ChcExpr::Int(_)
-                | ChcExpr::Real(_, _)
-                | ChcExpr::BitVec(_, _)
-                | ChcExpr::IsTesterMarker(_) => {}
-            }
-        }
-    }
-
     fn validate_function_applications_in_expr(
         expression: &ChcExpr,
         predicate_names: &FxHashSet<&str>,
-        datatype_symbols: &FxHashSet<String>,
-        datatype_signatures: &FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
+        authenticated_datatypes: &mut datatype_signatures::AuthenticatedDatatypes,
     ) -> ChcResult<()> {
+        // A shared inner node already popped is skipped (WP-F F0b): its subtree
+        // was checked at the first visit, in the same order, so the first error
+        // is the tree walk's. (Repeat visits also no longer re-charge the
+        // datatype-signature comparison budget.)
+        let mut seen: FxHashSet<*const ChcExpr> = FxHashSet::default();
         let mut stack = vec![expression];
         while let Some(current) = stack.pop() {
+            if !crate::expr::dag::children(current).is_empty()
+                && !seen.insert(current as *const ChcExpr)
+            {
+                continue;
+            }
             match current {
                 ChcExpr::FuncApp(name, return_sort, args) => {
                     let argument_sorts: Vec<ChcSort> =
@@ -927,16 +779,9 @@ impl ChcProblem {
                         )));
                     }
 
-                    if datatype_symbols.contains(name) {
+                    if authenticated_datatypes.contains(name) {
                         let matches_datatype_function =
-                            datatype_signatures.get(name).is_some_and(|overloads| {
-                                overloads
-                                    .iter()
-                                    .any(|(expected_return, expected_arguments)| {
-                                        expected_return == return_sort
-                                            && expected_arguments == &argument_sorts
-                                    })
-                            });
+                            authenticated_datatypes.matches(name, return_sort, &argument_sorts)?;
                         if !matches_datatype_function {
                             return Err(crate::ChcError::Verification(format!(
                                 "ordinary uninterpreted function '{name}' collides with a datatype constructor, selector, or tester"
@@ -963,6 +808,10 @@ impl ChcProblem {
                 }
                 ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
                     stack.extend(args.iter().map(AsRef::as_ref));
+                }
+                ChcExpr::ArrayLambda(lambda) => {
+                    stack.push(lambda.body());
+                    stack.extend(lambda.captures().iter().map(AsRef::as_ref));
                 }
                 ChcExpr::ConstArray(_, value) => stack.push(value),
                 ChcExpr::Bool(_)
@@ -1018,7 +867,7 @@ impl ChcProblem {
                     stack.push(element);
                 }
                 ChcSort::Datatype { constructors, .. } => {
-                    let identity = Arc::as_ptr(constructors) as usize;
+                    let identity = constructors.node_addr() as usize;
                     if seen_datatypes.insert(identity) {
                         for constructor in constructors.iter() {
                             for selector in &constructor.selectors {
@@ -1033,14 +882,75 @@ impl ChcProblem {
         Ok(())
     }
 
-    fn validate_bitvector_widths_in_expr(expr: &ChcExpr) -> ChcResult<()> {
+    fn computed_bitvector_width(op: &ChcOp, args: &[Arc<ChcExpr>]) -> ChcResult<Option<u32>> {
         let malformed = |operation: &str| {
             crate::ChcError::Verification(format!(
                 "malformed {operation} expression while validating bitvector widths"
             ))
         };
+        let result_width = match op {
+            ChcOp::BvConcat => {
+                let [left, right] = args else {
+                    return Err(malformed("concat"));
+                };
+                let (ChcSort::BitVec(left), ChcSort::BitVec(right)) = (left.sort(), right.sort())
+                else {
+                    return Err(malformed("concat"));
+                };
+                Some(left.checked_add(right).unwrap_or(u32::MAX))
+            }
+            ChcOp::BvZeroExtend(extension) | ChcOp::BvSignExtend(extension) => {
+                let [arg] = args else {
+                    return Err(malformed("bitvector extension"));
+                };
+                let ChcSort::BitVec(width) = arg.sort() else {
+                    return Err(malformed("bitvector extension"));
+                };
+                Some(width.checked_add(*extension).unwrap_or(u32::MAX))
+            }
+            ChcOp::BvRepeat(repetitions) => {
+                let [arg] = args else {
+                    return Err(malformed("bitvector repeat"));
+                };
+                let ChcSort::BitVec(width) = arg.sort() else {
+                    return Err(malformed("bitvector repeat"));
+                };
+                Some(width.checked_mul(*repetitions).unwrap_or(u32::MAX))
+            }
+            ChcOp::BvExtract(hi, lo) => {
+                let [arg] = args else {
+                    return Err(malformed("bitvector extract"));
+                };
+                let ChcSort::BitVec(input_width) = arg.sort() else {
+                    return Err(malformed("bitvector extract"));
+                };
+                if hi < lo || *hi >= input_width {
+                    return Err(malformed("bitvector extract"));
+                }
+                Some(
+                    hi.checked_sub(*lo)
+                        .and_then(|width| width.checked_add(1))
+                        .ok_or_else(|| malformed("bitvector extract"))?,
+                )
+            }
+            ChcOp::Int2Bv(width) => Some(*width),
+            _ => None,
+        };
+        Ok(result_width)
+    }
+
+    fn validate_bitvector_widths_in_expr(expr: &ChcExpr) -> ChcResult<()> {
+        // Explicit-stack DFS; a shared inner node already popped is skipped
+        // (WP-F F0b): its whole subtree was checked then, and skipping repeat
+        // pops keeps the order of first visits — so the first error found is
+        // the one the tree walk finds.
+        let mut seen: FxHashSet<*const ChcExpr> = FxHashSet::default();
         let mut stack = vec![expr];
         while let Some(expr) = stack.pop() {
+            if !crate::expr::dag::children(expr).is_empty() && !seen.insert(expr as *const ChcExpr)
+            {
+                continue;
+            }
             match expr {
                 ChcExpr::BitVec(_, width) => Self::validate_bitvector_width(*width)?,
                 ChcExpr::Var(var) => Self::validate_bitvector_widths_in_sort(&var.sort)?,
@@ -1051,60 +961,17 @@ impl ChcProblem {
                 ChcExpr::PredicateApp(_, _, args) => {
                     stack.extend(args.iter().map(AsRef::as_ref));
                 }
+                ChcExpr::ArrayLambda(lambda) => {
+                    Self::validate_bitvector_widths_in_sort(&lambda.binder().sort)?;
+                    stack.push(lambda.body());
+                    stack.extend(lambda.captures().iter().map(AsRef::as_ref));
+                }
                 ChcExpr::ConstArray(index_sort, value) => {
                     Self::validate_bitvector_widths_in_sort(index_sort)?;
                     stack.push(value);
                 }
                 ChcExpr::Op(op, args) => {
-                    let result_width = match op {
-                        ChcOp::BvConcat => {
-                            let [left, right] = args.as_slice() else {
-                                return Err(malformed("concat"));
-                            };
-                            let (ChcSort::BitVec(left), ChcSort::BitVec(right)) =
-                                (left.sort(), right.sort())
-                            else {
-                                return Err(malformed("concat"));
-                            };
-                            Some(left.checked_add(right).unwrap_or(u32::MAX))
-                        }
-                        ChcOp::BvZeroExtend(extension) | ChcOp::BvSignExtend(extension) => {
-                            let [arg] = args.as_slice() else {
-                                return Err(malformed("bitvector extension"));
-                            };
-                            let ChcSort::BitVec(width) = arg.sort() else {
-                                return Err(malformed("bitvector extension"));
-                            };
-                            Some(width.checked_add(*extension).unwrap_or(u32::MAX))
-                        }
-                        ChcOp::BvRepeat(repetitions) => {
-                            let [arg] = args.as_slice() else {
-                                return Err(malformed("bitvector repeat"));
-                            };
-                            let ChcSort::BitVec(width) = arg.sort() else {
-                                return Err(malformed("bitvector repeat"));
-                            };
-                            Some(width.checked_mul(*repetitions).unwrap_or(u32::MAX))
-                        }
-                        ChcOp::BvExtract(hi, lo) => {
-                            let [arg] = args.as_slice() else {
-                                return Err(malformed("bitvector extract"));
-                            };
-                            let ChcSort::BitVec(input_width) = arg.sort() else {
-                                return Err(malformed("bitvector extract"));
-                            };
-                            if hi < lo || *hi >= input_width {
-                                return Err(malformed("bitvector extract"));
-                            }
-                            Some(
-                                hi.checked_sub(*lo)
-                                    .and_then(|width| width.checked_add(1))
-                                    .ok_or_else(|| malformed("bitvector extract"))?,
-                            )
-                        }
-                        ChcOp::Int2Bv(width) => Some(*width),
-                        _ => None,
-                    };
+                    let result_width = Self::computed_bitvector_width(op, args)?;
                     if let Some(width) = result_width {
                         Self::validate_bitvector_width(width)?;
                     }
@@ -1122,13 +989,24 @@ impl ChcProblem {
         Ok(())
     }
 
-    fn expr_contains_predicate_app(expr: &ChcExpr) -> bool {
+    pub(crate) fn expr_contains_predicate_app(expr: &ChcExpr) -> bool {
+        // An OR over nodes: each distinct shared node once (WP-F F0b).
+        let mut seen: FxHashSet<*const ChcExpr> = FxHashSet::default();
         let mut stack = vec![expr];
         while let Some(current) = stack.pop() {
+            if !crate::expr::dag::children(current).is_empty()
+                && !seen.insert(current as *const ChcExpr)
+            {
+                continue;
+            }
             match current {
                 ChcExpr::PredicateApp(..) => return true,
                 ChcExpr::Op(_, args) | ChcExpr::FuncApp(_, _, args) => {
                     stack.extend(args.iter().map(AsRef::as_ref));
+                }
+                ChcExpr::ArrayLambda(lambda) => {
+                    stack.push(lambda.body());
+                    stack.extend(lambda.captures().iter().map(AsRef::as_ref));
                 }
                 ChcExpr::ConstArray(_, value) => stack.push(value.as_ref()),
                 ChcExpr::Bool(_)
@@ -1470,5 +1348,33 @@ impl ChcProblem {
         } else {
             None // Cycle detected
         }
+    }
+}
+
+impl ChcProblem {
+    /// Whether an active clause carries closed functional-array code. Sort-changing
+    /// transforms need an explicit bound-domain translation before accepting it.
+    pub(crate) fn has_array_lambda(&self) -> bool {
+        let contains = |expression: &ChcExpr| {
+            !crate::expr::dag::walk_distinct_preorder(expression, |node| {
+                if matches!(node, ChcExpr::ArrayLambda(_)) {
+                    crate::expr::dag::Step::Stop
+                } else {
+                    crate::expr::dag::Step::Descend
+                }
+            })
+        };
+        self.clauses().iter().any(|clause| {
+            clause.body.constraint.as_ref().is_some_and(contains)
+                || clause
+                    .body
+                    .predicates
+                    .iter()
+                    .any(|(_, args)| args.iter().any(contains))
+                || match &clause.head {
+                    ClauseHead::Predicate(_, args) => args.iter().any(contains),
+                    ClauseHead::False => false,
+                }
+        })
     }
 }

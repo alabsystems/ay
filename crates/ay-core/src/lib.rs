@@ -46,11 +46,16 @@ pub mod kani_compat;
 pub(crate) mod math;
 pub mod memory_pressure;
 pub mod nonlinear;
+pub mod original_query;
 pub mod panic_utils;
+pub mod pinned_carcara;
 pub(crate) mod proof;
 pub mod proof_validation;
+pub mod resource;
 pub mod serde_bignum;
 pub(crate) mod smtlib;
+pub use smtlib::admitted as render_admission;
+pub(crate) mod smtlib_char;
 pub(crate) mod sort;
 pub mod term;
 pub(crate) mod theory;
@@ -59,16 +64,16 @@ pub(crate) mod tseitin;
 pub mod verification;
 
 pub use debug_channel::{
-    chc_debug_env_flags, claim_trace_file, debug_channel_active, declared_proof_checker,
-    misc_cli_flags, misc_test_override, release_trace_file, sat_ab_switches, sat_ab_test_override,
-    sat_debug_env_flags, sat_disable_flags, set_global_chc_debug_env_flags,
-    set_global_debug_config, set_global_declared_proof_checker, set_global_misc_cli_flags,
-    set_global_misc_cli_flags_with, set_global_sat_ab_switches, set_global_sat_debug_env_flags,
-    set_global_sat_disable_flags, set_global_theory_disable_flags, set_global_trace_config,
-    set_global_trace_path_cache, theory_disable_flags, trace_config, trace_file_available,
-    trace_path_cache, ChcDebugEnvFlags, DebugChannel, DebugConfig, DeclaredProofChecker,
-    MiscCliFlags, ProofFormat, SatAbSwitches, SatDebugEnvFlags, SatDisableFlags,
-    TheoryDisableFlags, TraceConfig, TracePathCache,
+    captured_misc_cli_flags, chc_debug_env_flags, claim_trace_file, debug_channel_active,
+    declared_proof_checker, misc_cli_flags, misc_test_override, release_trace_file,
+    sat_ab_switches, sat_ab_test_override, sat_debug_env_flags, sat_disable_flags,
+    set_global_chc_debug_env_flags, set_global_debug_config, set_global_declared_proof_checker,
+    set_global_misc_cli_flags, set_global_misc_cli_flags_with, set_global_sat_ab_switches,
+    set_global_sat_debug_env_flags, set_global_sat_disable_flags, set_global_theory_disable_flags,
+    set_global_trace_config, set_global_trace_path_cache, theory_disable_flags, trace_config,
+    trace_file_available, trace_path_cache, ChcDebugEnvFlags, DebugChannel, DebugConfig,
+    DeclaredProofChecker, MiscCliFlags, ProofFormat, SatAbSwitches, SatDebugEnvFlags,
+    SatDisableFlags, TheoryDisableFlags, TraceConfig, TracePathCache,
 };
 pub use math::extended_gcd_bigint;
 pub use memory_pressure::{
@@ -76,26 +81,40 @@ pub use memory_pressure::{
     UnknownReason,
 };
 pub use proof::{
-    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
-    BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, Proof, ProofId,
-    ProofStep, TheoryLemmaKind, TheoryLemmaProof, CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
+    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, is_clean_dialect_alethe_rule,
+    wire_rule_name, AletheRule, BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp,
+    LiaAnnotation, NraSosCertificate, NraSosOrigin, NraSosRational, NraSosShapeError, NraSosTerm,
+    Proof, ProofId, ProofStep, TheoryLemmaKind, TheoryLemmaProof, CHECKABLE_ALETHE_RULES,
+    CLEAN_DIALECT_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 pub use smtlib::{
     escape_string_contents, quote_symbol, string_literal, unescape_string_contents,
-    StringDecodeError, SMTLIB_MAX_CODE_POINT,
+    SMTLIB_MAX_CODE_POINT,
 };
-pub use sort::{ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
-pub use term::{Constant, RationalWrapper, SkolemChoice, Symbol, TermData, TermId, TermStore};
+pub use smtlib_char::{
+    first_surrogate_carrier, is_surrogate_carrier, smtlib_char, smtlib_char_cmp, smtlib_code_point,
+    smtlib_next_char, smtlib_str_cmp, SMTLIB_SURROGATE_FIRST, SMTLIB_SURROGATE_LAST,
+};
+pub use sort::{
+    ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, FiniteFieldSort, Sort,
+    MAX_FINITE_FIELD_MODULUS,
+};
+pub use term::{
+    BvOffsetEquality, BvOffsetShares, Constant, RationalWrapper, SkolemChoice, Symbol, TermData,
+    TermId, TermSnapshotError, TermStore,
+};
 pub use theory::{
-    assert_conflict_soundness, BoundRefinementRequest, DiscoveredDisequality, DiscoveredEquality,
-    DisequalitySplitRequest, EqualityPropagationResult, ExpressionSplitRequest,
-    ModelEqualityRequest, NativeTheoryPropagationBackend, NativeTheoryPropagationProfile,
-    SplitRequest, StringLemma, StringLemmaKind, TheoryConflict, TheoryLemma, TheoryLit,
-    TheoryPropagation, TheoryResult, TheorySolver,
+    assert_conflict_soundness, AtomHandle, BoundRefinementRequest, DiscoveredDisequality,
+    DiscoveredEquality, DisequalitySplitRequest, Effort, EqualityPropagationResult,
+    ExpressionSplitRequest, ModelEqualityRequest, NativeTheoryPropagationBackend,
+    NativeTheoryPropagationProfile, RuleId, SplitRequest, StrengthenId, StringLemma,
+    StringLemmaKind, TheoryConflict, TheoryLemma, TheoryLemmaReplay, TheoryLit, TheoryPropagation,
+    TheoryResult, TheorySolver,
 };
 pub use tseitin::{
-    ClausificationProof, CnfClause, CnfLit, Tseitin, TseitinEncodedAssertion, TseitinResult,
-    TseitinState,
+    ClausificationProof, CnfClause, CnfLit, CountedCnf, CountedCnfDistinctBridge, CountedCnfError,
+    CountedCnfJustification, CountedCnfRow, CountedCnfSourceLit, CountedCnfStep, Tseitin,
+    TseitinEncodedAssertion, TseitinResult, TseitinState, COUNTED_CNF_WORK_VERSION,
 };
 pub use verification::{
     VerificationBoundary, VerificationEvidenceKind, VerificationFailure, VerificationVerdict,
@@ -255,8 +274,23 @@ pub fn is_theory_atom(terms: &TermStore, term: TermId) -> bool {
 ///
 /// Given a list of `(term, value, reasons)` triples where each variable has
 /// tight bounds (lower == upper, non-strict), groups variables by value and
-/// propagates equalities between all pairs in each group. Used by both LRA
-/// and LIA Nelson-Oppen equality propagation.
+/// propagates equalities between them. Used by both LRA and LIA
+/// Nelson-Oppen equality propagation.
+///
+/// Emission is a per-sort ANCHOR STAR, not all pairs: within a value
+/// group, the first term of each sort is the anchor and every later
+/// same-sort term is equated to it. Equality is transitive, so the
+/// receiving EUF merges exactly the same classes, and any pair's
+/// explanation composes through the anchor (each emitted edge carries
+/// both endpoints' pinning reasons). The anchor pattern mirrors
+/// `discover_model_value_equalities` in ay-lra, whose consumers have
+/// always seen chains, and the disequality discovery beside this call
+/// already anchors on the first group member. All-pairs emission was
+/// quadratic in group size — profiled hot on QF_LIRA smtopt
+/// (`propagate_tight_bound_equalities`, sort equality and pair-set
+/// inserts atop the sample), where thousands of tight-bound vars can
+/// share a value and every Nelson-Oppen round re-scanned Θ(n²) pairs
+/// against the retained `propagated_pairs` set.
 ///
 /// Deduplicates against `propagated_pairs` to avoid re-propagating equalities
 /// that were already sent in prior calls (e.g., after push/pop).
@@ -300,37 +334,38 @@ pub fn propagate_tight_bound_equalities(
             continue;
         }
 
-        // Propagate pairwise equalities between all variables with same value
-        let mut rest = vars.as_slice();
-        while let Some(((lhs, lhs_reasons), tail)) = rest.split_first() {
-            for (rhs, rhs_reasons) in tail {
-                // Cross-sort pairs are ill-sorted — see doc comment (SOUNDNESS).
-                if terms.sort(*lhs) != terms.sort(*rhs) {
-                    continue;
-                }
-
-                // Canonicalize the pair to avoid duplicate propagations
-                let pair = if lhs.0 < rhs.0 {
-                    (*lhs, *rhs)
-                } else {
-                    (*rhs, *lhs)
-                };
-
-                if !propagated_pairs.contains(&pair) {
-                    propagated_pairs.insert(pair);
-
-                    // Combine reasons from both variables
-                    let mut combined_reasons = lhs_reasons.clone();
-                    for r in rhs_reasons {
-                        if !combined_reasons.contains(r) {
-                            combined_reasons.push(*r);
-                        }
-                    }
-
-                    equalities.push(DiscoveredEquality::new(*lhs, *rhs, combined_reasons));
+        // Anchor star per sort (see doc comment): the first term of each
+        // sort anchors the group; later same-sort terms equate to it.
+        // Cross-sort pairs are ill-sorted — see doc comment (SOUNDNESS) —
+        // so a sort's members never need edges to another sort's anchor.
+        let mut anchors: Vec<(&Sort, TermId, &Vec<TheoryLit>)> = Vec::new();
+        for (term, reasons) in vars {
+            let sort = terms.sort(*term);
+            let Some(&(_, anchor, anchor_reasons)) = anchors.iter().find(|(s, _, _)| *s == sort)
+            else {
+                anchors.push((sort, *term, reasons));
+                continue;
+            };
+            if anchor == *term {
+                continue;
+            }
+            // Canonicalize the pair to avoid duplicate propagations
+            let pair = if anchor.0 < term.0 {
+                (anchor, *term)
+            } else {
+                (*term, anchor)
+            };
+            if !propagated_pairs.insert(pair) {
+                continue;
+            }
+            // Combine reasons from both variables
+            let mut combined_reasons = anchor_reasons.clone();
+            for r in reasons {
+                if !combined_reasons.contains(r) {
+                    combined_reasons.push(*r);
                 }
             }
-            rest = tail;
+            equalities.push(DiscoveredEquality::new(anchor, *term, combined_reasons));
         }
     }
 

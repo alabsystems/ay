@@ -4,6 +4,21 @@
 
 use super::*;
 
+#[test]
+fn expired_parallel_grant_cannot_publish_a_trivial_safe_result() {
+    let solver = PortfolioSolver::new(
+        ChcProblem::new(),
+        PortfolioConfig::test_default().parallel_timeout(Some(Duration::ZERO)),
+    );
+    assert!(matches!(solver.solve(), PortfolioResult::Unknown));
+    let (result, report) = solver.solve_with_budget_report();
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::NotStarted));
+}
+
 fn pdr_only_preprocessing_config() -> PortfolioConfig {
     PortfolioConfig {
         external_cancellation: None,

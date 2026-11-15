@@ -84,19 +84,24 @@ impl Executor {
         ) {
             return None;
         }
-        // The spend refused. Separate the two ways it can: a root nothing can
-        // render at any budget, versus roots that are all individually
-        // renderable and simply do not fit in what is left of the envelope.
-        // The remedies are opposite — the first needs a per-root bound that
-        // reflects real rendering work, the second needs a bigger or
+        // The spend refused. Separate the two ways it can: a root the build
+        // pass cannot traverse at any budget, versus roots that are all
+        // individually traversable and simply do not fit in what is left of
+        // the envelope. The remedies are opposite — the first needs a per-root
+        // bound that reflects real work, the second needs a bigger or
         // better-spent envelope — and only this distinction tells a census
         // which one a given instance wants.
-        if self
-            .ctx
-            .assertions_parsed()
-            .iter()
-            .any(|root| !crate::executor::proof_repair::proof_trust_surgery_surface_audit::surface_source_is_bounded(root))
-        {
+        //
+        // The per-root test is the build pass's OWN model, a traversal. It
+        // used to be the per-subtree rendering bound, which refused the whole
+        // proof for a root only a per-subtree renderer cannot afford; each of
+        // those renderers refuses such a root at its own site.
+        if self.ctx.assertions_parsed().iter().any(|root| {
+            use crate::executor::proof_repair::proof_trust_surgery_surface_audit::{
+                surface_source_work_probe_as, SurfaceWorkModel,
+            };
+            surface_source_work_probe_as(root, SurfaceWorkModel::Traversal).is_err()
+        }) {
             Some(ProofDeclineMechanism::AuthoredSourceRootUnbounded)
         } else {
             Some(ProofDeclineMechanism::AuthoredSourceAggregateBudget)
@@ -119,6 +124,17 @@ impl Executor {
         self.last_proof_quality = None;
         self.proof_check_result = None;
         self.last_proof = Some(proof);
+        // #unbounded-population. Census the parsed stack at the moment the
+        // per-root bound refuses it. Write-only; the poison above is
+        // byte-identical with or without it.
+        if matches!(
+            mechanism,
+            ProofDeclineMechanism::AuthoredSourceRootUnbounded
+        ) {
+            self.last_unbounded_census = Some(crate::executor::UnboundedCensus::SourceRoot(
+                self.source_root_census(),
+            ));
+        }
         self.record_proof_decline(mechanism);
     }
 
@@ -129,12 +145,18 @@ impl Executor {
 
     /// Reconstruct arithmetic certificates and immediately demote any step
     /// that still lacks the annotation required by its declared kind.
+    ///
+    /// The pass polls the search's controls, and every poll (one per
+    /// reconstruction attempt) is also an assembly observation, so a caller's
+    /// allowance ends it at an attempt the query fixes
+    /// (`assembly_observations.rs`).
     pub(super) fn reconstruct_missing_farkas_and_demote(
         &mut self,
         proof: &mut Proof,
         hidden_equality_assertions: &[TermId],
     ) {
-        let should_stop = self.make_should_stop();
+        let search_stop = self.make_should_stop();
+        let should_stop = || super::assembly_observations::observe() || search_stop();
         crate::executor::proof_repair::proof_farkas::reconstruct_missing_farkas_coefficients(
             &mut self.ctx.terms,
             proof,

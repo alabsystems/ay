@@ -38,11 +38,34 @@
 //! De Morgans into an `and` literal this matcher does not model), foreign
 //! scrutinees — fails closed to non-recognition.
 
-use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
+#[cfg(test)]
+use ay_core::{Sort, Symbol, TermData};
+use ay_core::{TermId, TermStore};
+
+mod progress;
+pub(crate) use progress::assumed_is_authored_bool_ite_consequence_with_progress;
+
+/// Compatibility wrapper for exact structural recognition without a caller
+/// envelope. Malformed handles or allocation refusal are not recognition.
+#[must_use]
+pub fn assumed_is_authored_bool_ite_consequence(
+    terms: &TermStore,
+    assumed: TermId,
+    authored_bool_ites: &[(TermId, TermId, TermId)],
+) -> bool {
+    assumed_is_authored_bool_ite_consequence_with_progress(
+        terms,
+        assumed,
+        authored_bool_ites,
+        &mut |_, _| true,
+    )
+    .unwrap_or(false)
+}
 
 /// Bounded or-flattening of a term into its disjunct set. `mk_or` interns
 /// flat, sorted, deduplicated disjunctions, so one level is the common case;
 /// the recursion is still bounded to be robust against hand-built terms.
+#[cfg(test)]
 fn flatten_or_into(terms: &TermStore, term: TermId, out: &mut Vec<TermId>, depth: usize) {
     if depth < 8 {
         if let TermData::App(Symbol::Named(name), args) = terms.get(term) {
@@ -59,6 +82,7 @@ fn flatten_or_into(terms: &TermStore, term: TermId, out: &mut Vec<TermId>, depth
 
 /// The conjunct view of an ITE condition: the `and`-args for a conjunctive
 /// condition, the condition itself otherwise.
+#[cfg(test)]
 fn condition_conjuncts(terms: &TermStore, cond: TermId) -> Vec<TermId> {
     if let TermData::App(Symbol::Named(name), args) = terms.get(cond) {
         if name == "and" && !args.is_empty() {
@@ -70,6 +94,7 @@ fn condition_conjuncts(terms: &TermStore, cond: TermId) -> Vec<TermId> {
 
 /// Whether `literals` is EXACTLY `{not g | g in conjuncts}` ∪ `flatten(branch)`
 /// as a set. Every literal must be consumed and every expected member present.
+#[cfg(test)]
 fn matches_branch_form(
     terms: &TermStore,
     literals: &[TermId],
@@ -139,8 +164,8 @@ fn matches_branch_form(
 
 /// Whether `assumed` is the then-implication, else-implication, or combined
 /// `and` of both, for one of `authored_bool_ites` (each `(cond, then, else)`).
-#[must_use]
-pub fn assumed_is_authored_bool_ite_consequence(
+#[cfg(test)]
+fn legacy_assumed_is_authored_bool_ite_consequence(
     terms: &TermStore,
     assumed: TermId,
     authored_bool_ites: &[(TermId, TermId, TermId)],
@@ -175,6 +200,7 @@ pub fn assumed_is_authored_bool_ite_consequence(
 
 /// `Some(true)` when `assumed` matches the then-implication of one supplied
 /// ITE, `Some(false)` for the else-implication, `None` for neither.
+#[cfg(test)]
 fn assumed_is_single_branch(
     terms: &TermStore,
     assumed: TermId,

@@ -175,8 +175,25 @@ fn run_trial(seed: u64) {
             depth -= 1;
         }
         solver.implied_tighten_streak.fill(0);
-        let _ = solver.check();
+        let result = solver.check();
         let _ = solver.propagate();
+        if matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ) {
+            // The base scope itself is infeasible. Implied-bound analysis on
+            // an infeasible tableau has no fixpoint (every pass tightens the
+            // contradictory bounds further), so how far each derivation got
+            // says nothing about row coverage, and the entailment oracle is
+            // vacuous. Nothing to compare for this history.
+            //
+            // #lra-scope-trail: this outcome became reachable once atoms
+            // asserted at scope 0 (or any outer scope) before a push are
+            // applied in THEIR scope and survive the pops that used to drop
+            // them; before, the same history silently lost those bounds and
+            // its base scope came out feasible.
+            return;
+        }
     }
     // Converge the incremental state over its pending touched rows only
     // (never a full sweep).

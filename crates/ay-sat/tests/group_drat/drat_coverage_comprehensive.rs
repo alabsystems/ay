@@ -509,7 +509,7 @@ fn drat_comprehensive_satcomp_crn_11_99_u() {
 ///
 /// `benchmarks/sat/satcomp2024-sample/*.cnf[.xz]` is a PROVISIONED corpus, not
 /// a committed one (`benchmarks/.gitignore` excludes `*.cnf`/`*.cnf.xz` there;
-/// `scripts/fetch_satcomp_sample.sh` downloads it from the GBD mirror). So the
+/// `ay corpus download satcomp2024-sample` downloads it from the GBD mirror). So the
 /// instance is optional exactly like `crn_11_99_u` above — the DRAT assertion
 /// is unchanged and still runs whenever the corpus has been fetched.
 #[test]

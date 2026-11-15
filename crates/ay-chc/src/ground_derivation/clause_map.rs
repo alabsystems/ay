@@ -114,6 +114,7 @@ impl ClauseMapGroundTranslator {
             // Prefer a candidate whose body-predicate arity matches the step's
             // premise count; among those, the first whose environment completes.
             let mut chosen = None;
+            let mut fallback = None;
             for &candidate in candidates {
                 let Some(clause) = clauses.get(candidate) else {
                     continue;
@@ -141,14 +142,30 @@ impl ClauseMapGroundTranslator {
                 if !complete_env_for_clause(clause, &mut env) {
                     continue;
                 }
-                chosen = Some(GroundDerivationStep {
+                // A completed environment is total, not necessarily true:
+                // completion fills a variable the candidate's equalities do
+                // not determine with a default. Of several candidates (a
+                // merged multi-edge), take one whose constraint the
+                // environment satisfies; the first that only completes is
+                // kept as the fallback, which the validation below rejects.
+                let holds = clause.body.constraint.as_ref().is_none_or(|constraint| {
+                    matches!(
+                        super::eval_ground_pub(constraint, &env),
+                        Some(SmtValue::Bool(true))
+                    )
+                });
+                let completed = GroundDerivationStep {
                     clause_index: candidate,
                     env,
                     premises: step.premises.clone(),
-                });
-                break;
+                };
+                if holds {
+                    chosen = Some(completed);
+                    break;
+                }
+                fallback.get_or_insert(completed);
             }
-            let Some(chosen) = chosen else {
+            let Some(chosen) = chosen.or(fallback) else {
                 log_ground_translation_detail(format_args!(
                     "{}: no input clause among {:?} completes for output clause {} (step {index})",
                     self.name, candidates, step.clause_index

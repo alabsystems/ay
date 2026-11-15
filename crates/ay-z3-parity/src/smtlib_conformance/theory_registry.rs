@@ -291,7 +291,7 @@ pub(super) fn validate_and_replay(
     let declarations = reference_inventory::load_bound_registry_theories(
         input,
         context.manifest_dir,
-        &canonical_profile(),
+        &canonical_profile()?,
     )?;
     let prepared = prepare_campaign(&declarations)?;
     validate_recorded_shape(receipt, &prepared)?;
@@ -567,7 +567,7 @@ fn prepare_campaign(
 fn parse_theory_fields(
     declaration: &RegistryTheoryDeclaration,
 ) -> Result<Vec<ParsedField>, String> {
-    let parsed = ay_frontend::sexp::parse_sexp(&declaration.content)
+    let parsed = parse_registry_theory(declaration)
         .map_err(|error| format!("parsing authenticated {}: {error}", declaration.path))?;
     let items = parsed
         .as_list()
@@ -611,6 +611,36 @@ fn parse_theory_fields(
         });
     }
     Ok(fields)
+}
+
+/// The pinned registry uses formal metavariables that are not legal unquoted
+/// SMT-LIB symbols. Quote only that known declaration while parsing metadata;
+/// preserve its names and retain the original authenticated source bytes.
+/// Solver input continues to use the ordinary parser without this adapter.
+fn parse_registry_theory(declaration: &RegistryTheoryDeclaration) -> Result<SExpr, String> {
+    let original_error = match ay_frontend::sexp::parse_sexp(&declaration.content) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error.to_string(),
+    };
+    // Theories/UnicodeStrings.smt2 at registry revision
+    // 47f7ee09ea05de990277781bbb2091245ea4a3f1. This fallback deliberately
+    // does not generalize to other files, revisions or malformed inputs.
+    if declaration.name != "Strings"
+        || declaration.path != "Theories/UnicodeStrings.smt2"
+        || declaration.git_blob != "c05844378a78694d35d1fe01a0ee9d2869270d86"
+        || declaration.content_sha256
+            != "0a7a6fc5e223d38be343549a9672865c18aa4451c6cf877b875a2932507a75cc"
+        || sha256_bytes(declaration.content.as_bytes()) != declaration.content_sha256
+    {
+        return Err(original_error);
+    }
+    const FORMAL: &str = "((_ re.loop n₁ n₂) RegLan RegLan)";
+    const QUOTED: &str = "((_ re.loop |n₁| |n₂|) RegLan RegLan)";
+    if declaration.content.matches(FORMAL).count() != 1 {
+        return Err(original_error);
+    }
+    let metadata = declaration.content.replacen(FORMAL, QUOTED, 1);
+    ay_frontend::sexp::parse_sexp(&metadata).map_err(|error| error.to_string())
 }
 
 fn expected_field_shape(theory: &str) -> Result<Vec<(&'static str, usize)>, String> {
@@ -845,6 +875,16 @@ fn signature_symbol(signature: &SExpr) -> Result<String, String> {
     };
     match head {
         SExpr::Symbol(symbol) => Ok(symbol.clone()),
+        // The shared SMT-LIB parser represents these two reserved constants
+        // as literals, including when they name nullary Core declarations.
+        // Accept only their actual signature, not a Boolean term in a head
+        // position or a malformed arity/result sort.
+        SExpr::True | SExpr::False => {
+            if items.len() != 2 || !items[1].is_symbol("Bool") {
+                return Err("malformed Boolean constant signature".to_string());
+            }
+            Ok(head.to_raw_string())
+        }
         SExpr::List(indexed) => indexed
             .get(1)
             .and_then(SExpr::as_symbol)
@@ -1505,7 +1545,7 @@ fn description_signatures(
     field: &ParsedField,
     field_sha256: &str,
 ) -> Result<Vec<SourceSignature>, String> {
-    let Some(SExpr::String(text)) = field.value.as_ref() else {
+    let Some(value @ SExpr::String(text)) = field.value.as_ref() else {
         return Err(format!(
             "{} {}[{}] is not a description string",
             declaration.name, field.key, field.occurrence
@@ -1514,9 +1554,19 @@ fn description_signatures(
     let (expected_sha256, families) =
         description_catalog(&declaration.name, field.key.as_str(), field.occurrence)?;
     let actual_sha256 = sha256_bytes(text.as_bytes());
-    if actual_sha256 != expected_sha256 || actual_sha256 != field_sha256 {
+    if actual_sha256 != expected_sha256 {
         return Err(format!(
             "{} {}[{}] prose signature field drift: expected {expected_sha256}, got {actual_sha256}",
+            declaration.name, field.key, field.occurrence
+        ));
+    }
+    // The catalog authenticates decoded prose. The source-field identity
+    // authenticates its canonical S-expression, including string delimiters
+    // and escaping; these are deliberately different byte representations.
+    let actual_field_sha256 = sha256_bytes(value.to_raw_string().as_bytes());
+    if actual_field_sha256 != field_sha256 {
+        return Err(format!(
+            "{} {}[{}] source-field digest mismatch: expected {field_sha256}, got {actual_field_sha256}",
             declaration.name, field.key, field.occurrence
         ));
     }
@@ -2208,6 +2258,258 @@ fn validate_recorded_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exact pinned bytes, including Unicode and upstream trailing whitespace.
+    include!("../../tests/data/smtlib-unicode-strings-47f7ee09.rs");
+
+    fn pinned_unicode_strings() -> RegistryTheoryDeclaration {
+        RegistryTheoryDeclaration {
+            name: "Strings".to_string(),
+            path: "Theories/UnicodeStrings.smt2".to_string(),
+            git_blob: "c05844378a78694d35d1fe01a0ee9d2869270d86".to_string(),
+            content_sha256: "0a7a6fc5e223d38be343549a9672865c18aa4451c6cf877b875a2932507a75cc"
+                .to_string(),
+            content: PINNED_UNICODE_STRINGS_SOURCE.to_string(),
+        }
+    }
+
+    #[test]
+    fn pinned_registry_metavariables_preserve_names_and_semantic_witnesses() {
+        let declaration = pinned_unicode_strings();
+        assert_eq!(
+            sha256_bytes(declaration.content.as_bytes()),
+            declaration.content_sha256
+        );
+        assert!(ay_frontend::sexp::parse_sexp(&declaration.content).is_err());
+        let fields = parse_theory_fields(&declaration).unwrap();
+        validate_field_shape("Strings", &fields).unwrap();
+        let mut catalog_rows = Vec::new();
+        let mut signatures = Vec::new();
+        let mut embedded_fields = 0;
+        for field in &fields {
+            let raw = field
+                .value
+                .as_ref()
+                .map_or_else(|| "<valueless>".to_string(), SExpr::to_raw_string);
+            let digest = sha256_bytes(raw.as_bytes());
+            match field.key.as_str() {
+                ":funs" | ":fun" | ":sorts" | ":sort" => {
+                    let (mut machine, embedded) =
+                        machine_signatures(&declaration, field, &digest, &mut catalog_rows)
+                            .unwrap();
+                    signatures.append(&mut machine);
+                    embedded_fields += embedded;
+                }
+                ":funs-description" | ":sorts-description" => {
+                    signatures
+                        .extend(description_signatures(&declaration, field, &digest).unwrap());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(embedded_fields, 1);
+        let loop_signature = signatures
+            .iter()
+            .find(|signature| signature.declaration.starts_with("((_ re.loop "))
+            .unwrap();
+        assert_eq!(
+            loop_signature.declaration,
+            "((_ re.loop |n₁| |n₂|) RegLan RegLan)"
+        );
+        assert!(loop_signature.witness.positive.contains("(_ re.loop 2 3)"));
+        assert!(loop_signature
+            .witness
+            .negative
+            .contains("(_ re.loop bad 3)"));
+        assert_eq!(
+            loop_signature.witness.semantic,
+            "(assert (not (str.in_re \"aaa\" ((_ re.loop 2 3) (str.to_re \"a\")))))\n"
+        );
+        assert_eq!(
+            sha256_bytes(declaration.content.as_bytes()),
+            declaration.content_sha256,
+            "registry adaptation must not change authenticated source bytes"
+        );
+    }
+
+    #[test]
+    fn registry_metavariable_adapter_refuses_other_inputs_and_identity_drift() {
+        let original = pinned_unicode_strings();
+        let mut wrong_path = original.clone();
+        wrong_path.path = "Theories/Other.smt2".to_string();
+        let mut wrong_blob = original.clone();
+        wrong_blob.git_blob = "0".repeat(40);
+        let mut changed = original.clone();
+        changed.content = changed.content.replace("n₂", "n₃");
+        changed.content_sha256 = sha256_bytes(changed.content.as_bytes());
+        let mut changed_semantics = original.clone();
+        changed_semantics.content = changed_semantics.content.replace(
+            "((_ re.loop n₁ n₂) RegLan RegLan)",
+            "((_ re.loop n₁ n₂) Int Int)",
+        );
+        changed_semantics.content_sha256 = sha256_bytes(changed_semantics.content.as_bytes());
+        for declaration in [wrong_path, wrong_blob, changed, changed_semantics] {
+            assert!(parse_registry_theory(&declaration).is_err());
+        }
+        assert!(ay_frontend::sexp::parse_sexp("((_ re.loop n₁ n₂) RegLan RegLan)").is_err());
+    }
+
+    fn pinned_bitvector_sort_description() -> (RegistryTheoryDeclaration, ParsedField) {
+        // Exact :sorts-description string in Theories/FixedSizeBitVectors.smt2
+        // at registry revision 47f7ee09ea05de990277781bbb2091245ea4a3f1.
+        let source = "\"\n    All sort symbols of the form (_ BitVec m)\n    where m is a numeral greater than 0.\n \"";
+        (
+            RegistryTheoryDeclaration {
+                name: "FixedSizeBitVectors".to_string(),
+                path: "Theories/FixedSizeBitVectors.smt2".to_string(),
+                git_blob: String::new(),
+                content_sha256: String::new(),
+                content: String::new(),
+            },
+            ParsedField {
+                key: ":sorts-description".to_string(),
+                occurrence: 0,
+                value: Some(ay_frontend::sexp::parse_sexp(source).unwrap()),
+            },
+        )
+    }
+
+    #[test]
+    fn pinned_prose_content_and_source_field_have_distinct_authenticated_digests() {
+        let (declaration, field) = pinned_bitvector_sort_description();
+        let expected_prose_sha = description_catalog("FixedSizeBitVectors", &field.key, 0)
+            .unwrap()
+            .0;
+        let Some(value @ SExpr::String(text)) = field.value.as_ref() else {
+            panic!("pinned description must be a string")
+        };
+        assert_eq!(sha256_bytes(text.as_bytes()), expected_prose_sha);
+        let field_sha = sha256_bytes(value.to_raw_string().as_bytes());
+        assert_ne!(field_sha, expected_prose_sha);
+        let signatures = description_signatures(&declaration, &field, &field_sha).unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].source_field_sha256, field_sha);
+        assert_eq!(signatures[0].declaration, "prose-family:sort.BitVec");
+    }
+
+    #[test]
+    fn prose_signature_requires_both_pinned_content_and_exact_field_binding() {
+        let (declaration, mut field) = pinned_bitvector_sort_description();
+        let expected_prose_sha = description_catalog("FixedSizeBitVectors", &field.key, 0)
+            .unwrap()
+            .0;
+        let wrong_binding =
+            description_signatures(&declaration, &field, expected_prose_sha).unwrap_err();
+        assert!(wrong_binding.contains("source-field digest mismatch"));
+        let Some(SExpr::String(text)) = field.value.as_mut() else {
+            panic!("pinned description must be a string")
+        };
+        *text = text.replace("greater than 0", "greater than 1");
+        let changed_field_sha =
+            sha256_bytes(field.value.as_ref().unwrap().to_raw_string().as_bytes());
+        let changed_content =
+            description_signatures(&declaration, &field, &changed_field_sha).unwrap_err();
+        assert!(changed_content.contains("prose signature field drift"));
+    }
+
+    // Escaped lines preserve upstream trailing whitespace byte-for-byte.
+    include!("../../tests/data/smtlib-core-47f7ee09.rs");
+
+    #[test]
+    fn pinned_core_source_retains_boolean_nullary_signatures() {
+        // Exact Theories/Core.smt2 at the active registry revision
+        // 47f7ee09ea05de990277781bbb2091245ea4a3f1 (Git blob below).
+        let content = PINNED_CORE_SOURCE;
+        let content_sha256 = sha256_bytes(content.as_bytes());
+        assert_eq!(
+            content_sha256,
+            "2f587d919f385355b0300ee2b9e634a5bcae9292a91ecd6698bae6c380cd9243"
+        );
+        let declaration = RegistryTheoryDeclaration {
+            name: "Core".to_string(),
+            path: "Theories/Core.smt2".to_string(),
+            git_blob: "17d62449270f105fdcd5d7865d04b847987b0218".to_string(),
+            content_sha256,
+            content: content.to_string(),
+        };
+        let fields = parse_theory_fields(&declaration).unwrap();
+        validate_field_shape("Core", &fields).unwrap();
+        let mut catalog_rows = Vec::new();
+        let mut signatures = Vec::new();
+        for field in fields
+            .iter()
+            .filter(|field| matches!(field.key.as_str(), ":sorts" | ":funs"))
+        {
+            let raw = field.value.as_ref().unwrap().to_raw_string();
+            let (mut extracted, embedded) = machine_signatures(
+                &declaration,
+                field,
+                &sha256_bytes(raw.as_bytes()),
+                &mut catalog_rows,
+            )
+            .unwrap();
+            assert_eq!(embedded, 0);
+            signatures.append(&mut extracted);
+        }
+        assert_eq!(signatures.len(), 11); // Bool sort and all ten functions.
+        for (symbol, semantic) in [
+            ("true", "(assert (not true))\n"),
+            ("false", "(assert false)\n"),
+        ] {
+            let signature = signatures
+                .iter()
+                .find(|signature| signature.declaration == format!("({symbol} Bool)"))
+                .unwrap();
+            assert!(signature.id.ends_with(&format!(".{symbol}")));
+            assert_eq!(signature.witness.semantic, semantic);
+            assert!(signature.witness.negative.contains(&format!("({symbol} ")));
+        }
+    }
+
+    #[test]
+    fn named_nullary_rounding_mode_signatures_remain_owned() {
+        // The ten constant declarations in Theories/FloatingPoint.smt2 at
+        // registry revision 47f7ee09ea05de990277781bbb2091245ea4a3f1.
+        for symbol in [
+            "roundNearestTiesToEven",
+            "RNE",
+            "roundNearestTiesToAway",
+            "RNA",
+            "roundTowardPositive",
+            "RTP",
+            "roundTowardNegative",
+            "RTN",
+            "roundTowardZero",
+            "RTZ",
+        ] {
+            let raw = format!("({symbol} RoundingMode)");
+            let parsed = ay_frontend::sexp::parse_sexp(&raw).unwrap();
+            assert_eq!(signature_symbol(&parsed).unwrap(), symbol);
+            machine_witness("FloatingPoint", symbol, &raw).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_boolean_and_non_identifier_signature_heads_are_rejected() {
+        for raw in [
+            "()",
+            "(true)",
+            "(false)",
+            "(true Bool Bool)",
+            "(false Bool Bool)",
+            "(true Int)",
+            "(false (Bool))",
+            "(par (A) (true Bool))",
+            "(\"true\" Bool)",
+            "(0 Bool)",
+            "(#b1 Bool)",
+            "(:true Bool)",
+            "((_) Bool)",
+        ] {
+            let parsed = ay_frontend::sexp::parse_sexp(raw).unwrap();
+            assert!(signature_symbol(&parsed).is_err(), "accepted {raw}");
+        }
+    }
 
     #[test]
     fn field_and_description_catalog_counts_are_closed() {

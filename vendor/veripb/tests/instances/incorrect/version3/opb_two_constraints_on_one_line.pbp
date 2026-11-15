@@ -1,0 +1,35 @@
+pseudo-Boolean proof version 3.0
+% refused-at: parse
+% Regression test (wrong verdict): the formula reader silently discarded
+% everything after the first `;` on a line.
+%
+% the development design notes makes the XPB format line-oriented: every production ends
+% with optional *spaces* -- which do not include a newline -- and then
+% end-of-line. The reader lexed one line, parsed one item and moved on, so the
+% second constraint on this file's single line was dropped and the proof was
+% checked against a strict subset of the formula. No error, no warning at any
+% verbosity. `f 1;` cannot catch it either, because the count it compares
+% against is the truncated one.
+%
+% `check_constraint_end`'s doc comment claimed it checked "that no further data
+% is specified after the semicolon" and its body checked only the `;`. That is
+% the whole defect: a documented check that was never implemented.
+%
+% The formula is unsatisfiable over its one variable -- `x1 = 0` falsifies
+% `1 x1 >= 1` and `x1 = 1` falsifies `1 ~x1 >= 1` -- and this used to print
+% `s VERIFIED SATISFIABLE` at exit 0 under default flags. The same two
+% constraints on two lines were correctly refused, which is what made it
+% invisible: every corpus formula writes one item per line.
+%
+% It also defeated the independent formula cross-check. `veripb-second-reader`
+% exists to catch "the formula stored is not the formula on disk", the class
+% defects 16 and 17 lived in, and it was written to the same shape and
+% inherited the same lenience -- so `--kernel-verify` reported "1 formula
+% constraint(s) cross-checked against the file on disk; nothing outside the
+% proved fragment" on exactly this input. Both readers are fixed, each on its
+% own terms.
+f 1;
+sol x1;
+output NONE;
+conclusion SAT : x1;
+end pseudo-Boolean proof;

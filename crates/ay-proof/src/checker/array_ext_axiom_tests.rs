@@ -440,6 +440,7 @@ fn folded_registry_matching_has_one_aggregate_work_budget() {
         ProofId(7),
         &unrelated_clause,
         &registry,
+        &mut |_, _| true,
     )
     .expect_err("one shared unit cannot scan two registry bindings");
     assert!(
@@ -457,6 +458,7 @@ fn folded_registry_matching_has_one_aggregate_work_budget() {
         ProofId(8),
         &unrelated_clause,
         &one_binding_registry,
+        &mut |_, _| true,
     )
     .expect("the first lemma fits the shared proof budget"));
     array_axiom::validate_folded_registry_match_with_budget(
@@ -464,6 +466,7 @@ fn folded_registry_matching_has_one_aggregate_work_budget() {
         ProofId(9),
         &unrelated_clause,
         &one_binding_registry,
+        &mut |_, _| true,
     )
     .expect_err("a second lemma must not receive a fresh per-step budget");
 }
@@ -1511,5 +1514,104 @@ fn an_introduction_produces_no_clause_and_derives_no_empty_clause() {
     assert!(
         matches!(err, ProofCheckError::FinalClauseNotEmpty { .. }),
         "expected a terminal-clause rejection, got {err:?}"
+    );
+}
+
+// ============================================================================
+// The O(1) clause-shape pre-check of the folded-read recognizer.
+// ============================================================================
+
+/// `folded_extensionality_literal_pair` is exactly the procedure it replaced —
+/// `flatten_clause_literals` (the arguments of a unit `or`, else the clause
+/// itself) followed by the non-empty, length-2 and all-Bool checks — on every
+/// shape that procedure distinguishes, without cloning a wide `or` first.
+/// The reference below IS the old procedure, re-spelled.
+#[test]
+fn folded_literal_pair_matches_the_flatten_then_check_procedure() {
+    use ay_core::TermData;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("pair_x", Sort::Bool);
+    let y = terms.mk_var("pair_y", Sort::Bool);
+    let z = terms.mk_var("pair_z", Sort::Bool);
+    let i = terms.mk_var("pair_i", Sort::Int);
+    // Raw applications: `TermStore` permits them, and the strict boundary must
+    // re-establish every shape itself.
+    let or1 = terms.mk_app(Symbol::named("or"), vec![x], Sort::Bool);
+    let or2 = terms.mk_app(Symbol::named("or"), vec![x, y], Sort::Bool);
+    let or3 = terms.mk_app(Symbol::named("or"), vec![x, y, z], Sort::Bool);
+    let or_int = terms.mk_app(Symbol::named("or"), vec![x, i], Sort::Bool);
+    let and2 = terms.mk_app(Symbol::named("and"), vec![x, y], Sort::Bool);
+
+    let reference = |terms: &TermStore, clause: &[TermId]| -> Option<[TermId; 2]> {
+        if clause.is_empty()
+            || clause
+                .iter()
+                .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+        {
+            return None;
+        }
+        let literals: Vec<TermId> = if clause.len() == 1 {
+            match terms.get(clause[0]) {
+                TermData::App(Symbol::Named(sym), args) if sym == "or" => args.clone(),
+                _ => clause.to_vec(),
+            }
+        } else {
+            clause.to_vec()
+        };
+        if literals.len() != 2
+            || literals
+                .iter()
+                .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
+        {
+            return None;
+        }
+        Some([literals[0], literals[1]])
+    };
+
+    let shapes: Vec<Vec<TermId>> = vec![
+        vec![],
+        vec![x],
+        vec![i],
+        vec![or1],
+        vec![or2],
+        vec![or3],
+        vec![or_int],
+        vec![and2],
+        vec![x, y],
+        vec![y, x],
+        vec![x, i],
+        vec![i, x],
+        vec![x, y, z],
+        vec![or2, y],
+        vec![or2, or2],
+    ];
+    for clause in &shapes {
+        assert_eq!(
+            array_axiom::folded_extensionality_literal_pair(&terms, clause),
+            reference(&terms, clause),
+            "{clause:?}"
+        );
+    }
+    // And the answers themselves, so the reference cannot be vacuous.
+    assert_eq!(
+        array_axiom::folded_extensionality_literal_pair(&terms, &[or2]),
+        Some([x, y])
+    );
+    assert_eq!(
+        array_axiom::folded_extensionality_literal_pair(&terms, &[y, x]),
+        Some([y, x])
+    );
+    assert_eq!(
+        array_axiom::folded_extensionality_literal_pair(&terms, &[or3]),
+        None
+    );
+    assert_eq!(
+        array_axiom::folded_extensionality_literal_pair(&terms, &[or_int]),
+        None
+    );
+    assert_eq!(
+        array_axiom::folded_extensionality_literal_pair(&terms, &[or2, or2]),
+        Some([or2, or2])
     );
 }

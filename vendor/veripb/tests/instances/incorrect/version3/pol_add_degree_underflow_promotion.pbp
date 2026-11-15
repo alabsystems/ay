@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% Regression test: `GeneralPBConstraint::add` promotes an i64 accumulator to i128 when the
+% sums no longer fit into i64, and that branch subtracted the cancellation in i128 after
+% checking only the unadjusted sums. The degree sum is i128::MIN + 1 and merging `2 x3`
+% with `2 ~x3` cancels 2, so the true degree is i128::MIN - 1. The formula is satisfiable
+% (x2, x3 true).
+f 2 ;
+pol 1 2 + ;
+output NONE;
+conclusion UNSAT : 3 ;
+end pseudo-Boolean proof;

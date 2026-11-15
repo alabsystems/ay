@@ -87,7 +87,8 @@ pub struct SinzCardinalityEncoding {
 impl SinzCardinalityEncoding {
     /// `true` iff `var` is one of this encoding's auxiliary register variables.
     fn is_aux(&self, var: u32) -> bool {
-        var >= self.aux_base && var < self.aux_base + self.aux_count
+        var.checked_sub(self.aux_base)
+            .is_some_and(|offset| offset < self.aux_count)
     }
 }
 
@@ -102,8 +103,15 @@ impl SinzCardinalityEncoding {
 ///
 /// The constraint is satisfied iff the final register `r(n-1, k-1)` is true; the
 /// last emitted clause is the unit `[r(n-1, k-1)]` asserting it.
+///
+/// Returns `None` when a literal has no DIMACS negation (`i32::MIN` is not a
+/// DIMACS literal: its complement is not representable).
 #[must_use]
-pub fn encode_sinz_cardinality(lits: &[i32], k: usize, aux_base: u32) -> SinzCardinalityEncoding {
+pub fn encode_sinz_cardinality(
+    lits: &[i32],
+    k: usize,
+    aux_base: u32,
+) -> Option<SinzCardinalityEncoding> {
     let n = lits.len();
     assert!(n > 0, "cardinality encoding needs at least one literal");
     assert!(k >= 1, "cardinality threshold must be positive");
@@ -118,7 +126,7 @@ pub fn encode_sinz_cardinality(lits: &[i32], k: usize, aux_base: u32) -> SinzCar
 
     // Base case i = 0 (cardinality: coefficient c0 = 1, so only level j = 0 is
     // reachable from the first literal).
-    clauses.push(vec![-lits[0], r(0, 0)]); // lit0 -> r(0,0)
+    clauses.push(vec![lits[0].checked_neg()?, r(0, 0)]); // lit0 -> r(0,0)
     clauses.push(vec![-r(0, 0), lits[0]]); // r(0,0) -> lit0
     for j in 1..k {
         clauses.push(vec![-r(0, j)]); // levels >= 2 impossible from one literal
@@ -132,10 +140,10 @@ pub fn encode_sinz_cardinality(lits: &[i32], k: usize, aux_base: u32) -> SinzCar
 
             if j == 0 {
                 // (c) level 1 reached by this literal alone: lit_i -> r(i, 0)
-                clauses.push(vec![-lits[i], r(i, 0)]);
+                clauses.push(vec![lits[i].checked_neg()?, r(i, 0)]);
             } else {
                 // (b) lit_i AND r(i-1, j-1) -> r(i, j)
-                clauses.push(vec![-lits[i], -r(i - 1, j - 1), r(i, j)]);
+                clauses.push(vec![lits[i].checked_neg()?, -r(i - 1, j - 1), r(i, j)]);
             }
 
             // backward: r(i, j) -> r(i-1, j) OR lit_i
@@ -151,11 +159,11 @@ pub fn encode_sinz_cardinality(lits: &[i32], k: usize, aux_base: u32) -> SinzCar
     // Constraint holds iff the top register is set.
     clauses.push(vec![r(n - 1, k - 1)]);
 
-    SinzCardinalityEncoding {
+    Some(SinzCardinalityEncoding {
         clauses,
         aux_base,
         aux_count,
-    }
+    })
 }
 
 /// Encode the **weighted** PB constraint `sum(coeffs[i] * lits[i]) >= rhs` with
@@ -281,7 +289,7 @@ fn clause_constraint_body(clause: &[i32]) -> String {
         if lit > 0 {
             body.push_str(&format!("+1 x{lit} "));
         } else {
-            body.push_str(&format!("+1 ~x{} ", -lit));
+            body.push_str(&format!("+1 ~x{} ", lit.unsigned_abs()));
         }
     }
     body.push_str(">= 1");
@@ -346,7 +354,8 @@ pub fn emit_sinz_aux_introductions<W: Write>(
         let constraint = clause_constraint_body(clause);
         let witness = aux_intro_witness(aux_var, clause);
         writer.log_step(ProofStep::Red(constraint, witness))?;
-        emitted += 1;
+        // One step per encoding clause: bounded by `encoding.clauses.len()`.
+        emitted = emitted.saturating_add(1);
     }
     Ok(emitted)
 }
@@ -387,7 +396,8 @@ pub(super) fn emit_sinz_introductions_asserted<W: Write>(
             let witness = aux_intro_witness(aux_var, clause);
             writer.log_step(ProofStep::Red(constraint, witness))?;
         }
-        emitted += 1;
+        // One step per encoding clause: bounded by `encoding.clauses.len()`.
+        emitted = emitted.saturating_add(1);
     }
     Ok(emitted)
 }
@@ -462,6 +472,37 @@ pub(super) fn emit_sinz_introductions_pol_derived<W: Write>(
     )
 }
 
+/// Step 1 of [`emit_sinz_introductions_pol_derived_weighted`]: introduce every
+/// definition clause of `encoding` (all but the final `r_top` unit, which the
+/// telescope DERIVES) via `red`, in `encoding.clauses` order exactly as
+/// [`emit_sinz_aux_introductions`] does, and return each one's ConstraintId so
+/// the telescope can reference it.
+fn introduce_sinz_definitions<W: Write>(
+    writer: &mut VeriPbWriter<W>,
+    encoding: &SinzCardinalityEncoding,
+) -> Result<std::collections::HashMap<Vec<i32>, super::ConstraintId>> {
+    let last = encoding.clauses.len().wrapping_sub(1);
+    let mut def_ids = std::collections::HashMap::new();
+    for (idx, clause) in encoding.clauses.iter().enumerate() {
+        if idx == last && clause.len() == 1 && clause[0] > 0 {
+            // The final r_top unit is *derived* by the telescope, not introduced.
+            continue;
+        }
+        let defined = clause
+            .iter()
+            .map(|&lit| lit.unsigned_abs())
+            .filter(|&var| encoding.is_aux(var))
+            .max();
+        let Some(aux_var) = defined else { continue };
+        let id = writer.log_step(ProofStep::Red(
+            clause_constraint_body(clause),
+            aux_intro_witness(aux_var, clause),
+        ))?;
+        def_ids.insert(clause.clone(), id);
+    }
+    Ok(def_ids)
+}
+
 /// WEIGHTED generalization of `emit_sinz_introductions_pol_derived`: derive the
 /// top register `r(n-1, rhs-1) >= 1` of the **weighted** Sinz encoding
 /// ([`encode_sinz_weighted`]) for `sum(coeffs[i] * lits[i]) >= rhs` by the same
@@ -511,32 +552,20 @@ pub(super) fn emit_sinz_introductions_pol_derived_weighted<W: Write>(
     let r = |i: usize, j: usize| -> i32 { (aux_base + (i * k + j) as u32) as i32 };
     // Coefficient of term i, clamped at k=rhs (matching the encoder's clamp). The
     // number of "bottom" columns term i drives directly via its (c) clauses.
-    let ci_clamped = |i: usize| -> usize { (coeffs[i].min(k as i128)).max(0) as usize };
+    // A term without a coefficient means `coeffs` and `lits` are misaligned:
+    // fail closed (no certificate) instead of telescoping a guessed weight.
+    let ci_clamped = |i: usize| -> Result<usize> {
+        let coeff = coeffs.get(i).ok_or_else(|| {
+            super::veripb::ProofError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "weighted Sinz certificate has fewer coefficients than literals",
+            ))
+        })?;
+        Ok((*coeff).min(k as i128).max(0) as usize)
+    };
 
-    // 1) Introduce every definition clause (all clauses except the final r_top
-    //    unit) via `red`, recording each one's allocated ConstraintId so the
-    //    telescope can reference them. Clauses are emitted in `encoding.clauses`
-    //    order, exactly as `emit_sinz_aux_introductions` does.
-    let last = encoding.clauses.len().wrapping_sub(1);
-    let mut def_ids: std::collections::HashMap<Vec<i32>, ConstraintId> =
-        std::collections::HashMap::new();
-    for (idx, clause) in encoding.clauses.iter().enumerate() {
-        if idx == last && clause.len() == 1 && clause[0] > 0 {
-            // The final r_top unit is *derived* below, not introduced.
-            continue;
-        }
-        let defined = clause
-            .iter()
-            .map(|&lit| lit.unsigned_abs())
-            .filter(|&var| encoding.is_aux(var))
-            .max();
-        let Some(aux_var) = defined else { continue };
-        let id = writer.log_step(ProofStep::Red(
-            clause_constraint_body(clause),
-            aux_intro_witness(aux_var, clause),
-        ))?;
-        def_ids.insert(clause.clone(), id);
-    }
+    // 1) Introduce every definition clause via `red`, keyed by clause.
+    let def_ids = introduce_sinz_definitions(writer, encoding)?;
 
     let id_of = |clause: Vec<i32>| -> ConstraintId {
         *def_ids
@@ -547,7 +576,7 @@ pub(super) fn emit_sinz_introductions_pol_derived_weighted<W: Write>(
     // 2) Telescope the saturated column sum C_i := sum_{j} r(i,j).
     // C_0 := sum_{j < min(c_0, k)} (r(0,j) >= lit_0)  ==  [-lit_0, r(0,j)].
     // (For cardinality c_0 = 1 this is the single clause [-lit_0, r(0,0)].)
-    let c0 = ci_clamped(0).min(k).max(1); // at least column 0 (c_i >= 1)
+    let c0 = ci_clamped(0)?.min(k).max(1); // at least column 0 (c_i >= 1)
     let mut col = id_of(vec![-lits[0], r(0, 0)]);
     for j in 1..c0 {
         let cj = id_of(vec![-lits[0], r(0, j)]);
@@ -558,7 +587,7 @@ pub(super) fn emit_sinz_introductions_pol_derived_weighted<W: Write>(
         col = writer.log_step(ProofStep::Saturate(col))?;
     }
     for i in 1..n {
-        let ci = ci_clamped(i).min(k).max(1);
+        let ci = ci_clamped(i)?.min(k).max(1);
         // inc_i := sum_{j < ci} (c)[r(i,j) >= lit_i]  +  sum_{j >= ci} (a)carry.
         // Bottom `ci` columns are driven by lit_i; the rest carry r(i-1,j).
         let mut acc = id_of(vec![-lits[i], r(i, 0)]);
@@ -685,7 +714,7 @@ pub(super) fn encode_instance_proof_producing(
     instance: &PbInstance,
 ) -> Option<ProofProducingEncoding> {
     let num_pb = instance.num_vars;
-    let mut next_aux = num_pb + 1;
+    let mut next_aux = num_pb.checked_add(1)?;
     let mut clauses: Vec<Vec<i32>> = Vec::new();
     let mut encodings: Vec<SinzConstraintCert> = Vec::new();
 
@@ -700,17 +729,16 @@ pub(super) fn encode_instance_proof_producing(
         // Linear terms only: each term must be a single literal. A non-linear
         // (product) term would need its own AND-aux introduction; decline so the
         // caller falls back to the aux-free path. (DEC-LIN is linear anyway.)
-        let mut terms: Vec<(i128, i32)> = Vec::with_capacity(constraint.terms.len());
+        let mut terms: Vec<(i128, i32)> = Vec::new();
+        terms.try_reserve(constraint.terms.len()).ok()?;
         for term in &constraint.terms {
             if term.lits.len() != 1 {
                 return None;
             }
             let lit = term.lits[0];
-            let dimacs = if lit.negated {
-                -(lit.var as i32)
-            } else {
-                lit.var as i32
-            };
+            // A variable beyond i32::MAX has no DIMACS spelling: decline.
+            let var = i32::try_from(lit.var).ok()?;
+            let dimacs = if lit.negated { var.checked_neg()? } else { var };
             terms.push((term.coeff, dimacs));
         }
 
@@ -723,16 +751,20 @@ pub(super) fn encode_instance_proof_producing(
         // so the per-direction Sinz cert records the correct `input_row_id`.
         let mut directions: Vec<(Vec<i128>, Vec<i32>, i128, super::ConstraintId)> = Vec::new();
         let ge_id = super::ConstraintId::new(next_input_row_id)?;
-        let (gc, gl, gr) = normalize_ge_positive(&terms, constraint.rhs);
+        let (gc, gl, gr) = normalize_ge_positive(&terms, constraint.rhs)?;
         directions.push((gc, gl, gr, ge_id));
         if constraint.rel == PbRel::Eq {
-            let le_id = super::ConstraintId::new(next_input_row_id + 1)?;
-            let negated: Vec<(i128, i32)> = terms.iter().map(|&(c, l)| (-c, l)).collect();
-            let (nc, nl, nr) = normalize_ge_positive(&negated, -constraint.rhs);
+            let le_id = super::ConstraintId::new(next_input_row_id.checked_add(1)?)?;
+            let negated: Vec<(i128, i32)> = terms
+                .iter()
+                .map(|&(c, l)| Some((c.checked_neg()?, l)))
+                .collect::<Option<_>>()?;
+            let (nc, nl, nr) = normalize_ge_positive(&negated, constraint.rhs.checked_neg()?)?;
             directions.push((nc, nl, nr, le_id));
         }
         // Advance the running id by this constraint's VeriPB contribution.
-        next_input_row_id += if constraint.rel == PbRel::Eq { 2 } else { 1 };
+        next_input_row_id =
+            next_input_row_id.checked_add(if constraint.rel == PbRel::Eq { 2 } else { 1 })?;
 
         for (coeffs, lits, rhs, input_row_id) in directions {
             if rhs <= 0 {
@@ -768,7 +800,7 @@ pub(super) fn encode_instance_proof_producing(
                 return None; // proof would be impractically large; decline
             }
             let enc = encode_sinz_weighted(&coeffs, &lits, rhs, next_aux);
-            next_aux += enc.aux_count;
+            next_aux = next_aux.checked_add(enc.aux_count)?;
             clauses.extend(enc.clauses.iter().cloned());
             // Record the metadata the pol-derivation needs to CERTIFY r_top: the
             // normalized coeffs/lits/rhs and the VeriPB id of this normalized
@@ -786,7 +818,7 @@ pub(super) fn encode_instance_proof_producing(
     Some(ProofProducingEncoding {
         clauses,
         encodings,
-        max_var: next_aux - 1,
+        max_var: next_aux.checked_sub(1)?,
     })
 }
 
@@ -794,9 +826,15 @@ pub(super) fn encode_instance_proof_producing(
 /// flipping negative-coefficient literals: `c*l = |c|*(~l) - |c|`, so a negative
 /// `c` becomes `|c|` on `~l` with `rhs += |c|`. Mirrors the solver encoder's
 /// `normalize_ge_direction`. Drops zero-coefficient terms.
-fn normalize_ge_positive(terms: &[(i128, i32)], rhs: i128) -> (Vec<i128>, Vec<i32>, i128) {
-    let mut coeffs = Vec::with_capacity(terms.len());
-    let mut lits = Vec::with_capacity(terms.len());
+///
+/// Returns `None` (the caller declines) when a flip is not representable: an
+/// `i128::MIN` coefficient, an `i32::MIN` literal, or an adjusted `rhs` beyond
+/// `i128`.
+fn normalize_ge_positive(terms: &[(i128, i32)], rhs: i128) -> Option<(Vec<i128>, Vec<i32>, i128)> {
+    let mut coeffs = Vec::new();
+    coeffs.try_reserve(terms.len()).ok()?;
+    let mut lits = Vec::new();
+    lits.try_reserve(terms.len()).ok()?;
     let mut adjusted = rhs;
     for &(coeff, lit) in terms {
         if coeff == 0 {
@@ -806,22 +844,26 @@ fn normalize_ge_positive(terms: &[(i128, i32)], rhs: i128) -> (Vec<i128>, Vec<i3
             coeffs.push(coeff);
             lits.push(lit);
         } else {
-            coeffs.push(-coeff);
-            lits.push(-lit);
-            adjusted -= coeff; // rhs += |coeff|
+            coeffs.push(coeff.checked_neg()?);
+            lits.push(lit.checked_neg()?);
+            adjusted = adjusted.checked_sub(coeff)?; // rhs += |coeff|
         }
     }
-    (coeffs, lits, adjusted)
+    Some((coeffs, lits, adjusted))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Test outcome. `Result` in this module is the VeriPB alias, so spell the
+    /// std one out.
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
     #[test]
-    fn encode_matches_known_3_of_3_layout() {
+    fn encode_matches_known_3_of_3_layout() -> TestResult {
         // n = 3, k = 3, aux_base = 4: aux vars are x4..x12 (9 registers).
-        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, 4);
+        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, 4).ok_or("encode 3-of-3")?;
         assert_eq!(enc.aux_base, 4);
         assert_eq!(enc.aux_count, 9);
         // Final clause asserts the top register r(2,2) = x12.
@@ -832,6 +874,7 @@ mod tests {
         // Unreachable levels for the first literal: ~r(0,1), ~r(0,2).
         assert!(enc.clauses.contains(&vec![-5]));
         assert!(enc.clauses.contains(&vec![-6]));
+        Ok(())
     }
 
     #[test]
@@ -852,8 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn intro_emits_one_red_per_clause() {
-        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, 4);
+    fn intro_emits_one_red_per_clause() -> TestResult {
+        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, 4).ok_or("encode 3-of-3")?;
         let mut writer = VeriPbWriter::new(Vec::new(), 2).expect("header");
         let emitted = emit_sinz_aux_introductions(&mut writer, &enc).expect("intro");
         assert_eq!(emitted, enc.clauses.len());
@@ -862,6 +905,7 @@ mod tests {
         assert!(text.contains("red +1 ~x1 +1 x4 >= 1: x4 -> 1 ;"));
         // The top-register unit clause is introduced force-true.
         assert!(text.contains("red +1 x12 >= 1: x12 -> 1 ;"));
+        Ok(())
     }
 
     /// Reference re-implementation of [`crate::encoding`]'s
@@ -931,7 +975,7 @@ mod tests {
         // cardinality clause set.
         let weighted = encode_sinz_weighted(&[1, 1, 1], &[1, 2, 3], 3, 4);
         let cardinality = encode_sinz_cardinality(&[1, 2, 3], 3, 4);
-        assert_eq!(weighted, cardinality);
+        assert_eq!(Some(weighted), cardinality);
     }
 
     #[test]
@@ -962,33 +1006,13 @@ mod tests {
     /// deriving the empty constraint), and require the OFFICIAL VeriPB checker to
     /// print "VERIFIED UNSATISFIABLE". Skips cleanly if the checker is absent.
     #[test]
-    fn sinz_reified_intro_is_veripb_verified() {
-        use std::path::PathBuf;
+    fn sinz_reified_intro_is_veripb_verified() -> TestResult {
         use std::process::Command;
 
-        // Locate the official VeriPB checker; skip if unavailable.
-        let veripb = {
-            let mut found: Option<PathBuf> = None;
-            if let Some(p) = std::env::var_os("VERIPB_BIN").map(PathBuf::from) {
-                if p.is_file() {
-                    found = Some(p);
-                }
-            }
-            if found.is_none() {
-                // Fall back to `veripb` resolved from PATH.
-                found = std::env::var_os("PATH").and_then(|paths| {
-                    std::env::split_paths(&paths)
-                        .map(|dir| dir.join("veripb"))
-                        .find(|p| p.is_file())
-                });
-            }
-            match found {
-                Some(p) => p,
-                None => {
-                    eprintln!("VeriPB checker not present; skipping reified-intro verification");
-                    return;
-                }
-            }
+        // Locate the official VeriPB checker through the VETTED resolver; skip
+        // if absent. See `locate_veripb` for why this must not be hand-rolled.
+        let Some(veripb) = locate_veripb() else {
+            return Ok(());
         };
 
         // Tiny UNSAT instance over 3 vars:
@@ -1001,7 +1025,8 @@ mod tests {
 
         // Build the proof: introduce the Sinz aux of C1 (>= 3), then RUP empty.
         // f = 2 input constraints (C1, C2).
-        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, /* aux_base after x1..x3 */ 4);
+        let enc = encode_sinz_cardinality(&[1, 2, 3], 3, /* aux_base after x1..x3 */ 4)
+            .ok_or("encode 3-of-3")?;
         let mut writer = VeriPbWriter::new(Vec::<u8>::new(), 2).expect("header");
         let emitted = emit_sinz_aux_introductions(&mut writer, &enc).expect("aux intros");
         assert_eq!(emitted, enc.clauses.len());
@@ -1039,22 +1064,31 @@ mod tests {
             "VeriPB did not verify the Sinz reified-intro proof\n\
              stdout: {stdout}\nstderr: {stderr}\nproof:\n{proof}"
         );
+        Ok(())
     }
 
-    /// Locate the official VeriPB checker (env `VERIPB_BIN`, else `veripb`
-    /// from PATH), returning `None` to signal a clean test skip when absent.
+    /// Locate the official VeriPB checker, returning `None` for a clean skip
+    /// when it is ABSENT — and only then.
+    ///
+    /// This delegates to [`ay_test_support::veripb::optional_checker`] rather
+    /// than reading `VERIPB_BIN`/`$PATH` itself, and the difference is the whole
+    /// point. These four tests assert `stdout.contains("VERIFIED
+    /// UNSATISFIABLE")`, which any rubber stamp satisfies for free, so a
+    /// resolver that hands back whatever is on `$PATH` makes them evidence about
+    /// nothing. Measured on this machine: an unpatched upstream VeriPB 3.0.2
+    /// accepts all 22 committed wrong-verdict fixtures in `ci/veripb-soundness/`
+    /// — including answering `s VERIFIED UNSATISFIABLE` for a SATISFIABLE
+    /// formula — while reporting the pinned version string, so the version alone
+    /// does not discriminate. The shared resolver runs the self-test and the
+    /// soundness battery and PANICS on a checker that is present but broken,
+    /// unsound, or named by a typo'd override; it degrades to `None` only when
+    /// no checker exists at all.
+    ///
+    /// `ay-pb-core` already depends on `ay-test-support` as a dev-dependency and
+    /// `veripb_runner.rs` already consumes this module from `#[cfg(test)]` code
+    /// in this same crate, so nothing here is a new coupling.
     fn locate_veripb() -> Option<std::path::PathBuf> {
-        use std::path::PathBuf;
-        if let Some(p) = std::env::var_os("VERIPB_BIN").map(PathBuf::from) {
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join("veripb"))
-                .find(|p| p.is_file())
-        })
+        ay_test_support::veripb::optional_checker("reified_encoding")
     }
 
     /// Run the official VeriPB checker over `opb`/`proof` and assert it prints
@@ -1095,20 +1129,21 @@ mod tests {
         rhs: i128,
         aux_base: u32,
         f_count: u64,
-    ) -> String {
+    ) -> TestResult<String> {
         let enc = encode_sinz_weighted(coeffs, lits, rhs, aux_base);
-        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f_count).expect("header");
-        let emitted = emit_sinz_aux_introductions(&mut writer, &enc).expect("aux intros");
+        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f_count)?;
+        let emitted = emit_sinz_aux_introductions(&mut writer, &enc)?;
         assert_eq!(emitted, enc.clauses.len());
         // The aux definitions pin the weighted constraint; together with the
         // contradicting input rows the empty constraint follows by RUP.
-        writer
-            .log_step(ProofStep::Rup(String::from(">= 1 ;")))
-            .expect("rup empty");
-        let final_id =
-            super::super::ConstraintId::new(f_count + emitted as u64 + 1).expect("non-zero id");
-        writer.conclude_unsat(final_id).expect("conclude");
-        String::from_utf8(writer.into_inner()).expect("utf8 proof")
+        writer.log_step(ProofStep::Rup(String::from(">= 1 ;")))?;
+        let final_raw = u64::try_from(emitted)?
+            .checked_add(f_count)
+            .and_then(|ids| ids.checked_add(1))
+            .ok_or("final constraint id overflows u64")?;
+        let final_id = super::super::ConstraintId::new(final_raw).ok_or("non-zero id")?;
+        writer.conclude_unsat(final_id)?;
+        Ok(String::from_utf8(writer.into_inner())?)
     }
 
     /// END-TO-END acceptance for the WEIGHTED case: for several tiny UNSAT
@@ -1118,10 +1153,10 @@ mod tests {
     /// absent. Covers (a) a coefficient > rhs and (b) a coefficient > 1 that
     /// drives the `r(i-1, j-ci)` predecessor clauses.
     #[test]
-    fn sinz_weighted_reified_intro_is_veripb_verified() {
+    fn sinz_weighted_reified_intro_is_veripb_verified() -> TestResult {
         let Some(veripb) = locate_veripb() else {
             eprintln!("VeriPB checker not present; skipping weighted reified-intro verification");
-            return;
+            return Ok(());
         };
 
         // Shape A: +2 x1 +1 x2 +1 x3 >= 3 (coeff 2 = c0 < rhs). Contradict with
@@ -1130,7 +1165,7 @@ mod tests {
         let opb_a = "* #variable= 3 #constraint= 2\n\
                      +2 x1 +1 x2 +1 x3 >= 3 ;\n\
                      +1 ~x1 >= 1 ;\n";
-        let proof_a = build_weighted_unsat_proof(&[2, 1, 1], &[1, 2, 3], 3, 4, 2);
+        let proof_a = build_weighted_unsat_proof(&[2, 1, 1], &[1, 2, 3], 3, 4, 2)?;
         assert_veripb_verifies(&veripb, "sinz_w_a", opb_a, &proof_a);
 
         // Shape B: +3 x1 +1 x2 >= 2 with a COEFFICIENT GREATER THAN RHS (c0 is
@@ -1139,7 +1174,7 @@ mod tests {
         let opb_b = "* #variable= 2 #constraint= 2\n\
                      +3 x1 +1 x2 >= 2 ;\n\
                      +1 ~x1 >= 1 ;\n";
-        let proof_b = build_weighted_unsat_proof(&[3, 1], &[1, 2], 2, 3, 2);
+        let proof_b = build_weighted_unsat_proof(&[3, 1], &[1, 2], 2, 3, 2)?;
         assert_veripb_verifies(&veripb, "sinz_w_b", opb_b, &proof_b);
 
         // Shape C: +1 x1 +3 x2 +1 x3 >= 4 — ci = 3 > 1 in the inductive step
@@ -1150,8 +1185,9 @@ mod tests {
                      +1 x1 +3 x2 +1 x3 >= 4 ;\n\
                      +1 ~x1 >= 1 ;\n\
                      +1 ~x2 >= 1 ;\n";
-        let proof_c = build_weighted_unsat_proof(&[1, 3, 1], &[1, 2, 3], 4, 4, 3);
+        let proof_c = build_weighted_unsat_proof(&[1, 3, 1], &[1, 2, 3], 4, 4, 3)?;
         assert_veripb_verifies(&veripb, "sinz_w_c", opb_c, &proof_c);
+        Ok(())
     }
 
     /// Build a VeriPB proof that DERIVES the Sinz top register `r(n-1,k-1) >= 1`
@@ -1163,15 +1199,23 @@ mod tests {
     /// the first `k-1` free literals is `k-1 < k` — UNSAT. Those units are *not*
     /// referenced by the `pol` chain (the derivation is purely from the input row
     /// + the `red`-introduced Sinz definitions); they only drive the final RUP.
-    fn build_pol_derived_rtop_proof(n: usize, k: usize) -> (String, String) {
+    fn build_pol_derived_rtop_proof(n: usize, k: usize) -> TestResult<(String, String)> {
         let lits: Vec<i32> = (1..=n as i32).collect();
-        let aux_base = (n as u32) + 1;
-        let enc = encode_sinz_cardinality(&lits, k, aux_base);
+        let aux_base = u32::try_from(n)?
+            .checked_add(1)
+            .ok_or("aux base overflows u32")?;
+        let enc = encode_sinz_cardinality(&lits, k, aux_base).ok_or("encode cardinality")?;
 
         // OPB: input cardinality row (id 1) + units ~x_k .. ~x_n (ids 2..).
-        let num_vars = n + n * k;
+        let num_vars = n
+            .checked_mul(k)
+            .and_then(|aux| aux.checked_add(n))
+            .ok_or("variable count overflows usize")?;
         let units: Vec<i32> = (k as i32..=n as i32).collect();
-        let f = 1 + units.len();
+        let f = units
+            .len()
+            .checked_add(1)
+            .ok_or("row count overflows usize")?;
         let mut opb = format!("* #variable= {num_vars} #constraint= {f}\n");
         opb.push_str("+1 ");
         opb.push_str(
@@ -1185,19 +1229,16 @@ mod tests {
             opb.push_str(&format!("+1 ~x{u} >= 1 ;\n"));
         }
 
-        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f as u64).expect("header");
-        let input_row_id = super::super::ConstraintId::new(1).expect("input row id");
+        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), u64::try_from(f)?)?;
+        let input_row_id = super::super::ConstraintId::new(1).ok_or("input row id")?;
         // Derive r_top via cutting planes.
-        let _rtop = emit_sinz_introductions_pol_derived(&mut writer, &enc, &lits, k, input_row_id)
-            .expect("pol-derived r_top");
+        let _rtop = emit_sinz_introductions_pol_derived(&mut writer, &enc, &lits, k, input_row_id)?;
         // With r_top forced 1 plus the units (count < k), the empty constraint
         // follows by RUP (the backward definition clauses unit-propagate down).
-        let empty_id = writer
-            .log_step(ProofStep::Rup(String::from(">= 1 ;")))
-            .expect("rup empty");
-        writer.conclude_unsat(empty_id).expect("conclude");
-        let proof = String::from_utf8(writer.into_inner()).expect("utf8 proof");
-        (opb, proof)
+        let empty_id = writer.log_step(ProofStep::Rup(String::from(">= 1 ;")))?;
+        writer.conclude_unsat(empty_id)?;
+        let proof = String::from_utf8(writer.into_inner())?;
+        Ok((opb, proof))
     }
 
     /// END-TO-END acceptance for the CUTTING-PLANE-DERIVED top register: for a
@@ -1209,10 +1250,10 @@ mod tests {
     /// OFFICIAL VeriPB checker to print "VERIFIED UNSATISFIABLE". Skips cleanly if
     /// the checker is absent.
     #[test]
-    fn sinz_cardinality_pol_derived_rtop_is_veripb_verified() {
+    fn sinz_cardinality_pol_derived_rtop_is_veripb_verified() -> TestResult {
         let Some(veripb) = locate_veripb() else {
             eprintln!("VeriPB checker not present; skipping pol-derived r_top verification");
-            return;
+            return Ok(());
         };
 
         // Cover the single-division band (k in {n-1, n}) AND the genuinely staged
@@ -1229,9 +1270,10 @@ mod tests {
             (4, 1),
         ];
         for &(n, k) in cases {
-            let (opb, proof) = build_pol_derived_rtop_proof(n, k);
+            let (opb, proof) = build_pol_derived_rtop_proof(n, k)?;
             assert_veripb_verifies(&veripb, &format!("sinz_pol_{n}_{k}"), &opb, &proof);
         }
+        Ok(())
     }
 
     /// Build a VeriPB proof that DERIVES the WEIGHTED Sinz top register
@@ -1244,15 +1286,23 @@ mod tests {
         coeffs: &[i128],
         rhs: i128,
         false_lits: &[i32],
-    ) -> (String, String) {
+    ) -> TestResult<(String, String)> {
         let n = coeffs.len();
         let lits: Vec<i32> = (1..=n as i32).collect();
-        let aux_base = (n as u32) + 1;
+        let aux_base = u32::try_from(n)?
+            .checked_add(1)
+            .ok_or("aux base overflows u32")?;
         let k = rhs as usize;
         let enc = encode_sinz_weighted(coeffs, &lits, rhs, aux_base);
 
-        let num_vars = n + n * k;
-        let f = 1 + false_lits.len();
+        let num_vars = n
+            .checked_mul(k)
+            .and_then(|aux| aux.checked_add(n))
+            .ok_or("variable count overflows usize")?;
+        let f = false_lits
+            .len()
+            .checked_add(1)
+            .ok_or("row count overflows usize")?;
         let mut opb = format!("* #variable= {num_vars} #constraint= {f}\n");
         // Input weighted row (id 1).
         let body: Vec<String> = coeffs
@@ -1265,8 +1315,8 @@ mod tests {
             opb.push_str(&format!("+1 ~x{u} >= 1 ;\n"));
         }
 
-        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f as u64).expect("header");
-        let input_row_id = super::super::ConstraintId::new(1).expect("input row id");
+        let mut writer = VeriPbWriter::new(Vec::<u8>::new(), u64::try_from(f)?)?;
+        let input_row_id = super::super::ConstraintId::new(1).ok_or("input row id")?;
         let _rtop = emit_sinz_introductions_pol_derived_weighted(
             &mut writer,
             &enc,
@@ -1274,15 +1324,12 @@ mod tests {
             &lits,
             k,
             input_row_id,
-        )
-        .expect("weighted pol-derived r_top");
+        )?;
         // r_top forced 1 plus the units (remaining weight < rhs) => empty by RUP.
-        let empty_id = writer
-            .log_step(ProofStep::Rup(String::from(">= 1 ;")))
-            .expect("rup empty");
-        writer.conclude_unsat(empty_id).expect("conclude");
-        let proof = String::from_utf8(writer.into_inner()).expect("utf8 proof");
-        (opb, proof)
+        let empty_id = writer.log_step(ProofStep::Rup(String::from(">= 1 ;")))?;
+        writer.conclude_unsat(empty_id)?;
+        let proof = String::from_utf8(writer.into_inner())?;
+        Ok((opb, proof))
     }
 
     /// END-TO-END acceptance for the WEIGHTED CUTTING-PLANE-DERIVED top register:
@@ -1292,12 +1339,12 @@ mod tests {
     /// require the OFFICIAL VeriPB checker to print "VERIFIED UNSATISFIABLE". Skips
     /// cleanly if the checker is absent.
     #[test]
-    fn sinz_weighted_pol_derived_rtop_is_veripb_verified() {
+    fn sinz_weighted_pol_derived_rtop_is_veripb_verified() -> TestResult {
         let Some(veripb) = locate_veripb() else {
             eprintln!(
                 "VeriPB checker not present; skipping weighted pol-derived r_top verification"
             );
-            return;
+            return Ok(());
         };
 
         // (coeffs, rhs, false_lits-to-contradict). After forcing false_lits false,
@@ -1346,8 +1393,10 @@ mod tests {
             },
         ];
         for (idx, c) in cases.iter().enumerate() {
-            let (opb, proof) = build_pol_derived_rtop_weighted_proof(c.coeffs, c.rhs, c.false_lits);
+            let (opb, proof) =
+                build_pol_derived_rtop_weighted_proof(c.coeffs, c.rhs, c.false_lits)?;
             assert_veripb_verifies(&veripb, &format!("sinz_wpol_{idx}"), &opb, &proof);
         }
+        Ok(())
     }
 }

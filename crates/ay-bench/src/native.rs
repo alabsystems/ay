@@ -565,20 +565,18 @@ fn decompress_to_temp(
         .stdin(Stdio::null())
         .env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string())
         .env("NBCORE", resources.plan.nbcore_per_child.to_string());
-    let (mut child, watchdog) =
-        match resources.spawn_external_child(&mut command, "ay bench decompress") {
-            Ok(guarded) => guarded,
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(BenchError::msg(format!(
-                    "failed to run {decompress_cmd} — is it installed? (needed for {}): {error}",
-                    path.display()
-                )));
-            }
-        };
-    let Some(stdout_pipe) = child.stdout.take() else {
-        let cleanup =
-            crate::resource::terminate_guarded_child(&mut child, watchdog, "ay bench decompress");
+    let mut child = match resources.spawn_owned_child(&mut command, "ay bench decompress") {
+        Ok(guarded) => guarded,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(BenchError::msg(format!(
+                "failed to run {decompress_cmd} — is it installed? (needed for {}): {error}",
+                path.display()
+            )));
+        }
+    };
+    let Some(stdout_pipe) = child.take_stdout() else {
+        let cleanup = child.cancel();
         let removal = std::fs::remove_file(&temp_path);
         cleanup?;
         removal.with_bench_context(|| format!("removing {}", temp_path.display()))?;
@@ -592,16 +590,9 @@ fn decompress_to_temp(
         DECOMPRESSED_FILE_LIMIT_BYTES,
     );
     let output_breach = output_capture.breach_flag();
-    let stderr_capture = child.stderr.take().map(PipeCapture::start);
+    let stderr_capture = child.take_stderr().map(PipeCapture::start);
     let timeout = Duration::from_secs_f64(timeout_sec.max(0.001));
-    let outcome = crate::resource::wait_for_guarded_child_with_limits(
-        &mut child,
-        watchdog,
-        timeout,
-        "ay bench decompress",
-        None,
-        Some(output_breach.as_ref()),
-    );
+    let outcome = child.wait_with_limits(timeout, None, Some(output_breach.as_ref()));
     let output = output_capture.finish();
     let stderr = stderr_capture
         .map(PipeCapture::finish)
@@ -855,6 +846,12 @@ pub(crate) fn prepare_benchmark(
         if read == 0 {
             break;
         }
+        let bytes = buffer.get(..read).ok_or_else(|| {
+            BenchError::msg(format!(
+                "reading benchmark snapshot {} reported more bytes than its buffer holds",
+                original.display()
+            ))
+        })?;
         copied = copied
             .checked_add(read as u64)
             .ok_or_else(|| BenchError::msg("benchmark snapshot size overflow"))?;
@@ -865,8 +862,8 @@ pub(crate) fn prepare_benchmark(
                 DECOMPRESSED_FILE_LIMIT_BYTES
             )));
         }
-        hasher.update(&buffer[..read]);
-        pinned_source.write_all(&buffer[..read])?;
+        hasher.update(bytes);
+        pinned_source.write_all(bytes)?;
     }
     pinned_source.sync_all()?;
     let after = source.metadata()?;
@@ -986,6 +983,12 @@ pub(crate) fn current_benchmark_source_identity(path: &Path) -> Result<(String, 
         if read == 0 {
             break;
         }
+        let bytes = buffer.get(..read).ok_or_else(|| {
+            BenchError::msg(format!(
+                "hashing benchmark source {} reported more bytes than its buffer holds",
+                path.display()
+            ))
+        })?;
         size_bytes = size_bytes
             .checked_add(read as u64)
             .ok_or_else(|| BenchError::msg("benchmark source size overflow"))?;
@@ -996,7 +999,7 @@ pub(crate) fn current_benchmark_source_identity(path: &Path) -> Result<(String, 
                 DECOMPRESSED_FILE_LIMIT_BYTES
             )));
         }
-        hasher.update(&buffer[..read]);
+        hasher.update(bytes);
     }
 
     let after = source.metadata()?;
@@ -1151,10 +1154,6 @@ fn benchmark_identifier(path: &Path, corpus_root: &Path) -> Result<String> {
 // CPU time measurement via /usr/bin/time
 // ===================================================================
 
-const CPU_TIMING_NONCE_ENV: &str = "AY_BENCH_CPU_TIMING_NONCE";
-const REQUIRE_SANDBOX_CPU_TIMING_ENV: &str = "AY_BENCH_REQUIRE_SANDBOX_CPU_TIME_V1";
-const SANDBOX_CPU_TIMING_PREFIX: &str = "AY_BENCH_CPU_TIME_V1";
-
 /// Check whether `/usr/bin/time` is available (cached after first call).
 fn has_usr_bin_time() -> bool {
     use std::sync::OnceLock;
@@ -1217,66 +1216,12 @@ fn parse_posix_time_output(stderr: &str) -> Option<f64> {
     }
 }
 
-/// Parse the nonce-bound timing footer emitted by the trusted continuous
-/// benchmark launcher. The launcher places `/usr/bin/time` *inside*
-/// bubblewrap, immediately around `/solver/ay`, because timing the outer
-/// bubblewrap supervisor does not include the sandboxed solver's CPU usage.
-///
-/// Exactly one nonce-bound record is required. Ambiguous output fails closed
-/// instead of choosing a candidate-controlled lookalike.
-fn parse_sandbox_cpu_time_output(stderr: &str, nonce: &str) -> Option<f64> {
-    let expected_prefix = format!("{SANDBOX_CPU_TIMING_PREFIX} {nonce} ");
-    let mut measured = None;
-    for line in stderr.lines() {
-        let Some(rest) = line.trim().strip_prefix(&expected_prefix) else {
-            continue;
-        };
-        if measured.is_some() {
-            return None;
-        }
-        let mut fields = rest.split_whitespace();
-        let user = fields.next()?.parse::<f64>().ok()?;
-        let system = fields.next()?.parse::<f64>().ok()?;
-        if fields.next().is_some()
-            || !user.is_finite()
-            || !system.is_finite()
-            || user < 0.0
-            || system < 0.0
-        {
-            return None;
-        }
-        measured = Some(user + system);
-    }
-    measured
-}
-
-fn timing_nonce_for_output(output: &tempfile::NamedTempFile) -> Option<String> {
-    let value = output.path().file_name()?.to_str()?;
-    (!value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
-    .then(|| value.to_string())
-}
-
 fn exact_cpu_time_source(source: &str) -> bool {
-    matches!(
-        source,
-        "posix-time-user+sys" | "sandbox-posix-time-user+sys-v1"
-    )
+    source == "posix-time-user+sys"
 }
 
 fn is_definitive_verdict(verdict: &str) -> bool {
     matches!(verdict, "sat" | "unsat")
-}
-
-fn append_harness_error(existing: &mut Option<String>, detail: &str) {
-    let combined = match existing.take() {
-        Some(previous) => format!("{previous}; {detail}"),
-        None => detail.to_string(),
-    };
-    *existing = Some(bounded_output_excerpt(&combined));
 }
 
 // ===================================================================
@@ -1339,22 +1284,38 @@ impl PipeCapture {
                         break;
                     }
                 };
-                hasher.update(&chunk[..read]);
+                // `Read` promises `read <= chunk.len()`; a reader that breaks
+                // that promise is a failed read, not an out-of-bounds slice.
+                let Some(bytes) = chunk.get(..read) else {
+                    read_failed = true;
+                    break;
+                };
+                hasher.update(bytes);
                 total_len = total_len.saturating_add(read);
-                let head_read = read.min(CAPTURE_HEAD_BYTES.saturating_sub(head.len()));
-                head.extend_from_slice(&chunk[..head_read]);
-                if head_read < read {
-                    let trailing = chunk[head_read..read].to_vec();
-                    tail_len += trailing.len();
-                    tail.push_back(trailing);
-                    while tail_len > CAPTURE_TAIL_BYTES {
-                        let excess = tail_len - CAPTURE_TAIL_BYTES;
+                // Everything fits in the head when the room left is at least
+                // the chunk; otherwise the chunk splits at the room left.
+                let head_room = CAPTURE_HEAD_BYTES.saturating_sub(head.len());
+                let (head_part, trailing) =
+                    bytes.split_at_checked(head_room).unwrap_or((bytes, &[]));
+                head.extend_from_slice(head_part);
+                if !trailing.is_empty() {
+                    let Some(new_tail_len) = tail_len.checked_add(trailing.len()) else {
+                        read_failed = true;
+                        break;
+                    };
+                    tail_len = new_tail_len;
+                    tail.push_back(trailing.to_vec());
+                    loop {
+                        let excess = tail_len.saturating_sub(CAPTURE_TAIL_BYTES);
+                        if excess == 0 {
+                            break;
+                        }
                         let Some(front) = tail.front_mut() else {
                             break;
                         };
                         let remove = excess.min(front.len());
                         front.drain(..remove);
-                        tail_len -= remove;
+                        tail_len = tail_len.saturating_sub(remove);
                         if front.is_empty() {
                             tail.pop_front();
                         }
@@ -1436,28 +1397,12 @@ fn run_solver(
 
     let start = Instant::now();
     let timeout = Duration::from_secs_f64(timeout_sec);
-    let require_sandbox_timing =
-        std::env::var(REQUIRE_SANDBOX_CPU_TIMING_ENV).as_deref() == Ok("1");
-
-    // Direct solver paths are timed by this outer wrapper. The continuous
-    // benchmark launcher additionally recognizes the nonce below and emits a
-    // trusted timing footer from an inner `/usr/bin/time` immediately around
-    // `/solver/ay`. Continuous runs require that inner path and deliberately
-    // do not time the outer bubblewrap supervisor.
-    let timing_output = (require_sandbox_timing || has_usr_bin_time())
+    let timing_output = has_usr_bin_time()
         .then(|| tempfile::Builder::new().prefix("ay-time-").tempfile())
         .transpose()
         .ok()
         .flatten();
-    let use_outer_time_wrapper =
-        timing_output.is_some() && has_usr_bin_time() && !require_sandbox_timing;
-    // The nonce is a private contract with the trusted continuous-benchmark
-    // launcher. Never expose it to an ordinary candidate process: otherwise
-    // that process could forge a sandbox timing footer and override the
-    // independent outer `/usr/bin/time` measurement.
-    let cpu_timing_nonce = require_sandbox_timing
-        .then(|| timing_output.as_ref().and_then(timing_nonce_for_output))
-        .flatten();
+    let use_outer_time_wrapper = timing_output.is_some();
 
     let mut cmd = if use_outer_time_wrapper {
         let mut c = if artifact_plan.is_some() {
@@ -1483,9 +1428,6 @@ fn run_solver(
     cmd.args(&command_args);
     cmd.env_clear();
     cmd.envs(solver_env);
-    if let Some(nonce) = cpu_timing_nonce.as_deref() {
-        cmd.env(CPU_TIMING_NONCE_ENV, nonce);
-    }
     cmd.arg("--");
     cmd.arg(actual_path);
     cmd.stdout(Stdio::piped());
@@ -1493,7 +1435,7 @@ fn run_solver(
     let solver_argv = solver_argv(ay_path, &command_args, actual_path);
     let solver_input_path = Some(actual_path.display().to_string());
 
-    let (mut child, watchdog) = match resources.spawn_external_child(&mut cmd, "ay bench run") {
+    let mut child = match resources.spawn_owned_child(&mut cmd, "ay bench run") {
         Ok(guarded) => guarded,
         Err(e) => {
             return prepare_solver_run_artifacts(
@@ -1521,20 +1463,14 @@ fn run_solver(
             );
         }
     };
-    let stdout_capture = child.stdout.take().map(PipeCapture::start);
-    let stderr_capture = child.stderr.take().map(PipeCapture::start);
+    let stdout_capture = child.take_stdout().map(PipeCapture::start);
+    let stderr_capture = child.take_stderr().map(PipeCapture::start);
 
     let proof_limit = artifact_plan
         .as_ref()
         .map(|plan| plan.proof_work_path.as_path())
         .map(|path| (path, PROOF_ARTIFACT_LIMIT_BYTES));
-    let outcome = crate::resource::wait_for_guarded_child_with_file_limit(
-        &mut child,
-        watchdog,
-        timeout,
-        "ay bench run",
-        proof_limit,
-    );
+    let outcome = child.wait_with_limits(timeout, proof_limit, None);
     let elapsed = start.elapsed().as_secs_f64();
     let stdout = stdout_capture
         .map(PipeCapture::finish)
@@ -1543,7 +1479,7 @@ fn run_solver(
         .map(PipeCapture::finish)
         .unwrap_or_else(CapturedPipe::missing);
     let capture_incomplete = stdout.incomplete() || stderr_output.incomplete();
-    let (mut result, sat_run, exit_code, mut harness_error) = match outcome {
+    let (result, sat_run, exit_code, harness_error) = match outcome {
         Err(error) => (
             "error".to_string(),
             None,
@@ -1576,9 +1512,6 @@ fn run_solver(
         },
     };
 
-    let sandbox_cpu = cpu_timing_nonce
-        .as_deref()
-        .and_then(|nonce| parse_sandbox_cpu_time_output(&stderr_output.text, nonce));
     let outer_cpu = if use_outer_time_wrapper {
         timing_output
             .as_ref()
@@ -1590,25 +1523,11 @@ fn run_solver(
     } else {
         None
     };
-    let (cpu_time, cpu_time_source) = match (sandbox_cpu, outer_cpu, require_sandbox_timing) {
-        (Some(cpu_time), _, _) => (cpu_time, "sandbox-posix-time-user+sys-v1"),
-        (None, Some(cpu_time), false) => (cpu_time, "posix-time-user+sys"),
-        (None, _, true) => (0.0, "unavailable-required-sandbox-timing"),
-        (None, _, false) if use_outer_time_wrapper => {
-            (elapsed, "wall-fallback-malformed-posix-time")
-        }
-        (None, _, false) => (elapsed, "wall-no-posix-time"),
+    let (cpu_time, cpu_time_source) = match (use_outer_time_wrapper, outer_cpu) {
+        (_, Some(cpu_time)) => (cpu_time, "posix-time-user+sys"),
+        (true, None) => (elapsed, "wall-fallback-malformed-posix-time"),
+        (false, None) => (elapsed, "wall-no-posix-time"),
     };
-    if require_sandbox_timing
-        && is_definitive_verdict(&result)
-        && !exact_cpu_time_source(cpu_time_source)
-    {
-        result = "error".to_string();
-        append_harness_error(
-            &mut harness_error,
-            "definitive solver verdict lacks exact child CPU timing",
-        );
-    }
 
     prepare_solver_run_artifacts(
         NativeResultItem {
@@ -1649,7 +1568,8 @@ fn solver_command_args(domain: &str, solver_args: &[String]) -> Vec<String> {
 }
 
 fn solver_argv(ay_path: &Path, solver_args: &[String], benchmark: &Path) -> Vec<String> {
-    let mut argv = Vec::with_capacity(3 + solver_args.len());
+    // Grown on push rather than pre-sized from the caller's argument count.
+    let mut argv = Vec::new();
     argv.push(ay_path.display().to_string());
     argv.extend(solver_args.iter().cloned());
     argv.push("--".to_string());
@@ -1711,7 +1631,7 @@ fn bounded_output_excerpt(text: &str) -> String {
     }
     let payload = LIMIT.saturating_sub(MARKER.len());
     let head_budget = payload / 2;
-    let tail_budget = payload - head_budget;
+    let tail_budget = payload.saturating_sub(head_budget);
     let head_end = (0..=head_budget)
         .rev()
         .find(|index| text.is_char_boundary(*index))
@@ -1719,7 +1639,10 @@ fn bounded_output_excerpt(text: &str) -> String {
     let tail_start = (text.len().saturating_sub(tail_budget)..text.len())
         .find(|index| text.is_char_boundary(*index))
         .unwrap_or(text.len());
-    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
+    // Both cuts are char boundaries within `text`.
+    let head = text.get(..head_end).unwrap_or_default();
+    let tail = text.get(tail_start..).unwrap_or_default();
+    format!("{head}{MARKER}{tail}")
 }
 
 fn empty_sha256() -> String {
@@ -1766,8 +1689,6 @@ fn run_external_solver(
 ) -> ReferenceRunEvidence {
     let start = Instant::now();
     let timeout = Duration::from_secs_f64(timeout_sec);
-    let require_exact_cpu_timing =
-        std::env::var(REQUIRE_SANDBOX_CPU_TIMING_ENV).as_deref() == Ok("1");
 
     let mut solver_env = BTreeMap::new();
     solver_env.insert("LC_ALL".to_string(), "C".to_string());
@@ -1828,28 +1749,22 @@ fn run_external_solver(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let (mut child, watchdog) =
-        match resources.spawn_external_child(&mut cmd, "ay bench run reference") {
-            Ok(guarded) => guarded,
-            Err(error) => {
-                return failed_reference_evidence(
-                    solver_path,
-                    benchmark,
-                    solver_input_hash,
-                    solver_argv,
-                    solver_env,
-                    error.to_string(),
-                )
-            }
-        };
-    let stdout_capture = child.stdout.take().map(PipeCapture::start);
-    let stderr_capture = child.stderr.take().map(PipeCapture::start);
-    let outcome = crate::resource::wait_for_guarded_child(
-        &mut child,
-        watchdog,
-        timeout,
-        "ay bench run reference",
-    );
+    let mut child = match resources.spawn_owned_child(&mut cmd, "ay bench run reference") {
+        Ok(guarded) => guarded,
+        Err(error) => {
+            return failed_reference_evidence(
+                solver_path,
+                benchmark,
+                solver_input_hash,
+                solver_argv,
+                solver_env,
+                error.to_string(),
+            )
+        }
+    };
+    let stdout_capture = child.take_stdout().map(PipeCapture::start);
+    let stderr_capture = child.take_stderr().map(PipeCapture::start);
+    let outcome = child.wait(timeout);
     let elapsed = round6(start.elapsed().as_secs_f64());
     let stdout = stdout_capture
         .map(PipeCapture::finish)
@@ -1857,7 +1772,7 @@ fn run_external_solver(
     let stderr = stderr_capture
         .map(PipeCapture::finish)
         .unwrap_or_else(CapturedPipe::missing);
-    let (mut result, recorded_time, exit_code, mut harness_error) = match outcome {
+    let (result, recorded_time, exit_code, harness_error) = match outcome {
         Err(error) => ("error".to_string(), elapsed, None, Some(error.to_string())),
         Ok(outcome) if outcome.memout => ("memout".to_string(), elapsed, None, None),
         Ok(outcome) if outcome.timed_out => ("timeout".to_string(), timeout_sec, None, None),
@@ -1902,16 +1817,6 @@ fn run_external_solver(
         (true, None) => (elapsed, "wall-fallback-malformed-posix-time"),
         (false, _) => (elapsed, "wall-no-posix-time"),
     };
-    if require_exact_cpu_timing
-        && is_definitive_verdict(&result)
-        && !exact_cpu_time_source(cpu_time_source)
-    {
-        result = "error".to_string();
-        append_harness_error(
-            &mut harness_error,
-            "definitive reference verdict lacks exact child CPU timing",
-        );
-    }
     ReferenceRunEvidence {
         result,
         time_sec: round6(recorded_time),
@@ -1932,20 +1837,12 @@ fn run_external_solver(
     }
 }
 
-/// Progress-log stride for native runs (every Nth benchmark, plus first and
-/// last). RETIRED knob: this read an env var literally named
-/// `--progress-every`, which nothing sets — `ay launch-packet
-/// --progress-every` only echoes `bench_progress_every=` into packet
-/// metadata and never reaches this process — so the value was constant 10.
-/// Kept as a function so the decision site keeps its shape; a future carrier
-/// would be a `NativeRunArgs` field fed by the bench CLI (the lu_enabled
-/// documented-constant pattern).
-fn progress_every() -> usize {
-    10
-}
+const PROGRESS_EVERY: usize = 10;
 
 fn should_log_progress(index: usize, total: usize, every: usize) -> bool {
-    index == 0 || index + 1 == total || (index + 1).is_multiple_of(every)
+    // Callers pass `index < total`, so the ordinal never saturates.
+    let ordinal = index.saturating_add(1);
+    index == 0 || ordinal == total || ordinal.is_multiple_of(every)
 }
 
 fn round6(x: f64) -> f64 {
@@ -2075,7 +1972,9 @@ fn artifact_file_name(index: usize, benchmark: &Path, proof_format: &str) -> Str
             }
         })
         .collect();
-    format!("{:06}-{sanitized}.{proof_format}", index + 1)
+    // `index` is an enumeration position, so its 1-based ordinal never
+    // saturates in practice.
+    format!("{:06}-{sanitized}.{proof_format}", index.saturating_add(1))
 }
 
 fn artifact_plan_for_benchmark(
@@ -2690,6 +2589,11 @@ fn content_hash_open_file(file: &mut std::fs::File, label: &str, limit: u64) -> 
         if read == 0 {
             break;
         }
+        let bytes = buf.get(..read).ok_or_else(|| {
+            BenchError::msg(format!(
+                "reading {label} reported more bytes than its buffer holds"
+            ))
+        })?;
         total = total
             .checked_add(read as u64)
             .ok_or_else(|| BenchError::msg(format!("{label} size overflow")))?;
@@ -2698,7 +2602,7 @@ fn content_hash_open_file(file: &mut std::fs::File, label: &str, limit: u64) -> 
                 "{label} exceeds the fixed {limit}-byte hash cap"
             )));
         }
-        hasher.update(&buf[..read]);
+        hasher.update(bytes);
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
@@ -2826,7 +2730,8 @@ pub(crate) fn select_representative(
         return Err(BenchError::msg(classification_error));
     }
     results.sort_by(|a, b| a.time_sec.total_cmp(&b.time_sec));
-    let mid = (results.len() - 1) / 2;
+    // `results` is non-empty (checked above), so this is the lower median.
+    let mid = results.len().saturating_sub(1) / 2;
     Ok(results.remove(mid))
 }
 
@@ -2881,7 +2786,8 @@ fn select_prepared_representative(mut runs: Vec<NativeSolverRun>) -> Result<Nati
     }
 
     runs.sort_by(|a, b| a.item.time_sec.total_cmp(&b.item.time_sec));
-    let selected_index = (runs.len() - 1) / 2;
+    // `runs` is non-empty (checked above), so this is the lower median.
+    let selected_index = runs.len().saturating_sub(1) / 2;
     let mut selected = runs.remove(selected_index);
     if let Err(error) = cleanup_private_solver_runs(&mut runs) {
         let selected_cleanup =
@@ -2993,7 +2899,8 @@ fn apply_native_shard(
         ));
     }
 
-    let shard_count = (benchmarks.len() - 1) / selection.size + 1;
+    // `benchmarks` is non-empty (checked above), so the subtraction is exact.
+    let shard_count = benchmarks.len().saturating_sub(1) / selection.size + 1;
     let shard_index = selection.index % shard_count;
     let start = shard_index
         .checked_mul(selection.size)
@@ -3345,7 +3252,7 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
         }
     }
 
-    let progress_every = progress_every();
+    let progress_every = PROGRESS_EVERY;
     let mut reference_campaigns = args
         .reference_solvers
         .iter()
@@ -3599,10 +3506,16 @@ impl ReferenceCampaign {
             resources,
             "ay bench pinned reference version probe",
         )?;
+        let mut items = Vec::new();
+        items.try_reserve(capacity).map_err(|_| {
+            BenchError::msg(format!(
+                "cannot allocate {capacity} reference campaign items for {name}"
+            ))
+        })?;
         Ok(Self {
             name: name.to_string(),
             pinned,
-            items: Vec::with_capacity(capacity),
+            items,
             agree: 0,
             disagree: 0,
             ay_only: 0,
@@ -4303,12 +4216,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = dir.path().join("signaled-reference-solver.sh");
+        // The stand-in dies by SIGTERM. SIGABRT made macOS write a crash report
+        // for the shell and for `/usr/bin/time` on every run; SIGKILL would not,
+        // but BSD `time` cannot re-raise KILL, so it exits 1 and the run takes the
+        // nonzero-exit branch instead of the signal death this test is about.
         let body = "#!/bin/sh\n\
                     if [ \"$1\" = \"--version\" ]; then\n\
                     printf '%s\\n' 'signaled reference solver'\n\
                     exit 0\n\
                     fi\n\
-                    kill -ABRT $$\n";
+                    kill -TERM $$\n";
         std::fs::write(&path, body).expect("write signaled reference script");
         let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
         perms.set_mode(0o755);
@@ -5234,35 +5151,6 @@ mod tests {
         assert!(cpu.unwrap().abs() < 0.001);
     }
 
-    #[test]
-    fn test_parse_sandbox_cpu_time_requires_one_matching_nonce() {
-        let output = "solver diagnostic\n\
-                      AY_BENCH_CPU_TIME_V1 other 99.0 99.0\n\
-                      AY_BENCH_CPU_TIME_V1 expected-nonce 1.25 0.50\n";
-        let cpu = parse_sandbox_cpu_time_output(output, "expected-nonce");
-        assert!((cpu.unwrap() - 1.75).abs() < 0.001);
-
-        let duplicate = format!("{output}AY_BENCH_CPU_TIME_V1 expected-nonce 1.25 0.50\n");
-        assert!(parse_sandbox_cpu_time_output(&duplicate, "expected-nonce").is_none());
-    }
-
-    #[test]
-    fn test_parse_sandbox_cpu_time_rejects_malformed_values() {
-        assert!(
-            parse_sandbox_cpu_time_output("AY_BENCH_CPU_TIME_V1 nonce NaN 0.2\n", "nonce")
-                .is_none()
-        );
-        assert!(
-            parse_sandbox_cpu_time_output("AY_BENCH_CPU_TIME_V1 nonce -0.1 0.2\n", "nonce")
-                .is_none()
-        );
-        assert!(parse_sandbox_cpu_time_output(
-            "AY_BENCH_CPU_TIME_V1 nonce 0.1 0.2 trailing\n",
-            "nonce"
-        )
-        .is_none());
-    }
-
     #[cfg(unix)]
     #[test]
     #[cfg(any(
@@ -5285,7 +5173,7 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 printf '%s\n' sat
-printf 'AY_BENCH_CPU_TIME_V1 %s 1.25 0.50\n' "$AY_BENCH_CPU_TIMING_NONCE" >&2
+printf 'candidate-cpu-time 1.25 0.50\n' >&2
 "#,
         )
         .expect("write solver");

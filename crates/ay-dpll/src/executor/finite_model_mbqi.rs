@@ -172,12 +172,19 @@ use num_bigint::BigInt;
 
 use super::model::EvalValue;
 use super::quantifier_loop::result_mapping::CheckedGroundDecision;
+use super::unsat_cert::ProbeUnsatAuthority;
 use super::Executor;
 use crate::ematching::{contains_quantifier, subst_vars};
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
 mod budget;
+mod generic;
+mod interpretation;
+mod leaves;
+mod tables;
+#[cfg(test)]
+mod trust_refutation_tests;
 mod witness;
 pub(in crate::executor) use budget::LaneAccount;
 use budget::{
@@ -231,6 +238,15 @@ struct AuthoredUniversal {
     /// Set ONLY from [`Executor::forall_ids_in_conjunctive_position`]; see
     /// [`authored_universal_leaves_impl`] for why a local walk got this wrong.
     refinable: bool,
+    /// True for an `Exists` node whose negation-dual `forall x. (not body)`
+    /// is in that same conjunctive set — the `(assert (not (exists …)))`
+    /// spelling of an entailed universal. Then `(not body)[v]` is a
+    /// consequence of the problem and may drive refinement. Only the generic
+    /// pass (`generic.rs`) sets it; the legacy pass never refines an `Exists`.
+    dual_refinable: bool,
+    /// Quantifier nodes nested in this one that the generic pass pulled into
+    /// its prenex block (`leaves.rs`); discharged together with `node`.
+    covered: Vec<TermId>,
 }
 
 /// What the pins force one quantifier's truth value to be.
@@ -390,6 +406,8 @@ fn classify_authored_universal(terms: &TermStore, leaf: TermId) -> Option<Author
         negate_body,
         universal,
         refinable: false,
+        dual_refinable: false,
+        covered: Vec::new(),
     })
 }
 
@@ -473,7 +491,7 @@ fn finite_value_term(terms: &mut TermStore, sort: &Sort, value: &EvalValue) -> O
             Some(terms.mk_bitvec(value.clone(), *width))
         }
         (Sort::FloatingPoint(eb, sb), EvalValue::Fp(fp)) if fp.eb() == *eb && fp.sb() == *sb => {
-            Some(fp_value_term(terms, fp))
+            fp_value_term(terms, fp)
         }
         _ => None,
     }
@@ -484,38 +502,51 @@ fn finite_value_term(terms: &mut TermStore, sort: &Sort, value: &EvalValue) -> O
 /// Mirrors `model/eval_fp.rs::clone_fp_value_term`; kept here as a free
 /// function so it can write into `self.ctx.terms` while the executor is
 /// mutably borrowed.
-fn fp_value_term(terms: &mut TermStore, value: &ay_fp::FpModelValue) -> TermId {
-    use num_traits::One;
-
+fn fp_value_term(terms: &mut TermStore, value: &ay_fp::FpModelValue) -> Option<TermId> {
     let (eb, sb) = (value.eb(), value.sb());
+    if !(2..=ay_fp::MAX_ENCODING_EXPONENT_BITS).contains(&eb)
+        || !(2..=ay_fp::MAX_ENCODING_SIGNIFICAND_BITS).contains(&sb)
+    {
+        return None;
+    }
     let sort = Sort::FloatingPoint(eb, sb);
     let nullary = |terms: &mut TermStore, name: &str| {
         terms.mk_app(Symbol::indexed(name, vec![eb, sb]), vec![], sort.clone())
     };
-    match value {
+    Some(match value {
         ay_fp::FpModelValue::PosZero { .. } => nullary(terms, "+zero"),
         ay_fp::FpModelValue::NegZero { .. } => nullary(terms, "-zero"),
         ay_fp::FpModelValue::PosInf { .. } => nullary(terms, "+oo"),
         ay_fp::FpModelValue::NegInf { .. } => nullary(terms, "-oo"),
         ay_fp::FpModelValue::NaN { .. } => nullary(terms, "NaN"),
-        ay_fp::FpModelValue::Fp { .. } => {
-            let (bits, _) = value.to_ieee_bv();
-            let sig_width = sb - 1;
-            let sign = (&bits >> (eb + sig_width)) & BigInt::one();
-            let exp_mask = (BigInt::one() << eb) - BigInt::one();
-            let sig_mask = (BigInt::one() << sig_width) - BigInt::one();
-            let exponent = (&bits >> sig_width) & exp_mask;
-            let significand = bits & sig_mask;
-            let sign_term = terms.mk_bitvec(sign, 1);
+        ay_fp::FpModelValue::Fp { .. } | ay_fp::FpModelValue::Exact(_) => {
+            let (sign, exponent, significand) = match value {
+                ay_fp::FpModelValue::Exact(fields) => (
+                    fields.sign(),
+                    BigInt::from(fields.exponent().clone()),
+                    BigInt::from(fields.significand().clone()),
+                ),
+                ay_fp::FpModelValue::Fp {
+                    sign,
+                    exponent,
+                    significand,
+                    ..
+                } => {
+                    ay_fp::FpModelValue::from_fields(*sign, *exponent, *significand, eb, sb)?;
+                    (*sign, BigInt::from(*exponent), BigInt::from(*significand))
+                }
+                _ => return None,
+            };
+            let sign_term = terms.mk_bitvec(BigInt::from(u8::from(sign)), 1);
             let exp_term = terms.mk_bitvec(exponent, eb);
-            let sig_term = terms.mk_bitvec(significand, sig_width);
+            let sig_term = terms.mk_bitvec(significand, sb - 1);
             terms.mk_app(
                 Symbol::named("fp"),
                 vec![sign_term, exp_term, sig_term],
                 sort,
             )
         }
-    }
+    })
 }
 
 impl Executor {
@@ -629,21 +660,56 @@ impl Executor {
         (matrix, skolems)
     }
 
-    /// Is `assertions` checked-UNSAT, within what the lane has left to spend?
+    /// Is `assertions` refuted, within what the lane has left to spend?
     ///
-    /// A budget-exhausted call answers "not refuted", which is the same shape
-    /// as a sub-solve that ran out its own budget: the caller loses a decision,
-    /// never gains one.
+    /// The refutation is checked, or, when the enclosing solve sheds proof
+    /// work, admitted raw on the same terms as a top-level UNSAT of that
+    /// posture ([`Executor::checked_model_check_solve`]). A budget-exhausted
+    /// call answers "not refuted", which is the same shape as a sub-solve that
+    /// ran out its own budget: the caller loses a decision, never gains one.
+    ///
+    /// A refutation resting on `discharged-trust` (a fresh executor running
+    /// the same code re-decided it; [`ProbeUnsatAuthority::DischargedTrust`])
+    /// decides nothing: the probe mode refuses it, because the value it would
+    /// decide is substituted into the residual whose model is published as
+    /// `sat`. The booking in [`LaneAccount::discharged_trust_refutations`] is
+    /// the second line behind that refusal: a refutation it ever counts marks
+    /// the pass `DischargedTrust`, and the installer refuses that pass's
+    /// grant, so the publication gate never defers to it.
     fn finite_model_refutes(&mut self, assertions: Vec<TermId>, budget: LaneBudget) -> bool {
-        self.checked_ground_solve(
-            assertions.clone(),
-            LogicCategory::Other,
-            budget.sub_solve_ms(),
-        )
-        .is_some_and(|decision| match decision {
+        let Some((decision, authority)) =
+            self.checked_model_check_solve_classified(assertions.clone(), budget.sub_solve_ms())
+        else {
+            return false;
+        };
+        let refuted = match decision {
             CheckedGroundDecision::Unsat(checked) => checked.consume(self, &assertions),
             CheckedGroundDecision::Sat(_) => false,
-        })
+        };
+        if refuted && authority == ProbeUnsatAuthority::DischargedTrust {
+            self.finite_model_lane.discharged_trust_refutations = self
+                .finite_model_lane
+                .discharged_trust_refutations
+                .saturating_add(1);
+        }
+        refuted
+    }
+
+    /// The session's `discharged-trust` refutation count, read before a
+    /// certificate pass and handed to [`Self::finite_model_pass_trust`].
+    fn finite_model_trust_mark(&self) -> u64 {
+        self.finite_model_lane.discharged_trust_refutations
+    }
+
+    /// The admission class of the certificate a pass begun at `mark` installs:
+    /// `DischargedTrust` when any refutation it rests on was admitted only as
+    /// `discharged-trust`.
+    fn finite_model_pass_trust(&self, mark: u64) -> ProbeUnsatAuthority {
+        if self.finite_model_lane.discharged_trust_refutations > mark {
+            ProbeUnsatAuthority::DischargedTrust
+        } else {
+            ProbeUnsatAuthority::Checked
+        }
     }
 
     /// `matrix[x_bar := v_bar]` for the concrete values `values`.
@@ -657,7 +723,17 @@ impl Executor {
         }
         let mut binding: Vec<TermId> = Vec::with_capacity(leaf.vars.len());
         for ((_, sort), value) in leaf.vars.iter().zip(values) {
+            let _scratch = if let EvalValue::Fp(fp) = value {
+                if sort != &Sort::FloatingPoint(fp.eb(), fp.sb()) {
+                    return None;
+                }
+                let bytes = Self::fp_model_clone_scratch_bytes(fp)?;
+                Some(self.admit_evaluation_scratch(bytes).ok()?)
+            } else {
+                None
+            };
             binding.push(finite_value_term(&mut self.ctx.terms, sort, value)?);
+            self.poll_evaluation_stop().ok()?;
         }
         let subst: HashMap<String, TermId> = leaf
             .vars
@@ -835,8 +911,7 @@ impl Executor {
             .map(|&root| replace_subterms(&mut self.ctx.terms, root, &values, &mut memo))
             .collect();
         confirm.extend_from_slice(&pins);
-        let decision =
-            self.checked_ground_solve(confirm.clone(), LogicCategory::Other, budget.sub_solve_ms());
+        let decision = self.checked_model_check_solve(confirm.clone(), budget.sub_solve_ms());
         let outcome = match decision {
             // The witness stage below is NOT budgeted away. It is the only
             // check standing between pin completion and a published wrong
@@ -886,7 +961,12 @@ impl Executor {
         let Some(budget) = self.finite_model_lane_open() else {
             return false;
         };
-        let authority_roots = self.independent_gate_query_roots();
+        let authority_roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return false;
+            }
+        };
         let Some(universals) = authored_universal_leaves_impl(self, &authority_roots) else {
             self.finite_model_lane_settle(budget, false);
             return false;
@@ -900,6 +980,7 @@ impl Executor {
             )
         });
         let mut instances = Vec::new();
+        let trust_mark = self.finite_model_trust_mark();
         let outcome = self.finite_model_certificate_pass(
             0,
             &authority_roots,
@@ -918,8 +999,9 @@ impl Executor {
                     trace(|| "gate-hook: authority roots do not cover".to_string());
                     return false;
                 };
-                let installed =
-                    self.install_finite_model_full_domain_sat_authority(evidence, *model);
+                let admission = self.finite_model_pass_trust(trust_mark);
+                let installed = self
+                    .install_finite_model_full_domain_sat_authority(evidence, *model, admission);
                 trace(|| format!("gate-hook: installed={installed}"));
                 installed
             }
@@ -1022,7 +1104,7 @@ impl Executor {
             return result;
         }
         trace(|| "last-chance: consulting the finite-sort certificate".to_string());
-        if !self.try_finite_model_sat_certificate() {
+        if !self.try_finite_model_sat_certificate() && !self.try_model_check_sat_certificate() {
             return result;
         }
         self.defer_model_validation = false;
@@ -1049,7 +1131,12 @@ impl Executor {
         // engage at all, so a closed lane neither traverses the roots nor
         // revokes an authority it is not going to replace.
         let budget = self.finite_model_lane_open()?;
-        let authority_roots = self.independent_gate_query_roots();
+        let authority_roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return None;
+            }
+        };
         let Some(universals) = authored_universal_leaves_impl(self, &authority_roots) else {
             trace(|| "authored leaves not all finite-sort universals".to_string());
             self.finite_model_lane_settle(budget, false);
@@ -1110,6 +1197,7 @@ impl Executor {
             }
 
             let mut new_instances: Vec<TermId> = Vec::new();
+            let trust_mark = self.finite_model_trust_mark();
             match self.finite_model_certificate_pass(
                 round,
                 authority_roots,
@@ -1128,7 +1216,10 @@ impl Executor {
                         trace(|| format!("round {round}: authority roots do not cover"));
                         return None;
                     };
-                    if !self.install_finite_model_full_domain_sat_authority(evidence, *model) {
+                    let admission = self.finite_model_pass_trust(trust_mark);
+                    if !self
+                        .install_finite_model_full_domain_sat_authority(evidence, *model, admission)
+                    {
                         trace(|| format!("round {round}: staged witness install declined"));
                         return None;
                     }
@@ -1141,6 +1232,22 @@ impl Executor {
             if new_instances.is_empty() {
                 return None;
             }
+            // (#degrade277-narrow) Finite-model MBQI counterexample instances are conjoined
+            // as TOP-LEVEL FACTS, and their source list
+            // (`unhandled_quantifiers`) deliberately INCLUDES universals
+            // `setup_cegqi_for_unhandled` refused as non-entailed
+            // (`should_process == false` still pushes a `forall` onto
+            // `unhandled_quantifier_list`). So this lane is NOT covered by the
+            // `entailed_forall_set` licence that every E-matching and
+            // enumerative conjoin passes through.
+            //
+            // Record the event rather than argue from call ordering: these
+            // instances outlive the `process_quantifiers` call that made them,
+            // so a later `classify_quantifier_result` could otherwise narrow
+            // `degrade@277` on a premise this push falsified. The marker makes
+            // that gate fall back to its unnarrowed behaviour for the rest of
+            // the query.
+            self.unlicensed_instance_conjoined = true;
             for instance in &new_instances {
                 self.ctx.assertions.push(*instance);
             }
@@ -1483,4 +1590,6 @@ mod refinable_contract_tests {
             "a declined consult leaves the published reason exactly as it was"
         );
     }
+
+    include!("finite_model_mbqi/negated_universal_tests.rs");
 }

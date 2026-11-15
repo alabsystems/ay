@@ -2,7 +2,7 @@
 # Copyright 2026 Andrew Yates
 # Author: Andrew Yates
 # Licensed under the Apache License, Version 2.0
-"""Exactness obligations for the symbolic-index array-read elimination.
+r"""Exactness obligations for the symbolic-index array-read elimination.
 
 The pass replaces every `(select A i)` on a declared array symbol by a fresh
 constant `r_i` and, for every pair of distinct cells on the same array, asserts

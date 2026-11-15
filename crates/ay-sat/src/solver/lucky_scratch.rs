@@ -31,6 +31,13 @@ use std::time::{Duration, Instant};
 /// Throttle for wall-clock deadline / interrupt checks inside the hot loops.
 const LUCKY_SCRATCH_CHECK_INTERVAL: usize = 4096;
 
+/// Under `--sat-deterministic-inproc` the probe budgets are occurrence
+/// visits, not wall time: this many visits per millisecond of the wall
+/// budgets below. Anchor: the 63M-clause 00fd8ac9 wins in about 2e8 visits
+/// and 1.4-1.6 s. Provisional; `lucky_visit_budgets` also floors every
+/// budget at a full sweep, so no one-pass win is ever cut.
+const LUCKY_SCRATCH_VISITS_PER_MS: u64 = 150_000;
+
 /// The kissat lucky probe order (lucky.c:307-393).
 #[derive(Clone, Copy, Debug)]
 enum LuckyProbe {
@@ -105,6 +112,11 @@ struct LuckyScratch {
     /// undo below this.
     root_len: usize,
     deadline: Instant,
+    /// Occurrence visits made by `propagate` so far.
+    visits: u64,
+    /// Under `--sat-deterministic-inproc`: the visit count at which the
+    /// current probe stops, in place of `deadline`. `None` on the wall clock.
+    visit_limit: Option<u64>,
 }
 
 impl LuckyScratch {
@@ -183,13 +195,39 @@ impl LuckyScratch {
             qhead: 0,
             root_len: 0,
             deadline: Instant::now(),
+            visits: 0,
+            visit_limit: None,
         })
+    }
+
+    /// Whether the current probe has spent its budget: the visit limit under
+    /// `--sat-deterministic-inproc`, the wall deadline otherwise.
+    #[inline]
+    fn out_of_budget(&self) -> bool {
+        match self.visit_limit {
+            Some(limit) => self.visits >= limit,
+            None => Instant::now() >= self.deadline,
+        }
     }
 
     #[inline]
     fn occ_range(&self, lit: Literal) -> std::ops::Range<usize> {
         let i = lit.index();
         self.occ_start[i] as usize..self.occ_start[i + 1] as usize
+    }
+
+    /// The per-probe and total budgets in occurrence visits, under
+    /// `--sat-deterministic-inproc`: the wall budgets at
+    /// `LUCKY_SCRATCH_VISITS_PER_MS`, each floored at two full passes over the
+    /// occurrence lists, so a successful sweep always fits.
+    fn visit_budgets(&self, per_probe: Duration, total: Duration) -> (u64, u64) {
+        let floor = 2 * self.occ.len() as u64;
+        let visits = |budget: Duration| {
+            (budget.as_millis() as u64)
+                .saturating_mul(LUCKY_SCRATCH_VISITS_PER_MS)
+                .max(floor)
+        };
+        (visits(per_probe), visits(total))
     }
 
     /// Signed value of `lit` under the scratch assignment: 1 true, -1 false,
@@ -215,7 +253,7 @@ impl LuckyScratch {
     /// their counter effects. The solver is at a BCP fixpoint, so this cannot
     /// derive anything new; a conflict here would mean inconsistent input
     /// state, in which case we refuse to probe (fail closed).
-    fn init_root(&mut self, arena: &ClauseArena, solver_vals: &[i8]) -> bool {
+    fn init_root(&mut self, arena: &ClauseArena, solver_vals: &[i8], counted: bool) -> bool {
         for v in 0..self.num_vars {
             let val = solver_vals[v * 2];
             if val > 0 {
@@ -225,7 +263,11 @@ impl LuckyScratch {
             }
         }
         // Generous deadline for the root replay: it is O(root occurrences).
+        // Unlimited under `--sat-deterministic-inproc`, for the same reason.
         self.deadline = Instant::now() + Duration::from_mins(1);
+        if counted {
+            self.visit_limit = Some(u64::MAX);
+        }
         let ok = matches!(self.propagate(arena, &|| false), Ok(()));
         self.root_len = self.trail.len();
         ok && self.qhead == self.trail.len()
@@ -248,11 +290,12 @@ impl LuckyScratch {
                 if is_interrupted() {
                     return Err(ProbeStop::Interrupted);
                 }
-                if Instant::now() >= self.deadline {
+                if self.out_of_budget() {
                     return Err(ProbeStop::Deadline);
                 }
             }
             let lit = self.trail[self.qhead];
+            self.visits += (self.occ_range(lit).len() + self.occ_range(lit.negated()).len()) as u64;
 
             // Satisfy loop first so unit detection below sees fresh n_sat.
             for k in self.occ_range(lit) {
@@ -362,7 +405,9 @@ impl LuckyScratch {
                 if is_interrupted() {
                     return Err(ProbeStop::Interrupted);
                 }
-                if Instant::now() >= self.deadline {
+                // One read-only pass over the clauses: under the flag its
+                // length is its bound.
+                if self.visit_limit.is_none() && Instant::now() >= self.deadline {
                     return Err(ProbeStop::Deadline);
                 }
             }
@@ -469,7 +514,7 @@ impl Solver {
         total_budget: Duration,
     ) -> Option<Vec<bool>> {
         let mut eng = LuckyScratch::build(&self.arena, self.num_vars)?;
-        if !eng.init_root(&self.arena, &self.vals) {
+        if !eng.init_root(&self.arena, &self.vals, self.deterministic_inproc()) {
             return None;
         }
         // #lucky-total-cap: bound the WHOLE probe sequence, not just each
@@ -482,17 +527,30 @@ impl Solver {
         // noise. Failures typically die in ms via conflicts; the cap only
         // bites pathological all-probes-slow cases.
         let overall_deadline = Instant::now() + total_budget;
+        // Under `--sat-deterministic-inproc` both budgets are visits.
+        let visit_budgets = self
+            .deterministic_inproc()
+            .then(|| eng.visit_budgets(per_probe_budget, total_budget));
         let is_interrupted = || self.is_interrupted();
         for probe in LUCKY_PROBE_ORDER {
             if self.is_interrupted() {
                 return None;
             }
-            let remaining = overall_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::debug!("lucky (scratch): total budget exhausted, falling through");
-                return None;
+            if let Some((per_probe, total)) = visit_budgets {
+                let remaining = total.saturating_sub(eng.visits);
+                if remaining == 0 {
+                    tracing::debug!("lucky (scratch): total budget exhausted, falling through");
+                    return None;
+                }
+                eng.visit_limit = Some(eng.visits + per_probe.min(remaining));
+            } else {
+                let remaining = overall_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    tracing::debug!("lucky (scratch): total budget exhausted, falling through");
+                    return None;
+                }
+                eng.deadline = Instant::now() + per_probe_budget.min(remaining);
             }
-            eng.deadline = Instant::now() + per_probe_budget.min(remaining);
             let outcome = match probe {
                 LuckyProbe::ConstantTrue => eng.run_constant(&self.arena, true, &is_interrupted),
                 LuckyProbe::ConstantFalse => eng.run_constant(&self.arena, false, &is_interrupted),

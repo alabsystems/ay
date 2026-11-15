@@ -79,16 +79,18 @@ impl LraSolver {
         // per-invocation latch, so clear for hygiene.
         self.post_simplex_bounds_added = false;
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // #inc-guard-memo: lifecycle reset — values/bounds may be rewritten
         // below, so the guard's clean memo no longer holds. Also breaks the
         // tracked-only chain (#inc-guard-chain) until a full verification.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         self.direct_bounds_changed_since_implied = true;
         self.direct_bounds_changed_vars.clear();
         self.bcp_implied_dry_streak = 0;
         self.bcp_cascade_dry_streak = 0;
-        self.last_simplex_feasible = false;
+        self.set_last_simplex_feasible(false);
         self.last_simplex_feasible_scopes.clear();
         self.feasible_value_snapshot.clear();
         self.pivots_at_last_snapshot = u64::MAX;
@@ -130,6 +132,7 @@ impl LraSolver {
         self.warm.nonbasic_stamp.clear();
         self.warm.delta_stamp.clear();
         self.disequality_trail.clear();
+        self.asserted_value_flips = self.asserted_value_flips.wrapping_add(1);
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();
         self.shared_disequality_trail_scopes.clear();
@@ -148,6 +151,8 @@ impl LraSolver {
         // fingerprint) are stale for whatever is registered next.
         self.theory_prop_jit = ay_jit::TheoryPropJit::new();
         self.theory_prop_jit_compiled = false;
+        self.atom_index_atom_count = 0;
+        self.jit_stale_propagate_calls = 0;
         // STAGE B: registered_atoms + asserted were both cleared above, so the
         // decision-candidate index is empty.
         self.decision_index.eq.clear();
@@ -217,16 +222,18 @@ impl LraSolver {
         // for hygiene.
         self.post_simplex_bounds_added = false;
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // #inc-guard-memo: lifecycle reset — values/bounds may be rewritten
         // below, so the guard's clean memo no longer holds. Also breaks the
         // tracked-only chain (#inc-guard-chain) until a full verification.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         self.direct_bounds_changed_since_implied = true;
         self.direct_bounds_changed_vars.clear();
         self.bcp_implied_dry_streak = 0;
         self.bcp_cascade_dry_streak = 0;
-        self.last_simplex_feasible = false;
+        self.set_last_simplex_feasible(false);
         self.last_simplex_feasible_scopes.clear();
         self.feasible_value_snapshot.clear();
         self.pivots_at_last_snapshot = u64::MAX;
@@ -263,6 +270,7 @@ impl LraSolver {
         // tracking is stale.
         self.warm_invalidate();
         self.disequality_trail.clear();
+        self.asserted_value_flips = self.asserted_value_flips.wrapping_add(1);
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();
         self.shared_disequality_trail_scopes.clear();
@@ -336,6 +344,7 @@ impl LraSolver {
         };
         // Imported vars replace every bound slot — stale-memo hazard for LIA.
         self.bump_bound_revision();
+        self.asserted_value_flips = self.asserted_value_flips.wrapping_add(1);
         self.rows = snap.rows;
         self.vars = snap.vars;
         self.term_to_var = snap.term_to_var;
@@ -346,6 +355,12 @@ impl LraSolver {
         self.ite_link_terms_seen = snap.ite_link_terms_seen;
         self.registered_atoms = snap.registered_atoms;
         self.atom_index = snap.atom_index;
+        self.atom_index_atom_count = self
+            .atom_index
+            .values()
+            .map(|atoms| atoms.len() as u64)
+            .sum();
+        self.jit_stale_propagate_calls = 0;
         self.compound_use_index = snap.compound_use_index;
         self.var_to_atoms = snap.var_to_atoms;
         self.atom_slack = snap.atom_slack;
@@ -396,10 +411,12 @@ impl LraSolver {
         // #8187: restore_from_snapshot — soundness gate flag is per-invocation.
         self.post_simplex_bounds_added = false;
         self.vars_tightened_since_simplex.clear();
+        self.pre_scan_tightened_complete = false;
         // #inc-guard-memo: lifecycle reset — values/bounds may be rewritten
         // below, so the guard's clean memo no longer holds. Also breaks the
         // tracked-only chain (#inc-guard-chain) until a full verification.
         self.guard_clean_valid = false;
+        self.note_phase_state_change();
         self.guard_tracked_only = false;
         self.direct_bounds_changed_since_implied = true;
         self.direct_bounds_changed_vars.clear();

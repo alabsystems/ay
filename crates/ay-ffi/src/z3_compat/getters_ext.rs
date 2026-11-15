@@ -8,8 +8,8 @@
 //!
 //! Every function is real over existing AY engine/handle state, or an HONEST
 //! DOCUMENTED DIVERGENCE where AY structurally lacks the queried capability
-//! (real-closed-field algebraic numbers, `(as-array f)` nodes, decl parameters
-//! other than integers, finite-domain / relation sorts, de-Bruijn indices,
+//! (decl parameters other than integers, finite-domain / relation
+//! sorts, de-Bruijn indices,
 //! `:qid`/`:skid` attributes). Divergent functions set a Z3 error code and
 //! return a sound sentinel — they NEVER fabricate a value.
 //!
@@ -23,11 +23,11 @@ use ay_dpll::api::{FuncDecl, Sort, Term, TermKind};
 use num_bigint::BigInt;
 
 use super::{
-    alloc_sort, cache_dt_func_decl, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_double, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    finite_set_empty_decl_parameter, record_ast_sort, require_term_ast_or_return, term_to_ast,
-    DatatypeOp, Z3_ast, Z3_context, Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol,
-    Z3_INVALID_ARG, Z3_IOB,
+    alloc_sort, cache_dt_func_decl, cache_func_decl, cache_string, engine_ast, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_double, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
+    ffi_guard_void, finite_set_empty_decl_parameter, lookup_ast_sort, mk_ast, record_ast_sort,
+    require_ast_or_return, require_term_ast_or_return, term_to_ast, DatatypeOp, Z3_ast, Z3_context,
+    Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
 };
 
 // ============================================================================
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn Z3_get_numerator(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // SAFETY: `c` guarded by `ffi_guard_ast`; `a` is a term handle value.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numerator", "numeral", 0);
+            let term = require_ast_or_return!(ctx, a, "Z3_get_numerator", "numeral", 0).term;
             match ctx
                 .solver
                 .numeral_string(term)
@@ -80,9 +80,7 @@ pub unsafe extern "C" fn Z3_get_numerator(c: Z3_context, a: Z3_ast) -> Z3_ast {
             {
                 Some((num, _den)) => {
                     let t = ctx.solver.int_const_bigint(&num);
-                    let ast = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, ast, Sort::Int);
-                    ast
+                    mk_ast(ctx, t, Sort::Int)
                 }
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -106,7 +104,7 @@ pub unsafe extern "C" fn Z3_get_denominator(c: Z3_context, a: Z3_ast) -> Z3_ast 
     // SAFETY: `c` guarded by `ffi_guard_ast`.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let term = require_term_ast_or_return!(ctx, a, "Z3_get_denominator", "numeral", 0);
+            let term = require_ast_or_return!(ctx, a, "Z3_get_denominator", "numeral", 0).term;
             match ctx
                 .solver
                 .numeral_string(term)
@@ -115,9 +113,7 @@ pub unsafe extern "C" fn Z3_get_denominator(c: Z3_context, a: Z3_ast) -> Z3_ast 
             {
                 Some((_num, den)) => {
                     let t = ctx.solver.int_const_bigint(&den);
-                    let ast = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, ast, Sort::Int);
-                    ast
+                    mk_ast(ctx, t, Sort::Int)
                 }
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -143,7 +139,7 @@ pub unsafe extern "C" fn Z3_get_numeral_double(c: Z3_context, a: Z3_ast) -> c_do
     // SAFETY: `c` guarded by `ffi_guard_double`.
     unsafe {
         ffi_guard_double(c, 0.0, |ctx| {
-            let t = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_double", "numeral", 0.0);
+            let t = require_ast_or_return!(ctx, a, "Z3_get_numeral_double", "numeral", 0.0).term;
             if matches!(ctx.solver.sort_of(t), Sort::BitVec(_)) {
                 ctx.last_error = Z3_INVALID_ARG;
                 return 0.0;
@@ -193,7 +189,7 @@ pub unsafe extern "C" fn Z3_get_numeral_rational_int64(
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
             let term =
-                require_term_ast_or_return!(ctx, v, "Z3_get_numeral_rational_int64", "numeral", 0);
+                require_ast_or_return!(ctx, v, "Z3_get_numeral_rational_int64", "numeral", 0).term;
             if let Some((n, d)) = ctx
                 .solver
                 .numeral_string(term)
@@ -247,7 +243,7 @@ pub unsafe extern "C" fn Z3_get_numeral_small(
     // SAFETY: as `Z3_get_numeral_rational_int64`, but signals `Z3_INVALID_ARG` on failure.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_small", "numeral", 0);
+            let term = require_ast_or_return!(ctx, a, "Z3_get_numeral_small", "numeral", 0).term;
             match ctx
                 .solver
                 .numeral_string(term)
@@ -292,13 +288,14 @@ pub unsafe extern "C" fn Z3_get_numeral_binary_string(c: Z3_context, a: Z3_ast) 
     // SAFETY: `c` guarded by `ffi_guard_const_ptr`.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 a,
                 "Z3_get_numeral_binary_string",
                 "numeral",
                 ptr::null()
-            );
+            )
+            .term;
             let value = ctx
                 .solver
                 .numeral_string(term)
@@ -338,7 +335,7 @@ pub unsafe extern "C" fn Z3_get_depth(c: Z3_context, a: Z3_ast) -> c_uint {
     // SAFETY: `c` guarded by `ffi_guard_uint`.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            let root = require_term_ast_or_return!(ctx, a, "Z3_get_depth", "term", 0);
+            let root = require_ast_or_return!(ctx, a, "Z3_get_depth", "term", 0).term;
             let mut memo: HashMap<Term, u32> = HashMap::new();
             let mut stack: Vec<(Term, bool)> = vec![(root, false)];
             while let Some((t, processed)) = stack.pop() {
@@ -392,11 +389,10 @@ pub unsafe extern "C" fn Z3_get_index_value(c: Z3_context, a: Z3_ast) -> c_uint 
     // SAFETY: `c` guarded by `ffi_guard_uint`.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            let term = require_term_ast_or_return!(ctx, a, "Z3_get_index_value", "term", 0);
+            let term = require_ast_or_return!(ctx, a, "Z3_get_index_value", "term", 0).term;
             if let TermKind::Var { name } = ctx.solver.term_kind(term) {
-                if let Some(idx) = name
-                    .strip_prefix("__db")
-                    .and_then(|s| s.parse::<c_uint>().ok())
+                if let Some(idx) =
+                    ay_dpll::api::de_bruijn_index(&name).and_then(|k| c_uint::try_from(k).ok())
                 {
                     return idx;
                 }
@@ -424,37 +420,104 @@ pub unsafe extern "C" fn Z3_get_func_decl_id(c: Z3_context, f: Z3_func_decl) -> 
     unsafe { ffi_guard_uint(c, 0, |_ctx| id) }
 }
 
-/// Z3's `Z3_is_algebraic_number`. AY numerals are exact rationals — no RCF
-/// algebraic-number AST exists — so always false.
+/// Z3's `Z3_is_algebraic_number`: true exactly for a genuine irrational
+/// algebraic value (measured libz3 5.1.0: `√2` true; rationals and
+/// rational-valued roots like `√4` false, since both engines intern
+/// those as ordinary numerals).
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_is_algebraic_number(_c: Z3_context, _a: Z3_ast) -> bool {
-    false
+pub unsafe extern "C" fn Z3_is_algebraic_number(c: Z3_context, a: Z3_ast) -> bool {
+    // SAFETY: `ffi_guard_int` null-checks `c` and catches panics; pure
+    // predicate (a non-value is quietly false, no error, as in z3).
+    unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let is_algebraic = super::algebraic::ast_as_scalar(ctx, a)
+                .is_some_and(|s| ay_nra::rcf_api::is_rational(&s) == Some(false));
+            i32::from(is_algebraic)
+        }) != 0
+    }
 }
 
-/// Z3's `Z3_is_as_array`. AY builds no `(as-array f)` node — always false.
-///
-/// # Safety
-/// `c` must be a valid context pointer.
-#[no_mangle]
-pub unsafe extern "C" fn Z3_is_as_array(_c: Z3_context, _a: Z3_ast) -> bool {
-    false
+/// The function name inside AY's `(as-array f)` node (`App` head
+/// `as-array[f]`, mirroring Z3's `OP_AS_ARRAY` parameter), or `None` for
+/// any other term.
+fn as_array_func_name(ctx: &super::Z3Context, term: Term) -> Option<String> {
+    let head = ctx.solver.app_symbol_name(term)?;
+    head.strip_prefix("as-array[")?
+        .strip_suffix(']')
+        .map(str::to_string)
 }
 
-/// Z3's `Z3_get_as_array_func_decl`. No `(as-array f)` node exists in AY.
-/// DIVERGENCE: set `Z3_INVALID_ARG`, return null.
+/// Z3's `Z3_is_as_array`: true exactly for `(as-array f)` terms (built by
+/// `Z3_mk_as_array` or parsed `(as-array f)`).
 ///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_get_as_array_func_decl(c: Z3_context, _a: Z3_ast) -> Z3_func_decl {
+pub unsafe extern "C" fn Z3_is_as_array(c: Z3_context, a: Z3_ast) -> bool {
+    if a == 0 {
+        return false;
+    }
+    // SAFETY: `c` guarded by `ffi_guard_int`.
+    unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_is_as_array", "term", 0);
+            i32::from(as_array_func_name(ctx, term).is_some())
+        }) != 0
+    }
+}
+
+/// Z3's `Z3_get_as_array_func_decl`: the unary function declaration `f` of
+/// an `(as-array f)` term. Non-as-array input sets `Z3_INVALID_ARG` and
+/// returns null.
+///
+/// # Safety
+/// `c` must be a valid context pointer.
+#[no_mangle]
+pub unsafe extern "C" fn Z3_get_as_array_func_decl(c: Z3_context, a: Z3_ast) -> Z3_func_decl {
+    if a == 0 {
+        return ptr::null_mut();
+    }
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            ctx.last_error = Z3_INVALID_ARG;
-            ptr::null_mut()
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_as_array_func_decl",
+                "term",
+                ptr::null_mut()
+            );
+            let Some(name) = as_array_func_name(ctx, term) else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_get_as_array_func_decl: argument is not an as-array term".to_string());
+                return ptr::null_mut();
+            };
+            // Prefer the context's authenticated declaration of `f`.
+            if let Some(authenticated) = ctx
+                .ffi_func_decls
+                .values()
+                .find(|decl| decl.declaration_identity_name() == name && decl.arity() == 1)
+                .cloned()
+            {
+                return cache_func_decl(ctx, authenticated);
+            }
+            // Otherwise synthesize `f : index -> element` from the term's
+            // recorded `(Array index element)` sort.
+            let sort = lookup_ast_sort(ctx, a)
+                .cloned()
+                .unwrap_or_else(|| ctx.solver.term_sort(term));
+            let Sort::Array(array_sort) = sort else {
+                ctx.last_error = Z3_INVALID_ARG;
+                return ptr::null_mut();
+            };
+            cache_func_decl(
+                ctx,
+                FuncDecl::new(name, vec![array_sort.index_sort], array_sort.element_sort),
+            )
         })
     }
 }
@@ -470,7 +533,7 @@ pub unsafe extern "C" fn Z3_is_well_sorted(c: Z3_context, t: Z3_ast) -> bool {
     // SAFETY: `ffi_guard_int` handles a null context and catches panics.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            let _term = require_term_ast_or_return!(ctx, t, "Z3_is_well_sorted", "term", 0);
+            let _term = require_ast_or_return!(ctx, t, "Z3_is_well_sorted", "term", 0).term;
             1
         }) != 0
     }
@@ -482,9 +545,10 @@ pub unsafe extern "C" fn Z3_is_well_sorted(c: Z3_context, t: Z3_ast) -> bool {
 //
 // `FuncDeclHandle.params` stores integer parameters for indexed operators.
 // Finite-set `set.empty` additionally exposes one computed SORT parameter
-// through `Z3_get_decl_sort_parameter` in `accessors.rs`. No declaration
-// currently carries an AST, double, rational, symbol, or func-decl parameter,
-// so those getters set `Z3_IOB` and return a null/zero sentinel.
+// through `Z3_get_decl_sort_parameter` in `accessors.rs`, and an
+// `(as-array f)` declaration exposes one computed FUNC_DECL parameter
+// below. No declaration carries an AST, double, rational, or symbol
+// parameter, so those getters set `Z3_IOB` and return a null/zero sentinel.
 
 /// Z3's `Z3_get_decl_ast_parameter` — no AST decl parameters in AY.
 /// # Safety
@@ -522,36 +586,108 @@ pub unsafe extern "C" fn Z3_get_decl_double_parameter(
     }
 }
 
-/// Z3's `Z3_get_decl_func_decl_parameter` — no func_decl decl parameters in AY.
+/// The inner function name of an `(as-array f)` declaration: AY encodes
+/// the parameter in the declaration's (private) name `as-array[f]`
+/// rather than a parameter slot, so the decl-parameter getters compute
+/// it on query (the same pattern as the finite-set sort parameter).
+pub(crate) fn as_array_decl_inner_name(decl: &FuncDecl) -> Option<&str> {
+    decl.name().strip_prefix("as-array[")?.strip_suffix(']')
+}
+
+/// Resolve the func-decl parameter of an `(as-array f)` declaration the
+/// same way [`Z3_get_as_array_func_decl`] resolves it from the term:
+/// the context's authenticated declaration of `f` when one exists,
+/// else `f : index -> element` synthesized from the decl's Array
+/// range.
+pub(crate) fn as_array_decl_parameter(
+    ctx: &mut super::Z3Context,
+    decl: &FuncDecl,
+) -> Option<Z3_func_decl> {
+    let name = as_array_decl_inner_name(decl)?;
+    if let Some(authenticated) = ctx
+        .ffi_func_decls
+        .values()
+        .find(|d| d.declaration_identity_name() == name && d.arity() == 1)
+        .cloned()
+    {
+        return Some(cache_func_decl(ctx, authenticated));
+    }
+    let Sort::Array(array_sort) = decl.range() else {
+        return None;
+    };
+    Some(cache_func_decl(
+        ctx,
+        FuncDecl::new(
+            name.to_string(),
+            vec![array_sort.index_sort.clone()],
+            array_sort.element_sort.clone(),
+        ),
+    ))
+}
+
+/// Z3's `Z3_get_decl_func_decl_parameter`: parameter 0 of an
+/// `(as-array f)` declaration is `f` itself (measured libz3 5.1.0:
+/// one parameter of kind `Z3_PARAMETER_FUNC_DECL`), and a
+/// recognizer's (`is`) one parameter is the constructor it tests
+/// for; every other declaration/index is `Z3_IOB` + null.
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must be a valid context pointer; `d` null or a live declaration handle.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_get_decl_func_decl_parameter(
     c: Z3_context,
-    _d: Z3_func_decl,
-    _idx: c_uint,
+    d: Z3_func_decl,
+    idx: c_uint,
 ) -> Z3_func_decl {
-    // SAFETY: `c` guarded by `ffi_guard_ptr`.
+    // SAFETY: `c` guarded by `ffi_guard_ptr`; `d` per this function's contract.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            if !d.is_null() && idx == 0 {
+                if let Some(constructor) = super::datatypes::recognizer_constructor_decl(ctx, d) {
+                    return constructor;
+                }
+                // SAFETY: `d` null-checked; `.decl` clone is a
+                // single-threaded read of a context-owned handle.
+                let decl = (*d).decl.clone();
+                if let Some(handle) = as_array_decl_parameter(ctx, &decl) {
+                    ctx.last_error = super::Z3_OK;
+                    return handle;
+                }
+            }
             ctx.last_error = Z3_IOB;
             ptr::null_mut()
         })
     }
 }
 
-/// Z3's `Z3_get_decl_rational_parameter` — no rational decl parameters in AY.
+/// Z3's `Z3_get_decl_rational_parameter`: parameter 0 of a numeral's
+/// declaration is its value (`Int`/`Real`/bit-vector numerals, as in z3); no
+/// other AY decl has a rational parameter.
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must be a valid context pointer; `d` null or a live declaration handle.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_get_decl_rational_parameter(
     c: Z3_context,
-    _d: Z3_func_decl,
-    _idx: c_uint,
+    d: Z3_func_decl,
+    idx: c_uint,
 ) -> Z3_string {
-    // SAFETY: `c` guarded by `ffi_guard_const_ptr`.
+    // SAFETY: `c` guarded by `ffi_guard_const_ptr`; `d` per this function's contract.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            if let Some(handle) = d.as_ref() {
+                if idx == 0 {
+                    if let Some(value) =
+                        super::accessors::numeral_decl_rational_parameter(ctx, handle)
+                    {
+                        return cache_string(ctx, value);
+                    }
+                }
+                if let Some(super::accessors::BoundedValueParam::Rational(value)) =
+                    super::accessors::bounded_value_decl_parameters(ctx, handle)
+                        .and_then(|params| params.get(idx as usize).cloned())
+                {
+                    return cache_string(ctx, value);
+                }
+            }
             ctx.last_error = Z3_IOB;
             ptr::null()
         })
@@ -574,6 +710,13 @@ pub unsafe extern "C" fn Z3_get_decl_sort_parameter(
                 if let Some(sort) = finite_set_empty_decl_parameter(ctx, &(*d).decl) {
                     return alloc_sort(ctx, sort);
                 }
+            }
+            if let Some(super::accessors::BoundedValueParam::Sort(sort)) = d
+                .as_ref()
+                .and_then(|handle| super::accessors::bounded_value_decl_parameters(ctx, handle))
+                .and_then(|params| params.get(idx as usize).cloned())
+            {
+                return alloc_sort(ctx, sort);
             }
             ctx.last_error = Z3_IOB;
             ptr::null_mut()
@@ -906,7 +1049,7 @@ pub unsafe extern "C" fn Z3_get_pattern(c: Z3_context, p: Z3_pattern, idx: c_uin
     // SAFETY: `c` guarded by `ffi_guard_ast`.
     unsafe {
         ffi_guard_ast(c, |ctx| match term {
-            Some(t) => term_to_ast(ctx, t),
+            Some(t) => engine_ast(ctx, t),
             None => {
                 ctx.last_error = Z3_IOB;
                 0
@@ -943,19 +1086,28 @@ pub unsafe extern "C" fn Z3_get_quantifier_id(c: Z3_context, a: Z3_ast) -> Z3_sy
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 a,
                 "Z3_get_quantifier_id",
                 "quantifier",
                 ptr::null_mut()
-            );
+            )
+            .term;
             let symbol = ctx
                 .quantifier_ffi_metadata
                 .get(&term)
                 .and_then(|metadata| metadata.quantifier_id.clone());
             match symbol {
                 Some(symbol) => super::cache_symbol_key(ctx, symbol),
+                // A quantifier without the id has z3's null symbol.
+                None if matches!(
+                    ctx.solver.term_kind(term),
+                    TermKind::Forall | TermKind::Exists
+                ) =>
+                {
+                    ptr::null_mut()
+                }
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ptr::null_mut()
@@ -986,19 +1138,28 @@ pub unsafe extern "C" fn Z3_get_quantifier_skolem_id(c: Z3_context, a: Z3_ast) -
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let term = require_term_ast_or_return!(
+            let term = require_ast_or_return!(
                 ctx,
                 a,
                 "Z3_get_quantifier_skolem_id",
                 "quantifier",
                 ptr::null_mut()
-            );
+            )
+            .term;
             let symbol = ctx
                 .quantifier_ffi_metadata
                 .get(&term)
                 .and_then(|metadata| metadata.skolem_id.clone());
             match symbol {
                 Some(symbol) => super::cache_symbol_key(ctx, symbol),
+                // A quantifier without the id has z3's null symbol.
+                None if matches!(
+                    ctx.solver.term_kind(term),
+                    TermKind::Forall | TermKind::Exists
+                ) =>
+                {
+                    ptr::null_mut()
+                }
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ptr::null_mut()
@@ -1008,12 +1169,29 @@ pub unsafe extern "C" fn Z3_get_quantifier_skolem_id(c: Z3_context, a: Z3_ast) -
     }
 }
 
-/// Z3's `Z3_is_lambda`. AY has no lambda term — always false.
+/// Z3's `Z3_is_lambda`: whether `a` is a lambda (AY's `lambda-array`, which
+/// `Z3_mk_lambda` / `Z3_mk_lambda_const` build). z3py reads a `Lambda`'s sort
+/// through this predicate: answering false made every lambda a `Bool` term
+/// there (`Store(Lambda([x], x), 2, 1)` raised).
+///
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_is_lambda(_c: Z3_context, _a: Z3_ast) -> bool {
-    false
+pub unsafe extern "C" fn Z3_is_lambda(c: Z3_context, a: Z3_ast) -> bool {
+    if a == 0 {
+        return false;
+    }
+    // SAFETY: `c` guarded by `ffi_guard_int`, which handles null and catches
+    // panics.
+    unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let term = require_ast_or_return!(ctx, a, "Z3_is_lambda", "term", 0).term;
+            i32::from(matches!(
+                ctx.solver.term_kind(term),
+                TermKind::App { name, num_args: 2 } if name == "lambda-array"
+            ))
+        }) != 0
+    }
 }
 
 // ============================================================================
@@ -1195,8 +1373,10 @@ pub unsafe extern "C" fn Z3_get_tuple_sort_field_decl(
 // String-literal accessors (long form)
 // ============================================================================
 
-/// Unescaped contents of a string literal plus its byte length (Z3's
-/// `Z3_get_lstring`).
+/// Contents of a string literal plus its byte length (Z3's `Z3_get_lstring`):
+/// characters `1..256` as one (Latin-1) byte each, character 0, characters
+/// `>= 256` and a backslash before `u` escaped as `\u{hex}`
+/// (`super::zstring::encode_lstring`). z3py decodes the bytes as Latin-1.
 ///
 /// For a non-literal, libz3 4.15.4 returns a non-null EMPTY string, sets
 /// `Z3_INVALID_ARG` and leaves `*length` untouched — the error code, not the
@@ -1219,7 +1399,7 @@ pub unsafe extern "C" fn Z3_get_lstring(
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
             let t =
-                require_term_ast_or_return!(ctx, s, "Z3_get_lstring", "string term", ptr::null());
+                require_ast_or_return!(ctx, s, "Z3_get_lstring", "string term", ptr::null()).term;
             let text = if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String)
             {
                 ctx.solver.numeral_string(t)
@@ -1228,10 +1408,11 @@ pub unsafe extern "C" fn Z3_get_lstring(
             };
             match text {
                 Some(text) => {
+                    let bytes = super::zstring::encode_lstring(&text);
                     if !length.is_null() {
-                        *length = text.len() as c_uint;
+                        *length = bytes.len() as c_uint;
                     }
-                    cache_string(ctx, text)
+                    super::cache_bytes(ctx, bytes)
                 }
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -1243,7 +1424,8 @@ pub unsafe extern "C" fn Z3_get_lstring(
 }
 
 /// Code points of a string literal, written into `contents[0..min(length, len)]`
-/// (Z3's `Z3_get_string_contents`). No-op for a non-literal or null buffer.
+/// (Z3's `Z3_get_string_contents`). `Z3_INVALID_ARG` for a non-literal; no-op
+/// for a null buffer.
 ///
 /// # Safety
 /// `c` valid; `contents`, when non-null, must be writable for `length` `unsigned`s.
@@ -1260,12 +1442,14 @@ pub unsafe extern "C" fn Z3_get_string_contents(
     // SAFETY: `c` guarded; `contents` valid for `length` writes by contract.
     unsafe {
         ffi_guard_void(c, |ctx| {
-            let t = require_term_ast_or_return!(ctx, s, "Z3_get_string_contents", "string term");
-            if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String) {
-                if let Some(text) = ctx.solver.numeral_string(t) {
-                    for (i, ch) in text.chars().take(length as usize).enumerate() {
-                        *contents.add(i) = ch as c_uint;
-                    }
+            let t = require_ast_or_return!(ctx, s, "Z3_get_string_contents", "string term").term;
+            if let Some(text) =
+                super::sets_regex::string_literal_text(ctx, t, "Z3_get_string_contents")
+            {
+                // Code points, a surrogate read back from its carrier
+                // `char` (`ay_core::smtlib_char`).
+                for (i, ch) in text.chars().take(length as usize).enumerate() {
+                    *contents.add(i) = ay_core::smtlib_code_point(ch);
                 }
             }
         })

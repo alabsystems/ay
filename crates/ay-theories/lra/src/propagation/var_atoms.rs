@@ -30,14 +30,22 @@ impl LraSolver {
         // #8352: Lazy JIT compilation on first propagation call.
         // Compiles per-variable atom bound checks using i64/i128 cross-multiply
         // and native machine code (aarch64/x86_64) when possible.
-        if !self.theory_prop_jit_compiled {
+        // Amortized: registrations invalidate the JIT, but the recompile is
+        // deferred until atom growth crosses the due threshold; meanwhile the
+        // interpreted path below serves (stale tables are never read, since
+        // the fast path is gated on `theory_prop_jit_compiled`).
+        if !self.theory_prop_jit_compiled && self.jit_recompile_due() {
             self.compile_theory_propagation_jit();
+        }
+        if !self.theory_prop_jit_compiled {
+            // Serving this call interpreted; count it against the stale cap.
+            self.jit_stale_propagate_calls = self.jit_stale_propagate_calls.saturating_add(1);
         }
 
         // #8352: Try JIT fast path (native machine code or interpreted i128).
         // If all atoms for this variable are handled by the JIT, skip the
         // BigRational fallback path entirely.
-        if self.try_jit_propagate_var_atoms(var) {
+        if self.theory_prop_jit_compiled && self.try_jit_propagate_var_atoms(var) {
             return;
         }
 

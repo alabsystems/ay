@@ -80,6 +80,7 @@ fn every_name_the_checker_rejects_becomes_hole() {
         "trust",
         "dt_project",
         "dt_enum_pigeonhole",
+        "divmod_def",
         "all_simplify",
         "arith_simplify",
         "array_ext_diff_intro",
@@ -262,6 +263,10 @@ fn wire_rendering_preserves_internal_identity_and_exposes_holes() {
     assert_eq!(AletheRule::QntNegExists.name(), "qnt_neg_exists");
     assert_eq!(AletheRule::QntNegExists.wire_name(), "hole");
 
+    // The binder join IS a pinned external rule, under its own name.
+    assert_eq!(AletheRule::QntJoin.name(), "qnt_join");
+    assert_eq!(AletheRule::QntJoin.wire_name(), "qnt_join");
+
     // The native theory-lemma bridge is independently strict-checked too; the
     // external calculus likewise has no exact rule for this implication.
     assert_eq!(
@@ -335,7 +340,13 @@ fn wire_rendering_preserves_internal_identity_and_exposes_holes() {
 /// failure rather than a silent regression.
 #[test]
 fn the_pinned_checker_implements_no_datatype_rules() {
-    for name in ["dt_clash", "dt_distinct", "dt_split", "dt_cons_eq"] {
+    for name in [
+        "dt_clash",
+        "dt_distinct",
+        "dt_split",
+        "dt_cons_eq",
+        "dt_project",
+    ] {
         assert!(
             !is_checkable_alethe_rule(name),
             "`{name}` is a datatype rule; the pinned carcara implements none of \
@@ -343,4 +354,70 @@ fn the_pinned_checker_implements_no_datatype_rules() {
              `invalid` document"
         );
     }
+}
+
+/// `dt_project` is Clean's rule, not the pinned checker's: it lives in its own
+/// table, never in the pinned one, and never passes through the wire map.
+/// Putting it in [`CHECKABLE_ALETHE_RULES`] would let any document name it,
+/// and pinned Carcara answers `unknown rule` for it, which voids the whole
+/// document (the reverted `dt_clash` alias's failure).
+#[test]
+fn clean_only_rules_stay_out_of_the_pinned_table_and_the_wire_map() {
+    let mut sorted = CLEAN_DIALECT_ALETHE_RULES;
+    sorted.sort_unstable();
+    assert_eq!(CLEAN_DIALECT_ALETHE_RULES, sorted, "table must stay sorted");
+    assert!(CLEAN_DIALECT_ALETHE_RULES.contains(&"dt_project"));
+    for name in CLEAN_DIALECT_ALETHE_RULES {
+        assert!(is_clean_dialect_alethe_rule(name), "{name}");
+        assert!(
+            !is_checkable_alethe_rule(name),
+            "`{name}` is Clean-only; the pinned table must not list it"
+        );
+        assert_eq!(
+            wire_rule_name(name),
+            UNPROVED_STEP_RULE,
+            "`{name}` must never reach a document through the wire map"
+        );
+    }
+    for name in ["hole", "resolution", "dt_clash", "dt_distinct", "trust"] {
+        assert!(!is_clean_dialect_alethe_rule(name), "{name}");
+    }
+}
+#[test]
+fn bv_eq_simplify_keeps_the_native_extension_out_of_generic_portable_emission() {
+    // Vocabulary support does not imply that the pinned checker implements
+    // every fragment of a same-named native rule. Only the dedicated Clean
+    // lowering may claim the modular offset cases.
+    assert!(super::is_checkable_alethe_rule("eq_simplify"));
+    assert_eq!(super::AletheRule::EqSimplify.name(), "eq_simplify");
+    assert_eq!(
+        super::AletheRule::EqSimplify.wire_name(),
+        super::UNPROVED_STEP_RULE
+    );
+}
+
+#[test]
+fn bv_offset_spines_keeps_its_versioned_rule_out_of_portable_emission() {
+    assert_eq!(
+        super::AletheRule::BvOffsetSpinesV1.name(),
+        "eq_simplify_bv_offset_spines"
+    );
+    assert_eq!(
+        super::AletheRule::BvOffsetSpinesV1.wire_name(),
+        super::UNPROVED_STEP_RULE
+    );
+    assert!(super::is_clean_dialect_alethe_rule(
+        "eq_simplify_bv_offset_spines"
+    ));
+    assert!(!super::is_checkable_alethe_rule(
+        "eq_simplify_bv_offset_spines"
+    ));
+}
+
+#[test]
+fn bv_reconstruct_keeps_its_versioned_rule_out_of_portable_emission() {
+    assert_eq!(AletheRule::BvReconstructV1.name(), "bv_reconstruct_v1");
+    assert_eq!(AletheRule::BvReconstructV1.wire_name(), UNPROVED_STEP_RULE);
+    assert!(is_clean_dialect_alethe_rule("bv_reconstruct_v1"));
+    assert!(!is_checkable_alethe_rule("bv_reconstruct_v1"));
 }

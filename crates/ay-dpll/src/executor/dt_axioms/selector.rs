@@ -1123,17 +1123,73 @@ impl Executor {
             let Some(selectors) = self.selector_signature_in(dt_name, &ctors[0]) else {
                 return;
             };
+            // (#dt-value-eq-fold-ite) FOLD each projection through an `ite`
+            // chain or a constructor head instead of applying the selector
+            // raw.
+            //
+            // The early return above skips a pair where either side IS a
+            // constructor application, but an `ite` BETWEEN two constructors
+            // is neither, so it reaches here and `(sel_k (ite g C1 C2))` is
+            // built opaque. Nothing then relates that term to `C1`/`C2`'s
+            // fields, the SAT core is free to pick any value for it, and the
+            // biconditional this function emits is FALSIFIED by the model the
+            // solver itself produced -- which the strict `ite_uf_definition`
+            // oracle then catches, correctly, by degrading a decidable query
+            // to `unknown`. Measured on a nested-`Vec` replay obligation:
+            // `(fld_ptr (ite (= idx i) (mkInner 0 ..) (mkInner 0 ..)))`
+            // evaluated to `0xffffffffffffffff` while both branches carry `0`.
+            //
+            // `dt_fold_selector_with_work` distributes the projection over the
+            // `ite` and reads the field off a constructor head, which is the
+            // selector's defining equation in both cases -- semantically the
+            // SAME term, so the emitted biconditional is unchanged in meaning.
+            // It shares this call's axiom budget and falls back to the raw
+            // application whenever it declines, so an unfoldable shape emits
+            // byte-identically to before.
+            let mut fold_work = 0usize;
             for (sel_name, sel_sort) in &selectors {
-                let fi = self.ctx.terms.mk_app(
-                    Symbol::named(sel_name.clone()),
-                    vec![x],
-                    sel_sort.clone(),
-                );
-                let fj = self.ctx.terms.mk_app(
-                    Symbol::named(sel_name.clone()),
-                    vec![y],
-                    sel_sort.clone(),
-                );
+                // FRESH memo per selector. `dt_fold_selector_with_work` keys
+                // its memo by `(term, depth)` ONLY, so one map shared across
+                // selectors makes the second selector read back the FIRST
+                // one's folded field -- `len(x)` returning `ptr(x)`. The
+                // sibling `emit_dt_read_field_congruence` scopes it the same
+                // way; only the WORK budget is shared, because that is a cost
+                // ceiling rather than a cache.
+                let mut fold_memo: HashMap<(TermId, usize), TermId> = HashMap::default();
+                let fi = self
+                    .dt_fold_selector_with_work(
+                        sel_name,
+                        sel_sort,
+                        dt_name,
+                        x,
+                        0,
+                        &mut fold_memo,
+                        &mut fold_work,
+                    )
+                    .unwrap_or_else(|| {
+                        self.ctx.terms.mk_app(
+                            Symbol::named(sel_name.clone()),
+                            vec![x],
+                            sel_sort.clone(),
+                        )
+                    });
+                let fj = self
+                    .dt_fold_selector_with_work(
+                        sel_name,
+                        sel_sort,
+                        dt_name,
+                        y,
+                        0,
+                        &mut fold_memo,
+                        &mut fold_work,
+                    )
+                    .unwrap_or_else(|| {
+                        self.ctx.terms.mk_app(
+                            Symbol::named(sel_name.clone()),
+                            vec![y],
+                            sel_sort.clone(),
+                        )
+                    });
                 if let Some(nested_dt) = dt_sort_name(sel_sort, datatype_ctors) {
                     nested.push((fi, fj, nested_dt));
                 }
@@ -1760,22 +1816,28 @@ impl Executor {
         // nested / large-index false SATs.
         //
         // Fix (the sound essence of z3's lazy array reasoning): for each index
-        // sort carrying a datatype-element array equality, mint ONE fresh SYMBOLIC
-        // witness index and add it to the observed set. Extensionality is then
-        // instantiated at the witness, and the const-array / store folds
-        // (dt_fold_select) reduce `(select X w)` to the fill / stored value — so
-        // the clash surfaces symbolically, WITHOUT enumerating the domain. The
-        // witness is SHARED across all equalities of its index sort so the
-        // transitive chain closes: `select X w = fill1`, `select Y w = fill2`,
-        // `(= X Y) => select X w = select Y w` together force `fill1 = fill2`.
+        // sort carrying a datatype-element array equality, add ONE SYMBOLIC
+        // witness index to the observed set: one per public query, which every
+        // later round and retry reuses (`ext_read_witness.rs`; a fresh one per
+        // call kept the deepening loop's repeat exit from ever firing).
+        // Extensionality is then instantiated at the witness, and the
+        // const-array / store folds (dt_fold_select) reduce `(select X w)` to
+        // the fill / stored value — so the clash surfaces symbolically, WITHOUT
+        // enumerating the domain. The witness is SHARED across all equalities of
+        // its index sort so the transitive chain closes: `select X w = fill1`,
+        // `select Y w = fill2`, `(= X Y) => select X w = select Y w` together
+        // force `fill1 = fill2`.
         //
         // SOUND: instantiating the extensionality universal `forall k. X=Y =>
-        // X[k]=Y[k]` at the fresh ground term `w` is a valid consequence in every
-        // model, and a fresh variable adds no constraint of its own — so this can
-        // only prune spurious models, never cause a false-UNSAT. (Disequalities
-        // need a DISTINCT witness each and are handled separately below.)
+        // X[k]=Y[k]` at the ground term `w` is a valid consequence in every
+        // model, whatever else mentions `w`, and `w` has no constraint of its
+        // own — so this can only prune spurious models, never cause a
+        // false-UNSAT. (Disequalities need a DISTINCT fresh witness each and are
+        // handled separately below.)
         for (idx_key, index_sort) in idx_sort_by_key {
-            let witness = self.ctx.terms.mk_fresh_var("dt_ext_witness", index_sort);
+            let witness = self
+                .array_ext_witness_cache
+                .shared_read_witness(&mut self.ctx.terms, index_sort);
             if seen_index.insert((idx_key.clone(), witness)) {
                 indices_by_sort.entry(idx_key).or_default().push(witness);
             }
@@ -1981,6 +2043,190 @@ impl Executor {
                 return axioms;
             }
             debug_assert!(axioms.len() <= MAX_READ_CONGRUENCE_AXIOMS);
+        }
+        axioms
+    }
+
+    /// Read-over-write (McCarthy) FIELD congruence for datatype-valued array
+    /// selects taken over a `store` / array-`ite` chain
+    /// (#dt-array-select-over-store).
+    ///
+    /// Every sibling pass above groups datatype-valued selects BY THEIR
+    /// SYNTACTIC BASE ARRAY, so each relates `(select a i)` to `(select a j)`
+    /// but none relates `(select (store a i v) j)` to `v` / `(select a j)` —
+    /// the bases differ. The eager array lane cannot close that gap either: a
+    /// datatype-valued select has no bit representation, so its functional-
+    /// consistency consequent is a no-op there, and the ordinary ROW rewrite
+    /// leaves the symbolic-index case alone because the McCarthy `ite` would
+    /// range over datatype VALUES. The result is a datatype value whose every
+    /// field is FREE — measured on a nested-`Vec` frame obligation, where
+    /// `(fld_len (select (store d row (mkInner ..)) r))` was unconstrained,
+    /// the SAT core picked the printer default, and the strict
+    /// `datatype-field` oracle (fail-closed) degraded a genuinely UNSAT
+    /// obligation to `unknown`.
+    ///
+    /// For every reachable datatype-valued select whose array operand folds
+    /// (`dt_fold_select`: ROW1, ROW2, the general McCarthy expansion,
+    /// select-through-array-ITE, const-array), emit the UNGUARDED folded
+    /// field/tester congruence between the raw select and its fold:
+    ///   `(= (sel_k (select (store a i v) j))
+    ///       (ite (= j i) (sel_k v) (sel_k (select a j))))`
+    /// Those consequents are scalar / scalar-element-array sorted, so they ARE
+    /// bit-blasted and the eager lane finishes the case split itself.
+    ///
+    /// SOUNDNESS: `dt_fold_select` applies only valid array identities, so the
+    /// folded term is semantically EQUAL to the raw select in EVERY model, and
+    /// selector/tester congruence over an equality is a theory tautology.
+    /// Every emitted assertion is therefore entailed by the problem: it can
+    /// only SHRINK the model space, never cause a false-`unsat`. No fresh
+    /// symbol is introduced, so the model space is not widened either.
+    pub(in crate::executor) fn dt_array_select_over_store_field_axioms(
+        &mut self,
+        base_assertions: &HashSet<TermId>,
+    ) -> Vec<TermId> {
+        /// Cap on emitted implications (mirrors the sibling read-congruence pass).
+        const MAX_SELECT_OVER_STORE_AXIOMS: usize = 50_000;
+        /// Recursion bound for datatype-valued fields (mirrors the sibling passes).
+        const MAX_SELECT_OVER_STORE_DT_DEPTH: usize = 3;
+
+        let base_term_len = self.ctx.terms.len();
+        if base_term_len == 0 {
+            return Vec::new();
+        }
+        let datatype_ctors: HashMap<String, Vec<String>> = self
+            .ctx
+            .datatype_iter()
+            .map(|(name, ctors)| (name.to_string(), ctors.to_vec()))
+            .collect();
+        if datatype_ctors.is_empty() {
+            return Vec::new();
+        }
+
+        // Reachable terms from the asserted set (#5082 discipline) — identical
+        // walk to the sibling passes; NOT into quantifier bodies (capture).
+        let reachable: HashSet<TermId> = {
+            let mut visited = HashSet::default();
+            let mut stack: Vec<TermId> = base_assertions.iter().copied().collect();
+            while let Some(t) = stack.pop() {
+                if !visited.insert(t) {
+                    continue;
+                }
+                match self.ctx.terms.get(t) {
+                    TermData::App(_, args) => stack.extend(args.iter().copied()),
+                    TermData::Not(inner) => stack.push(*inner),
+                    TermData::Ite(c, th, el) => {
+                        stack.push(*c);
+                        stack.push(*th);
+                        stack.push(*el);
+                    }
+                    TermData::Let(bindings, body) => {
+                        stack.push(*body);
+                        for (_, v) in bindings {
+                            stack.push(*v);
+                        }
+                    }
+                    TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {}
+                    _ => {}
+                }
+            }
+            visited
+        };
+
+        // Pass 1 (TermId order -> deterministic): the datatype-valued selects
+        // whose array operand can fold, and every index observed on a
+        // datatype-element array (the recursion into a datatype-ELEMENT array
+        // field reads those).
+        let mut foldable_selects: Vec<(TermId, TermId, TermId, Sort, String)> = Vec::new();
+        let mut indices_by_sort: HashMap<String, Vec<TermId>> = HashMap::default();
+        let mut seen_index: HashSet<(String, TermId)> = HashSet::default();
+        for idx in 0..base_term_len {
+            let term = TermId::new(idx as u32);
+            if !reachable.contains(&term) {
+                continue;
+            }
+            let parts: Option<(bool, TermId, TermId)> = match self.ctx.terms.get(term) {
+                TermData::App(Symbol::Named(name), args) if name == "select" && args.len() == 2 => {
+                    Some((true, args[0], args[1]))
+                }
+                TermData::App(Symbol::Named(name), args) if name == "store" && args.len() == 3 => {
+                    Some((false, args[0], args[1]))
+                }
+                _ => None,
+            };
+            let Some((is_select, array, index)) = parts else {
+                continue;
+            };
+            let elem_sort = match self.ctx.terms.sort(array) {
+                Sort::Array(a) => a.element_sort.clone(),
+                _ => continue,
+            };
+            let Some(dt_name) = dt_sort_name(&elem_sort, &datatype_ctors) else {
+                continue;
+            };
+            let idx_key = format!("{}", self.ctx.terms.sort(index));
+            if seen_index.insert((idx_key.clone(), index)) {
+                indices_by_sort.entry(idx_key).or_default().push(index);
+            }
+            if !is_select {
+                continue;
+            }
+            // Only a store / array-ite / const-array base has anything to
+            // fold; a plain array operand folds to the select itself.
+            let foldable = match self.ctx.terms.get(array) {
+                TermData::Ite(..) => true,
+                TermData::App(Symbol::Named(n), a) => {
+                    (n == "store" && a.len() == 3) || (n == "const-array" && a.len() == 1)
+                }
+                _ => false,
+            };
+            if foldable {
+                foldable_selects.push((term, array, index, elem_sort, dt_name));
+            }
+        }
+        if foldable_selects.is_empty() {
+            return Vec::new();
+        }
+
+        // Pass 2: `(= sel_k(raw) sel_k(fold))` for every selector, recursing
+        // (bounded) into datatype-valued and datatype-element-array fields.
+        let mut axioms: Vec<TermId> = Vec::new();
+        let mut select_fold_work = 0usize;
+        let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
+        // `mk_implies(true, X)` returns `X`: the two terms are EQUAL, not
+        // conditionally equal, so the shared emitter runs with a vacuous guard.
+        let unguarded = self.ctx.terms.true_term();
+        for (select_term, array, index, elem_sort, dt_name) in foldable_selects {
+            if axioms.len() >= MAX_SELECT_OVER_STORE_AXIOMS {
+                break;
+            }
+            let Some(folded) =
+                self.dt_fold_select_with_work(array, index, &elem_sort, 0, &mut select_fold_work)
+            else {
+                return axioms;
+            };
+            if folded == select_term {
+                continue;
+            }
+            if !self.emit_dt_read_field_congruence(
+                unguarded,
+                select_term,
+                folded,
+                &dt_name,
+                &datatype_ctors,
+                &indices_by_sort,
+                0,
+                MAX_SELECT_OVER_STORE_DT_DEPTH,
+                MAX_SELECT_OVER_STORE_AXIOMS,
+                &mut select_fold_work,
+                &mut axioms,
+                &mut seen_pairs,
+            ) {
+                return axioms;
+            }
+            debug_assert!(axioms.len() <= MAX_SELECT_OVER_STORE_AXIOMS);
+        }
+        if ay_core::misc_cli_flags().phase_trace && !axioms.is_empty() {
+            eprintln!("c phase-trace dt-select-over-store axioms={}", axioms.len());
         }
         axioms
     }
@@ -2828,6 +3074,25 @@ impl Executor {
         }
     }
 
+    /// Every term reachable from the current `check-sat-assuming` literals
+    /// (`last_assumptions`), quantifier bodies excluded. Empty outside one.
+    fn dt_terms_reachable_from_assumptions(&self) -> HashSet<TermId> {
+        let mut visited = HashSet::default();
+        let mut stack: Vec<TermId> = self.last_assumptions.clone().unwrap_or_default();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t) {
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, th, el) => stack.extend([*c, *th, *el]),
+                _ => {}
+            }
+        }
+        visited
+    }
+
     /// Generate DT selector, tester, exhaustiveness, constructor, and equality axioms.
     ///
     /// This is the central DT axiom generator for combined DT+theory solver paths
@@ -2907,8 +3172,26 @@ impl Executor {
         // where sel_app = sel(arg).
         let mut selector_apps: HashMap<String, Vec<(TermId, TermId)>> = HashMap::default();
 
+        // Session history the query cannot reach is not instantiated
+        // (#dt-live-scan, `live_terms.rs`).
+        let live = self.dt_live_term_mask(base_term_len, base_assertions.iter().copied());
+        // #dt-frontier-tester-diet gate (see `frontier_dt_terms`): only on
+        // BV bit-blast routes that armed it, and only when no live term is
+        // quantified — quantified rounds consume frontier terms (and their
+        // tester atoms) as instantiation/demand seeds across rounds.
+        let frontier_diet = self.dt_frontier_tester_diet_armed
+            && !(0..base_term_len).any(|idx| {
+                live[idx]
+                    && matches!(
+                        self.ctx.terms.get(TermId::new(idx as u32)),
+                        TermData::Forall(..) | TermData::Exists(..)
+                    )
+            });
         for idx in 0..base_term_len {
             debug_assert!(u32::try_from(idx).is_ok(), "term id overflow");
+            if !live[idx] {
+                continue;
+            }
             let term = TermId::new(idx as u32);
 
             match self.ctx.terms.get(term) {
@@ -3535,6 +3818,18 @@ impl Executor {
 
         // Track all DT-sorted terms that have received axioms to avoid duplicates.
         let mut axiomatized_dt_terms: HashSet<TermId> = dt_vars.iter().map(|(t, _)| *t).collect();
+        // Terms created by the LAST (C) level (the unroll frontier): they
+        // receive no (C) axiom in this call, so on a quantifier-free
+        // bit-blast route their tester atoms occur only in their own
+        // (D)/(G) clauses — no authored assertion (the terms did not
+        // exist) and no other generated family references
+        // `is-C(frontier)`. Where `frontier_diet` gates on, omitting
+        // frontier (D)/(G) is verdict-equivalent for this round (any
+        // assignment extends by choosing one tester) and removes the
+        // dominant axiom family on high-fan-out datatypes
+        // (#dt-frontier-tester-diet: on Certora 39657_47 the lane floor's
+        // (G) family was 3,048 of 5,400 axioms, almost all frontier).
+        let mut frontier_dt_terms: HashSet<TermId> = HashSet::default();
 
         // All constructor terms from axiom (C) across all depths, for (B') generation.
         let mut all_axiom_c_ctor_terms: Vec<(TermId, String, String)> = Vec::new();
@@ -3542,7 +3837,7 @@ impl Executor {
         // Current depth level's DT variables to process.
         let mut current_level_vars: Vec<(TermId, String)> = dt_vars;
 
-        for _depth in 0..max_recursive_depth {
+        for depth in 0..max_recursive_depth {
             if current_level_vars.is_empty() {
                 break;
             }
@@ -3662,8 +3957,19 @@ impl Executor {
                 }
             }
 
+            // The latest next level is the frontier candidate; on the last
+            // unroll level its terms receive no (C), so their (D) is omitted
+            // (#dt-frontier-tester-diet, see `frontier_dt_terms`).
+            frontier_dt_terms = next_level_vars.iter().map(|(t, _)| *t).collect();
+            let is_last_level = depth + 1 == max_recursive_depth;
+
             // Generate exhaustiveness axioms (D) for next level's DT-sorted terms.
-            for (var_term, dt_name) in &next_level_vars {
+            let d_vars: &[(TermId, String)] = if is_last_level && frontier_diet {
+                &[]
+            } else {
+                &next_level_vars
+            };
+            for (var_term, dt_name) in d_vars {
                 let Some(dt_ctors) = datatype_ctors.get(dt_name) else {
                     continue;
                 };
@@ -3956,9 +4262,42 @@ impl Executor {
         // distinctness / wrong-control refutations are untouched (they remain
         // SAT/refuted). With the atom pinned to BV/Bool-decidable selector/tester
         // facts, the family is decided without any DT-sorted EUF transitivity.
+        //
+        // Which atoms: the store stands in for what the session's lanes have
+        // seen (an incremental session's lanes still hold an earlier check's
+        // atoms, a popped scope's included; the r2 incremental corpus loses
+        // verdicts when they go unbridged) — but only atoms of the current
+        // epoch, and only while the store mirrors the lanes
+        // ([`Self::store_mirrors_session_lanes`]). Otherwise a stale atom no
+        // lane encoded — the scratch of a check whose lanes were dropped (the
+        // LNH-carrying check, whose substitution `x0 := c0` minted
+        // `(= (e c0) E0)`), or of an epoch before `reset-assertions` — was
+        // bridged and pulled `(e c0)` into a later check through its tester
+        // while the exhaustiveness axioms (D), which are reachability-scoped,
+        // never covered it: a fifth value of a four-constructor enum, and the
+        // cardinality gate degraded a satisfiable check to `unknown`
+        // (2026-10-09 verify lv1/lv1c/lv4; with the pass off, an authored pin
+        // followed by `reset-assertions`). Then the bridge reads only atoms
+        // the problem reaches: the assertions, or the `check-sat-assuming`
+        // literals a route keeps out of them — what a fresh session reads.
         {
+            let store_mirrors_lanes = self.store_mirrors_session_lanes();
+            let assumption_atoms = if store_mirrors_lanes {
+                HashSet::default()
+            } else {
+                self.dt_terms_reachable_from_assumptions()
+            };
             for idx in 0..base_term_len {
+                if !live[idx] {
+                    continue;
+                }
                 let term = TermId::new(idx as u32);
+                let live = reachable_terms.contains(&term)
+                    || assumption_atoms.contains(&term)
+                    || (store_mirrors_lanes && idx >= self.assertion_epoch_terms_len);
+                if !live {
+                    continue;
+                }
                 let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(term) else {
                     continue;
                 };
@@ -3990,8 +4329,9 @@ impl Executor {
                     (None, Some((cn, ca))) => (lhs, cn, ca),
                     (None, None) => continue,
                 };
-                // The variable side must be datatype-sorted.
-                let Some(dt_name) = self.dt_name_of(dt_term) else {
+                // The variable side must be datatype-sorted, at the sort of
+                // the constructor side.
+                let Some(dt_name) = self.dt_name_of_equality_side(term, dt_term) else {
                     continue;
                 };
                 let tester_name = format!("is-{ctor_name}");
@@ -4061,6 +4401,10 @@ impl Executor {
         // conflict between immutable sort() lookups and mutable mk_* calls).
         let exclusion_vars: Vec<(TermId, String)> = axiomatized_dt_terms
             .iter()
+            // Frontier terms receive no (C) this call; their tester atoms
+            // occur only here and in their (D) (both omitted,
+            // #dt-frontier-tester-diet).
+            .filter(|t| !(frontier_diet && frontier_dt_terms.contains(*t)))
             .filter_map(|t| {
                 let sort = self.ctx.terms.sort(*t);
                 match sort {

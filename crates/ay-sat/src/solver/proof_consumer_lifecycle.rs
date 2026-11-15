@@ -22,11 +22,12 @@ impl Solver {
         let (valid, message) = match requirement {
             ProofLifecycleRequirement::NoClauseAuthorityForInternalLrat => (
                 self.has_no_prior_clause_authority()
+                    && !self.consuming_trace_pending()
                     && self.cold.proof_bookkeeping_budget.is_none(),
                 "BUG: enable_lrat() must be called before adding any clauses and without a proof bookkeeping budget",
             ),
             ProofLifecycleRequirement::NoClauseAuthorityForClauseTrace => (
-                self.has_no_prior_clause_authority(),
+                self.has_no_prior_clause_authority() && !self.consuming_trace_pending(),
                 "BUG: enable_clause_trace() must be called before adding any clauses",
             ),
             ProofLifecycleRequirement::NoRetainedProofStateForIc3 => (
@@ -143,6 +144,9 @@ impl Solver {
     /// Other proof consumers remain active; otherwise the solver transitions
     /// conservatively to no-proof state.
     pub fn take_clause_trace(&mut self) -> Option<ClauseTrace> {
+        if self.consuming_trace_pending() {
+            return None;
+        }
         let solver_num_vars = self.total_num_vars();
         let scope_assumptions = self.active_scope_assumptions();
         if let Some(t) = self.cold.clause_trace.as_mut() {

@@ -10,7 +10,7 @@
 fn list_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Lst".to_string(),
-        constructors: Arc::new(vec![
+        constructors: crate::ChcDtConstructors::new(vec![
             ChcDtConstructor {
                 name: "nil".to_string(),
                 selectors: vec![],

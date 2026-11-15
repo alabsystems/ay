@@ -15,6 +15,33 @@
 // The companion shape — a theory UNSAT with no explanation at all — records
 // nothing and must never mint.
 
+/// Enter the theory producer directly. The ordinary public route may first
+/// prove congruence by a checked preprocessing lemma and never build this
+/// unregistered level-0 theory-conflict trace.
+#[cfg(test)]
+fn unregistered_level0_uf_lia_executor() -> Executor {
+    let input = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/smt/QF_UFLIA/unsat_congruence_to_lia.smt2"
+    ));
+    let mut commands = ay_frontend::parse(input).expect("parse producer fixture");
+    assert!(matches!(
+        commands.pop(),
+        Some(ay_frontend::Command::CheckSat)
+    ));
+    let mut executor = Executor::new();
+    executor
+        .execute_all(&commands)
+        .expect("install exact assertions");
+    executor.begin_public_solve(false);
+    executor.bind_unsat_query_assumptions(&[]);
+    assert!(executor
+        .solve_uf_lia()
+        .expect("theory producer solve")
+        .is_unsat());
+    executor
+}
+
 #[cfg(test)]
 fn level0_theory_conflict_executor(relative_path: &str) -> Executor {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -36,9 +63,7 @@ fn level0_theory_conflict_executor(relative_path: &str) -> Executor {
 }
 
 #[cfg(test)]
-fn level0_theory_conflict_trace_error(
-    executor: &Executor,
-) -> Option<ClauseTraceResolutionError> {
+fn level0_theory_conflict_trace_error(executor: &Executor) -> Option<ClauseTraceResolutionError> {
     let trace = executor
         .last_clause_trace
         .as_ref()
@@ -75,8 +100,7 @@ fn level0_theory_conflict_trace_error(
 /// flag. Part (b) below is the soundness half of this test.
 #[test]
 fn level0_theory_conflict_records_derivation_without_conferring_authority() {
-    let mut executor =
-        level0_theory_conflict_executor("benchmarks/smt/QF_UFLIA/unsat_congruence_to_lia.smt2");
+    let mut executor = unregistered_level0_uf_lia_executor();
 
     // (a) The trace no longer claims an UNSAT it never derived.
     let trace_error = level0_theory_conflict_trace_error(&executor);
@@ -114,38 +138,203 @@ fn level0_theory_conflict_records_derivation_without_conferring_authority() {
     );
 }
 
-/// The companion shape (`theory_callback.rs::handle_conflict_clause`, and the
-/// level-0 arm when the conflict clause is empty): the theory reported UNSAT
-/// with NO explanation whatsoever. No receipt exists and none can be built, so
-/// nothing is recorded and the trace still carries only the bare UNSAT marker.
-///
-/// `chain_10`'s recorded clause set is six unit clauses over six distinct
-/// atoms — propositionally SATISFIABLE. Nothing may EVER mint from it, and
-/// this test is the fail-closed pin on that.
-///
-/// The decline stays imprecise on purpose. Stamping
-/// `mark_proof_work_exhausted()` to make it honest was measured to abandon SAT
-/// proof reconstruction (`sat_proof_manager/mod.rs`), degenerate the SMT proof
-/// to a `TheoryLemma { Generic }`, and turn published UNSAT verdicts into
-/// `unknown`. See the comment at the producer.
+#[test]
+fn public_congruence_route_keeps_a_checked_unsat_verdict() {
+    let mut solver = crate::api::Solver::new(crate::api::Logic::All);
+    solver
+        .parse_smtlib2(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/smt/QF_UFLIA/unsat_congruence_to_lia.smt2"
+        )))
+        .expect("public fixture");
+    let details = solver.try_check_sat_with_details().expect("public solve");
+    let result = &details.result;
+    assert!(result.is_unsat(), "{details:?}");
+    assert!(result.has_unsat_emission_witness(), "{details:?}");
+    assert!(
+        result.was_unsat_strictly_verified()
+            || result.was_unsat_independently_verified()
+            || result.was_unsat_exact_semantically_verified()
+            || result.was_unsat_corroborated(),
+        "{details:?}"
+    );
+}
+
+/// Produce the unexplained boundary directly: six independent authored Bool
+/// units are satisfiable, while the actual SAT callback deliberately reports
+/// an empty theory conflict. The real producer may mark UNSAT, but it has no
+/// explanation to record and no refutation to authenticate.
+#[cfg(test)]
+fn unexplained_level0_callback_executor() -> Executor {
+    let mut executor = Executor::new();
+    let propositions: Vec<_> = (0..6)
+        .map(|index| {
+            executor
+                .ctx
+                .terms
+                .mk_var(format!("unexplained_{index}"), Sort::Bool)
+        })
+        .collect();
+    executor.ctx.assertions = propositions.clone();
+    executor.begin_public_solve(false);
+    executor.bind_unsat_query_assumptions(&[]);
+
+    let mut sat = ay_sat::Solver::new(propositions.len());
+    sat.set_preprocess_enabled(false);
+    sat.enable_clause_trace();
+    for index in 0..propositions.len() {
+        sat.add_clause(vec![Literal::positive(Variable::new(index as u32))]);
+    }
+    let original_ids_before = sat.issued_original_clause_id_max();
+    let mut callback_calls = 0;
+    let result = sat.solve_with_theory(|current| {
+        callback_calls += 1;
+        assert_eq!(current.current_decision_level(), 0);
+        for index in 0..propositions.len() {
+            assert_eq!(current.value(Variable::new(index as u32)), Some(true));
+        }
+        // The missing explanation is the test input. No trace entry, proof
+        // annotation, scope stamp or successful checked result is fabricated.
+        ay_sat::TheoryPropResult::Conflict(Vec::new())
+    });
+    assert!(
+        result.into_inner().is_unsat(),
+        "exercise the real empty-conflict producer"
+    );
+    assert_eq!(callback_calls, 1);
+    assert_eq!(
+        sat.issued_original_clause_id_max(),
+        original_ids_before,
+        "an empty explanation installs no original theory lemma"
+    );
+    let trace = sat
+        .take_clause_trace()
+        .expect("actual solver-produced trace");
+    assert_eq!(trace.solver_num_vars(), Some(propositions.len()));
+    assert!(trace
+        .scope_assumptions()
+        .is_some_and(|scope| scope.is_empty()));
+    assert!(!trace.is_truncated());
+    assert!(
+        trace.has_empty_clause(),
+        "the producer supplies only the UNSAT marker"
+    );
+    assert_eq!(trace.len(), propositions.len());
+    let mut variables = Vec::new();
+    for entry in trace.entries().iter() {
+        assert!(entry.is_original);
+        assert!(entry.resolution_hints.is_empty());
+        assert_eq!(
+            entry.clause.len(),
+            1,
+            "no explanation or derived empty is recorded"
+        );
+        let literal = entry.clause[0];
+        assert!(
+            literal.is_positive(),
+            "all-true satisfies the entire recorded clause set"
+        );
+        variables.push(literal.variable().index());
+    }
+    variables.sort_unstable();
+    assert_eq!(variables, (0..propositions.len()).collect::<Vec<_>>());
+
+    executor.last_clause_trace = Some(trace);
+    executor.last_var_to_term = Some(
+        propositions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, term)| (index as u32, term))
+            .collect(),
+    );
+    assert!(executor.checked_sat_refutation_query_scope().is_some());
+    assert!(executor
+        .checked_sat_refutation_query_assumptions()
+        .is_some_and(|assumptions| assumptions.is_empty()));
+    assert!(executor.last_clausification_proofs.is_none());
+    assert!(executor.last_original_clause_theory_proofs.is_none());
+    executor.refresh_checked_sat_refutation();
+    executor
+}
+
+/// A real empty theory callback supplies no explanation. The actual trace is
+/// six independent authored units plus the producer's bare UNSAT marker.
+/// Every no-mint assertion stays unconditional; the exact structural decline
+/// also rules out a vacuous missing-map or unsupported-query failure.
 #[test]
 fn unexplained_level0_theory_conflict_never_mints() {
-    let mut executor = level0_theory_conflict_executor("benchmarks/smt/QF_UF/chain_10.smt2");
+    let mut executor = unexplained_level0_callback_executor();
 
     let trace_error = level0_theory_conflict_trace_error(&executor);
     assert!(
         trace_error.is_some(),
         "a trace with no derivation must never resolve into a refutation"
     );
+    assert!(matches!(
+        trace_error,
+        Some(ClauseTraceResolutionError::EmptyMarkerWithoutDerivedEmpty)
+    ));
 
     assert!(
         executor.last_checked_sat_refutation.is_none(),
         "an unexplained theory UNSAT must never mint a refutation"
     );
+    let built = CheckedSatRefutation::build(&mut executor);
     assert!(
-        CheckedSatRefutation::build(&mut executor).is_err(),
+        built.is_err(),
         "an unexplained theory UNSAT must never mint a refutation"
     );
+    assert!(matches!(
+        built,
+        Err(CheckedSatRefutationError::StructuralTrace(
+            ClauseTraceResolutionError::EmptyMarkerWithoutDerivedEmpty
+        ))
+    ));
+}
+
+/// Preserving the six actual equality causes repairs chain_10's explanation:
+/// it now records a nonempty theory lemma and a genuine terminal derivation.
+/// Keep that real public route as the positive counterpart to the deliberate
+/// empty-explanation input above, including independent strict native proof.
+#[test]
+fn retained_level0_chain_explanation_mints_a_strict_native_proof() {
+    let mut executor = level0_theory_conflict_executor("benchmarks/smt/QF_UF/chain_10.smt2");
+    let trace_error = level0_theory_conflict_trace_error(&executor);
+    assert!(
+        trace_error.is_none(),
+        "the retained explanation must resolve: {trace_error:?}"
+    );
+    let trace = executor
+        .last_clause_trace
+        .as_ref()
+        .expect("actual retained chain trace");
+    assert!(
+        trace
+            .entries()
+            .iter()
+            .any(|entry| entry.is_original && entry.clause.len() > 1),
+        "a nonempty retained explanation must accompany the unit assertions"
+    );
+    assert!(
+        trace
+            .entries()
+            .iter()
+            .any(|entry| !entry.is_original && entry.clause.is_empty()),
+        "the real producer must record a derived empty clause"
+    );
+    assert!(executor.last_checked_sat_refutation.is_some());
+    assert!(executor.checked_sat_refutation_authorizes_current_query());
+    let checked = CheckedSatRefutation::build(&mut executor)
+        .expect("the actual retained chain explanation must authenticate");
+    let native = checked
+        .native_proof
+        .as_ref()
+        .expect("actual native proof presentation");
+    assert!(executor
+        .check_proof_strict_with_datatypes(native)
+        .expect("independent strict validation of the real native proof")
+        .is_complete());
 }
 
 /// The third shape, and the one this producer fix exists to make REACHABLE:

@@ -1314,3 +1314,274 @@ fn a_grid_derived_tree_is_rejected_against_a_tampered_value() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// STREAMING: the same proof, produced and checked without holding the tree.
+//
+// The streamed lane exists because the held tree was the feature's binding
+// constraint — measured at ~148 kB of live heap per leaf on `khb05250`, which
+// put a 17,124-leaf tree past this box's 3,072 MiB jetsam bound and turned a
+// raised budget into a SIGKILL that emitted NOTHING. Every test below asks the
+// only question that matters about such a change: is it the SAME evidence?
+// ---------------------------------------------------------------------------
+
+/// The `opttree` block body as the shipped serialisers write it from a HELD
+/// tree — i.e. the object the streaming lane claims to reproduce.
+fn held_tree_body(cert: &MilpOptimalityCertificate) -> String {
+    cert.wire_body()
+}
+
+#[test]
+fn a_streamed_body_matches_the_held_tree_byte_for_byte() {
+    // THE CENTRAL CLAIM. If these two ever differ, the change stopped being a
+    // memory optimisation and became a format change, and every ratchet pin and
+    // the PB gate would be measuring a different artifact than they were built
+    // against.
+    for (name, m, z, witness) in stream_fixtures() {
+        let held = derive_optimality_tree(&m, &z, &witness, &budget())
+            .unwrap_or_else(|| panic!("{name}: the held lane certifies"));
+        let (streamed, _) = ay_milp::stream_optimality_tree(&m, &z, &witness, &budget());
+        let streamed = streamed.unwrap_or_else(|| panic!("{name}: the streamed lane certifies"));
+        assert_eq!(
+            streamed.body(),
+            held_tree_body(&held),
+            "{name}: the streamed body diverged from the held tree's block"
+        );
+        assert_eq!(streamed.num_leaves(), held.num_leaves(), "{name}: leaves");
+        assert_eq!(
+            streamed.num_dominated_leaves(),
+            held.num_dominated_leaves(),
+            "{name}: dominated leaves"
+        );
+    }
+}
+
+#[test]
+fn the_two_lanes_agree_on_every_report_counter() {
+    // The report is what the CLI prints and what a harness ratchets on. A sink
+    // cannot reach the descent's decisions, and this is the check that says so
+    // in numbers rather than in a comment.
+    for (name, m, z, witness) in stream_fixtures() {
+        let (_, held) = derive_optimality_tree_reported(&m, &z, &witness, &budget());
+        let (_, streamed) = ay_milp::stream_optimality_tree(&m, &z, &witness, &budget());
+        assert_eq!(held.leaves, streamed.leaves, "{name}: leaves");
+        assert_eq!(held.nodes, streamed.nodes, "{name}: nodes");
+        assert_eq!(held.work, streamed.work, "{name}: work");
+        assert_eq!(held.max_depth, streamed.max_depth, "{name}: depth");
+        assert_eq!(held.rim_solves, streamed.rim_solves, "{name}: rim solves");
+        assert_eq!(
+            held.float_iters, streamed.float_iters,
+            "{name}: float iters"
+        );
+        assert_eq!(held.decline, streamed.decline, "{name}: decline");
+        assert_eq!(
+            held.grid_fallbacks, streamed.grid_fallbacks,
+            "{name}: grid fallbacks"
+        );
+    }
+}
+
+#[test]
+fn a_declining_budget_declines_identically_in_both_lanes() {
+    // A partial descent is where a streaming sink is most likely to differ:
+    // it has WRITTEN bytes it must now discard, and the held lane merely drops
+    // an object. Sweep the whole range where the two could disagree.
+    let (m, _x, _y) = branch_model();
+    let witness = vec![int(1), int(0)];
+    for work in 0..24u64 {
+        let b = budget().with_work(work);
+        let (held, hr) = derive_optimality_tree_reported(&m, &int(-1), &witness, &b);
+        let (streamed, sr) = ay_milp::stream_optimality_tree(&m, &int(-1), &witness, &b);
+        assert_eq!(
+            held.is_some(),
+            streamed.is_some(),
+            "work {work}: one lane certified and the other did not"
+        );
+        assert_eq!(hr.decline, sr.decline, "work {work}: decline reason");
+        assert_eq!(hr.leaves, sr.leaves, "work {work}: leaves");
+        if let (Some(h), Some(s)) = (held, streamed) {
+            assert_eq!(s.body(), held_tree_body(&h), "work {work}: body");
+        }
+    }
+    for leaf_cap in 0..8usize {
+        let b = OptimalityTreeBudget::new(leaf_cap);
+        let (held, hr) = derive_optimality_tree_reported(&m, &int(-1), &witness, &b);
+        let (streamed, sr) = ay_milp::stream_optimality_tree(&m, &int(-1), &witness, &b);
+        assert_eq!(held.is_some(), streamed.is_some(), "leaf cap {leaf_cap}");
+        assert_eq!(hr.decline, sr.decline, "leaf cap {leaf_cap}: decline");
+        assert_eq!(hr.leaves, sr.leaves, "leaf cap {leaf_cap}: leaves");
+        if let (Some(h), Some(s)) = (held, streamed) {
+            assert_eq!(s.body(), held_tree_body(&h), "leaf cap {leaf_cap}: body");
+        }
+    }
+}
+
+#[test]
+fn the_streamed_lane_refuses_the_same_forgeries_the_held_lane_refuses() {
+    // A cheaper producer that would emit a certificate for a value the model
+    // refutes is not an optimisation, it is a defect. Same three refusals the
+    // held lane makes, asked of the streaming one.
+    let (m, _x, _y) = branch_model();
+    // -2 is better than the true optimum -1 and is not attainable.
+    assert!(m.check_point(&[int(1), int(1)]).is_err(), "2+2 = 4 > 3");
+    assert!(
+        ay_milp::stream_optimality_tree(&m, &int(-2), &[int(1), int(1)], &budget())
+            .0
+            .is_none()
+    );
+    // A witness that does not attain the claimed value.
+    assert!(
+        ay_milp::stream_optimality_tree(&m, &int(-1), &[int(0), int(0)], &budget())
+            .0
+            .is_none()
+    );
+    // A witness of the wrong arity.
+    assert!(
+        ay_milp::stream_optimality_tree(&m, &int(-1), &[int(1)], &budget())
+            .0
+            .is_none()
+    );
+}
+
+#[test]
+fn a_streamed_body_verifies_and_a_mutated_one_does_not() {
+    // The streaming VERIFIER is the half a consumer runs, and it must be
+    // adversarial in exactly the ways the object-form verifier is. Every
+    // mutation below is a concrete lie about a concrete model.
+    let (m, _x, _y) = branch_model();
+    let witness = vec![int(1), int(0)];
+    let (streamed, _) = ay_milp::stream_optimality_tree(&m, &int(-1), &witness, &budget());
+    let streamed = streamed.expect("the true optimum certifies");
+    let body = streamed.body().to_string();
+    ay_milp::verify_optimality_tree_block(&m, &int(-1), &body)
+        .expect("the honest body verifies, so every rejection below is substantive");
+
+    // 1. THE VALUE, in the direction that is actually a LIE. This block proves
+    //    `objective >= value`, so re-pricing it at a SMALLER value (-2) is a
+    //    weaker true claim and correctly verifies — the primal half is what
+    //    refuses -2, and it does (`the_streamed_lane_refuses_the_same_forgeries`
+    //    pins that). The dual half's forgery is the opposite direction: a bound
+    //    of 0 on a model whose optimum is -1 is false, because (1, 0) is
+    //    feasible and attains -1.
+    assert_eq!(m.objective_value_at(&witness), int(-1));
+    assert!(m.check_point(&witness).is_ok());
+    assert!(
+        ay_milp::verify_optimality_tree_block(&m, &int(0), &body).is_err(),
+        "the tree was re-priced at a bound of 0 that the feasible point (1, 0) refutes"
+    );
+    assert!(
+        ay_milp::verify_optimality_tree_block(&m, &int(-2), &body).is_ok(),
+        "-2 is a WEAKER bound than the honest -1 and must still verify, or the \
+         rejection of 0 above is not evidence about the direction of the check"
+    );
+
+    // 2. TRUNCATION. A proof that stops early covers less of the feasible set
+    //    than it claims to, and half a tiling is not a tiling.
+    let lines: Vec<&str> = body.lines().collect();
+    for cut in 1..lines.len() {
+        let short = format!("{}\n", lines[..cut].join("\n"));
+        if short == body {
+            continue;
+        }
+        assert!(
+            ay_milp::verify_optimality_tree_block(&m, &int(-1), &short).is_err(),
+            "a body truncated to {cut} of {} lines verified",
+            lines.len()
+        );
+    }
+
+    // 3. A DROPPED SPLIT. Deleting the split record leaves two leaves priced at
+    //    boxes neither of them was proved in, and orphans the second.
+    let no_split: String = body
+        .lines()
+        .filter(|l| !l.starts_with("split "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    if no_split != body {
+        assert!(
+            ay_milp::verify_optimality_tree_block(&m, &int(-1), &no_split).is_err(),
+            "a body with its splits deleted verified"
+        );
+    }
+
+    // 4. A TAMPERED MULTIPLIER. Scaling one coefficient breaks the identity
+    //    `sum multipliers == objective` that makes a bound leaf a bound.
+    if let Some(idx) = body.lines().position(|l| l.starts_with("mult ")) {
+        let mut lines: Vec<String> = body.lines().map(ToString::to_string).collect();
+        let f: Vec<String> = lines[idx]
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect();
+        lines[idx] = format!("{} {} {} {}", f[0], f[1], f[2], f[3]) + " 999999";
+        let tampered = lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+        assert!(
+            ay_milp::verify_optimality_tree_block(&m, &int(-1), &tampered).is_err(),
+            "a body with a multiplier rewritten to 999999 verified"
+        );
+    }
+}
+
+#[test]
+fn a_streamed_leaf_cannot_smuggle_in_a_tighter_box() {
+    // The design review's own counterexample, asked of the STREAMING verifier:
+    // `x in [0,10]` integer, `y` continuous, `y - x <= 0`, minimise `-y`. A leaf
+    // priced at a RECORDED `x in [0,0]` proves `obj >= 0` while the true optimum
+    // is -10. The streaming verifier reconstructs every box from the model and
+    // the path, so there is nowhere for such a claim to live — and the check
+    // that says so is that the SAME leaf, honest at the root, is accepted only
+    // for the value the model actually supports.
+    let (m, _x, _y, _r) = box_forgery_model();
+    let witness = vec![int(10), int(10)];
+    assert_eq!(m.objective_value_at(&witness), int(-10));
+    let (streamed, _) = ay_milp::stream_optimality_tree(&m, &int(-10), &witness, &budget());
+    let body = streamed
+        .expect("the true optimum -10 certifies")
+        .body()
+        .to_string();
+    ay_milp::verify_optimality_tree_block(&m, &int(-10), &body).expect("honest body");
+    // 0 is a strictly better claim than the true optimum -10 in a Minimize
+    // model, and it is exactly what the recorded-box forgery would have bought.
+    assert!(
+        ay_milp::verify_optimality_tree_block(&m, &int(0), &body).is_err(),
+        "the streaming verifier accepted a bound of 0 on a model whose optimum is -10"
+    );
+}
+
+#[test]
+fn a_split_on_a_continuous_column_is_refused_by_the_streaming_verifier() {
+    // The COVERAGE LICENCE. Only an integral column split at an integer leaves
+    // no point between the branches; the whitelist is what makes a future
+    // non-integral kind fail closed rather than pass silently.
+    let (m, _x, _y, _r) = box_forgery_model();
+    // Column 1 is the CONTINUOUS `y`. The leaves below are irrelevant: the
+    // split alone must be refused.
+    let body = "split 1 5\nboundleaf\nendleaf\nboundleaf\nendleaf\n";
+    assert!(ay_milp::verify_optimality_tree_block(&m, &int(0), body).is_err());
+    // ... and a non-integer cut on the INTEGRAL column 0 is refused too, so the
+    // rejection above is about the column kind and not about the shape.
+    let body = "split 0 5/2\nboundleaf\nendleaf\nboundleaf\nendleaf\n";
+    assert!(ay_milp::verify_optimality_tree_block(&m, &int(0), body).is_err());
+}
+
+/// The fixtures the streaming lane is compared against: one root-only tree, one
+/// that genuinely branches, one Maximize, one with an objective offset, and the
+/// recorded-box counterexample.
+fn stream_fixtures() -> Vec<(&'static str, Model, BigRational, Vec<BigRational>)> {
+    let (offset_model, _, _) = {
+        let (mut m, x, r) = root_only_model();
+        m.set_objective_offset(100.0);
+        (m, x, r)
+    };
+    vec![
+        ("root-only", root_only_model().0, int(4), vec![int(4)]),
+        ("branch", branch_model().0, int(-1), vec![int(1), int(0)]),
+        ("maximize", maximize_model().0, int(7), vec![int(7)]),
+        ("offset", offset_model, int(104), vec![int(4)]),
+        (
+            "box-forgery",
+            box_forgery_model().0,
+            int(-10),
+            vec![int(10), int(10)],
+        ),
+    ]
+}

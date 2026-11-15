@@ -19,14 +19,20 @@ use crate::{ChcExpr, ChcVar};
 /// constants become `a_i = constant`, repeated variables become
 /// `a_j = a_first`, and a variable's first occurrence supplies the ordinary
 /// clause-to-canonical rename. A compound argument is pinned only when every
-/// variable it mentions has that canonical binding. Otherwise it keeps the
-/// previous weaker treatment; admitting a free clause-local name would corrupt
-/// ghost-pair certification, array forwarding, and arithmetic proof scoring.
+/// variable it mentions has that canonical binding (admitting a free
+/// clause-local name would corrupt ghost-pair certification, array forwarding,
+/// and arithmetic proof scoring). Otherwise there is NO sound summary in the
+/// canonical frame: dropping the position, as this used to, left `a_i`
+/// unconstrained, so `y = 0 => P(true, (mod y 3))` summarized as "every
+/// `P(true, _)` is reachable" and PDR published a one-step counterexample for a
+/// safe system (CHC differential generator, z3 5.1: `sat`, AY: `unsat`). Such a
+/// fact gets no summary: `None`, which the caller skips (a must summary only
+/// ever adds reachability evidence).
 pub(super) fn rewrite_fact_summary(
     constraint: &ChcExpr,
     head_args: &[ChcExpr],
     canonical_vars: &[ChcVar],
-) -> ChcExpr {
+) -> Option<ChcExpr> {
     debug_assert_eq!(head_args.len(), canonical_vars.len());
     // Bind direct variable arguments first so a compound argument can be
     // classified independently of the order of the head positions.
@@ -41,7 +47,7 @@ pub(super) fn rewrite_fact_summary(
         }
     }
 
-    let mut rewritten = constraint.substitute(&subst);
+    let rewritten = constraint.substitute(&subst);
     let mut pins = Vec::new();
     for (argument, canonical) in head_args.iter().zip(canonical_vars) {
         match argument {
@@ -66,27 +72,57 @@ pub(super) fn rewrite_fact_summary(
                     .vars()
                     .iter()
                     .all(|variable| subst.iter().any(|(source, _)| source == variable));
-                if bound {
-                    pins.push(ChcExpr::eq(
-                        ChcExpr::var(canonical.clone()),
-                        compound.substitute(&subst),
-                    ));
-                } else {
-                    // #2492: preserve the historical identity substitution for
-                    // constituent variables without treating them as canonical.
-                    for variable in compound.vars() {
-                        rewritten = rewritten
-                            .substitute(&[(variable.clone(), ChcExpr::var(variable.clone()))]);
-                    }
+                if !bound {
+                    return None;
                 }
+                pins.push(ChcExpr::eq(
+                    ChcExpr::var(canonical.clone()),
+                    compound.substitute(&subst),
+                ));
             }
         }
     }
 
     if pins.is_empty() {
-        rewritten
+        Some(rewritten)
     } else {
         pins.insert(0, rewritten);
-        ChcExpr::and_all(pins)
+        Some(ChcExpr::and_all(pins))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_fact_summary;
+    use crate::{ChcExpr, ChcSort, ChcVar};
+
+    fn canonical() -> [ChcVar; 2] {
+        [
+            ChcVar::new("__p1_a0", ChcSort::Int),
+            ChcVar::new("__p1_a1", ChcSort::Int),
+        ]
+    }
+
+    #[test]
+    fn a_compound_argument_over_a_fact_local_variable_has_no_summary() {
+        // `y = 0 => P(1, (mod y 3))`: `y` has no canonical binding.
+        let y = ChcExpr::var(ChcVar::new("y", ChcSort::Int));
+        let constraint = ChcExpr::eq(y.clone(), ChcExpr::int(0));
+        let head = [ChcExpr::int(1), ChcExpr::mod_op(y, ChcExpr::int(3))];
+        assert!(rewrite_fact_summary(&constraint, &head, &canonical()).is_none());
+    }
+
+    #[test]
+    fn constants_and_bound_compound_arguments_are_still_pinned() {
+        // `x >= 0 => P(x, x + 1)` pins `a1 = a0 + 1`.
+        let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+        let constraint = ChcExpr::ge(x.clone(), ChcExpr::int(0));
+        let head = [x.clone(), ChcExpr::add(x, ChcExpr::int(1))];
+        let summary = rewrite_fact_summary(&constraint, &head, &canonical()).expect("pinned");
+        let text = summary.to_string();
+        assert!(
+            text.contains("__p1_a1") && text.contains("__p1_a0"),
+            "{text}"
+        );
     }
 }

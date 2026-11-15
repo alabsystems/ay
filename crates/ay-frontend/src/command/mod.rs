@@ -752,6 +752,8 @@ pub enum Command {
     DebugPpVar(String),
     /// `(simplify <term>)` - Z3 extension
     Simplify(Term),
+    /// Explicit, locally scoped rewriter parameters; never discarded by parsing.
+    SimplifyWithParams(Term, Vec<(String, SExpr)>),
     /// `(get-interpolant <term-A> <term-B>)` - Z3/SeaHorn/KLEE extension.
     ///
     /// Computes a Craig interpolant `I` for the pair `(A, B)` where the
@@ -1419,7 +1421,23 @@ impl Command {
                 let term = items
                     .get(1)
                     .ok_or_else(|| ParseError::new("simplify requires term"))?;
-                Ok(Self::Simplify(Term::from_sexp(term)?))
+                let term = Term::from_sexp(term)?;
+                if items.len() == 2 {
+                    return Ok(Self::Simplify(term));
+                }
+                if (items.len() - 2) % 2 != 0 {
+                    return Err(ParseError::new(
+                        "simplify parameters require keyword/value pairs",
+                    ));
+                }
+                let mut parameters = Vec::new();
+                for pair in items[2..].chunks_exact(2) {
+                    let SExpr::Keyword(name) = &pair[0] else {
+                        return Err(ParseError::new("simplify parameter requires a keyword"));
+                    };
+                    parameters.push((name.clone(), pair[1].clone()));
+                }
+                Ok(Self::SimplifyWithParams(term, parameters))
             }
             "get-interpolant" => Self::parse_interpolant(items, false),
             "compute-interpolant" => Self::parse_interpolant(items, true),

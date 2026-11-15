@@ -111,24 +111,24 @@ fn run_dimacs_solver_lean4_with_source(
         proof_writer_telemetry = telemetry;
         let file = match create_owned_dimacs_proof_file(lean4_path) {
             Ok(f) => f,
-            Err(e) => {
-                safe_eprintln!("Error: failed to create Lean4 proof file {lean4_path}: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => fail_lean4_proof_export(&format!(
+                "failed to create Lean4 proof file {lean4_path}: {e}"
+            )),
         };
         let mut writer = proof_output_writer(file);
         if let Err(e) = lean_cert.write_lean4_verified(original_clauses, &mut writer) {
-            safe_eprintln!("Error: failed to write Lean4 proof to {lean4_path}: {e}");
-            std::process::exit(1);
+            fail_lean4_proof_export(&format!("failed to write Lean4 proof to {lean4_path}: {e}"));
         }
         if let Err(e) = writer.flush() {
-            safe_eprintln!("Error: failed to flush Lean4 proof file {lean4_path}: {e}");
-            std::process::exit(1);
+            fail_lean4_proof_export(&format!(
+                "failed to flush Lean4 proof file {lean4_path}: {e}"
+            ));
         }
         drop(writer);
         if let Err(e) = seal_owned_dimacs_proof(lean4_path) {
-            safe_eprintln!("Error: failed to seal Lean4 proof file {lean4_path}: {e}");
-            std::process::exit(1);
+            fail_lean4_proof_export(&format!(
+                "failed to seal Lean4 proof file {lean4_path}: {e}"
+            ));
         }
     }
 
@@ -142,6 +142,13 @@ fn run_dimacs_solver_lean4_with_source(
         None,
         proof_writer_telemetry,
     );
+}
+
+/// A failed Lean4 export ends the run without an answer, settled as one.
+fn fail_lean4_proof_export(reason: &str) -> ! {
+    settle_unanswered_dimacs_exit();
+    safe_eprintln!("Error: {reason}");
+    std::process::exit(1);
 }
 
 fn take_text_lrat_certificate(

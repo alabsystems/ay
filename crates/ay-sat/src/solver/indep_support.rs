@@ -111,6 +111,7 @@ use crate::lit_marks::LitMarks;
 use crate::literal::{Literal, Variable};
 
 mod closure;
+mod ge;
 
 /// Largest formula the support computation will look at (variables).
 const INDEP_SUPPORT_MAX_VARS: usize = 1 << 20;
@@ -169,6 +170,11 @@ struct DefinitionGraph {
     as_lhs: Vec<Vec<u32>>,
     /// Number of definitions `v` feeds as an input (kissat `gates_as_rhs`).
     rhs_count: Vec<u32>,
+    /// GE free variables over the recovered XOR gates (`ge::GeBasis::free`);
+    /// empty when no basis was built.
+    ge_free: Vec<u32>,
+    /// GE pivot expressions as definitions (pivot := XOR of free inputs).
+    ge_exprs: Vec<Definition>,
 }
 
 impl Solver {

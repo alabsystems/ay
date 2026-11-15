@@ -42,17 +42,40 @@ set -u
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$REPO"
 . "$REPO/scripts/lib/veripb_verdict.sh"
+. "$REPO/scripts/lib/veripb_build_id.sh"
+# The pin is needed unconditionally now, not only when resolving a cache build:
+# $VERIPB_SOUNDNESS_DIR names the fixtures the control checker has to survive.
+# It sets no bare VERIPB / VERIPB_BIN key, so it cannot disturb the line below.
+. "$REPO/ci/veripb.pin"
 
 REAL=${1:-${VERIPB_BIN:-${AY_PB26_VERIPB_BIN:-${VERIPB:-}}}}
-if [ -z "$REAL" ] && command -v veripb >/dev/null 2>&1; then
-    REAL=$(command -v veripb)
-fi
 if [ -z "$REAL" ]; then
+    # IDENTITY FIRST, then the ambient candidates.
+    #
+    # The pre-pin cache layout `<cache>/ay-veripb/VeriPB/...` was dropped from
+    # this list on 2026-09-22: its name records no commit and no patch, the
+    # early cert_ci.sh that wrote it built the upstream default branch
+    # UNPATCHED, and the binary measured sitting there accepts all 22 committed
+    # wrong-verdict fixtures. But it was the LAST candidate, and the three that
+    # outranked it -- `veripb` on PATH, /tmp/veripb-3, ~/.cargo/bin -- are
+    # identity-free in exactly the same way. Dropping the last one and keeping
+    # the first three is not a fix, so: the identity-bearing pinned builds are
+    # tried first, and whatever wins is put to the batteries below.
+    #
+    # The glob matches a keyed directory built by ANY compiler, which is what
+    # the Rust resolver's is_pinned_cache_dir accepts and why this needs no
+    # rustc of its own: the key exists so two compilers do not share one target
+    # dir (E0514), and a finished binary runs the same either way.
+    _fcg_cache="${VERIPB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb}"
+    _fcg_id="$_fcg_cache/$(veripb_legacy_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256")"
     for candidate in \
+        "$_fcg_id"-rustc*/target/release/veripb \
+        "$_fcg_id/target/release/veripb" \
+        "$(command -v veripb 2>/dev/null || true)" \
         /tmp/veripb-3/bin/veripb \
-        "$HOME/.cargo/bin/veripb" \
-        "${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb/VeriPB/target/release/veripb"
+        "$HOME/.cargo/bin/veripb"
     do
+        [ -n "$candidate" ] || continue
         [ -x "$candidate" ] || continue
         REAL=$candidate
         break
@@ -63,6 +86,16 @@ fi
     echo "       Usage: $0 /path/to/veripb" >&2
     exit 2
 }
+
+# $REAL is load-bearing TWICE: it is the control case ("a genuine checker still
+# PASSES these gates"), and fake (i) delegates to it. Both claims are void if
+# $REAL is itself unsound -- and it can arrive from $1, $VERIPB_BIN, $PATH or a
+# neutral default, none of which says which checker it is. Every other entry
+# point (cert_ci.sh, the Rust resolver) already puts its checker to these two
+# batteries; this script, whose whole subject is gates that cannot be fooled,
+# did not.
+veripb_require_self_test "$REAL"
+veripb_require_soundness "$REAL" "$REPO/$VERIPB_SOUNDNESS_DIR"
 
 BIN=${AY_PB_BIN:-"$REPO/target/release/ay-pb"}
 [ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN" >&2; exit 2; }
@@ -76,7 +109,8 @@ DEV=${AY_PB_DEV_BIN:-"$REPO/target/release/ay-pb-dev"}
     echo "ERROR: campaign binary missing: $DEV" >&2
     echo "       It carries the certify-unsat --veripb surface, which is the one" >&2
     echo "       that takes a checker path from the user. Build it with:" >&2
-    echo "         cargo build --release -p ay-pb --features dev-tools --bin ay-pb-dev" >&2
+    echo "         targo --unverified build --release -p ay-pb --features dev-tools --bin ay-pb-dev" >&2
+    echo "       (without the Trust toolchain: cargo build with the same arguments)" >&2
     exit 2
 }
 

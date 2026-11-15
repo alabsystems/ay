@@ -47,6 +47,9 @@ use ay_core::{
 use crate::executor::model::{EvalValue, Executor, Model, EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE};
 use crate::term_helpers::is_pure_arithmetic_term;
 
+#[path = "definitive_eval/leaf_provenance.rs"]
+mod leaf_provenance;
+
 /// True if `term` is, or contains, an integer-returning string conversion
 /// (`str.to_int`, `str.to_code`, `str.indexof`, `str.len`). The model evaluator
 /// computes these exactly (`eval_string.rs`), so a bridge equality/comparison
@@ -1582,6 +1585,7 @@ impl DefinitiveEval for IteDefinitionOracle {
                 }
                 leaves.sort_unstable();
                 for t in leaves {
+                    leaf_provenance::observe(executor, model, t);
                     eprintln!(
                         "[ite-uf-oracle]   leaf {:?} = {:?} :: {}",
                         t,
@@ -2333,6 +2337,9 @@ fn dt_reduced_eq(executor: &Executor, a: TermId, b: TermId, depth: u32) -> Optio
 pub(crate) fn dt_axiom_bool(executor: &Executor, term: TermId, depth: u32) -> Option<bool> {
     if depth == 0 {
         return None;
+    }
+    if super::dt_eta::is_eta(executor, term, depth) {
+        return Some(true);
     }
     match executor.ctx.terms.get(term) {
         TermData::Const(Constant::Bool(b)) => Some(*b),

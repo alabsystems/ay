@@ -212,9 +212,11 @@ fn typed_array_rejects_noncanonical_bitvector_payloads() {
         },
         store: Vec::new(),
     };
-    assert!(!typed_array_value(&negative, &sort));
-    assert!(!typed_array_value(&out_of_range, &sort));
-    assert!(typed_array_value(&canonical, &sort));
+    let executor = Executor::new();
+    let guard = RenderedDatatypeGuard::new(&executor);
+    assert!(!typed_array_value(&negative, &sort, &guard));
+    assert!(!typed_array_value(&out_of_range, &sort, &guard));
+    assert!(typed_array_value(&canonical, &sort, &guard));
 }
 
 #[test]

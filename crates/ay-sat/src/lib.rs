@@ -5,6 +5,8 @@
 // Unsafe is denied by default; audited hot paths opt in only at the narrow
 // function/module boundary carrying their local invariant.
 #![deny(unsafe_code)]
+// Fallible allocation of the cold solver tail; no raw allocation/unsafe escape.
+#![feature(allocator_api)]
 // SAT solvers use many domain acronyms (BCE, BVE, VSIDS, HTR, CDCL, etc.).
 #![allow(clippy::upper_case_acronyms)]
 
@@ -90,12 +92,6 @@ extern crate ay_core;
 
 pub(crate) mod bce;
 pub(crate) mod bve;
-// Phase 1 of incremental BVE during search (#8795) lives inside `bve::` as
-// `bve::incremental_cost` and `bve::trigger`. The previous standalone
-// `bve_incremental` module was removed in #8808 because it was a parallel
-// island with no CDCL hooks; the re-landed Phase 1 ships as sibling modules
-// of the existing preprocessing BVE so Phase 2 can share clause-database
-// accessors without another round of relocation.
 pub(crate) mod cce;
 // The two circuit_* modules below carry a module-level dead-code allow on
 // purpose: they are audit/replay surfaces for the multiplier-equivalence
@@ -105,7 +101,7 @@ pub(crate) mod cce;
 // (same convention as ay-chc's documented per-module allows).
 pub mod auto;
 #[allow(dead_code)]
-pub mod circuit_equiv_packet;
+pub(crate) mod circuit_equiv_packet;
 #[allow(dead_code)]
 pub(crate) mod circuit_scout;
 pub(crate) mod clause;
@@ -126,7 +122,7 @@ pub(crate) mod dimacs;
 /// Shared DIMACS-family parser core for SAT/XOR/QBF format tokenization.
 pub mod dimacs_core;
 pub(crate) mod elim_heap;
-pub mod er_proof;
+pub(crate) mod er_proof;
 pub(crate) mod extension;
 pub(crate) mod factor;
 /// Test-only `.xz` fixture decompression that skips gracefully when the system
@@ -141,8 +137,6 @@ pub mod feature_flags {
     pub const RAW_POINTER_BCP: bool = cfg!(feature = "raw-pointer-bcp");
     /// JIT-compiled BCP enabled (FC-SAT).
     pub const JIT: bool = cfg!(feature = "jit");
-    /// GPU compute infrastructure enabled.
-    pub const GPU: bool = cfg!(feature = "gpu");
 }
 
 /// Capacity limits of the clause-arena addressing scheme, exposed so callers
@@ -181,6 +175,7 @@ pub mod arena_limits {
 
 pub(crate) mod adaptive;
 pub(crate) mod alethe_export;
+mod counted_storage;
 pub(crate) mod cube_and_conquer;
 pub(crate) mod features;
 pub(crate) mod flip;
@@ -189,11 +184,11 @@ pub mod fmla_ledger_preview;
 pub mod fmla_runtime_ledger;
 pub(crate) mod forward_checker;
 pub(crate) mod gates;
-#[cfg(feature = "gpu")]
-pub(crate) mod gpu;
 pub mod guard_cover_sidecar;
-pub mod guidance;
+pub(crate) mod guidance;
 pub(crate) mod htr;
+pub mod initial_cnf;
+pub use solver::CountedInitialSolver;
 /// Structured JSONL progress observer for `--progress-json` output.
 pub mod json_observer;
 pub(crate) mod kani_compat;
@@ -216,17 +211,17 @@ pub mod proof_certificate;
 pub(crate) mod proof_manager;
 pub(crate) mod reconstruct;
 pub(crate) mod replay_trace;
+mod resolution_counted;
 pub mod resolution_dag;
 mod resolution_validate;
-pub mod sat_proof_manager;
 pub(crate) mod sbva;
 pub(crate) mod solver;
 pub(crate) mod solver_log;
 pub(crate) mod subsume;
 pub(crate) mod sweep;
 pub(crate) mod symmetry;
-pub mod technique;
-#[cfg(any(test, kani))]
+pub(crate) mod technique;
+#[cfg(test)]
 pub(crate) mod test_util;
 pub(crate) mod tla_trace;
 pub(crate) mod tla_traceable;
@@ -332,8 +327,9 @@ impl Default for InprocessingFeatureProfile {
 pub use adaptive::adjust_features_for_instance;
 pub use clause_provenance::{ClauseProvenance, TrackedClauseProvenanceSummary};
 pub use clause_trace::{
-    ClauseTrace, ClauseTraceEntry, ClauseTraceEntryRef, HintOmission, HintOmissionStats,
-    TraceEntries, TraceEntriesIter,
+    clause_trace_armings, ClauseEventCapture, ClauseEventOrigin, ClauseTrace, ClauseTraceEntry,
+    ClauseTraceEntryRef, ExhaustionSnapshot, HintOmission, HintOmissionStats, TraceEntries,
+    TraceEntriesIter,
 };
 pub use clause_trace_resolution::{
     validate_clause_trace_resolution, validate_clause_trace_resolution_interruptible,
@@ -348,10 +344,12 @@ pub use decision_trace::{
     reserve_decision_trace, suppress_decision_trace_after_public_mismatch, write_minimal_trace,
     write_minimal_trace_to, SettledDecisionTrace, TraceOutcome,
 };
+pub use determinism::{deterministic_inproc_enabled, TICKS_PER_MS};
 pub use dimacs::{parse_str as parse_dimacs, DimacsError, DimacsFormula};
 pub use er_proof::{ErDefinition, ErObligationKind, ErProducer, ErProofLog};
 pub use extension::{
-    ExtCheckResult, ExtProofStep, ExtPropagateResult, Extension, PreparedExtension, SolverContext,
+    ExtCheckResult, ExtContinue, ExtProofStep, ExtPropagateResult, Extension, PreparedExtension,
+    SolverContext, TheoryClauseOrigin,
 };
 pub use features::{InstanceClass, SatFeatureAccumulator, SatFeatures};
 pub use guidance::{
@@ -364,22 +362,33 @@ pub use portfolio::PortfolioSolver;
 pub use preprocess_transaction::PreprocessTransactionStats;
 pub use proof::{DratWriter, LratWriter, ProofOutput, VeripbWriter, MAX_LRAT_ORIGINAL_CLAUSES};
 pub use proof_certificate::{ProofCertificate, ProofCompleteness, ProofStep};
+pub use resolution_counted::{
+    prove_unsat_resolution_dag_counted_work, solve_resolution_dag_counted,
+    solve_resolution_dag_counted_local,
+};
 pub use resolution_dag::{
-    prove_unsat_resolution_dag, prove_unsat_resolution_dag_with_limits,
-    solve_resolution_dag_with_limits, ResolutionDag, ResolutionDagError, ResolutionProofError,
+    prove_unsat_resolution_dag, prove_unsat_resolution_dag_until,
+    prove_unsat_resolution_dag_with_cancellation, prove_unsat_resolution_dag_with_limits,
+    prove_unsat_resolution_dag_with_limits_and_cancellation,
+    prove_unsat_resolution_dag_with_limits_and_cancellation_work,
+    prove_unsat_resolution_dag_within, solve_resolution_dag_with_limits,
+    solve_resolution_dag_with_limits_and_cancellation, ResolutionDag,
+    ResolutionDagCancellationError, ResolutionDagError, ResolutionDagWork, ResolutionProofError,
     ResolutionProofLimits, ResolutionProofPhase, ResolutionProofResource, ResolutionSolveOutcome,
     RupStep,
 };
 pub use resolution_validate::{
-    ResolutionDagValidateError, ResolutionValidationError, ResolutionValidationLimits,
-    ResolutionValidationResource,
+    conservative_rup_validation_work_bound, ConservativeRupSourceShape, ResolutionDagValidateError,
+    ResolutionValidationError, ResolutionValidationLimits, ResolutionValidationResource,
 };
 pub use solver::{
-    AssumeResult, BcpLongScanStats, BcpSavedPosStats, DecomposeLratPreflightStats, DumpCnfReport,
+    keep_proof_inprocessing_after_exhaustion, AssumeResult, BcpLongScanStats, BcpSavedPosStats,
+    CandidateSearchOutcome, CandidateSearchWork, CandidateSolver, ConsumingTraceControl,
+    ConsumingTraceError, ConsumingTraceStop, DecomposeLratPreflightStats, DumpCnfReport,
     DumpCnfVerdict, ExtendModelReport, FactorStats, IndepEnumReport, LookaheadStats,
-    LratMaterializationStats, RephaseAttributionStats, RestartAttributionStats, SatResult,
-    SatUnknownReason, SetSolutionError, Solver, SolverAssumeResult, SolverSatResult,
-    TheoryPropResult, VarAssignmentKind,
+    LratMaterializationStats, ProofInprocessingKeptAfterExhaustion, RephaseAttributionStats,
+    RestartAttributionStats, SatResult, SatUnknownReason, SetSolutionError, Solver,
+    SolverAssumeResult, SolverSatResult, TheoryPropResult, VarAssignmentKind,
 };
 pub use symmetry::SymmetryReport;
 pub use technique::SatTechnique;
@@ -395,10 +404,6 @@ pub use variant::{
 pub use watched::ClauseRef;
 
 // Approximate-BCP filter bridge (issue #8789 Phase 2). The enum is part of
-// the feature-gated public API so integration tests in the external `tests/`
-// crate can assert counter movement and verdict values.
-#[cfg(feature = "approx-bcp-filter")]
-pub use solver::approx_bcp_bridge::ApproxBcpPrefilterVerdict;
 
 // -- Inprocessing statistics types (consumed by integration tests and ay binary) --
 pub use bce::BCEStats;

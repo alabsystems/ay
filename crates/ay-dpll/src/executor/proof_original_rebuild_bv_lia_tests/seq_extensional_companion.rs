@@ -423,7 +423,10 @@ fn exact_ite_uf_completion_declines_sat_subset_and_assumption_scopes_atomically(
         .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
         .is_unknown());
     assert!(subset.last_proof.is_none());
-    assert_eq!(subset.last_lrat_certificate.as_deref(), Some([11].as_slice()));
+    assert_eq!(
+        subset.last_lrat_certificate.as_deref(),
+        Some([11].as_slice())
+    );
 
     let mut assumed = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
     let assumption = assumed.ctx.terms.true_term();

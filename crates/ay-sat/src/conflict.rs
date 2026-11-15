@@ -7,6 +7,8 @@
 //! Implements the First Unique Implication Point (1UIP) scheme for
 //! conflict-driven clause learning.
 
+mod counted;
+
 use crate::literal::Literal;
 use crate::solver::VarData;
 
@@ -391,7 +393,6 @@ impl ConflictAnalyzer {
 }
 
 /// Reorder learned clause so lits[1] is at backtrack level (for 2WL correctness).
-/// Production path: inline in `add_learned_clause`. This is for tests/Kani only.
 pub(crate) fn reorder_for_watches(
     clause: &mut [Literal],
     var_data: &[VarData],
@@ -428,7 +429,3 @@ pub(crate) fn reorder_for_watches(
 #[cfg(test)]
 #[path = "conflict_tests.rs"]
 mod tests;
-
-#[cfg(kani)]
-#[path = "conflict_verification.rs"]
-mod verification;

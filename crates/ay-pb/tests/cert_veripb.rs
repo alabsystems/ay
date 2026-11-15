@@ -122,29 +122,25 @@ mod certified_gate {
         }
     }
 
+    /// The checker, or a hard failure — this gate has no degraded mode.
+    ///
+    /// Was `$VERIPB_BIN` then a `$PATH` scan, with nothing asked of whatever
+    /// came back. Both are identity-free channels, and the assertion this file
+    /// makes ("VeriPB verified the generated proof") is one an unsound checker
+    /// satisfies for free, so the gate could be green against a binary with
+    /// twenty-one known wrong-verdict defects. The ONE resolver keeps both
+    /// channels, adds the identity-bearing pinned cache builds, and puts
+    /// whichever wins through the self-test and the twenty-two fixtures.
+    ///
+    /// `resolve` rather than `require_checker`: `AY_VERIPB_OPTIONAL` must NOT
+    /// be able to skip this suite, which is what the old hard panic meant.
     fn required_veripb() -> PathBuf {
-        if let Some(raw) = std::env::var_os("VERIPB_BIN") {
-            let path = PathBuf::from(raw);
-            assert!(
-                path.is_file(),
-                "certified-proof-artifacts requires VERIPB_BIN to name a file; got {}",
-                path.display()
-            );
-            return path;
-        }
-        if let Some(paths) = std::env::var_os("PATH") {
-            let executable = format!("veripb{}", std::env::consts::EXE_SUFFIX);
-            if let Some(path) = std::env::split_paths(&paths)
-                .map(|directory| directory.join(&executable))
-                .find(|path| path.is_file())
-            {
-                return path;
-            }
-        }
-        panic!(
-            "certified-proof-artifacts requires the official VeriPB checker; \
-             set VERIPB_BIN or put veripb on PATH"
-        );
+        ay_test_support::veripb::resolve().unwrap_or_else(|error| {
+            panic!(
+                "certified-proof-artifacts requires the official VeriPB checker, \
+                 self-tested and sound.\n{error}"
+            )
+        })
     }
 
     fn temporary_proof(label: &str, proof: &str) -> TemporaryProof {

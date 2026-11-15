@@ -36,11 +36,6 @@ pub(crate) fn all_features() -> &'static [Feature] {
             enabled: ay_sat::feature_flags::JIT,
             description: "Native-code SAT helper kernels (non-BCP)",
         },
-        Feature {
-            name: "sat-gpu",
-            enabled: ay_sat::feature_flags::GPU,
-            description: "GPU compute infrastructure (wgpu: Vulkan/DX12/Metal)",
-        },
         // DPLL(T) features
         Feature {
             name: "proof-checker",

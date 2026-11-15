@@ -14,7 +14,7 @@
 //! Algorithm: Brzozowski, J.A. "Derivatives of Regular Expressions" (1964).
 
 use ay_core::term::{Constant, TermData, TermId, TermStore};
-use ay_core::{Symbol, TheoryLit};
+use ay_core::{Sort, Symbol, TheoryLit};
 
 use crate::infer::{InferenceKind, InferenceManager};
 use crate::state::SolverState;
@@ -380,6 +380,9 @@ impl RegExpSolver {
         state: &SolverState,
         infer: &mut InferenceManager,
     ) -> bool {
+        if Self::check_ground_regex_equalities(terms, state, infer) {
+            return true;
+        }
         for &lit in state.assertions() {
             let (atom, polarity) = Self::atom_and_polarity(terms, lit);
 
@@ -428,6 +431,93 @@ impl RegExpSolver {
         }
 
         infer.has_conflict()
+    }
+
+    /// Check ground RegLan `=`/`distinct` atoms.
+    ///
+    /// Nothing else in the pipeline inspects an equality between two regex
+    /// terms: it is neither a word equation nor a membership, so a FALSE
+    /// ground equality such as
+    /// `(= re.none (re.inter (str.to_re "a") (re.* re.allchar)))` survived
+    /// every check round and only the model gate withheld the resulting
+    /// wrong candidate (unknown where z3 answers unsat). When every
+    /// operand translates to a [`WeRegex`], the atom's exact truth is a
+    /// language-equality decision; a polarity contradiction conflicts
+    /// with the literal alone as explanation (a ground theory fact needs
+    /// no premises). Untranslatable operands (RegLan variables, symbolic
+    /// string leaves) and capped decisions are left to the other paths.
+    ///
+    /// Returns true if a conflict was found.
+    fn check_ground_regex_equalities(
+        terms: &TermStore,
+        state: &SolverState,
+        infer: &mut InferenceManager,
+    ) -> bool {
+        let limits = crate::term_regex::TranslateLimits::for_ground_eval();
+        for &lit in state.assertions() {
+            let (atom, polarity) = Self::atom_and_polarity(terms, lit);
+            let TermData::App(sym, args) = terms.get(atom) else {
+                continue;
+            };
+            let is_distinct = match sym.name() {
+                "=" => false,
+                "distinct" => true,
+                _ => continue,
+            };
+            if args.len() < 2 || args.len() > 8 {
+                continue;
+            }
+            if !matches!(terms.sort(args[0]), Sort::RegLan) {
+                continue;
+            }
+            let mut langs: Vec<WeRegex> = Vec::with_capacity(args.len());
+            let mut translated = true;
+            for &arg in args {
+                match crate::term_regex::translate(terms, arg, &limits) {
+                    Some(w) => langs.push(w),
+                    None => {
+                        translated = false;
+                        break;
+                    }
+                }
+            }
+            if !translated {
+                continue;
+            }
+            let actual = Self::ground_regex_atom_truth(&langs, is_distinct);
+            if actual == Some(!polarity) {
+                infer.add_conflict(InferenceKind::PredicateConflict, vec![lit]);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Exact truth of a ground RegLan `=` (all operand languages equal) or
+    /// `distinct` (pairwise unequal) atom, or `None` when a language
+    /// comparison exceeds its caps.
+    fn ground_regex_atom_truth(langs: &[WeRegex], is_distinct: bool) -> Option<bool> {
+        if is_distinct {
+            for i in 0..langs.len() {
+                for j in (i + 1)..langs.len() {
+                    match crate::we_regex::languages_equal(&langs[i], &langs[j]) {
+                        Some(true) => return Some(false),
+                        Some(false) => {}
+                        None => return None,
+                    }
+                }
+            }
+            Some(true)
+        } else {
+            for w in &langs[1..] {
+                match crate::we_regex::languages_equal(&langs[0], w) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            Some(true)
+        }
     }
 
     /// Evaluate whether concrete string `s` matches regex term `r`.
@@ -631,17 +721,17 @@ impl RegExpSolver {
                     // Non-singleton endpoint(s): empty language, matches nothing.
                     return Some(false);
                 }
-                let lo_char = lo.chars().next().unwrap();
-                let hi_char = hi.chars().next().unwrap();
-                if lo_char > hi_char {
+                let lo_code = ay_core::smtlib_code_point(lo.chars().next().unwrap());
+                let hi_code = ay_core::smtlib_code_point(hi.chars().next().unwrap());
+                if lo_code > hi_code {
                     // Reversed range: empty language, matches nothing.
                     return Some(false);
                 }
                 if s.chars().count() != 1 {
                     return Some(false);
                 }
-                let c = s.chars().next().unwrap();
-                Some(lo_char <= c && c <= hi_char)
+                let c = ay_core::smtlib_code_point(s.chars().next().unwrap());
+                Some(lo_code <= c && c <= hi_code)
             }
 
             // str.to_re(t): matches exactly the string t.
@@ -1155,7 +1245,7 @@ impl RegExpSolver {
                 }
                 let lo_char = lo.chars().next().unwrap();
                 let hi_char = hi.chars().next().unwrap();
-                if lo_char <= hi_char {
+                if ay_core::smtlib_char_cmp(lo_char, hi_char).is_le() {
                     Some([1].into_iter().collect())
                 } else {
                     Some(BTreeSet::new())

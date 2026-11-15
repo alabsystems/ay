@@ -10,6 +10,8 @@
 
 use super::*;
 
+mod chrono;
+
 impl Solver {
     /// Handle initial unit clauses (before solve loop).
     ///
@@ -155,64 +157,13 @@ impl Solver {
     /// - Otherwise, try to reuse trail by finding the best variable above the
     ///   jump level and backtracking only to that level
     pub(super) fn compute_chrono_backtrack_level(&mut self, jump_level: u32) -> u32 {
-        // CaDiCaL analyze.cpp:653: backtrack level must be strictly below current level
-        debug_assert!(
-            jump_level < self.decision_level,
-            "BUG: jump_level ({jump_level}) >= decision_level ({})",
-            self.decision_level,
-        );
-
-        if !self.chrono_enabled {
-            return jump_level;
+        match self.chrono_backtrack_level_admitted(
+            jump_level,
+            &conflict_analysis_minimize::admitted::Ordinary,
+        ) {
+            Ok(level) => level,
+            Err(never) => match never {},
         }
-
-        // Unit clauses (jump_level == 0) MUST backtrack to level 0.
-        // Chronological backtracking cannot be used here because the unit literal
-        // would be enqueued at a non-zero level, and subsequent backtracking could
-        // undo the assignment. The unit clause would then be unsatisfied in the model.
-        // This was the root cause of #1696.
-        if jump_level == 0 {
-            return 0;
-        }
-
-        // If jump level is at or above current level - 1, no point in chrono BT
-        if jump_level >= self.decision_level.saturating_sub(1) {
-            return jump_level;
-        }
-
-        // Compute how many levels we'd skip with NCB
-        let skip_levels = self.decision_level - jump_level;
-
-        let actual_level = if skip_levels > CHRONO_LEVEL_LIMIT {
-            // Too many levels to skip - use chronological backtracking
-            self.stats.chrono_backtracks += 1;
-            self.decision_level - 1
-        } else if self.chrono_reuse_trail && !self.deep_dive_full_backjump() {
-            // CaDiCaL-style trail reuse: find the best variable above the jump level
-            // and only backtrack to that level to keep more of the useful trail.
-            // CaDiCaL analyze.cpp:675 applies this unconditionally in both stable
-            // and focused modes — use_scores() selects the metric (VSIDS activity
-            // for stable, bump order for focused), not whether to apply trail reuse.
-            self.compute_chrono_reuse_level(jump_level)
-        } else {
-            // Deep-diving (or trail reuse disabled): full non-chronological
-            // backjump straight to the asserting level, matching kissat
-            // learn.c::kissat_determine_new_level. On a fruitless deep dive,
-            // CaDiCaL-style trail reuse keeps the solver pinned deep (staying at
-            // the level of the highest-priority variable above the asserting
-            // level after every conflict), inflating decisions-per-conflict and
-            // starving conflict generation. kissat backjumps to exactly the
-            // asserting level and reuses trail only at restart, generating far
-            // more conflicts per second on the same core (profile lever #1).
-            jump_level
-        };
-
-        // Emit diagnostic event when chrono BT was chosen (#4172, #4674).
-        if actual_level != jump_level {
-            self.emit_diagnostic_chrono_backtrack(self.decision_level, jump_level, actual_level);
-        }
-
-        actual_level
     }
 
     /// Deep-dive full-backjump gate (retired profile lever #1, kissat parity).
@@ -258,104 +209,13 @@ impl Solver {
     /// level. This is important for correctness with chronological backtracking
     /// where variables can have out-of-order level assignments.
     pub(super) fn compute_chrono_reuse_level(&mut self, jump_level: u32) -> u32 {
-        // Precondition: jump_level must be below decision level
-        debug_assert!(
-            jump_level < self.decision_level,
-            "BUG: compute_chrono_reuse_level: jump_level {} >= decision_level {}",
+        match self.chrono_reuse_level_admitted(
             jump_level,
-            self.decision_level,
-        );
-        // Get the trail position where jump_level+1 starts
-        let start_pos = if (jump_level as usize) < self.trail_lim.len() {
-            self.trail_lim[jump_level as usize]
-        } else {
-            return jump_level;
-        };
-
-        // If no assignments above jump level, just use jump level
-        if start_pos >= self.trail.len() {
-            return jump_level;
+            &conflict_analysis_minimize::admitted::Ordinary,
+        ) {
+            Ok(level) => level,
+            Err(never) => match never {},
         }
-
-        // Find the best variable's trail position (not just index).
-        //
-        // COST, NOT POLICY (#backtrack-self-time). This loop is O(trail above
-        // jump_level) and runs once per conflict; it profiled at 20-31%
-        // self-time across live `--competition --proof` children versus
-        // CaDiCaL's 1.37%/2.22% for the same job. The scan itself is
-        // irreducible — the argmax is over a metric (VSIDS activity / VMTF
-        // bump order) that every conflict mutates, so nothing can be cached
-        // across calls — but the ORIGINAL inner body was doing far more work
-        // per element than the argmax needs:
-        //
-        //   * `branch_priority_is_lower` re-dispatched on
-        //     `active_branch_heuristic` on EVERY element, inside the loop;
-        //   * it re-loaded `self.trail[current_best]` and re-looked-up the
-        //     incumbent's score on EVERY element, instead of carrying it;
-        //   * the `Option<usize>` incumbent forced a second branch per element.
-        //
-        // The rewrite hoists the heuristic dispatch out of the loop, carries
-        // the incumbent's score in a register, and seeds the incumbent with
-        // the first element so the `None` arm disappears.
-        //
-        // BIT-IDENTICAL BY CONSTRUCTION. `is_better` was
-        // `score(best) < score(var)` — strict, so the EARLIEST element
-        // attaining the maximum wins, and ties keep the lower trail position
-        // (hence the lower level). `best_score < s` is the same expression on
-        // the same values in the same order, including f64 NaN behaviour
-        // (`<` is false against NaN either way, so a NaN activity keeps the
-        // incumbent exactly as before). No score is read that the old loop did
-        // not read, and none is written.
-        let start_lit = self.trail[start_pos];
-        let mut best_pos = start_pos;
-        match self.active_branch_heuristic {
-            BranchHeuristic::Evsids | BranchHeuristic::Chb => {
-                let mut best_score = self.vsids.activity(start_lit.variable());
-                for i in (start_pos + 1)..self.trail.len() {
-                    let score = self.vsids.activity(self.trail[i].variable());
-                    if best_score < score {
-                        best_pos = i;
-                        best_score = score;
-                    }
-                }
-            }
-            BranchHeuristic::Vmtf => {
-                let mut best_order = self.vsids.bump_order(start_lit.variable());
-                for i in (start_pos + 1)..self.trail.len() {
-                    let order = self.vsids.bump_order(self.trail[i].variable());
-                    if best_order < order {
-                        best_pos = i;
-                        best_order = order;
-                    }
-                }
-            }
-        }
-
-        // Find the level containing the best variable's trail position.
-        // CaDiCaL: while (res < level - 1 && control[res + 1].trail <= best_pos) res++;
-        // In AY: trail_lim[i] = start of level i+1's assignments
-        // So to match control[res+1].trail (start of level res+1), use trail_lim[res]
-        let mut res = jump_level;
-        while res < self.decision_level - 1
-            && (res as usize) < self.trail_lim.len()
-            && self.trail_lim[res as usize] <= best_pos
-        {
-            res += 1;
-        }
-
-        if res > jump_level {
-            self.stats.chrono_backtracks += 1;
-        }
-
-        // Post-condition: result must be between jump_level and decision_level - 1
-        debug_assert!(
-            res >= jump_level && res < self.decision_level,
-            "BUG: chrono_reuse_level result {} out of range [{}, {})",
-            res,
-            jump_level,
-            self.decision_level,
-        );
-        res
     }
 
     /// Reset transient search state so the solver can be reused across multiple `solve()` calls.
@@ -373,6 +233,13 @@ impl Solver {
         // Default to full watch rebuild. Case (b) below may upgrade this to
         // an incremental attach if the arena is preserved (#8374).
         self.cold.incremental_watch_boundary = None;
+
+        // A retracted refutation (`lower_empty_clause_flag`) forces this full
+        // reset. The trail is rebuilt from scratch below, and so are the watch
+        // lists: the incremental attach leaves a clause it found falsified, or
+        // used as a level-0 reason, unwatched.
+        let rebuild_after_retraction =
+            std::mem::take(&mut self.cold.full_reset_after_empty_clause_retraction);
 
         // #inc-pending-conflict: a pending theory conflict is within-solve
         // state — the ClauseRef refers to a clause that was all-false under
@@ -487,6 +354,9 @@ impl Solver {
             let needs_l0_gc_rebuild =
                 !needs_destructive_rebuild && self.cold.l0_gc_modified_clause_db;
             if needs_destructive_rebuild || needs_l0_gc_rebuild {
+                if !self.preflight_original_ledger_replay(0) {
+                    return;
+                }
                 // #8375: When only L0 GC modified the clause DB (no BVE/BCE/
                 // congruence), learned clauses are safe to preserve. They were
                 // derived under the original clause set (L0 GC only removes
@@ -544,7 +414,7 @@ impl Solver {
                 // minimization treats NO_REASON as non-removable (sound,
                 // at worst slightly weaker minimization).
                 for vd in self.var_data.iter_mut() {
-                    vd.reason = NO_REASON;
+                    vd.clear_reason();
                 }
                 self.bump_reason_graph_epoch();
                 self.cold.clause_ids.clear();
@@ -565,7 +435,7 @@ impl Solver {
                             self.cold.clause_ids_reserve_hint,
                             idx,
                         );
-                        self.cold.clause_ids[idx] = (ordinal as u64) + 1;
+                        self.cold.clause_ids[idx] = self.cold.original_ledger.clause_id(ordinal);
                     }
                 }
                 // #8375: Re-add preserved learned clauses after rebuilding
@@ -581,6 +451,9 @@ impl Solver {
                 self.cold.inprocessing_modified_clause_db = false;
                 self.cold.l0_gc_modified_clause_db = false;
                 self.inproc.bve.invalidate_occ_lists();
+                // The rebuilt arena keeps none or only the preserved learned
+                // clauses (`lower_reduction_retrigger_points`).
+                self.lower_reduction_retrigger_points();
                 // JIT cache (#8225): arena was rebuilt from scratch, all
                 // cached compiled code is invalid.
             } else if self.cold.incremental_original_boundary
@@ -591,9 +464,16 @@ impl Solver {
                 // can skip clearing existing watches and attach only new clauses
                 // (#8374). This is safe because the existing clause database is
                 // unchanged — only new originals are appended at the end.
-                self.cold.incremental_watch_boundary = Some(self.arena.len());
+                // After a retracted refutation the existing watches are not
+                // trusted (see `rebuild_after_retraction` above).
+                if !rebuild_after_retraction {
+                    self.cold.incremental_watch_boundary = Some(self.arena.len());
+                }
                 let start = self.cold.incremental_original_boundary;
                 let new_count = self.cold.original_ledger.num_clauses();
+                if !self.preflight_original_ledger_replay(start) {
+                    return;
+                }
                 for clause_idx in start..new_count {
                     let clause = self.cold.original_ledger.clause(clause_idx);
                     let idx = self.arena.add(clause, false);
@@ -606,7 +486,7 @@ impl Solver {
                             self.cold.clause_ids_reserve_hint,
                             idx,
                         );
-                        self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
+                        self.cold.clause_ids[idx] = self.cold.original_ledger.clause_id(clause_idx);
                     }
 
                     // Subsumption scheduling (#8376): mark variables in new
@@ -737,6 +617,10 @@ impl Solver {
         self.cold.stable_mode_start_conflicts = 0;
         self.cold.stable_phase_length = self.cold.stable_phase_init;
         self.cold.stable_phase_count = 0;
+        self.cold.lifetime_search_ticks = self
+            .cold
+            .lifetime_search_ticks
+            .saturating_add(self.total_search_ticks());
         self.search_ticks = [0; 2];
         self.cold.stabilize_tick_inc = 0;
         self.cold.focused_ticks_at_entry = 0;
@@ -985,6 +869,13 @@ impl Solver {
         if !self.cold.assumption_cache_valid {
             return false;
         }
+        // A retracted refutation was derived from the level-0 trail and watch
+        // state the incremental reset would keep. The inc-engine lane
+        // re-validates `assumption_cache_valid` on every solve, so this is the
+        // only gate that reaches it (see `lower_empty_clause_flag`).
+        if self.cold.full_reset_after_empty_clause_retraction {
+            return false;
+        }
 
         // IC3 fast path (#8569 Gap 1): in IC3 mode the ordinary between-solves
         // arena mutation is add_clause (tracked by ic3_new_clauses_pending and
@@ -1064,6 +955,11 @@ impl Solver {
     /// + unit propagation. This avoids the full O(num_vars) reset that
     ///   previously occurred on every IC3 `add_clause` call.
     ///
+    /// That attach can refute the clause database (`has_empty_clause`), and
+    /// nothing may search a refuted database: the assumption and extension
+    /// solves answer UNSAT right after this call, and the IC3 query loop and
+    /// its incremental inprocessing check the flag before they propagate.
+    ///
     /// SAFETY: Caller MUST verify `can_use_incremental_reset()` returns true.
     /// Using this when the arena has been destructively modified is unsound.
     pub(super) fn reset_search_state_incremental(&mut self) {
@@ -1116,6 +1012,9 @@ impl Solver {
         if self.cold.ic3_new_clauses_pending {
             self.cold.ic3_new_clauses_pending = false;
             self.attach_new_clauses_incremental();
+            if self.original_ledger_replay_failed() {
+                return;
+            }
         }
 
         // VSIDS: don't rebuild the full heap. Just re-insert variables
@@ -1215,6 +1114,10 @@ impl Solver {
         self.cold.stable_mode_start_conflicts = 0;
         self.cold.stable_phase_length = self.cold.stable_phase_init;
         self.cold.stable_phase_count = 0;
+        self.cold.lifetime_search_ticks = self
+            .cold
+            .lifetime_search_ticks
+            .saturating_add(self.total_search_ticks());
         self.search_ticks = [0; 2];
         self.cold.stabilize_tick_inc = 0;
         self.cold.focused_ticks_at_entry = 0;
@@ -1385,6 +1288,12 @@ impl Solver {
     /// This is O(new_clauses) instead of the O(num_vars) cost of the full
     /// `reset_search_state()` + `initialize_watches()` path.
     ///
+    /// A clause falsified at level 0 refutes the clause database
+    /// (`has_empty_clause`); every caller must check the flag before
+    /// propagating. The remaining new clauses are still added to the arena,
+    /// because the boundary set on return tells every later reset that all
+    /// ledger clauses below it are there.
+    ///
     /// REQUIRES: at decision level 0, all level-0 state intact from prior solve.
     fn attach_new_clauses_incremental(&mut self) {
         debug_assert_eq!(
@@ -1398,24 +1307,38 @@ impl Solver {
         if start >= new_count {
             return;
         }
+        if !self.preflight_original_ledger_replay(start) {
+            return;
+        }
 
+        // Set once a clause is found falsified at level 0. The clauses after
+        // it still go into the arena, because the boundary set on return
+        // records every ledger clause below it as present; nothing is
+        // propagated or watched on a refuted database, and the full reset that
+        // follows a retraction rebuilds both.
+        let mut refuted = false;
         for clause_idx in start..new_count {
             // Copy clause to avoid borrow conflict with self.
             let clause: Vec<Literal> = self.cold.original_ledger.clause(clause_idx).to_vec();
+            let clause_id = self.cold.original_ledger.clause_id(clause_idx);
 
             // Unit clause: propagate directly at level 0.
             if clause.len() == 1 {
                 let lit = clause[0];
-                if let Some(val) = self.lit_value(lit) {
+                if refuted {
+                    // No propagation on a refuted database; just keep the
+                    // arena complete (below).
+                } else if let Some(val) = self.lit_value(lit) {
                     if !val {
                         // Contradictory unit clause -- mark empty.
                         self.mark_empty_clause();
-                        break;
+                        refuted = true;
                     }
                     // Already satisfied, skip.
                 } else {
-                    let cid = (clause_idx as u64) + 1;
-                    self.record_unit_proof_id_for_lit(lit, cid);
+                    if clause_id != 0 {
+                        self.record_unit_proof_id_for_lit(lit, clause_id);
+                    }
                     self.enqueue(lit, None);
                     if !self.var_lifecycle.is_inactive(lit.variable().index()) {
                         self.fixed_count += 1;
@@ -1425,10 +1348,7 @@ impl Solver {
                 }
                 // Add to arena even though it's unit (for consistency).
                 let idx = self.arena.add(&clause, false);
-                if !self.cold.clause_ids_disabled {
-                    self.cold.clause_ids_grow_for(idx);
-                    self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
-                }
+                self.cold.record_clause_id(idx, clause_id);
                 continue;
             }
 
@@ -1446,9 +1366,13 @@ impl Solver {
             // are false, record a level-0 conflict.
             let clause_len = clause.len();
             let idx = self.arena.add(&clause, false);
-            if !self.cold.clause_ids_disabled {
-                self.cold.clause_ids_grow_for(idx);
-                self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
+            self.cold.record_clause_id(idx, clause_id);
+
+            if clause_len >= 2 && refuted {
+                // Arena-only after a refutation: no search runs on this state
+                // (the flag is checked first), and the full reset that follows
+                // a retraction rebuilds every watch.
+                continue;
             }
 
             if clause_len >= 2 {
@@ -1505,7 +1429,7 @@ impl Solver {
                     // All literals false at level 0 — clause is falsified.
                     // Record level-0 conflict.
                     self.record_level0_conflict_chain(ClauseRef(idx as u32));
-                    break;
+                    refuted = true;
                 } else if num_non_false == 1 && best0_score == 1 {
                     // Exactly one unassigned literal — propagate it as unit.
                     let unit_lit = self.arena.literal(idx, 0);

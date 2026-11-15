@@ -9,6 +9,8 @@ use super::*;
 /// Fully authenticated theorem selected by the common UNSAT mint.
 pub(super) enum CertificationSource {
     StrictProof,
+    StrictNativeBvLiaBundle(PreparedStrictNativeBvLiaBundle),
+    StrictNativeNraSosBundle(PreparedStrictNativeNraSosBundle),
     CheckedSatRefutation,
     PendingNestedArray(PendingNestedArrayBoolBvUnsat),
     CheckedBoolBv {
@@ -26,7 +28,7 @@ pub(super) enum CertificationSource {
         evidence: AuthenticatedBvLiaUnsatQuery,
         exact_roots: Box<[TermId]>,
     },
-    DischargedTrust,
+    DischargedTrust(crate::executor::UnsatCorroboration),
 }
 
 pub(super) enum StrictProofPresentationFailure {
@@ -91,6 +93,58 @@ impl Executor {
         )
     }
 
+    /// #certify-before-presentation fallback. When the proof the funnel is
+    /// about to certify is a derivation kept behind a presentation bound
+    /// (`last_proof_surface_withheld`) and that derivation cannot be certified
+    /// — the strict checker rejects it outright (an `assume` outside the
+    /// obligation), or the trust discharge rejects one of its non-trust steps
+    /// (no empty clause) — revert it to the one-line `(cl)` poison the bound
+    /// used to install, with the document un-withheld, i.e. to exactly the
+    /// state that route produced before. The verdict is then admitted, or
+    /// not, by the same discharge it always was, under the same
+    /// `discharged-trust` label; nothing stronger is ever claimed for it.
+    ///
+    /// Measured on the D7 list (2026-10-02): 2 of the 62 rewrite-site files
+    /// carry a kept derivation rejected this way — AUFDTLIRA spark
+    /// `N624-020 perm_rem sort.adb_72_52` and UFDTNIRA spark `R509-011
+    /// higher_order`, each with a reachable `assume` of a term outside the
+    /// supplied problem obligation. Without the revert both correct `unsat`s
+    /// published `unknown`, here and again in the step-(4) twin screen; the
+    /// poison had been hiding the defective derivation in BOTH places, which
+    /// is a producer defect this records rather than repairs. The probe line
+    /// names it.
+    ///
+    /// Returns whether a revert happened.
+    pub(super) fn revert_withheld_derivation_to_poison(
+        &mut self,
+        why: &dyn std::fmt::Display,
+    ) -> bool {
+        if self.last_proof_surface_withheld.is_none() {
+            return false;
+        }
+        probe_cert_reject(|| {
+            format!(
+                "withheld-surface derivation REJECTED ({why}); reverted to the (cl) poison \
+                 the presentation bound installed before #certify-before-presentation"
+            )
+        });
+        let mut poisoned = ay_core::Proof::new();
+        poisoned.add_rule_step(
+            ay_core::AletheRule::Trust,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        self.last_proof = Some(poisoned);
+        self.last_unsat_proof_reconstruction_suppressed = false;
+        self.last_proof_surface_withheld = None;
+        self.last_proof_term_overrides = None;
+        self.last_proof_quality = None;
+        self.proof_check_result = None;
+        self.clear_finite_enum_proof_state();
+        true
+    }
+
     /// Bind a selected theorem to the freshly authenticated publication scope.
     pub(super) fn bind_unsat_certification_source(
         &mut self,
@@ -99,6 +153,25 @@ impl Executor {
     ) -> Result<UnsatCertificate, UnsatCertificationError> {
         let kind = match source {
             CertificationSource::StrictProof => UnsatCertificateKind::StrictProof(scope),
+            CertificationSource::StrictNativeNraSosBundle(prepared) => {
+                let checked = prepared.bind(scope, self).ok_or_else(|| {
+                    UnsatCertificationError::StrictProofRejected {
+                        reason:
+                            "strict native SOS bundle became stale or stopped before token mint"
+                                .to_string(),
+                    }
+                })?;
+                UnsatCertificateKind::StrictNativeNraSosBundle(checked)
+            }
+            CertificationSource::StrictNativeBvLiaBundle(prepared) => {
+                let checked = prepared.bind(scope, self).ok_or_else(|| {
+                    UnsatCertificationError::StrictProofRejected {
+                        reason: "strict native BV/LIA bundle became stale before token mint"
+                            .to_string(),
+                    }
+                })?;
+                UnsatCertificateKind::StrictNativeBvLiaBundle(checked)
+            }
             CertificationSource::CheckedSatRefutation => {
                 let checked = self.last_checked_sat_refutation.take().ok_or_else(|| {
                     UnsatCertificationError::StrictProofRejected {
@@ -154,7 +227,9 @@ impl Executor {
                         })?;
                 UnsatCertificateKind::CheckedBvLia(checked)
             }
-            CertificationSource::DischargedTrust => UnsatCertificateKind::DischargedTrust(scope),
+            CertificationSource::DischargedTrust(corroboration) => {
+                UnsatCertificateKind::DischargedTrust(scope, corroboration)
+            }
         };
         Ok(UnsatCertificate(kind))
     }

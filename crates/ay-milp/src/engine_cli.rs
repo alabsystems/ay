@@ -31,8 +31,8 @@ impl Flags {
     /// twice. An unknown value flag could instead leak its value into the seed
     /// path positional and turn a misparse into a missing datum.
     ///
-    /// `tests/knob_census.rs` closed the other half (a flag whose knob has no
-    /// carrier); this closes the parser half.
+    /// This closes the parser half; `opts/carriers.rs` closed the other half (a
+    /// flag whose knob had no carrier).
     ///
     /// A bare `--` ends flag parsing: everything after it is positional,
     /// which is how a path that starts with `--` gets through.
@@ -410,7 +410,7 @@ pub const VALUE_FLAGS: &[&str] = &[
     "bumpdiff-lanes",
     "drought-dive",
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
-    // gave their knobs a writer. See `tests/knob_census.rs`.
+    // gave their knobs a writer.
     "node-cut-slots",
     "node-cut-every",
     "node-gmi",
@@ -612,7 +612,7 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
     ("no-bump-lu", EngineEconomics::with_bump_lu, false),
     ("no-float", EngineEconomics::with_float_lane, false),
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
-    // gave their knobs a writer. See `tests/knob_census.rs`.
+    // gave their knobs a writer.
     ("singleton-sub", EngineEconomics::with_singleton_sub, true),
     ("node-cut-eager", EngineEconomics::with_node_cut_eager, true),
     ("amo-multiway", EngineEconomics::with_amo_multiway, true),
@@ -706,7 +706,7 @@ const USIZE_BUILDERS: &[(&str, UsizeBuilder)] = &[
     ("gub-meas-every", EngineEconomics::with_gub_meas_every),
     ("drought-dive", EngineEconomics::with_drought_dive),
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
-    // gave their knobs a writer. See `tests/knob_census.rs`.
+    // gave their knobs a writer.
     ("node-cut-slots", EngineEconomics::with_node_cut_slots),
     ("node-cut-every", EngineEconomics::with_node_cut_every),
     ("node-gmi", EngineEconomics::with_node_gmi),
@@ -744,7 +744,7 @@ const FLOAT_BUILDERS: &[(&str, FloatBuilder)] = &[
     ("heur-share", EngineEconomics::with_heur_share),
     ("diag-cost-perturb", EngineEconomics::with_diag_cost_perturb),
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
-    // gave their knobs a writer. See `tests/knob_census.rs`.
+    // gave their knobs a writer.
     ("node-gmi-margin", EngineEconomics::with_node_gmi_margin),
     ("dive-probe-secs", EngineEconomics::with_dive_probe_secs),
     ("rens-window", EngineEconomics::with_rens_window),

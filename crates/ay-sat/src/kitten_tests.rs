@@ -6,6 +6,8 @@ use super::*;
 
 #[path = "kitten_tests/failing_analysis.rs"]
 mod failing_analysis;
+#[path = "kitten_tests/terminator.rs"]
+mod terminator;
 
 /// Helper: make external literal from 1-based signed integer.
 fn ext_lit(signed: i32) -> u32 {

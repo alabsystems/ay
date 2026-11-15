@@ -4,7 +4,7 @@
 
 //! Let-bridge boundary barriers for derived resolution literals.
 
-use crate::alethe_printer::AlethePrinter;
+use crate::alethe_printer::{AlethePrintError, AlethePrinter};
 use crate::try_export_alethe_with_problem_scope_and_overrides;
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{Proof, Sort, Symbol, TermId, TermStore};
@@ -63,14 +63,26 @@ fn binary_resolution_uses_the_eliminated_complement_of_a_let_assumption() {
         Some(positive_work - 1),
     );
     bounded.prepare_proof(&proof).unwrap();
-    bounded
+    // The step that crosses the budget is reported AS exhaustion, at that
+    // step: the placeholder-filled rendering never leaves `format_step`, so
+    // no judgement reads it and no ledger records it.
+    let refused = bounded
         .format_step(proof.get_step(positive).unwrap(), positive)
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(refused, AlethePrintError::EmissionBudgetExhausted { .. }),
+        "{refused:?}"
+    );
     assert!(bounded.work_budget_exhausted());
     let exhausted_work = bounded.work_used();
-    let discarded = bounded
+    let refused = bounded
         .format_step(proof.get_step(negative).unwrap(), negative)
-        .unwrap();
-    assert!(discarded.contains("@a2b_emission_budget_exhausted"));
+        .unwrap_err();
+    assert!(
+        matches!(refused, AlethePrintError::EmissionBudgetExhausted { .. }),
+        "{refused:?}"
+    );
+    // And the counter stands still past exhaustion: the placeholder costs
+    // nothing.
     assert_eq!(bounded.work_used(), exhausted_work);
 }

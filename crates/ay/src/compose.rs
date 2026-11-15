@@ -1675,9 +1675,19 @@ mod tests {
         let snapshot = StagingSnapshot::take(std::slice::from_ref(&dir));
 
         // Stranded during the stage by a DEAD producer (a grandchild PID, i.e.
-        // not the pid the driver spawned) — both a file and a directory.
-        let stranded_file = dir.join(".ay-dimacs-proof-4243-0.stage");
-        let stranded_dir = dir.join(".ay-dimacs-proof-4244-1");
+        // not the pid the driver spawned) — both a file and a directory. The
+        // PIDs are of children this test ran and reaped: fixed numbers can be
+        // live processes on a busy host, and the sweep rightly spares those.
+        let dead_pid = || {
+            let mut child = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn a short-lived child");
+            let pid = child.id();
+            child.wait().expect("reap the child");
+            pid
+        };
+        let stranded_file = dir.join(format!(".ay-dimacs-proof-{}-0.stage", dead_pid()));
+        let stranded_dir = dir.join(format!(".ay-dimacs-proof-{}-1", dead_pid()));
         std::fs::write(&stranded_file, b"x").expect("write");
         std::fs::create_dir_all(&stranded_dir).expect("mkdir");
         std::fs::write(stranded_dir.join("proof"), b"x").expect("write");

@@ -1,0 +1,11 @@
+pseudo-Boolean proof version 3.0
+% Positive companion to incorrect/version3/output_derivable_solx: DERIVABLE is a
+% real guarantee and must still verify when the core set is genuinely
+% input-entailed. Here a `pol` adds the input constraint to itself (entailed),
+% and the output file matches the resulting core, so every model of the input is
+% a model of the output.
+f 1;
+pol 1 1 +;
+output DERIVABLE FILE;
+conclusion NONE;
+end pseudo-Boolean proof;

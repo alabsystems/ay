@@ -34,8 +34,12 @@ impl GridProbe {
             return None;
         }
         let supplied = diagnostics::witness();
-        let mut witness = Vec::with_capacity(order.len());
-        let mut names = Vec::with_capacity(order.len());
+        // Fallible reservation: a probe that cannot hold one entry per variable
+        // is not installed, rather than aborting the search it observes.
+        let mut witness = Vec::new();
+        witness.try_reserve_exact(order.len()).ok()?;
+        let mut names = Vec::new();
+        names.try_reserve_exact(order.len()).ok()?;
         for &var in order {
             let ay_core::TermData::Var(name, _) = solver.terms.get(var) else {
                 return None;
@@ -60,7 +64,22 @@ impl GridProbe {
     }
 
     fn prefix_is_correct(&self, depth: usize) -> bool {
-        self.correct.borrow()[..depth].iter().all(|value| *value)
+        self.correct
+            .borrow()
+            .get(..depth)
+            .is_some_and(|prefix| prefix.iter().all(|value| *value))
+    }
+
+    /// Record whether the value at `depth` matches the witness and clear every
+    /// deeper slot. `None` when `depth` is outside the traversal order.
+    fn mark(&self, depth: usize, correct: bool) -> Option<()> {
+        let mut flags = self.correct.borrow_mut();
+        *flags.get_mut(depth)? = correct;
+        let deeper = depth.checked_add(1)?;
+        for slot in flags.get_mut(deeper..)? {
+            *slot = false;
+        }
+        Some(())
     }
 
     pub(super) fn level_reset(&self, level: usize) {
@@ -128,15 +147,14 @@ impl GridProbe {
 
     pub(super) fn pin(&self, depth: usize, value: &BigRational) {
         let prefix_was_correct = self.prefix_is_correct(depth);
-        let correct = prefix_was_correct && *value == self.witness[depth];
-        self.correct.borrow_mut()[depth] = correct;
-        for slot in &mut self.correct.borrow_mut()[depth + 1..] {
-            *slot = false;
-        }
+        let correct = prefix_was_correct && self.witness.get(depth) == Some(value);
+        // A depth outside the traversal order has no slot to observe.
+        let (Some(()), Some(reached)) = (self.mark(depth, correct), depth.checked_add(1)) else {
+            return;
+        };
         if correct {
-            self.max_prefix.set(self.max_prefix.get().max(depth + 1));
-            self.level_prefix
-                .set(self.level_prefix.get().max(depth + 1));
+            self.max_prefix.set(self.max_prefix.get().max(reached));
+            self.level_prefix.set(self.level_prefix.get().max(reached));
         } else if prefix_was_correct {
             let mut indices = self.candidate_index.borrow_mut();
             match indices
@@ -151,20 +169,22 @@ impl GridProbe {
     }
 
     pub(super) fn pick(&self, depth: usize, candidate: &BigRational) {
-        self.nodes.set(self.nodes.get() + 1);
+        self.nodes.set(self.nodes.get().saturating_add(1));
         if let Some(count) = self.per_level.borrow_mut().get_mut(self.level.get()) {
-            *count += 1;
+            *count = count.saturating_add(1);
         }
-        self.max_depth.set(self.max_depth.get().max(depth + 1));
-        let correct = self.prefix_is_correct(depth) && *candidate == self.witness[depth];
-        self.correct.borrow_mut()[depth] = correct;
-        for slot in &mut self.correct.borrow_mut()[depth + 1..] {
-            *slot = false;
+        // A depth outside the traversal order has no slot to observe.
+        let Some(reached) = depth.checked_add(1) else {
+            return;
+        };
+        self.max_depth.set(self.max_depth.get().max(reached));
+        let correct = self.prefix_is_correct(depth) && self.witness.get(depth) == Some(candidate);
+        if self.mark(depth, correct).is_none() {
+            return;
         }
         if correct {
-            self.max_prefix.set(self.max_prefix.get().max(depth + 1));
-            self.level_prefix
-                .set(self.level_prefix.get().max(depth + 1));
+            self.max_prefix.set(self.max_prefix.get().max(reached));
+            self.level_prefix.set(self.level_prefix.get().max(reached));
         }
     }
 

@@ -96,7 +96,7 @@ fn test_smt_default_verify_proof_debug_does_not_reject() {
         "SMT default run must not reject synthesized proof config; stderr={stderr}"
     );
     assert!(
-        stdout.contains("sat"),
+        stdout.lines().any(|line| line.trim() == "sat"),
         "expected sat output; stdout={stdout}; stderr={stderr}"
     );
     // Successful SMT solve exits 0 (or 10 for SAT in DIMACS convention, but

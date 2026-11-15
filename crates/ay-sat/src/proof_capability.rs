@@ -132,7 +132,11 @@ const PROOF_CAPABILITY_REGISTRY: &[ProofCapability] = &[
     // `transform_allowed`). The feature itself remains OPT-IN on the Default
     // DIMACS route (0 measured flips — see variant.rs).
     ProofCapability::new(ProofTransform::Congruence, true, false),
-    ProofCapability::new(ProofTransform::Sweep, false, false),
+    // proof-posture-parity (2026-09-10): sweep certifies its facts with the
+    // kitten core lemmas (Kissat sweep.c save_core / add_core), so it is open
+    // on DRAT/VeriPB. LRAT stays closed (no hint chains). Kill-switch:
+    // --sat-no-drat-subst clamps it together with decompose/congruence.
+    ProofCapability::new(ProofTransform::Sweep, true, false),
     ProofCapability::new(ProofTransform::Cce, true, true),
     ProofCapability::new(ProofTransform::Reorder, true, true),
     ProofCapability::new(ProofTransform::Symmetry, false, false),
@@ -200,7 +204,7 @@ pub(crate) fn transform_allowed(mode: ProofMode, transform: ProofTransform) -> b
     if matches!(mode, ProofMode::Drat)
         && matches!(
             transform,
-            ProofTransform::Decompose | ProofTransform::Congruence
+            ProofTransform::Decompose | ProofTransform::Congruence | ProofTransform::Sweep
         )
         && ay_core::sat_ab_switches().no_drat_subst
     {
@@ -312,7 +316,9 @@ mod tests {
         ));
         assert!(transform_allowed(ProofMode::Drat, ProofTransform::Factor));
         assert!(transform_allowed(ProofMode::Drat, ProofTransform::Sbva));
-        assert!(!transform_allowed(ProofMode::Drat, ProofTransform::Sweep));
+        // Sweep DRAT unclamped 2026-09-10 (proof-posture-parity): kitten core
+        // lemmas certify every backbone unit and equivalence binary.
+        assert!(transform_allowed(ProofMode::Drat, ProofTransform::Sweep));
         assert!(!transform_allowed(
             ProofMode::Drat,
             ProofTransform::Symmetry

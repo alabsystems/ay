@@ -65,6 +65,24 @@ fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
 }
 
+/// Whether the run entered the XOR/GE DRAT proof route, read off the one line
+/// that route prints on entry (`crates/ay/src/dimacs/streaming_proof.rs`):
+///
+/// `c XOR: detected N constraints, N clauses consumed, N remaining, N components, A/D rows admitted (proof mode)`
+///
+/// 64a0a0084 (#xor-route-entry) inserted `, A/D rows admitted` before the
+/// suffix on purpose -- the admitted count is what decides whether the route
+/// is worth its cost. The old `components (proof mode)` substring stopped
+/// matching then, which failed every positive arm below and made every
+/// negative arm (the opt-out, the LRAT exclusion) pass without looking. Key on
+/// the line's stable ends instead; the plain theory-route line has no
+/// `(proof mode)` suffix and the declining line has no `detected` prefix.
+fn entered_xor_proof_route(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.starts_with("c XOR: detected ") && line.ends_with(" (proof mode)"))
+}
+
 /// Smoke test: running ay on a DIMACS UNSAT instance with defaults emits
 /// `s UNSATISFIABLE` on stdout and exits with code 20. Verification may
 /// or may not fire based on build mode (debug vs release), but the result
@@ -149,7 +167,7 @@ fn test_xor_proof_route_emits_checker_accepted_drat() {
     );
     assert!(stdout.contains("s UNSATISFIABLE"), "stdout={stdout}");
     assert!(
-        stderr.contains("components (proof mode)"),
+        entered_xor_proof_route(&stderr),
         "flagged DRAT run did not enter the XOR proof route: {stderr}"
     );
     assert!(
@@ -178,7 +196,7 @@ fn assert_xor_route_checker_accepts(stem: &str, content: &str) {
     );
     assert!(stdout.contains("s UNSATISFIABLE"), "stdout={stdout}");
     assert!(
-        stderr.contains("components (proof mode)"),
+        entered_xor_proof_route(&stderr),
         "fixture did not enter XOR proof route: {stderr}"
     );
     assert!(
@@ -235,14 +253,14 @@ fn test_xor_proof_route_is_default_on_with_false_opt_out() {
 
     let default_stderr = run("xor_default_on", false);
     assert!(
-        default_stderr.contains("components (proof mode)"),
+        entered_xor_proof_route(&default_stderr),
         "the XOR proof route ships ON since 2b2749dbfa, but the default run did \
          not enter it: {default_stderr}"
     );
 
     let opt_out_stderr = run("xor_opt_out", true);
     assert!(
-        !opt_out_stderr.contains("components (proof mode)"),
+        !entered_xor_proof_route(&opt_out_stderr),
         "--sat-xor-proof-route false must be honored as the opt-out, but the \
          route still fired: {opt_out_stderr}"
     );
@@ -270,7 +288,7 @@ fn test_xor_proof_flag_keeps_lrat_on_standard_route() {
     );
     assert!(stderr.contains("verify-proof") && stderr.contains("verified"));
     assert!(
-        !stderr.contains("components (proof mode)"),
+        !entered_xor_proof_route(&stderr),
         "LRAT incorrectly entered the hintless XOR TrustedTransform route: {stderr}"
     );
 }

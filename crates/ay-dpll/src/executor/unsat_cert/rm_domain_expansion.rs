@@ -5,19 +5,17 @@
 //! The exact RoundingMode finite-domain UNSAT theorem (#P0.2 Pass C
 //! certification).
 //!
-//! `theories/fp/rm_expand.rs` DECIDES a query whose declared `RoundingMode`
-//! constants reach an FP rounding-op operand, by case-splitting the fixed
-//! five-element mode domain. Until this module existed it could not SAY what it
-//! had proved: the enumeration's per-branch proof sessions attest substituted
-//! problems, so the unsat return wiped the proof/trace state, and the mandatory
-//! certification funnel then refused the verdict. Two correct refutations
-//! published as `unknown` in every certified mode while `--competition` printed
-//! `unsat` for the same queries.
+//! The FP lane DECIDES a query whose declared `RoundingMode` constants reach an
+//! FP rounding-op operand by carrying each mode as three bits in one circuit
+//! (`ay-theories/fp/src/rm.rs`; before 2026-09-30 by case-splitting the five
+//! modes, `theories/fp/rm_expand.rs`). Neither form says what it proved in a
+//! form the mandatory certification funnel checks, so before this module two
+//! correct refutations published as `unknown` in every certified mode while
+//! `--competition` printed `unsat` for the same queries.
 //!
-//! This module is the independent second derivation the funnel can consume. It
-//! reads NOTHING from the enumeration — not its verdict, not its sessions, not
-//! its substitution cache — and re-expands the immutable public-query roots
-//! itself.
+//! This module is the independent derivation the funnel can consume. It reads
+//! NOTHING from the FP lane — not its verdict, not its session — and re-expands
+//! the immutable public-query roots itself.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData, TermEntryStamp, TermStoreSnapshotStamp};
@@ -25,11 +23,11 @@ use ay_core::{Sort as CoreSort, TermId, TermStore as CoreTermStore};
 use ay_frontend::SourceContextStamp;
 use std::cell::Cell;
 
-use super::{CheckedExactClosedForallUnsat, UnsatCertificateKind};
+use super::{CheckedExactClosedForallUnsat, ProbeUnsatAuthority, UnsatCertificateKind};
 use crate::executor::rm_domain::{
     fp_rounding_mode_operand, is_rm_literal, is_rm_sort, rm_literal_mode, rm_literal_term, RM_MODES,
 };
-use crate::executor::{Executor, QueryAuthorityEpoch};
+use crate::executor::{CorroborationSource, Executor, QueryAuthorityEpoch, UnsatEvidence};
 use crate::executor_types::SolveResult;
 
 thread_local! {
@@ -91,8 +89,16 @@ enum RmDomainExpansionRefutation {
     /// folds to `false` because the five modes are five distinct elements.
     FalseConjunct { index: usize },
     /// A disposable probe published UNSAT for the exact branch roots through
-    /// the whole mandatory certification funnel.
+    /// the whole mandatory certification funnel, on a checked authority (a
+    /// strict proof, an independently re-checked refutation, or an exact
+    /// semantic theorem).
     CheckedProbe,
+    /// A disposable probe published UNSAT for the exact branch roots, but on
+    /// `discharged-trust`: its holes were discharged by a fresh-executor
+    /// re-solve of the same code, which is not an independent check. A branch
+    /// refuted this way makes the whole expansion a `discharged-trust`
+    /// admission (see [`CheckedExactRmDomainExpansionUnsat::rests_on_discharged_trust`]).
+    DischargedTrustProbe,
 }
 
 /// One enumerated RoundingMode assignment and the exact root vector the
@@ -108,6 +114,9 @@ struct RmDomainExpansionBranch {
     roots: Box<[TermId]>,
     root_entries: Box<[TermEntryStamp]>,
     refutation: RmDomainExpansionRefutation,
+    /// The branch refutation's evidence: checked for an elementary `false`
+    /// conjunct, the probe's own (level and corroboration) otherwise.
+    evidence: UnsatEvidence,
 }
 
 /// Sealed source theorem for one exact RoundingMode finite-domain expansion.
@@ -275,13 +284,13 @@ fn rm_literal_equality_value(
     symbol: &Symbol,
     args: &[TermId],
 ) -> Option<bool> {
-    if symbol.name() != "=" || args.len() != 2 {
+    if !matches!(symbol, Symbol::Named(name) if name == "=" && !terms.is_declared_function(name))
+        || args.len() != 2
+    {
         return None;
     }
-    // SORT-GUARDED. `rm_literal_mode` recognizes a term by NAME, and the ten
-    // mode spellings are frontend-sealed but not unforgeable through the
-    // embedder API. Requiring the RoundingMode sort as well keeps this fold off
-    // any equality that merely borrows a mode's name at another sort.
+    // Both operands must retain their typed builtin literal identity; a
+    // display name on a free variable never licenses a constant fold.
     if !is_rm_sort(terms.sort(args[0])) || !is_rm_sort(terms.sort(args[1])) {
         return None;
     }
@@ -373,6 +382,53 @@ fn rm_domain_expansion_image_is_exact(
 }
 
 impl CheckedExactRmDomainExpansionUnsat {
+    /// Whether any branch was refuted only on a `discharged-trust` admission.
+    ///
+    /// The theorem is then no stronger than that branch: a floating-point
+    /// branch refuted by the bit-blaster publishes on `discharged-trust`
+    /// (the FP lane records no derivation), and sealing it here must not turn
+    /// it into a checked semantic certificate. This is the D7 evidence defect
+    /// (2026-09-23 hunt): nine wrong `unsat` answers, each a branch the D7
+    /// bit-blaster refuted wrongly, were published as
+    /// `checked-exact-rm-domain-expansion`.
+    pub(super) fn rests_on_discharged_trust(&self) -> bool {
+        self.branches.iter().any(|branch| {
+            matches!(
+                branch.refutation,
+                RmDomainExpansionRefutation::DischargedTrustProbe
+            )
+        })
+    }
+
+    /// The theorem's evidence: that of its weakest branch refutation.
+    pub(super) fn nested_evidence(&self) -> UnsatEvidence {
+        self.branches
+            .iter()
+            .fold(UnsatEvidence::CHECKED, |weakest, branch| {
+                weakest.weakest(branch.evidence)
+            })
+            .nested(CorroborationSource::NestedRmDomainExpansion)
+    }
+
+    /// `(branches, false_conjunct, checked_probe, discharged_trust_probe)`,
+    /// for the #semantic-token census line.
+    pub(super) fn refutation_counts(&self) -> (u32, u32, u32, u32) {
+        let count = |wanted: fn(&RmDomainExpansionRefutation) -> bool| {
+            let n = self
+                .branches
+                .iter()
+                .filter(|branch| wanted(&branch.refutation))
+                .count();
+            u32::try_from(n).unwrap_or(u32::MAX)
+        };
+        (
+            u32::try_from(self.branches.len()).unwrap_or(u32::MAX),
+            count(|r| matches!(r, RmDomainExpansionRefutation::FalseConjunct { .. })),
+            count(|r| matches!(r, RmDomainExpansionRefutation::CheckedProbe)),
+            count(|r| matches!(r, RmDomainExpansionRefutation::DischargedTrustProbe)),
+        )
+    }
+
     pub(super) fn is_current(&self, executor: &Executor) -> bool {
         if crate::executor::model::scoped_term_evaluation_override_active()
             || !self
@@ -467,8 +523,8 @@ impl Executor {
     /// [`Self::try_authorize_current_query_exact_finite_expansion_unsat`]: a
     /// bounded finite expansion that mints a checkable token instead of leaving
     /// a computed refutation with nothing to say for itself.  It takes NOTHING
-    /// from the producer-side enumeration in `theories/fp/rm_expand.rs` — not
-    /// its verdict, not its per-branch sessions, not its substitution cache. It
+    /// from the FP lane's own decision (the three-bit mode encoding,
+    /// `ay-theories/fp/src/rm.rs`) — not its verdict, not its session. It
     /// re-derives the carrier from the epoch roots, rebuilds all `5^k` images
     /// itself, and accepts a branch only on its own elementary `false` conjunct
     /// or on a disposable probe that published UNSAT for it through the whole
@@ -587,7 +643,9 @@ impl Executor {
     /// Elementary first: a root vector holding the constant `false` is refuted
     /// outright, with no solver in the loop at all. Otherwise the branch goes to
     /// a disposable probe whose UNSAT counts only if it published through the
-    /// whole mandatory certification funnel with a checked exact-query token.
+    /// whole mandatory certification funnel with a checked exact-query token —
+    /// and the branch records WHICH authority admitted it, so a
+    /// `discharged-trust` admission is never sealed as a checked one.
     fn rm_domain_expansion_branches(
         &mut self,
         images: Vec<(Vec<TermId>, Vec<TermId>)>,
@@ -599,6 +657,7 @@ impl Executor {
                 return None;
             }
             let false_term = self.ctx.terms.false_term();
+            let mut evidence = UnsatEvidence::CHECKED;
             let refutation = match image.iter().position(|&root| root == false_term) {
                 Some(index) => RmDomainExpansionRefutation::FalseConjunct { index },
                 None => {
@@ -606,10 +665,17 @@ impl Executor {
                         image.clone(),
                         RM_DOMAIN_EXPANSION_BRANCH_BUDGET_MS,
                     )?;
+                    let authority = certified.authority();
+                    evidence = certified.evidence();
                     if !certified.consume(self, &image) {
                         return None;
                     }
-                    RmDomainExpansionRefutation::CheckedProbe
+                    match authority {
+                        ProbeUnsatAuthority::Checked => RmDomainExpansionRefutation::CheckedProbe,
+                        ProbeUnsatAuthority::DischargedTrust => {
+                            RmDomainExpansionRefutation::DischargedTrustProbe
+                        }
+                    }
                 }
             };
             let mode_entries = modes
@@ -626,6 +692,7 @@ impl Executor {
                 roots: image.into_boxed_slice(),
                 root_entries: image_entries.into_boxed_slice(),
                 refutation,
+                evidence,
             });
         }
         Some(branches)
@@ -693,16 +760,11 @@ mod tests {
         (executor, evidence)
     }
 
-    /// The verdict is RECOVERED, and by the intended lane.
-    ///
-    /// Both queries computed `unsat` before this certificate existed and were
-    /// published as `unknown (incomplete self-check-rejected)` — the
-    /// `AssertionEpochMismatch` refusal at `unsat_cert.rs`. Asserting the exact
-    /// admission class rather than the string `unsat` is deliberate: a future
-    /// change that recovers the verdict through some OTHER lane has changed
-    /// what is being claimed, and this test is meant to say so.
+    /// Integral rounding has an independent exact checker. Every branch must
+    /// now carry checked evidence; a trusted branch would invalidate this
+    /// stronger admission even if the solver's UNSAT result remained right.
     #[test]
-    fn rm_domain_expansion_publishes_the_exact_semantic_theorem() {
+    fn rm_domain_expansion_of_integral_rounding_has_checked_branches() {
         for source in [RM_WRONG_PIN_UNSAT_SCRIPT, RM_EQUAL_PAIR_UNSAT_SCRIPT] {
             let mut executor = Executor::new();
             let outputs = execute_script(&mut executor, &format!("{source} (check-sat)"));
@@ -711,12 +773,96 @@ mod tests {
             assert_eq!(
                 executor.last_command_unsat_admission,
                 Some(CommandUnsatAdmission::CheckedExactRmDomainExpansion),
-                "the RoundingMode expansion verdict must come from its own \
-                 exact semantic lane: {source}"
+                "{source}"
             );
             assert!(
-                executor.last_unsat_proof_reconstruction_suppressed,
-                "semantic-only UNSAT must not expose an unrelated proof trace"
+                executor.last_command_unsat_was_exact_semantically_verified(),
+                "{source}"
+            );
+            let (_, evidence) = rm_domain_expansion_evidence(source);
+            assert!(!evidence.rests_on_discharged_trust(), "{source}");
+            let (branches, false_conjunct, checked, trust) = evidence.refutation_counts();
+            assert_eq!(branches, false_conjunct + checked + trust, "{source}");
+            assert_eq!(trust, 0, "{source}");
+        }
+    }
+
+    /// Every branch folded to `false`: nothing but the five-distinct-modes fact
+    /// did the work, the checker re-reads each `false` conjunct itself, and the
+    /// lane's own checked class stands.
+    #[test]
+    fn rm_domain_expansion_of_false_conjuncts_alone_is_checked() {
+        let source = "(declare-const rm RoundingMode) \
+             (assert (fp.isNaN (fp.roundToIntegral rm ((_ to_fp 8 24) RNE 2.5)))) \
+             (assert (= rm roundTowardPositive)) \
+             (assert (= rm roundTowardNegative))";
+        let mut executor = Executor::new();
+        let outputs = execute_script(&mut executor, &format!("{source} (check-sat)"));
+        assert_eq!(outputs, vec!["unsat"]);
+        assert_eq!(
+            executor.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CheckedExactRmDomainExpansion)
+        );
+        let (_, evidence) = rm_domain_expansion_evidence(source);
+        assert!(!evidence.rests_on_discharged_trust());
+        let (branches, false_conjunct, _, trust) = evidence.refutation_counts();
+        assert_eq!((branches, false_conjunct, trust), (5, 5, 0));
+    }
+
+    /// Every branch refuted by a STRICT proof: the lane's checked class
+    /// stands, and each branch's derivation is trust-free.
+    ///
+    /// The 2026-09-23 fp-strings verifier (E1) read `unproved_steps=1` on each
+    /// branch of this shape (its fresh `g5_00027`) as a hole in the branch's
+    /// derivation. It is not one: the branch's FP lemma is `FpGroundEval`,
+    /// which AY's strict checker validates with the exact IEEE-754 evaluator,
+    /// and which the Alethe printer downgrades to `hole` only because no
+    /// pinned external checker can spell it (`--debug-cert`: `c !! wire
+    /// downgrade ... kind FpGroundEval prints as hole`). A checked admission
+    /// may seal only branches like these, so this test fails if the lane is
+    /// ever admitted as `checked-exact-rm-domain-expansion` over a branch whose
+    /// derivation holds a `trust` or `hole` step.
+    #[test]
+    fn rm_domain_expansion_over_strict_checked_fp_branches_is_checked() {
+        let source = "(declare-const r RoundingMode) \
+             (declare-const q Real) \
+             (declare-const x0 (_ FloatingPoint 3 5)) \
+             (assert (= x0 ((_ to_fp 3 5) RTZ q))) \
+             (assert (= q 1000.0)) \
+             (assert (fp.isZero (fp.div r (fp #b1 #b110 #b0111) (_ +zero 3 5))))";
+        let mut executor = Executor::new();
+        let outputs = execute_script(&mut executor, &format!("{source} (check-sat)"));
+        assert_eq!(outputs, vec!["unsat"]);
+        assert_eq!(
+            executor.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CheckedExactRmDomainExpansion)
+        );
+        let (_, evidence) = rm_domain_expansion_evidence(source);
+        assert!(!evidence.rests_on_discharged_trust());
+        let (branches, false_conjunct, checked, trust) = evidence.refutation_counts();
+        assert_eq!((branches, false_conjunct, checked, trust), (5, 0, 5, 0));
+
+        for mode in ["RNE", "RNA", "RTP", "RTN", "RTZ"] {
+            let branch = source
+                .replace("(declare-const r RoundingMode) ", "")
+                .replace("fp.div r ", &format!("fp.div {mode} "));
+            let mut executor = Executor::new();
+            let outputs = execute_script(&mut executor, &format!("{branch} (check-sat)"));
+            assert_eq!(outputs, vec!["unsat"], "{mode}");
+            assert_eq!(
+                executor.last_command_unsat_admission,
+                Some(CommandUnsatAdmission::StrictProof),
+                "{mode}"
+            );
+            let proof = executor
+                .last_proof
+                .as_ref()
+                .expect("a strict-proof branch retains its derivation");
+            let report = ay_proof::terminal_trust_report(proof);
+            assert!(
+                report.is_trust_free(),
+                "{mode}: the branch's derivation must reach the empty clause through \
+                 no trust or hole step: {report:?}"
             );
         }
     }

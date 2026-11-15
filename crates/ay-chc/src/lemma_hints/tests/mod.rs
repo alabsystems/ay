@@ -19,3 +19,4 @@ mod infrastructure;
 mod mod_hints;
 mod parametric_mul_tests;
 mod recurrence;
+mod shared_dag;

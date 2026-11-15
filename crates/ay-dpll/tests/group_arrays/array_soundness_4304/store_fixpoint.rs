@@ -223,3 +223,130 @@ fn disjunctive_store_equality_separated_5086() {
         "separated disjunctive store equality: x=y OR a=b"
     );
 }
+
+/// Storecomm n=3: two 3-store chains over one base in different orders,
+/// reads at a shared index j forced apart. Sat via i2 = i3 (z3 agrees).
+/// Regression #qf-auflia-diseq-shift-overlay: the all-default candidate's
+/// disequality-shift repair used pre-shift values, needlessly separating
+/// i3 from i2; both reads then routed to one write term with conflicting
+/// pin demands and the strict oracle rejected a completable model.
+#[test]
+#[timeout(10_000)]
+fn qf_auflia_storecomm_n3_sat() {
+    let (_, outputs) = solve(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun b () (Array Int Int))
+        (declare-fun i1 () Int)
+        (declare-fun e1 () Int)
+        (declare-fun i2 () Int)
+        (declare-fun e2 () Int)
+        (declare-fun i3 () Int)
+        (declare-fun e3 () Int)
+        (declare-fun j () Int)
+        (declare-fun r1 () Int)
+        (declare-fun r2 () Int)
+        (declare-fun a1 () (Array Int Int))
+        (declare-fun a2 () (Array Int Int))
+        (declare-fun a3 () (Array Int Int))
+        (declare-fun a4 () (Array Int Int))
+        (declare-fun a5 () (Array Int Int))
+        (declare-fun a6 () (Array Int Int))
+        (assert (= a1 (store b i1 e1)))
+        (assert (= a2 (store a1 i2 e2)))
+        (assert (= a3 (store a2 i3 e3)))
+        (assert (= a4 (store b i3 e3)))
+        (assert (= a5 (store a4 i1 e1)))
+        (assert (= a6 (store a5 i2 e2)))
+        (assert (= r1 (select a3 j)))
+        (assert (= r2 (select a6 j)))
+        (assert (not (= i1 i2)))
+        (assert (not (= i1 i3)))
+        (assert (not (= r1 r2)))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(
+        outputs[0], "sat",
+        "storecomm n=3 with i2=i3 read separation is sat (z3 agrees)"
+    );
+}
+
+/// Long alias chain (20 single-store definitions) whose read pin matches
+/// only the BOTTOM write: pin reconstruction must peel every alias link
+/// to route the demand (regression: peel depth was capped at 16, landing
+/// the pin on a dropped mid-chain alias; census storecomm t3 sf files).
+#[test]
+#[timeout(10_000)]
+fn qf_auflia_long_chain_bottom_pin_sat() {
+    let mut smt = String::from("(set-logic QF_AUFLIA)\n(declare-fun b () (Array Int Int))\n");
+    for k in 1..=20 {
+        smt += &format!("(declare-fun a{k} () (Array Int Int))\n(declare-fun i{k} () Int)\n(declare-fun e{k} () Int)\n");
+    }
+    smt += "(declare-fun j () Int)\n(declare-fun r () Int)\n";
+    smt += "(assert (= a1 (store b i1 e1)))\n";
+    for k in 2..=20 {
+        smt += &format!("(assert (= a{k} (store a{} i{k} e{k})))\n", k - 1);
+    }
+    smt += "(assert (= j i1))\n";
+    for k in 2..=20 {
+        smt += &format!("(assert (not (= j i{k})))\n");
+    }
+    smt += "(assert (= r (select a20 j)))\n(assert (= r 5))\n(check-sat)\n";
+    let (_, outputs) = solve(&smt);
+    assert_eq!(
+        outputs[0], "sat",
+        "20-link chain bottom-write read pin is sat (z3 agrees)"
+    );
+}
+
+/// Skolemized-flattened swap: two 6-swap compositions over one base in
+/// sf form — every swap read is its own pin `(= e (select chain i))`
+/// and the final disequality is between pin VARIABLES
+/// `(not (= r1 r2))`. Regression #qfax-sf-witness-target: witness
+/// completion recognized only direct select/select disequalities, so
+/// no separating-index install ever ran for this shape (census
+/// swap_invalid sf), and alias reconciliation then re-equalized the
+/// final reads from stale cascade values. z3 agrees: sat (the last
+/// swap pair differs between the compositions).
+#[test]
+#[timeout(15_000)]
+fn qf_auflia_swap_sf_pin_diseq_sat() {
+    let mut smt = String::from("(set-logic QF_AUFLIA)\n(declare-fun b () (Array Int Int))\n");
+    for i in 0..6 {
+        smt += &format!("(declare-fun i{i} () Int)\n");
+    }
+    smt += "(declare-fun s () Int)\n";
+    let mut ctr = 0usize;
+    let mut chain = |smt: &mut String, pairs: &[(usize, usize)]| -> String {
+        let mut cur = "b".to_string();
+        for &(x, y) in pairs {
+            ctr += 1;
+            let (ea, eb) = (format!("e_{ctr}a"), format!("e_{ctr}b"));
+            ctr += 1;
+            let (a1, a2) = (format!("a_{ctr}a"), format!("a_{ctr}b"));
+            smt.push_str(&format!(
+                "(declare-fun {ea} () Int)\n(declare-fun {eb} () Int)\n\
+                 (declare-fun {a1} () (Array Int Int))\n(declare-fun {a2} () (Array Int Int))\n\
+                 (assert (= {ea} (select {cur} i{y})))\n\
+                 (assert (= {a1} (store {cur} i{x} {ea})))\n\
+                 (assert (= {eb} (select {cur} i{x})))\n\
+                 (assert (= {a2} (store {a1} i{y} {eb})))\n"
+            ));
+            cur = a2;
+        }
+        cur
+    };
+    let a = chain(&mut smt, &[(0, 5), (3, 1), (2, 0), (4, 1), (3, 0), (2, 5)]);
+    let b = chain(&mut smt, &[(0, 5), (3, 1), (2, 0), (4, 1), (3, 0), (0, 2)]);
+    smt += &format!(
+        "(declare-fun r1 () Int)\n(declare-fun r2 () Int)\n\
+         (assert (= r1 (select {a} s)))\n(assert (= r2 (select {b} s)))\n\
+         (assert (not (= r1 r2)))\n(check-sat)\n"
+    );
+    let (_, outputs) = solve(&smt);
+    assert_eq!(
+        outputs[0], "sat",
+        "sf swap compositions differing in last swap pair is sat (z3 agrees)"
+    );
+}

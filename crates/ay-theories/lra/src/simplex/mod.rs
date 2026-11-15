@@ -13,9 +13,8 @@ use crate::rational::Rational;
 use crate::types::{ColEntry, ErrorKey, InfRational, RowPrecision};
 use crate::{BoundType, LraSolver, TableauRow, VarInfo, VarStatus};
 
-/// After this many consecutive iterations with the same basis hash,
-/// switch to Bland's rule for anti-cycling. Reference: Z3 uses 1000
-/// (lp_primal_core_solver.h:380-381 `m_bland_mode_threshold`).
+/// After this many pivots in one feasibility check, use least-index pivoting.
+/// Reference: Dutertre and de Moura, CAV 2006, Fig. 3.
 const BLAND_THRESHOLD: u32 = 1000;
 
 // Cached `--debug lra` channel (checked once per process). #8858

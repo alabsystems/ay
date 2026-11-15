@@ -4,6 +4,8 @@
 
 use super::*;
 
+use crate::types::FdSearchStats;
+
 #[derive(Clone, Debug)]
 struct FiniteLinearExpr {
     coeffs: Vec<(usize, BigInt)>,
@@ -38,15 +40,99 @@ struct FdApp {
     args: Vec<TermId>,
 }
 
+/// Node budget of one finite-domain search (committed assignments).
+pub(crate) const MAX_FD_SEARCH_NODES: u64 = 2_000_000;
+
+/// Work budget of one finite-domain search, in constraint evaluations
+/// (`finite_constraint_possible` calls).
+///
+/// The node budget alone does not bound a call: a node's MRV scan evaluates
+/// every constraint for every value of every unassigned column — up to
+/// `vars × domain × constraints` (≈ 96 × 16 × 2 048 ≈ 3·10^6 BigInt
+/// evaluations per node here), so `MAX_FD_SEARCH_NODES` admits ~10^12
+/// evaluations, i.e. hours inside a single theory `check()`. The work budget
+/// is the bound that actually holds, and the solver deadline/interrupt is
+/// polled every `1 << FdBudget::POLL_SHIFT` evaluations inside a node, not
+/// just at node boundaries (2026-09-23, LIA_finite_domain_deadline report).
+///
+/// Calibration (measured 2026-09-23, release, `AY_DEBUG_ENUM=1`): the three
+/// puzzle tests need 14 400 (SEND+MORE), 94 496 (8-queens) and 8 023 257
+/// (Sudoku 9×9, 81 nodes) evaluations; a deadline cuts a tripped call
+/// within 4 096 evaluations. The cap was 200M (~25× Sudoku) until
+/// 2026-11-03: on `v20_problem__019` a mid-search call with still-wide
+/// domains burned the whole 200M (~19 s) for no witness, while the
+/// witness-bearing call after bound tightening needed only 2M. 32M keeps
+/// ~4× headroom over the largest calibrated witness and bounds a wasted
+/// call to a few seconds; this search is a best-effort witness shortcut,
+/// so a trip only loses the shortcut (see `FdBudget`).
+pub(crate) const MAX_FD_SEARCH_WORK: u64 = 32_000_000;
+
+/// Budget and accounting of one finite-domain search.
+///
+/// A tripped budget (or a deadline/interrupt) aborts the search with `None`
+/// — "no conclusion", never "no witness": every caller falls back to the
+/// ordinary LIA procedure, so a trip can only cost time, never soundness.
+pub(crate) struct FdBudget {
+    nodes: u64,
+    work: u64,
+    max_nodes: u64,
+    max_work: u64,
+    poll_epoch: u64,
+    aborted: bool,
+}
+
+impl FdBudget {
+    /// The deadline is polled once per `1 << POLL_SHIFT` constraint
+    /// evaluations (the polling epoch is `work >> POLL_SHIFT`).
+    const POLL_SHIFT: u32 = 12;
+
+    pub(crate) fn new(max_nodes: u64, max_work: u64) -> Self {
+        Self {
+            nodes: 0,
+            work: 0,
+            max_nodes,
+            max_work,
+            poll_epoch: 0,
+            aborted: false,
+        }
+    }
+
+    /// Charge one constraint evaluation. Returns `true` when a polling epoch
+    /// boundary was crossed, i.e. the caller must check the work budget and
+    /// the solver deadline before continuing.
+    fn charge(&mut self) -> bool {
+        self.work += 1;
+        let epoch = self.work >> Self::POLL_SHIFT;
+        if epoch != self.poll_epoch {
+            self.poll_epoch = epoch;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.nodes >= self.max_nodes || self.work >= self.max_work
+    }
+
+    pub(crate) fn stats(&self) -> FdSearchStats {
+        FdSearchStats {
+            nodes: self.nodes,
+            work: self.work,
+            aborted: self.aborted,
+        }
+    }
+}
+
 impl LiaSolver<'_> {
     pub(crate) fn try_finite_domain_search(&mut self) -> DirectEnumResult {
         const MAX_FD_VARS: usize = 96;
         const MAX_FD_DOMAIN: usize = 16;
         const MAX_FD_ASSERTED_LITS: usize = 2_048;
-        const MAX_FD_SEARCH_NODES: u64 = 2_000_000;
 
         let debug = self.debug_enum;
         self.direct_enum_witness = None;
+        self.fd_search_stats = FdSearchStats::default();
 
         if self.integer_vars.is_empty()
             || self.integer_vars.len() > MAX_FD_VARS
@@ -62,14 +148,20 @@ impl LiaSolver<'_> {
         }
 
         let (term_to_idx, idx_to_term) = self.build_var_index();
-        let Some(constraints) = self.collect_finite_domain_constraints(&term_to_idx) else {
-            return DirectEnumResult::NoConclusion;
-        };
 
-        if constraints.is_empty() {
-            return DirectEnumResult::NoConclusion;
-        }
-
+        // Order of the cheap and the expensive step (2026-09-23,
+        // LIA_finite_domain_deadline report): the domain windows are decided
+        // BEFORE the per-literal linear parse. `collect_finite_domain_constraints`
+        // is the costly part of this probe — a HashMap-backed walk of every
+        // asserted literal, rebuilt on every `check()` — and it used to run
+        // first, only for the very next step to bail because some column had
+        // no finite window (the usual shape of a DPLL(T) query over unbounded
+        // integers; it was ~30 % of every LIA `check()` in the sampled
+        // livelock). The two shape flags the window synthesis needs are a
+        // literal scan, so nothing is parsed until the windows are known to
+        // exist. The verdict is unchanged: both steps are pure functions of the
+        // asserted set, and either bailing yields `NoConclusion`.
+        //
         // Synthesized-domain width for variables that lack a finite bound.
         //
         // The disequality-dense SAT shapes this path targets (pairwise
@@ -106,12 +198,19 @@ impl LiaSolver<'_> {
         // those slots, so the spread requirement is still bounded by the slot
         // count. Capped at `MAX_FD_DOMAIN` so the per-variable branching factor
         // (and total search) stays bounded.
-        let is_disequality_dense = constraints.iter().any(|c| {
-            matches!(
-                c,
-                FiniteConstraint::AllDistinct(_) | FiniteConstraint::Cmp(_, FiniteCmp::Ne)
-            )
-        });
+        // Literal-level mirror of "the constraint set contains an `AllDistinct`
+        // or a `Cmp(_, Ne)`" (see `collect_finite_domain_constraints`: a true
+        // n-ary `distinct` with more than one argument, or a false binary `=`).
+        let is_disequality_dense =
+            self.asserted
+                .iter()
+                .any(|&(literal, value)| match self.terms().get(literal) {
+                    TermData::App(Symbol::Named(name), args) => {
+                        (value && name == "distinct" && args.len() > 1)
+                            || (!value && name == "=" && args.len() == 2)
+                    }
+                    _ => false,
+                });
         // Nonlinear/reification guard: a product/`div`/`mod` term (e.g. `n*n`)
         // is registered as an opaque LIA "variable" so the simplex can carry it
         // as a column, but its *definitional* constraint (`p = n*n`) lives
@@ -125,7 +224,7 @@ impl LiaSolver<'_> {
         // problem to the nonlinear / Diophantine paths by disabling synthesis.
         let all_vars_atomic = idx_to_term
             .iter()
-            .all(|&t| matches!(self.terms.get(t), TermData::Var(_, _)));
+            .all(|&t| matches!(self.terms().get(t), TermData::Var(_, _)));
         let synth_domain_width = if is_disequality_dense && all_vars_atomic {
             self.integer_vars.len().min(MAX_FD_DOMAIN)
         } else {
@@ -137,22 +236,29 @@ impl LiaSolver<'_> {
             return DirectEnumResult::NoConclusion;
         };
 
+        let Some(constraints) = self.collect_finite_domain_constraints(&term_to_idx) else {
+            return DirectEnumResult::NoConclusion;
+        };
+
+        if constraints.is_empty() {
+            return DirectEnumResult::NoConclusion;
+        }
+
         let mut assignment = vec![None; idx_to_term.len()];
-        let mut nodes = 0u64;
-        let found = self.search_finite_domain(
-            &domains,
-            &constraints,
-            &mut assignment,
-            &mut nodes,
-            MAX_FD_SEARCH_NODES,
-        );
+        let mut budget = FdBudget::new(MAX_FD_SEARCH_NODES, MAX_FD_SEARCH_WORK);
+        let found = self.search_finite_domain(&domains, &constraints, &mut assignment, &mut budget);
+        let stats = budget.stats();
+        self.fd_search_stats = stats;
 
         let Some(true) = found else {
             if debug {
                 safe_eprintln!(
-                    "[FD] finite-domain search no witness: nodes={}, budget={}",
-                    nodes,
-                    MAX_FD_SEARCH_NODES
+                    "[FD] finite-domain search no witness: nodes={}/{}, work={}/{}, aborted={}",
+                    stats.nodes,
+                    MAX_FD_SEARCH_NODES,
+                    stats.work,
+                    MAX_FD_SEARCH_WORK,
+                    stats.aborted
                 );
             }
             return DirectEnumResult::NoConclusion;
@@ -167,7 +273,11 @@ impl LiaSolver<'_> {
         match self.check_solution_satisfies_asserted(&solution, &idx_to_term, debug) {
             Some(true) => {
                 if debug {
-                    safe_eprintln!("[FD] finite-domain search found SAT witness in {nodes} nodes");
+                    safe_eprintln!(
+                        "[FD] finite-domain search found SAT witness in {} nodes, {} evaluations",
+                        stats.nodes,
+                        stats.work
+                    );
                 }
                 self.direct_enum_witness = Some(Self::solution_to_model(&solution, &idx_to_term));
                 DirectEnumResult::SatWitness
@@ -210,7 +320,7 @@ impl LiaSolver<'_> {
             if !value {
                 continue;
             }
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {
@@ -220,13 +330,13 @@ impl LiaSolver<'_> {
             let fixed = term_to_idx
                 .get(&args[0])
                 .and_then(|&idx| {
-                    self.terms
+                    self.terms()
                         .extract_integer_constant(args[1])
                         .map(|c| (idx, c))
                 })
                 .or_else(|| {
                     term_to_idx.get(&args[1]).and_then(|&idx| {
-                        self.terms
+                        self.terms()
                             .extract_integer_constant(args[0])
                             .map(|c| (idx, c))
                     })
@@ -317,7 +427,7 @@ impl LiaSolver<'_> {
         let mut constraints = Vec::new();
 
         for &(literal, value) in &self.asserted {
-            match self.terms.get(literal) {
+            match self.terms().get(literal) {
                 TermData::Const(Constant::Bool(b)) => {
                     if value != *b {
                         return None;
@@ -414,7 +524,7 @@ impl LiaSolver<'_> {
             return Some(());
         }
 
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => {
                 *constant += scale * n;
                 Some(())
@@ -467,7 +577,7 @@ impl LiaSolver<'_> {
                     let mut const_factor = BigInt::one();
                     let mut non_const = None;
                     for &arg in args {
-                        if let Some(c) = self.terms.extract_integer_constant(arg) {
+                        if let Some(c) = self.terms().extract_integer_constant(arg) {
                             const_factor *= c;
                         } else if non_const.replace(arg).is_some() {
                             return None;
@@ -502,20 +612,26 @@ impl LiaSolver<'_> {
         FiniteLinearExpr { coeffs, constant }
     }
 
+    /// Backtracking search over `domains` (MRV forward checking over the
+    /// linear `constraints`). Returns `Some(true)` with the witness left in
+    /// `assignment`, `Some(false)` when the box is exhausted, and `None` when
+    /// the `budget` or the solver deadline/interrupt aborted it — an abort is
+    /// no conclusion, the caller falls back to the ordinary procedure.
     fn search_finite_domain(
         &self,
         domains: &[Vec<BigInt>],
         constraints: &[FiniteConstraint],
         assignment: &mut [Option<BigInt>],
-        nodes: &mut u64,
-        max_nodes: u64,
+        budget: &mut FdBudget,
     ) -> Option<bool> {
-        if *nodes >= max_nodes || self.should_timeout() {
+        if budget.exhausted() || self.should_timeout() {
+            budget.aborted = true;
             return None;
         }
 
         if assignment.iter().all(Option::is_some) {
             return Some(constraints.iter().all(|constraint| {
+                budget.charge();
                 self.finite_constraint_possible(constraint, assignment, domains)
             }));
         }
@@ -529,10 +645,19 @@ impl LiaSolver<'_> {
             let mut candidates = Vec::new();
             for value in &domains[idx] {
                 assignment[idx] = Some(value.clone());
+                let mut poll = false;
                 let possible = constraints.iter().all(|constraint| {
+                    poll |= budget.charge();
                     self.finite_constraint_possible(constraint, assignment, domains)
                 });
                 assignment[idx] = None;
+                // The deadline poll inside a node: one MRV scan can be
+                // millions of evaluations, so a per-node poll alone would
+                // overstay a deadline by seconds.
+                if poll && (budget.exhausted() || self.should_timeout()) {
+                    budget.aborted = true;
+                    return None;
+                }
                 if possible {
                     candidates.push(value.clone());
                 }
@@ -551,9 +676,9 @@ impl LiaSolver<'_> {
 
         let idx = best_idx?;
         for value in best_candidates {
-            *nodes += 1;
+            budget.nodes += 1;
             assignment[idx] = Some(value);
-            match self.search_finite_domain(domains, constraints, assignment, nodes, max_nodes) {
+            match self.search_finite_domain(domains, constraints, assignment, budget) {
                 Some(true) => return Some(true),
                 None => {
                     assignment[idx] = None;
@@ -681,15 +806,16 @@ impl LiaSolver<'_> {
         // `MAX_FD_FREE_CLASSES` (equality-classes with a non-singleton domain),
         // not the raw column count, and UFLIA problems carry many pinned UF
         // application columns (e.g. the Hash family has ~10 free vars but 80+
-        // app columns). The node budget + `should_timeout` keep it bounded.
+        // app columns). The node + work budgets and `should_timeout` keep it
+        // bounded.
         const MAX_FD_VARS: usize = 384;
         const MAX_FD_DOMAIN: usize = 16;
         const MAX_FD_ASSERTED_LITS: usize = 8_192;
         const MAX_FD_FREE_CLASSES: usize = 16;
-        const MAX_FD_SEARCH_NODES: u64 = 2_000_000;
         const MAX_FD_APPS: usize = 512;
 
         self.direct_enum_witness = None;
+        self.fd_search_stats = FdSearchStats::default();
         let debug = self.debug_enum;
 
         if self.shared_equalities.is_empty()
@@ -743,23 +869,27 @@ impl LiaSolver<'_> {
         }
 
         let mut assignment = vec![None; idx_to_term.len()];
-        let mut nodes = 0u64;
+        let mut budget = FdBudget::new(MAX_FD_SEARCH_NODES, MAX_FD_SEARCH_WORK);
         let found = self.search_uflia_domain(
             &domains,
             &constraints,
             &apps,
             &term_to_idx,
             &mut assignment,
-            &mut nodes,
-            MAX_FD_SEARCH_NODES,
+            &mut budget,
         );
+        let stats = budget.stats();
+        self.fd_search_stats = stats;
 
         let Some(true) = found else {
             if debug {
                 safe_eprintln!(
-                    "[FD] uflia finite-domain rescue: no witness (nodes={}, budget={})",
-                    nodes,
-                    MAX_FD_SEARCH_NODES
+                    "[FD] uflia finite-domain rescue: no witness (nodes={}/{}, work={}/{}, aborted={})",
+                    stats.nodes,
+                    MAX_FD_SEARCH_NODES,
+                    stats.work,
+                    MAX_FD_SEARCH_WORK,
+                    stats.aborted
                 );
             }
             return false;
@@ -775,7 +905,9 @@ impl LiaSolver<'_> {
             Some(true) => {
                 if debug {
                     safe_eprintln!(
-                        "[FD] uflia finite-domain rescue SAT witness in {nodes} nodes ({} apps)",
+                        "[FD] uflia finite-domain rescue SAT witness in {} nodes, {} evaluations ({} apps)",
+                        stats.nodes,
+                        stats.work,
                         apps.len()
                     );
                 }
@@ -800,7 +932,7 @@ impl LiaSolver<'_> {
     fn collect_fd_apps(&self, idx_to_term: &[TermId]) -> Vec<FdApp> {
         let mut apps = Vec::new();
         for (idx, &term) in idx_to_term.iter().enumerate() {
-            if let TermData::App(Symbol::Named(name), args) = self.terms.get(term) {
+            if let TermData::App(Symbol::Named(name), args) = self.terms().get(term) {
                 if Self::is_fd_arith_symbol(name) {
                     continue;
                 }
@@ -826,7 +958,7 @@ impl LiaSolver<'_> {
             if !value {
                 continue;
             }
-            if let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) {
+            if let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) {
                 if name == "=" && args.len() == 2 {
                     if let (Some(&a), Some(&b)) =
                         (term_to_idx.get(&args[0]), term_to_idx.get(&args[1]))
@@ -889,7 +1021,7 @@ impl LiaSolver<'_> {
             if !value {
                 continue;
             }
-            let TermData::App(Symbol::Named(name), args) = self.terms.get(literal) else {
+            let TermData::App(Symbol::Named(name), args) = self.terms().get(literal) else {
                 continue;
             };
             if name != "=" || args.len() != 2 {
@@ -898,13 +1030,13 @@ impl LiaSolver<'_> {
             let fixed = term_to_idx
                 .get(&args[0])
                 .and_then(|&idx| {
-                    self.terms
+                    self.terms()
                         .extract_integer_constant(args[1])
                         .map(|c| (idx, c))
                 })
                 .or_else(|| {
                     term_to_idx.get(&args[1]).and_then(|&idx| {
-                        self.terms
+                        self.terms()
                             .extract_integer_constant(args[0])
                             .map(|c| (idx, c))
                     })
@@ -1021,13 +1153,9 @@ impl LiaSolver<'_> {
     ) -> usize {
         let n = domains.len();
         let mut parent: Vec<usize> = (0..n).collect();
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
+        // Path-halving union-find (`super::union_find`): every forest read is a
+        // stated bounds check; the O(n) whole-forest check runs once, below.
+        use super::union_find::{find, is_forest};
         for (a, b) in self.collect_fd_equality_edges(term_to_idx) {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
@@ -1035,6 +1163,7 @@ impl LiaSolver<'_> {
                 parent[ra] = rb;
             }
         }
+        debug_assert!(is_forest(&parent));
         let mut reps: HashSet<usize> = HashSet::default();
         for i in 0..n {
             if domains[i].len() > 1 {
@@ -1049,8 +1178,9 @@ impl LiaSolver<'_> {
     /// AND UF congruence over `apps`. Mirrors `search_finite_domain` (MRV
     /// forward-checking over the linear constraints) but prunes each committed
     /// assignment against congruence before recursing, and checks congruence at
-    /// every complete assignment. Never blocks: honours the node budget and the
-    /// global timeout (returning `None`).
+    /// every complete assignment. Never blocks: honours the node and work
+    /// budgets and the global timeout (returning `None`, polled inside a node
+    /// as well as at node boundaries).
     #[allow(clippy::too_many_arguments)]
     fn search_uflia_domain(
         &self,
@@ -1059,18 +1189,18 @@ impl LiaSolver<'_> {
         apps: &[FdApp],
         term_to_idx: &HashMap<TermId, usize>,
         assignment: &mut [Option<BigInt>],
-        nodes: &mut u64,
-        max_nodes: u64,
+        budget: &mut FdBudget,
     ) -> Option<bool> {
-        if *nodes >= max_nodes || self.should_timeout() {
+        if budget.exhausted() || self.should_timeout() {
+            budget.aborted = true;
             return None;
         }
 
         if assignment.iter().all(Option::is_some) {
-            let ok = constraints
-                .iter()
-                .all(|c| self.finite_constraint_possible(c, assignment, domains))
-                && self.uflia_congruence_ok(apps, assignment, term_to_idx);
+            let ok = constraints.iter().all(|c| {
+                budget.charge();
+                self.finite_constraint_possible(c, assignment, domains)
+            }) && self.uflia_congruence_ok(apps, assignment, term_to_idx);
             return Some(ok);
         }
 
@@ -1083,10 +1213,16 @@ impl LiaSolver<'_> {
             let mut candidates = Vec::new();
             for value in &domains[idx] {
                 assignment[idx] = Some(value.clone());
-                let possible = constraints
-                    .iter()
-                    .all(|c| self.finite_constraint_possible(c, assignment, domains));
+                let mut poll = false;
+                let possible = constraints.iter().all(|c| {
+                    poll |= budget.charge();
+                    self.finite_constraint_possible(c, assignment, domains)
+                });
                 assignment[idx] = None;
+                if poll && (budget.exhausted() || self.should_timeout()) {
+                    budget.aborted = true;
+                    return None;
+                }
                 if possible {
                     candidates.push(value.clone());
                 }
@@ -1105,7 +1241,7 @@ impl LiaSolver<'_> {
 
         let idx = best_idx?;
         for value in best_candidates {
-            *nodes += 1;
+            budget.nodes += 1;
             assignment[idx] = Some(value);
             // Prune the committed partial assignment against congruence before
             // descending (keeps the free application chains from exploding).
@@ -1116,8 +1252,7 @@ impl LiaSolver<'_> {
                     apps,
                     term_to_idx,
                     assignment,
-                    nodes,
-                    max_nodes,
+                    budget,
                 ) {
                     Some(true) => return Some(true),
                     None => {
@@ -1188,7 +1323,7 @@ impl LiaSolver<'_> {
         if let Some(&idx) = term_to_idx.get(&term) {
             return assignment[idx].clone();
         }
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Int(n)) => Some(n.clone()),
             TermData::Const(Constant::Rational(r)) if r.0.denom().is_one() => {
                 Some(r.0.numer().clone())
@@ -1240,7 +1375,7 @@ impl LiaSolver<'_> {
         assignment: &[Option<BigInt>],
         term_to_idx: &HashMap<TermId, usize>,
     ) -> Option<bool> {
-        match self.terms.get(term) {
+        match self.terms().get(term) {
             TermData::Const(Constant::Bool(b)) => Some(*b),
             TermData::Not(inner) => Some(!self.fd_eval_bool(*inner, assignment, term_to_idx)?),
             TermData::App(Symbol::Named(name), args) => match name.as_str() {
@@ -1281,3 +1416,6 @@ impl LiaSolver<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

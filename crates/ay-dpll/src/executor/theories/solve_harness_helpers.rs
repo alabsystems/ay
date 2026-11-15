@@ -524,12 +524,12 @@ pub(super) fn augment_lia_source_sets_with_substitutions(
         .zip(source_sets.iter_mut())
     {
         let mut extra_sources = HashSet::default();
-        let mut visited_vars = HashSet::default();
+        let mut visited = HashSet::default();
         collect_lia_substitution_sources_for_term(
             terms,
             assertion,
             var_subst,
-            &mut visited_vars,
+            &mut visited,
             &mut extra_sources,
         );
         for source in extra_sources {
@@ -540,19 +540,24 @@ pub(super) fn augment_lia_source_sets_with_substitutions(
     }
 }
 
+/// Every term is visited once per assertion. Marking only variables, as this
+/// walk once did, re-walked each shared application once per path to it:
+/// exponential on a DAG. On QF_LIA nec-smt `prp-33-43` the `--z3-mode` run was
+/// still inside this walk at 5 s of a `-T:10` budget (sampled), polling no stop,
+/// and ended in the watchdog's hard exit without statistics.
 fn collect_lia_substitution_sources_for_term(
     terms: &TermStore,
     term: TermId,
     var_subst: &VariableSubstitution,
-    visited_vars: &mut HashSet<TermId>,
+    visited: &mut HashSet<TermId>,
     sources: &mut HashSet<TermId>,
 ) {
+    if !visited.insert(term) {
+        return;
+    }
     match terms.get(term) {
         TermData::Const(_) => {}
         TermData::Var(_, _) => {
-            if !visited_vars.insert(term) {
-                return;
-            }
             if let Some(&source_assertion) = var_subst.substitution_sources().get(&term) {
                 sources.insert(source_assertion);
             }
@@ -561,84 +566,44 @@ fn collect_lia_substitution_sources_for_term(
                     terms,
                     replacement,
                     var_subst,
-                    visited_vars,
+                    visited,
                     sources,
                 );
             }
         }
         TermData::App(_, args) => {
             for &arg in args {
-                collect_lia_substitution_sources_for_term(
-                    terms,
-                    arg,
-                    var_subst,
-                    visited_vars,
-                    sources,
-                );
+                collect_lia_substitution_sources_for_term(terms, arg, var_subst, visited, sources);
             }
         }
-        TermData::Not(inner) => collect_lia_substitution_sources_for_term(
-            terms,
-            *inner,
-            var_subst,
-            visited_vars,
-            sources,
-        ),
+        TermData::Not(inner) => {
+            collect_lia_substitution_sources_for_term(terms, *inner, var_subst, visited, sources)
+        }
         TermData::Ite(cond, then_term, else_term) => {
+            collect_lia_substitution_sources_for_term(terms, *cond, var_subst, visited, sources);
             collect_lia_substitution_sources_for_term(
-                terms,
-                *cond,
-                var_subst,
-                visited_vars,
-                sources,
+                terms, *then_term, var_subst, visited, sources,
             );
             collect_lia_substitution_sources_for_term(
-                terms,
-                *then_term,
-                var_subst,
-                visited_vars,
-                sources,
-            );
-            collect_lia_substitution_sources_for_term(
-                terms,
-                *else_term,
-                var_subst,
-                visited_vars,
-                sources,
+                terms, *else_term, var_subst, visited, sources,
             );
         }
         TermData::Let(bindings, body) => {
             for (_, value) in bindings {
                 collect_lia_substitution_sources_for_term(
-                    terms,
-                    *value,
-                    var_subst,
-                    visited_vars,
-                    sources,
+                    terms, *value, var_subst, visited, sources,
                 );
             }
-            collect_lia_substitution_sources_for_term(
-                terms,
-                *body,
-                var_subst,
-                visited_vars,
-                sources,
-            );
+            collect_lia_substitution_sources_for_term(terms, *body, var_subst, visited, sources);
         }
         TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-            collect_lia_substitution_sources_for_term(
-                terms,
-                *body,
-                var_subst,
-                visited_vars,
-                sources,
-            );
+            collect_lia_substitution_sources_for_term(terms, *body, var_subst, visited, sources);
             for &trigger_term in triggers.iter().flatten() {
                 collect_lia_substitution_sources_for_term(
                     terms,
                     trigger_term,
                     var_subst,
-                    visited_vars,
+                    visited,
                     sources,
                 );
             }

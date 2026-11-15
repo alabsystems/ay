@@ -51,9 +51,9 @@ use num_bigint::BigInt;
 use ay_dpll::api::Sort;
 
 use super::{
-    ffi_guard_ast, ffi_guard_uint, record_ast_sort, require_fpa_rounding_mode, require_term_ast,
-    term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_mk_fpa_numeral_double, Z3_mk_fpa_sort, Z3_sort,
-    MAX_FFI_BITVECTOR_WIDTH, MAX_FFI_FP_EXPONENT_BITS, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    ffi_guard_mk, ffi_guard_uint, mk_ast, require_ast, require_fpa_rounding_mode, Z3Context,
+    Z3_ast, Z3_context, Z3_mk_fpa_numeral_double, Z3_mk_fpa_sort, Z3_sort, MAX_FFI_BITVECTOR_WIDTH,
+    MAX_FFI_FP_EXPONENT_BITS, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 /// Record an error code + message on the context and return the null AST sentinel.
@@ -213,14 +213,20 @@ pub unsafe extern "C" fn Z3_mk_fpa_fp(
 ) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(sgnt) = require_term_ast(ctx, sgn, "Z3_mk_fpa_fp", "sign") else {
+        ffi_guard_mk(c, "Z3_mk_fpa_fp", |ctx| {
+            let Some(sgnt) =
+                require_ast(ctx, sgn, "Z3_mk_fpa_fp", "sign").map(|decoded| decoded.term)
+            else {
                 return 0;
             };
-            let Some(expt) = require_term_ast(ctx, exp, "Z3_mk_fpa_fp", "exponent") else {
+            let Some(expt) =
+                require_ast(ctx, exp, "Z3_mk_fpa_fp", "exponent").map(|decoded| decoded.term)
+            else {
                 return 0;
             };
-            let Some(sigt) = require_term_ast(ctx, sig, "Z3_mk_fpa_fp", "significand") else {
+            let Some(sigt) =
+                require_ast(ctx, sig, "Z3_mk_fpa_fp", "significand").map(|decoded| decoded.term)
+            else {
                 return 0;
             };
             let Sort::BitVec(sign_bv) = ctx.solver.sort_of(sgnt) else {
@@ -259,11 +265,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_fp(
                 );
             }
             match ctx.solver.try_fp_from_bvs(sgnt, expt, sigt, eb, sb) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::FloatingPoint(eb, sb)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -290,7 +292,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_bv(c: Z3_context, bv: Z3_ast, s: Z3_sor
     let Some((eb, sb)) = (unsafe { fp_sort_params(s) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_to_fp_bv", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -301,8 +303,9 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_bv(c: Z3_context, bv: Z3_ast, s: Z3_sor
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(bvt) = require_term_ast(ctx, bv, "Z3_mk_fpa_to_fp_bv", "bit-vector value")
+        ffi_guard_mk(c, "Z3_mk_fpa_to_fp_bv", |ctx| {
+            let Some(bvt) = require_ast(ctx, bv, "Z3_mk_fpa_to_fp_bv", "bit-vector value")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -314,11 +317,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_bv(c: Z3_context, bv: Z3_ast, s: Z3_sor
                 );
             }
             match ctx.solver.try_bv_to_fp_reinterpret(bvt, eb, sb) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::FloatingPoint(eb, sb)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -345,7 +344,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
     let Some((eb, sb)) = (unsafe { fp_sort_params(s) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_to_fp_unsigned", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -356,12 +355,12 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_to_fp_unsigned", |ctx| {
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_unsigned", rm) else {
                 return 0;
             };
-            let Some(bvt) =
-                require_term_ast(ctx, t, "Z3_mk_fpa_to_fp_unsigned", "bit-vector value")
+            let Some(bvt) = require_ast(ctx, t, "Z3_mk_fpa_to_fp_unsigned", "bit-vector value")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -373,11 +372,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
                 );
             }
             match ctx.solver.try_bv_to_fp_unsigned(rmt, bvt, eb, sb) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::FloatingPoint(eb, sb)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -401,9 +396,9 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
 pub unsafe extern "C" fn Z3_mk_fpa_to_ieee_bv(c: Z3_context, t: Z3_ast) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(xt) =
-                require_term_ast(ctx, t, "Z3_mk_fpa_to_ieee_bv", "floating-point operand")
+        ffi_guard_mk(c, "Z3_mk_fpa_to_ieee_bv", |ctx| {
+            let Some(xt) = require_ast(ctx, t, "Z3_mk_fpa_to_ieee_bv", "floating-point operand")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -432,11 +427,9 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ieee_bv(c: Z3_context, t: Z3_ast) -> Z3_as
             }
             match ctx.solver.try_fp_to_ieee_bv(xt) {
                 Ok(t) => {
-                    let a = term_to_ast(ctx, t);
                     // Record the BitVec(eb+sb) sort the core builder computed.
                     let sort = ctx.solver.sort_of(t);
-                    record_ast_sort(ctx, a, sort);
-                    a
+                    mk_ast(ctx, t, sort)
                 }
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
@@ -456,8 +449,9 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ieee_bv(c: Z3_context, t: Z3_ast) -> Z3_as
 pub unsafe extern "C" fn Z3_mk_fpa_to_real(c: Z3_context, t: Z3_ast) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
-            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_real", "floating-point operand")
+        ffi_guard_mk(c, "Z3_mk_fpa_to_real", |ctx| {
+            let Some(xt) = require_ast(ctx, t, "Z3_mk_fpa_to_real", "floating-point operand")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -469,11 +463,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_real(c: Z3_context, t: Z3_ast) -> Z3_ast {
                 );
             }
             match ctx.solver.try_fp_to_real(xt) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::Real);
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::Real),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -497,7 +487,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_sbv(
 ) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_to_sbv", |ctx| {
             if sz == 0 || sz > MAX_FFI_BITVECTOR_WIDTH {
                 return ast_error(
                     ctx,
@@ -510,7 +500,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_sbv(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_sbv", rm) else {
                 return 0;
             };
-            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_sbv", "floating-point operand")
+            let Some(xt) = require_ast(ctx, t, "Z3_mk_fpa_to_sbv", "floating-point operand")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -522,11 +513,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_sbv(
                 );
             }
             match ctx.solver.try_fp_to_sbv(rmt, xt, sz) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::bitvec(sz));
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::bitvec(sz)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -550,7 +537,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ubv(
 ) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_to_ubv", |ctx| {
             if sz == 0 || sz > MAX_FFI_BITVECTOR_WIDTH {
                 return ast_error(
                     ctx,
@@ -563,7 +550,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ubv(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_ubv", rm) else {
                 return 0;
             };
-            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_ubv", "floating-point operand")
+            let Some(xt) = require_ast(ctx, t, "Z3_mk_fpa_to_ubv", "floating-point operand")
+                .map(|decoded| decoded.term)
             else {
                 return 0;
             };
@@ -575,11 +563,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ubv(
                 );
             }
             match ctx.solver.try_fp_to_ubv(rmt, xt, sz) {
-                Ok(t) => {
-                    let a = term_to_ast(ctx, t);
-                    record_ast_sort(ctx, a, Sort::bitvec(sz));
-                    a
-                }
+                Ok(t) => mk_ast(ctx, t, Sort::bitvec(sz)),
                 Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
             }
         })
@@ -676,11 +660,7 @@ fn build_fp_numeral_fields(
     let bits =
         (BigInt::from(u8::from(sgn)) << sign_shift) | (biased << (sb as usize - 1)) | sig_big;
     match ctx.solver.try_fp_const_from_bits_bigint(&bits, eb, sb) {
-        Ok(t) => {
-            let a = term_to_ast(ctx, t);
-            record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
-            a
-        }
+        Ok(t) => mk_ast(ctx, t, Sort::FloatingPoint(eb, sb)),
         Err(e) => ast_error(ctx, Z3_INVALID_ARG, format!("{e}")),
     }
 }
@@ -708,7 +688,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_numeral_int_uint(
     let Some((eb, sb)) = (unsafe { fp_sort_params(ty) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_numeral_int_uint", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -719,7 +699,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_numeral_int_uint(
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_numeral_int_uint", |ctx| {
             build_fp_numeral_fields(
                 ctx,
                 "Z3_mk_fpa_numeral_int_uint",
@@ -755,7 +735,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_numeral_int64_uint64(
     let Some((eb, sb)) = (unsafe { fp_sort_params(ty) }) else {
         // SAFETY: `c` forwarded under the caller's contract.
         return unsafe {
-            ffi_guard_ast(c, |ctx| {
+            ffi_guard_mk(c, "Z3_mk_fpa_numeral_int64_uint64", |ctx| {
                 ast_error(
                     ctx,
                     Z3_SORT_ERROR,
@@ -766,7 +746,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_numeral_int64_uint64(
     };
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
-        ffi_guard_ast(c, |ctx| {
+        ffi_guard_mk(c, "Z3_mk_fpa_numeral_int64_uint64", |ctx| {
             build_fp_numeral_fields(
                 ctx,
                 "Z3_mk_fpa_numeral_int64_uint64",

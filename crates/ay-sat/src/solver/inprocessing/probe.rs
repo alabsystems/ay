@@ -11,8 +11,15 @@ impl Solver {
     ///
     /// Returns `true` only if UNSAT is proven (level-0 conflict after learning
     /// a derived unit). Returns `false` otherwise.
+    #[cfg(test)]
     pub(in crate::solver) fn probe(&mut self) -> bool {
-        let result = self.probe_body();
+        self.probe_until(&|| false)
+    }
+
+    /// `probe`, ending early, as on an interrupt, once the search's stop
+    /// fires (`inprocessing_stop_requested`, polled per candidate).
+    pub(in crate::solver) fn probe_until(&mut self, should_stop: &dyn Fn() -> bool) -> bool {
+        let result = self.probe_body(should_stop);
         self.inproc_ctrl
             .probe
             .reschedule(self.num_conflicts, PROBE_INTERVAL);
@@ -25,7 +32,7 @@ impl Solver {
     /// If a conflict is found, the literal is "failed" and its negation must be true.
     ///
     /// This must be called at decision level 0 (after a restart) for correctness.
-    fn probe_body(&mut self) -> bool {
+    fn probe_body(&mut self, should_stop: &dyn Fn() -> bool) -> bool {
         if !self.require_level_zero() {
             return false;
         }
@@ -78,13 +85,15 @@ impl Solver {
         // AY_XP_PROBE_PERMILLE / AY_XP_PROBE_MIN (default-OFF measured-infra,
         // see xp_probe_vivify.rs): when unset these fall through to the shipping
         // constants, so the default budget is byte-for-byte unchanged.
-        let effective_probe_effort = probe_permille().unwrap_or(
-            if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
-                PROBE_LARGE_FORMULA_EFFORT_PERMILLE
-            } else {
-                PROBE_EFFORT_PERMILLE
-            },
-        );
+        let effective_probe_effort = probe_permille()
+            .or_else(|| giant_inproc_permille(self.num_vars).map(|(_, probe)| probe))
+            .unwrap_or(
+                if self.num_original_clauses > LARGE_FORMULA_REDUCE_CAP_THRESHOLD {
+                    PROBE_LARGE_FORMULA_EFFORT_PERMILLE
+                } else {
+                    PROBE_EFFORT_PERMILLE
+                },
+            );
         let min_effort = probe_min_effort().unwrap_or(PROBE_MIN_EFFORT);
         let ticks_now = self.search_ticks[0] + self.search_ticks[1];
         let ticks_delta = ticks_now.saturating_sub(self.inproc.prober.last_search_ticks());
@@ -103,8 +112,10 @@ impl Solver {
             // because the inprocessing dispatcher only checks the flag BETWEEN
             // passes. Probing is a pure optimization, so bailing out is always
             // sound; one relaxed atomic load per candidate is negligible next
-            // to the full BCP each probe performs.
-            if self.cold.probe_ticks >= tick_limit || self.is_interrupted() {
+            // to the full BCP each probe performs. The search's stop, which no
+            // flag carries, is polled here too, and costs one call of it.
+            if self.cold.probe_ticks >= tick_limit || self.inprocessing_stop_requested(should_stop)
+            {
                 break;
             }
 
@@ -255,9 +266,12 @@ impl Solver {
                 } else {
                     self.collect_probe_conflict_lrat_hints(conflict_ref, probe_lit, forced)
                 };
+                // `--sat-veripb-hints`: the unit's ids, read off the conflict.
+                let veripb_ids = forced
+                    .and_then(|unit| self.veripb_probe_hints(&[unit], Some(conflict_ref), None));
 
                 // Backtrack to level 0
-                self.backtrack(0);
+                self.backtrack_probe(0);
                 debug_assert_eq!(
                     self.decision_level, 0,
                     "BUG: probe backtrack did not reach level 0"
@@ -289,6 +303,9 @@ impl Solver {
                     if self.cold.lrat_enabled && lrat_hints.is_empty() {
                         self.inproc.prober.mark_probed(probe_lit, self.fixed_count);
                         continue;
+                    }
+                    if let Some(ids) = &veripb_ids {
+                        self.veripb_ready_hints(&[unit_lit], ids);
                     }
                     // Learn the unit clause (proof emit + clause DB + enqueue + propagate).
                     if self.learn_derived_unit(unit_lit, &lrat_hints) {
@@ -353,7 +370,7 @@ impl Solver {
                 }
             } else {
                 // No conflict - backtrack and continue
-                self.backtrack(0);
+                self.backtrack_probe(0);
                 debug_assert_eq!(
                     self.decision_level, 0,
                     "BUG: probe backtrack (no-conflict) did not reach level 0"

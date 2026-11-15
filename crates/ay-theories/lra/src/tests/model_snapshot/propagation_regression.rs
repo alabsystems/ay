@@ -789,6 +789,87 @@ fn test_capped_implied_bound_cascade_stays_pending_issue_8422() {
     );
 }
 
+/// A full overlay whose direct bounds did not actually change any slot
+/// must not restamp every variable: restamping defeats the generation
+/// skip and re-analyzes every row on the next sweep (measured on Gcd:
+/// 4,040 full overlays and 35M rows analyzed in 20 s). Only variables
+/// whose slot value or strictness changed earn a new generation.
+#[test]
+fn test_full_overlay_without_slot_change_keeps_generation_stamps() {
+    let terms = TermStore::new();
+    let mut solver = LraSolver::new(&terms);
+
+    let bound = |value: i64, reason: u32| {
+        Bound::new(
+            BigRational::from(BigInt::from(value)).into(),
+            vec![TermId::new(reason)],
+            vec![true],
+            vec![Rational::one()],
+            false,
+        )
+    };
+
+    solver.vars = vec![
+        VarInfo {
+            value: InfRational::from_rational(BigRational::zero()),
+            lower: Some(bound(0, 1000)),
+            upper: None,
+            status: Some(VarStatus::Basic(0)),
+        },
+        VarInfo {
+            value: InfRational::from_rational(BigRational::zero()),
+            lower: Some(bound(5, 1001)),
+            upper: None,
+            status: Some(VarStatus::NonBasic),
+        },
+        VarInfo {
+            value: InfRational::from_rational(BigRational::zero()),
+            lower: None,
+            upper: None,
+            status: Some(VarStatus::NonBasic),
+        },
+    ];
+    // Row 0: s0 = y - x (derives y >= 5 from s0 >= 0 and x >= 5).
+    solver.rows = vec![TableauRow::new(
+        0,
+        vec![
+            (1, BigRational::from(BigInt::from(-1))),
+            (2, BigRational::from(BigInt::from(1))),
+        ],
+        BigRational::zero(),
+    )];
+    solver.col_index = vec![Vec::new(); 3];
+    solver.col_index[1].push(ColEntry::new(0, 0));
+    solver.col_index[2].push(ColEntry::new(0, 1));
+    solver.basic_var_to_row.insert(0, 0);
+    solver.touched_rows.insert(0);
+
+    let first = solver.compute_implied_bounds();
+    assert!(
+        solver.implied_bounds[2].0.is_some(),
+        "first pass should derive y >= 5, got {first:?}"
+    );
+    let gens_before = solver.var_bound_gen.clone();
+    let analyzed_before = solver.stats.implied_rows_analyzed;
+    assert!(analyzed_before > 0, "first pass must analyze the row");
+
+    // Force the full-overlay path (flag set, no tracked changed vars)
+    // with every direct bound unchanged.
+    solver.direct_bounds_changed_since_implied = true;
+    solver.direct_bounds_changed_vars.clear();
+    solver.touched_rows.clear();
+    let _ = solver.compute_implied_bounds();
+
+    assert_eq!(
+        solver.var_bound_gen, gens_before,
+        "unchanged slots must keep their generation stamps"
+    );
+    assert_eq!(
+        solver.stats.implied_rows_analyzed, analyzed_before,
+        "rows with unchanged inputs must be generation-skipped, not re-analyzed"
+    );
+}
+
 /// Verify that propagate() refreshes simplex feasibility before running
 /// touched-row analysis (#6987). When `bounds_tightened_since_simplex` is
 /// true, propagate() must call dual_simplex() to update the basis before

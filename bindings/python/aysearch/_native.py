@@ -61,7 +61,8 @@ def _load_library() -> ctypes.CDLL:
         if path.is_file():
             return ctypes.CDLL(str(path))
     raise OSError(
-        "Could not locate libay_ffi. Build it with `cargo build -p ay-ffi`, "
+        "Could not locate libay_ffi. Build it with `targo --unverified build -p ay-ffi` (Trust toolchain) "
+        "or `cargo build -p ay-ffi`, "
         "install the bundled wheel, or set AYSEARCH_LIB to its full path.\nTried:\n  "
         + "\n  ".join(tried)
     )

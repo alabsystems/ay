@@ -2198,12 +2198,12 @@ fn test_real_int_mixed_get_value_z3_exact() {
         .expect("invariant: execute succeeds");
 
     assert_eq!(outputs[0], "sat");
-    // Real pairs are z3-byte-exact. Int stays on the legacy path untouched
-    // (positive `5` matches z3; the bare `-5` is the pre-existing Int
-    // get-value spelling, deliberately NOT changed here — flagged follow-up).
+    // Real and Int pairs are z3-byte-exact: a negative Int is `(- 5)`, the
+    // only SMT-LIB spelling (a bare `-5` lexes as a symbol and the strict
+    // typed decoder refuses it).
     assert_eq!(
         outputs[1],
-        "((r 5.0) (s (/ 7.0 2.0)) (n (- 5.0)) (m (- (/ 7.0 2.0))) (i 5) (j -5))"
+        "((r 5.0) (s (/ 7.0 2.0)) (n (- 5.0)) (m (- (/ 7.0 2.0))) (i 5) (j (- 5)))"
     );
 }
 

@@ -44,6 +44,22 @@ use record::TapRecord;
 use ring::{RingConsumer, RingProducer, RingPushError};
 use serializer::{SerializerFlow, TapSerializer};
 
+/// Internal accounting failure cannot authorize uncounted writer/capture
+/// cleanup. Ordinary capacity contention queues rather than reaching this.
+fn caller_scope() -> ay_sys::compute_budget::ComputeScope {
+    match ay_sys::compute_budget::ComputeScope::enter() {
+        Ok(scope) => scope,
+        Err(_) => std::process::abort(),
+    }
+}
+
+fn passive_wait<R>(wait: impl FnOnce() -> R) -> R {
+    match ay_sys::compute_budget::with_suspended_current(wait) {
+        Ok(result) => result,
+        Err(_) => std::process::abort(),
+    }
+}
+
 /// Generous conclusion-handshake timeout: the serializer only has the ring
 /// backlog plus one flush left when the solver blocks here.
 const CONCLUSION_TIMEOUT: Duration = Duration::from_mins(10);
@@ -192,6 +208,7 @@ impl ProofTap {
         num_input_constraints: u64,
         ring_capacity: usize,
     ) -> Result<Self, ProofError> {
+        let _scope = caller_scope();
         let stats = Arc::new(TapStats::default());
         let writer = VeriPbWriter::new(
             CountingWriter {
@@ -238,6 +255,7 @@ impl ProofTap {
         stats: Arc<TapStats>,
         soft_cap: Option<u64>,
     ) -> Self {
+        let _scope = caller_scope();
         let (producer, consumer) = ring::ring(ring_capacity);
         let shared = Arc::new(TapShared {
             poisoned: AtomicBool::new(false),
@@ -336,6 +354,7 @@ impl ProofTap {
     /// Pushes one record, returning its encoded byte size (feeds the
     /// CHECKPOINT frame-bytes threshold).
     fn push(&mut self, record: &TapRecord) -> Result<usize, ProofError> {
+        let _scope = caller_scope();
         let Some(producer) = self.producer.as_mut() else {
             return Err(ProofError::TapTransport("tap already shut down"));
         };
@@ -530,7 +549,8 @@ impl ProofTap {
     }
 
     fn await_conclusion(&mut self) -> Result<(), ProofError> {
-        match self.done_rx.recv_timeout(CONCLUSION_TIMEOUT) {
+        let _scope = caller_scope();
+        match passive_wait(|| self.done_rx.recv_timeout(CONCLUSION_TIMEOUT)) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(())) => Err(self.take_error()),
             Err(RecvTimeoutError::Timeout) => Err(ProofError::TapSerializer(String::from(
@@ -551,6 +571,7 @@ impl ProofTap {
     /// Shuts the tap down and surfaces any serializer error. Called from
     /// `conclude_proof` after the (optional) conclusion handshake.
     pub(crate) fn finish(&mut self) -> Result<(), ProofError> {
+        let _scope = caller_scope();
         if let Some(producer) = self.producer.as_mut() {
             // Best-effort; producer drop below closes the ring regardless.
             let mut buf = Vec::with_capacity(4);
@@ -559,7 +580,7 @@ impl ProofTap {
         }
         self.producer = None;
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let _ = passive_wait(|| join.join());
         }
         if self.shared.poisoned.load(Ordering::Acquire) {
             return Err(self.take_error());
@@ -570,12 +591,13 @@ impl ProofTap {
 
 impl Drop for ProofTap {
     fn drop(&mut self) {
+        let _scope = caller_scope();
         // Close the ring so the serializer drains and exits, then join. The
         // temp proof is deleted by the caller's commit-or-remove logic when no
         // conclusion committed, so a discarded result here is safe.
         self.producer = None;
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let _ = passive_wait(|| join.join());
         }
     }
 }
@@ -590,6 +612,9 @@ fn serializer_thread<W: Write>(
     stats: Arc<TapStats>,
     soft_cap: Option<u64>,
 ) {
+    // Writer operations, formatting and arbitrary sink cleanup all retain a
+    // real unit. Only the empty-ring passive wait releases occupancy.
+    let _scope = caller_scope();
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut serializer = TapSerializer::new(writer);
         let mut buf = Vec::with_capacity(512);
@@ -644,6 +669,9 @@ fn serializer_thread<W: Write>(
         }
     }
 }
+
+#[cfg(test)]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {

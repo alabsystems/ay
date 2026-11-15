@@ -1,0 +1,6 @@
+(set-logic QF_UFDTLIA)
+(declare-datatypes ((P 0)) (((mk (fst Int) (snd Int)))))
+(declare-const p P)
+(assert (= (fst p) 1))
+(assert (= (snd p) 2))
+(check-sat)

@@ -22,12 +22,244 @@
 
 use ay_core::term::{Constant, Symbol, TermData, TermId};
 use num_rational::BigRational;
-use num_traits::{One, Zero};
+use num_traits::{One, Signed, Zero};
+use std::cmp::Ordering;
 
 use crate::feasible_set::{FeasibilityClass, FeasibleSet};
 use crate::NiaSolver;
 
 impl NiaSolver<'_> {
+    /// The feasible-set look-ahead's phase suggestion for `atom`, or `None`
+    /// when it has no opinion (the caller then asks the wrapped linear solver,
+    /// exactly as before).
+    ///
+    /// # Why this exists (#nonlinear-phase-hints)
+    ///
+    /// The SAT seeder queries `suggest_phase` for EVERY unassigned theory atom
+    /// after EVERY BCP quiescence. The previous implementation answered by
+    /// building both polarities' feasible sets — two `compute_literal_feasible_set`
+    /// calls, each evaluating both operands and every leaf of the
+    /// linear-univariate walk through `LraSolver::get_value` (a `BigRational`
+    /// per leaf, plus the O(#vars) materialisation delta whenever the value
+    /// carries an ε) and allocating the interval sets — and then compared the
+    /// two sets. Sampled at 36–72 % of the wall on QF_UFNRA `cas` (`40m10`) and
+    /// 62–68 % on QF_UFDTNIA Certora `11775` (this NIA copy is the lane the
+    /// Certora file runs on; the NRA copy carries the same derivation).
+    ///
+    /// # What it computes, and why it is value-exact
+    ///
+    /// For a binary atom `lhs cmp rhs` the two feasible sets differ only in
+    /// the polarity they are built for; the free variable, the coefficient
+    /// `a` and the target are the same, so the old decision is a function of
+    /// `cmp`, of which side carries the free variable, and of `a` alone:
+    ///
+    /// - `a = 0` (a factor evaluates to zero): the set for polarity `p` is full
+    ///   iff `0 cmp target` has truth value `p`, so exactly one polarity is
+    ///   empty and the suggestion is that truth value — computed below by the
+    ///   reference (it needs the target's exact value; measured rare).
+    /// - `a ≠ 0`: both sets are non-empty, and the comparison of their
+    ///   interval counts decides. With `cmp'` = `cmp` flipped when `a < 0`:
+    ///   `distinct` gives 2 intervals against 1 for its negation → `true`;
+    ///   `=` gives 1 against 2 → `false`; the four inequalities give 1 against
+    ///   1 → no opinion; an unrecognised comparator gives the full line (1)
+    ///   against `distinct` (2) → `false`. (`flip_cmp` maps an unrecognised
+    ///   comparator to `=`, which lands on the same `false`.)
+    ///
+    /// So only the SIGN of `a` is needed, and `a` is a product of leaf values
+    /// (`c * inner` at every `*` node, negated by `-`), whose sign is the
+    /// product of the leaves' signs and which is zero iff a leaf is zero.
+    /// `linear_univariate_coefficient_sign` walks the term exactly as
+    /// `extract_linear_univariate` does — the same nodes, the same
+    /// "is this operand evaluable" tests (`term_has_value`, the existence bit
+    /// of `term_value`), the same first-match order — and folds the leaf
+    /// signs (`term_value_sign`, exact without materialising) instead of the
+    /// leaf values. Nothing is allocated on this path; the reference is kept
+    /// as `feasible_set_phase_reference` and every debug build asserts the two
+    /// agree on every call.
+    pub(crate) fn feasible_set_phase(&self, atom: TermId) -> Option<bool> {
+        let (cmp_name, lhs, rhs) = match self.terms.get(atom) {
+            TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
+                (name.as_str(), args[0], args[1])
+            }
+            _ => return None,
+        };
+        let lhs_has = self.term_has_value(lhs);
+        let rhs_has = self.term_has_value(rhs);
+        // Both sides fully evaluated: `compute_literal_feasible_set` returned
+        // `None` for both polarities.
+        if lhs_has && rhs_has {
+            return None;
+        }
+        // The reference tries `extract_linear_univariate(lhs)` and uses it iff
+        // the RHS evaluates; otherwise `extract_linear_univariate(rhs)` iff the
+        // LHS evaluates (flipping the comparator). At most one side evaluates
+        // here, so the branch is decided by which one does.
+        let (side, cmp) = if rhs_has {
+            (lhs, cmp_name)
+        } else if lhs_has {
+            (rhs, flip_cmp(cmp_name))
+        } else {
+            return None;
+        };
+        let coeff_sign = self.linear_univariate_coefficient_sign(side)?;
+        if coeff_sign == Ordering::Equal {
+            // Degenerate `0 cmp target`: the answer is the constant truth
+            // value, which needs the target's exact value. Rare; take the
+            // reference path, which is exact by definition.
+            return self.feasible_set_phase_reference(atom);
+        }
+        let effective_cmp = if coeff_sign == Ordering::Less {
+            flip_cmp(cmp)
+        } else {
+            cmp
+        };
+        match effective_cmp {
+            "distinct" | "!=" => Some(true),
+            "=" => Some(false),
+            ">=" | ">" | "<=" | "<" => None,
+            _ => Some(false),
+        }
+    }
+
+    /// The previous `suggest_phase` body, verbatim: both polarities' feasible
+    /// sets, then emptiness and interval-count comparison. The debug-build
+    /// oracle for `feasible_set_phase`, and its exact fallback for the
+    /// degenerate zero-coefficient case.
+    pub(crate) fn feasible_set_phase_reference(&self, atom: TermId) -> Option<bool> {
+        if let Some((_free_var, fs_true)) = self.compute_literal_feasible_set(atom, true) {
+            if let Some((_free_var, fs_false)) = self.compute_literal_feasible_set(atom, false) {
+                // Prefer the phase that produces a non-empty feasible set
+                let true_empty = fs_true.is_empty();
+                let false_empty = fs_false.is_empty();
+                if true_empty && !false_empty {
+                    return Some(false);
+                }
+                if false_empty && !true_empty {
+                    return Some(true);
+                }
+                // If both are non-empty, prefer the one with a wider feasible set
+                // (more intervals = more flexibility). Fall through to LRA otherwise.
+                if fs_true.num_intervals() > fs_false.num_intervals() {
+                    return Some(true);
+                }
+                if fs_false.num_intervals() > fs_true.num_intervals() {
+                    return Some(false);
+                }
+            }
+        }
+        None
+    }
+
+    /// `term_value(term).is_some()` without computing the value: an LRA
+    /// column or a numeric literal. Exactly `term_value_sign(..).is_some()`
+    /// (both read the column first, then the literal, and `value_sign` is
+    /// `Some` iff the column exists), served from the same per-epoch leaf
+    /// memo so shared operands cost one lookup per epoch, not per atom.
+    #[inline]
+    pub(crate) fn term_has_value(&self, term: TermId) -> bool {
+        self.term_value_sign(term).is_some()
+    }
+
+    /// The exact sign of `term_value(term)` (`Equal` for zero), in the same
+    /// precedence order as `term_value`: the LRA column first, then the
+    /// literal. `None` iff `term_value` is `None`. Memoised per
+    /// `phase_state_epoch` (see the `leaf_sign_memo` field): the sign is
+    /// a pure function of the state that epoch covers.
+    fn term_value_sign(&self, term: TermId) -> Option<Ordering> {
+        let epoch = self.lia.lra_solver().phase_state_epoch();
+        {
+            let memo = self.leaf_sign_memo.borrow();
+            if memo.0 == Some(epoch) {
+                if let Some(sign) = memo.1.get(&term) {
+                    return *sign;
+                }
+            }
+        }
+        let sign = if let Some(sign) = self.lia.lra_solver().value_sign(term) {
+            Some(sign)
+        } else {
+            match self.terms.get(term) {
+                TermData::Const(Constant::Rational(r)) => Some(sign_of(&r.0)),
+                TermData::Const(Constant::Int(n)) => Some(n.sign().cmp(&num_bigint::Sign::NoSign)),
+                _ => None,
+            }
+        };
+        let mut memo = self.leaf_sign_memo.borrow_mut();
+        if memo.0 != Some(epoch) {
+            memo.0 = Some(epoch);
+            memo.1.clear();
+        }
+        memo.1.insert(term, sign);
+        sign
+    }
+
+    /// The sign of the coefficient `extract_linear_univariate(term)` would
+    /// return (`Equal` when it would be zero), or `None` when that extraction
+    /// finds no linear-in-one-free-variable form. Same recursion, same
+    /// first-match order, same evaluability tests; the values are replaced by
+    /// their signs (a product's sign is the product of signs and is zero iff a
+    /// factor is zero; `-` reverses it; `+` leaves it alone).
+    fn linear_univariate_coefficient_sign(&self, term: TermId) -> Option<Ordering> {
+        match self.terms.get(term) {
+            TermData::Var(_, _) => {
+                if self.lia.lra_solver().has_value(term) {
+                    return None; // Already assigned
+                }
+                Some(Ordering::Greater) // coefficient 1
+            }
+            TermData::Const(_) => None,
+            TermData::App(Symbol::Named(name), args) => match name.as_str() {
+                "*" if args.len() == 2 => {
+                    let (a0, a1) = (args[0], args[1]);
+                    if let Some(c) = self.term_value_sign(a0) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a1) {
+                            return Some(mul_sign(c, inner));
+                        }
+                    }
+                    if let Some(c) = self.term_value_sign(a1) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a0) {
+                            return Some(mul_sign(c, inner));
+                        }
+                    }
+                    None
+                }
+                "+" if args.len() == 2 => {
+                    let (a0, a1) = (args[0], args[1]);
+                    if self.term_has_value(a0) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a1) {
+                            return Some(inner);
+                        }
+                    }
+                    if self.term_has_value(a1) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a0) {
+                            return Some(inner);
+                        }
+                    }
+                    None
+                }
+                "-" if args.len() == 2 => {
+                    let (a0, a1) = (args[0], args[1]);
+                    if self.term_has_value(a0) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a1) {
+                            return Some(inner.reverse());
+                        }
+                    }
+                    if self.term_has_value(a1) {
+                        if let Some(inner) = self.linear_univariate_coefficient_sign(a0) {
+                            return Some(inner);
+                        }
+                    }
+                    None
+                }
+                "-" if args.len() == 1 => self
+                    .linear_univariate_coefficient_sign(args[0])
+                    .map(Ordering::reverse),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Compute the feasible set for a comparison atom `lhs cmp rhs` where one
     /// side involves a monomial with a single free variable.
     ///
@@ -333,6 +565,28 @@ impl NiaSolver<'_> {
         self.feasible_sets.clear();
         self.blocked_vars.clear();
         self.fixed_vars.clear();
+    }
+}
+
+/// Sign of a rational as an ordering against zero.
+fn sign_of(r: &BigRational) -> Ordering {
+    if r.is_zero() {
+        Ordering::Equal
+    } else if r.is_positive() {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    }
+}
+
+/// Sign of a product from the signs of its factors.
+fn mul_sign(a: Ordering, b: Ordering) -> Ordering {
+    match (a, b) {
+        (Ordering::Equal, _) | (_, Ordering::Equal) => Ordering::Equal,
+        (Ordering::Greater, Ordering::Greater) | (Ordering::Less, Ordering::Less) => {
+            Ordering::Greater
+        }
+        _ => Ordering::Less,
     }
 }
 

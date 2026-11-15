@@ -266,8 +266,23 @@ impl Executor {
     /// ever runs when a parsed prefix was retained.
     pub(super) fn apply_input_syntax_rewrites_to_proof(&mut self, proof: &mut Proof) {
         self.last_proof_term_overrides = None;
+        // Refuse source-bound certificates even with no rewrite map or parsed
+        // assertions: the later authority/surface passes may mutate their
+        // clauses too. Native bundle checking remains independent of this
+        // unsupported presentation transform.
+        if Self::preflight_proof_term_rewrite(proof).is_err() {
+            Self::poison_input_syntax_rewrite(proof);
+            return;
+        }
         if Self::proof_has_nonportable_ground_evaluate(&self.ctx.terms, proof) {
             self.suppress_unsat_proof_reconstruction();
+            // #evidence-stage-3, second pass. Found by MEASUREMENT, not by
+            // reading: after the first six sites were attributed, 7 of 95
+            // unevidenced refutations still reported `no-derivation-recorded`,
+            // and that tag exists to be chased.
+            self.record_proof_decline(
+                crate::executor::ProofDeclineMechanism::NonPortableGroundEvaluate,
+            );
         }
         if self.ctx.assertions.is_empty() {
             return;
@@ -279,9 +294,12 @@ impl Executor {
             super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxRewrite,
             self.ctx.assertions_parsed(),
         ) {
-            let mut poisoned = Proof::new();
-            poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-            *proof = poisoned;
+            // #certify-before-presentation. The envelope bounds work over the
+            // PARSED stack; the derivation is canonical and owes it nothing.
+            self.withhold_surface_presentation(
+                proof,
+                crate::executor::ProofDeclineMechanism::InputSyntaxRewriteSourceBudget,
+            );
             return;
         }
         if self.ctx.assertions_parsed().is_empty() {
@@ -293,9 +311,24 @@ impl Executor {
         let aux_assume_steps =
             Self::collect_assume_steps_with_aux_mod_div_vars(&self.ctx.terms, proof);
         let mut rewrites: HashMap<TermId, TermId> = HashMap::default();
-        let Some((override_pairs, mut term_overrides)) = self.prepare_surface_overrides() else {
-            Self::poison_input_syntax_rewrite(proof);
-            return;
+        let (override_pairs, mut term_overrides) = match self.prepare_surface_overrides() {
+            Ok(plan) => plan,
+            Err(decline) => {
+                let mechanism =
+                    crate::executor::ProofDeclineMechanism::AuthoredSurfaceOverridePlanUnbounded;
+                if decline.shape_only {
+                    // #certify-before-presentation. The plan only collects
+                    // SPELLINGS for the exported document; see
+                    // `withhold_surface_presentation`.
+                    self.withhold_surface_presentation(proof, mechanism);
+                } else {
+                    // A size refusal: see `OverridePlanDecline::shape_only`.
+                    self.probe_behind_presentation_bound(proof, mechanism, "size", false);
+                    Self::poison_input_syntax_rewrite(proof);
+                    self.record_proof_decline(mechanism);
+                }
+                return;
+            }
         };
 
         self.add_forall_instance_surface_overrides(proof, &override_pairs, &mut term_overrides);
@@ -306,7 +339,10 @@ impl Executor {
 
         if !rewrites.is_empty() {
             let step_count_before = proof.steps.len();
-            Self::rewrite_proof_terms(&mut self.ctx.terms, proof, &rewrites);
+            if Self::rewrite_proof_terms(&mut self.ctx.terms, proof, &rewrites).is_err() {
+                Self::poison_input_syntax_rewrite(proof);
+                return;
+            }
             debug_assert_eq!(
                 proof.steps.len(),
                 step_count_before,
@@ -358,6 +394,12 @@ impl Executor {
     /// retention-on path it was measured against. `proof_rewrite_tests.rs`
     /// pins that absence so a later refactor cannot silently re-enable it.
     ///
+    /// # Not the withheld-surface path
+    ///
+    /// [`Self::withhold_surface_presentation`] (a presentation bound declined
+    /// with a parsed prefix retained) runs the retention-ON tail instead; see
+    /// its docs for why and for what that measured.
+    ///
     /// # This grants no authority
     ///
     /// Demotion turns an unauthorized `assume` into a `trust` step that
@@ -369,12 +411,9 @@ impl Executor {
         &mut self,
         proof: &mut Proof,
     ) {
-        debug_assert!(
-            self.ctx.assertions_parsed().is_empty(),
-            "BUG: the narrowed authority subset is only for the retention-off configuration"
-        );
         tracing::debug!(
-            "cause-b-narrow-authority-split-v1: no parsed prefix retained; running the \
+            "cause-b-narrow-authority-split-v1: no parsed prefix retained (or its surface \
+             withheld); running the \
              assumption-authority subset (demote + trust-leaf rebuild) and skipping both the \
              COSMETIC surface-syntax half and derive_conjunct_assumptions_from_problem_roots"
         );
@@ -519,6 +558,245 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// The surface presentation of this refutation exceeded a bound: WITHHOLD
+    /// the document and keep the derivation for certification.
+    ///
+    /// # #certify-before-presentation (2026-10-02)
+    ///
+    /// Both callers used to replace the WHOLE internal proof with the one-line
+    /// `(step t0 (cl) :rule hole)` poison. That happened before the mandatory
+    /// certification funnel read `last_proof`, so the funnel could only ever
+    /// see one anonymous trust step, and on the default posture the verdict
+    /// was admitted by `discharged-trust` — a same-engine re-solve — however
+    /// sound the derivation it had just thrown away was. Measured on the D7
+    /// held-out list: 62 of the 211 discharged-trust unsats ended on these two
+    /// poisons (override plan 56, source-work envelope 6), and 49 of the 56
+    /// plan declines were the binder SHAPE veto on roots of at most 20,201
+    /// expanded nodes (most under 100), not any size at all. The bounds themselves are right: they
+    /// bound the work of collecting SPELLINGS over the parsed stack and of
+    /// rendering, and lifting them was measured (2026-09-11, `dbbbf1dce4`) to
+    /// gain 0 externally valid documents, lose 10 of 56 verdicts and double
+    /// peak RSS. What was wrong is that a presentation bound decided the
+    /// ADMISSION. Admission must not depend on a rendering budget; the budget
+    /// limits the export only.
+    ///
+    /// So the derivation now goes on through the same assumption-authority
+    /// tail this posture runs when no bound fires
+    /// (`finish_input_syntax_rewrite`), with no surface rewrite and no
+    /// spelling collected: every derivation lane there reasons over canonical
+    /// `TermId`s and is re-validated by the untouched strict checker, and the
+    /// one lane that reads the parsed stack (the original-assertion rebuild)
+    /// charges the shared source-work envelope as it always does. The document
+    /// is withheld through the same `suppress_unsat_proof_reconstruction`
+    /// state the non-portable `evaluate` case already uses.
+    ///
+    /// The tail is the retention-ON one, not the narrower retention-off subset
+    /// (`run_assumption_authority_passes_without_parsed_syntax`) the first
+    /// version of this path ran. That subset leaves out the conjunct and
+    /// propagated-value derivations for a cost measured where no parsed
+    /// surface exists at all; here the parsed surface was retained, so the
+    /// default posture's own tail is the honest comparison. Measured on the
+    /// 82 D7 files (2026-10-09): the subset left QF_IDL `parity/16.100.graph`
+    /// with 4 demoted `trust` leaves — normalized conjuncts of its one
+    /// authored `and` — and the default tail derives them: `discharged-trust`
+    /// 0.27 s -> `strict-proof` 0.13 s, no other admission moved.
+    ///
+    /// Consequences, by posture:
+    ///
+    /// * default: `check_strict_unsat_presentation` strict-checks the
+    ///   retained derivation against the frozen problem obligation. If it
+    ///   passes, the admission is `strict-proof` — which is exactly what was
+    ///   checked. The document stays withheld (the decline line names why)
+    ///   unless, at the end of the assembly, every reachable `assume`
+    ///   authenticates against its authored source and none is foreign; see
+    ///   `build_unsat_proof`.
+    ///   If it carries trust steps, the discharge fallback now strict-checks
+    ///   every NON-trust step of a real derivation instead of zero steps of
+    ///   the poison, and collects the real trust clauses.
+    /// * `--proof`, `:produce-proofs`, proof checking, `--rigor strict`: the
+    ///   artifact was promised, the suppressed presentation reads `Missing`,
+    ///   and the verdict is refused exactly as the poison refused it.
+    ///
+    /// Nothing about the bounds moves and no parsed root is traversed past
+    /// them. The override plan reaches this only on a SHAPE-only decline
+    /// (`OverridePlanDecline::shape_only`); a size decline keeps the poison.
+    ///
+    /// # Measured limits (D7 held-out list, 2026-10-02)
+    ///
+    /// Behind the bound there is often NO derivation. Either the refutation
+    /// was closed by a bare trust head because the deciding lane recorded no
+    /// clause trace (the sibling `assume-family-trust-closure` finding of
+    /// 2026-09-11: vlsat3 records none at all, and the trace recorder's
+    /// ~10K-entry budget dies during input load on large CNFs), or nothing
+    /// derives the empty clause at all. Certifying that is one `(cl)` trust
+    /// step after a full authority pass over thousands of assumes: it bought
+    /// no label on any file and cost verdicts at `-T:10` (QF_UFDT vlsat3_e53:
+    /// 4.4 s -> 17.8 s, the outer and the nested re-solve each paying 7 s).
+    /// So such a refutation keeps the poison it always had —
+    /// [`Self::proof_has_derivation_to_certify`] — and only a real derivation
+    /// goes on to certification. When that derivation is itself rejected
+    /// (an `assume` outside the obligation, no empty clause), the funnel
+    /// reverts it to the same poison; see `last_proof_surface_withheld`.
+    ///
+    /// # Not the source-root bound
+    ///
+    /// `authored-source-root-unbounded` refuses BEFORE any proof is built
+    /// (`proof_source_decline`), so there the derivation would first have to
+    /// be assembled with the parsed surface detached. That was built and
+    /// measured on the same list and is NOT done: it lifted 2 of its 8
+    /// discharged-trust files to `strict-proof`, but on files an independent
+    /// lane already certified it paid the whole assembly before that lane
+    /// could speak (QF_UFLRA `pb_real_30_75_45_78`: `checked-uf-leaf-bool-bv`
+    /// in 0.33 s became `strict-proof` in 15.3 s, an `unknown` at `-T:10`).
+    /// The route there is a lazy assembly AFTER the independent lanes
+    /// decline, inside the funnel.
+    fn withhold_surface_presentation(
+        &mut self,
+        proof: &mut Proof,
+        mechanism: crate::executor::ProofDeclineMechanism,
+    ) {
+        let kept = self.proof_has_derivation_to_certify(proof);
+        self.probe_behind_presentation_bound(proof, mechanism, "shape-or-envelope", kept);
+        if !kept {
+            Self::poison_input_syntax_rewrite(proof);
+            self.record_proof_decline(mechanism);
+            return;
+        }
+        self.record_proof_decline(mechanism);
+        self.suppress_unsat_proof_reconstruction();
+        self.last_proof_surface_withheld = Some(mechanism);
+        self.last_proof_term_overrides = None;
+        let aux_assume_steps =
+            Self::collect_assume_steps_with_aux_mod_div_vars(&self.ctx.terms, proof);
+        self.finish_input_syntax_rewrite(
+            proof,
+            &HashMap::default(),
+            HashMap::default(),
+            &aux_assume_steps,
+        );
+        crate::executor::unsat_cert::probe_cert_reject(|| {
+            let trust = proof
+                .steps
+                .iter()
+                .filter(|step| match step {
+                    ProofStep::Step { rule, .. } => {
+                        matches!(rule, AletheRule::Trust | AletheRule::Hole)
+                    }
+                    ProofStep::TheoryLemma { kind, .. } => kind.is_trust(),
+                    _ => false,
+                })
+                .count();
+            format!(
+                "withheld-surface derivation after the authority passes: steps={} trust={trust}",
+                proof.steps.len()
+            )
+        });
+    }
+
+    /// What stands behind a presentation bound when it fires, under
+    /// `--probe-cert-reject` only: the step census of the internal proof the
+    /// bound is about to withhold or replace by the `(cl)` poison, which step
+    /// (if any) concludes the empty clause, and the closer the assembly
+    /// recorded before the bound overwrote it on the decline line.
+    ///
+    /// #certify-before-presentation census. The decline line names the bound;
+    /// it cannot say whether reasoning stood behind it. Measured on the D7
+    /// discharged-trust list this is the question that decides the class: most
+    /// of the bound's files hold no derivation at all (a trust-head closer, or
+    /// no empty clause), so lifting the bound only exposes that hole. Write-only.
+    fn probe_behind_presentation_bound(
+        &self,
+        proof: &Proof,
+        mechanism: crate::executor::ProofDeclineMechanism,
+        bound: &'static str,
+        kept: bool,
+    ) {
+        crate::executor::unsat_cert::probe_cert_reject(|| {
+            let (mut assumes, mut trust, mut empty_by) = (0usize, 0usize, "none".to_string());
+            for step in &proof.steps {
+                let (is_trust, empty) = match step {
+                    ProofStep::Assume(_) => {
+                        assumes += 1;
+                        (false, None)
+                    }
+                    ProofStep::Resolution { clause, .. } => {
+                        (false, clause.is_empty().then(|| "resolution".to_string()))
+                    }
+                    ProofStep::TheoryLemma { clause, kind, .. } => (
+                        kind.is_trust(),
+                        clause.is_empty().then(|| format!("lemma:{kind:?}")),
+                    ),
+                    ProofStep::Step { rule, clause, .. } => (
+                        matches!(rule, AletheRule::Trust | AletheRule::Hole),
+                        clause.is_empty().then(|| format!("rule:{rule:?}")),
+                    ),
+                    _ => (false, None),
+                };
+                trust += usize::from(is_trust);
+                if let (Some(by), "none") = (empty, empty_by.as_str()) {
+                    empty_by = by;
+                }
+            }
+            format!(
+                "presentation bound {} ({bound}) fired: behind it steps={} assumes={assumes} \
+                 trust={trust} first_empty_clause={empty_by} closer_recorded={} \
+                 derivation_kept={kept} inside_discharge_resolve={}",
+                mechanism.tag(),
+                proof.steps.len(),
+                self.last_proof_decline
+                    .map_or("none", crate::executor::ProofDeclineMechanism::tag),
+                crate::executor::unsat_cert::inside_trust_discharge_solve(),
+            )
+        });
+    }
+
+    /// Whether there is a derivation behind a presentation bound worth
+    /// certifying: some step other than a `trust`/`hole` closer (or a
+    /// `Generic` theory lemma) concludes the empty clause, and
+    /// `ensure_empty_clause_derivation` did not close the refutation with a
+    /// bare trust head over the assumptions (a recorded trust-closure decline).
+    ///
+    /// Measured on QF_UFDT `vlsat3_e53` (12,460 assertions, no clause trace):
+    /// without the first test its "derivation" reached no empty clause at all,
+    /// the canonical authority passes took 7 s over it, the strict collecting
+    /// check then rejected it ("final clause-producing step t0 is not the
+    /// empty clause"), and the nested re-solve paid the same 7 s again —
+    /// 4.4 s -> 17.8 s for the same `discharged-trust` admission.
+    ///
+    /// Never inside a deferred-trust discharge's corroborating re-solve: that
+    /// solve publishes nothing and its proof is only SCREENED for a
+    /// trust-kind rejection, so certifying its derivation buys no label. It
+    /// was measured to cost the whole difference where a twin derivation is
+    /// large (a 175,314-step twin on QF_UFLRA `pb_real_40_1000_10_27`, +4 s,
+    /// 8.4 s -> over `-T:10`). There the poison stays exactly as it was.
+    pub(in crate::executor) fn proof_has_derivation_to_certify(&self, proof: &Proof) -> bool {
+        if crate::executor::unsat_cert::inside_trust_discharge_solve() {
+            return false;
+        }
+        let closed_by_trust_head = matches!(
+            self.last_proof_decline,
+            Some(
+                crate::executor::ProofDeclineMechanism::AssumeFamilyTrustClosure
+                    | crate::executor::ProofDeclineMechanism::DerivedLeafTrustClosure { .. }
+            )
+        );
+        !closed_by_trust_head
+            && proof.steps.iter().any(|step| match step {
+                ProofStep::Resolution { clause, .. } => clause.is_empty(),
+                ProofStep::TheoryLemma { clause, kind, .. } => {
+                    clause.is_empty() && !kind.is_trust()
+                }
+                ProofStep::Step { rule, clause, .. } => {
+                    clause.is_empty()
+                        && !matches!(
+                            rule,
+                            AletheRule::Trust | AletheRule::Hole | AletheRule::ArrayExtDiffIntro
+                        )
+                }
+                _ => false,
+            })
     }
 
     /// The authority passes that run AFTER the `EqDiffVar` lane in the

@@ -9,13 +9,13 @@ use ay_nia::NiaSolver;
 
 use crate::combined_solvers::check_loops::{
     assert_fixpoint_convergence, debug_nelson_oppen, defer_non_local_result,
-    discover_model_equality, forward_non_sat, propagate_all_to, propagate_equalities_to,
-    triage_lia_result,
+    discover_model_equality, forward_non_sat, propagate_all_to_dedup, triage_lia_result,
+    ForwardedPairs,
 };
 use crate::combined_solvers::interface_bridge::{
     evaluate_arith_term_with_reasons, lia_get_int_value_with_reasons, InterfaceBridge,
 };
-use crate::combined_solvers::models::euf_with_int_values;
+use crate::combined_solvers::models::{euf_with_int_values, merge_lia_values};
 use crate::term_helpers::{involves_int_arithmetic, is_uf_int_equality};
 
 /// Combined EUF + NIA theory solver for QF_UFNIA / QF_AUFNIRA theory combination.
@@ -59,13 +59,47 @@ impl<'a> UfNiaSolver<'a> {
         }
     }
 
-    /// Extract both EUF and NIA (LIA-compatible) models for model generation
-    pub(crate) fn extract_models(&mut self) -> (EufModel, Option<LiaModel>) {
-        let euf_model = euf_with_int_values(&mut self.euf);
+    /// Genuine Boolean data from the NIA's current verified candidate only.
+    pub(crate) fn boolean_witness(&self) -> impl Iterator<Item = (TermId, bool)> + '_ {
+        self.nia.boolean_witness()
+    }
+
+    /// Extract both EUF and NIA (LIA-compatible) models for model generation.
+    ///
+    /// The NIA's values are merged into the EUF model's integer views
+    /// (`merge_lia_values`), exactly as every other EUF+arithmetic lane does
+    /// (`combiner_models.rs`, `auf_lira.rs`). Without it the EUF model kept its
+    /// own fabricated per-class integers for terms the NIA owns, and the
+    /// function tables keyed and resolved through them: on a QF_UFNIA fuzz
+    /// file (`nia_8301_004`) the NIA's point had `f(z) = -4 < f(x*z*w) = -3`
+    /// while the EUF lane still said `x = 4, x*z*w = 5, f(z) = 6`; the
+    /// model gate read `f(z)` through the table, found the assertion false and
+    /// answered `unknown (self-check-rejected)` on a satisfiable problem.
+    ///
+    /// The EUF model is scoped to `model_roots`, the window this solve
+    /// actually decided (#ufnia-model-scope). Unscoped, `EufSolver` models
+    /// every application in the whole `TermStore`, and an incremental session
+    /// keeps the applications of earlier windows, popped assertions and
+    /// `get-value` queries there. The Nelson-Oppen loop never saw those
+    /// orphans: no asserted literal mentions them, so their arguments are not
+    /// interface terms and `x1 = x2` in the NIA model never reaches EUF. Each
+    /// orphan then got its own fabricated class integer and its own table row,
+    /// so with `x1 = x2 = 0` the model published `(f x1) = 8`, `(f x2) = 9` —
+    /// not a function. Every other EUF+arithmetic lane already scopes
+    /// (`scope_euf_model_to_roots`); an application outside the scope is read
+    /// through the table at its evaluated arguments, which is a function.
+    pub(crate) fn extract_models(
+        &mut self,
+        model_roots: &[TermId],
+    ) -> (EufModel, Option<LiaModel>) {
+        self.euf.scope_model_to_roots(model_roots);
+        let mut euf_model = euf_with_int_values(&mut self.euf);
+        self.euf.clear_model_scope();
         let lia_model = self
             .nia
             .extract_model()
             .map(|m| LiaModel { values: m.values });
+        merge_lia_values(&mut euf_model, lia_model.as_ref());
         (euf_model, lia_model)
     }
 
@@ -160,6 +194,10 @@ impl TheorySolver for UfNiaSolver<'_> {
         let max_iters = crate::theory_debug_flags::max_fixpoint_rounds()
             .unwrap_or(MAX_ITERATIONS)
             .min(MAX_ITERATIONS);
+        // Pairs already forwarded this check, per direction (see
+        // ForwardedPairs: tentative-patch pops re-export the same pairs).
+        let mut fwd_nia_to_euf = ForwardedPairs::default();
+        let mut fwd_euf_to_nia = ForwardedPairs::default();
         // #8469: Configure EUF with shared arith terms for unified diseq propagation.
         self.euf
             .set_shared_arith_terms(self.interface.sorted_arith_terms());
@@ -171,15 +209,16 @@ impl TheorySolver for UfNiaSolver<'_> {
             if let Some(early) = nia_early {
                 return early;
             }
-            let nia_eq_count = match propagate_equalities_to(
+            let nia_eq_count = match propagate_all_to_dedup(
                 &mut self.nia,
                 &mut self.euf,
+                &mut fwd_nia_to_euf,
                 debug,
                 "UFNIA-NIA",
                 iteration,
             ) {
-                Ok(n) => n,
-                Err(conflict) => return conflict,
+                Ok(counts) => counts.equalities,
+                Err(conflict) => return *conflict,
             };
             let (interface_eq_count, bridge_speculative) = self.propagate_interface_bridge(debug);
             let has_new_equalities = nia_eq_count > 0 || interface_eq_count > 0;
@@ -187,12 +226,17 @@ impl TheorySolver for UfNiaSolver<'_> {
                 return result;
             }
             // #8469: Unified equality + disequality propagation from EUF to NIA.
-            let euf_counts =
-                match propagate_all_to(&mut self.euf, &mut self.nia, debug, "UFNIA-EUF", iteration)
-                {
-                    Ok(c) => c,
-                    Err(conflict) => return conflict,
-                };
+            let euf_counts = match propagate_all_to_dedup(
+                &mut self.euf,
+                &mut self.nia,
+                &mut fwd_euf_to_nia,
+                debug,
+                "UFNIA-EUF",
+                iteration,
+            ) {
+                Ok(c) => c,
+                Err(conflict) => return *conflict,
+            };
 
             if !has_new_equalities && euf_counts.equalities == 0 && euf_counts.disequalities == 0 {
                 // Model equality discovery for non-convex theory combination (#4906).
@@ -363,6 +407,15 @@ impl TheorySolver for UfNiaSolver<'_> {
         self.nia.suggest_phase(atom)
     }
 
+    fn phase_hint_epoch(&self) -> Option<u64> {
+        // `suggest_phase` above is a pure delegate, so the nonlinear solver's
+        // epoch (size-gated there, value-exact by `LraSolver::phase_state_epoch`)
+        // covers every suggestion this adapter emits (#nonlinear-phase-hints).
+        // Without this forwarding the SAT seeder's epoch skip was dead on the
+        // UF+NIA lane.
+        self.nia.phase_hint_epoch()
+    }
+
     fn sort_atom_index(&mut self) {
         self.nia.sort_atom_index();
     }
@@ -373,5 +426,65 @@ impl TheorySolver for UfNiaSolver<'_> {
 
     fn generate_incremental_bound_axioms(&self, atom: TermId) -> Vec<(TermId, bool, TermId, bool)> {
         self.nia.generate_incremental_bound_axioms(atom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ay_core::term::Symbol;
+    use ay_core::Sort;
+    use num_bigint::BigInt;
+
+    /// After a `Sat`, every term the NIA assigns carries the NIA's value in
+    /// BOTH EUF integer views, and none of them is left speculative: the
+    /// function tables key and resolve through `int_values`, so a fabricated
+    /// class integer there contradicts the arithmetic model the gate checks.
+    #[test]
+    fn extract_models_merges_the_nia_values_into_the_euf_integer_views() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let fx = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+        let xy = terms.mk_mul(vec![x, y]);
+        let three = terms.mk_int(BigInt::from(3));
+        let six = terms.mk_int(BigInt::from(6));
+        let atoms = [
+            terms.mk_eq(x, three),
+            terms.mk_eq(xy, six),
+            terms.mk_gt(fx, xy),
+        ];
+        let mut solver = UfNiaSolver::new(&terms);
+        for atom in atoms {
+            solver.register_atom(atom);
+            solver.assert_literal(atom, true);
+        }
+        let result = solver.check();
+        assert!(
+            matches!(result, TheoryResult::Sat),
+            "x = 3, y = 2, f(3) > 6: {result:?}"
+        );
+        let (euf, lia) = solver.extract_models(&atoms);
+        let lia = lia.expect("an NIA model after Sat");
+        assert!(
+            lia.values.contains_key(&x),
+            "the NIA assigns x: {:?}",
+            lia.values
+        );
+        for (term, value) in &lia.values {
+            assert_eq!(
+                euf.int_values.get(term),
+                Some(value),
+                "EUF's integer view of {term:?} disagrees with the NIA's {value}"
+            );
+            assert!(
+                euf.term_values.contains_key(term),
+                "EUF's formatted view has no value for {term:?}"
+            );
+            assert!(
+                !euf.speculative_int_terms.contains(term),
+                "{term:?} carries the NIA's value but is still marked speculative"
+            );
+        }
     }
 }

@@ -306,7 +306,7 @@ pub(super) fn validate_and_replay(
         let productions = reference_inventory::load_bound_language_commands(
             input,
             context.manifest_dir,
-            &canonical_profile(),
+            &canonical_profile()?,
         )?;
         validate_receipt_rows(receipt, &productions)?;
         let envelope = receipt

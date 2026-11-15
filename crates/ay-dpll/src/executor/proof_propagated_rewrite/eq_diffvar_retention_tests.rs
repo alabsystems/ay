@@ -229,7 +229,8 @@ fn the_retention_off_unsat_is_still_backed_by_a_certificate() {
     assert!(
         exec.last_command_unsat_was_strictly_verified()
             || exec.last_command_unsat_was_independently_verified()
-            || exec.last_command_unsat_was_exact_semantically_verified(),
+            || exec.last_command_unsat_was_exact_semantically_verified()
+            || exec.last_command_unsat_was_corroborated(),
         "the `unsat` must stay backed by a real certificate"
     );
 }
@@ -309,23 +310,165 @@ fn envelope_refused_fixture(
 }
 
 /// A crafted proof whose strict walk reaches a TYPED verdict (the trailing
-/// foreign leaf) but only after consuming more than HALF the envelope: valid
-/// `eq_reflexive` steps over a large unshared term chain accumulate their
-/// linearithmic `ClauseIdentityRoute` charges past 125M — the exact figure the
-/// retired second price used — while staying inside the full envelope.
+/// foreign leaf) but only after consuming more than HALF the envelope — the
+/// exact figure the retired second price used — while staying inside the full
+/// envelope.
 ///
+/// NOT via the step's own payload: `fbed3a39e` routed `eq_reflexive` through
+/// `literal_decode_payload` (`quality/semantic_payload.rs:27-29`), so the
+/// `ClauseIdentityRoute` charge no longer walks below an atom and the chain
+/// costs the STEP nothing. The expense is the whole-store pre-charge over
+/// `0..terms.len()` (`quality/authentication_payload.rs:100-109`, taken only
+/// when the typed context has a member — see `register_datatype_member`), so
+/// it is the interned STORE the chain grows, not the document. See
+/// `expensive_typed_verdict` for the measured cost model.
+///
+/// Half the 350M envelope: the retired second price, named literally so the
+/// guard cannot silently follow a constant that moves.
+const HALF_ENVELOPE_WORK: usize = 125_000_000;
+
+/// Register one datatype so the strict walk's typed context has MEMBERS.
+///
+/// Since #inc-dead-atoms' proof fast path (`54f932f76`), a typed context with
+/// NO member signatures skips the whole-store occurrence scan and its
+/// pre-charge (`validate_occurrences` can reject nothing then), which removed
+/// the lever Tier 2 is calibrated on: the 941_000 chain fell to 93_276_999
+/// work, and every longer chain refuses on the BYTE limb first, so no
+/// chain-only document lands in `(125M, 350M)` any more. With one registered
+/// member the scan — and the `135 * chain_len + 76_177` cost model measured
+/// below — is exactly what it was. The members are unrelated to the proof, so
+/// the verdict and the commit decision are unchanged.
+fn register_datatype_member(exec: &mut Executor) {
+    let commands = parse("(declare-datatypes ((EqdvPad 0)) (((eqdv_pad_a) (eqdv_pad_b))))")
+        .expect("parse datatype");
+    exec.execute_all(&commands).expect("declare datatype");
+    assert!(
+        exec.datatype_member_signatures_for_strict_proof()
+            .is_some_and(|members| !members.is_empty()),
+        "the typed context must carry members, or the whole-store lever is off"
+    );
+}
+
+/// Drive Tier 2's document to a TYPED verdict and report what it cost.
+///
+/// The window is `(125M, 350M)` and only its LOWER edge is the claim. The upper
+/// edge is the envelope, and what a document costs against it is the sum of
+/// every meter the strict walk charges — a number that grows whenever a meter
+/// is added. A hard-coded chain length therefore rots: `38520a5a3`/`f0e5f9807`
+/// added the datatype/quantifier and snapshot-replay meters, the 30,000-node
+/// chain crossed 350M, and this tier went red on a REFUSAL — Tier 1's outcome,
+/// and not this tier's claim at all. Halve until the walk lands back inside the
+/// envelope. Failed attempts only intern more terms, i.e. only push cost UP, so
+/// the loop cannot settle on a length a re-run would refuse.
+///
+/// WHY THE START MOVED 30_000 -> 941_000, and what the chain actually buys.
+/// `fbed3a39e` routed `eq_reflexive` through `literal_decode_payload`
+/// (`quality/semantic_payload.rs:27-29`), so the STEP stopped paying for its
+/// own term DAG. The chain still moves the meter, through a DIFFERENT charge:
+/// every strict check with a registered member pre-charges the whole authority surface
+/// `datatype_axiom::context::terms::validate_occurrences` scans, which is
+/// `for node_index in 0..terms.len()` over the ENTIRE store — see
+/// `ay-proof/src/quality/authentication_payload.rs:100-109`, taken whenever
+/// the typed context has at least one member signature (an empty one skips the
+/// vacuous scan since `54f932f76`), which is why Tier 2 first calls
+/// `register_datatype_member`. Each chain link interns exactly two
+/// store terms (a `repeat_pad_i` variable and a `+` application), so the cost
+/// is affine in `chain_len` — in the STORE, not in the document.
+///
+/// MEASURED on the built test binary (2026-09-19, `chain_len` driven under a
+/// debugger, Tier 2's `consumed` read back): from about 120_000 links up the
+/// walk costs exactly `135 * chain_len + 76_177` — 120_000 -> 16_276_177,
+/// 240_000 -> 32_476_177, 600_000 -> 81_076_177, 925_361 -> 124_999_912,
+/// 941_000 -> 127_111_177. Below that the per-link cost is slightly higher
+/// (30_000 -> 4_406_177, 60_000 -> 8_336_177), which is why the old 30_000
+/// start now measures 3.5% of the price. So the WORK floor is
+/// `chain_len >= 925_362`, and the ceiling is NOT the 350M work envelope — at
+/// 941_000 the walk has spent 127M of 350M — it is the BYTE limb
+/// (`MAX_CHECK_BYTES` = 512MiB + `MAX_EXPENSIVE_BV_BYTES_PER_LEMMA` =
+/// 1_342_177_280): 957_000 still reaches a typed verdict, 958_000 refuses.
+/// 941_000 is the middle of `[925_362, 957_000]`, ~1.7% from each edge. CI
+/// cost, measured: this module goes from 0.36s / 70_304 kB maxrss to ~3.9s /
+/// ~829_000 kB peak RSS. That is inherent to the lever — the pre-charge bills
+/// ~67.5 work per store term, so ~1.85M terms are needed for 125M work at any
+/// length inside the window — not to the particular constant.
+///
+/// The halving cannot REPAIR an overshoot, only report it. Because the cost
+/// follows the store rather than the document, the terms a refused attempt
+/// interned stay interned: measured, a 1_000_000 start refuses at 1_000_000
+/// and again at every halving down to 976 nodes. The START is the calibration.
+///
+/// TIER 3 NO LONGER MOVES WITH THIS CONSTANT: it runs on a fresh fixture
+/// (no registered member, none of this chain's terms), so its cost is
+/// `leaf_proof`'s own. It used to reuse this `exec` and pay the chain's
+/// whole-store pre-charge (57_211_022 at 941_000).
+fn expensive_typed_verdict(
+    exec: &mut Executor,
+    rewritten: TermId,
+    scope: &[TermId],
+) -> (Proof, usize) {
+    let mut chain_len = 941_000;
+    let mut registered = false;
+    loop {
+        let mut expensive = repeat_budget_exceeded_fixture(exec, rewritten, &[], chain_len);
+        assert!(
+            !registered && exec.derive_eq_diffvar_rewritten_assertions(&mut expensive, scope),
+            "the lane must splice the leading leaf, or the tier is not exercised \
+             (a halving after the datatype was registered means the START \
+             overshot — re-derive it, see below)"
+        );
+        // Splice first (the lane runs on the datatype-free problem), THEN
+        // give the typed context its member so the walk pays the whole-store
+        // pre-charge this calibration is built on.
+        register_datatype_member(exec);
+        registered = true;
+        let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&expensive);
+        let error = outcome.expect_err("the trailing foreign leaf must keep the walk rejected");
+        if !matches!(
+            error,
+            ay_proof::ProofCheckError::ResourceLimit | ay_proof::ProofCheckError::Cancelled
+        ) {
+            return (expensive, consumed);
+        }
+        assert!(
+            chain_len > 1_000,
+            "no chain length at or below the start reaches a TYPED verdict \
+             inside the envelope ({error} at {chain_len} nodes). The halving \
+             CANNOT recover, so this message means the START is too high: the \
+             walk's cost follows the whole store, not the document (every \
+             check with a registered member pre-charges `0..terms.len()`, \
+             authentication_payload.rs), \
+             and a refused attempt leaves its terms interned, so once one \
+             length refuses every smaller one refuses too. Re-derive the START \
+             against the current meters — the walk cost `135 * chain_len + \
+             76_177` and the BYTE limb refused above 957_000 when this was \
+             last measured — rather than deleting the guard."
+        );
+        chain_len /= 2;
+    }
+}
+
 /// The expense is the point, not incidental: this is the fixture that pins
 /// #eqdv-second-price-retired. A gate that reintroduces ANY price below the
 /// envelope reverts this document, and the tier test below goes RED.
+///
+/// `chain_len` is a parameter rather than a constant because the WORK PER NODE
+/// is not one: it is the sum of every meter the strict walk charges, and new
+/// meters are added over time. A single hard-coded length therefore does not
+/// stay inside `(125M, 350M)` — when `38520a5a3`/`f0e5f9807` added the
+/// datatype/quantifier and snapshot-replay meters, the 30,000-node chain
+/// crossed the envelope and the tier test went red on a REFUSAL, which is the
+/// one outcome this tier is not about. The caller searches for a length that
+/// still lands in the window; see `the_commit_gate_decides_every_tier_against_the_real_walk`.
 fn repeat_budget_exceeded_fixture(
     exec: &mut Executor,
     rewritten: TermId,
     extra_leaves: &[TermId],
+    chain_len: usize,
 ) -> Proof {
     let mut proof = Proof::new();
     proof.add_rule_step(AletheRule::Trust, vec![rewritten], Vec::new(), Vec::new());
     let mut chain = exec.ctx.terms.mk_var("repeat_pad", ay_core::Sort::Int);
-    for level in 0..30_000 {
+    for level in 0..chain_len {
         let leaf = exec
             .ctx
             .terms
@@ -418,25 +561,14 @@ fn the_commit_gate_decides_every_tier_against_the_real_walk() {
     // named literally so the guard cannot silently follow a constant that
     // moves; `HALF_ENVELOPE_WORK` is asserted below to be under the envelope
     // so the fixture stays a typed verdict rather than a refusal.
-    const HALF_ENVELOPE_WORK: usize = 125_000_000;
-    let mut expensive = repeat_budget_exceeded_fixture(&mut exec, rewritten, &[]);
-    assert!(
-        exec.derive_eq_diffvar_rewritten_assertions(&mut expensive, &scope),
-        "the lane must splice the leading leaf, or the tier is not exercised"
-    );
-    let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&expensive);
-    let error = outcome.expect_err("the trailing foreign leaf must keep the walk rejected");
-    assert!(
-        !matches!(
-            error,
-            ay_proof::ProofCheckError::ResourceLimit | ay_proof::ProofCheckError::Cancelled
-        ),
-        "the fixture must reach a TYPED verdict, not an envelope refusal: {error}"
-    );
+    let (expensive, consumed) = expensive_typed_verdict(&mut exec, rewritten, &scope);
     assert!(
         consumed > HALF_ENVELOPE_WORK,
         "the fixture must genuinely cost more than the retired 125M price, or \
-         it does not guard the retirement: {consumed}"
+         it does not guard the retirement: {consumed}. The window \
+         `(125M, 350M)` has closed from BOTH sides — a typed verdict can no \
+         longer be made expensive enough without refusing — so the retirement \
+         needs a differently-shaped expensive document, not a lowered price."
     );
     assert_eq!(
         exec.eq_diffvar_presentation_commit_decision(&expensive),
@@ -446,7 +578,11 @@ fn the_commit_gate_decides_every_tier_against_the_real_walk() {
          (#strict-walk-memo), and the re-derived price is 10.7x the envelope"
     );
 
-    // Tier 3: cheap typed verdict -> commit, unchanged.
+    // Tier 3: cheap typed verdict -> commit, unchanged. On a FRESH fixture:
+    // Tier 2's registered member and its ~1.88M interned chain terms would
+    // otherwise bill the whole-store pre-charge here too.
+    drop(exec);
+    let (mut exec, rewritten) = retention_off_fixture();
     let cheap = leaf_proof(&mut exec, rewritten);
     let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&cheap);
     assert!(outcome.is_err(), "the two trust leaves keep it rejected");

@@ -232,6 +232,13 @@ impl<E: EngineId> FixedOrderSchedule<E> {
         } else {
             clamped.iter().map(|(_, weight)| weight / max_weight).sum()
         };
+        // `weights` is non-empty and `clamped` maps it one-to-one, so this
+        // `else` is never taken; it keeps the index derivation total.
+        let Some(last_index) = clamped.len().checked_sub(1) else {
+            return Self {
+                entries: Vec::new(),
+            };
+        };
         // Apportion every other entry first and give the residual to a largest
         // entry. This is more than a tie-break detail: if weights are
         // `[1.0, 1e-17]`, `1.0 + 1e-17` rounds to `1.0`. Giving the first arm
@@ -239,41 +246,55 @@ impl<E: EngineId> FixedOrderSchedule<E> {
         // large Duration even though the second arm is owed many nanoseconds.
         // Reserving the residual for a maximum-weight arm prevents that loss.
         let residual_index = if equal_share {
-            clamped.len() - 1
+            last_index
         } else {
             clamped
                 .iter()
                 .rposition(|(_, weight)| *weight == max_weight)
-                .unwrap_or(clamped.len() - 1)
+                .unwrap_or(last_index)
         };
         let total_nanos =
             u128::from(total.as_secs()) * 1_000_000_000 + u128::from(total.subsec_nanos());
         let mut remaining_nanos = total_nanos;
-        let mut allocations = vec![0u128; clamped.len()];
-        for (index, (_, weight)) in clamped.iter().enumerate() {
-            if index == residual_index {
-                continue;
-            }
-            let share = if equal_share {
-                1.0 / scaled_sum
-            } else {
-                (*weight / max_weight) / scaled_sum
-            };
-            // Work in integer nanoseconds. `Duration::MAX.as_secs_f64()`
-            // rounds above the representable Duration range, so converting
-            // that float back with `from_secs_f64` panics even at share 1.
-            let requested = ((total_nanos as f64) * share).floor() as u128;
-            let allocated = requested.min(remaining_nanos);
-            allocations[index] = allocated;
-            remaining_nanos -= allocated;
-        }
-        allocations[residual_index] = remaining_nanos;
-
-        let entries = clamped
+        // Every non-residual entry takes its share in order; the residual
+        // entry is filled once all other shares are known. Building the
+        // allocations by mapping `clamped` keeps them the same length as the
+        // (already materialised) input, so no separate zeroed buffer is sized.
+        let mut planned: Vec<(E, u128)> = clamped
             .into_iter()
             .enumerate()
-            .map(|(index, (e, _))| {
-                let allocated = allocations[index];
+            .map(|(index, (e, weight))| {
+                if index == residual_index {
+                    return (e, 0);
+                }
+                let share = if equal_share {
+                    1.0 / scaled_sum
+                } else {
+                    (weight / max_weight) / scaled_sum
+                };
+                // Work in integer nanoseconds. `Duration::MAX.as_secs_f64()`
+                // rounds above the representable Duration range, so converting
+                // that float back with `from_secs_f64` panics even at share 1.
+                let requested = ((total_nanos as f64) * share).floor() as u128;
+                // `min(requested, remaining)` without a subtraction that could
+                // underflow: take the request when it fits, otherwise the rest.
+                let allocated = match remaining_nanos.checked_sub(requested) {
+                    Some(rest) => {
+                        remaining_nanos = rest;
+                        requested
+                    }
+                    None => core::mem::take(&mut remaining_nanos),
+                };
+                (e, allocated)
+            })
+            .collect();
+        if let Some((_, residual)) = planned.get_mut(residual_index) {
+            *residual = remaining_nanos;
+        }
+
+        let entries = planned
+            .into_iter()
+            .map(|(e, allocated)| {
                 let secs = (allocated / 1_000_000_000) as u64;
                 let nanos = (allocated % 1_000_000_000) as u32;
                 (e, Duration::new(secs, nanos))
@@ -366,16 +387,24 @@ mod tests {
     }
 
     #[test]
-    fn weighted_accepts_duration_max_without_float_rounding_panic() {
+    fn weighted_accepts_duration_max_without_float_rounding_panic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let single = FixedOrderSchedule::weighted(vec![(E::A, 1.0)], Duration::MAX);
-        assert_eq!(single.entries()[0].1, Duration::MAX);
+        let (_, single_budget) = single.entries().first().ok_or("single entry missing")?;
+        if *single_budget != Duration::MAX {
+            return Err(format!("single budget {single_budget:?} != Duration::MAX").into());
+        }
 
         let split = FixedOrderSchedule::weighted(vec![(E::A, 1.0), (E::B, 1.0)], Duration::MAX);
-        let allocated = split.entries()[0]
-            .1
-            .checked_add(split.entries()[1].1)
-            .expect("allocation must not exceed Duration::MAX");
-        assert_eq!(allocated, Duration::MAX);
+        let (_, first) = split.entries().first().ok_or("first split entry missing")?;
+        let (_, second) = split.entries().get(1).ok_or("second split entry missing")?;
+        let allocated = first
+            .checked_add(*second)
+            .ok_or("allocation must not exceed Duration::MAX")?;
+        if allocated != Duration::MAX {
+            return Err(format!("split allocation {allocated:?} != Duration::MAX").into());
+        }
+        Ok(())
     }
 
     #[test]

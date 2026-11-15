@@ -335,7 +335,11 @@ impl ResolutionProof {
 
     /// Check if this is a tree resolution proof (no clause reuse).
     pub fn is_tree(&self) -> bool {
-        let mut used = vec![false; self.steps.len()];
+        // One flag per step, reserved fallibly: a failed reservation only
+        // forgoes the pre-sizing.
+        let mut used: Vec<bool> = Vec::new();
+        let _ = used.try_reserve_exact(self.steps.len());
+        used.extend(std::iter::repeat_n(false, self.steps.len()));
 
         for step in &self.steps {
             if let ResolutionStep::Resolve {
@@ -358,7 +362,11 @@ impl ResolutionProof {
     /// each variable is resolved on at most once.
     pub fn is_regular(&self) -> bool {
         // For each step, track which variables have been resolved on the path to it
-        let mut resolved_on_path: Vec<HashSet<Var>> = vec![HashSet::default(); self.steps.len()];
+        // One set per step, reserved fallibly: a failed reservation only
+        // forgoes the pre-sizing.
+        let mut resolved_on_path: Vec<HashSet<Var>> = Vec::new();
+        let _ = resolved_on_path.try_reserve_exact(self.steps.len());
+        resolved_on_path.extend(std::iter::repeat_n(HashSet::default(), self.steps.len()));
 
         for (idx, step) in self.steps.iter().enumerate() {
             if let ResolutionStep::Resolve {
@@ -403,7 +411,11 @@ impl ResolutionProof {
         }
 
         // For each step, compute when it's last used
-        let mut last_use = vec![0usize; n];
+        // One slot per step, reserved fallibly: a failed reservation only
+        // forgoes the pre-sizing.
+        let mut last_use: Vec<usize> = Vec::new();
+        let _ = last_use.try_reserve_exact(n);
+        last_use.extend(std::iter::repeat_n(0, n));
         for (idx, step) in self.steps.iter().enumerate() {
             if let ResolutionStep::Resolve {
                 parent1, parent2, ..
@@ -419,11 +431,12 @@ impl ResolutionProof {
         let mut max_alive = 0usize;
 
         for idx in 0..n {
-            alive += 1; // New clause derived
+            // New clause derived. `alive` counts live steps, at most `n`.
+            alive = alive.saturating_add(1);
             max_alive = max_alive.max(alive);
 
-            // Check if any clause dies at this step
-            for (prev, &usage) in last_use.iter().enumerate().take(idx + 1) {
+            // Check if any clause dies at this step (`idx < n`: no saturation)
+            for (prev, &usage) in last_use.iter().enumerate().take(idx.saturating_add(1)) {
                 if usage == idx && prev != idx {
                     alive = alive.saturating_sub(1);
                 }

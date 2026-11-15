@@ -136,6 +136,57 @@ fn single_var_atom_implied_through_one_row_is_delivered_with_exact_reason() {
     assert_eq!(stat(&solver, "lra_stale_reason_filtered"), 0);
 }
 
+/// tA after the SAT core assigned the propagated literal: the theory has
+/// asserted `x <= 7/10`, which is now `x`'s own direct upper bound, so
+/// strategy 0 decides the atom with the atom itself. That circular reason is
+/// rejected, and returning it ended the search: the SAT core demoted the
+/// literal and every conflict analysis through it failed closed (the
+/// session-persistent QF_LRA lane livelocked on it). The explanation must
+/// fall through to the row.
+#[test]
+fn lazy_explanation_after_the_atom_is_asserted_does_not_cite_the_atom() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let one = terms.mk_rational(rat(1, 1));
+    let zero = terms.mk_rational(rat(0, 1));
+    let half = terms.mk_rational(rat(1, 2));
+    let seven_tenths = terms.mk_rational(rat(7, 10));
+    let sum = terms.mk_add(vec![x, y]);
+    let sum_le_1 = terms.mk_le(sum, one);
+    let y_ge_half = terms.mk_ge(y, half);
+    let x_ge_0 = terms.mk_ge(x, zero);
+    let x_le_7_10 = terms.mk_le(x, seven_tenths);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [sum_le_1, y_ge_half, x_ge_0, x_le_7_10] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(sum_le_1, true);
+    solver.assert_literal(y_ge_half, true);
+    solver.assert_literal(x_ge_0, true);
+    let result = solver.check();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+
+    let lit = TheoryLit::new(x_le_7_10, true);
+    let prop = expect_delivered(&mut solver, lit, "x <= 7/10");
+    assert!(
+        prop.is_lazy(),
+        "the probe needs a lazy implied-bound propagation, got {prop:?}"
+    );
+    solver.assert_literal(x_le_7_10, true);
+    // `assert_literal` only records the literal; the bound is installed by
+    // the next check, which the SAT integration runs before any conflict.
+    let result = solver.check();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+    let reason = assert_sound_reason(&terms, &mut solver, &prop);
+    assert!(
+        reason.contains(&TheoryLit::new(sum_le_1, true))
+            && reason.contains(&TheoryLit::new(y_ge_half, true)),
+        "the reason must come from the row, got {reason:?}"
+    );
+}
+
 /// tB: compound atom whose original variables all carry DIRECT bounds.
 /// `x >= 1/2, y >= 3/5, x <= 5` decides `x + y <= 1` (false) and
 /// `x + y >= 1` (true).
@@ -331,6 +382,99 @@ fn compound_atom_needing_implied_bound_is_delivered_with_exact_reason() {
     );
 }
 
+/// tF: pure offset graph with NO direct bounds anywhere (the
+/// pointer-family shape): `x = y + 1` asserted with `y` free must still
+/// refute `x < y` and decide `x <= y + 1` / `x >= y + 1`, with the
+/// equality itself as the entire reason. Every antecedent variable is
+/// unbounded, so neither the direct-bounds interval probe nor
+/// component-bounded row analysis can fire; only the shared-slack
+/// direct bound (the asserted equality bounds the `x - y` slack to 1)
+/// or an implied slack bound can deliver these.
+#[test]
+fn offset_equality_with_free_vars_decides_sibling_atoms() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let one = terms.mk_rational(rat(1, 1));
+    let y_plus_1 = terms.mk_add(vec![y, one]);
+    let x_eq_y1 = terms.mk_eq(x, y_plus_1);
+    let x_lt_y = terms.mk_lt(x, y);
+    let x_le_y1 = terms.mk_le(x, y_plus_1);
+    let x_ge_y1 = terms.mk_ge(x, y_plus_1);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [x_eq_y1, x_lt_y, x_le_y1, x_ge_y1] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(x_eq_y1, true);
+    let result = solver.check();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+
+    let propagations = solver.propagate();
+    for (lit, what) in [
+        (TheoryLit::new(x_lt_y, false), "¬(x < y)"),
+        (TheoryLit::new(x_le_y1, true), "x <= y + 1"),
+        (TheoryLit::new(x_ge_y1, true), "x >= y + 1"),
+    ] {
+        let prop = propagations
+            .iter()
+            .find(|p| p.literal == lit)
+            .cloned()
+            .unwrap_or_else(|| panic!("expected {what} delivered, got {propagations:?}"));
+        let reason = assert_sound_reason(&terms, &mut solver, &prop);
+        assert!(
+            reason.contains(&TheoryLit::new(x_eq_y1, true)),
+            "reason for {what} must cite the offset equality, got {reason:?}"
+        );
+    }
+    assert_eq!(stat(&solver, "lra_stale_reason_filtered"), 0);
+}
+
+/// tF on the BCP path: the combiner drives the solver through
+/// `check_during_propagate` during search, not the full `check()`.
+/// The same offset propagations must be queued there too; this is the
+/// path the AUFLIA combiner exercises on the pointer family, where
+/// delivered propagations measure zero.
+#[test]
+fn offset_equality_with_free_vars_decides_sibling_atoms_via_bcp_check() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let one = terms.mk_rational(rat(1, 1));
+    let y_plus_1 = terms.mk_add(vec![y, one]);
+    let x_eq_y1 = terms.mk_eq(x, y_plus_1);
+    let x_lt_y = terms.mk_lt(x, y);
+    let x_le_y1 = terms.mk_le(x, y_plus_1);
+    let x_ge_y1 = terms.mk_ge(x, y_plus_1);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [x_eq_y1, x_lt_y, x_le_y1, x_ge_y1] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(x_eq_y1, true);
+    let result = solver.check_during_propagate();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+
+    let propagations = solver.propagate();
+    for (lit, what) in [
+        (TheoryLit::new(x_lt_y, false), "¬(x < y)"),
+        (TheoryLit::new(x_le_y1, true), "x <= y + 1"),
+        (TheoryLit::new(x_ge_y1, true), "x >= y + 1"),
+    ] {
+        let prop = propagations
+            .iter()
+            .find(|p| p.literal == lit)
+            .cloned()
+            .unwrap_or_else(|| panic!("expected {what} delivered, got {propagations:?}"));
+        let reason = assert_sound_reason(&terms, &mut solver, &prop);
+        assert!(
+            reason.contains(&TheoryLit::new(x_eq_y1, true)),
+            "reason for {what} must cite the offset equality, got {reason:?}"
+        );
+    }
+    assert_eq!(stat(&solver, "lra_stale_reason_filtered"), 0);
+}
+
 /// The chain walker fails closed when an antecedent's current bound is
 /// looser than the one the derivation consumed (the pop-restore hole):
 /// no reason is produced rather than an unsound one.
@@ -415,4 +559,114 @@ fn chain_walker_rejects_antecedent_looser_than_consumed() {
         solver.make_eager_implied_propagation_reasons(b_id as usize, false),
         Some(vec![TheoryLit::new(a_ge_0, true)])
     );
+}
+
+/// tH: conflict-size counters record emitted core sizes. `x >= 2`
+/// with `x <= 1` conflicts; the counters must count the conflict and
+/// its literals so core quality is measurable from statistics alone.
+#[test]
+fn conflict_size_counters_record_core_literals() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let two = terms.mk_rational(rat(2, 1));
+    let one = terms.mk_rational(rat(1, 1));
+    let x_ge_2 = terms.mk_ge(x, two);
+    let x_le_1 = terms.mk_le(x, one);
+
+    let mut solver = LraSolver::new(&terms);
+    solver.register_atom(x_ge_2);
+    solver.register_atom(x_le_1);
+    assert!(
+        stat(&solver, "lra_conflict_lits_max") == 0
+            && stat(&solver, "lra_conflict_lits_total") == 0,
+        "counters start at zero"
+    );
+    let _ = solver.assert_literal(x_ge_2, true);
+    let _ = solver.assert_literal(x_le_1, true);
+    let result = solver.check();
+    assert!(
+        matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "expected conflict, got {result:?}"
+    );
+    let total = stat(&solver, "lra_conflict_lits_total");
+    let max = stat(&solver, "lra_conflict_lits_max");
+    let conflicts = stat(&solver, "lra_conflicts");
+    assert!(conflicts >= 1, "expected >= 1 conflict, got {conflicts}");
+    assert!(max >= 1 && max <= total, "max={max} total={total}");
+    assert!(total >= conflicts, "total={total} conflicts={conflicts}");
+}
+
+/// tF: a variable fixed by its bounds decides its equality atom.
+/// `x >= 1/2, x <= 1/2` propagates `(= x 1/2)` true. (Two-argument
+/// `distinct` canonicalizes to `Not(=)` in the term store, so it is
+/// the same literal at opposite polarity.) Equality atoms are
+/// excluded from atom_index, so only the interval candidate path
+/// can deliver these.
+#[test]
+fn fixed_var_equality_atom_is_delivered_with_exact_reason() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let half = terms.mk_rational(rat(1, 2));
+    let x_ge_half = terms.mk_ge(x, half);
+    let x_le_half = terms.mk_le(x, half);
+    let x_eq_half = terms.mk_eq(x, half);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [x_ge_half, x_le_half, x_eq_half] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(x_ge_half, true);
+    solver.assert_literal(x_le_half, true);
+    let result = solver.check();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+
+    let propagations = solver.propagate();
+    let prop = propagations
+        .iter()
+        .find(|p| p.literal == TheoryLit::new(x_eq_half, true))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected x = 1/2 delivered, got {propagations:?}"));
+    let reason = assert_sound_reason(&terms, &mut solver, &prop);
+    assert!(
+        reason.contains(&TheoryLit::new(x_ge_half, true))
+            && reason.contains(&TheoryLit::new(x_le_half, true)),
+        "reason must cite both fixing bounds, got {reason:?}"
+    );
+    assert_eq!(stat(&solver, "lra_stale_reason_filtered"), 0);
+}
+
+/// tG: bounds excluding the equality value refute the equality atom.
+/// `x >= 1` propagates `(= x 1/2)` false (equivalently distinct true).
+#[test]
+fn excluded_var_equality_atom_is_refuted_with_exact_reason() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let one = terms.mk_rational(rat(1, 1));
+    let half = terms.mk_rational(rat(1, 2));
+    let x_ge_1 = terms.mk_ge(x, one);
+    let x_eq_half = terms.mk_eq(x, half);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [x_ge_1, x_eq_half] {
+        solver.register_atom(atom);
+    }
+    solver.assert_literal(x_ge_1, true);
+    let result = solver.check();
+    assert!(is_sat_like(&result), "expected SAT-like, got {result:?}");
+
+    let propagations = solver.propagate();
+    let prop = propagations
+        .iter()
+        .find(|p| p.literal == TheoryLit::new(x_eq_half, false))
+        .cloned()
+        .unwrap_or_else(|| panic!("expected ¬(x = 1/2) delivered, got {propagations:?}"));
+    let reason = assert_sound_reason(&terms, &mut solver, &prop);
+    assert!(
+        reason.contains(&TheoryLit::new(x_ge_1, true)),
+        "reason must cite the excluding bound, got {reason:?}"
+    );
+    assert_eq!(stat(&solver, "lra_stale_reason_filtered"), 0);
 }

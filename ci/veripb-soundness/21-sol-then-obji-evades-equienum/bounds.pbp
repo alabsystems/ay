@@ -1,0 +1,12 @@
+pseudo-Boolean proof version 3.0
+% THE OPPOSITE-VERDICT COMPANION, same formula and same binary: what the formula actually
+% is. Its three solutions over the preserved set {x1,x2} have objective 1, 1 and 2, so the
+% optimum is 1 — and `soli` may install the objective-restricting constraint that proves it,
+% because `conclusion BOUNDS` is a claim about the objective and not about the solution set.
+% What the forgery does with the same constraint is EXPORT it as an equienumerable output.
+f 1 ;
+soli x1 ~x2 : 1 ;
+rup >= 1 ;
+output NONE ;
+conclusion BOUNDS 1 1 ;
+end pseudo-Boolean proof;

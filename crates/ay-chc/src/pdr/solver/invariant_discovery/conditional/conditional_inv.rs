@@ -224,12 +224,15 @@ impl PdrSolver {
         result
     }
 
-    /// Recursively extract threshold constants from an expression.
+    /// Extract threshold constants from an expression into a set, visiting
+    /// each distinct (shared) sub-term once: the tree walk this replaces was
+    /// exponential in the nesting of shared sub-terms (the early
+    /// conditional-invariant probe on a shared `let` chain).
     pub(in crate::pdr::solver) fn extract_thresholds_from_expr(
         expr: &ChcExpr,
         thresholds: &mut FxHashSet<i128>,
     ) {
-        match expr {
+        crate::expr::dag::walk_distinct_preorder(expr, |node| match node {
             // Look for patterns like x <= K, x < K, x >= K, x > K
             ChcExpr::Op(ChcOp::Le | ChcOp::Lt | ChcOp::Ge | ChcOp::Gt, args) if args.len() == 2 => {
                 // Check if one side is a constant (handles Op(Neg,[Int(n)]) via as_i128())
@@ -244,14 +247,11 @@ impl PdrSolver {
                     thresholds.insert(k.saturating_sub(1));
                     thresholds.insert(k.saturating_add(1));
                 }
+                crate::expr::dag::Step::Skip
             }
-            ChcExpr::Op(_, args) => {
-                for arg in args {
-                    Self::extract_thresholds_from_expr(arg, thresholds);
-                }
-            }
-            _ => {}
-        }
+            ChcExpr::Op(..) => crate::expr::dag::Step::Descend,
+            _ => crate::expr::dag::Step::Skip,
+        });
     }
 
     /// Check if a conditional equality invariant holds.

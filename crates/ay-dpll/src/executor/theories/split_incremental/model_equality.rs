@@ -122,6 +122,28 @@ impl ModelEqualityTracker {
         }
     }
 
+    /// Reset the round counter when a dispatch encoded at least one
+    /// genuinely new equality atom.
+    ///
+    /// A new atom is real progress of exactly the kind the budget exists to
+    /// distinguish from cycling: the SAT problem grew, and it can only grow
+    /// that way finitely many times (one atom per requested term pair), so
+    /// replenishing here cannot reintroduce the infinite loop the budget
+    /// guards against — dispatches with nothing new still count down via
+    /// [`Self::increment_round`]. Without this, a converging search that
+    /// legitimately needs more than `max_rounds` fresh interface equalities
+    /// between theory conflicts is falsely cut off as "incomplete"
+    /// (convert-jpg2gif-query-1145: 21st fresh singleton equality bailed at
+    /// the eager budget of 20; the same search decides `sat` once fresh
+    /// atoms replenish). Mirrors the theory-conflict reset in
+    /// [`Self::note_theory_progress`] (#8727).
+    ///
+    /// Call INSTEAD of [`Self::increment_round`] for a dispatch that
+    /// introduced at least one new equality atom.
+    pub(crate) fn note_new_equality(&mut self) {
+        self.rounds = 0;
+    }
+
     /// Check whether triangle axiom clauses should be added for an equality atom.
     /// Returns `true` on the first call for a given atom (add the clauses),
     /// `false` on subsequent calls (already added).
@@ -351,6 +373,30 @@ mod tests {
         assert!(!tracker.increment_round()); // round 2
         assert!(!tracker.increment_round()); // round 3
         assert!(tracker.increment_round()); // round 4 > 3, exhausted
+    }
+
+    // #1145: a dispatch that encodes a genuinely new equality atom is
+    // finite progress (one atom per term pair), so it must replenish the
+    // budget just like a learned theory conflict does (#8727) — a
+    // converging search needing more fresh equalities than `max_rounds`
+    // between conflicts must not be falsely cut off. Stale dispatches
+    // (nothing new encoded) still count down and exhaust.
+    #[test]
+    fn test_note_new_equality_replenishes_budget() {
+        let mut tracker = ModelEqualityTracker::new(3);
+        // 50 fresh dispatches, each replenishing: never exhausted.
+        for _ in 0..50 {
+            tracker.note_new_equality();
+            assert_eq!(tracker.rounds(), 0);
+        }
+        // Interleave: stale dispatches count up, a fresh one resets.
+        assert!(!tracker.increment_round()); // stale 1
+        assert!(!tracker.increment_round()); // stale 2
+        tracker.note_new_equality();
+        assert!(!tracker.increment_round()); // stale 1
+        assert!(!tracker.increment_round()); // stale 2
+        assert!(!tracker.increment_round()); // stale 3
+        assert!(tracker.increment_round()); // stale 4 > 3, exhausted
     }
 
     // #8727: note_theory_progress must NOT reset when no conflicts were

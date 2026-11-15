@@ -87,14 +87,18 @@ pub fn parse_qdimacs(input: &str) -> Result<QbfFormula, QdimacsError> {
     let mut quantified_variables = HashSet::new();
     let mut matrix_started = false;
     // Cap the speculative clause pre-allocation from the untrusted declared count
-    // (the vector grows to fit real clauses anyway).
-    let mut clauses = Vec::with_capacity(header.num_clauses.min(1 << 20));
+    // (the vector grows to fit real clauses anyway). The reservation is only a
+    // capacity hint, so a refused one is not an error.
+    let mut clauses = Vec::new();
+    let _ = clauses.try_reserve_exact(header.num_clauses.min(1 << 20));
     // Content-driven variable count: the highest 1-indexed variable that actually
     // appears in the prefix or matrix. The QBF solver's per-variable arrays are
     // sized by this, not by the (untrusted) declared header.
     let mut actual_num_vars: u32 = 0;
     for record in records {
-        match record {
+        // Match by reference: moving a payload out of `record` left a drop
+        // that switched on its discriminant.
+        match &record {
             DimacsRecord::Tagged {
                 tag: tag @ ('e' | 'a'),
                 values,
@@ -104,14 +108,14 @@ pub fn parse_qdimacs(input: &str) -> Result<QbfFormula, QdimacsError> {
                         "quantifier block appears after the matrix has started".to_string(),
                     ));
                 }
-                let quantifier = if tag == 'e' {
+                let quantifier = if *tag == 'e' {
                     Quantifier::Exists
                 } else {
                     Quantifier::Forall
                 };
 
                 let mut variables = Vec::new();
-                for &val in &values {
+                for &val in values {
                     if val <= 0 {
                         return Err(QdimacsError::InvalidQuantifierLine(format!(
                             "non-positive variable {val} in quantifier block"
@@ -141,7 +145,7 @@ pub fn parse_qdimacs(input: &str) -> Result<QbfFormula, QdimacsError> {
                 // is 2^31; using that as QBF's 1-based internal variable would
                 // otherwise trip Literal's encoding assertion before the
                 // post-parse allocation backstop could return a typed error.
-                for &literal in &raw {
+                for &literal in raw {
                     let variable = literal.unsigned_abs();
                     if variable as usize > MAX_QBF_VARS {
                         return Err(QdimacsError::InvalidClause(format!(

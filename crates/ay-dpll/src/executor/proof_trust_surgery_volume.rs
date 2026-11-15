@@ -327,6 +327,8 @@ fn spend_and_distinct(
         let ok = match &unit.kind {
             AndDistinctKind::Plain => true,
             AndDistinctKind::Arith { .. } => volume.spend(5),
+            AndDistinctKind::EqFlip => volume.spend(6),
+            AndDistinctKind::Transport(plan) => volume.spend(plan.nodes().saturating_mul(6)),
             AndDistinctKind::DistinctBinary => volume.spend(7),
             AndDistinctKind::DistinctNary { count, .. } => match usize::try_from(*count) {
                 Ok(count) => volume.spend(7usize.saturating_add(count.saturating_mul(3))),
@@ -353,6 +355,19 @@ fn spend_and_distinct(
         }
     }
     volume.triangle(conjs.len().saturating_add(1))
+}
+
+/// An identity consequence (empty lemma, see `QuantConsequencePlan::lemma`)
+/// emits its chain alone; every other plan adds its lemma and resolutions.
+fn spend_quant_consequence(volume: &mut Volume, plan: &QuantConsequencePlan) -> bool {
+    if plan.lemma.is_empty() {
+        return plan.supports.is_empty() && spend_quant_chain(volume, &plan.chain);
+    }
+    plan.lemma.len() == plan.supports.len().saturating_add(2)
+        && spend_quant_chain(volume, &plan.chain)
+        && volume.triangle(plan.lemma.len())
+        && volume.spend(plan.lemma.len())
+        && volume.spend(plan.supports.len().saturating_add(1))
 }
 
 fn spend_quant_chain(volume: &mut Volume, chain: &QuantInstanceChain) -> bool {
@@ -476,12 +491,7 @@ pub(super) fn emitted_proof_volume_is_bounded(
         }
     }
     for plan in plans.quant_consequences.values() {
-        if plan.lemma.len() != plan.supports.len().saturating_add(2)
-            || !spend_quant_chain(&mut volume, &plan.chain)
-            || !volume.triangle(plan.lemma.len())
-            || !volume.spend(plan.lemma.len())
-            || !volume.spend(plan.supports.len().saturating_add(1))
-        {
+        if !spend_quant_consequence(&mut volume, plan) {
             return false;
         }
     }

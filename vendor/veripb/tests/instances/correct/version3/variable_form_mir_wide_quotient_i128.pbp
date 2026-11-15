@@ -1,0 +1,9 @@
+pseudo-Boolean proof version 3.0
+% The i128 twin of variable_form_mir_wide_quotient: the MIR routine is generic in the constraint's
+% integer type, so the same wide intermediate aborted the checker one tier up as well.
+f 1 ;
+pol 1 170141183460469231731687303715884105726 m ;
+e 170141183460469231731687303715884105725 ~x1 >= 0 : 2 ;
+output NONE;
+conclusion NONE;
+end pseudo-Boolean proof;

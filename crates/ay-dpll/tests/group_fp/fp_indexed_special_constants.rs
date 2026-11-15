@@ -53,8 +53,8 @@
 //! - **Not `check_fp_support` / `UnknownReason::Unsupported`.** The reported
 //!   reason is `incomplete`, and the SAT solver runs to completion
 //!   (`solve: sat num_vars=127`).
-//! - **Not the constant-fold in `solve_fp`.** Extending
-//!   `to_fp_const::fold_to_fp_real_constants` to rewrite these constants into
+//! - **Not the constant-fold in `solve_fp`.** Extending that fold (then
+//!   `to_fp_const::fold_to_fp_real_constants`, now `ay_fp::rewriter`) to rewrite these constants into
 //!   the (known-good) 1-arg BV-reinterpret `to_fp` form was implemented and
 //!   measured: zero change on every query above. So the degradation happens
 //!   OUTSIDE `solve_fp`, downstream of a `sat` the FP lane already returned.

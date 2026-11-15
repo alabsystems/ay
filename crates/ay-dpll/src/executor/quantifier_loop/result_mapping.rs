@@ -7,26 +7,38 @@
 //! `map_quantifier_result` maps raw solves through CEGQI forall/exists inversion,
 //! E-matching incompleteness, interleaved refinement, and assertion restoration.
 
+mod affine_elimination;
+mod ce_free_resolve;
 mod cert_consult;
 mod checked_isolated_solve;
 mod checked_model_rewrite;
+pub(in crate::executor) use checked_model_rewrite::CheckedModelRewriteSatAuthority;
 mod closed_universal;
+mod derived_arena;
 mod exact_array_negation;
 mod finite_expansion_replay;
+mod finite_expansion_unsat;
 mod interleaved_ematching;
 mod justification;
 mod qpf_premise_forced;
 mod quantified_unsat;
 mod restore_refinement;
+#[cfg(test)]
+mod sat_authority_forge_tests;
+#[cfg(test)]
+pub(in crate::executor) mod trust_forge;
 mod unsafe_partial_unknown;
 mod vacuous_collapse;
 use ay_core::term::{TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::{TermData, TermId};
 use ay_frontend::SourceContextStamp;
+pub(in crate::executor) use checked_isolated_solve::carries_name_encoded_term_ids;
+pub(in crate::executor) use derived_arena::compact_derived_arena;
 pub(in crate::executor) use exact_array_negation::CheckedExactArrayNegationSatAuthority;
 
 use super::super::Executor;
 use super::collect_and_conjuncts;
+use super::exact_array_negation::ExactArrayNegationEvidence;
 use super::{ExactFiniteExpansionEvidence, QuantifierProcessingResult};
 use crate::cegqi::CegqiInstantiator;
 use crate::ematching::contains_quantifier;
@@ -143,12 +155,27 @@ impl CheckedSameContextGroundScope {
 #[derive(Debug)]
 struct CheckedSameContextGroundModel {
     scope: CheckedSameContextGroundScope,
+    outer_roots: Vec<TermId>,
     _certificate: ValidatedModelCertificate,
     model: Model,
     nra_algebraic_model: HashMap<TermId, ay_nra::RealAlgebraicValue>,
     dt_theory_model: Option<ay_dt::DtModel>,
     recorded_var_substitutions: HashMap<TermId, TermId>,
     delegated_assertions: ay_core::kani_compat::DetHashSet<TermId>,
+}
+
+/// Exact candidate after checking its derived ground obligations both before
+/// and after postprocessing, under the restored source/query window. Only
+/// this transaction can transfer its original construction accounting.
+pub(in crate::executor) struct CheckedGroundModelConstruction<'a> {
+    model: Model,
+    outer_roots: &'a [TermId],
+}
+
+impl<'a> CheckedGroundModelConstruction<'a> {
+    pub(in crate::executor) fn into_parts(self) -> (Model, &'a [TermId]) {
+        (self.model, self.outer_roots)
+    }
 }
 
 /// Exact outer model state parked while a checked candidate is installed.
@@ -158,7 +185,7 @@ struct CheckedSameContextGroundModel {
 /// entry. Statistics and scalar result state stay live during the transaction
 /// and are snapshotted only so a declining/panicking postprocessor is a true
 /// no-op.
-struct CheckedModelInstallSnapshot {
+pub(in crate::executor) struct CheckedModelInstallSnapshot {
     model: Option<Model>,
     nra_algebraic_model: HashMap<TermId, ay_nra::RealAlgebraicValue>,
     dt_theory_model: Option<ay_dt::DtModel>,
@@ -180,7 +207,7 @@ struct CheckedModelInstallSnapshot {
 }
 
 impl CheckedModelInstallSnapshot {
-    fn take(executor: &mut Executor) -> Self {
+    pub(in crate::executor) fn take(executor: &mut Executor) -> Self {
         Self {
             model: executor.last_model.take(),
             nra_algebraic_model: executor.nra_algebraic_model.take_values(),
@@ -205,7 +232,7 @@ impl CheckedModelInstallSnapshot {
         }
     }
 
-    fn restore(self, executor: &mut Executor) {
+    pub(in crate::executor) fn restore(self, executor: &mut Executor) {
         executor.last_model = self.model;
         executor.restore_nra_values(self.nra_algebraic_model);
         executor.dt_theory_model = self.dt_theory_model;
@@ -293,6 +320,15 @@ impl CheckedGroundUnsat {
     }
 }
 
+/// What a checked isolated probe establishes: the bound scope, the decision,
+/// the authority class an UNSAT was admitted on, and its evidence.
+type CheckedIsolatedOutcome = (
+    CheckedGroundScope,
+    CheckedGroundKind,
+    crate::executor::unsat_cert::ProbeUnsatAuthority,
+    crate::executor::UnsatEvidence,
+);
+
 /// Checked strict-proof UNSAT authority for one exact assertion vector.
 ///
 /// Unlike [`CheckedGroundUnsat`], this token is UNSAT-only and accepts both
@@ -304,9 +340,28 @@ impl CheckedGroundUnsat {
 #[derive(Debug)]
 pub(in crate::executor) struct CheckedExactUnsat {
     scope: CheckedGroundScope,
+    authority: crate::executor::unsat_cert::ProbeUnsatAuthority,
+    evidence: crate::executor::UnsatEvidence,
 }
 
 impl CheckedExactUnsat {
+    /// The authority class that admitted the probe's UNSAT. A caller sealing
+    /// this refutation into a certificate of its own inherits it: a
+    /// `discharged-trust` admission is a fresh-executor re-solve of the same
+    /// code, not an independent check, and may not be re-labelled as one.
+    pub(in crate::executor) const fn authority(
+        &self,
+    ) -> crate::executor::unsat_cert::ProbeUnsatAuthority {
+        self.authority
+    }
+
+    /// The probe certificate's evidence (level and corroboration). A sealing
+    /// theorem reports it as its own, so a nested corroboration reaches the
+    /// published label.
+    pub(in crate::executor) const fn evidence(&self) -> crate::executor::UnsatEvidence {
+        self.evidence
+    }
+
     pub(in crate::executor) fn consume(self, executor: &mut Executor, roots: &[TermId]) -> bool {
         !executor.should_abort_theory_loop() && self.scope.is_current_for(executor, roots)
     }
@@ -371,6 +426,49 @@ enum CheckedGroundKind {
 enum CheckedIsolatedMode {
     GroundDecision,
     ExactUnsat,
+    /// [`Self::ExactUnsat`] narrowed to one certificate class: the probe's own
+    /// strict checker accepted its complete refutation proof
+    /// (`UnsatCertificate::strict_proof_verified`). Independent-reconfirmation
+    /// and exact-semantic certificates are refused.
+    StrictExactUnsat,
+    /// [`Self::ExactUnsat`] minus `DischargedTrust` (a same-engine re-solve).
+    ExactUnsatWithoutTrustDischarge,
+    /// [`Self::GroundDecision`] minus `DischargedTrust` at every rigor, for
+    /// the quantified model check's auxiliary solves (each UNSAT decides a
+    /// truth value a published `sat` rests on), whose UNSAT is also admitted
+    /// as the shed-mode raw admission when, and only when, the ENCLOSING solve
+    /// sheds proof work (`competition_shedding_active`). See
+    /// [`Executor::checked_model_check_solve`].
+    ModelCheckDecision,
+    /// [`Self::GroundDecision`] for any other probe whose UNSAT CONFIRMS that a
+    /// quantified conjunct holds, so that a published `sat` rests on it:
+    /// `DischargedTrust` is admitted only while the ENCLOSING solve accepts it
+    /// as grant authority (`Executor::accepts_discharged_trust_grant`), and is
+    /// reported to the consumer. See
+    /// [`Executor::checked_sat_authority_ground_solve`].
+    SatAuthorityDecision,
+}
+
+/// Which window [`Executor::checked_same_context_unsat_proof`] opens.
+pub(in crate::executor) enum SameContextWindow<'a> {
+    /// A quantifier-free consequence set, no parsed surfaces (the consequence
+    /// replay). A window carrying a quantifier is refused.
+    Ground,
+    /// Authored roots of the enclosing query, possibly quantified, which the
+    /// probe decides through the whole ordinary pipeline (ground-first
+    /// scheduling, `check_sat/ground_first.rs`). `surfaces`, when given, are
+    /// their authored parsed forms aligned with the roots: the window then
+    /// carries them exactly as a standalone query over those roots would, so
+    /// the probe's proof build has the same surface-aligned lanes (the
+    /// fold-to-false rescues need them).
+    AuthoredRoots {
+        surfaces: Option<&'a [ay_frontend::command::Term]>,
+        /// Receives, beside a [`SameContextProbeOutcome::Proof`], the
+        /// source-syntax spellings the probe's proof build recorded for those
+        /// surfaces (`last_proof_term_overrides`): the printer needs them to
+        /// `assume` each root as authored and bridge to its canonical term.
+        surface_overrides: &'a mut Option<HashMap<TermId, String>>,
+    },
 }
 
 /// Outcome of one same-context consequence probe
@@ -495,6 +593,93 @@ fn exact_public_table_rescue_needed(
         || (has_table_routing_bit && !exact_public_transport)
 }
 
+/// What one quantified SOLVE established, read by every pass of
+/// [`Executor::classify_and_certify_quantifier_result`] over it -- the
+/// primary verdict's pass and, when the counterexample-free probe refutes,
+/// the rescue's (#quantifier-ce-free-resolve). Nothing here describes a
+/// classification; that is [`CegqiClassification`].
+///
+/// OWNED, not borrowed. The rescue pass no longer runs inside
+/// `map_quantifier_result`: the probe fires at the EXECUTOR, after the five
+/// passes that can still publish a verdict once the quantifier loop has
+/// returned (see [`Executor::fire_stashed_ce_free_resolve`]), so these facts
+/// have to outlive that frame. Every one of them is already an owned local
+/// there -- destructured out of the [`QuantifierProcessingResult`] -- so
+/// owning them costs a move, not a clone, and there is ONE struct rather
+/// than a borrowed one and an owned mirror that can drift apart.
+struct QuantifierVerdictInputs {
+    category: LogicCategory,
+    ematching_added_instantiations: bool,
+    reached_instantiation_limit: bool,
+    unsat_from_interleaved: bool,
+    /// After the interleaved rounds: what the classification reads.
+    has_uninstantiated_quantifiers: bool,
+    /// Before them: what `restore_assertions` reads.
+    has_uninstantiated_quantifiers_before_interleaving: bool,
+    has_deferred: bool,
+    has_completely_unhandled_quantifiers: bool,
+    unhandled_quantifiers: Vec<TermId>,
+    ematching_has_exists: bool,
+    refinement_assertions: Option<Vec<TermId>>,
+    has_unsafe_partial_quantifiers: bool,
+    quantifiers_supported_by_uf_completion: bool,
+    full_ematching_coverage: bool,
+    /// The SOLVE's CEGQI-forall bit, read by the public-root table rescue and
+    /// the SAT postflight. Those describe the solve, not the classification,
+    /// so the rescue pass sees the same value the primary pass saw.
+    cegqi_has_forall: bool,
+    /// The source-context stamp captured before the pass ran, so a
+    /// certificate minted in the rescue pass is measured against the same
+    /// point the primary pass was.
+    cegqi_source_context_stamp: Option<SourceContextStamp>,
+    exact_finite_expansion: Option<ExactFiniteExpansionEvidence>,
+    exact_array_negation: Option<ExactArrayNegationEvidence>,
+}
+
+/// (#quantifier-ce-free-resolve) Everything the counterexample-free probe
+/// and its rescue pass need, parked by `map_quantifier_result` when the loop
+/// ends `unknown` with the probe ARMED, and consumed at exactly one place:
+/// [`Executor::fire_stashed_ce_free_resolve`], called from
+/// `check_sat_guarded` after every executor-level pass that could still
+/// publish a verdict has declined. Parking is not firing, and a parked stash
+/// that is never fired costs the query nothing.
+pub(in crate::executor) struct CeFreeResolveStash {
+    /// The exact vector the primary dispatch was handed.
+    snapshot: Option<Vec<TermId>>,
+    /// The counterexample conjuncts `setup_cegqi_for_unhandled` recorded.
+    ce_lemma_ids: Vec<TermId>,
+    category: LogicCategory,
+    /// The SOLVE's facts, so the rescue pass reads exactly what the primary
+    /// pass read.
+    inputs: QuantifierVerdictInputs,
+    /// The authored vector `restore_assertions` puts back over the probe's
+    /// counterexample-free one.
+    original_assertions: Option<Vec<TermId>>,
+}
+
+/// What CEGQI contributes to ONE classification of a ground result: the
+/// solve's own lemmas and instantiators for the primary verdict, and nothing
+/// at all ([`Self::NONE`]) for a counterexample-free refutation, which is
+/// classified as an E-matching-only refutation of the same problem.
+struct CegqiClassification<'a> {
+    has_forall: bool,
+    has_exists: bool,
+    ce_lemma_ids: &'a [TermId],
+    ce_lemma_groups: &'a [(TermId, Vec<TermId>)],
+    state: &'a [(TermId, CegqiInstantiator)],
+}
+
+impl CegqiClassification<'static> {
+    /// Every CEGQI flag off.
+    const NONE: Self = Self {
+        has_forall: false,
+        has_exists: false,
+        ce_lemma_ids: &[],
+        ce_lemma_groups: &[],
+        state: &[],
+    };
+}
+
 /// Exact facts consumed by the final CEGQI SAT postflight.
 #[derive(Debug, Clone, Copy)]
 struct CegqiSatPostflightFacts {
@@ -550,6 +735,19 @@ struct CegqiUfRecompletion {
     /// proof-tight semantic revision check: direct Model field writes cannot
     /// preserve authority merely because they bypass a mutation counter.
     model_definition: Box<[TermId]>,
+}
+
+/// Owned M′ after its CEGQI theorem, declaration, premise and semantic-seal
+/// checks. Generic model readers cannot construct this accounting handoff.
+pub(in crate::executor) struct CheckedCegqiModelConstruction<'a> {
+    model: Box<Model>,
+    roots: &'a [TermId],
+}
+
+impl<'a> CheckedCegqiModelConstruction<'a> {
+    pub(in crate::executor) fn into_parts(self) -> (Box<Model>, &'a [TermId]) {
+        (self.model, self.roots)
+    }
 }
 
 /// Query-scoped authority that the installed model is the exact UF
@@ -608,6 +806,16 @@ impl CegqiUfRecompletionGrant {
         {
             return None;
         }
+        // The theorem owns this exact sealed M′. Reconstruct only its DATA
+        // accounting at the checked publication window; preserve the checked
+        // semantic seal and the original cumulative counter/attempt.
+        let model = crate::executor::model::reconstruct_checked_cegqi_model_owner(
+            executor,
+            CheckedCegqiModelConstruction {
+                model: completion.model,
+                roots: &roots,
+            },
+        )?;
         let grant = Self {
             query_epoch: executor.query_authority_epoch.clone(),
             source_context_stamp: executor.ctx.source_context_stamp(),
@@ -618,7 +826,7 @@ impl CegqiUfRecompletionGrant {
             model_definition: completion.model_definition,
             model_definition_entries,
         };
-        Some((grant, completion.model))
+        Some((grant, model))
     }
 
     /// Recheck query, roots, source scope, declaration identities/signatures,
@@ -1163,8 +1371,43 @@ impl Executor {
         self.has_current_model_free_mbqi_sat_authority(roots)
     }
 
-    fn replay_exact_finite_quantifier_root(&mut self, root: TermId) -> Option<TermId> {
-        finite_expansion_replay::replay(&mut self.ctx.terms, root)
+    /// Independently replay `root`'s exact finite expansion, as a theorem of
+    /// `source`.
+    ///
+    /// The first attempt uses LITERAL bounds only. That is
+    /// [`crate::skolemize::scoped_standalone_finite_domain_replay`]'s rule and
+    /// stays the only route for every expansion that needs nothing more.
+    ///
+    /// The second attempt (#source-derived-replay-bound) adds the constants
+    /// this replay DERIVES ITSELF from `source`, then expands again. The
+    /// replay remains a SOURCE THEOREM, which is the property the standalone
+    /// scope exists to protect. `collect_conjunctive_ground_facts` reads only
+    /// positive conjunctive-position ground facts of the vector it is handed,
+    /// and `source` IS the authored root vector, so every constant it returns
+    /// is entailed by the problem itself. Nothing producer-side is consulted:
+    /// the PRODUCER needs an extra non-conjunctive-`forall` gate precisely
+    /// because it derives from POST-E-MATCHING assertions, which carry
+    /// quantifier instances that need not be consequences; this derivation
+    /// sees no instances at all, and an inconsistent premise set makes the
+    /// deriver return nothing rather than "anything follows".
+    ///
+    /// Everything downstream is unchanged, so this only ever turns a REFUSAL
+    /// into a candidate: the caller still demands a one-to-one record match,
+    /// byte-identical agreement with the recorded replacement, and validation
+    /// of the retained model against every expanded root plus every authored
+    /// ground sibling.
+    ///
+    /// Without it, a guarded binder whose bound is a destructured datatype
+    /// FIELD — `outer!fld_len`, pinned by an asserted defining equality rather
+    /// than written as a literal — is expanded by the producer and can then
+    /// never be re-authenticated, so a decided ground SAT is withheld and the
+    /// query answers `unknown`.
+    fn replay_exact_finite_quantifier_root(
+        &mut self,
+        root: TermId,
+        source: &[TermId],
+    ) -> Option<TermId> {
+        finite_expansion_replay::replay_from_source(&mut self.ctx.terms, root, source)
     }
 
     /// Re-authenticate a fully-ground finite expansion and return the complete
@@ -1238,7 +1481,8 @@ impl Executor {
             // not mere recognizer success, is load-bearing: strict-int or
             // bridge rewrites that changed the solved root without synchronised
             // provenance must fail closed.
-            let Some(canonical) = self.replay_exact_finite_quantifier_root(assertion) else {
+            let Some(canonical) = self.replay_exact_finite_quantifier_root(assertion, original)
+            else {
                 decline!("canonical independent replay declined");
             };
             if canonical != recorded_expansion {
@@ -1293,7 +1537,7 @@ impl Executor {
                 continue;
             }
             quantified_roots += 1;
-            let expanded = self.replay_exact_finite_quantifier_root(root)?;
+            let expanded = self.replay_exact_finite_quantifier_root(root, roots)?;
             model_roots.push(expanded);
         }
         (quantified_roots > 0).then_some(model_roots)
@@ -1315,7 +1559,10 @@ impl Executor {
         // representations under the same retained model; never retarget the
         // ground record by syntax alone.
         let authority_roots = if self.independent_gate_authored_assertions.is_some() {
-            self.independent_gate_query_roots()
+            match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => return false,
+            }
         } else {
             original.to_vec()
         };
@@ -1370,8 +1617,18 @@ impl Executor {
             cegqi_state,
             has_unsafe_partial_quantifiers,
             quantifiers_supported_by_uf_completion,
+            cegqi_ce_free_snapshot,
+            guard_seed_instances: _,
+            guard_seed_presolve_refuted,
         } = qr;
         let cegqi_source_context_stamp = cegqi_has_forall.then(|| self.ctx.source_context_stamp());
+        // (#quantifier-ce-free-resolve) One arm per mapping: the classification
+        // below sets it, the tail of this function consumes it. The parked
+        // stash goes with it -- a mapping that does not re-arm must not leave
+        // an EARLIER mapping's facts for the executor to fire on, and this
+        // function is re-entered by every nested retry solve.
+        self.cegqi_ce_free_resolve_armed = false;
+        self.cegqi_ce_free_stash = None;
 
         // Exact finite-array exhaustion is cumulative for this external query.
         // Demand, E-matching, MBQI, and CEGQI re-solves cannot replenish it, so
@@ -1420,6 +1677,18 @@ impl Executor {
         self.last_statistics.ematching_rounds_completed = ems.ematching_rounds_completed;
         self.last_statistics.ematching_instances_created = ems.ematching_instances_created;
 
+        // Phase 1.5 (#demand-post-interleave-fence): the interleaved rounds
+        // above run AFTER Phase 0's demand fence, so instances they park
+        // (generation over the then-current frontier) would otherwise reach
+        // classification still parked — LAW #2's fence never drains them and
+        // a Sat conclusion is blocked/degraded with `flushes=0`. Run the
+        // demand refine once more on the interleaved result: it is inert
+        // unless the lane armed, returns a definitive Unsat verbatim, and is
+        // bounded by the same persistent frontier ceiling, so the second
+        // call only continues the bump/flush/fence sequence for the
+        // post-interleave parked set.
+        ems.result = self.demand_refine(ems.result, category);
+
         self.accept_strict_producer_refutation(&mut ems.result);
         // Complete E-matching CAMPAIGN guard for the left-inverse SAT
         // certificate (#2774): every quantifier produced an accepted match
@@ -1434,8 +1703,220 @@ impl Executor {
             && !reached_instantiation_limit
             && !ems.reached_instantiation_limit
             && !has_deferred
-            && !ematching_has_exists;
+            && !ematching_has_exists
+            // #quantifier-proxy-abstraction: an abstracted solve ran against an
+            // OVER-APPROXIMATION whose fresh proxies are assigned freely, so
+            // "every quantifier produced an accepted match" says nothing about
+            // the authored problem. Never let the campaign guard hold here.
+            && !self.quantifier_abstraction_active;
 
+        // Phase 2 and everything after it -- the classification, the SAT
+        // certificates, the restoration, the UNSAT theorems and the
+        // publication postflight -- run as ONE pass, so that a
+        // counterexample-free refutation can be sent through the identical
+        // pass afterwards.
+        let inputs = QuantifierVerdictInputs {
+            category,
+            ematching_added_instantiations: ems.ematching_added_instantiations,
+            reached_instantiation_limit: ems.reached_instantiation_limit,
+            unsat_from_interleaved: ems.unsat_from_interleaved,
+            has_uninstantiated_quantifiers: ems.has_uninstantiated_quantifiers,
+            has_uninstantiated_quantifiers_before_interleaving: has_uninstantiated_quantifiers,
+            has_deferred,
+            has_completely_unhandled_quantifiers,
+            unhandled_quantifiers,
+            ematching_has_exists,
+            refinement_assertions,
+            has_unsafe_partial_quantifiers,
+            quantifiers_supported_by_uf_completion,
+            full_ematching_coverage,
+            cegqi_has_forall,
+            cegqi_source_context_stamp,
+            exact_finite_expansion,
+            exact_array_negation,
+        };
+        // A ground model the quantifier checks below decline to publish is
+        // what z3 reports as its candidate after `unknown`.
+        let ground_candidate = if matches!(ems.result, Ok(SolveResult::Sat)) {
+            self.snapshot_candidate_model()
+        } else {
+            None
+        };
+        // (#nra-guard-seed-instances) A seed-presolve refutation decided the
+        // counterexample-free vector, so no counterexample hypothesis is left
+        // to attribute: it is classified with every CEGQI flag off and the
+        // SOLVE's own facts, exactly as the stage-4 re-solve's refutation is
+        // (`fire_stashed_ce_free_resolve`).
+        let cegqi_classification = if guard_seed_presolve_refuted {
+            CegqiClassification::NONE
+        } else {
+            CegqiClassification {
+                has_forall: cegqi_has_forall,
+                has_exists: cegqi_has_exists,
+                ce_lemma_ids: &cegqi_ce_lemma_ids,
+                ce_lemma_groups: &cegqi_ce_lemma_groups,
+                state: &cegqi_state,
+            }
+        };
+        let final_result = self.classify_and_certify_quantifier_result(
+            ems.result,
+            &cegqi_classification,
+            &inputs,
+            original_assertions.clone(),
+        );
+        if let (Some(model), Ok(SolveResult::Unknown)) = (ground_candidate, &final_result) {
+            self.keep_rejected_model(model);
+        }
+
+        // (#quantifier-ce-free-resolve) THE HAND-OVER. The loop is about to
+        // publish `unknown` and nothing IN IT could decide the query: every
+        // CEGQI arm failed closed (that is what armed the probe, at the tail
+        // of `classify_quantifier_result`), every SAT certificate of the
+        // pass declined, the restoration demoted nothing into a verdict, the
+        // closed-sentence UNSAT theorem and the public-root rescue declined,
+        // and the postflight had nothing to fail closed on.
+        //
+        // That is NOT the end of the solve, and this is where the probe used
+        // to fire anyway. Five EXECUTOR-level passes run after this function
+        // returns, each able to turn this `unknown` into a verdict and each
+        // gated on the very deadline a refutation-only probe would spend --
+        // the CEGAR pending-lemma loop, `deep_qe_unknown_retry` and
+        // `quantified_trace_arming_unknown_retry` (all three in
+        // `cegar_refine_solve`), `finite_model_last_chance`, and the four
+        // model-rejection re-solves of `check_sat_guarded`. In the DEFAULT
+        // posture the first two are dead by construction (the best-effort
+        // Alethe sidecar makes `is_producing_proofs()` true, which is the
+        // early return of both -- see `qe_route_runs_while_a_certificate_is
+        // _being_produced`), but `--z3-mode` sheds that sidecar and BOTH
+        // become live. Measured on 217 instrumented A/B rows (report #2.7):
+        // in `--z3-mode` the deep-QE retry DECIDED 38 base rows and
+        // `finite_model_last_chance` one more, and on
+        // `starve/impl2_ex36_none.smt2` the probe held 17.55 s of a 20 s
+        // budget, both retries then read `skipped (deadline)`, and a `sat`
+        // `main` answers in 3.6 s was withdrawn.
+        //
+        // So the loop hands the probe OVER instead of firing it: park the
+        // solve's facts and return the `unknown` unchanged. The arming
+        // predicate does not move; only the fire does, out to
+        // `check_sat_guarded` after all five of those passes have declined
+        // (`fire_stashed_ce_free_resolve`). Parking costs a move and no
+        // solve time, and a parked stash the executor never fires -- because
+        // one of those passes decided -- costs the query nothing at all.
+        self.cegqi_ce_free_stash = (matches!(final_result, Ok(SolveResult::Unknown))
+            && self.cegqi_ce_free_resolve_armed)
+            .then(|| CeFreeResolveStash {
+                snapshot: cegqi_ce_free_snapshot,
+                ce_lemma_ids: cegqi_ce_lemma_ids,
+                category,
+                inputs,
+                original_assertions,
+            });
+        final_result
+    }
+
+    /// (#quantifier-ce-free-resolve) THE LAST RESORT OF THE SOLVE. Fires the
+    /// counterexample-free probe parked by [`Self::map_quantifier_result`],
+    /// from the single site in `check_sat_guarded` that runs after every
+    /// executor-level pass which could still publish a verdict: the CEGAR
+    /// pending-lemma loop, the deep-QE and trace-arming retries, the
+    /// finite-model last chance, and all four model-rejection re-solves.
+    /// Returns `None` when nothing was parked (the overwhelming majority of
+    /// solves), when the probe declines, or when it does not refute -- in
+    /// every one of those the caller's verdict stands untouched.
+    ///
+    /// A refutation is handed to the SAME
+    /// [`Self::classify_and_certify_quantifier_result`] pass the primary
+    /// verdict went through, with every CEGQI flag off
+    /// ([`CegqiClassification::NONE`]) and the SOLVE's own facts: it is
+    /// classified as an E-matching-only refutation of the same problem,
+    /// through the same non-conjunctive-forall firewall, the same
+    /// translation-incomplete demotion, the same `restore_assertions` and
+    /// the same postflight. What it can NOT inherit from `map_quantifier_result`
+    /// is `check_sat_internal`'s frame, because it no longer runs inside it,
+    /// so this function re-establishes the two pieces of that frame the
+    /// rescue actually depends on, named rather than assumed:
+    ///
+    /// * **the scope-tracked assertion vector.** `try_ce_free_resolve` leaves
+    ///   its counterexample-free vector in `ctx.assertions` on a refutation,
+    ///   and `restore_assertions` puts the authored one back only when
+    ///   `original_assertions` is `Some`. Inside `check_sat_internal` the
+    ///   tail's unconditional `ctx.assertions = scope_tracked_assertions`
+    ///   caught the other case; out here nothing would, and a
+    ///   solver-derived vector would leak into the user's assertion set for
+    ///   the rest of an incremental session. Snapshotted and restored on
+    ///   every exit.
+    /// * **the authored window the mandatory gates read.**
+    ///   `check_sat_internal` installs `independent_gate_authored_assertions`
+    ///   (and, under `--self-check`, `self_check_authored_assertions`) from
+    ///   the assertions on entry, so the always-on independent model gate
+    ///   judges a model against the AUTHORED roots rather than whatever the
+    ///   lane left behind. The probe's nested solve and the rescue pass's
+    ///   certificates run under the same window here, and the outer slots are
+    ///   put back afterwards.
+    ///
+    /// The caller completes the hand-over: `build_unsat_proof` for a rescue
+    /// `Unsat` (today's call sits above this point) and `emit_sat_verdict`
+    /// for the result, exactly as the three model-rejection re-solves beside
+    /// it do, so the SAT chokepoint cannot be bypassed. The probe itself
+    /// returns `Some` only on `Ok(Unsat)`, but the rescue PASS can demote a
+    /// refutation and then certify -- so the chokepoint is required, not
+    /// belt-and-braces.
+    pub(in crate::executor) fn fire_stashed_ce_free_resolve(
+        &mut self,
+    ) -> Option<Result<SolveResult>> {
+        let stash = self.cegqi_ce_free_stash.take()?;
+        // The frame `check_sat_internal` would have provided, re-established
+        // explicitly because the rescue no longer runs inside it.
+        let scope_tracked_assertions = self.ctx.assertions.clone();
+        let saved_independent_gate_authored = self
+            .independent_gate_authored_assertions
+            .replace(scope_tracked_assertions.clone());
+        let saved_self_check_authored = if self.self_check {
+            self.self_check_authored_assertions
+                .replace(scope_tracked_assertions.clone())
+        } else {
+            self.self_check_authored_assertions.take()
+        };
+        let rescued = self
+            .try_ce_free_resolve(
+                stash.snapshot.as_deref(),
+                &stash.ce_lemma_ids,
+                stash.category,
+            )
+            .map(|refutation| {
+                self.classify_and_certify_quantifier_result(
+                    refutation,
+                    &CegqiClassification::NONE,
+                    &stash.inputs,
+                    stash.original_assertions,
+                )
+            });
+        self.self_check_authored_assertions = saved_self_check_authored;
+        self.independent_gate_authored_assertions = saved_independent_gate_authored;
+        self.ctx.assertions = scope_tracked_assertions;
+        rescued
+    }
+
+    /// Phase 2 of [`Self::map_quantifier_result`] and everything after it,
+    /// as ONE pass: the CEGQI/E-matching classification, the SAT certificates
+    /// (2.4-2.5f), the restoration (3), the post-restore certificates
+    /// (3.5x), the closed-sentence UNSAT theorem (3.5u), the public-root
+    /// table rescue (3.7) and the publication postflight. Every exit of this
+    /// pass is a verdict or a fail-closed `unknown`, and the caller reads it
+    /// at ONE point -- which is where the counterexample-free probe is hooked
+    /// (#quantifier-ce-free-resolve). A refutation the probe finds is fed
+    /// back through this same pass with every CEGQI flag off (`cegqi`), so
+    /// it is classified, certified, restored and postflighted exactly as an
+    /// E-matching-only refutation of the same problem would be; `inputs`
+    /// describes the SOLVE and is the same in both passes.
+    fn classify_and_certify_quantifier_result(
+        &mut self,
+        result: Result<SolveResult>,
+        cegqi: &CegqiClassification<'_>,
+        inputs: &QuantifierVerdictInputs,
+        original_assertions: Option<Vec<TermId>>,
+    ) -> Result<SolveResult> {
+        let category = inputs.category;
         // Phase 2: Classify result through CEGQI/E-matching semantics.
         //
         // Timed as its own bucket. `phase.quantifier_result_mapping.seconds`
@@ -1445,25 +1926,30 @@ impl Executor {
         // Attributing them separately is what tells you whether a budget-bound
         // quantified solve died in the instance flood or somewhere else.
         let classify_started_at = std::time::Instant::now();
+        // The GROUND verdict, before classification rewrites it. The
+        // last-resort finite-expansion rescue below needs to know that the
+        // ground solve actually answered `Sat`.
+        let ground_solve_was_sat = matches!(result, Ok(SolveResult::Sat));
+        let ground_solve_was_unsat = matches!(result, Ok(SolveResult::Unsat(_)));
         let mut final_result = self.classify_quantifier_result(
-            ems.result,
-            ems.ematching_added_instantiations,
-            ems.reached_instantiation_limit,
-            ems.unsat_from_interleaved,
-            ems.has_uninstantiated_quantifiers,
-            has_deferred,
-            cegqi_has_forall,
-            cegqi_has_exists,
-            &cegqi_ce_lemma_ids,
-            &cegqi_ce_lemma_groups,
-            has_completely_unhandled_quantifiers,
-            &unhandled_quantifiers,
-            ematching_has_exists,
-            refinement_assertions.as_deref(),
-            &cegqi_state,
+            result,
+            inputs.ematching_added_instantiations,
+            inputs.reached_instantiation_limit,
+            inputs.unsat_from_interleaved,
+            inputs.has_uninstantiated_quantifiers,
+            inputs.has_deferred,
+            cegqi.has_forall,
+            cegqi.has_exists,
+            cegqi.ce_lemma_ids,
+            cegqi.ce_lemma_groups,
+            inputs.has_completely_unhandled_quantifiers,
+            &inputs.unhandled_quantifiers,
+            inputs.ematching_has_exists,
+            inputs.refinement_assertions.as_deref(),
+            cegqi.state,
             category,
-            has_unsafe_partial_quantifiers,
-            quantifiers_supported_by_uf_completion,
+            inputs.has_unsafe_partial_quantifiers,
+            inputs.quantifiers_supported_by_uf_completion,
         );
         self.add_phase_seconds(
             "time.quantifier.classify_seconds",
@@ -1508,6 +1994,18 @@ impl Executor {
             }
         }
 
+        // An exact authored instance can be independently false even when
+        // the mixed ground lane returned a relaxation Unknown. This producer
+        // performs no solve and carries no CE-model assumption; only its
+        // complete strict proof may supersede that search result.
+        if matches!(final_result, Ok(SolveResult::Unknown))
+            && self.try_translate_closed_fp_forall_zero_unsat()
+        {
+            if let Some(checked) = cegqi_unsat_authority::publish_installed(self) {
+                final_result = Ok(checked);
+            }
+        }
+
         // Phase 2.4 (CONSTANT-INTERPRETATION certificate): consult the
         // narrow all-`forall` constant-function class before the more general
         // finite-table certificate. Besides avoiding redundant work, this
@@ -1519,7 +2017,7 @@ impl Executor {
         {
             if let Some(snapshot) = original_assertions
                 .as_deref()
-                .or(refinement_assertions.as_deref())
+                .or(inputs.refinement_assertions.as_deref())
             {
                 let snapshot = snapshot.to_vec();
                 if self
@@ -1567,7 +2065,7 @@ impl Executor {
         {
             if let Some(snapshot) = original_assertions
                 .as_deref()
-                .or(refinement_assertions.as_deref())
+                .or(inputs.refinement_assertions.as_deref())
             {
                 let snapshot = snapshot.to_vec();
                 // A primary theory lane may return `Unknown` without retaining
@@ -1579,7 +2077,13 @@ impl Executor {
                 // re-check every ground assertion and quantified obligation.
                 let ground_model_ready =
                     self.ensure_snapshot_ground_model_for_completion(&snapshot, category);
-                if ground_model_ready
+                if ground_model_ready && self.try_exact_array_frame_sat(&snapshot) {
+                    self.revoke_dt_sat_authority();
+                    self.defer_model_validation = false;
+                    self.last_model_validated = true;
+                    self.last_unknown_reason = None;
+                    final_result = Ok(SolveResult::Sat);
+                } else if ground_model_ready
                     && (self
                         .try_finite_table_sat_certificate(&snapshot, category)
                         .is_some()
@@ -1624,13 +2128,48 @@ impl Executor {
         {
             if let Some(snapshot) = original_assertions
                 .as_deref()
-                .or(refinement_assertions.as_deref())
+                .or(inputs.refinement_assertions.as_deref())
             {
                 let snapshot = snapshot.to_vec();
                 if let Some(evidence) =
                     self.try_valid_closed_sentence_sat_certificate(&snapshot, category)
                 {
                     if self.install_exact_closed_sentence_sat_authority(evidence) {
+                        self.defer_model_validation = false;
+                        self.last_model_validated = true;
+                        self.last_unknown_reason = None;
+                        final_result = Ok(SolveResult::Sat);
+                    }
+                }
+            }
+        }
+
+        // Phase 2.5b (FINITE-DOMAIN UF certificate,
+        // #finite-domain-uf-cert): pure-UF snapshots whose functions
+        // return binder sorts are outside both the EPR finite-universe
+        // class and the arithmetic finite-table class. This leg exhibits
+        // the candidate model's finite element domains as installed
+        // total tables and verifies every snapshot assertion over the
+        // full domain cross-product; the returned MBQI authority is
+        // consumed by the same installer as the EPR leg. Grant-only.
+        if matches!(final_result, Ok(SolveResult::Unknown))
+            && self.quantifier_sat_cert_consult_admitted()
+            && !self.demand_parked_blocks_sat()
+        {
+            if let Some(snapshot) = original_assertions
+                .as_deref()
+                .or(inputs.refinement_assertions.as_deref())
+            {
+                let snapshot = snapshot.to_vec();
+                let forall_quants: Vec<TermId> = snapshot
+                    .iter()
+                    .copied()
+                    .filter(|&a| matches!(self.ctx.terms.get(a), TermData::Forall(..)))
+                    .collect();
+                if let Some(evidence) =
+                    self.mbqi_sat_validated_finite_domain_uf(&snapshot, &forall_quants)
+                {
+                    if self.install_mbqi_sat_authority(evidence) {
                         self.defer_model_validation = false;
                         self.last_model_validated = true;
                         self.last_unknown_reason = None;
@@ -1667,7 +2206,7 @@ impl Executor {
             )
             && !self.demand_parked_blocks_sat()
         {
-            if let Some(snapshot) = refinement_assertions.as_deref() {
+            if let Some(snapshot) = inputs.refinement_assertions.as_deref() {
                 let snapshot = snapshot.to_vec();
                 if self
                     .try_const_interp_sat_certificate(&snapshot, category)
@@ -1709,7 +2248,7 @@ impl Executor {
             )
             && !self.demand_parked_blocks_sat()
         {
-            if let Some(snapshot) = refinement_assertions.as_deref() {
+            if let Some(snapshot) = inputs.refinement_assertions.as_deref() {
                 let snapshot = snapshot.to_vec();
                 if let Some(evidence) = self.try_dt_model_sat_certificate(&snapshot, category) {
                     self.defer_model_validation = false;
@@ -1779,7 +2318,7 @@ impl Executor {
         {
             if let Some(snapshot) = original_assertions
                 .as_deref()
-                .or(refinement_assertions.as_deref())
+                .or(inputs.refinement_assertions.as_deref())
             {
                 let snapshot = snapshot.to_vec();
                 if let Some(evidence) =
@@ -1799,79 +2338,56 @@ impl Executor {
         self.route_exact_array_negation_result(
             &mut final_result,
             original_assertions.as_deref(),
-            exact_array_negation.as_ref(),
+            inputs.exact_array_negation.as_ref(),
         );
 
         self.install_finite_expansion_if_sat(
             &final_result,
-            full_ematching_coverage,
+            inputs.full_ematching_coverage,
             original_assertions.as_deref(),
-            exact_finite_expansion.as_ref(),
+            inputs.exact_finite_expansion.as_ref(),
         );
 
-        // Preserve only a routing fact here: before restoration, authenticate
-        // that the ground UNSAT was obtained after the exact recorded
-        // finite-domain replacement of every solve-time quantified root.  The
-        // record is never retargeted to authored roots.  After restoration the
-        // semantic certificate below independently re-expands the immutable
-        // public roots and checks their complete ground vector itself.
-        let exact_finite_expansion_unsat_route = matches!(final_result, Ok(SolveResult::Unsat(_)))
-            && full_ematching_coverage
-            && match (
+        // (#derived-expansion-evidence) LAST-RESORT rescue, after every phase
+        // above has had its turn: a ground solve that returned `Sat` must not
+        // be published as `unknown` merely because the binders a derived-bound
+        // expansion discharged are still counted as unhandled. Gated on that
+        // exact refusal, so no other route can lose a problem to it.
+        if matches!(final_result, Ok(SolveResult::Unknown))
+            && self.last_unknown_reason == Some(UnknownReason::QuantifierUnhandled)
+            && self.rescue_unknown_with_finite_expansion(
+                ground_solve_was_sat,
+                inputs.full_ematching_coverage,
                 original_assertions.as_deref(),
-                exact_finite_expansion.as_ref(),
-            ) {
-                (Some(original), Some(expansion)) => self
-                    .exact_finite_expansion_model_roots(original, expansion)
-                    .is_some(),
-                _ => false,
-            };
+                inputs.exact_finite_expansion.as_ref(),
+            )
+        {
+            final_result = Ok(SolveResult::Sat);
+        }
+
+        // Preserve only a routing fact here, before restoration: the finite-
+        // expansion UNSAT route (finite_expansion_unsat.rs).
+        let finite_expansion_unsat_route = self.finite_expansion_unsat_route(
+            ground_solve_was_unsat,
+            &final_result,
+            inputs.full_ematching_coverage,
+            original_assertions.as_deref(),
+            inputs.exact_finite_expansion.as_ref(),
+        );
 
         // Phase 3: Restore original assertions after solve (#2844).
         self.restore_assertions(
             original_assertions,
             &mut final_result,
             category,
-            has_uninstantiated_quantifiers,
-            full_ematching_coverage,
+            inputs.has_uninstantiated_quantifiers_before_interleaving,
+            inputs.full_ematching_coverage,
             finite_table_sat_certificate,
         );
 
-        // Exact finite-expansion UNSAT theorem.  This is deliberately after
-        // restoration: its private constructor sees only the current public
-        // query epoch, canonical-expands those roots afresh, and accepts a
-        // model-independent `false` conjunct or distinct-scalar assignment
-        // clash.  A failed theorem leaves the ordinary mandatory strict-proof
-        // gate in charge; explicit proof/self-check modes decline this lane.
-        if exact_finite_expansion_unsat_route && matches!(final_result, Ok(SolveResult::Unsat(_))) {
-            // `original_assertions` is the solve-time preprocessing snapshot,
-            // which can differ from the always-on gate's authored vector. The
-            // outer transaction restores this same vector on return; install it
-            // now so the source theorem binds to the immutable public epoch,
-            // never to the record's transformed root identity.
-            let public_roots = self.independent_gate_query_roots();
-            let prior_roots = std::mem::replace(&mut self.ctx.assertions, public_roots);
-            if let Some(evidence) = self.try_authorize_current_query_exact_finite_expansion_unsat()
-            {
-                if ay_core::misc_cli_flags().debug_cert {
-                    eprintln!("CERT/exact-finite-expansion-unsat: public theorem accepted");
-                }
-                let emitted = self.emit_checked_exact_finite_expansion_unsat(evidence);
-                if !emitted.is_unsat() {
-                    // A stop or strict-presentation request can arrive between
-                    // authorization and emission. It must not leave the failed
-                    // semantic lane's temporary public-root window installed
-                    // for later strict reconstruction.
-                    self.ctx.assertions = prior_roots;
-                }
-                final_result = Ok(emitted);
-            } else if ay_core::misc_cli_flags().debug_cert {
-                self.ctx.assertions = prior_roots;
-                eprintln!("CERT/exact-finite-expansion-unsat: public theorem declined");
-            } else {
-                self.ctx.assertions = prior_roots;
-            }
-        }
+        // Exact finite-expansion UNSAT theorem, deliberately after restoration
+        // (finite_expansion_unsat.rs).
+        self.certify_finite_expansion_unsat_route(finite_expansion_unsat_route, &mut final_result);
 
         // Restoration may demote a DT-certified candidate after checking the
         // original assertion window.  Once the candidate is no longer SAT,
@@ -1989,7 +2505,7 @@ impl Executor {
             )
             && !self.demand_parked_blocks_sat()
         {
-            if let Some(snapshot) = refinement_assertions.as_deref() {
+            if let Some(snapshot) = inputs.refinement_assertions.as_deref() {
                 let snapshot = snapshot.to_vec();
                 if let Some(evidence) = self.try_dt_model_sat_certificate(&snapshot, category) {
                     self.defer_model_validation = false;
@@ -2072,7 +2588,12 @@ impl Executor {
                 )
             )
         {
-            let public_roots = self.independent_gate_query_roots();
+            let public_roots = match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => {
+                    return Ok(SolveResult::Unknown);
+                }
+            };
             let prior_roots = std::mem::replace(&mut self.ctx.assertions, public_roots);
             if let Some(evidence) = self.try_authorize_current_query_refuted_closed_sentence_unsat()
             {
@@ -2122,13 +2643,18 @@ impl Executor {
             && !self.finite_table_cert_grant_active
             && !self.const_interp_cert_grant_active
             && {
-                let public_roots = self.independent_gate_query_roots();
+                let public_roots = match self.independent_gate_query_roots() {
+                    Ok(roots) => roots,
+                    Err(_) => {
+                        return Ok(SolveResult::Unknown);
+                    }
+                };
                 self.current_quantified_sat_authority(&public_roots)
                     .is_none()
             }
             && !self.demand_parked_blocks_sat()
         {
-            if let Some(snapshot) = refinement_assertions.as_deref() {
+            if let Some(snapshot) = inputs.refinement_assertions.as_deref() {
                 let snapshot = snapshot.to_vec();
                 if self
                     .try_const_interp_sat_certificate(&snapshot, category)
@@ -2165,7 +2691,8 @@ impl Executor {
         // theorem strictly subsumes the unfinished instance search. If the
         // producer cannot prove that stronger fact, it declines and the parked
         // lane's Unknown remains unchanged.
-        let cegqi_source_stamp_is_stale = cegqi_source_context_stamp
+        let cegqi_source_stamp_is_stale = inputs
+            .cegqi_source_context_stamp
             .as_ref()
             .is_some_and(|stamp| stamp != &self.ctx.source_context_stamp());
         let public_table_rescue_candidate =
@@ -2177,7 +2704,12 @@ impl Executor {
             && !public_table_rescue_aborted
             && self.independent_gate_authored_assertions.is_some()
         {
-            let public_roots = self.independent_gate_query_roots();
+            let public_roots = match self.independent_gate_query_roots() {
+                Ok(roots) => roots,
+                Err(_) => {
+                    return Ok(SolveResult::Unknown);
+                }
+            };
             if !public_roots.is_empty() {
                 // This rescue is not CEGQI-specific. E-matching and other
                 // quantified routes can also mint a checked table package for
@@ -2185,15 +2717,14 @@ impl Executor {
                 // authored public query. In that case the stale package must
                 // trigger a fresh all-public-roots theorem instead of reaching
                 // the SAT funnel with only a legacy routing bit.
-                let mut has_top_level_forall = false;
-                let public_roots_match_table_partition = public_roots.iter().all(|&root| {
-                    if matches!(self.ctx.terms.get(root), TermData::Forall(..)) {
-                        has_top_level_forall = true;
-                        true
-                    } else {
-                        !contains_quantifier(&self.ctx.terms, root)
-                    }
-                }) && has_top_level_forall;
+                // Judged on the conjunct view: the producers partition an
+                // `(and forall ground)` root by its leaves, while `public_roots`
+                // itself stays the bound identity.
+                let public_roots_match_table_partition =
+                    super::and_roots::roots_match_certificate_partition(
+                        &self.ctx.terms,
+                        &public_roots,
+                    );
                 let exact_public_transport =
                     self.has_current_pending_certificate_model_transport(&public_roots);
                 let exact_public_authority = self.current_quantified_sat_authority(&public_roots);
@@ -2203,7 +2734,7 @@ impl Executor {
                     &final_result,
                     self.last_unknown_reason,
                     public_roots_match_table_partition,
-                    cegqi_has_forall,
+                    inputs.cegqi_has_forall,
                     cegqi_source_stamp_is_stale,
                     has_table_routing_bit,
                     exact_public_transport,
@@ -2309,10 +2840,16 @@ impl Executor {
         // certificate producers: their nested work may advance source state.
         // A pre-rescue `false` must never authorize the old CEGQI candidate if
         // every fresh producer subsequently declines.
-        let cegqi_source_stamp_is_stale = cegqi_source_context_stamp
+        let cegqi_source_stamp_is_stale = inputs
+            .cegqi_source_context_stamp
             .as_ref()
             .is_some_and(|stamp| stamp != &self.ctx.source_context_stamp());
-        let postflight_roots = self.independent_gate_query_roots();
+        let postflight_roots = match self.independent_gate_query_roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return Ok(SolveResult::Unknown);
+            }
+        };
         let current_quantified_sat_authority =
             self.current_quantified_sat_authority(&postflight_roots);
         let has_current_model_free_mbqi_authority =
@@ -2322,13 +2859,35 @@ impl Executor {
         if cegqi_sat_postflight_must_fail_closed(CegqiSatPostflightFacts {
             final_result_is_sat: matches!(final_result, Ok(SolveResult::Sat)),
             should_abort: self.should_abort_theory_loop(),
-            cegqi_has_forall,
+            cegqi_has_forall: inputs.cegqi_has_forall,
             has_retained_model: self.last_model.is_some(),
             has_pending_certificate_model,
             has_current_model_free_mbqi_authority,
             cegqi_source_stamp_is_stale,
             has_current_quantified_sat_authority: current_quantified_sat_authority.is_some(),
         }) {
+            return self.cegqi_fail_closed_unknown();
+        }
+
+        // #quantifier-proxy-abstraction, PUBLICATION SWEEP. Computed where it is
+        // CONSUMED rather than set by the producer: the arms above can mint a
+        // `Sat` from a dozen places (four finite/default-table certificates,
+        // two constant-interpretation arms, the DT certificate, the
+        // quantified-model gate bridge, the public-root rescue), and a
+        // thirteenth added later would silently escape a check placed in any
+        // one of them. Every one of those authorities re-verifies an
+        // ASSERTION SNAPSHOT, and this solve's snapshots are the authored,
+        // PRE-abstraction vectors — but the ground model they complete, and
+        // `ensure_snapshot_ground_model_for_completion`'s reconstruction of it,
+        // came from the abstracted problem. The over-approximation licenses
+        // `unsat` and nothing else, so no `sat` crosses this boundary while the
+        // abstraction is live. Inert (`quantifier_abstraction_active` false) on
+        // every problem the pass declined and with the kill switch off.
+        if self.quantifier_abstraction_active && matches!(final_result, Ok(SolveResult::Sat)) {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!("CERT/qproxy: refusing to publish sat over an abstracted problem");
+            }
+            self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
             return self.cegqi_fail_closed_unknown();
         }
 
@@ -2484,10 +3043,27 @@ impl Executor {
     /// deduplicating against what is already present. Returns whether anything new
     /// was added. (The instances are E-matching instances of universally-asserted
     /// foralls — sound to assert; see `demand_refine`.)
-    fn demand_assert_flushed(&mut self, instances: Vec<TermId>) -> bool {
-        if instances.is_empty() {
+    ///
+    /// (#demand-flush-provenance) Each instance carries its quantifier and
+    /// binding, so it gets the E-matching lane's proof discipline: when the
+    /// solve produces proofs, the exact structural instance is asserted and
+    /// its `forall_inst` provenance registered, and a record either step
+    /// refuses marks the translation incomplete; when it produces none, there
+    /// is no raw proof to fence, exactly as for an instance the matcher
+    /// asserted directly. The parked queue used to keep only the TermId, so
+    /// every flush marked the translation incomplete and withheld every
+    /// refutation after it, even with the proof cycle shed (`--z3-mode`).
+    fn demand_assert_flushed(
+        &mut self,
+        mut records: Vec<crate::ematching::ForallInstantiationProvenance>,
+    ) -> bool {
+        if records.is_empty() {
             return false;
         }
+        let mut instances: Vec<TermId> = records.iter().map(|record| record.instance).collect();
+        let mut roots = ay_core::kani_compat::DetHashSet::default();
+        self.materialize_exact_ematching_instances(&mut instances, &mut roots, &mut records);
+        self.register_ematching_proof_provenance(&records);
         let existing: std::collections::HashSet<TermId> =
             self.ctx.assertions.iter().copied().collect();
         let mut added = false;
@@ -2498,14 +3074,163 @@ impl Executor {
             self.ctx.assertions.push(inst);
             added = true;
         }
-        if added {
-            // The parked queue currently retains only the instantiated TermId,
-            // not an authenticated authored quantifier/binding token.  Preserve
-            // the sound consequence for solving, but forbid its raw proof from
-            // becoming an outer artifact.
-            self.quantified_proof_translation_incomplete = true;
-        }
         added
+    }
+
+    /// COST GATE for [`Self::unsafe_partial_mbqi_refutation`]: `true` only when
+    /// every binder is MBQI-unsafe BY SORT and has no ground term of its sort
+    /// in the problem, so MBQI's candidate set for it is the small SYNTHESIZED
+    /// family rather than every ground term the assertions mention.
+    ///
+    /// This is about cost and nothing else — running MBQI on the wider set is
+    /// just as sound, only far more expensive, and this rescue is speculative
+    /// work on a query that is about to answer `unknown` anyway. Measured on
+    /// `crates/ay-dpll/tests/fixtures/verification_consumer_9185/slice_index_in_bounds_usize_sat.smt2`
+    /// (AUFLIA, `Int` binders indexing arrays, plenty of ground `Int` terms):
+    /// ungated, the rescue took the query from 0.9 s to 345 s and still
+    /// answered the same `unknown`, blowing the fixture's 30 s pin. Gated, the
+    /// scan costs one pass and the rescue declines.
+    ///
+    /// It is also where the value is. The class the MBQI-unsafe guard STRANDS
+    /// is the one where E-matching had nothing to match on — `∀q:Float64.
+    /// fp.isNaN(q)` has no ground `Float64` anywhere — so synthesis is the only
+    /// source of an instance and the probe is bounded by
+    /// `MAX_SYNTHESIZED_CANDIDATES`. Where ground terms DO exist, E-matching
+    /// has already instantiated over them.
+    fn unsafe_partial_binder_sorts_are_synthesis_only(
+        &self,
+        unhandled_quantifiers: &[TermId],
+    ) -> bool {
+        // FREE STRUCTURAL PRE-FILTER, ahead of any scan. Require that the
+        // binder SORT is itself what made the `forall` MBQI-unsafe, rather than
+        // the deliberately over-approximating `forall_indexes_array_at_binder`
+        // rule. An `Int` binder that merely indexes an array lives in a theory
+        // E-matching and CEGQI both handle, so its ground-term universe is
+        // large and its candidate space is the expensive one; that is the
+        // AUFLIA class the measurement below is about, and it is declined here
+        // without touching the term store.
+        let sort_is_the_reason = |quant: &TermId| match self.ctx.terms.get(*quant) {
+            TermData::Forall(vars, _, _) => {
+                !vars.is_empty()
+                    && vars
+                        .iter()
+                        .all(|(_, sort)| super::is_mbqi_unsafe_binder_sort(sort))
+            }
+            // Not a `forall` at all: nothing for MBQI to instantiate.
+            _ => false,
+        };
+        if !unhandled_quantifiers.iter().all(sort_is_the_reason) {
+            return false;
+        }
+        // Only now pay for the scan: `collect_ground_terms_by_sort` walks the
+        // whole term store, which its own comment records as ~99% of the wall
+        // clock on SPARK VCs.
+        let ground_by_sort =
+            crate::ematching::collect_ground_terms_by_sort(&self.ctx.terms, &self.ctx.assertions);
+        unhandled_quantifiers
+            .iter()
+            .all(|&quant| match self.ctx.terms.get(quant) {
+                TermData::Forall(vars, _, _) => vars
+                    .iter()
+                    .all(|(_, sort)| ground_by_sort.get(sort).is_none_or(Vec::is_empty)),
+                _ => false,
+            })
+    }
+
+    /// Ask MBQI to REFUTE a ground `Sat` that the MBQI-unsafe-binder guard is
+    /// about to fail closed on, and publish only an `Unsat`.
+    ///
+    /// Returns `None` to mean "nothing rescued, degrade exactly as before" —
+    /// every decline path, including an MBQI `Sat`/`Unknown`, returns `None`.
+    ///
+    /// # Why this is sound
+    ///
+    /// MBQI adds GROUND INSTANCES of universals and nothing else (see the
+    /// `mbqi` module header: unlike CEGQI it does not inject counterexample
+    /// lemma variables into the assertion set). `∀x̄. B` entails `B[c̄]` for any
+    /// closed `c̄`, so the strengthened problem is UNSAT only if the original
+    /// is. That is the same licence the `instance_closure_ground_unsat` rescue
+    /// beside the call site already relies on, and the same direction the
+    /// guard's own comment declares safe.
+    ///
+    /// # What it refuses
+    ///
+    /// * ANY counterexample lemma in play (`cegqi_*`). A ground UNSAT derived
+    ///   under CE lemmas is not a consequence-only refutation, and reading one
+    ///   as a verdict for an MBQI-unsafe `forall` is the documented
+    ///   `Unsat -> Sat` disambiguation hazard.
+    /// * A `forall` in non-conjunctive position, or one marked
+    ///   `no_mbqi`. A false DISJUNCT refutes nothing (the #quant-alternation
+    ///   wrong-unsat), and the `no_mbqi` marker means "E-matching only".
+    /// * A binder sort that HAS ground terms in the problem — see
+    ///   `unsafe_partial_binder_sorts_are_synthesis_only` for why, which is
+    ///   about cost, not soundness.
+    /// * Everything except `Unsat`. "No counterexample found" over the finitely
+    ///   many candidates MBQI probed is not a totality proof, so a `Sat` here
+    ///   degrades exactly as it did before this rescue existed.
+    fn unsafe_partial_mbqi_refutation(
+        &mut self,
+        unhandled_quantifiers: &[TermId],
+        refinement_assertions: Option<&[TermId]>,
+        cegqi_ce_lemma_ids: &[TermId],
+        cegqi_has_forall: bool,
+        cegqi_has_exists: bool,
+        category: LogicCategory,
+    ) -> Option<Result<SolveResult>> {
+        if !cegqi_ce_lemma_ids.is_empty() || cegqi_has_forall || cegqi_has_exists {
+            return None;
+        }
+        let snapshot = refinement_assertions?;
+        // CHEAPEST TESTS FIRST. This runs on every query the MBQI-unsafe guard
+        // is about to fail closed on, and most of them are not the class this
+        // rescue can help, so an expensive decline is a regression on all of
+        // them. `unsafe_partial_binder_sorts_are_synthesis_only` opens with a
+        // free structural filter; `forall_ids_in_conjunctive_position` and the
+        // `no_mbqi` walk both traverse terms, so they come after it.
+        if unhandled_quantifiers.is_empty()
+            || !self.unsafe_partial_binder_sorts_are_synthesis_only(unhandled_quantifiers)
+        {
+            return None;
+        }
+        // EVERY unhandled `forall` must be eligible. One that is not stays
+        // undischarged, so a refutation of the rest says nothing about the
+        // whole — the same all-or-nothing the sibling consumer enforces with
+        // its `has_nonconjunctive` flag.
+        let conjunctive = self.forall_ids_in_conjunctive_position(snapshot);
+        if unhandled_quantifiers
+            .iter()
+            .any(|q| !conjunctive.contains(q) || self.ctx.terms.is_no_mbqi(*q))
+        {
+            return None;
+        }
+        match self.try_mbqi_refinement(unhandled_quantifiers, category, snapshot) {
+            Some(Ok(SolveResult::Unsat(_))) => {
+                if ay_core::misc_cli_flags().debug_cert {
+                    eprintln!("CERT/rescue@298: MBQI refutation");
+                }
+                Some(if self.translate_refinement_seeded_replay() {
+                    self.last_unknown_reason = None;
+                    Ok(SolveResult::unsat())
+                } else {
+                    self.quantified_semantic_unsat_or_unknown(UnknownReason::QuantifierUnhandled)
+                })
+            }
+            other => {
+                // MBQI DID NOT REFUTE, so the caller degrades exactly as it did
+                // before this rescue existed — and it must degrade from the same
+                // STATE. `try_mbqi_refinement` can install SAT-side authority on
+                // its way to a `Sat` (the BV full-domain grant, the finite-model
+                // FP lane's staged witness), and this arm is reached precisely
+                // when the MBQI-unsafe guard has ruled that no `Sat` may be
+                // published for this query. Leaving a grant installed would park
+                // exactly the unverified authority the guard exists to stop, so
+                // the pre-call posture is restored before falling through.
+                if other.is_some() {
+                    self.clear_quantified_sat_authority();
+                }
+                None
+            }
+        }
     }
 
     /// Classify the solve result through CEGQI/E-matching semantics.
@@ -2535,6 +3260,28 @@ impl Executor {
         // classification only, so a stale `true` from an earlier solve can never
         // widen a later certificate consult.
         self.unsafe_partial_quantifier_unknown = false;
+        self.quantified_refutation_withheld = false;
+        // #quantifier-proxy-abstraction, FAIL-CLOSED HEAD ARM. When
+        // `purify_quantifier_atoms` rewrote an assertion, the ground problem
+        // this result came from is an OVER-APPROXIMATION of the authored one:
+        // each abstracted quantifier became a fresh Boolean variable that the
+        // SAT solver assigns freely, with nothing tying `M(q_i)` to `⟦Q_i⟧`. So
+        // the abstract problem can be satisfiable when the authored one is not,
+        // and a `Sat` here is not evidence of anything about the query. UNSAT
+        // is the direction that transfers — a refutation of a weaker problem
+        // refutes the stronger one — so it flows through untouched, and so does
+        // an `Unknown`/`Err`. This is not optional and it is not a heuristic:
+        // it is the whole licence for the abstraction to exist.
+        let mut result = result;
+        if self.quantifier_abstraction_active && matches!(result, Ok(SolveResult::Sat)) {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!("CERT/qproxy: ground Sat over an abstracted problem -> Unknown");
+            }
+            self.clear_quantified_sat_authority();
+            self.last_model_validated = false;
+            self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
+            result = Ok(SolveResult::Unknown);
+        }
         let cegqi_mixed = cegqi_has_forall && cegqi_has_exists;
         if ay_core::misc_cli_flags().debug_cert {
             let kind = match &result {
@@ -2596,6 +3343,7 @@ impl Executor {
         if matches!(result, Ok(SolveResult::Unsat(_))) && !cegqi_has_forall && !cegqi_has_exists {
             if let Some(snapshot) = refinement_assertions {
                 if self.snapshot_has_nonconjunctive_forall(snapshot)
+                    && self.nonconjunctive_forall_may_have_been_conjoined(snapshot)
                     && !self.ground_core_is_unsat(snapshot, category)
                 {
                     // SOUND UNSAT RESCUE before the non-conjunctive-forall
@@ -2628,6 +3376,28 @@ impl Executor {
                     if self.instance_closure_ground_unsat(&snapshot_owned, category) {
                         if ay_core::misc_cli_flags().debug_cert {
                             eprintln!("CERT/rescue@277: instance-closure UNSAT");
+                        }
+                        return self.quantified_semantic_unsat_or_unknown(
+                            UnknownReason::QuantifierUnhandled,
+                        );
+                    }
+                    // (#skolem-guarded-proxy-instances) SECOND sound rescue,
+                    // on the same principle as the instance-closure arm above
+                    // but for a different independent set. When the guarded
+                    // lane fired, the abstracted assertion vector plus its
+                    // guard clauses is on its own an OVER-APPROXIMATION of the
+                    // post-Skolemization problem — every model of the latter
+                    // extends to it by `q_i := ⟦Q_i⟧`, and each guard holds in
+                    // that extension. So a refutation of THAT set alone
+                    // refutes the query, and owes nothing to any instance a
+                    // later lane conjoined, which is precisely the premise this
+                    // arm distrusts. Gated on a non-empty snapshot (only the
+                    // guarded lane writes one) and fail-closed: anything short
+                    // of a definitive isolated UNSAT falls through to the
+                    // degrade, byte-identical to before.
+                    if self.guarded_abstraction_ground_unsat(category) {
+                        if ay_core::misc_cli_flags().debug_cert {
+                            eprintln!("CERT/rescue@277: guarded-abstraction UNSAT");
                         }
                         return self.quantified_semantic_unsat_or_unknown(
                             UnknownReason::QuantifierUnhandled,
@@ -2705,6 +3475,59 @@ impl Executor {
                                 );
                             }
                         }
+                    }
+                    // SECOND SOUND UNSAT RESCUE, refutation only: ask MBQI to
+                    // REFUTE the ground Sat before failing closed.
+                    //
+                    // The guard above exists to stop a wrong SAT — E-matching
+                    // may satisfy a narrow set of instances while missing
+                    // semantically required ones. It says nothing about UNSAT,
+                    // and the comment opening this block records why: "UNSAT
+                    // propagates unchanged because adding partial quantifier
+                    // instances can only strengthen the problem". MBQI adds
+                    // exactly that and nothing else — unlike CEGQI it never
+                    // injects counterexample-lemma variables into the assertion
+                    // set, so every assertion it adds is `∀x̄. B ⊨ B[c̄]`, a
+                    // consequence in every model. A refutation of the
+                    // strengthened problem is a refutation of the original.
+                    //
+                    // Without this, `∀q:Float64. fp.isNaN(q)` (UNSAT, violated
+                    // at +0.0) answered `(incomplete quantifier-unhandled)`:
+                    // the FP binder sort makes the `forall` MBQI-unsafe, the
+                    // early return here fires, and the MBQI arm further down
+                    // this same classification — which would have refuted it —
+                    // is never reached. The missing FP candidates were only
+                    // half of it; `synthesize_mbqi_candidates` now has an FP
+                    // arm, and this is what lets the refutation be asked for.
+                    //
+                    // FOUR THINGS THIS DELIBERATELY DOES NOT DO:
+                    //   * it does not relax `is_mbqi_unsafe_binder_sort` or
+                    //     `forall_indexes_array_at_binder` — the ay#8729 /
+                    //     Z3#6303 wrong-SAT guard is untouched;
+                    //   * it accepts ONLY `Unsat`. A `Sat` or `Unknown` from
+                    //     MBQI falls through to the same degrade as before:
+                    //     "no counterexample found" over a finite candidate
+                    //     sample is not a totality proof;
+                    //   * it refuses to run when ANY counterexample lemma is in
+                    //     the snapshot. A ground UNSAT obtained under CE lemmas
+                    //     is not a consequence-only refutation — that is the
+                    //     precise hazard the `cegqi_has_forall` note below this
+                    //     block describes;
+                    //   * it publishes through `translate_refinement_seeded_replay`
+                    //     and otherwise through
+                    //     `quantified_semantic_unsat_or_unknown`, the SAME pair
+                    //     the sibling MBQI consumer uses, so the proof-artifact
+                    //     gate still decides whether the verdict may be spoken
+                    //     under `:produce-proofs`. Nothing here widens it.
+                    if let Some(rescued) = self.unsafe_partial_mbqi_refutation(
+                        unhandled_quantifiers,
+                        refinement_assertions,
+                        cegqi_ce_lemma_ids,
+                        cegqi_has_forall,
+                        cegqi_has_exists,
+                        category,
+                    ) {
+                        return rescued;
                     }
                     if ay_core::misc_cli_flags().debug_cert {
                         eprintln!("CERT/degrade@298");
@@ -2835,116 +3658,24 @@ impl Executor {
             }
         }
 
-        match result {
+        // (#quantifier-ce-free-resolve) Stage 4 reads the verdict of the arms
+        // below and may ARM the last-resort re-solve; see the tail of this
+        // function, and the hook at the tail of `map_quantifier_result`.
+        let result_was_unsat = matches!(result, Ok(SolveResult::Unsat(_)));
+        let outcome = match result {
             Ok(SolveResult::Sat) | Ok(SolveResult::Unknown) if cegqi_mixed => {
                 self.record_unknown_from_origin(UnknownOrigin::CegqiRefinement);
                 Ok(SolveResult::Unknown)
             }
-            Ok(SolveResult::Unsat(_)) if cegqi_mixed || cegqi_has_forall => {
-                let disamb = self.disambiguate_cegqi_unsat(
+            Ok(SolveResult::Unsat(_)) if cegqi_mixed || cegqi_has_forall => self
+                .classify_cegqi_forall_unsat(
                     category,
                     cegqi_ce_lemma_ids,
                     cegqi_ce_lemma_groups,
                     cegqi_mixed,
                     cegqi_state,
                     refinement_assertions,
-                );
-                // Every downstream interpretation of `disamb` assumes the
-                // extracted universals are asserted obligations. For a
-                // non-conjunctive `forall`, that assumption can manufacture a
-                // wrong result in either direction: a local validity proof can
-                // flip to SAT, a conjoined CE instance can yield UNSAT, and an
-                // Unknown fed to the MBQI cross-check can conjoin still more
-                // non-entailed instances. Stop all three before they diverge.
-                // The sole exception is an independently UNSAT quantifier-free
-                // ground core, which is a certificate for the original formula
-                // regardless of quantifier position. A missing snapshot cannot
-                // establish position and therefore also fails closed.
-                let Some(snapshot) = refinement_assertions else {
-                    self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
-                    return Ok(SolveResult::Unknown);
-                };
-                if self.snapshot_has_nonconjunctive_forall(snapshot) {
-                    // The sealed consequence verifier inside disambiguation is
-                    // the only UNSAT authority here. Re-solving G0 in place
-                    // would bypass its proof-mode refusal and could attach the
-                    // CE-primary or an inner untranslated proof to the verdict.
-                    if matches!(&disamb, Ok(SolveResult::Unsat(_))) {
-                        return disamb;
-                    }
-                    self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
-                    return Ok(SolveResult::Unknown);
-                }
-                // SOUNDNESS (#forall-alternation wrong-sat): a CEGQI "forall valid
-                // ⟹ SAT" verdict is unreliable when the snapshot has a
-                // skolemized-alternation forall with a witness-independent
-                // arithmetic conjunct (a bound-var constraint no existential
-                // witness can repair). Fail closed there. The genuine
-                // witness-driven cases (e.g. `(forall x (exists y (> y x)))`,
-                // skolemized to `(forall x (> sk(x) x))`) have no such conjunct
-                // and keep their SAT.
-                if matches!(disamb, Ok(SolveResult::Sat)) {
-                    if let Some(snapshot) = refinement_assertions {
-                        // DECISION (#forall-alternation): the CEGQI "forall valid"
-                        // verdict bypasses model validation. Validate it directly
-                        // with model-based quantifier instantiation against the
-                        // candidate (ground-only) model: instantiate each snapshot
-                        // `forall` at ground/synthesized candidates, evaluate under
-                        // the model, and re-solve the falsifying instances. If that
-                        // drives the problem UNSAT the universal is genuinely
-                        // violated — decide UNSAT (matching z3) rather than trust
-                        // the unvalidated certificate. This resolves the
-                        // alternation wrong-sats where infeasibility comes from the
-                        // COMBINATION of (skolem-)constrained conjuncts, which no
-                        // syntactic guard can see.
-                        if let Some(Ok(SolveResult::Unsat(_))) =
-                            self.disambiguate_cegqi_valid_via_mbqi_ext(snapshot, category, true)
-                        {
-                            return self.cegqi_inner_unsat_or_unknown();
-                        }
-                        // Safety net: fail closed on the unreliable
-                        // skolem-alternation shape MBQI could not refute.
-                        if self.snapshot_has_witness_independent_skolem_alternation(snapshot) {
-                            self.last_unknown_reason =
-                                Some(UnknownReason::QuantifierCegqiIncomplete);
-                            return Ok(SolveResult::Unknown);
-                        }
-                    }
-                }
-                // DECISION (#quantified-ce-lemma, second S3 route): when
-                // disambiguation stays honestly Unknown (ground remainder Sat
-                // but the CE obligation neither refuted nor decided), try the
-                // model-based instantiation refutation before surfacing the
-                // Unknown — mirror of the refinement-Unknown branch below. It
-                // only ever returns UNSAT on a real instantiation contradiction
-                // (a sound universal instance driven UNSAT, now including the
-                // per-candidate ISOLATED single-instance solves that decide the
-                // NIA-conjunction chokepoint), so this can only upgrade a
-                // fail-closed Unknown to the decisive answer, never flip a
-                // genuine verdict.
-                if matches!(disamb, Ok(SolveResult::Unknown)) {
-                    if let Some(snapshot) = refinement_assertions {
-                        if let Some(Ok(SolveResult::Unsat(_))) =
-                            self.disambiguate_cegqi_valid_via_mbqi_ext(snapshot, category, true)
-                        {
-                            return self.cegqi_inner_unsat_or_unknown();
-                        }
-                    }
-                }
-                // MBQI and alternation safety nets run after the sealed SAT
-                // authority was consumed. Recheck the two publication
-                // postconditions after that downstream work as well.
-                if matches!(disamb, Ok(SolveResult::Sat))
-                    && (self.should_abort_theory_loop()
-                        || (self.last_model.is_none()
-                            && !self.has_current_pending_certificate_model_transport(
-                                &self.ctx.assertions,
-                            )))
-                {
-                    return self.cegqi_fail_closed_unknown();
-                }
-                disamb
-            }
+                ),
             Ok(SolveResult::Sat) if cegqi_has_forall => {
                 // CEGQI asserts counterexample instances conjunctively. That
                 // is sound only for a universal that is itself entailed in a
@@ -3272,7 +4003,10 @@ impl Executor {
                                                 // producers retain the legacy pending-
                                                 // evidence path below.
                                                 let gate_roots =
-                                                    self.independent_gate_query_roots();
+                                                    match self.independent_gate_query_roots() {
+                                                        Ok(roots) => roots,
+                                                        Err(_) => return Ok(SolveResult::Unknown),
+                                                    };
                                                 let installed_current = self
                                                     .bv_quantifier_full_domain_query_grant
                                                     .as_ref()
@@ -3325,6 +4059,12 @@ impl Executor {
                                                     &epr_snapshot,
                                                     &epr_quants,
                                                 )
+                                                .or_else(|| {
+                                                    self.mbqi_sat_validated_finite_domain_uf(
+                                                        &epr_snapshot,
+                                                        &epr_quants,
+                                                    )
+                                                })
                                             {
                                                 if self.install_mbqi_sat_authority(evidence) {
                                                     self.defer_model_validation = false;
@@ -3379,7 +4119,9 @@ impl Executor {
                                     // truth value under the pins with checked
                                     // UNSAT solves and substitutes a constant,
                                     // which is position-independent.
-                                    if self.try_finite_model_sat_certificate() {
+                                    if self.try_finite_model_sat_certificate()
+                                        || self.try_model_check_sat_certificate()
+                                    {
                                         self.defer_model_validation = false;
                                         self.last_model_validated = true;
                                         self.last_unknown_reason = None;
@@ -3428,7 +4170,9 @@ impl Executor {
                                 // in a non-conjunctive position, so none was
                                 // eligible — but a finite-sort quantifier can
                                 // still be discharged by constant substitution.
-                                if self.try_finite_model_sat_certificate() {
+                                if self.try_finite_model_sat_certificate()
+                                    || self.try_model_check_sat_certificate()
+                                {
                                     self.defer_model_validation = false;
                                     self.last_model_validated = true;
                                     self.last_unknown_reason = None;
@@ -3591,7 +4335,158 @@ impl Executor {
                 Ok(SolveResult::Unknown)
             }
             other => other,
+        };
+        // (#quantifier-ce-free-resolve) Stage 4. Every CEGQI arm above has
+        // had its say and the verdict is a fail-closed `unknown` on a solve
+        // whose refutation -- live, or a refinement round's, or the one the
+        // div/mod exit refused to look for -- may owe nothing to the
+        // counterexample hypothesis. That ARMS the counterexample-free
+        // re-solve; it does not run it. A refutation-only probe has no
+        // business running before an arm that can still publish a verdict,
+        // and the SAT certificates of `map_quantifier_result` run AFTER this
+        // classification. Measured with the probe hooked here: on a
+        // satisfiable NRA shape (`nra_cube_sortpred`) the re-solve took the
+        // whole deadline -- 16 / 56 / 116 s of `-T:20` / `60` / `120` -- and
+        // the finite-table certificate that decides the file in four seconds
+        // on `main` never ran. The probe fires at the LAST point of the
+        // SOLVE: the tail of `map_quantifier_result` only PARKS it, and
+        // `check_sat_guarded` fires it once the five executor-level passes
+        // behind the loop -- the CEGAR loop, the deep-QE and trace-arming
+        // retries, the finite-model last chance, the model-rejection
+        // re-solves -- have declined too. Firing at the loop's tail instead
+        // starved those, measurably: a `sat` `main` answers in 3.6 s was
+        // withdrawn (`starve/impl2_ex36_none.smt2`, `--z3-mode`).
+        // A ground `Sat` never arms it: the CE-free set is a subset of a
+        // satisfiable one and the probe could only cost.
+        if matches!(outcome, Ok(SolveResult::Unknown))
+            && cegqi_has_forall
+            && !cegqi_has_exists
+            && (result_was_unsat
+                || self.cegqi_lane_refused_counterexample
+                || self.cegqi_refinement_round_refuted)
+        {
+            self.cegqi_ce_free_resolve_armed = true;
         }
+        outcome
+    }
+
+    /// The CEGQI-forall UNSAT arm of [`Self::classify_quantifier_result`],
+    /// verbatim: disambiguation, the non-conjunctive-forall firewall, the
+    /// SAT post-checks and the MBQI safety nets. Split out so the stage-4
+    /// counterexample-free re-solve is armed strictly AFTER every one of
+    /// these has failed closed -- and fires later still, at the executor,
+    /// once the loop's SAT certificates and the five passes behind the loop
+    /// have all had their turn.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_cegqi_forall_unsat(
+        &mut self,
+        category: LogicCategory,
+        cegqi_ce_lemma_ids: &[TermId],
+        cegqi_ce_lemma_groups: &[(TermId, Vec<TermId>)],
+        cegqi_mixed: bool,
+        cegqi_state: &[(TermId, CegqiInstantiator)],
+        refinement_assertions: Option<&[TermId]>,
+    ) -> Result<SolveResult> {
+        let disamb = self.disambiguate_cegqi_unsat(
+            category,
+            cegqi_ce_lemma_ids,
+            cegqi_ce_lemma_groups,
+            cegqi_mixed,
+            cegqi_state,
+            refinement_assertions,
+        );
+        // Every downstream interpretation of `disamb` assumes the
+        // extracted universals are asserted obligations. For a
+        // non-conjunctive `forall`, that assumption can manufacture a
+        // wrong result in either direction: a local validity proof can
+        // flip to SAT, a conjoined CE instance can yield UNSAT, and an
+        // Unknown fed to the MBQI cross-check can conjoin still more
+        // non-entailed instances. Stop all three before they diverge.
+        // The sole exception is an independently UNSAT quantifier-free
+        // ground core, which is a certificate for the original formula
+        // regardless of quantifier position. A missing snapshot cannot
+        // establish position and therefore also fails closed.
+        let Some(snapshot) = refinement_assertions else {
+            self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+            return Ok(SolveResult::Unknown);
+        };
+        if self.snapshot_has_nonconjunctive_forall(snapshot) {
+            // The sealed consequence verifier inside disambiguation is
+            // the only UNSAT authority here. Re-solving G0 in place
+            // would bypass its proof-mode refusal and could attach the
+            // CE-primary or an inner untranslated proof to the verdict.
+            if matches!(&disamb, Ok(SolveResult::Unsat(_))) {
+                return disamb;
+            }
+            self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+            return Ok(SolveResult::Unknown);
+        }
+        // SOUNDNESS (#forall-alternation wrong-sat): a CEGQI "forall valid
+        // ⟹ SAT" verdict is unreliable when the snapshot has a
+        // skolemized-alternation forall with a witness-independent
+        // arithmetic conjunct (a bound-var constraint no existential
+        // witness can repair). Fail closed there. The genuine
+        // witness-driven cases (e.g. `(forall x (exists y (> y x)))`,
+        // skolemized to `(forall x (> sk(x) x))`) have no such conjunct
+        // and keep their SAT.
+        if matches!(disamb, Ok(SolveResult::Sat)) {
+            if let Some(snapshot) = refinement_assertions {
+                // DECISION (#forall-alternation): the CEGQI "forall valid"
+                // verdict bypasses model validation. Validate it directly
+                // with model-based quantifier instantiation against the
+                // candidate (ground-only) model: instantiate each snapshot
+                // `forall` at ground/synthesized candidates, evaluate under
+                // the model, and re-solve the falsifying instances. If that
+                // drives the problem UNSAT the universal is genuinely
+                // violated — decide UNSAT (matching z3) rather than trust
+                // the unvalidated certificate. This resolves the
+                // alternation wrong-sats where infeasibility comes from the
+                // COMBINATION of (skolem-)constrained conjuncts, which no
+                // syntactic guard can see.
+                if let Some(Ok(SolveResult::Unsat(_))) =
+                    self.disambiguate_cegqi_valid_via_mbqi_ext(snapshot, category, true)
+                {
+                    return self.cegqi_inner_unsat_or_unknown();
+                }
+                // Safety net: fail closed on the unreliable
+                // skolem-alternation shape MBQI could not refute.
+                if self.snapshot_has_witness_independent_skolem_alternation(snapshot) {
+                    self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
+                    return Ok(SolveResult::Unknown);
+                }
+            }
+        }
+        // DECISION (#quantified-ce-lemma, second S3 route): when
+        // disambiguation stays honestly Unknown (ground remainder Sat
+        // but the CE obligation neither refuted nor decided), try the
+        // model-based instantiation refutation before surfacing the
+        // Unknown — mirror of the refinement-Unknown branch below. It
+        // only ever returns UNSAT on a real instantiation contradiction
+        // (a sound universal instance driven UNSAT, now including the
+        // per-candidate ISOLATED single-instance solves that decide the
+        // NIA-conjunction chokepoint), so this can only upgrade a
+        // fail-closed Unknown to the decisive answer, never flip a
+        // genuine verdict.
+        if matches!(disamb, Ok(SolveResult::Unknown)) {
+            if let Some(snapshot) = refinement_assertions {
+                if let Some(Ok(SolveResult::Unsat(_))) =
+                    self.disambiguate_cegqi_valid_via_mbqi_ext(snapshot, category, true)
+                {
+                    return self.cegqi_inner_unsat_or_unknown();
+                }
+            }
+        }
+        // MBQI and alternation safety nets run after the sealed SAT
+        // authority was consumed. Recheck the two publication
+        // postconditions after that downstream work as well.
+        if matches!(disamb, Ok(SolveResult::Sat))
+            && (self.should_abort_theory_loop()
+                || (self.last_model.is_none()
+                    && !self.has_current_pending_certificate_model_transport(&self.ctx.assertions)))
+        {
+            return self.cegqi_fail_closed_unknown();
+        }
+        disamb
     }
 
     /// Collect the quantifier TermIds (as `collect_quantifiers` would surface
@@ -3628,10 +4523,6 @@ impl Executor {
         &mut self,
         snapshot: &[TermId],
     ) -> ay_core::kani_compat::DetHashSet<TermId> {
-        use ay_core::kani_compat::DetHashSet as HashSet;
-        use ay_core::Symbol;
-        let mut out: HashSet<TermId> = HashSet::default();
-
         // #unit-conjunctive: a top-level UNIT literal is a FACT, so the
         // conjunctive-position test must be taken modulo those facts, not just
         // read off the syntax tree.
@@ -3664,6 +4555,68 @@ impl Executor {
                 }
             }
         }
+        self.conjunctive_quantifiers_modulo_units(snapshot, &|terms, t| {
+            unit_value(terms, &units, t)
+        })
+    }
+
+    /// (#degrade277-unit-harvest) [`Self::forall_ids_in_conjunctive_position`]
+    /// taken modulo the SAME unit facts the instantiation licence uses:
+    /// [`crate::ematching::UnitFacts::from_assertions`], which also descends
+    /// through an asserted `and` (#unit-and-harvest) and keys integer bounds
+    /// canonically (#unit-int-bound-key).
+    ///
+    /// The E-matcher licenses conjoining an instance with
+    /// `entailed_forall_set`, whose unit harvest is `UnitFacts`. Since
+    /// `1aea2c0cb` that harvest reads through a conjunction, while the walk
+    /// above still read only literally-top-level atoms. So a universal whose
+    /// guard is a conjunct of an asserted `and` was LICENSED (and instantiated)
+    /// but judged non-conjunctive here, and `degrade@277` then discarded a
+    /// refutation that rested only on instances of entailed universals. Every
+    /// Verus query has that shape: `mk_implies`/`mk_not` store the negated goal
+    /// `(not (=> (fuel_bool f) … ))` as `(and (fuel_bool f) … )`, and each
+    /// fuel-controlled definition as `(or (not (fuel_bool f)) (forall …))`.
+    ///
+    /// SOUNDNESS. A conjunct of an asserted `and` is unconditionally true, so
+    /// it is exactly as much a unit FACT as a bare `(assert c)` — the argument
+    /// `#unit-conjunctive` already makes for top-level atoms — and simplifying
+    /// with it only ever RECOGNISES universals the problem entails. The walk is
+    /// unchanged; only its unit oracle is stronger.
+    ///
+    /// Deliberately NOT substituted into `forall_ids_in_conjunctive_position`:
+    /// that predicate also gates SAT-side lanes, and this change is scoped to
+    /// the one UNSAT-only reader, [`Self::nonconjunctive_forall_may_have_been_conjoined`],
+    /// so every SAT path reads exactly the set it read before.
+    ///
+    /// `facts` are extra formulas, each a consequence of `snapshot`, whose unit
+    /// facts count too (#conjunctive-closure); only `snapshot` is walked.
+    pub(in crate::executor) fn forall_ids_entailed_modulo_harvested_units(
+        &mut self,
+        snapshot: &[TermId],
+        facts: &[TermId],
+    ) -> ay_core::kani_compat::DetHashSet<TermId> {
+        let units = if facts.is_empty() {
+            crate::ematching::UnitFacts::from_assertions(&self.ctx.terms, snapshot)
+        } else {
+            let mut roots = snapshot.to_vec();
+            roots.extend_from_slice(facts);
+            crate::ematching::UnitFacts::from_assertions(&self.ctx.terms, &roots)
+        };
+        self.conjunctive_quantifiers_modulo_units(snapshot, &|terms, t| units.value(terms, t))
+    }
+
+    /// The conjunctive-position walk shared by
+    /// [`Self::forall_ids_in_conjunctive_position`] and
+    /// [`Self::forall_ids_entailed_modulo_harvested_units`]; `unit` reports the
+    /// truth a unit fact assigns to a term, if any.
+    fn conjunctive_quantifiers_modulo_units(
+        &mut self,
+        snapshot: &[TermId],
+        unit: &dyn Fn(&ay_core::TermStore, TermId) -> Option<bool>,
+    ) -> ay_core::kani_compat::DetHashSet<TermId> {
+        use ay_core::kani_compat::DetHashSet as HashSet;
+        use ay_core::Symbol;
+        let mut out: HashSet<TermId> = HashSet::default();
 
         // `positive` tracks polarity: true = the term appears positively in a
         // conjunctive context, false = it appears negated (so an inner `and`
@@ -3713,48 +4666,10 @@ impl Executor {
                     }
                 }
                 TermData::App(Symbol::Named(name), args) => {
-                    // `(and ...)` in positive position and `(or ...)` under a
-                    // negation (De Morgan -> conjunction) both keep a conjunctive
-                    // context for their arguments. Everything else (positive
-                    // `or`, function applications, `=>`, `ite`) breaks conjunctive
-                    // descent — quantifiers below are not top-level conjuncts...
-                    if (name == "and" && positive) || (name == "or" && !positive) {
-                        for &arg in &args {
-                            stack.push((arg, positive));
-                        }
-                    } else if name == "=>" && positive && args.len() == 2 {
-                        // ...EXCEPT modulo top-level unit facts (#unit-conjunctive).
-                        // `(=> a b)`: if `a` is a unit fact, `b` is a top-level
-                        // consequence, so descend conjunctively. If `b` is already
-                        // true (or `a` already false), the implication is satisfied
-                        // and constrains nothing — it cannot put any forall of its
-                        // own into a disjunctive obligation, so descend into
-                        // neither side.
-                        let (a, b) = (args[0], args[1]);
-                        let a_unit = unit_value(&self.ctx.terms, &units, a);
-                        let b_unit = unit_value(&self.ctx.terms, &units, b);
-                        if b_unit == Some(true) || a_unit == Some(false) {
-                            // satisfied by a unit fact — contributes nothing
-                        } else if a_unit == Some(true) {
-                            stack.push((b, positive));
-                        }
-                    } else if name == "or" && positive {
-                        // Unit propagation through a positive `or`: if every
-                        // disjunct but one is falsified by a unit fact, the
-                        // survivor is a top-level consequence.
-                        if !args
-                            .iter()
-                            .any(|&x| unit_value(&self.ctx.terms, &units, x) == Some(true))
-                        {
-                            let live: Vec<TermId> = args
-                                .iter()
-                                .copied()
-                                .filter(|&x| unit_value(&self.ctx.terms, &units, x) != Some(false))
-                                .collect();
-                            if live.len() == 1 {
-                                stack.push((live[0], positive));
-                            }
-                        }
+                    for child in
+                        conjunctive_app_children(&self.ctx.terms, &name, positive, &args, unit)
+                    {
+                        stack.push((child, positive));
                     }
                 }
                 _ => {}
@@ -3783,6 +4698,87 @@ impl Executor {
             .into_iter()
             .filter(|&q| matches!(self.ctx.terms.get(q), TermData::Forall(..)))
             .any(|q| !conjunctive.contains(&q))
+    }
+
+    /// (#degrade277-narrow) Whether the `degrade@277` distrust still has a
+    /// premise: could an instance of a NON-CONJUNCTIVE `forall` of `snapshot`
+    /// actually have been conjoined into the assertion set this refutation
+    /// came from?
+    ///
+    /// `snapshot_has_nonconjunctive_forall` answers a purely SYNTACTIC
+    /// question — "is some `forall` outside top-level conjunctive position?"
+    /// — and the gate above then discards the refutation. But no lane is
+    /// permitted to conjoin an instance on the strength of syntactic position:
+    /// every conjoining lane is gated on `entailed_forall_set`
+    /// (`ematching/mod.rs`'s `if !entailed_foralls.contains(&quant) { continue }`
+    /// and `setup_cegqi_for_unhandled`'s `quant_is_entailed_forall`), which is
+    /// the polarity- and unit-aware predicate for "the PROBLEM entails this
+    /// universal". A universal the problem entails may be instantiated
+    /// wherever it sits, because `∀x̄.B` is then a consequence of the problem
+    /// and so is every `B[t̄]`.
+    ///
+    /// So when NO non-conjunctive `forall` of the snapshot was ever treated as
+    /// entailed, every instance in the assertion set came from a universal the
+    /// problem entails, and the refutation cannot have been manufactured the
+    /// way this gate fears. That is the exact condition checked here; the two
+    /// predicates are genuinely different, because
+    /// `purify_quantifier_atoms` proxies every maximal quantifier of a target
+    /// assertion INCLUDING entailed ones, so "unproxied" would not establish
+    /// it and "non-conjunctive" alone does not either.
+    ///
+    /// Fail-closed in three ways, each of which returns `true` (keep the
+    /// distrust):
+    ///
+    /// 1. Nothing recorded an entailed set for this query
+    ///    (`entailed_forall_authority == None`) — an unrecorded lane is
+    ///    indistinguishable from a lane that licensed everything.
+    /// 2. A lane conjoined an instance WITHOUT that licence
+    ///    (`unlicensed_instance_conjoined`) — today the three MBQI
+    ///    counterexample-refinement pushes, whose source lists include
+    ///    non-entailed universals. This is the audit obligation
+    ///    (`mbqi.rs`, `bv_mbqi.rs`, `finite_model_mbqi.rs` must not reach the
+    ///    arm) discharged by observation instead of by call ordering.
+    /// 3. Some non-conjunctive `forall` of the snapshot IS in the recorded
+    ///    union.
+    ///
+    /// This function NEVER widens a SAT path: it is read at one site, inside
+    /// an arm already conditioned on `Ok(SolveResult::Unsat(_))`.
+    fn nonconjunctive_forall_may_have_been_conjoined(&mut self, snapshot: &[TermId]) -> bool {
+        if self.unlicensed_instance_conjoined {
+            return true;
+        }
+        let Some(authority) = self.entailed_forall_authority.clone() else {
+            return true;
+        };
+        // Taken modulo the licence's own unit harvest, so a universal that the
+        // harvest makes a top-level consequence is not held non-conjunctive
+        // merely because its guard sits inside an asserted `and`
+        // (#degrade277-unit-harvest), and closed over the instances of the
+        // universals so shown entailed, so a guard those instances settle
+        // counts too (#conjunctive-closure).
+        let conjunctive = self.conjunctive_forall_closure(snapshot);
+        let mut all_quants: Vec<TermId> = Vec::new();
+        for &a in snapshot {
+            crate::ematching::collect_quantifiers(&mut self.ctx.terms, a, &mut all_quants);
+        }
+        let foralls: Vec<TermId> = all_quants
+            .into_iter()
+            .filter(|&q| matches!(self.ctx.terms.get(q), TermData::Forall(..)))
+            .collect();
+        let reachable = foralls
+            .iter()
+            .any(|q| !conjunctive.contains(q) && authority.contains(q));
+        if !reachable && ay_core::misc_cli_flags().debug_cert {
+            let top_level_only = self.forall_ids_in_conjunctive_position(snapshot);
+            let by_harvest = foralls
+                .iter()
+                .any(|q| !top_level_only.contains(q) && authority.contains(q));
+            eprintln!(
+                "CERT/degrade@277 narrowed: no non-conjunctive forall of the snapshot is entailed{}",
+                if by_harvest { " (unit-and-harvest)" } else { "" }
+            );
+        }
+        reachable
     }
 
     /// Reconstruct the quantifier-free conjunctive consequences of the
@@ -3830,9 +4826,75 @@ impl Executor {
         }
 
         match self.checked_ground_solve(ground.clone(), fallback_category, 2_000) {
-            Some(CheckedGroundDecision::Unsat(checked)) => checked.consume(self, &ground),
+            Some(CheckedGroundDecision::Unsat(checked)) => {
+                let consumed = checked.consume(self, &ground);
+                self.note_justified_obligation_shape(consumed, &ground);
+                consumed
+            }
             _ => false,
         }
+    }
+
+    /// Record, for [`justification::Justification::publish_if_established`],
+    /// whether the obligation a registry leg just refuted carries a nested
+    /// array.
+    ///
+    /// The write sits beside the obligation vector itself so the recorded shape
+    /// can never drift from the formulas actually re-solved. It is a NO-OP when
+    /// the leg did not decide, and `Justification::establish` clears the slot
+    /// before each attempt, so a leg invoked from somewhere other than the
+    /// registry can never leave a value the registry then reads.
+    pub(super) fn note_justified_obligation_shape(&mut self, decided: bool, obligation: &[TermId]) {
+        if !decided {
+            return;
+        }
+        self.justified_obligation_has_nested_arrays = Some(
+            crate::features::StaticFeatures::collect(&self.ctx.terms, obligation).has_nested_arrays,
+        );
+    }
+
+    /// Re-solve the guarded abstracted assertion vector IN ISOLATION.
+    ///
+    /// `quantifier_guarded_abstraction_snapshot` is written only by the
+    /// Skolem-witness guarded-instantiation lane and only when it actually
+    /// asserted a clause, so this returns `false` — with no solve at all — on
+    /// every query that lane did not touch.
+    ///
+    /// SOUNDNESS. The snapshot is `sigma(A')` (the proxy abstraction of the
+    /// post-Skolemization assertions, quantifier-free members only) together
+    /// with the guard clauses. Every model of `A'` extends to a model of that
+    /// set by `q_i := ⟦Q_i⟧`, so its UNSAT implies `A'` UNSAT, which implies
+    /// the authored query is UNSAT. Nothing else is in the obligation — no
+    /// E-matching instance, no CE lemma, no MBQI instance — so the verdict is
+    /// independent of the instances `CERT/degrade@277` distrusts.
+    ///
+    /// Fail-closed: anything but a definitive `Unsat` from the checked ground
+    /// solve is `false`.
+    pub(super) fn guarded_abstraction_ground_unsat(
+        &mut self,
+        fallback_category: LogicCategory,
+    ) -> bool {
+        if self.quantifier_guarded_abstraction_snapshot.is_empty() {
+            return false;
+        }
+        if self.external_stop_reason().is_some() {
+            return false;
+        }
+        let obligation_terms = self.quantifier_guarded_abstraction_snapshot.clone();
+        let formula = self.ctx.terms.mk_and(obligation_terms);
+        let obligation = vec![formula];
+        let decided = match self.checked_ground_solve(obligation.clone(), fallback_category, 2_000)
+        {
+            Some(CheckedGroundDecision::Unsat(checked)) => checked.consume(self, &obligation),
+            _ => false,
+        };
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/guarded-abstraction: roots={} unsat={decided}",
+                self.quantifier_guarded_abstraction_snapshot.len()
+            );
+        }
+        decided
     }
 
     /// (#p2-ufnia-refutation) Instance-closure FRESH re-solve: re-solve the
@@ -3916,6 +4978,7 @@ impl Executor {
             Some(CheckedGroundDecision::Unsat(checked)) => checked.consume(self, &obligation),
             _ => false,
         };
+        self.note_justified_obligation_shape(decided, &obligation);
         if decided && ay_core::misc_cli_flags().debug_cert {
             eprintln!("CERT/instance-closure: UNSAT via fresh consequence-set re-solve");
         }
@@ -4341,7 +5404,13 @@ impl Executor {
                 && self.restored_has_bound_dependent_non_skolem_application()
             {
                 let restored_roots = self.ctx.assertions.clone();
-                let public_roots = self.independent_gate_query_roots();
+                let public_roots = match self.independent_gate_query_roots() {
+                    Ok(roots) => roots,
+                    Err(_) => {
+                        *final_result = Ok(SolveResult::Unknown);
+                        return;
+                    }
+                };
                 let current_exact_authority = self
                     .current_quantified_sat_authority(&restored_roots)
                     .is_some()
@@ -4426,9 +5495,20 @@ impl Executor {
                 // that package now authenticates this exact restored root
                 // window. The direct MBQI gate remains a fresh check over the
                 // live roots and is not represented by a durable routing bit.
+                // Re-read after the producers above: either window, for the
+                // reason `current_exact_authority` states. A current grant on
+                // the AUTHORED roots — the window the emission gate checks —
+                // is the theorem about the query being published; the restored
+                // window is the solver's working copy of it, which may carry
+                // internal axioms besides (measured: the RoundingMode domain
+                // pass adds two to BVFPLRA `double_req_bl_1052d_…c_5`, and a
+                // model-check grant on the authored roots was demoted).
                 let explicit_certificate = self
                     .current_quantified_sat_authority(&restored_roots)
-                    .is_some();
+                    .is_some()
+                    || self
+                        .current_quantified_sat_authority(&public_roots)
+                        .is_some();
                 let mbqi_gate_confirms = explicit_certificate
                     || matches!(
                         self.mbqi_soundness_gate_for_skipped_quantifiers(),
@@ -4677,8 +5757,10 @@ impl Executor {
         let refinement_result =
             self.try_mbqi_refinement(&forall_quants, category, &original_assertions);
 
-        // Only proceed to certification when refinement did NOT refute
-        // (None => SAT fixpoint, or Sat).
+        // Only proceed to certification when refinement did NOT refute:
+        // `Sat`, or `None`, which is a fixpoint or a refinement the input
+        // switched off (`smt.mbqi false`). Neither is taken on trust; the
+        // validators below examine every instance themselves.
         let proceed = !matches!(
             refinement_result,
             Some(Ok(SolveResult::Unsat(_))) | Some(Err(_))
@@ -4697,6 +5779,14 @@ impl Executor {
                 &original_assertions,
                 &forall_quants,
             )
+            // FINITE-DOMAIN UF (#finite-domain-uf-cert): the EPR leg
+            // declines when functions return binder sorts; this leg
+            // exhibits the candidate model's finite element domains as
+            // installed total tables and verifies every assertion over
+            // the full domain cross-product.
+            .or_else(|| {
+                self.mbqi_sat_validated_finite_domain_uf(&original_assertions, &forall_quants)
+            })
             // LEFT-INVERSE (boxing) axioms `forall x. Unbox(Box x) = x`
             // (deductive-checks polymorphism, #2774), mixed only with
             // universe-independent shapes (unary identity definitions,
@@ -4896,6 +5986,9 @@ impl Executor {
             return None;
         }
         let scope = CheckedSameContextGroundScope::capture(self, &assertions)?;
+        // The child derives different ground obligations; only the original
+        // ordered public roots may name construction ownership after return.
+        let outer_roots = self.independent_gate_query_roots().ok()?;
 
         // Construct and configure the disposable owner before lending it the
         // real Context. No allocation is then needed to put the Context back.
@@ -4966,6 +6059,7 @@ impl Executor {
 
         Some(CheckedSameContextGroundModel {
             scope,
+            outer_roots,
             _certificate: certificate,
             model: probe.last_model.take()?,
             nra_algebraic_model: probe.nra_algebraic_model.take_values(),
@@ -4994,22 +6088,39 @@ impl Executor {
     /// the enclosing authored scope, which is where publication authority
     /// lives. Every other outcome — SAT, unknown, missing or trust-carrying
     /// proof, stale window, external stop — returns `None`.
+    ///
+    /// `window` selects what the probe decides: [`SameContextWindow::Ground`]
+    /// is the quantifier-free consequence set above;
+    /// [`SameContextWindow::AuthoredRoots`] admits authored roots that carry
+    /// quantifiers (the probe's pipeline instantiates and Skolemizes them
+    /// itself) and, optionally, their authored surfaces.
+    ///
+    /// `budget_ms` is the probe's own wall budget. `None` bounds the probe
+    /// only by what bounds the caller — its deadline and interrupt, and the
+    /// deterministic effort allowances the probe executor inherits — and adds
+    /// no sub-budget (the unrewritten authored replay's posture).
+    ///
+    /// `work_round_trips` is a counted grant on the probe's split-loop round
+    /// trips (`ay_core::resource::enter_work_grant`): with it the probe stops
+    /// at the same round on every host, and `budget_ms` is only its backstop.
     pub(in crate::executor) fn checked_same_context_unsat_proof(
         &mut self,
         assertions: &[TermId],
-        budget_ms: u64,
+        window: SameContextWindow<'_>,
+        budget_ms: Option<u64>,
+        work_round_trips: Option<u64>,
         scope_to_window: bool,
     ) -> SameContextProbeOutcome {
-        if assertions
-            .iter()
-            .any(|&root| contains_quantifier(&self.ctx.terms, root))
+        let window_has_quantifiers =
+            crate::ematching::contains_quantifier_in_any(&self.ctx.terms, assertions);
+        if (window_has_quantifiers && matches!(window, SameContextWindow::Ground))
             || self.should_abort_theory_loop()
             || !self.qpf_probe_preflight()
         {
             return SameContextProbeOutcome::Other;
         }
 
-        let mut probe = self.qpf_probe_executor(ay_frontend::Context::new(), budget_ms);
+        let mut probe = self.qpf_probe_executor_within(ay_frontend::Context::new(), budget_ms);
         // This disposable executor is a proof *producer*, not a publication
         // boundary.  Inherited self-check would inspect the raw proof before
         // the consequence-replay-specific assertion/conjunct and EUF rebuilds
@@ -5020,6 +6131,9 @@ impl Executor {
         // enclosing authored query then strictly checks the stitched proof
         // again before publication.
         probe.set_self_check(false);
+        // Evidence policy P1 (`strengthening.rs`): a probe whose refutation
+        // certifies the enclosing query runs no strengthening.
+        probe.force_strengthenings_off();
         // Scope the probe's whole-store array-axiom scans to its own window
         // (see the field doc: unscoped, outer dead array-equality terms seed
         // hundreds of phantom congruence axioms and a fused Generic conflict).
@@ -5035,9 +6149,39 @@ impl Executor {
         // therefore retries exactly the raw-UNSAT-but-unpromotable outcome
         // with the scope off, under a fresh grant from the same envelope.
         probe.shared_store_derived_query = scope_to_window;
+        // A proof producer must keep its assume leaves aligned with the
+        // consequence set: no in-place variable substitution (see the field).
+        probe.proof_probe_skips_varsubst = true;
+        // Run under the caller's proof posture however the caller spelled it.
+        // `:produce-proofs` travels with the context swapped in below; the
+        // native API's `Solver::set_produce_proofs` is an executor flag the
+        // fresh probe would otherwise lack, and the passes gated on "did the
+        // caller ask for a proof" (guarded-equality mining, EqDiffVar) then
+        // rewrote the probe's window into leaves its proof cannot authenticate.
+        // Measured on deductive-checksgen's reach-encoded `Unreachable` rows: certified
+        // through the text lane, refused through the API session.
+        probe.proof_output_requested |= self.proof_output_requested;
+        probe.proof_probe_skips_som = self.proof_probe_skips_som;
+        let (surfaces, mut surface_overrides) = match window {
+            SameContextWindow::Ground => (None, None),
+            SameContextWindow::AuthoredRoots {
+                surfaces,
+                surface_overrides,
+            } => (surfaces, Some(surface_overrides)),
+        };
         let Ok(window) = self.ctx.begin_internal_query_window(assertions.to_vec()) else {
             return SameContextProbeOutcome::Other;
         };
+        if let Some(surfaces) = surfaces.filter(|surfaces| surfaces.len() == assertions.len()) {
+            // The same roots, re-installed with their authored surfaces under
+            // host retention. The window saved and restores every stack and the
+            // retention policy these pushes touch.
+            self.ctx.truncate_assertions(0);
+            self.ctx.set_retain_parsed_assertions(true);
+            for (&root, surface) in assertions.iter().zip(surfaces) {
+                self.ctx.add_assertion_with_parsed(root, surface.clone());
+            }
+        }
         std::mem::swap(&mut self.ctx, &mut probe.ctx);
         std::mem::swap(
             &mut self.array_default_epsilon_by_sort,
@@ -5047,14 +6191,23 @@ impl Executor {
             &mut self.array_default_diag_by_sort,
             &mut probe.array_default_diag_by_sort,
         );
-        probe.original_problem_had_quantifiers = false;
+        probe.original_problem_had_quantifiers = window_has_quantifiers;
         probe.incremental_mode = false;
 
         // Keep `probe` outside the closure: a solver panic is resumed only
         // after the exact outer query window, Context, and sidecars have been
         // restored.
         let trace = ay_core::misc_cli_flags().trace_cegqi_attr;
+        let enclosing_lia_probe_state = ay_lia::save_probe_state();
         let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The counted grant covers the probe's own solve and proof only:
+            // it ends with this closure, before this executor polls its own
+            // stop controls again below.
+            let _work_grant = work_round_trips.map(ay_core::resource::enter_work_grant);
+            // `ay_lia`'s per-thread probe trajectory state: the probe decides
+            // a different problem, so it starts from a clean state and leaves
+            // the enclosing solve's exactly as it found it (restored below).
+            ay_lia::reset_probe_subset_hint();
             probe.begin_public_solve(false);
             probe.bind_unsat_query_assumptions(&[]);
             let raw = probe.check_sat();
@@ -5067,7 +6220,12 @@ impl Executor {
             match raw {
                 Ok(SolveResult::Unsat(_)) => {
                     match probe.finish_consequence_probe_unsat_proof(assertions) {
-                        Some(proof) => SameContextProbeOutcome::Proof(proof),
+                        Some(proof) => {
+                            if let Some(slot) = surface_overrides.as_deref_mut() {
+                                *slot = probe.last_proof_term_overrides.take();
+                            }
+                            SameContextProbeOutcome::Proof(proof)
+                        }
                         // The refutation is real but its proof could not be
                         // completed to a strict-checkable document.
                         None => SameContextProbeOutcome::UnsatUnpromotable,
@@ -5079,6 +6237,7 @@ impl Executor {
             }
         }));
 
+        ay_lia::restore_probe_state(enclosing_lia_probe_state);
         let window_is_current = probe.ctx.restore_internal_query_window(window);
         // (#ground-conflict-decomp) Fold the disposable probe's decomposition
         // meters into this executor so `--stats` reports the pass's exact
@@ -5153,6 +6312,7 @@ impl Executor {
     {
         let CheckedSameContextGroundModel {
             scope,
+            outer_roots,
             _certificate,
             model,
             nra_algebraic_model,
@@ -5198,6 +6358,15 @@ impl Executor {
                 return None;
             }
 
+            let model = executor.last_model.take()?;
+            let model = crate::executor::model::reconstruct_checked_ground_model_owner(
+                executor,
+                CheckedGroundModelConstruction {
+                    model,
+                    outer_roots: &outer_roots,
+                },
+            )?;
+            executor.last_model = Some(model);
             let model_epoch = executor.last_model.as_mut()?.seal_quantified_grant_model();
             let installed = InstalledCheckedGroundModel { scope, model_epoch };
             if !installed.is_current(executor) {
@@ -5248,11 +6417,38 @@ impl Executor {
         )
     }
 
+    fn try_exact_array_frame_sat(&mut self, snapshot: &[TermId]) -> bool {
+        if !snapshot
+            .iter()
+            .any(|&root| ay_model_check::recognizes_int_array_frame(&self.ctx.terms, root))
+        {
+            return false;
+        }
+        let Ok(roots) = self.independent_gate_query_roots() else {
+            return false;
+        };
+        let Some(checked) =
+            CheckedModelRewriteSatAuthority::for_independently_evaluated_model(self, &roots)
+        else {
+            return false;
+        };
+        self.install_independently_evaluated_quantified_sat_authority(checked)
+    }
+
     fn ensure_snapshot_ground_model_for_completion(
         &mut self,
         snapshot: &[TermId],
         fallback_category: LogicCategory,
     ) -> bool {
+        // #refutation-withheld: this pass refuted the query and withheld the
+        // verdict only for want of a translated proof, so the snapshot has no
+        // model to complete. Measured on the `nested_query_false_unsat` corpus
+        // row: with congruence bridging already fast, this probe and the
+        // constant-interpretation certificate still spent ~4.3 s re-refuting
+        // the ground core (the row fails closed in 6.9 s -> 2.6 s).
+        if self.quantified_refutation_withheld {
+            return false;
+        }
         // A retained CE/live-window model is only an untrusted candidate here.
         // Reuse it when the same exact evaluator trusted by the completion
         // certificates establishes every authenticated ground conjunct. If it
@@ -5265,10 +6461,15 @@ impl Executor {
                 .into_iter()
                 .all(|ground| matches!(self.evaluate_term(model, ground), EvalValue::Bool(true)))
         });
+        // A core-subset nomination consumes only UNSAT. A fresh ground model
+        // here feeds SAT-only completion certificates; SAT and Unknown both
+        // leave that candidate unadopted. Keep every refutation route and the
+        // exact adoption check, and still reuse an already valid candidate.
         retained_satisfies_ground
-            || self
-                .install_authenticated_snapshot_ground_model(snapshot, fallback_category)
-                .is_some()
+            || (!self.core_subset_nomination
+                && self
+                    .install_authenticated_snapshot_ground_model(snapshot, fallback_category)
+                    .is_some())
     }
 
     fn install_authenticated_snapshot_ground_model(
@@ -5305,7 +6506,7 @@ impl Executor {
     /// provenance fields retained by an inner per-lemma refutation. Keep this
     /// cleanup adjacent to the sealed SAT witness consumption sites so no
     /// later internal path can reuse those stale artifacts.
-    fn clear_cegqi_inner_unsat_artifacts(&mut self) {
+    pub(in crate::executor) fn clear_cegqi_inner_unsat_artifacts(&mut self) {
         self.note_cegqi_inner_unsat_artifact_clear();
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
@@ -5375,6 +6576,18 @@ impl Executor {
         self.proof_problem_assertion_provenance = None;
         self.proof_tracker.reset_session();
         self.suppress_unsat_proof_reconstruction();
+        // #evidence-stage-3. Everything cleared above this line is EVIDENCE: on
+        // the measured firewall files a `CheckedSatRefutation` — RUP replay to
+        // the empty clause, every original matched by trace identity, every
+        // clause strict-checked against the frozen authored roots — was minted
+        // and is deleted here, because a CEGQI counterexample constant in a leaf
+        // is not an authored term and no bridge carries it back. The CLI said
+        // "UNSAT produced no reconstructable proof", which inverts the truth:
+        // the refutation existed and was thrown away. Record which of the two
+        // things happened. Nothing else changes; the firewall still fires.
+        self.record_proof_decline(
+            crate::executor::ProofDeclineMechanism::QuantifierArtifactFirewall,
+        );
         self.last_unknown_reason = None;
         SolveResult::unsat()
     }
@@ -6053,7 +7266,7 @@ impl Executor {
         // Unknown, never a wrong verdict.
         let saved_deadline = self.solve_deadline.get();
         let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(300);
-        self.set_deadline(match saved_deadline {
+        self.set_search_deadline(match saved_deadline {
             Some(d) if d < tight => Some(d),
             _ => Some(tight),
         });
@@ -6102,6 +7315,7 @@ impl Executor {
             }
         }
         let mut all_ce_lemmas_refuted = !ce_lemma_groups.is_empty();
+        let mut rests_on_trust = false;
         for (quant, group) in ce_lemma_groups {
             if !matches!(self.ctx.terms.get(*quant), TermData::Forall(..)) {
                 // Defensive: an exists group cannot be certified by
@@ -6128,15 +7342,20 @@ impl Executor {
                 lemma_ctx.extend(uf_pins.iter().copied());
             }
             lemma_ctx.extend(group.iter().copied());
-            let lemma_result = match self.checked_ground_solve(lemma_ctx.clone(), category, 2_000) {
-                Some(CheckedGroundDecision::Unsat(checked)) => checked
-                    .consume(self, &lemma_ctx)
-                    .then_some(CheckedGroundKind::Unsat),
-                Some(CheckedGroundDecision::Sat(checked)) => checked
-                    .consume(self, &lemma_ctx)
-                    .then_some(CheckedGroundKind::Sat),
-                _ => None,
-            };
+            let lemma_result =
+                match self.checked_sat_authority_ground_solve(lemma_ctx.clone(), category, 2_000) {
+                    Some((CheckedGroundDecision::Unsat(checked), class)) => {
+                        rests_on_trust |= class
+                            == crate::executor::unsat_cert::ProbeUnsatAuthority::DischargedTrust;
+                        checked
+                            .consume(self, &lemma_ctx)
+                            .then_some(CheckedGroundKind::Unsat)
+                    }
+                    Some((CheckedGroundDecision::Sat(checked), _)) => checked
+                        .consume(self, &lemma_ctx)
+                        .then_some(CheckedGroundKind::Sat),
+                    _ => None,
+                };
             if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT model-group refutation: quant={quant:?} group_terms={} pins={} uf_pins={} result={lemma_result:?}",
@@ -6150,7 +7369,7 @@ impl Executor {
                 break;
             }
         }
-        self.set_deadline(saved_deadline);
+        self.set_search_deadline(saved_deadline);
         if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!(
                 "[cegqi-attr] SAT model-group verifier result: all_refuted={all_ce_lemmas_refuted} uf_pins_usable={uf_pins_usable} stopped={}",
@@ -6158,8 +7377,10 @@ impl Executor {
             );
         }
         if !all_ce_lemmas_refuted || self.should_abort_theory_loop() {
-            None
-        } else if uf_pins_usable {
+            return None;
+        }
+        self.book_trust_resting_certificate(rests_on_trust);
+        if uf_pins_usable {
             let mut completion = uf_recompletion?;
             if pins_usable {
                 completion.model_definition = m_def.into_boxed_slice();
@@ -6299,12 +7520,13 @@ impl Executor {
         // Shared tight deadline across the whole leg.
         let saved_deadline = self.solve_deadline.get();
         let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(300);
-        self.set_deadline(match saved_deadline {
+        self.set_search_deadline(match saved_deadline {
             Some(d) if d < tight => Some(d),
             _ => Some(tight),
         });
 
         let mut all_refuted = true;
+        let mut rests_on_trust = false;
         'lemmas: for (quant, inst) in cegqi_state {
             let Some((binders, rho)) =
                 rebuild_quantified_ce_lemma(&mut self.ctx.terms, *quant, inst)
@@ -6315,14 +7537,9 @@ impl Executor {
             if binders.is_empty() {
                 // Ground lemma: the obligation IS the stored CE lemma; refute
                 // it directly with one isolated solve.
-                let obligation = vec![rho];
-                if self
-                    .checked_ground_solve(obligation.clone(), category, 2_000)
-                    .is_some_and(|decision| match decision {
-                        CheckedGroundDecision::Unsat(checked) => checked.consume(self, &obligation),
-                        CheckedGroundDecision::Sat(_) => false,
-                    })
-                {
+                if let Some(class) = self.sat_authority_refutes(vec![rho], category, 2_000) {
+                    rests_on_trust |=
+                        class == crate::executor::unsat_cert::ProbeUnsatAuthority::DischargedTrust;
                     continue;
                 }
                 all_refuted = false;
@@ -6344,14 +7561,9 @@ impl Executor {
                     .zip(tuple.iter().copied())
                     .collect();
                 let instance = crate::ematching::subst_vars(&mut self.ctx.terms, rho, &subst);
-                let obligation = vec![instance];
-                if self
-                    .checked_ground_solve(obligation.clone(), category, 2_000)
-                    .is_some_and(|decision| match decision {
-                        CheckedGroundDecision::Unsat(checked) => checked.consume(self, &obligation),
-                        CheckedGroundDecision::Sat(_) => false,
-                    })
-                {
+                if let Some(class) = self.sat_authority_refutes(vec![instance], category, 2_000) {
+                    rests_on_trust |=
+                        class == crate::executor::unsat_cert::ProbeUnsatAuthority::DischargedTrust;
                     continue 'lemmas; // this lemma is refuted — next lemma
                 }
             }
@@ -6359,7 +7571,10 @@ impl Executor {
             break;
         }
 
-        self.set_deadline(saved_deadline);
+        self.set_search_deadline(saved_deadline);
+        if all_refuted {
+            self.book_trust_resting_certificate(rests_on_trust);
+        }
         all_refuted
     }
 
@@ -6515,7 +7730,7 @@ impl Executor {
 
         let saved_deadline = self.solve_deadline.get();
         let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(300);
-        self.set_deadline(match saved_deadline {
+        self.set_search_deadline(match saved_deadline {
             Some(d) if d < tight => Some(d),
             _ => Some(tight),
         });
@@ -6572,7 +7787,7 @@ impl Executor {
             }
         }
 
-        self.set_deadline(saved_deadline);
+        self.set_search_deadline(saved_deadline);
         outcome
     }
 
@@ -6589,13 +7804,20 @@ impl Executor {
     /// proof/model artifact die with the probe. Only the non-cloneable decision
     /// crosses back, bound to the enclosing query epoch, source stamp, exact
     /// ordered roots, and term-store snapshot.
+    ///
+    /// "Independently verified" includes `discharged-trust` (a fresh executor
+    /// running the same code re-decided the obligation). A consumer whose
+    /// UNSAT confirms a quantified conjunct behind a published `sat` uses
+    /// [`Self::checked_sat_authority_ground_solve`] instead, which admits that
+    /// class only where the rigor accepts it as grant authority and reports
+    /// it.
     pub(in crate::executor) fn checked_ground_solve(
         &mut self,
         assertions: Vec<TermId>,
         _fallback_category: LogicCategory,
         budget_ms: u64,
     ) -> Option<CheckedGroundDecision> {
-        let (scope, outcome) = self.checked_isolated_solve(
+        let (scope, outcome, _authority, _evidence) = self.checked_isolated_solve(
             assertions,
             CheckedIsolatedMode::GroundDecision,
             budget_ms,
@@ -6622,9 +7844,36 @@ impl Executor {
         assertions: Vec<TermId>,
         budget_ms: u64,
     ) -> Option<CheckedExactUnsat> {
-        let (scope, outcome) =
+        let (scope, outcome, authority, evidence) =
             self.checked_isolated_solve(assertions, CheckedIsolatedMode::ExactUnsat, budget_ms)?;
-        matches!(outcome, CheckedGroundKind::Unsat).then_some(CheckedExactUnsat { scope })
+        matches!(outcome, CheckedGroundKind::Unsat).then_some(CheckedExactUnsat {
+            scope,
+            authority,
+            evidence,
+        })
+    }
+
+    /// [`Self::checked_exact_unsat_solve`] that admits ONLY a strict-proof
+    /// certificate: the disposable probe's complete refutation proof must pass
+    /// its own strict checker. A refutation the probe can back only by an
+    /// independent re-solve (`DischargedTrust`, the other independently
+    /// checked classes) or an exact semantic theorem is refused, so the token
+    /// never rests on the solver agreeing with itself.
+    pub(in crate::executor) fn checked_strict_exact_unsat_solve(
+        &mut self,
+        assertions: Vec<TermId>,
+        budget_ms: u64,
+    ) -> Option<CheckedExactUnsat> {
+        let (scope, outcome, authority, evidence) = self.checked_isolated_solve(
+            assertions,
+            CheckedIsolatedMode::StrictExactUnsat,
+            budget_ms,
+        )?;
+        matches!(outcome, CheckedGroundKind::Unsat).then_some(CheckedExactUnsat {
+            scope,
+            authority,
+            evidence,
+        })
     }
 
     /// Ground instances of conjunctive-position `forall`s, for
@@ -7616,7 +8865,7 @@ impl Executor {
     /// term/parser footprint. A term-count cap alone does not bound parsed AST,
     /// symbol, or string storage, so waiting until after `Context::clone` can
     /// already have crossed the process ceiling.
-    fn qpf_probe_preflight(&self) -> bool {
+    pub(in crate::executor) fn qpf_probe_preflight(&self) -> bool {
         if self.external_stop_reason().is_some()
             || self.term_memory_exceeded()
             || ay_core::TermStore::global_memory_exceeded()
@@ -7638,7 +8887,7 @@ impl Executor {
         {
             return false;
         }
-        self.ctx.terms.true_memory_bytes() <= ay_core::TermStore::per_engine_budget() / 2
+        self.ctx.terms.true_memory_bytes() <= self.predictive_term_clone_budget()
     }
 
     /// Heuristically recover a premise candidate from a universal body.
@@ -7758,9 +9007,27 @@ impl Executor {
     /// Build an isolated probe executor over `ctx` under the caller's resource
     /// envelope. The caller owns the cloned context, so solving may mutate every
     /// executor/context bookkeeping field without touching the outer query.
-    fn qpf_probe_executor(&self, ctx: ay_frontend::Context, budget_ms: u64) -> Executor {
+    pub(in crate::executor) fn qpf_probe_executor(
+        &self,
+        ctx: ay_frontend::Context,
+        budget_ms: u64,
+    ) -> Executor {
+        self.qpf_probe_executor_within(ctx, Some(budget_ms))
+    }
+
+    /// [`Self::qpf_probe_executor`] with the probe's wall budget optional:
+    /// `None` gives the probe exactly the caller's deadline (or none) and no
+    /// sub-budget of its own. The deterministic effort settings are inherited
+    /// either way.
+    pub(in crate::executor) fn qpf_probe_executor_within(
+        &self,
+        ctx: ay_frontend::Context,
+        budget_ms: Option<u64>,
+    ) -> Executor {
         let mut probe = Executor::new();
         probe.ctx = ctx;
+        probe.random_seed = self.random_seed;
+        probe.qlra_lane.nested_inert = true;
         probe.set_verification_level(self.verification_level());
         probe.set_self_check(self.self_check());
         probe.set_learned_clause_limit(self.learned_clause_limit());
@@ -7770,10 +9037,17 @@ impl Executor {
         probe.set_ground_budget_enabled(self.ground_budget_enabled());
         probe.set_memory_limit(self.memory_limit());
         probe.set_term_memory_limit(self.term_memory_limit());
-        let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
-        let bounded = match self.solve_deadline.get() {
-            Some(d) if d < tight => Some(d),
-            _ => Some(tight),
+        let caller = self.solve_deadline.get();
+        let bounded = match budget_ms {
+            Some(budget_ms) => {
+                let tight =
+                    ay_core::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+                match caller {
+                    Some(d) if d < tight => Some(d),
+                    _ => Some(tight),
+                }
+            }
+            None => caller,
         };
         probe.set_solve_controls(self.solve_interrupt.clone(), bounded);
         probe
@@ -8964,10 +10238,15 @@ impl Executor {
     /// as vacuous and collapsed.
     pub(in crate::executor) fn simplify_vacuous_quantifiers(&mut self) {
         let proof_authority_active = self.produce_proofs_enabled();
+        // One memo for the whole pass: the rewrite is a function of the term
+        // alone, and assertions share subterms.
+        let mut dropped: ay_core::kani_compat::DetHashMap<TermId, TermId> = Default::default();
+        let mut hoisted: ay_core::kani_compat::DetHashMap<TermId, TermId> = Default::default();
+        let mut infeasible: ay_core::kani_compat::DetHashMap<TermId, TermId> = Default::default();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
             if contains_quantifier(&self.ctx.terms, a) {
-                let mut simplified = self.drop_unused_bound_vars(a);
+                let mut simplified = self.drop_unused_bound_vars(a, &mut dropped);
                 if proof_authority_active && simplified != a {
                     // (#vacuous-quantifier-authority) Certify the collapse from
                     // the authored root (the tracker independently replays the
@@ -9027,12 +10306,54 @@ impl Executor {
                     // free Assume and erase the exact `forall_inst` route. Preserve
                     // the quantified source instead; downstream instantiation can
                     // derive a concrete contradiction from the authored binder.
-                    simplified = self.hoist_binder_independent_conjuncts(simplified);
-                    simplified = self.simplify_infeasible_forall_eq(simplified);
+                    simplified = self.hoist_binder_independent_conjuncts(simplified, &mut hoisted);
+                    simplified = self.simplify_infeasible_forall_eq(simplified, &mut infeasible);
                 }
                 self.ctx.assertions[i] = simplified;
             }
         }
+    }
+
+    /// `roots` with the one rewrite [`Self::simplify_vacuous_quantifiers`]
+    /// applies in every proof posture: unused binders dropped, and a
+    /// quantifier whose body mentions none of its binders collapsed to that
+    /// body. Mints terms and nothing else; for a caller that has to predict
+    /// what the passes after that one will see.
+    pub(in crate::executor) fn without_vacuous_quantifiers(
+        &mut self,
+        roots: &[TermId],
+    ) -> Vec<TermId> {
+        let mut dropped: ay_core::kani_compat::DetHashMap<TermId, TermId> = Default::default();
+        roots
+            .iter()
+            .map(|&root| {
+                if contains_quantifier(&self.ctx.terms, root) {
+                    self.drop_unused_bound_vars(root, &mut dropped)
+                } else {
+                    root
+                }
+            })
+            .collect()
+    }
+
+    /// The quantifier-free equivalent of `root` that the proof-free rewrites
+    /// build without proof authority (`fold_quantified_linear_eqs`, then
+    /// `simplify_vacuous_quantifiers`: unused binders, binder-independent
+    /// conjuncts, affine `Int` binder elimination), or `None` when a
+    /// quantifier survives them. Mints terms and nothing else. For the SAT-only
+    /// QE lane's affine route (`eq_qe_lane/affine_route.rs`): its result is
+    /// never evidence, the quantified model gate re-decides the authored `root`.
+    pub(in crate::executor) fn proof_free_quantifier_elimination(
+        &mut self,
+        root: TermId,
+    ) -> Option<TermId> {
+        let mut provenance = Vec::new();
+        let folded = self.fold_linear_eqs(root, &mut provenance);
+        let simplified = self.drop_unused_bound_vars(folded, &mut Default::default());
+        let simplified =
+            self.hoist_binder_independent_conjuncts(simplified, &mut Default::default());
+        let simplified = self.simplify_infeasible_forall_eq(simplified, &mut Default::default());
+        (!contains_quantifier(&self.ctx.terms, simplified)).then_some(simplified)
     }
 
     /// #quantprod-g2: fold `select` over a KNOWN-CONSTANT array inside
@@ -9087,11 +10408,13 @@ impl Executor {
                 }
             }
         }
-        // Phase 2: fold inside quantified assertions.
+        // Phase 2: fold inside quantified assertions. One memo for the pass:
+        // the fold is a function of the term and the pins.
+        let mut folded: DetHashMap<TermId, TermId> = Default::default();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
             if contains_quantifier(&self.ctx.terms, a) {
-                self.ctx.assertions[i] = self.fold_const_array_selects_rec(a, &pins);
+                self.ctx.assertions[i] = self.fold_const_array_selects_rec(a, &pins, &mut folded);
             }
         }
     }
@@ -9101,16 +10424,38 @@ impl Executor {
     /// literal const-array or a pinned ground array term. Quantifiers are
     /// rebuilt with their trigger lists intact; `Let` is left untouched
     /// (conservative — a let-bound shadow could alias the pinned name).
+    ///
+    /// Memoized per TermId (`memo`): the walk without it re-walked every
+    /// shared subterm once per path, exponential on a DAG. On AUFBV Alive2
+    /// `ph7__532_ph7`, once `drop_unused_bound_vars` was memoized, the
+    /// `--z3-mode` run was inside this walk 8-10 s into `-T:10` (sampled) and
+    /// still ended in the watchdog's hard exit. Hash-consing keeps the result
+    /// and the order terms are created in identical.
     fn fold_const_array_selects_rec(
         &mut self,
         term: TermId,
         pins: &ay_core::kani_compat::DetHashMap<TermId, TermId>,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&done) = memo.get(&term) {
+            return done;
+        }
+        let result = self.fold_const_array_selects_uncached(term, pins, memo);
+        memo.insert(term, result);
+        result
+    }
+
+    fn fold_const_array_selects_uncached(
+        &mut self,
+        term: TermId,
+        pins: &ay_core::kani_compat::DetHashMap<TermId, TermId>,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
     ) -> TermId {
         match self.ctx.terms.get(term).clone() {
             TermData::App(sym, args) => {
                 let new: Vec<TermId> = args
                     .iter()
-                    .map(|&a| self.fold_const_array_selects_rec(a, pins))
+                    .map(|&a| self.fold_const_array_selects_rec(a, pins, memo))
                     .collect();
                 if let ay_core::term::Symbol::Named(name) = &sym {
                     if name == "select" && new.len() == 2 {
@@ -9136,7 +10481,7 @@ impl Executor {
                 }
             }
             TermData::Not(inner) => {
-                let ni = self.fold_const_array_selects_rec(inner, pins);
+                let ni = self.fold_const_array_selects_rec(inner, pins, memo);
                 if ni == inner {
                     term
                 } else {
@@ -9145,9 +10490,9 @@ impl Executor {
             }
             TermData::Ite(c, t, e) => {
                 let (nc, nt, ne) = (
-                    self.fold_const_array_selects_rec(c, pins),
-                    self.fold_const_array_selects_rec(t, pins),
-                    self.fold_const_array_selects_rec(e, pins),
+                    self.fold_const_array_selects_rec(c, pins, memo),
+                    self.fold_const_array_selects_rec(t, pins, memo),
+                    self.fold_const_array_selects_rec(e, pins, memo),
                 );
                 if nc == c && nt == t && ne == e {
                     term
@@ -9157,7 +10502,7 @@ impl Executor {
             }
             TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
                 let is_forall = matches!(self.ctx.terms.get(term), TermData::Forall(..));
-                let nb = self.fold_const_array_selects_rec(body, pins);
+                let nb = self.fold_const_array_selects_rec(body, pins, memo);
                 if nb == body {
                     term
                 } else {
@@ -9175,12 +10520,31 @@ impl Executor {
     /// through an existential unchanged). Sound and equivalence-preserving. Lifts a
     /// deep binder-independent atom to the enclosing scope so the infeasibility
     /// rewrite can see it as a top-level conjunct of an OUTER universal.
-    fn hoist_binder_independent_conjuncts(&mut self, term: TermId) -> TermId {
+    /// Memoized per TermId, like [`Self::drop_unused_bound_vars`]: the rewrite
+    /// is a function of the term, so a shared subterm is rewritten once.
+    fn hoist_binder_independent_conjuncts(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&done) = memo.get(&term) {
+            return done;
+        }
+        let result = self.hoist_binder_independent_conjuncts_uncached(term, memo);
+        memo.insert(term, result);
+        result
+    }
+
+    fn hoist_binder_independent_conjuncts_uncached(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
         match self.ctx.terms.get(term).clone() {
             TermData::App(sym, args) => {
                 let new: Vec<TermId> = args
                     .iter()
-                    .map(|&a| self.hoist_binder_independent_conjuncts(a))
+                    .map(|&a| self.hoist_binder_independent_conjuncts(a, memo))
                     .collect();
                 if new == args {
                     term
@@ -9190,7 +10554,7 @@ impl Executor {
                 }
             }
             TermData::Not(i) => {
-                let ni = self.hoist_binder_independent_conjuncts(i);
+                let ni = self.hoist_binder_independent_conjuncts(i, memo);
                 if ni == i {
                     term
                 } else {
@@ -9199,9 +10563,9 @@ impl Executor {
             }
             TermData::Ite(c, t, e) => {
                 let (nc, nt, ne) = (
-                    self.hoist_binder_independent_conjuncts(c),
-                    self.hoist_binder_independent_conjuncts(t),
-                    self.hoist_binder_independent_conjuncts(e),
+                    self.hoist_binder_independent_conjuncts(c, memo),
+                    self.hoist_binder_independent_conjuncts(t, memo),
+                    self.hoist_binder_independent_conjuncts(e, memo),
                 );
                 if nc == c && nt == t && ne == e {
                     term
@@ -9211,7 +10575,7 @@ impl Executor {
             }
             TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
                 let is_forall = matches!(self.ctx.terms.get(term), TermData::Forall(..));
-                let nb = self.hoist_binder_independent_conjuncts(body);
+                let nb = self.hoist_binder_independent_conjuncts(body, memo);
                 let mut conjs = Vec::new();
                 collect_and_conjuncts(&self.ctx.terms, nb, &mut conjs);
                 if conjs.len() < 2 {
@@ -9248,7 +10612,7 @@ impl Executor {
                 self.ctx.terms.mk_and(out)
             }
             TermData::Let(bindings, body) => {
-                let nb = self.hoist_binder_independent_conjuncts(body);
+                let nb = self.hoist_binder_independent_conjuncts(body, memo);
                 if nb == body {
                     term
                 } else {
@@ -9283,12 +10647,31 @@ impl Executor {
     /// inner `(forall z (and (= x (+ (* 3 b) z)) ...))` of a forall-exists-forall
     /// alternation that no existential witness can repair
     /// (#quant-inner-forall-infeasible-eq).
-    fn simplify_infeasible_forall_eq(&mut self, term: TermId) -> TermId {
+    /// Memoized per TermId, like [`Self::drop_unused_bound_vars`]: the rewrite
+    /// is a function of the term, so a shared subterm is rewritten once.
+    fn simplify_infeasible_forall_eq(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&done) = memo.get(&term) {
+            return done;
+        }
+        let result = self.simplify_infeasible_forall_eq_uncached(term, memo);
+        memo.insert(term, result);
+        result
+    }
+
+    fn simplify_infeasible_forall_eq_uncached(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
         match self.ctx.terms.get(term).clone() {
             TermData::App(sym, args) => {
                 let new: Vec<TermId> = args
                     .iter()
-                    .map(|&a| self.simplify_infeasible_forall_eq(a))
+                    .map(|&a| self.simplify_infeasible_forall_eq(a, memo))
                     .collect();
                 if new == args {
                     term
@@ -9298,7 +10681,7 @@ impl Executor {
                 }
             }
             TermData::Not(i) => {
-                let ni = self.simplify_infeasible_forall_eq(i);
+                let ni = self.simplify_infeasible_forall_eq(i, memo);
                 if ni == i {
                     term
                 } else {
@@ -9307,9 +10690,9 @@ impl Executor {
             }
             TermData::Ite(c, t, e) => {
                 let (nc, nt, ne) = (
-                    self.simplify_infeasible_forall_eq(c),
-                    self.simplify_infeasible_forall_eq(t),
-                    self.simplify_infeasible_forall_eq(e),
+                    self.simplify_infeasible_forall_eq(c, memo),
+                    self.simplify_infeasible_forall_eq(t, memo),
+                    self.simplify_infeasible_forall_eq(e, memo),
                 );
                 if nc == c && nt == t && ne == e {
                     term
@@ -9318,17 +10701,18 @@ impl Executor {
                 }
             }
             TermData::Forall(vars, body, triggers) => {
-                let nb = self.simplify_infeasible_forall_eq(body);
-                if self.forall_has_infeasible_linear_eq(nb, &vars) {
-                    return self.ctx.terms.mk_bool(false);
-                }
+                let nb = self.simplify_infeasible_forall_eq(body, memo);
+                // Affine conjuncts lose their Int binders exactly:
+                // `∀v. (c·v + r REL 0)` is `c = 0 ∧ r REL 0`.
+                let nb = self.eliminate_affine_binder_conjuncts(nb, &vars);
                 // Disjunction-infeasible: `(forall v. (or A(v) B))` where EVERY
-                // binder-DEPENDENT disjunct is a binder-infeasible linear equality
-                // and the rest are binder-INDEPENDENT equals `(or <indep>)` —
-                // `∀v.(or Ai(v) Bj) = (∀v.(or Ai)) ∨ (or Bj)`, and a finite union
-                // of single-point exceptions cannot cover the infinite Int domain,
-                // so `(∀v.(or Ai))` is false. Computed DIRECTLY (no intermediate
-                // forall-in-disjunction, which the instantiation loop mishandles).
+                // binder-DEPENDENT disjunct is an affine equality and the rest
+                // are binder-INDEPENDENT equals `(or <indep>)` plus, for each
+                // equality whose coefficient is not a numeral, the case where
+                // it holds identically — a finite union of single-point
+                // exceptions cannot cover the infinite Int domain. Computed
+                // DIRECTLY (no intermediate forall-in-disjunction, which the
+                // instantiation loop mishandles).
                 if let Some(reduced) = self.forall_or_drop_infeasible_disjuncts(nb, &vars) {
                     return reduced;
                 }
@@ -9339,13 +10723,22 @@ impl Executor {
                     return nb;
                 }
                 if nb == body {
-                    term
+                    return term;
+                }
+                // The elimination can leave binders the body no longer
+                // mentions; over SMT-LIB's non-empty sorts they drop, and a
+                // body free of every binder is the formula itself.
+                let live = self.binders_mentioned_in(nb, &vars);
+                if live.is_empty() {
+                    nb
+                } else if live.len() < vars.len() {
+                    self.ctx.terms.mk_forall(live, nb)
                 } else {
                     self.ctx.terms.mk_forall_with_triggers(vars, nb, triggers)
                 }
             }
             TermData::Exists(vars, body, triggers) => {
-                let nb = self.simplify_infeasible_forall_eq(body);
+                let nb = self.simplify_infeasible_forall_eq(body, memo);
                 // `(exists x <bool const>)` = that constant over a non-empty sort.
                 if let TermData::Const(ay_core::Constant::Bool(_)) = self.ctx.terms.get(nb) {
                     return nb;
@@ -9357,7 +10750,7 @@ impl Executor {
                 }
             }
             TermData::Let(bindings, body) => {
-                let nb = self.simplify_infeasible_forall_eq(body);
+                let nb = self.simplify_infeasible_forall_eq(body, memo);
                 if nb == body {
                     term
                 } else {
@@ -9368,102 +10761,10 @@ impl Executor {
         }
     }
 
-    /// True when a top-level conjunct of `body` is an `Int` equality `(= L R)`
-    /// whose `L - R` is LINEAR in some binder of `vars` with a nonzero constant
-    /// coefficient (so `(forall <that binder>. (= L R))` is false). The
-    /// coefficient is read by the same `d[v:=1] - d[v:=0]` probe as the FM
-    /// projection; a non-constant result (binder under a UF / nonlinear) is
-    /// skipped — fail open (never a wrong rewrite).
-    fn forall_has_infeasible_linear_eq(
-        &mut self,
-        body: TermId,
-        vars: &[(String, ay_core::Sort)],
-    ) -> bool {
-        let mut conjuncts = Vec::new();
-        collect_and_conjuncts(&self.ctx.terms, body, &mut conjuncts);
-        // `collect_and_conjuncts` only descends an `and`; a body that is itself a
-        // single atom (e.g. a bare `(= L R)` or a single disjunct) is the lone
-        // conjunct.
-        if conjuncts.is_empty() {
-            conjuncts.push(body);
-        }
-        // Conjunct position: a single conjunct false at SOME v makes the whole
-        // `(forall v. (and ..))` false, so inequalities are admissible here (a
-        // nonzero-coefficient inequality is false at an extreme v).
-        conjuncts
-            .into_iter()
-            .any(|c| self.atom_is_binder_infeasible(c, vars, true))
-    }
-
-    /// True when `c` is an `Int` (in)equality `(REL L R)` (`REL ∈ {=,<,<=,>,>=}`)
-    /// whose `L - R` has a NONZERO coefficient in some binder of `vars`, so
-    /// `(forall <that binder>. c)` is false. For `=` the difference is not
-    /// identically zero (fails at some v); for an inequality a nonzero
-    /// v-coefficient makes `L-R` UNBOUNDED in v, so it crosses 0 and violates the
-    /// bound at an extreme v. The coefficient is `d[v:=1] - d[v:=0]` evaluated with
-    /// every OTHER free Int atom (Var or 0-ary constant) set to 0 — independent of
-    /// them — so the probe folds even with a term like `(* x 4)`. A non-constant
-    /// residue (binder under a UF / nonlinear in another var) yields no firing —
-    /// fail open, never a wrong rewrite.
-    fn atom_is_binder_infeasible(
-        &mut self,
-        c: TermId,
-        vars: &[(String, ay_core::Sort)],
-        allow_inequalities: bool,
-    ) -> bool {
-        let TermData::App(sym, args) = self.ctx.terms.get(c).clone() else {
-            return false;
-        };
-        let ineq = matches!(sym.name(), "<" | "<=" | ">" | ">=");
-        if !(sym.name() == "=" || (allow_inequalities && ineq)) || args.len() != 2 {
-            return false;
-        }
-        if !matches!(self.ctx.terms.sort(args[0]), ay_core::Sort::Int) {
-            return false;
-        }
-        let zero = self.ctx.terms.mk_int(num_bigint::BigInt::from(0));
-        let one = self.ctx.terms.mk_int(num_bigint::BigInt::from(1));
-        let d = self.ctx.terms.mk_sub(vec![args[0], args[1]]);
-        for (name, sort) in vars {
-            if !matches!(sort, ay_core::Sort::Int) {
-                continue;
-            }
-            // The parser creates fresh per-scope bound vars, so `mk_var(name)`
-            // does NOT recover the body's binder; find its actual hash-consed
-            // `Var(name, _)` TermId inside the difference instead.
-            let Some(v) = self.find_bound_var_id(d, name) else {
-                continue;
-            };
-            if !self.term_contains_id(d, v) {
-                continue;
-            }
-            // SOUNDNESS: the v-coefficient is only well-defined (and the UF-app
-            // zeroing in int_const_zeroing_vars only sound) when v occurs PURELY
-            // ARITHMETICALLY. If v sits under an uninterpreted/other app (e.g.
-            // `z + f(z)`), then `f(1)` and `f(0)` differ and zeroing both would
-            // manufacture a spurious nonzero coefficient (f could be `-z`, making
-            // the universal SAT). Skip that binder.
-            if self.var_under_nonarith(d, v) {
-                continue;
-            }
-            let d1 = self.subst_term(d, v, one);
-            let d0 = self.subst_term(d, v, zero);
-            let (Some(c1), Some(c0)) = (
-                self.int_const_zeroing_vars(d1),
-                self.int_const_zeroing_vars(d0),
-            ) else {
-                continue;
-            };
-            if c1 != c0 {
-                return true;
-            }
-        }
-        false
-    }
-
     /// True when binder `v` has any NON-AFFINE occurrence in `root` — i.e. the
-    /// `d[v:=1] - d[v:=0]` probe in `atom_is_binder_infeasible` would NOT measure
-    /// a genuine linear coefficient.
+    /// `d[v:=1] - d[v:=0]` probes of the Skolem projections would NOT measure
+    /// a genuine linear coefficient. (The infeasible-universal rewrite reads
+    /// affinity itself, `affine_binder_probe`.)
     ///
     /// SOUNDNESS (S2 wrong-UNSAT closure, 2026-07-08): the probe's argument ("a
     /// nonzero v-coefficient makes `L-R` unbounded in v, so it crosses 0") is
@@ -9518,114 +10819,6 @@ impl Executor {
         false
     }
 
-    /// Substitute every Int-sorted `Var` in `term` with 0 (folding) and return the
-    /// resulting integer constant, or `None` if a non-constant residue remains
-    /// (e.g. an uninterpreted application). Used to read a v-free coefficient term
-    /// reliably regardless of which other free variables it mentions.
-    fn int_const_zeroing_vars(&mut self, term: TermId) -> Option<num_bigint::BigInt> {
-        let mut vars: Vec<TermId> = Vec::new();
-        let mut stack = vec![term];
-        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
-        while let Some(t) = stack.pop() {
-            if !seen.insert(t) {
-                continue;
-            }
-            let is_int = matches!(self.ctx.terms.sort(t), ay_core::Sort::Int);
-            match self.ctx.terms.get(t) {
-                // A free Int atom (a bound/free Var or a 0-ary declared constant)
-                // is independent of the binder's coefficient, so zero it.
-                TermData::Var(_, _) if is_int => {
-                    if !vars.contains(&t) {
-                        vars.push(t);
-                    }
-                }
-                // An Int-sorted application: recurse into ARITHMETIC operators
-                // (their args may hold the binder/atoms), but treat any OTHER Int
-                // app (a declared 0-ary constant, an uninterpreted `(g ..)`, a
-                // `seq.len`, etc.) as an OPAQUE atom and zero it. Since this is
-                // called on `d[v:=1]`/`d[v:=0]` — the binder is already substituted
-                // out — every such app is binder-free, so zeroing it is exact for
-                // the v-coefficient and lets `g(-1,b-y) - z` resolve coeff -1.
-                TermData::App(sym, args)
-                    if is_int && matches!(sym.name(), "+" | "-" | "*" | "div" | "mod" | "abs") =>
-                {
-                    stack.extend(args.iter().copied());
-                }
-                TermData::App(_, _) if is_int => {
-                    if !vars.contains(&t) {
-                        vars.push(t);
-                    }
-                }
-                TermData::App(_, args) => stack.extend(args.iter().copied()),
-                TermData::Not(i) => stack.push(*i),
-                TermData::Ite(c, a, b) => {
-                    stack.push(*c);
-                    stack.push(*a);
-                    stack.push(*b);
-                }
-                _ => {}
-            }
-        }
-        let zero = self.ctx.terms.mk_int(num_bigint::BigInt::from(0));
-        let mut t = term;
-        for v in vars {
-            t = self.subst_term(t, v, zero);
-        }
-        match self.ctx.terms.get(t) {
-            TermData::Const(ay_core::Constant::Int(n)) => Some(n.clone()),
-            _ => None,
-        }
-    }
-
-    /// For `(forall vars. (or operands))`: when EVERY binder-dependent operand is a
-    /// binder-infeasible linear equality, return `(or <binder-independent operands>)`
-    /// (or `false` if none remain) — the universal of the infeasible disjuncts is
-    /// false (finite single-point exceptions can't cover the infinite Int domain),
-    /// so it drops out. Returns `None` (keep the forall) if the body is not an `or`,
-    /// nothing infeasible drops, or a binder-dependent operand cannot be proven
-    /// infeasible. Computing the result here — rather than hoisting `(∀v.(or Ai))`
-    /// into a disjunction — avoids leaving a forall in a non-conjunctive position,
-    /// where the instantiation loop conjoins instances unsoundly (#quant-or-infeasible).
-    fn forall_or_drop_infeasible_disjuncts(
-        &mut self,
-        body: TermId,
-        vars: &[(String, ay_core::Sort)],
-    ) -> Option<TermId> {
-        let TermData::App(sym, args) = self.ctx.terms.get(body).clone() else {
-            return None;
-        };
-        if sym.name() != "or" || args.len() < 2 {
-            return None;
-        }
-        let mut indep: Vec<TermId> = Vec::new();
-        let mut dropped_any = false;
-        for op in args {
-            let mentions = vars.iter().any(|(n, _)| self.term_mentions_name(op, n));
-            if !mentions {
-                indep.push(op);
-            } else if self.atom_is_binder_infeasible(op, vars, false) {
-                // EQUALITY disjuncts only: an infeasible equality is true at <=1
-                // point, so a finite set of them can't cover the infinite domain
-                // and `(forall v. (or eqs))` is false. An INEQUALITY is true on a
-                // half-line, so dropping it would be UNSOUND (e.g.
-                // `(forall z. (or (> z 5) (<= z 6)))` is TRUE) — excluded here.
-                dropped_any = true;
-            } else {
-                return None;
-            }
-        }
-        if !dropped_any {
-            return None;
-        }
-        Some(if indep.is_empty() {
-            self.ctx.terms.mk_bool(false)
-        } else if indep.len() == 1 {
-            indep[0]
-        } else {
-            self.ctx.terms.mk_or(indep)
-        })
-    }
-
     /// Find the hash-consed `TermData::Var(name, _)` TermId for binder `name`
     /// inside `root` (all occurrences of a bound var in a body share one TermId).
     fn find_bound_var_id(&self, root: TermId, name: &str) -> Option<TermId> {
@@ -9656,12 +10849,34 @@ impl Executor {
         None
     }
 
-    fn drop_unused_bound_vars(&mut self, term: TermId) -> TermId {
+    /// Memoized per TermId: the walk visits each distinct subterm once. The
+    /// unmemoized walk re-walked every shared subterm once per path to it,
+    /// exponential on a DAG: on AUFBV Alive2 `ph7__532_ph7` it was still
+    /// inside this function when the `-T:10` deadline fired, and it polls no
+    /// stop, so the run ended in the 2 s hard exit with no statistics.
+    fn drop_unused_bound_vars(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&done) = memo.get(&term) {
+            return done;
+        }
+        let result = self.drop_unused_bound_vars_uncached(term, memo);
+        memo.insert(term, result);
+        result
+    }
+
+    fn drop_unused_bound_vars_uncached(
+        &mut self,
+        term: TermId,
+        memo: &mut ay_core::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
         match self.ctx.terms.get(term).clone() {
             TermData::App(sym, args) => {
                 let new_args: Vec<TermId> = args
                     .iter()
-                    .map(|&a| self.drop_unused_bound_vars(a))
+                    .map(|&a| self.drop_unused_bound_vars(a, memo))
                     .collect();
                 if new_args == args {
                     term
@@ -9671,7 +10886,7 @@ impl Executor {
                 }
             }
             TermData::Not(inner) => {
-                let ni = self.drop_unused_bound_vars(inner);
+                let ni = self.drop_unused_bound_vars(inner, memo);
                 if ni == inner {
                     term
                 } else {
@@ -9680,9 +10895,9 @@ impl Executor {
             }
             TermData::Ite(c, t, e) => {
                 let (nc, nt, ne) = (
-                    self.drop_unused_bound_vars(c),
-                    self.drop_unused_bound_vars(t),
-                    self.drop_unused_bound_vars(e),
+                    self.drop_unused_bound_vars(c, memo),
+                    self.drop_unused_bound_vars(t, memo),
+                    self.drop_unused_bound_vars(e, memo),
                 );
                 if nc == c && nt == t && ne == e {
                     term
@@ -9691,7 +10906,7 @@ impl Executor {
                 }
             }
             TermData::Forall(vars, body, triggers) => {
-                let nb = self.drop_unused_bound_vars(body);
+                let nb = self.drop_unused_bound_vars(body, memo);
                 let kept: Vec<(String, ay_core::Sort)> = vars
                     .iter()
                     .filter(|(n, _)| self.term_mentions_name(nb, n))
@@ -9709,7 +10924,7 @@ impl Executor {
                     .mk_forall_with_triggers(kept, nb, new_triggers)
             }
             TermData::Exists(vars, body, triggers) => {
-                let nb = self.drop_unused_bound_vars(body);
+                let nb = self.drop_unused_bound_vars(body, memo);
                 let kept: Vec<(String, ay_core::Sort)> = vars
                     .iter()
                     .filter(|(n, _)| self.term_mentions_name(nb, n))
@@ -9729,9 +10944,9 @@ impl Executor {
             TermData::Let(bindings, body) => {
                 let new_bindings: Vec<(String, TermId)> = bindings
                     .iter()
-                    .map(|(n, v)| (n.clone(), self.drop_unused_bound_vars(*v)))
+                    .map(|(n, v)| (n.clone(), self.drop_unused_bound_vars(*v, memo)))
                     .collect();
-                let nb = self.drop_unused_bound_vars(body);
+                let nb = self.drop_unused_bound_vars(body, memo);
                 if new_bindings == bindings && nb == body {
                     term
                 } else {
@@ -9769,27 +10984,51 @@ impl Executor {
     /// True when `name` occurs as a `Var` anywhere in `term`. Does not stop at
     /// shadowing inner quantifiers — that only CONSERVES the binder (never wrongly
     /// drops it), so the rewrite stays sound.
+    /// The binders of `vars` that `body` mentions, in binder order.
+    fn binders_mentioned_in(
+        &self,
+        body: TermId,
+        vars: &[(String, ay_core::Sort)],
+    ) -> Vec<(String, ay_core::Sort)> {
+        vars.iter()
+            .filter(|(n, _)| self.term_mentions_name(body, n))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a `Var` named `name` is reachable from `term`, through the same
+    /// children as always (arguments, `not`, `ite`, quantifier and `let`
+    /// bodies, `let` values). Visits each distinct subterm once: the recursive
+    /// form re-walked shared subterms once per path.
     fn term_mentions_name(&self, term: TermId, name: &str) -> bool {
-        match self.ctx.terms.get(term) {
-            TermData::Var(n, _) => n == name,
-            TermData::App(_, args) => args.iter().any(|&a| self.term_mentions_name(a, name)),
-            TermData::Not(i) => self.term_mentions_name(*i, name),
-            TermData::Ite(c, t, e) => {
-                self.term_mentions_name(*c, name)
-                    || self.term_mentions_name(*t, name)
-                    || self.term_mentions_name(*e, name)
+        let mut stack = vec![term];
+        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
             }
-            TermData::Forall(_, b, _) | TermData::Exists(_, b, _) => {
-                self.term_mentions_name(*b, name)
+            match self.ctx.terms.get(t) {
+                TermData::Var(n, _) => {
+                    if n == name {
+                        return true;
+                    }
+                }
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(i) => stack.push(*i),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::Forall(_, b, _) | TermData::Exists(_, b, _) => stack.push(*b),
+                TermData::Let(bindings, b) => {
+                    stack.extend(bindings.iter().map(|(_, v)| *v));
+                    stack.push(*b);
+                }
+                _ => {}
             }
-            TermData::Let(bindings, b) => {
-                bindings
-                    .iter()
-                    .any(|(_, v)| self.term_mentions_name(*v, name))
-                    || self.term_mentions_name(*b, name)
-            }
-            _ => false,
         }
+        false
     }
 
     /// `(= A (* k T))`: true when `A` is an Int constant, the product side is
@@ -10151,6 +11390,29 @@ impl Executor {
     /// scaled/combined expression of the free variables that the per-variable
     /// offset bases cannot reach. Instantiating the binder at `boundary + k` makes
     /// the critical atom flip, exposing the conflict. Real instances ⇒ sound.
+    ///
+    /// # The boundary of a NON-UNIT coefficient is an integer `div`
+    ///
+    /// For `|c| >= 2` the flip point `-rest/c` is not an integer, so the arm
+    /// below takes the nearest integer below it with SMT-LIB `div`
+    /// ([`TermStore::mk_intdiv`]), whose divisor here is the non-zero constant
+    /// `|c|`, so `div`-by-zero's underspecification never arises.
+    ///
+    /// It used to build that point with [`TermStore::mk_div`], the REALS `/`:
+    /// that builds `App("/", [Int, Int])` and interns it at `Sort::Real`, so
+    /// the integer instantiation point for an `Int` binder came out
+    /// `Real`-sorted over `Int` operands — a term whose declared sort
+    /// contradicts its own arguments. `mk_div`'s `debug_assert!` exists for
+    /// exactly that and FIRED, aborting any DEBUG build (which is every test
+    /// run in this repo) on an ordinary quantified LIA query: `(f c) = 0` with
+    /// `∀q. (f q) > 0 ∨ 3·q <= 7` reaches this arm with `c = 3`. In a release
+    /// build the assertion is compiled out and the ill-sorted term was
+    /// substituted for the binder instead, so the instance this arm exists to
+    /// produce was never the integer point either way.
+    /// `executor_tests::quantifier::binder_boundary_sorts` pins the shape.
+    ///
+    /// [`TermStore::mk_div`]: ay_core::TermStore::mk_div
+    /// [`TermStore::mk_intdiv`]: ay_core::TermStore::mk_intdiv
     fn atom_boundary_binder_bases(&mut self, body: TermId, bound_name: &str) -> Vec<TermId> {
         use ay_core::kani_compat::DetHashSet as HashSet;
         const MAX_BASES: usize = 6;
@@ -10217,17 +11479,18 @@ impl Executor {
             } else if c == num_bigint::BigInt::from(-1) {
                 d0 // rest
             } else if !c.is_zero() {
-                // DIVISIBILITY boundary: integer point nearest the rational flip
-                // `-rest/c`, via `div`. The ±k window around it (in the caller)
-                // covers the residue classes for small |c|. `div`'s constant
-                // divisor keeps this a real integer instantiation point.
+                // DIVISIBILITY boundary: integer point nearest the rational
+                // flip `-rest/c`, via SMT-LIB `div` (`mk_intdiv` — NOT the
+                // Reals `/`; see this function's doc comment for the debug
+                // abort that came of confusing the two). The ±k window around
+                // it (in the caller) covers the residue classes for small |c|.
                 let (num, den) = if c > num_bigint::BigInt::zero() {
                     (self.ctx.terms.mk_sub(vec![zero, d0]), c.clone()) // (-rest)/c
                 } else {
                     (d0, -c.clone()) // rest/|c|
                 };
                 let den_t = self.ctx.terms.mk_int(den);
-                self.ctx.terms.mk_div(num, den_t)
+                self.ctx.terms.mk_intdiv(num, den_t)
             } else {
                 continue;
             };
@@ -10790,6 +12053,7 @@ mod rebuild_tests {
         let mut exec = load_assertions(
             r#"
                 (set-logic QF_LIA)
+                (set-option :produce-models true)
                 (declare-const x Int)
                 (assert (= x 1))
             "#,
@@ -11041,6 +12305,13 @@ mod rebuild_tests {
         assert_eq!(result, Some(()));
         assert!(installed_model_satisfies_roots(&exec, &roots));
         assert!(exec.last_model_validated);
+        let get_value = ay_frontend::parse("(get-value (x))").expect("valid public model read");
+        assert_eq!(
+            exec.execute_all(&get_value)
+                .expect("read transported model"),
+            vec!["((x 1))"],
+            "the transferred model must be readable under the restored outer query",
+        );
         assert_eq!(
             exec.last_validation_stats
                 .as_ref()
@@ -12023,6 +13294,32 @@ mod rebuild_tests {
             !grant.is_current(&exec),
             "changing any certified interpretation revokes the exact model identity"
         );
+    }
+
+    #[test]
+    fn checked_cegqi_recompletion_cannot_replace_missing_original_owner() {
+        let mut exec = load_assertions(
+            r#"(set-logic ALL) (declare-fun rem (Int Int) Int)
+            (assert (forall ((x Int)) (= (rem x 2) 0)))"#,
+        );
+        assert_eq!(execute_authored_check_sat(&mut exec), "sat");
+        let grant = exec.cegqi_uf_recompletion_grant.take().unwrap();
+        let mut model = exec.last_model.take().unwrap();
+        assert!(model.carries_cegqi_uf_recompletion(&grant.model_epoch));
+        model.clear_construction_owner_for_test();
+        assert!(
+            model.carries_cegqi_uf_recompletion(&grant.model_epoch),
+            "accounting removal does not remint or revoke the original semantic seal"
+        );
+        let completion = CegqiUfRecompletion {
+            bindings: grant.bindings,
+            model: Box::new(model),
+            model_epoch: grant.model_epoch,
+            model_definition: grant.model_definition,
+        };
+        assert!(CegqiUfRecompletionGrant::from_checked(&exec, grant.roots, completion).is_none());
+        assert!(exec.cegqi_uf_recompletion_grant.is_none());
+        assert!(exec.last_model.is_none());
     }
 
     #[test]
@@ -13164,6 +14461,195 @@ mod rebuild_tests {
         assert_eq!(terms.sort(bv_term), &bv8);
     }
 
+    /// (#degrade277-narrow) The `degrade@277` narrowing predicate, on its four
+    /// legs, against a snapshot whose only `forall` really is outside
+    /// top-level conjunctive position.
+    ///
+    /// This is the unit-level differential for the invariant. The gate reads
+    /// the predicate as "keep the distrust", so `true` is the SAFE answer and
+    /// every leg that cannot establish the premise is false must return it.
+    fn nonconjunctive_forall_fixture() -> (Executor, Vec<TermId>, TermId) {
+        // `(forall x. q x)` sits under a POSITIVE `or` whose sibling disjunct
+        // is not falsified by any unit fact, so it is outside conjunctive
+        // position on both walks — and nothing entails it.
+        let mut exec = load_assertions(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun c () Int)
+                (declare-fun p (Int) Bool)
+                (declare-fun q (Int) Bool)
+                (assert (or (p c) (forall ((x Int)) (q x))))
+                (assert (not (q c)))
+            "#,
+        );
+        let snapshot = exec.ctx.assertions.clone();
+        let mut quants: Vec<TermId> = Vec::new();
+        for &a in &snapshot {
+            crate::ematching::collect_quantifiers(&mut exec.ctx.terms, a, &mut quants);
+        }
+        let forall = *quants
+            .iter()
+            .find(|&&q| matches!(exec.ctx.terms.get(q), TermData::Forall(..)))
+            .expect("fixture must surface a forall");
+        assert!(
+            exec.snapshot_has_nonconjunctive_forall(&snapshot),
+            "fixture is pointless unless the OLD gate would fire on it"
+        );
+        (exec, snapshot, forall)
+    }
+
+    #[test]
+    fn degrade_277_narrowing_fails_closed_without_a_recorded_authority() {
+        let (mut exec, snapshot, _) = nonconjunctive_forall_fixture();
+        exec.entailed_forall_authority = None;
+        exec.unlicensed_instance_conjoined = false;
+        assert!(
+            exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "no lane recorded what it was licensed to conjoin, so the gate has \
+             no evidence its premise is false and MUST keep the distrust"
+        );
+    }
+
+    #[test]
+    fn degrade_277_narrowing_declines_after_an_unlicensed_conjoin() {
+        let (mut exec, snapshot, _) = nonconjunctive_forall_fixture();
+        // The recorded authority says nothing was entailed — the narrow leg —
+        // but an MBQI push conjoined an instance outside that licence.
+        exec.entailed_forall_authority = Some(Default::default());
+        exec.unlicensed_instance_conjoined = true;
+        assert!(
+            exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "an unlicensed conjoin (the MBQI counterexample lanes) must poison \
+             the narrowing for the rest of the query — this is the audit \
+             obligation, enforced by observation rather than by call ordering"
+        );
+    }
+
+    #[test]
+    fn degrade_277_narrowing_declines_when_the_nonconjunctive_forall_is_entailed() {
+        let (mut exec, snapshot, forall) = nonconjunctive_forall_fixture();
+        let mut authority: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        authority.insert(forall);
+        exec.entailed_forall_authority = Some(authority);
+        exec.unlicensed_instance_conjoined = false;
+        assert!(
+            exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "a universal that some lane treated as ENTAILED could have had an \
+             instance conjoined wherever it sits, so the distrust stands — \
+             this is exactly the case a `not proxied` invariant would have \
+             narrowed away, because `purify_quantifier_atoms` proxies entailed \
+             quantifiers too"
+        );
+    }
+
+    #[test]
+    fn degrade_277_narrowing_fires_only_when_no_nonconjunctive_forall_is_entailed() {
+        let (mut exec, snapshot, _) = nonconjunctive_forall_fixture();
+        exec.entailed_forall_authority = Some(Default::default());
+        exec.unlicensed_instance_conjoined = false;
+        assert!(
+            !exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "every lane recorded its licence and none of them covered a \
+             non-conjunctive universal, so no instance of one was conjoined \
+             and the gate's premise is false"
+        );
+    }
+
+    /// A snapshot `(=> g (forall x. q x))` plus `guard_assertion`, and the
+    /// universal's `TermId`, recorded as the only licensed universal.
+    fn guarded_forall_fixture(guard_assertion: &str) -> (Executor, Vec<TermId>, TermId) {
+        let mut exec = load_assertions(&format!(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun c () Int)
+                (declare-fun g () Bool)
+                (declare-fun h () Bool)
+                (declare-fun q (Int) Bool)
+                (assert (=> g (forall ((x Int)) (q x))))
+                {guard_assertion}
+            "#
+        ));
+        let snapshot = exec.ctx.assertions.clone();
+        let mut quants: Vec<TermId> = Vec::new();
+        for &a in &snapshot {
+            crate::ematching::collect_quantifiers(&mut exec.ctx.terms, a, &mut quants);
+        }
+        let forall = *quants
+            .iter()
+            .find(|&&q| matches!(exec.ctx.terms.get(q), TermData::Forall(..)))
+            .expect("fixture must surface a forall");
+        let mut authority: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        authority.insert(forall);
+        exec.entailed_forall_authority = Some(authority);
+        exec.unlicensed_instance_conjoined = false;
+        (exec, snapshot, forall)
+    }
+
+    /// (#degrade277-unit-harvest) The guard is a conjunct of an asserted `and`
+    /// — Verus's negated goal — which the licence's `UnitFacts` harvest reads
+    /// as a unit. The narrowing takes the same harvest, so the licensed
+    /// universal no longer vetoes the refutation. The SAT-side predicate is
+    /// deliberately untouched: it still reads the universal as
+    /// non-conjunctive.
+    #[test]
+    fn degrade_277_narrowing_reads_units_through_an_asserted_conjunction() {
+        let (mut exec, snapshot, forall) = guarded_forall_fixture("(assert (and g (not (q c))))");
+        assert!(
+            !exec
+                .forall_ids_in_conjunctive_position(&snapshot)
+                .contains(&forall),
+            "the SAT-side predicate must read exactly what it read before"
+        );
+        assert!(
+            !exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "`g` is a conjunct of an asserted `and`, so `(=> g (forall ...))` \
+             makes the universal a top-level consequence and its licensed \
+             instances are sound"
+        );
+    }
+
+    /// (#degrade277-unit-harvest) The control: the guard sits under an `or`
+    /// inside the asserted conjunction, so it is NOT a unit and the problem
+    /// does not entail the universal. Even with the universal recorded as
+    /// licensed — a licence bug — the narrowing must keep the distrust.
+    #[test]
+    fn degrade_277_narrowing_keeps_the_distrust_for_a_guard_under_a_disjunction() {
+        let (mut exec, snapshot, _) = guarded_forall_fixture("(assert (and (or g h) (not (q c))))");
+        assert!(
+            exec.nonconjunctive_forall_may_have_been_conjoined(&snapshot),
+            "`(or g h)` does not entail `g`, so the guarded universal is not a \
+             consequence and an instance of it may have manufactured the \
+             refutation"
+        );
+    }
+
+    #[test]
+    fn entailed_forall_authority_unions_across_lanes_and_starts_unset() {
+        let mut exec = Executor::new();
+        assert!(
+            exec.entailed_forall_authority.is_none(),
+            "unset is the fail-closed initial state, distinct from empty"
+        );
+        let a = TermId::new(7);
+        let b = TermId::new(11);
+        let mut first: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        first.insert(a);
+        exec.record_entailed_forall_authority(&first);
+        let mut second: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
+        second.insert(b);
+        exec.record_entailed_forall_authority(&second);
+        let got = exec
+            .entailed_forall_authority
+            .as_ref()
+            .expect("recorded")
+            .clone();
+        assert!(
+            got.contains(&a) && got.contains(&b) && got.len() == 2,
+            "each lane's licence is folded in, never replaced: a round that \
+             entailed less must not erase what an earlier round entailed"
+        );
+    }
+
     #[test]
     fn pin_eval_const_rejects_incompatible_value_sort_pairs() {
         let mut terms = TermStore::new();
@@ -13181,5 +14667,53 @@ mod rebuild_tests {
             },
         )
         .is_none());
+    }
+
+    #[test]
+    fn core_subset_nomination_defers_only_fresh_sat_completion() {
+        let mut exec = load_assertions("(set-logic QF_LIA) (declare-const x Int) (assert (= x 7))");
+        let snapshot = exec.ctx.assertions.clone();
+        exec.begin_public_solve(false);
+        exec.bind_unsat_query_assumptions(&[]);
+        assert!(exec.last_model.is_none());
+
+        exec.core_subset_nomination = true;
+        assert!(!exec.ensure_snapshot_ground_model_for_completion(&snapshot, LogicCategory::QfLia));
+        assert!(exec.last_model.is_none(), "the nomination minted no model");
+
+        exec.core_subset_nomination = false;
+        assert!(exec.ensure_snapshot_ground_model_for_completion(&snapshot, LogicCategory::QfLia));
+        let terms_before = exec.ctx.terms.len();
+        exec.core_subset_nomination = true;
+        assert!(exec.ensure_snapshot_ground_model_for_completion(&snapshot, LogicCategory::QfLia));
+        assert_eq!(exec.ctx.terms.len(), terms_before);
+        assert!(
+            exec.last_model.is_some(),
+            "an existing checked model stays reusable"
+        );
+    }
+
+    #[test]
+    fn core_subset_nomination_keeps_checked_refutations_and_refusals() {
+        for (script, expected_unsat) in [
+            (
+                "(set-logic QF_LIA) (declare-const x Int) (assert (= x 7)) (assert (= x 8))",
+                true,
+            ),
+            (
+                "(set-logic QF_LIA) (declare-const x Int) (assert (= x 7))",
+                false,
+            ),
+        ] {
+            let mut exec = load_assertions(script);
+            let roots = exec.ctx.assertions.clone();
+            exec.begin_public_solve(false);
+            exec.bind_unsat_query_assumptions(&[]);
+            exec.core_subset_nomination = true;
+            let refuted = exec
+                .checked_exact_unsat_solve(roots.clone(), 2_000)
+                .is_some_and(|checked| checked.consume(&mut exec, &roots));
+            assert_eq!(refuted, expected_unsat, "{script}");
+        }
     }
 }

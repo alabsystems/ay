@@ -6,6 +6,37 @@ use super::*;
 use ay_core::Sort;
 
 #[test]
+fn precision_carries_the_full_reference_exponent_range() {
+    let precision = FpPrecision::from_eb_sb(63, 3);
+    assert_eq!(precision.bias(), (1u64 << 62) - 1);
+    assert_eq!(precision.max_exponent(), (1u64 << 63) - 1);
+}
+
+#[test]
+fn signed_guard_constants_extend_past_the_host_word() {
+    let terms = TermStore::new();
+    let mut solver = FpSolver::new(&terms);
+    let truth = solver.const_true();
+    let falsity = solver.const_false();
+    for value in [i64::MIN, -1, 0, 1] {
+        for width in [3, 64, 65, 80] {
+            let bits = solver.const_bv_signed(value, width);
+            let expected = num_bigint::BigInt::from(value);
+            for (index, bit) in bits.into_iter().enumerate() {
+                assert_eq!(
+                    bit,
+                    if expected.bit(index as u64) {
+                        truth
+                    } else {
+                        falsity
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_fp_precision() {
     assert_eq!(FpPrecision::Float32.exponent_bits(), 8);
     assert_eq!(FpPrecision::Float32.significand_bits(), 24);
@@ -330,4 +361,52 @@ fn set_next_var_moves_the_allocator_so_names_can_survive_a_solve() {
         502,
         "a stale restore rewound the allocator and re-issued an existing name"
     );
+}
+
+/// Two NaN inputs, each converted by `((_ fp.to_ubv 3) rm _)`, with the two
+/// results required to DIFFER; whether that is satisfiable says whether the
+/// encoder related the two unspecified values.
+fn to_ubv_pair_can_differ(
+    x_sort: Sort,
+    y_sort: Sort,
+    x_rm: RoundingMode,
+    y_rm: RoundingMode,
+) -> bool {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", x_sort);
+    let y = terms.mk_var("y", y_sort);
+    let mut solver = FpSolver::new(&terms);
+    let x_nan = solver.bitblast_is_nan(x);
+    let y_nan = solver.bitblast_is_nan(y);
+    let x_bits = solver.bitblast_to_bv(x, x_rm, 3, false);
+    let y_bits = solver.bitblast_to_bv(y, y_rm, 3, false);
+    let equal = solver.make_bits_equal(&x_bits, &y_bits);
+    solver.add_clause(CnfClause::unit(x_nan));
+    solver.add_clause(CnfClause::unit(y_nan));
+    solver.add_clause(CnfClause::unit(-equal));
+    match tests_support::solve_fp_result(&solver) {
+        ay_sat::SatResult::Sat(_) => true,
+        ay_sat::SatResult::Unsat(_) => false,
+        other => panic!("a 3-bit conversion pair must be decided, got {other:?}"),
+    }
+}
+
+/// The unspecified `fp.to_ubv` value is a function of `(rm, x)` in ONE
+/// floating-point format (D7, 2026-09-23 hunt). Congruence relates two
+/// applications only when the mode AND the format are equal: `(3,5)` and
+/// `(4,4)` are both 8 bits wide, but they are two sorts and two conversion
+/// functions (the verifier's `vd7_18`: z3 `sat`). Keyed on the total width
+/// alone (mutant M02), the encoder compared the pair field by field and
+/// panicked on the shorter exponent.
+#[test]
+fn to_ubv_unspecified_congruence_is_per_mode_and_per_format() {
+    use RoundingMode::{RNE, RTZ};
+    let (f35, f44) = (Sort::FloatingPoint(3, 5), Sort::FloatingPoint(4, 4));
+    // One function, equal (NaN) arguments: one value.
+    assert!(!to_ubv_pair_can_differ(f35.clone(), f35.clone(), RNE, RNE));
+    // Two modes: two functions.
+    assert!(to_ubv_pair_can_differ(f35.clone(), f35.clone(), RNE, RTZ));
+    // Two formats of one total width: two functions.
+    assert!(to_ubv_pair_can_differ(f35.clone(), f44.clone(), RNE, RNE));
+    assert!(to_ubv_pair_can_differ(f44, f35, RNE, RNE));
 }

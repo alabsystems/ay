@@ -18,7 +18,7 @@
 #     an UNSAT check with production enabled, and raises honestly otherwise —
 #     never a fabricated proof for sat/unknown or when production was off.
 #
-# Run:  cargo build -p ay-ffi   &&   pytest bindings/python/tests -v
+# Run:  targo --unverified build -p ay-ffi   &&   pytest bindings/python/tests -v
 
 import pytest
 

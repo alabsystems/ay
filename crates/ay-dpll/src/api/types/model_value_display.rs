@@ -11,6 +11,16 @@ use super::{FpSpecialKind, ModelValue};
 impl fmt::Display for ModelValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FloatingPointExact(fields) => {
+                write!(
+                    f,
+                    "{}",
+                    ay_fp::FpModelValue::Exact(fields.clone()).to_smtlib()
+                )
+            }
+            Self::FiniteField { value, field } => {
+                write!(f, "(as ff{value} (_ FiniteField {}))", field.modulus())
+            }
             Self::Bool(b) => write!(f, "{b}"),
             Self::Int(n) => write!(f, "{}", crate::executor_format::format_bigint(n)),
             Self::Real(r) => write!(f, "{}", crate::executor_format::format_rational(r)),
@@ -30,6 +40,13 @@ impl fmt::Display for ModelValue {
             Self::ArraySmtlib(s) => write!(f, "{s}"),
             Self::Array { default, stores } => fmt_array(f, default, stores),
             Self::FloatingPoint {
+                sign,
+                exponent,
+                significand,
+                eb,
+                sb,
+            } => fmt_floating_point(f, sign, exponent, &u128::from(*significand), eb, sb),
+            Self::FloatingPointWide {
                 sign,
                 exponent,
                 significand,
@@ -57,7 +74,7 @@ fn fmt_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
         match c {
             '"' => write!(f, "\"\"")?, // SMT-LIB uses "" for escaped quote
             c if ('\u{20}'..='\u{7e}').contains(&c) => write!(f, "{c}")?,
-            c => write!(f, "\\u{{{:x}}}", c as u32)?,
+            c => write!(f, "\\u{{{:x}}}", ay_core::smtlib_code_point(c))?,
         }
     }
     write!(f, "\"")
@@ -67,7 +84,7 @@ fn fmt_floating_point(
     f: &mut fmt::Formatter<'_>,
     sign: &bool,
     exponent: &u64,
-    significand: &u64,
+    significand: &u128,
     eb: &u32,
     sb: &u32,
 ) -> fmt::Result {

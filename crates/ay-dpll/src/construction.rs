@@ -22,7 +22,7 @@ impl<'a, T: TheorySolver> DpllT<'a, T> {
         tseitin_result: &ay_core::TseitinResult,
         theory: T,
     ) -> Self {
-        Self::from_tseitin_impl(terms, tseitin_result, theory, false)
+        Self::from_tseitin_impl(terms, tseitin_result, theory, None)
     }
 
     /// Create a DPLL(T) solver from a Tseitin result with clause tracing enabled.
@@ -35,14 +35,29 @@ impl<'a, T: TheorySolver> DpllT<'a, T> {
         tseitin_result: &ay_core::TseitinResult,
         theory: T,
     ) -> Self {
-        Self::from_tseitin_impl(terms, tseitin_result, theory, true)
+        Self::from_tseitin_impl(
+            terms,
+            tseitin_result,
+            theory,
+            Some(ay_sat::ClauseEventCapture::Additions),
+        )
+    }
+
+    /// Select artifact retention before loading any clauses or propagating units.
+    pub(crate) fn from_tseitin_with_clause_capture(
+        terms: &'a TermStore,
+        tseitin_result: &ay_core::TseitinResult,
+        theory: T,
+        capture: ay_sat::ClauseEventCapture,
+    ) -> Self {
+        Self::from_tseitin_impl(terms, tseitin_result, theory, Some(capture))
     }
 
     fn from_tseitin_impl(
         terms: &'a TermStore,
         tseitin_result: &ay_core::TseitinResult,
         theory: T,
-        proof_enabled: bool,
+        capture: Option<ay_sat::ClauseEventCapture>,
     ) -> Self {
         let mut construction_timings = DpllConstructionTimings::default();
         let mut solver = {
@@ -70,8 +85,9 @@ impl<'a, T: TheorySolver> DpllT<'a, T> {
 
             // Enable clause tracing BEFORE adding clauses so original clauses are
             // recorded in the trace for resolution proof reconstruction (#4176).
-            if proof_enabled {
+            if let Some(policy) = capture {
                 solver.sat.enable_clause_trace();
+                solver.sat.set_clause_event_capture(policy);
             }
 
             // Add all clauses to the SAT solver.

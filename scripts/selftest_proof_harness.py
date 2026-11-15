@@ -121,6 +121,13 @@ FAULTS = {
         '    verdict="$(printf %s "$CC_VERDICT" | sed s/holey/valid/)"',
         "Report proofs containing `hole` steps as fully certified.",
     ),
+    "guard-off-misjudged": (
+        CHECK_SH,
+        '      if ! guard_out="$("$AY" check carcara-guard "$1" "$2" 2>&1)"; then',
+        "      if false; then",
+        "Skip the pinned-Carcara guard, so a carcara `valid` resting on an "
+        "`evaluate` step it computes wrongly (fixture c10) counts as a pass.",
+    ),
     "guard-off-nothing-checked": (
         CHECK_SH,
         'if [ "$CHECKED" -eq 0 ] && [ "$ALLOW_NOTHING_CHECKED" -eq 0 ]; then',
@@ -521,10 +528,19 @@ def main():
         print("carcara not found; the proof harness cannot be self-tested without it",
               file=sys.stderr)
         return 2
-    if not shutil.which(os.environ.get("Z3_BIN", "z3")):
-        print("z3 not found; soundness_sweep adjudication cannot be self-tested",
+    # The same resolution soundness_sweep adjudicates with: $Z3_BIN, else the
+    # z3 oracle (scripts/_z3_oracle.py). `shutil.which` accepted a refusing
+    # reroute stub here, and the self-test then ran with a blind oracle.
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import _z3_oracle
+
+    try:
+        z3 = _z3_oracle.resolve_z3_spelling(os.environ.get("Z3_BIN", "z3"))
+    except _z3_oracle.Z3Unavailable as error:
+        print(f"no usable z3 ({error}); soundness_sweep adjudication cannot be self-tested",
               file=sys.stderr)
         return 2
+    print(f"z3 oracle: {z3.identity()}")
 
     real = {"check": CHECK_SH, "sweep": SWEEP_PY}
 

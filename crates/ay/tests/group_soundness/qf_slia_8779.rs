@@ -15,10 +15,10 @@
 
 use ntest::timeout;
 use std::io::Write;
-use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::corpus::tracked_fixture;
 use crate::spawn::{OutputTimeout, DEFAULT_CHILD_TIMEOUT};
 
 const NARROW7_SMT: &str = r#"(set-logic QF_SLIA)
@@ -116,14 +116,11 @@ fn qf_slia_8779_narrow_repro_not_sat() {
 #[timeout(120_000)]
 fn qf_slia_8779_lan_replace_all2_not_sat() {
     let ay_path = env!("CARGO_BIN_EXE_ay");
-    let benchmark_path = format!(
-        "{}/../../benchmarks/smtlib-2025/non-incremental/QF_SLIA/20230403-webapp/lan-rep-all/lan_replace_all2.smt2",
-        env!("CARGO_MANIFEST_DIR")
+    // Committed fixture: its absence is a broken tree and fails here. It used
+    // to be a silent skip, which the target read as a pass.
+    let benchmark_path = tracked_fixture(
+        "benchmarks/smtlib-2025/non-incremental/QF_SLIA/20230403-webapp/lan-rep-all/lan_replace_all2.smt2",
     );
-    if !Path::new(&benchmark_path).is_file() {
-        eprintln!("SKIP: optional #8779 benchmark not found: {benchmark_path}");
-        return;
-    }
     let output = Command::new(ay_path)
         .arg("solve")
         .arg("-t:30000")
@@ -134,8 +131,9 @@ fn qf_slia_8779_lan_replace_all2_not_sat() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         output.status.success(),
-        "ay exited with {:?} for {benchmark_path}\nstdout:\n{}\nstderr:\n{}",
+        "ay exited with {:?} for {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
+        benchmark_path.display(),
         stdout,
         stderr
     );

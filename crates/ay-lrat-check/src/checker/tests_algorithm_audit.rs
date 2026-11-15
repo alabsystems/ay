@@ -367,11 +367,25 @@ fn test_delete_after_conclude_still_works() {
 
 // -- num_vars overflow guard (#5321) --
 
-/// 2 * num_vars overflow must panic (not silently produce garbage arrays).
+/// A universe whose `2 * num_vars` overflows must not silently produce
+/// garbage arrays. It used to panic; it is now refused before allocation and
+/// the checker fails closed: nothing is admitted and no proof concludes.
 #[test]
-#[should_panic(expected = "num_vars too large")]
-fn test_num_vars_overflow_panics() {
-    let _ = LratChecker::new(usize::MAX);
+fn test_num_vars_overflow_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    for num_vars in [usize::MAX, MAX_DENSE_VARS + 1] {
+        let mut checker = LratChecker::new_lenient(num_vars);
+        if checker.num_vars != 0 || !checker.assigns.is_empty() || !checker.occ_lists.is_empty() {
+            return Err(format!("num_vars={num_vars}: dense arrays were allocated").into());
+        }
+        if checker.add_original(1, &[lit(1)]) || checker.add_trusted(2, &[]) {
+            return Err(format!("num_vars={num_vars}: a refused checker admitted a clause").into());
+        }
+        let conclusion = checker.conclude_unsat();
+        if conclusion == ConcludeResult::Verified {
+            return Err(format!("num_vars={num_vars}: a refused checker concluded").into());
+        }
+    }
+    Ok(())
 }
 
 // -- Clause ID boundary tests (#5321) --

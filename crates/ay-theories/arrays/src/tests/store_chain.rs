@@ -4,6 +4,100 @@
 
 use super::*;
 
+/// A satisfied alias guard is not a clause already installed in SAT. After
+/// backtracking, the same structural read still needs its ROW2 implication.
+#[test]
+fn guarded_row2_false_alias_then_true_keeps_the_unemitted_obligation() {
+    let mut terms = TermStore::new();
+    let array_sort = make_array_sort();
+    let a = terms.mk_var("a", array_sort.clone());
+    let alias = terms.mk_var("alias", array_sort);
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let value = terms.mk_var("value", Sort::Int);
+    let stored = terms.mk_store(a, i, value);
+    let read = terms.mk_select(alias, j);
+    let base_read = terms.mk_select(a, j);
+    let alias_eq = terms.mk_eq(alias, stored);
+    let index_eq = terms.mk_eq(i, j);
+    let read_eq = terms.mk_eq(read, base_read);
+    let mut expected = vec![
+        TheoryLit::new(alias_eq, false),
+        TheoryLit::new(index_eq, true),
+        TheoryLit::new(read_eq, true),
+    ];
+    expected.sort_by_key(|lit| (lit.term.0, lit.value));
+
+    // Independent real-solver twin: the same live true-alias window has a
+    // productive ROW2 clause when no earlier false guard consumed its work.
+    let mut fresh = ArraySolver::new(&terms);
+    fresh.assert_literal(alias_eq, true);
+    fresh.generate_all_lazy_row2_axioms();
+    let Some(TheoryResult::NeedLemmas(lemmas)) = fresh.check_row2() else {
+        panic!("fresh true alias must produce its ROW2 implication");
+    };
+    assert!(lemmas.iter().any(|lemma| lemma.clause == expected));
+
+    let mut solver = ArraySolver::new(&terms);
+    solver.populate_caches();
+    solver.push();
+    solver.assert_literal(alias_eq, false);
+    solver.generate_all_lazy_row2_axioms();
+    assert!(solver.check_row2().is_none());
+    assert!(solver.applied_theory_lemmas.is_empty());
+    solver.pop();
+    solver.push();
+    solver.assert_literal(alias_eq, true);
+    solver.generate_all_lazy_row2_axioms();
+    let result = solver.check_row2();
+    solver.pop();
+    let Some(TheoryResult::NeedLemmas(lemmas)) = result else {
+        panic!("false-alias branch discarded an unapplied ROW2 obligation");
+    };
+    assert!(lemmas.iter().any(|lemma| lemma.clause == expected));
+}
+
+/// Different alias guards and read equalities are different obligations even
+/// when their store and index happen to be identical.
+#[test]
+fn guarded_row2_two_alias_reads_keep_both_distinct_guarded_clauses() {
+    let mut terms = TermStore::new();
+    let array_sort = make_array_sort();
+    let a = terms.mk_var("a", array_sort.clone());
+    let alias1 = terms.mk_var("alias1", array_sort.clone());
+    let alias2 = terms.mk_var("alias2", array_sort);
+    let i = terms.mk_var("i", Sort::Int);
+    let j = terms.mk_var("j", Sort::Int);
+    let value = terms.mk_var("value", Sort::Int);
+    let stored = terms.mk_store(a, i, value);
+    let read1 = terms.mk_select(alias1, j);
+    let read2 = terms.mk_select(alias2, j);
+    let base_read = terms.mk_select(a, j);
+    let alias_eq1 = terms.mk_eq(alias1, stored);
+    let alias_eq2 = terms.mk_eq(alias2, stored);
+    let index_eq = terms.mk_eq(i, j);
+    let read_eq1 = terms.mk_eq(read1, base_read);
+    let read_eq2 = terms.mk_eq(read2, base_read);
+    let mut solver = ArraySolver::new(&terms);
+    solver.populate_caches();
+    solver.generate_all_lazy_row2_axioms();
+    let Some(TheoryResult::NeedLemmas(lemmas)) = solver.check_row2() else {
+        panic!("unassigned aliases must yield guarded ROW2 implications");
+    };
+    for (alias_eq, read_eq) in [(alias_eq1, read_eq1), (alias_eq2, read_eq2)] {
+        let mut expected = vec![
+            TheoryLit::new(alias_eq, false),
+            TheoryLit::new(index_eq, true),
+            TheoryLit::new(read_eq, true),
+        ];
+        expected.sort_by_key(|lit| (lit.term.0, lit.value));
+        assert!(
+            lemmas.iter().any(|lemma| lemma.clause == expected),
+            "missing independently guarded read clause: {expected:?}"
+        );
+    }
+}
+
 #[test]
 fn test_arrays_store_chain_resolution_conflict_emits_lemma() {
     let mut store = TermStore::new();
@@ -818,9 +912,10 @@ fn test_effective_store_propagation_keeps_alias_reasons() {
     solver.assert_literal(eq_xy, true);
     solver.populate_caches();
 
-    let (_x_base, _x_base_reasons, x_effective) = solver
-        .collect_effective_stores(x)
+    let x_chain = solver
+        .collect_effective_stores_shared(x)
         .expect("x should resolve to an aliased store chain");
+    let (_x_base, _x_base_reasons, x_effective) = &*x_chain;
     assert_eq!(x_effective.len(), 1);
     assert_eq!(
         x_effective[0].2,
@@ -828,9 +923,10 @@ fn test_effective_store_propagation_keeps_alias_reasons() {
         "effective store entry for x must carry the alias equality"
     );
 
-    let (_y_base, _y_base_reasons, y_effective) = solver
-        .collect_effective_stores(y)
+    let y_chain = solver
+        .collect_effective_stores_shared(y)
         .expect("y should resolve to an aliased store chain");
+    let (_y_base, _y_base_reasons, y_effective) = &*y_chain;
     assert_eq!(y_effective.len(), 1);
     assert_eq!(
         y_effective[0].2,
@@ -2204,6 +2300,119 @@ fn test_arrays_final_check_progresses_drained_row2_upward_conflict_8785() {
     );
 }
 
+/// Lemma batching across final-check sub-checks: one final_check call
+/// must return the ROW2-upward conflict-ready lemma AND an unrelated
+/// ROW2-down lemma in a single NeedLemmas batch. Previously the first
+/// sub-check with lemmas returned immediately, so each refinement
+/// round learned ~1 lemma family per full SAT re-solve (measured
+/// 2,849 rounds / 4,478 lemmas in 20 s on qlock.induction.5).
+#[test]
+fn test_final_check_batches_upward_and_downward_row2_lemmas() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    // Upward conflict-ready pair (mirrors the 8785 scenario):
+    // a = b, i != j, select(b, j) != select(store(a, i, v), j).
+    let a = store.mk_var("a", arr_sort.clone());
+    let b = store.mk_var("b", arr_sort.clone());
+    let i = store.mk_var("i", Sort::Int);
+    let j = store.mk_var("j", Sort::Int);
+    let v = store.mk_var("v", Sort::Int);
+    let stored = store.mk_store(a, i, v);
+    let sel_b_j = store.mk_select(b, j);
+    let sel_stored_j = store.mk_select(stored, j);
+    let eq_a_b = store.mk_eq(a, b);
+    let eq_ij = store.mk_eq(i, j);
+    let eq_sels = store.mk_eq(sel_b_j, sel_stored_j);
+
+    // Independent downward pair: select(store(c, k, v2), l) vs
+    // select(c, l) with no asserted (dis)equalities — the lazy ROW2
+    // axiom surface produces its lemma in check_row2.
+    let c = store.mk_var("c", arr_sort);
+    let k = store.mk_var("k", Sort::Int);
+    let l = store.mk_var("l", Sort::Int);
+    let v2 = store.mk_var("v2", Sort::Int);
+    let stored2 = store.mk_store(c, k, v2);
+    let sel_stored2_l = store.mk_select(stored2, l);
+    let sel_c_l = store.mk_select(c, l);
+    let eq_kl = store.mk_eq(k, l);
+    let eq_sel2 = store.mk_eq(sel_stored2_l, sel_c_l);
+
+    let mut solver = ArraySolver::new(&store);
+    solver.populate_caches();
+    solver.assert_literal(eq_a_b, true);
+    solver.assert_literal(eq_ij, false);
+    solver.assert_literal(eq_sels, false);
+
+    let TheoryResult::NeedLemmas(lemmas) = solver.final_check() else {
+        panic!("expected a batched NeedLemmas from final_check");
+    };
+    let clauses: Vec<&Vec<TheoryLit>> = lemmas.iter().map(|l| &l.clause).collect();
+    let upward_clause = vec![
+        TheoryLit::new(eq_a_b, false),
+        TheoryLit::new(eq_ij, true),
+        TheoryLit::new(eq_sels, true),
+    ];
+    let mut downward_clause = vec![TheoryLit::new(eq_kl, true), TheoryLit::new(eq_sel2, true)];
+    downward_clause.sort_by_key(|lit| (lit.term.0, lit.value));
+    assert!(
+        clauses.iter().any(|c| **c == upward_clause),
+        "batch must contain the ROW2-upward lemma, got {clauses:?}"
+    );
+    assert!(
+        clauses.iter().any(|c| **c == downward_clause),
+        "batch must also contain the ROW2-down lemma in the SAME final_check, got {clauses:?}"
+    );
+}
+
+/// Guarded ROW2-down emission before the array alias is decided:
+/// `select(a1, j)` with `stored = store(a, i, v)` and the equality
+/// atom `(= a1 stored)` present but NOT asserted. The ROW2 clause
+/// `a1 != stored ∨ i = j ∨ select(a1, j) = select(a, j)` is a theory
+/// tautology guarded by that atom, so final_check must emit it
+/// without waiting for the alias to become provable. Measured on
+/// qlock.induction.5, the provable-alias gate parked 52,205 of
+/// 52,211 drained ROW2 axioms (`remaining`), so BCP-time check()
+/// emitted zero ROW2 lemmas during search and every linkage waited
+/// for a full-assignment final check.
+#[test]
+fn test_final_check_emits_guarded_row2_down_before_alias_decided() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    let a = store.mk_var("a", arr_sort.clone());
+    let a1 = store.mk_var("a1", arr_sort);
+    let i = store.mk_var("i", Sort::Int);
+    let j = store.mk_var("j", Sort::Int);
+    let v = store.mk_var("v", Sort::Int);
+
+    let stored = store.mk_store(a, i, v);
+    let sel_a1_j = store.mk_select(a1, j);
+    let sel_a_j = store.mk_select(a, j);
+    let eq_alias = store.mk_eq(a1, stored);
+    let eq_ij = store.mk_eq(i, j);
+    let eq_sels = store.mk_eq(sel_a1_j, sel_a_j);
+
+    let mut solver = ArraySolver::new(&store);
+    solver.populate_caches();
+    // The alias atom exists but is deliberately never asserted.
+
+    let TheoryResult::NeedLemmas(lemmas) = solver.final_check() else {
+        panic!("expected a guarded ROW2-down lemma batch before the alias is decided");
+    };
+    let mut expected = vec![
+        TheoryLit::new(eq_alias, false),
+        TheoryLit::new(eq_ij, true),
+        TheoryLit::new(eq_sels, true),
+    ];
+    expected.sort_by_key(|lit| (lit.term.0, lit.value));
+    assert!(
+        lemmas.iter().any(|l| l.clause == expected),
+        "batch must contain the alias-guarded ROW2 clause, got {:?}",
+        lemmas.iter().map(|l| &l.clause).collect::<Vec<_>>()
+    );
+}
+
 /// Since #6546 Packet 4, `assert_literal(eq_b_store, true)` triggers
 /// `notify_equality(b, store_a)` which eagerly queues ROW2-down axioms.
 /// This means `check()` catches the b=store(a,0,v) + select(b,1)!=select(a,1)
@@ -2902,5 +3111,103 @@ fn test_self_store_pending_pair_falls_back_to_index_alias_select() {
     assert!(
         clause.contains(&TheoryLit::new(eq_select_v, true)),
         "lemma should block select(alias, j) != v"
+    );
+}
+
+/// 2026-09-23 hunt D4 (storeeq_41_0293): the partial effective-store walker
+/// must treat every outer store as a possible shadow, admitted or not.
+///
+/// In `store(store(store(b, j, 1), i, v), 2, j)` with `j = 5` asserted and `i`
+/// undecided against both `2` and `j`, the store at `i` is skipped (its own
+/// shadowing by the store at `2` is undecided), but it still hides the store
+/// at `j` whenever `i = j`. Publishing `(j, 1)` with reasons `{j = 5}` alone
+/// let the effective-store decomposition propagate `1 = 2` against
+/// `store(store(c, j, 2), 2, 5)` and refute a satisfiable equality.
+#[test]
+fn test_partial_walker_keeps_skipped_store_as_shadow() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    let b = store.mk_var("b", arr_sort.clone());
+    let c = store.mk_var("c", arr_sort);
+    let i = store.mk_var("i", Sort::Int);
+    let j = store.mk_var("j", Sort::Int);
+    let v = store.mk_var("v", Sort::Int);
+    let one = store.mk_int(BigInt::from(1));
+    let two = store.mk_int(BigInt::from(2));
+    let five = store.mk_int(BigInt::from(5));
+    let eq_j_5 = store.mk_eq(j, five);
+
+    let l1 = store.mk_store(b, j, one);
+    let l2 = store.mk_store(l1, i, v);
+    let lhs = store.mk_store(l2, two, j);
+    let r1 = store.mk_store(c, j, two);
+    let rhs = store.mk_store(r1, two, five);
+    let eq_chains = store.mk_eq(lhs, rhs);
+
+    let mut solver = ArraySolver::new(&store);
+    solver.assert_literal(eq_j_5, true);
+    solver.assert_literal(eq_chains, true);
+    solver.populate_caches();
+
+    let chain = solver
+        .collect_effective_stores_shared(lhs)
+        .expect("lhs is a store chain");
+    let (_base, _base_reasons, effective) = &*chain;
+    assert!(
+        effective.iter().all(|(idx, _, _)| *idx != j),
+        "the store at j is hidden whenever i = j, and i vs j is undecided: {effective:?}"
+    );
+
+    let propagated = solver.propagate_equalities();
+    assert!(
+        !propagated.equalities.iter().any(|eq| {
+            ArraySolver::ordered_pair(eq.lhs, eq.rhs) == ArraySolver::ordered_pair(one, two)
+        }),
+        "1 = 2 is not implied: i = j = 5, v = 2 satisfies the chain equality"
+    );
+}
+
+/// 2026-09-23 hunt D4 (storeeq_41_0883): a store-permutation equality must be
+/// read from the COMPLETE effective maps. With `i` undecided against `2`, the
+/// partial maps of `store(store(b, 2, r), i, w)` and
+/// `store(store(k1, 2, 2), i, w)` both drop their `(2, _)` store and match on
+/// `(i, w)` alone; `b = k1` then "proved" the chains equal although they
+/// differ at index 2 whenever `r != 2` and `i != 2`.
+#[test]
+fn test_store_permutation_requires_complete_maps() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    let b = store.mk_var("b", arr_sort.clone());
+    let k1 = store.mk_var("k1", arr_sort);
+    let i = store.mk_var("i", Sort::Int);
+    let r = store.mk_var("r", Sort::Int);
+    let w = store.mk_var("w", Sort::Int);
+    let two = store.mk_int(BigInt::from(2));
+    let eq_b_k1 = store.mk_eq(b, k1);
+
+    let x1 = store.mk_store(b, two, r);
+    let x = store.mk_store(x1, i, w);
+    let y1 = store.mk_store(k1, two, two);
+    let y = store.mk_store(y1, i, w);
+    // Make both chains array-equality candidates without asserting x = y.
+    let eq_xy = store.mk_eq(x, y);
+
+    let mut solver = ArraySolver::new(&store);
+    solver.register_atom(eq_xy);
+    solver.assert_literal(eq_b_k1, true);
+    solver.populate_caches();
+
+    assert!(
+        solver.complete_store_permutation_reasons(x, y).is_none(),
+        "undecided i vs 2 leaves both chains incomplete"
+    );
+    let propagated = solver.propagate_equalities();
+    assert!(
+        !propagated.equalities.iter().any(|eq| {
+            ArraySolver::ordered_pair(eq.lhs, eq.rhs) == ArraySolver::ordered_pair(x, y)
+        }),
+        "x = y is not implied by b = k1 while r vs 2 and i vs 2 are open"
     );
 }

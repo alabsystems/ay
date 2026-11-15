@@ -13,8 +13,9 @@
 //!
 //! Measures performance of the CDCL SAT solver on various problem classes.
 
+use ay_criterion_main::criterion_main;
 use ay_sat::{parse_dimacs, Literal, Solver, Variable};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
 
 /// Benchmark solving uf20 (20 variable, 91 clause) satisfiable formulas
 ///

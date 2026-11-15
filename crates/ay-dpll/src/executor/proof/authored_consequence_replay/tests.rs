@@ -26,6 +26,7 @@ fn dual_forall_plan() -> ReplayPlans {
         ConsequencePlan::NegatedExistsDual {
             not_exists_root: TermId(4),
             exists: TermId(5),
+            co_units: Vec::new(),
         },
     );
     plans

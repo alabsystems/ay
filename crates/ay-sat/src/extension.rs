@@ -45,6 +45,43 @@ pub enum ExtCheckResult {
     /// scratch), add the lemma clauses and continue within the same SAT
     /// invocation. This eliminates O(N) full SAT-solve round-trips.
     AddClauses(Vec<Vec<Literal>>),
+    /// Final-check lemmas added at the CURRENT decision level (design G2,
+    /// the development design notes K7): no restart. Each lemma gets the
+    /// handling a `propagate` lemma gets: a falsified lemma is a conflict, a
+    /// unit lemma propagates, and the search continues from the current
+    /// assignment. `AddClauses` keeps its backtrack-to-level-0 semantics for
+    /// the case it was written for (#8480, a 9,500-clause BV circuit).
+    Continue(ExtContinue),
+}
+
+/// The clauses of an [`ExtCheckResult::Continue`] (design G1-G3).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtContinue {
+    /// Theory lemmas: re-derivable, so they go to the deletable tier.
+    pub lemmas: Vec<Vec<Literal>>,
+    /// Irredundant clauses (design G1); see [`ExtPropagateResult::definitions`].
+    pub definitions: Vec<Vec<Literal>>,
+    /// Grow the solver to at least this many variables (design G3); see
+    /// [`ExtPropagateResult::num_vars`].
+    pub num_vars: usize,
+}
+
+impl ExtContinue {
+    /// Lemmas and definitions, with no explicit variable request.
+    pub fn new(lemmas: Vec<Vec<Literal>>, definitions: Vec<Vec<Literal>>) -> Self {
+        Self {
+            lemmas,
+            definitions,
+            num_vars: 0,
+        }
+    }
+
+    /// Ask the solver to grow to at least `num_vars` variables (builder).
+    pub fn with_num_vars(mut self, num_vars: usize) -> Self {
+        self.num_vars = num_vars;
+        self
+    }
 }
 
 /// One proof-only step from a preprocessing extension (task #20 chunked XOR
@@ -67,6 +104,16 @@ pub enum ExtProofStep {
     Delete(Vec<Literal>),
 }
 
+/// Origin of additional clauses returned by a theory extension.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TheoryClauseOrigin {
+    /// A propagation or conflict consequence.
+    #[default]
+    Lemma,
+    /// An unconditional theory axiom.
+    Axiom,
+}
+
 /// Result of extension's unit propagation
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -76,6 +123,8 @@ pub struct ExtPropagateResult {
     /// Each clause is a disjunction. If the clause has one satisfied literal
     /// or one unassigned literal with all others false, SAT will propagate.
     pub clauses: Vec<Vec<Literal>>,
+    /// Insertion origin for this result's additional clauses.
+    pub clause_origin: TheoryClauseOrigin,
 
     /// Lightweight theory propagations (#4919).
     ///
@@ -133,6 +182,24 @@ pub struct ExtPropagateResult {
     /// ladder scaffolding over fresh extension variables). Empty for every
     /// extension except the chunked XOR proof route. See [`ExtProofStep`].
     pub proof_script: Vec<ExtProofStep>,
+
+    /// Irredundant clauses (design G1): definitions of symbols the extension
+    /// introduced (a Tseitin definition of a minted compound atom, a Skolem or
+    /// `ite` definition, an instance). Nothing would derive them again, so they
+    /// are never deleted: they go to the irredundant tier, are recorded in the
+    /// original ledger (so a destructive rebuild keeps them), are never scoped
+    /// to a user push, and are never dropped when the same result carries a
+    /// conflict. They are processed before `clauses`, with the same unit and
+    /// falsified-clause handling.
+    pub definitions: Vec<Vec<Literal>>,
+
+    /// Grow the solver to at least this many variables before anything else in
+    /// this result is processed (design G3). Every variable an extension result
+    /// creates, whether through this request or through a literal beyond the
+    /// current range in any clause, propagation or conflict of the result, is
+    /// frozen, so inprocessing can never eliminate a variable the extension
+    /// names. This is how an extension creates a variable without a clause.
+    pub num_vars: usize,
 }
 
 impl ExtPropagateResult {
@@ -145,12 +212,15 @@ impl ExtPropagateResult {
     pub fn clause(clause: Vec<Literal>) -> Self {
         Self {
             clauses: vec![clause],
+            clause_origin: TheoryClauseOrigin::Lemma,
             propagations: vec![],
             lazy_propagations: vec![],
             conflict: None,
             stop: false,
             bump_vars: Vec::new(),
             proof_script: Vec::new(),
+            definitions: Vec::new(),
+            num_vars: 0,
         }
     }
 
@@ -158,12 +228,15 @@ impl ExtPropagateResult {
     pub fn clauses(clauses: Vec<Vec<Literal>>) -> Self {
         Self {
             clauses,
+            clause_origin: TheoryClauseOrigin::Lemma,
             propagations: vec![],
             lazy_propagations: vec![],
             conflict: None,
             stop: false,
             bump_vars: Vec::new(),
             proof_script: Vec::new(),
+            definitions: Vec::new(),
+            num_vars: 0,
         }
     }
 
@@ -171,12 +244,15 @@ impl ExtPropagateResult {
     pub fn conflict(clause: Vec<Literal>) -> Self {
         Self {
             clauses: vec![],
+            clause_origin: TheoryClauseOrigin::Lemma,
             propagations: vec![],
             lazy_propagations: vec![],
             conflict: Some(clause),
             stop: false,
             bump_vars: Vec::new(),
             proof_script: Vec::new(),
+            definitions: Vec::new(),
+            num_vars: 0,
         }
     }
 
@@ -189,12 +265,15 @@ impl ExtPropagateResult {
     ) -> Self {
         Self {
             clauses,
+            clause_origin: TheoryClauseOrigin::Lemma,
             propagations,
             lazy_propagations: vec![],
             conflict,
             stop,
             bump_vars: Vec::new(),
             proof_script: Vec::new(),
+            definitions: Vec::new(),
+            num_vars: 0,
         }
     }
 
@@ -208,6 +287,27 @@ impl ExtPropagateResult {
     pub fn with_bump_vars(mut self, vars: Vec<Variable>) -> Self {
         self.bump_vars = vars;
         self
+    }
+
+    /// Set the irredundant definitions (builder pattern, design G1).
+    pub fn with_definitions(mut self, definitions: Vec<Vec<Literal>>) -> Self {
+        self.definitions = definitions;
+        self
+    }
+
+    /// Ask the solver to grow to at least `num_vars` variables (builder
+    /// pattern, design G3).
+    pub fn with_num_vars(mut self, num_vars: usize) -> Self {
+        self.num_vars = num_vars;
+        self
+    }
+
+    /// Whether the result asks the solver to do anything at all.
+    pub fn has_work(&self) -> bool {
+        !self.clauses.is_empty()
+            || !self.definitions.is_empty()
+            || !self.propagations.is_empty()
+            || !self.lazy_propagations.is_empty()
     }
 }
 
@@ -310,6 +410,24 @@ pub trait SolverContext {
     /// Enables theory extensions to gauge BCP activity for adaptive
     /// batching and deferral thresholds.
     fn propagations(&self) -> u64 {
+        0
+    }
+
+    /// Search ticks of the current search: ay-sat's count of BCP and
+    /// conflict-analysis work (`Solver::total_search_ticks`), the unit of a
+    /// tick budget (`determinism::TICKS_PER_MS`, GT-G6 in the development design notes
+    /// DR-36).
+    ///
+    /// It never decreases during a search. A solve entry that resets the
+    /// search state starts it again from 0, so a caller that charges its own
+    /// budget charges the change since its previous reading in the same
+    /// solve. Probe, vivify and inprocessing-scan work is not in it; those
+    /// are bounded by their own counted round budgets
+    /// (`Solver::set_deterministic_inproc`).
+    ///
+    /// The default of 0 is for contexts with no search behind them; only the
+    /// real solver overrides it.
+    fn search_ticks(&self) -> u64 {
         0
     }
 }
@@ -510,6 +628,29 @@ pub trait Extension {
     fn on_restart(&self) -> Vec<Variable> {
         Vec::new()
     }
+
+    /// The solver's own heuristic picked `lit` as the next decision (design
+    /// G4, z3's `decide_eh`). Return `Some(other)` to decide `other` instead.
+    /// A returned literal that is already assigned is ignored; one over a
+    /// variable beyond `ctx.num_vars()` grows the solver, frozen (G3).
+    ///
+    /// Not called for decisions the extension itself suggested through
+    /// [`Extension::suggest_decision`].
+    fn on_decide(&mut self, _ctx: &dyn SolverContext, _lit: Literal) -> Option<Literal> {
+        None
+    }
+
+    /// Whether [`Extension::on_learned`] should be called. Copying each learned
+    /// clause costs an allocation, so the default is off.
+    fn wants_learned_clauses(&self) -> bool {
+        false
+    }
+
+    /// A clause the solver learned by conflict analysis (design G4, z3's
+    /// `on_clause` for learned clauses). Called after the solver backjumped,
+    /// only when [`Extension::wants_learned_clauses`] is true. Theory lemmas
+    /// and conflicts the extension itself returned are not echoed back.
+    fn on_learned(&mut self, _clause: &[Literal]) {}
 }
 
 #[cfg(test)]

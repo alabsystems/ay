@@ -287,6 +287,11 @@ fn declare_and_fill(
     dt_symbol: &SymbolKey,
     ctor_handles: &[Z3_constructor],
 ) -> Z3_sort {
+    if let Some(reason) = super::datatype_name_collision(ctx, &dt.name) {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(reason);
+        return ptr::null_mut();
+    }
     if let Err(e) = ctx.solver.try_declare_datatype(dt) {
         ctx.last_error = Z3_INVALID_ARG;
         ctx.error_msg = Some(format!("{e}"));
@@ -499,7 +504,11 @@ pub unsafe extern "C" fn Z3_query_constructor(
 /// `constr` must be a constructor handle from `Z3_mk_constructor` that has not
 /// already been freed.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_del_constructor(_c: Z3_context, constr: Z3_constructor) {
+pub unsafe extern "C" fn Z3_del_constructor(c: Z3_context, constr: Z3_constructor) {
+    // Every z3 API call resets the context's error code; z3py checks it after
+    // this one, so an earlier refusal must not resurface here.
+    // SAFETY: `c` is null or a live context per the C API contract.
+    unsafe { ffi_guard_void(c, |_| ()) };
     if constr.is_null() {
         return;
     }
@@ -519,7 +528,10 @@ pub unsafe extern "C" fn Z3_del_constructor(_c: Z3_context, constr: Z3_construct
 /// `clist` must be a list handle from `Z3_mk_constructor_list` that has not
 /// already been freed.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_del_constructor_list(_c: Z3_context, clist: Z3_constructor_list) {
+pub unsafe extern "C" fn Z3_del_constructor_list(c: Z3_context, clist: Z3_constructor_list) {
+    // See `Z3_del_constructor`: the call resets the error code.
+    // SAFETY: `c` is null or a live context per the C API contract.
+    unsafe { ffi_guard_void(c, |_| ()) };
     if clist.is_null() {
         return;
     }
@@ -866,4 +878,53 @@ mod tests {
             Err(())
         );
     }
+}
+
+/// The constructor a recognizer decl tests for: z3's `is` declaration carries
+/// it as its one `Z3_PARAMETER_FUNC_DECL` parameter (z3py prints a recognizer
+/// application as `is(cons, x)` from it). `None` for any other decl.
+///
+/// # Safety
+/// `d` must be null or a live declaration handle of `ctx`.
+pub(crate) unsafe fn recognizer_constructor_decl(
+    ctx: &mut Z3Context,
+    d: Z3_func_decl,
+) -> Option<Z3_func_decl> {
+    // SAFETY: forwarded from this function's contract.
+    let handle = unsafe { d.as_ref() }?;
+    let Some(DatatypeOp::Recognizer { ctor }) = &handle.dt_op else {
+        return None;
+    };
+    let Some(Sort::Datatype(dt)) = handle.decl.domain().first() else {
+        return None;
+    };
+    let (ctor, dt) = (ctor.clone(), dt.clone());
+    let constructor = dt.constructors.iter().find(|c| c.name == ctor)?;
+    let decl = FuncDecl::new(
+        constructor.name.clone(),
+        constructor.fields.iter().map(|f| f.sort.clone()).collect(),
+        Sort::Datatype(dt.clone()),
+    );
+    let key = (
+        decl.name().to_string(),
+        decl.domain().to_vec(),
+        decl.range().clone(),
+    );
+    if let Some(&existing) = ctx.dt_decl_index.get(&key) {
+        return Some(existing);
+    }
+    Some(cache_dt_func_decl(
+        ctx,
+        decl,
+        DatatypeOp::Constructor { dt, ctor },
+    ))
+}
+
+/// Whether `d` is a datatype recognizer (z3's `is` declaration).
+///
+/// # Safety
+/// `d` must be null or a live declaration handle.
+pub(crate) unsafe fn is_recognizer_decl(d: Z3_func_decl) -> bool {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { d.as_ref() }.is_some_and(|h| matches!(h.dt_op, Some(DatatypeOp::Recognizer { .. })))
 }

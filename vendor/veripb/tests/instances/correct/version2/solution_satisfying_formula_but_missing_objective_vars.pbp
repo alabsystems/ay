@@ -1,0 +1,181 @@
+pseudo-Boolean proof version 2.0
+f 73 0
+rup 1 i1_a_g3 1 ~i1_a_g4 >= 1 ;
+rup 1 i1_a_g4 1 ~i1_a_g5 >= 1 ;
+rup 1 i2_b_g4 1 ~i2_b_g5 >= 1 ;
+rup 1 i3_c_g4 1 ~i3_c_g5 >= 1 ;
+rup 1 i2_b_g5 1 ~i2_b_g6 >= 1 ;
+rup 1 i4_d_g3 1 ~i4_d_g4 >= 1 ;
+rup 1 i4_d_g4 1 ~i4_d_g5 >= 1 ;
+red 1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 6 ~i3_c_g6 >= 6 ; i3_c_g6 -> 0 ;
+red -1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 2 i3_c_g6 >= -5 ; i3_c_g6 -> 1 ;
+rup 1 ~i3_c_g6 >= 1 ;
+rup 1 i3_c_g5 1 ~i3_c_g6 >= 1 ;
+u 1 i3_c_g6 1 ~i2_b_g6 >= 1 ;
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 6 ~i0_X_INTRODUCED_0__g_2 >= -2 ; i0_X_INTRODUCED_0__g_2 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 10 i0_X_INTRODUCED_0__g_2 >= 3 ; i0_X_INTRODUCED_0__g_2 -> 1 ;
+* justifying integer linear inequality varidx 0 >= -2
+red 1 i3_c_b0 2 i3_c_b1 4 i3_c_b2 3 ~i3_c_g3 >= 3 ; i3_c_g3 -> 0 ;
+red -1 i3_c_b0 -2 i3_c_b1 -4 i3_c_b2 5 i3_c_g3 >= -2 ; i3_c_g3 -> 1 ;
+rup 1 i3_c_g3 >= 1 ;
+rup 1 i3_c_g3 1 ~i3_c_g4 >= 1 ;
+red 1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 6 ~i4_d_g6 >= 6 ; i4_d_g6 -> 0 ;
+red -1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 2 i4_d_g6 >= -5 ; i4_d_g6 -> 1 ;
+rup 1 ~i4_d_g6 >= 1 ;
+rup 1 i4_d_g5 1 ~i4_d_g6 >= 1 ;
+p 72 88 + 93 + 1 d
+u 1 ~i3_c_g3 1 i4_d_g6 1 i0_X_INTRODUCED_0__g_2 >= 1 ;
+del id 96
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 12 ~i0_X_INTRODUCED_0__g4 >= 4 ; i0_X_INTRODUCED_0__g4 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 4 i0_X_INTRODUCED_0__g4 >= -3 ; i0_X_INTRODUCED_0__g4 -> 1 ;
+rup 1 i0_X_INTRODUCED_0__g_2 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+* justifying integer linear inequality varidx 0 < 4
+red 1 i4_d_b0 2 i4_d_b1 4 i4_d_b2 2 ~i4_d_g2 >= 2 ; i4_d_g2 -> 0 ;
+red -1 i4_d_b0 -2 i4_d_b1 -4 i4_d_b2 6 i4_d_g2 >= -1 ; i4_d_g2 -> 1 ;
+rup 1 i4_d_g2 >= 1 ;
+rup 1 i4_d_g2 1 ~i4_d_g3 >= 1 ;
+p 73 82 + 101 + 1 d
+u 1 i3_c_g6 1 ~i4_d_g2 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+del id 105
+u 1 i2_b_g4 1 ~i4_d_g4 >= 1 ;
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 8 ~i0_X_INTRODUCED_0__g0 >= 0 ; i0_X_INTRODUCED_0__g0 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 8 i0_X_INTRODUCED_0__g0 >= 1 ; i0_X_INTRODUCED_0__g0 -> 1 ;
+rup 1 i0_X_INTRODUCED_0__g0 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+rup 1 i0_X_INTRODUCED_0__g_2 1 ~i0_X_INTRODUCED_0__g0 >= 1 ;
+* justifying integer linear inequality varidx 0 >= 0
+p 72 88 + 60 + 1 d
+u 1 ~i3_c_g3 1 i4_d_g4 1 i0_X_INTRODUCED_0__g0 >= 1 ;
+del id 112
+u 1 i1_a_g3 1 ~i4_d_g3 >= 1 ;
+u 1 i1_a_e4 1 i2_b_e4 1 ~i3_c_e4 >= 1 ;
+u 1 i1_a_e5 1 i2_b_e5 1 ~i3_c_e5 >= 1 ;
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 9 ~i0_X_INTRODUCED_0__g1 >= 1 ; i0_X_INTRODUCED_0__g1 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 7 i0_X_INTRODUCED_0__g1 >= 0 ; i0_X_INTRODUCED_0__g1 -> 1 ;
+rup 1 i0_X_INTRODUCED_0__g1 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+rup 1 i0_X_INTRODUCED_0__g0 1 ~i0_X_INTRODUCED_0__g1 >= 1 ;
+* justifying integer linear inequality varidx 0 >= 1
+p 72 88 + 55 + 1 d
+u 1 ~i3_c_g3 1 i4_d_g3 1 i0_X_INTRODUCED_0__g1 >= 1 ;
+del id 121
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 10 ~i0_X_INTRODUCED_0__g2 >= 2 ; i0_X_INTRODUCED_0__g2 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 6 i0_X_INTRODUCED_0__g2 >= -1 ; i0_X_INTRODUCED_0__g2 -> 1 ;
+rup 1 i0_X_INTRODUCED_0__g2 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+rup 1 i0_X_INTRODUCED_0__g1 1 ~i0_X_INTRODUCED_0__g2 >= 1 ;
+* justifying integer linear inequality varidx 0 < 2
+p 73 24 + 101 + 1 d
+u 1 i3_c_g4 1 ~i4_d_g2 1 ~i0_X_INTRODUCED_0__g2 >= 1 ;
+del id 127
+* solution
+red 1 i0_X_INTRODUCED_0__g1 1 ~i0_X_INTRODUCED_0__g2 2 ~i0_X_INTRODUCED_0__e1 >= 2 ; i0_X_INTRODUCED_0__e1 -> 0 ;
+red -1 i0_X_INTRODUCED_0__g1 -1 ~i0_X_INTRODUCED_0__g2 1 i0_X_INTRODUCED_0__e1 >= -1 ; i0_X_INTRODUCED_0__e1 -> 1 ;
+soli i0_X_INTRODUCED_0__e1 i1_a_e2 i2_b_e3 i3_c_e3 i4_d_e2
+rup 1 i0_X_INTRODUCED_0__g2 >= 1 ;
+* backtracking
+rup 1 ~i2_b_e3 1 ~i1_a_e2 >= 1 ;
+del range 114 117
+del id 122
+del id 128
+red 1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 2 ~i2_b_g2 >= 2 ; i2_b_g2 -> 0 ;
+red -1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 6 i2_b_g2 >= -1 ; i2_b_g2 -> 1 ;
+rup 1 i2_b_g2 >= 1 ;
+rup 1 i2_b_g2 1 ~i2_b_g4 >= 1 ;
+red 1 i2_b_b0 2 i2_b_b1 4 i2_b_b2 3 ~i2_b_g3 >= 3 ; i2_b_g3 -> 0 ;
+red -1 i2_b_b0 -2 i2_b_b1 -4 i2_b_b2 5 i2_b_g3 >= -2 ; i2_b_g3 -> 1 ;
+rup 1 i2_b_g3 >= 1 ;
+rup 1 i2_b_g3 1 ~i2_b_g4 >= 1 ;
+rup 1 i2_b_g2 1 ~i2_b_g3 >= 1 ;
+red 1 i2_b_g2 1 ~i2_b_g3 2 ~i2_b_e2 >= 2 ; i2_b_e2 -> 0 ;
+red -1 i2_b_g2 -1 ~i2_b_g3 1 i2_b_e2 >= -1 ; i2_b_e2 -> 1 ;
+u 1 i1_a_e2 1 i2_b_e2 1 ~i4_d_e2 >= 1 ;
+u 1 i1_a_e4 1 i2_b_e4 1 ~i3_c_e4 >= 1 ;
+u 1 i1_a_e5 1 i2_b_e5 1 ~i3_c_e5 >= 1 ;
+* justifying integer linear inequality varidx 0 < 1
+p 73 24 + 54 + 1 d
+u 1 i3_c_g4 1 ~i4_d_g3 1 ~i0_X_INTRODUCED_0__g1 >= 1 ;
+del id 148
+* backtracking
+rup 1 ~i2_b_e3 1 ~i1_a_e3 >= 1 ;
+del range 145 148
+del id 149
+u 1 i1_a_e2 1 i2_b_e2 1 ~i4_d_e2 >= 1 ;
+u 1 ~i1_a_g4 1 i3_c_g4 >= 1 ;
+u 1 i1_a_e5 1 i2_b_e5 1 ~i3_c_e5 >= 1 ;
+* justifying integer linear inequality varidx 0 < 2
+p 73 37 + 54 + 1 d
+u 1 i3_c_g5 1 ~i4_d_g3 1 ~i0_X_INTRODUCED_0__g2 >= 1 ;
+del id 154
+* backtracking
+rup 1 ~i2_b_e3 1 ~i1_a_e4 >= 1 ;
+del range 151 154
+del id 155
+u 1 i1_a_e2 1 i2_b_e2 1 ~i4_d_e2 >= 1 ;
+u 1 ~i1_a_g5 1 i3_c_g5 >= 1 ;
+red -8 i0_X_INTRODUCED_0__n 1 i0_X_INTRODUCED_0__b0 2 i0_X_INTRODUCED_0__b1 4 i0_X_INTRODUCED_0__b2 11 ~i0_X_INTRODUCED_0__g3 >= 3 ; i0_X_INTRODUCED_0__g3 -> 0 ;
+red 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 5 i0_X_INTRODUCED_0__g3 >= -2 ; i0_X_INTRODUCED_0__g3 -> 1 ;
+rup 1 i0_X_INTRODUCED_0__g3 1 ~i0_X_INTRODUCED_0__g4 >= 1 ;
+rup 1 i0_X_INTRODUCED_0__g2 1 ~i0_X_INTRODUCED_0__g3 >= 1 ;
+* justifying integer linear inequality varidx 0 < 3
+p 73 82 + 54 + 1 d
+u 1 i3_c_g6 1 ~i4_d_g3 1 ~i0_X_INTRODUCED_0__g3 >= 1 ;
+del id 163
+* solution
+red 1 i0_X_INTRODUCED_0__g2 1 ~i0_X_INTRODUCED_0__g3 2 ~i0_X_INTRODUCED_0__e2 >= 2 ; i0_X_INTRODUCED_0__e2 -> 0 ;
+red -1 i0_X_INTRODUCED_0__g2 -1 ~i0_X_INTRODUCED_0__g3 1 i0_X_INTRODUCED_0__e2 >= -1 ; i0_X_INTRODUCED_0__e2 -> 1 ;
+soli i0_X_INTRODUCED_0__e2 i1_a_e5 i2_b_e3 i3_c_e5 i4_d_e3
+rup 1 i0_X_INTRODUCED_0__g3 >= 1 ;
+* backtracking
+rup 1 ~i2_b_e3 1 ~i1_a_e5 >= 1 ;
+del range 157 159
+del id 164
+* backtracking
+rup 1 ~i2_b_e3 >= 1 ;
+del id 107
+del id 113
+del id 133
+del id 150
+del id 156
+del id 169
+u 1 i2_b_g5 1 ~i4_d_g5 >= 1 ;
+u 1 ~i2_b_g4 1 i3_c_g4 >= 1 ;
+* justifying integer linear inequality varidx 3 >= 5
+p 73 159 + 101 +
+u 1 ~i0_X_INTRODUCED_0__g3 1 ~i4_d_g2 1 i3_c_g5 >= 1 ;
+del id 173
+* justifying integer linear inequality varidx 4 < 3
+p 73 159 + 82 + 1 d
+u 1 ~i0_X_INTRODUCED_0__g3 1 i3_c_g6 1 ~i4_d_g3 >= 1 ;
+del id 175
+u 1 ~i3_c_e5 1 i2_b_g5 1 i1_a_g5 >= 1 ;
+u 1 i1_a_e2 1 i2_b_e2 1 ~i4_d_e2 >= 1 ;
+* backtracking
+rup 1 ~i2_b_e4 >= 1 ;
+del range 171 173
+del id 174
+del range 176 179
+u 1 ~i2_b_g5 1 i3_c_g5 >= 1 ;
+* justifying integer linear inequality varidx 4 < 3
+p 73 159 + 82 + 1 d
+u 1 ~i0_X_INTRODUCED_0__g3 1 i3_c_g6 1 ~i4_d_g3 >= 1 ;
+del id 181
+u 1 ~i4_d_e2 1 ~i2_b_g3 1 ~i1_a_g3 >= 1 ;
+* solution
+red 1 i0_X_INTRODUCED_0__g3 1 ~i0_X_INTRODUCED_0__g4 2 ~i0_X_INTRODUCED_0__e3 >= 2 ; i0_X_INTRODUCED_0__e3 -> 0 ;
+red -1 i0_X_INTRODUCED_0__g3 -1 ~i0_X_INTRODUCED_0__g4 1 i0_X_INTRODUCED_0__e3 >= -1 ; i0_X_INTRODUCED_0__e3 -> 1 ;
+soli i0_X_INTRODUCED_0__e3 i1_a_e2 i2_b_e5 i3_c_e5 i4_d_e2
+rup 1 i0_X_INTRODUCED_0__g4 >= 1 ;
+* backtracking
+rup 1 ~i2_b_e5 >= 1 ;
+del id 180
+del range 182 184
+* backtracking
+rup >= 1 ;
+del id 85
+del id 97
+del id 106
+del id 170
+del id 179
+del id 188
+rup 8 i0_X_INTRODUCED_0__n -1 i0_X_INTRODUCED_0__b0 -2 i0_X_INTRODUCED_0__b1 -4 i0_X_INTRODUCED_0__b2 >= -3 ;
+output NONE
+conclusion BOUNDS -3 -3
+end pseudo-Boolean proof

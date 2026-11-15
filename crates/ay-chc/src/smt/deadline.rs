@@ -20,12 +20,122 @@
 //! - An expired deadline makes checks return `Unknown` immediately, which
 //!   every caller already treats as a sound "give up" signal.
 
+use crate::cancellation::CancellationToken;
 use ay_core::time::Instant;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 thread_local! {
     static THREAD_SMT_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The cancellation of the portfolio lane that owns this thread, if any
+    /// (see [`ScopedLaneCancellation`]).
+    static THREAD_LANE_CANCELLATION: RefCell<Option<LaneCancellation>> =
+        const { RefCell::new(None) };
+}
+
+struct LaneCancellation {
+    token: CancellationToken,
+    interrupt: Option<Arc<AtomicBool>>,
+}
+
+/// RAII guard binding a portfolio lane's cancellation to the current thread.
+///
+/// Engines poll their own token only at loop heads, and the SMT layer never
+/// saw it: after a portfolio winner cancelled the losers, every SMT check a
+/// loser issued still ran to its own per-check timeout (PDKind's reachability
+/// interpolation, sanity BMC, `check_sat_10s` validations), so a loser kept a
+/// validated verdict waiting for tens of seconds. With this guard installed, a
+/// cancelled lane is an EXPIRED deadline for every check on the thread:
+/// [`smt_deadline_remaining`] reports zero, so new checks answer `Unknown`
+/// without starting, the internal DPLL(T) loop stops at its next iteration or
+/// SAT interrupt poll, and the executor lane receives `interrupt` (a flag the
+/// portfolio sets when it cancels its workers) as its interrupt handle.
+///
+/// SOUNDNESS: only ever turns a check into `Unknown` earlier, on a lane whose
+/// result the portfolio no longer accepts.
+pub(crate) struct ScopedLaneCancellation {
+    prev: Option<LaneCancellation>,
+}
+
+impl ScopedLaneCancellation {
+    /// Bind `token` (and optionally the portfolio-owned `interrupt` flag that
+    /// is set whenever the lane's workers are cancelled) to this thread.
+    /// Restores the previous binding on drop.
+    pub(crate) fn install(token: CancellationToken, interrupt: Option<Arc<AtomicBool>>) -> Self {
+        let prev = THREAD_LANE_CANCELLATION
+            .with(|cell| cell.replace(Some(LaneCancellation { token, interrupt })));
+        Self { prev }
+    }
+}
+
+impl Drop for ScopedLaneCancellation {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        // `try_with`: never panic in a destructor, even during thread teardown.
+        let _ = THREAD_LANE_CANCELLATION.try_with(|cell| {
+            cell.replace(prev);
+        });
+    }
+}
+
+/// True when the portfolio lane owning this thread has been cancelled.
+pub(crate) fn lane_cancelled() -> bool {
+    THREAD_LANE_CANCELLATION
+        .try_with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|lane| lane.as_ref().map(|lane| lane.token.is_cancelled()))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// The cancellation token of the lane owning this thread, if any. A route that
+/// builds a token for work it hands to another thread links this one, so the
+/// work stops when the lane does (`AdaptivePortfolio::lane_token`).
+pub(crate) fn current_lane_token() -> Option<CancellationToken> {
+    THREAD_LANE_CANCELLATION
+        .try_with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|lane| lane.as_ref().map(|lane| lane.token.clone()))
+        })
+        .ok()
+        .flatten()
+}
+
+/// The portfolio-owned interrupt flag of the lane owning this thread, for
+/// solvers that take an interrupt handle (`ay_dpll::Executor::set_interrupt`).
+/// Readers must never store to it.
+pub(crate) fn lane_interrupt_flag() -> Option<Arc<AtomicBool>> {
+    THREAD_LANE_CANCELLATION
+        .try_with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|lane| lane.as_ref().and_then(|lane| lane.interrupt.clone()))
+        })
+        .ok()
+        .flatten()
+}
+
+/// Strict capture for cross-thread original owners; failure is not absence.
+/// Existing lane getters retain their historical behavior.
+pub(crate) fn try_lane_cancellation(
+) -> Result<(Option<CancellationToken>, Option<Arc<AtomicBool>>), ()> {
+    THREAD_LANE_CANCELLATION
+        .try_with(|cell| {
+            cell.try_borrow()
+                .map(|lane| {
+                    (
+                        lane.as_ref().map(|lane| lane.token.clone()),
+                        lane.as_ref().and_then(|lane| lane.interrupt.clone()),
+                    )
+                })
+                .map_err(|_| ())
+        })
+        .map_err(|_| ())?
 }
 
 /// RAII guard for a thread-local SMT deadline scope.
@@ -108,11 +218,35 @@ impl Drop for ScopedSmtDeadlineOverride {
     }
 }
 
-/// Remaining time before the thread's SMT deadline; `None` if unbounded.
+/// The deadline every `check_sat` on this thread honours: the earlier of the
+/// scoped SMT deadline and the thread-wide solve deadline
+/// (`ScopedSolveDeadline`, installed per engine by the portfolio scheduler and
+/// per proof run by the CLI).
+///
+/// Rung 0 (CHC-COMP 2026): the executor adapter already refused to start once
+/// the solve deadline had passed, while the internal DPLL(T) loop clamped only
+/// to the SMT deadline — so after an engine's budget expired the executor lane
+/// was dead (676 of 2,257 executor-first attempts on metros_4 refused at
+/// entry) and the internal lane kept answering, letting the engine spin between
+/// cancellation polls. Folding the solve deadline in here makes the refusal
+/// gate, the internal clamp and `is_cancelled` agree with the adapter.
+pub(crate) fn effective_thread_deadline() -> Option<Instant> {
+    [
+        THREAD_SMT_DEADLINE.with(Cell::get),
+        super::context::current_thread_solve_deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// Remaining time before the thread's effective deadline; `None` if unbounded.
+/// A cancelled portfolio lane ([`ScopedLaneCancellation`]) has none left.
 pub(crate) fn smt_deadline_remaining() -> Option<Duration> {
-    THREAD_SMT_DEADLINE
-        .with(Cell::get)
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    if lane_cancelled() {
+        return Some(Duration::ZERO);
+    }
+    effective_thread_deadline().map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
 /// Return the exact route-scoped SMT deadline for child solver adapters.
@@ -141,6 +275,32 @@ pub(crate) fn clamp_timeout_to_smt_deadline(
             Some(t) => t.min(remaining),
             None => remaining,
         })),
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn a_borrowed_original_lane_refuses_owner_capture() {
+        let mut original = ay_core::resource::ResourceGuard::new();
+        original.set_deadline(Some(
+            ay_core::time::Instant::now() + std::time::Duration::from_secs(20),
+        ));
+        THREAD_LANE_CANCELLATION.with(|cell| {
+            let _borrowed = cell.borrow_mut();
+            assert!(try_lane_cancellation().is_err());
+            let owner = crate::engines::ExternalInvariantValidationOwner::capture(
+                &original,
+                &crate::PdrConfig::production(false),
+            );
+            assert_eq!(
+                owner.check(),
+                Some(crate::engines::ExternalInvariantValidation::Inconclusive)
+            );
+        });
+        assert!(try_lane_cancellation().is_ok());
     }
 }
 
@@ -201,5 +361,48 @@ mod tests {
         assert!(clamped <= Duration::from_millis(100));
         let unbounded_clamped = clamp_timeout_to_smt_deadline(None).unwrap().unwrap();
         assert!(unbounded_clamped <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn cancelled_lane_is_an_expired_deadline_and_scope_restores() {
+        let group = CancellationToken::new();
+        let lane = group.child();
+        let interrupt = group.interrupt_flag();
+        {
+            let _lane = ScopedLaneCancellation::install(lane, Some(interrupt.clone()));
+            assert!(!lane_cancelled());
+            assert!(!smt_deadline_expired());
+            assert_eq!(clamp_timeout_to_smt_deadline(None), Ok(None));
+            assert!(lane_interrupt_flag().is_some_and(|flag| Arc::ptr_eq(&flag, &interrupt)));
+
+            // The portfolio cancels the worker group: every check on the lane
+            // thread now sees an expired deadline, and the executor interrupt
+            // handed out earlier observes the same cancellation.
+            group.cancel();
+            assert!(lane_cancelled());
+            assert!(smt_deadline_expired());
+            assert_eq!(smt_deadline_remaining(), Some(Duration::ZERO));
+            assert_eq!(
+                clamp_timeout_to_smt_deadline(Some(Duration::from_secs(5))),
+                Err(())
+            );
+            assert!(interrupt.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // Leaving the lane scope restores the unbounded, uncancelled thread.
+        assert!(!lane_cancelled());
+        assert!(lane_interrupt_flag().is_none());
+        assert!(!smt_deadline_expired());
+    }
+
+    #[test]
+    fn lane_cancellation_is_thread_local() {
+        let group = CancellationToken::new();
+        let _lane = ScopedLaneCancellation::install(group.child(), None);
+        group.cancel();
+        assert!(smt_deadline_expired());
+        let other = std::thread::spawn(|| (lane_cancelled(), smt_deadline_expired()))
+            .join()
+            .expect("probe thread");
+        assert_eq!(other, (false, false));
     }
 }

@@ -1,0 +1,7 @@
+(set-option :timeout 90000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const xn (_ BitVec 64))
+(assert (not (= (bvashr xn (_ bv0 64)) xn)))
+(check-sat)
+(exit)

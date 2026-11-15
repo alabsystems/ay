@@ -73,32 +73,74 @@ fn bv_to_signed_big(value: BigUint, width: u32) -> BigInt {
     }
 }
 
-fn exact_bitvec_operands(
-    lhs: &ChcExpr,
-    rhs: &ChcExpr,
-    model: &FxHashMap<String, SmtValue>,
-) -> Option<(BigUint, BigUint, u32)> {
-    let (lhs, lhs_width) = eval_bv_big_val(lhs, model)?;
-    let (rhs, rhs_width) = eval_bv_big_val(rhs, model)?;
-    (lhs_width == rhs_width).then_some((lhs, rhs, lhs_width))
+/// A bit-vector operand, evaluated once, in the narrowest exact form: the
+/// common <=128-bit arithmetic lane stays on `u128`, and only a wider value
+/// takes the exact `BigUint` lane.
+///
+/// Every operator used to evaluate an operand for the narrow lane and, when
+/// that declined, evaluate the SAME operand again for the wide lane. An operand
+/// that does not evaluate at all (an unassigned variable, the depth guard)
+/// declines both, so it was evaluated twice per enclosing operator: `2^depth`
+/// work on a chain like `(bvsdiv (bvmul (bvsdiv (bvmul x 4) 4) 4) 4)`. One
+/// such chain, 250 levels deep, held a CHC portfolio worker past its deadline
+/// in model verification (model-checker-consumer `safe_symbolic_from_elem`, 875 s against a
+/// 30 s budget). One evaluation now feeds both lanes.
+pub(super) enum BvOperand {
+    Narrow(u128, u32),
+    Wide(BigUint, u32),
 }
 
-/// Extract a BV value from a subexpression: returns (value, width).
-pub(super) fn eval_bv_val(
-    expr: &ChcExpr,
-    model: &FxHashMap<String, SmtValue>,
-) -> Option<(u128, u32)> {
-    match evaluate_expr(expr, model)? {
-        SmtValue::BitVec(v, w) if w != 0 && w <= 128 => Some((v & bv_mask(w), w)),
-        _ => None,
+impl BvOperand {
+    pub(super) fn narrow(&self) -> Option<(u128, u32)> {
+        match self {
+            Self::Narrow(value, width) => Some((*value, *width)),
+            Self::Wide(..) => None,
+        }
+    }
+
+    pub(super) fn wide(self) -> (BigUint, u32) {
+        match self {
+            Self::Narrow(value, width) => (BigUint::from(value), width),
+            Self::Wide(value, width) => (value, width),
+        }
     }
 }
 
+/// Evaluate `expr` once as a bit-vector operand.
+pub(super) fn eval_bv_operand(
+    expr: &ChcExpr,
+    model: &FxHashMap<String, SmtValue>,
+) -> Option<BvOperand> {
+    match evaluate_expr(expr, model)? {
+        SmtValue::BitVec(v, w) if w != 0 && w <= 128 => Some(BvOperand::Narrow(v & bv_mask(w), w)),
+        value => {
+            let (value, width) = value.bitvec_to_biguint()?;
+            (width != 0 && width <= crate::MAX_BITVECTOR_WIDTH)
+                .then_some(BvOperand::Wide(value, width))
+        }
+    }
+}
+
+/// Both operands, each evaluated once (left first; a left operand that does
+/// not evaluate leaves the right one unevaluated).
+fn bv_operands(
+    lhs: &ChcExpr,
+    rhs: &ChcExpr,
+    model: &FxHashMap<String, SmtValue>,
+) -> Option<(BvOperand, BvOperand)> {
+    let lhs = eval_bv_operand(lhs, model)?;
+    let rhs = eval_bv_operand(rhs, model)?;
+    Some((lhs, rhs))
+}
+
+/// The exact lane of two operands of one width.
+fn exact_bitvec_operands(lhs: BvOperand, rhs: BvOperand) -> Option<(BigUint, BigUint, u32)> {
+    let (lhs, lhs_width) = lhs.wide();
+    let (rhs, rhs_width) = rhs.wide();
+    (lhs_width == rhs_width).then_some((lhs, rhs, lhs_width))
+}
+
 /// Extract an exact BV value from a subexpression.
-///
-/// This is intentionally separate from [`eval_bv_val`]: the common <=128-bit
-/// arithmetic lane stays on `u128`, while exact wide operations opt into
-/// `BigUint` explicitly.
 pub(super) fn eval_bv_big_val(
     expr: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
@@ -114,7 +156,8 @@ pub(super) fn eval_bv_binop(
     model: &FxHashMap<String, SmtValue>,
     op: BvBinOp,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -141,7 +184,7 @@ pub(super) fn eval_bv_binop(
         return Some(SmtValue::BitVec(value & mask, aw));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     let mask = big_bv_modulus(width) - BigUint::one();
     let value = match op {
         BvBinOp::Add => av + bv,
@@ -184,7 +227,8 @@ pub(super) fn eval_bv_cmp(
     model: &FxHashMap<String, SmtValue>,
     op: BvCmpOp,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -201,7 +245,7 @@ pub(super) fn eval_bv_cmp(
         return Some(SmtValue::Bool(result));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     let result = match op {
         BvCmpOp::Ult => av < bv,
         BvCmpOp::Ule => av <= bv,
@@ -221,7 +265,8 @@ pub(super) fn eval_bv_ashr(
     rhs: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -238,7 +283,7 @@ pub(super) fn eval_bv_ashr(
         return Some(SmtValue::BitVec(result, aw));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     let signed = bv_to_signed_big(av, width);
     let result = if bv >= BigUint::from(width) {
         if signed.is_negative() {
@@ -258,7 +303,8 @@ pub(super) fn eval_bv_signed_div(
     rhs: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -273,7 +319,7 @@ pub(super) fn eval_bv_signed_div(
         return Some(SmtValue::BitVec((q as u128) & bv_mask(aw), aw));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     let sa = bv_to_signed_big(av, width);
     let sb = bv_to_signed_big(bv, width);
     let result = if sb.is_zero() {
@@ -294,7 +340,8 @@ pub(super) fn eval_bv_signed_rem(
     rhs: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -305,7 +352,7 @@ pub(super) fn eval_bv_signed_rem(
         return Some(SmtValue::BitVec((result as u128) & bv_mask(aw), aw));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     if bv.is_zero() {
         return Some(SmtValue::bitvec_from_biguint(av, width));
     }
@@ -322,7 +369,8 @@ pub(super) fn eval_bv_smod(
     rhs: &ChcExpr,
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
-    if let (Some((av, aw)), Some((bv, bw))) = (eval_bv_val(lhs, model), eval_bv_val(rhs, model)) {
+    let (lhs, rhs) = bv_operands(lhs, rhs, model)?;
+    if let (Some((av, aw)), Some((bv, bw))) = (lhs.narrow(), rhs.narrow()) {
         if aw != bw {
             return None;
         }
@@ -343,7 +391,7 @@ pub(super) fn eval_bv_smod(
         return Some(SmtValue::BitVec((result as u128) & bv_mask(aw), aw));
     }
 
-    let (av, bv, width) = exact_bitvec_operands(lhs, rhs, model)?;
+    let (av, bv, width) = exact_bitvec_operands(lhs, rhs)?;
     if bv.is_zero() {
         return Some(SmtValue::bitvec_from_biguint(av, width));
     }

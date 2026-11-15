@@ -58,7 +58,7 @@ fn retain_published_dimacs_proof(
     binary: bool,
 ) -> io::Result<RetainedDimacsPublication> {
     let resolved = resolved_dimacs_proof_path(path)?;
-    let descriptor = {
+    let (descriptor, recheck) = {
         let owned = owned_dimacs_proofs()
             .lock()
             .map_err(|_| dimacs_proof_registry_error())?;
@@ -73,7 +73,12 @@ fn retain_published_dimacs_proof(
                 "same-run DIMACS proof seal changed before authorization",
             ));
         }
-        state.descriptor.try_clone()?
+        let recheck = if state.custody.fast_publication {
+            DimacsPublicationRecheck::Identity
+        } else {
+            DimacsPublicationRecheck::Bytes
+        };
+        (state.descriptor.try_clone()?, recheck)
     };
     RetainedDimacsPublication::capture(
         descriptor,
@@ -81,6 +86,7 @@ fn retain_published_dimacs_proof(
         "DIMACS proof",
         Some(published),
         DimacsPublicationInvalidation::Proof { binary },
+        recheck,
     )
 }
 

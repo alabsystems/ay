@@ -335,7 +335,7 @@ pub unsafe extern "C" fn Z3_parser_context_from_string(
     // SAFETY: `ffi_guard_ptr` guards `c`; `pc` is a separate allocation.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(_handle) = pc.as_mut() else {
+            let Some(handle) = pc.as_mut() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg =
                     Some("Z3_parser_context_from_string: null parser context".to_string());
@@ -356,12 +356,26 @@ pub unsafe extern "C" fn Z3_parser_context_from_string(
                 }
                 Some(Ok(t)) => t,
             };
-            let terms = super::solver::parse_solver_transaction(
+            // Earlier texts' declarations, sorts and definitions stay in
+            // scope (z3's parser context keeps one command context), and each
+            // declared name is the context's declaration of that name and
+            // signature (see `parse_binding`).
+            let scope = super::parse_binding::ParseScope {
+                prior: handle.parse_prior.clone(),
+                ..super::parse_binding::ParseScope::default()
+            };
+            let terms = match super::solver::parse_solver_transaction_scoped(
                 ctx,
                 &text,
                 "Z3_parser_context_from_string",
-            )
-            .unwrap_or_default();
+                &scope,
+            ) {
+                Some(content) => {
+                    handle.parse_prior.extend(content.prior);
+                    content.assertions
+                }
+                None => Vec::new(),
+            };
             let asts = terms
                 .into_iter()
                 .map(|term| term_to_ast(ctx, term))

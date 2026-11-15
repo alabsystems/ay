@@ -151,7 +151,7 @@ fn rejects_free_query_index() {
 #[test]
 fn rejects_more_distinct_accesses_than_ghost_slots() {
     let problem = one_array_problem(|array| {
-        ChcExpr::or(
+        ChcExpr::and(
             ChcExpr::ne(
                 ChcExpr::select(array.clone(), ChcExpr::Int(0)),
                 ChcExpr::Int(0),
@@ -190,17 +190,32 @@ fn rejects_non_variable_body_argument_and_non_plain_array_base() {
     let spec = GhostPairSpec::analyze(&non_variable, 1);
     assert!(query_anchored_ghost_candidates(&non_variable, &spec).is_none());
 
-    let stored_base = one_array_problem(|array| {
-        ChcExpr::ne(
-            ChcExpr::select(
-                ChcExpr::store(array, ChcExpr::Int(0), ChcExpr::Int(1)),
-                ChcExpr::Int(0),
+    // add_clause folds ITE(true, a, a); retain the unsupported source shape
+    // explicitly so this remains an array-base admission control.
+    let array = var("array", int_array());
+    let constraint = ChcExpr::ne(
+        ChcExpr::select(
+            ChcExpr::Op(
+                ChcOp::Ite,
+                vec![
+                    Arc::new(ChcExpr::Bool(true)),
+                    Arc::new(array.clone()),
+                    Arc::new(array),
+                ],
             ),
             ChcExpr::Int(0),
-        )
-    });
-    let spec = GhostPairSpec::analyze(&stored_base, 1);
-    assert!(query_anchored_ghost_candidates(&stored_base, &spec).is_none());
+        ),
+        ChcExpr::Int(0),
+    );
+    let mut conditional_base = one_array_problem(|_| constraint.clone());
+    conditional_base
+        .clauses_mut()
+        .last_mut()
+        .expect("query")
+        .body
+        .constraint = Some(constraint);
+    let spec = GhostPairSpec::analyze(&conditional_base, 1);
+    assert!(query_anchored_ghost_candidates(&conditional_base, &spec).is_none());
 }
 
 #[test]
@@ -240,7 +255,7 @@ fn exact_scalar_boundary_rejects_functions_and_datatype_terms() {
 
     let datatype_sort = ChcSort::Datatype {
         name: "Cell".to_string(),
-        constructors: Arc::new(Vec::new()),
+        constructors: crate::ChcDtConstructors::new(Vec::new()),
     };
     let datatype_var = ChcVar::new("cell", datatype_sort);
     let datatype_expr = ChcExpr::eq(

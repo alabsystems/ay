@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 2.0
+* Version 2 spelling of the same defect. `d` is the one divide operator version 2 has (`c`, `n`
+* and `m` are version 3), and version 2 `pol` has no subtract-constant step, so the degree of
+* `-i64::MAX` comes straight from the formula.
+f 1
+p 1 9223372036854775808 d
+e 1 x1 1 x2 >= 0 ; 2
+output NONE
+conclusion NONE
+end pseudo-Boolean proof

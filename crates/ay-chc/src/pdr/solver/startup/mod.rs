@@ -96,6 +96,17 @@ impl PdrSolver {
     /// - narrow predicates (algebraic/accumulator classes where discovery wins),
     /// - mod/div/multiplication constraints (parity/scaled-sum passes win),
     /// - BV/array/datatype problems (they have dedicated startup routes).
+    ///
+    /// Real-sorted state is deliberately NOT an exclusion. The sally / vmt
+    /// LRA transition systems (CHC-COMP LRA-Lin: 272 of 277 instances have
+    /// Real state, arity 9-791, median 68, all linear, no mod/div) are exactly
+    /// the wide-var shape this cap was written for, and unlike BV they have no
+    /// alternative startup route. With the cap disabled on them the discovery
+    /// passes (Bool-pair clauses + Bool->comparison implications, quadratic in
+    /// the state width, ~3 s per candidate on `om1_with_relays_agreement`)
+    /// consumed the entire engine window and the IC3 loop never started
+    /// (`frames=2, obligations=0, interpolation attempts=0` after 30-240 s).
+    /// Measured with the cap: level 1 -> 7 and 0 -> 42 obligations in 30 s.
     fn wide_var_startup_budget(&self) -> Option<std::time::Duration> {
         let remaining = self
             .solve_deadline
@@ -111,11 +122,7 @@ impl PdrSolver {
         if max_arity < WIDE_VAR_STARTUP_ARITY {
             return None;
         }
-        if self.problem.has_bv_sorts()
-            || self.uses_arrays
-            || self.problem.has_datatype_sorts()
-            || self.problem.has_real_sorts()
-        {
+        if self.problem.has_bv_sorts() || self.uses_arrays || self.problem.has_datatype_sorts() {
             return None;
         }
         // Linear shape only (SimpleLoop/MultiPredLinear): hyperedge problems
@@ -157,6 +164,34 @@ impl PdrSolver {
     pub(in crate::pdr::solver) fn startup_budget_exhausted(&self) -> bool {
         self.startup_deadline
             .is_some_and(|d| ay_core::time::Instant::now() >= d)
+    }
+
+    /// inc-12 x Rung 0: whether an `Unknown` from a startup discovery phase
+    /// was the wide-var startup cap running out rather than a cancellation of
+    /// the solve. Returns `true` when the solve should continue past startup.
+    ///
+    /// `is_cancelled` polls the thread SMT deadline (Rung 0: once it has
+    /// passed every `check_sat` is refused, so engine loops stop), and the cap
+    /// is installed as exactly such a deadline, so every discovery pass bails
+    /// with `Unknown` as soon as the cap expires. The cap's contract is that
+    /// running out stops DISCOVERY and hands the rest of the window to the
+    /// main loop ("Exhaustion is NOT a failure", `run_fixpoint_discovery`).
+    /// Leave the startup scope, which restores the enclosing SMT deadline, and
+    /// ask again: only a cancellation that survives leaving the scope (solve
+    /// deadline, portfolio token, an enclosing SMT or thread solve deadline,
+    /// memory, the no-progress breaker) is terminal. Fails closed: with no cap
+    /// installed, or before it has run out, the answer is `false` and the
+    /// scope is kept.
+    fn leave_spent_startup_scope(
+        &self,
+        startup_scope: &mut Option<crate::smt::ScopedSmtDeadline>,
+    ) -> bool {
+        if startup_scope.is_none() || !self.startup_budget_exhausted() {
+            return false;
+        }
+        // Dropping the guard restores the enclosing thread SMT deadline.
+        *startup_scope = None;
+        !self.is_cancelled()
     }
 
     fn allow_post_cancel_startup_salvage(&self) -> bool {
@@ -355,30 +390,50 @@ impl PdrSolver {
             // guard is dropped before the end-of-startup direct safety check
             // and the main loop, which keep their full budgets. Timing-only:
             // candidates that miss the window are simply not discovered.
-            let _startup_total_deadline_guard = self.wide_var_startup_budget().map(|budget| {
+            //
+            // Since Rung 0, `is_cancelled` also polls the thread SMT deadline,
+            // so the moment this cap expires every discovery pass bails with
+            // `Unknown`. That `Unknown` means "startup is over", not "the
+            // solve is cancelled": `leave_spent_startup_scope` tells the two
+            // apart. One deadline instant feeds both the field and the scope
+            // so they expire together.
+            let mut startup_total_deadline_guard = self.wide_var_startup_budget().map(|budget| {
                 if self.config.verbose {
                     safe_eprintln!(
                         "PDR: wide-var startup cap — total discovery budget {:?} (inc-12)",
                         budget
                     );
                 }
-                self.startup_deadline = Some(ay_core::time::Instant::now() + budget);
-                crate::smt::ScopedSmtDeadline::install(budget)
+                let deadline = ay_core::time::Instant::now() + budget;
+                self.startup_deadline = Some(deadline);
+                crate::smt::ScopedSmtDeadline::install_until(deadline)
             });
 
+            let mut startup_cap_spent = false;
             let fixpoint_cancelled = if let Some(result) = self.run_fixpoint_discovery() {
                 if !matches!(result, PdrResult::Unknown) {
                     return Some(result);
                 }
-                // Fixpoint was cancelled (solve_deadline or portfolio). The
-                // post-cancel kernel path below is only allowed to continue if
-                // the startup timeout helper still finds bounded budget.
-                true
+                if self.leave_spent_startup_scope(&mut startup_total_deadline_guard) {
+                    // The wide-var cap ran out mid-fixpoint and nothing else
+                    // cancelled the solve: skip the rest of discovery (its
+                    // budget is spent) and go straight to the end-of-startup
+                    // direct safety check and the main loop.
+                    startup_cap_spent = true;
+                    false
+                } else {
+                    // Fixpoint was cancelled (solve_deadline or portfolio). The
+                    // post-cancel kernel path below is only allowed to continue if
+                    // the startup timeout helper still finds bounded budget.
+                    true
+                }
             } else {
                 false
             };
 
-            if !fixpoint_cancelled {
+            // A spent cap runs neither branch: no post-fixpoint check, no
+            // nonfixpoint tail and no post-cancel salvage.
+            if !fixpoint_cancelled && !startup_cap_spent {
                 // The fixpoint loop can now seed phase-conditional invariants for
                 // small ITE loops. Check immediately so a proof-carrying frame does
                 // not spend the remaining focused PDR budget in the late discovery
@@ -415,11 +470,17 @@ impl PdrSolver {
                     }
                 }
 
-                // Normal path: run full nonfixpoint discovery.
+                // Normal path: run full nonfixpoint discovery. An `Unknown`
+                // from the wide-var cap running out mid-pass ends discovery,
+                // not the solve (see `leave_spent_startup_scope`).
                 if let Some(result) = self.run_nonfixpoint_discovery() {
-                    return Some(result);
+                    let cap_spent_mid_pass = matches!(result, PdrResult::Unknown)
+                        && self.leave_spent_startup_scope(&mut startup_total_deadline_guard);
+                    if !cap_spent_mid_pass {
+                        return Some(result);
+                    }
                 }
-            } else {
+            } else if fixpoint_cancelled {
                 // Cancelled path: fail closed if the solve deadline/cancellation
                 // budget is exhausted. If a caller reaches this path with bounded
                 // budget still available, keep the old kernel salvage path.

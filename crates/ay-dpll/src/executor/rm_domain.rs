@@ -74,6 +74,8 @@ use super::Executor;
 
 mod literal_pins;
 use literal_pins::RmLiteralAtoms;
+mod quantifier_walk;
+use quantifier_walk::{walk_quantifier_body, BinderScope};
 
 /// The five IEEE 754 / SMT-LIB rounding modes, in canonical order.
 pub(in crate::executor) const RM_MODES: [RoundingMode; 5] = [
@@ -99,10 +101,7 @@ pub(in crate::executor) fn is_rm_sort(sort: &Sort) -> bool {
     matches!(sort, Sort::Uninterpreted(name) if name == "RoundingMode")
 }
 
-/// Whether `term` is a *literal* rounding mode: a nullary application or a
-/// variable whose name resolves via `RoundingMode::from_name` (mirrors
-/// `theories/fp/support.rs::is_literal_rounding_mode`; the Var arm only
-/// matters for embedder-built terms — the frontend seals the ten names).
+/// Whether `term` is a genuine typed builtin rounding-mode literal.
 pub(in crate::executor) fn is_rm_literal(terms: &TermStore, term: TermId) -> bool {
     rm_literal_mode(terms, term).is_some()
 }
@@ -112,11 +111,7 @@ pub(in crate::executor) fn rm_literal_mode(
     terms: &TermStore,
     term: TermId,
 ) -> Option<RoundingMode> {
-    match terms.get(term) {
-        TermData::App(sym, args) if args.is_empty() => RoundingMode::from_name(sym.name()),
-        TermData::Var(name, _) => RoundingMode::from_name(name),
-        _ => None,
-    }
+    ay_fp::rewriter::rounding_mode_literal(terms, term)
 }
 
 /// Intern the literal term for `mode`, exactly as the frontend elaborates RM
@@ -246,7 +241,7 @@ impl Executor {
                         || !walk_quantifier_body(
                             terms,
                             *body,
-                            &mut vars.iter().map(|(n, _)| n.clone()).collect(),
+                            &mut BinderScope::new(vars.iter().map(|(n, _)| n.clone()).collect()),
                             &mut needs_coverage,
                             &mut coverage_set,
                             &mut literal_domain_mention,
@@ -265,6 +260,19 @@ impl Executor {
         }
         if needs_coverage.len() > RM_COVERAGE_MAX_TERMS {
             // NEVER proceed uncovered (a wrong `sat` would be reachable).
+            return RmDomainAxioms::FailClose;
+        }
+        // The generated domain axioms need genuine builtin constants and
+        // connectives. A raw caller can register these names as user heads;
+        // neither the source registry nor operand position grants them a
+        // builtin meaning. Do not manufacture axioms in that namespace.
+        if RM_MODES
+            .iter()
+            .any(|mode| terms.is_declared_function(mode.name()))
+            || ["=", "and", "or"]
+                .iter()
+                .any(|name| terms.is_declared_function(name))
+        {
             return RmDomainAxioms::FailClose;
         }
 
@@ -292,128 +300,6 @@ impl Executor {
             axioms.push(terms.mk_or(eqs));
         }
         RmDomainAxioms::Axioms(axioms)
-    }
-}
-
-/// Walk a quantifier body classifying its RoundingMode mentions.
-///
-/// Returns `true` when every RM mention is handled soundly:
-/// * an RM literal in an FP rounding-op mode slot — benign, ignored (this is
-///   the standard quantified-FP pattern, e.g. `forall i. … (fp.add RNE …)`);
-/// * an RM literal in a domain position — sets `literal_domain_mention` so
-///   the distinct-5 axiom (ground, valid) constrains every instantiation, and
-///   collects any different-mode literal equality into `literal_atoms`: the
-///   atom is GROUND (both operands are mode literals), so instantiation leaves
-///   it untouched and a top-level pin on it is both valid and effective;
-/// * a plain RM-sorted `Var` that is NOT a bound variable of any enclosing
-///   binder — a GLOBAL constant (bound-variable-carrying terms are never
-///   plain global Vars), so the ground coverage disjunction reaches it:
-///   collected into `needs_coverage`.
-///
-/// Returns `false` (caller MUST fail closed) for every other shape: an
-/// RM-sorted binder of a nested quantifier, an RM-sorted Var that shadows an
-/// enclosing binder name, any RM-sorted application/ite (it may carry bound
-/// variables — asserting ground coverage over it would be ill-formed), and
-/// any `let` whose subtree mentions the sort (binding structure makes
-/// groundness analysis unreliable; rare, conservative).
-fn walk_quantifier_body(
-    terms: &TermStore,
-    body: TermId,
-    binder_names: &mut Vec<String>,
-    needs_coverage: &mut Vec<TermId>,
-    coverage_set: &mut HashSet<TermId>,
-    literal_domain_mention: &mut bool,
-    literal_atoms: &mut RmLiteralAtoms,
-) -> bool {
-    // No cross-call seen-set: the binder-name context matters, and quantifier
-    // bodies are small relative to the ground DAG.
-    let data = terms.get(body).clone();
-    if is_rm_sort(terms.sort(body)) && !is_rm_literal(terms, body) {
-        match &data {
-            TermData::Var(name, _) => {
-                if binder_names.iter().any(|b| b == name) {
-                    return false; // bound RM var (or shadowing) — fail closed
-                }
-                if coverage_set.insert(body) {
-                    needs_coverage.push(body);
-                }
-            }
-            _ => return false, // RM-valued app/ite/let under a binder
-        }
-    }
-    match data {
-        TermData::App(sym, args) => {
-            literal_atoms.record(terms, body, &sym, &args);
-            let mode_slot = fp_rounding_mode_operand(sym.name(), &args);
-            for (i, &a) in args.iter().enumerate() {
-                let in_mode_slot = i == 0 && mode_slot == Some(a);
-                if is_rm_literal(terms, a) {
-                    if !in_mode_slot {
-                        *literal_domain_mention = true;
-                    }
-                    continue;
-                }
-                if !walk_quantifier_body(
-                    terms,
-                    a,
-                    binder_names,
-                    needs_coverage,
-                    coverage_set,
-                    literal_domain_mention,
-                    literal_atoms,
-                ) {
-                    return false;
-                }
-            }
-            true
-        }
-        TermData::Not(inner) => walk_quantifier_body(
-            terms,
-            inner,
-            binder_names,
-            needs_coverage,
-            coverage_set,
-            literal_domain_mention,
-            literal_atoms,
-        ),
-        TermData::Ite(c, th, el) => [c, th, el].into_iter().all(|x| {
-            if is_rm_literal(terms, x) {
-                *literal_domain_mention = true;
-                return true;
-            }
-            walk_quantifier_body(
-                terms,
-                x,
-                binder_names,
-                needs_coverage,
-                coverage_set,
-                literal_domain_mention,
-                literal_atoms,
-            )
-        }),
-        // `let` under a binder: fail closed iff its subtree mentions RM at
-        // all (conservative — see doc comment).
-        TermData::Let(..) => !subtree_mentions_rm_sort(terms, body),
-        TermData::Forall(vars, b, _) | TermData::Exists(vars, b, _) => {
-            if vars.iter().any(|(_, s)| is_rm_sort(s)) {
-                return false;
-            }
-            let added = vars.len();
-            binder_names.extend(vars.iter().map(|(n, _)| n.clone()));
-            let ok = walk_quantifier_body(
-                terms,
-                b,
-                binder_names,
-                needs_coverage,
-                coverage_set,
-                literal_domain_mention,
-                literal_atoms,
-            );
-            binder_names.truncate(binder_names.len() - added);
-            ok
-        }
-        // Constants and non-RM vars carry no RM structure.
-        _ => true,
     }
 }
 

@@ -11,6 +11,8 @@ use crate::api::proofs::strict_verdict_from_result;
 use crate::api::*;
 use ay_core::{AletheRule, FarkasAnnotation, ProofStep, Symbol, TheoryLemmaKind};
 mod duplicate_authored_root;
+mod mixed_arithmetic_fp;
+mod quantified_fp;
 #[test]
 fn finite_enum_artifact_is_native_strict_and_explicitly_holey_on_alethe_wire() {
     #[allow(deprecated)]
@@ -106,6 +108,8 @@ fn surface_less_finite_enum_declines_alethe_but_exports_native_bundle() {
     let checked = re_check_bundle_strict(&bundle).expect("strictly recheck surface-less bundle");
     assert_eq!(checked.assume_terms.len(), 6);
 }
+
+include!("test_proof_artifact/canonical_rescue_verdict_gate.rs");
 
 /// A native API assertion of literal `false` is already an empty-clause
 /// obligation. It must still publish a concrete, strictly checked artifact;
@@ -252,6 +256,9 @@ fn artifact_qf_bool_accepts_strict_and_restricted_subset() {
         }
         StrictProofVerdict::Rejected(reason) => {
             panic!("pure Boolean proof must pass strict validation, got: {reason}");
+        }
+        StrictProofVerdict::Stopped(stop) => {
+            panic!("pure Boolean proof must pass strict validation, got a stop: {stop:?}");
         }
     }
     assert_eq!(
@@ -1805,9 +1812,11 @@ fn qfufbv_binary_congruence_is_strict_verified() {
 /// `validate_fp_ground_eval`'s full re-derivation, substituting the clause's
 /// own ground bindings and evaluating the residual formula with the independent
 /// correctly-rounded exact integer/rational IEEE-754 kernel. Pinned Carcara
-/// has no floating-point sort grammar, so the textual Alethe boundary must
-/// decline rather than publish an unparseable document; the portable native
-/// bundle remains the independently re-checkable artifact for this theory.
+/// has no floating-point sort grammar; since owner decision D7 (2026-09-22)
+/// the textual artifact is PUBLISHED at the strict-checker class with that
+/// disclosed as `carcara_surface = unsupported(...)`, instead of vanishing and
+/// reaching every consumer as `Unknown`. The portable native bundle remains
+/// the independently re-checkable artifact for this theory.
 fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
     let proof = solver
         .last_proof()
@@ -1839,9 +1848,33 @@ fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
         ay_proof::terminal_trust_report(proof).is_trust_free(),
         "the native proof must contain no trust-family step",
     );
+    let artifact = solver.export_last_unsat_artifact().expect(
+        "a strict-checked FP refutation publishes its artifact with the surface disclosed (D7)",
+    );
     assert!(
-        solver.export_last_unsat_artifact().is_none(),
-        "an FP proof must not claim a pinned-Carcara Alethe surface",
+        matches!(
+            artifact.strict_verdict,
+            StrictProofVerdict::Verified(ref quality) if quality.is_complete()
+        ),
+        "the FP artifact stands on the strict checker: {:?}",
+        artifact.strict_verdict,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+    assert!(
+        !artifact.alethe.contains("UNVERIFIABLE PROOF") && !artifact.alethe.contains(":rule trust"),
+        "the FP document renders what the strict checker accepted:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        artifact
+            .carcara_surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains("FloatingPoint")),
+        "an FP artifact must disclose its surface as outside pinned Carcara's grammar, got {}",
+        artifact.carcara_surface,
     );
     let bundle = solver
         .export_last_unsat_bundle()
@@ -1849,6 +1882,91 @@ fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
     let checked = re_check_bundle_strict(&bundle)
         .expect("the native FP bundle must pass an independent offline replay");
     assert!(checked.quality.is_complete(), "{}", checked.quality);
+}
+
+/// D7 (2026-09-22): a `Seq`-sorted refutation publishes its artifact at the
+/// strict-checker class with the surface disclosed. Before this, every
+/// Vec/slice/String obligation ay refuted reached Trust as
+/// `Unknown { "UNSAT but no strict-checked proof artifact was produced" }`,
+/// because the printer refused the `Seq` sort pinned Carcara cannot parse.
+#[test]
+fn seq_sorted_refutation_publishes_artifact_with_unsupported_surface_disclosed() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const s (Seq Int))
+            (assert (= (seq.len s) 1))
+            (assert (= (seq.len s) 2))
+            "#,
+        )
+        .expect("seq fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "a sequence length pinned to two constants is UNSAT, got {verdict:?} / {:?}",
+        solver.unknown_reason(),
+    );
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("a strict-checked Seq refutation publishes its artifact (D7)");
+    assert!(
+        matches!(artifact.strict_verdict, StrictProofVerdict::Verified(_)),
+        "the Seq artifact stands on the strict checker: {:?}",
+        artifact.strict_verdict,
+    );
+    assert_eq!(
+        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
+        Ok(()),
+    );
+    assert!(
+        (artifact.alethe.contains("(step ") || artifact.alethe.contains("(assume "))
+            && !artifact.alethe.contains("UNVERIFIABLE PROOF"),
+        "the Seq document renders what the strict checker accepted:\n{}",
+        artifact.alethe,
+    );
+    assert!(
+        artifact
+            .carcara_surface
+            .unsupported_reason()
+            .is_some_and(|reason| reason.contains("(Seq Int)")),
+        "a Seq artifact must disclose its surface as outside pinned Carcara's grammar, got {}",
+        artifact.carcara_surface,
+    );
+}
+
+/// Positive control for D7: a plain integer refutation carries
+/// `carcara_surface = supported`, so the disclosure is a verdict about the
+/// document, not a label every artifact wears.
+#[test]
+fn int_refutation_artifact_carries_supported_surface() {
+    let mut solver = Solver::new(Logic::QfLia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2("(declare-const x Int)(assert (< x 1))(assert (> x 2))")
+        .expect("int fixture must parse");
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "{verdict:?} / {:?}",
+        solver.unknown_reason()
+    );
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("an integer refutation publishes its artifact");
+    assert!(
+        matches!(artifact.strict_verdict, StrictProofVerdict::Verified(_)),
+        "{:?}",
+        artifact.strict_verdict,
+    );
+    assert_eq!(
+        artifact.carcara_surface,
+        CarcaraSurface::Supported,
+        "an Int/Bool document is inside pinned Carcara's grammar"
+    );
 }
 
 /// Regression (#fp-ground-cert): a GROUND floating-point refutation whose only
@@ -2590,37 +2708,62 @@ fn uflia_congruence_value_conflict_without_argument_equality_is_sat() {
 /// declines because the problem authors no `(not (= i j))` premise, so the
 /// reconstruction fell through to the whole-problem `trust` closer and the
 /// mandatory publication gate degraded the verdict to `unknown`.
+///
+/// Which lane certifies the direct read depends on the strict checker: the
+/// guarded collapse at the head of the authored cascade refutes the raw
+/// authored roots with one `BvBitBlast` lemma wherever the checker can
+/// bit-blast the read. Measured at 1c4ed9d77, that joint blast (400 to 640
+/// printed lines, trust-free) was already the published proof over a 4-, 9-
+/// and 16-bit index; only the 8-bit index took the derived-disequality ROW2
+/// lane, because the checker refused to scalarize an 8-bit array there. Now
+/// that it reads such an array through its store chain instead, the direct
+/// fixture is certified like the other widths (one `BvBitBlast` lemma, 489
+/// printed lines, trust-free), and the ROW2 lane is pinned through an SSA
+/// array name, which the collapse does not rebuild.
 #[test]
 fn qfabv_row2_derived_index_disequality_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfAbv);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
-            (declare-const i (_ BitVec 8))
-            (declare-const j (_ BitVec 8))
-            (declare-const v (_ BitVec 8))
-            (assert (= i #x05))
-            (assert (= j #x06))
-            (assert (= (select a j) #xAA))
-            (assert (= (select (store a i v) j) #xBB))
-            "#,
-        )
-        .expect("ROW2 derived-disequality fixture must parse");
+    for (fixture, read, lane) in [
+        (
+            "(assert (= (select (store a i v) j) #xBB))",
+            "direct",
+            TheoryLemmaKind::BvBitBlast,
+        ),
+        (
+            "(declare-const b (Array (_ BitVec 8) (_ BitVec 8)))
+             (assert (= b (store a i v)))
+             (assert (= (select b j) #xBB))",
+            "SSA",
+            TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        ),
+    ] {
+        let mut solver = Solver::new(Logic::QfAbv);
+        solver.set_produce_proofs(true);
+        solver
+            .parse_smtlib2(&format!(
+                "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+                 (declare-const i (_ BitVec 8))
+                 (declare-const j (_ BitVec 8))
+                 (declare-const v (_ BitVec 8))
+                 (assert (= i #x05))
+                 (assert (= j #x06))
+                 (assert (= (select a j) #xAA))
+                 {fixture}"
+            ))
+            .expect("ROW2 derived-disequality fixture must parse");
 
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "a write at #x05 cannot change the cell at #x06 (z3 5.0.0 agrees), \
-         got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_refutation_is_plainly_checked(
-        &solver,
-        TheoryLemmaKind::ArraySelectStore { index_eq: false },
-        "ROW2 derived-index-disequality",
-    );
+        let verdict = solver.check_sat();
+        assert!(
+            verdict.is_unsat(),
+            "{read}: a write at #x05 cannot change the cell at #x06 (z3 5.0.0 \
+             agrees), got {verdict:?} / {:?}",
+            solver.unknown_reason(),
+        );
+        assert_refutation_is_plainly_checked(
+            &solver,
+            lane,
+            &format!("ROW2 derived-index-disequality ({read} read)"),
+        );
+    }
 }
 
 /// Regression (#trust-count→0): a ROW1 read-over-write reached through an
@@ -2866,15 +3009,32 @@ fn assert_forall_inst_equality_refutation_is_plainly_checked(solver: &Solver) {
         "refutation must instantiate the authored forall with `forall_inst`:\n{}",
         artifact.alethe,
     );
+    // A CHECKED equality-reasoning step, named as a set rather than as one
+    // rule. #alpha-quantifier-sharing changed which one this fixture takes:
+    // MEASURED on the same query, `--no-alpha-quantifier-sharing` closes it
+    // with `eq_transitive` (5 steps) and the default closes it with
+    // `eq_congruent_pred` + `distinct_elim` (12 steps). Both publish
+    // `unproved_steps=0 trust_free=yes ay_self_checkable=yes
+    // unsat_admission=strict-proof`, so nothing about the evidence moved — only
+    // the route did, because with sharing on the reconstruction's re-interned
+    // `forall` IS the authored term.
+    //
+    // This still refuses a rubber stamp: the plain strict check above accepts
+    // the whole document, the hole-free assertion below admits no `trust`, and
+    // the near-miss twin `forall_instance_shared_endpoint_agreeing_pin_is_not_unsat`
+    // keeps a fabricated endpoint from turning a SATISFIABLE problem `unsat`.
     assert!(
         proof.steps.iter().any(|step| matches!(
             step,
             ProofStep::Step {
-                rule: AletheRule::EqTransitive,
+                rule: AletheRule::EqTransitive | AletheRule::EqCongruentPred,
+                ..
+            } | ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::EufTransitive | TheoryLemmaKind::EufCongruentPred,
                 ..
             }
         )),
-        "refutation must close through a checked transitivity chain:\n{}",
+        "refutation must close through a checked equality-reasoning step:\n{}",
         artifact.alethe,
     );
     assert!(
@@ -3380,289 +3540,7 @@ fn datatype_constructor_congruence_closure_is_strict_verified() {
     );
 }
 
-/// Assert the shared post-conditions of a refutation this round's string
-/// passes rebuild, and that the step the checker accepted carries `kind`.
-///
-/// The PLAIN-checker call is the load-bearing one. `artifact.strict_verdict`
-/// is NOT enough on its own: `strict_verdict_with_deferred_trust`
-/// (`api/proofs.rs`) also reports `Verified` when the deferred-trust RESCUE
-/// re-discharges an unverified leaf, so it cannot distinguish "the step was
-/// checked" from "the step was tolerated". `check_proof_strict_with_datatypes`
-/// is the same call `mint_unsat_certificate` makes BEFORE any rescue, and it
-/// runs each new validator's full independent re-derivation.
-fn assert_string_refutation_carries_kind(solver: &Solver, kind: TheoryLemmaKind) {
-    let artifact = solver
-        .export_last_unsat_artifact()
-        .expect("a certified UNSAT must publish a proof artifact");
-    let proof = solver
-        .last_proof()
-        .expect("a certified UNSAT publishes its proof");
-
-    solver
-        .executor
-        .check_proof_strict_with_datatypes(proof)
-        .unwrap_or_else(|error| {
-            panic!(
-                "the PLAIN strict checker must accept the refutation, got \
-                 {error}\n{}",
-                artifact.alethe,
-            )
-        });
-
-    // ...and the step it accepted is the expected rule, not something else.
-    // Read the proof IR, not the printed text: Carcara has no rule for these
-    // internal certificates, so the WIRE name is an honest `hole` while AY's
-    // own checker validates the kind.
-    assert!(
-        proof
-            .steps
-            .iter()
-            .any(|step| matches!(step, ProofStep::TheoryLemma { kind: k, .. } if *k == kind)),
-        "refutation must contain a checker-validated {kind:?} lemma:\n{}",
-        artifact.alethe,
-    );
-    assert!(
-        artifact.quality.is_complete(),
-        "proof must have zero trust/hole steps: {}\n{}",
-        artifact.quality,
-        artifact.alethe,
-    );
-    assert_eq!(
-        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
-        Ok(()),
-    );
-}
-
-/// Regression (#trust-count→0, the extended-function reduction shape):
-/// `(= x "hello")` propagated into `(= (str.substr x 1 3) "abc")` leaves a
-/// GROUND claim — `str.substr("hello", 1, 3)` is `"ell"`, not `"abc"` — so the
-/// problem is UNSAT and z3 5.0.0 agrees. AY computed that every time and
-/// published `unknown`, because the reduction happens outside the SAT trace and
-/// the reconstruction closed on the whole-problem `trust` fallback.
-///
-/// The rebuilt refutation transports the authored literal across the ground
-/// binding with `eq_congruent` / `eq_congruent_pred` (whose validators re-derive
-/// the per-argument matching themselves) and closes on `StringGroundEval`, whose
-/// INDEPENDENT evaluator re-decides `str.substr("hello", 1, 3)`.
-#[test]
-fn qfslia_substr_ground_substitution_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfSlia);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (= x "hello"))
-            (assert (= (str.substr x 1 3) "abc"))
-            "#,
-        )
-        .expect("substr reduction fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "str.substr(\"hello\", 1, 3) is \"ell\", not \"abc\"; UNSAT (z3 5.0.0 \
-         agrees), got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
-}
-
-/// The same pass over `str.indexof`: `str.indexof("abcab", "b", 0)` is the
-/// LEFTMOST occurrence, `1`, not `4`. z3 5.0.0 answers `unsat`.
-#[test]
-fn qfslia_indexof_ground_substitution_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfSlia);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (= x "abcab"))
-            (assert (= (str.indexof x "b" 0) 4))
-            "#,
-        )
-        .expect("indexof reduction fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "the leftmost \"b\" in \"abcab\" is at index 1, not 4; UNSAT (z3 5.0.0 \
-         agrees), got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
-}
-
-/// The same pass over `str.replace`, which rewrites only the FIRST occurrence:
-/// `str.replace("abcab", "b", "z")` is `"azcab"`, not `"abcaz"`. z3 5.0.0
-/// answers `unsat`.
-#[test]
-fn qfslia_replace_ground_substitution_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfSlia);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (= x "abcab"))
-            (assert (= (str.replace x "b" "z") "abcaz"))
-            "#,
-        )
-        .expect("replace reduction fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "str.replace rewrites only the first occurrence; UNSAT (z3 5.0.0 \
-         agrees), got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundEval);
-}
-
-/// Regression (#trust-count→0, the self-containment shape): every word contains
-/// itself, so `(not (str.contains x x))` is UNSAT for any `x`. z3 5.0.0 agrees.
-/// The refutation states that theorem as `StringContainmentIdentity`, whose
-/// validator re-checks that the two argument positions hold the SAME term.
-#[test]
-fn qfs_self_containment_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfS);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (not (str.contains x x)))
-            "#,
-        )
-        .expect("self-containment fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "a word contains itself; UNSAT (z3 5.0.0 agrees), got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringContainmentIdentity);
-}
-
-/// Regression (#trust-count→0, the ground-factor shape): `"c"` does not occur
-/// in `"ab"`, so no value of `x` makes `x ++ "c"` a factor of `"ab"` and
-/// `(str.contains "ab" (str.++ x "c"))` is UNSAT. z3 5.0.0 agrees.
-#[test]
-fn qfs_ground_factor_conflict_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfS);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (str.contains "ab" (str.++ x "c")))
-            "#,
-        )
-        .expect("ground-factor fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "\"c\" is not a factor of \"ab\"; UNSAT (z3 5.0.0 agrees), got \
-         {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundFactorConflict);
-}
-
-/// The boundary-block arm of the same kind: the last character of `x ++ "b"` is
-/// `"b"`, so `(str.suffixof "c" (str.++ x "b"))` is UNSAT. z3 5.0.0 agrees.
-/// This exercises the prefix/suffix schema (pattern no longer than the ground
-/// boundary block) rather than the factor scan.
-#[test]
-fn qfs_ground_suffix_conflict_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfS);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (str.suffixof "c" (str.++ x "b")))
-            "#,
-        )
-        .expect("ground-suffix fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "the last character of x ++ \"b\" is \"b\"; UNSAT (z3 5.0.0 agrees), \
-         got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringGroundFactorConflict);
-}
-
-/// Regression (#trust-count→0, the cancellation shape): `str.++` cancels on the
-/// right in the free monoid, so `x ++ "c" = y ++ "c"` forces `x = y` and the
-/// added `(not (= x y))` is UNSAT. z3 5.0.0 agrees. The refutation states the
-/// cancellation as `StringConcatCancellation`, whose validator re-derives the
-/// shared operand run and both residuals from the clause alone.
-#[test]
-fn qfslia_concat_cancellation_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfSlia);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (declare-fun y () String)
-            (assert (= (str.len x) (str.len y)))
-            (assert (= (str.++ x "c") (str.++ y "c")))
-            (assert (not (= x y)))
-            "#,
-        )
-        .expect("concat cancellation fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "str.++ cancels on the right; UNSAT (z3 5.0.0 agrees), got \
-         {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::StringConcatCancellation);
-}
-
-/// Regression (#trust-count→0, the regex length-bound shape): `x ++ x = "aaaa"`
-/// pins `2*len(x) = 4`, i.e. `len(x) = 2`, while
-/// `x` in `((_ re.loop 3 5) (str.to_re "a"))` pins `len(x) >= 3`. z3 5.0.0
-/// answers `unsat`.
-///
-/// The bound joins the existing length-arithmetic pool as a
-/// `RegexLengthLowerBound` clause, whose validator recomputes the regex's
-/// minimum word length compositionally, and the pool closes on a rational
-/// `LraFarkas` certificate.
-#[test]
-fn qfs_regex_length_lower_bound_unsat_proof_is_strict_verified() {
-    let mut solver = Solver::new(Logic::QfS);
-    solver.set_produce_proofs(true);
-    solver
-        .parse_smtlib2(
-            r#"
-            (declare-fun x () String)
-            (assert (= (str.++ x x) "aaaa"))
-            (assert (str.in_re x ((_ re.loop 3 5) (str.to_re "a"))))
-            "#,
-        )
-        .expect("regex length-bound fixture must parse");
-
-    let verdict = solver.check_sat();
-    assert!(
-        verdict.is_unsat(),
-        "len(x) = 2 contradicts the regex's minimum length 3; UNSAT (z3 5.0.0 \
-         agrees), got {verdict:?} / {:?}",
-        solver.unknown_reason(),
-    );
-    assert_string_refutation_carries_kind(&solver, TheoryLemmaKind::RegexLengthLowerBound);
-}
+include!("test_proof_artifact/string_ground_refutations.rs");
 
 /// Best-effort proof collection is a diagnostic surface, not an authority
 /// demand. The mandatory UNSAT-certification funnel may publish this genuine

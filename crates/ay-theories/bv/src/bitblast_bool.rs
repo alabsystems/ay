@@ -15,7 +15,13 @@ impl BvSolver<'_> {
     /// Used for Boolean conditions appearing *inside* BV terms (e.g., `ite`).
     /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#4602).
     pub(crate) fn bitblast_bool(&mut self, term: TermId) -> CnfLit {
+        if self.encoding.is_counted() {
+            return self.counted_bool(term);
+        }
         stacker::maybe_grow(BV_STACK_RED_ZONE, BV_STACK_SIZE, || {
+            if !self.encoding_complete() {
+                return 0;
+            }
             if let Some(&lit) = self.bool_to_var.get(&term) {
                 return lit;
             }
@@ -76,6 +82,9 @@ impl BvSolver<'_> {
                                     let first = it.next().unwrap();
                                     let mut acc = self.bitblast_bool(first);
                                     for a in it {
+                                        if !self.encoding_step() {
+                                            return 0;
+                                        }
                                         let next = self.bitblast_bool(a);
                                         acc = self.mk_xor(acc, next);
                                     }
@@ -100,16 +109,25 @@ impl BvSolver<'_> {
                                                 let mut eqs: Vec<CnfLit> =
                                                     Vec::with_capacity(args.len() - 1);
                                                 for &t in args.iter().skip(1) {
+                                                    if !self.encoding_step() {
+                                                        return 0;
+                                                    }
                                                     let next = self.bitblast_bool(t);
                                                     eqs.push(self.mk_xnor(first, next));
                                                 }
                                                 self.mk_and_many(&eqs)
+                                            }
+                                            Sort::BitVec(_) if args.len() == 2 => {
+                                                self.bitblast_term_eq(args[0], args[1])
                                             }
                                             Sort::BitVec(_) => {
                                                 let first = self.get_bits(args[0]);
                                                 let mut eqs: Vec<CnfLit> =
                                                     Vec::with_capacity(args.len() - 1);
                                                 for &t in args.iter().skip(1) {
+                                                    if !self.encoding_step() {
+                                                        return 0;
+                                                    }
                                                     let next = self.get_bits(t);
                                                     eqs.push(self.bitblast_eq(&first, &next));
                                                 }
@@ -140,7 +158,13 @@ impl BvSolver<'_> {
                                                     .collect();
                                                 let mut pairwise = Vec::new();
                                                 for i in 0..lits.len() {
+                                                    if !self.encoding_step() {
+                                                        return 0;
+                                                    }
                                                     for j in (i + 1)..lits.len() {
+                                                        if !self.encoding_step() {
+                                                            return 0;
+                                                        }
                                                         pairwise
                                                             .push(self.mk_xor(lits[i], lits[j]));
                                                     }
@@ -154,7 +178,13 @@ impl BvSolver<'_> {
                                                     .collect();
                                                 let mut pairwise = Vec::new();
                                                 for i in 0..bits.len() {
+                                                    if !self.encoding_step() {
+                                                        return 0;
+                                                    }
                                                     for j in (i + 1)..bits.len() {
+                                                        if !self.encoding_step() {
+                                                            return 0;
+                                                        }
                                                         let eq =
                                                             self.bitblast_eq(&bits[i], &bits[j]);
                                                         pairwise.push(-eq);
@@ -179,6 +209,9 @@ impl BvSolver<'_> {
                 _ => self.fresh_var(),
             };
 
+            if !self.encoding_complete() {
+                return 0;
+            }
             self.bool_to_var.insert(term, lit);
             lit
         }) // stacker::maybe_grow

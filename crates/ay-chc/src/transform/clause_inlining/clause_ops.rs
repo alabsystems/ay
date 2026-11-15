@@ -394,6 +394,14 @@ impl ClauseInliner {
     /// Compute the size of an expression (number of nodes).
     pub(super) fn expr_size(expr: &ChcExpr) -> usize {
         crate::expr::maybe_grow_expr_stack(|| match expr {
+            ChcExpr::ArrayLambda(lambda) => {
+                1 + Self::expr_size(lambda.body())
+                    + lambda
+                        .captures()
+                        .iter()
+                        .map(|value| Self::expr_size(value))
+                        .sum::<usize>()
+            }
             ChcExpr::Bool(_)
             | ChcExpr::Int(_)
             | ChcExpr::Real(_, _)
@@ -501,33 +509,39 @@ impl ClauseInliner {
 
         let mut equalities: Vec<ChcExpr> = Vec::new();
         let mut subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
+        // Bind EVERY plain head variable before inspecting compound arguments.
+        // In P(f(x), x), x already has a retained formal: inventing a local
+        // witness for f(x), then linking the later formal to it, needlessly
+        // makes all constraints on x existential during model reconstruction.
+        // R29's seven later stack bases otherwise turn 15 retained layout ORs
+        // into a branch product before exact projection can remove the aliases.
         for (i, arg) in head_args.iter().enumerate() {
-            match arg {
-                ChcExpr::Var(v) => {
-                    // Already bound (a repeated head variable, or a variable
-                    // first freshened as a constituent of an earlier compound
-                    // argument): keep the single existing binding and link this
-                    // position's formal to it explicitly.
-                    if let Some((_, bound)) = subst.iter().find(|(sv, _)| sv.name == v.name) {
-                        let bound = bound.clone();
-                        equalities.push(ChcExpr::eq(ChcExpr::var(fresh_vars[i].clone()), bound));
-                    } else {
-                        subst.push((v.clone(), ChcExpr::var(fresh_vars[i].clone())));
+            if let ChcExpr::Var(v) = arg {
+                // Repeated positions remain separate formals constrained to
+                // the first position; never replace the existing substitution.
+                if let Some((_, bound)) = subst.iter().find(|(sv, _)| sv.name == v.name) {
+                    let bound = bound.clone();
+                    equalities.push(ChcExpr::eq(ChcExpr::var(fresh_vars[i].clone()), bound));
+                } else {
+                    subst.push((v.clone(), ChcExpr::var(fresh_vars[i].clone())));
+                }
+            }
+        }
+        for (i, expr) in head_args.iter().enumerate() {
+            if !matches!(expr, ChcExpr::Var(_)) {
+                // Only variables absent from ALL plain head positions need
+                // fresh existential witnesses; share them across compounds.
+                for v in expr.vars() {
+                    if !subst.iter().any(|(sv, _)| sv.name == v.name) {
+                        let fresh = ChcVar::new(fresh_var_name(&v.name), v.sort.clone());
+                        subst.push((v, ChcExpr::var(fresh)));
                     }
                 }
-                expr => {
-                    for v in expr.vars() {
-                        if !subst.iter().any(|(sv, _)| sv.name == v.name) {
-                            let fresh = ChcVar::new(fresh_var_name(&v.name), v.sort.clone());
-                            subst.push((v, ChcExpr::var(fresh)));
-                        }
-                    }
-                    let freshened_expr = expr.substitute(&subst);
-                    equalities.push(ChcExpr::eq(
-                        ChcExpr::var(fresh_vars[i].clone()),
-                        freshened_expr,
-                    ));
-                }
+                let freshened_expr = expr.substitute(&subst);
+                equalities.push(ChcExpr::eq(
+                    ChcExpr::var(fresh_vars[i].clone()),
+                    freshened_expr,
+                ));
             }
         }
         (fresh_vars, equalities, subst)

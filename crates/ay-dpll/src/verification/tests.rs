@@ -2233,6 +2233,122 @@ mod mixed_need_lemmas_verification_tests {
              verification combiner and must not reject the valid context"
         );
     }
+
+    /// The QSAT kernel's wrong UNSAT (fuzzer fz5/s505_12): on unpreprocessed
+    /// roots the LIA lane derived the 1-literal conflict
+    ///   { not (= (to_real c) (+ (to_real c) 1/2)) }
+    /// — the negation of a VALID literal — and dispatch accepted it unchecked
+    /// as an int/real-mixed conflict. Any Int c is an exact model of it.
+    #[test]
+    fn test_int_real_mix_rejects_refuted_valid_disequality() {
+        let mut terms = TermStore::new();
+        let c = terms.mk_var("c", Sort::Int);
+        let half = terms.mk_rational(num_rational::BigRational::new(
+            BigInt::from(1),
+            BigInt::from(2),
+        ));
+        let to_real_c = terms.mk_app(Symbol::named("to_real"), vec![c], Sort::Real);
+        let plus_half = terms.mk_app(Symbol::named("+"), vec![to_real_c, half], Sort::Real);
+        let atom = terms.mk_app(Symbol::named("="), vec![to_real_c, plus_half], Sort::Bool);
+        assert!(
+            matches!(terms.get(atom), ay_core::TermData::App(..)),
+            "the reproducer needs the unfolded atom"
+        );
+        let conflict = vec![TheoryLit::new(atom, false)];
+
+        assert!(
+            matches!(
+                verify_conflict_semantic(&conflict, &terms, &[]),
+                Err(VerificationError::ConflictIsSat)
+            ),
+            "the negation of a valid literal is satisfiable and must be rejected"
+        );
+        assert!(
+            matches!(
+                verify_mixed_conflict_semantic(&conflict, &terms, &[]),
+                Err(VerificationError::ConflictIsSat)
+            ),
+            "the mixed verifier must reject it too"
+        );
+    }
+
+    /// Two variables: `c = d` with `to_real c != to_real d + 1/2` holds at
+    /// c = d = 0, so a conflict on it is spurious.
+    #[test]
+    fn test_int_real_mix_rejects_spurious_two_variable_conflict() {
+        let mut terms = TermStore::new();
+        let c = terms.mk_var("c", Sort::Int);
+        let d = terms.mk_var("d", Sort::Int);
+        let half = terms.mk_rational(num_rational::BigRational::new(
+            BigInt::from(1),
+            BigInt::from(2),
+        ));
+        let to_real_c = terms.mk_to_real(c);
+        let to_real_d = terms.mk_to_real(d);
+        let d_plus_half = terms.mk_app(Symbol::named("+"), vec![to_real_d, half], Sort::Real);
+        let offset = terms.mk_app(Symbol::named("="), vec![to_real_c, d_plus_half], Sort::Bool);
+        let c_eq_d = terms.mk_eq(c, d);
+        let conflict = vec![TheoryLit::new(c_eq_d, true), TheoryLit::new(offset, false)];
+
+        assert!(matches!(
+            verify_conflict_semantic(&conflict, &terms, &[]),
+            Err(VerificationError::ConflictIsSat)
+        ));
+    }
+
+    /// An integer-gap mixed conflict is valid but its LRA relaxation is SAT
+    /// at a fractional point: `0 < to_real k < 1` has no Int k. It must stay
+    /// accepted — only an exact INTEGRAL model may refute.
+    #[test]
+    fn test_int_real_mix_keeps_valid_integer_gap_conflict() {
+        let mut terms = TermStore::new();
+        let k = terms.mk_var("k", Sort::Int);
+        let zero_r = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+        let one_r = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+        let to_real_k = terms.mk_to_real(k);
+        let gt_zero = terms.mk_gt(to_real_k, zero_r);
+        let lt_one = terms.mk_lt(to_real_k, one_r);
+        let conflict = vec![TheoryLit::new(gt_zero, true), TheoryLit::new(lt_one, true)];
+
+        assert!(
+            verify_conflict_semantic(&conflict, &terms, &[]).is_ok(),
+            "a valid integer-gap conflict must not be rejected"
+        );
+    }
+
+    /// A relaxation-UNSAT mixed conflict is REPROVED, not merely accepted.
+    #[test]
+    fn test_int_real_mix_relaxation_unsat_is_reproved() {
+        let mut terms = TermStore::new();
+        let k = terms.mk_var("k", Sort::Int);
+        let x = terms.mk_var("x", Sort::Real);
+        let to_real_k = terms.mk_to_real(k);
+        let x_eq_k = terms.mk_eq(x, to_real_k);
+        let zero_r = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+        let x_lt_0 = terms.mk_lt(x, zero_r);
+        let zero_i = terms.mk_int(BigInt::from(0));
+        let k_ge_0 = terms.mk_ge(k, zero_i);
+        let conflict = vec![
+            TheoryLit::new(x_eq_k, true),
+            TheoryLit::new(x_lt_0, true),
+            TheoryLit::new(k_ge_0, true),
+        ];
+
+        let mut memo = super::super::dispatch::ConflictSemanticVerifyMemo::default();
+        assert!(super::super::dispatch::verify_conflict_semantic_memoized(
+            &mut memo,
+            &conflict,
+            &terms,
+            &[]
+        )
+        .is_ok());
+        let mut key = conflict.clone();
+        key.sort_unstable();
+        assert_eq!(
+            memo.get(&key).copied(),
+            Some(super::super::dispatch::ConflictSemanticVerdict::Reproved)
+        );
+    }
 }
 
 mod bv_verification_tests {

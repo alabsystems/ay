@@ -111,12 +111,10 @@ use super::ProofCheckError;
 ///
 /// SMT-LIB fixes the string alphabet at code points `0x0 ..= 0x2FFFF`. Every
 /// character here is a raw `u32` code point, INCLUDING the surrogate range
-/// `0xD800 ..= 0xDFFF` that Rust's `char` cannot represent — the solver works
-/// over `char`, so this is a deliberately different (and strictly larger)
-/// alphabet. That direction is safe: for every regex expression `E`,
-/// `L_small(E) = L_big(E) ∩ Σ_small*` (by induction over the constructors,
-/// complement included), so emptiness over the larger alphabet implies
-/// emptiness over the smaller one.
+/// `0xD800 ..= 0xDFFF` that Rust's `char` cannot represent. The solver stores a
+/// surrogate in a carrier `char` (`ay_core::smtlib_char`), and a string
+/// constant is read here through `ay_core::smtlib_code_point`, so both sides
+/// range over the same full alphabet.
 const ALPHABET_HI: u32 = 0x2_FFFF;
 
 /// Maximum number of alphabet blocks. Each block costs one transition per
@@ -648,7 +646,9 @@ impl<'a> Translator<'a> {
     fn str_const(&self, t: TermId) -> Option<Vec<u32>> {
         match self.terms.get(t) {
             TermData::Const(Constant::String(s)) => {
-                let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
+                // A surrogate is stored in its carrier `char`; its code point
+                // is what the regex denotes (`ay_core::smtlib_code_point`).
+                let cps: Vec<u32> = s.chars().map(ay_core::smtlib_code_point).collect();
                 // A code point outside the SMT-LIB alphabet has no place in a
                 // well-formed string constant. Rejecting is the fail-closed
                 // move: silently clamping it away would shrink the language

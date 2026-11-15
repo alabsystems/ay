@@ -43,8 +43,22 @@ requires   = ["git", "make", "c++"]
 # VeriPB 3 (the PB26+ proof-format checker) is Rust: the official GitLab README
 # installs it with `cargo install` from a checkout. It is not on PyPI — the pip
 # route belongs to the retired `version2` branch — so the recipe is a cargo
-# install pinned at the upstream 3.0.2 release tag, the version the PB CERT
-# evidence was audited with.
+# install of the upstream 3.0.2 release tag.
+#
+# That binary is NOT the checker AY certifies against, and its version string
+# cannot tell the two apart (both report 3.0.2). `ci/veripb.pin` (f60006223,
+# added after this entry) pins upstream 4bb10c2c PLUS
+# `ci/veripb-patches/0001-ay-veripb-alab-main.patch`, which closes twenty-one
+# wrong-verdict defects. `ay-pb --test veripb_pin_gate`, `scripts/cert_ci.sh`
+# and `scripts/ci/pb_certified_gate.sh` refuse any checker that accepts one of
+# the 22 `ci/veripb-soundness` fixtures; measured 2026-09-22, this recipe's
+# binary (tag 3.0.2 = c648bac06) accepts 15 of them. The pinned checker is
+# built by the build block of `scripts/ci/pb_certified_gate.sh` (clone
+# `VERIPB_REPO`, check out `VERIPB_COMMIT`, apply `VERIPB_PATCH`, then
+# `cargo build --release --bin veripb`) into the directory under
+# `${XDG_CACHE_HOME:-~/.cache}/ay-veripb/` that `scripts/lib/veripb_build_id.sh`
+# keys by commit, patch and compiler. Select it with `VERIPB_BIN`, which every
+# resolver ranks above all other sources.
 [[tool]]
 name   = "veripb"
 kind   = "checker"

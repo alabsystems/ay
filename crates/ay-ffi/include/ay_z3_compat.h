@@ -1,10 +1,10 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 //
-// AY compatibility include for the exact Z3 5.1.0 C surface.
+// AY compatibility include based on the historical Z3 5.1.0 C surface.
 //
-// `z3.h` and every header it includes are byte-for-byte copies from Z3 commit
-// 0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8.  Existing AY users may keep this
+// The standard headers also expose implemented Z3 5.3 additions; their enum
+// layout still requires reconciliation. Existing AY users may keep this
 // include name; stock Z3 C consumers can include `z3.h` directly.
 
 #pragma once
@@ -23,11 +23,16 @@ extern "C" {
 
 Z3_ast Z3_API Z3_mk_bvcomp(Z3_context c, Z3_ast t1, Z3_ast t2);
 Z3_ast Z3_API Z3_mk_set_has_size(Z3_context c, Z3_ast set, Z3_ast k);
+// AY alias for Z3_tactic_using_params; retains the same typed parameter semantics.
+Z3_tactic Z3_API Z3_tactic_with(Z3_context c, Z3_tactic t, Z3_params p);
 void Z3_API Z3_solver_set_proof_production(
     Z3_context c,
     Z3_solver s,
     bool enabled);
 bool Z3_API Z3_solver_get_proof_production(Z3_context c, Z3_solver s);
+// Z3_solver_get_proof exposes real asserted/unit-resolution application DAGs
+// for the supported native fragment. Other rules retain opaque Alethe handles
+// (UNKNOWN_AST). This named accessor always returns the Alethe artifact.
 Z3_string Z3_API Z3_solver_get_proof_string(Z3_context c, Z3_solver s);
 
 #ifdef __cplusplus

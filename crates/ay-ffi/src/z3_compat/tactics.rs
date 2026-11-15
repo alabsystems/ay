@@ -82,18 +82,148 @@ use super::{
     cache_string, ffi_count_within_limit, ffi_guard_const_ptr, ffi_guard_ptr,
     ffi_read_bounded_text, DecisionOwnerFamily, ParamDescrsHandle, TacticHandle, Z3Context,
     Z3SolverHandle, Z3_context, Z3_param_descrs, Z3_params, Z3_probe, Z3_solver, Z3_string,
-    Z3_tactic, Z3_INVALID_ARG, Z3_OK,
+    Z3_tactic, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK,
 };
 use std::os::raw::c_uint;
+
+/// Preserve invalid-handle diagnostics separately from owned-operation refusal.
+enum OwnedControlError {
+    InvalidArgument(&'static str),
+    Operation(String),
+}
+
+impl From<String> for OwnedControlError {
+    fn from(message: String) -> Self {
+        Self::Operation(message)
+    }
+}
+
+impl OwnedControlError {
+    fn into_parts(self) -> (c_uint, String) {
+        match self {
+            Self::InvalidArgument(message) => (Z3_INVALID_ARG, message.to_owned()),
+            Self::Operation(message) => (Z3_EXCEPTION, message),
+        }
+    }
+}
 
 /// Allocate a [`TacticHandle`] for `tactic`, register it in the context arena
 /// (freed at `Z3_del_context`), and return the handle. Shared by every tactic
 /// constructor here so the arena discipline is single-sourced.
 fn store_tactic(ctx: &mut Z3Context, tactic: Tactic) -> Z3_tactic {
     ctx.last_error = Z3_OK;
-    let handle = Box::into_raw(Box::new(TacticHandle { tactic }));
+    let handle = Box::into_raw(Box::new(TacticHandle {
+        tactic: std::sync::Arc::new(ay_dpll::api::TacticInstance::new(tactic)),
+    }));
     ctx.tactic_handle_cache.push(handle);
     handle
+}
+
+/// Borrow typed setter data under this request's original owner. A printed
+/// symbol `true` must never be guessed to be a Boolean parameter.
+pub(crate) fn parameter_snapshot(
+    ctx: &Z3Context,
+    p: Z3_params,
+    operation: &ay_dpll::api::TacticOperation,
+) -> Result<ay_dpll::api::TacticParameters, String> {
+    let mut result = ay_dpll::api::TacticParameters::default();
+    visit_parameters(ctx, p, operation, &mut |key, value| {
+        result.set(key, value).map_err(|e| e.message)
+    })?;
+    Ok(result)
+}
+
+pub(super) fn visit_parameters(
+    ctx: &Z3Context,
+    p: Z3_params,
+    operation: &ay_dpll::api::TacticOperation,
+    visit: &mut dyn FnMut(&str, ay_dpll::api::TacticParameterValue) -> Result<(), String>,
+) -> Result<(), String> {
+    let owner = operation.admission();
+    owner
+        .admit(ctx.params_cache.len(), 0)
+        .map_err(|e| e.to_string())?;
+    if p.is_null() || !ctx.params_cache.contains(&p) {
+        return Err("foreign or null tactic parameters".into());
+    }
+    if !operation.validate(&ctx.solver) {
+        return Err("parameter source changed".into());
+    }
+    // SAFETY: this live context exclusively retains the authenticated object.
+    let params = unsafe { &*p };
+    if params.params.len() != params.kinds.len() {
+        return Err("untyped tactic parameter data".into());
+    }
+    owner
+        .admit(params.params.len(), 0)
+        .map_err(|e| e.to_string())?;
+    for (index, ((key, text), kind)) in params.params.iter().zip(&params.kinds).enumerate() {
+        let mut shadowed = false;
+        for (later, _) in &params.params[index + 1..] {
+            owner
+                .admit(
+                    key.len()
+                        .checked_add(later.len())
+                        .ok_or("parameter size overflow")?,
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+            if key == later {
+                shadowed = true;
+                break;
+            }
+        }
+        if shadowed {
+            continue;
+        }
+        owner
+            .admit(
+                key.len()
+                    .checked_add(text.len())
+                    .ok_or("parameter size overflow")?,
+                0,
+            )
+            .map_err(|e| e.to_string())?;
+        use ay_dpll::api::TacticParameterValue as V;
+        let value = match kind {
+            super::StoredParamKind::Bool => match text.as_str() {
+                "true" => V::Bool(true),
+                "false" => V::Bool(false),
+                _ => V::Unsupported,
+            },
+            super::StoredParamKind::UInt => {
+                text.parse::<u32>().map(V::UInt).unwrap_or(V::Unsupported)
+            }
+            _ => V::Unsupported,
+        };
+        visit(key, value)?;
+    }
+    if !operation.validate(&ctx.solver) {
+        return Err("parameter source changed".into());
+    }
+    Ok(())
+}
+
+fn store_owned_control(
+    ctx: &mut Z3Context,
+    tactic: Tactic,
+    operation: &ay_dpll::api::TacticOperation,
+) -> Result<Z3_tactic, String> {
+    let owner = operation.admission();
+    owner
+        .admit(
+            1,
+            std::mem::size_of::<TacticHandle>()
+                + std::mem::size_of::<ay_dpll::api::TacticInstance>()
+                + 2 * std::mem::size_of::<usize>(),
+        )
+        .map_err(|e| e.to_string())?;
+    ay_core::term::reserve_counted(&mut ctx.tactic_handle_cache, 1, owner)
+        .map_err(|e| e.to_string())?;
+    if !operation.validate(&ctx.solver) {
+        return Err("tactic control source changed".into());
+    }
+    Ok(store_tactic(ctx, tactic))
 }
 
 /// Resolve a tactic NAME to a verdict-preserving [`Tactic`], or `Err` with an
@@ -158,7 +288,9 @@ pub unsafe extern "C" fn Z3_mk_tactic(c: Z3_context, name: Z3_string) -> Z3_tact
             match tactic_from_name(n) {
                 Ok(tactic) => {
                     ctx.last_error = Z3_OK;
-                    let handle = Box::into_raw(Box::new(TacticHandle { tactic }));
+                    let handle = Box::into_raw(Box::new(TacticHandle {
+                        tactic: std::sync::Arc::new(ay_dpll::api::TacticInstance::new(tactic)),
+                    }));
                     ctx.tactic_handle_cache.push(handle);
                     handle
                 }
@@ -263,8 +395,10 @@ unsafe fn combine_tactics(
     // shared read does not race. `as_ref` null-checks.
     let (first, second) = unsafe {
         (
-            t1.as_ref().map(|h| h.tactic.clone()),
-            t2.as_ref().map(|h| h.tactic.clone()),
+            t1.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
+            t2.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
         )
     };
 
@@ -283,7 +417,9 @@ unsafe fn combine_tactics(
                 TacticCombinator::OrElse => a.or_else(b),
             };
             ctx.last_error = Z3_OK;
-            let handle = Box::into_raw(Box::new(TacticHandle { tactic: combined }));
+            let handle = Box::into_raw(Box::new(TacticHandle {
+                tactic: std::sync::Arc::new(ay_dpll::api::TacticInstance::new(combined)),
+            }));
             ctx.tactic_handle_cache.push(handle);
             handle
         })
@@ -306,7 +442,7 @@ pub unsafe extern "C" fn Z3_tactic_repeat(c: Z3_context, t: Z3_tactic, max: c_ui
     // SAFETY: `t`, when non-null, is a `TacticHandle` kept alive in the context's
     // `tactic_handle_cache`; single-threaded per context, so no race. `as_ref`
     // null-checks.
-    let body = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
+    let body = unsafe { t.as_ref() }.map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic)));
 
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ptr` handles null
     // and catches panics.
@@ -319,49 +455,65 @@ pub unsafe extern "C" fn Z3_tactic_repeat(c: Z3_context, t: Z3_tactic, max: c_ui
             };
             let repeated = body.repeat_up_to(max as usize);
             ctx.last_error = Z3_OK;
-            let handle = Box::into_raw(Box::new(TacticHandle { tactic: repeated }));
+            let handle = Box::into_raw(Box::new(TacticHandle {
+                tactic: std::sync::Arc::new(ay_dpll::api::TacticInstance::new(repeated)),
+            }));
             ctx.tactic_handle_cache.push(handle);
             handle
         })
     }
 }
 
-/// Attach parameters to a tactic (Z3's `Z3_tactic_using_params`, aliased by
-/// `Z3_tactic_with`).
-///
-/// HONEST DIVERGENCE: AY's tactics are always the equivalence-preserving
-/// transform, so parameters that would only affect output *shape* (not the model
-/// set) do not change the transform. This therefore returns the underlying
-/// tactic unchanged (the `p` handle is accepted for API compatibility). It never
-/// silently substitutes a different, possibly-unsound transform. Returns NULL and
-/// sets `Z3_INVALID_ARG` if `t` is NULL.
+/// Attach a validated immutable parameter snapshot while preserving the real
+/// shared tactic identity and upstream stored-options precedence.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `t`, when non-null, a valid tactic
-/// handle; `p`, when non-null, a valid params handle.
+/// Handles must be live in `c`; the context must be non-aliased.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_tactic_using_params(
     c: Z3_context,
     t: Z3_tactic,
-    _p: Z3_params,
+    p: Z3_params,
 ) -> Z3_tactic {
-    // SAFETY: `t`, when non-null, is a `TacticHandle` kept alive in the context's
-    // cache; single-threaded per context. `as_ref` null-checks.
-    let inner = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
-
-    // SAFETY: `c` is the caller's context pointer; `ffi_guard_ptr` handles null
-    // and catches panics.
+    // SAFETY: the guard authenticates the context and contains Rust unwinding.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(inner) = inner else {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_tactic_using_params: null tactic handle".to_string());
-                return ptr::null_mut();
-            };
-            ctx.last_error = Z3_OK;
-            let handle = Box::into_raw(Box::new(TacticHandle { tactic: inner }));
-            ctx.tactic_handle_cache.push(handle);
-            handle
+            let result = (|| -> Result<Z3_tactic, OwnedControlError> {
+                let operation = ctx
+                    .solver
+                    .begin_tactic_operation()
+                    .map_err(|e| e.to_string())?;
+                let owner = operation.admission();
+                owner
+                    .admit(ctx.tactic_handle_cache.len(), std::mem::size_of::<Tactic>())
+                    .map_err(|e| e.to_string())?;
+                if t.is_null() || !ctx.tactic_handle_cache.contains(&t) {
+                    return Err(OwnedControlError::InvalidArgument("foreign or null tactic"));
+                }
+                let params = parameter_snapshot(ctx, p, &operation)?;
+                let body = Tactic::Shared(std::sync::Arc::clone(&(*t).tactic));
+                body.update_parameters(params, owner)
+                    .map_err(|e| e.message)?;
+                if !operation.validate(&ctx.solver) {
+                    return Err(OwnedControlError::Operation(
+                        "tactic parameter owner stopped".to_owned(),
+                    ));
+                }
+                Ok(store_owned_control(
+                    ctx,
+                    Tactic::WithParams(Box::new(body), params),
+                    &operation,
+                )?)
+            })();
+            match result {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let (code, message) = error.into_parts();
+                    ctx.last_error = code;
+                    ctx.error_msg = Some(message);
+                    ptr::null_mut()
+                }
+            }
         })
     }
 }
@@ -394,7 +546,7 @@ pub unsafe extern "C" fn Z3_mk_solver_from_tactic(c: Z3_context, t: Z3_tactic) -
     // SAFETY: `t`, when non-null, is a `TacticHandle` kept alive in the context's
     // `tactic_handle_cache`; single-threaded per context, so no race. `as_ref`
     // null-checks.
-    let tactic = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
+    let tactic = unsafe { t.as_ref() }.map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic)));
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -541,7 +693,8 @@ pub unsafe extern "C" fn Z3_tactic_when(c: Z3_context, p: Z3_probe, t: Z3_tactic
     let (probe, body) = unsafe {
         (
             p.as_ref().map(|h| h.probe.clone()),
-            t.as_ref().map(|h| h.tactic.clone()),
+            t.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
         )
     };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
@@ -582,8 +735,10 @@ pub unsafe extern "C" fn Z3_tactic_cond(
     let (probe, first, second) = unsafe {
         (
             p.as_ref().map(|h| h.probe.clone()),
-            t1.as_ref().map(|h| h.tactic.clone()),
-            t2.as_ref().map(|h| h.tactic.clone()),
+            t1.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
+            t2.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
         )
     };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
@@ -599,32 +754,49 @@ pub unsafe extern "C" fn Z3_tactic_cond(
     }
 }
 
-/// Apply `t` under a wall-clock bound `ms` (Z3's `Z3_tactic_try_for`).
-///
-/// HONEST DIVERGENCE (documented): AY's tactic passes are all internally bounded
-/// and terminate quickly, so the `ms` deadline is never reached — the tactic
-/// therefore behaves exactly like `t` itself (the equivalence-preserving
-/// transform). It never fabricates a timeout failure, and it never silently
-/// substitutes a different transform. The `ms` argument is accepted for API
-/// compatibility and recorded in the honesty note here. Returns NULL and sets
-/// `Z3_INVALID_ARG` if `t` is NULL.
+/// Apply the body under an additional scoped deadline. Zero and UINT_MAX
+/// disable only this timer; neither can clear an original/enclosing stop.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `t`, when non-null, a valid tactic
-/// handle.
+/// The context must be live/non-aliased and the tactic live in its arena.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_tactic_try_for(c: Z3_context, t: Z3_tactic, _ms: c_uint) -> Z3_tactic {
-    // SAFETY: `t`, when non-null, is a live `TacticHandle`; `as_ref` null-checks.
-    let inner = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
-    // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
+pub unsafe extern "C" fn Z3_tactic_try_for(c: Z3_context, t: Z3_tactic, ms: c_uint) -> Z3_tactic {
+    // SAFETY: the guard authenticates the context and contains Rust unwinding.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(inner) = inner else {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_tactic_try_for: null tactic handle".to_string());
-                return ptr::null_mut();
-            };
-            store_tactic(ctx, inner)
+            let result = (|| -> Result<Z3_tactic, OwnedControlError> {
+                let operation = ctx
+                    .solver
+                    .begin_tactic_operation()
+                    .map_err(|e| e.to_string())?;
+                let owner = operation.admission();
+                owner
+                    .admit(ctx.tactic_handle_cache.len(), std::mem::size_of::<Tactic>())
+                    .map_err(|e| e.to_string())?;
+                if t.is_null() || !ctx.tactic_handle_cache.contains(&t) {
+                    return Err(OwnedControlError::InvalidArgument("foreign or null tactic"));
+                }
+                if !operation.validate(&ctx.solver) {
+                    return Err(OwnedControlError::Operation(
+                        "tactic timer source changed".to_owned(),
+                    ));
+                }
+                let body = Tactic::Shared(std::sync::Arc::clone(&(*t).tactic));
+                Ok(store_owned_control(
+                    ctx,
+                    Tactic::TryFor(Box::new(body), ms),
+                    &operation,
+                )?)
+            })();
+            match result {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let (code, message) = error.into_parts();
+                    ctx.last_error = code;
+                    ctx.error_msg = Some(message);
+                    ptr::null_mut()
+                }
+            }
         })
     }
 }
@@ -650,8 +822,10 @@ pub unsafe extern "C" fn Z3_tactic_par_and_then(
     // per context; `as_ref` null-checks.
     let (first, second) = unsafe {
         (
-            t1.as_ref().map(|h| h.tactic.clone()),
-            t2.as_ref().map(|h| h.tactic.clone()),
+            t1.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
+            t2.as_ref()
+                .map(|h| Tactic::Shared(std::sync::Arc::clone(&h.tactic))),
         )
     };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
@@ -704,7 +878,9 @@ pub unsafe extern "C" fn Z3_tactic_par_or(
         slice
             .iter()
             // SAFETY: each element, when non-null, is a live `TacticHandle`.
-            .map(|&h| unsafe { h.as_ref() }.map(|th| th.tactic.clone()))
+            .map(|&h| {
+                unsafe { h.as_ref() }.map(|th| Tactic::Shared(std::sync::Arc::clone(&th.tactic)))
+            })
             .collect()
     };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
@@ -772,6 +948,11 @@ pub unsafe extern "C" fn Z3_tactic_get_descr(c: Z3_context, name: Z3_string) -> 
 fn tactic_descr(name: &str) -> Option<&'static str> {
     Some(match name {
         "skip" => "do nothing tactic.",
+        "ff-simplify" => "AY modular field constant propagation and ring reductions, retaining defining equalities; no wire elimination or fresh variables.",
+        "ff-unique" => "Owned affine functional-dependency and field congruence propagation; unchanged on stall, with no SAT-model or proof/core transport and no Boolean digit splitting.",
+        "ff-solve" => "Original-owned prime-field equation-conjunction decision with independently checked fixed models and ideal refutations; unsupported source remains, proof/core transport refuses.",
+        "ff-sat" => "Original-owned lazy Boolean and prime-field reasoning with typed model reconstruction and independently checked native resolution/algebra; unsupported source and external proof/core transport refuse.",
+        "ff2bv" => "Exact quantifier-free prime-field residue encoding with typed scalar model reconstruction; unsupported proof/core and cross-context converter transport refuse.",
         "fail" => "always fail tactic.",
         "simplify" => {
             "apply simplification rules and split top-level conjunctions into separate goal formulas."
@@ -889,7 +1070,7 @@ fn tactic_descr(name: &str) -> Option<&'static str> {
             "normalize variable bounds; AY realizes it as the identity (documented divergence: z3 mints fresh k!i variables in-fragment where AY truthfully prints the input)."
         }
         "max-bv-sharing" => {
-            "maximize bit-vector term sharing; AY terms are hash-consed so sharing is already maximal — the identity is literally the completed transform."
+            "reuse common binary circuits in BV addition, multiplication, AND and OR, then balance remaining operands."
         }
         "collect-statistics" => {
             "collect goal statistics; AY realizes it as the identity WITHOUT z3's statistics block (documented output divergence, deliberately: a partial fabricated block would diverge across the SMT-LIB and C-API surfaces)."
@@ -953,11 +1134,9 @@ fn tactic_descr(name: &str) -> Option<&'static str> {
 /// Return the parameter-descriptor set for a tactic (Z3's
 /// `Z3_tactic_get_param_descrs`).
 ///
-/// HONEST EMPTY (documented): AY's tactics are always the equivalence-preserving
-/// transform, so they expose NO per-tactic tunable parameters that would change
-/// the produced goal's model set. This therefore returns a REAL, queryable —
-/// empty — [`ParamDescrsHandle`] (size 0), never a fabricated parameter set
-/// disguised as Z3's. The `t` handle is validated (NULL ⇒ `Z3_INVALID_ARG`).
+/// Lists the implemented typed descriptor union. The Boolean simplifier
+/// exposes its real rewrite/work/memory controls; primitives with no supported
+/// parameter semantics expose no keys instead of advertising ignored options.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `t`, when non-null, a valid tactic
@@ -967,26 +1146,144 @@ pub unsafe extern "C" fn Z3_tactic_get_param_descrs(
     c: Z3_context,
     t: Z3_tactic,
 ) -> Z3_param_descrs {
-    // SAFETY: `t`, when non-null, is a live `TacticHandle`; `as_ref` null-checks.
-    let has_tactic = unsafe { t.as_ref() }.is_some();
-    // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics.
+    // SAFETY: the guard authenticates the context and contains Rust unwinding.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            if !has_tactic {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_tactic_get_param_descrs: null tactic handle".to_string());
-                return ptr::null_mut();
+            let result = (|| -> Result<Z3_param_descrs, OwnedControlError> {
+                let operation = ctx
+                    .solver
+                    .begin_tactic_operation()
+                    .map_err(|e| e.to_string())?;
+                let owner = operation.admission();
+                owner
+                    .admit(ctx.tactic_handle_cache.len(), 0)
+                    .map_err(|e| e.to_string())?;
+                if t.is_null() || !ctx.tactic_handle_cache.contains(&t) {
+                    return Err(OwnedControlError::InvalidArgument("foreign or null tactic"));
+                }
+                let tactic = Tactic::Shared(std::sync::Arc::clone(&(*t).tactic));
+                let supported = tactic
+                    .has_simplifier_parameters(owner)
+                    .map_err(|e| e.message)?;
+                Ok(parameter_descriptions(
+                    ctx,
+                    if supported {
+                        SIMPLIFIER_DESCRIPTIONS
+                    } else {
+                        &[]
+                    },
+                    &operation,
+                )?)
+            })();
+            match result {
+                Ok(value) => {
+                    ctx.last_error = Z3_OK;
+                    value
+                }
+                Err(error) => {
+                    let (code, message) = error.into_parts();
+                    ctx.last_error = code;
+                    ctx.error_msg = Some(message);
+                    ptr::null_mut()
+                }
             }
-            ctx.last_error = Z3_OK;
-            // Honest-empty: no per-tactic params affect AY's equivalence-preserving
-            // transform. A real (queryable) descr set of size 0 — not a fake.
-            let handle = Box::into_raw(Box::new(ParamDescrsHandle {
-                entries: Vec::new(),
-            }));
-            ctx.param_descrs_cache.push(handle);
-            handle
         })
     }
+}
+
+pub(super) const SIMPLIFIER_DESCRIPTIONS: &[(&str, std::ffi::c_uint, &str)] = &[
+    (
+        "som",
+        super::Z3_PK_BOOL,
+        "Normalize Int/Real polynomials to sums of monomials.",
+    ),
+    (
+        "som_blowup",
+        super::Z3_PK_UINT,
+        "Maximum Cartesian monomial growth factor before collection.",
+    ),
+    (
+        "flat",
+        super::Z3_PK_BOOL,
+        "Flatten arithmetic addition and multiplication; false disables SOM.",
+    ),
+    (
+        "expand_power",
+        super::Z3_PK_BOOL,
+        "Expand positive powers up to max_degree.",
+    ),
+    (
+        "mul_to_power",
+        super::Z3_PK_BOOL,
+        "Compress repeated polynomial factors; expand_power takes precedence.",
+    ),
+    (
+        "max_degree",
+        super::Z3_PK_UINT,
+        "Maximum positive power degree expanded by the rewriter.",
+    ),
+    (
+        "sort_sums",
+        super::Z3_PK_BOOL,
+        "Order polynomial monomials canonically.",
+    ),
+    (
+        "push_to_real",
+        super::Z3_PK_BOOL,
+        "Distribute to_real over integer sums and products.",
+    ),
+    (
+        "elim_and",
+        super::Z3_PK_BOOL,
+        "Rewrite Boolean conjunctions using negation and disjunction.",
+    ),
+    (
+        "max_steps",
+        super::Z3_PK_UINT,
+        "Maximum native simplifier rewrite steps; original owner remains binding.",
+    ),
+    (
+        "max_memory",
+        super::Z3_PK_UINT,
+        "Memory checkpoint cap in MiB; original owner remains binding.",
+    ),
+];
+
+pub(super) fn parameter_descriptions(
+    ctx: &mut Z3Context,
+    descriptions: &[(&str, std::ffi::c_uint, &str)],
+    operation: &ay_dpll::api::TacticOperation,
+) -> Result<Z3_param_descrs, String> {
+    let owner = operation.admission();
+    let mut entries = Vec::new();
+    ay_core::term::reserve_counted(&mut entries, descriptions.len(), owner)
+        .map_err(|e| e.to_string())?;
+    for &(name, kind, doc) in descriptions {
+        let bytes = name
+            .len()
+            .checked_add(doc.len())
+            .ok_or("descriptor overflow")?;
+        owner.admit(bytes, bytes).map_err(|e| e.to_string())?;
+        if !operation.validate(&ctx.solver) {
+            return Err("descriptor source changed".into());
+        }
+        entries.push(super::ParamDescr {
+            name: name.into(),
+            kind,
+            doc: doc.into(),
+        });
+    }
+    owner
+        .admit(1, std::mem::size_of::<ParamDescrsHandle>())
+        .map_err(|e| e.to_string())?;
+    ay_core::term::reserve_counted(&mut ctx.param_descrs_cache, 1, owner)
+        .map_err(|e| e.to_string())?;
+    if !operation.validate(&ctx.solver) {
+        return Err("descriptor source changed".into());
+    }
+    let result = Box::into_raw(Box::new(ParamDescrsHandle { entries }));
+    ctx.param_descrs_cache.push(result);
+    Ok(result)
 }
 
 // ============================================================================

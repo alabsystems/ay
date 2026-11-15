@@ -184,8 +184,18 @@ impl PdrSolver {
             if conjuncts.len() < 2 {
                 continue;
             }
+            let canonical: Vec<String> = self
+                .canonical_vars(pred_id)
+                .map(|vars| vars.iter().map(|v| v.name.clone()).collect())
+                .unwrap_or_default();
 
             for conjunct in conjuncts {
+                // A conjunct over the fact's local variables (renamed apart
+                // in the must-summary) is not a predicate invariant: skip it
+                // instead of admitting a lemma with a free variable.
+                if !conjunct.vars().iter().all(|v| canonical.contains(&v.name)) {
+                    continue;
+                }
                 if self.is_cancelled()
                     || fact_deadline.is_some_and(|d| ay_core::time::Instant::now() >= d)
                 {
@@ -260,9 +270,17 @@ impl PdrSolver {
                 continue;
             }
 
+            let canonical: Vec<String> = self
+                .canonical_vars(pred_id)
+                .map(|vars| vars.iter().map(|v| v.name.clone()).collect())
+                .unwrap_or_default();
             let mut conjuncts = Vec::new();
             for conjunct in must_summary.collect_conjuncts() {
                 if matches!(conjunct, ChcExpr::Bool(true)) {
+                    continue;
+                }
+                // Canonical-only conjuncts (see the per-conjunct discovery above).
+                if !conjunct.vars().iter().all(|v| canonical.contains(&v.name)) {
                     continue;
                 }
                 if conjunct.contains_array_ops() && !conjunct.is_bool_sorted_top_level() {

@@ -317,22 +317,30 @@ fn upoly(coeffs: &[i64]) -> Vec<BigRational> {
     p
 }
 
-fn count_roots_between(p: &[BigRational], a: &BigRational, b: &BigRational) -> usize {
+type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Sturm's theorem: the number of distinct roots in `(a, b]` is
+/// `V(a) - V(b)`. For `a < b` that difference is never negative; a chain
+/// whose variations INCREASE is reported as an error, not wrapped.
+fn count_roots_between(p: &[BigRational], a: &BigRational, b: &BigRational) -> TestResult<usize> {
     let mut meter = WorkMeter::new();
-    let chain = sturm_chain(&p.to_vec(), &mut meter).expect("chain");
-    let va = sign_variations(&chain, a, &mut meter).expect("va");
-    let vb = sign_variations(&chain, b, &mut meter).expect("vb");
-    va - vb
+    let chain = sturm_chain(&p.to_vec(), &mut meter)?;
+    let va = sign_variations(&chain, a, &mut meter)?;
+    let vb = sign_variations(&chain, b, &mut meter)?;
+    va.checked_sub(vb).ok_or_else(|| {
+        format!("sign variations increased across the interval: V(a) = {va} < V(b) = {vb}").into()
+    })
 }
 
 #[test]
-fn sturm_counts_match_known_factorizations() {
+fn sturm_counts_match_known_factorizations() -> TestResult<()> {
     // x(x-1)(x+2) = x^3 + x^2 - 2x: roots -2, 0, 1.
     let p = upoly(&[0, -2, 1, 1]);
-    assert_eq!(count_roots_between(&p, &rat(-3), &rat(2)), 3);
-    assert_eq!(count_roots_between(&p, &rat2(-1, 2), &rat(2)), 2);
-    assert_eq!(count_roots_between(&p, &rat2(1, 2), &rat(2)), 1);
-    assert_eq!(count_roots_between(&p, &rat2(3, 2), &rat(2)), 0);
+    assert_eq!(count_roots_between(&p, &rat(-3), &rat(2))?, 3);
+    assert_eq!(count_roots_between(&p, &rat2(-1, 2), &rat(2))?, 2);
+    assert_eq!(count_roots_between(&p, &rat2(1, 2), &rat(2))?, 1);
+    assert_eq!(count_roots_between(&p, &rat2(3, 2), &rat(2))?, 0);
+    Ok(())
 }
 
 #[test]

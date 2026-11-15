@@ -6,7 +6,8 @@
 //! with `PdrSolver` directly (no adaptive portfolio, no transforms). Prints
 //! `sat` / `unsat` / `unknown` (standard CHC polarity: Safe = sat).
 //!
-//! Usage: `pdr_probe <file.smt2> [--verbose]`
+//! Usage: `pdr_probe <file.smt2> [--verbose] [--config=default|production|splits|spacer|spacer-lane]
+//! [--timeout-ms=N] [--spacer-nonlinear=0|1]`
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -28,6 +29,15 @@ fn main() {
         .iter()
         .find(|a| a.starts_with("--timeout-ms="))
         .and_then(|a| a.trim_start_matches("--timeout-ms=").parse().ok());
+    if let Some(v) = rest
+        .iter()
+        .find_map(|a| a.strip_prefix("--spacer-nonlinear="))
+    {
+        let _ = ay_chc::ab_switches::set(ay_chc::ab_switches::ChcAbSwitches {
+            spacer_nonlinear: Some(v != "0"),
+            ..ay_chc::ab_switches::ChcAbSwitches::default()
+        });
+    }
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -48,6 +58,10 @@ fn main() {
         "production" => ay_chc::PdrConfig::production(verbose),
         "splits" => ay_chc::PdrConfig::portfolio_variant_with_splits().with_verbose(verbose),
         "spacer" => ay_chc::PdrConfig::portfolio_spacer_variant().with_verbose(verbose),
+        // The Spacer-mode profile (no startup discovery) with the lane at rung 2.
+        "spacer-lane" => ay_chc::PdrConfig::portfolio_spacer_variant()
+            .with_spacer(ay_chc::SpacerLane::rung(2))
+            .with_verbose(verbose),
         _ => ay_chc::PdrConfig::default().with_verbose(verbose),
     };
     if let Some(ms) = timeout_ms {

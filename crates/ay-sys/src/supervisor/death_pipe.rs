@@ -345,35 +345,87 @@ mod tests {
     fn exec_child_inherits_the_read_end_and_not_the_write_end() {
         let pipe = DeathPipe::new().expect("create death pipe");
         let reader_fd = pipe.reader_fd();
-        let writer_fd = pipe.writer.as_raw_fd();
 
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", "ls /dev/fd"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        configure_child_death_pipe(&mut command, &pipe);
-        let output = command.output().expect("list the child's descriptors");
-        assert!(output.status.success(), "ls /dev/fd failed: {output:?}");
-        let listing = String::from_utf8_lossy(&output.stdout);
-        let open_in_child: Vec<RawFd> = listing
-            .split_whitespace()
-            .filter_map(|entry| entry.parse().ok())
-            .collect();
+        // READ END, asked semantically. An earlier version of this test listed
+        // `ls /dev/fd` in the child and compared raw NUMBERS against the
+        // parent's. That reports a leak that is not there: `ls` opens two
+        // directory handles of its own, so whenever the parent's write end
+        // happened to land on one of those numbers the child "had" it. Ask
+        // instead whether the descriptor is a pipe, and pin the answer with a
+        // control spawn on the very same number that is NOT given the hook --
+        // a coincidental descriptor cannot satisfy both.
+        let inherits_a_pipe_at_the_read_fd = |armed: bool| -> bool {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", &format!("test -p /dev/fd/{reader_fd}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if armed {
+                configure_child_death_pipe(&mut command, &pipe);
+            }
+            command
+                .status()
+                .expect("run the descriptor probe")
+                .success()
+        };
         assert!(
-            open_in_child.contains(&reader_fd),
-            "the exec'd child must inherit the read end {reader_fd}; it has {open_in_child:?}"
+            inherits_a_pipe_at_the_read_fd(true),
+            "the exec'd child must inherit the read end {reader_fd}"
         );
         assert!(
-            !open_in_child.contains(&writer_fd),
-            "the exec'd child must NOT inherit the write end {writer_fd}; it has {open_in_child:?}"
+            !inherits_a_pipe_at_the_read_fd(false),
+            "without the pre-exec hook the child must see nothing at {reader_fd}: \
+             if it does, this test's positive case proves nothing"
         );
+
         // The parent's own copy of the read end keeps its CLOEXEC flag: only
-        // the forked child cleared it, after the fork.
+        // the forked child cleared it, after the fork. Asked here, while the
+        // pipe is still whole -- `into_parent_writer` below closes this
+        // descriptor, and `fcntl` on a closed one answers about nothing.
         assert!(
             is_cloexec(reader_fd),
             "the pre-exec hook must not touch the parent's descriptor flags"
+        );
+
+        // WRITE END, asked semantically. The invariant that matters is not
+        // which number is open in the child but whether the child can keep the
+        // pipe alive. Hand the parent an independent read end -- `try_clone`
+        // sets CLOEXEC, so this copy never reaches any child -- then let the
+        // parent's write end go while a long-lived child runs. EOF can only
+        // arrive if NO write end survives anywhere, the child's included.
+        let observer = pipe.reader.try_clone().expect("dup the read end");
+
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_child_death_pipe(&mut command, &pipe);
+        let mut child = command.spawn().expect("spawn the long-lived child");
+
+        // The parent releases its own -- and, if the invariant holds, the last
+        // -- write end. A child holding an inherited one would hold the pipe
+        // open for its whole 5 s lifetime instead.
+        drop(pipe.into_parent_writer());
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut end = std::fs::File::from(observer);
+            let mut sink = [0_u8; 1];
+            let _ = tx.send(matches!(end.read(&mut sink), Ok(0)));
+        });
+        let eof = rx.recv_timeout(Duration::from_secs(2));
+
+        // Reap before asserting so a failure never leaves the child behind.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            matches!(eof, Ok(true)),
+            "EOF must arrive as soon as the parent drops its write end; a child \
+             that inherited one would hold the pipe open until it exits (got {eof:?})"
         );
     }
 

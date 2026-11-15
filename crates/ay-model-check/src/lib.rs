@@ -18,10 +18,18 @@
 //! * It returns [`GateVerdict::ConfirmedSat`] **only** when every assertion
 //!   provably evaluates to `Bool(true)` under the model.
 //! * Anything the evaluator cannot faithfully compute — an operator it does not
-//!   implement, a leaf the model does not pin, a quantifier, an uninterpreted
+//!   implement, a leaf the model does not pin, an unbounded or over-budget
+//!   quantifier, an uninterpreted
 //!   function application whose value is not determined, an unknown sort, a
 //!   recursion-depth overflow — yields [`EvalOutcome::Unevaluable`], which maps
 //!   to [`GateVerdict::CannotConfirm`]. It is **never** assumed `true`.
+//! * Bool and small bit-vector quantifiers are evaluated by exact enumeration,
+//!   with one shared assignment/work budget per model check. Int and unsigned
+//!   BV guards can also establish finite decisive support for ordered groups,
+//!   including bounds depending on earlier binders and typed nested reads. All
+//!   omitted values are proved irrelevant, and the original body is evaluated
+//!   over retained tuples; complete group planning precedes any decisive result.
+//!   Unsupported or excessive support fails closed under shared resource caps.
 //! * The evaluator is total and panic-free: every partial/ill-typed/under-
 //!   specified case without an exact typed proof and a checked model choice
 //!   returns `Unevaluable` instead of unwrapping or panicking.
@@ -32,24 +40,40 @@
 //!
 //! ## Independence
 //!
-//! This crate depends ONLY on [`ay_core`] (the term/sort types) and exact
-//! bignum/rational arithmetic. It does NOT depend on the solver, its theory
+//! This crate depends ONLY on [`ay_core`] (the term/sort types), exact
+//! bignum/rational arithmetic, and error formatting. It does NOT depend on the solver, its theory
 //! engines, or its model-construction/`evaluate_term` code (which has had
 //! bugs). The compositional evaluation here is written from scratch.
 
 use ay_core::{TermId, TermStore};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 use num_traits::One;
+use std::sync::Arc;
 
 pub mod algebraic;
 mod bitvec;
 pub mod dt_axiom;
+pub mod dt_eta;
 mod eval;
+mod evaluation_work;
+mod functional_array;
+pub use functional_array::topology::{
+    SnapshotKind, SnapshotNode, SnapshotTermError, SnapshotTopology,
+};
+pub use functional_array::{
+    recognize_fill_lambda, recognize_identity_lambda, recognize_range_lambda, ArraySnapshot,
+    FillInterval, FillLambda, FunctionalArrayError, IdentityLambda, RangeLambda,
+};
 pub mod fp;
+mod fp_exact;
+// Existing per-evaluator data/functional work ceiling. Exact FP shares it,
+// including original-owner cancellation/charges; it receives no second bank.
+pub(crate) const MODEL_DATA_WORK_LIMIT: usize = 1_048_576;
 pub mod ieee;
 mod projection;
 mod regex;
+mod regex_equiv;
 mod residual;
 mod seq;
 pub mod sets;
@@ -60,12 +84,15 @@ mod unconstrained;
 mod tests;
 
 pub use dt_axiom::{is_datatype_tautology, is_datatype_tautology_with};
+pub use eval::quantifier::array_frame::recognizes_int_array_frame;
 pub use eval::Evaluator;
+pub use evaluation_work::admit_model_value_work;
 pub use projection::{
     check_projection_implication, check_projection_implication_with_stop,
     CheckedProjectionImplication, CheckedProjectionUf, ProjectionCertificateRejection,
     ProjectionImplicationCandidate, ProjectionUfCandidate,
 };
+pub use residual::{ArrayCompletion, CompletedArrayAssignment, ModelConfirmation};
 pub use unconstrained::ProvenUnconstrainedKind;
 
 /// Maximum compositional recursion depth before the evaluator fails closed.
@@ -116,10 +143,27 @@ pub enum ModelValue {
         /// Biased exponent field.
         exponent: u64,
         /// Stored fraction/significand field (without the hidden bit).
-        significand: u64,
+        /// Up to 128 stored bits; format and work bounds are checked by the
+        /// independent evaluator before arithmetic.
+        significand: u128,
         /// Exponent-field width.
         exponent_bits: u32,
         /// Total significand precision, including the hidden bit.
+        significand_bits: u32,
+    },
+    /// Exact raw IEEE fields beyond native integer storage. Immutable sharing
+    /// keeps model/memo clones constant-size; every consumer validates widths.
+    /// Data admission does not authorize arithmetic in the narrower kernel.
+    FloatingPointExact {
+        /// IEEE sign, retaining the distinction between signed zeros.
+        sign: bool,
+        /// Unsigned biased exponent field.
+        exponent: Arc<BigUint>,
+        /// Unsigned stored fraction (hidden bit excluded).
+        significand: Arc<BigUint>,
+        /// Exponent width.
+        exponent_bits: u32,
+        /// Precision including the hidden bit.
         significand_bits: u32,
     },
     /// String (sequence of Unicode code points).
@@ -160,6 +204,32 @@ pub struct ArrayValue {
 }
 
 impl ModelValue {
+    /// Construct checked exact data without rounding, truncation, or arithmetic
+    /// admission. Abstract NaN identity is checked after metered field reads;
+    /// the raw immutable input is retained without a premature payload scan.
+    #[must_use]
+    pub fn floating_point_exact(
+        sign: bool,
+        exponent: BigUint,
+        significand: BigUint,
+        exponent_bits: u32,
+        significand_bits: u32,
+    ) -> Option<Self> {
+        fp_exact::construct(sign, exponent, significand, exponent_bits, significand_bits)
+    }
+    /// Receive immutable raw fields without a variable-sized copy. Field widths
+    /// and actual payload bounds are independently checked here; sharing data
+    /// does not share a solver computation or authorize arithmetic.
+    #[must_use]
+    pub fn floating_point_exact_shared(
+        sign: bool,
+        exponent: Arc<BigUint>,
+        significand: Arc<BigUint>,
+        exponent_bits: u32,
+        significand_bits: u32,
+    ) -> Option<Self> {
+        fp_exact::construct_shared(sign, exponent, significand, exponent_bits, significand_bits)
+    }
     /// Construct a normalized bitvector value.
     #[must_use]
     pub fn bitvec(value: BigInt, width: u32) -> Self {
@@ -214,7 +284,10 @@ pub(crate) fn value_eq(a: &ModelValue, b: &ModelValue) -> Result<bool, String> {
         ) => Ok(w1 == w2 && v1 == v2),
         // `=` on floating-point is identity of the DENOTED ELEMENT, which is
         // raw-field identity everywhere except NaN — see `fp::same_element`.
-        (V::FloatingPoint { .. }, V::FloatingPoint { .. }) => Ok(fp::same_element(a, b)),
+        (
+            V::FloatingPoint { .. } | V::FloatingPointExact { .. },
+            V::FloatingPoint { .. } | V::FloatingPointExact { .. },
+        ) => fp_exact::same_element(a, b),
         // Algebraic equality is decided by reduction in one extension. Values
         // in DIFFERENT extensions come back `None` and fall through to the
         // incomparable arm -- deciding those needs resultants, and guessing
@@ -330,9 +403,93 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 /// `a = b` would let the gate confirm an internally-inconsistent model. The gate
 /// returns `Unevaluable` for any function application it does not interpret,
 /// which is the sound behaviour.
+/// A view that wraps or overlays another view must forward its shared
+/// admission/refusal and dedicated Exact FP hooks to the SAME underlying
+/// owner, even when it supplies replacement leaves. Default hooks are for
+/// standalone views, not permission to replace a wrapped owner's ledger.
 pub trait ModelView {
+    /// Whether a shared evaluator resource ledger is active for this view.
+    /// This grants no array/value interpretation or model publication authority.
+    /// Default-absent views keep their existing evaluation and copying behavior.
+    fn has_evaluation_admission(&self) -> bool {
+        false
+    }
+
+    /// Retain any evaluator admission refusal in the active owner's shared
+    /// ledger, including a borrowed payload walk's depth/accounting failure.
+    /// Active views must implement this and forward it through wrapper views.
+    /// It must not evaluate terms or mutate a model interpretation.
+    fn refuse_evaluation_work(&self, _reason: &str) {}
+
+    /// Admit evaluator work and owned-value payload copying under the model
+    /// owner's optional shared ledger. Queried only while
+    /// [`Self::has_evaluation_admission`] is true. The default preserves existing views.
+    ///
+    /// A refusal is evidence insufficiency, never a Boolean result or permission
+    /// to complete a missing interpretation. Implementations must retain refusal
+    /// for their entire owner scope, share the same ledger with forwarding views
+    /// and fresh nested evaluators, and check cancellation even for `(0, 0)`.
+    /// This hook must not evaluate terms or change model interpretations.
+    ///
+    /// Hooks returning owned model values must also admit their producer-side
+    /// copies BEFORE cloning: the evaluator cannot retroactively bound those
+    /// allocations. [`admit_model_value_work`] supplies the same borrowed payload
+    /// accounting. This is not a complete meter for arbitrary-precision arithmetic.
+    fn admit_evaluation_work(&self, _work: usize, _bytes: usize) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The model's value for a leaf term, or `None` if unpinned.
     fn leaf_value(&self, t: TermId) -> Option<ModelValue>;
+
+    /// Complete immutable array DATA selected for this exact model/source.
+    /// No verdict or publication authority accompanies it. An error records
+    /// stale/conflicting ownership and must not fall back to per-read pins.
+    /// Existing views decline this optional representation by default.
+    fn array_snapshot(&self, _t: TermId) -> Result<Option<std::sync::Arc<ArraySnapshot>>, String> {
+        Ok(None)
+    }
+
+    /// Original owner's cancellation/deadline/memory predicate. Snapshot work
+    /// is bounded separately and never gives a caller a new owner allowance.
+    fn functional_array_interrupted(&self) -> bool {
+        false
+    }
+
+    /// Share the original model owner's finite work ledger. This grants no
+    /// array interpretation; consumers without snapshots keep the old route.
+    fn charge_functional_array_work(&self, _amount: usize) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Exact floating-point DATA uses the same retained model ledger even
+    /// when array completion was unavailable. Legacy views retain their hooks.
+    fn exact_fp_interrupted(&self) -> bool {
+        self.functional_array_interrupted()
+    }
+
+    fn charge_exact_fp_work(&self, amount: usize) -> Result<(), String> {
+        self.charge_functional_array_work(amount)
+    }
+
+    /// Admit one exact arithmetic event, including its temporary storage.
+    /// Views sharing a physical retained/read counter may debit that counter
+    /// once. Distinct ledgers retain both ceilings. Value-copy charges still
+    /// use `charge_exact_fp_work` independently.
+    fn admit_exact_fp_work(&self, work: usize, bytes: usize) -> Result<(), String> {
+        let admission_enabled = self.has_evaluation_admission();
+        self.charge_exact_fp_work(work)?;
+        if admission_enabled {
+            self.admit_evaluation_work(work, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Explicit activation is required whenever array_snapshot can return data.
+    /// Inconsistent hooks refuse; default-absent consumers keep their old budget.
+    fn has_functional_arrays(&self) -> bool {
+        false
+    }
 
     /// The selected argument index when application `t` has an independently
     /// checked exact projection interpretation.
@@ -605,6 +762,21 @@ pub fn confirm_model(
     model: &dyn ModelView,
     assertions: &[TermId],
 ) -> GateVerdict {
+    confirm_model_with_array_completion(terms, model, assertions)
+        .into_parts()
+        .0
+}
+
+/// Confirm a candidate and retain any exact free-array extension used by the
+/// gate. The extension borrows this source/model and is data, not a reusable
+/// SAT publication permit. A consumer that installs it must invalidate older
+/// model-relative authority and freshly check the complete original roots.
+#[must_use]
+pub fn confirm_model_with_array_completion<'a>(
+    terms: &'a TermStore,
+    model: &'a dyn ModelView,
+    assertions: &'a [TermId],
+) -> ModelConfirmation<'a> {
     confirm_model_with_policy(
         terms,
         model,
@@ -618,15 +790,23 @@ pub fn confirm_model(
 ///
 /// This is deliberately the same fresh-evaluator path as [`confirm_model`],
 /// except that residual admission is disabled.  A completed witness therefore
-/// earns `ConfirmedSat` only by making every assertion evaluate to `true`; it
 /// cannot recursively justify a remaining coverage gap with another abstract
-/// extension argument.
-pub(crate) fn confirm_completed_model(
+/// extension argument: the existing concrete evaluation and datatype-tautology
+/// checks must suffice.
+///
+/// Existing independently checked datatype tautologies remain admissible; this
+/// is not a claim that every leaf must have an explicit model entry. Callers
+/// installing a completion must pass all original roots, not a window narrowed
+/// by an older model-relative quantified certificate.
+#[must_use]
+pub fn confirm_completed_model(
     terms: &TermStore,
     model: &dyn ModelView,
     assertions: &[TermId],
 ) -> GateVerdict {
     confirm_model_with_policy(terms, model, assertions, ResidualPolicy::ReplayOnly)
+        .into_parts()
+        .0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -635,12 +815,12 @@ enum ResidualPolicy {
     ReplayOnly,
 }
 
-fn confirm_model_with_policy(
-    terms: &TermStore,
-    model: &dyn ModelView,
-    assertions: &[TermId],
+fn confirm_model_with_policy<'a>(
+    terms: &'a TermStore,
+    model: &'a dyn ModelView,
+    assertions: &'a [TermId],
     residual_policy: ResidualPolicy,
-) -> GateVerdict {
+) -> ModelConfirmation<'a> {
     let evaluator = Evaluator::new(terms, model);
     // Registry-aware datatype resolver: maps a `Sort::Uninterpreted(name)` that
     // abstracts a declared datatype back to its definition, so the
@@ -683,7 +863,7 @@ fn confirm_model_with_policy(
                 if is_datatype_tautology_with(terms, assertion, &resolve) {
                     continue;
                 }
-                return GateVerdict::ModelViolates { assertion };
+                return ModelConfirmation::new(GateVerdict::ModelViolates { assertion }, None);
             }
             EvalOutcome::Value(_) => {
                 non_residual_gap = true;
@@ -713,7 +893,7 @@ fn confirm_model_with_policy(
         }
     }
     let Some(reason) = first_gap else {
-        return GateVerdict::ConfirmedSat;
+        return ModelConfirmation::new(GateVerdict::ConfirmedSat, None);
     };
     // Residual free-datatype-array joint-satisfiability
     // (#free-dt-array-residual): when the ONLY residue consists of alias
@@ -725,15 +905,14 @@ fn confirm_model_with_policy(
     // pin probes inside the decision). This maps Sat -> {Sat, Unknown} only:
     // any residue beyond that fragment, any pinned read over the class, or
     // any conflict keeps the fail-closed verdict below.
-    if residual_policy == ResidualPolicy::MaterializeAndReplay
-        && !non_residual_gap
-        && residual::free_dt_array_residue_extends(
+    if residual_policy == ResidualPolicy::MaterializeAndReplay && !non_residual_gap {
+        if let Some(completion) = residual::free_dt_array_residue_extends(
             terms, model, &evaluator, assertions, &residue, &resolve,
-        )
-    {
-        return GateVerdict::ConfirmedSat;
+        ) {
+            return ModelConfirmation::new(GateVerdict::ConfirmedSat, Some(completion));
+        }
     }
-    GateVerdict::CannotConfirm { reason }
+    ModelConfirmation::new(GateVerdict::CannotConfirm { reason }, None)
 }
 
 /// The shape name of a model value, for diagnostics only.
@@ -743,7 +922,7 @@ fn value_shape(value: &ModelValue) -> &'static str {
         ModelValue::Int(_) => "Int",
         ModelValue::Real(_) => "Real",
         ModelValue::BitVec { .. } => "BitVec",
-        ModelValue::FloatingPoint { .. } => "FloatingPoint",
+        ModelValue::FloatingPoint { .. } | ModelValue::FloatingPointExact { .. } => "FloatingPoint",
         ModelValue::Str(_) => "Str",
         ModelValue::Uninterpreted(_) => "Uninterpreted",
         ModelValue::Seq(_) => "Seq",

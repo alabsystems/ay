@@ -189,14 +189,17 @@ fn collection_roots_include_active_assumption_but_not_inactive_retained_term() {
     );
     assert!(!exec
         .datatype_model_collection_roots(&[])
+        .unwrap()
         .contains(&inactive));
 
     exec.last_assumptions = Some(vec![inactive]);
     assert!(exec
         .datatype_model_collection_roots(&[])
+        .unwrap()
         .contains(&inactive));
     exec.last_assumptions = None;
     assert!(!exec
         .datatype_model_collection_roots(&[])
+        .unwrap()
         .contains(&inactive));
 }

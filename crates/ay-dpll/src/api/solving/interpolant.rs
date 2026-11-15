@@ -33,8 +33,15 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::TermData;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, TermId, TermStore};
 
-use crate::api::types::{InterpolantResult, InterpolantStrength, PathInterpolantResult, Term};
+use crate::api::types::{
+    InterpolantFailure, InterpolantMode, InterpolantResult, InterpolantStrength,
+    PathInterpolantResult, Term,
+};
 use crate::api::Solver;
+
+/// Fail-closed (Explicit-mode) traversal (Workstream D Rung 1, WP-D1-P).
+#[path = "interpolant_explicit.rs"]
+mod explicit;
 
 impl Solver {
     /// Compute a Craig interpolant from the last UNSAT proof.
@@ -101,15 +108,30 @@ impl Solver {
             return None;
         }
 
+        let result_tid = self.legacy_interpolant(&proof, &a_term_ids, &b_term_ids, strength)?;
+        Some(InterpolantResult::new(self.wrap_term(result_tid), strength))
+    }
+
+    /// The historical (Legacy-mode) binary interpolant of the flattened split
+    /// `a_term_ids` / `b_term_ids` from `proof`, shared by
+    /// [`Solver::get_interpolant_with_strength`] and the Legacy arm of
+    /// [`Solver::get_interpolants_for_masks`].
+    fn legacy_interpolant(
+        &mut self,
+        proof: &Proof,
+        a_term_ids: &HashSet<TermId>,
+        b_term_ids: &HashSet<TermId>,
+        strength: InterpolantStrength,
+    ) -> Option<TermId> {
         // Collect variables for A and B to determine shared variables.
         let mut a_vars = HashSet::default();
         let mut b_vars = HashSet::default();
         {
             let terms = self.terms();
-            for &tid in &a_term_ids {
+            for &tid in a_term_ids {
                 collect_vars(terms, tid, &mut a_vars);
             }
-            for &tid in &b_term_ids {
+            for &tid in b_term_ids {
                 collect_vars(terms, tid, &mut b_vars);
             }
         }
@@ -121,19 +143,19 @@ impl Solver {
         let mut b_atoms = HashSet::default();
         {
             let terms = self.terms();
-            for &tid in &a_term_ids {
+            for &tid in a_term_ids {
                 collect_atoms(terms, tid, &mut a_atoms);
             }
-            for &tid in &b_term_ids {
+            for &tid in b_term_ids {
                 collect_atoms(terms, tid, &mut b_atoms);
             }
         }
 
         // Walk the proof DAG bottom-up and compute partial interpolants.
         let result_tid = self.traverse_proof_for_interpolant(
-            &proof,
-            &a_term_ids,
-            &b_term_ids,
+            proof,
+            a_term_ids,
+            b_term_ids,
             &a_atoms,
             &b_atoms,
             &a_vars,
@@ -154,7 +176,7 @@ impl Solver {
                 .unwrap_or_else(|| "<unknown>".to_string())
         );
 
-        Some(InterpolantResult::new(self.wrap_term(result_tid), strength))
+        Some(result_tid)
     }
 
     /// Compute path interpolants for a sequence of formula partitions.
@@ -293,6 +315,246 @@ impl Solver {
         Some(PathInterpolantResult::new(interpolants, strength))
     }
 
+    /// Compute one Craig interpolant per mask from the last UNSAT proof.
+    ///
+    /// `groups` lists the assertion groups in order; each `masks[i]` selects
+    /// the A-side groups for the i-th interpolant (bit `g` set = group `g` is
+    /// in A; at most 128 groups). The proof is cloned ONCE for all masks.
+    ///
+    /// In [`InterpolantMode::Legacy`] every mask behaves exactly like
+    /// [`Solver::get_interpolant_with_strength`] on the flattened A/B split.
+    /// In [`InterpolantMode::Explicit`] extraction fails closed (see
+    /// [`InterpolantFailure`]): one literal-label function per cut is built
+    /// from the occurrences of every atom and composite subterm in the A- and
+    /// B-assertions and is consulted by the input-leaf, pivot and theory-leaf
+    /// rules; a missing premise, a Trust step, an uncertified or undecodable
+    /// theory leaf and a non-local result are errors, and the theory-lemma
+    /// fallbacks are off.
+    ///
+    /// Every mask must select at least one and not all groups, and
+    /// `groups.len()` must be in `1..=128`; otherwise
+    /// [`InterpolantFailure::InvalidGroups`]. A Legacy mask whose traversal
+    /// yields no root reports [`InterpolantFailure::MissingPremise`] at the
+    /// root step.
+    ///
+    /// Workstream D, Rung 1 (`DESIGN_lra_interp_tpa.md` §4.1). Owner: WP-D1-P.
+    pub fn get_interpolants_for_masks(
+        &mut self,
+        groups: &[&[Term]],
+        masks: &[u128],
+        strength: InterpolantStrength,
+        mode: InterpolantMode,
+    ) -> Result<Vec<Term>, InterpolantFailure> {
+        if groups.is_empty() || groups.len() > 128 {
+            return Err(InterpolantFailure::InvalidGroups);
+        }
+        let full: u128 = if groups.len() == 128 {
+            u128::MAX
+        } else {
+            (1u128 << groups.len()) - 1
+        };
+        if masks.iter().any(|&m| m == 0 || m & !full != 0 || m == full) {
+            return Err(InterpolantFailure::InvalidGroups);
+        }
+        // Authenticate every caller-owned group before touching the proof.
+        let mut group_ids: Vec<Vec<TermId>> = Vec::with_capacity(groups.len());
+        for group in groups {
+            group_ids.push(
+                self.resolve_terms("get_interpolants_for_masks", group)
+                    .map_err(|_| InterpolantFailure::InvalidGroups)?,
+            );
+        }
+        // ONE clone of the proof for every mask (the per-call clone of
+        // `get_interpolant_with_strength` dominated multi-cut extraction).
+        // Explicit mode reads the solver's own refutation when the session
+        // records one (`set_interpolation_proofs`); Legacy mode classifies
+        // leaves by the flattened group sets and keeps the artifact proof.
+        let source = match mode {
+            InterpolantMode::Explicit => self.explicit_interpolation_proof(),
+            InterpolantMode::Legacy => self.last_proof(),
+        };
+        let proof = match source {
+            Some(proof) if !proof.steps.is_empty() => proof.clone(),
+            _ => return Err(InterpolantFailure::NoProof),
+        };
+        let mut out = Vec::with_capacity(masks.len());
+        match mode {
+            InterpolantMode::Explicit => {
+                let view = explicit::ProofView::build(&proof)?;
+                let mut occ = explicit::GroupOccurrence::build(self.terms(), &group_ids);
+                if let Some(sources) = self.executor.interpolation_leaf_sources() {
+                    occ.attribute_preprocessed_leaves(self.terms(), sources);
+                }
+                for &mask in masks {
+                    let tid = explicit::explicit_interpolant(
+                        self.terms_mut(),
+                        &proof,
+                        &view,
+                        &occ,
+                        mask,
+                        strength,
+                    )?;
+                    out.push(self.wrap_term(tid));
+                }
+            }
+            InterpolantMode::Legacy => {
+                for &mask in masks {
+                    let mut a_ids: HashSet<TermId> = HashSet::default();
+                    let mut b_ids: HashSet<TermId> = HashSet::default();
+                    for (g, ids) in group_ids.iter().enumerate() {
+                        let side = if mask & (1u128 << g) != 0 {
+                            &mut a_ids
+                        } else {
+                            &mut b_ids
+                        };
+                        side.extend(ids.iter().copied());
+                    }
+                    let tid = self
+                        .legacy_interpolant(&proof, &a_ids, &b_ids, strength)
+                        .ok_or(InterpolantFailure::MissingPremise {
+                            step: proof.steps.len() - 1,
+                        })?;
+                    out.push(self.wrap_term(tid));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The refutation [`InterpolantMode::Explicit`] extraction reads: the
+    /// solver's own refutation when this session records one
+    /// ([`Solver::set_interpolation_proofs`]), else the last proof.
+    #[must_use]
+    pub fn explicit_interpolation_proof(&self) -> Option<&Proof> {
+        self.executor
+            .last_interpolation_proof()
+            .or_else(|| self.last_proof())
+    }
+
+    /// Reachable `Trust`/`Hole` steps of the refutation Explicit extraction
+    /// reads (the steps it refuses), or `None` without a refutation proof.
+    ///
+    /// Workstream D board counter (`trust_steps`); owner WP-D1-P.
+    #[must_use]
+    pub fn last_proof_trust_steps(&self) -> Option<usize> {
+        let proof = self.explicit_interpolation_proof()?;
+        explicit::ProofView::build(proof)
+            .ok()
+            .map(|view| view.trust_steps)
+    }
+
+    /// Why the last UNSAT's proof was withheld or poisoned, when ay-dpll
+    /// recorded a mechanism ([`crate::ProofDeclineMechanism::tag`] is the
+    /// stable census string; `None` also when the proof was kept intact).
+    /// Workstream D corpus-gate census (K-1 attribution of blocked queries).
+    #[must_use]
+    pub fn last_proof_decline(&self) -> Option<crate::ProofDeclineMechanism> {
+        self.executor.last_proof_decline()
+    }
+
+    /// One-line description of step `index` of the refutation Explicit
+    /// extraction reads (rule or step kind, premise ids, and the clause
+    /// printed with a node budget per literal), for interpolation diagnostics.
+    /// `None` when there is no proof or no such step.
+    #[must_use]
+    pub fn describe_last_proof_step(&self, index: usize) -> Option<String> {
+        const LITERAL_NODE_BUDGET: usize = 64;
+        let proof = self.explicit_interpolation_proof()?;
+        let step = proof.steps.get(index)?;
+        let terms = self.terms();
+        let fmt_clause = |clause: &[TermId]| -> String {
+            let mut out = String::from("(cl");
+            for &lit in clause {
+                out.push(' ');
+                let mut budget = LITERAL_NODE_BUDGET;
+                self.format_term_bounded(terms, lit, &mut budget, &mut out);
+            }
+            out.push(')');
+            out
+        };
+        Some(match step {
+            ProofStep::Assume(t) => format!("assume {}", fmt_clause(std::slice::from_ref(t))),
+            ProofStep::Resolution {
+                clause,
+                clause1,
+                clause2,
+                ..
+            } => format!(
+                "resolution premises=[{},{}] {}",
+                clause1.0,
+                clause2.0,
+                fmt_clause(clause)
+            ),
+            ProofStep::TheoryLemma {
+                theory,
+                clause,
+                farkas,
+                kind,
+                ..
+            } => format!(
+                "lemma theory={theory} kind={} farkas={} {}",
+                kind.alethe_rule(),
+                farkas.is_some(),
+                fmt_clause(clause)
+            ),
+            ProofStep::Step {
+                rule,
+                clause,
+                premises,
+                ..
+            } => format!(
+                "step rule={} premises={:?} {}",
+                rule.name(),
+                premises.iter().map(|p| p.0).collect::<Vec<_>>(),
+                fmt_clause(clause)
+            ),
+            ProofStep::Anchor { end_step, .. } => format!("anchor end={}", end_step.0),
+            other => format!("{other:?}").chars().take(200).collect(),
+        })
+    }
+
+    /// SMT-LIB-ish rendering of `id` that stops after `budget` nodes (`…`).
+    fn format_term_bounded(
+        &self,
+        terms: &TermStore,
+        id: TermId,
+        budget: &mut usize,
+        out: &mut String,
+    ) {
+        if *budget == 0 {
+            out.push('…');
+            return;
+        }
+        *budget -= 1;
+        match terms.get(id) {
+            TermData::Var(name, _) => out.push_str(name),
+            TermData::Const(_) => out.push_str(&self.executor.format_term(id)),
+            TermData::Not(inner) => {
+                out.push_str("(not ");
+                self.format_term_bounded(terms, *inner, budget, out);
+                out.push(')');
+            }
+            TermData::Ite(c, t, e) => {
+                out.push_str("(ite");
+                for x in [*c, *t, *e] {
+                    out.push(' ');
+                    self.format_term_bounded(terms, x, budget, out);
+                }
+                out.push(')');
+            }
+            TermData::App(sym, args) => {
+                out.push('(');
+                out.push_str(sym.name());
+                for &arg in args {
+                    out.push(' ');
+                    self.format_term_bounded(terms, arg, budget, out);
+                }
+                out.push(')');
+            }
+            _ => out.push_str("<binder>"),
+        }
+    }
+
     /// Walk the proof DAG bottom-up, computing partial interpolants at each node.
     ///
     /// Uses `&mut self` because building new interpolant terms (And, Or, Not)
@@ -409,7 +671,12 @@ impl Solver {
                         }
                     }
                 }
-                ProofStep::TheoryLemma { clause, farkas, .. } => {
+                ProofStep::TheoryLemma {
+                    clause,
+                    farkas,
+                    kind,
+                    ..
+                } => {
                     // Certificate-based leaf first (rank-4 inc-4): when the
                     // lemma carries a Farkas certificate that re-verifies,
                     // derive the partial interpolant from the certificate
@@ -428,6 +695,13 @@ impl Solver {
                     });
                     match cert {
                         Some(itp) => Some(itp),
+                        // Native arithmetic truth does not provide a Craig
+                        // leaf contract. Missing, malformed or partition-
+                        // rejected metadata cannot authorize the occurrence
+                        // projection for this pedigree-free arithmetic kind.
+                        None if matches!(kind, ay_core::TheoryLemmaKind::ArithClauseTautology) => {
+                            return None
+                        }
                         // Labeled-system projection: disjunction of the
                         // clause literals outside the A-restriction
                         // (all-A-local lemmas take `false`).
@@ -1936,5 +2210,165 @@ mod tests {
         let empty_pr = PathInterpolantResult::new(vec![], InterpolantStrength::Default);
         assert_eq!(empty_pr.len(), 0);
         assert!(empty_pr.is_empty());
+    }
+
+    fn retained_affine_case(
+        annotation: Option<ay_core::FarkasAnnotation>,
+    ) -> (Solver, Proof, HashSet<TermId>, HashSet<TermId>) {
+        let mut solver = Solver::try_new(crate::api::types::Logic::QfLia).unwrap();
+        let terms = solver.terms_mut();
+        let a = terms.mk_var("retained_a", Sort::Int);
+        let b = terms.mk_var("retained_b", Sort::Int);
+        let x = terms.mk_var("retained_x", Sort::Int);
+        let five = terms.mk_int(5.into());
+        let a_eq_x = terms.mk_eq(a, x);
+        let a_eq_5 = terms.mk_eq(a, five);
+        let b_eq_x = terms.mk_eq(b, x);
+        let b_eq_5 = terms.mk_eq(b, five);
+        let not_b_eq_5 = terms.mk_not_raw(b_eq_5);
+        let assumptions = [a_eq_x, a_eq_5, b_eq_x, not_b_eq_5];
+        let clause = vec![
+            terms.mk_not_raw(a_eq_x),
+            terms.mk_not_raw(a_eq_5),
+            terms.mk_not_raw(b_eq_x),
+            b_eq_5,
+        ];
+        assert!(ay_proof::recognize_arith_clause_tautology(terms, &clause));
+        let mut proof = Proof::new();
+        let ids: Vec<_> = assumptions
+            .iter()
+            .map(|&term| proof.add_assume(term, None))
+            .collect();
+        let mut previous = proof.add_step(ProofStep::TheoryLemma {
+            theory: "arith".to_owned(),
+            clause: clause.clone(),
+            farkas: annotation,
+            kind: ay_core::TheoryLemmaKind::ArithClauseTautology,
+            lia: None,
+        });
+        for (index, (&assumption, &id)) in assumptions.iter().zip(ids.iter()).enumerate() {
+            previous = proof.add_resolution(clause[index + 1..].to_vec(), assumption, id, previous);
+        }
+        let a_terms = [a_eq_x, a_eq_5].into_iter().collect();
+        let b_terms = [b_eq_x, not_b_eq_5].into_iter().collect();
+        (solver, proof, a_terms, b_terms)
+    }
+
+    #[test]
+    fn missing_or_rejected_arithmetic_metadata_never_serves_an_invalid_projection() {
+        for annotation in [
+            None,
+            Some(ay_core::FarkasAnnotation::from_ints(&[1, 1, 1])),
+            Some(ay_core::FarkasAnnotation::from_ints(&[0, 0, 0, 0])),
+        ] {
+            let (mut solver, proof, a_terms, b_terms) = retained_affine_case(annotation);
+            // B is satisfiable, so the old occurrence fallback's constant
+            // true cannot be a Craig interpolant for this exact split.
+            assert_eq!(script_verdict("(set-logic QF_LIA) (declare-const retained_b Int) (declare-const retained_x Int) (assert (= retained_b retained_x)) (assert (not (= retained_b 5))) (assert true) (check-sat)"), "sat");
+            assert!(solver
+                .legacy_interpolant(&proof, &a_terms, &b_terms, InterpolantStrength::Strongest)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_valid_retained_arithmetic_annotation_serves_a_real_craig_interpolant() {
+        let (mut solver, proof, a_terms, b_terms) =
+            retained_affine_case(Some(ay_core::FarkasAnnotation::from_ints(&[1, 1, 1, 1])));
+        let interpolant = solver
+            .legacy_interpolant(&proof, &a_terms, &b_terms, InterpolantStrength::Strongest)
+            .expect("an exact verified equality witness must remain useful");
+        let text = solver.format_term(solver.wrap_term(interpolant));
+        let declarations = "(set-logic QF_LIA) (declare-const retained_a Int) (declare-const retained_b Int) (declare-const retained_x Int)";
+        let a = format!("{declarations} (assert (= retained_a retained_x)) (assert (= retained_a 5)) (assert (not {text})) (check-sat)");
+        let b = format!("{declarations} (assert (= retained_b retained_x)) (assert (not (= retained_b 5))) (assert {text}) (check-sat)");
+        assert_eq!(script_verdict(&a), "unsat");
+        assert_eq!(script_verdict(&b), "unsat");
+    }
+
+    #[test]
+    fn a_native_congruence_annotation_with_a_zero_weight_cause_serves_verified_craig() {
+        let (mut solver, proof, a_terms, b_terms) =
+            retained_affine_case(Some(ay_core::FarkasAnnotation::from_ints(&[1, 1, 0, 1])));
+        let (clause, witness) = proof
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                ProofStep::TheoryLemma {
+                    clause,
+                    farkas: Some(witness),
+                    ..
+                } => Some((clause, witness)),
+                _ => None,
+            })
+            .expect("the genuine arithmetic theorem retains the complete original witness");
+        let conflict: Vec<_> = clause
+            .iter()
+            .map(|&term| ay_core::TheoryLit::new(term, false))
+            .collect();
+        assert!(ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            solver.terms(),
+            &conflict,
+            witness,
+        )
+        .is_ok());
+        assert!(
+            ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+                solver.terms(),
+                &conflict,
+                witness,
+            )
+            .is_err()
+        );
+
+        let interpolant = solver
+            .legacy_interpolant(&proof, &a_terms, &b_terms, InterpolantStrength::Strongest)
+            .expect("the independently verified congruence witness must remain useful");
+        // Capture before any fresh Craig-check helper can run on this thread.
+        let stats = super::super::interpolant_farkas::last_cert_leaf_stats();
+        assert_eq!((stats.attempted, stats.verified, stats.served), (1, 1, 1));
+
+        let mut a_vars = HashSet::default();
+        let mut b_vars = HashSet::default();
+        for &term in &a_terms {
+            collect_vars(solver.terms(), term, &mut a_vars);
+        }
+        for &term in &b_terms {
+            collect_vars(solver.terms(), term, &mut b_vars);
+        }
+        let shared: HashSet<TermId> = a_vars.intersection(&b_vars).copied().collect();
+        assert_eq!(shared.len(), 1, "the original split shares only retained_x");
+        assert!(uses_only_shared_vars(solver.terms(), interpolant, &shared));
+        let x = *shared
+            .iter()
+            .next()
+            .expect("the actual shared variable exists");
+        let five = solver.terms_mut().mk_int(5.into());
+        let expected = solver.terms_mut().mk_eq(x, five);
+        assert_eq!(
+            interpolant, expected,
+            "the observed shared projection is x=5"
+        );
+
+        let text = solver.format_term(solver.wrap_term(interpolant));
+        let declarations = "(set-logic QF_LIA) (declare-const retained_a Int) (declare-const retained_b Int) (declare-const retained_x Int)";
+        let b_alone = format!("{declarations} (assert (= retained_b retained_x)) (assert (not (= retained_b 5))) (check-sat)");
+        let a = format!("{declarations} (assert (= retained_a retained_x)) (assert (= retained_a 5)) (assert (not {text})) (check-sat)");
+        let b = format!("{declarations} (assert (= retained_b retained_x)) (assert (not (= retained_b 5))) (assert {text}) (check-sat)");
+        assert_eq!(
+            script_verdict(&b_alone),
+            "sat",
+            "B is a nontrivial satisfiable side"
+        );
+        assert_eq!(
+            script_verdict(&a),
+            "unsat",
+            "A must imply the actual served interpolant"
+        );
+        assert_eq!(
+            script_verdict(&b),
+            "unsat",
+            "the actual interpolant must refute B"
+        );
     }
 }

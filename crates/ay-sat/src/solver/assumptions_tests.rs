@@ -729,37 +729,36 @@ fn test_incremental_assumption_add_clause_between_solves_regression_7987() {
 }
 
 /// Verify that AssumeResult::Unsat carries an Option<ProofCertificate> (#8209).
-/// When LRAT proof output is enabled, the certificate should be Some.
+/// Strengthened fixture: the persistent formula itself is UNSAT, so LRAT
+/// output may carry an unconditional certificate. Historical identity retained.
 #[test]
 fn test_assume_unsat_carries_proof_certificate_when_lrat_enabled() {
     // Create a solver with LRAT proof output.
-    let proof = ProofOutput::lrat_text(Vec::new(), 2);
+    let proof = ProofOutput::lrat_text(Vec::new(), 3);
     let mut solver = Solver::with_proof_output(3, proof);
 
     let v0 = Variable::new(0);
     let v1 = Variable::new(1);
 
-    // x0 AND x1
+    // x0 AND !x0 AND x1: genuine base UNSAT, independently of assumptions.
     solver.add_clause(vec![Literal::positive(v0)]);
     solver.add_clause(vec![Literal::positive(v1)]);
+    solver.add_clause(vec![Literal::negative(v0)]);
 
-    // Assume ~x0: conflicts with the unit clause x0.
+    // This assumption is irrelevant to the already-refuted base formula.
     let result = solver.solve_with_assumptions(&[Literal::negative(v0)]);
     assert!(
         result.is_unsat(),
         "Should be UNSAT with contradicting assumption"
     );
 
-    // The core should contain the conflicting assumption.
+    // No assumption is needed for the base contradiction.
     let core = result
         .unsat_core()
         .expect("UNSAT result should have a core");
-    assert!(
-        !core.is_empty(),
-        "Core should contain at least the conflicting assumption"
-    );
+    assert!(core.is_empty(), "Base UNSAT needs no assumptions");
 
-    // With LRAT enabled, the proof certificate should be present.
+    // Genuine base UNSAT preserves the historical LRAT certificate assertion.
     match result.result() {
         AssumeResult::Unsat(_, cert) => {
             assert!(

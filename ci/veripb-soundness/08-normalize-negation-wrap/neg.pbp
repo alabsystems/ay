@@ -1,0 +1,10 @@
+pseudo-Boolean proof version 3.0
+% Truth: UNSATISFIABLE. The row is `-1 x1 >= 9223372036854775807`; the largest
+% attainable left-hand side is 0, so no assignment satisfies it.
+% Unfixed: normalizing flips `-1 x1` to `1 ~x1` and raises the degree to 2^63,
+% which wraps to i64::MIN, storing the infeasible row as trivially true; the
+% checker then accepts `conclusion SAT : x1`.
+f 1 ;
+output NONE;
+conclusion SAT : x1 ;
+end pseudo-Boolean proof;
